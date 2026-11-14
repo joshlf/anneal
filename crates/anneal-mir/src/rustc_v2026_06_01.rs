@@ -15,7 +15,11 @@
 //!   [`RUST_INTRINSIC_DEF_PATHS_V2026_06_01`];
 //! - `isUnreachableCallTarget` is [`UNREACHABLE_DEF_PATHS_V2026_06_01`];
 //! - `isAbortingPanicDefPath` is [`ABORTING_PANIC_DEF_PATHS_V2026_06_01`];
-//! - `isUnwindingPanicDefPath` is [`UNWINDING_PANIC_DEF_PATHS_V2026_06_01`].
+//! - `isUnwindingPanicDefPath` is [`UNWINDING_PANIC_DEF_PATHS_V2026_06_01`];
+//! - the `CastKind::PointerCoercion` tags that `MirSemantics.Places` matches with
+//!   `stringEq coercionKind "…"` (`evalReifyFnPointer`, `reifyCoercionSafetyCompatible`, ...)
+//!   are [`POINTER_COERCION_SPELLINGS_V2026_06_01`], each mapped to its typed
+//!   [`PointerCoercionKind`] (so `ir` and `lower` never match a coercion's spelling).
 //!
 //! The diverging entry points are classified whatever the call's `target`, and Anneal executes
 //! a call of one as `Trusted` executes a call without a return target (`rustc` never gives a
@@ -26,8 +30,61 @@
 //! or panic classification), [`classify_linked_call_target_v2026_06_01`] prefers a body linked
 //! in a [`CallTable`] over these tables.
 
-use crate::ir::{CallTarget, CalleeSymbol, IntrinsicOp};
+use crate::ir::{CallTarget, CalleeSymbol, IntrinsicOp, PointerCoercionKind, Safety};
 use crate::lower::cfg::CallTable;
+
+/// The `CastKind::PointerCoercion` tags of `rustc` `V2026_06_01` (the `Debug` spellings of
+/// `rustc_middle::ty::adjustment::PointerCoercion` that `MirSemantics.Places` matches with
+/// `stringEq coercionKind "…"`) and the [`PointerCoercionKind`] each denotes. The
+/// unparameterized `ReifyFnPointer` / `ClosureFnPointer` tags accept a function pointer of
+/// either safety (`reifyCoercionSafetyCompatible`); the `(Safe)` / `(Unsafe)` forms require
+/// that safety of the target function pointer.
+pub const POINTER_COERCION_SPELLINGS_V2026_06_01: &[(&str, PointerCoercionKind)] = &[
+    ("Unsize", PointerCoercionKind::Unsize),
+    ("MutToConstPointer", PointerCoercionKind::MutToConstPointer),
+    ("ArrayToPointer", PointerCoercionKind::ArrayToPointer),
+    ("ReifyFnPointer", PointerCoercionKind::ReifyFnPointer),
+    (
+        "ReifyFnPointer(Safe)",
+        PointerCoercionKind::ReifyFnPointerWithSafety(Safety::Safe),
+    ),
+    (
+        "ReifyFnPointer(Unsafe)",
+        PointerCoercionKind::ReifyFnPointerWithSafety(Safety::Unsafe),
+    ),
+    (
+        "ClosureFnPointer",
+        PointerCoercionKind::ClosureFnPointerAnySafety,
+    ),
+    (
+        "ClosureFnPointer(Safe)",
+        PointerCoercionKind::ClosureFnPointer(Safety::Safe),
+    ),
+    (
+        "ClosureFnPointer(Unsafe)",
+        PointerCoercionKind::ClosureFnPointer(Safety::Unsafe),
+    ),
+    ("UnsafeFnPointer", PointerCoercionKind::UnsafeFnPointer),
+];
+
+/// The [`PointerCoercionKind`] that the `CastKind::PointerCoercion` tag `spelling` (compared
+/// exactly, as `Trusted`'s `stringEq`) denotes in `rustc` `V2026_06_01`, or `None` for a tag
+/// this version does not have.
+pub fn lower_pointer_coercion_kind_v2026_06_01(spelling: &str) -> Option<PointerCoercionKind> {
+    POINTER_COERCION_SPELLINGS_V2026_06_01
+        .iter()
+        .find(|(tag, _)| *tag == spelling)
+        .map(|(_, kind)| *kind)
+}
+
+/// The `rustc` `V2026_06_01` tag of the [`PointerCoercionKind`] `kind` (the inverse of
+/// [`lower_pointer_coercion_kind_v2026_06_01`]).
+pub fn pointer_coercion_spelling_v2026_06_01(kind: PointerCoercionKind) -> &'static str {
+    POINTER_COERCION_SPELLINGS_V2026_06_01
+        .iter()
+        .find(|(_, k)| *k == kind)
+        .map_or("", |(tag, _)| tag)
+}
 
 /// `core::intrinsics::*` paths of the inline intrinsics (`classifyRustIntrinsic?`,
 /// `isDirectExactDivTarget`, and the call forms of the memory intrinsics).

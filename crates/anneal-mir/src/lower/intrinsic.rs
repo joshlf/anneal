@@ -234,7 +234,8 @@ pub fn check_intrinsic_call_types(
             arity(1)?;
             let pointee = arg_tys[0].pointee_ty().ok_or(Signature(NOT_POINTER))?;
             expect(*dest_ty == Ty::Uint(UintTy::Usize), SIZE_ALIGN_RESULT)?;
-            exact_layout(pointee).map(|_| ())
+            // A slice or `str` pointee (a wide pointer argument) needs an exact element layout.
+            exact_layout(pointee.slice_elem_ty().unwrap_or(pointee)).map(|_| ())
         }
         IntrinsicOp::CopyNonOverlapping => {
             arity(3)?;
@@ -618,16 +619,39 @@ fn eval_value_intrinsic(
             })
         }
         IntrinsicOp::SizeOfVal | IntrinsicOp::AlignOfVal => {
-            let MirValue::Ptr { ty: ptr_ty, .. } = &args[0] else {
-                return Err(RvalueEvalError::TypeMismatch(NOT_POINTER));
+            let (ptr_ty, len) = match &args[0] {
+                MirValue::Ptr { ty, .. } => (ty, None),
+                MirValue::WidePtr { ty, len, .. } => (ty, Some(*len)),
+                _ => return Err(RvalueEvalError::TypeMismatch(NOT_POINTER)),
             };
-            let (_, layout) = pointee_layout(ptr_ty, ptr_width)?;
-            let bytes = if op == IntrinsicOp::SizeOfVal {
-                layout.size
-            } else {
-                layout.align
+            let Some(len) = len else {
+                let (_, layout) = pointee_layout(ptr_ty, ptr_width)?;
+                let bytes = if op == IntrinsicOp::SizeOfVal {
+                    layout.size
+                } else {
+                    layout.align
+                };
+                return Ok(MirValue::unsigned(bytes as u128, UintTy::Usize, ptr_width));
             };
-            Ok(MirValue::unsigned(bytes as u128, UintTy::Usize, ptr_width))
+            // `[T]` / `str`: the element's alignment, and `len * size_of::<T>()` bytes, which
+            // must not exceed `isize::MAX` (no valid slice is larger).
+            let elem_ty = ptr_ty
+                .wide_ptr_elem_ty()
+                .ok_or(RvalueEvalError::TypeMismatch(NOT_POINTER))?;
+            let layout = elem_ty
+                .layout_for(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(elem_ty, err)))?;
+            if op == IntrinsicOp::AlignOfVal {
+                return Ok(MirValue::unsigned(layout.align as u128, UintTy::Usize, ptr_width));
+            }
+            let total = len as u128 * layout.size as u128;
+            if total > ptr_width.max_isize() as u128 {
+                return Err(RvalueEvalError::IntrinsicUb {
+                    op,
+                    reason: "the slice's size exceeds isize::MAX",
+                });
+            }
+            Ok(MirValue::unsigned(total, UintTy::Usize, ptr_width))
         }
         IntrinsicOp::CopyNonOverlapping
         | IntrinsicOp::WriteBytes

@@ -221,6 +221,17 @@ pub enum Mutability {
     Mut,
 }
 
+/// Safety qualifier of a function pointer type (`fn(..)` vs `unsafe fn(..)`), of a linked
+/// callee, or of the function pointer a `ReifyFnPointer` / `ClosureFnPointer` coercion
+/// produces (`rustc`'s `hir::Safety`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Safety {
+    /// A safe function (pointer).
+    Safe,
+    /// An `unsafe` function (pointer).
+    Unsafe,
+}
+
 /// Niche-aware scalar type descriptor for MIR cast and transmute validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScalarTy {
@@ -551,7 +562,10 @@ pub enum AdtKind {
 ///   `B(!)`, decided for both pointer widths); with no present variant the enum is laid out
 ///   like `!` (size `0`, alignment `1`, ignoring `repr(align)`), and with exactly one present
 ///   variant like a struct of that variant's fields with the enum's `repr` (no tag is stored;
-///   the absent variants' 1-ZST fields sit at offset `0`). Any other tagless enum has an
+///   the absent variants' 1-ZST fields sit at offset `0`). An `Option`-like enum whose
+///   payload is a reference or function pointer has the guaranteed null-pointer
+///   optimization ([`AdtDef::null_pointer_niche`]): it is laid out exactly like its payload.
+///   Any other tagless enum has an
 ///   **unspecified** layout (`repr(Rust)` niche/tag optimizations): it is representable when
 ///   an upper bound of its size fits in `isize::MAX`, but [`Ty::layout_for`] reports
 ///   [`LayoutError::Unspecified`], so `size_of`, `align_of`, `offset_of!`, and transmutes
@@ -580,6 +594,17 @@ pub struct TyLayout {
     pub align: usize,
 }
 
+/// Null-pointer optimization of an `Option`-like enum (see [`AdtDef::null_pointer_niche`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NullPointerNiche {
+    /// The dataless variant, represented by a null payload data pointer.
+    pub null_variant: usize,
+    /// The variant holding the non-null payload pointer.
+    pub payload_variant: usize,
+    /// Index of the payload pointer field in `payload_variant`.
+    pub payload_field: usize,
+}
+
 /// Reason a type has no exact layout under a target pointer width.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LayoutError {
@@ -592,6 +617,10 @@ pub enum LayoutError {
     Unspecified,
     /// Ill-formed ADT definition (with the violated rule).
     IllFormed(&'static str),
+    /// A dynamically sized type (`[T]`, `str`, or a type containing one by value), which has
+    /// no static layout: it only exists behind a wide pointer or reference (see
+    /// [`Ty::is_sized`]).
+    Unsized,
 }
 
 impl std::fmt::Display for LayoutError {
@@ -600,6 +629,7 @@ impl std::fmt::Display for LayoutError {
             LayoutError::TooLarge => write!(f, "type is too large for the target architecture"),
             LayoutError::Unspecified => write!(f, "type layout is unspecified"),
             LayoutError::IllFormed(reason) => write!(f, "ill-formed ADT definition: {reason}"),
+            LayoutError::Unsized => write!(f, "type is dynamically sized (has no static layout)"),
         }
     }
 }
@@ -632,6 +662,24 @@ impl LayoutInfo {
 }
 
 /// MIR type representation.
+///
+/// # Unsized types and wide pointers
+///
+/// [`Ty::Slice`] (`[T]`) and [`Ty::Str`] (`str`) are dynamically sized ([`Ty::is_sized`] is
+/// `false`): they have no static layout ([`LayoutError::Unsized`]) and only exist behind a
+/// pointer. A [`Ty::RawPtr`] or [`Ty::Ref`] to one of them is a *wide* pointer
+/// ([`Ty::is_wide_ptr`]): `2 * ptr_width.byte_size()` bytes laid out as the data pointer
+/// followed by the `usize` element count (the byte count for `str`), aligned to
+/// `ptr_width.byte_size()`. A wide reference keeps the reference's non-null niche on its data
+/// pointer. Every other pointer is *thin* ([`Ty::is_thin_ptr`]).
+///
+/// # Function pointers, function items, and closures
+///
+/// [`Ty::FnPtr`] is a thin, non-null function pointer (valid range `1..=ptr_width.mask()`,
+/// with a null niche). [`Ty::FnDef`] is the zero-sized type of a function item and
+/// [`Ty::Closure`] the type of a closure, laid out like the [`Ty::Tuple`] of its upvars; both
+/// only carry the identity of their callee in the type (a [`Constant::FnDef`] function item
+/// is still typed `()`, see [`Constant::ty`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     Bool,
@@ -646,7 +694,33 @@ pub enum Ty {
     /// Struct, enum, or union with a known definition (see [`AdtDef`]). Legacy MIR captures may
     /// still model ADTs as the `Ty::Tuple` of their fields.
     Adt(Arc<AdtDef>),
+    /// Dynamically sized slice `[T]` of a sized element type `T` (unsized; see the type-level
+    /// documentation).
+    Slice(Box<Ty>),
+    /// Dynamically sized UTF-8 string slice `str` (unsized; its elements are `u8` bytes).
+    Str,
+    /// Thin, non-null function pointer `fn(inputs..) -> output` (`unsafe fn` for
+    /// [`Safety::Unsafe`]); every input and the output must be sized. The parameter list is a
+    /// boxed slice (constructed by [`Ty::fn_ptr`]) so that `Ty` stays four words.
+    FnPtr {
+        inputs: Box<[Ty]>,
+        output: Box<Ty>,
+        safety: Safety,
+    },
+    /// Zero-sized function item type naming its callee (`rustc`'s `FnDef`).
+    FnDef(CallTarget),
+    /// Closure type: the symbol of the closure's body (called with the closure's arguments
+    /// when the closure is coerced to a function pointer) and the types of its captured
+    /// upvars, laid out like `Ty::Tuple(upvars)` (constructed by [`Ty::closure`]; boxed so
+    /// that `Ty` stays four words).
+    Closure {
+        target: Box<CalleeSymbol>,
+        upvars: Box<[Ty]>,
+    },
 }
+
+/// Element type of `str` (`u8`).
+static STR_ELEM_TY: Ty = Ty::Uint(UintTy::U8);
 
 impl Ty {
     /// Constructs the unit type `()`.
@@ -657,6 +731,115 @@ impl Ty {
     /// Constructs `Ty::Adt` from an ADT definition.
     pub fn adt(def: AdtDef) -> Self {
         Ty::Adt(Arc::new(def))
+    }
+
+    /// Constructs the slice type `[elem]`.
+    pub fn slice(elem: Ty) -> Self {
+        Ty::Slice(Box::new(elem))
+    }
+
+    /// Constructs the function pointer type `fn(inputs..) -> output` with `safety`.
+    pub fn fn_ptr(inputs: Vec<Ty>, output: Ty, safety: Safety) -> Self {
+        Ty::FnPtr {
+            inputs: inputs.into_boxed_slice(),
+            output: Box::new(output),
+            safety,
+        }
+    }
+
+    /// Constructs the type of the closure whose body is `target`, capturing upvars of the
+    /// types `upvars`.
+    pub fn closure(target: impl Into<CalleeSymbol>, upvars: Vec<Ty>) -> Self {
+        Ty::Closure {
+            target: Box::new(target.into()),
+            upvars: upvars.into_boxed_slice(),
+        }
+    }
+
+    /// The field types of a tuple, or the captured upvar types of a closure (which is laid
+    /// out like the tuple of its upvars); `None` for every other type.
+    pub fn tuple_like_fields(&self) -> Option<&[Ty]> {
+        match self {
+            Ty::Tuple(fields) => Some(fields),
+            Ty::Closure { upvars, .. } => Some(upvars),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this type is statically sized: every type except the dynamically sized
+    /// [`Ty::Slice`] and [`Ty::Str`] and the arrays, tuples, ADTs, and closures containing one
+    /// by value (Anneal supports no unsized aggregates). Pointers to unsized types are sized
+    /// (wide pointers).
+    pub fn is_sized(&self) -> bool {
+        match self {
+            Ty::Slice(_) | Ty::Str => false,
+            Ty::Array(elem, _) => elem.is_sized(),
+            Ty::Tuple(_) | Ty::Closure { .. } => self
+                .tuple_like_fields()
+                .unwrap_or_default()
+                .iter()
+                .all(Ty::is_sized),
+            Ty::Adt(def) => def.all_fields().all(Ty::is_sized),
+            Ty::Bool
+            | Ty::Char
+            | Ty::Int(_)
+            | Ty::Uint(_)
+            | Ty::RawPtr(_, _)
+            | Ty::Ref(_, _)
+            | Ty::Never
+            | Ty::FnPtr { .. }
+            | Ty::FnDef(_) => true,
+        }
+    }
+
+    /// Returns true for the dynamically sized pointee types [`Ty::Slice`] and [`Ty::Str`].
+    pub fn is_slice_like(&self) -> bool {
+        matches!(self, Ty::Slice(_) | Ty::Str)
+    }
+
+    /// Element type of a slice-like type: `T` for `[T]` and `u8` for `str`.
+    pub fn slice_elem_ty(&self) -> Option<&Ty> {
+        match self {
+            Ty::Slice(elem) => Some(elem),
+            Ty::Str => Some(&STR_ELEM_TY),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this type is a wide (fat) raw pointer or reference to a slice-like
+    /// pointee (`*const [T]`, `*mut [T]`, `&[T]`, `&mut [T]`, and the `str` forms).
+    pub fn is_wide_ptr(&self) -> bool {
+        matches!(self, Ty::RawPtr(inner, _) | Ty::Ref(inner, _) if inner.is_slice_like())
+    }
+
+    /// Returns true if this type is a thin raw pointer or reference (a pointer whose pointee
+    /// is not slice-like).
+    pub fn is_thin_ptr(&self) -> bool {
+        self.is_any_ptr() && !self.is_wide_ptr()
+    }
+
+    /// Element type of a wide pointer's pointee (`T` for `*const [T]` / `&[T]`, `u8` for the
+    /// `str` forms).
+    pub fn wide_ptr_elem_ty(&self) -> Option<&Ty> {
+        match self {
+            Ty::RawPtr(inner, _) | Ty::Ref(inner, _) => inner.slice_elem_ty(),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this type is a function pointer.
+    pub fn is_fn_ptr(&self) -> bool {
+        matches!(self, Ty::FnPtr { .. })
+    }
+
+    /// This raw pointer or reference type with its pointee replaced by `pointee` (keeping the
+    /// pointer kind and mutability), or `None` for non-pointer types.
+    pub fn with_pointee(&self, pointee: Ty) -> Option<Ty> {
+        match self {
+            Ty::RawPtr(_, m) => Some(Ty::RawPtr(Box::new(pointee), *m)),
+            Ty::Ref(_, m) => Some(Ty::Ref(Box::new(pointee), *m)),
+            _ => None,
+        }
     }
 
     /// Returns the ADT definition if `self` is `Ty::Adt`.
@@ -706,28 +889,49 @@ impl Ty {
     ///
     /// For `Ty::Adt`, every declared field of a struct or union and of every enum variant is
     /// considered (independently of inhabitedness), matching the conservative pointer analysis
-    /// of `Ptr -> Int` transmute checks.
+    /// of `Ptr -> Int` transmute checks. Wide pointers (whose data pointer carries provenance)
+    /// and function pointers count as pointers; a slice counts when its element type does.
     pub fn contains_ptr(&self) -> bool {
         match self {
-            Ty::RawPtr(_, _) | Ty::Ref(_, _) => true,
+            Ty::RawPtr(_, _) | Ty::Ref(_, _) | Ty::FnPtr { .. } => true,
             Ty::Array(elem, count) => *count > 0 && elem.contains_ptr(),
-            Ty::Tuple(fields) => fields.iter().any(Ty::contains_ptr),
-            Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::Never => false,
+            Ty::Slice(elem) => elem.contains_ptr(),
+            Ty::Tuple(_) | Ty::Closure { .. } => {
+                let fields = self.tuple_like_fields().unwrap_or_default();
+                fields.iter().any(Ty::contains_ptr)
+            }
+            Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::Never | Ty::Str | Ty::FnDef(_) => {
+                false
+            }
             Ty::Adt(def) => def.all_fields().any(Ty::contains_ptr),
         }
     }
 
     /// Returns true if this type or any value it contains without indirection holds a
-    /// reference (`&T` / `&mut T`) that `Statement::Retag` must validate: references directly
-    /// or inside arrays, tuples, structs, and enum variants, but not inside unions (whose
-    /// contents are never retagged) or behind raw pointers.
+    /// reference (`&T` / `&mut T`, thin or wide) that `Statement::Retag` must validate:
+    /// references directly or inside arrays, tuples, closures, structs, and enum variants, but
+    /// not inside unions (whose contents are never retagged) or behind raw pointers. Function
+    /// pointers are not references (their non-null validity is checked wherever a value is
+    /// checked for well-formedness).
     pub fn contains_ref(&self) -> bool {
         match self {
             Ty::Ref(_, _) => true,
             Ty::Array(elem, count) => *count > 0 && elem.contains_ref(),
-            Ty::Tuple(fields) => fields.iter().any(Ty::contains_ref),
+            Ty::Slice(elem) => elem.contains_ref(),
+            Ty::Tuple(_) | Ty::Closure { .. } => {
+                let fields = self.tuple_like_fields().unwrap_or_default();
+                fields.iter().any(Ty::contains_ref)
+            }
             Ty::Adt(def) => !def.is_union() && def.all_fields().any(Ty::contains_ref),
-            Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::RawPtr(_, _) | Ty::Never => false,
+            Ty::Bool
+            | Ty::Char
+            | Ty::Int(_)
+            | Ty::Uint(_)
+            | Ty::RawPtr(_, _)
+            | Ty::Never
+            | Ty::Str
+            | Ty::FnPtr { .. }
+            | Ty::FnDef(_) => false,
         }
     }
 
@@ -740,31 +944,48 @@ impl Ty {
     }
 
     /// Converts a scalar MIR `Ty` to its `ScalarTy` descriptor, or `None` for composites/`Never`.
+    ///
+    /// Thin raw pointers, thin references, and function pointers are pointer scalars; wide
+    /// pointers (two words) are not scalars.
     pub fn to_scalar_ty(&self) -> Option<ScalarTy> {
         match self {
             Ty::Bool => Some(ScalarTy::Bool),
             Ty::Char => Some(ScalarTy::Char),
             Ty::Int(it) => Some(ScalarTy::Int(*it)),
             Ty::Uint(ut) => Some(ScalarTy::Uint(*ut)),
-            Ty::RawPtr(_, m) | Ty::Ref(_, m) => Some(ScalarTy::Ptr(*m)),
-            Ty::Array(_, _) | Ty::Tuple(_) | Ty::Never | Ty::Adt(_) => None,
+            Ty::RawPtr(inner, m) | Ty::Ref(inner, m) if !inner.is_slice_like() => {
+                Some(ScalarTy::Ptr(*m))
+            }
+            Ty::FnPtr { .. } => Some(ScalarTy::Ptr(Mutability::Not)),
+            Ty::RawPtr(_, _)
+            | Ty::Ref(_, _)
+            | Ty::Array(_, _)
+            | Ty::Tuple(_)
+            | Ty::Never
+            | Ty::Adt(_)
+            | Ty::Slice(_)
+            | Ty::Str
+            | Ty::FnDef(_)
+            | Ty::Closure { .. } => None,
         }
     }
 
-    /// Returns true if this type is a single scalar (`Bool`, `Char`, `Int`, `Uint`, `RawPtr`, `Ref`).
+    /// Returns true if this type is a single scalar (`Bool`, `Char`, `Int`, `Uint`, a thin
+    /// `RawPtr` / `Ref`, or a `FnPtr`).
     pub fn is_scalar(&self) -> bool {
         self.to_scalar_ty().is_some()
     }
 
-    /// Bitmask for scalar types under `ptr_width`.
+    /// Bitmask for scalar types under `ptr_width` (`0` for non-scalars, including wide
+    /// pointers).
     pub fn scalar_mask(&self, ptr_width: PtrWidth) -> u128 {
-        match self {
-            Ty::Bool => 1,
-            Ty::Char => 0xFFFF_FFFF,
-            Ty::Int(it) => it.mask(ptr_width),
-            Ty::Uint(ut) => ut.mask(ptr_width),
-            Ty::RawPtr(_, _) | Ty::Ref(_, _) => ptr_width.mask(),
-            Ty::Array(_, _) | Ty::Tuple(_) | Ty::Never | Ty::Adt(_) => 0,
+        match self.to_scalar_ty() {
+            Some(ScalarTy::Bool) => 1,
+            Some(ScalarTy::Char) => 0xFFFF_FFFF,
+            Some(ScalarTy::Int(it)) => it.mask(ptr_width),
+            Some(ScalarTy::Uint(ut)) => ut.mask(ptr_width),
+            Some(ScalarTy::Ptr(_)) => ptr_width.mask(),
+            None => 0,
         }
     }
 
@@ -774,20 +995,28 @@ impl Ty {
     }
 
     /// Valid bit patterns of a scalar type under `ptr_width` as disjoint inclusive intervals
-    /// (`bool`: `0..=1`; `char`: Unicode scalar values; `&T`: non-null; integers and raw
-    /// pointers: every pattern of their width). Empty for non-scalar types.
+    /// (`bool`: `0..=1`; `char`: Unicode scalar values; `&T` and function pointers: non-null;
+    /// integers and thin raw pointers: every pattern of their width). Empty for non-scalar
+    /// types (including wide pointers).
     pub fn scalar_valid_intervals(&self, ptr_width: PtrWidth) -> Vec<(u128, u128)> {
-        match self {
-            Ty::Bool => vec![(0, 1)],
-            Ty::Char => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
-            Ty::Int(_) | Ty::Uint(_) | Ty::RawPtr(_, _) => vec![(0, self.scalar_mask(ptr_width))],
-            Ty::Ref(_, _) => vec![(1, ptr_width.mask())],
-            Ty::Array(_, _) | Ty::Tuple(_) | Ty::Never | Ty::Adt(_) => Vec::new(),
+        match self.to_scalar_ty() {
+            Some(ScalarTy::Bool) => vec![(0, 1)],
+            Some(ScalarTy::Char) => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
+            Some(ScalarTy::Ptr(_)) if self.has_null_niche() => vec![(1, ptr_width.mask())],
+            Some(_) => vec![(0, self.scalar_mask(ptr_width))],
+            None => Vec::new(),
         }
     }
 
+    /// Returns true for the pointer types whose validity invariant excludes the null pointer
+    /// (the non-null niche): references (thin or wide; for a wide reference, its data
+    /// pointer) and function pointers.
+    pub fn has_null_niche(&self) -> bool {
+        matches!(self, Ty::Ref(_, _) | Ty::FnPtr { .. })
+    }
+
     /// Checks whether `bits` is a valid bit pattern for a scalar `Ty`, including the
-    /// non-null niche requirement (`bits != 0`) on `Ty::Ref`.
+    /// non-null niche requirement (`bits != 0`) on `Ty::Ref` and `Ty::FnPtr`.
     pub fn is_valid_scalar_bits(&self, bits: u128, ptr_width: PtrWidth) -> bool {
         let Some(scalar) = self.to_scalar_ty() else {
             return false;
@@ -795,7 +1024,7 @@ impl Ty {
         if !scalar.is_valid_bits(bits, ptr_width) {
             return false;
         }
-        if self.is_ref() && bits == 0 {
+        if self.has_null_niche() && bits == 0 {
             return false;
         }
         true
@@ -819,17 +1048,26 @@ impl Ty {
     }
 
     /// Returns true if this type is inhabited under `ptr_width` (see [`Ty::is_inhabited`]).
+    /// Slices (the empty slice), `str`, function pointers, and function items are inhabited;
+    /// a closure is inhabited iff all of its upvars are.
     pub fn is_inhabited_for(&self, ptr_width: PtrWidth) -> bool {
         match self {
             Ty::Never => false,
-            Ty::Tuple(fields) => fields.iter().all(|f| f.is_inhabited_for(ptr_width)),
+            Ty::Tuple(_) | Ty::Closure { .. } => {
+                let fields = self.tuple_like_fields().unwrap_or_default();
+                fields.iter().all(|f| f.is_inhabited_for(ptr_width))
+            }
             Ty::Array(elem, count) => *count == 0 || elem.is_inhabited_for(ptr_width),
             Ty::Bool
             | Ty::Char
             | Ty::Int(_)
             | Ty::Uint(_)
             | Ty::RawPtr(_, _)
-            | Ty::Ref(_, _) => true,
+            | Ty::Ref(_, _)
+            | Ty::Slice(_)
+            | Ty::Str
+            | Ty::FnPtr { .. }
+            | Ty::FnDef(_) => true,
             Ty::Adt(def) => def.is_inhabited_for(ptr_width),
         }
     }
@@ -848,15 +1086,21 @@ impl Ty {
     /// Arrays have their element's alignment; tuples have the maximum field alignment
     /// (`1` for `()`); `!` has alignment `1`. `Ty::Adt` follows the [`AdtDef`] layout model
     /// (an upper bound for unspecified layouts, `1` for ill-formed or too-large ADTs).
+    /// Wide and function pointers are pointer-aligned; the (dynamic) alignment of a slice is
+    /// its element's (`1` for `str`); function items have alignment `1`, and closures their
+    /// upvar tuple's alignment.
     pub fn align_for(&self, ptr_width: PtrWidth) -> usize {
         match self {
-            Ty::Bool | Ty::Never => 1,
+            Ty::Bool | Ty::Never | Ty::Str | Ty::FnDef(_) => 1,
             Ty::Char => 4,
             Ty::Int(it) => it.byte_size_for(ptr_width),
             Ty::Uint(ut) => ut.byte_size_for(ptr_width),
-            Ty::RawPtr(_, _) | Ty::Ref(_, _) => ptr_width.byte_size(),
-            Ty::Array(elem, _) => elem.align_for(ptr_width),
-            Ty::Tuple(fields) => fields.iter().map(|f| f.align_for(ptr_width)).max().unwrap_or(1),
+            Ty::RawPtr(_, _) | Ty::Ref(_, _) | Ty::FnPtr { .. } => ptr_width.byte_size(),
+            Ty::Array(elem, _) | Ty::Slice(elem) => elem.align_for(ptr_width),
+            Ty::Tuple(_) | Ty::Closure { .. } => {
+                let fields = self.tuple_like_fields().unwrap_or_default();
+                fields.iter().map(|f| f.align_for(ptr_width)).max().unwrap_or(1)
+            }
             Ty::Adt(def) => def.layout_info(ptr_width).map(|l| l.align).unwrap_or(1),
         }
     }
@@ -873,30 +1117,76 @@ impl Ty {
     /// ADTs).
     ///
     /// Use [`Ty::layout_size_for`] to detect types that are too large for the target.
+    ///
+    /// Wide pointers are `2 * ptr_width.byte_size()` bytes, function pointers
+    /// `ptr_width.byte_size()`, function items `0`, and closures the size of their upvar
+    /// tuple; the unsized `[T]` and `str` (which have no static size) report `usize::MAX`.
     pub fn byte_size_for(&self, ptr_width: PtrWidth) -> usize {
         match self {
             Ty::Bool => 1,
             Ty::Char => 4,
             Ty::Int(it) => it.byte_size_for(ptr_width),
             Ty::Uint(ut) => ut.byte_size_for(ptr_width),
-            Ty::RawPtr(_, _) | Ty::Ref(_, _) => ptr_width.byte_size(),
+            Ty::RawPtr(inner, _) | Ty::Ref(inner, _) if inner.is_slice_like() => {
+                2 * ptr_width.byte_size()
+            }
+            Ty::RawPtr(_, _) | Ty::Ref(_, _) | Ty::FnPtr { .. } => ptr_width.byte_size(),
             Ty::Array(elem, count) => elem.byte_size_for(ptr_width).saturating_mul(*count),
-            Ty::Tuple(fields) => {
+            Ty::Tuple(_) | Ty::Closure { .. } => {
+                let fields = self.tuple_like_fields().unwrap_or_default();
                 let unpadded = fields
                     .iter()
                     .fold(0usize, |acc, f| acc.saturating_add(f.byte_size_for(ptr_width)));
                 let align = self.align_for(ptr_width);
                 unpadded.checked_next_multiple_of(align).unwrap_or(usize::MAX)
             }
-            Ty::Never => 0,
+            Ty::Never | Ty::FnDef(_) => 0,
+            Ty::Slice(_) | Ty::Str => usize::MAX,
             Ty::Adt(def) => def.layout_info(ptr_width).map(|l| l.size).unwrap_or(usize::MAX),
         }
     }
 
     /// Computes this type's (possibly inexact) layout under `ptr_width`, checking that every
     /// component is representable and every ADT well-formed.
+    ///
+    /// The unsized `[T]` and `str` (and any type containing one by value) are
+    /// [`LayoutError::Unsized`]. A wide pointer's slice element type must be sized
+    /// (`IllFormed` otherwise) and representable, and every input and the output of a function
+    /// pointer must be sized and representable (`IllFormed` for an unsized one).
     fn layout_info(&self, ptr_width: PtrWidth) -> Result<LayoutInfo, LayoutError> {
         let info = match self {
+            Ty::Slice(_) | Ty::Str => return Err(LayoutError::Unsized),
+            Ty::RawPtr(inner, _) | Ty::Ref(inner, _) if inner.is_slice_like() => {
+                if let Ty::Slice(elem) = &**inner {
+                    if !elem.is_sized() {
+                        return Err(LayoutError::IllFormed(
+                            "slice element type must be sized",
+                        ));
+                    }
+                    elem.layout_info(ptr_width)?;
+                }
+                LayoutInfo::exact(2 * ptr_width.byte_size(), ptr_width.byte_size())
+            }
+            Ty::FnPtr { inputs, output, .. } => {
+                for ty in inputs.iter().chain(std::iter::once(&**output)) {
+                    if !ty.is_sized() {
+                        return Err(LayoutError::IllFormed(
+                            "function pointer parameter and return types must be sized",
+                        ));
+                    }
+                    ty.layout_info(ptr_width)?;
+                }
+                LayoutInfo::exact(ptr_width.byte_size(), ptr_width.byte_size())
+            }
+            Ty::FnDef(_) => LayoutInfo::exact(0, 1),
+            Ty::Closure { upvars, .. } => Ty::Tuple(upvars.to_vec()).layout_info(ptr_width)?,
+            Ty::RawPtr(inner, _) | Ty::Ref(inner, _) if !inner.is_sized() => {
+                // A pointer to an unsized type other than `[T]` / `str` (e.g. a struct with a
+                // slice tail) would be wide, but Anneal models no such pointee.
+                return Err(LayoutError::IllFormed(
+                    "pointers to unsized types other than [T] and str are not supported",
+                ));
+            }
             Ty::Bool
             | Ty::Char
             | Ty::Int(_)
@@ -1012,13 +1302,20 @@ impl Ty {
         self.contains_niche_for(PtrWidth::Bits64)
     }
 
-    /// [`Ty::contains_niche`] under an explicit `ptr_width`.
+    /// [`Ty::contains_niche`] under an explicit `ptr_width`. References (thin or wide) and
+    /// function pointers expose their null niche; raw pointers (thin or wide) have none.
     pub fn contains_niche_for(&self, ptr_width: PtrWidth) -> bool {
         match self {
-            Ty::Bool | Ty::Char | Ty::Ref(_, _) => true,
+            Ty::Bool | Ty::Char | Ty::Ref(_, _) | Ty::FnPtr { .. } => true,
             Ty::Array(elem, count) => *count > 0 && elem.contains_niche_for(ptr_width),
-            Ty::Tuple(fields) => fields.iter().any(|f| f.contains_niche_for(ptr_width)),
-            Ty::Int(_) | Ty::Uint(_) | Ty::RawPtr(_, _) | Ty::Never => false,
+            Ty::Slice(elem) => elem.contains_niche_for(ptr_width),
+            Ty::Tuple(_) | Ty::Closure { .. } => {
+                let fields = self.tuple_like_fields().unwrap_or_default();
+                fields.iter().any(|f| f.contains_niche_for(ptr_width))
+            }
+            Ty::Int(_) | Ty::Uint(_) | Ty::RawPtr(_, _) | Ty::Never | Ty::Str | Ty::FnDef(_) => {
+                false
+            }
             Ty::Adt(def) => def.contains_niche_for(ptr_width),
         }
     }
@@ -1058,15 +1355,24 @@ impl Ty {
     ///
     /// A `Ty::Adt` must have an exact, well-formed layout and be canonical per
     /// [`AdtDef::has_canonical_byte_layout`].
+    ///
+    /// A wide pointer's byte image is its data pointer followed by its `usize` metadata, so
+    /// (well-formed) wide pointers are canonical, as are function pointers, function items
+    /// (no bytes), and closures whose upvar tuple is canonical. The unsized `[T]` and `str`
+    /// have no byte layout.
     pub fn has_canonical_byte_layout(&self, ptr_width: PtrWidth) -> bool {
         match self {
             Ty::Bool
             | Ty::Char
             | Ty::Int(_)
             | Ty::Uint(_)
-            | Ty::RawPtr(_, _)
-            | Ty::Ref(_, _)
-            | Ty::Never => true,
+            | Ty::Never
+            | Ty::FnDef(_) => true,
+            Ty::RawPtr(_, _) | Ty::Ref(_, _) | Ty::FnPtr { .. } => {
+                self.layout_for(ptr_width).is_ok()
+            }
+            Ty::Slice(_) | Ty::Str => false,
+            Ty::Closure { upvars, .. } => Ty::Tuple(upvars.to_vec()).has_canonical_byte_layout(ptr_width),
             Ty::Array(elem, _) => {
                 self.layout_for(ptr_width).is_ok() && elem.has_canonical_byte_layout(ptr_width)
             }
@@ -1554,6 +1860,61 @@ impl AdtDef {
         }
     }
 
+    /// The null-pointer optimization of an `Option`-like enum (`Option<&T>`, `Option<&[T]>`,
+    /// `Option<&str>`, `Option<fn(..) -> R>`, and any enum of the same shape), if this enum
+    /// has it: a tagless `#[repr(Rust)]` enum without `repr(align)` or `scalar_valid_range`
+    /// with exactly two variants, one (the *null* variant) whose fields are all inhabited
+    /// 1-ZSTs, and the other (the *payload* variant) whose fields are inhabited 1-ZSTs except
+    /// for exactly one *payload* field of a type with a null niche ([`Ty::has_null_niche`]: a
+    /// thin or wide reference, or a function pointer) and an exact layout.
+    ///
+    /// `rustc` lays such an enum out exactly like its payload: same size and alignment, every
+    /// field at offset `0`, and the null data pointer (the payload's first word, `0`)
+    /// represents the null variant, every non-null one the payload variant. (For a wide
+    /// payload, the metadata word of the null variant is uninitialized.)
+    pub fn null_pointer_niche(&self, ptr_width: PtrWidth) -> Option<NullPointerNiche> {
+        let AdtKind::Enum {
+            tag_ty: None,
+            variants,
+        } = &self.kind
+        else {
+            return None;
+        };
+        if variants.len() != 2 || self.repr != AdtRepr::rust() || self.scalar_valid_range.is_some()
+        {
+            return None;
+        }
+        let is_one_zst = |ty: &Ty| ty.layout_info(ptr_width).is_ok_and(|l| l.is_one_zst());
+        let inhabited = |fields: &[Ty]| fields.iter().all(|f| f.is_inhabited_for(ptr_width));
+        for (payload_variant, null_variant) in [(0, 1), (1, 0)] {
+            let null_fields = &variants[null_variant].fields;
+            let payload_fields = &variants[payload_variant].fields;
+            if !null_fields.iter().all(is_one_zst)
+                || !inhabited(null_fields)
+                || !inhabited(payload_fields)
+            {
+                continue;
+            }
+            let mut non_zst = payload_fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !is_one_zst(f));
+            let (Some((payload_field, payload_ty)), None) = (non_zst.next(), non_zst.next()) else {
+                continue;
+            };
+            if payload_ty.has_null_niche()
+                && payload_ty.layout_info(ptr_width).is_ok_and(|l| l.exact)
+            {
+                return Some(NullPointerNiche {
+                    null_variant,
+                    payload_variant,
+                    payload_field,
+                });
+            }
+        }
+        None
+    }
+
     /// Returns true if this is an enum whose value stores a tag: an explicit `tag_ty`, a
     /// tagless `#[repr(C)]` enum (a C `int` tag, even for a single variant), or a tagless enum
     /// with more than one present variant (see the layout model). An enum value built
@@ -1733,6 +2094,10 @@ impl AdtDef {
                             repr_align,
                             ptr_width,
                         )?
+                    } else if let Some(niche) = self.null_pointer_niche(ptr_width) {
+                        // Null-pointer optimization: exactly the payload pointer's layout.
+                        variants[niche.payload_variant].fields[niche.payload_field]
+                            .layout_info(ptr_width)?
                     } else {
                         match self.untagged_present_variants().as_deref() {
                             // Only absent variants: laid out like `!` (`repr(align)` is ignored).
@@ -1786,7 +2151,8 @@ impl AdtDef {
     /// declaration-order offsets only when the fields' tuple is canonical
     /// ([`Ty::has_canonical_byte_layout`]); enum variant fields per the tagged layouts of
     /// [`AdtDef`] (or the struct rules for the present variant of an enum laid out without a
-    /// tag, whose absent variants' fields sit at `0`). Every other case is
+    /// tag, whose absent variants' fields sit at `0`; every field of a null-pointer-optimized
+    /// enum, see [`AdtDef::null_pointer_niche`], sits at `0`). Every other case is
     /// [`LayoutError::Unspecified`]. Every `Ok(off)` satisfies
     /// `off + size_of(field) <= size_of(self)` and `off % align_of(field) == 0`.
     pub fn field_offset(
@@ -1823,6 +2189,8 @@ impl AdtDef {
                 {
                     Ok(0)
                 }
+                // The payload pointer and every 1-ZST field of a null-pointer-optimized enum.
+                _ if self.null_pointer_niche(ptr_width).is_some() => Ok(0),
                 _ => Err(LayoutError::Unspecified),
             },
             AdtKind::Enum {
@@ -1925,7 +2293,9 @@ impl AdtDef {
     ///   ([`AdtDef::univariant_index`]) under the struct rules for their present variant,
     ///   and explicit-tag enums whose every variant's byte image is exactly the tag
     ///   followed by its canonical, pointer-free fields without any padding (so all variants
-    ///   have the enum's full size).
+    ///   have the enum's full size);
+    /// - null-pointer-optimized enums ([`AdtDef::null_pointer_niche`]), whose byte image is
+    ///   their payload pointer's (the null data pointer encodes the dataless variant).
     pub fn has_canonical_byte_layout(&self, ptr_width: PtrWidth) -> bool {
         let Ok(info) = self.layout_info(ptr_width) else {
             return false;
@@ -1953,7 +2323,10 @@ impl AdtDef {
                     Some([v]) => {
                         struct_like_canonical(&variants[*v].fields, self.repr.kind, info.size, ptr_width)
                     }
-                    _ => false,
+                    _ => self.null_pointer_niche(ptr_width).is_some_and(|niche| {
+                        variants[niche.payload_variant].fields[niche.payload_field]
+                            .has_canonical_byte_layout(ptr_width)
+                    }),
                 },
                 Some(tag) => {
                     let tag_size = tag.size_bytes(ptr_width);
@@ -2296,6 +2669,90 @@ impl From<String> for CalleeSymbol {
     }
 }
 
+/// Allocation id of the provenance of every reified function pointer
+/// ([`fn_ptr_provenance`]). It is reserved: it never names a frame's synthetic local
+/// allocation (`1..=locals`) or the opaque provenance of a caller frame's exposed locals
+/// (`u64::MAX`), so a function pointer never resolves to (or aliases) stack memory.
+pub const FN_PTR_ALLOC_ID: u64 = u64::MAX - 1;
+
+/// First address of the synthetic function-pointer region ([`fn_ptr_addr`]).
+pub const FN_PTR_REGION_START: u64 = 0x100;
+
+/// End (exclusive) of the synthetic function-pointer region ([`fn_ptr_addr`]): the first
+/// page, which no synthetic stack allocation ever uses (every frame's allocations start at or
+/// above `0x1000`, see `StatementEvalState::frame_addr_base`), so function addresses never lie
+/// inside a stack allocation on either pointer width.
+pub const FN_PTR_REGION_END: u64 = 0x1000;
+
+/// Deterministic 64-bit FNV-1a hash of a callee symbol's name: the tag of its function
+/// pointer provenance ([`fn_ptr_provenance`]).
+fn fn_ptr_tag(symbol: &CalleeSymbol) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    symbol
+        .as_str()
+        .bytes()
+        .fold(OFFSET_BASIS, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+}
+
+/// Address of the function pointer reified from `symbol` (`ReifyFnPointer` /
+/// `ClosureFnPointer`): a deterministic function of the symbol in the synthetic
+/// function-pointer region `FN_PTR_REGION_START..FN_PTR_REGION_END` (non-null, valid on both
+/// pointer widths, and disjoint from every synthetic stack allocation). As in Rust, distinct
+/// functions are not guaranteed distinct addresses; a function pointer's identity is its
+/// provenance ([`fn_ptr_provenance`]).
+pub fn fn_ptr_addr(symbol: &CalleeSymbol) -> u64 {
+    FN_PTR_REGION_START + fn_ptr_tag(symbol) % (FN_PTR_REGION_END - FN_PTR_REGION_START)
+}
+
+/// Registry from function-pointer provenance tags to their symbols, used only to decode a
+/// function pointer from its bytes or from a raw pointer (the inverse of the deterministic
+/// [`fn_ptr_tag`]); registration order never affects any address or tag.
+fn fn_ptr_registry() -> &'static std::sync::Mutex<std::collections::BTreeMap<u64, CalleeSymbol>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<u64, CalleeSymbol>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+/// Provenance `{ alloc_id: FN_PTR_ALLOC_ID, tag: fnv1a64(symbol) }` of the function pointer
+/// reified from `symbol`, which is recorded so the pointer can be decoded again
+/// ([`fn_ptr_symbol`]). `None` only if a different symbol with the same 64-bit tag was
+/// recorded before (a hash collision, which reifying coercions report as unsupported rather
+/// than conflate the two functions).
+pub fn fn_ptr_provenance(symbol: &CalleeSymbol) -> Option<Provenance> {
+    let tag = fn_ptr_tag(symbol);
+    let mut registry = fn_ptr_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registered = registry.entry(tag).or_insert_with(|| symbol.clone());
+    (registered == symbol).then_some(Provenance {
+        alloc_id: FN_PTR_ALLOC_ID,
+        tag,
+    })
+}
+
+/// Returns true if `prov` is the provenance of a function pointer (allocation id
+/// [`FN_PTR_ALLOC_ID`]).
+pub fn is_fn_ptr_provenance(prov: &Provenance) -> bool {
+    prov.alloc_id == FN_PTR_ALLOC_ID
+}
+
+/// The symbol whose function pointer carries the provenance `prov` (see
+/// [`fn_ptr_provenance`]), or `None` for any other provenance.
+pub fn fn_ptr_symbol(prov: &Provenance) -> Option<CalleeSymbol> {
+    if !is_fn_ptr_provenance(prov) {
+        return None;
+    }
+    let registry = fn_ptr_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .get(&prov.tag)
+        .filter(|symbol| fn_ptr_tag(symbol) == prov.tag)
+        .cloned()
+}
+
 /// Declarative target of a direct call (the callee of a [`Constant::FnDef`] function item).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CallTarget {
@@ -2437,8 +2894,12 @@ pub enum CastKind {
     IntToInt,
     /// Unicode scalar (`char`) to integer conversion (`'A' as u8`, `c as i32`).
     CharToInt,
-    /// Raw pointer type change (`*const u8 as *const i32`).
+    /// Raw pointer type change (`*const u8 as *const i32`): thin to thin, wide to thin
+    /// (dropping the metadata), or wide to wide (keeping the metadata unchanged).
     PtrToPtr,
+    /// Function pointer to thin raw pointer (`f as *const ()`), keeping the function's
+    /// address and provenance.
+    FnPtrToPtr,
     /// Bitwise reinterpretation (`core::mem::transmute`).
     Transmute,
     /// Subtyping coercion inserted by `rustc` (`CastKind::Subtype`). Anneal MIR types carry no
@@ -2449,12 +2910,65 @@ pub enum CastKind {
 }
 
 /// Built-in pointer coercion flavor for `CastKind::PointerCoercion`.
+///
+/// Version-specific `rustc` spellings map onto these variants in thin adapters such as
+/// [`crate::rustc_v2026_06_01::lower_pointer_coercion_kind_v2026_06_01`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PointerCoercionKind {
-    /// `*mut T -> *const T` (same pointee).
+    /// `*mut T -> *const T` (same pointee, thin or slice-like).
     MutToConstPointer,
     /// `*const [T; N] -> *const T` / `*mut [T; N] -> *mut T` (mutability preserved).
     ArrayToPointer,
+    /// Array-to-slice unsizing (`&[T; N] -> &[T]`, `&mut [T; N] -> &[T] | &mut [T] |
+    /// *const [T] | *mut [T]`, `&[T; N] -> *const [T]`, `*mut [T; N] -> *const [T] | *mut [T]`,
+    /// `*const [T; N] -> *const [T]`), attaching the length `N` as metadata.
+    Unsize,
+    /// Function item to function pointer of either safety (the unparameterized
+    /// `ReifyFnPointer` coercion); an `unsafe` callee is never reified to a safe pointer.
+    ReifyFnPointer,
+    /// Function item to function pointer whose safety must be the given one
+    /// (`ReifyFnPointer(Safety)`).
+    ReifyFnPointerWithSafety(Safety),
+    /// Non-capturing closure (or function item) to a function pointer whose safety must be the
+    /// given one (`ClosureFnPointer(Safety)`).
+    ClosureFnPointer(Safety),
+    /// Non-capturing closure (or function item) to a function pointer of either safety (the
+    /// unparameterized `ClosureFnPointer` coercion).
+    ClosureFnPointerAnySafety,
+    /// Safe function pointer to `unsafe` function pointer with identical inputs and output.
+    UnsafeFnPointer,
+}
+
+impl PointerCoercionKind {
+    /// Returns true for the coercions producing a function pointer from a function item or a
+    /// closure (`ReifyFnPointer*` and `ClosureFnPointer*`).
+    pub const fn is_reify(self) -> bool {
+        matches!(
+            self,
+            PointerCoercionKind::ReifyFnPointer
+                | PointerCoercionKind::ReifyFnPointerWithSafety(_)
+                | PointerCoercionKind::ClosureFnPointer(_)
+                | PointerCoercionKind::ClosureFnPointerAnySafety
+        )
+    }
+
+    /// Returns true for the closure coercions (`ClosureFnPointer*`).
+    pub const fn is_closure_reify(self) -> bool {
+        matches!(
+            self,
+            PointerCoercionKind::ClosureFnPointer(_) | PointerCoercionKind::ClosureFnPointerAnySafety
+        )
+    }
+
+    /// The function pointer safety a reifying coercion requires (`None`: either safety;
+    /// `rustc`'s `reifyCoercionSafetyCompatible`), or `None` for the other coercions.
+    pub const fn required_fn_ptr_safety(self) -> Option<Safety> {
+        match self {
+            PointerCoercionKind::ReifyFnPointerWithSafety(safety)
+            | PointerCoercionKind::ClosureFnPointer(safety) => Some(safety),
+            _ => None,
+        }
+    }
 }
 
 /// Nullary operation flavor for `Rvalue::NullaryOp`.

@@ -22,16 +22,20 @@
 //!   evaluated message;
 //! - `Call` evaluates the callee and arguments left to right (a `Move` of a bare local
 //!   deinitializes it), checks the destination place, and then runs the callee: a function
-//!   item of an inline intrinsic ([`CallTarget::Intrinsic`], see [`IntrinsicOp`]) executes in
-//!   the calling frame ([`eval_intrinsic_call`]); a function item of a symbol linked in a
-//!   [`CallTable`] runs the callee's body in a new frame (under
+//!   item (a [`Constant::FnDef`](crate::ir::Constant::FnDef) or a value of type
+//!   [`Ty::FnDef`]) of an inline intrinsic ([`CallTarget::Intrinsic`], see [`IntrinsicOp`])
+//!   executes in the calling frame ([`eval_intrinsic_call`]); a function item of a symbol
+//!   linked in a [`CallTable`], or a function pointer ([`Ty::FnPtr`], an indirect call) to
+//!   one whose signature it matches ([`LinkedCallee::check_fn_ptr_signature`]), runs the
+//!   callee's body in a new frame (under
 //!   [`eval_cfg_in_state_with_call_table`], [`eval_lowered_body_cfg_with_call_table`], or
 //!   [`eval_lowered_body_cfg_with_call_table_and_calls`]); any other callee goes to the
 //!   caller-supplied call handler (a [`CallHandler`], or an [`ExternalCallHandler`] given the
 //!   [`ExternalCall`] under a call table; without a handler: [`CfgEvalError::UnsupportedCall`],
-//!   or [`CfgEvalError::UnknownCallee`] for an unlinked symbol). A returned value must be well
-//!   formed and of the destination's type, and is written to the destination before jumping
-//!   to `target` (a return from a call without `target` is undefined behavior); a panicking
+//!   or [`CfgEvalError::UnknownCallee`] for an unlinked symbol or function pointer target). A
+//!   returned value must be well formed and of the destination's type, and is written to the
+//!   destination before jumping to `target` (a return from a call without `target` is
+//!   undefined behavior); a panicking
 //!   call leaves the destination unchanged. `UnreachableUnchecked` is undefined behavior
 //!   ([`CfgEvalError::UnreachableReached`]), `Abort` ends the evaluation with
 //!   [`CfgEvalOutcome::Terminated`] without running any cleanup block, and `PanicUnwind`
@@ -63,16 +67,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
     AssertMessage, BinOp, Body, CallTarget, CalleeSymbol, IntrinsicOp, Operand, Place,
-    PointerValue, Provenance, PtrWidth, SwitchTargets, Terminator, Ty, UintTy, UnwindAction,
+    PointerValue, Provenance, PtrWidth, Safety, SwitchTargets, Terminator, Ty, UintTy,
+    UnwindAction,
 };
-use crate::lower::cast::CastEvalError;
+use crate::lower::cast::{CastEvalError, LoweredCast, is_valid_pointer_coercion, reify_target};
 use crate::lower::intrinsic::{
     IntrinsicOutcome, IntrinsicTypeError, check_intrinsic_call_types, eval_intrinsic_call,
 };
 use crate::lower::rvalue::{
-    LocalSlotState, LoweredBasicBlock, LoweredBody, MirValue, RvalueEvalError, RvalueLowerError,
-    StatementEvalState, check_value_well_formed, eval_lowered_statement, lower_layout_error,
-    lower_operand_ty, mir_value_matches_ty, resolve_place_ty,
+    LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredRvalue, LoweredStatement, MirValue,
+    RvalueEvalError, RvalueLowerError, StatementEvalState, check_value_well_formed, eval_constant,
+    eval_lowered_statement, lower_layout_error, lower_operand_ty, mir_value_matches_ty,
+    resolve_place_ty,
 };
 
 /// Terminator-specific static lowering error (wrapped in
@@ -119,6 +125,9 @@ pub enum TerminatorLowerError {
         op: IntrinsicOp,
         reason: &'static str,
     },
+    /// Indirect `Call` through a function pointer (`Ty::FnPtr { inputs, output, .. }`) whose
+    /// argument types differ from `inputs` or whose destination type differs from `output`.
+    InvalidFnPtrCall { reason: &'static str },
 }
 
 impl std::fmt::Display for TerminatorLowerError {
@@ -182,6 +191,9 @@ impl std::fmt::Display for TerminatorLowerError {
             TerminatorLowerError::InvalidIntrinsicCall { op, reason } => {
                 write!(f, "ill-typed call of intrinsic {op}: {reason}")
             }
+            TerminatorLowerError::InvalidFnPtrCall { reason } => {
+                write!(f, "ill-typed call through a function pointer: {reason}")
+            }
         }
     }
 }
@@ -237,13 +249,14 @@ pub enum LoweredTerminator {
 }
 
 impl LoweredTerminator {
-    /// Direct [`CallTarget`] if this terminator is a `Call` of a [`Constant::FnDef`] function
-    /// item (`None` for indirect `Call`s and non-`Call` terminators).
+    /// Direct [`CallTarget`] if this terminator is a `Call` of a function item: a
+    /// [`Constant::FnDef`] or a function item value of type [`Ty::FnDef`] (`None` for calls
+    /// through function pointers and non-`Call` terminators).
     ///
     /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
     pub fn call_target(&self) -> Option<&CallTarget> {
         match self {
-            LoweredTerminator::Call { func, .. } => func.call_target(),
+            LoweredTerminator::Call { func, func_ty, .. } => call_target_of(func, func_ty),
             _ => None,
         }
     }
@@ -492,7 +505,7 @@ pub fn lower_terminator(
                 check_normal_edge(*target)?;
             }
             check_unwind(*unwind)?;
-            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
+            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func, &func_ty) {
                 check_intrinsic_call_types(*op, &arg_tys, &dest_ty, ptr_width).map_err(|err| {
                     match err {
                         IntrinsicTypeError::Signature(reason) => {
@@ -501,6 +514,25 @@ pub fn lower_terminator(
                         IntrinsicTypeError::Layout { ty, error } => lower_layout_error(&ty, error),
                     }
                 })?;
+            }
+            // An indirect call through a function pointer passes exactly its parameter types
+            // and returns its output type.
+            if let Ty::FnPtr { inputs, output, .. } = &func_ty {
+                if arg_tys.len() != inputs.len() {
+                    return Err(invalid(TerminatorLowerError::InvalidFnPtrCall {
+                        reason: "argument count differs from the function pointer's parameter count",
+                    }));
+                }
+                if arg_tys[..] != inputs[..] {
+                    return Err(invalid(TerminatorLowerError::InvalidFnPtrCall {
+                        reason: "argument types differ from the function pointer's parameter types",
+                    }));
+                }
+                if dest_ty != **output {
+                    return Err(invalid(TerminatorLowerError::InvalidFnPtrCall {
+                        reason: "destination type differs from the function pointer's return type",
+                    }));
+                }
             }
             Ok(LoweredTerminator::Call {
                 func: func.clone(),
@@ -1030,7 +1062,7 @@ pub fn eval_lowered_terminator(
                 *target,
                 state,
             )?;
-            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
+            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func, func_ty) {
                 let op = *op;
                 match eval_intrinsic_call(op, &arg_vals, arg_tys, dest_ty, state)
                     .map_err(term_err)?
@@ -1149,11 +1181,16 @@ fn check_goto(
     }
 }
 
-/// The call target of a function-item callee operand ([`Constant::FnDef`]).
+/// The call target of a function-item callee operand `func` of type `func_ty`: a
+/// [`Constant::FnDef`], or a `Copy`/`Move` of a zero-sized function item value, whose type
+/// [`Ty::FnDef`] names its callee (a direct call either way).
 ///
 /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
-fn call_target_of(func: &Operand) -> Option<&CallTarget> {
-    func.call_target()
+fn call_target_of<'a>(func: &'a Operand, func_ty: &'a Ty) -> Option<&'a CallTarget> {
+    func.call_target().or(match func_ty {
+        Ty::FnDef(target) => Some(target),
+        _ => None,
+    })
 }
 
 /// A call's evaluated callee, arguments, and destination (see [`prepare_call`]).
@@ -1283,7 +1320,7 @@ const CROSS_FRAME_POINTER: &str = "a pointer into a frame-local synthetic alloca
 /// `alloc_id - 1`).
 fn frame_local_pointer(val: &MirValue, limit: usize) -> Option<PointerValue> {
     match val {
-        MirValue::Ptr { ptr, .. } => ptr
+        MirValue::Ptr { ptr, .. } | MirValue::WidePtr { data: ptr, .. } => ptr
             .provenance
             .filter(|prov| usize::try_from(prov.alloc_id).is_ok_and(|id| id >= 1 && id <= limit))
             .map(|_| *ptr),
@@ -1310,7 +1347,12 @@ fn frame_local_pointer(val: &MirValue, limit: usize) -> Option<PointerValue> {
             };
             active_val.and_then(|field| frame_local_pointer(field, limit))
         }
-        MirValue::Int { .. } | MirValue::Bool(_) | MirValue::Char(_) | MirValue::Unit => None,
+        // A function pointer's provenance is global (never a frame-local allocation).
+        MirValue::Int { .. }
+        | MirValue::Bool(_)
+        | MirValue::Char(_)
+        | MirValue::Unit
+        | MirValue::FnPtr { .. } => None,
     }
 }
 
@@ -1388,6 +1430,59 @@ pub struct LinkedCallee {
     pub arg_count: usize,
     /// The callee's lowered body.
     pub body: LoweredBody,
+    /// Whether the callee is an `unsafe fn` (which cannot be reified to, or called through, a
+    /// safe function pointer).
+    pub safety: Safety,
+}
+
+impl LinkedCallee {
+    /// Checks that this callee, linked as `symbol`, can be reified to or called through a
+    /// function pointer of type `fn_ptr_ty` (`Trusted`'s `checkCalleeSig`): its parameter
+    /// count, parameter types (`_1..=arg_count`), and return type (`_0`) must be the function
+    /// pointer's, and an `unsafe fn` needs an `unsafe` function pointer
+    /// ([`RvalueEvalError::FnPtrSignatureMismatch`] otherwise, undefined behavior).
+    pub fn check_fn_ptr_signature(
+        &self,
+        symbol: &CalleeSymbol,
+        fn_ptr_ty: &Ty,
+    ) -> Result<(), RvalueEvalError> {
+        let Ty::FnPtr {
+            inputs,
+            output,
+            safety,
+        } = fn_ptr_ty
+        else {
+            return Err(RvalueEvalError::TypeMismatch(
+                "function pointer signature check requires a function pointer type",
+            ));
+        };
+        let mismatch = |reason: &'static str| RvalueEvalError::FnPtrSignatureMismatch {
+            callee: symbol.clone(),
+            reason,
+        };
+        if self.arg_count != inputs.len() {
+            return Err(mismatch(
+                "the callee's parameter count differs from the function pointer's",
+            ));
+        }
+        let decls = &self.body.local_decls;
+        if decls.get(1..=self.arg_count) != Some(&inputs[..]) {
+            return Err(mismatch(
+                "the callee's parameter types differ from the function pointer's",
+            ));
+        }
+        if decls.first() != Some(&**output) {
+            return Err(mismatch(
+                "the callee's return type differs from the function pointer's",
+            ));
+        }
+        if self.safety == Safety::Unsafe && *safety == Safety::Safe {
+            return Err(mismatch(
+                "an unsafe function cannot be reified to or called through a safe function pointer",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Multi-callee call table: the linked intra-crate callees of an evaluation, keyed by
@@ -1397,6 +1492,13 @@ pub struct LinkedCallee {
 /// linked symbol ([`CallTarget::Fn`]) in a new frame of that callee's body, on an explicit
 /// (heap-allocated) frame stack, so neither self nor mutual recursion can overflow the Rust
 /// stack:
+/// - **Function pointers.** An indirect `Call` through a function pointer whose target is
+///   linked runs that callee likewise, once the evaluated callee and arguments pass
+///   [`LinkedCallee::check_fn_ptr_signature`] against the pointer's type
+///   ([`RvalueEvalError::FnPtrSignatureMismatch`] otherwise, undefined behavior); reifying a
+///   linked function item or closure (`ReifyFnPointer*` / `ClosureFnPointer*`) checks the
+///   same signature when the coercion executes. An unlinked target is an [`ExternalCall`]
+///   naming it ([`ExternalCall::callee`]), or [`CfgEvalError::UnknownCallee`].
 /// - **Arguments.** After the caller has evaluated the callee, the arguments, and the
 ///   destination exactly as for any call, the callee frame starts with `_1..=arg_count` set to
 ///   the arguments, which must match the parameter types and be well formed; the argument
@@ -1479,6 +1581,18 @@ impl CallTable {
         self
     }
 
+    /// This table with the `unsafe fn` `body` (taking `arg_count` parameters) linked as
+    /// `symbol`.
+    pub fn with_unsafe_callee(
+        mut self,
+        symbol: impl Into<CalleeSymbol>,
+        arg_count: usize,
+        body: LoweredBody,
+    ) -> Self {
+        self.insert_with_safety(symbol, arg_count, body, Safety::Unsafe);
+        self
+    }
+
     /// Maximum number of nested callee frames.
     pub fn max_call_depth(&self) -> usize {
         self.max_call_depth
@@ -1489,16 +1603,34 @@ impl CallTable {
         self.max_call_depth = max_call_depth;
     }
 
-    /// Links `body` (taking `arg_count` parameters) as `symbol`, returning the callee it
-    /// replaces.
+    /// Links the safe `body` (taking `arg_count` parameters) as `symbol`, returning the callee
+    /// it replaces.
     pub fn insert(
         &mut self,
         symbol: impl Into<CalleeSymbol>,
         arg_count: usize,
         body: LoweredBody,
     ) -> Option<LinkedCallee> {
-        self.callees
-            .insert(symbol.into(), LinkedCallee { arg_count, body })
+        self.insert_with_safety(symbol, arg_count, body, Safety::Safe)
+    }
+
+    /// Links `body` (taking `arg_count` parameters, an `unsafe fn` iff `safety` is
+    /// [`Safety::Unsafe`]) as `symbol`, returning the callee it replaces.
+    pub fn insert_with_safety(
+        &mut self,
+        symbol: impl Into<CalleeSymbol>,
+        arg_count: usize,
+        body: LoweredBody,
+        safety: Safety,
+    ) -> Option<LinkedCallee> {
+        self.callees.insert(
+            symbol.into(),
+            LinkedCallee {
+                arg_count,
+                body,
+                safety,
+            },
+        )
     }
 
     /// The callee linked as `symbol`.
@@ -1549,8 +1681,10 @@ pub struct ExternalCall<'a> {
     pub call_stack: &'a [CallSite],
     /// The calling block, in the body of the innermost frame.
     pub bb: usize,
-    /// The unlinked symbol a direct call names (`None` when the callee operand is not a direct
-    /// `Constant::FnDef(CallTarget::Fn(_))`, e.g. an indirect `Copy`/`Move` or pointer constant).
+    /// The unlinked symbol the call names: a direct function item callee (a
+    /// `Constant::FnDef(CallTarget::Fn(_))`, or a function item value of type
+    /// `Ty::FnDef(CallTarget::Fn(_))`), or the target of the function pointer an indirect call
+    /// evaluated its callee to (`None` for any other callee).
     pub callee: Option<&'a CalleeSymbol>,
     /// The evaluated callee operand.
     pub func: &'a MirValue,
@@ -1647,14 +1781,22 @@ enum BlockStep<'a> {
     Done(CfgEvalOutcome),
 }
 
-/// The linked callee that the terminator of `frame`'s current block calls, if any.
-fn linked_call_of<'a>(frame: &Frame<'_>, table: &'a CallTable) -> Option<&'a LinkedCallee> {
-    match frame.body.basic_blocks.get(frame.bb)?.terminator.as_ref()? {
-        LoweredTerminator::Call { func, .. } => match call_target_of(func)? {
-            CallTarget::Fn(symbol) => table.get(symbol),
-            CallTarget::Intrinsic(_) => None,
-        },
-        _ => None,
+/// Returns true if the terminator of `frame`'s current block may call a linked callee of
+/// `table`: a direct call of a linked symbol, or an indirect call through a function pointer
+/// (whose target is only known once the block's statements have run).
+fn may_call_linked(frame: &Frame<'_>, table: &CallTable) -> bool {
+    let Some(LoweredTerminator::Call { func, func_ty, .. }) = frame
+        .body
+        .basic_blocks
+        .get(frame.bb)
+        .and_then(|block| block.terminator.as_ref())
+    else {
+        return false;
+    };
+    match call_target_of(func, func_ty) {
+        Some(CallTarget::Fn(symbol)) => table.contains(symbol),
+        Some(CallTarget::Intrinsic(_)) => false,
+        None => func_ty.is_fn_ptr() && !table.is_empty(),
     }
 }
 
@@ -1672,13 +1814,17 @@ fn run_block<'a>(
         return Err(CfgEvalError::InvalidBlock { bb });
     };
     for (index, stmt) in block.statements.iter().enumerate() {
+        if let Some(table) = table {
+            check_reify_signature(stmt, &frame.state, table)
+                .map_err(|error| CfgEvalError::Statement { bb, index, error })?;
+        }
         eval_lowered_statement(stmt, &mut frame.state)
             .map_err(|error| CfgEvalError::Statement { bb, index, error })?;
     }
     let Some(term) = &block.terminator else {
         return Err(CfgEvalError::MissingTerminator { bb });
     };
-    let unlinked_symbol = match term {
+    let unlinked_symbol: Option<CalleeSymbol> = match term {
         LoweredTerminator::Call {
             func,
             func_ty,
@@ -1688,44 +1834,74 @@ fn run_block<'a>(
             dest_ty,
             target,
             unwind,
-        } => match (table, call_target_of(func)) {
-            (Some(table), Some(CallTarget::Fn(symbol))) => {
-                if let Some(callee) = table.get(symbol) {
-                    check_terminator_entry(body, bb, &frame.state, &frame.unwinding)?;
-                    let PreparedCall {
-                        arg_vals,
-                        dest_place,
-                        ..
-                    } = prepare_call(
-                        bb,
-                        func,
-                        func_ty,
-                        args,
-                        arg_tys,
-                        destination,
-                        dest_ty,
-                        *target,
-                        &mut frame.state,
-                    )?;
-                    return Ok(BlockStep::Call {
-                        callee,
-                        args: arg_vals,
-                        pending: PendingCall {
-                            site: CallSite {
-                                bb,
-                                callee: symbol.clone(),
+        } => {
+            // The linked symbol a direct call names, or that the function pointer an indirect
+            // call reads designates (peeked without side effects; `prepare_call` evaluates
+            // the callee operand for real, faulting on an invalid one).
+            let (symbol, indirect) = match call_target_of(func, func_ty) {
+                Some(CallTarget::Fn(symbol)) => (Some(symbol.clone()), false),
+                Some(CallTarget::Intrinsic(_)) => (None, false),
+                None if func_ty.is_fn_ptr() => match peek_operand(func, &frame.state) {
+                    Some(MirValue::FnPtr { target, .. }) => (Some(target), true),
+                    _ => (None, true),
+                },
+                None => (None, false),
+            };
+            match (table, symbol) {
+                (Some(table), Some(symbol)) => {
+                    if let Some(callee) = table.get(&symbol) {
+                        check_terminator_entry(body, bb, &frame.state, &frame.unwinding)?;
+                        let PreparedCall {
+                            func_val,
+                            arg_vals,
+                            dest_place,
+                        } = prepare_call(
+                            bb,
+                            func,
+                            func_ty,
+                            args,
+                            arg_tys,
+                            destination,
+                            dest_ty,
+                            *target,
+                            &mut frame.state,
+                        )?;
+                        if indirect {
+                            // The evaluated function pointer must still designate `symbol`,
+                            // and the linked callee must have its signature.
+                            if !matches!(&func_val, MirValue::FnPtr { target, .. } if *target == symbol)
+                            {
+                                return Err(CfgEvalError::Terminator {
+                                    bb,
+                                    error: RvalueEvalError::TypeMismatch(
+                                        "indirect callee changed while evaluating the call",
+                                    ),
+                                });
+                            }
+                            callee
+                                .check_fn_ptr_signature(&symbol, func_ty)
+                                .map_err(|error| CfgEvalError::Terminator { bb, error })?;
+                        }
+                        return Ok(BlockStep::Call {
+                            callee,
+                            args: arg_vals,
+                            pending: PendingCall {
+                                site: CallSite {
+                                    bb,
+                                    callee: symbol,
+                                },
+                                destination: dest_place,
+                                dest_ty: dest_ty.clone(),
+                                target: *target,
+                                unwind: *unwind,
                             },
-                            destination: dest_place,
-                            dest_ty: dest_ty.clone(),
-                            target: *target,
-                            unwind: *unwind,
-                        },
-                    });
+                        });
+                    }
+                    Some(symbol)
                 }
-                Some(symbol)
+                _ => None,
             }
-            _ => None,
-        },
+        }
         _ => None,
     };
     // Any other `Call` reaching the handler is an `ExternalCall` of this frame.
@@ -1734,8 +1910,8 @@ fn run_block<'a>(
         None => None,
         Some(handler) => {
             let callee = match term {
-                LoweredTerminator::Call { func, .. } => {
-                    func.call_target().and_then(CallTarget::as_callee)
+                LoweredTerminator::Call { func, func_ty, .. } => {
+                    call_target_of(func, func_ty).and_then(CallTarget::as_callee)
                 }
                 _ => None,
             };
@@ -1744,6 +1920,11 @@ fn run_block<'a>(
                     .iter()
                     .filter_map(|caller| caller.pending.as_ref().map(|p| p.site.clone()))
                     .collect();
+                // An indirect call names the target of the function pointer it evaluated.
+                let callee = callee.or(match func {
+                    MirValue::FnPtr { target, .. } => Some(target),
+                    _ => None,
+                });
                 handler(&ExternalCall {
                     call_stack: &call_stack,
                     bb,
@@ -1771,11 +1952,73 @@ fn run_block<'a>(
         Err(CfgEvalError::UnsupportedCall { bb }) => Err(match unlinked_symbol {
             Some(symbol) => CfgEvalError::UnknownCallee {
                 bb,
-                callee: symbol.clone(),
+                callee: symbol,
             },
             None => CfgEvalError::UnsupportedCall { bb },
         }),
         Err(error) => Err(error),
+    }
+}
+
+/// The value of the operand `op` in `state` if it can be read without side effects (a
+/// `Copy` or `Move` place is read, not moved, and a failed read is `None`).
+fn peek_operand(op: &Operand, state: &StatementEvalState) -> Option<MirValue> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => state.read_place(place).ok(),
+        Operand::Constant(_) => None,
+    }
+}
+
+/// Under a call table, checks that a statement reifying a linked function item or closure
+/// into a function pointer (`ReifyFnPointer*` / `ClosureFnPointer*`) gives it the callee's
+/// signature ([`LinkedCallee::check_fn_ptr_signature`]): creating a function pointer of
+/// another signature is undefined behavior. Unlinked callees are not checked, and ill-typed
+/// or unreadable source operands defer to [`eval_lowered_statement`] so operand faults
+/// (`DeadLocal`, `UninitializedLocal`, `TypeMismatch`) precede `checkCalleeSig` as in
+/// `Trusted`'s `evalReifyFnPointer`.
+fn check_reify_signature(
+    stmt: &LoweredStatement,
+    state: &StatementEvalState,
+    table: &CallTable,
+) -> Result<(), RvalueEvalError> {
+    let LoweredStatement::Assign {
+        rvalue:
+            LoweredRvalue::Cast {
+                cast:
+                    LoweredCast::PointerCoercion {
+                        coercion,
+                        src_ty,
+                        target_ty,
+                        operand,
+                    },
+                ..
+            },
+        ..
+    } = stmt
+    else {
+        return Ok(());
+    };
+    if (!coercion.is_reify() && !coercion.is_closure_reify())
+        || !is_valid_pointer_coercion(*coercion, src_ty, target_ty)
+    {
+        return Ok(());
+    }
+    let val = match operand {
+        Operand::Copy(place) | Operand::Move(place) => state.read_place(place),
+        Operand::Constant(c) => eval_constant(c, state.ptr_width),
+    };
+    let Ok(val) = val else {
+        return Ok(());
+    };
+    if !val.is_unit() || !mir_value_matches_ty(&val, src_ty) {
+        return Ok(());
+    }
+    let Ok(symbol) = reify_target(*coercion, operand, src_ty) else {
+        return Ok(());
+    };
+    match table.get(&symbol) {
+        Some(callee) => callee.check_fn_ptr_signature(&symbol, target_ty),
+        None => Ok(()),
     }
 }
 
@@ -1814,41 +2057,8 @@ fn restore_caller_exposed_provenance(
     limit: usize,
 ) {
     match val {
-        MirValue::Ptr { ptr, ty }
-            if ptr
-                .provenance
-                .is_some_and(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID) =>
-        {
-            if let Some(local_prov) =
-                caller_state.match_exposed_local_provenance(u128::from(ptr.addr), ty)
-            {
-                ptr.provenance = Some(local_prov);
-            } else if caller_state
-                .tracker
-                .exposed
-                .iter()
-                .any(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID)
-            {
-                // Keep `CALLER_EXPOSED_ALLOC_ID` for an outer caller frame lower on the stack.
-            } else if let Some(&ext_prov) = caller_state.tracker.exposed.iter().find(|prov| {
-                usize::try_from(prov.alloc_id)
-                    .is_ok_and(|id| id > caller_state.local_decls.len() && id <= limit)
-            }) {
-                ptr.provenance = Some(ext_prov);
-            } else {
-                ptr.provenance = caller_state.tracker.exposed.iter().copied().find(|prov| {
-                    prov.alloc_id
-                        .checked_sub(1)
-                        .and_then(|i| usize::try_from(i).ok())
-                        .is_some_and(|loc| {
-                            loc < caller_state.local_decls.len()
-                                && !matches!(
-                                    caller_state.slots.get(loc),
-                                    Some(LocalSlotState::Dead)
-                                )
-                        })
-                });
-            }
+        MirValue::Ptr { ptr, ty } | MirValue::WidePtr { data: ptr, ty, .. } => {
+            restore_caller_exposed_pointer(ptr, ty, caller_state, limit);
         }
         MirValue::Array { elements, .. } => {
             for element in elements {
@@ -1879,11 +2089,52 @@ fn restore_caller_exposed_provenance(
                 restore_caller_exposed_provenance(field, caller_state, limit);
             }
         }
-        MirValue::Ptr { .. }
-        | MirValue::Int { .. }
+        MirValue::Int { .. }
         | MirValue::Bool(_)
         | MirValue::Char(_)
-        | MirValue::Unit => {}
+        | MirValue::Unit
+        | MirValue::FnPtr { .. } => {}
+    }
+}
+
+/// [`restore_caller_exposed_provenance`] of one (thin or data) pointer `ptr` of type `ty`.
+fn restore_caller_exposed_pointer(
+    ptr: &mut PointerValue,
+    ty: &Ty,
+    caller_state: &StatementEvalState,
+    limit: usize,
+) {
+    if !ptr
+        .provenance
+        .is_some_and(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID)
+    {
+        return;
+    }
+    if let Some(local_prov) = caller_state.match_exposed_local_provenance(u128::from(ptr.addr), ty)
+    {
+        ptr.provenance = Some(local_prov);
+    } else if caller_state
+        .tracker
+        .exposed
+        .iter()
+        .any(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID)
+    {
+        // Keep `CALLER_EXPOSED_ALLOC_ID` for an outer caller frame lower on the stack.
+    } else if let Some(&ext_prov) = caller_state.tracker.exposed.iter().find(|prov| {
+        usize::try_from(prov.alloc_id)
+            .is_ok_and(|id| id > caller_state.local_decls.len() && id <= limit)
+    }) {
+        ptr.provenance = Some(ext_prov);
+    } else {
+        ptr.provenance = caller_state.tracker.exposed.iter().copied().find(|prov| {
+            prov.alloc_id
+                .checked_sub(1)
+                .and_then(|i| usize::try_from(i).ok())
+                .is_some_and(|loc| {
+                    loc < caller_state.local_decls.len()
+                        && !matches!(caller_state.slots.get(loc), Some(LocalSlotState::Dead))
+                })
+        });
     }
 }
 
@@ -2027,7 +2278,7 @@ fn eval_frames<'a>(
         let frame = &mut top_frame[0];
         if top == 0
             && let Some(table) = table
-            && linked_call_of(frame, table).is_some()
+            && may_call_linked(frame, table)
         {
             root_call_entry = Some(frame.state.clone());
         }

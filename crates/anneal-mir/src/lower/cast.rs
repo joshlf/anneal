@@ -10,8 +10,9 @@
 use std::collections::BTreeSet;
 
 use crate::ir::{
-    AdtDef, AdtKind, CastKind, LayoutError, Mutability, Operand, PointerCoercionKind, PointerValue,
-    Provenance, PtrWidth, ScalarTy, Ty,
+    AdtDef, AdtKind, CallTarget, CalleeSymbol, CastKind, Constant, LayoutError, Mutability,
+    NullPointerNiche, Operand, PointerCoercionKind, PointerValue, Provenance, PtrWidth, Safety,
+    ScalarTy, Ty,
 };
 
 /// Policy governing pointer-to-integer reinterpretation in `CastKind::Transmute`.
@@ -94,6 +95,19 @@ pub enum CastLowerError {
         ty: Ty,
         reason: &'static str,
     },
+    /// A by-value use (or transmute) of a dynamically sized type (`[T]`, `str`, or a type
+    /// containing one by value; see [`LayoutError::Unsized`]).
+    UnsizedType {
+        ty: Ty,
+    },
+    /// A `CastKind::PointerCoercion` whose source and target types (or operand) do not form a
+    /// valid coercion of its kind, with the violated rule.
+    InvalidPointerCoercion {
+        coercion: PointerCoercionKind,
+        src_ty: Ty,
+        target_ty: Ty,
+        reason: &'static str,
+    },
 }
 
 /// Maps a [`LayoutError`] of `ty` to the corresponding [`CastLowerError`].
@@ -105,6 +119,7 @@ pub(crate) fn cast_lower_layout_error(ty: &Ty, err: LayoutError) -> CastLowerErr
             ty: ty.clone(),
             reason,
         },
+        LayoutError::Unsized => CastLowerError::UnsizedType { ty: ty.clone() },
     }
 }
 
@@ -117,6 +132,7 @@ pub(crate) fn cast_eval_layout_error(ty: &Ty, err: LayoutError) -> CastEvalError
             ty: ty.clone(),
             reason,
         },
+        LayoutError::Unsized => CastEvalError::UnsizedType { ty: ty.clone() },
     }
 }
 
@@ -161,6 +177,20 @@ impl std::fmt::Display for CastLowerError {
             CastLowerError::IllFormedType { ty, reason } => {
                 write!(f, "type {ty:?} is ill-formed: {reason}")
             }
+            CastLowerError::UnsizedType { ty } => {
+                write!(f, "type {ty:?} is dynamically sized and cannot be used by value")
+            }
+            CastLowerError::InvalidPointerCoercion {
+                coercion,
+                src_ty,
+                target_ty,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "invalid {coercion:?} coercion from {src_ty:?} to {target_ty:?}: {reason}"
+                )
+            }
         }
     }
 }
@@ -201,8 +231,16 @@ pub enum LoweredCast {
         operand: Operand,
         target_ty: Ty,
     },
-    /// Raw pointer to raw pointer reinterpretation (`CastKind::PtrToPtr`).
+    /// Raw pointer to raw pointer reinterpretation (`CastKind::PtrToPtr`): thin to thin, wide
+    /// to thin (dropping the metadata), or wide to wide (keeping the metadata unchanged).
     PtrToPtr {
+        src_ty: Ty,
+        target_ty: Ty,
+        operand: Operand,
+    },
+    /// Function pointer to thin raw pointer (`CastKind::FnPtrToPtr`): the function's address
+    /// (offset `0`) with its function-pointer provenance.
+    FnPtrToPtr {
         src_ty: Ty,
         target_ty: Ty,
         operand: Operand,
@@ -224,8 +262,11 @@ pub enum LoweredCast {
         target_ty: Ty,
         operand: Operand,
     },
-    /// Built-in pointer coercion (`CastKind::PointerCoercion`); preserves address and
-    /// provenance.
+    /// Built-in pointer coercion (`CastKind::PointerCoercion`): preserves address and
+    /// provenance (`MutToConstPointer`, `ArrayToPointer`, `UnsafeFnPointer`), attaches the
+    /// array length (`Unsize`), or reifies a function item or closure into a function pointer
+    /// (`ReifyFnPointer*`, `ClosureFnPointer*`, whose target is named by the operand, see
+    /// [`reify_target`]).
     PointerCoercion {
         coercion: PointerCoercionKind,
         src_ty: Ty,
@@ -243,6 +284,7 @@ impl LoweredCast {
             | LoweredCast::IntToInt { operand, .. }
             | LoweredCast::CharToInt { operand, .. }
             | LoweredCast::PtrToPtr { operand, .. }
+            | LoweredCast::FnPtrToPtr { operand, .. }
             | LoweredCast::Transmute { operand, .. }
             | LoweredCast::Subtype { operand, .. }
             | LoweredCast::PointerCoercion { operand, .. } => operand,
@@ -266,32 +308,135 @@ pub fn is_subtype_compatible(src: &Ty, target: &Ty) -> bool {
 }
 
 /// Returns true if `coercion` is a valid `CastKind::PointerCoercion` from `src_ty` to
-/// `target_ty`.
+/// `target_ty`, as far as the types determine it:
+/// - `MutToConstPointer`: `*mut P -> *const P` (raw pointers, `P` thin or slice-like);
+/// - `ArrayToPointer`: `*m [T; N] -> *m T`;
+/// - `Unsize`: an array-to-slice pair ([`unsize_array_len`]);
+/// - `UnsafeFnPointer`: `fn(I..) -> O` to `unsafe fn(I..) -> O`;
+/// - `ReifyFnPointer*` / `ClosureFnPointer*`: a function pointer target whose safety the
+///   coercion permits (the operand naming the reified callee is checked by [`reify_target`]).
 pub(crate) fn is_valid_pointer_coercion(
     coercion: PointerCoercionKind,
     src_ty: &Ty,
     target_ty: &Ty,
 ) -> bool {
-    let (Ty::RawPtr(src_pointee, src_mut), Ty::RawPtr(target_pointee, target_mut)) =
-        (src_ty, target_ty)
-    else {
-        return false;
-    };
     match coercion {
-        PointerCoercionKind::MutToConstPointer => {
-            *src_mut == Mutability::Mut
-                && *target_mut == Mutability::Not
-                && src_pointee == target_pointee
-        }
-        PointerCoercionKind::ArrayToPointer => {
-            src_mut == target_mut
-                && matches!(&**src_pointee, Ty::Array(elem, _) if elem == target_pointee)
-        }
+        PointerCoercionKind::MutToConstPointer => matches!(
+            (src_ty, target_ty),
+            (Ty::RawPtr(src_pointee, Mutability::Mut), Ty::RawPtr(target_pointee, Mutability::Not))
+                if src_pointee == target_pointee
+        ),
+        PointerCoercionKind::ArrayToPointer => matches!(
+            (src_ty, target_ty),
+            (Ty::RawPtr(src_pointee, src_mut), Ty::RawPtr(target_pointee, target_mut))
+                if src_mut == target_mut
+                    && matches!(&**src_pointee, Ty::Array(elem, _) if elem == target_pointee)
+        ),
+        PointerCoercionKind::Unsize => unsize_array_len(src_ty, target_ty).is_some(),
+        PointerCoercionKind::UnsafeFnPointer => matches!(
+            (src_ty, target_ty),
+            (
+                Ty::FnPtr { inputs: src_inputs, output: src_output, safety: Safety::Safe },
+                Ty::FnPtr { inputs: target_inputs, output: target_output, safety: Safety::Unsafe },
+            ) if src_inputs == target_inputs && src_output == target_output
+        ),
+        PointerCoercionKind::ReifyFnPointer
+        | PointerCoercionKind::ReifyFnPointerWithSafety(_)
+        | PointerCoercionKind::ClosureFnPointer(_)
+        | PointerCoercionKind::ClosureFnPointerAnySafety => match target_ty {
+            Ty::FnPtr { safety, .. } => coercion
+                .required_fn_ptr_safety()
+                .is_none_or(|required| required == *safety),
+            _ => false,
+        },
     }
 }
 
-/// Lowers a `CastKind::PointerCoercion` (`MutToConstPointer`: `*mut T -> *const T`;
-/// `ArrayToPointer`: `*m [T; N] -> *m T` with the same mutability).
+/// Length `N` of an array-to-slice unsizing coercion from `src_ty` to `target_ty`
+/// (`Trusted`'s `unsizeArrayToSliceSpec?`), with identical element types `T`:
+/// - `&mut [T; N]` to `&[T]`, `&mut [T]`, `*const [T]`, or `*mut [T]`;
+/// - `&[T; N]` to `&[T]` or `*const [T]`;
+/// - `*mut [T; N]` to `*const [T]` or `*mut [T]`;
+/// - `*const [T; N]` to `*const [T]`.
+///
+/// Every other pair (a shared or `*const` source to a mutable target, a raw source to a
+/// reference, mismatched element types, or non-array/non-slice pointees) is `None`.
+pub(crate) fn unsize_array_len(src_ty: &Ty, target_ty: &Ty) -> Option<usize> {
+    let (src_is_ref, src_pointee, src_mut) = match src_ty {
+        Ty::Ref(pointee, m) => (true, pointee, *m),
+        Ty::RawPtr(pointee, m) => (false, pointee, *m),
+        _ => return None,
+    };
+    let (target_is_ref, target_pointee, target_mut) = match target_ty {
+        Ty::Ref(pointee, m) => (true, pointee, *m),
+        Ty::RawPtr(pointee, m) => (false, pointee, *m),
+        _ => return None,
+    };
+    let (Ty::Array(src_elem, len), Ty::Slice(target_elem)) = (&**src_pointee, &**target_pointee)
+    else {
+        return None;
+    };
+    if src_elem != target_elem {
+        return None;
+    }
+    let compatible = match (src_is_ref, src_mut) {
+        // `&mut [T; N]` unsizes to any slice pointer or reference.
+        (true, Mutability::Mut) => true,
+        // `&[T; N]` unsizes to `&[T]` or `*const [T]`.
+        (true, Mutability::Not) => target_mut == Mutability::Not,
+        // `*mut [T; N]` unsizes to `*const [T]` or `*mut [T]`.
+        (false, Mutability::Mut) => !target_is_ref,
+        // `*const [T; N]` unsizes to `*const [T]`.
+        (false, Mutability::Not) => !target_is_ref && target_mut == Mutability::Not,
+    };
+    compatible.then_some(*len)
+}
+
+/// The callee symbol that a reifying coercion (`ReifyFnPointer*` / `ClosureFnPointer*`) of
+/// `operand` (of type `src_ty`) turns into a function pointer: a function item constant
+/// `Constant::FnDef(CallTarget::Fn(sym))`, a place of function item type
+/// `Ty::FnDef(CallTarget::Fn(sym))` (`ReifyFnPointer*` only), or a place of non-capturing
+/// closure type `Ty::Closure { target, upvars: [] }` (`ClosureFnPointer*` only). Fails with
+/// the violated rule otherwise: compiler intrinsics cannot be reified, and capturing closures
+/// cannot be coerced to function pointers.
+pub fn reify_target(
+    coercion: PointerCoercionKind,
+    operand: &Operand,
+    src_ty: &Ty,
+) -> Result<CalleeSymbol, &'static str> {
+    const INTRINSIC: &str = "compiler intrinsics cannot be coerced to function pointers";
+    if let Operand::Constant(constant) = operand {
+        return match constant {
+            Constant::FnDef(CallTarget::Fn(symbol)) => Ok(symbol.clone()),
+            Constant::FnDef(CallTarget::Intrinsic(_)) => Err(INTRINSIC),
+            _ => Err("operand is not a function item or closure"),
+        };
+    }
+    match src_ty {
+        Ty::FnDef(CallTarget::Intrinsic(_)) => Err(INTRINSIC),
+        Ty::FnDef(CallTarget::Fn(symbol)) if !coercion.is_closure_reify() => Ok(symbol.clone()),
+        Ty::FnDef(_) => Err("ClosureFnPointer requires a closure operand"),
+        Ty::Closure { target, upvars } if coercion.is_closure_reify() => {
+            if upvars.is_empty() {
+                Ok((**target).clone())
+            } else {
+                Err("only non-capturing closures can be coerced to function pointers")
+            }
+        }
+        Ty::Closure { .. } => Err("ReifyFnPointer requires a function item operand"),
+        _ => Err("operand is not a function item or closure"),
+    }
+}
+
+/// Lowers a `CastKind::PointerCoercion`:
+/// - `MutToConstPointer` (`*mut P -> *const P`) and `ArrayToPointer` (`*m [T; N] -> *m T`)
+///   between raw pointers;
+/// - `Unsize` between an array pointer or reference and a slice pointer or reference
+///   ([`unsize_array_len`]), where `[T; N]` must be representable and `N` fit the target's
+///   `usize`;
+/// - `UnsafeFnPointer` from a safe to an `unsafe` function pointer of the same signature;
+/// - `ReifyFnPointer*` / `ClosureFnPointer*` from a function item or non-capturing closure
+///   ([`reify_target`]) to a function pointer whose safety the coercion permits.
 fn lower_pointer_coercion(
     coercion: PointerCoercionKind,
     operand: &Operand,
@@ -299,30 +444,109 @@ fn lower_pointer_coercion(
     target_ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Result<LoweredCast, CastLowerError> {
-    if !src_ty.is_raw_ptr() {
-        return Err(CastLowerError::InvalidSourceType {
-            expected: "raw pointer",
-            got: src_ty.clone(),
-        });
-    }
-    if !target_ty.is_raw_ptr() {
-        return Err(CastLowerError::InvalidTargetType {
-            expected: "raw pointer",
-            got: target_ty.clone(),
-        });
-    }
-    src_ty
-        .check_representable(ptr_width)
-        .map_err(|err| cast_lower_layout_error(src_ty, err))?;
-    target_ty
-        .check_representable(ptr_width)
-        .map_err(|err| cast_lower_layout_error(target_ty, err))?;
-    if !is_valid_pointer_coercion(coercion, src_ty, target_ty) {
-        return Err(CastLowerError::UnsupportedCast {
-            kind: CastKind::PointerCoercion(coercion),
-            src_ty: src_ty.clone(),
-            target_ty: target_ty.clone(),
-        });
+    let invalid = |reason: &'static str| CastLowerError::InvalidPointerCoercion {
+        coercion,
+        src_ty: src_ty.clone(),
+        target_ty: target_ty.clone(),
+        reason,
+    };
+    let representable = |ty: &Ty| {
+        ty.check_representable(ptr_width)
+            .map_err(|err| cast_lower_layout_error(ty, err))
+    };
+    match coercion {
+        PointerCoercionKind::MutToConstPointer | PointerCoercionKind::ArrayToPointer => {
+            if !src_ty.is_raw_ptr() {
+                return Err(CastLowerError::InvalidSourceType {
+                    expected: "raw pointer",
+                    got: src_ty.clone(),
+                });
+            }
+            if !target_ty.is_raw_ptr() {
+                return Err(CastLowerError::InvalidTargetType {
+                    expected: "raw pointer",
+                    got: target_ty.clone(),
+                });
+            }
+            representable(src_ty)?;
+            representable(target_ty)?;
+            if !is_valid_pointer_coercion(coercion, src_ty, target_ty) {
+                return Err(CastLowerError::UnsupportedCast {
+                    kind: CastKind::PointerCoercion(coercion),
+                    src_ty: src_ty.clone(),
+                    target_ty: target_ty.clone(),
+                });
+            }
+        }
+        PointerCoercionKind::Unsize => {
+            if !src_ty.is_thin_ptr() {
+                return Err(CastLowerError::InvalidSourceType {
+                    expected: "reference or raw pointer to an array",
+                    got: src_ty.clone(),
+                });
+            }
+            if !target_ty.is_wide_ptr() {
+                return Err(CastLowerError::InvalidTargetType {
+                    expected: "reference or raw pointer to a slice",
+                    got: target_ty.clone(),
+                });
+            }
+            representable(src_ty)?;
+            representable(target_ty)?;
+            let Some(len) = unsize_array_len(src_ty, target_ty) else {
+                return Err(invalid(
+                    "not an array-to-slice unsizing of the same element type with compatible mutability",
+                ));
+            };
+            if let Some(array_ty) = src_ty.pointee_ty() {
+                array_ty
+                    .check_representable(ptr_width)
+                    .map_err(|err| cast_lower_layout_error(array_ty, err))?;
+            }
+            if len as u128 > ptr_width.max_usize() {
+                return Err(invalid("array length exceeds the target's usize::MAX"));
+            }
+        }
+        PointerCoercionKind::UnsafeFnPointer => {
+            if !src_ty.is_fn_ptr() {
+                return Err(CastLowerError::InvalidSourceType {
+                    expected: "function pointer",
+                    got: src_ty.clone(),
+                });
+            }
+            if !target_ty.is_fn_ptr() {
+                return Err(CastLowerError::InvalidTargetType {
+                    expected: "function pointer",
+                    got: target_ty.clone(),
+                });
+            }
+            representable(src_ty)?;
+            representable(target_ty)?;
+            if !is_valid_pointer_coercion(coercion, src_ty, target_ty) {
+                return Err(invalid(
+                    "requires a safe function pointer and an unsafe one with identical inputs and output",
+                ));
+            }
+        }
+        PointerCoercionKind::ReifyFnPointer
+        | PointerCoercionKind::ReifyFnPointerWithSafety(_)
+        | PointerCoercionKind::ClosureFnPointer(_)
+        | PointerCoercionKind::ClosureFnPointerAnySafety => {
+            if !target_ty.is_fn_ptr() {
+                return Err(CastLowerError::InvalidTargetType {
+                    expected: "function pointer",
+                    got: target_ty.clone(),
+                });
+            }
+            representable(src_ty)?;
+            representable(target_ty)?;
+            reify_target(coercion, operand, src_ty).map_err(invalid)?;
+            if !is_valid_pointer_coercion(coercion, src_ty, target_ty) {
+                return Err(invalid(
+                    "the coercion's safety does not match the function pointer's safety",
+                ));
+            }
+        }
     }
     Ok(LoweredCast::PointerCoercion {
         coercion,
@@ -335,16 +559,19 @@ fn lower_pointer_coercion(
 /// Lowers a pointer-to-integer cast (`Rvalue::Cast(PointerExposeProvenance)`).
 ///
 /// Preconditions:
-/// - `src_ty` must be a raw pointer (`*const T`, `*mut T`) or reference (`&T`, `&mut T`).
+/// - `src_ty` must be a thin raw pointer (`*const T`, `*mut T`), a thin reference (`&T`,
+///   `&mut T`), or a function pointer (`fn(..) -> R`, exposing the function's provenance); a
+///   wide pointer must first be cast to a thin one (`*const [T] as usize` is not a valid
+///   cast).
 /// - `target_ty` must be an integer type (`usize`, `u64`, `isize`, `i64`, `u32`, etc.).
 pub fn lower_ptr_to_int(
     operand: &Operand,
     src_ty: &Ty,
     target_ty: &Ty,
 ) -> Result<LoweredCast, CastLowerError> {
-    if !src_ty.is_any_ptr() {
+    if !src_ty.is_thin_ptr() && !src_ty.is_fn_ptr() {
         return Err(CastLowerError::InvalidSourceType {
-            expected: "raw pointer or reference",
+            expected: "thin raw pointer, thin reference, or function pointer",
             got: src_ty.clone(),
         });
     }
@@ -367,7 +594,8 @@ pub fn lower_ptr_to_int(
 ///
 /// Preconditions:
 /// - `src_ty` must be an integer type (`usize`, `u64`, `isize`, etc.).
-/// - `target_ty` must be a raw pointer (`*const T` or `*mut T`).
+/// - `target_ty` must be a thin raw pointer (`*const T` or `*mut T`): an integer carries no
+///   slice metadata.
 pub fn lower_int_to_ptr(
     operand: &Operand,
     src_ty: &Ty,
@@ -379,9 +607,9 @@ pub fn lower_int_to_ptr(
             got: src_ty.clone(),
         });
     }
-    if !target_ty.is_raw_ptr() {
+    if !target_ty.is_raw_ptr() || target_ty.is_wide_ptr() {
         return Err(CastLowerError::InvalidTargetType {
-            expected: "raw pointer",
+            expected: "thin raw pointer",
             got: target_ty.clone(),
         });
     }
@@ -397,9 +625,10 @@ pub fn lower_int_to_ptr(
 /// Maximum number of pointer leaves analyzed when checking a transmute's provenance policy.
 const MAX_POINTER_LEAVES: usize = 1 << 16;
 
-/// Collects the byte offsets (in increasing order) of every thin pointer (`RawPtr`/`Ref`)
-/// inside the canonical byte layout of `ty`, starting at `base`. Returns `false` if more
-/// than `budget` pointers would be collected.
+/// Collects the byte offsets (in increasing order) of every pointer word that carries
+/// provenance (thin `RawPtr`/`Ref`, the data pointer of a wide pointer, and `FnPtr`) inside
+/// the canonical byte layout of `ty`, starting at `base`. Returns `false` if more than
+/// `budget` pointers would be collected (or `ty` has no byte layout).
 fn collect_pointer_offsets(
     ty: &Ty,
     ptr_width: PtrWidth,
@@ -411,7 +640,9 @@ fn collect_pointer_offsets(
         return true;
     }
     match ty {
-        Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
+        // A wide pointer's metadata word is an integer; only its data pointer (at offset `0`)
+        // carries provenance.
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) | Ty::FnPtr { .. } => {
             if *budget == 0 {
                 return false;
             }
@@ -425,7 +656,8 @@ fn collect_pointer_offsets(
                 collect_pointer_offsets(elem, ptr_width, base + i * elem_size, out, budget)
             })
         }
-        Ty::Tuple(fields) => {
+        Ty::Tuple(_) | Ty::Closure { .. } => {
+            let fields = ty.tuple_like_fields().unwrap_or_default();
             let mut offset = base;
             for field in fields {
                 if !collect_pointer_offsets(field, ptr_width, offset, out, budget) {
@@ -435,8 +667,14 @@ fn collect_pointer_offsets(
             }
             true
         }
-        Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::Never => true,
+        Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::Never | Ty::FnDef(_) => true,
+        // Unsized types have no byte layout.
+        Ty::Slice(_) | Ty::Str => false,
         Ty::Adt(def) => {
+            // A null-pointer-optimized enum's image is its payload pointer's.
+            if let Some((_, payload)) = null_pointer_payload(def, ptr_width) {
+                return collect_pointer_offsets(payload, ptr_width, base, out, budget);
+            }
             // Canonical ADTs are the declaration-order concatenation of their (single-variant)
             // fields; canonical explicit-tag enums carry no pointers (handled above).
             let Some(fields) = canonical_untagged_fields(def) else {
@@ -457,7 +695,8 @@ fn collect_pointer_offsets(
 /// The fields whose declaration-order concatenation forms a canonical, untagged ADT's byte
 /// image: a struct's fields, a single-field union's field, the only present variant's fields
 /// of an enum laid out without a tag ([`AdtDef::univariant_index`]), or none for a variant-less
-/// or all-absent-variant enum. `None` for enums that store a tag, whose image depends on it.
+/// or all-absent-variant enum. `None` for enums that store a tag, whose image depends on it
+/// (including null-pointer-optimized enums, see [`null_pointer_payload`]).
 pub(crate) fn canonical_untagged_fields(def: &AdtDef) -> Option<&[Ty]> {
     match &def.kind {
         AdtKind::Struct { fields } => Some(fields),
@@ -468,6 +707,41 @@ pub(crate) fn canonical_untagged_fields(def: &AdtDef) -> Option<&[Ty]> {
             None if !def.requires_tag_write() => Some(&[]),
             None => None,
         },
+    }
+}
+
+/// The null-pointer optimization of `def` ([`AdtDef::null_pointer_niche`]) with the type of
+/// its payload pointer field.
+pub(crate) fn null_pointer_payload(
+    def: &AdtDef,
+    ptr_width: PtrWidth,
+) -> Option<(NullPointerNiche, &Ty)> {
+    let niche = def.null_pointer_niche(ptr_width)?;
+    let payload = def
+        .variant_fields(niche.payload_variant)?
+        .get(niche.payload_field)?;
+    Some((niche, payload))
+}
+
+/// Returns true if `len` is valid metadata for a wide pointer of type `ty`: a wide reference's
+/// pointee must fit an allocation (`len * size_of::<T>() <= isize::MAX`, `len <= isize::MAX`
+/// for `str` or an element type with an unspecified layout, whose size is at least `1`),
+/// whereas a wide raw pointer may carry any `usize` length.
+pub(crate) fn wide_ptr_len_valid(ty: &Ty, len: u128, ptr_width: PtrWidth) -> bool {
+    if len > ptr_width.max_usize() {
+        return false;
+    }
+    let Ty::Ref(pointee, _) = ty else {
+        return true;
+    };
+    let Some(elem) = pointee.slice_elem_ty() else {
+        return true;
+    };
+    match elem.layout_for(ptr_width) {
+        Ok(layout) => len
+            .checked_mul(layout.size as u128)
+            .is_some_and(|size| size <= ptr_width.max_object_size()),
+        Err(_) => len <= ptr_width.max_object_size(),
     }
 }
 
@@ -645,7 +919,43 @@ pub fn lower_cast_rvalue_with_ptr_width(
                     got: target_ty.clone(),
                 });
             }
+            // Thin -> thin, wide -> thin (dropping the metadata), and wide -> wide (keeping
+            // it); a thin pointer has no metadata to widen with.
+            if target_ty.is_wide_ptr() && !src_ty.is_wide_ptr() {
+                return Err(CastLowerError::UnsupportedCast {
+                    kind,
+                    src_ty: src_ty.clone(),
+                    target_ty: target_ty.clone(),
+                });
+            }
+            for ty in [src_ty, target_ty] {
+                ty.check_representable(ptr_width)
+                    .map_err(|err| cast_lower_layout_error(ty, err))?;
+            }
             Ok(LoweredCast::PtrToPtr {
+                src_ty: src_ty.clone(),
+                target_ty: target_ty.clone(),
+                operand: operand.clone(),
+            })
+        }
+        CastKind::FnPtrToPtr => {
+            if !src_ty.is_fn_ptr() {
+                return Err(CastLowerError::InvalidSourceType {
+                    expected: "function pointer",
+                    got: src_ty.clone(),
+                });
+            }
+            if !target_ty.is_raw_ptr() || target_ty.is_wide_ptr() {
+                return Err(CastLowerError::InvalidTargetType {
+                    expected: "thin raw pointer",
+                    got: target_ty.clone(),
+                });
+            }
+            for ty in [src_ty, target_ty] {
+                ty.check_representable(ptr_width)
+                    .map_err(|err| cast_lower_layout_error(ty, err))?;
+            }
+            Ok(LoweredCast::FnPtrToPtr {
                 src_ty: src_ty.clone(),
                 target_ty: target_ty.clone(),
                 operand: operand.clone(),
@@ -775,6 +1085,11 @@ pub enum CastEvalError {
         ty: Ty,
         reason: &'static str,
     },
+    /// A by-value use (or transmute) of a dynamically sized type (see
+    /// [`LayoutError::Unsized`]).
+    UnsizedType {
+        ty: Ty,
+    },
 }
 
 impl std::fmt::Display for CastEvalError {
@@ -813,6 +1128,9 @@ impl std::fmt::Display for CastEvalError {
             }
             CastEvalError::IllFormedType { ty, reason } => {
                 write!(f, "type {ty:?} is ill-formed: {reason}")
+            }
+            CastEvalError::UnsizedType { ty } => {
+                write!(f, "type {ty:?} is dynamically sized and has no byte layout")
             }
         }
     }
@@ -920,7 +1238,31 @@ fn normalize_bytes(
     out: &mut Vec<AbstractByte>,
 ) -> Result<(), CastEvalError> {
     match ty {
-        Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) if ty.is_wide_ptr() => {
+            // `[data pointer, usize metadata]`: the data pointer keeps a provenance only if all
+            // of its bytes agree on it, a wide reference's data pointer is non-null and its
+            // pointee fits an allocation (`wide_ptr_len_valid`), and the metadata is an
+            // integer (any provenance is stripped).
+            let ptr_bytes = ptr_width.byte_size();
+            let data = decode_ptr_bytes(&bytes[..ptr_bytes]);
+            if ty.is_ref() && data.addr == 0 {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: 0,
+                });
+            }
+            let len = decode_int_bytes(&bytes[ptr_bytes..2 * ptr_bytes]);
+            if !wide_ptr_len_valid(ty, len, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: len,
+                });
+            }
+            out.extend(encode_ptr_bytes(data, ptr_width));
+            out.extend(encode_int_bytes(len, ptr_bytes));
+            Ok(())
+        }
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) | Ty::FnPtr { .. } => {
             let ptr = decode_ptr_bytes(bytes);
             let bits = u128::from(ptr.addr);
             if !ty.is_valid_scalar_bits(bits, ptr_width) {
@@ -960,7 +1302,8 @@ fn normalize_bytes(
             }
             Ok(())
         }
-        Ty::Tuple(fields) => {
+        Ty::Tuple(_) | Ty::Closure { .. } => {
+            let fields = ty.tuple_like_fields().unwrap_or_default();
             let mut offset = 0usize;
             for field in fields {
                 let size = field.byte_size_for(ptr_width);
@@ -972,6 +1315,9 @@ fn normalize_bytes(
         Ty::Never => Err(CastEvalError::UninhabitedTarget {
             target_ty: Ty::Never,
         }),
+        // A function item is a zero-sized value: it occupies no bytes.
+        Ty::FnDef(_) => Ok(()),
+        Ty::Slice(_) | Ty::Str => Err(CastEvalError::UnsizedType { ty: ty.clone() }),
         Ty::Adt(def) => normalize_adt_bytes(bytes, ty, def, ptr_width, out),
     }
 }
@@ -979,7 +1325,7 @@ fn normalize_bytes(
 /// Decodes the scalar bit pattern (integer bits, or a pointer's address) of the canonical byte
 /// image `bytes` of the scalar type `ty`.
 pub(crate) fn decode_scalar_bits(bytes: &[AbstractByte], ty: &Ty) -> u128 {
-    if ty.is_any_ptr() {
+    if ty.is_any_ptr() || ty.is_fn_ptr() {
         u128::from(decode_ptr_bytes(bytes).addr)
     } else {
         decode_int_bytes(bytes)
@@ -1001,6 +1347,18 @@ fn normalize_adt_bytes(
         return Err(CastEvalError::UninhabitedTarget {
             target_ty: ty.clone(),
         });
+    }
+    if let Some((_, payload)) = null_pointer_payload(def, ptr_width) {
+        // Null-pointer optimization: a null data pointer is the null variant (whose 1-ZST
+        // fields occupy no bytes, and whose remaining metadata bytes, if any, are not part of
+        // its value); any other image is the payload variant's pointer.
+        let ptr_bytes = ptr_width.byte_size();
+        if decode_int_bytes(&bytes[..ptr_bytes]) == 0 {
+            out.extend(encode_int_bytes(0, ptr_bytes));
+            out.extend(bytes[ptr_bytes..].iter().map(|b| AbstractByte::new(b.data)));
+            return Ok(());
+        }
+        return normalize_bytes(bytes, payload, ptr_width, out);
     }
     let (start, fields) = match &def.kind {
         AdtKind::Enum {
@@ -1326,7 +1684,7 @@ pub fn eval_transmute(
     // 1. Encode the (validated) source value at `src_ty`.
     let bytes: Vec<AbstractByte> = match val {
         TransmuteValue::Scalar(src_bits) => {
-            if src_ty.is_any_ptr() || !src_ty.is_scalar() {
+            if src_ty.is_any_ptr() || src_ty.is_fn_ptr() || !src_ty.is_scalar() {
                 return Err(CastEvalError::TypeMismatch(
                     "TransmuteValue::Scalar requires non-pointer scalar source type",
                 ));
@@ -1340,9 +1698,9 @@ pub fn eval_transmute(
             encode_int_bytes(src_bits, src_bytes).collect()
         }
         TransmuteValue::Ptr(ptr) => {
-            if !src_ty.is_any_ptr() {
+            if !src_ty.is_thin_ptr() && !src_ty.is_fn_ptr() {
                 return Err(CastEvalError::TypeMismatch(
-                    "TransmuteValue::Ptr requires pointer or reference source type",
+                    "TransmuteValue::Ptr requires a thin pointer, thin reference, or function pointer source type",
                 ));
             }
             let addr_bits = u128::from(ptr.addr) & ptr_width.mask();
