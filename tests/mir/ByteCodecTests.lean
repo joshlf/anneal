@@ -1383,6 +1383,69 @@ theorem overlapping_placement_not_sequential :
 #guard_msgs (whitespace := lax) in
 #print axioms TupleFieldCodec.uint
 
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.mapEquiv' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.mapEquiv
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.u8' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.u8
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.bool' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.bool
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.u8ListFixed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.u8ListFixed
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.u8Array' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.u8Array
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine_encode_toValue' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine_encode_toValue
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine_encode_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine_encode_witness
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine_decode_eq_map' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine_decode_eq_map
+
+/--
+Concrete parametric equivalence instance: `u8u32PairLayouts` `(u8, u32)` tuple codec constructed
+via `uintPairArbitraryTuple` and via `ofPlacedCodecSpine` agree on every value and every byte buffer.
+-/
+theorem u8u32Pair_uintPairArbitraryTuple_eq_ofPlacedCodecSpine :
+    let mPair := MirValueCodec.uintPairArbitraryTuple u8u32PairLayouts .u8 .u32 3 0 0
+      u8u32PairLayout [0, 1] rfl rfl rfl
+    let mGen := MirValueCodec.uintPairArbitraryTupleOfPlacedCodecSpine u8u32PairLayouts .u8 .u32
+      3 0 0 u8u32PairLayout [0, 1] rfl rfl rfl
+    (∀ x₁ x₂, mPair.toValue (x₁, x₂) = mGen.toValue (x₁, x₂, ())) ∧
+    (∀ x₁ x₂, mPair.codec.encode (x₁, x₂) = mGen.codec.encode (x₁, x₂, ())) ∧
+    (∀ bs, (mPair.codec.decode bs).map (fun p => (p.1, p.2, ())) = mGen.codec.decode bs) :=
+  MirValueCodec.uintPairArbitraryTuple_eq_ofPlacedCodecSpine
+    u8u32PairLayouts .u8 .u32 3 0 0 u8u32PairLayout [0, 1] rfl rfl rfl
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone.of_sentinel_fieldLayouts' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackNone.of_sentinel_fieldLayouts
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone.of_reordered_head' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackNone.of_reordered_head
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.uintPairArbitraryTuple_eq_ofPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.uintPairArbitraryTuple_eq_ofPlacedCodecSpine
+
 /-- info: 'Anneal.ByteCodec.MirValueCodec.u8u32UnitPermutedArbitraryTuple' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms MirValueCodec.u8u32UnitPermutedArbitraryTuple

@@ -7318,11 +7318,14 @@ def MirValueCodec.ofValidStructLayoutWorld
 **Trusted-Level Bit Validity of Every Valid Tuple Layout World**: for the `MirValueCodec` of any valid
 layout world (any `AdtRepr`, any memory order, zero-sized fields anywhere) of a concrete tuple
 `LayoutTable` entry:
-1. `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes` whenever every field codec is a surjective
-   initialized-byte decoder;
-2. `IsInitCodec` and `IsIntoBytes` in tight worlds (`w.totalSize = sumSizes fs`) with initialized
-   field codecs;
-3. `¬ IsIntoBytes` in padded worlds (`sumSizes fs < w.totalSize`).
+1. Index-exact field byte-window placement in `m.codec.encode x` for every declaration field;
+2. `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes` whenever every field codec is a surjective
+   initialized-byte decoder, and `HasZeroValid` / `IsFromZeros` / `IsTryFromBytes` whenever every
+   field codec has a valid all-zero encoding (including niche fields such as `bool`);
+3. `IsInitCodec`, `IsIntoBytes`, and `transmute_typed` soundness in tight worlds
+   (`w.totalSize = sumSizes fs`) with initialized field codecs;
+4. `.uninit` byte emission (`allBytesInitialized = false`), `¬ IsInitCodec`, and `¬ IsIntoBytes`
+   in padded worlds (`sumSizes fs < w.totalSize`).
 
 Kind: safety
 Witness: universal
@@ -7342,26 +7345,158 @@ theorem MirValueCodec.ofValidStructLayoutWorld_bitValidity
     let ty : Ty := { kind := .tuple (k :: ks), layoutIdx := idx }
     let m := MirValueCodec.ofValidStructLayoutWorld hValid layouts idx l memoryIndex pc fcs hPlaced
       hLookup hSize hFields
-    (pc.AllFieldsSurjective →
-      IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
-    (w.totalSize = sumSizes fs → pc.AllFieldsInit → m.codec.IsInitCodec ∧ IsIntoBytes layouts ty) ∧
-    (sumSizes fs < w.totalSize → FieldTuple αs → ¬ IsIntoBytes layouts ty) := by
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    ((pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid →
+        m.codec.HasZeroValid ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
   intro ty m
   have hW : pc.realizedWidth w.totalSize = w.totalSize :=
     (pc.realized_offsets_and_width_of_sequential w.totalSize
       (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)).2
   have hSpec := pc.realizedCodec_spec hValid hPlaced
-  obtain ⟨_, _, _, _, hTight, hPadded⟩ := hSpec
-  refine ⟨fun hSurj => ?_, fun hT hInit => ?_, fun hLt x₀ => ?_⟩
+  obtain ⟨_, _, hWin, _, hTight, hPadded⟩ := hSpec
+  refine ⟨fun x i o bs hGet => hWin x i o bs hGet, ⟨fun hSurj => ?_, fun hZero => ?_⟩,
+    fun hT hInit => ?_, fun hLt x₀ => ?_⟩
   · have hMSurj : m.codec.IsSurjectiveInitDecoder :=
       FixedByteCodec.castWidth_isSurjectiveInitDecoder (pc.realizedCodec w.totalSize) hW
         (pc.realizedCodec_isSurjectiveInitDecoder w.totalSize hSurj)
     have hFb := m.isFromBytes hMSurj
     exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+  · exact Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      pc w.totalSize hW m rfl hZero
   · have hMInit : m.codec.IsInitCodec :=
       FixedByteCodec.castWidth_isInitCodec (pc.realizedCodec w.totalSize) hW (hTight hT hInit).1
-    exact ⟨hMInit, m.isIntoBytes hMInit rfl⟩
-  · exact m.not_isIntoBytes_of_uninit_encode x₀ ((hPadded hLt).1 x₀)
+    exact ⟨hMInit, m.isIntoBytes hMInit rfl,
+      fun mDst hFrom x => MirValueCodec.transmute_typed m mDst hMInit hFrom x⟩
+  · have hUninit : allBytesInitialized (m.codec.encode x₀) = false := (hPadded hLt).1 x₀
+    have hNotInit : ¬ m.codec.IsInitCodec := fun hInit => by
+      have hTrue := hInit x₀
+      rw [hUninit] at hTrue
+      nomatch hTrue
+    exact ⟨hUninit, hNotInit, m.not_isIntoBytes_of_uninit_encode x₀ hUninit⟩
+
+/--
+**`MirValueCodec` of Every Valid Single-Variant Struct (`TyKind.adt`) Layout World**: a concrete
+`LayoutTable` entry `l` for `.adt defPath (k :: ks)` whose `FieldsShape.arbitrary` offsets and size
+realize a valid layout world `w` of the struct's field layouts and satisfy `AdtDecodeFallbackNone`
+yields the general $k$-field `MirValueCodec.adtOfPlacedCodecSpine` against the computable
+`pc.realizedCodec w.totalSize`.
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone layouts l varIdx
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) w.totalSize) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine layouts defPath idx l varIdx memoryIndex
+    pc w.totalSize fcs hLookup hInhab hVar hSize hFields hFallback
+    (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)
+
+/--
+**Trusted-Level Bit Validity of Every Valid Single-Variant Struct (`TyKind.adt`) Layout World**:
+for the `MirValueCodec` of any valid layout world (any `AdtRepr`, any memory order, zero-sized
+fields anywhere) of a concrete single-variant `.adt defPath (k :: ks)` `LayoutTable` entry:
+1. Index-exact field byte-window placement in `m.codec.encode x` for every declaration field;
+2. `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes` whenever every field codec is a surjective
+   initialized-byte decoder, and `HasZeroValid` / `IsFromZeros` / `IsTryFromBytes` whenever every
+   field codec has a valid all-zero encoding;
+3. `IsInitCodec`, `IsIntoBytes`, and `transmute_typed` soundness in tight worlds
+   (`w.totalSize = sumSizes fs`) with initialized field codecs;
+4. `.uninit` byte emission (`allBytesInitialized = false`), `¬ IsInitCodec`, and `¬ IsIntoBytes`
+   in padded worlds (`sumSizes fs < w.totalSize`).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone layouts l varIdx
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) w.totalSize) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx
+      memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields hFallback
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    ((pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid →
+        m.codec.HasZeroValid ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hW : pc.realizedWidth w.totalSize = w.totalSize :=
+    (pc.realized_offsets_and_width_of_sequential w.totalSize
+      (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)).2
+  have hSpec := pc.realizedCodec_spec hValid hPlaced
+  obtain ⟨_, _, hWin, _, hTight, hPadded⟩ := hSpec
+  refine ⟨fun x i o bs hGet => hWin x i o bs hGet, ⟨fun hSurj => ?_, fun hZero => ?_⟩,
+    fun hT hInit => ?_, fun hLt x₀ => ?_⟩
+  · have hMSurj : m.codec.IsSurjectiveInitDecoder :=
+      FixedByteCodec.castWidth_isSurjectiveInitDecoder (pc.realizedCodec w.totalSize) hW
+        (pc.realizedCodec_isSurjectiveInitDecoder w.totalSize hSurj)
+    have hFb := m.isFromBytes hMSurj
+    exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+  · exact Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      pc w.totalSize hW m rfl hZero
+  · have hMInit : m.codec.IsInitCodec :=
+      FixedByteCodec.castWidth_isInitCodec (pc.realizedCodec w.totalSize) hW (hTight hT hInit).1
+    exact ⟨hMInit, m.isIntoBytes hMInit rfl,
+      fun mDst hFrom x => MirValueCodec.transmute_typed m mDst hMInit hFrom x⟩
+  · have hUninit : allBytesInitialized (m.codec.encode x₀) = false := (hPadded hLt).1 x₀
+    have hNotInit : ¬ m.codec.IsInitCodec := fun hInit => by
+      have hTrue := hInit x₀
+      rw [hUninit] at hTrue
+      nomatch hTrue
+    exact ⟨hUninit, hNotInit, m.not_isIntoBytes_of_uninit_encode x₀ hUninit⟩
 
 
 /--

@@ -7586,6 +7586,312 @@ def unit (layouts : LayoutTable) : TupleFieldCodec layouts (.tuple []) FixedByte
   decode_eq_map := fun bs => by
     cases bs <;> rfl
 
+/--
+Transport a `TupleFieldCodec layouts k c` across a constructive bijection `(toB, ofB)` onto
+`FixedByteCodec.mapEquiv c toB ofB hLeft hRight`.
+-/
+def mapEquiv {layouts : LayoutTable} {k : RigidTy} {α β : Type} {n : Nat}
+    {c : FixedByteCodec α n}
+    (fc : TupleFieldCodec layouts k c)
+    (toB : α → β) (ofB : β → α)
+    (hLeft : ∀ a, ofB (toB a) = a)
+    (hRight : ∀ b, toB (ofB b) = b) :
+    TupleFieldCodec layouts k (FixedByteCodec.mapEquiv c toB ofB hLeft hRight) where
+  toValue := fun b => fc.toValue (ofB b)
+  ofValue := fun v => (fc.ofValue v).map toB
+  ofValue_toValue := fun b => by
+    show (fc.ofValue (fc.toValue (ofB b))).map toB = some b
+    rw [fc.ofValue_toValue (ofB b)]
+    dsimp only [Option.map]
+    exact congrArg some (hRight b)
+  kindSize_eq := fc.kindSize_eq
+  encode_toValue := fun b => fc.encode_toValue (ofB b)
+  encode_witness := fun v bs hEnc => by
+    obtain ⟨a, ha⟩ := fc.encode_witness v bs hEnc
+    refine ⟨toB a, ?_⟩
+    show bs = c.encode (ofB (toB a))
+    rw [hLeft a]
+    exact ha
+  decode_eq_map := fun bs => by
+    rw [fc.decode_eq_map bs]
+    change (c.decode bs).map fc.toValue =
+      ((c.decode bs).map toB).map (fun b => fc.toValue (ofB b))
+    cases c.decode bs with
+    | none => rfl
+    | some a =>
+      dsimp only [Option.map]
+      rw [hLeft a]
+
+/-- `TupleFieldCodec` for a single-byte `u8` field typed directly as `UInt8` (`FixedByteCodec.u8`). -/
+def u8 (layouts : LayoutTable) : TupleFieldCodec layouts (.uint .u8) FixedByteCodec.u8 where
+  toValue := fun b => .scalar ⟨b.toNat, 1⟩
+  ofValue := fun v =>
+    match v with
+    | .scalar sv =>
+      if Nat.beq sv.sizeBytes 1 then some (UInt8.ofNat sv.bits) else none
+    | _ => none
+  ofValue_toValue := fun b => by
+    dsimp only
+    exact congrArg some UInt8.ofNat_toNat
+  kindSize_eq := rfl
+  encode_toValue := fun b => by
+    unfold tupleFieldFuel encodeValueToBytes encodeScalarBytes encodeLittleEndianBytes
+    dsimp only [intCastTargetBytes]
+    rw [UInt8.ofNat_toNat]
+    rfl
+  encode_witness := fun v bs hEnc => by
+    obtain ⟨⟨bits, hLt⟩, hBs⟩ := (uint layouts .u8).encode_witness v bs hEnc
+    exact ⟨UInt8.ofNat bits, hBs⟩
+  decode_eq_map := fun bs => by
+    cases bs with
+    | nil => rfl
+    | cons b0 rest =>
+      cases rest with
+      | cons b1 rest' =>
+        unfold tupleFieldFuel decodeValueFromBytes
+        dsimp only [intCastTargetBytes]
+        have hFalse : Nat.beq (Trusted.Sequence.length (b0 :: b1 :: rest')) 1 = false := rfl
+        rw [hFalse]
+        cases b0 <;> rfl
+      | nil =>
+        cases b0 with
+        | uninit => rfl
+        | init b prov => rfl
+
+/-- `TupleFieldCodec` for a `bool` field (`FixedByteCodec.boolByte`, 1 byte, niche `{0, 1}`). -/
+def bool (layouts : LayoutTable) : TupleFieldCodec layouts .bool FixedByteCodec.boolByte where
+  toValue := (MirValueCodec.bool layouts 0).toValue
+  ofValue := (MirValueCodec.bool layouts 0).ofValue
+  ofValue_toValue := (MirValueCodec.bool layouts 0).ofValue_toValue
+  kindSize_eq := rfl
+  encode_toValue := (MirValueCodec.bool layouts 0).encode_toValue
+  encode_witness := fun v bs hEnc => by
+    unfold tupleFieldFuel encodeValueToBytes at hEnc
+    cases v <;> dsimp only at hEnc
+    case unit => nomatch hEnc
+    case ptr => nomatch hEnc
+    case aggregate => nomatch hEnc
+    case scalar sv =>
+      cases hSz : Nat.beq sv.sizeBytes 1 <;> rw [hSz] at hEnc
+      · nomatch hEnc
+      · dsimp only at hEnc
+        cases h0 : Nat.beq sv.bits 0 <;> rw [h0] at hEnc
+        · dsimp only at hEnc
+          cases h1 : Nat.beq sv.bits 1 <;> rw [h1] at hEnc
+          · nomatch hEnc
+          · injection hEnc with hBs
+            exact ⟨true, hBs.symm⟩
+        · injection hEnc with hBs
+          exact ⟨false, hBs.symm⟩
+  decode_eq_map := (MirValueCodec.bool layouts 0).decode_eq_map
+
+/-- Extract a fixed-length list of `UInt8` scalars from a list of runtime `Value`s. -/
+def u8ArrayDecodeVals : Nat → List Value → Option (List UInt8)
+  | 0, [] => some []
+  | k + 1, .scalar sv :: vs =>
+    if Nat.beq sv.sizeBytes 1 then
+      (u8ArrayDecodeVals k vs).map (UInt8.ofNat sv.bits :: ·)
+    else none
+  | _, _ => none
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem u8ArrayDecodeVals_map_scalar :
+    ∀ (k : Nat) (xs : List UInt8),
+      xs.length = k →
+      u8ArrayDecodeVals k (xs.map fun b : UInt8 => Value.scalar ⟨b.toNat, 1⟩) = some xs
+  | 0, [], _ => rfl
+  | k + 1, b :: xs, hLen => by
+    have hTail : xs.length = k := Nat.succ.inj hLen
+    dsimp only [List.map, u8ArrayDecodeVals]
+    rw [u8ArrayDecodeVals_map_scalar k xs hTail, UInt8.ofNat_toNat]
+    rfl
+
+/--
+`TupleFieldCodec` for a fixed-length byte array `[u8; k]` represented as `{ xs : List UInt8 // xs.length = k }`
+(`FixedByteCodec.listFixed k FixedByteCodec.u8`), proved via `FixedByteCodec.encodeListWith_map_eq_encodeElems`
+and `FixedByteCodec.decodeArrayChunksWith_eq_listFixed_map`.
+-/
+def u8ListFixed (layouts : LayoutTable) (k : Nat) :
+    TupleFieldCodec layouts (.array (.uint .u8) k) (FixedByteCodec.listFixed k FixedByteCodec.u8) where
+  toValue := fun xs => .aggregate 0 (xs.val.map fun b => .scalar ⟨b.toNat, 1⟩)
+  ofValue := fun v =>
+    match v with
+    | .aggregate 0 vs =>
+      match u8ArrayDecodeVals k vs with
+      | some xs =>
+        if h : xs.length = k then some ⟨xs, h⟩ else none
+      | none => none
+    | _ => none
+  ofValue_toValue := fun ⟨xs, hLen⟩ => by
+    simp only [u8ArrayDecodeVals_map_scalar k xs hLen, hLen, ↓reduceDIte]
+  kindSize_eq := by
+    show (match rigidTyKindByteSize (.uint .u8) with
+      | some elemSz => some (Nat.mul elemSz k)
+      | none => none) = some (k * 1)
+    have hElem : rigidTyKindByteSize (.uint .u8) = some 1 := rfl
+    rw [hElem]
+    exact congrArg some (Nat.mul_comm 1 k)
+  encode_toValue := fun ⟨xs, hLen⟩ => by
+    cases k with
+    | zero =>
+      cases xs with
+      | nil => rfl
+      | cons _ _ => nomatch hLen
+    | succ k' =>
+      have hK0 : Nat.beq (k' + 1) 0 = false := rfl
+      unfold tupleFieldFuel encodeValueToBytes
+      dsimp only
+      rw [hK0]
+      simp only []
+      have hMapLen : Nat.beq (Trusted.Sequence.length (xs.map fun b : UInt8 => Value.scalar ⟨b.toNat, 1⟩)) (k' + 1) = true := by
+        apply Nat.beq_eq.mpr
+        show (xs.map _).length = k' + 1
+        rw [List.length_map, hLen]
+      rw [hMapLen]
+      dsimp only [rigidTyKindByteSize, intCastTargetBytes]
+      apply FixedByteCodec.encodeListWith_map_eq_encodeElems FixedByteCodec.u8
+        (fun b : UInt8 => Value.scalar ⟨b.toNat, 1⟩)
+        (fun e => encodeValueToBytes 14 layouts { kind := .uint .u8, layoutIdx := 0 } e)
+      intro b
+      exact (u8 layouts).encode_toValue b
+  encode_witness := fun v bs hEnc => by
+    cases k with
+    | zero =>
+      unfold tupleFieldFuel encodeValueToBytes at hEnc
+      cases v <;> dsimp only at hEnc
+      case unit =>
+        injection hEnc with hBs
+        exact ⟨⟨[], rfl⟩, hBs.symm⟩
+      case scalar => nomatch hEnc
+      case ptr => nomatch hEnc
+      case aggregate varIdx vals =>
+        cases varIdx with
+        | succ _ => nomatch hEnc
+        | zero =>
+          cases vals with
+          | cons _ _ => nomatch hEnc
+          | nil =>
+            injection hEnc with hBs
+            exact ⟨⟨[], rfl⟩, hBs.symm⟩
+    | succ k' =>
+      have hK0 : Nat.beq (k' + 1) 0 = false := rfl
+      unfold tupleFieldFuel encodeValueToBytes at hEnc
+      dsimp only at hEnc
+      rw [hK0] at hEnc
+      cases v <;> dsimp only at hEnc
+      case unit => nomatch hEnc
+      case scalar => nomatch hEnc
+      case ptr => nomatch hEnc
+      case aggregate varIdx elems =>
+        cases varIdx with
+        | succ _ => nomatch hEnc
+        | zero =>
+          change
+            (match Nat.beq (Trusted.Sequence.length elems) (k' + 1) with
+             | false => none
+             | true =>
+               encodeListWith
+                 (fun e => encodeValueToBytes 14 layouts { kind := .uint .u8, layoutIdx := 0 } e)
+                 1 elems) = some bs at hEnc
+          cases hELen : Nat.beq (Trusted.Sequence.length elems) (k' + 1) <;> rw [hELen] at hEnc
+          · nomatch hEnc
+          · dsimp only at hEnc
+            have hListWitness :
+                ∀ (es : List Value) (outBs : List AbstractByte),
+                  encodeListWith
+                    (fun e => encodeValueToBytes 14 layouts { kind := .uint .u8, layoutIdx := 0 } e)
+                    1 es = some outBs →
+                  ∃ ys : List UInt8,
+                    ys.length = es.length ∧ outBs = FixedByteCodec.encodeElems FixedByteCodec.u8 ys := by
+              intro es
+              induction es with
+              | nil =>
+                intro outBs hE
+                injection hE with hOut
+                exact ⟨[], rfl, hOut.symm⟩
+              | cons e rest ih =>
+                intro outBs hE
+                unfold encodeListWith at hE
+                cases hHead : encodeValueToBytes 14 layouts { kind := .uint .u8, layoutIdx := 0 } e <;>
+                  rw [hHead] at hE
+                · nomatch hE
+                case some headBs =>
+                  dsimp only at hE
+                  cases hHeadLen : Nat.beq (Trusted.Sequence.length headBs) 1 <;>
+                    rw [hHeadLen] at hE
+                  · nomatch hE
+                  · dsimp only at hE
+                    cases hTail :
+                        encodeListWith
+                          (fun e => encodeValueToBytes 14 layouts { kind := .uint .u8, layoutIdx := 0 } e)
+                          1 rest <;> rw [hTail] at hE
+                    · nomatch hE
+                    case some tailBs =>
+                      injection hE with hOut
+                      rw [appendAbstractBytes_eq_append] at hOut
+                      obtain ⟨b0, hb0⟩ := (u8 layouts).encode_witness e headBs hHead
+                      obtain ⟨ys, hYsLen, hYsBs⟩ := ih tailBs hTail
+                      refine ⟨b0 :: ys, congrArg Nat.succ hYsLen, ?_⟩
+                      rw [← hOut, hb0, hYsBs]
+            obtain ⟨ys, hYsLen, hYsBs⟩ := hListWitness elems bs hEnc
+            have hElemsLen : elems.length = k' + 1 := Nat.eq_of_beq_eq_true hELen
+            exact ⟨⟨ys, hYsLen.trans hElemsLen⟩, hYsBs⟩
+  decode_eq_map := fun bs => by
+    cases k with
+    | zero =>
+      unfold tupleFieldFuel decodeValueFromBytes
+      cases bs <;> rfl
+    | succ k' =>
+      have hK0 : Nat.beq (k' + 1) 0 = false := rfl
+      unfold tupleFieldFuel decodeValueFromBytes
+      dsimp only
+      rw [hK0]
+      dsimp only [rigidTyKindByteSize, intCastTargetBytes]
+      have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+      have hMul : Nat.mul 1 (k' + 1) = (k' + 1) * 1 := Nat.mul_comm 1 (k' + 1)
+      rw [hLenDef, hMul]
+      cases hLen : Nat.beq bs.length ((k' + 1) * 1)
+      · dsimp only
+        have hNe : bs.length ≠ (k' + 1) * 1 := fun hEq => by
+          rw [Nat.beq_eq.mpr hEq] at hLen; nomatch hLen
+        rw [(FixedByteCodec.listFixed_isExactWidth (k' + 1) FixedByteCodec.u8).decode_eq_none_of_length_ne hNe]
+        rfl
+      · dsimp only
+        have hBridge := FixedByteCodec.decodeArrayChunksWith_eq_listFixed_map FixedByteCodec.u8
+          (fun b : UInt8 => Value.scalar ⟨b.toNat, 1⟩)
+          (fun chunk => decodeValueFromBytes 14 layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
+          (fun chunk => (u8 layouts).decode_eq_map chunk)
+          (k' + 1) bs
+        rw [hBridge]
+        cases (FixedByteCodec.listFixed (k' + 1) FixedByteCodec.u8).decode bs <;> rfl
+
+/--
+`TupleFieldCodec` for a fixed-length byte array `[u8; k]` typed as `Vector UInt8 k`
+(`FixedByteCodec.array k FixedByteCodec.u8`).
+-/
+def u8Array (layouts : LayoutTable) (k : Nat) :
+    TupleFieldCodec layouts (.array (.uint .u8) k) (FixedByteCodec.array k FixedByteCodec.u8) :=
+  mapEquiv (u8ListFixed layouts k)
+    (fun xs => Vector.mk xs.val.toArray (by rw [List.size_toArray, xs.property]))
+    (fun v => ⟨v.toList, v.length_toList⟩)
+    (fun ⟨_, _⟩ => Subtype.ext (by simp [Vector.toList]))
+    (fun v => by
+      cases v with
+      | mk arr hSize =>
+        simp [Vector.toList])
+
+/--
+Declaration-order `TupleFieldCodecs` for `demoS3Placed` (`struct S { a: u8, b: [u8; 4], c: () }`
+at `[.uint .u8, .array (.uint .u8) 4, .tuple []]`).
+-/
+def demoS3PlacedFieldCodecs (layouts : LayoutTable) :
+    TupleFieldCodecs layouts [.uint .u8, .array (.uint .u8) 4, .tuple []] demoS3Placed :=
+  .cons (u8 layouts) (.cons (u8Array layouts 4) (.cons (unit layouts) .nil))
+
 end TupleFieldCodec
 
 namespace MirValueCodec
@@ -7786,6 +8092,372 @@ def ofPlacedCodecSpine
     (fun x => ofPlacedCodecSpine_encode_toValue fcs hLookup hSize hFields hSeq x)
     (fun v bs hEnc => ofPlacedCodecSpine_encode_witness fcs hLookup hSize hFields hSeq v bs hEnc)
     (fun bs => ofPlacedCodecSpine_decode_eq_map fcs hLookup hSize hFields hSeq bs)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem adt_cons_rigidTyByteSize {layouts : LayoutTable} {defPath : DefPath} {idx : LayoutIdx}
+    {l : TypeLayout} {k : RigidTy} {ks : List RigidTy} {totalSize : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size = { bytes := totalSize }) :
+    rigidTyByteSize layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } = some totalSize := by
+  unfold rigidTyByteSize
+  dsimp only [rigidTyKindByteSize]
+  rw [hLookup]
+  dsimp only
+  rw [hSize]
+
+/--
+Trusted's single-variant `.adt` fallback decoder on a `LayoutTable` entry `l` with field offsets
+`offsets`: used by `decodeValueFromBytes` only if the primary `byArgs` field decode returns `none`.
+-/
+def adtDecodeFallback (layouts : LayoutTable) (l : TypeLayout) (varIdx : VariantIdx)
+    (offsets : List Size) (bs : List AbstractByte) : Option Value :=
+  match Nat.beq (Trusted.Sequence.length l.fieldLayouts) (Trusted.Sequence.length offsets) with
+  | true =>
+    let decodeByLayout := fun (fIdx : Nat) (fSlice : List AbstractByte) =>
+      decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" .nil, layoutIdx := fIdx } fSlice
+    match decodeFieldsByLayoutIdxs decodeByLayout layouts bs offsets l.fieldLayouts with
+    | .some vals => .some (.aggregate varIdx vals)
+    | .none => .none
+  | false =>
+    match offsets, l.backendRepr with
+    | off0 :: .nil, .scalar s0 =>
+      match scalarLayoutByteWidth s0 with
+      | .none => .none
+      | .some sz0 =>
+        match sliceAbstractBytes bs off0.bytes sz0 with
+        | .none => .none
+        | .some slice0 =>
+          match decodeScalarLayoutBytes s0 slice0 with
+          | .some v0 => .some (.aggregate varIdx (v0 :: .nil))
+          | .none => .none
+    | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
+      match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
+      | .some sz0, .some sz1 =>
+        match sliceAbstractBytes bs off0.bytes sz0, sliceAbstractBytes bs off1.bytes sz1 with
+        | .some slice0, .some slice1 =>
+          match decodeScalarLayoutBytes s0 slice0, decodeScalarLayoutBytes s1 slice1 with
+          | .some v0, .some v1 => .some (.aggregate varIdx (v0 :: v1 :: .nil))
+          | _, _ => .none
+        | _, _ => .none
+      | _, _ => .none
+    | _, _ =>
+      match decodeFieldsBySpan bs l.size.bytes offsets with
+      | .some vals => .some (.aggregate varIdx vals)
+      | .none => .none
+
+/--
+Predicate stating that `adtDecodeFallback` returns `none` on every `totalSize`-byte buffer, so
+Trusted's `decodeValueFromBytes` on `.adt defPath (k :: ks)` reduces purely to `byArgs`
+(`decodeFieldsAtOffsetsWith` over `k :: ks`).
+-/
+def AdtDecodeFallbackNone (layouts : LayoutTable) (l : TypeLayout) (varIdx : VariantIdx)
+    (offsets : List Size) (totalSize : Nat) : Prop :=
+  ∀ bs : List AbstractByte, bs.length = totalSize →
+    adtDecodeFallback layouts l varIdx offsets bs = none
+
+/--
+Sufficient condition 1 for `AdtDecodeFallbackNone`: `l.fieldLayouts` has length matching `offsets = off₀ :: offRest`
+with an unmapped sentinel head layout index `LayoutTable.lookup layouts fIdx₀ = none`.
+-/
+theorem AdtDecodeFallbackNone.of_sentinel_fieldLayouts
+    {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {off₀ : Size} {offRest : List Size}
+    {fIdx₀ : LayoutIdx} {fIdxRest : List LayoutIdx} {totalSize : Nat}
+    (hFl : l.fieldLayouts = fIdx₀ :: fIdxRest)
+    (hLen : (fIdx₀ :: fIdxRest).length = (off₀ :: offRest).length)
+    (hLookup₀ : LayoutTable.lookup layouts fIdx₀ = none) :
+    AdtDecodeFallbackNone layouts l varIdx (off₀ :: offRest) totalSize := by
+  intro bs _
+  unfold adtDecodeFallback
+  have hBeq : Nat.beq (Trusted.Sequence.length l.fieldLayouts)
+      (Trusted.Sequence.length (off₀ :: offRest)) = true := by
+    rw [hFl]
+    exact Nat.beq_eq.mpr hLen
+  rw [hBeq]
+  dsimp only
+  rw [hFl]
+  dsimp only [decodeFieldsByLayoutIdxs]
+  rw [hLookup₀]
+
+/--
+Sufficient condition 2 for `AdtDecodeFallbackNone`: `l.fieldLayouts = []`, `l.backendRepr = .memory`,
+and the first two declared fields are reordered in memory (`off₁.bytes < off₀.bytes`, so
+`Nat.ble off₀.bytes off₁.bytes = false`). This holds directly for any reordered `#[repr(Rust)]`
+struct such as `demoS3Placed` (`struct S { a: u8 @ 4, b: [u8; 4] @ 0, c: () @ 5 }`) or
+`u8u32UnitPermutedLayout` without needing any `fieldLayouts` entries!
+-/
+theorem AdtDecodeFallbackNone.of_reordered_head
+    {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {off₀ off₁ : Size} {offRest : List Size} {totalSize : Nat}
+    (hFl : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .memory)
+    (hReord : off₁.bytes < off₀.bytes) :
+    AdtDecodeFallbackNone layouts l varIdx (off₀ :: off₁ :: offRest) totalSize := by
+  intro bs _
+  unfold adtDecodeFallback
+  rw [hFl, hRepr]
+  have hBle : Nat.ble off₀.bytes off₁.bytes = false := by
+    cases h : Nat.ble off₀.bytes off₁.bytes with
+    | false => rfl
+    | true =>
+      have hLe : off₀.bytes ≤ off₁.bytes := Nat.le_of_ble_eq_true h
+      omega
+  cases offRest <;> dsimp only [decodeFieldsBySpan] <;> rw [hBle] <;> rfl
+
+/--
+Trusted encodes the single-variant laid-out struct `.adt defPath (k :: ks)` value
+`.aggregate varIdx (fcs.toValues x)` to the realized codec's encoding of `x`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: encodeValueToBytes
+-/
+theorem adtOfPlacedCodecSpine_encode_toValue
+    {layouts : LayoutTable} {defPath : DefPath} {idx : LayoutIdx} {l : TypeLayout}
+    {varIdx : VariantIdx} {memoryIndex : List Nat}
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (x : FieldTuple αs) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .adt defPath (k :: ks), layoutIdx := idx }
+        (.aggregate varIdx (fcs.toValues x)) =
+      some ((pc.realizedCodec totalSize).encode x) := by
+  cases fcs with
+  | @cons _ _ _ _ p₀ c₀ tail f₀ rest =>
+    unfold defaultCodecFuel encodeValueToBytes
+    simp only []
+    rw [hLookup]
+    dsimp only
+    rw [hInhab]
+    dsimp only
+    rw [hVar]
+    dsimp only
+    rw [hFields]
+    dsimp only
+    have hCond1 :
+        Bool.and (Nat.beq varIdx varIdx)
+          (Nat.beq
+            (Trusted.Sequence.length
+              (((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size))))
+            (Trusted.Sequence.length ((TupleFieldCodecs.cons f₀ rest).toValues x))) = true := by
+      rw [nat_beq_self varIdx, Bool.true_and]
+      apply Nat.beq_eq.mpr
+      show ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length =
+        ((TupleFieldCodecs.cons f₀ rest).toValues x).length
+      rw [List.length_map, (TupleFieldCodecs.cons f₀ rest).length_placed,
+          (TupleFieldCodecs.cons f₀ rest).length_toValues]
+    rw [hCond1]
+    dsimp only
+    have hCond2 :
+        Nat.beq (Trusted.Sequence.length (k :: ks))
+          (Trusted.Sequence.length
+            (((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)))) = true := by
+      apply Nat.beq_eq.mpr
+      show (k :: ks).length =
+        ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length
+      rw [List.length_map, (TupleFieldCodecs.cons f₀ rest).length_placed]
+    rw [hCond2]
+    dsimp only
+    rw [hSize]
+    exact ((TupleFieldCodecs.cons f₀ rest).encodeFieldsAtOffsetsWith_eq_writeWindows _ x _).trans
+      ((PlacedCodecSpine.cons p₀ c₀ tail).writeWindows_realizedCodec_encode totalSize hSeq x)
+
+/--
+Every successful Trusted encoding of the single-variant laid-out struct `.adt defPath (k :: ks)`
+is a realized-codec encoding.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: PlacedCodecSpine.realizedCodec
+-/
+theorem adtOfPlacedCodecSpine_encode_witness
+    {layouts : LayoutTable} {defPath : DefPath} {idx : LayoutIdx} {l : TypeLayout}
+    {varIdx : VariantIdx} {memoryIndex : List Nat}
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts
+      { kind := .adt defPath (k :: ks), layoutIdx := idx } v = some bs) :
+    ∃ x : FieldTuple αs, bs = (pc.realizedCodec totalSize).encode x := by
+  cases fcs with
+  | @cons _ _ _ _ p₀ c₀ tail f₀ rest =>
+    unfold defaultCodecFuel encodeValueToBytes at hEnc
+    rw [hLookup] at hEnc
+    dsimp only at hEnc
+    rw [hInhab] at hEnc
+    dsimp only at hEnc
+    rw [hVar] at hEnc
+    dsimp only at hEnc
+    rw [hFields] at hEnc
+    cases v <;> dsimp only [PlacedCodecSpine.placed, List.map] at hEnc
+    case unit => nomatch hEnc
+    case scalar => nomatch hEnc
+    case ptr => nomatch hEnc
+    case aggregate vIdx vals =>
+      cases hCond1 : Bool.and (Nat.beq vIdx varIdx)
+          (Nat.beq
+            (Trusted.Sequence.length
+              (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size))))
+            (Trusted.Sequence.length vals)) with
+      | false =>
+        rw [hCond1] at hEnc
+        nomatch hEnc
+      | true =>
+        rw [hCond1] at hEnc
+        dsimp only at hEnc
+        have hCond2 :
+            Nat.beq (Trusted.Sequence.length (k :: ks))
+              (Trusted.Sequence.length
+                (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size)))) = true := by
+          apply Nat.beq_eq.mpr
+          show (k :: ks).length =
+            ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length
+          rw [List.length_map, (TupleFieldCodecs.cons f₀ rest).length_placed]
+        rw [hCond2] at hEnc
+        dsimp only at hEnc
+        rw [hSize] at hEnc
+        obtain ⟨x, hx⟩ := (TupleFieldCodecs.cons f₀ rest).encodeFieldsAtOffsetsWith_witness _ vals _ bs hEnc
+        rw [(PlacedCodecSpine.cons p₀ c₀ tail).writeWindows_realizedCodec_encode totalSize hSeq x] at hx
+        injection hx with hx
+        exact ⟨x, hx.symm⟩
+
+/--
+Trusted decodes the single-variant laid-out struct `.adt defPath (k :: ks)` exactly as the realized
+codec whenever `AdtDecodeFallbackNone` holds.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: decodeValueFromBytes
+-/
+theorem adtOfPlacedCodecSpine_decode_eq_map
+    {layouts : LayoutTable} {defPath : DefPath} {idx : LayoutIdx} {l : TypeLayout}
+    {varIdx : VariantIdx} {memoryIndex : List Nat}
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFallback : AdtDecodeFallbackNone layouts l varIdx
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) totalSize)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } bs =
+      ((pc.realizedCodec totalSize).decode bs).map (fun x => .aggregate varIdx (fcs.toValues x)) := by
+  cases fcs with
+  | @cons _ _ _ _ p₀ c₀ tail f₀ rest =>
+    have hWidth := ((PlacedCodecSpine.cons p₀ c₀ tail).realized_offsets_and_width_of_sequential totalSize hSeq).2
+    unfold defaultCodecFuel decodeValueFromBytes
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [hInhab, hSize]
+    dsimp only
+    cases hL : Nat.beq (Trusted.Sequence.length bs) totalSize with
+    | false =>
+      have hNe : bs.length ≠ (PlacedCodecSpine.cons p₀ c₀ tail).realizedWidth totalSize := by
+        rw [hWidth]
+        intro hEq
+        rw [show Trusted.Sequence.length bs = bs.length from rfl, Nat.beq_eq.mpr hEq] at hL
+        nomatch hL
+      rw [((PlacedCodecSpine.cons p₀ c₀ tail).realizedCodec_isExactWidth totalSize).decode_eq_none_of_length_ne hNe]
+      rfl
+    | true =>
+      have hLen : bs.length = totalSize := Nat.eq_of_beq_eq_true hL
+      rw [hVar, hFields]
+      dsimp only [Bool.not, Bool.or, PlacedCodecSpine.placed, List.map]
+      have hCond2 :
+          Nat.beq (Trusted.Sequence.length (k :: ks))
+            (Trusted.Sequence.length
+              (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size)))) = true := by
+        apply Nat.beq_eq.mpr
+        show (k :: ks).length =
+          ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length
+        rw [List.length_map, (TupleFieldCodecs.cons f₀ rest).length_placed]
+      rw [hCond2]
+      dsimp only
+      have hDecodeAt :
+          decodeFieldsAtOffsetsWith
+              (fun k b => decodeValueFromBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } b)
+              (fun k => rigidTyByteSize layouts { kind := k, layoutIdx := 0 }) bs
+              (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size)))
+              (k :: ks) =
+            ((PlacedCodecSpine.cons p₀ c₀ tail).decodeAt bs).map
+              (TupleFieldCodecs.cons f₀ rest).toValues :=
+        (TupleFieldCodecs.cons f₀ rest).decodeFieldsAtOffsetsWith_eq_decodeAt bs (by
+          rw [hLen]
+          exact (PlacedCodecSpine.cons p₀ c₀ tail).placed_in_bounds_of_memSort_sequential totalSize hSeq)
+      rw [hDecodeAt,
+        (PlacedCodecSpine.cons p₀ c₀ tail).realizedCodec_decode_eq_decodeAt totalSize hSeq bs hLen]
+      have hFb :
+          adtDecodeFallback layouts l varIdx
+            (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size))) bs =
+            none :=
+        hFallback bs hLen
+      unfold adtDecodeFallback at hFb
+      rw [hSize] at hFb
+      cases (PlacedCodecSpine.cons p₀ c₀ tail).decodeAt bs with
+      | some x => rfl
+      | none => exact hFb
+
+/--
+**General $k$-Field Laid-Out Struct (`TyKind.adt`) `MirValueCodec`**: bridges any single-variant
+struct `{ kind := .adt defPath (k :: ks), layoutIdx := idx }` with `FieldsShape.arbitrary` field
+offsets and `AdtDecodeFallbackNone` directly to `pc.realizedCodec totalSize`.
+-/
+def adtOfPlacedCodecSpine
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs) (totalSize : Nat)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFallback : AdtDecodeFallbackNone layouts l varIdx
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) totalSize)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) totalSize :=
+  ofCanonicalEncode
+    ((pc.realizedCodec totalSize).castWidth
+      (pc.realized_offsets_and_width_of_sequential totalSize hSeq).2)
+    (fun x => .aggregate varIdx (fcs.toValues x))
+    (fun v =>
+      match v with
+      | .aggregate vIdx vs => if vIdx == varIdx then fcs.ofValues vs else none
+      | _ => none)
+    (fun x => by
+      have hBeq : (varIdx == varIdx) = true := decide_eq_true rfl
+      dsimp only
+      rw [hBeq]
+      exact fcs.ofValues_toValues x)
+    (adt_cons_rigidTyByteSize hLookup hSize)
+    (fun x => adtOfPlacedCodecSpine_encode_toValue fcs hLookup hInhab hVar hSize hFields hSeq x)
+    (fun v bs hEnc => adtOfPlacedCodecSpine_encode_witness fcs hLookup hInhab hVar hSize hFields hSeq v bs hEnc)
+    (fun bs => adtOfPlacedCodecSpine_decode_eq_map fcs hLookup hInhab hVar hSize hFields hFallback hSeq bs)
 
 
 /--
@@ -8063,6 +8735,143 @@ theorem u8u32UnitPermutedArbitraryTuple_trail_pos_not_intoBytes
       u8u32UnitPermutedPlaced (5 + trail) (u8u32UnitPermutedPlaced_realizedWidth trail)
       m rfl hPadPos x₀
   exact ⟨hNotInit, hNotInto⟩
+
+/--
+Declaration-order `PlacedCodecSpine` for the 2-field unsigned integer tuple `(u₁, u₂)` with
+field 0 at byte offset `0` and field 1 at byte offset `uintByteSize w₁ + pad₁`.
+-/
+def uintPairPlaced (w₁ w₂ : UintTy) (pad₁ : Nat) :
+    PlacedCodecSpine
+      [{ bits : Nat // bits < 2 ^ (8 * uintByteSize w₁) },
+       { bits : Nat // bits < 2 ^ (8 * uintByteSize w₂) }] :=
+  .cons (0, ⟨uintByteSize w₁, uintByteSize w₁⟩)
+    (FixedByteCodec.uintBitsLE (uintByteSize w₁) (uintByteSize_pos w₁))
+    (.cons (uintByteSize w₁ + pad₁, ⟨uintByteSize w₂, uintByteSize w₂⟩)
+      (FixedByteCodec.uintBitsLE (uintByteSize w₂) (uintByteSize_pos w₂))
+      .nil)
+
+/-- Declaration-order `TupleFieldCodecs` for `uintPairPlaced w₁ w₂ pad₁`. -/
+def uintPairPlacedFieldCodecs (layouts : LayoutTable) (w₁ w₂ : UintTy) (pad₁ : Nat) :
+    TupleFieldCodecs layouts [.uint w₁, .uint w₂] (uintPairPlaced w₁ w₂ pad₁) :=
+  .cons (TupleFieldCodec.uint layouts w₁)
+    (.cons (TupleFieldCodec.uint layouts w₂) .nil)
+
+/--
+Every 2-field integer placement `uintPairPlaced w₁ w₂ pad₁` is a sequential memory-order placement
+within `(uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂)`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem uintPairPlaced_sequential (w₁ w₂ : UintTy) (pad₁ pad₂ : Nat) :
+    SequentialFieldPlacement 0
+      ((uintPairPlaced w₁ w₂ pad₁).memSort.placed.map Prod.snd)
+      ((uintPairPlaced w₁ w₂ pad₁).memSort.placed.map Prod.fst)
+      ((uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂)) := by
+  have hMemSort :
+      (uintPairPlaced w₁ w₂ pad₁).memSort.placed =
+        [(0, ⟨uintByteSize w₁, uintByteSize w₁⟩),
+         (uintByteSize w₁ + pad₁, ⟨uintByteSize w₂, uintByteSize w₂⟩)] := by
+    rw [PlacedCodecSpine.placed_memSort]
+    dsimp only [uintPairPlaced, PlacedCodecSpine.placed, Anneal.ByteCodec.memSort,
+      Anneal.ByteCodec.memInsert]
+    have hKey :
+        memKey (0, ⟨uintByteSize w₁, uintByteSize w₁⟩) ≤
+          memKey (uintByteSize w₁ + pad₁, ⟨uintByteSize w₂, uintByteSize w₂⟩) := by
+      cases w₁ <;> cases w₂ <;>
+        dsimp only [memKey, nzBit, uintByteSize] <;> omega
+    exact ite_eq_left_iff.mpr (fun hNot => absurd hKey hNot)
+  rw [hMemSort]
+  dsimp only [List.map]
+  exact .cons (Nat.le_refl 0)
+    (.cons (by dsimp only; omega) (.nil (by dsimp only; omega)))
+
+/--
+2-field unsigned integer tuple `MirValueCodec` instantiated directly from the general
+$k$-field `MirValueCodec.ofPlacedCodecSpine` over `uintPairPlaced w₁ w₂ pad₁`.
+-/
+def uintPairArbitraryTupleOfPlacedCodecSpine
+    (layouts : LayoutTable) (w₁ w₂ : UintTy) (pad₁ pad₂ : Nat)
+    (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := (uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂) })
+    (hFields : l.fields =
+      .arbitrary [{ bytes := 0 }, { bytes := uintByteSize w₁ + pad₁ }] memoryIndex) :
+    MirValueCodec layouts { kind := .tuple [.uint w₁, .uint w₂], layoutIdx := idx }
+      (FieldTuple
+        [{ bits : Nat // bits < 2 ^ (8 * uintByteSize w₁) },
+         { bits : Nat // bits < 2 ^ (8 * uintByteSize w₂) }])
+      ((uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂)) :=
+  ofPlacedCodecSpine layouts idx l memoryIndex (uintPairPlaced w₁ w₂ pad₁)
+    ((uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂))
+    (uintPairPlacedFieldCodecs layouts w₁ w₂ pad₁)
+    hLookup hSize hFields (uintPairPlaced_sequential w₁ w₂ pad₁ pad₂)
+
+/--
+**Parametric Equivalence of `uintPairArbitraryTuple` and `ofPlacedCodecSpine`**: for all unsigned
+integer widths `w₁, w₂` and all inter-field/trailing padding widths `pad₁, pad₂`, the 2-field
+`MirValueCodec.uintPairArbitraryTuple` and the general $k$-field `MirValueCodec.ofPlacedCodecSpine`
+instantiation `uintPairArbitraryTupleOfPlacedCodecSpine` have identical runtime `toValue` embeddings,
+identical `encode` byte sequences, and identical `decode` results on every byte buffer `bs`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.uintPairArbitraryTuple
+-/
+theorem uintPairArbitraryTuple_eq_ofPlacedCodecSpine
+    (layouts : LayoutTable) (w₁ w₂ : UintTy) (pad₁ pad₂ : Nat)
+    (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := (uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂) })
+    (hFields : l.fields =
+      .arbitrary [{ bytes := 0 }, { bytes := uintByteSize w₁ + pad₁ }] memoryIndex) :
+    let mPair := uintPairArbitraryTuple layouts w₁ w₂ pad₁ pad₂ idx l memoryIndex
+      hLookup hSize hFields
+    let mGen := uintPairArbitraryTupleOfPlacedCodecSpine layouts w₁ w₂ pad₁ pad₂ idx l memoryIndex
+      hLookup hSize hFields
+    (∀ x₁ x₂, mPair.toValue (x₁, x₂) = mGen.toValue (x₁, x₂, ())) ∧
+    (∀ x₁ x₂, mPair.codec.encode (x₁, x₂) = mGen.codec.encode (x₁, x₂, ())) ∧
+    (∀ bs, (mPair.codec.decode bs).map (fun p => (p.1, p.2, ())) = mGen.codec.decode bs) := by
+  intro mPair mGen
+  have hToVal : ∀ x₁ x₂, mPair.toValue (x₁, x₂) = mGen.toValue (x₁, x₂, ()) :=
+    fun _ _ => rfl
+  refine ⟨hToVal, fun x₁ x₂ => ?_, fun bs => ?_⟩
+  · have hE1 := mPair.encode_toValue (x₁, x₂)
+    have hE2 := mGen.encode_toValue (x₁, x₂, ())
+    rw [hToVal x₁ x₂] at hE1
+    exact Option.some.inj (hE1.symm.trans hE2)
+  · have hD1 := mPair.decode_eq_map bs
+    have hD2 := mGen.decode_eq_map bs
+    have hMapEq : (mPair.codec.decode bs).map mPair.toValue =
+        (mGen.codec.decode bs).map mGen.toValue :=
+      hD1.symm.trans hD2
+    have hBind := congrArg (fun o : Option Value => o.bind mGen.ofValue) hMapEq
+    cases hP : mPair.codec.decode bs with
+    | none =>
+      rw [hP] at hBind
+      cases hG : mGen.codec.decode bs with
+      | none => rfl
+      | some y =>
+        rw [hG] at hBind
+        dsimp only [Option.map, Option.bind] at hBind
+        rw [mGen.ofValue_toValue y] at hBind
+        nomatch hBind
+    | some p =>
+      rcases p with ⟨x₁, x₂⟩
+      rw [hP] at hBind
+      dsimp only [Option.map, Option.bind] at hBind ⊢
+      rw [hToVal x₁ x₂, mGen.ofValue_toValue (x₁, x₂, ())] at hBind
+      cases hG : mGen.codec.decode bs with
+      | none =>
+        rw [hG] at hBind
+        nomatch hBind
+      | some y =>
+        rw [hG] at hBind
+        dsimp only [Option.map, Option.bind] at hBind
+        rw [mGen.ofValue_toValue y] at hBind
+        exact hBind
 
 end MirValueCodec
 
