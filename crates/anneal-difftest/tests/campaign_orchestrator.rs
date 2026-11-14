@@ -1199,9 +1199,12 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     );
 }
 
-/// Loads `scripts/run_diff_test_campaign.py` as a module and prints
-/// `classify_witness_polarity_from_tags(miri, anneal, slug)` (or `null`) for every
-/// `[miri, anneal, slug]` case of the JSON file in `sys.argv[2]`, one per line.
+/// Loads `scripts/run_diff_test_campaign.py` as a module and prints, one line per
+/// case of the JSON file in `sys.argv[2]`: `classify_witness_polarity_from_tags(miri,
+/// anneal, slug)` (or `null`) for mode `tags`; the `<verdict>:<detail>` of
+/// `compare_parsed_outcomes` over the parsed `[miri, anneal]` tags (or `unparsed`)
+/// for mode `verdict`; that of `classify_oracle_outcome_tags` for mode
+/// `legacy_verdict`; and `witness_polarity_accounting_holds(summary)` otherwise.
 const POLARITY_DRIVER: &str = r#"
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
@@ -1215,6 +1218,15 @@ for case in cases:
     if mode == "tags":
         out = runner.classify_witness_polarity_from_tags(*case)
         print("null" if out is None else out)
+    elif mode == "verdict":
+        miri = runner.parse_miri_summary_tag(case[0])
+        anneal = runner.parse_anneal_summary_tag(case[1])
+        if miri is None or anneal is None:
+            print("unparsed")
+        else:
+            print("%s:%s" % runner.compare_parsed_outcomes(miri, anneal))
+    elif mode == "legacy_verdict":
+        print("%s:%s" % runner.classify_oracle_outcome_tags(*case))
     else:
         print("true" if runner.witness_polarity_accounting_holds(case) else "false")
 "#;
@@ -1245,17 +1257,15 @@ fn run_polarity_driver(label: &str, cases_json: &str, mode: &str) -> Vec<String>
         .collect()
 }
 
-/// Python's `classify_witness_polarity_from_tags` agrees with Rust's
-/// `classify_outcome_tags_polarity` on the full Cartesian product of Miri tags x
-/// Anneal tags x verdict slugs: the summary tags of every `MiriOutcome` /
-/// `AnnealOutcome` shape (located, unlocated, contained, and not contained), plus
-/// adversarial spellings that only an exact port of the Rust parsers classifies
-/// identically (Unicode `White_Space` vs U+001F, leading zeros and `+` signs,
-/// `u128` / `u32` overflow, empty or `none` locations, family-prefix lookalikes).
-#[test]
-fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
-    use anneal_difftest::miri_eval::classify_outcome_tags_polarity;
-    use anneal_difftest::miri_eval::json_escape;
+/// The Miri and Anneal outcome tags of the Rust <-> Python comparator product
+/// tests, as `(miri_tags, canonical_miri, anneal_tags, canonical_anneal)`: the
+/// first `canonical_*` tags are the `summary_tag`s of every `MiriOutcome` /
+/// `AnnealOutcome` shape (located, unlocated, contained, and not contained), and
+/// the rest are adversarial spellings that only an exact port of the Rust parsers
+/// classifies identically (Unicode `White_Space` vs U+001F, leading zeros and `+`
+/// signs, `u128` / `u32` overflow, empty or `none` locations, family-prefix
+/// lookalikes).
+fn outcome_tag_product() -> (Vec<String>, usize, Vec<String>, usize) {
     use cargo_anneal::{AnnealOutcome, MiriOutcome, SourcePos, SourceSpan};
 
     let pos = |line: u32, col: u32| SourcePos {
@@ -1313,6 +1323,7 @@ fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
     .iter()
     .map(MiriOutcome::summary_tag)
     .collect();
+    let canonical_miri = miri_tags.len();
     miri_tags.extend(
         [
             " pass:unit\u{3000}",
@@ -1382,6 +1393,7 @@ fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
     .iter()
     .map(AnnealOutcome::summary_tag)
     .collect();
+    let canonical_anneal = anneal_tags.len();
     anneal_tags.extend(
         [
             "pass:scalar:0042:4",
@@ -1398,6 +1410,22 @@ fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
         ]
         .map(str::to_string),
     );
+    (miri_tags, canonical_miri, anneal_tags, canonical_anneal)
+}
+
+/// Python's `classify_witness_polarity_from_tags` agrees with Rust's
+/// `classify_outcome_tags_polarity` on the full Cartesian product of Miri tags x
+/// Anneal tags x verdict slugs: the summary tags of every `MiriOutcome` /
+/// `AnnealOutcome` shape (located, unlocated, contained, and not contained), plus
+/// adversarial spellings that only an exact port of the Rust parsers classifies
+/// identically (Unicode `White_Space` vs U+001F, leading zeros and `+` signs,
+/// `u128` / `u32` overflow, empty or `none` locations, family-prefix lookalikes).
+#[test]
+fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
+    use anneal_difftest::miri_eval::classify_outcome_tags_polarity;
+    use anneal_difftest::miri_eval::json_escape;
+
+    let (miri_tags, _, anneal_tags, _) = outcome_tag_product();
     let slugs: Vec<Option<&str>> = vec![
         None,
         Some("agree"),
@@ -1463,6 +1491,117 @@ fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
             "product never produced {slug}"
         );
     }
+}
+
+/// Python's two outcome comparators agree with Rust's `compare_miri_and_anneal`
+/// (verdict and divergence class or not-compared reason): `compare_parsed_outcomes`,
+/// behind every per-finding and per-item verdict recomputation of
+/// `witness_polarity_accounting_problems`, on every pair of the tag product (tags
+/// that a Rust parser rejects must be `unparsed` in Python too), and the legacy
+/// `classify_oracle_outcome_tags`, behind `audit_item_outcomes_against_summary` and
+/// the semantic-mutant simulation, on every pair of canonical `summary_tag`s.
+#[test]
+fn python_outcome_comparators_match_rust_compare_miri_and_anneal() {
+    use anneal_difftest::miri_eval::{
+        divergence_class_slug, json_escape, parse_anneal_summary_tag, parse_miri_summary_tag,
+    };
+    use cargo_anneal::{ComparisonVerdict, NotComparedReason, compare_miri_and_anneal};
+
+    let verdict_slug = |verdict: &ComparisonVerdict| -> String {
+        match verdict {
+            ComparisonVerdict::Agree => "agree:".to_string(),
+            ComparisonVerdict::Diverge(kind) => {
+                format!("diverge:{}", divergence_class_slug(kind))
+            }
+            ComparisonVerdict::NotCompared(reason) => format!(
+                "not_compared:{}",
+                match reason {
+                    NotComparedReason::ExternalCall(_) => "external_call",
+                    NotComparedReason::Unsupported(_) => "unsupported",
+                    NotComparedReason::OutOfFuel(_) => "out_of_fuel",
+                    NotComparedReason::MiriOracleError(_) => "miri_oracle_error",
+                    NotComparedReason::CaptureFailed(_) => "capture_failed",
+                }
+            ),
+        }
+    };
+    let (miri_tags, canonical_miri, anneal_tags, canonical_anneal) = outcome_tag_product();
+    let mut cases = Vec::new();
+    let mut expected = Vec::new();
+    let mut canonical_cases = Vec::new();
+    let mut canonical_expected = Vec::new();
+    for (m_idx, m) in miri_tags.iter().enumerate() {
+        for (a_idx, a) in anneal_tags.iter().enumerate() {
+            let case = format!("[{}, {}]", json_escape(m), json_escape(a));
+            let verdict = match (parse_miri_summary_tag(m), parse_anneal_summary_tag(a)) {
+                (Some(miri), Some(anneal)) => {
+                    verdict_slug(&compare_miri_and_anneal(&miri, &anneal))
+                }
+                _ => "unparsed".to_string(),
+            };
+            if m_idx < canonical_miri && a_idx < canonical_anneal {
+                assert_ne!(
+                    verdict, "unparsed",
+                    "canonical tags {m:?} / {a:?} must parse"
+                );
+                canonical_cases.push(case.clone());
+                canonical_expected.push(verdict.clone());
+            }
+            cases.push(case);
+            expected.push(verdict);
+        }
+    }
+    for (mode, mode_cases, mode_expected) in [
+        ("verdict", &cases, &expected),
+        ("legacy_verdict", &canonical_cases, &canonical_expected),
+    ] {
+        let got = run_polarity_driver(
+            &format!("comparator_{mode}"),
+            &format!("[{}]", mode_cases.join(",\n")),
+            mode,
+        );
+        assert_eq!(
+            got.len(),
+            mode_expected.len(),
+            "one Python result per {mode} case"
+        );
+        let mismatches: Vec<String> = mode_cases
+            .iter()
+            .zip(mode_expected.iter().zip(got.iter()))
+            .filter(|(_, (rust, py))| rust != py)
+            .map(|(case, (rust, py))| format!("{case}: rust={rust} python={py}"))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "{mode}: {} of {} cases disagree:\n{}",
+            mismatches.len(),
+            mode_cases.len(),
+            mismatches.join("\n")
+        );
+    }
+    // The canonical product reaches agreement, every divergence class, and every
+    // not-compared reason that an item outcome can carry.
+    let mut reached: Vec<&str> = vec![
+        "agree:",
+        "diverge:missed_ub",
+        "diverge:panic_vs_return",
+        "diverge:false_positive_ub",
+        "diverge:wrong_value",
+        "diverge:return_vs_panic",
+        "diverge:ub_location_mismatch",
+        "diverge:panic_site_mismatch",
+        "not_compared:external_call",
+        "not_compared:unsupported",
+        "not_compared:out_of_fuel",
+        "not_compared:miri_oracle_error",
+        "not_compared:capture_failed",
+    ];
+    reached.retain(|slug| !canonical_expected.iter().any(|e| e == slug));
+    assert!(
+        reached.is_empty(),
+        "canonical product never produced {reached:?}"
+    );
+    assert!(expected.iter().any(|e| e == "unparsed"));
 }
 
 /// Python's `witness_polarity_accounting_holds` agrees with Rust's over
