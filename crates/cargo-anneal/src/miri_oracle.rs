@@ -1176,9 +1176,15 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Time
             }
         }
     };
+    // One shared grace period for both pipes (not 5s each, in sequence): if the
+    // group kill could not run (e.g. no `kill` binary), descendants that left
+    // the process group may still hold the pipes open.
     let grace = Duration::from_secs(5);
+    let drain_started = Instant::now();
     let stdout = stdout_rx.recv_timeout(grace).unwrap_or_default();
-    let stderr = stderr_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = stderr_rx
+        .recv_timeout(grace.saturating_sub(drain_started.elapsed()))
+        .unwrap_or_default();
     Ok(match status {
         Some(status) => TimedOutput::Finished(std::process::Output {
             status,
@@ -2741,6 +2747,39 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         let _ = fs::remove_dir_all(&temp);
     }
 
+    /// Whether `pid` still names a live (not yet killed) process whose command
+    /// name is `comm`.
+    ///
+    /// A SIGKILLed orphan is reparented and reaped asynchronously by PID 1 or a
+    /// subreaper, so until then it is a zombie that still answers `kill -0`
+    /// (and where PID 1 never reaps, it answers forever). Zombies therefore
+    /// count as dead, and a recycled PID running something else is not "alive".
+    #[cfg(unix)]
+    fn process_is_live(pid: &str, comm: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // `<pid> (<comm>) <state> ...`; `comm` may itself contain spaces or `)`.
+            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+                return false;
+            };
+            let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+            !matches!(state, "Z" | "X" | "x") && &stat[open + 1..close] == comm
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = comm;
+            Command::new("kill")
+                .args(["-s", "0", pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn hung_miri_setup_is_killed_at_the_timeout_and_fails_closed() {
@@ -2749,7 +2788,7 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         let grandchild_pid_file = temp.join("grandchild.pid");
         // Spawn a non-`exec` child sleeper (modeling `cargo` -> `cargo-miri` ->
         // `rustc`) to verify that process-group termination kills descendants
-        // and closes stdout/stderr pipes immediately without a 5s+5s grace stall.
+        // and closes stdout/stderr pipes immediately without a grace stall.
         write_executable_script(
             &hung_cargo,
             &format!(
@@ -2758,10 +2797,12 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
             ),
         );
         let home = temp.join("home");
+        // 2s (not 1s) so the mock has recorded its grandchild before the kill
+        // even on a heavily loaded machine; the slack below stays 4s.
         let get_env = env_map(&[
             ("HOME", home.as_os_str()),
             (MIRI_SETUP_BIN_ENV, hung_cargo.as_os_str()),
-            (MIRI_SETUP_TIMEOUT_ENV, OsStr::new("1")),
+            (MIRI_SETUP_TIMEOUT_ENV, OsStr::new("2")),
         ]);
         let started = Instant::now();
         let err = resolve_sysroot_path_with(None, &get_env, |candidate| {
@@ -2770,25 +2811,26 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         .expect_err("a hung miri setup must fail closed");
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < Duration::from_secs(6),
             "process-group kill must terminate hung setup and grandchildren without pipe-drain stall, took {elapsed:?}"
         );
         let grandchild_pid = fs::read_to_string(&grandchild_pid_file)
             .expect("grandchild pid recorded")
             .trim()
             .to_string();
-        let grandchild_alive = Command::new("kill")
-            .args(["-s", "0", &grandchild_pid])
-            .stdout( std::process::Stdio::null() )
-            .stderr( std::process::Stdio::null() )
-            .status()
-            .is_ok_and(|s| s.success());
+        // Reaping the killed (reparented) grandchild is asynchronous: allow it
+        // a moment to leave the run queue, but a survivor of the timeout would
+        // keep sleeping for a minute and fail this.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_live(&grandchild_pid, "sleep") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
-            !grandchild_alive,
+            !process_is_live(&grandchild_pid, "sleep"),
             "grandchild process {grandchild_pid} must be killed when miri setup times out"
         );
         assert!(
-            err.contains("timed out after 1s")
+            err.contains("timed out after 2s")
                 && err.contains("compiling core...")
                 && err.contains(MIRI_SETUP_TIMEOUT_ENV)
                 && err.contains("missing Miri sysroot is a hard error"),
@@ -2824,6 +2866,29 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
                 Ok(default)
             );
         }
+        // The documented maximum is accepted for both knobs, and only an explicit
+        // lock timeout is capped: the derived default may exceed the cap by 60s
+        // (the staged launcher derives and validates the same way).
+        let max = Duration::from_secs(MAX_MIRI_SETUP_TIMEOUT_SECS);
+        assert_eq!(MAX_MIRI_SETUP_TIMEOUT_SECS, 31_536_000);
+        assert_eq!(
+            miri_setup_timeout(&env_map(&[(
+                MIRI_SETUP_TIMEOUT_ENV,
+                OsStr::new("31536000")
+            )])),
+            Ok(max)
+        );
+        assert_eq!(
+            miri_setup_lock_wait(&env_map(&[]), max),
+            Ok(max + Duration::from_secs(60))
+        );
+        assert_eq!(
+            miri_setup_lock_wait(
+                &env_map(&[(MIRI_SETUP_LOCK_TIMEOUT_ENV, OsStr::new("31536000"))]),
+                default
+            ),
+            Ok(max)
+        );
         for bad in [
             "0",
             "-5",
@@ -2924,6 +2989,29 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     }
 
     #[test]
+    fn unopenable_setup_lock_fails_closed_without_running_setup() {
+        // Parity with the staged launcher's exit-74 path: a `.setup.lock` that
+        // cannot be opened (here: a directory) is a hard error, never an
+        // unlocked setup.
+        let temp = unique_oracle_temp_dir("sysroot-lock-unopenable");
+        let sysroot = temp.join(".cache/miri");
+        fs::create_dir_all(sysroot.join(".setup.lock")).expect("create .setup.lock as a dir");
+        let mut called = false;
+        let err = ensure_miri_sysroot_initialized_with(&sysroot, |_| {
+            called = true;
+            Ok(())
+        })
+        .expect_err("an unopenable .setup.lock must fail closed");
+        assert!(!called, "setup must never run without the lock");
+        assert!(
+            err.contains("failed to open Miri sysroot lock file")
+                && err.contains(".setup.lock"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn lock_wait_is_bounded_when_another_holder_never_releases() {
         let temp = unique_oracle_temp_dir("sysroot-lock-wait");
         let sysroot = temp.join(".cache/miri");
@@ -3019,6 +3107,43 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         assert!(sysroot.join(".setup.lock").is_file());
         assert!(sysroot.join("lib/rustlib").is_dir());
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// Live end-to-end check of the production provisioning path against the
+    /// real pinned toolchain: resolves `cargo` exactly as the oracle does and
+    /// runs `cargo miri setup` into a fresh directory (never `~/.cache/miri`).
+    /// Run it with
+    /// `cargo test -p cargo-anneal --lib -- --ignored live_miri_setup`.
+    #[test]
+    #[ignore = "builds a real Miri sysroot with the pinned nightly-2026-06-01 toolchain (minutes)"]
+    fn live_miri_setup_provisions_a_fresh_sysroot_through_the_production_path() {
+        let temp = unique_oracle_temp_dir("sysroot-live-setup");
+        let candidate = temp.join("miri-sysroot");
+        let resolved = ensure_miri_sysroot_initialized_from_env(&candidate, &process_env_var)
+            .unwrap_or_else(|err| panic!("live miri setup failed: {err}"));
+        assert_eq!(resolved, candidate);
+        assert!(candidate.join(".setup.lock").is_file());
+        let mut rlibs = Vec::new();
+        for target in fs::read_dir(candidate.join("lib/rustlib")).expect("read lib/rustlib") {
+            let lib_dir = target.expect("target dir entry").path().join("lib");
+            if let Ok(entries) = fs::read_dir(&lib_dir) {
+                rlibs.extend(
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|name| name.ends_with(".rlib")),
+                );
+            }
+        }
+        for krate in ["core", "alloc", "std"] {
+            assert!(
+                rlibs
+                    .iter()
+                    .any(|name| name.starts_with(&format!("lib{krate}-"))),
+                "live sysroot is missing lib{krate}-*.rlib: {rlibs:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&temp);
     }
 
