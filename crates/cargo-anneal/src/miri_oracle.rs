@@ -1114,6 +1114,14 @@ enum TimedOutput {
 /// captured, killing the entire process group once `timeout` elapses so
 /// grandchildren (`cargo-miri`, `cargo build`, `rustc`) cannot outlive the
 /// `.setup.lock` guard or keep stdout/stderr pipes open.
+///
+/// Design trade-off: placing `cmd` into a dedicated process group (`pgid = child.id()`)
+/// means a process-group signal sent to `cargo-anneal` itself (e.g., terminal
+/// `SIGINT`) will not automatically reach the setup subtree if `cargo-anneal`
+/// terminates before `kill_child_and_group` runs; in that rare event,
+/// `rustc-build-sysroot` stages builds in a temporary directory and atomically
+/// renames into `lib/rustlib`, while keeping `.setup.lock` `CLOEXEC` ensures a
+/// hung grandchild can never wedge `.setup.lock` past `timeout`.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<TimedOutput> {
     use std::io::Read;
     use std::process::Stdio;
@@ -1131,13 +1139,22 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Time
     fn kill_child_and_group(child: &mut std::process::Child) {
         #[cfg(unix)]
         {
-            let pgid = child.id();
-            let _ = Command::new("kill")
-                .args(["-s", "KILL", "--", &format!("-{pgid}")])
+            let pgid_arg = format!("-{}", child.id());
+            let killed = Command::new("kill")
+                .args(["-s", "KILL", "--", &pgid_arg])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .status()
+                .is_ok();
+            if !killed {
+                let _ = Command::new("/bin/kill")
+                    .args(["-s", "KILL", "--", &pgid_arg])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -2851,6 +2868,13 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         );
         assert_eq!(
             miri_setup_timeout(&env_map(&[(MIRI_SETUP_TIMEOUT_ENV, OsStr::new(" 42 "))])),
+            Ok(Duration::from_secs(42))
+        );
+        assert_eq!(
+            miri_setup_timeout(&env_map(&[(
+                MIRI_SETUP_TIMEOUT_ENV,
+                OsStr::new("0000000042")
+            )])),
             Ok(Duration::from_secs(42))
         );
         assert_eq!(
