@@ -263,10 +263,11 @@ theorem demoS3World_tuple_isFromBytes_not_isIntoBytes :
 /--
 End-to-end non-vacuity on the **actual** `demoS3Placed` (`struct S { a: u8, b: [u8; 4], c: () }`
 at `{ kind := .adt "demo::S3" [.uint .u8, .array (.uint .u8) 4, .tuple []], layoutIdx := 0 }`):
-using `TupleFieldCodec.demoS3PlacedFieldCodecs`, `AdtDecodeFallbackNone.of_reordered_head`, and
-`MirValueCodec.adtOfValidStructLayoutWorld_bitValidity`, the single-variant `.adt` struct satisfies
-`IsFromBytes`, `IsFromZeros`, and `IsTryFromBytes`, places every field window at its declared offset,
-and emits `.uninit` padding bytes (`¬ IsIntoBytes`).
+using `TupleFieldCodec.demoS3PlacedFieldCodecs` and
+`MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity`, the single-variant `.adt`
+struct satisfies `IsFromBytes`, `IsFromZeros`, and `IsTryFromBytes`, places every field window at
+its declared offset, and emits `.uninit` padding bytes (`¬ IsIntoBytes`), with zero manual fallback
+obligations.
 -/
 theorem demoS3World_real_adt_bitValidity :
     let ty : Ty :=
@@ -276,22 +277,50 @@ theorem demoS3World_real_adt_bitValidity :
     IsTryFromBytes u8u32UnitPermutedLayouts ty ∧
     ¬ IsIntoBytes u8u32UnitPermutedLayouts ty := by
   intro ty
-  have hFbNone :
-      MirValueCodec.AdtDecodeFallbackNone u8u32UnitPermutedLayouts u8u32UnitPermutedLayout 0
-        (demoS3Placed.placed.map fun p => ({ bytes := p.1 } : Size)) demoS3World.totalSize :=
-    MirValueCodec.AdtDecodeFallbackNone.of_reordered_head rfl rfl (by decide)
-  have h := MirValueCodec.adtOfValidStructLayoutWorld_bitValidity demoS3World_valid
-    u8u32UnitPermutedLayouts "demo::S3" 0 u8u32UnitPermutedLayout 0 [1, 0, 2]
-    demoS3Placed (TupleFieldCodec.demoS3PlacedFieldCodecs _)
-    rfl rfl rfl rfl rfl rfl (MirValueCodec.AdtDecodeFallbackNone.toSound hFbNone)
   have hSurj : demoS3Placed.AllFieldsSurjective :=
     ⟨FixedByteCodec.u8_isSurjectiveInitDecoder,
      FixedByteCodec.array_isSurjectiveInitDecoder 4 FixedByteCodec.u8_isSurjectiveInitDecoder,
      FixedByteCodec.unit_isSurjectiveInitDecoder,
      trivial⟩
-  have hFrom := h.2.1.1 hSurj
+  have h := MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity demoS3World_valid
+    u8u32UnitPermutedLayouts "demo::S3" 0 u8u32UnitPermutedLayout 0 [1, 0, 2]
+    demoS3Placed (TupleFieldCodec.demoS3PlacedFieldCodecs _)
+    rfl rfl rfl rfl rfl rfl rfl rfl hSurj
+  have hFrom := h.2.1
   have hNotInto :=
     (h.2.2.2 (by decide) (0, ⟨#[0, 0, 0, 0], rfl⟩, (), ())).2.2
+  exact ⟨hFrom.1, hFrom.2.1, hFrom.2.2, hNotInto⟩
+
+/--
+End-to-end non-vacuity on an **in-order** padded struct `struct PaddedPair { a: u8, b: u32 }`
+(`u8 @ 0`, `u32 @ 4`, `size = 8`, `align = 4`) using `concretePaddedU8U32PairWorld.valid` and
+`MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity`: proves `IsFromBytes`,
+`IsFromZeros`, `IsTryFromBytes`, and `¬ IsIntoBytes` with zero manual fallback obligations.
+-/
+theorem reprCU8U32PairWorld_real_adt_bitValidity :
+    let ty : Ty := { kind := .adt "demo::ReprCPair" [.uint .u8, .uint .u32], layoutIdx := 0 }
+    IsFromBytes u8u32PairLayouts ty ∧
+    IsFromZeros u8u32PairLayouts ty ∧
+    IsTryFromBytes u8u32PairLayouts ty ∧
+    ¬ IsIntoBytes u8u32PairLayouts ty := by
+  intro ty
+  have hValid :=
+    Anneal.Mir.AdtAndControl.SymbolicPairPad.toStructLayoutWorld_valid_reprRust
+      (f₀ := ⟨1, 1⟩) (f₁ := ⟨4, 4⟩)
+      ⟨0, 3, 0, false⟩ (by decide) (by decide) (by decide) (by decide)
+      (fun h => absurd h (by decide))
+  have hSurj : (MirValueCodec.uintPairPlaced .u8 .u32 3).AllFieldsSurjective :=
+    ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide),
+     FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide),
+     trivial⟩
+  have h := MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity hValid
+    u8u32PairLayouts "demo::ReprCPair" 0 u8u32PairLayout 0 [0, 1]
+    (MirValueCodec.uintPairPlaced .u8 .u32 3)
+    (MirValueCodec.uintPairPlacedFieldCodecs _ .u8 .u32 3)
+    rfl rfl rfl rfl rfl rfl rfl rfl hSurj
+  have hFrom := h.2.1
+  have hNotInto :=
+    (h.2.2.2 (by decide) (⟨0, by decide⟩, ⟨0, by decide⟩, ())).2.2
   exact ⟨hFrom.1, hFrom.2.1, hFrom.2.2, hNotInto⟩
 
 /--
@@ -406,5 +435,17 @@ theorem tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes :
 /-- info: 'Anneal.Mir.AdtAndControlTests.tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes
+
+/-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective
+
+/-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity
+
+/-- info: 'Anneal.Mir.AdtAndControlTests.reprCU8U32PairWorld_real_adt_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reprCU8U32PairWorld_real_adt_bitValidity
 
 end Anneal.Mir.AdtAndControlTests

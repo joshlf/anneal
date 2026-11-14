@@ -7284,6 +7284,86 @@ theorem decodeLittleEndianBytes_some_allBytesInitialized :
       exact decodeLittleEndianBytes_some_allBytesInitialized rest r' hR
 
 /--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeScalarBytes_some_allBytesInitialized (bytes : List AbstractByte) (signed : Bool)
+    (r : ScalarInt × Option (Nat × Nat))
+    (h : decodeScalarBytes bytes signed = some r) :
+    allBytesInitialized bytes = true := by
+  unfold decodeScalarBytes at h
+  dsimp only at h
+  cases h0 : Nat.beq (Trusted.Sequence.length bytes) 0 with
+  | true =>
+    rw [h0] at h
+    nomatch h
+  | false =>
+    rw [h0] at h
+    dsimp only at h
+    cases hLE : decodeLittleEndianBytes bytes with
+    | none =>
+      rw [hLE] at h
+      nomatch h
+    | some r' =>
+      exact decodeLittleEndianBytes_some_allBytesInitialized bytes r' hLE
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeScalarLayoutBytes_some_allBytesInitialized (sl : ScalarLayout)
+    (bytes : List AbstractByte) (v : Value)
+    (h : decodeScalarLayoutBytes sl bytes = some v) :
+    allBytesInitialized bytes = true := by
+  unfold decodeScalarLayoutBytes at h
+  cases hW : scalarLayoutByteWidth sl with
+  | none =>
+    rw [hW] at h
+    nomatch h
+  | some sz =>
+    rw [hW] at h
+    dsimp only at h
+    cases hLen : Nat.beq (Trusted.Sequence.length bytes) sz with
+    | false =>
+      rw [hLen] at h
+      nomatch h
+    | true =>
+      rw [hLen] at h
+      dsimp only at h
+      cases sl <;>
+        (cases hSc : decodeScalarBytes bytes false with
+         | none =>
+           rw [hSc] at h
+           nomatch h
+         | some r =>
+           exact decodeScalarBytes_some_allBytesInitialized bytes false r hSc)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem sliceAbstractBytes_some_eq_drop_take_and_len
+    {bs : List AbstractByte} {off sz : Nat} {fSlice : List AbstractByte}
+    (h : sliceAbstractBytes bs off sz = some fSlice) :
+    fSlice = (bs.drop off).take sz ∧ fSlice.length = sz := by
+  unfold sliceAbstractBytes at h
+  cases hBle : Nat.ble (Nat.add off sz) (Trusted.Sequence.length bs) with
+  | false =>
+    rw [hBle] at h
+    nomatch h
+  | true =>
+    rw [hBle] at h
+    injection h with hEq
+    rw [takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop] at hEq
+    have hIn : off + sz ≤ bs.length := Nat.le_of_ble_eq_true hBle
+    refine ⟨hEq.symm, ?_⟩
+    rw [← hEq, List.length_take, List.length_drop]
+    exact Nat.min_eq_left (Nat.le_sub_of_add_le (by rw [Nat.add_comm]; exact hIn))
+
+/--
 One-step unfolding of Trusted's `decodeFieldsBySpan` with the next offset as `headD`.
 
 Kind: helper
@@ -8552,6 +8632,376 @@ theorem AdtDecodeFallbackSound.of_memory_surjective
           List.mem_map_of_mem (f := fun p : Nat × FieldLayout => ({ bytes := p.1 } : Size)) hp
         exact hInitAll j (Nat.le_trans (hHeadLe _ hMem) hj₁)
           (Nat.lt_of_lt_of_le hj₂ (hIn p hp)))
+    rw [hNone] at hx
+    nomatch hx
+
+/--
+**Fallback Soundness for 1-Field `.scalar` Structs With a Surjective Field Codec**:
+when `l.fieldLayouts = []` and `l.backendRepr = .scalar s0` with `scalarLayoutByteWidth s0 = some p₀.2.size`,
+Trusted's fallback slices `[p₀.1 .. p₀.1 + p₀.2.size)` and runs `decodeScalarLayoutBytes s0`, which
+succeeds only if that window is initialized; then `c₀.IsSurjectiveInitDecoder` makes `pc.decodeAt bs`
+succeed.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: AdtDecodeFallbackSound
+-/
+theorem AdtDecodeFallbackSound.of_scalar_surjective
+    {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {α : Type} {p₀ : Nat × FieldLayout} {c₀ : FixedByteCodec α p₀.2.size}
+    {s0 : ScalarLayout} {totalSize : Nat}
+    (hFl : l.fieldLayouts = []) (hRepr : l.backendRepr = .scalar s0)
+    (hWidth0 : scalarLayoutByteWidth s0 = some p₀.2.size)
+    (hSurj0 : c₀.IsSurjectiveInitDecoder) :
+    AdtDecodeFallbackSound layouts l varIdx (.cons p₀ c₀ .nil) totalSize := by
+  intro bs _ hNone
+  unfold adtDecodeFallback
+  rw [hFl, hRepr]
+  dsimp only [PlacedCodecSpine.placed, List.map]
+  rw [hWidth0]
+  dsimp only
+  cases hSl : sliceAbstractBytes bs p₀.1 p₀.2.size with
+  | none => rfl
+  | some slice0 =>
+    dsimp only
+    cases hSc : decodeScalarLayoutBytes s0 slice0 with
+    | none => rfl
+    | some v0 =>
+      exfalso
+      obtain ⟨hEq, hLen⟩ := sliceAbstractBytes_some_eq_drop_take_and_len hSl
+      have hInit := decodeScalarLayoutBytes_some_allBytesInitialized s0 slice0 v0 hSc
+      obtain ⟨a₀, ha₀⟩ := hSurj0 slice0 hLen hInit
+      rw [hEq] at ha₀
+      unfold PlacedCodecSpine.decodeAt at hNone
+      rw [ha₀] at hNone
+      nomatch hNone
+
+/--
+**Fallback Soundness for 2-Field `.scalarPair` Structs With Surjective Field Codecs**
+(in-order *or* reordered, with any leading/inter-field/trailing padding):
+when `l.fieldLayouts = []` and `l.backendRepr = .scalarPair s0 s1` with matching byte widths
+`scalarLayoutByteWidth s0 = some p₀.2.size` and `scalarLayoutByteWidth s1 = some p₁.2.size`,
+Trusted's fallback slices both field windows `[p₀.1 .. p₀.1 + p₀.2.size)` and
+`[p₁.1 .. p₁.1 + p₁.2.size)` and runs `decodeScalarLayoutBytes` on each, which succeeds only if both
+windows are initialized; then `c₀.IsSurjectiveInitDecoder` and `c₁.IsSurjectiveInitDecoder` make
+`pc.decodeAt bs` succeed.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: AdtDecodeFallbackSound
+-/
+theorem AdtDecodeFallbackSound.of_scalarPair_surjective
+    {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {α₀ α₁ : Type} {p₀ p₁ : Nat × FieldLayout}
+    {c₀ : FixedByteCodec α₀ p₀.2.size} {c₁ : FixedByteCodec α₁ p₁.2.size}
+    {s0 s1 : ScalarLayout} {totalSize : Nat}
+    (hFl : l.fieldLayouts = []) (hRepr : l.backendRepr = .scalarPair s0 s1)
+    (hWidth0 : scalarLayoutByteWidth s0 = some p₀.2.size)
+    (hWidth1 : scalarLayoutByteWidth s1 = some p₁.2.size)
+    (hSurj0 : c₀.IsSurjectiveInitDecoder)
+    (hSurj1 : c₁.IsSurjectiveInitDecoder) :
+    AdtDecodeFallbackSound layouts l varIdx (.cons p₀ c₀ (.cons p₁ c₁ .nil)) totalSize := by
+  intro bs _ hNone
+  unfold adtDecodeFallback
+  rw [hFl, hRepr]
+  dsimp only [PlacedCodecSpine.placed, List.map]
+  rw [hWidth0, hWidth1]
+  dsimp only
+  cases hSl0 : sliceAbstractBytes bs p₀.1 p₀.2.size with
+  | none => rfl
+  | some slice0 =>
+    cases hSl1 : sliceAbstractBytes bs p₁.1 p₁.2.size with
+    | none => rfl
+    | some slice1 =>
+      dsimp only
+      cases hSc0 : decodeScalarLayoutBytes s0 slice0 with
+      | none => rfl
+      | some v0 =>
+        cases hSc1 : decodeScalarLayoutBytes s1 slice1 with
+        | none => rfl
+        | some v1 =>
+          exfalso
+          obtain ⟨hEq0, hLen0⟩ := sliceAbstractBytes_some_eq_drop_take_and_len hSl0
+          obtain ⟨hEq1, hLen1⟩ := sliceAbstractBytes_some_eq_drop_take_and_len hSl1
+          have hInit0 := decodeScalarLayoutBytes_some_allBytesInitialized s0 slice0 v0 hSc0
+          have hInit1 := decodeScalarLayoutBytes_some_allBytesInitialized s1 slice1 v1 hSc1
+          obtain ⟨a₀, ha₀⟩ := hSurj0 slice0 hLen0 hInit0
+          obtain ⟨a₁, ha₁⟩ := hSurj1 slice1 hLen1 hInit1
+          rw [hEq0] at ha₀
+          rw [hEq1] at ha₁
+          unfold PlacedCodecSpine.decodeAt at hNone
+          rw [ha₀] at hNone
+          unfold PlacedCodecSpine.decodeAt at hNone
+          rw [ha₁] at hNone
+          nomatch hNone
+
+/--
+Per-field layout-table soundness for `TypeLayout.fieldLayouts`: each field `(p, c)` in `pc` is paired
+with a layout index `fIdx` in `layouts` whose entry `fl` has size `p.2.size` and whose layout-based
+decode (`decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx }`)
+succeeds only on byte slices that `c.decode` also accepts.
+
+Unlike `l.fieldLayouts = []` (where Trusted falls back to `decodeFieldsBySpan`), a struct with
+populated `l.fieldLayouts` satisfying `FieldLayoutsDecodeSound` enforces per-field niche invariants
+(such as `bool` `0 ..= 1` or `NonZero*` `1 ..= MAX`) inside `adtDecodeFallback`, so
+`AdtDecodeFallbackSound` holds for both in-order and reordered structs with niche fields!
+-/
+inductive FieldLayoutsDecodeSound (layouts : LayoutTable) :
+    {αs : List Type} → PlacedCodecSpine αs → List LayoutIdx → Prop where
+  | nil : FieldLayoutsDecodeSound layouts .nil []
+  | cons {α : Type} {αs : List Type} {p : Nat × FieldLayout}
+      {c : FixedByteCodec α p.2.size} {tail : PlacedCodecSpine αs}
+      {fIdx : LayoutIdx} {fRest : List LayoutIdx} {fl : TypeLayout}
+      (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+      (hSize : fl.size.bytes = p.2.size)
+      (hField : ∀ fSlice : List AbstractByte, fSlice.length = p.2.size →
+        (∃ v, decodeValueFromBytes tupleFieldFuel layouts
+          { kind := .adt "" [], layoutIdx := fIdx } fSlice = some v) →
+        ∃ a, c.decode fSlice = some a)
+      (rest : FieldLayoutsDecodeSound layouts tail fRest) :
+      FieldLayoutsDecodeSound layouts (.cons p c tail) (fIdx :: fRest)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.length_eq {layouts : LayoutTable} :
+    ∀ {αs : List Type} {pc : PlacedCodecSpine αs} {fIdxs : List LayoutIdx},
+      FieldLayoutsDecodeSound layouts pc fIdxs →
+      fIdxs.length = pc.placed.length
+  | _, .nil, _, .nil => rfl
+  | _, .cons _ _ _, _, .cons _ _ _ rest =>
+    congrArg Nat.succ (FieldLayoutsDecodeSound.length_eq rest)
+
+/--
+If `FieldLayoutsDecodeSound layouts pc fIdxs` holds, any successful `decodeFieldsByLayoutIdxs` run
+implies that `pc.decodeAt bs` also succeeds.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.decodeAt_isSome_of_decodeFieldsByLayoutIdxs
+    {layouts : LayoutTable} (bs : List AbstractByte) :
+    ∀ {αs : List Type} {pc : PlacedCodecSpine αs} {fIdxs : List LayoutIdx} {vals : List Value},
+      FieldLayoutsDecodeSound layouts pc fIdxs →
+      decodeFieldsByLayoutIdxs
+        (fun fIdx fSlice =>
+          decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+        layouts bs (pc.placed.map fun p => ({ bytes := p.1 } : Size)) fIdxs = some vals →
+      ∃ x, pc.decodeAt bs = some x
+  | _, .nil, _, _, .nil, _ => ⟨(), rfl⟩
+  | _, .cons p c tail, _ :: fRest, vals, .cons hLookup hSize hField rest, hDec => by
+    unfold decodeFieldsByLayoutIdxs at hDec
+    dsimp only [PlacedCodecSpine.placed, List.map] at hDec
+    rw [hLookup] at hDec
+    dsimp only at hDec
+    rw [hSize] at hDec
+    cases hSl : sliceAbstractBytes bs p.1 p.2.size with
+    | none =>
+      rw [hSl] at hDec
+      nomatch hDec
+    | some fSlice =>
+      rw [hSl] at hDec
+      dsimp only at hDec
+      cases hFV : decodeValueFromBytes tupleFieldFuel layouts
+          { kind := .adt "" [], layoutIdx := _ } fSlice with
+      | none =>
+        rw [hFV] at hDec
+        nomatch hDec
+      | some v =>
+        rw [hFV] at hDec
+        dsimp only at hDec
+        cases hRest : decodeFieldsByLayoutIdxs
+            (fun fIdx fSlice =>
+              decodeValueFromBytes tupleFieldFuel layouts
+                { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+            layouts bs (tail.placed.map fun p => ({ bytes := p.1 } : Size)) fRest with
+        | none =>
+          rw [hRest] at hDec
+          nomatch hDec
+        | some vs =>
+          obtain ⟨hEq, hLen⟩ := sliceAbstractBytes_some_eq_drop_take_and_len hSl
+          obtain ⟨a, ha⟩ := hField fSlice hLen ⟨v, hFV⟩
+          rw [hEq] at ha
+          obtain ⟨r, hr⟩ :=
+            FieldLayoutsDecodeSound.decodeAt_isSome_of_decodeFieldsByLayoutIdxs bs rest hRest
+          refine ⟨(a, r), ?_⟩
+          show (match c.decode ((bs.drop p.1).take p.2.size), tail.decodeAt bs with
+            | some a', some r' => some (a', r')
+            | _, _ => none) = some (a, r)
+          rw [ha, hr]
+
+/--
+Ready-made `FieldLayoutsDecodeSound` step for any surjective field codec (`c.IsSurjectiveInitDecoder`)
+paired with a `.primitive` field layout `fl` (`fl.size.bytes = p.2.size`, `0 < p.2.size`,
+`fl.isUninhabited = false`, `fl.variants = .single varIdx`, `fl.fields = .primitive`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.cons_primitive_surjective
+    {layouts : LayoutTable} {α : Type} {αs : List Type}
+    {p : Nat × FieldLayout} {c : FixedByteCodec α p.2.size} {tail : PlacedCodecSpine αs}
+    {fIdx : LayoutIdx} {fRest : List LayoutIdx} {fl : TypeLayout} {varIdx : VariantIdx}
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hInhab : fl.isUninhabited = false)
+    (hVar : fl.variants = .single varIdx)
+    (hFields : fl.fields = .primitive)
+    (hSize : fl.size.bytes = p.2.size)
+    (hNz : 0 < p.2.size)
+    (hSurj : c.IsSurjectiveInitDecoder)
+    (rest : FieldLayoutsDecodeSound layouts tail fRest) :
+    FieldLayoutsDecodeSound layouts (.cons p c tail) (fIdx :: fRest) := by
+  refine .cons hLookup hSize (fun fSlice hLen ⟨v, hDec⟩ => ?_) rest
+  unfold tupleFieldFuel decodeValueFromBytes at hDec
+  dsimp only at hDec
+  rw [hLookup] at hDec
+  dsimp only at hDec
+  rw [hInhab, hSize] at hDec
+  have hBeqLen : Nat.beq (Trusted.Sequence.length fSlice) p.2.size = true :=
+    Nat.beq_eq.mpr hLen
+  rw [hBeqLen] at hDec
+  dsimp only [Bool.not, Bool.or] at hDec
+  rw [hVar, hFields] at hDec
+  dsimp only at hDec
+  have hBeq0 : Nat.beq p.2.size 0 = false := nat_beq_eq_false_of_ne (by omega)
+  rw [hBeq0] at hDec
+  dsimp only at hDec
+  have hInit : allBytesInitialized fSlice = true := by
+    cases hRepr : fl.backendRepr with
+    | scalar s0 =>
+      rw [hRepr] at hDec
+      exact decodeScalarLayoutBytes_some_allBytesInitialized s0 fSlice v hDec
+    | scalarPair _ _ | memory =>
+      rw [hRepr] at hDec
+      dsimp only at hDec
+      cases hSc : decodeScalarBytes fSlice false with
+      | none =>
+        rw [hSc] at hDec
+        nomatch hDec
+      | some r =>
+        exact decodeScalarBytes_some_allBytesInitialized fSlice false r hSc
+  exact hSurj fSlice hLen hInit
+
+/--
+Ready-made `FieldLayoutsDecodeSound` step for a `bool` field (`FixedByteCodec.boolByte`) paired with
+its `.primitive` scalar-niche `TypeLayout` (`fl.size.bytes = 1`, `fl.isUninhabited = false`,
+`fl.variants = .single varIdx`, `fl.fields = .primitive`,
+`fl.backendRepr = .scalar (.initialized (.int 8 false) ⟨0, 1⟩)`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.cons_primitive_bool
+    {layouts : LayoutTable} {αs : List Type}
+    {off : Nat} {align : Nat} {tail : PlacedCodecSpine αs}
+    {fIdx : LayoutIdx} {fRest : List LayoutIdx} {fl : TypeLayout} {varIdx : VariantIdx}
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hInhab : fl.isUninhabited = false)
+    (hVar : fl.variants = .single varIdx)
+    (hFields : fl.fields = .primitive)
+    (hSize : fl.size.bytes = 1)
+    (hRepr : fl.backendRepr = .scalar (.initialized (.int 8 false) ⟨0, 1⟩))
+    (rest : FieldLayoutsDecodeSound layouts tail fRest) :
+    FieldLayoutsDecodeSound layouts (.cons (off, ⟨1, align⟩) FixedByteCodec.boolByte tail)
+      (fIdx :: fRest) := by
+  refine .cons hLookup hSize (fun fSlice hLen ⟨v, hDec⟩ => ?_) rest
+  unfold tupleFieldFuel decodeValueFromBytes at hDec
+  dsimp only at hDec
+  rw [hLookup] at hDec
+  dsimp only at hDec
+  rw [hInhab, hSize, hVar, hFields, hRepr] at hDec
+  cases fSlice with
+  | nil => nomatch hLen
+  | cons b0 restSlice =>
+    cases restSlice with
+    | cons _ _ => nomatch hLen
+    | nil =>
+      cases b0 with
+      | uninit => nomatch hDec
+      | init b prov =>
+        unfold decodeScalarLayoutBytes decodeScalarBytes decodeLittleEndianBytes
+          wrappingRangeContains at hDec
+        dsimp only [scalarLayoutByteWidth, primitiveKindByteWidth] at hDec
+        cases h0 : Nat.beq b.toBitVec.toNat 0
+        · cases h1 : Nat.beq b.toBitVec.toNat 1
+          · have hGe2 : 2 ≤ b.toBitVec.toNat := by
+              have hNe0 : b.toBitVec.toNat ≠ 0 := fun h => by
+                rw [Nat.beq_eq.mpr h] at h0; nomatch h0
+              have hNe1 : b.toBitVec.toNat ≠ 1 := fun h => by
+                rw [Nat.beq_eq.mpr h] at h1; nomatch h1
+              omega
+            have hBle1 : Nat.ble (b.toBitVec.toNat + 256 * 0) 1 = false := by
+              cases hB : Nat.ble (b.toBitVec.toNat + 256 * 0) 1 with
+              | false => rfl
+              | true =>
+                have := Nat.le_of_ble_eq_true hB
+                omega
+            change (match Bool.and (Nat.ble 0 (b.toBitVec.toNat + 256 * 0))
+                (Nat.ble (b.toBitVec.toNat + 256 * 0) 1) with
+              | false => none
+              | true => some (Value.scalar ⟨b.toBitVec.toNat + 256 * 0, 1⟩)) = some v at hDec
+            rw [hBle1, Bool.and_false] at hDec
+            nomatch hDec
+          · refine ⟨true, ?_⟩
+            show (match Nat.beq b.toBitVec.toNat 0 with
+              | true => some false
+              | false =>
+                match Nat.beq b.toBitVec.toNat 1 with
+                | true => some true
+                | false => none) = some true
+            rw [h0, h1]
+        · refine ⟨false, ?_⟩
+          show (match Nat.beq b.toBitVec.toNat 0 with
+            | true => some false
+            | false =>
+              match Nat.beq b.toBitVec.toNat 1 with
+              | true => some true
+              | false => none) = some false
+          rw [h0]
+
+/--
+**Fallback Soundness for Structs With Populated `l.fieldLayouts`** (in-order *or* reordered, with
+any `l.backendRepr` and niche fields such as `bool` or `NonZero*`):
+whenever `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` holds, Trusted's `adtDecodeFallback`
+takes the `decodeFieldsByLayoutIdxs` branch and cannot succeed on any buffer rejected by
+`pc.decodeAt`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: AdtDecodeFallbackSound
+-/
+theorem AdtDecodeFallbackSound.of_fieldLayouts
+    {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (hFl : FieldLayoutsDecodeSound layouts pc l.fieldLayouts) :
+    AdtDecodeFallbackSound layouts l varIdx pc totalSize := by
+  intro bs _ hNone
+  unfold adtDecodeFallback
+  have hBeq :
+      Nat.beq (Trusted.Sequence.length l.fieldLayouts)
+        (Trusted.Sequence.length (pc.placed.map fun p => ({ bytes := p.1 } : Size))) = true := by
+    apply Nat.beq_eq.mpr
+    show l.fieldLayouts.length = (pc.placed.map fun p => ({ bytes := p.1 } : Size)).length
+    rw [List.length_map]
+    exact hFl.length_eq
+  rw [hBeq]
+  dsimp only
+  cases hIdx : decodeFieldsByLayoutIdxs
+      (fun fIdx fSlice =>
+        decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+      layouts bs (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.fieldLayouts with
+  | none => rfl
+  | some vals =>
+    exfalso
+    obtain ⟨x, hx⟩ := hFl.decodeAt_isSome_of_decodeFieldsByLayoutIdxs bs hIdx
     rw [hNone] at hx
     nomatch hx
 
