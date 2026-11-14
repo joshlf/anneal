@@ -679,10 +679,6 @@ impl MiriToolchain {
     }
 }
 
-fn find_executable_in_path(tool_name: &str) -> Option<PathBuf> {
-    find_executable_in_path_with(&process_env_var, tool_name)
-}
-
 fn find_executable_in_path_with(get_env: EnvLookup<'_>, tool_name: &str) -> Option<PathBuf> {
     let path_var = get_env("ANNEAL_CALLER_PATH").or_else(|| get_env("PATH"))?;
     for dir in env::split_paths(&path_var) {
@@ -711,6 +707,15 @@ fn resolve_tool_path(
     env_var: &str,
     tool_name: &str,
 ) -> Result<PathBuf, String> {
+    resolve_tool_path_with(explicit, &process_env_var, env_var, tool_name)
+}
+
+fn resolve_tool_path_with(
+    explicit: Option<&Path>,
+    get_env: EnvLookup<'_>,
+    env_var: &str,
+    tool_name: &str,
+) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         if path.is_file() {
             return Ok(path.to_path_buf());
@@ -720,28 +725,34 @@ fn resolve_tool_path(
             path.display()
         ));
     }
-    if let Ok(val) = env::var(env_var)
-        && !val.trim().is_empty()
-    {
-        let p = PathBuf::from(val.trim());
-        if p.is_file() {
-            return Ok(p);
+    if let Some(val) = non_empty_env_str(get_env, env_var) {
+        if val.chars().any(std::path::is_separator) {
+            let p = PathBuf::from(&val);
+            if p.is_file() {
+                return Ok(p);
+            }
+            return Err(format!(
+                "{env_var} points to non-existent {tool_name} binary: {}",
+                p.display()
+            ));
         }
-        return Err(format!(
-            "{env_var} points to non-existent {tool_name} binary: {}",
-            p.display()
-        ));
+        return find_executable_in_path_with(get_env, &val).ok_or_else(|| {
+            format!("{env_var} points to non-existent {tool_name} binary: {val} (not found on PATH)")
+        });
     }
+    let home = non_empty_env_str(get_env, "HOME").map(PathBuf::from);
     if tool_name == "miri" {
-        if let Some(path_miri) = find_executable_in_path("miri") {
-            let is_cargo_proxy = env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".cargo/bin/miri"))
+        if let Some(path_miri) = find_executable_in_path_with(get_env, "miri") {
+            let cargo_home = non_empty_env_str(get_env, "CARGO_HOME")
+                .map(PathBuf::from)
+                .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+            let is_cargo_proxy = cargo_home
+                .map(|c| c.join("bin/miri"))
                 .is_some_and(|p| p == path_miri);
             if !is_cargo_proxy {
                 return Ok(path_miri);
             }
-        } else if find_executable_in_path("cargo-miri").is_none() {
+        } else if find_executable_in_path_with(get_env, "cargo-miri").is_none() {
             return Err(
                 "could not locate 'miri' or 'cargo-miri' on PATH \
                  (set ANNEAL_MIRI_BIN or add Miri to PATH)"
@@ -749,8 +760,11 @@ fn resolve_tool_path(
             );
         }
     }
-    if let Ok(home) = env::var("HOME") {
-        let toolchains_dir = PathBuf::from(home).join(".rustup/toolchains");
+    let rustup_home = non_empty_env_str(get_env, "RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".rustup")));
+    if let Some(rustup_home) = rustup_home {
+        let toolchains_dir = rustup_home.join("toolchains");
         if let Ok(entries) = fs::read_dir(&toolchains_dir) {
             let mut candidates: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok().map(|d| d.path()))
@@ -3091,6 +3105,52 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
                 .expect("read mock args")
                 .trim(),
             "+nightly-2026-06-01 miri setup"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tool_path_honors_bare_names_rustup_home_and_cargo_home() {
+        let temp = unique_oracle_temp_dir("resolve-tool-path-parity");
+        let bin_dir = temp.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        write_executable_script(&bin_dir.join("custom-rustc"), "#!/bin/sh\nexit 0\n");
+
+        // Bare `ANNEAL_RUSTC_BIN` resolves on `PATH` (rather than checking `./custom-rustc` in cwd).
+        let get_env = env_map(&[
+            ("PATH", bin_dir.as_os_str()),
+            ("ANNEAL_RUSTC_BIN", OsStr::new(" custom-rustc ")),
+        ]);
+        assert_eq!(
+            resolve_tool_path_with(None, &get_env, "ANNEAL_RUSTC_BIN", "rustc"),
+            Ok(bin_dir.join("custom-rustc"))
+        );
+
+        // `CARGO_HOME/bin/miri` proxy is skipped in favor of `RUSTUP_HOME` toolchain `miri`.
+        let cargo_home = temp.join("custom-cargo-home");
+        let cargo_bin = cargo_home.join("bin");
+        fs::create_dir_all(&cargo_bin).expect("create cargo_home/bin");
+        write_executable_script(&cargo_bin.join("miri"), "#!/bin/sh\nexit 0\n");
+        let rustup_home = temp.join("custom-rustup-home");
+        let tc_bin = rustup_home
+            .join("toolchains/nightly-2026-06-01-x86_64-unknown-linux-gnu/bin");
+        fs::create_dir_all(&tc_bin).expect("create rustup_home toolchain bin");
+        write_executable_script(&tc_bin.join("miri"), "#!/bin/sh\nexit 0\n");
+        write_executable_script(&tc_bin.join("rustc"), "#!/bin/sh\nexit 0\n");
+        let get_env_homes = env_map(&[
+            ("PATH", cargo_bin.as_os_str()),
+            ("CARGO_HOME", cargo_home.as_os_str()),
+            ("RUSTUP_HOME", rustup_home.as_os_str()),
+        ]);
+        assert_eq!(
+            resolve_tool_path_with(None, &get_env_homes, "ANNEAL_MIRI_BIN", "miri"),
+            Ok(tc_bin.join("miri"))
+        );
+        assert_eq!(
+            resolve_tool_path_with(None, &get_env_homes, "ANNEAL_RUSTC_BIN", "rustc"),
+            Ok(tc_bin.join("rustc"))
         );
 
         let _ = fs::remove_dir_all(&temp);
