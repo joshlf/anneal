@@ -7723,10 +7723,12 @@ theorem MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity
 
 /--
 **Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` Struct With Populated `l.fieldLayouts`**
-satisfying `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` (supporting both in-order and reordered
-structs with niche fields such as `bool` and ZST marker fields). Integer-niche fields (`NonZero*`) are
-out of scope: they admit no `TupleFieldCodec` for `fcs`
-(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`, `TupleFieldCodec.not_adt`).
+satisfying `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` on the `byArgs` path (`args = k :: ks`,
+supporting both in-order and reordered structs with niche fields such as `bool` and ZST marker fields).
+For integer-niche fields (`NonZero*`), which admit no `TupleFieldCodec` on the `byArgs` path
+(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`, `TupleFieldCodec.not_adt`), use
+`MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine` with `FieldLayoutCodec.scalarValidRange` on the
+`args.length ≠ offsets.length` (`l.fieldLayouts`) path.
 -/
 def MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts
     {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}

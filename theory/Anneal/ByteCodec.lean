@@ -8088,6 +8088,21 @@ theorem decode_isSome_of_sameKind {layouts : LayoutTable} {k : RigidTy} {α β :
   | some y => exact ⟨y, rfl⟩
 
 /--
+Symmetric (`↔`) form of `decode_isSome_of_sameKind`: two `TupleFieldCodec`s at the same kind `k`
+accept the exact same byte windows.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decode_isSome_iff_of_sameKind {layouts : LayoutTable} {k : RigidTy} {α β : Type} {n m : Nat}
+    {c₀ : FixedByteCodec α n} {c : FixedByteCodec β m}
+    (fc₀ : TupleFieldCodec layouts k c₀) (fc : TupleFieldCodec layouts k c)
+    (bs : List AbstractByte) :
+    (∃ x, c₀.decode bs = some x) ↔ (∃ y, c.decode bs = some y) :=
+  ⟨decode_isSome_of_sameKind fc₀ fc bs, decode_isSome_of_sameKind fc fc₀ bs⟩
+
+/--
 A `TupleFieldCodec` at a kind that also carries a surjective reference `TupleFieldCodec` is itself
 surjective on fully-initialized windows (byte widths agree through `kindSize_eq`).
 
@@ -9195,12 +9210,15 @@ and float scalar niches (such as `NonZeroU8` `1 ..= 255` or `NonZeroU32` `1 ..= 
 discharging the `hAccept` obligation of `AdtDecodeFallbackSound.of_scalar`,
 `AdtDecodeFallbackSound.of_scalarPair`, and `FieldLayoutsDecodeSound.cons_primitive_scalar`.
 
-**Scope (fallback level only)**: this discharges fallback soundness for a spine whose field codec is
-`scalarValidRange`, but an ADT codec built by `adtOfPlacedCodecSpine` also needs a `TupleFieldCodec`
-for that field, and a genuine integer niche has none: `.uint w` / `.int w` fields are niche-blind
-(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`,
+**Scope (`byArgs` vs. `fieldLayouts` struct paths)**: on the `byArgs` path (`args.length = offsets.length`,
+`adtOfPlacedCodecSpine`), every field also needs a `TupleFieldCodec`, and a genuine integer niche has none:
+`.uint w` / `.int w` fields are niche-blind (`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`,
 `TupleFieldCodec.int_not_scalarValidRange_of_out_of_range`) and ADT kinds carry no structural size
-(`TupleFieldCodec.not_adt`). End-to-end `NonZero*` codecs use `MirValueCodec.scalarNicheNewtypeNonPtr`.
+(`TupleFieldCodec.not_adt`). On the `fieldLayouts` path (`args.length ≠ offsets.length`, covering all
+non-generic multi-field structs `.adt defPath []`), `FieldLayoutCodec.scalarValidRange` and
+`MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine` build end-to-end $k$-field `MirValueCodec`s for
+structs with `NonZero*` and bounded scalar-niche fields (generalizing 1-field
+`MirValueCodec.scalarNicheNewtypeNonPtr`).
 
 Kind: helper
 Witness: universal
@@ -9288,9 +9306,11 @@ Unlike `l.fieldLayouts = []` (where Trusted falls back to `decodeFieldsBySpan`),
 populated `l.fieldLayouts` satisfying `FieldLayoutsDecodeSound` enforces per-field niche invariants
 (such as `bool` `0 ..= 1` or `NonZero*` `1 ..= MAX`) inside `adtDecodeFallback`, so
 `AdtDecodeFallbackSound` holds for both in-order and reordered structs with niche fields!
-(Only fallback soundness: combined with `adtOfPlacedCodecSpine`, every field also needs a
-`TupleFieldCodec`, which exists for `bool` but not for integer niches such as `NonZero*`; see
-`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`.)
+(On the `byArgs` path `adtOfPlacedCodecSpine`, every field also needs a `TupleFieldCodec`, which exists
+for `bool` but not for integer niches such as `NonZero*`, see
+`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`; on the `args.length ≠ offsets.length`
+path `adtOfFieldLayoutsPlacedCodecSpine`, `FieldLayoutCodec.scalarValidRange` builds end-to-end codecs
+for multi-field `NonZero*` structs as well.)
 -/
 inductive FieldLayoutsDecodeSound (layouts : LayoutTable) :
     {αs : List Type} → PlacedCodecSpine αs → List LayoutIdx → Prop where
@@ -9505,10 +9525,11 @@ Ready-made `FieldLayoutsDecodeSound` step for `FixedByteCodec.scalarValidRange p
 paired with its `.primitive` non-pointer scalar-niche `TypeLayout`
 (`fl.backendRepr = .scalar (.initialized pk range)`).
 
-This is a fallback-level fact only: when `range` excludes some bit pattern (a genuine niche such as
-`NonZero*`), the field has no `TupleFieldCodec` at `.uint w` / `.int w` / `.adt _ _`
-(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`, `TupleFieldCodec.not_adt`), so the step
-cannot complete an `adtOfPlacedCodecSpine` codec for such a field.
+When `range` excludes some bit pattern (a genuine integer niche such as `NonZero*`), the field has no
+`TupleFieldCodec` on the `byArgs` path (`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`,
+`TupleFieldCodec.not_adt`), so full struct codecs with `NonZero*` fields use the `fieldLayouts` path
+`MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine` with `FieldLayoutCodec.scalarValidRange` instead of
+`adtOfPlacedCodecSpine`.
 
 Kind: helper
 Witness: universal
@@ -9862,6 +9883,475 @@ def adtOfPlacedCodecSpine
     (fun x => adtOfPlacedCodecSpine_encode_toValue fcs hLookup hInhab hVar hSize hFields hSeq x)
     (fun v bs hEnc => adtOfPlacedCodecSpine_encode_witness fcs hLookup hInhab hVar hSize hFields hSeq v bs hEnc)
     (fun bs => adtOfPlacedCodecSpine_decode_eq_map fcs hLookup hInhab hVar hSize hFields hFallback hSeq bs)
+
+/-! ### `FieldLayoutCodec` & `adtOfFieldLayoutsPlacedCodecSpine` (The `l.fieldLayouts` Struct Path)
+
+In Rust MIR (`Trusted.Rustc.V2026_06_01.MirSemantics.Bytes`), a non-generic struct
+`struct S { a: NonZeroU8, b: u32 }` has type `{ kind := .adt "S" [], layoutIdx := idx }` (`args = []`),
+and any generic struct whose type-parameter count `args.length` differs from its field count
+`offsets.length` also satisfies `Nat.beq (length args) (length offsets) = false`.
+On all such structs with populated `l.fieldLayouts`:
+1. `decodeValueFromBytes` skips `byArgs` (`byArgs = none`) and decodes fields exclusively via
+   `decodeFieldsByLayoutIdxs` over `l.fieldLayouts` (`{ kind := .adt "" [], layoutIdx := fIdx }`).
+2. `encodeValueToBytes` sets `fieldKinds = []` and encodes each field via `encodeUntypedValueToBytes`.
+
+Whereas `TupleFieldCodec` (which models the `byArgs` path `args.length = offsets.length`) cannot carry
+integer niches (`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`, `TupleFieldCodec.not_adt`),
+`FieldLayoutCodec` and `MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine` generalize 1-field
+`MirValueCodec.scalarNicheNewtypeNonPtr` to arbitrary $k$-field structs with populated `l.fieldLayouts`,
+supporting `FixedByteCodec.scalarValidRange` (`NonZero*` and bounded scalar niches), `boolByte`,
+`uintBitsLE`, and `unit` across all padding and field-permutation configurations.
+-/
+
+/--
+Trusted-level bridge for one struct field referenced by layout index `fIdx` in `TypeLayout.fieldLayouts`
+when Trusted decodes via `decodeFieldsByLayoutIdxs` (`{ kind := .adt "" [], layoutIdx := fIdx }`) and
+encodes via `encodeUntypedValueToBytes` at `tupleFieldFuel`.
+-/
+structure FieldLayoutCodec (layouts : LayoutTable) (fIdx : LayoutIdx)
+    {α : Type} {n : Nat} (c : FixedByteCodec α n) : Type where
+  /-- Embed a field value into a runtime `Value`. -/
+  toValue : α → Value
+  /-- Partial projection from a runtime `Value` back to a field value. -/
+  ofValue : Value → Option α
+  /-- `ofValue` is a left inverse to `toValue`. -/
+  ofValue_toValue : ∀ x : α, ofValue (toValue x) = some x
+  /-- The layout entry `fl` at `fIdx` in `layouts` has byte size `n`. -/
+  layoutSize_eq : ∃ fl : TypeLayout, LayoutTable.lookup layouts fIdx = some fl ∧ fl.size.bytes = n
+  /-- Untyped field encoding at `tupleFieldFuel` matches `c.encode x`. -/
+  encode_toValue : ∀ x : α,
+    encodeUntypedValueToBytes tupleFieldFuel (toValue x) = some (c.encode x)
+  /-- Layout-indexed field decoding at `tupleFieldFuel` matches `(c.decode bs).map toValue`. -/
+  decode_eq_map : ∀ bs : List AbstractByte,
+    decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx } bs =
+      (c.decode bs).map toValue
+
+namespace FieldLayoutCodec
+
+/--
+`FieldLayoutCodec` for any `.primitive` non-pointer scalar-niche layout entry `fl` at `fIdx`
+(`fl.backendRepr = .scalar (.initialized pk range)`, `0 < sz`), bridging
+`FixedByteCodec.scalarValidRange sz hNz range` (covering `NonZeroU8`, `NonZeroU32`, `NonZeroI32`,
+bounded scalar niches, and full-range scalars).
+-/
+def scalarValidRange (layouts : LayoutTable) (fIdx : LayoutIdx) (fl : TypeLayout)
+    (sz : Nat) (pk : PrimitiveKind) (varIdx : VariantIdx) (range : WrappingRange)
+    (hNz : 0 < sz)
+    (hNonPtr : FixedByteCodec.isNonPointerPrimitiveKind pk = true)
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hInhab : fl.isUninhabited = false)
+    (hSize : fl.size.bytes = sz)
+    (hFields : fl.fields = .primitive)
+    (hVar : fl.variants = .single varIdx)
+    (hRepr : fl.backendRepr = .scalar (.initialized pk range))
+    (hWidth : primitiveKindByteWidth pk = some sz) :
+    FieldLayoutCodec layouts fIdx (FixedByteCodec.scalarValidRange sz hNz range) where
+  toValue := fun x => .scalar ⟨x.val, sz⟩
+  ofValue := (MirValueCodec.primitiveNicheAdtNonPtr layouts "" [] fIdx fl sz pk varIdx range
+    hNz hNonPtr hLookup hInhab hSize hFields hVar hRepr hWidth).ofValue
+  ofValue_toValue := (MirValueCodec.primitiveNicheAdtNonPtr layouts "" [] fIdx fl sz pk varIdx range
+    hNz hNonPtr hLookup hInhab hSize hFields hVar hRepr hWidth).ofValue_toValue
+  layoutSize_eq := ⟨fl, hLookup, hSize⟩
+  encode_toValue := fun ⟨bits, _⟩ => by
+    unfold tupleFieldFuel encodeUntypedValueToBytes encodeScalarBytes
+    have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
+    dsimp only
+    rw [hBeq0]
+    rfl
+  decode_eq_map := fun bs => by
+    unfold tupleFieldFuel decodeValueFromBytes
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+    rw [hLenDef, hInhab, hSize, Bool.false_or]
+    cases hLen : Nat.beq bs.length sz
+    · have hNe : bs.length ≠ sz := fun hEq => by
+        rw [Nat.beq_eq.mpr hEq] at hLen; nomatch hLen
+      rw [(FixedByteCodec.scalarValidRange_isExactWidth sz hNz range).decode_eq_none_of_length_ne hNe]
+      rfl
+    · rw [Bool.not_true, hVar, hFields]
+      have hSzBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
+      rw [hSzBeq0, hRepr]
+      exact FixedByteCodec.decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+        pk range sz hNz hNonPtr hWidth bs
+
+/--
+`FieldLayoutCodec` for a 0-byte `.primitive` unit/ZST layout entry `fl` at `fIdx`
+(`fl.size.bytes = 0`, `fl.fields = .primitive`), bridging `FixedByteCodec.unit`.
+-/
+def unit (layouts : LayoutTable) (fIdx : LayoutIdx) (fl : TypeLayout) (varIdx : VariantIdx)
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hInhab : fl.isUninhabited = false)
+    (hSize : fl.size.bytes = 0)
+    (hFields : fl.fields = .primitive)
+    (hVar : fl.variants = .single varIdx) :
+    FieldLayoutCodec layouts fIdx FixedByteCodec.unit where
+  toValue := fun _ => .unit
+  ofValue := fun v => match v with | .unit => some () | _ => none
+  ofValue_toValue := fun _ => rfl
+  layoutSize_eq := ⟨fl, hLookup, hSize⟩
+  encode_toValue := fun _ => rfl
+  decode_eq_map := fun bs => by
+    unfold tupleFieldFuel decodeValueFromBytes
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [hInhab, hSize, hVar, hFields]
+    cases bs <;> rfl
+
+end FieldLayoutCodec
+
+/--
+Declaration-order `FieldLayoutCodec` for every field of a `PlacedCodecSpine` paired with its
+layout index in `fIdxs : List LayoutIdx` (`TypeLayout.fieldLayouts`).
+-/
+inductive FieldLayoutCodecs (layouts : LayoutTable) :
+    List LayoutIdx → {αs : List Type} → PlacedCodecSpine αs → Type 1 where
+  | nil : FieldLayoutCodecs layouts [] .nil
+  | cons {fIdx : LayoutIdx} {fRest : List LayoutIdx} {α : Type} {αs : List Type}
+      {p : Nat × FieldLayout} {c : FixedByteCodec α p.2.size} {tail : PlacedCodecSpine αs}
+      (f : FieldLayoutCodec layouts fIdx c) (rest : FieldLayoutCodecs layouts fRest tail) :
+      FieldLayoutCodecs layouts (fIdx :: fRest) (.cons p c tail)
+
+namespace FieldLayoutCodecs
+
+variable {layouts : LayoutTable}
+
+/-- Runtime field `Value`s of a declaration-order value tuple. -/
+def toValues : {fIdxs : List LayoutIdx} → {αs : List Type} → {pc : PlacedCodecSpine αs} →
+    FieldLayoutCodecs layouts fIdxs pc → FieldTuple αs → List Value
+  | _, _, _, .nil, _ => []
+  | _, _, _, .cons f rest, (a, r) => f.toValue a :: rest.toValues r
+
+/-- Partial projection from runtime field `Value`s back to a declaration-order value tuple. -/
+def ofValues : {fIdxs : List LayoutIdx} → {αs : List Type} → {pc : PlacedCodecSpine αs} →
+    FieldLayoutCodecs layouts fIdxs pc → List Value → Option (FieldTuple αs)
+  | _, _, _, .nil, [] => some ()
+  | _, _, _, .nil, _ :: _ => none
+  | _, _, _, .cons _ _, [] => none
+  | _, _, _, .cons f rest, v :: vs =>
+    match f.ofValue v, rest.ofValues vs with
+    | some a, some r => some (a, r)
+    | _, _ => none
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem ofValues_toValues :
+    ∀ {fIdxs : List LayoutIdx} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : FieldLayoutCodecs layouts fIdxs pc) (x : FieldTuple αs),
+      fcs.ofValues (fcs.toValues x) = some x
+  | _, _, _, .nil, () => rfl
+  | _, _, _, .cons f rest, (a, r) => by
+    show (match f.ofValue (f.toValue a), rest.ofValues (rest.toValues r) with
+      | some a', some r' => some (a', r')
+      | _, _ => none) = some (a, r)
+    rw [f.ofValue_toValue a, ofValues_toValues rest r]
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem length_toValues :
+    ∀ {fIdxs : List LayoutIdx} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : FieldLayoutCodecs layouts fIdxs pc) (x : FieldTuple αs),
+      (fcs.toValues x).length = fIdxs.length
+  | _, _, _, .nil, _ => rfl
+  | _, _, _, .cons _ rest, (_, r) => congrArg Nat.succ (length_toValues rest r)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem length_placed :
+    ∀ {fIdxs : List LayoutIdx} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (_ : FieldLayoutCodecs layouts fIdxs pc), pc.placed.length = fIdxs.length
+  | _, _, _, .nil => rfl
+  | _, _, _, .cons _ rest => congrArg Nat.succ (length_placed rest)
+
+/--
+Every `FieldLayoutCodecs layouts fIdxs pc` automatically implies `FieldLayoutsDecodeSound layouts pc fIdxs`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem toFieldLayoutsDecodeSound :
+    ∀ {fIdxs : List LayoutIdx} {αs : List Type} {pc : PlacedCodecSpine αs},
+      FieldLayoutCodecs layouts fIdxs pc →
+      FieldLayoutsDecodeSound layouts pc fIdxs
+  | _, _, .nil, .nil => .nil
+  | _, _, .cons _ c _, .cons f rest => by
+    obtain ⟨fl, hLookup, hSize⟩ := f.layoutSize_eq
+    refine .cons hLookup hSize (fun fSlice _ ⟨v, hDec⟩ => ?_) (toFieldLayoutsDecodeSound rest)
+    rw [f.decode_eq_map fSlice] at hDec
+    cases hC : c.decode fSlice with
+    | none =>
+      rw [hC] at hDec
+      nomatch hDec
+    | some a => exact ⟨a, rfl⟩
+
+/--
+When `fieldKinds = []` (the `args.length ≠ offsets.length` path of `.adt defPath args`),
+Trusted's `encodeFieldsAtOffsetsWith` writes the declaration-order windows `pc.windows x`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: encodeFieldsAtOffsetsWith
+-/
+theorem encodeFieldsAtOffsetsWith_nil_eq_writeWindows
+    (encodeTyped : RigidTy → Value → Option (List AbstractByte)) :
+    ∀ {fIdxs : List LayoutIdx} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : FieldLayoutCodecs layouts fIdxs pc) (x : FieldTuple αs) (buf : List AbstractByte),
+      encodeFieldsAtOffsetsWith encodeTyped (encodeUntypedValueToBytes tupleFieldFuel)
+          (pc.placed.map fun p => ({ bytes := p.1 } : Size)) [] (fcs.toValues x) buf =
+        writeWindows buf (pc.windows x)
+  | _, _, _, .nil, _, _ => rfl
+  | _, _, _, @FieldLayoutCodecs.cons _ _ _ _ _ p c tail f rest, (a, r), buf => by
+    have ih := encodeFieldsAtOffsetsWith_nil_eq_writeWindows encodeTyped rest r
+    show (match encodeUntypedValueToBytes tupleFieldFuel (f.toValue a) with
+        | none => none
+        | some fBytes =>
+          match writeAbstractBytesAt buf p.1 fBytes with
+          | none => none
+          | some buf' =>
+            encodeFieldsAtOffsetsWith encodeTyped (encodeUntypedValueToBytes tupleFieldFuel)
+              (tail.placed.map fun p => ({ bytes := p.1 } : Size)) [] (rest.toValues r) buf') =
+      (match writeAbstractBytesAt buf p.1 (c.encode a) with
+        | some buf' => writeWindows buf' (tail.windows r)
+        | none => none)
+    rw [f.encode_toValue a]
+    dsimp only
+    cases writeAbstractBytesAt buf p.1 (c.encode a) with
+    | none => rfl
+    | some buf' => exact ih buf'
+
+/--
+Trusted's `decodeFieldsByLayoutIdxs` over `fIdxs` decodes each field from its own window (`pc.decodeAt`).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: decodeFieldsByLayoutIdxs
+-/
+theorem decodeFieldsByLayoutIdxs_eq_decodeAt :
+    ∀ {fIdxs : List LayoutIdx} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : FieldLayoutCodecs layouts fIdxs pc) (bs : List AbstractByte),
+      (∀ p ∈ pc.placed, p.1 + p.2.size ≤ bs.length) →
+      decodeFieldsByLayoutIdxs
+          (fun fIdx fSlice =>
+            decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+          layouts bs (pc.placed.map fun p => ({ bytes := p.1 } : Size)) fIdxs =
+        (pc.decodeAt bs).map fcs.toValues
+  | _, _, _, .nil, _, _ => rfl
+  | _, _, _, @FieldLayoutCodecs.cons _ fIdx fRest _ _ p c tail f rest, bs, hIn => by
+    have ih := decodeFieldsByLayoutIdxs_eq_decodeAt rest bs
+      (fun q hq => hIn q (List.mem_cons_of_mem _ hq))
+    obtain ⟨fl, hLookup, hSize⟩ := f.layoutSize_eq
+    have hP := hIn p (List.mem_cons_self ..)
+    have hSlice : sliceAbstractBytes bs p.1 p.2.size = some ((bs.drop p.1).take p.2.size) := by
+      unfold sliceAbstractBytes
+      rw [Nat.ble_eq_true_of_le (show Nat.add p.1 p.2.size ≤ Trusted.Sequence.length bs from hP)]
+      dsimp only
+      rw [takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop]
+    show (match LayoutTable.lookup layouts fIdx with
+        | none => none
+        | some fl =>
+          match sliceAbstractBytes bs p.1 fl.size.bytes with
+          | none => none
+          | some fSlice =>
+            match decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice with
+            | none => none
+            | some v =>
+              match decodeFieldsByLayoutIdxs
+                  (fun fIdx' fSlice' =>
+                    decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx' } fSlice')
+                  layouts bs (tail.placed.map fun p => ({ bytes := p.1 } : Size)) fRest with
+              | some vs => some (v :: vs)
+              | none => none) =
+      (match c.decode ((bs.drop p.1).take p.2.size), tail.decodeAt bs with
+        | some a, some r => some (a, r)
+        | _, _ => none).map (fun x => (FieldLayoutCodecs.cons f rest).toValues x)
+    rw [hLookup]
+    dsimp only
+    rw [hSize, hSlice]
+    dsimp only
+    rw [f.decode_eq_map ((bs.drop p.1).take p.2.size), ih]
+    cases c.decode ((bs.drop p.1).take p.2.size) <;> cases tail.decodeAt bs <;> rfl
+
+end FieldLayoutCodecs
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem adt_rigidTyByteSize {layouts : LayoutTable} {defPath : DefPath} {args : List RigidTy}
+    {idx : LayoutIdx} {l : TypeLayout} {totalSize : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size = { bytes := totalSize }) :
+    rigidTyByteSize layouts { kind := .adt defPath args, layoutIdx := idx } = some totalSize := by
+  unfold rigidTyByteSize
+  dsimp only [rigidTyKindByteSize]
+  rw [hLookup]
+  dsimp only
+  rw [hSize]
+
+/--
+**General $k$-Field `l.fieldLayouts` Struct (`TyKind.adt`) `MirValueCodec`**:
+for any single-variant struct `{ kind := .adt defPath args, layoutIdx := idx }` with
+`args.length ≠ pc.placed.length` (covering all non-generic multi-field structs `.adt defPath []`,
+as well as generic structs whose type-parameter count differs from their field count) and populated
+`l.fieldLayouts` bridged by `fcs : FieldLayoutCodecs layouts l.fieldLayouts pc`, constructs a
+`MirValueCodec` backed by `pc.realizedCodec totalSize`.
+
+Unlike `adtOfPlacedCodecSpine` (which models the `byArgs` path `args.length = pc.placed.length` and
+therefore requires `TupleFieldCodec`), `adtOfFieldLayoutsPlacedCodecSpine` decodes fields through
+`l.fieldLayouts` (`decodeFieldsByLayoutIdxs`) and supports `FixedByteCodec.scalarValidRange`
+(`NonZero*` and bounded scalar niches), `boolByte`, `uintBitsLE`, and `unit` (`()` / `PhantomData<T>`).
+Like 1-field `scalarNicheNewtypeNonPtr`, `enforcesUntypedFieldWidths` is `false` because Trusted's
+`encodeValueToBytes` delegates untyped field values to `encodeUntypedValueToBytes` when
+`args.length ≠ offsets.length` (`scalarNicheNewtype_untyped_unit_field_divergence`); well-typed/decoded
+transmutation is proved via `MirValueCodec.transmute_typed` and `MirValueCodec.transmute_sound_of_decoded`.
+-/
+def adtOfFieldLayoutsPlacedCodecSpine
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
+    (idx : LayoutIdx) (l : TypeLayout) (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {fIdx₀ : LayoutIdx} {fRest : List LayoutIdx}
+    {αs : List Type} (pc : PlacedCodecSpine αs) (totalSize : Nat)
+    (fcs : FieldLayoutCodecs layouts (fIdx₀ :: fRest) pc)
+    (hArgsNe : args.length ≠ pc.placed.length)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = fIdx₀ :: fRest)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize) :
+    MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx } (FieldTuple αs) totalSize where
+  codec := (pc.realizedCodec totalSize).castWidth
+    (pc.realized_offsets_and_width_of_sequential totalSize hSeq).2
+  toValue := fun x => .aggregate varIdx (fcs.toValues x)
+  ofValue := fun v =>
+    match v with
+    | .aggregate vIdx vs => if vIdx == varIdx then fcs.ofValues vs else none
+    | _ => none
+  ofValue_toValue := fun x => by
+    have hBeq : (varIdx == varIdx) = true := decide_eq_true rfl
+    dsimp only
+    rw [hBeq]
+    exact fcs.ofValues_toValues x
+  tySize_eq := adt_rigidTyByteSize hLookup hSize
+  encode_toValue := fun x => by
+    cases fcs with
+    | @cons _ _ _ _ p₀ c₀ tail f₀ rest =>
+      unfold defaultCodecFuel encodeValueToBytes
+      simp only []
+      rw [hLookup]
+      dsimp only
+      rw [hInhab]
+      dsimp only
+      rw [hVar]
+      dsimp only
+      rw [hFields]
+      dsimp only
+      have hCond1 :
+          Bool.and (Nat.beq varIdx varIdx)
+            (Nat.beq
+              (Trusted.Sequence.length
+                (((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size))))
+              (Trusted.Sequence.length ((FieldLayoutCodecs.cons f₀ rest).toValues x))) = true := by
+        rw [nat_beq_self varIdx, Bool.true_and]
+        apply Nat.beq_eq.mpr
+        show ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length =
+          ((FieldLayoutCodecs.cons f₀ rest).toValues x).length
+        rw [List.length_map, (FieldLayoutCodecs.cons f₀ rest).length_placed,
+            (FieldLayoutCodecs.cons f₀ rest).length_toValues]
+      rw [hCond1]
+      dsimp only
+      have hCond2 :
+          Nat.beq (Trusted.Sequence.length args)
+            (Trusted.Sequence.length
+              (((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)))) = false := by
+        apply nat_beq_eq_false_of_ne
+        show args.length ≠
+          ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length
+        rw [List.length_map]
+        exact hArgsNe
+      rw [hCond2]
+      dsimp only
+      rw [hSize]
+      exact ((FieldLayoutCodecs.cons f₀ rest).encodeFieldsAtOffsetsWith_nil_eq_writeWindows _ x _).trans
+        ((PlacedCodecSpine.cons p₀ c₀ tail).writeWindows_realizedCodec_encode totalSize hSeq x)
+  enforcesUntypedFieldWidths := false
+  encode_length_and_init_of_isInit := fun h => nomatch h
+  decode_eq_map := fun bs => by
+    cases fcs with
+    | @cons _ _ _ _ p₀ c₀ tail f₀ rest =>
+      have hWidth := ((PlacedCodecSpine.cons p₀ c₀ tail).realized_offsets_and_width_of_sequential totalSize hSeq).2
+      unfold defaultCodecFuel decodeValueFromBytes
+      dsimp only
+      rw [hLookup]
+      dsimp only
+      rw [hInhab, hSize]
+      dsimp only
+      cases hL : Nat.beq (Trusted.Sequence.length bs) totalSize with
+      | false =>
+        have hNe : bs.length ≠ (PlacedCodecSpine.cons p₀ c₀ tail).realizedWidth totalSize := by
+          rw [hWidth]
+          intro hEq
+          rw [show Trusted.Sequence.length bs = bs.length from rfl, Nat.beq_eq.mpr hEq] at hL
+          nomatch hL
+        rw [FixedByteCodec.castWidth_decode,
+            ((PlacedCodecSpine.cons p₀ c₀ tail).realizedCodec_isExactWidth totalSize).decode_eq_none_of_length_ne hNe]
+        rfl
+      | true =>
+        have hLen : bs.length = totalSize := Nat.eq_of_beq_eq_true hL
+        rw [hVar, hFields]
+        dsimp only [Bool.not, Bool.or, PlacedCodecSpine.placed, List.map]
+        have hCond2 :
+            Nat.beq (Trusted.Sequence.length args)
+              (Trusted.Sequence.length
+                (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size)))) = false := by
+          apply nat_beq_eq_false_of_ne
+          show args.length ≠
+            ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length
+          rw [List.length_map]
+          exact hArgsNe
+        rw [hCond2]
+        dsimp only
+        have hCondFl :
+            Nat.beq (Trusted.Sequence.length l.fieldLayouts)
+              (Trusted.Sequence.length
+                (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size)))) = true := by
+          apply Nat.beq_eq.mpr
+          show l.fieldLayouts.length =
+            ((PlacedCodecSpine.cons p₀ c₀ tail).placed.map fun p => ({ bytes := p.1 } : Size)).length
+          rw [hFl, List.length_map, (FieldLayoutCodecs.cons f₀ rest).length_placed]
+        rw [hCondFl]
+        dsimp only
+        rw [hFl, FixedByteCodec.castWidth_decode]
+        have hDecodeIdx :
+            decodeFieldsByLayoutIdxs
+                (fun fIdx fSlice =>
+                  decodeValueFromBytes tupleFieldFuel layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+                layouts bs
+                (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size)))
+                (fIdx₀ :: fRest) =
+              ((PlacedCodecSpine.cons p₀ c₀ tail).decodeAt bs).map
+                (FieldLayoutCodecs.cons f₀ rest).toValues :=
+          (FieldLayoutCodecs.cons f₀ rest).decodeFieldsByLayoutIdxs_eq_decodeAt bs (by
+            rw [hLen]
+            exact (PlacedCodecSpine.cons p₀ c₀ tail).placed_in_bounds_of_memSort_sequential totalSize hSeq)
+        rw [hDecodeIdx,
+          (PlacedCodecSpine.cons p₀ c₀ tail).realizedCodec_decode_eq_decodeAt totalSize hSeq bs hLen]
+        cases (PlacedCodecSpine.cons p₀ c₀ tail).decodeAt bs <;> rfl
 
 
 /--
