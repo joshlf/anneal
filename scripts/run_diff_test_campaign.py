@@ -749,6 +749,17 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
                 False,
                 f"finding[{idx}] has a not-compared outcome instead of a divergence",
             )
+        # `applied_mutators` decides the finding's cause, and so its fingerprint and
+        # quarantine keys (`infer_finding_cause`); `miri-difftest` always emits a list
+        # of mutator names (empty for an unmutated candidate).
+        mutators = f.get("applied_mutators")
+        if not isinstance(mutators, list) or not all(
+            isinstance(m, str) and m.strip() for m in mutators
+        ):
+            return (
+                False,
+                f"finding[{idx}] has missing or malformed 'applied_mutators' {mutators!r}",
+            )
         if not isinstance(f.get("kernel_confirmed"), bool):
             return False, f"finding[{idx}] has non-boolean 'kernel_confirmed'"
         polarity = f.get("witness_polarity")
@@ -4208,10 +4219,8 @@ def infer_finding_cause(
     seed_name = str(finding["seed_name"])
     mutators = finding.get("applied_mutators")
     first_mutator = (
-        mutators[0].strip()
+        next((m.strip() for m in mutators if isinstance(m, str) and m.strip()), "")
         if isinstance(mutators, list)
-        and len(mutators) > 0
-        and isinstance(mutators[0], str)
         else ""
     )
     if not first_mutator:
@@ -5610,6 +5619,22 @@ def _reported_variant_problems(
     }
 
 
+def _json_safe(value: Any) -> Any:
+    """A strict-JSON copy of a semantic-mutant result: tuples become lists, keys
+    become strings, and anything else that JSON cannot carry (sets, objects,
+    non-finite floats) becomes its `repr`, so a custom evaluator's passed-through
+    values can never crash the summary JSON, Markdown, or JUnit rendering."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float("inf") else repr(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return repr(value)
+
+
 def run_semantic_mutant_self_check(
     evaluator: Any = None,
     mutants: tuple[dict[str, Any], ...] | list[dict[str, Any]] = SEEDED_SEMANTIC_MUTANTS,
@@ -5821,13 +5846,20 @@ def run_semantic_mutant_self_check(
             if outcome["killed"] and outcome.get(key):
                 outcome["killed"] = False
 
+        # The result lands in `LATEST_CAMPAIGN_SUMMARY.json`, the Markdown report, and
+        # JUnit: a custom evaluator's passed-through values must not crash them.
+        outcome = _json_safe(outcome)
         per_mutant_results.append(outcome)
         if outcome["killed"]:
             killed_mutants.append(mutant_id)
             variants = outcome.get("variants")
             if isinstance(variants, list) and variants:
                 for v in variants:
-                    if v.get("killed") and v.get("witness_polarity") in polarity_counts:
+                    if (
+                        isinstance(v, dict)
+                        and v.get("killed") is True
+                        and v.get("witness_polarity") in polarity_counts
+                    ):
                         polarity_counts[v["witness_polarity"]] += 1
             elif outcome.get("witness_polarity") in polarity_counts:
                 polarity_counts[outcome["witness_polarity"]] += 1
@@ -5961,12 +5993,23 @@ def render_gate_report_sections(
             ]
         )
         for res in mutant_report.get("results", []):
+            if not isinstance(res, dict):
+                continue
+            # Only well-formed variant records are rendered (a malformed custom
+            # evaluator report is already a survivor, and must not crash the report).
+            raw_variants = res.get("variants")
+            res_variants = (
+                [v for v in raw_variants if isinstance(v, dict)]
+                if isinstance(raw_variants, list)
+                else []
+            )
             variants = "; ".join(
                 f"{v.get('label')}: {v.get('exit_code')}, {v.get('kill_class')}, "
                 f"{v.get('witness_polarity')}"
-                for v in res.get("variants", [])
+                for v in res_variants
             )
-            probe_count = len(res.get("baselines") or [])
+            raw_baselines = res.get("baselines")
+            probe_count = len(raw_baselines) if isinstance(raw_baselines, list) else 0
             probes_note = f"; {probe_count} probes" if probe_count > 1 else ""
             baseline = (
                 f"{_md_table_cell(res.get('baseline_verdict', 'n/a'), code=True)} (exit "
@@ -5976,7 +6019,7 @@ def render_gate_report_sections(
             # Every distinct variant polarity, in variant order (a family such as
             # `protector_release_order` kills in both soundness directions).
             variant_polarities = list(
-                dict.fromkeys(str(v.get("witness_polarity")) for v in res.get("variants", []))
+                dict.fromkeys(str(v.get("witness_polarity")) for v in res_variants)
             )
             polarity_cell = (
                 ", ".join(variant_polarities)

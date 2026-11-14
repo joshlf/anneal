@@ -8587,5 +8587,88 @@ class PassEp2B3AdversarialRegressionTest(unittest.TestCase):
         self.assertFalse(gate_broken_probe["passed"])
 
 
+class PassEp2A3AdversarialRegressionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_malformed_custom_evaluator_reports_never_crash_the_gate_reports(self) -> None:
+        # Before A3, a custom evaluator's passed-through `variants` (non-list, or
+        # non-dict entries) crashed `render_gate_report_sections`, and a
+        # non-JSON `detail` (set, NaN) crashed the summary JSON, turning a gate
+        # result into an internal error.
+        mutant = next(
+            m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "bool_valid_range"
+        )
+        for name, extra, passed in (
+            ("variants_int", {"variants": 5}, False),
+            ("variants_of_strings", {"variants": ["x", None]}, False),
+            ("variants_dict", {"variants": {"label": "validity_check_omitted"}}, False),
+            ("detail_set", {"detail": {1, 2}}, True),
+            ("detail_nan", {"detail": float("nan"), "baselines": None}, False),
+            ("detail_object", {"detail": object()}, True),
+        ):
+            with self.subTest(case=name):
+                report = campaign.run_semantic_mutant_self_check(
+                    evaluator=lambda m, extra=extra: {
+                        "killed": True,
+                        "kill_class": "missed_ub",
+                        "witness_polarity": UNSOUND,
+                        **extra,
+                    },
+                    mutants=[mutant],
+                )
+                self.assertEqual(report["passed"], passed, report["results"])
+                rendered = campaign.render_gate_report_sections(report, None)
+                self.assertIn("(`", rendered)
+                campaign.gate_junit_cases(report, None)
+                # Strict JSON round trip (no `NaN`, no `repr`-less objects).
+                self.assertEqual(
+                    campaign._strict_json_loads(json.dumps(report)), json.loads(json.dumps(report))
+                )
+        self.assertEqual(campaign._json_safe((1, {2: float("inf")})), [1, {"2": "inf"}])
+        # The default simulation's results are unchanged by the JSON-safe copy.
+        simulated = campaign.run_semantic_mutant_self_check()
+        self.assertTrue(simulated["passed"])
+        self.assertEqual(json.loads(json.dumps(simulated)), simulated)
+
+    def test_applied_mutators_are_validated_and_blank_entries_never_hide_a_mutator(
+        self,
+    ) -> None:
+        # `applied_mutators` decides a finding's cause, fingerprint, and quarantine
+        # keys, so a performed summary must carry a list of mutator names.
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar"
+            for mutators, ok in (
+                (["BitValidityTransmuteMutator"], True),
+                ([], True),
+                (None, False),
+                ("BitValidityTransmuteMutator", False),
+                (["   "], False),
+                (["BitValidityTransmuteMutator", 7], False),
+                ("<missing>", False),
+            ):
+                with self.subTest(applied_mutators=mutators):
+                    report = make_healthy_miri_report(Path(tmp), fingerprints=[fp])
+                    if mutators == "<missing>":
+                        report["findings"][0].pop("applied_mutators")
+                    else:
+                        report["findings"][0]["applied_mutators"] = mutators
+                    valid, reason = campaign.validate_performed_miri_summary(report)
+                    self.assertEqual(valid, ok, reason)
+                    if not ok:
+                        self.assertIn("applied_mutators", reason)
+        # B3 took only `applied_mutators[0]`: a blank first entry made a mutated
+        # candidate look unmutated (and its divergence the seed's).
+        finding = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["   ", "ArithmeticCastMutator"],
+            "mutant_source": "pub fn s01_checked_add__b0_c0() -> u32 {\n    7u32\n}\n",
+            "miri_pos": "src/lib.rs:2:5",
+        }
+        self.assertEqual(campaign.infer_finding_cause(finding, set()), "ArithmeticCastMutator")
+        finding["applied_mutators"] = ["   ", ""]
+        self.assertEqual(campaign.infer_finding_cause(finding, set()), "s01_checked_add")
+
+
 if __name__ == "__main__":
     unittest.main()
