@@ -4026,6 +4026,11 @@ theorem mirWpConverges_of_liftLensStmts
       rw [← hPrefixLen]
       exact ih (prefixStmts ++ [stmt]) m₀ m₁ Φ hAppend hInv₁ hFrame₁ hKeys₁ hCont
 
+/-- Constructive `(n == n) = true` for the `DecidableEq`-derived `BEq Nat`: the
+generic `beq_self_eq_true` resolves `ReflBEq Nat` through the `Ord`-based
+`EquivBEq` instances, which depend on `Classical.choice`. -/
+private theorem nat_beq_self_eq_true (n : Nat) : (n == n) = true := decide_eq_true rfl
+
 /-- A root-frame `return_` terminator halts with `_0`'s value and the memory. -/
 theorem mirWpConverges_return_of_lens
     {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
@@ -4052,7 +4057,7 @@ theorem mirWpConverges_return_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  rw [ite_eq_left (beq_self_eq_true _)]
+  rw [ite_eq_left (nat_beq_self_eq_true _)]
   rcases h_t : bb.terminator with ⟨kind, span⟩
   rw [h_t] at hTerm
   dsimp only at hTerm
@@ -4089,7 +4094,7 @@ theorem mirWpConverges_goto_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  rw [ite_eq_left (beq_self_eq_true _)]
+  rw [ite_eq_left (nat_beq_self_eq_true _)]
   rcases h_t : bb.terminator with ⟨kind, span⟩
   rw [h_t] at hTerm
   dsimp only at hTerm
@@ -4132,7 +4137,7 @@ theorem mirWpConverges_assert_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  rw [ite_eq_left (beq_self_eq_true _)]
+  rw [ite_eq_left (nat_beq_self_eq_true _)]
   rcases h_t : bb.terminator with ⟨kind, span⟩
   rw [h_t] at hTerm
   dsimp only at hTerm
@@ -4180,7 +4185,7 @@ theorem mirWpConverges_switchInt_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  rw [ite_eq_left (beq_self_eq_true _)]
+  rw [ite_eq_left (nat_beq_self_eq_true _)]
   rcases h_t : bb.terminator with ⟨kind, span⟩
   rw [h_t] at hTerm
   dsimp only at hTerm
@@ -4227,7 +4232,7 @@ theorem mirWpConverges_drop_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  rw [ite_eq_left (beq_self_eq_true _)]
+  rw [ite_eq_left (nat_beq_self_eq_true _)]
   rcases h_t : bb.terminator with ⟨kind, span⟩
   rw [h_t] at hTerm
   dsimp only at hTerm
@@ -21480,6 +21485,8 @@ theorem LiftLensBlock.goto_return {body : CapturedMir} {bbIdx retBb : BasicBlock
 
 /-! ### Constructive `MirBoolPredicateHolds` adequacy & signature combinators -/
 
+section SignatureCombinators
+
 open Anneal.PureMirExec
 open Anneal.Scalars
 open Anneal.Rustc.V2026_06_01.Lower
@@ -21508,19 +21515,20 @@ def u16TypeLayout : TypeLayout :=
     fields := .primitive, variants := .single 0,
     isUninhabited := false, fieldLayouts := [] }
 
-set_option maxHeartbeats 500000 in
 /-- Extract a 2-byte scalar below `2^16` from a `valueMatchesRigidTyAndLayout` hypothesis
-on a `u16` local declaration. -/
-theorem u16_of_valueMatchesRigid {fuel' : Nat} {body : CapturedMir} {layoutIdx : LayoutIdx}
-    {v : Value} {mem : Memory}
+on a `u16` local declaration, for every 2-byte `TypeLayout` (not only `u16TypeLayout`). -/
+theorem u16_of_valueMatchesRigid {fuel' : Nat} {body : CapturedMir} {layout : TypeLayout}
+    {layoutIdx : LayoutIdx} {v : Value} {mem : Memory} (h_size : layout.size.bytes = 2)
     (h : valueMatchesRigidTyAndLayout (fuel' + 1) body (.uint .u16)
-      (some u16TypeLayout) layoutIdx v mem) :
+      (some layout) layoutIdx v mem) :
     ∃ b, v = .scalar { bits := b, sizeBytes := 2 } ∧ b < 65536 := by
-  rcases v with _ | ⟨b, sz⟩ | _ | _ <;>
-    simp only [valueMatchesRigidTyAndLayout] at h
+  rcases v with _ | ⟨b, sz⟩ | _ | _ <;> simp only [valueMatchesRigidTyAndLayout] at h
   all_goals first
     | exact h.2.2.elim
-    | (obtain ⟨-, -, rfl, -, h_lt, -⟩ := h; exact ⟨b, rfl, h_lt⟩)
+    | (obtain ⟨-, -, h_sz, -, h_lt, -⟩ := h
+       have h2 : sz = 2 := h_sz.trans h_size
+       subst h2
+       exact ⟨b, rfl, h_lt⟩)
 
 /-- Establish `scalarMatchesBackendRepr` for a 2-byte scalar below `2^16` on `u16TypeLayout`. -/
 theorem u16_scalarMatchesBackendRepr {r : Nat} (h_lt : r < 65536) :
@@ -21530,16 +21538,17 @@ theorem u16_scalarMatchesBackendRepr {r : Nat} (h_lt : r < 65536) :
   rfl
 
 /-- Extract a 2-byte scalar below `2^16` from `valueMatchesTyAndLayout` without unfolding
-`valueMatchesRigidTyAndLayout` at the call site. -/
+`valueMatchesRigidTyAndLayout` at the call site (any 2-byte layout for the `u16` local). -/
 theorem u16_of_valueMatchesTy {fuel' : Nat} {body : CapturedMir} {ty : Ty}
-    {layoutIdx : LayoutIdx} {v : Value} {mem : Memory}
+    {layoutIdx : LayoutIdx} {layout : TypeLayout} {v : Value} {mem : Memory}
     (h_kind : ty.kind = .uint .u16)
-    (h_get : sigGet? body.layouts.entries layoutIdx = some u16TypeLayout)
+    (h_get : sigGet? body.layouts.entries layoutIdx = some layout)
+    (h_size : layout.size.bytes = 2)
     (h : valueMatchesTyAndLayout (fuel' + 1) body ty layoutIdx v mem) :
     ∃ b, v = .scalar { bits := b, sizeBytes := 2 } ∧ b < 65536 := by
   unfold valueMatchesTyAndLayout at h
   rw [h_kind, h_get] at h
-  exact u16_of_valueMatchesRigid h
+  exact u16_of_valueMatchesRigid h_size h
 
 /-- Establish `retMatchesSignature` for a 2-byte scalar below `2^16` when return local `_0`
 has type `u16` and layout `u16TypeLayout`. -/
@@ -21584,5 +21593,7 @@ theorem decodeScalarLayoutBytesNoForge_u16_le (b2 b3 : Nat) (hb2 : b2 < 256) (hb
      | false => Option.none
      | true => Option.some (Value.scalar { bits := rawBits, sizeBytes := 2 })) = _
   rw [h_ble, h_val]
+
+end SignatureCombinators
 
 end Anneal.SepLogicLenses

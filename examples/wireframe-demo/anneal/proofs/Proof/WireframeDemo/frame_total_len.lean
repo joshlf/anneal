@@ -41,42 +41,30 @@ private theorem ensures_holds (b1 b2 : Nat) (hb1 : b1 ≤ 16) (hb2 : b2 ≤ 1024
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_ensures_frame_total_len.layouts,
-        Mir.WireframeDemo.__anodized_fn_ensures_frame_total_len.body,
-        defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-        wpBlockLinear, wpCfgStep, dispatchBlock, evalSymNodeTree,
+        Mir.WireframeDemo.__anodized_fn_ensures_frame_total_len.body, defaultSpecSteps, entryBB,
+        dummyBB, lookupBlock, wpBlockLinear, wpCfgStep, dispatchBlock, evalSymNodeTree,
         evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
         evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast, evalOperandsFast,
         derefReadTreeUB, hasTreeReadUB, borrowEntryReadUB, treeBorrowTransitionIsUB,
-        placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls,
-        isUnresolvedLayoutIdx, isUnionLayout, LayoutTable.lookup,
-        evalConstValue,
-        evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0,
-        evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
-        rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,
-        pointeeTyOf, elemTyOf, tyIsSigned,
-        scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-        mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-        evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-        MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-        initMachineState, initLocals, initLocalsAux, emptyMemory,
-        readProjectedValue_nil, readProjectedValue_field,
-        ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
-        projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
-        byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
-        isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-        invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+        placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls, isUnresolvedLayoutIdx,
+        isUnionLayout, LayoutTable.lookup, evalConstValue, evalScalarBinOpSymTree,
+        bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, operandIsSigned, operandTy,
+        sharedBorrowPerm, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf,
+        tyIsSigned, scalarModulus_2, evalTerminatorSymTreeFast, lookupSwitchTargetTree,
+        applyUnwindAction, MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
+        initMachineState, initLocalsAux, readProjectedValue_nil, readProjectedValue_field,
+        ProvenancePtr.tag, lookupBorrow, stripTransparentProjections, projectionsOverlap,
+        projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
+        borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
+        natListContainsBool, invalidateConflictingBorrows, updateBorrowPerm,
         freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj,
         isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, disableLocalBorrows,
         treeBorrowWriterRelatedness, applyTreeBorrowTransition, treeBorrowNodeAccess,
         treeBorrowPermTransition, treeBorrowProtectorCheck, treeBorrowChildRead,
-        treeBorrowForeignRead, treeBorrowChildWrite, treeBorrowForeignWrite,
-        boolToScalar,
-        GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-        HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-        List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-        get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-        ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-        Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+        treeBorrowForeignRead, treeBorrowForeignWrite, GetElem?.getElem?, List.get?Internal,
+        List.length, List.set, Option.getD, get?, set?, length, Nat.add, Nat.mul, Nat.ble,
+        Nat.beq, Bool.and, Bool.or, Bool.not, ite, dite, Nat.decLt, Nat.decLe, Bool.decEq,
+        instDecidableEqBool]
     | rw [h_ov]
     | rw [h_wrap]
     | rw [Nat.beq_refl]
@@ -102,42 +90,30 @@ private theorem wpReq_inversion (b1 b2 : Nat)
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.layouts,
-        Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.body,
-        defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-        wpBlockLinear, wpCfgStep, dispatchBlock, evalSymNodeTree,
+        Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.body, defaultSpecSteps, entryBB,
+        dummyBB, lookupBlock, wpBlockLinear, wpCfgStep, dispatchBlock, evalSymNodeTree,
         evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
         evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast, evalOperandsFast,
         derefReadTreeUB, hasTreeReadUB, borrowEntryReadUB, treeBorrowTransitionIsUB,
-        placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls,
-        isUnresolvedLayoutIdx, isUnionLayout, LayoutTable.lookup,
-        evalConstValue,
-        evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0,
-        evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
-        rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,
-        pointeeTyOf, elemTyOf, tyIsSigned,
-        scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-        mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-        evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-        MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-        initMachineState, initLocals, initLocalsAux, emptyMemory, mirSafePost,
-        readProjectedValue_nil, readProjectedValue_field,
-        ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
+        placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls, isUnresolvedLayoutIdx,
+        isUnionLayout, LayoutTable.lookup, evalConstValue, evalScalarBinOpSymTree,
+        bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, operandIsSigned, operandTy,
+        sharedBorrowPerm, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf,
+        tyIsSigned, scalarModulus_2, evalTerminatorSymTreeFast, lookupSwitchTargetTree,
+        applyUnwindAction, MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
+        initMachineState, initLocalsAux, mirSafePost, readProjectedValue_nil,
+        readProjectedValue_field, ProvenancePtr.tag, lookupBorrow, stripTransparentProjections,
         projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
         byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
-        isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-        invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+        isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, updateBorrowPerm,
         freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj,
         isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, disableLocalBorrows,
         treeBorrowWriterRelatedness, applyTreeBorrowTransition, treeBorrowNodeAccess,
         treeBorrowPermTransition, treeBorrowProtectorCheck, treeBorrowChildRead,
-        treeBorrowForeignRead, treeBorrowChildWrite, treeBorrowForeignWrite,
-        boolToScalar,
-        GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-        HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-        List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-        get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-        ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-        Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+        treeBorrowForeignRead, treeBorrowForeignWrite, GetElem?.getElem?, List.get?Internal,
+        List.length, List.set, Option.getD, get?, set?, length, Nat.add, Nat.mul, Nat.ble,
+        Nat.beq, Bool.and, Bool.or, Bool.not, ite, dite, Nat.decLt, Nat.decLe, Bool.decEq,
+        instDecidableEqBool]
     | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf
     | (rintro ⟨h_val⟩; injection h_val with h_sc; injection h_sc with h_bits _; contradiction)
     | (cases h_ble1 : Nat.ble b1 16 <;> dsimp only [])
@@ -166,8 +142,8 @@ theorem verified : Obligations.WireframeDemo.frame_total_len.polyClaim := by
     rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
     all_goals first | exact ⟨_, _, rfl⟩ | nomatch h_len
   obtain ⟨h1, h2, -⟩ := h_sig
-  obtain ⟨b1, rfl, -⟩ := u16_of_valueMatchesTy rfl rfl h1
-  obtain ⟨b2, rfl, -⟩ := u16_of_valueMatchesTy rfl rfl h2
+  obtain ⟨b1, rfl, -⟩ := u16_of_valueMatchesTy rfl rfl rfl h1
+  obtain ⟨b2, rfl, -⟩ := u16_of_valueMatchesTy rfl rfl rfl h2
   obtain ⟨hb1, hb2⟩ := wpReq_inversion b1 b2 h_req
   have h_sum : Nat.add b1 b2 < 65536 := by change b1 + b2 < 65536; omega
   -- bb0: `_3 = AddWithOverflow(_1, _2); assert(!_3.1) -> bb1`, evaluated in one

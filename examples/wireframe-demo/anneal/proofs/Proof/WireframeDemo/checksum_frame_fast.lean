@@ -124,10 +124,9 @@ private theorem impl_verified
         invalidateConflictingBorrows, updateBorrowPerm, freezeDerefReadBorrowsAt,
         freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
         isBorrowDescendantOrSelfAux, boolToScalar, GetElem?.getElem?, List.get?Internal,
-        List.length, List.set, List.replicate, HAppend.hAppend, instHAppendOfAppend,
-        Append.append, List.instAppend, List.append, get?, set?, length, Nat.add, Nat.mod,
-        Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not, ite, dite, Nat.decLt, Nat.decLe,
-        Bool.decEq, instDecidableEqBool]
+        List.length, List.set, List.replicate, HAppend.hAppend, Append.append, List.append,
+        get?, set?, length, Nat.add, Nat.mod, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
+        ite, dite, Nat.decLt, Nat.decLe, Bool.decEq, instDecidableEqBool]
       try rw [evalByteCastAfterOperand_frame8])
   case entry.nil | entry.cons => exact ⟨rfl, rfl⟩
   case exit =>
