@@ -2650,6 +2650,8 @@ class TestCliBenchmarkAndLivePrototypeSelfAudit(unittest.TestCase):
 
 
 def _clear_audit_caches() -> None:
+    audit._LAST_LEAN_AUDIT.clear()
+    audit._LAST_LEAN_SCAN.clear()
     audit._THM_AUDIT_CACHE.clear()
     audit._META_CACHE.clear()
     audit._NORM_CACHE.clear()
@@ -3696,10 +3698,107 @@ class TestRules6And7Integration(unittest.TestCase):
             self.assertFalse(proof_health._THM_AUDIT_CACHE)
 
     def test_dogfood_bytecodec_and_adt_and_control_warm_under_5ms(self) -> None:
-        for path in (EPISODE1_BYTECODEC, EPISODE1_ADT_AND_CONTROL):
+        for path, anchor in (
+            (EPISODE1_BYTECODEC, "theorem scalarValidRange_isExactWidth (sz : Nat)"),
+            (EPISODE1_ADT_AND_CONTROL, "theorem evalConst_size_eq_forces_zero_pad_and_intoBytes"),
+        ):
             self.assertEqual(proof_health.scan_lean_file(path), [], path.name)
             elapsed_ms = best_of_ms(lambda: proof_health.scan_lean_file(path, scan_siblings=True))
             self.assertLess(elapsed_ms, 5.0, f"{path.name} warm scan took {elapsed_ms:.2f} ms")
+
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(anchor, text)
+            self.assertEqual(audit.scan_lean_text(text, file_path=path), [], path.name)
+            counter = iter(range(10**6))
+
+            def incremental_audit() -> None:
+                k = next(counter)
+                audit.scan_lean_text(
+                    text.replace(anchor, f"{anchor} (hInc{k} : {k} ≤ {k} + 1)", 1),
+                    file_path=path,
+                )
+
+            inc_audit_ms = best_of_ms(incremental_audit, budget_ms=5.0)
+            self.assertLess(
+                inc_audit_ms,
+                5.0,
+                f"{path.name} incremental 1-theorem audit_lean_text took {inc_audit_ms:.2f} ms",
+            )
+
+            def incremental_full_scan() -> None:
+                k = next(counter)
+                proof_health.scan_lean_text(
+                    text.replace(anchor, f"{anchor} (hScan{k} : {k} ≤ {k} + 1)", 1),
+                    file_path=path,
+                    scan_siblings=True,
+                )
+
+            inc_scan_ms = best_of_ms(incremental_full_scan, budget_ms=5.0)
+            self.assertLess(
+                inc_scan_ms,
+                5.0,
+                f"{path.name} incremental 1-theorem scan_lean_text took {inc_scan_ms:.2f} ms",
+            )
+
+            # Verify that a real vacuity or waiver-drift mutation inside the incremental window
+            # is still caught identically to a cold full scan.
+            bad_edit = text.replace(anchor, f"{anchor} (hBad : 0 = 1)", 1)
+            inc_bad = proof_health.scan_lean_text(bad_edit, file_path=path, scan_siblings=True)
+            proof_health.clear_in_process_caches()
+            cold_bad = proof_health.scan_lean_text(bad_edit, file_path=path, scan_siblings=True)
+            self.assertEqual(inc_bad, cold_bad, path.name)
+            self.assertTrue(
+                any(f.subrule == audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS for f in inc_bad),
+                path.name,
+            )
+
+    def test_multiline_and_inline_block_comment_before_decl_preserves_pin_span(self) -> None:
+        # 1. Multi-line `/- ... -/` block comment ending on the same line as an indented `def`
+        # must preserve `\n` in `code_only` and compute the true line indentation (`2`), keeping
+        # `where\n  def helper` inside the pinned span.
+        indented_draft = (
+            "namespace BlockIndent\n"
+            "  /-- anneal:documented_intent test\n"
+            "  PIN_TAG\n"
+            "  -/\n"
+            "  /- multi-line comment with a very long first line\n"
+            "  -/ def pinnedIndented : Nat :=\n"
+            "    helper\n"
+            "    where\n"
+            "      def helper : Nat := 1\n"
+            "end BlockIndent\n"
+        )
+        tag1 = audit.compute_lean_decl_pins(indented_draft.replace("  PIN_TAG\n", ""))["pinnedIndented"]
+        pinned1 = indented_draft.replace("PIN_TAG", tag1)
+        self.assertEqual(audit.scan_lean_text(pinned1, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned1.replace(":= 1", ":= 999"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+        # 2. Same-line `/- inline comment -/ def pinnedTopLevel` at column 0 must keep `where\n  def helper`
+        # inside the pinned span, while a subsequent `/- comment -/ def nextCmd` at column 0 must end the span.
+        top_draft = (
+            "/-- anneal:documented_intent test\n"
+            "PIN_TOP\n"
+            "-/\n"
+            "/- inline comment -/ def pinnedTopLevel : Nat :=\n"
+            "  helper\n"
+            "where\n"
+            "  def helper : Nat := 1\n"
+            "/- next inline -/ def nextCmd : Nat := 2\n"
+        )
+        tag2 = audit.compute_lean_decl_pins(top_draft.replace("PIN_TOP\n", ""))["pinnedTopLevel"]
+        pinned2 = top_draft.replace("PIN_TOP", tag2)
+        self.assertEqual(audit.scan_lean_text(pinned2, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned2.replace("helper : Nat := 1", "helper : Nat := 999"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+        self.assertEqual(
+            audit.scan_lean_text(pinned2.replace("nextCmd : Nat := 2", "nextCmd : Nat := 999"), check_3axis=False),
+            [],
+        )
 
     def test_shared_auditor_section_byte_identical_and_check_trusted_stdlib_only(self) -> None:
         import ast

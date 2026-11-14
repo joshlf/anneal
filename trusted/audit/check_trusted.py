@@ -205,12 +205,17 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
         raise Failure(1, phase, "compilation_succeeded is not true in CaptureManifest.json")
     if not isinstance(manifest["rust_sources"], list) or not manifest["rust_sources"]:
         raise Failure(1, phase, "CaptureManifest.json must record at least one Rust source file")
+    root_resolved = root.resolve()
     for entry in manifest["rust_sources"]:
         if (not isinstance(entry, list) or len(entry) != 2
                 or not all(isinstance(x, str) and x for x in entry)
                 or not re.fullmatch(r"[0-9a-f]{64}", entry[1])):
             raise Failure(1, phase, "invalid rust_sources entry in CaptureManifest.json")
         src_path = (root / entry[0]).resolve()
+        try:
+            src_path.relative_to(root_resolved)
+        except ValueError:
+            raise Failure(1, phase, f"CaptureManifest.json rust_sources path escapes checkout: {entry[0]}")
         regular(src_path, phase)
         if digest(src_path) != entry[1]:
             raise Failure(1, phase, f"Rust source digest mismatch for {entry[0]}")
@@ -227,6 +232,12 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
             raise Failure(1, phase, f"duplicate target def_id {target['def_id']}")
         seen_defs.add(target["def_id"])
         mir_path = (root / target["mir_module_path"]).resolve()
+        try:
+            mir_path.relative_to(root_resolved)
+        except ValueError:
+            raise Failure(
+                1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {target['mir_module_path']}"
+            )
         regular(mir_path, phase)
         if digest(mir_path) != target["mir_module_sha256"]:
             raise Failure(1, phase, f"Mir module digest mismatch for {target['mir_module_path']}")
@@ -2616,7 +2627,7 @@ def _scan_lean_comments_and_strings(
             c_kind = "d" if raw_blk.startswith("/--") else ("m" if raw_blk.startswith("/-!") else "b")
             c_line = line_of(nxt) if (c_kind in ("d", "m") and ("anneal:" in inner or "pin:" in inner)) else 0
             comments.append((nxt, cur, c_line, inner, c_kind))
-            app_c(" " * (cur - nxt))
+            app_c(" " * (cur - nxt) if "\n" not in raw_blk else _wa_blank(raw_blk))
             pos = cur
             continue
 
@@ -2737,13 +2748,32 @@ def _is_lean_command_start(code_only: str, cand: int) -> bool:
     return _LEAN_BARE_COMMAND_START_RE.match(code_only, kw) is not None
 
 
-def _lean_indent_of(code_only: str, offset: int) -> int:
-    """Return the column offset (`0`-based) of `offset` from the start of its line."""
+def _lean_indent_of(code_only: str, offset: int, text: str | None = None) -> int:
+    """Return the column offset (`0`-based) of `offset`'s line indentation (ignoring any
+    leading `/- ... -/` block comment on the same line when `text` is given)."""
     nl = code_only.rfind("\n", 0, offset)
-    return offset if nl == -1 else offset - (nl + 1)
+    line_start = 0 if nl == -1 else nl + 1
+    if text is None:
+        return offset - line_start
+    p = line_start
+    while p < offset and text[p] in " \t":
+        p += 1
+    if p < offset and not text.startswith("/-", p):
+        open_pos = text.rfind("/-", 0, offset)
+        if open_pos != -1:
+            nl0 = text.rfind("\n", 0, open_pos)
+            ls0 = 0 if nl0 == -1 else nl0 + 1
+            q = ls0
+            while q < open_pos and text[q] in " \t":
+                q += 1
+            if q == open_pos:
+                return q - ls0
+    return p - line_start
 
 
-def _find_lean_decl_end(code_only: str, after_hdr_pos: int, decl_indent: int = 0) -> int:
+def _find_lean_decl_end(
+    code_only: str, after_hdr_pos: int, decl_indent: int = 0, text: str | None = None
+) -> int:
     """Find the end offset of a Lean declaration starting at indentation `decl_indent` before `after_hdr_pos`.
 
     - Any line indented strictly deeper than `decl_indent` (`line_indent > decl_indent`) belongs to
@@ -2757,7 +2787,7 @@ def _find_lean_decl_end(code_only: str, after_hdr_pos: int, decl_indent: int = 0
     """
     n = len(code_only)
     pos = after_hdr_pos
-    if decl_indent <= 0:
+    if decl_indent <= 0 and (text is None or "-/" not in text[after_hdr_pos:]):
         while pos < n:
             m = _LEAN_COL0_BOUNDARY_RE.search(code_only, pos)
             if m is None:
@@ -2776,8 +2806,12 @@ def _find_lean_decl_end(code_only: str, after_hdr_pos: int, decl_indent: int = 0
         if m is None:
             return n
         ws = m.group(1)
-        line_indent = len(ws)
         cand = m.end()
+        line_indent = (
+            _lean_indent_of(code_only, cand, text)
+            if (text is not None and len(ws) > decl_indent and text[m.start() + 1 : cand] != ws)
+            else len(ws)
+        )
         if line_indent > decl_indent:
             pos = cand + 1
             continue
@@ -2791,7 +2825,7 @@ def _find_lean_decl_end(code_only: str, after_hdr_pos: int, decl_indent: int = 0
 
 
 def _extract_lean_decl_span(
-    code_only: str, search_from: int
+    code_only: str, search_from: int, text: str | None = None
 ) -> tuple[int, int, str, str] | None:
     """Find the Lean declaration immediately following `search_from`.
     Returns `(start_off, end_off, decl_kind, decl_name)` or `None` if dangling."""
@@ -2812,7 +2846,7 @@ def _extract_lean_decl_span(
     if hit is None:
         return None
     hdr_end, decl_kind, decl_name = hit
-    end_off = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, i))
+    end_off = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, i, text), text)
     return i, end_off, decl_kind, decl_name
 
 
@@ -3673,7 +3707,7 @@ def _audit_lean_theorem(
     if contradiction_only:
         hyps = [h for h in hyps if h[0]]
     findings: list[WaiverPinFinding] = []
-    norm_conc = _norm_expr(conclusion)
+    norm_conc = "" if contradiction_only else _norm_expr(conclusion)
 
     kind_raw = meta.get("kind", "")
     witness_raw = meta.get("witness", "")
@@ -4114,6 +4148,144 @@ def _lean_docstring_lines(c_list: list[tuple[int, str, str]], kind: str = "d") -
 _3AXIS_KEYS = frozenset(("kind", "witness", "assumes", "subject"))
 _META_CACHE: dict[str, tuple[dict[str, str], list[str]]] = {}
 _THM_AUDIT_CACHE: dict[tuple[str, str, str, bool], tuple[WaiverPinFinding, ...]] = {}
+_LAST_LEAN_AUDIT: dict[
+    tuple[str, bool, str],
+    tuple[str, str, list[int], list[int], list[int], tuple[WaiverPinFinding, ...]],
+] = {}
+
+
+def _find_incremental_lean_window(
+    old_text: str,
+    old_code: str,
+    c_starts: list[int],
+    c_ends: list[int],
+    col0_thms: list[int],
+    text: str,
+) -> (
+    tuple[
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        str,
+        list[tuple[int, int, int, str, str]],
+    ]
+    | None
+):
+    """If `text` is a localized edit of `old_text`, return two-ring window boundaries
+    `(safe_lo, safe_hi_old, safe_hi_new, lo_line_offset, cut_lo_line, cut_hi_old_line,
+    cut_hi_new_line, delta_lines, win_code, win_comments)` for `O(window)` incremental
+    scanning, or `None` when a full scan is needed."""
+    n_old = len(old_text)
+    n_new = len(text)
+    if n_old < 32768 or n_new < 32768 or len(col0_thms) < 8:
+        return None
+    step = 4096
+    limit = n_old if n_old < n_new else n_new
+    p = 0
+    while p + step <= limit and old_text[p : p + step] == text[p : p + step]:
+        p += step
+    while p + 64 <= limit and old_text[p : p + 64] == text[p : p + 64]:
+        p += 64
+    delta_len = n_new - n_old
+    s = n_old
+    while s - step >= p and old_text[s - step : s] == text[s + delta_len - step : s + delta_len]:
+        s -= step
+    while s - 64 >= p and old_text[s - 64 : s] == text[s + delta_len - 64 : s + delta_len]:
+        s -= 64
+    if (p == 0 and s == n_old) or (p + (n_old - s) < (n_new * 3) // 4):
+        return None
+
+    def _backup_col0_decl(kw_pos: int) -> int | None:
+        pos = kw_pos
+        while True:
+            idx = _wa_bisect_right(c_ends, pos) - 1
+            if idx >= 0 and pos - c_ends[idx] <= 64 and old_code[c_ends[idx] : pos].strip() == "":
+                c0 = c_starts[idx]
+                nl = old_code.rfind("\n", 0, c0)
+                pos = 0 if nl == -1 else nl + 1
+            else:
+                break
+        if pos > 0 and (old_text[pos - 1] != "\n" or old_code[pos - 1] != "\n"):
+            return None
+        prev_nl = old_code.rfind("\n", 0, pos - 1) if pos > 0 else -1
+        prev_line = old_code[prev_nl + 1 : pos - 1].strip() if pos > 0 else ""
+        if prev_line.startswith("@") or prev_line.startswith("where"):
+            return None
+        return pos
+
+    i_lo = _wa_bisect_right(col0_thms, p) - 1
+    cut_lo: int | None = None
+    safe_lo: int | None = None
+    while i_lo >= 0:
+        cand = _backup_col0_decl(col0_thms[i_lo])
+        if cand is not None and cand <= p:
+            if cut_lo is None:
+                cut_lo = cand
+            elif cand < cut_lo:
+                safe_lo = cand
+                break
+        i_lo -= 1
+
+    n_thms = len(col0_thms)
+    i_hi = _wa_bisect_right(col0_thms, s - 1 if s > 0 else 0)
+    cut_hi_old: int | None = None
+    safe_hi_old: int | None = None
+    while i_hi < n_thms:
+        cand = _backup_col0_decl(col0_thms[i_hi])
+        if cand is not None and cand >= s:
+            if cut_hi_old is None:
+                cut_hi_old = cand
+            elif cand > cut_hi_old:
+                safe_hi_old = cand
+                break
+        i_hi += 1
+
+    if (
+        safe_lo is None
+        or cut_lo is None
+        or cut_hi_old is None
+        or safe_hi_old is None
+        or not (safe_lo < cut_lo <= p and s <= cut_hi_old < safe_hi_old)
+    ):
+        return None
+
+    safe_hi_new = safe_hi_old + delta_len
+    cut_hi_new = cut_hi_old + delta_len
+
+    look = 64 if n_old - safe_hi_old >= 64 else (n_old - safe_hi_old)
+    win_look_code, win_look_comments = _scan_lean_comments_and_strings(
+        text[safe_lo : safe_hi_new + look]
+    )
+    win_len = safe_hi_new - safe_lo
+    if win_look_code[win_len:] != old_code[safe_hi_old : safe_hi_old + look]:
+        return None
+    if any(cs < win_len < ce for cs, ce, _, _, _ in win_look_comments):
+        return None
+
+    win_code = win_look_code[:win_len]
+    win_comments = [c for c in win_look_comments if c[1] <= win_len]
+    lo_line_offset = old_text.count("\n", 0, safe_lo)
+    cut_lo_line = lo_line_offset + old_text.count("\n", safe_lo, cut_lo) + 1
+    cut_hi_old_line = cut_lo_line - 1 + old_text.count("\n", cut_lo, cut_hi_old) + 1
+    cut_hi_new_line = lo_line_offset + text.count("\n", safe_lo, cut_hi_new) + 1
+    delta_lines = cut_hi_new_line - cut_hi_old_line
+    return (
+        safe_lo,
+        safe_hi_old,
+        safe_hi_new,
+        lo_line_offset,
+        cut_lo_line,
+        cut_hi_old_line,
+        cut_hi_new_line,
+        delta_lines,
+        win_code,
+        win_comments,
+    )
 
 # Which theorems the 3-axis / `TRIVIAL_PROOF` audit covers (`audit_lean_text(vacuity_scope=...)`):
 # - `"all"`: every `theorem` / `lemma` gets every check (`--all-theorems`, the prototype default).
@@ -4171,6 +4343,7 @@ def audit_lean_text(
     file_path: str | Path | None = None,
     check_3axis: bool = True,
     vacuity_scope: str = "all",
+    _preparsed: tuple[str, list[tuple[int, int, int, str, str]]] | None = None,
 ) -> list[WaiverPinFinding]:
     """Scan Lean 4 source `text` for `S0`-`S3` waiver pin findings and 3-axis / `TRIVIAL_PROOF` hazards.
 
@@ -4184,14 +4357,87 @@ def audit_lean_text(
         raise ValueError(f"unknown vacuity_scope {vacuity_scope!r}")
     if not check_3axis and "anneal:" not in text and "pin:sha256:" not in text:
         return []
+    state_key = (
+        str(file_path) if file_path is not None else "",
+        bool(check_3axis),
+        vacuity_scope,
+    )
+    if _preparsed is None and len(text) >= 32768:
+        prev = _LAST_LEAN_AUDIT.get(state_key)
+        if prev is not None:
+            old_text, old_code, c_starts, c_ends, col0_thms, old_findings = prev
+            if text == old_text:
+                return list(old_findings)
+            win_info = _find_incremental_lean_window(
+                old_text, old_code, c_starts, c_ends, col0_thms, text
+            )
+            if win_info is not None:
+                (
+                    safe_lo,
+                    _safe_hi_old,
+                    safe_hi_new,
+                    lo_line_offset,
+                    cut_lo_line,
+                    cut_hi_old_line,
+                    cut_hi_new_line,
+                    delta_lines,
+                    win_code,
+                    win_comments,
+                ) = win_info
+                win_findings = audit_lean_text(
+                    text[safe_lo:safe_hi_new],
+                    file_path=file_path,
+                    check_3axis=check_3axis,
+                    vacuity_scope=vacuity_scope,
+                    _preparsed=(win_code, win_comments),
+                )
+                spliced = [f for f in old_findings if f.line < cut_lo_line]
+                for wf in win_findings:
+                    adj_line = wf.line + lo_line_offset
+                    if cut_lo_line <= adj_line < cut_hi_new_line:
+                        spliced.append(
+                            WaiverPinFinding(
+                                rule=wf.rule,
+                                line=adj_line,
+                                message=wf.message,
+                                suggestion=wf.suggestion,
+                                symbol=wf.symbol,
+                                expected_pin=wf.expected_pin,
+                                actual_pin=wf.actual_pin,
+                                tier=wf.tier,
+                            )
+                        )
+                for f in old_findings:
+                    if f.line >= cut_hi_old_line:
+                        spliced.append(
+                            f
+                            if delta_lines == 0
+                            else WaiverPinFinding(
+                                rule=f.rule,
+                                line=f.line + delta_lines,
+                                message=f.message,
+                                suggestion=f.suggestion,
+                                symbol=f.symbol,
+                                expected_pin=f.expected_pin,
+                                actual_pin=f.actual_pin,
+                                tier=f.tier,
+                            )
+                        )
+                spliced.sort(key=lambda f: (f.line, f.rule, f.symbol))
+                return spliced
+
     claim_module = is_proof_claim_module(file_path)
     if len(_NORM_CACHE) > 8192:
         _NORM_CACHE.clear()
-    code_only, comment_blocks = _scan_lean_comments_and_strings(text)
+    if _preparsed is not None:
+        code_only, comment_blocks = _preparsed
+    else:
+        code_only, comment_blocks = _scan_lean_comments_and_strings(text)
     comment_starts: list[int] | None = None
     findings: list[WaiverPinFinding] = []
     line_of = _WaLineCounter(text)
     n_code = len(code_only)
+    thms: list[tuple[int, int, str]] = []
 
     decl_comment_map: dict[int, str] = {}
 
@@ -4245,7 +4491,7 @@ def audit_lean_text(
                         decl_comment_map[kw_off] = meta_text
             continue
 
-        decl_info = _extract_lean_decl_span(code_only, grp_end)
+        decl_info = _extract_lean_decl_span(code_only, grp_end, text)
         if decl_info is None:
             for ann in anns:
                 findings.append(
@@ -4355,6 +4601,21 @@ def audit_lean_text(
                     )
 
     findings.sort(key=lambda f: (f.line, f.rule, f.symbol))
+    if _preparsed is None and len(text) >= 32768:
+        if not thms:
+            thms = _iter_lean_theorem_headers(code_only)
+        col0_thms = [kw for kw, _, _ in thms if kw == 0 or code_only[kw - 1] == "\n"]
+        if len(col0_thms) >= 8:
+            if len(_LAST_LEAN_AUDIT) >= 16:
+                _LAST_LEAN_AUDIT.clear()
+            _LAST_LEAN_AUDIT[state_key] = (
+                text,
+                code_only,
+                [c[0] for c in comment_blocks],
+                [c[1] for c in comment_blocks],
+                col0_thms,
+                tuple(findings),
+            )
     return findings
 
 
@@ -4387,7 +4648,7 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
             pos = nl + 1
             continue
         hdr_end, _, d_name = hit
-        d_end = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, d_start))
+        d_end = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, d_start, text), text)
         hash_input = waiver_hash_input(
             anns_by_decl.get(d_start, []),
             _normalize_lean_decl(_no_comments_slice(text, comment_blocks, comment_starts, d_start, d_end)),
@@ -4461,12 +4722,13 @@ def audit_waivers_and_vacuity(sources, *, vacuity: bool = True) -> dict[str, int
     `.rs` sources get the waiver-pin audit; `.lean` sources get the waiver-pin audit plus
     (with `vacuity`) every 3-axis / `TRIVIAL_PROOF` check on theorems carrying 3-axis
     metadata (`Kind:` / `Witness:` / `Assumes:` / `Subject:`) or an `anneal:` waiver
-    docstring, and on `Proof/` claim theorems (`vacuity_scope="annotated-only"`).
-    Unannotated theorems (smoke lemmas such as `theorem trivial_witness : True := trivial`)
-    are not vacuity-audited here. Raises `Failure(1, "waiver-pin", ...)` when any source has
-    a waiver finding, else `Failure(1, "vacuity-audit", ...)` on any vacuity finding, and
-    returns `{"leanFiles": ..., "rustFiles": ...}` when clean. Pure Python: it spawns no
-    subprocess, so `--fast` status-file counts are unaffected.
+    docstring, and on `Proof/` claim theorems, plus the syntactic hypothesis-contradiction
+    check on all named hypotheses (`vacuity_scope="annotated"`).
+    Unannotated smoke lemmas without contradictory hypotheses (such as
+    `theorem trivial_witness : True := trivial`) pass cleanly. Raises `Failure(1, "waiver-pin", ...)`
+    when any source has a waiver finding, else `Failure(1, "vacuity-audit", ...)` on any
+    vacuity finding, and returns `{"leanFiles": ..., "rustFiles": ...}` when clean. Pure
+    Python: it spawns no subprocess, so `--fast` status-file counts are unaffected.
     """
     waiver_hits: list[tuple[str, WaiverPinFinding]] = []
     vacuity_hits: list[tuple[str, WaiverPinFinding]] = []
@@ -4483,7 +4745,7 @@ def audit_waivers_and_vacuity(sources, *, vacuity: bool = True) -> dict[str, int
         else:
             n_lean += 1
             findings = audit_lean_text(
-                text, file_path=label, check_3axis=vacuity, vacuity_scope="annotated-only"
+                text, file_path=label, check_3axis=vacuity, vacuity_scope="annotated"
             )
         for finding in findings:
             (waiver_hits if finding.rule in _WAIVER_RULE_SET else vacuity_hits).append((label, finding))
@@ -4533,9 +4795,8 @@ def make_tree_writable(root: Path) -> None:
 
 def tcb_snapshot_files(root: Path) -> dict[str, Path]:
     """TCB files compared by `--base-snapshot`, keyed by checkout-relative POSIX path:
-    `trusted/audit/{check_trusted.py,TrustedBoundary.lean}`, `trusted/lean/` lock files,
-    `lean-toolchain`, `Trusted.lean` and `Trusted/**/*.lean`, and
-    `trusted/rustc-capture/Cargo.toml`."""
+    `trusted/audit/{check_trusted.py,TrustedBoundary.lean}`, every non-doc file or symlink
+    under `trusted/lean/`, and `trusted/rustc-capture/Cargo.toml`."""
     out: dict[str, Path] = {}
     for rel in ("trusted/audit/check_trusted.py", "trusted/audit/TrustedBoundary.lean",
                 "trusted/lean/lean-toolchain", "trusted/rustc-capture/Cargo.toml"):
@@ -4543,10 +4804,21 @@ def tcb_snapshot_files(root: Path) -> dict[str, Path]:
         if path.exists() or path.is_symlink():
             out[rel] = path
     lean_root = root / "trusted/lean"
-    if lean_root.is_dir():
-        for pattern in ("foundation-lock*.json", "locks/foundation-lock*.json", "Trusted.lean", "Trusted/**/*.lean"):
-            for path in sorted(lean_root.glob(pattern)):
-                out[path.relative_to(root).as_posix()] = path
+    if lean_root.is_symlink():
+        out["trusted/lean"] = lean_root
+    elif lean_root.is_dir():
+        for directory, dirs, files in os.walk(lean_root, followlinks=False):
+            dirs.sort()
+            for dname in dirs:
+                dpath = Path(directory) / dname
+                if dpath.is_symlink():
+                    out[dpath.relative_to(root).as_posix()] = dpath
+            for fname in sorted(files):
+                fpath = Path(directory) / fname
+                rel = fpath.relative_to(root).as_posix()
+                if rel == "trusted/lean/README.md":
+                    continue
+                out[rel] = fpath
     return out
 
 

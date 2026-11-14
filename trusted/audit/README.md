@@ -75,7 +75,8 @@ one in `tools/anneal-lsp/server/proof_health.py`) the `S0`-`S3` waiver auditor:
   `Witness:`, `Assumes:`, `Subject:`) or an `anneal:` waiver docstring, and `Proof/`
   claim theorems (`verified`, `prove_*`), must not have syntactically contradictory
   hypotheses, trivial conclusions, tautological implications, unused subjects,
-  invalid or conflicting metadata, or `S0` padding-pin tier mismatches.
+  invalid or conflicting metadata, or `S0` padding-pin tier mismatches; all theorems
+  are also checked for syntactically contradictory named hypotheses (`vacuity_scope="annotated"`).
 - **Read-only staging:** staged copies of `TrustedBoundary.lean`, `trusted/lean/`,
   and downstream sources are `0444` from the moment they are copied.
 - **`--base-snapshot DIR` / `ANNEAL_TRUSTED_BASE_SNAPSHOT` (`base-snapshot`):**

@@ -618,6 +618,13 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             assert f"[{subrule}]" in str(err) and "trusted/lean/Trusted.lean" in str(err), str(err)
         err = checked(fixture(header + vacuous), expected=1, phase="vacuity-audit", executed=False)
         assert "[syntactic_contradiction_hypothesis]" in str(err), str(err)
+        err_unann = checked(
+            fixture(header + "theorem unannotatedVac (n : Nat) (h : 0 = 1) : n = 99 := by omega\n"),
+            expected=1,
+            phase="vacuity-audit",
+            executed=False,
+        )
+        assert "[syntactic_contradiction_hypothesis]" in str(err_unann), str(err_unann)
 
         # 18c. trusted/rustc-capture Rust sources: an unpinned `///` waiver and an escaped
         # `#[doc = "anneal\x3a..."]` directive are rejected; the pinned item passes the audit.
@@ -680,6 +687,20 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         write_manifest(rs_pinned, vacuous)
         expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "vacuity-audit",
                        "Mir/Foo.lean", "[syntactic_contradiction_hypothesis]")
+        write_manifest(rs_pinned, "theorem unannotatedMirVac (n : Nat) (h : False) : n = 0 := False.elim h\n")
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "vacuity-audit",
+                       "Mir/Foo.lean", "[syntactic_contradiction_hypothesis]")
+        escape_rs = suite / "escape.rs"
+        escape_rs.write_text("pub fn f() {}\n")
+        manifest_path.write_text(json.dumps({
+            "schema": 1, "compilation_succeeded": True,
+            "rust_sources": [["../escape.rs", runner.digest(escape_rs)]],
+            "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": "Mir/Foo.lean",
+                         "mir_module_sha256": runner.digest(mir_file)}],
+        }))
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "manifest",
+                       "escapes checkout")
+        escape_rs.unlink()
         shutil.rmtree(manifest_dir)
 
         # 18f. Staged inspector and Trusted source copies are read-only (0444) from admission on.
@@ -719,6 +740,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         expect_failure(lambda: runner.verify_base_snapshot(root, snap, ("trusted/lean/Trusted.lean",)),
                        1, "base-snapshot", "absent from base snapshot: trusted/lean/Trusted/Extra.lean")
         shutil.rmtree(root / "trusted/lean/Trusted")
+        (root / "trusted/lean/RogueTop.lean").write_text(header)
+        expect_failure(lambda: runner.verify_base_snapshot(root, snap, ("trusted/lean/Trusted.lean",)),
+                       1, "base-snapshot", "absent from base snapshot: trusted/lean/RogueTop.lean")
+        (root / "trusted/lean/RogueTop.lean").unlink()
         assert set(runner.verify_base_snapshot(root, snap, ("trusted/lean/Trusted.lean",))) == set(
             runner.tcb_snapshot_files(snap))
         (snap / "trusted/lean/lean-toolchain").chmod(0o644)
