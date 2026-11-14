@@ -2487,14 +2487,18 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 ///   `u32` parameter `pad2` both at local `_3`, the callee reads `pad2` (`200`)
 ///   instead of `x` (`10`), and its write lands in `pad2`, leaving `x`
 ///   unchanged (Anneal `13` vs Miri `11`): silent wrong values.
+/// - `cat9_gap_callee_raw_write_collides_with_ptr_arg` (`wrong_value`,
+///   `value_mismatch`): the caller's `x` and the callee's pointer argument
+///   `alias` are both local `_1`, so the callee's write through `alias`
+///   overwrites `alias` itself and `x` stays `10` (Anneal `13` vs Miri `9`).
 /// - `cat9_gap_callee_deref_ref_arg` (`false_positive_ub`,
 ///   `sound_conservative_abstraction`): `x` and the reference argument `r` are
 ///   both local `_1`, so `*r` reads the callee's own 8-byte `r` as a `u32` and
 ///   faults.
 /// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): see
 ///   the raw-pointer sibling roots below; without the caller's `&x` the
-///   callee's write proceeds but is misdirected into its own frame (a silent
-///   `wrong_value`, Anneal `13` vs Miri `10`).
+///   callee's write proceeds but is misdirected into its own frame, as in
+///   `cat9_gap_callee_raw_write_collides_with_ptr_arg`.
 /// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
 ///   `unsound_missed_fault`): Miri reports the `FnEntry` protector violation of
 ///   writing through `raw` while `&*raw` is a protected argument; in Anneal the
@@ -2514,6 +2518,18 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 /// - `cat9_gap_post_return_raw_write_after_ref_arg` (`false_positive_ub`): `&x`
 ///   is a call argument and the raw write follows the call (it reproduces with
 ///   a callee whose only locals are `_0` and `_r`).
+///
+/// User `Drop` impls never run: Anneal's `.drop` terminator only de-initializes
+/// the dropped place (the capture's `TerminatorKind::Drop` names no drop impl),
+/// while Miri calls `Drop::drop` (Category 9's `UnwindCleanupGuard` has an
+/// empty `drop` for this reason):
+/// - `cat9_gap_drop_impl_side_effect_skipped` (`wrong_value`,
+///   `value_mismatch`): a write through the guard's raw pointer is lost
+///   (Anneal `1` vs Miri `7`).
+/// - `cat9_gap_drop_impl_panic_missed` (`panic_vs_return`,
+///   `unsound_missed_fault`): an overflow panic inside `drop` is missed.
+/// - `cat9_gap_drop_impl_ub_missed` (`missed_ub`, `unsound_missed_fault`):
+///   `ctlz_nonzero(0)` inside `drop` is missed.
 ///
 /// Other pins:
 /// - `cat9_in_scope_move_raw_read_conservative` (`false_positive_ub`): Anneal
@@ -2779,6 +2795,59 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
 }
 "#,
         ),
+        (
+            "cat9_gap_drop_impl_side_effect_skipped",
+            r#"pub struct Cat9WriteOnDrop(pub *mut u32);
+
+impl Drop for Cat9WriteOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            *self.0 = 7u32;
+        }
+    }
+}
+
+pub fn cat9_gap_drop_impl_side_effect_skipped() -> u32 {
+    let mut x: u32 = 1u32;
+    {
+        let _guard = Cat9WriteOnDrop(&raw mut x);
+    }
+    x
+}
+"#,
+        ),
+        (
+            "cat9_gap_drop_impl_panic_missed",
+            r#"pub struct Cat9OverflowOnDrop(pub u32);
+
+impl Drop for Cat9OverflowOnDrop {
+    fn drop(&mut self) {
+        let _sum: u32 = self.0 + u32::MAX;
+    }
+}
+
+pub fn cat9_gap_drop_impl_panic_missed() -> u32 {
+    let _bomb = Cat9OverflowOnDrop(1u32);
+    5u32
+}
+"#,
+        ),
+        (
+            "cat9_gap_drop_impl_ub_missed",
+            r#"pub struct Cat9CtlzOnDrop(pub u32);
+
+impl Drop for Cat9CtlzOnDrop {
+    fn drop(&mut self) {
+        let _zeros: u32 = unsafe { ctlz_nonzero(self.0 - 1u32) };
+    }
+}
+
+pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
+    let _bomb = Cat9CtlzOnDrop(1u32);
+    5u32
+}
+"#,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -2816,16 +2885,16 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
     )
     .expect("evaluate Category 9 live batch");
 
-    assert_eq!(report.total_candidates, 16);
-    assert_eq!(report.compiled_candidates, 16);
+    assert_eq!(report.total_candidates, 19);
+    assert_eq!(report.compiled_candidates, 19);
     assert_eq!(report.agree_count, 6, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 10, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 13, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
-        ("unsound_missed_fault", 2usize),
+        ("unsound_missed_fault", 4usize),
         ("sound_conservative_abstraction", 5),
-        ("value_mismatch", 3),
+        ("value_mismatch", 4),
         ("harness_or_extraction_error", 0),
     ] {
         assert_eq!(
@@ -2835,8 +2904,8 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 10);
-    assert_eq!(report.kernel_confirmed_divergences, 10);
+    assert_eq!(report.findings.len(), 13);
+    assert_eq!(report.kernel_confirmed_divergences, 13);
     // With no shrinkable mutator chain, every finding reports its original
     // candidate, so each original item report is itself kernel-confirmed.
     for f in &report.findings {
@@ -2988,6 +3057,65 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
              tests/miri-diff/README.md",
             ub_marker.trim(),
             rep.anneal
+        );
+    }
+
+    // Anneal never runs a user `Drop` impl: its `.drop` terminator only
+    // de-initializes the dropped place, so the side effect, panic, and UB of a
+    // `Drop::drop` body are all invisible to it.
+    let skipped = item("cat9_gap_drop_impl_side_effect_skipped");
+    assert_eq!(
+        finding("cat9_gap_drop_impl_side_effect_skipped").witness_polarity,
+        "value_mismatch"
+    );
+    assert_eq!(
+        (&skipped.miri, &skipped.anneal),
+        (
+            &MiriOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4
+            },
+            &AnnealOutcome::PassScalar {
+                bits: 1,
+                size_bytes: 4
+            }
+        ),
+        "known Category 9 `Drop` gap changed (fixed?); update the pin and tests/miri-diff/README.md"
+    );
+    for (name, class, fault_marker) in [
+        (
+            "cat9_gap_drop_impl_panic_missed",
+            "panic_vs_return",
+            "        let _sum: u32 = self.0 + u32::MAX;",
+        ),
+        (
+            "cat9_gap_drop_impl_ub_missed",
+            "missed_ub",
+            "        let _zeros: u32 = unsafe { ctlz_nonzero(self.0 - 1u32) };",
+        ),
+    ] {
+        let f = finding(name);
+        assert_eq!(f.divergence_class, class, "`{name}`");
+        assert_eq!(f.witness_polarity, "unsound_missed_fault", "`{name}`");
+        let rep = item(name);
+        let fault_line = cat9_line_of(&staged, fault_marker);
+        let miri_line = match &rep.miri {
+            MiriOutcome::Panic { pos: Some(p), .. } if class == "panic_vs_return" => p.line,
+            MiriOutcome::Ub { pos: Some(p), .. } if class == "missed_ub" => p.line,
+            other => panic!("`{name}`: unexpected Miri outcome {other:?}"),
+        };
+        assert_eq!(
+            miri_line, fault_line,
+            "`{name}`: Miri must fault inside `Drop::drop`"
+        );
+        assert_eq!(
+            rep.anneal,
+            AnnealOutcome::PassScalar {
+                bits: 5,
+                size_bytes: 4
+            },
+            "known Category 9 `Drop` gap `{name}` changed (fixed?); update the pin and \
+             tests/miri-diff/README.md"
         );
     }
 }

@@ -1016,8 +1016,8 @@ pub fn helper_unwind_mid(_protected: &u32, _base: u32) -> u32 {
     helper_unwind_leaf(u32::MAX, 1u32)
 }
 
-/// Guard with an (empty) `Drop` impl: while one is live, a call's unwind edge
-/// is `UnwindAction::Cleanup` into a landing pad that drops the guard.
+/// Guard with an empty `Drop` impl, since Anneal never runs `Drop::drop` bodies:
+/// while one is live, a call unwinds through an `UnwindAction::Cleanup` landing pad.
 pub struct UnwindCleanupGuard(pub u32);
 
 impl Drop for UnwindCleanupGuard {

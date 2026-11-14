@@ -2386,17 +2386,14 @@ fn collect_ident_tokens(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<Str
     }
 }
 
-/// Names of the top-level functions of a staged `src/lib.rs` that the
-/// evaluated `items` (or the candidate portion after
-/// [`MIRI_CORPUS_MODULE_PREAMBLE`] when `items` is empty) reach, transitively.
-///
-/// When `items` names one or more parsed functions in `lib_rs`, the reachability
-/// worklist starts from those functions directly so evaluating a subset of
-/// `tests/miri-diff/corpus/src/lib.rs` links only the model-marked helpers that
-/// subset actually calls. When `items` is empty or does not match parsed
-/// functions in `lib_rs`, the worklist starts from identifiers in the text after
-/// [`MIRI_CORPUS_MODULE_PREAMBLE`] (or the whole crate if the preamble is not
-/// embedded verbatim).
+/// Index the function bodies of a parsed crate by name for
+/// [`staged_helper_fns_reachable_from_candidates`]: top-level functions,
+/// functions nested in function bodies or inline modules, and `impl` methods.
+/// Same-named functions (a nested function shadowing a top-level helper, or the
+/// `drop` methods of several `Drop` impls) share one entry holding the union of
+/// their bodies, so reachability over-approximates instead of following only
+/// the last body indexed. `macro_rules!` items and `impl` blocks are indexed as
+/// auxiliary tokens, by macro name and by the idents of the `impl`'s self type.
 fn collect_fn_and_aux_items(
     items: &[syn::Item],
     fn_bodies: &mut BTreeMap<String, proc_macro2::TokenStream>,
@@ -2405,10 +2402,10 @@ fn collect_fn_and_aux_items(
     for item in items {
         match item {
             syn::Item::Fn(func) => {
-                fn_bodies.insert(
-                    func.sig.ident.to_string(),
-                    quote::ToTokens::to_token_stream(&func.block),
-                );
+                fn_bodies
+                    .entry(func.sig.ident.to_string())
+                    .or_default()
+                    .extend(quote::ToTokens::to_token_stream(&func.block));
                 let nested_items: Vec<syn::Item> = func
                     .block
                     .stmts
@@ -2445,10 +2442,10 @@ fn collect_fn_and_aux_items(
                 }
                 for impl_item in &imp.items {
                     if let syn::ImplItem::Fn(method) = impl_item {
-                        fn_bodies.insert(
-                            method.sig.ident.to_string(),
-                            quote::ToTokens::to_token_stream(&method.block),
-                        );
+                        fn_bodies
+                            .entry(method.sig.ident.to_string())
+                            .or_default()
+                            .extend(quote::ToTokens::to_token_stream(&method.block));
                     }
                 }
             }
@@ -2457,6 +2454,18 @@ fn collect_fn_and_aux_items(
     }
 }
 
+/// Names of the functions of a staged `src/lib.rs` (top-level, nested, and
+/// `impl` methods; see [`collect_fn_and_aux_items`]) that the evaluated `items`
+/// (or the candidate portion after [`MIRI_CORPUS_MODULE_PREAMBLE`] when `items`
+/// is empty) reach, transitively.
+///
+/// When `items` names one or more parsed functions in `lib_rs`, the reachability
+/// worklist starts from those functions directly so evaluating a subset of
+/// `tests/miri-diff/corpus/src/lib.rs` links only the model-marked helpers that
+/// subset actually calls. When `items` is empty or does not match parsed
+/// functions in `lib_rs`, the worklist starts from identifiers in the text after
+/// [`MIRI_CORPUS_MODULE_PREAMBLE`] (or the whole crate if the preamble is not
+/// embedded verbatim).
 fn staged_helper_fns_reachable_from_candidates(
     lib_rs: &str,
     items: &[OracleItemSpec],
@@ -2723,6 +2732,46 @@ fn partition_subject_callees(
     }
 
     (captured_candidates, helpers.into_iter().collect())
+}
+
+/// Subset of the batch's `helper_module_suffixes` that `MiriOracleConfirm.lean`
+/// links for `entries`. A helper is kept when its function is reachable from
+/// `entries` ([`staged_helper_fns_reachable_from_candidates`]), when it is nested
+/// in an entry (`<Crate>.<entry>_…` or `<Crate>.<entry>.…`), or when its short
+/// name is not a function of `lib_rs` at all (a closure, a derive-generated
+/// impl, a shim): token reachability cannot see calls into those (operators,
+/// trait dispatch, closure calls), so they stay linked exactly as in the probe
+/// module, whose result each confirmation theorem restates.
+fn confirm_helper_module_suffixes(
+    lib_rs: &str,
+    crate_camel: &str,
+    subject_pairs: &[(String, String)],
+    helper_module_suffixes: &[String],
+    entries: &[OracleItemSpec],
+) -> Vec<String> {
+    let entry_reachable = staged_helper_fns_reachable_from_candidates(lib_rs, entries);
+    let mut source_fns: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
+    if let Ok(file) = syn::parse_file(lib_rs) {
+        collect_fn_and_aux_items(&file.items, &mut source_fns, &mut BTreeMap::new());
+    }
+    helper_module_suffixes
+        .iter()
+        .filter(|suffix| {
+            let linked_by_name =
+                subject_pairs
+                    .iter()
+                    .filter(|(_, s)| s == *suffix)
+                    .any(|(short, _)| {
+                        entry_reachable.contains(short) || !source_fns.contains_key(short)
+                    });
+            let nested_in_entry = entries.iter().any(|spec| {
+                suffix.starts_with(&format!("{crate_camel}.{}_", spec.name))
+                    || suffix.starts_with(&format!("{crate_camel}.{}.", spec.name))
+            });
+            linked_by_name || nested_in_entry
+        })
+        .cloned()
+        .collect()
 }
 
 /// Render the Lean list of callees linked into every probed or confirmed item:
@@ -3292,22 +3341,13 @@ fn run_linked_difftest_oracle_pipeline(
         let write_confirm_module = |entries: &[(OracleItemSpec, String, AnnealOutcome)]| {
             let entry_specs: Vec<OracleItemSpec> =
                 entries.iter().map(|(spec, _, _)| spec.clone()).collect();
-            let entry_reachable =
-                staged_helper_fns_reachable_from_candidates(&lib_rs, &entry_specs);
-            let entry_helper_suffixes: Vec<String> = helper_module_suffixes
-                .iter()
-                .filter(|suffix| {
-                    let short_matches = subject_pairs
-                        .iter()
-                        .any(|(short, s)| s == *suffix && entry_reachable.contains(short));
-                    let nested_in_entry = entries.iter().any(|(spec, _, _)| {
-                        suffix.starts_with(&format!("{crate_camel}.{}_", spec.name))
-                            || suffix.starts_with(&format!("{crate_camel}.{}.", spec.name))
-                    });
-                    short_matches || nested_in_entry
-                })
-                .cloned()
-                .collect();
+            let entry_helper_suffixes = confirm_helper_module_suffixes(
+                &lib_rs,
+                &crate_camel,
+                &subject_pairs,
+                &helper_module_suffixes,
+                &entry_specs,
+            );
             let src = render_linked_anneal_confirm_module(
                 &crate_camel,
                 entries,
@@ -8056,5 +8096,89 @@ pub fn cand_entry() -> u32 {
         assert!(reached.contains("helper_from_macro"));
         assert!(reached.contains("helper_from_drop"));
         assert!(!reached.contains("unrelated_helper"));
+    }
+
+    #[test]
+    fn helper_reachability_unions_same_named_fns_and_confirm_keeps_opaque_helpers() {
+        // `cand_shadow`'s nested `helper_mid` is indexed after the top-level
+        // `helper_mid`; reachability from `cand_top` must still follow the
+        // top-level body to `helper_leaf`, not just the last body indexed.
+        let lib_rs = "\
+pub fn helper_leaf(v: u32) -> u32 { v }
+pub fn helper_mid(v: u32) -> u32 { helper_leaf(v) }
+fn helper_unrelated(v: u32) -> u32 { v + 1 }
+pub struct Guard(pub u32);
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+pub fn cand_top() -> u32 {
+    helper_mid(1u32)
+}
+pub fn cand_shadow() -> u32 {
+    fn helper_mid() -> u32 { 7u32 }
+    let _g = Guard(2u32);
+    helper_mid() + helper_unrelated(3u32)
+}
+";
+        let spec = |name: &str| OracleItemSpec {
+            name: name.to_string(),
+            fuel: 128,
+        };
+        let reached = staged_helper_fns_reachable_from_candidates(lib_rs, &[spec("cand_top")]);
+        for name in ["cand_top", "helper_mid", "helper_leaf"] {
+            assert!(reached.contains(name), "missing {name}: {reached:?}");
+        }
+        for name in ["helper_unrelated", "drop", "cand_shadow"] {
+            assert!(!reached.contains(name), "unexpected {name}: {reached:?}");
+        }
+
+        // `MiriOracleConfirm.lean` links, for `cand_top`, only the helpers it
+        // reaches plus helpers that token reachability cannot rule out: a
+        // derive-generated `eq` and a closure have no source `fn`.
+        let pairs: Vec<(String, String)> = [
+            ("cand_top", "X.cand_top"),
+            ("cand_shadow", "X.cand_shadow"),
+            ("helper_leaf", "X.helper_leaf"),
+            ("helper_mid", "X.helper_mid"),
+            ("helper_mid", "X.cand_shadow.helper_mid"),
+            ("helper_unrelated", "X.helper_unrelated"),
+            ("drop", "X.Guard_as_core_ops_Drop_drop"),
+            ("eq", "X.Pair_as_core_cmp_PartialEq_eq"),
+            ("{closure#0}", "X.cand_top__closure_0"),
+        ]
+        .iter()
+        .map(|(short, suffix)| (short.to_string(), suffix.to_string()))
+        .collect();
+        let entries = [spec("cand_top")];
+        let (_, helpers) = partition_subject_callees("X", &pairs, &entries);
+        let linked = confirm_helper_module_suffixes(lib_rs, "X", &pairs, &helpers, &entries);
+        assert_eq!(
+            linked,
+            [
+                "X.Pair_as_core_cmp_PartialEq_eq",
+                "X.cand_shadow.helper_mid",
+                "X.cand_top__closure_0",
+                "X.helper_leaf",
+                "X.helper_mid",
+            ],
+            "helpers: {helpers:?}"
+        );
+        // For `cand_shadow`, the `Drop` impl of its `Guard` and the nested
+        // `helper_mid` are linked; `helper_leaf` is too, an over-approximation
+        // of the shared `helper_mid` entry.
+        let shadow = [spec("cand_shadow")];
+        let (_, helpers) = partition_subject_callees("X", &pairs, &shadow);
+        let linked = confirm_helper_module_suffixes(lib_rs, "X", &pairs, &helpers, &shadow);
+        for suffix in [
+            "X.Guard_as_core_ops_Drop_drop",
+            "X.cand_shadow.helper_mid",
+            "X.helper_unrelated",
+            "X.helper_leaf",
+        ] {
+            assert!(
+                linked.iter().any(|s| s == suffix),
+                "missing {suffix}: {linked:?}"
+            );
+        }
     }
 }

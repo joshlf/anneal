@@ -127,9 +127,10 @@ in [`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_
 pins each one, kernel-confirmed, with its exact Miri and Anneal outcomes.
 The Category 9 seeds and the `miri-difftest` templates avoid them all: no
 helper or template accesses memory through a pointer into its caller's frame,
-or writes through a raw pointer after a sibling `&x` exists. The call-chain
-tests therefore check reference passing, reborrow return, frame cleanup, and
-unwinding, but not Anneal's `FnEntry` protector enforcement.
+writes through a raw pointer after a sibling `&x` exists, or relies on the body
+of a `Drop` impl. The call-chain tests therefore check reference passing,
+reborrow return, frame cleanup, and unwinding into cleanup landing pads, but
+not Anneal's `FnEntry` protector enforcement or `Drop::drop` calls.
 
 **Frame-relative pointer resolution.** A borrow entry's `targetLocal` is a
 local index into the *running* frame (`get? locals entry.targetLocal`, falling
@@ -141,8 +142,9 @@ resolves to the callee's own local `_k`:
   and a `u32` parameter `pad2` of the callee are both local `_3`, a callee read
   through a raw pointer to `x` returns `pad2` (Anneal `200`, Miri `10`), and a
   callee write through it lands in `pad2` and leaves `x` unchanged (Anneal `13`,
-  Miri `11`). A callee write that collides with its own pointer argument is
-  lost the same way (Anneal `13`, Miri `10`).
+  Miri `11`). When the caller's `x` and the callee's pointer argument `alias`
+  are both local `_1`, the callee's write through `alias` overwrites `alias`
+  itself and is lost the same way (Anneal `13`, Miri `9`).
 - False UB (`false_positive_ub`): a callee dereferencing a reference argument
   (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as `f(&x, 1)`, with
   `x` and `r` both local `_1`) reads its own 8-byte `r` as a `u32` and faults.
@@ -175,6 +177,20 @@ tag and the write only disables `&x`:
 - After a call: `&x` is a call argument and the caller writes through `raw`
   once the callee has returned. This also reproduces with a callee whose only
   locals are `_0` and `_r`, so it does not depend on local-index collisions.
+
+**User `Drop` impls never run.** The MIR capture lowers `TerminatorKind::Drop`
+to a `.drop place target unwind` terminator that names no drop impl, and
+Anneal's step for it only de-initializes `place` (or checks that a projected
+place is readable) before jumping to `target`. Miri calls `Drop::drop`. Every
+effect of a `drop` body is therefore invisible to Anneal, which is why
+Category 9's `UnwindCleanupGuard` has an empty `drop`:
+
+- A write through a raw pointer held by the dropped guard is lost (`wrong_value`,
+  `value_mismatch`; Anneal `1`, Miri `7`).
+- An overflow panic inside `drop` is missed (`panic_vs_return`,
+  `unsound_missed_fault`; Anneal returns `5`).
+- `ctlz_nonzero(0)` inside `drop` is missed (`missed_ub`,
+  `unsound_missed_fault`; Anneal returns `5`).
 
 **Other gaps.**
 
