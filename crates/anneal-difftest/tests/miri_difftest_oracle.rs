@@ -2917,12 +2917,14 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
             "item report for `{}` must stay kernel-confirmed",
             f.fn_name
         );
-        // None of the diverging pins call preamble `helper_*` functions;
-        // `MiriOracleConfirm.lean` must not link helpers reachable only from
-        // the agreeing candidates in the batch.
+        // None of the diverging pins call preamble `helper_*` functions or
+        // construct `UnwindCleanupGuard`; `MiriOracleConfirm.lean` must not
+        // link helpers or `Drop` impls reachable only from the agreeing
+        // candidates in the batch.
         assert!(
             !f.kernel_confirm_theorems.contains("helper_reborrow_")
-                && !f.kernel_confirm_theorems.contains("helper_unwind_"),
+                && !f.kernel_confirm_theorems.contains("helper_unwind_")
+                && !f.kernel_confirm_theorems.contains("UnwindCleanupGuard"),
             "confirm module for `{}` linked unrelated batch helpers:\n{}",
             f.fn_name,
             f.kernel_confirm_theorems
@@ -3064,6 +3066,10 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
     // de-initializes the dropped place, so the side effect, panic, and UB of a
     // `Drop::drop` body are all invisible to it.
     let skipped = item("cat9_gap_drop_impl_side_effect_skipped");
+    assert_eq!(
+        finding("cat9_gap_drop_impl_side_effect_skipped").divergence_class,
+        "wrong_value"
+    );
     assert_eq!(
         finding("cat9_gap_drop_impl_side_effect_skipped").witness_polarity,
         "value_mismatch"
