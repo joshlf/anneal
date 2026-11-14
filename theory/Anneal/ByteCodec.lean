@@ -395,15 +395,6 @@ theorem boolByte_not_isSurjectiveInitDecoder :
   rcases hSurj [.init (UInt8.ofNat 2) none] rfl rfl with ⟨b, hb⟩
   nomatch hb
 
-private theorem scalarModulus_eq_two_pow : ∀ sz : Nat, scalarModulus sz = 2 ^ (8 * sz)
-  | 0 => rfl
-  | k + 1 => by
-    unfold scalarModulus
-    change 256 * scalarModulus k = 2 ^ (8 * (k + 1))
-    have h256 : (256 : Nat) = 2 ^ 8 := rfl
-    have hmul : 8 * (k + 1) = 8 * k + 8 := by omega
-    rw [scalarModulus_eq_two_pow k, h256, hmul, Nat.pow_add, Nat.mul_comm]
-
 /--
 Fixed-width little-endian unsigned bit-pattern codec of positive byte width `sz`,
 decoding into `{ bits : Nat // bits < 2 ^ (8 * sz) }`.
@@ -428,7 +419,7 @@ def uintBitsLE (sz : Nat) (hNz : 0 < sz) :
       have hLen : Nat.beq (encodeLittleEndianBytes bits (k + 1) none).length (k + 1) = true :=
         Nat.beq_eq.mpr hLenEq
       have hModLt : bits < scalarModulus (k + 1) := by
-        rw [scalarModulus_eq_two_pow]
+        rw [Anneal.Scalars.scalarModulus_eq_two_pow]
         exact hProp
       have hDec := decodeLittleEndianBytes_encodeLittleEndianBytes_of_lt none k bits hModLt
       dsimp only
@@ -457,7 +448,7 @@ theorem uintBitsLE_isSurjectiveInitDecoder (sz : Nat) (hNz : 0 < sz) :
   have hModLt : bits < scalarModulus bs.length :=
     decodeLittleEndianBytes_lt_scalarModulus bs bits prov hDec
   have hLt : bits < 2 ^ (8 * sz) := by
-    rw [hLen, scalarModulus_eq_two_pow] at hModLt
+    rw [hLen, Anneal.Scalars.scalarModulus_eq_two_pow] at hModLt
     exact hModLt
   refine ⟨⟨bits, hLt⟩, ?_⟩
   unfold uintBitsLE ofRoundTrip
@@ -1354,7 +1345,7 @@ theorem decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
       rcases bp with ⟨bits, prov⟩
       have hModLt := decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
       have hLt : bits < 2 ^ (8 * sz) := by
-        rw [hLenDef, hLenEq, scalarModulus_eq_two_pow] at hModLt
+        rw [hLenDef, hLenEq, Anneal.Scalars.scalarModulus_eq_two_pow] at hModLt
         exact hModLt
       dsimp only
       simp only [hLt, ↓reduceDIte]
@@ -2004,7 +1995,7 @@ def uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx) :
           rcases bp with ⟨bits, prov⟩
           have hModLt := decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
           have hLt : bits < 2 ^ (8 * sz) := by
-            rw [hLenDef, hLenEq, FixedByteCodec.scalarModulus_eq_two_pow] at hModLt
+            rw [hLenDef, hLenEq, Anneal.Scalars.scalarModulus_eq_two_pow] at hModLt
             exact hModLt
           dsimp only
           simp only [hLt, ↓reduceDIte]
@@ -4028,19 +4019,20 @@ theorem rigidTyKindByteSize_eq_zero_of_isUnitTupleRigidTy {r : RigidTy}
 /-! ## 7. Symbolic Pair & Multi-Field Struct Padding (`SymbolicPairPad`, `SymbolicStructSpine`, `FieldPerm`, `PlacedCodecSpine`) -/
 
 /--
-Size and alignment of a single ADT field (shared between `Anneal.ByteCodec` and
-`Anneal.Mir.AdtAndControl`).
+Exact size and ABI alignment of a field type (`TyLayout` in `crates/anneal-mir/src/ir.rs`), shared
+between `Anneal.ByteCodec` and `Anneal.Mir.AdtAndControl` (which re-exports it).
 -/
-structure FieldLayout where
+structure FieldLayout : Type where
+  /-- Size in bytes. -/
   size : Nat
+  /-- ABI alignment in bytes. -/
   align : Nat
   deriving DecidableEq, Repr
 
-/-- Whether a field is a 1-aligned zero-sized type (`1-ZST`, ignored by `#[repr(transparent)]`). -/
-def FieldLayout.isOneZst (f : FieldLayout) : Bool :=
-  f.size == 0 && f.align == 1
+/-- A 1-ZST (size `0`, alignment `1`), which `#[repr(transparent)]` ignores. -/
+def FieldLayout.isOneZst (f : FieldLayout) : Bool := f.size == 0 && f.align == 1
 
-/-- Sum of raw field sizes in declaration or memory order. -/
+/-- Sum of the fields' sizes (in declaration or memory order). -/
 def sumSizes : List FieldLayout → Nat
   | [] => 0
   | f :: fs => f.size + sumSizes fs
@@ -6438,7 +6430,19 @@ theorem demoS3Placed_memSortTypes :
     demoS3Placed.memSort.placed = [(0, ⟨4, 4⟩), (4, ⟨1, 1⟩), (5, ⟨0, 1⟩)] :=
   ⟨rfl, rfl⟩
 
-/-! ## 8. Real `LayoutTable` (`FieldsShape.arbitrary`) Bridge (`MirValueCodec.ofPlacedCodecSpine` & Concrete 2/3-Field Instances) -/
+/-! ## 8. Real `LayoutTable` (`FieldsShape.arbitrary`) Bridge (`MirValueCodec.ofPlacedCodecSpine` & Concrete 2/3-Field Instances)
+
+`MirValueCodec.ofPlacedCodecSpine` derives Trusted's tuple semantics from the `LayoutTable` entry:
+1. **Byte windows** (`writeWindows`, `WindowImage`): Trusted's `encodeFieldsAtOffsetsWith` writes each
+   declaration field's encoding at its offset over `.uninit` bytes, and pairwise-disjoint in-bounds
+   window writes commute (`writeWindows_eq_of_perm`), so the memory-order realized codec agrees with
+   the declaration-order writes (`PlacedCodecSpine.writeWindows_realizedCodec_encode`).
+2. **Window decodes** (`PlacedCodecSpine.decodeAt`): both Trusted's `decodeFieldsAtOffsetsWith` and the
+   realized codec decode each field from its own window and ignore padding bytes
+   (`PlacedCodecSpine.realizedCodec_decode_eq_decodeAt`).
+3. **Per-field bridges** (`TupleFieldCodec`) at `tupleFieldFuel`, the fuel at which Trusted recurses into
+   tuple fields, with ready-made instances for `uN` and `()` fields.
+-/
 
 namespace FixedByteCodec
 
@@ -6479,50 +6483,1310 @@ theorem castWidth_hasZeroValid {α : Type} {m n : Nat} (c : FixedByteCodec α m)
 
 end FixedByteCodec
 
+/-! ### Byte-Window Images (`InWindow`, `WindowImage`, `writeWindows`) -/
+
+/-- Byte index `j` lies inside the byte window `w = (offset, bytes)`. -/
+def InWindow (j : Nat) (w : Nat × List AbstractByte) : Prop :=
+  w.1 ≤ j ∧ j < w.1 + w.2.length
+
+instance (j : Nat) (w : Nat × List AbstractByte) : Decidable (InWindow j w) :=
+  inferInstanceAs (Decidable (_ ∧ _))
+
+/-- Two byte windows occupy disjoint byte ranges. -/
+def WindowsDisjoint (w₁ w₂ : Nat × List AbstractByte) : Prop :=
+  w₁.1 + w₁.2.length ≤ w₂.1 ∨ w₂.1 + w₂.2.length ≤ w₁.1
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem WindowsDisjoint.symm {w₁ w₂ : Nat × List AbstractByte} (h : WindowsDisjoint w₁ w₂) :
+    WindowsDisjoint w₂ w₁ :=
+  h.elim Or.inr Or.inl
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem WindowsDisjoint.not_inWindow {w₁ w₂ : Nat × List AbstractByte} (h : WindowsDisjoint w₁ w₂)
+    {j : Nat} (h₁ : InWindow j w₁) : ¬ InWindow j w₂ := by
+  intro h₂
+  unfold WindowsDisjoint at h
+  unfold InWindow at h₁ h₂
+  omega
+
+/--
+`out` is the background buffer `buf` with every byte window of `ws` written over it: bytes inside a
+window are that window's bytes, bytes outside every window are `buf`'s bytes, and the length is
+unchanged.
+-/
+structure WindowImage (buf : List AbstractByte) (ws : List (Nat × List AbstractByte))
+    (out : List AbstractByte) : Prop where
+  length_eq : out.length = buf.length
+  inside : ∀ w ∈ ws, ∀ j, InWindow j w → out[j]? = w.2[j - w.1]?
+  outside : ∀ j, (∀ w ∈ ws, ¬ InWindow j w) → out[j]? = buf[j]?
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem WindowImage.perm {buf out : List AbstractByte} {ws ws' : List (Nat × List AbstractByte)}
+    (h : WindowImage buf ws out) (hp : ws.Perm ws') : WindowImage buf ws' out where
+  length_eq := h.length_eq
+  inside := fun w hw => h.inside w (hp.mem_iff.mpr hw)
+  outside := fun j hj => h.outside j (fun w hw => hj w (hp.mem_iff.mp hw))
+
+/--
+A window image is unique: two buffers that both realize the same background and window list are
+equal (every byte is either inside some window or outside all of them).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem WindowImage.unique {buf out₁ out₂ : List AbstractByte} {ws : List (Nat × List AbstractByte)}
+    (h₁ : WindowImage buf ws out₁) (h₂ : WindowImage buf ws out₂) : out₁ = out₂ := by
+  apply List.ext_getElem?
+  intro j
+  by_cases hIn : ∃ w ∈ ws, InWindow j w
+  · obtain ⟨w, hw, hj⟩ := hIn
+    rw [h₁.inside w hw j hj, h₂.inside w hw j hj]
+  · have hOut : ∀ w ∈ ws, ¬ InWindow j w := fun w hw hj => hIn ⟨w, hw, hj⟩
+    rw [h₁.outside j hOut, h₂.outside j hOut]
+
+/--
+Closed form of Trusted's `writeAbstractBytesAt` on an in-bounds window.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem writeAbstractBytesAt_eq_take_append_drop :
+    ∀ (buf : List AbstractByte) (o : Nat) (p : List AbstractByte),
+      o + p.length ≤ buf.length →
+      writeAbstractBytesAt buf o p = some (buf.take o ++ p ++ buf.drop (o + p.length))
+  | buf, o, [], _ => by
+    have hNil : writeAbstractBytesAt buf o [] = some buf := by
+      cases buf <;> cases o <;> rfl
+    rw [hNil, List.length_nil, List.append_nil, Nat.add_zero, List.take_append_drop]
+  | [], o, w :: ws, h => by
+    exact absurd h (by simp only [List.length_cons, List.length_nil]; omega)
+  | b :: bufRest, 0, w :: ws, h => by
+    have hRest : 0 + ws.length ≤ bufRest.length := by
+      simp only [List.length_cons] at h
+      omega
+    have ih := writeAbstractBytesAt_eq_take_append_drop bufRest 0 ws hRest
+    show (match writeAbstractBytesAt bufRest 0 ws with
+      | some tail' => some (w :: tail')
+      | none => none) = _
+    rw [ih]
+    show some (w :: (bufRest.take 0 ++ ws ++ bufRest.drop (0 + ws.length))) =
+      some ((b :: bufRest).take 0 ++ (w :: ws) ++ (b :: bufRest).drop (0 + (ws.length + 1)))
+    rw [Nat.zero_add, Nat.zero_add]
+    rfl
+  | b :: bufRest, o + 1, w :: ws, h => by
+    have hRest : o + (w :: ws).length ≤ bufRest.length := by
+      simp only [List.length_cons] at h ⊢
+      omega
+    have ih := writeAbstractBytesAt_eq_take_append_drop bufRest o (w :: ws) hRest
+    show (match writeAbstractBytesAt bufRest o (w :: ws) with
+      | some tail' => some (b :: tail')
+      | none => none) = _
+    rw [ih]
+    have hIdx : o + 1 + (w :: ws).length = (o + (w :: ws).length) + 1 := by omega
+    rw [hIdx]
+    rfl
+
+/--
+Pointwise characterization of an in-bounds `writeAbstractBytesAt`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem writeAbstractBytesAt_windowImage (buf : List AbstractByte) (o : Nat) (p : List AbstractByte)
+    (h : o + p.length ≤ buf.length) :
+    ∃ out, writeAbstractBytesAt buf o p = some out ∧ WindowImage buf [(o, p)] out := by
+  refine ⟨_, writeAbstractBytesAt_eq_take_append_drop buf o p h, ?_, ?_, ?_⟩
+  · rw [List.length_append, List.length_append, List.length_take, List.length_drop]
+    rw [Nat.min_eq_left (by omega)]
+    omega
+  · intro w hw j hj
+    have hwEq : w = (o, p) := List.mem_singleton.mp hw
+    rw [hwEq] at hj ⊢
+    obtain ⟨hj₁, hj₂⟩ := hj
+    dsimp only at hj₁ hj₂ ⊢
+    have hTakeLen : (buf.take o).length = o := by
+      rw [List.length_take]
+      exact Nat.min_eq_left (by omega)
+    rw [List.append_assoc, List.getElem?_append_right (by omega), hTakeLen,
+      List.getElem?_append_left (by omega)]
+  · intro j hj
+    have hNot : ¬ InWindow j (o, p) := hj (o, p) (List.mem_singleton_self _)
+    have hTakeLen : (buf.take o).length = o := by
+      rw [List.length_take]
+      exact Nat.min_eq_left (by omega)
+    by_cases hj₁ : j < o
+    · clear hNot
+      rw [List.append_assoc, List.getElem?_append_left (by omega), List.getElem?_take]
+      exact ite_eq_left_iff.mpr (fun hNot' => absurd hj₁ hNot')
+    · have hoj : o ≤ j := Nat.le_of_not_lt hj₁
+      have hj₂ : o + p.length ≤ j := Nat.le_of_not_lt (fun hlt => hNot ⟨hoj, hlt⟩)
+      clear hNot hj hj₁
+      rw [List.getElem?_append_right (by rw [List.length_append, hTakeLen]; omega),
+        List.length_append, hTakeLen, List.getElem?_drop]
+      congr 1
+      omega
+
+/-- Write every byte window of `ws` into `buf`, left to right (Trusted's tuple-field writes). -/
+def writeWindows : List AbstractByte → List (Nat × List AbstractByte) → Option (List AbstractByte)
+  | buf, [] => some buf
+  | buf, w :: ws =>
+    match writeAbstractBytesAt buf w.1 w.2 with
+    | some buf' => writeWindows buf' ws
+    | none => none
+
+/--
+Writing pairwise-disjoint in-bounds windows succeeds and produces their window image.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem writeWindows_windowImage :
+    ∀ (ws : List (Nat × List AbstractByte)) (buf : List AbstractByte),
+      (∀ w ∈ ws, w.1 + w.2.length ≤ buf.length) → ws.Pairwise WindowsDisjoint →
+      ∃ out, writeWindows buf ws = some out ∧ WindowImage buf ws out
+  | [], buf, _, _ =>
+    ⟨buf, rfl, rfl, (fun _ hw => nomatch hw), (fun _ _ => rfl)⟩
+  | w :: ws, buf, hIn, hDisj => by
+    obtain ⟨buf', hW, hImg'⟩ := writeAbstractBytesAt_windowImage buf w.1 w.2
+      (hIn w (List.mem_cons_self ..))
+    have hLen' := hImg'.length_eq
+    have hDisj' := List.pairwise_cons.mp hDisj
+    obtain ⟨out, hOut, hImg⟩ := writeWindows_windowImage ws buf'
+      (fun v hv => by rw [hLen']; exact hIn v (List.mem_cons_of_mem _ hv)) hDisj'.2
+    refine ⟨out, ?_, hImg.length_eq.trans hLen', ?_, ?_⟩
+    · show (match writeAbstractBytesAt buf w.1 w.2 with
+        | some b => writeWindows b ws
+        | none => none) = some out
+      rw [hW]
+      exact hOut
+    · intro v hv j hj
+      rcases List.mem_cons.mp hv with hvw | hv
+      · rw [hvw] at hj ⊢
+        have hNot : ∀ u ∈ ws, ¬ InWindow j u :=
+          fun u hu => (hDisj'.1 u hu).not_inWindow hj
+        rw [hImg.outside j hNot, hImg'.inside (w.1, w.2) (List.mem_singleton_self _) j hj]
+      · exact hImg.inside v hv j hj
+    · intro j hj
+      rw [hImg.outside j (fun u hu => hj u (List.mem_cons_of_mem _ hu)),
+        hImg'.outside j (fun u hu => by
+          have huw : u = (w.1, w.2) := List.mem_singleton.mp hu
+          rw [huw]
+          exact hj w (List.mem_cons_self ..))]
+
+/--
+`writeWindows` is independent of the order of pairwise-disjoint in-bounds windows.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem writeWindows_eq_of_perm {buf : List AbstractByte} {ws₁ ws₂ : List (Nat × List AbstractByte)}
+    (hp : ws₁.Perm ws₂) (hIn : ∀ w ∈ ws₁, w.1 + w.2.length ≤ buf.length)
+    (hDisj : ws₁.Pairwise WindowsDisjoint) :
+    writeWindows buf ws₁ = writeWindows buf ws₂ := by
+  obtain ⟨o₁, h₁, i₁⟩ := writeWindows_windowImage ws₁ buf hIn hDisj
+  obtain ⟨o₂, h₂, i₂⟩ := writeWindows_windowImage ws₂ buf (fun w hw => hIn w (hp.mem_iff.mpr hw))
+    ((hp.pairwise_iff (fun h => WindowsDisjoint.symm h)).mp hDisj)
+  rw [h₁, h₂, (i₁.perm hp).unique i₂]
+
+/--
+A spine's encoding is obtained by writing its field windows over uninitialized bytes.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem SymbolicStructSpine.writeWindows_encode :
+    ∀ {βs : List Type} {W : Nat} (s : SymbolicStructSpine βs W) (y : FieldTuple βs)
+      (pre post : List AbstractByte),
+      writeWindows (pre ++ replicateUninitBytes W ++ post) (s.windows y pre.length) =
+        some (pre ++ (laidOutStructSymbolicPad s).encode y ++ post)
+  | _, _, .nil _, _, _, _ => rfl
+  | _, _, @SymbolicStructSpine.cons _ _ n restW c postPad tail, (a, rest), pre, post => by
+    have hSplit : pre ++ replicateUninitBytes ((n + postPad) + restW) ++ post =
+        pre ++ replicateUninitBytes n ++
+          (replicateUninitBytes postPad ++ replicateUninitBytes restW ++ post) := by
+      rw [MirValueCodec.replicateUninitBytes_add_eq, MirValueCodec.replicateUninitBytes_add_eq]
+      simp only [List.append_assoc]
+    have hWrite := MirValueCodec.writeAbstractBytesAt_offset_replicateUninit pre (c.encode a)
+      (replicateUninitBytes postPad ++ replicateUninitBytes restW ++ post) rfl (c.encode_length a)
+    have hPre : (pre ++ c.encode a ++ replicateUninitBytes postPad).length =
+        pre.length + (n + postPad) := by
+      rw [List.length_append, List.length_append, c.encode_length, length_replicateUninitBytes]
+      omega
+    have ih := SymbolicStructSpine.writeWindows_encode tail rest
+      (pre ++ c.encode a ++ replicateUninitBytes postPad) post
+    rw [hPre] at ih
+    show (match writeAbstractBytesAt (pre ++ replicateUninitBytes ((n + postPad) + restW) ++ post)
+        pre.length (c.encode a) with
+      | some b => writeWindows b (tail.windows rest (pre.length + (n + postPad)))
+      | none => none) = _
+    rw [hSplit, hWrite]
+    dsimp only
+    have hBuf : pre ++ c.encode a ++
+        (replicateUninitBytes postPad ++ replicateUninitBytes restW ++ post) =
+        pre ++ c.encode a ++ replicateUninitBytes postPad ++ replicateUninitBytes restW ++ post := by
+      simp only [List.append_assoc]
+    rw [hBuf, ih]
+    show some (pre ++ c.encode a ++ replicateUninitBytes postPad ++
+        (laidOutStructSymbolicPad tail).encode rest ++ post) =
+      some (pre ++ ((c.encode a ++ replicateUninitBytes postPad) ++
+        (laidOutStructSymbolicPad tail).encode rest) ++ post)
+    simp only [List.append_assoc]
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem SequentialFieldPlacement.base_le_total {base total : Nat} {fls : List FieldLayout}
+    {offs : List Nat} (h : SequentialFieldPlacement base fls offs total) : base ≤ total := by
+  induction h with
+  | nil hLe => exact hLe
+  | cons hBase _ ih => omega
+
+namespace PlacedCodecSpine
+
+/--
+The byte windows of a sequentially placed spine are pairwise disjoint and lie within
+`[base, total)`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem windows_disjoint_of_sequential :
+    ∀ {βs : List Type} (q : PlacedCodecSpine βs) (base total : Nat) (y : FieldTuple βs),
+      SequentialFieldPlacement base (q.placed.map Prod.snd) (q.placed.map Prod.fst) total →
+      (q.windows y).Pairwise WindowsDisjoint ∧
+        ∀ w ∈ q.windows y, base ≤ w.1 ∧ w.1 + w.2.length ≤ total
+  | _, .nil, _, _, _, _ => ⟨List.Pairwise.nil, fun _ hw => nomatch hw⟩
+  | _, .cons p c tail, base, total, (a, rest), hSeq => by
+    have hSeq' : SequentialFieldPlacement base (p.2 :: tail.placed.map Prod.snd)
+        (p.1 :: tail.placed.map Prod.fst) total := hSeq
+    cases hSeq' with
+    | cons hBase hTail =>
+      obtain ⟨hPw, hBd⟩ := windows_disjoint_of_sequential tail (p.1 + p.2.size) total rest hTail
+      have hTot := hTail.base_le_total
+      refine ⟨List.pairwise_cons.mpr ⟨fun w hw => ?_, hPw⟩, fun w hw => ?_⟩
+      · left
+        show p.1 + (c.encode a).length ≤ w.1
+        rw [c.encode_length]
+        exact (hBd w hw).1
+      · rcases List.mem_cons.mp hw with hw | hw
+        · rw [hw]
+          show base ≤ p.1 ∧ p.1 + (c.encode a).length ≤ total
+          rw [c.encode_length]
+          exact ⟨hBase, hTot⟩
+        · have hW := hBd w hw
+          exact ⟨Nat.le_trans (Nat.le_trans hBase (Nat.le_add_right _ _)) hW.1, hW.2⟩
+
+/--
+Every placed field of a sequentially placed spine lies within `[base, total)`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem placed_in_bounds_of_sequential :
+    ∀ (l : List (Nat × FieldLayout)) (base total : Nat),
+      SequentialFieldPlacement base (l.map Prod.snd) (l.map Prod.fst) total →
+      ∀ p ∈ l, base ≤ p.1 ∧ p.1 + p.2.size ≤ total
+  | [], _, _, _, _, hp => nomatch hp
+  | q :: qs, base, total, hSeq, p, hp => by
+    have hSeq' : SequentialFieldPlacement base (q.2 :: qs.map Prod.snd) (q.1 :: qs.map Prod.fst)
+        total := hSeq
+    cases hSeq' with
+    | cons hBase hTail =>
+      rcases List.mem_cons.mp hp with hp | hp
+      · rw [hp]
+        exact ⟨hBase, hTail.base_le_total⟩
+      · have h := placed_in_bounds_of_sequential qs (q.1 + q.2.size) total hTail p hp
+        exact ⟨Nat.le_trans (Nat.le_trans hBase (Nat.le_add_right _ _)) h.1, h.2⟩
+
+/-- Map every declaration field `(placement, codec, value)` of a placed codec spine to a `β`. -/
+def fieldMap {β : Type}
+    (F : {α : Type} → (p : Nat × FieldLayout) → FixedByteCodec α p.2.size → α → β) :
+    {αs : List Type} → PlacedCodecSpine αs → FieldTuple αs → List β
+  | _, .nil, _ => []
+  | _, .cons p c tail, (a, rest) => F p c a :: fieldMap F tail rest
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem fieldMap_memInsertAux {β : Type}
+    (F : {α : Type} → (p : Nat × FieldLayout) → FixedByteCodec α p.2.size → α → β)
+    {α γ : Type} {γs recTypes : List Type}
+    (p : Nat × FieldLayout) (c : FixedByteCodec α p.2.size)
+    (q : Nat × FieldLayout) (c' : FixedByteCodec γ q.2.size)
+    (tail : PlacedCodecSpine γs) (recSpine : PlacedCodecSpine recTypes)
+    (recPerm : FieldPerm (α :: γs) recTypes) (a : α) (b : γ) (t : FieldTuple γs)
+    (hRec : (recSpine.fieldMap F (recPerm.apply (a, t))).Perm (F p c a :: tail.fieldMap F t)) :
+    ∀ (bb : Bool),
+      ((memInsertAux p c q c' tail recSpine bb).fieldMap F
+          ((memInsertPermAux α γ γs recPerm bb).apply (a, b, t))).Perm
+        (F p c a :: F q c' b :: tail.fieldMap F t)
+  | true => by
+    show ((PlacedCodecSpine.cons p c (.cons q c' tail)).fieldMap F
+        ((FieldPerm.refl (α :: γ :: γs)).apply (a, b, t))).Perm _
+    rw [FieldPerm.refl_apply]
+    exact List.Perm.refl _
+  | false => by
+    show (F q c' b :: recSpine.fieldMap F (recPerm.apply (a, t))).Perm _
+    exact (List.Perm.cons _ hRec).trans (List.Perm.swap _ _ _)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem fieldMap_memInsert {β : Type}
+    (F : {α : Type} → (p : Nat × FieldLayout) → FixedByteCodec α p.2.size → α → β)
+    {α : Type} (p : Nat × FieldLayout) (c : FixedByteCodec α p.2.size) :
+    ∀ {γs : List Type} (pc : PlacedCodecSpine γs) (a : α) (y : FieldTuple γs),
+      ((pc.memInsert p c).fieldMap F ((pc.memInsertPerm α p).apply (a, y))).Perm
+        (F p c a :: pc.fieldMap F y)
+  | _, .nil, _, _ => List.Perm.refl _
+  | _, .cons q c' tail, a, (b, t) =>
+    fieldMap_memInsertAux F p c q c' tail (tail.memInsert p c) (tail.memInsertPerm _ p) a b t
+      (fieldMap_memInsert F p c tail a t) (decide (memKey p ≤ memKey q))
+
+/--
+**`memSortPerm` Routes Every Per-Field Fact With Its Placement**: for any per-field functional `F`,
+the memory-order spine's `fieldMap` on `pc.memSortPerm.apply x` is a permutation of the
+declaration-order `fieldMap` on `x` (generalizing `windows_memSort`).
+
+Kind: codec
+Witness: universal
+Assumes: S0
+Subject: PlacedCodecSpine.memSortPerm
+-/
+theorem fieldMap_memSort {β : Type}
+    (F : {α : Type} → (p : Nat × FieldLayout) → FixedByteCodec α p.2.size → α → β) :
+    ∀ {αs : List Type} (pc : PlacedCodecSpine αs) (x : FieldTuple αs),
+      (pc.memSort.fieldMap F (pc.memSortPerm.apply x)).Perm (pc.fieldMap F x)
+  | _, .nil, _ => List.Perm.refl _
+  | _, .cons p c tail, (a, rest) => by
+    show ((tail.memSort.memInsert p c).fieldMap F
+        ((tail.memSort.memInsertPerm _ p).apply (a, tail.memSortPerm.apply rest))).Perm
+      (F p c a :: tail.fieldMap F rest)
+    exact (fieldMap_memInsert F p c tail.memSort a (tail.memSortPerm.apply rest)).trans
+      ((fieldMap_memSort F tail rest).cons _)
+
+/-- Declaration-order decode of every field window `[p.1, p.1 + p.2.size)` of `bs`. -/
+def decodeAt : {αs : List Type} → PlacedCodecSpine αs → List AbstractByte → Option (FieldTuple αs)
+  | _, .nil, _ => some ()
+  | _, .cons p c tail, bs =>
+    match c.decode ((bs.drop p.1).take p.2.size), tail.decodeAt bs with
+    | some a, some rest => some (a, rest)
+    | _, _ => none
+
+/-- Per-field decode obligations `c.decode (field window of bs) = some a` of a value tuple. -/
+def decodeChecks {αs : List Type} (pc : PlacedCodecSpine αs) (bs : List AbstractByte)
+    (x : FieldTuple αs) : List Prop :=
+  pc.fieldMap (fun p c a => c.decode ((bs.drop p.1).take p.2.size) = some a) x
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeAt_eq_some_iff :
+    ∀ {αs : List Type} (pc : PlacedCodecSpine αs) (bs : List AbstractByte) (x : FieldTuple αs),
+      pc.decodeAt bs = some x ↔ ∀ P ∈ pc.decodeChecks bs x, P
+  | _, .nil, _, () => ⟨(fun _ _ hP => nomatch hP), (fun _ => rfl)⟩
+  | _, .cons p c tail, bs, (a, rest) => by
+    have ih := decodeAt_eq_some_iff tail bs rest
+    show (match c.decode ((bs.drop p.1).take p.2.size), tail.decodeAt bs with
+      | some a', some r => some (a', r)
+      | _, _ => none) = some (a, rest) ↔
+      ∀ P ∈ (c.decode ((bs.drop p.1).take p.2.size) = some a) :: tail.decodeChecks bs rest, P
+    cases hC : c.decode ((bs.drop p.1).take p.2.size) with
+    | none =>
+      refine ⟨(fun h => nomatch h), fun h => ?_⟩
+      have h0 := h _ (List.mem_cons_self ..)
+      nomatch h0
+    | some a' =>
+      cases hT : tail.decodeAt bs with
+      | none =>
+        refine ⟨(fun h => nomatch h), fun h => ?_⟩
+        have hT' := ih.mpr (fun P hP => h P (List.mem_cons_of_mem _ hP))
+        rw [hT] at hT'
+        nomatch hT'
+      | some r =>
+        constructor
+        · intro h P hP
+          injection h with h
+          injection h with ha hr
+          rcases List.mem_cons.mp hP with hP | hP
+          · rw [hP, ha]
+          · rw [hr] at hT
+            exact ih.mp hT P hP
+        · intro h
+          have ha : some a' = some a := h _ (List.mem_cons_self ..)
+          have hT' := ih.mpr (fun P hP => h P (List.mem_cons_of_mem _ hP))
+          rw [hT] at hT'
+          injection ha with ha
+          injection hT' with hr
+          rw [ha, hr]
+
+end PlacedCodecSpine
+
+namespace FixedByteCodec
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem prod_decode_eq_some_iff {α β : Type} {n₁ n₂ : Nat}
+    (c₁ : FixedByteCodec α n₁) (c₂ : FixedByteCodec β n₂) (bs : List AbstractByte) (a : α) (b : β) :
+    (prod c₁ c₂).decode bs = some (a, b) ↔
+      bs.length = n₁ + n₂ ∧ c₁.decode (bs.take n₁) = some a ∧ c₂.decode (bs.drop n₁) = some b := by
+  unfold prod ofRoundTrip
+  dsimp only
+  cases hL : Nat.beq bs.length (n₁ + n₂) with
+  | false =>
+    refine ⟨(fun h => nomatch h), fun ⟨hLen, _, _⟩ => ?_⟩
+    rw [Nat.beq_eq.mpr hLen] at hL
+    nomatch hL
+  | true =>
+    have hLen := Nat.eq_of_beq_eq_true hL
+    dsimp only
+    cases h₁ : c₁.decode (bs.take n₁) with
+    | none => exact ⟨(fun h => nomatch h), fun ⟨_, h, _⟩ => nomatch h⟩
+    | some a' =>
+      cases h₂ : c₂.decode (bs.drop n₁) with
+      | none => exact ⟨(fun h => nomatch h), fun ⟨_, _, h⟩ => nomatch h⟩
+      | some b' =>
+        constructor
+        · intro h
+          injection h with h
+          injection h with ha hb
+          rw [ha, hb]
+          exact ⟨hLen, rfl, rfl⟩
+        · rintro ⟨_, ha, hb⟩
+          injection ha with ha
+          injection hb with hb
+          rw [ha, hb]
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem padLeft_decode_eq_some_iff {α : Type} {n : Nat} (k : Nat) (c : FixedByteCodec α n)
+    (bs : List AbstractByte) (x : α) :
+    (padLeft k c).decode bs = some x ↔ bs.length = k + n ∧ c.decode (bs.drop k) = some x := by
+  have hDec : (padLeft k c).decode bs = ((prod (padUninit k) c).decode bs).map (fun p => p.2) := rfl
+  rw [hDec]
+  constructor
+  · intro h
+    cases hP : (prod (padUninit k) c).decode bs with
+    | none =>
+      rw [hP] at h
+      nomatch h
+    | some uy =>
+      rw [hP] at h
+      injection h with hx
+      obtain ⟨u, y⟩ := uy
+      have hP' := (prod_decode_eq_some_iff (padUninit k) c bs u y).mp hP
+      dsimp only at hx
+      rw [← hx]
+      exact ⟨hP'.1, hP'.2.2⟩
+  · rintro ⟨hLen, hC⟩
+    have hU : (padUninit k).decode (bs.take k) = some () := by
+      have hTakeLen : (bs.take k).length = k := by
+        rw [List.length_take]
+        exact Nat.min_eq_left (by omega)
+      unfold padUninit ofRoundTrip
+      dsimp only
+      rw [Nat.beq_eq.mpr hTakeLen]
+      rfl
+    rw [(prod_decode_eq_some_iff (padUninit k) c bs () x).mpr ⟨hLen, hU, hC⟩]
+    rfl
+
+end FixedByteCodec
+
+namespace PlacedCodecSpine
+
+/--
+Sequential decode of a re-padded memory-order spine: `bs` decodes to `y` iff it has the spine width
+and every field window (at its absolute placement inside `pre ++ bs`) decodes to the matching
+component of `y`.
+
+Kind: codec
+Witness: universal
+Assumes: S0
+Subject: laidOutStructSymbolicPad
+-/
+theorem decode_toSymbolicStructSpine_repad_eq_some_iff :
+    ∀ {βs : List Type} (q : PlacedCodecSpine βs) (pads : List Nat) (trail : Nat)
+      (pre bs : List AbstractByte) (y : FieldTuple βs),
+      (q.toSymbolicStructSpine.repad pads trail).fieldOffsets pre.length = q.placed.map Prod.fst →
+      ((laidOutStructSymbolicPad (q.toSymbolicStructSpine.repad pads trail)).decode bs = some y ↔
+        bs.length = q.toSymbolicStructSpine.repadWidth pads trail ∧
+          ∀ P ∈ q.decodeChecks (pre ++ bs) y, P)
+  | _, .nil, _, trail, _, bs, (), _ => by
+    show (FixedByteCodec.padUninit trail).decode bs = some () ↔
+      bs.length = trail ∧ ∀ P ∈ ([] : List Prop), P
+    unfold FixedByteCodec.padUninit FixedByteCodec.ofRoundTrip
+    dsimp only
+    cases hL : Nat.beq bs.length trail with
+    | false =>
+      refine ⟨(fun h => nomatch h), fun ⟨hLen, _⟩ => ?_⟩
+      rw [Nat.beq_eq.mpr hLen] at hL
+      nomatch hL
+    | true =>
+      exact ⟨fun _ => ⟨Nat.eq_of_beq_eq_true hL, fun _ hP => nomatch hP⟩, fun _ => rfl⟩
+  | _, .cons p c tail, pads, trail, pre, bs, (a, rest), hOffs => by
+    have hCons : pre.length :: (tail.toSymbolicStructSpine.repad pads.tail trail).fieldOffsets
+        (pre.length + (p.2.size + pads.headD 0)) = p.1 :: tail.placed.map Prod.fst := hOffs
+    injection hCons with hP1 hTailOffs
+    show (FixedByteCodec.prod (FixedByteCodec.padRight c (pads.headD 0))
+        (laidOutStructSymbolicPad (tail.toSymbolicStructSpine.repad pads.tail trail))).decode bs =
+          some (a, rest) ↔
+      bs.length = (p.2.size + pads.headD 0) + tail.toSymbolicStructSpine.repadWidth pads.tail trail ∧
+        ∀ P ∈ (c.decode (((pre ++ bs).drop p.1).take p.2.size) = some a) ::
+          tail.decodeChecks (pre ++ bs) rest, P
+    rw [FixedByteCodec.prod_decode_eq_some_iff]
+    have hDropPre : (pre ++ bs).drop p.1 = bs := by
+      rw [← hP1]
+      exact List.drop_left' rfl
+    rw [hDropPre]
+    constructor
+    · rintro ⟨hLen, hHead, hTailDec⟩
+      have hTakeLen : (bs.take (p.2.size + pads.headD 0)).length = p.2.size + pads.headD 0 := by
+        rw [List.length_take]
+        exact Nat.min_eq_left (by omega)
+      rw [FixedByteCodec.padRight_decode_of_length_eq c hTakeLen, List.take_take,
+        Nat.min_eq_left (Nat.le_add_right _ _)] at hHead
+      have hPre' : (pre ++ bs.take (p.2.size + pads.headD 0)).length =
+          pre.length + (p.2.size + pads.headD 0) := by
+        rw [List.length_append, hTakeLen]
+      have ih := decode_toSymbolicStructSpine_repad_eq_some_iff tail pads.tail trail
+        (pre ++ bs.take (p.2.size + pads.headD 0)) (bs.drop (p.2.size + pads.headD 0)) rest
+        (by rw [hPre']; exact hTailOffs)
+      rw [List.append_assoc, List.take_append_drop] at ih
+      obtain ⟨_, hChecks⟩ := ih.mp hTailDec
+      refine ⟨hLen, fun P hP => ?_⟩
+      rcases List.mem_cons.mp hP with hP | hP
+      · rw [hP]
+        exact hHead
+      · exact hChecks P hP
+    · rintro ⟨hLen, hChecks⟩
+      have hTakeLen : (bs.take (p.2.size + pads.headD 0)).length = p.2.size + pads.headD 0 := by
+        rw [List.length_take]
+        exact Nat.min_eq_left (by omega)
+      have hHead : c.decode (bs.take p.2.size) = some a := hChecks _ (List.mem_cons_self ..)
+      have hPre' : (pre ++ bs.take (p.2.size + pads.headD 0)).length =
+          pre.length + (p.2.size + pads.headD 0) := by
+        rw [List.length_append, hTakeLen]
+      have ih := decode_toSymbolicStructSpine_repad_eq_some_iff tail pads.tail trail
+        (pre ++ bs.take (p.2.size + pads.headD 0)) (bs.drop (p.2.size + pads.headD 0)) rest
+        (by rw [hPre']; exact hTailOffs)
+      rw [List.append_assoc, List.take_append_drop] at ih
+      refine ⟨hLen, ?_, ih.mpr ⟨by rw [List.length_drop]; omega,
+        fun P hP => hChecks P (List.mem_cons_of_mem _ hP)⟩⟩
+      rw [FixedByteCodec.padRight_decode_of_length_eq c hTakeLen, List.take_take,
+        Nat.min_eq_left (Nat.le_add_right _ _)]
+      exact hHead
+
+/--
+Computable realization of any sequential memory-order placement: `realizedWidth` is `totalSize`, and
+the realized spine places every memory-order field at its offset.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem realized_offsets_and_width_of_sequential {αs : List Type} (pc : PlacedCodecSpine αs)
+    (totalSize : Nat)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize) :
+    (pc.realizedSpine totalSize).fieldOffsets pc.realizedLead = pc.memSort.placed.map Prod.fst ∧
+      pc.realizedWidth totalSize = totalSize :=
+  repad_sequentialPads_spec pc.memSort.placed 0 totalSize hSeq pc.memSort.toSymbolicStructSpine
+    (widths_toSymbolicStructSpine pc.memSort)
+
+/--
+**Byte-Window Encoding of the Realized Codec**: in a sequential placement, `pc.realizedCodec`
+encodes `x` exactly as writing the declaration-order windows `pc.windows x` over `totalSize`
+uninitialized bytes (Trusted's `encodeFieldsAtOffsetsWith` strategy).
+
+Kind: codec
+Witness: universal
+Assumes: S0
+Subject: PlacedCodecSpine.realizedCodec
+-/
+theorem writeWindows_realizedCodec_encode {αs : List Type} (pc : PlacedCodecSpine αs)
+    (totalSize : Nat)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (x : FieldTuple αs) :
+    writeWindows (replicateUninitBytes totalSize) (pc.windows x) =
+      some ((pc.realizedCodec totalSize).encode x) := by
+  obtain ⟨hOffs, hWidth⟩ := pc.realized_offsets_and_width_of_sequential totalSize hSeq
+  have hSpineWin : (pc.realizedSpine totalSize).windows (pc.memSortPerm.apply x) pc.realizedLead =
+      pc.memSort.windows (pc.memSortPerm.apply x) :=
+    windows_toSymbolicStructSpine_repad pc.memSort pc.realizedPads (pc.realizedTrail totalSize)
+      (pc.memSortPerm.apply x) pc.realizedLead hOffs
+  have hEnc := SymbolicStructSpine.writeWindows_encode (pc.realizedSpine totalSize)
+    (pc.memSortPerm.apply x) (replicateUninitBytes pc.realizedLead) []
+  rw [length_replicateUninitBytes, hSpineWin, List.append_nil, List.append_nil,
+    ← MirValueCodec.replicateUninitBytes_add_eq] at hEnc
+  have hW : pc.realizedLead + pc.memSort.toSymbolicStructSpine.repadWidth pc.realizedPads
+      (pc.realizedTrail totalSize) = totalSize := hWidth
+  rw [hW] at hEnc
+  obtain ⟨hPw, hBd⟩ := windows_disjoint_of_sequential pc.memSort 0 totalSize
+    (pc.memSortPerm.apply x) hSeq
+  rw [← writeWindows_eq_of_perm (windows_memSort pc x)
+    (fun w hw => by rw [length_replicateUninitBytes]; exact (hBd w hw).2) hPw]
+  exact hEnc
+
+/--
+**Byte-Window Decoding of the Realized Codec**: in a sequential placement, `pc.realizedCodec`
+decodes every `totalSize`-byte buffer exactly as decoding each declaration field from its own
+window (`pc.decodeAt`), ignoring all padding bytes (Trusted's `decodeFieldsAtOffsetsWith` strategy).
+
+Kind: codec
+Witness: universal
+Assumes: S0
+Subject: PlacedCodecSpine.realizedCodec
+-/
+theorem realizedCodec_decode_eq_decodeAt {αs : List Type} (pc : PlacedCodecSpine αs)
+    (totalSize : Nat)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (bs : List AbstractByte) (hLen : bs.length = totalSize) :
+    (pc.realizedCodec totalSize).decode bs = pc.decodeAt bs := by
+  obtain ⟨hOffs, hWidth⟩ := pc.realized_offsets_and_width_of_sequential totalSize hSeq
+  have hW : pc.realizedLead + pc.memSort.toSymbolicStructSpine.repadWidth pc.realizedPads
+      (pc.realizedTrail totalSize) = totalSize := hWidth
+  apply Option.ext
+  intro x
+  have hDec : (pc.realizedCodec totalSize).decode bs =
+      ((FixedByteCodec.padLeft pc.realizedLead
+        (laidOutStructSymbolicPad (pc.realizedSpine totalSize))).decode bs).map
+          pc.memSortPerm.unapply := rfl
+  rw [hDec, decodeAt_eq_some_iff]
+  have hTakeLen : (bs.take pc.realizedLead).length = pc.realizedLead := by
+    rw [List.length_take]
+    exact Nat.min_eq_left (by omega)
+  have hSpine := decode_toSymbolicStructSpine_repad_eq_some_iff pc.memSort pc.realizedPads
+    (pc.realizedTrail totalSize) (bs.take pc.realizedLead) (bs.drop pc.realizedLead)
+    (pc.memSortPerm.apply x) (by rw [hTakeLen]; exact hOffs)
+  rw [List.take_append_drop] at hSpine
+  have hPerm := fieldMap_memSort
+    (fun p c a => c.decode ((bs.drop p.1).take p.2.size) = some a) pc x
+  constructor
+  · intro h
+    cases hP : (FixedByteCodec.padLeft pc.realizedLead
+        (laidOutStructSymbolicPad (pc.realizedSpine totalSize))).decode bs with
+    | none =>
+      rw [hP] at h
+      nomatch h
+    | some y =>
+      rw [hP] at h
+      injection h with hx
+      have hy : y = pc.memSortPerm.apply x := by
+        rw [← hx, FieldPerm.apply_unapply]
+      rw [hy] at hP
+      have hSp := (FixedByteCodec.padLeft_decode_eq_some_iff _ _ bs _).mp hP
+      have hChecks := (hSpine.mp hSp.2).2
+      intro P hP
+      exact hChecks P (hPerm.mem_iff.mpr hP)
+  · intro hChecks
+    have hSp : (laidOutStructSymbolicPad (pc.realizedSpine totalSize)).decode
+        (bs.drop pc.realizedLead) = some (pc.memSortPerm.apply x) :=
+      hSpine.mpr ⟨by rw [List.length_drop]; omega,
+        fun P hP => hChecks P (hPerm.mem_iff.mp hP)⟩
+    rw [(FixedByteCodec.padLeft_decode_eq_some_iff _ _ bs _).mpr ⟨by rw [hLen]; exact hW.symm, hSp⟩]
+    show some (pc.memSortPerm.unapply (pc.memSortPerm.apply x)) = some x
+    rw [FieldPerm.unapply_apply]
+
+end PlacedCodecSpine
+
+/-! ### Trusted Tuple-Field Bridges (`TupleFieldCodec`, `TupleFieldCodecs`) -/
+
+/--
+Fuel at which Trusted's `encodeValueToBytes` / `decodeValueFromBytes` recurse into the fields of a
+tuple encoded at `defaultCodecFuel` (`defaultCodecFuel = tupleFieldFuel + 1`).
+-/
+abbrev tupleFieldFuel : Nat := 15
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem defaultCodecFuel_eq_tupleFieldFuel_succ : defaultCodecFuel = tupleFieldFuel + 1 := rfl
+
+/--
+Trusted-level bridge for one tuple field of rigid kind `k` (field type `{ kind := k, layoutIdx := 0 }`)
+whose bytes are the `FixedByteCodec` `c`, stated at `tupleFieldFuel` — the fuel at which Trusted
+encodes and decodes tuple fields. `kindSize_eq` pins the field's structural byte size, which also
+rules out Trusted's untyped `encodeFallback` for this field.
+-/
+structure TupleFieldCodec (layouts : LayoutTable) (k : RigidTy) {α : Type} {n : Nat}
+    (c : FixedByteCodec α n) : Type where
+  /-- Embed a field value into a runtime `Value`. -/
+  toValue : α → Value
+  /-- Partial projection from a runtime `Value` back to a field value. -/
+  ofValue : Value → Option α
+  /-- `ofValue` is a left inverse to `toValue`. -/
+  ofValue_toValue : ∀ x : α, ofValue (toValue x) = some x
+  /-- The field kind has structural byte size `n`. -/
+  kindSize_eq : rigidTyKindByteSize k = some n
+  /-- Trusted encodes `toValue x` to `c.encode x`. -/
+  encode_toValue : ∀ x : α,
+    encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } (toValue x) =
+      some (c.encode x)
+  /-- Every successful Trusted field encoding is `c.encode x` for some `x`. -/
+  encode_witness : ∀ (v : Value) (bs : List AbstractByte),
+    encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } v = some bs →
+      ∃ x : α, bs = c.encode x
+  /-- Trusted decodes every field window exactly as `c.decode`. -/
+  decode_eq_map : ∀ bs : List AbstractByte,
+    decodeValueFromBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } bs =
+      (c.decode bs).map toValue
+
+/--
+Declaration-order `TupleFieldCodec` for every field of a `PlacedCodecSpine` (field kinds `ks`).
+-/
+inductive TupleFieldCodecs (layouts : LayoutTable) :
+    List RigidTy → {αs : List Type} → PlacedCodecSpine αs → Type 1 where
+  | nil : TupleFieldCodecs layouts [] .nil
+  | cons {k : RigidTy} {ks : List RigidTy} {α : Type} {αs : List Type} {p : Nat × FieldLayout}
+      {c : FixedByteCodec α p.2.size} {tail : PlacedCodecSpine αs}
+      (f : TupleFieldCodec layouts k c) (rest : TupleFieldCodecs layouts ks tail) :
+      TupleFieldCodecs layouts (k :: ks) (.cons p c tail)
+
+namespace TupleFieldCodecs
+
+variable {layouts : LayoutTable}
+
+/-- Runtime field `Value`s of a declaration-order value tuple. -/
+def toValues : {ks : List RigidTy} → {αs : List Type} → {pc : PlacedCodecSpine αs} →
+    TupleFieldCodecs layouts ks pc → FieldTuple αs → List Value
+  | _, _, _, .nil, _ => []
+  | _, _, _, .cons f rest, (a, r) => f.toValue a :: rest.toValues r
+
+/-- Partial projection from runtime field `Value`s back to a declaration-order value tuple. -/
+def ofValues : {ks : List RigidTy} → {αs : List Type} → {pc : PlacedCodecSpine αs} →
+    TupleFieldCodecs layouts ks pc → List Value → Option (FieldTuple αs)
+  | _, _, _, .nil, [] => some ()
+  | _, _, _, .nil, _ :: _ => none
+  | _, _, _, .cons _ _, [] => none
+  | _, _, _, .cons f rest, v :: vs =>
+    match f.ofValue v, rest.ofValues vs with
+    | some a, some r => some (a, r)
+    | _, _ => none
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem ofValues_toValues :
+    ∀ {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : TupleFieldCodecs layouts ks pc) (x : FieldTuple αs),
+      fcs.ofValues (fcs.toValues x) = some x
+  | _, _, _, .nil, () => rfl
+  | _, _, _, .cons f rest, (a, r) => by
+    show (match f.ofValue (f.toValue a), rest.ofValues (rest.toValues r) with
+      | some a', some r' => some (a', r')
+      | _, _ => none) = some (a, r)
+    rw [f.ofValue_toValue a, ofValues_toValues rest r]
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem length_toValues :
+    ∀ {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : TupleFieldCodecs layouts ks pc) (x : FieldTuple αs),
+      (fcs.toValues x).length = ks.length
+  | _, _, _, .nil, _ => rfl
+  | _, _, _, .cons _ rest, (_, r) => congrArg Nat.succ (length_toValues rest r)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem length_placed :
+    ∀ {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (_ : TupleFieldCodecs layouts ks pc), pc.placed.length = ks.length
+  | _, _, _, .nil => rfl
+  | _, _, _, .cons _ rest => congrArg Nat.succ (length_placed rest)
+
+/--
+**Trusted Tuple-Field Writes Are Window Writes**: Trusted's `encodeFieldsAtOffsetsWith` over the
+placed offsets of `pc` writes exactly the declaration-order windows `pc.windows x`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: encodeFieldsAtOffsetsWith
+-/
+theorem encodeFieldsAtOffsetsWith_eq_writeWindows
+    (encodeFallback : Value → Option (List AbstractByte)) :
+    ∀ {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : TupleFieldCodecs layouts ks pc) (x : FieldTuple αs) (buf : List AbstractByte),
+      encodeFieldsAtOffsetsWith
+          (fun k fv => encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } fv)
+          encodeFallback (pc.placed.map fun p => ({ bytes := p.1 } : Size)) ks (fcs.toValues x) buf =
+        writeWindows buf (pc.windows x)
+  | _, _, _, .nil, _, _ => rfl
+  | _, _, _, @TupleFieldCodecs.cons _ k ks _ _ p c tail f rest, (a, r), buf => by
+    have ih := encodeFieldsAtOffsetsWith_eq_writeWindows encodeFallback rest r
+    show (match (match encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 }
+              (f.toValue a) with
+            | some bs => some bs
+            | none =>
+              match rigidTyKindByteSize k with
+              | some _ => none
+              | none => encodeFallback (f.toValue a)) with
+        | none => none
+        | some fBytes =>
+          match writeAbstractBytesAt buf p.1 fBytes with
+          | none => none
+          | some buf' =>
+            encodeFieldsAtOffsetsWith
+              (fun k fv => encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } fv)
+              encodeFallback (tail.placed.map fun p => ({ bytes := p.1 } : Size)) ks
+              (rest.toValues r) buf') =
+      (match writeAbstractBytesAt buf p.1 (c.encode a) with
+        | some buf' => writeWindows buf' (tail.windows r)
+        | none => none)
+    rw [f.encode_toValue a]
+    dsimp only
+    cases writeAbstractBytesAt buf p.1 (c.encode a) with
+    | none => rfl
+    | some buf' => exact ih buf'
+
+/--
+**Trusted Tuple-Field Write Witness**: every successful `encodeFieldsAtOffsetsWith` run over the
+placed offsets of `pc` writes the windows `pc.windows x` of some value tuple `x`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: encodeFieldsAtOffsetsWith
+-/
+theorem encodeFieldsAtOffsetsWith_witness
+    (encodeFallback : Value → Option (List AbstractByte)) :
+    ∀ {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (_fcs : TupleFieldCodecs layouts ks pc) (vals : List Value) (buf out : List AbstractByte),
+      encodeFieldsAtOffsetsWith
+          (fun k fv => encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } fv)
+          encodeFallback (pc.placed.map fun p => ({ bytes := p.1 } : Size)) ks vals buf = some out →
+        ∃ x : FieldTuple αs, writeWindows buf (pc.windows x) = some out
+  | _, _, _, .nil, [], buf, out, h => ⟨(), h⟩
+  | _, _, _, .nil, _ :: _, _, _, h => nomatch h
+  | _, _, _, .cons _ _, [], _, _, h => nomatch h
+  | _, _, _, @TupleFieldCodecs.cons _ k ks _ _ p c tail f rest, v :: vs, buf, out, h => by
+    change (match (match encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } v with
+            | some bs => some bs
+            | none =>
+              match rigidTyKindByteSize k with
+              | some _ => none
+              | none => encodeFallback v) with
+        | none => none
+        | some fBytes =>
+          match writeAbstractBytesAt buf p.1 fBytes with
+          | none => none
+          | some buf' =>
+            encodeFieldsAtOffsetsWith
+              (fun k fv => encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } fv)
+              encodeFallback (tail.placed.map fun p => ({ bytes := p.1 } : Size)) ks vs buf') =
+      some out at h
+    cases hE : encodeValueToBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } v with
+    | none =>
+      rw [hE, f.kindSize_eq] at h
+      nomatch h
+    | some bs =>
+      rw [hE] at h
+      obtain ⟨a, rfl⟩ := f.encode_witness v bs hE
+      dsimp only at h
+      cases hW : writeAbstractBytesAt buf p.1 (c.encode a) with
+      | none =>
+        rw [hW] at h
+        nomatch h
+      | some buf' =>
+        rw [hW] at h
+        obtain ⟨r, hr⟩ := encodeFieldsAtOffsetsWith_witness encodeFallback rest vs buf' out h
+        refine ⟨(a, r), ?_⟩
+        show (match writeAbstractBytesAt buf p.1 (c.encode a) with
+          | some b => writeWindows b (tail.windows r)
+          | none => none) = some out
+        rw [hW]
+        exact hr
+
+/--
+**Trusted Tuple-Field Reads Are Window Decodes**: Trusted's `decodeFieldsAtOffsetsWith` over the
+placed offsets of `pc` decodes each declaration field from its own window (`pc.decodeAt`).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: decodeFieldsAtOffsetsWith
+-/
+theorem decodeFieldsAtOffsetsWith_eq_decodeAt :
+    ∀ {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs}
+      (fcs : TupleFieldCodecs layouts ks pc) (bs : List AbstractByte),
+      (∀ p ∈ pc.placed, p.1 + p.2.size ≤ bs.length) →
+      decodeFieldsAtOffsetsWith
+          (fun k b => decodeValueFromBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } b)
+          (fun k => rigidTyByteSize layouts { kind := k, layoutIdx := 0 }) bs
+          (pc.placed.map fun p => ({ bytes := p.1 } : Size)) ks =
+        (pc.decodeAt bs).map fcs.toValues
+  | _, _, _, .nil, _, _ => rfl
+  | _, _, _, @TupleFieldCodecs.cons _ k ks _ _ p c tail f rest, bs, hIn => by
+    have ih := decodeFieldsAtOffsetsWith_eq_decodeAt rest bs
+      (fun q hq => hIn q (List.mem_cons_of_mem _ hq))
+    have hSz : rigidTyByteSize layouts { kind := k, layoutIdx := 0 } = some p.2.size := by
+      unfold rigidTyByteSize
+      dsimp only
+      rw [f.kindSize_eq]
+    have hP := hIn p (List.mem_cons_self ..)
+    have hSlice : sliceAbstractBytes bs p.1 p.2.size = some ((bs.drop p.1).take p.2.size) := by
+      unfold sliceAbstractBytes
+      rw [Nat.ble_eq_true_of_le (show Nat.add p.1 p.2.size ≤ Trusted.Sequence.length bs from hP)]
+      dsimp only
+      rw [takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop]
+    show (match rigidTyByteSize layouts { kind := k, layoutIdx := 0 } with
+        | none => none
+        | some fSize =>
+          match sliceAbstractBytes bs p.1 fSize with
+          | none => none
+          | some fSlice =>
+            match decodeValueFromBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } fSlice with
+            | none => none
+            | some v =>
+              match decodeFieldsAtOffsetsWith
+                  (fun k b => decodeValueFromBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 } b)
+                  (fun k => rigidTyByteSize layouts { kind := k, layoutIdx := 0 }) bs
+                  (tail.placed.map fun p => ({ bytes := p.1 } : Size)) ks with
+              | some vs => some (v :: vs)
+              | none => none) =
+      (match c.decode ((bs.drop p.1).take p.2.size), tail.decodeAt bs with
+        | some a, some r => some (a, r)
+        | _, _ => none).map (fun x => (TupleFieldCodecs.cons f rest).toValues x)
+    rw [hSz]
+    dsimp only
+    rw [hSlice]
+    dsimp only
+    rw [f.decode_eq_map, ih]
+    cases c.decode ((bs.drop p.1).take p.2.size) with
+    | none => rfl
+    | some a =>
+      cases tail.decodeAt bs with
+      | none => rfl
+      | some r => rfl
+
+end TupleFieldCodecs
+
+/--
+Every placed field of a sequential memory-order placement lies within `totalSize` (declaration order).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem PlacedCodecSpine.placed_in_bounds_of_memSort_sequential {αs : List Type}
+    (pc : PlacedCodecSpine αs) (totalSize : Nat)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize) :
+    ∀ p ∈ pc.placed, p.1 + p.2.size ≤ totalSize := by
+  intro p hp
+  have hMem : p ∈ pc.memSort.placed := by
+    rw [placed_memSort]
+    exact (memSort_perm pc.placed).mem_iff.mpr hp
+  exact (PlacedCodecSpine.placed_in_bounds_of_sequential pc.memSort.placed 0 totalSize hSeq p hMem).2
+
+namespace TupleFieldCodec
+
+/-- `TupleFieldCodec` for an unsigned integer field `uN` (`FixedByteCodec.uintBitsLE`). -/
+def uint (layouts : LayoutTable) (w : UintTy) :
+    TupleFieldCodec layouts (.uint w)
+      (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize w) (MirValueCodec.uintByteSize_pos w)) where
+  toValue := (MirValueCodec.uint layouts w 0).toValue
+  ofValue := (MirValueCodec.uint layouts w 0).ofValue
+  ofValue_toValue := (MirValueCodec.uint layouts w 0).ofValue_toValue
+  kindSize_eq := MirValueCodec.intCastTargetBytes_uint_eq w
+  encode_toValue := (MirValueCodec.uint layouts w 0).encode_toValue
+  encode_witness := fun v bs hEnc => by
+    unfold tupleFieldFuel encodeValueToBytes at hEnc
+    dsimp only at hEnc
+    rw [MirValueCodec.intCastTargetBytes_uint_eq w] at hEnc
+    cases v <;> dsimp only at hEnc
+    case unit => nomatch hEnc
+    case ptr => nomatch hEnc
+    case aggregate => nomatch hEnc
+    case scalar sv =>
+      cases hEq : Nat.beq sv.sizeBytes (MirValueCodec.uintByteSize w) <;> rw [hEq] at hEnc
+      · nomatch hEnc
+      · have hSvSz : sv.sizeBytes = MirValueCodec.uintByteSize w := Nat.eq_of_beq_eq_true hEq
+        unfold encodeScalarBytes at hEnc
+        rw [hSvSz] at hEnc
+        have hBeq0 : Nat.beq (MirValueCodec.uintByteSize w) 0 = false :=
+          nat_beq_eq_false_of_ne (by have := MirValueCodec.uintByteSize_pos w; omega)
+        rw [hBeq0] at hEnc
+        injection hEnc with hBs
+        refine ⟨⟨sv.bits % 2 ^ (8 * MirValueCodec.uintByteSize w), Nat.mod_lt _ (Nat.two_pow_pos _)⟩, ?_⟩
+        rw [← hBs]
+        exact (encodeLittleEndianBytes_mod_two_pow none _ sv.bits).symm
+  decode_eq_map := (MirValueCodec.uint layouts w 0).decode_eq_map
+
+/-- `TupleFieldCodec` for a unit field `()` (`FixedByteCodec.unit`, a 1-ZST). -/
+def unit (layouts : LayoutTable) : TupleFieldCodec layouts (.tuple []) FixedByteCodec.unit where
+  toValue := fun _ => .unit
+  ofValue := fun v =>
+    match v with
+    | .unit => some ()
+    | _ => none
+  ofValue_toValue := fun _ => rfl
+  kindSize_eq := rfl
+  encode_toValue := fun _ => rfl
+  encode_witness := fun v bs hEnc => by
+    refine ⟨(), ?_⟩
+    unfold tupleFieldFuel encodeValueToBytes at hEnc
+    cases v <;> dsimp only at hEnc
+    case unit =>
+      injection hEnc with hBs
+      exact hBs.symm
+    case scalar => nomatch hEnc
+    case ptr => nomatch hEnc
+    case aggregate varIdx fs =>
+      match varIdx, fs, hEnc with
+      | 0, [], hEnc =>
+        injection hEnc with hBs
+        exact hBs.symm
+  decode_eq_map := fun bs => by
+    cases bs <;> rfl
+
+end TupleFieldCodec
+
 namespace MirValueCodec
 
 /--
-General $k$-field `MirValueCodec` constructor bridging a `LayoutTable` `FieldsShape.arbitrary`
-entry and a declaration-order `PlacedCodecSpine αs` (with arbitrary leading/inter-field/trailing
-padding, zero-sized `1-ZST` fields, and memory-order field permutations `pc.memSortPerm`) to
-`MirValueCodec layouts ty (FieldTuple αs) totalSize`.
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem tuple_cons_rigidTyByteSize {layouts : LayoutTable} {idx : LayoutIdx} {l : TypeLayout}
+    {k : RigidTy} {ks : List RigidTy} {totalSize : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size = { bytes := totalSize }) :
+    rigidTyByteSize layouts { kind := .tuple (k :: ks), layoutIdx := idx } = some totalSize := by
+  unfold rigidTyByteSize
+  dsimp only [rigidTyKindByteSize]
+  rw [hLookup]
+  dsimp only
+  rw [hSize]
+
+/--
+Trusted encodes the laid-out tuple value `.aggregate 0 (fcs.toValues x)` to the realized codec's
+encoding of `x`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: encodeValueToBytes
+-/
+theorem ofPlacedCodecSpine_encode_toValue
+    {layouts : LayoutTable} {idx : LayoutIdx} {l : TypeLayout} {memoryIndex : List Nat}
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (x : FieldTuple αs) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .tuple (k :: ks), layoutIdx := idx }
+        (.aggregate 0 (fcs.toValues x)) =
+      some ((pc.realizedCodec totalSize).encode x) := by
+  unfold defaultCodecFuel encodeValueToBytes
+  simp only []
+  have hLen1 : Nat.beq (Trusted.Sequence.length (fcs.toValues x))
+      (Trusted.Sequence.length (k :: ks)) = true :=
+    Nat.beq_eq.mpr (fcs.length_toValues x)
+  rw [hLen1]
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  have hLen2 : Nat.beq (Trusted.Sequence.length (pc.placed.map fun p => ({ bytes := p.1 } : Size)))
+      (Trusted.Sequence.length (fcs.toValues x)) = true := by
+    apply Nat.beq_eq.mpr
+    show (pc.placed.map fun p => ({ bytes := p.1 } : Size)).length = (fcs.toValues x).length
+    rw [List.length_map, fcs.length_placed, fcs.length_toValues]
+  rw [hLen2]
+  dsimp only
+  rw [hSize]
+  exact (fcs.encodeFieldsAtOffsetsWith_eq_writeWindows _ x _).trans
+    (pc.writeWindows_realizedCodec_encode totalSize hSeq x)
+
+/--
+Every successful Trusted encoding of the laid-out tuple type is a realized-codec encoding.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: PlacedCodecSpine.realizedCodec
+-/
+theorem ofPlacedCodecSpine_encode_witness
+    {layouts : LayoutTable} {idx : LayoutIdx} {l : TypeLayout} {memoryIndex : List Nat}
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts
+      { kind := .tuple (k :: ks), layoutIdx := idx } v = some bs) :
+    ∃ x : FieldTuple αs, bs = (pc.realizedCodec totalSize).encode x := by
+  unfold defaultCodecFuel encodeValueToBytes at hEnc
+  cases v <;> dsimp only at hEnc
+  case unit => nomatch hEnc
+  case scalar => nomatch hEnc
+  case ptr => nomatch hEnc
+  case aggregate varIdx vals =>
+    cases varIdx with
+    | succ _ => nomatch hEnc
+    | zero =>
+      simp only [] at hEnc
+      cases hL : Nat.beq (Trusted.Sequence.length vals) (Trusted.Sequence.length (k :: ks)) with
+      | false =>
+        rw [hL] at hEnc
+        nomatch hEnc
+      | true =>
+        rw [hL] at hEnc
+        dsimp only at hEnc
+        rw [hLookup] at hEnc
+        dsimp only at hEnc
+        rw [hFields] at hEnc
+        dsimp only at hEnc
+        have hValsLen : vals.length = (k :: ks).length := Nat.eq_of_beq_eq_true hL
+        have hLen2 : Nat.beq
+            (Trusted.Sequence.length (pc.placed.map fun p => ({ bytes := p.1 } : Size)))
+            (Trusted.Sequence.length vals) = true := by
+          apply Nat.beq_eq.mpr
+          show (pc.placed.map fun p => ({ bytes := p.1 } : Size)).length = vals.length
+          rw [List.length_map, fcs.length_placed, hValsLen]
+        rw [hLen2] at hEnc
+        dsimp only at hEnc
+        rw [hSize] at hEnc
+        obtain ⟨x, hx⟩ := fcs.encodeFieldsAtOffsetsWith_witness _ vals _ bs hEnc
+        rw [pc.writeWindows_realizedCodec_encode totalSize hSeq x] at hx
+        injection hx with hx
+        exact ⟨x, hx.symm⟩
+
+/--
+Trusted decodes the laid-out tuple type exactly as the realized codec (padding bytes ignored).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: decodeValueFromBytes
+-/
+theorem ofPlacedCodecSpine_decode_eq_map
+    {layouts : LayoutTable} {idx : LayoutIdx} {l : TypeLayout} {memoryIndex : List Nat}
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize)
+    (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts { kind := .tuple (k :: ks), layoutIdx := idx } bs =
+      ((pc.realizedCodec totalSize).decode bs).map (fun x => .aggregate 0 (fcs.toValues x)) := by
+  have hWidth := (pc.realized_offsets_and_width_of_sequential totalSize hSeq).2
+  unfold defaultCodecFuel decodeValueFromBytes
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hSize]
+  dsimp only
+  cases hL : Nat.beq (Trusted.Sequence.length bs) totalSize with
+  | false =>
+    have hNe : bs.length ≠ pc.realizedWidth totalSize := by
+      rw [hWidth]
+      intro hEq
+      rw [show Trusted.Sequence.length bs = bs.length from rfl, Nat.beq_eq.mpr hEq] at hL
+      nomatch hL
+    rw [(pc.realizedCodec_isExactWidth totalSize).decode_eq_none_of_length_ne hNe]
+    rfl
+  | true =>
+    have hLen : bs.length = totalSize := Nat.eq_of_beq_eq_true hL
+    dsimp only
+    rw [hFields]
+    dsimp only
+    rw [fcs.decodeFieldsAtOffsetsWith_eq_decodeAt bs (by
+        rw [hLen]
+        exact pc.placed_in_bounds_of_memSort_sequential totalSize hSeq),
+      pc.realizedCodec_decode_eq_decodeAt totalSize hSeq bs hLen]
+    cases pc.decodeAt bs <;> rfl
+
+/--
+**General $k$-Field Laid-Out Tuple `MirValueCodec`** (generalizing `uintPairArbitraryTuple` to any
+number of fields, any field memory order, zero-sized fields, and arbitrary leading/inter-field/
+trailing padding): from a concrete `LayoutTable` entry `l` for the tuple type (`hLookup`, `hSize`,
+and `hFields` giving the declaration-order `FieldsShape.arbitrary` offsets of `pc`), per-field
+Trusted bridges `fcs`, and a sequential memory-order placement of those offsets within `l.size`
+(`hSeq`, which every `ValidStructLayoutWorld` provides), this *derives* — rather than assumes —
+the agreement of Trusted's `encodeValueToBytes` / `decodeValueFromBytes` with the computable
+`pc.realizedCodec totalSize`.
 -/
 def ofPlacedCodecSpine
-    (layouts : LayoutTable) (ty : Ty) (l : TypeLayout) (memoryIndex : List Nat)
-    {αs : List Type} (pc : PlacedCodecSpine αs) (totalSize : Nat)
-    (hLookup : LayoutTable.lookup layouts ty.layoutIdx = some l)
+    (layouts : LayoutTable) (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs) (totalSize : Nat)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
     (hSize : l.size = { bytes := totalSize })
-    (hFields : l.fields = .arbitrary (pc.placed.map (fun p => { bytes := p.1 })) memoryIndex)
-    (hWidth : pc.realizedWidth totalSize = totalSize)
-    (toValue : FieldTuple αs → Value)
-    (ofValue : Value → Option (FieldTuple αs))
-    (ofValue_toValue : ∀ x : FieldTuple αs, ofValue (toValue x) = some x)
-    (tySize_eq : rigidTyByteSize layouts ty = some totalSize)
-    (encode_toValue :
-      ∀ x : FieldTuple αs,
-        encodeValueToBytes defaultCodecFuel layouts ty (toValue x) =
-          some ((pc.realizedCodec totalSize).encode x))
-    (encode_witness :
-      ∀ (v : Value) (bs : List AbstractByte),
-        encodeValueToBytes defaultCodecFuel layouts ty v = some bs →
-        ∃ x : FieldTuple αs, bs = (pc.realizedCodec totalSize).encode x)
-    (decode_eq_map :
-      ∀ bs : List AbstractByte,
-        decodeValueFromBytes defaultCodecFuel layouts ty bs =
-          ((pc.realizedCodec totalSize).decode bs).map toValue) :
-    MirValueCodec layouts ty (FieldTuple αs) totalSize :=
-  let _ := hLookup
-  let _ := hSize
-  let _ := hFields
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) totalSize) :
+    MirValueCodec layouts { kind := .tuple (k :: ks), layoutIdx := idx } (FieldTuple αs) totalSize :=
   ofCanonicalEncode
-    ((pc.realizedCodec totalSize).castWidth hWidth)
-    toValue
-    ofValue
-    ofValue_toValue
-    tySize_eq
-    encode_toValue
-    encode_witness
-    decode_eq_map
+    ((pc.realizedCodec totalSize).castWidth
+      (pc.realized_offsets_and_width_of_sequential totalSize hSeq).2)
+    (fun x => .aggregate 0 (fcs.toValues x))
+    (fun v =>
+      match v with
+      | .aggregate 0 vs => fcs.ofValues vs
+      | _ => none)
+    (fun x => fcs.ofValues_toValues x)
+    (tuple_cons_rigidTyByteSize hLookup hSize)
+    (fun x => ofPlacedCodecSpine_encode_toValue fcs hLookup hSize hFields hSeq x)
+    (fun v bs hEnc => ofPlacedCodecSpine_encode_witness fcs hLookup hSize hFields hSeq v bs hEnc)
+    (fun bs => ofPlacedCodecSpine_decode_eq_map fcs hLookup hSize hFields hSeq bs)
+
 
 /--
 Universal `IsFromBytes`, `IsFromZeros`, and `IsTryFromBytes` preservation for any
@@ -6658,24 +7922,31 @@ theorem u8u32UnitPermutedPlaced_realizedWidth (trail : Nat) :
   change 0 + ((4 + 0) + ((1 + 0) + ((0 + 0) + ((5 + trail) - 5)))) = 5 + trail
   omega
 
-theorem u8u32UnitPermutedPlaced_realizedCodec_decode (trail : Nat) (bs : List AbstractByte) :
-    (u8u32UnitPermutedPlaced.realizedCodec (5 + trail)).decode bs =
-      Option.map
-        (fun (b, a, u, ()) => (a, b, u, ()))
-        ((FixedByteCodec.padLeft 0
-          (FixedByteCodec.prod
-            (FixedByteCodec.padRight (FixedByteCodec.uintBitsLE 4 (by decide)) 0)
-            (FixedByteCodec.prod
-              (FixedByteCodec.padRight (FixedByteCodec.uintBitsLE 1 (by decide)) 0)
-              (FixedByteCodec.prod
-                (FixedByteCodec.padRight FixedByteCodec.unit 0)
-                (FixedByteCodec.padUninit ((5 + trail) - 5)))))).decode bs) :=
-  rfl
+/-- Declaration-order `TupleFieldCodecs` of the `(u8, u32, ())` tuple fields. -/
+def u8u32UnitPermutedFieldCodecs (layouts : LayoutTable) :
+    TupleFieldCodecs layouts [.uint .u8, .uint .u32, .tuple []] u8u32UnitPermutedPlaced :=
+  .cons (TupleFieldCodec.uint layouts .u8)
+    (.cons (TupleFieldCodec.uint layouts .u32) (.cons (TupleFieldCodec.unit layouts) .nil))
 
 /--
-Concrete 3-field `MirValueCodec` built via `MirValueCodec.ofPlacedCodecSpine` for `(u8, u32, ())`
-laid out with reordered field offsets `[{ bytes := 4 }, { bytes := 0 }, { bytes := 5 }]` and
-parametric trailing padding `trail : Nat` (`l.size = { bytes := 5 + trail }`).
+The reordered placement `u32 @ 0`, `u8 @ 4`, `() @ 5` is a sequential memory-order placement
+within every total size `5 + trail`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem u8u32UnitPermutedPlaced_sequential (trail : Nat) :
+    SequentialFieldPlacement 0 (u8u32UnitPermutedPlaced.memSort.placed.map Prod.snd)
+      (u8u32UnitPermutedPlaced.memSort.placed.map Prod.fst) (5 + trail) :=
+  .cons (Nat.le_refl 0) (.cons (Nat.le_refl 4) (.cons (Nat.le_refl 5)
+    (.nil (Nat.le_add_right 5 trail))))
+
+/--
+Concrete 3-field `MirValueCodec` for `(u8, u32, ())` laid out with reordered field offsets
+`[{ bytes := 4 }, { bytes := 0 }, { bytes := 5 }]` and parametric trailing padding `trail : Nat`
+(`l.size = { bytes := 5 + trail }`), obtained from the general `MirValueCodec.ofPlacedCodecSpine`:
+no bespoke `encodeValueToBytes` / `decodeValueFromBytes` proof is needed.
 -/
 def u8u32UnitPermutedArbitraryTuple
     (layouts : LayoutTable) (trail : Nat) (idx : LayoutIdx) (l : TypeLayout)
@@ -6690,320 +7961,9 @@ def u8u32UnitPermutedArbitraryTuple
          { bits : Nat // bits < 2 ^ (8 * uintByteSize .u32) },
          Unit])
       (5 + trail) :=
-  let c₁ := FixedByteCodec.uintBitsLE 1 (by decide)
-  let c₂ := FixedByteCodec.uintBitsLE 4 (by decide)
-  let m₁ := uint layouts .u8 0
-  let m₂ := uint layouts .u32 0
-  have hSub : (5 + trail) - 5 = trail := Nat.add_sub_cancel_left 5 trail
-  ofPlacedCodecSpine
-    layouts
-    { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := idx }
-    l
-    memoryIndex
-    u8u32UnitPermutedPlaced
-    (5 + trail)
-    hLookup
-    hSize
-    hFields
-    (u8u32UnitPermutedPlaced_realizedWidth trail)
-    (fun ⟨a, b, (), ()⟩ => .aggregate 0 [m₁.toValue a, m₂.toValue b, .unit])
-    (fun v =>
-      match v with
-      | .aggregate 0 [v₁, v₂, .unit] =>
-        match m₁.ofValue v₁, m₂.ofValue v₂ with
-        | some a, some b => some (a, b, (), ())
-        | _, _ => none
-      | _ => none)
-    (fun ⟨a, b, (), ()⟩ => by
-      simp only []
-      rw [m₁.ofValue_toValue a, m₂.ofValue_toValue b])
-    (by
-      unfold rigidTyByteSize
-      dsimp only [rigidTyKindByteSize]
-      rw [hLookup]
-      dsimp only
-      rw [hSize])
-    (fun ⟨a, b, (), ()⟩ => by
-      have ha : encodeValueToBytes 15 layouts { kind := .uint .u8, layoutIdx := 0 }
-          (m₁.toValue a) = some (c₁.encode a) := m₁.encode_toValue a
-      have hb : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 }
-          (m₂.toValue b) = some (c₂.encode b) := m₂.encode_toValue b
-      unfold defaultCodecFuel encodeValueToBytes
-      simp only []
-      have hLen3 : Nat.beq (Trusted.Sequence.length [m₁.toValue a, m₂.toValue b, Value.unit])
-          (Trusted.Sequence.length [RigidTy.uint .u8, RigidTy.uint .u32, RigidTy.tuple []]) = true := rfl
-      rw [hLen3]
-      dsimp only
-      rw [hLookup]
-      dsimp only
-      rw [hFields, hSize]
-      dsimp only
-      have hOffLen : Nat.beq
-          (Trusted.Sequence.length ([{ bytes := 4 }, { bytes := 0 }, { bytes := 5 }] : List Size))
-          (Trusted.Sequence.length [m₁.toValue a, m₂.toValue b, Value.unit]) = true := rfl
-      rw [hOffLen]
-      dsimp only [encodeFieldsAtOffsetsWith]
-      rw [ha]
-      dsimp only
-      have hRepSplit :
-          replicateUninitBytes (5 + trail) =
-            replicateUninitBytes 4 ++ replicateUninitBytes 1 ++ replicateUninitBytes trail := by
-        rw [show 5 + trail = (4 + 1) + trail by omega,
-            replicateUninitBytes_add_eq (4 + 1) trail,
-            replicateUninitBytes_add_eq 4 1]
-      rw [hRepSplit,
-          writeAbstractBytesAt_offset_replicateUninit
-            (replicateUninitBytes 4) (c₁.encode a) (replicateUninitBytes trail)
-            (length_replicateUninitBytes 4) (c₁.encode_length a)]
-      dsimp only [encodeFieldsAtOffsetsWith]
-      rw [hb]
-      dsimp only
-      rw [List.append_assoc (replicateUninitBytes 4) (c₁.encode a) (replicateUninitBytes trail),
-          writeAbstractBytesAt_zero_replicateUninit (c₂.encode b)
-            (c₁.encode a ++ replicateUninitBytes trail) (c₂.encode_length b)]
-      dsimp only [encodeFieldsAtOffsetsWith, writeAbstractBytesAt]
-      apply congrArg some
-      change c₂.encode b ++ (c₁.encode a ++ replicateUninitBytes trail) =
-        replicateUninitBytes 0 ++
-          ((c₂.encode b ++ replicateUninitBytes 0) ++
-            ((c₁.encode a ++ replicateUninitBytes 0) ++
-              (([] ++ replicateUninitBytes 0) ++ replicateUninitBytes ((5 + trail) - 5))))
-      rw [hSub]
-      simp only [show replicateUninitBytes 0 = [] from rfl, List.nil_append, List.append_nil])
-    (fun v bs hEnc => by
-      unfold defaultCodecFuel encodeValueToBytes at hEnc
-      cases v <;> dsimp only at hEnc
-      case unit => nomatch hEnc
-      case scalar => nomatch hEnc
-      case ptr => nomatch hEnc
-      case aggregate varIdx fs =>
-        cases varIdx with
-        | succ _ => nomatch hEnc
-        | zero =>
-          rcases fs with _ | ⟨v₁, _ | ⟨v₂, _ | ⟨v₃, _ | ⟨_, _⟩⟩⟩⟩
-          · nomatch hEnc
-          · nomatch hEnc
-          · nomatch hEnc
-          · simp only [] at hEnc
-            have hLen3 : Nat.beq (Trusted.Sequence.length [v₁, v₂, v₃])
-                (Trusted.Sequence.length [RigidTy.uint .u8, RigidTy.uint .u32, RigidTy.tuple []]) = true := rfl
-            rw [hLen3] at hEnc
-            dsimp only at hEnc
-            rw [hLookup] at hEnc
-            dsimp only at hEnc
-            rw [hFields, hSize] at hEnc
-            dsimp only at hEnc
-            have hOffLen : Nat.beq
-                (Trusted.Sequence.length ([{ bytes := 4 }, { bytes := 0 }, { bytes := 5 }] : List Size))
-                (Trusted.Sequence.length [v₁, v₂, v₃]) = true := rfl
-            rw [hOffLen] at hEnc
-            dsimp only [encodeFieldsAtOffsetsWith] at hEnc
-            cases hE₁ : encodeValueToBytes 15 layouts { kind := .uint .u8, layoutIdx := 0 } v₁ <;>
-              rw [hE₁] at hEnc
-            · nomatch hEnc
-            case some b₁ =>
-              dsimp only at hEnc
-              unfold encodeValueToBytes at hE₁
-              dsimp only [intCastTargetBytes] at hE₁
-              cases v₁ <;> dsimp only at hE₁
-              case unit => nomatch hE₁
-              case ptr => nomatch hE₁
-              case aggregate => nomatch hE₁
-              case scalar sv₁ =>
-                cases hS₁ : Nat.beq sv₁.sizeBytes 1 <;> rw [hS₁] at hE₁
-                · nomatch hE₁
-                · have hSvSz₁ : sv₁.sizeBytes = 1 := Nat.eq_of_beq_eq_true hS₁
-                  unfold encodeScalarBytes at hE₁
-                  rw [hSvSz₁] at hE₁
-                  dsimp only at hE₁
-                  injection hE₁ with hB₁
-                  let x₁ : { bits : Nat // bits < 2 ^ (8 * uintByteSize .u8) } :=
-                    ⟨sv₁.bits % 2 ^ (8 * 1), Nat.mod_lt _ (Nat.two_pow_pos _)⟩
-                  have hCEnc₁ : b₁ = c₁.encode x₁ := by
-                    rw [← hB₁]
-                    exact (encodeLittleEndianBytes_mod_two_pow none 1 sv₁.bits).symm
-                  have hB₁Len : b₁.length = 1 := by
-                    rw [hCEnc₁]
-                    exact c₁.encode_length x₁
-                  have hRepSplit :
-                      replicateUninitBytes (5 + trail) =
-                        replicateUninitBytes 4 ++ replicateUninitBytes 1 ++ replicateUninitBytes trail := by
-                    rw [show 5 + trail = (4 + 1) + trail by omega,
-                        replicateUninitBytes_add_eq (4 + 1) trail,
-                        replicateUninitBytes_add_eq 4 1]
-                  rw [hRepSplit,
-                      writeAbstractBytesAt_offset_replicateUninit
-                        (replicateUninitBytes 4) b₁ (replicateUninitBytes trail)
-                        (length_replicateUninitBytes 4) hB₁Len] at hEnc
-                  dsimp only [encodeFieldsAtOffsetsWith] at hEnc
-                  cases hE₂ : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v₂ <;>
-                    rw [hE₂] at hEnc
-                  · nomatch hEnc
-                  case some b₂ =>
-                    dsimp only at hEnc
-                    unfold encodeValueToBytes at hE₂
-                    dsimp only [intCastTargetBytes] at hE₂
-                    cases v₂ <;> dsimp only at hE₂
-                    case unit => nomatch hE₂
-                    case ptr => nomatch hE₂
-                    case aggregate => nomatch hE₂
-                    case scalar sv₂ =>
-                      cases hS₂ : Nat.beq sv₂.sizeBytes 4 <;> rw [hS₂] at hE₂
-                      · nomatch hE₂
-                      · have hSvSz₂ : sv₂.sizeBytes = 4 := Nat.eq_of_beq_eq_true hS₂
-                        unfold encodeScalarBytes at hE₂
-                        rw [hSvSz₂] at hE₂
-                        dsimp only at hE₂
-                        injection hE₂ with hB₂
-                        let x₂ : { bits : Nat // bits < 2 ^ (8 * uintByteSize .u32) } :=
-                          ⟨sv₂.bits % 2 ^ (8 * 4), Nat.mod_lt _ (Nat.two_pow_pos _)⟩
-                        have hCEnc₂ : b₂ = c₂.encode x₂ := by
-                          rw [← hB₂]
-                          exact (encodeLittleEndianBytes_mod_two_pow none 4 sv₂.bits).symm
-                        have hB₂Len : b₂.length = 4 := by
-                          rw [hCEnc₂]
-                          exact c₂.encode_length x₂
-                        rw [List.append_assoc (replicateUninitBytes 4) b₁ (replicateUninitBytes trail),
-                            writeAbstractBytesAt_zero_replicateUninit b₂
-                              (b₁ ++ replicateUninitBytes trail) hB₂Len] at hEnc
-                        dsimp only [encodeFieldsAtOffsetsWith] at hEnc
-                        cases hE₃ : encodeValueToBytes 15 layouts { kind := .tuple [], layoutIdx := 0 } v₃ <;>
-                          rw [hE₃] at hEnc
-                        · dsimp only [rigidTyKindByteSize] at hEnc
-                          nomatch hEnc
-                        case some b₃ =>
-                          dsimp only at hEnc
-                          have hB₃Nil : b₃ = [] := by
-                            unfold encodeValueToBytes at hE₃
-                            cases v₃ with
-                            | unit => injection hE₃ with h; exact h.symm
-                            | aggregate varIdx' fs' =>
-                              match varIdx', fs' with
-                              | 0, [] => injection hE₃ with h; exact h.symm
-                              | _ + 1, _ | 0, _ :: _ => nomatch hE₃
-                            | _ => nomatch hE₃
-                          subst hB₃Nil
-                          have hWriteUnit :
-                              writeAbstractBytesAt (b₂ ++ (b₁ ++ replicateUninitBytes trail)) 5 [] =
-                                some (b₂ ++ (b₁ ++ replicateUninitBytes trail)) := by
-                            have hPre : (b₂ ++ b₁).length = 5 := by
-                              rw [List.length_append, hB₂Len, hB₁Len]
-                            have hW :=
-                              writeAbstractBytesAt_offset_replicateUninit
-                                (b₂ ++ b₁) [] (replicateUninitBytes trail) hPre rfl
-                            simpa only [List.length_nil,
-                                        show replicateUninitBytes 0 = [] from rfl,
-                                        List.nil_append, List.append_nil,
-                                        List.append_assoc] using hW
-                          rw [hWriteUnit] at hEnc
-                          injection hEnc with hBs
-                          refine ⟨(x₁, x₂, (), ()), ?_⟩
-                          rw [← hBs, hCEnc₁, hCEnc₂]
-                          change c₂.encode x₂ ++ (c₁.encode x₁ ++ replicateUninitBytes trail) =
-                            replicateUninitBytes 0 ++
-                              ((c₂.encode x₂ ++ replicateUninitBytes 0) ++
-                                ((c₁.encode x₁ ++ replicateUninitBytes 0) ++
-                                  (([] ++ replicateUninitBytes 0) ++ replicateUninitBytes ((5 + trail) - 5))))
-                          rw [hSub]
-                          simp only [show replicateUninitBytes 0 = [] from rfl, List.nil_append,
-                                     List.append_nil]
-          · nomatch hEnc)
-    (fun bs => by
-      unfold defaultCodecFuel decodeValueFromBytes
-      dsimp only
-      rw [hLookup]
-      dsimp only
-      rw [hSize, hFields]
-      dsimp only
-      have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
-      rw [hLenDef]
-      have hWidthEq := u8u32UnitPermutedPlaced_realizedWidth trail
-      cases hBeq : Nat.beq bs.length (5 + trail)
-      · dsimp only
-        have hNe : bs.length ≠ u8u32UnitPermutedPlaced.realizedWidth (5 + trail) := by
-          rw [hWidthEq]
-          intro hEq
-          rw [Nat.beq_eq.mpr hEq] at hBeq
-          nomatch hBeq
-        rw [(u8u32UnitPermutedPlaced.realizedCodec_isExactWidth (5 + trail)).decode_eq_none_of_length_ne hNe]
-        rfl
-      · dsimp only [decodeFieldsAtOffsetsWith]
-        have hSz₁ : rigidTyByteSize layouts { kind := .uint .u8, layoutIdx := 0 } = some 1 := rfl
-        have hSz₂ : rigidTyByteSize layouts { kind := .uint .u32, layoutIdx := 0 } = some 4 := rfl
-        have hSz₃ : rigidTyByteSize layouts { kind := .tuple [], layoutIdx := 0 } = some 0 := rfl
-        rw [hSz₁]
-        dsimp only [sliceAbstractBytes]
-        rw [hLenDef]
-        have hBsEq : bs.length = 5 + trail := Nat.eq_of_beq_eq_true hBeq
-        have hBle₁ : Nat.ble (Nat.add 4 1) bs.length = true :=
-          Nat.ble_eq_true_of_le (by change 4 + 1 ≤ bs.length; rw [hBsEq]; omega)
-        rw [hBle₁]
-        dsimp only
-        rw [dropAbstractBytes_eq_drop, takeAbstractBytes_eq_take,
-            m₁.decode_eq_map ((bs.drop 4).take 1)]
-        have hMC₁ : m₁.codec = c₁ := rfl
-        have hMC₂ : m₂.codec = c₂ := rfl
-        rw [hMC₁]
-        have hBle₂ : Nat.ble (Nat.add 0 4) bs.length = true :=
-          Nat.ble_eq_true_of_le (by change 0 + 4 ≤ bs.length; rw [hBsEq]; omega)
-        have hBle₃ : Nat.ble (Nat.add 5 0) bs.length = true :=
-          Nat.ble_eq_true_of_le (by change 5 + 0 ≤ bs.length; rw [hBsEq]; omega)
-        rw [u8u32UnitPermutedPlaced_realizedCodec_decode]
-        have hBsLenPad : bs.length = (4 + 0) + ((1 + 0) + ((0 + 0) + ((5 + trail) - 5))) := by
-          rw [hBsEq]; omega
-        rw [FixedByteCodec.padLeft_zero_decode_of_length_eq _ hBsLenPad]
-        unfold FixedByteCodec.prod FixedByteCodec.ofRoundTrip
-        dsimp only []
-        have hBeqPad1 : Nat.beq bs.length ((4 + 0) + ((1 + 0) + ((0 + 0) + ((5 + trail) - 5)))) = true :=
-          Nat.beq_eq.mpr hBsLenPad
-        rw [hBeqPad1]
-        dsimp only []
-        have hTake4Len : (bs.take (4 + 0)).length = 4 + 0 := by rw [List.length_take, hBsEq]; omega
-        have hTake4Take : (bs.take (4 + 0)).take 4 = bs.take 4 := by
-          change (bs.take 4).take 4 = bs.take 4
-          exact List.take_of_length_le (by rw [hTake4Len]; decide)
-        rw [FixedByteCodec.padRight_decode_of_length_eq c₂ hTake4Len, hTake4Take]
-        have hDrop4Len : (bs.drop (4 + 0)).length = (1 + 0) + ((0 + 0) + ((5 + trail) - 5)) := by
-          rw [List.length_drop, hBsEq]; omega
-        rw [Nat.beq_eq.mpr hDrop4Len]
-        dsimp only []
-        have hDrop4Take1Len : ((bs.drop (4 + 0)).take (1 + 0)).length = 1 + 0 := by
-          rw [List.length_take, List.length_drop, hBsEq]; omega
-        have hDrop4Take1Take : ((bs.drop (4 + 0)).take (1 + 0)).take 1 = (bs.drop 4).take 1 := by
-          change ((bs.drop 4).take 1).take 1 = (bs.drop 4).take 1
-          exact List.take_of_length_le (by rw [hDrop4Take1Len]; decide)
-        rw [FixedByteCodec.padRight_decode_of_length_eq c₁ hDrop4Take1Len, hDrop4Take1Take]
-        have hDrop4Drop1Len : ((bs.drop (4 + 0)).drop (1 + 0)).length = (0 + 0) + ((5 + trail) - 5) := by
-          rw [List.length_drop, List.length_drop, hBsEq]; omega
-        rw [Nat.beq_eq.mpr hDrop4Drop1Len]
-        dsimp only []
-        have hUnitTakeLen : (((bs.drop (4 + 0)).drop (1 + 0)).take (0 + 0)).length = 0 + 0 := rfl
-        rw [FixedByteCodec.padRight_decode_of_length_eq FixedByteCodec.unit hUnitTakeLen]
-        have hUnitDec : FixedByteCodec.unit.decode
-            ((((bs.drop (4 + 0)).drop (1 + 0)).take (0 + 0)).take 0) = some () := rfl
-        rw [hUnitDec]
-        have hTrailDec : (FixedByteCodec.padUninit ((5 + trail) - 5)).decode
-            (((bs.drop (4 + 0)).drop (1 + 0)).drop (0 + 0)) = some () := by
-          unfold FixedByteCodec.padUninit FixedByteCodec.ofRoundTrip
-          dsimp only []
-          have hTLen : (((bs.drop (4 + 0)).drop (1 + 0)).drop (0 + 0)).length = (5 + trail) - 5 := by
-            rw [List.length_drop, List.length_drop, List.length_drop, hBsEq]; omega
-          rw [Nat.beq_eq.mpr hTLen]
-          rfl
-        rw [hTrailDec]
-        cases hC₁ : c₁.decode ((bs.drop 4).take 1) with
-        | none =>
-          cases c₂.decode (bs.take 4) <;> rfl
-        | some a =>
-          dsimp only [Option.map]
-          rw [hSz₂]
-          dsimp only []
-          rw [hBle₂]
-          dsimp only [dropAbstractBytes]
-          rw [takeAbstractBytes_eq_take, m₂.decode_eq_map (bs.take 4), hMC₂]
-          cases hC₂ : c₂.decode (bs.take 4) with
-          | none => rfl
-          | some b => rfl)
+  ofPlacedCodecSpine layouts idx l memoryIndex u8u32UnitPermutedPlaced (5 + trail)
+    (u8u32UnitPermutedFieldCodecs layouts) hLookup hSize hFields
+    (u8u32UnitPermutedPlaced_sequential trail)
 
 /--
 Universal `IsFromBytes`, `IsFromZeros`, and `IsTryFromBytes` for the 3-field permuted tuple

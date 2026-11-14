@@ -45,6 +45,9 @@ Kernel regression and axiom-hygiene test suite for `Anneal.Mir.AdtAndControl` Se
    `evalDeinitPlace_symbolicPad_sibling_bytes_preserved`.
 6. Pins `#print axioms` via `#guard_msgs (whitespace := lax)` on every headline theorem,
    confirming zero `Classical.choice`, zero `sorryAx`, and zero `Lean.ofReduceBool`.
+7. `[adv ep1-B1]` Exercises `MirValueCodec.ofValidStructLayoutWorld` end-to-end: a valid reordered
+   `#[repr(Rust)]` world realized by a concrete `LayoutTable` entry yields Trusted-level
+   `IsFromBytes` and `¬ IsIntoBytes` through the general `MirValueCodec.ofPlacedCodecSpine`.
 -/
 
 #guard reprCPaddingFree none [⟨1, 1⟩, ⟨1, 1⟩] == true
@@ -234,5 +237,39 @@ theorem concretePaddedU8U32PairWorld_toSymbolicPad_pos :
 /-- info: 'Anneal.Mir.AdtAndControl.evalDeinitPlace_symbolicPad_sibling_bytes_preserved' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalDeinitPlace_symbolicPad_sibling_bytes_preserved
+
+/-! ## `[adv ep1-B1]` Valid Layout Worlds → General `MirValueCodec.ofPlacedCodecSpine` -/
+
+/--
+End-to-end non-vacuity: the reordered `#[repr(Rust)]` world `demoS3World` (`u32 @ 0`, `u8 @ 4`,
+`() @ 5`, size 8) is realized by the concrete `u8u32UnitPermutedLayouts` entry, so
+`MirValueCodec.ofValidStructLayoutWorld` yields `IsFromBytes` but `¬ IsIntoBytes` for `(u8, u32, ())`
+with no bespoke `encodeValueToBytes` / `decodeValueFromBytes` proof.
+-/
+theorem demoS3World_tuple_isFromBytes_not_isIntoBytes :
+    IsFromBytes u8u32UnitPermutedLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    ¬ IsIntoBytes u8u32UnitPermutedLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } := by
+  have h := MirValueCodec.ofValidStructLayoutWorld_bitValidity demoS3World_valid
+    u8u32UnitPermutedLayouts 0 u8u32UnitPermutedLayout [1, 0, 2]
+    MirValueCodec.u8u32UnitPermutedPlaced (MirValueCodec.u8u32UnitPermutedFieldCodecs _)
+    rfl rfl rfl rfl
+  exact ⟨(h.1 ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide),
+      FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide),
+      FixedByteCodec.unit_isSurjectiveInitDecoder, trivial⟩).1,
+    h.2.2 (by decide) (⟨0, by decide⟩, ⟨0, by decide⟩, (), ())⟩
+
+/-- info: 'Anneal.Mir.AdtAndControl.PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld
+
+/-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.ofValidStructLayoutWorld_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.MirValueCodec.ofValidStructLayoutWorld_bitValidity
+
+/-- info: 'Anneal.Mir.AdtAndControlTests.demoS3World_tuple_isFromBytes_not_isIntoBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms demoS3World_tuple_isFromBytes_not_isIntoBytes
 
 end Anneal.Mir.AdtAndControlTests

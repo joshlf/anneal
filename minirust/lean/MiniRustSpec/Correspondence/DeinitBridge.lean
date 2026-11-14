@@ -1770,6 +1770,9 @@ theorem adt_control_residual_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_symbolicPad_bytes_simulation
   let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_symbolicPad_singleField_bytes_simulation
   let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_symbolicPad_sibling_bytes_preserved
+  -- `[adv ep1-B1]` valid tuple layout worlds → general `MirValueCodec.ofPlacedCodecSpine`.
+  let _ := @Anneal.Mir.AdtAndControl.PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld
+  let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.ofValidStructLayoutWorld_bitValidity
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge

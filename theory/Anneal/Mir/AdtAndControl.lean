@@ -14,6 +14,28 @@ import Lean.Elab.Command
 import Trusted.Rustc.V2026_06_01.MirSemantics.Bytes
 import Trusted.Rustc.V2026_06_01.MirSemantics.Machine
 
+/-
+**Import-boundary `simp`-set firewall for `import Anneal.ByteCodec`.**
+
+Before Section 2e2 imported `Anneal.ByteCodec`, neither this module nor its importers saw
+`Anneal.Scalars`. `Anneal.ByteCodec` imports `Anneal.Scalars`, whose global `@[simp]` lemmas
+`scalarPow2_eq_two_pow`, `scalarModulus_eq_two_pow`, `wrapScalarBits_eq_mod_modulus`, and
+`isSignedNegative_eq_msb` would otherwise leak into every downstream `simp` call. They break
+existing downstream proofs that pass `hxWrap : wrapScalarBits x (scalarModulus sz) = x`-style
+hypotheses to `simp` (`MiniRustSpec/Correspondence/DeinitBridge.lean` lines 506, 520, 891, 895,
+and 1166 fail with `unsolved goals` without this block), and `DeinitBridge.lean` may not be edited
+by this change.
+
+`attribute [-simp]` cannot fix this: `simp`-attribute erasure is module-local and is not exported to
+importers. Instead, for each lemma `n` we register one inert global `SimpEntry` whose origin is the
+converse `← n` (`Origin.decl n (post := true) (inv := true)`). `SimpTheorems.addSimpTheorem` erases the
+forward theorem of every converse entry it adds (`eraseFwdIfBwd`, Lean issue #4290), and the entry is
+replayed in every importing environment, so `n` is erased from the default `simp` set here and in all
+importers of this module. The entry itself can never fire: its only discrimination-tree key is the
+undeclared constant `_anneal_erased_simp_key`, and its proof term `True.intro` would be re-checked by
+the kernel even if it did. This changes only which lemmas the default `simp` set tries; it adds no
+axioms, and explicit `rw [Anneal.Scalars.scalarModulus_eq_two_pow]` / `simp [n]` uses are unaffected.
+-/
 run_cmd do
   for n in [``Anneal.Scalars.scalarPow2_eq_two_pow,
             ``Anneal.Scalars.scalarModulus_eq_two_pow,
@@ -5315,7 +5337,7 @@ theorem union_field_uninit_bytes {spec : AdtLayoutSpec} (hWF : spec.WF)
 
 /-! ### Section 2e2: Forward-Compatible Layout Worlds (`S0`–`S3`), `Stmt.evalConst` Guards, and `Deinit` Symbolic-Pad Simulation -/
 
-/-! ## Section 1: `ForwardCompatTier` (`S0`–`S3`), `TargetLayout`, `AdtRepr`, and `StructLayoutWorld` -/
+/-! #### Section 2e2.1: `ForwardCompatTier` (`S0`–`S3`), `TargetLayout`, `AdtRepr`, and `StructLayoutWorld` -/
 
 /--
 Forward-compatibility trust and coupling tiers matching `b1f15f743c`'s `TCBItem`
@@ -5937,7 +5959,7 @@ end SymbolicPairPad
 abbrev _root_.Anneal.ByteCodec.SymbolicPairPad.toStructLayoutWorld_inBounds_and_disjoint :=
   @SymbolicPairPad.toStructLayoutWorld_inBounds_and_disjoint
 
-/-! ### Pair Layout-World Bridge: `SymbolicPairPad` ↔ `ValidStructLayoutWorld` -/
+/-! #### Section 2e2.2: Pair Layout-World Bridge: `SymbolicPairPad` ↔ `ValidStructLayoutWorld` -/
 
 /--
 Rounding up adds at most one alignment unit: `alignUp x a ≤ x + a`.
@@ -7246,6 +7268,101 @@ abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.realize_validStructLayoutWorld_b
 abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.realizedCodec_spec :=
   @PlacedCodecSpine.realizedCodec_spec
 
+/--
+**Every Valid Layout World Is a Sequential Memory-Order Placement**: for every valid layout world `w`
+of `fs` (any `AdtRepr`, any field memory order, zero-sized fields anywhere) and every
+declaration-order `pc : PlacedCodecSpine αs` with `pc.placed = w.fieldOffsets.zip fs`, the
+constructively sorted placement `pc.memSort.placed` is a `SequentialFieldPlacement` from `0` within
+`w.totalSize` — exactly the `hSeq` hypothesis of `MirValueCodec.ofPlacedCodecSpine`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: SequentialFieldPlacement
+-/
+theorem PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs) (hPlaced : pc.placed = w.fieldOffsets.zip fs) :
+    SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd) (pc.memSort.placed.map Prod.fst)
+      w.totalSize := by
+  rw [Anneal.ByteCodec.PlacedCodecSpine.placed_memSort pc, hPlaced]
+  exact sequentialFieldPlacement_of_sorted_disjoint _ 0 w.totalSize (memSort_pairwise _)
+    (hValid.placed_pairwise_disjoint.perm (memSort_perm _).symm (fun h => Or.symm h))
+    (fun _ _ => Nat.zero_le _)
+    (fun p hp => hValid.placed_in_bounds p ((memSort_perm _).mem_iff.mp hp))
+    (Nat.zero_le _)
+
+/--
+**`MirValueCodec` of Every Valid Tuple Layout World**: a concrete `LayoutTable` entry `l` whose
+`FieldsShape.arbitrary` offsets and size realize a valid layout world `w` of the tuple's field
+layouts yields the general $k$-field `MirValueCodec.ofPlacedCodecSpine` against the computable
+`pc.realizedCodec w.totalSize` (its `hSeq` is discharged by
+`PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld`).
+-/
+def MirValueCodec.ofValidStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex) :
+    MirValueCodec layouts { kind := .tuple (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine layouts idx l memoryIndex pc w.totalSize fcs
+    hLookup hSize hFields (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)
+
+/--
+**Trusted-Level Bit Validity of Every Valid Tuple Layout World**: for the `MirValueCodec` of any valid
+layout world (any `AdtRepr`, any memory order, zero-sized fields anywhere) of a concrete tuple
+`LayoutTable` entry:
+1. `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes` whenever every field codec is a surjective
+   initialized-byte decoder;
+2. `IsInitCodec` and `IsIntoBytes` in tight worlds (`w.totalSize = sumSizes fs`) with initialized
+   field codecs;
+3. `¬ IsIntoBytes` in padded worlds (`sumSizes fs < w.totalSize`).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.ofValidStructLayoutWorld
+-/
+theorem MirValueCodec.ofValidStructLayoutWorld_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex) :
+    let ty : Ty := { kind := .tuple (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.ofValidStructLayoutWorld hValid layouts idx l memoryIndex pc fcs hPlaced
+      hLookup hSize hFields
+    (pc.AllFieldsSurjective →
+      IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit → m.codec.IsInitCodec ∧ IsIntoBytes layouts ty) ∧
+    (sumSizes fs < w.totalSize → FieldTuple αs → ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hW : pc.realizedWidth w.totalSize = w.totalSize :=
+    (pc.realized_offsets_and_width_of_sequential w.totalSize
+      (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)).2
+  have hSpec := pc.realizedCodec_spec hValid hPlaced
+  obtain ⟨_, _, _, _, hTight, hPadded⟩ := hSpec
+  refine ⟨fun hSurj => ?_, fun hT hInit => ?_, fun hLt x₀ => ?_⟩
+  · have hMSurj : m.codec.IsSurjectiveInitDecoder :=
+      FixedByteCodec.castWidth_isSurjectiveInitDecoder (pc.realizedCodec w.totalSize) hW
+        (pc.realizedCodec_isSurjectiveInitDecoder w.totalSize hSurj)
+    have hFb := m.isFromBytes hMSurj
+    exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+  · have hMInit : m.codec.IsInitCodec :=
+      FixedByteCodec.castWidth_isInitCodec (pc.realizedCodec w.totalSize) hW (hTight hT hInit).1
+    exact ⟨hMInit, m.isIntoBytes hMInit rfl⟩
+  · exact m.not_isIntoBytes_of_uninit_encode x₀ ((hPadded hLt).1 x₀)
+
 
 /--
 Kind: helper
@@ -7444,7 +7561,7 @@ theorem reprC_struct_paddingFree_iff_isIntoBytes
       nomatch hNotPF
     exact hPadImpl (by omega)
 
-/-! ### `[adv B4]` Concrete Non-Vacuity Witness for the $k$-Field Realization Chain
+/-! #### Section 2e2.3: `[adv B4]` Concrete Non-Vacuity Witness for the $k$-Field Realization Chain
 
 Every $k$-field realization theorem above is a `∀ w, ValidStructLayoutWorld … w → …` implication, so it
 says nothing unless its premises are satisfiable by genuinely **permuted** worlds. This witness
@@ -7569,7 +7686,7 @@ theorem demoS3Placed_realizedCodec_spec :
   exact ⟨rfl, rfl, rfl, rfl, hSpec.2.2.1, (hSpec.2.2.2.2.2 (by decide)).1⟩
 
 
-/-! ## Section 3: `Stmt.evalConst` Compile-Time Guard Soundness & `S0` vs. `S1` Tier Separation -/
+/-! #### Section 2e2.4: `Stmt.evalConst` Compile-Time Guard Soundness & `S0` vs. `S1` Tier Separation -/
 
 /--
 Small-step / terminal outcome of a function containing an inline `const { ... }` block
@@ -7957,7 +8074,7 @@ theorem s0_vs_s1_separation_over_validStructLayoutWorlds {α β : Type} {f₀ f�
     have hPost := (s0_vs_s1_const_guarded_transmute_separation h₁ h₂ x).2 p
     exact ⟨p, hP, hPost, hPost.1⟩
 
-/-! ## Section 4: `AdtLayoutSpec` + `deinitFieldSlot` / `evalDeinitPlace` Byte-Simulation Under Symbolic `adtPad` -/
+/-! #### Section 2e2.5: `AdtLayoutSpec` + `deinitFieldSlot` / `evalDeinitPlace` Byte-Simulation Under Symbolic `adtPad` -/
 
 /--
 Construct an `AdtAndControl.ByteLayout` from any `StructLayoutWorld` (supporting arbitrary
