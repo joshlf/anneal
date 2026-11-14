@@ -14414,6 +14414,50 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_backing_iff
     simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hBacking, hAlign,
       LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
 
+/-- **Misaligned stack-borrowed `Unsize` faults**: when the backing aggregate resolves but
+`ptrVal.offsetBytes` is not a whole number of elements (`byteOffsetToElemIdx? = .none`, e.g. a
+`&[u32; 5]` reborrowed at byte offset `2`), both `evalUnsizeCoercion` and the lifted
+`evalRvalue (.cast (.pointerCoercion "Unsize") ...)` return `.ub` (the complement of
+`trusted_evalUnsizeCoercion_stack_borrow_backing_iff`'s alignment hypothesis). -/
+theorem trusted_evalUnsizeCoercion_stack_borrow_misaligned_ub
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat)
+    (entry : BorrowEntry) (rootVal : Value)
+    (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
+    (hTy : operandTy localDecls layouts op = .some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
+      .some n)
+    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hBacking :
+      readSliceBackingAggregate? locals' rootVal entry.targetProjection n
+        (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
+        .some (cProj, baseIdx, elems))
+    (hMisalign : byteOffsetToElemIdx? ptrVal.offsetBytes (inferElemListByteStride elems) = .none) :
+    evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts = .ub ∧
+    evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts = .ub := by
+  have hUb :
+      evalUnsizeCoercion locals op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+          mem localDecls layouts = .ub := by
+    unfold evalUnsizeCoercion
+    dsimp only [slicePtrTargetKind] at *
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
+      simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hBacking, hMisalign,
+        Bool.and_true, Bool.not_false] <;> rfl
+  exact ⟨hUb, hUb⟩
+
 /-- Stack-borrowed ZST `.unit` `evalUnsizeCoercion` two-sided characterization: when
 `readSliceBackingAggregate? = .none` and `readProjectedValue = .ok .unit`, unsizing succeeds iff
 `ptrVal.offsetBytes = 0 ∧ n = 0`. -/
@@ -16575,6 +16619,352 @@ theorem fnPtrToPtrSrcTyValid_rustIntrinsic_eq_false
     fnPtrToPtrSrcTyValid
         (.some { kind := .fnPtr inputs output safety .rustIntrinsic, layoutIdx := lIdx }) =
       false := rfl
+
+/-- `callConvEq abi .rustIntrinsic = false` is exactly `abi ≠ .rustIntrinsic`. -/
+theorem callConvEq_rustIntrinsic_eq_false_iff (abi : CallConv) :
+    callConvEq abi .rustIntrinsic = false ↔ abi ≠ .rustIntrinsic := by
+  cases abi
+  case rustIntrinsic => exact ⟨fun h => (by cases h), fun h => absurd rfl h⟩
+  all_goals exact ⟨fun _ h => (by cases h), fun _ => rfl⟩
+
+/-- `Bool.not (callConvEq abi .rustIntrinsic) = true` is exactly `abi ≠ .rustIntrinsic`. -/
+theorem not_callConvEq_rustIntrinsic_eq_true_iff (abi : CallConv) :
+    Bool.not (callConvEq abi .rustIntrinsic) = true ↔ abi ≠ .rustIntrinsic := by
+  rw [← callConvEq_rustIntrinsic_eq_false_iff]
+  cases callConvEq abi .rustIntrinsic
+  · exact ⟨fun _ => rfl, fun _ => rfl⟩
+  · exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+
+/-- **Structural form of `fnPtrToPtrSrcTyValid`**: the source operand type is unknown, or it is a
+`fn` pointer type whose ABI is not `rustIntrinsic`. -/
+theorem fnPtrToPtrSrcTyValid_eq_true_iff (srcTyOpt : Option Ty) :
+    fnPtrToPtrSrcTyValid srcTyOpt = true ↔
+      srcTyOpt = .none ∨
+        ∃ inputs output safety abi lIdx,
+          srcTyOpt = .some { kind := .fnPtr inputs output safety abi, layoutIdx := lIdx } ∧
+            abi ≠ .rustIntrinsic := by
+  rcases srcTyOpt with _ | ⟨kind, lIdx⟩
+  · exact ⟨fun _ => Or.inl rfl, fun _ => rfl⟩
+  · cases kind
+    case fnPtr inputs output safety abi =>
+      show Bool.not (callConvEq abi .rustIntrinsic) = true ↔ _
+      rw [not_callConvEq_rustIntrinsic_eq_true_iff]
+      constructor
+      · exact fun hNe => Or.inr ⟨inputs, output, safety, abi, lIdx, rfl, hNe⟩
+      · rintro (h | ⟨_, _, _, _, _, h, hNe⟩)
+        · cases h
+        · cases h
+          exact hNe
+    all_goals
+      exact ⟨fun h => (by cases h), fun h => (by
+        rcases h with h | ⟨_, _, _, _, _, h, _⟩ <;> cases h)⟩
+
+/-- Registry condition of `FnPtrToPtr` (structural reading of `evalFnPtrToPtr`): with an empty
+`mem.fnPtrs` table the allocation must lie in the synthetic function-pointer range
+(`isFnPtrAllocId`); otherwise it must be registered, and its recorded signature (if any) must be a
+`fn` pointer whose ABI is not `rustIntrinsic`. -/
+def fnPtrToPtrRegistryOk (fnPtrs : List FnPtrEntry) (allocId : Nat) : Prop :=
+  (fnPtrs = .nil ∧ isFnPtrAllocId allocId = true) ∨
+    (fnPtrs ≠ .nil ∧ ∃ entry, lookupFnPtr fnPtrs allocId = .some entry ∧
+      (entry.fnSig = .none ∨
+        ∃ inputs output safety abi, entry.fnSig = .some (.fnPtr inputs output safety abi) ∧
+          abi ≠ .rustIntrinsic))
+
+/-- **Structural form of `fnPtrToPtrPtrValid`**: an 8-byte (`sz = 8`), offset-0, unborrowed
+(`lookupBorrow = .none`) pointer satisfying `fnPtrToPtrRegistryOk`. -/
+theorem fnPtrToPtrPtrValid_eq_true_iff (mem : Memory) (ptrVal : ProvenancePtr) (sz : Nat) :
+    fnPtrToPtrPtrValid mem ptrVal sz = true ↔
+      sz = 8 ∧ ptrVal.offsetBytes = 0 ∧ lookupBorrow mem.borrows ptrVal.tag = .none ∧
+        fnPtrToPtrRegistryOk mem.fnPtrs ptrVal.allocId := by
+  unfold fnPtrToPtrPtrValid fnPtrToPtrRegistryOk
+  cases hSz : Nat.beq sz 8
+  · have hne : sz ≠ 8 := fun h => by rw [h] at hSz; cases hSz
+    exact ⟨fun h => (by cases h), fun h => absurd h.1 hne⟩
+  · have hsz : sz = 8 := Nat.eq_of_beq_eq_true hSz
+    cases hOff : Nat.beq ptrVal.offsetBytes 0
+    · have hne : ptrVal.offsetBytes ≠ 0 := fun h => by rw [h] at hOff; cases hOff
+      exact ⟨fun h => (by cases h), fun h => absurd h.2.1 hne⟩
+    · have hoff : ptrVal.offsetBytes = 0 := Nat.eq_of_beq_eq_true hOff
+      cases hB : lookupBorrow mem.borrows ptrVal.tag
+      · cases hF : mem.fnPtrs
+        · exact ⟨fun h => ⟨hsz, hoff, rfl, Or.inl ⟨rfl, h⟩⟩,
+            fun ⟨_, _, _, h⟩ => h.elim (fun h => h.2) (fun h => absurd rfl h.1)⟩
+        · rename_i e es
+          have hcons : e :: es ≠ .nil := fun h => by cases h
+          cases hL : lookupFnPtr (e :: es) ptrVal.allocId
+          · exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim (fun h => absurd h.1 hcons)
+              (fun ⟨_, _, hE, _⟩ => (by cases hE))⟩
+          · rename_i entry
+            dsimp only
+            cases hS : entry.fnSig
+            · exact ⟨fun _ => ⟨hsz, hoff, rfl, Or.inr ⟨hcons, entry, rfl, Or.inl hS⟩⟩,
+                fun _ => rfl⟩
+            · rename_i k
+              cases k
+              case fnPtr inputs output safety abi =>
+                show Bool.not (callConvEq abi .rustIntrinsic) = true ↔ _
+                rw [not_callConvEq_rustIntrinsic_eq_true_iff]
+                constructor
+                · exact fun hNe => ⟨hsz, hoff, rfl, Or.inr ⟨hcons, entry, rfl,
+                    Or.inr ⟨inputs, output, safety, abi, hS, hNe⟩⟩⟩
+                · rintro ⟨_, _, _, h | ⟨_, _, hE, hSig⟩⟩
+                  · exact absurd h.1 hcons
+                  · cases hE
+                    rcases hSig with h | ⟨_, _, _, _, h, hNe⟩
+                    · rw [hS] at h
+                      cases h
+                    · rw [hS] at h
+                      cases h
+                      exact hNe
+              all_goals
+                exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim
+                  (fun h => absurd h.1 hcons)
+                  (fun ⟨_, _, hE, hSig⟩ => (by
+                    cases hE
+                    rcases hSig with h | ⟨_, _, _, _, h, _⟩ <;> rw [hS] at h <;> cases h))⟩
+      · exact ⟨fun h => (by cases h), fun h => (by cases h.2.2.1)⟩
+
+/-- **`FnPtrToPtr` fully structural two-sided characterization** (on `evalRvalue`), in the
+vocabulary of the brief: the cast succeeds with `.ptr ptrVal 8` (provenance preserved) iff the
+target is a thin raw pointer, the source type is unknown or a non-`rustIntrinsic` `fn` pointer,
+`sz = 8`, `ptrVal.offsetBytes = 0`, the pointer is unborrowed, and it is a registered (or
+synthetic-range) function pointer whose recorded signature, if any, is not `rustIntrinsic`; it
+faults with `.ub` otherwise. -/
+theorem trusted_evalRvalue_fnPtrToPtr_structural_iff
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal sz) locals') :
+    (evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts =
+        .ok (.ptr ptrVal 8) locals' mem ↔
+      (isThinRawPtrTy targetTy = true ∧
+        (operandTy localDecls layouts op = .none ∨
+          ∃ inputs output safety abi lIdx,
+            operandTy localDecls layouts op =
+              .some { kind := .fnPtr inputs output safety abi, layoutIdx := lIdx } ∧
+            abi ≠ .rustIntrinsic) ∧
+        sz = 8 ∧ ptrVal.offsetBytes = 0 ∧ lookupBorrow mem.borrows ptrVal.tag = .none ∧
+        fnPtrToPtrRegistryOk mem.fnPtrs ptrVal.allocId)) ∧
+    (evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts = .ub ↔
+      ¬ (isThinRawPtrTy targetTy = true ∧
+        (operandTy localDecls layouts op = .none ∨
+          ∃ inputs output safety abi lIdx,
+            operandTy localDecls layouts op =
+              .some { kind := .fnPtr inputs output safety abi, layoutIdx := lIdx } ∧
+            abi ≠ .rustIntrinsic) ∧
+        sz = 8 ∧ ptrVal.offsetBytes = 0 ∧ lookupBorrow mem.borrows ptrVal.tag = .none ∧
+        fnPtrToPtrRegistryOk mem.fnPtrs ptrVal.allocId)) := by
+  have h := trusted_evalRvalue_fnPtrToPtr_iff locals locals' op targetTy mem localDecls layouts
+    ptrVal sz hOp
+  rw [fnPtrToPtrSrcTyValid_eq_true_iff, fnPtrToPtrPtrValid_eq_true_iff] at h
+  exact h
+
+/-! ### 9.3 (cont.) Structural form of the `UnsafeFnPointer` side conditions
+
+The two-sided `trusted_evalRvalue_unsafeFnPointer_iff` above is phrased with the verbatim Boolean
+checks `unsafeFnPtrSrcTyValid` / `unsafeFnPtrValid`. The theorems below unfold them into the
+structural conditions of the brief: a *safe* source `fn` pointer with the target's ABI, an 8-byte,
+offset-0, unborrowed, registered (or synthetic-range) pointer. Signature *type* equality stays the
+fuel-bounded `rigidTyListEq` / `rigidTyEq` of `Trusted` (which is not equivalent to `=` on types
+nested deeper than its fuel). -/
+
+/-- `callConvEq` is exactly equality of calling conventions. -/
+theorem callConvEq_eq_true_iff (a b : CallConv) : callConvEq a b = true ↔ a = b := by
+  cases a <;> cases b
+  all_goals first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+    | exact Iff.trans LPointerCoercionKind.stringEq_eq_true_iff_eq
+        ⟨fun h => congrArg CallConv.other h, fun h => CallConv.other.inj h⟩
+
+/-- **Structural form of `unsafeFnPtrSrcTyValid`**: the source type is unknown, or it is a *safe*
+`fn` pointer with the target's ABI and (fuel-bounded) equal inputs and output. -/
+theorem unsafeFnPtrSrcTyValid_eq_true_iff (srcTyOpt : Option Ty) (dstInputs : List RigidTy)
+    (dstOutput : RigidTy) (dstAbi : CallConv) :
+    unsafeFnPtrSrcTyValid srcTyOpt dstInputs dstOutput dstAbi = true ↔
+      srcTyOpt = .none ∨
+        ∃ srcInputs srcOutput lIdx,
+          srcTyOpt = .some { kind := .fnPtr srcInputs srcOutput .safe dstAbi, layoutIdx := lIdx } ∧
+          rigidTyListEq srcInputs dstInputs = true ∧ rigidTyEq srcOutput dstOutput = true := by
+  rcases srcTyOpt with _ | ⟨kind, lIdx⟩
+  · exact ⟨fun _ => Or.inl rfl, fun _ => rfl⟩
+  · cases kind
+    case fnPtr srcInputs srcOutput safety srcAbi =>
+      cases safety
+      case safe =>
+        show Bool.and (callConvEq srcAbi dstAbi)
+            (Bool.and (rigidTyListEq srcInputs dstInputs) (rigidTyEq srcOutput dstOutput)) =
+            true ↔ _
+        cases hA : callConvEq srcAbi dstAbi
+        · have hne : srcAbi ≠ dstAbi := fun h => by
+            subst h
+            rw [(callConvEq_eq_true_iff _ _).mpr rfl] at hA
+            cases hA
+          exact ⟨fun h => (by cases h), fun h => (by
+            rcases h with h | ⟨_, _, _, h, _⟩
+            · cases h
+            · cases h
+              exact absurd rfl hne)⟩
+        · have heq : srcAbi = dstAbi := (callConvEq_eq_true_iff _ _).mp hA
+          subst heq
+          cases hI : rigidTyListEq srcInputs dstInputs
+          · exact ⟨fun h => (by cases h), fun h => (by
+              rcases h with h | ⟨_, _, _, h, hI', _⟩
+              · cases h
+              · cases h
+                rw [hI] at hI'
+                cases hI')⟩
+          · cases hO : rigidTyEq srcOutput dstOutput
+            · exact ⟨fun h => (by cases h), fun h => (by
+                rcases h with h | ⟨_, _, _, h, _, hO'⟩
+                · cases h
+                · cases h
+                  rw [hO] at hO'
+                  cases hO')⟩
+            · exact ⟨fun _ => Or.inr ⟨srcInputs, srcOutput, lIdx, rfl, hI, hO⟩, fun _ => rfl⟩
+      case unsafe_ =>
+        exact ⟨fun h => (by cases h), fun h => (by
+          rcases h with h | ⟨_, _, _, h, _⟩ <;> cases h)⟩
+    all_goals
+      exact ⟨fun h => (by cases h), fun h => (by
+        rcases h with h | ⟨_, _, _, h, _⟩ <;> cases h)⟩
+
+/-- Registry condition of `UnsafeFnPointer` (structural reading of `evalUnsafeFnPointer`): with an
+empty `mem.fnPtrs` table the allocation must lie in the synthetic function-pointer range; otherwise it
+must be registered, and its recorded signature (if any) must be a *safe* `fn` pointer with the target's
+ABI and (fuel-bounded) equal inputs and output. -/
+def unsafeFnPtrRegistryOk (fnPtrs : List FnPtrEntry) (allocId : Nat) (dstInputs : List RigidTy)
+    (dstOutput : RigidTy) (dstAbi : CallConv) : Prop :=
+  (fnPtrs = .nil ∧ isFnPtrAllocId allocId = true) ∨
+    (fnPtrs ≠ .nil ∧ ∃ entry, lookupFnPtr fnPtrs allocId = .some entry ∧
+      (entry.fnSig = .none ∨
+        ∃ sigInputs sigOutput, entry.fnSig = .some (.fnPtr sigInputs sigOutput .safe dstAbi) ∧
+          rigidTyListEq sigInputs dstInputs = true ∧ rigidTyEq sigOutput dstOutput = true))
+
+/-- **Structural form of `unsafeFnPtrValid`**: an 8-byte (`sz = 8`), offset-0, unborrowed pointer
+satisfying `unsafeFnPtrRegistryOk`. -/
+theorem unsafeFnPtrValid_eq_true_iff (mem : Memory) (ptrVal : ProvenancePtr) (sz : Nat)
+    (dstInputs : List RigidTy) (dstOutput : RigidTy) (dstAbi : CallConv) :
+    unsafeFnPtrValid mem ptrVal sz dstInputs dstOutput dstAbi = true ↔
+      sz = 8 ∧ ptrVal.offsetBytes = 0 ∧ lookupBorrow mem.borrows ptrVal.tag = .none ∧
+        unsafeFnPtrRegistryOk mem.fnPtrs ptrVal.allocId dstInputs dstOutput dstAbi := by
+  unfold unsafeFnPtrValid unsafeFnPtrRegistryOk
+  cases hSz : Nat.beq sz 8
+  · have hne : sz ≠ 8 := fun h => by rw [h] at hSz; cases hSz
+    exact ⟨fun h => (by cases h), fun h => absurd h.1 hne⟩
+  · have hsz : sz = 8 := Nat.eq_of_beq_eq_true hSz
+    cases hOff : Nat.beq ptrVal.offsetBytes 0
+    · have hne : ptrVal.offsetBytes ≠ 0 := fun h => by rw [h] at hOff; cases hOff
+      exact ⟨fun h => (by cases h), fun h => absurd h.2.1 hne⟩
+    · have hoff : ptrVal.offsetBytes = 0 := Nat.eq_of_beq_eq_true hOff
+      cases hB : lookupBorrow mem.borrows ptrVal.tag
+      · cases hF : mem.fnPtrs
+        · exact ⟨fun h => ⟨hsz, hoff, rfl, Or.inl ⟨rfl, h⟩⟩,
+            fun ⟨_, _, _, h⟩ => h.elim (fun h => h.2) (fun h => absurd rfl h.1)⟩
+        · rename_i e es
+          have hcons : e :: es ≠ .nil := fun h => by cases h
+          cases hL : lookupFnPtr (e :: es) ptrVal.allocId
+          · exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim (fun h => absurd h.1 hcons)
+              (fun ⟨_, _, hE, _⟩ => (by cases hE))⟩
+          · rename_i entry
+            dsimp only
+            cases hS : entry.fnSig
+            · exact ⟨fun _ => ⟨hsz, hoff, rfl, Or.inr ⟨hcons, entry, rfl, Or.inl hS⟩⟩,
+                fun _ => rfl⟩
+            · rename_i k
+              cases k
+              case fnPtr sigInputs sigOutput safety sigAbi =>
+                cases safety
+                case safe =>
+                  show Bool.and (callConvEq sigAbi dstAbi)
+                      (Bool.and (rigidTyListEq sigInputs dstInputs) (rigidTyEq sigOutput dstOutput)) =
+                      true ↔ _
+                  cases hA : callConvEq sigAbi dstAbi
+                  · exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim
+                      (fun h => absurd h.1 hcons) (fun ⟨_, _, hE, hSig⟩ => (by
+                        cases hE
+                        rcases hSig with h | ⟨_, _, h, _, _⟩
+                        · rw [hS] at h
+                          cases h
+                        · rw [hS] at h
+                          cases h
+                          rw [(callConvEq_eq_true_iff _ _).mpr rfl] at hA
+                          cases hA))⟩
+                  · have heq : sigAbi = dstAbi := (callConvEq_eq_true_iff _ _).mp hA
+                    subst heq
+                    cases hI : rigidTyListEq sigInputs dstInputs
+                    · exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim
+                        (fun h => absurd h.1 hcons) (fun ⟨_, _, hE, hSig⟩ => (by
+                          cases hE
+                          rcases hSig with h | ⟨_, _, h, hI', _⟩
+                          · rw [hS] at h
+                            cases h
+                          · rw [hS] at h
+                            cases h
+                            rw [hI] at hI'
+                            cases hI'))⟩
+                    · cases hO : rigidTyEq sigOutput dstOutput
+                      · exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim
+                          (fun h => absurd h.1 hcons) (fun ⟨_, _, hE, hSig⟩ => (by
+                            cases hE
+                            rcases hSig with h | ⟨_, _, h, _, hO'⟩
+                            · rw [hS] at h
+                              cases h
+                            · rw [hS] at h
+                              cases h
+                              rw [hO] at hO'
+                              cases hO'))⟩
+                      · exact ⟨fun _ => ⟨hsz, hoff, rfl, Or.inr ⟨hcons, entry, rfl,
+                          Or.inr ⟨sigInputs, sigOutput, hS, hI, hO⟩⟩⟩, fun _ => rfl⟩
+                case unsafe_ =>
+                  exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim
+                    (fun h => absurd h.1 hcons) (fun ⟨_, _, hE, hSig⟩ => (by
+                      cases hE
+                      rcases hSig with h | ⟨_, _, h, _, _⟩ <;> rw [hS] at h <;> cases h))⟩
+              all_goals
+                exact ⟨fun h => (by cases h), fun ⟨_, _, _, h⟩ => h.elim
+                  (fun h => absurd h.1 hcons) (fun ⟨_, _, hE, hSig⟩ => (by
+                    cases hE
+                    rcases hSig with h | ⟨_, _, h, _, _⟩ <;> rw [hS] at h <;> cases h))⟩
+      · exact ⟨fun h => (by cases h), fun h => (by cases h.2.2.1)⟩
+
+/-- **`UnsafeFnPointer` fully structural two-sided characterization** (on `evalRvalue`): coercing a
+function pointer `.ptr ptrVal sz` to `unsafe fn(dstInputs) -> dstOutput` (ABI `dstAbi`) succeeds with
+`.ptr ptrVal 8` iff `dstAbi ≠ rustIntrinsic`, the source type is unknown or a *safe* `fn` pointer
+with ABI `dstAbi` and equal signature, `sz = 8`, `ptrVal.offsetBytes = 0`, the pointer is unborrowed,
+and `unsafeFnPtrRegistryOk` holds; it faults with `.ub` otherwise. -/
+theorem trusted_evalRvalue_unsafeFnPointer_structural_iff
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
+    (dstInputs : List RigidTy) (dstOutput : RigidTy) (dstAbi : CallConv)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal sz) locals')
+    (hTy : targetTy.kind = .fnPtr dstInputs dstOutput .unsafe_ dstAbi) :
+    (evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op targetTy) mem localDecls
+        layouts = .ok (.ptr ptrVal 8) locals' mem ↔
+      (dstAbi ≠ .rustIntrinsic ∧
+        (operandTy localDecls layouts op = .none ∨
+          ∃ srcInputs srcOutput lIdx,
+            operandTy localDecls layouts op =
+              .some { kind := .fnPtr srcInputs srcOutput .safe dstAbi, layoutIdx := lIdx } ∧
+            rigidTyListEq srcInputs dstInputs = true ∧ rigidTyEq srcOutput dstOutput = true) ∧
+        sz = 8 ∧ ptrVal.offsetBytes = 0 ∧ lookupBorrow mem.borrows ptrVal.tag = .none ∧
+        unsafeFnPtrRegistryOk mem.fnPtrs ptrVal.allocId dstInputs dstOutput dstAbi)) ∧
+    (evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op targetTy) mem localDecls
+        layouts = .ub ↔
+      ¬ (dstAbi ≠ .rustIntrinsic ∧
+        (operandTy localDecls layouts op = .none ∨
+          ∃ srcInputs srcOutput lIdx,
+            operandTy localDecls layouts op =
+              .some { kind := .fnPtr srcInputs srcOutput .safe dstAbi, layoutIdx := lIdx } ∧
+            rigidTyListEq srcInputs dstInputs = true ∧ rigidTyEq srcOutput dstOutput = true) ∧
+        sz = 8 ∧ ptrVal.offsetBytes = 0 ∧ lookupBorrow mem.borrows ptrVal.tag = .none ∧
+        unsafeFnPtrRegistryOk mem.fnPtrs ptrVal.allocId dstInputs dstOutput dstAbi)) := by
+  have h := trusted_evalRvalue_unsafeFnPointer_iff locals locals' op targetTy mem localDecls layouts
+    ptrVal sz dstInputs dstOutput dstAbi hOp hTy
+  rw [callConvEq_rustIntrinsic_eq_false_iff, unsafeFnPtrSrcTyValid_eq_true_iff,
+    unsafeFnPtrValid_eq_true_iff] at h
+  exact h
 
 /-! ### 9.5 `evalCastPtrToPtr` & `evalRvalue (.cast .ptrToPtr ...)` Wide-Pointer Refinement -/
 
