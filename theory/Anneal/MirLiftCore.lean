@@ -7300,3 +7300,2348 @@ theorem verify_witnessSharedReturnDag_via_isCfgDag_induct :
 end MirLiftReadyWitness
 
 end Anneal.MirLiftCore
+
+namespace Anneal.MirLiftCore
+
+open Trusted.Effect
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.VerificationResult
+open Anneal.MirFuelFree
+open Anneal.PureMirExec
+open Anneal.Rustc.V2026_06_01.SymbolicEval
+
+/-!
+## Single-Pass Bounds-Checked Slot Normalization (`setSpineChecked?` & `forcePureEnv`)
+-/
+
+section ForcePureEnv
+
+/-- Projection of the `n`-slot prefix of a frame, padding missing slots with `d`.
+Pattern-matches on `env` once per slot so symbolic frames are never duplicated
+across `headD`/`tail` projections. -/
+def forcePureEnvD {α : Type} (d : α) : Nat → List α → List α
+  | 0, _ => []
+  | n + 1, [] => d :: forcePureEnvD d n []
+  | n + 1, x :: xs => x :: forcePureEnvD d n xs
+
+/-- **`forcePureEnv`**: projection-based normalization of the `n`-slot prefix. -/
+def forcePureEnv {α : Type} [Inhabited α] (n : Nat) (env : List α) : List α :=
+  forcePureEnvD default n env
+
+theorem length_forcePureEnvD {α : Type} (d : α) :
+    ∀ (n : Nat) (env : List α), (forcePureEnvD d n env).length = n
+  | 0, _ => rfl
+  | n + 1, [] => by simp only [forcePureEnvD, List.length_cons, length_forcePureEnvD d n []]
+  | n + 1, _ :: xs => by simp only [forcePureEnvD, List.length_cons, length_forcePureEnvD d n xs]
+
+theorem forcePureEnvD_eq_self {α : Type} (d : α) :
+    ∀ (n : Nat) (env : List α), env.length = n → forcePureEnvD d n env = env
+  | 0, [], _ => rfl
+  | 0, _ :: _, h => absurd h (Nat.succ_ne_zero _)
+  | n + 1, [], h => absurd h.symm (Nat.succ_ne_zero n)
+  | n + 1, _ :: xs, h => by
+    have h' : xs.length = n := Nat.succ.inj h
+    simp only [forcePureEnvD, forcePureEnvD_eq_self d n xs h']
+
+/-- **Exact identity on well-sized frames**. -/
+theorem forcePureEnv_eq_self {α : Type} [Inhabited α] (n : Nat) (env : List α)
+    (h : env.length = n) : forcePureEnv n env = env :=
+  forcePureEnvD_eq_self default n env h
+
+/-- Closed form under arbitrary frame lengths (truncates when `n < env.length`
+and pads with `n - env.length` copies of `d` when `env.length < n`). -/
+theorem forcePureEnvD_eq_take_append_replicate {α : Type} (d : α) :
+    ∀ (n : Nat) (env : List α),
+      forcePureEnvD d n env = env.take n ++ List.replicate (n - env.length) d
+  | 0, _ => by
+    simp only [forcePureEnvD, List.take_zero, Nat.zero_sub, List.replicate_zero, List.append_nil]
+  | n + 1, [] => by
+    simp only [forcePureEnvD, List.take_nil, List.nil_append, List.length_nil, Nat.sub_zero,
+      List.replicate_succ, forcePureEnvD_eq_take_append_replicate d n []]
+  | n + 1, _ :: xs => by
+    simp only [forcePureEnvD, List.take_succ_cons, List.cons_append, List.length_cons,
+      Nat.succ_sub_succ_eq_sub, forcePureEnvD_eq_take_append_replicate d n xs]
+
+/-- **Length-mismatch failure**: when `env.length ≠ n`, `forcePureEnv n env`
+differs from `env`. -/
+theorem forcePureEnv_ne_self_of_length_ne {α : Type} [Inhabited α] {n : Nat} {env : List α}
+    (hne : env.length ≠ n) : forcePureEnv n env ≠ env := by
+  intro heq
+  have hlen := congrArg List.length heq
+  rw [forcePureEnv, length_forcePureEnvD] at hlen
+  exact hne hlen.symm
+
+/-- **Exact biconditional**: `forcePureEnv n env = env` iff `env.length = n`. -/
+theorem forcePureEnv_eq_self_iff {α : Type} [Inhabited α] (n : Nat) (env : List α) :
+    forcePureEnv n env = env ↔ env.length = n :=
+  ⟨fun h => by
+    have hlen := congrArg List.length h
+    rw [forcePureEnv, length_forcePureEnvD] at hlen
+    exact hlen.symm,
+   forcePureEnv_eq_self n env⟩
+
+theorem getD_zero_eq_headD {α : Type} (env : List α) (d : α) : env.getD 0 d = env.headD d := by
+  cases env <;> rfl
+
+theorem getD_succ_eq_tail {α : Type} (env : List α) (i : Nat) (d : α) :
+    env.getD (i + 1) d = env.tail.getD i d := by
+  cases env <;> rfl
+
+theorem getElem?_forcePureEnvD {α : Type} (d : α) :
+    ∀ (n : Nat) (env : List α) (i : Nat),
+      (forcePureEnvD d n env)[i]? = if i < n then some (env.getD i d) else none
+  | 0, _, _ => by simp [forcePureEnvD]
+  | n + 1, [], 0 => by
+    simp only [forcePureEnvD, List.getElem?_cons_zero, List.getD_nil, Nat.zero_lt_succ, ↓reduceIte]
+  | n + 1, _ :: _, 0 => by
+    simp only [forcePureEnvD, List.getElem?_cons_zero, List.getD_cons_zero, Nat.zero_lt_succ, ↓reduceIte]
+  | n + 1, [], i + 1 => by
+    simp only [forcePureEnvD, List.getElem?_cons_succ, getElem?_forcePureEnvD d n [] i,
+      List.getD_nil, Nat.add_lt_add_iff_right]
+  | n + 1, _ :: xs, i + 1 => by
+    simp only [forcePureEnvD, List.getElem?_cons_succ, getElem?_forcePureEnvD d n xs i,
+      List.getD_cons_succ, Nat.add_lt_add_iff_right]
+
+/-- **Slot projection**: reads through `forcePureEnv` are slot reads. -/
+theorem getElem?_forcePureEnv {α : Type} [Inhabited α] (n : Nat) (env : List α) (i : Nat) :
+    (forcePureEnv n env)[i]? = if i < n then some (env.getD i default) else none :=
+  getElem?_forcePureEnvD default n env i
+
+theorem forcePureEnvD_set_comm {α : Type} (d : α) :
+    ∀ (n : Nat) (env : List α) (i : Nat) (v : α), (i < env.length ∨ n ≤ i) →
+      forcePureEnvD d n (env.set i v) = (forcePureEnvD d n env).set i v
+  | 0, _, _, _, _ => rfl
+  | n + 1, [], i, v, h => by
+    have hi : n + 1 ≤ i := by
+      rcases h with h | h
+      · exact absurd h (Nat.not_lt_zero i)
+      · exact h
+    rw [List.set_eq_of_length_le (by simp), List.set_eq_of_length_le (by rw [length_forcePureEnvD]; exact hi)]
+  | n + 1, _ :: _, 0, _, _ => rfl
+  | n + 1, _ :: xs, i + 1, v, h => by
+    have h' : i < xs.length ∨ n ≤ i := by
+      rcases h with h | h
+      · left; simpa using h
+      · right; omega
+    simp only [List.set_cons_succ, forcePureEnvD, forcePureEnvD_set_comm d n xs i v h']
+
+/-- **Projection commutes with in-range slot updates**. The side condition is
+necessary (see `forcePureEnv_set_comm_counterexample`). -/
+theorem forcePureEnv_set_comm {α : Type} [Inhabited α] (n : Nat) (env : List α) (i : Nat) (v : α)
+    (h : i < env.length ∨ n ≤ i) :
+    forcePureEnv n (env.set i v) = (forcePureEnv n env).set i v :=
+  forcePureEnvD_set_comm default n env i v h
+
+/-- Without the side condition the commutation fails: updating a padding slot. -/
+theorem forcePureEnv_set_comm_counterexample :
+    forcePureEnv 2 (([] : List Nat).set 0 5) ≠ (forcePureEnv 2 ([] : List Nat)).set 0 5 := by
+  decide
+
+/-- Collapse lemma: a chain equals its projection-normal form. -/
+theorem eq_of_forcePureEnv {α : Type} [Inhabited α] {n : Nat} {chain flat : List α}
+    (hlen : chain.length = n) (h : forcePureEnv n chain = flat) : chain = flat := by
+  rw [← h, forcePureEnv_eq_self n chain hlen]
+
+/-- **Symbolic chained-update collapse by `rfl`**: four nested `List.set`
+updates over symbolic slot values collapse to one flat list literal by kernel
+reduction of the projection, without `List.set` commutation `simp` lemmas. -/
+theorem chained_sets_collapse_rfl (a b c d x y z : Nat) :
+    (((([a, b, c, d].set 0 x).set 2 y).set 0 z).set 3 (x + y)) = [z, b, y, x + y] :=
+  eq_of_forcePureEnv (n := 4) rfl rfl
+
+/-- Spine-forcing normalizer (the generic form of `forcePureEnv?`): reducing
+`forceSpine? l` to `some _` materializes the whole list spine in one pass. -/
+def forceSpine? {α : Type} : List α → Option (List α)
+  | [] => some []
+  | x :: xs =>
+    match forceSpine? xs with
+    | some ys => some (x :: ys)
+    | none => none
+
+theorem forceSpine?_eq_some {α : Type} : ∀ (l : List α), forceSpine? l = some l
+  | [] => rfl
+  | _ :: xs => by simp only [forceSpine?, forceSpine?_eq_some xs]
+
+theorem forceSpine?_eq_some_forcePureEnv {α : Type} [Inhabited α] (l : List α) :
+    forceSpine? l = some (forcePureEnv l.length l) := by
+  rw [forceSpine?_eq_some, forcePureEnv_eq_self l.length l rfl]
+
+/-- Single-pass spine-forcing slot update: forces the list spine up to index `i`
+and stops at `0` (`some (v :: xs)`), avoiding a second full-list traversal over
+the untouched suffix `xs`. -/
+def setSpine? {α : Type} : List α → Nat → α → Option (List α)
+  | [], _, _ => some []
+  | _ :: xs, 0, v => some (v :: xs)
+  | x :: xs, i + 1, v =>
+    match setSpine? xs i v with
+    | some xs' => some (x :: xs')
+    | none => none
+
+theorem setSpine?_eq_some_set {α : Type} :
+    ∀ (env : List α) (i : Nat) (v : α), setSpine? env i v = some (env.set i v)
+  | [], _, _ => rfl
+  | _ :: _, 0, _ => rfl
+  | _ :: xs, i + 1, v => by simp only [setSpine?, setSpine?_eq_some_set xs i v, List.set_cons_succ]
+
+theorem setSpine?_eq_forceSpine?_set {α : Type} (env : List α) (i : Nat) (v : α) :
+    setSpine? env i v = forceSpine? (env.set i v) := by
+  rw [setSpine?_eq_some_set, forceSpine?_eq_some]
+
+/-- Sequential local updates (`env[i₁] := v₁; …; env[i_K] := v_K`). -/
+def applySlotUpdates {α : Type} (env : List α) (ups : List (Nat × α)) : List α :=
+  ups.foldl (fun e u => e.set u.1 u.2) env
+
+/-- Step-wise normalized execution: after every update the modified prefix spine
+is forced via `setSpine?`, so the next update always acts on a flat literal. -/
+def applySlotUpdatesForced {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match setSpine? env u.1 u.2 with
+    | some env' => applySlotUpdatesForced ups env'
+    | none => none
+
+theorem applySlotUpdatesForced_eq {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α),
+      applySlotUpdatesForced ups env = some (applySlotUpdates env ups)
+  | [], _ => rfl
+  | _ :: ups, _ => by
+    simp only [applySlotUpdatesForced, setSpine?_eq_some_set, applySlotUpdates, List.foldl]
+    exact applySlotUpdatesForced_eq ups _
+
+/-- Soundness of step-wise normalization: a `rfl` proof of the forced run
+proves the unnormalized update sequence. -/
+theorem applySlotUpdates_eq_of_forced {α : Type} {env flat : List α} {ups : List (Nat × α)}
+    (h : applySlotUpdatesForced ups env = some flat) : applySlotUpdates env ups = flat := by
+  rw [applySlotUpdatesForced_eq] at h
+  exact Option.some.inj h
+
+theorem length_applySlotUpdates {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α), (applySlotUpdates env ups).length = env.length
+  | [], _ => rfl
+  | u :: ups, env => by
+    simp only [applySlotUpdates, List.foldl] at *
+    rw [show List.foldl (fun e u => e.set u.1 u.2) (env.set u.1 u.2) ups =
+      applySlotUpdates (env.set u.1 u.2) ups from rfl, length_applySlotUpdates ups, List.length_set]
+
+/-- **Single-pass forcing is `forcePureEnv`-normalization of the update**:
+`setSpine?` returns exactly the `forcePureEnv` normal form of `env.set i v`. -/
+theorem setSpine?_eq_some_forcePureEnv_set {α : Type} [Inhabited α] (env : List α) (i : Nat)
+    (v : α) : setSpine? env i v = some (forcePureEnv env.length (env.set i v)) := by
+  rw [setSpine?_eq_some_set, forcePureEnv_eq_self env.length (env.set i v) List.length_set]
+
+/-- **The step-wise run computes the `forcePureEnv` normal form** of the
+unnormalized update sequence (`applySlotUpdates`). -/
+theorem applySlotUpdatesForced_eq_forcePureEnv {α : Type} [Inhabited α] (ups : List (Nat × α))
+    (env : List α) :
+    applySlotUpdatesForced ups env = some (forcePureEnv env.length (applySlotUpdates env ups)) := by
+  rw [applySlotUpdatesForced_eq, forcePureEnv_eq_self env.length _ (length_applySlotUpdates ups env)]
+
+/-- Twelve symbolic updates collapse by `rfl` through step-wise forcing. -/
+theorem slotUpdates_collapse_forced (a₀ a₁ a₂ a₃ a₄ a₅ x₁ x₂ x₃ x₄ x₅ x₆ : Nat) :
+    applySlotUpdates [a₀, a₁, a₂, a₃, a₄, a₅]
+      [(3, x₁), (0, x₂), (3, x₃), (5, x₄), (1, x₅), (0, x₆),
+       (2, x₁ + x₂), (4, x₃), (5, x₆), (1, x₂), (3, x₄), (0, x₅)] =
+      [x₅, x₂, x₁ + x₂, x₄, x₃, x₆] :=
+  applySlotUpdates_eq_of_forced rfl
+
+/-- Specialization of `forcePureEnv` to `PureEnv` (`List SlotState`), padding
+with `.uninit`. -/
+def forcePureEnvSlots (n : Nat) (env : PureEnv) : PureEnv :=
+  forcePureEnvD LocalSlot.uninit n env
+
+theorem forcePureEnvSlots_eq_self (env : PureEnv) :
+    forcePureEnvSlots env.length env = env :=
+  forcePureEnvD_eq_self _ env.length env rfl
+
+/-- **Bridge to `forcePureEnv?`**: the generic spine forcer agrees with
+`forcePureEnv?` on every `PureEnv`. -/
+theorem forceSpine?_eq_live (env : PureEnv) :
+    forceSpine? env = forcePureEnv? env := by
+  rw [forceSpine?_eq_some, forcePureEnv?_eq_some]
+
+/-- Bridge to the trusted `Trusted.Sequence.set?` used by `evalPureStmt`:
+a successful slot update commutes with the projection. -/
+theorem forcePureEnvSlots_set? {env env' : PureEnv} {loc : Nat}
+    {s : LocalSlot}
+    (h : Trusted.Sequence.set? env loc s = some env') :
+    forcePureEnvSlots env.length env' = (forcePureEnvSlots env.length env).set loc s := by
+  unfold Trusted.Sequence.set? at h
+  by_cases hlt : loc < env.length
+  · rw [ite_eq_left hlt] at h
+    cases h
+    exact forcePureEnvD_set_comm _ env.length env loc s (Or.inl hlt)
+  · rw [ite_eq_right hlt] at h
+    cases h
+
+/-- **Bridge from the trusted slot update `Trusted.Sequence.set?`** to
+single-pass forcing: in range the update *is* `setSpine?`, out of range it fails. -/
+theorem liveSet?_eq_setSpine? {α : Type} (env : List α) (loc : Nat) (v : α) :
+    Trusted.Sequence.set? env loc v = if loc < env.length then setSpine? env loc v else none := by
+  unfold Trusted.Sequence.set?
+  rw [setSpine?_eq_some_set]
+
+/-- Sequential slot updates through `Trusted.Sequence.set?` (failing on the
+first out-of-range slot). -/
+def applySlotUpdatesLive? {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match Trusted.Sequence.set? env u.1 u.2 with
+    | some env' => applySlotUpdatesLive? ups env'
+    | none => none
+
+/-- **Live update chains are computed by the step-wise forced run**: when every
+updated slot is in range, the `Trusted.Sequence.set?` chain equals
+`applySlotUpdatesForced`. -/
+theorem applySlotUpdatesLive?_eq_forced {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α), (∀ u ∈ ups, u.1 < env.length) →
+      applySlotUpdatesLive? ups env = applySlotUpdatesForced ups env
+  | [], _, _ => rfl
+  | u :: ups, env, h => by
+    have hu : u.1 < env.length := h u (List.mem_cons_self ..)
+    have hrest : ∀ w ∈ ups, w.1 < (env.set u.1 u.2).length := fun w hw => by
+      rw [List.length_set]
+      exact h w (List.mem_cons_of_mem _ hw)
+    have hlive : Trusted.Sequence.set? env u.1 u.2 = some (env.set u.1 u.2) := by
+      unfold Trusted.Sequence.set?
+      rw [ite_eq_left hu]
+    simp only [applySlotUpdatesLive?, applySlotUpdatesForced, hlive, setSpine?_eq_some_set]
+    exact applySlotUpdatesLive?_eq_forced ups (env.set u.1 u.2) hrest
+
+/-- An out-of-range update makes `applySlotUpdatesLive?` fail. -/
+theorem applySlotUpdatesLive?_oob {α : Type} (u : Nat × α) (ups : List (Nat × α)) (env : List α)
+    (h : env.length ≤ u.1) : applySlotUpdatesLive? (u :: ups) env = none := by
+  have hlive : Trusted.Sequence.set? env u.1 u.2 = none := by
+    unfold Trusted.Sequence.set?
+    rw [ite_eq_right (Nat.not_lt.mpr h)]
+  simp only [applySlotUpdatesLive?, hlive]
+
+/-- Two-pass step-wise forcing with the structure of `evalPureStmtNorm` /
+`set?_of_forcePureEnv?`: a bounds-checked `Trusted.Sequence.set?` followed by
+a full spine-forcing pass (`forceSpine?`). -/
+def applySlotUpdatesTwoPass {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match (Trusted.Sequence.set? env u.1 u.2).bind forceSpine? with
+    | some env' => applySlotUpdatesTwoPass ups env'
+    | none => none
+
+/-- The two-pass run computes the `Trusted.Sequence.set?` chain. -/
+theorem applySlotUpdatesTwoPass_eq_live? {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α),
+      applySlotUpdatesTwoPass ups env = applySlotUpdatesLive? ups env
+  | [], _ => rfl
+  | u :: ups, env => by
+    cases h : Trusted.Sequence.set? env u.1 u.2 with
+    | none => simp only [applySlotUpdatesTwoPass, applySlotUpdatesLive?, h, Option.bind_none]
+    | some e =>
+      simp only [applySlotUpdatesTwoPass, applySlotUpdatesLive?, h, Option.bind_some, forceSpine?_eq_some]
+      exact applySlotUpdatesTwoPass_eq_live? ups e
+
+/-- **Soundness of the two-pass strategy**: a successful run proves the
+unnormalized update sequence. -/
+theorem applySlotUpdates_eq_of_twoPass {α : Type} :
+    ∀ {ups : List (Nat × α)} {env flat : List α},
+      applySlotUpdatesTwoPass ups env = some flat → applySlotUpdates env ups = flat
+  | [], _, _, h => Option.some.inj h
+  | u :: ups, env, _, h => by
+    have hset : ∀ e, Trusted.Sequence.set? env u.1 u.2 = some e → e = env.set u.1 u.2 := by
+      intro e he
+      unfold Trusted.Sequence.set? at he
+      by_cases hlt : u.1 < env.length
+      · rw [ite_eq_left hlt] at he
+        exact (Option.some.inj he).symm
+      · rw [ite_eq_right hlt] at he
+        cases he
+    cases hs : Trusted.Sequence.set? env u.1 u.2 with
+    | none => simp only [applySlotUpdatesTwoPass, hs, Option.bind_none] at h; cases h
+    | some e =>
+      simp only [applySlotUpdatesTwoPass, hs, Option.bind_some, forceSpine?_eq_some] at h
+      rw [show applySlotUpdates env (u :: ups) = applySlotUpdates (env.set u.1 u.2) ups from rfl,
+        ← hset e hs]
+      exact applySlotUpdates_eq_of_twoPass h
+
+/-- Single-pass constructor-forcing slot update over `PureEnv` (`List LocalSlot`):
+checks bounds like `Trusted.Sequence.set?`, forces both the `List` spine and
+`LocalSlot` constructors (`.dead`, `.uninit`, `.init v`) along `[0..loc]`, and
+stops at `loc` without a second pass over the tail. -/
+def setPureEnvSlot? : PureEnv → Nat → LocalSlot → Option PureEnv
+  | [], _, _ => none
+  | _ :: rest, 0, .dead => some (.dead :: rest)
+  | _ :: rest, 0, .uninit => some (.uninit :: rest)
+  | _ :: rest, 0, .init v => some (.init v :: rest)
+  | .dead :: rest, i + 1, s =>
+    match setPureEnvSlot? rest i s with
+    | some rest' => some (.dead :: rest')
+    | none => none
+  | .uninit :: rest, i + 1, s =>
+    match setPureEnvSlot? rest i s with
+    | some rest' => some (.uninit :: rest')
+    | none => none
+  | .init v :: rest, i + 1, s =>
+    match setPureEnvSlot? rest i s with
+    | some rest' => some (.init v :: rest')
+    | none => none
+
+/-- **Single-pass `setPureEnvSlot?` equals `Trusted.Sequence.set?`**. -/
+theorem setPureEnvSlot?_eq_set? :
+    ∀ (env : PureEnv) (loc : Nat) (s : LocalSlot),
+      setPureEnvSlot? env loc s = Trusted.Sequence.set? env loc s
+  | [], _, _ => by
+    simp [setPureEnvSlot?, Trusted.Sequence.set?]
+  | x :: rest, 0, s => by
+    unfold Trusted.Sequence.set?
+    have h0 : 0 < (x :: rest).length := Nat.zero_lt_succ rest.length
+    rw [ite_eq_left h0]
+    cases s <;> rfl
+  | x :: rest, i + 1, s => by
+    have ih := setPureEnvSlot?_eq_set? rest i s
+    unfold Trusted.Sequence.set? at ih ⊢
+    by_cases hlt : i < rest.length
+    · have hlt' : i + 1 < (x :: rest).length := Nat.succ_lt_succ hlt
+      rw [ite_eq_left hlt] at ih
+      rw [ite_eq_left hlt']
+      cases x <;> simp only [setPureEnvSlot?, ih, List.set_cons_succ]
+    · have hlt' : ¬ i + 1 < (x :: rest).length := fun h => hlt (Nat.lt_of_succ_lt_succ h)
+      rw [ite_eq_right hlt] at ih
+      rw [ite_eq_right hlt']
+      cases x <;> simp only [setPureEnvSlot?, ih]
+
+/-- **Single-pass `setPureEnvSlot?` equals `(set? env loc s).bind forcePureEnv?`**. -/
+theorem setPureEnvSlot?_eq_live_bind_forcePureEnv? (env : PureEnv)
+    (loc : Nat) (s : LocalSlot) :
+    setPureEnvSlot? env loc s =
+      (Trusted.Sequence.set? env loc s).bind forcePureEnv? := by
+  rw [setPureEnvSlot?_eq_set?]
+  cases Trusted.Sequence.set? env loc s with
+  | none => rfl
+  | some env' => exact (forcePureEnv?_eq_some env').symm
+
+/-- **Bridge from `evalPureStmtNorm` to `forceSpine?`**:
+`evalPureStmtNorm` equals `evalPureStmt` followed by `forceSpine?`. -/
+theorem evalPureStmtNorm_eq_bind_forceSpine?
+    (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (env : PureEnv) (stmt : Statement) :
+    evalPureStmtNorm body bbIdx stmtIdx env stmt =
+      (evalPureStmt body bbIdx stmtIdx env stmt).bind forceSpine? := by
+  unfold evalPureStmtNorm
+  cases evalPureStmt body bbIdx stmtIdx env stmt with
+  | none => rfl
+  | some rawEnv => exact (forceSpine?_eq_live rawEnv).symm
+
+/-- **Bounds-checked single-pass spine-forcing slot update**: returns `none`
+out of bounds and forces the modified prefix `[0..loc]` in a single pass
+without calling `env.length`, traversing the suffix `[loc+1..)`, or
+pattern-matching on untouched `LocalSlot` elements. -/
+def setSpineChecked? {α : Type} : List α → Nat → α → Option (List α)
+  | [], _, _ => none
+  | _ :: xs, 0, v => some (v :: xs)
+  | x :: xs, i + 1, v =>
+    match setSpineChecked? xs i v with
+    | some xs' => some (x :: xs')
+    | none => none
+
+/-- **Exact unconditional agreement with `Trusted.Sequence.set?`**:
+`setSpineChecked?` equals `Trusted.Sequence.set?` on every list and index
+(both in-bounds and out-of-bounds, with no `loc < env.length` side condition). -/
+theorem setSpineChecked?_eq_live_set? {α : Type} :
+    ∀ (env : List α) (loc : Nat) (v : α),
+      setSpineChecked? env loc v = Trusted.Sequence.set? env loc v
+  | [], _, _ => by
+    simp [setSpineChecked?, Trusted.Sequence.set?]
+  | x :: xs, 0, _ => by
+    unfold Trusted.Sequence.set?
+    have h0 : 0 < (x :: xs).length := Nat.zero_lt_succ xs.length
+    rw [ite_eq_left h0]
+    rfl
+  | x :: xs, i + 1, v => by
+    have ih := setSpineChecked?_eq_live_set? xs i v
+    unfold Trusted.Sequence.set? at ih ⊢
+    by_cases hlt : i < xs.length
+    · have hlt' : i + 1 < (x :: xs).length := Nat.succ_lt_succ hlt
+      rw [ite_eq_left hlt] at ih
+      rw [ite_eq_left hlt']
+      simp only [setSpineChecked?, ih, List.set_cons_succ]
+    · have hlt' : ¬ i + 1 < (x :: xs).length := fun h => hlt (Nat.lt_of_succ_lt_succ h)
+      rw [ite_eq_right hlt] at ih
+      rw [ite_eq_right hlt']
+      simp only [setSpineChecked?, ih]
+
+/-- **Drop-in single-pass replacement for `(set? env loc s).bind forcePureEnv?`**
+that also reduces when untouched prefix slots are symbolic `LocalSlot` variables. -/
+theorem setSpineChecked?_eq_live_bind_forcePureEnv? (env : PureEnv)
+    (loc : Nat) (s : LocalSlot) :
+    setSpineChecked? env loc s =
+      (Trusted.Sequence.set? env loc s).bind forcePureEnv? := by
+  rw [setSpineChecked?_eq_live_set?]
+  cases Trusted.Sequence.set? env loc s with
+  | none => rfl
+  | some env' => exact (forcePureEnv?_eq_some env').symm
+
+/-- **Symbolic `LocalSlot` framing by `rfl`**: unlike `forcePureEnv?` and
+`setPureEnvSlot?` (both of which pattern-match on `.dead`/`.uninit`/`.init` at
+every prefix element and get stuck when an untouched slot is a symbolic
+`s₀ : LocalSlot`), `setSpineChecked?` reduces to `some [...]` by `rfl`. -/
+theorem setSpineChecked?_symbolic_slot_rfl
+    (s₀ s₁ : LocalSlot) (v₂ v₂' : Value) :
+    setSpineChecked? [s₀, s₁, .init v₂] 2 (.init v₂') = some [s₀, s₁, .init v₂'] :=
+  rfl
+
+/-- Bounds-checked single-pass step-wise update chain. -/
+def applySlotUpdatesChecked {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match setSpineChecked? env u.1 u.2 with
+    | some env' => applySlotUpdatesChecked ups env'
+    | none => none
+
+/-- `applySlotUpdatesChecked` equals the `Trusted.Sequence.set?` chain on
+every update list (both in-bounds and out-of-bounds). -/
+theorem applySlotUpdatesChecked_eq_live? {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α),
+      applySlotUpdatesChecked ups env = applySlotUpdatesLive? ups env
+  | [], _ => rfl
+  | u :: ups, env => by
+    simp only [applySlotUpdatesChecked, applySlotUpdatesLive?, setSpineChecked?_eq_live_set?]
+    cases Trusted.Sequence.set? env u.1 u.2 with
+    | none => rfl
+    | some env' => exact applySlotUpdatesChecked_eq_live? ups env'
+
+/-- **Soundness of bounds-checked single-pass normalization**: a `rfl` proof of
+`applySlotUpdatesChecked` proves the unnormalized `applySlotUpdates` chain. -/
+theorem applySlotUpdates_eq_of_checked {α : Type} {ups : List (Nat × α)} {env flat : List α}
+    (h : applySlotUpdatesChecked ups env = some flat) : applySlotUpdates env ups = flat := by
+  rw [applySlotUpdatesChecked_eq_live?, ← applySlotUpdatesTwoPass_eq_live?] at h
+  exact applySlotUpdates_eq_of_twoPass h
+
+/-- **Soundness of the bare `Trusted.Sequence.set?` chain** without the
+`forcePureEnv?` pass. -/
+theorem applySlotUpdates_eq_of_live? {α : Type} {ups : List (Nat × α)} {env flat : List α}
+    (h : applySlotUpdatesLive? ups env = some flat) : applySlotUpdates env ups = flat := by
+  rw [← applySlotUpdatesTwoPass_eq_live?] at h
+  exact applySlotUpdates_eq_of_twoPass h
+
+/-- **Single-pass drop-in replacement for `set?_of_forcePureEnv?`**:
+proves `Trusted.Sequence.set? env loc s = some env'` directly from `setSpineChecked?`. -/
+theorem set?_of_setSpineChecked? {env env' : PureEnv}
+    {loc : Local} {s : LocalSlot}
+    (h : setSpineChecked? env loc s = some env') :
+    Trusted.Sequence.set? env loc s = some env' := by
+  rwa [← setSpineChecked?_eq_live_set?]
+
+/-- **Single-pass drop-in replacement for `evalPureStmtNorm_assign_local_of_evalRvalue`**:
+replaces the two-pass `(set? env dstLoc (.init val)).bind forcePureEnv? = some env'`
+premise with single-pass `setSpineChecked?` (without modifying `trusted/lean/`
+and without getting stuck on symbolic `LocalSlot` prefix entries). -/
+theorem evalPureStmtNorm_assign_local_of_setSpineChecked?
+    {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat}
+    {env env' : PureEnv} {dstLoc : Local}
+    {rv : Rvalue} {span : String}
+    {val : Value} {oldSlot : LocalSlot}
+    (h_pure : isPureStatement
+      (.assign { local_ := dstLoc, projection := [] } rv) = true)
+    (h_rv : evalRvalue env rv emptyMemory body.localDecls body.layouts =
+      .ok val env emptyMemory)
+    (h_get : Trusted.Sequence.get? env dstLoc = some oldSlot)
+    (h_live : oldSlot ≠ .dead)
+    (h_set : setSpineChecked? env dstLoc (.init val) = some env') :
+    evalPureStmtNorm body bbIdx stmtIdx env
+      { kind := .assign { local_ := dstLoc, projection := [] } rv, span := span } = some env' := by
+  rw [setSpineChecked?_eq_live_bind_forcePureEnv?] at h_set
+  exact evalPureStmtNorm_assign_local_of_evalRvalue
+    h_pure h_rv h_get h_live h_set
+
+/-- Unforced multi-statement pure execution matching `evalPureStmtsN` without
+the per-statement `forcePureEnv?` pass. -/
+def evalPureStmtsUnforced
+    (body : CapturedMir) (bbIdx : BasicBlockIdx)
+    (stmts : List Statement) :
+    Nat → Nat → PureEnv → Option PureEnv
+  | 0, _, env => some env
+  | n + 1, stmtIdx, env =>
+    match Trusted.Sequence.get? stmts stmtIdx with
+    | some stmt =>
+      match evalPureStmt body bbIdx stmtIdx env stmt with
+      | some env₁ => evalPureStmtsUnforced body bbIdx stmts n (stmtIdx + 1) env₁
+      | none => none
+    | none => none
+
+/-- **Bridge from multi-statement `evalPureStmtsN` to unforced `evalPureStmt` execution**:
+extensionally identical on every block segment. Computationally they differ:
+the per-statement forcing pass of `evalPureStmtsN` is what keeps `rfl`
+evaluation linear, so the unforced form is a specification, not a faster evaluator. -/
+theorem evalPureStmtsN_eq_unforced
+    (body : CapturedMir) (bbIdx : BasicBlockIdx)
+    (stmts : List Statement) :
+    ∀ (n stmtIdx : Nat) (env : PureEnv),
+      evalPureStmtsN body bbIdx stmts n stmtIdx env =
+        evalPureStmtsUnforced body bbIdx stmts n stmtIdx env
+  | 0, _, env => forcePureEnv?_eq_some env
+  | n + 1, stmtIdx, env => by
+    unfold evalPureStmtsN evalPureStmtsUnforced
+    cases Trusted.Sequence.get? stmts stmtIdx with
+    | none => rfl
+    | some stmt =>
+      dsimp only
+      rw [evalPureStmtNorm_eq_evalPureStmt]
+      cases evalPureStmt body bbIdx stmtIdx env stmt with
+      | none => rfl
+      | some env₁ => exact evalPureStmtsN_eq_unforced body bbIdx stmts n (stmtIdx + 1) env₁
+
+/-- Untrusted single-pass pure statement normalizer: uses `setSpineChecked?`
+directly on local `.storageLive`, `.storageDead`, `.deinit`, and `.assign`
+updates so modified prefixes are normalized in a single pass without calling
+`env.length` or pattern-matching on untouched `LocalSlot` constructors, while
+remaining extensionally identical to `evalPureStmt` and `evalPureStmtNorm`. -/
+def evalPureStmtChecked (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (env : PureEnv) (stmt : Statement) : Option PureEnv :=
+  if isPureStatement stmt.kind then
+    match stmt.kind with
+    | .nop | .coverage | .constEvalCounter => some env
+    | .storageLive loc =>
+      match get? env loc with
+      | some _ => setSpineChecked? env loc .uninit
+      | none => none
+    | .storageDead loc =>
+      match get? env loc with
+      | some _ => setSpineChecked? env loc .dead
+      | none => none
+    | .deinit { local_ := loc, projection := [] } =>
+      match get? env loc with
+      | some .dead => none
+      | some _ => setSpineChecked? env loc .uninit
+      | none => none
+    | .assign { local_ := dstLoc, projection := [] } rv =>
+      match evalRvalue env rv emptyMemory body.localDecls body.layouts with
+      | .ok val locals₁ mem₁ =>
+        match get? locals₁ dstLoc with
+        | some .dead => none
+        | some _ =>
+          match setSpineChecked? locals₁ dstLoc (.init val) with
+          | some locals₂ =>
+            match mem₁.activeProtectors with
+            | [] => some locals₂
+            | protHead :: protTail =>
+              match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none .nil with
+              | true => none
+              | false => some locals₂
+          | none => none
+        | none => none
+      | _ => none
+    | _ => (evalPureStmt body bbIdx stmtIdx env stmt).bind forceSpine?
+  else none
+
+/-- **Exact agreement between single-pass `evalPureStmtChecked` and `evalPureStmt`**. -/
+theorem evalPureStmtChecked_eq_evalPureStmt
+    (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (env : PureEnv) (stmt : Statement) :
+    evalPureStmtChecked body bbIdx stmtIdx env stmt =
+      evalPureStmt body bbIdx stmtIdx env stmt := by
+  rcases stmt with ⟨kind, span⟩
+  unfold evalPureStmtChecked
+  cases hp : isPureStatement kind with
+  | false =>
+    unfold evalPureStmt
+    rw [hp]
+    rfl
+  | true =>
+    rw [if_pos rfl]
+    cases kind with
+    | nop | coverage | constEvalCounter =>
+      unfold evalPureStmt
+      rw [hp]
+      rfl
+    | storageLive loc | storageDead loc =>
+      unfold evalPureStmt
+      rw [hp, if_pos rfl]
+      dsimp only [evalStmt, PureState.toMachineState, emptyMemory]
+      rw [setSpineChecked?_eq_live_set?]
+      cases get? env loc with
+      | none => rfl
+      | some _ =>
+        cases set? env loc _ <;> rfl
+    | deinit p =>
+      rcases p with ⟨loc, proj⟩
+      cases proj with
+      | nil =>
+        unfold evalPureStmt
+        rw [hp, if_pos rfl]
+        dsimp only [evalStmt, PureState.toMachineState, emptyMemory]
+        rw [setSpineChecked?_eq_live_set?]
+        cases get? env loc with
+        | none => rfl
+        | some slot =>
+          cases slot with
+          | dead => rfl
+          | uninit | init _ =>
+            cases set? env loc .uninit <;> rfl
+      | cons _ _ =>
+        dsimp only
+        cases evalPureStmt body bbIdx stmtIdx env { kind := .deinit ⟨loc, _ :: _⟩, span := span } with
+        | none => rfl
+        | some e => exact forceSpine?_eq_some e
+    | assign dst rv =>
+      rcases dst with ⟨dstLoc, proj⟩
+      cases proj with
+      | nil =>
+        unfold evalPureStmt
+        rw [hp, if_pos rfl]
+        dsimp only [evalStmt, PureState.toMachineState]
+        cases evalRvalue env rv emptyMemory body.localDecls body.layouts with
+        | ub | unsupported => rfl
+        | ok val locals₁ mem₁ =>
+          dsimp only
+          rw [setSpineChecked?_eq_live_set?]
+          cases get? locals₁ dstLoc with
+          | none => rfl
+          | some slot =>
+            cases slot with
+            | dead => rfl
+            | uninit | init _ =>
+              cases set? locals₁ dstLoc (.init val) with
+              | none => rfl
+              | some locals₂ =>
+                cases mem₁.activeProtectors with
+                | nil => rfl
+                | cons ph pt =>
+                  dsimp only
+                  cases hasProtectedWriteConflict mem₁.borrows (ph :: pt) dstLoc .none <;> rfl
+      | cons _ _ =>
+        dsimp only
+        cases evalPureStmt body bbIdx stmtIdx env { kind := .assign ⟨dstLoc, _ :: _⟩ rv, span := span } with
+        | none => rfl
+        | some e => exact forceSpine?_eq_some e
+    | _ =>
+      dsimp only
+      cases evalPureStmt body bbIdx stmtIdx env _ with
+      | none => rfl
+      | some e => exact forceSpine?_eq_some e
+
+theorem evalPureStmtChecked_eq_evalPureStmtNorm
+    (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (env : PureEnv) (stmt : Statement) :
+    evalPureStmtChecked body bbIdx stmtIdx env stmt =
+      evalPureStmtNorm body bbIdx stmtIdx env stmt := by
+  rw [evalPureStmtChecked_eq_evalPureStmt, evalPureStmtNorm_eq_evalPureStmt]
+
+/-- Multi-statement pure execution using single-pass `evalPureStmtChecked` and
+`forceSpine?`. -/
+def evalPureStmtsCheckedN
+    (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmts : List Statement) :
+    Nat → Nat → PureEnv → Option PureEnv
+  | 0, _, env => forceSpine? env
+  | n + 1, stmtIdx, env =>
+    match Trusted.Sequence.get? stmts stmtIdx with
+    | some stmt =>
+      match evalPureStmtChecked body bbIdx stmtIdx env stmt with
+      | some env₁ => evalPureStmtsCheckedN body bbIdx stmts n (stmtIdx + 1) env₁
+      | none => none
+    | none => none
+
+theorem evalPureStmtsCheckedN_eq_evalPureStmtsN
+    (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmts : List Statement) :
+    ∀ (n stmtIdx : Nat) (env : PureEnv),
+      evalPureStmtsCheckedN body bbIdx stmts n stmtIdx env =
+        evalPureStmtsN body bbIdx stmts n stmtIdx env
+  | 0, _, env => forceSpine?_eq_live env
+  | n + 1, stmtIdx, env => by
+    unfold evalPureStmtsCheckedN evalPureStmtsN
+    cases Trusted.Sequence.get? stmts stmtIdx with
+    | none => rfl
+    | some stmt =>
+      dsimp only
+      rw [evalPureStmtChecked_eq_evalPureStmtNorm]
+      cases evalPureStmtNorm body bbIdx stmtIdx env stmt with
+      | none => rfl
+      | some env₁ => exact evalPureStmtsCheckedN_eq_evalPureStmtsN body bbIdx stmts n (stmtIdx + 1) env₁
+
+theorem evalPureStmtsCheckedN_eq_unforced
+    (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmts : List Statement)
+    (n stmtIdx : Nat) (env : PureEnv) :
+    evalPureStmtsCheckedN body bbIdx stmts n stmtIdx env =
+      evalPureStmtsUnforced body bbIdx stmts n stmtIdx env := by
+  rw [evalPureStmtsCheckedN_eq_evalPureStmtsN, evalPureStmtsN_eq_unforced]
+
+theorem LiftStmtsTerminator.cons_eval_checked {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {stmt : Statement}
+    {term : Terminator} {post : Value → Prop} {fuel : Nat}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
+    (h_eval : evalPureStmtChecked body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + 1) env' stmts term post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term post (fuel + 1) := by
+  rw [evalPureStmtChecked_eq_evalPureStmt] at h_eval
+  exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
+
+theorem LiftStmtsTerminator.cons_eval_checked_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_eval : evalPureStmtChecked body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) := by
+  rw [evalPureStmtChecked_eq_evalPureStmtNorm] at h_eval
+  exact LiftStmtsTerminator.cons_eval_norm_ready h_ready h_bb h_get h_eval h_next
+
+theorem LiftStmtsTerminator.eval_n_checked {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {n stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {term : Terminator}
+    {post : Value → Prop} {fuel : Nat}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsCheckedN body bbIdx stmts n stmtIdx env = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + n) env' stmts term post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term post (fuel + n) := by
+  rw [evalPureStmtsCheckedN_eq_evalPureStmtsN] at h_eval
+  exact LiftStmtsTerminator.eval_n h_bb h_phase h_eval h_next
+
+theorem LiftStmtsTerminator.eval_n_checked_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {n stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsCheckedN body bbIdx bb.statements n stmtIdx env = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + n) env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + n) := by
+  rw [evalPureStmtsCheckedN_eq_evalPureStmtsN] at h_eval
+  exact LiftStmtsTerminator.eval_n_ready h_ready h_bb h_eval h_next
+
+theorem LiftStmtsTerminator.eval_rest_checked {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {term : Terminator} {post : Value → Prop}
+    {fuel : Nat}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsCheckedN body bbIdx stmts (List.length stmts - stmtIdx)
+      stmtIdx env = some env')
+    (h_next : LiftStmtsTerminator body bbIdx
+      (stmtIdx + (List.length stmts - stmtIdx)) env' stmts term post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term post
+      (fuel + (List.length stmts - stmtIdx)) :=
+  LiftStmtsTerminator.eval_n_checked h_bb h_phase h_eval h_next
+
+theorem LiftStmtsTerminator.eval_rest_checked_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsCheckedN body bbIdx bb.statements
+      (List.length bb.statements - stmtIdx) stmtIdx env = some env')
+    (h_next : LiftStmtsTerminator body bbIdx
+      (stmtIdx + (List.length bb.statements - stmtIdx))
+      env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post
+      (fuel + (List.length bb.statements - stmtIdx)) :=
+  LiftStmtsTerminator.eval_n_checked_ready h_ready h_bb h_eval h_next
+
+theorem LiftStmtsTerminator.term_drop_checked_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {place : Place} {unwind : UnwindAction}
+    {span : String} {post : Value → Prop} {fuel : Nat} {slot : LocalSlot}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .drop place target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_proj : place.projection = [])
+    (h_set : setSpineChecked? env place.local_ .uninit = some env')
+    (h_next : LiftBlock body target env' post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) :=
+  LiftStmtsTerminator.term_drop_ready h_ready h_bb h_term h_end h_get h_not_dead
+    h_proj (set?_of_setSpineChecked? h_set) h_next
+
+end ForcePureEnv
+
+/-!
+## Opaque-Postcondition `LiftBlock` Diamond Join Sharing (`liftBlock_diamond_shared`)
+-/
+
+section DiamondJoinSharing
+
+/-- Fuel monotonicity for `LiftBlock`. -/
+theorem LiftBlock.mono_fuel {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {env : PureEnv} {post : Value → Prop} {f₁ f₂ : Nat}
+    (h_le : f₁ ≤ f₂) (h : LiftBlock body bbIdx env post f₁) :
+    LiftBlock body bbIdx env post f₂ := by
+  unfold LiftBlock wpPureMirExec at h ⊢
+  exact MirFuelFree.wpMirExecSym_mono h_le h
+
+/-- Postcondition monotonicity for `LiftBlock`. -/
+theorem LiftBlock.mono_post {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {env : PureEnv} {P Q : Value → Prop} {fuel : Nat}
+    (h_imp : ∀ v, P v → Q v) (h : LiftBlock body bbIdx env P fuel) :
+    LiftBlock body bbIdx env Q fuel := by
+  unfold LiftBlock wpPureMirExec at h ⊢
+  refine MirFuelFree.wpMirExecSym_mono_post ?_ h
+  intro out h_out
+  cases out with
+  | normal rv => exact h_imp rv.1 h_out
+  | panic => exact False.elim h_out
+  | abort => exact False.elim h_out
+
+/-- Combined fuel and postcondition monotonicity for `LiftBlock`. -/
+theorem LiftBlock.mono {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {env : PureEnv} {P Q : Value → Prop} {f₁ f₂ : Nat}
+    (h_le : f₁ ≤ f₂) (h_imp : ∀ v, P v → Q v)
+    (h : LiftBlock body bbIdx env P f₁) :
+    LiftBlock body bbIdx env Q f₂ :=
+  LiftBlock.mono_post h_imp (LiftBlock.mono_fuel h_le h)
+
+/-- Fuel monotonicity for `LiftStmtsTerminator`. -/
+theorem LiftStmtsTerminator.mono_fuel {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env : PureEnv} {stmts : List Statement} {term : Terminator}
+    {post : Value → Prop} {f₁ f₂ : Nat}
+    (h_le : f₁ ≤ f₂) (h : LiftStmtsTerminator body bbIdx stmtIdx env stmts term post f₁) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term post f₂ := by
+  unfold LiftStmtsTerminator at h ⊢
+  exact MirFuelFree.wpMirExecSym_mono h_le h
+
+/-- Postcondition monotonicity for `LiftStmtsTerminator`. -/
+theorem LiftStmtsTerminator.mono_post {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env : PureEnv} {stmts : List Statement} {term : Terminator}
+    {P Q : Value → Prop} {fuel : Nat}
+    (h_imp : ∀ v, P v → Q v)
+    (h : LiftStmtsTerminator body bbIdx stmtIdx env stmts term P fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term Q fuel := by
+  unfold LiftStmtsTerminator at h ⊢
+  refine MirFuelFree.wpMirExecSym_mono_post ?_ h
+  intro out h_out
+  cases out with
+  | normal rv => exact h_imp rv.1 h_out
+  | panic => exact False.elim h_out
+  | abort => exact False.elim h_out
+
+/-- Combined fuel and postcondition monotonicity for `LiftStmtsTerminator`. -/
+theorem LiftStmtsTerminator.mono {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env : PureEnv} {stmts : List Statement} {term : Terminator}
+    {P Q : Value → Prop} {f₁ f₂ : Nat}
+    (h_le : f₁ ≤ f₂) (h_imp : ∀ v, P v → Q v)
+    (h : LiftStmtsTerminator body bbIdx stmtIdx env stmts term P f₁) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term Q f₂ :=
+  LiftStmtsTerminator.mono_post h_imp (LiftStmtsTerminator.mono_fuel h_le h)
+
+/-- Fuel-free block lifting judgment (`∃ fuel, LiftBlock body bbIdx env post fuel`):
+allows branches of a CFG diamond with different path lengths to package their own
+existential fuel budgets and share a single continuation proof for a join block. -/
+def LiftBlockConverges (body : CapturedMir) (bbIdx : BasicBlockIdx)
+    (env : PureEnv) (post : Value → Prop) : Prop :=
+  ∃ fuel, LiftBlock body bbIdx env post fuel
+
+/-- Fuel-free statement/terminator lifting judgment. -/
+def LiftStmtsConverges (body : CapturedMir) (bbIdx : BasicBlockIdx)
+    (stmtIdx : Nat) (env : PureEnv) (stmts : List Statement) (term : Terminator)
+    (post : Value → Prop) : Prop :=
+  ∃ fuel, LiftStmtsTerminator body bbIdx stmtIdx env stmts term post fuel
+
+theorem LiftBlockConverges.iff_pureMirConverges {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} :
+    LiftBlockConverges body bbIdx env post ↔
+      PureMirConverges body { bb := bbIdx, stmtIdx := 0, env := env } post := by
+  unfold LiftBlockConverges LiftBlock PureMirConverges
+  exact Iff.rfl
+
+theorem LiftBlockConverges.of_liftBlock {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} {fuel : Nat}
+    (h : LiftBlock body bbIdx env post fuel) :
+    LiftBlockConverges body bbIdx env post :=
+  ⟨fuel, h⟩
+
+theorem LiftBlockConverges.mono {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {env : PureEnv} {P Q : Value → Prop}
+    (h_imp : ∀ v, P v → Q v) (h : LiftBlockConverges body bbIdx env P) :
+    LiftBlockConverges body bbIdx env Q := by
+  obtain ⟨fuel, hf⟩ := h
+  exact ⟨fuel, LiftBlock.mono_post h_imp hf⟩
+
+theorem LiftBlockConverges.of_lookup {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {bb : BasicBlockData} {env : PureEnv} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_lift : LiftStmtsConverges body bbIdx 0 env bb.statements bb.terminator post) :
+    LiftBlockConverges body bbIdx env post := by
+  obtain ⟨fuel, hf⟩ := h_lift
+  exact ⟨fuel, LiftBlock.of_lookup h_bb hf⟩
+
+theorem LiftStmtsConverges.of_liftStmtsTerminator {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
+    {stmts : List Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
+    (h : LiftStmtsTerminator body bbIdx stmtIdx env stmts term post fuel) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post :=
+  ⟨fuel, h⟩
+
+theorem LiftStmtsConverges.mono {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
+    {stmts : List Statement} {term : Terminator} {P Q : Value → Prop}
+    (h_imp : ∀ v, P v → Q v)
+    (h : LiftStmtsConverges body bbIdx stmtIdx env stmts term P) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term Q := by
+  obtain ⟨fuel, hf⟩ := h
+  exact ⟨fuel, LiftStmtsTerminator.mono_post h_imp hf⟩
+
+theorem LiftStmtsConverges.cons_eval {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {stmt : Statement}
+    {term : Terminator} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
+    (h_eval : MirLiftCore.evalPureStmt body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + 1) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval hf⟩
+
+theorem LiftStmtsConverges.cons_eval_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_eval : MirLiftCore.evalPureStmt body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.cons_eval_ready h_ready h_bb h_get h_eval hf⟩
+
+theorem LiftStmtsConverges.cons_eval_norm {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {stmt : Statement}
+    {term : Terminator} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
+    (h_eval : evalPureStmtNorm body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + 1) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.cons_eval_norm h_bb h_phase h_get h_eval hf⟩
+
+theorem LiftStmtsConverges.cons_eval_norm_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_eval : evalPureStmtNorm body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.cons_eval_norm_ready h_ready h_bb h_get h_eval hf⟩
+
+theorem LiftStmtsConverges.cons_eval_checked {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {stmt : Statement}
+    {term : Terminator} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
+    (h_eval : evalPureStmtChecked body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + 1) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.cons_eval_checked h_bb h_phase h_get h_eval hf⟩
+
+theorem LiftStmtsConverges.cons_eval_checked_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_eval : evalPureStmtChecked body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.cons_eval_checked_ready h_ready h_bb h_get h_eval hf⟩
+
+theorem LiftStmtsConverges.eval_n {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {n stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {term : Terminator}
+    {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsN body bbIdx stmts n stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + n) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + n, LiftStmtsTerminator.eval_n h_bb h_phase h_eval hf⟩
+
+theorem LiftStmtsConverges.eval_n_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {n stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsN body bbIdx bb.statements n stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + n) env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + n, LiftStmtsTerminator.eval_n_ready h_ready h_bb h_eval hf⟩
+
+theorem LiftStmtsConverges.eval_n_checked {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {n stmtIdx : Nat} {env env' : PureEnv} {stmts : List Statement} {term : Terminator}
+    {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsCheckedN body bbIdx stmts n stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + n) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + n, LiftStmtsTerminator.eval_n_checked h_bb h_phase h_eval hf⟩
+
+theorem LiftStmtsConverges.eval_n_checked_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {n stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsCheckedN body bbIdx bb.statements n stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx (stmtIdx + n) env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + n, LiftStmtsTerminator.eval_n_checked_ready h_ready h_bb h_eval hf⟩
+
+theorem LiftStmtsConverges.eval_rest {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {term : Terminator} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsN body bbIdx stmts (List.length stmts - stmtIdx)
+      stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx
+      (stmtIdx + (List.length stmts - stmtIdx)) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post :=
+  LiftStmtsConverges.eval_n h_bb h_phase h_eval h_next
+
+theorem LiftStmtsConverges.eval_rest_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsN body bbIdx bb.statements
+      (List.length bb.statements - stmtIdx) stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx
+      (stmtIdx + (List.length bb.statements - stmtIdx))
+      env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post :=
+  LiftStmtsConverges.eval_n_ready h_ready h_bb h_eval h_next
+
+theorem LiftStmtsConverges.eval_rest_checked {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {term : Terminator} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsCheckedN body bbIdx stmts (List.length stmts - stmtIdx)
+      stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx
+      (stmtIdx + (List.length stmts - stmtIdx)) env' stmts term post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term post :=
+  LiftStmtsConverges.eval_n_checked h_bb h_phase h_eval h_next
+
+theorem LiftStmtsConverges.eval_rest_checked_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsCheckedN body bbIdx bb.statements
+      (List.length bb.statements - stmtIdx) stmtIdx env = some env')
+    (h_next : LiftStmtsConverges body bbIdx
+      (stmtIdx + (List.length bb.statements - stmtIdx))
+      env' bb.statements bb.terminator post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post :=
+  LiftStmtsConverges.eval_n_checked_ready h_ready h_bb h_eval h_next
+
+theorem LiftStmtsConverges.term_return {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {stmts : List Statement}
+    {span : String} {post : Value → Prop} {val : Value}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := { kind := .return_, span := span }, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_end : stmtIdx = List.length stmts)
+    (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
+    (h_post : post val) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts { kind := .return_, span := span } post :=
+  ⟨1, LiftStmtsTerminator.term_return h_bb h_phase h_end h_ret h_post⟩
+
+theorem LiftStmtsConverges.term_return_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
+    {bb : BasicBlockData} {span : String} {post : Value → Prop} {val : Value}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .return_, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
+    (h_post : post val) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post :=
+  ⟨1, LiftStmtsTerminator.term_return_ready h_ready h_bb h_term h_end h_ret h_post⟩
+
+theorem LiftStmtsConverges.term_goto {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
+    {stmts : List Statement} {span : String} {post : Value → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := { kind := .goto target, span := span }, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_end : stmtIdx = List.length stmts)
+    (h_lift : LiftBlockConverges body target env post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts { kind := .goto target, span := span } post := by
+  obtain ⟨fuel, hf⟩ := h_lift
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_goto h_bb h_phase h_end hf⟩
+
+theorem LiftStmtsConverges.term_goto_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
+    {bb : BasicBlockData} {span : String} {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .goto target, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_lift : LiftBlockConverges body target env post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_lift
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_goto_ready h_ready h_bb h_term h_end hf⟩
+
+theorem LiftStmtsConverges.term_switchInt {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {discr : Operand} {targets : SwitchTargets}
+    {span : String} {post : Value → Prop} {sc : ScalarInt}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := { kind := .switchInt discr targets, span := span }, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_end : stmtIdx = List.length stmts)
+    (h_eval : MirLiftCore.evalPureOperand body env discr = .ok (.scalar sc) env')
+    (h_target : target = lookupSwitchTarget sc.bits targets.branches targets.otherwise)
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts { kind := .switchInt discr targets, span := span } post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_switchInt h_bb h_phase h_end h_eval h_target hf⟩
+
+theorem LiftStmtsConverges.term_switchInt_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {discr : Operand} {targets : SwitchTargets}
+    {span : String} {post : Value → Prop} {sc : ScalarInt}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .switchInt discr targets, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env discr = .ok (.scalar sc) env')
+    (h_target : target = lookupSwitchTarget sc.bits targets.branches targets.otherwise)
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_switchInt_ready h_ready h_bb h_term h_end h_eval h_target hf⟩
+
+theorem LiftStmtsConverges.term_assert {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {cond : Operand} {expected : Bool}
+    {unwind : UnwindAction} {span : String} {post : Value → Prop} {sc : ScalarInt}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := { kind := .assert cond expected target unwind, span := span }, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_end : stmtIdx = List.length stmts)
+    (h_eval : MirLiftCore.evalPureOperand body env cond = .ok (.scalar sc) env')
+    (h_cond : sc.bits = (match expected with | true => 1 | false => 0))
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts { kind := .assert cond expected target unwind, span := span } post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_assert h_bb h_phase h_end h_eval
+    (by cases expected <;> simpa using h_cond) hf⟩
+
+theorem LiftStmtsConverges.term_assert_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {cond : Operand} {expected : Bool}
+    {unwind : UnwindAction} {span : String} {post : Value → Prop} {sc : ScalarInt}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .assert cond expected target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env cond = .ok (.scalar sc) env')
+    (h_cond : sc.bits = (match expected with | true => 1 | false => 0))
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_assert_ready h_ready h_bb h_term h_end h_eval h_cond hf⟩
+
+theorem LiftStmtsConverges.term_drop {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {place : Place} {unwind : UnwindAction}
+    {span : String} {post : Value → Prop} {slot : LocalSlot}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := { kind := .drop place target unwind, span := span }, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_end : stmtIdx = List.length stmts)
+    (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_proj : place.projection = [])
+    (h_set : Trusted.Sequence.set? env place.local_ .uninit = some env')
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env stmts { kind := .drop place target unwind, span := span } post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_drop h_bb h_phase h_end h_get h_not_dead h_proj h_set hf⟩
+
+theorem LiftStmtsConverges.term_drop_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {place : Place} {unwind : UnwindAction}
+    {span : String} {post : Value → Prop} {slot : LocalSlot}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .drop place target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_proj : place.projection = [])
+    (h_set : Trusted.Sequence.set? env place.local_ .uninit = some env')
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post := by
+  obtain ⟨fuel, hf⟩ := h_next
+  exact ⟨fuel + 1, LiftStmtsTerminator.term_drop_ready h_ready h_bb h_term h_end h_get h_not_dead h_proj h_set hf⟩
+
+theorem LiftStmtsConverges.term_drop_checked_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {place : Place} {unwind : UnwindAction}
+    {span : String} {post : Value → Prop} {slot : LocalSlot}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .drop place target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_proj : place.projection = [])
+    (h_set : setSpineChecked? env place.local_ .uninit = some env')
+    (h_next : LiftBlockConverges body target env' post) :
+    LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post :=
+  LiftStmtsConverges.term_drop_ready h_ready h_bb h_term h_end h_get h_not_dead
+    h_proj (set?_of_setSpineChecked? h_set) h_next
+
+/-- Opaque-postcondition block-to-join lifting judgment: from `(bbIdx, env)`,
+whenever every environment `env_j` at `joinBb` satisfying `JoinInv env_j`
+converges to an arbitrary postcondition `Q`, `(bbIdx, env)` also converges to `Q`. -/
+def LiftBlockToJoin (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv)
+    (joinBb : BasicBlockIdx) (JoinInv : PureEnv → Prop) : Prop :=
+  ∀ (Q : Value → Prop),
+    (∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j Q) →
+    LiftBlockConverges body bbIdx env Q
+
+theorem LiftBlockToJoin.refl {body : CapturedMir} {joinBb : BasicBlockIdx}
+    {env : PureEnv} {JoinInv : PureEnv → Prop} (h_inv : JoinInv env) :
+    LiftBlockToJoin body joinBb env joinBb JoinInv :=
+  fun _ h_join => h_join env h_inv
+
+theorem LiftBlockToJoin.trans {body : CapturedMir}
+    {bb₀ bb₁ bb₂ : BasicBlockIdx} {env₀ : PureEnv}
+    {MidInv JoinInv : PureEnv → Prop}
+    (h₁ : LiftBlockToJoin body bb₀ env₀ bb₁ MidInv)
+    (h₂ : ∀ env₁, MidInv env₁ → LiftBlockToJoin body bb₁ env₁ bb₂ JoinInv) :
+    LiftBlockToJoin body bb₀ env₀ bb₂ JoinInv :=
+  fun Q h_join => h₁ Q (fun env₁ h_mid => h₂ env₁ h_mid Q h_join)
+
+theorem LiftBlockToJoin.mono {body : CapturedMir}
+    {bbIdx joinBb : BasicBlockIdx} {env : PureEnv}
+    {Inv₁ Inv₂ : PureEnv → Prop}
+    (h_imp : ∀ e, Inv₁ e → Inv₂ e)
+    (h : LiftBlockToJoin body bbIdx env joinBb Inv₁) :
+    LiftBlockToJoin body bbIdx env joinBb Inv₂ :=
+  fun Q h_join => h Q (fun e he => h_join e (h_imp e he))
+
+/-- **Opaque-postcondition diamond join sharing (`liftBlock_diamond_shared`)**:
+proves the shared join block `joinBb` **once** under `JoinInv : PureEnv → Prop`,
+and passes it as an opaque continuation hypothesis to the upstream branching
+prefix `h_branches`, avoiding any branch duplication of `joinBb` (even when
+incoming branches have different instruction counts). -/
+theorem liftBlock_diamond_shared {body : CapturedMir}
+    {entryBb joinBb : BasicBlockIdx} {env₀ : PureEnv}
+    {JoinInv : PureEnv → Prop} {post : Value → Prop}
+    (h_branches :
+      (∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) →
+      LiftBlockConverges body entryBb env₀ post)
+    (h_join : ∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) :
+    LiftBlockConverges body entryBb env₀ post :=
+  h_branches h_join
+
+/-- `PureMirConverges` entry-block specialization of `liftBlock_diamond_shared`. -/
+theorem pureMirConverges_of_shared_join {body : CapturedMir}
+    {args : List Value} {joinBb : BasicBlockIdx}
+    (JoinInv : PureEnv → Prop) {post : Value → Prop}
+    (h_branches :
+      (∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) →
+      LiftBlockConverges body 0 (initPureEnv body args) post)
+    (h_join : ∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) :
+    PureMirConverges body (initPureState body args) post :=
+  LiftBlockConverges.iff_pureMirConverges.mp (h_branches h_join)
+
+/-- Multi-join composition: chains an upstream diamond reaching `midBb` under
+`MidInv` with a downstream diamond from `midBb` to `exitBb` under `ExitInv` and
+a single shared proof of `exitBb`. -/
+theorem liftBlock_two_diamonds_shared {body : CapturedMir}
+    {entryBb midBb exitBb : BasicBlockIdx} {env₀ : PureEnv}
+    {MidInv ExitInv : PureEnv → Prop} {post : Value → Prop}
+    (h_first : LiftBlockToJoin body entryBb env₀ midBb MidInv)
+    (h_second : ∀ env_m, MidInv env_m → LiftBlockToJoin body midBb env_m exitBb ExitInv)
+    (h_exit : ∀ env_e, ExitInv env_e → LiftBlockConverges body exitBb env_e post) :
+    LiftBlockConverges body entryBb env₀ post :=
+  (h_first.trans h_second) post h_exit
+
+/-- Direct 4-block `switchInt` diamond rule (`bb_entry -> {bb_then, bb_else} -> bb_join`):
+evaluates `bb_entry` up to its `switchInt`, branches on a decidable condition `C`
+into `bb_then` vs `bb_else` (which may have different statement lengths), and
+proves `bb_join` **once** for `JoinInv`. -/
+theorem liftBlock_switchInt_diamond_shared {body : CapturedMir}
+    {entryBb thenBb elseBb joinBb : BasicBlockIdx}
+    {bbEntry : BasicBlockData} {env₀ envSw env' : PureEnv}
+    {discr : Operand} {targets : SwitchTargets} {span : String}
+    {sc : ScalarInt} (C : Prop) [Decidable C]
+    (JoinInv : PureEnv → Prop) {post : Value → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks entryBb = some bbEntry)
+    (h_eval : evalPureStmtsCheckedN body entryBb bbEntry.statements
+      (List.length bbEntry.statements) 0 env₀ = some envSw)
+    (h_term : bbEntry.terminator = { kind := .switchInt discr targets, span := span })
+    (h_op : MirLiftCore.evalPureOperand body envSw discr = .ok (.scalar sc) env')
+    (h_then : C →
+      lookupSwitchTarget sc.bits targets.branches targets.otherwise = thenBb ∧
+      ((∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) →
+        LiftBlockConverges body thenBb env' post))
+    (h_else : ¬ C →
+      lookupSwitchTarget sc.bits targets.branches targets.otherwise = elseBb ∧
+      ((∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) →
+        LiftBlockConverges body elseBb env' post))
+    (h_join : ∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) :
+    LiftBlockConverges body entryBb env₀ post := by
+  refine LiftBlockConverges.of_lookup h_bb ?_
+  have h_eval' : evalPureStmtsCheckedN body entryBb bbEntry.statements
+      (List.length bbEntry.statements - 0) 0 env₀ = some envSw := h_eval
+  refine LiftStmtsConverges.eval_rest_checked_ready h_ready h_bb h_eval' ?_
+  by_cases hC : C
+  · obtain ⟨h_tgt, h_th⟩ := h_then hC
+    exact LiftStmtsConverges.term_switchInt_ready h_ready h_bb h_term
+      (Nat.zero_add _) h_op h_tgt.symm (h_th h_join)
+  · obtain ⟨h_tgt, h_el⟩ := h_else hC
+    exact LiftStmtsConverges.term_switchInt_ready h_ready h_bb h_term
+      (Nat.zero_add _) h_op h_tgt.symm (h_el h_join)
+
+/-- Readiness-discharged `VerificationResult` gate using fuel-free `LiftBlockConverges`. -/
+theorem verifyMirNoPanic_of_mirLiftReady_converges
+    (c : Claim)
+    (h_ready : checkMirLiftReady c.body = true)
+    (h_lift : ∀ args, c.pre args →
+      LiftBlockConverges c.body 0 (initPureEnv c.body args) (c.post args)) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_mirLiftReady c h_ready h_lift
+
+/--
+Asymmetric diamond CFG witness (`argCount := 2`: `_1 : u32`, `_2 : u32`):
+- `bb0`: `_3 = Le(Copy(_1), Copy(_2)); switchInt(Move(_3)) [0 => bb2, otherwise => bb1]`
+- `bb1` (1 statement): `_4 = Copy(_1); goto -> bb3`
+- `bb2` (2 statements, asymmetric fuel!): `_4 = Copy(_2); _1 = Copy(_2); goto -> bb3`
+- `bb3` (shared join block with 2 statements + return):
+  `_0 = Copy(_4); StorageDead(_4); return_`
+-/
+def witnessDiamondShared : CapturedMir where
+  defPath := "Anneal::MirLiftCore::witness_diamond_shared"
+  phase := .runtimeOptimized
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "_0" },
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "a" },
+    { mutability := .not, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "b" },
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessBoolTy, debugName := some "cond" },
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "chosen" }
+  ]
+  basicBlocks := [
+    -- bb0
+    { statements := [
+        { kind := .storageLive 3, span := "s0" },
+        { kind := .storageLive 4, span := "s1" },
+        { kind := .assign { local_ := 3, projection := [] }
+            (.binaryOp .le (.copy { local_ := 1, projection := [] })
+              (.copy { local_ := 2, projection := [] })),
+          span := "s2" }
+      ]
+      terminator := {
+        kind := .switchInt (.move { local_ := 3, projection := [] })
+          { branches := [(0, 2)], otherwise := 1 }
+        span := "t0"
+      }
+      isCleanup := false },
+    -- bb1 (a <= b: 1 statement)
+    { statements := [
+        { kind := .assign { local_ := 4, projection := [] }
+            (.use (.copy { local_ := 1, projection := [] })),
+          span := "s3" }
+      ]
+      terminator := { kind := .goto 3, span := "t1" }
+      isCleanup := false },
+    -- bb2 (a > b: 2 statements — different step count from bb1!)
+    { statements := [
+        { kind := .assign { local_ := 4, projection := [] }
+            (.use (.copy { local_ := 2, projection := [] })),
+          span := "s4" },
+        { kind := .assign { local_ := 1, projection := [] }
+            (.use (.copy { local_ := 2, projection := [] })),
+          span := "s5" }
+      ]
+      terminator := { kind := .goto 3, span := "t2" }
+      isCleanup := false },
+    -- bb3 (shared join & return: 2 statements + return)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.copy { local_ := 4, projection := [] })),
+          span := "s6" },
+        { kind := .storageDead 4, span := "s7" }
+      ]
+      terminator := { kind := .return_, span := "t3" }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [
+      { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct },
+      { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct }
+    ]
+    ret := { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := MirLiftReadyWitness.witnessLayouts
+  allocations := []
+
+theorem checkMirLiftReady_witnessDiamondShared :
+    checkMirLiftReady witnessDiamondShared = true := rfl
+
+theorem checkMirLiftDagReady_witnessDiamondShared :
+    checkMirLiftDagReady witnessDiamondShared = true := rfl
+
+/-- End-to-end verification of `witnessDiamondShared` using
+`liftBlock_switchInt_diamond_shared`: the shared join block `bb3` is proved
+**once** over a symbolic slot `s₁ : LocalSlot` (via single-pass
+`eval_rest_checked_ready`, which reduces across symbolic `s₁` by `rfl`), even
+though `bb1` and `bb2` have different statement counts and leave `_1` in
+different states. -/
+theorem verify_witnessDiamondShared_via_diamond_shared :
+    VerificationResult
+      { body := witnessDiamondShared
+        pre := fun args =>
+          ∃ a b : Nat,
+            args = [.scalar { bits := a, sizeBytes := 4 },
+                    .scalar { bits := b, sizeBytes := 4 }]
+        post := fun args retVal =>
+          ∀ a b : Nat,
+            args = [.scalar { bits := a, sizeBytes := 4 },
+                    .scalar { bits := b, sizeBytes := 4 }] →
+            retVal = .scalar { bits := if a ≤ b then a else b, sizeBytes := 4 }
+        callees := [] } := by
+  have hr := checkMirLiftReady_witnessDiamondShared
+  refine verifyMirNoPanic_of_mirLiftReady_converges _ hr (fun args hpre => ?_)
+  rcases hpre with ⟨a, b, rfl⟩
+  dsimp only
+  let chosen := if a ≤ b then a else b
+  refine liftBlock_switchInt_diamond_shared (thenBb := 1) (elseBb := 2) (joinBb := 3)
+    (sc := boolToScalar (Nat.ble a b)) (C := a ≤ b)
+    (JoinInv := fun env_j =>
+      ∃ s₁ : LocalSlot,
+        env_j = [.uninit, s₁, .init (.scalar ⟨b, 4⟩), .uninit,
+                 .init (.scalar ⟨chosen, 4⟩)])
+    hr (by rfl) (by rfl) rfl (by rfl) ?_ ?_ ?_
+  · intro hle
+    refine ⟨?_, fun h_join => ?_⟩
+    · change lookupSwitchTarget (boolToScalar (Nat.ble a b)).bits [(0, 2)] 1 = 1
+      rw [Nat.ble_eq_true_of_le hle]; rfl
+    · refine LiftBlockConverges.of_lookup (by rfl) ?_
+      refine LiftStmtsConverges.eval_rest_checked_ready hr (by rfl) (by rfl) ?_
+      refine LiftStmtsConverges.term_goto_ready hr (by rfl) rfl rfl ?_
+      exact h_join _ ⟨.init (.scalar ⟨a, 4⟩), by dsimp [chosen]; rw [if_pos hle]⟩
+  · intro hgt
+    have hble : Nat.ble a b = false :=
+      Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (Nat.lt_of_not_le hgt)
+    refine ⟨?_, fun h_join => ?_⟩
+    · change lookupSwitchTarget (boolToScalar (Nat.ble a b)).bits [(0, 2)] 1 = 2
+      rw [hble]; rfl
+    · refine LiftBlockConverges.of_lookup (by rfl) ?_
+      refine LiftStmtsConverges.eval_rest_checked_ready hr (by rfl) (by rfl) ?_
+      refine LiftStmtsConverges.term_goto_ready hr (by rfl) rfl rfl ?_
+      exact h_join _ ⟨.init (.scalar ⟨b, 4⟩), by dsimp [chosen]; rw [if_neg hgt]⟩
+  · intro env_j ⟨s₁, h_env⟩
+    subst h_env
+    refine LiftBlockConverges.of_lookup (by rfl) ?_
+    refine LiftStmtsConverges.eval_rest_checked_ready hr (by rfl) (by rfl) ?_
+    refine LiftStmtsConverges.term_return_ready hr (by rfl) rfl rfl (by rfl) ?_
+    intro a' b' h_eq
+    injection h_eq with ha hb
+    injection hb with hb' _
+    injection ha with ha_sc
+    injection ha_sc with ha_bits _
+    injection hb' with hb_sc
+    injection hb_sc with hb_bits _
+    subst ha_bits hb_bits
+    rfl
+
+end DiamondJoinSharing
+
+/-!
+## Header-Targeted `runCfgToBlock` / `runMirToBlock`, Structural `forRangeUp`, and Fuel-Free Loop Lifting
+-/
+
+section FuelFreeLoops
+
+/-- **`runCfgToBlock`**: header-targeted block stepping on toy `Instr` CFGs
+whose internal ceiling is derived from the CFG (`cfg.length`, an upper bound on
+the length of any header-free acyclic segment), so call sites contain no step
+numerals. -/
+def runCfgToBlock (cfg : List Instr) (target : Nat) (s : CfgState) :
+    TargetOutcome CfgState Nat :=
+  runToTarget (stepCfg cfg) (fun s' => s'.bb == target) cfg.length s
+
+theorem runCfgToBlock_reached_bb {cfg : List Instr} {target : Nat} {s s' : CfgState}
+    (h : runCfgToBlock cfg target s = .reached s') : s'.bb = target := by
+  unfold runCfgToBlock at h
+  have ht := runToTarget_reached_atTarget h
+  exact beq_iff_eq.mp ht
+
+/-- **Target arrival soundness** for `runCfgToBlock`. -/
+theorem stepsTo_of_runCfgToBlock_reached {cfg : List Instr} {target : Nat}
+    {s s' : CfgState} (h : runCfgToBlock cfg target s = .reached s') :
+    StepsTo (stepCfg cfg) s (· = s') :=
+  stepsTo_of_runToTarget_reached h
+
+/-- **Halting soundness** for `runCfgToBlock`. -/
+theorem wpConverges_of_runCfgToBlock_halted {cfg : List Instr} {target : Nat}
+    {s : CfgState} {v : Nat} {post : Nat → Prop}
+    (h : runCfgToBlock cfg target s = .halted v) (hp : post v) :
+    WpConverges (stepCfg cfg) s post :=
+  wpConverges_of_runToTarget_halted h hp
+
+/-- **Stuck soundness** for `runCfgToBlock`. -/
+theorem not_wpConverges_of_runCfgToBlock_stuck {cfg : List Instr} {target : Nat}
+    {s : CfgState} {post : Nat → Prop}
+    (h : runCfgToBlock cfg target s = .stuck) : ¬ WpConverges (stepCfg cfg) s post :=
+  not_wpConverges_of_runToTarget_stuck h
+
+/-- Multi-block `countUp(n)` with a symbolic accumulator (slots `[n, i, acc]`). -/
+def countUpCfg : List Instr :=
+  [.setConst 1 0 1, .branchLt 1 0 2 4, .addConst 2 2 1 3, .addConst 1 1 1 1, .ret 2]
+
+/-- Entry state of `countUp(n)` with accumulator `x` and arbitrary junk in `i`. -/
+def countUpInit (n x junk : Nat) : CfgState := ⟨0, [n, junk, x]⟩
+
+/-- Loop-header state of `countUp`. -/
+def countUpHeader (n i acc : Nat) : CfgState := ⟨1, [n, i, acc]⟩
+
+theorem countUp_entry_step (n x junk : Nat) :
+    stepCfg countUpCfg (countUpInit n x junk) = .cont (countUpHeader n 0 x) := rfl
+
+theorem countUp_header_exit_steps (n acc : Nat) :
+    stepCfg countUpCfg (countUpHeader n n acc) = .cont ⟨4, [n, n, acc]⟩ ∧
+      stepCfg countUpCfg ⟨4, [n, n, acc]⟩ = .done acc := by
+  refine ⟨?_, rfl⟩
+  simp [stepCfg, countUpCfg, countUpHeader]
+
+theorem countUp_header_iter_steps (n i acc : Nat) (hlt : i < n) :
+    stepCfg countUpCfg (countUpHeader n i acc) = .cont ⟨2, [n, i, acc]⟩ ∧
+      stepCfg countUpCfg ⟨2, [n, i, acc]⟩ = .cont ⟨3, [n, i, acc + 1]⟩ ∧
+      stepCfg countUpCfg ⟨3, [n, i, acc + 1]⟩ = .cont (countUpHeader n (i + 1) (acc + 1)) := by
+  refine ⟨?_, rfl, rfl⟩
+  simp [stepCfg, countUpCfg, countUpHeader, hlt]
+
+/-- Exact fuel characterization of `countUp` from its header: with `d = n - i`
+remaining iterations, `3 * d + 2` steps are necessary and sufficient. -/
+theorem evalFuel_countUp_header :
+    ∀ (d n i acc k : Nat), i + d = n →
+      evalFuel (stepCfg countUpCfg) k (countUpHeader n i acc) =
+        if 3 * d + 2 ≤ k then .halted (acc + d) else .outOfFuel
+  | 0, n, i, acc, k, _ => by
+    have hi : i = n := by omega
+    subst hi
+    obtain ⟨h1, h2⟩ := countUp_header_exit_steps i acc
+    match k with
+    | 0 => rfl
+    | 1 => simp [evalFuel, h1]
+    | k + 2 =>
+      simp only [evalFuel, h1, h2]
+      have hk : 3 * 0 + 2 ≤ k + 2 := by omega
+      simp only [hk, ↓reduceIte, Nat.add_zero]
+  | d + 1, n, i, acc, k, _ => by
+    have hlt : i < n := by omega
+    obtain ⟨h1, h2, h3⟩ := countUp_header_iter_steps n i acc hlt
+    have ih := evalFuel_countUp_header d n (i + 1) (acc + 1)
+    match k with
+    | 0 => rfl
+    | 1 => simp [evalFuel, h1]
+    | 2 => simp [evalFuel, h1, h2]
+    | k + 3 =>
+      simp only [evalFuel, h1, h2, h3]
+      rw [ih k (by omega)]
+      by_cases hk : 3 * d + 2 ≤ k
+      · have hk' : 3 * (d + 1) + 2 ≤ k + 3 := by omega
+        simp only [hk, hk', ↓reduceIte, Nat.add_assoc, Nat.add_comm 1 d]
+      · have hk' : ¬ 3 * (d + 1) + 2 ≤ k + 3 := by omega
+        simp only [hk, hk', ↓reduceIte]
+
+/-- Naive explicit-fuel verification of `countUp(n)` needs `3 * n + 3` steps. -/
+theorem countUp_halts_with_fuel (n x junk : Nat) :
+    evalFuel (stepCfg countUpCfg) (3 * n + 3) (countUpInit n x junk) = .halted (x + n) := by
+  have h := evalFuel_countUp_header n n 0 x (3 * n + 2) (by omega)
+  simp only [Nat.le_refl, ↓reduceIte] at h
+  show evalFuel (stepCfg countUpCfg) ((3 * n + 2) + 1) (countUpInit n x junk) = _
+  simp only [evalFuel, countUp_entry_step]
+  exact h
+
+/-- **Impossibility of a uniform fuel constant**: for the multi-block
+`countUp(n)` CFG, no fixed `F : Nat` halts the program for every bound `n`. -/
+theorem no_uniform_fuel_countUp :
+    ¬ ∃ F : Nat, ∀ n : Nat, ∃ v, evalFuel (stepCfg countUpCfg) F (countUpInit n 0 0) = .halted v := by
+  rintro ⟨F, hF⟩
+  obtain ⟨v, hv⟩ := hF F
+  match F, hv with
+  | 0, hv => cases hv
+  | F + 1, hv =>
+    simp only [evalFuel, countUp_entry_step] at hv
+    have hlt : ¬ 3 * (F + 1) + 2 ≤ F := by omega
+    rw [evalFuel_countUp_header (F + 1) (F + 1) 0 0 F (by omega)] at hv
+    simp only [hlt, ↓reduceIte] at hv
+    cases hv
+
+/-- One loop iteration from the re-entrant header `bb1` back to `bb1`: the
+stepper stops at the first re-entry (three block steps), never overshooting. -/
+theorem runCfgToBlock_countUp_iter (n i acc : Nat) (hlt : i < n) :
+    runCfgToBlock countUpCfg 1 (countUpHeader n i acc) =
+      .reached (countUpHeader n (i + 1) (acc + 1)) := by
+  obtain ⟨h1, _, _⟩ := countUp_header_iter_steps n i acc hlt
+  simp only [runCfgToBlock, runToTarget, h1]
+  rfl
+
+/-- Exit from the header halts with the accumulator. -/
+theorem runCfgToBlock_countUp_exit (n acc : Nat) :
+    runCfgToBlock countUpCfg 1 (countUpHeader n n acc) = .halted acc := by
+  obtain ⟨h1, _⟩ := countUp_header_exit_steps n acc
+  simp only [runCfgToBlock, runToTarget, h1]
+  rfl
+
+/-- The entry block reaches the loop header in one step. -/
+theorem runCfgToBlock_countUp_entry (n x junk : Nat) :
+    runCfgToBlock countUpCfg 1 (countUpInit n x junk) = .reached (countUpHeader n 0 x) := rfl
+
+/-- Structurally recursive `for i in lo..hi` fold (re-exported in `MirLiftCore`). -/
+def forRangeUp {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) : α :=
+  PureMirExec.forRangeUp lo hi init step
+
+theorem forRangeUpAux_eq_live {α : Type} (lo hi : Nat)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
+    ∀ (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (acc : α),
+      forRangeUpAux lo hi step i rem hlo hsum acc =
+        Anneal.MirLoops.forRangeUp i hi acc
+          (fun j hj hlt a => step j (Nat.le_trans hlo hj) hlt a)
+  | i, 0, _, _, _ => by
+    rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
+    rfl
+  | i, rem + 1, _, _, _ => by
+    rw [Anneal.MirLoops.forRangeUp_step_of_lt _ _ _ _ (by omega)]
+    exact forRangeUpAux_eq_live lo hi step (i + 1) rem _ _ _
+
+/-- **Bridge to the live `Anneal.MirLoops.forRangeUp`**: the structural fold is
+extensionally identical to the live well-founded definition. -/
+theorem forRangeUp_eq_live {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
+    forRangeUp lo hi init step = Anneal.MirLoops.forRangeUp lo hi init step := by
+  unfold forRangeUp PureMirExec.forRangeUp
+  split
+  · next hle => exact forRangeUpAux_eq_live lo hi step lo (hi - lo) _ _ init
+  · next hgt => rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
+
+/-- **Structural `[lo, hi)` loop induction** (re-exported in `MirLiftCore`). -/
+theorem forRangeUp_induction {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → Prop)
+    (hle : lo ≤ hi) (hinit : inv lo init)
+    (hstep : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a, inv i a → inv (i + 1) (step i hlo hlt a)) :
+    inv hi (forRangeUp lo hi init step) :=
+  PureMirExec.forRangeUp_induction lo hi init step inv hle hinit hstep
+
+/-- Range induction transported to the live `Anneal.MirLoops.forRangeUp`
+through `forRangeUp_eq_live`. -/
+theorem live_forRangeUp_induction {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → Prop)
+    (hle : lo ≤ hi) (hinit : inv lo init)
+    (hstep : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a, inv i a → inv (i + 1) (step i hlo hlt a)) :
+    inv hi (Anneal.MirLoops.forRangeUp lo hi init step) := by
+  rw [← forRangeUp_eq_live]
+  exact forRangeUp_induction lo hi init step inv hle hinit hstep
+
+/-- **Fuel-free total correctness of `countUp(n)` for every symbolic `n`** (and
+symbolic accumulator `x`): the statement contains no fuel numeral, and the proof
+composes `runCfgToBlock` segment soundness with `wpConverges_forRangeUp`. -/
+theorem countUp_wpConverges_all_n (n x junk : Nat) :
+    WpConverges (stepCfg countUpCfg) (countUpInit n x junk) (fun v => v = x + n) := by
+  have hfold : PureMirExec.forRangeUp 0 n x (fun _ _ _ acc => acc + 1) = x + n :=
+    PureMirExec.forRangeUp_induction 0 n x (fun _ _ _ acc => acc + 1) (fun i acc => acc = x + i)
+      (Nat.zero_le n) rfl (fun _ _ _ _ h => by rw [h]; rfl)
+  refine StepsTo.bind_wp (stepsTo_of_runCfgToBlock_reached (runCfgToBlock_countUp_entry n x junk))
+    (fun s₁ hs₁ => ?_)
+  subst hs₁
+  refine wpConverges_forRangeUp (stepCfg countUpCfg) 0 n x (fun _ _ _ acc => acc + 1)
+    (fun i acc s => s = countUpHeader n i acc) (countUpHeader n 0 x) (fun v => v = x + n)
+    (Nat.zero_le n) rfl ?_ ?_
+  · intro i _ hlt a s hs
+    subst hs
+    exact (stepsTo_of_runCfgToBlock_reached (runCfgToBlock_countUp_iter n i a hlt)).mono
+      (fun _ h => h)
+  · intro s_exit hs
+    rw [hfold] at hs
+    subst hs
+    exact wpConverges_of_runCfgToBlock_halted (runCfgToBlock_countUp_exit n (x + n)) rfl
+
+/-- Single-block self-loop (slots `[n, i]`): `bb0` re-enters itself directly. -/
+def selfLoopCfg : List Instr := [.incBranchLt 1 0 0 1, .ret 1]
+
+/-- **No overshoot on self-loops**: from the self-looping header, the stepper
+stops after one iteration even though `bb0` is re-entered immediately. -/
+theorem selfLoop_iter_step (n i : Nat) (hlt : i < n) :
+    stepCfg selfLoopCfg ⟨0, [n, i]⟩ = .cont ⟨0, [n, i + 1]⟩ := by
+  simp [stepCfg, selfLoopCfg, hlt]
+
+theorem selfLoop_exit_steps (n : Nat) :
+    stepCfg selfLoopCfg ⟨0, [n, n]⟩ = .cont ⟨1, [n, n]⟩ ∧
+      stepCfg selfLoopCfg ⟨1, [n, n]⟩ = .done n := by
+  refine ⟨?_, rfl⟩
+  simp [stepCfg, selfLoopCfg]
+
+theorem runCfgToBlock_selfLoop_no_overshoot (n i : Nat) (hlt : i < n) :
+    runCfgToBlock selfLoopCfg 0 ⟨0, [n, i]⟩ = .reached ⟨0, [n, i + 1]⟩ := by
+  simp only [runCfgToBlock, runToTarget, selfLoop_iter_step n i hlt]
+  rfl
+
+/-- The first-hit characterization pins the self-loop successor uniquely. -/
+theorem selfLoop_firstHit_unique (n i : Nat) (hlt : i < n) {m : Nat} {s' : CfgState}
+    (h : FirstHitIn (stepCfg selfLoopCfg) (fun s => s.bb == 0) m ⟨0, [n, i]⟩ s') :
+    s' = ⟨0, [n, i + 1]⟩ ∧ m = 0 :=
+  FirstHitIn.unique h (.here (selfLoop_iter_step n i hlt) rfl)
+
+/-- Fuel-free convergence of the self-loop for every symbolic bound. -/
+theorem selfLoop_wpConverges_all_n (n : Nat) :
+    WpConverges (stepCfg selfLoopCfg) ⟨0, [n, 0]⟩ (fun v => v = n) := by
+  refine wpConverges_forRangeUp (stepCfg selfLoopCfg) 0 n () (fun _ _ _ u => u)
+    (fun i _ s => s = ⟨0, [n, i]⟩) ⟨0, [n, 0]⟩ (fun v => v = n) (Nat.zero_le n) rfl ?_ ?_
+  · intro i _ hlt _ s hs
+    subst hs
+    exact (stepsTo_of_runCfgToBlock_reached (runCfgToBlock_selfLoop_no_overshoot n i hlt)).mono
+      (fun _ h => h)
+  · intro s_exit hs
+    subst hs
+    have hexit : runCfgToBlock selfLoopCfg 0 ⟨0, [n, n]⟩ = .halted n := by
+      simp only [runCfgToBlock, runToTarget, (selfLoop_exit_steps n).1]
+      rfl
+    exact wpConverges_of_runCfgToBlock_halted hexit rfl
+
+/-- `.stuck` is reported for a jump to a missing block and soundly refutes
+convergence. -/
+theorem runCfgToBlock_stuck_example :
+    runCfgToBlock [.goto 7] 0 ⟨0, []⟩ = .stuck ∧
+      ¬ WpConverges (stepCfg [.goto 7]) ⟨0, []⟩ (fun _ => True) :=
+  ⟨rfl, not_wpConverges_of_runCfgToBlock_stuck (target := 0) rfl⟩
+
+/-- `.outOfFuel` is inconclusive and ceiling-sensitive. -/
+theorem runToTarget_outOfFuel_vs_reached (n i acc : Nat) (hlt : i < n) :
+    runToTarget (stepCfg countUpCfg) (fun s => s.bb == 1) 0 (countUpHeader n i acc) = .outOfFuel ∧
+      runToTarget (stepCfg countUpCfg) (fun s => s.bb == 1) 2 (countUpHeader n i acc) =
+        .reached (countUpHeader n (i + 1) (acc + 1)) := by
+  obtain ⟨h1, h2, h3⟩ := countUp_header_iter_steps n i acc hlt
+  refine ⟨?_, ?_⟩
+  · simp only [runToTarget, h1, runUntilTarget]; rfl
+  · simp only [runToTarget, h1, runUntilTarget, h2, h3]; rfl
+
+/-- Non-terminating single-block self-loop (`bb0: goto bb0`). -/
+def infiniteLoopCfg : List Instr := [.goto 0]
+
+theorem stepCfg_infiniteLoop (env : List Nat) :
+    stepCfg infiniteLoopCfg ⟨0, env⟩ = .cont ⟨0, env⟩ := rfl
+
+/-- **Non-terminating loop fuel characterization**: under every finite fuel
+budget `k`, `infiniteLoopCfg` returns `.outOfFuel` (never `.halted` or `.faulted`). -/
+theorem evalFuel_infiniteLoop_outOfFuel :
+    ∀ (k : Nat) (env : List Nat),
+      evalFuel (stepCfg infiniteLoopCfg) k ⟨0, env⟩ = .outOfFuel
+  | 0, _ => rfl
+  | k + 1, env => evalFuel_infiniteLoop_outOfFuel k env
+
+/-- **Non-terminating loop refutes `WpConverges`**. -/
+theorem not_wpConverges_infiniteLoop (env : List Nat) (post : Nat → Prop) :
+    ¬ WpConverges (stepCfg infiniteLoopCfg) ⟨0, env⟩ post := by
+  rintro ⟨k, v, hk, _⟩
+  rw [evalFuel_infiniteLoop_outOfFuel k env] at hk
+  cases hk
+
+theorem runUntilTarget_infiniteLoop_unreached :
+    ∀ (bound : Nat) (env : List Nat),
+      runUntilTarget (stepCfg infiniteLoopCfg) (fun s => s.bb == 1) bound ⟨0, env⟩ = .outOfFuel
+  | 0, _ => rfl
+  | bound + 1, env => runUntilTarget_infiniteLoop_unreached bound env
+
+/-- Targeting an unreachable exit block (`bb1`) on `infiniteLoopCfg` returns
+`.outOfFuel` for every ceiling `bound`, whereas targeting the loop header (`bb0`)
+stops after one step without overshooting. -/
+theorem runToTarget_infiniteLoop_outOfFuel (bound : Nat) (env : List Nat) :
+    runToTarget (stepCfg infiniteLoopCfg) (fun s => s.bb == 1) bound ⟨0, env⟩ = .outOfFuel ∧
+      runCfgToBlock infiniteLoopCfg 0 ⟨0, env⟩ = .reached ⟨0, env⟩ :=
+  ⟨runUntilTarget_infiniteLoop_unreached bound env, rfl⟩
+
+theorem inferMinFragment_countUp :
+    inferMinFragment (toMirShape countUpCfg) = .pureBoundedLoop := by
+  rw [inferMinFragment_toMirShape]
+  rfl
+
+theorem inferMinFragment_selfLoop :
+    inferMinFragment (toMirShape selfLoopCfg) = .pureBoundedLoop := by
+  rw [inferMinFragment_toMirShape]
+  rfl
+
+/-- **Fuel-free range-loop rule for live MIR**, stated with the live
+`Anneal.MirLoops.forRangeUp`. -/
+theorem mirWpConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState) (post : MirOutcome → Prop) (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
+      inv i a s → StepsTo (mirStep body) s (inv (i + 1) (f i hlo hlt a)))
+    (hexit : ∀ s_exit, inv hi (Anneal.MirLoops.forRangeUp lo hi init f) s_exit →
+      WpConverges (mirStep body) s_exit post) :
+    Anneal.MirFuelFree.MirWpConverges body s₀ post := by
+  refine mirWpConverges_of_wpConverges
+    (wpConverges_forRangeUp (mirStep body) lo hi init f inv s₀ post hle hinit hiter ?_)
+  intro s_exit h
+  change inv hi (forRangeUp lo hi init f) s_exit at h
+  rw [forRangeUp_eq_live] at h
+  exact hexit s_exit h
+
+/-- **Call-free range-loop rule for live MIR (`MirNoCallWpConverges`)** via `StepsTo (mirStep body)`. -/
+theorem mirNoCallWpConverges_forRangeUp_of_stepsTo {α : Type}
+    (body : CapturedMir) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState) (post : MirOutcome → Prop) (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
+      inv i a s → StepsTo (mirStep body) s (inv (i + 1) (f i hlo hlt a)))
+    (hexit : ∀ s_exit, inv hi (Anneal.MirLoops.forRangeUp lo hi init f) s_exit →
+      WpConverges (mirStep body) s_exit post) :
+    Anneal.MirFuelFree.MirNoCallWpConverges body s₀ post := by
+  refine mirNoCallWpConverges_of_wpConverges
+    (wpConverges_forRangeUp (mirStep body) lo hi init f inv s₀ post hle hinit hiter ?_)
+  intro s_exit h
+  change inv hi (forRangeUp lo hi init f) s_exit at h
+  rw [forRangeUp_eq_live] at h
+  exact hexit s_exit h
+
+/-- **Header-targeted `runMirToBlock` range-loop rule (`MirNoCallWpConverges`)**:
+takes an entry segment to `headerBb`, per-iteration `runMirToBlock` re-entry to
+`headerBb`, and a halting exit segment from `headerBb`, discharging the loop
+with zero fuel numerals. -/
+theorem mirNoCallWpConverges_forRangeUp_of_runMirToBlock {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (stateAt : Nat → α → MachineState)
+    (s₀ : MachineState) (post : MirOutcome → Prop)
+    (hle : lo ≤ hi)
+    (hentry : runMirToBlock body headerBb s₀ = .reached (stateAt lo init))
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
+      runMirToBlock body headerBb (stateAt i a) =
+        .reached (stateAt (i + 1) (f i hlo hlt a)))
+    (hexit : ∃ out,
+      runMirToBlock body headerBb (stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) =
+        .halted out ∧ post out) :
+    Anneal.MirFuelFree.MirNoCallWpConverges body s₀ post := by
+  refine mirNoCallWpConverges_of_stepsTo_bind
+    (stepsTo_of_runToTarget_reached hentry) (fun s₁ hs₁ => ?_)
+  subst hs₁
+  refine mirNoCallWpConverges_forRangeUp_of_stepsTo body lo hi init f
+    (fun i a s => s = stateAt i a) (stateAt lo init) post hle rfl ?_ ?_
+  · intro i hlo hlt a s hs
+    subst hs
+    exact stepsTo_of_runToTarget_reached (hiter i hlo hlt a)
+  · intro s_exit hs
+    subst hs
+    obtain ⟨out, hout, hp⟩ := hexit
+    exact wpConverges_of_runToTarget_halted hout hp
+
+/-- **Header-targeted `runMirToBlock` range-loop rule (`MirWpConverges`)**. -/
+theorem mirWpConverges_forRangeUp_of_runMirToBlock {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (stateAt : Nat → α → MachineState)
+    (s₀ : MachineState) (post : MirOutcome → Prop)
+    (hle : lo ≤ hi)
+    (hentry : runMirToBlock body headerBb s₀ = .reached (stateAt lo init))
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
+      runMirToBlock body headerBb (stateAt i a) =
+        .reached (stateAt (i + 1) (f i hlo hlt a)))
+    (hexit : ∃ out,
+      runMirToBlock body headerBb (stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) =
+        .halted out ∧ post out) :
+    Anneal.MirFuelFree.MirWpConverges body s₀ post :=
+  Anneal.MirFuelFree.MirWpConverges.of_noCall
+    (mirNoCallWpConverges_forRangeUp_of_runMirToBlock body headerBb lo hi init f
+      stateAt s₀ post hle hentry hiter hexit)
+
+/-- **Alias-erased `PureMirConverges` range-loop rule via `runMirToBlock`**. -/
+theorem pureMirConverges_forRangeUp_of_runMirToBlock {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (stateAt : Nat → α → PureState)
+    (ps₀ : PureState) (post : Value → Prop)
+    (hle : lo ≤ hi)
+    (hentry : runMirToBlock body headerBb (ps₀.toMachineState emptyMemory) =
+      .reached ((stateAt lo init).toMachineState emptyMemory))
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
+      runMirToBlock body headerBb ((stateAt i a).toMachineState emptyMemory) =
+        .reached ((stateAt (i + 1) (f i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∃ retVal mem',
+      runMirToBlock body headerBb
+        ((stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem')) ∧ post retVal) :
+    PureMirConverges body ps₀ post := by
+  refine mirWpConverges_forRangeUp_of_runMirToBlock body headerBb lo hi init f
+    (fun i a => (stateAt i a).toMachineState emptyMemory)
+    (ps₀.toMachineState emptyMemory)
+    (mirNormalPost (fun retVal _ => post retVal))
+    hle hentry hiter ?_
+  obtain ⟨retVal, mem', hout, hp⟩ := hexit
+  exact ⟨.normal (retVal, mem'), hout, hp⟩
+
+/-- **Stateless `VerificationResult` gate for `.pureBoundedLoop` via `runMirToBlock` + `forRangeUp`**. -/
+theorem verifyMirNoPanic_forRangeUp_of_runMirToBlock {α : Type}
+    (c : Claim)
+    (h_pure : checkPureMir c.body = true)
+    (headerBb : BasicBlockIdx)
+    (lo hi : List Value → Nat)
+    (init : List Value → α)
+    (f : (args : List Value) → (i : Nat) → lo args ≤ i → i < hi args → α → α)
+    (stateAt : List Value → Nat → α → PureState)
+    (hle : ∀ args, c.pre args → lo args ≤ hi args)
+    (hentry : ∀ args, c.pre args →
+      runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+        .reached ((stateAt args (lo args) (init args)).toMachineState emptyMemory))
+    (hiter : ∀ args, c.pre args → ∀ i (hlo : lo args ≤ i) (hlt : i < hi args) a,
+      runMirToBlock c.body headerBb ((stateAt args i a).toMachineState emptyMemory) =
+        .reached ((stateAt args (i + 1) (f args i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∀ args, c.pre args → ∃ retVal mem',
+      runMirToBlock c.body headerBb
+        ((stateAt args (hi args)
+          (Anneal.MirLoops.forRangeUp (lo args) (hi args) (init args) (f args))).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem')) ∧ c.post args retVal) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_pureExec c h_pure (fun args hp =>
+    pureMirConverges_forRangeUp_of_runMirToBlock c.body headerBb
+      (lo args) (hi args) (init args) (f args) (stateAt args)
+      (initPureState c.body args) (c.post args)
+      (hle args hp) (hentry args hp) (hiter args hp) (hexit args hp))
+
+/-- **Stateful `StatefulVerificationResult` gate for `.pureBoundedLoop` via `runMirToBlock` + `forRangeUp`**. -/
+theorem verifyStatefulMirNoPanic_forRangeUp_of_runMirToBlock {α : Type}
+    (c : StatefulClaim)
+    (h_pure : checkPureMir c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (headerBb : BasicBlockIdx)
+    (lo hi : List Value → Memory → Nat)
+    (init : List Value → Memory → α)
+    (f : (args : List Value) → (mem : Memory) → (i : Nat) → lo args mem ≤ i → i < hi args mem → α → α)
+    (stateAt : List Value → Memory → Nat → α → PureState)
+    (hle : ∀ args mem, c.pre args mem → lo args mem ≤ hi args mem)
+    (hentry : ∀ args mem, c.pre args mem →
+      runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (lo args mem) (init args mem)).toMachineState emptyMemory))
+    (hiter : ∀ args mem, c.pre args mem → ∀ i (hlo : lo args mem ≤ i) (hlt : i < hi args mem) a,
+      runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (i + 1) (f args mem i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∀ args mem, c.pre args mem → ∃ retVal mem_e,
+      runMirToBlock c.body headerBb
+        ((stateAt args mem (hi args mem)
+          (Anneal.MirLoops.forRangeUp (lo args mem) (hi args mem) (init args mem) (f args mem))).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem_e)) ∧
+        c.post args mem retVal
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees).memory) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirNoPanic_of_pureExec c h_pure h_root (fun args mem hp =>
+    pureMirConverges_forRangeUp_of_runMirToBlock c.body headerBb
+      (lo args mem) (hi args mem) (init args mem) (f args mem) (stateAt args mem)
+      (initPureState c.body args) _
+      (hle args mem hp) (hentry args mem hp) (hiter args mem hp) (hexit args mem hp))
+
+/-- **Total-correctness `TotalVerificationResult` gate for `.pureBoundedLoop` via `runMirToBlock` + `forRangeUp`**. -/
+theorem verifyTotalMir_forRangeUp_of_runMirToBlock {α : Type}
+    (c : TotalClaim)
+    (h_pure : checkPureMir c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (headerBb : BasicBlockIdx)
+    (lo hi : List Value → Memory → Nat)
+    (init : List Value → Memory → α)
+    (f : (args : List Value) → (mem : Memory) → (i : Nat) → lo args mem ≤ i → i < hi args mem → α → α)
+    (stateAt : List Value → Memory → Nat → α → PureState)
+    (hle : ∀ args mem, c.pre args mem → lo args mem ≤ hi args mem)
+    (hentry : ∀ args mem, c.pre args mem →
+      runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (lo args mem) (init args mem)).toMachineState emptyMemory))
+    (hiter : ∀ args mem, c.pre args mem → ∀ i (hlo : lo args mem ≤ i) (hlt : i < hi args mem) a,
+      runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (i + 1) (f args mem i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∀ args mem, c.pre args mem → ∃ retVal mem_e,
+      runMirToBlock c.body headerBb
+        ((stateAt args mem (hi args mem)
+          (Anneal.MirLoops.forRangeUp (lo args mem) (hi args mem) (init args mem) (f args mem))).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem_e)) ∧
+        c.post args mem retVal
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees).memory) :
+    TotalVerificationResult c :=
+  verifyTotalMir_of_pureExec c h_pure h_root (fun args mem hp =>
+    pureMirConverges_forRangeUp_of_runMirToBlock c.body headerBb
+      (lo args mem) (hi args mem) (init args mem) (f args mem) (stateAt args mem)
+      (initPureState c.body args) _
+      (hle args mem hp) (hentry args mem hp) (hiter args mem hp) (hexit args mem hp))
+
+/-- Entry segment of the live `Anneal.MirLoops.countToNBody n` executed through
+`runMirToBlock` (reaches loop header `bb1` in two steps). -/
+theorem runMirToBlock_countToN_entry (n : Nat) :
+    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+      (Anneal.MirLoops.countStateMem 0 0 0 emptyMemory) =
+      .reached (Anneal.MirLoops.countStateMem 1 0 0 emptyMemory) := rfl
+
+/-- Loop-body iteration segment of the live `Anneal.MirLoops.countToNBody n`
+executed through `runMirToBlock`: steps across `bb1`'s `.switchInt` (`.emitStep`)
+and `bb2`'s increment + `goto 1` back to `bb1` without overshooting. -/
+theorem runMirToBlock_countToN_iter (n i : Nat) (hlt : i < n) (hn : n < 4294967296) :
+    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+      (Anneal.MirLoops.countStateMem 1 0 i emptyMemory) =
+      .reached (Anneal.MirLoops.countStateMem 1 0 (i + 1) emptyMemory) := by
+  have hbeq : Nat.beq i n = false := (Bool.not_eq_true _).mp (Nat.ne_of_lt hlt ∘ Nat.eq_of_beq_eq_true)
+  have hs1 : mirStep (Anneal.MirLoops.countToNBody n) (Anneal.MirLoops.countStateMem 1 0 i emptyMemory) =
+      .cont (Anneal.MirLoops.countStateMem (match Nat.beq i n with | true => 3 | false => 2) 0 i emptyMemory) := rfl
+  rw [hbeq] at hs1
+  have hs2 : mirStep (Anneal.MirLoops.countToNBody n) (Anneal.MirLoops.countStateMem 2 0 i emptyMemory) =
+      .cont (Anneal.MirLoops.countStateMem 2 1 (i + 1) emptyMemory) := by
+    have hmod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt (by omega)
+    unfold mirStep stepMirFn
+    dsimp [Anneal.MirLoops.countStateMem, emptyMemory]
+    simp [Anneal.MirLoops.countToNBody, Anneal.MirLoops.mkMirBody,
+      Anneal.MirLoops.constU32, Trusted.Sequence.get?, evalStmt, evalOperand,
+      readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?,
+      invalidateConflictingBorrows, hmod]
+    rfl
+  have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
+      (Anneal.MirLoops.countStateMem 2 1 (i + 1) emptyMemory) =
+      .cont (Anneal.MirLoops.countStateMem 1 0 (i + 1) emptyMemory) := rfl
+  unfold runMirToBlock
+  have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+/-- Loop-exit segment of the live `Anneal.MirLoops.countToNBody n` executed
+through `runMirToBlock`: steps from `bb1` (`i = n`) through `bb3` to `.halted`. -/
+theorem runMirToBlock_countToN_exit (n : Nat) :
+    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+      (Anneal.MirLoops.countStateMem 1 0 n emptyMemory) =
+      .halted (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := by
+  have hs1 : mirStep (Anneal.MirLoops.countToNBody n) (Anneal.MirLoops.countStateMem 1 0 n emptyMemory) =
+      .cont (Anneal.MirLoops.countStateMem (match Nat.beq n n with | true => 3 | false => 2) 0 n emptyMemory) := rfl
+  rw [Nat.beq_refl] at hs1
+  have hs2 : mirStep (Anneal.MirLoops.countToNBody n) (Anneal.MirLoops.countStateMem 3 0 n emptyMemory) =
+      .cont (Anneal.MirLoops.countStateMemRet 3 1 n emptyMemory) := rfl
+  have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
+      (Anneal.MirLoops.countStateMemRet 3 1 n emptyMemory) =
+      .done (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := rfl
+  unfold runMirToBlock
+  have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+/-- **End-to-end live `CapturedMir` fuel-free loop verification**:
+`Anneal.MirLoops.countToNBody n` converges for every symbolic `n < 2^32` via
+`runMirToBlock` + `mirWpConverges_forRangeUp` with zero fuel numerals. -/
+theorem live_countToN_mirWpConverges_all_n (n : Nat) (hn : n < 4294967296) :
+    Anneal.MirFuelFree.MirWpConverges (Anneal.MirLoops.countToNBody n)
+      (Anneal.MirLoops.countStateMem 0 0 0 emptyMemory)
+      (fun out => out = .normal (.scalar ⟨n, 4⟩, emptyMemory)) :=
+  mirWpConverges_forRangeUp_of_runMirToBlock
+    (Anneal.MirLoops.countToNBody n) 1 0 n () (fun _ _ _ u => u)
+    (fun i _ => Anneal.MirLoops.countStateMem 1 0 i emptyMemory)
+    (Anneal.MirLoops.countStateMem 0 0 0 emptyMemory)
+    (fun out => out = .normal (.scalar ⟨n, 4⟩, emptyMemory))
+    (Nat.zero_le n)
+    (runMirToBlock_countToN_entry n)
+    (fun i _ hlt _ => runMirToBlock_countToN_iter n i hlt hn)
+    ⟨.normal (.scalar ⟨n, 4⟩, emptyMemory), runMirToBlock_countToN_exit n, rfl⟩
+
+/-- Call-free `MirNoCallWpConverges` verification of `Anneal.MirLoops.countToNBody n`
+over every symbolic `n < 2^32`. -/
+theorem live_countToN_mirNoCallWpConverges_all_n (n : Nat) (hn : n < 4294967296) :
+    Anneal.MirFuelFree.MirNoCallWpConverges (Anneal.MirLoops.countToNBody n)
+      (Anneal.MirLoops.countStateMem 0 0 0 emptyMemory)
+      (fun out => out = .normal (.scalar ⟨n, 4⟩, emptyMemory)) :=
+  mirNoCallWpConverges_forRangeUp_of_runMirToBlock
+    (Anneal.MirLoops.countToNBody n) 1 0 n () (fun _ _ _ u => u)
+    (fun i _ => Anneal.MirLoops.countStateMem 1 0 i emptyMemory)
+    (Anneal.MirLoops.countStateMem 0 0 0 emptyMemory)
+    (fun out => out = .normal (.scalar ⟨n, 4⟩, emptyMemory))
+    (Nat.zero_le n)
+    (runMirToBlock_countToN_entry n)
+    (fun i _ hlt _ => runMirToBlock_countToN_iter n i hlt hn)
+    ⟨.normal (.scalar ⟨n, 4⟩, emptyMemory), runMirToBlock_countToN_exit n, rfl⟩
+
+theorem checkPureMir_countToNBody (n : Nat) :
+    checkPureMir (Anneal.MirLoops.countToNBody n) = true := rfl
+
+theorem inferMinFragment_countToNBody (n : Nat) :
+    inferMinFragment (Anneal.MirLoops.countToNBody n) = .pureBoundedLoop := rfl
+
+/-- Alias-erased `PureState` for `Anneal.MirLoops.countToNBody n` starting from
+`initPureState` (where return slot `_0` is `.uninit` until exit block `bb3`). -/
+def countToNPureState (bb stmt i : Nat) : PureState :=
+  { bb := bb, stmtIdx := stmt, env := [.uninit, .init (.scalar ⟨i, 4⟩)] }
+
+theorem runMirToBlock_countToN_entry_initPureState (n : Nat) (v₀ : Value) :
+    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+      ((initPureState (Anneal.MirLoops.countToNBody n) [v₀]).toMachineState emptyMemory) =
+      .reached ((countToNPureState 1 0 0).toMachineState emptyMemory) := rfl
+
+theorem runMirToBlock_countToN_iter_initPureState (n i : Nat) (hlt : i < n) (hn : n < 4294967296) :
+    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+      ((countToNPureState 1 0 i).toMachineState emptyMemory) =
+      .reached ((countToNPureState 1 0 (i + 1)).toMachineState emptyMemory) := by
+  have hbeq : Nat.beq i n = false := (Bool.not_eq_true _).mp (Nat.ne_of_lt hlt ∘ Nat.eq_of_beq_eq_true)
+  have hs1 : mirStep (Anneal.MirLoops.countToNBody n) ((countToNPureState 1 0 i).toMachineState emptyMemory) =
+      .cont ((countToNPureState (match Nat.beq i n with | true => 3 | false => 2) 0 i).toMachineState emptyMemory) := rfl
+  rw [hbeq] at hs1
+  have hs2 : mirStep (Anneal.MirLoops.countToNBody n) ((countToNPureState 2 0 i).toMachineState emptyMemory) =
+      .cont ((countToNPureState 2 1 (i + 1)).toMachineState emptyMemory) := by
+    have hmod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt (by omega)
+    unfold mirStep stepMirFn
+    dsimp [countToNPureState, PureState.toMachineState, emptyMemory]
+    simp [Anneal.MirLoops.countToNBody, Anneal.MirLoops.mkMirBody,
+      Anneal.MirLoops.constU32, Trusted.Sequence.get?, evalStmt, evalOperand,
+      readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?,
+      invalidateConflictingBorrows, hmod]
+    rfl
+  have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
+      ((countToNPureState 2 1 (i + 1)).toMachineState emptyMemory) =
+      .cont ((countToNPureState 1 0 (i + 1)).toMachineState emptyMemory) := rfl
+  unfold runMirToBlock
+  have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+theorem runMirToBlock_countToN_exit_initPureState (n : Nat) :
+    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+      ((countToNPureState 1 0 n).toMachineState emptyMemory) =
+      .halted (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := by
+  have hs1 : mirStep (Anneal.MirLoops.countToNBody n) ((countToNPureState 1 0 n).toMachineState emptyMemory) =
+      .cont ((countToNPureState (match Nat.beq n n with | true => 3 | false => 2) 0 n).toMachineState emptyMemory) := rfl
+  rw [Nat.beq_refl] at hs1
+  have hs2 : mirStep (Anneal.MirLoops.countToNBody n) ((countToNPureState 3 0 n).toMachineState emptyMemory) =
+      .cont { frame := { blockIdx := 3, stmtIdx := 1, locals := [.init (.scalar ⟨n, 4⟩), .init (.scalar ⟨n, 4⟩)] }, memory := emptyMemory } := rfl
+  have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
+      { frame := { blockIdx := 3, stmtIdx := 1, locals := [.init (.scalar ⟨n, 4⟩), .init (.scalar ⟨n, 4⟩)] }, memory := emptyMemory } =
+      .done (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := rfl
+  unfold runMirToBlock
+  have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+/-- Alias-erased `PureMirConverges` from `initPureState (countToNBody n) [v₀]`
+for every symbolic `n < 2^32`. -/
+theorem live_countToN_pureMirConverges_all_n (n : Nat) (hn : n < 4294967296) (v₀ : Value) :
+    PureMirConverges (Anneal.MirLoops.countToNBody n)
+      (initPureState (Anneal.MirLoops.countToNBody n) [v₀])
+      (fun retVal => retVal = .scalar ⟨n, 4⟩) :=
+  pureMirConverges_forRangeUp_of_runMirToBlock
+    (Anneal.MirLoops.countToNBody n) 1 0 n () (fun _ _ _ u => u)
+    (fun i _ => countToNPureState 1 0 i)
+    (initPureState (Anneal.MirLoops.countToNBody n) [v₀])
+    (fun retVal => retVal = .scalar ⟨n, 4⟩)
+    (Nat.zero_le n)
+    (runMirToBlock_countToN_entry_initPureState n v₀)
+    (fun i _ hlt _ => runMirToBlock_countToN_iter_initPureState n i hlt hn)
+    ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToN_exit_initPureState n, rfl⟩
+
+/-- Stateless `VerificationResult` for `Anneal.MirLoops.countToNBody n` over
+every symbolic `n < 2^32` with zero fuel numerals. -/
+theorem live_countToN_verifyMir_all_n (n : Nat) (hn : n < 4294967296) :
+    VerificationResult
+      { body := Anneal.MirLoops.countToNBody n
+        pre := fun args => ∃ v₀, args = [v₀]
+        post := fun _ retVal => retVal = .scalar ⟨n, 4⟩
+        callees := [] } :=
+  verifyMirNoPanic_forRangeUp_of_runMirToBlock _
+    (checkPureMir_countToNBody n) 1
+    (fun _ => 0) (fun _ => n) (fun _ => ()) (fun _ _ _ _ u => u)
+    (fun _ i _ => countToNPureState 1 0 i)
+    (fun _ _ => Nat.zero_le n)
+    (fun args ⟨v₀, hargs⟩ => by subst hargs; exact runMirToBlock_countToN_entry_initPureState n v₀)
+    (fun _ _ i _ hlt _ => runMirToBlock_countToN_iter_initPureState n i hlt hn)
+    (fun _ _ => ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToN_exit_initPureState n, rfl⟩)
+
+/-- **End-to-end `StatefulVerificationResult` for live `Anneal.MirLoops.countToNBody n`**
+over every symbolic `n < 2^32` and arbitrary root-active memory `mem`, with
+zero fuel numerals and purely constructive axioms (`⊆ {propext, Quot.sound}`). -/
+theorem live_countToN_statefulVerificationResult_all_n (n : Nat) (hn : n < 4294967296) :
+    StatefulVerificationResult
+      { body := Anneal.MirLoops.countToNBody n
+        pre := fun args mem => (∃ v₀, args = [v₀]) ∧ RootActiveMemory mem
+        post := fun _ mem retVal mem' =>
+          mem' = mem ∧ retVal = .scalar ⟨n, 4⟩
+        callees := [] } :=
+  verifyStatefulMirNoPanic_forRangeUp_of_runMirToBlock _
+    (checkPureMir_countToNBody n)
+    (fun _ _ hp => hp.2) 1
+    (fun _ _ => 0) (fun _ _ => n) (fun _ _ => ()) (fun _ _ _ _ _ u => u)
+    (fun _ _ i _ => countToNPureState 1 0 i)
+    (fun _ _ _ => Nat.zero_le n)
+    (fun args _ ⟨⟨v₀, hargs⟩, _⟩ => by rw [hargs]; exact runMirToBlock_countToN_entry_initPureState n v₀)
+    (fun _ _ _ i _ hlt _ => runMirToBlock_countToN_iter_initPureState n i hlt hn)
+    (fun _ _ _ => ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToN_exit_initPureState n, rfl, rfl⟩)
+
+/-- **End-to-end `TotalVerificationResult` for live `Anneal.MirLoops.countToNBody n`**
+over every symbolic `n < 2^32` and arbitrary root-active memory `mem`, with
+zero fuel numerals in the statement or proof. -/
+theorem live_countToN_totalVerificationResult_all_n (n : Nat) (hn : n < 4294967296) :
+    TotalVerificationResult
+      { body := Anneal.MirLoops.countToNBody n
+        pre := fun args mem => (∃ v₀, args = [v₀]) ∧ RootActiveMemory mem
+        post := fun _ mem retVal mem' =>
+          mem' = mem ∧ retVal = .scalar ⟨n, 4⟩
+        callees := [] } :=
+  verifyTotalMir_forRangeUp_of_runMirToBlock _
+    (checkPureMir_countToNBody n)
+    (fun _ _ hp => hp.2) 1
+    (fun _ _ => 0) (fun _ _ => n) (fun _ _ => ()) (fun _ _ _ _ _ u => u)
+    (fun _ _ i _ => countToNPureState 1 0 i)
+    (fun _ _ _ => Nat.zero_le n)
+    (fun args _ ⟨⟨v₀, hargs⟩, _⟩ => by rw [hargs]; exact runMirToBlock_countToN_entry_initPureState n v₀)
+    (fun _ _ _ i _ hlt _ => runMirToBlock_countToN_iter_initPureState n i hlt hn)
+    (fun _ _ _ => ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToN_exit_initPureState n, rfl, rfl⟩)
+
+/-- **Concrete witness that live `Anneal.FunctionalTranslation.runMirToBlock` conflates
+normal halting, faulting, and out-of-fuel**: on the live `Anneal.MirLoops.countToNBody n`,
+stepping from the return block `bb3`, from an invalid block `bb99`, and from `bb0` with
+insufficient fuel all evaluate to `none` in the live stepper, whereas `runUntilTarget`
+distinguishes `.halted`, `.stuck`, and `.outOfFuel`. -/
+theorem live_runMirToBlock_conflates_halt_stuck_outOfFuel (n : Nat) :
+    let body := Anneal.MirLoops.countToNBody n
+    let atHdr := fun (ms : MachineState) => ms.frame.blockIdx == 1 && ms.frame.stmtIdx == 0
+    let sHalt := Anneal.MirLoops.countStateMem 3 0 n emptyMemory
+    let sFault := Anneal.MirLoops.countStateMem 99 0 0 emptyMemory
+    let sOOF := Anneal.MirLoops.countStateMem 0 0 0 emptyMemory
+    runUntilTarget (mirStep body) atHdr 7 sHalt = .halted (.normal (.scalar ⟨n, 4⟩, emptyMemory)) ∧
+      Anneal.FunctionalTranslation.runMirToBlock 8 body 1 sHalt = none ∧
+      runUntilTarget (mirStep body) atHdr 7 sFault = .stuck ∧
+      Anneal.FunctionalTranslation.runMirToBlock 8 body 1 sFault = none ∧
+      runUntilTarget (mirStep body) atHdr 1 sOOF = .outOfFuel ∧
+      Anneal.FunctionalTranslation.runMirToBlock 2 body 1 sOOF = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+end FuelFreeLoops
+
+end Anneal.MirLiftCore
