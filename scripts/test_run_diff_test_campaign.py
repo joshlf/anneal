@@ -7812,5 +7812,401 @@ class PassEp2A1AdversarialRegressionTest(unittest.TestCase):
         self.assertEqual(ledger["resolved_history"][miri_fp]["witness_polarity"], UNSOUND)
 
 
+class PassEp2B2AdversarialRegressionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_every_mutator_token_in_mutators_miri_rs_attributes_to_its_owning_mutator(
+        self,
+    ) -> None:
+        """Every `__<ident>` local introduced inside each `impl MiriAstMutator for ...`
+        block in `crates/anneal-difftest/src/mutators_miri.rs` (including Episode 1's
+        new intrinsic, move-borrow, `Operand::Copy`, `FnEntry` protector, `write_bytes!`,
+        `copy_nonoverlapping`, and `arith_offset` templates) must attribute to its
+        owning mutator in `infer_finding_cause`, even when `seed_name` is a known
+        corpus bug seed and `applied_mutators` lists a different mutator first."""
+        src = MUTATORS_MIRI_RS.read_text(encoding="utf-8")
+        checked = 0
+        for mutator in campaign.MIRI_MUTATOR_NAMES:
+            marker = f"impl MiriAstMutator for {mutator}"
+            start = src.index(marker)
+            # Extract up to the matching top-level closing `}` of the `impl` block.
+            end = src.index("\n}\n", start)
+            block = src[start:end]
+            idents = sorted(set(re.findall(r"\b__[a-zA-Z0-9_]+\b", block)))
+            self.assertTrue(idents, mutator)
+            other_mutator = next(m for m in campaign.MIRI_MUTATOR_NAMES if m != mutator)
+            for ident in idents:
+                sample_ident = f"{ident}42" if ident.endswith("_") else ident
+                with self.subTest(mutator=mutator, ident=sample_ident):
+                    finding = {
+                        "seed_name": "known_bug_seed",
+                        "applied_mutators": [other_mutator, mutator],
+                        "mutant_source": (
+                            "pub fn known_bug_seed__b0_c0() -> u32 {\n"
+                            "    let seed_local: u32 = 10u32;\n"
+                            f"    let {sample_ident}: u32 = seed_local;\n"
+                            f"    {sample_ident}\n"
+                            "}\n"
+                        ),
+                        "miri_pos": "src/lib.rs:3:5",
+                    }
+                    self.assertTrue(
+                        any(t in sample_ident for t in campaign.ALL_MIRI_MUTATOR_TOKENS),
+                        f"{sample_ident!r} missing from ALL_MIRI_MUTATOR_TOKENS",
+                    )
+                    self.assertEqual(
+                        campaign.infer_finding_cause(finding, {"known_bug_seed"}),
+                        mutator,
+                    )
+                    checked += 1
+        self.assertGreaterEqual(checked, 120)
+
+        # Explicit regression checks for the two cross-mutator prefix collisions:
+        # 1. `PlaceProjectionWrapper::Panic`'s `let __miri_proj_1: u32 = __oob_arr[__oob_idx];`
+        #    must attribute to `PlaceProjectionWrapper`, never `RawPtrOffsetMutator`.
+        proj_panic_finding = {
+            "seed_name": "seed_a",
+            "applied_mutators": ["RawPtrOffsetMutator", "PlaceProjectionWrapper"],
+            "mutant_source": (
+                "pub fn seed_a__b0_c0() -> u32 {\n"
+                "    let __oob_arr: [u32; 3] = [1u32, 2u32, 3u32];\n"
+                "    let __oob_idx: usize = 4usize;\n"
+                "    let __miri_proj_1: u32 = __oob_arr[__oob_idx];\n"
+                "    __miri_proj_1\n"
+                "}\n"
+            ),
+            "miri_pos": "src/lib.rs:4:5",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(proj_panic_finding, set()),
+            "PlaceProjectionWrapper",
+        )
+        # 2. `TreeBorrowsRetagInterleaver::Ub`'s `*__ub_nc_r = ...` and `__ub_prot_raw`
+        #    must attribute to `TreeBorrowsRetagInterleaver`, never `ArithmeticCastMutator`.
+        for tb_line in (
+            "    *__ub_nc_r = __ub_nc_after ^ 1u32;\n",
+            "    let __ub_prot_d: u32 = helper_reborrow_mid(unsafe { &mut *__ub_prot_raw }, 1u32);\n",
+        ):
+            tb_finding = {
+                "seed_name": "seed_a",
+                "applied_mutators": ["ArithmeticCastMutator", "TreeBorrowsRetagInterleaver"],
+                "mutant_source": f"pub fn seed_a__b0_c0() -> u32 {{\n{tb_line}    0u32\n}}\n",
+                "miri_pos": "src/lib.rs:2:5",
+            }
+            self.assertEqual(
+                campaign.infer_finding_cause(tb_finding, set()),
+                "TreeBorrowsRetagInterleaver",
+            )
+
+    def test_verdict_dict_evaluator_and_baseline_and_variant_consistency_enforced(
+        self,
+    ) -> None:
+        base = copy.deepcopy(campaign.SEEDED_SEMANTIC_MUTANTS[0])
+
+        # 1. A `"verdict": "diverge"` dict evaluator cannot bypass `_reported_variant_problems`,
+        #    `SEMANTIC_MUTANT_SURVIVAL_KEYS`, or `exit_code` checks.
+        for bad_verdict_dict in (
+            {
+                "verdict": "diverge",
+                "divergence_class": "missed_ub",
+                "survived_variants": ["validity_check_omitted"],
+            },
+            {
+                "verdict": "diverge",
+                "divergence_class": "missed_ub",
+                "variants": [],
+            },
+            {
+                "verdict": "diverge",
+                "divergence_class": "missed_ub",
+                "exit_code": campaign.EXIT_SUCCESS,
+            },
+            {
+                "verdict": "diverge",
+                "divergence_class": "missed_ub",
+                "exit_code": True,
+            },
+        ):
+            with self.subTest(verdict_dict=bad_verdict_dict):
+                res = campaign.run_semantic_mutant_self_check(
+                    evaluator=lambda m, d=bad_verdict_dict: d,
+                    mutants=[base],
+                )
+                self.assertFalse(res["passed"], res)
+
+        # 2. Unclean baseline fields on a result dict must fail `run_semantic_mutant_self_check`.
+        for bad_baseline in (
+            {"baseline_verdict": "diverge"},
+            {"baseline_exit_code": campaign.EXIT_DIVERGENCE_DETECTED},
+            {"baseline_exit_code": True},
+            {"baseline_witness_polarity": UNSOUND},
+            {"baselines": []},
+            {
+                "baselines": [
+                    {
+                        "probe_id": "bool_valid_range",
+                        "clean": False,
+                        "verdict": "agree",
+                        "exit_code": 0,
+                        "witness_polarity": None,
+                    }
+                ]
+            },
+        ):
+            with self.subTest(bad_baseline=bad_baseline):
+                res = campaign.run_semantic_mutant_self_check(
+                    evaluator=lambda m, b=bad_baseline: {
+                        "killed": True,
+                        "kill_class": "missed_ub",
+                        "witness_polarity": UNSOUND,
+                        **b,
+                    },
+                    mutants=[base],
+                )
+                self.assertFalse(res["passed"], res)
+
+        # 3. Variant dicts carrying contradicting `expected_kill_class`,
+        #    `expected_witness_polarity`, `tag_witness_polarity`, or `verdict` must fail.
+        for patch in (
+            {"expected_kill_class": "wrong_value"},
+            {"expected_witness_polarity": VALUE},
+            {"tag_witness_polarity": VALUE},
+            {"verdict": ["agree", ""]},
+        ):
+            with self.subTest(variant_patch=patch):
+                res = campaign.run_semantic_mutant_self_check(
+                    evaluator=_variant_reporting_evaluator(
+                        lambda m, vs, p=patch: [dict(vs[0], **p), *vs[1:]]
+                    ),
+                    mutants=[base],
+                )
+                self.assertFalse(res["passed"], res)
+
+        # 4. Bare string `expected_kill_classes` or malformed `mutant_variants` must fail
+        #    even when a custom evaluator omits `"variants"`.
+        for broken_mutant in (
+            dict(base, expected_kill_classes="missed_ub"),
+            dict(base, expected_witness_polarities=UNSOUND),
+            dict(base, mutant_variants=5),
+            dict(base, mutant_variants=()),
+            dict(
+                base,
+                mutant_variants=(
+                    dict(base["mutant_variants"][0], expected_witness_polarity=VALUE),
+                ),
+            ),
+        ):
+            with self.subTest(broken_mutant=broken_mutant.get("mutant_variants")):
+                res = campaign.run_semantic_mutant_self_check(
+                    evaluator=lambda m: {
+                        "killed": True,
+                        "kill_class": "missed_ub",
+                        "witness_polarity": UNSOUND,
+                    },
+                    mutants=[broken_mutant],
+                )
+                self.assertFalse(res["passed"], res)
+
+    def test_witness_polarity_accounting_catches_same_polarity_class_swaps_duplicate_findings_and_unused_reconciled_sites(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            # 1. Two `missed_ub` findings when `divergence_classes` claims 1 `missed_ub`
+            #    and 1 `panic_vs_return` (both `unsound_missed_fault`) must fail even
+            #    without `item_outcomes`.
+            rep = make_healthy_miri_report(
+                state_dir,
+                fingerprints=[
+                    "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar",
+                    "PlaceProjectionWrapper:missed_ub:MirDiffTag.normalScalar",
+                ],
+            )
+            rep["divergence_classes"]["missed_ub"] = 1
+            rep["divergence_classes"]["panic_vs_return"] = 1
+            probs_swap = campaign.witness_polarity_accounting_problems(rep)
+            self.assertTrue(
+                any(
+                    "2 findings have divergence_class 'missed_ub', but divergence_classes.missed_ub is 1"
+                    in p
+                    for p in probs_swap
+                ),
+                probs_swap,
+            )
+
+            # 2. Duplicate `finding_id`, duplicate `fn_name`, or `anneal_lean_tag == "none"`
+            #    on a finding must fail `witness_polarity_accounting_problems`.
+            rep_dup_id = make_healthy_miri_report(
+                state_dir,
+                fingerprints=[
+                    "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar",
+                    "PlaceProjectionWrapper:missed_ub:MirDiffTag.normalScalar",
+                ],
+            )
+            rep_dup_id["findings"][1]["finding_id"] = rep_dup_id["findings"][0]["finding_id"]
+            self.assertTrue(
+                any(
+                    "repeats finding_id" in p
+                    for p in campaign.witness_polarity_accounting_problems(rep_dup_id)
+                )
+            )
+            rep_dup_fn = make_healthy_miri_report(
+                state_dir,
+                fingerprints=[
+                    "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar",
+                    "PlaceProjectionWrapper:missed_ub:MirDiffTag.normalScalar",
+                ],
+            )
+            rep_dup_fn["findings"][1]["fn_name"] = rep_dup_fn["findings"][0]["fn_name"]
+            self.assertTrue(
+                any(
+                    "repeats candidate fn_name" in p
+                    for p in campaign.witness_polarity_accounting_problems(rep_dup_fn)
+                )
+            )
+            rep_none_lean = make_healthy_miri_report(
+                state_dir,
+                fingerprints=["BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar"],
+            )
+            rep_none_lean["findings"][0]["anneal_lean_tag"] = "none"
+            self.assertTrue(
+                any(
+                    "anneal_lean_tag 'none' on a divergence finding" in p
+                    for p in campaign.witness_polarity_accounting_problems(rep_none_lean)
+                )
+            )
+
+            # 3. Non-list `findings` or unused/unjustified `reconciled_panic_sites`
+            #    (with or without `item_outcomes`) must fail `witness_polarity_accounting_problems`.
+            s_bad_findings = _make_valid_miri_summary()
+            s_bad_findings["findings"] = "not-a-list"
+            self.assertTrue(
+                any(
+                    "findings is missing or not a list" in p
+                    for p in campaign.witness_polarity_accounting_problems(s_bad_findings)
+                )
+            )
+            s_unused_rec = _with_reconciled_panic_macro_item(
+                _with_consistent_item_outcomes(_make_valid_miri_summary())
+            )
+            # `panic_item` already agrees at the same site (`src/lib.rs:30:7`), so the
+            # `reconciled_panic_sites` entry is unused.
+            s_unused_rec["item_outcomes"]["panic_item"] = {  # type: ignore[index]
+                "verdict": "agree",
+                "miri_outcome": "panic@src/lib.rs:30:7",
+                "anneal_outcome": "panic@src/lib.rs:30:5: 30:12",
+                "anneal_lean_tag": "MirDiffTag.panic",
+            }
+            self.assertTrue(
+                any(
+                    "reconciled_panic_sites lists 'panic_item'" in p
+                    for p in campaign.witness_polarity_accounting_problems(s_unused_rec)
+                )
+            )
+            s_no_items_bad_rec = _make_valid_miri_summary()
+            s_no_items_bad_rec["reconciled_panic_sites"] = [
+                {
+                    "fn_name": "panic_item",
+                    "batch_miri_pos": "src/lib.rs:12:5",
+                    "anneal_span": "src/lib.rs:99:1: 99:10",
+                    "anneal_panic_frame": "miri_diff_corpus::panic_item",
+                    "kernel_confirmed": True,
+                }
+            ]
+            self.assertTrue(
+                any(
+                    "is not a valid kernel-confirmed panic-macro reconciliation" in p
+                    for p in campaign.witness_polarity_accounting_problems(s_no_items_bad_rec)
+                )
+            )
+
+    def test_json_quarantine_duplicate_keys_harness_polarity_and_known_bug_multi_source_polarity_enforced(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # 1. Duplicate keys in a JSON quarantine file must fail closed.
+            q_dup = tmp_path / "dup_quarantine.json"
+            q_dup.write_text(
+                '{"quarantined": [{"fingerprint": "BitValidityTransmuteMutator:missed_ub:MirDiffTag.ub", '
+                '"expires": "2020-01-01", "expires": "2099-01-01", "reason": "dup"}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+                campaign.load_quarantine_rules(q_dup)
+            audit_dup = campaign.verify_no_stale_quarantine_or_known_bugs(quarantine_file=q_dup)
+            self.assertFalse(audit_dup["passed"])
+            self.assertIn("duplicate JSON object key", audit_dup["stale_entries"][0]["reason"])
+
+            # 2. Quarantine table entries cannot declare `harness_or_extraction_error`,
+            #    lack a valid `divergence_class` segment, or name conflicting classes.
+            q_bad = tmp_path / "bad_quarantine.toml"
+            q_bad.write_text(
+                "\n".join(
+                    [
+                        "[[quarantined]]",
+                        'fingerprint = "BitValidityTransmuteMutator:missed_ub:MirDiffTag.ub"',
+                        'witness_polarity = "harness_or_extraction_error"',
+                        'expires = "2099-01-01"',
+                        'reason = "harness polarity on quarantine entry"',
+                        "",
+                        "[[quarantined]]",
+                        'fingerprint = "BitValidityTransmuteMutator:not_a_class:MirDiffTag.ub"',
+                        'witness_polarity = "unsound_missed_fault"',
+                        'expires = "2099-01-01"',
+                        'reason = "no divergence class in token"',
+                        "",
+                        "[[quarantined]]",
+                        'fingerprint = "BitValidityTransmuteMutator:missed_ub:false_positive_ub"',
+                        'witness_polarity = "unsound_missed_fault"',
+                        'expires = "2099-01-01"',
+                        'reason = "conflicting divergence classes in token"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(campaign.load_quarantine_rules(q_bad), set())
+            audit_bad = campaign.verify_no_stale_quarantine_or_known_bugs(quarantine_file=q_bad)
+            self.assertFalse(audit_bad["passed"])
+            reasons_bad = " | ".join(e["reason"] for e in audit_bad["stale_entries"])
+            self.assertIn("only divergences are quarantined", reasons_bad)
+            self.assertIn("lacks a valid divergence_class", reasons_bad)
+            self.assertIn("conflicting divergence classes", reasons_bad)
+
+            # 3. `_known_bug_eval_problem` must reject an evaluation dict whose
+            #    `witness_polarity` matches `expected_polarity` while its
+            #    `divergence_class` or `(miri_outcome, anneal_outcome)` tags disagree.
+            prob_cls = campaign._known_bug_eval_problem(
+                "MirDiffTag.ub",
+                {
+                    "verdict": "diverge",
+                    "divergence_class": "false_positive_ub",
+                    "anneal_lean_tag": "MirDiffTag.ub",
+                    "witness_polarity": UNSOUND,
+                },
+                expected_div_class=None,
+                expected_polarity=UNSOUND,
+            )
+            self.assertIsNotNone(prob_cls)
+            self.assertIn("stale_known_anneal_bug_witness_polarity_mismatch", str(prob_cls))
+
+            prob_tags = campaign._known_bug_eval_problem(
+                "MirDiffTag.ub",
+                {
+                    "verdict": "diverge",
+                    "miri_outcome": "pass:unit",
+                    "anneal_outcome": "ub@src/lib.rs:5:5: 5:9",
+                    "anneal_lean_tag": "MirDiffTag.ub",
+                    "witness_polarity": UNSOUND,
+                },
+                expected_div_class=None,
+                expected_polarity=UNSOUND,
+            )
+            self.assertIsNotNone(prob_tags)
+            self.assertIn("stale_known_anneal_bug_witness_polarity_mismatch", str(prob_tags))
+
+
 if __name__ == "__main__":
     unittest.main()

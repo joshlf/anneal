@@ -2365,15 +2365,90 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
     if "item_outcomes" in summary and items is not None and not isinstance(items, dict):
         reasons.append(f"{label}: item_outcomes is not a dict")
     has_items = isinstance(items, dict)
+
+    reconciled: dict[str, Any] = {}
+    sites = summary.get("reconciled_panic_sites")
+    site_count = summary.get("reconciled_panic_sites_count")
+    if sites is not None:
+        if not isinstance(sites, list):
+            reasons.append(f"{label}: reconciled_panic_sites is not a list")
+        else:
+            for site_idx, site in enumerate(sites):
+                name = site.get("fn_name") if isinstance(site, dict) else None
+                if not isinstance(name, str) or not name.strip():
+                    reasons.append(
+                        f"{label}: reconciled_panic_sites[{site_idx}] lacks a fn_name"
+                    )
+                elif name in reconciled:
+                    reasons.append(
+                        f"{label}: reconciled_panic_sites lists {name!r} twice"
+                    )
+                else:
+                    reconciled[name] = site
+                    if not has_items:
+                        m_pos = site.get("batch_miri_pos")
+                        a_span = site.get("anneal_span")
+                        if not (
+                            isinstance(m_pos, str)
+                            and isinstance(a_span, str)
+                            and _reconciled_panic_site_matches(
+                                site, name, f"panic@{m_pos}", f"panic@{a_span}"
+                            )
+                        ):
+                            reasons.append(
+                                f"{label}: reconciled_panic_sites[{site_idx}] for {name!r} "
+                                "is not a valid kernel-confirmed panic-macro reconciliation"
+                            )
+            if site_count is not None and (
+                not is_nonneg_int(site_count) or site_count != len(sites)
+            ):
+                reasons.append(
+                    f"{label}: reconciled_panic_sites_count is {site_count!r} "
+                    f"but reconciled_panic_sites lists {len(sites)}"
+                )
+    elif site_count is not None and (not is_nonneg_int(site_count) or site_count != 0):
+        reasons.append(
+            f"{label}: reconciled_panic_sites_count is {site_count!r} "
+            "without reconciled_panic_sites"
+        )
+
     findings = summary.get("findings")
-    if isinstance(findings, list):
+    if ("findings" in summary and not isinstance(findings, list)) or (
+        findings is None
+        and is_nonneg_int(summary.get("diverge_count"))
+        and int(summary["diverge_count"]) > 0
+    ):
+        reasons.append(f"{label}: findings is missing or not a list")
+    elif isinstance(findings, list):
         tallies = empty_witness_polarity_counts()
+        class_tallies = {cls: 0 for cls in VALID_DIVERGENCE_CLASSES}
+        seen_finding_ids: set[str] = set()
+        seen_finding_fns: set[str] = set()
         for idx, f in enumerate(findings):
             if not isinstance(f, dict):
                 reasons.append(f"{label}: findings[{idx}] is not a JSON object")
                 continue
+            fid = f.get("finding_id")
+            if isinstance(fid, str) and fid.strip():
+                if fid.strip() in seen_finding_ids:
+                    reasons.append(f"{label}: findings[{idx}] repeats finding_id {fid!r}")
+                seen_finding_ids.add(fid.strip())
+            fn_name = f.get("fn_name")
+            if isinstance(fn_name, str) and fn_name.strip():
+                if fn_name.strip() in seen_finding_fns:
+                    reasons.append(
+                        f"{label}: findings[{idx}] repeats candidate fn_name {fn_name!r}"
+                    )
+                seen_finding_fns.add(fn_name.strip())
+            f_lean_tag = f.get("anneal_lean_tag")
+            if isinstance(f_lean_tag, str) and normalize_anneal_tag(f_lean_tag) == "none":
+                reasons.append(
+                    f"{label}: findings[{idx}] has anneal_lean_tag 'none' on a divergence finding"
+                )
             polarity = f.get("witness_polarity")
             div_cls = f.get("divergence_class")
+            if isinstance(div_cls, str) and div_cls in class_tallies:
+                class_tallies[div_cls] += 1
             expected = (
                 DIVERGENCE_CLASS_WITNESS_POLARITY.get(div_cls) if isinstance(div_cls, str) else None
             )
@@ -2415,6 +2490,12 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
                         f"{label}: {tallies[pol]} findings have witness_polarity {pol!r}, but "
                         f"divergence_classes account for {expected_tallies[pol]}"
                     )
+            for cls in VALID_DIVERGENCE_CLASSES:
+                if class_tallies[cls] != int(div_map.get(cls, 0)):
+                    reasons.append(
+                        f"{label}: {class_tallies[cls]} findings have divergence_class {cls!r}, "
+                        f"but divergence_classes.{cls} is {int(div_map.get(cls, 0))}"
+                    )
 
     if has_items:
         compiled = summary.get("compiled_candidates")
@@ -2423,23 +2504,7 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
                 f"{label}: item_outcomes covers {len(items)} items but compiled_candidates "
                 f"is {compiled}"
             )
-        reconciled: dict[str, Any] = {}
-        sites = summary.get("reconciled_panic_sites")
-        if sites is not None and not isinstance(sites, list):
-            reasons.append(f"{label}: reconciled_panic_sites is not a list")
-        elif isinstance(sites, list):
-            for site_idx, site in enumerate(sites):
-                name = site.get("fn_name") if isinstance(site, dict) else None
-                if not isinstance(name, str) or not name.strip():
-                    reasons.append(
-                        f"{label}: reconciled_panic_sites[{site_idx}] lacks a fn_name"
-                    )
-                elif name in reconciled:
-                    reasons.append(
-                        f"{label}: reconciled_panic_sites lists {name!r} twice"
-                    )
-                else:
-                    reconciled[name] = site
+        reconciled_used: set[str] = set()
         recount = empty_witness_polarity_counts()
         for name, entry in items.items():
             if not isinstance(entry, dict):
@@ -2479,6 +2544,7 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
             ):
                 polarity = None
                 expected_verdict = "agree"
+                reconciled_used.add(name)
             if reported != expected_verdict:
                 reasons.append(
                     f"{label}: item_outcomes[{name!r}] reported verdict {reported_raw!r}, "
@@ -2486,6 +2552,11 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
                 )
             if polarity is not None:
                 recount[polarity] += 1
+        for unused_name in sorted(set(reconciled) - reconciled_used):
+            reasons.append(
+                f"{label}: reconciled_panic_sites lists {unused_name!r}, but its item "
+                "outcome is not a panic-macro site agreement that the entry justifies"
+            )
         compile_failed = summary.get("compile_failed_candidates")
         if is_nonneg_int(compile_failed):
             recount[WITNESS_POLARITY_HARNESS] += compile_failed
@@ -3098,7 +3169,10 @@ class QuarantineEntry:
 
 
 def _quarantine_token_witness_polarity_defect(
-    token: str | None, raw_polarity: Any, prefix: str
+    token: str | None,
+    raw_polarity: Any,
+    prefix: str,
+    allow_harness_polarity: bool = True,
 ) -> str | None:
     """Validates an optional `witness_polarity` field on a quarantine or
     `known_anneal_bug` entry against `VALID_WITNESS_POLARITIES`, the entry's harness,
@@ -3108,17 +3182,34 @@ def _quarantine_token_witness_polarity_defect(
     if not isinstance(raw_polarity, str) or raw_polarity.strip() not in VALID_WITNESS_POLARITIES:
         return f"{prefix}: invalid witness_polarity {raw_polarity!r}"
     pol = raw_polarity.strip()
+    if not allow_harness_polarity and pol == WITNESS_POLARITY_HARNESS:
+        return (
+            f"{prefix}: quarantine entry {token!r} cannot have "
+            f"witness_polarity {pol!r} (only divergences are quarantined)"
+        )
     if token is not None:
         if quarantine_entry_harness(token) == "itree":
             return f"{prefix}: itree entry {token!r} cannot have witness_polarity {pol!r}"
-        for part in token.split(":"):
-            if part in DIVERGENCE_CLASS_WITNESS_POLARITY:
-                expected = DIVERGENCE_CLASS_WITNESS_POLARITY[part]
-                if pol != expected:
-                    return (
-                        f"{prefix}: witness_polarity {pol!r} contradicts "
-                        f"divergence_class {part!r} ({expected!r})"
-                    )
+        div_parts = [
+            part for part in token.split(":") if part in DIVERGENCE_CLASS_WITNESS_POLARITY
+        ]
+        if len(set(div_parts)) > 1:
+            return (
+                f"{prefix}: token {token!r} names conflicting divergence classes "
+                f"{div_parts!r}"
+            )
+        if not allow_harness_polarity and ":" in token and not div_parts:
+            return (
+                f"{prefix}: token {token!r} lacks a valid divergence_class to confirm "
+                f"witness_polarity {pol!r}"
+            )
+        for part in div_parts:
+            expected = DIVERGENCE_CLASS_WITNESS_POLARITY[part]
+            if pol != expected:
+                return (
+                    f"{prefix}: witness_polarity {pol!r} contradicts "
+                    f"divergence_class {part!r} ({expected!r})"
+                )
     return None
 
 
@@ -3138,7 +3229,10 @@ def _quarantine_list_entry(location: str, item: Any) -> QuarantineEntry:
             defects_list.append(f"malformed_or_missing_fingerprint: {raw_token!r}")
             token = None
         pol_defect = _quarantine_token_witness_polarity_defect(
-            token, item.get("witness_polarity"), "malformed_quarantine_entry"
+            token,
+            item.get("witness_polarity"),
+            "malformed_quarantine_entry",
+            allow_harness_polarity=False,
         )
         if pol_defect is not None:
             defects_list.append(pol_defect)
@@ -3274,7 +3368,7 @@ def read_quarantine_document(quarantine_file: Path) -> Any:
         except tomllib.TOMLDecodeError as e:
             raise ValueError(f"invalid TOML in {quarantine_file}: {e}") from e
     try:
-        return _strict_json_loads(text)
+        return _strict_json_loads(text, reject_duplicate_keys=True)
     except ValueError as e:
         raise ValueError(f"invalid JSON in {quarantine_file}: {e}") from e
 
@@ -3467,21 +3561,38 @@ def _known_bug_eval_problem(
                 "stale_known_anneal_bug_divergence_class_mismatch: "
                 f"expected {expected_div_class!r}, got {observed_div_cls.strip()!r}"
             )
+    raw_ev_pol = ev.get("witness_polarity")
+    if raw_ev_pol is not None and (
+        not isinstance(raw_ev_pol, str) or raw_ev_pol.strip() not in VALID_WITNESS_POLARITIES
+    ):
+        return (
+            "stale_known_anneal_bug_unconfirmed: evaluation has invalid "
+            f"witness_polarity {raw_ev_pol!r}"
+        )
     if expected_polarity is not None:
-        raw_ev_pol = ev.get("witness_polarity")
+        observed_sources: list[str | None] = []
         if isinstance(raw_ev_pol, str) and raw_ev_pol.strip() in VALID_WITNESS_POLARITIES:
-            observed_pol: str | None = raw_ev_pol.strip()
-        elif isinstance(observed_div_cls, str) and observed_div_cls.strip() in DIVERGENCE_CLASS_WITNESS_POLARITY:
-            observed_pol = DIVERGENCE_CLASS_WITNESS_POLARITY[observed_div_cls.strip()]
-        elif isinstance(miri_tag, str) and isinstance(anneal_tag, str):
-            observed_pol = classify_witness_polarity_from_tags(miri_tag, anneal_tag)
-        else:
-            observed_pol = None
-        if observed_pol != expected_polarity:
+            observed_sources.append(raw_ev_pol.strip())
+        if (
+            isinstance(observed_div_cls, str)
+            and observed_div_cls.strip() in DIVERGENCE_CLASS_WITNESS_POLARITY
+        ):
+            observed_sources.append(
+                DIVERGENCE_CLASS_WITNESS_POLARITY[observed_div_cls.strip()]
+            )
+        if isinstance(miri_tag, str) and isinstance(anneal_tag, str):
+            observed_sources.append(classify_witness_polarity_from_tags(miri_tag, anneal_tag))
+        if not observed_sources:
             return (
                 "stale_known_anneal_bug_witness_polarity_mismatch: "
-                f"expected {expected_polarity!r}, got {observed_pol!r}"
+                f"expected {expected_polarity!r}, got None"
             )
+        for obs_pol in observed_sources:
+            if obs_pol != expected_polarity:
+                return (
+                    "stale_known_anneal_bug_witness_polarity_mismatch: "
+                    f"expected {expected_polarity!r}, got {obs_pol!r}"
+                )
     return None
 
 
@@ -3813,15 +3924,45 @@ def normalize_anneal_tag(raw_tag: str) -> str:
 # whose earliest fault line contains one of them to that mutator.
 RAW_PTR_OFFSET_MUTATOR_TOKENS = (
     "__miri_ptr_",
+    "__oob_pair",
+    "__oob_base",
+    "__oob_step",
     "__oob_",
+    "__oob",
     "__neg_",
     "__ptr_pair",
+    "__ptr_arr",
     "__base_ptr",
+    "__far_ptr",
+    "__field_b_ptr",
+    "__back_ptr",
     "__null_p",
     "__unaligned_",
     "__u8_base",
+    "__wb_src",
+    "__wb_dst",
+    "__cp_src",
+    "__cp_dst",
+    "__src_p",
+    "__dst_p",
+    "__ovl_",
 )
-TREE_BORROWS_MUTATOR_TOKENS = ("__miri_tb_", "__tb_")
+TREE_BORROWS_MUTATOR_TOKENS = (
+    "__miri_tb_",
+    "__tb_",
+    "__rr_",
+    "__mv_",
+    "__mp_",
+    "__fn_",
+    "__fns_",
+    "__cp_x",
+    "__cp_root",
+    "__cp_res",
+    "__cp_copied",
+    "__rt_",
+    "__ub_nc",
+    "__ub_prot_",
+)
 BIT_VALIDITY_MUTATOR_TOKENS = (
     "__miri_valid_",
     "__valid_",
@@ -3829,21 +3970,45 @@ BIT_VALIDITY_MUTATOR_TOKENS = (
     "__uninit_",
     "__padded",
     "__pad_bytes",
+    "__pad_idx",
     "__ptr_b",
     "__raw_u8",
     "__panic_arr",
     "__panic_idx",
+    "__niche_",
+    "__meters",
+    "__single",
+    "__overlay",
+    "__nz_zero",
+    "__nzm_zero",
+    "__part_slot",
+    "__part_read",
 )
 ARITHMETIC_CAST_MUTATOR_TOKENS = (
     "__miri_arith_",
     "__miri_wide",
+    "__intr_",
+    "__sat_",
+    "__wrap_",
+    "__cmp_",
+    "__ediv_",
+    "__layout_pair",
+    "__sz",
+    "__al",
     "__ovf_",
     "__udf_",
     "__div_",
     "__shl_",
     "__ub_",
 )
-PLACE_PROJECTION_MUTATOR_TOKENS = ("__miri_proj_", "__proj_", "__dangling_ptr", "__dead_slot")
+PLACE_PROJECTION_MUTATOR_TOKENS = (
+    "__miri_proj_",
+    "__proj_",
+    "__dangling_",
+    "__dead_",
+    "__oob_arr",
+    "__oob_idx",
+)
 
 ALL_MIRI_MUTATOR_TOKENS = (
     *RAW_PTR_OFFSET_MUTATOR_TOKENS,
@@ -3905,12 +4070,24 @@ def infer_finding_cause(
     )
     fault_text = extract_fault_line_text(finding)
     if fault_text:
+        for probe_prefix, mutator_name in (
+            ("__miri_ptr_", "RawPtrOffsetMutator"),
+            ("__miri_tb_", "TreeBorrowsRetagInterleaver"),
+            ("__miri_valid_", "BitValidityTransmuteMutator"),
+            ("__miri_arith_", "ArithmeticCastMutator"),
+            ("__miri_proj_", "PlaceProjectionWrapper"),
+        ):
+            if probe_prefix in fault_text:
+                return mutator_name
+        # Check `PlaceProjectionWrapper` (`__oob_arr` / `__oob_idx`) before
+        # `RawPtrOffsetMutator`'s `__oob_` prefix, and `TreeBorrowsRetagInterleaver`
+        # (`__ub_nc` / `__ub_prot_`) before `ArithmeticCastMutator`'s `__ub_` prefix.
         for mutator_name, tokens in (
+            ("PlaceProjectionWrapper", PLACE_PROJECTION_MUTATOR_TOKENS),
             ("RawPtrOffsetMutator", RAW_PTR_OFFSET_MUTATOR_TOKENS),
             ("TreeBorrowsRetagInterleaver", TREE_BORROWS_MUTATOR_TOKENS),
             ("BitValidityTransmuteMutator", BIT_VALIDITY_MUTATOR_TOKENS),
             ("ArithmeticCastMutator", ARITHMETIC_CAST_MUTATOR_TOKENS),
-            ("PlaceProjectionWrapper", PLACE_PROJECTION_MUTATOR_TOKENS),
         ):
             if any(tok in fault_text for tok in tokens):
                 return mutator_name
@@ -5034,6 +5211,17 @@ def _normalize_evaluator_result(
             kill_class_witness_polarity(k_class),
         )
     if isinstance(raw_res, dict):
+        extra_keys = (
+            "variants",
+            "baselines",
+            "baseline_verdict",
+            "baseline_exit_code",
+            "baseline_witness_polarity",
+            "survived_variants",
+            "missing_expected_kill_classes",
+            "missing_expected_witness_polarities",
+            "detail",
+        )
         if "killed" in raw_res:
             raw_exit = raw_res.get(
                 "exit_code",
@@ -5055,17 +5243,7 @@ def _normalize_evaluator_result(
             out = result(
                 is_killed, k_class, exit_c, _explicit_or_implied_polarity(raw_res, k_class)
             )
-            for extra_key in (
-                "variants",
-                "baselines",
-                "baseline_verdict",
-                "baseline_exit_code",
-                "baseline_witness_polarity",
-                "survived_variants",
-                "missing_expected_kill_classes",
-                "missing_expected_witness_polarities",
-                "detail",
-            ):
+            for extra_key in extra_keys:
                 if extra_key in raw_res:
                     out[extra_key] = raw_res[extra_key]
             return out
@@ -5075,7 +5253,7 @@ def _normalize_evaluator_result(
                 div_cls = raw_res.get("divergence_class", raw_res.get("kill_class"))
                 is_killed = isinstance(div_cls, str) and bool(div_cls.strip())
                 k_class = div_cls.strip() if is_killed else "survived"
-                exit_c = EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
+                default_exit = EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
             elif verdict_str in ("error", HARNESS_ERROR_KILL_CLASS):
                 is_killed = True
                 k_class = str(
@@ -5083,12 +5261,28 @@ def _normalize_evaluator_result(
                         "divergence_class", raw_res.get("kill_class", HARNESS_ERROR_KILL_CLASS)
                     )
                 )
-                exit_c = EXIT_HARNESS_FAILED
+                default_exit = EXIT_HARNESS_FAILED
             else:
-                return result(False, "survived", EXIT_SUCCESS, None)
-            return result(
-                is_killed, k_class, exit_c, _explicit_or_implied_polarity(raw_res, k_class)
+                is_killed = False
+                k_class = "survived"
+                default_exit = EXIT_SUCCESS
+            raw_exit = raw_res.get("exit_code", default_exit)
+            if isinstance(raw_exit, bool) or not isinstance(raw_exit, int):
+                raise ValueError(f"evaluator returned a non-integer exit_code {raw_exit!r}")
+            exit_c = raw_exit
+            if is_killed and exit_c not in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED):
+                is_killed = False
+                k_class = "survived"
+            out = result(
+                is_killed,
+                k_class,
+                exit_c,
+                _explicit_or_implied_polarity(raw_res, k_class) if is_killed else None,
             )
+            for extra_key in extra_keys:
+                if extra_key in raw_res:
+                    out[extra_key] = raw_res[extra_key]
+            return out
         if "diverge_count" in raw_res or "miri_verdicts" in raw_res:
             verdict = campaign_verdict_for_miri_summary(raw_res)
             exit_c = verdict["exit_code"]
@@ -5151,8 +5345,19 @@ def _reported_variant_problems(
         d_label = d.get("label") if isinstance(d, dict) else None
         if not isinstance(d_label, str) or not d_label.strip() or d_label in declared:
             survivors.append(f"<declared variant[{d_idx}] without a unique label>")
-        else:
-            declared[d_label] = d
+            continue
+        d_cls = d.get("expected_kill_class")
+        d_pol = d.get("expected_witness_polarity")
+        if (
+            not isinstance(d_cls, str)
+            or d_cls not in expected_classes
+            or d_pol not in VALID_WITNESS_POLARITIES
+            or d_pol not in expected_polarities
+            or kill_class_witness_polarity(d_cls) != d_pol
+        ):
+            survivors.append(f"<declared variant[{d_idx}] ({d_label}) has invalid expectations>")
+            continue
+        declared[d_label] = d
     reported_labels: set[str] = set()
     for v_idx, v in enumerate(variants):
         if not isinstance(v, dict):
@@ -5169,7 +5374,22 @@ def _reported_variant_problems(
             and v_pol in VALID_WITNESS_POLARITIES
             and v_pol in expected_polarities
             and kill_class_witness_polarity(v_cls) == v_pol
+            and ("expected_kill_class" not in v or v.get("expected_kill_class") == v_cls)
+            and (
+                "expected_witness_polarity" not in v
+                or v.get("expected_witness_polarity") == v_pol
+            )
+            and ("tag_witness_polarity" not in v or v.get("tag_witness_polarity") == v_pol)
         )
+        if "verdict" in v:
+            v_verdict = v.get("verdict")
+            v_ok = (
+                v_ok
+                and isinstance(v_verdict, (list, tuple))
+                and len(v_verdict) >= 1
+                and isinstance(v_verdict[0], str)
+                and v_verdict[0].strip().lower() in ("diverge", "not_compared")
+            )
         if "exit_code" in v:
             v_exit = v.get("exit_code")
             v_ok = (
@@ -5248,8 +5468,16 @@ def run_semantic_mutant_self_check(
     for idx, mutant in enumerate(mutants):
         try:
             mutant_id = str(mutant["id"])
-            expected_classes = tuple(mutant.get("expected_kill_classes", ()))
-            expected_polarities = tuple(mutant.get("expected_witness_polarities", ()))
+            raw_classes = mutant.get("expected_kill_classes", ())
+            raw_polarities = mutant.get("expected_witness_polarities", ())
+            if not isinstance(raw_classes, (list, tuple)) or not isinstance(
+                raw_polarities, (list, tuple)
+            ):
+                raise TypeError(
+                    "expected_kill_classes and expected_witness_polarities must be sequences"
+                )
+            expected_classes = tuple(raw_classes)
+            expected_polarities = tuple(raw_polarities)
         except Exception as e:  # noqa: BLE001 - fail closed on a malformed mutant
             mutant_id = f"<mutant[{idx}]>"
             per_mutant_results.append(
@@ -5307,6 +5535,35 @@ def run_semantic_mutant_self_check(
             ):
                 outcome["killed"] = False
                 outcome["unexpected_witness_polarity"] = polarity
+        if outcome["killed"]:
+            if "baseline_verdict" in outcome and outcome.get("baseline_verdict") != "agree":
+                outcome["killed"] = False
+            if "baseline_exit_code" in outcome and (
+                isinstance(outcome.get("baseline_exit_code"), bool)
+                or outcome.get("baseline_exit_code") != EXIT_SUCCESS
+            ):
+                outcome["killed"] = False
+            if (
+                "baseline_witness_polarity" in outcome
+                and outcome.get("baseline_witness_polarity") is not None
+            ):
+                outcome["killed"] = False
+            if "baselines" in outcome:
+                baselines = outcome.get("baselines")
+                if not isinstance(baselines, list) or not baselines:
+                    outcome["killed"] = False
+                else:
+                    for b in baselines:
+                        if not (
+                            isinstance(b, dict)
+                            and b.get("clean") is True
+                            and b.get("verdict") == "agree"
+                            and not isinstance(b.get("exit_code"), bool)
+                            and b.get("exit_code") == EXIT_SUCCESS
+                            and b.get("witness_polarity") is None
+                        ):
+                            outcome["killed"] = False
+                            break
         if outcome["killed"] and "variants" in outcome:
             variants = outcome.get("variants")
             if isinstance(variants, list):
@@ -5324,6 +5581,42 @@ def run_semantic_mutant_self_check(
                 for key, values in problems.items():
                     if values:
                         outcome[key] = values
+        elif outcome["killed"] and isinstance(mutant, dict) and "mutant_variants" in mutant:
+            raw_declared = mutant.get("mutant_variants")
+            if not isinstance(raw_declared, (list, tuple)) or not raw_declared:
+                outcome["killed"] = False
+                outcome["survived_variants"] = ["<mutant_variants is empty or not a list>"]
+            else:
+                seen_decl_labels: set[str] = set()
+                decl_classes: set[str] = set()
+                decl_polarities: set[str] = set()
+                for d_idx, d in enumerate(raw_declared):
+                    d_label = d.get("label") if isinstance(d, dict) else None
+                    d_cls = d.get("expected_kill_class") if isinstance(d, dict) else None
+                    d_pol = d.get("expected_witness_polarity") if isinstance(d, dict) else None
+                    if (
+                        not isinstance(d_label, str)
+                        or not d_label.strip()
+                        or d_label in seen_decl_labels
+                        or not isinstance(d_cls, str)
+                        or d_cls not in expected_classes
+                        or d_pol not in VALID_WITNESS_POLARITIES
+                        or d_pol not in expected_polarities
+                        or kill_class_witness_polarity(d_cls) != d_pol
+                    ):
+                        outcome["killed"] = False
+                        outcome.setdefault("survived_variants", []).append(
+                            f"<declared variant[{d_idx}]>"
+                        )
+                    else:
+                        seen_decl_labels.add(d_label)
+                        decl_classes.add(d_cls)
+                        decl_polarities.add(d_pol)
+                if outcome["killed"] and (
+                    set(expected_classes) - decl_classes
+                    or set(expected_polarities) - decl_polarities
+                ):
+                    outcome["killed"] = False
         # A result that itself names a surviving variant or an expected kill class or
         # polarity that no variant reached is never a kill, whatever its `killed`.
         for key in SEMANTIC_MUTANT_SURVIVAL_KEYS:
