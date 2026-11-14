@@ -1074,4 +1074,141 @@ theorem rigidTy_predicate_characterizations_and_sizes (r : RigidTy) :
           fun hWide => ⟨isThinPtrRigidTy_eq_false_of_isWidePtrRigidTy hWide,
                         rigidTyKindByteSize_eq_sixteen_of_isWidePtrRigidTy hWide⟩⟩
 
+/-! ## 6. Symbolic-Padding Struct Codecs, `PlacedCodecSpine`, `ofPlacedCodecSpine` & `CompactEnumVal` (`[adv ep1-A0]`) -/
+
+#guard u8ExhaustiveCompactSpec.isValidDiscr 0 == true
+#guard u8ExhaustiveCompactSpec.isValidDiscr 255 == true
+#guard u8ExhaustiveCompactSpec.isValidDiscr 256 == false
+#guard sparseU16EnumSpec.isValidDiscr 0 == true
+#guard sparseU16EnumSpec.isValidDiscr 1000 == true
+#guard sparseU16EnumSpec.isValidDiscr 65535 == true
+#guard sparseU16EnumSpec.isValidDiscr 1 == false
+#guard nonZeroU32EnumSpec.isValidDiscr 0 == false
+#guard nonZeroU32EnumSpec.isValidDiscr 1 == true
+
+def u8u32UnitPermutedTightLayout : TypeLayout :=
+  { size := ⟨5⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨4⟩, ⟨0⟩, ⟨5⟩] [1, 0, 2], variants := .single 0, isUninhabited := false }
+
+def u8u32UnitPermutedTightLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u8u32UnitPermutedTightLayout] }
+
+theorem u8u32UnitPermuted_trail0_intoBytes_and_trail3_not_intoBytes :
+    IsIntoBytes u8u32UnitPermutedTightLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    IsFromBytes u8u32UnitPermutedTightLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    ¬ IsIntoBytes u8u32UnitPermutedLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    IsFromBytes u8u32UnitPermutedLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } := by
+  have h0 := MirValueCodec.u8u32UnitPermutedArbitraryTuple_trail_zero_isIntoBytes_and_transmute
+    u8u32UnitPermutedTightLayouts 0
+    u8u32UnitPermutedTightLayout [1, 0, 2] rfl rfl rfl
+  have h0Fb := MirValueCodec.u8u32UnitPermutedArbitraryTuple_isFromBytes_all_trail
+    u8u32UnitPermutedTightLayouts 0 0
+    u8u32UnitPermutedTightLayout [1, 0, 2] rfl rfl rfl
+  have h3 := u8u32UnitPermutedLayouts_not_isIntoBytes_but_isFromBytes
+  exact ⟨h0.2.1, h0Fb.2.1, h3.1, h3.2⟩
+
+/-- info: 'Anneal.ByteCodec.laidOutPairSymbolicPad_field_windows' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutPairSymbolicPad_field_windows
+
+/-- info: 'Anneal.ByteCodec.laidOutPairSymbolicPad_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutPairSymbolicPad_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.laidOutPairSymbolicPad_hasZeroValid' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutPairSymbolicPad_hasZeroValid
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPadPerm_isInitCodec_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPadPerm_isInitCodec_iff
+
+/-- info: 'Anneal.ByteCodec.FieldPerm.toListPerm' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms FieldPerm.toListPerm
+
+/-- info: 'Anneal.ByteCodec.FieldPerm.symm_apply_eq_unapply' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms FieldPerm.symm_apply_eq_unapply
+
+/-- info: 'Anneal.ByteCodec.exists_pads_of_sequentialFieldPlacement' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms exists_pads_of_sequentialFieldPlacement
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPad_cons_windows' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPad_cons_windows
+
+/-- info: 'Anneal.ByteCodec.SymbolicStructSpine.window_bytes' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms SymbolicStructSpine.window_bytes
+
+/-- info: 'Anneal.ByteCodec.SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement
+
+/-- info: 'Anneal.ByteCodec.memSort_perm' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms memSort_perm
+
+/-- info: 'Anneal.ByteCodec.memSort_pairwise' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms memSort_pairwise
+
+/-- info: 'Anneal.ByteCodec.placed_end_le_of_memKey_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms placed_end_le_of_memKey_le
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.windows_memSort' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.windows_memSort
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.repad_sequentialPads_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.repad_sequentialPads_spec
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.uintPairArbitraryTuple' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.uintPairArbitraryTuple
+
+/-- info: 'Anneal.ByteCodec.uintPairArbitraryTuple_pad_pos_not_intoBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms uintPairArbitraryTuple_pad_pos_not_intoBytes
+
+/-- info: 'Anneal.ByteCodec.u8u32UnitPermutedLayouts_not_isIntoBytes_but_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8u32UnitPermutedLayouts_not_isIntoBytes_but_isFromBytes
+
+/-- info: 'Anneal.ByteCodec.CompactEnumSpec.isValidDiscr_eq_true_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms CompactEnumSpec.isValidDiscr_eq_true_iff
+
+/-- info: 'Anneal.ByteCodec.CompactEnumVal.byteCodec_decode_eq_some_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms CompactEnumVal.byteCodec_decode_eq_some_iff
+
+/-- info: 'Anneal.ByteCodec.CompactEnumVal.byteCodec_equiv_enumRepr' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms CompactEnumVal.byteCodec_equiv_enumRepr
+
+/-- info: 'Anneal.ByteCodec.compactEnumSpec_rejects_duplicate_unsorted_and_out_of_range' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms compactEnumSpec_rejects_duplicate_unsorted_and_out_of_range
+
+/-- info: 'Anneal.ByteCodec.u8ExhaustiveCompactSpec_full_zerocopy_traits' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8ExhaustiveCompactSpec_full_zerocopy_traits
+
+/-- info: 'Anneal.ByteCodec.u8ExhaustiveMirValueCodec_full_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8ExhaustiveMirValueCodec_full_bitValidity
+
 end Anneal.ByteCodecTests
