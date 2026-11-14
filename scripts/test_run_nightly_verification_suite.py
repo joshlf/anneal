@@ -131,6 +131,110 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             )
             self.assertEqual(loaded["schema_version"], 1)
 
+    def test_build_suite_steps_ordering_core_theory_and_profile_isolation(self) -> None:
+        census_steps = suite.build_suite_steps(REPO_ROOT, "census-only")
+        census_names = [s[0] for s in census_steps]
+        self.assertEqual(
+            census_names,
+            ["lean_miri_semantic_source_lint", "ci_check_non_stable_version"],
+        )
+        for _name, _cat, cmd, _timeout in census_steps:
+            self.assertNotIn("lake", cmd)
+            self.assertNotIn("cargo", cmd)
+
+        quick_steps = suite.build_suite_steps(REPO_ROOT, "quick")
+        quick_names = [s[0] for s in quick_steps]
+        self.assertIn("lake_build_core_theory", quick_names)
+        self.assertIn("check_trusted_fast", quick_names)
+        self.assertLess(
+            quick_names.index("lake_build_core_theory"),
+            quick_names.index("check_trusted_fast"),
+        )
+        self.assertNotIn("check_trusted_self_test", quick_names)
+        self.assertNotIn("lake_build_minirust_spec", quick_names)
+
+        nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")
+        nightly_names = [s[0] for s in nightly_steps]
+        core_idx = nightly_names.index("lake_build_core_theory")
+        for dependent in (
+            "check_trusted_fast",
+            "check_trusted_self_test",
+            "tests_mir_bit_validity_stage1",
+            "tests_mir_byte_codec",
+            "tests_mir_cast_stage1",
+            "lake_build_correspondence",
+            "lake_build_minirust_spec",
+            "lake_build_lean_miri_spec",
+        ):
+            self.assertIn(dependent, nightly_names)
+            self.assertLess(
+                core_idx,
+                nightly_names.index(dependent),
+                f"lake_build_core_theory must precede {dependent}",
+            )
+
+        core_step = dict((s[0], s) for s in nightly_steps)["lake_build_core_theory"]
+        self.assertEqual(core_step[1], "cat1_trusted_boundary")
+        self.assertEqual(
+            core_step[2][-5:],
+            ["lake", "build", "Trusted", "Anneal", "MiniRust"],
+        )
+
+    def test_timeout_propagation_and_calibrated_step_timeouts(self) -> None:
+        nightly_by_name = {
+            name: (cat, cmd, timeout_sec)
+            for name, cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, "nightly")
+        }
+        expected_timeouts = {
+            "lake_build_core_theory": 900,
+            "check_trusted_fast": 600,
+            "rust_workspace_unit_tests": 600,
+            "check_trusted_self_test": 600,
+            "tests_mir_bit_validity_stage1": 300,
+            "tests_mir_byte_codec": 300,
+            "tests_mir_cast_stage1": 300,
+            "lake_build_correspondence": 900,
+            "lake_build_minirust_spec": 1200,
+            "lake_build_lean_miri_spec": 1800,
+            "domain_integration_tests_anneal_difftest": 900,
+            "cargo_anneal_e2e_minirust_correspondence": 600,
+            "cargo_anneal_e2e_pipeline_and_adoption": 900,
+        }
+        for step_name, exp_timeout in expected_timeouts.items():
+            self.assertIn(step_name, nightly_by_name)
+            _cat, cmd, timeout_sec = nightly_by_name[step_name]
+            self.assertEqual(timeout_sec, exp_timeout, f"Unexpected timeout for {step_name}")
+            self.assertEqual(Path(cmd[0]).name, "anneal-lean-run", f"{step_name} must be wrapped")
+            self.assertIn("--timeout", cmd)
+            t_idx = cmd.index("--timeout")
+            self.assertEqual(int(cmd[t_idx + 1]), timeout_sec)
+
+    def test_run_step_wrapper_timeout_grace_and_exit_124_classification(self) -> None:
+        # When a wrapped command exits with 124 (inner anneal-lean-run timeout),
+        # `_run_step` classifies status as TIMEOUT and preserves diagnostic stderr.
+        res = suite._run_step(
+            name="simulated_inner_timeout",
+            category="cat2_correspondence_suites",
+            cmd=[
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('[anneal-lean-run] ERROR: Command timed out\\n'); sys.exit(124)",
+            ],
+            cwd=REPO_ROOT,
+            timeout_sec=10,
+        )
+        self.assertEqual(res["status"], "TIMEOUT")
+        self.assertEqual(res["exit_code"], 124)
+        self.assertIn("[anneal-lean-run] ERROR: Command timed out", res["failure_excerpt"])
+
+        # Verify `_ensure_toolchain_path` populates existing user toolchain dirs into minimal PATH.
+        minimal_env = {"PATH": "/usr/bin:/bin"}
+        suite._ensure_toolchain_path(minimal_env)
+        for rel in (".elan/bin", ".cargo/bin", ".local/bin"):
+            cand = Path.home() / rel
+            if cand.is_dir():
+                self.assertIn(str(cand), minimal_env["PATH"].split(":"))
+
 
 if __name__ == "__main__":
     unittest.main()

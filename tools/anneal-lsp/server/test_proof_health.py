@@ -1506,10 +1506,38 @@ class TestPerformanceAndDogfood(unittest.TestCase):
     def test_dogfood_episode1_files_under_5ms(self) -> None:
         bit_validity = REPO_ROOT / "theory" / "Anneal" / "BitValidity.lean"
         mir_cast = REPO_ROOT / "theory" / "Anneal" / "Mir" / "Cast.lean"
-        for path in (bit_validity, mir_cast):
+        adt_and_control = REPO_ROOT / "theory" / "Anneal" / "Mir" / "AdtAndControl.lean"
+        sym_reflect = REPO_ROOT / "theory" / "Anneal" / "Rustc" / "V2026_06_01" / "SymReflect.lean"
+
+        for path in (bit_validity, mir_cast, adt_and_control, sym_reflect):
             self.assertTrue(path.is_file(), f"Missing {path}")
-            elapsed_ms = best_of_ms(lambda: proof_health.scan_lean_file(path, scan_siblings=True))
-            self.assertLess(elapsed_ms, 5.0, f"{path.name} scan took {elapsed_ms:.2f} ms")
+            line_count = path.read_text(encoding="utf-8", errors="replace").count("\n") + 1
+            scaled_budget_ms = min(15.0, max(5.0, 2.0 * (line_count / 1000.0)))
+            # 1 warmup pass, then minimum across 3 warm iterations (with best_of_ms fallback)
+            proof_health.scan_lean_file(path, scan_siblings=True)
+            warm_samples: list[float] = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                proof_health.scan_lean_file(path, scan_siblings=True)
+                warm_samples.append((time.perf_counter() - t0) * 1000.0)
+            elapsed_ms = min(warm_samples)
+            if elapsed_ms >= scaled_budget_ms:
+                elapsed_ms = best_of_ms(
+                    lambda p=path: proof_health.scan_lean_file(p, scan_siblings=True),
+                    runs=3,
+                    budget_ms=scaled_budget_ms,
+                )
+            self.assertLess(
+                elapsed_ms,
+                scaled_budget_ms,
+                f"{path.name} ({line_count} lines) scan took {elapsed_ms:.2f} ms (budget {scaled_budget_ms:.2f} ms)",
+            )
+            if path in (bit_validity, mir_cast):
+                self.assertLess(
+                    elapsed_ms,
+                    5.0,
+                    f"{path.name} scan took {elapsed_ms:.2f} ms (must be < 5.0 ms)",
+                )
 
         self.assertEqual(proof_health.scan_lean_file(bit_validity), [])
 
@@ -1525,6 +1553,57 @@ class TestPerformanceAndDogfood(unittest.TestCase):
             source = lines[f.line - 1]
             self.assertIn("simp [", source)
             self.assertNotIn("dsimp", source)
+
+    def test_prefilter_soundness_on_multiline_qualified_and_large_files(self) -> None:
+        # Verify module-level regexes are pre-compiled at import time.
+        for attr in (
+            "_FORBIDDEN_SIMP_SYM_RE",
+            "_MIR_BODY_RE",
+            "_RAW_BITWISE_RE",
+            "_PROFILER_THRESHOLD_RE",
+            "_PRIVATE_LIT_RE",
+            "_DECL_BOUNDARY_RE",
+            "_EQN_ALT_LINE_RE",
+            "_MATCH_OR_FUN_RE",
+            "_HDR_TOKEN_RE",
+            "_JETSKI_REPL_RESULT_RE",
+            "_CREATED_COMPLETED_RE",
+        ):
+            self.assertIsNotNone(getattr(proof_health, attr), f"{attr} must be pre-compiled")
+
+        # Large (>8192 char) file exercising every pre-filter edge case:
+        # 1. Qualified `Anneal.Mir.Crate.Item.body` inside multiline `dsimp only [\n ...\n]`
+        #    with no earlier unqualified `Mir.` token
+        # 2. Repeated `Mir.` segment `Mir.Crate.Mir.body`
+        # 3. Nested guillemet `«a«b».wpMirExecSym` inside multiline `simp [\n ...\n]`
+        # 4. Multiline `unfold\n  bitwiseAndBits`
+        # 5. Multiline `set_option\n  trace.profiler.threshold 10`
+        # 6. Multiline `private\ntheorem` duplicate
+        pad = "-- padding line without tactic keywords\n" * 250
+        src = (
+            pad
+            + "theorem prefilter_edges : True := by\n"
+            + "  dsimp only [\n    Anneal.Mir.Crate.Item.body,\n    Mir.Crate.Mir.body\n  ]\n"
+            + "  simp [\n    «a«b».wpMirExecSym\n  ]\n"
+            + "  unfold\n    bitwiseAndBits\n"
+            + "  trivial\n"
+            + "set_option\n  trace.profiler.threshold 10\n"
+            + "private\ntheorem dup_multiline (x : Nat) : x = x := rfl\n"
+            + "private\nlemma dup_multiline (y : Nat) : y = y := rfl\n"
+        )
+        self.assertGreater(len(src), 9000)
+        findings = [(f.rule, f.symbol) for f in proof_health.scan_lean_text(src, scan_siblings=False)]
+        self.assertEqual(
+            findings,
+            [
+                (R2, "Anneal.Mir.Crate.Item.body"),
+                (R2, "Mir.Crate.Mir.body"),
+                (R1, "«a«b».wpMirExecSym"),
+                (R3, "bitwiseAndBits"),
+                (R4, "trace.profiler.threshold=10"),
+                (R5, "dup_multiline"),
+            ],
+        )
 
 
 class TestTranscriptLatencyTelemetry(unittest.TestCase):

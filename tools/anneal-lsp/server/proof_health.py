@@ -32,11 +32,16 @@ import sys
 sys.dont_write_bytecode = True
 
 from bisect import bisect_right
+from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
+import statistics
+import time
 from typing import Any, Iterable
+import zlib
 
 RULE_DSIMP_FORBIDDEN_SYM = "dsimp_forbidden_sym"
 RULE_DSIMP_MIR_BODY_UNFOLD = "dsimp_mir_body_unfold"
@@ -119,7 +124,9 @@ class PrivateDecl:
         "kind",
         "name",
         "norm_sig",
-        "line",
+        "_line",
+        "_pos",
+        "_line_of",
         "file",
         "raw_header",
         "sig_fp",
@@ -142,11 +149,15 @@ class PrivateDecl:
         body_start: int = -1,
         path: str = "",
         decl_indent: int = 0,
+        pos: int = -1,
+        line_of: Any = None,
     ) -> None:
         self.kind = kind
         self.name = name
         self.norm_sig = norm_sig
-        self.line = line
+        self._line = line
+        self._pos = pos
+        self._line_of = line_of
         self.file = file
         self.raw_header = raw_header
         self.sig_fp = sig_fp
@@ -158,6 +169,18 @@ class PrivateDecl:
         # computed when the sibling is lexed and persisted in the sibling index, so a
         # later process can compare bodies without re-reading the sibling.
         self.body_keys: tuple[Any, Any] | None = None
+
+    @property
+    def line(self) -> int:
+        if self._line <= 0 and self._pos >= 0 and self._line_of is not None:
+            self._line = int(self._line_of(self._pos))
+            self._line_of = None
+        return self._line
+
+    @line.setter
+    def line(self, value: int) -> None:
+        self._line = value
+        self._line_of = None
 
     def ensure_norm_sig(self) -> str:
         if not self.norm_sig and self.raw_header:
@@ -466,10 +489,16 @@ _PRIVATE_LIT_RE = re.compile(
 # A line starting in column 0 begins a new top-level command; indented commands inside
 # an indented `section` / `namespace` are recognised by `_DECL_BOUNDARY_RE`.
 _TOPLEVEL_LINE_RE = re.compile(r"\n(?=\S)")
-_DECL_BOUNDARY_RE: re.Pattern[str] | None = None
-_EQN_ALT_LINE_RE: re.Pattern[str] | None = None
-_MATCH_OR_FUN_RE: re.Pattern[str] | None = None
-_HDR_TOKEN_RE: re.Pattern[str] | None = None
+_DECL_BOUNDARY_RE = re.compile(
+    r"\n(?:(?=\S)|([ \t]+)(?=@\[|"
+    r"(?:private|protected|public|scoped|local|noncomputable|partial|unsafe|"
+    r"theorem|lemma|def|abbrev|opaque|axiom|example|instance|class|structure|"
+    r"inductive|mutual|section|namespace|end|variable|open|universe|set_option)(?![\w'!?.])|"
+    r"#(?:check|eval|print|reduce)\b))"
+)
+_EQN_ALT_LINE_RE = re.compile(r"\n[ \t]*\|")
+_MATCH_OR_FUN_RE = re.compile(r"(?<![\w'!?.])(?:match|fun|λ)(?![\w'!?])")
+_HDR_TOKEN_RE = re.compile(r"«[^»\n]*»|[()\[\]{}]|:=|:|(?<![\w'!?.])where(?![\w'!?])")
 _RESERVED_TYPE_NAMES = frozenset(("Type", "Prop", "Sort", "Nat", "Bool", "True", "False"))
 _UNFOLD_STOP_WORDS = frozenset(
     (
@@ -608,37 +637,6 @@ def _is_simp_unfold_entry(content: str, start: int, end: int | None = None) -> b
     return is_eq_lemma or (content[k] == ":" and content[k : k + 2] != ":=")
 
 
-def _active_simp_keywords(
-    stripped: str, simp_start: int = 0, check_rule1: bool = True
-) -> tuple[dict[str, int], bool, bool]:
-    """Map of candidate keywords to their first offset in `stripped`, plus
-    `(has_mir_body, has_bitwise)`. Avoids scanning twice for the same keyword."""
-    kw_offsets: dict[str, int] = {}
-    if check_rule1:
-        p = stripped.find("wpMirExecSym", simp_start)
-        if p != -1:
-            kw_offsets["wpMirExecSym"] = p
-        p = stripped.find("Sequence.length", simp_start)
-        if p != -1:
-            kw_offsets["Sequence.length"] = p
-    p_body = stripped.find(".body", 0)
-    has_mir_body = p_body != -1 and stripped.find("Mir.", 0) != -1
-    if has_mir_body:
-        kw_offsets[".body"] = p_body
-    has_bitwise = False
-    p_bw = stripped.find("bitwise", 0)
-    if p_bw != -1:
-        p = stripped.find("bitwiseAndBits", p_bw)
-        if p != -1:
-            kw_offsets["bitwiseAndBits"] = p
-            has_bitwise = True
-        p = stripped.find("bitwiseOrBits", p_bw)
-        if p != -1:
-            kw_offsets["bitwiseOrBits"] = p
-            has_bitwise = True
-    return kw_offsets, has_mir_body, has_bitwise
-
-
 def _is_symbol_end(stripped: str, end: int) -> bool:
     """True unless the identifier text ending at `end` continues: with more
     identifier characters, or with a `.` component other than an unfolding-equation
@@ -649,6 +647,117 @@ def _is_symbol_end(stripped: str, end: int) -> bool:
     if ch == ".":
         return _EQ_SUFFIX_AT_RE.match(stripped, end) is not None
     return not _is_ident_char(ch)
+
+
+def _has_unfold_entry_tail_at(stripped: str, end: int) -> bool:
+    """Fast necessary condition for `stripped[...:end]` to pass `_is_simp_unfold_entry`:
+    either followed by an `.eq_` suffix, or (after whitespace) by `)`, `,`, `:`, or `]`."""
+    if not _is_symbol_end(stripped, end):
+        return False
+    n = len(stripped)
+    if end < n and stripped[end] == ".":
+        return True
+    k = end
+    while k < n and stripped[k] in " \t\r\n":
+        k += 1
+    return k >= n or stripped[k] in "),:]"
+
+
+def _has_unfold_entry_head_before(stripped: str, pos: int) -> bool:
+    """Fast necessary condition for `stripped[pos:...]` (optionally preceded by a
+    dotted namespace prefix) to stand as a `simp`/`dsimp` entry after `[` or `,`."""
+    j = pos
+    while j > 0 and (_is_ident_char(stripped[j - 1]) or stripped[j - 1] == "."):
+        j -= 1
+    if j > 0 and stripped[j - 1] in "«»":
+        return True
+    k = j - 1
+    while k >= 0 and stripped[k] in " \t\r\n@(↓↑":
+        k -= 1
+    return k >= 0 and stripped[k] in "[,"
+
+
+def _first_unfold_entry_offset(stripped: str, kw: str, start: int = 0) -> int:
+    """First offset `>= start` where `kw` has valid simp-entry head and tail tokens."""
+    klen = len(kw)
+    pos = stripped.find(kw, start)
+    while pos != -1:
+        end = pos + klen
+        if _has_unfold_entry_tail_at(stripped, end) and _has_unfold_entry_head_before(
+            stripped, pos
+        ):
+            return pos
+        pos = stripped.find(kw, end)
+    return -1
+
+
+def _first_mir_body_offsets(stripped: str, start: int = 0) -> tuple[int, int]:
+    """Return `(first_any_mir_body_dot_body, first_simp_entry_mir_body_dot_body)`.
+    Avoids false `has_mir_body = True` when `Mir.` and `.body` appear at unrelated
+    positions in a file without any `Mir.<...>.body` identifier."""
+    p_mir = stripped.find("Mir.", start)
+    if p_mir == -1:
+        return -1, -1
+    n = len(stripped)
+    first_any = -1
+    first_simp = -1
+    pos = stripped.find(".body", p_mir + 4)
+    while pos != -1:
+        if _is_symbol_end(stripped, pos + 5):
+            line_start = stripped.rfind("\n", 0, pos) + 1
+            if stripped.find("Mir.", line_start, pos) != -1:
+                nl = stripped.find("\n", pos + 5)
+                line_end = n if nl == -1 else nl
+                for bm in _MIR_BODY_RE.finditer(stripped, line_start, line_end):
+                    b_pos = bm.end(1) - 5
+                    if first_any == -1:
+                        first_any = b_pos
+                    if (
+                        first_simp == -1
+                        and _has_unfold_entry_tail_at(stripped, b_pos + 5)
+                        and _has_unfold_entry_head_before(stripped, bm.start(1))
+                    ):
+                        first_simp = b_pos
+                        return first_any, first_simp
+                pos = stripped.find(".body", line_end)
+                continue
+        pos = stripped.find(".body", pos + 5)
+    return first_any, first_simp
+
+
+def _active_simp_keywords(
+    stripped: str, simp_start: int = 0, check_rule1: bool = True
+) -> tuple[dict[str, int], bool, bool]:
+    """Map of candidate keywords to their first simp-entry offset in `stripped`, plus
+    `(has_mir_body, has_bitwise)`. Avoids scanning twice for the same keyword."""
+    kw_offsets: dict[str, int] = {}
+    if check_rule1:
+        p = _first_unfold_entry_offset(stripped, "wpMirExecSym", simp_start)
+        if p != -1:
+            kw_offsets["wpMirExecSym"] = p
+        p = _first_unfold_entry_offset(stripped, "Sequence.length", simp_start)
+        if p != -1:
+            kw_offsets["Sequence.length"] = p
+    first_any_mb, first_simp_mb = _first_mir_body_offsets(stripped, 0)
+    has_mir_body = first_any_mb != -1
+    if first_simp_mb != -1:
+        kw_offsets[".body"] = first_simp_mb
+    has_bitwise = False
+    p_bw = stripped.find("bitwise", 0)
+    if p_bw != -1:
+        p = stripped.find("bitwiseAndBits", p_bw)
+        if p != -1:
+            has_bitwise = True
+            p_simp = _first_unfold_entry_offset(stripped, "bitwiseAndBits", p)
+            if p_simp != -1:
+                kw_offsets["bitwiseAndBits"] = p_simp
+        p = stripped.find("bitwiseOrBits", p_bw)
+        if p != -1:
+            has_bitwise = True
+            p_simp = _first_unfold_entry_offset(stripped, "bitwiseOrBits", p)
+            if p_simp != -1:
+                kw_offsets["bitwiseOrBits"] = p_simp
+    return kw_offsets, has_mir_body, has_bitwise
 
 
 def _step_back_simp_header_start(stripped: str, open_bracket: int) -> int:
@@ -703,11 +812,10 @@ def _candidate_search_windows(
     raw_spans: list[tuple[int, int]] = []
     for kw, first_pos in kw_offsets.items():
         klen = len(kw)
-        check_before = kw[0] != "."
         pos = first_pos
         while pos != -1:
-            if not _is_symbol_end(stripped, pos + klen) or (
-                check_before and pos > 0 and _is_ident_char(stripped[pos - 1])
+            if not _has_unfold_entry_tail_at(stripped, pos + klen) or not _has_unfold_entry_head_before(
+                stripped, pos
             ):
                 pos = stripped.find(kw, pos + klen)
                 continue
@@ -718,8 +826,10 @@ def _candidate_search_windows(
                     hdr_start = _step_back_simp_header_start(stripped, last_open)
                     if stripped.find("simp", hdr_start, last_open) != -1:
                         raw_spans.append((hdr_start, last_open + 1))
-                elif stripped.find("simp", w_start, pos) != -1 and (
-                    stripped.count("[", w_start, pos) > stripped.count("]", w_start, pos)
+                elif (
+                    stripped.rfind("[", w_start, last_open) != -1
+                    and stripped.find("simp", w_start, pos) != -1
+                    and stripped.count("[", w_start, pos) > stripped.count("]", w_start, pos)
                 ):
                     raw_spans.append((w_start, pos + klen))
             pos = stripped.find(kw, pos + klen)
@@ -849,96 +959,138 @@ def _iter_simp_brackets(
             pos = stripped.find("simp", pos + 4, win_end)
 
 
-def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
+def _unfold_search_windows(
+    stripped: str,
+    target_kws: tuple[str, ...] | None,
+    max_unfold_len: int = 2048,
+) -> list[tuple[int, int]]:
+    n = len(stripped)
+    if not target_kws or n <= 8192:
+        return [(0, n)]
+    raw_spans: list[tuple[int, int]] = []
+    for tkw in target_kws:
+        tlen = len(tkw)
+        pos = stripped.find(tkw, 0)
+        while pos != -1:
+            if _is_symbol_end(stripped, pos + tlen):
+                w_start = pos - max_unfold_len if pos > max_unfold_len else 0
+                raw_spans.append((w_start, pos + tlen))
+            pos = stripped.find(tkw, pos + tlen)
+    if not raw_spans:
+        return []
+    raw_spans.sort()
+    merged: list[tuple[int, int]] = [raw_spans[0]]
+    for st, en in raw_spans[1:]:
+        prev_st, prev_en = merged[-1]
+        if st <= prev_en:
+            if en > prev_en:
+                merged[-1] = (prev_st, en)
+        else:
+            merged.append((st, en))
+    return merged
+
+
+def _iter_unfold_targets(
+    stripped: str,
+    *,
+    target_kws: tuple[str, ...] | None = None,
+) -> Iterable[tuple[str, int, str]]:
     """Yield `(tactic_kw, token_offset, token)` for every identifier passed to an
     `unfold` or `delta` tactic, across both single-line and indented multiline target
     lists, while rejecting `.unfold`/`.delta` field projections and honoring Lean
     identifier characters (`at'`, `in?`) on stop-word checks.
     """
     n = len(stripped)
+    windows = _unfold_search_windows(stripped, target_kws)
+    if not windows:
+        return
     for kw in ("unfold", "delta"):
         klen = len(kw)
-        pos = stripped.find(kw, 0)
-        while pos != -1:
-            end_kw = pos + klen
-            if (
-                (pos > 0 and (_is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "."))
-                or end_kw >= n
-                or stripped[end_kw] not in " \t\r\n"
-            ):
-                pos = stripped.find(kw, end_kw)
-                continue
-            line_start = stripped.rfind("\n", 0, pos) + 1
-            k_ind = line_start
-            while k_ind < pos and stripped[k_ind] in " \t":
-                k_ind += 1
-            line_indent = k_ind - line_start
+        seen_kw: set[int] = set()
+        for win_start, win_end in windows:
+            pos = stripped.find(kw, win_start, win_end)
+            while pos != -1:
+                end_kw = pos + klen
+                if (
+                    pos in seen_kw
+                    or (pos > 0 and (_is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "."))
+                    or end_kw >= n
+                    or stripped[end_kw] not in " \t\r\n"
+                ):
+                    pos = stripped.find(kw, end_kw, win_end)
+                    continue
+                seen_kw.add(pos)
+                line_start = stripped.rfind("\n", 0, pos) + 1
+                k_ind = line_start
+                while k_ind < pos and stripped[k_ind] in " \t":
+                    k_ind += 1
+                line_indent = k_ind - line_start
 
-            cur = end_kw
-            saw_target = False
-            while cur < n:
-                while cur < n and stripped[cur] in " \t\r":
-                    cur += 1
-                if cur >= n:
-                    break
-                if stripped[cur] == "\n":
-                    nxt_line = cur + 1
-                    k = nxt_line
-                    while k < n and stripped[k] in " \t":
-                        k += 1
-                    if k >= n:
-                        cur = k
-                        break
-                    if stripped[k] in "\r\n":
-                        cur = k
-                        continue
-                    if k - nxt_line <= line_indent:
-                        break
-                    cur = k
-                ch = stripped[cur]
-                if not saw_target:
-                    # Optional `(config := ...)` or `+opt` / `-opt` flags before targets.
-                    if ch == "(":
-                        depth = 1
-                        cur += 1
-                        while cur < n and depth > 0:
-                            c2 = stripped[cur]
-                            if c2 == "(":
-                                depth += 1
-                            elif c2 == ")":
-                                depth -= 1
-                            cur += 1
-                        if depth != 0:
-                            break
-                        continue
-                    if ch in "+-" and cur + 1 < n and (
-                        stripped[cur + 1].isalpha() or stripped[cur + 1] == "_"
-                    ):
-                        cur += 2
-                        while cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
-                            cur += 1
-                        continue
-                if not (_is_ident_char(ch) or ch == "«"):
-                    break
-                tok_start = cur
+                cur = end_kw
+                saw_target = False
                 while cur < n:
-                    c2 = stripped[cur]
-                    if c2 == "«":
-                        g_end = stripped.find("»", cur + 1)
-                        if g_end == -1 or stripped.find("\n", cur + 1, g_end) != -1:
-                            cur += 1
-                            break
-                        cur = g_end + 1
-                    elif _is_ident_char(c2) or c2 == ".":
+                    while cur < n and stripped[cur] in " \t\r":
                         cur += 1
-                    else:
+                    if cur >= n:
                         break
-                tok = stripped[tok_start:cur]
-                if not tok or tok in _UNFOLD_STOP_WORDS:
-                    break
-                saw_target = True
-                yield kw, tok_start, tok
-            pos = stripped.find(kw, end_kw)
+                    if stripped[cur] == "\n":
+                        nxt_line = cur + 1
+                        k = nxt_line
+                        while k < n and stripped[k] in " \t":
+                            k += 1
+                        if k >= n:
+                            cur = k
+                            break
+                        if stripped[k] in "\r\n":
+                            cur = k
+                            continue
+                        if k - nxt_line <= line_indent:
+                            break
+                        cur = k
+                    ch = stripped[cur]
+                    if not saw_target:
+                        # Optional `(config := ...)` or `+opt` / `-opt` flags before targets.
+                        if ch == "(":
+                            depth = 1
+                            cur += 1
+                            while cur < n and depth > 0:
+                                c2 = stripped[cur]
+                                if c2 == "(":
+                                    depth += 1
+                                elif c2 == ")":
+                                    depth -= 1
+                                cur += 1
+                            if depth != 0:
+                                break
+                            continue
+                        if ch in "+-" and cur + 1 < n and (
+                            stripped[cur + 1].isalpha() or stripped[cur + 1] == "_"
+                        ):
+                            cur += 2
+                            while cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
+                                cur += 1
+                            continue
+                    if not (_is_ident_char(ch) or ch == "«"):
+                        break
+                    tok_start = cur
+                    while cur < n:
+                        c2 = stripped[cur]
+                        if c2 == "«":
+                            g_end = stripped.find("»", cur + 1)
+                            if g_end == -1 or stripped.find("\n", cur + 1, g_end) != -1:
+                                cur += 1
+                                break
+                            cur = g_end + 1
+                        elif _is_ident_char(c2) or c2 == ".":
+                            cur += 1
+                        else:
+                            break
+                    tok = stripped[tok_start:cur]
+                    if not tok or tok in _UNFOLD_STOP_WORDS:
+                        break
+                    saw_target = True
+                    yield kw, tok_start, tok
+                pos = stripped.find(kw, end_kw, win_end)
 
 
 def _line_indent_at(stripped: str, pos: int) -> int:
@@ -951,15 +1103,6 @@ def _line_indent_at(stripped: str, pos: int) -> int:
 
 
 def _get_decl_boundary_re() -> re.Pattern[str]:
-    global _DECL_BOUNDARY_RE
-    if _DECL_BOUNDARY_RE is None:
-        _DECL_BOUNDARY_RE = re.compile(
-            r"\n(?:(?=\S)|([ \t]+)(?=@\[|"
-            r"(?:private|protected|public|scoped|local|noncomputable|partial|unsafe|"
-            r"theorem|lemma|def|abbrev|opaque|axiom|example|instance|class|structure|"
-            r"inductive|mutual|section|namespace|end|variable|open|universe|set_option)(?![\w'!?.])|"
-            r"#(?:check|eval|print|reduce)\b))"
-        )
     return _DECL_BOUNDARY_RE
 
 
@@ -973,7 +1116,7 @@ def _next_decl_boundary(stripped: str, start_pos: int, max_end: int, decl_indent
     if decl_indent <= 0:
         m = _TOPLEVEL_LINE_RE.search(stripped, start_pos, max_end)
         return m.start() if m is not None else max_end
-    for m in _get_decl_boundary_re().finditer(stripped, start_pos, max_end):
+    for m in _DECL_BOUNDARY_RE.finditer(stripped, start_pos, max_end):
         ind = m.group(1)
         if ind is None or (len(ind) <= decl_indent and len(ind.expandtabs(2)) <= decl_indent):
             return m.start()
@@ -991,7 +1134,6 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
     or 2,500 characters. Returns `(header, body_start)` with `body_start` the offset
     where the body begins, or `("", -1)` when no complete header is found.
     """
-    global _EQN_ALT_LINE_RE, _MATCH_OR_FUN_RE, _HDR_TOKEN_RE
     n = len(stripped)
     max_end = min(n, start_pos + 2500)
     # Fast C `str.find(":=")` path before running regexes across all 2,500 chars:
@@ -1015,13 +1157,10 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
     limit = _next_decl_boundary(stripped, start_pos, max_end, decl_indent)
     eqn_end = False
     if stripped.find("|", start_pos, limit) != -1:
-        if _EQN_ALT_LINE_RE is None:
-            _EQN_ALT_LINE_RE = re.compile(r"\n[ \t]*\|")
-            _MATCH_OR_FUN_RE = re.compile(r"(?<![\w'!?.])(?:match|fun|λ)(?![\w'!?])")
         m_alt = _EQN_ALT_LINE_RE.search(stripped, start_pos, limit)
         if (
             m_alt is not None
-            and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None  # type: ignore[union-attr]
+            and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None
         ):
             eqn_end = True
             limit = m_alt.start()
@@ -1043,8 +1182,6 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
             search_pos = colon_eq + 2
 
     # Token walk over guillemet names, brackets, `:=`, `:` and `where` only.
-    if _HDR_TOKEN_RE is None:
-        _HDR_TOKEN_RE = re.compile(r"«[^»\n]*»|[()\[\]{}]|:=|:|(?<![\w'!?.])where(?![\w'!?])")
     depth = 0
     colon_pos = -1
     for tm in _HDR_TOKEN_RE.finditer(stripped, start_pos, limit):
@@ -1177,8 +1314,6 @@ def _body_key2(r: str, st: str, b: int, e: int, has_binders: bool) -> tuple[int,
     blanked body with identifiers collapsed to `_` (rename-invariant). Without:
     the comment-stripped body with string literals (no renaming needed). Whitespace
     is dropped in both."""
-    import zlib
-
     if has_binders:
         comp = (
             _BODY_IDENT_RE.sub("_", st[b:e]).encode("utf-8", "surrogatepass").translate(None, _WS_BYTES)
@@ -1365,20 +1500,26 @@ def extract_private_decls(
     lazy_norm: bool = False,
     file_path: str = "",
     line_of: _LineCounter | None = None,
+    start_pos: int = 0,
 ) -> list[PrivateDecl]:
-    pos = stripped.find("private", 0)
+    if start_pos < 0:
+        return []
+    pos = stripped.find("private", start_pos)
     if pos == -1:
         return []
     decls: list[PrivateDecl] = []
     if line_of is None and newline_offsets is None:
         line_of = _LineCounter(stripped)
+    defer_line = lazy_norm and newline_offsets is None and line_of is not None
     while pos != -1:
         if pos == 0 or not (_is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "."):
             m = _PRIVATE_LIT_RE.match(stripped, pos)
             if m is not None:
                 kind = m.group(1)
                 name = m.group(2)
-                if line_of is not None:
+                if defer_line:
+                    line = 0
+                elif line_of is not None:
                     line = line_of(pos)
                 else:
                     line = _offset_to_line(newline_offsets, pos)
@@ -1398,6 +1539,8 @@ def extract_private_decls(
                         body_start=body_start,
                         path=file_path,
                         decl_indent=decl_indent,
+                        pos=pos,
+                        line_of=line_of if defer_line else None,
                     )
                 )
                 pos = stripped.find("private", m.end())
@@ -1411,7 +1554,7 @@ def extract_private_decls(
 # texts (only needed to compare definition bodies) so warm in-process checks take <0.05 ms.
 _SIBLING_PRIVATE_CACHE: dict[str, tuple[int, int, int, list[PrivateDecl]]] = {}
 _DIR_LEAN_FILES_CACHE: dict[str, tuple[int, list[Path]]] = {}
-_FILE_TEXTS_CACHE: dict[str, tuple[int, int, str, str]] = {}
+_FILE_TEXTS_CACHE: dict[str, tuple[Any, ...]] = {}
 
 # Each hook invocation is a fresh process, so sibling declarations are persisted per
 # directory (`sibling_index_path`) instead of re-reading and re-lexing every sibling
@@ -1426,8 +1569,6 @@ CACHE_FORMAT_VERSION = 6
 def sibling_index_path(cache_path: str | Path, directory: str | Path) -> Path:
     """File holding the persisted private-declaration index of `directory`'s `.lean`
     files, next to the count cache `cache_path`."""
-    import zlib
-
     cpath = Path(cache_path)
     tag = zlib.crc32(str(directory).encode("utf-8", "surrogatepass"))
     return cpath.with_name(f"{cpath.name}.siblings-v{CACHE_FORMAT_VERSION}-{tag:08x}.json")
@@ -1580,8 +1721,6 @@ RACY_MTIME_WINDOW_NS = 2_000_000_000
 
 
 def _is_racy(st: os.stat_result) -> bool:
-    import time
-
     return time.time_ns() - st.st_mtime_ns < RACY_MTIME_WINDOW_NS
 
 
@@ -1925,30 +2064,124 @@ def _duplicate_private_findings(
     return findings
 
 
+_ORIG_EXTRACT_PRIVATE_DECLS = extract_private_decls
+
+
+def _scan_text_meta(
+    text: str, stripped: str | None = None
+) -> tuple[
+    str,
+    int,
+    dict[str, int],
+    bool,
+    bool,
+    tuple[str, ...],
+    bool,
+    int,
+    tuple[tuple[str, str, str, tuple[int, int, int, int], int, int, int], ...],
+]:
+    """Return `(stripped, first_simp, active_kws, has_mir_body, has_bitwise,
+    unfold_kws, has_profiler, first_private, private_specs)` for `text`, caching
+    the immutable keyword and declaration-header index in `_FILE_TEXTS_CACHE` for
+    large texts (`>= 4096` chars)."""
+    n = len(text)
+    idx_key = ""
+    if n >= 4096:
+        idx_key = f"_idx:{n}:{hash(text[:128])}:{hash(text[-128:])}"
+        cached = _FILE_TEXTS_CACHE.get(idx_key)
+        if cached is not None and len(cached) == 10 and cached[0] == text:
+            return cached[1:]  # type: ignore[return-value]
+
+    st = stripped if stripped is not None else strip_lean_comments_and_strings(text)
+    first_simp = st.find("simp", 0)
+    has_unfold_or_delta = ("unfold" in st) or ("delta" in st)
+    if first_simp != -1 or has_unfold_or_delta:
+        active_kws, has_mir_body, has_bitwise = _active_simp_keywords(
+            st,
+            simp_start=(first_simp + 4) if first_simp != -1 else 0,
+            check_rule1=(first_simp != -1),
+        )
+    else:
+        active_kws, has_mir_body, has_bitwise = {}, False, False
+
+    unfold_kws_list: list[str] = []
+    if has_unfold_or_delta:
+        if has_mir_body:
+            unfold_kws_list.append(".body")
+        if has_bitwise:
+            if "bitwiseAndBits" in st:
+                unfold_kws_list.append("bitwiseAndBits")
+            if "bitwiseOrBits" in st:
+                unfold_kws_list.append("bitwiseOrBits")
+    unfold_kws = tuple(unfold_kws_list)
+    has_profiler = "trace.profiler.threshold" in st
+    first_private = st.find("private", 0)
+    private_specs_list: list[tuple[str, str, str, tuple[int, int, int, int], int, int, int]] = []
+    if first_private != -1:
+        pos = first_private
+        while pos != -1:
+            if pos == 0 or not (_is_ident_char(st[pos - 1]) or st[pos - 1] == "."):
+                m = _PRIVATE_LIT_RE.match(st, pos)
+                if m is not None:
+                    decl_indent = _line_indent_at(st, pos)
+                    raw_header, body_start = _decl_header_span(st, m.end(), decl_indent)
+                    sig_fp = _header_fingerprint(raw_header)
+                    private_specs_list.append(
+                        (
+                            m.group(1),
+                            m.group(2),
+                            raw_header,
+                            sig_fp,
+                            body_start,
+                            decl_indent,
+                            pos,
+                        )
+                    )
+                    pos = st.find("private", m.end())
+                    continue
+            pos = st.find("private", pos + 7)
+    private_specs = tuple(private_specs_list)
+
+    res = (
+        st,
+        first_simp,
+        active_kws,
+        has_mir_body,
+        has_bitwise,
+        unfold_kws,
+        has_profiler,
+        first_private,
+        private_specs,
+    )
+    if idx_key:
+        if len(_FILE_TEXTS_CACHE) >= 128:
+            _FILE_TEXTS_CACHE.clear()
+        _FILE_TEXTS_CACHE[idx_key] = (text, *res)
+    return res
+
+
 def scan_lean_text(
     text: str,
     *,
     file_path: str | Path | None = None,
     scan_siblings: bool = True,
     sibling_decls: list[PrivateDecl] | None = None,
+    _stripped: str | None = None,
 ) -> list[ProofHealthFinding]:
     """Scan Lean 4 source `text` and return all structural proof-health findings."""
-    stripped = strip_lean_comments_and_strings(text)
+    (
+        stripped,
+        first_simp,
+        active_kws,
+        has_mir_body,
+        has_bitwise,
+        unfold_kws,
+        has_profiler,
+        first_private,
+        private_specs,
+    ) = _scan_text_meta(text, _stripped)
     line_of = _LineCounter(stripped)
     findings: list[ProofHealthFinding] = []
-
-    # Rules 1-3 need a simp-family tactic, `unfold` or `delta` somewhere; rule-1
-    # symbols can only sit in a simp list after the first `simp`.
-    first_simp = stripped.find("simp", 0)
-    has_tactic_kw = first_simp != -1 or "unfold" in stripped or "delta" in stripped
-    if has_tactic_kw:
-        active_kws, has_mir_body, has_bitwise = _active_simp_keywords(
-            stripped,
-            simp_start=(first_simp + 4) if first_simp != -1 else 0,
-            check_rule1=(first_simp != -1),
-        )
-    else:
-        active_kws, has_mir_body, has_bitwise = {}, False, False
 
     # Rules 1, 2, 3 inside `dsimp [...]` / `simp [...]` bracket lists
     if active_kws and first_simp != -1:
@@ -2032,8 +2265,8 @@ def scan_lean_text(
                     )
 
     # Rules 2 & 3 inside `unfold` / `delta` tactics (single-line and multiline)
-    if (has_mir_body or has_bitwise) and ("unfold" in stripped or "delta" in stripped):
-        for tactic_kw, tok_off, tok in _iter_unfold_targets(stripped):
+    if unfold_kws:
+        for tactic_kw, tok_off, tok in _iter_unfold_targets(stripped, target_kws=unfold_kws):
             if has_mir_body and ".body" in tok and "Mir." in tok:
                 bm = _MIR_BODY_RE.fullmatch(tok)
                 if bm is not None:
@@ -2077,7 +2310,7 @@ def scan_lean_text(
                     )
 
     # Rule 4: `low_profiler_threshold`
-    if "profiler.threshold" in stripped:
+    if has_profiler:
         for pm in _PROFILER_THRESHOLD_RE.finditer(stripped):
             before = stripped[pm.start() - 1] if pm.start() > 0 else " "
             if _is_ident_char(before) or before == ".":
@@ -2110,12 +2343,34 @@ def scan_lean_text(
                 )
 
     # Rule 5: `duplicate_private_lemma`
-    local_decls = extract_private_decls(
-        stripped,
-        file_label=Path(file_path).name if file_path else "",
-        lazy_norm=True,
-        line_of=line_of,
-    )
+    file_label = Path(file_path).name if file_path else ""
+    if not private_specs:
+        local_decls: list[PrivateDecl] = []
+    elif extract_private_decls is not _ORIG_EXTRACT_PRIVATE_DECLS:
+        local_decls = extract_private_decls(
+            stripped,
+            file_label=file_label,
+            lazy_norm=True,
+            line_of=line_of,
+            start_pos=first_private,
+        )
+    else:
+        local_decls = [
+            PrivateDecl(
+                kind=kind,
+                name=name,
+                norm_sig="",
+                line=0,
+                file=file_label,
+                raw_header=raw_header,
+                sig_fp=sig_fp,
+                body_start=body_start,
+                decl_indent=decl_indent,
+                pos=pos,
+                line_of=line_of,
+            )
+            for kind, name, raw_header, sig_fp, body_start, decl_indent, pos in private_specs
+        ]
     if local_decls:
         ext_decls: list[PrivateDecl] = []
         if sibling_decls is not None:
@@ -2134,10 +2389,34 @@ def scan_lean_file(
     scan_siblings: bool = True,
 ) -> list[ProofHealthFinding]:
     path = Path(file_path)
+    key = str(path)
+    try:
+        st = path.stat()
+    except (OSError, ValueError):
+        st = None
+    if st is not None and not _is_racy(st):
+        cached = _FILE_TEXTS_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return scan_lean_text(
+                cached[2],
+                file_path=path,
+                scan_siblings=scan_siblings,
+                _stripped=cached[3],
+            )
     # Bytes + decode skips text-mode newline translation; line numbers count `\n`
     # either way and a stray `\r` is whitespace to every rule.
     text = path.read_bytes().decode("utf-8", errors="replace")
-    return scan_lean_text(text, file_path=path, scan_siblings=scan_siblings)
+    stripped = strip_lean_comments_and_strings(text)
+    if st is not None:
+        if len(_FILE_TEXTS_CACHE) >= 128:
+            _FILE_TEXTS_CACHE.clear()
+        _FILE_TEXTS_CACHE[key] = (st.st_mtime_ns, st.st_size, text, stripped)
+    return scan_lean_text(
+        text,
+        file_path=path,
+        scan_siblings=scan_siblings,
+        _stripped=stripped,
+    )
 
 
 def count_findings_by_rule(findings: Iterable[ProofHealthFinding]) -> dict[str, int]:
@@ -2157,8 +2436,6 @@ def default_cache_path() -> Path:
 
 def _text_crc(text: str) -> int:
     """CRC-32 of `text` (UTF-16 code units; a near-memcpy encoding for Lean source)."""
-    import zlib
-
     return zlib.crc32(text.encode("utf-16-le", "surrogatepass"))
 
 
@@ -2217,22 +2494,19 @@ def _extract_edit_args_list(payload: dict[str, Any] | None) -> list[dict[str, An
     return candidates
 
 
-_JETSKI_REPL_RESULT_RE: re.Pattern[str] | None = None
+_JETSKI_REPL_RESULT_RE = re.compile(
+    r"\bMade\s+(\d{1,9})\s+replacements?\b"
+    r"(?:[^\n]*?\bstarting at line\s+(\d{1,9})\b)?"
+)
 
 
 def _jetski_result_hint(payload: dict[str, Any] | None) -> tuple[int | None, int | None]:
     """Parse `(count, start_line)` from Jetski's `edit_file` result string if present."""
-    global _JETSKI_REPL_RESULT_RE
     if not isinstance(payload, dict):
         return None, None
     res = payload.get("result")
     if not isinstance(res, str) or "Made " not in res:
         return None, None
-    if _JETSKI_REPL_RESULT_RE is None:
-        _JETSKI_REPL_RESULT_RE = re.compile(
-            r"\bMade\s+(\d{1,9})\s+replacements?\b"
-            r"(?:[^\n]*?\bstarting at line\s+(\d{1,9})\b)?"
-        )
     m = _JETSKI_REPL_RESULT_RE.search(res)
     if m is None:
         return None, None
@@ -2753,14 +3027,15 @@ def check_post_edit_proof_health(
 # Transcript Latency Telemetry (`compute_unbatched_tool_latencies`)
 # ---------------------------------------------------------------------------
 
-_CREATED_COMPLETED_RE: re.Pattern[str] | None = None
+_CREATED_COMPLETED_RE = re.compile(
+    r"Created At:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s*\r?\n"
+    r"Completed At:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)"
+)
 
 
 def _is_finite_nonneg_number(val: Any) -> bool:
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         return False
-    import math
-
     try:
         return math.isfinite(val) and val >= 0
     except OverflowError:  # an int too large for a float
@@ -2769,16 +3044,12 @@ def _is_finite_nonneg_number(val: Any) -> bool:
 
 def _parse_iso_ts(ts: Any) -> float | None:
     if not isinstance(ts, bool) and isinstance(ts, (int, float)):
-        import math
-
         try:
             return float(ts) if math.isfinite(ts) else None
         except OverflowError:  # an int too large for a float
             return None
     if not isinstance(ts, str) or not ts.strip():
         return None
-    from datetime import datetime
-
     s = ts.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
@@ -2797,7 +3068,6 @@ def _first_present(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _extract_duration_ms(obj: dict[str, Any]) -> float | None:
-    global _CREATED_COMPLETED_RE
     for key in ("duration_ms", "latency_ms", "elapsed_ms", "time_ms"):
         val = obj.get(key)
         if _is_finite_nonneg_number(val):
@@ -2814,11 +3084,6 @@ def _extract_duration_ms(obj: dict[str, Any]) -> float | None:
         return ms if _is_finite_nonneg_number(ms) else None
     content = obj.get("content") if obj.get("content") is not None else obj.get("output")
     if isinstance(content, str) and "Created At:" in content:
-        if _CREATED_COMPLETED_RE is None:
-            _CREATED_COMPLETED_RE = re.compile(
-                r"Created At:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s*\r?\n"
-                r"Completed At:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)"
-            )
         m = _CREATED_COMPLETED_RE.search(content)
         if m:
             t0 = _parse_iso_ts(m.group(1))
@@ -2954,8 +3219,6 @@ def compute_unbatched_tool_latencies(
       are whole seconds (a sub-second call straddling a second boundary reads 1000 ms).
     Entries without usable timings are skipped without raising.
     """
-    import statistics
-
     if not _is_finite_nonneg_number(long_call_threshold_ms):
         long_call_threshold_ms = DEFAULT_LONG_CALL_THRESHOLD_MS
 
