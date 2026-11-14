@@ -1230,19 +1230,32 @@ fn spawn_retrying_text_file_busy(cmd: &mut Command) -> std::io::Result<std::proc
 
 fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, String> {
     if let Some(val) = non_empty_env_str(get_env, MIRI_SETUP_BIN_ENV) {
-        let p = PathBuf::from(val);
-        if p.is_file() {
-            return Ok(MiriSetupCommand {
-                cargo_bin: p,
-                pass_toolchain_arg: true,
-                prepend_path_dir: None,
-                rustup_toolchain: None,
-            });
-        }
-        return Err(format!(
-            "{MIRI_SETUP_BIN_ENV} points to non-existent binary: {}",
-            p.display()
-        ));
+        // A bare command name (no path separator) is looked up on PATH, exactly
+        // like the staged launcher's `"${ANNEAL_MIRI_SETUP_BIN:-cargo}"`, and the
+        // resolved path is what gets spawned (`Command::new("name")` would search
+        // PATH even if `./name` exists, so checking `is_file()` on a bare name
+        // validated a different file than the one executed). Anything with a
+        // separator is a path that must exist.
+        let resolved = if val.chars().any(std::path::is_separator) {
+            let p = PathBuf::from(&val);
+            if !p.is_file() {
+                return Err(format!(
+                    "{MIRI_SETUP_BIN_ENV} points to non-existent binary: {}",
+                    p.display()
+                ));
+            }
+            p
+        } else {
+            find_executable_in_path_with(get_env, &val).ok_or_else(|| {
+                format!("{MIRI_SETUP_BIN_ENV} command `{val}` was not found on PATH")
+            })?
+        };
+        return Ok(MiriSetupCommand {
+            cargo_bin: resolved,
+            pass_toolchain_arg: true,
+            prepend_path_dir: None,
+            rustup_toolchain: None,
+        });
     }
     let home = non_empty_env_str(get_env, "HOME").map(PathBuf::from);
     let rustup_home = non_empty_env_str(get_env, "RUSTUP_HOME")
@@ -3007,6 +3020,77 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         assert!(
             err.contains("could not locate 'cargo'"),
             "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn miri_setup_bin_bare_names_resolve_on_path_like_the_launcher() {
+        let temp = unique_oracle_temp_dir("sysroot-setup-bin-bare-name");
+        let bin_dir = temp.join("bin");
+        let empty_dir = temp.join("empty-bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&empty_dir).expect("create empty bin dir");
+        write_executable_script(&bin_dir.join("anneal-test-cargo"), RECORDING_MOCK_CARGO);
+
+        // A bare name (padding trimmed) resolves to the executable on PATH, and
+        // the resolved absolute path is what gets spawned.
+        let get_env = env_map(&[
+            ("PATH", bin_dir.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, OsStr::new(" anneal-test-cargo ")),
+        ]);
+        assert_eq!(
+            resolve_miri_setup_cargo(&get_env),
+            Ok(MiriSetupCommand {
+                cargo_bin: bin_dir.join("anneal-test-cargo"),
+                pass_toolchain_arg: true,
+                prepend_path_dir: None,
+                rustup_toolchain: None,
+            })
+        );
+
+        // `ANNEAL_CALLER_PATH` wins over `PATH`, as for every lookup here.
+        let get_env_caller = env_map(&[
+            ("ANNEAL_CALLER_PATH", empty_dir.as_os_str()),
+            ("PATH", bin_dir.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, OsStr::new("anneal-test-cargo")),
+        ]);
+        let err = resolve_miri_setup_cargo(&get_env_caller)
+            .expect_err("ANNEAL_CALLER_PATH without the command must not fall back to PATH");
+        assert!(
+            err.contains("`anneal-test-cargo` was not found on PATH"),
+            "unexpected error: {err}"
+        );
+
+        // A path (with a separator) must exist.
+        let missing = bin_dir.join("missing-cargo");
+        let get_env_path = env_map(&[(MIRI_SETUP_BIN_ENV, missing.as_os_str())]);
+        let err = resolve_miri_setup_cargo(&get_env_path).expect_err("missing path must fail");
+        assert!(
+            err.contains("ANNEAL_MIRI_SETUP_BIN points to non-existent binary"),
+            "unexpected error: {err}"
+        );
+
+        // End to end: the bare name provisions through the production path.
+        let home = temp.join("home");
+        let get_env_e2e = env_map(&[
+            ("HOME", home.as_os_str()),
+            ("PATH", bin_dir.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, OsStr::new("anneal-test-cargo")),
+        ]);
+        let resolved = resolve_sysroot_path_with(None, &get_env_e2e, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env_e2e)
+        })
+        .expect("bare-name setup binary provisions the sysroot");
+        assert_eq!(resolved, home.join(".cache/miri"));
+        assert!(resolved.join("lib/rustlib").is_dir());
+        assert_eq!(
+            fs::read_to_string(home.join(".cache/miri.args"))
+                .expect("read mock args")
+                .trim(),
+            "+nightly-2026-06-01 miri setup"
         );
 
         let _ = fs::remove_dir_all(&temp);
