@@ -500,15 +500,19 @@ structure ProtoMachineState : Type where
   frame : StackFrame
   memory : ProtoMemory
 
-/-- Configuration knobs used only to *execute contrast models* on the real AST:
+/-- Configuration knobs used only to *execute contrast or follow-up models* on the real AST:
 * `preserveReservedOnDirectWrite := true` is the pre-`LM-3.3` buggy direct-write
   model in which a direct root write leaves `.reservedFrz` borrows untouched;
 * `legacyDeallocCheck := true` is the unpatched `Trusted.hasProtectedLocalBorrow`
-  rule in which every protected tag (including `.cell`) blocks deallocation.
+  rule in which every protected tag (including `.cell`) blocks deallocation;
+* `directReadTreeBorrows := true` applies the frame-scoped Tree Borrows foreign-read
+  transition (`accessUBProto`/`accessUpdateProto` with `accessTag = .none` and `kind = .read`)
+  on direct (non-deref) local reads, closing the `DIV-MR-TB-DIRECT-LOCAL-ACCESS` follow-up gap.
 The prototype semantics proper is `ProtoConfig.default` (`{}`). -/
 structure ProtoConfig : Type where
   preserveReservedOnDirectWrite : Bool := false
   legacyDeallocCheck : Bool := false
+  directReadTreeBorrows : Bool := false
 
 /-- Depth of the active frame: `0` for the root frame. -/
 def currentFrameDepth (s : ProtoMachineState) : Nat := s.memory.callStack.length
@@ -896,7 +900,18 @@ def readPlaceProto (cfg : ProtoConfig) (s : ProtoMachineState) (p : Place) : Pro
       match get? s.frame.locals p.local_ with
       | .some (.init rootVal) =>
         match readProjectedValue s.frame.locals rootVal proj with
-        | .ok v => .ok v s
+        | .ok v =>
+          match cfg.directReadTreeBorrows with
+          | false => .ok v s
+          | true =>
+            let d := currentFrameDepth s
+            let loc := p.local_
+            let prots := s.memory.activeProtectors
+            match accessUBProto cfg s.memory.borrows prots .read d loc proj .none with
+            | true => .ub
+            | false =>
+              .ok v { s with memory := { s.memory with
+                borrows := accessUpdateProto cfg s.memory.borrows prots .read d loc proj .none } }
         | .ub => .ub
         | .unsupported => .unsupported
       | _ => .ub
@@ -996,7 +1011,20 @@ def evalOperandProto (cfg : ProtoConfig) (s : ProtoMachineState) (op : Operand) 
         match validateLoadedValueProto s.body.localDecls s.body.layouts op v with
         | true =>
           match set? s.frame.locals p.local_ .uninit with
-          | .some locals' => .ok v { s with frame := { s.frame with locals := locals' } }
+          | .some locals' =>
+            match cfg.directReadTreeBorrows with
+            | false => .ok v { s with frame := { s.frame with locals := locals' } }
+            | true =>
+              let d := currentFrameDepth s
+              let loc := p.local_
+              let prots := s.memory.activeProtectors
+              match accessUBProto cfg s.memory.borrows prots .read d loc .nil .none with
+              | true => .ub
+              | false =>
+                .ok v { s with
+                  frame := { s.frame with locals := locals' }
+                  memory := { s.memory with
+                    borrows := accessUpdateProto cfg s.memory.borrows prots .read d loc .nil .none } }
           | .none => .ub
         | false => .ub
       | _ => .ub
@@ -4528,6 +4556,99 @@ theorem tb_direct_read_freeze_gap_shared_with_trusted :
   ⟨ProtoOutcome.eq_of_okScalar? (by decide +kernel), by decide +kernel, by decide +kernel,
    by decide +kernel⟩
 
+/-- Contrast witness 1: direct read `_3 = copy _1` *before* `_2 = &mut _1` is activated by a
+local write (`_2` is still `.reservedFrz false`), followed by `*_2 = 7; _0 = copy _1`. In
+Tree Borrows (`MachTB`), a foreign read of `.reservedFrz false` stays `.reservedFrz false`,
+so the subsequent activation write `*_2 = 7` is valid and returns `7`. -/
+def tbDirectReadBeforeActivationMir : CapturedMir :=
+  ptrBody "witness::tb_direct_read_before_activation"
+    [u32Decl, u32Decl, refMutU32Decl, u32Decl]
+    [.storageLive 2, .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .storageLive 3, .assign (local_ 3) (.use (.copy (local_ 1))),
+     .assign (derefPlace 2) (.use (constU32 7)),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+/-- Contrast witness 2: `_2 = &mut _1; Retag([fn entry], _2); *_2 = 6; _0 = copy _1`. Because
+`_2` is activated to `.unique` *and* protected by `FnEntry`, the direct foreign read
+`_0 = copy _1` attempts to freeze a protected `.unique` tag, which is immediate UB in
+`MachTB` (`"Tree Borrows: foreign read of protected Unique reference"`). -/
+def tbDirectReadProtectedUniqueMir : CapturedMir :=
+  ptrBody "witness::tb_direct_read_protected_unique"
+    [u32Decl, u32Decl, refMutU32Decl]
+    [.storageLive 2, .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .retag .fnEntry (local_ 2),
+     .assign (derefPlace 2) (.use (constU32 6)),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+/-- **Candidate fix for `DIV-MR-TB-DIRECT-LOCAL-ACCESS` (`ProtoConfig.directReadTreeBorrows := true`)**:
+enabling frame-scoped Tree Borrows foreign-read transitions on direct (non-deref) local reads:
+1. Faults with `.ub` on `tbDirectReadFreezeMir` (matching `MachTB`'s
+   `"Tree Borrows: local write of Frozen reference"`);
+2. Preserves `.reservedFrz false` on `tbDirectReadBeforeActivationMir`, returning
+   `.ok (.scalar ⟨7, 4⟩)` in agreement with `MachTB`;
+3. Immediately faults with `.ub` on `tbDirectReadProtectedUniqueMir` at step 5 (the direct
+   read `_0 = copy _1` itself, so `stepsProto { directReadTreeBorrows := true } 5` is `.none`),
+   matching `MachTB`'s `"Tree Borrows: foreign read of protected Unique reference"` (whereas
+   default `{}` steps through `_0 = copy _1` without UB and unpatched `Trusted` returns `6`). -/
+theorem tb_direct_read_freeze_repaired_by_directReadTreeBorrows :
+    runMirProto tbDirectReadFreezeMir [] [.scalar ⟨5, 4⟩]
+        (cfg := { directReadTreeBorrows := true }) = .ub ∧
+    runMirProto tbDirectReadBeforeActivationMir [] [.scalar ⟨5, 4⟩]
+        (cfg := { directReadTreeBorrows := true }) =
+      .ok (.scalar ⟨7, 4⟩) ∧
+    MiniRustSpec.Correspondence.RefWitness.ubAfterTB tbDirectReadBeforeActivationMir [.scalar ⟨5, 4⟩] 10 =
+      .none ∧
+    runMirProto tbDirectReadProtectedUniqueMir [] [.scalar ⟨5, 4⟩]
+        (cfg := { directReadTreeBorrows := true }) = .ub ∧
+    (stepsProto { directReadTreeBorrows := true } 5
+        (initProtoState tbDirectReadProtectedUniqueMir [] [.scalar ⟨5, 4⟩])).isNone = true ∧
+    (stepsProto {} 5
+        (initProtoState tbDirectReadProtectedUniqueMir [] [.scalar ⟨5, 4⟩])).isSome = true ∧
+    trustedRunScalar? tbDirectReadProtectedUniqueMir [] [.scalar ⟨5, 4⟩] 30 = .some (6, 4) ∧
+    MiniRustSpec.Correspondence.RefWitness.ubAfterTB tbDirectReadProtectedUniqueMir [.scalar ⟨5, 4⟩] 6 =
+      .some "Tree Borrows: foreign read of protected Unique reference" :=
+  ⟨ProtoOutcome.eq_ub_of_isUB (by decide +kernel),
+   ProtoOutcome.eq_of_okScalar? (by decide +kernel),
+   by decide +kernel,
+   ProtoOutcome.eq_ub_of_isUB (by decide +kernel),
+   by decide +kernel,
+   by decide +kernel,
+   by decide +kernel,
+   by decide +kernel⟩
+
+/-- **Universal frame & local isolation of direct `readPlaceProto` across all `ProtoConfig`**
+(including `directReadTreeBorrows := true`): every successful direct read
+`readPlaceProto cfg s ⟨loc, proj⟩ = .ok v s'` (`projectionHasDeref proj = false`) preserves
+`currentFrameDepth`, `s.frame.locals`, `s.memory.callStack`, and every borrow entry belonging
+to any other stack frame (`s.memory.borrows[i].targetFrameDepth ≠ currentFrameDepth s`). -/
+theorem readPlaceProto_direct_frame_isolation (cfg : ProtoConfig) (s s' : ProtoMachineState)
+    (loc : Nat) (proj : List ProjectionElem) (v : Value)
+    (hnd : projectionHasDeref proj = false)
+    (h : readPlaceProto cfg s ⟨loc, proj⟩ = .ok v s') :
+    currentFrameDepth s' = currentFrameDepth s ∧
+    s'.frame.locals = s.frame.locals ∧
+    s'.memory.callStack = s.memory.callStack ∧
+    (∀ i (hi : i < s.memory.borrows.length),
+      s.memory.borrows[i].targetFrameDepth ≠ currentFrameDepth s →
+      s'.memory.borrows[i]? = .some s.memory.borrows[i]) := by
+  have hcases : s' = s ∨
+      s' = { s with memory := { s.memory with
+        borrows := accessUpdateProto cfg s.memory.borrows s.memory.activeProtectors
+          .read (currentFrameDepth s) loc proj .none } } := by
+    unfold readPlaceProto at h
+    split at h
+    · rename_i rest heq; simp only at heq; subst heq; simp [projectionHasDeref] at hnd
+    · simp only [hnd] at h
+      repeat' split at h
+      all_goals first | (cases h; exact Or.inl rfl) | (cases h; exact Or.inr rfl) | cases h
+  rcases hcases with rfl | rfl
+  · exact ⟨rfl, rfl, rfl, fun i hi _ => List.getElem?_eq_getElem hi⟩
+  · refine ⟨rfl, rfl, rfl, fun i hi hd => ?_⟩
+    rw [accessUpdateProto, List.getElem?_map, List.getElem?_eq_getElem hi]
+    dsimp only [Option.map]
+    rw [entryAccessTransitionProto_other_frame _ _ _ _ _ _ _ _ _ hd]
+    rfl
+
 end PartAWitnesses
 
 /-! ## §5. Part B witnesses: IEEE-754 casts on raw bit patterns -/
@@ -6521,6 +6642,64 @@ theorem evalFloatToIntSaturating_roundtrip_of_intToFloat :
       omega)
   cases pw <;> exact ⟨h1, h2⟩
 
+theorem clampInt_monotone (lo hi v₁ v₂ : Int) (hv : v₁ ≤ v₂) :
+    clampInt lo hi v₁ ≤ clampInt lo hi v₂ := by
+  unfold clampInt; omega
+
+theorem truncRatio_monotone_nonneg {n₁ d₁ n₂ d₂ : Nat} (hd₁ : 0 < d₁) (hd₂ : 0 < d₂)
+    (hle : n₁ * d₂ ≤ n₂ * d₁) : n₁ / d₁ ≤ n₂ / d₂ := by
+  have h1 : (n₁ / d₁) * d₁ ≤ n₁ := Nat.div_mul_le_self n₁ d₁
+  have h2 : (n₁ / d₁) * d₁ * d₂ ≤ n₂ * d₁ :=
+    Nat.le_trans (Nat.mul_le_mul_right d₂ h1) hle
+  have h3 : (n₁ / d₁) * d₂ * d₁ ≤ n₂ * d₁ := by
+    rwa [Nat.mul_right_comm (n₁ / d₁) d₁ d₂] at h2
+  have h4 : (n₁ / d₁) * d₂ ≤ n₂ := (Nat.mul_le_mul_right_iff hd₁).mp h3
+  exact (Nat.le_div_iff_mul_le hd₂).mpr h4
+
+/-- **Universal monotonicity of `floatToIntValue` & `clampInt`**:
+1. `clampInt lo hi` is monotone (`v₁ ≤ v₂ → clampInt lo hi v₁ ≤ clampInt lo hi v₂`);
+2. For any two finite rationals `(-1)^neg₁ * (n₁ / d₁)` and `(-1)^neg₂ * (n₂ / d₂)`
+   (`0 < d₁`, `0 < d₂`) ordered in the rational order (`neg₁ = true ∧ neg₂ = false`, or
+   `neg₁ = false ∧ neg₂ = false ∧ n₁ * d₂ ≤ n₂ * d₁`, or
+   `neg₁ = true ∧ neg₂ = true ∧ n₂ * d₁ ≤ n₁ * d₂`), both `truncRatio` and
+   `floatToIntValue` are monotone (`truncRatio neg₁ n₁ d₁ ≤ truncRatio neg₂ n₂ d₂` and
+   `floatToIntValue (.finite neg₁ n₁ d₁) lo hi ≤ floatToIntValue (.finite neg₂ n₂ d₂) lo hi`);
+3. For every non-NaN `k : FloatKind` and `lo ≤ 0 ≤ hi`,
+   `floatToIntValue (.inf true) lo hi ≤ floatToIntValue k lo hi` and
+   `floatToIntValue k lo hi ≤ floatToIntValue (.inf false) lo hi`. -/
+theorem floatToIntValue_monotone :
+    (∀ (lo hi v₁ v₂ : Int), v₁ ≤ v₂ → clampInt lo hi v₁ ≤ clampInt lo hi v₂) ∧
+    (∀ (lo hi : Int) (neg₁ neg₂ : Bool) (n₁ d₁ n₂ d₂ : Nat),
+      0 < d₁ → 0 < d₂ →
+      ((neg₁ = true ∧ neg₂ = false) ∨
+       (neg₁ = false ∧ neg₂ = false ∧ n₁ * d₂ ≤ n₂ * d₁) ∨
+       (neg₁ = true ∧ neg₂ = true ∧ n₂ * d₁ ≤ n₁ * d₂)) →
+      truncRatio neg₁ n₁ d₁ ≤ truncRatio neg₂ n₂ d₂ ∧
+      floatToIntValue (.finite neg₁ n₁ d₁) lo hi ≤
+        floatToIntValue (.finite neg₂ n₂ d₂) lo hi) ∧
+    (∀ (lo hi : Int) (k : FloatKind),
+      lo ≤ 0 → 0 ≤ hi →
+      (match k with | .nan _ _ _ => false | _ => true) = true →
+      floatToIntValue (.inf true) lo hi ≤ floatToIntValue k lo hi ∧
+      floatToIntValue k lo hi ≤ floatToIntValue (.inf false) lo hi) := by
+  refine ⟨clampInt_monotone, ?_, ?_⟩
+  · intro lo hi neg₁ neg₂ n₁ d₁ n₂ d₂ hd₁ hd₂ hord
+    have htr : truncRatio neg₁ n₁ d₁ ≤ truncRatio neg₂ n₂ d₂ := by
+      rcases hord with ⟨rfl, rfl⟩ | ⟨rfl, rfl, hle⟩ | ⟨rfl, rfl, hle⟩
+      · simp only [truncRatio, ↓reduceIte, Bool.false_eq_true]
+        have hq1 : 0 ≤ ((n₁ / d₁ : Nat) : Int) := Int.natCast_nonneg _
+        have hq2 : 0 ≤ ((n₂ / d₂ : Nat) : Int) := Int.natCast_nonneg _
+        omega
+      · simp only [truncRatio, Bool.false_eq_true, ↓reduceIte]
+        have := truncRatio_monotone_nonneg hd₁ hd₂ hle; omega
+      · simp only [truncRatio, ↓reduceIte]
+        have := truncRatio_monotone_nonneg hd₂ hd₁ hle; omega
+    exact ⟨htr, clampInt_monotone lo hi _ _ htr⟩
+  · intro lo hi k h0 h1 hnotnan
+    obtain ⟨hlo, hhi⟩ := floatToIntValue_mem k lo hi h0 h1
+    simp only [floatToIntValue, ↓reduceIte, Bool.false_eq_true]
+    exact ⟨hlo, hhi⟩
+
 /-! ### Part B soundness bundles -/
 
 /-- **`evalIntToFloatRoundTiesToEven_sound`**: (1) every representable integer
@@ -7039,6 +7218,18 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.tb_direct_read_freeze_gap_shared_with_trusted' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms tb_direct_read_freeze_gap_shared_with_trusted
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.tb_direct_read_freeze_repaired_by_directReadTreeBorrows' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms tb_direct_read_freeze_repaired_by_directReadTreeBorrows
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.readPlaceProto_direct_frame_isolation' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms readPlaceProto_direct_frame_isolation
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.floatToIntValue_monotone' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToIntValue_monotone
 
 end AxiomGuards
 

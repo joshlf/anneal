@@ -204,6 +204,11 @@ HEADLINE_THEOREMS = (
     "evalFloatToIntSaturating_roundtrip_of_intToFloat",
     # A3: known Tree Borrows gap shared with Trusted (negative canary)
     "tb_direct_read_freeze_gap_shared_with_trusted",
+    # B4: candidate fix for DIV-MR-TB-DIRECT-LOCAL-ACCESS (`directReadTreeBorrows`),
+    # direct-read frame isolation, and floatToIntValue monotonicity
+    "tb_direct_read_freeze_repaired_by_directReadTreeBorrows",
+    "readPlaceProto_direct_frame_isolation",
+    "floatToIntValue_monotone",
 )
 
 
