@@ -16470,6 +16470,59 @@ theorem sliceLenBorrowOk_stack_backing (locals' : List LocalSlot) (mem : Memory)
     | exact absurd rfl hPerm
     | (simp only [hRoot, hBacking, hOff] <;> rfl)
 
+/-- A live stack borrow whose target projects to a ZST `.unit` value (when
+`readSliceBackingAggregate? = .none`) is valid for `Rvalue.len` iff `ptrVal.offsetBytes = 0` and
+`lenSc.bits = 0`. -/
+theorem sliceLenBorrowOk_zst_unit (locals' : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (ptrVal : ProvenancePtr)
+    (lenSc : ScalarInt) (entry : BorrowEntry) (rootVal : Value)
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hNoAgg : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
+        (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
+      .none)
+    (hUnit : readProjectedValue locals' rootVal entry.targetProjection = .ok .unit) :
+    sliceLenBorrowOk locals' mem localDecls layouts elem ptrVal lenSc =
+      Bool.and (Nat.beq ptrVal.offsetBytes 0) (Nat.beq lenSc.bits 0) := by
+  unfold sliceLenBorrowOk
+  rw [hBorrow]
+  dsimp only
+  rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  dsimp only at hPerm hRoot hNoAgg hUnit ⊢
+  cases perm
+  all_goals first
+    | exact absurd rfl hPerm
+    | (simp only [hRoot, hNoAgg, hUnit] <;> rfl)
+
+/-- Cross-frame `callerLocals` resolution in `sliceLenBorrowOk`: when `get? locals' entry.targetLocal = .none`
+and `get? mem.callerLocals entry.targetLocal = .some (.init rootVal)`, the backing aggregate is
+resolved from `mem.callerLocals`. -/
+theorem sliceLenBorrowOk_callerLocals_backing (locals' : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (ptrVal : ProvenancePtr)
+    (lenSc : ScalarInt) (entry : BorrowEntry) (rootVal : Value)
+    (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hNoLocal : get? locals' entry.targetLocal = .none)
+    (hCallerRoot : get? mem.callerLocals entry.targetLocal = .some (.init rootVal))
+    (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
+        (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
+      .some (cProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? ptrVal.offsetBytes (inferElemListByteStride elems) =
+      .some rawElemOffset) :
+    sliceLenBorrowOk locals' mem localDecls layouts elem ptrVal lenSc =
+      Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) lenSc.bits) (length elems) := by
+  unfold sliceLenBorrowOk
+  rw [hBorrow]
+  dsimp only
+  rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  dsimp only at hPerm hNoLocal hCallerRoot hBacking ⊢
+  cases perm
+  all_goals first
+    | exact absurd rfl hPerm
+    | (simp only [hNoLocal, hCallerRoot, hBacking, hOff] <;> rfl)
+
 /-- An unborrowed pointer into a global allocation is valid for `Rvalue.len` iff
 `offsetBytes + len * elemSz ≤ length alloc.bytes`. -/
 theorem sliceLenBorrowOk_global (locals' : List LocalSlot) (mem : Memory)
@@ -16576,6 +16629,55 @@ theorem normalizeSubsliceProjections_subslice_subslice_fromEnd
 theorem normalizeSubsliceProjectionsAux_window_nil (fromA toA : Nat) :
     normalizeSubsliceProjectionsAux (.some (fromA, toA)) .nil =
       .subslice fromA toA false :: .nil := rfl
+
+/-- **Three-level nested `fromEnd = false` subslices compose**
+(`s[a..b][c..d][e..f] = s[a+c+e .. a+c+f]`) whenever each nested window lies within its parent. -/
+theorem normalizeSubsliceProjections_subslice_3
+    (fromA toA fromB toB fromC toC : Nat) (rest : List ProjectionElem)
+    (h1 : fromA ≤ toA) (h2 : fromB ≤ toB) (h3 : toB ≤ toA - fromA)
+    (h4 : fromC ≤ toC) (h5 : toC ≤ (fromA + toB) - (fromA + fromB)) :
+    normalizeSubsliceProjections
+        (.subslice fromA toA false ::
+          .subslice fromB toB false ::
+          .subslice fromC toC false :: rest) =
+      normalizeSubsliceProjectionsAux
+        (.some (fromA + fromB + fromC, fromA + fromB + toC)) rest := by
+  rw [normalizeSubsliceProjections_subslice_subslice fromA toA fromB toB
+    (.subslice fromC toC false :: rest) h1 h2 h3]
+  have hb : Bool.and (Nat.ble fromC toC)
+      (Nat.ble toC (Nat.sub (fromA + toB) (fromA + fromB))) = true := by
+    have e4 : Nat.ble fromC toC = true := Nat.ble_eq_true_of_le h4
+    have e5 : Nat.ble toC (Nat.sub (fromA + toB) (fromA + fromB)) = true :=
+      Nat.ble_eq_true_of_le h5
+    rw [e4, e5] <;> rfl
+  dsimp only [normalizeSubsliceProjectionsAux]
+  rw [hb] <;> rfl
+
+/-- **Three-level nested subslice with trailing `fromEnd = true` composes**
+(`s[a..b][c..d][e..len-f] = s[a+c+e .. a+c+((a+d)-(a+c)-f)]`). -/
+theorem normalizeSubsliceProjections_subslice_3_fromEnd
+    (fromA toA fromB toB fromC toC : Nat) (rest : List ProjectionElem)
+    (h1 : fromA ≤ toA) (h2 : fromB ≤ toB) (h3 : toB ≤ toA - fromA)
+    (h4 : toC ≤ (fromA + toB) - (fromA + fromB))
+    (h5 : fromC ≤ (fromA + toB) - (fromA + fromB) - toC) :
+    normalizeSubsliceProjections
+        (.subslice fromA toA false ::
+          .subslice fromB toB false ::
+          .subslice fromC toC true :: rest) =
+      normalizeSubsliceProjectionsAux
+        (.some (fromA + fromB + fromC,
+          fromA + fromB + ((fromA + toB) - (fromA + fromB) - toC))) rest := by
+  rw [normalizeSubsliceProjections_subslice_subslice fromA toA fromB toB
+    (.subslice fromC toC true :: rest) h1 h2 h3]
+  have hb : Bool.and (Nat.ble toC (Nat.sub (fromA + toB) (fromA + fromB)))
+      (Nat.ble fromC (Nat.sub (Nat.sub (fromA + toB) (fromA + fromB)) toC)) = true := by
+    have e4 : Nat.ble toC (Nat.sub (fromA + toB) (fromA + fromB)) = true :=
+      Nat.ble_eq_true_of_le h4
+    have e5 : Nat.ble fromC (Nat.sub (Nat.sub (fromA + toB) (fromA + fromB)) toC) = true :=
+      Nat.ble_eq_true_of_le h5
+    rw [e4, e5] <;> rfl
+  dsimp only [normalizeSubsliceProjectionsAux]
+  rw [hb] <;> rfl
 
 /-- **`constantIndex` (`fromEnd = false`) inside a subslice window** becomes root-relative
 (`s[a..b][i] = s[a+i]`). -/
@@ -16775,6 +16877,276 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_eq_lex
       (nat_beq_eq_false_of_ne hEq),
       evalScalarBinOp_rel_unsigned .eq a₁ a₂ _ locals₂ mem hPb,
       nat_beq_eq_false_of_ne hEq, hd] <;> rfl
+
+
+
+/-- **Lexicographic `!=` on wide pointers** (on `evalRvalue`). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_ne_lex
+    (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (a₁ a₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
+    (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
+    (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
+    (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+    (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+    (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+    (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp .ne lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (boolToScalar (decide (a₁ ≠ a₂ ∨ m₁ ≠ m₂)))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ .ne lhsOp rhsOp mem
+    localDecls layouts 0 0 _ _ hL hR]
+  by_cases hEq : a₁ = a₂
+  · subst hEq
+    rw [evalWidePtrAggregateRelBinOp_ne_addr_eq lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂ (Nat.beq_refl _),
+      evalScalarBinOp_rel_unsigned .ne m₁ m₂ _ locals₂ mem hPb]
+    by_cases hm : m₁ = m₂
+    · subst hm
+      have hd : decide (a₁ ≠ a₁ ∨ m₁ ≠ m₁) = false := decide_eq_false (by omega)
+      rw [Nat.beq_refl, Bool.not_true, hd] <;> rfl
+    · have hd : decide (a₁ ≠ a₁ ∨ m₁ ≠ m₂) = true := decide_eq_true (Or.inr hm)
+      rw [nat_beq_eq_false_of_ne hm, Bool.not_false, hd] <;> rfl
+  · have hd : decide (a₁ ≠ a₂ ∨ m₁ ≠ m₂) = true := decide_eq_true (Or.inl hEq)
+    rw [evalWidePtrAggregateRelBinOp_ne_addr_ne lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂
+      (nat_beq_eq_false_of_ne hEq),
+      evalScalarBinOp_rel_unsigned .ne a₁ a₂ _ locals₂ mem hPb,
+      nat_beq_eq_false_of_ne hEq, Bool.not_false, hd] <;> rfl
+
+/-- **Lexicographic `<=` on wide pointers** (on `evalRvalue`). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_le_lex
+    (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (a₁ a₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
+    (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
+    (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
+    (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+    (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+    (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+    (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp .le lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (boolToScalar (decide (a₁ < a₂ ∨ (a₁ = a₂ ∧ m₁ ≤ m₂))))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ .le lhsOp rhsOp mem
+    localDecls layouts 0 0 _ _ hL hR]
+  by_cases hEq : a₁ = a₂
+  · subst hEq
+    rw [evalWidePtrAggregateRelBinOp_le_addr_eq lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂ (Nat.beq_refl _),
+      evalScalarBinOp_rel_unsigned .le m₁ m₂ _ locals₂ mem hPb]
+    by_cases hm : m₁ ≤ m₂
+    · have hb : Nat.ble m₁ m₂ = true := Nat.ble_eq_true_of_le hm
+      have hd : decide (a₁ < a₁ ∨ (a₁ = a₁ ∧ m₁ ≤ m₂)) = true := decide_eq_true (Or.inr ⟨rfl, hm⟩)
+      rw [hb, hd] <;> rfl
+    · have hb : Nat.ble m₁ m₂ = false := by
+        cases h : Nat.ble m₁ m₂
+        · rfl
+        · exact absurd (Nat.le_of_ble_eq_true h) hm
+      have hd : decide (a₁ < a₁ ∨ (a₁ = a₁ ∧ m₁ ≤ m₂)) = false := decide_eq_false (by omega)
+      rw [hb, hd] <;> rfl
+  · rw [evalWidePtrAggregateRelBinOp_le_addr_ne lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂
+      (nat_beq_eq_false_of_ne hEq),
+      evalScalarBinOp_rel_unsigned .le a₁ a₂ _ locals₂ mem hPb]
+    by_cases ha : a₁ < a₂
+    · have hb : Nat.ble a₁ a₂ = true := Nat.ble_eq_true_of_le (Nat.le_of_lt ha)
+      have hd : decide (a₁ < a₂ ∨ (a₁ = a₂ ∧ m₁ ≤ m₂)) = true := decide_eq_true (Or.inl ha)
+      rw [hb, hd] <;> rfl
+    · have hb : Nat.ble a₁ a₂ = false := by
+        cases h : Nat.ble a₁ a₂
+        · rfl
+        · exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+      have hd : decide (a₁ < a₂ ∨ (a₁ = a₂ ∧ m₁ ≤ m₂)) = false := decide_eq_false (by omega)
+      rw [hb, hd] <;> rfl
+
+/-- **Lexicographic `>` on wide pointers** (on `evalRvalue`). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_gt_lex
+    (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (a₁ a₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
+    (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
+    (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
+    (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+    (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+    (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+    (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp .gt lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (boolToScalar (decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ > m₂))))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ .gt lhsOp rhsOp mem
+    localDecls layouts 0 0 _ _ hL hR]
+  by_cases hEq : a₁ = a₂
+  · subst hEq
+    rw [evalWidePtrAggregateRelBinOp_gt_addr_eq lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂ (Nat.beq_refl _),
+      evalScalarBinOp_rel_unsigned .gt m₁ m₂ _ locals₂ mem hPb]
+    by_cases hm : m₁ > m₂
+    · have hb : Nat.ble m₁ m₂ = false := by
+        cases h : Nat.ble m₁ m₂
+        · rfl
+        · exact absurd (Nat.le_of_ble_eq_true h) (Nat.not_le.mpr hm)
+      have hd : decide (a₁ > a₁ ∨ (a₁ = a₁ ∧ m₁ > m₂)) = true := decide_eq_true (Or.inr ⟨rfl, hm⟩)
+      rw [hb, hd] <;> rfl
+    · have hb : Nat.ble m₁ m₂ = true := Nat.ble_eq_true_of_le (Nat.le_of_not_lt hm)
+      have hd : decide (a₁ > a₁ ∨ (a₁ = a₁ ∧ m₁ > m₂)) = false := decide_eq_false (by omega)
+      rw [hb, hd] <;> rfl
+  · rw [evalWidePtrAggregateRelBinOp_gt_addr_ne lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂
+      (nat_beq_eq_false_of_ne hEq),
+      evalScalarBinOp_rel_unsigned .gt a₁ a₂ _ locals₂ mem hPb]
+    by_cases ha : a₁ > a₂
+    · have hb : Nat.ble a₁ a₂ = false := by
+        cases h : Nat.ble a₁ a₂
+        · rfl
+        · exact absurd (Nat.le_of_ble_eq_true h) (Nat.not_le.mpr ha)
+      have hd : decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ > m₂)) = true := decide_eq_true (Or.inl ha)
+      rw [hb, hd] <;> rfl
+    · have hb : Nat.ble a₁ a₂ = true := Nat.ble_eq_true_of_le (Nat.le_of_not_lt ha)
+      have hd : decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ > m₂)) = false := decide_eq_false (by omega)
+      rw [hb, hd] <;> rfl
+
+/-- **Lexicographic `>=` on wide pointers** (on `evalRvalue`). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_ge_lex
+    (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (a₁ a₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
+    (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
+    (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
+    (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+    (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+    (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+    (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp .ge lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (boolToScalar (decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ ≥ m₂))))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ .ge lhsOp rhsOp mem
+    localDecls layouts 0 0 _ _ hL hR]
+  by_cases hEq : a₁ = a₂
+  · subst hEq
+    rw [evalWidePtrAggregateRelBinOp_ge_addr_eq lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂ (Nat.beq_refl _),
+      evalScalarBinOp_rel_unsigned .ge m₁ m₂ _ locals₂ mem hPb]
+    by_cases hm : m₁ ≥ m₂
+    · have hb : Nat.ble m₂ m₁ = true := Nat.ble_eq_true_of_le hm
+      have hd : decide (a₁ > a₁ ∨ (a₁ = a₁ ∧ m₁ ≥ m₂)) = true := decide_eq_true (Or.inr ⟨rfl, hm⟩)
+      rw [hb, hd] <;> rfl
+    · have hb : Nat.ble m₂ m₁ = false := by
+        cases h : Nat.ble m₂ m₁
+        · rfl
+        · exact absurd (Nat.le_of_ble_eq_true h) hm
+      have hd : decide (a₁ > a₁ ∨ (a₁ = a₁ ∧ m₁ ≥ m₂)) = false := decide_eq_false (by omega)
+      rw [hb, hd] <;> rfl
+  · rw [evalWidePtrAggregateRelBinOp_ge_addr_ne lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂
+      (nat_beq_eq_false_of_ne hEq),
+      evalScalarBinOp_rel_unsigned .ge a₁ a₂ _ locals₂ mem hPb]
+    by_cases ha : a₁ > a₂
+    · have hb : Nat.ble a₂ a₁ = true := Nat.ble_eq_true_of_le (Nat.le_of_lt ha)
+      have hd : decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ ≥ m₂)) = true := decide_eq_true (Or.inl ha)
+      rw [hb, hd] <;> rfl
+    · have hb : Nat.ble a₂ a₁ = false := by
+        cases h : Nat.ble a₂ a₁
+        · rfl
+        · exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+      have hd : decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ ≥ m₂)) = false := decide_eq_false (by omega)
+      rw [hb, hd] <;> rfl
+
+
+
+
+
+/-- **Lexicographic `cmp` on wide pointers** (on `evalRvalue`). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex
+    (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (a₁ a₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
+    (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
+    (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
+    (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+    (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+    (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+    (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp .cmp lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (
+        match Nat.beq a₁ a₂ with
+        | true =>
+          match Nat.beq m₁ m₂ with
+          | true => { bits := 0, sizeBytes := 1 }
+          | false => match Nat.ble m₁ m₂ with
+                     | true => { bits := 255, sizeBytes := 1 }
+                     | false => { bits := 1, sizeBytes := 1 }
+        | false =>
+          match Nat.ble a₁ a₂ with
+          | true => { bits := 255, sizeBytes := 1 }
+          | false => { bits := 1, sizeBytes := 1 })) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ .cmp lhsOp rhsOp mem
+    localDecls layouts 0 0 _ _ hL hR]
+  by_cases hEq : a₁ = a₂
+  · subst hEq
+    rw [evalWidePtrAggregateRelBinOp_cmp_addr_eq lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂ (Nat.beq_refl _),
+      evalScalarBinOp_rel_unsigned .cmp m₁ m₂ _ locals₂ mem hPb]
+    simp only [Nat.beq_refl]
+    cases Nat.beq m₁ m₂ <;> cases Nat.ble m₁ m₂ <;> rfl
+  · rw [evalWidePtrAggregateRelBinOp_cmp_addr_ne lhsOp lhsThin lhsMeta rhsThin rhsMeta locals₂ mem
+      localDecls layouts _ _ _ _ hPtrOp hLhsMetaTy hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂
+      (nat_beq_eq_false_of_ne hEq),
+      evalScalarBinOp_rel_unsigned .cmp a₁ a₂ _ locals₂ mem hPb]
+    have hEqB : Nat.beq a₁ a₂ = false := nat_beq_eq_false_of_ne hEq
+    simp only [hEqB]
+    cases Nat.ble a₁ a₂ <;> rfl
 
 end WidePtrSliceRvalueRefinement
 

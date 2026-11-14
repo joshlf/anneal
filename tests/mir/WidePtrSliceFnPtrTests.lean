@@ -395,6 +395,59 @@ theorem unsize_spec_lemma_witnesses :
     unsizeArrayToSliceSpec?_elem_mismatch_eq_none true true .not .not u32Ty (.uint .u8) 5 rfl,
     (rawPtrUnsizeArrayToSliceLen?_eq_some_iff .mut .not u32Ty u32Ty 5 5 1 3 4).mpr ⟨rfl, rfl⟩⟩
 
+/-- Cross-frame `callerLocals` borrow (tag `99` targeting caller local `0`, which is out of bounds
+in the 1-slot current frame `[.init (.ptr ⟨99, 0⟩ 8)]`): `Unsize` resolves the backing array from
+`mem.callerLocals`. -/
+def callerBorrowEntry : BorrowEntry :=
+  { tag := 99, targetLocal := 1, targetProjection := [], perm := .active }
+
+def memWithCallerLocals : Memory :=
+  { testMem with
+    borrows := callerBorrowEntry :: testMem.borrows
+    callerLocals := [.init .unit, .init backing] }
+
+def refArray5Decl : LocalDecl :=
+  { mutability := .not, ty := { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 }, debugName := none }
+
+theorem unsize_callerLocals_ok_64 :
+    evalRvalue [.init (.ptr ⟨99, 0⟩ 8)]
+        (.cast (.pointerCoercion "Unsize") (cp 0) (sliceTy (.ref .not (.slice u32Ty))))
+        memWithCallerLocals [refArray5Decl] testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨99, 0⟩ 5 8) [.init (.ptr ⟨99, 0⟩ 8)] memWithCallerLocals :=
+  (trusted_evalUnsizeCoercion_callerLocals_backing_iff
+    [.init (.ptr ⟨99, 0⟩ 8)] [.init (.ptr ⟨99, 0⟩ 8)] (cp 0) memWithCallerLocals
+    [refArray5Decl] testLayouts64 true .not u32Ty 3
+    { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨99, 0⟩ 5
+    callerBorrowEntry backing [] 0 backingElems 0
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl).2.mpr rfl
+
+/-- Untyped operand (`localDecls = []`, so `operandTy [] _ (cp 1) = none`) on a stack borrow:
+`Unsize` infers length `5 - 0 = 5` directly from `backing`. -/
+theorem unsize_untyped_stack_ok_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem [] testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨1, 0⟩ 5 8) L64 testMem :=
+  (trusted_evalUnsizeCoercion_untyped_stack_borrow L64 L64 (cp 1) testMem [] testLayouts64
+    true .not u32Ty 3 ⟨1, 0⟩ activeEntry backing [] 0 backingElems 0
+    rfl rfl rfl rfl rfl rfl rfl rfl).2
+
+/-- Untyped operand (`localDecls = []`) on the 20-byte global allocation (`allocId = 9`):
+`Unsize` infers `20 / 4 = 5` elements (32-bit). -/
+theorem unsize_untyped_global_ok_32 :
+    evalRvalue L32 (.cast (.pointerCoercion "Unsize") (cp 32) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem [] testLayouts32 =
+      .ok (LWidePtr.encodeProv ⟨9, 0⟩ 5 4) L32 testMem :=
+  (trusted_evalUnsizeCoercion_untyped_global_alloc L32 L32 (cp 32) testMem [] testLayouts32
+    true .not u32Ty 3 ⟨9, 0⟩ testGlobal 4 0 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl).2
+
+/-- Untyped operand (`localDecls = []`) on an unbacked pointer (`allocId = 7`): `Unsize` faults. -/
+theorem unsize_untyped_unbacked_ub_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 2) (sliceTy (.rawPtr .not (.slice u32Ty))))
+        testMem [] testLayouts64 = .ub :=
+  (trusted_evalUnsizeCoercion_untyped_unbacked_ub L64 L64 (cp 2) testMem [] testLayouts64
+    false .not u32Ty 3 ⟨7, 16⟩ rfl rfl rfl rfl).2
+
 /-! ## 9.3 `MutToConstPointer`, `ArrayToPointer`, reification, `UnsafeFnPointer` -/
 
 /-- `*mut u32 -> *const u32` on a thin provenance pointer (64-bit). -/
@@ -464,6 +517,54 @@ theorem mutToConst_shape_witnesses :
   ⟨(mutToConstTargetShape?_rawPtr_mut_to_const _ _ _ _).trans rfl,
     (mutToConstTargetShape?_rawPtr_mut_to_const _ _ _ _).trans rfl,
     (mutToConstTargetShape?_rawPtr_mut_to_const _ _ _ _).trans rfl⟩
+
+def rawMutDynDecl : LocalDecl :=
+  { mutability := .not, ty := { kind := .rawPtr .mut (.dynamic "Tr"), layoutIdx := 3 },
+    debugName := none }
+
+def declsDynMut : List LocalDecl := testDecls.set 6 rawMutDynDecl
+
+/-- `*mut dyn Tr -> *const dyn Tr` on a vtable-carrying `[.ptr, .ptr]` aggregate preserves the
+vtable pointer `⟨65536, 0⟩` (64-bit). -/
+theorem mutToConst_dyn_ptr_ok_64 :
+    evalRvalue (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+        (.cast (.pointerCoercion "MutToConstPointer") (cp 6)
+          (sliceTy (.rawPtr .not (.dynamic "Tr"))))
+        testMem declsDynMut testLayouts64 =
+      .ok (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])
+        (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8]))) testMem :=
+  (trusted_evalRvalue_mutToConstPointer_dyn_ptr_iff
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8]))) (cp 6)
+    (sliceTy (.rawPtr .not (.dynamic "Tr"))) testMem declsDynMut testLayouts64 ⟨7, 0⟩ ⟨65536, 0⟩
+    8 8 rfl).1.mpr ⟨rfl, rfl, rfl⟩
+
+/-- A vtable-carrying `[.ptr, .ptr]` aggregate is rejected when the target is `*const [u32]`
+(`mutToConstTargetShape? = some (some false)`). -/
+theorem mutToConst_dyn_ptr_slice_target_ub_64 :
+    evalRvalue (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+        (.cast (.pointerCoercion "MutToConstPointer") (cp 6)
+          (sliceTy (.rawPtr .not (.slice u32Ty))))
+        testMem testDecls testLayouts64 = .ub :=
+  (trusted_evalRvalue_mutToConstPointer_dyn_ptr_iff
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8]))) (cp 6)
+    (sliceTy (.rawPtr .not (.slice u32Ty))) testMem testDecls testLayouts64 ⟨7, 0⟩ ⟨65536, 0⟩
+    8 8 rfl).2.mpr (fun ⟨_, _, h⟩ => by cases h)
+
+/-- Scalar-address, vtable-carrying `*mut dyn Tr -> *const dyn Tr` (32-bit). -/
+theorem mutToConst_dyn_scalar_ok_32 :
+    evalRvalue (L32.set 6 (.init (.aggregate 0 [.scalar ⟨4096, 4⟩, .ptr ⟨65536, 0⟩ 4])))
+        (.cast (.pointerCoercion "MutToConstPointer") (cp 6)
+          (sliceTy (.rawPtr .not (.dynamic "Tr"))))
+        testMem declsDynMut testLayouts32 =
+      .ok (.aggregate 0 [.scalar ⟨4096, 4⟩, .ptr ⟨65536, 0⟩ 4])
+        (L32.set 6 (.init (.aggregate 0 [.scalar ⟨4096, 4⟩, .ptr ⟨65536, 0⟩ 4]))) testMem :=
+  (trusted_evalRvalue_mutToConstPointer_dyn_scalar_iff
+    (L32.set 6 (.init (.aggregate 0 [.scalar ⟨4096, 4⟩, .ptr ⟨65536, 0⟩ 4])))
+    (L32.set 6 (.init (.aggregate 0 [.scalar ⟨4096, 4⟩, .ptr ⟨65536, 0⟩ 4]))) (cp 6)
+    (sliceTy (.rawPtr .not (.dynamic "Tr"))) testMem declsDynMut testLayouts32 ⟨4096, 4⟩ ⟨65536, 0⟩
+    4 rfl).1.mpr ⟨rfl, rfl, rfl⟩
 
 /-- `*const [u32; 5] -> *const u32` on a stack borrow refines to `deriveStackElemThinPtr`, which
 allocates the fresh narrowed tag `10` with projection `[.subslice 0 5 false]` at offset `0`. -/
@@ -627,6 +728,63 @@ theorem unsafeFnPtr_invalid_witnesses :
   ⟨unsafeFnPtrSrcTyValid_unsafe_source_eq_false _ _ _ _ _ _ _,
     unsafeFnPtrValid_eq_false_of_offset_or_borrow _ _ _ _ _ _ (Or.inr ⟨activeEntry, rfl⟩)⟩
 
+/-- Minimal `ArgAbi` for a unit return. -/
+def unitRetAbi : ArgAbi :=
+  { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+                fields := .arbitrary [] [], variants := .single 0, isUninhabited := false,
+                fieldLayouts := [] }
+    mode := .ignore }
+
+/-- A `CapturedMir` callee for `"f"` whose own `FnAbi.conv` is `.rustIntrinsic`. -/
+def intrinsicCalleeF : CapturedMir := {
+  defPath := "f"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [{ mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := none }]
+  basicBlocks := []
+  fnAbi := { args := [], ret := unitRetAbi, conv := .rustIntrinsic, canUnwind := false }
+  layouts := testLayouts64
+  allocations := [] }
+
+/-- A `CapturedMir` callee for `"f"` with `argCount = 1` (mismatching a 0-arg `fn()` target). -/
+def arityMismatchCalleeF : CapturedMir := {
+  intrinsicCalleeF with
+  argCount := 1
+  fnAbi := { args := [], ret := unitRetAbi, conv := .rust, canUnwind := true } }
+
+/-- Reifying `"f"` into a `"Rust"` `fn()` pointer faults when `"f"` resolves in `mem.callees` to a
+`.rustIntrinsic` body (`checkCalleeSig = false`). -/
+theorem reify_intrinsic_callee_ub_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "ReifyFnPointer") (cp 7)
+        { kind := fnSigSafe, layoutIdx := 1 })
+        { testMem with callees := [intrinsicCalleeF] } testDecls testLayouts64 = .ub :=
+  trusted_evalRvalue_reifyFnPointer_ub L64 L64 (cp 7) { kind := fnSigSafe, layoutIdx := 1 }
+    { testMem with callees := [intrinsicCalleeF] } testDecls testLayouts64 "ReifyFnPointer" .unit
+    rfl rfl rfl
+    (Or.inr (fun _ _ _ _ h => by
+      cases h
+      exact Or.inr (Or.inr (Or.inr (fun _ _ hT => by
+        cases hT
+        exact checkCalleeSig_rustIntrinsic_callee_eq_false intrinsicCalleeF [] "f" [] (.tuple [])
+          .rust [] [] intrinsicCalleeF [] rfl rfl)))))
+
+/-- Reifying `"f"` into a 0-arg `fn()` pointer faults when `"f"` resolves in `mem.callees` to a
+1-arg body (`checkCalleeSig = false`). -/
+theorem reify_arity_mismatch_callee_ub_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "ReifyFnPointer") (cp 7)
+        { kind := fnSigSafe, layoutIdx := 1 })
+        { testMem with callees := [arityMismatchCalleeF] } testDecls testLayouts64 = .ub :=
+  trusted_evalRvalue_reifyFnPointer_ub L64 L64 (cp 7) { kind := fnSigSafe, layoutIdx := 1 }
+    { testMem with callees := [arityMismatchCalleeF] } testDecls testLayouts64 "ReifyFnPointer" .unit
+    rfl rfl rfl
+    (Or.inr (fun _ _ _ _ h => by
+      cases h
+      exact Or.inr (Or.inr (Or.inr (fun _ _ hT => by
+        cases hT
+        exact checkCalleeSig_arity_or_abi_mismatch_eq_false arityMismatchCalleeF [] "f" []
+          (.tuple []) .rust [] [] arityMismatchCalleeF [] rfl (Or.inl (by decide)))))))
+
 /-! ## 9.4 `FnPtrToPtr` -/
 
 /-- `fn() as *const u32` preserves the function pointer's provenance (64-bit). -/
@@ -736,6 +894,43 @@ theorem ptrToPtr_thin_to_wide_ub_64 :
         testDecls testLayouts64 = .ub :=
   trusted_evalRvalue_ptrToPtr_thin_to_wide_ub L64 L64 (cp 11) (sliceTy (.rawPtr .not (.slice u32Ty)))
     testMem testDecls testLayouts64 ⟨7, 0⟩ 8 rfl rfl
+
+/-- Wide `dyn` `[.ptr, .ptr]` -> thin `*const u32` strips the vtable pointer directly (64-bit). -/
+theorem ptrToPtr_dyn_to_thin_64 :
+    evalRvalue (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+        (.cast .ptrToPtr (cp 6) { kind := .rawPtr .not u32Ty, layoutIdx := 1 })
+        testMem declsDynMut testLayouts64 =
+      .ok (.ptr ⟨7, 0⟩ 8)
+        (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8]))) testMem :=
+  trusted_evalRvalue_ptrToPtr_dyn_to_thin
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8]))) (cp 6)
+    { kind := .rawPtr .not u32Ty, layoutIdx := 1 } testMem declsDynMut testLayouts64 ⟨7, 0⟩
+    ⟨65536, 0⟩ rfl rfl
+
+/-- Wide `dyn` `[.ptr, .ptr]` -> wide `*const dyn Tr` preserves the vtable pointer (32-bit). -/
+theorem ptrToPtr_dyn_to_dyn_32 :
+    evalRvalue (L32.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 4, .ptr ⟨65536, 0⟩ 4])))
+        (.cast .ptrToPtr (cp 6) (sliceTy (.rawPtr .not (.dynamic "Tr"))))
+        testMem declsDynMut testLayouts32 =
+      .ok (.aggregate 0 [.ptr ⟨7, 0⟩ 4, .ptr ⟨65536, 0⟩ 4])
+        (L32.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 4, .ptr ⟨65536, 0⟩ 4]))) testMem :=
+  trusted_evalRvalue_ptrToPtr_dyn_to_dyn
+    (L32.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 4, .ptr ⟨65536, 0⟩ 4])))
+    (L32.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 4, .ptr ⟨65536, 0⟩ 4]))) (cp 6)
+    (sliceTy (.rawPtr .not (.dynamic "Tr"))) testMem declsDynMut testLayouts32 ⟨7, 0⟩ ⟨65536, 0⟩
+    rfl rfl rfl
+
+/-- Wide `dyn` `[.ptr, .ptr]` -> `*const [u32]` faults with `.ub` (64-bit). -/
+theorem ptrToPtr_dyn_to_slice_ub_64 :
+    evalRvalue (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+        (.cast .ptrToPtr (cp 6) (sliceTy (.rawPtr .not (.slice u32Ty))))
+        testMem declsDynMut testLayouts64 = .ub :=
+  trusted_evalRvalue_ptrToPtr_dyn_to_slice_ub
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8])))
+    (L64.set 6 (.init (.aggregate 0 [.ptr ⟨7, 0⟩ 8, .ptr ⟨65536, 0⟩ 8]))) (cp 6)
+    (sliceTy (.rawPtr .not (.slice u32Ty))) testMem declsDynMut testLayouts64 ⟨7, 0⟩ ⟨65536, 0⟩
+    8 8 rfl rfl
 
 /-! ## 3.B.1 `AggregateKind.rawPtr` -/
 
@@ -917,6 +1112,61 @@ theorem len_str_ub_64 :
     evalRvalue L64 (.len (derefPlace 29)) testMem testDecls testLayouts64 = .ub :=
   trusted_evalRvalue_len_str_ub L64 (derefPlace 29) testMem testDecls testLayouts64 _ rfl
 
+/-- ZST `.unit` backing slot (tag `5` on local `19`) with `offsetBytes = 0` and `len = 0`:
+`Rvalue.len` succeeds returning `0` (64-bit). -/
+theorem len_zst_unit_ok_64 :
+    evalRvalue (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨0, 8⟩])))
+        (.len (derefPlace 15)) testMem testDecls testLayouts64 =
+      .ok (.scalar ⟨0, 8⟩)
+        (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨0, 8⟩]))) testMem :=
+  (trusted_evalRvalue_len_deref_slice_iff
+    (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨0, 8⟩])))
+    (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨0, 8⟩])))
+    (derefPlace 15) testMem testDecls testLayouts64 [] u32Ty _ ⟨5, 0⟩ 8 ⟨0, 8⟩
+    rfl rfl rfl).1.mpr
+    ⟨rfl, rfl,
+      (sliceLenBorrowOk_zst_unit
+        (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨0, 8⟩])))
+        testMem testDecls testLayouts64 u32Ty ⟨5, 0⟩ ⟨0, 8⟩ zstEntry .unit
+        rfl (fun h => by cases h) rfl rfl rfl).trans rfl⟩
+
+/-- ZST `.unit` backing slot (tag `5` on local `19`) with `len = 1 > 0`: `Rvalue.len` faults. -/
+theorem len_zst_unit_nonzero_ub_64 :
+    evalRvalue (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨1, 8⟩])))
+        (.len (derefPlace 15)) testMem testDecls testLayouts64 = .ub :=
+  (trusted_evalRvalue_len_deref_slice_iff
+    (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨1, 8⟩])))
+    (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨1, 8⟩])))
+    (derefPlace 15) testMem testDecls testLayouts64 [] u32Ty _ ⟨5, 0⟩ 8 ⟨1, 8⟩
+    rfl rfl rfl).2.mpr (fun ⟨_, _, h⟩ => by
+      rw [sliceLenBorrowOk_zst_unit
+        (L64.set 15 (.init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨1, 8⟩])))
+        testMem testDecls testLayouts64 u32Ty ⟨5, 0⟩ ⟨1, 8⟩ zstEntry .unit
+        rfl (fun hc => by cases hc) rfl rfl rfl] at h
+      cases h)
+
+def refSliceU32Decl : LocalDecl :=
+  { mutability := .not, ty := { kind := .ref .not (.slice u32Ty), layoutIdx := 3 }, debugName := none }
+
+/-- Cross-frame `callerLocals` backing array (tag `99` targeting caller local `1`):
+`Rvalue.len` succeeds returning `5` (64-bit). -/
+theorem len_callerLocals_ok_64 :
+    evalRvalue [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨5, 8⟩])]
+        (.len (derefPlace 0)) memWithCallerLocals [refSliceU32Decl] testLayouts64 =
+      .ok (.scalar ⟨5, 8⟩)
+        [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨5, 8⟩])] memWithCallerLocals :=
+  (trusted_evalRvalue_len_deref_slice_iff
+    [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨5, 8⟩])]
+    [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨5, 8⟩])]
+    (derefPlace 0) memWithCallerLocals [refSliceU32Decl] testLayouts64 [] u32Ty _ ⟨99, 0⟩ 8 ⟨5, 8⟩
+    rfl rfl rfl).1.mpr
+    ⟨rfl, rfl,
+      (sliceLenBorrowOk_callerLocals_backing
+        [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨5, 8⟩])]
+        memWithCallerLocals [refSliceU32Decl] testLayouts64 u32Ty ⟨99, 0⟩ ⟨5, 8⟩
+        callerBorrowEntry backing [] 0 backingElems 0
+        rfl (fun h => by cases h) rfl rfl rfl rfl).trans rfl⟩
+
 /-! ## 3.B.4 Subslice window laws (Episode 1 `Subslice` / `ConstantIndex` formulas) -/
 
 /-- `s[2..5][1..2] = s[3..4]`. -/
@@ -950,6 +1200,25 @@ theorem subslice_out_of_window_witness :
       [.subslice 2 5 false, .subslice 0 4 false] :=
   (normalizeSubsliceProjections_subslice_subslice_out_of_window 2 5 0 4 [] (by decide)
     (by decide)).trans rfl
+
+/-- Three-level nested `fromEnd = false` composition: `s[1..9][2..7][1..4] = s[4..7]`. -/
+theorem subslice_compose_3_witness :
+    normalizeSubsliceProjections
+        [.subslice 1 9 false, .subslice 2 7 false, .subslice 1 4 false] =
+      [.subslice 4 7 false] :=
+  (normalizeSubsliceProjections_subslice_3 1 9 2 7 1 4 []
+    (by decide) (by decide) (by decide) (by decide) (by decide)).trans
+    (normalizeSubsliceProjectionsAux_window_nil 4 7)
+
+/-- Three-level nested composition with trailing `fromEnd = true`:
+`s[1..9][2..7][1..len-1] = s[4..7]`. -/
+theorem subslice_compose_3_fromEnd_witness :
+    normalizeSubsliceProjections
+        [.subslice 1 9 false, .subslice 2 7 false, .subslice 1 1 true] =
+      [.subslice 4 7 false] :=
+  (normalizeSubsliceProjections_subslice_3_fromEnd 1 9 2 7 1 1 []
+    (by decide) (by decide) (by decide) (by decide) (by decide)).trans
+    (normalizeSubsliceProjectionsAux_window_nil 4 7)
 
 /-! ### Instantiations of the step-level (non-`evalRvalue`) lemmas -/
 
@@ -1022,6 +1291,93 @@ theorem widePtr_eq_refl_64 :
     evalRvalue L64 (.binaryOp .eq (cp 20) (cp 20)) testMem testDecls testLayouts64 =
       .ok (.scalar (boolToScalar true)) L64 testMem :=
   (trusted_evalRvalue_binaryOp_wide_ptr_eq_lex L64 L64 L64 (cp 20) (cp 20) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) 458756 458756 5 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Same data address, different metadata: `lhs != rhs` is `true` (64-bit). -/
+theorem widePtr_ne_meta_differs_64 :
+    evalRvalue L64 (.binaryOp .ne (cp 20) (cp 21)) testMem testDecls testLayouts64 =
+      .ok (.scalar (boolToScalar true)) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_ne_lex L64 L64 L64 (cp 20) (cp 21) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) 458756 458756 5 3
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Identical wide pointers: `lhs != rhs` is `false` (32-bit). -/
+theorem widePtr_ne_refl_32 :
+    evalRvalue L32 (.binaryOp .ne (cp 20) (cp 20)) testMem testDecls testLayouts32 =
+      .ok (.scalar (boolToScalar false)) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_ne_lex L32 L32 L32 (cp 20) (cp 20) testMem testDecls
+    testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 4⟩) (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 4⟩) 458756 458756 5 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Same data address, metadata `3 <= 5`: `lhs <= rhs` is `true` (64-bit). -/
+theorem widePtr_le_same_addr_64 :
+    evalRvalue L64 (.binaryOp .le (cp 21) (cp 20)) testMem testDecls testLayouts64 =
+      .ok (.scalar (boolToScalar true)) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_le_lex L64 L64 L64 (cp 21) (cp 20) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) 458756 458756 3 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Larger data address: `lhs <= rhs` is `false` even when `m₁ < m₂` (32-bit). -/
+theorem widePtr_le_addr_gt_false_32 :
+    evalRvalue L32 (.binaryOp .le (cp 22) (cp 21)) testMem testDecls testLayouts32 =
+      .ok (.scalar (boolToScalar false)) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_le_lex L32 L32 L32 (cp 22) (cp 21)) testMem testDecls
+    testLayouts32 (.ptr ⟨7, 8⟩ 4) (.scalar ⟨1, 4⟩) (.ptr ⟨7, 4⟩ 4) (.scalar ⟨3, 4⟩) 458760 458756 1 3
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) |>.trans rfl
+
+/-- Same data address, metadata `5 > 3`: `lhs > rhs` is `true` (64-bit). -/
+theorem widePtr_gt_same_addr_64 :
+    evalRvalue L64 (.binaryOp .gt (cp 20) (cp 21)) testMem testDecls testLayouts64 =
+      .ok (.scalar (boolToScalar true)) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_gt_lex L64 L64 L64 (cp 20) (cp 21) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) 458756 458756 5 3
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Smaller data address: `lhs > rhs` is `false` even when `m₁ > m₂` (32-bit). -/
+theorem widePtr_gt_addr_lt_false_32 :
+    evalRvalue L32 (.binaryOp .gt (cp 21) (cp 22)) testMem testDecls testLayouts32 =
+      .ok (.scalar (boolToScalar false)) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_gt_lex L32 L32 L32 (cp 21) (cp 22) testMem testDecls
+    testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨3, 4⟩) (.ptr ⟨7, 8⟩ 4) (.scalar ⟨1, 4⟩) 458756 458760 3 1
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Same data address, metadata `3 >= 5`: `lhs >= rhs` is `false` (64-bit). -/
+theorem widePtr_ge_same_addr_64 :
+    evalRvalue L64 (.binaryOp .ge (cp 21) (cp 20)) testMem testDecls testLayouts64 =
+      .ok (.scalar (boolToScalar false)) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_ge_lex L64 L64 L64 (cp 21) (cp 20) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) 458756 458756 3 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Identical wide pointers: `lhs >= rhs` is `true` (32-bit). -/
+theorem widePtr_ge_refl_32 :
+    evalRvalue L32 (.binaryOp .ge (cp 20) (cp 20)) testMem testDecls testLayouts32 =
+      .ok (.scalar (boolToScalar true)) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_ge_lex L32 L32 L32 (cp 20) (cp 20) testMem testDecls
+    testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 4⟩) (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 4⟩) 458756 458756 5 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Lexicographic `cmp` on wide pointers: returns `Ordering::Greater` (`1`), `Ordering::Less`
+(`255`), and `Ordering::Equal` (`0`) as 1-byte scalars. -/
+theorem widePtr_cmp_same_addr_gt_64 :
+    evalRvalue L64 (.binaryOp .cmp (cp 20) (cp 21)) testMem testDecls testLayouts64 =
+      .ok (.scalar ⟨1, 1⟩) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex L64 L64 L64 (cp 20) (cp 21) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) 458756 458756 5 3
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+theorem widePtr_cmp_addr_lt_32 :
+    evalRvalue L32 (.binaryOp .cmp (cp 21) (cp 22)) testMem testDecls testLayouts32 =
+      .ok (.scalar ⟨255, 1⟩) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex L32 L32 L32 (cp 21) (cp 22) testMem testDecls
+    testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨3, 4⟩) (.ptr ⟨7, 8⟩ 4) (.scalar ⟨1, 4⟩) 458756 458760 3 1
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+theorem widePtr_cmp_eq_64 :
+    evalRvalue L64 (.binaryOp .cmp (cp 20) (cp 20)) testMem testDecls testLayouts64 =
+      .ok (.scalar ⟨0, 1⟩) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex L64 L64 L64 (cp 20) (cp 20) testMem testDecls
     testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) 458756 458756 5 5
     rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
 
