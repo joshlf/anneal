@@ -1353,6 +1353,108 @@ theorem overlapping_placement_not_sequential :
     cases hTail with
     | cons hBase _ => exact absurd hBase (by decide)
 
+/-! ### `[adv ep1-B2]` Single-Variant `.adt` Structs: the Precise Fallback Condition
+
+Trusted decodes a single-variant struct by its typed field windows (`byArgs`) and, only when that
+fails, by a fallback decoder. `AdtDecodeFallbackSound` asks exactly that the fallback cannot rescue a
+rejected buffer. These tests show it holds for an in-order struct (which `AdtDecodeFallbackNone`
+excludes) and is genuinely necessary (Trusted's span fallback accepts an invalid `bool`).
+-/
+
+/-- The in-order `(u8, u32)` struct at `u8u32PairLayouts` (`.memory`, no `fieldLayouts`). -/
+theorem u8u32PairAdt_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound u8u32PairLayouts u8u32PairLayout 0 u8u32PairPlaced 8 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective rfl rfl rfl
+    ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+     FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, trivial⟩
+    (by decide)
+
+/-- `struct S { a: u8, b: u32 }` (in declaration order) through the general `.adt` constructor. -/
+def u8u32PairAdtCodec :
+    MirValueCodec u8u32PairLayouts { kind := .adt "S" [.uint .u8, .uint .u32], layoutIdx := 0 }
+      (FieldTuple
+        [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+         { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }])
+      8 :=
+  MirValueCodec.adtOfPlacedCodecSpine u8u32PairLayouts "S" 0 u8u32PairLayout 0 [0, 1]
+    u8u32PairPlaced 8 (.cons (TupleFieldCodec.uint _ .u8) (.cons (TupleFieldCodec.uint _ .u32) .nil))
+    rfl rfl rfl rfl rfl u8u32PairAdt_fallbackSound
+    (.cons (Nat.le_refl 0) (.cons (by decide) (.nil (by decide))))
+
+theorem u8u32PairAdt_not_isIntoBytes_but_isFromBytes :
+    ¬ IsIntoBytes u8u32PairLayouts { kind := .adt "S" [.uint .u8, .uint .u32], layoutIdx := 0 } ∧
+    IsFromBytes u8u32PairLayouts { kind := .adt "S" [.uint .u8, .uint .u32], layoutIdx := 0 } :=
+  ⟨(MirValueCodec.ofPlacedCodecSpine_pad_pos_not_intoBytes u8u32PairPlaced 8 rfl u8u32PairAdtCodec rfl
+      (by decide) (⟨0, by decide⟩, ⟨0, by decide⟩, ())).2.2,
+   (MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads u8u32PairPlaced 8 rfl u8u32PairAdtCodec rfl
+      ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+       FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, trivial⟩).2.1⟩
+
+/-- `AdtDecodeFallbackNone` is too strong for in-order structs: the span fallback decodes zero bytes. -/
+theorem u8u32PairAdt_not_fallbackNone :
+    ¬ MirValueCodec.AdtDecodeFallbackNone u8u32PairLayouts u8u32PairLayout 0
+      (u8u32PairPlaced.placed.map fun p => ({ bytes := p.1 } : Size)) 8 := by
+  intro h
+  have h0 := h (zeroInitBytes 8) rfl
+  rw [show MirValueCodec.adtDecodeFallback u8u32PairLayouts u8u32PairLayout 0
+      (u8u32PairPlaced.placed.map fun p => ({ bytes := p.1 } : Size)) (zeroInitBytes 8) =
+      some (.aggregate 0 [.scalar ⟨0, 4⟩, .scalar ⟨0, 4⟩]) from rfl] at h0
+  nomatch h0
+
+/-- An in-order `(bool, u8)` struct entry (`.memory`, no `fieldLayouts`). -/
+def boolU8Layout : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false }
+
+def boolU8Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [boolU8Layout] }
+
+def boolU8Placed : PlacedCodecSpine [Bool, UInt8] :=
+  .cons (0, ⟨1, 1⟩) FixedByteCodec.boolByte (.cons (1, ⟨1, 1⟩) FixedByteCodec.u8 .nil)
+
+/--
+Trusted's `.adt` decoder accepts the invalid `bool` byte `2` in an in-order struct without
+`fieldLayouts`: the typed field decode rejects it, but the padding-inclusive span fallback reads it as a
+raw scalar (kernel evaluation).
+-/
+example :
+    decodeValueFromBytes defaultCodecFuel boolU8Layouts
+        { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 }
+        [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] =
+      some (.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨7, 1⟩]) :=
+  rfl
+
+/-- Hence the fallback condition fails, so no `boolByte`-field codec exists for this entry. -/
+theorem boolU8Adt_not_fallbackSound :
+    ¬ MirValueCodec.AdtDecodeFallbackSound boolU8Layouts boolU8Layout 0 boolU8Placed 2 := by
+  intro h
+  have h0 := h [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] rfl rfl
+  rw [show MirValueCodec.adtDecodeFallback boolU8Layouts boolU8Layout 0
+      (boolU8Placed.placed.map fun p => ({ bytes := p.1 } : Size))
+      [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] =
+      some (.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨7, 1⟩]) from rfl] at h0
+  nomatch h0
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective
+
+/-- info: 'Anneal.ByteCodec.decodeFieldsBySpan_some_initAt' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeFieldsBySpan_some_initAt
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.decodeAt_isSome_of_initAt' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.decodeAt_isSome_of_initAt
+
+/-- info: 'Anneal.ByteCodecTests.u8u32PairAdt_not_isIntoBytes_but_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8u32PairAdt_not_isIntoBytes_but_isFromBytes
+
+/-- info: 'Anneal.ByteCodecTests.boolU8Adt_not_fallbackSound' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms boolU8Adt_not_fallbackSound
+
 /-! ### Axiom pins for the general constructor and the newly `Classical.choice`-free theorems -/
 
 /-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/

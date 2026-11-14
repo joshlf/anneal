@@ -7393,7 +7393,7 @@ theorem MirValueCodec.ofValidStructLayoutWorld_bitValidity
 /--
 **`MirValueCodec` of Every Valid Single-Variant Struct (`TyKind.adt`) Layout World**: a concrete
 `LayoutTable` entry `l` for `.adt defPath (k :: ks)` whose `FieldsShape.arbitrary` offsets and size
-realize a valid layout world `w` of the struct's field layouts and satisfy `AdtDecodeFallbackNone`
+realize a valid layout world `w` of the struct's field layouts and satisfy `AdtDecodeFallbackSound`
 yields the general $k$-field `MirValueCodec.adtOfPlacedCodecSpine` against the computable
 `pc.realizedCodec w.totalSize`.
 -/
@@ -7410,8 +7410,8 @@ def MirValueCodec.adtOfValidStructLayoutWorld
     (hVar : l.variants = .single varIdx)
     (hSize : l.size = { bytes := w.totalSize })
     (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
-    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone layouts l varIdx
-      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) w.totalSize) :
+    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc
+      w.totalSize) :
     MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
   Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine layouts defPath idx l varIdx memoryIndex
     pc w.totalSize fcs hLookup hInhab hVar hSize hFields hFallback
@@ -7448,8 +7448,8 @@ theorem MirValueCodec.adtOfValidStructLayoutWorld_bitValidity
     (hVar : l.variants = .single varIdx)
     (hSize : l.size = { bytes := w.totalSize })
     (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
-    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone layouts l varIdx
-      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) w.totalSize) :
+    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc
+      w.totalSize) :
     let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
     let m := MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx
       memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields hFallback

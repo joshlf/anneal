@@ -7225,6 +7225,259 @@ theorem realizedCodec_decode_eq_decodeAt {αs : List Type} (pc : PlacedCodecSpin
 
 end PlacedCodecSpine
 
+/-- Byte `j` of `bs` exists and is initialized. -/
+def InitAt (bs : List AbstractByte) (j : Nat) : Prop :=
+  ∃ (b : UInt8) (p : Option (Nat × Nat)), bs[j]? = some (.init b p)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem initAt_of_allBytesInitialized :
+    ∀ (l : List AbstractByte), allBytesInitialized l = true → ∀ k, k < l.length → InitAt l k
+  | [], _, k, hk => absurd hk (Nat.not_lt_zero k)
+  | .uninit :: _, h, _, _ => nomatch h
+  | .init b p :: rest, h, k, hk => by
+    cases k with
+    | zero => exact ⟨b, p, rfl⟩
+    | succ k =>
+      have hRest : allBytesInitialized rest = true := h
+      exact initAt_of_allBytesInitialized rest hRest k (Nat.lt_of_succ_lt_succ hk)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem allBytesInitialized_of_initAt :
+    ∀ (l : List AbstractByte), (∀ k, k < l.length → InitAt l k) → allBytesInitialized l = true
+  | [], _ => rfl
+  | x :: rest, h => by
+    obtain ⟨b, p, hx⟩ := h 0 (Nat.zero_lt_succ _)
+    have hx' : x = .init b p := Option.some.inj hx
+    subst hx'
+    exact allBytesInitialized_of_initAt rest (fun k hk => h (k + 1) (Nat.succ_lt_succ hk))
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeLittleEndianBytes_some_allBytesInitialized :
+    ∀ (l : List AbstractByte) (r : Nat × Option (Nat × Nat)),
+      decodeLittleEndianBytes l = some r → allBytesInitialized l = true
+  | [], _, _ => rfl
+  | .uninit :: _, _, h => nomatch h
+  | .init b prov :: rest, r, h => by
+    have hUnfold : decodeLittleEndianBytes (.init b prov :: rest) =
+        (match decodeLittleEndianBytes rest with
+          | .some (highBits, restProv) =>
+            .some (Nat.add b.toBitVec.toNat (Nat.mul 256 highBits), mergeByteProvenance prov restProv)
+          | .none => .none) := rfl
+    rw [hUnfold] at h
+    cases hR : decodeLittleEndianBytes rest with
+    | none =>
+      rw [hR] at h
+      nomatch h
+    | some r' =>
+      exact decodeLittleEndianBytes_some_allBytesInitialized rest r' hR
+
+/--
+One-step unfolding of Trusted's `decodeFieldsBySpan` with the next offset as `headD`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeFieldsBySpan_cons (bs : List AbstractByte) (T : Nat) (off : Size) (rest : List Size) :
+    decodeFieldsBySpan bs T (off :: rest) =
+      (match Nat.ble off.bytes ((rest.map Size.bytes).headD T) with
+      | false => none
+      | true =>
+        match sliceAbstractBytes bs off.bytes
+            (Nat.sub ((rest.map Size.bytes).headD T) off.bytes) with
+        | none => none
+        | some fSlice =>
+          match (match Nat.beq (Nat.sub ((rest.map Size.bytes).headD T) off.bytes) 0 with
+            | true => some Value.unit
+            | false =>
+              match decodeScalarBytes fSlice false with
+              | some (sv, _) => some (Value.scalar sv)
+              | none => none) with
+          | none => none
+          | some v =>
+            match decodeFieldsBySpan bs T rest with
+            | some vs => some (v :: vs)
+            | none => none) := by
+  cases rest <;> rfl
+
+/--
+A successful `decodeFieldsBySpan` run certifies that its offsets are bounded below by the first one
+and that every byte from the first offset up to `totalSize` is initialized.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeFieldsBySpan_some_initAt (bs : List AbstractByte) (T : Nat) :
+    ∀ (offs : List Size) (vs : List Value), decodeFieldsBySpan bs T offs = some vs →
+      (∀ off ∈ offs, (offs.map Size.bytes).headD T ≤ off.bytes) ∧
+      (∀ j, (offs.map Size.bytes).headD T ≤ j → j < T → InitAt bs j)
+  | [], _, _ => ⟨(fun _ h => nomatch h),
+      (fun j h₁ h₂ => absurd (Nat.lt_of_le_of_lt h₁ h₂) (Nat.lt_irrefl _))⟩
+  | off :: rest, vs, h => by
+    rw [decodeFieldsBySpan_cons] at h
+    generalize hN : (rest.map Size.bytes).headD T = nextOff at h
+    cases hBle : Nat.ble off.bytes nextOff with
+    | false =>
+      rw [hBle] at h
+      nomatch h
+    | true =>
+      rw [hBle] at h
+      dsimp only at h
+      have hOffLe : off.bytes ≤ nextOff := Nat.le_of_ble_eq_true hBle
+      cases hSl : sliceAbstractBytes bs off.bytes (Nat.sub nextOff off.bytes) with
+      | none =>
+        rw [hSl] at h
+        nomatch h
+      | some fSlice =>
+        rw [hSl] at h
+        dsimp only at h
+        have hSlice := hSl
+        unfold sliceAbstractBytes at hSlice
+        cases hBle2 : Nat.ble (Nat.add off.bytes (Nat.sub nextOff off.bytes))
+            (Trusted.Sequence.length bs) with
+        | false =>
+          rw [hBle2] at hSlice
+          nomatch hSlice
+        | true =>
+          rw [hBle2] at hSlice
+          injection hSlice with hFs0
+          rw [takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop] at hFs0
+          have hFs : (bs.drop off.bytes).take (nextOff - off.bytes) = fSlice := hFs0
+          have hInBs : off.bytes + (nextOff - off.bytes) ≤ bs.length := Nat.le_of_ble_eq_true hBle2
+          have hFsLen : fSlice.length = nextOff - off.bytes := by
+            rw [← hFs, List.length_take, List.length_drop]
+            exact Nat.min_eq_left (Nat.le_sub_of_add_le (by rw [Nat.add_comm]; exact hInBs))
+          have hFsAt : ∀ k, k < nextOff - off.bytes → fSlice[k]? = bs[off.bytes + k]? := by
+            intro k hk
+            rw [← hFs, List.getElem?_take, List.getElem?_drop]
+            exact ite_eq_left_iff.mpr (fun hNot => absurd hk hNot)
+          have hFieldInit : nextOff - off.bytes ≠ 0 → allBytesInitialized fSlice = true := by
+            intro hNz
+            have hBeq0 : Nat.beq (Nat.sub nextOff off.bytes) 0 = false :=
+              nat_beq_eq_false_of_ne hNz
+            rw [hBeq0] at h
+            dsimp only at h
+            cases hDec : decodeScalarBytes fSlice false with
+            | none =>
+              rw [hDec] at h
+              nomatch h
+            | some svp =>
+              unfold decodeScalarBytes at hDec
+              dsimp only at hDec
+              cases hZ : Nat.beq (Trusted.Sequence.length fSlice) 0 with
+              | true =>
+                rw [hZ] at hDec
+                nomatch hDec
+              | false =>
+                rw [hZ] at hDec
+                dsimp only at hDec
+                cases hLE : decodeLittleEndianBytes fSlice with
+                | none =>
+                  rw [hLE] at hDec
+                  nomatch hDec
+                | some r =>
+                  exact decodeLittleEndianBytes_some_allBytesInitialized fSlice r hLE
+          have hRestSome : ∃ vs', decodeFieldsBySpan bs T rest = some vs' := by
+            cases hR : decodeFieldsBySpan bs T rest with
+            | some vs' => exact ⟨vs', rfl⟩
+            | none =>
+              exfalso
+              cases hB0 : Nat.beq (Nat.sub nextOff off.bytes) 0 with
+              | true =>
+                rw [hB0] at h
+                dsimp only at h
+                rw [hR] at h
+                nomatch h
+              | false =>
+                rw [hB0] at h
+                dsimp only at h
+                cases hDec : decodeScalarBytes fSlice false with
+                | none =>
+                  rw [hDec] at h
+                  nomatch h
+                | some svp =>
+                  rw [hDec] at h
+                  dsimp only at h
+                  rw [hR] at h
+                  nomatch h
+          obtain ⟨vs', hRest⟩ := hRestSome
+          obtain ⟨ihLe, ihInit⟩ := decodeFieldsBySpan_some_initAt bs T rest vs' hRest
+          rw [hN] at ihLe ihInit
+          refine ⟨fun off' hOff' => ?_, fun j hj₁ hj₂ => ?_⟩
+          · show off.bytes ≤ off'.bytes
+            rcases List.mem_cons.mp hOff' with hEq | hMem
+            · rw [hEq]
+              exact Nat.le_refl _
+            · exact Nat.le_trans hOffLe (ihLe off' hMem)
+          · have hj₁' : off.bytes ≤ j := hj₁
+            by_cases hjN : j < nextOff
+            · have hk : j - off.bytes < nextOff - off.bytes := Nat.sub_lt_sub_right hj₁' hjN
+              have hNz : nextOff - off.bytes ≠ 0 :=
+                Nat.pos_iff_ne_zero.mp (Nat.sub_pos_of_lt (Nat.lt_of_le_of_lt hj₁' hjN))
+              obtain ⟨b, p, hb⟩ := initAt_of_allBytesInitialized fSlice (hFieldInit hNz)
+                (j - off.bytes) (by rw [hFsLen]; exact hk)
+              rw [hFsAt (j - off.bytes) hk, Nat.add_sub_cancel' hj₁'] at hb
+              exact ⟨b, p, hb⟩
+            · exact ihInit j (Nat.le_of_not_lt hjN) hj₂
+
+namespace PlacedCodecSpine
+
+/--
+If every field codec is a surjective initialized-byte decoder and every byte of every in-bounds field
+window is initialized, the declaration-order window decode succeeds.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decodeAt_isSome_of_initAt :
+    ∀ {αs : List Type} (pc : PlacedCodecSpine αs) (bs : List AbstractByte),
+      pc.AllFieldsSurjective →
+      (∀ p ∈ pc.placed, p.1 + p.2.size ≤ bs.length) →
+      (∀ p ∈ pc.placed, ∀ j, p.1 ≤ j → j < p.1 + p.2.size → InitAt bs j) →
+      ∃ x, pc.decodeAt bs = some x
+  | _, .nil, _, _, _, _ => ⟨(), rfl⟩
+  | _, .cons p c tail, bs, hSurj, hIn, hInit => by
+    obtain ⟨hC, hTail⟩ := hSurj
+    have hP := hIn p (List.mem_cons_self ..)
+    have hSliceLen : ((bs.drop p.1).take p.2.size).length = p.2.size := by
+      rw [List.length_take, List.length_drop]
+      omega
+    have hSliceInit : allBytesInitialized ((bs.drop p.1).take p.2.size) = true := by
+      apply allBytesInitialized_of_initAt
+      intro k hk
+      rw [hSliceLen] at hk
+      obtain ⟨b, q, hb⟩ := hInit p (List.mem_cons_self ..) (p.1 + k) (Nat.le_add_right _ _)
+        (Nat.add_lt_add_left hk _)
+      refine ⟨b, q, ?_⟩
+      rw [List.getElem?_take, List.getElem?_drop]
+      rw [ite_eq_left_iff.mpr (fun hNot => absurd hk hNot)]
+      exact hb
+    obtain ⟨a, ha⟩ := hC _ hSliceLen hSliceInit
+    obtain ⟨r, hr⟩ := decodeAt_isSome_of_initAt tail bs hTail
+      (fun q hq => hIn q (List.mem_cons_of_mem _ hq))
+      (fun q hq => hInit q (List.mem_cons_of_mem _ hq))
+    refine ⟨(a, r), ?_⟩
+    show (match c.decode ((bs.drop p.1).take p.2.size), tail.decodeAt bs with
+      | some a', some r' => some (a', r')
+      | _, _ => none) = some (a, r)
+    rw [ha, hr]
+
+end PlacedCodecSpine
+
 /-! ### Trusted Tuple-Field Bridges (`TupleFieldCodec`, `TupleFieldCodecs`) -/
 
 /--
@@ -8185,9 +8438,10 @@ theorem AdtDecodeFallbackNone.of_sentinel_fieldLayouts
 /--
 Sufficient condition 2 for `AdtDecodeFallbackNone`: `l.fieldLayouts = []`, `l.backendRepr = .memory`,
 and the first two declared fields are reordered in memory (`off₁.bytes < off₀.bytes`, so
-`Nat.ble off₀.bytes off₁.bytes = false`). This holds directly for any reordered `#[repr(Rust)]`
-struct such as `demoS3Placed` (`struct S { a: u8 @ 4, b: [u8; 4] @ 0, c: () @ 5 }`) or
-`u8u32UnitPermutedLayout` without needing any `fieldLayouts` entries!
+`Nat.ble off₀.bytes off₁.bytes = false` and Trusted's span decoder rejects the offsets). This covers
+reordered entries without `fieldLayouts`, such as `demoS3Placed`
+(`struct S { a: u8 @ 4, b: [u8; 4] @ 0, c: () @ 5 }`) at `u8u32UnitPermutedLayout`; it never holds for
+in-order structs (see `AdtDecodeFallbackSound.of_memory_surjective` for those).
 -/
 theorem AdtDecodeFallbackNone.of_reordered_head
     {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
@@ -8206,6 +8460,101 @@ theorem AdtDecodeFallbackNone.of_reordered_head
       have hLe : off₀.bytes ≤ off₁.bytes := Nat.le_of_ble_eq_true h
       omega
   cases offRest <;> dsimp only [decodeFieldsBySpan] <;> rw [hBle] <;> rfl
+
+/--
+Precise fallback condition for single-variant `.adt` decoding: on every `totalSize`-byte buffer whose
+declaration-order field windows do **not** all decode (so Trusted's primary `byArgs` decoder fails),
+Trusted's fallback decoder `adtDecodeFallback` fails too. Implied by `AdtDecodeFallbackNone`
+(`AdtDecodeFallbackNone.toSound`) and, for `.memory` layouts without `fieldLayouts`, by surjective
+field codecs (`AdtDecodeFallbackSound.of_memory_surjective`), which covers in-order structs.
+-/
+def AdtDecodeFallbackSound (layouts : LayoutTable) (l : TypeLayout) (varIdx : VariantIdx)
+    {αs : List Type} (pc : PlacedCodecSpine αs) (totalSize : Nat) : Prop :=
+  ∀ bs : List AbstractByte, bs.length = totalSize → pc.decodeAt bs = none →
+    adtDecodeFallback layouts l varIdx (pc.placed.map fun p => ({ bytes := p.1 } : Size)) bs = none
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem AdtDecodeFallbackNone.toSound {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {αs : List Type} {pc : PlacedCodecSpine αs} {totalSize : Nat}
+    (h : AdtDecodeFallbackNone layouts l varIdx (pc.placed.map fun p => ({ bytes := p.1 } : Size))
+      totalSize) :
+    AdtDecodeFallbackSound layouts l varIdx pc totalSize :=
+  fun bs hLen _ => h bs hLen
+
+/--
+For a `.memory` layout without `fieldLayouts`, Trusted's single-variant fallback decoder is the
+padding-inclusive span decoder `decodeFieldsBySpan`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem adtDecodeFallback_eq_span {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {bs : List AbstractByte} (hFl : l.fieldLayouts = []) (hRepr : l.backendRepr = .memory) :
+    ∀ (offsets : List Size), offsets ≠ [] →
+      adtDecodeFallback layouts l varIdx offsets bs =
+        (decodeFieldsBySpan bs l.size.bytes offsets).map (fun vals => .aggregate varIdx vals)
+  | [], h => absurd rfl h
+  | [o], _ => by
+    unfold adtDecodeFallback
+    rw [hFl, hRepr]
+    cases decodeFieldsBySpan bs l.size.bytes [o] <;> rfl
+  | [o₁, o₂], _ => by
+    unfold adtDecodeFallback
+    rw [hFl, hRepr]
+    cases decodeFieldsBySpan bs l.size.bytes [o₁, o₂] <;> rfl
+  | o₁ :: o₂ :: o₃ :: rest, _ => by
+    unfold adtDecodeFallback
+    rw [hFl, hRepr]
+    cases decodeFieldsBySpan bs l.size.bytes (o₁ :: o₂ :: o₃ :: rest) <;> rfl
+
+/--
+**Fallback Soundness for `.memory` Structs With Surjective Field Codecs** (in-order *or* reordered):
+when `l.fieldLayouts = []` and `l.backendRepr = .memory`, Trusted's fallback is the span decoder,
+which succeeds only if every byte from the first offset to `totalSize` is initialized; then every
+field window is initialized, so surjective field codecs make the primary window decode succeed.
+Hence the fallback can only run where it fails.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: AdtDecodeFallbackSound
+-/
+theorem AdtDecodeFallbackSound.of_memory_surjective
+    {layouts : LayoutTable} {l : TypeLayout} {varIdx : VariantIdx}
+    {α : Type} {αs : List Type} {p₀ : Nat × FieldLayout} {c₀ : FixedByteCodec α p₀.2.size}
+    {tail : PlacedCodecSpine αs} {totalSize : Nat}
+    (hFl : l.fieldLayouts = []) (hRepr : l.backendRepr = .memory)
+    (hSize : l.size = { bytes := totalSize })
+    (hSurj : (PlacedCodecSpine.cons p₀ c₀ tail).AllFieldsSurjective)
+    (hIn : ∀ p ∈ (PlacedCodecSpine.cons p₀ c₀ tail).placed, p.1 + p.2.size ≤ totalSize) :
+    AdtDecodeFallbackSound layouts l varIdx (PlacedCodecSpine.cons p₀ c₀ tail) totalSize := by
+  intro bs hLen hNone
+  show adtDecodeFallback layouts l varIdx
+    (({ bytes := p₀.1 } : Size) :: tail.placed.map fun p => ({ bytes := p.1 } : Size)) bs = none
+  rw [adtDecodeFallback_eq_span hFl hRepr _ (List.cons_ne_nil _ _), hSize]
+  dsimp only
+  cases hSpan : decodeFieldsBySpan bs totalSize
+      (({ bytes := p₀.1 } : Size) :: tail.placed.map fun p => ({ bytes := p.1 } : Size)) with
+  | none => rfl
+  | some vs =>
+    exfalso
+    obtain ⟨hHeadLe, hInitAll⟩ := decodeFieldsBySpan_some_initAt bs totalSize _ vs hSpan
+    obtain ⟨x, hx⟩ := (PlacedCodecSpine.cons p₀ c₀ tail).decodeAt_isSome_of_initAt bs hSurj
+      (fun p hp => by rw [hLen]; exact hIn p hp)
+      (fun p hp j hj₁ hj₂ => by
+        have hMem : ({ bytes := p.1 } : Size) ∈
+            (({ bytes := p₀.1 } : Size) :: tail.placed.map fun p => ({ bytes := p.1 } : Size)) :=
+          List.mem_map_of_mem (f := fun p : Nat × FieldLayout => ({ bytes := p.1 } : Size)) hp
+        exact hInitAll j (Nat.le_trans (hHeadLe _ hMem) hj₁)
+          (Nat.lt_of_lt_of_le hj₂ (hIn p hp)))
+    rw [hNone] at hx
+    nomatch hx
+
 
 /--
 Trusted encodes the single-variant laid-out struct `.adt defPath (k :: ks)` value
@@ -8341,7 +8690,8 @@ theorem adtOfPlacedCodecSpine_encode_witness
 
 /--
 Trusted decodes the single-variant laid-out struct `.adt defPath (k :: ks)` exactly as the realized
-codec whenever `AdtDecodeFallbackNone` holds.
+codec whenever Trusted's fallback decoder cannot rescue a buffer that the field windows reject
+(`AdtDecodeFallbackSound`).
 
 Kind: refinement
 Witness: universal
@@ -8358,8 +8708,7 @@ theorem adtOfPlacedCodecSpine_decode_eq_map
     (hVar : l.variants = .single varIdx)
     (hSize : l.size = { bytes := totalSize })
     (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
-    (hFallback : AdtDecodeFallbackNone layouts l varIdx
-      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) totalSize)
+    (hFallback : AdtDecodeFallbackSound layouts l varIdx pc totalSize)
     (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
       (pc.memSort.placed.map Prod.fst) totalSize)
     (bs : List AbstractByte) :
@@ -8410,21 +8759,28 @@ theorem adtOfPlacedCodecSpine_decode_eq_map
           exact (PlacedCodecSpine.cons p₀ c₀ tail).placed_in_bounds_of_memSort_sequential totalSize hSeq)
       rw [hDecodeAt,
         (PlacedCodecSpine.cons p₀ c₀ tail).realizedCodec_decode_eq_decodeAt totalSize hSeq bs hLen]
-      have hFb :
-          adtDecodeFallback layouts l varIdx
-            (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size))) bs =
-            none :=
-        hFallback bs hLen
-      unfold adtDecodeFallback at hFb
-      rw [hSize] at hFb
-      cases (PlacedCodecSpine.cons p₀ c₀ tail).decodeAt bs with
+      cases hDA : (PlacedCodecSpine.cons p₀ c₀ tail).decodeAt bs with
       | some x => rfl
-      | none => exact hFb
+      | none =>
+        have hFb :
+            adtDecodeFallback layouts l varIdx
+              (({ bytes := p₀.1 } : Size) :: (tail.placed.map fun p => ({ bytes := p.1 } : Size))) bs =
+              none :=
+          hFallback bs hLen hDA
+        unfold adtDecodeFallback at hFb
+        rw [hSize] at hFb
+        exact hFb
 
 /--
-**General $k$-Field Laid-Out Struct (`TyKind.adt`) `MirValueCodec`**: bridges any single-variant
+**General $k$-Field Laid-Out Struct (`TyKind.adt`) `MirValueCodec`**: bridges a single-variant
 struct `{ kind := .adt defPath (k :: ks), layoutIdx := idx }` with `FieldsShape.arbitrary` field
-offsets and `AdtDecodeFallbackNone` directly to `pc.realizedCodec totalSize`.
+offsets to `pc.realizedCodec totalSize`, provided Trusted's fallback decoder cannot accept a buffer
+whose field windows are rejected (`AdtDecodeFallbackSound`). This side condition is necessary, not
+technical: for an in-order `.memory` struct without `fieldLayouts`, Trusted's padding-inclusive span
+fallback decodes a `bool` byte `2` as a raw scalar, so no codec with a `bool` field exists there. It
+holds for every `.memory` struct without `fieldLayouts` whose field codecs are surjective
+(`AdtDecodeFallbackSound.of_memory_surjective`, in-order or reordered) and whenever the fallback always
+fails (`AdtDecodeFallbackNone.toSound`, e.g. `AdtDecodeFallbackNone.of_reordered_head`).
 -/
 def adtOfPlacedCodecSpine
     (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
@@ -8436,8 +8792,7 @@ def adtOfPlacedCodecSpine
     (hVar : l.variants = .single varIdx)
     (hSize : l.size = { bytes := totalSize })
     (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
-    (hFallback : AdtDecodeFallbackNone layouts l varIdx
-      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) totalSize)
+    (hFallback : AdtDecodeFallbackSound layouts l varIdx pc totalSize)
     (hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
       (pc.memSort.placed.map Prod.fst) totalSize) :
     MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) totalSize :=

@@ -283,7 +283,7 @@ theorem demoS3World_real_adt_bitValidity :
   have h := MirValueCodec.adtOfValidStructLayoutWorld_bitValidity demoS3World_valid
     u8u32UnitPermutedLayouts "demo::S3" 0 u8u32UnitPermutedLayout 0 [1, 0, 2]
     demoS3Placed (TupleFieldCodec.demoS3PlacedFieldCodecs _)
-    rfl rfl rfl rfl rfl rfl hFbNone
+    rfl rfl rfl rfl rfl rfl (MirValueCodec.AdtDecodeFallbackNone.toSound hFbNone)
   have hSurj : demoS3Placed.AllFieldsSurjective :=
     ⟨FixedByteCodec.u8_isSurjectiveInitDecoder,
      FixedByteCodec.array_isSurjectiveInitDecoder 4 FixedByteCodec.u8_isSurjectiveInitDecoder,
