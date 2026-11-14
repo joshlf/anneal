@@ -630,6 +630,18 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             executed=False,
         )
         assert "[syntactic_contradiction_hypothesis]" in str(err_unann), str(err_unann)
+        err_in_meta = checked(
+            fixture(
+                header
+                + "/- Kind: safety\nWitness: universal\nAssumes: S0 -/\n"
+                + "set_option maxHeartbeats 200000 in\n"
+                + "theorem vacuousIn (n : Nat) : n = n := rfl\n"
+            ),
+            expected=1,
+            phase="vacuity-audit",
+            executed=False,
+        )
+        assert "[trivial_conclusion]" in str(err_in_meta), str(err_in_meta)
 
         # 18c. trusted/rustc-capture Rust sources: an unpinned `///` waiver and an escaped
         # `#[doc = "anneal\x3a..."]` directive are rejected; the pinned item passes the audit.

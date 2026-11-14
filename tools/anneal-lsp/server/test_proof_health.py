@@ -3948,6 +3948,142 @@ class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
         self.assertEqual(inc, cold)
         self.assertEqual(inc_a, cold_a)
 
+    def test_3axis_metadata_on_scoped_local_and_in_prefixed_theorems(self) -> None:
+        for mod_or_prefix in (
+            "scoped ",
+            "local ",
+            "set_option maxHeartbeats 200000 in\n",
+            "open Nat in\n@[simp] ",
+            "variable (m : Nat) in\n",
+        ):
+            src = (
+                "/- Kind: safety\nWitness: universal\nAssumes: S0\nSubject: n -/\n"
+                f"{mod_or_prefix}theorem bypassed (n : Nat) : n = n := rfl\n"
+            )
+            for scope in ("annotated", "annotated-only", "all"):
+                res = proof_health.audit_lean_text(src, vacuity_scope=scope)
+                self.assertEqual(
+                    [(f.rule, f.tier) for f in res],
+                    [(audit.RULE_TRIVIAL_CONCLUSION, "S0")],
+                    (mod_or_prefix, scope),
+                )
+
+    def test_waiver_docstring_before_in_prefix_and_single_line_in_prefix(self) -> None:
+        for tpl, old, new in (
+            (
+                "/-- anneal:allow_compile_time_guard\nPIN\n-/\n"
+                "set_option maxHeartbeats 400000 in\n"
+                "theorem guarded_thm : True := trivial\n",
+                "400000 in",
+                "100000 in",
+            ),
+            (
+                "/-- anneal:allow_compile_time_guard\nPIN\n-/\n"
+                "set_option maxHeartbeats 400000 in theorem guarded_thm : True := trivial\n",
+                "400000 in",
+                "100000 in",
+            ),
+            (
+                "open Foo in\n"
+                "/-- anneal:allow_compile_time_guard\nPIN\n-/\n"
+                "set_option maxHeartbeats 400000 in\n"
+                "theorem guarded_thm : True := trivial\n",
+                "open Foo in",
+                "open Bar in",
+            ),
+        ):
+            pin = proof_health.compute_lean_decl_pins(tpl.replace("PIN\n", ""))["guarded_thm"]
+            pinned = tpl.replace("PIN", pin)
+            self.assertEqual(proof_health.audit_lean_text(pinned, check_3axis=False), [], tpl)
+            self.assertEqual(
+                _rules(proof_health.audit_lean_text(pinned.replace(old, new, 1), check_3axis=False)),
+                [audit.RULE_DRIFTED_WAIVER_PIN],
+                tpl,
+            )
+
+    def test_comments_separated_by_long_whitespace_or_in_prefix_never_overwrite_metadata_or_waivers(self) -> None:
+        # 1. >64 spaces between `Kind: safety` and `Kind: helper` must flag conflicting `Kind:`.
+        src_conflict = (
+            "/- Kind: safety\nWitness: universal\nAssumes: S0\nSubject: n -/\n"
+            + (" " * 80)
+            + "\n/- Kind: helper -/\n"
+            + "theorem bypass_conflict (n : Nat) : n = n := rfl\n"
+        )
+        rules_c = _rules(proof_health.audit_lean_text(src_conflict, vacuity_scope="annotated"))
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, rules_c)
+
+        # 2. `set_option ... in` between two 3-axis comments on the same theorem must also preserve both.
+        src_in_conflict = (
+            "/- Kind: safety\nWitness: universal\nAssumes: S0\nSubject: n -/\n"
+            "set_option maxHeartbeats 200000 in\n"
+            "/- Kind: helper -/\n"
+            "theorem bypass_in_conflict (n : Nat) : n = n := rfl\n"
+        )
+        rules_in = _rules(proof_health.audit_lean_text(src_in_conflict, vacuity_scope="annotated"))
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, rules_in)
+
+        # 3. >64 spaces between a `/-- anneal:... -/` docstring and a trailing `-- note` comment
+        # must not overwrite `anns_by_decl` in `compute_lean_decl_pins`.
+        waiver_draft = (
+            "/-- anneal:documented_intent kept\nPIN\n-/\n"
+            + (" " * 80)
+            + "\n-- trailing note\n"
+            + "def long_ws_waiver : Nat := 1\n"
+        )
+        pin_w = proof_health.compute_lean_decl_pins(waiver_draft.replace("PIN\n", ""))["long_ws_waiver"]
+        waiver_pinned = waiver_draft.replace("PIN", pin_w)
+        self.assertEqual(proof_health.audit_lean_text(waiver_pinned, check_3axis=False), [])
+        self.assertEqual(
+            _rules(proof_health.audit_lean_text(waiver_pinned.replace(":= 1", ":= 2"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_lean_in_prefix_start_does_not_swallow_preceding_decl_ending_with_let_in(self) -> None:
+        draft = (
+            "def prev (x : Nat) : Nat :=\n"
+            "  let y := x + 1 in\n\n"
+            "/-- anneal:documented_intent kept\nPIN\n-/\n"
+            "def nextDecl : Nat := 7\n"
+        )
+        pin = proof_health.compute_lean_decl_pins(draft.replace("PIN\n", ""))["nextDecl"]
+        pinned = draft.replace("PIN", pin)
+        self.assertEqual(proof_health.audit_lean_text(pinned, check_3axis=False), [])
+        # Editing `prev` must NOT drift `nextDecl`'s pin:
+        self.assertEqual(
+            proof_health.audit_lean_text(pinned.replace("x + 1", "x + 99"), check_3axis=False), []
+        )
+
+    def test_rust_outer_doc_groups_with_spaced_or_semicolon_attributes_and_non_attribute_code(self) -> None:
+        # 1. Spaced `# [repr(C)]` and attributes containing `;` / `{}` in string literals between
+        # outer doc lines belong to the same doc group and item span.
+        rust_draft = (
+            "/// anneal:pinned_compiler_coupled C ABI\n"
+            "# [repr(C)]\n"
+            '#[deprecated(note = "old; use {new}[0]")]\n'
+            "/// PIN\n"
+            "pub struct Packet { pub a: u16 }\n"
+        )
+        r_pin = proof_health.compute_rust_item_pins(rust_draft.replace("/// PIN\n", ""))["Packet"]
+        rust_pinned = rust_draft.replace("PIN", r_pin)
+        self.assertEqual(proof_health.audit_rust_text(rust_pinned), [])
+        self.assertEqual(
+            _rules(proof_health.audit_rust_text(rust_pinned.replace("# [repr(C)]", "# [repr(transparent)]"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+        # 2. Non-attribute code (`my_macro!(unpinned_item)`) bracketed by `#[...]` and `#[...]`
+        # must NOT merge two separate items' doc comments into one group.
+        macro_between = (
+            '/// anneal:trusted reason = "waiver on macro"\n'
+            "#[cfg(all())] my_macro!(unpinned_item) #[repr(C)]\n"
+            "/// pin:sha256:0123456789ab\n"
+            "pub struct SecondItem(pub u32);\n"
+        )
+        self.assertIn(
+            audit.RULE_UNPINNED_WAIVER,
+            _rules(proof_health.audit_rust_text(macro_between)),
+        )
+
     def test_randomized_incremental_edits_match_cold_full_scans(self) -> None:
         import random
 

@@ -4788,13 +4788,9 @@ def _rust_outer_doc_groups(
             continue
         if groups:
             prev_start, prev_end, prev_lines = groups[-1]
-            between = stripped[prev_end:seg_start].strip()
-            if not between or (
-                between.startswith("#[")
-                and between.endswith("]")
-                and ";" not in between
-                and "{" not in between
-            ):
+            if not stripped[
+                prev_end : _find_preceding_rust_attributes_start(stripped, seg_start)
+            ].strip():
                 groups[-1] = (prev_start, seg_end, prev_lines + [(seg_line, doc_body)])
                 continue
         groups.append((seg_start, seg_end, [(seg_line, doc_body)]))
@@ -5230,7 +5226,7 @@ def _extract_lean_decl_span(
         ):
             return None
 
-    hit = _match_lean_decl_at(code_only, i)
+    hit = _match_lean_decl_at(code_only, i, skip_in_prefixes=True)
     if hit is None:
         return None
     hdr_end, decl_kind, decl_name = hit
@@ -5244,13 +5240,17 @@ _LEAN_DECL_KW_RE = re.compile(
 )
 
 
-def _match_lean_decl_at(code_only: str, i: int) -> tuple[int, str, str] | None:
+def _match_lean_decl_at(
+    code_only: str, i: int, *, skip_in_prefixes: bool = False
+) -> tuple[int, str, str] | None:
     """If a declaration starts at `i` (after optional `@[...]` attributes, whose arguments may
-    nest brackets as in `@[aesop safe [constructors]]`, and declaration modifiers), return
-    `(header_end, decl_kind, decl_name)`. The A0-A1 regex skipped attributes up to the first `]`
-    only, so a nested `]` made such waivers dangling (their pins never checked) while
-    `compute_lean_decl_pins` hashed the bare keyword without the directives."""
-    kw = _skip_lean_attrs_and_modifiers(code_only, i)
+    nest brackets as in `@[aesop safe [constructors]]`, declaration modifiers, and optionally
+    `<command> in` prefixes), return `(header_end, decl_kind, decl_name)`."""
+    kw = (
+        _skip_lean_prefixes_attrs_and_modifiers(code_only, i)
+        if skip_in_prefixes
+        else _skip_lean_attrs_and_modifiers(code_only, i)
+    )
     m = _LEAN_DECL_KW_RE.match(code_only, kw)
     if m is None:
         return None
@@ -5340,6 +5340,48 @@ def _skip_lean_attrs_and_modifiers(code_only: str, pos: int) -> int:
                     break
         if not matched_mod:
             break
+    return p
+
+
+_LEAN_IN_PREFIX_CMD_RE = re.compile(
+    r"(?:set_option|open|variable|universe|attribute|include|omit|export|"
+    r"notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules)\b"
+)
+_LEAN_IN_TOKEN_RE = re.compile(r"[(){}\[\]\n]|(?<![\w'!?.\u00bb])in(?![\w'!?.\u00bb])")
+
+
+def _skip_lean_prefixes_attrs_and_modifiers(code_only: str, pos: int) -> int:
+    """Advance `pos` past any whitespace, `@[...]` attributes, declaration modifiers, and
+    `<command> in` prefixes (`set_option ... in`, `open ... in`, `variable ... in`,
+    `attribute ... in`, ...) to the declaration keyword (`theorem`, `lemma`, `def`, ...)."""
+    n = len(code_only)
+    p = pos
+    while p < n:
+        q = _skip_lean_attrs_and_modifiers(code_only, p)
+        m = _LEAN_IN_PREFIX_CMD_RE.match(code_only, q)
+        if m is None:
+            return q
+        depth = 0
+        in_end = -1
+        for tm in _LEAN_IN_TOKEN_RE.finditer(code_only, m.end()):
+            tok = tm.group()
+            if tok in "({[":
+                depth += 1
+            elif tok in ")}]":
+                if depth > 0:
+                    depth -= 1
+            elif tok == "in" and depth == 0:
+                in_end = tm.end()
+                break
+            elif tok == "\n" and depth == 0:
+                cand = tm.end()
+                while cand < n and code_only[cand] in " \t":
+                    cand += 1
+                if cand < n and _is_lean_command_start(code_only, cand):
+                    break
+        if in_end == -1:
+            return q
+        p = in_end
     return p
 
 
@@ -6511,12 +6553,12 @@ def _audit_lean_theorem(
 def _lean_comment_groups(
     code_only: str, comment_blocks: list[tuple[int, int, int, str, str]]
 ) -> list[tuple[int, int, list[tuple[int, str, str]]]]:
-    """Group consecutive Lean comments separated only by (short) whitespace."""
+    """Group consecutive non-module-doc Lean comments separated only by whitespace."""
     groups: list[tuple[int, int, list[tuple[int, str, str]]]] = []
     for c_start, c_end, c_line, c_body, c_kind in comment_blocks:
-        if groups:
+        if groups and c_kind != "m":
             p_start, p_end, p_list = groups[-1]
-            if c_start - p_end <= 64 and code_only[p_end:c_start].strip() == "":
+            if p_list[-1][2] != "m" and code_only[p_end:c_start].strip() == "":
                 p_list.append((c_line, c_body, c_kind))
                 groups[-1] = (p_start, c_end, p_list)
                 continue
@@ -6914,11 +6956,12 @@ def audit_lean_text(
             while d_start < n_code and code_only[d_start] in " \t\r\n":
                 d_start += 1
             if d_start < n_code:
-                decl_comment_map[d_start] = meta_text
-                if code_only[d_start] not in ("t", "l", "d", "a", "s", "i", "c", "o", "e"):
-                    kw_off = _skip_lean_attrs_and_modifiers(code_only, d_start)
-                    if kw_off < n_code:
-                        decl_comment_map[kw_off] = meta_text
+                prev_m = decl_comment_map.get(d_start)
+                decl_comment_map[d_start] = f"{prev_m}\n{meta_text}" if prev_m else meta_text
+                kw_off = _skip_lean_prefixes_attrs_and_modifiers(code_only, d_start)
+                if kw_off < n_code and kw_off != d_start:
+                    prev_kw = decl_comment_map.get(kw_off)
+                    decl_comment_map[kw_off] = f"{prev_kw}\n{meta_text}" if prev_kw else meta_text
             continue
 
         decl_info = _extract_lean_decl_span(code_only, grp_end, text)
@@ -6939,10 +6982,12 @@ def audit_lean_text(
                 )
             continue
         d_start, d_end, _, d_name = decl_info
-        decl_comment_map[d_start] = meta_text
-        kw_off = _skip_lean_attrs_and_modifiers(code_only, d_start)
-        if kw_off < n_code:
-            decl_comment_map[kw_off] = meta_text
+        prev_m = decl_comment_map.get(d_start)
+        decl_comment_map[d_start] = f"{prev_m}\n{meta_text}" if prev_m else meta_text
+        kw_off = _skip_lean_prefixes_attrs_and_modifiers(code_only, d_start)
+        if kw_off < n_code and kw_off != d_start:
+            prev_kw = decl_comment_map.get(kw_off)
+            decl_comment_map[kw_off] = f"{prev_kw}\n{meta_text}" if prev_kw else meta_text
         if comment_starts is None:
             comment_starts = [c[0] for c in comment_blocks]
         # `<command> in` prefixes above the docstring belong to the pinned command.
@@ -7067,7 +7112,7 @@ def _lean_in_prefix_start(code_only: str, pos: int) -> int:
     otherwise `set_option debug.skipKernelTC true in` (or `open Other in`, re-resolving every
     name of the statement) could be added before or edited above a pinned declaration's
     docstring without drifting its pin. A prefix may span several lines; its first line is the
-    nearest command start above the `in` line (bounded walk, over-including when unbounded).
+    nearest prefix-command start above the `in` line (bounded walk).
     """
     start = pos
     while True:
@@ -7080,14 +7125,19 @@ def _lean_in_prefix_start(code_only: str, pos: int) -> int:
         if _LEAN_IN_SUFFIX_RE.search(code_only, line_start, q) is None:
             return start
         cmd = line_start
+        found_prefix_cmd = False
         for _ in range(64):
             k = cmd
             while k < q and code_only[k] in " \t":
                 k += 1
-            if cmd == 0 or _is_lean_command_start(code_only, k):
+            kw = _skip_lean_attrs_and_modifiers(code_only, k)
+            if _LEAN_IN_PREFIX_CMD_RE.match(code_only, kw) is not None:
+                found_prefix_cmd = True
+                break
+            if _is_lean_command_start(code_only, k) or cmd == 0:
                 break
             cmd = code_only.rfind("\n", 0, cmd - 1) + 1
-        if cmd >= start:
+        if not found_prefix_cmd or cmd >= start:
             return start
         start = cmd
 
@@ -7100,13 +7150,23 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
     n = len(code_only)
     anns_by_decl: dict[int, list[WaiverAnnotation]] = {}
     grp_start_by_decl: dict[int, int] = {}
+    post_doc_start_by_decl: dict[int, int] = {}
     for grp_start, grp_end, c_list in _lean_comment_groups(code_only, comment_blocks):
         d = grp_end
         while d < n and code_only[d] in " \t\r\n":
             d += 1
+        kw_off = _skip_lean_prefixes_attrs_and_modifiers(code_only, d)
         anns, _ = _collect_block_directives(_lean_docstring_lines(c_list, "d"))
-        anns_by_decl[d] = anns
-        grp_start_by_decl[d] = grp_start
+        for key_off in (d,) if d == kw_off else (d, kw_off):
+            if key_off in anns_by_decl:
+                if anns:
+                    anns_by_decl[key_off].extend(anns)
+            else:
+                anns_by_decl[key_off] = list(anns)
+            if key_off not in grp_start_by_decl or grp_start < grp_start_by_decl[key_off]:
+                grp_start_by_decl[key_off] = grp_start
+            if key_off not in post_doc_start_by_decl or d < post_doc_start_by_decl[key_off]:
+                post_doc_start_by_decl[key_off] = d
     pins: dict[str, str] = {}
     pos = 0
     while pos < n:
@@ -7115,7 +7175,7 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
             d_start += 1
         if d_start >= n:
             break
-        hit = _match_lean_decl_at(code_only, d_start)
+        hit = _match_lean_decl_at(code_only, d_start, skip_in_prefixes=True)
         if hit is None:
             nl = code_only.find("\n", d_start)
             if nl == -1:
@@ -7123,14 +7183,21 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
             pos = nl + 1
             continue
         hdr_end, _, d_name = hit
-        d_end = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, d_start, text), text)
-        lead = grp_start_by_decl.get(d_start, d_start)
+        kw_off = _skip_lean_prefixes_attrs_and_modifiers(code_only, d_start)
+        doc_grp_start = grp_start_by_decl.get(kw_off, -1)
+        if 0 <= doc_grp_start and d_start < doc_grp_start:
+            pos = doc_grp_start
+            continue
+        post_doc_d = post_doc_start_by_decl.get(kw_off, d_start)
+        span_start = post_doc_d if post_doc_d < d_start else d_start
+        d_end = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, span_start, text), text)
+        lead = grp_start_by_decl.get(kw_off, span_start)
         p_start = _lean_in_prefix_start(code_only, lead)
         hash_input = waiver_hash_input(
-            anns_by_decl.get(d_start, []),
+            anns_by_decl.get(kw_off, []),
             _normalize_lean_decl(
                 _no_comments_slice(
-                    text, comment_blocks, comment_starts, p_start if p_start < lead else d_start, d_end
+                    text, comment_blocks, comment_starts, p_start if p_start < lead else span_start, d_end
                 )
             ),
         )
