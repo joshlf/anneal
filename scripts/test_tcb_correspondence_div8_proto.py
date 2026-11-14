@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+#
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+"""Regression and audit suite for the TCB correspondence + IEEE-754 prototype.
+
+Run with::
+
+    python3 -B -m unittest scripts/test_tcb_correspondence_div8_proto.py -v
+
+The suite checks, against `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`:
+
+1. the prototype never edits `trusted/`, `lakefile.toml`, `minirust/`, or
+   `lean-miri/`, and the branch diff only touches the three prototype files;
+2. the Lean file compiles (`anneal-lean-run ... lake env lean`) with zero
+   errors, zero warnings, and zero forbidden tokens;
+3. a live kernel replay on a temporary `/tmp` copy of the file confirms that
+   every headline theorem exists and depends only on `propext` / `Quot.sound`
+   (no `sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`, or
+   `Classical.choice`), and that the in-file `#guard_msgs` axiom block covers
+   every headline theorem;
+4. differential cross-checks of the pure IEEE-754 casts against (a) Python
+   `fractions.Fraction` / `struct` ground truth and (b) a line-by-line Python
+   port of `lean-miri/vendor/Miri/Interpreter/Float.lean`;
+5. all eight actionable `TRACKED_CORRESPONDENCE_DIVERGENCES` IDs of
+   `scripts/run_nightly_verification_suite.py` are addressed in both the Lean
+   file and `PROTOTYPE_REPORT.md`.
+"""
+
+from __future__ import annotations
+
+import ast
+from fractions import Fraction
+import math
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from typing import Callable
+import unittest
+
+sys.dont_write_bytecode = True
+
+REPO = Path(__file__).resolve().parent.parent
+LEAN_FILE = REPO / "theory" / "Anneal" / "TcbCorrespondenceDiv8AndFloatPrototype.lean"
+REPORT = REPO / "PROTOTYPE_REPORT.md"
+SUITE = REPO / "scripts" / "run_nightly_verification_suite.py"
+MIRI_FLOAT = REPO / "lean-miri" / "vendor" / "Miri" / "Interpreter" / "Float.lean"
+BASE_SHA = "3da6d48d24b4f289c1b4c161a1172f98f4806f27"
+NAMESPACE = "Anneal.TcbCorrespondenceDiv8AndFloatPrototype"
+
+ALLOWED_DIFF = {
+    "theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean",
+    "scripts/test_tcb_correspondence_div8_proto.py",
+    "PROTOTYPE_REPORT.md",
+}
+PROTECTED_PREFIXES = ("trusted/", "lakefile.toml", "minirust/", "lean-miri/")
+FORBIDDEN_TOKENS = (
+    "sorry",
+    "admit",
+    "axiom ",
+    "native_decide",
+    "import LeanMiriSpec",
+    "import Miri",
+)
+ALLOWED_AXIOMS = {"propext", "Quot.sound"}
+BANNED_AXIOMS = {"sorryAx", "Lean.ofReduceBool", "Lean.trustCompiler", "Classical.choice"}
+
+# Every headline theorem of the prototype (Part A and Part B).
+HEADLINE_THEOREMS = (
+    # String.toList-free MiniRust translator replica (Mach / MachTB ground truth)
+    "intrinsicOfDefPathSF_table",
+    "translateProgWithIntrinsicsSF_witnesses_isSome",
+    # 1. DIV-MR-CALL-TARGET-LOCAL
+    "div_mr_call_target_local_trusted_baseline",
+    "div_mr_call_target_local_trusted_137",
+    "div_mr_call_target_local_mach_tb_42",
+    "div_mr_call_target_local_repaired_agrees",
+    "div_mr_call_target_local_write_back_canary",
+    "div_mr_call_target_local_write_back_trusted",
+    # 2. DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL
+    "div_mr_caller_borrow_across_scalar_call_trusted_ub",
+    "div_mr_caller_borrow_across_scalar_call_mach_tb_42",
+    "div_mr_caller_borrow_across_scalar_call_repaired_agrees",
+    "div_mr_caller_borrow_frame_isolation",
+    "updateBorrowPermAtProjProto_other_frame",
+    "entryAccessTransitionProto_other_frame",
+    # 3. DIV-MR-TB-TWOPHASE-DIRECT-WRITE
+    "div_mr_tb_twophase_direct_write_repaired_agrees",
+    # 4. DIV-MR-TB-FNENTRY-LOCAL-DEALLOC
+    "div_mr_tb_fnentry_local_dealloc_trusted_ret",
+    "div_mr_tb_fnentry_local_dealloc_repaired_agrees",
+    "div_mr_tb_fnentry_local_dealloc_ub_at_return",
+    "div_mr_tb_fnentry_local_dealloc_callee_return_canary",
+    "preventsDeallocation_eq_miniRust",
+    "preventsDeallocation_table",
+    # 5. DIV-MR-TB-UNSAFECELL-PROTECTED-IM
+    "div_mr_tb_unsafecell_protected_im_repaired_agrees",
+    "div_mr_tb_unsafecell_coupling_legacy_breaks",
+    "div_mr_tb_unsafecell_storage_dead_canary",
+    # 6. DIV-LM-RAW-OVERWRITE-CHAR-COPY
+    "div_lm_raw_overwrite_char_copy_trusted_steps",
+    "div_lm_raw_overwrite_char_copy_repaired_ub",
+    "div_lm_raw_overwrite_char_copy_ub_at_load",
+    "div_lm_raw_overwrite_char_copy_valid_accepted",
+    "isValidCharCode_iff_isValidChar",
+    "validateLoadedValueProto_char_eq_miri",
+    "miriValidateCharScalar_boundaries",
+    # 7. DIV-LM-D6-OFFSET-DISABLED-TAG
+    "div_lm_d6_offset_disabled_trusted_ub",
+    "div_lm_d6_offset_trusted_evalPtrOffsetBinOp",
+    "div_lm_d6_offset_disabled_repaired_steps",
+    "div_lm_d6_offset_disabled_deref_canary",
+    "evalBinOpOffset_lockstep_miri",
+    "div_lm_d6_offset_disabled_tag_repaired_agrees",
+    "div_lm_d6_offset_lockstep_examples",
+    # 8. DIV-LM-ENUM-SET-DISCR-UNINIT
+    "div_lm_enum_set_discr_trusted_uninit_ub",
+    "div_lm_enum_set_discr_trusted_faults",
+    "div_lm_enum_set_discr_uninit_repaired_agrees",
+    "div_lm_enum_set_discr_observed",
+    "div_lm_enum_set_discr_payload_canary",
+    "div_lm_enum_set_discr_dead_and_init",
+    # Part B
+    "pack_unpack_f32",
+    "unpack_pack_f32",
+    "pack_unpack_f64",
+    "unpack_pack_f64",
+    "decodeBits_agrees_miriDecode",
+    "evalFloatToIntSaturating_sound",
+    "evalFloatToIntSaturating_nan",
+    "evalFloatToIntSaturating_canaries",
+    "roundQuotientTiesToEven_half_ulp",
+    "roundQuotientTiesToEven_tie_even",
+    "roundRatioBits_congr",
+    "roundRatioBits_normal",
+    "roundRatioBits_subnormal",
+    "evalIntToFloatRoundTiesToEven_exact",
+    "evalIntToFloat_i32_u32_to_f64_exact",
+    "b585733184_ties_to_even_separation",
+    "evalIntToFloatRoundTiesToEven_canaries",
+    "evalIntToFloatRoundTiesToEven_sound",
+    "f32ToF64_exact_and_roundtrip",
+    "convertFloatBits_nan_quiet",
+    "f64ToF32_signaling_nan_quietized",
+    "evalFloatToFloatRoundTiesToEven_canaries",
+    "evalFloatToFloatRoundTiesToEven_sound",
+    "castKind_end_to_end",
+    "castKind_trusted_unsupported",
+)
+
+
+# Kernel-checked bridges between the in-file `String.toList`-free MiniRust translator
+# replica and the upstream `ProvenanceWitness` machines. They are replayed only in the
+# temporary harness: the upstream definitions depend on `Classical.choice` through core
+# `String.toList`, so the bridges may (and today do) mention it, unlike every in-file
+# declaration.
+MINIRUST_BRIDGES = (
+    ("callerRefMutSilentWrongLocalProgSF", "callerRefMutSilentWrongLocalProg"),
+    ("callerRefMutSilentWrongLocalMInitSF", "callerRefMutSilentWrongLocalMInit"),
+    ("callerRefMutSilentWrongLocalTBInitSF", "callerRefMutSilentWrongLocalTBInit"),
+    ("callerBorrowAcrossScalarCallProgSF", "callerBorrowAcrossScalarCallProg"),
+    ("callerBorrowAcrossScalarCallMInitSF", "callerBorrowAcrossScalarCallMInit"),
+    ("callerBorrowAcrossScalarCallTBInitSF", "callerBorrowAcrossScalarCallTBInit"),
+)
+BRIDGE_NAMESPACE = "TcbDiv8ProtoBridge"
+BRIDGE_ALLOWED_AXIOMS = ALLOWED_AXIOMS | {"Classical.choice"}
+
+
+def declared_names(source: str) -> list[str]:
+    """Fully qualified names of every `theorem` / `def` / `abbrev` in the Lean file."""
+    names: list[str] = []
+    stack: list[str] = []
+    for line in source.splitlines():
+        m = re.match(r"^namespace\s+(\S+)", line)
+        if m:
+            stack.append(m.group(1))
+            continue
+        m = re.match(r"^end\s+(\S+)", line)
+        if m and stack and stack[-1] == m.group(1):
+            stack.pop()
+            continue
+        m = re.match(r"^(?:@\[[^\]]*\]\s*)?(?:protected\s+|private\s+)?(?:theorem|def|abbrev)\s+([^\s:(\[{]+)",
+                     line)
+        if m:
+            names.append(".".join(stack + [m.group(1)]))
+    return names
+
+
+def _env() -> dict[str, str]:
+    env = os.environ.copy()
+    elan = str(Path.home() / ".elan" / "bin")
+    env["PATH"] = elan + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _lean_cmd(path: Path) -> list[str]:
+    lean_run = shutil.which("anneal-lean-run", path=_env()["PATH"])
+    if lean_run is None:
+        lean_run = str(REPO / "scripts" / "anneal-lean-run")
+    return [lean_run, "--mode", "file", "--concurrency", "1", "--", "lake", "env", "lean", str(path)]
+
+
+def _run_lean(path: Path, timeout: int = 3600) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        _lean_cmd(path),
+        cwd=str(REPO),
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git(*args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=str(REPO), capture_output=True, text=True, check=True
+    )
+    return proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Python ground truth: exact rationals + struct
+# ---------------------------------------------------------------------------
+
+FORMATS = {
+    "binary32": {"eb": 8, "fb": 23, "bias": 127, "w": 32},
+    "binary64": {"eb": 11, "fb": 52, "bias": 1023, "w": 64},
+}
+
+
+def decode_ref(fmt: str, bits: int):
+    """Independent decoding to ('zero'|'fin'|'inf'|'nan', neg, value/payload)."""
+    p = FORMATS[fmt]
+    neg = (bits >> (p["w"] - 1)) & 1
+    e = (bits >> p["fb"]) & ((1 << p["eb"]) - 1)
+    f = bits & ((1 << p["fb"]) - 1)
+    if e == (1 << p["eb"]) - 1:
+        return ("inf", neg, None) if f == 0 else ("nan", neg, f)
+    if e == 0 and f == 0:
+        return ("zero", neg, Fraction(0))
+    if e == 0:
+        return ("fin", neg, Fraction(f, 1 << (p["fb"] + p["bias"] - 1)))
+    return ("fin", neg, Fraction((1 << p["fb"]) + f) * Fraction(2) ** (e - p["bias"] - p["fb"]))
+
+
+def encode_ref(fmt: str, neg: int, e: int, f: int) -> int:
+    p = FORMATS[fmt]
+    return (neg << (p["w"] - 1)) | (e << p["fb"]) | f
+
+
+def round_ref(fmt: str, neg: int, val: Fraction, ties_even: bool = True) -> int:
+    """Independent correctly rounded encoding of a nonnegative rational."""
+    p = FORMATS[fmt]
+    fb, bias, eb = p["fb"], p["bias"], p["eb"]
+    emin = 1 - bias
+    if val == 0:
+        return encode_ref(fmt, neg, 0, 0)
+    # floor(log2(val)) via exact comparisons
+    e = val.numerator.bit_length() - val.denominator.bit_length()
+    while Fraction(2) ** e > val:
+        e -= 1
+    while Fraction(2) ** (e + 1) <= val:
+        e += 1
+    e = max(e, emin)
+    quantum = Fraction(2) ** (e - fb)
+    q = val / quantum
+    fl = math.floor(q)
+    rem = q - fl
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and (not ties_even or fl % 2 == 1)):
+        fl += 1
+    sig = fl
+    if sig >= (1 << (fb + 1)):
+        sig //= 2
+        e += 1
+    if e > bias:
+        return encode_ref(fmt, neg, (1 << eb) - 1, 0)
+    if sig < (1 << fb):
+        return encode_ref(fmt, neg, 0, sig)
+    return encode_ref(fmt, neg, e + bias, sig - (1 << fb))
+
+
+def struct_narrow_f64_to_f32(bits: int) -> int:
+    x = struct.unpack("<d", struct.pack("<Q", bits))[0]
+    try:
+        return struct.unpack("<I", struct.pack("<f", x))[0]
+    except OverflowError:
+        return 0xFF800000 if x < 0 else 0x7F800000
+
+
+def struct_widen_f32_to_f64(bits: int) -> int:
+    x = struct.unpack("<f", struct.pack("<I", bits))[0]
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def int_target(spec: str, pw: int) -> tuple[bool, int]:
+    signed = spec.startswith("i")
+    width = pw if spec[1:] == "size" else int(spec[1:])
+    return signed, width
+
+
+def f2i_ref(fmt: str, bits: int, spec: str, pw: int) -> int:
+    signed, width = int_target(spec, pw)
+    lo = -(1 << (width - 1)) if signed else 0
+    hi = (1 << (width - 1)) - 1 if signed else (1 << width) - 1
+    kind, neg, val = decode_ref(fmt, bits)
+    if kind == "nan" or kind == "zero":
+        v = 0
+    elif kind == "inf":
+        v = lo if neg else hi
+    else:
+        t = math.trunc(val)
+        v = max(lo, min(hi, -t if neg else t))
+    return v % (1 << width)
+
+
+def i2f_ref(signed: bool, width: int, bits: int, fmt: str) -> int:
+    b = bits % (1 << width)
+    v = b - (1 << width) if signed and b >= (1 << (width - 1)) else b
+    return round_ref(fmt, 1 if v < 0 else 0, Fraction(abs(v)))
+
+
+def f2f_ref(src: str, dst: str, bits: int) -> int:
+    kind, neg, val = decode_ref(src, bits)
+    pd = FORMATS[dst]
+    if kind == "zero":
+        return encode_ref(dst, neg, 0, 0)
+    if kind == "inf":
+        return encode_ref(dst, neg, (1 << pd["eb"]) - 1, 0)
+    if kind == "nan":
+        ps = FORMATS[src]
+        quiet = val | (1 << (ps["fb"] - 1))
+        if pd["fb"] >= ps["fb"]:
+            payload = quiet << (pd["fb"] - ps["fb"])
+        else:
+            payload = quiet >> (ps["fb"] - pd["fb"])
+        return encode_ref(dst, neg, (1 << pd["eb"]) - 1, payload | (1 << (pd["fb"] - 1)))
+    return round_ref(dst, neg, val)
+
+
+# ---------------------------------------------------------------------------
+# Line-by-line port of lean-miri/vendor/Miri/Interpreter/Float.lean
+# ---------------------------------------------------------------------------
+
+
+class MiriError(Exception):
+    pass
+
+
+def miri_pow_scale(n: int, d: int, exponent: int) -> tuple[int, int]:
+    return (n * 2**exponent, d) if exponent >= 0 else (n, d * 2 ** (-exponent))
+
+
+def miri_encode(fmt: str, negative: bool, exponent: int, fraction: int) -> int:
+    p = FORMATS[fmt]
+    return ((2 ** (p["w"] - 1) if negative else 0) + exponent * 2 ** p["fb"] + fraction) % 2**128
+
+
+def miri_decode(fmt: str, bits: int):
+    p = FORMATS[fmt]
+    if bits >= 2 ** p["w"]:
+        raise MiriError("encodingExceedsWidth")
+    negative = bits // 2 ** (p["w"] - 1) != 0
+    exponent = (bits // 2 ** p["fb"]) % 2 ** p["eb"]
+    fraction = bits % 2 ** p["fb"]
+    if exponent == 2 ** p["eb"] - 1:
+        return negative, ("infinite",) if fraction == 0 else ("nan", fraction)
+    significand = fraction if exponent == 0 else 2 ** p["fb"] + fraction
+    unbiased = (1 - p["bias"]) if exponent == 0 else exponent - p["bias"]
+    n, d = miri_pow_scale(significand, 1, unbiased - p["fb"])
+    return negative, ("finite", n, d)
+
+
+def miri_ratio_exponent(n: int, d: int) -> int:
+    if n >= d:
+        return (n // d).bit_length() - 1
+    k = (d // n).bit_length() - 1
+    return -k if n * 2**k >= d else -(k + 1)
+
+
+def miri_round_quotient_even(n: int, d: int) -> int:
+    q, r = n // d, n % d
+    return q + 1 if r * 2 > d or (r * 2 == d and q % 2 == 1) else q
+
+
+def miri_round_ratio(fmt: str, negative: bool, n: int, d: int) -> int:
+    p = FORMATS[fmt]
+    fb, bias, eb = p["fb"], p["bias"], p["eb"]
+    min_exp, max_exp = 1 - bias, bias
+    if d == 0:
+        raise MiriError("zeroDenominator")
+    if n == 0:
+        return miri_encode(fmt, negative, 0, 0)
+    exponent = max(miri_ratio_exponent(n, d), min_exp)
+    if exponent > max_exp:
+        return miri_encode(fmt, negative, 2**eb - 1, 0)
+    scaled_n, scaled_d = miri_pow_scale(n, d, fb - exponent)
+    significand = miri_round_quotient_even(scaled_n, scaled_d)
+    if significand >= 2 ** (fb + 1):
+        significand, exponent = significand // 2, exponent + 1
+    if exponent > max_exp:
+        return miri_encode(fmt, negative, 2**eb - 1, 0)
+    if significand < 2**fb:
+        if exponent != min_exp:
+            raise MiriError("inconsistentRounding")
+        return miri_encode(fmt, negative, 0, significand)
+    if significand >= 2 ** (fb + 1):
+        raise MiriError("inconsistentRounding")
+    return miri_encode(fmt, negative, exponent + bias, significand - 2**fb)
+
+
+def miri_convert(src: str, bits: int, target: str) -> int:
+    negative, value = miri_decode(src, bits)
+    ps, pt = FORMATS[src], FORMATS[target]
+    if value[0] == "finite":
+        return miri_round_ratio(target, negative, value[1], value[2])
+    if value[0] == "infinite":
+        return miri_encode(target, negative, 2 ** pt["eb"] - 1, 0)
+    payload = value[1]
+    quiet = payload | 2 ** (ps["fb"] - 1)
+    if pt["fb"] >= ps["fb"]:
+        payload = quiet * 2 ** (pt["fb"] - ps["fb"])
+    else:
+        payload = quiet // 2 ** (ps["fb"] - pt["fb"])
+    return miri_encode(target, negative, 2 ** pt["eb"] - 1, payload | 2 ** (pt["fb"] - 1))
+
+
+def miri_from_integer(fmt: str, value: int) -> int:
+    return miri_round_ratio(fmt, value < 0, abs(value), 1)
+
+
+def miri_to_integer(fmt: str, bits: int, width: int, is_signed: bool) -> int:
+    if width == 0 or width > 128:
+        raise MiriError("invalidIntegerWidth")
+    negative, value = miri_decode(fmt, bits)
+    min_value = -(2 ** (width - 1)) if is_signed else 0
+    max_value = 2 ** (width - 1) - 1 if is_signed else 2**width - 1
+    if value[0] == "nan":
+        return 0
+    if value[0] == "infinite":
+        return min_value if negative else max_value
+    n, d = value[1], value[2]
+    return max(min_value, min(max_value, -(n // d) if negative else n // d))
+
+
+# ---------------------------------------------------------------------------
+# Test vectors
+# ---------------------------------------------------------------------------
+
+INT_SPECS = ("i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize")
+LEAN_INT_TARGET = {
+    "i8": ".signed .i8", "i16": ".signed .i16", "i32": ".signed .i32", "i64": ".signed .i64",
+    "i128": ".signed .i128", "isize": ".signed .isize", "u8": ".unsigned .u8",
+    "u16": ".unsigned .u16", "u32": ".unsigned .u32", "u64": ".unsigned .u64",
+    "u128": ".unsigned .u128", "usize": ".unsigned .usize",
+}
+
+
+def f64_bits(x: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def f32_bits(x: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def build_vectors(seed: int = 585733184):
+    rng = random.Random(seed)
+    f64_special = [
+        0, 1 << 63, 0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000000,
+        0x7FF0000000000001, 0xFFF8000000000123, 0x7FEFFFFFFFFFFFFF, 0x0000000000000001,
+        0x000FFFFFFFFFFFFF, 0x0010000000000000, 0x3690000000000000, 0x3690000000000001,
+        0x36A8000000000000, 0x47EFFFFFF0000000, 0x47EFFFFFEFFFFFFF, 0x3FF0000010000000,
+        0x3FF0000030000000, 0x3FD5555555555555,
+    ]
+    for x in (0.5, -0.5, 1.5, 2.5, -2.5, 2.7, -2.7, 0.999999, -0.999999, 1e-300, 1e300, 255.5,
+              -128.5, 127.99, 2.0**31, -2.0**31, 2.0**31 - 0.5, 2.0**63, -2.0**63, 2.0**64,
+              2.0**127, -2.0**127, 2.0**128, 1e40, -1e40, 4294967295.5, 65535.9, -32768.9):
+        f64_special.append(f64_bits(x))
+    f64_random = [rng.getrandbits(64) for _ in range(48)]
+    f64_random += [f64_bits(rng.uniform(-3e38, 3e38)) for _ in range(16)]
+    f64_random += [f64_bits(rng.uniform(-1e5, 1e5)) for _ in range(16)]
+    f64_vals = f64_special + f64_random
+    f32_vals = [
+        0, 1 << 31, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001, 0xFFC00123, 0x7F7FFFFF,
+        0x00000001, 0x007FFFFF, 0x00800000, 0x3F000000, 0xBF000000, 0x4B800000, 0xCF000000,
+        0x4F800000, 0x5F000000, 0xDF000000,
+    ] + [rng.getrandbits(32) for _ in range(48)]
+    ints = []
+    for signed in (False, True):
+        for width in (8, 16, 32, 64, 128):
+            m = 1 << width
+            cands = {0, 1, m - 1, m // 2, m // 2 - 1, m // 2 + 1}
+            cands |= {rng.getrandbits(width) for _ in range(10)}
+            if width >= 32:
+                for base in ((1 << 24), (1 << 53)):
+                    for k in (-3, -1, 0, 1, 2, 3):
+                        if 0 <= base + k < m:
+                            cands.add(base + k)
+                        if signed and 0 < base + k < m // 2:
+                            cands.add(m - (base + k))
+            if width == 128:
+                cands |= {m - (1 << 103), m - (1 << 103) - 1, m - (1 << 104), m - 1}
+            for c in sorted(cands):
+                ints.append((signed, width, c))
+    return f64_vals, f32_vals, ints
+
+
+# ---------------------------------------------------------------------------
+# Lean harness (kernel replay + #eval differential probes)
+# ---------------------------------------------------------------------------
+
+
+def _lean_list(xs) -> str:
+    return "[" + ", ".join(str(x) for x in xs) + "]"
+
+
+def build_harness(source: str, f64_vals, f32_vals, ints) -> tuple[str, list[tuple[str, list]]]:
+    probes: list[tuple[str, list]] = []
+    lines = [source, ""]
+    for name in declared_names(source):
+        lines.append(f"#print axioms {name}")
+    lines.append(f"namespace {BRIDGE_NAMESPACE}")
+    for ours, theirs in MINIRUST_BRIDGES:
+        lines.append(
+            f"theorem bridge_{theirs} : {NAMESPACE}.{ours} = "
+            f"MiniRustSpec.Correspondence.ProvenanceWitness.{theirs} := rfl"
+        )
+        lines.append(f"#print axioms bridge_{theirs}")
+    lines += [f"end {BRIDGE_NAMESPACE}", "", "open Trusted.Rustc.V2026_06_01.MirAst", f"open {NAMESPACE}", ""]
+    # float -> int
+    for fmt, vals in (("binary64", f64_vals), ("binary32", f32_vals)):
+        for spec in INT_SPECS:
+            for pw in (64, 32) if spec.endswith("size") else (64,):
+                tag = f"F2I|{fmt}|{spec}|{pw}"
+                pws = ".bits64" if pw == 64 else ".bits32"
+                lines.append(
+                    f'#eval IO.println ("{tag}|" ++ toString ({_lean_list(vals)}.map '
+                    f"(fun b => (evalFloatToIntSaturating .{fmt} b ({LEAN_INT_TARGET[spec]}) {pws}).bits)))"
+                )
+                probes.append((tag, list(vals)))
+    # int -> float
+    for fmt in ("binary32", "binary64"):
+        tag = f"I2F|{fmt}"
+        triples = ", ".join(f"({'true' if s else 'false'}, {w}, {b})" for s, w, b in ints)
+        lines.append(
+            f'#eval IO.println ("{tag}|" ++ toString ([{triples}].map '
+            f"(fun (t : Bool × Nat × Nat) => evalIntToFloatRoundTiesToEven t.1 t.2.1 t.2.2 .{fmt})))"
+        )
+        probes.append((tag, list(ints)))
+    # float -> float
+    for src, dst, vals in (("binary64", "binary32", f64_vals), ("binary32", "binary64", f32_vals)):
+        tag = f"F2F|{src}|{dst}"
+        lines.append(
+            f'#eval IO.println ("{tag}|" ++ toString ({_lean_list(vals)}.map '
+            f"(fun b => evalFloatToFloatRoundTiesToEven .{src} .{dst} b)))"
+        )
+        probes.append((tag, list(vals)))
+    return "\n".join(lines) + "\n", probes
+
+
+class _HarnessCache:
+    result: subprocess.CompletedProcess[str] | None = None
+    probes: list[tuple[str, list]] = []
+    vectors = None
+
+    @classmethod
+    def get(cls):
+        if cls.result is None:
+            f64_vals, f32_vals, ints = build_vectors()
+            cls.vectors = (f64_vals, f32_vals, ints)
+            source = LEAN_FILE.read_text(encoding="utf-8")
+            text, cls.probes = build_harness(source, f64_vals, f32_vals, ints)
+            with tempfile.TemporaryDirectory(prefix="tcb_div8_proto_") as tmp:
+                harness = Path(tmp) / "TcbDiv8ProtoHarness.lean"
+                harness.write_text(text, encoding="utf-8")
+                cls.result = _run_lean(harness)
+        return cls.result
+
+
+def _parse_probe_outputs(stdout: str) -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {}
+    for line in stdout.splitlines():
+        m = re.match(r"^((?:F2I|I2F|F2F)\|[^\[]*)\|\[(.*)\]\s*$", line.strip())
+        if m:
+            body = m.group(2).strip()
+            out[m.group(1)] = [int(x) for x in body.split(",")] if body else []
+    return out
+
+
+def _parse_axioms(stdout: str) -> dict[str, set[str]]:
+    text = re.sub(r"\s+", " ", stdout)
+    result: dict[str, set[str]] = {}
+    # Names may contain `'` (e.g. `if_pos'`), so match lazily up to the closing quote.
+    for m in re.finditer(r"'(\S+?)' depends on axioms: \[([^\]]*)\]", text):
+        result[m.group(1)] = {a.strip() for a in m.group(2).split(",") if a.strip()}
+    for m in re.finditer(r"'(\S+?)' does not depend on any axioms", text):
+        result[m.group(1)] = set()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TrustedBoundaryTests(unittest.TestCase):
+    def test_no_protected_path_edits(self) -> None:
+        changed = set(_git("diff", "--name-only", BASE_SHA).split())
+        changed |= {line[3:] for line in _git("status", "--porcelain").splitlines() if line}
+        offending = sorted(p for p in changed if p.startswith(PROTECTED_PREFIXES))
+        self.assertEqual(offending, [], f"protected paths modified: {offending}")
+
+    def test_diff_only_touches_prototype_files(self) -> None:
+        changed = set(_git("diff", "--name-only", BASE_SHA).split())
+        self.assertTrue(changed <= ALLOWED_DIFF, f"unexpected files in diff: {sorted(changed - ALLOWED_DIFF)}")
+
+
+class LeanSourceTests(unittest.TestCase):
+    def test_forbidden_tokens_absent(self) -> None:
+        source = LEAN_FILE.read_text(encoding="utf-8")
+        for token in FORBIDDEN_TOKENS:
+            self.assertNotIn(token, source, f"forbidden token {token!r} present")
+
+    def test_imports_are_root_lakefile_modules(self) -> None:
+        source = LEAN_FILE.read_text(encoding="utf-8")
+        imports = re.findall(r"^import\s+(\S+)", source, flags=re.M)
+        self.assertIn("Trusted.MirAst", imports)
+        self.assertIn("Trusted.MirSemantics", imports)
+        for mod in ("ProvenanceWitness", "RefWitness", "TbWitness"):
+            self.assertIn(f"MiniRustSpec.Correspondence.{mod}", imports)
+        for imp in imports:
+            self.assertTrue(imp.startswith(("Trusted.", "MiniRustSpec.", "Anneal.")), imp)
+
+    def test_headline_theorems_declared_and_guarded(self) -> None:
+        source = LEAN_FILE.read_text(encoding="utf-8")
+        for thm in HEADLINE_THEOREMS:
+            self.assertRegex(source, rf"(?m)^theorem {re.escape(thm)}\b", thm)
+            guard = re.search(
+                rf"/--\s*info:\s*'{re.escape(NAMESPACE)}\.{re.escape(thm)}'\s+"
+                rf"(?:depends\s+on\s+axioms:\s*\[(?P<axioms>[^\]]*)\]|does\s+not\s+depend\s+on\s+any\s+axioms)"
+                rf"\s*-/\s*\n#guard_msgs\b[^\n]*\bin\s*\n#print axioms {re.escape(thm)}[ \t]*$",
+                source,
+                flags=re.M,
+            )
+            self.assertIsNotNone(guard, f"{thm} lacks a `#guard_msgs in #print axioms` block")
+            pinned = {a.strip() for a in (guard.group("axioms") or "").split(",") if a.strip()}
+            self.assertTrue(pinned <= ALLOWED_AXIOMS, f"{thm} guard pins non-standard axioms {pinned}")
+
+    def test_lean_file_compiles_cleanly(self) -> None:
+        proc = _run_lean(LEAN_FILE)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined[-4000:])
+        self.assertNotRegex(combined, r"\berror\b", combined[-4000:])
+        self.assertNotRegex(combined, r"\bwarning\b", combined[-4000:])
+
+
+class KernelReplayTests(unittest.TestCase):
+    def test_harness_runs(self) -> None:
+        proc = _HarnessCache.get()
+        self.assertEqual(proc.returncode, 0, (proc.stdout + proc.stderr)[-4000:])
+        self.assertNotRegex(proc.stdout + proc.stderr, r"\berror\b")
+
+    def test_headline_axioms_standard(self) -> None:
+        proc = _HarnessCache.get()
+        axioms = _parse_axioms(proc.stdout)
+        for thm in HEADLINE_THEOREMS:
+            full = f"{NAMESPACE}.{thm}"
+            self.assertIn(full, axioms, f"missing #print axioms output for {full}")
+            used = axioms[full]
+            self.assertFalse(used & BANNED_AXIOMS, f"{full} uses banned axioms {used & BANNED_AXIOMS}")
+            self.assertTrue(used <= ALLOWED_AXIOMS, f"{full} uses non-standard axioms {used}")
+
+
+    def test_every_declaration_axiom_clean(self) -> None:
+        proc = _HarnessCache.get()
+        axioms = _parse_axioms(proc.stdout)
+        names = declared_names(LEAN_FILE.read_text(encoding="utf-8"))
+        self.assertGreater(len(names), 200)
+        for name in names:
+            self.assertIn(name, axioms, f"missing #print axioms output for {name}")
+            used = axioms[name]
+            self.assertTrue(used <= ALLOWED_AXIOMS, f"{name} uses non-standard axioms {used}")
+
+    def test_minirust_translator_replica_bridges(self) -> None:
+        proc = _HarnessCache.get()
+        axioms = _parse_axioms(proc.stdout)
+        for _, theirs in MINIRUST_BRIDGES:
+            full = f"{BRIDGE_NAMESPACE}.bridge_{theirs}"
+            self.assertIn(full, axioms, f"bridge {full} failed to elaborate")
+            used = axioms[full]
+            self.assertTrue(used <= BRIDGE_ALLOWED_AXIOMS, f"{full} uses unexpected axioms {used}")
+
+
+class Ieee754DifferentialTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = _HarnessCache.get()
+        cls.outputs = _parse_probe_outputs(proc.stdout)
+        cls.probes = dict(_HarnessCache.probes)
+
+    def _lean(self, tag: str) -> list[int]:
+        self.assertIn(tag, self.outputs, f"missing Lean probe output {tag}")
+        got = self.outputs[tag]
+        self.assertEqual(len(got), len(self.probes[tag]))
+        return got
+
+    def test_python_reference_matches_struct(self) -> None:
+        f64_vals, f32_vals, _ = build_vectors()
+        for b in f64_vals:
+            kind, _, _ = decode_ref("binary64", b)
+            if kind != "nan":
+                self.assertEqual(f2f_ref("binary64", "binary32", b), struct_narrow_f64_to_f32(b), hex(b))
+        for b in f32_vals:
+            kind, _, _ = decode_ref("binary32", b)
+            if kind != "nan":
+                self.assertEqual(f2f_ref("binary32", "binary64", b), struct_widen_f32_to_f64(b), hex(b))
+
+    def test_python_reference_matches_miri_port(self) -> None:
+        f64_vals, f32_vals, ints = build_vectors()
+        for src, dst, vals in (("binary64", "binary32", f64_vals), ("binary32", "binary64", f32_vals)):
+            for b in vals:
+                self.assertEqual(f2f_ref(src, dst, b), miri_convert(src, b, dst), hex(b))
+        for signed, width, b in ints:
+            v = b - (1 << width) if signed and b >= (1 << (width - 1)) else b
+            for fmt in ("binary32", "binary64"):
+                self.assertEqual(i2f_ref(signed, width, b, fmt), miri_from_integer(fmt, v))
+
+    def test_float_to_int_matches_reference(self) -> None:
+        for tag, vals in self.probes.items():
+            if not tag.startswith("F2I"):
+                continue
+            _, fmt, spec, pw = tag.split("|")
+            got = self._lean(tag)
+            signed, width = int_target(spec, int(pw))
+            for b, g in zip(vals, got):
+                self.assertEqual(g, f2i_ref(fmt, b, spec, int(pw)), f"{tag} {hex(b)}")
+                self.assertEqual(g, miri_to_integer(fmt, b, width, signed) % (1 << width), f"{tag} {hex(b)}")
+
+    def test_int_to_float_matches_reference(self) -> None:
+        for fmt in ("binary32", "binary64"):
+            tag = f"I2F|{fmt}"
+            got = self._lean(tag)
+            for (signed, width, b), g in zip(self.probes[tag], got):
+                self.assertEqual(g, i2f_ref(signed, width, b, fmt), f"{tag} {(signed, width, b)}")
+                v = b - (1 << width) if signed and b >= (1 << (width - 1)) else b
+                if fmt == "binary64":
+                    try:
+                        self.assertEqual(g, f64_bits(float(v)), f"{tag} {v}")
+                    except OverflowError:
+                        pass
+                elif abs(v) < (1 << 53):
+                    self.assertEqual(g, f32_bits(float(v)), f"{tag} {v}")
+
+    def test_float_to_float_matches_reference(self) -> None:
+        for src, dst in (("binary64", "binary32"), ("binary32", "binary64")):
+            tag = f"F2F|{src}|{dst}"
+            got = self._lean(tag)
+            for b, g in zip(self.probes[tag], got):
+                self.assertEqual(g, f2f_ref(src, dst, b), f"{tag} {hex(b)}")
+                self.assertEqual(g, miri_convert(src, b, dst), f"{tag} {hex(b)}")
+
+    def test_brief_witness_values(self) -> None:
+        # b/585733184 separation witnesses and signaling-NaN canary (Python side).
+        self.assertEqual(i2f_ref(False, 32, 16777217, "binary32"), 0x4B800000)
+        self.assertEqual(round_ref("binary32", 0, Fraction(16777217), ties_even=False), 0x4B800001)
+        self.assertEqual(i2f_ref(False, 32, 16777219, "binary32"), 0x4B800002)
+        self.assertEqual(i2f_ref(False, 64, 2**53 + 1, "binary64"), 0x4340000000000000)
+        self.assertEqual(f2f_ref("binary64", "binary32", 0x7FF0000000000001), 0x7FC00000)
+        self.assertEqual(i2f_ref(False, 128, 2**128 - 1, "binary32"), 0x7F800000)
+
+    def test_miri_float_source_pinned(self) -> None:
+        text = MIRI_FLOAT.read_text(encoding="utf-8")
+        for needle in ("def roundRatio", "def decode", "def convert", "def toInteger", "def fromInteger",
+                       "roundQuotientEven"):
+            self.assertIn(needle, text)
+
+
+class DivergenceCoverageTests(unittest.TestCase):
+    def test_all_eight_tracked_divergences_addressed(self) -> None:
+        tree = ast.parse(SUITE.read_text(encoding="utf-8"))
+        items = None
+        for node in ast.walk(tree):
+            target = None
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target = node.target.id
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+            if target == "TRACKED_CORRESPONDENCE_DIVERGENCES":
+                items = ast.literal_eval(node.value)
+        self.assertIsNotNone(items)
+        ids = [it["id"] for it in items if it["category"] == "actionable_anneal_bug"]
+        self.assertEqual(len(ids), 8, ids)
+        lean = LEAN_FILE.read_text(encoding="utf-8")
+        report = REPORT.read_text(encoding="utf-8")
+        for div_id in ids:
+            self.assertIn(div_id, lean, f"{div_id} missing from Lean file")
+            self.assertIn(div_id, report, f"{div_id} missing from PROTOTYPE_REPORT.md")
+
+
+if __name__ == "__main__":
+    unittest.main()
