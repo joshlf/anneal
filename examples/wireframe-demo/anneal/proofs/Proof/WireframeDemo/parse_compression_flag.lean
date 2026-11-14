@@ -31,35 +31,43 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
       Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body
       [.scalar { bits := b, sizeBytes := 1 }] rfl rfl h_req.2
   revert h_hold
-  dsimp only [
-    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
-    defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-    wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-    stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-    finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast,
-    evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-    evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
-    rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,
-    pointeeTyOf, elemTyOf, tyIsSigned, evalTerminatorSymTreeFast,
-    lookupSwitchTargetTree, applyUnwindAction, MirStepNode.step,
-    MirStepNode.retNormal, SymTree.bind, initMachineState, initLocals,
-    initLocalsAux, emptyMemory, mirSafePost, readProjectedValue_nil,
-    readProjectedValue_field, ProvenancePtr.tag, lookupBorrow, appendProjections,
-    stripTransparentProjections, projectionsOverlap, projectionsOverlapAux,
-    borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts,
-    hasProtectedWriteConflict, isBorrowProtected, natListContainsBool,
-    invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj,
-    updateBorrowPerm, updateBorrowPermAtProj, freezeDerefReadBorrowsAt,
-    freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj,
-    isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, boolToScalar,
-    GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-    HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-    List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or,
-    Bool.not, bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
-    ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-    Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+  -- The companion reads `flags_byte` through its closure capture (`*(*_8).0`):
+  -- `dsimp` steps the CFG, and each typed deref read (`evalOperandFallback`) and
+  -- its Tree Borrows read check (`derefReadTreeUB`) is evaluated in place by `whnf`.
+  repeat (first
+    | dsimp only [
+        Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
+        Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+        defaultSpecSteps, entryBB, dummyBB, lookupBlock,
+        wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
+        stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
+        finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, validateLoadedValue,
+        evalOperandFast,
+        evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
+        evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
+        rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,
+        pointeeTyOf, elemTyOf, tyIsSigned, evalTerminatorSymTreeFast,
+        lookupSwitchTargetTree, applyUnwindAction, MirStepNode.step,
+        MirStepNode.retNormal, SymTree.bind, initMachineState, initLocals,
+        initLocalsAux, emptyMemory, mirSafePost, readProjectedValue_nil,
+        readProjectedValue_field, ProvenancePtr.tag, lookupBorrow, appendProjections,
+        stripTransparentProjections, projectionsOverlap, projectionsOverlapAux,
+        borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts,
+        hasProtectedWriteConflict, isBorrowProtected, natListContainsBool,
+        invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj,
+        updateBorrowPerm, updateBorrowPermAtProj, freezeDerefReadBorrowsAt,
+        freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj,
+        isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, boolToScalar,
+        disableLocalBorrows,
+        GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
+        HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
+        List.replicate, List.append, List.length, List.set, List.map, Option.getD,
+        get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or,
+        Bool.not, bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
+        ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
+        Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+    | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf
+    | conv in (derefReadTreeUB _ _ _ _ _) => whnf)
   intro h_hold
   cases h_eq : Nat.beq (b % 2) b with
   | false =>
@@ -92,11 +100,12 @@ Only the guarded functional postcondition consults `rustRequires`. -/
 theorem verified : VerificationResult Obligations.WireframeDemo.parse_compression_flag.claim := by
   refine verifyMirNoPanic_of_pureExec _ rfl fun args h_pre => ?_
   obtain ⟨b, -, rfl⟩ := h_pre
-  -- bb0: `_2 = BitAnd(_1, const 1_u8); _0 = Ne(move _2, const 0_u8); return`
+  -- bb0: `_2 = BitAnd(_1, const 1_u8); _0 = Ne(move _2, const 0_u8); return`,
+  -- evaluated in one single-pass `evalPureStmtsCheckedN` step.
   apply lift_PureMirConverges (by rfl)
   apply LiftBlock.of_lookup (by rfl)
-  repeat apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-  apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.eval_rest_checked_ready (by rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.term_return_ready (by rfl) (by rfl) rfl (by rfl) (by rfl)
   rintro ⟨h_req, -⟩
   rcases rustRequires_imp_zero_or_one b h_req with rfl | rfl <;>
     exact ⟨mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl,
