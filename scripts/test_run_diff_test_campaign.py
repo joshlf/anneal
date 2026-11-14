@@ -8353,5 +8353,239 @@ class PassEp2A2AdversarialRegressionTest(unittest.TestCase):
                         self.assertEqual(v["verdict"], ["diverge", v["kill_class"]])
 
 
+class PassEp2B3AdversarialRegressionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_stdlib_anneal_span_and_outcome_tag_fallback_do_not_misattribute_mutator_faults(
+        self,
+    ) -> None:
+        prefix = _repro_prefix()
+        start = len(prefix.splitlines()) + 1
+        src = (
+            prefix
+            + "pub fn s01_checked_add__b0_c2() -> u32 {\n"
+            "    let x: u32 = 1u32;\n"
+            "    let __tb_ovf: u32 = u32::MAX;\n"
+            "    let __miri_tb_1: u32 = __tb_ovf + x;\n"
+            "    __miri_tb_1\n"
+            "}\n"
+        )
+        # 1. `anneal_span` in `library/core/src/panic.rs:57` (line 57 < `start`) must
+        #    not shadow `miri_pos` at `src/lib.rs:{start + 3}` or trigger the seed-prefix
+        #    rule by slicing the preamble at line 57.
+        finding_std_span = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["ArithmeticCastMutator", "TreeBorrowsRetagInterleaver"],
+            "mutant_source": src,
+            "miri_pos": f"src/lib.rs:{start + 3}:28",
+            "anneal_span": "/rustc/0123456789abcdef/library/core/src/panic.rs:57:9: 57:51",
+        }
+        self.assertEqual(
+            campaign.extract_earliest_fault_line_no(finding_std_span), start + 3
+        )
+        self.assertEqual(
+            campaign.infer_finding_cause(finding_std_span, set()),
+            "TreeBorrowsRetagInterleaver",
+        )
+
+        # 2. When `miri_pos` / `anneal_span` are omitted and locations live on
+        #    `miri_outcome` / `anneal_outcome` (`panic@...`, `ub@...`), fault-line
+        #    extraction falls back to the outcome tags.
+        finding_from_outcomes = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["ArithmeticCastMutator", "TreeBorrowsRetagInterleaver"],
+            "mutant_source": src,
+            "miri_outcome": f"panic@src/lib.rs:{start + 3}:28",
+            "anneal_outcome": "panic@/rustc/0123456789abcdef/library/core/src/panic.rs:57:9: 57:51",
+        }
+        self.assertEqual(
+            campaign.extract_earliest_fault_line_no(finding_from_outcomes), start + 3
+        )
+        self.assertEqual(
+            campaign.infer_finding_cause(finding_from_outcomes, set()),
+            "TreeBorrowsRetagInterleaver",
+        )
+
+    def test_preamble_helper_and_macro_fault_lines_resolve_to_candidate_call_sites(
+        self,
+    ) -> None:
+        prefix = _repro_prefix()
+        prefix_lines = prefix.splitlines()
+        start = len(prefix_lines) + 1
+        frozen_line = next(
+            idx + 1 for idx, line in enumerate(prefix_lines) if "*r = 99u32;" in line
+        )
+        unwind_leaf_line = next(
+            idx + 1 for idx, line in enumerate(prefix_lines) if "base + delta" in line
+        )
+        wb_line = next(
+            idx + 1 for idx, line in enumerate(prefix_lines) if "offset(__wb_dst" in line
+        )
+
+        # 1. Fault inside `helper_frozen_reborrow_write_in_callee` in the preamble
+        #    called by `TreeBorrowsRetagInterleaver` in the candidate function.
+        finding_frozen = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["ArithmeticCastMutator", "TreeBorrowsRetagInterleaver"],
+            "mutant_source": (
+                prefix
+                + "pub fn s01_checked_add__b0_c4() -> u32 {\n"
+                "    let mut __ub_prot_slot: u32 = 10u32;\n"
+                "    let __ub_prot_raw: *mut u32 = &raw mut __ub_prot_slot;\n"
+                "    let __miri_tb_9: u32 = helper_frozen_reborrow_write_in_callee(unsafe { *__ub_prot_raw });\n"
+                "    __miri_tb_9\n"
+                "}\n"
+            ),
+            "miri_pos": f"src/lib.rs:{frozen_line}:5",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(finding_frozen, set()),
+            "TreeBorrowsRetagInterleaver",
+        )
+
+        # 2. Fault inside `helper_unwind_leaf` in the preamble called via
+        #    `helper_unwind_mid` by `TreeBorrowsRetagInterleaver`.
+        finding_unwind = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["RawPtrOffsetMutator", "TreeBorrowsRetagInterleaver"],
+            "mutant_source": (
+                prefix
+                + "pub fn s01_checked_add__b0_c5() -> u32 {\n"
+                "    let __tb_u_slot: u32 = 10u32;\n"
+                "    let __miri_tb_4: u32 = helper_unwind_mid(&__tb_u_slot, u32::MAX);\n"
+                "    __miri_tb_4\n"
+                "}\n"
+            ),
+            "miri_pos": f"src/lib.rs:{unwind_leaf_line}:5",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(finding_unwind, set()),
+            "TreeBorrowsRetagInterleaver",
+        )
+
+        # 3. Fault inside `write_bytes!` in the preamble called on `__wb_src` by
+        #    `RawPtrOffsetMutator`.
+        finding_wb = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["ArithmeticCastMutator", "RawPtrOffsetMutator"],
+            "mutant_source": (
+                prefix
+                + "pub fn s01_checked_add__b0_c6() -> u32 {\n"
+                "    let mut __wb_src: PairU32 = PairU32 { a: 1u32, b: 2u32 };\n"
+                "    unsafe {\n"
+                "        write_bytes!(&raw mut __wb_src.a, 1u8, 1usize);\n"
+                "    }\n"
+                "    __wb_src.a\n"
+                "}\n"
+            ),
+            "miri_pos": f"src/lib.rs:{wb_line}:40",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(finding_wb, set()),
+            "RawPtrOffsetMutator",
+        )
+
+        # 4. Conversely, when the unmutated seed prefix itself calls
+        #    `helper_frozen_reborrow_write_in_callee` before an appended mutator tail,
+        #    the preamble fault resolves to the seed's call site and attributes to `seed_name`.
+        seed_helper_fault = {
+            "seed_name": "ub_tb_frozen_reborrow_write_in_callee",
+            "applied_mutators": ["ArithmeticCastMutator"],
+            "mutant_source": (
+                prefix
+                + "pub fn ub_tb_frozen_reborrow_write_in_callee__b0_c7() -> u32 {\n"
+                "    let v: u32 = helper_frozen_reborrow_write_in_callee(10u32);\n"
+                "    let __ovf_a: u32 = 1u32;\n"
+                "    v ^ __ovf_a\n"
+                "}\n"
+            ),
+            "miri_pos": f"src/lib.rs:{frozen_line}:5",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(seed_helper_fault, set()),
+            "ub_tb_frozen_reborrow_write_in_callee",
+        )
+        self.assertGreater(start, frozen_line)
+
+    def test_whitespace_only_mutators_and_custom_evaluator_probe_and_variant_fields_enforced(
+        self,
+    ) -> None:
+        # 1. Whitespace-only `applied_mutators` entries fall back to `seed_name` across
+        #    both Miri and ITree attribution/quarantine helpers.
+        miri_ws = {
+            "seed_name": "s01_checked_add",
+            "applied_mutators": ["   "],
+            "mutant_source": "pub fn s01_checked_add() -> u32 {\n    let __ovf_a: u32 = 1u32;\n    __ovf_a\n}\n",
+            "miri_pos": "src/lib.rs:2:9",
+        }
+        self.assertEqual(campaign.infer_finding_cause(miri_ws, set()), "s01_checked_add")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repro = Path(tmp) / "repro.rs"
+            repro.write_text("fn main() {}\n", encoding="utf-8")
+            itree_ws = {
+                "finding_id": "itree_f0",
+                "fn_name": "b0_c0__kernel_step",
+                "seed_index": 3,
+                "applied_mutators": ["   "],
+                "case_ident": "case_0",
+                "diag_tag": "outcome_mismatch",
+                "diag_repr": "TraceReplayDiag.outcome_mismatch",
+                "repro_path": str(repro),
+                "kernel_confirmed": True,
+            }
+            fp, keys = campaign.quarantine_match_keys_for_itree_finding(itree_ws)
+            self.assertEqual(
+                fp,
+                "itree_seed_3:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch",
+            )
+            self.assertIn("itree_seed_3", keys)
+            all_d, _, _ = campaign.deduplicate_and_quarantine_itree_findings([itree_ws], set())
+            self.assertEqual(all_d[0].cause, "itree_seed_3")
+
+        # 2. Custom evaluator reporting wrong `probe_id` or wrong `detail` on a variant,
+        #    or a mutant with a broken/conflicting probe definition under a custom
+        #    evaluator, must fail closed.
+        prot = next(
+            m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "protector_release_order"
+        )
+        gate_bad_probe_id = campaign.run_semantic_mutant_self_check(
+            evaluator=_variant_reporting_evaluator(
+                lambda m, vs: [vs[0], dict(vs[1], probe_id="protector_release_order")]
+            ),
+            mutants=[prot],
+        )
+        self.assertFalse(gate_bad_probe_id["passed"])
+        self.assertEqual(
+            gate_bad_probe_id["results"][0]["survived_variants"],
+            ["protector_conflict_omitted"],
+        )
+
+        wide = next(m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "wide_shift")
+        gate_bad_detail = campaign.run_semantic_mutant_self_check(
+            evaluator=_variant_reporting_evaluator(
+                lambda m, vs: [dict(vs[0], detail="unrelated error"), *vs[1:]]
+            ),
+            mutants=[wide],
+        )
+        self.assertFalse(gate_bad_detail["passed"])
+        self.assertEqual(
+            gate_bad_detail["results"][0]["survived_variants"],
+            ["guard_omitted_lean_abort"],
+        )
+
+        bad_probe_mutant = dict(prot, probe_rust_source="not a function")
+        gate_broken_probe = campaign.run_semantic_mutant_self_check(
+            evaluator=lambda m: {
+                "killed": True,
+                "kill_class": "false_positive_ub",
+                "witness_polarity": CONSERVATIVE,
+            },
+            mutants=[bad_probe_mutant],
+        )
+        self.assertFalse(gate_broken_probe["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

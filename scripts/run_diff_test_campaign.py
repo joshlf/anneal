@@ -4022,24 +4022,159 @@ ALL_MIRI_MUTATOR_TOKENS = (
     *PLACE_PROJECTION_MUTATOR_TOKENS,
 )
 
+def _is_src_lib_or_repro_file(file_str: str) -> bool:
+    """Returns `True` iff `file_str` names the candidate source (`src/lib.rs` or
+    `repro.rs`) rather than a standard-library panic macro or foreign file."""
+    norm = _normalize_file_for_match(file_str)
+    if not norm or _is_std_panic_macro_file(norm):
+        return False
+    slashed = f"/{norm.lstrip('/')}"
+    if any(seg in slashed for seg in ("/library/core/", "/library/std/", "/library/alloc/")):
+        return False
+    return _source_files_match(norm, "src/lib.rs") or _source_files_match(norm, "repro.rs")
+
+
+def _extract_src_lib_fault_line_nos(finding: dict[str, Any], num_lines: int) -> list[int]:
+    """Returns 1-based fault line numbers in `mutant_source` (`1..=num_lines`) from
+    `("miri_pos", "anneal_span")` (falling back to `@<loc>` on `miri_outcome` /
+    `anneal_outcome`), ignoring standard-library panic-macro spans and foreign files."""
+    line_nos: list[int] = []
+    for loc_key, outcome_key in (
+        ("miri_pos", "miri_outcome"),
+        ("anneal_span", "anneal_outcome"),
+    ):
+        loc = finding.get(loc_key)
+        if not isinstance(loc, str) or ":" not in loc:
+            out_tag = finding.get(outcome_key)
+            if isinstance(out_tag, str) and "@" in out_tag:
+                loc = out_tag.partition("@")[2]
+            else:
+                continue
+        span = _parse_src_span(loc)
+        if span is not None:
+            file_str, line_no = span[0], span[1]
+        else:
+            pos = _parse_src_pos(loc)
+            if pos is not None:
+                file_str, line_no = pos[0], pos[1]
+            else:
+                parts = loc.split(":")
+                if (
+                    len(parts) >= 2
+                    and parts[1].strip().isascii()
+                    and parts[1].strip().isdigit()
+                ):
+                    file_str, line_no = parts[0].strip(), int(parts[1].strip())
+                else:
+                    continue
+        if not _is_src_lib_or_repro_file(file_str):
+            continue
+        if 1 <= line_no <= num_lines and line_no not in line_nos:
+            line_nos.append(line_no)
+    return line_nos
+
+
+def _candidate_fn_start_line_no(src_lines: list[str], finding: dict[str, Any]) -> int:
+    """Returns the 1-based start line of the candidate `fn` in `src_lines` (after
+    any `MIRI_CORPUS_MODULE_PREAMBLE` helpers), or `1` if none is found."""
+    fn_name = finding.get("fn_name")
+    if isinstance(fn_name, str) and fn_name.strip():
+        target = f"fn {fn_name.strip()}("
+        for idx, line in enumerate(src_lines):
+            if target in line:
+                return idx + 1
+    last_cand_line = 1
+    for idx, line in enumerate(src_lines):
+        stripped = line.lstrip()
+        for prefix in ("pub fn ", "pub unsafe fn ", "fn "):
+            if stripped.startswith(prefix):
+                rest = stripped[len(prefix) :].lstrip()
+                ident = rest.split("(", 1)[0].strip()
+                if _is_rust_ident_segment(ident) and not ident.startswith("helper_"):
+                    last_cand_line = idx + 1
+                break
+    return last_cand_line
+
+
+def _resolve_preamble_fault_line_no(
+    src_lines: list[str], line_no: int, cand_fn_start_line: int
+) -> int:
+    """Maps a fault line inside a `MIRI_CORPUS_MODULE_PREAMBLE` helper or macro
+    (`line_no < cand_fn_start_line`) to its call site inside the candidate function
+    when the candidate calls that helper or macro."""
+    if line_no >= cand_fn_start_line:
+        return line_no
+    call_targets: tuple[str, ...] = ()
+    for idx in range(line_no - 1, -1, -1):
+        stripped = src_lines[idx].lstrip()
+        if stripped.startswith("macro_rules! write_bytes"):
+            call_targets = ("write_bytes!(",)
+            break
+        if stripped.startswith("pub fn "):
+            rest = stripped[len("pub fn ") :].lstrip()
+            ident = rest.split("(", 1)[0].strip()
+            if ident in (
+                "helper_unwind_leaf",
+                "helper_unwind_mid",
+                "helper_unwind_guarded",
+            ):
+                call_targets = (
+                    "helper_unwind_leaf(",
+                    "helper_unwind_mid(",
+                    "helper_unwind_guarded(",
+                )
+            elif _is_rust_ident_segment(ident):
+                call_targets = (f"{ident}(",)
+            break
+    if not call_targets:
+        return line_no
+    first_call_line: int | None = None
+    for cand_idx in range(cand_fn_start_line - 1, len(src_lines)):
+        text = src_lines[cand_idx]
+        if any(t in text for t in call_targets):
+            if first_call_line is None:
+                first_call_line = cand_idx + 1
+            if any(tok in text for tok in ALL_MIRI_MUTATOR_TOKENS):
+                return cand_idx + 1
+    return first_call_line if first_call_line is not None else line_no
+
+
+def _mutator_for_fault_line(fault_text: str) -> str | None:
+    """Returns the mutator that owns a token on `fault_text`, or `None`."""
+    if not fault_text:
+        return None
+    for probe_prefix, mutator_name in (
+        ("__miri_ptr_", "RawPtrOffsetMutator"),
+        ("__miri_tb_", "TreeBorrowsRetagInterleaver"),
+        ("__miri_valid_", "BitValidityTransmuteMutator"),
+        ("__miri_arith_", "ArithmeticCastMutator"),
+        ("__miri_proj_", "PlaceProjectionWrapper"),
+    ):
+        if probe_prefix in fault_text:
+            return mutator_name
+    # Check `PlaceProjectionWrapper` (`__oob_arr` / `__oob_idx`) before
+    # `RawPtrOffsetMutator`'s `__oob_` prefix, and `TreeBorrowsRetagInterleaver`
+    # (`__ub_nc` / `__ub_prot_`) before `ArithmeticCastMutator`'s `__ub_` prefix.
+    for mutator_name, tokens in (
+        ("PlaceProjectionWrapper", PLACE_PROJECTION_MUTATOR_TOKENS),
+        ("RawPtrOffsetMutator", RAW_PTR_OFFSET_MUTATOR_TOKENS),
+        ("TreeBorrowsRetagInterleaver", TREE_BORROWS_MUTATOR_TOKENS),
+        ("BitValidityTransmuteMutator", BIT_VALIDITY_MUTATOR_TOKENS),
+        ("ArithmeticCastMutator", ARITHMETIC_CAST_MUTATOR_TOKENS),
+    ):
+        if any(tok in fault_text for tok in tokens):
+            return mutator_name
+    return None
+
+
 def extract_earliest_fault_line_no(finding: dict[str, Any]) -> int | None:
     """Returns the 1-based line number of the earliest fault (`miri_pos` or `anneal_span`)."""
     src = finding.get("mutant_source")
     if not isinstance(src, str) or not src:
         return None
     src_lines = src.splitlines()
-    earliest_line_no: int | None = None
-    for loc_key in ("miri_pos", "anneal_span"):
-        loc = finding.get(loc_key)
-        if not isinstance(loc, str) or ":" not in loc:
-            continue
-        parts = loc.split(":")
-        if len(parts) >= 2 and parts[1].strip().isdigit():
-            line_no = int(parts[1].strip())
-            if 1 <= line_no <= len(src_lines):
-                if earliest_line_no is None or line_no < earliest_line_no:
-                    earliest_line_no = line_no
-    return earliest_line_no
+    line_nos = _extract_src_lib_fault_line_nos(finding, len(src_lines))
+    return min(line_nos) if line_nos else None
 
 
 def extract_fault_line_text(finding: dict[str, Any]) -> str:
@@ -4056,7 +4191,9 @@ def extract_fault_line_text(finding: dict[str, Any]) -> str:
     if earliest_line_no is None:
         return ""
     src_lines = src.splitlines()
-    return src_lines[earliest_line_no - 1]
+    cand_start = _candidate_fn_start_line_no(src_lines, finding)
+    resolved = _resolve_preamble_fault_line_no(src_lines, earliest_line_no, cand_start)
+    return src_lines[resolved - 1]
 
 
 def infer_finding_cause(
@@ -4071,7 +4208,7 @@ def infer_finding_cause(
     seed_name = str(finding["seed_name"])
     mutators = finding.get("applied_mutators")
     first_mutator = (
-        str(mutators[0])
+        mutators[0].strip()
         if isinstance(mutators, list)
         and len(mutators) > 0
         and isinstance(mutators[0], str)
@@ -4081,41 +4218,33 @@ def infer_finding_cause(
         return seed_name
     fault_text = extract_fault_line_text(finding)
     if fault_text:
-        for probe_prefix, mutator_name in (
-            ("__miri_ptr_", "RawPtrOffsetMutator"),
-            ("__miri_tb_", "TreeBorrowsRetagInterleaver"),
-            ("__miri_valid_", "BitValidityTransmuteMutator"),
-            ("__miri_arith_", "ArithmeticCastMutator"),
-            ("__miri_proj_", "PlaceProjectionWrapper"),
-        ):
-            if probe_prefix in fault_text:
-                return mutator_name
-        # Check `PlaceProjectionWrapper` (`__oob_arr` / `__oob_idx`) before
-        # `RawPtrOffsetMutator`'s `__oob_` prefix, and `TreeBorrowsRetagInterleaver`
-        # (`__ub_nc` / `__ub_prot_`) before `ArithmeticCastMutator`'s `__ub_` prefix.
-        for mutator_name, tokens in (
-            ("PlaceProjectionWrapper", PLACE_PROJECTION_MUTATOR_TOKENS),
-            ("RawPtrOffsetMutator", RAW_PTR_OFFSET_MUTATOR_TOKENS),
-            ("TreeBorrowsRetagInterleaver", TREE_BORROWS_MUTATOR_TOKENS),
-            ("BitValidityTransmuteMutator", BIT_VALIDITY_MUTATOR_TOKENS),
-            ("ArithmeticCastMutator", ARITHMETIC_CAST_MUTATOR_TOKENS),
-        ):
-            if any(tok in fault_text for tok in tokens):
-                return mutator_name
+        hit = _mutator_for_fault_line(fault_text)
+        if hit is not None:
+            return hit
 
-        # If the earliest fault occurred inside the unmutated seed prefix before
-        # an appended mutator tail (which only introduces mutator tokens on later
-        # lines), attribute the fault to `seed_name`.
+        # If the earliest fault occurred inside the unmutated seed prefix of the
+        # candidate function before an appended mutator tail (which only introduces
+        # mutator tokens on later lines), attribute the fault to `seed_name`.
         earliest_line_no = extract_earliest_fault_line_no(finding)
         src = finding.get("mutant_source")
         if earliest_line_no is not None and isinstance(src, str):
             src_lines = src.splitlines()
-            prefix_text = "\n".join(src_lines[:earliest_line_no])
-            suffix_text = "\n".join(src_lines[earliest_line_no:])
-            if not any(tok in prefix_text for tok in ALL_MIRI_MUTATOR_TOKENS) and any(
-                tok in suffix_text for tok in ALL_MIRI_MUTATOR_TOKENS
-            ):
-                return seed_name
+            cand_start = _candidate_fn_start_line_no(src_lines, finding)
+            resolved_earliest = _resolve_preamble_fault_line_no(
+                src_lines, earliest_line_no, cand_start
+            )
+            if resolved_earliest >= cand_start:
+                prefix_text = "\n".join(src_lines[cand_start - 1 : resolved_earliest])
+                suffix_text = "\n".join(src_lines[resolved_earliest:])
+                if not any(tok in prefix_text for tok in ALL_MIRI_MUTATOR_TOKENS) and any(
+                    tok in suffix_text for tok in ALL_MIRI_MUTATOR_TOKENS
+                ):
+                    return seed_name
+            for raw_ln in _extract_src_lib_fault_line_nos(finding, len(src_lines)):
+                resolved_ln = _resolve_preamble_fault_line_no(src_lines, raw_ln, cand_start)
+                other_hit = _mutator_for_fault_line(src_lines[resolved_ln - 1])
+                if other_hit is not None:
+                    return other_hit
 
     if seed_name in known_corpus_bug_seeds or not first_mutator:
         return seed_name
@@ -4145,8 +4274,11 @@ def quarantine_match_keys_for_itree_finding(finding: dict[str, Any]) -> tuple[st
     seed_name = f"itree_seed_{finding.get('seed_index', 0)}"
     mutators = finding.get("applied_mutators")
     cause = (
-        str(mutators[0])
-        if isinstance(mutators, list) and len(mutators) > 0 and isinstance(mutators[0], str)
+        mutators[0].strip()
+        if isinstance(mutators, list)
+        and len(mutators) > 0
+        and isinstance(mutators[0], str)
+        and mutators[0].strip()
         else seed_name
     )
     diag_tag = str(finding["diag_tag"])
@@ -4253,10 +4385,11 @@ def deduplicate_and_quarantine_itree_findings(
         seed_name = f"itree_seed_{seed_idx}"
         mutators = f.get("applied_mutators")
         cause = (
-            str(mutators[0])
+            mutators[0].strip()
             if isinstance(mutators, list)
             and len(mutators) > 0
             and isinstance(mutators[0], str)
+            and mutators[0].strip()
             else seed_name
         )
         diag_tag = str(f["diag_tag"])
@@ -5431,12 +5564,31 @@ def _reported_variant_problems(
             )
         if declared:
             spec = declared.get(label) if label is not None else None
+            expected_probe_id = None
+            expected_sub = None
+            if spec is not None:
+                raw_probe = spec.get("probe")
+                if isinstance(raw_probe, dict) and isinstance(raw_probe.get("id"), str):
+                    expected_probe_id = raw_probe["id"].strip()
+                elif isinstance(mutant, dict) and isinstance(mutant.get("id"), str):
+                    expected_probe_id = mutant["id"].strip()
+                expected_sub = spec.get("expected_detail_substring")
             v_ok = (
                 v_ok
                 and spec is not None
                 and label not in reported_labels
                 and v_cls == spec.get("expected_kill_class")
                 and v_pol == spec.get("expected_witness_polarity")
+                and (
+                    "probe_id" not in v
+                    or expected_probe_id is None
+                    or v.get("probe_id") == expected_probe_id
+                )
+                and (
+                    "detail" not in v
+                    or expected_sub is None
+                    or (isinstance(v.get("detail"), str) and str(expected_sub) in v["detail"])
+                )
             )
             if label is not None:
                 reported_labels.add(label)
@@ -5643,6 +5795,26 @@ def run_semantic_mutant_self_check(
                     or set(expected_polarities) - decl_polarities
                 ):
                     outcome["killed"] = False
+        if (
+            outcome["killed"]
+            and evaluator is not None
+            and isinstance(mutant, dict)
+            and (
+                any(k in mutant for k in SEMANTIC_MUTANT_PROBE_KEYS)
+                or any(
+                    isinstance(v, dict) and v.get("probe") is not None
+                    for v in (mutant.get("mutant_variants") or ())
+                    if isinstance(mutant.get("mutant_variants"), (list, tuple))
+                )
+            )
+        ):
+            try:
+                semantic_mutant_probes([mutant])
+            except Exception as e:  # noqa: BLE001 - fail closed on a malformed probe
+                outcome["killed"] = False
+                outcome.setdefault("survived_variants", []).append(
+                    f"<invalid probe: {e}>"
+                )
         # A result that itself names a surviving variant or an expected kill class or
         # polarity that no variant reached is never a kill, whatever its `killed`.
         for key in SEMANTIC_MUTANT_SURVIVAL_KEYS:
