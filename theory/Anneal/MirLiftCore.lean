@@ -7440,6 +7440,47 @@ theorem forcePureEnv_set_comm_counterexample :
     forcePureEnv 2 (([] : List Nat).set 0 5) ≠ (forcePureEnv 2 ([] : List Nat)).set 0 5 := by
   decide
 
+/-- **Exact side condition** of `forcePureEnv_set_comm`: projection commutes with
+`List.set` iff the slot is in range, lies outside the projected prefix, or the
+written value coincides with the padding value `default` (the only way an
+out-of-range write into the padded region can be invisible). -/
+theorem forcePureEnv_set_comm_iff {α : Type} [Inhabited α] (n : Nat) (env : List α) (i : Nat)
+    (v : α) :
+    forcePureEnv n (env.set i v) = (forcePureEnv n env).set i v ↔
+      (i < env.length ∨ n ≤ i ∨ v = default) := by
+  have hlenF : (forcePureEnv n env).length = n := length_forcePureEnvD default n env
+  have hgetD : env.length ≤ i → env.getD i default = default := fun hge => by
+    rw [List.getD_eq_getElem?_getD, List.getElem?_eq_none hge]
+    rfl
+  constructor
+  · intro h
+    rcases Nat.lt_or_ge i env.length with hlt | hge
+    · exact Or.inl hlt
+    · rcases Nat.lt_or_ge i n with hin | hni
+      · refine Or.inr (Or.inr ?_)
+        have h_i := congrArg (fun l => l[i]?) h
+        rw [List.set_eq_of_length_le hge, getElem?_forcePureEnv, ite_eq_left hin,
+          List.getElem?_set_self (by rw [hlenF]; exact hin), hgetD hge] at h_i
+        exact (Option.some.inj h_i).symm
+      · exact Or.inr (Or.inl hni)
+  · rintro (h | h | h)
+    · exact forcePureEnv_set_comm n env i v (Or.inl h)
+    · exact forcePureEnv_set_comm n env i v (Or.inr h)
+    · subst h
+      rcases Nat.lt_or_ge i env.length with hlt | hge
+      · exact forcePureEnv_set_comm n env i default (Or.inl hlt)
+      · rcases Nat.lt_or_ge i n with hin | hni
+        · rw [List.set_eq_of_length_le hge]
+          apply List.ext_getElem?
+          intro j
+          rw [List.getElem?_set]
+          by_cases hij : i = j
+          · subst hij
+            rw [ite_eq_left rfl, ite_eq_left (by rw [hlenF]; exact hin), getElem?_forcePureEnv,
+              ite_eq_left hin, hgetD hge]
+          · rw [ite_eq_right hij]
+        · exact forcePureEnv_set_comm n env i default (Or.inr hni)
+
 /-- Collapse lemma: a chain equals its projection-normal form. -/
 theorem eq_of_forcePureEnv {α : Type} [Inhabited α] {n : Nat} {chain flat : List α}
     (hlen : chain.length = n) (h : forcePureEnv n chain = flat) : chain = flat := by
@@ -7947,7 +7988,7 @@ theorem evalPureStmtChecked_eq_evalPureStmt
     rw [hp]
     rfl
   | true =>
-    rw [if_pos rfl]
+    rw [ite_eq_left rfl]
     cases kind with
     | nop | coverage | constEvalCounter =>
       unfold evalPureStmt
@@ -7955,7 +7996,7 @@ theorem evalPureStmtChecked_eq_evalPureStmt
       rfl
     | storageLive loc | storageDead loc =>
       unfold evalPureStmt
-      rw [hp, if_pos rfl]
+      rw [hp, ite_eq_left rfl]
       dsimp only [evalStmt, PureState.toMachineState, emptyMemory]
       rw [setSpineChecked?_eq_live_set?]
       cases get? env loc with
@@ -7967,7 +8008,7 @@ theorem evalPureStmtChecked_eq_evalPureStmt
       cases proj with
       | nil =>
         unfold evalPureStmt
-        rw [hp, if_pos rfl]
+        rw [hp, ite_eq_left rfl]
         dsimp only [evalStmt, PureState.toMachineState, emptyMemory]
         rw [setSpineChecked?_eq_live_set?]
         cases get? env loc with
@@ -7987,7 +8028,7 @@ theorem evalPureStmtChecked_eq_evalPureStmt
       cases proj with
       | nil =>
         unfold evalPureStmt
-        rw [hp, if_pos rfl]
+        rw [hp, ite_eq_left rfl]
         dsimp only [evalStmt, PureState.toMachineState]
         cases evalRvalue env rv emptyMemory body.localDecls body.layouts with
         | ub | unsupported => rfl
@@ -8854,7 +8895,7 @@ theorem verify_witnessDiamondShared_via_diamond_shared :
     · refine LiftBlockConverges.of_lookup (by rfl) ?_
       refine LiftStmtsConverges.eval_rest_checked_ready hr (by rfl) (by rfl) ?_
       refine LiftStmtsConverges.term_goto_ready hr (by rfl) rfl rfl ?_
-      exact h_join _ ⟨.init (.scalar ⟨a, 4⟩), by dsimp [chosen]; rw [if_pos hle]⟩
+      exact h_join _ ⟨.init (.scalar ⟨a, 4⟩), by dsimp [chosen]; rw [ite_eq_left hle]⟩
   · intro hgt
     have hble : Nat.ble a b = false :=
       Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (Nat.lt_of_not_le hgt)
@@ -8864,7 +8905,7 @@ theorem verify_witnessDiamondShared_via_diamond_shared :
     · refine LiftBlockConverges.of_lookup (by rfl) ?_
       refine LiftStmtsConverges.eval_rest_checked_ready hr (by rfl) (by rfl) ?_
       refine LiftStmtsConverges.term_goto_ready hr (by rfl) rfl rfl ?_
-      exact h_join _ ⟨.init (.scalar ⟨b, 4⟩), by dsimp [chosen]; rw [if_neg hgt]⟩
+      exact h_join _ ⟨.init (.scalar ⟨b, 4⟩), by dsimp [chosen]; rw [ite_eq_right hgt]⟩
   · intro env_j ⟨s₁, h_env⟩
     subst h_env
     refine LiftBlockConverges.of_lookup (by rfl) ?_
@@ -8880,6 +8921,389 @@ theorem verify_witnessDiamondShared_via_diamond_shared :
     subst ha_bits hb_bits
     rfl
 
+/-! ### Compositional opaque-postcondition join paths (`LiftStmtsToJoin` / `LiftBlockToJoin`)
+
+`LiftBlockToJoin body bb env joinBb JoinInv` is parametric in the final
+postcondition `Q`, so a path proof to a join block is written once and reused
+for every downstream continuation. The constructors below build such paths
+block by block (single-pass statement evaluation, `goto`, `switchInt`, `assert`,
+`drop`), so sequential diamonds compose through `LiftBlockToJoin.trans` /
+`liftBlock_two_diamonds_shared` without unfolding any definition. -/
+
+/-- Opaque-postcondition statement-suffix judgment: from statement `stmtIdx` of
+block `bbIdx`, every path reaches `joinBb` in an environment satisfying
+`JoinInv`, so the suffix converges to every postcondition `Q` that `joinBb`
+converges to from all `JoinInv` environments. -/
+def LiftStmtsToJoin (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (env : PureEnv) (stmts : List Statement) (term : Terminator)
+    (joinBb : BasicBlockIdx) (JoinInv : PureEnv → Prop) : Prop :=
+  ∀ (Q : Value → Prop),
+    (∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j Q) →
+    LiftStmtsConverges body bbIdx stmtIdx env stmts term Q
+
+/-- Enter block `bbIdx` at statement `0`. -/
+theorem LiftBlockToJoin.of_lookup {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
+    {bb : BasicBlockData} {env : PureEnv} {JoinInv : PureEnv → Prop}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h : LiftStmtsToJoin body bbIdx 0 env bb.statements bb.terminator joinBb JoinInv) :
+    LiftBlockToJoin body bbIdx env joinBb JoinInv :=
+  fun Q h_join => LiftBlockConverges.of_lookup h_bb (h Q h_join)
+
+/-- Case split on a decidable path condition. -/
+theorem LiftBlockToJoin.by_cases {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
+    {env : PureEnv} {JoinInv : PureEnv → Prop} (C : Prop) [Decidable C]
+    (h_pos : C → LiftBlockToJoin body bbIdx env joinBb JoinInv)
+    (h_neg : ¬ C → LiftBlockToJoin body bbIdx env joinBb JoinInv) :
+    LiftBlockToJoin body bbIdx env joinBb JoinInv :=
+  if hC : C then h_pos hC else h_neg hC
+
+/-- Discharge the shared join proof: a path to `joinBb` plus one proof of
+`joinBb` for every `JoinInv` environment yields convergence. -/
+theorem LiftBlockToJoin.converges {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
+    {env : PureEnv} {JoinInv : PureEnv → Prop} {post : Value → Prop}
+    (h : LiftBlockToJoin body bbIdx env joinBb JoinInv)
+    (h_join : ∀ env_j, JoinInv env_j → LiftBlockConverges body joinBb env_j post) :
+    LiftBlockConverges body bbIdx env post :=
+  h post h_join
+
+/-- Single-pass (`evalPureStmtsCheckedN`) evaluation of the remaining statements. -/
+theorem LiftStmtsToJoin.eval_rest_checked_ready {body : CapturedMir}
+    {bbIdx joinBb : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsCheckedN body bbIdx bb.statements
+      (List.length bb.statements - stmtIdx) stmtIdx env = some env')
+    (h_next : LiftStmtsToJoin body bbIdx (stmtIdx + (List.length bb.statements - stmtIdx))
+      env' bb.statements bb.terminator joinBb JoinInv) :
+    LiftStmtsToJoin body bbIdx stmtIdx env bb.statements bb.terminator joinBb JoinInv :=
+  fun Q h_join => LiftStmtsConverges.eval_rest_checked_ready h_ready h_bb h_eval (h_next Q h_join)
+
+/-- `goto target` continues along a path to the join. -/
+theorem LiftStmtsToJoin.term_goto_ready {body : CapturedMir}
+    {bbIdx target joinBb : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
+    {bb : BasicBlockData} {span : String} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .goto target, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_next : LiftBlockToJoin body target env joinBb JoinInv) :
+    LiftStmtsToJoin body bbIdx stmtIdx env bb.statements bb.terminator joinBb JoinInv :=
+  fun Q h_join => LiftStmtsConverges.term_goto_ready h_ready h_bb h_term h_end (h_next Q h_join)
+
+/-- `switchInt` with a resolved target continues along a path to the join. -/
+theorem LiftStmtsToJoin.term_switchInt_ready {body : CapturedMir}
+    {bbIdx target joinBb : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {discr : Operand} {targets : SwitchTargets}
+    {span : String} {sc : ScalarInt} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .switchInt discr targets, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env discr = .ok (.scalar sc) env')
+    (h_target : target = lookupSwitchTarget sc.bits targets.branches targets.otherwise)
+    (h_next : LiftBlockToJoin body target env' joinBb JoinInv) :
+    LiftStmtsToJoin body bbIdx stmtIdx env bb.statements bb.terminator joinBb JoinInv :=
+  fun Q h_join =>
+    LiftStmtsConverges.term_switchInt_ready h_ready h_bb h_term h_end h_eval h_target
+      (h_next Q h_join)
+
+/-- Two-way `switchInt` split on a decidable guard `C`: each branch supplies its
+resolved target and its own (opaque-postcondition) path to the shared join. -/
+theorem LiftStmtsToJoin.term_switchInt_cases_ready {body : CapturedMir}
+    {bbIdx thenBb elseBb joinBb : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {discr : Operand} {targets : SwitchTargets}
+    {span : String} {sc : ScalarInt} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .switchInt discr targets, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env discr = .ok (.scalar sc) env')
+    (C : Prop) [Decidable C]
+    (h_then : C → lookupSwitchTarget sc.bits targets.branches targets.otherwise = thenBb ∧
+      LiftBlockToJoin body thenBb env' joinBb JoinInv)
+    (h_else : ¬ C → lookupSwitchTarget sc.bits targets.branches targets.otherwise = elseBb ∧
+      LiftBlockToJoin body elseBb env' joinBb JoinInv) :
+    LiftStmtsToJoin body bbIdx stmtIdx env bb.statements bb.terminator joinBb JoinInv :=
+  if hC : C then
+    LiftStmtsToJoin.term_switchInt_ready h_ready h_bb h_term h_end h_eval
+      (h_then hC).1.symm (h_then hC).2
+  else
+    LiftStmtsToJoin.term_switchInt_ready h_ready h_bb h_term h_end h_eval
+      (h_else hC).1.symm (h_else hC).2
+
+/-- A passing `assert` continues along a path to the join. -/
+theorem LiftStmtsToJoin.term_assert_ready {body : CapturedMir}
+    {bbIdx target joinBb : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {cond : Operand} {expected : Bool}
+    {unwind : UnwindAction} {span : String} {sc : ScalarInt} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .assert cond expected target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env cond = .ok (.scalar sc) env')
+    (h_cond : sc.bits = (match expected with | true => 1 | false => 0))
+    (h_next : LiftBlockToJoin body target env' joinBb JoinInv) :
+    LiftStmtsToJoin body bbIdx stmtIdx env bb.statements bb.terminator joinBb JoinInv :=
+  fun Q h_join =>
+    LiftStmtsConverges.term_assert_ready h_ready h_bb h_term h_end h_eval h_cond (h_next Q h_join)
+
+/-- A `drop` of a local (single-pass `setSpineChecked?` update) continues along
+a path to the join. -/
+theorem LiftStmtsToJoin.term_drop_checked_ready {body : CapturedMir}
+    {bbIdx target joinBb : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {place : Place} {unwind : UnwindAction}
+    {span : String} {slot : LocalSlot} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .drop place target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_proj : place.projection = [])
+    (h_set : setSpineChecked? env place.local_ .uninit = some env')
+    (h_next : LiftBlockToJoin body target env' joinBb JoinInv) :
+    LiftStmtsToJoin body bbIdx stmtIdx env bb.statements bb.terminator joinBb JoinInv :=
+  fun Q h_join =>
+    LiftStmtsConverges.term_drop_checked_ready h_ready h_bb h_term h_end h_get h_not_dead
+      h_proj h_set (h_next Q h_join)
+
+/-- **Opaque-postcondition `switchInt` diamond (`bb_entry -> {bb_then, bb_else} -> joinBb`)**:
+both branch paths are postcondition-parametric `LiftBlockToJoin` proofs, so the
+resulting entry path composes with further diamonds (`LiftBlockToJoin.trans`)
+and the join block is proved exactly once by whoever consumes the path. -/
+theorem liftBlock_switchInt_diamond_toJoin {body : CapturedMir}
+    {entryBb thenBb elseBb joinBb : BasicBlockIdx}
+    {bbEntry : BasicBlockData} {env₀ envSw env' : PureEnv}
+    {discr : Operand} {targets : SwitchTargets} {span : String}
+    {sc : ScalarInt} (C : Prop) [Decidable C] {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks entryBb = some bbEntry)
+    (h_eval : evalPureStmtsCheckedN body entryBb bbEntry.statements
+      (List.length bbEntry.statements) 0 env₀ = some envSw)
+    (h_term : bbEntry.terminator = { kind := .switchInt discr targets, span := span })
+    (h_op : MirLiftCore.evalPureOperand body envSw discr = .ok (.scalar sc) env')
+    (h_then : C → lookupSwitchTarget sc.bits targets.branches targets.otherwise = thenBb ∧
+      LiftBlockToJoin body thenBb env' joinBb JoinInv)
+    (h_else : ¬ C → lookupSwitchTarget sc.bits targets.branches targets.otherwise = elseBb ∧
+      LiftBlockToJoin body elseBb env' joinBb JoinInv) :
+    LiftBlockToJoin body entryBb env₀ joinBb JoinInv :=
+  LiftBlockToJoin.of_lookup h_bb
+    (LiftStmtsToJoin.eval_rest_checked_ready h_ready h_bb h_eval
+      (LiftStmtsToJoin.term_switchInt_cases_ready h_ready h_bb h_term (Nat.zero_add _) h_op
+        C h_then h_else))
+
+/-- Straight-line block ending in `goto`: single-pass statement evaluation, then
+continue along a path to the join. -/
+theorem liftBlock_goto_toJoin {body : CapturedMir} {bbIdx target joinBb : BasicBlockIdx}
+    {bb : BasicBlockData} {env env' : PureEnv} {span : String} {JoinInv : PureEnv → Prop}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsCheckedN body bbIdx bb.statements
+      (List.length bb.statements) 0 env = some env')
+    (h_term : bb.terminator = { kind := .goto target, span := span })
+    (h_next : LiftBlockToJoin body target env' joinBb JoinInv) :
+    LiftBlockToJoin body bbIdx env joinBb JoinInv :=
+  LiftBlockToJoin.of_lookup h_bb
+    (LiftStmtsToJoin.eval_rest_checked_ready h_ready h_bb h_eval
+      (LiftStmtsToJoin.term_goto_ready h_ready h_bb h_term (Nat.zero_add _) h_next))
+
+/--
+Two sequential diamonds sharing a middle join and an exit join
+(`argCount := 3`: `_1 = a`, `_2 = b`, `_3 = c`, all `u32`), computing
+`min (max a b) c`:
+- `bb0`: `_4 = Le(Copy(_1), Copy(_2)); switchInt(Move(_4)) [0 => bb2, otherwise => bb1]`
+- `bb1`: `_5 = Copy(_2); goto -> bb3`; `bb2`: `_5 = Copy(_1); goto -> bb3`
+- `bb3` (middle join): `_6 = Le(Copy(_5), Copy(_3)); switchInt(Move(_6)) [0 => bb5, otherwise => bb4]`
+- `bb4`: `_0 = Copy(_5); goto -> bb6`; `bb5`: `_0 = Copy(_3); goto -> bb6`
+- `bb6` (exit join): `StorageDead(_6); return_`
+-/
+def witnessTwoDiamonds : CapturedMir where
+  defPath := "Anneal::MirLiftCore::witness_two_diamonds"
+  phase := .runtimeOptimized
+  role := .subject
+  argCount := 3
+  localDecls := [
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "a" },
+    { mutability := .not, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "b" },
+    { mutability := .not, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "c" },
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessBoolTy, debugName := some "le_ab" },
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessU32Ty, debugName := some "m" },
+    { mutability := .mut, ty := MirLiftReadyWitness.witnessBoolTy, debugName := some "le_mc" }
+  ]
+  basicBlocks := [
+    -- bb0
+    { statements := [
+        { kind := .storageLive 4, span := "d0" },
+        { kind := .storageLive 5, span := "d1" },
+        { kind := .assign { local_ := 4, projection := [] }
+            (.binaryOp .le (.copy { local_ := 1, projection := [] })
+              (.copy { local_ := 2, projection := [] })),
+          span := "d2" }
+      ]
+      terminator := {
+        kind := .switchInt (.move { local_ := 4, projection := [] })
+          { branches := [(0, 2)], otherwise := 1 }
+        span := "e0"
+      }
+      isCleanup := false },
+    -- bb1 (a <= b)
+    { statements := [
+        { kind := .assign { local_ := 5, projection := [] }
+            (.use (.copy { local_ := 2, projection := [] })),
+          span := "d3" }
+      ]
+      terminator := { kind := .goto 3, span := "e1" }
+      isCleanup := false },
+    -- bb2 (a > b)
+    { statements := [
+        { kind := .assign { local_ := 5, projection := [] }
+            (.use (.copy { local_ := 1, projection := [] })),
+          span := "d4" }
+      ]
+      terminator := { kind := .goto 3, span := "e2" }
+      isCleanup := false },
+    -- bb3 (middle join)
+    { statements := [
+        { kind := .storageLive 6, span := "d5" },
+        { kind := .assign { local_ := 6, projection := [] }
+            (.binaryOp .le (.copy { local_ := 5, projection := [] })
+              (.copy { local_ := 3, projection := [] })),
+          span := "d6" }
+      ]
+      terminator := {
+        kind := .switchInt (.move { local_ := 6, projection := [] })
+          { branches := [(0, 5)], otherwise := 4 }
+        span := "e3"
+      }
+      isCleanup := false },
+    -- bb4 (m <= c)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.copy { local_ := 5, projection := [] })),
+          span := "d7" }
+      ]
+      terminator := { kind := .goto 6, span := "e4" }
+      isCleanup := false },
+    -- bb5 (m > c)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.copy { local_ := 3, projection := [] })),
+          span := "d8" }
+      ]
+      terminator := { kind := .goto 6, span := "e5" }
+      isCleanup := false },
+    -- bb6 (exit join & return)
+    { statements := [
+        { kind := .storageDead 6, span := "d9" }
+      ]
+      terminator := { kind := .return_, span := "e6" }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [
+      { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct },
+      { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct },
+      { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct }
+    ]
+    ret := { layout := MirLiftReadyWitness.witnessU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := MirLiftReadyWitness.witnessLayouts
+  allocations := []
+
+theorem checkMirLiftReady_witnessTwoDiamonds :
+    checkMirLiftReady witnessTwoDiamonds = true := rfl
+
+/-- **Sequential diamonds with shared joins, end to end**: the first diamond is a
+postcondition-parametric path `bb0 -> bb3` (`liftBlock_switchInt_diamond_toJoin`),
+the second is a family of paths `bb3 -> bb6` over the middle-join invariant, and
+the exit block `bb6` is proved **once**; `liftBlock_two_diamonds_shared` glues
+them, so neither join block is re-verified per incoming branch. -/
+theorem verify_witnessTwoDiamonds_via_shared_joins :
+    VerificationResult
+      { body := witnessTwoDiamonds
+        pre := fun args =>
+          ∃ a b c : Nat,
+            args = [.scalar { bits := a, sizeBytes := 4 }, .scalar { bits := b, sizeBytes := 4 },
+                    .scalar { bits := c, sizeBytes := 4 }]
+        post := fun args retVal =>
+          ∀ a b c : Nat,
+            args = [.scalar { bits := a, sizeBytes := 4 }, .scalar { bits := b, sizeBytes := 4 },
+                    .scalar { bits := c, sizeBytes := 4 }] →
+            retVal = .scalar { bits := if (if a ≤ b then b else a) ≤ c then
+                (if a ≤ b then b else a) else c, sizeBytes := 4 }
+        callees := [] } := by
+  have hr := checkMirLiftReady_witnessTwoDiamonds
+  refine verifyMirNoPanic_of_mirLiftReady_converges _ hr (fun args hpre => ?_)
+  rcases hpre with ⟨a, b, c, rfl⟩
+  dsimp only
+  refine liftBlock_two_diamonds_shared (midBb := 3) (exitBb := 6)
+    (MidInv := fun env => ∃ m : Nat, m = (if a ≤ b then b else a) ∧
+      env = [.uninit, .init (.scalar ⟨a, 4⟩), .init (.scalar ⟨b, 4⟩), .init (.scalar ⟨c, 4⟩),
+             .uninit, .init (.scalar ⟨m, 4⟩), .dead])
+    (ExitInv := fun env => ∃ m : Nat, m = (if a ≤ b then b else a) ∧
+      env = [.init (.scalar ⟨if m ≤ c then m else c, 4⟩), .init (.scalar ⟨a, 4⟩),
+             .init (.scalar ⟨b, 4⟩), .init (.scalar ⟨c, 4⟩), .uninit, .init (.scalar ⟨m, 4⟩),
+             .uninit])
+    ?_ ?_ ?_
+  · -- first diamond: bb0 -> {bb1, bb2} -> bb3 (postcondition-parametric)
+    refine liftBlock_switchInt_diamond_toJoin (thenBb := 1) (elseBb := 2)
+      (sc := boolToScalar (Nat.ble a b)) (a ≤ b) hr (by rfl) (by rfl) rfl (by rfl) ?_ ?_
+    · intro hle
+      refine ⟨?_, ?_⟩
+      · change lookupSwitchTarget (boolToScalar (Nat.ble a b)).bits [(0, 2)] 1 = 1
+        rw [Nat.ble_eq_true_of_le hle]; rfl
+      · exact liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+          (LiftBlockToJoin.refl ⟨b, (ite_eq_left hle).symm, rfl⟩)
+    · intro hgt
+      have hble : Nat.ble a b = false :=
+        Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (Nat.lt_of_not_le hgt)
+      refine ⟨?_, ?_⟩
+      · change lookupSwitchTarget (boolToScalar (Nat.ble a b)).bits [(0, 2)] 1 = 2
+        rw [hble]; rfl
+      · exact liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+          (LiftBlockToJoin.refl ⟨a, (ite_eq_right hgt).symm, rfl⟩)
+  · -- second diamond: bb3 -> {bb4, bb5} -> bb6, for every middle-join environment
+    intro env_m ⟨m, hm, h_env⟩
+    subst h_env
+    refine liftBlock_switchInt_diamond_toJoin (thenBb := 4) (elseBb := 5)
+      (sc := boolToScalar (Nat.ble m c)) (m ≤ c) hr (by rfl) (by rfl) rfl (by rfl) ?_ ?_
+    · intro hle
+      refine ⟨?_, ?_⟩
+      · change lookupSwitchTarget (boolToScalar (Nat.ble m c)).bits [(0, 5)] 4 = 4
+        rw [Nat.ble_eq_true_of_le hle]; rfl
+      · refine liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl (LiftBlockToJoin.refl ⟨m, hm, ?_⟩)
+        rw [ite_eq_left hle]
+    · intro hgt
+      have hble : Nat.ble m c = false :=
+        Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (Nat.lt_of_not_le hgt)
+      refine ⟨?_, ?_⟩
+      · change lookupSwitchTarget (boolToScalar (Nat.ble m c)).bits [(0, 5)] 4 = 5
+        rw [hble]; rfl
+      · refine liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl (LiftBlockToJoin.refl ⟨m, hm, ?_⟩)
+        rw [ite_eq_right hgt]
+  · -- exit join `bb6`, proved once
+    intro env_e ⟨m, hm, h_env⟩
+    subst h_env
+    refine LiftBlockConverges.of_lookup (by rfl) ?_
+    refine LiftStmtsConverges.eval_rest_checked_ready hr (by rfl) (by rfl) ?_
+    refine LiftStmtsConverges.term_return_ready hr (by rfl) rfl rfl (by rfl) ?_
+    intro a' b' c' h_eq
+    injection h_eq with ha h_tl
+    injection h_tl with hb h_tl'
+    injection h_tl' with hc _
+    injection ha with ha_sc
+    injection ha_sc with ha_bits _
+    injection hb with hb_sc
+    injection hb_sc with hb_bits _
+    injection hc with hc_sc
+    injection hc_sc with hc_bits _
+    subst ha_bits hb_bits hc_bits hm
+    rfl
+
 end DiamondJoinSharing
 
 /-!
@@ -8892,33 +9316,33 @@ section FuelFreeLoops
 whose internal ceiling is derived from the CFG (`cfg.length`, an upper bound on
 the length of any header-free acyclic segment), so call sites contain no step
 numerals. -/
-def runCfgToBlock (cfg : List Instr) (target : Nat) (s : CfgState) :
+protected def runCfgToBlock (cfg : List Instr) (target : Nat) (s : CfgState) :
     TargetOutcome CfgState Nat :=
   runToTarget (stepCfg cfg) (fun s' => s'.bb == target) cfg.length s
 
 theorem runCfgToBlock_reached_bb {cfg : List Instr} {target : Nat} {s s' : CfgState}
-    (h : runCfgToBlock cfg target s = .reached s') : s'.bb = target := by
-  unfold runCfgToBlock at h
+    (h : MirLiftCore.runCfgToBlock cfg target s = .reached s') : s'.bb = target := by
+  unfold MirLiftCore.runCfgToBlock at h
   have ht := runToTarget_reached_atTarget h
   exact beq_iff_eq.mp ht
 
 /-- **Target arrival soundness** for `runCfgToBlock`. -/
 theorem stepsTo_of_runCfgToBlock_reached {cfg : List Instr} {target : Nat}
-    {s s' : CfgState} (h : runCfgToBlock cfg target s = .reached s') :
+    {s s' : CfgState} (h : MirLiftCore.runCfgToBlock cfg target s = .reached s') :
     StepsTo (stepCfg cfg) s (· = s') :=
   stepsTo_of_runToTarget_reached h
 
 /-- **Halting soundness** for `runCfgToBlock`. -/
 theorem wpConverges_of_runCfgToBlock_halted {cfg : List Instr} {target : Nat}
     {s : CfgState} {v : Nat} {post : Nat → Prop}
-    (h : runCfgToBlock cfg target s = .halted v) (hp : post v) :
+    (h : MirLiftCore.runCfgToBlock cfg target s = .halted v) (hp : post v) :
     WpConverges (stepCfg cfg) s post :=
   wpConverges_of_runToTarget_halted h hp
 
 /-- **Stuck soundness** for `runCfgToBlock`. -/
 theorem not_wpConverges_of_runCfgToBlock_stuck {cfg : List Instr} {target : Nat}
     {s : CfgState} {post : Nat → Prop}
-    (h : runCfgToBlock cfg target s = .stuck) : ¬ WpConverges (stepCfg cfg) s post :=
+    (h : MirLiftCore.runCfgToBlock cfg target s = .stuck) : ¬ WpConverges (stepCfg cfg) s post :=
   not_wpConverges_of_runToTarget_stuck h
 
 /-- Multi-block `countUp(n)` with a symbolic accumulator (slots `[n, i, acc]`). -/
@@ -9008,25 +9432,25 @@ theorem no_uniform_fuel_countUp :
 /-- One loop iteration from the re-entrant header `bb1` back to `bb1`: the
 stepper stops at the first re-entry (three block steps), never overshooting. -/
 theorem runCfgToBlock_countUp_iter (n i acc : Nat) (hlt : i < n) :
-    runCfgToBlock countUpCfg 1 (countUpHeader n i acc) =
+    MirLiftCore.runCfgToBlock countUpCfg 1 (countUpHeader n i acc) =
       .reached (countUpHeader n (i + 1) (acc + 1)) := by
   obtain ⟨h1, _, _⟩ := countUp_header_iter_steps n i acc hlt
-  simp only [runCfgToBlock, runToTarget, h1]
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, h1]
   rfl
 
 /-- Exit from the header halts with the accumulator. -/
 theorem runCfgToBlock_countUp_exit (n acc : Nat) :
-    runCfgToBlock countUpCfg 1 (countUpHeader n n acc) = .halted acc := by
+    MirLiftCore.runCfgToBlock countUpCfg 1 (countUpHeader n n acc) = .halted acc := by
   obtain ⟨h1, _⟩ := countUp_header_exit_steps n acc
-  simp only [runCfgToBlock, runToTarget, h1]
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, h1]
   rfl
 
 /-- The entry block reaches the loop header in one step. -/
 theorem runCfgToBlock_countUp_entry (n x junk : Nat) :
-    runCfgToBlock countUpCfg 1 (countUpInit n x junk) = .reached (countUpHeader n 0 x) := rfl
+    MirLiftCore.runCfgToBlock countUpCfg 1 (countUpInit n x junk) = .reached (countUpHeader n 0 x) := rfl
 
 /-- Structurally recursive `for i in lo..hi` fold (re-exported in `MirLiftCore`). -/
-def forRangeUp {α : Type} (lo hi : Nat) (init : α)
+protected def forRangeUp {α : Type} (lo hi : Nat) (init : α)
     (step : (i : Nat) → lo ≤ i → i < hi → α → α) : α :=
   PureMirExec.forRangeUp lo hi init step
 
@@ -9047,18 +9471,18 @@ theorem forRangeUpAux_eq_live {α : Type} (lo hi : Nat)
 extensionally identical to the live well-founded definition. -/
 theorem forRangeUp_eq_live {α : Type} (lo hi : Nat) (init : α)
     (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
-    forRangeUp lo hi init step = Anneal.MirLoops.forRangeUp lo hi init step := by
-  unfold forRangeUp PureMirExec.forRangeUp
+    MirLiftCore.forRangeUp lo hi init step = Anneal.MirLoops.forRangeUp lo hi init step := by
+  unfold MirLiftCore.forRangeUp PureMirExec.forRangeUp
   split
   · next hle => exact forRangeUpAux_eq_live lo hi step lo (hi - lo) _ _ init
   · next hgt => rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
 
 /-- **Structural `[lo, hi)` loop induction** (re-exported in `MirLiftCore`). -/
-theorem forRangeUp_induction {α : Type} (lo hi : Nat) (init : α)
+protected theorem forRangeUp_induction {α : Type} (lo hi : Nat) (init : α)
     (step : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → Prop)
     (hle : lo ≤ hi) (hinit : inv lo init)
     (hstep : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a, inv i a → inv (i + 1) (step i hlo hlt a)) :
-    inv hi (forRangeUp lo hi init step) :=
+    inv hi (MirLiftCore.forRangeUp lo hi init step) :=
   PureMirExec.forRangeUp_induction lo hi init step inv hle hinit hstep
 
 /-- Range induction transported to the live `Anneal.MirLoops.forRangeUp`
@@ -9069,7 +9493,7 @@ theorem live_forRangeUp_induction {α : Type} (lo hi : Nat) (init : α)
     (hstep : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a, inv i a → inv (i + 1) (step i hlo hlt a)) :
     inv hi (Anneal.MirLoops.forRangeUp lo hi init step) := by
   rw [← forRangeUp_eq_live]
-  exact forRangeUp_induction lo hi init step inv hle hinit hstep
+  exact MirLiftCore.forRangeUp_induction lo hi init step inv hle hinit hstep
 
 /-- **Fuel-free total correctness of `countUp(n)` for every symbolic `n`** (and
 symbolic accumulator `x`): the statement contains no fuel numeral, and the proof
@@ -9110,8 +9534,8 @@ theorem selfLoop_exit_steps (n : Nat) :
   simp [stepCfg, selfLoopCfg]
 
 theorem runCfgToBlock_selfLoop_no_overshoot (n i : Nat) (hlt : i < n) :
-    runCfgToBlock selfLoopCfg 0 ⟨0, [n, i]⟩ = .reached ⟨0, [n, i + 1]⟩ := by
-  simp only [runCfgToBlock, runToTarget, selfLoop_iter_step n i hlt]
+    MirLiftCore.runCfgToBlock selfLoopCfg 0 ⟨0, [n, i]⟩ = .reached ⟨0, [n, i + 1]⟩ := by
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, selfLoop_iter_step n i hlt]
   rfl
 
 /-- The first-hit characterization pins the self-loop successor uniquely. -/
@@ -9131,15 +9555,15 @@ theorem selfLoop_wpConverges_all_n (n : Nat) :
       (fun _ h => h)
   · intro s_exit hs
     subst hs
-    have hexit : runCfgToBlock selfLoopCfg 0 ⟨0, [n, n]⟩ = .halted n := by
-      simp only [runCfgToBlock, runToTarget, (selfLoop_exit_steps n).1]
+    have hexit : MirLiftCore.runCfgToBlock selfLoopCfg 0 ⟨0, [n, n]⟩ = .halted n := by
+      simp only [MirLiftCore.runCfgToBlock, runToTarget, (selfLoop_exit_steps n).1]
       rfl
     exact wpConverges_of_runCfgToBlock_halted hexit rfl
 
 /-- `.stuck` is reported for a jump to a missing block and soundly refutes
 convergence. -/
 theorem runCfgToBlock_stuck_example :
-    runCfgToBlock [.goto 7] 0 ⟨0, []⟩ = .stuck ∧
+    MirLiftCore.runCfgToBlock [.goto 7] 0 ⟨0, []⟩ = .stuck ∧
       ¬ WpConverges (stepCfg [.goto 7]) ⟨0, []⟩ (fun _ => True) :=
   ⟨rfl, not_wpConverges_of_runCfgToBlock_stuck (target := 0) rfl⟩
 
@@ -9185,7 +9609,7 @@ theorem runUntilTarget_infiniteLoop_unreached :
 stops after one step without overshooting. -/
 theorem runToTarget_infiniteLoop_outOfFuel (bound : Nat) (env : List Nat) :
     runToTarget (stepCfg infiniteLoopCfg) (fun s => s.bb == 1) bound ⟨0, env⟩ = .outOfFuel ∧
-      runCfgToBlock infiniteLoopCfg 0 ⟨0, env⟩ = .reached ⟨0, env⟩ :=
+      MirLiftCore.runCfgToBlock infiniteLoopCfg 0 ⟨0, env⟩ = .reached ⟨0, env⟩ :=
   ⟨runUntilTarget_infiniteLoop_unreached bound env, rfl⟩
 
 theorem inferMinFragment_countUp :
@@ -9200,7 +9624,7 @@ theorem inferMinFragment_selfLoop :
 
 /-- **Fuel-free range-loop rule for live MIR**, stated with the live
 `Anneal.MirLoops.forRangeUp`. -/
-theorem mirWpConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : Nat) (init : α)
+protected theorem mirWpConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : Nat) (init : α)
     (f : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → MachineState → Prop)
     (s₀ : MachineState) (post : MirOutcome → Prop) (hle : lo ≤ hi) (hinit : inv lo init s₀)
     (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
@@ -9211,7 +9635,7 @@ theorem mirWpConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : Nat)
   refine mirWpConverges_of_wpConverges
     (wpConverges_forRangeUp (mirStep body) lo hi init f inv s₀ post hle hinit hiter ?_)
   intro s_exit h
-  change inv hi (forRangeUp lo hi init f) s_exit at h
+  change inv hi (MirLiftCore.forRangeUp lo hi init f) s_exit at h
   rw [forRangeUp_eq_live] at h
   exact hexit s_exit h
 
@@ -9228,7 +9652,7 @@ theorem mirNoCallWpConverges_forRangeUp_of_stepsTo {α : Type}
   refine mirNoCallWpConverges_of_wpConverges
     (wpConverges_forRangeUp (mirStep body) lo hi init f inv s₀ post hle hinit hiter ?_)
   intro s_exit h
-  change inv hi (forRangeUp lo hi init f) s_exit at h
+  change inv hi (MirLiftCore.forRangeUp lo hi init f) s_exit at h
   rw [forRangeUp_eq_live] at h
   exact hexit s_exit h
 
@@ -9242,12 +9666,12 @@ theorem mirNoCallWpConverges_forRangeUp_of_runMirToBlock {α : Type}
     (stateAt : Nat → α → MachineState)
     (s₀ : MachineState) (post : MirOutcome → Prop)
     (hle : lo ≤ hi)
-    (hentry : runMirToBlock body headerBb s₀ = .reached (stateAt lo init))
+    (hentry : PureMirExec.runMirToBlock body headerBb s₀ = .reached (stateAt lo init))
     (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
-      runMirToBlock body headerBb (stateAt i a) =
+      PureMirExec.runMirToBlock body headerBb (stateAt i a) =
         .reached (stateAt (i + 1) (f i hlo hlt a)))
     (hexit : ∃ out,
-      runMirToBlock body headerBb (stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) =
+      PureMirExec.runMirToBlock body headerBb (stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) =
         .halted out ∧ post out) :
     Anneal.MirFuelFree.MirNoCallWpConverges body s₀ post := by
   refine mirNoCallWpConverges_of_stepsTo_bind
@@ -9270,12 +9694,12 @@ theorem mirWpConverges_forRangeUp_of_runMirToBlock {α : Type}
     (stateAt : Nat → α → MachineState)
     (s₀ : MachineState) (post : MirOutcome → Prop)
     (hle : lo ≤ hi)
-    (hentry : runMirToBlock body headerBb s₀ = .reached (stateAt lo init))
+    (hentry : PureMirExec.runMirToBlock body headerBb s₀ = .reached (stateAt lo init))
     (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
-      runMirToBlock body headerBb (stateAt i a) =
+      PureMirExec.runMirToBlock body headerBb (stateAt i a) =
         .reached (stateAt (i + 1) (f i hlo hlt a)))
     (hexit : ∃ out,
-      runMirToBlock body headerBb (stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) =
+      PureMirExec.runMirToBlock body headerBb (stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) =
         .halted out ∧ post out) :
     Anneal.MirFuelFree.MirWpConverges body s₀ post :=
   Anneal.MirFuelFree.MirWpConverges.of_noCall
@@ -9289,13 +9713,13 @@ theorem pureMirConverges_forRangeUp_of_runMirToBlock {α : Type}
     (stateAt : Nat → α → PureState)
     (ps₀ : PureState) (post : Value → Prop)
     (hle : lo ≤ hi)
-    (hentry : runMirToBlock body headerBb (ps₀.toMachineState emptyMemory) =
+    (hentry : PureMirExec.runMirToBlock body headerBb (ps₀.toMachineState emptyMemory) =
       .reached ((stateAt lo init).toMachineState emptyMemory))
     (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
-      runMirToBlock body headerBb ((stateAt i a).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock body headerBb ((stateAt i a).toMachineState emptyMemory) =
         .reached ((stateAt (i + 1) (f i hlo hlt a)).toMachineState emptyMemory))
     (hexit : ∃ retVal mem',
-      runMirToBlock body headerBb
+      PureMirExec.runMirToBlock body headerBb
         ((stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)).toMachineState emptyMemory) =
         .halted (.normal (retVal, mem')) ∧ post retVal) :
     PureMirConverges body ps₀ post := by
@@ -9318,13 +9742,13 @@ theorem verifyMirNoPanic_forRangeUp_of_runMirToBlock {α : Type}
     (stateAt : List Value → Nat → α → PureState)
     (hle : ∀ args, c.pre args → lo args ≤ hi args)
     (hentry : ∀ args, c.pre args →
-      runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
         .reached ((stateAt args (lo args) (init args)).toMachineState emptyMemory))
     (hiter : ∀ args, c.pre args → ∀ i (hlo : lo args ≤ i) (hlt : i < hi args) a,
-      runMirToBlock c.body headerBb ((stateAt args i a).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock c.body headerBb ((stateAt args i a).toMachineState emptyMemory) =
         .reached ((stateAt args (i + 1) (f args i hlo hlt a)).toMachineState emptyMemory))
     (hexit : ∀ args, c.pre args → ∃ retVal mem',
-      runMirToBlock c.body headerBb
+      PureMirExec.runMirToBlock c.body headerBb
         ((stateAt args (hi args)
           (Anneal.MirLoops.forRangeUp (lo args) (hi args) (init args) (f args))).toMachineState emptyMemory) =
         .halted (.normal (retVal, mem')) ∧ c.post args retVal) :
@@ -9347,13 +9771,13 @@ theorem verifyStatefulMirNoPanic_forRangeUp_of_runMirToBlock {α : Type}
     (stateAt : List Value → Memory → Nat → α → PureState)
     (hle : ∀ args mem, c.pre args mem → lo args mem ≤ hi args mem)
     (hentry : ∀ args mem, c.pre args mem →
-      runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
         .reached ((stateAt args mem (lo args mem) (init args mem)).toMachineState emptyMemory))
     (hiter : ∀ args mem, c.pre args mem → ∀ i (hlo : lo args mem ≤ i) (hlt : i < hi args mem) a,
-      runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
         .reached ((stateAt args mem (i + 1) (f args mem i hlo hlt a)).toMachineState emptyMemory))
     (hexit : ∀ args mem, c.pre args mem → ∃ retVal mem_e,
-      runMirToBlock c.body headerBb
+      PureMirExec.runMirToBlock c.body headerBb
         ((stateAt args mem (hi args mem)
           (Anneal.MirLoops.forRangeUp (lo args mem) (hi args mem) (init args mem) (f args mem))).toMachineState emptyMemory) =
         .halted (.normal (retVal, mem_e)) ∧
@@ -9379,13 +9803,13 @@ theorem verifyTotalMir_forRangeUp_of_runMirToBlock {α : Type}
     (stateAt : List Value → Memory → Nat → α → PureState)
     (hle : ∀ args mem, c.pre args mem → lo args mem ≤ hi args mem)
     (hentry : ∀ args mem, c.pre args mem →
-      runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
         .reached ((stateAt args mem (lo args mem) (init args mem)).toMachineState emptyMemory))
     (hiter : ∀ args mem, c.pre args mem → ∀ i (hlo : lo args mem ≤ i) (hlt : i < hi args mem) a,
-      runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
+      PureMirExec.runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
         .reached ((stateAt args mem (i + 1) (f args mem i hlo hlt a)).toMachineState emptyMemory))
     (hexit : ∀ args mem, c.pre args mem → ∃ retVal mem_e,
-      runMirToBlock c.body headerBb
+      PureMirExec.runMirToBlock c.body headerBb
         ((stateAt args mem (hi args mem)
           (Anneal.MirLoops.forRangeUp (lo args mem) (hi args mem) (init args mem) (f args mem))).toMachineState emptyMemory) =
         .halted (.normal (retVal, mem_e)) ∧
@@ -9402,7 +9826,7 @@ theorem verifyTotalMir_forRangeUp_of_runMirToBlock {α : Type}
 /-- Entry segment of the live `Anneal.MirLoops.countToNBody n` executed through
 `runMirToBlock` (reaches loop header `bb1` in two steps). -/
 theorem runMirToBlock_countToN_entry (n : Nat) :
-    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+    PureMirExec.runMirToBlock (Anneal.MirLoops.countToNBody n) 1
       (Anneal.MirLoops.countStateMem 0 0 0 emptyMemory) =
       .reached (Anneal.MirLoops.countStateMem 1 0 0 emptyMemory) := rfl
 
@@ -9410,7 +9834,7 @@ theorem runMirToBlock_countToN_entry (n : Nat) :
 executed through `runMirToBlock`: steps across `bb1`'s `.switchInt` (`.emitStep`)
 and `bb2`'s increment + `goto 1` back to `bb1` without overshooting. -/
 theorem runMirToBlock_countToN_iter (n i : Nat) (hlt : i < n) (hn : n < 4294967296) :
-    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+    PureMirExec.runMirToBlock (Anneal.MirLoops.countToNBody n) 1
       (Anneal.MirLoops.countStateMem 1 0 i emptyMemory) =
       .reached (Anneal.MirLoops.countStateMem 1 0 (i + 1) emptyMemory) := by
   have hbeq : Nat.beq i n = false := (Bool.not_eq_true _).mp (Nat.ne_of_lt hlt ∘ Nat.eq_of_beq_eq_true)
@@ -9430,7 +9854,7 @@ theorem runMirToBlock_countToN_iter (n i : Nat) (hlt : i < n) (hn : n < 42949672
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       (Anneal.MirLoops.countStateMem 2 1 (i + 1) emptyMemory) =
       .cont (Anneal.MirLoops.countStateMem 1 0 (i + 1) emptyMemory) := rfl
-  unfold runMirToBlock
+  unfold PureMirExec.runMirToBlock
   have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
   rw [hmb]
   simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
@@ -9439,7 +9863,7 @@ theorem runMirToBlock_countToN_iter (n i : Nat) (hlt : i < n) (hn : n < 42949672
 /-- Loop-exit segment of the live `Anneal.MirLoops.countToNBody n` executed
 through `runMirToBlock`: steps from `bb1` (`i = n`) through `bb3` to `.halted`. -/
 theorem runMirToBlock_countToN_exit (n : Nat) :
-    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+    PureMirExec.runMirToBlock (Anneal.MirLoops.countToNBody n) 1
       (Anneal.MirLoops.countStateMem 1 0 n emptyMemory) =
       .halted (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := by
   have hs1 : mirStep (Anneal.MirLoops.countToNBody n) (Anneal.MirLoops.countStateMem 1 0 n emptyMemory) =
@@ -9450,7 +9874,7 @@ theorem runMirToBlock_countToN_exit (n : Nat) :
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       (Anneal.MirLoops.countStateMemRet 3 1 n emptyMemory) =
       .done (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := rfl
-  unfold runMirToBlock
+  unfold PureMirExec.runMirToBlock
   have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
   rw [hmb]
   simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
@@ -9501,12 +9925,12 @@ def countToNPureState (bb stmt i : Nat) : PureState :=
   { bb := bb, stmtIdx := stmt, env := [.uninit, .init (.scalar ⟨i, 4⟩)] }
 
 theorem runMirToBlock_countToN_entry_initPureState (n : Nat) (v₀ : Value) :
-    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+    PureMirExec.runMirToBlock (Anneal.MirLoops.countToNBody n) 1
       ((initPureState (Anneal.MirLoops.countToNBody n) [v₀]).toMachineState emptyMemory) =
       .reached ((countToNPureState 1 0 0).toMachineState emptyMemory) := rfl
 
 theorem runMirToBlock_countToN_iter_initPureState (n i : Nat) (hlt : i < n) (hn : n < 4294967296) :
-    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+    PureMirExec.runMirToBlock (Anneal.MirLoops.countToNBody n) 1
       ((countToNPureState 1 0 i).toMachineState emptyMemory) =
       .reached ((countToNPureState 1 0 (i + 1)).toMachineState emptyMemory) := by
   have hbeq : Nat.beq i n = false := (Bool.not_eq_true _).mp (Nat.ne_of_lt hlt ∘ Nat.eq_of_beq_eq_true)
@@ -9526,14 +9950,14 @@ theorem runMirToBlock_countToN_iter_initPureState (n i : Nat) (hlt : i < n) (hn 
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       ((countToNPureState 2 1 (i + 1)).toMachineState emptyMemory) =
       .cont ((countToNPureState 1 0 (i + 1)).toMachineState emptyMemory) := rfl
-  unfold runMirToBlock
+  unfold PureMirExec.runMirToBlock
   have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
   rw [hmb]
   simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
   rfl
 
 theorem runMirToBlock_countToN_exit_initPureState (n : Nat) :
-    runMirToBlock (Anneal.MirLoops.countToNBody n) 1
+    PureMirExec.runMirToBlock (Anneal.MirLoops.countToNBody n) 1
       ((countToNPureState 1 0 n).toMachineState emptyMemory) =
       .halted (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := by
   have hs1 : mirStep (Anneal.MirLoops.countToNBody n) ((countToNPureState 1 0 n).toMachineState emptyMemory) =
@@ -9544,7 +9968,7 @@ theorem runMirToBlock_countToN_exit_initPureState (n : Nat) :
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       { frame := { blockIdx := 3, stmtIdx := 1, locals := [.init (.scalar ⟨n, 4⟩), .init (.scalar ⟨n, 4⟩)] }, memory := emptyMemory } =
       .done (.normal (.scalar ⟨n, 4⟩, emptyMemory)) := rfl
-  unfold runMirToBlock
+  unfold PureMirExec.runMirToBlock
   have hmb : mirSegmentBound (Anneal.MirLoops.countToNBody n) = 7 := rfl
   rw [hmb]
   simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
@@ -9641,6 +10065,172 @@ theorem live_runMirToBlock_conflates_halt_stuck_outOfFuel (n : Nat) :
       runUntilTarget (mirStep body) atHdr 1 sOOF = .outOfFuel ∧
       Anneal.FunctionalTranslation.runMirToBlock 2 body 1 sOOF = none :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### No overshoot and completeness of live `runMirToBlock` -/
+
+/-- **No overshoot on live MIR**: a `.reached s_hit` outcome of `runMirToBlock`
+is the *first* re-entry into `(target, 0)` after the mandatory step, within the
+CFG-derived ceiling `mirSegmentBound body` (unique by `FirstHitIn.unique`). -/
+theorem firstHitIn_of_runMirToBlock_reached {body : CapturedMir} {target : BasicBlockIdx}
+    {s s_hit : MachineState}
+    (h : PureMirExec.runMirToBlock body target s = .reached s_hit) :
+    ∃ n, n ≤ mirSegmentBound body ∧
+      FirstHitIn (mirStep body)
+        (fun ms => ms.frame.blockIdx == target && ms.frame.stmtIdx == 0) n s s_hit :=
+  firstHitIn_of_runToTarget_reached h
+
+/-- **Completeness on live MIR**: every first re-entry into `(target, 0)` whose
+silent prefix fits the CFG-derived ceiling is found by `runMirToBlock`. -/
+theorem runMirToBlock_of_firstHitIn {body : CapturedMir} {target : BasicBlockIdx}
+    {n : Nat} {s s_hit : MachineState}
+    (h : FirstHitIn (mirStep body)
+      (fun ms => ms.frame.blockIdx == target && ms.frame.stmtIdx == 0) n s s_hit)
+    (hle : n ≤ mirSegmentBound body) :
+    PureMirExec.runMirToBlock body target s = .reached s_hit :=
+  runToTarget_of_firstHitIn h hle
+
+/-! ### `MirFragment`-keyed loop-lifting entrypoints (`inferMinFragment ≤ .pureBoundedLoop`)
+
+These gates take the live minimal-fragment classifier verdict
+`inferMinFragment c.body ≤ .pureBoundedLoop` (plus the auto-discharged
+`hasNoPtrRelationalAssign`) instead of a raw `checkPureMir` certificate, so the
+`.pureBoundedLoop` level of the `MirFragment` lattice routes directly to
+header-targeted `runMirToBlock` + `forRangeUp` loop lifting. -/
+
+/-- **`MirFragment`-keyed stateless loop gate** (`VerificationResult`). -/
+theorem verifyMirNoPanic_forRangeUp_of_inferMinFragment_le_pureBoundedLoop {α : Type}
+    (c : Claim)
+    (h_frag : inferMinFragment c.body ≤ .pureBoundedLoop)
+    (headerBb : BasicBlockIdx)
+    (lo hi : List Value → Nat)
+    (init : List Value → α)
+    (f : (args : List Value) → (i : Nat) → lo args ≤ i → i < hi args → α → α)
+    (stateAt : List Value → Nat → α → PureState)
+    (hle : ∀ args, c.pre args → lo args ≤ hi args)
+    (hentry : ∀ args, c.pre args →
+      PureMirExec.runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+        .reached ((stateAt args (lo args) (init args)).toMachineState emptyMemory))
+    (hiter : ∀ args, c.pre args → ∀ i (hlo : lo args ≤ i) (hlt : i < hi args) a,
+      PureMirExec.runMirToBlock c.body headerBb ((stateAt args i a).toMachineState emptyMemory) =
+        .reached ((stateAt args (i + 1) (f args i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∀ args, c.pre args → ∃ retVal mem',
+      PureMirExec.runMirToBlock c.body headerBb
+        ((stateAt args (hi args)
+          (Anneal.MirLoops.forRangeUp (lo args) (hi args) (init args) (f args))).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem')) ∧ c.post args retVal)
+    (h_no_ptr_rel : hasNoPtrRelationalAssign c.body = true := by decide) :
+    VerificationResult c :=
+  verifyMirNoPanic_forRangeUp_of_runMirToBlock c
+    (checkPureMir_of_inferMinFragment_le_pureBoundedLoop c.body h_frag h_no_ptr_rel)
+    headerBb lo hi init f stateAt hle hentry hiter hexit
+
+/-- **`MirFragment`-keyed stateful loop gate** (`StatefulVerificationResult`). -/
+theorem verifyStatefulMirNoPanic_forRangeUp_of_inferMinFragment_le_pureBoundedLoop {α : Type}
+    (c : StatefulClaim)
+    (h_frag : inferMinFragment c.body ≤ .pureBoundedLoop)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (headerBb : BasicBlockIdx)
+    (lo hi : List Value → Memory → Nat)
+    (init : List Value → Memory → α)
+    (f : (args : List Value) → (mem : Memory) → (i : Nat) → lo args mem ≤ i → i < hi args mem → α → α)
+    (stateAt : List Value → Memory → Nat → α → PureState)
+    (hle : ∀ args mem, c.pre args mem → lo args mem ≤ hi args mem)
+    (hentry : ∀ args mem, c.pre args mem →
+      PureMirExec.runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (lo args mem) (init args mem)).toMachineState emptyMemory))
+    (hiter : ∀ args mem, c.pre args mem → ∀ i (hlo : lo args mem ≤ i) (hlt : i < hi args mem) a,
+      PureMirExec.runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (i + 1) (f args mem i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∀ args mem, c.pre args mem → ∃ retVal mem_e,
+      PureMirExec.runMirToBlock c.body headerBb
+        ((stateAt args mem (hi args mem)
+          (Anneal.MirLoops.forRangeUp (lo args mem) (hi args mem) (init args mem) (f args mem))).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem_e)) ∧
+        c.post args mem retVal
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees).memory)
+    (h_no_ptr_rel : hasNoPtrRelationalAssign c.body = true := by decide) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirNoPanic_forRangeUp_of_runMirToBlock c
+    (checkPureMir_of_inferMinFragment_le_pureBoundedLoop c.body h_frag h_no_ptr_rel)
+    h_root headerBb lo hi init f stateAt hle hentry hiter hexit
+
+/-- **`MirFragment`-keyed total-correctness loop gate** (`TotalVerificationResult`). -/
+theorem verifyTotalMir_forRangeUp_of_inferMinFragment_le_pureBoundedLoop {α : Type}
+    (c : TotalClaim)
+    (h_frag : inferMinFragment c.body ≤ .pureBoundedLoop)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (headerBb : BasicBlockIdx)
+    (lo hi : List Value → Memory → Nat)
+    (init : List Value → Memory → α)
+    (f : (args : List Value) → (mem : Memory) → (i : Nat) → lo args mem ≤ i → i < hi args mem → α → α)
+    (stateAt : List Value → Memory → Nat → α → PureState)
+    (hle : ∀ args mem, c.pre args mem → lo args mem ≤ hi args mem)
+    (hentry : ∀ args mem, c.pre args mem →
+      PureMirExec.runMirToBlock c.body headerBb ((initPureState c.body args).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (lo args mem) (init args mem)).toMachineState emptyMemory))
+    (hiter : ∀ args mem, c.pre args mem → ∀ i (hlo : lo args mem ≤ i) (hlt : i < hi args mem) a,
+      PureMirExec.runMirToBlock c.body headerBb ((stateAt args mem i a).toMachineState emptyMemory) =
+        .reached ((stateAt args mem (i + 1) (f args mem i hlo hlt a)).toMachineState emptyMemory))
+    (hexit : ∀ args mem, c.pre args mem → ∃ retVal mem_e,
+      PureMirExec.runMirToBlock c.body headerBb
+        ((stateAt args mem (hi args mem)
+          (Anneal.MirLoops.forRangeUp (lo args mem) (hi args mem) (init args mem) (f args mem))).toMachineState emptyMemory) =
+        .halted (.normal (retVal, mem_e)) ∧
+        c.post args mem retVal
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees).memory)
+    (h_no_ptr_rel : hasNoPtrRelationalAssign c.body = true := by decide) :
+    TotalVerificationResult c :=
+  verifyTotalMir_forRangeUp_of_runMirToBlock c
+    (checkPureMir_of_inferMinFragment_le_pureBoundedLoop c.body h_frag h_no_ptr_rel)
+    h_root headerBb lo hi init f stateAt hle hentry hiter hexit
+
+/-- The live classifier places every `Anneal.MirLoops.countToNBody n` at or below
+`.pureBoundedLoop`. -/
+theorem inferMinFragment_countToNBody_le_pureBoundedLoop (n : Nat) :
+    inferMinFragment (Anneal.MirLoops.countToNBody n) ≤ .pureBoundedLoop := by
+  rw [inferMinFragment_countToNBody]
+  exact Nat.le_refl _
+
+/-- Stateless `VerificationResult` for `Anneal.MirLoops.countToNBody n` routed by
+the live `MirFragment` classifier (`.pureBoundedLoop`) with zero fuel numerals. -/
+theorem live_countToN_verifyMir_all_n_of_fragment (n : Nat) (hn : n < 4294967296) :
+    VerificationResult
+      { body := Anneal.MirLoops.countToNBody n
+        pre := fun args => ∃ v₀, args = [v₀]
+        post := fun _ retVal => retVal = .scalar ⟨n, 4⟩
+        callees := [] } :=
+  verifyMirNoPanic_forRangeUp_of_inferMinFragment_le_pureBoundedLoop _
+    (inferMinFragment_countToNBody_le_pureBoundedLoop n) 1
+    (fun _ => 0) (fun _ => n) (fun _ => ()) (fun _ _ _ _ u => u)
+    (fun _ i _ => countToNPureState 1 0 i)
+    (fun _ _ => Nat.zero_le n)
+    (fun args ⟨v₀, hargs⟩ => by subst hargs; exact runMirToBlock_countToN_entry_initPureState n v₀)
+    (fun _ _ i _ hlt _ => runMirToBlock_countToN_iter_initPureState n i hlt hn)
+    (fun _ _ => ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToN_exit_initPureState n, rfl⟩)
+    rfl
+
+/-- **End-to-end `TotalVerificationResult` for live `Anneal.MirLoops.countToNBody n`
+routed by the live `MirFragment` classifier** (`.pureBoundedLoop`), over every
+symbolic `n < 2^32` and root-active memory, with zero fuel numerals. -/
+theorem live_countToN_totalVerificationResult_all_n_of_fragment (n : Nat) (hn : n < 4294967296) :
+    TotalVerificationResult
+      { body := Anneal.MirLoops.countToNBody n
+        pre := fun args mem => (∃ v₀, args = [v₀]) ∧ RootActiveMemory mem
+        post := fun _ mem retVal mem' =>
+          mem' = mem ∧ retVal = .scalar ⟨n, 4⟩
+        callees := [] } :=
+  verifyTotalMir_forRangeUp_of_inferMinFragment_le_pureBoundedLoop _
+    (inferMinFragment_countToNBody_le_pureBoundedLoop n)
+    (fun _ _ hp => hp.2) 1
+    (fun _ _ => 0) (fun _ _ => n) (fun _ _ => ()) (fun _ _ _ _ _ u => u)
+    (fun _ _ i _ => countToNPureState 1 0 i)
+    (fun _ _ _ => Nat.zero_le n)
+    (fun args _ ⟨⟨v₀, hargs⟩, _⟩ => by rw [hargs]; exact runMirToBlock_countToN_entry_initPureState n v₀)
+    (fun _ _ _ i _ hlt _ => runMirToBlock_countToN_iter_initPureState n i hlt hn)
+    (fun _ _ _ => ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToN_exit_initPureState n, rfl, rfl⟩)
+    rfl
 
 end FuelFreeLoops
 

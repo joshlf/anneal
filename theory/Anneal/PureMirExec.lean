@@ -25938,41 +25938,41 @@ def mirSegmentBound (body : CapturedMir) : Nat :=
 
 /-- Header-targeted stepping over live MIR: takes one mandatory step and stops
 at the first statement of basic block `target`. -/
-def runMirToBlock (body : CapturedMir) (target : BasicBlockIdx) (s : MachineState) :
+protected def runMirToBlock (body : CapturedMir) (target : BasicBlockIdx) (s : MachineState) :
     TargetOutcome MachineState MirOutcome :=
   runToTarget (mirStep body)
     (fun ms => ms.frame.blockIdx == target && ms.frame.stmtIdx == 0) (mirSegmentBound body) s
 
 theorem runMirToBlock_reached_block_and_stmt {body : CapturedMir}
     {target : BasicBlockIdx} {s s' : MachineState}
-    (h : runMirToBlock body target s = .reached s') :
+    (h : PureMirExec.runMirToBlock body target s = .reached s') :
     s'.frame.blockIdx = target ∧ s'.frame.stmtIdx = 0 := by
-  unfold runMirToBlock at h
+  unfold PureMirExec.runMirToBlock at h
   have ht0 := runToTarget_reached_atTarget h
   have ht := Bool.and_eq_true_iff.mp ht0
   exact ⟨beq_iff_eq.mp ht.1, beq_iff_eq.mp ht.2⟩
 
 theorem mirStepsConverges_of_runMirToBlock_reached {body : CapturedMir}
     {target : BasicBlockIdx} {s s' : MachineState} {post : MirOutcome → Prop}
-    (h : runMirToBlock body target s = .reached s') :
+    (h : PureMirExec.runMirToBlock body target s = .reached s') :
     Anneal.MirFuelFree.MirStepsConverges body s (· = s') post :=
   mirStepsConverges_of_stepsTo (stepsTo_of_runToTarget_reached h)
 
 theorem mirWpConverges_of_runMirToBlock_halted {body : CapturedMir}
     {target : BasicBlockIdx} {s : MachineState} {v : MirOutcome} {post : MirOutcome → Prop}
-    (h : runMirToBlock body target s = .halted v) (hp : post v) :
+    (h : PureMirExec.runMirToBlock body target s = .halted v) (hp : post v) :
     Anneal.MirFuelFree.MirWpConverges body s post :=
   mirWpConverges_of_wpConverges (wpConverges_of_runToTarget_halted h hp)
 
 theorem mirNoCallWpConverges_of_runMirToBlock_halted {body : CapturedMir}
     {target : BasicBlockIdx} {s : MachineState} {v : MirOutcome} {post : MirOutcome → Prop}
-    (h : runMirToBlock body target s = .halted v) (hp : post v) :
+    (h : PureMirExec.runMirToBlock body target s = .halted v) (hp : post v) :
     Anneal.MirFuelFree.MirNoCallWpConverges body s post :=
   mirNoCallWpConverges_of_wpConverges (wpConverges_of_runToTarget_halted h hp)
 
 theorem not_wpConverges_of_runMirToBlock_stuck {body : CapturedMir}
     {target : BasicBlockIdx} {s : MachineState} {post : MirOutcome → Prop}
-    (h : runMirToBlock body target s = .stuck) :
+    (h : PureMirExec.runMirToBlock body target s = .stuck) :
     ¬ WpConverges (mirStep body) s post :=
   not_wpConverges_of_runToTarget_stuck h
 
@@ -25992,7 +25992,7 @@ theorem pureMirConverges_of_wpConverges {body : CapturedMir} {ps : PureState}
 
 theorem pureMirStepsConverges_of_runMirToBlock_reached {body : CapturedMir}
     {target : BasicBlockIdx} {ps ps' : PureState} {post : Value → Prop}
-    (h : runMirToBlock body target (ps.toMachineState emptyMemory) =
+    (h : PureMirExec.runMirToBlock body target (ps.toMachineState emptyMemory) =
       .reached (ps'.toMachineState emptyMemory)) :
     PureMirStepsConverges body ps (· = ps') post := by
   have hs := stepsTo_of_runToTarget_reached h
@@ -26002,7 +26002,7 @@ theorem pureMirStepsConverges_of_runMirToBlock_reached {body : CapturedMir}
 
 theorem pureMirConverges_of_runMirToBlock_halted {body : CapturedMir}
     {target : BasicBlockIdx} {ps : PureState} {v : Value} {mem : Memory} {post : Value → Prop}
-    (h : runMirToBlock body target (ps.toMachineState emptyMemory) =
+    (h : PureMirExec.runMirToBlock body target (ps.toMachineState emptyMemory) =
       .halted (.normal (v, mem)))
     (hp : post v) :
     PureMirConverges body ps post :=
@@ -26090,10 +26090,10 @@ iff taking one mandatory `mirStep` (`mirStep body s = .cont s₁`) followed by t
 live `Anneal.FunctionalTranslation.runMirToBlock` reaches `s_hit`. -/
 theorem runMirToBlock_reached_iff_step_and_live (body : CapturedMir)
     (target : BasicBlockIdx) (s s_hit : MachineState) :
-    runMirToBlock body target s = .reached s_hit ↔
+    PureMirExec.runMirToBlock body target s = .reached s_hit ↔
       ∃ s₁, mirStep body s = .cont s₁ ∧
         Anneal.FunctionalTranslation.runMirToBlock (mirSegmentBound body + 1) body target s₁ = some s_hit := by
-  unfold runMirToBlock runToTarget
+  unfold PureMirExec.runMirToBlock runToTarget
   cases hs : mirStep body s with
   | cont s₁ =>
     rw [runUntilTarget_reached_iff_live_runMirToBlock]
