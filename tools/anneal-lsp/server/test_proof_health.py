@@ -4280,5 +4280,135 @@ class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
         self.assertEqual(inc_a, cold_a)
 
 
+class TestB3PinAndScopeProperties(unittest.TestCase):
+    """`[adv ep2-B3]` seeded property tests: for random docstring / `cmd in` prefix / attribute /
+    modifier / comment arrangements, `compute_*_pins` and the audit agree (a freshly pinned
+    waiver is clean, a body edit drifts, neighbour edits do not, `check_trusted.py` computes the
+    same pins), and the vacuity scopes are monotone (`annotated-only` ⊆ `annotated` ⊆ `all`)."""
+
+    _LEAN_PREFIXES = ["set_option maxHeartbeats 400000 in\n", "open Foo in\n", "variable (k : Nat) in\n",
+                      "set_option maxHeartbeats\n  400000 in\n", "attribute [local simp] foo in\n"]
+    _LEAN_PLAIN = ["/- plain note -/\n", "-- line note\n", "/- far -/\n\n\n\n" + " " * 70 + "\n"]
+    _LEAN_ATTRS = ["@[simp]\n", "@[aesop safe [constructors]]\n", "@[simp] ", ""]
+    _LEAN_MODS = ["private ", "noncomputable ", "protected ", ""]
+    _LEAN_KINDS = [("theorem", ": True := trivial"), ("def", ": Nat := 7"),
+                   ("theorem", "(n : Nat) : n + 0 = n := by\n  simp")]
+
+    def test_lean_waiver_pins_consistent_across_random_arrangements(self) -> None:
+        import random
+
+        rnd = random.Random(1114)
+        ct = _load_check_trusted()
+        failures = []
+        for it in range(120):
+            name = f"target{it}"
+            pre = "".join(rnd.choice(self._LEAN_PREFIXES) for _ in range(rnd.randint(0, 2)))
+            plain = rnd.choice(self._LEAN_PLAIN) if rnd.random() < 0.3 else ""
+            meta = "Kind: helper\nWitness: universal\nAssumes: S3\n" if rnd.random() < 0.5 else ""
+            directive = rnd.choice(["anneal:documented_intent kept", "anneal:pinned_compiler_coupled rustc 1.90",
+                                    'anneal:trusted reason = "audited"'])
+            doc = f"/--\nWaived thing.\n{meta}{directive}\nPIN\n-/\n"
+            post = rnd.choice(self._LEAN_PREFIXES) if rnd.random() < 0.3 else ""
+            kw, rest = rnd.choice(self._LEAN_KINDS)
+            decl = f"{kw} {name} {rest}\n"
+            block = pre + plain + doc + post + rnd.choice(self._LEAN_ATTRS) + rnd.choice(self._LEAN_MODS) + decl
+            text = "def before : Nat := 0\n\n" + block + "\ndef after : Nat := 1\n"
+            draft = text.replace("PIN\n", "")
+            pins = proof_health.compute_lean_decl_pins(draft)
+            if name not in pins or ct.compute_lean_decl_pins(draft) != pins:
+                failures.append((it, "pins", block))
+                continue
+            pinned = text.replace("PIN", pins[name])
+            edited = pinned.replace(
+                decl, decl.replace("trivial", "True.intro").replace(":= 7", ":= 8").replace("simp", "omega"), 1
+            )
+            neighbours = pinned.replace("before : Nat := 0", "before : Nat := 5").replace(
+                "after : Nat := 1", "after : Nat := 9"
+            )
+            got = (
+                _rules(audit.scan_lean_text(pinned, check_3axis=False)),
+                _rules(audit.scan_lean_text(edited, check_3axis=False)),
+                _rules(audit.scan_lean_text(neighbours, check_3axis=False)),
+            )
+            if got != ([], [audit.RULE_DRIFTED_WAIVER_PIN], []):
+                failures.append((it, got, block))
+        self.assertEqual(failures, [])
+
+    def test_rust_waiver_pins_consistent_across_random_arrangements(self) -> None:
+        import random
+
+        attrs = ["#[repr(C)]\n", "#[derive(Clone, Copy)]\n", '#[deprecated(note = "use foo[0]; {x}")]\n',
+                 "# [inline]\n", "#[cfg(all())]\n", '#[doc = "plain prose"]\n', "#[allow(dead_code)] ", ""]
+        items = [
+            "pub fn {n}() -> u32 {{ 7 }}",
+            "pub fn {n}<T: Copy>(x: T) -> T where T: PartialOrd<T> {{ if 1 << 2 <= 4 {{ x }} else {{ x }} }}",
+            "pub struct {n} {{ pub a: u8, pub b: u32 }}",
+            "pub enum {n} {{ A = 1, B = 2 }}",
+            "pub const {n}: u32 = 7;",
+            "pub trait {n} {{ fn f(&self) -> u8; }}",
+            "pub type {n} = [u8; 4];",
+        ]
+        rnd = random.Random(1115)
+        ct = _load_check_trusted()
+        failures = []
+        for it in range(120):
+            name = f"target_{it}"
+            directive = rnd.choice(["anneal:documented_intent kept for ABI parity", "anneal:allow_compile_time_guard",
+                                    'anneal:trusted reason = "audited by hand"'])
+            doc = rnd.choice(["/// Waived item.\n", '#[doc = " Waived item."]\n', ""]) + "/// " + directive + "\nPIN"
+            item = rnd.choice(items).format(n=name) + "\n"
+            block = (
+                "".join(rnd.choice(attrs) for _ in range(rnd.randint(0, 2)))
+                + doc
+                + "".join(rnd.choice(attrs) for _ in range(rnd.randint(0, 2)))
+                + item
+            )
+            text = "pub fn before() -> u8 { 0 }\n\n" + block + "\npub fn after() -> u8 { 1 }\n"
+            draft = text.replace("PIN", "")
+            pins = proof_health.compute_rust_item_pins(draft)
+            if name not in pins or ct.compute_rust_item_pins(draft) != pins:
+                failures.append((it, "pins", block))
+                continue
+            pinned = text.replace("PIN", "/// " + pins[name] + "\n")
+            edited = pinned.replace(item, item.replace("7", "8").replace("u8", "u16").replace("4", "5").replace("A = 1", "A = 3"), 1)
+            neighbours = pinned.replace("{ 0 }", "{ 5 }").replace("{ 1 }", "{ 9 }")
+            got = (
+                _rules(audit.scan_rust_text(pinned)),
+                _rules(audit.scan_rust_text(edited)),
+                _rules(audit.scan_rust_text(neighbours)),
+            )
+            expected = ([], [audit.RULE_DRIFTED_WAIVER_PIN], [])
+            if "#[repr(C)]" in block:
+                got += (_rules(audit.scan_rust_text(pinned.replace("#[repr(C)]", "#[repr(packed)]", 1))),)
+                expected += ([audit.RULE_DRIFTED_WAIVER_PIN],)
+            if got != expected:
+                failures.append((it, got, block))
+        self.assertEqual(failures, [])
+
+    def test_vacuity_scopes_are_monotone_on_random_files(self) -> None:
+        import random
+
+        rnd = random.Random(1116)
+        snippets = TestB1IncrementalAndSpanSoundness._SNIPPETS
+        failures = []
+        for it in range(30):
+            text = TestB1IncrementalAndSpanSoundness._corpus(random.Random(rnd.randrange(10**6)))
+            for _ in range(rnd.randint(0, 8)):
+                pos = rnd.randrange(len(text))
+                text = text[:pos] + rnd.choice(snippets) + text[pos:]
+            proof_health.clear_in_process_caches()
+
+            def keyed(scope: str) -> set:
+                return {
+                    (f.rule, f.line, f.symbol, f.message)
+                    for f in proof_health.audit_lean_text(text, file_path="X.lean", vacuity_scope=scope)
+                }
+
+            only, annotated, everything = keyed("annotated-only"), keyed("annotated"), keyed("all")
+            if not (only <= annotated <= everything):
+                failures.append(it)
+        self.assertEqual(failures, [])
+
+
 if __name__ == "__main__":
     unittest.main()

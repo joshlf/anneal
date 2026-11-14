@@ -43,6 +43,13 @@ the `BEGIN/END SHARED WAIVER-PIN & 3-AXIS AUDITOR` banners, byte-identical in
 Also provides delta-only post-edit checking (`check_post_edit_proof_health`) for
 `tools/anneal-lsp/hooks/post_tool_use.py`, unbatched tool-call latency telemetry
 (`compute_unbatched_tool_latencies`), and a CLI (`python3 proof_health.py --help`).
+
+Performance: `scan_lean_text` memoizes whole-file results by exact content (plus sibling
+declaration-list identity), and in a long-lived process re-scans a localized edit of a large
+file (>= 32 KiB) by splicing: only a window of whole column-0 theorems around the edit is
+re-scanned, guarded by a neutral-lexer-state sentinel and exact outer-ring code equality, and
+anything else falls back to a full scan (`INCREMENTAL_SPLICING`; the TCB checker disables it).
+Seeded property tests check spliced results against cold full scans.
 """
 
 from __future__ import annotations

@@ -97,3 +97,7 @@ one in `tools/anneal-lsp/server/proof_health.py`) the `S0`-`S3` waiver auditor:
   root. Final-component symlinks are rejected for both.
 - The embedded auditor never splices findings across scans here
   (`INCREMENTAL_SPLICING = False`): every staged file gets one cold, full audit.
+- Scope note: a pin binds the declaration's own text (with its `cmd in` prefixes and
+  doc directives), not its elaboration context: section-level `open`, `variable`,
+  `set_option`, or notation commands above it can still change its meaning without
+  drifting the pin.
