@@ -654,29 +654,55 @@ impl MiriToolchain {
     /// `~/.rustup/toolchains/nightly-2026-06-01-*` and `~/.cache/miri`
     /// locations.
     ///
-    /// Returns an `Err` if any component is missing.
+    /// Returns an `Err` if any component is missing. All three paths are
+    /// absolute: they are validated against the current directory, but `rustc`,
+    /// `miri`, and `--sysroot` are consumed by children spawned with
+    /// `current_dir(corpus_root)`, which would re-resolve a relative path
+    /// against a different directory.
     pub fn resolve(
         explicit_rustc: Option<&Path>,
         explicit_miri: Option<&Path>,
         explicit_sysroot: Option<&Path>,
     ) -> Result<Self, String> {
-        let rustc_bin = resolve_tool_path(
+        Self::resolve_with(
             explicit_rustc,
-            "ANNEAL_MIRI_RUSTC",
-            "rustc",
-        )?;
-        let miri_bin = resolve_tool_path(
             explicit_miri,
-            "ANNEAL_MIRI_BIN",
-            "miri",
-        )?;
-        let miri_sysroot = resolve_sysroot_path(explicit_sysroot)?;
+            explicit_sysroot,
+            &process_env_var,
+            ensure_miri_sysroot_initialized,
+        )
+    }
+
+    fn resolve_with<P>(
+        explicit_rustc: Option<&Path>,
+        explicit_miri: Option<&Path>,
+        explicit_sysroot: Option<&Path>,
+        get_env: EnvLookup<'_>,
+        provision_default: P,
+    ) -> Result<Self, String>
+    where
+        P: FnOnce(&Path) -> Result<PathBuf, String>,
+    {
+        let rustc_bin =
+            resolve_tool_path_with(explicit_rustc, get_env, "ANNEAL_MIRI_RUSTC", "rustc")?;
+        let miri_bin = resolve_tool_path_with(explicit_miri, get_env, "ANNEAL_MIRI_BIN", "miri")?;
+        let miri_sysroot = resolve_sysroot_path_with(explicit_sysroot, get_env, provision_default)?;
         Ok(Self {
             rustc_bin,
             miri_bin,
             miri_sysroot,
         })
     }
+}
+
+/// `path` anchored to the current directory (symlinks and `..` are kept).
+///
+/// Every path the toolchain resolver validates is returned in this form, so
+/// the file that was checked is the file a child spawned with a different
+/// `current_dir` (or handed `--sysroot <path>`) actually uses.
+fn absolutize(path: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(path)
+        .map_err(|err| format!("failed to make {} absolute: {err}", path.display()))
 }
 
 fn find_executable_in_path_with(get_env: EnvLookup<'_>, tool_name: &str) -> Option<PathBuf> {
@@ -702,14 +728,6 @@ fn find_executable_in_path_with(get_env: EnvLookup<'_>, tool_name: &str) -> Opti
     None
 }
 
-fn resolve_tool_path(
-    explicit: Option<&Path>,
-    env_var: &str,
-    tool_name: &str,
-) -> Result<PathBuf, String> {
-    resolve_tool_path_with(explicit, &process_env_var, env_var, tool_name)
-}
-
 fn resolve_tool_path_with(
     explicit: Option<&Path>,
     get_env: EnvLookup<'_>,
@@ -717,8 +735,9 @@ fn resolve_tool_path_with(
     tool_name: &str,
 ) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
+        let path = absolutize(path)?;
         if path.is_file() {
-            return Ok(path.to_path_buf());
+            return Ok(path);
         }
         return Err(format!(
             "explicit {tool_name} binary does not exist: {}",
@@ -727,7 +746,7 @@ fn resolve_tool_path_with(
     }
     if let Some(val) = non_empty_env_str(get_env, env_var) {
         if val.chars().any(std::path::is_separator) {
-            let p = PathBuf::from(&val);
+            let p = absolutize(Path::new(&val))?;
             if p.is_file() {
                 return Ok(p);
             }
@@ -736,18 +755,22 @@ fn resolve_tool_path_with(
                 p.display()
             ));
         }
-        return find_executable_in_path_with(get_env, &val).ok_or_else(|| {
-            format!("{env_var} points to non-existent {tool_name} binary: {val} (not found on PATH)")
-        });
+        let found = find_executable_in_path_with(get_env, &val).ok_or_else(|| {
+            format!(
+                "{env_var} points to non-existent {tool_name} binary: {val} (not found on PATH)"
+            )
+        })?;
+        return absolutize(&found);
     }
     let home = non_empty_env_str(get_env, "HOME").map(PathBuf::from);
     if tool_name == "miri" {
         if let Some(path_miri) = find_executable_in_path_with(get_env, "miri") {
+            let path_miri = absolutize(&path_miri)?;
             let cargo_home = non_empty_env_str(get_env, "CARGO_HOME")
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
             let is_cargo_proxy = cargo_home
-                .map(|c| c.join("bin/miri"))
+                .and_then(|c| absolutize(&c.join("bin/miri")).ok())
                 .is_some_and(|p| p == path_miri);
             if !is_cargo_proxy {
                 return Ok(path_miri);
@@ -778,7 +801,7 @@ fn resolve_tool_path_with(
                 .collect();
             candidates.sort();
             if let Some(first) = candidates.into_iter().next() {
-                return Ok(first);
+                return absolutize(&first);
             }
         }
     }
@@ -786,10 +809,6 @@ fn resolve_tool_path_with(
         "could not locate pinned nightly-2026-06-01 '{tool_name}' binary \
          (set {env_var} or install the nightly-2026-06-01 toolchain)"
     ))
-}
-
-fn resolve_sysroot_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    resolve_sysroot_path_with(explicit, &process_env_var, ensure_miri_sysroot_initialized)
 }
 
 /// Environment lookup injected into the Miri sysroot resolver.
@@ -833,8 +852,9 @@ where
     P: FnOnce(&Path) -> Result<PathBuf, String>,
 {
     if let Some(path) = explicit {
+        let path = absolutize(path)?;
         if path.join("lib/rustlib").is_dir() {
-            return Ok(path.to_path_buf());
+            return Ok(path);
         }
         return Err(format!(
             "explicit Miri sysroot is missing lib/rustlib: {}",
@@ -842,7 +862,7 @@ where
         ));
     }
     if let Some(val) = non_empty_env_str(get_env, "ANNEAL_MIRI_SYSROOT") {
-        let p = PathBuf::from(val);
+        let p = absolutize(Path::new(&val))?;
         if p.join("lib/rustlib").is_dir() {
             return Ok(p);
         }
@@ -852,7 +872,7 @@ where
         ));
     }
     if let Some(home) = non_empty_env_str(get_env, "HOME") {
-        return provision_default(&PathBuf::from(home).join(".cache/miri"));
+        return provision_default(&absolutize(&PathBuf::from(home).join(".cache/miri"))?);
     }
     Err(
         "Miri sysroot not found at ~/.cache/miri (or ANNEAL_MIRI_SYSROOT); \
@@ -3157,6 +3177,86 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     }
 
     #[test]
+    fn resolved_toolchain_paths_are_absolute_so_corpus_root_children_use_the_validated_files() {
+        // Unit tests run with the package root as the working directory.
+        let cwd = env::current_dir().expect("current dir");
+        assert!(
+            cwd.join("Cargo.toml").is_file(),
+            "expected to run from the cargo-anneal package root, got {}",
+            cwd.display()
+        );
+        let temp = unique_oracle_temp_dir("toolchain-absolute-paths");
+        let sysroot = temp.join("sysroot");
+        fs::create_dir_all(sysroot.join("lib/rustlib")).expect("create lib/rustlib");
+        let never_provision = |candidate: &Path| -> Result<PathBuf, String> {
+            panic!(
+                "an explicit sysroot must not be provisioned: {}",
+                candidate.display()
+            )
+        };
+
+        // Relative explicit tool paths (validated against the cwd) come back
+        // anchored to the cwd, never as a bare/relative program name that a
+        // `current_dir(corpus_root)` spawn would resolve elsewhere.
+        let toolchain = MiriToolchain::resolve_with(
+            Some(Path::new("Cargo.toml")),
+            Some(Path::new("./Cargo.toml")),
+            Some(&sysroot),
+            &env_map(&[]),
+            never_provision,
+        )
+        .expect("resolve toolchain from explicit paths");
+        assert_eq!(toolchain.rustc_bin, cwd.join("Cargo.toml"));
+        assert!(
+            toolchain.miri_bin.is_absolute(),
+            "{}",
+            toolchain.miri_bin.display()
+        );
+        assert_eq!(
+            fs::canonicalize(&toolchain.miri_bin).expect("canonicalize miri_bin"),
+            fs::canonicalize(cwd.join("Cargo.toml")).expect("canonicalize Cargo.toml")
+        );
+        assert_eq!(toolchain.miri_sysroot, sysroot);
+
+        // A relative env override with a separator is anchored the same way.
+        let get_env = env_map(&[("ANNEAL_MIRI_RUSTC", OsStr::new("src/../Cargo.toml"))]);
+        let rustc = resolve_tool_path_with(None, &get_env, "ANNEAL_MIRI_RUSTC", "rustc")
+            .expect("relative ANNEAL_MIRI_RUSTC resolves");
+        assert_eq!(rustc, cwd.join("src/../Cargo.toml"));
+
+        // Diagnostics name the absolute location that was actually checked.
+        let err = resolve_sysroot_path_with(
+            None,
+            &env_map(&[(
+                "ANNEAL_MIRI_SYSROOT",
+                OsStr::new("no-such-relative-sysroot"),
+            )]),
+            never_provision,
+        )
+        .expect_err("missing relative sysroot must fail closed");
+        let expected = cwd.join("no-such-relative-sysroot");
+        assert!(
+            err.contains(&expected.display().to_string()),
+            "error must name {}: {err}",
+            expected.display()
+        );
+        let err = resolve_sysroot_path_with(
+            Some(Path::new("no-such-explicit-sysroot")),
+            &env_map(&[]),
+            never_provision,
+        )
+        .expect_err("missing explicit sysroot must fail closed");
+        assert!(
+            err.contains(&cwd.join("no-such-explicit-sysroot").display().to_string()),
+            "unexpected error: {err}"
+        );
+        assert!(!cwd.join("no-such-relative-sysroot").exists());
+        assert!(!cwd.join("no-such-explicit-sysroot").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn unopenable_setup_lock_fails_closed_without_running_setup() {
         // Parity with the staged launcher's exit-74 path: a `.setup.lock` that
         // cannot be opened (here: a directory) is a hard error, never an
@@ -3316,12 +3416,18 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     }
 
     /// R4 regression guard: `cargo-anneal` unit tests share one process, so a
-    /// test that mutates the process environment races every test that reads
-    /// it. Inject configuration instead (see `EnvLookup`).
+    /// test that mutates the process environment or working directory races
+    /// every test that reads it (relative-path validation and `absolutize`
+    /// both depend on a stable cwd). Inject configuration instead (see
+    /// `EnvLookup`) and pass `Command::current_dir` to children.
     #[test]
     fn cargo_anneal_sources_never_mutate_the_process_environment() {
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let forbidden = [concat!("set", "_var("), concat!("remove", "_var(")];
+        let forbidden = [
+            concat!("set", "_var("),
+            concat!("remove", "_var("),
+            concat!("set_current", "_dir("),
+        ];
         let mut stack = vec![src_dir];
         let mut offenders = Vec::new();
         while let Some(dir) = stack.pop() {
