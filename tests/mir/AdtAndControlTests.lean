@@ -408,6 +408,127 @@ theorem tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes :
      trivial⟩
   exact ⟨(h.2.1.2 hZero).2.1, (h.2.1.2 hZero).2.2, (h.2.2.1 rfl hInit).2.1⟩
 
+/--
+`[adv ep1-A3]` End-to-end test of `MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity`
+on `struct W(u32, PhantomData<T>)` (`u32 @ 0`, `() @ 4`, total size `4`, `.scalar` backend repr,
+where `usesSpanFallback` is `true` even though `backendRepr ≠ .memory`).
+-/
+def u32MarkerWorld : StructLayoutWorld := ⟨[0, 4], 4, 4⟩
+
+/-- Validity proof for `u32MarkerWorld` under `AdtRepr.rust`. -/
+theorem u32MarkerWorld_valid :
+    ValidStructLayoutWorld .rust none [⟨4, 4⟩, ⟨0, 1⟩] u32MarkerWorld :=
+  Anneal.Mir.AdtAndControl.SymbolicPairPad.toStructLayoutWorld_valid_reprRust
+    (f₀ := ⟨4, 4⟩) (f₁ := ⟨0, 1⟩)
+    ⟨0, 0, 0, false⟩ (by decide) (by decide) (by decide) (by decide)
+    (fun h => absurd h (by decide))
+
+def u32MarkerPlaced :
+    PlacedCodecSpine [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }, Unit] :=
+  .cons (0, ⟨4, 4⟩)
+    (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u32) (MirValueCodec.uintByteSize_pos .u32))
+    (.cons (4, ⟨0, 1⟩) FixedByteCodec.unit .nil)
+
+def u32MarkerLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false }
+
+def u32MarkerLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u32MarkerLayout] }
+
+/--
+Zero-boilerplate bit-validity for `struct W(u32, PhantomData<T>)` (`.scalar` backend repr with a ZST
+marker field) via `MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity`:
+satisfies `IsFromBytes`, `IsFromZeros`, `IsTryFromBytes`, and `IsIntoBytes`.
+-/
+theorem u32MarkerWorld_real_adt_span_surjective_bitValidity :
+    let ty : Ty := { kind := .adt "demo::W" [.uint .u32, .tuple []], layoutIdx := 0 }
+    IsFromBytes u32MarkerLayouts ty ∧
+    IsFromZeros u32MarkerLayouts ty ∧
+    IsTryFromBytes u32MarkerLayouts ty ∧
+    IsIntoBytes u32MarkerLayouts ty := by
+  intro ty
+  have hSurj : u32MarkerPlaced.AllFieldsSurjective :=
+    ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide),
+     FixedByteCodec.unit_isSurjectiveInitDecoder,
+     trivial⟩
+  have hInit : u32MarkerPlaced.AllFieldsInit :=
+    ⟨FixedByteCodec.uintBitsLE_isInitCodec 4 (by decide),
+     FixedByteCodec.unit_isInitCodec,
+     trivial⟩
+  have h := MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity u32MarkerWorld_valid
+    u32MarkerLayouts "demo::W" 0 u32MarkerLayout 0 [0, 1] u32MarkerPlaced
+    (.cons (TupleFieldCodec.uint _ .u32) (.cons (TupleFieldCodec.unit _) .nil))
+    rfl rfl rfl rfl rfl rfl rfl rfl hSurj
+  exact ⟨h.2.1.1, h.2.1.2.1, h.2.1.2.2, (h.2.2.1 rfl hInit).2.1⟩
+
+/--
+`[adv ep1-A3]` Populated `fieldLayouts = [1, 2, 3]` for `tightBoolU8ArrUnitWorld` as a real `.adt`
+struct `struct TightS3(bool, [u8; 2], ())`, exercising
+`MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity`.
+-/
+def boolFieldLayoutEntry : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def u8Arr2FieldLayoutEntry : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 16 false) ⟨0, 65535⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def unitFieldLayoutEntry : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
+
+def tightBoolU8ArrUnitAdtLayout : TypeLayout :=
+  { size := ⟨3⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨2⟩, ⟨0⟩, ⟨3⟩] [1, 0, 2], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [1, 2, 3] }
+
+def tightBoolU8ArrUnitAdtLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [tightBoolU8ArrUnitAdtLayout, boolFieldLayoutEntry,
+                u8Arr2FieldLayoutEntry, unitFieldLayoutEntry] }
+
+/--
+End-to-end test of `MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity` on
+`tightBoolU8ArrUnitWorld` as a real `.adt`: proves `IsFromZeros`, `IsTryFromBytes`, and `IsIntoBytes`
+for `struct TightS3(bool, [u8; 2], ())` with populated `fieldLayouts = [1, 2, 3]`.
+-/
+theorem tightBoolU8ArrUnitWorld_real_adt_fieldLayouts_bitValidity :
+    let ty : Ty := { kind := .adt "demo::TightS3" [.bool, .array (.uint .u8) 2, .tuple []], layoutIdx := 0 }
+    IsFromZeros tightBoolU8ArrUnitAdtLayouts ty ∧
+    IsTryFromBytes tightBoolU8ArrUnitAdtLayouts ty ∧
+    IsIntoBytes tightBoolU8ArrUnitAdtLayouts ty := by
+  intro ty
+  have hFlSound :
+      Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound
+        tightBoolU8ArrUnitAdtLayouts tightBoolU8ArrUnitPlaced [1, 2, 3] :=
+    .cons_primitive_bool rfl rfl rfl rfl rfl rfl
+      (.cons_primitive_surjective rfl rfl rfl rfl rfl (by decide)
+        (FixedByteCodec.array_isSurjectiveInitDecoder 2 FixedByteCodec.u8_isSurjectiveInitDecoder)
+        (.cons_zst_unit rfl rfl .nil))
+  have h := MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity
+    tightBoolU8ArrUnitWorld_valid tightBoolU8ArrUnitAdtLayouts "demo::TightS3" 0
+    tightBoolU8ArrUnitAdtLayout 0 [1, 0, 2] tightBoolU8ArrUnitPlaced
+    (.cons (TupleFieldCodec.bool _)
+      (.cons (TupleFieldCodec.u8Array _ 2)
+        (.cons (TupleFieldCodec.unit _) .nil)))
+    rfl rfl rfl rfl rfl rfl hFlSound
+  have hZero : tightBoolU8ArrUnitPlaced.AllFieldsZeroValid :=
+    ⟨FixedByteCodec.boolByte_hasZeroValid,
+     FixedByteCodec.array_hasZeroValid 2 FixedByteCodec.u8_hasZeroValid,
+     FixedByteCodec.unit_hasZeroValid,
+     trivial⟩
+  have hInit : tightBoolU8ArrUnitPlaced.AllFieldsInit :=
+    ⟨FixedByteCodec.boolByte_isInitCodec,
+     FixedByteCodec.array_isInitCodec 2 FixedByteCodec.u8_isInitCodec,
+     FixedByteCodec.unit_isInitCodec,
+     trivial⟩
+  exact ⟨(h.2.1.2 hZero).2.1, (h.2.1.2 hZero).2.2, (h.2.2.1 rfl hInit).2.1⟩
+
 /-- info: 'Anneal.Mir.AdtAndControl.PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.Mir.AdtAndControl.PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld
@@ -451,5 +572,21 @@ theorem tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes :
 /-- info: 'Anneal.Mir.AdtAndControlTests.reprCU8U32PairWorld_real_adt_bitValidity' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms reprCU8U32PairWorld_real_adt_bitValidity
+
+/-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity
+
+/-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity
+
+/-- info: 'Anneal.Mir.AdtAndControlTests.u32MarkerWorld_real_adt_span_surjective_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u32MarkerWorld_real_adt_span_surjective_bitValidity
+
+/-- info: 'Anneal.Mir.AdtAndControlTests.tightBoolU8ArrUnitWorld_real_adt_fieldLayouts_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms tightBoolU8ArrUnitWorld_real_adt_fieldLayouts_bitValidity
 
 end Anneal.Mir.AdtAndControlTests

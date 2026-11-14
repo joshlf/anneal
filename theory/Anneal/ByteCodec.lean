@@ -2002,6 +2002,113 @@ def uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx) :
           rw [hLenDef, hLenEq]
           rfl)
 
+/-- Byte width of `IntTy` on 64-bit targets (`1, 2, 4, 8, 16`), matching `intCastTargetBytes`. -/
+@[reducible]
+def intByteSize : IntTy → Nat
+  | .i8 => 1
+  | .i16 => 2
+  | .i32 => 4
+  | .i64 => 8
+  | .i128 => 16
+  | .isize => 8
+
+/-- Every `IntTy` has strictly positive byte width. -/
+theorem intByteSize_pos (w : IntTy) : 0 < intByteSize w := by
+  cases w <;> decide
+
+/-- `intCastTargetBytes (.int w)` equals `some (intByteSize w)`. -/
+theorem intCastTargetBytes_int_eq (w : IntTy) :
+    intCastTargetBytes (.int w) = some (intByteSize w) := by
+  cases w <;> rfl
+
+/-- `MirValueCodec` for every signed integer type `i8`, `i16`, `i32`, `i64`, `i128`, `isize`
+(storing canonical two's-complement unsigned bit patterns in `[0, 2^(8 * intByteSize w))`). -/
+def int (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx) :
+    MirValueCodec layouts { kind := .int w, layoutIdx := idx }
+      { bits : Nat // bits < 2 ^ (8 * intByteSize w) } (intByteSize w) :=
+  let sz := intByteSize w
+  let hNz := intByteSize_pos w
+  ofCanonicalEncode
+    (FixedByteCodec.uintBitsLE sz hNz)
+    (fun x => .scalar ⟨x.val, sz⟩)
+    (fun v =>
+      match v with
+      | .scalar sv =>
+        if sv.sizeBytes == sz then
+          if hLt : sv.bits < 2 ^ (8 * sz) then some ⟨sv.bits, hLt⟩ else none
+        else none
+      | _ => none)
+    (fun ⟨bits, hLt⟩ => by
+      have hBeq : (sz == sz) = true := decide_eq_true rfl
+      dsimp only
+      rw [hBeq]
+      exact dite_eq_left_of_eq_true (eq_true hLt))
+    (by
+      unfold rigidTyByteSize rigidTyKindByteSize
+      rw [intCastTargetBytes_int_eq w])
+    (fun ⟨bits, _hLt⟩ => by
+      unfold defaultCodecFuel encodeValueToBytes
+      dsimp only
+      rw [intCastTargetBytes_int_eq w]
+      dsimp only
+      have hSzEq : Nat.beq sz sz = true := nat_beq_self sz
+      rw [hSzEq]
+      dsimp only
+      unfold encodeScalarBytes
+      have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
+      rw [hBeq0]
+      rfl)
+    (fun v bs hEnc => by
+      unfold defaultCodecFuel encodeValueToBytes at hEnc
+      dsimp only at hEnc
+      rw [intCastTargetBytes_int_eq w] at hEnc
+      cases v <;> dsimp only at hEnc
+      case unit => nomatch hEnc
+      case ptr => nomatch hEnc
+      case aggregate => nomatch hEnc
+      case scalar sv =>
+        cases hEq : Nat.beq sv.sizeBytes sz <;> rw [hEq] at hEnc
+        · nomatch hEnc
+        · have hSvSz : sv.sizeBytes = sz := Nat.eq_of_beq_eq_true hEq
+          unfold encodeScalarBytes at hEnc
+          rw [hSvSz] at hEnc
+          have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
+          rw [hBeq0] at hEnc
+          injection hEnc with hBs
+          refine ⟨⟨sv.bits % 2 ^ (8 * sz), Nat.mod_lt _ (Nat.two_pow_pos _)⟩, ?_⟩
+          rw [← hBs]
+          exact (encodeLittleEndianBytes_mod_two_pow none sz sv.bits).symm)
+    (fun bs => by
+      unfold defaultCodecFuel decodeValueFromBytes FixedByteCodec.uintBitsLE FixedByteCodec.ofRoundTrip
+      dsimp only
+      rw [intCastTargetBytes_int_eq w]
+      dsimp only
+      have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+      rw [hLenDef]
+      cases hLen : Nat.beq bs.length sz
+      · rfl
+      · have hLenEq : bs.length = sz := Nat.eq_of_beq_eq_true hLen
+        have hNonEmpty : Nat.beq (Trusted.Sequence.length bs) 0 = false := by
+          rw [hLenDef, hLenEq]
+          exact nat_beq_eq_false_of_ne (by omega)
+        dsimp only
+        unfold decodeScalarBytes
+        dsimp only
+        rw [hNonEmpty]
+        dsimp only
+        cases hLE : decodeLittleEndianBytes bs with
+        | none => rfl
+        | some bp =>
+          rcases bp with ⟨bits, prov⟩
+          have hModLt := decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
+          have hLt : bits < 2 ^ (8 * sz) := by
+            rw [hLenDef, hLenEq, Anneal.Scalars.scalarModulus_eq_two_pow] at hModLt
+            exact hModLt
+          dsimp only
+          simp only [hLt, ↓reduceDIte]
+          rw [hLenDef, hLenEq]
+          rfl)
+
 /--
 `MirValueCodec` for a `.primitive`-fields scalar-niche ADT (`l.fields = .primitive`,
 `l.variants = .single varIdx`) backed by `ScalarLayout.initialized pk range` for any
@@ -7892,6 +7999,38 @@ def uint (layouts : LayoutTable) (w : UintTy) :
         exact (encodeLittleEndianBytes_mod_two_pow none _ sv.bits).symm
   decode_eq_map := (MirValueCodec.uint layouts w 0).decode_eq_map
 
+/-- `TupleFieldCodec` for a signed integer field `iN` (`FixedByteCodec.uintBitsLE` of two's-complement bits). -/
+def int (layouts : LayoutTable) (w : IntTy) :
+    TupleFieldCodec layouts (.int w)
+      (FixedByteCodec.uintBitsLE (MirValueCodec.intByteSize w) (MirValueCodec.intByteSize_pos w)) where
+  toValue := (MirValueCodec.int layouts w 0).toValue
+  ofValue := (MirValueCodec.int layouts w 0).ofValue
+  ofValue_toValue := (MirValueCodec.int layouts w 0).ofValue_toValue
+  kindSize_eq := MirValueCodec.intCastTargetBytes_int_eq w
+  encode_toValue := (MirValueCodec.int layouts w 0).encode_toValue
+  encode_witness := fun v bs hEnc => by
+    unfold tupleFieldFuel encodeValueToBytes at hEnc
+    dsimp only at hEnc
+    rw [MirValueCodec.intCastTargetBytes_int_eq w] at hEnc
+    cases v <;> dsimp only at hEnc
+    case unit => nomatch hEnc
+    case ptr => nomatch hEnc
+    case aggregate => nomatch hEnc
+    case scalar sv =>
+      cases hEq : Nat.beq sv.sizeBytes (MirValueCodec.intByteSize w) <;> rw [hEq] at hEnc
+      · nomatch hEnc
+      · have hSvSz : sv.sizeBytes = MirValueCodec.intByteSize w := Nat.eq_of_beq_eq_true hEq
+        unfold encodeScalarBytes at hEnc
+        rw [hSvSz] at hEnc
+        have hBeq0 : Nat.beq (MirValueCodec.intByteSize w) 0 = false :=
+          nat_beq_eq_false_of_ne (by have := MirValueCodec.intByteSize_pos w; omega)
+        rw [hBeq0] at hEnc
+        injection hEnc with hBs
+        refine ⟨⟨sv.bits % 2 ^ (8 * MirValueCodec.intByteSize w), Nat.mod_lt _ (Nat.two_pow_pos _)⟩, ?_⟩
+        rw [← hBs]
+        exact (encodeLittleEndianBytes_mod_two_pow none _ sv.bits).symm
+  decode_eq_map := (MirValueCodec.int layouts w 0).decode_eq_map
+
 /-- `TupleFieldCodec` for a unit field `()` (`FixedByteCodec.unit`, a 1-ZST). -/
 def unit (layouts : LayoutTable) : TupleFieldCodec layouts (.tuple []) FixedByteCodec.unit where
   toValue := fun _ => .unit
@@ -8881,6 +9020,36 @@ theorem boolByte_decode_isSome_of_decodeScalarLayoutBytes (slice : List Abstract
       rw [h0]
 
 /--
+Every slice accepted by any non-pointer scalar layout `.initialized pk range`
+(`pk = .int bitsWidth signed` or `.float bitsWidth`) of byte width `sz` is accepted by
+`FixedByteCodec.scalarValidRange sz hNz range`. Generalizes
+`boolByte_decode_isSome_of_decodeScalarLayoutBytes` from `bool` (`range = ⟨0, 1⟩`) to all integer
+and float scalar niches (such as `NonZeroU8` `1 ..= 255` or `NonZeroU32` `1 ..= 2^32 - 1`),
+discharging the `hAccept` obligation of `AdtDecodeFallbackSound.of_scalar`,
+`AdtDecodeFallbackSound.of_scalarPair`, and `FieldLayoutsDecodeSound.cons_primitive_scalar`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes
+    (pk : PrimitiveKind) (range : WrappingRange) (sz : Nat) (hNz : 0 < sz)
+    (hNonPtr : FixedByteCodec.isNonPointerPrimitiveKind pk = true)
+    (hWidth : primitiveKindByteWidth pk = some sz)
+    (slice : List AbstractByte)
+    (h : ∃ v, decodeScalarLayoutBytes (.initialized pk range) slice = some v) :
+    ∃ x, (FixedByteCodec.scalarValidRange sz hNz range).decode slice = some x := by
+  obtain ⟨v, hDec⟩ := h
+  rw [FixedByteCodec.decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+      pk range sz hNz hNonPtr hWidth slice] at hDec
+  cases hC : (FixedByteCodec.scalarValidRange sz hNz range).decode slice with
+  | none =>
+    rw [hC] at hDec
+    nomatch hDec
+  | some x =>
+    exact ⟨x, rfl⟩
+
+/--
 **Fallback Soundness for 1-Field `.scalar` Structs With a Surjective Field Codec**:
 when `l.fieldLayouts = []` and `l.backendRepr = .scalar s0` with `scalarLayoutByteWidth s0 = some p₀.2.size`,
 Trusted's fallback slices `[p₀.1 .. p₀.1 + p₀.2.size)` and runs `decodeScalarLayoutBytes s0`, which
@@ -9087,6 +9256,107 @@ theorem FieldLayoutsDecodeSound.cons_primitive_surjective
   exact hSurj fSlice hLen hInit
 
 /--
+Ready-made `FieldLayoutsDecodeSound` step for a 0-byte ZST unit/marker field (`FixedByteCodec.unit`)
+paired with any 0-byte `TypeLayout` entry `fl` (`fl.size.bytes = 0`), such as `()` or `PhantomData<T>`.
+Because `FixedByteCodec.unit.decode` succeeds on the empty slice `[]` regardless of how `fl` decodes,
+no assumptions on `fl.fields`, `fl.variants`, or `fl.backendRepr` are needed.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.cons_zst_unit
+    {layouts : LayoutTable} {αs : List Type}
+    {off : Nat} {align : Nat} {tail : PlacedCodecSpine αs}
+    {fIdx : LayoutIdx} {fRest : List LayoutIdx} {fl : TypeLayout}
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hSize : fl.size.bytes = 0)
+    (rest : FieldLayoutsDecodeSound layouts tail fRest) :
+    FieldLayoutsDecodeSound layouts (.cons (off, ⟨0, align⟩) FixedByteCodec.unit tail)
+      (fIdx :: fRest) := by
+  refine .cons hLookup hSize (fun fSlice hLen _ => ?_) rest
+  cases fSlice with
+  | nil => exact ⟨(), rfl⟩
+  | cons _ _ => nomatch hLen
+
+/--
+Ready-made `FieldLayoutsDecodeSound` step for any field codec `c` paired with a `.primitive`
+scalar-niche field layout `fl` (`fl.backendRepr = .scalar s0`, `0 < p.2.size`, `fl.size.bytes = p.2.size`,
+`fl.isUninhabited = false`, `fl.variants = .single varIdx`, `fl.fields = .primitive`) whose scalar
+layout decode `decodeScalarLayoutBytes s0` accepts only slices that `c.decode` also accepts.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.cons_primitive_scalar
+    {layouts : LayoutTable} {α : Type} {αs : List Type}
+    {p : Nat × FieldLayout} {c : FixedByteCodec α p.2.size} {tail : PlacedCodecSpine αs}
+    {fIdx : LayoutIdx} {fRest : List LayoutIdx} {fl : TypeLayout} {varIdx : VariantIdx}
+    {s0 : ScalarLayout}
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hInhab : fl.isUninhabited = false)
+    (hVar : fl.variants = .single varIdx)
+    (hFields : fl.fields = .primitive)
+    (hSize : fl.size.bytes = p.2.size)
+    (hNz : 0 < p.2.size)
+    (hRepr : fl.backendRepr = .scalar s0)
+    (hAccept : ∀ fSlice : List AbstractByte, fSlice.length = p.2.size →
+      (∃ v, decodeScalarLayoutBytes s0 fSlice = some v) → ∃ a, c.decode fSlice = some a)
+    (rest : FieldLayoutsDecodeSound layouts tail fRest) :
+    FieldLayoutsDecodeSound layouts (.cons p c tail) (fIdx :: fRest) := by
+  refine .cons hLookup hSize (fun fSlice hLen ⟨v, hDec⟩ => ?_) rest
+  unfold tupleFieldFuel decodeValueFromBytes at hDec
+  dsimp only at hDec
+  rw [hLookup] at hDec
+  dsimp only at hDec
+  rw [hInhab, hSize] at hDec
+  have hBeqLen : Nat.beq (Trusted.Sequence.length fSlice) p.2.size = true :=
+    Nat.beq_eq.mpr hLen
+  rw [hBeqLen] at hDec
+  dsimp only [Bool.not, Bool.or] at hDec
+  rw [hVar, hFields] at hDec
+  dsimp only at hDec
+  have hBeq0 : Nat.beq p.2.size 0 = false := nat_beq_eq_false_of_ne (by omega)
+  rw [hBeq0] at hDec
+  dsimp only at hDec
+  rw [hRepr] at hDec
+  exact hAccept fSlice hLen ⟨v, hDec⟩
+
+/--
+Ready-made `FieldLayoutsDecodeSound` step for `FixedByteCodec.scalarValidRange p.2.size hNz range`
+paired with its `.primitive` non-pointer scalar-niche `TypeLayout`
+(`fl.backendRepr = .scalar (.initialized pk range)`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem FieldLayoutsDecodeSound.cons_primitive_scalarValidRange
+    {layouts : LayoutTable} {αs : List Type}
+    {p : Nat × FieldLayout} {hNz : 0 < p.2.size} {range : WrappingRange}
+    {tail : PlacedCodecSpine αs}
+    {fIdx : LayoutIdx} {fRest : List LayoutIdx} {fl : TypeLayout} {varIdx : VariantIdx}
+    {pk : PrimitiveKind}
+    (hLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hInhab : fl.isUninhabited = false)
+    (hVar : fl.variants = .single varIdx)
+    (hFields : fl.fields = .primitive)
+    (hSize : fl.size.bytes = p.2.size)
+    (hRepr : fl.backendRepr = .scalar (.initialized pk range))
+    (hNonPtr : FixedByteCodec.isNonPointerPrimitiveKind pk = true)
+    (hWidth : primitiveKindByteWidth pk = some p.2.size)
+    (rest : FieldLayoutsDecodeSound layouts tail fRest) :
+    FieldLayoutsDecodeSound layouts
+      (.cons p (FixedByteCodec.scalarValidRange p.2.size hNz range) tail)
+      (fIdx :: fRest) :=
+  FieldLayoutsDecodeSound.cons_primitive_scalar hLookup hInhab hVar hFields hSize hNz hRepr
+    (fun fSlice _ h =>
+      scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes pk range p.2.size hNz hNonPtr
+        hWidth fSlice h)
+    rest
+
+/--
 Ready-made `FieldLayoutsDecodeSound` step for a `bool` field (`FixedByteCodec.boolByte`) paired with
 its `.primitive` scalar-niche `TypeLayout` (`fl.size.bytes = 1`, `fl.isUninhabited = false`,
 `fl.variants = .single varIdx`, `fl.fields = .primitive`,
@@ -9108,61 +9378,10 @@ theorem FieldLayoutsDecodeSound.cons_primitive_bool
     (hRepr : fl.backendRepr = .scalar (.initialized (.int 8 false) ⟨0, 1⟩))
     (rest : FieldLayoutsDecodeSound layouts tail fRest) :
     FieldLayoutsDecodeSound layouts (.cons (off, ⟨1, align⟩) FixedByteCodec.boolByte tail)
-      (fIdx :: fRest) := by
-  refine .cons hLookup hSize (fun fSlice hLen ⟨v, hDec⟩ => ?_) rest
-  unfold tupleFieldFuel decodeValueFromBytes at hDec
-  dsimp only at hDec
-  rw [hLookup] at hDec
-  dsimp only at hDec
-  rw [hInhab, hSize, hVar, hFields, hRepr] at hDec
-  cases fSlice with
-  | nil => nomatch hLen
-  | cons b0 restSlice =>
-    cases restSlice with
-    | cons _ _ => nomatch hLen
-    | nil =>
-      cases b0 with
-      | uninit => nomatch hDec
-      | init b prov =>
-        unfold decodeScalarLayoutBytes decodeScalarBytes decodeLittleEndianBytes
-          wrappingRangeContains at hDec
-        dsimp only [scalarLayoutByteWidth, primitiveKindByteWidth] at hDec
-        cases h0 : Nat.beq b.toBitVec.toNat 0
-        · cases h1 : Nat.beq b.toBitVec.toNat 1
-          · have hGe2 : 2 ≤ b.toBitVec.toNat := by
-              have hNe0 : b.toBitVec.toNat ≠ 0 := fun h => by
-                rw [Nat.beq_eq.mpr h] at h0; nomatch h0
-              have hNe1 : b.toBitVec.toNat ≠ 1 := fun h => by
-                rw [Nat.beq_eq.mpr h] at h1; nomatch h1
-              omega
-            have hBle1 : Nat.ble (b.toBitVec.toNat + 256 * 0) 1 = false := by
-              cases hB : Nat.ble (b.toBitVec.toNat + 256 * 0) 1 with
-              | false => rfl
-              | true =>
-                have := Nat.le_of_ble_eq_true hB
-                omega
-            change (match Bool.and (Nat.ble 0 (b.toBitVec.toNat + 256 * 0))
-                (Nat.ble (b.toBitVec.toNat + 256 * 0) 1) with
-              | false => none
-              | true => some (Value.scalar ⟨b.toBitVec.toNat + 256 * 0, 1⟩)) = some v at hDec
-            rw [hBle1, Bool.and_false] at hDec
-            nomatch hDec
-          · refine ⟨true, ?_⟩
-            show (match Nat.beq b.toBitVec.toNat 0 with
-              | true => some false
-              | false =>
-                match Nat.beq b.toBitVec.toNat 1 with
-                | true => some true
-                | false => none) = some true
-            rw [h0, h1]
-        · refine ⟨false, ?_⟩
-          show (match Nat.beq b.toBitVec.toNat 0 with
-            | true => some false
-            | false =>
-              match Nat.beq b.toBitVec.toNat 1 with
-              | true => some true
-              | false => none) = some false
-          rw [h0]
+      (fIdx :: fRest) :=
+  FieldLayoutsDecodeSound.cons_primitive_scalar hLookup hInhab hVar hFields hSize Nat.zero_lt_one hRepr
+    (fun fSlice _ h => boolByte_decode_isSome_of_decodeScalarLayoutBytes fSlice h)
+    rest
 
 /--
 **Fallback Soundness for Structs With Populated `l.fieldLayouts`** (in-order *or* reordered, with

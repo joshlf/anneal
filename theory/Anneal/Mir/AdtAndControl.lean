@@ -7639,6 +7639,162 @@ theorem MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity
       hValid layouts l varIdx pc fcs hPlaced hFl hRepr hSize hSurj)
   exact ⟨hAll.1, hAll.2.1.1 hSurj, hAll.2.2.1, hAll.2.2.2⟩
 
+/--
+**Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` Span-Fallback Struct With Surjective Field Codecs**
+(generalizing `adtOfValidStructLayoutWorld_memory_surjective` to all entries with `l.fieldLayouts = []`
+and `usesSpanFallback ... l.backendRepr = true`, including `.scalar` and `.scalarPair` structs with
+zero-sized marker fields such as `struct W(u32, PhantomData<T>)` as well as `.memory` structs).
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld_span_surjective
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = [])
+    (hSpan : Anneal.ByteCodec.MirValueCodec.usesSpanFallback
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.backendRepr = true)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSurj : pc.AllFieldsSurjective) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx memoryIndex
+    pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+      hValid layouts l varIdx pc fcs hPlaced hFl hSpan hSize hSurj)
+
+/--
+**Trusted-Level Bit Validity for Any `ValidStructLayoutWorld` Span-Fallback Struct With Surjective Field Codecs**
+(covering `.scalar` / `.scalarPair` structs with marker ZST fields as well as `.memory` structs, with no
+separate `hFallback` obligation).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld_span_surjective
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = [])
+    (hSpan : Anneal.ByteCodec.MirValueCodec.usesSpanFallback
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.backendRepr = true)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSurj : pc.AllFieldsSurjective) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld_span_surjective hValid layouts defPath
+      idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hFl hSpan hSize hFields hSurj
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    (IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hAll := MirValueCodec.adtOfValidStructLayoutWorld_bitValidity hValid layouts defPath
+    idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+      hValid layouts l varIdx pc fcs hPlaced hFl hSpan hSize hSurj)
+  exact ⟨hAll.1, hAll.2.1.1 hSurj, hAll.2.2.1, hAll.2.2.2⟩
+
+/--
+**Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` Struct With Populated `l.fieldLayouts`**
+satisfying `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` (supporting both in-order and reordered
+structs with niche fields such as `bool` or `NonZero*` and ZST marker fields).
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFlSound : Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound layouts pc l.fieldLayouts) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx memoryIndex
+    pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts hFlSound)
+
+/--
+**Trusted-Level Bit Validity for Any `ValidStructLayoutWorld` Struct With Populated `l.fieldLayouts`**
+satisfying `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` (preserving both `AllFieldsSurjective`
+and `AllFieldsZeroValid` for niche structs such as `bool`-containing structs).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFlSound : Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound layouts pc l.fieldLayouts) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts hValid layouts defPath
+      idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields hFlSound
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    ((pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid →
+        m.codec.HasZeroValid ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) :=
+  MirValueCodec.adtOfValidStructLayoutWorld_bitValidity hValid layouts defPath
+    idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts hFlSound)
+
 
 /--
 Kind: helper
