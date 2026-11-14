@@ -4644,4 +4644,89 @@ mod tests {
             "the second shrink's `[]` query is answered by the first shrink's run"
         );
     }
+
+    #[test]
+    fn itree_ddmin_shrinks_ep1_multi_callee_and_bit_sat_chains_to_one_minimal() {
+        const MARKERS: [&str; 2] = ["__anneal_itree_outlined_stage2_", "__bit_mix"];
+        let sig = outcome_mismatch_signature();
+        let mut covered = BTreeSet::new();
+
+        for seed_idx in 0..64u64 {
+            if covered.len() == MARKERS.len() {
+                break;
+            }
+            for cand in generate_itree_batch(ITREE_SAFE_SEEDS, 16, 0xE17E_0000 + seed_idx) {
+                if cand.applied_mutators.len() < 2 {
+                    continue;
+                }
+                let Some((base, steps)) =
+                    reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS)
+                else {
+                    continue;
+                };
+                for &marker in &MARKERS {
+                    if covered.contains(marker) || !cand.source.contains(marker) {
+                        continue;
+                    }
+                    let res = minimize_itree_candidate_mutations_with_compile_check(
+                        &cand,
+                        ITREE_SAFE_SEEDS,
+                        &sig,
+                        |_| true,
+                        |sub| {
+                            if sub.source.contains(marker) {
+                                divergent(vec![trace_verdict("ep1_t0", "outcome_mismatch", true)])
+                            } else {
+                                divergent(Vec::new())
+                            }
+                        },
+                    );
+                    assert!(
+                        matches!(
+                            res.status,
+                            ItreeShrinkStatus::Minimized | ItreeShrinkStatus::AlreadyOneMinimal
+                        ),
+                        "`{marker}`: unexpected ITree shrink status {:?}",
+                        res.status
+                    );
+                    assert!(res.minimized_candidate.source.contains(marker));
+                    assert!(!crate::mutators_itree::contains_unsafe_token(
+                        &res.minimized_candidate.source
+                    ));
+                    let n = steps.len();
+                    let replay_mask = |mask: u32| {
+                        let kept: Vec<ItreeMutationStep> = (0..n)
+                            .filter(|i| mask & (1 << i) != 0)
+                            .map(|i| steps[i].clone())
+                            .collect();
+                        replay_itree_mutation_steps(&cand, &base, &kept)
+                    };
+                    let kept_masks: Vec<u32> = (0..(1u32 << n))
+                        .filter(|&mask| {
+                            replay_mask(mask).source == res.minimized_candidate.source
+                        })
+                        .collect();
+                    assert!(
+                        !kept_masks.is_empty(),
+                        "`{marker}`: minimized ITree candidate is not a replayable subsequence"
+                    );
+                    assert!(
+                        kept_masks.iter().any(|&mask| {
+                            (0..n)
+                                .filter(|i| mask & (1 << i) != 0)
+                                .all(|i| !replay_mask(mask & !(1 << i)).source.contains(marker))
+                        }),
+                        "`{marker}`: minimized ITree chain {:?} is not 1-minimal",
+                        res.minimized_mutator_chain
+                    );
+                    covered.insert(marker);
+                }
+            }
+        }
+        assert_eq!(
+            covered.len(),
+            MARKERS.len(),
+            "expected ITree ddmin coverage of both Episode 1 variants, covered {covered:?}"
+        );
+    }
 }

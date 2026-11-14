@@ -488,10 +488,11 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
             r#"
 import json, pathlib, sys
 rep = json.loads(pathlib.Path(sys.argv[1]).read_text())
-_, _, fn_name, exp_class, exp_miri, exp_anneal, exp_lean = sys.argv
+_, _, fn_name, exp_class, exp_polarity, exp_miri, exp_anneal, exp_lean = sys.argv
 assert rep["fn_name"] == fn_name, f"{rep['fn_name']} != {fn_name}"
 assert rep["verdict"] == "diverge", f"expected diverge, got {rep}"
 assert rep["divergence_class"] == exp_class, f"{rep['divergence_class']} != {exp_class}"
+assert rep["witness_polarity"] == exp_polarity, f"{rep['witness_polarity']} != {exp_polarity}"
 assert rep["miri_outcome"] == exp_miri, f"{rep['miri_outcome']} != {exp_miri}"
 assert rep["anneal_outcome"] == exp_anneal, f"{rep['anneal_outcome']} != {exp_anneal}"
 assert rep["anneal_lean_tag"] == exp_lean, f"{rep['anneal_lean_tag']} != {exp_lean}"
@@ -502,6 +503,7 @@ assert rep["kernel_confirmed"] is True, f"expected kernel_confirmed=True, got {r
         .args([
             &f.fn_name,
             &f.divergence_class,
+            &f.witness_polarity,
             &f.miri_outcome_tag,
             &f.anneal_outcome_tag,
             &f.anneal_lean_tag,
@@ -2453,13 +2455,19 @@ fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
     assert_eq!(shrunk_to_one, 1, "expected one k -> 1 live shrink");
 }
 
-/// 1-based line of the first line of `haystack` that contains `needle`.
+/// 1-based line of the unique line of `haystack` that contains `needle`.
 fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
-    haystack
+    let matches: Vec<u32> = haystack
         .lines()
-        .position(|l| l.contains(needle))
-        .map(|i| i as u32 + 1)
-        .unwrap_or_else(|| panic!("`{needle}` not found in staged crate"))
+        .enumerate()
+        .filter_map(|(i, l)| l.contains(needle).then_some(i as u32 + 1))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "`{needle}` must match a unique line in staged crate, matched lines: {matches:?}"
+    );
+    matches[0]
 }
 
 /// Category 9 templates must agree with Miri live, and the Category 9 engine
@@ -2594,6 +2602,14 @@ fn ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live() {
 "#,
         ),
         (
+            "cat9_unwind_cleanup_guard_panic",
+            r#"pub fn cat9_unwind_cleanup_guard_panic() -> u32 {
+    let start: u32 = u32::MAX;
+    helper_unwind_guarded(start, 1u32)
+}
+"#,
+        ),
+        (
             "cat9_in_scope_move_raw_read_conservative",
             r#"pub fn cat9_in_scope_move_raw_read_conservative() -> u32 {
     let x = NonCopyU32(15u32);
@@ -2667,7 +2683,7 @@ pub fn cat9_gap_callee_raw_read_wrong_value() -> u32 {
             r#"#[inline(never)]
 fn cat9_gap_write_through_raw_arg(alias: *mut u32, pad: u32, pad2: u32) -> u32 {
     unsafe {
-        *alias = 8u32;
+        *alias = 8u32 + 0u32;
     }
     3u32 + (pad & 0u32) + (pad2 & 0u32)
 }
@@ -2678,6 +2694,24 @@ pub fn cat9_gap_callee_raw_write_wrong_value() -> u32 {
     let mut x: u32 = 10u32;
     let raw: *mut u32 = &raw mut x;
     let v: u32 = cat9_gap_write_through_raw_arg(raw, 100u32, 200u32);
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_raw_write_collides_with_ptr_arg",
+            r#"#[inline(never)]
+fn cat9_gap_alias_write_no_caller_borrow(alias: *mut u32) -> u32 {
+    unsafe {
+        *alias = 6u32;
+    }
+    3u32
+}
+
+pub fn cat9_gap_callee_raw_write_collides_with_ptr_arg() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = cat9_gap_alias_write_no_caller_borrow(raw);
     v + unsafe { *raw }
 }
 "#,
@@ -2782,16 +2816,16 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
     )
     .expect("evaluate Category 9 live batch");
 
-    assert_eq!(report.total_candidates, 14);
-    assert_eq!(report.compiled_candidates, 14);
-    assert_eq!(report.agree_count, 5, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 9, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.total_candidates, 16);
+    assert_eq!(report.compiled_candidates, 16);
+    assert_eq!(report.agree_count, 6, "agreements: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 10, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
         ("unsound_missed_fault", 2usize),
         ("sound_conservative_abstraction", 5),
-        ("value_mismatch", 2),
+        ("value_mismatch", 3),
         ("harness_or_extraction_error", 0),
     ] {
         assert_eq!(
@@ -2801,8 +2835,8 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 9);
-    assert_eq!(report.kernel_confirmed_divergences, 9);
+    assert_eq!(report.findings.len(), 10);
+    assert_eq!(report.kernel_confirmed_divergences, 10);
     // With no shrinkable mutator chain, every finding reports its original
     // candidate, so each original item report is itself kernel-confirmed.
     for f in &report.findings {
@@ -2813,6 +2847,16 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
                 .any(|r| r.name == f.fn_name && r.kernel_confirmed),
             "item report for `{}` must stay kernel-confirmed",
             f.fn_name
+        );
+        // None of the diverging pins call preamble `helper_*` functions;
+        // `MiriOracleConfirm.lean` must not link helpers reachable only from
+        // the agreeing candidates in the batch.
+        assert!(
+            !f.kernel_confirm_theorems.contains("helper_reborrow_")
+                && !f.kernel_confirm_theorems.contains("helper_unwind_"),
+            "confirm module for `{}` linked unrelated batch helpers:\n{}",
+            f.fn_name,
+            f.kernel_confirm_theorems
         );
     }
     for f in &report.findings {
@@ -2843,10 +2887,13 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
         "cat9_returned_child_pass",
         "cat9_scalar_and_mem_intrinsics_pass",
         "cat9_frozen_reborrow_write_in_callee_ub",
+        "cat9_unwind_cleanup_guard_panic",
     ] {
         assert_eq!(item(name).verdict, ComparisonVerdict::Agree, "`{name}` must agree");
     }
     assert!(matches!(item("cat9_frozen_reborrow_write_in_callee_ub").miri, MiriOutcome::Ub { .. }));
+    assert!(matches!(item("cat9_unwind_cleanup_guard_panic").miri, MiriOutcome::Panic { .. }));
+    assert!(matches!(item("cat9_unwind_cleanup_guard_panic").anneal, AnnealOutcome::Panic { .. }));
 
     let finding = |name: &str| {
         report
@@ -2889,6 +2936,7 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
     for (name, miri_bits, anneal_bits) in [
         ("cat9_gap_callee_raw_read_wrong_value", 10u128, 200u128),
         ("cat9_gap_callee_raw_write_wrong_value", 11, 13),
+        ("cat9_gap_callee_raw_write_collides_with_ptr_arg", 9, 13),
     ] {
         let f = finding(name);
         assert_eq!(f.divergence_class, "wrong_value", "`{name}`");

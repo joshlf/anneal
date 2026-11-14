@@ -2397,6 +2397,66 @@ fn collect_ident_tokens(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<Str
 /// functions in `lib_rs`, the worklist starts from identifiers in the text after
 /// [`MIRI_CORPUS_MODULE_PREAMBLE`] (or the whole crate if the preamble is not
 /// embedded verbatim).
+fn collect_fn_and_aux_items(
+    items: &[syn::Item],
+    fn_bodies: &mut BTreeMap<String, proc_macro2::TokenStream>,
+    aux_tokens: &mut BTreeMap<String, Vec<proc_macro2::TokenStream>>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(func) => {
+                fn_bodies.insert(
+                    func.sig.ident.to_string(),
+                    quote::ToTokens::to_token_stream(&func.block),
+                );
+                let nested_items: Vec<syn::Item> = func
+                    .block
+                    .stmts
+                    .iter()
+                    .filter_map(|stmt| match stmt {
+                        syn::Stmt::Item(it) => Some(it.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                collect_fn_and_aux_items(&nested_items, fn_bodies, aux_tokens);
+            }
+            syn::Item::Mod(inner_mod) => {
+                if let Some((_, mod_items)) = &inner_mod.content {
+                    collect_fn_and_aux_items(mod_items, fn_bodies, aux_tokens);
+                }
+            }
+            syn::Item::Macro(mac) => {
+                if let Some(id) = &mac.ident {
+                    aux_tokens
+                        .entry(id.to_string())
+                        .or_default()
+                        .push(quote::ToTokens::to_token_stream(&mac.mac));
+                }
+            }
+            syn::Item::Impl(imp) => {
+                let mut self_idents = BTreeSet::new();
+                collect_ident_tokens(
+                    quote::ToTokens::to_token_stream(&imp.self_ty),
+                    &mut self_idents,
+                );
+                let ts = quote::ToTokens::to_token_stream(&imp);
+                for id in self_idents {
+                    aux_tokens.entry(id).or_default().push(ts.clone());
+                }
+                for impl_item in &imp.items {
+                    if let syn::ImplItem::Fn(method) = impl_item {
+                        fn_bodies.insert(
+                            method.sig.ident.to_string(),
+                            quote::ToTokens::to_token_stream(&method.block),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn staged_helper_fns_reachable_from_candidates(
     lib_rs: &str,
     items: &[OracleItemSpec],
@@ -2404,36 +2464,7 @@ fn staged_helper_fns_reachable_from_candidates(
     let mut fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
     let mut aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>> = BTreeMap::new();
     if let Ok(file) = syn::parse_file(lib_rs) {
-        for item in file.items {
-            match item {
-                syn::Item::Fn(func) => {
-                    fn_bodies.insert(
-                        func.sig.ident.to_string(),
-                        quote::ToTokens::to_token_stream(&func.block),
-                    );
-                }
-                syn::Item::Macro(mac) => {
-                    if let Some(id) = &mac.ident {
-                        aux_tokens
-                            .entry(id.to_string())
-                            .or_default()
-                            .push(quote::ToTokens::to_token_stream(&mac.mac));
-                    }
-                }
-                syn::Item::Impl(imp) => {
-                    let mut self_idents = BTreeSet::new();
-                    collect_ident_tokens(
-                        quote::ToTokens::to_token_stream(&imp.self_ty),
-                        &mut self_idents,
-                    );
-                    let ts = quote::ToTokens::to_token_stream(&imp);
-                    for id in self_idents {
-                        aux_tokens.entry(id).or_default().push(ts.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
+        collect_fn_and_aux_items(&file.items, &mut fn_bodies, &mut aux_tokens);
     }
     let item_seeds: Vec<String> = items
         .iter()
@@ -3259,10 +3290,28 @@ fn run_linked_difftest_oracle_pipeline(
             .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
         let confirm_path = oracle_dir.join("MiriOracleConfirm.lean");
         let write_confirm_module = |entries: &[(OracleItemSpec, String, AnnealOutcome)]| {
+            let entry_specs: Vec<OracleItemSpec> =
+                entries.iter().map(|(spec, _, _)| spec.clone()).collect();
+            let entry_reachable =
+                staged_helper_fns_reachable_from_candidates(&lib_rs, &entry_specs);
+            let entry_helper_suffixes: Vec<String> = helper_module_suffixes
+                .iter()
+                .filter(|suffix| {
+                    let short_matches = subject_pairs
+                        .iter()
+                        .any(|(short, s)| s == *suffix && entry_reachable.contains(short));
+                    let nested_in_entry = entries.iter().any(|(spec, _, _)| {
+                        suffix.starts_with(&format!("{crate_camel}.{}_", spec.name))
+                            || suffix.starts_with(&format!("{crate_camel}.{}.", spec.name))
+                    });
+                    short_matches || nested_in_entry
+                })
+                .cloned()
+                .collect();
             let src = render_linked_anneal_confirm_module(
                 &crate_camel,
                 entries,
-                &helper_module_suffixes,
+                &entry_helper_suffixes,
                 &anneal_panic_frames,
                 &anneal_panic_messages,
             )?;
@@ -5786,13 +5835,23 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     fn ddmin_shrinks_category9_variant_chains_to_one_minimal_subsequences() {
         let seed_sources = corpus_seed_sources();
         let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
-        const MARKERS: [&str; 6] = [
+        const MARKERS: [&str; 16] = [
             "helper_unwind_guarded(",
             "helper_reborrow_return(",
             "let __cp_copied: u32 = __cp_x;",
             "NonCopyU32(",
+            "NonCopyPairU32",
+            "helper_reborrow_mid(",
+            "helper_shared_mid(",
+            "helper_unwind_mid(",
+            "helper_frozen_reborrow_write_in_callee(",
             "ctlz_nonzero(",
+            "saturating_add(",
+            "three_way_compare(",
+            "exact_div(",
+            "arith_offset(",
             "write_bytes!(",
+            "copy_nonoverlapping(",
         ];
         let miri_msg = "constructing invalid value: encountered 0x02, but expected a boolean";
         let anneal = AnnealOutcome::PassScalar {
@@ -5801,6 +5860,9 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         };
         let mut covered = BTreeSet::new();
         for batch_idx in 0..96usize {
+            if covered.len() == MARKERS.len() {
+                break;
+            }
             for cand in generate_miri_corpus_batch(12, 0xC9D0_0000 + batch_idx as u64, batch_idx) {
                 if cand.applied_mutators.len() < 2 {
                     continue;
@@ -5809,63 +5871,67 @@ pub fn parameterized_after(x: u32) -> u32 { x }
                     continue;
                 };
                 let base_src = prettyplease::unparse(&base);
-                let Some(&marker) = MARKERS.iter().find(|m| {
-                    !covered.contains(*m) && cand.fn_source.contains(*m) && !base_src.contains(*m)
-                }) else {
-                    continue;
-                };
-                let original = missed_ub_report(&cand.fn_name, 50, miri_msg, anneal.clone(), true);
-                let res = minimize_miri_candidate_mutations_with_compile_check(
-                    &cand,
-                    &seed_refs,
-                    &original,
-                    |_| true,
-                    |sub| {
-                        Some(if sub.fn_source.contains(marker) {
-                            missed_ub_report(&sub.fn_name, 50, miri_msg, anneal.clone(), true)
-                        } else {
-                            agree_report(&sub.fn_name)
-                        })
-                    },
-                );
-                assert!(
-                    matches!(
-                        res.status,
-                        MiriShrinkStatus::Minimized | MiriShrinkStatus::AlreadyOneMinimal
-                    ),
-                    "`{marker}`: unexpected status {:?}",
-                    res.status
-                );
-                assert!(res.minimized_candidate.fn_source.contains(marker));
-                // Find the kept pass indices: the subsequences whose replay
-                // reproduces the minimized program byte for byte.
-                let n = steps.len();
-                let replay_mask = |mask: u32| {
-                    let kept: Vec<RecordedMutationStep> = (0..n)
-                        .filter(|i| mask & (1 << i) != 0)
-                        .map(|i| steps[i].clone())
-                        .collect();
-                    replay_miri_mutation_steps(&cand, &base, &kept)
-                };
-                let kept_masks: Vec<u32> = (0..(1u32 << n))
-                    .filter(|&mask| {
-                        replay_mask(mask).fn_source == res.minimized_candidate.fn_source
-                    })
-                    .collect();
-                assert!(
-                    !kept_masks.is_empty(),
-                    "`{marker}`: the minimized program is not a replayable subsequence"
-                );
-                assert!(
-                    kept_masks.iter().any(|&mask| {
-                        (0..n)
+                for &marker in &MARKERS {
+                    if covered.contains(marker)
+                        || !cand.fn_source.contains(marker)
+                        || base_src.contains(marker)
+                    {
+                        continue;
+                    }
+                    let original =
+                        missed_ub_report(&cand.fn_name, 50, miri_msg, anneal.clone(), true);
+                    let res = minimize_miri_candidate_mutations_with_compile_check(
+                        &cand,
+                        &seed_refs,
+                        &original,
+                        |_| true,
+                        |sub| {
+                            Some(if sub.fn_source.contains(marker) {
+                                missed_ub_report(&sub.fn_name, 50, miri_msg, anneal.clone(), true)
+                            } else {
+                                agree_report(&sub.fn_name)
+                            })
+                        },
+                    );
+                    assert!(
+                        matches!(
+                            res.status,
+                            MiriShrinkStatus::Minimized | MiriShrinkStatus::AlreadyOneMinimal
+                        ),
+                        "`{marker}`: unexpected status {:?}",
+                        res.status
+                    );
+                    assert!(res.minimized_candidate.fn_source.contains(marker));
+                    // Find the kept pass indices: the subsequences whose replay
+                    // reproduces the minimized program byte for byte.
+                    let n = steps.len();
+                    let replay_mask = |mask: u32| {
+                        let kept: Vec<RecordedMutationStep> = (0..n)
                             .filter(|i| mask & (1 << i) != 0)
-                            .all(|i| !replay_mask(mask & !(1 << i)).fn_source.contains(marker))
-                    }),
-                    "`{marker}`: minimized chain {:?} is not 1-minimal",
-                    res.minimized_mutator_chain
-                );
-                covered.insert(marker);
+                            .map(|i| steps[i].clone())
+                            .collect();
+                        replay_miri_mutation_steps(&cand, &base, &kept)
+                    };
+                    let kept_masks: Vec<u32> = (0..(1u32 << n))
+                        .filter(|&mask| {
+                            replay_mask(mask).fn_source == res.minimized_candidate.fn_source
+                        })
+                        .collect();
+                    assert!(
+                        !kept_masks.is_empty(),
+                        "`{marker}`: the minimized program is not a replayable subsequence"
+                    );
+                    assert!(
+                        kept_masks.iter().any(|&mask| {
+                            (0..n)
+                                .filter(|i| mask & (1 << i) != 0)
+                                .all(|i| !replay_mask(mask & !(1 << i)).fn_source.contains(marker))
+                        }),
+                        "`{marker}`: minimized chain {:?} is not 1-minimal",
+                        res.minimized_mutator_chain
+                    );
+                    covered.insert(marker);
+                }
             }
         }
         assert!(
@@ -7969,10 +8035,14 @@ impl Drop for Guard {
 }
 fn helper_from_macro(x: u32) -> u32 { x + 1 }
 fn helper_from_drop(x: u32) -> u32 { x + 2 }
+fn helper_from_nested(x: u32) -> u32 { x + 4 }
 fn unrelated_helper(x: u32) -> u32 { x + 3 }
 pub fn cand_entry() -> u32 {
+    fn inner_nested(v: u32) -> u32 {
+        helper_from_nested(v)
+    }
     let _g = Guard(5);
-    call_via_macro!(10)
+    inner_nested(call_via_macro!(10))
 }
 ";
         let specs = vec![OracleItemSpec {
@@ -7981,6 +8051,8 @@ pub fn cand_entry() -> u32 {
         }];
         let reached = staged_helper_fns_reachable_from_candidates(staged, &specs);
         assert!(reached.contains("cand_entry"));
+        assert!(reached.contains("inner_nested"));
+        assert!(reached.contains("helper_from_nested"));
         assert!(reached.contains("helper_from_macro"));
         assert!(reached.contains("helper_from_drop"));
         assert!(!reached.contains("unrelated_helper"));

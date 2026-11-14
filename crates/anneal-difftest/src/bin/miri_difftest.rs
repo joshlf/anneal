@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anneal_difftest::miri_eval::{
-    MIRI_MUTATOR_NAMES, compile_candidates, divergence_class_slug, evaluate_miri_batches,
-    json_escape, render_eval_report_json, render_eval_report_markdown, reproduce_miri_finding,
+    MIRI_MUTATOR_NAMES, classify_verdict_witness_polarity, compile_candidates,
+    divergence_class_slug, evaluate_miri_batches, json_escape, render_eval_report_json,
+    render_eval_report_markdown, reproduce_miri_finding,
 };
 use anneal_difftest::mutators_miri::{
     GeneratedMiriCandidate, generate_miri_corpus_batch, generate_miri_identity_batch,
@@ -259,6 +260,9 @@ fn run_reproducer(repro_path: &Path, output_json: Option<&Path>) -> Result<(), S
         ),
         ComparisonVerdict::NotCompared(reason) => (format!("not_compared:{reason:?}"), None),
     };
+    let witness_polarity =
+        classify_verdict_witness_polarity(&item_rep.miri, &item_rep.anneal, &item_rep.verdict)
+            .map(|p| p.as_str().to_string());
     let miri_tag = item_rep.miri.summary_tag();
     let anneal_tag = item_rep.anneal.summary_tag();
     let anneal_lean = item_rep
@@ -271,6 +275,7 @@ fn run_reproducer(repro_path: &Path, output_json: Option<&Path>) -> Result<(), S
          \x20 \"fn_name\": {},\n\
          \x20 \"verdict\": {},\n\
          \x20 \"divergence_class\": {},\n\
+         \x20 \"witness_polarity\": {},\n\
          \x20 \"miri_outcome\": {},\n\
          \x20 \"anneal_outcome\": {},\n\
          \x20 \"anneal_lean_tag\": {},\n\
@@ -282,6 +287,10 @@ fn run_reproducer(repro_path: &Path, output_json: Option<&Path>) -> Result<(), S
         div_class
             .as_ref()
             .map(|c| json_escape(c))
+            .unwrap_or_else(|| "null".to_string()),
+        witness_polarity
+            .as_ref()
+            .map(|p| json_escape(p))
             .unwrap_or_else(|| "null".to_string()),
         json_escape(&miri_tag),
         json_escape(&anneal_tag),

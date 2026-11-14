@@ -550,6 +550,71 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "`ub_assign_after_reborrow_disables_child` must assign `x`, never move it:\n{assign_mir}"
     );
 
+    // Category 9's guarded unwind helper lowers its call edge to
+    // `UnwindAction.cleanup` with a landing pad that drops `UnwindCleanupGuard`
+    // and resumes unwinding (`TerminatorKind.unwindResume`), whereas the
+    // unguarded unwind helper uses `UnwindAction.continue_`.
+    let guarded_mir = captured_mir("helper_unwind_guarded");
+    assert!(
+        guarded_mir.contains("UnwindAction.cleanup ")
+            && guarded_mir.contains("TerminatorKind.unwindResume"),
+        "`helper_unwind_guarded` must capture an `UnwindAction.cleanup` landing pad:\n{guarded_mir}"
+    );
+    let unguarded_mir = captured_mir("helper_unwind_mid");
+    assert!(
+        unguarded_mir.contains("UnwindAction.continue_")
+            && !unguarded_mir.contains("UnwindAction.cleanup "),
+        "`helper_unwind_mid` must use `UnwindAction.continue_`:\n{unguarded_mir}"
+    );
+
+    // Category 9's `copy_nonoverlapping` seeds lower to the inline MIR statement
+    // `StatementKind.intrinsic (NonDivergingIntrinsic.copyNonOverlapping ...)`.
+    for name in [
+        "pass_intrinsics_write_bytes_copy_and_arith_offset",
+        "ub_copy_nonoverlapping_partial_overlap_array",
+    ] {
+        let mir = captured_mir(name);
+        assert!(
+            mir.contains("NonDivergingIntrinsic.copyNonOverlapping"),
+            "`{name}` must lower to `NonDivergingIntrinsic.copyNonOverlapping`:\n{mir}"
+        );
+    }
+
+    // Category 9's multi-callee `Verify` modules link their transitive helper
+    // bodies in `callees := [...]`.
+    for (verify_name, expected_callees) in [
+        (
+            "pass_fn_entry_protector_two_stage_reborrow_chain",
+            &[
+                "Mir.MiriDiffCorpus.helper_reborrow_leaf.body",
+                "Mir.MiriDiffCorpus.helper_reborrow_mid.body",
+            ][..],
+        ),
+        (
+            "pass_fn_entry_shared_reborrow_chain",
+            &[
+                "Mir.MiriDiffCorpus.helper_shared_leaf.body",
+                "Mir.MiriDiffCorpus.helper_shared_mid.body",
+            ][..],
+        ),
+        (
+            "panic_multi_callee_unwind_cleanup_guard",
+            &[
+                "Mir.MiriDiffCorpus.helper_unwind_guarded.body",
+                "Mir.MiriDiffCorpus.helper_unwind_leaf.body",
+            ][..],
+        ),
+    ] {
+        let verify_src = fs::read_to_string(verify_dir.join(format!("{verify_name}.lean")))
+            .unwrap_or_else(|e| panic!("read `{verify_name}.lean`: {e}"));
+        for callee in expected_callees {
+            assert!(
+                verify_src.contains(callee),
+                "`{verify_name}.lean` must link `{callee}`:\n{verify_src}"
+            );
+        }
+    }
+
     // The retired bug's certificate links only the captured `helper_add_ten`
     // body, through the general bounded combinator rather than the
     // callee-free point combinator.
