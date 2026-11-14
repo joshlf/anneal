@@ -209,6 +209,8 @@ HEADLINE_THEOREMS = (
     "tb_direct_read_freeze_repaired_by_directReadTreeBorrows",
     "readPlaceProto_direct_frame_isolation",
     "floatToIntValue_monotone",
+    # A4: direct reference creation is a Tree Borrows read (candidate-fix coverage)
+    "tb_direct_reborrow_read_repaired_by_directReadTreeBorrows",
 )
 
 

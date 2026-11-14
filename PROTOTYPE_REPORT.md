@@ -6,8 +6,9 @@
 > All semantics live in the overlay `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`;
 > the regression/audit suite is `scripts/test_tcb_correspondence_div8_proto.py`.
 
-Status: **B4 final adversarial critique & hardening pass** (recommendation in §7, finalized in round A4). All
-declarations of the overlay (including all 109 pinned headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero
+Status: **FINAL (round A4 of the N = 4 adversarial build–critique loop; recommendation in §7:
+CONDITIONAL GO).** All 203 theorems / all declarations of the overlay (including the 110 pinned
+headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero
 `Classical.choice`, zero `sorry`, zero `native_decide` (see §5). The overlay is differentially
 tested against the unpatched `Trusted` stepper on all 235 MiniRust witness bodies × 3 argument
 vectors (705 runs), and its definite agreement on all 138 scalar-argument bodies (`114`
@@ -165,7 +166,7 @@ proves the same on **33 composite-argument bodies** (`Tuple`, `Array`, `PaddedSt
 `uninitProjCallDestCaller` fixes with their callees; the frame-bug divergences are headline
 theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
-## 3. Track A edit plan (draft)
+## 3. Track A edit plan
 
 | File | Edit |
 |------|------|
@@ -185,6 +186,7 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 | Downstream (`L5_ControlAndCalls.lean` & `Statements.lean` storage lemmas) | `Statements.lean:1945` (`hasProtectedLocalBorrow_of_hasProtectedWriteConflict`) continues to hold via `hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto`; `Statements.lean:3752` (`evalStmt_storageRevive_old_ptr_deref_ub`) and `L5_ControlAndCalls.lean:5342` (`stmt_div_storage_revive_ptr_offset_is_ub`) continue to hold via `disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound`; in `theory/Correspondence/V2026_{06,08}_01/L5_ControlAndCalls.lean:278,443` (`hasProtectedLocalBorrow_disableLocalBorrows`), add `(d₁, loc₁) ≠ (d₂, loc₂) ∨ hasProtectedLocalBorrow ... d₁ loc₁ = false` per `hasProtectedLocalBorrowProto_disableLocalBorrowsProto` |
 | `minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean` | the frame fix also flips `callRefMutProtected_anneal_ret` (`Trusted` UB → 84 = `Mach`/`MachTB` in `callRefMutProtectedRoundTrip_three_way`); update that theorem together with items 1–2 (`callerRefMutProtectedBadCallDst_notInFragmentWithIntrinsics` is purely syntactic and needs no change) |
 | `…/MirSemantics/Terminators.lean` (`Call` / `Return`) | as in the overlay: check the callee's arity at `Call` (MiniRust "call ABI violation", flips `argCountMismatch_*`) and write `_0` back with the general place write (uninit-field shell; flips `uninitProjCallDest_*`) — optional, outside the eight items |
+| Follow-up (`DIV-MR-TB-DIRECT-LOCAL-ACCESS`, *not* part of this update) | Tree Borrows root read on direct local `copy` / `move` / `&local` / `&mut local` (model: `ProtoConfig.directReadTreeBorrows`; witnesses `tb_direct_read_freeze_*`, `tb_direct_reborrow_read_*`); needs its own corpus validation against `MachTB` before landing |
 | Tracker | retire the 8 IDs in `scripts/run_nightly_verification_suite.py` once the witnesses flip |
 
 ## 4. Part B specification summary
@@ -228,7 +230,7 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
 ## 5. Axiom hygiene (zero `Classical.choice`)
 
-* `#guard_msgs in #print axioms` pins all 109 headline theorems (§7 of the Lean file); the
+* `#guard_msgs in #print axioms` pins all 110 headline theorems (§7 of the Lean file); the
   audit suite replays `#print axioms` for **every** `theorem` / `def` of the file.
 * Lean `v4.34.1` core lemmas that silently pull `Classical.choice` and were replaced by
   constructive versions: `Nat.pow_lt_pow_right`, `Nat.pow_lt_pow_iff_right`,
@@ -271,7 +273,16 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
   proves in the kernel that it faults with `.ub` on `tbDirectReadFreezeMir` and
   `tbDirectReadProtectedUniqueMir` while preserving `.reservedFrz false` on
   `tbDirectReadBeforeActivationMir` (matching `MachTB` in all three cases), with frame isolation
-  proved universally in `readPlaceProto_direct_frame_isolation`.
+  proved universally in `readPlaceProto_direct_frame_isolation`. A4 found that the B4 knob still
+  missed the UB when the root's read is a *reference creation*: `_2 = &mut _1; *_2 = 6;
+  _3 = &_1; *_2 = 7` is UB in `MachTB` (step 7, `"Tree Borrows: local write of Frozen
+  reference"`) yet returned `7` under the knob; the knob now also applies the root read on direct
+  `&local` / `&mut local` creation (not for interior-mutable `.cell` reborrows, and not for
+  `&raw`, which Tree Borrows does not retag), proved in
+  `tb_direct_reborrow_read_repaired_by_directReadTreeBorrows` (which also pins `MachTB`'s return
+  value `7` on `tbDirectReadBeforeActivationMir`). The knob stays off by default, so the 171
+  kernel-checked agreements with `Trusted` are unaffected; Track A should treat it as the starting
+  point of `DIV-MR-TB-DIRECT-LOCAL-ACCESS`, not as validated against a corpus.
 * Return values (`_0`) are not re-validated at `Return` (same as `Trusted`); a typed load of
   the caller's destination validates them later.
 * No `rangeOffset` / `rangeLen` byte-ranged entries.
@@ -279,52 +290,91 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
   `inconsistentRounding` (`preferredNaNBits`) branches of `roundRatioBits` are now proved
   universally in `roundRatioBits_valid_and_not_nan` and `roundRatioTiesToEven_float_half_ulp`.
 
-## 7. Recommendation (A3/B4 — finalized in A4)
+## 7. Recommendation — **CONDITIONAL GO** (final, A4)
 
-**CONDITIONAL GO** for the Track A TCB update `ws-tcb-correspondence-div8-and-ieee-float`.
+**Verdict: CONDITIONAL GO** for the Track A TCB update `ws-tcb-correspondence-div8-and-ieee-float`:
+the candidate semantics are validated and should land, subject to the conditions below. It is
+not an unconditional GO because (i) the update is only sound as a single coupled change, (ii)
+several downstream proofs and witnesses must change with it, and (iii) the overlay inherits one
+pre-existing Tree Borrows soundness gap from `Trusted` (§6) that this update does not close.
 
-Evidence: all eight tracked divergences flip to agreement with their MiniRust / lean-miri
-ground truth (§2); the overlay does not regress `Trusted` on the 235-body MiniRust witness
-corpus under three argument vectors — every definite divergence is a fix with ground truth,
-171 agreements are kernel theorems, and the 30 fail-closed bodies are exactly the unmodeled
-construct families (§2b); Part B is pure, kernel-reducible, and proved correctly rounded with
-exact overflow, signed-zero, quiet-NaN, exactness, monotonicity, and round-trip guarantees, and is
-differentially tested against `fractions` / `struct` and a lean-miri `Float.lean` port (§4);
-every declaration is classical-free (§5).
+### Evidence
 
-Conditions:
-1. **Land Part A as one unit.** Items 1–2 need `targetFrameDepth` threaded through *every*
-   borrow-table operation and frame-qualified deref access; item 4 (`Return` dealloc check,
-   `disableFrameBorrows`, and destination write invalidation/protector check) breaks
-   `unsafeCellProtectedInteriorMut` without item 5 (`preventsDeallocation` exemption)
-   (`div_mr_tb_unsafecell_coupling_legacy_breaks`); item 7 needs `allocDead` together with
-   the frame-qualified liveness bound and zero-delta dead-allocation offset handling; item 8
-   needs protector checks and borrow invalidation on both `.uninit` and `.init (.aggregate _ fs)`.
-2. **Update the dependent proofs and witnesses listed in §3** (char-validation sites
-   `SimLM2_1` / `SimLM2_4` / `SymReflect` / `AnnealEval`; `hasProtectedLocalBorrow` /
+| Claim | Evidence (kernel-checked unless noted) |
+|-------|-----------------------------------------|
+| All 8 tracked divergences flip to their MiniRust / lean-miri ground truth | §2 table: 3-way `runMirProto` / `Mach` / `MachTB` agreement for items 1–2 (MiniRust machines via the `String.toList`-free translator replica, bridged by `rfl` in the suite), `MachTB` for items 3–5, faithful lean-miri reference specs for items 6–8 (universal lockstep theorems `validateLoadedValueProto_char_eq_miri`, `div_lm_d6_offset_disabled_tag_repaired_agrees`, `div_lm_d6_offset_dead_alloc_lockstep_miri`, `div_lm_enum_set_discr_uninit_repaired_agrees`), plus unpatched-`Trusted` baselines and positive / negative canaries |
+| The fixes are frame-local and invariant-preserving | `div_mr_caller_borrow_frame_isolation`, `writePlaceProto_{direct,deref}_frame_isolation`, `writePlaceProto_frame_local_isolation`, `readPlaceProto_and_stmt_borrow_frame_isolation`, `readPlaceProto_direct_frame_isolation`, `disableFrameBorrowsProto_frame_isolation`, `reborrow_inherits_targetFrameDepth`, `disabled_tag_deref_and_reborrow_ub`, `disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound`, `preventsDeallocation_eq_miniRust` |
+| No regression vs. `Trusted` outside the fixes | 235-body MiniRust corpus × 3 argument vectors (705 runs, `CorpusDifferentialTests`): every definite divergence is one of 7 ground-truth fixes; 171 agreements proved by `decide +kernel` (`corpus_agreement_kernel`, `corpus_multifn_agreement_kernel`, `corpus_composite_agreement_kernel`); the 30 fail-closed bodies are exactly the unmodeled construct families (§6) |
+| Part B is a correct, pure IEEE-754 `roundTiesToEven` cast semantics | `roundRatioTiesToEven_correctly_rounded` (exact quantum, ½ ULP, ties-to-even, exact value), `roundRatioTiesToEven_overflow_iff`, `evalFloatToIntSaturating_sound`, `floatToIntValue_monotone`, `evalIntToFloatRoundTiesToEven_sound` (exactness, `i32`/`u32 → f64` lossless), `evalFloatToFloatRoundTiesToEven_sound` (exact widening + round trip, quiet NaN, sNaN canary), `roundRatioBits_sign_and_underflow_zero_preserved`, `b585733184_ties_to_even_separation`, `castKind_end_to_end` (`rfl`); differential tests vs. `fractions` / `struct` and a line-by-line port of lean-miri `Float.lean` (suite) |
+| Axiom hygiene | every declaration `⊆ {propext, Quot.sound}` (suite replay of all declarations + 110 `#guard_msgs` guards); zero `sorry` / `native_decide` / `Classical.choice` |
+
+### Conditions (all required)
+
+1. **Land Part A as one coupled unit.** `targetFrameDepth` must be threaded through *every*
+   borrow-table operation and every deref access (items 1–2); the `Return` deallocation check
+   and frame-borrow disabling (item 4) break `unsafeCellProtectedInteriorMut` without the
+   `preventsDeallocation` `.cell` exemption (item 5, `div_mr_tb_unsafecell_coupling_legacy_breaks`);
+   item 7 needs `allocDead`, the frame-qualified liveness bound, and the zero-delta
+   dead-allocation offset rule together; item 8 needs the protector check and borrow
+   invalidation on both `.uninit` and `.init (.aggregate _ _)`; `Return` must write `_0` with the
+   protector check and invalidation (`div_mr_return_destination_invalidation_and_protector_canary`).
+2. **Update dependents in the same change** (§3): the four char-validation sites
+   (`SimLM2_1`, `SimLM2_4`, `SymReflect`, `AnnealEval`), the `hasProtectedLocalBorrow` /
    `disableLocalBorrows` / storage-revival lemma hypotheses in `Statements.lean` and
-   `L5_ControlAndCalls.lean`; the `ProvenanceWitness` / `RefWitness` statements that flip,
-   including `callRefMutProtected_anneal_ret`), mirror every edit into `V2026_08_01`, and retire
-   the eight IDs in `scripts/run_nightly_verification_suite.py`.
-3. **Do not claim Tree Borrows completeness**: file the direct-local-access gap (§6) as a new
-   tracker item (`DIV-MR-TB-DIRECT-LOCAL-ACCESS`, candidate fix mechanized in
-   `ProtoConfig.directReadTreeBorrows` and `tb_direct_read_freeze_repaired_by_directReadTreeBorrows`).
-4. **Part B scope**: wire `CastKind.{floatToInt, intToFloat, floatToFloat}` for `f32` / `f64`
-   only (`f16` / `f128` stay unsupported); NaN results follow the deterministic
-   `rustc_apfloat` / Miri rule (quiet bit set, payload shifted), one admissible choice under
-   Rust's non-deterministic NaN semantics.
-5. **Upstream hygiene**: replace the `String.toList` match in `translateIntrinsicOrNone` so the
-   MiniRust witnesses themselves become `Classical.choice`-free (§5).
+   `L5_ControlAndCalls.lean`, the `ProvenanceWitness` / `RefWitness` statements that flip
+   (including `callRefMutProtected_anneal_ret` and `twoPhaseDirectWriteTreeBorrowsGap`), the
+   `V2026_08_01` mirror, and the eight tracker IDs.
+3. **Re-run this suite against the patched `Trusted`** (the corpus differential and the kernel
+   agreement theorems): the 5 in-scope corpus divergences must become agreements, the 171
+   agreements must persist, and any change to the 30 fail-closed bodies must be explained.
+4. **Do not claim Tree Borrows completeness.** File `DIV-MR-TB-DIRECT-LOCAL-ACCESS` (direct
+   local `copy` / `move` / reference creation apply no Tree Borrows transition in `Trusted`;
+   `tb_direct_read_freeze_gap_shared_with_trusted`, `tb_direct_reborrow_read_repaired_by_directReadTreeBorrows`)
+   as a separate soundness item, starting from `ProtoConfig.directReadTreeBorrows`.
+5. **Part B scope:** wire `CastKind.{floatToInt, intToFloat, floatToFloat}` for `f32` / `f64`
+   only (`f16` / `f128` stay `.unsupported`); NaN results follow the deterministic
+   `rustc_apfloat` / Miri rule (quiet bit set, payload shifted), which is one admissible choice
+   under Rust's non-deterministic NaN semantics — document it as such.
+6. **Upstream hygiene (non-blocking):** replace the `String.toList` match in
+   `translateIntrinsicOrNone` so the MiniRust witnesses themselves become
+   `Classical.choice`-free (§5).
 
-Track A roadmap (in order): (1) `BorrowEntry.targetFrameDepth` + `allocDead` and frame-qualified
-local access helpers; (2) frame-scoped borrow-table operations, `Return` dealloc check +
-frame-borrow disabling + destination write checks, `preventsDeallocation`; (3) `validateLoadedValue`
-`.char` case, `evalPtrOffsetBinOp` + `ptrAllocByteBound?` + `evalBinOpOffset` dead-allocation
-zero-delta decoupling, `SetDiscriminant` on `.uninit` + `.init`; (4) Part B float casts in
-`evalRvalue`; (5) dependent proof / witness / tracker updates and the `V2026_08_01` mirror;
-(6) re-run this suite's corpus differential against the patched `Trusted` (expected: the 5
-in-scope frame/dealloc divergences of §2b — `callerRefMutSilentWrongLocalMir`,
-`callerBorrowAcrossScalarCallMir`, `callerRefMutProtectedMir`,
-`callerRefMutProtectedBadCallDstMir`, and `retagFnEntryLocalDeallocUb` — become agreements, and
-all 7 become agreements if Track A also lands the optional `Call` arity check and `Return`
-uninit-field shell write).
+### Caveats
+
+* The overlay fails closed on exposed provenance / int-to-pointer casts, `transmute`,
+  wide-pointer and array-element `PtrToPtr`, sub-local byte offsets, index borrow projections,
+  unions, `Len`, unwinding, external calls, and `f16` / `f128` (§6): the validation covers the
+  eight items and the corpus bodies the overlay executes (171 kernel-checked agreements and the
+  7 ground-truth divergences), not those constructs.
+* The two out-of-fragment fixes (`argCountMismatchCaller`, `uninitProjCallDestCaller`) come
+  from overlay behaviors (call arity check, uninit-field shell on return writes) that are
+  optional for Track A (§3).
+* Return values are not re-validated at `Return`, as in `Trusted` (§6).
+
+### Track A roadmap (in order)
+
+1. `BorrowEntry.targetFrameDepth` + `allocDead` and the frame-qualified local access helpers
+   (`readFrameLocal` / `writeFrameLocal` with the root `callerLocals` fallback).
+2. Frame-scoped borrow-table operations; `Return`: deallocation-protector check, frame-borrow
+   disabling (`allocDead := true`), protector release, and destination write with protector
+   check + invalidation; `preventsDeallocation` (`.cell` / `.disabled` exempt).
+3. `validateLoadedValue` `.char` case; `evalPtrOffsetBinOp` / `ptrAllocByteBound?` /
+   `evalBinOpOffset` decoupling (bounds + `allocDead` only, zero-delta rule); `SetDiscriminant`
+   on `.uninit` / `.init` with protector check + invalidation.
+4. Part B float casts in `evalRvalue` (`f32` / `f64`).
+5. Dependent proofs, witnesses, tracker IDs, and the `V2026_08_01` mirror (Condition 2).
+6. Re-run this suite against the patched `Trusted` (Condition 3): expected — the 5 in-scope
+   frame / dealloc divergences (`callerRefMutSilentWrongLocalMir`,
+   `callerBorrowAcrossScalarCallMir`, `callerRefMutProtectedMir`,
+   `callerRefMutProtectedBadCallDstMir`, `retagFnEntryLocalDeallocUb`) become agreements, and all
+   7 if the optional `Call` arity check and `Return` uninit-field shell write also land.
+7. Separately: `DIV-MR-TB-DIRECT-LOCAL-ACCESS` (Condition 4).
+
+### Reproduce
+
+```bash
+cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-worktrees/ws-proto-tcb-correspondence-div8-and-ieee-float
+export PATH="$HOME/.elan/bin:$PATH"
+anneal-lean-run --mode file --concurrency 1 -- lake env lean theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean
+python3 -B -m unittest scripts/test_tcb_correspondence_div8_proto.py -v
+```

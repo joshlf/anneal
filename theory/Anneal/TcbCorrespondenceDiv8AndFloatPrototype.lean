@@ -1267,12 +1267,30 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
         | .none => .ub
         | .some .dead => .ub
         | .some _ =>
-          let tag := s.memory.nextTag
-          let entry : ProtoBorrowEntry :=
-            { tag := tag, targetLocal := place.local_, targetProjection := proj, perm := perm,
-              targetFrameDepth := currentFrameDepth s }
-          .ok (.ptr { allocId := tag, offsetBytes := 0 } 8)
-            { s with memory := { s.memory with borrows := entry :: s.memory.borrows, nextTag := tag + 1 } }
+          -- `ProtoConfig.directReadTreeBorrows` (`DIV-MR-TB-DIRECT-LOCAL-ACCESS` follow-up model):
+          -- creating `&local` / `&mut local` is a read access of the root, i.e. a foreign read for
+          -- the local's other borrows (interior-mutable `.cell` reborrows perform no read).
+          let applyRead : Bool :=
+            match cfg.directReadTreeBorrows, perm with
+            | true, .cell => false
+            | true, _ => true
+            | false, _ => false
+          let d := currentFrameDepth s
+          let prots := s.memory.activeProtectors
+          match Bool.and applyRead
+              (accessUBProto cfg s.memory.borrows prots .read d place.local_ proj .none) with
+          | true => .ub
+          | false =>
+            let borrows₁ :=
+              match applyRead with
+              | true => accessUpdateProto cfg s.memory.borrows prots .read d place.local_ proj .none
+              | false => s.memory.borrows
+            let tag := s.memory.nextTag
+            let entry : ProtoBorrowEntry :=
+              { tag := tag, targetLocal := place.local_, targetProjection := proj, perm := perm,
+                targetFrameDepth := currentFrameDepth s }
+            .ok (.ptr { allocId := tag, offsetBytes := 0 } 8)
+              { s with memory := { s.memory with borrows := entry :: borrows₁, nextTag := tag + 1 } }
   | .rawPtr mutability place =>
     let perm :=
       match mutability with
@@ -4649,6 +4667,41 @@ theorem readPlaceProto_direct_frame_isolation (cfg : ProtoConfig) (s s' : ProtoM
     rw [entryAccessTransitionProto_other_frame _ _ _ _ _ _ _ _ _ hd]
     rfl
 
+
+/-- `_2 = &mut _1; *_2 = 6; _3 = &_1; *_2 = 7; _0 = copy _1`: the *reference creation*
+`&_1` (not a `copy`) is the root's read access that freezes the active `_2`. -/
+def tbDirectReborrowFreezeMir : CapturedMir :=
+  ptrBody "witness::tb_direct_reborrow_freeze"
+    [u32Decl, u32Decl, refMutU32Decl, refSharedU32Decl]
+    [.storageLive 2, .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (derefPlace 2) (.use (constU32 6)),
+     .storageLive 3, .assign (local_ 3) (.ref .shared (local_ 1)),
+     .assign (derefPlace 2) (.use (constU32 7)),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+/-- **A4: the `DIV-MR-TB-DIRECT-LOCAL-ACCESS` candidate fix must also cover reference
+creation.** In Tree Borrows, creating `&_1` from the root is itself a read access, so it
+freezes the active `&mut` borrow `_2` and the next `*_2 = 7` is UB in `MachTB` (step 7:
+`"Tree Borrows: local write of Frozen reference"`), while `Trusted` and the default overlay
+return `7`. B4's knob covered direct `copy` / `move` reads only (it returned `7` here as
+well); `directReadTreeBorrows` now also applies the root read on direct `&local` /
+`&mut local` creation (except interior-mutable `.cell` reborrows) and faults with `.ub`.
+The last conjunct pins the `MachTB` return value `7` of `tbDirectReadBeforeActivationMir`
+(step 8), on which the knob also returns `7`. -/
+theorem tb_direct_reborrow_read_repaired_by_directReadTreeBorrows :
+    runMirProto tbDirectReborrowFreezeMir [] [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨7, 4⟩) ∧
+    trustedRunScalar? tbDirectReborrowFreezeMir [] [.scalar ⟨5, 4⟩] 40 = .some (7, 4) ∧
+    MiniRustSpec.Correspondence.RefWitness.ubAfterTB tbDirectReborrowFreezeMir [.scalar ⟨5, 4⟩] 7 =
+      .some "Tree Borrows: local write of Frozen reference" ∧
+    MiniRustSpec.Correspondence.RefWitness.ubAfterTB tbDirectReborrowFreezeMir [.scalar ⟨5, 4⟩] 6 =
+      .none ∧
+    runMirProto tbDirectReborrowFreezeMir [] [.scalar ⟨5, 4⟩]
+        (cfg := { directReadTreeBorrows := true }) = .ub ∧
+    MiniRustSpec.Correspondence.RefWitness.retAfterTB tbDirectReadBeforeActivationMir
+        [.scalar ⟨5, 4⟩] 8 = tbRetU32 7 :=
+  ⟨ProtoOutcome.eq_of_okScalar? (by decide +kernel), by decide +kernel, by decide +kernel,
+   by decide +kernel, ProtoOutcome.eq_ub_of_isUB (by decide +kernel), by decide +kernel⟩
+
 end PartAWitnesses
 
 /-! ## §5. Part B witnesses: IEEE-754 casts on raw bit patterns -/
@@ -7230,6 +7283,10 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.floatToIntValue_monotone' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms floatToIntValue_monotone
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.tb_direct_reborrow_read_repaired_by_directReadTreeBorrows' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms tb_direct_reborrow_read_repaired_by_directReadTreeBorrows
 
 end AxiomGuards
 
