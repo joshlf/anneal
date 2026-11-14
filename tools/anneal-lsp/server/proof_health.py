@@ -5354,23 +5354,27 @@ _LEAN_IN_PREFIX_CMD_RE = re.compile(
     r"(?:set_option|open|variable|universe|attribute|include|omit|export|"
     r"notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules)\b"
 )
-_LEAN_IN_TOKEN_RE = re.compile(r"[(){}\[\]\n]|(?<![\w'!?.\u00bb])in(?![\w'!?.\u00bb])")
+_LEAN_IN_TOKEN_RE = re.compile(r"[(){}\[\]\n]|:=|(?<![\w'!?.\u00bb])in(?![\w'!?.\u00bb])")
 
 
-def _skip_lean_prefixes_attrs_and_modifiers(code_only: str, pos: int) -> int:
+def _skip_lean_prefixes_attrs_and_modifiers(
+    code_only: str, pos: int, limit: int | None = None
+) -> int:
     """Advance `pos` past any whitespace, `@[...]` attributes, declaration modifiers, and
     `<command> in` prefixes (`set_option ... in`, `open ... in`, `variable ... in`,
     `attribute ... in`, ...) to the declaration keyword (`theorem`, `lemma`, `def`, ...)."""
-    n = len(code_only)
+    end_lim = len(code_only) if limit is None else min(len(code_only), limit)
     p = pos
-    while p < n:
+    while p < end_lim:
         q = _skip_lean_attrs_and_modifiers(code_only, p)
+        if q >= end_lim:
+            return end_lim
         m = _LEAN_IN_PREFIX_CMD_RE.match(code_only, q)
-        if m is None:
+        if m is None or m.end() > end_lim:
             return q
         depth = 0
         in_end = -1
-        for tm in _LEAN_IN_TOKEN_RE.finditer(code_only, m.end()):
+        for tm in _LEAN_IN_TOKEN_RE.finditer(code_only, m.end(), end_lim):
             tok = tm.group()
             if tok in "({[":
                 depth += 1
@@ -5380,11 +5384,13 @@ def _skip_lean_prefixes_attrs_and_modifiers(code_only: str, pos: int) -> int:
             elif tok == "in" and depth == 0:
                 in_end = tm.end()
                 break
+            elif tok == ":=" and depth == 0:
+                break
             elif tok == "\n" and depth == 0:
                 cand = tm.end()
-                while cand < n and code_only[cand] in " \t":
+                while cand < end_lim and code_only[cand] in " \t\r\n":
                     cand += 1
-                if cand < n and _is_lean_command_start(code_only, cand):
+                if cand < end_lim and _is_lean_command_start(code_only, cand):
                     break
         if in_end == -1:
             return q
@@ -5902,17 +5908,45 @@ def _any_disjunct_trivial(expr: str) -> bool:
     return found_trivial or _is_trivially_true(expr[start:])
 
 
+_STANDALONE_EQ_SPLIT_RE = re.compile(r"[()\[\]{}]|(?<![=!<>:])=(?!=)")
+
+
+def _split_top_level_eq(expr: str) -> list[str]:
+    """Split `expr` on top-level standalone `=` (excluding `==`, `:=`, `!=`, `<=`, `>=`) outside `()[]{}`."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for m in _STANDALONE_EQ_SPLIT_RE.finditer(expr):
+        t = m.group(0)
+        if t in "([{":
+            depth += 1
+        elif t in ")]}":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            parts.append(expr[start : m.start()])
+            start = m.end()
+    parts.append(expr[start:])
+    return [_norm_expr(p) for p in parts]
+
+
 def _is_trivially_true(conj: str) -> bool:
-    """`True`, `¬ False`, a reflexive `a = a` / `a ↔ a` / `a ≤ a` conjunct, or a universally
-    quantified `∀ ..., <trivial>` whose body is itself trivially true."""
-    c = conj.strip()
-    if c in ("True", "¬ False", "¬False"):
+    """`True`, `¬ False`, a reflexive `a = a` / `a ↔ a` / `a ≤ a` conjunct, a parenthesized
+    trivial conjunction/disjunction, or a universally quantified `∀ ..., <trivial>` whose body is
+    itself trivially true."""
+    raw = conj.strip()
+    if raw in ("True", "¬ False", "¬False"):
         return True
-    if "=" not in c and "↔" not in c and "≤" not in c and "True" not in c and "False" not in c:
+    if "=" not in raw and "↔" not in raw and "≤" not in raw and "True" not in raw and "False" not in raw:
         return False
-    c = _norm_expr(c)
+    c = _norm_expr(raw)
     if c in ("True", "¬ False", "¬False"):
         return True
+    if len(c) < len(raw):
+        if "∧" in c and _all_conjuncts_trivial(c):
+            return True
+        if "∨" in c and _any_disjunct_trivial(c):
+            return True
     if c.startswith("∀") or (
         c.startswith("forall") and len(c) > 6 and not _is_lean_ident_char(c[6])
     ):
@@ -5935,11 +5969,29 @@ def _is_trivially_true(conj: str) -> bool:
     for op in ("↔", "≤", "="):
         if op not in c:
             continue
-        if op == "=" and ("==" in c or "≠" in c or "≤" in c or "≥" in c or ":=" in c):
+        if op == "=":
+            if c.count("=") == 1 and ":=" not in c:
+                lhs, _, rhs = c.partition("=")
+                if (
+                    lhs.count("(") == lhs.count(")")
+                    and lhs.count("[") == lhs.count("]")
+                    and lhs.count("{") == lhs.count("}")
+                ):
+                    nl = _norm_expr(lhs)
+                    if nl and nl == _norm_expr(rhs):
+                        return True
+                continue
+            sides = _split_top_level_eq(c)
+            if len(sides) == 2 and sides[0] and sides[0] == sides[1]:
+                return True
             continue
         if c.count(op) == 1:
             lhs, _, rhs = c.partition(op)
-            if lhs.count("(") == lhs.count(")") and lhs.count("[") == lhs.count("]"):
+            if (
+                lhs.count("(") == lhs.count(")")
+                and lhs.count("[") == lhs.count("]")
+                and lhs.count("{") == lhs.count("}")
+            ):
                 nl = _norm_expr(lhs)
                 if nl and nl == _norm_expr(rhs):
                     return True
@@ -6048,9 +6100,9 @@ def _check_hypothesis_contradiction(
         inner = _norm_expr(h[1:])
         if inner == "True":
             return f"negated `True` hypothesis `{h}`"
-        if "=" in inner and "==" not in inner and "≠" not in inner and "≤" not in inner:
-            lhs, _, rhs = inner.partition("=")
-            if _norm_expr(lhs) and _norm_expr(lhs) == _norm_expr(rhs):
+        if "=" in inner:
+            eq_sides = _split_top_level_eq(inner)
+            if len(eq_sides) == 2 and eq_sides[0] and eq_sides[0] == eq_sides[1]:
                 return f"negated reflexive equality `{h}`"
 
     # Check `lhs < rhs` for `x < x`, `< 0`, or numeric `5 < 3`
@@ -6560,15 +6612,26 @@ def _audit_lean_theorem(
 def _lean_comment_groups(
     code_only: str, comment_blocks: list[tuple[int, int, int, str, str]]
 ) -> list[tuple[int, int, list[tuple[int, str, str]]]]:
-    """Group consecutive non-module-doc Lean comments separated only by whitespace."""
+    """Group consecutive non-module-doc Lean comments of the same declaration (separated only by
+    whitespace, `@[...]` attributes, declaration modifiers, or `<command> in` prefixes)."""
     groups: list[tuple[int, int, list[tuple[int, str, str]]]] = []
     for c_start, c_end, c_line, c_body, c_kind in comment_blocks:
         if groups and c_kind != "m":
             p_start, p_end, p_list = groups[-1]
-            if p_list[-1][2] != "m" and code_only[p_end:c_start].strip() == "":
-                p_list.append((c_line, c_body, c_kind))
-                groups[-1] = (p_start, c_end, p_list)
-                continue
+            if p_list[-1][2] != "m":
+                gap = code_only[p_end:c_start]
+                if (
+                    not gap
+                    or gap.isspace()
+                    or (
+                        c_start - p_end <= 512
+                        and ":=" not in gap
+                        and _skip_lean_prefixes_attrs_and_modifiers(code_only, p_end, c_start) >= c_start
+                    )
+                ):
+                    p_list.append((c_line, c_body, c_kind))
+                    groups[-1] = (p_start, c_end, p_list)
+                    continue
         groups.append((c_start, c_end, [(c_line, c_body, c_kind)]))
     return groups
 
@@ -6965,10 +7028,11 @@ def audit_lean_text(
             if d_start < n_code:
                 prev_m = decl_comment_map.get(d_start)
                 decl_comment_map[d_start] = f"{prev_m}\n{meta_text}" if prev_m else meta_text
-                kw_off = _skip_lean_prefixes_attrs_and_modifiers(code_only, d_start)
-                if kw_off < n_code and kw_off != d_start:
-                    prev_kw = decl_comment_map.get(kw_off)
-                    decl_comment_map[kw_off] = f"{prev_kw}\n{meta_text}" if prev_kw else meta_text
+                if not code_only.startswith(("theorem ", "lemma ", "def ", "abbrev "), d_start):
+                    kw_off = _skip_lean_prefixes_attrs_and_modifiers(code_only, d_start)
+                    if kw_off < n_code and kw_off != d_start:
+                        prev_kw = decl_comment_map.get(kw_off)
+                        decl_comment_map[kw_off] = f"{prev_kw}\n{meta_text}" if prev_kw else meta_text
             continue
 
         decl_info = _extract_lean_decl_span(code_only, grp_end, text)
@@ -6997,14 +7061,15 @@ def audit_lean_text(
             decl_comment_map[kw_off] = f"{prev_kw}\n{meta_text}" if prev_kw else meta_text
         if comment_starts is None:
             comment_starts = [c[0] for c in comment_blocks]
-        # `<command> in` prefixes above the docstring belong to the pinned command.
+        # `<command> in` prefixes above or between comments in the group belong to the pinned command.
         p_start = _lean_in_prefix_start(code_only, grp_start)
+        code_start = p_start
+        while code_start < d_start and code_only[code_start] in " \t\r\n":
+            code_start += 1
         hash_input = waiver_hash_input(
             anns,
             _normalize_lean_decl(
-                _no_comments_slice(
-                    text, comment_blocks, comment_starts, p_start if p_start < grp_start else d_start, d_end
-                )
+                _no_comments_slice(text, comment_blocks, comment_starts, code_start, d_end)
             ),
         )
         findings.extend(_validate_waiver_block(anns, block_pins, d_name, hash_input))
@@ -7132,21 +7197,21 @@ def _lean_in_prefix_start(code_only: str, pos: int) -> int:
         if _LEAN_IN_SUFFIX_RE.search(code_only, line_start, q) is None:
             return start
         cmd = line_start
-        found_prefix_cmd = False
+        found_start = -1
         for _ in range(64):
             k = cmd
             while k < q and code_only[k] in " \t":
                 k += 1
             kw = _skip_lean_attrs_and_modifiers(code_only, k)
             if _LEAN_IN_PREFIX_CMD_RE.match(code_only, kw) is not None:
-                found_prefix_cmd = True
+                found_start = k
                 break
             if _is_lean_command_start(code_only, k) or cmd == 0:
                 break
             cmd = code_only.rfind("\n", 0, cmd - 1) + 1
-        if not found_prefix_cmd or cmd >= start:
+        if found_start == -1 or found_start >= start:
             return start
-        start = cmd
+        start = found_start
 
 
 def compute_lean_decl_pins(text: str) -> dict[str, str]:
@@ -7172,8 +7237,7 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
                 anns_by_decl[key_off] = list(anns)
             if key_off not in grp_start_by_decl or grp_start < grp_start_by_decl[key_off]:
                 grp_start_by_decl[key_off] = grp_start
-            if key_off not in post_doc_start_by_decl or d < post_doc_start_by_decl[key_off]:
-                post_doc_start_by_decl[key_off] = d
+            post_doc_start_by_decl[key_off] = d
     pins: dict[str, str] = {}
     pos = 0
     while pos < n:
@@ -7196,16 +7260,18 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
             pos = doc_grp_start
             continue
         post_doc_d = post_doc_start_by_decl.get(kw_off, d_start)
-        span_start = post_doc_d if post_doc_d < d_start else d_start
-        d_end = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, span_start, text), text)
-        lead = grp_start_by_decl.get(kw_off, span_start)
+        d_end = _find_lean_decl_end(
+            code_only, hdr_end, _lean_indent_of(code_only, post_doc_d, text), text
+        )
+        lead = grp_start_by_decl.get(kw_off, post_doc_d)
         p_start = _lean_in_prefix_start(code_only, lead)
+        code_start = p_start
+        while code_start < post_doc_d and code_only[code_start] in " \t\r\n":
+            code_start += 1
         hash_input = waiver_hash_input(
             anns_by_decl.get(kw_off, []),
             _normalize_lean_decl(
-                _no_comments_slice(
-                    text, comment_blocks, comment_starts, p_start if p_start < lead else span_start, d_end
-                )
+                _no_comments_slice(text, comment_blocks, comment_starts, code_start, d_end)
             ),
         )
         pins[d_name] = format_pin_tag(compute_sha256_pin12(hash_input))

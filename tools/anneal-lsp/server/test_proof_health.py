@@ -4410,5 +4410,92 @@ class TestB3PinAndScopeProperties(unittest.TestCase):
         self.assertEqual(failures, [])
 
 
+class TestA4MultiDocstringInPrefixesAndOperatorTriviality(unittest.TestCase):
+    """[adv ep2-A4] Multi-docstring `<command> in` / `@[...]` grouping, indented `<command> in`
+    prefix pin alignment, standalone `open Foo` before `let ... in` rejection, and parenthesized /
+    operator-bearing (`==`, `:=`, `≤`) trivial conclusion and negated reflexive hypothesis checks."""
+
+    def test_multiple_docstrings_separated_by_in_prefix_or_attributes_and_indented_in_prefix(self) -> None:
+        ct = _load_check_trusted()
+        for label, src in (
+            (
+                "in-between-docstrings",
+                "/-- anneal:documented_intent first waiver -/\n"
+                "set_option maxHeartbeats 200000 in\n"
+                "/-- anneal:allow_compile_time_guard\nPIN\n-/\n"
+                "theorem t : True := trivial\n",
+            ),
+            (
+                "attr-between-docstrings",
+                "/-- anneal:documented_intent first waiver -/\n"
+                "@[simp]\n"
+                "/-- anneal:allow_compile_time_guard\nPIN\n-/\n"
+                "theorem t : True := trivial\n",
+            ),
+            (
+                "indented-in-after-comment",
+                "-- comment before set_option\n"
+                "  set_option maxHeartbeats 200000 in\n"
+                "/-- anneal:allow_compile_time_guard\nPIN\n-/\n"
+                "theorem t : True := trivial\n",
+            ),
+        ):
+            draft = src.replace("PIN\n", "")
+            pins = proof_health.compute_lean_decl_pins(draft)
+            self.assertEqual(ct.compute_lean_decl_pins(draft), pins, label)
+            pinned = src.replace("PIN", pins["t"])
+            self.assertEqual(proof_health.audit_lean_text(pinned, check_3axis=False), [], label)
+            self.assertEqual(ct.audit_lean_text(pinned, check_3axis=False), [], label)
+            drifted = pinned.replace("trivial", "True.intro")
+            self.assertIn(
+                proof_health.RULE_DRIFTED_WAIVER_PIN,
+                _rules(proof_health.audit_lean_text(drifted, check_3axis=False)),
+                label,
+            )
+
+        # Standalone `open Foo` (without `in`) before a theorem containing `let x := 1 in` must NOT
+        # be mistaken for an `open ... in` prefix.
+        dangling_open = (
+            "/-- anneal:allow_compile_time_guard -/\n"
+            "open Foo\n"
+            "theorem t : let x := 1 in x = 1 := rfl\n"
+        )
+        self.assertEqual(
+            _rules(proof_health.audit_lean_text(dangling_open, check_3axis=False)),
+            [proof_health.RULE_DANGLING_WAIVER],
+        )
+
+    def test_parenthesized_conjunct_disjunct_and_operator_bearing_reflexive_triviality(self) -> None:
+        for conc in (
+            "(x == y) = (x == y)",
+            "({ a := x } : S) = ({ a := x } : S)",
+            "(x ≤ y) = (x ≤ y)",
+            "(True ∧ x = x) ∧ y = y",
+            "(P ∨ True) ∨ Q",
+            "(x = x ∨ P) ∧ (y = y)",
+        ):
+            src = (
+                "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n"
+                f"theorem t (x y : Nat) (P Q : Prop) : {conc} := by sorry\n"
+            )
+            self.assertIn(
+                proof_health.RULE_TRIVIAL_CONCLUSION,
+                _rules(proof_health.audit_lean_text(src, vacuity_scope="all")),
+                conc,
+            )
+
+        for hyp in (
+            "¬ ((x == y) = (x == y))",
+            "¬ (({ a := x } : S) = ({ a := x } : S))",
+            "¬ ((x ≤ y) = (x ≤ y))",
+        ):
+            src = f"theorem t (x y : Nat) (h : {hyp}) : x = y := by contradiction\n"
+            self.assertIn(
+                proof_health.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(proof_health.audit_lean_text(src, vacuity_scope="annotated")),
+                hyp,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

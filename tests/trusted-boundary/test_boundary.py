@@ -642,6 +642,17 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             executed=False,
         )
         assert "[trivial_conclusion]" in str(err_in_meta), str(err_in_meta)
+        err_paren_eq = checked(
+            fixture(
+                header
+                + "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n"
+                + "theorem vacParen (x y : Nat) : (True ∧ x = x) ∧ (x == y) = (x == y) := ⟨⟨trivial, rfl⟩, rfl⟩\n"
+            ),
+            expected=1,
+            phase="vacuity-audit",
+            executed=False,
+        )
+        assert "[trivial_conclusion]" in str(err_paren_eq), str(err_paren_eq)
 
         # 18c. trusted/rustc-capture Rust sources: an unpinned `///` waiver and an escaped
         # `#[doc = "anneal\x3a..."]` directive are rejected; the pinned item passes the audit.
