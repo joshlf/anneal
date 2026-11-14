@@ -857,6 +857,20 @@ def validate_performed_itree_summary(summary: dict[str, Any]) -> tuple[bool, str
                 False,
                 f"itree finding[{idx}] has invalid divergence diag_tag {f['diag_tag']!r}",
             )
+        if "seed_index" in f and not is_nonneg_int(f.get("seed_index")):
+            return (
+                False,
+                f"itree finding[{idx}] has invalid 'seed_index' {f.get('seed_index')!r}",
+            )
+        if "applied_mutators" in f:
+            it_muts = f.get("applied_mutators")
+            if not isinstance(it_muts, list) or not all(
+                isinstance(m, str) and m.strip() for m in it_muts
+            ):
+                return (
+                    False,
+                    f"itree finding[{idx}] has invalid 'applied_mutators' {it_muts!r}",
+                )
         if not isinstance(f.get("kernel_confirmed"), bool):
             return False, f"itree finding[{idx}] has non-boolean 'kernel_confirmed'"
 
@@ -2452,10 +2466,28 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
                     )
                 seen_finding_fns.add(fn_name.strip())
             f_lean_tag = f.get("anneal_lean_tag")
-            if isinstance(f_lean_tag, str) and normalize_anneal_tag(f_lean_tag) == "none":
-                reasons.append(
-                    f"{label}: findings[{idx}] has anneal_lean_tag 'none' on a divergence finding"
-                )
+            if isinstance(f_lean_tag, str):
+                norm_f_lean = normalize_anneal_tag(f_lean_tag)
+                if norm_f_lean == "none":
+                    reasons.append(
+                        f"{label}: findings[{idx}] has anneal_lean_tag 'none' on a divergence finding"
+                    )
+                elif norm_f_lean in (
+                    "MirDiffTag.unsupported",
+                    "MirDiffTag.outOfFuel",
+                ) or norm_f_lean.startswith("MirDiffTag.externalCall"):
+                    reasons.append(
+                        f"{label}: findings[{idx}] has non-divergence anneal_lean_tag "
+                        f"{f_lean_tag!r} on a divergence finding"
+                    )
+            if "applied_mutators" in f:
+                f_muts = f.get("applied_mutators")
+                if not isinstance(f_muts, list) or not all(
+                    isinstance(m, str) and m.strip() for m in f_muts
+                ):
+                    reasons.append(
+                        f"{label}: findings[{idx}] has invalid applied_mutators {f_muts!r}"
+                    )
             polarity = f.get("witness_polarity")
             div_cls = f.get("divergence_class")
             if isinstance(div_cls, str) and div_cls in class_tallies:
@@ -4116,6 +4148,7 @@ def _resolve_preamble_fault_line_no(
     if line_no >= cand_fn_start_line:
         return line_no
     call_targets: tuple[str, ...] = ()
+    always_faults = False
     for idx in range(line_no - 1, -1, -1):
         stripped = src_lines[idx].lstrip()
         if stripped.startswith("macro_rules! write_bytes"):
@@ -4134,8 +4167,10 @@ def _resolve_preamble_fault_line_no(
                     "helper_unwind_mid(",
                     "helper_unwind_guarded(",
                 )
+                always_faults = True
             elif _is_rust_ident_segment(ident):
                 call_targets = (f"{ident}(",)
+                always_faults = ident == "helper_frozen_reborrow_write_in_callee"
             break
     if not call_targets:
         return line_no
@@ -4143,6 +4178,8 @@ def _resolve_preamble_fault_line_no(
     for cand_idx in range(cand_fn_start_line - 1, len(src_lines)):
         text = src_lines[cand_idx]
         if any(t in text for t in call_targets):
+            if always_faults:
+                return cand_idx + 1
             if first_call_line is None:
                 first_call_line = cand_idx + 1
             if any(tok in text for tok in ALL_MIRI_MUTATOR_TOKENS):
@@ -4282,14 +4319,12 @@ def quarantine_match_keys_for_itree_finding(finding: dict[str, Any]) -> tuple[st
     fn_name = str(finding["fn_name"])
     seed_name = f"itree_seed_{finding.get('seed_index', 0)}"
     mutators = finding.get("applied_mutators")
-    cause = (
-        mutators[0].strip()
+    first_mutator = (
+        next((m.strip() for m in mutators if isinstance(m, str) and m.strip()), "")
         if isinstance(mutators, list)
-        and len(mutators) > 0
-        and isinstance(mutators[0], str)
-        and mutators[0].strip()
-        else seed_name
+        else ""
     )
+    cause = first_mutator or seed_name
     diag_tag = str(finding["diag_tag"])
     div_class = f"itree_{diag_tag}"
     fp = f"{cause}:{div_class}:TraceReplayDiag.{diag_tag}"
@@ -4393,14 +4428,12 @@ def deduplicate_and_quarantine_itree_findings(
         seed_idx = f.get("seed_index", 0)
         seed_name = f"itree_seed_{seed_idx}"
         mutators = f.get("applied_mutators")
-        cause = (
-            mutators[0].strip()
+        first_mutator = (
+            next((m.strip() for m in mutators if isinstance(m, str) and m.strip()), "")
             if isinstance(mutators, list)
-            and len(mutators) > 0
-            and isinstance(mutators[0], str)
-            and mutators[0].strip()
-            else seed_name
+            else ""
         )
+        cause = first_mutator or seed_name
         diag_tag = str(f["diag_tag"])
         div_class = f"itree_{diag_tag}"
         norm_tag = f"TraceReplayDiag.{diag_tag}"
@@ -5619,19 +5652,35 @@ def _reported_variant_problems(
     }
 
 
-def _json_safe(value: Any) -> Any:
+def _json_safe(value: Any, _seen: set[int] | None = None) -> Any:
     """A strict-JSON copy of a semantic-mutant result: tuples become lists, keys
     become strings, and anything else that JSON cannot carry (sets, objects,
-    non-finite floats) becomes its `repr`, so a custom evaluator's passed-through
-    values can never crash the summary JSON, Markdown, or JUnit rendering."""
-    if value is None or isinstance(value, (bool, int, str)):
+    non-finite floats, >256-bit integers, cyclic containers) becomes a safe string
+    representation, so a custom evaluator's passed-through values can never crash
+    the summary JSON, Markdown, or JUnit rendering."""
+    if value is None or isinstance(value, (bool, str)):
         return value
+    if isinstance(value, int):
+        return (
+            value
+            if abs(value) <= (1 << 256)
+            else f"<int bit_length={value.bit_length()}>"
+        )
     if isinstance(value, float):
         return value if value == value and abs(value) != float("inf") else repr(value)
+    seen = set() if _seen is None else _seen
     if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
+        obj_id = id(value)
+        if obj_id in seen:
+            return "<cyclic dict>"
+        next_seen = seen | {obj_id}
+        return {str(k): _json_safe(v, next_seen) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
+        obj_id = id(value)
+        if obj_id in seen:
+            return "<cyclic list>"
+        next_seen = seen | {obj_id}
+        return [_json_safe(v, next_seen) for v in value]
     return repr(value)
 
 

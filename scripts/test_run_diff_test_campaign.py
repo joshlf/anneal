@@ -8670,5 +8670,152 @@ class PassEp2A3AdversarialRegressionTest(unittest.TestCase):
         self.assertEqual(campaign.infer_finding_cause(finding, set()), "s01_checked_add")
 
 
+class PassEp2B4AdversarialRegressionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_seed_call_to_always_faulting_preamble_helper_beats_later_mutator_call(
+        self,
+    ) -> None:
+        prefix = _repro_prefix()
+        prefix_lines = prefix.splitlines()
+        frozen_line = next(
+            idx + 1 for idx, line in enumerate(prefix_lines) if "*r = 99u32;" in line
+        )
+        unwind_leaf_line = next(
+            idx + 1 for idx, line in enumerate(prefix_lines) if "base + delta" in line
+        )
+        # When corpus seed `ub_tb_frozen_reborrow_write_in_callee` or
+        # `panic_unwind_across_mid_and_leaf` calls the always-faulting preamble helper
+        # in its unmutated seed prefix AND `TreeBorrowsRetagInterleaver` appends a
+        # second call to the same helper at the end of the candidate function, the
+        # seed's call executes and faults first, so the finding must be attributed to
+        # the seed rather than the appended mutator call.
+        seed_then_mut_frozen = {
+            "seed_name": "ub_tb_frozen_reborrow_write_in_callee",
+            "applied_mutators": ["TreeBorrowsRetagInterleaver"],
+            "mutant_source": (
+                prefix
+                + "pub fn ub_tb_frozen_reborrow_write_in_callee__b0_c0() -> u32 {\n"
+                "    let v: u32 = helper_frozen_reborrow_write_in_callee(10u32);\n"
+                "    let mut __ub_prot_slot: u32 = 10u32;\n"
+                "    let __ub_prot_raw: *mut u32 = &raw mut __ub_prot_slot;\n"
+                "    let __miri_tb_9: u32 = helper_frozen_reborrow_write_in_callee(unsafe { *__ub_prot_raw });\n"
+                "    v ^ __miri_tb_9\n"
+                "}\n"
+            ),
+            "miri_pos": f"src/lib.rs:{frozen_line}:5",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(seed_then_mut_frozen, set()),
+            "ub_tb_frozen_reborrow_write_in_callee",
+        )
+
+        seed_then_mut_unwind = {
+            "seed_name": "panic_unwind_across_mid_and_leaf",
+            "applied_mutators": ["TreeBorrowsRetagInterleaver"],
+            "mutant_source": (
+                prefix
+                + "pub fn panic_unwind_across_mid_and_leaf__b0_c1() -> u32 {\n"
+                "    let slot: u32 = 10u32;\n"
+                "    let v: u32 = helper_unwind_mid(&slot, u32::MAX);\n"
+                "    let __tb_u_slot: u32 = 10u32;\n"
+                "    let __miri_tb_4: u32 = helper_unwind_mid(&__tb_u_slot, u32::MAX);\n"
+                "    v ^ __miri_tb_4\n"
+                "}\n"
+            ),
+            "miri_pos": f"src/lib.rs:{unwind_leaf_line}:5",
+        }
+        self.assertEqual(
+            campaign.infer_finding_cause(seed_then_mut_unwind, set()),
+            "panic_unwind_across_mid_and_leaf",
+        )
+
+    def test_itree_applied_mutators_and_finding_non_divergence_lean_tags_and_json_safe_cycles(
+        self,
+    ) -> None:
+        # 1. ITree `quarantine_match_keys_for_itree_finding`,
+        #    `deduplicate_and_quarantine_itree_findings`, and
+        #    `validate_performed_itree_summary` handle `applied_mutators` and
+        #    `seed_index` consistently with Miri.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            fp = "CallBoundaryOutliner:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
+            it_rep = make_healthy_itree_report(state_dir, fingerprints=[fp])
+            it_f = dict(it_rep["findings"][0], applied_mutators=["   ", "CallBoundaryOutliner"])
+            it_fp, it_keys = campaign.quarantine_match_keys_for_itree_finding(it_f)
+            self.assertEqual(it_fp, fp)
+            self.assertIn("CallBoundaryOutliner", it_keys)
+            dedup_it, _, _ = campaign.deduplicate_and_quarantine_itree_findings([it_f], set())
+            self.assertEqual(dedup_it[0].cause, "CallBoundaryOutliner")
+
+            for bad_muts in (None, "CallBoundaryOutliner", ["   "], ["CallBoundaryOutliner", 7]):
+                with self.subTest(itree_applied_mutators=bad_muts):
+                    bad_it = copy.deepcopy(it_rep)
+                    bad_it["findings"][0]["applied_mutators"] = bad_muts
+                    ok_it, reason_it = campaign.validate_performed_itree_summary(bad_it)
+                    self.assertFalse(ok_it)
+                    self.assertIn("applied_mutators", reason_it)
+            for bad_seed_idx in (-1, True, "0"):
+                with self.subTest(itree_seed_index=bad_seed_idx):
+                    bad_it = copy.deepcopy(it_rep)
+                    bad_it["findings"][0]["seed_index"] = bad_seed_idx
+                    ok_it, reason_it = campaign.validate_performed_itree_summary(bad_it)
+                    self.assertFalse(ok_it)
+                    self.assertIn("seed_index", reason_it)
+
+            # 2. `witness_polarity_accounting_problems` rejects non-divergence
+            #    `anneal_lean_tag`s (`MirDiffTag.unsupported`, `MirDiffTag.outOfFuel`,
+            #    `MirDiffTag.externalCall`) and malformed `applied_mutators` on findings.
+            miri_fp = "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar"
+            for bad_lean in (
+                "MirDiffTag.unsupported",
+                "MirDiffTag.outOfFuel",
+                '(MirDiffTag.externalCall "core::panicking::panic_fmt")',
+            ):
+                with self.subTest(anneal_lean_tag=bad_lean):
+                    rep = make_healthy_miri_report(state_dir, fingerprints=[miri_fp])
+                    rep["findings"][0]["anneal_lean_tag"] = bad_lean
+                    probs = campaign.witness_polarity_accounting_problems(rep)
+                    self.assertTrue(
+                        any("non-divergence anneal_lean_tag" in p for p in probs), probs
+                    )
+            rep_bad_mut = make_healthy_miri_report(state_dir, fingerprints=[miri_fp])
+            rep_bad_mut["findings"][0]["applied_mutators"] = ["   "]
+            probs_mut = campaign.witness_polarity_accounting_problems(rep_bad_mut)
+            self.assertTrue(any("invalid applied_mutators" in p for p in probs_mut), probs_mut)
+
+        # 3. `_json_safe` handles cyclic containers and >4300-digit ints without raising
+        #    `RecursionError` or `ValueError` in `json.dumps` / `render_gate_report_sections`.
+        cyclic_dict: dict[str, Any] = {}
+        cyclic_dict["self"] = cyclic_dict
+        cyclic_list: list[Any] = []
+        cyclic_list.append(cyclic_list)
+        huge_int = 10**5000
+        mutant = next(
+            m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "bool_valid_range"
+        )
+        for name, detail_val in (
+            ("cyclic_dict", cyclic_dict),
+            ("cyclic_list", cyclic_list),
+            ("huge_int", huge_int),
+        ):
+            with self.subTest(case=name):
+                report = campaign.run_semantic_mutant_self_check(
+                    evaluator=lambda m, dv=detail_val: {
+                        "killed": True,
+                        "kill_class": "missed_ub",
+                        "witness_polarity": UNSOUND,
+                        "detail": dv,
+                    },
+                    mutants=[mutant],
+                )
+                self.assertTrue(report["passed"], report)
+                dumped = json.dumps(report)
+                self.assertEqual(campaign._strict_json_loads(dumped), report)
+                rendered = campaign.render_gate_report_sections(report, None)
+                self.assertIn("bool_valid_range", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
