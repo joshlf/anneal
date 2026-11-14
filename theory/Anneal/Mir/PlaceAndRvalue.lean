@@ -17148,6 +17148,82 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex
     simp only [hEqB]
     cases Nat.ble a₁ a₂ <;> rfl
 
+/-- `Trusted`'s 1-byte encoding of an `Ordering` for `BinOp.cmp` (`Less ↦ 255 = -1i8`,
+`Equal ↦ 0`, `Greater ↦ 1`). -/
+def orderingCmpScalar : Ordering → ScalarInt
+  | .lt => ⟨255, 1⟩
+  | .eq => ⟨0, 1⟩
+  | .gt => ⟨1, 1⟩
+
+/-- **Lexicographic `cmp` on wide pointers as an `Ordering`** (on `evalRvalue`): `lhs.cmp(rhs)` is
+exactly the lexicographic ordering `(compare a₁ a₂).then (compare m₁ m₂)` of the
+`(data address, metadata)` pairs, encoded by `orderingCmpScalar` (rather than a restatement of
+`Trusted`'s nested `Nat.beq` / `Nat.ble` matches). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_cmp_ordering
+    (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (a₁ a₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
+    (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
+    (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
+    (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+    (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+    (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+    (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
+      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp .cmp lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (orderingCmpScalar ((compare a₁ a₂).then (compare m₁ m₂)))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex locals locals₁ locals₂ lhsOp rhsOp mem
+    localDecls layouts lhsThin lhsMeta rhsThin rhsMeta a₁ a₂ m₁ m₂ hL hR hPtrOp hLhsMetaTy
+    hRhsMetaTy hExp hA₁ hA₂ hM₁ hM₂ hPb]
+  have hbleF : ∀ x y : Nat, y < x → Nat.ble x y = false := by
+    intro x y hxy
+    cases h : Nat.ble x y
+    · rfl
+    · exact absurd (Nat.le_of_ble_eq_true h) (Nat.not_le.mpr hxy)
+  rcases Nat.lt_trichotomy a₁ a₂ with ha | ha | ha
+  · rw [nat_beq_eq_false_of_ne (Nat.ne_of_lt ha), Nat.ble_eq_true_of_le (Nat.le_of_lt ha),
+      Nat.compare_eq_lt.mpr ha] <;> rfl
+  · subst ha
+    rw [Nat.beq_refl, Nat.compare_eq_eq.mpr rfl]
+    rcases Nat.lt_trichotomy m₁ m₂ with hm | hm | hm
+    · rw [nat_beq_eq_false_of_ne (Nat.ne_of_lt hm), Nat.ble_eq_true_of_le (Nat.le_of_lt hm),
+        Nat.compare_eq_lt.mpr hm] <;> rfl
+    · subst hm
+      rw [Nat.beq_refl, Nat.compare_eq_eq.mpr rfl] <;> rfl
+    · rw [nat_beq_eq_false_of_ne (Nat.ne_of_gt hm), hbleF m₁ m₂ hm, Nat.compare_eq_gt.mpr hm] <;>
+        rfl
+  · rw [nat_beq_eq_false_of_ne (Nat.ne_of_gt ha), hbleF a₁ a₂ ha, Nat.compare_eq_gt.mpr ha] <;> rfl
+
+/-- **Non-relational `BinOp`s on two wide pointers are unsupported** (on `evalRvalue`): arithmetic,
+bitwise, shift, and `offset` operators applied to two 2-word wide aggregates never produce `.ok` or
+`.ub` — `Trusted` returns `.unsupported` (Rust has no such operators on fat pointers). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_nonrelational_unsupported
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
+    (hNotRel : isRelationalBinOp op = false) :
+    evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts = .unsupported := by
+  rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ op lhsOp rhsOp mem
+    localDecls layouts 0 0 _ _ hL hR]
+  show (match Bool.and (isRelationalBinOp op) _ with
+    | true => _
+    | false => RvalueEvalResult.unsupported) = _
+  rw [hNotRel]
+  rfl
+
 end WidePtrSliceRvalueRefinement
 
 end Anneal.Mir.PlaceAndRvalue

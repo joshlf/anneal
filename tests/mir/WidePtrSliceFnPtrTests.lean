@@ -419,7 +419,21 @@ theorem unsize_callerLocals_ok_64 :
     [refArray5Decl] testLayouts64 true .not u32Ty 3
     { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨99, 0⟩ 5
     callerBorrowEntry backing [] 0 backingElems 0
-    rfl rfl rfl rfl rfl rfl rfl rfl rfl).2.mpr rfl
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl).2.2.1.mpr rfl
+
+/-- Cross-frame `callerLocals` borrow at element offset `1` with array length `5`: the window
+`[1 .. 6)` overflows the 5-element caller array, so `Unsize` faults (the `.ub` half of the two-sided
+characterization). -/
+theorem unsize_callerLocals_out_of_bounds_ub_64 :
+    evalRvalue [.init (.ptr ⟨99, 4⟩ 8)]
+        (.cast (.pointerCoercion "Unsize") (cp 0) (sliceTy (.ref .not (.slice u32Ty))))
+        memWithCallerLocals [refArray5Decl] testLayouts64 = .ub :=
+  (trusted_evalUnsizeCoercion_callerLocals_backing_iff
+    [.init (.ptr ⟨99, 4⟩ 8)] [.init (.ptr ⟨99, 4⟩ 8)] (cp 0) memWithCallerLocals
+    [refArray5Decl] testLayouts64 true .not u32Ty 3
+    { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨99, 4⟩ 5
+    callerBorrowEntry backing [] 0 backingElems 1
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl).2.2.2.mpr rfl
 
 /-- Untyped operand (`localDecls = []`, so `operandTy [] _ (cp 1) = none`) on a stack borrow:
 `Unsize` infers length `5 - 0 = 5` directly from `backing`. -/
@@ -1389,6 +1403,157 @@ theorem scalar_rel_witnesses :
     (evalScalarBinOp_rel_unsigned .ge 3 5 8 [] {} (by decide)).trans rfl⟩
 
 end PlaceAndRvalueWitnesses
+
+/-! ## Dispatch exhaustiveness, representability, function-pointer width, and `Ordering` -/
+
+section DispatchAndRangeWitnesses
+
+open Anneal.Mir.PlaceAndRvalue
+
+/-- Total dispatch: the `Unsize` spelling of `LPointerCoercionKind.unsize` runs `evalUnsizeCoercion`
+(here the stack-borrowed `&[u32; 5] -> &[u32]` success). -/
+theorem dispatch_unsize_witness :
+    evalRvalue L64
+        (.cast (.pointerCoercion (LPointerCoercionKind.toRustcSpelling_V2026_06_01 .unsize)) (cp 1)
+          (sliceTy (.ref .not (.slice u32Ty)))) testMem testDecls testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨1, 0⟩ 5 8) L64 testMem :=
+  (evalRvalue_cast_pointerCoercion_dispatch L64 (cp 1) (sliceTy (.ref .not (.slice u32Ty))) testMem
+    testDecls testLayouts64 .unsize).trans unsize_stack_ok_64
+
+/-- Total dispatch: `ReifyFnPointer(Safe)` runs `reifyFnPointerStep` under its own spelling. -/
+theorem dispatch_reify_safe_witness :
+    evalRvalue L64
+        (.cast (.pointerCoercion
+          (LPointerCoercionKind.toRustcSpelling_V2026_06_01 (.reifyFnPointerWithSafety .safe))) (cp 7)
+          { kind := fnSigSafe, layoutIdx := 1 }) testMem testDecls testLayouts64 =
+      reifyFnPointerStep L64 (cp 7) { kind := fnSigSafe, layoutIdx := 1 } testMem testDecls
+        testLayouts64 "ReifyFnPointer(Safe)" :=
+  evalRvalue_cast_pointerCoercion_dispatch L64 (cp 7) { kind := fnSigSafe, layoutIdx := 1 } testMem
+    testDecls testLayouts64 (.reifyFnPointerWithSafety .safe)
+
+/-- An unknown `rustc` coercion tag (rejected by Episode 1's lowering) is `.unsupported` in
+`Trusted` — neither `.ok` nor `.ub`. -/
+theorem unknown_spelling_unsupported_witness :
+    evalRvalue L64 (.cast (.pointerCoercion "ReifyFnPointer(Maybe)") (cp 7)
+        { kind := fnSigSafe, layoutIdx := 1 }) testMem testDecls testLayouts64 = .unsupported :=
+  evalRvalue_cast_pointerCoercion_unknown_spelling L64 (cp 7) { kind := fnSigSafe, layoutIdx := 1 }
+    testMem testDecls testLayouts64 "ReifyFnPointer(Maybe)" rfl
+
+/-- Untyped stack-borrowed `Unsize` at element offset `2`: length inferred as `5 - 2 = 3`. -/
+theorem unsize_untyped_offset_ok_64 :
+    evalRvalue (L64.set 1 (.init (.ptr ⟨1, 8⟩ 8)))
+        (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice u32Ty)))) testMem []
+        testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨1, 8⟩ 3 8) (L64.set 1 (.init (.ptr ⟨1, 8⟩ 8))) testMem :=
+  (trusted_evalUnsizeCoercion_untyped_stack_borrow_iff (L64.set 1 (.init (.ptr ⟨1, 8⟩ 8)))
+    (L64.set 1 (.init (.ptr ⟨1, 8⟩ 8))) (cp 1) testMem [] testLayouts64 true .not u32Ty 3 ⟨1, 8⟩
+    activeEntry backing [] 0 backingElems 2 rfl rfl rfl rfl rfl rfl rfl).2.2.1.mpr rfl
+
+/-- Untyped stack-borrowed `Unsize` at element offset `6` (past the 5-element array): `.ub`. -/
+theorem unsize_untyped_offset_ub_64 :
+    evalRvalue (L64.set 1 (.init (.ptr ⟨1, 24⟩ 8)))
+        (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice u32Ty)))) testMem []
+        testLayouts64 = .ub :=
+  (trusted_evalUnsizeCoercion_untyped_stack_borrow_iff (L64.set 1 (.init (.ptr ⟨1, 24⟩ 8)))
+    (L64.set 1 (.init (.ptr ⟨1, 24⟩ 8))) (cp 1) testMem [] testLayouts64 true .not u32Ty 3 ⟨1, 24⟩
+    activeEntry backing [] 0 backingElems 6 rfl rfl rfl rfl rfl rfl rfl).2.2.2.mpr rfl
+
+/-- `*const [u8; 2^32]` (an array whose length does not fit a 32-bit metadata word). -/
+def hugeArrDecl : LocalDecl :=
+  { mutability := .not, ty := { kind := .rawPtr .not (.array (.uint .u8) 4294967296), layoutIdx := 1 },
+    debugName := none }
+
+def declsHugeScalar : List LocalDecl := testDecls.set 12 hugeArrDecl
+
+def declsHugePtr : List LocalDecl := testDecls.set 11 hugeArrDecl
+
+def u8SliceRawTy : Ty := sliceTy (.rawPtr .not (.slice (.uint .u8)))
+
+/-- 32-bit: provenance-less `*const [u8; 2^32] -> *const [u8]` faults (length not representable). -/
+theorem unsize_scalar_huge_len_ub_32 :
+    evalRvalue L32 (.cast (.pointerCoercion "Unsize") (cp 12) u8SliceRawTy) testMem declsHugeScalar
+        testLayouts32 = .ub :=
+  (trusted_evalUnsizeCoercion_scalar_iff L32 L32 (cp 12) u8SliceRawTy testMem declsHugeScalar
+    testLayouts32 ⟨4096, 4⟩ rfl rfl).2.2.2.mpr
+    (rawPtrUnsizeArrayToSliceLen?_eq_none_of_len_ge .not .not (.uint .u8) (.uint .u8) 4294967296 1 3
+      4 (by decide))
+
+/-- 64-bit: the same provenance-less coercion succeeds with length `2^32`. -/
+theorem unsize_scalar_huge_len_ok_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 12) u8SliceRawTy) testMem declsHugeScalar
+        testLayouts64 = .ok (LWidePtr.encodeScalar 4096 4294967296 8) L64 testMem :=
+  ((trusted_evalUnsizeCoercion_scalar_iff L64 L64 (cp 12) u8SliceRawTy testMem declsHugeScalar
+    testLayouts64 ⟨4096, 8⟩ rfl rfl).2.2.1 4294967296).mpr rfl
+
+/-- FINDING (32-bit): `Trusted`'s *provenance* `Unsize` path performs no such range check — an
+unbacked `*const [u8; 2^32]` is unsized to a non-canonical 4-byte length word holding `2^32 ≥
+scalarModulus 4`, while the provenance-less path above faults. -/
+theorem unsize_ptr_huge_len_noncanonical_32 :
+    evalRvalue L32 (.cast (.pointerCoercion "Unsize") (cp 11) u8SliceRawTy) testMem declsHugePtr
+        testLayouts32 = .ok (.aggregate 0 [.ptr ⟨7, 0⟩ 4, .scalar ⟨4294967296, 4⟩]) L32 testMem ∧
+      scalarModulus 4 ≤ 4294967296 :=
+  ⟨(trusted_evalUnsizeCoercion_unbacked_nonzero_allocId L32 L32 (cp 11) testMem declsHugePtr
+      testLayouts32 false .not (.uint .u8) 3
+      { kind := .rawPtr .not (.array (.uint .u8) 4294967296), layoutIdx := 1 } ⟨7, 0⟩ 4294967296
+      rfl rfl rfl rfl rfl rfl).2, by decide⟩
+
+/-- 32-bit: `fn() as *const u32` yields an 8-byte thin pointer (function pointers are always 8 bytes
+in `Trusted`) … -/
+theorem fnPtrToPtr_ok_32 :
+    evalRvalue L32 (.cast .fnPtrToPtr (cp 8) { kind := .rawPtr .not u32Ty, layoutIdx := 1 }) testMem
+        testDecls testLayouts32 = .ok (.ptr ⟨65536, 0⟩ 8) L32 testMem :=
+  (trusted_evalRvalue_fnPtrToPtr_iff L32 L32 (cp 8) { kind := .rawPtr .not u32Ty, layoutIdx := 1 }
+    testMem testDecls testLayouts32 ⟨65536, 0⟩ 8 rfl).1.mpr ⟨rfl, rfl, rfl⟩
+
+/-- … which a subsequent `PtrToPtr` rejects on the 32-bit layout (`8 ≠ 4`): `.ub`. -/
+theorem ptrToPtr_fnPtr8_ub_32 :
+    evalRvalue (L32.set 11 (.init (.ptr ⟨65536, 0⟩ 8)))
+        (.cast .ptrToPtr (cp 11) { kind := .rawPtr .not (.uint .u8), layoutIdx := 1 }) testMem
+        testDecls testLayouts32 = .ub :=
+  trusted_evalRvalue_ptrToPtr_ptr8_width_ub (L32.set 11 (.init (.ptr ⟨65536, 0⟩ 8)))
+    (L32.set 11 (.init (.ptr ⟨65536, 0⟩ 8))) (cp 11) { kind := .rawPtr .not (.uint .u8), layoutIdx := 1 }
+    testMem testDecls testLayouts32 ⟨65536, 0⟩ rfl (by decide)
+
+/-- `*mut u32 -> *const u8` (mismatched pointees) is not a `MutToConstPointer` coercion: `.ub`. -/
+theorem mutToConst_pointee_mismatch_ub_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "MutToConstPointer") (cp 11)
+        { kind := .rawPtr .not (.uint .u8), layoutIdx := 1 }) testMem testDecls testLayouts64 = .ub :=
+  (trusted_evalRvalue_mutToConstPointer_thin_ptr_iff L64 L64 (cp 11)
+    { kind := .rawPtr .not (.uint .u8), layoutIdx := 1 } testMem testDecls testLayouts64 ⟨7, 0⟩ 8
+    rfl).2.mpr (fun ⟨_, h⟩ => by cases h)
+
+/-- Same data address, metadata `5` vs `3`: `cmp` is `Greater` (64-bit). -/
+theorem widePtr_cmp_ordering_gt_64 :
+    evalRvalue L64 (.binaryOp .cmp (cp 20) (cp 21)) testMem testDecls testLayouts64 =
+      .ok (.scalar (orderingCmpScalar .gt)) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_cmp_ordering L64 L64 L64 (cp 20) (cp 21) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) 458756 458756 5 3
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Smaller data address: `cmp` is `Less` regardless of metadata (32-bit). -/
+theorem widePtr_cmp_ordering_lt_32 :
+    evalRvalue L32 (.binaryOp .cmp (cp 21) (cp 22)) testMem testDecls testLayouts32 =
+      .ok (.scalar (orderingCmpScalar .lt)) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_cmp_ordering L32 L32 L32 (cp 21) (cp 22) testMem testDecls
+    testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨3, 4⟩) (.ptr ⟨7, 8⟩ 4) (.scalar ⟨1, 4⟩) 458756 458760 3 1
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Identical wide pointers: `cmp` is `Equal` (64-bit). -/
+theorem widePtr_cmp_ordering_eq_64 :
+    evalRvalue L64 (.binaryOp .cmp (cp 20) (cp 20)) testMem testDecls testLayouts64 =
+      .ok (.scalar (orderingCmpScalar .eq)) L64 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_cmp_ordering L64 L64 L64 (cp 20) (cp 20) testMem testDecls
+    testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) 458756 458756 5 5
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl
+
+/-- Pointer arithmetic on two fat pointers (`BinOp.add`) is `.unsupported` (32-bit). -/
+theorem widePtr_add_unsupported_32 :
+    evalRvalue L32 (.binaryOp .add (cp 20) (cp 21)) testMem testDecls testLayouts32 = .unsupported :=
+  trusted_evalRvalue_binaryOp_wide_ptr_nonrelational_unsupported L32 L32 L32 .add (cp 20) (cp 21)
+    testMem testDecls testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 4⟩) (.ptr ⟨7, 4⟩ 4) (.scalar ⟨3, 4⟩)
+    rfl rfl rfl
+
+end DispatchAndRangeWitnesses
 
 /-! ## Kernel axiom audit -/
 
