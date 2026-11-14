@@ -9,8 +9,46 @@ those terms.
 -/
 
 import Anneal.Mir.PlaceAndRvalue
+import Anneal.ByteCodec
+import Lean.Elab.Command
 import Trusted.Rustc.V2026_06_01.MirSemantics.Bytes
 import Trusted.Rustc.V2026_06_01.MirSemantics.Machine
+
+/-
+**Import-boundary `simp`-set firewall for `import Anneal.ByteCodec`.**
+
+Before Section 2e2 imported `Anneal.ByteCodec`, neither this module nor its importers saw
+`Anneal.Scalars`. `Anneal.ByteCodec` imports `Anneal.Scalars`, whose global `@[simp]` lemmas
+`scalarPow2_eq_two_pow`, `scalarModulus_eq_two_pow`, `wrapScalarBits_eq_mod_modulus`, and
+`isSignedNegative_eq_msb` would otherwise leak into every downstream `simp` call. They break
+existing downstream proofs that pass `hxWrap : wrapScalarBits x (scalarModulus sz) = x`-style
+hypotheses to `simp` (`MiniRustSpec/Correspondence/DeinitBridge.lean` lines 506, 520, 891, 895,
+and 1166 fail with `unsolved goals` without this block), and `DeinitBridge.lean` may not be edited
+by this change.
+
+`attribute [-simp]` cannot fix this: `simp`-attribute erasure is module-local and is not exported to
+importers. Instead, for each lemma `n` we register one inert global `SimpEntry` whose origin is the
+converse `← n` (`Origin.decl n (post := true) (inv := true)`). `SimpTheorems.addSimpTheorem` erases the
+forward theorem of every converse entry it adds (`eraseFwdIfBwd`, Lean issue #4290), and the entry is
+replayed in every importing environment, so `n` is erased from the default `simp` set here and in all
+importers of this module. The entry itself can never fire: its only discrimination-tree key is the
+undeclared constant `_anneal_erased_simp_key`, and its proof term `True.intro` would be re-checked by
+the kernel even if it did. This changes only which lemmas the default `simp` set tries; it adds no
+axioms, and explicit `rw [Anneal.Scalars.scalarModulus_eq_two_pow]` / `simp [n]` uses are unaffected.
+-/
+run_cmd do
+  for n in [``Anneal.Scalars.scalarPow2_eq_two_pow,
+            ``Anneal.Scalars.scalarModulus_eq_two_pow,
+            ``Anneal.Scalars.wrapScalarBits_eq_mod_modulus,
+            ``Anneal.Scalars.isSignedNegative_eq_msb] do
+    Lean.Elab.Command.liftCoreM <|
+      Lean.ScopedEnvExtension.add Lean.Meta.simpExtension
+        (Lean.Meta.SimpEntry.thm {
+          keys := #[Lean.Meta.DiscrTree.Key.const `_anneal_erased_simp_key 0]
+          proof := Lean.mkConst ``True.intro
+          origin := .decl n true true
+          rfl := false
+        })
 
 open Trusted.Sequence
 open Trusted.MirAst
@@ -18,6 +56,8 @@ open Trusted.MirSemantics
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Anneal.Mir.PlaceAndRvalue
+open Anneal.BitValidity
+open Anneal.ByteCodec
 
 namespace Anneal.Mir.AdtAndControl
 
@@ -604,16 +644,9 @@ end ScalarValidRange
 
 /-! ## Section 1b: ADT Layout Specifications, `resolveAdtOffsetOf`, and Offset Bounds -/
 
-/-- Exact size and ABI alignment of a field type (`TyLayout` in `crates/anneal-mir/src/ir.rs`). -/
-structure FieldLayout : Type where
-  /-- Size in bytes. -/
-  size : Nat
-  /-- ABI alignment in bytes. -/
-  align : Nat
-  deriving DecidableEq, Repr
-
-/-- A 1-ZST (size `0`, alignment `1`), which `#[repr(transparent)]` ignores. -/
-def FieldLayout.isOneZst (f : FieldLayout) : Bool := f.size == 0 && f.align == 1
+-- Exact size and ABI alignment of a field type (`TyLayout` in `crates/anneal-mir/src/ir.rs`),
+-- shared with `Anneal.ByteCodec.FieldLayout` and `Anneal.ByteCodec.sumSizes`.
+export Anneal.ByteCodec (FieldLayout sumSizes)
 
 /-- Primary `#[repr(...)]` of an ADT (`AdtReprKind` in `ir.rs`). -/
 inductive AdtReprKind : Type where
@@ -660,11 +693,6 @@ structure AdtLayoutSpec : Type where
 def maxAlign (base : Nat) : List FieldLayout → Nat
   | [] => base
   | f :: fs => maxAlign (max base f.align) fs
-
-/-- Sum of the fields' sizes. -/
-def sumSizes : List FieldLayout → Nat
-  | [] => 0
-  | f :: fs => f.size + sumSizes fs
 
 /-- Maximum field size (`0` for no fields). -/
 def maxSize : List FieldLayout → Nat
@@ -3915,19 +3943,75 @@ theorem length_deinitBytes (img : ByteImage) (off len : Nat) :
     (deinitBytes img off len).length = img.length := by
   simp [deinitBytes]
 
+/-- Constructive characterization of `List.mapIdx.go` indexing without `Classical.choice`. -/
+private theorem getElem?_mapIdx_go {α β : Type} (f : Nat → α → β) :
+    ∀ (xs : List α) (acc : Array β) (i : Nat),
+      (List.mapIdx.go f xs acc)[i]? =
+        if i < acc.size then acc[i]?
+        else Option.map (f (acc.size + (i - acc.size))) xs[i - acc.size]?
+  | [], acc, i => by
+    simp only [List.mapIdx.go, List.getElem?_nil, Option.map_none, Array.getElem?_toList]
+    by_cases h : i < acc.size
+    · rw [ite_eq_left_iff.mpr (fun hNot => absurd h hNot)]
+    · rw [ite_eq_right_iff.mpr (fun hLt => absurd hLt h), Array.getElem?_eq_none (Nat.le_of_not_lt h)]
+  | x :: xs, acc, i => by
+    simp only [List.mapIdx.go]
+    rw [getElem?_mapIdx_go f xs (acc.push (f acc.size x)) i, Array.size_push]
+    by_cases h : i < acc.size
+    · have h1 : i < acc.size + 1 := Nat.lt_succ_of_lt h
+      have hPushSz : i < (acc.push (f acc.size x)).size := by rw [Array.size_push]; exact h1
+      rw [ite_eq_left_iff.mpr (fun hNot => absurd h1 hNot),
+          ite_eq_left_iff.mpr (fun hNot => absurd h hNot),
+          Array.getElem?_eq_getElem hPushSz, Array.getElem?_eq_getElem h,
+          Array.getElem_push_lt h]
+    · by_cases hEq : i = acc.size
+      · subst hEq
+        have h1 : acc.size < acc.size + 1 := Nat.lt_succ_self acc.size
+        have hPushSz : acc.size < (acc.push (f acc.size x)).size := by rw [Array.size_push]; exact h1
+        rw [ite_eq_left_iff.mpr (fun hNot => absurd h1 hNot),
+            ite_eq_right_iff.mpr (fun hLt => absurd hLt h),
+            Array.getElem?_eq_getElem hPushSz, Array.getElem_push_eq,
+            Nat.sub_self, Nat.add_zero]
+        rfl
+      · have hGt : acc.size < i := Nat.lt_of_le_of_ne (Nat.le_of_not_lt h) (Ne.symm hEq)
+        have hNot1 : ¬ (i < acc.size + 1) := Nat.not_lt.mpr (Nat.succ_le_of_lt hGt)
+        rw [ite_eq_right_iff.mpr (fun hLt => absurd hLt hNot1),
+            ite_eq_right_iff.mpr (fun hLt => absurd hLt h)]
+        obtain ⟨k, hk⟩ : ∃ k, i - acc.size = k + 1 :=
+          ⟨i - acc.size - 1, (Nat.sub_add_cancel (Nat.sub_pos_of_lt hGt)).symm⟩
+        have hk' : i - (acc.size + 1) = k := by omega
+        have hAdd : acc.size + 1 + k = acc.size + (k + 1) := by omega
+        rw [hk, hk', hAdd]
+        rfl
+
+/-- Constructive `List.getElem?_mapIdx` without `Classical.choice`. -/
+private theorem getElem?_mapIdx_constructive {α β : Type} (f : Nat → α → β) (xs : List α) (i : Nat) :
+    (xs.mapIdx f)[i]? = Option.map (f i) xs[i]? := by
+  unfold List.mapIdx
+  rw [getElem?_mapIdx_go f xs #[] i]
+  change (if i < 0 then (#[] : Array β)[i]? else Option.map (f (0 + (i - 0))) xs[i - 0]?) =
+    Option.map (f i) xs[i]?
+  rw [ite_eq_right_iff.mpr (fun hLt => absurd hLt (Nat.not_lt_zero i)), Nat.sub_zero, Nat.zero_add]
+
 /-- Bytes inside the deinitialized range become `Uninit`. -/
 theorem deinitBytes_getElem?_inside {img : ByteImage} {off len i : Nat}
     (hIn : off ≤ i ∧ i < off + len) (hLt : i < img.length) :
     (deinitBytes img off len)[i]? = some none := by
-  simp [deinitBytes, List.getElem?_mapIdx, hIn, List.getElem?_eq_getElem hLt]
+  unfold deinitBytes
+  rw [getElem?_mapIdx_constructive, List.getElem?_eq_getElem hLt]
+  dsimp only [Option.map]
+  rw [ite_eq_left_iff.mpr (fun hNot => absurd hIn hNot)]
 
 /-- Bytes outside the deinitialized range are unchanged. -/
 theorem deinitBytes_getElem?_outside {img : ByteImage} {off len i : Nat}
     (hOut : ¬ (off ≤ i ∧ i < off + len)) : (deinitBytes img off len)[i]? = img[i]? := by
-  simp only [deinitBytes, List.getElem?_mapIdx]
+  unfold deinitBytes
+  rw [getElem?_mapIdx_constructive]
   cases img[i]? with
   | none => rfl
-  | some b => simp only [Option.map_some, hOut, ↓reduceIte]
+  | some b =>
+    dsimp only [Option.map]
+    rw [ite_eq_right_iff.mpr (fun hIn => absurd hIn hOut)]
 
 /-- The bytes `[off, off + size)` of `img` represent a field slot: an uninitialized field is all
 `Uninit` bytes, an initialized field is its encoding (`enc`, MiniRust's `encode`), and a nested
@@ -4172,35 +4256,41 @@ theorem slotsBytes_iff (enc : Value → List UInt8) (img : ByteImage) :
         ∀ (i : Nat) (c : FieldSlot), fs[i]? = some c →
           ∃ (o : Nat) (l : ByteLayout), offs[i]? = some o ∧ ls[i]? = some l ∧
             SlotBytes enc img l (base + o) c
-  | [], offs, ls, base => by
-    cases offs <;> cases ls <;> simp [SlotsBytes]
-  | c :: cs, offs, ls, base => by
-    cases offs with
-    | nil => cases ls <;> simp [SlotsBytes]
-    | cons o os =>
-      cases ls with
-      | nil => simp [SlotsBytes]
-      | cons l ls =>
-        have ih := slotsBytes_iff enc img cs os ls base
-        simp only [SlotsBytes, ih, List.length_cons, Nat.add_right_cancel_iff]
-        constructor
-        · rintro ⟨hc, hLen1, hLen2, hAll⟩
-          refine ⟨hLen1, hLen2, fun i c' hi => ?_⟩
-          cases i with
-          | zero =>
-            simp only [List.getElem?_cons_zero, Option.some.injEq] at hi
-            subst hi
-            exact ⟨o, l, rfl, rfl, hc⟩
-          | succ i =>
-            simp only [List.getElem?_cons_succ] at hi ⊢
-            exact hAll i c' hi
-        · rintro ⟨hLen1, hLen2, hAll⟩
-          obtain ⟨o', l', ho, hl, hc⟩ := hAll 0 c rfl
-          simp only [List.getElem?_cons_zero, Option.some.injEq] at ho hl
-          subst ho hl
-          refine ⟨hc, hLen1, hLen2, fun i c' hi => ?_⟩
-          have := hAll (i + 1) c' (by simpa using hi)
-          simpa using this
+  | [], [], [], _ =>
+    ⟨fun _ => ⟨rfl, rfl, fun i _ h => by cases i <;> nomatch h⟩, fun _ => trivial⟩
+  | [], [], _ :: _, _ =>
+    ⟨fun h => False.elim h, fun ⟨_, h, _⟩ => nomatch h⟩
+  | [], _ :: _, [], _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | [], _ :: _, _ :: _, _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | _ :: _, [], [], _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | _ :: _, [], _ :: _, _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | _ :: _, _ :: _, [], _ =>
+    ⟨fun h => False.elim h, fun ⟨_, h, _⟩ => nomatch h⟩
+  | c :: cs, o :: os, l :: ls, base => by
+    have ih := slotsBytes_iff enc img cs os ls base
+    dsimp only [SlotsBytes, List.length_cons]
+    constructor
+    · rintro ⟨hc, hRest⟩
+      obtain ⟨hLen1, hLen2, hAll⟩ := ih.mp hRest
+      refine ⟨congrArg Nat.succ hLen1, congrArg Nat.succ hLen2, fun i c' hi => ?_⟩
+      cases i with
+      | zero =>
+        injection hi with hEq
+        subst hEq
+        exact ⟨o, l, rfl, rfl, hc⟩
+      | succ i =>
+        exact hAll i c' hi
+    · rintro ⟨hLen1, hLen2, hAll⟩
+      obtain ⟨o', l', ho, hl, hc⟩ := hAll 0 c rfl
+      injection ho with ho'
+      injection hl with hl'
+      subst ho' hl'
+      refine ⟨hc, ih.mpr ⟨Nat.succ.inj hLen1, Nat.succ.inj hLen2, fun i c' hi => ?_⟩⟩
+      exact hAll (i + 1) c' hi
 
 /-- Pointwise characterization of `ValuesBytes`. -/
 theorem valuesBytes_iff (enc : Value → List UInt8) (img : ByteImage) :
@@ -4210,35 +4300,41 @@ theorem valuesBytes_iff (enc : Value → List UInt8) (img : ByteImage) :
         ∀ (i : Nat) (w : Value), vals[i]? = some w →
           ∃ (o : Nat) (l : ByteLayout), offs[i]? = some o ∧ ls[i]? = some l ∧
             SlotBytes enc img l (base + o) (.init w)
-  | [], offs, ls, base => by
-    cases offs <;> cases ls <;> simp [ValuesBytes]
-  | w :: ws, offs, ls, base => by
-    cases offs with
-    | nil => cases ls <;> simp [ValuesBytes]
-    | cons o os =>
-      cases ls with
-      | nil => simp [ValuesBytes]
-      | cons l ls =>
-        have ih := valuesBytes_iff enc img ws os ls base
-        simp only [ValuesBytes, ih, List.length_cons, Nat.add_right_cancel_iff]
-        constructor
-        · rintro ⟨hw, hLen1, hLen2, hAll⟩
-          refine ⟨hLen1, hLen2, fun i w' hi => ?_⟩
-          cases i with
-          | zero =>
-            simp only [List.getElem?_cons_zero, Option.some.injEq] at hi
-            subst hi
-            exact ⟨o, l, rfl, rfl, hw⟩
-          | succ i =>
-            simp only [List.getElem?_cons_succ] at hi ⊢
-            exact hAll i w' hi
-        · rintro ⟨hLen1, hLen2, hAll⟩
-          obtain ⟨o', l', ho, hl, hw⟩ := hAll 0 w rfl
-          simp only [List.getElem?_cons_zero, Option.some.injEq] at ho hl
-          subst ho hl
-          refine ⟨hw, hLen1, hLen2, fun i w' hi => ?_⟩
-          have := hAll (i + 1) w' (by simpa using hi)
-          simpa using this
+  | [], [], [], _ =>
+    ⟨fun _ => ⟨rfl, rfl, fun i _ h => by cases i <;> nomatch h⟩, fun _ => trivial⟩
+  | [], [], _ :: _, _ =>
+    ⟨fun h => False.elim h, fun ⟨_, h, _⟩ => nomatch h⟩
+  | [], _ :: _, [], _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | [], _ :: _, _ :: _, _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | _ :: _, [], [], _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | _ :: _, [], _ :: _, _ =>
+    ⟨fun h => False.elim h, fun ⟨h, _, _⟩ => nomatch h⟩
+  | _ :: _, _ :: _, [], _ =>
+    ⟨fun h => False.elim h, fun ⟨_, h, _⟩ => nomatch h⟩
+  | w :: ws, o :: os, l :: ls, base => by
+    have ih := valuesBytes_iff enc img ws os ls base
+    dsimp only [ValuesBytes, List.length_cons]
+    constructor
+    · rintro ⟨hw, hRest⟩
+      obtain ⟨hLen1, hLen2, hAll⟩ := ih.mp hRest
+      refine ⟨congrArg Nat.succ hLen1, congrArg Nat.succ hLen2, fun i w' hi => ?_⟩
+      cases i with
+      | zero =>
+        injection hi with hEq
+        subst hEq
+        exact ⟨o, l, rfl, rfl, hw⟩
+      | succ i =>
+        exact hAll i w' hi
+    · rintro ⟨hLen1, hLen2, hAll⟩
+      obtain ⟨o', l', ho, hl, hw⟩ := hAll 0 w rfl
+      injection ho with ho'
+      injection hl with hl'
+      subst ho' hl'
+      refine ⟨hw, ih.mpr ⟨Nat.succ.inj hLen1, Nat.succ.inj hLen2, fun i w' hi => ?_⟩⟩
+      exact hAll (i + 1) w' hi
 
 /-- **Byte frame**: a slot's byte representation only depends on the bytes of its layout's range. -/
 theorem slotBytes_frame {enc : Value → List UInt8} {img img' : ByteImage} :
@@ -4303,43 +4399,52 @@ theorem pathRange_sub : ∀ (p : List ProjectionElem) {lay : ByteLayout} {base o
     lay.WF → pathRange lay base p = some (off, len) → base ≤ off ∧ off + len ≤ base + lay.size
   | [], lay, base, off, len, _, h => by
     simp only [pathRange, Option.some.injEq, Prod.mk.injEq] at h
-    omega
+    exact ⟨by omega, by omega⟩
   | a :: rest, lay, base, off, len, hWF, h => by
     cases lay with
     | leaf n =>
       cases a with
-      | downcast _ _ => cases rest with | nil => simp [pathRange] at h | cons b _ => cases b <;> simp [pathRange] at h
-      | _ => simp [pathRange] at h
+      | downcast _ _ =>
+        cases rest with
+        | nil => nomatch h
+        | cons b _ => cases b <;> nomatch h
+      | _ => nomatch h
     | struct n offs ls =>
       cases a with
       | field f ty =>
-        simp only [pathRange] at h
-        split at h
-        · rename_i o l ho hl
-          cases hWF with
-          | struct _ _ _ hLen hFit hDisj hChildren =>
-            have := pathRange_sub rest (hChildren f l hl) h
-            have := hFit f o l ho hl
-            simp only [ByteLayout.size]
-            omega
+        dsimp only [pathRange] at h
+        cases ho : offs[f]? <;> rw [ho] at h
         · nomatch h
+        case some o =>
+          cases hl : ls[f]? <;> rw [hl] at h
+          · nomatch h
+          case some l =>
+            cases hWF with
+            | struct _ _ _ hLen hFit hDisj hChildren =>
+              have := pathRange_sub rest (hChildren f l hl) h
+              have := hFit f o l ho hl
+              dsimp only [ByteLayout.size]
+              exact ⟨by omega, by omega⟩
       | downcast nm v =>
         rcases rest with _ | ⟨b, rest'⟩
-        · simp [pathRange] at h
+        · nomatch h
         · cases b with
           | field f ty =>
-            simp only [pathRange] at h
-            split at h
-            · rename_i o l ho hl
-              cases hWF with
-              | struct _ _ _ hLen hFit hDisj hChildren =>
-                have := pathRange_sub rest' (hChildren f l hl) h
-                have := hFit f o l ho hl
-                simp only [ByteLayout.size]
-                omega
+            dsimp only [pathRange] at h
+            cases ho : offs[f]? <;> rw [ho] at h
             · nomatch h
-          | _ => simp [pathRange] at h
-      | _ => simp [pathRange] at h
+            case some o =>
+              cases hl : ls[f]? <;> rw [hl] at h
+              · nomatch h
+              case some l =>
+                cases hWF with
+                | struct _ _ _ hLen hFit hDisj hChildren =>
+                  have := pathRange_sub rest' (hChildren f l hl) h
+                  have := hFit f o l ho hl
+                  dsimp only [ByteLayout.size]
+                  exact ⟨by omega, by omega⟩
+          | _ => nomatch h
+      | _ => nomatch h
 
 /-- `ValuesBytes` of an aggregate's fields is `SlotsBytes` of its exploded shell. -/
 theorem valuesBytes_iff_slotsBytes_map_init (enc : Value → List UInt8) (img : ByteImage) :
@@ -4380,126 +4485,135 @@ theorem deinitFieldSlot_bytes_sim (ts : Bool) (L : List LocalSlot) (enc : Value 
     cases lay with
     | leaf n =>
       cases a with
-      | downcast _ _ => cases rest with | nil => simp [pathRange] at hRange | cons b _ => cases b <;> simp [pathRange] at hRange
-      | _ => simp [pathRange] at hRange
+      | downcast _ _ =>
+        cases rest with
+        | nil => nomatch hRange
+        | cons b _ => cases b <;> nomatch hRange
+      | _ => nomatch hRange
     | struct n offs ls =>
       cases a with
       | field f ty =>
         have hTagRest : ts = true ∨ noDowncast rest = true := by
           rcases hTag with hT | hND
           · exact Or.inl hT
-          · exact Or.inr (by simpa [noDowncast] using hND)
-        simp only [pathRange] at hRange
-        split at hRange
-        · rename_i o l ho hl
-          cases hWF with
-          | struct _ _ _ hLen hFit hDisj hChildren =>
-            cases v with
-            | aggregate var vals =>
-              simp only [deinitFieldSlot] at h
-              obtain ⟨hV, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some h
-              obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
-              have hU := deinitFieldSlot_uninitAt _ _ _ _ _ hcc
-              have hN := stepped_tryIntoValue?_none (sh := explodeAggregate var vals)
-                (disc' := (explodeAggregate var vals).discriminantSet &&
-                  ((none : Option Nat).isNone || ts)) hc hU
-              rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate])]
-              simp only [SlotBytes] at hS
-              obtain ⟨hL1, hL2, hAll⟩ := (valuesBytes_iff enc img vals offs ls base).mp hS
-              have hLtF : f < vals.length := (List.getElem?_eq_some_iff.mp hcv).1
-              have hSub := pathRange_sub rest (hChildren f l hl) hRange
-              have hFitF := hFit f o l ho hl
-              simp only [explodeAggregate, SlotBytes]
-              refine (slotsBytes_iff enc _ _ offs ls base).mpr ⟨?_, ?_, fun i ci hi => ?_⟩
-              · simp [hL1]
-              · simp [hL2]
-              · by_cases hif : i = f
-                · subst hif
-                  rw [List.getElem?_set_self (by simpa using hLtF)] at hi
-                  cases hi
-                  obtain ⟨o', l', ho', hl', hb⟩ := hAll i cv hcv
-                  rw [ho] at ho'
-                  rw [hl] at hl'
-                  cases ho'
-                  cases hl'
-                  refine ⟨o, l, ho, hl, ?_⟩
-                  exact deinitFieldSlot_bytes_sim ts L enc img rest cv l (base + o) _ off len hcc
-                    hTagRest (hChildren i l hl) (by simp only [ByteLayout.size] at hFits; omega)
-                    hb hRange
-                · rw [List.getElem?_set_ne (Ne.symm hif), List.getElem?_map] at hi
-                  cases hw : vals[i]? with
-                  | none => rw [hw] at hi; nomatch hi
-                  | some w =>
-                    rw [hw] at hi
-                    simp only [Option.map_some, Option.some.injEq] at hi
-                    subst hi
-                    obtain ⟨oi, li, hoi, hli, hb⟩ := hAll i w hw
-                    refine ⟨oi, li, hoi, hli, slotBytes_frame (hChildren i li hli) _ _
-                      (fun k hk => deinitBytes_getElem?_outside ?_) hb⟩
-                    rcases hDisj i f oi o li l hif hoi ho hli hl with hD | hD <;> omega
-            | _ => nomatch h
+          · exact Or.inr hND
+        dsimp only [pathRange] at hRange
+        cases ho : offs[f]? <;> rw [ho] at hRange
         · nomatch hRange
+        case some o =>
+          cases hl : ls[f]? <;> rw [hl] at hRange
+          · nomatch hRange
+          case some l =>
+            cases hWF with
+            | struct _ _ _ hLen hFit hDisj hChildren =>
+              cases v with
+              | aggregate var vals =>
+                simp only [deinitFieldSlot] at h
+                obtain ⟨hV, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some h
+                obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
+                have hU := deinitFieldSlot_uninitAt _ _ _ _ _ hcc
+                have hN := stepped_tryIntoValue?_none (sh := explodeAggregate var vals)
+                  (disc' := (explodeAggregate var vals).discriminantSet &&
+                    ((none : Option Nat).isNone || ts)) hc hU
+                rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate])]
+                simp only [SlotBytes] at hS
+                obtain ⟨hL1, hL2, hAll⟩ := (valuesBytes_iff enc img vals offs ls base).mp hS
+                have hLtF : f < vals.length := (List.getElem?_eq_some_iff.mp hcv).1
+                have hSub := pathRange_sub rest (hChildren f l hl) hRange
+                have hFitF := hFit f o l ho hl
+                simp only [explodeAggregate, SlotBytes]
+                refine (slotsBytes_iff enc _ _ offs ls base).mpr ⟨?_, ?_, fun i ci hi => ?_⟩
+                · simp [hL1]
+                · simp [hL2]
+                · by_cases hif : i = f
+                  · subst hif
+                    rw [List.getElem?_set_self (by simpa using hLtF)] at hi
+                    cases hi
+                    obtain ⟨o', l', ho', hl', hb⟩ := hAll i cv hcv
+                    rw [ho] at ho'
+                    rw [hl] at hl'
+                    cases ho'
+                    cases hl'
+                    refine ⟨o, l, ho, hl, ?_⟩
+                    exact deinitFieldSlot_bytes_sim ts L enc img rest cv l (base + o) _ off len hcc
+                      hTagRest (hChildren i l hl) (by simp only [ByteLayout.size] at hFits; omega)
+                      hb hRange
+                  · rw [List.getElem?_set_ne (Ne.symm hif), List.getElem?_map] at hi
+                    cases hw : vals[i]? with
+                    | none => rw [hw] at hi; nomatch hi
+                    | some w =>
+                      rw [hw] at hi
+                      simp only [Option.map_some, Option.some.injEq] at hi
+                      subst hi
+                      obtain ⟨oi, li, hoi, hli, hb⟩ := hAll i w hw
+                      refine ⟨oi, li, hoi, hli, slotBytes_frame (hChildren i li hli) _ _
+                        (fun k hk => deinitBytes_getElem?_outside ?_) hb⟩
+                      rcases hDisj i f oi o li l hif hoi ho hli hl with hD | hD <;> omega
+              | _ => nomatch h
       | downcast nm dv =>
         rcases rest with _ | ⟨b, rest'⟩
-        · simp [pathRange] at hRange
+        · nomatch hRange
         · cases b with
           | field f ty =>
             have hTs : ts = true := by
               rcases hTag with hT | hND
               · exact hT
-              · simp [noDowncast] at hND
-            simp only [pathRange] at hRange
-            split at hRange
-            · rename_i o l ho hl
-              cases hWF with
-              | struct _ _ _ hLen hFit hDisj hChildren =>
-                cases v with
-                | aggregate var vals =>
-                  simp only [deinitFieldSlot] at h
-                  obtain ⟨hV, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some h
-                  obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
-                  have hU := deinitFieldSlot_uninitAt _ _ _ _ _ hcc
-                  have hN := stepped_tryIntoValue?_none (sh := explodeAggregate var vals)
-                    (disc' := (explodeAggregate var vals).discriminantSet &&
-                      ((some dv).isNone || ts)) hc hU
-                  rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate, hTs])]
-                  simp only [SlotBytes] at hS
-                  obtain ⟨hL1, hL2, hAll⟩ := (valuesBytes_iff enc img vals offs ls base).mp hS
-                  have hLtF : f < vals.length := (List.getElem?_eq_some_iff.mp hcv).1
-                  have hSub := pathRange_sub rest' (hChildren f l hl) hRange
-                  have hFitF := hFit f o l ho hl
-                  simp only [explodeAggregate, SlotBytes]
-                  refine (slotsBytes_iff enc _ _ offs ls base).mpr ⟨?_, ?_, fun i ci hi => ?_⟩
-                  · simp [hL1]
-                  · simp [hL2]
-                  · by_cases hif : i = f
-                    · subst hif
-                      rw [List.getElem?_set_self (by simpa using hLtF)] at hi
-                      cases hi
-                      obtain ⟨o', l', ho', hl', hb⟩ := hAll i cv hcv
-                      rw [ho] at ho'
-                      rw [hl] at hl'
-                      cases ho'
-                      cases hl'
-                      refine ⟨o, l, ho, hl, ?_⟩
-                      exact deinitFieldSlot_bytes_sim ts L enc img rest' cv l (base + o) _ off len
-                        hcc (Or.inl hTs) (hChildren i l hl)
-                        (by simp only [ByteLayout.size] at hFits; omega) hb hRange
-                    · rw [List.getElem?_set_ne (Ne.symm hif), List.getElem?_map] at hi
-                      cases hw : vals[i]? with
-                      | none => rw [hw] at hi; nomatch hi
-                      | some w =>
-                        rw [hw] at hi
-                        simp only [Option.map_some, Option.some.injEq] at hi
-                        subst hi
-                        obtain ⟨oi, li, hoi, hli, hb⟩ := hAll i w hw
-                        refine ⟨oi, li, hoi, hli, slotBytes_frame (hChildren i li hli) _ _
-                          (fun k hk => deinitBytes_getElem?_outside ?_) hb⟩
-                        rcases hDisj i f oi o li l hif hoi ho hli hl with hD | hD <;> omega
-                | _ => nomatch h
+              · nomatch hND
+            dsimp only [pathRange] at hRange
+            cases ho : offs[f]? <;> rw [ho] at hRange
             · nomatch hRange
-          | _ => simp [pathRange] at hRange
-      | _ => simp [pathRange] at hRange
+            case some o =>
+              cases hl : ls[f]? <;> rw [hl] at hRange
+              · nomatch hRange
+              case some l =>
+                cases hWF with
+                | struct _ _ _ hLen hFit hDisj hChildren =>
+                  cases v with
+                  | aggregate var vals =>
+                    simp only [deinitFieldSlot] at h
+                    obtain ⟨hV, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some h
+                    obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
+                    have hU := deinitFieldSlot_uninitAt _ _ _ _ _ hcc
+                    have hN := stepped_tryIntoValue?_none (sh := explodeAggregate var vals)
+                      (disc' := (explodeAggregate var vals).discriminantSet &&
+                        ((some dv).isNone || ts)) hc hU
+                    rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate, hTs])]
+                    simp only [SlotBytes] at hS
+                    obtain ⟨hL1, hL2, hAll⟩ := (valuesBytes_iff enc img vals offs ls base).mp hS
+                    have hLtF : f < vals.length := (List.getElem?_eq_some_iff.mp hcv).1
+                    have hSub := pathRange_sub rest' (hChildren f l hl) hRange
+                    have hFitF := hFit f o l ho hl
+                    simp only [explodeAggregate, SlotBytes]
+                    refine (slotsBytes_iff enc _ _ offs ls base).mpr ⟨?_, ?_, fun i ci hi => ?_⟩
+                    · simp [hL1]
+                    · simp [hL2]
+                    · by_cases hif : i = f
+                      · subst hif
+                        rw [List.getElem?_set_self (by simpa using hLtF)] at hi
+                        cases hi
+                        obtain ⟨o', l', ho', hl', hb⟩ := hAll i cv hcv
+                        rw [ho] at ho'
+                        rw [hl] at hl'
+                        cases ho'
+                        cases hl'
+                        refine ⟨o, l, ho, hl, ?_⟩
+                        exact deinitFieldSlot_bytes_sim ts L enc img rest' cv l (base + o) _ off len
+                          hcc (Or.inl hTs) (hChildren i l hl)
+                          (by simp only [ByteLayout.size] at hFits; omega) hb hRange
+                      · rw [List.getElem?_set_ne (Ne.symm hif), List.getElem?_map] at hi
+                        cases hw : vals[i]? with
+                        | none => rw [hw] at hi; nomatch hi
+                        | some w =>
+                          rw [hw] at hi
+                          simp only [Option.map_some, Option.some.injEq] at hi
+                          subst hi
+                          obtain ⟨oi, li, hoi, hli, hb⟩ := hAll i w hw
+                          refine ⟨oi, li, hoi, hli, slotBytes_frame (hChildren i li hli) _ _
+                            (fun k hk => deinitBytes_getElem?_outside ?_) hb⟩
+                          rcases hDisj i f oi o li l hif hoi ho hli hl with hD | hD <;> omega
+                  | _ => nomatch h
+          | _ => nomatch hRange
+      | _ => nomatch hRange
 
 /-- **`Deinit` of a nested field of an initialized local is MiniRust's byte-range `Uninit`
 write** (arbitrary depth, across both struct `Field` steps and tag-preserving enum `Downcast` +
@@ -5220,6 +5334,3343 @@ theorem union_field_uninit_bytes {spec : AdtLayoutSpec} (hWF : spec.WF)
     simp only [Nat.zero_add] at h0
     rw [hUninit] at h0
     cases hE : (enc w)[0]? <;> rw [hE] at h0 <;> nomatch h0
+
+/-! ### Section 2e2: Forward-Compatible Layout Worlds (`S0`–`S3`), `Stmt.evalConst` Guards, and `Deinit` Symbolic-Pad Simulation -/
+
+/-! #### Section 2e2.1: `ForwardCompatTier` (`S0`–`S3`), `TargetLayout`, `AdtRepr`, and `StructLayoutWorld` -/
+
+/--
+Forward-compatibility trust and coupling tiers matching `b1f15f743c`'s `TCBItem`
+and `THREAT_MODEL.md` (`S0`–`S3`):
+- `S0_rustcLowering`: baseline assumption that `rustc` lowers Rust source to MIR faithfully.
+- `S0_fnVerified`: unwaived universal behavioral verification across all valid `#[repr(Rust)]`
+  layout worlds, type-parameter sizes, and execution states.
+- `S1_compileTimeGuard`: compilation-stability coupling (`/// anneal:allow_compile_time_guard`)
+  allowing `Stmt.evalConst` compile-time assertions to prune incompatible layout or
+  type-parameter worlds via `.compileTimeError`, provided the canonical world succeeds.
+- `S2_documentedIntent`: reliance on documented pre-normative upstream intent
+  (`/// anneal:documented_intent`).
+- `S3_pinnedCompilerCoupled`: soundness coupling (`/// anneal:pinned_compiler_coupled`)
+  restricting verification to the pinned compiler's canonical zero-extra-padding layout.
+-/
+inductive ForwardCompatTier : Type where
+  | S0_rustcLowering
+  | S0_fnVerified
+  | S1_compileTimeGuard
+  | S2_documentedIntent
+  | S3_pinnedCompilerCoupled
+  deriving DecidableEq, Repr
+
+namespace ForwardCompatTier
+
+/-- Whether `tier` permits `.compileTimeError` to prune non-canonical layout worlds (`S1`). -/
+@[reducible]
+def allowsCompileTimeError : ForwardCompatTier → Bool
+  | .S1_compileTimeGuard => true
+  | .S0_rustcLowering | .S0_fnVerified | .S2_documentedIntent | .S3_pinnedCompilerCoupled => false
+
+/-- Whether `tier` pins `#[repr(Rust)]` layouts to the canonical zero-padding world (`S3`). -/
+@[reducible]
+def pinsCanonicalRustLayout : ForwardCompatTier → Bool
+  | .S3_pinnedCompilerCoupled => true
+  | .S0_rustcLowering | .S0_fnVerified | .S1_compileTimeGuard | .S2_documentedIntent => false
+
+/-- Whether `tier` universally quantifies over all valid `#[repr(Rust)]` layout worlds. -/
+@[reducible]
+def isUniversalLayoutTier (t : ForwardCompatTier) : Bool :=
+  !t.pinsCanonicalRustLayout
+
+end ForwardCompatTier
+
+/--
+First-order TCB ledger entry mirroring `Trusted.TCBItem` from `b1f15f743c:trusted/lean/Trusted/MirAst.lean`.
+-/
+inductive TCBObligationItem : Type where
+  | rustcLowering (fnName : String) (bodyId : Nat)
+  | fnVerified (fnName : String) (bodyId : Nat)
+  | compileTimeGuard (fnName : String) (bodyId : Nat)
+  | transparentDepBody (fnName : String) (calleeId : Nat)
+  | documentedIntent (fnName : String) (bodyId : Nat) (rationale : String)
+  | pinnedCompilerCoupled (fnName : String) (bodyId : Nat) (reason : String)
+  deriving DecidableEq, Repr
+
+/-- Classify any `TCBObligationItem` into its `ForwardCompatTier`. -/
+@[reducible]
+def TCBObligationItem.tier : TCBObligationItem → ForwardCompatTier
+  | .rustcLowering _ _ => .S0_rustcLowering
+  | .fnVerified _ _ => .S0_fnVerified
+  | .compileTimeGuard _ _ => .S1_compileTimeGuard
+  | .transparentDepBody _ _ => .S1_compileTimeGuard
+  | .documentedIntent _ _ _ => .S2_documentedIntent
+  | .pinnedCompilerCoupled _ _ _ => .S3_pinnedCompilerCoupled
+
+/--
+Target C ABI primitive layout parameters captured from `tcx.data_layout()`
+(`b1f15f743c:trusted/lean/Trusted/MirAst.lean`).
+-/
+structure TargetLayout : Type where
+  ptrByteWidth : Nat := 8
+  i64Align : Nat := 8
+  i128Align : Nat := 16
+  deriving DecidableEq, Repr
+
+/-- Default 64-bit target layout (`ptrByteWidth = 8`, `i64Align = 8`, `i128Align = 16`). -/
+def defaultTargetLayout : TargetLayout := ⟨8, 8, 16⟩
+
+/-- Well-formedness of a `TargetLayout`: 32-bit or 64-bit pointers and power-of-two integer alignments. -/
+structure TargetLayout.WF (t : TargetLayout) : Prop where
+  ptrWidthValid : t.ptrByteWidth = 4 ∨ t.ptrByteWidth = 8
+  i64AlignPow2 : IsPow2 t.i64Align ∧ 1 ≤ t.i64Align ∧ t.i64Align ≤ 8
+  i128AlignPow2 : IsPow2 t.i128Align ∧ 1 ≤ t.i128Align ∧ t.i128Align ≤ 16
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem defaultTargetLayout_wf : defaultTargetLayout.WF where
+  ptrWidthValid := Or.inr rfl
+  i64AlignPow2 := ⟨⟨3, rfl⟩, by decide, by decide⟩
+  i128AlignPow2 := ⟨⟨4, rfl⟩, by decide, by decide⟩
+
+/--
+Layout representation attribute on an `AdtDecl` (`b1f15f743c:trusted/lean/Trusted/MirAst.lean`):
+- `.rust`: default `#[repr(Rust)]` layout with unspecified field order and non-negative padding.
+- `.transparent`: `#[repr(transparent)]` delegating size and alignment to its sole non-1-ZST field.
+- `.c`: `#[repr(C)]` with deterministic C ABI declaration-order alignment-rounded offsets.
+- `.unmodeled`: unmodeled representation modifiers that fail closed on layout and validity queries.
+-/
+inductive AdtRepr : Type where
+  | rust
+  | transparent
+  | c
+  | unmodeled
+  deriving DecidableEq, Repr
+
+namespace AdtRepr
+
+/-- Partial projection from `AdtRepr` to `AdtAndControl.AdtReprKind` (`none` on `.unmodeled`). -/
+@[reducible]
+def toAdtReprKind? : AdtRepr → Option AdtReprKind
+  | .rust => some .rust
+  | .transparent => some .transparent
+  | .c => some .c
+  | .unmodeled => none
+
+/-- Embed `AdtAndControl.AdtReprKind` into `AdtRepr`. -/
+@[reducible]
+def ofAdtReprKind : AdtReprKind → AdtRepr
+  | .rust => .rust
+  | .transparent => .transparent
+  | .c => .c
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem toAdtReprKind?_ofAdtReprKind (k : AdtReprKind) :
+    (ofAdtReprKind k).toAdtReprKind? = some k := by
+  cases k <;> rfl
+
+end AdtRepr
+
+/--
+Concrete per-struct layout world assigning a byte offset to every declaration field,
+total byte size, and ABI alignment.
+
+For `#[repr(Rust)]`, `fieldOffsets` may realize any memory-order permutation of the
+declared fields and any non-negative inter-field/trailing padding consistent with
+field alignments, disjointness, `r[layout.repr.rust.struct-zst]`, and the
+`PlaceAndRvalue.alignUp (sumSizes fs) align` lower bound.
+-/
+structure StructLayoutWorld : Type where
+  /-- Byte offset of each declaration field `0 .. fs.length - 1`. -/
+  fieldOffsets : List Nat
+  /-- Total byte size of the struct in this layout world. -/
+  totalSize : Nat
+  /-- ABI alignment in bytes of the struct in this layout world. -/
+  align : Nat
+  deriving DecidableEq, Repr
+
+/--
+Representation-specific validity constraints on a `StructLayoutWorld`:
+- `.rust`: enforces `r[layout.repr.rust.struct-zst]` (`sumSizes fs = 0 ∧ reprAlign = none → totalSize = 0`),
+  `align = maxAlign (reprAlign.getD 1) fs`, `totalSize % align = 0`, and
+  `PlaceAndRvalue.alignUp (sumSizes fs) align ≤ totalSize`.
+- `.c`: enforces the exact deterministic C ABI size, alignment, and `cOffset? 0 fs i` field offsets.
+- `.transparent`: requires `reprAlign = none`, delegates `totalSize` and `align` to the unique
+  non-1-ZST field (or `(0, 1)` when all fields are 1-ZSTs), places the non-1-ZST field at offset `0`,
+  and allows 1-ZST sibling fields at any offset `o ≤ totalSize` (the generic strict disjointness of
+  `ValidStructLayoutWorld` then narrows these to `{0, totalSize}`,
+  `reprTransparent_oneZst_offset_zero_or_end`).
+- `.unmodeled`: always `False` (fails closed).
+-/
+def ReprLayoutConstraint (repr : AdtRepr) (reprAlign : Option Nat)
+    (fs : List FieldLayout) (w : StructLayoutWorld) : Prop :=
+  match repr with
+  | .unmodeled => False
+  | .rust =>
+    let a := maxAlign (reprAlign.getD 1) fs
+    w.align = a ∧
+    w.totalSize % a = 0 ∧
+    PlaceAndRvalue.alignUp (sumSizes fs) a ≤ w.totalSize ∧
+    (sumSizes fs = 0 → reprAlign = none → w.totalSize = 0)
+  | .c =>
+    let a := maxAlign (reprAlign.getD 1) fs
+    w.align = a ∧
+    w.totalSize = PlaceAndRvalue.alignUp (cEnd 0 fs) a ∧
+    ∀ (i : Nat), i < fs.length → w.fieldOffsets[i]? = cOffset? 0 fs i
+  | .transparent =>
+    reprAlign = none ∧
+    match nonOneZstFields fs with
+    | [] =>
+      w.totalSize = 0 ∧
+      w.align = 1 ∧
+      ∀ (i : Nat), i < fs.length → w.fieldOffsets[i]? = some 0
+    | [f] =>
+      w.totalSize = f.size ∧
+      w.align = f.align ∧
+      ∀ (i : Nat) (fl : FieldLayout), fs[i]? = some fl →
+        (FieldLayout.isOneZst fl = false → w.fieldOffsets[i]? = some 0) ∧
+        (FieldLayout.isOneZst fl = true → ∃ o, w.fieldOffsets[i]? = some o ∧ o ≤ f.size)
+    | _ :: _ :: _ => False
+
+/--
+Full validity predicate for a `StructLayoutWorld` of `fs` under `repr` and `reprAlign`:
+1. One byte offset per declared field (`w.fieldOffsets.length = fs.length`),
+2. Every field fits within `w.totalSize` (`o + fl.size ≤ w.totalSize`),
+3. Every field offset is aligned to the field's alignment (`fl.align ∣ o`),
+4. Distinct fields occupy pairwise disjoint byte ranges (`oi + fi.size ≤ oj ∨ oj + fj.size ≤ oi`),
+5. `ReprLayoutConstraint repr reprAlign fs w` holds.
+-/
+structure ValidStructLayoutWorld (repr : AdtRepr) (reprAlign : Option Nat)
+    (fs : List FieldLayout) (w : StructLayoutWorld) : Prop where
+  offsets_len : w.fieldOffsets.length = fs.length
+  field_in_bounds :
+    ∀ (i o : Nat) (fl : FieldLayout),
+      w.fieldOffsets[i]? = some o → fs[i]? = some fl → o + fl.size ≤ w.totalSize
+  field_aligned :
+    ∀ (i o : Nat) (fl : FieldLayout),
+      w.fieldOffsets[i]? = some o → fs[i]? = some fl → fl.align ∣ o
+  fields_disjoint :
+    ∀ (i j oi oj : Nat) (fi fj : FieldLayout), i ≠ j →
+      w.fieldOffsets[i]? = some oi → w.fieldOffsets[j]? = some oj →
+      fs[i]? = some fi → fs[j]? = some fj →
+      oi + fi.size ≤ oj ∨ oj + fj.size ≤ oi
+  repr_valid : ReprLayoutConstraint repr reprAlign fs w
+
+/--
+Kind: safety
+Witness: negative
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem unmodeled_no_validStructLayoutWorld (reprAlign : Option Nat)
+    (fs : List FieldLayout) (w : StructLayoutWorld) :
+    ¬ ValidStructLayoutWorld .unmodeled reprAlign fs w :=
+  fun h => h.repr_valid
+
+/--
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem reprRust_zst_totalSize_eq_zero {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .rust none fs w)
+    (hZst : sumSizes fs = 0) :
+    w.totalSize = 0 ∧ ∀ (i o : Nat), w.fieldOffsets[i]? = some o → o = 0 := by
+  rcases hValid.repr_valid with ⟨_, _, _, hZeroLaw⟩
+  have hSz0 : w.totalSize = 0 := hZeroLaw hZst rfl
+  refine ⟨hSz0, fun i o hOff => ?_⟩
+  have hLt : i < fs.length := by
+    rw [← hValid.offsets_len]
+    exact (List.getElem?_eq_some_iff.mp hOff).1
+  have hFl : fs[i]? = some fs[i] := List.getElem?_eq_getElem hLt
+  have hBound := hValid.field_in_bounds i o fs[i] hOff hFl
+  omega
+
+/-- Deterministic `#[repr(C)]` layout world built from `AdtAndControl.cOffset?` and `cEnd`. -/
+def reprCLayoutWorld (reprAlign : Option Nat) (fs : List FieldLayout) : StructLayoutWorld :=
+  let a := maxAlign (reprAlign.getD 1) fs
+  { fieldOffsets := (List.range fs.length).map (fun i => (cOffset? 0 fs i).getD 0)
+    totalSize := PlaceAndRvalue.alignUp (cEnd 0 fs) a
+    align := a }
+
+/--
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: reprCLayoutWorld
+-/
+theorem reprCLayoutWorld_valid {reprAlign : Option Nat} {fs : List FieldLayout}
+    (hWF : ({ shape := .struct fs, repr := .c, reprAlign := reprAlign, rustOrderCanonical := false } : AdtLayoutSpec).WF) :
+    ValidStructLayoutWorld .c reprAlign fs (reprCLayoutWorld reprAlign fs) := by
+  let spec : AdtLayoutSpec :=
+    { shape := .struct fs, repr := .c, reprAlign := reprAlign, rustOrderCanonical := false }
+  have hPlaced : SpecFieldsPlaced spec 0 fs := reprC_struct_placed rfl rfl
+  have hOffEq : ∀ i, i < fs.length →
+      (reprCLayoutWorld reprAlign fs).fieldOffsets[i]? = cOffset? 0 fs i := by
+    intro i hi
+    obtain ⟨o, ho⟩ := cOffset?_isSome 0 fs i hi
+    simp [reprCLayoutWorld, List.getElem?_range hi, ho]
+  refine
+    { offsets_len := by simp [reprCLayoutWorld]
+      field_in_bounds := ?_
+      field_aligned := ?_
+      fields_disjoint := ?_
+      repr_valid := ⟨rfl, rfl, hOffEq⟩ }
+  · -- In bounds via the constructive `cOffset?_spec` (no `resolveAdtOffsetOf_bounds_and_align`,
+    -- whose upstream proof depends on `Classical.choice`).
+    intro i o fl hOff hFl
+    have hi : i < fs.length := (List.getElem?_eq_some_iff.mp hFl).1
+    rw [hOffEq i hi] at hOff
+    obtain ⟨f, hF, hEnd, _⟩ := cOffset?_spec 0 fs i o hOff
+    rw [hFl] at hF
+    cases hF
+    exact Nat.le_trans hEnd (PlaceAndRvalue.alignUp_ge _ _)
+  · intro i o fl hOff hFl
+    have hi : i < fs.length := (List.getElem?_eq_some_iff.mp hFl).1
+    rw [hOffEq i hi] at hOff
+    obtain ⟨f, hF, _, hDvd⟩ := cOffset?_spec 0 fs i o hOff
+    rw [hFl] at hF
+    cases hF
+    exact hDvd (hWF.fieldAlignPow2 fl (List.mem_of_getElem? hFl)).pos
+  · intro i j oi oj fi fj hNe hoi hoj hfi hfj
+    have hi : i < fs.length := (List.getElem?_eq_some_iff.mp hfi).1
+    have hj : j < fs.length := (List.getElem?_eq_some_iff.mp hfj).1
+    rw [hOffEq i hi] at hoi
+    rw [hOffEq j hj] at hoj
+    have hResI : resolveAdtOffsetOf spec 0 i = some oi := by
+      simp [resolveAdtOffsetOf, adtLayout?, spec, structLayout?, structFieldOffset?, hoi]
+    have hResJ : resolveAdtOffsetOf spec 0 j = some oj := by
+      simp [resolveAdtOffsetOf, adtLayout?, spec, structLayout?, structFieldOffset?, hoj]
+    exact hPlaced.disjoint i j oi oj fi fj hNe hResI hResJ hfi hfj
+
+/--
+**`#[repr(C)]` Layout Uniqueness Theorem**: Any two valid `#[repr(C)]` layout worlds
+for the same `(reprAlign, fs)` are identical (`w₁ = w₂`).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem reprC_validStructLayoutWorld_unique {reprAlign : Option Nat} {fs : List FieldLayout}
+    {w₁ w₂ : StructLayoutWorld}
+    (h₁ : ValidStructLayoutWorld .c reprAlign fs w₁)
+    (h₂ : ValidStructLayoutWorld .c reprAlign fs w₂) :
+    w₁ = w₂ := by
+  have hLen₁ := h₁.offsets_len
+  have hLen₂ := h₂.offsets_len
+  rcases h₁.repr_valid with ⟨hA₁, hS₁, hO₁⟩
+  rcases h₂.repr_valid with ⟨hA₂, hS₂, hO₂⟩
+  cases w₁ with
+  | mk offs₁ sz₁ al₁ =>
+    cases w₂ with
+    | mk offs₂ sz₂ al₂ =>
+      dsimp only at hLen₁ hLen₂ hA₁ hS₁ hO₁ hA₂ hS₂ hO₂
+      have hAl : al₁ = al₂ := hA₁.trans hA₂.symm
+      have hSz : sz₁ = sz₂ := hS₁.trans hS₂.symm
+      have hOffs : offs₁ = offs₂ := by
+        apply List.ext_getElem?
+        intro i
+        rcases Nat.lt_or_ge i fs.length with hi | hGe
+        · rw [hO₁ i hi, hO₂ i hi]
+        · have hGe₁ : offs₁.length ≤ i := by omega
+          have hGe₂ : offs₂.length ≤ i := by omega
+          rw [List.getElem?_eq_none hGe₁, List.getElem?_eq_none hGe₂]
+      subst hAl hSz hOffs
+      rfl
+
+/--
+**`#[repr(transparent)]` Payload Uniqueness Theorem**: In every valid `#[repr(transparent)]`
+layout world with a unique non-1-ZST field `f` at index `i₀`, the total size is `f.size`,
+the alignment is `f.align`, and field `i₀` sits at byte offset `0`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem reprTransparent_nonOneZst_offset_zero_and_size_eq
+    {fs : List FieldLayout} {w : StructLayoutWorld} {f : FieldLayout} {i₀ : Nat}
+    (hValid : ValidStructLayoutWorld .transparent none fs w)
+    (hUniqueNonZst : nonOneZstFields fs = [f])
+    (hField : fs[i₀]? = some f)
+    (hNotOneZst : f.isOneZst = false) :
+    w.totalSize = f.size ∧ w.align = f.align ∧ w.fieldOffsets[i₀]? = some 0 := by
+  rcases hValid.repr_valid with ⟨_, hTrans⟩
+  rw [hUniqueNonZst] at hTrans
+  rcases hTrans with ⟨hSz, hAl, hPlace⟩
+  exact ⟨hSz, hAl, (hPlace i₀ f hField).1 hNotOneZst⟩
+
+/--
+**`#[repr(transparent)]` 1-ZST Sibling Placement**: in every valid `#[repr(transparent)]`
+world, a 1-ZST sibling `z` of the unique non-1-ZST payload `f` sits either at offset `0` or at
+offset `w.totalSize` (the payload's end). `ReprLayoutConstraint .transparent` alone admits any
+`o ≤ f.size`, but `ValidStructLayoutWorld.fields_disjoint` (mirroring `ByteLayout.WF`'s strict
+disjointness, which `symbolicPadByteLayout_wf` needs) rules out interior offsets. This matches
+`rustc`'s sequential field placement; worlds with interior zero-size offsets are byte-equivalent
+(a 0-byte field encodes and deinitializes no bytes).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem reprTransparent_oneZst_offset_zero_or_end
+    {fs : List FieldLayout} {w : StructLayoutWorld} {f z : FieldLayout} {i₀ j oz : Nat}
+    (hValid : ValidStructLayoutWorld .transparent none fs w)
+    (hUniqueNonZst : nonOneZstFields fs = [f])
+    (hField : fs[i₀]? = some f) (hNotOneZst : f.isOneZst = false)
+    (hZ : fs[j]? = some z) (hZst : z.isOneZst = true)
+    (hOz : w.fieldOffsets[j]? = some oz) :
+    oz = 0 ∨ oz = w.totalSize := by
+  obtain ⟨hSz, _, hOff0⟩ :=
+    reprTransparent_nonOneZst_offset_zero_and_size_eq hValid hUniqueNonZst hField hNotOneZst
+  have hNe : j ≠ i₀ := by
+    intro hEq
+    subst hEq
+    rw [hField] at hZ
+    cases hZ
+    rw [hZst] at hNotOneZst
+    nomatch hNotOneZst
+  have hZSize : z.size = 0 := by
+    unfold FieldLayout.isOneZst at hZst
+    simp only [Bool.and_eq_true, beq_iff_eq] at hZst
+    exact hZst.1
+  have hDisj := hValid.fields_disjoint j i₀ oz 0 z f hNe hOz hOff0 hZ hField
+  have hIn := hValid.field_in_bounds j oz z hOz hZ
+  rw [hZSize] at hDisj hIn
+  omega
+
+/--
+**`#[repr(transparent)]` Full Uniqueness Theorem**: two valid `#[repr(transparent)]` worlds for
+the same fields that agree on every 1-ZST sibling offset are identical (`w₁ = w₂`); the payload
+offset, total size, and alignment are forced by `ReprLayoutConstraint .transparent`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem reprTransparent_validStructLayoutWorld_unique_of_oneZst_offsets
+    {fs : List FieldLayout} {w₁ w₂ : StructLayoutWorld}
+    (h₁ : ValidStructLayoutWorld .transparent none fs w₁)
+    (h₂ : ValidStructLayoutWorld .transparent none fs w₂)
+    (hZstAgree : ∀ (j : Nat) (z : FieldLayout), fs[j]? = some z → z.isOneZst = true →
+      w₁.fieldOffsets[j]? = w₂.fieldOffsets[j]?) :
+    w₁ = w₂ := by
+  have hLen₁ := h₁.offsets_len
+  have hLen₂ := h₂.offsets_len
+  rcases h₁.repr_valid with ⟨_, hT₁⟩
+  rcases h₂.repr_valid with ⟨_, hT₂⟩
+  cases w₁ with
+  | mk offs₁ sz₁ al₁ =>
+    cases w₂ with
+    | mk offs₂ sz₂ al₂ =>
+      dsimp only at hLen₁ hLen₂ hT₁ hT₂ hZstAgree ⊢
+      cases hNZ : nonOneZstFields fs with
+      | nil =>
+        rw [hNZ] at hT₁ hT₂
+        rcases hT₁ with ⟨hS₁, hA₁, hO₁⟩
+        rcases hT₂ with ⟨hS₂, hA₂, hO₂⟩
+        have hOffs : offs₁ = offs₂ := by
+          apply List.ext_getElem?
+          intro i
+          rcases Nat.lt_or_ge i fs.length with hi | hGe
+          · rw [hO₁ i hi, hO₂ i hi]
+          · rw [List.getElem?_eq_none (by omega), List.getElem?_eq_none (by omega)]
+        subst hOffs
+        rw [hS₁, hS₂, hA₁, hA₂]
+      | cons f rest =>
+        cases rest with
+        | nil =>
+          rw [hNZ] at hT₁ hT₂
+          rcases hT₁ with ⟨hS₁, hA₁, hP₁⟩
+          rcases hT₂ with ⟨hS₂, hA₂, hP₂⟩
+          have hOffs : offs₁ = offs₂ := by
+            apply List.ext_getElem?
+            intro i
+            rcases Nat.lt_or_ge i fs.length with hi | hGe
+            · have hFl : fs[i]? = some fs[i] := List.getElem?_eq_getElem hi
+              cases hZ : FieldLayout.isOneZst fs[i] with
+              | false => rw [(hP₁ i fs[i] hFl).1 hZ, (hP₂ i fs[i] hFl).1 hZ]
+              | true => exact hZstAgree i fs[i] hFl hZ
+            · rw [List.getElem?_eq_none (by omega), List.getElem?_eq_none (by omega)]
+          subst hOffs
+          rw [hS₁, hS₂, hA₁, hA₂]
+        | cons _ _ =>
+          rw [hNZ] at hT₁
+          exact False.elim hT₁
+
+/-- Canonical zero-inter-field-padding `#[repr(Rust)]` layout world in declaration order. -/
+def canonicalRustLayoutWorld (reprAlign : Option Nat) (fs : List FieldLayout) : StructLayoutWorld :=
+  let a := maxAlign (reprAlign.getD 1) fs
+  { fieldOffsets := (List.range fs.length).map (fun i => (rustOffset? 0 fs i).getD 0)
+    totalSize := PlaceAndRvalue.alignUp (sumSizes fs) a
+    align := a }
+
+/--
+Kind: refinement
+Witness: universal
+Assumes: S3
+Subject: canonicalRustLayoutWorld
+-/
+theorem canonicalRustLayoutWorld_valid {reprAlign : Option Nat} {fs : List FieldLayout}
+    (hPadFree : paddingFree 0 fs = true)
+    (hWF : ({ shape := .struct fs, repr := .rust, reprAlign := reprAlign, rustOrderCanonical := true } : AdtLayoutSpec).WF) :
+    ValidStructLayoutWorld .rust reprAlign fs (canonicalRustLayoutWorld reprAlign fs) := by
+  let spec : AdtLayoutSpec :=
+    { shape := .struct fs, repr := .rust, reprAlign := reprAlign, rustOrderCanonical := true }
+  have hPlaced : SpecFieldsPlaced spec 0 fs :=
+    reprRust_canonical_struct_placed rfl rfl rfl hPadFree
+  have hOffEq : ∀ i, i < fs.length →
+      (canonicalRustLayoutWorld reprAlign fs).fieldOffsets[i]? = rustOffset? 0 fs i := by
+    intro i hi
+    obtain ⟨o, ho⟩ := rustOffset?_isSome 0 fs i hi
+    simp [canonicalRustLayoutWorld, List.getElem?_range hi, ho]
+  have hAlignPow2 : IsPow2 (maxAlign (reprAlign.getD 1) fs) := by
+    have hBasePow2 : IsPow2 (reprAlign.getD 1) := by
+      cases hR : reprAlign with
+      | none => exact isPow2_one
+      | some a => exact hWF.reprAlignPow2 a hR
+    exact maxAlign_pow2 (reprAlign.getD 1) fs hBasePow2 hWF.fieldAlignPow2
+  have hAlignPos : 0 < maxAlign (reprAlign.getD 1) fs := hAlignPow2.pos
+  refine
+    { offsets_len := by simp [canonicalRustLayoutWorld]
+      field_in_bounds := ?_
+      field_aligned := ?_
+      fields_disjoint := ?_
+      repr_valid := ?_ }
+  · -- In bounds via the constructive `rustOffset?_spec` (choice-free).
+    intro i o fl hOff hFl
+    have hi : i < fs.length := (List.getElem?_eq_some_iff.mp hFl).1
+    rw [hOffEq i hi] at hOff
+    obtain ⟨f, hF, hEnd, _⟩ := rustOffset?_spec 0 fs i o hOff hPadFree
+    rw [hFl] at hF
+    cases hF
+    have hUp := PlaceAndRvalue.alignUp_ge (sumSizes fs) (maxAlign (reprAlign.getD 1) fs)
+    dsimp only [canonicalRustLayoutWorld]
+    omega
+  · intro i o fl hOff hFl
+    have hi : i < fs.length := (List.getElem?_eq_some_iff.mp hFl).1
+    rw [hOffEq i hi] at hOff
+    obtain ⟨f, hF, _, hMod⟩ := rustOffset?_spec 0 fs i o hOff hPadFree
+    rw [hFl] at hF
+    cases hF
+    exact Nat.dvd_of_mod_eq_zero hMod
+  · intro i j oi oj fi fj hNe hoi hoj hfi hfj
+    have hi : i < fs.length := (List.getElem?_eq_some_iff.mp hfi).1
+    have hj : j < fs.length := (List.getElem?_eq_some_iff.mp hfj).1
+    rw [hOffEq i hi] at hoi
+    rw [hOffEq j hj] at hoj
+    have hResI : resolveAdtOffsetOf spec 0 i = some oi := by
+      rw [resolveAdtOffsetOf_reprRust_struct rfl rfl rfl hPadFree i]
+      exact hoi
+    have hResJ : resolveAdtOffsetOf spec 0 j = some oj := by
+      rw [resolveAdtOffsetOf_reprRust_struct rfl rfl rfl hPadFree j]
+      exact hoj
+    exact hPlaced.disjoint i j oi oj fi fj hNe hResI hResJ hfi hfj
+  · refine ⟨rfl, PlaceAndRvalue.alignUp_mod_eq_zero (sumSizes fs) (maxAlign (reprAlign.getD 1) fs) hAlignPos,
+      Nat.le_refl _, ?_⟩
+    intro hSum0 _
+    dsimp only [canonicalRustLayoutWorld]
+    rw [hSum0]
+    exact PlaceAndRvalue.alignUp_eq_self_of_mod_zero (Nat.zero_mod _)
+
+/--
+Add `extraAlignMultiples * w.align` bytes of trailing compiler-chosen padding to a
+`StructLayoutWorld`. For any non-ZST `#[repr(Rust)]` struct, this produces infinitely
+many distinct valid layout worlds (`extraAlignMultiples = 1, 2, ...`).
+-/
+def addTrailingAlignedPad (w : StructLayoutWorld) (extraAlignMultiples : Nat) : StructLayoutWorld :=
+  { w with totalSize := w.totalSize + extraAlignMultiples * w.align }
+
+/--
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: addTrailingAlignedPad
+-/
+theorem addTrailingAlignedPad_preserves_valid_reprRust
+    {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .rust reprAlign fs w)
+    (hNonZst : 0 < sumSizes fs) (extraAlignMultiples : Nat) :
+    ValidStructLayoutWorld .rust reprAlign fs (addTrailingAlignedPad w extraAlignMultiples) := by
+  rcases hValid.repr_valid with ⟨hAl, hMod, hGe, _⟩
+  refine
+    { offsets_len := hValid.offsets_len
+      field_in_bounds := fun i o fl hOff hFl => by
+        have hB := hValid.field_in_bounds i o fl hOff hFl
+        dsimp only [addTrailingAlignedPad]
+        omega
+      field_aligned := hValid.field_aligned
+      fields_disjoint := hValid.fields_disjoint
+      repr_valid := ?_ }
+  dsimp only [ReprLayoutConstraint, addTrailingAlignedPad]
+  refine ⟨hAl, ?_, by omega, fun hZero _ => by omega⟩
+  rw [← hAl, Nat.add_mul_mod_self_right, hAl]
+  exact hMod
+
+
+namespace SymbolicPairPad
+
+open Anneal.ByteCodec.SymbolicPairPad
+
+/--
+Convert a `SymbolicPairPad` into a concrete `StructLayoutWorld` for two fields `[f₀, f₁]`.
+-/
+def toStructLayoutWorld (w : SymbolicPairPad) (f₀ f₁ : FieldLayout) (align : Nat) : StructLayoutWorld where
+  fieldOffsets := [w.offsetField0 f₀.size f₁.size, w.offsetField1 f₀.size f₁.size]
+  totalSize := w.totalByteSize f₀.size f₁.size
+  align := align
+
+abbrev _root_.Anneal.ByteCodec.SymbolicPairPad.toStructLayoutWorld :=
+  @SymbolicPairPad.toStructLayoutWorld
+
+/--
+Every `SymbolicPairPad` (whether in declaration order `swapOrder = false` or permuted
+memory order `swapOrder = true`!) places fields `0` and `1` at in-bounds, pairwise
+disjoint byte windows inside `w.totalByteSize f₀.size f₁.size`.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: SymbolicPairPad.toStructLayoutWorld
+-/
+theorem toStructLayoutWorld_inBounds_and_disjoint (w : SymbolicPairPad)
+    (f₀ f₁ : FieldLayout) (align : Nat) :
+    let sw := w.toStructLayoutWorld f₀ f₁ align
+    w.offsetField0 f₀.size f₁.size + f₀.size ≤ sw.totalSize ∧
+    w.offsetField1 f₀.size f₁.size + f₁.size ≤ sw.totalSize ∧
+    (w.offsetField0 f₀.size f₁.size + f₀.size ≤ w.offsetField1 f₀.size f₁.size ∨
+     w.offsetField1 f₀.size f₁.size + f₁.size ≤ w.offsetField0 f₀.size f₁.size) := by
+  dsimp only [toStructLayoutWorld, _root_.Anneal.ByteCodec.SymbolicPairPad.toStructLayoutWorld]
+  unfold offsetField0 offsetField1 totalByteSize firstMemWidth secondMemWidth
+  cases w.swapOrder <;> dsimp only
+  · refine ⟨by omega, by omega, Or.inl (by omega)⟩
+  · refine ⟨by omega, by omega, Or.inr (by omega)⟩
+
+end SymbolicPairPad
+
+abbrev _root_.Anneal.ByteCodec.SymbolicPairPad.toStructLayoutWorld_inBounds_and_disjoint :=
+  @SymbolicPairPad.toStructLayoutWorld_inBounds_and_disjoint
+
+/-! #### Section 2e2.2: Pair Layout-World Bridge: `SymbolicPairPad` ↔ `ValidStructLayoutWorld` -/
+
+/--
+Rounding up adds at most one alignment unit: `alignUp x a ≤ x + a`.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem alignUp_le_add (x a : Nat) : PlaceAndRvalue.alignUp x a ≤ x + a := by
+  unfold PlaceAndRvalue.alignUp roundUpToAlign
+  cases Nat.beq (Nat.mod x a) 0 with
+  | true => exact Nat.le_add_right x a
+  | false =>
+    show x + (a - x % a) ≤ x + a
+    omega
+
+/--
+Constructive (`Classical.choice`-free) divisibility of powers of two: `a ≤ b → a ∣ b` for
+`IsPow2 a`, `IsPow2 b` (the upstream `IsPow2.dvd_of_le` routes through
+`Nat.pow_le_pow_iff_right`, which depends on `Classical.choice`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem isPow2_dvd_of_le_constructive {a b : Nat} (ha : IsPow2 a) (hb : IsPow2 b) (hLe : a ≤ b) :
+    a ∣ b := by
+  rcases ha with ⟨i, rfl⟩
+  rcases hb with ⟨j, rfl⟩
+  rcases Nat.lt_or_ge j i with hji | hij
+  · have h1 : 2 ^ j < 2 ^ (j + 1) := Nat.pow_lt_pow_succ (by decide)
+    have h2 : 2 ^ (j + 1) ≤ 2 ^ i := Nat.pow_le_pow_right (by decide) hji
+    exact absurd hLe (Nat.not_le_of_lt (Nat.lt_of_lt_of_le h1 h2))
+  · exact Nat.pow_dvd_pow 2 hij
+
+/--
+Index inversion for 2-element lists.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem getElem?_pair_eq_some {γ : Type} {x y z : γ} :
+    ∀ {i : Nat}, [x, y][i]? = some z → (i = 0 ∧ z = x) ∨ (i = 1 ∧ z = y)
+  | 0, h => Or.inl ⟨rfl, (Option.some.inj h).symm⟩
+  | 1, h => Or.inr ⟨rfl, (Option.some.inj h).symm⟩
+  | _ + 2, h => nomatch h
+
+/--
+**Pair Layout-World Completeness**: every valid layout world of a 2-field struct (under any
+representation) is realized by some `SymbolicPairPad` (leading/inter-field/trailing padding plus
+memory order): `p.toStructLayoutWorld f₀ f₁ w.align = w`. Hence every theorem quantified over all
+`SymbolicPairPad`s covers every `ValidStructLayoutWorld` of a pair.
+
+Kind: refinement
+Witness: exists-sat
+Assumes: S0
+Subject: SymbolicPairPad.toStructLayoutWorld
+-/
+theorem SymbolicPairPad.exists_of_validStructLayoutWorld {repr : AdtRepr} {reprAlign : Option Nat}
+    {f₀ f₁ : FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign [f₀, f₁] w) :
+    ∃ p : SymbolicPairPad, p.toStructLayoutWorld f₀ f₁ w.align = w := by
+  have hLen := hValid.offsets_len
+  rcases w with ⟨offs, total, al⟩
+  dsimp only at hLen ⊢
+  rcases offs with _ | ⟨o₀, _ | ⟨o₁, _ | ⟨_, _⟩⟩⟩
+  · nomatch hLen
+  · nomatch hLen
+  · have hIn₀ := hValid.field_in_bounds 0 o₀ f₀ rfl rfl
+    have hIn₁ := hValid.field_in_bounds 1 o₁ f₁ rfl rfl
+    have hDisj := hValid.fields_disjoint 0 1 o₀ o₁ f₀ f₁ (by decide) rfl rfl rfl rfl
+    dsimp only at hIn₀ hIn₁
+    rcases hDisj with hLe | hLe
+    · refine ⟨⟨o₀, o₁ - (o₀ + f₀.size), total - (o₁ + f₁.size), false⟩, ?_⟩
+      simp only [SymbolicPairPad.toStructLayoutWorld, SymbolicPairPad.offsetField0,
+        SymbolicPairPad.offsetField1, SymbolicPairPad.totalByteSize, SymbolicPairPad.firstMemWidth,
+        SymbolicPairPad.secondMemWidth, StructLayoutWorld.mk.injEq, List.cons.injEq, and_true,
+        true_and]
+      exact ⟨by omega, by omega⟩
+    · refine ⟨⟨o₁, o₀ - (o₁ + f₁.size), total - (o₀ + f₀.size), true⟩, ?_⟩
+      simp only [SymbolicPairPad.toStructLayoutWorld, SymbolicPairPad.offsetField0,
+        SymbolicPairPad.offsetField1, SymbolicPairPad.totalByteSize, SymbolicPairPad.firstMemWidth,
+        SymbolicPairPad.secondMemWidth, StructLayoutWorld.mk.injEq, List.cons.injEq, and_true]
+      exact ⟨by omega, by omega⟩
+  · nomatch hLen
+
+/--
+**Pair Layout-World Soundness (`#[repr(Rust)]`)**: a `SymbolicPairPad` whose field offsets are
+aligned, whose total size is a multiple of `a = maxAlign 1 [f₀, f₁]` and at least
+`alignUp (f₀.size + f₁.size) a`, and which respects `r[layout.repr.rust.struct-zst]`, yields a
+`ValidStructLayoutWorld .rust none [f₀, f₁]` (in either memory order).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: SymbolicPairPad.toStructLayoutWorld
+-/
+theorem SymbolicPairPad.toStructLayoutWorld_valid_reprRust {f₀ f₁ : FieldLayout}
+    (p : SymbolicPairPad)
+    (hAl₀ : f₀.align ∣ p.offsetField0 f₀.size f₁.size)
+    (hAl₁ : f₁.align ∣ p.offsetField1 f₀.size f₁.size)
+    (hMod : p.totalByteSize f₀.size f₁.size % maxAlign 1 [f₀, f₁] = 0)
+    (hGe : PlaceAndRvalue.alignUp (f₀.size + f₁.size) (maxAlign 1 [f₀, f₁]) ≤
+      p.totalByteSize f₀.size f₁.size)
+    (hZst : f₀.size + f₁.size = 0 → p.totalByteSize f₀.size f₁.size = 0) :
+    ValidStructLayoutWorld .rust none [f₀, f₁]
+      (p.toStructLayoutWorld f₀ f₁ (maxAlign 1 [f₀, f₁])) := by
+  obtain ⟨hB₀, hB₁, hD⟩ := p.toStructLayoutWorld_inBounds_and_disjoint f₀ f₁ (maxAlign 1 [f₀, f₁])
+  have hSum : sumSizes [f₀, f₁] = f₀.size + f₁.size := by simp [sumSizes]
+  refine
+    { offsets_len := rfl
+      field_in_bounds := ?_
+      field_aligned := ?_
+      fields_disjoint := ?_
+      repr_valid := ?_ }
+  · intro i o fl hO hF
+    rcases getElem?_pair_eq_some hO with ⟨hi, ho⟩ | ⟨hi, ho⟩ <;>
+      rcases getElem?_pair_eq_some hF with ⟨hi', hf⟩ | ⟨hi', hf⟩ <;>
+      subst ho hf
+    · exact hB₀
+    · exact absurd (hi.symm.trans hi') (by decide)
+    · exact absurd (hi.symm.trans hi') (by decide)
+    · exact hB₁
+  · intro i o fl hO hF
+    rcases getElem?_pair_eq_some hO with ⟨hi, ho⟩ | ⟨hi, ho⟩ <;>
+      rcases getElem?_pair_eq_some hF with ⟨hi', hf⟩ | ⟨hi', hf⟩ <;>
+      subst ho hf
+    · exact hAl₀
+    · exact absurd (hi.symm.trans hi') (by decide)
+    · exact absurd (hi.symm.trans hi') (by decide)
+    · exact hAl₁
+  · intro i j oi oj fi fj hNe hoi hoj hfi hfj
+    rcases getElem?_pair_eq_some hoi with ⟨hi, ho⟩ | ⟨hi, ho⟩ <;>
+      rcases getElem?_pair_eq_some hfi with ⟨hi', hf⟩ | ⟨hi', hf⟩ <;>
+      rcases getElem?_pair_eq_some hoj with ⟨hj, ho'⟩ | ⟨hj, ho'⟩ <;>
+      rcases getElem?_pair_eq_some hfj with ⟨hj', hf'⟩ | ⟨hj', hf'⟩ <;>
+      subst ho hf ho' hf' <;>
+      first
+        | exact hD
+        | exact hD.symm
+        | exact absurd (hi.symm.trans hi') (by decide)
+        | exact absurd (hj.symm.trans hj') (by decide)
+        | exact absurd (hi.trans hj.symm) hNe
+  · dsimp only [ReprLayoutConstraint, Option.getD]
+    refine ⟨rfl, hMod, ?_, ?_⟩
+    · rw [hSum]
+      exact hGe
+    · intro hZ _
+      rw [hSum] at hZ
+      exact hZst hZ
+
+
+/--
+Bundled 2-field valid layout world carrying its realizing `SymbolicPairPad` directly,
+allowing constructive (`Classical.choice`-free) extraction of `toSymbolicPad`.
+-/
+structure ValidPairLayoutWorld (repr : AdtRepr) (reprAlign : Option Nat)
+    (f₀ f₁ : FieldLayout) : Type where
+  pad : SymbolicPairPad
+  align : Nat
+  valid : ValidStructLayoutWorld repr reprAlign [f₀, f₁]
+    (pad.toStructLayoutWorld f₀ f₁ align)
+
+/-- Extract the underlying `SymbolicPairPad` from a `ValidPairLayoutWorld`. -/
+abbrev ValidPairLayoutWorld.toSymbolicPad {repr : AdtRepr} {reprAlign : Option Nat}
+    {f₀ f₁ : FieldLayout} (w : ValidPairLayoutWorld repr reprAlign f₀ f₁) : SymbolicPairPad :=
+  w.pad
+/--
+Alignment-respecting padded pair world: field `0` at offset `0`, field `1` at offset
+`f₀.size * a`, and total size `(f₀.size + f₁.size + 1) * a` where `a = maxAlign 1 [f₀, f₁]`;
+the extra trailing alignment unit guarantees strictly positive padding.
+-/
+abbrev _root_.Anneal.ByteCodec.SymbolicPairPad.exists_of_validStructLayoutWorld :=
+  @SymbolicPairPad.exists_of_validStructLayoutWorld
+abbrev _root_.Anneal.ByteCodec.SymbolicPairPad.toStructLayoutWorld_valid_reprRust :=
+  @SymbolicPairPad.toStructLayoutWorld_valid_reprRust
+
+def paddedPairWitness (f₀ f₁ : FieldLayout) : SymbolicPairPad :=
+  ⟨0, f₀.size * maxAlign 1 [f₀, f₁] - f₀.size,
+    (f₀.size + f₁.size + 1) * maxAlign 1 [f₀, f₁] - (f₀.size * maxAlign 1 [f₀, f₁] + f₁.size),
+    false⟩
+
+/--
+The padded witness world is a genuinely valid `#[repr(Rust)]` layout world (aligned offsets,
+`totalSize % align = 0`, `alignUp` lower bound) for every non-ZST pair with power-of-two field
+alignments, and it carries at least one full alignment unit of padding.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: paddedPairWitness
+-/
+theorem paddedPairWitness_valid_and_padded {f₀ f₁ : FieldLayout}
+    (hAlign₀ : IsPow2 f₀.align) (hAlign₁ : IsPow2 f₁.align) (hNonZst : 0 < f₀.size + f₁.size) :
+    ValidStructLayoutWorld .rust none [f₀, f₁]
+        ((paddedPairWitness f₀ f₁).toStructLayoutWorld f₀ f₁ (maxAlign 1 [f₀, f₁])) ∧
+      maxAlign 1 [f₀, f₁] ≤ (paddedPairWitness f₀ f₁).totalPad ∧
+      ∃ k, (paddedPairWitness f₀ f₁).totalPad = k + 1 := by
+  -- Pure arithmetic facts first (only `Nat` hypotheses in scope, so `omega` stays
+  -- `Classical.choice`-free), alignment/divisibility facts afterwards.
+  have hAPos : 0 < maxAlign 1 [f₀, f₁] :=
+    (maxAlign_pow2 1 [f₀, f₁] isPow2_one (by
+      intro f hf
+      rcases List.mem_cons.mp hf with rfl | hf'
+      · exact hAlign₀
+      · rcases List.mem_cons.mp hf' with rfl | hf''
+        · exact hAlign₁
+        · nomatch hf'')).pos
+  have hm₀ : f₀.size ≤ f₀.size * maxAlign 1 [f₀, f₁] := Nat.le_mul_of_pos_right _ hAPos
+  have hm₁ : f₁.size ≤ f₁.size * maxAlign 1 [f₀, f₁] := Nat.le_mul_of_pos_right _ hAPos
+  have hExp : (f₀.size + f₁.size + 1) * maxAlign 1 [f₀, f₁] =
+      f₀.size * maxAlign 1 [f₀, f₁] + f₁.size * maxAlign 1 [f₀, f₁] + maxAlign 1 [f₀, f₁] := by
+    rw [Nat.add_mul, Nat.add_mul, Nat.one_mul]
+  have hTotal : (paddedPairWitness f₀ f₁).totalByteSize f₀.size f₁.size =
+      (f₀.size + f₁.size + 1) * maxAlign 1 [f₀, f₁] := by
+    simp only [paddedPairWitness, SymbolicPairPad.totalByteSize, SymbolicPairPad.firstMemWidth,
+      SymbolicPairPad.secondMemWidth]
+    omega
+  have hOff1 : (paddedPairWitness f₀ f₁).offsetField1 f₀.size f₁.size =
+      f₀.size * maxAlign 1 [f₀, f₁] := by
+    simp only [paddedPairWitness, SymbolicPairPad.offsetField1]
+    omega
+  have hPadEq : (paddedPairWitness f₀ f₁).totalPad =
+      (f₀.size * maxAlign 1 [f₀, f₁] - f₀.size) +
+        ((f₀.size + f₁.size + 1) * maxAlign 1 [f₀, f₁] -
+          (f₀.size * maxAlign 1 [f₀, f₁] + f₁.size)) := by
+    simp only [paddedPairWitness, SymbolicPairPad.totalPad]
+    omega
+  have hUp := alignUp_le_add (f₀.size + f₁.size) (maxAlign 1 [f₀, f₁])
+  have hGe : PlaceAndRvalue.alignUp (f₀.size + f₁.size) (maxAlign 1 [f₀, f₁]) ≤
+      (paddedPairWitness f₀ f₁).totalByteSize f₀.size f₁.size := by
+    rw [hTotal]
+    omega
+  have hPadGe : maxAlign 1 [f₀, f₁] ≤ (paddedPairWitness f₀ f₁).totalPad := by
+    rw [hPadEq]
+    omega
+  have hPadSucc : (paddedPairWitness f₀ f₁).totalPad =
+      ((paddedPairWitness f₀ f₁).totalPad - 1) + 1 := by
+    omega
+  have hZstVac : f₀.size + f₁.size = 0 →
+      (paddedPairWitness f₀ f₁).totalByteSize f₀.size f₁.size = 0 := by
+    intro h
+    exact absurd h (Nat.pos_iff_ne_zero.mp hNonZst)
+  -- Alignment / divisibility facts.
+  have hAPow : IsPow2 (maxAlign 1 [f₀, f₁]) := by
+    refine maxAlign_pow2 1 [f₀, f₁] isPow2_one ?_
+    intro f hf
+    rcases List.mem_cons.mp hf with rfl | hf'
+    · exact hAlign₀
+    · rcases List.mem_cons.mp hf' with rfl | hf''
+      · exact hAlign₁
+      · nomatch hf''
+  have hDvd₁ : f₁.align ∣ maxAlign 1 [f₀, f₁] :=
+    isPow2_dvd_of_le_constructive hAlign₁ hAPow
+      (le_maxAlign_of_mem 1 [f₀, f₁] f₁ (List.mem_cons_of_mem _ (List.mem_cons_self ..)))
+  refine ⟨SymbolicPairPad.toStructLayoutWorld_valid_reprRust _ (Nat.dvd_zero _) ?_ ?_ hGe hZstVac,
+    hPadGe, _, hPadSucc⟩
+  · rw [hOff1]
+    exact Nat.dvd_trans hDvd₁ (Nat.dvd_mul_left _ _)
+  · rw [hTotal]
+    exact Nat.mul_mod_left _ _
+
+/--
+**Forward-Compatible `IntoBytes` Rejection Theorem (`reprRust_unconstrained_pad_not_intoBytes`)**:
+for **any** inhabited non-ZST two-field `#[repr(Rust)]` struct (arbitrary field layouts with
+power-of-two alignments and arbitrary field codecs), there EXISTS a valid
+`ValidStructLayoutWorld .rust` (aligned offsets, `totalSize % align = 0`, `alignUp` lower bound,
+`r[layout.repr.rust.struct-zst]`) with strictly positive padding in which the struct codec emits
+`.uninit` bytes, violates `IsInitCodec`, and refutes `BitValidity.IsIntoBytes` for every
+`MirValueCodec` realizing that world's encoding. Unguarded `transmute::<ReprRustStruct, [u8; N]>`
+is therefore unsound under `S0` without an `S1` guard or `S3` pin.
+
+Kind: divergence
+Witness: exists-sat
+Assumes: S0
+Subject: laidOutPairSymbolicPad
+-/
+theorem reprRust_unconstrained_pad_not_intoBytes {α β : Type} {f₀ f₁ : FieldLayout}
+    (hAlign₀ : IsPow2 f₀.align) (hAlign₁ : IsPow2 f₁.align) (hNonZst : 0 < f₀.size + f₁.size)
+    (c₁ : FixedByteCodec α f₀.size) (c₂ : FixedByteCodec β f₁.size) (a₀ : α) (b₀ : β) :
+    ∃ p : SymbolicPairPad,
+      ValidStructLayoutWorld .rust none [f₀, f₁]
+        (p.toStructLayoutWorld f₀ f₁ (maxAlign 1 [f₀, f₁])) ∧
+      0 < p.totalPad ∧
+      allBytesInitialized ((laidOutPairSymbolicPad p c₁ c₂).encode (a₀, b₀)) = false ∧
+      ¬ (laidOutPairSymbolicPad p c₁ c₂).IsInitCodec ∧
+      ∀ (layouts : LayoutTable) (ty : Ty)
+        (m : MirValueCodec layouts ty (α × β) (p.totalByteSize f₀.size f₁.size)),
+        (∀ x, m.codec.encode x = (laidOutPairSymbolicPad p c₁ c₂).encode x) →
+        ¬ IsIntoBytes layouts ty := by
+  obtain ⟨hValid, _, k, hK⟩ := paddedPairWitness_valid_and_padded hAlign₀ hAlign₁ hNonZst
+  have hPos : 0 < (paddedPairWitness f₀ f₁).totalPad := by omega
+  have hUninit := laidOutPairSymbolicPad_encode_uninit_of_totalPad_pos hPos c₁ c₂ a₀ b₀
+  refine ⟨paddedPairWitness f₀ f₁, hValid, hPos, hUninit, ?_, ?_⟩
+  · intro hInit
+    have hTrue := hInit (a₀, b₀)
+    rw [hUninit] at hTrue
+    nomatch hTrue
+  · intro layouts ty m hAgree
+    exact m.not_isIntoBytes_of_uninit_encode (a₀, b₀) (by rw [hAgree]; exact hUninit)
+
+/--
+**`r[layout.repr.rust.struct-zst]` Tightness**: the non-ZST hypothesis of
+`reprRust_unconstrained_pad_not_intoBytes` is necessary. Every valid `#[repr(Rust)]` world of an
+all-ZST pair has zero padding, so its codec is `IsInitCodec` whenever the field codecs are.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: laidOutPairSymbolicPad
+-/
+theorem reprRust_zst_pair_every_world_isInitCodec {α β : Type} {f₀ f₁ : FieldLayout}
+    (hZst : f₀.size + f₁.size = 0) (p : SymbolicPairPad)
+    (hValid : ValidStructLayoutWorld .rust none [f₀, f₁]
+      (p.toStructLayoutWorld f₀ f₁ (maxAlign 1 [f₀, f₁])))
+    {c₁ : FixedByteCodec α f₀.size} {c₂ : FixedByteCodec β f₁.size}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) :
+    p.totalPad = 0 ∧ (laidOutPairSymbolicPad p c₁ c₂).IsInitCodec := by
+  have hSum : sumSizes [f₀, f₁] = 0 := by
+    show f₀.size + (f₁.size + 0) = 0
+    omega
+  have hSz := (reprRust_zst_totalSize_eq_zero hValid hSum).1
+  have hEq := p.totalByteSize_eq_sum_plus_totalPad f₀.size f₁.size
+  have hPad : p.totalPad = 0 := by
+    dsimp only [SymbolicPairPad.toStructLayoutWorld, _root_.Anneal.ByteCodec.SymbolicPairPad.toStructLayoutWorld] at hSz
+    omega
+  exact ⟨hPad, laidOutPairSymbolicPad_isInitCodec_of_zero_pad hPad h₁ h₂⟩
+
+/--
+**Tight-World `IntoBytes` Soundness (any representation)**: in every valid 2-field layout world
+whose total size equals the sum of the field sizes, the realizing `SymbolicPairPad` has zero
+padding and the struct codec is `IsInitCodec`; every `MirValueCodec` realizing that encoding (and
+enforcing untyped field widths) is `BitValidity.IsIntoBytes`. This is the common core of the
+`#[repr(C)]` padding-free, `#[repr(transparent)]`, and `S3`-pinned canonical certificates.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: laidOutPairSymbolicPad
+-/
+theorem validPairWorld_tight_isInitCodec_and_isIntoBytes {repr : AdtRepr} {reprAlign : Option Nat}
+    {α β : Type} {f₀ f₁ : FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign [f₀, f₁] w)
+    (hTight : w.totalSize = f₀.size + f₁.size)
+    {c₁ : FixedByteCodec α f₀.size} {c₂ : FixedByteCodec β f₁.size}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) :
+    ∃ p : SymbolicPairPad,
+      p.toStructLayoutWorld f₀ f₁ w.align = w ∧ p.totalPad = 0 ∧
+      (laidOutPairSymbolicPad p c₁ c₂).IsInitCodec ∧
+      ∀ (layouts : LayoutTable) (ty : Ty)
+        (m : MirValueCodec layouts ty (α × β) (p.totalByteSize f₀.size f₁.size)),
+        m.enforcesUntypedFieldWidths = true →
+        (∀ x, m.codec.encode x = (laidOutPairSymbolicPad p c₁ c₂).encode x) →
+        IsIntoBytes layouts ty := by
+  obtain ⟨p, hP⟩ := SymbolicPairPad.exists_of_validStructLayoutWorld hValid
+  have hTot : p.totalByteSize f₀.size f₁.size = w.totalSize := by
+    rw [← hP]
+    rfl
+  have hEq := p.totalByteSize_eq_sum_plus_totalPad f₀.size f₁.size
+  have hPad : p.totalPad = 0 := by omega
+  have hInit := laidOutPairSymbolicPad_isInitCodec_of_zero_pad hPad h₁ h₂
+  refine ⟨p, hP, hPad, hInit, ?_⟩
+  intro layouts ty m hW hAgree
+  exact m.isIntoBytes (fun x => by rw [hAgree]; exact hInit x) hW
+
+/--
+**Tight-World Typed Transmute Soundness (any representation, either memory order)**: in every valid
+2-field layout world whose total size equals `f₀.size + f₁.size`, any `MirValueCodec` `mSrc`
+realizing `laidOutPairSymbolicPad p c₁ c₂` can soundly `transmute_typed` to any same-sized
+`IsSurjectiveInitDecoder` (`FromBytes`) target `mDst`, producing a decoded value `y : γ` that
+agrees with MIR `decodeValueFromBytes`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: laidOutPairSymbolicPad
+-/
+theorem validPairWorld_tight_transmute_sound {repr : AdtRepr} {reprAlign : Option Nat}
+    {α β : Type} {f₀ f₁ : FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign [f₀, f₁] w)
+    (hTight : w.totalSize = f₀.size + f₁.size)
+    {c₁ : FixedByteCodec α f₀.size} {c₂ : FixedByteCodec β f₁.size}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) :
+    ∃ p : SymbolicPairPad,
+      p.toStructLayoutWorld f₀ f₁ w.align = w ∧ p.totalPad = 0 ∧
+      ∀ (layouts : LayoutTable) (srcTy dstTy : Ty) {γ : Type}
+        (mSrc : MirValueCodec layouts srcTy (α × β) (p.totalByteSize f₀.size f₁.size))
+        (mDst : MirValueCodec layouts dstTy γ (p.totalByteSize f₀.size f₁.size)),
+        (∀ x, mSrc.codec.encode x = (laidOutPairSymbolicPad p c₁ c₂).encode x) →
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : α × β, ∃ y : γ,
+          mDst.codec.decode (mSrc.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (mSrc.codec.encode x) =
+            some (mDst.toValue y) := by
+  obtain ⟨p, hP, hPad, hInit, _⟩ :=
+    validPairWorld_tight_isInitCodec_and_isIntoBytes hValid hTight h₁ h₂
+  refine ⟨p, hP, hPad, ?_⟩
+  intro layouts srcTy dstTy γ mSrc mDst hAgree hSurj x
+  have hSrcInit : mSrc.codec.IsInitCodec := fun v => by
+    rw [hAgree v]
+    exact hInit v
+  exact MirValueCodec.transmute_typed mSrc mDst hSrcInit hSurj x
+
+/--
+`#[repr(C)]` padding-freedom check (including trailing alignment rounding): the deterministic
+C ABI total size `alignUp (cEnd 0 fs) align` equals the sum of the field sizes.
+-/
+def reprCPaddingFree (reprAlign : Option Nat) (fs : List FieldLayout) : Bool :=
+  Nat.beq (reprCLayoutWorld reprAlign fs).totalSize (sumSizes fs)
+
+/--
+**`#[repr(C)]` Padding-Free `IntoBytes` Soundness**: when `reprCPaddingFree` holds (no
+inter-field padding and no trailing alignment rounding), the unique valid `#[repr(C)]` world of a
+pair is realized by a zero-padding `SymbolicPairPad`, the struct codec is `IsInitCodec`, and every
+realizing width-enforcing `MirValueCodec` is `IsIntoBytes`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: reprCLayoutWorld
+-/
+theorem reprC_pair_paddingFree_isInitCodec_and_isIntoBytes {reprAlign : Option Nat}
+    {α β : Type} {f₀ f₁ : FieldLayout}
+    (hWF : ({ shape := .struct [f₀, f₁], repr := .c, reprAlign := reprAlign,
+              rustOrderCanonical := false } : AdtLayoutSpec).WF)
+    (hPF : reprCPaddingFree reprAlign [f₀, f₁] = true)
+    {c₁ : FixedByteCodec α f₀.size} {c₂ : FixedByteCodec β f₁.size}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) :
+    ∃ p : SymbolicPairPad,
+      p.toStructLayoutWorld f₀ f₁ (reprCLayoutWorld reprAlign [f₀, f₁]).align =
+        reprCLayoutWorld reprAlign [f₀, f₁] ∧
+      p.totalPad = 0 ∧ (laidOutPairSymbolicPad p c₁ c₂).IsInitCodec ∧
+      ∀ (layouts : LayoutTable) (ty : Ty)
+        (m : MirValueCodec layouts ty (α × β) (p.totalByteSize f₀.size f₁.size)),
+        m.enforcesUntypedFieldWidths = true →
+        (∀ x, m.codec.encode x = (laidOutPairSymbolicPad p c₁ c₂).encode x) →
+        IsIntoBytes layouts ty := by
+  have hTight : (reprCLayoutWorld reprAlign [f₀, f₁]).totalSize = f₀.size + f₁.size := by
+    have h := Nat.eq_of_beq_eq_true hPF
+    simpa [sumSizes] using h
+  exact validPairWorld_tight_isInitCodec_and_isIntoBytes (reprCLayoutWorld_valid hWF) hTight h₁ h₂
+
+/--
+**`#[repr(C)]` Mandatory-Padding Rejection**: when `reprCPaddingFree` fails, the unique valid
+`#[repr(C)]` world of a pair carries positive padding, so every realizing codec emits `.uninit`
+bytes on every value (deterministic layouts are NOT automatically `IntoBytes`).
+
+Kind: divergence
+Witness: negative
+Assumes: S0
+Subject: reprCLayoutWorld
+-/
+theorem reprC_pair_not_paddingFree_encode_uninit {reprAlign : Option Nat}
+    {α β : Type} {f₀ f₁ : FieldLayout}
+    (hWF : ({ shape := .struct [f₀, f₁], repr := .c, reprAlign := reprAlign,
+              rustOrderCanonical := false } : AdtLayoutSpec).WF)
+    (hNotPF : reprCPaddingFree reprAlign [f₀, f₁] = false)
+    (c₁ : FixedByteCodec α f₀.size) (c₂ : FixedByteCodec β f₁.size) :
+    ∀ p : SymbolicPairPad,
+      p.toStructLayoutWorld f₀ f₁ (reprCLayoutWorld reprAlign [f₀, f₁]).align =
+        reprCLayoutWorld reprAlign [f₀, f₁] →
+      ∀ (a : α) (b : β), allBytesInitialized ((laidOutPairSymbolicPad p c₁ c₂).encode (a, b)) ≠ true := by
+  intro p hP a b
+  have hValid := reprCLayoutWorld_valid hWF
+  have hTot : p.totalByteSize f₀.size f₁.size = (reprCLayoutWorld reprAlign [f₀, f₁]).totalSize := by
+    rw [← hP]
+    rfl
+  have hEq := p.totalByteSize_eq_sum_plus_totalPad f₀.size f₁.size
+  have hNe : (reprCLayoutWorld reprAlign [f₀, f₁]).totalSize ≠ f₀.size + f₁.size := by
+    intro hEq'
+    have : reprCPaddingFree reprAlign [f₀, f₁] = true := by
+      unfold reprCPaddingFree
+      apply Nat.beq_eq.mpr
+      simpa [sumSizes] using hEq'
+    rw [this] at hNotPF
+    nomatch hNotPF
+  have hGe : f₀.size + f₁.size ≤ (reprCLayoutWorld reprAlign [f₀, f₁]).totalSize := by
+    obtain ⟨p', hP'⟩ := SymbolicPairPad.exists_of_validStructLayoutWorld hValid
+    have hTot' : p'.totalByteSize f₀.size f₁.size = (reprCLayoutWorld reprAlign [f₀, f₁]).totalSize := by
+      rw [← hP']
+      rfl
+    have := p'.totalByteSize_eq_sum_plus_totalPad f₀.size f₁.size
+    omega
+  have hPos : 0 < p.totalPad := by omega
+  rw [laidOutPairSymbolicPad_encode_uninit_of_totalPad_pos hPos c₁ c₂ a b]
+  decide
+
+/-- Concrete `#[repr(C)]` checks: `(u8, u8)` is padding-free; `(u8, u32)` is not
+(3 inter-field padding bytes); `(u32, u8)` is not (3 trailing alignment-rounding bytes). -/
+example : reprCPaddingFree none [⟨1, 1⟩, ⟨1, 1⟩] = true := by decide
+example : reprCPaddingFree none [⟨1, 1⟩, ⟨4, 4⟩] = false := by decide
+example : reprCPaddingFree none [⟨4, 4⟩, ⟨1, 1⟩] = false := by decide
+
+/--
+**`#[repr(transparent)]` `IntoBytes` Soundness**: a transparent pair wrapping a non-1-ZST payload
+`f` next to a 1-ZST sibling `z` has zero padding in every valid transparent world, so the struct
+codec is `IsInitCodec` whenever the payload codec (and the 0-byte sibling codec) are, and every
+realizing width-enforcing `MirValueCodec` is `IsIntoBytes`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: laidOutPairSymbolicPad
+-/
+theorem reprTransparent_pair_isInitCodec_and_isIntoBytes {α β : Type} {f z : FieldLayout}
+    (hF : f.isOneZst = false) (hZ : z.isOneZst = true) {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .transparent none [f, z] w)
+    {c₁ : FixedByteCodec α f.size} {c₂ : FixedByteCodec β z.size}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) :
+    ∃ p : SymbolicPairPad,
+      p.toStructLayoutWorld f z w.align = w ∧ p.totalPad = 0 ∧
+      (laidOutPairSymbolicPad p c₁ c₂).IsInitCodec ∧
+      ∀ (layouts : LayoutTable) (ty : Ty)
+        (m : MirValueCodec layouts ty (α × β) (p.totalByteSize f.size z.size)),
+        m.enforcesUntypedFieldWidths = true →
+        (∀ x, m.codec.encode x = (laidOutPairSymbolicPad p c₁ c₂).encode x) →
+        IsIntoBytes layouts ty := by
+  have hNZ : nonOneZstFields [f, z] = [f] := by
+    simp [nonOneZstFields, List.filter, hF, hZ]
+  have hZSize : z.size = 0 := by
+    unfold FieldLayout.isOneZst at hZ
+    simp only [Bool.and_eq_true, beq_iff_eq] at hZ
+    exact hZ.1
+  obtain ⟨hSz, _, _⟩ :=
+    reprTransparent_nonOneZst_offset_zero_and_size_eq hValid hNZ (i₀ := 0) rfl hF
+  have hTight : w.totalSize = f.size + z.size := by omega
+  exact validPairWorld_tight_isInitCodec_and_isIntoBytes hValid hTight h₁ h₂
+
+
+namespace SymbolicStructSpine
+
+open Anneal.ByteCodec.SymbolicStructSpine
+
+/-- Convert a $k$-field `SymbolicStructSpine` with leading padding `lead` into a `StructLayoutWorld`. -/
+def toStructLayoutWorld {αs : List Type} {w : Nat}
+    (s : SymbolicStructSpine αs w) (lead : Nat) (align : Nat) : StructLayoutWorld where
+  fieldOffsets := s.fieldOffsets lead
+  totalSize := lead + w
+  align := align
+
+abbrev _root_.Anneal.ByteCodec.SymbolicStructSpine.toStructLayoutWorld :=
+  @SymbolicStructSpine.toStructLayoutWorld
+
+/--
+**$k$-Field Layout-World Soundness (`#[repr(Rust)]`)**: any `SymbolicStructSpine` with leading
+padding `lead` whose induced field offsets are aligned, whose total size `lead + w` is a multiple
+of `a = maxAlign 1 (s.toFieldLayouts aligns)` and at least `alignUp s.sumFieldWidths a`, and which
+respects `r[layout.repr.rust.struct-zst]`, yields a valid $k$-field `ValidStructLayoutWorld .rust`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: SymbolicStructSpine.toStructLayoutWorld
+-/
+theorem toStructLayoutWorld_valid_reprRust {αs : List Type} {w : Nat}
+    (s : SymbolicStructSpine αs w) (lead : Nat) (aligns : List Nat)
+    (hAligned : ∀ (i o : Nat) (fl : FieldLayout),
+      (s.fieldOffsets lead)[i]? = some o → (s.toFieldLayouts aligns)[i]? = some fl → fl.align ∣ o)
+    (hMod : (lead + w) % maxAlign 1 (s.toFieldLayouts aligns) = 0)
+    (hGe : PlaceAndRvalue.alignUp s.sumFieldWidths (maxAlign 1 (s.toFieldLayouts aligns)) ≤ lead + w)
+    (hZst : s.sumFieldWidths = 0 → lead + w = 0) :
+    ValidStructLayoutWorld .rust none (s.toFieldLayouts aligns)
+      (s.toStructLayoutWorld lead (maxAlign 1 (s.toFieldLayouts aligns))) := by
+  have hSum := s.sumSizes_toFieldLayouts aligns
+  refine
+    { offsets_len := (s.fieldOffsets_length lead).trans (s.toFieldLayouts_length aligns).symm
+      field_in_bounds := fun i o fl hO hF => s.fieldOffsets_inBounds lead aligns i o fl hO hF
+      field_aligned := hAligned
+      fields_disjoint := fun i j oi oj fi fj hNe hOi hOj hFi hFj =>
+        s.fieldOffsets_disjoint lead aligns i j oi oj fi fj hNe hOi hOj hFi hFj
+      repr_valid := ?_ }
+  dsimp only [ReprLayoutConstraint, toStructLayoutWorld, _root_.Anneal.ByteCodec.SymbolicStructSpine.toStructLayoutWorld, Option.getD]
+  refine ⟨rfl, hMod, ?_, ?_⟩
+  · rw [hSum]
+    exact hGe
+  · intro hZero _
+    rw [hSum] at hZero
+    exact hZst hZero
+
+end SymbolicStructSpine
+
+abbrev _root_.Anneal.ByteCodec.SymbolicStructSpine.toStructLayoutWorld_valid_reprRust :=
+  @SymbolicStructSpine.toStructLayoutWorld_valid_reprRust
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem mem_zip_exists_getElem? {α β : Type} {l₁ : List α} {l₂ : List β} {z : α × β}
+    (hz : z ∈ l₁.zip l₂) : ∃ k : Nat, l₁[k]? = some z.1 ∧ l₂[k]? = some z.2 := by
+  obtain ⟨k, hk⟩ := List.mem_iff_getElem?.mp hz
+  exact ⟨k, List.getElem?_zip_eq_some.mp hk⟩
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem pairwise_zip_of_getElem? {α β : Type} {R : α × β → α × β → Prop} :
+    ∀ (l₁ : List α) (l₂ : List β),
+      (∀ (i j : Nat) (a b : α) (c d : β), i ≠ j → l₁[i]? = some a → l₁[j]? = some b →
+        l₂[i]? = some c → l₂[j]? = some d → R (a, c) (b, d)) →
+      (l₁.zip l₂).Pairwise R
+  | [], _, _ => List.Pairwise.nil
+  | _ :: _, [], _ => List.Pairwise.nil
+  | a :: l₁, c :: l₂, h => by
+    rw [List.zip_cons_cons, List.pairwise_cons]
+    refine ⟨fun z hz => ?_, pairwise_zip_of_getElem? l₁ l₂
+      (fun i j a' b' c' d' hij h₁ h₂ h₃ h₄ =>
+        h (i + 1) (j + 1) a' b' c' d' (fun e => hij (Nat.succ.inj e)) h₁ h₂ h₃ h₄)⟩
+    obtain ⟨k, hk₁, hk₂⟩ := mem_zip_exists_getElem? hz
+    exact h 0 (k + 1) a z.1 c z.2 (Nat.succ_ne_zero k).symm rfl hk₁ rfl hk₂
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem ValidStructLayoutWorld.placed_pairwise_disjoint
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w) :
+    (w.fieldOffsets.zip fs).Pairwise PlacedDisjoint :=
+  pairwise_zip_of_getElem? w.fieldOffsets fs (fun i j a b c d hij h₁ h₂ h₃ h₄ =>
+    hValid.fields_disjoint i j a b c d hij h₁ h₂ h₃ h₄)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem ValidStructLayoutWorld.placed_in_bounds
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w) :
+    ∀ p ∈ w.fieldOffsets.zip fs, p.1 + p.2.size ≤ w.totalSize := fun p hp => by
+  obtain ⟨k, h₁, h₂⟩ := mem_zip_exists_getElem? hp
+  exact hValid.field_in_bounds k p.1 p.2 h₁ h₂
+
+
+/--
+**$k$-Field Memory-Order Completeness**: every valid layout world (any `AdtRepr`, any field memory
+order, zero-sized fields anywhere) lists its placed fields, in some memory order `mem` that is a
+permutation of the declaration-order `(offset, layout)` pairs, as a `SequentialFieldPlacement`
+from offset `0` within `w.totalSize`.
+
+Kind: refinement
+Witness: exists-sat
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem validStructLayoutWorld_exists_sequential_memOrder
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w) :
+    ∃ mem : List (Nat × FieldLayout),
+      mem.Perm (w.fieldOffsets.zip fs) ∧
+      SequentialFieldPlacement 0 (mem.map Prod.snd) (mem.map Prod.fst) w.totalSize := by
+  have hPerm := memSort_perm (w.fieldOffsets.zip fs)
+  refine ⟨memSort (w.fieldOffsets.zip fs), hPerm, ?_⟩
+  exact sequentialFieldPlacement_of_sorted_disjoint _ 0 w.totalSize (memSort_pairwise _)
+    (hValid.placed_pairwise_disjoint.perm hPerm.symm (fun h => Or.symm h))
+    (fun _ _ => Nat.zero_le _)
+    (fun p hp => hValid.placed_in_bounds p (hPerm.mem_iff.mp hp))
+    (Nat.zero_le _)
+
+
+/--
+**Permutation Invariance of `maxAlign`**: permuting a struct's field list leaves `maxAlign base fs`
+unchanged for every `base`.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: maxAlign
+-/
+theorem maxAlign_perm_eq {l₁ l₂ : List FieldLayout} (h : l₁.Perm l₂) :
+    ∀ (base : Nat), maxAlign base l₁ = maxAlign base l₂ := by
+  induction h with
+  | nil => intro _; rfl
+  | cons x _ ih => intro base; exact ih (max base x.align)
+  | swap x y l =>
+    intro base
+    show maxAlign (max (max base y.align) x.align) l = maxAlign (max (max base x.align) y.align) l
+    rw [show max (max base y.align) x.align = max (max base x.align) y.align by omega]
+  | trans _ _ ih₁ ih₂ => intro base; exact (ih₁ base).trans (ih₂ base)
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem pairwise_getElem?_of_ne {α : Type} {R : α → α → Prop} (hSymm : ∀ {x y}, R x y → R y x) :
+    ∀ (l : List α), l.Pairwise R →
+      ∀ (i j : Nat) (x y : α), i ≠ j → l[i]? = some x → l[j]? = some y → R x y
+  | [], _, _, _, _, _, _, hX, _ => nomatch hX
+  | _ :: _, _, 0, 0, _, _, hNe, _, _ => False.elim (hNe rfl)
+  | a :: l, hPw, 0, j + 1, x, y, _, hX, hY => by
+    rw [List.pairwise_cons] at hPw
+    cases hX
+    exact hPw.1 y (List.mem_of_getElem? hY)
+  | a :: l, hPw, i + 1, 0, x, y, _, hX, hY => by
+    rw [List.pairwise_cons] at hPw
+    cases hY
+    exact hSymm (hPw.1 x (List.mem_of_getElem? hX))
+  | _ :: l, hPw, i + 1, j + 1, x, y, hNe, hX, hY => by
+    rw [List.pairwise_cons] at hPw
+    exact pairwise_getElem?_of_ne hSymm l hPw.2 i j x y (fun h => hNe (congrArg Nat.succ h)) hX hY
+
+/--
+**Memory-Order `ValidStructLayoutWorld` Preservation (`#[repr(Rust)]`)**: sorting the placed fields
+`w.fieldOffsets.zip fs` of any valid `#[repr(Rust)]` layout world into memory order (`memSort`)
+yields a valid `#[repr(Rust)]` layout world for the memory-ordered field layouts.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem validStructLayoutWorld_memSort_valid_reprRust
+    {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .rust reprAlign fs w) :
+    let mem := memSort (w.fieldOffsets.zip fs)
+    ValidStructLayoutWorld .rust reprAlign (mem.map Prod.snd)
+      { fieldOffsets := mem.map Prod.fst, totalSize := w.totalSize, align := w.align } := by
+  intro mem
+  have hPerm : mem.Perm (w.fieldOffsets.zip fs) := memSort_perm (w.fieldOffsets.zip fs)
+  have hSnd : (w.fieldOffsets.zip fs).map Prod.snd = fs :=
+    List.map_snd_zip (Nat.le_of_eq hValid.offsets_len.symm)
+  have hFsPerm : (mem.map Prod.snd).Perm fs := hSnd ▸ hPerm.map Prod.snd
+  have hDisjPw : mem.Pairwise PlacedDisjoint :=
+    hValid.placed_pairwise_disjoint.perm hPerm.symm (fun h => Or.symm h)
+  refine
+    { offsets_len := by simp only [List.length_map]
+      field_in_bounds := fun i o fl hO hF => ?_
+      field_aligned := fun i o fl hO hF => ?_
+      fields_disjoint := fun i j oi oj fi fj hNe hOi hOj hFi hFj => ?_
+      repr_valid := ?_ }
+  · rw [List.getElem?_map] at hO hF
+    cases hM : mem[i]? with
+    | none => simp [hM] at hO
+    | some p =>
+      simp only [hM, Option.map_some, Option.some.injEq] at hO hF
+      subst hO; subst hF
+      exact hValid.placed_in_bounds p (hPerm.mem_iff.mp (List.mem_of_getElem? hM))
+  · rw [List.getElem?_map] at hO hF
+    cases hM : mem[i]? with
+    | none => simp [hM] at hO
+    | some p =>
+      simp only [hM, Option.map_some, Option.some.injEq] at hO hF
+      subst hO; subst hF
+      obtain ⟨k, hk₁, hk₂⟩ := mem_zip_exists_getElem? (hPerm.mem_iff.mp (List.mem_of_getElem? hM))
+      exact hValid.field_aligned k p.1 p.2 hk₁ hk₂
+  · rw [List.getElem?_map] at hOi hOj hFi hFj
+    cases hMi : mem[i]? with
+    | none => simp [hMi] at hOi
+    | some pi =>
+      cases hMj : mem[j]? with
+      | none => simp [hMj] at hOj
+      | some pj =>
+        simp only [hMi, hMj, Option.map_some, Option.some.injEq] at hOi hOj hFi hFj
+        subst hOi; subst hOj; subst hFi; subst hFj
+        exact pairwise_getElem?_of_ne (fun h => Or.symm h) mem hDisjPw i j pi pj hNe hMi hMj
+  · rcases hValid.repr_valid with ⟨hAlign, hMod, hGe, hZst⟩
+    dsimp only [ReprLayoutConstraint]
+    rw [maxAlign_perm_eq hFsPerm (reprAlign.getD 1), sumSizes_perm hFsPerm]
+    exact ⟨hAlign, hMod, hGe, hZst⟩
+
+
+/--
+**$k$-Field Layout-World Realization**: every valid layout world `w` of `fs` (any `AdtRepr`, any
+field memory order, zero-sized fields anywhere) is realized by re-padding **every** codec spine `s`
+laid out in its memory order `mem` (a permutation of the declaration-order `(offset, layout)` pairs):
+the re-padded spine places its `j`-th memory-order field at `mem[j].1` and has total size
+`w.totalSize`.
+
+Kind: refinement
+Witness: exists-sat
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem validStructLayoutWorld_realized_by_memOrder_spine
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w) :
+    ∃ mem : List (Nat × FieldLayout),
+      mem.Perm (w.fieldOffsets.zip fs) ∧
+      ∀ {βs : List Type} {W : Nat} (s : SymbolicStructSpine βs W),
+        s.widths = mem.map (fun p => p.2.size) →
+        ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+          (s.repad pads trail).fieldOffsets lead = mem.map Prod.fst ∧
+          lead + s.repadWidth pads trail = w.totalSize := by
+  obtain ⟨mem, hPerm, hSeq⟩ := validStructLayoutWorld_exists_sequential_memOrder hValid
+  refine ⟨mem, hPerm, fun s hW => ?_⟩
+  obtain ⟨pads, trail, hOffs, hTot⟩ :=
+    SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement hSeq s (by rw [List.map_map]; exact hW)
+  exact ⟨_, pads, trail, hOffs, hTot⟩
+
+/--
+Re-padding a memory-order spine of a valid world keeps exactly the world's field bytes:
+`(s.repad pads trail).sumFieldWidths = sumSizes fs` (the memory order is a permutation of `fs`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem ValidStructLayoutWorld.memOrder_repad_sumFieldWidths
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w) {mem : List (Nat × FieldLayout)}
+    (hPerm : mem.Perm (w.fieldOffsets.zip fs)) {βs : List Type} {W : Nat}
+    (s : SymbolicStructSpine βs W) (hW : s.widths = mem.map (fun p => p.2.size))
+    (pads : List Nat) (trail : Nat) :
+    (s.repad pads trail).sumFieldWidths = sumSizes fs := by
+  have hSnd : (w.fieldOffsets.zip fs).map Prod.snd = fs :=
+    List.map_snd_zip (Nat.le_of_eq hValid.offsets_len.symm)
+  rw [s.sumFieldWidths_repad pads trail,
+    s.sumFieldWidths_eq_sumSizes_of_widths (mem.map Prod.snd) (by rw [List.map_map]; exact hW),
+    sumSizes_perm (hPerm.map Prod.snd), hSnd]
+
+/--
+**Universal $k$-Field Codec Traits Across Every `ValidStructLayoutWorld`**: realize any valid world
+`w` of `fs` (any `AdtRepr`, any memory order, any padding) by re-padding a memory-order spine `s` and
+wrapping it in any `FieldPerm` back to declaration order. The resulting struct codec is `FromBytes`
+(`IsSurjectiveInitDecoder`) and `FromZeros` (`HasZeroValid`) whenever the field codecs are, and it
+is `IntoBytes` (`IsInitCodec`) **iff** `w` has no padding byte at all (`w.totalSize = sumSizes fs`)
+and every field codec is `IsInitCodec`.
+
+Kind: codec
+Witness: exists-sat
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem validStructLayoutWorld_memOrder_codec_traits
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w) :
+    ∃ mem : List (Nat × FieldLayout),
+      mem.Perm (w.fieldOffsets.zip fs) ∧
+      ∀ {αs βs : List Type} {W : Nat} (perm : FieldPerm αs βs) (s : SymbolicStructSpine βs W),
+        s.widths = mem.map (fun p => p.2.size) →
+        ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+          (s.repad pads trail).fieldOffsets lead = mem.map Prod.fst ∧
+          lead + s.repadWidth pads trail = w.totalSize ∧
+          (s.AllFieldsSurjective →
+            (laidOutStructSymbolicPadPerm lead perm (s.repad pads trail)).IsSurjectiveInitDecoder) ∧
+          (s.AllFieldsZeroValid →
+            (laidOutStructSymbolicPadPerm lead perm (s.repad pads trail)).HasZeroValid) ∧
+          (FieldTuple αs →
+            ((laidOutStructSymbolicPadPerm lead perm (s.repad pads trail)).IsInitCodec ↔
+              w.totalSize = sumSizes fs ∧ s.AllFieldsInit)) := by
+  obtain ⟨mem, hPerm, hReal⟩ := validStructLayoutWorld_realized_by_memOrder_spine hValid
+  refine ⟨mem, hPerm, fun perm s hW => ?_⟩
+  obtain ⟨lead, pads, trail, hOffs, hTot⟩ := hReal s hW
+  refine ⟨lead, pads, trail, hOffs, hTot,
+    fun h => laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder lead perm _
+      (s.allFieldsSurjective_repad pads trail h),
+    fun h => laidOutStructSymbolicPadPerm_hasZeroValid lead perm _
+      (s.allFieldsZeroValid_repad pads trail h),
+    fun x₀ => ?_⟩
+  -- Field bytes are invariant under the memory-order permutation and under re-padding.
+  have hSum := hValid.memOrder_repad_sumFieldWidths hPerm s hW pads trail
+  have hWidth := (s.repad pads trail).width_eq_sumFieldWidths_add_totalPadBytes
+  rw [laidOutStructSymbolicPadPerm_isInitCodec_iff lead perm (s.repad pads trail) x₀,
+    s.allFieldsInit_repad_iff pads trail]
+  constructor
+  · rintro ⟨hLead, hPad, hInit⟩
+    exact ⟨by omega, hInit⟩
+  · rintro ⟨hTight, hInit⟩
+    exact ⟨by omega, by omega, hInit⟩
+
+
+namespace PlacedCodecSpine
+
+open Anneal.ByteCodec.PlacedCodecSpine
+
+/--
+**End-to-End Constructive Declaration-Order to Memory-Order Realization Across Every `ValidStructLayoutWorld`**:
+given *only* a valid layout world `w` of `fs` (any `AdtRepr`, any field memory order, zero-sized
+fields anywhere) and a **declaration-order** `PlacedCodecSpine αs` whose `pc.placed = w.fieldOffsets.zip fs`,
+`pc.memSortPerm` and `pc.memSort.toSymbolicStructSpine` constructively produce the memory-order type
+list `pc.memSortTypes`, the `FieldPerm αs pc.memSortTypes` back to declaration order, and the
+memory-order `SymbolicStructSpine`, such that some `(lead, pads, trail)` realizes `w` with universal
+`FromBytes`/`FromZeros` preservation and an exact `IntoBytes` characterization
+(`w.totalSize = sumSizes fs ∧ pc.AllFieldsInit`).
+
+Kind: codec
+Witness: exists-sat
+Assumes: S0
+Subject: PlacedCodecSpine.memSort
+-/
+theorem realize_validStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs) :
+    let mem := Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs)
+    let perm := pc.memSortPerm
+    let sRaw := pc.memSort.toSymbolicStructSpine
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      (sRaw.repad pads trail).fieldOffsets lead = mem.map Prod.fst ∧
+      lead + sRaw.repadWidth pads trail = w.totalSize ∧
+      (pc.AllFieldsSurjective →
+        (laidOutStructSymbolicPadPerm lead perm (sRaw.repad pads trail)).IsSurjectiveInitDecoder) ∧
+      (pc.AllFieldsZeroValid →
+        (laidOutStructSymbolicPadPerm lead perm (sRaw.repad pads trail)).HasZeroValid) ∧
+      (FieldTuple αs →
+        ((laidOutStructSymbolicPadPerm lead perm (sRaw.repad pads trail)).IsInitCodec ↔
+          w.totalSize = sumSizes fs ∧ pc.AllFieldsInit)) := by
+  intro mem perm sRaw
+  have hPerm : mem.Perm (w.fieldOffsets.zip fs) := memSort_perm (w.fieldOffsets.zip fs)
+  have hSeq : SequentialFieldPlacement 0 (mem.map Prod.snd) (mem.map Prod.fst) w.totalSize :=
+    sequentialFieldPlacement_of_sorted_disjoint mem 0 w.totalSize (memSort_pairwise _)
+      (hValid.placed_pairwise_disjoint.perm hPerm.symm (fun h => Or.symm h))
+      (fun _ _ => Nat.zero_le _)
+      (fun p hp => hValid.placed_in_bounds p (hPerm.mem_iff.mp hp))
+      (Nat.zero_le _)
+  have hW : sRaw.widths = mem.map (fun p => p.2.size) := by
+    rw [widths_toSymbolicStructSpine pc.memSort, placed_memSort pc, hPlaced]
+  obtain ⟨pads, trail, hOffs, hTot⟩ :=
+    SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement hSeq sRaw
+      (by rw [List.map_map]; exact hW)
+  refine ⟨(mem.map Prod.fst).headD 0, pads, trail, hOffs, hTot, ?_, ?_, ?_⟩
+  · intro hSurj
+    have hSurjRaw : sRaw.AllFieldsSurjective :=
+      (allFieldsSurjective_toSymbolicStructSpine pc.memSort).mpr
+        ((allFieldsSurjective_memSort pc).mpr hSurj)
+    exact laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder _ perm _
+      (sRaw.allFieldsSurjective_repad pads trail hSurjRaw)
+  · intro hZero
+    have hZeroRaw : sRaw.AllFieldsZeroValid :=
+      (allFieldsZeroValid_toSymbolicStructSpine pc.memSort).mpr
+        ((allFieldsZeroValid_memSort pc).mpr hZero)
+    exact laidOutStructSymbolicPadPerm_hasZeroValid _ perm _
+      (sRaw.allFieldsZeroValid_repad pads trail hZeroRaw)
+  · intro x₀
+    have hSum := hValid.memOrder_repad_sumFieldWidths hPerm sRaw hW pads trail
+    have hWidth := (sRaw.repad pads trail).width_eq_sumFieldWidths_add_totalPadBytes
+    rw [laidOutStructSymbolicPadPerm_isInitCodec_iff _ perm (sRaw.repad pads trail) x₀,
+      sRaw.allFieldsInit_repad_iff pads trail,
+      allFieldsInit_toSymbolicStructSpine pc.memSort,
+      allFieldsInit_memSort pc]
+    constructor
+    · rintro ⟨hLead, hPad, hInit⟩
+      exact ⟨by omega, hInit⟩
+    · rintro ⟨hTight, hInit⟩
+      exact ⟨by omega, by omega, hInit⟩
+
+
+/--
+**Byte-Window Correctness of the Constructive Realization**: for every valid layout world `w` of
+`fs` (any `AdtRepr`, any memory order, zero-sized fields anywhere) and every declaration-order
+`pc : PlacedCodecSpine αs` placed at `w.fieldOffsets.zip fs`, the realized codec
+`laidOutStructSymbolicPadPerm lead pc.memSortPerm (pc.memSort.toSymbolicStructSpine.repad pads trail)`
+has total width `w.totalSize` and writes **each declaration field's encoding exactly at its world
+offset**: `(encode x).drop o |>.take bs.length = bs` for every window `(o, bs) ∈ pc.windows x`.
+
+Kind: codec
+Witness: exists-sat
+Assumes: S0
+Subject: PlacedCodecSpine.memSortPerm
+-/
+theorem realize_field_windows
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs) :
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      lead + pc.memSort.toSymbolicStructSpine.repadWidth pads trail = w.totalSize ∧
+      ∀ (x : FieldTuple αs) (o : Nat) (bs : List AbstractByte), (o, bs) ∈ pc.windows x →
+        (((laidOutStructSymbolicPadPerm lead pc.memSortPerm
+            (pc.memSort.toSymbolicStructSpine.repad pads trail)).encode x).drop o).take
+          bs.length = bs := by
+  have hPerm := memSort_perm (w.fieldOffsets.zip fs)
+  have hSeq : SequentialFieldPlacement 0 ((Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs)).map Prod.snd)
+      ((Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs)).map Prod.fst) w.totalSize :=
+    sequentialFieldPlacement_of_sorted_disjoint _ 0 w.totalSize (memSort_pairwise _)
+      (hValid.placed_pairwise_disjoint.perm hPerm.symm (fun h => Or.symm h))
+      (fun _ _ => Nat.zero_le _)
+      (fun p hp => hValid.placed_in_bounds p (hPerm.mem_iff.mp hp))
+      (Nat.zero_le _)
+  have hPlacedSort : pc.memSort.placed = Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs) := by
+    rw [placed_memSort pc, hPlaced]
+  have hW : pc.memSort.toSymbolicStructSpine.widths =
+      ((Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs)).map Prod.snd).map FieldLayout.size := by
+    rw [widths_toSymbolicStructSpine pc.memSort, hPlacedSort, List.map_map]
+    rfl
+  obtain ⟨pads, trail, hOffs, hTot⟩ :=
+    SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement hSeq
+      pc.memSort.toSymbolicStructSpine hW
+  refine ⟨_, pads, trail, hTot, fun x o bs hMem => ?_⟩
+  rw [laidOutStructSymbolicPadPerm_encode]
+  have hMem' := (windows_memSort pc x).mem_iff.mpr hMem
+  rw [← windows_toSymbolicStructSpine_repad pc.memSort pads trail _ _
+    (by rw [hOffs, hPlacedSort])] at hMem'
+  exact SymbolicStructSpine.window_bytes _ _ _ o bs (by rwa [length_replicateUninitBytes])
+
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem getElem?_windows_offset_and_mem
+    {αs : List Type} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hLen : w.fieldOffsets.length = fs.length)
+    (pc : PlacedCodecSpine αs) (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte)
+    (hWin : (pc.windows x)[i]? = some (o, bs)) :
+    w.fieldOffsets[i]? = some o ∧ (o, bs) ∈ pc.windows x := by
+  refine ⟨?_, List.mem_of_getElem? hWin⟩
+  have hFst : ((pc.windows x).map Prod.fst)[i]? = some o := by
+    rw [List.getElem?_map, hWin]
+    rfl
+  rw [windows_map_fst, hPlaced, List.map_fst_zip (Nat.le_of_eq hLen)] at hFst
+  exact hFst
+
+/--
+**Unified $k$-Field Layout-World Realization & `Anneal.BitValidity` Bridge**:
+for every valid layout world `w` of `fs` (any `AdtRepr`, any memory order, zero-sized fields
+anywhere) and every declaration-order `pc : PlacedCodecSpine αs` placed at `w.fieldOffsets.zip fs`,
+some `(lead, pads, trail)` makes the constructively sorted memory-order codec
+`cStruct := laidOutStructSymbolicPadPerm lead pc.memSortPerm (pc.memSort.toSymbolicStructSpine.repad pads trail)`
+simultaneously:
+1. match `w.totalSize` and the memory-order offsets `(memSort (w.fieldOffsets.zip fs)).map Prod.fst`,
+2. place the `i`-th declaration field's bytes `(pc.windows x)[i]? = some (o, bs)` at `w.fieldOffsets[i]? = some o`,
+3. lift `pc.AllFieldsSurjective` / `pc.AllFieldsZeroValid` to `Anneal.BitValidity`'s `IsFromBytes`,
+   `IsFromZeros`, and `IsTryFromBytes` on any realizing `MirValueCodec`,
+4. when `w.totalSize = sumSizes fs` and `pc.AllFieldsInit`, satisfy `IsInitCodec`, lift to
+   `IsIntoBytes`, and discharge `MirValueCodec.transmute_typed` into any same-sized `FromBytes` target,
+5. when `sumSizes fs < w.totalSize`, emit `.uninit` bytes on every value and reject `IsIntoBytes` on
+   every realizing `MirValueCodec`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: PlacedCodecSpine.memSort
+-/
+theorem realize_validStructLayoutWorld_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs) :
+    let mem := Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs)
+    let perm := pc.memSortPerm
+    let sRaw := pc.memSort.toSymbolicStructSpine
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      let W := lead + sRaw.repadWidth pads trail
+      let cStruct := laidOutStructSymbolicPadPerm lead perm (sRaw.repad pads trail)
+      (sRaw.repad pads trail).fieldOffsets lead = mem.map Prod.fst ∧
+      W = w.totalSize ∧
+      (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+        (pc.windows x)[i]? = some (o, bs) →
+        w.fieldOffsets[i]? = some o ∧ ((cStruct.encode x).drop o).take bs.length = bs) ∧
+      (∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+        (∀ bs, m.codec.decode bs = cStruct.decode bs) →
+        (pc.AllFieldsSurjective →
+          IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+        (pc.AllFieldsZeroValid → IsFromZeros layouts ty)) ∧
+      (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+        cStruct.IsInitCodec ∧
+        (∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+          m.enforcesUntypedFieldWidths = true →
+          (∀ x, m.codec.encode x = cStruct.encode x) →
+          IsIntoBytes layouts ty) ∧
+        (∀ (layouts : LayoutTable) (srcTy dstTy : Ty) {γ : Type}
+          (mSrc : MirValueCodec layouts srcTy (FieldTuple αs) W)
+          (mDst : MirValueCodec layouts dstTy γ W),
+          (∀ x, mSrc.codec.encode x = cStruct.encode x) →
+          mDst.codec.IsSurjectiveInitDecoder →
+          ∀ x : FieldTuple αs, ∃ y : γ,
+            mDst.codec.decode (mSrc.codec.encode x) = some y ∧
+            decodeValueFromBytes defaultCodecFuel layouts dstTy (mSrc.codec.encode x) =
+              some (mDst.toValue y))) ∧
+      (sumSizes fs < w.totalSize →
+        (∀ x : FieldTuple αs, allBytesInitialized (cStruct.encode x) = false) ∧
+        ∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+          (∀ x, m.codec.encode x = cStruct.encode x) →
+          FieldTuple αs → ¬ IsIntoBytes layouts ty) := by
+  intro mem perm sRaw
+  have hPerm : mem.Perm (w.fieldOffsets.zip fs) := memSort_perm (w.fieldOffsets.zip fs)
+  have hSeq : SequentialFieldPlacement 0 (mem.map Prod.snd) (mem.map Prod.fst) w.totalSize :=
+    sequentialFieldPlacement_of_sorted_disjoint mem 0 w.totalSize (memSort_pairwise _)
+      (hValid.placed_pairwise_disjoint.perm hPerm.symm (fun h => Or.symm h))
+      (fun _ _ => Nat.zero_le _)
+      (fun p hp => hValid.placed_in_bounds p (hPerm.mem_iff.mp hp))
+      (Nat.zero_le _)
+  have hPlacedSort : pc.memSort.placed = mem := by
+    rw [placed_memSort pc, hPlaced]
+  have hW : sRaw.widths = mem.map (fun p => p.2.size) := by
+    rw [widths_toSymbolicStructSpine pc.memSort, hPlacedSort]
+  obtain ⟨pads, trail, hOffs, hTot⟩ :=
+    SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement hSeq sRaw
+      (by rw [List.map_map]; exact hW)
+  have hSum := hValid.memOrder_repad_sumFieldWidths hPerm sRaw hW pads trail
+  have hWidth := (sRaw.repad pads trail).width_eq_sumFieldWidths_add_totalPadBytes
+  refine ⟨(mem.map Prod.fst).headD 0, pads, trail, hOffs, hTot, ?_, ?_, ?_, ?_⟩
+  · intro x i o bs hWin
+    obtain ⟨hOffI, hMem⟩ := getElem?_windows_offset_and_mem hValid.offsets_len pc hPlaced x i o bs hWin
+    refine ⟨hOffI, ?_⟩
+    rw [laidOutStructSymbolicPadPerm_encode]
+    have hMem' := (windows_memSort pc x).mem_iff.mpr hMem
+    rw [← windows_toSymbolicStructSpine_repad pc.memSort pads trail _ _
+      (by rw [hOffs, hPlacedSort])] at hMem'
+    exact SymbolicStructSpine.window_bytes _ _ _ o bs (by rwa [length_replicateUninitBytes])
+  · intro layouts ty m hDecAgree
+    refine ⟨fun hSurj => ?_, fun hZero => ?_⟩
+    · have hSurjRaw : sRaw.AllFieldsSurjective :=
+        (allFieldsSurjective_toSymbolicStructSpine pc.memSort).mpr
+          ((allFieldsSurjective_memSort pc).mpr hSurj)
+      have hCSurj := laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder
+        ((mem.map Prod.fst).headD 0) perm (sRaw.repad pads trail)
+        (sRaw.allFieldsSurjective_repad pads trail hSurjRaw)
+      have hMSurj : m.codec.IsSurjectiveInitDecoder := fun bs hLen hInit => by
+        rw [hDecAgree bs]
+        exact hCSurj bs hLen hInit
+      have hFb := m.isFromBytes hMSurj
+      exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+    · have hZeroRaw : sRaw.AllFieldsZeroValid :=
+        (allFieldsZeroValid_toSymbolicStructSpine pc.memSort).mpr
+          ((allFieldsZeroValid_memSort pc).mpr hZero)
+      obtain ⟨x₀, hZDec⟩ := laidOutStructSymbolicPadPerm_hasZeroValid
+        ((mem.map Prod.fst).headD 0) perm (sRaw.repad pads trail)
+        (sRaw.allFieldsZeroValid_repad pads trail hZeroRaw)
+      exact m.isFromZeros ⟨x₀, by rw [hDecAgree]; exact hZDec⟩
+  · intro hTight hInit
+    have hLead0 : (mem.map Prod.fst).headD 0 = 0 := by omega
+    have hPad0 : (sRaw.repad pads trail).totalPadBytes = 0 := by omega
+    have hInitRaw : sRaw.AllFieldsInit :=
+      (allFieldsInit_toSymbolicStructSpine pc.memSort).mpr
+        ((allFieldsInit_memSort pc).mpr hInit)
+    have hCInit : (laidOutStructSymbolicPadPerm ((mem.map Prod.fst).headD 0) perm
+        (sRaw.repad pads trail)).IsInitCodec :=
+      FixedByteCodec.mapEquiv_isInitCodec _ _ _ _ _
+        (FixedByteCodec.padLeft_isInitCodec_of_eq_zero hLead0
+          (laidOutStructSymbolicPad_isInitCodec_of_zero_pad _ hPad0
+            ((sRaw.allFieldsInit_repad_iff pads trail).mpr hInitRaw)))
+    refine ⟨hCInit, fun layouts ty m hWidths hEncAgree => ?_,
+      fun layouts srcTy dstTy γ mSrc mDst hEncAgree hDstSurj x => ?_⟩
+    · exact m.isIntoBytes (fun x => by rw [hEncAgree x]; exact hCInit x) hWidths
+    · exact MirValueCodec.transmute_typed mSrc mDst
+        (fun v => by rw [hEncAgree v]; exact hCInit v) hDstSurj x
+  · intro hPadLt
+    have hPadPos : 0 < (mem.map Prod.fst).headD 0 + (sRaw.repad pads trail).totalPadBytes := by omega
+    have hUninit : ∀ x : FieldTuple αs,
+        allBytesInitialized ((laidOutStructSymbolicPadPerm ((mem.map Prod.fst).headD 0) perm
+          (sRaw.repad pads trail)).encode x) = false :=
+      laidOutStructSymbolicPadPerm_encode_uninit_of_pad_pos _ perm _ hPadPos
+    refine ⟨hUninit, fun layouts ty m hEncAgree x₀ => ?_⟩
+    exact m.not_isIntoBytes_of_uninit_encode x₀ (by rw [hEncAgree x₀]; exact hUninit x₀)
+
+
+/--
+**Existential-Free Specification of the Computable `PlacedCodecSpine.realizedCodec`**:
+for every valid layout world `w` of `fs` (any `AdtRepr`, any field memory order, zero-sized fields
+anywhere) and every declaration-order `pc : PlacedCodecSpine αs` with `pc.placed = w.fieldOffsets.zip fs`,
+the computable codec `pc.realizedCodec w.totalSize` directly satisfies:
+1. `pc.realizedWidth w.totalSize = w.totalSize` and
+   `(pc.realizedSpine w.totalSize).fieldOffsets pc.realizedLead = (memSort (w.fieldOffsets.zip fs)).map Prod.fst`,
+2. **Index-exact field byte windows**: `(pc.windows x)[i]? = some (o, bs) → w.fieldOffsets[i]? = some o ∧ (((pc.realizedCodec w.totalSize).encode x).drop o).take bs.length = bs`,
+3. **Universal `BitValidity` `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes`** on any `MirValueCodec`
+   whose `codec` is `pc.realizedCodec w.totalSize`,
+4. **Tight-world `IsInitCodec` / `IsIntoBytes` / `transmute_typed`** when `w.totalSize = sumSizes fs ∧ pc.AllFieldsInit`,
+5. **Padded-world `.uninit` emission & `¬ IsIntoBytes`** when `sumSizes fs < w.totalSize`.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: PlacedCodecSpine.realizedCodec
+-/
+theorem realizedCodec_spec
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs) :
+    let mem := Anneal.ByteCodec.memSort (w.fieldOffsets.zip fs)
+    let W := pc.realizedWidth w.totalSize
+    let cStruct := pc.realizedCodec w.totalSize
+    (pc.realizedSpine w.totalSize).fieldOffsets pc.realizedLead = mem.map Prod.fst ∧
+    W = w.totalSize ∧
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((cStruct.encode x).drop o).take bs.length = bs) ∧
+    (∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+      (∀ bs, m.codec.decode bs = cStruct.decode bs) →
+      (pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid → IsFromZeros layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      cStruct.IsInitCodec ∧
+      (∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+        m.enforcesUntypedFieldWidths = true →
+        (∀ x, m.codec.encode x = cStruct.encode x) →
+        IsIntoBytes layouts ty) ∧
+      (∀ (layouts : LayoutTable) (srcTy dstTy : Ty) {γ : Type}
+        (mSrc : MirValueCodec layouts srcTy (FieldTuple αs) W)
+        (mDst : MirValueCodec layouts dstTy γ W),
+        (∀ x, mSrc.codec.encode x = cStruct.encode x) →
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : γ,
+          mDst.codec.decode (mSrc.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (mSrc.codec.encode x) =
+            some (mDst.toValue y))) ∧
+    (sumSizes fs < w.totalSize →
+      (∀ x : FieldTuple αs, allBytesInitialized (cStruct.encode x) = false) ∧
+      ∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+        (∀ x, m.codec.encode x = cStruct.encode x) →
+        FieldTuple αs → ¬ IsIntoBytes layouts ty) := by
+  intro mem W cStruct
+  have hPlacedSort : pc.memSort.placed = mem := by
+    rw [placed_memSort pc, hPlaced]
+  have hPerm : pc.memSort.placed.Perm (w.fieldOffsets.zip fs) := by
+    rw [hPlacedSort]
+    exact memSort_perm (w.fieldOffsets.zip fs)
+  have hSeq : SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd)
+      (pc.memSort.placed.map Prod.fst) w.totalSize := by
+    rw [hPlacedSort]
+    exact sequentialFieldPlacement_of_sorted_disjoint mem 0 w.totalSize (memSort_pairwise _)
+      (hValid.placed_pairwise_disjoint.perm (memSort_perm _).symm (fun h => Or.symm h))
+      (fun _ _ => Nat.zero_le _)
+      (fun p hp => hValid.placed_in_bounds p ((memSort_perm _).mem_iff.mp hp))
+      (Nat.zero_le _)
+  have hW : pc.memSort.toSymbolicStructSpine.widths = pc.memSort.placed.map (fun p => p.2.size) :=
+    widths_toSymbolicStructSpine pc.memSort
+  obtain ⟨hOffs, hTot⟩ :=
+    repad_sequentialPads_spec pc.memSort.placed 0 w.totalSize hSeq
+      pc.memSort.toSymbolicStructSpine hW
+  have hOffsMem : (pc.realizedSpine w.totalSize).fieldOffsets pc.realizedLead = mem.map Prod.fst := by
+    rw [← hPlacedSort]
+    exact hOffs
+  have hSum := hValid.memOrder_repad_sumFieldWidths hPerm pc.memSort.toSymbolicStructSpine hW
+    pc.realizedPads (pc.realizedTrail w.totalSize)
+  have hWidth := (pc.realizedSpine w.totalSize).width_eq_sumFieldWidths_add_totalPadBytes
+  refine ⟨hOffsMem, hTot, ?_, ?_, ?_, ?_⟩
+  · intro x i o bs hWin
+    obtain ⟨hOffI, hMem⟩ := getElem?_windows_offset_and_mem hValid.offsets_len pc hPlaced x i o bs hWin
+    refine ⟨hOffI, ?_⟩
+    show (((laidOutStructSymbolicPadPerm pc.realizedLead pc.memSortPerm
+        (pc.realizedSpine w.totalSize)).encode x).drop o).take bs.length = bs
+    rw [laidOutStructSymbolicPadPerm_encode]
+    have hMem' := (windows_memSort pc x).mem_iff.mpr hMem
+    rw [← windows_toSymbolicStructSpine_repad pc.memSort pc.realizedPads
+      (pc.realizedTrail w.totalSize) _ _ hOffs] at hMem'
+    exact SymbolicStructSpine.window_bytes _ _ _ o bs (by rwa [length_replicateUninitBytes])
+  · intro layouts ty m hDecAgree
+    refine ⟨fun hSurj => ?_, fun hZero => ?_⟩
+    · have hSurjRaw : pc.memSort.toSymbolicStructSpine.AllFieldsSurjective :=
+        (allFieldsSurjective_toSymbolicStructSpine pc.memSort).mpr
+          ((allFieldsSurjective_memSort pc).mpr hSurj)
+      have hCSurj := laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder
+        pc.realizedLead pc.memSortPerm (pc.realizedSpine w.totalSize)
+        (pc.memSort.toSymbolicStructSpine.allFieldsSurjective_repad
+          pc.realizedPads (pc.realizedTrail w.totalSize) hSurjRaw)
+      have hMSurj : m.codec.IsSurjectiveInitDecoder := fun bs hLen hInit => by
+        rw [hDecAgree bs]
+        exact hCSurj bs hLen hInit
+      have hFb := m.isFromBytes hMSurj
+      exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+    · have hZeroRaw : pc.memSort.toSymbolicStructSpine.AllFieldsZeroValid :=
+        (allFieldsZeroValid_toSymbolicStructSpine pc.memSort).mpr
+          ((allFieldsZeroValid_memSort pc).mpr hZero)
+      obtain ⟨x₀, hZDec⟩ := laidOutStructSymbolicPadPerm_hasZeroValid
+        pc.realizedLead pc.memSortPerm (pc.realizedSpine w.totalSize)
+        (pc.memSort.toSymbolicStructSpine.allFieldsZeroValid_repad
+          pc.realizedPads (pc.realizedTrail w.totalSize) hZeroRaw)
+      exact m.isFromZeros ⟨x₀, by rw [hDecAgree]; exact hZDec⟩
+  · intro hTight hInit
+    have hTot' : pc.realizedLead +
+        pc.memSort.toSymbolicStructSpine.repadWidth pc.realizedPads (pc.realizedTrail w.totalSize) =
+      w.totalSize := hTot
+    have hSum' : (pc.realizedSpine w.totalSize).sumFieldWidths = sumSizes fs := hSum
+    have hLead0 : pc.realizedLead = 0 := by omega
+    have hPad0 : (pc.realizedSpine w.totalSize).totalPadBytes = 0 := by omega
+    have hInitRaw : pc.memSort.toSymbolicStructSpine.AllFieldsInit :=
+      (allFieldsInit_toSymbolicStructSpine pc.memSort).mpr
+        ((allFieldsInit_memSort pc).mpr hInit)
+    have hCInit : (laidOutStructSymbolicPadPerm pc.realizedLead pc.memSortPerm
+        (pc.realizedSpine w.totalSize)).IsInitCodec :=
+      FixedByteCodec.mapEquiv_isInitCodec _ _ _ _ _
+        (FixedByteCodec.padLeft_isInitCodec_of_eq_zero hLead0
+          (laidOutStructSymbolicPad_isInitCodec_of_zero_pad _ hPad0
+            ((pc.memSort.toSymbolicStructSpine.allFieldsInit_repad_iff
+              pc.realizedPads (pc.realizedTrail w.totalSize)).mpr hInitRaw)))
+    refine ⟨hCInit, fun layouts ty m hWidths hEncAgree => ?_,
+      fun layouts srcTy dstTy γ mSrc mDst hEncAgree hDstSurj x => ?_⟩
+    · exact m.isIntoBytes (fun x => by rw [hEncAgree x]; exact hCInit x) hWidths
+    · exact MirValueCodec.transmute_typed mSrc mDst
+        (fun v => by rw [hEncAgree v]; exact hCInit v) hDstSurj x
+  · intro hPadLt
+    have hTot' : pc.realizedLead +
+        pc.memSort.toSymbolicStructSpine.repadWidth pc.realizedPads (pc.realizedTrail w.totalSize) =
+      w.totalSize := hTot
+    have hSum' : (pc.realizedSpine w.totalSize).sumFieldWidths = sumSizes fs := hSum
+    have hPadPos : 0 < pc.realizedLead + (pc.realizedSpine w.totalSize).totalPadBytes := by omega
+    have hUninit : ∀ x : FieldTuple αs, allBytesInitialized (cStruct.encode x) = false :=
+      laidOutStructSymbolicPadPerm_encode_uninit_of_pad_pos _ pc.memSortPerm _ hPadPos
+    refine ⟨hUninit, fun layouts ty m hEncAgree x₀ => ?_⟩
+    exact m.not_isIntoBytes_of_uninit_encode x₀ (by rw [hEncAgree x₀]; exact hUninit x₀)
+
+end PlacedCodecSpine
+
+abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.realize_validStructLayoutWorld :=
+  @PlacedCodecSpine.realize_validStructLayoutWorld
+abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.realize_field_windows :=
+  @PlacedCodecSpine.realize_field_windows
+abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.getElem?_windows_offset_and_mem :=
+  @PlacedCodecSpine.getElem?_windows_offset_and_mem
+abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.realize_validStructLayoutWorld_bitValidity :=
+  @PlacedCodecSpine.realize_validStructLayoutWorld_bitValidity
+abbrev _root_.Anneal.ByteCodec.PlacedCodecSpine.realizedCodec_spec :=
+  @PlacedCodecSpine.realizedCodec_spec
+
+/--
+**Every Valid Layout World Is a Sequential Memory-Order Placement**: for every valid layout world `w`
+of `fs` (any `AdtRepr`, any field memory order, zero-sized fields anywhere) and every
+declaration-order `pc : PlacedCodecSpine αs` with `pc.placed = w.fieldOffsets.zip fs`, the
+constructively sorted placement `pc.memSort.placed` is a `SequentialFieldPlacement` from `0` within
+`w.totalSize` — exactly the `hSeq` hypothesis of `MirValueCodec.ofPlacedCodecSpine`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: SequentialFieldPlacement
+-/
+theorem PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs) (hPlaced : pc.placed = w.fieldOffsets.zip fs) :
+    SequentialFieldPlacement 0 (pc.memSort.placed.map Prod.snd) (pc.memSort.placed.map Prod.fst)
+      w.totalSize := by
+  rw [Anneal.ByteCodec.PlacedCodecSpine.placed_memSort pc, hPlaced]
+  exact sequentialFieldPlacement_of_sorted_disjoint _ 0 w.totalSize (memSort_pairwise _)
+    (hValid.placed_pairwise_disjoint.perm (memSort_perm _).symm (fun h => Or.symm h))
+    (fun _ _ => Nat.zero_le _)
+    (fun p hp => hValid.placed_in_bounds p ((memSort_perm _).mem_iff.mp hp))
+    (Nat.zero_le _)
+
+/--
+**`MirValueCodec` of Every Valid Tuple Layout World**: a concrete `LayoutTable` entry `l` whose
+`FieldsShape.arbitrary` offsets and size realize a valid layout world `w` of the tuple's field
+layouts yields the general $k$-field `MirValueCodec.ofPlacedCodecSpine` against the computable
+`pc.realizedCodec w.totalSize` (its `hSeq` is discharged by
+`PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld`).
+-/
+def MirValueCodec.ofValidStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex) :
+    MirValueCodec layouts { kind := .tuple (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine layouts idx l memoryIndex pc w.totalSize fcs
+    hLookup hSize hFields (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)
+
+/--
+**Trusted-Level Bit Validity of Every Valid Tuple Layout World**: for the `MirValueCodec` of any valid
+layout world (any `AdtRepr`, any memory order, zero-sized fields anywhere) of a concrete tuple
+`LayoutTable` entry:
+1. Index-exact field byte-window placement in `m.codec.encode x` for every declaration field;
+2. `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes` whenever every field codec is a surjective
+   initialized-byte decoder, and `HasZeroValid` / `IsFromZeros` / `IsTryFromBytes` whenever every
+   field codec has a valid all-zero encoding (including niche fields such as `bool`);
+3. `IsInitCodec`, `IsIntoBytes`, and `transmute_typed` soundness in tight worlds
+   (`w.totalSize = sumSizes fs`) with initialized field codecs;
+4. `.uninit` byte emission (`allBytesInitialized = false`), `¬ IsInitCodec`, and `¬ IsIntoBytes`
+   in padded worlds (`sumSizes fs < w.totalSize`).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.ofValidStructLayoutWorld
+-/
+theorem MirValueCodec.ofValidStructLayoutWorld_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex) :
+    let ty : Ty := { kind := .tuple (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.ofValidStructLayoutWorld hValid layouts idx l memoryIndex pc fcs hPlaced
+      hLookup hSize hFields
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    ((pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid →
+        m.codec.HasZeroValid ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hW : pc.realizedWidth w.totalSize = w.totalSize :=
+    (pc.realized_offsets_and_width_of_sequential w.totalSize
+      (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)).2
+  have hSpec := pc.realizedCodec_spec hValid hPlaced
+  obtain ⟨_, _, hWin, _, hTight, hPadded⟩ := hSpec
+  refine ⟨fun x i o bs hGet => hWin x i o bs hGet, ⟨fun hSurj => ?_, fun hZero => ?_⟩,
+    fun hT hInit => ?_, fun hLt x₀ => ?_⟩
+  · have hMSurj : m.codec.IsSurjectiveInitDecoder :=
+      FixedByteCodec.castWidth_isSurjectiveInitDecoder (pc.realizedCodec w.totalSize) hW
+        (pc.realizedCodec_isSurjectiveInitDecoder w.totalSize hSurj)
+    have hFb := m.isFromBytes hMSurj
+    exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+  · exact Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      pc w.totalSize hW m rfl hZero
+  · have hMInit : m.codec.IsInitCodec :=
+      FixedByteCodec.castWidth_isInitCodec (pc.realizedCodec w.totalSize) hW (hTight hT hInit).1
+    exact ⟨hMInit, m.isIntoBytes hMInit rfl,
+      fun mDst hFrom x => MirValueCodec.transmute_typed m mDst hMInit hFrom x⟩
+  · have hUninit : allBytesInitialized (m.codec.encode x₀) = false := (hPadded hLt).1 x₀
+    have hNotInit : ¬ m.codec.IsInitCodec := fun hInit => by
+      have hTrue := hInit x₀
+      rw [hUninit] at hTrue
+      nomatch hTrue
+    exact ⟨hUninit, hNotInit, m.not_isIntoBytes_of_uninit_encode x₀ hUninit⟩
+
+/--
+**`MirValueCodec` of Every Valid Single-Variant Struct (`TyKind.adt`) Layout World**: a concrete
+`LayoutTable` entry `l` for `.adt defPath (k :: ks)` whose `FieldsShape.arbitrary` offsets and size
+realize a valid layout world `w` of the struct's field layouts and satisfy `AdtDecodeFallbackSound`
+yields the general $k$-field `MirValueCodec.adtOfPlacedCodecSpine` against the computable
+`pc.realizedCodec w.totalSize`.
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc
+      w.totalSize) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine layouts defPath idx l varIdx memoryIndex
+    pc w.totalSize fcs hLookup hInhab hVar hSize hFields hFallback
+    (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)
+
+/--
+**Trusted-Level Bit Validity of Every Valid Single-Variant Struct (`TyKind.adt`) Layout World**:
+for the `MirValueCodec` of any valid layout world (any `AdtRepr`, any memory order, zero-sized
+fields anywhere) of a concrete single-variant `.adt defPath (k :: ks)` `LayoutTable` entry:
+1. Index-exact field byte-window placement in `m.codec.encode x` for every declaration field;
+2. `IsFromBytes` / `IsFromZeros` / `IsTryFromBytes` whenever every field codec is a surjective
+   initialized-byte decoder, and `HasZeroValid` / `IsFromZeros` / `IsTryFromBytes` whenever every
+   field codec has a valid all-zero encoding;
+3. `IsInitCodec`, `IsIntoBytes`, and `transmute_typed` soundness in tight worlds
+   (`w.totalSize = sumSizes fs`) with initialized field codecs;
+4. `.uninit` byte emission (`allBytesInitialized = false`), `¬ IsInitCodec`, and `¬ IsIntoBytes`
+   in padded worlds (`sumSizes fs < w.totalSize`).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFallback : Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc
+      w.totalSize) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx
+      memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields hFallback
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    ((pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid →
+        m.codec.HasZeroValid ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hW : pc.realizedWidth w.totalSize = w.totalSize :=
+    (pc.realized_offsets_and_width_of_sequential w.totalSize
+      (PlacedCodecSpine.memSort_sequential_of_validStructLayoutWorld hValid pc hPlaced)).2
+  have hSpec := pc.realizedCodec_spec hValid hPlaced
+  obtain ⟨_, _, hWin, _, hTight, hPadded⟩ := hSpec
+  refine ⟨fun x i o bs hGet => hWin x i o bs hGet, ⟨fun hSurj => ?_, fun hZero => ?_⟩,
+    fun hT hInit => ?_, fun hLt x₀ => ?_⟩
+  · have hMSurj : m.codec.IsSurjectiveInitDecoder :=
+      FixedByteCodec.castWidth_isSurjectiveInitDecoder (pc.realizedCodec w.totalSize) hW
+        (pc.realizedCodec_isSurjectiveInitDecoder w.totalSize hSurj)
+    have hFb := m.isFromBytes hMSurj
+    exact ⟨hFb, isFromBytes_implies_isFromZeros _ _ hFb, isFromBytes_implies_isTryFromBytes _ _ hFb⟩
+  · exact Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      pc w.totalSize hW m rfl hZero
+  · have hMInit : m.codec.IsInitCodec :=
+      FixedByteCodec.castWidth_isInitCodec (pc.realizedCodec w.totalSize) hW (hTight hT hInit).1
+    exact ⟨hMInit, m.isIntoBytes hMInit rfl,
+      fun mDst hFrom x => MirValueCodec.transmute_typed m mDst hMInit hFrom x⟩
+  · have hUninit : allBytesInitialized (m.codec.encode x₀) = false := (hPadded hLt).1 x₀
+    have hNotInit : ¬ m.codec.IsInitCodec := fun hInit => by
+      have hTrue := hInit x₀
+      rw [hUninit] at hTrue
+      nomatch hTrue
+    exact ⟨hUninit, hNotInit, m.not_isIntoBytes_of_uninit_encode x₀ hUninit⟩
+
+/--
+**Automatic Fallback Soundness for Any `ValidStructLayoutWorld` `.memory` Struct With Surjective Field Codecs**:
+for any valid layout world `w` (any `AdtRepr`, in-order or reordered, with arbitrary padding and ZSTs)
+and any `pc : PlacedCodecSpine αs` with `pc.placed = w.fieldOffsets.zip fs` and `pc.AllFieldsSurjective`,
+`hValid.placed_in_bounds` automatically discharges the in-bounds hypothesis of
+`AdtDecodeFallbackSound.of_memory_surjective`.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound
+-/
+theorem MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (l : TypeLayout) (varIdx : VariantIdx)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hFl : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .memory)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hSurj : pc.AllFieldsSurjective) :
+    Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc w.totalSize := by
+  cases fcs with
+  | @cons _ _ _ _ p₀ c₀ tail _ _ =>
+    exact Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective
+      hFl hRepr hSize hSurj (fun p hp => by
+        rw [hPlaced] at hp
+        exact hValid.placed_in_bounds p hp)
+
+/--
+**Automatic Fallback Soundness for Any `ValidStructLayoutWorld` Span-Fallback Struct With Surjective
+Field Codecs**: generalizes `adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective` from
+`.memory` entries to every entry without `fieldLayouts` whose shape makes Trusted fall back to the span
+decoder (`usesSpanFallback`), e.g. `.scalar` structs with zero-sized marker fields such as
+`struct W(u32, PhantomData<T>)`; `hValid.placed_in_bounds` discharges the in-bounds hypothesis.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound
+-/
+theorem MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (l : TypeLayout) (varIdx : VariantIdx)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hFl : l.fieldLayouts = [])
+    (hSpan : Anneal.ByteCodec.MirValueCodec.usesSpanFallback
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.backendRepr = true)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hSurj : pc.AllFieldsSurjective) :
+    Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc w.totalSize := by
+  cases fcs with
+  | @cons _ _ _ _ p₀ c₀ tail _ _ =>
+    exact Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_span_surjective
+      hFl hSpan hSize hSurj (fun p hp => by
+        rw [hPlaced] at hp
+        exact hValid.placed_in_bounds p hp)
+
+/--
+**Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` `.memory` Struct With Surjective Field Codecs**
+(covering both in-order `#[repr(C)]`/`#[repr(Rust)]` structs and reordered `#[repr(Rust)]` structs
+without requiring a manual `AdtDecodeFallbackSound` proof).
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .memory)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSurj : pc.AllFieldsSurjective) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx memoryIndex
+    pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective
+      hValid layouts l varIdx pc fcs hPlaced hFl hRepr hSize hSurj)
+
+/--
+**Trusted-Level Bit Validity for Any `ValidStructLayoutWorld` `.memory` Struct With Surjective Field Codecs**
+(in-order or reordered, with no separate `hFallback` obligation).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .memory)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSurj : pc.AllFieldsSurjective) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective hValid layouts defPath
+      idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hFl hRepr hSize hFields hSurj
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    (IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hAll := MirValueCodec.adtOfValidStructLayoutWorld_bitValidity hValid layouts defPath
+    idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective
+      hValid layouts l varIdx pc fcs hPlaced hFl hRepr hSize hSurj)
+  exact ⟨hAll.1, hAll.2.1.1 hSurj, hAll.2.2.1, hAll.2.2.2⟩
+
+/--
+**Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` Span-Fallback Struct With Surjective Field Codecs**
+(generalizing `adtOfValidStructLayoutWorld_memory_surjective` to all entries with `l.fieldLayouts = []`
+and `usesSpanFallback ... l.backendRepr = true`, including `.scalar` and `.scalarPair` structs with
+zero-sized marker fields such as `struct W(u32, PhantomData<T>)` as well as `.memory` structs).
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld_span_surjective
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = [])
+    (hSpan : Anneal.ByteCodec.MirValueCodec.usesSpanFallback
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.backendRepr = true)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSurj : pc.AllFieldsSurjective) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx memoryIndex
+    pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+      hValid layouts l varIdx pc fcs hPlaced hFl hSpan hSize hSurj)
+
+/--
+**Trusted-Level Bit Validity for Any `ValidStructLayoutWorld` Span-Fallback Struct With Surjective Field Codecs**
+(covering `.scalar` / `.scalarPair` structs with marker ZST fields as well as `.memory` structs, with no
+separate `hFallback` obligation).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld_span_surjective
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFl : l.fieldLayouts = [])
+    (hSpan : Anneal.ByteCodec.MirValueCodec.usesSpanFallback
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.backendRepr = true)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hSurj : pc.AllFieldsSurjective) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld_span_surjective hValid layouts defPath
+      idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hFl hSpan hSize hFields hSurj
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    (IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) := by
+  intro ty m
+  have hAll := MirValueCodec.adtOfValidStructLayoutWorld_bitValidity hValid layouts defPath
+    idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+      hValid layouts l varIdx pc fcs hPlaced hFl hSpan hSize hSurj)
+  exact ⟨hAll.1, hAll.2.1.1 hSurj, hAll.2.2.1, hAll.2.2.2⟩
+
+/--
+**Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` Struct With Populated `l.fieldLayouts`**
+satisfying `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` on the `byArgs` path (`args = k :: ks`,
+supporting both in-order and reordered structs with niche fields such as `bool` and ZST marker fields).
+For integer-niche fields (`NonZero*`), which admit no `TupleFieldCodec` on the `byArgs` path
+(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`, `TupleFieldCodec.not_adt`), use
+`MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine` with `FieldLayoutCodec.scalarValidRange` on the
+`args.length ≠ offsets.length` (`l.fieldLayouts`) path.
+-/
+def MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFlSound : Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound layouts pc l.fieldLayouts) :
+    MirValueCodec layouts { kind := .adt defPath (k :: ks), layoutIdx := idx } (FieldTuple αs) w.totalSize :=
+  MirValueCodec.adtOfValidStructLayoutWorld hValid layouts defPath idx l varIdx memoryIndex
+    pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts hFlSound)
+
+/--
+**Trusted-Level Bit Validity for Any `ValidStructLayoutWorld` Struct With Populated `l.fieldLayouts`**
+satisfying `FieldLayoutsDecodeSound layouts pc l.fieldLayouts` (preserving both `AllFieldsSurjective`
+and `AllFieldsZeroValid` for niche structs such as `bool`-containing structs).
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts
+-/
+theorem MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx) (l : TypeLayout)
+    (varIdx : VariantIdx) (memoryIndex : List Nat)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hFields : l.fields = .arbitrary (pc.placed.map fun p => ({ bytes := p.1 } : Size)) memoryIndex)
+    (hFlSound : Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound layouts pc l.fieldLayouts) :
+    let ty : Ty := { kind := .adt defPath (k :: ks), layoutIdx := idx }
+    let m := MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts hValid layouts defPath
+      idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields hFlSound
+    (∀ (x : FieldTuple αs) (i o : Nat) (bs : List AbstractByte),
+      (pc.windows x)[i]? = some (o, bs) →
+      w.fieldOffsets[i]? = some o ∧ ((m.codec.encode x).drop o).take bs.length = bs) ∧
+    ((pc.AllFieldsSurjective →
+        IsFromBytes layouts ty ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty) ∧
+      (pc.AllFieldsZeroValid →
+        m.codec.HasZeroValid ∧ IsFromZeros layouts ty ∧ IsTryFromBytes layouts ty)) ∧
+    (w.totalSize = sumSizes fs → pc.AllFieldsInit →
+      m.codec.IsInitCodec ∧ IsIntoBytes layouts ty ∧
+      ∀ {dstTy : Ty} {β : Type} (mDst : MirValueCodec layouts dstTy β w.totalSize),
+        mDst.codec.IsSurjectiveInitDecoder →
+        ∀ x : FieldTuple αs, ∃ y : β,
+          mDst.codec.decode (m.codec.encode x) = some y ∧
+          decodeValueFromBytes defaultCodecFuel layouts dstTy (m.codec.encode x) =
+            some (mDst.toValue y)) ∧
+    (sumSizes fs < w.totalSize → ∀ x₀ : FieldTuple αs,
+      allBytesInitialized (m.codec.encode x₀) = false ∧
+      ¬ m.codec.IsInitCodec ∧
+      ¬ IsIntoBytes layouts ty) :=
+  MirValueCodec.adtOfValidStructLayoutWorld_bitValidity hValid layouts defPath
+    idx l varIdx memoryIndex pc fcs hPlaced hLookup hInhab hVar hSize hFields
+    (Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts hFlSound)
+
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem sumSizes_eq_zero_of_nonOneZstFields_nil :
+    ∀ {fs : List FieldLayout}, nonOneZstFields fs = [] → sumSizes fs = 0
+  | [], _ => rfl
+  | fl :: fs, h => by
+    unfold nonOneZstFields at h
+    cases hZ : fl.isOneZst
+    · simp [List.filter, hZ] at h
+    · simp only [List.filter, hZ] at h
+      have hFlSz : fl.size = 0 := by
+        unfold FieldLayout.isOneZst at hZ
+        simp only [Bool.and_eq_true, beq_iff_eq] at hZ
+        exact hZ.1
+      simp only [sumSizes, hFlSz, Nat.zero_add]
+      exact sumSizes_eq_zero_of_nonOneZstFields_nil h
+
+/--
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem sumSizes_eq_of_nonOneZstFields_singleton :
+    ∀ {fs : List FieldLayout} {f : FieldLayout},
+      nonOneZstFields fs = [f] → sumSizes fs = f.size
+  | [], _, h => nomatch h
+  | fl :: fs, f, h => by
+    unfold nonOneZstFields at h
+    cases hZ : fl.isOneZst
+    · simp only [List.filter, hZ, Bool.not_false] at h
+      injection h with hFl hNil
+      subst hFl
+      have hRest : sumSizes fs = 0 := sumSizes_eq_zero_of_nonOneZstFields_nil hNil
+      simp [sumSizes, hRest]
+    · simp only [List.filter, hZ, Bool.not_true] at h
+      have hFlSz : fl.size = 0 := by
+        unfold FieldLayout.isOneZst at hZ
+        simp only [Bool.and_eq_true, beq_iff_eq] at hZ
+        exact hZ.1
+      simp only [sumSizes, hFlSz, Nat.zero_add]
+      exact sumSizes_eq_of_nonOneZstFields_singleton h
+
+/--
+**$k$-Field `#[repr(transparent)]` Tightness**: every valid $k$-field `#[repr(transparent)]` layout
+world (with zero or one non-1-ZST field and arbitrarily many 1-ZST fields) has `w.totalSize = sumSizes fs`.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem reprTransparent_validStructLayoutWorld_totalSize_eq_sumSizes
+    {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .transparent reprAlign fs w) :
+    w.totalSize = sumSizes fs := by
+  have hRepr := hValid.repr_valid
+  dsimp only [ReprLayoutConstraint] at hRepr
+  rcases hRepr with ⟨_, hCases⟩
+  cases hNZ : nonOneZstFields fs with
+  | nil =>
+    rw [hNZ] at hCases
+    rw [hCases.1, sumSizes_eq_zero_of_nonOneZstFields_nil hNZ]
+  | cons f rest =>
+    cases rest with
+    | nil =>
+      rw [hNZ] at hCases
+      rw [hCases.1, sumSizes_eq_of_nonOneZstFields_singleton hNZ]
+    | cons f₂ rest' =>
+      rw [hNZ] at hCases
+      exact False.elim hCases
+
+/--
+**$k$-Field `#[repr(transparent)]` `IntoBytes` Soundness**: for any valid $k$-field
+`#[repr(transparent)]` world `w` and declaration-order `pc : PlacedCodecSpine αs` with
+`pc.AllFieldsInit`, the constructively sorted memory-order struct codec is `IsInitCodec` and every
+realizing width-enforcing `MirValueCodec` is `BitValidity.IsIntoBytes`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: PlacedCodecSpine.memSort
+-/
+theorem reprTransparent_struct_isIntoBytes
+    {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .transparent reprAlign fs w)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hInit : pc.AllFieldsInit) :
+    let sRaw := pc.memSort.toSymbolicStructSpine
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      let W := lead + sRaw.repadWidth pads trail
+      let cStruct := laidOutStructSymbolicPadPerm lead pc.memSortPerm (sRaw.repad pads trail)
+      W = w.totalSize ∧ cStruct.IsInitCodec ∧
+      ∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+        m.enforcesUntypedFieldWidths = true →
+        (∀ x, m.codec.encode x = cStruct.encode x) →
+        IsIntoBytes layouts ty := by
+  intro sRaw
+  obtain ⟨lead, pads, trail, _, hTot, _, _, hTightImpl, _⟩ :=
+    pc.realize_validStructLayoutWorld_bitValidity hValid hPlaced
+  obtain ⟨hCInit, hInto, _⟩ :=
+    hTightImpl (reprTransparent_validStructLayoutWorld_totalSize_eq_sumSizes hValid) hInit
+  exact ⟨lead, pads, trail, hTot, hCInit, hInto⟩
+
+
+/--
+**$k$-Field Tight `#[repr(Rust)]` `IntoBytes` Soundness**: in any valid $k$-field `#[repr(Rust)]`
+world `w` whose `w.totalSize = sumSizes fs` and declaration-order `pc : PlacedCodecSpine αs`
+with `pc.AllFieldsInit`, the constructively sorted memory-order struct codec is `IsInitCodec`
+and every realizing width-enforcing `MirValueCodec` is `BitValidity.IsIntoBytes`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: PlacedCodecSpine.memSort
+-/
+theorem reprRust_zero_pad_of_sumSizes_eq_totalSize
+    {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld .rust reprAlign fs w)
+    (hTight : w.totalSize = sumSizes fs)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hInit : pc.AllFieldsInit) :
+    let sRaw := pc.memSort.toSymbolicStructSpine
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      let W := lead + sRaw.repadWidth pads trail
+      let cStruct := laidOutStructSymbolicPadPerm lead pc.memSortPerm (sRaw.repad pads trail)
+      W = w.totalSize ∧ cStruct.IsInitCodec ∧
+      ∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+        m.enforcesUntypedFieldWidths = true →
+        (∀ x, m.codec.encode x = cStruct.encode x) →
+        IsIntoBytes layouts ty := by
+  intro sRaw
+  obtain ⟨lead, pads, trail, _, hTot, _, _, hTightImpl, _⟩ :=
+    pc.realize_validStructLayoutWorld_bitValidity hValid hPlaced
+  obtain ⟨hCInit, hInto, _⟩ := hTightImpl hTight hInit
+  exact ⟨lead, pads, trail, hTot, hCInit, hInto⟩
+/--
+**$k$-Field `#[repr(C)]` `IntoBytes` Dichotomy (`reprCPaddingFree`)**: for any well-formed $k$-field
+`#[repr(C)]` struct and declaration-order `pc : PlacedCodecSpine αs` placed at `reprCLayoutWorld reprAlign fs`:
+- if `reprCPaddingFree reprAlign fs = true` and `pc.AllFieldsInit`, then the realized codec is
+  `IsInitCodec` and every realizing width-enforcing `MirValueCodec` is `IsIntoBytes`;
+- if `reprCPaddingFree reprAlign fs = false`, then the realized codec emits `.uninit` on every value
+  and every realizing `MirValueCodec` over an inhabited `FieldTuple αs` fails `IsIntoBytes`.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S0
+Subject: reprCLayoutWorld
+-/
+theorem reprC_struct_paddingFree_iff_isIntoBytes
+    {reprAlign : Option Nat} {fs : List FieldLayout}
+    (hWF : ({ shape := .struct fs, repr := .c, reprAlign := reprAlign,
+              rustOrderCanonical := false } : AdtLayoutSpec).WF)
+    {αs : List Type} (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = (reprCLayoutWorld reprAlign fs).fieldOffsets.zip fs) :
+    let w := reprCLayoutWorld reprAlign fs
+    let sRaw := pc.memSort.toSymbolicStructSpine
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      let W := lead + sRaw.repadWidth pads trail
+      let cStruct := laidOutStructSymbolicPadPerm lead pc.memSortPerm (sRaw.repad pads trail)
+      W = w.totalSize ∧
+      (reprCPaddingFree reprAlign fs = true → pc.AllFieldsInit →
+        cStruct.IsInitCodec ∧
+        ∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+          m.enforcesUntypedFieldWidths = true →
+          (∀ x, m.codec.encode x = cStruct.encode x) →
+          IsIntoBytes layouts ty) ∧
+      (reprCPaddingFree reprAlign fs = false →
+        (∀ x : FieldTuple αs, allBytesInitialized (cStruct.encode x) = false) ∧
+        ∀ (layouts : LayoutTable) (ty : Ty) (m : MirValueCodec layouts ty (FieldTuple αs) W),
+          (∀ x, m.codec.encode x = cStruct.encode x) →
+          FieldTuple αs → ¬ IsIntoBytes layouts ty) := by
+  intro w sRaw
+  have hValid := reprCLayoutWorld_valid hWF
+  obtain ⟨lead, pads, trail, hOffs, hTot, _, _, hTightImpl, hPadImpl⟩ :=
+    pc.realize_validStructLayoutWorld_bitValidity hValid hPlaced
+  refine ⟨lead, pads, trail, hTot, fun hPF hInit => ?_, fun hNotPF => ?_⟩
+  · obtain ⟨hCInit, hInto, _⟩ := hTightImpl (Nat.eq_of_beq_eq_true hPF) hInit
+    exact ⟨hCInit, hInto⟩
+  · have hMemPerm := memSort_perm (w.fieldOffsets.zip fs)
+    have hPlacedSort : pc.memSort.placed = memSort (w.fieldOffsets.zip fs) := by
+      rw [PlacedCodecSpine.placed_memSort pc, hPlaced]
+    have hW : sRaw.widths = (memSort (w.fieldOffsets.zip fs)).map (fun p => p.2.size) := by
+      rw [PlacedCodecSpine.widths_toSymbolicStructSpine pc.memSort, hPlacedSort]
+    have hSum := hValid.memOrder_repad_sumFieldWidths hMemPerm sRaw hW pads trail
+    have hWidth := (sRaw.repad pads trail).width_eq_sumFieldWidths_add_totalPadBytes
+    have hTot' : lead + sRaw.repadWidth pads trail = (reprCLayoutWorld reprAlign fs).totalSize := hTot
+    have hNe : (reprCLayoutWorld reprAlign fs).totalSize ≠ sumSizes fs := fun hEq => by
+      have : reprCPaddingFree reprAlign fs = true := Nat.beq_eq.mpr hEq
+      rw [this] at hNotPF
+      nomatch hNotPF
+    exact hPadImpl (by omega)
+
+/-! #### Section 2e2.3: `[adv B4]` Concrete Non-Vacuity Witness for the $k$-Field Realization Chain
+
+Every $k$-field realization theorem above is a `∀ w, ValidStructLayoutWorld … w → …` implication, so it
+says nothing unless its premises are satisfiable by genuinely **permuted** worlds. This witness
+kernel-checks a `rustc`-style reordered world with an interior zero-sized field
+(`struct S { a: u8, b: [u8; 4] /* align 4 */, c: () }` laid out as `b @ 0, a @ 4, c @ 5`, size 8) and
+instantiates `PlacedCodecSpine.realize_field_windows` and
+`PlacedCodecSpine.realize_validStructLayoutWorld_bitValidity` on it.
+-/
+
+/-- Declaration-order field layouts of `struct S { a: u8, b: [u8; 4] /* align 4 */, c: () }`. -/
+def demoS3Fields : List FieldLayout := [⟨1, 1⟩, ⟨4, 4⟩, ⟨0, 1⟩]
+
+/-- A reordered `#[repr(Rust)]` world: `b @ 0`, `a @ 4`, `c @ 5`, size 8, align 4. -/
+def demoS3World : StructLayoutWorld := ⟨[4, 0, 5], 8, 4⟩
+
+/--
+The reordered world is a genuine `ValidStructLayoutWorld .rust` (in bounds, aligned, pairwise
+disjoint, `align = maxAlign`, `8 % 4 = 0`, `alignUp 5 4 ≤ 8`), so the realization theorems are not vacuous
+on permuted worlds.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: ValidStructLayoutWorld
+-/
+theorem demoS3World_valid : ValidStructLayoutWorld .rust none demoS3Fields demoS3World := by
+  refine
+    { offsets_len := rfl
+      field_in_bounds := ?_
+      field_aligned := ?_
+      fields_disjoint := ?_
+      repr_valid := ⟨rfl, rfl, by decide, fun h => absurd h (by decide)⟩ }
+  · intro i o fl hO hF
+    match i, hO, hF with
+    | 0, hO, hF => cases hO; cases hF; decide
+    | 1, hO, hF => cases hO; cases hF; decide
+    | 2, hO, hF => cases hO; cases hF; decide
+    | _ + 3, hO, _ => nomatch hO
+  · intro i o fl hO hF
+    match i, hO, hF with
+    | 0, hO, hF => cases hO; cases hF; decide
+    | 1, hO, hF => cases hO; cases hF; decide
+    | 2, hO, hF => cases hO; cases hF; decide
+    | _ + 3, hO, _ => nomatch hO
+  · intro i j oi oj fi fj hNe hOi hOj hFi hFj
+    match i, j, hOi, hOj, hFi, hFj with
+    | 0, 0, _, _, _, _ => exact absurd rfl hNe
+    | 1, 1, _, _, _, _ => exact absurd rfl hNe
+    | 2, 2, _, _, _, _ => exact absurd rfl hNe
+    | 0, 1, hOi, hOj, hFi, hFj => cases hOi; cases hOj; cases hFi; cases hFj; decide
+    | 0, 2, hOi, hOj, hFi, hFj => cases hOi; cases hOj; cases hFi; cases hFj; decide
+    | 1, 0, hOi, hOj, hFi, hFj => cases hOi; cases hOj; cases hFi; cases hFj; decide
+    | 1, 2, hOi, hOj, hFi, hFj => cases hOi; cases hOj; cases hFi; cases hFj; decide
+    | 2, 0, hOi, hOj, hFi, hFj => cases hOi; cases hOj; cases hFi; cases hFj; decide
+    | 2, 1, hOi, hOj, hFi, hFj => cases hOi; cases hOj; cases hFi; cases hFj; decide
+    | _ + 3, _, hOi, _, _, _ => nomatch hOi
+    | _, _ + 3, _, hOj, _, _ => nomatch hOj
+
+
+/--
+Instantiation of `PlacedCodecSpine.realize_field_windows` on the permuted world: the realized codec
+has width `8` and puts `b`'s 4 bytes at offset `0`, `a`'s byte at offset `4`, and `c` at offset `5`.
+
+Kind: codec
+Witness: exists-sat
+Assumes: S0
+Subject: demoS3Placed
+-/
+theorem demoS3_realized_field_windows :
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      lead + demoS3Placed.memSort.toSymbolicStructSpine.repadWidth pads trail = 8 ∧
+      ∀ (x : FieldTuple [UInt8, Vector UInt8 4, Unit]) (o : Nat) (bs : List AbstractByte),
+        (o, bs) ∈ demoS3Placed.windows x →
+        (((laidOutStructSymbolicPadPerm lead demoS3Placed.memSortPerm
+            (demoS3Placed.memSort.toSymbolicStructSpine.repad pads trail)).encode x).drop o).take
+          bs.length = bs :=
+  demoS3Placed.realize_field_windows demoS3World_valid rfl
+
+/--
+Instantiation of the padded-world branch of `PlacedCodecSpine.realize_validStructLayoutWorld_bitValidity`
+(`sumSizes demoS3Fields = 5 < 8`): the realized codec of the permuted world emits `.uninit` padding
+on **every** value, so no realizing `MirValueCodec` can be `IsIntoBytes` (no `MirValueCodec` needed).
+
+Kind: codec
+Witness: exists-sat
+Assumes: S0
+Subject: demoS3Placed
+-/
+theorem demoS3_realized_codec_emits_uninit :
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      ∀ x : FieldTuple [UInt8, Vector UInt8 4, Unit],
+        allBytesInitialized ((laidOutStructSymbolicPadPerm lead demoS3Placed.memSortPerm
+          (demoS3Placed.memSort.toSymbolicStructSpine.repad pads trail)).encode x) = false := by
+  obtain ⟨lead, pads, trail, _, _, _, _, _, hPad⟩ :=
+    demoS3Placed.realize_validStructLayoutWorld_bitValidity demoS3World_valid rfl
+  exact ⟨lead, pads, trail, (hPad (by decide)).1⟩
+
+/--
+**Existential-Free Computable Realization of `demoS3Placed`**:
+`demoS3Placed.realizedCodec 8` computes `realizedLead = 0`, `realizedPads = [0, 0, 0]`,
+`realizedTrail 8 = 3`, and `realizedWidth 8 = 8` by `rfl`, places every declaration field `i`
+at `demoS3World.fieldOffsets[i]?`, and emits `.uninit` padding on every value with **no existential
+quantifiers**.
+
+Kind: codec
+Witness: universal
+Assumes: S0
+Subject: demoS3Placed
+-/
+theorem demoS3Placed_realizedCodec_spec :
+    demoS3Placed.realizedLead = 0 ∧
+    demoS3Placed.realizedPads = [0, 0, 0] ∧
+    demoS3Placed.realizedTrail 8 = 3 ∧
+    demoS3Placed.realizedWidth 8 = 8 ∧
+    (∀ (x : FieldTuple [UInt8, Vector UInt8 4, Unit]) (i o : Nat) (bs : List AbstractByte),
+      (demoS3Placed.windows x)[i]? = some (o, bs) →
+      demoS3World.fieldOffsets[i]? = some o ∧
+      (((demoS3Placed.realizedCodec 8).encode x).drop o).take bs.length = bs) ∧
+    (∀ x : FieldTuple [UInt8, Vector UInt8 4, Unit],
+      allBytesInitialized ((demoS3Placed.realizedCodec 8).encode x) = false) := by
+  have hSpec := demoS3Placed.realizedCodec_spec demoS3World_valid rfl
+  exact ⟨rfl, rfl, rfl, rfl, hSpec.2.2.1, (hSpec.2.2.2.2.2 (by decide)).1⟩
+
+
+/-! #### Section 2e2.4: `Stmt.evalConst` Compile-Time Guard Soundness & `S0` vs. `S1` Tier Separation -/
+
+/--
+Small-step / terminal outcome of a function containing an inline `const { ... }` block
+(`Stmt.evalConst` in `b1f15f743c:trusted/lean/Trusted/MirSemantics.lean`).
+-/
+inductive ConstGuardTermination (α : Type) : Type where
+  | normal (ret : α)
+  | unwind
+  | abort
+  | compileTimeError
+  | ub
+  deriving DecidableEq, Repr
+
+/--
+Operational evaluation of an in-order `Stmt.evalConst` guard `const { assert!(cond); }`
+followed by body continuation `k`:
+- When `cond = true`, the constant block returns `()` at compile time and runtime
+  execution proceeds with `k ()`.
+- When `cond = false`, CTFE panics and `evalMirStmt` terminates the enclosing execution
+  with `.compileTimeError` (pruning that layout world at compile time rather than
+  hitting runtime `.ub`).
+-/
+@[reducible]
+def evalConstGuard {α : Type} (cond : Bool) (k : Unit → ConstGuardTermination α) :
+    ConstGuardTermination α :=
+  match cond with
+  | true => k ()
+  | false => .compileTimeError
+
+/--
+Tier-parameterized safety postcondition matching `SafetyPost` in
+`b1f15f743c:trusted/lean/Trusted/MirSemantics.lean`:
+1. Execution never triggers undefined behavior (`out ≠ .ub`).
+2. When `tier.allowsCompileTimeError = false` (`S0_fnVerified`), `.compileTimeError` is
+   forbidden in all layout worlds.
+3. When `tier.allowsCompileTimeError = true` (`S1_compileTimeGuard`), `.compileTimeError`
+   is permitted on non-canonical padded worlds provided the canonical zero-padded world
+   (`isCanonicalWorld = true`) does not hit `.compileTimeError`.
+-/
+def TierSafetyPost {α : Type} (tier : ForwardCompatTier) (isCanonicalWorld : Bool)
+    (out : ConstGuardTermination α) : Prop :=
+  out ≠ .ub ∧
+  match tier.allowsCompileTimeError with
+  | true => isCanonicalWorld = true → out ≠ .compileTimeError
+  | false => out ≠ .compileTimeError
+
+/--
+**`Stmt.evalConst` Size-Equality Guard Forces Zero Padding (`evalConst_size_eq_forces_zero_pad_and_intoBytes`)**:
+For any 2-field symbolic layout world `w : SymbolicPairPad` (with arbitrary non-negative
+`pad0`, `padMid`, `padTail` and arbitrary field permutation `swapOrder`), if
+`evalConstGuard (Nat.beq (w.totalByteSize n₁ n₂) (n₁ + n₂)) k` does NOT terminate with
+`.compileTimeError`, then `w.pad0 = 0`, `w.padMid = 0`, `w.padTail = 0`, and
+`(laidOutPairSymbolicPad w c₁ c₂).IsInitCodec` holds!
+
+anneal:allow_compile_time_guard
+pin:sha256:8d610640725b
+
+Kind: safety
+Witness: universal
+Assumes: S1
+Subject: evalConstGuard
+-/
+theorem evalConst_size_eq_forces_zero_pad_and_intoBytes {α β γ : Type} {n₁ n₂ : Nat}
+    (w : SymbolicPairPad)
+    {c₁ : FixedByteCodec α n₁} {c₂ : FixedByteCodec β n₂}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec)
+    (a₀ : α) (b₀ : β)
+    (k : Unit → ConstGuardTermination γ)
+    (hNoCte : evalConstGuard (Nat.beq (w.totalByteSize n₁ n₂) (n₁ + n₂)) k ≠ .compileTimeError) :
+    w.pad0 = 0 ∧ w.padMid = 0 ∧ w.padTail = 0 ∧
+    (laidOutPairSymbolicPad w c₁ c₂).IsInitCodec := by
+  unfold evalConstGuard at hNoCte
+  cases hBeq : Nat.beq (w.totalByteSize n₁ n₂) (n₁ + n₂) with
+  | false =>
+    rw [hBeq] at hNoCte
+    exact False.elim (hNoCte rfl)
+  | true =>
+    have hSizeEq : w.totalByteSize n₁ n₂ = n₁ + n₂ := Nat.eq_of_beq_eq_true hBeq
+    rw [w.totalByteSize_eq_sum_plus_totalPad n₁ n₂] at hSizeEq
+    have hPad0 : w.totalPad = 0 := by omega
+    unfold SymbolicPairPad.totalPad at hPad0
+    have hp0 : w.pad0 = 0 := by omega
+    have hpM : w.padMid = 0 := by omega
+    have hpT : w.padTail = 0 := by omega
+    refine ⟨hp0, hpM, hpT, ?_⟩
+    exact (laidOutPairSymbolicPad_isInitCodec_iff w c₁ c₂ a₀ b₀).mpr ⟨hp0, hpM, hpT, h₁, h₂⟩
+
+/--
+General $k$-field `Stmt.evalConst` size-equality guard soundness: for any heterogeneous
+struct spine `s : SymbolicStructSpine αs w`, if `evalConstGuard (Nat.beq w s.sumFieldWidths) k`
+does not terminate with `.compileTimeError`, then `s.totalPadBytes = 0` and
+`(laidOutStructSymbolicPad s).IsInitCodec` holds.
+
+Kind: safety
+Witness: universal
+Assumes: S1
+Subject: laidOutStructSymbolicPad
+-/
+theorem evalConst_structSpine_size_eq_forces_zero_pad_and_init {αs : List Type} {w : Nat} {γ : Type}
+    (s : SymbolicStructSpine αs w) (x₀ : FieldTuple αs)
+    (hAllInit : s.AllFieldsInit)
+    (k : Unit → ConstGuardTermination γ)
+    (hNoCte : evalConstGuard (Nat.beq w s.sumFieldWidths) k ≠ .compileTimeError) :
+    s.totalPadBytes = 0 ∧ (laidOutStructSymbolicPad s).IsInitCodec := by
+  unfold evalConstGuard at hNoCte
+  cases hBeq : Nat.beq w s.sumFieldWidths with
+  | false =>
+    rw [hBeq] at hNoCte
+    exact False.elim (hNoCte rfl)
+  | true =>
+    have hEq : w = s.sumFieldWidths := Nat.eq_of_beq_eq_true hBeq
+    have hWidth := s.width_eq_sumFieldWidths_add_totalPadBytes
+    have hPad0 : s.totalPadBytes = 0 := by omega
+    exact ⟨hPad0, (laidOutStructSymbolicPad_isInitCodec_iff s x₀).mpr ⟨hPad0, hAllInit⟩⟩
+
+/--
+General $k$-field `Stmt.evalConst` guard soundness **with arbitrary memory-order permutation and
+leading padding**: if `evalConstGuard (Nat.beq (lead + w) s.sumFieldWidths) k` does not terminate
+with `.compileTimeError`, then the leading padding and every spine padding slot are `0`, and the
+permuted struct codec is `IsInitCodec` (no inhabitant needed).
+
+Kind: safety
+Witness: universal
+Assumes: S1
+Subject: laidOutStructSymbolicPadPerm
+-/
+theorem evalConst_structSpinePerm_size_eq_forces_zero_pad_and_init
+    {αs βs : List Type} {w : Nat} {γ : Type}
+    (lead : Nat) (perm : FieldPerm αs βs) (s : SymbolicStructSpine βs w)
+    (hAllInit : s.AllFieldsInit)
+    (k : Unit → ConstGuardTermination γ)
+    (hNoCte : evalConstGuard (Nat.beq (lead + w) s.sumFieldWidths) k ≠ .compileTimeError) :
+    lead = 0 ∧ s.totalPadBytes = 0 ∧ (laidOutStructSymbolicPadPerm lead perm s).IsInitCodec := by
+  unfold evalConstGuard at hNoCte
+  cases hBeq : Nat.beq (lead + w) s.sumFieldWidths with
+  | false =>
+    rw [hBeq] at hNoCte
+    exact False.elim (hNoCte rfl)
+  | true =>
+    have hEq : lead + w = s.sumFieldWidths := Nat.eq_of_beq_eq_true hBeq
+    have hWidth := s.width_eq_sumFieldWidths_add_totalPadBytes
+    have hLead : lead = 0 := by omega
+    have hPad0 : s.totalPadBytes = 0 := by omega
+    exact ⟨hLead, hPad0, FixedByteCodec.mapEquiv_isInitCodec _ _ _ _ _
+      (FixedByteCodec.padLeft_isInitCodec_of_eq_zero hLead
+        (laidOutStructSymbolicPad_isInitCodec_of_zero_pad s hPad0 hAllInit))⟩
+
+/--
+**World-Level $k$-Field `Stmt.evalConst` Guard Soundness (Any Field Memory Order)**: in **every**
+valid layout world `w` of `fs` (any `AdtRepr`, any memory order, zero-sized fields anywhere) in which
+`const { assert!(size_of::<S>() == sumSizes fs) }` does not terminate with `.compileTimeError`, the
+world is padding-free (`w.totalSize = sumSizes fs`), and its realized memory-order struct codec has
+zero leading padding and zero spine padding and is `IsInitCodec` whenever its field codecs are.
+
+Kind: safety
+Witness: exists-sat
+Assumes: S1
+Subject: evalConstGuard
+-/
+theorem evalConst_validWorld_size_eq_forces_zero_pad_and_init
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    {γ : Type} (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (k : Unit → ConstGuardTermination γ)
+    (hNoCte : evalConstGuard (Nat.beq w.totalSize (sumSizes fs)) k ≠ .compileTimeError) :
+    w.totalSize = sumSizes fs ∧
+    ∃ mem : List (Nat × FieldLayout),
+      mem.Perm (w.fieldOffsets.zip fs) ∧
+      ∀ {αs βs : List Type} {W : Nat} (perm : FieldPerm αs βs) (s : SymbolicStructSpine βs W),
+        s.widths = mem.map (fun p => p.2.size) → s.AllFieldsInit →
+        ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+          (s.repad pads trail).fieldOffsets lead = mem.map Prod.fst ∧
+          lead = 0 ∧ (s.repad pads trail).totalPadBytes = 0 ∧
+          (laidOutStructSymbolicPadPerm lead perm (s.repad pads trail)).IsInitCodec := by
+  have hTight : w.totalSize = sumSizes fs := by
+    unfold evalConstGuard at hNoCte
+    cases hBeq : Nat.beq w.totalSize (sumSizes fs) with
+    | false =>
+      rw [hBeq] at hNoCte
+      exact False.elim (hNoCte rfl)
+    | true => exact Nat.eq_of_beq_eq_true hBeq
+  refine ⟨hTight, ?_⟩
+  obtain ⟨mem, hPerm, hReal⟩ := validStructLayoutWorld_realized_by_memOrder_spine hValid
+  refine ⟨mem, hPerm, fun perm s hW hInit => ?_⟩
+  obtain ⟨lead, pads, trail, hOffs, hTot⟩ := hReal s hW
+  have hSum := hValid.memOrder_repad_sumFieldWidths hPerm s hW pads trail
+  have hWidth := (s.repad pads trail).width_eq_sumFieldWidths_add_totalPadBytes
+  have hLead : lead = 0 := by omega
+  have hPad : (s.repad pads trail).totalPadBytes = 0 := by omega
+  exact ⟨lead, pads, trail, hOffs, hLead, hPad,
+    FixedByteCodec.mapEquiv_isInitCodec _ _ _ _ _
+      (FixedByteCodec.padLeft_isInitCodec_of_eq_zero hLead
+        (laidOutStructSymbolicPad_isInitCodec_of_zero_pad _ hPad
+          ((s.allFieldsInit_repad_iff pads trail).mpr hInit)))⟩
+
+/--
+**Constructive Declaration-Order $k$-Field `Stmt.evalConst` Guard Soundness**: starting from a
+declaration-order `pc : PlacedCodecSpine αs` with `pc.placed = w.fieldOffsets.zip fs` and
+`pc.AllFieldsInit`, if `evalConstGuard (Nat.beq w.totalSize (sumSizes fs)) k ≠ .compileTimeError`,
+then `w.totalSize = sumSizes fs` and the constructively sorted memory-order struct codec
+`laidOutStructSymbolicPadPerm lead pc.memSortPerm (pc.memSort.toSymbolicStructSpine.repad pads trail)`
+has zero leading padding, zero spine padding, and is `IsInitCodec` (even for uninhabited `FieldTuple αs`).
+
+Kind: safety
+Witness: exists-sat
+Assumes: S1
+Subject: evalConstGuard
+-/
+theorem evalConst_placedCodecSpine_size_eq_forces_zero_pad_and_init
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    {αs : List Type} {γ : Type}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (pc : PlacedCodecSpine αs)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hAllInit : pc.AllFieldsInit)
+    (k : Unit → ConstGuardTermination γ)
+    (hNoCte : evalConstGuard (Nat.beq w.totalSize (sumSizes fs)) k ≠ .compileTimeError) :
+    let mem := memSort (w.fieldOffsets.zip fs)
+    let perm := pc.memSortPerm
+    let sRaw := pc.memSort.toSymbolicStructSpine
+    w.totalSize = sumSizes fs ∧
+    ∃ (lead : Nat) (pads : List Nat) (trail : Nat),
+      (sRaw.repad pads trail).fieldOffsets lead = mem.map Prod.fst ∧
+      lead = 0 ∧ (sRaw.repad pads trail).totalPadBytes = 0 ∧
+      (laidOutStructSymbolicPadPerm lead perm (sRaw.repad pads trail)).IsInitCodec := by
+  intro mem perm sRaw
+  have hTight : w.totalSize = sumSizes fs := by
+    unfold evalConstGuard at hNoCte
+    cases hBeq : Nat.beq w.totalSize (sumSizes fs) with
+    | false =>
+      rw [hBeq] at hNoCte
+      exact False.elim (hNoCte rfl)
+    | true => exact Nat.eq_of_beq_eq_true hBeq
+  have hPerm : mem.Perm (w.fieldOffsets.zip fs) := memSort_perm (w.fieldOffsets.zip fs)
+  have hSeq : SequentialFieldPlacement 0 (mem.map Prod.snd) (mem.map Prod.fst) w.totalSize :=
+    sequentialFieldPlacement_of_sorted_disjoint mem 0 w.totalSize (memSort_pairwise _)
+      (hValid.placed_pairwise_disjoint.perm hPerm.symm (fun h => Or.symm h))
+      (fun _ _ => Nat.zero_le _)
+      (fun p hp => hValid.placed_in_bounds p (hPerm.mem_iff.mp hp))
+      (Nat.zero_le _)
+  have hW : sRaw.widths = mem.map (fun p => p.2.size) := by
+    rw [PlacedCodecSpine.widths_toSymbolicStructSpine pc.memSort,
+      PlacedCodecSpine.placed_memSort pc, hPlaced]
+  obtain ⟨pads, trail, hOffs, hTot⟩ :=
+    SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement hSeq sRaw
+      (by rw [List.map_map]; exact hW)
+  have hSum := hValid.memOrder_repad_sumFieldWidths hPerm sRaw hW pads trail
+  have hWidth := (sRaw.repad pads trail).width_eq_sumFieldWidths_add_totalPadBytes
+  have hLead : (mem.map Prod.fst).headD 0 = 0 := by omega
+  have hPad : (sRaw.repad pads trail).totalPadBytes = 0 := by omega
+  have hInitRaw : sRaw.AllFieldsInit :=
+    (PlacedCodecSpine.allFieldsInit_toSymbolicStructSpine pc.memSort).mpr
+      ((PlacedCodecSpine.allFieldsInit_memSort pc).mpr hAllInit)
+  exact ⟨hTight, (mem.map Prod.fst).headD 0, pads, trail, hOffs, hLead, hPad,
+    FixedByteCodec.mapEquiv_isInitCodec _ _ _ _ _
+      (FixedByteCodec.padLeft_isInitCodec_of_eq_zero hLead
+        (laidOutStructSymbolicPad_isInitCodec_of_zero_pad _ hPad
+          ((sRaw.allFieldsInit_repad_iff pads trail).mpr hInitRaw)))⟩
+
+/--
+Model of a function body that executes `const { assert!(size_of::<Pair>() == n₁ + n₂); }`
+and then transmutes `x : α × β` into an initialized byte buffer (stepping to `.ub` if any
+encoded byte is `.uninit`).
+-/
+def execConstGuardedPairTransmute {α β : Type} {n₁ n₂ : Nat}
+    (w : SymbolicPairPad) (c₁ : FixedByteCodec α n₁) (c₂ : FixedByteCodec β n₂)
+    (x : α × β) : ConstGuardTermination (List AbstractByte) :=
+  evalConstGuard (Nat.beq (w.totalByteSize n₁ n₂) (n₁ + n₂)) (fun () =>
+    let bs := (laidOutPairSymbolicPad w c₁ c₂).encode x
+    match allBytesInitialized bs with
+    | true => .normal bs
+    | false => .ub)
+
+/--
+**`S0` vs. `S1` Tier Separation Theorem**:
+1. Under `S0_fnVerified` (`allowsCompileTimeError = false`), `execConstGuardedPairTransmute`
+   fails universal verification across all `w : SymbolicPairPad` because any padded world
+   (`w = ⟨0, 1, 0, false⟩`) terminates with `.compileTimeError`.
+2. Under `S1_compileTimeGuard` (`allowsCompileTimeError = true`), `execConstGuardedPairTransmute`
+   satisfies `TierSafetyPost .S1_compileTimeGuard (w == SymbolicPairPad.canonical)` in
+   **every** `w : SymbolicPairPad` (including permuted and arbitrarily padded worlds!).
+
+Kind: refinement
+Witness: universal
+Assumes: S1
+Subject: execConstGuardedPairTransmute
+-/
+theorem s0_vs_s1_const_guarded_transmute_separation {α β : Type} {n₁ n₂ : Nat}
+    {c₁ : FixedByteCodec α n₁} {c₂ : FixedByteCodec β n₂}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) (x : α × β) :
+    (∃ w : SymbolicPairPad,
+      ¬ TierSafetyPost .S0_fnVerified (w == SymbolicPairPad.canonical)
+          (execConstGuardedPairTransmute w c₁ c₂ x)) ∧
+    (∀ w : SymbolicPairPad,
+      TierSafetyPost .S1_compileTimeGuard (w == SymbolicPairPad.canonical)
+        (execConstGuardedPairTransmute w c₁ c₂ x)) := by
+  refine ⟨⟨⟨0, 1, 0, false⟩, ?_⟩, ?_⟩
+  · intro ⟨_, hNoCte⟩
+    dsimp only [TierSafetyPost, ForwardCompatTier.allowsCompileTimeError,
+                execConstGuardedPairTransmute, evalConstGuard] at hNoCte
+    have hNe : (⟨0, 1, 0, false⟩ : SymbolicPairPad).totalByteSize n₁ n₂ ≠ n₁ + n₂ := by
+      unfold SymbolicPairPad.totalByteSize SymbolicPairPad.firstMemWidth SymbolicPairPad.secondMemWidth
+      dsimp only
+      omega
+    rw [Anneal.ByteCodec.nat_beq_eq_false_of_ne hNe] at hNoCte
+    exact hNoCte rfl
+  · intro w
+    unfold TierSafetyPost ForwardCompatTier.allowsCompileTimeError execConstGuardedPairTransmute
+    dsimp only
+    cases hBeq : Nat.beq (w.totalByteSize n₁ n₂) (n₁ + n₂) with
+    | false =>
+      dsimp only [evalConstGuard]
+      refine ⟨(fun hBad => nomatch hBad), fun hCanon => ?_⟩
+      have hW : w = SymbolicPairPad.canonical := of_decide_eq_true hCanon
+      subst hW
+      have hSzEq : SymbolicPairPad.canonical.totalByteSize n₁ n₂ = n₁ + n₂ := by
+        unfold SymbolicPairPad.canonical SymbolicPairPad.totalByteSize
+               SymbolicPairPad.firstMemWidth SymbolicPairPad.secondMemWidth
+        dsimp only
+        omega
+      rw [Nat.beq_eq.mpr hSzEq] at hBeq
+      nomatch hBeq
+    | true =>
+      have hSizeEq : w.totalByteSize n₁ n₂ = n₁ + n₂ := Nat.eq_of_beq_eq_true hBeq
+      rw [w.totalByteSize_eq_sum_plus_totalPad n₁ n₂] at hSizeEq
+      have hPad0 : w.totalPad = 0 := by omega
+      unfold SymbolicPairPad.totalPad at hPad0
+      have hp0 : w.pad0 = 0 := by omega
+      have hpM : w.padMid = 0 := by omega
+      have hpT : w.padTail = 0 := by omega
+      have hInitCodec : (laidOutPairSymbolicPad w c₁ c₂).IsInitCodec :=
+        (laidOutPairSymbolicPad_isInitCodec_iff w c₁ c₂ x.1 x.2).mpr ⟨hp0, hpM, hpT, h₁, h₂⟩
+      have hBsInit : allBytesInitialized ((laidOutPairSymbolicPad w c₁ c₂).encode x) = true :=
+        hInitCodec x
+      dsimp only [evalConstGuard]
+      rw [hBsInit]
+      exact ⟨(fun hBad => nomatch hBad), fun _ hBad => nomatch hBad⟩
+
+/--
+**`S0` vs. `S1` Tier Separation over `ValidStructLayoutWorld`s** (strengthening
+`s0_vs_s1_const_guarded_transmute_separation`, whose `S0` witness `⟨0, 1, 0, false⟩` need not
+respect field alignment, e.g. it misaligns a second `u32` field):
+1. For every non-ZST pair with power-of-two alignments there is a **valid** `#[repr(Rust)]`
+   layout world (`paddedPairWitness`) in which the const-guarded transmute terminates with
+   `.compileTimeError`, so universal verification fails under `S0_fnVerified`.
+2. Under `S1_compileTimeGuard`, **every** `ValidStructLayoutWorld` of the pair (any representation)
+   is realized by a `SymbolicPairPad` whose guarded execution satisfies `TierSafetyPost` and never
+   reaches `.ub`.
+
+Kind: refinement
+Witness: universal
+Assumes: S1
+Subject: execConstGuardedPairTransmute
+-/
+theorem s0_vs_s1_separation_over_validStructLayoutWorlds {α β : Type} {f₀ f₁ : FieldLayout}
+    (hAlign₀ : IsPow2 f₀.align) (hAlign₁ : IsPow2 f₁.align) (hNonZst : 0 < f₀.size + f₁.size)
+    {c₁ : FixedByteCodec α f₀.size} {c₂ : FixedByteCodec β f₁.size}
+    (h₁ : c₁.IsInitCodec) (h₂ : c₂.IsInitCodec) (x : α × β) :
+    (∃ p : SymbolicPairPad,
+      ValidStructLayoutWorld .rust none [f₀, f₁]
+        (p.toStructLayoutWorld f₀ f₁ (maxAlign 1 [f₀, f₁])) ∧
+      execConstGuardedPairTransmute p c₁ c₂ x = .compileTimeError ∧
+      ¬ TierSafetyPost .S0_fnVerified (p == SymbolicPairPad.canonical)
+          (execConstGuardedPairTransmute p c₁ c₂ x)) ∧
+    (∀ (repr : AdtRepr) (reprAlign : Option Nat) (w : StructLayoutWorld),
+      ValidStructLayoutWorld repr reprAlign [f₀, f₁] w →
+      ∃ p : SymbolicPairPad, p.toStructLayoutWorld f₀ f₁ w.align = w ∧
+        TierSafetyPost .S1_compileTimeGuard (p == SymbolicPairPad.canonical)
+          (execConstGuardedPairTransmute p c₁ c₂ x) ∧
+        execConstGuardedPairTransmute p c₁ c₂ x ≠ .ub) := by
+  refine ⟨?_, ?_⟩
+  · obtain ⟨hValid, _, k, hK⟩ := paddedPairWitness_valid_and_padded hAlign₀ hAlign₁ hNonZst
+    have hNe : (paddedPairWitness f₀ f₁).totalByteSize f₀.size f₁.size ≠ f₀.size + f₁.size := by
+      have := (paddedPairWitness f₀ f₁).totalByteSize_eq_sum_plus_totalPad f₀.size f₁.size
+      omega
+    have hCte : execConstGuardedPairTransmute (paddedPairWitness f₀ f₁) c₁ c₂ x =
+        .compileTimeError := by
+      unfold execConstGuardedPairTransmute evalConstGuard
+      rw [Anneal.ByteCodec.nat_beq_eq_false_of_ne hNe]
+    refine ⟨paddedPairWitness f₀ f₁, hValid, hCte, ?_⟩
+    intro ⟨_, hNoCte⟩
+    dsimp only [ForwardCompatTier.allowsCompileTimeError] at hNoCte
+    exact hNoCte hCte
+  · intro repr reprAlign w hValid
+    obtain ⟨p, hP⟩ := SymbolicPairPad.exists_of_validStructLayoutWorld hValid
+    have hPost := (s0_vs_s1_const_guarded_transmute_separation h₁ h₂ x).2 p
+    exact ⟨p, hP, hPost, hPost.1⟩
+
+/-! #### Section 2e2.5: `AdtLayoutSpec` + `deinitFieldSlot` / `evalDeinitPlace` Byte-Simulation Under Symbolic `adtPad` -/
+
+/--
+Construct an `AdtAndControl.ByteLayout` from any `StructLayoutWorld` (supporting arbitrary
+non-negative inter-field/trailing padding and arbitrary field memory-order permutations).
+-/
+def symbolicPadByteLayout (w : StructLayoutWorld) (children : List ByteLayout) : ByteLayout :=
+  .struct w.totalSize w.fieldOffsets children
+
+/--
+For **every** valid `StructLayoutWorld` `w` (across `AdtRepr.rust`, `AdtRepr.c`, and
+`AdtRepr.transparent`, including non-canonical padded or field-permuted `#[repr(Rust)]`
+worlds) and any well-formed child layouts `children` matching `fs`, `symbolicPadByteLayout w children`
+satisfies `ByteLayout.WF`.
+
+Kind: safety
+Witness: universal
+Assumes: S0
+Subject: symbolicPadByteLayout
+-/
+theorem symbolicPadByteLayout_wf {repr : AdtRepr} {reprAlign : Option Nat}
+    {fs : List FieldLayout} {w : StructLayoutWorld} {children : List ByteLayout}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (hCh : ChildrenFit fs children) :
+    (symbolicPadByteLayout w children).WF := by
+  refine ByteLayout.WF.struct w.totalSize w.fieldOffsets children
+    (hValid.offsets_len.trans hCh.length_eq.symm) ?_ ?_ hCh.wf
+  · intro i o l ho hl
+    have hi : i < fs.length := by
+      rw [← hValid.offsets_len]
+      exact (List.getElem?_eq_some_iff.mp ho).1
+    have hFl : fs[i]? = some fs[i] := List.getElem?_eq_getElem hi
+    rw [hCh.size_eq i l fs[i] hl hFl]
+    exact hValid.field_in_bounds i o fs[i] ho hFl
+  · intro i j oi oj li lj hNe hoi hoj hli hlj
+    have hi : i < fs.length := by
+      rw [← hValid.offsets_len]
+      exact (List.getElem?_eq_some_iff.mp hoi).1
+    have hj : j < fs.length := by
+      rw [← hValid.offsets_len]
+      exact (List.getElem?_eq_some_iff.mp hoj).1
+    have hfi : fs[i]? = some fs[i] := List.getElem?_eq_getElem hi
+    have hfj : fs[j]? = some fs[j] := List.getElem?_eq_getElem hj
+    rw [hCh.size_eq i li fs[i] hli hfi, hCh.size_eq j lj fs[j] hlj hfj]
+    exact hValid.fields_disjoint i j oi oj fs[i] fs[j] hNe hoi hoj hfi hfj
+
+/--
+**Symbolic-Padding Nested `Deinit` Byte-Simulation (`evalDeinitPlace_symbolicPad_bytes_simulation`)**:
+In **every** valid `StructLayoutWorld` `w` (for `#[repr(Rust)]` with arbitrary padding and
+field permutations, `#[repr(C)]`, or `#[repr(transparent)]`), deinitializing any nested
+`Field` / tag-preserving `Downcast` + `Field` place inside an initialized local corresponds
+to MiniRust's `deinitBytes img off len` on the symbolic `pathRange`, preserving all bytes
+outside `[off, off + len)` (including sibling fields and padding bytes).
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: evalDeinitPlace
+-/
+theorem evalDeinitPlace_symbolicPad_bytes_simulation
+    {ts : Bool} {slots slots' : List LocalSlotState}
+    {place : Place} {rootVal : Value}
+    {repr : AdtRepr} {reprAlign : Option Nat}
+    {fs : List FieldLayout} {w : StructLayoutWorld} {children : List ByteLayout}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (hCh : ChildrenFit fs children)
+    (enc : Value → List UInt8) (img : ByteImage)
+    (hRoot : slots[place.local_]? = some (.init rootVal))
+    (hDeinit : evalDeinitPlace ts slots place = some slots')
+    (hTag : ts = true ∨ noDowncast place.projection = true)
+    (hFits : w.totalSize ≤ img.length)
+    (hS : SlotBytes enc img (symbolicPadByteLayout w children) 0 (.init rootVal))
+    {off len : Nat}
+    (hRange : pathRange (symbolicPadByteLayout w children) 0 place.projection = some (off, len)) :
+    off + len ≤ w.totalSize ∧
+    ∃ st', slots'[place.local_]? = some st' ∧
+      SlotBytes enc (deinitBytes img off len) (symbolicPadByteLayout w children) 0
+        (slotStateToFieldSlot st') ∧
+      ∀ i, ¬ (off ≤ i ∧ i < off + len) → (deinitBytes img off len)[i]? = img[i]? := by
+  have hWF : (symbolicPadByteLayout w children).WF := symbolicPadByteLayout_wf hValid hCh
+  have hSub := pathRange_sub place.projection hWF hRange
+  dsimp only [symbolicPadByteLayout, ByteLayout.size] at hSub
+  refine ⟨by omega, ?_⟩
+  exact evalDeinitPlace_nested_bytes_simulation enc (symbolicPadByteLayout w children) img
+    hRoot hDeinit hTag hWF hFits hS hRange
+
+/--
+Single-step field specialization of `evalDeinitPlace_symbolicPad_bytes_simulation`:
+deinitializing field `f` in any valid `StructLayoutWorld` `w` uninitializes the exact
+symbolic byte window `[w.fieldOffsets[f], w.fieldOffsets[f] + fs[f].size)` while leaving
+all sibling fields and padding bytes untouched.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: evalDeinitPlace
+-/
+theorem evalDeinitPlace_symbolicPad_singleField_bytes_simulation
+    {ts : Bool} {slots slots' : List LocalSlotState}
+    {loc : Local} {vals : List Value} {f : Nat} {ty : Ty}
+    {repr : AdtRepr} {reprAlign : Option Nat}
+    {fs : List FieldLayout} {w : StructLayoutWorld} {children : List ByteLayout}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (hCh : ChildrenFit fs children)
+    (enc : Value → List UInt8) (img : ByteImage)
+    (hRoot : slots[loc]? = some (.init (.aggregate 0 vals)))
+    (hDeinit : evalDeinitPlace ts slots ⟨loc, [.field f ty]⟩ = some slots')
+    (hFits : w.totalSize ≤ img.length)
+    (hS : SlotBytes enc img (symbolicPadByteLayout w children) 0 (.init (.aggregate 0 vals)))
+    {off : Nat} {fl : FieldLayout} {childLay : ByteLayout}
+    (hOff : w.fieldOffsets[f]? = some off)
+    (hFl : fs[f]? = some fl)
+    (hChild : children[f]? = some childLay) :
+    off + fl.size ≤ w.totalSize ∧
+    fl.align ∣ off ∧
+    ∃ st', slots'[loc]? = some st' ∧
+      SlotBytes enc (deinitBytes img off fl.size) (symbolicPadByteLayout w children) 0
+        (slotStateToFieldSlot st') ∧
+      ∀ i, ¬ (off ≤ i ∧ i < off + fl.size) → (deinitBytes img off fl.size)[i]? = img[i]? := by
+  have hSzEq : childLay.size = fl.size := hCh.size_eq f childLay fl hChild hFl
+  have hRange : pathRange (symbolicPadByteLayout w children) 0 [.field f ty] = some (off, fl.size) := by
+    simp [symbolicPadByteLayout, pathRange, hOff, hChild, hSzEq]
+  have ⟨hBound, hSim⟩ := evalDeinitPlace_symbolicPad_bytes_simulation
+    hValid hCh enc img hRoot hDeinit (Or.inr rfl) hFits hS hRange
+  exact ⟨hBound, hValid.field_aligned f off fl hOff hFl, hSim⟩
+
+/--
+**Disjoint-Sibling Byte Preservation**: deinitializing field `f` in any valid layout world (any
+padding, any memory order) leaves every byte of every sibling field `j ≠ f` unchanged, because
+valid worlds place distinct fields in disjoint byte windows.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: deinitBytes
+-/
+theorem evalDeinitPlace_symbolicPad_sibling_bytes_preserved
+    {ts : Bool} {slots slots' : List LocalSlotState}
+    {loc : Local} {vals : List Value} {f : Nat} {ty : Ty}
+    {repr : AdtRepr} {reprAlign : Option Nat}
+    {fs : List FieldLayout} {w : StructLayoutWorld} {children : List ByteLayout}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (hCh : ChildrenFit fs children)
+    (enc : Value → List UInt8) (img : ByteImage)
+    (hRoot : slots[loc]? = some (.init (.aggregate 0 vals)))
+    (hDeinit : evalDeinitPlace ts slots ⟨loc, [.field f ty]⟩ = some slots')
+    (hFits : w.totalSize ≤ img.length)
+    (hS : SlotBytes enc img (symbolicPadByteLayout w children) 0 (.init (.aggregate 0 vals)))
+    {off : Nat} {fl : FieldLayout} {childLay : ByteLayout}
+    (hOff : w.fieldOffsets[f]? = some off)
+    (hFl : fs[f]? = some fl)
+    (hChild : children[f]? = some childLay)
+    {j oj : Nat} {fj : FieldLayout} (hNe : j ≠ f)
+    (hOj : w.fieldOffsets[j]? = some oj) (hFj : fs[j]? = some fj) :
+    ∀ i, oj ≤ i → i < oj + fj.size → (deinitBytes img off fl.size)[i]? = img[i]? := by
+  obtain ⟨_, _, _, _, _, hOut⟩ := evalDeinitPlace_symbolicPad_singleField_bytes_simulation
+    hValid hCh enc img hRoot hDeinit hFits hS hOff hFl hChild
+  intro i hLo hHi
+  have hDisj := hValid.fields_disjoint j f oj off fj fl hNe hOj hOff hFj hFl
+  exact hOut i (fun ⟨h1, h2⟩ => by omega)
+
 
 /-! ### Section 2f: `Retag` -/
 
@@ -16033,18 +19484,18 @@ def witnessPtr : ProvenancePtr := { allocId := 1, offsetBytes := 0x1004 }
 def witnessSlots : List LocalSlotState :=
   [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]), .init (.ptr witnessPtr 8)]
 
-/-- **Witness: the synthetic sub-place borrow `&raw _0.1`** is the pointer `0x1004` (`_0`'s base
+/-- **Concrete witness: the synthetic sub-place borrow `&raw _0.1`** is the pointer `0x1004` (`_0`'s base
 `0x1000` plus `_0.1`'s offset `4`) with provenance `1`. -/
 theorem witness_borrow :
     evalSubplaceRef witnessCtx witnessSlots 0 [.field 1 witnessU32] 0 = .ok ⟨0x1004, some (1, 0)⟩ := by
   with_unfolding_all rfl
 
-/-- **Witness: `*_1` reads `9`** (the value of `_0.1`). -/
+/-- **Concrete witness: `*_1` reads `9`** (the value of `_0.1`). -/
 theorem witness_deref_read :
     evalDerefPlaceRead witnessCtx witnessSlots ⟨1, [.deref]⟩ = .ok (.scalar ⟨9, 4⟩) := by
   with_unfolding_all rfl
 
-/-- **Witness: `*_1 = 5` writes only `_0.1`**, and reading `*_1` back yields `5`. -/
+/-- **Concrete witness: `*_1 = 5` writes only `_0.1`**, and reading `*_1` back yields `5`. -/
 theorem witness_deref_write_put_get :
     evalDerefPlaceWrite (fun _ _ _ => none) (fun _ => witnessU32) witnessCtx witnessSlots
         ⟨1, [.deref]⟩ (.scalar ⟨5, 4⟩) =
@@ -16054,7 +19505,7 @@ theorem witness_deref_write_put_get :
         ⟨1, [.deref]⟩ = .ok (.scalar ⟨5, 4⟩) := by
   constructor <;> with_unfolding_all rfl
 
-/-- **Witness: collision-free bases** — `_1`'s synthetic allocation starts at `0x2000`, past
+/-- **Concrete witness: collision-free bases** — `_1`'s synthetic allocation starts at `0x2000`, past
 `_0`'s `[0x1000, 0x1008)`. -/
 theorem witness_bases :
     localBaseAddr witnessCtx.allocs 0 witnessCtx.limit = some 0x1000 ∧
@@ -16130,7 +19581,7 @@ theorem witnessCtx_wf : witnessCtx.WF := by
           by simp [witnessCtx], by with_unfolding_all rfl, by simp [witnessCtx], rfl⟩
       · simp [witnessCtx, hA, hB] at hq
 
-/-- **Witness: no-guess resolution through the general round-trip theorem**: dereferencing the
+/-- **Concrete witness: no-guess resolution through the general round-trip theorem**: dereferencing the
 borrowed pointer `0x1004` (pointee `u32`) resolves to exactly `_0.1`, in both modes — an instance
 of `resolveSyntheticSubplace_evalSubplaceRef` whose hypotheses all hold in the witness frame. -/
 theorem witness_resolve (ow : Bool) :
@@ -16167,7 +19618,7 @@ def witnessEntry : BorrowEntry :=
 
 theorem witnessCtxT_wf : witnessCtxT.WF := ⟨witnessCtx_wf.layout, witnessCtx_wf.candidates⟩
 
-/-- **Witness: Anneal resolves Trusted's pointer to Trusted's borrow target
+/-- **Concrete witness: Anneal resolves Trusted's pointer to Trusted's borrow target
 (`witness_trusted_resolve`)**: under `witnessCtxT`, the no-guess resolution of Trusted's pointer
 value `witnessPtrT` (pointee `u32`) is exactly the sub-place `_0.1` named by Trusted's borrow entry
 `witnessEntry` — an instance of `resolveSyntheticSubplace_evalSubplaceRef`. -/
@@ -16263,7 +19714,7 @@ theorem witness_trusted_deref_read_typed :
 def witnessTagFp (t : Nat) : Nat :=
   if t = 1 then 1 else 2
 
-/-- **Witness: type-fingerprinted tag disambiguates same-offset candidates in read mode
+/-- **Concrete witness: type-fingerprinted tag disambiguates same-offset candidates in read mode
 (`witness_tag_disambiguates_read`)** and **in whole-union-field write mode
 (`witness_tag_disambiguates_union_write`)**, while a **cast-pointer fingerprint mismatch rejects
 the ambiguous offset (`witness_tag_cast_mismatch_rejects`)**. -/
@@ -16283,7 +19734,7 @@ theorem witness_tag_disambiguates_and_rejects_mismatch :
       none := by
   refine ⟨by decide, by decide, by decide, ?_, ?_, ?_⟩ <;> with_unfolding_all rfl
 
-/-- **Witness: `count = 2` array-window `CopyNonOverlapping` (`witness_window_copy`)**: copying the
+/-- **Concrete witness: `count = 2` array-window `CopyNonOverlapping` (`witness_window_copy`)**: copying the
 2-element window `_0[1..3]` (`[20, 30]`) of `_0 : [u32; 4] = [10, 20, 30, 40]` into `_1[0..2]` of
 `_1 : [u32; 4] = [1, 2, 3, 4]` produces `_1 = [20, 30, 3, 4]`. -/
 theorem witness_window_copy :
