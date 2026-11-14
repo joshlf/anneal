@@ -935,12 +935,14 @@ where
     // Bounded wait: a holder that never releases (a hung `miri setup` started
     // by an older launcher, or a stuck operator `flock`) must not wedge every
     // later difftest run. The lock is released when `lock_file` is dropped.
-    let deadline = Instant::now() + lock_wait;
+    // Compare `started.elapsed() >= lock_wait` rather than `Instant::now() + lock_wait`
+    // so arbitrarily large `Duration`s never panic on `Instant` addition overflow.
+    let started = Instant::now();
     loop {
         match lock_file.try_lock() {
             Ok(()) => break,
             Err(fs::TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
+                if started.elapsed() >= lock_wait {
                     return Err(format!(
                         "timed out after {}s waiting for the Miri sysroot setup lock {} \
                          (held by another `miri setup`); missing Miri sysroot is a hard error",
@@ -979,7 +981,13 @@ where
     Ok(candidate.to_path_buf())
 }
 
-/// Parse a positive whole number of seconds from `key`, or `default` when unset.
+/// Upper bound (`1 year` in seconds) for `ANNEAL_MIRI_SETUP_TIMEOUT_SECS` and
+/// `ANNEAL_MIRI_SETUP_LOCK_TIMEOUT_SECS`, matching `run_capsule_diff_test.sh`
+/// and preventing `Instant` / `flock -w` overflow on pathological inputs.
+const MAX_MIRI_SETUP_TIMEOUT_SECS: u64 = 31_536_000;
+
+/// Parse a positive whole number of seconds (`1..=MAX_MIRI_SETUP_TIMEOUT_SECS`)
+/// from `key`, or `default` when unset.
 fn positive_secs_env(
     get_env: EnvLookup<'_>,
     key: &str,
@@ -994,9 +1002,11 @@ fn positive_secs_env(
         return Ok(default);
     }
     match text.trim().parse::<u64>() {
-        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        Ok(secs) if (1..=MAX_MIRI_SETUP_TIMEOUT_SECS).contains(&secs) => {
+            Ok(Duration::from_secs(secs))
+        }
         _ => Err(format!(
-            "{key} must be a positive whole number of seconds, got {text:?}"
+            "{key} must be a positive whole number of seconds (at most {MAX_MIRI_SETUP_TIMEOUT_SECS}), got {text:?}"
         )),
     }
 }
@@ -1100,8 +1110,10 @@ enum TimedOutput {
     TimedOut { stdout: Vec<u8>, stderr: Vec<u8> },
 }
 
-/// Run `cmd` with stdin closed and stdout/stderr captured, killing it once
-/// `timeout` elapses.
+/// Run `cmd` in its own process group with stdin closed and stdout/stderr
+/// captured, killing the entire process group once `timeout` elapses so
+/// grandchildren (`cargo-miri`, `cargo build`, `rustc`) cannot outlive the
+/// `.setup.lock` guard or keep stdout/stderr pipes open.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<TimedOutput> {
     use std::io::Read;
     use std::process::Stdio;
@@ -1110,7 +1122,26 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Time
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = spawn_retrying_text_file_busy(&mut cmd)?;
+    fn kill_child_and_group(child: &mut std::process::Child) {
+        #[cfg(unix)]
+        {
+            let pgid = child.id();
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", "--", &format!("-{pgid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
         match pipe {
@@ -1130,26 +1161,21 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Time
     let stdout_rx = drain(child.stdout.take());
     let stderr_rx = drain(child.stderr.take());
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Ok(None) if started.elapsed() >= timeout => {
+                kill_child_and_group(&mut child);
                 break None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
             Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_child_and_group(&mut child);
                 return Err(err);
             }
         }
     };
-    // Grandchildren (e.g. the sysroot `cargo build` that `cargo-miri` spawns)
-    // may outlive a killed `cargo-miri` while holding the pipes open; bound the
-    // wait for the remaining output instead of blocking on them.
     let grace = Duration::from_secs(5);
     let stdout = stdout_rx.recv_timeout(grace).unwrap_or_default();
     let stderr = stderr_rx.recv_timeout(grace).unwrap_or_default();
@@ -2720,10 +2746,16 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     fn hung_miri_setup_is_killed_at_the_timeout_and_fails_closed() {
         let temp = unique_oracle_temp_dir("sysroot-setup-timeout");
         let hung_cargo = temp.join("mock-hung-cargo");
-        // `exec` so the killed child is the sleeper itself and the pipes close.
+        let grandchild_pid_file = temp.join("grandchild.pid");
+        // Spawn a non-`exec` child sleeper (modeling `cargo` -> `cargo-miri` ->
+        // `rustc`) to verify that process-group termination kills descendants
+        // and closes stdout/stderr pipes immediately without a 5s+5s grace stall.
         write_executable_script(
             &hung_cargo,
-            "#!/bin/sh\necho 'compiling core...' >&2\nexec sleep 60\n",
+            &format!(
+                "#!/bin/sh\necho 'compiling core...' >&2\nsleep 60 &\nprintf '%s\\n' \"$!\" > \"{}\"\nwait\n",
+                grandchild_pid_file.display()
+            ),
         );
         let home = temp.join("home");
         let get_env = env_map(&[
@@ -2738,8 +2770,22 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         .expect_err("a hung miri setup must fail closed");
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(30),
-            "timeout must kill the hung setup promptly, took {elapsed:?}"
+            elapsed < Duration::from_secs(5),
+            "process-group kill must terminate hung setup and grandchildren without pipe-drain stall, took {elapsed:?}"
+        );
+        let grandchild_pid = fs::read_to_string(&grandchild_pid_file)
+            .expect("grandchild pid recorded")
+            .trim()
+            .to_string();
+        let grandchild_alive = Command::new("kill")
+            .args(["-s", "0", &grandchild_pid])
+            .stdout( std::process::Stdio::null() )
+            .stderr( std::process::Stdio::null() )
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(
+            !grandchild_alive,
+            "grandchild process {grandchild_pid} must be killed when miri setup times out"
         );
         assert!(
             err.contains("timed out after 1s")
@@ -2778,7 +2824,16 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
                 Ok(default)
             );
         }
-        for bad in ["0", "-5", "abc", "1.5", "18446744073709551616"] {
+        for bad in [
+            "0",
+            "-5",
+            "abc",
+            "1.5",
+            "31536001",
+            "9223372036854775807",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
             let err = miri_setup_timeout(&env_map(&[(MIRI_SETUP_TIMEOUT_ENV, OsStr::new(bad))]))
                 .expect_err("invalid timeout must be rejected");
             assert!(
