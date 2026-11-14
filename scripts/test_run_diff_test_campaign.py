@@ -8817,5 +8817,106 @@ class PassEp2B4AdversarialRegressionTest(unittest.TestCase):
                 self.assertIn("bool_valid_range", rendered)
 
 
+class _HostileValue:
+    """An evaluator-supplied object whose comparisons, truthiness, `str`, and
+    `repr` all raise."""
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("eq")
+
+    def __ne__(self, other: object) -> bool:
+        raise RuntimeError("ne")
+
+    def __bool__(self) -> bool:
+        raise RuntimeError("bool")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr")
+
+    __hash__ = object.__hash__
+
+
+class PassEp2A4AdversarialRegressionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_json_safe_is_total(self) -> None:
+        deep: list[Any] = []
+        cursor = deep
+        for _ in range(5000):
+            inner: list[Any] = []
+            cursor.append(inner)
+            cursor = inner
+        for name, value in (
+            ("huge_int_key", {10**5000: 1}),
+            ("hostile_value", _HostileValue()),
+            ("hostile_key", {_HostileValue(): 1}),
+            ("deep_nesting", deep),
+            ("mixed_keys", {(1, "a"): 2, None: 3, True: 4, 1.5: 5, 7: 6}),
+        ):
+            with self.subTest(case=name):
+                safe = campaign._json_safe(value)
+                self.assertEqual(campaign._strict_json_loads(json.dumps(safe)), safe)
+        self.assertEqual(
+            campaign._json_safe({(1, "a"): 2, None: 3, True: 4, 1.5: 5, 7: 6}),
+            {'[1, "a"]': 2, "null": 3, "true": 4, "1.5": 5, "7": 6},
+        )
+        self.assertEqual(campaign._json_safe(_HostileValue()), "<unrepresentable _HostileValue>")
+        nested = campaign._json_safe(deep)
+        for _ in range(campaign._JSON_SAFE_MAX_DEPTH):
+            self.assertIsInstance(nested, list)
+            nested = nested[0]
+        self.assertEqual(nested, "<list nested too deep>")
+
+    def test_hostile_or_unserializable_evaluator_results_never_crash_the_gate(self) -> None:
+        # B4 still crashed `run_semantic_mutant_self_check` itself (outside the
+        # evaluator's `try`) on a huge-int dict key (`str(10**5000)` raises), on an
+        # object whose `__repr__` raises, on 5000-deep nesting, and on objects whose
+        # comparisons or truthiness raise in the post-evaluation checks
+        # (`baseline_verdict`, `survived_variants`, ...).
+        mutant = next(
+            m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "bool_valid_range"
+        )
+        deep: list[Any] = []
+        cursor = deep
+        for _ in range(5000):
+            inner: list[Any] = []
+            cursor.append(inner)
+            cursor = inner
+        for name, extra, passed in (
+            ("huge_int_key_detail", {"detail": {10**5000: 1}}, True),
+            ("hostile_detail", {"detail": _HostileValue()}, True),
+            ("deep_detail", {"detail": deep}, True),
+            ("hostile_baseline_verdict", {"baseline_verdict": _HostileValue()}, False),
+            ("hostile_survived_variants", {"survived_variants": _HostileValue()}, False),
+            ("hostile_variants", {"variants": [_HostileValue()]}, False),
+            ("hostile_kill_class", {"kill_class": _HostileValue()}, False),
+            ("hostile_polarity", {"witness_polarity": _HostileValue()}, False),
+            ("huge_exit_code", {"exit_code": 10**5000}, False),
+        ):
+            with self.subTest(case=name):
+                report = campaign.run_semantic_mutant_self_check(
+                    evaluator=lambda m, extra=extra: {
+                        "killed": True,
+                        "kill_class": "missed_ub",
+                        "witness_polarity": UNSOUND,
+                        **extra,
+                    },
+                    mutants=[mutant],
+                )
+                self.assertEqual(report["passed"], passed, report["results"])
+                self.assertEqual(
+                    campaign._strict_json_loads(json.dumps(report)), report
+                )
+                campaign.render_gate_report_sections(report, None)
+                campaign.gate_junit_cases(report, None)
+        # Defense in depth: if the copy itself ever raised, the mutant survives.
+        with mock.patch.object(campaign, "_json_safe", side_effect=RecursionError("deep")):
+            report = campaign.run_semantic_mutant_self_check(mutants=[mutant])
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["results"][0]["kill_class"], "evaluator_error")
+        self.assertIn("RecursionError", report["results"][0]["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5652,12 +5652,35 @@ def _reported_variant_problems(
     }
 
 
-def _json_safe(value: Any, _seen: set[int] | None = None) -> Any:
+_JSON_SAFE_MAX_DEPTH = 64
+
+
+def _safe_repr(value: Any) -> str:
+    """`repr(value)`, or a placeholder when that `repr` raises (or is unprintable)."""
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - an evaluator object's `__repr__` may raise
+        return f"<unrepresentable {type(value).__name__}>"
+    return text if isinstance(text, str) else f"<unrepresentable {type(value).__name__}>"
+
+
+def _safe_str(value: Any) -> str:
+    """`str(value)`, falling back to `_safe_repr` when that `str` raises."""
+    try:
+        text = str(value)
+    except Exception:  # noqa: BLE001 - an evaluator exception's `__str__` may raise
+        return _safe_repr(value)
+    return text if isinstance(text, str) else _safe_repr(value)
+
+
+def _json_safe(value: Any, _seen: set[int] | None = None, _depth: int = 0) -> Any:
     """A strict-JSON copy of a semantic-mutant result: tuples become lists, keys
     become strings, and anything else that JSON cannot carry (sets, objects,
-    non-finite floats, >256-bit integers, cyclic containers) becomes a safe string
-    representation, so a custom evaluator's passed-through values can never crash
-    the summary JSON, Markdown, or JUnit rendering."""
+    non-finite floats, >256-bit integers, cyclic or more than
+    `_JSON_SAFE_MAX_DEPTH`-deep containers) becomes a safe string representation, so
+    a custom evaluator's passed-through values can never crash the summary JSON,
+    Markdown, or JUnit rendering. Total: it never raises, even for a key that
+    cannot be stringified or an object whose `__repr__` raises."""
     if value is None or isinstance(value, (bool, str)):
         return value
     if isinstance(value, int):
@@ -5667,21 +5690,24 @@ def _json_safe(value: Any, _seen: set[int] | None = None) -> Any:
             else f"<int bit_length={value.bit_length()}>"
         )
     if isinstance(value, float):
-        return value if value == value and abs(value) != float("inf") else repr(value)
-    seen = set() if _seen is None else _seen
-    if isinstance(value, dict):
+        return value if value == value and abs(value) != float("inf") else _safe_repr(value)
+    if isinstance(value, (dict, list, tuple)):
+        if _depth >= _JSON_SAFE_MAX_DEPTH:
+            return f"<{type(value).__name__} nested too deep>"
+        seen = set() if _seen is None else _seen
         obj_id = id(value)
         if obj_id in seen:
-            return "<cyclic dict>"
+            return f"<cyclic {type(value).__name__}>"
         next_seen = seen | {obj_id}
-        return {str(k): _json_safe(v, next_seen) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        obj_id = id(value)
-        if obj_id in seen:
-            return "<cyclic list>"
-        next_seen = seen | {obj_id}
-        return [_json_safe(v, next_seen) for v in value]
-    return repr(value)
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for k, v in value.items():
+                safe_key = k if isinstance(k, str) else _json_safe(k, next_seen, _depth + 1)
+                key_text = safe_key if isinstance(safe_key, str) else json.dumps(safe_key)
+                out[key_text] = _json_safe(v, next_seen, _depth + 1)
+            return out
+        return [_json_safe(v, next_seen, _depth + 1) for v in value]
+    return _safe_repr(value)
 
 
 def run_semantic_mutant_self_check(
@@ -5751,6 +5777,12 @@ def run_semantic_mutant_self_check(
                 outcome = _normalize_evaluator_result(
                     mutant_id, expected_classes, evaluator(mutant)
                 )
+            # Every check below runs on a strict-JSON copy, so no evaluator-supplied
+            # object (a raising `__eq__` / `__bool__` / `__repr__`, a cycle, a huge
+            # int) can crash or sway them.
+            outcome = _json_safe(outcome)
+            if not isinstance(outcome, dict) or not isinstance(outcome.get("killed"), bool):
+                raise ValueError("result is not a JSON object with a boolean 'killed'")
         except Exception as e:  # noqa: BLE001 - fail closed on any evaluation crash
             outcome = {
                 "id": mutant_id,
@@ -5758,7 +5790,7 @@ def run_semantic_mutant_self_check(
                 "kill_class": "evaluator_error",
                 "exit_code": EXIT_INTERNAL_ERROR,
                 "witness_polarity": None,
-                "detail": f"{type(e).__name__}: {e}",
+                "detail": f"{type(e).__name__}: {_safe_str(e)}",
             }
 
         if outcome["killed"] and (
@@ -5896,8 +5928,21 @@ def run_semantic_mutant_self_check(
                 outcome["killed"] = False
 
         # The result lands in `LATEST_CAMPAIGN_SUMMARY.json`, the Markdown report, and
-        # JUnit: a custom evaluator's passed-through values must not crash them.
-        outcome = _json_safe(outcome)
+        # JUnit: a custom evaluator's passed-through values must not crash them, and
+        # a result that cannot even be copied safely is a survivor, never a crash.
+        try:
+            outcome = _json_safe(outcome)
+            if not isinstance(outcome, dict) or not isinstance(outcome.get("killed"), bool):
+                raise ValueError("result is not a JSON object with a boolean 'killed'")
+        except Exception as e:  # noqa: BLE001 - fail closed on an unserializable result
+            outcome = {
+                "id": mutant_id,
+                "killed": False,
+                "kill_class": "evaluator_error",
+                "exit_code": EXIT_INTERNAL_ERROR,
+                "witness_polarity": None,
+                "detail": f"unserializable evaluator result: {type(e).__name__}",
+            }
         per_mutant_results.append(outcome)
         if outcome["killed"]:
             killed_mutants.append(mutant_id)
