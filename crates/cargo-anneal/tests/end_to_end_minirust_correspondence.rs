@@ -1399,25 +1399,26 @@ end MutationBreakageCheck
         &format!("{mutated_ops}\n{proof_assertions}"),
     );
 
-    let ops_olean = root.join(
-        ".lake/build/lib/lean/MiniRust/Snapshots/S2026_05_Matched/Generated/Ops.olean",
+    // Both check files inline an emitted `Ops.lean`, whose only import is
+    // `MiniRust.LibSpecr` from the root `lean_lib MiniRust`. Always (re)build
+    // it: `lake env lean` never rebuilds imports, so a missing or stale
+    // `.olean` would make the verdicts below meaningless. A no-op when fresh.
+    let build_out = Command::new("lake")
+        .current_dir(&root)
+        .args(["build", "MiniRust.LibSpecr"])
+        .output()
+        .expect("failed to invoke `lake build MiniRust.LibSpecr`");
+    assert!(
+        build_out.status.success(),
+        "`lake build MiniRust.LibSpecr` must succeed, stderr:\n{}\nstdout:\n{}",
+        String::from_utf8_lossy(&build_out.stderr),
+        String::from_utf8_lossy(&build_out.stdout)
     );
-    if !ops_olean.is_file() {
-        let build_out = Command::new("lake")
-            .current_dir(&root)
-            .args([
-                "build",
-                "MiniRust.Snapshots.S2026_05_Matched.Generated.Ops",
-            ])
-            .output()
-            .expect("failed to invoke `lake build MiniRust.Snapshots.S2026_05_Matched.Generated.Ops`");
-        assert!(
-            build_out.status.success(),
-            "`lake build MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` must succeed, stderr:\n{}\nstdout:\n{}",
-            String::from_utf8_lossy(&build_out.stderr),
-            String::from_utf8_lossy(&build_out.stdout)
-        );
-    }
+    assert!(
+        unmutated_ops.contains("import MiniRust.LibSpecr")
+            && mutated_ops.contains("import MiniRust.LibSpecr"),
+        "emitted Ops.lean must import MiniRust.LibSpecr (the module built above)"
+    );
 
     let unmutated_lean_out = Command::new("lake")
         .current_dir(&root)

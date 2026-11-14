@@ -15,10 +15,11 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anneal_rustc_capture::{ANNEAL_CAPTURE_DIR_ENV, CapturedItemKind, UnitTargetRecord};
 
@@ -37,6 +38,21 @@ pub const ALLOW_MISSING_MIRI_ENV: &str = "ANNEAL_ALLOW_MISSING_MIRI";
 /// [`ensure_miri_sysroot_initialized`] when running
 /// `cargo +nightly-2026-06-01 miri setup`.
 pub const MIRI_SETUP_BIN_ENV: &str = "ANNEAL_MIRI_SETUP_BIN";
+
+/// Environment variable bounding, in whole seconds, how long
+/// [`ensure_miri_sysroot_initialized`] lets `cargo miri setup` run before it is
+/// killed and provisioning fails closed (default
+/// [`DEFAULT_MIRI_SETUP_TIMEOUT_SECS`]).
+pub const MIRI_SETUP_TIMEOUT_ENV: &str = "ANNEAL_MIRI_SETUP_TIMEOUT_SECS";
+
+/// Default `cargo miri setup` timeout in seconds (a cold `std` sysroot check
+/// build normally takes a few minutes).
+pub const DEFAULT_MIRI_SETUP_TIMEOUT_SECS: u64 = 1800;
+
+/// Environment variable bounding, in whole seconds, how long
+/// [`ensure_miri_sysroot_initialized`] waits for `<sysroot>/.setup.lock` while
+/// another `miri setup` holds it (default: the setup timeout plus 60 seconds).
+pub const MIRI_SETUP_LOCK_TIMEOUT_ENV: &str = "ANNEAL_MIRI_SETUP_LOCK_TIMEOUT_SECS";
 
 /// Default fuel bound per item when evaluating `evalMirDiffTagBounded` and
 /// `probeMirDiffExecBounded`.
@@ -664,7 +680,11 @@ impl MiriToolchain {
 }
 
 fn find_executable_in_path(tool_name: &str) -> Option<PathBuf> {
-    let path_var = env::var_os("ANNEAL_CALLER_PATH").or_else(|| env::var_os("PATH"))?;
+    find_executable_in_path_with(&process_env_var, tool_name)
+}
+
+fn find_executable_in_path_with(get_env: EnvLookup<'_>, tool_name: &str) -> Option<PathBuf> {
+    let path_var = get_env("ANNEAL_CALLER_PATH").or_else(|| get_env("PATH"))?;
     for dir in env::split_paths(&path_var) {
         let candidate = dir.join(tool_name);
         if candidate.is_file() {
@@ -755,6 +775,49 @@ fn resolve_tool_path(
 }
 
 fn resolve_sysroot_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    resolve_sysroot_path_with(explicit, &process_env_var, ensure_miri_sysroot_initialized)
+}
+
+/// Environment lookup injected into the Miri sysroot resolver.
+///
+/// Production code passes [`process_env_var`]. Unit tests pass a fixed map
+/// instead of calling `env::set_var`: mutating the process environment races
+/// every concurrently running test in the same binary that reads `HOME` or
+/// `PATH` or spawns an `elan`/`rustup` proxy (which locate their toolchains
+/// through `HOME`).
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+fn process_env_var(key: &str) -> Option<OsString> {
+    env::var_os(key)
+}
+
+/// `key` as a trimmed, non-empty UTF-8 string, matching the
+/// `env::var(key)` + `trim()` handling of the other `ANNEAL_*` overrides
+/// (non-UTF-8 or blank values count as unset).
+fn non_empty_env_str(get_env: EnvLookup<'_>, key: &str) -> Option<String> {
+    let raw = get_env(key)?.into_string().ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// [`resolve_sysroot_path`] with an injected environment and default-path
+/// provisioner.
+///
+/// A caller-supplied sysroot (`explicit`, then `ANNEAL_MIRI_SYSROOT`) must
+/// already contain `lib/rustlib`: it is never created, locked, or provisioned.
+/// Only the default `${HOME}/.cache/miri` is handed to `provision_default`.
+fn resolve_sysroot_path_with<P>(
+    explicit: Option<&Path>,
+    get_env: EnvLookup<'_>,
+    provision_default: P,
+) -> Result<PathBuf, String>
+where
+    P: FnOnce(&Path) -> Result<PathBuf, String>,
+{
     if let Some(path) = explicit {
         if path.join("lib/rustlib").is_dir() {
             return Ok(path.to_path_buf());
@@ -764,10 +827,8 @@ fn resolve_sysroot_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    if let Ok(val) = env::var("ANNEAL_MIRI_SYSROOT")
-        && !val.trim().is_empty()
-    {
-        let p = PathBuf::from(val.trim());
+    if let Some(val) = non_empty_env_str(get_env, "ANNEAL_MIRI_SYSROOT") {
+        let p = PathBuf::from(val);
         if p.join("lib/rustlib").is_dir() {
             return Ok(p);
         }
@@ -776,11 +837,8 @@ fn resolve_sysroot_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             p.display()
         ));
     }
-    if let Ok(home) = env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        let candidate = PathBuf::from(home.trim()).join(".cache/miri");
-        return ensure_miri_sysroot_initialized(&candidate);
+    if let Some(home) = non_empty_env_str(get_env, "HOME") {
+        return provision_default(&PathBuf::from(home).join(".cache/miri"));
     }
     Err(
         "Miri sysroot not found at ~/.cache/miri (or ANNEAL_MIRI_SYSROOT); \
@@ -789,21 +847,63 @@ fn resolve_sysroot_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
     )
 }
 
+/// Toolchain argument passed to a `rustup` proxy `cargo` for `miri setup`.
+const MIRI_SETUP_TOOLCHAIN_ARG: &str = "+nightly-2026-06-01";
+
 /// Ensure the Miri sysroot directory at `candidate` contains `lib/rustlib`,
 /// auto-provisioning it via `cargo +nightly-2026-06-01 miri setup` under an
 /// exclusive advisory lock (`<candidate>/.setup.lock`) when absent.
 ///
-/// Fails closed if `miri setup` exits non-zero or leaves `lib/rustlib` absent.
+/// Fails closed if `miri setup` cannot be started, exits non-zero, exceeds
+/// [`MIRI_SETUP_TIMEOUT_ENV`] seconds (default
+/// [`DEFAULT_MIRI_SETUP_TIMEOUT_SECS`]), or leaves `lib/rustlib` absent, and
+/// if the lock cannot be acquired within [`MIRI_SETUP_LOCK_TIMEOUT_ENV`]
+/// seconds (default: setup timeout + 60).
 pub fn ensure_miri_sysroot_initialized(candidate: &Path) -> Result<PathBuf, String> {
-    ensure_miri_sysroot_initialized_with(candidate, run_default_miri_setup)
+    ensure_miri_sysroot_initialized_from_env(candidate, &process_env_var)
+}
+
+fn ensure_miri_sysroot_initialized_from_env(
+    candidate: &Path,
+    get_env: EnvLookup<'_>,
+) -> Result<PathBuf, String> {
+    // Fast path first, so a populated sysroot never depends on the setup knobs.
+    if candidate.join("lib/rustlib").is_dir() {
+        return Ok(candidate.to_path_buf());
+    }
+    let setup_timeout = miri_setup_timeout(get_env)?;
+    let lock_wait = miri_setup_lock_wait(get_env, setup_timeout)?;
+    ensure_miri_sysroot_initialized_bounded(candidate, lock_wait, |dir| {
+        run_miri_setup(dir, get_env, setup_timeout)
+    })
 }
 
 /// Test-friendly variant of [`ensure_miri_sysroot_initialized`] that invokes
 /// `setup_fn(candidate)` under `<candidate>/.setup.lock` when
 /// `<candidate>/lib/rustlib` is absent and verifies `<candidate>/lib/rustlib`
-/// exists afterwards.
+/// exists afterwards. Waits at most the default lock timeout
+/// ([`DEFAULT_MIRI_SETUP_TIMEOUT_SECS`] + 60 seconds) for the lock.
 pub fn ensure_miri_sysroot_initialized_with<F>(
     candidate: &Path,
+    setup_fn: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    ensure_miri_sysroot_initialized_bounded(
+        candidate,
+        default_lock_wait(Duration::from_secs(DEFAULT_MIRI_SETUP_TIMEOUT_SECS)),
+        setup_fn,
+    )
+}
+
+fn default_lock_wait(setup_timeout: Duration) -> Duration {
+    setup_timeout.saturating_add(Duration::from_secs(60))
+}
+
+fn ensure_miri_sysroot_initialized_bounded<F>(
+    candidate: &Path,
+    lock_wait: Duration,
     setup_fn: F,
 ) -> Result<PathBuf, String>
 where
@@ -832,12 +932,32 @@ where
                 lock_path.display()
             )
         })?;
-    lock_file.lock().map_err(|err| {
-        format!(
-            "failed to acquire advisory lock on {}: {err}",
-            lock_path.display()
-        )
-    })?;
+    // Bounded wait: a holder that never releases (a hung `miri setup` started
+    // by an older launcher, or a stuck operator `flock`) must not wedge every
+    // later difftest run. The lock is released when `lock_file` is dropped.
+    let deadline = Instant::now() + lock_wait;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out after {}s waiting for the Miri sysroot setup lock {} \
+                         (held by another `miri setup`); missing Miri sysroot is a hard error",
+                        lock_wait.as_secs(),
+                        lock_path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(format!(
+                    "failed to acquire advisory lock on {}: {err}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
 
     // Re-check after acquiring the exclusive lock in case another process
     // finished provisioning while we waited.
@@ -859,94 +979,279 @@ where
     Ok(candidate.to_path_buf())
 }
 
-fn run_default_miri_setup(candidate: &Path) -> Result<(), String> {
-    let (cargo_bin, is_direct_toolchain_cargo, extra_path_dir) = resolve_miri_setup_cargo()?;
-    let mut cmd = Command::new(&cargo_bin);
-    if !is_direct_toolchain_cargo {
-        cmd.arg("+nightly-2026-06-01");
+/// Parse a positive whole number of seconds from `key`, or `default` when unset.
+fn positive_secs_env(
+    get_env: EnvLookup<'_>,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, String> {
+    let Some(raw) = get_env(key) else {
+        return Ok(default);
+    };
+    let text = raw.to_string_lossy();
+    if text.trim().is_empty() {
+        // Blank counts as unset, like `${VAR:-default}` in the launcher.
+        return Ok(default);
+    }
+    match text.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "{key} must be a positive whole number of seconds, got {text:?}"
+        )),
+    }
+}
+
+fn miri_setup_timeout(get_env: EnvLookup<'_>) -> Result<Duration, String> {
+    positive_secs_env(
+        get_env,
+        MIRI_SETUP_TIMEOUT_ENV,
+        Duration::from_secs(DEFAULT_MIRI_SETUP_TIMEOUT_SECS),
+    )
+}
+
+fn miri_setup_lock_wait(
+    get_env: EnvLookup<'_>,
+    setup_timeout: Duration,
+) -> Result<Duration, String> {
+    positive_secs_env(
+        get_env,
+        MIRI_SETUP_LOCK_TIMEOUT_ENV,
+        default_lock_wait(setup_timeout),
+    )
+}
+
+/// How to invoke `cargo miri setup` for the pinned `nightly-2026-06-01` toolchain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MiriSetupCommand {
+    /// `cargo` binary to run.
+    cargo_bin: PathBuf,
+    /// Whether `cargo_bin` is a `rustup` proxy needing `+nightly-2026-06-01`.
+    pass_toolchain_arg: bool,
+    /// Directory prepended to `PATH` so `cargo miri` resolves the pinned
+    /// toolchain's `cargo-miri`.
+    prepend_path_dir: Option<PathBuf>,
+    /// `RUSTUP_TOOLCHAIN` pin for a direct toolchain `cargo`, so `rustup` proxies
+    /// that `cargo-miri` invokes (e.g. `~/.cargo/bin/cargo-miri`, which `cargo`
+    /// searches before `PATH`, or `rustup component add rust-src`) cannot
+    /// resolve a different toolchain from the working directory.
+    rustup_toolchain: Option<String>,
+}
+
+fn run_miri_setup(
+    candidate: &Path,
+    get_env: EnvLookup<'_>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let setup = resolve_miri_setup_cargo(get_env)?;
+    let mut cmd = Command::new(&setup.cargo_bin);
+    if setup.pass_toolchain_arg {
+        cmd.arg(MIRI_SETUP_TOOLCHAIN_ARG);
     }
     cmd.args(["miri", "setup"]);
     cmd.env("MIRI_SYSROOT", candidate);
-    if let Some(bin_dir) = extra_path_dir {
-        let current_path = env::var_os("ANNEAL_CALLER_PATH")
-            .or_else(|| env::var_os("PATH"))
+    if let Some(toolchain) = &setup.rustup_toolchain {
+        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    if let Some(bin_dir) = &setup.prepend_path_dir {
+        let current_path = get_env("ANNEAL_CALLER_PATH")
+            .or_else(|| get_env("PATH"))
             .unwrap_or_default();
-        let mut paths = vec![bin_dir];
+        let mut paths = vec![bin_dir.clone()];
         paths.extend(env::split_paths(&current_path));
         if let Ok(joined) = env::join_paths(paths) {
             cmd.env("PATH", joined);
         }
     }
 
-    let output = cmd.output().map_err(|err| {
+    let outcome = run_with_timeout(cmd, timeout).map_err(|err| {
         format!(
-            "failed to execute '{}' to initialize Miri sysroot at {}: {err}",
-            cargo_bin.display(),
+            "failed to execute '{}' to initialize Miri sysroot at {}: {err}; \
+             missing Miri sysroot is a hard error",
+            setup.cargo_bin.display(),
             candidate.display()
         )
     })?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+    match outcome {
+        TimedOutput::Finished(output) if output.status.success() => Ok(()),
+        TimedOutput::Finished(output) => Err(format!(
             "Miri sysroot auto-provisioning failed at {} (status {}):\nstdout:\n{}\nstderr:\n{}; \
              missing Miri sysroot is a hard error",
             candidate.display(),
             output.status,
-            stdout.trim(),
-            stderr.trim()
-        ));
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        TimedOutput::TimedOut { stdout, stderr } => Err(format!(
+            "Miri sysroot auto-provisioning timed out after {}s at {} (killed `{} miri setup`; \
+             raise {MIRI_SETUP_TIMEOUT_ENV} if the build is legitimately slow):\nstdout:\n{}\nstderr:\n{}; \
+             missing Miri sysroot is a hard error",
+            timeout.as_secs(),
+            candidate.display(),
+            setup.cargo_bin.display(),
+            String::from_utf8_lossy(&stdout).trim(),
+            String::from_utf8_lossy(&stderr).trim()
+        )),
     }
-    Ok(())
 }
 
-fn resolve_miri_setup_cargo() -> Result<(PathBuf, bool, Option<PathBuf>), String> {
-    if let Ok(val) = env::var(MIRI_SETUP_BIN_ENV)
-        && !val.trim().is_empty()
-    {
-        let p = PathBuf::from(val.trim());
+/// Result of [`run_with_timeout`].
+enum TimedOutput {
+    Finished(std::process::Output),
+    TimedOut { stdout: Vec<u8>, stderr: Vec<u8> },
+}
+
+/// Run `cmd` with stdin closed and stdout/stderr captured, killing it once
+/// `timeout` elapses.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<TimedOutput> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn_retrying_text_file_busy(&mut cmd)?;
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        match pipe {
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = pipe.read_to_end(&mut buf);
+                    let _ = tx.send(buf);
+                });
+            }
+            None => {
+                let _ = tx.send(Vec::new());
+            }
+        }
+        rx
+    }
+    let stdout_rx = drain(child.stdout.take());
+    let stderr_rx = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+    };
+    // Grandchildren (e.g. the sysroot `cargo build` that `cargo-miri` spawns)
+    // may outlive a killed `cargo-miri` while holding the pipes open; bound the
+    // wait for the remaining output instead of blocking on them.
+    let grace = Duration::from_secs(5);
+    let stdout = stdout_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(grace).unwrap_or_default();
+    Ok(match status {
+        Some(status) => TimedOutput::Finished(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        None => TimedOutput::TimedOut { stdout, stderr },
+    })
+}
+
+/// `cmd.spawn()`, retrying `ETXTBSY`: `execve` of a just-written executable
+/// fails transiently while a concurrently forked child still holds an
+/// inherited write descriptor for it.
+fn spawn_retrying_text_file_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut attempt: u64 = 0;
+    loop {
+        match cmd.spawn() {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 10 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, String> {
+    if let Some(val) = non_empty_env_str(get_env, MIRI_SETUP_BIN_ENV) {
+        let p = PathBuf::from(val);
         if p.is_file() {
-            return Ok((p, false, None));
+            return Ok(MiriSetupCommand {
+                cargo_bin: p,
+                pass_toolchain_arg: true,
+                prepend_path_dir: None,
+                rustup_toolchain: None,
+            });
         }
         return Err(format!(
             "{MIRI_SETUP_BIN_ENV} points to non-existent binary: {}",
             p.display()
         ));
     }
-    if let Ok(home) = env::var("HOME") {
-        let toolchains_dir = PathBuf::from(&home).join(".rustup/toolchains");
-        if let Ok(entries) = fs::read_dir(&toolchains_dir) {
-            let mut candidates: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok().map(|d| d.path()))
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("nightly-2026-06-01"))
-                })
-                .map(|p| p.join("bin"))
-                .filter(|bin_dir| {
-                    bin_dir.join("cargo").is_file() && bin_dir.join("cargo-miri").is_file()
-                })
-                .collect();
-            candidates.sort();
-            if let Some(bin_dir) = candidates.into_iter().next() {
-                return Ok((bin_dir.join("cargo"), true, Some(bin_dir)));
-            }
-        }
-        let cargo_proxy = PathBuf::from(&home).join(".cargo/bin/cargo");
-        if cargo_proxy.is_file() {
-            return Ok((cargo_proxy, false, None));
+    let home = non_empty_env_str(get_env, "HOME").map(PathBuf::from);
+    let rustup_home = non_empty_env_str(get_env, "RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+    if let Some(rustup_home) = rustup_home
+        && let Ok(entries) = fs::read_dir(rustup_home.join("toolchains"))
+    {
+        let mut candidates: Vec<(String, PathBuf)> = entries
+            .filter_map(|e| e.ok().map(|d| d.path()))
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?.to_string();
+                name.starts_with("nightly-2026-06-01")
+                    .then(|| (name, p.join("bin")))
+            })
+            .filter(|(_, bin_dir)| {
+                bin_dir.join("cargo").is_file() && bin_dir.join("cargo-miri").is_file()
+            })
+            .collect();
+        candidates.sort();
+        if let Some((toolchain, bin_dir)) = candidates.into_iter().next() {
+            return Ok(MiriSetupCommand {
+                cargo_bin: bin_dir.join("cargo"),
+                pass_toolchain_arg: false,
+                prepend_path_dir: Some(bin_dir),
+                rustup_toolchain: Some(toolchain),
+            });
         }
     }
-    if let Some(path_cargo) = find_executable_in_path("cargo") {
-        let is_direct_toolchain = path_cargo
+    let cargo_home = non_empty_env_str(get_env, "CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    if let Some(cargo_home) = cargo_home {
+        let cargo_proxy = cargo_home.join("bin/cargo");
+        if cargo_proxy.is_file() {
+            return Ok(MiriSetupCommand {
+                cargo_bin: cargo_proxy,
+                pass_toolchain_arg: true,
+                prepend_path_dir: None,
+                rustup_toolchain: None,
+            });
+        }
+    }
+    if let Some(path_cargo) = find_executable_in_path_with(get_env, "cargo") {
+        let direct_toolchain = path_cargo
             .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("nightly-2026-06-01"));
+            .filter(|n| n.starts_with("nightly-2026-06-01"))
+            .map(str::to_string);
         let bin_dir = path_cargo.parent().map(Path::to_path_buf);
-        return Ok((path_cargo, is_direct_toolchain, bin_dir));
+        return Ok(MiriSetupCommand {
+            cargo_bin: path_cargo,
+            pass_toolchain_arg: direct_toolchain.is_none(),
+            prepend_path_dir: bin_dir,
+            rustup_toolchain: direct_toolchain,
+        });
     }
     Err(
         "could not locate 'cargo' for `cargo +nightly-2026-06-01 miri setup` \
@@ -2086,6 +2391,42 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         assert!(matches!(missing_start, MiriOutcome::OracleError(_)));
     }
 
+    use std::ffi::OsStr;
+
+    // Miri sysroot provisioning tests. None of these tests call
+    // `env::set_var`/`env::remove_var`: mutating the process environment races
+    // every concurrently running test in this binary that reads `HOME`/`PATH`
+    // or spawns an `elan`/`rustup` proxy. Environment inputs are injected
+    // through `EnvLookup` maps instead.
+
+    fn env_map(pairs: &[(&str, &OsStr)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let vars: BTreeMap<String, OsString> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_os_string()))
+            .collect();
+        move |key: &str| vars.get(key).cloned()
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, body).expect("write script");
+        let mut perms = fs::metadata(path).expect("script metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod +x script");
+    }
+
+    /// Mock `cargo` that records its argv, `MIRI_SYSROOT`, and
+    /// `RUSTUP_TOOLCHAIN`, then populates `${MIRI_SYSROOT}/lib/rustlib`.
+    #[cfg(unix)]
+    const RECORDING_MOCK_CARGO: &str = "#!/bin/sh\n\
+        if [ -z \"${MIRI_SYSROOT:-}\" ]; then echo 'MIRI_SYSROOT missing' >&2; exit 1; fi\n\
+        printf '%s\\n' \"$*\" > \"${MIRI_SYSROOT}.args\"\n\
+        printf '%s\\n' \"${MIRI_SYSROOT}\" > \"${MIRI_SYSROOT}.sysroot\"\n\
+        printf '%s\\n' \"${RUSTUP_TOOLCHAIN:-<unset>}\" > \"${MIRI_SYSROOT}.toolchain\"\n\
+        if read -r _line; then echo 'stdin must be closed' >&2; exit 1; fi\n\
+        mkdir -p \"${MIRI_SYSROOT}/lib/rustlib\"\n";
+
     #[test]
     fn sysroot_fast_path_skips_setup_when_lib_rustlib_already_exists() {
         let temp = unique_oracle_temp_dir("sysroot-fast-path");
@@ -2100,29 +2441,120 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         .expect("fast path should succeed");
         assert_eq!(resolved, sysroot);
         assert!(!called, "setup_fn must not run when lib/rustlib exists");
+        assert!(
+            !sysroot.join(".setup.lock").exists(),
+            "the fast path must not create or take .setup.lock"
+        );
 
+        // The production resolver reaches the same fast path through `HOME`,
+        // even with a broken setup binary and invalid setup knobs (none of
+        // which may be consulted for an already-populated sysroot).
+        let get_env = env_map(&[
+            ("HOME", temp.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, OsStr::new("/nonexistent/cargo")),
+            (MIRI_SETUP_TIMEOUT_ENV, OsStr::new("not-a-number")),
+        ]);
+        let via_resolve = resolve_sysroot_path_with(None, &get_env, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env)
+        })
+        .expect("resolve_sysroot_path fast path");
+        assert_eq!(via_resolve, sysroot);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn sysroot_resolution_order_and_caller_paths_are_never_provisioned() {
+        let temp = unique_oracle_temp_dir("sysroot-resolution-order");
+        let valid = temp.join("valid-sysroot");
+        fs::create_dir_all(valid.join("lib/rustlib")).expect("create valid lib/rustlib");
+        let bare = temp.join("bare-sysroot");
+        fs::create_dir_all(&bare).expect("create bare sysroot");
+        let home = temp.join("home");
+        let default_candidate = home.join(".cache/miri");
+
+        let never_provision = |candidate: &Path| -> Result<PathBuf, String> {
+            panic!(
+                "caller-supplied sysroot must not be provisioned: {}",
+                candidate.display()
+            )
+        };
+
+        // 1. `explicit` wins over `ANNEAL_MIRI_SYSROOT` and `HOME`.
+        let env_all = env_map(&[
+            ("ANNEAL_MIRI_SYSROOT", bare.as_os_str()),
+            ("HOME", home.as_os_str()),
+        ]);
+        assert_eq!(
+            resolve_sysroot_path_with(Some(&valid), &env_all, never_provision),
+            Ok(valid.clone())
+        );
+        let err_explicit = resolve_sysroot_path_with(Some(&bare), &env_all, never_provision)
+            .expect_err("explicit path without lib/rustlib must fail immediately");
+        assert!(
+            err_explicit.contains("explicit Miri sysroot is missing lib/rustlib"),
+            "unexpected error: {err_explicit}"
+        );
+
+        // 2. `ANNEAL_MIRI_SYSROOT` wins over `HOME` and is never provisioned.
+        let env_valid = env_map(&[
+            ("ANNEAL_MIRI_SYSROOT", valid.as_os_str()),
+            ("HOME", home.as_os_str()),
+        ]);
+        assert_eq!(
+            resolve_sysroot_path_with(None, &env_valid, never_provision),
+            Ok(valid.clone())
+        );
+        let err_env = resolve_sysroot_path_with(None, &env_all, never_provision)
+            .expect_err("ANNEAL_MIRI_SYSROOT without lib/rustlib must fail");
+        assert!(
+            err_env.contains("ANNEAL_MIRI_SYSROOT is missing lib/rustlib"),
+            "unexpected error: {err_env}"
+        );
+        assert!(
+            !bare.join(".setup.lock").exists() && !bare.join("lib").exists(),
+            "caller-supplied sysroot paths must not be mutated"
+        );
+
+        // 3. Blank `ANNEAL_MIRI_SYSROOT` counts as unset: fall back to `HOME`.
+        let env_blank = env_map(&[
+            ("ANNEAL_MIRI_SYSROOT", OsStr::new("  ")),
+            ("HOME", home.as_os_str()),
+        ]);
+        let mut provisioned = Vec::new();
+        let resolved = resolve_sysroot_path_with(None, &env_blank, |candidate| {
+            provisioned.push(candidate.to_path_buf());
+            Ok(candidate.to_path_buf())
+        });
+        assert_eq!(resolved, Ok(default_candidate.clone()));
+        assert_eq!(provisioned, vec![default_candidate]);
+
+        // 4. Neither `ANNEAL_MIRI_SYSROOT` nor a non-blank `HOME`: hard error.
+        for get_env in [env_map(&[]), env_map(&[("HOME", OsStr::new(" "))])] {
+            let err = resolve_sysroot_path_with(None, &get_env, never_provision)
+                .expect_err("no sysroot location must fail closed");
+            assert!(
+                err.contains("Miri sysroot not found") && err.contains("hard error"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // 5. The production wrapper reads the real process environment
+        // (read-only: no test in this binary mutates it).
+        let expected = resolve_sysroot_path_with(None, &process_env_var, |candidate| {
+            Ok(candidate.to_path_buf())
+        });
+        let real_home = env::var("HOME").ok().filter(|h| !h.trim().is_empty());
+        let real_override = env::var("ANNEAL_MIRI_SYSROOT")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if real_override.is_none()
+            && let Some(real_home) = real_home
         {
-            let _guard = crate::lock_test_env();
-            let prev_home = env::var_os("HOME");
-            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
-            unsafe {
-                env::set_var("HOME", &temp);
-                env::remove_var("ANNEAL_MIRI_SYSROOT");
-            }
-            let via_resolve = resolve_sysroot_path(None).expect("resolve_sysroot_path fast path");
-            unsafe {
-                if let Some(h) = prev_home {
-                    env::set_var("HOME", h);
-                } else {
-                    env::remove_var("HOME");
-                }
-                if let Some(s) = prev_sysroot {
-                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
-                } else {
-                    env::remove_var("ANNEAL_MIRI_SYSROOT");
-                }
-            }
-            assert_eq!(via_resolve, sysroot);
+            assert_eq!(
+                expected,
+                Ok(PathBuf::from(real_home.trim()).join(".cache/miri"))
+            );
         }
 
         let _ = fs::remove_dir_all(&temp);
@@ -2131,66 +2563,79 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     #[cfg(unix)]
     #[test]
     fn missing_sysroot_auto_provisions_via_miri_setup_and_returns_path() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = unique_oracle_temp_dir("sysroot-autoprovision");
-        let fake_setup = temp.join("mock-cargo-miri-setup.sh");
-        fs::write(
-            &fake_setup,
-            "#!/usr/bin/env bash\n\
-             set -euo pipefail\n\
-             if [[ -z \"${MIRI_SYSROOT:-}\" ]]; then\n\
-               echo \"MIRI_SYSROOT missing\" >&2\n\
-               exit 1\n\
-             fi\n\
-             mkdir -p \"${MIRI_SYSROOT}/lib/rustlib\"\n\
-             printf '%s\\n' \"$*\" > \"${MIRI_SYSROOT}/setup_args.txt\"\n",
-        )
-        .expect("write mock setup script");
-        let mut perms = fs::metadata(&fake_setup).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_setup, perms).expect("chmod +x");
+        let mock_cargo = temp.join("mock-cargo");
+        write_executable_script(&mock_cargo, RECORDING_MOCK_CARGO);
 
         let expected_sysroot = temp.join(".cache/miri");
         assert!(!expected_sysroot.join("lib/rustlib").exists());
 
-        {
-            let _guard = crate::lock_test_env();
-            let prev_home = env::var_os("HOME");
-            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
-            let prev_setup_bin = env::var_os(MIRI_SETUP_BIN_ENV);
-            unsafe {
-                env::set_var("HOME", &temp);
-                env::remove_var("ANNEAL_MIRI_SYSROOT");
-                env::set_var(MIRI_SETUP_BIN_ENV, &fake_setup);
-            }
-            let resolved = resolve_sysroot_path(None);
-            unsafe {
-                if let Some(h) = prev_home {
-                    env::set_var("HOME", h);
-                } else {
-                    env::remove_var("HOME");
-                }
-                if let Some(s) = prev_sysroot {
-                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
-                } else {
-                    env::remove_var("ANNEAL_MIRI_SYSROOT");
-                }
-                if let Some(b) = prev_setup_bin {
-                    env::set_var(MIRI_SETUP_BIN_ENV, b);
-                } else {
-                    env::remove_var(MIRI_SETUP_BIN_ENV);
-                }
-            }
-            let resolved = resolved.expect("auto-provision should succeed");
-            assert_eq!(resolved, expected_sysroot);
-        }
+        // Full production plumbing (`resolve_sysroot_path` ->
+        // `ensure_miri_sysroot_initialized` -> `run_miri_setup`) with only the
+        // environment injected.
+        let get_env = env_map(&[
+            ("HOME", temp.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, mock_cargo.as_os_str()),
+        ]);
+        let resolved = resolve_sysroot_path_with(None, &get_env, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env)
+        })
+        .expect("auto-provision should succeed");
+        assert_eq!(resolved, expected_sysroot);
 
         assert!(expected_sysroot.join("lib/rustlib").is_dir());
         assert!(expected_sysroot.join(".setup.lock").is_file());
-        let recorded_args =
-            fs::read_to_string(expected_sysroot.join("setup_args.txt")).expect("read setup_args");
-        assert_eq!(recorded_args.trim(), "+nightly-2026-06-01 miri setup");
+        let read_record = |suffix: &str| {
+            fs::read_to_string(temp.join(format!(".cache/miri.{suffix}")))
+                .unwrap_or_else(|err| panic!("read mock record {suffix}: {err}"))
+        };
+        assert_eq!(read_record("args").trim(), "+nightly-2026-06-01 miri setup");
+        assert_eq!(
+            read_record("sysroot").trim(),
+            expected_sysroot.to_str().expect("utf-8 temp path")
+        );
+        // An explicit `ANNEAL_MIRI_SETUP_BIN` is used as given: no toolchain pin
+        // is added on top of whatever this process inherited.
+        let inherited_toolchain =
+            env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| "<unset>".to_string());
+        assert_eq!(read_record("toolchain").trim(), inherited_toolchain);
+
+        // Without an override, a pinned `nightly-2026-06-01*` toolchain `cargo`
+        // runs directly: no `+toolchain` argument, its `bin/` first on `PATH`,
+        // and `RUSTUP_TOOLCHAIN` pinned to the toolchain directory name.
+        let home2 = temp.join("home2");
+        let toolchain_name = "nightly-2026-06-01-anneal-test";
+        let toolchain_bin = home2
+            .join(".rustup/toolchains")
+            .join(toolchain_name)
+            .join("bin");
+        fs::create_dir_all(&toolchain_bin).expect("create fake toolchain bin");
+        write_executable_script(
+            &toolchain_bin.join("cargo"),
+            &format!(
+                "{RECORDING_MOCK_CARGO}printf '%s\\n' \"${{PATH%%:*}}\" > \"${{MIRI_SYSROOT}}.path0\"\n"
+            ),
+        );
+        write_executable_script(&toolchain_bin.join("cargo-miri"), "#!/bin/sh\nexit 0\n");
+        let real_path = env::var_os("PATH").unwrap_or_default();
+        let get_env2 = env_map(&[("HOME", home2.as_os_str()), ("PATH", real_path.as_os_str())]);
+        let sysroot2 = home2.join(".cache/miri");
+        let resolved2 = resolve_sysroot_path_with(None, &get_env2, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env2)
+        })
+        .expect("auto-provision through the pinned toolchain cargo should succeed");
+        assert_eq!(resolved2, sysroot2);
+        let read_record2 = |suffix: &str| {
+            fs::read_to_string(home2.join(format!(".cache/miri.{suffix}")))
+                .unwrap_or_else(|err| panic!("read mock record {suffix}: {err}"))
+        };
+        assert_eq!(read_record2("args").trim(), "miri setup");
+        assert_eq!(read_record2("toolchain").trim(), toolchain_name);
+        assert_eq!(
+            read_record2("path0").trim(),
+            toolchain_bin.to_str().expect("utf-8 temp path")
+        );
+        assert!(sysroot2.join("lib/rustlib").is_dir());
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -2198,116 +2643,265 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     #[cfg(unix)]
     #[test]
     fn missing_sysroot_fails_closed_when_miri_setup_fails_or_leaves_rustlib_absent() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = unique_oracle_temp_dir("sysroot-fail-closed");
 
         // Case 1: `miri setup` exits non-zero.
-        let failing_script = temp.join("mock-failing-setup.sh");
-        fs::write(
-            &failing_script,
-            "#!/usr/bin/env bash\necho 'simulated rust-src missing error' >&2\nexit 17\n",
-        )
-        .expect("write failing script");
-        let mut perms = fs::metadata(&failing_script).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&failing_script, perms).expect("chmod");
-
-        {
-            let _guard = crate::lock_test_env();
-            let prev_home = env::var_os("HOME");
-            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
-            let prev_setup_bin = env::var_os(MIRI_SETUP_BIN_ENV);
-            unsafe {
-                env::set_var("HOME", &temp);
-                env::remove_var("ANNEAL_MIRI_SYSROOT");
-                env::set_var(MIRI_SETUP_BIN_ENV, &failing_script);
-            }
-            let res = resolve_sysroot_path(None);
-            unsafe {
-                if let Some(h) = prev_home {
-                    env::set_var("HOME", h);
-                } else {
-                    env::remove_var("HOME");
-                }
-                if let Some(s) = prev_sysroot {
-                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
-                } else {
-                    env::remove_var("ANNEAL_MIRI_SYSROOT");
-                }
-                if let Some(b) = prev_setup_bin {
-                    env::set_var(MIRI_SETUP_BIN_ENV, b);
-                } else {
-                    env::remove_var(MIRI_SETUP_BIN_ENV);
-                }
-            }
-            let err = res.expect_err("non-zero miri setup must fail closed");
-            assert!(
-                err.contains("Miri sysroot auto-provisioning failed")
-                    && err.contains("simulated rust-src missing error")
-                    && err.contains("missing Miri sysroot is a hard error"),
-                "unexpected error: {err}"
-            );
-        }
+        let failing_cargo = temp.join("mock-failing-cargo");
+        write_executable_script(
+            &failing_cargo,
+            "#!/bin/sh\necho 'partial setup progress'\necho 'simulated rust-src missing error' >&2\nexit 17\n",
+        );
+        let home_fail = temp.join("home-fail");
+        let get_env = env_map(&[
+            ("HOME", home_fail.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, failing_cargo.as_os_str()),
+        ]);
+        let err = resolve_sysroot_path_with(None, &get_env, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env)
+        })
+        .expect_err("non-zero miri setup must fail closed");
+        assert!(
+            err.contains("Miri sysroot auto-provisioning failed")
+                && err.contains("exit status: 17")
+                && err.contains("partial setup progress")
+                && err.contains("simulated rust-src missing error")
+                && err.contains("missing Miri sysroot is a hard error"),
+            "unexpected error: {err}"
+        );
+        assert!(!home_fail.join(".cache/miri/lib/rustlib").exists());
 
         // Case 2: `miri setup` exits 0 without populating `lib/rustlib`.
-        let empty_sysroot = temp.join("empty-after-setup");
-        let err_missing_rustlib =
-            ensure_miri_sysroot_initialized_with(&empty_sysroot, |_dir| Ok(()))
-                .expect_err("setup leaving lib/rustlib absent must fail closed");
+        let lying_cargo = temp.join("mock-lying-cargo");
+        write_executable_script(&lying_cargo, "#!/bin/sh\nexit 0\n");
+        let home_lie = temp.join("home-lie");
+        let get_env = env_map(&[
+            ("HOME", home_lie.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, lying_cargo.as_os_str()),
+        ]);
+        let err = resolve_sysroot_path_with(None, &get_env, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env)
+        })
+        .expect_err("setup leaving lib/rustlib absent must fail closed");
         assert!(
-            err_missing_rustlib.contains("lib/rustlib is still missing")
-                && err_missing_rustlib.contains("missing Miri sysroot is a hard error"),
-            "unexpected error: {err_missing_rustlib}"
+            err.contains("lib/rustlib is still missing")
+                && err.contains("missing Miri sysroot is a hard error"),
+            "unexpected error: {err}"
+        );
+
+        // Case 3: a configured setup binary that does not exist.
+        let home_missing = temp.join("home-missing-bin");
+        let get_env = env_map(&[
+            ("HOME", home_missing.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, OsStr::new("/nonexistent/anneal/cargo")),
+        ]);
+        let err = resolve_sysroot_path_with(None, &get_env, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env)
+        })
+        .expect_err("missing setup binary must fail closed");
+        assert!(
+            err.contains("ANNEAL_MIRI_SETUP_BIN points to non-existent binary"),
+            "unexpected error: {err}"
+        );
+
+        // Case 4: generic `setup_fn` contract.
+        let empty_sysroot = temp.join("empty-after-setup");
+        let err = ensure_miri_sysroot_initialized_with(&empty_sysroot, |_dir| Ok(()))
+            .expect_err("setup leaving lib/rustlib absent must fail closed");
+        assert!(
+            err.contains("lib/rustlib is still missing"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_miri_setup_is_killed_at_the_timeout_and_fails_closed() {
+        let temp = unique_oracle_temp_dir("sysroot-setup-timeout");
+        let hung_cargo = temp.join("mock-hung-cargo");
+        // `exec` so the killed child is the sleeper itself and the pipes close.
+        write_executable_script(
+            &hung_cargo,
+            "#!/bin/sh\necho 'compiling core...' >&2\nexec sleep 60\n",
+        );
+        let home = temp.join("home");
+        let get_env = env_map(&[
+            ("HOME", home.as_os_str()),
+            (MIRI_SETUP_BIN_ENV, hung_cargo.as_os_str()),
+            (MIRI_SETUP_TIMEOUT_ENV, OsStr::new("1")),
+        ]);
+        let started = Instant::now();
+        let err = resolve_sysroot_path_with(None, &get_env, |candidate| {
+            ensure_miri_sysroot_initialized_from_env(candidate, &get_env)
+        })
+        .expect_err("a hung miri setup must fail closed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "timeout must kill the hung setup promptly, took {elapsed:?}"
+        );
+        assert!(
+            err.contains("timed out after 1s")
+                && err.contains("compiling core...")
+                && err.contains(MIRI_SETUP_TIMEOUT_ENV)
+                && err.contains("missing Miri sysroot is a hard error"),
+            "unexpected error: {err}"
+        );
+        assert!(!home.join(".cache/miri/lib/rustlib").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn miri_setup_timeouts_are_validated_and_defaulted() {
+        let default = Duration::from_secs(DEFAULT_MIRI_SETUP_TIMEOUT_SECS);
+        assert_eq!(miri_setup_timeout(&env_map(&[])), Ok(default));
+        assert_eq!(
+            miri_setup_lock_wait(&env_map(&[]), default),
+            Ok(default + Duration::from_secs(60))
+        );
+        assert_eq!(
+            miri_setup_timeout(&env_map(&[(MIRI_SETUP_TIMEOUT_ENV, OsStr::new(" 42 "))])),
+            Ok(Duration::from_secs(42))
+        );
+        assert_eq!(
+            miri_setup_lock_wait(
+                &env_map(&[(MIRI_SETUP_LOCK_TIMEOUT_ENV, OsStr::new("7"))]),
+                default
+            ),
+            Ok(Duration::from_secs(7))
+        );
+        for blank in ["", "  "] {
+            assert_eq!(
+                miri_setup_timeout(&env_map(&[(MIRI_SETUP_TIMEOUT_ENV, OsStr::new(blank))])),
+                Ok(default)
+            );
+        }
+        for bad in ["0", "-5", "abc", "1.5", "18446744073709551616"] {
+            let err = miri_setup_timeout(&env_map(&[(MIRI_SETUP_TIMEOUT_ENV, OsStr::new(bad))]))
+                .expect_err("invalid timeout must be rejected");
+            assert!(
+                err.contains(MIRI_SETUP_TIMEOUT_ENV) && err.contains("positive whole number"),
+                "unexpected error for {bad:?}: {err}"
+            );
+            assert!(
+                miri_setup_lock_wait(
+                    &env_map(&[(MIRI_SETUP_LOCK_TIMEOUT_ENV, OsStr::new(bad))]),
+                    default
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn miri_setup_cargo_prefers_pinned_toolchain_and_pins_rustup_toolchain() {
+        let temp = unique_oracle_temp_dir("sysroot-setup-cargo-resolution");
+        let home = temp.join("home");
+
+        // Only a `rustup` proxy: pass `+nightly-2026-06-01`, no PATH/toolchain pin.
+        let proxy = home.join(".cargo/bin/cargo");
+        fs::create_dir_all(proxy.parent().expect("proxy dir")).expect("create proxy dir");
+        fs::write(&proxy, b"").expect("write proxy");
+        let no_bin = temp.join("no-bin");
+        let get_env = env_map(&[("HOME", home.as_os_str()), ("PATH", no_bin.as_os_str())]);
+        assert_eq!(
+            resolve_miri_setup_cargo(&get_env),
+            Ok(MiriSetupCommand {
+                cargo_bin: proxy.clone(),
+                pass_toolchain_arg: true,
+                prepend_path_dir: None,
+                rustup_toolchain: None,
+            })
+        );
+
+        // A pinned toolchain with `cargo-miri` wins and pins `RUSTUP_TOOLCHAIN`
+        // (toolchains without `cargo-miri` are skipped).
+        let toolchains = home.join(".rustup/toolchains");
+        let no_miri = toolchains.join("nightly-2026-06-01-aarch64-unknown-linux-gnu/bin");
+        fs::create_dir_all(&no_miri).expect("create toolchain without miri");
+        fs::write(no_miri.join("cargo"), b"").expect("write cargo");
+        let pinned_name = "nightly-2026-06-01-x86_64-unknown-linux-gnu";
+        let pinned = toolchains.join(pinned_name).join("bin");
+        fs::create_dir_all(&pinned).expect("create pinned toolchain");
+        fs::write(pinned.join("cargo"), b"").expect("write cargo");
+        fs::write(pinned.join("cargo-miri"), b"").expect("write cargo-miri");
+        let other = toolchains.join("nightly-2026-07-01-x86_64-unknown-linux-gnu/bin");
+        fs::create_dir_all(&other).expect("create other toolchain");
+        fs::write(other.join("cargo"), b"").expect("write cargo");
+        fs::write(other.join("cargo-miri"), b"").expect("write cargo-miri");
+        assert_eq!(
+            resolve_miri_setup_cargo(&get_env),
+            Ok(MiriSetupCommand {
+                cargo_bin: pinned.join("cargo"),
+                pass_toolchain_arg: false,
+                prepend_path_dir: Some(pinned.clone()),
+                rustup_toolchain: Some(pinned_name.to_string()),
+            })
+        );
+
+        // `RUSTUP_HOME` takes precedence over `${HOME}/.rustup`.
+        let empty_rustup_home = temp.join("empty-rustup-home");
+        fs::create_dir_all(empty_rustup_home.join("toolchains")).expect("create rustup home");
+        let get_env_rustup_home = env_map(&[
+            ("HOME", home.as_os_str()),
+            ("RUSTUP_HOME", empty_rustup_home.as_os_str()),
+            ("PATH", no_bin.as_os_str()),
+        ]);
+        assert_eq!(
+            resolve_miri_setup_cargo(&get_env_rustup_home).map(|c| c.cargo_bin),
+            Ok(proxy)
+        );
+
+        // No cargo anywhere: fail closed.
+        let get_env_none = env_map(&[
+            ("HOME", temp.join("empty-home").as_os_str()),
+            ("PATH", no_bin.as_os_str()),
+        ]);
+        let err = resolve_miri_setup_cargo(&get_env_none).expect_err("no cargo must fail");
+        assert!(
+            err.contains("could not locate 'cargo'"),
+            "unexpected error: {err}"
         );
 
         let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
-    fn explicit_or_env_sysroot_missing_lib_rustlib_fails_closed_without_clobbering() {
-        let temp = unique_oracle_temp_dir("sysroot-explicit-strict");
-        let explicit_dir = temp.join("caller-explicit-sysroot");
-        fs::create_dir_all(&explicit_dir).expect("create explicit_dir");
+    fn lock_wait_is_bounded_when_another_holder_never_releases() {
+        let temp = unique_oracle_temp_dir("sysroot-lock-wait");
+        let sysroot = temp.join(".cache/miri");
+        fs::create_dir_all(&sysroot).expect("create sysroot dir");
+        let holder = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(sysroot.join(".setup.lock"))
+            .expect("open lock as foreign holder");
+        holder.lock().expect("foreign holder takes the lock");
 
-        let err_explicit = resolve_sysroot_path(Some(&explicit_dir))
-            .expect_err("explicit path without lib/rustlib must fail immediately");
+        let mut called = false;
+        let err =
+            ensure_miri_sysroot_initialized_bounded(&sysroot, Duration::from_millis(300), |_| {
+                called = true;
+                Ok(())
+            })
+            .expect_err("a never-released lock must fail closed after the bounded wait");
+        assert!(!called, "setup must never run without the lock");
         assert!(
-            err_explicit.contains("explicit Miri sysroot is missing lib/rustlib"),
-            "unexpected error: {err_explicit}"
-        );
-        assert!(
-            !explicit_dir.join(".setup.lock").exists()
-                && !explicit_dir.join("lib/rustlib").exists(),
-            "explicit caller path must not be mutated or auto-provisioned"
+            err.contains("waiting for the Miri sysroot setup lock")
+                && err.contains("missing Miri sysroot is a hard error"),
+            "unexpected error: {err}"
         );
 
-        let env_dir = temp.join("caller-env-sysroot");
-        fs::create_dir_all(&env_dir).expect("create env_dir");
-        {
-            let _guard = crate::lock_test_env();
-            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
-            unsafe {
-                env::set_var("ANNEAL_MIRI_SYSROOT", &env_dir);
-            }
-            let res = resolve_sysroot_path(None);
-            unsafe {
-                if let Some(s) = prev_sysroot {
-                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
-                } else {
-                    env::remove_var("ANNEAL_MIRI_SYSROOT");
-                }
-            }
-            let err_env = res.expect_err("ANNEAL_MIRI_SYSROOT without lib/rustlib must fail");
-            assert!(
-                err_env.contains("ANNEAL_MIRI_SYSROOT is missing lib/rustlib"),
-                "unexpected error: {err_env}"
-            );
-        }
-        assert!(
-            !env_dir.join(".setup.lock").exists() && !env_dir.join("lib/rustlib").exists(),
-            "ANNEAL_MIRI_SYSROOT path must not be mutated"
-        );
+        holder.unlock().expect("release foreign lock");
+        let resolved =
+            ensure_miri_sysroot_initialized_bounded(&sysroot, Duration::from_secs(5), |dir| {
+                fs::create_dir_all(dir.join("lib/rustlib")).map_err(|e| e.to_string())
+            })
+            .expect("provisioning proceeds once the lock is released");
+        assert_eq!(resolved, sysroot);
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -2319,7 +2913,6 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
             atomic::{AtomicUsize, Ordering},
         };
         use std::thread;
-        use std::time::Duration;
 
         let temp = unique_oracle_temp_dir("sysroot-concurrent-lock");
         let sysroot = Arc::new(temp.join(".cache/miri"));
@@ -2372,5 +2965,41 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         assert!(sysroot.join("lib/rustlib").is_dir());
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// R4 regression guard: `cargo-anneal` unit tests share one process, so a
+    /// test that mutates the process environment races every test that reads
+    /// it. Inject configuration instead (see `EnvLookup`).
+    #[test]
+    fn cargo_anneal_sources_never_mutate_the_process_environment() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let forbidden = [concat!("set", "_var("), concat!("remove", "_var(")];
+        let mut stack = vec![src_dir];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = fs::read_to_string(&path).expect("read source");
+                    for (lineno, line) in text.lines().enumerate() {
+                        if forbidden.iter().any(|needle| line.contains(needle)) {
+                            offenders.push(format!(
+                                "{}:{}: {}",
+                                path.display(),
+                                lineno + 1,
+                                line.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "process-environment mutation in cargo-anneal sources:\n{}",
+            offenders.join("\n")
+        );
     }
 }
