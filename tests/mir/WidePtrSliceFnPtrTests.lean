@@ -2194,6 +2194,22 @@ theorem unsize_elem_mismatch_ub_32 :
   (trusted_evalUnsizeCoercion_spec_none_ub L32 L32 (cp 1) testMem testDecls testLayouts32 true .not
     (.uint .u8) 3 { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨1, 0⟩ rfl rfl rfl).2
 
+/-- `&[&^15 bool; 5]`, a well-formed Rust type within the `defaultTyEqFuel = 16` recursion budget. -/
+def deepRef15ArrayDecl : LocalDecl :=
+  { mutability := .not
+    ty := { kind := .ref .not (.array (nestedRefRigidTy 15) 5), layoutIdx := 1 }
+    debugName := none }
+
+/-- Local `1` re-typed as `&[&^15 bool; 5]`. -/
+def declsDeepRef15 : List LocalDecl := testDecls.set 1 deepRef15ArrayDecl
+
+/-- 5-element backing array of 8-byte `&^15 bool` pointers for local `0`. -/
+def backingPtr5 : Value :=
+  .aggregate 0 [.ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8]
+
+def backingPtr5Elems : List Value :=
+  [.ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8, .ptr ⟨1, 0⟩ 8]
+
 /-- `&[&^16 bool; 5]`, a well-formed Rust type. -/
 def deepRefArrayDecl : LocalDecl :=
   { mutability := .not
@@ -2203,16 +2219,28 @@ def deepRefArrayDecl : LocalDecl :=
 /-- Local `1` re-typed as `&[&^16 bool; 5]`. -/
 def declsDeepRef : List LocalDecl := testDecls.set 1 deepRefArrayDecl
 
-/-- The well-typed `&[&^16 bool; 5] -> &[&^16 bool]` unsizing faults in `Trusted` because
-`rigidTyEq` runs out of fuel on the 16-deep element type, whereas the 15-deep coercion is accepted by
-`unsizeArrayToSliceSpec?` (64-bit). -/
+/-- Program-level `evalRvalue` fuel-boundary witness on well-formed nested reference types:
+1. At depth `15` (`&[&^15 bool; 5] -> &[&^15 bool]`), `evalRvalue` over a stack-borrowed 5-element
+   pointer array `backingPtr5` succeeds with `.ok (LWidePtr.encodeProv ⟨1, 0⟩ 5 8)`;
+2. At depth `16` (`&[&^16 bool; 5] -> &[&^16 bool]`), `evalRvalue` faults with `.ub` because
+   `rigidTyEq` exhausts `defaultTyEqFuel = 16` (64-bit). -/
 theorem unsize_deep_ref_elem_fuel_boundary_64 :
     unsizeArrayToSliceSpec? (.ref .not (.array (nestedRefRigidTy 15) 5))
         (.ref .not (.slice (nestedRefRigidTy 15))) = some 5 ∧
+    evalRvalue (L64.set 0 (.init backingPtr5))
+        (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice (nestedRefRigidTy 15)))))
+        testMem declsDeepRef15 testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨1, 0⟩ 5 8) (L64.set 0 (.init backingPtr5)) testMem ∧
     evalRvalue L64
         (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice (nestedRefRigidTy 16)))))
         testMem declsDeepRef testLayouts64 = .ub :=
   ⟨rigidTyEq_nested_ref_depth_boundary.2.1,
+    (trusted_evalUnsizeCoercion_stack_borrow_backing_iff
+      (L64.set 0 (.init backingPtr5)) (L64.set 0 (.init backingPtr5)) (cp 1)
+      testMem declsDeepRef15 testLayouts64 true .not (nestedRefRigidTy 15) 3
+      { kind := .ref .not (.array (nestedRefRigidTy 15) 5), layoutIdx := 1 }
+      ⟨1, 0⟩ 5 activeEntry backingPtr5 [] 0 backingPtr5Elems 0
+      rfl rfl rfl rfl rigidTyEq_nested_ref_depth_boundary.2.1 rfl rfl rfl).2.2.1.mpr rfl,
     (trusted_evalUnsizeCoercion_spec_none_ub L64 L64 (cp 1) testMem declsDeepRef testLayouts64 true
       .not (nestedRefRigidTy 16) 3 { kind := .ref .not (.array (nestedRefRigidTy 16) 5), layoutIdx := 1 }
       ⟨1, 0⟩ rfl rfl rigidTyEq_nested_ref_depth_boundary.2.2.2).2⟩
@@ -2251,6 +2279,36 @@ theorem len_scalar_wide_empty_ub_64 :
     (L64.set 27 (.init (.aggregate 0 [.scalar ⟨4096, 8⟩, .scalar ⟨0, 8⟩])))
     (L64.set 27 (.init (.aggregate 0 [.scalar ⟨4096, 8⟩, .scalar ⟨0, 8⟩]))) (derefPlace 27) testMem
     testDecls testLayouts64 [] u32Ty _ ⟨4096, 8⟩ ⟨0, 8⟩ rfl rfl rfl
+
+/-- Symmetric exposed-address-on-the-left vs. provenance-pointer-on-the-right comparison
+(`trusted_evalRvalue_binaryOp_wide_ptr_lhs_exposed_addr_ordering`), exercising the `rhsThin = .ptr`
+gate of `evalWidePtrAggregateRelBinOp` on both typed (32-bit `<`) and untyped (`localDecls = []`,
+64-bit `==`) executions. -/
+theorem widePtr_lhs_exposed_addr_lt_and_eq_witnesses :
+    evalRvalue L32 (.binaryOp .lt (cp 27) (cp 20)) testMem testDecls testLayouts32 =
+      .ok (.scalar (boolToScalar true)) L32 testMem ∧
+    evalRvalue (exposedPairLocals 8) (.binaryOp .eq (cp 27) (cp 20)) testMem [] testLayouts64 =
+      .ok (.scalar (boolToScalar true)) (exposedPairLocals 8) testMem :=
+  ⟨(trusted_evalRvalue_binaryOp_wide_ptr_lhs_exposed_addr_ordering L32 L32 L32 .lt (cp 27) (cp 20)
+      testMem testDecls testLayouts32 4096 7 4 5 5 rfl rfl rfl rfl rfl (by decide) (by decide)
+      (by decide) (by decide) (by decide)).trans rfl,
+    (trusted_evalRvalue_binaryOp_wide_ptr_lhs_exposed_addr_ordering (exposedPairLocals 8)
+      (exposedPairLocals 8) (exposedPairLocals 8) .eq (cp 27) (cp 20) testMem [] testLayouts64
+      458756 7 4 5 5 rfl rfl rfl rfl rfl (by decide) (by decide) (by decide) (by decide)
+      (by decide)).trans rfl⟩
+
+/-- Structural untyped global-allocation `Unsize` quotient witness
+(`trusted_evalUnsizeCoercion_untyped_global_alloc_div_ok`): at byte offset `4` of the 20-byte
+`testGlobal`, `4 ∣ 4` and `4 ∣ (20 - 4)`, yielding length `(20 - 4) / 4 = 4` (64-bit). -/
+theorem unsize_untyped_global_div_ok_witness_64 :
+    evalRvalue (L64.set 32 (.init (.ptr ⟨9, 4⟩ 8)))
+        (.cast (.pointerCoercion "Unsize") (cp 32) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem [] testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨9, 4⟩ 4 8) (L64.set 32 (.init (.ptr ⟨9, 4⟩ 8))) testMem :=
+  trusted_evalUnsizeCoercion_untyped_global_alloc_div_ok
+    (L64.set 32 (.init (.ptr ⟨9, 4⟩ 8))) (L64.set 32 (.init (.ptr ⟨9, 4⟩ 8))) (cp 32)
+    testMem [] testLayouts64 true .not u32Ty 3 ⟨9, 4⟩ testGlobal 4
+    rfl rfl rfl rfl (fun h => by cases h) (by decide) rfl (by decide) ⟨1, by decide⟩ ⟨4, by decide⟩
 
 end IllTypedAndExposedWitnesses
 

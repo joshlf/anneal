@@ -17871,6 +17871,61 @@ theorem rigidTyEq_nested_ref_depth_boundary :
         (.ref .not (.slice (nestedRefRigidTy 16))) = .none :=
   ⟨rfl, rfl, rfl, rfl⟩
 
+/-- **Structural arithmetic quotient theorem for untyped global-allocation `Unsize`**
+(`operandTy = .none`, `Places.lean:13512–13545`): when mutability is compatible,
+`ptrVal.offsetBytes ≤ length alloc.bytes`, `0 < elemSz`, and `elemSz` divides both
+`ptrVal.offsetBytes` and the remaining byte count `length alloc.bytes - ptrVal.offsetBytes`,
+`evalRvalue (.cast (.pointerCoercion "Unsize") ...)` produces a slice fat pointer of length
+`(length alloc.bytes - ptrVal.offsetBytes) / elemSz`. -/
+theorem trusted_evalUnsizeCoercion_untyped_global_alloc_div_ok
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (ptrVal : ProvenancePtr) (alloc : CapturedAllocation) (elemSz : Nat)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
+    (hUntyped : operandTy localDecls layouts op = .none)
+    (hGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .some alloc)
+    (hMut : dstMut = .mut → alloc.mutability = .mut)
+    (hOffLe : ptrVal.offsetBytes ≤ length alloc.bytes)
+    (hSz : tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } =
+      .some elemSz)
+    (hPos : 0 < elemSz)
+    (hDvdOff : elemSz ∣ ptrVal.offsetBytes)
+    (hDvdRem : elemSz ∣ (length alloc.bytes - ptrVal.offsetBytes)) :
+    evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts =
+      .ok (LWidePtr.encodeProv ptrVal ((length alloc.bytes - ptrVal.offsetBytes) / elemSz)
+        (layoutPointerBytes layouts)) locals' mem := by
+  have hMutB :
+      ∀ m₁ m₂ : Mutability,
+        (m₁ = .mut → m₂ = .mut) →
+          (match m₁, m₂ with | .mut, .not => false | _, _ => true) = true := by
+    intro m₁ m₂
+    cases m₁ <;> cases m₂
+    · exact fun _ => rfl
+    · exact fun _ => rfl
+    · exact fun h => by cases h rfl
+    · exact fun _ => rfl
+  have hSzNz : Nat.beq elemSz 0 = false :=
+    nat_beq_eq_false_of_ne (Nat.ne_of_gt hPos)
+  have hAlignOff : byteOffsetToElemIdx? ptrVal.offsetBytes elemSz =
+      .some (ptrVal.offsetBytes / elemSz) :=
+    (byteOffsetToElemIdx?_eq_some_iff ptrVal.offsetBytes elemSz
+      (ptrVal.offsetBytes / elemSz)).mpr (Or.inr ⟨hPos, hDvdOff, rfl⟩)
+  have hAlignRem : byteOffsetToElemIdx? (Nat.sub (length alloc.bytes) ptrVal.offsetBytes) elemSz =
+      .some ((length alloc.bytes - ptrVal.offsetBytes) / elemSz) :=
+    (byteOffsetToElemIdx?_eq_some_iff (length alloc.bytes - ptrVal.offsetBytes) elemSz
+      ((length alloc.bytes - ptrVal.offsetBytes) / elemSz)).mpr (Or.inr ⟨hPos, hDvdRem, rfl⟩)
+  exact (trusted_evalUnsizeCoercion_untyped_global_alloc locals locals' op mem localDecls layouts
+    isDstRef dstMut dstElem dstLIdx ptrVal alloc elemSz (ptrVal.offsetBytes / elemSz)
+    ((length alloc.bytes - ptrVal.offsetBytes) / elemSz) hOp hNoBorrow hUntyped hGlobal
+    (hMutB dstMut alloc.mutability hMut)
+    (Nat.ble_eq_true_of_le hOffLe) hSz hSzNz hAlignOff hAlignRem).2
+
 end WidePtrSliceAndFnPtrCast
 
 end Anneal.Mir.Cast

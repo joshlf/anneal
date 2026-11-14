@@ -16303,7 +16303,16 @@ theorem trusted_evalRvalue_ptrMetadata_wide_scalar_iff
       · rfl
       · exact absurd ⟨Nat.eq_of_beq_eq_true h1, Nat.eq_of_beq_eq_true h2⟩ hBad
 
-/-! ### 3.B.3 Dereferenced Slice `evalPlaceLen` & `evalRvalue (.len place)` -/
+/-! ### 3.B.3 Dereferenced Slice `evalPlaceLen` & `evalRvalue (.len place)`
+
+Note on `Trusted` (`Places.lean:14391–14530`):
+- For a provenance-carrying wide slice pointer `.aggregate 0 [.ptr ptrVal ptrSz, .scalar lenSc]`,
+  `evalPlaceLen` checks `sliceLenBorrowOk` (supporting stack borrows, `callerLocals`, global
+  allocations, `allocId = 0` with `offsetBytes ≠ 0 ∧ lenSc.bits = 0`, and unbacked `allocId ≠ 0`).
+- For a provenance-less wide slice pointer `.aggregate 0 [.scalar addrSc, .scalar lenSc]`,
+  `evalPlaceLen` has no `.ok` arm (`| .ok _ _ => .ub` at `Places.lean:14520`), so `Rvalue.len`
+  faults with `.ub` for *every* `lenSc.bits` (including `lenSc.bits = 0`, unlike `evalUnsizeCoercion`
+  at `Places.lean:13547` and unlike `allocId = 0` at `Places.lean:14485`). -/
 
 /-- Step-level dispatch identity for `Rvalue.len`. -/
 theorem evalRvalue_len_eq (locals : List LocalSlot) (place : Place) (mem : Memory)
@@ -16698,8 +16707,11 @@ theorem sliceLenBorrowOk_unbacked (locals' : List LocalSlot) (mem : Memory)
   unfold sliceLenBorrowOk
   simp only [hNoBorrow, hNoGlobal, nat_beq_eq_false_of_ne hNz] <;> rfl
 
-/-- **`Rvalue.len` of a dereferenced provenance-less wide pointer faults** (no allocation can
-justify the length word). -/
+/-- **`Rvalue.len` of a dereferenced provenance-less wide pointer faults for every length**
+(`Places.lean:14520`): `Trusted`'s `evalPlaceLen` has no `.ok` arm for
+`.aggregate 0 [.scalar addrSc, .scalar lenSc]`, so `Rvalue.len` returns `.ub` even when
+`lenSc.bits = 0` and `addrSc.bits ≠ 0` (contrasting with `evalUnsizeCoercion` on scalar raw
+pointers at `Places.lean:13547` and with `allocId = 0` at `Places.lean:14485`). -/
 theorem trusted_evalRvalue_len_deref_wide_scalar_ub
     (locals locals' : List LocalSlot) (place : Place) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (initProj : List ProjectionElem)
@@ -17965,6 +17977,44 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_exposed_addr_ordering
       mem.callerLocals localDecls layouts hNoBorrow hW)
     (resolveWideWordScalar?_scalar_canonical x _ locals₂ mem.borrows mem.callerLocals localDecls
       layouts hx)
+    (resolveWideWordScalar?_scalar_canonical m₁ _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hm₁)
+    (resolveWideWordScalar?_scalar_canonical m₂ _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hm₂) hPb
+
+/-- **Exposed integer address vs. provenance pointer** (on `evalRvalue`, symmetric to
+`trusted_evalRvalue_binaryOp_wide_ptr_exposed_addr_ordering` via the `rhsThin = .ptr` gate of
+`evalWidePtrAggregateRelBinOp`): a provenance-less wide pointer `[.scalar ⟨x, ptrBytes⟩, .scalar ⟨m₁, ptrBytes⟩]`
+on the left compared with an unborrowed provenance pointer `[.ptr ⟨allocId, o⟩, .scalar ⟨m₂, ptrBytes⟩]`
+on the right evaluates under every relational `op` to
+`relOpOrderingScalar op ((compare x (allocId * 65536 + o)).then (compare m₁ m₂))` — even when `lhsOp`
+is untyped (`isExplicitWidePtrTy = false`). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_lhs_exposed_addr_ordering
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (x allocId o m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.scalar ⟨x, layoutPointerBytes layouts⟩ ::
+        .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ⟨allocId, o⟩ (layoutPointerBytes layouts) ::
+        .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
+    (hRel : isRelationalBinOp op = true)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hNoBorrow : lookupBorrow mem.borrows allocId = .none)
+    (hx : x < scalarModulus (layoutPointerBytes layouts))
+    (hW : Nat.add (Nat.mul allocId 65536) o < scalarModulus (layoutPointerBytes layouts))
+    (hm₁ : m₁ < scalarModulus (layoutPointerBytes layouts))
+    (hm₂ : m₂ < scalarModulus (layoutPointerBytes layouts))
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (relOpOrderingScalar op
+        ((compare x (Nat.add (Nat.mul allocId 65536) o)).then (compare m₁ m₂)))) locals₂ mem :=
+  trusted_evalRvalue_binaryOp_wide_ptr_rel_ordering locals locals₁ locals₂ op lhsOp rhsOp mem
+    localDecls layouts _ _ _ _ x _ m₁ m₂ hL hR hRel hPtrOp rfl rfl (Or.inr (Or.inr ⟨_, _, rfl⟩))
+    (resolveWideWordScalar?_scalar_canonical x _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hx)
+    (resolveWideWordScalar?_unborrowed_ptr_canonical allocId o _ locals₂ mem.borrows
+      mem.callerLocals localDecls layouts hNoBorrow hW)
     (resolveWideWordScalar?_scalar_canonical m₁ _ locals₂ mem.borrows mem.callerLocals localDecls
       layouts hm₁)
     (resolveWideWordScalar?_scalar_canonical m₂ _ locals₂ mem.borrows mem.callerLocals localDecls
