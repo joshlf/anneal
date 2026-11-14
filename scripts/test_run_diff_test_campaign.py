@@ -7826,6 +7826,20 @@ class PassEp2B2AdversarialRegressionTest(unittest.TestCase):
         owning mutator in `infer_finding_cause`, even when `seed_name` is a known
         corpus bug seed and `applied_mutators` lists a different mutator first."""
         src = MUTATORS_MIRI_RS.read_text(encoding="utf-8")
+        # Identifiers that the shared repro prefix (which precedes every finding's
+        # `mutant_source`) or the corpus seeds also declare cannot identify a
+        # mutator; `RawPtrOffsetMutator`'s `write_bytes!` template reuses the
+        # preamble macro's `__wb_dst`, and is identified by `__wb_src` instead.
+        shared_text = "\n".join(
+            [
+                _rust_str_const("MIRI_CORPUS_CRATE_HEADER"),
+                _rust_str_const("MIRI_CORPUS_MODULE_PREAMBLE"),
+                (REPO_ROOT / "tests" / "miri-diff" / "corpus" / "src" / "lib.rs").read_text(
+                    encoding="utf-8"
+                ),
+            ]
+        )
+        shared_idents: set[str] = set()
         checked = 0
         for mutator in campaign.MIRI_MUTATOR_NAMES:
             marker = f"impl MiriAstMutator for {mutator}"
@@ -7837,6 +7851,9 @@ class PassEp2B2AdversarialRegressionTest(unittest.TestCase):
             self.assertTrue(idents, mutator)
             other_mutator = next(m for m in campaign.MIRI_MUTATOR_NAMES if m != mutator)
             for ident in idents:
+                if re.search(rf"\b{re.escape(ident)}\b", shared_text):
+                    shared_idents.add(ident)
+                    continue
                 sample_ident = f"{ident}42" if ident.endswith("_") else ident
                 with self.subTest(mutator=mutator, ident=sample_ident):
                     finding = {
@@ -7861,6 +7878,7 @@ class PassEp2B2AdversarialRegressionTest(unittest.TestCase):
                     )
                     checked += 1
         self.assertGreaterEqual(checked, 120)
+        self.assertEqual(shared_idents, {"__wb_dst"})
 
         # Explicit regression checks for the two cross-mutator prefix collisions:
         # 1. `PlaceProjectionWrapper::Panic`'s `let __miri_proj_1: u32 = __oob_arr[__oob_idx];`
@@ -8206,6 +8224,133 @@ class PassEp2B2AdversarialRegressionTest(unittest.TestCase):
             )
             self.assertIsNotNone(prob_tags)
             self.assertIn("stale_known_anneal_bug_witness_polarity_mismatch", str(prob_tags))
+
+
+def _repro_prefix() -> str:
+    """The prefix `miri-difftest` puts before every candidate in `repro.rs` (and so
+    in every finding's `mutant_source`)."""
+    return (
+        _rust_str_const("MIRI_CORPUS_CRATE_HEADER")
+        + "\n"
+        + _rust_str_const("MIRI_CORPUS_MODULE_PREAMBLE")
+        + "\n"
+    )
+
+
+class PassEp2A2AdversarialRegressionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_no_mutator_token_occurs_in_the_shared_preamble_or_corpus_seeds(self) -> None:
+        # B2 added `__wb_dst` to `RAW_PTR_OFFSET_MUTATOR_TOKENS`, but the preamble's
+        # `write_bytes!` macro (in every `mutant_source`, and in the corpus crate)
+        # declares `__wb_dst` too.
+        corpus = (REPO_ROOT / "tests" / "miri-diff" / "corpus" / "src" / "lib.rs").read_text(
+            encoding="utf-8"
+        )
+        for name, text in (("repro prefix", _repro_prefix()), ("corpus crate", corpus)):
+            with self.subTest(text=name):
+                self.assertEqual(
+                    [tok for tok in campaign.ALL_MIRI_MUTATOR_TOKENS if tok in text], []
+                )
+
+    def test_attribution_against_the_real_repro_prefix(self) -> None:
+        prefix = _repro_prefix()
+        start = len(prefix.splitlines()) + 1
+        # 1. A fault on the seed's own line before a mutator tail is the seed's
+        #    (B2: the preamble's `__wb_dst` in `prefix_text` disabled this rule for
+        #    every real finding, blaming the first mutator instead).
+        seed_fault = {
+            "seed_name": "s07_shift_seed",
+            "applied_mutators": ["ArithmeticCastMutator"],
+            "mutant_source": prefix
+            + "pub fn s07_shift_seed__b0_c3() -> u32 {\n"
+            "    let x: u32 = 7u32;\n"
+            "    let y: u32 = x << 40u32;\n"
+            "    let __ovf_a: u32 = 1u32;\n"
+            "    y ^ __ovf_a\n"
+            "}\n",
+            "miri_pos": f"src/lib.rs:{start + 2}:18",
+        }
+        self.assertEqual(campaign.infer_finding_cause(seed_fault, set()), "s07_shift_seed")
+        # 2. An unmutated candidate is its seed's even when its fault lies inside
+        #    the preamble's `write_bytes!` macro (B2: `RawPtrOffsetMutator`).
+        wb_line = next(
+            idx + 1
+            for idx, line in enumerate(prefix.splitlines())
+            if "offset(__wb_dst" in line
+        )
+        seed = "pass_intrinsics_write_bytes_copy_and_arith_offset"
+        for mutators in ([], None, [7]):
+            with self.subTest(applied_mutators=mutators):
+                identity = {
+                    "seed_name": seed,
+                    "applied_mutators": mutators,
+                    "mutant_source": prefix
+                    + f"pub fn {seed}() -> u32 {{\n    let __oob_x: u32 = 0u32;\n    __oob_x\n}}\n",
+                    "miri_pos": f"src/lib.rs:{wb_line}:40",
+                }
+                self.assertEqual(campaign.infer_finding_cause(identity, set()), seed)
+                identity["miri_pos"] = f"src/lib.rs:{start + 1}:9"
+                self.assertEqual(campaign.infer_finding_cause(identity, set()), seed)
+        # 3. `RawPtrOffsetMutator`'s `write_bytes!` template is still attributed by
+        #    `__wb_src`, on each of its faulting lines.
+        template = (
+            "pub fn s01_checked_add__b0_c1() -> u32 {\n"
+            "    let mut __wb_src: PairU32 = PairU32 { a: 1u32, b: 2u32 };\n"
+            "    let mut __wb_dst: u32 = 0u32;\n"
+            "    unsafe {\n"
+            "        write_bytes!(&raw mut __wb_src.a, 1u8, 1usize);\n"
+            "        copy_nonoverlapping(&raw const __wb_src.a, &raw mut __wb_dst, 1usize);\n"
+            "    }\n"
+            "    let __miri_ptr_9: u32 = (__wb_dst & 0xFFu32) ^ __wb_src.b;\n"
+            "    __miri_ptr_9\n"
+            "}\n"
+        )
+        for offset in (4, 5, 7):
+            with self.subTest(template_line=offset):
+                finding = {
+                    "seed_name": "s01_checked_add",
+                    "applied_mutators": ["ArithmeticCastMutator", "RawPtrOffsetMutator"],
+                    "mutant_source": prefix + template,
+                    "miri_pos": f"src/lib.rs:{start + offset}:9",
+                }
+                self.assertEqual(
+                    campaign.infer_finding_cause(finding, set()), "RawPtrOffsetMutator"
+                )
+
+    def test_variant_verdict_must_name_the_variant_kill_class(self) -> None:
+        bool_mutant = next(
+            m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "bool_valid_range"
+        )
+        wide_shift = next(m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "wide_shift")
+        for mutant, verdict, killed in (
+            (bool_mutant, ["diverge", "missed_ub"], True),
+            (bool_mutant, ["diverge", "wrong_value"], False),
+            (bool_mutant, ["not_compared", "unsupported"], False),
+            (bool_mutant, ["agree", ""], False),
+            (bool_mutant, ["diverge", "missed_ub", "extra"], False),
+            (bool_mutant, ["diverge"], False),
+            (bool_mutant, "diverge:missed_ub", False),
+            (wide_shift, ["not_compared", "capture_failed"], True),
+            (wide_shift, ["diverge", "missed_ub"], True),
+            (wide_shift, ["not_compared", "not_a_reason"], False),
+            (wide_shift, ["agree", ""], False),
+        ):
+            with self.subTest(mutant=mutant["id"], verdict=verdict):
+                gate = campaign.run_semantic_mutant_self_check(
+                    evaluator=_variant_reporting_evaluator(
+                        lambda m, vs, verdict=verdict: [dict(vs[0], verdict=verdict), *vs[1:]]
+                    ),
+                    mutants=[mutant],
+                )
+                self.assertEqual(gate["passed"], killed, gate["results"])
+        # The simulation's own per-variant verdicts satisfy the check.
+        for res in campaign.run_semantic_mutant_self_check()["results"]:
+            for v in res["variants"]:
+                with self.subTest(variant=v["label"]):
+                    if v["kill_class"] != campaign.HARNESS_ERROR_KILL_CLASS:
+                        self.assertEqual(v["verdict"], ["diverge", v["kill_class"]])
 
 
 if __name__ == "__main__":

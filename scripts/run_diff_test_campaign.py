@@ -3921,7 +3921,12 @@ def normalize_anneal_tag(raw_tag: str) -> str:
 
 # Identifiers that each `miri-difftest` mutator introduces into a candidate (see
 # `crates/anneal-difftest/src/mutators_miri.rs`), used to attribute a divergence
-# whose earliest fault line contains one of them to that mutator.
+# whose earliest fault line contains one of them to that mutator. No token may
+# occur in the shared repro prefix (`MIRI_CORPUS_CRATE_HEADER` +
+# `MIRI_CORPUS_MODULE_PREAMBLE`, which precedes every finding's `mutant_source`)
+# or in the corpus seeds: the preamble's `write_bytes!` macro declares its own
+# `__wb_dst`, so `RawPtrOffsetMutator`'s `write_bytes!` template is identified by
+# `__wb_src` (which every faulting line of that template names) instead.
 RAW_PTR_OFFSET_MUTATOR_TOKENS = (
     "__miri_ptr_",
     "__oob_pair",
@@ -3940,7 +3945,6 @@ RAW_PTR_OFFSET_MUTATOR_TOKENS = (
     "__unaligned_",
     "__u8_base",
     "__wb_src",
-    "__wb_dst",
     "__cp_src",
     "__cp_dst",
     "__src_p",
@@ -4058,7 +4062,12 @@ def extract_fault_line_text(finding: dict[str, Any]) -> str:
 def infer_finding_cause(
     finding: dict[str, Any], known_corpus_bug_seeds: set[str]
 ) -> str:
-    """Identifies the seed or mutator responsible for a divergence finding."""
+    """Identifies the seed or mutator responsible for a divergence finding.
+
+    An unmutated candidate (no `applied_mutators`) is always its seed's: no
+    mutator introduced any of its code, whatever tokens its fault line (for example
+    a fault inside the shared preamble's `write_bytes!` macro) happens to contain.
+    """
     seed_name = str(finding["seed_name"])
     mutators = finding.get("applied_mutators")
     first_mutator = (
@@ -4068,6 +4077,8 @@ def infer_finding_cause(
         and isinstance(mutators[0], str)
         else ""
     )
+    if not first_mutator:
+        return seed_name
     fault_text = extract_fault_line_text(finding)
     if fault_text:
         for probe_prefix, mutator_name in (
@@ -5382,14 +5393,29 @@ def _reported_variant_problems(
             and ("tag_witness_polarity" not in v or v.get("tag_witness_polarity") == v_pol)
         )
         if "verdict" in v:
+            # The variant's outcome-tag verdict `[verdict, detail]`: a divergence
+            # kill must be exactly `["diverge", kill_class]`, and a harness kill a
+            # real divergence or not-compared verdict (never an agreement).
             v_verdict = v.get("verdict")
-            v_ok = (
-                v_ok
-                and isinstance(v_verdict, (list, tuple))
-                and len(v_verdict) >= 1
-                and isinstance(v_verdict[0], str)
-                and v_verdict[0].strip().lower() in ("diverge", "not_compared")
+            verdict_pair = (
+                tuple(v_verdict)
+                if isinstance(v_verdict, (list, tuple))
+                and len(v_verdict) == 2
+                and all(isinstance(part, str) for part in v_verdict)
+                else None
             )
+            v_ok = v_ok and verdict_pair is not None
+            if v_ok and verdict_pair is not None:
+                if v_cls == HARNESS_ERROR_KILL_CLASS:
+                    v_ok = (
+                        verdict_pair[0] == "diverge"
+                        and verdict_pair[1] in VALID_DIVERGENCE_CLASSES
+                    ) or (
+                        verdict_pair[0] == "not_compared"
+                        and verdict_pair[1] in VALID_NOT_COMPARED_REASONS
+                    )
+                else:
+                    v_ok = verdict_pair == ("diverge", v_cls)
         if "exit_code" in v:
             v_exit = v.get("exit_code")
             v_ok = (
