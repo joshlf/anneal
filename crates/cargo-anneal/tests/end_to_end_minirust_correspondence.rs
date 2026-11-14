@@ -1399,9 +1399,28 @@ end MutationBreakageCheck
         &format!("{mutated_ops}\n{proof_assertions}"),
     );
 
-    let examples_dir = root.join("examples");
+    let ops_olean = root.join(
+        ".lake/build/lib/lean/MiniRust/Snapshots/S2026_05_Matched/Generated/Ops.olean",
+    );
+    if !ops_olean.is_file() {
+        let build_out = Command::new("lake")
+            .current_dir(&root)
+            .args([
+                "build",
+                "MiniRust.Snapshots.S2026_05_Matched.Generated.Ops",
+            ])
+            .output()
+            .expect("failed to invoke `lake build MiniRust.Snapshots.S2026_05_Matched.Generated.Ops`");
+        assert!(
+            build_out.status.success(),
+            "`lake build MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` must succeed, stderr:\n{}\nstdout:\n{}",
+            String::from_utf8_lossy(&build_out.stderr),
+            String::from_utf8_lossy(&build_out.stdout)
+        );
+    }
+
     let unmutated_lean_out = Command::new("lake")
-        .current_dir(&examples_dir)
+        .current_dir(&root)
         .args(["env", "lean"])
         .arg(&unmutated_check_file)
         .output()
@@ -1414,7 +1433,7 @@ end MutationBreakageCheck
     );
 
     let mutated_lean_out = Command::new("lake")
-        .current_dir(&examples_dir)
+        .current_dir(&root)
         .args(["env", "lean"])
         .arg(&mutated_check_file)
         .output()

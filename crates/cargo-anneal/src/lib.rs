@@ -83,9 +83,10 @@ pub use miri_diff::{
 pub use miri_oracle::{
     ALLOW_MISSING_MIRI_ENV, AnnealOracleConfig, AnnealOutcome, ComparisonVerdict,
     DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
-    DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
-    MiriToolchain, NotComparedReason, OracleItemSpec, SourcePos, SourceSpan,
+    DifftestOracleReport, DivergenceKind, ItemOracleReport, MIRI_SETUP_BIN_ENV, MiriOracleConfig,
+    MiriOutcome, MiriToolchain, NotComparedReason, OracleItemSpec, SourcePos, SourceSpan,
     compare_miri_and_anneal, confirm_anneal_outcomes_in_kernel, discover_zero_arg_pub_fns,
+    ensure_miri_sysroot_initialized, ensure_miri_sysroot_initialized_with,
     parse_anneal_probe_output, parse_miri_process_output, render_anneal_confirm_module,
     render_anneal_probe_module, render_miri_driver_source, run_anneal_oracle,
     run_difftest_oracle_pipeline, run_miri_oracle, source_files_match,
@@ -3157,6 +3158,14 @@ pub(crate) fn resolve_lake_binary() -> PathBuf {
         }
     }
     PathBuf::from("lake")
+}
+
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

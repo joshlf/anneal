@@ -154,7 +154,7 @@ def toS07Permission :
   | .Prot p => .Prot (toS07PermissionProt p)
 
 @[reducible]
-def mrWriteNodeRelation (entry : BorrowEntry) (writerTag : Option Nat) : NodeRelation :=
+def treeBorrowWriteNodeRelation (entry : BorrowEntry) (writerTag : Option Nat) : NodeRelation :=
   match writerTag with
   | .none => .Foreign
   | .some tag =>
@@ -175,7 +175,7 @@ abbrev mrExpectedWritePerm
   | true =>
     match
       MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition
-        (toPermissionUnprot false entry.perm) .Write (mrWriteNodeRelation entry writerTag)
+        (toPermissionUnprot false entry.perm) .Write (treeBorrowWriteNodeRelation entry writerTag)
     with
     | .ok next => ofPermissionUnprot next
     | .error _ => entry.perm
@@ -253,7 +253,7 @@ theorem mir_updateBorrowPerm_corresponds_to_minirust_write
       | some wTag =>
         cases htag : Nat.beq tag wTag <;>
           rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-          simp [updateBorrowPerm, mrExpectedWritePerm, mrWriteNodeRelation, hloc,
+          simp [updateBorrowPerm, mrExpectedWritePerm, treeBorrowWriteNodeRelation, hloc,
             toPermissionUnprot, ofPermissionUnprot, htag,
             MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
             MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write,
@@ -280,7 +280,7 @@ theorem mir_updateBorrowPerm_unprot_eq_generated_ops
       | true =>
         match
           MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition
-            (toPermissionUnprot false entry.perm) .Write (mrWriteNodeRelation entry writerTag)
+            (toPermissionUnprot false entry.perm) .Write (treeBorrowWriteNodeRelation entry writerTag)
         with
         | .ok next => next
         | .error _ => toPermissionUnprot false entry.perm := by
@@ -296,7 +296,7 @@ theorem mir_updateBorrowPerm_unprot_eq_generated_ops
     | some wTag =>
       cases htag : Nat.beq tag wTag <;>
         rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-        simp [updateBorrowPerm, mrWriteNodeRelation, hloc, htag, toPermissionUnprot,
+        simp [updateBorrowPerm, treeBorrowWriteNodeRelation, hloc, htag, toPermissionUnprot,
           MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
           MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write,
           MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.local_write]

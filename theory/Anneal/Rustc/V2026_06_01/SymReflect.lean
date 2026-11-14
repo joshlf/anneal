@@ -3060,6 +3060,41 @@ theorem symFinishPinEq_expSz0_false
     rw [h] at hFin
     nomatch hFin
 
+theorem symFinishPinEq_scOut_eq
+    {st : SymState}
+    {dstLoc : Local}
+    {slots₂ : List SymSlot}
+    {idx : Nat}
+    {expectedSc : ScalarInt}
+    {idxOut : Nat}
+    {scOut : ScalarInt}
+    {stTrue stFalse : SymState}
+    (hFin : symFinishPinEq st dstLoc slots₂ idx expectedSc = .some (idxOut, scOut, stTrue, stFalse)) :
+    scOut = expectedSc := by
+  dsimp only [symFinishPinEq] at hFin
+  cases hExpSz0 : Nat.beq expectedSc.sizeBytes 0 with
+  | true => rw [hExpSz0] at hFin; nomatch hFin
+  | false =>
+    rw [hExpSz0] at hFin
+    dsimp only at hFin
+    cases hGetDst : get? slots₂ dstLoc with
+    | none => rw [hGetDst] at hFin; nomatch hFin
+    | some dstSlot =>
+      rw [hGetDst] at hFin
+      have ⟨_, hOk⟩ := symSlot_not_dead_of_match_some hFin
+      cases hSetT : set? slots₂ dstLoc (.concrete (.init (.scalar ⟨1, 1⟩))) with
+      | none => rw [hSetT] at hOk; nomatch hOk
+      | some slotsTrue =>
+        rw [hSetT] at hOk
+        cases hSetF : set? slots₂ dstLoc (.concrete (.init (.scalar ⟨0, 1⟩))) with
+        | none => rw [hSetF] at hOk; nomatch hOk
+        | some slotsFalse =>
+          rw [hSetF] at hOk
+          injection hOk with hTup
+          injection hTup with _ hRest1
+          injection hRest1 with hSc _
+          exact Eq.symm hSc
+
 theorem symExtractPinEq_branch_sound
     (fuel : Nat)
     (body : CapturedMir)
@@ -3276,6 +3311,2476 @@ theorem symExtractPinEq_sound
   | inl hTrue => exact hTrue
   | inr hFalseHold => exact False.elim (checkSymReturnsFalse_sound fuel body args stFalse hFalse hFalseHold)
 
+/-- Byte width of a `UintTy` on a 64-bit target. -/
+def uintBytesOfKind : UintTy → Nat
+  | .u8 => 1
+  | .u16 => 2
+  | .u32 => 4
+  | .u64 => 8
+  | .usize => 8
+  | .u128 => 16
+
+theorem nat_ble_one_uintBytesOfKind (uKind : UintTy) :
+    Nat.ble 1 (uintBytesOfKind uKind) = true := by
+  cases uKind <;> rfl
+
+/-- Boolean equality on `UintTy`. -/
+def uintTyEq : UintTy → UintTy → Bool
+  | .u8, .u8 => true
+  | .u16, .u16 => true
+  | .u32, .u32 => true
+  | .u64, .u64 => true
+  | .u128, .u128 => true
+  | .usize, .usize => true
+  | _, _ => false
+
+theorem uintTyEq_eq_true {a b : UintTy} (h : uintTyEq a b = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | nomatch h
+
+/-- Check whether `k` is `.uint uKind`. -/
+def isUintRigidKind (uKind : UintTy) : RigidTy → Bool
+  | .uint k => uintTyEq k uKind
+  | _ => false
+
+theorem eq_uint_of_isUintRigidKind
+    {uKind : UintTy} {k : RigidTy}
+    (h : isUintRigidKind uKind k = true) :
+    k = .uint uKind := by
+  cases k with
+  | uint k' => exact congrArg RigidTy.uint (uintTyEq_eq_true h)
+  | _ => nomatch h
+
+/-- Check whether `opt` is `.some { kind := .uint uKind, layoutIdx := _ }`. -/
+def isSomeUintKindTy (uKind : UintTy) : Option Ty → Bool
+  | .some ty => isUintRigidKind uKind ty.kind
+  | .none => false
+
+def isPrimFieldsShape : FieldsShape → Bool
+  | .primitive => true
+  | _ => false
+
+def isSingleVariantShape : VariantsShape → Bool
+  | .single _ => true
+  | _ => false
+
+/-- Check whether `opt` is `.none` or `.some l` with `isUninhabited = false`,
+`variants = .single _`, and `fields = .primitive`. -/
+def isPrimSingleOrNoneLayoutOpt : Option TypeLayout → Bool
+  | .none => true
+  | .some l =>
+    Bool.and
+      (Bool.not l.isUninhabited)
+      (Bool.and (isSingleVariantShape l.variants) (isPrimFieldsShape l.fields))
+
+/-- Extract a `targetBytes`-wide scalar from `v` via `extractScalarSlice?` at byte offset `0`. -/
+def extractValueScalarSlice0? (v : Value) (targetBytes : Nat) : Option ScalarInt :=
+  match v with
+  | .scalar sc => extractScalarSlice? sc 0 targetBytes
+  | .aggregate varIdx fields =>
+    match varIdx with
+    | .zero =>
+      match fields with
+      | f0 :: fRest =>
+        match f0 with
+        | .scalar sc =>
+          match isHomogeneousUntypedFields (.scalar sc :: fRest) with
+          | true => extractScalarSlice? sc 0 targetBytes
+          | false => .none
+        | .unit | .ptr _ _ | .aggregate _ _ => .none
+      | .nil => .none
+    | .succ _ => .none
+  | .unit | .ptr _ _ => .none
+
+theorem extractValueScalarSlice0?_scalar_self
+    (sc : ScalarInt)
+    (hSz0 : Nat.beq sc.sizeBytes 0 = false) :
+    extractValueScalarSlice0? (.scalar sc) sc.sizeBytes = .some sc := by
+  dsimp only [extractValueScalarSlice0?, extractScalarSlice?]
+  cases sc with
+  | mk bits sz =>
+    cases sz with
+    | zero => nomatch hSz0
+    | succ k =>
+      have hBle1 : Nat.ble 1 (.succ k) = true := rfl
+      have hAdd0 : Nat.add 0 (.succ k) = .succ k := Nat.zero_add (.succ k)
+      have hBle2 : Nat.ble (Nat.add 0 (.succ k)) (.succ k) = true := by
+        rw [hAdd0]
+        exact (nat_ble_eq_true_iff (.succ k) (.succ k)).2 (Nat.le_refl _)
+      have hBeq : Nat.beq (.succ k) (.succ k) = true := Nat.beq_refl (.succ k)
+      rw [hBle1, hBle2, hBeq]
+      rfl
+
+theorem checkTargetPlaceAlign_nil_irrel
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (tyOpt : Option Ty)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (valOpt1 valOpt2 : Option Value)
+    (hNil : entry.targetProjection = .nil) :
+    checkTargetPlaceAlign targetDecls layouts tyOpt entry ptrVal valOpt1 =
+      checkTargetPlaceAlign targetDecls layouts tyOpt entry ptrVal valOpt2 := by
+  dsimp only [checkTargetPlaceAlign]
+  rw [hNil]
+  cases tyOpt with
+  | none => rfl
+  | some ty =>
+    cases get? targetDecls entry.targetLocal with
+    | none => rfl
+    | some decl =>
+      dsimp only
+      cases Nat.ble (tyByteAlign targetDecls layouts ty) 1 <;> rfl
+
+def isClosureOrTupleOrAdtKind : RigidTy → Bool
+  | .closure _ _ => true
+  | .tuple _ => true
+  | .adt _ _ => true
+  | _ => false
+
+/-- Check whether `tyOpt` is `.some` with `.closure`, `.tuple`, or `.adt` kind. -/
+def isClosureOrTupleOrAdtTyOpt : Option Ty → Bool
+  | .some ty => isClosureOrTupleOrAdtKind ty.kind
+  | .none => false
+
+def isThinRefToPrimKind : RigidTy → Bool
+  | .ref _ (.uint _) => true
+  | .ref _ (.int _) => true
+  | .ref _ .bool => true
+  | .ref _ .char => true
+  | _ => false
+
+/-- Check whether `tyOpt` is `.some` thin shared/mutable reference to a primitive scalar. -/
+def isThinRefToPrimTyOpt : Option Ty → Bool
+  | .some ty => isThinRefToPrimKind ty.kind
+  | .none => false
+
+theorem resolveStackThinPtrTargetProjWithResidual?_field_of_closureOrTupleOrAdt
+    (locals : List LocalSlot)
+    (targetRootVal : Value)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (fIdx : FieldIdx)
+    (fTy : Ty)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (effPointeeTyOpt : Option Ty)
+    (hTProj : entry.targetProjection = .nil)
+    (hOff : Nat.beq ptrVal.offsetBytes 0 = true)
+    (hEffPt : isClosureOrTupleOrAdtTyOpt effPointeeTyOpt = true)
+    (hTarget : isClosureOrTupleOrAdtTyOpt
+      (placeTyResolved targetDecls layouts { local_ := entry.targetLocal, projection := .nil }) = true) :
+    resolveStackThinPtrTargetProjWithResidual?
+      locals targetRootVal entry ptrVal (.field fIdx fTy :: .nil)
+      targetDecls layouts effPointeeTyOpt .none = .some (.field fIdx fTy :: .nil, 0) := by
+  unfold resolveStackThinPtrTargetProjWithResidual?
+  rw [hTProj, hOff]
+  dsimp only [stripTransparentProjections, normalizeSubsliceProjections,
+    normalizeAdjacentSubslices, endsWithSubslice, startsWithArrayOrSliceProj]
+  cases effPointeeTyOpt with
+  | none => nomatch hEffPt
+  | some ePt =>
+    cases ePt with
+    | mk ek el =>
+      dsimp only [isClosureOrTupleOrAdtTyOpt, isClosureOrTupleOrAdtKind] at hEffPt
+      generalize hT :
+          placeTyResolved targetDecls layouts { local_ := entry.targetLocal, projection := .nil } =
+            tOpt at hTarget ⊢
+      cases tOpt with
+      | none => nomatch hTarget
+      | some tTy =>
+        cases tTy with
+        | mk tk tl =>
+          dsimp only [isClosureOrTupleOrAdtTyOpt, isClosureOrTupleOrAdtKind] at hTarget
+          cases ek <;> first | exact Bool.noConfusion hEffPt | (cases tk <;> first | rfl | exact Bool.noConfusion hTarget)
+
+/-- Static context check for a closure-tuple field pointer dereference `(*loc).fIdx`. -/
+def checkConcreteFieldPtrDerefCtx
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (fIdx : FieldIdx)
+    (fTy : Ty)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr) :
+    Bool :=
+  match localDecls, entry.targetProjection, Nat.beq ptrVal.offsetBytes 0 with
+  | d :: ds, .nil, true =>
+    let pointeeTyOpt :=
+      placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil }
+    let accessedTyOpt :=
+      placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .field fIdx fTy :: .nil }
+    let targetTyOpt :=
+      placeTyResolved (d :: ds) layouts { local_ := entry.targetLocal, projection := .nil }
+    let effPointeeTyOpt : Option Ty :=
+      match pointeeTyOpt with
+      | .some pt => .some (resolveTyWithLocalDecls (d :: ds) layouts pt)
+      | .none => .none
+    let resolvedAccTyOpt : Option Ty :=
+      match accessedTyOpt with
+      | .some accTy => .some (resolveTyWithLocalDecls (d :: ds) layouts accTy)
+      | .none => .none
+    Bool.and
+      (Nat.beq 8 (layoutPointerBytes layouts))
+      (Bool.and
+        (Bool.not (placeTouchesUnion (d :: ds) layouts { local_ := entry.targetLocal, projection := .field fIdx fTy :: .nil }))
+        (Bool.and
+          (isClosureOrTupleOrAdtTyOpt pointeeTyOpt)
+          (Bool.and
+            (isClosureOrTupleOrAdtTyOpt effPointeeTyOpt)
+            (Bool.and
+              (isClosureOrTupleOrAdtTyOpt targetTyOpt)
+              (Bool.and
+                (isThinRefToPrimTyOpt resolvedAccTyOpt)
+                (Bool.and
+                  (checkDerefAlign (d :: ds) layouts effPointeeTyOpt 0)
+                  (checkTargetPlaceAlign (d :: ds) layouts effPointeeTyOpt entry ptrVal .none)))))))
+  | _, _, _ => false
+
+theorem evalStackThinPtrTypedDerefRead_concreteFieldPtr_eq
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (fIdx : FieldIdx)
+    (fTy : Ty)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (fields : List Value)
+    (fPtr : ProvenancePtr)
+    (hCtx : checkConcreteFieldPtrDerefCtx localDecls layouts loc fIdx fTy entry ptrVal = true)
+    (hField : get? fields fIdx = .some (.ptr fPtr 8)) :
+    evalStackThinPtrTypedDerefRead
+      locals
+      (.aggregate 0 fields)
+      entry
+      ptrVal
+      (.field fIdx fTy :: .nil)
+      localDecls
+      layouts
+      (placeTyResolved localDecls layouts { local_ := loc, projection := .deref :: .nil })
+      (placeTyResolved localDecls layouts { local_ := loc, projection := .deref :: .field fIdx fTy :: .nil })
+      (placeTyResolved localDecls layouts { local_ := entry.targetLocal, projection := entry.targetProjection }) =
+      .ok (.ptr fPtr 8) locals := by
+  cases localDecls with
+  | nil => nomatch hCtx
+  | cons d ds =>
+    cases hTProj : entry.targetProjection with
+    | cons _ _ =>
+      dsimp only [checkConcreteFieldPtrDerefCtx] at hCtx
+      rw [hTProj] at hCtx
+      nomatch hCtx
+    | nil =>
+      cases hOff : Nat.beq ptrVal.offsetBytes 0 with
+      | false =>
+        dsimp only [checkConcreteFieldPtrDerefCtx] at hCtx
+        rw [hTProj, hOff] at hCtx
+        nomatch hCtx
+      | true =>
+        have hOffEq : ptrVal.offsetBytes = 0 := Nat.eq_of_beq_eq_true hOff
+        dsimp only [checkConcreteFieldPtrDerefCtx] at hCtx
+        rw [hTProj, hOff] at hCtx
+        dsimp only at hCtx
+        rcases Bool.and_eq_true_iff.1 hCtx with ⟨hPtrSz, hRest0⟩
+        rcases Bool.and_eq_true_iff.1 hRest0 with ⟨hNoUnion, hRest1⟩
+        rcases Bool.and_eq_true_iff.1 hRest1 with ⟨hPt, hRest2⟩
+        rcases Bool.and_eq_true_iff.1 hRest2 with ⟨hEffPt, hRest3⟩
+        rcases Bool.and_eq_true_iff.1 hRest3 with ⟨hTarget, hRest4⟩
+        rcases Bool.and_eq_true_iff.1 hRest4 with ⟨hAcc, hRest5⟩
+        rcases Bool.and_eq_true_iff.1 hRest5 with ⟨hAlign1, hAlign2⟩
+        have hUnionFalse :
+            placeTouchesUnion (d :: ds) layouts
+              { local_ := entry.targetLocal, projection := .field fIdx fTy :: .nil } = false := by
+          cases hU : placeTouchesUnion (d :: ds) layouts
+              { local_ := entry.targetLocal, projection := .field fIdx fTy :: .nil } with
+          | false => rfl
+          | true => rw [hU] at hNoUnion; nomatch hNoUnion
+        have hResProj := resolveStackThinPtrTargetProjWithResidual?_field_of_closureOrTupleOrAdt
+          locals (.aggregate 0 fields) entry ptrVal fIdx fTy (d :: ds) layouts
+          (match placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil } with
+           | .some pt => Option.some (resolveTyWithLocalDecls (d :: ds) layouts pt)
+           | .none => Option.none)
+          hTProj hOff hEffPt hTarget
+        unfold evalStackThinPtrTypedDerefRead
+        rw [hTProj]
+        generalize hP :
+            placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil } =
+              ptOpt at hPt hEffPt hAlign1 hAlign2 hResProj ⊢
+        cases ptOpt with
+        | none => nomatch hPt
+        | some pt =>
+          cases pt with
+          | mk pk pl =>
+            dsimp only [isClosureOrTupleOrAdtTyOpt, isClosureOrTupleOrAdtKind] at hPt
+            cases pk <;> first | exact Bool.noConfusion hPt | (
+              dsimp (config := { zetaHave := true }) only [stripTransparentProjections] at hEffPt hAlign1 hAlign2 hResProj ⊢
+              rw [checkTargetPlaceAlign_nil_irrel (d :: ds) layouts _
+                entry ptrVal (Option.some (.aggregate 0 fields)) Option.none hTProj]
+              rw [hResProj, hOffEq, hAlign1, hAlign2]
+              dsimp (config := { zetaHave := true }) only [Bool.and, readProjectedForLocal]
+              rw [hUnionFalse]
+              dsimp (config := { zetaHave := true }) only [readProjectedValue]
+              rw [hField]
+              dsimp (config := { zetaHave := true }) only [readProjectedValue]
+              generalize hA0 :
+                  placeTyResolved (d :: ds) layouts
+                    { local_ := loc, projection := .deref :: .field fIdx fTy :: .nil } =
+                    accTyOpt at hAcc ⊢
+              cases accTyOpt with
+              | none => nomatch hAcc
+              | some rawAccTy =>
+                dsimp (config := { zetaHave := true }) only at hAcc ⊢
+                generalize hA1 :
+                    resolveTyWithLocalDecls (d :: ds) layouts rawAccTy = accTy at hAcc ⊢
+                cases accTy with
+                | mk ak al =>
+                  dsimp only [isThinRefToPrimTyOpt, isThinRefToPrimKind] at hAcc
+                  cases ak with
+                  | ref rk pointee =>
+                    cases pointee <;> first | exact Bool.noConfusion hAcc | (
+                      dsimp (config := { zetaHave := true }) only [tyScalarBytes, intCastTargetBytes,
+                        isThinPtrKind, Bool.not, Nat.beq, Bool.and, validateValueForTy?]
+                      rw [hPtrSz])
+                  | _ => nomatch hAcc)
+
+theorem length_encodeLittleEndianBytes :
+    ∀ (n bits : Nat) (prov : Option (Nat × Nat)),
+      length (encodeLittleEndianBytes bits n prov) = n
+  | .zero, _, _ => rfl
+  | .succ rem, bits, prov =>
+    congrArg Nat.succ (length_encodeLittleEndianBytes rem (Nat.div bits 256) prov)
+
+theorem rigidTyKindByteSize_uint
+    (uKind : UintTy) :
+    rigidTyKindByteSize (.uint uKind) = .some (uintBytesOfKind uKind) := by
+  cases uKind <;> rfl
+
+theorem tyScalarBytes_uint
+    (uKind : UintTy)
+    (lIdx : Nat) :
+    tyScalarBytes { kind := .uint uKind, layoutIdx := lIdx } = .some (uintBytesOfKind uKind) := by
+  cases uKind <;> rfl
+
+theorem tyByteSize_uint_of_resolved
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (uKind : UintTy)
+    (rpIdx : Nat)
+    (hRes :
+      resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
+        { kind := .uint uKind, layoutIdx := rpIdx }) :
+    tyByteSize localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
+      .some (uintBytesOfKind uKind) := by
+  unfold tyByteSize tyByteSizeAndAlignAux
+  rw [hRes]
+  dsimp only [rigidTyByteSize]
+  rw [rigidTyKindByteSize_uint uKind]
+
+theorem resolveFaithfulAggregateTy?_uint_eq_none
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (uKind : UintTy)
+    (tIdx varIdx : Nat)
+    (fields : List Value)
+    (hLayout :
+      isPrimSingleOrNoneLayoutOpt
+        (LayoutTable.lookup
+          layouts
+          (resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx) =
+        true) :
+    resolveFaithfulAggregateTy?
+      localDecls
+      layouts
+      { kind := .uint uKind, layoutIdx := tIdx }
+      varIdx
+      fields = .none := by
+  unfold resolveFaithfulAggregateTy?
+  dsimp only
+  generalize hL :
+      LayoutTable.lookup
+        layouts
+        (resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx =
+        lOpt at hLayout ⊢
+  cases lOpt with
+  | none => rfl
+  | some l =>
+    cases l with
+    | mk sz align backendRepr fieldsShape variants isUninhabited fieldLayouts =>
+      dsimp only [isPrimSingleOrNoneLayoutOpt] at hLayout
+      rcases Bool.and_eq_true_iff.1 hLayout with ⟨hNotUninhab, hVarFields⟩
+      rcases Bool.and_eq_true_iff.1 hVarFields with ⟨hVar, hFields⟩
+      cases isUninhabited with
+      | true => nomatch hNotUninhab
+      | false =>
+        cases variants with
+        | empty => nomatch hVar
+        | multiple _ _ _ => nomatch hVar
+        | single sVar =>
+          cases fieldsShape with
+          | primitive =>
+            dsimp only [layoutMatchesAggregateVariant]
+            rw [Bool.and_false]
+          | union _ => nomatch hFields
+          | array _ _ => nomatch hFields
+          | arbitrary _ _ => nomatch hFields
+
+theorem decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (baseTyOpt : Option Ty)
+    (uKind : UintTy)
+    (rpIdx : Nat)
+    (v : Value)
+    (hRes :
+      resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
+        { kind := .uint uKind, layoutIdx := rpIdx })
+    (hNonAgg :
+      (match v with
+       | .aggregate _ _ => false
+       | _ => true) = true)
+    (hSlice :
+      (match v with
+       | .scalar sc => extractScalarSlice? sc 0 (uintBytesOfKind uKind)
+       | _ => .none) = .none) :
+    decodeSubValueAtByteOffset?
+      layouts
+      baseTyOpt
+      v
+      0
+      { kind := .uint uKind, layoutIdx := rpIdx }
+      localDecls = .none := by
+  unfold decodeSubValueAtByteOffset?
+  rw [hRes]
+  dsimp only
+  rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hRes]
+  dsimp only
+  cases v with
+  | unit =>
+    cases uKind <;> rfl
+  | scalar sc =>
+    dsimp only [extractScalarSlice?] at hSlice
+    rw [nat_ble_one_uintBytesOfKind uKind] at hSlice
+    dsimp only [Nat.beq, Bool.and] at hSlice
+    cases hBle : Nat.ble (Nat.add 0 (uintBytesOfKind uKind)) sc.sizeBytes with
+    | true =>
+      rw [hBle] at hSlice
+      cases hB : Nat.beq (uintBytesOfKind uKind) sc.sizeBytes with
+      | true =>
+        rw [hB] at hSlice
+        nomatch hSlice
+      | false =>
+        rw [hB] at hSlice
+        nomatch hSlice
+    | false =>
+      dsimp only [encodeUntypedValueToBytes, defaultCodecFuel, encodeScalarBytes]
+      cases Nat.beq sc.sizeBytes 0 with
+      | true => rfl
+      | false =>
+        dsimp only [sliceAbstractBytes]
+        rw [length_encodeLittleEndianBytes sc.sizeBytes sc.bits .none, hBle]
+  | ptr p sz =>
+    dsimp only [encodeUntypedValueToBytes, defaultCodecFuel, encodeScalarBytes]
+    cases sz with
+    | zero => rfl
+    | succ m =>
+      have hSz0 : Nat.beq (.succ m) 0 = false := rfl
+      rw [hSz0]
+      dsimp only [encodeLittleEndianBytes, sliceAbstractBytes]
+      cases Nat.ble (Nat.add 0 (uintBytesOfKind uKind))
+        (length (.init (UInt8.ofNat p.offsetBytes) (.some (p.allocId, p.tag)) ::
+          encodeLittleEndianBytes (Nat.div p.offsetBytes 256) m (.some (p.allocId, p.tag)))) with
+      | false => rfl
+      | true =>
+        cases uKind <;> rfl
+  | aggregate _ _ => nomatch hNonAgg
+
+theorem decodeSubValueAtByteOffset?_agg_uint_eq_none
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (uKind : UintTy)
+    (tIdx rpIdx varIdx : Nat)
+    (fields : List Value)
+    (hRes :
+      resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
+        { kind := .uint uKind, layoutIdx := rpIdx })
+    (hLayout :
+      isPrimSingleOrNoneLayoutOpt
+        (LayoutTable.lookup
+          layouts
+          (resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx) =
+        true) :
+    decodeSubValueAtByteOffset?
+      layouts
+      (.some { kind := .uint uKind, layoutIdx := tIdx })
+      (.aggregate varIdx fields)
+      0
+      { kind := .uint uKind, layoutIdx := rpIdx }
+      localDecls = .none := by
+  unfold decodeSubValueAtByteOffset?
+  rw [hRes]
+  dsimp only
+  rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hRes]
+  dsimp only
+  rw [resolveFaithfulAggregateTy?_uint_eq_none localDecls layouts uKind tIdx varIdx fields hLayout]
+
+theorem resolveSeqContainerElemByteStride_uint_eq_zero
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (targetLocal : Local)
+    (uKind : UintTy)
+    (tIdx : Nat)
+    (elems : List Value)
+    (hTarget :
+      placeTyResolved targetDecls layouts { local_ := targetLocal, projection := .nil } =
+        .some { kind := .uint uKind, layoutIdx := tIdx })
+    (hRTargetKind :
+      isUintRigidKind uKind
+        (resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).kind =
+        true)
+    (hLayout :
+      isPrimSingleOrNoneLayoutOpt
+        (LayoutTable.lookup
+          layouts
+          (resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx) =
+        true) :
+    resolveSeqContainerElemByteStride targetDecls layouts targetLocal .nil elems = 0 := by
+  unfold resolveSeqContainerElemByteStride
+  rw [hTarget]
+  dsimp only
+  generalize hRT :
+      resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx } =
+        rCTy at hRTargetKind hLayout ⊢
+  cases rCTy with
+  | mk rck rcl =>
+    dsimp only at hRTargetKind hLayout ⊢
+    have hRck : rck = .uint uKind := eq_uint_of_isUintRigidKind hRTargetKind
+    subst hRck
+    generalize hL : LayoutTable.lookup layouts rcl = lOpt at hLayout ⊢
+    cases lOpt with
+    | none => rfl
+    | some l =>
+      cases l with
+      | mk sz align backendRepr fieldsShape variants isUninhabited fieldLayouts =>
+        dsimp only [isPrimSingleOrNoneLayoutOpt] at hLayout
+        rcases Bool.and_eq_true_iff.1 hLayout with ⟨_, hVarFields⟩
+        rcases Bool.and_eq_true_iff.1 hVarFields with ⟨_, hFields⟩
+        cases fieldsShape with
+        | primitive => rfl
+        | union _ => nomatch hFields
+        | array _ _ => nomatch hFields
+        | arbitrary _ _ => nomatch hFields
+
+theorem resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
+    (locals : List LocalSlot)
+    (targetRootVal : Value)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (uKind : UintTy)
+    (rpIdx tIdx : Nat)
+    (reqBytesOpt : Option Nat)
+    (hTProj : entry.targetProjection = .nil)
+    (hOff : Nat.beq ptrVal.offsetBytes 0 = true)
+    (hTarget :
+      placeTyResolved targetDecls layouts { local_ := entry.targetLocal, projection := .nil } =
+        .some { kind := .uint uKind, layoutIdx := tIdx })
+    (hNonAgg :
+      (match targetRootVal with
+       | .aggregate _ _ => false
+       | _ => true) = true) :
+    resolveStackThinPtrTargetProjWithResidual?
+      locals targetRootVal entry ptrVal .nil targetDecls layouts
+      (.some { kind := .uint uKind, layoutIdx := rpIdx })
+      reqBytesOpt = .some (.nil, 0) := by
+  unfold resolveStackThinPtrTargetProjWithResidual?
+  rw [hTProj, hOff]
+  dsimp only [stripTransparentProjections, normalizeSubsliceProjections,
+    normalizeAdjacentSubslices, endsWithSubslice, startsWithArrayOrSliceProj]
+  rw [hTarget, tyScalarBytes_uint uKind rpIdx]
+  cases targetRootVal with
+  | unit => rfl
+  | scalar _ => rfl
+  | ptr _ _ => rfl
+  | aggregate _ _ => nomatch hNonAgg
+
+theorem resolveAggregateAtByteOffset?_uint_eq_none
+    (layouts : LayoutTable)
+    (varIdx : Nat)
+    (fields : List Value)
+    (uKind : UintTy)
+    (rtIdx : Nat)
+    (relOff expectedElemBytes : Nat)
+    (leafIsAggregate : Bool)
+    (defaultLeafTy : Ty)
+    (forceSeqRoot : Bool)
+    (targetDecls : List LocalDecl)
+    (hRRTargetEq :
+      resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := rtIdx } =
+        { kind := .uint uKind, layoutIdx := rtIdx })
+    (hLayout :
+      isPrimSingleOrNoneLayoutOpt (LayoutTable.lookup layouts rtIdx) = true) :
+    resolveAggregateAtByteOffset?
+      8
+      layouts
+      (.aggregate varIdx fields)
+      (.some { kind := .uint uKind, layoutIdx := rtIdx })
+      relOff
+      expectedElemBytes
+      leafIsAggregate
+      defaultLeafTy
+      forceSeqRoot
+      targetDecls = .none := by
+  unfold resolveAggregateAtByteOffset? resolveAggregateAtByteOffsetStep
+  dsimp (config := { zetaHave := true }) only
+  rw [hRRTargetEq]
+  cases Nat.beq varIdx 0 <;> (
+    dsimp (config := { zetaHave := true }) only [lookupAggregateLayout?]
+    generalize hL : LayoutTable.lookup layouts rtIdx = lOpt at hLayout ⊢
+    cases lOpt with
+    | none =>
+      cases isUnresolvedLayoutIdx layouts rtIdx <;> rfl
+    | some l =>
+      cases l with
+      | mk sz align backendRepr fieldsShape variants isUninhabited fieldLayouts =>
+        dsimp only [isPrimSingleOrNoneLayoutOpt] at hLayout
+        rcases Bool.and_eq_true_iff.1 hLayout with ⟨hNotUninhab, hVarFields⟩
+        rcases Bool.and_eq_true_iff.1 hVarFields with ⟨hVar, hFields⟩
+        cases isUninhabited with
+        | true => nomatch hNotUninhab
+        | false =>
+          cases variants with
+          | empty => nomatch hVar
+          | multiple _ _ _ => nomatch hVar
+          | single sVar =>
+            cases fieldsShape with
+            | primitive =>
+              dsimp (config := { zetaHave := true }) only [layoutMatchesAggregateVariant]
+              cases isUnresolvedLayoutIdx layouts rtIdx <;> cases Nat.beq varIdx sVar <;> rfl
+            | union _ => nomatch hFields
+            | array _ _ => nomatch hFields
+            | arbitrary _ _ => nomatch hFields)
+
+theorem resolveStackThinPtrFieldOffsetProj?_nil_agg_of_uint
+    (locals : List LocalSlot)
+    (varIdx : Nat)
+    (fields : List Value)
+    (targetLocal : Local)
+    (uKind : UintTy)
+    (rpIdx tIdx rtIdx : Nat)
+    (offsetBytes : Nat)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hTarget :
+      placeTyResolved targetDecls layouts { local_ := targetLocal, projection := .nil } =
+        .some { kind := .uint uKind, layoutIdx := tIdx })
+    (hRTargetEq :
+      resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx } =
+        { kind := .uint uKind, layoutIdx := rtIdx })
+    (hRRTargetEq :
+      resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := rtIdx } =
+        { kind := .uint uKind, layoutIdx := rtIdx })
+    (hLayout :
+      isPrimSingleOrNoneLayoutOpt (LayoutTable.lookup layouts rtIdx) = true) :
+    resolveStackThinPtrFieldOffsetProj?
+      locals
+      (.aggregate varIdx fields)
+      targetLocal
+      .nil
+      { kind := .uint uKind, layoutIdx := rpIdx }
+      offsetBytes
+      .nil
+      targetDecls
+      layouts
+      (.some { kind := .uint uKind, layoutIdx := rpIdx })
+      (.some (uintBytesOfKind uKind)) = .none := by
+  have hB0 : Nat.beq (uintBytesOfKind uKind) 0 = false := by
+    cases uKind <;> rfl
+  unfold resolveStackThinPtrFieldOffsetProj?
+  dsimp (config := { zetaHave := true }) only [splitAfterLastSeqProj, normalizeSubsliceProjections,
+    normalizeSubsliceProjectionsAux, readProjectedValue, projectionChainByteOffset?,
+    splitLastSubslice?]
+  rw [hTarget]
+  dsimp (config := { zetaHave := true }) only
+  rw [hRTargetEq, hB0,
+    tyByteSize_uint_of_resolved targetDecls layouts uKind rtIdx hRRTargetEq,
+    resolveAggregateAtByteOffset?_uint_eq_none
+      layouts varIdx fields uKind rtIdx (Nat.add 0 offsetBytes) (uintBytesOfKind uKind) _ _ _ targetDecls hRRTargetEq hLayout]
+  dsimp (config := { zetaHave := true }) only
+  cases lookupAggregateLayout? layouts { kind := .uint uKind, layoutIdx := rtIdx } varIdx fields with
+  | none =>
+    dsimp (config := { zetaHave := true }) only
+    cases Nat.ble (Nat.add (Nat.add 0 offsetBytes) (uintBytesOfKind uKind)) (uintBytesOfKind uKind) <;> rfl
+  | some l =>
+    dsimp (config := { zetaHave := true }) only
+    cases Nat.ble (Nat.add (Nat.add 0 offsetBytes) (uintBytesOfKind uKind)) l.size.bytes <;> rfl
+
+theorem resolveStackThinPtrTargetProjWithResidual?_nil_agg_of_uint
+    (locals : List LocalSlot)
+    (varIdx : Nat)
+    (fields : List Value)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (uKind : UintTy)
+    (rpIdx tIdx rtIdx : Nat)
+    (hTProj : entry.targetProjection = .nil)
+    (hOff : Nat.beq ptrVal.offsetBytes 0 = true)
+    (hTarget :
+      placeTyResolved targetDecls layouts { local_ := entry.targetLocal, projection := .nil } =
+        .some { kind := .uint uKind, layoutIdx := tIdx })
+    (hRTargetEq :
+      resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx } =
+        { kind := .uint uKind, layoutIdx := rtIdx })
+    (hRRTargetEq :
+      resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := rtIdx } =
+        { kind := .uint uKind, layoutIdx := rtIdx })
+    (hRTargetKind :
+      isUintRigidKind uKind
+        (resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).kind =
+        true)
+    (hLayout :
+      isPrimSingleOrNoneLayoutOpt
+        (LayoutTable.lookup
+          layouts
+          (resolveTyWithLocalDecls targetDecls layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx) =
+        true) :
+    resolveStackThinPtrTargetProjWithResidual?
+      locals (.aggregate varIdx fields) entry ptrVal .nil targetDecls layouts
+      (.some { kind := .uint uKind, layoutIdx := rpIdx })
+      (.some (uintBytesOfKind uKind)) =
+      match varIdx with
+      | .zero =>
+        match fields with
+        | .nil => .none
+        | f0 :: fRest =>
+          match isHomogeneousUntypedFields (f0 :: fRest) with
+          | true => .some (.constantIndex 0 0 false :: .nil, 0)
+          | false => .none
+      | .succ _ => .none := by
+  have hLayout' : isPrimSingleOrNoneLayoutOpt (LayoutTable.lookup layouts rtIdx) = true := by
+    rw [hRTargetEq] at hLayout
+    exact hLayout
+  unfold resolveStackThinPtrTargetProjWithResidual?
+  rw [hTProj, hOff]
+  dsimp (config := { zetaHave := true }) only [stripTransparentProjections, normalizeSubsliceProjections,
+    normalizeSubsliceProjectionsAux, normalizeAdjacentSubslices, normalizeAdjacentSubslicesAux,
+    endsWithSubslice, startsWithArrayOrSliceProj,
+    splitLastConstantIndex?, splitLastField?, readProjectedValue]
+  rw [hTarget, tyScalarBytes_uint uKind rpIdx]
+  dsimp (config := { zetaHave := true }) only
+  rw [resolveStackThinPtrFieldOffsetProj?_nil_agg_of_uint
+    locals varIdx fields entry.targetLocal uKind rpIdx tIdx rtIdx ptrVal.offsetBytes
+    targetDecls layouts hTarget hRTargetEq hRRTargetEq hLayout']
+  cases varIdx with
+  | succ _ => rfl
+  | zero =>
+    cases fields with
+    | nil => rfl
+    | cons f0 fRest =>
+      have hBle1 : Nat.ble 1 (length (f0 :: fRest)) = true := rfl
+      simp only [resolveSeqContainerElemByteStride_uint_eq_zero
+        targetDecls layouts entry.targetLocal uKind tIdx (f0 :: fRest) hTarget hRTargetKind hLayout,
+        byteOffsetToElemIdx?, hOff, hBle1, Bool.true_and]
+      cases hHom : isHomogeneousUntypedFields (f0 :: fRest) with
+      | false => rfl
+      | true =>
+        cases f0 with
+        | unit => rfl
+        | scalar _ => rfl
+        | ptr _ _ => rfl
+        | aggregate _ _ =>
+          cases fRest <;> nomatch hHom
+
+/-- Static context check for a 0-offset thin-pointer dereference read `*loc`
+at unsigned integer type `uKind`. -/
+def checkCanonicalUintDerefReadCtx
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (uKind : UintTy)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr) :
+    Bool :=
+  match localDecls, entry.targetProjection, Nat.beq ptrVal.offsetBytes 0 with
+  | d :: ds, .nil, true =>
+    match
+      placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil },
+      placeTyResolved (d :: ds) layouts { local_ := entry.targetLocal, projection := .nil },
+      placeTyResolved (d :: ds) layouts { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil }
+    with
+    | .some pt, .some targetTy, .none =>
+      let effPt := resolveTyWithLocalDecls (d :: ds) layouts pt
+      let rEffPt := resolveTyWithLocalDecls (d :: ds) layouts effPt
+      let rTargetTy := resolveTyWithLocalDecls (d :: ds) layouts targetTy
+      let rrTargetTy := resolveTyWithLocalDecls (d :: ds) layouts rTargetTy
+      Bool.and
+        (Bool.not (placeTouchesUnion (d :: ds) layouts { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil }))
+        (Bool.and
+          (isUintRigidKind uKind effPt.kind)
+          (Bool.and
+            (isUintRigidKind uKind rEffPt.kind)
+            (Bool.and
+              (Nat.beq rEffPt.layoutIdx effPt.layoutIdx)
+              (Bool.and
+                (isUintRigidKind uKind targetTy.kind)
+                (Bool.and
+                  (isUintRigidKind uKind rTargetTy.kind)
+                  (Bool.and
+                    (isUintRigidKind uKind rrTargetTy.kind)
+                    (Bool.and
+                      (Nat.beq rrTargetTy.layoutIdx rTargetTy.layoutIdx)
+                      (Bool.and
+                        (isPrimSingleOrNoneLayoutOpt (LayoutTable.lookup layouts rTargetTy.layoutIdx))
+                        (Bool.and
+                          (checkDerefAlign (d :: ds) layouts (.some effPt) 0)
+                          (checkTargetPlaceAlign (d :: ds) layouts (.some effPt) entry ptrVal .none))))))))))
+    | _, _, _ => false
+  | _, _, _ => false
+
+theorem evalStackThinPtrTypedDerefRead_uint_eq
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (uKind : UintTy)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (targetRootVal : Value)
+    (hCtx : checkCanonicalUintDerefReadCtx localDecls layouts loc uKind entry ptrVal = true) :
+    evalStackThinPtrTypedDerefRead
+      locals
+      targetRootVal
+      entry
+      ptrVal
+      .nil
+      localDecls
+      layouts
+      (placeTyResolved localDecls layouts { local_ := loc, projection := .deref :: .nil })
+      (placeTyResolved localDecls layouts { local_ := loc, projection := .deref :: .nil })
+      (placeTyResolved localDecls layouts { local_ := entry.targetLocal, projection := entry.targetProjection }) =
+      match extractValueScalarSlice0? targetRootVal (uintBytesOfKind uKind) with
+      | .some slicedSc => .ok (.scalar slicedSc) locals
+      | .none => .ub := by
+  cases localDecls with
+  | nil => nomatch hCtx
+  | cons d ds =>
+    cases hTProj : entry.targetProjection with
+    | cons _ _ =>
+      dsimp only [checkCanonicalUintDerefReadCtx] at hCtx
+      rw [hTProj] at hCtx
+      nomatch hCtx
+    | nil =>
+      cases hOff : Nat.beq ptrVal.offsetBytes 0 with
+      | false =>
+        dsimp only [checkCanonicalUintDerefReadCtx] at hCtx
+        rw [hTProj, hOff] at hCtx
+        nomatch hCtx
+      | true =>
+        have hOffEq : ptrVal.offsetBytes = 0 := Nat.eq_of_beq_eq_true hOff
+        dsimp only [checkCanonicalUintDerefReadCtx] at hCtx
+        rw [hTProj, hOff] at hCtx
+        dsimp only at hCtx
+        generalize hP :
+            placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil } =
+              ptOpt at hCtx ⊢
+        cases ptOpt with
+        | none => nomatch hCtx
+        | some pt =>
+          generalize hT :
+              placeTyResolved (d :: ds) layouts { local_ := entry.targetLocal, projection := .nil } =
+                tOpt at hCtx ⊢
+          cases tOpt with
+          | none => nomatch hCtx
+          | some targetTy =>
+            generalize hSubT :
+                placeTyResolved (d :: ds) layouts { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil } =
+                  subTOpt at hCtx
+            cases subTOpt with
+            | some _ => nomatch hCtx
+            | none =>
+              dsimp only at hCtx
+              rcases Bool.and_eq_true_iff.1 hCtx with ⟨hNoUnion0, hRestA⟩
+              rcases Bool.and_eq_true_iff.1 hRestA with ⟨hEffKind, hRest0⟩
+              rcases Bool.and_eq_true_iff.1 hRest0 with ⟨hREffKind, hRest1⟩
+              rcases Bool.and_eq_true_iff.1 hRest1 with ⟨hREffIdx, hRest2⟩
+              rcases Bool.and_eq_true_iff.1 hRest2 with ⟨hTargetKind, hRest3⟩
+              rcases Bool.and_eq_true_iff.1 hRest3 with ⟨hRTargetKind, hRest4⟩
+              rcases Bool.and_eq_true_iff.1 hRest4 with ⟨hRRTargetKind, hRest5⟩
+              rcases Bool.and_eq_true_iff.1 hRest5 with ⟨hRRTargetIdx, hRest6⟩
+              rcases Bool.and_eq_true_iff.1 hRest6 with ⟨hLayout, hRest7⟩
+              rcases Bool.and_eq_true_iff.1 hRest7 with ⟨hAlign1, hAlign2⟩
+              have hUnion0False :
+                  placeTouchesUnion (d :: ds) layouts
+                    { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil } = false := by
+                cases hU : placeTouchesUnion (d :: ds) layouts
+                    { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil } with
+                | false => rfl
+                | true => rw [hU] at hNoUnion0; nomatch hNoUnion0
+              generalize hE : resolveTyWithLocalDecls (d :: ds) layouts pt = effPt at hEffKind hREffKind hREffIdx hAlign1 hAlign2
+              cases effPt with
+              | mk ek rpIdx =>
+                dsimp only at hEffKind hREffIdx
+                have hEk : ek = .uint uKind := eq_uint_of_isUintRigidKind hEffKind
+                subst hEk
+                have hREffEq :
+                    resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := rpIdx } =
+                      { kind := .uint uKind, layoutIdx := rpIdx } := by
+                  cases hRE : resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := rpIdx } with
+                  | mk rek rel =>
+                    rw [hRE] at hREffKind hREffIdx
+                    dsimp only at hREffKind hREffIdx
+                    rw [eq_uint_of_isUintRigidKind hREffKind, Nat.eq_of_beq_eq_true hREffIdx]
+                cases targetTy with
+                | mk tk tIdx =>
+                  dsimp only at hTargetKind
+                  have hTk : tk = .uint uKind := eq_uint_of_isUintRigidKind hTargetKind
+                  subst hTk
+                  have hRTargetEq :
+                      resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := tIdx } =
+                        { kind := .uint uKind, layoutIdx := (resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx } := by
+                    cases hRT : resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := tIdx } with
+                    | mk rtk rtl =>
+                      rw [hRT] at hRTargetKind
+                      dsimp only at hRTargetKind ⊢
+                      rw [eq_uint_of_isUintRigidKind hRTargetKind]
+                  let rtIdx := (resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := tIdx }).layoutIdx
+                  have hRRTargetEq :
+                      resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := rtIdx } =
+                        { kind := .uint uKind, layoutIdx := rtIdx } := by
+                    have hRRK := hRRTargetKind
+                    have hRRI := hRRTargetIdx
+                    rw [hRTargetEq] at hRRK hRRI
+                    cases hRRT : resolveTyWithLocalDecls (d :: ds) layouts { kind := .uint uKind, layoutIdx := rtIdx } with
+                    | mk rrtk rrtl =>
+                      rw [hRRT] at hRRK hRRI
+                      dsimp only at hRRK hRRI
+                      rw [eq_uint_of_isUintRigidKind hRRK, Nat.eq_of_beq_eq_true hRRI]
+                  unfold evalStackThinPtrTypedDerefRead
+                  dsimp only [stripTransparentProjections]
+                  rw [hTProj, hE]
+                  dsimp only
+                  rw [checkTargetPlaceAlign_nil_irrel (d :: ds) layouts
+                    (Option.some { kind := .uint uKind, layoutIdx := rpIdx })
+                    entry ptrVal (Option.some targetRootVal) Option.none hTProj]
+                  rw [hOffEq, hAlign1, hAlign2]
+                  dsimp only [Bool.and]
+                  rw [tyScalarBytes_uint uKind rpIdx,
+                    tyByteSize_uint_of_resolved (d :: ds) layouts uKind rpIdx hREffEq]
+                  dsimp only [readProjectedForLocal, placeTouchesUnion, readProjectedValue,
+                    decodeAtBorrowTargetOffset?]
+                  rw [hTProj]
+                  dsimp only [readProjectedForLocal, placeTouchesUnion, readProjectedValue]
+                  rw [← hOffEq]
+                  cases targetRootVal with
+                  | unit =>
+                    rw [resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
+                      locals .unit entry ptrVal (d :: ds) layouts uKind rpIdx tIdx
+                      (.some (uintBytesOfKind uKind)) hTProj hOff hT rfl]
+                    dsimp (config := { zetaHave := true }) only [readProjectedForLocal,
+                      placeTouchesUnion, readProjectedValue, extractValueScalarSlice0?]
+                    rw [hOffEq, hT,
+                      decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+                        (d :: ds) layouts (.some { kind := .uint uKind, layoutIdx := tIdx })
+                        uKind rpIdx .unit hREffEq rfl rfl]
+                  | ptr p sz =>
+                    rw [resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
+                      locals (.ptr p sz) entry ptrVal (d :: ds) layouts uKind rpIdx tIdx
+                      (.some (uintBytesOfKind uKind)) hTProj hOff hT rfl]
+                    dsimp (config := { zetaHave := true }) only [readProjectedForLocal,
+                      placeTouchesUnion, readProjectedValue, extractValueScalarSlice0?]
+                    rw [hOffEq, hT,
+                      decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+                        (d :: ds) layouts (.some { kind := .uint uKind, layoutIdx := tIdx })
+                        uKind rpIdx (.ptr p sz) hREffEq rfl rfl]
+                  | scalar sc =>
+                    dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                    cases hSlice : extractScalarSlice? sc 0 (uintBytesOfKind uKind) with
+                    | some slicedSc =>
+                      dsimp (config := { zetaHave := true }) only
+                      rw [hOffEq, hSlice]
+                    | none =>
+                      rw [resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
+                        locals (.scalar sc) entry ptrVal (d :: ds) layouts uKind rpIdx tIdx
+                        (.some (uintBytesOfKind uKind)) hTProj hOff hT rfl]
+                      dsimp (config := { zetaHave := true }) only [readProjectedForLocal,
+                        placeTouchesUnion, readProjectedValue]
+                      have hSizeNe : Nat.beq (uintBytesOfKind uKind) sc.sizeBytes = false := by
+                        cases hBeq : Nat.beq (uintBytesOfKind uKind) sc.sizeBytes with
+                        | false => rfl
+                        | true =>
+                          have hEqSz : uintBytesOfKind uKind = sc.sizeBytes := Nat.eq_of_beq_eq_true hBeq
+                          have hSz0 : Nat.beq sc.sizeBytes 0 = false := by
+                            rw [← hEqSz]
+                            cases uKind <;> rfl
+                          have hSelf := extractValueScalarSlice0?_scalar_self sc hSz0
+                          dsimp only [extractValueScalarSlice0?] at hSelf
+                          rw [← hEqSz] at hSelf
+                          rw [hSelf] at hSlice
+                          nomatch hSlice
+                      rw [hOffEq, hSlice, hT,
+                        decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+                          (d :: ds) layouts (.some { kind := .uint uKind, layoutIdx := tIdx })
+                          uKind rpIdx (.scalar sc) hREffEq rfl hSlice,
+                        hSizeNe]
+                  | aggregate varIdx fields =>
+                    rw [resolveStackThinPtrTargetProjWithResidual?_nil_agg_of_uint
+                      locals varIdx fields entry ptrVal (d :: ds) layouts uKind rpIdx tIdx rtIdx
+                      hTProj hOff hT hRTargetEq hRRTargetEq hRTargetKind hLayout]
+                    have hDecAggNone :=
+                      decodeSubValueAtByteOffset?_agg_uint_eq_none
+                        (d :: ds) layouts uKind tIdx rpIdx varIdx fields hREffEq hLayout
+                    cases varIdx with
+                    | succ _ =>
+                      dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                      rw [hOffEq, hDecAggNone]
+                    | zero =>
+                      cases fields with
+                      | nil =>
+                        dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                        rw [hOffEq, hDecAggNone]
+                      | cons f0 fRest =>
+                        dsimp (config := { zetaHave := true }) only
+                        cases hHom : isHomogeneousUntypedFields (f0 :: fRest) with
+                        | false =>
+                          dsimp (config := { zetaHave := true }) only
+                          rw [hOffEq, hDecAggNone]
+                          cases f0 with
+                          | unit => rfl
+                          | ptr _ _ => rfl
+                          | aggregate _ _ => rfl
+                          | scalar sc =>
+                            dsimp only [extractValueScalarSlice0?]
+                            rw [hHom]
+                        | true =>
+                          dsimp only [placeTouchesUnion] at hUnion0False
+                          dsimp (config := { zetaHave := true }) only [readProjectedForLocal]
+                          rw [hUnion0False, hSubT, hOffEq, hDecAggNone]
+                          have hRead0 :
+                              readProjectedValue locals (.aggregate .zero (f0 :: fRest))
+                                [.constantIndex 0 0 false] = .ok f0 := rfl
+                          rw [hRead0]
+                          dsimp (config := { zetaHave := true }) only [Nat.beq]
+                          cases f0 with
+                          | unit =>
+                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                            rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+                              (d :: ds) layouts .none uKind rpIdx .unit hREffEq rfl rfl]
+                          | ptr p sz =>
+                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                            rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+                              (d :: ds) layouts .none uKind rpIdx (.ptr p sz) hREffEq rfl rfl]
+                          | aggregate _ _ =>
+                            cases fRest <;> nomatch hHom
+                          | scalar sc =>
+                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                            rw [hHom]
+                            dsimp (config := { zetaHave := true }) only [Nat.beq, Bool.and]
+                            cases hBeq : Nat.beq (uintBytesOfKind uKind) sc.sizeBytes with
+                            | true =>
+                              have hEqSz : uintBytesOfKind uKind = sc.sizeBytes := Nat.eq_of_beq_eq_true hBeq
+                              have hSz0 : Nat.beq sc.sizeBytes 0 = false := by
+                                rw [← hEqSz]
+                                cases uKind <;> rfl
+                              have hSelf := extractValueScalarSlice0?_scalar_self sc hSz0
+                              dsimp only [extractValueScalarSlice0?] at hSelf
+                              rw [← hEqSz] at hSelf
+                              rw [hSelf]
+                            | false =>
+                              cases hSlice : extractScalarSlice? sc 0 (uintBytesOfKind uKind) with
+                              | some slicedSc => rfl
+                              | none =>
+                                rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
+                                  (d :: ds) layouts .none uKind rpIdx (.scalar sc) hREffEq rfl hSlice]
+
+/-- Static/value check for a thin-pointer dereference read `*loc` when the
+borrow target local holds a concrete scalar `.scalar sc`. -/
+def checkConcreteScalarDerefCtx
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (sc : ScalarInt) :
+    Option ScalarInt :=
+  match localDecls, entry.targetProjection with
+  | d :: ds, .nil =>
+    match placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil } with
+    | .some pt =>
+      let effPt := resolveTyWithLocalDecls (d :: ds) layouts pt
+      match
+        Bool.and
+          (checkDerefAlign (d :: ds) layouts (.some effPt) ptrVal.offsetBytes)
+          (checkTargetPlaceAlign (d :: ds) layouts (.some effPt) entry ptrVal .none)
+      with
+      | false => .none
+      | true =>
+        match tyScalarBytes effPt with
+        | .some reqBytes =>
+          match extractScalarSlice? sc ptrVal.offsetBytes reqBytes with
+          | .some slicedSc =>
+            match validateValueForTy? layouts (.some effPt) (.scalar slicedSc) with
+            | true => .some slicedSc
+            | false => .none
+          | .none => .none
+        | .none => .none
+    | .none => .none
+  | _, _ => .none
+
+theorem evalStackThinPtrTypedDerefRead_concreteScalar_eq
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (sc slicedSc : ScalarInt)
+    (hCtx : checkConcreteScalarDerefCtx localDecls layouts loc entry ptrVal sc = .some slicedSc) :
+    evalStackThinPtrTypedDerefRead
+      locals
+      (.scalar sc)
+      entry
+      ptrVal
+      .nil
+      localDecls
+      layouts
+      (placeTyResolved localDecls layouts { local_ := loc, projection := .deref :: .nil })
+      (placeTyResolved localDecls layouts { local_ := loc, projection := .deref :: .nil })
+      (placeTyResolved localDecls layouts { local_ := entry.targetLocal, projection := entry.targetProjection }) =
+      .ok (.scalar slicedSc) locals := by
+  cases localDecls with
+  | nil => nomatch hCtx
+  | cons d ds =>
+    cases hTProj : entry.targetProjection with
+    | cons _ _ =>
+      dsimp only [checkConcreteScalarDerefCtx] at hCtx
+      rw [hTProj] at hCtx
+      nomatch hCtx
+    | nil =>
+      dsimp only [checkConcreteScalarDerefCtx] at hCtx
+      rw [hTProj] at hCtx
+      dsimp only at hCtx
+      generalize hP :
+          placeTyResolved (d :: ds) layouts { local_ := loc, projection := .deref :: .nil } =
+            ptOpt at hCtx ⊢
+      cases ptOpt with
+      | none => nomatch hCtx
+      | some pt =>
+        dsimp only at hCtx
+        unfold evalStackThinPtrTypedDerefRead
+        dsimp only [stripTransparentProjections]
+        rw [hTProj]
+        dsimp only
+        rw [checkTargetPlaceAlign_nil_irrel (d :: ds) layouts
+          (Option.some (resolveTyWithLocalDecls (d :: ds) layouts pt))
+          entry ptrVal (Option.some (.scalar sc)) Option.none hTProj]
+        cases hAlign :
+            Bool.and
+              (checkDerefAlign (d :: ds) layouts (.some (resolveTyWithLocalDecls (d :: ds) layouts pt)) ptrVal.offsetBytes)
+              (checkTargetPlaceAlign (d :: ds) layouts (.some (resolveTyWithLocalDecls (d :: ds) layouts pt)) entry ptrVal .none) with
+        | false =>
+          rw [hAlign] at hCtx
+          nomatch hCtx
+        | true =>
+          rw [hAlign] at hCtx
+          dsimp only at hCtx ⊢
+          cases hReqB : tyScalarBytes (resolveTyWithLocalDecls (d :: ds) layouts pt) with
+          | none =>
+            rw [hReqB] at hCtx
+            nomatch hCtx
+          | some reqBytes =>
+            rw [hReqB] at hCtx
+            dsimp only [readProjectedForLocal, placeTouchesUnion, readProjectedValue] at hCtx ⊢
+            cases hSlice : extractScalarSlice? sc ptrVal.offsetBytes reqBytes with
+            | none =>
+              rw [hSlice] at hCtx
+              nomatch hCtx
+            | some sSc =>
+              rw [hSlice] at hCtx
+              dsimp only at hCtx ⊢
+              cases hVal : validateValueForTy? layouts (.some (resolveTyWithLocalDecls (d :: ds) layouts pt)) (.scalar sSc) with
+              | false =>
+                rw [hVal] at hCtx
+                nomatch hCtx
+              | true =>
+                rw [hVal] at hCtx
+                injection hCtx with hEq
+                subst hEq
+                rfl
+
+theorem freezeDerefReadBorrowsAt_eq_of_ptr
+    (args : List Value)
+    (slots : List SymSlot)
+    (ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (hPtr : get? slots ptrLoc = .some (.concrete (.init (.ptr ptrVal ptrSz)))) :
+    freezeDerefReadBorrowsAt (concretizeSymSlots args slots) ptrLoc restProj borrows activeProtectors =
+      freezeSymDerefReadBorrowsAt slots ptrLoc restProj borrows activeProtectors := by
+  unfold freezeDerefReadBorrowsAt freezeSymDerefReadBorrowsAt
+  rw [get?_concretizeSymSlots args slots ptrLoc, hPtr]
+  rfl
+
+theorem derefReadTreeUB_eq_of_ptr
+    (args : List Value)
+    (slots : List SymSlot)
+    (ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (hPtr : get? slots ptrLoc = .some (.concrete (.init (.ptr ptrVal ptrSz)))) :
+    derefReadTreeUB (concretizeSymSlots args slots) ptrLoc restProj borrows activeProtectors =
+      derefSymReadTreeUB slots ptrLoc restProj borrows activeProtectors := by
+  unfold derefReadTreeUB derefSymReadTreeUB
+  rw [get?_concretizeSymSlots args slots ptrLoc, hPtr]
+  rfl
+
+def treeBorrowPermIsDisabled : TreeBorrowPerm → Bool
+  | .disabled => true
+  | _ => false
+
+def isNonBoolOperandTy : Option Ty → Bool
+  | .some { kind := .bool, .. } => false
+  | _ => true
+
+theorem symValidateLoadedValue_of_isNonBoolOperandTy
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl)
+    (p : Place)
+    (sv : SymVal)
+    (h : isNonBoolOperandTy (operandTy localDecls layouts (.copy p)) = true) :
+    symValidateLoadedValue layouts localDecls (.copy p) sv = true := by
+  dsimp only [symValidateLoadedValue]
+  cases hTy : operandTy localDecls layouts (.copy p) with
+  | none => rfl
+  | some ty =>
+    rw [hTy] at h
+    cases ty with
+    | mk kind layoutIdx =>
+      cases kind with
+      | bool => nomatch h
+      | _ => rfl
+
+theorem evalOperand_copy_deref_of_ptr
+    (args : List Value)
+    (slots : List SymSlot)
+    (ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (d : LocalDecl)
+    (ds : List LocalDecl)
+    (targetRootVal : Value)
+    (hPtr : get? slots ptrLoc = .some (.concrete (.init (.ptr ptrVal ptrSz))))
+    (hBorrow : lookupBorrow borrows ptrVal.tag = .some entry)
+    (hNotDis : treeBorrowPermIsDisabled entry.perm = false)
+    (hTarget : get? (concretizeSymSlots args slots) entry.targetLocal = .some (.init targetRootVal)) :
+    evalOperand
+      (concretizeSymSlots args slots)
+      (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+      borrows
+      globals
+      layouts
+      .nil
+      (d :: ds) =
+      evalStackThinPtrTypedDerefRead
+        (concretizeSymSlots args slots)
+        targetRootVal
+        entry
+        ptrVal
+        restProj
+        (d :: ds)
+        layouts
+        (placeTyResolved (d :: ds) layouts { local_ := ptrLoc, projection := .deref :: .nil })
+        (placeTyResolved (d :: ds) layouts { local_ := ptrLoc, projection := .deref :: restProj })
+        (placeTyResolved (d :: ds) layouts { local_ := entry.targetLocal, projection := entry.targetProjection }) := by
+  dsimp only [evalOperand]
+  rw [get?_concretizeSymSlots args slots ptrLoc, hPtr]
+  dsimp only [concretizeSymSlot]
+  rw [hBorrow]
+  dsimp only
+  cases hPerm : entry.perm with
+  | disabled =>
+    rw [hPerm] at hNotDis
+    nomatch hNotDis
+  | cell | reservedIM | reservedFrz _ | unique | frozen =>
+    dsimp only
+    rw [hTarget]
+
+theorem evalRvalue_use_copy_deref_ok_of_ptr
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (restProj : List ProjectionElem)
+    (loadedVal : Value)
+    (hPtr : get? st.slots ptrLoc = .some (.concrete (.init (.ptr ptrVal ptrSz))))
+    (hOp :
+      evalOperand
+        (concretizeSymSlots args st.slots)
+        (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+        st.borrows
+        body.allocations
+        body.layouts
+        .nil
+        body.localDecls =
+        .ok loadedVal (concretizeSymSlots args st.slots))
+    (hValid :
+      symValidateLoadedValue
+        body.layouts
+        body.localDecls
+        (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+        (.concrete loadedVal) = true)
+    (hUB :
+      symOperandReadTreeUB
+        st.slots
+        (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+        st.borrows
+        .nil = false) :
+    evalRvalue
+      (concretizeSymSlots args st.slots)
+      (.use (.copy { local_ := ptrLoc, projection := .deref :: restProj }))
+      (concretizeSymMemory body st)
+      body.localDecls
+      body.layouts =
+      .ok
+        loadedVal
+        (concretizeSymSlots args st.slots)
+        { concretizeSymMemory body st with
+          borrows :=
+            freezeSymOperandReadBorrows
+              st.slots
+              (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+              st.borrows
+              .nil } := by
+  dsimp only [evalRvalue, concretizeSymMemory]
+  rw [hOp]
+  dsimp only
+  have hVal :
+      validateLoadedValue
+        body.layouts
+        body.localDecls
+        (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+        loadedVal = true := by
+    dsimp only [validateLoadedValue]
+    dsimp only [symValidateLoadedValue] at hValid
+    cases hTy : operandTy body.localDecls body.layouts (.copy { local_ := ptrLoc, projection := .deref :: restProj }) with
+    | none => rfl
+    | some ty =>
+      cases ty with
+      | mk kind layoutIdx =>
+        cases kind with
+        | bool =>
+          rw [hTy] at hValid
+          dsimp only at hValid
+          cases loadedVal with
+          | scalar sc => exact hValid
+          | unit | ptr _ _ | aggregate _ _ => nomatch hValid
+        | _ => rfl
+  rw [hVal]
+  dsimp only
+  cases hBs : st.borrows with
+  | nil => rfl
+  | cons b1 rest1 =>
+    cases rest1 with
+    | nil => rfl
+    | cons b2 restBorrows =>
+      rw [hBs] at hUB
+      dsimp only [symOperandReadTreeUB] at hUB
+      dsimp only [freezeSymOperandReadBorrows]
+      rw [derefReadTreeUB_eq_of_ptr args st.slots ptrLoc ptrVal ptrSz restProj
+        (b1 :: b2 :: restBorrows) .nil hPtr, hUB]
+      rw [freezeDerefReadBorrowsAt_eq_of_ptr args st.slots ptrLoc ptrVal ptrSz restProj
+        (b1 :: b2 :: restBorrows) .nil hPtr]
+
+theorem evalAssignNilRvalueStep_concrete_ok
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (dstLoc : Local)
+    (loadedVal : Value)
+    (borrows₁ : List BorrowEntry)
+    (dstSlot : SymSlot)
+    (slots₂ : List SymSlot)
+    (hDst : get? st.slots dstLoc = .some dstSlot)
+    (hNotDead : symSlotIsDead dstSlot = false)
+    (hSet : set? st.slots dstLoc (.concrete (.init loadedVal)) = .some slots₂) :
+    evalAssignNilRvalueStep
+      (concretizeSymState body args st)
+      dstLoc
+      (.ok
+        loadedVal
+        (concretizeSymSlots args st.slots)
+        { concretizeSymMemory body st with borrows := borrows₁ }) =
+      MirStepNode.step
+        (concretizeSymState body args
+          { st with
+            stmtIdx := Nat.add st.stmtIdx 1
+            slots := slots₂
+            borrows := invalidateConflictingBorrows borrows₁ dstLoc .none }) := by
+  dsimp only [evalAssignNilRvalueStep, concretizeSymMemory]
+  rw [get?_concretizeSymSlots args st.slots dstLoc, hDst]
+  dsimp only
+  rw [set?_concretizeSymSlots_concrete args (.init loadedVal) st.slots dstLoc, hSet]
+  dsimp only
+  rcases concretizeSymSlot_eq_of_not_dead args dstSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+    (rw [hSlot]; rfl)
+
+theorem list_length_set {α : Type} :
+    ∀ (xs : List α) (i : Nat) (a : α),
+      (xs.set i a).length = xs.length
+  | .nil, _, _ => rfl
+  | _ :: _, .zero, _ => rfl
+  | _ :: rest, .succ i, a => congrArg Nat.succ (list_length_set rest i a)
+
+theorem list_get?_set_self {α : Type} :
+    ∀ (xs : List α) (i : Nat) (a : α),
+      i < xs.length →
+      get? (xs.set i a) i = .some a
+  | .nil, _, _, h => nomatch h
+  | _ :: _, .zero, _, _ => rfl
+  | _ :: rest, .succ i, a, h => list_get?_set_self rest i a (Nat.lt_of_succ_lt_succ h)
+
+theorem list_set_set_same {α : Type} :
+    ∀ (xs : List α) (i : Nat) (a b : α),
+      (xs.set i a).set i b = xs.set i b
+  | .nil, _, _, _ => rfl
+  | _ :: _, .zero, _, _ => rfl
+  | x :: rest, .succ i, a, b => congrArg (x :: ·) (list_set_set_same rest i a b)
+
+theorem set?_eq_some_set_of_set?_some {α : Type}
+    {xs ys : List α} {i : Nat} {a : α} (b : α)
+    (h : set? xs i a = .some ys) :
+    i < xs.length ∧ ys = xs.set i a ∧ set? xs i b = .some (xs.set i b) := by
+  unfold set? at h ⊢
+  split at h
+  · next hLt =>
+    injection h with hYs
+    split
+    · exact ⟨hLt, Eq.symm hYs, rfl⟩
+    · next hNot => exact absurd hLt hNot
+  · nomatch h
+
+theorem extractScalarSlice?_sizeBytes
+    (s : ScalarInt)
+    (byteOffset targetBytes : Nat)
+    (sc : ScalarInt)
+    (h : extractScalarSlice? s byteOffset targetBytes = .some sc) :
+    sc.sizeBytes = targetBytes := by
+  dsimp only [extractScalarSlice?] at h
+  cases hBle : Bool.and (Nat.ble 1 targetBytes) (Nat.ble (Nat.add byteOffset targetBytes) s.sizeBytes) with
+  | false =>
+    rw [hBle] at h
+    nomatch h
+  | true =>
+    rw [hBle] at h
+    dsimp only at h
+    cases hEq : Bool.and (Nat.beq byteOffset 0) (Nat.beq targetBytes s.sizeBytes) with
+    | true =>
+      rw [hEq] at h
+      injection h with hSc
+      subst hSc
+      rcases Bool.and_eq_true_iff.1 hEq with ⟨_, hSz⟩
+      exact Eq.symm (Nat.eq_of_beq_eq_true hSz)
+    | false =>
+      rw [hEq] at h
+      injection h with hSc
+      subst hSc
+      rfl
+
+theorem extractValueScalarSlice0?_sizeBytes
+    (v : Value)
+    (targetBytes : Nat)
+    (sc : ScalarInt)
+    (h : extractValueScalarSlice0? v targetBytes = .some sc) :
+    sc.sizeBytes = targetBytes := by
+  cases v with
+  | unit | ptr _ _ => nomatch h
+  | scalar s =>
+    exact extractScalarSlice?_sizeBytes s 0 targetBytes sc h
+  | aggregate varIdx fields =>
+    cases varIdx with
+    | succ _ => nomatch h
+    | zero =>
+      cases fields with
+      | nil => nomatch h
+      | cons f0 fRest =>
+        cases f0 with
+        | unit | ptr _ _ | aggregate _ _ => nomatch h
+        | scalar s =>
+          dsimp only [extractValueScalarSlice0?] at h
+          cases hHom : isHomogeneousUntypedFields (.scalar s :: fRest) with
+          | false =>
+            rw [hHom] at h
+            nomatch h
+          | true =>
+            rw [hHom] at h
+            exact extractScalarSlice?_sizeBytes s 0 targetBytes sc h
+
+def isPtr8Value : Value → Option ProvenancePtr
+  | .ptr p sz =>
+    match Nat.beq sz 8 with
+    | true => .some p
+    | false => .none
+  | _ => .none
+
+/-- Step a single `.assign ⟨dstLoc, .nil⟩ (.use (.copy ⟨ptrLoc, .deref :: restProj⟩))`
+statement when the target local in `st.slots` holds a concrete aggregate field
+pointer or concrete scalar. -/
+def symStepStmtConcreteDeref
+    (body : CapturedMir)
+    (st : SymState)
+    (stmt : Statement) :
+    Option SymState :=
+  match body.localDecls, stmt.kind with
+  | _ :: _, .assign ⟨dstLoc, .nil⟩ (.use (.copy { local_ := ptrLoc, projection := .deref :: restProj })) =>
+    match get? st.slots ptrLoc with
+    | .some (.concrete (.init (.ptr ptrVal _ptrSz))) =>
+      match lookupBorrow st.borrows ptrVal.tag with
+      | .some entry =>
+        match treeBorrowPermIsDisabled entry.perm with
+        | true => .none
+        | false =>
+          let loadedOpt : Option Value :=
+            match restProj, get? st.slots entry.targetLocal with
+            | .field fIdx fTy :: .nil, .some (.concrete (.init (.aggregate .zero fields))) =>
+              match get? fields fIdx with
+              | .some fVal =>
+                match isPtr8Value fVal, checkConcreteFieldPtrDerefCtx body.localDecls body.layouts ptrLoc fIdx fTy entry ptrVal with
+                | .some fPtr, true => .some (.ptr fPtr 8)
+                | _, _ => .none
+              | .none => .none
+            | .nil, .some (.concrete (.init (.scalar sc))) =>
+              match checkConcreteScalarDerefCtx body.localDecls body.layouts ptrLoc entry ptrVal sc with
+              | .some slicedSc => .some (.scalar slicedSc)
+              | .none => .none
+            | _, _ => .none
+          match loadedOpt with
+          | .none => .none
+          | .some loadedVal =>
+            let op := Operand.copy { local_ := ptrLoc, projection := .deref :: restProj }
+            match
+              symValidateLoadedValue body.layouts body.localDecls op (.concrete loadedVal),
+              symOperandReadTreeUB st.slots op st.borrows .nil
+            with
+            | true, false =>
+              match get? st.slots dstLoc with
+              | .none => .none
+              | .some (.concrete .dead) => .none
+              | .some _ =>
+                match set? st.slots dstLoc (.concrete (.init loadedVal)) with
+                | .some slots₂ =>
+                  let borrows₁ := freezeSymOperandReadBorrows st.slots op st.borrows .nil
+                  let borrows₂ := invalidateConflictingBorrows borrows₁ dstLoc .none
+                  .some {
+                    st with
+                    stmtIdx := Nat.add st.stmtIdx 1
+                    slots := slots₂
+                    borrows := borrows₂
+                  }
+                | .none => .none
+            | _, _ => .none
+      | .none => .none
+    | _ => .none
+  | _, _ => .none
+
+def symStepConcreteDeref (body : CapturedMir) (st : SymState) : Option SymState :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .some stmt => symStepStmtConcreteDeref body st stmt
+      | .none => .none
+
+theorem symStepStmtConcreteDeref_sound
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (stmt : Statement)
+    (h : symStepStmtConcreteDeref body st stmt = .some st') :
+    evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
+      MirStepNode.step (concretizeSymState body args st') := by
+  dsimp only [symStepStmtConcreteDeref] at h
+  cases hDecls : body.localDecls with
+  | nil =>
+    rw [hDecls] at h
+    nomatch h
+  | cons d ds =>
+    rw [hDecls] at h
+    cases stmt with
+    | mk kind span =>
+      cases kind with
+      | assign dst rv =>
+        cases dst with
+        | mk dstLoc dstProj =>
+          cases dstProj with
+          | cons _ _ => nomatch h
+          | nil =>
+            cases rv with
+            | use op =>
+              cases op with
+              | copy p =>
+                cases p with
+                | mk ptrLoc proj =>
+                  cases proj with
+                  | nil => nomatch h
+                  | cons pHead restProj =>
+                    cases pHead with
+                    | deref =>
+                      dsimp only at h
+                      rw [← hDecls] at h
+                      cases hPtr : get? st.slots ptrLoc with
+                      | none => rw [hPtr] at h; nomatch h
+                      | some ptrSlot =>
+                        rw [hPtr] at h
+                        cases ptrSlot with
+                        | symArg _ | symPair0 _ _ => nomatch h
+                        | concrete cPtrSlot =>
+                          cases cPtrSlot with
+                          | dead | uninit => nomatch h
+                          | init ptrRootVal =>
+                            cases ptrRootVal with
+                            | unit | scalar _ | aggregate _ _ => nomatch h
+                            | ptr ptrVal ptrSz =>
+                              dsimp only at h
+                              cases hBorrow : lookupBorrow st.borrows ptrVal.tag with
+                              | none => rw [hBorrow] at h; nomatch h
+                              | some entry =>
+                                rw [hBorrow] at h
+                                dsimp only at h
+                                cases hDis : treeBorrowPermIsDisabled entry.perm with
+                                | true => rw [hDis] at h; nomatch h
+                                | false =>
+                                  rw [hDis] at h
+                                  dsimp only at h
+                                  have hLoaded :
+                                      ∃ loadedVal,
+                                        ((match restProj, get? st.slots entry.targetLocal with
+                                          | .field fIdx fTy :: .nil, .some (.concrete (.init (.aggregate .zero fields))) =>
+                                            match get? fields fIdx with
+                                            | .some fVal =>
+                                              match isPtr8Value fVal, checkConcreteFieldPtrDerefCtx body.localDecls body.layouts ptrLoc fIdx fTy entry ptrVal with
+                                              | .some fPtr, true => Option.some (Value.ptr fPtr 8)
+                                              | _, _ => Option.none
+                                            | .none => Option.none
+                                          | .nil, .some (.concrete (.init (.scalar sc))) =>
+                                            match checkConcreteScalarDerefCtx body.localDecls body.layouts ptrLoc entry ptrVal sc with
+                                            | .some slicedSc => Option.some (Value.scalar slicedSc)
+                                            | .none => Option.none
+                                          | _, _ => Option.none) : Option Value) = Option.some loadedVal ∧
+                                        evalOperand
+                                          (concretizeSymSlots args st.slots)
+                                          (.copy { local_ := ptrLoc, projection := .deref :: restProj })
+                                          st.borrows
+                                          body.allocations
+                                          body.layouts
+                                          .nil
+                                          body.localDecls =
+                                          .ok loadedVal (concretizeSymSlots args st.slots) := by
+                                    cases restProj with
+                                    | nil =>
+                                      cases hTSlot : get? st.slots entry.targetLocal with
+                                      | none => rw [hTSlot] at h; nomatch h
+                                      | some tSlot =>
+                                        rw [hTSlot] at h
+                                        cases tSlot with
+                                        | symArg _ | symPair0 _ _ => nomatch h
+                                        | concrete cTSlot =>
+                                          cases cTSlot with
+                                          | dead | uninit => nomatch h
+                                          | init tVal =>
+                                            cases tVal with
+                                            | unit | ptr _ _ | aggregate _ _ => nomatch h
+                                            | scalar sc =>
+                                              dsimp only at h ⊢
+                                              cases hCtx : checkConcreteScalarDerefCtx body.localDecls body.layouts ptrLoc entry ptrVal sc with
+                                              | none => rw [hCtx] at h; nomatch h
+                                              | some slicedSc =>
+                                                refine ⟨.scalar slicedSc, rfl, ?_⟩
+                                                have hTarget :
+                                                    get? (concretizeSymSlots args st.slots) entry.targetLocal =
+                                                      .some (.init (.scalar sc)) := by
+                                                  rw [get?_concretizeSymSlots args st.slots entry.targetLocal, hTSlot]
+                                                  rfl
+                                                rw [hDecls] at hCtx ⊢
+                                                rw [evalOperand_copy_deref_of_ptr
+                                                  args st.slots ptrLoc ptrVal ptrSz .nil st.borrows entry
+                                                  body.allocations body.layouts d ds (.scalar sc) hPtr hBorrow hDis hTarget]
+                                                exact evalStackThinPtrTypedDerefRead_concreteScalar_eq
+                                                  (concretizeSymSlots args st.slots) (d :: ds) body.layouts
+                                                  ptrLoc entry ptrVal sc slicedSc hCtx
+                                    | cons rHead rTail =>
+                                      cases rHead with
+                                      | field fIdx fTy =>
+                                        cases rTail with
+                                        | cons _ _ => nomatch h
+                                        | nil =>
+                                          cases hTSlot : get? st.slots entry.targetLocal with
+                                          | none => rw [hTSlot] at h; nomatch h
+                                          | some tSlot =>
+                                            rw [hTSlot] at h
+                                            cases tSlot with
+                                            | symArg _ | symPair0 _ _ => nomatch h
+                                            | concrete cTSlot =>
+                                              cases cTSlot with
+                                              | dead | uninit => nomatch h
+                                              | init tVal =>
+                                                cases tVal with
+                                                | unit | scalar _ | ptr _ _ => nomatch h
+                                                | aggregate varIdx fields =>
+                                                  cases varIdx with
+                                                  | succ _ => nomatch h
+                                                  | zero =>
+                                                    dsimp only at h ⊢
+                                                    cases hField : get? fields fIdx with
+                                                    | none => rw [hField] at h; nomatch h
+                                                    | some fVal =>
+                                                      rw [hField] at h
+                                                      dsimp only at h ⊢
+                                                      cases hPtr8 : isPtr8Value fVal with
+                                                      | none => rw [hPtr8] at h; nomatch h
+                                                      | some fPtr =>
+                                                        rw [hPtr8] at h
+                                                        have hFValEq : fVal = .ptr fPtr 8 := by
+                                                          cases fVal with
+                                                          | unit | scalar _ | aggregate _ _ => nomatch hPtr8
+                                                          | ptr p sz =>
+                                                            dsimp only [isPtr8Value] at hPtr8
+                                                            cases hSz8 : Nat.beq sz 8 with
+                                                            | false => rw [hSz8] at hPtr8; nomatch hPtr8
+                                                            | true =>
+                                                              rw [hSz8] at hPtr8
+                                                              injection hPtr8 with hp
+                                                              rw [hp, Nat.eq_of_beq_eq_true hSz8]
+                                                        rw [hFValEq] at hField
+                                                        cases hCtx : checkConcreteFieldPtrDerefCtx body.localDecls body.layouts ptrLoc fIdx fTy entry ptrVal with
+                                                        | false => rw [hCtx] at h; nomatch h
+                                                        | true =>
+                                                          refine ⟨.ptr fPtr 8, rfl, ?_⟩
+                                                          have hTarget :
+                                                              get? (concretizeSymSlots args st.slots) entry.targetLocal =
+                                                                .some (.init (.aggregate 0 fields)) := by
+                                                            rw [get?_concretizeSymSlots args st.slots entry.targetLocal, hTSlot]
+                                                            rfl
+                                                          rw [hDecls] at hCtx ⊢
+                                                          rw [evalOperand_copy_deref_of_ptr
+                                                            args st.slots ptrLoc ptrVal ptrSz (.field fIdx fTy :: .nil) st.borrows entry
+                                                            body.allocations body.layouts d ds (.aggregate 0 fields) hPtr hBorrow hDis hTarget]
+                                                          exact evalStackThinPtrTypedDerefRead_concreteFieldPtr_eq
+                                                            (concretizeSymSlots args st.slots) (d :: ds) body.layouts
+                                                            ptrLoc fIdx fTy entry ptrVal fields fPtr hCtx hField
+                                      | _ => nomatch h
+                                  rcases hLoaded with ⟨loadedVal, hLOpt, hOp⟩
+                                  rw [hLOpt] at h
+                                  dsimp only at h
+                                  cases hValid : symValidateLoadedValue body.layouts body.localDecls (.copy { local_ := ptrLoc, projection := .deref :: restProj }) (.concrete loadedVal) with
+                                  | false => rw [hValid] at h; nomatch h
+                                  | true =>
+                                    rw [hValid] at h
+                                    cases hUB : symOperandReadTreeUB st.slots (.copy { local_ := ptrLoc, projection := .deref :: restProj }) st.borrows .nil with
+                                    | true => rw [hUB] at h; nomatch h
+                                    | false =>
+                                      rw [hUB] at h
+                                      dsimp only at h
+                                      cases hDst : get? st.slots dstLoc with
+                                      | none => rw [hDst] at h; nomatch h
+                                      | some dstSlot =>
+                                        rw [hDst] at h
+                                        have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
+                                        cases hSet : set? st.slots dstLoc (.concrete (.init loadedVal)) with
+                                        | none => rw [hSet] at hOk; nomatch hOk
+                                        | some slots₂ =>
+                                          rw [hSet] at hOk
+                                          injection hOk with hSt'
+                                          subst hSt'
+                                          rw [← hDecls]
+                                          rw [evalStmt_assign_nil_eq]
+                                          dsimp only [concretizeSymState]
+                                          rw [evalRvalue_use_copy_deref_ok_of_ptr
+                                            body args st ptrLoc ptrVal ptrSz restProj loadedVal hPtr hOp hValid hUB]
+                                          exact evalAssignNilRvalueStep_concrete_ok
+                                            body args st dstLoc loadedVal
+                                            (freezeSymOperandReadBorrows st.slots (.copy { local_ := ptrLoc, projection := .deref :: restProj }) st.borrows .nil)
+                                            dstSlot slots₂ hDst hNotDead hSet
+                    | _ => nomatch h
+              | _ => nomatch h
+            | _ => nomatch h
+      | _ => nomatch h
+
+theorem symStepConcreteDeref_stepMirFn_eq
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (h : symStepConcreteDeref body st = .some st') :
+    stepMirFn body (concretizeSymState body args st) =
+      MirStepNode.step (concretizeSymState body args st') := by
+  dsimp only [symStepConcreteDeref] at h
+  cases hPhase : body.phase with
+  | other _ => rw [hPhase] at h; nomatch h
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at h
+    dsimp only at h
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none => rw [hBb] at h; nomatch h
+    | some bb =>
+      rw [hBb] at h
+      dsimp only at h
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | none => rw [hStmt] at h; nomatch h
+      | some stmt =>
+        rw [hStmt] at h
+        rw [stepMirFn_concretize_stmt body args st bb stmt hNotOther hBb hStmt]
+        exact symStepStmtConcreteDeref_sound body args st st' stmt h
+
+theorem symStepConcreteDeref_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (h : symStepConcreteDeref body st = .some st')
+    (hHold : evalMirBoolHoldBounded (.succ fuel) body (concretizeSymState body args st)) :
+    evalMirBoolHoldBounded fuel body (concretizeSymState body args st') := by
+  change stepResultHoldBounded fuel body (stepMirFn body (concretizeSymState body args st)) at hHold
+  rw [symStepConcreteDeref_stepMirFn_eq body args st st' h] at hHold
+  exact hHold
+
+def symStepConcreteExt (body : CapturedMir) (st : SymState) : Option SymState :=
+  match symStepConcrete body st with
+  | .some st' => .some st'
+  | .none => symStepConcreteDeref body st
+
+theorem symStepConcreteExt_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (h : symStepConcreteExt body st = .some st')
+    (hHold : evalMirBoolHoldBounded (.succ fuel) body (concretizeSymState body args st)) :
+    evalMirBoolHoldBounded fuel body (concretizeSymState body args st') := by
+  dsimp only [symStepConcreteExt] at h
+  cases hStep : symStepConcrete body st with
+  | some s1 =>
+    rw [hStep] at h
+    injection h with hEq
+    subst hEq
+    exact symStepConcrete_sound fuel body args st s1 hStep hHold
+  | none =>
+    rw [hStep] at h
+    exact symStepConcreteDeref_sound fuel body args st st' h hHold
+
+def checkSymReturnsFalseExt : Nat → CapturedMir → SymState → Bool
+  | .zero, _, _ => false
+  | .succ fuel, body, st =>
+    match symStepConcreteExt body st with
+    | .some st' => checkSymReturnsFalseExt fuel body st'
+    | .none => symIsReturnFalse body st
+
+theorem checkSymReturnsFalseExt_sound :
+    ∀ (fuel : Nat) (body : CapturedMir) (args : List Value) (st : SymState),
+      checkSymReturnsFalseExt fuel body st = true →
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
+      False
+  | .zero, _, _, _, hCheck, _ => nomatch hCheck
+  | .succ fuel, body, args, st, hCheck, hHold => by
+    dsimp only [checkSymReturnsFalseExt] at hCheck
+    cases hStep : symStepConcreteExt body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact checkSymReturnsFalseExt_sound
+        fuel body args st' hCheck
+        (symStepConcreteExt_sound fuel body args st st' hStep hHold)
+    | none =>
+      rw [hStep] at hCheck
+      exact symIsReturnFalse_sound fuel body args st hCheck hHold
+
+/-- Match a dereference load statement `.assign ⟨dstLoc, .nil⟩ (.use (.copy ⟨ptrLoc, [.deref]⟩))`
+where `ptrLoc` borrows `.symArg idx` at unsigned integer type `uKind`. -/
+def symMatchDerefSymArgLoad
+    (body : CapturedMir)
+    (st : SymState)
+    (stmt : Statement) :
+    Option (Nat × UintTy × Local × List BorrowEntry) :=
+  match body.localDecls, stmt.kind with
+  | _ :: _, .assign ⟨dstLoc, .nil⟩ (.use (.copy { local_ := ptrLoc, projection := .deref :: .nil })) =>
+    match get? st.slots ptrLoc with
+    | .some (.concrete (.init (.ptr ptrVal _ptrSz))) =>
+      match lookupBorrow st.borrows ptrVal.tag with
+      | .some entry =>
+        match treeBorrowPermIsDisabled entry.perm with
+        | true => .none
+        | false =>
+          match get? st.slots entry.targetLocal with
+          | .some (.symArg idx) =>
+            match placeTyResolved body.localDecls body.layouts { local_ := ptrLoc, projection := .deref :: .nil } with
+            | .some { kind := .uint uKind, .. } =>
+              let op := Operand.copy { local_ := ptrLoc, projection := .deref :: .nil }
+              match
+                checkCanonicalUintDerefReadCtx body.localDecls body.layouts ptrLoc uKind entry ptrVal,
+                isNonBoolOperandTy (operandTy body.localDecls body.layouts op),
+                symOperandReadTreeUB st.slots op st.borrows .nil
+              with
+              | true, true, false =>
+                match get? st.slots dstLoc with
+                | .none => .none
+                | .some (.concrete .dead) => .none
+                | .some _ =>
+                  let borrows₁ := freezeSymOperandReadBorrows st.slots op st.borrows .nil
+                  let borrows₂ := invalidateConflictingBorrows borrows₁ dstLoc .none
+                  .some (idx, uKind, dstLoc, borrows₂)
+              | _, _, _ => .none
+            | _ => .none
+          | _ => .none
+      | .none => .none
+    | _ => .none
+  | _, _ => .none
+
+theorem symMatchDerefSymArgLoad_evalStmt
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (stmt : Statement)
+    (idx : Nat)
+    (uKind : UintTy)
+    (dstLoc : Local)
+    (borrows₂ : List BorrowEntry)
+    (hMatch : symMatchDerefSymArgLoad body st stmt = .some (idx, uKind, dstLoc, borrows₂)) :
+    match get? args idx with
+    | .none =>
+      evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
+        MirStepNode.fail .ub
+    | .some v =>
+      match extractValueScalarSlice0? v (uintBytesOfKind uKind) with
+      | .none =>
+        evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
+          MirStepNode.fail .ub
+      | .some actualSc =>
+        evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
+          match set? st.slots dstLoc (.concrete (.init (.scalar actualSc))) with
+          | .some slots₂ =>
+            MirStepNode.step
+              (concretizeSymState body args
+                { st with
+                  stmtIdx := Nat.add st.stmtIdx 1
+                  slots := slots₂
+                  borrows := borrows₂ })
+          | .none => MirStepNode.fail .ub := by
+  dsimp only [symMatchDerefSymArgLoad] at hMatch
+  cases hDecls : body.localDecls with
+  | nil => rw [hDecls] at hMatch; nomatch hMatch
+  | cons d ds =>
+    rw [hDecls] at hMatch
+    cases stmt with
+    | mk kind span =>
+      cases kind with
+      | assign dst rv =>
+        cases dst with
+        | mk dLoc dProj =>
+          cases dProj with
+          | cons _ _ => nomatch hMatch
+          | nil =>
+            cases rv with
+            | use op =>
+              cases op with
+              | copy p =>
+                cases p with
+                | mk ptrLoc proj =>
+                  cases proj with
+                  | nil => nomatch hMatch
+                  | cons pHead pTail =>
+                    cases pHead with
+                    | deref =>
+                      cases pTail with
+                      | cons _ _ => nomatch hMatch
+                      | nil =>
+                        dsimp only at hMatch
+                        rw [← hDecls] at hMatch
+                        cases hPtr : get? st.slots ptrLoc with
+                        | none => rw [hPtr] at hMatch; nomatch hMatch
+                        | some ptrSlot =>
+                          rw [hPtr] at hMatch
+                          cases ptrSlot with
+                          | symArg _ | symPair0 _ _ => nomatch hMatch
+                          | concrete cPtrSlot =>
+                            cases cPtrSlot with
+                            | dead | uninit => nomatch hMatch
+                            | init ptrRootVal =>
+                              cases ptrRootVal with
+                              | unit | scalar _ | aggregate _ _ => nomatch hMatch
+                              | ptr ptrVal ptrSz =>
+                                dsimp only at hMatch
+                                cases hBorrow : lookupBorrow st.borrows ptrVal.tag with
+                                | none => rw [hBorrow] at hMatch; nomatch hMatch
+                                | some entry =>
+                                  rw [hBorrow] at hMatch
+                                  dsimp only at hMatch
+                                  cases hDis : treeBorrowPermIsDisabled entry.perm with
+                                  | true => rw [hDis] at hMatch; nomatch hMatch
+                                  | false =>
+                                    rw [hDis] at hMatch
+                                    dsimp only at hMatch
+                                    cases hTSlot : get? st.slots entry.targetLocal with
+                                    | none => rw [hTSlot] at hMatch; nomatch hMatch
+                                    | some tSlot =>
+                                      rw [hTSlot] at hMatch
+                                      cases tSlot with
+                                      | concrete _ | symPair0 _ _ => nomatch hMatch
+                                      | symArg slotIdx =>
+                                        dsimp only at hMatch
+                                        cases hPTy : placeTyResolved body.localDecls body.layouts { local_ := ptrLoc, projection := .deref :: .nil } with
+                                        | none => rw [hPTy] at hMatch; nomatch hMatch
+                                        | some pTy =>
+                                          rw [hPTy] at hMatch
+                                          cases pTy with
+                                          | mk pKind pLayoutIdx =>
+                                            cases pKind with
+                                            | uint uK =>
+                                              dsimp only at hMatch
+                                              cases hCtx : checkCanonicalUintDerefReadCtx body.localDecls body.layouts ptrLoc uK entry ptrVal with
+                                              | false => rw [hCtx] at hMatch; nomatch hMatch
+                                              | true =>
+                                                rw [hCtx] at hMatch
+                                                cases hNonBool : isNonBoolOperandTy (operandTy body.localDecls body.layouts (.copy { local_ := ptrLoc, projection := .deref :: .nil })) with
+                                                | false => rw [hNonBool] at hMatch; nomatch hMatch
+                                                | true =>
+                                                  rw [hNonBool] at hMatch
+                                                  cases hUB : symOperandReadTreeUB st.slots (.copy { local_ := ptrLoc, projection := .deref :: .nil }) st.borrows .nil with
+                                                  | true => rw [hUB] at hMatch; nomatch hMatch
+                                                  | false =>
+                                                    rw [hUB] at hMatch
+                                                    dsimp only at hMatch
+                                                    cases hDst : get? st.slots dLoc with
+                                                    | none => rw [hDst] at hMatch; nomatch hMatch
+                                                    | some dstSlot =>
+                                                      rw [hDst] at hMatch
+                                                      have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some hMatch
+                                                      injection hOk with hTup
+                                                      injection hTup with hIdx hRest1
+                                                      injection hRest1 with hUK hRest2
+                                                      injection hRest2 with hDLoc hBorrows
+                                                      rw [← hIdx, ← hUK, ← hDLoc, ← hBorrows, ← hDecls]
+                                                      cases hArg : get? args slotIdx with
+                                                      | none =>
+                                                        dsimp only
+                                                        rw [evalStmt_assign_nil_eq, hDecls]
+                                                        dsimp only [evalRvalue, evalOperand, evalAssignNilRvalueStep, concretizeSymState]
+                                                        rw [get?_concretizeSymSlots args st.slots ptrLoc, hPtr]
+                                                        dsimp only [concretizeSymSlot, concretizeSymMemory]
+                                                        rw [hBorrow]
+                                                        dsimp only
+                                                        cases hPerm : entry.perm with
+                                                        | disabled => rfl
+                                                        | cell | reservedIM | reservedFrz _ | unique | frozen =>
+                                                          dsimp only
+                                                          rw [get?_concretizeSymSlots args st.slots entry.targetLocal, hTSlot]
+                                                          dsimp only [concretizeSymSlot]
+                                                          rw [hArg]
+                                                      | some v =>
+                                                        dsimp only
+                                                        have hTarget :
+                                                            get? (concretizeSymSlots args st.slots) entry.targetLocal = .some (.init v) := by
+                                                          rw [get?_concretizeSymSlots args st.slots entry.targetLocal, hTSlot]
+                                                          dsimp only [concretizeSymSlot]
+                                                          rw [hArg]
+                                                        have hOpEq :
+                                                            evalOperand
+                                                              (concretizeSymSlots args st.slots)
+                                                              (.copy { local_ := ptrLoc, projection := .deref :: .nil })
+                                                              st.borrows
+                                                              body.allocations
+                                                              body.layouts
+                                                              .nil
+                                                              body.localDecls =
+                                                              match extractValueScalarSlice0? v (uintBytesOfKind uK) with
+                                                              | .some slicedSc => .ok (.scalar slicedSc) (concretizeSymSlots args st.slots)
+                                                              | .none => .ub := by
+                                                          rw [hDecls] at hCtx ⊢
+                                                          rw [evalOperand_copy_deref_of_ptr
+                                                            args st.slots ptrLoc ptrVal ptrSz .nil st.borrows entry
+                                                            body.allocations body.layouts d ds v hPtr hBorrow hDis hTarget]
+                                                          exact evalStackThinPtrTypedDerefRead_uint_eq
+                                                            (concretizeSymSlots args st.slots) (d :: ds) body.layouts
+                                                            ptrLoc uK entry ptrVal v hCtx
+                                                        cases hSlice : extractValueScalarSlice0? v (uintBytesOfKind uK) with
+                                                        | none =>
+                                                          dsimp only
+                                                          rw [evalStmt_assign_nil_eq]
+                                                          dsimp only [evalRvalue, evalAssignNilRvalueStep, concretizeSymState, concretizeSymMemory]
+                                                          rw [hOpEq, hSlice]
+                                                        | some actualSc =>
+                                                          dsimp only
+                                                          rw [hSlice] at hOpEq
+                                                          have hValid :
+                                                              symValidateLoadedValue
+                                                                body.layouts
+                                                                body.localDecls
+                                                                (.copy { local_ := ptrLoc, projection := .deref :: .nil })
+                                                                (.concrete (.scalar actualSc)) = true :=
+                                                            symValidateLoadedValue_of_isNonBoolOperandTy
+                                                              body.layouts body.localDecls
+                                                              { local_ := ptrLoc, projection := .deref :: .nil }
+                                                              (.concrete (.scalar actualSc)) hNonBool
+                                                          rw [evalStmt_assign_nil_eq]
+                                                          dsimp only [concretizeSymState]
+                                                          rw [evalRvalue_use_copy_deref_ok_of_ptr
+                                                            body args st ptrLoc ptrVal ptrSz .nil (.scalar actualSc)
+                                                            hPtr hOpEq hValid hUB]
+                                                          cases hSet : set? st.slots dLoc (.concrete (.init (.scalar actualSc))) with
+                                                          | some slots₂ =>
+                                                            exact evalAssignNilRvalueStep_concrete_ok
+                                                              body args st dLoc (.scalar actualSc)
+                                                              (freezeSymOperandReadBorrows st.slots (.copy { local_ := ptrLoc, projection := .deref :: .nil }) st.borrows .nil)
+                                                              dstSlot slots₂ hDst hNotDead hSet
+                                                          | none =>
+                                                            dsimp only [evalAssignNilRvalueStep, concretizeSymMemory]
+                                                            rw [get?_concretizeSymSlots args st.slots dLoc, hDst]
+                                                            dsimp only
+                                                            rcases concretizeSymSlot_eq_of_not_dead args dstSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                                                              (rw [hSlot]
+                                                               dsimp only
+                                                               rw [set?_concretizeSymSlots_concrete args (.init (.scalar actualSc)) st.slots dLoc, hSet])
+                                            | _ => nomatch hMatch
+                    | _ => nomatch hMatch
+              | _ => nomatch hMatch
+            | _ => nomatch hMatch
+      | _ => nomatch hMatch
+
+def symStepDerefLoadSlice
+    (body : CapturedMir)
+    (st : SymState)
+    (expectedSc : ScalarInt) :
+    Option SymState :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .none => .none
+      | .some stmt =>
+        match symMatchDerefSymArgLoad body st stmt with
+        | .none => .none
+        | .some (idx, uKind, dstLoc, borrows₂) =>
+          match
+            Nat.blt idx body.argCount,
+            Nat.beq (uintBytesOfKind uKind) expectedSc.sizeBytes,
+            set? st.slots dstLoc (.concrete (.init (.scalar expectedSc)))
+          with
+          | true, true, .some slots₂ =>
+            .some {
+              st with
+              stmtIdx := Nat.add st.stmtIdx 1
+              slots := slots₂
+              borrows := borrows₂
+            }
+          | _, _, _ => .none
+
+def symExtractDerefSlicePinEq
+    (body : CapturedMir)
+    (st : SymState) :
+    Option (Nat × ScalarInt × SymState × SymState) :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match
+        get? bb.statements st.stmtIdx,
+        get? bb.statements (Nat.add st.stmtIdx 1)
+      with
+      | .some stmt1, .some stmt2 =>
+        match symMatchDerefSymArgLoad body st stmt1, stmt2.kind with
+        | .some (idx, uKind, tmpLoc, borrows₁),
+          .assign ⟨eqDstLoc, .nil⟩ (.binaryOp .eq (.move ⟨tmpLoc2, .nil⟩) (.constant { val := .scalar (.int expectedSc), .. })) =>
+          match
+            Nat.beq tmpLoc tmpLoc2,
+            Nat.beq (uintBytesOfKind uKind) expectedSc.sizeBytes,
+            Nat.beq expectedSc.sizeBytes 0,
+            isPtrOrUntypedOperand body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩),
+            set? st.slots tmpLoc (.concrete .uninit)
+          with
+          | true, true, false, false, .some slotsAfterMove =>
+            match get? slotsAfterMove eqDstLoc with
+            | .none => .none
+            | .some (.concrete .dead) => .none
+            | .some _ =>
+              match
+                set? slotsAfterMove eqDstLoc (.concrete (.init (.scalar ⟨1, 1⟩))),
+                set? slotsAfterMove eqDstLoc (.concrete (.init (.scalar ⟨0, 1⟩)))
+              with
+              | .some slotsTrue, .some slotsFalse =>
+                let borrows₂ := invalidateConflictingBorrows borrows₁ eqDstLoc .none
+                let stTrue : SymState := {
+                  st with
+                  stmtIdx := Nat.add (Nat.add st.stmtIdx 1) 1
+                  slots := slotsTrue
+                  borrows := borrows₂
+                }
+                let stFalse : SymState := {
+                  st with
+                  stmtIdx := Nat.add (Nat.add st.stmtIdx 1) 1
+                  slots := slotsFalse
+                  borrows := borrows₂
+                }
+                .some (idx, expectedSc, stTrue, stFalse)
+              | _, _ => .none
+          | _, _, _, _, _ => .none
+        | _, _ => .none
+      | _, _ => .none
+
+theorem symExtractDerefSlicePinEq_branch_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (idx : Nat)
+    (expectedSc : ScalarInt)
+    (stTrue stFalse : SymState)
+    (hExt : symExtractDerefSlicePinEq body st = .some (idx, expectedSc, stTrue, stFalse))
+    (hHold : evalMirBoolHoldBounded (.succ (.succ fuel)) body (concretizeSymState body args st)) :
+    ((∃ v, get? args idx = .some v ∧ extractValueScalarSlice0? v expectedSc.sizeBytes = .some expectedSc) ∧
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args stTrue)) ∨
+    evalMirBoolHoldBounded fuel body (concretizeSymState body args stFalse) := by
+  dsimp only [symExtractDerefSlicePinEq] at hExt
+  change stepResultHoldBounded (.succ fuel) body (stepMirFn body (concretizeSymState body args st)) at hHold
+  cases hPhase : body.phase with
+  | other _ => rw [hPhase] at hExt; nomatch hExt
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at hExt
+    dsimp only at hExt
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none => rw [hBb] at hExt; nomatch hExt
+    | some bb =>
+      rw [hBb] at hExt
+      dsimp only at hExt
+      cases hStmt1 : get? bb.statements st.stmtIdx with
+      | none => rw [hStmt1] at hExt; nomatch hExt
+      | some stmt1 =>
+        rw [hStmt1] at hExt
+        cases hStmt2 : get? bb.statements (Nat.add st.stmtIdx 1) with
+        | none => rw [hStmt2] at hExt; nomatch hExt
+        | some stmt2 =>
+          rw [hStmt2] at hExt
+          dsimp only at hExt
+          cases hMatch1 : symMatchDerefSymArgLoad body st stmt1 with
+          | none => rw [hMatch1] at hExt; nomatch hExt
+          | some tup1 =>
+            rw [hMatch1] at hExt
+            rcases tup1 with ⟨idx0, uKind, tmpLoc, borrows₁⟩
+            cases stmt2 with
+            | mk kind2 span2 =>
+              cases kind2 with
+              | assign dst2 rv2 =>
+                cases dst2 with
+                | mk eqDstLoc eqDstProj =>
+                  cases eqDstProj with
+                  | cons _ _ => nomatch hExt
+                  | nil =>
+                    cases rv2 with
+                    | binaryOp op2 lhsOp2 rhsOp2 =>
+                      cases op2 with
+                      | eq =>
+                        cases lhsOp2 with
+                        | move mp =>
+                          cases mp with
+                          | mk tmpLoc2 mpProj =>
+                            cases mpProj with
+                            | cons _ _ => nomatch hExt
+                            | nil =>
+                              cases rhsOp2 with
+                              | constant c2 =>
+                                cases c2 with
+                                | mk cTy2 cVal2 =>
+                                  cases cVal2 with
+                                  | scalar cSc2 =>
+                                    cases cSc2 with
+                                    | int sc0 =>
+                                      dsimp only at hExt
+                                      cases hTmpEq : Nat.beq tmpLoc tmpLoc2 with
+                                      | false => rw [hTmpEq] at hExt; nomatch hExt
+                                      | true =>
+                                        rw [hTmpEq] at hExt
+                                        cases hKindSz : Nat.beq (uintBytesOfKind uKind) sc0.sizeBytes with
+                                        | false => rw [hKindSz] at hExt; nomatch hExt
+                                        | true =>
+                                          rw [hKindSz] at hExt
+                                          cases hSz0 : Nat.beq sc0.sizeBytes 0 with
+                                          | true => rw [hSz0] at hExt; nomatch hExt
+                                          | false =>
+                                            rw [hSz0] at hExt
+                                            cases hPtrOp : isPtrOrUntypedOperand body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩) with
+                                            | true => rw [hPtrOp] at hExt; nomatch hExt
+                                            | false =>
+                                              rw [hPtrOp] at hExt
+                                              cases hSetMove : set? st.slots tmpLoc (.concrete .uninit) with
+                                              | none => rw [hSetMove] at hExt; nomatch hExt
+                                              | some slotsAfterMove =>
+                                                rw [hSetMove] at hExt
+                                                dsimp only at hExt
+                                                cases hGetEqDst : get? slotsAfterMove eqDstLoc with
+                                                | none => rw [hGetEqDst] at hExt; nomatch hExt
+                                                | some eqDstSlot =>
+                                                  rw [hGetEqDst] at hExt
+                                                  have ⟨hEqNotDead, hOk⟩ := symSlot_not_dead_of_match_some hExt
+                                                  cases hSetT : set? slotsAfterMove eqDstLoc (.concrete (.init (.scalar ⟨1, 1⟩))) with
+                                                  | none => rw [hSetT] at hOk; nomatch hOk
+                                                  | some slotsTrue =>
+                                                    rw [hSetT] at hOk
+                                                    cases hSetF : set? slotsAfterMove eqDstLoc (.concrete (.init (.scalar ⟨0, 1⟩))) with
+                                                    | none => rw [hSetF] at hOk; nomatch hOk
+                                                    | some slotsFalse =>
+                                                      rw [hSetF] at hOk
+                                                      injection hOk with hTup
+                                                      injection hTup with hIdxEq hRestA
+                                                      injection hRestA with hScEq hRestB
+                                                      injection hRestB with hStT hStF
+                                                      rw [← hIdxEq, ← hScEq, ← hStT, ← hStF]
+                                                      have hTmpEq' : tmpLoc2 = tmpLoc := Eq.symm (Nat.eq_of_beq_eq_true hTmpEq)
+                                                      rw [hTmpEq'] at hStmt2
+                                                      rw [stepMirFn_concretize_stmt body args st bb stmt1 hNotOther hBb hStmt1] at hHold
+                                                      have hEv1 := symMatchDerefSymArgLoad_evalStmt body args st stmt1 idx0 uKind tmpLoc borrows₁ hMatch1
+                                                      cases hArg : get? args idx0 with
+                                                      | none =>
+                                                        rw [hArg] at hEv1
+                                                        rw [hEv1] at hHold
+                                                        exact False.elim hHold
+                                                      | some v =>
+                                                        rw [hArg] at hEv1
+                                                        dsimp only at hEv1
+                                                        cases hSlice : extractValueScalarSlice0? v (uintBytesOfKind uKind) with
+                                                        | none =>
+                                                          rw [hSlice] at hEv1
+                                                          rw [hEv1] at hHold
+                                                          exact False.elim hHold
+                                                        | some actualSc =>
+                                                          rw [hSlice] at hEv1
+                                                          dsimp only at hEv1
+                                                          have ⟨hBltTmp, hAfterMoveEq, hSetLoad⟩ :=
+                                                            set?_eq_some_set_of_set?_some (.concrete (.init (.scalar actualSc))) hSetMove
+                                                          rw [hSetLoad] at hEv1
+                                                          dsimp only at hEv1
+                                                          rw [hEv1] at hHold
+                                                          let st1 : SymState := {
+                                                            st with
+                                                            stmtIdx := Nat.add st.stmtIdx 1
+                                                            slots := st.slots.set tmpLoc (.concrete (.init (.scalar actualSc)))
+                                                            borrows := borrows₁
+                                                          }
+                                                          change evalMirBoolHoldBounded (.succ fuel) body (concretizeSymState body args st1) at hHold
+                                                          change stepResultHoldBounded fuel body (stepMirFn body (concretizeSymState body args st1)) at hHold
+                                                          rw [stepMirFn_concretize_stmt body args st1 bb _ hNotOther hBb hStmt2] at hHold
+                                                          rw [evalStmt_assign_nil_eq] at hHold
+                                                          have hGetSt1Tmp : get? st1.slots tmpLoc = .some (.concrete (.init (.scalar actualSc))) :=
+                                                            list_get?_set_self st.slots tmpLoc (.concrete (.init (.scalar actualSc))) hBltTmp
+                                                          have hSetSt1Move : set? st1.slots tmpLoc (.concrete .uninit) = .some slotsAfterMove := by
+                                                            unfold set?
+                                                            change (if tmpLoc < (st.slots.set tmpLoc (.concrete (.init (.scalar actualSc)))).length then
+                                                              some ((st.slots.set tmpLoc (.concrete (.init (.scalar actualSc)))).set tmpLoc (.concrete .uninit))
+                                                            else none) = some slotsAfterMove
+                                                            rw [list_length_set st.slots tmpLoc (.concrete (.init (.scalar actualSc)))]
+                                                            split
+                                                            · rw [list_set_set_same st.slots tmpLoc (.concrete (.init (.scalar actualSc))) (.concrete .uninit), ← hAfterMoveEq]
+                                                            · next hNot => exact absurd hBltTmp hNot
+                                                          have hLhsOp :
+                                                              evalSymOperand st1.slots (.move ⟨tmpLoc, .nil⟩) st1.borrows body.localDecls body.layouts =
+                                                                .some (.concrete (.scalar actualSc), slotsAfterMove) := by
+                                                            dsimp only [evalSymOperand]
+                                                            rw [hGetSt1Tmp, hSetSt1Move]
+                                                          have hRhsOp :
+                                                              evalSymOperand slotsAfterMove (.constant { ty := cTy2, val := .scalar (.int sc0) }) st1.borrows body.localDecls body.layouts =
+                                                                .some (.concrete (.scalar sc0), slotsAfterMove) := rfl
+                                                          dsimp only [evalRvalue, concretizeSymState, concretizeSymMemory] at hHold
+                                                          rw [evalSymOperand_sound args st1.slots (.move ⟨tmpLoc, .nil⟩) borrows₁ body.allocations body.layouts (.concrete (.scalar actualSc)) slotsAfterMove hLhsOp] at hHold
+                                                          dsimp only [concretizeSymReadResult] at hHold
+                                                          rw [evalSymOperand_sound args slotsAfterMove (.constant { ty := cTy2, val := .scalar (.int sc0) }) borrows₁ body.allocations body.layouts (.concrete (.scalar sc0)) slotsAfterMove hRhsOp] at hHold
+                                                          dsimp only [concretizeSymReadResult, evalScalarBinOp] at hHold
+                                                          have hActSzEq : actualSc.sizeBytes = sc0.sizeBytes :=
+                                                            Eq.trans
+                                                              (extractValueScalarSlice0?_sizeBytes v (uintBytesOfKind uKind) actualSc hSlice)
+                                                              (Nat.eq_of_beq_eq_true hKindSz)
+                                                          have hActSz0 : Nat.beq actualSc.sizeBytes 0 = false := by
+                                                            rw [hActSzEq]
+                                                            exact hSz0
+                                                          have hActSzBeq : Nat.beq actualSc.sizeBytes sc0.sizeBytes = true := by
+                                                            rw [hActSzEq]
+                                                            exact Nat.beq_refl sc0.sizeBytes
+                                                          rw [hActSz0] at hHold
+                                                          dsimp only at hHold
+                                                          rw [hActSzBeq] at hHold
+                                                          dsimp only at hHold
+                                                          cases hBitsEq : Nat.beq actualSc.bits sc0.bits with
+                                                          | false =>
+                                                            rw [hBitsEq] at hHold
+                                                            dsimp only [boolToScalar] at hHold
+                                                            have hStepF :=
+                                                              evalAssignNilRvalueStep_concrete_ok
+                                                                body args
+                                                                { st with stmtIdx := Nat.add st.stmtIdx 1, slots := slotsAfterMove, borrows := borrows₁ }
+                                                                eqDstLoc (.scalar ⟨0, 1⟩) borrows₁ eqDstSlot slotsFalse hGetEqDst hEqNotDead hSetF
+                                                            dsimp only [evalAssignNilRvalueStep, advanceStmt, concretizeSymState, concretizeSymMemory] at hStepF hHold
+                                                            rw [hStepF] at hHold
+                                                            exact Or.inr hHold
+                                                          | true =>
+                                                            rw [hBitsEq] at hHold
+                                                            dsimp only [boolToScalar] at hHold
+                                                            have hStepT :=
+                                                              evalAssignNilRvalueStep_concrete_ok
+                                                                body args
+                                                                { st with stmtIdx := Nat.add st.stmtIdx 1, slots := slotsAfterMove, borrows := borrows₁ }
+                                                                eqDstLoc (.scalar ⟨1, 1⟩) borrows₁ eqDstSlot slotsTrue hGetEqDst hEqNotDead hSetT
+                                                            dsimp only [evalAssignNilRvalueStep, advanceStmt, concretizeSymState, concretizeSymMemory] at hStepT hHold
+                                                            rw [hStepT] at hHold
+                                                            have hScEq' : actualSc = sc0 :=
+                                                              scalarInt_eq_of_parts (Nat.eq_of_beq_eq_true hBitsEq) hActSzEq
+                                                            have hKindSzEq : uintBytesOfKind uKind = sc0.sizeBytes :=
+                                                              Nat.eq_of_beq_eq_true hKindSz
+                                                            rw [hKindSzEq, hScEq'] at hSlice
+                                                            exact Or.inl ⟨⟨v, rfl, hSlice⟩, hHold⟩
+                                    | ptr _ _ => nomatch hExt
+                                  | _ => nomatch hExt
+                              | _ => nomatch hExt
+                        | _ => nomatch hExt
+                      | _ => nomatch hExt
+                    | _ => nomatch hExt
+              | _ => nomatch hExt
+
+theorem symExtractDerefSlicePinEq_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (idx : Nat)
+    (expectedSc : ScalarInt)
+    (stTrue stFalse : SymState)
+    (hExt : symExtractDerefSlicePinEq body st = .some (idx, expectedSc, stTrue, stFalse))
+    (hFalse : checkSymReturnsFalseExt fuel body stFalse = true)
+    (hHold : evalMirBoolHoldBounded (.succ (.succ fuel)) body (concretizeSymState body args st)) :
+    (∃ v, get? args idx = .some v ∧ extractValueScalarSlice0? v expectedSc.sizeBytes = .some expectedSc) ∧
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args stTrue) := by
+  cases symExtractDerefSlicePinEq_branch_sound fuel body args st idx expectedSc stTrue stFalse hExt hHold with
+  | inl hTrue => exact hTrue
+  | inr hFalseHold => exact False.elim (checkSymReturnsFalseExt_sound fuel body args stFalse hFalse hFalseHold)
+
+
 
 /-- Conjunction of `get? args idx = .some (.scalar sc)` across a list of
 `(idx, sc)` scalar pin obligations. -/
@@ -3364,14 +5869,14 @@ theorem allScalarPinsHold_of_removeScalarPin
         subst hPins
         exact ⟨hRestHold.1, allScalarPinsHold_of_removeScalarPin args idx sc hHead rest rest' hRec hRestHold.2⟩
 
-/-- Symbolic abstract interpreter loop verifying that `body` from `st` pins all
+/-- Symbolic abstract interpreter loop verifying that `body` from `st` directly pins all
 `(idx, sc)` obligations in `pins`. -/
-def checkSymPinsLoop : Nat → CapturedMir → SymState → List (Nat × ScalarInt) → Bool
+def checkSymPinsLoopDirect : Nat → CapturedMir → SymState → List (Nat × ScalarInt) → Bool
   | _, _, _, .nil => true
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcrete body st with
-    | .some st' => checkSymPinsLoop fuel body st' (p :: ps)
+    | .some st' => checkSymPinsLoopDirect fuel body st' (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
@@ -3379,27 +5884,27 @@ def checkSymPinsLoop : Nat → CapturedMir → SymState → List (Nat × ScalarI
         | false => false
         | true =>
           match removeScalarPin idx sc (p :: ps) with
-          | .some pins' => checkSymPinsLoop fuel body stTrue pins'
-          | .none => checkSymPinsLoop fuel body stTrue (p :: ps)
+          | .some pins' => checkSymPinsLoopDirect fuel body stTrue pins'
+          | .none => checkSymPinsLoopDirect fuel body stTrue (p :: ps)
       | .none => false
 
-theorem checkSymPinsLoop_sound :
+theorem checkSymPinsLoopDirect_sound :
     ∀ (fuel : Nat)
       (body : CapturedMir)
       (args : List Value)
       (st : SymState)
       (pins : List (Nat × ScalarInt)),
-      checkSymPinsLoop fuel body st pins = true →
+      checkSymPinsLoopDirect fuel body st pins = true →
       evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
       AllScalarPinsHold args pins
   | _, _, _, _, .nil, _, _ => True.intro
   | .zero, _, _, _, _ :: _, hCheck, _ => nomatch hCheck
   | .succ fuel, body, args, st, p :: ps, hCheck, hHold => by
-    dsimp only [checkSymPinsLoop] at hCheck
+    dsimp only [checkSymPinsLoopDirect] at hCheck
     cases hStep : symStepConcrete body st with
     | some st' =>
       rw [hStep] at hCheck
-      exact checkSymPinsLoop_sound
+      exact checkSymPinsLoopDirect_sound
         fuel body args st' (p :: ps) hCheck
         (symStepConcrete_sound fuel body args st st' hStep hHold)
     | none =>
@@ -3430,11 +5935,11 @@ theorem checkSymPinsLoop_sound :
                 | some pins' =>
                   rw [hRem] at hCheck
                   have hRestHold :=
-                    checkSymPinsLoop_sound fuel body args stTrue pins' hCheck hHoldTrue
+                    checkSymPinsLoopDirect_sound fuel body args stTrue pins' hCheck hHoldTrue
                   exact allScalarPinsHold_of_removeScalarPin args idx sc hPinIdx (p :: ps) pins' hRem hRestHold
                 | none =>
                   rw [hRem] at hCheck
-                  exact checkSymPinsLoop_sound fuel body args stTrue (p :: ps) hCheck hHoldTrue
+                  exact checkSymPinsLoopDirect_sound fuel body args stTrue (p :: ps) hCheck hHoldTrue
 
 /-- Pair each `ScalarInt` in `xs` with its 0-based argument index starting at `idx`. -/
 def zipIdxScalars : Nat → List ScalarInt → List (Nat × ScalarInt)
@@ -3476,34 +5981,27 @@ theorem args_eq_mapScalarValues
     args = mapScalarValues expected :=
   args_eq_mapScalarValues_of_pins args expected args 0 rfl hLen hPins
 
-/-- Closed-term boolean checker verifying that `specBody` (within `fuel` steps)
-pins its `argCount` parameters to `expectedScalars`. -/
-def checkMirRequiresPinsScalars
+/-- Direct closed-term boolean checker verifying that `specBody` (within `fuel` steps)
+pins its `argCount` parameters directly to `expectedScalars`. -/
+def checkMirRequiresPinsScalarsDirect
     (fuel : Nat)
     (specBody : CapturedMir)
     (expectedScalars : List ScalarInt) :
     Bool :=
   Bool.and
     (Nat.beq specBody.argCount (length expectedScalars))
-    (checkSymPinsLoop fuel specBody (initSymState specBody) (zipIdxScalars 0 expectedScalars))
+    (checkSymPinsLoopDirect fuel specBody (initSymState specBody) (zipIdxScalars 0 expectedScalars))
 
-
-/--
-Soundness theorem for `checkMirRequiresPinsScalars`: when
-`checkMirRequiresPinsScalars fuel specBody expectedScalars = true`, any argument
-list `args` of length `length expectedScalars` satisfying
-`MirBoolPredicateHolds specBody args` is equal to `mapScalarValues expectedScalars`.
--/
-theorem checkMirRequiresPinsScalars_sound
+theorem checkMirRequiresPinsScalarsDirect_sound
     (fuel : Nat)
     (specBody : CapturedMir)
     (expectedScalars : List ScalarInt)
     (args : List Value)
-    (h_check : checkMirRequiresPinsScalars fuel specBody expectedScalars = true)
+    (h_check : checkMirRequiresPinsScalarsDirect fuel specBody expectedScalars = true)
     (h_len : length args = length expectedScalars)
     (h_req : MirBoolPredicateHolds specBody args) :
     args = mapScalarValues expectedScalars := by
-  dsimp only [checkMirRequiresPinsScalars] at h_check
+  dsimp only [checkMirRequiresPinsScalarsDirect] at h_check
   cases hArgEq : Nat.beq specBody.argCount (length expectedScalars) with
   | false =>
     rw [hArgEq] at h_check
@@ -3517,11 +6015,314 @@ theorem checkMirRequiresPinsScalars_sound
       Eq.trans h_len (Eq.symm (Nat.eq_of_beq_eq_true hArgEq))
     rw [← concretizeSymState_initSymState specBody args hLenSpec] at hHold
     have hPins :=
-      checkSymPinsLoop_sound
+      checkSymPinsLoopDirect_sound
         fuel specBody args (initSymState specBody)
         (zipIdxScalars 0 expectedScalars)
         h_check hHold
     exact args_eq_mapScalarValues args expectedScalars h_len hPins
+
+/-- Conjunction of `∃ v, get? args idx = .some v ∧ extractValueScalarSlice0? v sc.sizeBytes = .some sc`
+across a list of `(idx, sc)` scalar pin obligations. -/
+def AllScalarSlicePinsHold (args : List Value) : List (Nat × ScalarInt) → Prop
+  | .nil => True
+  | (idx, sc) :: rest =>
+    (∃ v, get? args idx = .some v ∧ extractValueScalarSlice0? v sc.sizeBytes = .some sc) ∧
+      AllScalarSlicePinsHold args rest
+
+theorem allScalarSlicePinsHold_of_removeScalarPin
+    (args : List Value)
+    (idx : Nat)
+    (sc : ScalarInt)
+    (hHead : ∃ v, get? args idx = .some v ∧ extractValueScalarSlice0? v sc.sizeBytes = .some sc) :
+    ∀ (pins pins' : List (Nat × ScalarInt)),
+      removeScalarPin idx sc pins = .some pins' →
+      AllScalarSlicePinsHold args pins' →
+      AllScalarSlicePinsHold args pins
+  | .nil, _, hRem, _ => nomatch hRem
+  | (i, s) :: rest, pins', hRem, hRestHold => by
+    dsimp only [removeScalarPin] at hRem
+    cases hEqIdx : Nat.beq i idx with
+    | true =>
+      rw [hEqIdx] at hRem
+      cases hEqBits : Nat.beq s.bits sc.bits with
+      | true =>
+        rw [hEqBits] at hRem
+        cases hEqSz : Nat.beq s.sizeBytes sc.sizeBytes with
+        | true =>
+          rw [hEqSz] at hRem
+          injection hRem with hPins
+          subst hPins
+          have hIdx : i = idx := Nat.eq_of_beq_eq_true hEqIdx
+          have hSc : s = sc :=
+            scalarInt_eq_of_parts
+              (Nat.eq_of_beq_eq_true hEqBits)
+              (Nat.eq_of_beq_eq_true hEqSz)
+          subst hIdx
+          subst hSc
+          exact ⟨hHead, hRestHold⟩
+        | false =>
+          rw [hEqSz] at hRem
+          dsimp only [Bool.and] at hRem
+          cases hRec : removeScalarPin idx sc rest with
+          | none => rw [hRec] at hRem; nomatch hRem
+          | some rest' =>
+            rw [hRec] at hRem
+            injection hRem with hPins
+            subst hPins
+            exact ⟨hRestHold.1, allScalarSlicePinsHold_of_removeScalarPin args idx sc hHead rest rest' hRec hRestHold.2⟩
+      | false =>
+        rw [hEqBits] at hRem
+        dsimp only [Bool.and] at hRem
+        cases hRec : removeScalarPin idx sc rest with
+        | none => rw [hRec] at hRem; nomatch hRem
+        | some rest' =>
+          rw [hRec] at hRem
+          injection hRem with hPins
+          subst hPins
+          exact ⟨hRestHold.1, allScalarSlicePinsHold_of_removeScalarPin args idx sc hHead rest rest' hRec hRestHold.2⟩
+    | false =>
+      rw [hEqIdx] at hRem
+      dsimp only [Bool.and] at hRem
+      cases hRec : removeScalarPin idx sc rest with
+      | none => rw [hRec] at hRem; nomatch hRem
+      | some rest' =>
+        rw [hRec] at hRem
+        injection hRem with hPins
+        subst hPins
+        exact ⟨hRestHold.1, allScalarSlicePinsHold_of_removeScalarPin args idx sc hHead rest rest' hRec hRestHold.2⟩
+
+theorem symExtractPinEq_expSz0_false
+    {body : CapturedMir}
+    {st : SymState}
+    {idx : Nat}
+    {expectedSc : ScalarInt}
+    {stTrue stFalse : SymState}
+    (hExt : symExtractPinEq body st = .some (idx, expectedSc, stTrue, stFalse)) :
+    Nat.beq expectedSc.sizeBytes 0 = false := by
+  dsimp only [symExtractPinEq] at hExt
+  cases hPhase : body.phase with
+  | other _ => rw [hPhase] at hExt; nomatch hExt
+  | runtimePostCleanup | runtimeOptimized =>
+    rw [hPhase] at hExt
+    dsimp only at hExt
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none => rw [hBb] at hExt; nomatch hExt
+    | some bb =>
+      rw [hBb] at hExt
+      dsimp only at hExt
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | none => rw [hStmt] at hExt; nomatch hExt
+      | some stmt =>
+        rw [hStmt] at hExt
+        dsimp only at hExt
+        cases stmt with
+        | mk kind _ =>
+          cases kind with
+          | assign dst rv =>
+            cases dst with
+            | mk dstLoc dstProj =>
+              cases dstProj with
+              | cons _ _ => nomatch hExt
+              | nil =>
+                cases rv with
+                | binaryOp op lhsOp rhsOp =>
+                  cases op with
+                  | eq =>
+                    dsimp only [symExtractPinEqStmt] at hExt
+                    cases hPtr : isPtrOrUntypedOperand body.localDecls body.layouts lhsOp with
+                    | true => rw [hPtr] at hExt; nomatch hExt
+                    | false =>
+                      rw [hPtr] at hExt
+                      dsimp only at hExt
+                      cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
+                      | none => rw [hLhs] at hExt; nomatch hExt
+                      | some pair1 =>
+                        rw [hLhs] at hExt
+                        rcases pair1 with ⟨sv1, slots1⟩
+                        dsimp only at hExt
+                        cases hRhs : evalSymOperand slots1 rhsOp st.borrows body.localDecls body.layouts with
+                        | none => rw [hRhs] at hExt; nomatch hExt
+                        | some pair2 =>
+                          rw [hRhs] at hExt
+                          rcases pair2 with ⟨sv2, slots2⟩
+                          dsimp only at hExt
+                          cases sv1 with
+                          | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                          | symArg idx0 =>
+                            cases sv2 with
+                            | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                            | concrete v2 =>
+                              cases v2 with
+                              | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                              | scalar sc0 =>
+                                dsimp only at hExt
+                                rw [symFinishPinEq_scOut_eq hExt]
+                                exact symFinishPinEq_expSz0_false hExt
+                          | concrete v1 =>
+                            cases v1 with
+                            | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                            | scalar sc0 =>
+                              cases sv2 with
+                              | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                              | symArg idx0 =>
+                                dsimp only at hExt
+                                rw [symFinishPinEq_scOut_eq hExt]
+                                exact symFinishPinEq_expSz0_false hExt
+                  | _ => nomatch hExt
+                | _ => nomatch hExt
+          | _ => nomatch hExt
+
+/-- Symbolic abstract interpreter loop verifying that `body` from `st` pins all
+`(idx, sc)` obligations in `pins` (supporting both direct scalar comparisons and
+`V2026_06_01` closure-captured reference dereferences). -/
+def checkSymPinsLoop : Nat → CapturedMir → SymState → List (Nat × ScalarInt) → Bool
+  | _, _, _, .nil => true
+  | .zero, _, _, _ :: _ => false
+  | .succ fuel, body, st, p :: ps =>
+    match symStepConcreteExt body st with
+    | .some st' => checkSymPinsLoop fuel body st' (p :: ps)
+    | .none =>
+      match symExtractPinEq body st with
+      | .some (idx, sc, stTrue, stFalse) =>
+        match checkSymReturnsFalseExt fuel body stFalse with
+        | false => false
+        | true =>
+          match removeScalarPin idx sc (p :: ps) with
+          | .some pins' => checkSymPinsLoop fuel body stTrue pins'
+          | .none => checkSymPinsLoop fuel body stTrue (p :: ps)
+      | .none =>
+        match fuel with
+        | .zero => false
+        | .succ fuel' =>
+          match symExtractDerefSlicePinEq body st with
+          | .none => false
+          | .some (idx, sc, stTrue, stFalse) =>
+            match checkSymReturnsFalseExt fuel' body stFalse with
+            | false => false
+            | true =>
+              match removeScalarPin idx sc (p :: ps) with
+              | .some pins' => checkSymPinsLoop fuel' body stTrue pins'
+              | .none => checkSymPinsLoop fuel' body stTrue (p :: ps)
+
+theorem checkSymPinsLoop_sound :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (args : List Value)
+      (st : SymState)
+      (pins : List (Nat × ScalarInt)),
+      checkSymPinsLoop fuel body st pins = true →
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
+      AllScalarSlicePinsHold args pins
+  | _, _, _, _, .nil, _, _ => True.intro
+  | .zero, _, _, _, _ :: _, hCheck, _ => nomatch hCheck
+  | .succ fuel, body, args, st, p :: ps, hCheck, hHold => by
+    unfold checkSymPinsLoop at hCheck
+    cases hStep : symStepConcreteExt body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact checkSymPinsLoop_sound
+        fuel body args st' (p :: ps) hCheck
+        (symStepConcreteExt_sound fuel body args st st' hStep hHold)
+    | none =>
+      rw [hStep] at hCheck
+      cases hExt : symExtractPinEq body st with
+      | some tup =>
+        rw [hExt] at hCheck
+        rcases tup with ⟨idx, sc, stTrue, stFalse⟩
+        dsimp only at hCheck
+        cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
+        | false => rw [hFalse] at hCheck; nomatch hCheck
+        | true =>
+          rw [hFalse] at hCheck
+          dsimp only at hCheck
+          have ⟨hPinIdx, hHoldTrue⟩ :
+              get? args idx = .some (.scalar sc) ∧
+                evalMirBoolHoldBounded fuel body (concretizeSymState body args stTrue) := by
+            cases symExtractPinEq_branch_sound fuel body args st idx sc stTrue stFalse hExt hHold with
+            | inl hT => exact hT
+            | inr hF => exact False.elim (checkSymReturnsFalseExt_sound fuel body args stFalse hFalse hF)
+          have hHead : ∃ v, get? args idx = .some v ∧ extractValueScalarSlice0? v sc.sizeBytes = .some sc :=
+            ⟨.scalar sc, hPinIdx, extractValueScalarSlice0?_scalar_self sc (symExtractPinEq_expSz0_false hExt)⟩
+          cases hRem : removeScalarPin idx sc (p :: ps) with
+          | some pins' =>
+            rw [hRem] at hCheck
+            have hRestHold :=
+              checkSymPinsLoop_sound fuel body args stTrue pins' hCheck hHoldTrue
+            exact allScalarSlicePinsHold_of_removeScalarPin args idx sc hHead (p :: ps) pins' hRem hRestHold
+          | none =>
+            rw [hRem] at hCheck
+            exact checkSymPinsLoop_sound fuel body args stTrue (p :: ps) hCheck hHoldTrue
+      | none =>
+        rw [hExt] at hCheck
+        cases fuel with
+        | zero => nomatch hCheck
+        | succ fuel' =>
+          cases hExtDeref : symExtractDerefSlicePinEq body st with
+          | none => rw [hExtDeref] at hCheck; nomatch hCheck
+          | some tup =>
+            rw [hExtDeref] at hCheck
+            rcases tup with ⟨idx, sc, stTrue, stFalse⟩
+            dsimp only at hCheck
+            cases hFalse : checkSymReturnsFalseExt fuel' body stFalse with
+            | false => rw [hFalse] at hCheck; nomatch hCheck
+            | true =>
+              rw [hFalse] at hCheck
+              dsimp only at hCheck
+              have ⟨hHead, hHoldTrue⟩ :=
+                symExtractDerefSlicePinEq_sound fuel' body args st idx sc stTrue stFalse hExtDeref hFalse hHold
+              cases hRem : removeScalarPin idx sc (p :: ps) with
+              | some pins' =>
+                rw [hRem] at hCheck
+                have hRestHold :=
+                  checkSymPinsLoop_sound fuel' body args stTrue pins' hCheck hHoldTrue
+                exact allScalarSlicePinsHold_of_removeScalarPin args idx sc hHead (p :: ps) pins' hRem hRestHold
+              | none =>
+                rw [hRem] at hCheck
+                exact checkSymPinsLoop_sound fuel' body args stTrue (p :: ps) hCheck hHoldTrue
+
+/-- Closed-term boolean checker verifying that `specBody` (within `fuel` steps)
+pins its `argCount` parameters to `expectedScalars`. -/
+def checkMirRequiresPinsScalars
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (expectedScalars : List ScalarInt) :
+    Bool :=
+  Bool.and
+    (Nat.beq specBody.argCount (length expectedScalars))
+    (checkSymPinsLoop fuel specBody (initSymState specBody) (zipIdxScalars 0 expectedScalars))
+
+/--
+Soundness theorem for `checkMirRequiresPinsScalars`: when
+`checkMirRequiresPinsScalars fuel specBody expectedScalars = true`, any argument
+list `args` of length `length expectedScalars` satisfying
+`MirBoolPredicateHolds specBody args` satisfies `AllScalarSlicePinsHold args (zipIdxScalars 0 expectedScalars)`.
+-/
+theorem checkMirRequiresPinsScalars_sound
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (expectedScalars : List ScalarInt)
+    (args : List Value)
+    (h_check : checkMirRequiresPinsScalars fuel specBody expectedScalars = true)
+    (h_len : length args = length expectedScalars)
+    (h_req : MirBoolPredicateHolds specBody args) :
+    AllScalarSlicePinsHold args (zipIdxScalars 0 expectedScalars) := by
+  dsimp only [checkMirRequiresPinsScalars] at h_check
+  cases hArgEq : Nat.beq specBody.argCount (length expectedScalars) with
+  | false =>
+    rw [hArgEq] at h_check
+    nomatch h_check
+  | true =>
+    rw [hArgEq] at h_check
+    dsimp only [Bool.and] at h_check
+    have hHold : evalMirBoolHoldBounded fuel specBody (initMachineState specBody args) :=
+      wpBoolOrExhausted_of_mirBoolPredicateHolds fuel specBody args h_req
+    have hLenSpec : length args = specBody.argCount :=
+      Eq.trans h_len (Eq.symm (Nat.eq_of_beq_eq_true hArgEq))
+    rw [← concretizeSymState_initSymState specBody args hLenSpec] at hHold
+    exact checkSymPinsLoop_sound
+      fuel specBody args (initSymState specBody)
+      (zipIdxScalars 0 expectedScalars)
+      h_check hHold
 
 /-! ### Auto-Extracted Witness Pinning, Bounded Ranges, and Modular Call Reflection -/
 
@@ -3597,15 +6398,21 @@ def collectSymPinsLoop :
     Nat → CapturedMir → SymState → List (Nat × ScalarInt)
   | .zero, _, _ => .nil
   | .succ fuel, body, st =>
-    match symStepConcrete body st with
+    match symStepConcreteExt body st with
     | .some st' => collectSymPinsLoop fuel body st'
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
-        match checkSymReturnsFalse fuel body stFalse with
+        match checkSymReturnsFalseExt fuel body stFalse with
         | true => (idx, sc) :: collectSymPinsLoop fuel body stTrue
         | false => .nil
-      | .none => .nil
+      | .none =>
+        match fuel, symExtractDerefSlicePinEq body st with
+        | .succ fuel', .some (idx, sc, stTrue, stFalse) =>
+          match checkSymReturnsFalseExt fuel' body stFalse with
+          | true => (idx, sc) :: collectSymPinsLoop fuel' body stTrue
+          | false => .nil
+        | _, _ => .nil
 
 /-- Look up the `ScalarInt` pinned for argument index `idx` in `pins`. -/
 def lookupScalarPin (idx : Nat) : List (Nat × ScalarInt) → Option ScalarInt
@@ -3648,7 +6455,7 @@ def checkOptMirRequiresPinsScalars
     (expectedScalars : List ScalarInt) :
     Bool :=
   match optReqBody with
-  | .some reqBody => checkMirRequiresPinsScalars fuel reqBody expectedScalars
+  | .some reqBody => checkMirRequiresPinsScalarsDirect fuel reqBody expectedScalars
   | .none => Nat.beq (length expectedScalars) 0
 
 theorem args_eq_nil_of_length_zero :
@@ -3669,7 +6476,7 @@ theorem checkOptMirRequiresPinsScalars_sound
   cases optReqBody with
   | some reqBody =>
     exact
-      checkMirRequiresPinsScalars_sound
+      checkMirRequiresPinsScalarsDirect_sound
         fuel reqBody expectedScalars args h_check h_len h_req
   | none =>
     dsimp only [checkOptMirRequiresPinsScalars] at h_check
@@ -6650,7 +9457,7 @@ def checkCalleeEnsuresPinsRet
     Bool :=
   Bool.and
     (Nat.beq calleeEnsBody.argCount (.succ (length callArgs)))
-    (checkSymPinsLoop
+    (checkSymPinsLoopDirect
       fuel
       calleeEnsBody
       (initSymStateWithCallArgs calleeEnsBody callArgs)
@@ -6682,7 +9489,7 @@ theorem checkCalleeEnsuresPinsRet_sound
     rw [← concretizeSymState_initSymStateWithCallArgs
       calleeEnsBody callArgs retVal (Nat.eq_of_beq_eq_true hArgEq)] at hHold
     have ⟨hPin, _⟩ :=
-      checkSymPinsLoop_sound
+      checkSymPinsLoopDirect_sound
         fuel calleeEnsBody (callArgs ++ [retVal])
         (initSymStateWithCallArgs calleeEnsBody callArgs)
         [(length callArgs, expectedRet)]
@@ -7173,6 +9980,336 @@ theorem dischargeRustModularBoundedRange1Auto
           callees
           hRun
 
+theorem symStepConcreteDeref_true_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (h : symStepConcreteDeref body st = .some st')
+    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
+  rw [symStepConcreteDeref_stepMirFn_eq body args st st' h]
+  exact hTrue
+
+theorem get?_two_eq_of_blt
+    (v : Value)
+    (idx : Nat)
+    (hBlt : Nat.blt idx 2 = true) :
+    get? [v, v] idx = .some v := by
+  cases idx with
+  | zero => rfl
+  | succ idx1 =>
+    cases idx1 with
+    | zero => rfl
+    | succ _ => nomatch hBlt
+
+theorem symStepDerefLoadSlice_true_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (v : Value)
+    (expectedSc : ScalarInt)
+    (st st' : SymState)
+    (hArgCount : body.argCount = 2)
+    (hSlice : extractValueScalarSlice0? v expectedSc.sizeBytes = .some expectedSc)
+    (h : symStepDerefLoadSlice body st expectedSc = .some st')
+    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body [v, v] st')) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body [v, v] st) := by
+  dsimp only [symStepDerefLoadSlice] at h
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body [v, v] st))
+  cases hPhase : body.phase with
+  | other _ => rw [hPhase] at h; nomatch h
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at h
+    dsimp only at h
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none => rw [hBb] at h; nomatch h
+    | some bb =>
+      rw [hBb] at h
+      dsimp only at h
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | none => rw [hStmt] at h; nomatch h
+      | some stmt =>
+        rw [hStmt] at h
+        dsimp only at h
+        cases hMatch : symMatchDerefSymArgLoad body st stmt with
+        | none => rw [hMatch] at h; nomatch h
+        | some tup =>
+          rw [hMatch] at h
+          rcases tup with ⟨idx, uKind, dstLoc, borrows₂⟩
+          dsimp only at h
+          cases hBlt : Nat.blt idx body.argCount with
+          | false => rw [hBlt] at h; nomatch h
+          | true =>
+            rw [hBlt] at h
+            cases hKindSz : Nat.beq (uintBytesOfKind uKind) expectedSc.sizeBytes with
+            | false => rw [hKindSz] at h; nomatch h
+            | true =>
+              rw [hKindSz] at h
+              cases hSet : set? st.slots dstLoc (.concrete (.init (.scalar expectedSc))) with
+              | none => rw [hSet] at h; nomatch h
+              | some slots₂ =>
+                rw [hSet] at h
+                injection h with hSt'
+                subst hSt'
+                rw [stepMirFn_concretize_stmt body [v, v] st bb stmt hNotOther hBb hStmt]
+                have hEv := symMatchDerefSymArgLoad_evalStmt body [v, v] st stmt idx uKind dstLoc borrows₂ hMatch
+                rw [hArgCount] at hBlt
+                rw [get?_two_eq_of_blt v idx hBlt] at hEv
+                dsimp only at hEv
+                rw [Nat.eq_of_beq_eq_true hKindSz, hSlice] at hEv
+                dsimp only at hEv
+                rw [hSet] at hEv
+                dsimp only at hEv
+                rw [hEv]
+                exact hTrue
+
+/-- Check whether symbolic execution from `st` (stepping through `symStepConcreteInBounds`,
+`symStepConcreteDeref`, and `symStepDerefLoadSlice`) reaches `Return` with `true`
+within `fuel` steps. -/
+def checkSymSliceBoolTrueBounded : Nat → CapturedMir → ScalarInt → SymState → Bool
+  | .zero, _, _, _ => false
+  | .succ fuel, body, expectedSc, st =>
+    match symStepConcreteInBounds body st with
+    | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+    | .none =>
+      match symStepConcreteDeref body st with
+      | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+      | .none =>
+        match symStepDerefLoadSlice body st expectedSc with
+        | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+        | .none => symIsReturnTrue body st
+
+theorem checkSymSliceBoolTrueBounded_sound :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (v : Value)
+      (expectedSc : ScalarInt)
+      (st : SymState),
+      body.argCount = 2 →
+      extractValueScalarSlice0? v expectedSc.sizeBytes = .some expectedSc →
+      checkSymSliceBoolTrueBounded fuel body expectedSc st = true →
+      evalMirBoolTrueBounded fuel body (concretizeSymState body [v, v] st)
+  | .zero, _, _, _, _, _, _, hCheck => nomatch hCheck
+  | .succ fuel, body, v, expectedSc, st, hArgCount, hSlice, hCheck => by
+    dsimp only [checkSymSliceBoolTrueBounded] at hCheck
+    have hLen : length [v, v] = body.argCount := Eq.symm hArgCount
+    cases hStep1 : symStepConcreteInBounds body st with
+    | some st' =>
+      rw [hStep1] at hCheck
+      exact symStepConcreteInBounds_true_sound
+        fuel body [v, v] st st' hLen hStep1
+        (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
+    | none =>
+      rw [hStep1] at hCheck
+      cases hStep2 : symStepConcreteDeref body st with
+      | some st' =>
+        rw [hStep2] at hCheck
+        exact symStepConcreteDeref_true_sound
+          fuel body [v, v] st st' hStep2
+          (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
+      | none =>
+        rw [hStep2] at hCheck
+        cases hStep3 : symStepDerefLoadSlice body st expectedSc with
+        | some st' =>
+          rw [hStep3] at hCheck
+          exact symStepDerefLoadSlice_true_sound
+            fuel body v expectedSc st st' hArgCount hSlice hStep3
+            (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
+        | none =>
+          rw [hStep3] at hCheck
+          exact symIsReturnTrue_sound fuel body [v, v] st hCheck
+
+/-- Check whether `st` is at a `Return` terminator with local `0` holding `.symArg 0`. -/
+def symIsReturnSymArg0 (body : CapturedMir) (st : SymState) : Bool :=
+  match body.phase with
+  | .other _ => false
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => false
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .some _ => false
+      | .none =>
+        match Nat.beq st.stmtIdx (length bb.statements) with
+        | false => false
+        | true =>
+          match bb.terminator.kind with
+          | .return_ =>
+            match get? st.slots 0 with
+            | .some (.symArg 0) => true
+            | _ => false
+          | _ => false
+
+/-- Check whether symbolic execution from `st` reaches `Return` with `.symArg 0`
+within `fuel` steps. -/
+def checkSymReturnsSymArg0 : Nat → CapturedMir → SymState → Bool
+  | .zero, _, _ => false
+  | .succ fuel, body, st =>
+    match symStepConcreteInBounds body st with
+    | .some st' => checkSymReturnsSymArg0 fuel body st'
+    | .none => symIsReturnSymArg0 body st
+
+theorem wpCoalBounded_of_symIsReturnSymArg0
+    (fuel : Nat)
+    (body : CapturedMir)
+    (v : Value)
+    (st : SymState)
+    (P : Value → Prop)
+    (hRet : symIsReturnSymArg0 body st = true)
+    (hP : P v) :
+    wpCoalBounded (.succ fuel) mirDefaultWP (stepMirState body)
+      (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → P retVal)
+      (.running (concretizeSymState body [v] st)) PUnit.unit := by
+  dsimp only [symIsReturnSymArg0] at hRet
+  unfold wpCoalBounded stepMirState
+  dsimp only
+  cases hPhase : body.phase with
+  | other _ => rw [hPhase] at hRet; nomatch hRet
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at hRet
+    dsimp only at hRet
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none => rw [hBb] at hRet; nomatch hRet
+    | some bb =>
+      rw [hBb] at hRet
+      dsimp only at hRet
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | some _ => rw [hStmt] at hRet; nomatch hRet
+      | none =>
+        rw [hStmt] at hRet
+        dsimp only at hRet
+        cases hLen : Nat.beq st.stmtIdx (length bb.statements) with
+        | false => rw [hLen] at hRet; nomatch hRet
+        | true =>
+          rw [hLen] at hRet
+          dsimp only at hRet
+          rw [stepMirFn_concretize_term body [v] st bb hNotOther hBb hStmt hLen]
+          cases hTerm : bb.terminator with
+          | mk tKind _ =>
+            rw [hTerm] at hRet
+            dsimp only at hRet
+            cases tKind with
+            | return_ =>
+              dsimp only at hRet
+              dsimp only [evalTerminator, concretizeSymState, concretizeSymMemory]
+              rw [get?_concretizeSymSlots [v] st.slots 0]
+              cases hGet0 : get? st.slots 0 with
+              | none => rw [hGet0] at hRet; nomatch hRet
+              | some sSlot0 =>
+                rw [hGet0] at hRet
+                cases sSlot0 with
+                | concrete _ | symPair0 _ _ => nomatch hRet
+                | symArg idx0 =>
+                  cases idx0 with
+                  | succ _ => nomatch hRet
+                  | zero =>
+                    dsimp only [concretizeSymSlot, get?, MirStepNode.retNormal, mirDefaultWP]
+                    intro retVal mem' hOut
+                    injection hOut with hPair
+                    injection hPair with hRv _
+                    subst hRv
+                    exact hP
+            | _ => nomatch hRet
+
+theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (v : Value)
+      (st : SymState)
+      (P : Value → Prop),
+      body.argCount = 1 →
+      checkSymReturnsSymArg0 fuel body st = true →
+      P v →
+      wpCoalBounded fuel mirDefaultWP (stepMirState body)
+        (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → P retVal)
+        (.running (concretizeSymState body [v] st)) PUnit.unit
+  | .zero, _, _, _, _, _, hCheck, _ => nomatch hCheck
+  | .succ fuel, body, v, st, P, hArg1, hCheck, hP => by
+    dsimp only [checkSymReturnsSymArg0] at hCheck
+    have hLen : length [v] = body.argCount := Eq.symm hArg1
+    cases hStep : symStepConcreteInBounds body st with
+    | none =>
+      rw [hStep] at hCheck
+      exact wpCoalBounded_of_symIsReturnSymArg0 fuel body v st P hCheck hP
+    | some st' =>
+      rw [hStep] at hCheck
+      have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hCheck hP
+      dsimp only [symStepConcreteInBounds] at hStep
+      unfold wpCoalBounded stepMirState
+      dsimp only
+      cases hPhase : body.phase with
+      | other _ => rw [hPhase] at hStep; nomatch hStep
+      | runtimePostCleanup | runtimeOptimized =>
+        have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+          intro msg hm; rw [hPhase] at hm; nomatch hm
+        rw [hPhase] at hStep
+        dsimp only at hStep
+        cases hBb : get? body.basicBlocks st.blockIdx with
+        | none => rw [hBb] at hStep; nomatch hStep
+        | some bb =>
+          rw [hBb] at hStep
+          dsimp only at hStep
+          cases hStmt : get? bb.statements st.stmtIdx with
+          | some stmt =>
+            rw [hStmt] at hStep
+            dsimp only at hStep
+            cases hInB : symStepStmtInBounds body.argCount body.localDecls body.layouts st stmt with
+            | false => rw [hInB] at hStep; nomatch hStep
+            | true =>
+              rw [hInB] at hStep
+              dsimp only at hStep
+              rw [stepMirFn_concretize_stmt body [v] st bb stmt hNotOther hBb hStmt]
+              rw [symStepStmtConcrete_step_of_inBounds body [v] st st' stmt hLen hInB hStep]
+              exact hRec
+          | none =>
+            rw [hStmt] at hStep
+            dsimp only at hStep
+            cases hLenBb : Nat.beq st.stmtIdx (length bb.statements) with
+            | false => rw [hLenBb] at hStep; nomatch hStep
+            | true =>
+              rw [hLenBb] at hStep
+              dsimp only at hStep
+              rw [stepMirFn_concretize_term body [v] st bb hNotOther hBb hStmt hLenBb]
+              rcases symStepTermConcrete_sound body [v] st st' bb.terminator hStep with hTerm | ⟨ev, hTerm⟩
+              · rw [hTerm]
+                exact hRec
+              · rw [hTerm]
+                cases ev <;> exact hRec
+
+def isNilMirList : List CapturedMir → Bool
+  | .nil => true
+  | _ :: _ => false
+
+/-- Closed-term checker for `dischargeRustEqScalar1`: succeeds either when
+`subjectBody` returns `args[0]` and `ensBody` is verified by
+`checkSymSliceBoolTrueBounded`, or when `reqBody` directly pins `args` via
+`checkMirRequiresPinsScalarsDirect` and `checkMirRustPinnedSpecWithCallees` holds. -/
+def checkMirRustEqScalar1SpecWithCallees
+    (subjectFuel specFuel : Nat)
+    (reqBody subjectBody ensBody : CapturedMir)
+    (callees : List CapturedMir)
+    (expectedSc : ScalarInt) :
+    Bool :=
+  Bool.or
+    (Bool.and
+      (isNilMirList callees)
+      (Bool.and
+        (Nat.beq subjectBody.argCount 1)
+        (Bool.and
+          (checkSymReturnsSymArg0 subjectFuel subjectBody (initSymState subjectBody))
+          (Bool.and
+            (Nat.beq ensBody.argCount 2)
+            (checkSymSliceBoolTrueBounded specFuel ensBody expectedSc (initSymState ensBody))))))
+    (Bool.and
+      (checkMirRequiresPinsScalarsDirect specFuel reqBody [expectedSc])
+      (checkMirRustPinnedSpecWithCallees
+        subjectFuel specFuel subjectBody ensBody callees [.scalar expectedSc]))
+
 end PinChecker
 
 /-! ## Pinned `#[spec]` Equality Discharge Combinators (`dischargeRustEqScalar1`/`2`/`3`) -/
@@ -7201,39 +10338,101 @@ theorem dischargeRustEqScalar1
         reqBody
         [{ bits := constVal, sizeBytes := width }] = true := by rfl)
     (h_check :
-      checkMirRustPinnedSpecWithCallees
+      checkMirRustEqScalar1SpecWithCallees
         subjectFuel
         specFuel
+        reqBody
         c.body
         ensBody
         c.callees
-        [.scalar { bits := constVal, sizeBytes := width }] =
+        { bits := constVal, sizeBytes := width } =
         true := by rfl)
     (h_post :
-      ∀ ret : Value,
+      ∀ (args : List Value) (ret : Value),
         MirBoolPredicateHoldsWithCallees
           ensBody
           c.callees
-          ([.scalar { bits := constVal, sizeBytes := width }] ++ [ret]) →
-        c.post [.scalar { bits := constVal, sizeBytes := width }] ret := by
-      intro _ h; exact h) :
+          (args ++ [ret]) →
+        c.post args ret := by
+      intro _ _ h; exact h) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
   rcases h_pre args hp with ⟨h_len, h_req⟩
-  have h_args : args = [.scalar { bits := constVal, sizeBytes := width }] :=
-    checkMirRequiresPinsScalars_sound
-      specFuel reqBody [{ bits := constVal, sizeBytes := width }] args
-      h_pins h_len h_req
-  subst h_args
-  have h_wp :=
-    wpMirBounded_of_checkMirRustPinnedSpecWithCallees
-      subjectFuel specFuel c.body ensBody c.callees
-      [.scalar { bits := constVal, sizeBytes := width }]
-      h_check
-  exact wpMirSym_eq_wpMirBounded subjectFuel c.body _ _ ▸
-    wpMirSym_mono
-      (fun out ho retVal mem' h_out => h_post retVal (ho retVal mem' h_out))
-      (wpMirSym_eq_wpMirBounded subjectFuel c.body _ _ ▸ h_wp)
+  let expectedSc : ScalarInt := { bits := constVal, sizeBytes := width }
+  dsimp only [checkMirRustEqScalar1SpecWithCallees] at h_check
+  cases hBranch1 :
+      Bool.and
+        (isNilMirList c.callees)
+        (Bool.and
+          (Nat.beq c.body.argCount 1)
+          (Bool.and
+            (checkSymReturnsSymArg0 subjectFuel c.body (initSymState c.body))
+            (Bool.and
+              (Nat.beq ensBody.argCount 2)
+              (checkSymSliceBoolTrueBounded specFuel ensBody expectedSc (initSymState ensBody))))) with
+  | true =>
+    rcases Bool.and_eq_true_iff.1 hBranch1 with ⟨hNilCallees, hB1⟩
+    rcases Bool.and_eq_true_iff.1 hB1 with ⟨hSubjArg1, hB2⟩
+    rcases Bool.and_eq_true_iff.1 hB2 with ⟨hSubjRet0, hB3⟩
+    rcases Bool.and_eq_true_iff.1 hB3 with ⟨hEnsArg2, hEnsTrue⟩
+    have hPins :=
+      checkMirRequiresPinsScalars_sound
+        specFuel reqBody [expectedSc] args h_pins h_len h_req
+    cases args with
+    | nil => nomatch h_len
+    | cons v0 restArgs =>
+      cases restArgs with
+      | cons _ _ =>
+        dsimp only [length] at h_len
+        injection h_len with h_len'
+        nomatch h_len'
+      | nil =>
+        rcases hPins with ⟨⟨vPin, hGet0, hSlice0⟩, _⟩
+        dsimp only [get?] at hGet0
+        injection hGet0 with hVEq
+        subst hVEq
+        have hCalleesNil : c.callees = .nil := by
+          cases hCal : c.callees with
+          | nil => rfl
+          | cons _ _ => rw [hCal] at hNilCallees; nomatch hNilCallees
+        have hEnsHolds : MirBoolPredicateHoldsWithCallees ensBody c.callees [v0, v0] := by
+          rw [hCalleesNil]
+          change MirBoolPredicateHolds ensBody [v0, v0]
+          apply mirBoolPredicateHolds_of_evalMirBoolTrueBounded specFuel ensBody [v0, v0]
+          have hEnsLen : length [v0, v0] = ensBody.argCount :=
+            Eq.symm (Nat.eq_of_beq_eq_true hEnsArg2)
+          rw [← concretizeSymState_initSymState ensBody [v0, v0] hEnsLen]
+          exact checkSymSliceBoolTrueBounded_sound
+            specFuel ensBody v0 expectedSc (initSymState ensBody)
+            (Nat.eq_of_beq_eq_true hEnsArg2) hSlice0 hEnsTrue
+        have hPostV0 : c.post [v0] v0 := h_post [v0] v0 hEnsHolds
+        rw [hCalleesNil]
+        change wpCoalBounded subjectFuel mirDefaultWP (stepMirState c.body)
+          (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → c.post [v0] retVal)
+          (.running (initMachineState c.body [v0])) PUnit.unit
+        have hSubjLen : length [v0] = c.body.argCount :=
+          Eq.symm (Nat.eq_of_beq_eq_true hSubjArg1)
+        rw [← concretizeSymState_initSymState c.body [v0] hSubjLen]
+        exact wpCoalBounded_of_checkSymReturnsSymArg0
+          subjectFuel c.body v0 (initSymState c.body) (fun rv => c.post [v0] rv)
+          (Nat.eq_of_beq_eq_true hSubjArg1) hSubjRet0 hPostV0
+  | false =>
+    rw [hBranch1] at h_check
+    dsimp only [Bool.or] at h_check
+    rcases Bool.and_eq_true_iff.1 h_check with ⟨hDirectPins, hDirectCheck⟩
+    have h_args : args = [.scalar expectedSc] :=
+      checkMirRequiresPinsScalarsDirect_sound
+        specFuel reqBody [expectedSc] args hDirectPins h_len h_req
+    subst h_args
+    have h_wp :=
+      wpMirBounded_of_checkMirRustPinnedSpecWithCallees
+        subjectFuel specFuel c.body ensBody c.callees
+        [.scalar expectedSc]
+        hDirectCheck
+    exact wpMirSym_eq_wpMirBounded subjectFuel c.body _ _ ▸
+      wpMirSym_mono
+        (fun out ho retVal mem' h_out => h_post [.scalar expectedSc] retVal (ho retVal mem' h_out))
+        (wpMirSym_eq_wpMirBounded subjectFuel c.body _ _ ▸ h_wp)
 
 /-- One-call discharge combinator for 1-argument `u8` equality `#[spec]`. -/
 abbrev dischargeRustEqU8 := @dischargeRustEqScalar1 1
@@ -7269,7 +10468,7 @@ theorem dischargeRustEqScalar2
           (MirBoolPredicateHolds reqBody args) := by
       intro _ h; exact h)
     (h_pins :
-      checkMirRequiresPinsScalars
+      checkMirRequiresPinsScalarsDirect
         specFuel
         reqBody
         [ { bits := c1, sizeBytes := w1 }
@@ -7303,7 +10502,7 @@ theorem dischargeRustEqScalar2
       args =
         [ .scalar { bits := c1, sizeBytes := w1 }
         , .scalar { bits := c2, sizeBytes := w2 } ] :=
-    checkMirRequiresPinsScalars_sound
+    checkMirRequiresPinsScalarsDirect_sound
       specFuel reqBody
       [ { bits := c1, sizeBytes := w1 }
       , { bits := c2, sizeBytes := w2 } ]
@@ -7547,13 +10746,13 @@ theorem dischargeRustEqScalar1FuelFree
       checkMirRequiresPinsScalars 64 reqBody [{ bits := constVal, sizeBytes := width }] =
         true := by rfl)
     (h_check :
-      checkMirRustPinnedSpecWithCallees 16 64 c.body ensBody c.callees
-        [.scalar { bits := constVal, sizeBytes := width }] = true := by rfl)
-    (h_post : ∀ ret : Value,
+      checkMirRustEqScalar1SpecWithCallees 16 64 reqBody c.body ensBody c.callees
+        { bits := constVal, sizeBytes := width } = true := by rfl)
+    (h_post : ∀ (args : List Value) (ret : Value),
       MirBoolPredicateHoldsWithCallees ensBody c.callees
-        ([.scalar { bits := constVal, sizeBytes := width }] ++ [ret]) →
-      c.post [.scalar { bits := constVal, sizeBytes := width }] ret := by
-      intro _ h; exact h) :
+        (args ++ [ret]) →
+      c.post args ret := by
+      intro _ _ h; exact h) :
     VerificationResult c :=
   dischargeRustEqScalar1 width c 16 64 reqBody ensBody constVal h_pre h_pins h_check h_post
 
@@ -7570,7 +10769,7 @@ theorem dischargeRustEqScalar2FuelFree
       And (Trusted.Sequence.length args = 2) (MirBoolPredicateHolds reqBody args) := by
       intro _ h; exact h)
     (h_pins :
-      checkMirRequiresPinsScalars 64 reqBody
+      checkMirRequiresPinsScalarsDirect 64 reqBody
         [{ bits := c1, sizeBytes := w1 }, { bits := c2, sizeBytes := w2 }] =
         true := by rfl)
     (h_check :

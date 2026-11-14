@@ -5830,22 +5830,63 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   rvalueOk_discriminant_nonOrdering
   rvalueOk_discriminant_proj
   cmpDiscrSwitch_inFragment
+  cmpDiscrSwitch_discriminant_statementOk
   cmpDiscrSwitch_translate
+  ctxI8_ok_cmpDiscrSwitch
+  cmpDiscrLess_anneal_ret
+  cmpDiscrLess_noUB
   cmpDiscrLess_minirust_ret_from_start
+  cmpDiscrLess_minirust_direct
+  cmpDiscrEqual_anneal_ret
+  cmpDiscrGreater_anneal_ret
+  cmpDiscrGreater_minirust_direct
   statementOk_deinit_proj
   statementOk_retag_proj
   evalStmt_retag_scalar_ub
   evalStmt_retag_scalar_noop
+  evalStmt_deinit_proj_keeps
+  paddedDeinitRead_not_inFragment
+  paddedDeinitRead_translate
+  paddedDeinitRead_anneal_ret
   paddedDeinitRead_minirust_ub
+  paddedRetagRead_not_inFragment
+  paddedRetagRead_translate
   paddedRetagRead_retag_noop
   paddedRetagRead_anneal_noop
+  retagVal_int_id
   paddedRetagRead_minirust_ret
   paddedRetagRead_stage1_parity
+  paddedDeinitSiblingReinit_not_inFragment
+  paddedDeinitSiblingReinit_translate
+  paddedDeinitSiblingReinit_anneal_ret
+  paddedDeinitSiblingReinit_noUB
+  paddedDeinitSiblingReinit_minirust_ret
+  deinitSiblingReinit_not_inFragment
+  deinitSiblingReinit_translate
+  ctxPadded2_ok_u8
+  deinitSiblingReinit_ctxOk
+  deinitSiblingReinit_argsOk
+  deinitSiblingReinitMInit_threads
+  deinitSiblingReinitMInit_active
+  deinitSiblingReinitMInit_allocs
+  deinitSiblingReinit_anneal_ret
+  deinitSiblingReinit_anneal_noUB
+  deinitSiblingReinit_erased
+  deinitSiblingReinit_minirust_direct
+  deinitSiblingReinit_minirust_ret_direct
+  deinitSiblingReinit_holeAt
+  deinitSiblingReinit_minirust_returnRel
   paddedDeinitRead_not_inFragmentD
   paddedRetagRead_inFragmentD
+  ctxPadded2_ok_u32
+  paddedRetagRead_ctxOk
+  paddedRetagRead_argsOk
+  paddedRetagRead_anneal_noUB
   paddedRetagRead_minirust_ret_from_start
   paddedRetagRead_minirust_noUB
   paddedDeinitSiblingRetagReinit_inFragmentD
+  paddedDeinitSiblingRetagReinit_translate
+  paddedDeinitSiblingRetagReinit_anneal_ret
   paddedDeinitSiblingRetagReinit_minirust_ret_from_start
   paddedDeinitRetagHole_not_inFragmentD
   paddedDeinitRetagHole_diverges
@@ -5853,23 +5894,59 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   deinitSiblingReinit_minirust_ret_from_start
   deinitSiblingReinit_minirust_noUB
   deinitSiblingReinit_minirust_progress
+  ctxPadded3_ok_u32
+  paddedDeinitSiblingReinit_ctxOk
+  paddedDeinitSiblingReinit_argsOk
+  ctxPadded2_ok_u8_u32
+  deinitSiblingCopyReinit_inFragmentD
+  deinitSiblingCopyReinit_not_inFragment
+  deinitSiblingCopyReinit_translate
+  deinitSiblingCopyReinit_ctxOk
+  deinitSiblingCopyReinit_argsOk
+  deinitSiblingCopyReinit_anneal_ret
+  deinitSiblingCopyReinit_anneal_noUB
   deinitSiblingCopyReinit_minirust_ret_from_start
   deinitSiblingCopyReinit_minirust_noUB
+  deinitSiblingReinitUb_inFragmentD
+  deinitSiblingReinitUb_translate
+  deinitSiblingReinitUb_ctxOk
+  deinitSiblingReinitUb_anneal_ub
   deinitSiblingReinitUb_minirust_ub_from_start
+  ctxPadded2_ok_u8_u32_u32
+  deinitSiblingRelayReinit_inFragmentD
+  deinitSiblingRelayReinit_not_inFragment
+  deinitSiblingRelayReinit_translate
+  deinitSiblingRelayReinit_ctxOk
+  deinitSiblingRelayReinit_argsOk
+  deinitSiblingRelayReinit_anneal_ret
+  deinitSiblingRelayReinit_anneal_noUB
+  deinitSiblingRelayReinit_holeAt
   deinitSiblingRelayReinit_minirust_ret_from_start
   deinitSiblingRelayReinit_minirust_noUB
   paddedDeinitSiblingReinit_inFragmentD
   paddedDeinitSiblingReinit_window_rules
   paddedDeinitSiblingReinit_minirust_ret_from_start
   paddedDeinitSiblingReinit_minirust_noUB
+  paddedDeinitBinOpDivZero_inFragmentD
+  paddedDeinitBinOpDivZero_translate
+  paddedDeinitBinOpDivZero_anneal_ub
   paddedDeinitBinOpDivZero_minirust_ub_from_start
   paddedDeinitBinOpDivZero_minirust_ub_direct
   paddedDeinitHoleBinOp_not_inFragmentD
+  paddedDeinitHoleBinOp_translate
   paddedDeinitHoleBinOp_diverges
   paddedDeinitHoleCastRead_not_inFragmentD
+  paddedDeinitHoleCastRead_translate
   paddedDeinitHoleCastRead_diverges
+  ctxPadded3_ok_u32_u32
   deinitSiblingBinOpWindowReinit_inFragmentD
+  deinitSiblingBinOpWindowReinit_not_inFragment
+  deinitSiblingBinOpWindowReinit_translate
   deinitSiblingBinOpWindowReinit_window_rules
+  deinitSiblingBinOpWindowReinit_ctxOk
+  deinitSiblingBinOpWindowReinit_argsOk
+  deinitSiblingBinOpWindowReinit_anneal_ret
+  deinitSiblingBinOpWindowReinit_anneal_noUB
   deinitSiblingBinOpWindowReinit_minirust_ret_from_start
   deinitSiblingBinOpWindowReinit_minirust_noUB
 

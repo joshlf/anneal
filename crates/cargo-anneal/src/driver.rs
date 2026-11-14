@@ -1713,6 +1713,7 @@ mod tests {
         // (`Mir/CrateA/*`, `Mir/CrateB/*`, `Mir/Core/*`) compiles cleanly in the
         // Lean 4 kernel (`lean`).
         let examples_dir = repo_root.join("examples");
+        let root_lean_lib_dir = repo_root.join(".lake/build/lib/lean");
         let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
         let lean_bin = if let Ok(home) = std::env::var("HOME") {
             let elan_lean = PathBuf::from(home).join(".elan/bin/lean");
@@ -1725,7 +1726,12 @@ mod tests {
             PathBuf::from("lean")
         };
         let gen_dir = crate_a_dir.join(".anneal/generated");
-        let lean_path_env = format!("{}:{}", lean_lib_dir.display(), gen_dir.display());
+        let lean_path_env = format!(
+            "{}:{}:{}",
+            root_lean_lib_dir.display(),
+            lean_lib_dir.display(),
+            gen_dir.display()
+        );
         for mir_file in &scaffold_report.generated_mir_files {
             let dst_olean = mir_file.with_extension("olean");
             let out = Command::new(&lean_bin)
@@ -2161,6 +2167,7 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
         // and prove in the Lean 4 kernel that `defaultCallees` steps directly into linked callees while
         // `externalSpecCallContract` enforces non-vacuous return-type and layout validity!
         let examples_dir = repo_root.join("examples");
+        let root_lean_lib_dir = repo_root.join(".lake/build/lib/lean");
         let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
         let lean_bin = if let Ok(home) = std::env::var("HOME") {
             let elan_lean = PathBuf::from(home).join(".elan/bin/lean");
@@ -2174,7 +2181,8 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
         };
         let proofs_dir = crate_a_dir.join("anneal/proofs");
         let lean_path_env = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
+            root_lean_lib_dir.display(),
             lean_lib_dir.display(),
             gen_dir.display(),
             proofs_dir.display()
@@ -2449,8 +2457,10 @@ example (p : ProvenancePtr) :
     evalRvalue
       [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
       (.ref .shared { local_ := 0, projection := [.deref] })
-      emptyMemory = .ub :=
-  rfl
+      emptyMemory = .ub := by
+  cases p with
+  | mk allocId offsetBytes =>
+    cases allocId <;> cases offsetBytes <;> rfl
 
 example :
     evalRvalue

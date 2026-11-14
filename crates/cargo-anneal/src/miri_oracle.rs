@@ -33,6 +33,11 @@ use crate::{normalize_path_against, resolve_lake_binary, run_lake_verify_targets
 /// explicitly opt out when Miri or its sysroot is not installed.
 pub const ALLOW_MISSING_MIRI_ENV: &str = "ANNEAL_ALLOW_MISSING_MIRI";
 
+/// Environment variable overriding the `cargo` binary used by
+/// [`ensure_miri_sysroot_initialized`] when running
+/// `cargo +nightly-2026-06-01 miri setup`.
+pub const MIRI_SETUP_BIN_ENV: &str = "ANNEAL_MIRI_SETUP_BIN";
+
 /// Default fuel bound per item when evaluating `evalMirDiffTagBounded` and
 /// `probeMirDiffExecBounded`.
 pub const DEFAULT_ORACLE_FUEL: u32 = 128;
@@ -771,15 +776,181 @@ fn resolve_sysroot_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             p.display()
         ));
     }
-    if let Ok(home) = env::var("HOME") {
-        let candidate = PathBuf::from(home).join(".cache/miri");
-        if candidate.join("lib/rustlib").is_dir() {
-            return Ok(candidate);
-        }
+    if let Ok(home) = env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        let candidate = PathBuf::from(home.trim()).join(".cache/miri");
+        return ensure_miri_sysroot_initialized(&candidate);
     }
     Err(
         "Miri sysroot not found at ~/.cache/miri (or ANNEAL_MIRI_SYSROOT); \
          missing Miri sysroot is a hard error"
+            .to_string(),
+    )
+}
+
+/// Ensure the Miri sysroot directory at `candidate` contains `lib/rustlib`,
+/// auto-provisioning it via `cargo +nightly-2026-06-01 miri setup` under an
+/// exclusive advisory lock (`<candidate>/.setup.lock`) when absent.
+///
+/// Fails closed if `miri setup` exits non-zero or leaves `lib/rustlib` absent.
+pub fn ensure_miri_sysroot_initialized(candidate: &Path) -> Result<PathBuf, String> {
+    ensure_miri_sysroot_initialized_with(candidate, run_default_miri_setup)
+}
+
+/// Test-friendly variant of [`ensure_miri_sysroot_initialized`] that invokes
+/// `setup_fn(candidate)` under `<candidate>/.setup.lock` when
+/// `<candidate>/lib/rustlib` is absent and verifies `<candidate>/lib/rustlib`
+/// exists afterwards.
+pub fn ensure_miri_sysroot_initialized_with<F>(
+    candidate: &Path,
+    setup_fn: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    if candidate.join("lib/rustlib").is_dir() {
+        return Ok(candidate.to_path_buf());
+    }
+
+    fs::create_dir_all(candidate).map_err(|err| {
+        format!(
+            "failed to create Miri sysroot directory {}: {err}",
+            candidate.display()
+        )
+    })?;
+
+    let lock_path = candidate.join(".setup.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open Miri sysroot lock file {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock().map_err(|err| {
+        format!(
+            "failed to acquire advisory lock on {}: {err}",
+            lock_path.display()
+        )
+    })?;
+
+    // Re-check after acquiring the exclusive lock in case another process
+    // finished provisioning while we waited.
+    if candidate.join("lib/rustlib").is_dir() {
+        return Ok(candidate.to_path_buf());
+    }
+
+    setup_fn(candidate)?;
+
+    if !candidate.join("lib/rustlib").is_dir() {
+        return Err(format!(
+            "Miri sysroot setup completed for {}, but {}/lib/rustlib is still missing; \
+             missing Miri sysroot is a hard error",
+            candidate.display(),
+            candidate.display()
+        ));
+    }
+
+    Ok(candidate.to_path_buf())
+}
+
+fn run_default_miri_setup(candidate: &Path) -> Result<(), String> {
+    let (cargo_bin, is_direct_toolchain_cargo, extra_path_dir) = resolve_miri_setup_cargo()?;
+    let mut cmd = Command::new(&cargo_bin);
+    if !is_direct_toolchain_cargo {
+        cmd.arg("+nightly-2026-06-01");
+    }
+    cmd.args(["miri", "setup"]);
+    cmd.env("MIRI_SYSROOT", candidate);
+    if let Some(bin_dir) = extra_path_dir {
+        let current_path = env::var_os("ANNEAL_CALLER_PATH")
+            .or_else(|| env::var_os("PATH"))
+            .unwrap_or_default();
+        let mut paths = vec![bin_dir];
+        paths.extend(env::split_paths(&current_path));
+        if let Ok(joined) = env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+
+    let output = cmd.output().map_err(|err| {
+        format!(
+            "failed to execute '{}' to initialize Miri sysroot at {}: {err}",
+            cargo_bin.display(),
+            candidate.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Miri sysroot auto-provisioning failed at {} (status {}):\nstdout:\n{}\nstderr:\n{}; \
+             missing Miri sysroot is a hard error",
+            candidate.display(),
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_miri_setup_cargo() -> Result<(PathBuf, bool, Option<PathBuf>), String> {
+    if let Ok(val) = env::var(MIRI_SETUP_BIN_ENV)
+        && !val.trim().is_empty()
+    {
+        let p = PathBuf::from(val.trim());
+        if p.is_file() {
+            return Ok((p, false, None));
+        }
+        return Err(format!(
+            "{MIRI_SETUP_BIN_ENV} points to non-existent binary: {}",
+            p.display()
+        ));
+    }
+    if let Ok(home) = env::var("HOME") {
+        let toolchains_dir = PathBuf::from(&home).join(".rustup/toolchains");
+        if let Ok(entries) = fs::read_dir(&toolchains_dir) {
+            let mut candidates: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|d| d.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("nightly-2026-06-01"))
+                })
+                .map(|p| p.join("bin"))
+                .filter(|bin_dir| {
+                    bin_dir.join("cargo").is_file() && bin_dir.join("cargo-miri").is_file()
+                })
+                .collect();
+            candidates.sort();
+            if let Some(bin_dir) = candidates.into_iter().next() {
+                return Ok((bin_dir.join("cargo"), true, Some(bin_dir)));
+            }
+        }
+        let cargo_proxy = PathBuf::from(&home).join(".cargo/bin/cargo");
+        if cargo_proxy.is_file() {
+            return Ok((cargo_proxy, false, None));
+        }
+    }
+    if let Some(path_cargo) = find_executable_in_path("cargo") {
+        let is_direct_toolchain = path_cargo
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("nightly-2026-06-01"));
+        let bin_dir = path_cargo.parent().map(Path::to_path_buf);
+        return Ok((path_cargo, is_direct_toolchain, bin_dir));
+    }
+    Err(
+        "could not locate 'cargo' for `cargo +nightly-2026-06-01 miri setup` \
+         (set ANNEAL_MIRI_SETUP_BIN or install the nightly-2026-06-01 toolchain)"
             .to_string(),
     )
 }
@@ -1913,5 +2084,293 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
             "",
         );
         assert!(matches!(missing_start, MiriOutcome::OracleError(_)));
+    }
+
+    #[test]
+    fn sysroot_fast_path_skips_setup_when_lib_rustlib_already_exists() {
+        let temp = unique_oracle_temp_dir("sysroot-fast-path");
+        let sysroot = temp.join(".cache/miri");
+        fs::create_dir_all(sysroot.join("lib/rustlib")).expect("create lib/rustlib");
+
+        let mut called = false;
+        let resolved = ensure_miri_sysroot_initialized_with(&sysroot, |_| {
+            called = true;
+            Err("setup_fn must not be invoked when lib/rustlib already exists".to_string())
+        })
+        .expect("fast path should succeed");
+        assert_eq!(resolved, sysroot);
+        assert!(!called, "setup_fn must not run when lib/rustlib exists");
+
+        {
+            let _guard = crate::lock_test_env();
+            let prev_home = env::var_os("HOME");
+            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
+            unsafe {
+                env::set_var("HOME", &temp);
+                env::remove_var("ANNEAL_MIRI_SYSROOT");
+            }
+            let via_resolve = resolve_sysroot_path(None).expect("resolve_sysroot_path fast path");
+            unsafe {
+                if let Some(h) = prev_home {
+                    env::set_var("HOME", h);
+                } else {
+                    env::remove_var("HOME");
+                }
+                if let Some(s) = prev_sysroot {
+                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
+                } else {
+                    env::remove_var("ANNEAL_MIRI_SYSROOT");
+                }
+            }
+            assert_eq!(via_resolve, sysroot);
+        }
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_sysroot_auto_provisions_via_miri_setup_and_returns_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = unique_oracle_temp_dir("sysroot-autoprovision");
+        let fake_setup = temp.join("mock-cargo-miri-setup.sh");
+        fs::write(
+            &fake_setup,
+            "#!/usr/bin/env bash\n\
+             set -euo pipefail\n\
+             if [[ -z \"${MIRI_SYSROOT:-}\" ]]; then\n\
+               echo \"MIRI_SYSROOT missing\" >&2\n\
+               exit 1\n\
+             fi\n\
+             mkdir -p \"${MIRI_SYSROOT}/lib/rustlib\"\n\
+             printf '%s\\n' \"$*\" > \"${MIRI_SYSROOT}/setup_args.txt\"\n",
+        )
+        .expect("write mock setup script");
+        let mut perms = fs::metadata(&fake_setup).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_setup, perms).expect("chmod +x");
+
+        let expected_sysroot = temp.join(".cache/miri");
+        assert!(!expected_sysroot.join("lib/rustlib").exists());
+
+        {
+            let _guard = crate::lock_test_env();
+            let prev_home = env::var_os("HOME");
+            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
+            let prev_setup_bin = env::var_os(MIRI_SETUP_BIN_ENV);
+            unsafe {
+                env::set_var("HOME", &temp);
+                env::remove_var("ANNEAL_MIRI_SYSROOT");
+                env::set_var(MIRI_SETUP_BIN_ENV, &fake_setup);
+            }
+            let resolved = resolve_sysroot_path(None);
+            unsafe {
+                if let Some(h) = prev_home {
+                    env::set_var("HOME", h);
+                } else {
+                    env::remove_var("HOME");
+                }
+                if let Some(s) = prev_sysroot {
+                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
+                } else {
+                    env::remove_var("ANNEAL_MIRI_SYSROOT");
+                }
+                if let Some(b) = prev_setup_bin {
+                    env::set_var(MIRI_SETUP_BIN_ENV, b);
+                } else {
+                    env::remove_var(MIRI_SETUP_BIN_ENV);
+                }
+            }
+            let resolved = resolved.expect("auto-provision should succeed");
+            assert_eq!(resolved, expected_sysroot);
+        }
+
+        assert!(expected_sysroot.join("lib/rustlib").is_dir());
+        assert!(expected_sysroot.join(".setup.lock").is_file());
+        let recorded_args =
+            fs::read_to_string(expected_sysroot.join("setup_args.txt")).expect("read setup_args");
+        assert_eq!(recorded_args.trim(), "+nightly-2026-06-01 miri setup");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_sysroot_fails_closed_when_miri_setup_fails_or_leaves_rustlib_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = unique_oracle_temp_dir("sysroot-fail-closed");
+
+        // Case 1: `miri setup` exits non-zero.
+        let failing_script = temp.join("mock-failing-setup.sh");
+        fs::write(
+            &failing_script,
+            "#!/usr/bin/env bash\necho 'simulated rust-src missing error' >&2\nexit 17\n",
+        )
+        .expect("write failing script");
+        let mut perms = fs::metadata(&failing_script).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&failing_script, perms).expect("chmod");
+
+        {
+            let _guard = crate::lock_test_env();
+            let prev_home = env::var_os("HOME");
+            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
+            let prev_setup_bin = env::var_os(MIRI_SETUP_BIN_ENV);
+            unsafe {
+                env::set_var("HOME", &temp);
+                env::remove_var("ANNEAL_MIRI_SYSROOT");
+                env::set_var(MIRI_SETUP_BIN_ENV, &failing_script);
+            }
+            let res = resolve_sysroot_path(None);
+            unsafe {
+                if let Some(h) = prev_home {
+                    env::set_var("HOME", h);
+                } else {
+                    env::remove_var("HOME");
+                }
+                if let Some(s) = prev_sysroot {
+                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
+                } else {
+                    env::remove_var("ANNEAL_MIRI_SYSROOT");
+                }
+                if let Some(b) = prev_setup_bin {
+                    env::set_var(MIRI_SETUP_BIN_ENV, b);
+                } else {
+                    env::remove_var(MIRI_SETUP_BIN_ENV);
+                }
+            }
+            let err = res.expect_err("non-zero miri setup must fail closed");
+            assert!(
+                err.contains("Miri sysroot auto-provisioning failed")
+                    && err.contains("simulated rust-src missing error")
+                    && err.contains("missing Miri sysroot is a hard error"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // Case 2: `miri setup` exits 0 without populating `lib/rustlib`.
+        let empty_sysroot = temp.join("empty-after-setup");
+        let err_missing_rustlib =
+            ensure_miri_sysroot_initialized_with(&empty_sysroot, |_dir| Ok(()))
+                .expect_err("setup leaving lib/rustlib absent must fail closed");
+        assert!(
+            err_missing_rustlib.contains("lib/rustlib is still missing")
+                && err_missing_rustlib.contains("missing Miri sysroot is a hard error"),
+            "unexpected error: {err_missing_rustlib}"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn explicit_or_env_sysroot_missing_lib_rustlib_fails_closed_without_clobbering() {
+        let temp = unique_oracle_temp_dir("sysroot-explicit-strict");
+        let explicit_dir = temp.join("caller-explicit-sysroot");
+        fs::create_dir_all(&explicit_dir).expect("create explicit_dir");
+
+        let err_explicit = resolve_sysroot_path(Some(&explicit_dir))
+            .expect_err("explicit path without lib/rustlib must fail immediately");
+        assert!(
+            err_explicit.contains("explicit Miri sysroot is missing lib/rustlib"),
+            "unexpected error: {err_explicit}"
+        );
+        assert!(
+            !explicit_dir.join(".setup.lock").exists()
+                && !explicit_dir.join("lib/rustlib").exists(),
+            "explicit caller path must not be mutated or auto-provisioned"
+        );
+
+        let env_dir = temp.join("caller-env-sysroot");
+        fs::create_dir_all(&env_dir).expect("create env_dir");
+        {
+            let _guard = crate::lock_test_env();
+            let prev_sysroot = env::var_os("ANNEAL_MIRI_SYSROOT");
+            unsafe {
+                env::set_var("ANNEAL_MIRI_SYSROOT", &env_dir);
+            }
+            let res = resolve_sysroot_path(None);
+            unsafe {
+                if let Some(s) = prev_sysroot {
+                    env::set_var("ANNEAL_MIRI_SYSROOT", s);
+                } else {
+                    env::remove_var("ANNEAL_MIRI_SYSROOT");
+                }
+            }
+            let err_env = res.expect_err("ANNEAL_MIRI_SYSROOT without lib/rustlib must fail");
+            assert!(
+                err_env.contains("ANNEAL_MIRI_SYSROOT is missing lib/rustlib"),
+                "unexpected error: {err_env}"
+            );
+        }
+        assert!(
+            !env_dir.join(".setup.lock").exists() && !env_dir.join("lib/rustlib").exists(),
+            "ANNEAL_MIRI_SYSROOT path must not be mutated"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn concurrent_callers_serialize_on_setup_lock_and_provision_once() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::thread;
+        use std::time::Duration;
+
+        let temp = unique_oracle_temp_dir("sysroot-concurrent-lock");
+        let sysroot = Arc::new(temp.join(".cache/miri"));
+        let barrier = Arc::new(Barrier::new(4));
+        let setup_runs = Arc::new(AtomicUsize::new(0));
+        let active_in_setup = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_in_setup = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let sysroot = Arc::clone(&sysroot);
+            let barrier = Arc::clone(&barrier);
+            let setup_runs = Arc::clone(&setup_runs);
+            let active_in_setup = Arc::clone(&active_in_setup);
+            let max_concurrent_in_setup = Arc::clone(&max_concurrent_in_setup);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                ensure_miri_sysroot_initialized_with(&sysroot, |dir| {
+                    let cur = active_in_setup.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent_in_setup.fetch_max(cur, Ordering::SeqCst);
+                    setup_runs.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(40));
+                    fs::create_dir_all(dir.join("lib/rustlib"))
+                        .map_err(|e| format!("create lib/rustlib: {e}"))?;
+                    active_in_setup.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }));
+        }
+
+        for h in handles {
+            let path = h
+                .join()
+                .expect("join thread")
+                .expect("concurrent sysroot init");
+            assert_eq!(path, *sysroot);
+        }
+
+        assert_eq!(
+            setup_runs.load(Ordering::SeqCst),
+            1,
+            "second and subsequent callers must see lib/rustlib after acquiring .setup.lock"
+        );
+        assert_eq!(
+            max_concurrent_in_setup.load(Ordering::SeqCst),
+            1,
+            "advisory lock must serialize setup_fn execution"
+        );
+        assert!(sysroot.join(".setup.lock").is_file());
+        assert!(sysroot.join("lib/rustlib").is_dir());
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

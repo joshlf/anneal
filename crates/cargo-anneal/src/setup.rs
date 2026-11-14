@@ -229,7 +229,10 @@ pub(crate) fn install_at(
         )
     })?;
 
-    let staging_dir = parent_dir.join(format!(".staging-{}", std::process::id()));
+    static STAGING_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seq = STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging_dir = parent_dir.join(format!(".staging-{}-{seq}", std::process::id()));
     let _ = fs::remove_dir_all(&staging_dir);
     fs::create_dir_all(&staging_dir).map_err(|err| {
         format!(
@@ -297,18 +300,21 @@ pub(crate) fn install_at(
     {
         tar_cmd.arg("--zstd");
     }
-    let tar_status = tar_cmd
+    let tar_out = tar_cmd
         .arg("-xf")
         .arg(&archive_path)
         .arg("-C")
         .arg(&extract_dir)
-        .status()
+        .output()
         .map_err(|err| format!("failed to execute `tar -xf`: {err}"))?;
-    if !tar_status.success() {
+    if !tar_out.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_out.stderr);
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(format!(
-            "tar extraction failed with status {tar_status} for {}",
-            archive_path.display()
+            "tar extraction failed with status {} for {}: {}",
+            tar_out.status,
+            archive_path.display(),
+            stderr.trim()
         ));
     }
 
