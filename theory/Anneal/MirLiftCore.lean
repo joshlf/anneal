@@ -7324,10 +7324,10 @@ open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Anneal.Rustc.V2026_06_01.Lower
 
 /-!
-## 12. Kleene Fuel Order, Header-Targeted `runToTarget` / `runMirToBlock`, and Structural Loop Lifting
+### Kleene Fuel Order, Header-Targeted `runToTarget` / `runMirToBlock`, and Structural Loop Lifting
 -/
 
-/-! ### 12A. Generic Deterministic Small-Step Machine and the Kleene Fuel Order -/
+/-! #### Generic Deterministic Small-Step Machine and the Kleene Fuel Order -/
 
 /-- Outcome of one deterministic small step. -/
 inductive Step (σ α : Type) where
@@ -7497,7 +7497,7 @@ theorem StepsTo.mono {σ α : Type} {step : σ → Step σ α} {s : σ}
     (h : StepsTo step s mid₁) : StepsTo step s mid₂ :=
   h.trans (fun s₁ hm => StepsTo.refl (himp s₁ hm))
 
-/-! ### 12B. Header-Targeted Stepping (`TargetOutcome`, `FirstHitIn`, `runToTarget`) -/
+/-! #### Header-Targeted Stepping (`TargetOutcome`, `FirstHitIn`, `runToTarget`) -/
 
 /-- Outcome of a header-targeted segment run. The four outcomes are pairwise
 distinct constructors: reaching the target, halting, getting stuck, and running
@@ -7811,7 +7811,7 @@ theorem runToTarget_of_firstHitIn {σ α : Type} {step : σ → Step σ α}
     unfold runToTarget; rw [hs]
     exact runUntilTarget_of_firstHitIn (.later hs hnt hrest) _ hs bound hle
 
-/-! ### 12C. Structural `[lo, hi)` Range Loops (`forRangeUpAux`, `PureMirExec.forRangeUp`, `wpConverges_forRangeUp`) -/
+/-! #### Structural `[lo, hi)` Range Loops (`forRangeUpAux`, `PureMirExec.forRangeUp`, `wpConverges_forRangeUp`, `stepsTo_forRangeUp`) -/
 
 /-- Structural range fold over `[i, hi)` indexed by the remaining trip count. -/
 def forRangeUpAux {α : Type} (lo hi : Nat)
@@ -7899,7 +7899,39 @@ theorem wpConverges_forRangeUp {σ out α : Type} (stepOp : σ → Step σ out)
   simp only [hle, ↓reduceDIte] at hexit
   exact wpConverges_forRangeUpAux stepOp lo hi f inv post lo (hi - lo) _ _ init s₀ hinit hiter hexit
 
-/-! ### 12D. Live `CapturedMir` Small-Step Embedding (`mirStep`) & Header-Targeted `runMirToBlock` -/
+theorem stepsTo_forRangeUpAux {σ out α : Type} (stepOp : σ → Step σ out)
+    (lo hi : Nat) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → σ → Prop) :
+    ∀ (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (a : α) (s : σ),
+      inv i a s →
+      (∀ j (hjlo : lo ≤ j) (hjlt : j < hi) acc s₀,
+        inv j acc s₀ → StepsTo stepOp s₀ (inv (j + 1) (f j hjlo hjlt acc))) →
+      StepsTo stepOp s (inv hi (forRangeUpAux lo hi f i rem hlo hsum a))
+  | i, 0, _, hsum, _, s, hinv, _ => by
+    have hi_eq : i = hi := by omega
+    subst hi_eq
+    exact StepsTo.refl hinv
+  | i, rem + 1, hlo, hsum, a, s, hinv, hiter => by
+    have hlt : i < hi := by omega
+    exact (hiter i hlo hlt a s hinv).trans (fun s₁ hinv₁ =>
+      stepsTo_forRangeUpAux stepOp lo hi f inv (i + 1) rem _ _ (f i hlo hlt a) s₁ hinv₁ hiter)
+
+/-- **Fuel-free range loop as a segment (`StepsTo`)**: unlike
+`wpConverges_forRangeUp`, which ends the program, this rule reaches the loop
+*exit state* `inv hi (forRangeUp lo hi init f)` as an intermediate segment, so a
+loop can sit inside another loop's iteration (nested loops) or be followed by
+further `StepsTo` segments, still with no step count or fuel numeral. -/
+theorem stepsTo_forRangeUp {σ out α : Type} (stepOp : σ → Step σ out)
+    (lo hi : Nat) (init : α) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → σ → Prop) (s₀ : σ) (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
+      inv i a s → StepsTo stepOp s (inv (i + 1) (f i hlo hlt a))) :
+    StepsTo stepOp s₀ (inv hi (PureMirExec.forRangeUp lo hi init f)) := by
+  unfold PureMirExec.forRangeUp
+  simp only [hle, ↓reduceDIte]
+  exact stepsTo_forRangeUpAux stepOp lo hi f inv lo (hi - lo) _ _ init s₀ hinit hiter
+
+/-! #### Live `CapturedMir` Small-Step Embedding (`mirStep`) & Header-Targeted `runMirToBlock` -/
 
 /-- Embedding of the live trusted step function `stepMirFn` into the generic
 machine. Both silent `.tau` transitions and `MirObsE` observation steps
@@ -8100,6 +8132,24 @@ theorem mirNoCallWpConverges_of_stepsTo_bind {body : CapturedMir} {s : MachineSt
 and terminators of the body (one live step each). -/
 def mirSegmentBound (body : CapturedMir) : Nat :=
   body.basicBlocks.foldl (fun acc bb => acc + bb.statements.length + 1) 0
+
+theorem mirSegmentBound_foldl_ge (l : List BasicBlockData) :
+    ∀ a : Nat, a + l.length ≤ l.foldl (fun acc bb => acc + bb.statements.length + 1) a := by
+  induction l with
+  | nil => intro a; exact Nat.le_refl a
+  | cons bb rest ih =>
+    intro a
+    refine Nat.le_trans ?_ (ih (a + bb.statements.length + 1))
+    rw [List.length_cons]
+    omega
+
+/-- The live ceiling is derived from the CFG: it is at least the number of basic
+blocks (`body.basicBlocks.length`), plus one step per statement. -/
+theorem basicBlocks_length_le_mirSegmentBound (body : CapturedMir) :
+    body.basicBlocks.length ≤ mirSegmentBound body := by
+  have h := mirSegmentBound_foldl_ge body.basicBlocks 0
+  rw [Nat.zero_add] at h
+  exact h
 
 /-- Header-targeted stepping over live MIR: takes one mandatory step and stops
 at the first statement of basic block `target`. -/
@@ -11292,6 +11342,112 @@ theorem inferMinFragment_selfLoop :
   rw [inferMinFragment_toMirShape]
   rfl
 
+/-- Nested `[0, n) × [0, m)` loops over slots `[n, m, i, j, acc]`: the outer header
+`bb1` and the inner header `bb3` are distinct re-entrant blocks. -/
+def nestedLoopCfg : List Instr :=
+  [ .setConst 2 0 1,
+    .branchLt 2 0 2 7,
+    .setConst 3 0 3,
+    .branchLt 3 1 4 6,
+    .addConst 4 4 1 5,
+    .addConst 3 3 1 3,
+    .addConst 2 2 1 1,
+    .ret 4 ]
+
+/-- Outer header to inner header (`bb1 -> bb2 -> bb3`, resetting `j`). -/
+theorem nestedLoop_outer_to_inner (n m i j acc : Nat) (hi : i < n) :
+    MirLiftCore.runCfgToBlock nestedLoopCfg 3 ⟨1, [n, m, i, j, acc]⟩ =
+      .reached ⟨3, [n, m, i, 0, acc]⟩ := by
+  have h1 : stepCfg nestedLoopCfg ⟨1, [n, m, i, j, acc]⟩ = .cont ⟨2, [n, m, i, j, acc]⟩ := by
+    simp [stepCfg, nestedLoopCfg, hi]
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, h1]
+  rfl
+
+/-- One inner iteration (`bb3 -> bb4 -> bb5 -> bb3`). -/
+theorem nestedLoop_inner_iter (n m i j acc : Nat) (hj : j < m) :
+    MirLiftCore.runCfgToBlock nestedLoopCfg 3 ⟨3, [n, m, i, j, acc]⟩ =
+      .reached ⟨3, [n, m, i, j + 1, acc + 1]⟩ := by
+  have h1 : stepCfg nestedLoopCfg ⟨3, [n, m, i, j, acc]⟩ = .cont ⟨4, [n, m, i, j, acc]⟩ := by
+    simp [stepCfg, nestedLoopCfg, hj]
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, h1]
+  rfl
+
+/-- Inner exit back to the outer header (`bb3 -> bb6 -> bb1`). -/
+theorem nestedLoop_inner_to_outer (n m i acc : Nat) :
+    MirLiftCore.runCfgToBlock nestedLoopCfg 1 ⟨3, [n, m, i, m, acc]⟩ =
+      .reached ⟨1, [n, m, i + 1, m, acc]⟩ := by
+  have h1 : stepCfg nestedLoopCfg ⟨3, [n, m, i, m, acc]⟩ = .cont ⟨6, [n, m, i, m, acc]⟩ := by
+    simp [stepCfg, nestedLoopCfg]
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, h1]
+  rfl
+
+/-- Outer exit (`bb1 -> bb7 -> return`). -/
+theorem nestedLoop_exit (n m j acc : Nat) :
+    MirLiftCore.runCfgToBlock nestedLoopCfg 1 ⟨1, [n, m, n, j, acc]⟩ = .halted acc := by
+  have h1 : stepCfg nestedLoopCfg ⟨1, [n, m, n, j, acc]⟩ = .cont ⟨7, [n, m, n, j, acc]⟩ := by
+    simp [stepCfg, nestedLoopCfg]
+  simp only [MirLiftCore.runCfgToBlock, runToTarget, h1]
+  rfl
+
+/-- **Fuel-free total correctness of nested loops for all symbolic bounds**: the
+outer `[0, n)` loop (`wpConverges_forRangeUp`) contains the inner `[0, m)` loop as a
+segment (`stepsTo_forRangeUp`), with header-to-header `runCfgToBlock` segments and
+arbitrary initial junk in both counters; no step count or fuel numeral appears. -/
+theorem nestedLoop_wpConverges_all (n m x i₀ j₀ : Nat) :
+    WpConverges (stepCfg nestedLoopCfg) ⟨0, [n, m, i₀, j₀, x]⟩ (fun v => v = x + n * m) := by
+  have hfold : PureMirExec.forRangeUp 0 n x (fun _ _ _ acc => acc + m) = x + n * m :=
+    PureMirExec.forRangeUp_induction 0 n x (fun _ _ _ acc => acc + m) (fun i acc => acc = x + i * m)
+      (Nat.zero_le n) (by simp) (fun i _ _ a h => by rw [h, Nat.succ_mul, Nat.add_assoc])
+  refine StepsTo.bind_wp (mid := fun s => s = ⟨1, [n, m, 0, j₀, x]⟩) ?_ (fun s₁ hs₁ => ?_)
+  · exact StepsTo.step rfl (StepsTo.refl rfl)
+  subst hs₁
+  refine wpConverges_forRangeUp (stepCfg nestedLoopCfg) 0 n x (fun _ _ _ acc => acc + m)
+    (fun i acc s => ∃ j, s = ⟨1, [n, m, i, j, acc]⟩) ⟨1, [n, m, 0, j₀, x]⟩ (fun v => v = x + n * m)
+    (Nat.zero_le n) ⟨j₀, rfl⟩ ?_ ?_
+  · intro i _ hlt acc s ⟨j, hs⟩
+    subst hs
+    refine (stepsTo_of_runCfgToBlock_reached (nestedLoop_outer_to_inner n m i j acc hlt)).trans
+      (fun s₁ hs₁ => ?_)
+    subst hs₁
+    have hinner := stepsTo_forRangeUp (stepCfg nestedLoopCfg) 0 m acc (fun _ _ _ a => a + 1)
+      (fun j a s => s = ⟨3, [n, m, i, j, a]⟩) ⟨3, [n, m, i, 0, acc]⟩ (Nat.zero_le m) rfl
+      (fun j _ hj a s hs => by
+        subst hs
+        exact (stepsTo_of_runCfgToBlock_reached (nestedLoop_inner_iter n m i j a hj)).mono
+          (fun _ h => h))
+    have hinner_fold : PureMirExec.forRangeUp 0 m acc (fun _ _ _ a => a + 1) = acc + m :=
+      PureMirExec.forRangeUp_induction 0 m acc (fun _ _ _ a => a + 1) (fun j a => a = acc + j)
+        (Nat.zero_le m) rfl (fun j _ _ a h => by rw [h, Nat.add_assoc])
+    rw [hinner_fold] at hinner
+    refine hinner.trans (fun s₂ hs₂ => ?_)
+    subst hs₂
+    exact (stepsTo_of_runCfgToBlock_reached (nestedLoop_inner_to_outer n m i (acc + m))).mono
+      (fun _ h => ⟨m, h⟩)
+  · intro s_exit ⟨j, hs⟩
+    rw [hfold] at hs
+    subst hs
+    exact wpConverges_of_runCfgToBlock_halted (nestedLoop_exit n m j (x + n * m)) rfl
+
+theorem inferMinFragment_nestedLoop :
+    inferMinFragment (toMirShape nestedLoopCfg) = .pureBoundedLoop := by
+  rw [inferMinFragment_toMirShape]
+  rfl
+
+/-- **Live-MIR range loop as a segment (`MirStepsConverges`)**, stated with the live
+`Anneal.MirLoops.forRangeUp`: the building block for nested loops over live
+`CapturedMir` bodies. -/
+theorem mirStepsConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α) (inv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState) (post : MirOutcome → Prop) (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
+      inv i a s → StepsTo (mirStep body) s (inv (i + 1) (f i hlo hlt a))) :
+    Anneal.MirFuelFree.MirStepsConverges body s₀
+      (inv hi (Anneal.MirLoops.forRangeUp lo hi init f)) post := by
+  have h := stepsTo_forRangeUp (mirStep body) lo hi init f inv s₀ hle hinit hiter
+  change StepsTo (mirStep body) s₀ (inv hi (MirLiftCore.forRangeUp lo hi init f)) at h
+  rw [forRangeUp_eq_live] at h
+  exact mirStepsConverges_of_stepsTo h
+
 /-- **Fuel-free range-loop rule for live MIR**, stated with the live
 `Anneal.MirLoops.forRangeUp`. -/
 protected theorem mirWpConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : Nat) (init : α)
@@ -12315,10 +12471,10 @@ Loop-carried staging-temporary MIR body (`countToNWithTempBody n`, 3 locals:
 - `bb3` (exit): `StorageDead(_2); _0 = Copy(_1); return_`
 
 Because `_2` is `.uninit` upon initial entry to `bb1` (`i = 0`) and
-`.init (.scalar ⟨i, 4⟩)` upon every subsequent re-entry (`i > 0`), no single
-fixed-slot expression `countToNPureState 1 0 i` matches both `i = 0` and `i > 0`;
-instead, the relational header invariant `∃ s₂ : LocalSlot, s₂ ≠ .dead ∧ ...`
-discharges entry, iteration, and exit uniformly.
+`.init (.scalar ⟨i, 4⟩)` upon every subsequent re-entry (`i > 0`), an exact
+header state would need a case split on `i = 0` inside `stateAt`; the relational
+header invariant `∃ s₂ : LocalSlot, s₂ ≠ .dead ∧ ...` instead discharges entry,
+iteration, and exit uniformly.
 -/
 def countToNWithTempBody (n : Nat) : CapturedMir :=
   Anneal.MirLoops.mkMirBody "Anneal::MirLiftCore::count_to_n_with_temp" 1
