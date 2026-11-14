@@ -1291,6 +1291,29 @@ theorem scalarValidRange_decode_rejects_out_of_range
       (fun x => wrappingRangeContains range x.val) hBase hOut]
   rfl
 
+/--
+A surjective `scalarValidRange` decoder carries only a trivial niche: if every fully-initialized
+`sz`-byte window decodes, then `range` contains every `sz`-byte bit pattern. Contrapositively, any
+genuine niche (such as `NonZeroU8` `⟨1, 255⟩` excluding `0`) makes `scalarValidRange` non-surjective.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem scalarValidRange_contains_of_isSurjectiveInitDecoder
+    {sz : Nat} {hNz : 0 < sz} {range : WrappingRange}
+    (hSurj : (scalarValidRange sz hNz range).IsSurjectiveInitDecoder)
+    (bits : Nat) (hLt : bits < 2 ^ (8 * sz)) :
+    wrappingRangeContains range bits = true := by
+  cases hIn : wrappingRangeContains range bits with
+  | true => rfl
+  | false =>
+    obtain ⟨x, hx⟩ := hSurj (encodeLittleEndianBytes bits sz none)
+      (length_encodeLittleEndianBytes none sz bits)
+      (allBytesInitialized_encodeLittleEndianBytes none sz bits)
+    rw [scalarValidRange_decode_rejects_out_of_range sz hNz range hLt hIn] at hx
+    nomatch hx
+
 /-- Kernel-reducing predicate classifying non-pointer `PrimitiveKind`s (`.int` and `.float`)
 that decode to `Value.scalar` in `decodeScalarLayoutBytes`.
 
@@ -7665,7 +7688,16 @@ theorem decodeAt_isSome_of_initAt :
 
 end PlacedCodecSpine
 
-/-! ### Trusted Tuple-Field Bridges (`TupleFieldCodec`, `TupleFieldCodecs`) -/
+/-! ### Trusted Tuple-Field Bridges (`TupleFieldCodec`, `TupleFieldCodecs`)
+
+A `TupleFieldCodec layouts k c` exists only for field kinds with a structural byte size
+(`rigidTyKindByteSize k = some n`: integers, `bool`, `char`, `()`, pointers, arrays), never for ADT
+kinds (`TupleFieldCodec.not_adt`). The windows it accepts are fixed by `k`
+(`TupleFieldCodec.decode_isSome_of_sameKind`): integer-kind fields are niche-blind
+(`TupleFieldCodec.uint_isSurjectiveInitDecoder`, `TupleFieldCodec.int_isSurjectiveInitDecoder`), so
+`NonZero*` niche codecs cannot be tuple fields
+(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`), whereas `.bool` enforces its niche.
+-/
 
 /--
 Fuel at which Trusted's `encodeValueToBytes` / `decodeValueFromBytes` recurse into the fields of a
@@ -8030,6 +8062,141 @@ def int (layouts : LayoutTable) (w : IntTy) :
         rw [← hBs]
         exact (encodeLittleEndianBytes_mod_two_pow none _ sv.bits).symm
   decode_eq_map := (MirValueCodec.int layouts w 0).decode_eq_map
+
+/--
+**Acceptance is fixed by the field kind**: two `TupleFieldCodec`s at the same kind `k` bridge the
+same Trusted field decode (`decodeValueFromBytes tupleFieldFuel layouts { kind := k, layoutIdx := 0 }`),
+so every window accepted by `c₀` is accepted by `c` (and symmetrically). Choosing a different byte
+codec for a tuple field can never add or remove a niche.
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem decode_isSome_of_sameKind {layouts : LayoutTable} {k : RigidTy} {α β : Type} {n m : Nat}
+    {c₀ : FixedByteCodec α n} {c : FixedByteCodec β m}
+    (fc₀ : TupleFieldCodec layouts k c₀) (fc : TupleFieldCodec layouts k c)
+    (bs : List AbstractByte) (h₀ : ∃ x, c₀.decode bs = some x) :
+    ∃ y, c.decode bs = some y := by
+  obtain ⟨x, hx⟩ := h₀
+  have hEq := (fc₀.decode_eq_map bs).symm.trans (fc.decode_eq_map bs)
+  rw [hx] at hEq
+  cases hC : c.decode bs with
+  | none =>
+    rw [hC] at hEq
+    nomatch hEq
+  | some y => exact ⟨y, rfl⟩
+
+/--
+A `TupleFieldCodec` at a kind that also carries a surjective reference `TupleFieldCodec` is itself
+surjective on fully-initialized windows (byte widths agree through `kindSize_eq`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem isSurjectiveInitDecoder_of_sameKind {layouts : LayoutTable} {k : RigidTy} {α β : Type}
+    {n m : Nat} {c₀ : FixedByteCodec α n} {c : FixedByteCodec β m}
+    (fc₀ : TupleFieldCodec layouts k c₀) (hSurj₀ : c₀.IsSurjectiveInitDecoder)
+    (fc : TupleFieldCodec layouts k c) :
+    c.IsSurjectiveInitDecoder := by
+  intro bs hLen hInit
+  have hNm : m = n := Option.some.inj (fc.kindSize_eq.symm.trans fc₀.kindSize_eq)
+  exact decode_isSome_of_sameKind fc₀ fc bs (hSurj₀ bs (hLen.trans hNm) hInit)
+
+/--
+Every unsigned-integer tuple field codec is surjective on fully-initialized windows: Trusted's typed
+`.uint w` field decode enforces no niche (`TupleFieldCodec.uint` bridges it to `uintBitsLE`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem uint_isSurjectiveInitDecoder {layouts : LayoutTable} {w : UintTy} {α : Type} {n : Nat}
+    {c : FixedByteCodec α n} (fc : TupleFieldCodec layouts (.uint w) c) :
+    c.IsSurjectiveInitDecoder :=
+  isSurjectiveInitDecoder_of_sameKind (uint layouts w)
+    (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ (MirValueCodec.uintByteSize_pos w)) fc
+
+/--
+Every signed-integer tuple field codec is surjective on fully-initialized windows: Trusted's typed
+`.int w` field decode enforces no niche (`TupleFieldCodec.int` bridges it to `uintBitsLE`).
+
+Kind: helper
+Witness: universal
+Assumes: S0
+-/
+theorem int_isSurjectiveInitDecoder {layouts : LayoutTable} {w : IntTy} {α : Type} {n : Nat}
+    {c : FixedByteCodec α n} (fc : TupleFieldCodec layouts (.int w) c) :
+    c.IsSurjectiveInitDecoder :=
+  isSurjectiveInitDecoder_of_sameKind (int layouts w)
+    (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ (MirValueCodec.intByteSize_pos w)) fc
+
+/--
+**No niche-enforcing unsigned-integer tuple field**: a `FixedByteCodec.scalarValidRange n hNz range`
+whose `range` excludes some `n`-byte bit pattern (e.g. `NonZeroU8` `⟨1, 255⟩`, which excludes `0`)
+admits no `TupleFieldCodec` at `.uint w`. Consequently a `scalarValidRange` niche field can never
+reach `MirValueCodec.ofPlacedCodecSpine` / `adtOfPlacedCodecSpine` through an integer field kind,
+whatever `AdtDecodeFallbackSound` / `FieldLayoutsDecodeSound` proof is available for it. Scalar-niche
+newtypes are modeled by `MirValueCodec.scalarNicheNewtypeNonPtr` at `.adt defPath []` instead; the
+type-argument path `.adt defPath [.uint w]` is niche-blind as well
+(`MirValueCodec.monomorphized_nonZero_u32_forces_hasZeroValid`).
+
+Kind: helper
+Witness: negative
+Assumes: S0
+-/
+theorem uint_not_scalarValidRange_of_out_of_range (layouts : LayoutTable) (w : UintTy)
+    {n : Nat} (hNz : 0 < n) (range : WrappingRange) {bits : Nat}
+    (hLt : bits < 2 ^ (8 * n)) (hOut : wrappingRangeContains range bits = false) :
+    ¬ Nonempty (TupleFieldCodec layouts (.uint w) (FixedByteCodec.scalarValidRange n hNz range)) :=
+  fun ⟨fc⟩ => nomatch hOut.symm.trans
+    (FixedByteCodec.scalarValidRange_contains_of_isSurjectiveInitDecoder
+      (uint_isSurjectiveInitDecoder fc) bits hLt)
+
+/--
+**No niche-enforcing signed-integer tuple field**: the `.int w` analogue of
+`uint_not_scalarValidRange_of_out_of_range` (e.g. `NonZeroI32` excluding `0`).
+
+Kind: helper
+Witness: negative
+Assumes: S0
+-/
+theorem int_not_scalarValidRange_of_out_of_range (layouts : LayoutTable) (w : IntTy)
+    {n : Nat} (hNz : 0 < n) (range : WrappingRange) {bits : Nat}
+    (hLt : bits < 2 ^ (8 * n)) (hOut : wrappingRangeContains range bits = false) :
+    ¬ Nonempty (TupleFieldCodec layouts (.int w) (FixedByteCodec.scalarValidRange n hNz range)) :=
+  fun ⟨fc⟩ => nomatch hOut.symm.trans
+    (FixedByteCodec.scalarValidRange_contains_of_isSurjectiveInitDecoder
+      (int_isSurjectiveInitDecoder fc) bits hLt)
+
+/--
+No tuple field exists at a kind without a structural byte size (`rigidTyKindByteSize k = none`):
+`kindSize_eq` would force `none = some n`.
+
+Kind: helper
+Witness: negative
+Assumes: S0
+-/
+theorem not_of_kindSize_none {layouts : LayoutTable} {k : RigidTy}
+    (hk : rigidTyKindByteSize k = none) {α : Type} {n : Nat} (c : FixedByteCodec α n) :
+    ¬ Nonempty (TupleFieldCodec layouts k c) :=
+  fun ⟨fc⟩ => nomatch hk.symm.trans fc.kindSize_eq
+
+/--
+**ADT-kind fields have no `TupleFieldCodec`** (`rigidTyKindByteSize (.adt defPath args) = none`), so
+`MirValueCodec.ofPlacedCodecSpine` / `adtOfPlacedCodecSpine` cover structs whose fields have
+primitive, array, or unit kinds only; nested ADT fields (user structs, `Option<T>`, `NonZero*`) need a
+dedicated constructor.
+
+Kind: helper
+Witness: negative
+Assumes: S0
+-/
+theorem not_adt (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
+    {α : Type} {n : Nat} (c : FixedByteCodec α n) :
+    ¬ Nonempty (TupleFieldCodec layouts (.adt defPath args) c) :=
+  not_of_kindSize_none rfl c
 
 /-- `TupleFieldCodec` for a unit field `()` (`FixedByteCodec.unit`, a 1-ZST). -/
 def unit (layouts : LayoutTable) : TupleFieldCodec layouts (.tuple []) FixedByteCodec.unit where
@@ -9028,6 +9195,13 @@ and float scalar niches (such as `NonZeroU8` `1 ..= 255` or `NonZeroU32` `1 ..= 
 discharging the `hAccept` obligation of `AdtDecodeFallbackSound.of_scalar`,
 `AdtDecodeFallbackSound.of_scalarPair`, and `FieldLayoutsDecodeSound.cons_primitive_scalar`.
 
+**Scope (fallback level only)**: this discharges fallback soundness for a spine whose field codec is
+`scalarValidRange`, but an ADT codec built by `adtOfPlacedCodecSpine` also needs a `TupleFieldCodec`
+for that field, and a genuine integer niche has none: `.uint w` / `.int w` fields are niche-blind
+(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`,
+`TupleFieldCodec.int_not_scalarValidRange_of_out_of_range`) and ADT kinds carry no structural size
+(`TupleFieldCodec.not_adt`). End-to-end `NonZero*` codecs use `MirValueCodec.scalarNicheNewtypeNonPtr`.
+
 Kind: helper
 Witness: universal
 Assumes: S0
@@ -9114,6 +9288,9 @@ Unlike `l.fieldLayouts = []` (where Trusted falls back to `decodeFieldsBySpan`),
 populated `l.fieldLayouts` satisfying `FieldLayoutsDecodeSound` enforces per-field niche invariants
 (such as `bool` `0 ..= 1` or `NonZero*` `1 ..= MAX`) inside `adtDecodeFallback`, so
 `AdtDecodeFallbackSound` holds for both in-order and reordered structs with niche fields!
+(Only fallback soundness: combined with `adtOfPlacedCodecSpine`, every field also needs a
+`TupleFieldCodec`, which exists for `bool` but not for integer niches such as `NonZero*`; see
+`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`.)
 -/
 inductive FieldLayoutsDecodeSound (layouts : LayoutTable) :
     {αs : List Type} → PlacedCodecSpine αs → List LayoutIdx → Prop where
@@ -9327,6 +9504,11 @@ theorem FieldLayoutsDecodeSound.cons_primitive_scalar
 Ready-made `FieldLayoutsDecodeSound` step for `FixedByteCodec.scalarValidRange p.2.size hNz range`
 paired with its `.primitive` non-pointer scalar-niche `TypeLayout`
 (`fl.backendRepr = .scalar (.initialized pk range)`).
+
+This is a fallback-level fact only: when `range` excludes some bit pattern (a genuine niche such as
+`NonZero*`), the field has no `TupleFieldCodec` at `.uint w` / `.int w` / `.adt _ _`
+(`TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range`, `TupleFieldCodec.not_adt`), so the step
+cannot complete an `adtOfPlacedCodecSpine` codec for such a field.
 
 Kind: helper
 Witness: universal

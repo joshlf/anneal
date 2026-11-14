@@ -1652,7 +1652,7 @@ Exercises:
 1. `TupleFieldCodec.int` (signed `i32` field in a struct/tuple);
 2. `FieldLayoutsDecodeSound.cons_zst_unit` (0-byte ZST `()` / `PhantomData<T>` field in `fieldLayouts`);
 3. `FieldLayoutsDecodeSound.cons_primitive_scalar` / `cons_primitive_bool` alongside `cons_primitive_surjective` and `cons_zst_unit` on a reordered 3-field struct (`i32 @ 0`, `bool @ 4`, `() @ 5`, total size `5`, `fieldLayouts = [1, 2, 3]`);
-4. `MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes` on a non-boolean scalar niche (`NonZeroU8` range `⟨1, 255⟩`).
+4. `MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes` on a non-boolean scalar niche (`NonZeroU8` range `⟨1, 255⟩`) at the fallback level only (`[adv ep1-B4]`: that spine has no `TupleFieldCodecs`, see `nonZeroU8Newtype_no_tupleFieldCodecs`).
 -/
 
 def i32PrimitiveFieldLayout : TypeLayout :=
@@ -1744,6 +1744,8 @@ theorem boolI32UnitWithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromByt
 /--
 Non-boolean scalar niche acceptance: `NonZeroU8` (`range = ⟨1, 255⟩`) newtype `.scalar` fallback
 soundness discharged directly by `MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes`.
+This is a fallback-level fact only: `nonZeroU8NewtypePlaced` has no `TupleFieldCodecs`
+(`nonZeroU8Newtype_no_tupleFieldCodecs`), so it cannot complete an `adtOfPlacedCodecSpine` codec.
 -/
 def nonZeroU8NewtypeLayout : TypeLayout :=
   { size := ⟨1⟩, align := ⟨1⟩,
@@ -1754,13 +1756,119 @@ def nonZeroU8NewtypePlaced :
     PlacedCodecSpine [{ bits : Nat // bits < 2 ^ (8 * 1) ∧ wrappingRangeContains ⟨1, 255⟩ bits = true }] :=
   .cons (0, ⟨1, 1⟩) (FixedByteCodec.scalarValidRange 1 (by decide) ⟨1, 255⟩) .nil
 
-/-- `AdtDecodeFallbackSound.of_scalar` for `NonZeroU8` via `scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes`. -/
+/-- `AdtDecodeFallbackSound.of_scalar` for `NonZeroU8` via `scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes`
+(fallback level only; see `nonZeroU8Newtype_no_tupleFieldCodecs`). -/
 theorem nonZeroU8Newtype_fallbackSound (layouts : LayoutTable) :
     MirValueCodec.AdtDecodeFallbackSound layouts nonZeroU8NewtypeLayout 0 nonZeroU8NewtypePlaced 1 :=
   MirValueCodec.AdtDecodeFallbackSound.of_scalar rfl rfl rfl
     (fun slice _ h =>
       MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes
         (.int 8 false) ⟨1, 255⟩ 1 (by decide) rfl rfl slice h)
+
+/-! ### `[adv ep1-B4]` Integer Niches (`NonZero*`) Have No `TupleFieldCodec`
+
+`nonZeroU8Newtype_fallbackSound` holds, but the `scalarValidRange` spine `nonZeroU8NewtypePlaced`
+admits no `TupleFieldCodecs` at `[.uint .u8]` (Trusted's typed integer decode is niche-blind:
+`TupleFieldCodec.uint_isSurjectiveInitDecoder`) nor at any ADT kind (no structural byte size:
+`TupleFieldCodec.not_adt`), so it can never complete an `adtOfPlacedCodecSpine` codec. At the Trusted
+level the type-argument path `.adt "NonZeroU8" [.uint .u8]` accepts `0x00`, while the
+niche-enforcing `.adt "NonZeroU8" []` path rejects it (the supported end-to-end route is
+`MirValueCodec.scalarNicheNewtypeNonPtr`). `bool` is the contrast case: its kind enforces the niche.
+-/
+
+def nonZeroU8NewtypeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [nonZeroU8NewtypeLayout] }
+
+/-- The type-argument decode path `.adt "NonZeroU8" [.uint .u8]` accepts `0x00` (niche bypassed). -/
+theorem nonZeroU8Newtype_typeArg_path_accepts_zero :
+    decodeValueFromBytes defaultCodecFuel nonZeroU8NewtypeLayouts
+        { kind := .adt "NonZeroU8" [.uint .u8], layoutIdx := 0 } [.init (UInt8.ofNat 0) none] =
+      some (.aggregate 0 [.scalar ⟨0, 1⟩]) := rfl
+
+/-- The niche-enforcing decode path `.adt "NonZeroU8" []` rejects `0x00`. -/
+theorem nonZeroU8Newtype_niche_path_rejects_zero :
+    decodeValueFromBytes defaultCodecFuel nonZeroU8NewtypeLayouts
+        { kind := .adt "NonZeroU8" [], layoutIdx := 0 } [.init (UInt8.ofNat 0) none] = none := rfl
+
+/-- No `TupleFieldCodec` at `.uint .u8` for the `NonZeroU8` niche codec (`0 ∉ ⟨1, 255⟩`). -/
+theorem nonZeroU8_no_uint_tupleFieldCodec (layouts : LayoutTable) :
+    ¬ Nonempty (TupleFieldCodec layouts (.uint .u8)
+      (FixedByteCodec.scalarValidRange 1 (by decide) ⟨1, 255⟩)) :=
+  TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range layouts .u8 (by decide) ⟨1, 255⟩
+    (bits := 0) (by decide) rfl
+
+/-- `nonZeroU8NewtypePlaced` admits no `TupleFieldCodecs` at `[.uint .u8]` nor at any ADT kind. -/
+theorem nonZeroU8Newtype_no_tupleFieldCodecs (layouts : LayoutTable) (k : RigidTy)
+    (hk : k = .uint .u8 ∨ ∃ defPath args, k = .adt defPath args) :
+    ¬ Nonempty (TupleFieldCodecs layouts [k] nonZeroU8NewtypePlaced) := by
+  intro ⟨fcs⟩
+  cases fcs with
+  | cons f _ =>
+    rcases hk with rfl | ⟨defPath, args, rfl⟩
+    · exact nonZeroU8_no_uint_tupleFieldCodec layouts ⟨f⟩
+    · exact TupleFieldCodec.not_adt layouts defPath args _ ⟨f⟩
+
+/-- `TupleFieldCodec.u8` and `TupleFieldCodec.uint .u8` accept the same windows (acceptance is fixed by kind). -/
+theorem u8_uint_same_acceptance (layouts : LayoutTable) (bs : List AbstractByte) :
+    (∃ x, FixedByteCodec.u8.decode bs = some x) →
+      ∃ y, (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u8)
+        (MirValueCodec.uintByteSize_pos .u8)).decode bs = some y :=
+  TupleFieldCodec.decode_isSome_of_sameKind (TupleFieldCodec.u8 layouts)
+    (TupleFieldCodec.uint layouts .u8) bs
+
+/-- Contrast: the `.bool` kind enforces its niche, so a non-surjective `TupleFieldCodec` exists there. -/
+theorem bool_tupleFieldCodec_niche_enforcing (layouts : LayoutTable) :
+    ¬ FixedByteCodec.boolByte.IsSurjectiveInitDecoder ∧
+      Nonempty (TupleFieldCodec layouts .bool FixedByteCodec.boolByte) :=
+  ⟨FixedByteCodec.boolByte_not_isSurjectiveInitDecoder, ⟨TupleFieldCodec.bool layouts⟩⟩
+
+/-- info: 'Anneal.ByteCodec.FixedByteCodec.scalarValidRange_contains_of_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms FixedByteCodec.scalarValidRange_contains_of_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.decode_isSome_of_sameKind' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.decode_isSome_of_sameKind
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.isSurjectiveInitDecoder_of_sameKind' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.isSurjectiveInitDecoder_of_sameKind
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.uint_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.uint_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.int_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.int_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.int_not_scalarValidRange_of_out_of_range' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.int_not_scalarValidRange_of_out_of_range
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.not_of_kindSize_none' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.not_of_kindSize_none
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.not_adt' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.not_adt
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_typeArg_path_accepts_zero' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_typeArg_path_accepts_zero
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_niche_path_rejects_zero' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_niche_path_rejects_zero
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_no_tupleFieldCodecs' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_no_tupleFieldCodecs
 
 /-- info: 'Anneal.ByteCodec.MirValueCodec.int' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
