@@ -6,12 +6,14 @@
 > All semantics live in the overlay `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`;
 > the regression/audit suite is `scripts/test_tcb_correspondence_div8_proto.py`.
 
-Status: **A2 critique & fix pass** (to be finalized in round A4 with the GO / CONDITIONAL GO /
-NO-GO recommendation). All declarations of the overlay (including all 101 pinned headline
-theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero `Classical.choice`,
-zero `sorry`, zero `native_decide` (see §5). The overlay is differentially tested against the
-unpatched `Trusted` stepper on all 235 MiniRust witness bodies × 3 argument vectors (705 runs),
-and its agreement on 114 single-function bodies is a kernel theorem (§2b).
+Status: **B3 adversarial critique & hardening pass** (to be finalized in round A4 with the GO /
+CONDITIONAL GO / NO-GO recommendation). All declarations of the overlay (including all 105 pinned
+headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero
+`Classical.choice`, zero `sorry`, zero `native_decide` (see §5). The overlay is differentially
+tested against the unpatched `Trusted` stepper on all 235 MiniRust witness bodies × 3 argument
+vectors (705 runs), and its definite agreement on all 138 scalar-argument bodies (`114`
+single-function + `24` multi-function callers) plus `33` composite-argument bodies (`171` bodies in
+total) is proved in the Lean kernel (§2b).
 
 ## 1. What was built
 
@@ -58,7 +60,7 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 | `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC` | P1_soundness | `div_mr_tb_fnentry_local_dealloc_trusted_ret` (Trusted returns 5) | `div_mr_tb_fnentry_local_dealloc_repaired_agrees` (`.ub` at root `Return`, = `MachTB`) | `_ub_at_return` (fault is exactly the terminator), `_callee_return_canary` (callee-frame `Return` faults; Trusted returns 5), `disableFrameBorrowsProto_frame_isolation` (universal), `div_mr_tb_fnentry_dangling_callee_raw_ptr_return_ub` (dangling callee raw pointer deref faults; Trusted returns 5), `div_mr_return_destination_invalidation_and_protector_canary` (`Return` write to `caller.destination` invalidates caller borrows and checks `caller.savedProtectors`) |
 | `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` | P2_false_positive_ub | `Trusted.hasProtectedLocalBorrow` reports `true` (`div_mr_tb_unsafecell_storage_dead_canary`) | `div_mr_tb_unsafecell_protected_im_repaired_agrees` (`.ok 77`, = `Mach`/`MachTB`) | `div_mr_tb_unsafecell_coupling_legacy_breaks` (legacy rule ⇒ UB at `Return`), StorageDead canary (`.ok 5`), `hasProtectedLocalBorrowProto_cell_exempt_reservedIM_blocks` (universal `.cell` vs `.reservedIM`), `hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto`, `hasProtectedLocalBorrowProto_disableLocalBorrowsProto` (downstream TCB compatibility) |
 | `DIV-LM-RAW-OVERWRITE-CHAR-COPY` | P1_soundness | `div_lm_raw_overwrite_char_copy_trusted_steps` (Trusted copies/moves and returns surrogate `0xD800`) | `div_lm_raw_overwrite_char_copy_repaired_ub` (`.ub` on `0xD800`, `0xDFFF`, `0x110000`, copy and move) | `_ub_at_load`, `_valid_accepted` (`0x41`, `0xD7FF`, `0xE000`, `0x10FFFF` for both copy & move), `div_lm_raw_overwrite_char_projected_move_canary` (`move (*_3)`), `validateLoadedValueProto_char_eq_miri` (universal), `isValidCharCode_iff_isValidChar` |
-| `DIV-LM-D6-OFFSET-DISABLED-TAG` | P2_false_positive_ub | `div_lm_d6_offset_disabled_trusted_ub`, `div_lm_d6_offset_trusted_evalPtrOffsetBinOp` | `div_lm_d6_offset_disabled_tag_repaired_agrees` (universal live-allocation lockstep) & `div_lm_d6_offset_dead_alloc_lockstep_miri` (universal dead-allocation lockstep at any `offsetBytes < 2^63`) | `div_lm_d6_offset_disabled_deref_canary`, `disabled_tag_deref_and_reborrow_ub` (universal across deref read/write/reborrow at any offset), `div_lm_d6_wit_lm3_1_four_witnesses_and_revive_canary` (all 4 `WitLM3_1` D6 disabled-tag bodies including `lm31OffsetDisabledDeadZeroBody` + `StorageDead`+`StorageLive` revival offset UB/ok), `evalBinOpOffset_lockstep_miri` |
+| `DIV-LM-D6-OFFSET-DISABLED-TAG` | P2_false_positive_ub | `div_lm_d6_offset_disabled_trusted_ub`, `div_lm_d6_offset_trusted_evalPtrOffsetBinOp` | `div_lm_d6_offset_disabled_tag_repaired_agrees` (universal live-allocation lockstep) & `div_lm_d6_offset_dead_alloc_lockstep_miri` (universal dead-allocation lockstep at any `offsetBytes < 2^63`) | `div_lm_d6_offset_disabled_deref_canary`, `disabled_tag_deref_and_reborrow_ub` (universal across deref read/write/reborrow at any offset), `disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound` (universal post-deallocation & `StorageLive` revival UB across deref read/write/reborrow/non-zero offset), `div_lm_d6_wit_lm3_1_four_witnesses_and_revive_canary` (all 4 `WitLM3_1` D6 disabled-tag bodies including `lm31OffsetDisabledDeadZeroBody` + `StorageDead`+`StorageLive` revival offset UB/ok), `evalBinOpOffset_lockstep_miri` |
 | `DIV-LM-ENUM-SET-DISCR-UNINIT` | P2_precision | `div_lm_enum_set_discr_trusted_uninit_ub` (universal), `_trusted_faults` | `div_lm_enum_set_discr_uninit_repaired_agrees` (universal lockstep with `miriWriteDiscriminant` over `.uninit` / `.init (.aggregate _ _)` / `.dead`) | `_observed` (`Rvalue.discriminant` sees the variant), `_payload_canary` (payload read is UB), `_dead_and_init`, `div_lm_enum_set_discr_protected_conflict_ub` (universal), `div_lm_enum_set_discr_borrow_invalidation_and_protector_canary` |
 
 ### Coupled findings
@@ -150,12 +152,17 @@ fail-closed bodies are exactly the unmodeled exposed-provenance / int-to-pointer
 `transmute` (8), array-element `PtrToPtr` re-derivation (1), and sub-local byte offsets (2).
 No body yields a definite overlay result where `Trusted` is indefinite.
 
-**Kernel-checked:** `corpus_agreement_kernel` proves by `decide +kernel` that the overlay and
-the unpatched `Trusted` stepper produce the same outcome (same pointer-abstracted value, or
-UB) on all 114 single-function corpus bodies that agree at the default arguments
-(`corpusAgreementBodies`, cross-checked against the differential by
-`test_kernel_agreement_list_consistent`); `overlay_coverage_canaries` pins 15 representative
-values / UB verdicts; `corpus_out_of_fragment_fixes` re-proves the `argCountMismatchCaller` /
+**Kernel-checked:** `corpusAgreesWith` explicitly rejects `.indefinite` in Lean (`(p != .indefinite)`),
+`corpus_agreement_kernel` proves by `decide +kernel` that the overlay and the unpatched `Trusted`
+stepper produce the same definite outcome (same pointer-abstracted value, or UB) on all 114
+single-function corpus bodies (`corpusAgreementBodies`), `corpus_multifn_agreement_kernel` proves
+the same on all **24 multi-function caller bodies** (`corpusMultiFnAgreementBodies`, covering
+100% of the `114 + 24 = 138` definite-agreement scalar-argument bodies, verified by exact set
+equality in `test_kernel_agreement_list_consistent`), and `corpus_composite_agreement_kernel`
+proves the same on **33 composite-argument bodies** (`Tuple`, `Array`, `PaddedStruct`,
+`UnsafeCell<u32>`, `core::cmp::Ordering`, bringing total kernel-checked corpus agreement to
+**171 bodies**); `overlay_coverage_canaries` pins 15 representative values / UB verdicts;
+`corpus_out_of_fragment_fixes` re-proves the `argCountMismatchCaller` /
 `uninitProjCallDestCaller` fixes with their callees; the frame-bug divergences are headline
 theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
@@ -176,7 +183,7 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 | `…/MirSemantics/Places.lean` (`evalRvalue .cast`) | `CastKind.{floatToInt, intToFloat, floatToFloat}` via the Part B functions |
 | `V2026_08_01` mirror of every edit above | same |
 | Downstream (`DIV-LM-RAW-OVERWRITE-CHAR-COPY`) | `SimLM2_1.lean` (`WellTypedLM2_1ScalarOperand.validateLoadedValue_true`), `SimLM2_4.lean` (`validateLoadedValue_unionField_true`), `SymReflect.lean` (symbolic `.char` arguments), `MiniRustSpec/Correspondence/AnnealEval.lean` |
-| Downstream (`L5_ControlAndCalls.lean` & `Statements.lean` storage lemmas) | `Statements.lean:1945` (`hasProtectedLocalBorrow_of_hasProtectedWriteConflict`) continues to hold via `hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto`; in `theory/Correspondence/V2026_{06,08}_01/L5_ControlAndCalls.lean:278,443` (`hasProtectedLocalBorrow_disableLocalBorrows`), add `(d₁, loc₁) ≠ (d₂, loc₂) ∨ hasProtectedLocalBorrow ... d₁ loc₁ = false` per `hasProtectedLocalBorrowProto_disableLocalBorrowsProto` |
+| Downstream (`L5_ControlAndCalls.lean` & `Statements.lean` storage lemmas) | `Statements.lean:1945` (`hasProtectedLocalBorrow_of_hasProtectedWriteConflict`) continues to hold via `hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto`; `Statements.lean:3752` (`evalStmt_storageRevive_old_ptr_deref_ub`) and `L5_ControlAndCalls.lean:5342` (`stmt_div_storage_revive_ptr_offset_is_ub`) continue to hold via `disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound`; in `theory/Correspondence/V2026_{06,08}_01/L5_ControlAndCalls.lean:278,443` (`hasProtectedLocalBorrow_disableLocalBorrows`), add `(d₁, loc₁) ≠ (d₂, loc₂) ∨ hasProtectedLocalBorrow ... d₁ loc₁ = false` per `hasProtectedLocalBorrowProto_disableLocalBorrowsProto` |
 | `minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean` | the frame fix also flips `callRefMutProtected_anneal_ret` (`Trusted` UB → 84 = `Mach`/`MachTB` in `callRefMutProtectedRoundTrip_three_way`); update that theorem together with items 1–2 (`callerRefMutProtectedBadCallDst_notInFragmentWithIntrinsics` is purely syntactic and needs no change) |
 | `…/MirSemantics/Terminators.lean` (`Call` / `Return`) | as in the overlay: check the callee's arity at `Call` (MiniRust "call ABI violation", flips `argCountMismatch_*`) and write `_0` back with the general place write (uninit-field shell; flips `uninitProjCallDest_*`) — optional, outside the eight items |
 | Tracker | retire the 8 IDs in `scripts/run_nightly_verification_suite.py` once the witnesses flip |
@@ -185,7 +192,9 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
 * `decodeBits` ≡ Miri `decode` (`decodeBits_agrees_miriDecode`, all in-width patterns).
 * `evalFloatToIntSaturating`: NaN ↦ 0, ±∞ ↦ max/min, finite ↦ clamp(trunc); canonical
-  two's-complement `ScalarInt` (`evalFloatToIntSaturating_sound`, `_nan`, `_canaries`).
+  two's-complement `ScalarInt` (`evalFloatToIntSaturating_sound`, `_nan`, `_canaries`), plus
+  universal `IntToFloat → FloatToInt` exact round-trip on all representable integers (`|v| < 2^(fb+1)`)
+  and unconditional `i32`/`u32 → f64 → i32`/`u32` left-inverse (`evalFloatToIntSaturating_roundtrip_of_intToFloat`).
 * `evalIntToFloatRoundTiesToEven` (`evalIntToFloatRoundTiesToEven_sound` bundle):
   - Integer-quotient and **float-level** ≤ ½ ULP + even-LSB ties (`roundQuotientTiesToEven_half_ulp`,
     `_tie_even`, `roundRatioTiesToEven_float_half_ulp`), plus universal unreachability of the
@@ -219,7 +228,7 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
 ## 5. Axiom hygiene (zero `Classical.choice`)
 
-* `#guard_msgs in #print axioms` pins all 101 headline theorems (§7 of the Lean file); the
+* `#guard_msgs in #print axioms` pins all 105 headline theorems (§7 of the Lean file); the
   audit suite replays `#print axioms` for **every** `theorem` / `def` of the file.
 * Lean `v4.34.1` core lemmas that silently pull `Classical.choice` and were replaced by
   constructive versions: `Nat.pow_lt_pow_right`, `Nat.pow_lt_pow_iff_right`,

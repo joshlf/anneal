@@ -1225,7 +1225,8 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
                   let tag := s.memory.nextTag
                   let child : ProtoBorrowEntry :=
                     { tag := tag, targetLocal := loc, targetProjection := fullProj, perm := perm,
-                      parentTag := .some ptrVal.tag, targetFrameDepth := d }
+                      parentTag := .some ptrVal.tag, targetFrameDepth := d,
+                      allocDead := parent.allocDead }
                   .ok (.ptr { allocId := tag, offsetBytes := ptrVal.offsetBytes } sz)
                     { s with memory := { s.memory with borrows := child :: borrows₁, nextTag := tag + 1 } }
       | .some (.init _) => .unsupported
@@ -1268,7 +1269,8 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
                 { tag := tag, targetLocal := parent.targetLocal,
                   targetProjection := appendProjections parent.targetProjection rest,
                   perm := perm, parentTag := .some ptrVal.tag,
-                  targetFrameDepth := parent.targetFrameDepth }
+                  targetFrameDepth := parent.targetFrameDepth,
+                  allocDead := parent.allocDead }
               .ok (.ptr { allocId := tag, offsetBytes := ptrVal.offsetBytes } sz)
                 { s with memory := { s.memory with borrows := child :: s.memory.borrows, nextTag := tag + 1 } }
       | .some (.init _) => .unsupported
@@ -1475,7 +1477,8 @@ def evalRetagProto (cfg : ProtoConfig) (s : ProtoMachineState) (kind : RetagKind
                   { tag := tag, targetLocal := loc, targetProjection := parent.targetProjection,
                     perm := childPerm,
                     protector := match isFnEntry with | true => .some protId | false => .none,
-                    parentTag := .some ptrVal.tag, targetFrameDepth := d }
+                    parentTag := .some ptrVal.tag, targetFrameDepth := d,
+                    allocDead := parent.allocDead }
                 match set? s.frame.locals place.local_
                     (.init (.ptr { allocId := tag, offsetBytes := ptrVal.offsetBytes } sz)) with
                 | .some locals' =>
@@ -3083,13 +3086,15 @@ theorem reborrow_inherits_targetFrameDepth (cfg : ProtoConfig) (s : ProtoMachine
       ∃ child tail, s'.memory.borrows = child :: tail ∧
         child.targetFrameDepth = parent.targetFrameDepth ∧
         child.targetLocal = parent.targetLocal ∧
-        child.parentTag = .some ptrVal.tag) ∧
+        child.parentTag = .some ptrVal.tag ∧
+        child.allocDead = parent.allocDead) ∧
     (∀ mutability v s',
       evalRvalueProto cfg s (.rawPtr mutability ⟨loc, .deref :: rest⟩) = .ok v s' →
       ∃ child, s'.memory.borrows = child :: s.memory.borrows ∧
         child.targetFrameDepth = parent.targetFrameDepth ∧
         child.targetLocal = parent.targetLocal ∧
-        child.parentTag = .some ptrVal.tag) := by
+        child.parentTag = .some ptrVal.tag ∧
+        child.allocDead = parent.allocDead) := by
   constructor
   · intro bk v s' h
     simp only [evalRvalueProto, hloc, hlook] at h
@@ -3097,12 +3102,12 @@ theorem reborrow_inherits_targetFrameDepth (cfg : ProtoConfig) (s : ProtoMachine
     split at h <;> try cases h
     split at h <;> try cases h
     split at h <;> try cases h
-    exact ⟨_, _, rfl, rfl, rfl, rfl⟩
+    exact ⟨_, _, rfl, rfl, rfl, rfl, rfl⟩
   · intro mutability v s' h
     simp only [evalRvalueProto, hloc, hlook] at h
     split at h <;> try cases h
     split at h <;> try cases h
-    exact ⟨_, rfl, rfl, rfl, rfl⟩
+    exact ⟨_, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Universal direct-write transition separation** (`DIV-MR-TB-TWOPHASE-DIRECT-WRITE`):
 an unprotected direct write (`writerTag = .none`) overlapping `e` at `(d, loc, proj)`
@@ -3977,6 +3982,141 @@ theorem hasProtectedLocalBorrowProto_disableLocalBorrowsProto
       · exact hother (Or.inr hl)
     · exact hother (Or.inl hd)
 
+theorem lookupProtoBorrow_disableLocalBorrowsProto
+    (borrows : List ProtoBorrowEntry) (d loc tag : Nat) (entry : ProtoBorrowEntry)
+    (hlook : lookupProtoBorrow borrows tag = .some entry) :
+    lookupProtoBorrow (disableLocalBorrowsProto borrows d loc) tag =
+      .some (if entryTargetsProto entry d loc then { entry with perm := .disabled, allocDead := true }
+             else entry) := by
+  induction borrows with
+  | nil => cases hlook
+  | cons hd tl ih =>
+    simp only [disableLocalBorrowsProto, List.map_cons, lookupProtoBorrow]
+    unfold lookupProtoBorrow at hlook
+    have htag : (match entryTargetsProto hd d loc with
+        | true => { hd with perm := .disabled, allocDead := true }
+        | false => hd).tag = hd.tag := by
+      cases entryTargetsProto hd d loc <;> rfl
+    rw [htag]
+    cases hb : Nat.beq hd.tag tag
+    · rw [hb] at hlook
+      exact ih hlook
+    · rw [hb] at hlook
+      injection hlook with heq
+      subst heq
+      cases entryTargetsProto hd d loc <;> rfl
+
+theorem lookupProtoBorrow_disableFrameBorrowsProto
+    (borrows : List ProtoBorrowEntry) (d nLocals tag : Nat) (entry : ProtoBorrowEntry)
+    (hlook : lookupProtoBorrow borrows tag = .some entry) :
+    lookupProtoBorrow (disableFrameBorrowsProto borrows d nLocals) tag =
+      .some (if Bool.and (Nat.beq entry.targetFrameDepth d) (Nat.blt entry.targetLocal nLocals) then
+               { entry with perm := .disabled, allocDead := true }
+             else entry) := by
+  induction borrows with
+  | nil => cases hlook
+  | cons hd tl ih =>
+    simp only [disableFrameBorrowsProto, List.map_cons, lookupProtoBorrow]
+    unfold lookupProtoBorrow at hlook
+    have htag : (match Bool.and (Nat.beq hd.targetFrameDepth d) (Nat.blt hd.targetLocal nLocals) with
+        | true => { hd with perm := .disabled, allocDead := true }
+        | false => hd).tag = hd.tag := by
+      cases Bool.and (Nat.beq hd.targetFrameDepth d) (Nat.blt hd.targetLocal nLocals) <;> rfl
+    rw [htag]
+    cases hb : Nat.beq hd.tag tag
+    · rw [hb] at hlook
+      exact ih hlook
+    · rw [hb] at hlook
+      injection hlook with heq
+      subst heq
+      cases Bool.and (Nat.beq hd.targetFrameDepth d) (Nat.blt hd.targetLocal nLocals) <;> rfl
+
+/-- **Universal post-deallocation & storage-revival soundness**
+(`Statements.lean:3752` `evalStmt_storageRevive_old_ptr_deref_ub` +
+`L5_ControlAndCalls.lean:5342` `stmt_div_storage_revive_ptr_offset_is_ub` +
+`DIV-LM-D6-OFFSET-DISABLED-TAG`):
+once `disableLocalBorrowsProto borrows d loc` (`StorageDead`/`StorageLive`) or
+`disableFrameBorrowsProto borrows d nLocals` (`Return` with `loc < nLocals`) has run on a
+borrow table where `lookupProtoBorrow borrows ptrVal.tag = .some entry` with
+`entry.targetFrameDepth = d` and `entry.targetLocal = loc`:
+1. Looking up `ptrVal.tag` in the resulting borrow table yields
+   `{ entry with perm := .disabled, allocDead := true }`;
+2. In **any** subsequent state `s` holding that deallocated entry for `ptrVal.tag` and
+   `get? s.frame.locals pLoc = .some (.init (.ptr ptrVal sz))` — **even if `(d, loc)` has
+   been revived by `StorageLive(loc)` and re-initialized in `s.frame.locals`** —
+   every deref read (`readPlaceProto`), deref write (`writePlaceProto`), safe reborrow
+   (`evalRvalueProto .ref`), and raw reborrow (`evalRvalueProto .rawPtr`) through `pLoc`
+   faults with `.ub`, `ptrAllocByteBoundProto` on a root borrow (`targetProjection = .nil`)
+   returns `.some 0`, and every non-zero-delta `evalPtrOffsetBinOpProto` (with
+   `ptrVal.offsetBytes < 2 ^ 63`, `stride ≠ 0`, and non-zero `offsetSc`) faults with `.ub`! -/
+theorem disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound
+    (borrows : List ProtoBorrowEntry) (d loc nLocals : Nat) (ptrVal : ProvenancePtr)
+    (entry : ProtoBorrowEntry)
+    (hlook : lookupProtoBorrow borrows ptrVal.tag = .some entry)
+    (hd : entry.targetFrameDepth = d) (hloc_eq : entry.targetLocal = loc) :
+    lookupProtoBorrow (disableLocalBorrowsProto borrows d loc) ptrVal.tag =
+      .some { entry with perm := .disabled, allocDead := true } ∧
+    (loc < nLocals →
+      lookupProtoBorrow (disableFrameBorrowsProto borrows d nLocals) ptrVal.tag =
+        .some { entry with perm := .disabled, allocDead := true }) ∧
+    (∀ (s : ProtoMachineState) (pLoc sz : Nat) (rest : List ProjectionElem)
+        (v : Value) (bk : BorrowKind) (mutability : Mutability),
+      lookupProtoBorrow s.memory.borrows ptrVal.tag =
+        .some { entry with perm := .disabled, allocDead := true } →
+      get? s.frame.locals pLoc = .some (.init (.ptr ptrVal sz)) →
+      isFieldOnlyProj entry.targetProjection = true →
+      readPlaceProto {} s ⟨pLoc, .deref :: rest⟩ = .ub ∧
+      writePlaceProto {} s ⟨pLoc, .deref :: rest⟩ v = .ub ∧
+      evalRvalueProto {} s (.ref bk ⟨pLoc, .deref :: rest⟩) = .ub ∧
+      evalRvalueProto {} s (.rawPtr mutability ⟨pLoc, .deref :: rest⟩) = .ub) ∧
+    (∀ (s : ProtoMachineState) (lhsOp : Operand) (stride : Nat) (offsetSc : ScalarInt),
+      entry.targetProjection = .nil →
+      lookupProtoBorrow s.memory.borrows ptrVal.tag =
+        .some { entry with perm := .disabled, allocDead := true } →
+      pointeeElemByteStride s.body.localDecls s.body.layouts lhsOp = .some stride →
+      layoutPointerBytes s.body.layouts = 8 →
+      offsetSc.sizeBytes = 8 →
+      ptrVal.offsetBytes < 2 ^ 63 →
+      stride ≠ 0 →
+      wrapScalarBits offsetSc.bits (scalarModulus 8) ≠ 0 →
+      ptrAllocByteBoundProto s { entry with perm := .disabled, allocDead := true } = .some 0 ∧
+      evalPtrOffsetBinOpProto s lhsOp ptrVal 8 offsetSc = .ub) := by
+  have htgt : entryTargetsProto entry d loc = true := by
+    simp [entryTargetsProto, hd, hloc_eq, Nat.beq_refl]
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · rw [lookupProtoBorrow_disableLocalBorrowsProto borrows d loc ptrVal.tag entry hlook]
+    simp only [htgt, ↓reduceIte]
+  · intro hlt
+    rw [lookupProtoBorrow_disableFrameBorrowsProto borrows d nLocals ptrVal.tag entry hlook]
+    have hcond : Bool.and (Nat.beq entry.targetFrameDepth d)
+        (Nat.blt entry.targetLocal nLocals) = true := by
+      simp [hd, hloc_eq, Nat.beq_refl, Nat.blt_eq.mpr hlt]
+    simp only [hcond, ↓reduceIte]
+  · intro s pLoc sz rest v bk mutability hlook' hpLoc hproj
+    exact disabled_tag_deref_and_reborrow_ub s pLoc rest ptrVal sz
+      { entry with perm := .disabled, allocDead := true } v bk mutability hpLoc hlook' hproj rfl
+  · intro s lhsOp stride offsetSc hnil hlook' hstride hptr hsz hoff hstr_ne hbits_ne
+    have hbnd : ptrAllocByteBoundProto s { entry with perm := .disabled, allocDead := true } = .some 0 := by
+      simp [ptrAllocByteBoundProto, hnil]
+    refine ⟨hbnd, ?_⟩
+    rw [div_lm_d6_offset_dead_alloc_lockstep_miri s lhsOp ptrVal offsetSc
+      { entry with perm := .disabled, allocDead := true } stride 0
+      hlook' hstride hbnd hptr hsz hoff]
+    have hisize : isizeValue offsetSc ≠ 0 := by
+      obtain ⟨bits, sz⟩ := offsetSc
+      simp only at hsz hbits_ne ⊢
+      subst hsz
+      simp only [scalarModulus_eight, wrap64] at hbits_ne
+      unfold isizeValue intValueOfBits
+      simp only [Nat.reducePow, Nat.reduceSub, true_and]
+      have hlt : bits % 18446744073709551616 < 18446744073709551616 := Nat.mod_lt _ (by decide)
+      generalize bits % 18446744073709551616 = B at hbits_ne hlt
+      split <;> omega
+    have hstr_int : (stride : Int) ≠ 0 := by omega
+    have hprod : isizeValue offsetSc * (stride : Int) ≠ 0 := Int.mul_ne_zero hisize hstr_int
+    unfold miriPtrOffsetInbounds
+    simp [hprod]
+
 
 /-! ### Kernel-checked corpus agreement with the unpatched `Trusted` stepper -/
 
@@ -4024,28 +4164,46 @@ inductive CorpusOutcome : Type where
   | indefinite : CorpusOutcome
   deriving DecidableEq
 
-/-- Overlay outcome class (no callees). -/
-def protoCorpusOutcome (body : CapturedMir) (args : List Value) : CorpusOutcome :=
-  match runMirProto body [] args with
+/-- Overlay outcome class (with explicit callee table). -/
+def protoCorpusOutcomeWith (callees : List CapturedMir) (body : CapturedMir) (args : List Value) :
+    CorpusOutcome :=
+  match runMirProto body callees args with
   | .ok v => .ok (corpusEncodeVal v)
   | .ub => .ub
   | _ => .indefinite
 
-/-- Unpatched `Trusted` outcome class (`runA` / `faultsA`, fuel `256`, no callees). -/
-def trustedCorpusOutcome (body : CapturedMir) (args : List Value) : CorpusOutcome :=
-  match runA body 256 (initMachineStateWithCallees body args []) with
+/-- Overlay outcome class (no callees). -/
+def protoCorpusOutcome (body : CapturedMir) (args : List Value) : CorpusOutcome :=
+  protoCorpusOutcomeWith [] body args
+
+/-- Unpatched `Trusted` outcome class (`runA` / `faultsA`, fuel `256`, with explicit callee table). -/
+def trustedCorpusOutcomeWith (callees : List CapturedMir) (body : CapturedMir) (args : List Value) :
+    CorpusOutcome :=
+  match runA body 256 (initMachineStateWithCallees body args callees) with
   | .some (_, .normal (v, _)) => .ok (corpusEncodeVal v)
   | .some _ => .indefinite
   | .none =>
-    match faultsA body 256 (initMachineStateWithCallees body args []) with
+    match faultsA body 256 (initMachineStateWithCallees body args callees) with
     | true => .ub
     | false => .indefinite
 
-/-- The overlay and the unpatched `Trusted` stepper agree on `body` at its default args. -/
-def corpusAgrees (body : CapturedMir) : Bool :=
+/-- Unpatched `Trusted` outcome class (`runA` / `faultsA`, fuel `256`, no callees). -/
+def trustedCorpusOutcome (body : CapturedMir) (args : List Value) : CorpusOutcome :=
+  trustedCorpusOutcomeWith [] body args
+
+/-- The overlay and the unpatched `Trusted` stepper both produce the same **definite**
+(`.ok _` or `.ub`, never `.indefinite`) outcome on `body` at its default args under `callees`. -/
+def corpusAgreesWith (callees : List CapturedMir) (body : CapturedMir) : Bool :=
   match corpusArgs body with
-  | .some args => decide (protoCorpusOutcome body args = trustedCorpusOutcome body args)
+  | .some args =>
+    let p := protoCorpusOutcomeWith callees body args
+    (p != .indefinite) && decide (p = trustedCorpusOutcomeWith callees body args)
   | .none => false
+
+/-- The overlay and the unpatched `Trusted` stepper both produce the same **definite**
+outcome on single-function `body` at its default args. -/
+def corpusAgrees (body : CapturedMir) : Bool :=
+  corpusAgreesWith [] body
 
 /-- The single-function MiniRust witness bodies (default scalar arguments) on which the
 overlay and the unpatched `Trusted` stepper both produce a definite outcome. -/
@@ -4171,6 +4329,155 @@ witness bodies, the overlay `runMirProto` and the unpatched `Trusted` stepper (`
 UB — so the overlay's fixes do not perturb `Trusted`'s behavior outside the tracked
 divergences. -/
 theorem corpus_agreement_kernel : corpusAgreementBodies.all corpusAgrees = true := by
+  decide +kernel
+
+/-- Callee table for the 24 multi-function caller bodies in the MiniRust witness corpus. -/
+def corpusMultiFnCallees : List CapturedMir := [
+    MiniRustSpec.Correspondence.Witness.calleePair,
+    MiniRustSpec.Correspondence.Witness.negI8Callee,
+    MiniRustSpec.Correspondence.Witness.flipBoolCallee,
+    MiniRustSpec.Correspondence.Witness.chainLeaf,
+    MiniRustSpec.Correspondence.Witness.chainMid,
+    MiniRustSpec.Correspondence.Witness.idU32Callee,
+    MiniRustSpec.Correspondence.Witness.divTenI8Callee,
+    MiniRustSpec.Correspondence.Witness.cAbiCallee,
+    MiniRustSpec.Correspondence.Witness.badCallConvCallee,
+    MiniRustSpec.Correspondence.Witness.diamondMidA,
+    MiniRustSpec.Correspondence.Witness.diamondMidB,
+    MiniRustSpec.Correspondence.Witness.idI8Callee,
+    MiniRustSpec.Correspondence.Witness.retUninitCallee,
+    MiniRustSpec.Correspondence.Witness.assumeChainCallee,
+    MiniRustSpec.Correspondence.ProvenanceWitness.calleeProtectorConflictMir,
+    MiniRustSpec.Correspondence.ProvenanceWitness.calleeRawPtrRetagFnEntryMir]
+
+/-- The 24 multi-function caller bodies in the MiniRust witness corpus (default scalar
+arguments) on which the overlay and the unpatched `Trusted` stepper both produce the same
+definite outcome (`114 + 24 = 138`, covering 100% of the 138 definite-agreement scalar-arg
+bodies in the 235-body corpus). -/
+def corpusMultiFnAgreementBodies : List CapturedMir := [
+    MiniRustSpec.Correspondence.Witness.callerMain,
+    MiniRustSpec.Correspondence.Witness.projDestCaller,
+    MiniRustSpec.Correspondence.Witness.chainMid,
+    MiniRustSpec.Correspondence.Witness.chainEntry,
+    MiniRustSpec.Correspondence.Witness.callArgUbCaller,
+    MiniRustSpec.Correspondence.Witness.calleeDivZeroCaller,
+    MiniRustSpec.Correspondence.Witness.callDestArgAlias,
+    MiniRustSpec.Correspondence.Witness.callMoveReuse,
+    MiniRustSpec.Correspondence.Witness.moveReinitByCall,
+    MiniRustSpec.Correspondence.Witness.condCallMoveJoin,
+    MiniRustSpec.Correspondence.Witness.stmtMoveThenCallArg,
+    MiniRustSpec.Correspondence.Witness.cAbiCaller,
+    MiniRustSpec.Correspondence.Witness.badCallConvCaller,
+    MiniRustSpec.Correspondence.Witness.deadCallDestCaller,
+    MiniRustSpec.Correspondence.Witness.diamondMidA,
+    MiniRustSpec.Correspondence.Witness.diamondMidB,
+    MiniRustSpec.Correspondence.Witness.diamondCallEntry,
+    MiniRustSpec.Correspondence.Witness.abiArgMismatchCaller,
+    MiniRustSpec.Correspondence.Witness.abiRetMismatchCaller,
+    MiniRustSpec.Correspondence.Witness.calleeRetUninitCaller,
+    MiniRustSpec.Correspondence.Witness.assumeTupleCallCaller,
+    MiniRustSpec.Correspondence.Witness.assumeMultiFrameCaller,
+    MiniRustSpec.Correspondence.ProvenanceWitness.callerProtectorConflictMir,
+    MiniRustSpec.Correspondence.ProvenanceWitness.callerRawPtrRetagFnEntryMir]
+
+/-- **Kernel-checked multi-function corpus agreement**: on all 24 multi-function caller
+bodies in `corpusMultiFnAgreementBodies`, `runMirProto` and the unpatched `Trusted` stepper
+both produce the same definite outcome (same returned value or UB). Together with
+`corpus_agreement_kernel` (`114` single-function bodies), this kernel-checks all `138`
+definite-agreement scalar-argument bodies in the 235-body MiniRust corpus. -/
+theorem corpus_multifn_agreement_kernel :
+    corpusMultiFnAgreementBodies.all (corpusAgreesWith corpusMultiFnCallees) = true := by
+  decide +kernel
+
+mutual
+/-- Default argument generator extended to composite parameter types (`.tuple`, `.array`, and
+the corpus `.adt` types `witness::Padded`, `core::cell::UnsafeCell`, `core::cmp::Ordering`). -/
+def corpusCompositeArgOfTy : Nat → RigidTy → Option Value
+  | 0, _ => .none
+  | _ + 1, .bool => .some (.scalar ⟨1, 1⟩)
+  | _ + 1, .char => .some (.scalar ⟨0x41, 4⟩)
+  | _ + 1, .uint .u8 | _ + 1, .int .i8 => .some (.scalar ⟨5, 1⟩)
+  | _ + 1, .uint .u16 | _ + 1, .int .i16 => .some (.scalar ⟨5, 2⟩)
+  | _ + 1, .uint .u32 | _ + 1, .int .i32 => .some (.scalar ⟨5, 4⟩)
+  | _ + 1, .uint .u64 | _ + 1, .int .i64 => .some (.scalar ⟨5, 8⟩)
+  | _ + 1, .uint .usize | _ + 1, .int .isize => .some (.scalar ⟨5, 8⟩)
+  | _ + 1, .uint .u128 | _ + 1, .int .i128 => .some (.scalar ⟨5, 16⟩)
+  | fuel + 1, .tuple tys => (corpusCompositeArgsOfTys fuel tys).map (.aggregate 0)
+  | fuel + 1, .array elemTy len =>
+    (corpusCompositeArgOfTy fuel elemTy).map (fun v => .aggregate 0 (replicateValue len v))
+  | _ + 1, .adt dp _ =>
+    if stringEq dp "witness::Padded" then
+      .some MiniRustSpec.Correspondence.Witness.initPaddedStruct
+    else if stringEq dp "core::cell::UnsafeCell" then
+      .some MiniRustSpec.Correspondence.TbWitness.initUnsafeCellU32
+    else if stringEq dp "core::cmp::Ordering" then
+      .some (.aggregate 0 [])
+    else .none
+  | _ + 1, _ => .none
+
+def corpusCompositeArgsOfTys : Nat → List RigidTy → Option (List Value)
+  | _, [] => .some []
+  | fuel, t :: ts =>
+    match corpusCompositeArgOfTy fuel t, corpusCompositeArgsOfTys fuel ts with
+    | .some v, .some vs => .some (v :: vs)
+    | _, _ => .none
+end
+
+def corpusCompositeArgs (body : CapturedMir) : Option (List Value) :=
+  ((body.localDecls.drop 1).take body.argCount).mapM (fun d => corpusCompositeArgOfTy 4 d.ty.kind)
+
+def corpusCompositeAgrees (body : CapturedMir) : Bool :=
+  match corpusCompositeArgs body with
+  | .some args =>
+    let p := protoCorpusOutcomeWith corpusMultiFnCallees body args
+    (p != .indefinite) && decide (p = trustedCorpusOutcomeWith corpusMultiFnCallees body args)
+  | .none => false
+
+/-- The 33 composite-parameter MiniRust witness bodies (tuples, arrays, `PaddedStruct`,
+`UnsafeCell<u32>`, `core::cmp::Ordering`) on which `runMirProto` and `Trusted` both produce
+the same definite outcome. -/
+def corpusCompositeAgreementBodies : List CapturedMir := [
+    MiniRustSpec.Correspondence.Witness.boolBitOrdUse,
+    MiniRustSpec.Correspondence.Witness.checkedArithI8,
+    MiniRustSpec.Correspondence.Witness.projectedDeinit,
+    MiniRustSpec.Correspondence.Witness.projAssignMoveReuse,
+    MiniRustSpec.Correspondence.Witness.calleePair,
+    MiniRustSpec.Correspondence.Witness.callProjMoveReuse,
+    MiniRustSpec.Correspondence.Witness.arraySignedIdxI8,
+    MiniRustSpec.Correspondence.Witness.zeroArrayI8,
+    MiniRustSpec.Correspondence.Witness.arrayUninitIdxI8,
+    MiniRustSpec.Correspondence.Witness.arrayU32Idx,
+    MiniRustSpec.Correspondence.Witness.arrayConstIdxOobI8,
+    MiniRustSpec.Correspondence.Witness.arrayComposeI8,
+    MiniRustSpec.Correspondence.Witness.paddedStructOps,
+    MiniRustSpec.Correspondence.Witness.nestedTupleOps,
+    MiniRustSpec.Correspondence.Witness.paddedDeinitRead,
+    MiniRustSpec.Correspondence.Witness.paddedReadOnly,
+    MiniRustSpec.Correspondence.Witness.paddedDeinitSiblingReinit,
+    MiniRustSpec.Correspondence.Witness.deinitSiblingReinit,
+    MiniRustSpec.Correspondence.Witness.deinitSiblingCopyReinit,
+    MiniRustSpec.Correspondence.Witness.deinitSiblingReinitUb,
+    MiniRustSpec.Correspondence.Witness.deinitSiblingRelayReinit,
+    MiniRustSpec.Correspondence.Witness.paddedDeinitBinOpDivZero,
+    MiniRustSpec.Correspondence.Witness.paddedDeinitHoleBinOp,
+    MiniRustSpec.Correspondence.Witness.paddedDeinitHoleCastRead,
+    MiniRustSpec.Correspondence.Witness.deinitSiblingBinOpWindowReinit,
+    MiniRustSpec.Correspondence.PointerWitness.fieldPtr,
+    MiniRustSpec.Correspondence.PointerWitness.nestedFieldPtr,
+    MiniRustSpec.Correspondence.PointerWitness.derefFieldWriteRhsUb,
+    MiniRustSpec.Correspondence.RefWitness.refPaddedStructReborrow,
+    MiniRustSpec.Correspondence.TbWitness.pairSplitReborrowOk,
+    MiniRustSpec.Correspondence.TbWitness.pairParentWriteDisablesChild,
+    MiniRustSpec.Correspondence.TbWitness.unsafeCellUnprotInteriorMut,
+    MiniRustSpec.Correspondence.TbWitness.unsafeCellProtectedInteriorMut]
+
+/-- **Kernel-checked composite-argument corpus agreement**: on all 33 composite-argument
+MiniRust witness bodies (`Tuple`, `Array`, `PaddedStruct`, `UnsafeCell<u32>`, `Ordering`),
+`runMirProto` and `Trusted` produce the same definite outcome. Together with
+`corpus_agreement_kernel` (`114`) and `corpus_multifn_agreement_kernel` (`24`), this
+kernel-checks `171` definite-agreement witness bodies across the 5 MiniRust modules. -/
+theorem corpus_composite_agreement_kernel :
+    corpusCompositeAgreementBodies.all corpusCompositeAgrees = true := by
   decide +kernel
 
 /-- **Out-of-fragment `Trusted` divergences fixed by the overlay** (found by the corpus
@@ -6095,6 +6402,93 @@ theorem roundRatioBits_sign_and_underflow_zero_preserved :
     unfold evalFloatToFloatRoundTiesToEven
     rw [convertFloatBits_of_inf _ _ _ _ _ h, decodeBits_infBits]
 
+theorem floatToIntValue_of_denotesInt (k : FloatKind) (v lo hi : Int)
+    (hlo : lo ≤ v) (hhi : v ≤ hi) (hd : k.denotesInt v) :
+    floatToIntValue k lo hi = v := by
+  cases k with
+  | zero neg =>
+    obtain ⟨rfl, _⟩ := hd
+    rfl
+  | finite neg n d =>
+    obtain ⟨hd_pos, hn, hneg⟩ := hd
+    have hdiv : n / d = v.natAbs := by
+      rw [hn, Nat.mul_div_cancel _ hd_pos]
+    simp only [floatToIntValue, truncRatio, clampInt, hdiv, hneg]
+    by_cases hv : v < 0
+    · simp only [hv, decide_true, ↓reduceIte]; omega
+    · simp only [hv, decide_false, Bool.false_eq_true, ↓reduceIte]; omega
+  | inf _ => cases hd
+  | nan _ _ _ => cases hd
+
+theorem encodeTwosComplement_intValueOfBits (signed : Bool) (w bits : Nat)
+    (hw : w = 8 ∨ w = 16 ∨ w = 32 ∨ w = 64 ∨ w = 128) (hbits : bits < 2 ^ w) :
+    (if signed = true then -((2 ^ (w - 1) : Nat) : Int) else 0) ≤ intValueOfBits signed w bits ∧
+    intValueOfBits signed w bits ≤
+      (if signed = true then ((2 ^ (w - 1) : Nat) : Int) - 1 else ((2 ^ w : Nat) : Int) - 1) ∧
+    encodeTwosComplement w (intValueOfBits signed w bits) = bits := by
+  rcases hw with rfl | rfl | rfl | rfl | rfl <;> cases signed <;>
+    simp only [intValueOfBits, encodeTwosComplement, Nat.reducePow, Nat.reduceSub,
+      Bool.false_eq_true, ite_false, ite_true, true_and, false_and] at hbits ⊢ <;>
+    (repeat' apply And.intro) <;>
+    (try split) <;> omega
+
+/-- **Universal `IntToFloat → FloatToInt` exact round-trip**:
+1. For every integer target `t : IntTarget`, pointer width `pw : PtrWidth`, format `f`,
+   and in-width bit pattern `bits < 2 ^ (t.bitWidth pw)`, whenever the integer value
+   `v := intValueOfBits t.isSigned (t.bitWidth pw) bits` is exactly representable in `f`
+   (`v.natAbs < 2 ^ (f.fractionBits + 1)`), casting `bits` to `f` via
+   `evalIntToFloatRoundTiesToEven` and then back to `t` via `evalFloatToIntSaturating`
+   recovers the exact original `ScalarInt` `⟨bits, (t.bitWidth pw) / 8⟩`;
+2. In particular, for `f = .binary64` and `t = .signed .i32` or `.unsigned .u32` (32-bit
+   signed and unsigned integers), `evalFloatToIntSaturating` is an unconditional left
+   inverse of `evalIntToFloatRoundTiesToEven` on all `bits < 2 ^ 32`. -/
+theorem evalFloatToIntSaturating_roundtrip_of_intToFloat :
+    (∀ (t : IntTarget) (pw : PtrWidth) (f : IeeeFormat) (bits : Nat),
+      bits < 2 ^ (t.bitWidth pw) →
+      (intValueOfBits t.isSigned (t.bitWidth pw) bits).natAbs < 2 ^ (f.fractionBits + 1) →
+      evalFloatToIntSaturating f
+          (evalIntToFloatRoundTiesToEven t.isSigned (t.bitWidth pw) bits f) t pw =
+        ⟨bits, (t.bitWidth pw) / 8⟩) ∧
+    (∀ (pw : PtrWidth) (bits : Nat), bits < 2 ^ 32 →
+      evalFloatToIntSaturating .binary64
+          (evalIntToFloatRoundTiesToEven true 32 bits .binary64) (.signed .i32) pw =
+        ⟨bits, 4⟩ ∧
+      evalFloatToIntSaturating .binary64
+          (evalIntToFloatRoundTiesToEven false 32 bits .binary64) (.unsigned .u32) pw =
+        ⟨bits, 4⟩) := by
+  have hmain : ∀ (t : IntTarget) (pw : PtrWidth) (f : IeeeFormat) (bits : Nat),
+      bits < 2 ^ (t.bitWidth pw) →
+      (intValueOfBits t.isSigned (t.bitWidth pw) bits).natAbs < 2 ^ (f.fractionBits + 1) →
+      evalFloatToIntSaturating f
+          (evalIntToFloatRoundTiesToEven t.isSigned (t.bitWidth pw) bits f) t pw =
+        ⟨bits, (t.bitWidth pw) / 8⟩ := by
+    intro t pw f bits hbits hrep
+    have hw := IntTarget.bitWidth_cases t pw
+    obtain ⟨hlo, hhi, henc⟩ := encodeTwosComplement_intValueOfBits t.isSigned (t.bitWidth pw) bits hw hbits
+    have hden := evalIntToFloatRoundTiesToEven_exact t.isSigned (t.bitWidth pw) bits f hrep
+    have hf2i := floatToIntValue_of_denotesInt
+      (decodeBits f (evalIntToFloatRoundTiesToEven t.isSigned (t.bitWidth pw) bits f))
+      (intValueOfBits t.isSigned (t.bitWidth pw) bits) (t.minValue pw) (t.maxValue pw)
+      (by unfold IntTarget.minValue; exact hlo)
+      (by unfold IntTarget.maxValue; exact hhi) hden
+    unfold evalFloatToIntSaturating
+    dsimp only
+    rw [hf2i, henc]
+  refine ⟨hmain, fun pw bits hbits => ?_⟩
+  have h1 := hmain (.signed .i32) pw .binary64 bits
+    (by cases pw <;> exact hbits)
+    (by
+      simp only [IntTarget.isSigned, IntTarget.bitWidth, IntTy.bitWidth, intValueOfBits,
+        IeeeFormat.fractionBits, Nat.reducePow, Nat.reduceSub, true_and]
+      split <;> omega)
+  have h2 := hmain (.unsigned .u32) pw .binary64 bits
+    (by cases pw <;> exact hbits)
+    (by
+      simp only [IntTarget.isSigned, IntTarget.bitWidth, UintTy.bitWidth, intValueOfBits,
+        IeeeFormat.fractionBits, Nat.reducePow, Nat.reduceSub, Bool.false_eq_true, false_and, ↓reduceIte]
+      omega)
+  cases pw <;> exact ⟨h1, h2⟩
+
 /-! ### Part B soundness bundles -/
 
 /-- **`evalIntToFloatRoundTiesToEven_sound`**: (1) every representable integer
@@ -6593,6 +6987,22 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.corpus_out_of_fragment_fixes' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms corpus_out_of_fragment_fixes
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.corpus_multifn_agreement_kernel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms corpus_multifn_agreement_kernel
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.corpus_composite_agreement_kernel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms corpus_composite_agreement_kernel
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.evalFloatToIntSaturating_roundtrip_of_intToFloat' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_roundtrip_of_intToFloat
 
 end AxiomGuards
 

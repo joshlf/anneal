@@ -196,6 +196,12 @@ HEADLINE_THEOREMS = (
     # A2: kernel-checked corpus agreement and out-of-fragment fixes
     "corpus_agreement_kernel",
     "corpus_out_of_fragment_fixes",
+    # B3: post-deallocation & storage-revival soundness, multi-function & composite corpus
+    # kernel agreement, and IntToFloat -> FloatToInt round-trip
+    "disableLocalBorrowsProto_and_disableFrameBorrowsProto_revival_sound",
+    "corpus_multifn_agreement_kernel",
+    "corpus_composite_agreement_kernel",
+    "evalFloatToIntSaturating_roundtrip_of_intToFloat",
 )
 
 
@@ -972,15 +978,34 @@ class CorpusDifferentialTests(unittest.TestCase):
                              f"stale FAIL_CLOSED_CORPUS entries (#{variant}; shrink the allowlist)")
 
     def test_kernel_agreement_list_consistent(self) -> None:
-        """`corpusAgreementBodies` (kernel-checked by `corpus_agreement_kernel`) lists exactly
-        the single-function bodies that agree at the default arguments."""
+        """`corpusAgreementBodies` (`114` single-function bodies) +
+        `corpusMultiFnAgreementBodies` (`24` multi-function caller bodies) list *exactly* all
+        `138` scalar-argument corpus bodies that agree definitively at the default arguments,
+        and `corpusCompositeAgreementBodies` covers the composite-argument bodies."""
         source = LEAN_FILE.read_text(encoding="utf-8")
-        m = re.search(r"def corpusAgreementBodies : List CapturedMir := \[(.*?)\]", source, re.S)
-        self.assertIsNotNone(m)
-        kernel = [n.strip().removeprefix(CORPUS_PREFIX) for n in m.group(1).split(",") if n.strip()]
-        self.assertGreaterEqual(len(kernel), 100)
-        self.assertEqual(len(kernel), len(set(kernel)))
-        for body in kernel:
+        m_single = re.search(r"def corpusAgreementBodies : List CapturedMir := \[(.*?)\]", source, re.S)
+        m_multi = re.search(r"def corpusMultiFnAgreementBodies : List CapturedMir := \[(.*?)\]", source, re.S)
+        m_comp = re.search(r"def corpusCompositeAgreementBodies : List CapturedMir := \[(.*?)\]", source, re.S)
+        self.assertIsNotNone(m_single)
+        self.assertIsNotNone(m_multi)
+        self.assertIsNotNone(m_comp)
+        single = [n.strip().removeprefix(CORPUS_PREFIX) for n in m_single.group(1).split(",") if n.strip()]
+        multi = [n.strip().removeprefix(CORPUS_PREFIX) for n in m_multi.group(1).split(",") if n.strip()]
+        comp = [n.strip().removeprefix(CORPUS_PREFIX) for n in m_comp.group(1).split(",") if n.strip()]
+        self.assertEqual(len(single), 114)
+        self.assertEqual(len(multi), 24)
+        self.assertEqual(len(single), len(set(single)))
+        self.assertEqual(len(multi), len(set(multi)))
+        self.assertEqual(len(comp), len(set(comp)))
+        self.assertEqual(set(single) & set(multi), set())
+        self.assertEqual((set(single) | set(multi)) & set(comp), set())
+        expected_138 = {
+            key.rsplit("#", 1)[0]
+            for key, (proto, trusted) in self.results.items()
+            if key.endswith("#0") and proto == trusted and _definite(proto)
+        }
+        self.assertEqual(set(single) | set(multi), expected_138)
+        for body in single + multi:
             proto, trusted = self.results[f"{body}#0"]
             self.assertTrue(proto == trusted and _definite(proto), f"{body}: {proto} vs {trusted}")
 
