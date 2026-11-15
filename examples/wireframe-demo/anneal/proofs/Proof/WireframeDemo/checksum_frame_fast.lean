@@ -20,6 +20,7 @@ open Anneal.Scalars
 open Anneal.ITreeWP
 open Anneal.MirFuelFree
 open Anneal.PureMirExec
+open Anneal.SepLogicLenses
 open Anneal.FunctionalTranslation
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
@@ -94,8 +95,8 @@ private theorem impl_verified
   rw [checksumModel_eq_of_callerLocals _ _ b0 b1 b2 b3 b4 b5 b6 b7 rfl]
   refine MirNoCallWpConverges.bind_reachState
     (s' := fastBb1State b0 b1 b2 b3 b4 b5 b6 b7 m ap)
-    (mirStepsConverges_of_runCfgToBlock (target := 1) _ _ _ rfl _ ?entry)
-    (mirNoCallWpConverges_of_runCfgToBlock (target := 0) _ _ rfl _ ?exit)
+    (mirStepsConverges_of_runCfgToBlock_constructive (target := 1) _ _ _ rfl _ ?entry)
+    (mirNoCallWpConverges_of_runCfgToBlock_constructive (target := 0) _ _ rfl _ ?exit)
   case' entry => cases ap -- `StorageLive` checks the active protectors if any
   all_goals
     repeat (

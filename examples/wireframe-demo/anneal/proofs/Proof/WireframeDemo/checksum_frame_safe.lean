@@ -18,6 +18,7 @@ open Anneal.ITreeWP
 open Anneal.MirFuelFree
 open Anneal.MirLoops
 open Anneal.PureMirExec
+open Anneal.SepLogicLenses
 open Anneal.FunctionalTranslation
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
@@ -35,18 +36,12 @@ every `StorageLive`) splits on them; `frame8Mem` and `frame8Pre_cases` are
 shared with the `checksum_frame_fast` equivalence proof.
 -/
 
-theorem mul_0_2 : Nat.mul 0 2 = 0 := rfl
-theorem mul_1_2 : Nat.mul 1 2 = 2 := rfl
-theorem mul_2_2 : Nat.mul 2 2 = 4 := rfl
-theorem mul_3_2 : Nat.mul 3 2 = 6 := rfl
-theorem wrap8_0 : wrapScalarBits 0 18446744073709551616 = 0 := rfl
-theorem wrap8_1 : wrapScalarBits 1 18446744073709551616 = 1 := rfl
-theorem wrap8_2 : wrapScalarBits 2 18446744073709551616 = 2 := rfl
-theorem wrap8_3 : wrapScalarBits 3 18446744073709551616 = 3 := rfl
-theorem wrap8_4 : wrapScalarBits 4 18446744073709551616 = 4 := rfl
-theorem wrap8_5 : wrapScalarBits 5 18446744073709551616 = 5 := rfl
-theorem wrap8_6 : wrapScalarBits 6 18446744073709551616 = 6 := rfl
-theorem wrap8_7 : wrapScalarBits 7 18446744073709551616 = 7 := rfl
+private theorem mul_two (n : Nat) : Nat.mul n 2 = Nat.add n n := Nat.mul_two n
+private theorem wrap8_eq (n : Nat) :
+    wrapScalarBits n 18446744073709551616 =
+      match Nat.ble 18446744073709551616 n with
+      | true => Nat.mod n 18446744073709551616
+      | false => n := rfl
 theorem wrap4_8 : wrapScalarBits 8 4294967296 = 8 := rfl
 
 theorem get?_frame8CallerLocals (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
@@ -200,7 +195,7 @@ theorem safe_noCallWpConverges
   rw [checksumModel_eq_of_callerLocals _ _ b0 b1 b2 b3 b4 b5 b6 b7 rfl]
   let mem₀ := frame8Mem b0 b1 b2 b3 b4 b5 b6 b7 m ap
   refine Anneal.MirFuelFree.MirNoCallWpConverges.bind
-    (mirStepsConverges_of_runCfgToBlock (target := 1)
+    (mirStepsConverges_of_runCfgToBlock_constructive (target := 1)
       Mir.WireframeDemo.checksum_frame_safe.body
       (checksumLoopInv b0 b1 b2 b3 b4 b5 b6 b7 mem₀ 0 0) _ rfl _ ?entry)
     (fun s₀ h_init => mirNoCallWpConverges_forRangeUp 0 4 0
@@ -212,15 +207,17 @@ theorem safe_noCallWpConverges
     have h_ab : a ≤ 196605 := by
       have := checksumPrefix_le hb0 hb1 hb2 hb3 hb4 hb5 hb6 hb7 i
       omega
-    refine mirStepsConverges_of_runCfgToBlock (target := 1) _ _ _ rfl _ ?_
-    rcases (by omega : i = 0 ∨ i = 1 ∨ i = 2 ∨ i = 3) with rfl | rfl | rfl | rfl
+    refine mirStepsConverges_of_runCfgToBlock_constructive (target := 1) _ _ _ rfl _ ?_
+    rcases i with _ | _ | _ | _ | i
+    rotate_left 4
+    · exact False.elim (Nat.not_lt_zero i (Nat.lt_of_add_lt_add_right h_i_lt))
   case' exit =>
     rintro i a s h_ge ⟨h_le, h_a,
       v6, v8, v9, v10, v12, v14, v15, v16, v17, v18, v20, v21, v25, v26, v27, rfl⟩
-    obtain rfl : i = 4 := by omega
+    obtain rfl : i = 4 := Nat.le_antisymm h_le h_ge
     rw [checksumPrefix_four] at h_a
     subst h_a
-    refine mirNoCallWpConverges_of_runCfgToBlock (target := 1) _ _ rfl _ ?_
+    refine mirNoCallWpConverges_of_runCfgToBlock_constructive (target := 1) _ _ rfl _ ?_
   case' entry => cases ap -- `StorageLive` checks the active protectors if any
   all_goals -- evaluate every segment (entry, iterations, exit) to `bb1`
     dsimp only [
@@ -238,8 +235,7 @@ theorem safe_noCallWpConverges
       evalOperandFast, evalConstValue, evalScalarBinOp, operandIsSigned, operandTy,
       stringEq, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
-      scalarModulus_4, scalarModulus_8, mul_4_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2,
-      wrap8_0, wrap8_1, wrap8_2, wrap8_3, wrap8_4, wrap8_5, wrap8_6, wrap8_7, wrap4_8,
+      scalarModulus_4, scalarModulus_8, mul_4_8, mul_two, wrap8_eq, wrap4_8,
       get?Internal_frame8CallerLocals, lookupSwitchTarget, MirStepNode.step,
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
@@ -255,20 +251,20 @@ theorem safe_noCallWpConverges
       Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Bool.decEq,
       instDecidableEqBool]
   case entry.nil | entry.cons => -- the temporaries are still uninitialised
-    exact ⟨rfl, by omega, rfl, .unit, .unit, .unit, .unit, .unit, .unit, .unit, .unit,
+    exact ⟨rfl, Nat.zero_le 4, rfl, .unit, .unit, .unit, .unit, .unit, .unit, .unit, .unit,
       .unit, .unit, .unit, .unit, .unit, .unit, .unit, rfl⟩
   case exit => exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 mem₀ rfl⟩
   all_goals -- iterations: `omega` discharges the symbolic overflow checks
     simp (disch := omega) only [Nat.add_eq, Nat.mul_eq, wrapScalarBits_eq_of_lt,
       bitwiseOrBits_32_mul256_add, nat_ble_eq_false_of_lt]
-    exact ⟨rfl, by omega, by rw [h_a]; rfl,
+    exact ⟨rfl, by decide, by rw [h_a]; rfl,
       _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, rfl⟩
 
 /-- Universal stateful verification certificate for `checksum_frame_safe`. -/
 theorem verified :
     StatefulVerificationResult
       Obligations.WireframeDemo.checksum_frame_safe.statefulClaim :=
-  verifyStatefulMirNoPanic_of_wpConverges _ fun args mem h_pre =>
+  verifyStatefulMirNoPanic_of_wpConverges_constructive _ fun args mem h_pre =>
     (MirWpConverges.of_noCall (safe_noCallWpConverges args mem h_pre)).mono
       fun _ ⟨h_out, h_post⟩ => h_out ▸ h_post
 
