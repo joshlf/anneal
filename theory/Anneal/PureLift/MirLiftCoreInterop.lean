@@ -677,6 +677,79 @@ theorem wpConverges_blockCfgStep_iff_of_noFork
   rw [hRun]
   rfl
 
+/-- **Invariant-scoped fork-free return preservation**: unlike
+`forkFree_eq_of_noFork` (which requires `stepBb` to be fork-free on *all* states,
+including unreachable states where a local could hold a symbolic choice), this
+lemma requires `hNoFork` only on states satisfying `BlockInv`. -/
+theorem runBlockCfg_forkFree_of_ret_inv
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) (PostRet : Ret → Prop)
+    (hLocal : LocalBlockVC stepBb BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st') :
+    ∀ (k : Nat) (bb : Nat) (st : State) (v : Ret),
+      BlockInv bb st →
+      runBlockCfg stepBb bb st k = .ret v →
+      runBlockCfg (forkFree stepBb) bb st k = .ret v
+  | 0, _, _, _, _, h => nomatch h
+  | k + 1, bb, st, v, hInv, h => by
+    have hVC := hLocal bb st hInv
+    rw [runBlockCfg_succ] at h ⊢
+    dsimp only [forkFree]
+    cases hst : stepBb bb st with
+    | jump nextBb st' =>
+      rw [hst] at h hVC
+      exact runBlockCfg_forkFree_of_ret_inv stepBb BlockInv PostRet hLocal
+        hNoFork k nextBb st' v hVC h
+    | jumpWrapped wrapRet nextBb st' =>
+      rw [hst] at h hVC
+      dsimp only at h ⊢
+      cases hRun : runBlockCfg stepBb nextBb st' k with
+      | ret v' =>
+        rw [hRun] at h
+        rw [runBlockCfg_forkFree_of_ret_inv stepBb BlockInv PostRet hLocal
+              hNoFork k nextBb st' v' hVC.1 hRun]
+        exact h
+      | diverged =>
+        rw [hRun] at h
+        exact nomatch h
+      | fault =>
+        rw [hRun] at h
+        exact nomatch h
+    | branchJump mergeRet thenBb elseBb st' =>
+      exact False.elim (hNoFork bb st hInv mergeRet thenBb elseBb st' hst)
+    | ret v' =>
+      rw [hst] at h
+      exact h
+    | fault =>
+      rw [hst] at h
+      exact nomatch h
+
+/-- **Invariant-scoped completeness of the CFG embedding**: for any CFG satisfying
+`LocalBlockVC` that does not fork on `BlockInv` states (even if `stepBb` would
+emit `.branchJump` on unreachable symbolic states outside `BlockInv`), the
+embedded machine converges from `(bb, st)` iff `runBlockCfg` returns at some
+fuel. -/
+theorem wpConverges_blockCfgStep_iff_of_blockInv
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) (PostRet : Ret → Prop)
+    (hLocal : LocalBlockVC stepBb BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st')
+    (bb : Nat) (st : State) (hInv : BlockInv bb st) (P : Ret → Prop) :
+    PureMirExec.WpConverges (blockCfgStep stepBb) ⟨fun v => v, bb, st⟩ P ↔
+      Exists fun k => Exists fun v => runBlockCfg stepBb bb st k = .ret v ∧ P v := by
+  refine ⟨runBlockCfg_of_wpConverges stepBb, ?_⟩
+  intro h
+  obtain ⟨k, v, hRun, hP⟩ := h
+  refine ⟨k, v, ?_, hP⟩
+  rw [evalFuel_blockCfgStep,
+      runBlockCfg_forkFree_of_ret_inv stepBb BlockInv PostRet hLocal hNoFork k
+        bb st v hInv hRun]
+  rfl
+
 end BlockMachine
 
 /-! ## Loops: `runWhileFlowSteps_cutpoint_sound` and `forRangeUp` -/
@@ -1084,6 +1157,64 @@ theorem mirWpConverges_of_blockCfg_forwardSim
     Anneal.MirFuelFree.MirWpConverges body ms
       (fun o => Exists fun v => P v ∧ RetRel v o) :=
   PureMirExec.mirWpConverges_of_wpConverges (wpConverges_of_forwardSim hSim h ms hR)
+
+/-- **`CfgCertificate` adequacy for the embedded CFG machine**: a `CfgCertificate`
+together with `HoldsFnSpec (evalFnValue ...)` and invariant-scoped fork-freedom
+yields fuel-free `WpConverges` of `blockCfgStep`. -/
+theorem wpConverges_of_cfgCertificate {Val : Type}
+    (alg : ValAlgebra Val) (cert : CfgCertificate alg)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (post : FuncOut Val → Prop)
+    (hInit : initFnState alg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue alg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState Val → Prop) (PostRet : FuncOut Val → Prop)
+    (hLocal : LocalBlockVC (stepBasicBlock alg cert.blocks) BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock alg cert.blocks bb st ≠
+          .branchJump mergeRet thenBb elseBb st')
+    (hInv0 : BlockInv cert.entryBb st0) :
+    PureMirExec.WpConverges (blockCfgStep (stepBasicBlock alg cert.blocks))
+      ⟨fun o => o, cert.entryBb, st0⟩ post := by
+  cases hEval : evalFnValue alg params cert.plan cert.retExpr with
+  | fail =>
+    rw [hEval] at hSpec
+    exact nomatch hSpec
+  | ok out =>
+    rw [hEval] at hSpec
+    exact (wpConverges_blockCfgStep_iff_of_blockInv
+      (stepBasicBlock alg cert.blocks) BlockInv PostRet hLocal hNoFork
+      cert.entryBb st0 hInv0 post).mpr
+      ⟨cert.fuel, out, cert.sound params st0 out hInit hEval, hSpec⟩
+
+/-- **`CfgCertificate` refines live MIR**: composes `wpConverges_of_cfgCertificate`
+with `mirWpConverges_of_blockCfg_forwardSim` to transport a `CfgCertificate` and
+`HoldsFnSpec` proof to live `MirWpConverges`. -/
+theorem mirWpConverges_of_cfgCertificate {Val : Type}
+    (alg : ValAlgebra Val) (cert : CfgCertificate alg)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (post : FuncOut Val → Prop)
+    (hInit : initFnState alg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue alg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState Val → Prop) (PostRet : FuncOut Val → Prop)
+    (hLocal : LocalBlockVC (stepBasicBlock alg cert.blocks) BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock alg cert.blocks bb st ≠
+          .branchJump mergeRet thenBb elseBb st')
+    (hInv0 : BlockInv cert.entryBb st0)
+    {body : CapturedMir}
+    {R : BlockMachineState (SymState Val) (FuncOut Val) → MachineState → Prop}
+    {RetRel : FuncOut Val → MirOutcome → Prop}
+    (hSim : ForwardSim (blockCfgStep (stepBasicBlock alg cert.blocks))
+      (PureMirExec.mirStep body) R RetRel)
+    {ms : MachineState} (hR : R ⟨fun o => o, cert.entryBb, st0⟩ ms) :
+    Anneal.MirFuelFree.MirWpConverges body ms
+      (fun o => Exists fun v => post v ∧ RetRel v o) :=
+  mirWpConverges_of_blockCfg_forwardSim hSim
+    (wpConverges_of_cfgCertificate alg cert params st0 post hInit hSpec BlockInv
+      PostRet hLocal hNoFork hInv0)
+    hR
 
 /-- **PureLift segments become MirLiftCore join paths** (`LiftBlockToJoin`): a
 PureLift CFG segment (for example from `runBlockCfgToBlock`, or from
@@ -1678,6 +1809,62 @@ theorem countdown_wpConverges_of_runBlockCfg :
       (· = 100) :=
   (wpConverges_blockCfgStep_iff_of_noFork testCfgStep testCfgStep_noFork 0 3
     (· = 100)).mpr ⟨10, 100, rfl, rfl⟩
+
+/-- **Why invariant-scoped `wpConverges_blockCfgStep_iff_of_blockInv` is strictly
+more general than global `wpConverges_blockCfgStep_iff_of_noFork`**:
+`sampleBranchBlockCfg` has a `.branch (.use (.localSub 0 [])) 1 2` terminator,
+so on an unreachable state where `_0` holds `.symBool true` it emits
+`.branchJump`, refuting the global `hNoFork` hypothesis. Under the concrete
+entry invariant `BlockInv`, however, it never forks and
+`wpConverges_blockCfgStep_iff_of_blockInv` applies cleanly. -/
+theorem sampleBranchBlockCfg_not_global_noFork :
+    ¬ (∀ bb st mergeRet thenBb elseBb st',
+        stepBasicBlock stdValAlg sampleBranchBlockCfg bb st ≠
+          .branchJump mergeRet thenBb elseBb st') := by
+  intro hAll
+  exact hAll 0 ⟨[⟨.symBool true, .unborrowed⟩], [], [], [], [], 0⟩
+    (mergeFuncOut stdValAlg (.symBool true)) 1 2
+    ⟨[⟨.symBool true, .unborrowed⟩], [], [], [], [], 0⟩ rfl
+
+def sampleBranchTrueInv (bb : Nat) (st : SymState StdVal) : Prop :=
+  (bb = 0 ∧ st = ⟨[⟨.bool true, .unborrowed⟩], [], [], [], [], 0⟩) ∨
+  (bb = 1 ∧ st = ⟨[⟨.bool true, .unborrowed⟩], [], [], [], [], 0⟩) ∨
+  (bb = 3 ∧
+    st = ⟨[⟨.bool true, .unborrowed⟩, ⟨.nat 10, .unborrowed⟩],
+          [], [], [], [], 0⟩)
+
+theorem sampleBranchTrue_localVC :
+    LocalBlockVC (stepBasicBlock stdValAlg sampleBranchBlockCfg)
+      sampleBranchTrueInv (· = ⟨.nat 10, []⟩) := by
+  intro bb st hInv
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · exact Or.inr (Or.inl ⟨rfl, rfl⟩)
+  · exact Or.inr (Or.inr ⟨rfl, rfl⟩)
+  · exact rfl
+
+theorem sampleBranchTrue_noFork :
+    ∀ bb st, sampleBranchTrueInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock stdValAlg sampleBranchBlockCfg bb st ≠
+          .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st hInv mergeRet thenBb elseBb st' hStep
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · exact nomatch hStep
+  · exact nomatch hStep
+  · exact nomatch hStep
+
+theorem sampleBranchBlockCfg_wpConverges_of_blockInv :
+    PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg sampleBranchBlockCfg))
+      ⟨fun o => o, 0, ⟨[⟨.bool true, .unborrowed⟩], [], [], [], [], 0⟩⟩
+      (· = ⟨.nat 10, []⟩) :=
+  (wpConverges_blockCfgStep_iff_of_blockInv
+    (stepBasicBlock stdValAlg sampleBranchBlockCfg)
+    sampleBranchTrueInv (· = ⟨.nat 10, []⟩)
+    sampleBranchTrue_localVC sampleBranchTrue_noFork
+    0 ⟨[⟨.bool true, .unborrowed⟩], [], [], [], [], 0⟩
+    (Or.inl ⟨rfl, rfl⟩) (· = ⟨.nat 10, []⟩)).mpr
+    ⟨4, ⟨.nat 10, []⟩, rfl, rfl⟩
 
 end Canaries
 

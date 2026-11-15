@@ -3317,25 +3317,48 @@ def round14DepositRegionSpec (gid : RegionGroupId)
   fwdOuts := fun _ _ => some []
   backFn := fun _ _ _ _ => some ([], dep)
 
+/-- A `returnsMutBorrow = true` call summary that forwards its mutable argument
+into the returned loan cell and writes the original `mutVals` back at loan
+termination (ignoring mutations to the returned loan cell). If `fwd` were
+allowed to extract a unique `.activeMut` handle from a locked local into the
+returned loan cell, a nested by-value swap could move that handle into a second
+local before `back` resurrects it from `vOld`. -/
+def round14PassthroughMutBorrowSummary : CallSummary StdVal where
+  returnsMutBorrow := true
+  fwd _ muts :=
+    match muts with
+    | [v] => some v
+    | _ => none
+  back _ muts _ := some muts
+
 /-- Round 14 regression tests for:
 1. Reference entry parameters (`.mutRef` and `.sharedRef`) rejecting initial
    pointed-to values that smuggle decodable borrow handles,
 2. `PrimAction.call` (`returnsMutBorrow = true`) and `PrimAction.callMultiRegion`
-   rejecting fabricated or duplicated non-copyable handles in `summary.fwd`,
-   `spec.fwdOuts`, and `endRegionGroupInState` `newDeposits`,
+   rejecting non-copyable handles in `summary.fwd`, `spec.fwdOuts`, and
+   `endRegionGroupInState` `newDeposits` (including when the handle was present
+   in `mutVals` or `outVals`, blocking the passthrough-resurrection and
+   deposit-duplication loopholes),
 3. `stepBasicBlock` rejecting handle-bearing outputs on `.ret` and early-return
-   wrappers (`.returned` and `.guardedContinuing`), and
-4. Bidirectional single-block equivalence `cfg_certificate_step_iff`. -/
+   wrappers (`.returned` and `.guardedContinuing`),
+4. Bidirectional single-block equivalence `cfg_certificate_step_iff`, and
+5. Universal spatial roundtrip `freeze_reabsorb_roundtrip_of_sizeBoundDecreasing`
+   on `stdValAlg` for all `v : StdVal`. -/
 theorem round14_handle_hygiene_and_cfg_complete_regressions_tests :
     -- 1. Reference parameters cannot smuggle handles inside pointed-to `p.val`:
     initFnState stdValAlg [⟨.mutRef 0 [], .refVal 0 []⟩] = .fail ∧
     initFnState stdValAlg
       [⟨.mutRef 0 [], .nat 5⟩, ⟨.sharedRef 1 [], .refVal 0 []⟩] = .fail ∧
     -- 2. Mutable-borrow call `fwd`, region `fwdOuts`, and region `newDeposits`
-    -- cannot fabricate handles:
+    -- cannot fabricate or extract non-copyable handles:
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
       (.seq
         (.act (.call 1 round14ForgeMutBorrowSummary [] [.derefSub 0 []]))
+        (.act (.endLoan 1)))
+      (.constVal .unit) = .fail ∧
+    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
+      (.seq
+        (.act (.call 1 round14PassthroughMutBorrowSummary [] [.localSub 0 []]))
         (.act (.endLoan 1)))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
@@ -3350,6 +3373,13 @@ theorem round14_handle_hygiene_and_cfg_complete_regressions_tests :
           , round14DepositRegionSpec 1 [] [.refVal 0 []] ]))
         (.seq (.act (.endRegionGroup 1)) (.act (.endRegionGroup 0))))
       (.constVal .unit) = .fail ∧
+    endRegionGroupInState stdValAlg 0
+      ⟨[⟨.refVal 0 [], .mutLocked 1⟩],
+       [⟨0, .activeMut, ⟨.nat 5, .unborrowed⟩, .rootParam 0⟩,
+        ⟨1, .activeMut, ⟨.refVal 0 [], .unborrowed⟩, .regionOut 0 0⟩],
+       [⟨0, true, 1, [(.localReg 0, [])], [1], [],
+         fun outs _ => some (outs, outs)⟩],
+       [], [], 0⟩ = .fail ∧
     -- 3. `stepBasicBlock` rejects returning a handle directly or via an
     -- early-return branch wrapper:
     (match initFnState stdValAlg
@@ -3377,11 +3407,53 @@ theorem round14_handle_hygiene_and_cfg_complete_regressions_tests :
         0 st0 1 = .ret out ↔
        evalFnValue stdValAlg [⟨.byVal, .nat 0⟩]
          (.act (.assign (.localSub 1 []) (.constVal (.nat 42))))
-         (.use (.localSub 1 [])) = .ok out)) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩,
+         (.use (.localSub 1 [])) = .ok out)) ∧
+    -- 5. Universal `StdVal` spatial roundtrip via `stdVal_sizeBoundDecreasing`:
+    (@unpinFromSpatialInState StdVal = @reabsorbFromSpatialInState StdVal) ∧
+    (∀ (v : StdVal),
+      let st0 : SymState StdVal :=
+        { locals := [⟨v, .mutLocked 0⟩]
+          loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
+          regionGroups := []
+          regionDeposits := []
+          spatial := []
+          nextSpatialTag := 0 }
+      match freezeToSpatialInState stdValAlg 0 valueCellCodec st0 with
+      | .ok stPinned =>
+        match reabsorbFromSpatialInState stdValAlg 0 valueCellCodec stPinned with
+        | .ok stReabsorbed =>
+          match findLoan 0 stReabsorbed.loans with
+          | some e =>
+            e.cell.val = v ∧
+            e.phase.isActiveMut = true ∧
+            stReabsorbed.spatial.isEmpty = true
+          | none => False
+        | .fail => False
+      | .fail => False) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩,
    fun st0 out hInit =>
      cfg_certificate_step_iff stdValAlg [⟨.byVal, .nat 0⟩]
        (.act (.assign (.localSub 1 []) (.constVal (.nat 42))))
-       (.use (.localSub 1 [])) st0 out hInit⟩
+       (.use (.localSub 1 [])) st0 out hInit,
+   rfl,
+   fun v => by
+     have h := freeze_reabsorb_roundtrip_of_sizeBoundDecreasing stdValAlg
+       stdVal_sizeBoundDecreasing valueCellCodec valueCellCodec rfl v rfl
+     dsimp only at h ⊢
+     cases hFrz : freezeToSpatialInState stdValAlg 0 valueCellCodec
+       (SymState.mk [{ val := v, perm := PermTree.mutLocked 0 }]
+         [LoanEntry.mk 0 LoanPhase.activeMut { val := v, perm := PermTree.unborrowed }
+           (BackTarget.direct (OwnerRef.localReg 0) [])]
+         [] [] [] 0) with
+     | fail => rw [hFrz] at h; nomatch h
+     | ok stPinned =>
+       rw [hFrz] at h; dsimp only at h ⊢
+       cases hReab : reabsorbFromSpatialInState stdValAlg 0 valueCellCodec stPinned with
+       | fail => rw [hReab] at h; nomatch h
+       | ok stReabsorbed =>
+         rw [hReab] at h; dsimp only at h ⊢
+         cases hFind : findLoan 0 stReabsorbed.loans with
+         | none => rw [hFind] at h; nomatch h
+         | some e => rw [hFind] at h; dsimp only at h ⊢; exact h⟩
 
 end Anneal.PureLift

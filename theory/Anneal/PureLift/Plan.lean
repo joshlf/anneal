@@ -287,9 +287,12 @@ def installRegionGroups {Val : Type} (alg : ValAlgebra Val)
           match spec.fwdOuts pureVals inMutVals with
           | none => none
           | some outVals =>
-            -- Forward output cells must not fabricate or duplicate non-copyable
-            -- handles that were not present in the locked mutable inputs.
-            if !replaceableVals alg stLocked.loans inMutVals outVals then none
+            -- Forward output cells coexist with the locked `inTargets` (which
+            -- retain their pre-call `vOld` for `targetsReplaceable` at
+            -- `endRegionGroupInState`), so output cells may carry only copyable
+            -- handles; otherwise a nested swap could move a unique handle out of
+            -- an output cell before `backFn` resurrects it from `vOld`.
+            if !outVals.all (copyableVal alg stLocked.loans) then none
             else
             match allocateRegionGroupOutputs alg spec.groupId 0
                     spec.outDsts outVals stLocked with
@@ -390,10 +393,13 @@ def stepAction {Val : Type} (alg : ValAlgebra Val)
         | none => .fail
         | some retVal =>
           if summary.returnsMutBorrow then
-            -- A returned mutable borrow cell is a projection of the locked
-            -- mutable inputs, so it must not fabricate or duplicate non-copyable
-            -- handles that were not in `mutVals`.
-            if !replaceableVals alg stLocked.loans mutVals [retVal] then .fail
+            -- The returned mutable borrow cell coexists with the locked
+            -- `targets` (which retain `vOld` for `replaceableVal` at
+            -- `endLoanInState`), so `retVal` may carry only copyable handles;
+            -- otherwise a nested swap could move a unique handle out of the
+            -- returned loan cell before `summary.back` resurrects it from
+            -- `vOld`.
+            if !copyableVal alg stLocked.loans retVal then .fail
             else
             let newEntry : LoanEntry Val :=
               ⟨newLid, .activeMut, ⟨retVal, .unborrowed⟩,

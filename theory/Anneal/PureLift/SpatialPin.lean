@@ -408,6 +408,86 @@ def reabsorbFromSpatialInState {Val : Type} (alg : ValAlgebra Val)
             .fail
     | _ => .fail
 
+/-- Alias of `reabsorbFromSpatialInState` for Episode 2 bridge compatibility. -/
+abbrev unpinFromSpatialInState := @reabsorbFromSpatialInState
+
+/-- General algebra-parametric round-trip and codec-binding theorem: under
+`SizeBoundDecreasing alg`, freezing an untouched loan with `pinnedCodec` (whose
+encoding of `v` has no `.uninit` cells) and immediately reabsorbing with any
+`collidingCodec` sharing `pinnedCodec.codecId` decodes via `pinnedCodec`
+(`pinnedCodec.decode_encode v`), restores `v` and `.activeMut`, and empties
+`stReabsorbed.spatial`. -/
+theorem freeze_reabsorb_roundtrip_of_sizeBoundDecreasing {Val : Type}
+    (alg : ValAlgebra Val) (hDec : SizeBoundDecreasing alg)
+    (pinnedCodec collidingCodec : SpatialCodec Val)
+    (hCid : (pinnedCodec.codecId != collidingCodec.codecId) = false)
+    (v : Val) (hInit : hasUninitCell (pinnedCodec.encode v) = false) :
+    let st0 : SymState Val :=
+      { locals := [⟨v, .mutLocked 0⟩]
+        loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
+        regionGroups := []
+        regionDeposits := []
+        spatial := []
+        nextSpatialTag := 0 }
+    match freezeToSpatialInState alg 0 pinnedCodec st0 with
+    | .ok stPinned =>
+      match reabsorbFromSpatialInState alg 0 collidingCodec stPinned with
+      | .ok stReabsorbed =>
+        match findLoan 0 stReabsorbed.loans with
+        | some e =>
+          e.cell.val = v ∧
+          e.phase.isActiveMut = true ∧
+          stReabsorbed.spatial.isEmpty = true
+        | none => False
+      | .fail => False
+    | .fail => False := by
+  dsimp only
+  let st0 : SymState Val :=
+    { locals := [⟨v, .mutLocked 0⟩]
+      loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
+      regionGroups := []
+      regionDeposits := []
+      spatial := []
+      nextSpatialTag := 0 }
+  have hFrz :
+      freezeToSpatialInState alg 0 pinnedCodec st0 =
+        .ok
+          ⟨[⟨v, .mutLocked 0⟩],
+           [⟨0, .spatialPinned 0 pinnedCodec, ⟨v, .unborrowed⟩,
+             .direct (.localReg 0) []⟩],
+           [], [], [⟨0, 0, .readWrite, 0, 0, pinnedCodec.encode v⟩], 1⟩ := by
+    unfold freezeToSpatialInState
+    dsimp [st0, hasUniqueLoanId, countLoanId, findLoan, LoanPhase.isActiveMut,
+      isUnborrowed, noActiveChildLoanEdgesIn, noActiveChildRegionEdges,
+      hasSpatialBlockId, countSpatialBlockId, countBlocksForLoan, updateLoan]
+    rw [hInit]
+    rfl
+  rw [hFrz]
+  dsimp only
+  have hReab :
+      reabsorbFromSpatialInState alg 0 collidingCodec
+        ⟨[⟨v, .mutLocked 0⟩],
+         [⟨0, .spatialPinned 0 pinnedCodec, ⟨v, .unborrowed⟩,
+           .direct (.localReg 0) []⟩],
+         [], [], [⟨0, 0, .readWrite, 0, 0, pinnedCodec.encode v⟩], 1⟩ =
+        .ok
+          ⟨[⟨v, .mutLocked 0⟩],
+           [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩],
+           [], [], [], 1⟩ := by
+    unfold reabsorbFromSpatialInState
+    dsimp [hasUniqueLoanId, countLoanId, findLoan, findSpatialBlock,
+      countBlocksForLoan, updateLoan]
+    rw [hCid]
+    dsimp
+    rw [hInit]
+    dsimp
+    rw [pinnedCodec.decode_encode v]
+    dsimp
+    rw [replaceableVal_self_of_sizeBoundDecreasing alg hDec]
+    rfl
+  rw [hReab]
+  exact ⟨rfl, rfl, rfl⟩
+
 /-!
 ## Exhaustive Kernel-Checked Tests for `SpatialPin`
 -/

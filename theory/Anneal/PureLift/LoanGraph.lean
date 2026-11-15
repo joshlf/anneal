@@ -1775,11 +1775,11 @@ def endRegionGroupInState {Val : Type} (alg : ValAlgebra Val)
         match g.backFn outVals childSplit.1 with
         | none => .fail
         | some (updatedInputs, newDeposits) =>
-          -- Newly deposited values must not fabricate or duplicate non-copyable
-          -- handles that were not present in the retired outputs or child
-          -- deposits.
-          if !replaceableVals alg stRetired.loans
-               (outVals ++ childSplit.1) newDeposits then
+          -- Newly deposited values are side-channel values passed to a parent
+          -- group while `updatedInputs` are written back to `g.inputTargets`
+          -- (checked against `g.inputTargets` by `targetsReplaceable`), so
+          -- deposits may carry only copyable handles.
+          if !newDeposits.all (copyableVal alg stRetired.loans) then
             .fail
           else
           -- Output loans are already `.ended` in `stRetired`, so their
