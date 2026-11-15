@@ -2310,15 +2310,10 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
     }
 }
 
-/// Extract the `confirm_tag_<fn_name>`, `confirm_probe_<fn_name>`, and (when
-/// present) `confirm_frame_<fn_name>` and `confirm_message_<fn_name>` theorems
-/// from `MiriOracleConfirm.lean` source, preceded by every confirm-module
-/// definition that they use: the synthetic constructor stub (when
-/// `linkedCallees` refers to it), `linkedCallees`, the run probe in
-/// [`PROBE_EXEC_LEAN`], and the panic-origin probe in
-/// [`PANIC_MESSAGE_PROBE_LEAN`] (when a frame or message theorem is present).
-/// The snippet therefore names no definition local to the confirm module that
-/// it does not also contain.
+/// The `namespace <ident> ... end <ident>` section of `confirm_src` enclosing
+/// byte offset `theorem_pos` (the whole source when there is none), so a
+/// multi-group `MiriOracleConfirm.lean` yields only the definitions of the
+/// group whose kernel check accepted the theorem.
 fn enclosing_confirm_namespace_slice<'a>(confirm_src: &'a str, theorem_pos: usize) -> &'a str {
     let prefix = &confirm_src[..theorem_pos];
     let ns_pos = prefix
@@ -2342,6 +2337,16 @@ fn enclosing_confirm_namespace_slice<'a>(confirm_src: &'a str, theorem_pos: usiz
     }
 }
 
+/// Extract the `confirm_tag_<fn_name>`, `confirm_probe_<fn_name>`, and (when
+/// present) `confirm_frame_<fn_name>` and `confirm_message_<fn_name>` theorems
+/// from `MiriOracleConfirm.lean` source, preceded by every confirm-module
+/// definition that they use: the synthetic constructor stub (when
+/// `linkedCallees` refers to it), `linkedCallees`, the run probe in
+/// [`PROBE_EXEC_LEAN`], and the panic-origin probe in
+/// [`PANIC_MESSAGE_PROBE_LEAN`] (when a frame or message theorem is present),
+/// all taken from the namespace section that holds `fn_name`'s theorems
+/// ([`enclosing_confirm_namespace_slice`]). The snippet therefore names no
+/// definition local to the confirm module that it does not also contain.
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     let theorem_headers = [
         format!("theorem confirm_tag_{fn_name} :"),
@@ -3576,29 +3581,271 @@ const PROBE_LEAN_MEMORY_MB: &str = "8192";
 /// runs of `oracle/MiriOracleConfirm*.lean`.
 const CONFIRM_LEAN_MEMORY_MB: &str = "4096";
 
+/// Hard resident-set budget (MiB) for one Stage 1b `lake env lean` probe
+/// process tree, enforced by [`run_lean_with_rss_budget`].
+///
+/// Lean's `-M` only bounds its small-object allocator: kernel `whnf` /
+/// `isDefEq` reduction memory is not counted. At 800-candidate scale a single
+/// `rfl` confirmation (`pass_int_widening_and_truncating_casts`, seed
+/// `0x42649b91`) grows past 7 GiB RSS under `-M 4096` (~280 MB/s), so without
+/// a harness-side bound one theorem OOM-kills the enclosing cgroup and with it
+/// the whole campaign. Measured healthy peaks: <= 0.65 GiB per 64-candidate
+/// probe chunk and <= 1.2 GiB per 16-entry confirm chunk.
+const PROBE_LEAN_RSS_BUDGET_MIB: u64 = 8192;
+
+/// Hard resident-set budget (MiB) for one Stage 2 `lake env lean` kernel
+/// confirmation process tree (see [`PROBE_LEAN_RSS_BUDGET_MIB`]); a run killed
+/// for exceeding it is classified as resource exhaustion
+/// ([`lean_confirm_failure_is_resource_exhaustion`]).
+const CONFIRM_LEAN_RSS_BUDGET_MIB: u64 = 4096;
+
+/// Overrides both per-stage RSS budget caps (MiB, `>= 1`).
+const MIRI_LEAN_RSS_BUDGET_ENV: &str = "ANNEAL_MIRI_LEAN_MAX_RSS_MIB";
+
+/// How often [`run_lean_with_rss_budget`] samples the process tree.
+const LEAN_RSS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Per-worker resident-set budget (KiB) for a Lean stage running `jobs`
+/// concurrent workers: the stage cap (`stage_cap_mib`, or
+/// `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` when set) bounded by 85% of this worker's share
+/// of the effective cgroup / host headroom, and never below 512 MiB.
+fn miri_lean_rss_budget_kib(
+    stage_cap_mib: u64,
+    override_mib: Option<&str>,
+    jobs: usize,
+    avail_kib: Option<u64>,
+) -> u64 {
+    let cap_kib = parse_positive_jobs(override_mib)
+        .map_or(stage_cap_mib, |n| n as u64)
+        .saturating_mul(1024);
+    let share_kib = avail_kib.map(|a| a / jobs.max(1) as u64 / 100 * 85);
+    share_kib
+        .map_or(cap_kib, |share| cap_kib.min(share))
+        .max(512 * 1024)
+}
+
+/// Resolves the per-worker RSS budget (KiB) for a Lean stage from
+/// `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` and the current effective memory headroom.
+fn resolve_miri_lean_rss_budget_kib(stage_cap_mib: u64, jobs: usize) -> u64 {
+    let (_, avail_kib) = probe_effective_memory_kib();
+    miri_lean_rss_budget_kib(
+        stage_cap_mib,
+        env::var(MIRI_LEAN_RSS_BUDGET_ENV).ok().as_deref(),
+        jobs,
+        avail_kib,
+    )
+}
+
+/// `root` and all of its live descendants, from a `/proc/*/stat` snapshot.
+#[cfg(target_os = "linux")]
+fn process_tree_pids(root: u32) -> Vec<u32> {
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // `pid (comm) state ppid ...`, where `comm` may contain spaces or `)`.
+            let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+                continue;
+            };
+            if let Some(ppid) = after_comm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<u32>().ok())
+            {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    let mut seen: BTreeSet<u32> = BTreeSet::from([root]);
+    let mut tree = vec![root];
+    let mut i = 0;
+    while i < tree.len() {
+        if let Some(kids) = children.get(&tree[i]) {
+            for &kid in kids {
+                if seen.insert(kid) {
+                    tree.push(kid);
+                }
+            }
+        }
+        i += 1;
+    }
+    tree
+}
+
+/// Total resident set (KiB, `VmRSS`) of `root` and its descendants, or `None`
+/// where `/proc` is unavailable (the budget is then not enforced).
+fn process_tree_rss_kib(root: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut total: Option<u64> = None;
+        for pid in process_tree_pids(root) {
+            let rss = fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("VmRSS:"))
+                        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+                });
+            if let Some(rss) = rss {
+                total = Some(total.unwrap_or(0) + rss);
+            }
+        }
+        total
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+/// SIGKILLs `child` and every descendant (`lake env lean` runs `lean` as a
+/// grandchild of the harness, so killing `lake` alone would orphan the
+/// runaway `lean`).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        let root = child.id();
+        for pid in process_tree_pids(root).into_iter().rev() {
+            if pid != root
+                && let Ok(pid) = i32::try_from(pid)
+                && pid > 0
+            {
+                // SAFETY: `kill(2)` takes plain integers and has no memory-safety
+                // preconditions; a pid that has already exited fails with ESRCH.
+                unsafe {
+                    kill(pid, SIGKILL);
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Result of [`run_lean_with_rss_budget`].
+struct BudgetedOutput {
+    output: std::process::Output,
+    /// Process-tree RSS (KiB) observed when the budget was exceeded and the
+    /// tree was killed.
+    budget_exceeded_kib: Option<u64>,
+}
+
+/// Runs `cmd` to completion capturing stdout / stderr like
+/// [`Command::output`], but SIGKILLs its whole process tree as soon as the
+/// tree's resident set exceeds `budget_kib` (sampled every
+/// [`LEAN_RSS_POLL_INTERVAL`]), so a runaway Lean kernel reduction is contained
+/// to its own run instead of OOM-killing the enclosing cgroup.
+fn run_lean_with_rss_budget(
+    cmd: &mut Command,
+    budget_kib: Option<u64>,
+) -> std::io::Result<BudgetedOutput> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout_reader = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr_reader = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let mut budget_exceeded_kib = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+        if let Some(budget) = budget_kib
+            && let Some(rss) = process_tree_rss_kib(child.id())
+            && rss > budget
+        {
+            budget_exceeded_kib = Some(rss);
+            kill_process_tree(&mut child);
+            break child.wait()?;
+        }
+        std::thread::sleep(LEAN_RSS_POLL_INTERVAL);
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(BudgetedOutput {
+        output: std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        budget_exceeded_kib,
+    })
+}
+
+/// Diagnostic appended to a run killed by [`run_lean_with_rss_budget`]. It is
+/// an `error:` line (so every diagnostics filter surfaces it) containing
+/// `out of memory`, so the run classifies as resource exhaustion even if `lake`
+/// reported an exit code before the kill reached it.
+fn rss_budget_kill_note(budget_kib: u64, observed_kib: u64) -> String {
+    format!(
+        "error: miri-difftest killed `lake env lean` (out of memory guard): process-tree \
+         resident set {} MiB exceeded the {} MiB budget (Lean's -M does not bound kernel \
+         reduction memory; override with {MIRI_LEAN_RSS_BUDGET_ENV})",
+        observed_kib / 1024,
+        budget_kib / 1024
+    )
+}
+
 /// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB <rel_oracle_path>` in `dot_anneal`
-/// with `LEAN_NUM_THREADS=1` so concurrent confirm chunk workers never multiply threads.
+/// with `LEAN_NUM_THREADS=1` (so concurrent confirm chunk workers never
+/// multiply threads) under a hard `rss_budget_kib` resident-set budget.
 fn run_lean_confirm_file(
     lake_bin: &Path,
     dot_anneal: &Path,
     rel_oracle_path: &str,
-) -> Result<std::process::Output, String> {
-    Command::new(lake_bin)
-        .current_dir(dot_anneal)
+    rss_budget_kib: u64,
+) -> Result<LeanConfirmRun, String> {
+    let mut cmd = Command::new(lake_bin);
+    cmd.current_dir(dot_anneal)
         .env("LEAN_NUM_THREADS", "1")
         .arg("env")
         .arg("lean")
         .arg("-M")
         .arg(CONFIRM_LEAN_MEMORY_MB)
-        .arg(rel_oracle_path)
-        .output()
-        .map_err(|err| {
-            format!(
-                "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
-                 {rel_oracle_path}': {err}",
-                lake_bin.display()
-            )
-        })
+        .arg(rel_oracle_path);
+    let run = run_lean_with_rss_budget(&mut cmd, Some(rss_budget_kib)).map_err(|err| {
+        format!(
+            "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
+             {rel_oracle_path}': {err}",
+            lake_bin.display()
+        )
+    })?;
+    Ok(LeanConfirmRun::from_budgeted_output(&run, rss_budget_kib))
 }
 
 fn sanitize_lean_file_stem(raw: &str) -> String {
@@ -4035,13 +4282,25 @@ struct LeanConfirmRun {
 }
 
 impl LeanConfirmRun {
-    fn from_output(out: &std::process::Output) -> Self {
+    /// Converts a [`run_lean_with_rss_budget`] result. A run killed for
+    /// exceeding `budget_kib` is reported as signal-terminated with an
+    /// `out of memory` note, i.e. as resource exhaustion, never as a kernel
+    /// rejection.
+    fn from_budgeted_output(run: &BudgetedOutput, budget_kib: u64) -> Self {
+        let out = &run.output;
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if let Some(observed_kib) = run.budget_exceeded_kib {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&rss_budget_kill_note(budget_kib, observed_kib));
+        }
         Self {
-            success: out.status.success(),
-            signal_terminated: out.status.code().is_none(),
+            success: out.status.success() && run.budget_exceeded_kib.is_none(),
+            signal_terminated: out.status.code().is_none() || run.budget_exceeded_kib.is_some(),
             status: out.status.to_string(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr,
         }
     }
 }
@@ -4055,9 +4314,28 @@ struct ChunkedMiriConfirm {
     /// so `MiriOracleConfirm.lean` preserves each slice's kernel-checked
     /// `linkedCallees` environment without cross-chunk contamination.
     confirmed_groups: Vec<Vec<MiriConfirmEntry>>,
-    /// Names of entries whose confirmation exhausted a resource
-    /// ([`lean_confirm_failure_is_resource_exhaustion`]).
-    unconfirmed: BTreeSet<String>,
+    /// Entries whose confirmation exhausted a resource
+    /// ([`lean_confirm_failure_is_resource_exhaustion`]), keyed by name, with
+    /// the diagnostic explaining the downgrade to `kernel_confirmed = false`.
+    unconfirmed: BTreeMap<String, String>,
+}
+
+/// One-line reason for a resource-exhausted confirmation: the run's exit
+/// status plus its last highlighted diagnostics (`error:` / budget-kill lines).
+fn resource_exhaustion_reason(module_name: &str, run: &LeanConfirmRun) -> String {
+    let highlights = extract_lean_error_lines(&run.stdout, &run.stderr, 3);
+    let detail = if highlights.is_empty() {
+        run.stderr
+            .lines()
+            .chain(run.stdout.lines())
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("(no diagnostics)")
+            .to_string()
+    } else {
+        highlights.join(" | ")
+    };
+    format!("oracle/{module_name} ({}): {detail}", run.status)
 }
 
 /// Stage 2: kernel-confirms `to_confirm` in `MiriOracleConfirm_{chunk_idx:03}.lean`
@@ -4092,7 +4370,7 @@ where
     let chunks: Vec<&[MiriConfirmEntry]> = to_confirm.chunks(chunk_size).collect();
     let mut confirmed: Vec<MiriConfirmEntry> = Vec::with_capacity(to_confirm.len());
     let mut confirmed_groups: Vec<Vec<MiriConfirmEntry>> = Vec::with_capacity(chunks.len());
-    let mut unconfirmed: BTreeSet<String> = BTreeSet::new();
+    let mut unconfirmed: BTreeMap<String, String> = BTreeMap::new();
 
     for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
         let mut prepared: Vec<(String, &[MiriConfirmEntry])> = Vec::with_capacity(wave.len());
@@ -4149,7 +4427,10 @@ where
                     run.signal_terminated,
                     &format!("{}\n{}", run.stdout, run.stderr),
                 ) {
-                    unconfirmed.insert(entry.0.name.clone());
+                    unconfirmed.insert(
+                        entry.0.name.clone(),
+                        resource_exhaustion_reason(&module_name, &run),
+                    );
                 } else {
                     return Err(format_lean_command_failure(
                         &format!(
@@ -4399,6 +4680,8 @@ fn run_linked_difftest_oracle_pipeline(
                 .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
             clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe"]);
 
+            let probe_rss_budget_kib =
+                resolve_miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, lean_jobs);
             let probe_errors = aggregate_miri_probe_stage(
                 &surviving_items,
                 MIRI_PROBE_CHUNK_SIZE,
@@ -4416,21 +4699,36 @@ fn run_linked_difftest_oracle_pipeline(
                         format!("failed to write {}: {}", probe_path.display(), err)
                     })?;
 
-                    let probe_out = Command::new(&lake_bin)
+                    let mut probe_cmd = Command::new(&lake_bin);
+                    probe_cmd
                         .current_dir(&dot_anneal)
                         .env("LEAN_NUM_THREADS", "1")
                         .arg("env")
                         .arg("lean")
                         .arg("-M")
                         .arg(PROBE_LEAN_MEMORY_MB)
-                        .arg(&rel_probe_path)
-                        .output()
+                        .arg(&rel_probe_path);
+                    let probe_run = run_lean_with_rss_budget(&mut probe_cmd, Some(probe_rss_budget_kib))
                         .map_err(|err| {
                             format!(
                                 "failed to execute '{} env lean -M {PROBE_LEAN_MEMORY_MB} {rel_probe_path}': {err}",
                                 lake_bin.display()
                             )
                         })?;
+                    let probe_out = &probe_run.output;
+                    if let Some(observed_kib) = probe_run.budget_exceeded_kib {
+                        let stdout = String::from_utf8_lossy(&probe_out.stdout);
+                        let stderr = String::from_utf8_lossy(&probe_out.stderr);
+                        return Err(format_lean_command_failure(
+                            &format!(
+                                "Lean probe evaluation for {rel_probe_path} in {}: {}",
+                                dot_anneal.display(),
+                                rss_budget_kill_note(probe_rss_budget_kib, observed_kib)
+                            ),
+                            &stdout,
+                            &stderr,
+                        ));
+                    }
                     if !probe_out.status.success() {
                         let stdout = String::from_utf8_lossy(&probe_out.stdout);
                         let stderr = String::from_utf8_lossy(&probe_out.stderr);
@@ -4554,14 +4852,20 @@ fn run_linked_difftest_oracle_pipeline(
 
         let _lean_guard = acquire_live_lean_oracle_lock();
         let lean_jobs = resolve_miri_lean_jobs().max(1);
+        let confirm_rss_budget_kib =
+            resolve_miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, lean_jobs);
         let stage = run_chunked_miri_confirm_stage(
             &to_confirm,
             MIRI_CONFIRM_CHUNK_SIZE,
             lean_jobs,
             |file_name, entries| write_confirm_module_at(&oracle_dir.join(file_name), entries),
             |file_name| {
-                run_lean_confirm_file(&lake_bin, &dot_anneal, &format!("oracle/{file_name}"))
-                    .map(|out| LeanConfirmRun::from_output(&out))
+                run_lean_confirm_file(
+                    &lake_bin,
+                    &dot_anneal,
+                    &format!("oracle/{file_name}"),
+                    confirm_rss_budget_kib,
+                )
             },
         );
         clean_oracle_files_with_prefixes(
@@ -4573,8 +4877,14 @@ fn run_linked_difftest_oracle_pipeline(
             confirmed_groups,
             unconfirmed: unconfirmed_names,
         } = stage.map_err(|e| format!("{e}\n(kernel confirmation modules in {})", oracle_dir.display()))?;
+        for (name, reason) in &unconfirmed_names {
+            eprintln!(
+                "miri-difftest: Stage 2 kernel confirmation of `{name}` exhausted a resource; \
+                 reporting kernel_confirmed = false: {reason}"
+            );
+        }
         for rep in &mut reports {
-            if unconfirmed_names.contains(&rep.name) {
+            if unconfirmed_names.contains_key(&rep.name) {
                 rep.kernel_confirmed = false;
             }
         }
@@ -10449,8 +10759,15 @@ pub fn cand_shadow() -> u32 {
         let ran = ran.into_inner().unwrap();
         assert_eq!(ran.len(), 3 + 16 + 8);
         assert_eq!(
-            stage.unconfirmed.iter().map(String::as_str).collect::<Vec<_>>(),
+            stage.unconfirmed.keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["div_20"]
+        );
+        // The downgrade carries its reason (module, status, and highlighted diagnostic).
+        let reason = &stage.unconfirmed["div_20"];
+        assert!(
+            reason.starts_with("oracle/MiriOracleConfirmFallback_div_20.lean (exit status: 1): ")
+                && reason.contains("maximum number of heartbeats"),
+            "{reason}"
         );
         let confirmed: Vec<&str> = stage.confirmed.iter().map(|e| e.0.name.as_str()).collect();
         let expected: Vec<String> = (0..40)
@@ -10662,5 +10979,112 @@ pub fn cand_shadow() -> u32 {
         );
         assert!(shadow_snippet.contains("theorem confirm_frame_cand_shadow :"));
         assert!(shadow_snippet.contains("theorem confirm_message_cand_shadow :"));
+    }
+
+    #[test]
+    fn miri_lean_rss_budget_bounds_stage_cap_by_worker_headroom_share() {
+        const GIB_KIB: u64 = 1024 * 1024;
+        // The stage cap binds when headroom is ample.
+        assert_eq!(
+            miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, None, 1, Some(15 * GIB_KIB)),
+            4 * GIB_KIB
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, None, 1, None),
+            8 * GIB_KIB,
+            "unknown headroom keeps the stage cap"
+        );
+        // 85% of each worker's share of the headroom binds when tighter.
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, None, 2, Some(6 * GIB_KIB)),
+            6 * GIB_KIB / 2 / 100 * 85
+        );
+        // `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` replaces the cap but stays headroom-bounded;
+        // invalid values are ignored; the budget never drops below 512 MiB.
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, Some("12288"), 1, Some(64 * GIB_KIB)),
+            12 * GIB_KIB
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, Some("12288"), 1, Some(8 * GIB_KIB)),
+            8 * GIB_KIB / 100 * 85
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, Some("0"), 1, None),
+            4 * GIB_KIB
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, None, 4, Some(GIB_KIB)),
+            512 * 1024
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rss_budget_watchdog_captures_output_kills_process_trees_and_classifies_exhaustion() {
+        use std::io::{BufRead, BufReader};
+        use std::time::Duration;
+
+        // 1. Under budget: behaves like `Command::output`.
+        let mut ok_cmd = Command::new("sh");
+        ok_cmd
+            .arg("-c")
+            .arg("echo out-line; echo err-line >&2; exit 3");
+        let ok = run_lean_with_rss_budget(&mut ok_cmd, Some(1 << 30)).expect("run sh");
+        assert_eq!(ok.budget_exceeded_kib, None);
+        assert_eq!(ok.output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&ok.output.stdout), "out-line\n");
+        assert_eq!(String::from_utf8_lossy(&ok.output.stderr), "err-line\n");
+
+        // 2. Over budget: the tree is SIGKILLed promptly instead of running to completion.
+        let start = Instant::now();
+        let mut hog_cmd = Command::new("sleep");
+        hog_cmd.arg("60");
+        let killed = run_lean_with_rss_budget(&mut hog_cmd, Some(1)).expect("run sleep");
+        assert!(killed.budget_exceeded_kib.is_some_and(|kib| kib > 1));
+        assert!(killed.output.status.code().is_none(), "must be signal-terminated");
+        assert!(start.elapsed() < Duration::from_secs(20));
+        // ...and classifies as resource exhaustion, never as a kernel rejection.
+        let confirm = LeanConfirmRun::from_budgeted_output(&killed, 4 * 1024 * 1024);
+        assert!(!confirm.success && confirm.signal_terminated);
+        assert!(
+            confirm.stderr.contains("out of memory guard")
+                && confirm.stderr.contains("exceeded the 4096 MiB budget"),
+            "{}",
+            confirm.stderr
+        );
+        assert!(lean_confirm_failure_is_resource_exhaustion(
+            confirm.signal_terminated,
+            &confirm.stderr
+        ));
+
+        // 3. `lake env lean` runs `lean` as a grandchild: the tree walk sees it and the
+        //    kill reaches it (killing only the direct child would orphan the hog).
+        let mut parent = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 & echo $!; wait")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut line = String::new();
+        BufReader::new(parent.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read grandchild pid");
+        let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+        assert!(process_tree_pids(parent.id()).contains(&grandchild));
+        assert!(process_tree_rss_kib(parent.id()).is_some_and(|kib| kib > 0));
+        kill_process_tree(&mut parent);
+        assert!(parent.wait().expect("wait sh").code().is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .and_then(|s| s.rfind(')').and_then(|i| s[i + 1..].trim_start().chars().next()));
+            match state {
+                None | Some('Z') | Some('X') => break,
+                Some(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Some(s) => panic!("grandchild {grandchild} survived the tree kill (state {s})"),
+            }
+        }
     }
 }

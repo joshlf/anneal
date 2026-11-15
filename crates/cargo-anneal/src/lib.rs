@@ -2739,6 +2739,110 @@ pub fn cgroup_memory_limits_kib(
     (limit_kib, headroom_kib)
 }
 
+/// cgroup v1 reports an unlimited `memory.limit_in_bytes` as `PAGE_COUNTER_MAX`
+/// pages (`0x7FFF_FFFF_FFFF_F000` on 4 KiB-page kernels); treat anything at or
+/// above 2^62 bytes as unbounded.
+const CGROUP_V1_UNLIMITED_BYTES: u64 = 1 << 62;
+
+/// Parses non-reclaimable usage (in bytes) from cgroup v1 `memory.stat`:
+/// hierarchical `total_rss + total_shmem` when present, else the cgroup-local
+/// `rss + shmem`. Returns `None` if none of those keys are present.
+pub fn parse_cgroup_v1_memory_stat_used_bytes(stat_text: &str) -> Option<u64> {
+    let mut fields: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(key), Some(val), None) = (parts.next(), parts.next(), parts.next())
+            && let Ok(v) = val.parse::<u64>()
+        {
+            fields.insert(key, v);
+        }
+    }
+    let sum = |rss: &str, shmem: &str| -> Option<u64> {
+        match (fields.get(rss), fields.get(shmem)) {
+            (None, None) => None,
+            (r, s) => Some(r.copied().unwrap_or(0).saturating_add(s.copied().unwrap_or(0))),
+        }
+    };
+    sum("total_rss", "total_shmem").or_else(|| sum("rss", "shmem"))
+}
+
+/// cgroup v1 counterpart of [`cgroup_memory_limits_kib`], used when the
+/// unified hierarchy exposes no memory bound (legacy or hybrid hosts and
+/// containers): walks this process's `memory` controller path (the
+/// `<id>:<controllers>:<path>` line of `proc_self_cgroup` whose controller list
+/// contains `memory`) from the leaf up to `memory_root` (normally
+/// `/sys/fs/cgroup/memory`), reading `memory.limit_in_bytes` and subtracting
+/// `memory.stat` `total_rss + total_shmem` (falling back to
+/// `memory.usage_in_bytes`). As in a cgroup-namespaced v2 container, a path
+/// that does not exist under the mount (because the container sees its own
+/// cgroup as the root) walks up to `memory_root`, whose limit is then the
+/// container's.
+pub fn cgroup_v1_memory_limits_kib(
+    memory_root: &Path,
+    proc_self_cgroup: &str,
+) -> (Option<u64>, Option<u64>) {
+    if !memory_root.is_dir() {
+        return (None, None);
+    }
+    let Some(raw_rel) = proc_self_cgroup.lines().map(str::trim).find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let (_id, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
+        controllers
+            .split(',')
+            .any(|c| c == "memory")
+            .then_some(path)
+    }) else {
+        return (None, None);
+    };
+    let rel = raw_rel
+        .trim()
+        .strip_suffix(" (deleted)")
+        .unwrap_or(raw_rel.trim())
+        .trim()
+        .trim_start_matches('/');
+    if Path::new(rel).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return (None, None);
+    }
+    let mut dir = if rel.is_empty() {
+        memory_root.to_path_buf()
+    } else {
+        memory_root.join(rel)
+    };
+    let mut descendant_used_bytes: Option<u64> = None;
+    let mut limit_kib: Option<u64> = None;
+    let mut headroom_kib: Option<u64> = None;
+    while dir.starts_with(memory_root) {
+        if dir.is_dir() {
+            let lvl_used = fs::read_to_string(dir.join("memory.stat"))
+                .ok()
+                .and_then(|s| parse_cgroup_v1_memory_stat_used_bytes(&s))
+                .or_else(|| read_u64_file(&dir.join("memory.usage_in_bytes")));
+            if let Some(u) = lvl_used {
+                descendant_used_bytes = Some(descendant_used_bytes.map_or(u, |prev| prev.max(u)));
+            }
+            if let Some(bound) = read_u64_file(&dir.join("memory.limit_in_bytes"))
+                .filter(|&b| b < CGROUP_V1_UNLIMITED_BYTES)
+            {
+                let used = lvl_used.or(descendant_used_bytes).unwrap_or(0);
+                limit_kib = min_opt_u64(limit_kib, Some(bound / 1024));
+                headroom_kib =
+                    min_opt_u64(headroom_kib, Some(bound.saturating_sub(used) / 1024));
+            }
+        }
+        if dir == memory_root || !dir.pop() {
+            break;
+        }
+    }
+    (limit_kib, headroom_kib)
+}
+
 /// Computes the default Lake worker concurrency (`LEAN_NUM_THREADS`) from
 /// effective total / available memory (in KiB) and logical CPU count:
 /// `(effective_avail_mib / 1536).clamp(1, 6)` bounded by
@@ -2792,14 +2896,22 @@ pub fn resolve_lake_build_threads_env(
 
 /// Probes host `/proc/meminfo` intersected with `/proc/self/cgroup` (the
 /// tighter of each level's `memory.max` / `memory.high`, minus `memory.stat`
-/// `anon + shmem`) in KiB.
+/// `anon + shmem`; or, when the unified hierarchy exposes no bound, the cgroup
+/// v1 `memory.limit_in_bytes` minus `total_rss + total_shmem`) in KiB.
 pub fn probe_effective_memory_kib() -> (Option<u64>, Option<u64>) {
     let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
         .map(|s| parse_meminfo_kib(&s))
         .unwrap_or((None, None));
     if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
-        let (cg_limit, cg_headroom) =
+        let (mut cg_limit, mut cg_headroom) =
             cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
+        if cg_limit.is_none() && cg_headroom.is_none() {
+            // Legacy / hybrid cgroup v1 hosts expose the memory controller
+            // separately; without this, `/proc/meminfo` (the whole host) would
+            // size Lean concurrency inside a memory-limited v1 container.
+            (cg_limit, cg_headroom) =
+                cgroup_v1_memory_limits_kib(Path::new("/sys/fs/cgroup/memory"), &self_cgroup);
+        }
         total_kib = min_opt_u64(total_kib, cg_limit);
         avail_kib = min_opt_u64(avail_kib, cg_headroom);
     }
@@ -3841,6 +3953,109 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&cg_root);
+    }
+
+    #[test]
+    fn cgroup_v1_memory_limits_cover_legacy_and_hybrid_containers() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+        const V1_UNLIMITED: &str = "9223372036854771712\n";
+
+        // `memory.stat` keys: hierarchical totals win over cgroup-local values,
+        // reclaimable `cache` / `total_cache` are ignored.
+        assert_eq!(
+            parse_cgroup_v1_memory_stat_used_bytes(
+                "cache 100\nrss 10\nshmem 1\ntotal_cache 900\ntotal_rss 40\ntotal_shmem 2\n"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_cgroup_v1_memory_stat_used_bytes("cache 100\nrss 10\nshmem 1\n"),
+            Some(11)
+        );
+        assert_eq!(parse_cgroup_v1_memory_stat_used_bytes("cache 100\n"), None);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let memory_root = env::temp_dir().join(format!(
+            "cargo-anneal-cgroup-v1-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let docker = memory_root.join("docker");
+        let container = docker.join("abc123");
+        fs::create_dir_all(&container).expect("create cgroup v1 test hierarchy");
+        fs::write(memory_root.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        fs::write(docker.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        // The container is limited to 8 GiB with 1.5 GiB non-reclaimable usage and
+        // 4 GiB of reclaimable page cache.
+        fs::write(container.join("memory.limit_in_bytes"), format!("{}\n", 8 * GIB)).unwrap();
+        fs::write(
+            container.join("memory.stat"),
+            format!(
+                "cache {}\nrss {}\nshmem {}\ntotal_cache {}\ntotal_rss {}\ntotal_shmem {}\n",
+                4 * GIB,
+                GIB,
+                GIB / 2,
+                4 * GIB,
+                GIB,
+                GIB / 2
+            ),
+        )
+        .unwrap();
+        fs::write(container.join("memory.usage_in_bytes"), format!("{}\n", 6 * GIB)).unwrap();
+
+        // Hybrid host: the unified `0::` line exposes no memory controller, the v1
+        // `memory` controller (possibly co-mounted, e.g. `memory,hugetlb`) does.
+        let proc_self_cgroup = "12:cpu,cpuacct:/docker/abc123\n\
+                                11:memory,hugetlb:/docker/abc123\n\
+                                0::/docker/abc123\n";
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (Some(8 * GIB_KIB), Some(6 * GIB_KIB + GIB_KIB / 2)),
+            "8 GiB - (1 GiB rss + 0.5 GiB shmem); page cache is reclaimable"
+        );
+        // Without `memory.stat`, `memory.usage_in_bytes` (6 GiB) is subtracted.
+        fs::remove_file(container.join("memory.stat")).unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (Some(8 * GIB_KIB), Some(2 * GIB_KIB))
+        );
+        // Inside the container the mount shows its own cgroup as the root, so the
+        // host-relative path does not exist: the walk climbs to the mount root,
+        // whose limit is the container's.
+        fs::write(memory_root.join("memory.limit_in_bytes"), format!("{}\n", 4 * GIB)).unwrap();
+        fs::write(memory_root.join("memory.usage_in_bytes"), format!("{}\n", GIB)).unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "4:memory:/kubepods/pod-xyz/ctr\n"),
+            (Some(4 * GIB_KIB), Some(3 * GIB_KIB))
+        );
+        // No `memory` controller line, unlimited everywhere, or path traversal -> None.
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "0::/docker/abc123\n"),
+            (None, None)
+        );
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "3:memory:/docker/../../etc\n"),
+            (None, None)
+        );
+        fs::write(memory_root.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        fs::write(container.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (None, None)
+        );
+        // The unified-hierarchy walk sees no `memory.max` in a v1 mount layout, which
+        // is what makes `probe_effective_memory_kib` fall back to v1.
+        assert_eq!(
+            cgroup_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (None, None)
+        );
+
+        let _ = fs::remove_dir_all(&memory_root);
     }
 
     #[test]
