@@ -70,6 +70,7 @@ impl TempFixture {
         expected_executed: Option<bool>,
     ) -> Result<Json, Failure> {
         let mut checker = Checker::new(&self.root, None).unwrap();
+        checker.set_require_mir_wp(false);
         let outcome = checker.run();
         match &outcome {
             Err(err) => {
@@ -1294,6 +1295,7 @@ fn verifies_upstream_pin_and_rejects_tampering() {
 fn rejects_vendor_constants_in_reserved_namespaces() {
     let fix = TempFixture::new(None);
     let mut checker = Checker::new(&fix.root, None).unwrap();
+    checker.set_require_mir_wp(false);
     checker.run().unwrap();
     let trusted_lib = checker.stage.join("lib");
     let vendor_src = checker.stage.join("src/fake-miri");
@@ -1409,4 +1411,95 @@ fn rejects_vendor_constants_in_reserved_namespaces() {
             }
         }
     }
+}
+
+/// Verifies non-backsliding enforcement on `Trusted.MirAst`,
+/// `Trusted.MirSemantics`, and `Anneal.MirWp` core theorems and canaries in
+/// Pass 1 (`"audit"`).
+#[test]
+fn enforces_mir_wp_non_backsliding() {
+    // 1. With default `Checker::new` (`require_mir_wp == true`), deleting both
+    // `Trusted/MirSemantics.lean` and `Anneal/MirWp.lean` (even when
+    // `Trusted/MirAst.lean` is present) is rejected fail-closed.
+    let fix_missing_both = TempFixture::new(Some(
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\n",
+    ));
+    fs::create_dir_all(fix_missing_both.root.join("trusted/lean/Trusted")).unwrap();
+    fs::write(
+        fix_missing_both.root.join("trusted/lean/Trusted/MirAst.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirAst\ndef placeholder : Nat := 0\nend Trusted.MirAst\n",
+    )
+    .unwrap();
+    let mut checker_missing_both = Checker::new(&fix_missing_both.root, None).unwrap();
+    let err_missing_both = checker_missing_both.run().unwrap_err();
+    assert_eq!(err_missing_both.code, 1);
+    assert!(
+        err_missing_both
+            .message
+            .contains("missing required trusted module Trusted.MirSemantics"),
+        "unexpected error: {err_missing_both}"
+    );
+
+    // 2. If `Trusted.MirAst` and `Trusted.MirSemantics` are present without
+    // `Anneal.MirWp`, Pass 1 `"audit"` rejects.
+    let mut fix_no_wp = TempFixture::new(Some(
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nimport Trusted.MirSemantics\n",
+    ));
+    fs::create_dir_all(fix_no_wp.root.join("trusted/lean/Trusted")).unwrap();
+    fs::write(
+        fix_no_wp.root.join("trusted/lean/Trusted/MirAst.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirAst\ndef placeholder : Nat := 0\nend Trusted.MirAst\n",
+    )
+    .unwrap();
+    fs::write(
+        fix_no_wp.root.join("trusted/lean/Trusted/MirSemantics.lean"),
+        b"-- anneal-trust-tier: candidate:mir_semantics\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nnamespace Trusted.MirSemantics\ndef placeholder : Nat := 0\nend Trusted.MirSemantics\n",
+    )
+    .unwrap();
+    let err_no_wp = fix_no_wp
+        .check_expected(Some(1), Some("audit"), Some(true))
+        .unwrap_err();
+    assert!(
+        err_no_wp
+            .message
+            .contains("missing required theory module Anneal.MirWp"),
+        "unexpected error: {err_no_wp}"
+    );
+
+    // 3. If `Anneal.MirWp` weakens or omits its required theorems/canaries,
+    // Pass 1 `"audit"` rejects.
+    let mut fix = TempFixture::new(Some(
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nimport Trusted.MirSemantics\n",
+    ));
+    fs::create_dir_all(fix.root.join("trusted/lean/Trusted")).unwrap();
+    fs::write(
+        fix.root.join("trusted/lean/Trusted/MirAst.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirAst\ndef placeholder : Nat := 0\nend Trusted.MirAst\n",
+    )
+    .unwrap();
+    fs::write(
+        fix.root.join("trusted/lean/Trusted/MirSemantics.lean"),
+        b"-- anneal-trust-tier: candidate:mir_semantics\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nnamespace Trusted.MirSemantics\ndef placeholder : Nat := 0\nend Trusted.MirSemantics\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fix.root.join("theory/Anneal")).unwrap();
+    fs::write(
+        fix.root.join("theory/Anneal.lean"),
+        b"prelude\nimport Trusted\nimport Anneal.MirWp\n",
+    )
+    .unwrap();
+    fs::write(
+        fix.root.join("theory/Anneal/MirWp.lean"),
+        b"prelude\nimport Trusted\nnamespace Anneal.MirWp\ntheorem wellFormed_and_spec_of_wp : True := True.intro\nend Anneal.MirWp\n",
+    )
+    .unwrap();
+    let err_wp = fix
+        .check_expected(Some(1), Some("audit"), Some(true))
+        .unwrap_err();
+    assert!(
+        err_wp.message.contains(
+            "theorem Anneal.MirWp.wellFormed_and_spec_of_wp must prove Trusted.MirSemantics.WpSoundnessClaim Anneal.MirWp.wpProg directly"
+        ),
+        "unexpected error: {err_wp}"
+    );
 }

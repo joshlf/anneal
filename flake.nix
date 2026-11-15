@@ -269,6 +269,7 @@
             leanToolchain = self.packages.${system}.lean-toolchain;
             rustcCapture = self.packages.${system}.rustc-capture;
             leanFoundation = ./trusted/lean;
+            leanTheory = ./theory;
 
             buildPhase = ''
               set -euo pipefail
@@ -282,6 +283,7 @@
               cp -r "$leanToolchain"/* "$TMPDIR/dist_staging/lean/"
               cp "$rustcCapture/bin/anneal-rustc-capture" "$TMPDIR/dist_staging/bin/"
               cp -r "$leanFoundation" "$TMPDIR/dist_staging/share/anneal/trusted/lean"
+              cp -r "$leanTheory" "$TMPDIR/dist_staging/share/anneal/theory"
 
               chmod -R u+w "$TMPDIR/dist_staging"
               rm -rf "$TMPDIR/dist_staging/rust/share/doc"
@@ -311,7 +313,9 @@
                 rust/bin/cargo \
                 rust/bin/rustc \
                 share/anneal/trusted/lean/foundation-lock.json \
-                share/anneal/trusted/lean/lean-toolchain; do
+                share/anneal/trusted/lean/lean-toolchain \
+                share/anneal/theory/Anneal.lean \
+                share/anneal/theory/Anneal/MirWp.lean; do
                 if [ ! -f "$TMPDIR/dist_staging/$path" ]; then
                   echo "ERROR: expected archive entry missing: $path" >&2
                   exit 1

@@ -291,6 +291,14 @@ fn lean_case(case: &mut CaseDirectory, root: &Path) -> TestResult {
         &root.join("share/anneal/trusted/lean/lean-toolchain"),
         "toolchain/lean-toolchain",
     )?;
+    case.copy(
+        &root.join("share/anneal/theory/Anneal.lean"),
+        "theory/Anneal.lean",
+    )?;
+    case.copy(
+        &root.join("share/anneal/theory/Anneal/MirWp.lean"),
+        "theory/Anneal/MirWp.lean",
+    )?;
     case.write("Small.lean", b"example (n : Nat) : n = n := rfl\n")?;
     let out = case.run(&Invocation::new(&lean, &["Small.lean"]))?;
     out.expect_code(0)
