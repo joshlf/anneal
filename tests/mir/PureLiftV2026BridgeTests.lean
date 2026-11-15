@@ -21,7 +21,10 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    one symbolic `PureLift` run with `symBool c` builds a `BackTarget.choice`
    loan whose `.choice` value is realized at the live join block `bb3`
    (`runMirToBlock`) for both oracles, and the post-join functional update
-   refines both live returns.
+   refines both live returns. Test 2b simulates the diamond block for block:
+   a 4-block `PureLift` `BlockCfg` is matched by header-targeted live runs
+   into `bb1`/`bb2` and `bb3` under `mirCfgStateRel` (the joined loan realized
+   on the live machine at `bb3`), and `mir_blockCfg_sound` concludes.
 3. **Hybrid `SpatialPin` freeze → `zerocopy` byte write → unpin**: the frozen
    block is the place's trusted byte window (`TypedAt`), the spatial mutation
    writes exactly the bytes produced by the live raw-pointer `*mut u8` store,
@@ -33,9 +36,16 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    pins `p.1` while a sibling loan `&mut p.0` stays live and is used after the
    unpin; the general frame rules carry its binding through freeze, mutation
    and the live store, and unpinning restores the full two-loan relation.
+   Test 3e repeats the whole-tuple bridge at the body's own tuple type and
+   captured rustc layout (`u32PairLayoutMirCodec`, `FieldsShape.arbitrary
+   [0, 4]`), with a reordered-layout falsification canary.
 4. **Negative canaries**: overlapping `&mut` borrows are rejected by `PermTree`
    (and their conflicting accesses are Tree Borrows UB on live MIR); unpinning
    `.uninit` bytes or the invalid `bool` pattern `0x02` fails.
+
+Like a real `anneal-rustc-capture` body, every fixture carries its own layout
+table (`fixtureLayouts`), in which the `(u32, u32)` locals point at their own
+rustc `TypeLayout` (`u32PairRustcLayout`) rather than at the `u32` entry.
 -/
 
 open Trusted.Rustc.V2026_06_01.Layout
@@ -49,8 +59,26 @@ namespace PureLiftV2026BridgeTests
 
 /-! ## Helpers -/
 
+/-- rustc's `tcx.layout_of((u32, u32))` as `anneal-rustc-capture` serializes it:
+size `8`, align `4`, a full-range `ScalarPair` backend, and in-order
+`FieldsShape.arbitrary` offsets `[0, 4]` (`memoryIndex [0, 1]`). -/
+def u32PairRustcLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr :=
+      .scalarPair (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+        (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+    isUninhabited := false }
+
+/-- Fixture layout table: entry `0` is the inherited `u32` layout and entry `1`
+is the captured `(u32, u32)` layout that `pairTy` points at, as in a real
+capture (every type carries its own `TypeLayout`). -/
+def fixtureLayouts : LayoutTable :=
+  { Anneal.PureMirExec.pureAdtMultiBlockBody.layouts with
+    entries := Anneal.PureMirExec.pureAdtMultiBlockBody.layouts.entries ++ [u32PairRustcLayout] }
+
 def u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
-def pairTy : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+def pairTy : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }
 def refU32Ty : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
 def refPairTy : Ty := { kind := .ref .mut (.tuple [.uint .u32, .uint .u32]), layoutIdx := 0 }
 def rawU32Ty : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
@@ -78,7 +106,7 @@ def decl (m : Mutability) (ty : Ty) : LocalDecl :=
 def mkBody (argCount : Nat) (ds : List LocalDecl) (bbs : List BasicBlockData) :
     CapturedMir :=
   { Anneal.PureMirExec.pureAdtMultiBlockBody with
-    argCount := argCount, localDecls := ds, basicBlocks := bbs }
+    argCount := argCount, localDecls := ds, basicBlocks := bbs, layouts := fixtureLayouts }
 
 /-- `PureLift` loans are created in the same order as live MIR provenance tags,
 which start at `1`. -/
@@ -707,6 +735,144 @@ theorem diamond_symbolic_sound (c : Bool) (x y : Nat) (hx : x < 256 ^ 4) (hy : y
         rfl rfl rfl
         (.pair (.choiceTrue (.nat (by decide))) (.choiceTrue (.nat hy))) rfl
 
+/-! ### Test 2b: Block-for-Block Diamond Simulation (`BlockCfg` ↔ live MIR blocks) -/
+
+/-- `PureLift` block CFG of `diamond`, block-for-block with `diamondBody`:
+`bb0` builds `p` and branches on `c`, `bb1` / `bb2` borrow `p.0` / `p.1`, and
+`bb3` writes through the handle, ends the loan, and returns `p`. -/
+def diamondBlocks : List (BasicBlock StdVal) :=
+  [⟨.act (.assign (.localSub 3 []) (.binary stdMkPair (.localSub 1 []) (.localSub 2 []))),
+     .branch (.use (.localSub 0 [])) 1 2⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [0])), .goto 3⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [1])), .goto 3⟩,
+   ⟨.seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 50)))) (.act (.endLoan 0)),
+     .ret (.use (.localSub 3 []))⟩]
+
+/-- Block-entry `PureLift` states for a concrete oracle `c`. -/
+def dbSt0 (c : Bool) : SymState StdVal :=
+  ⟨[⟨.bool c, .unborrowed⟩, ⟨.nat 3, .unborrowed⟩, ⟨.nat 4, .unborrowed⟩], [], [], [], [], 0⟩
+
+def dbSt1 (c : Bool) : SymState StdVal :=
+  ⟨[⟨.bool c, .unborrowed⟩, ⟨.nat 3, .unborrowed⟩, ⟨.nat 4, .unborrowed⟩,
+    ⟨.pair (.nat 3) (.nat 4), .unborrowed⟩], [], [], [], [], 0⟩
+
+def dbSt3 (c : Bool) : SymState StdVal :=
+  ⟨[⟨.bool c, .unborrowed⟩, ⟨.nat 3, .unborrowed⟩, ⟨.nat 4, .unborrowed⟩,
+    ⟨.pair (.nat 3) (.nat 4), .split [(if c then [0] else [1], .mutLocked 0)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat (if c then 3 else 4), .unborrowed⟩,
+     .direct (.localReg 3) (if c then [0] else [1])⟩],
+   [], [], [], 0⟩
+
+/-- Live MIR state at the header of the taken arm (`bb1` if `c`, else `bb2`). -/
+def dbMsArm (c : Bool) : MachineState :=
+  { frame :=
+      { blockIdx := if c then 1 else 2, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨if c then 1 else 0, 1⟩), .init (.scalar ⟨3, 4⟩),
+           .init (.scalar ⟨4, 4⟩), .init (.aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]),
+           .uninit] }
+    memory := (diamondMs0 c).memory }
+
+/-- The block-level relation pins, for each `PureLift` block entry, the live MIR
+state at the matching block header (`extra`), so every simulation obligation
+is a concrete header-targeted live run; `mirCfgStateRel` additionally requires
+the block-entry `PureLift` state to be realized there (the joined loan at
+`bb3`). -/
+def dbExtra (c : Bool) (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  (bb = 0 ∧ st = dbSt0 c ∧ ms = diamondMs0 c) ∨
+  (bb = (if c then 1 else 2) ∧ st = dbSt1 c ∧ ms = dbMsArm c) ∨
+  (bb = 3 ∧ st = dbSt3 c ∧ ms = diamondMsJoin c)
+
+def dbBindingsAt (c : Bool) (bb : Nat) : List (LoanId × Local × SubPath) :=
+  if bb = 3 then [(0, 4, if c then [0] else [1])] else []
+
+/-- `PureLift` result of the block CFG for oracle `c`. -/
+def dbOut (c : Bool) : FuncOut StdVal :=
+  ⟨if c then .pair (.nat 50) (.nat 4) else .pair (.nat 3) (.nat 50), []⟩
+
+theorem db_cfg_wpConverges (c : Bool) :
+    Anneal.PureMirExec.WpConverges (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks))
+      ⟨fun o => o, 0, dbSt0 c⟩ (· = dbOut c) := by
+  cases c <;> exact ⟨5, _, rfl, rfl⟩
+
+theorem db_rel_arm (c : Bool) :
+    mirStateRel tagOfLoan [] (dbSt1 c) (dbMsArm c) := by
+  cases c <;>
+  exact ⟨⟨trivial, trivial⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .pair (.nat (by decide)) (.nat (by decide))⟩, trivial⟩⟩
+
+theorem db_rel_join (c : Bool) :
+    mirStateRel tagOfLoan [(0, 4, if c then [0] else [1])] (dbSt3 c) (diamondMsJoin c) := by
+  cases c <;>
+  exact ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+/-- **Block-level forward simulation of the diamond**: every `PureLift` block
+step is matched by a header-targeted live MIR run (`runMirToBlock`) into the
+corresponding MIR block, and the return block by a live return refining the
+`PureLift` output. -/
+theorem db_forwardSim (c : Bool) :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks))
+      (Anneal.PureMirExec.mirStep diamondBody)
+      (mirCfgStateRel tagOfLoan (dbBindingsAt c) id (dbExtra c))
+      (MirOutcomeRel tagOfLoan []) := by
+  intro s ms hR
+  obtain ⟨hW, _, _, _, hExtra⟩ := hR
+  cases s with
+  | mk w bb st =>
+    have hwEq : w = (fun o => o) := funext hW
+    subst hwEq
+    rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+    · subst hBb; subst hSt; subst hMs
+      cases c
+      · exact stepsTo_of_runMirToBlock_reached (rfl :
+          Anneal.PureMirExec.runMirToBlock diamondBody 2 (diamondMs0 false) =
+            .reached (dbMsArm false))
+          ⟨fun _ => rfl, rfl, rfl, db_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      · exact stepsTo_of_runMirToBlock_reached (rfl :
+          Anneal.PureMirExec.runMirToBlock diamondBody 1 (diamondMs0 true) =
+            .reached (dbMsArm true))
+          ⟨fun _ => rfl, rfl, rfl, db_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+    · subst hSt; subst hMs
+      cases c
+      · subst hBb
+        exact stepsTo_of_runMirToBlock_reached (rfl :
+          Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm false) =
+            .reached (diamondMsJoin false))
+          ⟨fun _ => rfl, rfl, rfl, db_rel_join false, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+      · subst hBb
+        exact stepsTo_of_runMirToBlock_reached (rfl :
+          Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm true) =
+            .reached (diamondMsJoin true))
+          ⟨fun _ => rfl, rfl, rfl, db_rel_join true, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+    · subst hBb; subst hSt; subst hMs
+      cases c
+      · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+      · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+
+/-- **Test 2b (block-level adequacy)**: for each oracle, the `PureLift` block
+CFG of the diamond simulates `diamondBody` block for block, realizing the
+joined loan on the live machine at `bb3`, and the live body converges to the
+refined post-join update (`mir_blockCfg_sound`). -/
+theorem db_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = dbOut c) o []) :=
+  mir_blockCfg_sound tagOfLoan diamondBody diamondBlocks (· = dbOut c)
+    (dbBindingsAt c) id (dbExtra c) [] (db_forwardSim c) (db_cfg_wpConverges c)
+    ⟨fun _ => rfl, rfl, rfl, ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .bool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
 /-! ## Test 3: Hybrid `SpatialPin` Freeze → `zerocopy` Byte Write → Unpin -/
 
 /-- `fn patch_low_byte(v: u32) -> u32 { let mut x = v; let p = &raw mut x;
@@ -1232,6 +1398,98 @@ theorem fp_whole_pair_mirTypedByteCodec_bridge :
       (mPair.codec.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩)) rfl rfl).2
       (⟨7, by decide⟩, ⟨zcV1, by decide⟩) rfl),
     rfl⟩
+
+/-! ### Test 3e: Whole-Tuple Codec under the Body's Captured rustc Layout -/
+
+/-- The whole-tuple codec at the body's own tuple type `pairTy` and layout
+table, whose entry `1` is the captured `(u32, u32)` layout. -/
+def fpPairCodec :
+    MirTypedByteCodec zcLayouts pairTy
+      ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 :=
+  u32PairLayoutMirCodec zcLayouts 1 u32PairRustcLayout [0, 1] rfl rfl rfl
+
+/-- **Test 3e (captured-layout whole-tuple bridge on live MIR)**: at the
+body's own layout table and tuple type `pairTy` (so the trusted encoder and
+decoder take the `FieldsShape.arbitrary [0, 4]` offset-table branch rather than
+the layout-less sequential fallback), the whole-tuple window of `_3` is
+`u32PairExactLE.encode` before and after the live field store (`FieldsTyped`
+at offsets `0` / `4`), freezing it yields that trusted window, and unpinning
+the post-store cells is exactly the trusted decode of the live window. -/
+theorem fp_whole_pair_rustc_layout_bridge :
+    let cellsWr : List (CellVal StdVal) :=
+      [.rawByte 7, .rawByte 0, .rawByte 0, .rawByte 0,
+       .rawByte 0xAB, .rawByte 0x33, .rawByte 0x22, .rawByte 0x11]
+    fieldPinBody.layouts = zcLayouts ∧
+    LayoutTable.lookup zcLayouts pairTy.layoutIdx = some u32PairRustcLayout ∧
+    (Exists fun bsPin =>
+      placeByteWindow? zcLayouts pairTy fpMsPinned 3 [] = some bsPin ∧
+      bsPin = u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩) ∧
+      Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4 bsPin) ∧
+    (Exists fun bsWr =>
+      placeByteWindow? zcLayouts pairTy fpMsWritten 3 [] = some bsWr ∧
+      bsWr = u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩) ∧
+      Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4 bsWr) ∧
+    abstractBytesOfCells (u32PairSpatialCodec.encode (.pair (.nat 7) (.nat zcV0))) =
+      placeByteWindow? zcLayouts pairTy fpMsPinned 3 [] ∧
+    u32PairSpatialCodec.decode cellsWr = some (.pair (.nat 7) (.nat zcV1)) ∧
+    decodeValueFromBytes defaultCodecFuel zcLayouts pairTy
+      (u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩)) =
+      some (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV1, 4⟩]) := by
+  intro cellsWr
+  have hFreeze := spatialCodec_freeze_eq_placeByteWindow fpPairCodec 64 u32PairEmbed
+    u32PairEmbed? u32PairEmbed_embed? fpMsPinned 3 [] (.pair (.nat 7) (.nat zcV0))
+    (⟨7, by decide⟩, ⟨zcV0, by decide⟩) rfl rfl
+  exact ⟨rfl, rfl,
+    placeByteWindow?_u32PairLayout_fieldsTyped (idx := 1) rfl rfl rfl fpMsPinned 3 []
+      ⟨7, by decide⟩ ⟨zcV0, by decide⟩ rfl,
+    placeByteWindow?_u32PairLayout_fieldsTyped (idx := 1) rfl rfl rfl fpMsWritten 3 []
+      ⟨7, by decide⟩ ⟨zcV1, by decide⟩ rfl,
+    hFreeze.2.1.trans hFreeze.1.symm,
+    ((fpPairCodec.spatialCodec_unpin_iff_mir_decode 64 u32PairEmbed u32PairEmbed?
+      u32PairEmbed_embed? cellsWr
+      (fpPairCodec.codec.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩)) rfl rfl).2
+      (⟨7, by decide⟩, ⟨zcV1, by decide⟩) rfl),
+    fpPairCodec.decode_eq_map _⟩
+
+/-- A reordered layout for the same tuple (`FieldsShape.arbitrary [4, 0]`). -/
+def u32PairSwappedLayout : TypeLayout :=
+  { u32PairRustcLayout with fields := .arbitrary [⟨4⟩, ⟨0⟩] [1, 0] }
+
+def swappedLayouts : LayoutTable :=
+  { fixtureLayouts with
+    entries :=
+      Anneal.PureMirExec.pureAdtMultiBlockBody.layouts.entries ++ [u32PairSwappedLayout] }
+
+/-- **Layout falsification canary**: the offset hypothesis of
+`u32PairLayoutMirCodec` is load-bearing. Under a reordered layout the trusted
+encoder places field `1` first, so the live window of `_3` is the *swapped*
+encoding, the in-order encoding decodes to the swapped pair, and an
+all-`.uninit` or 4-byte window fails the trusted exact-size / initialization
+checks under the captured layout. -/
+theorem pair_layout_canaries :
+    placeByteWindow? swappedLayouts pairTy fpMsPinned 3 [] =
+      some (u32PairExactLE.encode (⟨zcV0, by decide⟩, ⟨7, by decide⟩)) ∧
+    decodeValueFromBytes defaultCodecFuel swappedLayouts pairTy
+      (u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩)) =
+      some (.aggregate 0 [.scalar ⟨zcV0, 4⟩, .scalar ⟨7, 4⟩]) ∧
+    decodeValueFromBytes defaultCodecFuel zcLayouts pairTy (replicateUninitBytes 8) = none ∧
+    decodeValueFromBytes defaultCodecFuel zcLayouts pairTy
+      (u32ExactLE.encode ⟨7, by decide⟩) = none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- The live whole-tuple windows of `_3` under the captured and the reordered
+layouts differ. -/
+theorem swapped_layout_window_ne :
+    placeByteWindow? swappedLayouts pairTy fpMsPinned 3 [] ≠
+      placeByteWindow? zcLayouts pairTy fpMsPinned 3 [] := by
+  have hIn : placeByteWindow? zcLayouts pairTy fpMsPinned 3 [] =
+      some (u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩)) := rfl
+  rw [pair_layout_canaries.1, hIn]
+  intro h
+  have h2 := congrArg (fun o => o.bind u32PairExactLE.decode) h
+  simp only [Option.bind_some, Anneal.SepLogicLenses.ByteLensCodec.decode_encode,
+    Option.some.injEq, Prod.mk.injEq, Subtype.mk.injEq] at h2
+  exact absurd h2.1 (by decide)
 
 /-! ### Test 3d: Hybrid Pin with an Active Unpinned Sibling Loan (General Frame Rules) -/
 

@@ -46,7 +46,12 @@ machine state:
    refines the PureLift return value. `mir_pure_lift_sound` instantiates
    `pure_lift_sound` and concludes fuel-free `MirFuelFree.MirWpConverges`;
    `mir_pure_lift_sound_of_evalFuel` discharges the simulation obligation from
-   one bounded live run.
+   one bounded live run. At block granularity, `mir_blockCfg_sound` turns a
+   forward simulation of the embedded `PureLift` block CFG (`blockCfgStep`)
+   into the live step function under `mirCfgStateRel` (each block-entry
+   `PureLift` state realized on the live machine at the matching MIR block
+   header) into the same conclusion, with no `CfgCertificate`;
+   `mir_cfgCertificate_sound` is its certificate-driven corollary.
 5. **Byte-window `SpatialCodec`s (`MirTypedByteCodec`).** A fixed-width
    `SepLogicLenses.ByteLensCodec α n` that agrees with the trusted operational
    byte codec `encodeValueToBytes` / `decodeValueFromBytes` at MIR type `ty`
@@ -58,7 +63,10 @@ machine state:
    marker traits `IsTryFromBytes` / `IsIntoBytes` / `IsFromBytes` are derived
    for the codec's type (`MirTypedByteCodec.isTryFromBytes`, `.isIntoBytes`,
    `.isFromBytes`, `.not_isFromBytes`). Instances: `u32MirCodec` (exact-width
-   little-endian `u32`) and `boolMirCodec` (Rust `bool`, rejecting `0x02`);
+   little-endian `u32`), `boolMirCodec` (Rust `bool`, rejecting `0x02`), and
+   whole `(u32, u32)` tuples both without a layout entry (`u32PairMirCodec`)
+   and under the captured rustc layout that real bodies carry
+   (`u32PairLayoutMirCodec`: size `8`, `FieldsShape.arbitrary [0, 4]`);
    `FixedByteCodecBridge.mirTypedByteCodecOfMirValueCodec` lifts every
    provenance-free `ByteCodec.MirValueCodec` (a `FixedByteCodec` agreeing with
    the trusted codec) to a `MirTypedByteCodec`.
@@ -1926,6 +1934,36 @@ def MirOutcomeRel (tagOf : LoanId → Nat)
     o = .normal (mv, mem) ∧ StdValRefines tagOf out.ret mv ∧
     spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out (callerExitState mem)
 
+/-- **Certificate-free block-level adequacy over live `V2026_06_01` MIR
+(`mir_blockCfg_sound`)**: a forward simulation from the embedded `PureLift`
+block CFG (`blockCfgStep (stepBasicBlock stdValAlg blocks)`) into the live step
+function `PureMirExec.mirStep body` under `mirCfgStateRel` (which realizes the
+block-entry `PureLift` state on the live machine at the corresponding MIR block
+header) and `MirOutcomeRel`, together with convergence of the embedded CFG from
+`s0` to outputs satisfying `post`, proves fuel-free convergence of the live
+body to `LiftedMirPost`. `mir_cfgCertificate_sound` is the special case whose
+CFG convergence comes from a `CfgCertificate`. -/
+theorem mir_blockCfg_sound (tagOf : LoanId → Nat) (body : CapturedMir)
+    (blocks : List (BasicBlock StdVal)) (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hSim : ForwardSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs))
+    {s0 : BlockMachineState (SymState StdVal) (FuncOut StdVal)} {m0 : MachineState}
+    (hWp : PureMirExec.WpConverges (blockCfgStep (stepBasicBlock stdValAlg blocks)) s0 post)
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra s0 m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  PureMirExec.mirWpConverges_of_wpConverges
+    (PureMirExec.WpConverges.mono
+      (fun _ ⟨out, hPost, mv, mem, ho, hRef, hFin⟩ =>
+        ⟨out, mv, mem, ho, hRef, hFin, hPost⟩)
+      (wpConverges_of_forwardSim hSim hWp m0 hR0))
+
 /-- **Compositional `CfgCertificate` adequacy over live `V2026_06_01` MIR
 (`mir_cfgCertificate_sound`)**: connects `MirLiftCoreInterop.wpConverges_of_cfgCertificate`
 and `wpConverges_of_forwardSim` to `mirCfgStateRel` and `LiftedMirPost`. -/
@@ -1953,17 +1991,11 @@ theorem mir_cfgCertificate_sound (tagOf : LoanId → Nat) (body : CapturedMir)
     {m0 : MachineState}
     (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨fun o => o, cert.entryBb, st0⟩ m0) :
     Anneal.MirFuelFree.MirWpConverges body m0
-      (fun o => LiftedMirPost tagOf post o rootAddrs) := by
-  have hWp :=
-    wpConverges_of_forwardSim hSim
-      (wpConverges_of_cfgCertificate stdValAlg cert params st0 post hInit hSpec
-        BlockInv PostRet hLocal hNoFork hInv0)
-      m0 hR0
-  exact PureMirExec.mirWpConverges_of_wpConverges
-    (PureMirExec.WpConverges.mono
-      (fun o ⟨out, hPost, mv, mem, ho, hRef, hFin⟩ =>
-        ⟨out, mv, mem, ho, hRef, hFin, hPost⟩)
-      hWp)
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_blockCfg_sound tagOf body cert.blocks post bindingsAt mirBb extra rootAddrs hSim
+    (wpConverges_of_cfgCertificate stdValAlg cert params st0 post hInit hSpec
+      BlockInv PostRet hLocal hNoFork hInv0)
+    hR0
 
 end PinLifecycle
 
@@ -2604,6 +2636,164 @@ theorem placeByteWindow?_u32Pair_fieldsTyped {layouts : LayoutTable} {idx : Nat}
         (appendAbstractBytes (u32ExactLE.encode y) [])) =
         some (u32ExactLE.encode x ++ u32ExactLE.encode y)
       rw [appendAbstractBytes_eq_append, appendAbstractBytes_eq_append, List.append_nil]
+    | uninit => exact nomatch hPlace
+    | dead => exact nomatch hPlace
+
+/-! ### Real rustc Tuple Layouts: `(u32, u32)` under `FieldsShape.arbitrary [0, 4]` -/
+
+/-- **Trusted tuple encoder under a captured rustc layout**: when the body's
+`LayoutTable` carries the tuple's own entry (`tcx.layout_of((u32, u32))`: size
+`8`, `FieldsShape.arbitrary` offsets `[0, 4]`, any `memoryIndex`),
+`encodeValueToBytes` takes the offset-table branch (`encodeFieldsAtOffsetsWith`
+into an 8-byte `.uninit` buffer) and produces exactly `u32PairExactLE.encode`. -/
+theorem encodeValueToBytes_u32PairLayout {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    (x y : {v : Nat // v < 256 ^ 4}) :
+    encodeValueToBytes defaultCodecFuel layouts (u32PairTy idx)
+        (.aggregate 0 [.scalar ⟨x.val, 4⟩, .scalar ⟨y.val, 4⟩]) =
+      some (u32PairExactLE.encode (x, y)) := by
+  show (match LayoutTable.lookup layouts idx with
+    | some l => _
+    | none => _) = some (u32ExactLE.encode x ++ u32ExactLE.encode y)
+  rw [hLookup]
+  dsimp only
+  rw [hFields, hSize]
+  rfl
+
+/-- **Trusted tuple decoder under a captured rustc layout**: the exact-size
+check against `l.size` followed by `decodeFieldsAtOffsetsWith` over the slices
+at offsets `0` and `4` agrees with `u32PairExactLE.decode` on every byte list. -/
+theorem decodeValueFromBytes_u32PairLayout {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts (u32PairTy idx) bs =
+      (u32PairExactLE.decode bs).map
+        (fun p => Value.aggregate 0 [.scalar ⟨p.1.val, 4⟩, .scalar ⟨p.2.val, 4⟩]) := by
+  have hLenDef : ∀ s : List AbstractByte, Trusted.Sequence.length s = s.length :=
+    fun _ => rfl
+  have hDecU32 : ∀ s : List AbstractByte,
+      decodeValueFromBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } s =
+        Option.map (u32MirCodec layouts).toValue (u32ExactLE.decode s) :=
+    (u32MirCodec layouts).decode_eq_map
+  show (match LayoutTable.lookup layouts idx with
+    | some l => _
+    | none => _) = _
+  rw [hLookup]
+  dsimp only
+  rw [hFields, hSize]
+  dsimp only [decodeFieldsAtOffsetsWith, sliceAbstractBytes, rigidTyByteSize,
+    rigidTyKindByteSize, intCastTargetBytes]
+  simp only [hLenDef, takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop, hDecU32]
+  unfold u32PairExactLE Anneal.SepLogicLenses.ByteLensCodec.prod
+  dsimp only
+  have hD0 : dropAbstractBytes 0 bs = bs := rfl
+  simp only [hD0]
+  cases h8 : bs.length.beq 8 with
+  | false => rfl
+  | true =>
+    have hLen : bs.length = 8 := Nat.eq_of_beq_eq_true h8
+    have hDropLen : (bs.drop 4).length = 4 := by rw [List.length_drop, hLen]
+    have hTakeDrop : (bs.drop 4).take 4 = bs.drop 4 :=
+      List.take_of_length_le (by rw [hDropLen]; exact Nat.le_refl 4)
+    have hB1 : (Nat.add 0 4).ble bs.length = true := by rw [hLen]; rfl
+    have hB2 : (Nat.add 4 4).ble bs.length = true := by rw [hLen]; rfl
+    rw [hB1, hB2, hTakeDrop]
+    dsimp only
+    cases u32ExactLE.decode (bs.take 4) <;> cases u32ExactLE.decode (bs.drop 4) <;> rfl
+
+/-- **`(u32, u32)` as a `MirTypedByteCodec` under its captured rustc layout**:
+the counterpart of `u32PairMirCodec` for real `anneal-rustc-capture` bodies,
+whose `LayoutTable` always carries the tuple's own `TypeLayout`
+(`LayoutTable.lookup layouts idx = some l`, size `8`, `FieldsShape.arbitrary`
+offsets `[0, 4]`), so whole-tuple places of captured MIR inherit the generic
+freeze / mutate / unpin bridges and the `BitValidity` marker traits. -/
+def u32PairLayoutMirCodec (layouts : LayoutTable) (idx : Nat) (l : TypeLayout)
+    (mem : List Nat) (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size.bytes = 8) (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    MirTypedByteCodec layouts (u32PairTy idx)
+      ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 where
+  codec := u32PairExactLE
+  toValue p := .aggregate 0 [.scalar ⟨p.1.val, 4⟩, .scalar ⟨p.2.val, 4⟩]
+  ofValue v :=
+    match v with
+    | .aggregate 0 [v1, v2] =>
+      match (u32MirCodec layouts).ofValue v1, (u32MirCodec layouts).ofValue v2 with
+      | some x, some y => some (x, y)
+      | _, _ => none
+    | _ => none
+  ofValue_toValue p := by
+    obtain ⟨x, y⟩ := p
+    have hx : (u32MirCodec layouts).ofValue (.scalar ⟨x.val, 4⟩) = some x :=
+      (u32MirCodec layouts).ofValue_toValue x
+    have hy : (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) = some y :=
+      (u32MirCodec layouts).ofValue_toValue y
+    show (match (u32MirCodec layouts).ofValue (.scalar ⟨x.val, 4⟩),
+                (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) with
+      | some a, some b => some (a, b)
+      | _, _ => none) = some (x, y)
+    rw [hx, hy]
+  tySize_eq := by
+    unfold rigidTyByteSize u32PairTy
+    dsimp only
+    rw [hLookup]
+    exact congrArg some hSize
+  encode_toValue p := encodeValueToBytes_u32PairLayout hLookup hSize hFields p.1 p.2
+  decode_eq_map := decodeValueFromBytes_u32PairLayout hLookup hSize hFields
+  encode_provenanceFree := u32PairExactLE_provenanceFree
+
+/-- The `PureLift`-side codec is layout-independent: the captured-layout and
+layout-less MIR codecs induce the same `SpatialCodec` (`u32PairSpatialCodec`). -/
+theorem u32PairLayoutMirCodec_spatialCodec_eq {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    (u32PairLayoutMirCodec layouts idx l mem hLookup hSize hFields).spatialCodec 64
+      u32PairEmbed u32PairEmbed? u32PairEmbed_embed? = u32PairSpatialCodec := rfl
+
+theorem u32PairLayout_isTryFromBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    Anneal.BitValidity.IsTryFromBytes layouts (u32PairTy idx)
+      (fun v => Exists fun p =>
+        (u32PairLayoutMirCodec layouts idx l mem hLookup hSize hFields).toValue p = v ∧
+        (u32PairLayoutMirCodec layouts idx l mem hLookup hSize hFields).ofValue v =
+          some p) :=
+  (u32PairLayoutMirCodec layouts idx l mem hLookup hSize hFields).isTryFromBytes
+
+/-- **Live MIR tuple byte window under a captured rustc layout
+(`FieldsTyped`)**: the counterpart of `placeByteWindow?_u32Pair_fieldsTyped`
+for bodies whose `LayoutTable` carries the tuple's `FieldsShape.arbitrary
+[0, 4]` entry. -/
+theorem placeByteWindow?_u32PairLayout_fieldsTyped {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    (ms : MachineState) (lc : Local) (path : SubPath)
+    (x y : {v : Nat // v < 256 ^ 4})
+    (hPlace :
+      placeValue? ms lc path =
+        some (.aggregate 0 [.scalar ⟨x.val, 4⟩, .scalar ⟨y.val, 4⟩])) :
+    Exists fun bs =>
+      placeByteWindow? layouts (u32PairTy idx) ms lc path = some bs ∧
+      bs = u32PairExactLE.encode (x, y) ∧
+      Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4 bs := by
+  refine ⟨u32PairExactLE.encode (x, y), ?_, rfl,
+    (u32PairExactLE_encode_fieldsTyped x y).1⟩
+  unfold placeValue? at hPlace
+  unfold placeByteWindow?
+  cases hSlot : lookupLocalSlot? ms lc with
+  | none => rw [hSlot] at hPlace; exact nomatch hPlace
+  | some slot =>
+    rw [hSlot] at hPlace
+    cases slot with
+    | init w =>
+      dsimp only at hPlace ⊢
+      rw [hPlace]
+      exact encodeValueToBytes_u32PairLayout hLookup hSize hFields x y
     | uninit => exact nomatch hPlace
     | dead => exact nomatch hPlace
 
