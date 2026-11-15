@@ -34,7 +34,9 @@ Apply these rules to all work in this repository:
   Authors`, matching [`PRINCIPLES.md`](PRINCIPLES.md) or
   [`ci/check_todo.sh`](ci/check_todo.sh) in the file's comment syntax) using
   the creation year; preserve the original year on edits. Files whose syntax
-  forbids leading comments (JSON, `SKILL.md` with YAML frontmatter) are exempt.
+  forbids leading comments (JSON, `SKILL.md` with YAML frontmatter), and
+  pinned upstream files under `vendor/lean-miri/` (which retain upstream
+  `LICENSE-*` headers), are exempt.
   CI does not check headers; verify them manually.
 <!-- TODO-check-disable -->
 - **`TODO` markers:** Leave no `TODO` markers unless intending to block merge;
@@ -170,7 +172,8 @@ never proves defect absence or substitutes for CI or merge gates.
     `.github/`, and pinned root manifests, reject any new Rust crate,
     `build.rs`, proc-macro, `Makefile`, `GNUmakefile`, `Justfile`, `lakefile*`,
     `lean-toolchain`, `.nix`, workflow, `.pre-commit-config.yaml`, shell/Python
-    script, or `.lean` file outside `theory/`.
+    script (except unexecuted pinned `vendor/lean-miri/` provenance files), or
+    `.lean` file outside `theory/` and pinned `vendor/lean-miri/`.
   - *`theory/` purity and `TrustedBoundary.lean` exclusions:* `theory/` `.lean`
     files must use only pure declarations and tactics admitted by
     `TrustedBoundary.lean`'s allowlists (`trusted/lean/` stays tactic-free).
@@ -397,8 +400,13 @@ enforcement). Before placing or modifying code, verify its boundary:
   (`trusted/audit/`), CLI orchestrator (`trusted/cargo-anneal/`), and `rustc`
   MIR/attribute serializer and proof-script generator
   (`trusted/rustc-capture/`)—belong in `trusted/`.
-- All code outside `trusted/` (`theory/`) must be pure, effect-free Lean
-  definitions and proofs checked by the Lean kernel.
+- All first-party code outside `trusted/` (`theory/`) must be pure,
+  effect-free Lean definitions and proofs checked by `anneal-audit` and the
+  Lean kernel.
+- `vendor/lean-miri/` holds the SHA-256-pinned upstream `lean-miri`
+  reference model for repository CI correspondence audits only (never
+  packaged or imported by `trusted/lean/` or `theory/`; audited and
+  kernel-replayed per [`docs/trust-model.md`](docs/trust-model.md)).
 
 ## Commenting in `trusted/`
 
