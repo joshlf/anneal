@@ -41,11 +41,14 @@ For related architectural details, see:
 
 ## 1. The `trusted/` boundary and how verification stays sound
 
-Anneal divides its repository into two zones with strictly separated roles:
+Anneal divides its core repository into two zones with strictly separated roles
+(augmented incrementally in repository CI by pinned `vendor/lean-miri/` and
+untrusted `correspondence/` for the MIR correspondence audit; see
+[`docs/architecture.md`](architecture.md)):
 
 | Zone | Directory | Role | Trust status |
 | :--- | :--- | :--- | :--- |
-| **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and reference semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
+| **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and verification operational semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
 | **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics invoked by generated proof scripts. | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
 
 ### How CI auditing and user-machine verification fit together
