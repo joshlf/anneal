@@ -11655,4 +11655,79 @@ pub fn cand_shadow() -> u32 {
             downgraded.unconfirmed
         );
     }
+
+    /// Classification against verbatim Lean v4.34.1 diagnostics captured from
+    /// this toolchain (`lean` on scratch files): a failing `:= by rfl`, a
+    /// heartbeat timeout (whose `Note:` / `Hint:` continuation is separated by
+    /// blank lines), and `-M` exhaustion while kernel-checking theorems over
+    /// imported definitions (the shape of every `MiriOracleConfirm*` module).
+    ///
+    /// Not covered on purpose: when `-M` is exhausted while checking a
+    /// definition in the *same* file, a dependent theorem then reports
+    /// `(kernel) declaration type mismatch`, which classifies as a rejection
+    /// (fail closed). Confirm modules only define small helpers ahead of their
+    /// theorems (whole modules peak at 0.6-1.1 GiB, far below `-M 4096`), so
+    /// that cascade cannot arise there.
+    #[test]
+    fn stage2_classification_matches_verbatim_lean_v4_34_1_diagnostics() {
+        const RFL_REJECTION: &str = "rfl_fail.lean:2:2: error: Tactic `rfl` failed: The \
+                                     left-hand side\n  1\nis not definitionally equal to the \
+                                     right-hand side\n  2\n\n⊢ 1 = 2\n";
+        const HEARTBEAT_TIMEOUT: &str = "hb.lean:6:19: error: (deterministic) timeout at \
+                                         `isDefEq`, maximum number of heartbeats (1) has been \
+                                         reached\n\nNote: Use `set_option maxHeartbeats <num>` \
+                                         to set the limit.\n\nHint: Additional diagnostic \
+                                         information may be available using the `set_option \
+                                         diagnostics true` command.\n";
+        const MINUS_M_EXHAUSTION: &str = "Use.lean:2:8: error: (kernel) excessive memory \
+                                          consumption detected\nUse.lean:4:8: error: (kernel) \
+                                          excessive memory consumption detected\nUse.lean:6:8: \
+                                          error: (kernel) excessive memory consumption \
+                                          detected\n";
+
+        assert!(lean_output_has_unexplained_kernel_rejection(RFL_REJECTION, ""));
+        for resource_only in [HEARTBEAT_TIMEOUT, MINUS_M_EXHAUSTION] {
+            assert!(!lean_output_has_unexplained_kernel_rejection(resource_only, ""));
+            assert!(lean_confirm_failure_is_resource_exhaustion(false, resource_only));
+        }
+        // One theorem timing out never hides another theorem's rejection.
+        let mixed = format!("{HEARTBEAT_TIMEOUT}{RFL_REJECTION}");
+        assert!(lean_output_has_unexplained_kernel_rejection(&mixed, ""));
+
+        let entry = |name: &str| -> MiriConfirmEntry {
+            (
+                OracleItemSpec::with_fuel(name.to_string(), 100),
+                format!("MiriDiffCorpus.{name}"),
+                AnnealOutcome::PassScalar {
+                    bits: 1,
+                    size_bytes: 4,
+                },
+            )
+        };
+        let exit1 = |stdout: &str| LeanConfirmRun {
+            success: false,
+            signal_terminated: false,
+            status: "exit status: 1".to_string(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        };
+        let stage_for = |stdout: String| {
+            run_chunked_miri_confirm_stage(
+                &[entry("div_v")],
+                MIRI_CONFIRM_CHUNK_SIZE,
+                1,
+                |_file_name, _entries| Ok(()),
+                move |_file_name, _active_workers| Ok(exit1(&stdout)),
+            )
+        };
+        for resource_only in [HEARTBEAT_TIMEOUT, MINUS_M_EXHAUSTION] {
+            let stage = stage_for(resource_only.to_string())
+                .expect("verbatim exhaustion output must downgrade, not abort");
+            assert!(stage.unconfirmed.contains_key("div_v"), "{resource_only}");
+        }
+        for rejecting in [RFL_REJECTION.to_string(), mixed] {
+            let err = stage_for(rejecting).expect_err("a verbatim rfl rejection must fail closed");
+            assert!(err.contains("Tactic `rfl` failed"), "{err}");
+        }
+    }
 }
