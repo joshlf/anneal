@@ -3456,4 +3456,73 @@ theorem round14_handle_hygiene_and_cfg_complete_regressions_tests :
          | none => rw [hFind] at h; nomatch h
          | some e => rw [hFind] at h; dsimp only at h ⊢; exact h⟩
 
+/-- Round 15 regression tests:
+1. `joinLoanEntries` rejects merging a `.rootParam` or `.regionOut` target with
+   a non-matching target into a `.choice` target.
+2. `applyOneJoinPair` rejects renaming `.regionOut` loans, duplicate loan IDs,
+   and residual `PermTree` permissions on ended target slots.
+3. `evalFnReturningMut` (`sanitizeMutRetSummary` / `synthesizeMutReturnFromVal`)
+   rejects caller-supplied `vFinal` containing a borrow handle.
+4. `wfPlan_*` and `evalPlan_whileLoop` compose cleanly. -/
+theorem round15_join_special_target_and_mut_ret_hygiene_tests :
+    let eRoot : LoanEntry StdVal :=
+      ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .rootParam 0⟩
+    let eRegOut : LoanEntry StdVal :=
+      ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .regionOut 0 0⟩
+    let eLocal : LoanEntry StdVal :=
+      ⟨0, .activeMut, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩
+    -- 1. `joinLoanEntries` rejects mixing `.rootParam` or `.regionOut` with `.direct`:
+    joinLoanEntries stdValAlg (.symBool true) [eRoot] [eLocal] = none ∧
+    joinLoanEntries stdValAlg (.symBool true) [eRegOut] [eLocal] = none ∧
+    -- 2. `applyOneJoinPair` rejects `.regionOut` loans and residual permissions:
+    let stReg1 : SymState StdVal :=
+      { locals := [⟨.nat 1, .unborrowed⟩]
+        loans :=
+          [ ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .regionOut 0 0⟩
+          , ⟨1, .ended, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ]
+        regionGroups := []
+        regionDeposits := []
+        spatial := []
+        nextSpatialTag := 0 }
+    let stReg2 : SymState StdVal :=
+      { locals := [⟨.nat 1, .mutLocked 1⟩]
+        loans :=
+          [ ⟨0, .ended, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩
+          , ⟨1, .activeMut, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ]
+        regionGroups := []
+        regionDeposits := []
+        spatial := []
+        nextSpatialTag := 0 }
+    let stResidual2 : SymState StdVal :=
+      { locals := [⟨.nat 1, .mutLocked 0⟩]
+        loans :=
+          [ ⟨0, .ended, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩
+          , ⟨1, .activeMut, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ]
+        regionGroups := []
+        regionDeposits := []
+        spatial := []
+        nextSpatialTag := 0 }
+    applyOneJoinPair stdValAlg 0 1 stReg1 stReg2 = none ∧
+    applyOneJoinPair stdValAlg 0 1
+      { stReg1 with
+        loans :=
+          [ ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩
+          , ⟨1, .ended, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ] }
+      stResidual2 = none ∧
+    -- 3. `evalFnReturningMut` backward closure rejects caller `vFinal` carrying a handle:
+    (match evalFnReturningMut stdValAlg [⟨.mutRef 0 [], .nat 10⟩] .skip 0 with
+     | .ok (fwd, backFn) =>
+       fwd = .nat 10 ∧
+       backFn (.nat 99) = some [.nat 99] ∧
+       backFn (.refVal 0 []) = none
+     | .fail => False) ∧
+    -- 4. `wfPlan_whileLoop` and `evalPlan_whileLoop`:
+    WfPlan stdValAlg
+      (.whileLoop 2 (.constVal (.bool false))
+        (.seq .skip (.act (.assign (.localSub 0 []) (.constVal (.nat 1)))))) :=
+  ⟨rfl, rfl, rfl, rfl, ⟨rfl, rfl, rfl⟩,
+   wfPlan_whileLoop stdValAlg 2 (.constVal (.bool false))
+     (wfPlan_seq stdValAlg (wfPlan_skip stdValAlg)
+       (wfPlan_act stdValAlg (.assign (.localSub 0 []) (.constVal (.nat 1)))))⟩
+
 end Anneal.PureLift

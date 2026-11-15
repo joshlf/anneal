@@ -6,6 +6,7 @@
 -- This file may not be copied, modified, or distributed except according to
 -- those terms.
 
+import Anneal.BitValidity
 import Anneal.MirLiftCore
 import Anneal.SepLogicLenses
 import Anneal.PureLift.BlockCfg
@@ -1264,9 +1265,146 @@ theorem cellsOfAbstractBytes_ne_init :
           | none => exact nomatch hb
           | some _ => exact nomatch hb
 
+/-- Converting a byte window to cells preserves length. -/
+theorem cellsOfAbstractBytes_length :
+    ∀ (bs : List AbstractByte) (cs : List (CellVal Val)),
+      cellsOfAbstractBytes bs = some cs → cs.length = bs.length
+  | [], cs, h => by
+    injection h with h
+    subst h
+    rfl
+  | b :: bs, cs, h => by
+    rw [cellsOfAbstractBytes_cons] at h
+    cases hb : cellOfAbstractByte (Val := Val) b with
+    | none =>
+      rw [hb] at h
+      exact nomatch h
+    | some c =>
+      cases hcs : cellsOfAbstractBytes (Val := Val) bs with
+      | none =>
+        rw [hb, hcs] at h
+        exact nomatch h
+      | some cs' =>
+        rw [hb, hcs] at h
+        injection h with h
+        subst h
+        exact congrArg (· + 1) (cellsOfAbstractBytes_length bs cs' hcs)
+
+/-- Converting a cell window to bytes preserves length. -/
+theorem abstractBytesOfCells_length :
+    ∀ (cs : List (CellVal Val)) (bs : List AbstractByte),
+      abstractBytesOfCells cs = some bs → bs.length = cs.length
+  | [], bs, h => by
+    injection h with h
+    subst h
+    rfl
+  | c :: cs, bs, h => by
+    rw [abstractBytesOfCells_cons] at h
+    cases hc : abstractByteOfCell c with
+    | none =>
+      rw [hc] at h
+      exact nomatch h
+    | some b =>
+      cases hbs : abstractBytesOfCells cs with
+      | none =>
+        rw [hc, hbs] at h
+        exact nomatch h
+      | some bs' =>
+        rw [hc, hbs] at h
+        injection h with h
+        subst h
+        exact congrArg (· + 1) (abstractBytesOfCells_length cs bs' hbs)
+
+/-- Converting a cell window to bytes and back is the identity. -/
+theorem cellsOfAbstractBytes_abstractBytesOfCells :
+    ∀ (cs : List (CellVal Val)) (bs : List AbstractByte),
+      abstractBytesOfCells cs = some bs →
+      cellsOfAbstractBytes (Val := Val) bs = some cs
+  | [], bs, h => by
+    injection h with h
+    subst h
+    rfl
+  | c :: cs, bs, h => by
+    rw [abstractBytesOfCells_cons] at h
+    cases hc : abstractByteOfCell c with
+    | none =>
+      rw [hc] at h
+      exact nomatch h
+    | some b =>
+      cases hbs : abstractBytesOfCells cs with
+      | none =>
+        rw [hc, hbs] at h
+        exact nomatch h
+      | some bs' =>
+        rw [hc, hbs] at h
+        injection h with h
+        subst h
+        rw [cellsOfAbstractBytes_cons,
+          cellsOfAbstractBytes_abstractBytesOfCells cs bs' hbs]
+        cases c with
+        | uninit =>
+          injection hc with hb
+          subst hb
+          rfl
+        | rawByte x =>
+          injection hc with hb
+          subst hb
+          rfl
+        | init _ => exact nomatch hc
+
+/-- `SpatialPin.hasUninitCell` on a converted byte window is the exact negation
+of `Anneal.BitValidity.allBytesInitialized`. -/
+theorem hasUninitCell_cellsOfAbstractBytes :
+    ∀ (bs : List AbstractByte) (cs : List (CellVal Val)),
+      cellsOfAbstractBytes bs = some cs →
+      hasUninitCell cs = !Anneal.BitValidity.allBytesInitialized bs
+  | [], cs, h => by
+    injection h with h
+    subst h
+    rfl
+  | b :: bs, cs, h => by
+    rw [cellsOfAbstractBytes_cons] at h
+    cases hb : cellOfAbstractByte (Val := Val) b with
+    | none =>
+      rw [hb] at h
+      exact nomatch h
+    | some c =>
+      cases hcs : cellsOfAbstractBytes (Val := Val) bs with
+      | none =>
+        rw [hb, hcs] at h
+        exact nomatch h
+      | some cs' =>
+        rw [hb, hcs] at h
+        injection h with h
+        subst h
+        cases b with
+        | uninit =>
+          injection hb with hc
+          subst hc
+          rfl
+        | init x p =>
+          cases p with
+          | none =>
+            injection hb with hc
+            subst hc
+            exact hasUninitCell_cellsOfAbstractBytes bs cs' hcs
+          | some _ => exact nomatch hb
+
+/-- `Anneal.BitValidity.allBytesInitialized` on a converted cell window is the
+exact negation of `SpatialPin.hasUninitCell`. -/
+theorem allBytesInitialized_abstractBytesOfCells :
+    ∀ (cs : List (CellVal Val)) (bs : List AbstractByte),
+      abstractBytesOfCells cs = some bs →
+      Anneal.BitValidity.allBytesInitialized bs = !hasUninitCell cs
+  | cs, bs, h => by
+    have hConv := cellsOfAbstractBytes_abstractBytesOfCells cs bs h
+    have hUninit := hasUninitCell_cellsOfAbstractBytes bs cs hConv
+    rw [hUninit, Bool.not_not]
+
 /-- **`ByteLensCodec` as a `SpatialCodec`**: a provenance-free trusted byte codec
-on `α`, embedded into `Val` by the prism `(toVal, ofVal?)`, encodes `α`'s image
-as its raw byte window and falls back to `[.init v]` elsewhere. -/
+on `α` of fixed width `n`, embedded into `Val` by the prism `(toVal, ofVal?)`,
+encodes `α`'s image as its `n`-byte raw byte window (enforcing exact width
+`bs.length == n` on decode) and falls back to `[.init v]` elsewhere. -/
 def spatialCodecOfByteLensCodec {α : Type} {n : Nat} (cid : Nat)
     (c : Anneal.SepLogicLenses.ByteLensCodec α n)
     (hProv : ∀ a, provenanceFree (c.encode a) = true)
@@ -1277,19 +1415,21 @@ def spatialCodecOfByteLensCodec {α : Type} {n : Nat} (cid : Nat)
     (fun a => (cellsOfAbstractBytes (c.encode a)).getD [])
     (fun cells =>
       match abstractBytesOfCells cells with
-      | some bs => c.decode bs
+      | some bs => if Nat.beq bs.length n then c.decode bs else none
       | none => none)
     (fun a => by
       obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
         (hProv a)
       show (match abstractBytesOfCells ((cellsOfAbstractBytes (c.encode a)).getD []) with
-        | some bs => c.decode bs
+        | some bs => if Nat.beq bs.length n then c.decode bs else none
         | none => none) = some a
       rw [hcs]
       show (match abstractBytesOfCells cs with
-        | some bs => c.decode bs
+        | some bs => if Nat.beq bs.length n then c.decode bs else none
         | none => none) = some a
       rw [abstractBytesOfCells_cellsOfAbstractBytes (c.encode a) cs hcs]
+      show (if Nat.beq (c.encode a).length n then c.decode (c.encode a) else none) = some a
+      rw [c.encode_len a, Nat.beq_refl]
       exact c.decode_encode a)
     (fun a w _ hEq => by
       obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
@@ -1297,6 +1437,94 @@ def spatialCodecOfByteLensCodec {α : Type} {n : Nat} (cid : Nat)
       have hEq' : (cellsOfAbstractBytes (c.encode a)).getD [] = [.init w] := hEq
       rw [hcs] at hEq'
       exact cellsOfAbstractBytes_ne_init (c.encode a) cs w hcs hEq')
+
+/-- Every value in the subdomain `ofVal? v = some a` encodes to an exact
+`n`-cell window under `spatialCodecOfByteLensCodec`. -/
+theorem spatialCodecOfByteLensCodec_encode_length {α : Type} {n : Nat}
+    (cid : Nat) (c : Anneal.SepLogicLenses.ByteLensCodec α n)
+    (hProv : ∀ a, provenanceFree (c.encode a) = true)
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (v : Val) (a : α) (hv : ofVal? v = some a) :
+    ((spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
+        toVal_ofVal?).encode v).length = n := by
+  unfold spatialCodecOfByteLensCodec SpatialCodec.ofSubdomain
+  dsimp only
+  rw [hv]
+  dsimp only
+  obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
+    (hProv a)
+  rw [hcs]
+  dsimp only [Option.getD]
+  rw [cellsOfAbstractBytes_length (c.encode a) cs hcs]
+  exact c.encode_len a
+
+theorem decode_wrong_length_aux {α : Type} {n : Nat}
+    (c : Anneal.SepLogicLenses.ByteLensCodec α n)
+    (toVal : α → Val)
+    (cells : List (CellVal Val)) (hLen : Nat.beq cells.length n = false) :
+    (match
+      (match abstractBytesOfCells cells with
+       | some bs => if Nat.beq bs.length n then c.decode bs else none
+       | none => none) with
+     | some a => some (toVal a)
+     | none => none) = none := by
+  cases hBytes : abstractBytesOfCells cells with
+  | none => rfl
+  | some bs =>
+    dsimp only
+    rw [abstractBytesOfCells_length cells bs hBytes, hLen]
+    rfl
+
+/-- Any non-fallback cell slice whose length differs from `n` is rejected by
+`spatialCodecOfByteLensCodec.decode`. -/
+theorem spatialCodecOfByteLensCodec_decode_wrong_length {α : Type} {n : Nat}
+    (cid : Nat) (c : Anneal.SepLogicLenses.ByteLensCodec α n)
+    (hProv : ∀ a, provenanceFree (c.encode a) = true)
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (cells : List (CellVal Val)) (hLen : Nat.beq cells.length n = false)
+    (hNoInit : ∀ w, cells ≠ [.init w]) :
+    (spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
+      toVal_ofVal?).decode cells = none := by
+  unfold spatialCodecOfByteLensCodec SpatialCodec.ofSubdomain
+    decodeSubdomainCells
+  dsimp only
+  cases cells with
+  | nil => exact decode_wrong_length_aux c toVal [] hLen
+  | cons hd tl =>
+    cases hd with
+    | uninit => exact decode_wrong_length_aux c toVal (.uninit :: tl) hLen
+    | rawByte b => exact decode_wrong_length_aux c toVal (.rawByte b :: tl) hLen
+    | init w =>
+      cases tl with
+      | nil => exact absurd rfl (hNoInit w)
+      | cons hd2 tl2 =>
+        exact decode_wrong_length_aux c toVal (.init w :: hd2 :: tl2) hLen
+
+/-- If `c.encode a` is fully initialized (`BitValidity.allBytesInitialized`),
+then `spatialCodecOfByteLensCodec` encodes `v` (with `ofVal? v = some a`) to an
+`.uninit`-free cell window (`hasUninitCell = false`). -/
+theorem spatialCodecOfByteLensCodec_hasUninitCell_false {α : Type} {n : Nat}
+    (cid : Nat) (c : Anneal.SepLogicLenses.ByteLensCodec α n)
+    (hProv : ∀ a, provenanceFree (c.encode a) = true)
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (v : Val) (a : α) (hv : ofVal? v = some a)
+    (hInit : Anneal.BitValidity.allBytesInitialized (c.encode a) = true) :
+    hasUninitCell
+      ((spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
+          toVal_ofVal?).encode v) = false := by
+  unfold spatialCodecOfByteLensCodec SpatialCodec.ofSubdomain
+  dsimp only
+  rw [hv]
+  dsimp only
+  obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
+    (hProv a)
+  rw [hcs]
+  dsimp only [Option.getD]
+  rw [hasUninitCell_cellsOfAbstractBytes (c.encode a) cs hcs, hInit]
+  rfl
 
 /-- Trusted little-endian encodings carry no pointer provenance. -/
 theorem provenanceFree_encodeLittleEndianBytes :
@@ -1308,6 +1536,15 @@ theorem provenanceFree_encodeLittleEndianBytes :
         true
     simp only [provenanceFree, List.all_cons, Bool.true_and]
     exact provenanceFree_encodeLittleEndianBytes sz (Nat.div bits 256)
+
+/-- Trusted little-endian encodings are fully initialized (`allBytesInitialized`). -/
+theorem allBytesInitialized_encodeLittleEndianBytes :
+    ∀ (sz bits : Nat),
+      Anneal.BitValidity.allBytesInitialized
+        (encodeLittleEndianBytes bits sz none) = true
+  | 0, _ => rfl
+  | sz + 1, bits =>
+    allBytesInitialized_encodeLittleEndianBytes sz (Nat.div bits 256)
 
 end ByteWindows
 
@@ -1501,6 +1738,52 @@ theorem liftBlockToJoin_of_runBlockCfgToBlock
   intro s'' ms' hEq hR'
   subst hEq
   exact hJoin ms' hSound.2 hSound.1 hR'
+
+/-- **Verified PureLift `while` cutpoints become MirLiftCore join paths**:
+for a `while` loop (`whileLoopBlocks cond bodyPlan retExpr`) satisfying a
+cutpoint invariant `Inv` and ranking measure `rank`, any entry state `st` with
+`Inv st` reaches exit block `2` in a state `stFinal` satisfying `Inv stFinal`
+and false loop condition; under a per-step simulation into live MIR, the join
+correspondence `hJoin` may use `Inv stFinal` and the false loop condition to
+establish `MirLiftCore.LiftBlockToJoin` at the MIR loop exit block. -/
+theorem liftBlockToJoin_of_whileCutpoint {Val : Type}
+    (alg : ValAlgebra Val) (cond : RvalOp Val) (bodyPlan : FlowPlan Val)
+    (retExpr : RvalOp Val) (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        ((alg.asBool cv = some false ∧ rank s = 0) ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg bodyPlan s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s = rank s' + 1)))
+    {body : CapturedMir}
+    {R : BlockMachineState (SymState Val) (FuncOut Val) → MachineState → Prop}
+    (hSim : SegmentSim
+      (blockCfgStep (stepBasicBlock alg (whileLoopBlocks cond bodyPlan retExpr)))
+      (PureMirExec.mirStep body) R)
+    (wrap : FuncOut Val → FuncOut Val) (st : SymState Val) (hInv : Inv st)
+    {bbIdx joinBb : BasicBlockIdx} {env : MirLiftCore.PureEnv}
+    {JoinInv : MirLiftCore.PureEnv → Prop}
+    (hR : R ⟨wrap, 0, st⟩ (({ bb := bbIdx, stmtIdx := 0, env := env } :
+      PureMirExec.PureState).toMachineState emptyMemory))
+    (hJoin : ∀ stFinal ms',
+      Inv stFinal →
+      (Exists fun cv =>
+        evalRval alg cond stFinal = some cv ∧ alg.asBool cv = some false) →
+      R ⟨wrap, 2, stFinal⟩ ms' →
+      ms' = ({ bb := joinBb, stmtIdx := 0, env := ms'.frame.locals } :
+        PureMirExec.PureState).toMachineState emptyMemory ∧
+      JoinInv ms'.frame.locals) :
+    MirLiftCore.LiftBlockToJoin body bbIdx env joinBb JoinInv := by
+  obtain ⟨stFinal, hWhile, hInvF, hCondF⟩ :=
+    runWhileFlowSteps_cutpoint_sound alg cond (evalPlan alg bodyPlan) Inv rank
+      hStep (rank st) st hInv rfl
+  refine liftBlockToJoin_of_blockCfg_segment hSim
+    (stepsTo_whileExit_of_runWhileFlowSteps alg cond bodyPlan retExpr (rank st)
+      wrap st stFinal hWhile) hR ?_
+  intro s' ms' hEq hR'
+  subst hEq
+  exact hJoin stFinal ms' hInvF hCondF hR'
 
 end LiveMir
 
@@ -2180,10 +2463,22 @@ def u32ValueSpatialCodec : SpatialCodec Value :=
     (fun a => provenanceFree_encodeLittleEndianBytes 4 a.val)
     u32ToValue u32OfValue? u32ToValue_ofValue?
 
+/-- Every in-range `u32` MIR scalar encodes under `u32ValueSpatialCodec` to an
+`.uninit`-free 4-cell byte window. -/
+theorem u32ValueSpatialCodec_hasUninitCell_false (v : Value)
+    (a : {n : Nat // n < 256 ^ 4}) (hv : u32OfValue? v = some a) :
+    hasUninitCell (u32ValueSpatialCodec.encode v) = false :=
+  spatialCodecOfByteLensCodec_hasUninitCell_false 32
+    Anneal.SepLogicLenses.ByteLensCodec.u32LE
+    (fun x => provenanceFree_encodeLittleEndianBytes 4 x.val)
+    u32ToValue u32OfValue? u32ToValue_ofValue? v a hv
+    (allBytesInitialized_encodeLittleEndianBytes 4 a.val)
+
 /-- **Episode 2 readiness canary**: a `u32` MIR scalar encodes to its
 little-endian raw byte window, a single-byte mutation of that window decodes to
-the updated scalar, an `.uninit` byte or an out-of-range window (`2 ^ 32`)
-fails to decode, and a non-`u32` value falls back to a value cell. -/
+the updated scalar, an `.uninit` byte or an out-of-range window (`2 ^ 32`) or a
+wrong-width window (`0`, `1`, or `5` bytes with trailing `0`) fails to decode,
+and a non-`u32` value falls back to a value cell. -/
 theorem u32ValueSpatialCodec_canaries :
     u32ValueSpatialCodec.encode (.scalar { bits := 0x01020304, sizeBytes := 4 }) =
       [.rawByte 4, .rawByte 3, .rawByte 2, .rawByte 1] ∧
@@ -2191,6 +2486,10 @@ theorem u32ValueSpatialCodec_canaries :
       some (.scalar { bits := 0x01020305, sizeBytes := 4 }) ∧
     u32ValueSpatialCodec.decode [.rawByte 5, .uninit, .rawByte 2, .rawByte 1] =
       none ∧
+    u32ValueSpatialCodec.decode [] = none ∧
+    u32ValueSpatialCodec.decode [.rawByte 5] = none ∧
+    u32ValueSpatialCodec.decode
+      [.rawByte 4, .rawByte 3, .rawByte 2, .rawByte 1, .rawByte 0] = none ∧
     u32ValueSpatialCodec.decode
       [.rawByte 0, .rawByte 0, .rawByte 0, .rawByte 0, .rawByte 1] = none ∧
     u32ValueSpatialCodec.encode (.scalar { bits := 7, sizeBytes := 1 }) =
@@ -2198,7 +2497,91 @@ theorem u32ValueSpatialCodec_canaries :
     hasUninitCell
       (u32ValueSpatialCodec.encode (.scalar { bits := 0x01020304, sizeBytes := 4 })) =
       false := by
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 1-byte `ByteLensCodec` for Rust `bool` (`0x00 ↔ false`, `0x01 ↔ true`,
+rejecting `0x02..0xFF`, `.uninit`, and wrong-width windows). -/
+def boolByteLensCodec : Anneal.SepLogicLenses.ByteLensCodec Bool 1 where
+  encode b := [.init (if b then 1 else 0) none]
+  decode bs :=
+    match bs with
+    | [.init b _] =>
+      if b == 0 then some false
+      else if b == 1 then some true
+      else none
+    | _ => none
+  encode_len _ := rfl
+  decode_encode b := by cases b <;> rfl
+
+theorem provenanceFree_boolByteLensCodec (b : Bool) :
+    provenanceFree (boolByteLensCodec.encode b) = true := by
+  cases b <;> rfl
+
+def boolToValue (b : Bool) : Value :=
+  .scalar (boolToScalar b)
+
+def boolOfValue? (v : Value) : Option Bool :=
+  match v with
+  | .scalar sc =>
+    if sc.sizeBytes = 1 then
+      if sc.bits = 0 then some false
+      else if sc.bits = 1 then some true
+      else none
+    else none
+  | _ => none
+
+theorem boolToValue_ofValue? (v : Value) (b : Bool)
+    (h : boolOfValue? v = some b) : boolToValue b = v := by
+  unfold boolOfValue? at h
+  split at h
+  · rename_i sc
+    split at h
+    · rename_i hs
+      split at h
+      · rename_i hb0
+        injection h with h
+        subst h
+        cases sc
+        simp only at hs hb0
+        subst hs
+        subst hb0
+        rfl
+      · split at h
+        · rename_i hb1
+          injection h with h
+          subst h
+          cases sc
+          simp only at hs hb1
+          subst hs
+          subst hb1
+          rfl
+        · exact nomatch h
+    · exact nomatch h
+  · exact nomatch h
+
+/-- `SpatialCodec` over MIR `Value` for 1-byte Rust `bool` scalars (`0x00` and
+`0x01`), rejecting invalid bit patterns (`0x02`), `.uninit` bytes, and
+wrong-width windows. -/
+def boolValueSpatialCodec : SpatialCodec Value :=
+  spatialCodecOfByteLensCodec 33 boolByteLensCodec
+    provenanceFree_boolByteLensCodec
+    boolToValue boolOfValue? boolToValue_ofValue?
+
+/-- **Episode 2 `TryFromBytes` / `bool` bit-validity canary**: valid `bool`
+scalars (`false`, `true`) encode to `[.rawByte 0]` / `[.rawByte 1]` and decode
+back, while `.uninit`, invalid bit-pattern `0x02`, and wrong-width windows
+decode to `none`. -/
+theorem boolValueSpatialCodec_canaries :
+    boolValueSpatialCodec.encode (.scalar (boolToScalar false)) = [.rawByte 0] ∧
+    boolValueSpatialCodec.encode (.scalar (boolToScalar true)) = [.rawByte 1] ∧
+    boolValueSpatialCodec.decode [.rawByte 0] =
+      some (.scalar (boolToScalar false)) ∧
+    boolValueSpatialCodec.decode [.rawByte 1] =
+      some (.scalar (boolToScalar true)) ∧
+    boolValueSpatialCodec.decode [.rawByte 2] = none ∧
+    boolValueSpatialCodec.decode [.uninit] = none ∧
+    boolValueSpatialCodec.decode [.rawByte 0, .rawByte 0] = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Canaries
 

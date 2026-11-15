@@ -583,7 +583,11 @@ def joinLoanEntries {Val : Type} (alg : ValAlgebra Val)
         else
           none
       | e2 :: es2' =>
-        if e1.id == e2.id && e1.phase.samePhase e2.phase then
+        let specialMismatch : Bool :=
+          !sameBackTargetShape e1.target e2.target &&
+          (isRootParamTarget e1.target || isRootParamTarget e2.target ||
+           isRegionOutTarget e1.target || isRegionOutTarget e2.target)
+        if e1.id == e2.id && e1.phase.samePhase e2.phase && !specialMismatch then
           match ih es2' with
           | some rest =>
             let mergedEntry : LoanEntry Val :=
@@ -863,20 +867,28 @@ in `st2`, and remapping `fLid` to `tLid` across locals, loan cells,
 `tLid != fLid`. -/
 def applyOneJoinPair {Val : Type} (alg : ValAlgebra Val)
     (tLid fLid : LoanId) (st1 st2 : SymState Val) : Option (SymState Val) :=
+  if !hasUniqueLoanId tLid st1.loans || !hasUniqueLoanId fLid st2.loans then none
+  else
   match findLoan tLid st1.loans, findLoan fLid st2.loans with
   | some e1, some e2 =>
     if !e1.phase.isActive || !e1.phase.samePhase e2.phase then none
     else if tLid == fLid then some st2
+    else if !hasUniqueLoanId tLid st2.loans || !hasUniqueLoanId fLid st1.loans then none
     else
       match findLoan tLid st2.loans, findLoan fLid st1.loans with
       | some e2AtT, some e1AtF =>
         -- Renaming a root-parameter loan would turn its `.rootParam` target
         -- into a `.choice` with a local target, which `isRootTarget` no
-        -- longer recognizes, silently dropping the parameter's writeback
-        -- obligation; so no pair may involve a root loan.
-        if isRootTarget e1.target || isRootTarget e2.target ||
-           isRootTarget e2AtT.target || isRootTarget e1AtF.target then none
+        -- longer recognizes; and renaming a `.regionOut` loan is only valid
+        -- when both branches share the exact same `.regionOut gid idx` target.
+        let regOutMismatch : Bool :=
+          (isRegionOutTarget e1.target || isRegionOutTarget e2.target) &&
+          !sameBackTargetShape e1.target e2.target
+        if isRootParamTarget e1.target || isRootParamTarget e2.target ||
+           isRootParamTarget e2AtT.target || isRootParamTarget e1AtF.target ||
+           regOutMismatch then none
         else if !e2AtT.phase.isEnded || !e1AtF.phase.isEnded then none
+        else if !noResidualLoanPerm tLid st2 || !noResidualLoanPerm fLid st1 then none
         -- `fLid` is renamed to `tLid` in `st2`, so a stale handle to `st2`'s
         -- ended loan `tLid` would come back to life as a handle to the moved
         -- entry.
@@ -934,6 +946,23 @@ def applyJoinPairs {Val : Type} (alg : ValAlgebra Val)
 returning a mutable reference. -/
 abbrev MutRetSummary (Val : Type) := Val × (Val → Option (List Val))
 
+/-- Sanitize a `MutRetSummary Val` so its forward value is handle-free and its
+backward closure rejects any caller-supplied `vFinal` containing a borrow handle
+as well as any final parameter list containing a borrow handle. -/
+def sanitizeMutRetSummary {Val : Type} (alg : ValAlgebra Val)
+    (m : MutRetSummary Val) : Option (MutRetSummary Val) :=
+  if !handleFreeVal alg m.1 then none
+  else
+    some
+      (m.1,
+       fun vFinal =>
+         if !handleFreeVal alg vFinal then none
+         else
+           match m.2 vFinal with
+           | some finals =>
+             if finals.all (handleFreeVal alg) then some finals else none
+           | none => none)
+
 /-- Merge two `MutRetSummary Val` results under symbolic branch condition
 `cVal`, preserving identical encoded references via `zipOrKeepSameRef` and
 projecting branch-specialized final values via `alg.projectBranchVal` before
@@ -942,7 +971,7 @@ def mergeMutRet {Val : Type} (alg : ValAlgebra Val) (cVal : Val)
     (tMut fMut : Option (MutRetSummary Val)) : Option (MutRetSummary Val) :=
   match tMut, fMut with
   | some (fwd1, back1), some (fwd2, back2) =>
-    some
+    sanitizeMutRetSummary alg
       (zipOrKeepSameRef alg cVal fwd1 fwd2,
        fun vFinal =>
          let vFinal1 := alg.projectBranchVal cVal true vFinal
@@ -1023,6 +1052,8 @@ def synthesizeMutReturnFromVal {Val : Type} (alg : ValAlgebra Val)
               let handleFreeFinals (finals : List Val) : Option (List Val) :=
                 if finals.all (handleFreeVal alg) then some finals else none
               let backFn : Val → Option (List Val) := fun vFinal =>
+                if !handleFreeVal alg vFinal then none
+                else
                 match putPath alg retPath retEntry.cell.val vFinal with
                 | none => none
                 | some entryVal' =>
@@ -1412,6 +1443,83 @@ theorem evalPlan_seq {Val : Type} (alg : ValAlgebra Val)
   rw [evalPlanOps_append, hWf2 [], hWf1]
   rfl
 
+theorem wfPlan_skip {Val : Type} (alg : ValAlgebra Val) :
+    WfPlan alg .skip :=
+  fun _ => rfl
+
+theorem wfPlan_act {Val : Type} (alg : ValAlgebra Val) (a : PrimAction Val) :
+    WfPlan alg (.act a) :=
+  fun _ => rfl
+
+theorem wfPlan_earlyReturn {Val : Type} (alg : ValAlgebra Val)
+    (ls : List LoanId) (gs : List RegionGroupId) (r : RvalOp Val) :
+    WfPlan alg (.earlyReturn ls gs r) :=
+  fun _ => rfl
+
+theorem wfPlan_seq {Val : Type} (alg : ValAlgebra Val)
+    {p1 p2 : FlowPlan Val} (hWf1 : WfPlan alg p1) (hWf2 : WfPlan alg p2) :
+    WfPlan alg (.seq p1 p2) := by
+  intro stk
+  change stepPlanOp alg .seqJoin (evalPlanOps alg (p1.ops ++ p2.ops) stk) =
+    (fun s0 =>
+      match stepPlanOp alg .seqJoin (evalPlanOps alg (p1.ops ++ p2.ops) []) with
+      | [evalFn] => evalFn s0
+      | _ => .fail) :: stk
+  rw [evalPlanOps_append, hWf2 stk, hWf1, evalPlanOps_append, hWf2 [], hWf1]
+  rfl
+
+theorem wfPlan_branch {Val : Type} (alg : ValAlgebra Val) (cond : RvalOp Val)
+    {p1 p2 : FlowPlan Val} (hWf1 : WfPlan alg p1) (hWf2 : WfPlan alg p2) :
+    WfPlan alg (.branch cond p1 p2) := by
+  intro stk
+  change stepPlanOp alg (.branchJoin cond) (evalPlanOps alg (p1.ops ++ p2.ops) stk) =
+    (fun s0 =>
+      match stepPlanOp alg (.branchJoin cond) (evalPlanOps alg (p1.ops ++ p2.ops) []) with
+      | [evalFn] => evalFn s0
+      | _ => .fail) :: stk
+  rw [evalPlanOps_append, hWf2 stk, hWf1, evalPlanOps_append, hWf2 [], hWf1]
+  rfl
+
+theorem wfPlan_branchExplicitJoin {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (joinPairs : List (LoanId × LoanId))
+    {p1 p2 : FlowPlan Val} (hWf1 : WfPlan alg p1) (hWf2 : WfPlan alg p2) :
+    WfPlan alg (.branchExplicitJoin cond p1 p2 joinPairs) := by
+  intro stk
+  change stepPlanOp alg (.branchExplicitJoinOp cond joinPairs)
+      (evalPlanOps alg (p1.ops ++ p2.ops) stk) =
+    (fun s0 =>
+      match stepPlanOp alg (.branchExplicitJoinOp cond joinPairs)
+              (evalPlanOps alg (p1.ops ++ p2.ops) []) with
+      | [evalFn] => evalFn s0
+      | _ => .fail) :: stk
+  rw [evalPlanOps_append, hWf2 stk, hWf1, evalPlanOps_append, hWf2 [], hWf1]
+  rfl
+
+theorem wfPlan_whileLoop {Val : Type} (alg : ValAlgebra Val)
+    (fuel : Nat) (cond : RvalOp Val) {body : FlowPlan Val}
+    (hWfB : WfPlan alg body) :
+    WfPlan alg (.whileLoop fuel cond body) := by
+  intro stk
+  change stepPlanOp alg (.whileLoopOp fuel cond) (evalPlanOps alg body.ops stk) =
+    (fun s0 =>
+      match stepPlanOp alg (.whileLoopOp fuel cond) (evalPlanOps alg body.ops []) with
+      | [evalFn] => evalFn s0
+      | _ => .fail) :: stk
+  rw [hWfB stk, hWfB []]
+  rfl
+
+theorem evalPlan_whileLoop {Val : Type} (alg : ValAlgebra Val)
+    (fuel : Nat) (cond : RvalOp Val) (body : FlowPlan Val) (s0 : SymState Val)
+    (hWfB : WfPlan alg body) :
+    evalPlan alg (.whileLoop fuel cond body) s0 =
+      runWhileFlowSteps alg cond (evalPlan alg body) fuel s0 := by
+  change
+    (match stepPlanOp alg (.whileLoopOp fuel cond) (evalPlanOps alg body.ops []) with
+     | [evalFn] => evalFn s0
+     | _ => .fail) = _
+  rw [hWfB []]
+  rfl
+
 /-- Entry parameter passing mode. -/
 inductive ParamMode where
   | byVal
@@ -1580,25 +1688,195 @@ def evalFnReturningMut {Val : Type} (alg : ValAlgebra Val)
   match initFnState alg params with
   | .fail => .fail
   | .ok st0 =>
-    match evalPlan alg plan st0 with
-    | .fail => .fail
-    | .ok (.returned _ _ (some mutRet)) => .ok mutRet
-    | .ok (.returned _ _ none) => .fail
-    | .ok (.continuing stF) =>
-      match readPlaceVal alg (.localSub retReg []) stF with
-      | some retRef =>
-        match synthesizeMutReturnFromVal alg retRef stF with
-        | some mutRet => .ok mutRet
-        | none => .fail
-      | none => .fail
-    | .ok (.guardedContinuing _ stF _ wrapMut) =>
-      let fallMut :=
+    let rawMut : Option (MutRetSummary Val) :=
+      match evalPlan alg plan st0 with
+      | .fail => none
+      | .ok (.returned _ _ mutOpt) => mutOpt
+      | .ok (.continuing stF) =>
         match readPlaceVal alg (.localSub retReg []) stF with
         | some retRef => synthesizeMutReturnFromVal alg retRef stF
         | none => none
-      match wrapMut fallMut with
-      | some mutRet => .ok mutRet
+      | .ok (.guardedContinuing _ stF _ wrapMut) =>
+        let fallMut :=
+          match readPlaceVal alg (.localSub retReg []) stF with
+          | some retRef => synthesizeMutReturnFromVal alg retRef stF
+          | none => none
+        wrapMut fallMut
+    match rawMut with
+    | some mutRet =>
+      match sanitizeMutRetSummary alg mutRet with
+      | some cleanRet => .ok cleanRet
       | none => .fail
+    | none => .fail
+
+/-- Every successful `evalFnValue` return is handle-free (`handleFreeOut`). -/
+theorem evalFnValue_handleFreeOut {Val : Type} (alg : ValAlgebra Val)
+    (params : List (ParamInput Val)) (plan : FlowPlan Val)
+    (retExpr : RvalOp Val) (out : FuncOut Val)
+    (h : evalFnValue alg params plan retExpr = .ok out) :
+    handleFreeOut alg out = true := by
+  dsimp [evalFnValue] at h
+  revert h
+  cases initFnState alg params with
+  | fail => intro h; nomatch h
+  | ok st0 =>
+    dsimp
+    cases evalPlan alg plan st0 with
+    | fail => intro h; nomatch h
+    | ok flow =>
+      cases flow with
+      | returned out' valClean _ =>
+        dsimp
+        cases valClean with
+        | false => intro h; nomatch h
+        | true =>
+          cases hFree : handleFreeOut alg out' with
+          | false => intro h; nomatch h
+          | true =>
+            dsimp
+            intro h
+            injection h with hEq
+            subst hEq
+            exact hFree
+      | continuing stF =>
+        dsimp
+        cases stateCleanAtReturn stF with
+        | false => intro h; nomatch h
+        | true =>
+          dsimp
+          cases evalRval alg retExpr stF with
+          | none => intro h; nomatch h
+          | some retVal =>
+            dsimp
+            cases hFree : handleFreeOut alg ⟨retVal, collectRootMutVals stF.loans⟩ with
+            | false => intro h; nomatch h
+            | true =>
+              dsimp
+              intro h
+              injection h with hEq
+              subst hEq
+              exact hFree
+      | guardedContinuing wrapOut stF valClean _ =>
+        dsimp
+        cases valClean with
+        | false => intro h; nomatch h
+        | true =>
+          cases stateCleanAtReturn stF with
+          | false => intro h; nomatch h
+          | true =>
+            dsimp
+            cases evalRval alg retExpr stF with
+            | none => intro h; nomatch h
+            | some retVal =>
+              dsimp
+              cases hFree :
+                handleFreeOut alg
+                  (wrapOut ⟨retVal, collectRootMutVals stF.loans⟩) with
+              | false => intro h; nomatch h
+              | true =>
+                dsimp
+                intro h
+                injection h with hEq
+                subst hEq
+                exact hFree
+
+theorem sanitizeMutRetSummary_handleFree {Val : Type} (alg : ValAlgebra Val)
+    (mutRet : MutRetSummary Val) (fwd : Val) (backFn : Val → Option (List Val))
+    (h : sanitizeMutRetSummary alg mutRet = some (fwd, backFn)) :
+    handleFreeVal alg fwd = true ∧
+    ∀ vFinal finals,
+      backFn vFinal = some finals →
+      handleFreeVal alg vFinal = true ∧
+      finals.all (handleFreeVal alg) = true := by
+  dsimp [sanitizeMutRetSummary] at h
+  revert h
+  cases hFwd : handleFreeVal alg mutRet.1 with
+  | false => intro h; nomatch h
+  | true =>
+    dsimp
+    intro h
+    injection h with hPair
+    injection hPair with hFwdEq hBackEq
+    subst hFwdEq
+    subst hBackEq
+    refine ⟨hFwd, ?_⟩
+    intro vFinal finals hBack
+    change
+      (if !handleFreeVal alg vFinal then none
+       else
+         match mutRet.2 vFinal with
+         | some finals =>
+           if finals.all (handleFreeVal alg) then some finals else none
+         | none => none) = some finals at hBack
+    cases hIn : handleFreeVal alg vFinal with
+    | false =>
+      rw [hIn] at hBack
+      nomatch hBack
+    | true =>
+      rw [hIn] at hBack
+      cases hRaw : mutRet.2 vFinal with
+      | none =>
+        rw [hRaw] at hBack
+        nomatch hBack
+      | some rawFinals =>
+        rw [hRaw] at hBack
+        change
+          (if rawFinals.all (handleFreeVal alg) then some rawFinals
+           else none) = some finals at hBack
+        cases hOut : rawFinals.all (handleFreeVal alg) with
+        | false =>
+          rw [hOut] at hBack
+          nomatch hBack
+        | true =>
+          rw [hOut] at hBack
+          injection hBack with hFinEq
+          subst hFinEq
+          exact ⟨rfl, hOut⟩
+
+/-- Every successful `evalFnReturningMut` summary has a handle-free forward
+value, rejects caller inputs containing borrow handles, and produces only
+handle-free final parameter values. -/
+theorem evalFnReturningMut_handleFree {Val : Type} (alg : ValAlgebra Val)
+    (params : List (ParamInput Val)) (plan : FlowPlan Val)
+    (retReg : LocalId) (fwd : Val) (backFn : Val → Option (List Val))
+    (h : evalFnReturningMut alg params plan retReg = .ok (fwd, backFn)) :
+    handleFreeVal alg fwd = true ∧
+    ∀ vFinal finals,
+      backFn vFinal = some finals →
+      handleFreeVal alg vFinal = true ∧
+      finals.all (handleFreeVal alg) = true := by
+  unfold evalFnReturningMut at h
+  cases hInit : initFnState alg params with
+  | fail => rw [hInit] at h; nomatch h
+  | ok st0 =>
+    rw [hInit] at h
+    dsimp only at h
+    revert h
+    generalize
+      (match evalPlan alg plan st0 with
+       | .fail => none
+       | .ok (.returned _ _ mutOpt) => mutOpt
+       | .ok (.continuing stF) =>
+         match readPlaceVal alg (.localSub retReg []) stF with
+         | some retRef => synthesizeMutReturnFromVal alg retRef stF
+         | none => none
+       | .ok (.guardedContinuing _ stF _ wrapMut) =>
+         wrapMut
+           (match readPlaceVal alg (.localSub retReg []) stF with
+            | some retRef => synthesizeMutReturnFromVal alg retRef stF
+            | none => none)) = rawMut
+    cases rawMut with
+    | none => intro h; nomatch h
+    | some mutRet =>
+      dsimp
+      cases hSan : sanitizeMutRetSummary alg mutRet with
+      | none => intro h; nomatch h
+      | some cleanRet =>
+        dsimp
+        intro h
+        injection h with hEq
+        subst hEq
+        exact sanitizeMutRetSummary_handleFree alg mutRet fwd backFn hSan
 
 /-!
 ## Exhaustive Kernel-Checked Unit Tests for `Plan`
