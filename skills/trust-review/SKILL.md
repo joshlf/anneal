@@ -66,7 +66,23 @@ Execute trust-boundary review as a dedicated pass:
    Pass 1 and (when triggered) Pass 2 first and emit a dedicated
    `### Trust-Boundary Assessment` section before general review comments
    whenever a change raises a boundary question or touches `trusted/`, `ci/`,
-   `.github/`, or pinned root manifests.
+   `.github/`, or pinned root manifests. If the host requires a fixed output
+   schema, put the assessment in its supported summary fields instead of
+   violating that schema or inventing an inline code finding.
+
+## Complete the trust assessment
+
+Use [`change-review`](../change-review/SKILL.md) for candidate identity,
+coverage, finding verification, and the author's review-fix loop. This skill
+retains ownership of the trust requirements below. Account for every changed
+path under each applicable trust goal, including absent companion updates;
+record why a goal is inapplicable rather than silently skipping it.
+
+Continue after finding a bypass or unsoundness issue. Before concluding, sweep
+for other affected boundaries and report every distinct supported violation.
+State blocked checks and unresolved trust questions separately from confirmed
+findings. An incomplete trust pass is not trust acceptance, and a local trust
+assessment does not grant hosted approval or permission to merge.
 
 ## Pass 1: Audit changes outside `trusted/`, `ci/`, and `.github/` for bypasses
 
