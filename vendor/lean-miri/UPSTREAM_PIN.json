@@ -251,12 +251,12 @@
     },
     {
       "module": "Miri.Interpreter.LocalAccess",
-      "olean_sha256": "747e191800078e4349f38627ee571106ac186f59b183d873ba08fdae19a35680",
+      "olean_sha256": "3f97a3e9e121accd58f45d6872eef61e0beb48eb9c9b048c840d0e009882b2a6",
       "path": "Miri/Interpreter/LocalAccess.lean"
     },
     {
       "module": "Miri.Interpreter.Call",
-      "olean_sha256": "be7ab1f7a924692c18ca7ffaed4ae2d84bb2193210cc2bb8ce2580df959c8211",
+      "olean_sha256": "61f7b4d408778553428387decf2a66fc8b1f5871e460dbb7fdcd5ff96db00976",
       "path": "Miri/Interpreter/Call.lean"
     },
     {
@@ -306,7 +306,7 @@
     },
     {
       "module": "Miri.Interpreter.MachineHooks",
-      "olean_sha256": "6ff4c8a377c45088d40221a740c13c470e6888cac532dd4937f6616602cb80dc",
+      "olean_sha256": "fdea5dcb0e176521b954fa4236411ff159922c3714426450a5aec01172714ec4",
       "path": "Miri/Interpreter/MachineHooks.lean"
     },
     {
@@ -321,7 +321,7 @@
     },
     {
       "module": "Miri.Interpreter.FrameRelevance",
-      "olean_sha256": "2a40c86f1d01c67964319f5ef83f5ae0419a57a663e97c1ce707ef8601515b52",
+      "olean_sha256": "0d632da4c409ff44387a01bc53bd37b12a2e7c4b7c06c3e62666b44c1e227b6f",
       "path": "Miri/Interpreter/FrameRelevance.lean"
     },
     {
@@ -336,12 +336,12 @@
     },
     {
       "module": "Miri.Interpreter.TypedRetag",
-      "olean_sha256": "ffa2e3d61bea00c5ba89365907859fb3b6dc277d79ade23de6a25075f568e2f6",
+      "olean_sha256": "b22d25970ad58e491e4ec8109b3e1f05c76496a783a69197926415c8fb6eb555",
       "path": "Miri/Interpreter/TypedRetag.lean"
     },
     {
       "module": "Miri.Interpreter.Place",
-      "olean_sha256": "afa416bc2e1c9ac84d4055ec956f3139fae98292b980274f82c50873f888e3ca",
+      "olean_sha256": "4b1e1b2d672c78297e15555418b7d4e4c8d15d66a852da97dcfb68481d88358e",
       "path": "Miri/Interpreter/Place.lean"
     },
     {
@@ -351,12 +351,12 @@
     },
     {
       "module": "Miri.Interpreter.PlaceDynamic",
-      "olean_sha256": "8928f8dfb1cfa8b88bea1149d8ebb655e24bcf2e00b67c717dc41e826851d72d",
+      "olean_sha256": "137b2c99c139b0e13d6e5bf18d0f61f54347eb88183aed20215237f99c793c0e",
       "path": "Miri/Interpreter/PlaceDynamic.lean"
     },
     {
       "module": "Miri.Interpreter.PlaceMachine",
-      "olean_sha256": "b34ce423f32368e03d3f13123cd986970494d7b0b16fe5c275f1d7216cc03bd1",
+      "olean_sha256": "35667e4969053e0b76458b0cdf20714596d5eff1453d7cc241f2b2167ee40106",
       "path": "Miri/Interpreter/PlaceMachine.lean"
     },
     {
@@ -431,12 +431,12 @@
     },
     {
       "module": "Miri.Interpreter.TypedMachineBindings",
-      "olean_sha256": "a89dd3e6de26aaa8694e33ee90642beecc20abbfbbbb548cccc31dd6be8cd959",
+      "olean_sha256": "996b22fd80b2016ec338b1435b8ff651bdd1b388d8a049f28ed9ec144042d821",
       "path": "Miri/Interpreter/TypedMachineBindings.lean"
     },
     {
       "module": "Miri.Interpreter.Unwind",
-      "olean_sha256": "271e7787ae0c0917140a28f143dad8026f33b21e34e92c22bf771ccf492c61ce",
+      "olean_sha256": "5d92f98f9c0323f5e1a8e8195e44ebda1e15cba904f4958a6f7e869ed7159911",
       "path": "Miri/Interpreter/Unwind.lean"
     },
     {
@@ -461,7 +461,7 @@
     },
     {
       "module": "Miri.Interpreter.PointerMachine",
-      "olean_sha256": "4745a1d5b3b27017f3f27c965a75f00b8b157fd263e6835fc28455d5cbbcdd8f",
+      "olean_sha256": "4bfc03f5d1fddd928cfbd8265c863930c1cb2d7dee4a7100d880db1ca7e7aafa",
       "path": "Miri/Interpreter/PointerMachine.lean"
     },
     {
@@ -481,12 +481,12 @@
     },
     {
       "module": "Miri.Interpreter.Cast",
-      "olean_sha256": "43ec08ace78c2572ef21e8ffa090d88a2ae84dbdaf50e5a15875f2af986b587f",
+      "olean_sha256": "90c9b7bd94bcc622fe1a6db11f63aca37f0dc6d694ef5a90fe2f1cc6d43efd3b",
       "path": "Miri/Interpreter/Cast.lean"
     },
     {
       "module": "Miri.Interpreter.FunctionPointers",
-      "olean_sha256": "0f328d14a87036e17f8b087a512135818f58361a2c3fbbc112f345abcaaad342",
+      "olean_sha256": "78f54c3db31d2be09fbeabee4b30658d26eb12567c2389914086687211ef40c3",
       "path": "Miri/Interpreter/FunctionPointers.lean"
     },
     {
@@ -531,17 +531,17 @@
     },
     {
       "module": "Miri.Interpreter.MemoryExtras",
-      "olean_sha256": "764e912f4fada23070b79ba2b3d26332f7df2896ae5f769b305f2c260c743e4f",
+      "olean_sha256": "0dfc8e858817bf2e27a637eebba63c479d3581fc7a57e2c4017891d9aee473e3",
       "path": "Miri/Interpreter/MemoryExtras.lean"
     },
     {
       "module": "Miri.Interpreter.ValidityMemory",
-      "olean_sha256": "ff566b80fa05bf3fb985241bfdd9f6d04138f8f80f94e3a0644021e394adce25",
+      "olean_sha256": "0e642935bb2d4ddbd06bc8d3cda223fa7075eedbd7393ff422f54ba746a53e44",
       "path": "Miri/Interpreter/ValidityMemory.lean"
     },
     {
       "module": "Miri.Interpreter.ValidityMachine",
-      "olean_sha256": "70ba0bae88a15dc6c8288984428d39eb91caa933f85f9a4061bf34b72685808c",
+      "olean_sha256": "b2f0639b3377ba805fa9f732f4d9ee9e146dffe882b361eec1083aa56e65b252",
       "path": "Miri/Interpreter/ValidityMachine.lean"
     },
     {
@@ -561,7 +561,7 @@
     },
     {
       "module": "Miri.Interpreter.IntrinsicSimd",
-      "olean_sha256": "55d898cd1176d2e80bf4721d6cf05cd81a74846e0a67e3d191aca0b89bd4e5e0",
+      "olean_sha256": "9a6ba9b81c89f22229a8304d9e500204e0c53ec3ebd2764d6ad59ab9e8c41c82",
       "path": "Miri/Interpreter/IntrinsicSimd.lean"
     },
     {
@@ -591,52 +591,52 @@
     },
     {
       "module": "Miri.Interpreter.PointerMachineBindings",
-      "olean_sha256": "3b96f872719aad24684a0b24641811f91a73ae2e19038435ea0bceb9ea300a21",
+      "olean_sha256": "cc910e2b4ea02f79e03421fdf7c0c520a1e6125ed8642a5e39913807188f700d",
       "path": "Miri/Interpreter/PointerMachineBindings.lean"
     },
     {
       "module": "Miri.Interpreter.AtomicMachine",
-      "olean_sha256": "80805652d21b63faa6deb8d26cc92fbebcacf193af959acbb0901d4bb651986b",
+      "olean_sha256": "8e8f2cd4cdda0a09a1eb0fc5c0d894168ce2b3e13fdadf4845c902ab6c4c61e0",
       "path": "Miri/Interpreter/AtomicMachine.lean"
     },
     {
       "module": "Miri.Interpreter.AllocationMachine",
-      "olean_sha256": "3642760dda66b48811e1c04db3944f1becc04334ffb19837a45b68b11365685f",
+      "olean_sha256": "70aaacbebbabda212c97b38d9e6e0581300ef82c634074070a815d4f9cebee57",
       "path": "Miri/Interpreter/AllocationMachine.lean"
     },
     {
       "module": "Miri.Interpreter.MemoryCopyMachine",
-      "olean_sha256": "caba847365c8cb7631a5911fa987fde4526291542d4383c798130fc7bb1cd529",
+      "olean_sha256": "41bec785b8880c56a438b2286e5db10864a8c4cd4f801f30b52fa59fd8e1d9fe",
       "path": "Miri/Interpreter/MemoryCopyMachine.lean"
     },
     {
       "module": "Miri.Interpreter.GlobalMemoryCopyMachine",
-      "olean_sha256": "171619b0104488d50b0a730a448d136d0b50d6cd6929d7177d5d24c3e1a76ae2",
+      "olean_sha256": "b2def811fe499c18094d235ab15e151b3101af40637c5caea258cfdb7eadda45",
       "path": "Miri/Interpreter/GlobalMemoryCopyMachine.lean"
     },
     {
       "module": "Miri.Interpreter.RawMemoryMachine",
-      "olean_sha256": "4249806d132deafa863bc1a505510e5d91286c545aaeee0c403a3ed269383ccc",
+      "olean_sha256": "42d5782bc9cca7d3bc86e136f0e25c23614070b3cf4695a760335c6f45388c5f",
       "path": "Miri/Interpreter/RawMemoryMachine.lean"
     },
     {
       "module": "Miri.Interpreter.IntrinsicMachine",
-      "olean_sha256": "264b2880977b4a084359ca8a24134aa2cedcc7fd26d36d2e11e54eece1873a4e",
+      "olean_sha256": "59b9a9e34ca58d811acd367846d46e375b0cc7cf7c92dcb3c2fcfb7653709da5",
       "path": "Miri/Interpreter/IntrinsicMachine.lean"
     },
     {
       "module": "Miri.Interpreter.PointerPlaceMachine",
-      "olean_sha256": "09fc5bbb34bbdb373bcd63b8155189b4631921aa0f93a0e736983144be0f2445",
+      "olean_sha256": "197dab8e388db4768485d0b7efd538d1c1b8c1a955e3aef091e80c8d58f5ed1e",
       "path": "Miri/Interpreter/PointerPlaceMachine.lean"
     },
     {
       "module": "Miri.Interpreter.FunctionCalls",
-      "olean_sha256": "ee1332d5ec38cfdf601f5279b0f12c2ea0d2534f287b36d3d4ec0f388c73dce0",
+      "olean_sha256": "63871b3ffdb0fc26ba26f2f703743af0546784fdf01203e256407ea5ee795ed3",
       "path": "Miri/Interpreter/FunctionCalls.lean"
     },
     {
       "module": "Miri.Interpreter.VirtualCalls",
-      "olean_sha256": "ab3f841dfee4e0070ea152f175565e4302e885912ad1452d376e2aae3bb8f672",
+      "olean_sha256": "52c07d5c2a80aadc393def27b52c3b9554fb15165ab6a0ad0049a5d01566e0ed",
       "path": "Miri/Interpreter/VirtualCalls.lean"
     },
     {
@@ -646,7 +646,7 @@
     },
     {
       "module": "Miri.Interpreter.IntrinsicBackend",
-      "olean_sha256": "f1fad014118e8c15632a6aad4c9f5d10e33ee4ddcb90f14b2034953f4a3a4648",
+      "olean_sha256": "13b44ea6c26a2c6449b4985c8d4ed1b6fbefeb9afb51b1d015d9e63691d9d419",
       "path": "Miri/Interpreter/IntrinsicBackend.lean"
     },
     {
@@ -686,42 +686,42 @@
     },
     {
       "module": "Miri.Interpreter.ThreadStacks",
-      "olean_sha256": "76085a5ba59af697796128c04761158192c5e1d2b289cc66841e18d8511d1c9c",
+      "olean_sha256": "337d2da59b109ff0014ed22910f7c389d1e29bccdc3f60836e3ef2e85cadbf59",
       "path": "Miri/Interpreter/ThreadStacks.lean"
     },
     {
       "module": "Miri.Interpreter.CallMachine",
-      "olean_sha256": "01d77d8d0f224a6a8719a4cd841a8adc1b42b34f219ddbd6d27ae15eb05fa30c",
+      "olean_sha256": "aac1752aa2027f598b94ee822321407ce8ea2a2f5a2a779b8b2853fd21732739",
       "path": "Miri/Interpreter/CallMachine.lean"
     },
     {
       "module": "Miri.Interpreter.OperandMachine",
-      "olean_sha256": "372e9e2e3d058b38f16c54c9ef46ed94b13de0416ab2acd75919b1ffc6fb8eab",
+      "olean_sha256": "1b62e1d6ac1033aa81625891634d4fc15ef4624eb1f8aef32406e5bd41cbf276",
       "path": "Miri/Interpreter/OperandMachine.lean"
     },
     {
       "module": "Miri.Interpreter.ExecutionCalls",
-      "olean_sha256": "14021d78586a216330b047a2aaf1bd96af56f9f718a8ce1c0c13053df19c8f10",
+      "olean_sha256": "dd1005ae0db540a6f7ac3fa69d2acf69cb4bce8949784ca1a15d6f1bc6ee9206",
       "path": "Miri/Interpreter/ExecutionCalls.lean"
     },
     {
       "module": "Miri.Interpreter.ExecutionControl",
-      "olean_sha256": "43d2efbbce5e693bdc7875141494545cc030aa874b7a3b661251c888bfe7300b",
+      "olean_sha256": "7f049518e6e50a4f11996a707883474a0677f7588b041592be764e570650b290",
       "path": "Miri/Interpreter/ExecutionControl.lean"
     },
     {
       "module": "Miri.Interpreter.FunctionPointerConsumers",
-      "olean_sha256": "cd37b3f8134a65a94500f33cf4752a35430dab03642b56754588623d8d907ab1",
+      "olean_sha256": "128eb095f4599ebd59959f4a09e67b2cb27b39ba5c123d5581871b43ecce2c1c",
       "path": "Miri/Interpreter/FunctionPointerConsumers.lean"
     },
     {
       "module": "Miri.Interpreter.ExecutionCast",
-      "olean_sha256": "ce0ef692aede9beb147337108ef88966dbeb0d7cc4fb80aa35c15aa76db89448",
+      "olean_sha256": "3183fc78026d49e8e6c5b60302ab1b9a9e20fbbb588ed993f72e78b17b796e12",
       "path": "Miri/Interpreter/ExecutionCast.lean"
     },
     {
       "module": "Miri.Interpreter.ExecutionScalar",
-      "olean_sha256": "c8c7d276574f6ecc32d06a299c263e7f8a9d996f7837019067b54a60cf9dddfe",
+      "olean_sha256": "f02c312f068582024f69da94c389d359a17ed0412bb31bde36a3d7e20b3fcfff",
       "path": "Miri/Interpreter/ExecutionScalar.lean"
     },
     {
@@ -791,17 +791,17 @@
     },
     {
       "module": "Miri.Interpreter.ProvenanceGC",
-      "olean_sha256": "6882d115033587fea24e1a6495ccb64cde856221aa2d780e09896df1900d6b5d",
+      "olean_sha256": "6b8081e68a1eb1f02c227cb1484f1b3a8e8b4f7b47a786d5b11619f229074717",
       "path": "Miri/Interpreter/ProvenanceGC.lean"
     },
     {
       "module": "Miri.Interpreter.TerminatorMachine",
-      "olean_sha256": "0a8dd0bee630251223b85fd73212e363481b8cf07fb7d4d968e8926b6fcfc23f",
+      "olean_sha256": "f05cd3951358baf428ba1908b4fd0f4e5b704c5e2274cb5f32abf72acfb4a838",
       "path": "Miri/Interpreter/TerminatorMachine.lean"
     },
     {
       "module": "Miri.Interpreter.ExecutionMachine",
-      "olean_sha256": "a2bb942365d581b69c65f00c6c805024164f21b32c73b2581c481b0d74f6f407",
+      "olean_sha256": "7250ae0c57650db21959d015f409ff5603b9bb01779544f63d75e49b5d46d1ba",
       "path": "Miri/Interpreter/ExecutionMachine.lean"
     }
   ],
@@ -809,7 +809,68 @@
     "upstream_lean_toolchain is the lean-toolchain file at the pinned commit; build_lean_toolchain is the Lean 4 toolchain Anneal uses to build and audit the vendored sources.",
     "upstream_git_objects are git object ids at the pinned commit (`git rev-parse <commit>:<path>` in a clone of the repository)."
   ],
-  "patched_files": [],
+  "patched_files": [
+    {
+      "patched_sha256": "b8dad43bc08f0ddd47e072bf0762e9bac4eb561c965d9a02fa15c6b89aaf39bd",
+      "path": "Miri/Interpreter/Call.lean",
+      "rationale": "Support opt-in deinitialization of moved call arguments (both immediate locals in evalFnCallArgumentAt and in-place arguments in passArgument, allocateVarargs, and direct call/intrinsic dispatch) when deinitMovedPlace is enabled.",
+      "upstream_sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287"
+    },
+    {
+      "patched_sha256": "70650097dd2256a7a6bab2a95c1f539389afcc81ee3c0f5532638323fd65e549",
+      "path": "Miri/Interpreter/Cast.lean",
+      "rationale": "Carry move deinitialization across Cast.cast by atomically taking pendingMoveDeinit at entry and deinitializing the complete source operand after cast/unsize evaluation.",
+      "upstream_sha256": "34d19a23f5128f4d00301bc3d9655e0b8a1e83c4877ae8adf188ddba57952661"
+    },
+    {
+      "patched_sha256": "bd062577d468fdba1f21e7bafab73677574c5defa6e22a75f1605b2184d8b6d2",
+      "path": "Miri/Interpreter/ExecutionCalls.lean",
+      "rationale": "Wire deinitMovedPlace and deinitInPlaceArgument into CallHooks in ExecutionCalls.make.",
+      "upstream_sha256": "0e401e0f72d5ac5dcb13ebb794e2e2affe742f25a8557fd68a4440dc15cf33d8"
+    },
+    {
+      "patched_sha256": "4c75cfe74524cac39365429e63033cb9f5e5f1535872d41967392d62e68892ea",
+      "path": "Miri/Interpreter/ExecutionCast.lean",
+      "rationale": "Wire takePendingMoveDeinit, restorePendingMoveDeinit, and deinitSource into CastHooks in ExecutionCast.hooks.",
+      "upstream_sha256": "037c6660d02ec418bc48a12f5465c322c8e9ddd666f7e8d2edbd2bdade54298b"
+    },
+    {
+      "patched_sha256": "a19a4ccbb0e6e722cd7c361a68fd390cff2d16acb15d721d4db1919f2662ed2a",
+      "path": "Miri/Interpreter/ExecutionMachine.lean",
+      "rationale": "Add opt-in Config.deinitMovedPlace flag, wire it into PlaceMachine/OperandMachine/PlaceHooks, and clear pendingMoveDeinit across step boundaries.",
+      "upstream_sha256": "e601f25d2c9c87014984ec580979cb8d8beb052b4c7c63507b1d98c7098a8796"
+    },
+    {
+      "patched_sha256": "3604445d2f726883f257de51234c5800cfce4e8a3054fbe6f0f38ecb19b7648d",
+      "path": "Miri/Interpreter/LocalAccess.lean",
+      "rationale": "Add opt-in LocalAccessHooks.deinitMovedPlace and forceLocalAllocation to deinitialize moved immediate locals and materialize or deinitialize projected immediate moves.",
+      "upstream_sha256": "051fe91f8ceee3bcb583332585dfdfe19187db5e4d8d9dc4cb9a552430d9d0eb"
+    },
+    {
+      "patched_sha256": "aad2b2340ee8b3457972a1db03b95a0abad1ac28ecf5fcd70d3eb5b4eb39a2f1",
+      "path": "Miri/Interpreter/MachineHooks.lean",
+      "rationale": "Add MachineState.pendingMoveDeinit flag to track deferred deinitialization of moved indirect operands.",
+      "upstream_sha256": "1df4df7ce4fbc696360b4a7ba0bf4bc921c6b91ed3793cb6c234eb826b8dad36"
+    },
+    {
+      "patched_sha256": "2886b799068636b2b0dcc98d6dff7bbe1d576994fd9f4de6dbc07d3fe8613de7",
+      "path": "Miri/Interpreter/OperandMachine.lean",
+      "rationale": "Deinitialize unprojected immediate locals on Operand.Move and set pendingMoveDeinit on indirect moves (materializing projected immediate locals via forceAllocation) when deinitMovedPlace is enabled.",
+      "upstream_sha256": "ee81c3890c4c8ac0e3e8812b7e5754855c80716c8d5d262157dec3866d00d9a5"
+    },
+    {
+      "patched_sha256": "9450f249d38eac5a260cf49c89816b4ab898dd92bde08f93cb30df5ead39b323",
+      "path": "Miri/Interpreter/Place.lean",
+      "rationale": "Add takePendingMoveDeinit to PlaceCopyHooks and deinitialize indirect moved source operands in copyRuntimePlaceNoValidate after reading/copying.",
+      "upstream_sha256": "75ed68eb91c983532dcf3184bf590e32993aef961c2f709051b7d1844bb0b9ab"
+    },
+    {
+      "patched_sha256": "54dd606270ce79fc38c9f6a0b9307f0024a2a7805059bfc7f815f0418ee23e49",
+      "path": "Miri/Interpreter/PlaceMachine.lean",
+      "rationale": "Add deinitMovedPlace to AccessConfig and deinitialize indirect moved operands in PlaceMachine.readImmediate after reading.",
+      "upstream_sha256": "573ff212da394ad9ec43f2f7010b1d6f3050dfcc218785168a66a0ebdc804e96"
+    }
+  ],
   "repository": "https://github.com/proofs-rs/lean-miri.git",
   "schema_version": 2,
   "upstream_git_objects": {
@@ -1947,6 +2008,7 @@
         "sha256": "7258085b6de8a1adc5473cc6c2c2726d324c424eebdb6f6a8eb5223a4022a122"
       },
       {
+        "patched_sha256": "b8dad43bc08f0ddd47e072bf0762e9bac4eb561c965d9a02fa15c6b89aaf39bd",
         "path": "Miri/Interpreter/Call.lean",
         "sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287"
       },
@@ -1959,6 +2021,7 @@
         "sha256": "b7970ac7f1acd544ff7cb8e0cba46f8de6d96b969ccb335fbd19036438bd462b"
       },
       {
+        "patched_sha256": "70650097dd2256a7a6bab2a95c1f539389afcc81ee3c0f5532638323fd65e549",
         "path": "Miri/Interpreter/Cast.lean",
         "sha256": "34d19a23f5128f4d00301bc3d9655e0b8a1e83c4877ae8adf188ddba57952661"
       },
@@ -2063,10 +2126,12 @@
         "sha256": "886426fb4dad6169f82f61d92ec8a2c838e1b449c8bb1d141bd9b198d5ff4d04"
       },
       {
+        "patched_sha256": "bd062577d468fdba1f21e7bafab73677574c5defa6e22a75f1605b2184d8b6d2",
         "path": "Miri/Interpreter/ExecutionCalls.lean",
         "sha256": "0e401e0f72d5ac5dcb13ebb794e2e2affe742f25a8557fd68a4440dc15cf33d8"
       },
       {
+        "patched_sha256": "4c75cfe74524cac39365429e63033cb9f5e5f1535872d41967392d62e68892ea",
         "path": "Miri/Interpreter/ExecutionCast.lean",
         "sha256": "037c6660d02ec418bc48a12f5465c322c8e9ddd666f7e8d2edbd2bdade54298b"
       },
@@ -2095,6 +2160,7 @@
         "sha256": "51743c1c743f649051aef0bbb1d364a3a4a20437a573c6787093296023a69fa0"
       },
       {
+        "patched_sha256": "a19a4ccbb0e6e722cd7c361a68fd390cff2d16acb15d721d4db1919f2662ed2a",
         "path": "Miri/Interpreter/ExecutionMachine.lean",
         "sha256": "e601f25d2c9c87014984ec580979cb8d8beb052b4c7c63507b1d98c7098a8796"
       },
@@ -2371,6 +2437,7 @@
         "sha256": "b8324c5eacba1a53076e85373aa5a1908cd22ec681993e8ba3ea7b06bdaf9245"
       },
       {
+        "patched_sha256": "3604445d2f726883f257de51234c5800cfce4e8a3054fbe6f0f38ecb19b7648d",
         "path": "Miri/Interpreter/LocalAccess.lean",
         "sha256": "051fe91f8ceee3bcb583332585dfdfe19187db5e4d8d9dc4cb9a552430d9d0eb"
       },
@@ -2399,6 +2466,7 @@
         "sha256": "7bc5ff2bb8ee689806a0d689351afa670ce532d00a6a45d36d7f825e205a385c"
       },
       {
+        "patched_sha256": "aad2b2340ee8b3457972a1db03b95a0abad1ac28ecf5fcd70d3eb5b4eb39a2f1",
         "path": "Miri/Interpreter/MachineHooks.lean",
         "sha256": "1df4df7ce4fbc696360b4a7ba0bf4bc921c6b91ed3793cb6c234eb826b8dad36"
       },
@@ -2535,6 +2603,7 @@
         "sha256": "649e2ac002e07d45fafa25444caae793760607f91e37fbcc3b1ea7949223084d"
       },
       {
+        "patched_sha256": "2886b799068636b2b0dcc98d6dff7bbe1d576994fd9f4de6dbc07d3fe8613de7",
         "path": "Miri/Interpreter/OperandMachine.lean",
         "sha256": "ee81c3890c4c8ac0e3e8812b7e5754855c80716c8d5d262157dec3866d00d9a5"
       },
@@ -2599,6 +2668,7 @@
         "sha256": "d0568583f7b05fdf4e70a0edd741f52db0b1c2078fdb49413f8a6f91dbc2fe28"
       },
       {
+        "patched_sha256": "9450f249d38eac5a260cf49c89816b4ab898dd92bde08f93cb30df5ead39b323",
         "path": "Miri/Interpreter/Place.lean",
         "sha256": "75ed68eb91c983532dcf3184bf590e32993aef961c2f709051b7d1844bb0b9ab"
       },
@@ -2607,6 +2677,7 @@
         "sha256": "6441735530610311027d4e9c3389f838765b991d4085927b293827d4b09720ca"
       },
       {
+        "patched_sha256": "54dd606270ce79fc38c9f6a0b9307f0024a2a7805059bfc7f815f0418ee23e49",
         "path": "Miri/Interpreter/PlaceMachine.lean",
         "sha256": "573ff212da394ad9ec43f2f7010b1d6f3050dfcc218785168a66a0ebdc804e96"
       },

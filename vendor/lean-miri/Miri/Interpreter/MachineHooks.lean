@@ -36,6 +36,83 @@ structure MachineState (K User : Type) where
   raceAllocations : Array (AllocId × Miri.Concurrency.VClockAlloc)
   allocationSpans : Array (AllocId × SpanRef × Option SpanRef)
   user : User
+  /-- Armed when `OperandMachine.evalOperand` evaluates `Operand.Move` on an
+  indirect (`MemPlace`) place in `deinitMovedPlace` mode, and atomically
+  consumed by the corresponding `PlaceMachine.readImmediate` or
+  `Place.copyRuntimePlaceNoValidate` for that operand (`Use`, `UnaryOp`,
+  `BinaryOp`, `Cast`, `SwitchInt`, `Assert`, `CopyNonOverlapping`).
+  `pendingMoveDeinits` queues `(mplace, isMove)` per indirect operand evaluation
+  so multi-operand paths (`CopyNonOverlapping`, indirect `FnPtr` callees)
+  preserve per-operand move-deinit intent across subsequent operand evaluations.
+  Call/TailCall arguments use `FnArg.InPlace` and `deinitInPlaceArgument`. -/
+  pendingMoveDeinit : Bool := false
+  pendingMoveDeinits : Array (MemPlace Provenance × Bool) := #[]
+
+/-- Record whether an indirect operand evaluation in `deinitMovedPlace` mode
+originated from `Operand.Move` (`isMove = true`) or `Operand.Copy` /
+`Operand.Constant` (`isMove = false`). -/
+def recordPendingMoveDeinit (m : MachineState K User)
+    (mplace : MemPlace Provenance) (isMove : Bool) : MachineState K User :=
+  { m with
+    pendingMoveDeinit := isMove
+    pendingMoveDeinits := m.pendingMoveDeinits.push (mplace, isMove) }
+
+/-- Move the most recently recorded indirect operand entry to the front of
+`pendingMoveDeinits`. Used for `CopyNonOverlapping`'s `count` operand, which is
+evaluated third (`src`, `dst`, `count`) in `Intrinsics.evalNondivergingWith`
+but read first (`count`, `src`, `dst`) in `Intrinsics.copyWith`, so that
+consumption order in `takePendingMoveDeinitFor` is strictly FIFO even when
+`count` and `src`/`dst` alias the same `MemPlace`. -/
+def prependLastPendingMoveDeinit (m : MachineState K User) :
+    MachineState K User :=
+  match m.pendingMoveDeinits.back? with
+  | none => m
+  | some last =>
+    { m with
+      pendingMoveDeinits := #[last] ++ m.pendingMoveDeinits.pop }
+
+/-- Consume the front queued `(mplace, isMove)` entry in strict FIFO consumption
+order when it matches `mplace?` (or fall back to the earliest matching entry or
+`m.pendingMoveDeinit`). Reading an `.immediate` operand (`mplace? = none`)
+clears `pendingMoveDeinit` without discarding queued entries for unread
+`.indirect` operands. -/
+def takePendingMoveDeinitFor (m : MachineState K User)
+    (mplace? : Option (MemPlace Provenance)) : MachineState K User × Bool :=
+  match mplace? with
+  | none =>
+    ({ m with pendingMoveDeinit := false }, false)
+  | some mplace =>
+    match m.pendingMoveDeinits[0]? with
+    | some (frontMplace, isMove) =>
+      if frontMplace == mplace then
+        ({ m with
+           pendingMoveDeinit := false
+           pendingMoveDeinits := m.pendingMoveDeinits.eraseIdxIfInBounds 0 },
+         isMove)
+      else
+        match m.pendingMoveDeinits.findIdx? (fun entry => entry.1 == mplace) with
+        | some idx =>
+          let isMove := (m.pendingMoveDeinits[idx]?.map Prod.snd).getD false
+          ({ m with
+             pendingMoveDeinit := false
+             pendingMoveDeinits := m.pendingMoveDeinits.eraseIdxIfInBounds idx },
+           isMove)
+        | none =>
+          ({ m with pendingMoveDeinit := false }, m.pendingMoveDeinit)
+    | none =>
+      ({ m with pendingMoveDeinit := false }, m.pendingMoveDeinit)
+
+/-- Consume the most recently evaluated operand's move-deinit flag for
+single-operand consumers (`copyRuntimePlaceNoValidate`, `Cast`, `PtrMetadata`). -/
+def takeLastPendingMoveDeinit (m : MachineState K User) :
+    MachineState K User × Bool :=
+  let isMove := match m.pendingMoveDeinits.back? with
+    | some (_, b) => b || m.pendingMoveDeinit
+    | none => m.pendingMoveDeinit
+  ({ m with
+     pendingMoveDeinit := false
+     pendingMoveDeinits := m.pendingMoveDeinits.pop },
+   isMove)
 
 abbrev State (K User : Type) := StepState Provenance LocalLayout FrameExtra (MachineState K User)
 abbrev M (K User A : Type) := EStateM StepError (State K User) A

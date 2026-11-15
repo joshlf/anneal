@@ -98,7 +98,7 @@ pub const LOCKED_MIRI_COMMIT: &str = "c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a";
 /// change to `UPSTREAM_PIN.json` requires a corresponding TCB diff inside
 /// `trusted/audit/`.
 pub const LOCKED_UPSTREAM_PIN_SHA256: &str =
-    "c7b58e6934125ff80ad7f11200056046e220d6d50b40148a4078645f94e30f2b";
+    "6b152a72bdda8ff156b688c12031acaa9bce0f7a11758b5d221d3e724f9af446";
 
 /// Pinned SHA-256 manifest digest of all `<prefix>/lib/lean/{Init,Std,Lean}*`
 /// `.olean`, `.olean.server`, and `.olean.private` artifacts in the pinned Lean
@@ -113,7 +113,18 @@ pub const LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256: &str =
 
 /// Closed allowlist of `vendor/lean-miri` files permitted to carry a
 /// consumer-side patch in `UPSTREAM_PIN.json`.
-pub const LOCKED_PATCHED_MIRI_FILES: &[&str] = &[];
+pub const LOCKED_PATCHED_MIRI_FILES: &[&str] = &[
+    "Miri/Interpreter/Call.lean",
+    "Miri/Interpreter/Cast.lean",
+    "Miri/Interpreter/ExecutionCalls.lean",
+    "Miri/Interpreter/ExecutionCast.lean",
+    "Miri/Interpreter/ExecutionMachine.lean",
+    "Miri/Interpreter/LocalAccess.lean",
+    "Miri/Interpreter/MachineHooks.lean",
+    "Miri/Interpreter/OperandMachine.lean",
+    "Miri/Interpreter/Place.lean",
+    "Miri/Interpreter/PlaceMachine.lean",
+];
 
 // ---------------------------------------------------------------------------
 // Domain types

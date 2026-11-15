@@ -1061,7 +1061,7 @@ fn verifies_upstream_pin_and_rejects_tampering() {
     let pin = anneal_audit::verify_upstream_pin(&checkout.join("vendor/lean-miri")).unwrap();
     assert_eq!(pin.schema_version, 2);
     assert_eq!(pin.vendor_tree.file_count, 608);
-    assert!(pin.patched_files.is_empty());
+    assert_eq!(pin.patched_files.len(), 10);
     assert_eq!(pin.execution_machine_closure.len(), 160);
 
     // 1. Deleting `vendor/` in a repository checkout fails `Checker::run()`
@@ -1166,16 +1166,21 @@ fn verifies_upstream_pin_and_rejects_tampering() {
         fs::remove_file(&link_path).unwrap();
     }
 
-    // 5. Unauthorized `patched_files` entry in `UPSTREAM_PIN.json` is rejected.
+    // 5. Unauthorized `patched_files` entry, mismatched `patched_sha256`
+    // between `patched_files` and `vendor_tree`, and missing `patched_sha256`
+    // annotation in `vendor_tree` are rejected.
     let pin_path = vendor_copy.join("UPSTREAM_PIN.json");
     let orig_pin_bytes = fs::read(&pin_path).unwrap();
     let mut pin_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
-    pin_json["patched_files"] = json!([{
-        "path": "Miri.lean",
-        "upstream_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-        "patched_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-        "rationale": "unauthorized patch"
-    }]);
+    pin_json["patched_files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "path": "Miri.lean",
+            "upstream_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "patched_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "rationale": "unauthorized patch"
+        }));
     fs::write(&pin_path, serde_json::to_vec(&pin_json).unwrap()).unwrap();
     let err_unauth_patch = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
     assert_eq!(err_unauth_patch.code, 1);
@@ -1184,6 +1189,42 @@ fn verifies_upstream_pin_and_rejects_tampering() {
             .message
             .contains("unauthorized patched file in UPSTREAM_PIN.json: Miri.lean"),
         "unexpected error: {err_unauth_patch}"
+    );
+
+    let mut pin_mismatch_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+    pin_mismatch_json["patched_files"][0]["patched_sha256"] =
+        json!("2222222222222222222222222222222222222222222222222222222222222222");
+    fs::write(&pin_path, serde_json::to_vec(&pin_mismatch_json).unwrap()).unwrap();
+    let err_patch_mismatch = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_patch_mismatch.code, 1);
+    assert!(
+        err_patch_mismatch
+            .message
+            .contains("patched_sha256 mismatch between patched_files and vendor_tree"),
+        "unexpected error: {err_patch_mismatch}"
+    );
+
+    let mut pin_missing_annot_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+    for entry in pin_missing_annot_json["vendor_tree"]["files"]
+        .as_array_mut()
+        .unwrap()
+    {
+        if entry["path"].as_str() == Some("Miri/Interpreter/Call.lean") {
+            entry.as_object_mut().unwrap().remove("patched_sha256");
+        }
+    }
+    fs::write(
+        &pin_path,
+        serde_json::to_vec(&pin_missing_annot_json).unwrap(),
+    )
+    .unwrap();
+    let err_missing_annot = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_missing_annot.code, 1);
+    assert!(
+        err_missing_annot.message.contains(
+            "inconsistent patched_sha256 annotation in vendor_tree for Miri/Interpreter/Call.lean"
+        ),
+        "unexpected error: {err_missing_annot}"
     );
 
     // 6. Forbidden `Miri.Input.NativeMathHost` or empty

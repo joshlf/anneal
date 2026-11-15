@@ -69,6 +69,7 @@ structure Config (K User C Other Extern Host : Type) where
   pointeeLayout : C → TyId → M K User LocalLayout
   terminators : TerminatorMachine.Hooks K User Host
   preemptionChoice : C → M K User Bool
+  deinitMovedPlace : Bool := false
 
 private def lift (result : Except StepError A) : M K U A :=
   match result with | .ok value => pure value | .error error => throw error
@@ -90,14 +91,15 @@ def scalarHooks (h : Config K U C O X Host) : ScalarOpsHooks Provenance (State K
 /-- Close raw reads, dynamically sized physical copies, and validation with
 actual source implementations before constructing any expression dictionary. -/
 def withValidation [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) : Config K U C O X Host :=
+  let access := {h.access with deinitMovedPlace := h.deinitMovedPlace || h.access.deinitMovedPlace}
   let retag := h.retag
   let copy := {h.copy with
-    readRaw := fun _ => PlaceMachine.readRaw h.access
-    memoryCopy := GlobalMemoryCopyMachine.typedCopy h.access h.addresses h.arithmetic
+    readRaw := fun _ => PlaceMachine.readRaw access
+    memoryCopy := GlobalMemoryCopyMachine.typedCopy access h.addresses h.arithmetic
       h.projection.dynamic h.projection.dynamicFuel h.compiler.debugAssertions}
   let (compiler,copy) := TypedMachineBindings.bindValidation h.compiler copy h.validity retag
     limits.retag limits.validation h.validationRecursive
-  {h with compiler,copy,retag}
+  {h with access,compiler,copy,retag}
 
 private def operandBase (h : Config K U C O X Host) : OperandMachine.Hooks K U C where
   compiler := h.compiler
@@ -114,7 +116,15 @@ def projectionHooks [DecidableEq K] (h : Config K U C O X Host) :
     PlaceProjectionHooks Provenance (State K U) C FrameExtra :=
   -- The source-owned projection contains the live ghost-mode read/write
   -- scopes. Reconstructing a generic PlaceHooks here would erase them.
-  {h.projection with target := h.access.runtime.base}
+  {h.projection with
+    target := h.access.runtime.base
+    place := {h.projection.place with
+      takePendingMoveDeinit := do
+        let s ← get
+        let (machine', pendingFlag) := MachineHooks.takeLastPendingMoveDeinit s.machine
+        let d := (h.deinitMovedPlace || h.access.deinitMovedPlace) && pendingFlag
+        set { s with machine := machine' }
+        return d}}
 
 /-- Projection/place/operand dictionaries share actual frame-local clocks,
 canonical layouts and source typed dereference; no read forces allocation. -/
@@ -122,7 +132,8 @@ def operandHooks [DecidableEq K] (h : Config K U C O X Host) : OperandMachine.Ho
   {operandBase h with
     projection := projectionHooks h
     checkPlaceType := fun c place value => do
-      if h.compiler.debugAssertions then h.operands.checkPlaceType c place value}
+      if h.compiler.debugAssertions then h.operands.checkPlaceType c place value
+    deinitMovedPlace := h.deinitMovedPlace || h.access.deinitMovedPlace}
 
 private def mutableAccess [DecidableEq K] (h : Config K U C O X Host) (c : C) (dest : Value) : M K U Unit := do
   let .memory memory := dest.ref | throw (.invalidProgram "repeat mutable access requires memory")
@@ -139,6 +150,7 @@ private def mutableAccess [DecidableEq K] (h : Config K U C O X Host) (c : C) (d
 
 def discriminantHooks [DecidableEq K] (h : Config K U C O X Host) :
     DiscriminantHooks Provenance (State K U) C Value :=
+  let h := { h with access := { h.access with deinitMovedPlace := h.deinitMovedPlace || h.access.deinitMovedPlace } }
   let place := (projectionHooks h).place
   {
     discriminantLayout := h.discriminant.discriminantLayout
@@ -157,6 +169,7 @@ def discriminantHooks [DecidableEq K] (h : Config K U C O X Host) :
 
 def castHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
     CastHooks Provenance (State K U) C Value :=
+  let h := withValidation h limits
   ExecutionCast.hooks h.casts h.access h.allocation h.compiler (projectionHooks h) h.copy
     h.retag h.validity h.functions h.floats h.operands.dereference
     (OperandMachine.field (operandHooks h)) h.validationRecursive limits.retag limits.validation
@@ -228,7 +241,23 @@ def rvalueHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
     binaryOp := ScalarOps.binary (scalarHooks h)
     unaryOp := ScalarOps.unary (scalarHooks h)
     writeAggregate := writeAggregate aggregate
-    writeRepeat := writeRepeat aggregate
+    writeRepeat := fun c operand dest => do
+      let source ← aggregate.evalOperandAt c (OperandPath.rvalue "operand") operand none
+      if !source.layout.layout.isSized then throw (.invalidProgram "repeat source is unsized")
+      let dest ← aggregate.forceAllocation c dest
+      let length ← aggregate.length c dest
+      if length == 0 then
+        aggregate.getPlaceAllocMut c dest
+        if ← place.takePendingMoveDeinit then
+          if let .indirect mplace := source.op then
+            place.writeMemoryNoValidate c .uninit ⟨mplace, source.layout⟩
+      else
+        let first ← aggregate.projectIndex c dest 0
+        aggregate.copyOp c source first
+        let elemSize := (aggregate.placeLayout first).layout.size
+        let firstPtr ← lift (aggregate.placePointer first)
+        let restPtr ← lift (aggregate.wrappingOffset firstPtr elemSize)
+        aggregate.memCopyRepeatedly c firstPtr restPtr elemSize (length - 1) true
     cast := fun c op kind ty dest => Cast.cast casts c limits.casts op kind ty dest
     readDiscriminant := Discriminant.readDiscriminant discr
     discriminantForVariant := Discriminant.discriminantForVariant discr}
@@ -363,7 +392,10 @@ def stepHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
     terminator := ControlFlow.evalTerminator terminators }
 
 def step [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) (c : C) (state : State K U) :
-    StepResult (State K U) Bool := Step.step (stepHooks h limits) c state
+    StepResult (State K U) Bool :=
+  let (state', out) := Step.step (stepHooks h limits) c
+    { state with machine := { state.machine with pendingMoveDeinit := false, pendingMoveDeinits := #[] } }
+  ({ state' with machine := { state'.machine with pendingMoveDeinit := false, pendingMoveDeinits := #[] } }, out)
 
 /-- Quantify runner resources as well as source choices. A bounded successful
 run alone establishes no unrestricted UB-freedom claim. -/

@@ -17,6 +17,7 @@ structure Hooks (K User C : Type) where
   boolLayout : C → M K User LocalLayout
   constant : C → ConstOperand → Option LocalLayout → M K User (OpTy Provenance)
   constantAt : C → OperandPath → ConstOperand → Option LocalLayout → M K User (OpTy Provenance) := fun c _ => constant c
+  deinitMovedPlace : Bool := false
 
 private def lift (result : Except StepError A) : M K User A :=
   match result with | .ok value => pure value | .error error => throw error
@@ -89,28 +90,86 @@ def project (h : Hooks K User C) (c : C) (base : OpTy Provenance) (elem : Projec
     | _ => projection (Miri.Interpreter.project cx base elem)
 
 def evalPlaceToOp (h : Hooks K User C) (c : C) (place : Place) (known : Option LocalLayout) : M K User (OpTy Provenance) := do
+  if h.deinitMovedPlace then
+    modify fun s => { s with machine := { s.machine with pendingMoveDeinit := false } }
   let mut op ← localToOp h c place.localId (if place.projection.isEmpty then known else none)
   for elem in place.projection do op ← project h c op elem
   h.checkPlaceType c place op
   return op
 
-/-- Copy and Move share source behavior; no invented move invalidation. -/
+/-- Copy and Move share source behavior when `deinitMovedPlace = false`; when
+`deinitMovedPlace = true`, `Move` deinitializes the moved source place. -/
 def evalOperand (h : Hooks K User C) (c : C) (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) := do
   match operand with
-  | .Copy place | .Move place => evalPlaceToOp h c place known
-  | .Constant value => h.constant c value known
+  | .Copy place =>
+    let result ← evalPlaceToOp h c place known
+    if h.deinitMovedPlace then
+      match result.op with
+      | .indirect mplace =>
+        modify fun s => { s with machine := MachineHooks.recordPendingMoveDeinit s.machine mplace false }
+      | .immediate _ =>
+        modify fun s => { s with machine := { s.machine with pendingMoveDeinit := false } }
+    return result
+  | .Move place =>
+    if !h.deinitMovedPlace then
+      evalPlaceToOp h c place known
+    else
+      let result ← evalPlaceToOp h c place known
+      match result.op with
+      | .immediate _ =>
+        if place.projection.isEmpty then
+          let deinitVal : Operand Provenance :=
+            if result.layout.layout.isZst then result.op else .immediate .uninit
+          let frame ← MachineHooks.currentFrame
+          let updated ← stack (frame.replaceLocalValue place.localId (.live deinitVal))
+          MachineHooks.setCurrentFrame updated
+          modify fun s => { s with machine := { s.machine with pendingMoveDeinit := false } }
+          return result
+        else
+          let basePlace ← localToPlace h.projection.place c place.localId
+          let _ ← forceAllocation h.projection.place c basePlace
+          let result ← evalPlaceToOp h c place known
+          match result.op with
+          | .indirect mplace =>
+            modify fun s => { s with machine := MachineHooks.recordPendingMoveDeinit s.machine mplace true }
+          | .immediate _ =>
+            modify fun s => { s with machine := { s.machine with pendingMoveDeinit := true } }
+          return result
+      | .indirect mplace =>
+        modify fun s => { s with machine := MachineHooks.recordPendingMoveDeinit s.machine mplace true }
+        return result
+  | .Constant value =>
+    if h.deinitMovedPlace then
+      modify fun s => { s with machine := { s.machine with pendingMoveDeinit := false } }
+    let result ← h.constant c value known
+    if h.deinitMovedPlace then
+      if let .indirect mplace := result.op then
+        modify fun s => { s with machine := MachineHooks.recordPendingMoveDeinit s.machine mplace false }
+    return result
   | .RuntimeChecks checks =>
+    if h.deinitMovedPlace then
+      modify fun s => { s with machine := { s.machine with pendingMoveDeinit := false } }
     let value ← h.runtimeChecks c checks
     let layout ← h.boolLayout c
     return ⟨.immediate (.scalar (.fromBool value)),layout⟩
 /-- The path is carried by the structural caller, not recovered from the operand. -/
 def evalOperandAt (h : Hooks K User C) (c : C) (path : OperandPath)
-    (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) :=
-  match operand with
+    (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) := do
+  let result ← match operand with
   | .Constant value =>
+    if h.deinitMovedPlace then
+      modify fun s => { s with machine := { s.machine with pendingMoveDeinit := false } }
     -- OperandPath identifies the field holding the MIR Operand. Exported
     -- ConstOperand query evidence is keyed at its nested `constant` payload,
     -- so carry the final constructor edge rather than querying the wrapper.
-    h.constantAt c (path.push (.field "constant")) value known
+    let result ← h.constantAt c (path.push (.field "constant")) value known
+    if h.deinitMovedPlace then
+      if let .indirect mplace := result.op then
+        modify fun s => { s with machine := MachineHooks.recordPendingMoveDeinit s.machine mplace false }
+    pure result
   | _ => evalOperand h c operand known
+  if h.deinitMovedPlace && path == OperandPath.instruction "count" then
+    if let .indirect _ := result.op then
+      modify fun s => { s with machine := MachineHooks.prependLastPendingMoveDeinit s.machine }
+  return result
 end Miri.Interpreter.OperandMachine
