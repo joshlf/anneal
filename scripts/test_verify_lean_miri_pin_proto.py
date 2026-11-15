@@ -907,6 +907,7 @@ class ToolchainTests(TempCase):
             ("other toolchain", dict(pin, toolchain="leanprover/lean4:v4.0.0"), "toolchain pin is for 'leanprover/lean4:v4.0.0'"),
             ("unknown key", dict(pin, extra=True), "unknown key 'extra'"),
             ("bad digest", dict(pin, files=dict(pin["files"], **{"bin/lean": "xyz"})), "toolchain pin entry 'bin/lean': invalid path or SHA-256"),
+            ("missing required file", dict(pin, files={k: v for k, v in pin["files"].items() if k != "lib/lean/libleanshared.so"}), "missing required entry 'lib/lean/libleanshared.so'"),
             ("version drift", dict(pin, versions=dict(pin["versions"], **{"bin/lake": "Lake version 0"})), "bin/lake --version"),
         ]
         for label, doc, needle in cases:
@@ -969,6 +970,23 @@ class ToolchainTests(TempCase):
         os.chmod(self.tc / "bin" / "lean", 0o755)
         self.assertRejected(self.verify, "SHA-256 mismatch for bin/lean", "skipped `bin/lean --version`")
         self.assertFalse(canary.exists(), "tampered bin/lean was executed before pin digest verification!")
+
+    def test_runpath_shadowing_in_parent_lib_dir_rejected_and_not_executed(self) -> None:
+        canary = self.tmp / "runpath-shadow-executed"
+        (self.tc / "bin" / "lean").write_text(f"#!/bin/sh\necho pwned > {str(canary)!r}\necho 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n")
+        os.chmod(self.tc / "bin" / "lean", 0o755)
+        V.write_toolchain_pin(V.verify_toolchain(self.ws.root, toolchain_dir=self.tc), self.pin)
+        if canary.exists():
+            canary.unlink()
+        shadow = self.tc / "lib" / "libleanshared_1.so"
+        shadow.write_bytes(b"shadow-trojan")
+        os.chmod(shadow, 0o644)
+        self.assertRejected(
+            self.verify,
+            "RUNPATH shadowing library in lib/ (shadows lib/lean/): lib/libleanshared_1.so",
+            "skipped `bin/lean --version`",
+        )
+        self.assertFalse(canary.exists(), "bin/lean was executed despite RUNPATH shadowing in lib/!")
 
 
 # ---------------------------------------------------------------------------

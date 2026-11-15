@@ -235,6 +235,7 @@ _MOVING_CHANNELS = frozenset({"stable", "beta", "nightly", "latest"})
 _REPOSITORY_RE = re.compile(r"\Ahttps://[A-Za-z0-9.\-]+/[A-Za-z0-9._\-/]+\Z")
 _SHARED_OBJECT_RE = re.compile(r"\.so(\.[0-9]+)*\Z")
 _LIBLEANSHARED_RE = re.compile(r"\Alibleanshared.*\.so(\.[0-9]+)*\Z")
+_SHADOW_LEAN_LIB_RE = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(\.[0-9]+)*\Z")
 
 #: Planted build-artifact detection inside `lean-miri/vendor/`.
 _ARTIFACT_SUFFIXES = (
@@ -1503,6 +1504,9 @@ def _load_toolchain_pin(path: Path, c: _Collector) -> Optional[Dict[str, Any]]:
         for rel, digest in files.items():
             if relpath_problem(rel) is not None or not _is_hex64(digest):
                 c.err("toolchain-pin", f"toolchain pin entry {rel!r}: invalid path or SHA-256")
+        for req in TOOLCHAIN_REQUIRED_FILES:
+            if req not in files:
+                c.err("toolchain-pin", f"toolchain pin 'files' is missing required entry {req!r}")
     versions = pin.get("versions")
     if versions is not None and (not isinstance(versions, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in versions.items())):
         c.err("toolchain-pin", "toolchain pin 'versions' must map strings to strings")
@@ -1543,6 +1547,14 @@ def _verify_toolchain_impl(
     integrity_errors_before = len(c.errors)
     for rel in ("bin", "lib", "lib/lean"):
         _check_toolchain_path(toolchain_dir, real_root, rel, want_dir=True, c=c)
+    parent_lib_dir = toolchain_dir / "lib"
+    try:
+        parent_lib_names = sorted(entry.name for entry in os.scandir(parent_lib_dir))
+    except OSError as exc:
+        c.fatal("toolchain", f"cannot list lib in the toolchain: {exc.strerror}")
+    for n in parent_lib_names:
+        if _SHADOW_LEAN_LIB_RE.match(n):
+            c.err("toolchain", f"RUNPATH shadowing library in lib/ (shadows lib/lean/): lib/{n}")
     candidates = ["bin/lean", "bin/lake"]
     lib_dir = toolchain_dir / "lib" / "lean"
     try:
