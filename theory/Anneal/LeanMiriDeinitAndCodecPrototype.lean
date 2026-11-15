@@ -2289,27 +2289,40 @@ def twoPhaseAssignUse (dm : Bool) (ptrBits : Nat) (st : PState) (op : SemOperand
   | .error e => .error e
   | .ok (o, ty, st₁) => refCopyRuntimePlaceNoValidate dm st₁ o ty d
 
+/-- Evaluate and consume operands left to right with `f`. -/
+def readOperandsWith (f : Nat → PState → SemOperand → Except Fault (Bytes × PState)) (pb : Nat) :
+    PState → List SemOperand → Except Fault (List Bytes × PState)
+  | st, [] => .ok ([], st)
+  | st, op :: ops =>
+    match f pb st op with
+    | .error e => .error e
+    | .ok (b, st₁) =>
+      match readOperandsWith f pb st₁ ops with
+      | .error e => .error e
+      | .ok (bs, st₂) => .ok (b :: bs, st₂)
+
 /-- How a machine evaluates and consumes operands. -/
 structure OperandStrategy : Type where
   readOperand : Nat → PState → SemOperand → Except Fault (Bytes × PState)
   assignUse : Nat → PState → SemOperand → DestPlace → Except Fault PState
+  /-- Call-argument evaluation (`Call.evalCalleeAndArgs` + `passArgument`), given the
+  call's destination place; by default every argument is evaluated *and
+  consumed* left to right through `readOperand` (the patched-`evalOperand`
+  route that `M_ref` models). -/
+  callArgs : Nat → PState → List SemOperand → SemPlace → Except Fault (List Bytes × PState) :=
+    fun pb st ops _ => readOperandsWith readOperand pb st ops
 
-def eagerStrategy : OperandStrategy := ⟨annealReadOperand, annealAssignUse⟩
+def eagerStrategy : OperandStrategy :=
+  { readOperand := annealReadOperand, assignUse := annealAssignUse }
 
-def twoPhaseStrategy (dm : Bool) : OperandStrategy := ⟨twoPhaseReadOperand dm, twoPhaseAssignUse dm⟩
+def twoPhaseStrategy (dm : Bool) : OperandStrategy :=
+  { readOperand := twoPhaseReadOperand dm, assignUse := twoPhaseAssignUse dm }
 
 /-! ### Statements and terminators (shared) -/
 
 def readOperands (S : OperandStrategy) (pb : Nat) :
-    PState → List SemOperand → Except Fault (List Bytes × PState)
-  | st, [] => .ok ([], st)
-  | st, op :: ops =>
-    match S.readOperand pb st op with
-    | .error e => .error e
-    | .ok (b, st₁) =>
-      match readOperands S pb st₁ ops with
-      | .error e => .error e
-      | .ok (bs, st₂) => .ok (b :: bs, st₂)
+    PState → List SemOperand → Except Fault (List Bytes × PState) :=
+  readOperandsWith S.readOperand pb
 
 def evalBinOpBytes (o : BinOp) (lb rb : Bytes) : Except Fault Bytes :=
   match decodeLittleEndianBytes lb, decodeLittleEndianBytes rb with
@@ -2533,7 +2546,7 @@ def execTerm (S : OperandStrategy) (pb : Nat) (st : PState) : SemTerm → StepOu
     match resolveDest pb st dest with
     | .error e => .fault e
     | .ok (d, _) =>
-      match readOperands S pb st args with
+      match S.callArgs pb st args dest with
       | .error e => .fault e
       | .ok (bs, st₁) =>
         match callee with
@@ -2686,10 +2699,11 @@ theorem twoPhaseAssignUse_true_eq (pb : Nat) (st : PState) (op : SemOperand) (d 
 `evalOperand` → `readImmediate` / `copyRuntimePlaceNoValidate` protocol is
 extensionally equal to `M_anneal`'s eager move deinitialization. -/
 theorem twoPhaseStrategy_true_eq_eager : twoPhaseStrategy true = eagerStrategy := by
-  unfold twoPhaseStrategy eagerStrategy
-  congr 1
-  · funext pb st op; exact twoPhaseReadOperand_true_eq pb st op
-  · funext pb st op d; exact twoPhaseAssignUse_true_eq pb st op d
+  have hR : twoPhaseReadOperand true = annealReadOperand := by
+    funext pb st op; exact twoPhaseReadOperand_true_eq pb st op
+  have hA : twoPhaseAssignUse true = annealAssignUse := by
+    funext pb st op d; exact twoPhaseAssignUse_true_eq pb st op d
+  simp only [twoPhaseStrategy, eagerStrategy, hR, hA]
 
 /-- `deinitMovedPlace_false_id`: with `deinitMoves = false`, `Operand.move`
 is *identical* to `Operand.copy` at `evalOperand` and at both consumers
@@ -2738,7 +2752,7 @@ def eagerInEvalOperandAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand)
   | _ => twoPhaseAssignUse true ptrBits st op d
 
 def eagerInEvalOperandStrategy : OperandStrategy :=
-  ⟨eagerInEvalOperandReadOperand, eagerInEvalOperandAssignUse⟩
+  { readOperand := eagerInEvalOperandReadOperand, assignUse := eagerInEvalOperandAssignUse }
 
 /-! ### Falsification variant: batched call-argument evaluation (`kani#5172`)
 
@@ -4025,36 +4039,154 @@ theorem batched_call_args_lose_move_deinit :
       some true := by
   decide
 
-/-- Models the unpatched `Miri.Interpreter.Call.evalFnCallArgumentAt`
-(`lean-miri/vendor/Miri/Interpreter/Call.lean:164-175`) under the 6-file
-`d9b41b58b` patch: `.Copy` and `.Constant` route through `evalOperandAt`
-(`twoPhaseReadOperand true`), whereas `.Move p` calls `evalPlace` + `placeToOp`
-(`evalPlaceToOp`) directly without calling `OperandMachine.evalOperand`, so
-neither immediate locals are deinitialized nor `pendingMoveDeinit := true` is
-set before `passArgument`'s `copyAllowTransmute`. -/
-def unpatchedCallEvalFnCallArgReadOperand (ptrBits : Nat) (st : PState) (op : SemOperand) :
-    Except Fault (Bytes × PState) :=
-  match op with
+/-! ### Upstream LeanMiri call-argument path (`Miri/Interpreter/Call.lean`)
+
+A faithful model of `Call.evalCalleeAndArgs` + `Call.passArgument` under the
+6-file `d9b41b58b` patch (which does not touch `Call.lean`):
+
+* `evalFnCallArgumentAt` (`Call.lean:164-175`) sends `.Copy` / `.Constant`
+  through the patched `evalOperandAt`, which yields a *lazy* `OpTy`
+  (`FnArg.Copy`). It sends `.Move place` through `evalPlace` + `placeToOp`
+  without calling `evalOperand`. If the move places and the destination are
+  `moveDefinitelyDisjoint`, an indirect place becomes `FnArg.InPlace` and an
+  immediate becomes `FnArg.Copy`, with **no deinit**. Otherwise the place is
+  force-allocated and passed `InPlace`.
+* `evalCallTerminator` evaluates the destination place first, then *all*
+  arguments, then (`initFnCall`) runs `passArgument` per argument. The copy is
+  `copyAllowTransmute` (the lazy read). It is followed, for `InPlace`
+  arguments, by `protectArgument` =
+  `TypedRetag.protectInPlaceFunctionArgument`, which ends in
+  `writeUninit place` (Miri `machine.rs`
+  `protect_in_place_function_argument`). The protector retag is not modeled;
+  the uninit write is modeled as the same Tree-Borrows-silent deinit. -/
+
+/-- `Miri.Interpreter.Call.FnArg`. -/
+inductive FnArgM : Type where
+  | copyOp (o : OpTy) (ty : SemTy)
+  | inPlace (mp : MPlace) (ty : SemTy)
+
+def localsDistinct : List Local → Bool
+  | [] => true
+  | l :: ls => !(ls.contains l) && localsDistinct ls
+
+/-- `Call.moveDefinitelyDisjoint`: move-argument places and the destination
+have pairwise distinct locals and no leading `Deref`. -/
+def moveDefinitelyDisjoint (args : List SemOperand) (dest : SemPlace) : Bool :=
+  let places := args.filterMap (fun a => match a with | .move p => some p | _ => none) ++ [dest]
+  places.all (fun p => match p.projs with | .deref :: _ => false | _ => true) &&
+    localsDistinct (places.map SemPlace.local_)
+
+/-- `Call.evalFnCallArgumentAt` (patched `evalOperandAt` for non-moves). -/
+def leanMiriEvalFnCallArg (pb : Nat) (disjoint : Bool) (st : PState) :
+    SemOperand → Except Fault (FnArgM × PState)
   | .move p =>
-    match evalPlaceToOp ptrBits st p with
+    match disjoint with
+    | true =>
+      match evalPlaceToOp pb st p with
+      | .error e => .error e
+      | .ok (.indirect mp, ty) => .ok (.inPlace mp ty, st)
+      | .ok (.immediate b, ty) => .ok (.copyOp (.immediate b) ty, st)
+    | false =>
+      match placeToMPlace pb st p with
+      | .error e => .error e
+      | .ok (mp, st₁) =>
+        match evalPlaceToOp pb st₁ p with
+        | .error e => .error e
+        | .ok (_, ty) => .ok (.inPlace mp ty, st₁)
+  | op =>
+    match refEvalOperand true pb st op with
     | .error e => .error e
-    | .ok (o, ty) => refReadImmediate true st o ty
-  | _ => twoPhaseReadOperand true ptrBits st op
+    | .ok (o, ty, st₁) => .ok (.copyOp o ty, st₁)
 
-def unpatchedCallEvalFnCallArgStrategy : OperandStrategy :=
-  ⟨unpatchedCallEvalFnCallArgReadOperand, twoPhaseAssignUse true⟩
+def leanMiriEvalFnCallArgs (pb : Nat) (disjoint : Bool) :
+    PState → List SemOperand → Except Fault (List FnArgM × PState)
+  | st, [] => .ok ([], st)
+  | st, op :: ops =>
+    match leanMiriEvalFnCallArg pb disjoint st op with
+    | .error e => .error e
+    | .ok (fa, st₁) =>
+      match leanMiriEvalFnCallArgs pb disjoint st₁ ops with
+      | .error e => .error e
+      | .ok (fas, st₂) => .ok (fa :: fas, st₂)
 
-/-- **7th-file soundness finding (`Miri/Interpreter/Call.lean:168-175`)**:
-because `Call.evalFnCallArgumentAt` bypasses `OperandMachine.evalOperand` on
-`.Move place`, applying only the 6-file `d9b41b58b` patch leaves moved call
-arguments initialized in the caller frame (`d7Prog (.move (loc 1))` falsely
-returns `5` instead of faulting with `.ub .invalidUninitBytes`). -/
-theorem call_evalFnCallArgumentAt_bypasses_evalOperand_falsified :
+/-- `Call.passArgument` for every argument, in order: the (lazy) copy, then the
+in-place protection's `writeUninit`. -/
+def leanMiriPassArgs : PState → List FnArgM → Except Fault (List Bytes × PState)
+  | st, [] => .ok ([], st)
+  | st, .copyOp o ty :: rest =>
+    match refReadImmediate true st o ty with
+    | .error e => .error e
+    | .ok (b, st₁) =>
+      match leanMiriPassArgs st₁ rest with
+      | .error e => .error e
+      | .ok (bs, st₂) => .ok (b :: bs, st₂)
+  | st, .inPlace mp ty :: rest =>
+    match loadMPlace st mp with
+    | .error e => .error e
+    | .ok (b, st₁) =>
+      match checkValid ty b with
+      | .error e => .error e
+      | .ok () =>
+        match deinitMPlaceRaw st₁ mp with
+        | .error e => .error e
+        | .ok st₂ =>
+          match leanMiriPassArgs st₂ rest with
+          | .error e => .error e
+          | .ok (bs, st₃) => .ok (b :: bs, st₃)
+
+def leanMiriCallArgsUpstream (pb : Nat) (st : PState) (args : List SemOperand) (dest : SemPlace) :
+    Except Fault (List Bytes × PState) :=
+  match leanMiriEvalFnCallArgs pb (moveDefinitelyDisjoint args dest) st args with
+  | .error e => .error e
+  | .ok (fas, st₁) => leanMiriPassArgs st₁ fas
+
+/-- `M_ref` with the *unpatched* `Call.lean` argument path (everything else as
+patched by `d9b41b58b`). -/
+def leanMiriUpstreamCallStrategy : OperandStrategy :=
+  { readOperand := twoPhaseReadOperand true, assignUse := twoPhaseAssignUse true,
+    callArgs := leanMiriCallArgsUpstream }
+
+def tFnCalleeImm : Ty := ⟨.fnDef "calleeImm" [], 9⟩
+
+/-- `_1 = 5; _2 = calleeImm(move _1); _0 = copy _1` with `_1` an immediate
+(never borrowed) local. -/
+def d7ImmProg : V2026Prog := ⟨[mkBody "caller" 0 [tU8, tU8, tU8]
+  [blk [asg (loc 1) (.use (cU8 5))]
+     (.call (.constant ⟨tFnCalleeImm, .zeroSized⟩) [.move (loc 1)] (loc 2) (some 1) .continue_),
+   blk [asg (loc 0) (.use (.copy (loc 1)))] .return_],
+  mkBody "calleeImm" 1 [tU8, tU8] [blk [asg (loc 0) (.use (.copy (loc 1)))] .return_]], 0⟩
+
+/-- **The 7th-file requirement, stated precisely (corrects B2).**
+(1) On `D7` (the moved argument `_1` is memory-backed because `_2 = &raw mut
+_1`), the unpatched `Call.lean` path *agrees* with `M_anneal`: the `InPlace`
+argument is deinitialized by `protectInPlaceFunctionArgument` before the callee
+runs, so the callee's raw-pointer read is UB. B2's
+`call_evalFnCallArgumentAt_bypasses_evalOperand_falsified` claimed "returns 5"
+only because its model omitted `passArgument`'s in-place protection, and it
+also applied the bypass to every move operand, not only call arguments.
+(2) The genuine divergence is the `.immediate → FnArg.Copy` branch. A moved
+*immediate* argument is never deinitialized, so a later use-after-move in the
+caller returns `5` upstream, where `M_anneal` and `M_ref` fault. Track A must
+patch `Call.evalFnCallArgumentAt` (a 7th file) to route `.Move` immediates
+through the patched `evalOperand`, or deinitialize them. -/
+theorem call_move_arg_upstream_call_path :
     annealObs (d7Prog (.move (loc 1))) [] 40 = .ub .invalidUninitBytes ∧
-    refObs true (encodeProg (d7Prog (.move (loc 1)))) [] 40 = .ub .invalidUninitBytes ∧
-    refObsWith unpatchedCallEvalFnCallArgStrategy (encodeProg (d7Prog (.move (loc 1)))) [] 40 =
-      .returned (some 5) 1 := by
+    refObsWith leanMiriUpstreamCallStrategy (encodeProg (d7Prog (.move (loc 1)))) [] 40 =
+      .ub .invalidUninitBytes ∧
+    annealObs d7ImmProg [] 40 = .ub .invalidUninitBytes ∧
+    refObs true (encodeProg d7ImmProg) [] 40 = .ub .invalidUninitBytes ∧
+    refObsWith leanMiriUpstreamCallStrategy (encodeProg d7ImmProg) [] 40 = .returned (some 5) 1 := by
   decide
+
+/-- Hence the unpatched call path is not the reference strategy. -/
+theorem leanMiriUpstreamCallStrategy_ne_eager : leanMiriUpstreamCallStrategy ≠ eagerStrategy := by
+  intro h
+  have h1 := call_move_arg_upstream_call_path.2.2.2.2
+  rw [h] at h1
+  have e : refObsWith eagerStrategy (encodeProg d7ImmProg) [] 40 =
+      refObs true (encodeProg d7ImmProg) [] 40 := by decide
+  rw [e, call_move_arg_upstream_call_path.2.2.2.1] at h1
+  cases h1
 
 /-! ## Part 9 — Tree Borrows: moving out of `*ptr` is not a write -/
 
@@ -5179,9 +5311,13 @@ theorem twoPhaseAssignUse_true_latch_clear (pb : Nat) (st st' : PState)
 #guard_msgs (whitespace := lax) in
 #print axioms canary_D7_call_bad_dest_ub_before_unsupported
 
-/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.call_evalFnCallArgumentAt_bypasses_evalOperand_falsified' depends on axioms: [propext] -/
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.call_move_arg_upstream_call_path' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
-#print axioms call_evalFnCallArgumentAt_bypasses_evalOperand_falsified
+#print axioms call_move_arg_upstream_call_path
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.leanMiriUpstreamCallStrategy_ne_eager' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms leanMiriUpstreamCallStrategy_ne_eager
 
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.twoPhaseReadOperand_true_latch_clear' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
