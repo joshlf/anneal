@@ -335,6 +335,15 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             suite._outer_timeout_sec(auto_file, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "240"}),
             240 + grace,
         )
+        # Explicit `--timeout 0` on the command line overrides `ANNEAL_LEAN_TIMEOUT_SEC`
+        # (falling back to the mode default 900s/180s), and `-- --` double separators strip cleanly.
+        explicit_zero = [lr, "--timeout", "0", "--", "lake", "build", "Anneal"]
+        self.assertEqual(
+            suite._outer_timeout_sec(explicit_zero, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "1500"}),
+            900 + 900 + grace,
+        )
+        double_sep = [lr, "--", "--", "lake", "env", "lean", "X.lean"]
+        self.assertEqual(suite._lean_run_wrapper_flags(double_sep), ("file", None, True))
         # A wrapped step never gets a shorter outer deadline than its own budget.
         for profile in ("quick", "nightly"):
             for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):
@@ -441,7 +450,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             f = Path(tmp) / "T.lean"
             f.write_text(
-                "/- header /- nested -/ comment -/\n"
+                "\ufeff/- header /- nested -/ comment -/\n"
                 "module\n"
                 "-- line comment import Fake.Module\n"
                 "public import Anneal.ByteCodec\n"

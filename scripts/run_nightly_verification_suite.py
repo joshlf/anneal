@@ -1096,12 +1096,12 @@ def _is_lean_run_wrapped(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "anneal-lean-run"
 
 
-def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
-    """`(mode, timeout_sec, slot_lock)` from the `anneal-lean-run` options preceding
-    `--` or the first positional command token (an `auto` mode resolves like the
-    wrapper: `lean` or `lake env lean` without `--run` is `file`)."""
+def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool]:
+    """`(mode, timeout_sec, slot_lock, saw_timeout_flag)` from the `anneal-lean-run`
+    options preceding `--` or the first positional command token."""
     mode = "auto"
     timeout: int | None = None
+    saw_timeout = False
     slot_lock = True
     i = 1
     n = len(cmd)
@@ -1109,6 +1109,8 @@ def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
         tok = cmd[i]
         if tok == "--":
             i += 1
+            if i < n and cmd[i] == "--":
+                i += 1
             break
         if not tok.startswith("-") or tok == "-":
             break
@@ -1127,6 +1129,7 @@ def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
         elif opt == "--mode" and val is not None:
             mode = val
         elif opt == "--timeout" and val is not None:
+            saw_timeout = True
             try:
                 timeout = int(val)
             except ValueError:
@@ -1143,6 +1146,14 @@ def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
         mode = "file" if is_lean_file and "--run" not in inner else "build"
     if timeout is not None and timeout <= 0:
         timeout = None
+    return mode, timeout, slot_lock, saw_timeout
+
+
+def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
+    """`(mode, timeout_sec, slot_lock)` from the `anneal-lean-run` options preceding
+    `--` or the first positional command token (an `auto` mode resolves like the
+    wrapper: `lean` or `lake env lean` without `--run` is `file`)."""
+    mode, timeout, slot_lock, _saw_timeout = _parse_lean_run_wrapper(cmd)
     return mode, timeout, slot_lock
 
 
@@ -1155,8 +1166,8 @@ def _outer_timeout_sec(
     wrapper's structured exit-124 diagnostic always wins the race."""
     if not _is_lean_run_wrapped(cmd):
         return timeout_sec
-    mode, inner_timeout, slot_lock = _lean_run_wrapper_flags(cmd)
-    if inner_timeout is None:
+    mode, inner_timeout, slot_lock, saw_timeout = _parse_lean_run_wrapper(cmd)
+    if inner_timeout is None and not saw_timeout:
         env_map = os.environ if env is None else env
         raw_env_timeout = env_map.get("ANNEAL_LEAN_TIMEOUT_SEC", "").strip()
         if raw_env_timeout:
@@ -1425,7 +1436,7 @@ def _lean_header_imports(path: Path, max_chars: int = 16384) -> list[str] | None
     file cannot be read."""
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
-            head = fh.read(max_chars)
+            head = fh.read(max_chars).lstrip("\ufeff")
     except OSError:
         return None
     tokens = _LEAN_HEADER_TOKEN_RE.findall(_strip_lean_comments(head))

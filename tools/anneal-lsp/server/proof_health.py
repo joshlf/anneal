@@ -662,7 +662,7 @@ def _is_symbol_end(stripped: str, end: int) -> bool:
     return not _is_ident_char(ch)
 
 
-def _has_mir_body_ident(stripped: str, first_body: int = -1) -> bool:
+def _has_mir_body_ident(stripped: str, first_body: int = -1, first_mir: int = -1) -> bool:
     """Exactly `_MIR_BODY_RE.search(stripped) is not None`, without a full regex scan.
 
     A match never spans a newline (no identifier part does) and always contains a
@@ -671,7 +671,7 @@ def _has_mir_body_ident(stripped: str, first_body: int = -1) -> bool:
     Every rule-2 finding (simp entry or `unfold`/`delta` target) is a `_MIR_BODY_RE`
     match at the same offset of `stripped`, so `False` soundly skips rule 2.
     """
-    p_mir = stripped.find("Mir.", 0)
+    p_mir = first_mir if first_mir >= 0 else stripped.find("Mir.", 0)
     if p_mir == -1:
         return False
     n = len(stripped)
@@ -711,11 +711,13 @@ def _active_simp_keywords(
         p = stripped.find("Sequence.length", simp_start)
         if p != -1:
             kw_offsets["Sequence.length"] = p
-    p_body = stripped.find(".body", 0)
     has_mir_body = False
-    if p_body != -1 and stripped.find("Mir.", 0) != -1:
-        kw_offsets[".body"] = p_body
-        has_mir_body = _has_mir_body_ident(stripped, first_body=p_body)
+    p_mir = stripped.find("Mir.", 0)
+    if p_mir != -1:
+        p_body = stripped.find(".body", 0)
+        if p_body != -1:
+            kw_offsets[".body"] = p_body
+            has_mir_body = _has_mir_body_ident(stripped, first_body=p_body, first_mir=p_mir)
     has_bitwise = False
     p_bw = stripped.find("bitwise", 0)
     if p_bw != -1:
