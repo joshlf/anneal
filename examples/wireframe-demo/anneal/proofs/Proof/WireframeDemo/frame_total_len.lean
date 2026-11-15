@@ -33,11 +33,7 @@ private theorem ensures_holds (b1 b2 : Nat) (hb1 : b1 ≤ 16) (hb2 : b2 ≤ 1024
   have h_wrap : wrapScalarBits (Nat.add b1 b2) 65536 = Nat.add b1 b2 :=
     wrapScalarBits_eq_of_lt h_sum
   apply Hold.val
-  refine hold_mirBool_of_blockLinear _ _ rfl rfl ?_
-  -- `dsimp` steps the companion's CFG (without unfolding untaken `wpExecFallback`
-  -- branches); each closure-capture deref read (`evalOperandFallback`) is evaluated
-  -- in place by `whnf`, and the overflow / equality branches on `b1 + b2` are
-  -- rewritten with `h_ov`, `h_wrap` and `Nat.beq_refl`.
+  refine hold_mirBool_of_blockLinear_constructive _ _ rfl rfl ?_
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_ensures_frame_total_len.layouts,
@@ -65,10 +61,10 @@ private theorem ensures_holds (b1 b2 : Nat) (hb1 : b1 ≤ 16) (hb2 : b2 ≤ 1024
         List.length, List.set, Option.getD, get?, set?, length, Nat.add, Nat.mul, Nat.ble,
         Nat.beq, Bool.and, Bool.or, Bool.not, ite, dite, Nat.decLt, Nat.decLe, Bool.decEq,
         instDecidableEqBool]
+    | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf
     | rw [h_ov]
     | rw [h_wrap]
-    | rw [Nat.beq_refl]
-    | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf)
+    | rw [Nat.beq_refl])
   exact ⟨boolTruePost_normal_one _⟩
 
 /-- `requires` inversion for `u16` arguments: the companion returns `true` only
@@ -137,14 +133,9 @@ theorem verified : Obligations.WireframeDemo.frame_total_len.polyClaim := by
   | nil =>
   simp only [Obligations.WireframeDemo.frame_total_len.claimFor, CapturedMir.instantiate_nil]
   refine verifyMirNoPanic_of_pureExec _ rfl fun args h_pre => ?_
-  obtain ⟨⟨-, h_req⟩, h_len, h_sig⟩ := h_pre
-  obtain ⟨v1, v2, rfl⟩ : ∃ v1 v2, args = [v1, v2] := by
-    rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
-    all_goals first | exact ⟨_, _, rfl⟩ | nomatch h_len
-  obtain ⟨h1, h2, -⟩ := h_sig
-  obtain ⟨b1, rfl, -⟩ := u16_of_valueMatchesTy rfl rfl rfl h1
-  obtain ⟨b2, rfl, -⟩ := u16_of_valueMatchesTy rfl rfl rfl h2
-  obtain ⟨hb1, hb2⟩ := wpReq_inversion b1 b2 h_req
+  obtain ⟨b1, b2, rfl, -, -⟩ :=
+    u16_pair_of_argsMatchSignature rfl rfl rfl rfl rfl rfl rfl rfl h_pre.2
+  obtain ⟨hb1, hb2⟩ := wpReq_inversion b1 b2 h_pre.1.2
   have h_sum : Nat.add b1 b2 < 65536 := by change b1 + b2 < 65536; omega
   -- bb0: `_3 = AddWithOverflow(_1, _2); assert(!_3.1) -> bb1`, evaluated in one
   -- single-pass `evalPureStmtsCheckedN` step.
@@ -166,7 +157,7 @@ theorem verified : Obligations.WireframeDemo.frame_total_len.polyClaim := by
       (.scalar ⟨wrapScalarBits (Nat.add b1 b2) 65536, 2⟩) _
   rw [wrapScalarBits_eq_of_lt h_sum]
   exact ⟨ensures_holds b1 b2 hb1 hb2,
-    u16_retMatchesSignature _ rfl rfl rfl h_sum⟩
+    u16_retMatchesSignature _ rfl rfl rfl rfl rfl rfl rfl h_sum⟩
 
 /-- Non-vacuity witness confirming `frame_total_len`'s `requires` contract is
 satisfiable (`header_len = 4`, `payload_len = 128`). -/
@@ -175,6 +166,6 @@ theorem nonVacuousRequires :
       Obligations.WireframeDemo.frame_total_len.rustRequires a := by
   refine ⟨[.scalar { bits := 4, sizeBytes := 2 }, .scalar { bits := 128, sizeBytes := 2 }],
     ⟨rfl, ?_⟩⟩
-  exact mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl
+  exact mirBoolPredicateHolds_of_evalMirSpecBool_true_constructive _ _ rfl rfl
 
 end Proof.WireframeDemo.frame_total_len

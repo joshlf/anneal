@@ -32,9 +32,6 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
       Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body
       [.scalar { bits := b, sizeBytes := 1 }] rfl rfl h_req.2
   revert h_hold
-  -- The companion reads `flags_byte` through its closure capture (`*(*_8).0`):
-  -- `dsimp` steps the CFG (without unfolding untaken `wpExecFallback` branches),
-  -- and each typed deref read (`evalOperandFallback`) is evaluated in place by `whnf`.
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
@@ -100,7 +97,7 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
   apply LiftStmtsTerminator.term_return_ready (by rfl) (by rfl) rfl (by rfl) (by rfl)
   rintro ⟨h_req, -⟩
   rcases rustRequires_imp_zero_or_one b h_req with rfl | rfl <;>
-    exact ⟨mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl,
+    exact ⟨mirBoolPredicateHolds_of_evalMirSpecBool_true_constructive _ _ rfl rfl,
       compressionFlagPost_bit _ (by decide)⟩
 
 /-- Non-vacuity witness confirming `parse_compression_flag`'s functional
@@ -109,6 +106,6 @@ theorem nonVacuousRequires :
     ∃ a : List Value,
       Obligations.WireframeDemo.parse_compression_flag.rustRequires a := by
   refine ⟨[.scalar { bits := 1, sizeBytes := 1 }], ⟨rfl, ?_⟩⟩
-  exact mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl
+  exact mirBoolPredicateHolds_of_evalMirSpecBool_true_constructive _ _ rfl rfl
 
 end Proof.WireframeDemo.parse_compression_flag

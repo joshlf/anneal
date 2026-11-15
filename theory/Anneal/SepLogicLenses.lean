@@ -21487,9 +21487,11 @@ theorem LiftLensBlock.goto_return {body : CapturedMir} {bbIdx retBb : BasicBlock
 
 section SignatureCombinators
 
+open Anneal.ITreeWP
 open Anneal.PureMirExec
 open Anneal.Scalars
 open Anneal.Rustc.V2026_06_01.Lower
+open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) sufficiency bridge from symbolic
 `wpMirSym` to `MirBoolPredicateHolds`, routing through `treeSafe_and_ret_of_mirWpConverges`
@@ -21508,15 +21510,378 @@ theorem mirBoolPredicateHolds_of_wpMirSym_true_constructive
   have h_bp : boolTruePost outPair.2 := h_ret outPair.1 outPair.2 h_r
   exact h_bp retVal mem' h_out
 
-/-- Standard 2-byte `u16` `TypeLayout` emitted by `cargo-anneal` for `u16` locals. -/
-def u16TypeLayout : TypeLayout :=
-  { size := { bytes := 2 }, align := { bytes := 2 },
-    backendRepr := .scalar (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 }),
-    fields := .primitive, variants := .single 0,
-    isUninhabited := false, fieldLayouts := [] }
+/-- Constructive (`⊆ {propext, Quot.sound}`) equivalence between `wpExecGen` and `wpCfgStep`
+(replacing `beq_self_eq_true` on `Nat` with `nat_beq_self_eq_true`). -/
+theorem wpCfgStep_eq_constructive
+    (zeroVal : Prop) (body : CapturedMir)
+    (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized) :
+    ∀ (fuel : Nat) (cur : Option (Nat × Nat × List Statement × Terminator))
+      (st : MirExecState),
+      (∀ bIdx sIdx stmts term,
+        cur = .some (bIdx, sIdx, stmts, term) →
+        ∃ bb pfx,
+          get? body.basicBlocks bIdx = some bb ∧
+          sIdx = length pfx ∧
+          bb.statements = pfx ++ stmts ∧
+          term = bb.terminator) →
+      wpExecGen zeroVal body post fuel st =
+        wpCfgStep zeroVal body post fuel cur st := by
+  intro fuel
+  induction fuel with
+  | zero => intros; rfl
+  | succ fuel' ih =>
+    intro cur st h_cur
+    cases st with
+    | halted _ =>
+      cases cur with
+      | none => rfl
+      | some tup => rcases tup with ⟨_, _, stmts, _⟩; cases stmts <;> rfl
+    | faulted _ =>
+      cases cur with
+      | none => rfl
+      | some tup => rcases tup with ⟨_, _, stmts, _⟩; cases stmts <;> rfl
+    | running s =>
+      cases cur with
+      | none =>
+        dsimp only [wpCfgStep, wpExecFallback]
+        cases h_ac : s.memory.activeCallee with
+        | some _ => rfl
+        | none =>
+          dsimp only
+          cases h_si : Nat.beq s.frame.stmtIdx 0 with
+          | false => rfl
+          | true =>
+            dsimp only [lookupBlock]
+            have h_si_eq : s.frame.stmtIdx = 0 := Nat.eq_of_beq_eq_true h_si
+            dsimp only [wpExecGen, stepMirSymTreeFast]
+            rw [h_ac]
+            dsimp only
+            rw [h_phase]
+            dsimp only
+            cases h_bb : get? body.basicBlocks s.frame.blockIdx with
+            | none =>
+              dsimp only [evalSymNodeTree, MirStepNode.fail, dispatchBlock]
+            | some bb =>
+              rcases bb with ⟨stmts, term, isCleanup⟩
+              dsimp only
+              rw [h_si_eq]
+              cases stmts with
+              | nil =>
+                dsimp only [dispatchBlock, get?, length, BEq.beq, instBEqOfDecidableEq,
+                  Nat.decEq, instDecidableEqNat, decide]
+                apply congrArg (fun k => evalSymNodeTree k post _)
+                funext st'
+                exact ih .none st' (fun _ _ _ _ h => nomatch h)
+              | cons stmt rest =>
+                dsimp only [dispatchBlock, get?]
+                apply congrArg (fun k => evalSymNodeTree k post _)
+                funext st'
+                refine ih (.some (s.frame.blockIdx, 1, rest, term)) st' ?_
+                intro bIdx sIdx stmts' term' h_some
+                injection h_some with h_tup
+                rcases Prod.mk.injEq _ _ _ _ ▸ h_tup with ⟨rfl, h_tup2⟩
+                rcases Prod.mk.injEq _ _ _ _ ▸ h_tup2 with ⟨rfl, h_tup3⟩
+                rcases Prod.mk.injEq _ _ _ _ ▸ h_tup3 with ⟨rfl, rfl⟩
+                exact ⟨⟨stmt :: rest, term, isCleanup⟩, [stmt], h_bb, rfl, rfl, rfl⟩
+      | some tup =>
+        rcases tup with ⟨blockIdx, stmtIdx, stmts, term⟩
+        rcases h_cur blockIdx stmtIdx stmts term rfl with ⟨bb, pfx, h_bb, rfl, h_stmts, rfl⟩
+        cases stmts with
+        | nil =>
+          dsimp only [wpCfgStep, wpExecFallback]
+          cases h_ac : s.memory.activeCallee with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            cases h_bi : Nat.beq s.frame.blockIdx blockIdx with
+            | false => rfl
+            | true =>
+              dsimp only
+              cases h_si : Nat.beq s.frame.stmtIdx (length pfx) with
+              | false => rfl
+              | true =>
+                dsimp only
+                have h_bi_eq : s.frame.blockIdx = blockIdx := Nat.eq_of_beq_eq_true h_bi
+                have h_si_eq : s.frame.stmtIdx = length pfx := Nat.eq_of_beq_eq_true h_si
+                have h_eq : bb.statements = pfx := by simpa using h_stmts
+                subst h_eq
+                dsimp only [wpExecGen, stepMirSymTreeFast]
+                rw [h_ac]
+                dsimp only
+                rw [h_phase]
+                dsimp only
+                rw [h_bi_eq, h_bb]
+                dsimp only
+                rw [h_si_eq, get?_length_none]
+                dsimp only
+                rw [nat_beq_self_eq_true]
+                apply congrArg (fun k => evalSymNodeTree k post _)
+                funext st'
+                exact ih .none st' (fun _ _ _ _ h => nomatch h)
+        | cons stmt rest =>
+          dsimp only [wpCfgStep, wpExecFallback]
+          cases h_ac : s.memory.activeCallee with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            cases h_bi : Nat.beq s.frame.blockIdx blockIdx with
+            | false => rfl
+            | true =>
+              dsimp only
+              cases h_si : Nat.beq s.frame.stmtIdx (length pfx) with
+              | false => rfl
+              | true =>
+                dsimp only
+                have h_bi_eq : s.frame.blockIdx = blockIdx := Nat.eq_of_beq_eq_true h_bi
+                have h_si_eq : s.frame.stmtIdx = length pfx := Nat.eq_of_beq_eq_true h_si
+                dsimp only [wpExecGen, stepMirSymTreeFast]
+                rw [h_ac]
+                dsimp only
+                rw [h_phase]
+                dsimp only
+                rw [h_bi_eq, h_bb]
+                dsimp only
+                rw [h_si_eq, h_stmts, get?_append_cons]
+                dsimp only
+                apply congrArg (fun k => evalSymNodeTree k post _)
+                funext st'
+                refine ih (.some (blockIdx, Nat.add (length pfx) 1, rest, bb.terminator)) st' ?_
+                intro bIdx sIdx stmts' term' h_some
+                injection h_some with h_tup
+                rcases Prod.mk.injEq _ _ _ _ ▸ h_tup with ⟨rfl, h_tup2⟩
+                rcases Prod.mk.injEq _ _ _ _ ▸ h_tup2 with ⟨rfl, h_tup3⟩
+                rcases Prod.mk.injEq _ _ _ _ ▸ h_tup3 with ⟨rfl, rfl⟩
+                refine ⟨bb, pfx ++ [stmt], h_bb, ?_, by simp [h_stmts, List.append_assoc], rfl⟩
+                exact (length_append_singleton pfx stmt).symm
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) entry-block initialization for `wpBlockLinear`. -/
+theorem wpStartBlock0_eq_constructive
+    (zeroVal : Prop) (body : CapturedMir) (bb : BasicBlockData)
+    (post : MirOutcome → Prop) (fuel : Nat) (args : List Value)
+    (h_phase : body.phase = .runtimeOptimized)
+    (h_bb : get? body.basicBlocks 0 = some bb) :
+    wpExecGen zeroVal body post fuel (.running (initMachineState body args)) =
+      wpBlockLinear zeroVal body bb.terminator post
+        0 0 fuel bb.statements (initLocalsAux 0 body.localDecls args)
+        (initMachineState body args).memory := by
+  refine wpCfgStep_eq_constructive zeroVal body post h_phase fuel
+    (.some (0, 0, bb.statements, bb.terminator))
+    (.running (initMachineState body args)) ?_
+  intro bIdx sIdx stmts term h_some
+  injection h_some with h_tup
+  rcases Prod.mk.injEq _ _ _ _ ▸ h_tup with ⟨rfl, h_tup2⟩
+  rcases Prod.mk.injEq _ _ _ _ ▸ h_tup2 with ⟨rfl, h_tup3⟩
+  rcases Prod.mk.injEq _ _ _ _ ▸ h_tup3 with ⟨rfl, rfl⟩
+  exact ⟨bb, [], h_bb, rfl, rfl, rfl⟩
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) `wpBlockLinear` bridge for `MirBoolPredicateHolds`. -/
+theorem hold_mirBool_of_blockLinear_constructive
+    (body : CapturedMir) (args : List Value)
+    (h_phase : body.phase = .runtimeOptimized)
+    (h_bb0 : get? body.basicBlocks 0 = some (entryBB body))
+    (h : Hold
+      (wpBlockLinear False body (entryBB body).terminator
+        boolTruePost 0 0 (defaultSpecSteps body) (entryBB body).statements
+        (initLocalsAux 0 body.localDecls args)
+        (initMachineState body args).memory)) :
+    Hold (MirBoolPredicateHolds body args) := by
+  refine ⟨mirBoolPredicateHolds_of_wpMirSym_true_constructive (defaultSpecSteps body) body args ?_⟩
+  unfold wpMirSym
+  rw [wpMirExecSym_eq_gen,
+      wpStartBlock0_eq_constructive False body (entryBB body) _ (defaultSpecSteps body) args h_phase h_bb0]
+  exact h.val
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) `runCfgSteps` soundness for `wpCoalBounded`. -/
+theorem wpCoalBounded_of_runCfgSteps_constructive
+    (body : CapturedMir) (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized) :
+    ∀ (fuel : Nat) (cfg : CfgExecState) (st : MirExecState),
+      CfgValid body cfg st →
+      cfgStateWP post (runCfgSteps body cfg fuel) →
+      wpCoalBounded (fuel + 1) mirNoCallWP (stepMirState body)
+        (fun out _ => post out) st PUnit.unit := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro cfg st h_valid h_wp
+    dsimp only [runCfgSteps] at h_wp
+    cases cfg with
+    | running _ _ _ => exact False.elim h_wp
+    | faulted => exact False.elim h_wp
+    | halted ok out =>
+      change st = .halted out at h_valid
+      subst h_valid
+      exact h_wp.2
+  | succ fuel' ih =>
+    intro cfg st h_valid h_wp
+    rw [runCfgSteps_step] at h_wp
+    have h_ok1 : cfgOk (stepCfgState body cfg) = true :=
+      cfgOk_of_runCfgSteps_true body fuel' (stepCfgState body cfg)
+        (by
+          cases h_end : runCfgSteps body (stepCfgState body cfg) fuel' with
+          | halted ok out =>
+            rw [h_end] at h_wp
+            exact h_wp.1
+          | running _ _ _ =>
+            rw [h_end] at h_wp
+            exact False.elim h_wp
+          | faulted =>
+            rw [h_end] at h_wp
+            exact False.elim h_wp)
+    have h_ok0 : cfgOk cfg = true := by
+      cases h_c : cfgOk cfg with
+      | true => rfl
+      | false =>
+        rw [cfgOk_stepCfgState_false body cfg h_c] at h_ok1
+        nomatch h_ok1
+    cases cfg with
+    | faulted => nomatch h_ok0
+    | halted ok out =>
+      change st = .halted out at h_valid
+      subst h_valid
+      change ok = true at h_ok0
+      subst h_ok0
+      dsimp only [stepCfgState] at h_wp
+      rw [runCfgSteps_halted] at h_wp
+      exact h_wp.2
+    | running ok cur s =>
+      change ok = true at h_ok0
+      subst h_ok0
+      rcases h_valid with ⟨rfl, h_cur⟩
+      dsimp only [stepCfgState] at h_ok1 h_wp
+      cases h_ac : s.memory.activeCallee with
+      | some _ =>
+        rw [h_ac] at h_ok1
+        nomatch h_ok1
+      | none =>
+        rw [h_ac] at h_ok1 h_wp
+        dsimp only at h_ok1 h_wp
+        rw [wpCoalBounded_succ_eq]
+        dsimp only [stepMirState, stepMirFn]
+        rw [h_ac]
+        dsimp only [Option.getD]
+        rw [h_phase]
+        dsimp only
+        cases cur with
+        | none =>
+          cases h_si : Nat.beq s.frame.stmtIdx 0 with
+          | false =>
+            rw [h_si] at h_ok1
+            nomatch h_ok1
+          | true =>
+            rw [h_si] at h_ok1 h_wp
+            dsimp only [lookupBlock] at h_ok1 h_wp
+            have h_si_eq : s.frame.stmtIdx = 0 := Nat.eq_of_beq_eq_true h_si
+            cases h_bb : get? body.basicBlocks s.frame.blockIdx with
+            | none =>
+              rw [h_bb] at h_ok1
+              nomatch h_ok1
+            | some bb =>
+              rw [h_bb] at h_ok1 h_wp
+              rcases bb with ⟨stmts, term, isCleanup⟩
+              rw [h_si_eq]
+              cases stmts with
+              | nil =>
+                dsimp only [dispatchBlockCfg, get?, GetElem?.getElem?,
+                  List.instGetElem?NatLtLength, List.get?Internal, length, BEq.beq,
+                  instBEqOfDecidableEq, Nat.decEq, instDecidableEqNat, decide] at h_ok1 h_wp ⊢
+                exact wpCoalBounded_evalTerminatorCfg body post fuel' s term h_ok1 ih h_wp
+              | cons stmt rest =>
+                dsimp only [dispatchBlockCfg, get?, GetElem?.getElem?,
+                  List.instGetElem?NatLtLength, List.get?Internal] at h_ok1 h_wp ⊢
+                rw [← evalStmtFast_eq body s stmt]
+                exact wpCoalBounded_stepNodeToCfg body post fuel'
+                  (.some (s.frame.blockIdx, 1, rest, term))
+                  (evalStmtFast body s stmt)
+                  ⟨⟨stmt :: rest, term, isCleanup⟩, [stmt], h_bb, rfl, rfl, rfl⟩
+                  h_ok1 ih h_wp
+        | some tup =>
+          rcases tup with ⟨blockIdx, stmtIdx, stmts, term⟩
+          rcases h_cur with ⟨bb, pfx, h_bb, rfl, h_stmts, rfl⟩
+          cases h_bi : Nat.beq s.frame.blockIdx blockIdx with
+          | false =>
+            cases stmts <;> (dsimp only at h_ok1; rw [h_bi] at h_ok1; nomatch h_ok1)
+          | true =>
+            have h_bi_eq : s.frame.blockIdx = blockIdx := Nat.eq_of_beq_eq_true h_bi
+            cases h_si : Nat.beq s.frame.stmtIdx (length pfx) with
+            | false =>
+              cases stmts <;> (dsimp only at h_ok1; rw [h_bi, h_si] at h_ok1; nomatch h_ok1)
+            | true =>
+              have h_si_eq : s.frame.stmtIdx = length pfx := Nat.eq_of_beq_eq_true h_si
+              rw [h_bi_eq, h_bb, h_si_eq]
+              dsimp only
+              cases stmts with
+              | nil =>
+                dsimp only at h_ok1 h_wp
+                rw [h_bi, h_si] at h_ok1 h_wp
+                have h_eq : bb.statements = pfx := by simpa using h_stmts
+                rw [← h_eq, get?_length_none]
+                dsimp only
+                rw [nat_beq_self_eq_true, ite_eq_left rfl]
+                exact wpCoalBounded_evalTerminatorCfg body post fuel' s bb.terminator h_ok1 ih h_wp
+              | cons stmt rest =>
+                dsimp only at h_ok1 h_wp
+                rw [h_bi, h_si] at h_ok1 h_wp
+                rw [h_stmts, get?_append_cons]
+                dsimp only
+                rw [← evalStmtFast_eq body s stmt]
+                exact wpCoalBounded_stepNodeToCfg body post fuel'
+                  (.some (blockIdx, Nat.add (length pfx) 1, rest, bb.terminator))
+                  (evalStmtFast body s stmt)
+                  ⟨bb, pfx ++ [stmt], h_bb, (length_append_singleton pfx stmt).symm,
+                    by simp [h_stmts, List.append_assoc], rfl⟩
+                  h_ok1 ih h_wp
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) `evalMirSpecBool` bridge for `MirBoolPredicateHolds`. -/
+theorem mirBoolPredicateHolds_of_evalMirSpecBool_true_constructive
+    (specBody : CapturedMir) (args : List Value)
+    (h_phase : specBody.phase = .runtimeOptimized)
+    (h_eval : evalMirSpecBool specBody args = true) :
+    MirBoolPredicateHolds specBody args := by
+  apply mirBoolPredicateHolds_of_wpMirSym_true_constructive (defaultSpecSteps specBody + 1) specBody args
+  unfold wpMirSym
+  rw [wpMirExecSym_eq_wpCoalBounded]
+  apply wpCoalBounded_default_of_noCall
+  refine wpCoalBounded_of_runCfgSteps_constructive specBody boolTruePost h_phase (defaultSpecSteps specBody)
+    (.running true .none (initMachineState specBody args))
+    (.running (initMachineState specBody args))
+    ⟨rfl, trivial⟩ ?_
+  unfold evalMirSpecBool at h_eval
+  revert h_eval
+  cases runCfgSteps specBody
+    (.running true .none (initMachineState specBody args))
+    (defaultSpecSteps specBody) with
+  | running _ _ _ => intro h; contradiction
+  | faulted => intro h; contradiction
+  | halted ok out =>
+    cases ok with
+    | false => intro h; contradiction
+    | true =>
+      cases out with
+      | panic => intro h; contradiction
+      | abort => intro h; contradiction
+      | normal rv =>
+        rcases rv with ⟨v, mem'⟩
+        cases v with
+        | scalar sc =>
+          rcases sc with ⟨bits, sz⟩
+          cases bits with
+          | zero => intro h; contradiction
+          | succ b' =>
+            cases b' with
+            | zero =>
+              cases sz with
+              | zero => intro h; contradiction
+              | succ sz' =>
+                cases sz' with
+                | zero => intro _; exact ⟨rfl, boolTruePost_normal_one mem'⟩
+                | succ _ => intro h; contradiction
+            | succ _ => intro h; contradiction
+        | _ => intro h; contradiction
 
 /-- Extract a 2-byte scalar below `2^16` from a `valueMatchesRigidTyAndLayout` hypothesis
-on a `u16` local declaration, for every 2-byte `TypeLayout` (not only `u16TypeLayout`). -/
+on a `u16` local declaration, for every 2-byte `TypeLayout`. -/
 theorem u16_of_valueMatchesRigid {fuel' : Nat} {body : CapturedMir} {layout : TypeLayout}
     {layoutIdx : LayoutIdx} {v : Value} {mem : Memory} (h_size : layout.size.bytes = 2)
     (h : valueMatchesRigidTyAndLayout (fuel' + 1) body (.uint .u16)
@@ -21530,9 +21895,13 @@ theorem u16_of_valueMatchesRigid {fuel' : Nat} {body : CapturedMir} {layout : Ty
        subst h2
        exact ⟨b, rfl, h_lt⟩)
 
-/-- Establish `scalarMatchesBackendRepr` for a 2-byte scalar below `2^16` on `u16TypeLayout`. -/
-theorem u16_scalarMatchesBackendRepr {r : Nat} (h_lt : r < 65536) :
-    scalarMatchesBackendRepr u16TypeLayout.backendRepr r := by
+/-- Establish `scalarMatchesBackendRepr` for a 2-byte scalar below `2^16` on any `TypeLayout`
+whose `backendRepr` is a `u16` initialized scalar layout (`[0, 65535]`). -/
+theorem u16_scalarMatchesBackendRepr {repr : BackendRepr} {r : Nat}
+    (h_repr : repr = .scalar (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 }))
+    (h_lt : r < 65536) :
+    scalarMatchesBackendRepr repr r := by
+  rw [h_repr]
   show (Nat.ble 0 r && Nat.ble r 65535) = true
   rw [Nat.ble_eq_true_of_le (Nat.zero_le r), Nat.ble_eq_true_of_le (Nat.le_of_lt_succ h_lt)]
   rfl
@@ -21550,13 +21919,47 @@ theorem u16_of_valueMatchesTy {fuel' : Nat} {body : CapturedMir} {ty : Ty}
   rw [h_kind, h_get] at h
   exact u16_of_valueMatchesRigid h_size h
 
+/-- Unpack a 2-argument `(u16, u16)` `argsMatchSignature` precondition into two 2-byte
+scalars below `2^16` without unfolding `valueMatchesRigidTyAndLayout` at the call site. -/
+theorem u16_pair_of_argsMatchSignature {body : CapturedMir}
+    {d0 d1 d2 : LocalDecl} {restDecls : List LocalDecl}
+    {l1 l2 : TypeLayout} {args : List Value} {mem : Memory}
+    (h_argc : body.argCount = 2)
+    (h_decls : body.localDecls = d0 :: d1 :: d2 :: restDecls)
+    (h_k1 : d1.ty.kind = .uint .u16)
+    (h_g1 : sigGet? body.layouts.entries d1.ty.layoutIdx = some l1)
+    (h_s1 : l1.size.bytes = 2)
+    (h_k2 : d2.ty.kind = .uint .u16)
+    (h_g2 : sigGet? body.layouts.entries d2.ty.layoutIdx = some l2)
+    (h_s2 : l2.size.bytes = 2)
+    (h_sig : argsMatchSignature body args mem) :
+    ∃ b1 b2,
+      args = [.scalar { bits := b1, sizeBytes := 2 }, .scalar { bits := b2, sizeBytes := 2 }] ∧
+      b1 < 65536 ∧ b2 < 65536 := by
+  obtain ⟨h_len, h_aux⟩ := h_sig
+  rw [h_argc] at h_len
+  obtain ⟨v1, v2, rfl⟩ : ∃ v1 v2, args = [v1, v2] := by
+    rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
+    all_goals first | exact ⟨_, _, rfl⟩ | nomatch h_len
+  rw [h_decls] at h_aux
+  dsimp only [argsMatchSignatureAux, defaultSignatureFuel] at h_aux
+  obtain ⟨h1, h2, -⟩ := h_aux
+  obtain ⟨b1, rfl, hb1⟩ := u16_of_valueMatchesTy h_k1 h_g1 h_s1 h1
+  obtain ⟨b2, rfl, hb2⟩ := u16_of_valueMatchesTy h_k2 h_g2 h_s2 h2
+  exact ⟨b1, b2, rfl, hb1, hb2⟩
+
 /-- Establish `retMatchesSignature` for a 2-byte scalar below `2^16` when return local `_0`
-has type `u16` and layout `u16TypeLayout`. -/
+has type `u16` and any 2-byte `u16` scalar `TypeLayout`. -/
 theorem u16_retMatchesSignature {body : CapturedMir} {retDecl : LocalDecl}
-    {restDecls : List LocalDecl} {r : Nat} (mem : Memory)
+    {restDecls : List LocalDecl} {layout : TypeLayout} {r : Nat} (mem : Memory)
     (h_decls : body.localDecls = retDecl :: restDecls)
     (h_kind : retDecl.ty.kind = .uint .u16)
-    (h_get : sigGet? body.layouts.entries retDecl.ty.layoutIdx = some u16TypeLayout)
+    (h_get : sigGet? body.layouts.entries retDecl.ty.layoutIdx = some layout)
+    (h_uninhabited : layout.isUninhabited = false)
+    (h_param : sigIsParamPlaceholder layout = false)
+    (h_size : layout.size.bytes = 2)
+    (h_repr : layout.backendRepr =
+      .scalar (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 }))
     (h_lt : r < 65536) :
     retMatchesSignature body (.scalar { bits := r, sizeBytes := 2 }) mem := by
   unfold retMatchesSignature valueMatchesTyAndLayout
@@ -21564,7 +21967,8 @@ theorem u16_retMatchesSignature {body : CapturedMir} {retDecl : LocalDecl}
   dsimp only []
   rw [h_kind, h_get]
   dsimp only [defaultSignatureFuel, valueMatchesRigidTyAndLayout]
-  exact ⟨rfl, rfl, rfl, Nat.two_pos, h_lt, u16_scalarMatchesBackendRepr h_lt⟩
+  exact ⟨h_uninhabited, h_param, h_size.symm, Nat.two_pos, h_lt,
+    u16_scalarMatchesBackendRepr h_repr h_lt⟩
 
 /-- `Nat.ble a b = false` from `¬ a ≤ b`. -/
 theorem nat_ble_eq_false_of_not_le {a b : Nat} (h : ¬ a ≤ b) : Nat.ble a b = false :=
