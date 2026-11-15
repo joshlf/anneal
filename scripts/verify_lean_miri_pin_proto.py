@@ -1387,7 +1387,7 @@ def _check_elan_overrides(repo_root: Path, name: str, elan_home: Path, environ: 
             override_dir = Path(directory).resolve()
         except OSError:
             continue
-        if (override_dir == root or root in override_dir.parents) and toolchain != name:
+        if (override_dir == root or root in override_dir.parents or override_dir in root.parents) and toolchain != name:
             c.err("toolchain", f"elan override {directory!r} -> {toolchain!r} shadows the repository lean-toolchain {name!r}")
 
 
@@ -1565,16 +1565,47 @@ def _verify_toolchain_impl(
             c.err("toolchain", f"cannot hash {rel}: {exc}")
     libleanshared = tuple(n for n in lib_names if _LIBLEANSHARED_RE.match(n))
 
+    pin_status = "not-requested"
+    active_pin: Optional[Mapping[str, Any]] = None
+    locked_prefix = False
+    if toolchain_pin_json is not None:
+        active_pin = _load_toolchain_pin(toolchain_pin_json, c)
+        if active_pin is not None:
+            pin_status = "verified"
+    elif resolved_by == "elan" and name in LOCKED_TOOLCHAIN_PINS:
+        locked = LOCKED_TOOLCHAIN_PINS[name]
+        if host_platform_triple() == locked["platform"]:
+            active_pin = {"toolchain": name, "files": dict(locked["files"]), "versions": dict(locked["versions"])}
+            locked_prefix = True
+            pin_status = "locked-verified"
+        else:
+            c.warn("toolchain", f"no locked release pin for {name!r} on {host_platform_triple()!r}; digests computed but not pinned (pass --toolchain-pin-json)")
+    elif resolved_by == "elan":
+        c.warn("toolchain", f"no locked release pin for {name!r}; digests computed but not pinned (pass --toolchain-pin-json)")
+
+    if active_pin is not None:
+        errors_before_lock = len(c.errors)
+        _compare_toolchain_pin_files(active_pin, name, files, c)
+        if locked_prefix:
+            for i in range(errors_before_lock, len(c.errors)):
+                c.errors[i] = c.errors[i].replace("[toolchain-pin]", "[toolchain-pin] (locked release pin)", 1)
+
     lean_version = lake_version = ""
     expected_version = _expected_version(name)
     if expected_version is None:
         c.warn("toolchain", f"cannot derive a release version from {name!r}; --version outputs not compared")
     if len(c.errors) != integrity_errors_before:
-        # Fail closed: never execute a toolchain whose files failed the checks.
+        # Fail closed: never execute a toolchain whose files or pinned digests failed the checks.
         c.err("toolchain", "skipped `bin/lean --version` / `bin/lake --version`: toolchain file checks failed")
     else:
         lean_version = _run_version(toolchain_dir / "bin" / "lean", "bin/lean", timeout, c) or ""
         lake_version = _run_version(toolchain_dir / "bin" / "lake", "bin/lake", timeout, c) or ""
+        if active_pin is not None:
+            errors_before_ver = len(c.errors)
+            _compare_toolchain_pin_versions(active_pin, {"bin/lean": lean_version, "bin/lake": lake_version}, c)
+            if locked_prefix:
+                for i in range(errors_before_ver, len(c.errors)):
+                    c.errors[i] = c.errors[i].replace("[toolchain-pin]", "[toolchain-pin] (locked release pin)", 1)
     lean_commit = lake_commit = None
     if lean_version:
         m = re.match(r"\ALean \(version ([0-9A-Za-z.+\-]+)[,)]", lean_version)
@@ -1595,26 +1626,6 @@ def _verify_toolchain_impl(
             lake_commit = cm.group(1) if cm else None
     if lean_commit and lake_commit and not lean_commit.startswith(lake_commit):
         c.err("toolchain", f"bin/lake build commit {lake_commit} does not match bin/lean commit {lean_commit}")
-
-    pin_status = "not-requested"
-    if toolchain_pin_json is not None:
-        pin = _load_toolchain_pin(toolchain_pin_json, c)
-        if pin is not None:
-            _compare_toolchain_pin(pin, name, files, {"bin/lean": lean_version, "bin/lake": lake_version}, c)
-            pin_status = "verified"
-    elif resolved_by == "elan" and name in LOCKED_TOOLCHAIN_PINS:
-        locked = LOCKED_TOOLCHAIN_PINS[name]
-        if host_platform_triple() == locked["platform"]:
-            locked_pin = {"toolchain": name, "files": dict(locked["files"]), "versions": dict(locked["versions"])}
-            errors_before_lock = len(c.errors)
-            _compare_toolchain_pin(locked_pin, name, files, {"bin/lean": lean_version, "bin/lake": lake_version}, c)
-            for i in range(errors_before_lock, len(c.errors)):
-                c.errors[i] = c.errors[i].replace("[toolchain-pin]", "[toolchain-pin] (locked release pin)", 1)
-            pin_status = "locked-verified"
-        else:
-            c.warn("toolchain", f"no locked release pin for {name!r} on {host_platform_triple()!r}; digests computed but not pinned (pass --toolchain-pin-json)")
-    elif resolved_by == "elan":
-        c.warn("toolchain", f"no locked release pin for {name!r}; digests computed but not pinned (pass --toolchain-pin-json)")
 
     if home is not None and environ.get("PATH"):
         for tool in ("lean", "lake"):
@@ -1640,7 +1651,7 @@ def _verify_toolchain_impl(
     )
 
 
-def _compare_toolchain_pin(pin: Mapping[str, Any], name: str, files: Mapping[str, str], versions: Mapping[str, str], c: _Collector) -> None:
+def _compare_toolchain_pin_files(pin: Mapping[str, Any], name: str, files: Mapping[str, str], c: _Collector) -> None:
     if pin["toolchain"] != name:
         c.err("toolchain-pin", f"toolchain pin is for {pin['toolchain']!r} but the active toolchain is {name!r}")
     pinned: Mapping[str, str] = pin["files"]
@@ -1651,9 +1662,17 @@ def _compare_toolchain_pin(pin: Mapping[str, Any], name: str, files: Mapping[str
     for rel in sorted(set(files) & set(pinned)):
         if files[rel] != pinned[rel]:
             c.err("toolchain-pin", f"SHA-256 mismatch for {rel}: pinned {pinned[rel]}, actual {files[rel]}")
+
+
+def _compare_toolchain_pin_versions(pin: Mapping[str, Any], versions: Mapping[str, str], c: _Collector) -> None:
     for rel, version in (pin.get("versions") or {}).items():
         if versions.get(rel) != version:
             c.err("toolchain-pin", f"{rel} --version {versions.get(rel)!r} != pinned {version!r}")
+
+
+def _compare_toolchain_pin(pin: Mapping[str, Any], name: str, files: Mapping[str, str], versions: Mapping[str, str], c: _Collector) -> None:
+    _compare_toolchain_pin_files(pin, name, files, c)
+    _compare_toolchain_pin_versions(pin, versions, c)
 
 
 def verify_toolchain(

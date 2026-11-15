@@ -8,7 +8,7 @@
 > `lean-miri/**`, `minirust/**`, `lakefile.toml`, or `theory/Anneal.lean` is modified, and no
 > `vendor/lean-miri/` is created.
 
-Status: **round A1** (second critique-and-fix pass of the N = 4 loop, after B1). Recommendation (§6):
+Status: **round B2** (third critique-and-fix pass of the N = 4 loop, after A1). Recommendation (§6):
 **CONDITIONAL GO**.
 
 ## 1. Architecture
@@ -34,27 +34,28 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 | 5 | Shared byte-level machine `PState`. Frames hold `imm`/`mem` slots, the heap holds real `AbstractByte`s, the borrow table holds real `BorrowEntry`s, and `pendingMoveDeinit` is LeanMiri's latch. `M_anneal` performs eager, value-level move deinit (`annealReadOperand`, `annealAssignUse`). `M_ref` uses the `d9b41b58b` two-phase protocol (`refEvalOperand` → `refReadImmediate` / `refCopyRuntimePlaceNoValidate`, `takePendingMoveDeinit`). Statements and terminators cover assign (`use`/`binaryOp`/`aggregate`/`ref`/`rawPtr`), `Deinit`, `StorageLive`/`StorageDead`, `goto`, `return`, `switchInt`, `assert` with `UnwindAction.cleanup`, `call` (arguments first, then callee resolution), and `unwindResume`. Everything else fails closed with `.unsupported`. |
 | 6 | Fetch/resolve for both machines. `M_anneal` resolves deep `Ty`s against `CapturedMir.layouts`; `M_ref` resolves `TyId`s via `evalLayoutQuery`. Also defines the step budget (`RefState.stepsExecuted`/`maxSteps`), runs, and observations. |
 | 6b | The codec-driven resolution correspondence and the whole-program equivalence. |
-| 7 | 28 executable canary theorems covering `D1`–`D9`. |
-| 8 | Falsification witnesses. |
+| 7 | 30 executable canary theorems covering `D1`–`D9` (including B2 call-destination-before-arg-move and bad-call-destination canaries). |
+| 8 | Falsification witnesses (including B2 `call_evalFnCallArgumentAt_bypasses_evalOperand_falsified` for `Miri/Interpreter/Call.lean`). |
 | 9 | Tree Borrows theorems. |
 | 10 | The wiring claim (`miriMoveDeinitWiring_proto`) and Part 10b live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge theorems (`trusted_evalOperand_root_move_deinits`, `trusted_evalOperand_projected_move_eq_copy`). |
 | 10c | A1 hardening: pointer constants fail closed (`constSem_ptr_fails_closed`, `canary_const_ptr_fails_closed`), the universal assignment Tree Borrows theorem with its non-vacuity witness, and destination-first assignment evaluation (`DestPlace`, `resolveDest`, `writeDest`). |
-| 11 | 78 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
+| 10d | B2 step-boundary latch invariant (`twoPhaseReadOperand_true_latch_clear`, `twoPhaseAssignUse_true_latch_clear`: every operand read or assignment leaves `pendingMoveDeinit = false`). |
+| 11 | 83 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
 | 12 | A `run_cmd` audit of **every** declaration in the module. Its axioms must be ⊆ {propext, Quot.sound}; otherwise elaboration fails. This was checked with a planted `Classical.choice` probe. |
 
-### 1.2 Inventory (A1)
+### 1.2 Inventory (B2)
 
 | Metric | Value |
 |---|---|
-| Lean LOC | 4,897 |
-| `theorem`s | 177 |
-| `def`/`abbrev`s | 254 |
-| `#guard_msgs` axiom guards | 78, all `[propext]` or `[propext, Quot.sound]` |
+| Lean LOC | 5,218 |
+| `theorem`s | 190 |
+| `def`/`abbrev`s | 259 |
+| `#guard_msgs` axiom guards | 83, all `[propext]` or `[propext, Quot.sound]` |
 | `sorry` / `admit` / `axiom` / `native_decide` / `partial` / `unsafe` | 0 |
 | `Classical.choice` anywhere in the module | 0 (enforced by the Part 12 audit) |
-| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), 37 s wall |
-| Receipt 3 (`unittest`) | 57 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), 64 s wall |
-| Verifier LOC / test LOC / tests | 1,854 / 1,242 / 57 (A1 adds `LOCKED_TOOLCHAIN_PINS` plus 2 locked-pin tests; 1 opt-in real-diff test) |
+| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~38 s wall |
+| Receipt 3 (`unittest`) | 58 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~65 s wall |
+| Verifier LOC / test LOC / tests | 1,873 / 1,251 / 58 (B2 verifies pin digests before executing `bin/lean` / `bin/lake` and checks parent-directory `elan` overrides) |
 
 ### 1.3 Headline theorems
 
@@ -144,6 +145,7 @@ Each row runs a real `CapturedMir`, with layouts from Trusted's `RigidTy.compute
 | D6 | `_1 = move _1`; `*_2 = move *_2`; `_1 = (move _1.1, move _1.0)` | `canary_D6_*` (3) | 5, 5, 2 in both | PR #257 `D8` |
 | D7 | `call callee(move _1, copy _2)`, callee reads `*_2` | `canary_D7_call_arg_move_deinit_before_callee` / `_copy_ok` | UB / UB; 5 / 5 | `kani#5172` |
 | D7 | `call unresolved(move _uninit)` vs `call unresolved(const 1)` | `canary_D7_uninit_arg_ub_before_unsupported` / `canary_D7_unresolved_callee_unsupported` | UB (before `.unsupported`); `.unsupported` | `kani#5172`, sibling `DIV-MR-CALL-TARGET-LOCAL` ordering |
+| D7 | `*_2 = call callee(move _2)` & `call unresolved(1) -> (*_uninit_ptr)` | `canary_D7_call_dest_resolved_before_arg_move` / `canary_D7_call_bad_dest_ub_before_unsupported` | 42 / 42; `Obs.ub .invalidPointer` | `Miri/Interpreter/Call.lean:453` dest-first |
 | D8 | `assert(move _1)` fails → `cleanup bb2` reads `_1` / `_2` | `canary_D8_assert_cleanup_{moved_cond_ub,unmoved_ok}` | UB / UB; panicked / panicked | `D8` |
 | D8 | unwinding `call panicky(move _1)` → `cleanup bb2` | `canary_D8_unwinding_call_{moved_arg_ub,unmoved_ok}` | UB / UB; panicked / panicked | `D8` |
 | D9 | `move _1[1]`; read `_1[0]`, `_1[3]`, `_1[1]` | `canary_D9_elem_move_{neighbors_ok,reread_ub}` | 10, 13, UB in both | `D9` |
@@ -227,19 +229,35 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
      `writePlace`.
    * Both machines now evaluate the destination first (`resolveDest` → `DestPlace`), then the
      rvalue, then `writeDest`. All theorems and canaries were re-proved.
-   * Remaining limit: the `Call` destination is still resolved at `return_` time. Miri evaluates
-     it before pushing the callee frame.
-10. **(A1) The default verifier run was trust-on-first-use for the toolchain.**
-    * Without `--toolchain-pin-json`, receipt 2 only *computed* the `libleanshared*.so` digests, so
+   * **(B2) `Call` destination resolved at call entry.** In A1, `TerminatorKind.call` still resolved
+     its destination at `return_` time. In B2, `execTerm` resolves `dest` via `resolveDest` at call
+     entry (before evaluating arguments or resolving the callee, matching
+     `Miri/Interpreter/Call.lean:453`), caches `retDest : Option DestPlace` in `PFrame`, and writes
+     via `writeDest` on `return_` (`canary_D7_call_dest_resolved_before_arg_move`,
+     `canary_D7_call_bad_dest_ub_before_unsupported`).
+10. **(A1 & B2) Toolchain pin enforcement before binary execution.**
+    * Without `--toolchain-pin-json`, receipt 2 in A0/B1 only *computed* the `libleanshared*.so` digests, so
       a substituted companion `libleanshared_1.so` would have passed.
-    * The verifier now compiles in `LOCKED_TOOLCHAIN_PINS` (release digests of
-      `leanprover/lean4:v4.34.1`, `x86_64-unknown-linux-gnu`) and enforces them by default
-      (`pin_status: locked-verified`). An explicit `--toolchain-pin-json` takes precedence.
-    * New tests:
-      * `test_locked_release_pin_rejects_substituted_elan_toolchain`;
-      * `test_live_locked_pin_detects_real_companion_libleanshared_tamper`, which copies the real
-        233 MB toolchain libraries and tampers only `libleanshared_1.so`.
-11. **Modeling limits, stated rather than hidden:**
+    * A1 compiled in `LOCKED_TOOLCHAIN_PINS` (release digests of
+      `leanprover/lean4:v4.34.1`, `x86_64-unknown-linux-gnu`) and enforced them by default
+      (`pin_status: locked-verified`).
+    * **(B2) Pre-execution digest verification.** In A1, `_verify_toolchain_impl` executed
+      `bin/lean --version` and `bin/lake --version` *before* checking file SHA-256 digests against
+      `toolchain_pin_json` or `LOCKED_TOOLCHAIN_PINS`, allowing a trojaned `bin/lean` or
+      `libleanshared_1.so` with `0o755`/`0o644` permissions to execute before rejection. B2 verifies
+      all file digests against the active pin *before* `_run_version` (`test_tampered_binary_or_libleanshared_not_executed_when_pin_mismatches`) and checks parent-directory `elan` overrides.
+11. **(B2) 7th-file soundness bug in `d9b41b58b`: `Miri/Interpreter/Call.lean:168-175` bypasses `evalOperand` on `.Move` call arguments.**
+    * In `lean-miri/vendor/Miri/Interpreter/Call.lean`, `evalFnCallArgumentAt` routes `.Copy`,
+      `.Constant` and `.RuntimeChecks` through `h.evalOperandAt`, **but routes `.Move place` directly
+      through `h.evalPlace` + `h.placeToOp` / `h.forceAllocation`**.
+    * Because `d9b41b58b` only patches 6 files and leaves `Miri/Interpreter/Call.lean` (and
+      `ExecutionCalls.lean`) unpatched, `.Move` call arguments in real `lean-miri` + `d9b41b58b`
+      neither deinitialize immediate locals nor set `pendingMoveDeinit := true` before
+      `passArgument`'s `copyAllowTransmute`.
+    * B2 proves `call_evalFnCallArgumentAt_bypasses_evalOperand_falsified` (`d7Prog (.move (loc 1))`
+      falsely returns `5` instead of `.ub .invalidUninitBytes`). Track A must patch `Call.lean` (or
+      `ExecutionCalls.lean`) alongside the 6 files.
+12. **Modeling limits, stated rather than hidden:**
    * Projections into immediates fail closed, so the patch's "projected immediate →
      `forceAllocation`" branch of `evalOperand` is unreachable in the prototype.
    * Protectors are not modeled (`isProtected = false`).

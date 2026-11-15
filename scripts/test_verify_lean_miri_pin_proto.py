@@ -957,9 +957,18 @@ class ToolchainTests(TempCase):
         )
         (elan / "settings.toml").write_text(f'default_toolchain = "{REPO_TOOLCHAIN}"\n\n[overrides]\n"{self.ws.root.resolve()}" = "leanprover/lean4:v4.0.0"\n')
         self.assertRejected(lambda: V.verify_toolchain(self.ws.root, elan_home=elan, environ={}), "elan override")
+        (elan / "settings.toml").write_text(f'default_toolchain = "{REPO_TOOLCHAIN}"\n\n[overrides]\n"{self.ws.root.resolve().parent}" = "leanprover/lean4:v4.0.0"\n')
+        self.assertRejected(lambda: V.verify_toolchain(self.ws.root, elan_home=elan, environ={}), "elan override")
         (elan / "settings.toml").unlink()
         shutil.rmtree(installed)
         self.assertRejected(lambda: V.verify_toolchain(self.ws.root, elan_home=elan, environ={}), "is not installed as a real directory")
+
+    def test_tampered_binary_or_libleanshared_not_executed_when_pin_mismatches(self) -> None:
+        canary = self.tmp / "trojan-executed"
+        (self.tc / "bin" / "lean").write_text(f"#!/bin/sh\necho pwned > {str(canary)!r}\necho 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n")
+        os.chmod(self.tc / "bin" / "lean", 0o755)
+        self.assertRejected(self.verify, "SHA-256 mismatch for bin/lean", "skipped `bin/lean --version`")
+        self.assertFalse(canary.exists(), "tampered bin/lean was executed before pin digest verification!")
 
 
 # ---------------------------------------------------------------------------

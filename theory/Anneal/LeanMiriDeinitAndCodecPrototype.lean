@@ -1720,12 +1720,30 @@ inductive PSlot : Type where
   | imm (b : Bytes)
   | mem (alloc : Nat)
 
-/-- Call-stack frame. -/
+/-- Memory place: allocation, byte window, and access provenance (`none` =
+direct access to the local, i.e. through the allocation's root tag). -/
+structure MPlace : Type where
+  alloc : Nat
+  offset : Nat
+  size : Nat
+  tag : Option Nat
+
+/-- An assignment or call destination, evaluated **before** the rvalue or call
+arguments (rustc `eval_rvalue_into_place` / `Call.evalCallTerminator` first
+runs `eval_place(dest)`, and `copyRuntimePlaceNoValidate` receives an
+already-resolved `RuntimePlace`). -/
+inductive DestPlace : Type where
+  | imm (l : Local)
+  | mem (mp : MPlace)
+
+/-- Call-stack frame (`retDest` caches the pre-resolved caller destination for
+`TerminatorKind.call`, matching `Miri.Interpreter.Frame.returnPlace`). -/
 structure PFrame : Type where
   body : Nat
   block : Nat
   stmt : Nat
   locals : List PSlot
+  retDest : Option DestPlace := none
 
 /-- Shared machine state. -/
 structure PState : Type where
@@ -1746,14 +1764,6 @@ def sliceBytes (b : Bytes) (off len : Nat) : Bytes := (b.drop off).take len
 
 def overwriteBytes (b : Bytes) (off : Nat) (w : Bytes) : Bytes :=
   b.take off ++ w ++ b.drop (off + w.length)
-
-/-- Memory place: allocation, byte window, and access provenance (`none` =
-direct access to the local, i.e. through the allocation's root tag). -/
-structure MPlace : Type where
-  alloc : Nat
-  offset : Nat
-  size : Nat
-  tag : Option Nat
 
 /-- LeanMiri `OpTy`: an already-loaded immediate or a reference to memory. -/
 inductive OpTy : Type where
@@ -1924,7 +1934,7 @@ inductive SemTerm : Type where
   | switchInt (d : SemOperand) (ts : SwitchTargets)
   | assert (c : SemOperand) (expected : Bool) (target : Nat) (unwind : UnwindAction)
   | call (callee : Option Nat) (calleeArgCount : Nat) (calleeLocals : List SemTy)
-      (args : List SemOperand)
+      (args : List SemOperand) (dest : SemPlace)
   | unwindResume (site : Option ReturnSite)
   | unreachable
   | unsupported
@@ -2053,14 +2063,7 @@ def writePlace (ptrBits : Nat) (st : PState) (dest : SemPlace) (b : Bytes) : Exc
   | .ok (.immediate _, _) => setLocalE st dest.local_ (.imm b)
   | .ok (.indirect mp, _) => storeMPlace st mp b
 
-/-- An assignment destination, evaluated **before** the rvalue (rustc
-`eval_rvalue_into_place` first runs `let dest = self.eval_place(place)?`, and
-`copyRuntimePlaceNoValidate` receives an already-resolved `RuntimePlace`). -/
-inductive DestPlace : Type where
-  | imm (l : Local)
-  | mem (mp : MPlace)
-
-/-- Resolve an assignment destination (and its type) against the current state. -/
+/-- Resolve an assignment or call destination (and its type) against the current state. -/
 def resolveDest (ptrBits : Nat) (st : PState) (dest : SemPlace) : Except Fault (DestPlace × SemTy) :=
   match evalPlaceToOp ptrBits st dest with
   | .error e => .error e
@@ -2493,7 +2496,14 @@ def execTerm (S : OperandStrategy) (pb : Nat) (st : PState) : SemTerm → StepOu
           match site with
           | none => .returned b
           | some rs =>
-            match writePlace pb (popFrame st₁) rs.dest b with
+            let wr :=
+              match st₁.frames with
+              | fr :: _ =>
+                match fr.retDest with
+                | some d => writeDest (popFrame st₁) d b
+                | none => writePlace pb (popFrame st₁) rs.dest b
+              | [] => writePlace pb (popFrame st₁) rs.dest b
+            match wr with
             | .error e => .fault e
             | .ok st₃ =>
               match rs.target with
@@ -2519,15 +2529,18 @@ def execTerm (S : OperandStrategy) (pb : Nat) (st : PState) : SemTerm → StepOu
           match unwind with
           | .cleanup bb => .running (jump st₁ bb)
           | _ => .panicked
-  | .call callee argc calleeLocals args =>
-    match readOperands S pb st args with
+  | .call callee argc calleeLocals args dest =>
+    match resolveDest pb st dest with
     | .error e => .fault e
-    | .ok (bs, st₁) =>
-      match callee with
-      | none => .fault .unsupported
-      | some bi =>
-        let r := allocLocals argc bs 0 st₁.heap calleeLocals
-        .running { st₁ with frames := ⟨bi, 0, 0, r.1⟩ :: st₁.frames, heap := r.2 }
+    | .ok (d, _) =>
+      match readOperands S pb st args with
+      | .error e => .fault e
+      | .ok (bs, st₁) =>
+        match callee with
+        | none => .fault .unsupported
+        | some bi =>
+          let r := allocLocals argc bs 0 st₁.heap calleeLocals
+          .running { st₁ with frames := ⟨bi, 0, 0, r.1, some d⟩ :: st₁.frames, heap := r.2 }
   | .unwindResume site =>
     match site with
     | none => .panicked
@@ -2888,16 +2901,16 @@ def annealResolveTerm (p : V2026Prog) (frames : List PFrame) (b : CapturedMir)
     match annealResolveOperand b c with
     | some c' => .assert c' e tgt u
     | none => .unsupported
-  | .call f args _ _ _ =>
-    match decodeList (annealResolveOperand b) args with
-    | none => .unsupported
-    | some args' =>
+  | .call f args dest _ _ =>
+    match annealResolvePlace b dest, decodeList (annealResolveOperand b) args with
+    | some dest', some args' =>
       match annealCallee p f with
-      | none => .call none 0 [] args'
+      | none => .call none 0 [] args' dest'
       | some bi =>
         match (nth? p.bodies bi).bind (fun cb => (annealResolveLocals cb).map (cb.argCount, ·)) with
-        | some (argc, tys) => .call (some bi) argc tys args'
+        | some (argc, tys) => .call (some bi) argc tys args' dest'
         | none => .unsupported
+    | _, _ => .unsupported
   | .unwindResume =>
     match annealSite p frames with
     | some site => .unwindResume site
@@ -3032,17 +3045,17 @@ def refResolveTerm (rp : RefProg) (frames : List PFrame) (b : RefBody) (t : RefT
     match refResolveOperand rp.types b c with
     | some c' => .assert c' e tgt u
     | none => .unsupported
-  | .call f args _ _ _ =>
-    match decodeList (refResolveOperand rp.types b) args with
-    | none => .unsupported
-    | some args' =>
+  | .call f args dest _ _ =>
+    match refResolvePlace rp.types b dest, decodeList (refResolveOperand rp.types b) args with
+    | some dest', some args' =>
       match refCallee rp f with
-      | none => .call none 0 [] args'
+      | none => .call none 0 [] args' dest'
       | some bi =>
         match (nth? rp.bodies bi).bind
             (fun cb => (refResolveLocals rp.types cb).map (cb.argCount, ·)) with
-        | some (argc, tys) => .call (some bi) argc tys args'
+        | some (argc, tys) => .call (some bi) argc tys args' dest'
         | none => .unsupported
+    | _, _ => .unsupported
   | .unwindResume =>
     match refSite rp frames with
     | some site => .unwindResume site
@@ -3129,7 +3142,7 @@ def refRunFuel (dm : Bool) (rp : RefProg) : Nat → RefState → RefOutcome
 /-- Entry state from resolved entry-body local types. -/
 def initFromLocals (entry : Nat) (argCount : Nat) (args : List Bytes) (tys : List SemTy) : PState :=
   let r := allocLocals argCount args 0 [] tys
-  { frames := [⟨entry, 0, 0, r.1⟩], heap := r.2, borrows := [], nextTag := 1,
+  { frames := [⟨entry, 0, 0, r.1, none⟩], heap := r.2, borrows := [], nextTag := 1,
     pendingMoveDeinit := false }
 
 def annealInit (p : V2026Prog) (args : List Bytes) : Except Fault PState :=
@@ -3368,23 +3381,27 @@ theorem refResolveTerm_encode (p : V2026Prog) (frames : List PFrame) (b : Captur
   case assert c e tgt u => rw [refResolveOperand_encode b c hd h]
   case unwindResume => rw [refSite_encode]
   case call f args dest target unwind =>
-    rw [refResolveOperands_encode b args hd h.append.1.append.2]
-    cases decodeList (annealResolveOperand b) args with
+    rw [refResolvePlace_encode b dest hd h.append.2,
+        refResolveOperands_encode b args hd h.append.1.append.2]
+    cases annealResolvePlace b dest with
     | none => rfl
-    | some args' =>
-      simp only
-      rw [refCallee_encode p f h.append.1.append.1]
-      cases hc : annealCallee p f with
+    | some dest' =>
+      cases decodeList (annealResolveOperand b) args with
       | none => rfl
-      | some bi =>
-        simp only [encodeProg_bodies, nth?_map]
-        cases hcb : nth? p.bodies bi with
+      | some args' =>
+        simp only
+        rw [refCallee_encode p f h.append.1.append.1]
+        cases hc : annealCallee p f with
         | none => rfl
-        | some cb =>
-          simp only [Option.map_some, Option.bind_some]
-          rw [refResolveLocals_encode cb
-            (bodyCovered_decls (encodeProg_body_covered p cb (mem_of_nth? hcb)))]
-          rfl
+        | some bi =>
+          simp only [encodeProg_bodies, nth?_map]
+          cases hcb : nth? p.bodies bi with
+          | none => rfl
+          | some cb =>
+            simp only [Option.map_some, Option.bind_some]
+            rw [refResolveLocals_encode cb
+              (bodyCovered_decls (encodeProg_body_covered p cb (mem_of_nth? hcb)))]
+            rfl
 
 /-- **Fetch/resolve correspondence**: for every program and every state,
 `M_ref`'s fetch of `encodeProg p` equals `M_anneal`'s fetch of `p`. -/
@@ -3835,6 +3852,33 @@ theorem canary_D7_uninit_arg_ub_before_unsupported :
 theorem canary_D7_unresolved_callee_unsupported :
     bothObs (d7Unresolved (cU8 1)) = (.unsupported, .unsupported) := by decide
 
+/-- `Call` destination `*_2` is resolved at call entry (before `move _2`
+deinitializes `_2`), matching `Miri.Interpreter.Call.evalCallTerminator`
+(`Call.lean:453`). When `callee` returns `42`, it writes through the
+pre-resolved `*_2` into `_1`, and the caller returns `42`. -/
+def d7DestCallee : CapturedMir := mkBody "callee" 1 [tU8, tRaw]
+  [blk [asg (loc 0) (.use (cU8 42))] .return_]
+
+def d7DestBeforeArgMove : V2026Prog := ⟨[mkBody "caller" 0 [tU8, tU8, tRaw]
+  [blk [asg (loc 1) (.use (cU8 5)), asg (loc 2) (.rawPtr .mut (loc 1))]
+     (.call (.constant ⟨tFnCallee, .zeroSized⟩) [.move (loc 2)] (drf 2) (some 1) .continue_),
+   blk [asg (loc 0) (.use (.copy (loc 1)))] .return_], d7DestCallee], 0⟩
+
+theorem canary_D7_call_dest_resolved_before_arg_move :
+    bothObs d7DestBeforeArgMove = (.returned (some 42) 1, .returned (some 42) 1) := by
+  decide
+
+/-- An invalid `Call` destination (`*_2` where `_2` is uninitialized) faults
+with `.ub .invalidPointer` at call entry *before* evaluating arguments or
+reporting `.unsupported` on an unresolved callee. -/
+def d7BadDestBeforeUnresolved : V2026Prog := prog1 <| mkBody "caller" 0 [tU8, tU8, tRaw]
+  [blk [] (.call (.constant ⟨tFnUnresolved, .zeroSized⟩) [cU8 1] (drf 2) (some 1) .continue_),
+   blk [] .return_]
+
+theorem canary_D7_call_bad_dest_ub_before_unsupported :
+    bothObs d7BadDestBeforeUnresolved = (.ub .invalidPointer, .ub .invalidPointer) := by
+  decide
+
 /-! ### `D8` — unwind / cleanup paths -/
 
 def d8Assert (cleanupRead : Nat) : V2026Prog := prog1 <| mkBody "d8" 0 [tU8, tBool, tU8]
@@ -3979,6 +4023,37 @@ theorem batched_call_args_lose_move_deinit :
       some false ∧
     (d7PreCallState.map fun st => argsKeepSource (readOperandsBatched true 64 st d7ArgOps)) =
       some true := by
+  decide
+
+/-- Models the unpatched `Miri.Interpreter.Call.evalFnCallArgumentAt`
+(`lean-miri/vendor/Miri/Interpreter/Call.lean:164-175`) under the 6-file
+`d9b41b58b` patch: `.Copy` and `.Constant` route through `evalOperandAt`
+(`twoPhaseReadOperand true`), whereas `.Move p` calls `evalPlace` + `placeToOp`
+(`evalPlaceToOp`) directly without calling `OperandMachine.evalOperand`, so
+neither immediate locals are deinitialized nor `pendingMoveDeinit := true` is
+set before `passArgument`'s `copyAllowTransmute`. -/
+def unpatchedCallEvalFnCallArgReadOperand (ptrBits : Nat) (st : PState) (op : SemOperand) :
+    Except Fault (Bytes × PState) :=
+  match op with
+  | .move p =>
+    match evalPlaceToOp ptrBits st p with
+    | .error e => .error e
+    | .ok (o, ty) => refReadImmediate true st o ty
+  | _ => twoPhaseReadOperand true ptrBits st op
+
+def unpatchedCallEvalFnCallArgStrategy : OperandStrategy :=
+  ⟨unpatchedCallEvalFnCallArgReadOperand, twoPhaseAssignUse true⟩
+
+/-- **7th-file soundness finding (`Miri/Interpreter/Call.lean:168-175`)**:
+because `Call.evalFnCallArgumentAt` bypasses `OperandMachine.evalOperand` on
+`.Move place`, applying only the 6-file `d9b41b58b` patch leaves moved call
+arguments initialized in the caller frame (`d7Prog (.move (loc 1))` falsely
+returns `5` instead of faulting with `.ub .invalidUninitBytes`). -/
+theorem call_evalFnCallArgumentAt_bypasses_evalOperand_falsified :
+    annealObs (d7Prog (.move (loc 1))) [] 40 = .ub .invalidUninitBytes ∧
+    refObs true (encodeProg (d7Prog (.move (loc 1)))) [] 40 = .ub .invalidUninitBytes ∧
+    refObsWith unpatchedCallEvalFnCallArgStrategy (encodeProg (d7Prog (.move (loc 1)))) [] 40 =
+      .returned (some 5) 1 := by
   decide
 
 /-! ## Part 9 — Tree Borrows: moving out of `*ptr` is not a write -/
@@ -4556,6 +4631,232 @@ borrow that does not overlap the destination, which stays `.frozen`). -/
 theorem deinitMovedPlace_assignUse_preserves_tb_tags_nonvacuous : tbAssignWitness = true := by
   decide
 
+/-! ## Part 10d — Step-boundary latch invariant (`pendingMoveDeinit = false`) -/
+
+theorem setLocalE_latch {st st' : PState} {l : Local} {v : PSlot}
+    (h : setLocalE st l v = .ok st') : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  unfold setLocalE at h
+  cases hf : st.frames with
+  | nil => rw [hf] at h; cases h
+  | cons fr rest =>
+    rw [hf] at h; simp only at h
+    cases hs : setNth? fr.locals l v with
+    | none => rw [hs] at h; cases h
+    | some ls => rw [hs] at h; cases h; rfl
+
+theorem putHeap_latch {st st' : PState} {a : Nat} {b : Bytes}
+    (h : putHeap st a b = .ok st') : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  unfold putHeap at h
+  cases hs : setNth? st.heap a (some b) with
+  | none => rw [hs] at h; cases h
+  | some hp => rw [hs] at h; cases h; rfl
+
+theorem loadMPlace_latch {st st' : PState} {mp : MPlace} {b : Bytes}
+    (h : loadMPlace st mp = .ok (b, st')) : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  unfold loadMPlace at h
+  cases hg : heapGet st mp.alloc with
+  | none => rw [hg] at h; cases h
+  | some bs =>
+    rw [hg] at h; simp only at h
+    cases hb : Nat.ble (mp.offset + mp.size) bs.length with
+    | false => rw [hb] at h; cases h
+    | true =>
+      rw [hb] at h
+      cases ht : tbAccess .read st.borrows mp.alloc mp.tag mp.offset mp.size with
+      | none => rw [ht] at h; cases h
+      | some bs' => rw [ht] at h; cases h; rfl
+
+theorem storeMPlace_latch {st st' : PState} {mp : MPlace} {b : Bytes}
+    (h : storeMPlace st mp b = .ok st') : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  unfold storeMPlace at h
+  cases hg : heapGet st mp.alloc with
+  | none => rw [hg] at h; cases h
+  | some bs =>
+    rw [hg] at h; simp only at h
+    cases hb : (Nat.ble (mp.offset + mp.size) bs.length && Nat.beq b.length mp.size) with
+    | false => rw [hb] at h; cases h
+    | true =>
+      rw [hb] at h; simp only at h
+      cases ht : tbAccess .write st.borrows mp.alloc mp.tag mp.offset mp.size with
+      | none => rw [ht] at h; cases h
+      | some bs' => rw [ht] at h; simp only at h; have hl := putHeap_latch h; exact hl
+
+theorem deinitMPlaceRaw_latch {st st' : PState} {mp : MPlace}
+    (h : deinitMPlaceRaw st mp = .ok st') : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  unfold deinitMPlaceRaw at h
+  cases hg : heapGet st mp.alloc with
+  | none => rw [hg] at h; cases h
+  | some b =>
+    rw [hg] at h; simp only at h
+    cases hb : Nat.ble (mp.offset + mp.size) b.length with
+    | false => rw [hb] at h; cases h
+    | true => rw [hb] at h; exact putHeap_latch h
+
+theorem writeDest_latch {st st' : PState} {d : DestPlace} {b : Bytes}
+    (h : writeDest st d b = .ok st') : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  cases d with
+  | imm l => exact setLocalE_latch h
+  | mem mp => exact storeMPlace_latch h
+
+theorem readOpBytes_latch {st st' : PState} {o : OpTy} {b : Bytes}
+    (h : readOpBytes st o = .ok (b, st')) : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  cases o with
+  | immediate _ => cases h; rfl
+  | indirect mp => exact loadMPlace_latch h
+
+theorem copyMemPath_latch {st st' : PState} {src : MPlace} {d : DestPlace}
+    (h : copyMemPath st src d = .ok st') : st'.pendingMoveDeinit = st.pendingMoveDeinit := by
+  cases d with
+  | imm _ => cases h
+  | mem dmp =>
+    simp only [copyMemPath] at h
+    cases hl : loadMPlace st src with
+    | error e => rw [hl] at h; cases h
+    | ok r =>
+      rw [hl] at h; simp only at h
+      cases ho : placesOverlap src dmp with
+      | true => rw [ho] at h; cases h
+      | false => rw [ho] at h; exact (storeMPlace_latch h).trans (loadMPlace_latch hl)
+
+/-- Every successful `twoPhaseReadOperand true` (and `annealReadOperand`) step
+leaves `pendingMoveDeinit = false`, regardless of the incoming latch state. -/
+theorem twoPhaseReadOperand_true_latch_clear (pb : Nat) (st st' : PState)
+    (op : SemOperand) (b : Bytes)
+    (h : twoPhaseReadOperand true pb st op = .ok (b, st')) :
+    st'.pendingMoveDeinit = false := by
+  rw [twoPhaseReadOperand_true_eq] at h
+  cases op with
+  | const cb ty =>
+    simp only [annealReadOperand] at h
+    cases hv : checkValid ty cb <;> rw [hv] at h <;> cases h; rfl
+  | copy p =>
+    simp only [annealReadOperand] at h
+    cases he : evalPlaceToOp pb (clearLatch st) p with
+    | error e => rw [he] at h; cases h
+    | ok r =>
+      obtain ⟨o, ty⟩ := r; rw [he] at h; simp only at h
+      cases hr : readOpBytes (clearLatch st) o with
+      | error e => rw [hr] at h; cases h
+      | ok r' =>
+        obtain ⟨rb, st₁⟩ := r'; rw [hr] at h; simp only at h
+        cases hv : checkValid ty rb <;> rw [hv] at h <;> cases h
+        exact readOpBytes_latch hr
+  | move p =>
+    simp only [annealReadOperand] at h
+    cases he : evalPlaceToOp pb (clearLatch st) p with
+    | error e => rw [he] at h; cases h
+    | ok r =>
+      obtain ⟨o, ty⟩ := r; rw [he] at h
+      cases o with
+      | immediate bb =>
+        simp only at h
+        cases hp : p.projs with
+        | cons _ _ => rw [hp] at h; cases h
+        | nil =>
+          rw [hp] at h; simp only at h
+          cases hs : setLocalE (clearLatch st) p.local_ (.imm (uninitBytes bb.length)) with
+          | error e => rw [hs] at h; cases h
+          | ok st₁ =>
+            rw [hs] at h; simp only at h
+            cases hv : checkValid ty bb <;> rw [hv] at h <;> cases h; rfl
+      | indirect mp =>
+        simp only at h
+        cases hl : loadMPlace (clearLatch st) mp with
+        | error e => rw [hl] at h; cases h
+        | ok r' =>
+          obtain ⟨bb, st₁⟩ := r'; rw [hl] at h; simp only at h
+          cases hv : checkValid ty bb with
+          | error e => rw [hv] at h; cases h
+          | ok u =>
+            rw [hv] at h; simp only at h
+            cases hd : deinitMPlaceRaw st₁ mp with
+            | error e => rw [hd] at h; cases h
+            | ok st₂ =>
+              rw [hd] at h; cases h
+              exact (deinitMPlaceRaw_latch hd).trans (loadMPlace_latch hl)
+
+/-- Every successful `twoPhaseAssignUse true` (and `annealAssignUse`) step
+leaves `pendingMoveDeinit = false`, regardless of the incoming latch state. -/
+theorem twoPhaseAssignUse_true_latch_clear (pb : Nat) (st st' : PState)
+    (op : SemOperand) (d : DestPlace)
+    (h : twoPhaseAssignUse true pb st op d = .ok st') :
+    st'.pendingMoveDeinit = false := by
+  rw [twoPhaseAssignUse_true_eq] at h
+  cases op with
+  | const cb ty =>
+    simp only [annealAssignUse] at h
+    cases hv : checkValid ty cb with
+    | error e => rw [hv] at h; cases h
+    | ok u => rw [hv] at h; exact writeDest_latch h
+  | copy p =>
+    simp only [annealAssignUse] at h
+    cases he : evalPlaceToOp pb (clearLatch st) p with
+    | error e => rw [he] at h; cases h
+    | ok r =>
+      obtain ⟨o, ty⟩ := r; rw [he] at h
+      cases o with
+      | immediate bb =>
+        simp only [readOpBytes] at h
+        cases hv : checkValid ty bb with
+        | error e => rw [hv] at h; cases h
+        | ok u => rw [hv] at h; exact writeDest_latch h
+      | indirect src =>
+        simp only at h
+        cases hm : usesMemoryPath ty (.indirect src) with
+        | true => rw [hm] at h; exact copyMemPath_latch h
+        | false =>
+          rw [hm] at h; simp only [readOpBytes] at h
+          cases hl : loadMPlace (clearLatch st) src with
+          | error e => rw [hl] at h; cases h
+          | ok r' =>
+            obtain ⟨bb, st₁⟩ := r'; rw [hl] at h; simp only at h
+            cases hv : checkValid ty bb with
+            | error e => rw [hv] at h; cases h
+            | ok u => rw [hv] at h; exact (writeDest_latch h).trans (loadMPlace_latch hl)
+  | move p =>
+    simp only [annealAssignUse] at h
+    cases he : evalPlaceToOp pb (clearLatch st) p with
+    | error e => rw [he] at h; cases h
+    | ok r =>
+      obtain ⟨o, ty⟩ := r; rw [he] at h
+      cases o with
+      | immediate bb =>
+        simp only at h
+        cases hp : p.projs with
+        | cons _ _ => rw [hp] at h; cases h
+        | nil =>
+          rw [hp] at h; simp only at h
+          cases hs : setLocalE (clearLatch st) p.local_ (.imm (uninitBytes bb.length)) with
+          | error e => rw [hs] at h; cases h
+          | ok st₁ =>
+            rw [hs] at h; simp only at h
+            cases hv : checkValid ty bb with
+            | error e => rw [hv] at h; cases h
+            | ok u => rw [hv] at h; exact writeDest_latch h
+      | indirect src =>
+        simp only at h
+        cases hm : usesMemoryPath ty (.indirect src) with
+        | true =>
+          rw [hm] at h; simp only at h
+          cases hc : copyMemPath (clearLatch st) src d with
+          | error e => rw [hc] at h; cases h
+          | ok st₁ => rw [hc] at h; exact (deinitMPlaceRaw_latch h).trans (copyMemPath_latch hc)
+        | false =>
+          rw [hm] at h; simp only at h
+          cases hl : loadMPlace (clearLatch st) src with
+          | error e => rw [hl] at h; cases h
+          | ok r' =>
+            obtain ⟨bb, st₁⟩ := r'; rw [hl] at h; simp only at h
+            cases hv : checkValid ty bb with
+            | error e => rw [hv] at h; cases h
+            | ok u =>
+              rw [hv] at h; simp only at h
+              cases hd : deinitMPlaceRaw st₁ src with
+              | error e => rw [hd] at h; cases h
+              | ok st₂ =>
+                rw [hd] at h
+                exact (writeDest_latch h).trans ((deinitMPlaceRaw_latch hd).trans (loadMPlace_latch hl))
+
 /-! ## Part 11 — Axiom guards (kernel axioms ⊆ {propext, Quot.sound}) -/
 
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.decodeType_encodeType' depends on axioms: [propext, Quot.sound] -/
@@ -4869,6 +5170,26 @@ theorem deinitMovedPlace_assignUse_preserves_tb_tags_nonvacuous : tbAssignWitnes
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.writeDest_nonoverlap_unchanged' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms writeDest_nonoverlap_unchanged
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_D7_call_dest_resolved_before_arg_move' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_D7_call_dest_resolved_before_arg_move
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_D7_call_bad_dest_ub_before_unsupported' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_D7_call_bad_dest_ub_before_unsupported
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.call_evalFnCallArgumentAt_bypasses_evalOperand_falsified' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms call_evalFnCallArgumentAt_bypasses_evalOperand_falsified
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.twoPhaseReadOperand_true_latch_clear' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms twoPhaseReadOperand_true_latch_clear
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.twoPhaseAssignUse_true_latch_clear' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms twoPhaseAssignUse_true_latch_clear
 
 /-! ## Part 12 — Whole-environment audit
 
