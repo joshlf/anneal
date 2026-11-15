@@ -77,7 +77,6 @@ def fixtureLayouts : LayoutTable :=
   { Anneal.PureMirExec.pureAdtMultiBlockBody.layouts with
     entries := Anneal.PureMirExec.pureAdtMultiBlockBody.layouts.entries ++ [u32PairRustcLayout] }
 
-def u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
 def pairTy : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }
 def refU32Ty : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
 def refPairTy : Ty := { kind := .ref .mut (.tuple [.uint .u32, .uint .u32]), layoutIdx := 0 }
@@ -873,6 +872,142 @@ theorem db_sound (c : Bool) :
          fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
      Or.inl ⟨rfl, rfl, rfl⟩⟩
 
+/-! ### Test 2c: 3-Block `while` Loop with Back-Edge (`CfgCertificate.whileLoop` + `mir_cfgCertificate_sound`) -/
+
+/-- `fn loop_borrow(mut flag: bool, mut x: u32) -> u32 {
+  while flag { let r = &mut x; *r = 42; flag = false; } x
+}` across 3 basic blocks (`bb0` header, `bb1` loop body with back-edge `.goto 0`,
+`bb2` exit). -/
+def loopBorrowBody : CapturedMir :=
+  mkBody 2
+    [decl .mut u32Ty, decl .mut boolTy, decl .mut u32Ty, decl .not refU32Ty]
+    [mkBb [] (.switchInt (.copy (pl 1)) ⟨[(1, 1)], 2⟩),
+     mkBb
+       [mkSt (.storageLive 3),
+        mkSt (.assign (pl 3) (.ref (.mut false) (pl 2))),
+        mkSt (.assign (pl 3 [.deref]) (.use (u32C 42))),
+        mkSt (.assign (pl 1) (.use (.constant { ty := boolTy, val := .scalar (.int ⟨0, 1⟩) })))]
+       (.goto 0),
+     mkBb
+       [mkSt (.assign (pl 0) (.use (.copy (pl 2)))),
+        mkSt (.storageDead 3)]
+       .return_]
+
+def lbMs0 : MachineState :=
+  initMachineState loopBorrowBody [.scalar ⟨1, 1⟩, .scalar ⟨7, 4⟩]
+
+def lbBodyPlan : FlowPlan StdVal :=
+  .seq (.act (.borrow 2 .mutBorrow (.localSub 1 [])))
+    (.seq (.act (.assign (.derefSub 2 []) (.constVal (.nat 42))))
+      (.seq (.act (.endLoan 0))
+        (.act (.assign (.localSub 0 []) (.constVal (.bool false))))))
+
+theorem lbBodyPlan_wf : WfPlan stdValAlg lbBodyPlan := fun _ => rfl
+
+theorem lbBodyPlan_continuing :
+    ∀ s f, evalPlan stdValAlg lbBodyPlan s = .ok f → Exists fun s' => f = .continuing s' :=
+  evalPlan_seq_continuing stdValAlg (fun _ => rfl) (fun _ => rfl)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_seq_continuing stdValAlg (fun _ => rfl) (fun _ => rfl)
+      (evalPlan_act_continuing stdValAlg _)
+      (evalPlan_seq_continuing stdValAlg (fun _ => rfl) (fun _ => rfl)
+        (evalPlan_act_continuing stdValAlg _) (evalPlan_act_continuing stdValAlg _)))
+
+def loopBorrowCert : CfgCertificate stdValAlg :=
+  CfgCertificate.whileLoop stdValAlg 1 (.use (.localSub 0 [])) lbBodyPlan
+    (.use (.localSub 1 [])) lbBodyPlan_wf lbBodyPlan_continuing
+
+def lbSt0 : SymState StdVal :=
+  ⟨[⟨.bool true, .unborrowed⟩, ⟨.nat 7, .unborrowed⟩], [], [], [], [], 0⟩
+
+def lbStAfterIter : SymState StdVal :=
+  ⟨[⟨.bool false, .unborrowed⟩, ⟨.nat 42, .unborrowed⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .ended, ⟨.nat 42, .unborrowed⟩, .direct (.localReg 1) []⟩],
+   [], [], [], 0⟩
+
+def lbMsBody : MachineState :=
+  { lbMs0 with frame := { lbMs0.frame with blockIdx := 1, stmtIdx := 0 } }
+
+def lbMsAfterIter : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨42, 4⟩), .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { lbMs0.memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .active }]
+        nextTag := 2 } }
+
+def lbMsExit : MachineState :=
+  { lbMsAfterIter with frame := { lbMsAfterIter.frame with blockIdx := 2, stmtIdx := 0 } }
+
+def lbBlockInv (bb : Nat) (st : SymState StdVal) : Prop :=
+  (bb = 0 ∧ st = lbSt0) ∨
+  (bb = 1 ∧ st = lbSt0) ∨
+  (bb = 0 ∧ st = lbStAfterIter) ∨
+  (bb = 2 ∧ st = lbStAfterIter)
+
+def lbExtra (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  (bb = 0 ∧ st = lbSt0 ∧ ms = lbMs0) ∨
+  (bb = 1 ∧ st = lbSt0 ∧ ms = lbMsBody) ∨
+  (bb = 0 ∧ st = lbStAfterIter ∧ ms = lbMsAfterIter) ∨
+  (bb = 2 ∧ st = lbStAfterIter ∧ ms = lbMsExit)
+
+/-- **Test 2c (3-block while-loop adequacy via `CfgCertificate.whileLoop` and
+`mir_cfgCertificate_sound`)**: verifies `loopBorrowBody` across `bb0 -> bb1 ->
+bb0 -> bb2`, matching the loop header branch, the back-edge jump `bb1 -> bb0`,
+and the exit jump `bb0 -> bb2` with `runMirToBlock`. -/
+theorem loopBorrow_cfgCertificate_sound :
+    Anneal.MirFuelFree.MirWpConverges loopBorrowBody lbMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .nat 42)) := by
+  have hRel0 : mirStateRel tagOfLoan [] lbSt0 lbMs0 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool true⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelBody : mirStateRel tagOfLoan [] lbSt0 lbMsBody :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool true⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelAfter : mirStateRel tagOfLoan [] lbStAfterIter lbMsAfterIter :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool false⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  have hRelExit : mirStateRel tagOfLoan [] lbStAfterIter lbMsExit :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool false⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  refine mir_cfgCertificate_sound tagOfLoan loopBorrowBody loopBorrowCert
+    [⟨.byVal, .bool true⟩, ⟨.byVal, .nat 7⟩] lbSt0 (fun out => out.ret = .nat 42)
+    (fun _ => []) id lbExtra [] rfl rfl lbBlockInv (fun out => out = ⟨.nat 42, []⟩)
+    ?_ ?_ (Or.inl ⟨rfl, rfl⟩) ?_ ⟨fun _ => rfl, rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
+  · intro bb st hInv
+    rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+    · exact Or.inr (Or.inl ⟨rfl, rfl⟩)
+    · exact Or.inr (Or.inr (Or.inl ⟨rfl, rfl⟩))
+    · exact Or.inr (Or.inr (Or.inr ⟨rfl, rfl⟩))
+    · exact rfl
+  · intro bb st hInv _ _ _ _ h
+    rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;> exact nomatch h
+  · intro s ms ⟨hW, _, _, _, hEx⟩
+    cases s with
+    | mk w bb st =>
+      have hwEq : w = (fun o => o) := funext hW
+      subst hwEq
+      rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+      · exact stepsTo_of_runMirToBlock_reached
+          (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 1 lbMs0 = .reached lbMsBody)
+          ⟨fun _ => rfl, rfl, rfl, hRelBody, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      · exact stepsTo_of_runMirToBlock_reached
+          (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 0 lbMsBody = .reached lbMsAfterIter)
+          ⟨fun _ => rfl, rfl, rfl, hRelAfter, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
+      · exact stepsTo_of_runMirToBlock_reached
+          (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 2 lbMsAfterIter = .reached lbMsExit)
+          ⟨fun _ => rfl, rfl, rfl, hRelExit, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+      · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+
 /-! ## Test 3: Hybrid `SpatialPin` Freeze → `zerocopy` Byte Write → Unpin -/
 
 /-- `fn patch_low_byte(v: u32) -> u32 { let mut x = v; let p = &raw mut x;
@@ -1490,6 +1625,71 @@ theorem swapped_layout_window_ne :
   simp only [Option.bind_some, Anneal.SepLogicLenses.ByteLensCodec.decode_encode,
     Option.some.injEq, Prod.mk.injEq, Subtype.mk.injEq] at h2
   exact absurd h2.1 (by decide)
+
+/-- **`FromBytes` and `IntoBytes` for `(u32, u32)` across unindexed, captured
+in-order (`[0, 4]`), and reordered (`[4, 0]`) rustc layouts**. -/
+theorem u32Pair_bitValidity_across_layouts :
+    Anneal.BitValidity.IsFromBytes zcLayouts (u32PairTy 99) ∧
+    Anneal.BitValidity.IsIntoBytes zcLayouts (u32PairTy 99) ∧
+    Anneal.BitValidity.IsFromBytes zcLayouts pairTy ∧
+    Anneal.BitValidity.IsIntoBytes zcLayouts pairTy ∧
+    Anneal.BitValidity.IsFromBytes swappedLayouts pairTy ∧
+    Anneal.BitValidity.IsIntoBytes swappedLayouts pairTy ∧
+    Anneal.SepLogicLenses.FieldsTyped u32ExactLE 4 u32ExactLE 0
+      (u32PairReorderedExactLE.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩)) :=
+  ⟨u32Pair_isFromBytes rfl,
+   u32Pair_isIntoBytes rfl,
+   u32PairLayout_isFromBytes (l := u32PairRustcLayout) (mem := [0, 1]) rfl rfl rfl,
+   u32PairLayout_isIntoBytes (l := u32PairRustcLayout) (mem := [0, 1]) rfl rfl rfl,
+   u32PairReorderedLayout_isFromBytes (l := u32PairSwappedLayout) (mem := [1, 0]) rfl rfl rfl,
+   u32PairReorderedLayout_isIntoBytes (l := u32PairSwappedLayout) (mem := [1, 0]) rfl rfl rfl,
+   (u32PairReorderedExactLE_encode_fieldsTyped ⟨7, by decide⟩ ⟨zcV0, by decide⟩).1⟩
+
+/-- rustc's `tcx.layout_of((u8, u32))` with 3 alignment-padding bytes `[1..4)`:
+size `8`, align `4`, and `FieldsShape.arbitrary` offsets `[0, 4]`. -/
+def u8U32RustcLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr :=
+      .scalarPair (.initialized (.int 8 false) ⟨0, 255⟩)
+        (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+    isUninhabited := false }
+
+def u8U32Layouts : LayoutTable :=
+  { fixtureLayouts with
+    entries :=
+      Anneal.PureMirExec.pureAdtMultiBlockBody.layouts.entries ++ [u8U32RustcLayout] }
+
+/-- **Heterogeneous padded `(u8, u32)` layout trichotomy**: under `u8U32RustcLayout`
+(size `8`, offsets `[0, 4]`, 3 padding bytes at `[1..4)`):
+1. `encodeValueToBytes` leaves bytes `1..3` as `.uninit`, and that padded buffer
+   satisfies `FieldsTyped u8ExactLE 0 u32ExactLE 4`;
+2. `decodeValueFromBytes` decodes `(u8, u32)` even when bytes `1..3` are `.uninit`;
+3. `(u8, u32)` is `IsFromBytes` and `IsTryFromBytes`, but **not** `IsIntoBytes`
+   (`¬ IsIntoBytes u8U32Layouts (u8U32Ty 1)`). -/
+theorem u8U32_padded_layout_trichotomy :
+    let padUninit : List AbstractByte := [.uninit, .uninit, .uninit]
+    let bsEnc :=
+      u8ExactLE.encode ⟨7, by decide⟩ ++ padUninit ++ u32ExactLE.encode ⟨zcV0, by decide⟩
+    encodeValueToBytes defaultCodecFuel u8U32Layouts (u8U32Ty 1)
+      (.aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨zcV0, 4⟩]) = some bsEnc ∧
+    Anneal.SepLogicLenses.FieldsTyped u8ExactLE 0 u32ExactLE 4 bsEnc ∧
+    decodeValueFromBytes defaultCodecFuel u8U32Layouts (u8U32Ty 1) bsEnc =
+      some (.aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨zcV0, 4⟩]) ∧
+    Anneal.BitValidity.IsFromBytes u8U32Layouts (u8U32Ty 1) ∧
+    Anneal.BitValidity.IsTryFromBytes u8U32Layouts (u8U32Ty 1)
+      (fun v => Exists fun (x : {v : Nat // v < 256 ^ 1}) =>
+        Exists fun (y : {v : Nat // v < 256 ^ 4}) =>
+          v = .aggregate 0 [.scalar ⟨x.val, 1⟩, .scalar ⟨y.val, 4⟩]) ∧
+    ¬ Anneal.BitValidity.IsIntoBytes u8U32Layouts (u8U32Ty 1) := by
+  intro padUninit bsEnc
+  exact ⟨encodeValueToBytes_u8U32PaddedLayout
+      (l := u8U32RustcLayout) (mem := [0, 1]) rfl rfl rfl ⟨7, by decide⟩ ⟨zcV0, by decide⟩,
+    (u8U32Padded_encode_fieldsTyped ⟨7, by decide⟩ ⟨zcV0, by decide⟩ padUninit rfl).1,
+    rfl,
+    u8U32Padded_isFromBytes (l := u8U32RustcLayout) (mem := [0, 1]) rfl rfl rfl,
+    u8U32Padded_isTryFromBytes (l := u8U32RustcLayout) (mem := [0, 1]) rfl rfl rfl,
+    u8U32Padded_not_isIntoBytes (l := u8U32RustcLayout) (mem := [0, 1]) rfl rfl rfl⟩
 
 /-! ### Test 3d: Hybrid Pin with an Active Unpinned Sibling Loan (General Frame Rules) -/
 

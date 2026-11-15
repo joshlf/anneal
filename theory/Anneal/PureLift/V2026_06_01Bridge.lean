@@ -1997,6 +1997,134 @@ theorem mir_cfgCertificate_sound (tagOf : LoanId → Nat) (body : CapturedMir)
       BlockInv PostRet hLocal hNoFork hInv0)
     hR0
 
+/-- If `body` produces only `.continuing` flows, then `runWhileFlowSteps`
+produces only `.continuing` flows for any fuel bound `k`. -/
+theorem runWhileFlowSteps_continuing {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val)
+    (hBody : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s') :
+    ∀ (k : Nat) (s : SymState Val) (f : ExecFlow Val),
+      runWhileFlowSteps alg cond (evalPlan alg body) k s = .ok f →
+      Exists fun sFinal => f = .continuing sFinal
+  | 0, s, f, h => by
+    rw [runWhileFlowSteps_zero] at h
+    cases hC : evalRval alg cond s with
+    | none => rw [hC] at h; exact nomatch h
+    | some cv =>
+      rw [hC] at h
+      dsimp only at h
+      cases hB : alg.asBool cv with
+      | none => rw [hB] at h; exact nomatch h
+      | some b =>
+        rw [hB] at h
+        cases b with
+        | true => exact nomatch h
+        | false =>
+          injection h with hf
+          exact ⟨s, hf.symm⟩
+  | k + 1, s, f, h => by
+    rw [runWhileFlowSteps_succ] at h
+    cases hC : evalRval alg cond s with
+    | none => rw [hC] at h; exact nomatch h
+    | some cv =>
+      rw [hC] at h
+      dsimp only at h
+      cases hB : alg.asBool cv with
+      | none => rw [hB] at h; exact nomatch h
+      | some b =>
+        rw [hB] at h
+        cases b with
+        | false =>
+          injection h with hf
+          exact ⟨s, hf.symm⟩
+        | true =>
+          dsimp only at h
+          cases hEv : evalPlan alg body s with
+          | fail => rw [hEv] at h; exact nomatch h
+          | ok fb =>
+            obtain ⟨s', hfb⟩ := hBody s fb hEv
+            subst hfb
+            rw [hEv] at h
+            exact runWhileFlowSteps_continuing alg cond body hBody k s' f h
+
+theorem evalPlan_act {Val : Type} (alg : ValAlgebra Val) (a : PrimAction Val)
+    (s : SymState Val) :
+    evalPlan alg (.act a) s =
+      (match stepAction alg a s with
+       | .ok st' => .ok (.continuing st')
+       | .fail => .fail) := rfl
+
+theorem evalPlan_act_continuing {Val : Type} (alg : ValAlgebra Val) (a : PrimAction Val) :
+    ∀ s f, evalPlan alg (.act a) s = .ok f → Exists fun s' => f = .continuing s' := by
+  intro s f h
+  rw [evalPlan_act alg a s] at h
+  cases hs : stepAction alg a s with
+  | fail => rw [hs] at h; exact nomatch h
+  | ok s' => rw [hs] at h; injection h with hf; exact ⟨s', hf.symm⟩
+
+theorem evalPlan_seq_continuing {Val : Type} (alg : ValAlgebra Val) {p1 p2 : FlowPlan Val}
+    (hWf1 : WfPlan alg p1) (hWf2 : WfPlan alg p2)
+    (h1 : ∀ s f, evalPlan alg p1 s = .ok f → Exists fun s' => f = .continuing s')
+    (h2 : ∀ s f, evalPlan alg p2 s = .ok f → Exists fun s' => f = .continuing s') :
+    ∀ s f, evalPlan alg (.seq p1 p2) s = .ok f → Exists fun s' => f = .continuing s' := by
+  intro s f h
+  rw [evalPlan_seq alg p1 p2 s hWf1 hWf2] at h
+  cases hp1 : evalPlan alg p1 s with
+  | fail => rw [hp1] at h; exact nomatch h
+  | ok f1 =>
+    obtain ⟨s1, hf1⟩ := h1 s f1 hp1
+    subst hf1
+    rw [hp1] at h
+    exact h2 s1 f h
+
+/-- **3-block while-loop `CfgCertificate` constructor (`CfgCertificate.whileLoop`)**:
+packages `[⟨.skip, .branch cond 1 2⟩, ⟨body, .goto 0⟩, ⟨.skip, .ret retExpr⟩]` at
+fuel `2 * loopFuel + 2` via `cfg_certificate_while_sound` whenever `body` is
+well-formed (`WfPlan`) and produces only continuing flows. -/
+def CfgCertificate.whileLoop {Val : Type} (alg : ValAlgebra Val)
+    (loopFuel : Nat) (cond : RvalOp Val) (body : FlowPlan Val)
+    (retExpr : RvalOp Val) (hWfB : WfPlan alg body)
+    (hBody : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s') :
+    CfgCertificate alg where
+  blocks :=
+    [⟨.skip, .branch cond 1 2⟩,
+     ⟨body, .goto 0⟩,
+     ⟨.skip, .ret retExpr⟩]
+  entryBb := 0
+  fuel := 2 * loopFuel + 2
+  plan := .whileLoop loopFuel cond body
+  retExpr := retExpr
+  sound := by
+    intro params st0 out hInit hEval
+    unfold evalFnValue at hEval
+    rw [hInit] at hEval
+    dsimp only at hEval
+    rw [evalPlan_whileLoop alg loopFuel cond body st0 hWfB] at hEval
+    cases hRun : runWhileFlowSteps alg cond (evalPlan alg body) loopFuel st0 with
+    | fail => rw [hRun] at hEval; exact nomatch hEval
+    | ok f =>
+      obtain ⟨sFinal, hf⟩ :=
+        runWhileFlowSteps_continuing alg cond body hBody loopFuel st0 f hRun
+      subst hf
+      rw [hRun] at hEval
+      dsimp only at hEval
+      cases hClean : stateCleanAtReturn sFinal with
+      | false => rw [hClean] at hEval; exact nomatch hEval
+      | true =>
+        rw [hClean] at hEval
+        cases hRet : evalRval alg retExpr sFinal with
+        | none => rw [hRet] at hEval; exact nomatch hEval
+        | some retVal =>
+          rw [hRet] at hEval
+          dsimp only at hEval
+          cases hFree : handleFreeOut alg ⟨retVal, collectRootMutVals sFinal.loans⟩ with
+          | false => rw [hFree] at hEval; exact nomatch hEval
+          | true =>
+            rw [hFree] at hEval
+            injection hEval with hOut
+            subst hOut
+            exact cfg_certificate_while_sound alg cond body retExpr loopFuel
+              st0 sFinal retVal hRun hClean hRet hFree
+
 end PinLifecycle
 
 /-! ### Concrete codecs: exact-width little-endian `u32` and Rust `bool` -/
@@ -2858,5 +2986,771 @@ theorem nonZeroU32Embed_embed? (v : StdVal) (x : {v : Nat // 0 < v ∧ v < 256 ^
 def nonZeroU32SpatialCodec : SpatialCodec StdVal :=
   spatialCodecOfByteLensCodec 33 nonZeroU32ExactLE nonZeroU32ExactLE_provenanceFree
     nonZeroU32Embed nonZeroU32Embed? nonZeroU32Embed_embed?
+
+/-! ### `u8` Codec, `(u32, u32)` `FromBytes`/`IntoBytes`, Reordered Layouts, and Padded `(u8, u32)` -/
+
+/-- MIR type `u8`. -/
+def u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+
+/-- Exact-width (1-byte) `u8` byte codec. -/
+def u8ExactLE : Anneal.SepLogicLenses.ByteLensCodec {v : Nat // v < 256 ^ 1} 1 where
+  encode v := encodeLittleEndianBytes v.val 1 none
+  decode bs :=
+    match Nat.beq bs.length 1 with
+    | false => none
+    | true =>
+      match decodeLittleEndianBytes bs with
+      | some (v, _) => if h : v < 256 ^ 1 then some ⟨v, h⟩ else none
+      | none => none
+  encode_len v := Anneal.SepLogicLenses.ByteLensCodec.length_encodeLE v.val 1 none
+  decode_encode v := by
+    have hLen : (encodeLittleEndianBytes v.val 1 none).length = 1 :=
+      Anneal.SepLogicLenses.ByteLensCodec.length_encodeLE v.val 1 none
+    have hd := Anneal.SepLogicLenses.ByteLensCodec.decodeLE_encodeLE 1 v.val none v.property
+    cases he : decodeLittleEndianBytes (encodeLittleEndianBytes v.val 1 none) with
+    | none => rw [he] at hd; exact nomatch hd
+    | some p =>
+      obtain ⟨w, rp⟩ := p
+      rw [he] at hd
+      have hw : w = v.val := Option.some.inj hd
+      subst hw
+      simp only [hLen, Nat.beq_refl]
+      exact dite_eq_left v.property
+
+theorem u8ExactLE_decode_of (bs : List AbstractByte) (bits : Nat)
+    (prov : Option (Nat × Nat)) (hLen : bs.length = 1)
+    (hLE : decodeLittleEndianBytes bs = some (bits, prov)) (hLt : bits < 256 ^ 1) :
+    u8ExactLE.decode bs = some ⟨bits, hLt⟩ := by
+  have hBeq : Nat.beq bs.length 1 = true := by rw [hLen]; rfl
+  unfold u8ExactLE
+  simp only [hBeq, hLE]
+  exact dite_eq_left hLt
+
+/-- `u8` as a MIR-typed byte codec: `x ↦ .scalar ⟨x, 1⟩`. -/
+def u8MirCodec (layouts : LayoutTable) :
+    MirTypedByteCodec layouts u8Ty {v : Nat // v < 256 ^ 1} 1 where
+  codec := u8ExactLE
+  toValue x := .scalar ⟨x.val, 1⟩
+  ofValue v :=
+    match v with
+    | .scalar sv =>
+      match Nat.beq sv.sizeBytes 1 with
+      | true => if h : sv.bits < 256 ^ 1 then some ⟨sv.bits, h⟩ else none
+      | false => none
+    | _ => none
+  ofValue_toValue x := dite_eq_left x.property
+  tySize_eq := rfl
+  encode_toValue _ := rfl
+  decode_eq_map bs := by
+    have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+    show (match Nat.beq (Trusted.Sequence.length bs) 1 with
+      | false => none
+      | true =>
+        match decodeScalarBytes bs false with
+        | some (sv, _) => some (Value.scalar sv)
+        | none => none) =
+      Option.map (fun x : {v : Nat // v < 256 ^ 1} => Value.scalar ⟨x.val, 1⟩)
+        (match Nat.beq bs.length 1 with
+        | false => none
+        | true =>
+          match decodeLittleEndianBytes bs with
+          | some (v, _) => if h : v < 256 ^ 1 then some ⟨v, h⟩ else none
+          | none => none)
+    rw [hLenDef]
+    cases hLen : Nat.beq bs.length 1 with
+    | false => rfl
+    | true =>
+      have hLenEq : bs.length = 1 := Nat.eq_of_beq_eq_true hLen
+      dsimp only
+      unfold decodeScalarBytes
+      rw [hLenDef, hLenEq]
+      dsimp only
+      cases hLE : decodeLittleEndianBytes bs with
+      | none => rfl
+      | some bp =>
+        obtain ⟨bits, prov⟩ := bp
+        have hMod := Anneal.BitValidity.decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
+        rw [hLenDef, hLenEq, Anneal.Scalars.scalarModulus_eq_two_pow] at hMod
+        have hLt : bits < 256 ^ 1 := by
+          have h256 : (256 : Nat) ^ 1 = 2 ^ (8 * 1) := rfl
+          rw [h256]
+          exact hMod
+        dsimp only
+        rw [dite_eq_left hLt]
+        rfl
+  encode_provenanceFree x := provenanceFree_encodeLittleEndianBytes 1 x.val
+
+theorem u8_isFromBytes (layouts : LayoutTable) :
+    Anneal.BitValidity.IsFromBytes layouts u8Ty := by
+  refine (u8MirCodec layouts).isFromBytes ?_
+  intro bs hLen hInit
+  obtain ⟨⟨bits, prov⟩, hLE⟩ := decodeLittleEndianBytes_isSome_of_init bs hInit
+  have hMod := Anneal.BitValidity.decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
+  have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+  rw [hLenDef, hLen, Anneal.Scalars.scalarModulus_eq_two_pow] at hMod
+  have hLt : bits < 256 ^ 1 := by
+    have h256 : (256 : Nat) ^ 1 = 2 ^ (8 * 1) := rfl
+    rw [h256]
+    exact hMod
+  exact ⟨⟨bits, hLt⟩, u8ExactLE_decode_of bs bits prov hLen hLE hLt⟩
+
+theorem u8_isIntoBytes (layouts : LayoutTable) :
+    Anneal.BitValidity.IsIntoBytes layouts u8Ty := by
+  refine ⟨1, rfl, ?_⟩
+  intro v bs hEnc
+  cases v with
+  | scalar sv =>
+    change (match Nat.beq sv.sizeBytes 1 with
+      | true => encodeScalarBytes sv none
+      | false => none) = some bs at hEnc
+    cases hSz : Nat.beq sv.sizeBytes 1 with
+    | false => rw [hSz] at hEnc; exact nomatch hEnc
+    | true =>
+      rw [hSz] at hEnc
+      have hSzEq : sv.sizeBytes = 1 := Nat.eq_of_beq_eq_true hSz
+      unfold encodeScalarBytes at hEnc
+      rw [hSzEq] at hEnc
+      injection hEnc with hBs
+      subst hBs
+      exact ⟨Anneal.SepLogicLenses.ByteLensCodec.length_encodeLE sv.bits 1 none,
+        allBytesInitialized_encodeLittleEndianBytes 1 sv.bits⟩
+  | _ => exact nomatch hEnc
+
+theorem allBytesInitialized_append :
+    ∀ (bs1 bs2 : List AbstractByte),
+      Anneal.BitValidity.allBytesInitialized bs1 = true →
+      Anneal.BitValidity.allBytesInitialized bs2 = true →
+      Anneal.BitValidity.allBytesInitialized (bs1 ++ bs2) = true
+  | [], _, _, h2 => h2
+  | .uninit :: _, _, h1, _ => nomatch h1
+  | .init _ _ :: rest, bs2, h1, h2 => allBytesInitialized_append rest bs2 h1 h2
+
+theorem allBytesInitialized_take :
+    ∀ (k : Nat) (bs : List AbstractByte),
+      Anneal.BitValidity.allBytesInitialized bs = true →
+      Anneal.BitValidity.allBytesInitialized (bs.take k) = true
+  | 0, _, _ => rfl
+  | _ + 1, [], _ => rfl
+  | _ + 1, .uninit :: _, h => nomatch h
+  | k + 1, .init _ _ :: rest, h => allBytesInitialized_take k rest h
+
+theorem allBytesInitialized_drop :
+    ∀ (k : Nat) (bs : List AbstractByte),
+      Anneal.BitValidity.allBytesInitialized bs = true →
+      Anneal.BitValidity.allBytesInitialized (bs.drop k) = true
+  | 0, _, h => h
+  | _ + 1, [], _ => rfl
+  | _ + 1, .uninit :: _, h => nomatch h
+  | k + 1, .init _ _ :: rest, h => allBytesInitialized_drop k rest h
+
+theorem u8ExactLE_surj (bs : List AbstractByte) (hLen : bs.length = 1)
+    (hInit : Anneal.BitValidity.allBytesInitialized bs = true) :
+    Exists fun x => u8ExactLE.decode bs = some x := by
+  obtain ⟨⟨bits, prov⟩, hLE⟩ := decodeLittleEndianBytes_isSome_of_init bs hInit
+  have hMod := Anneal.BitValidity.decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
+  have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+  rw [hLenDef, hLen, Anneal.Scalars.scalarModulus_eq_two_pow] at hMod
+  have hLt : bits < 256 ^ 1 := by
+    have h256 : (256 : Nat) ^ 1 = 2 ^ (8 * 1) := rfl
+    rw [h256]
+    exact hMod
+  exact ⟨⟨bits, hLt⟩, u8ExactLE_decode_of bs bits prov hLen hLE hLt⟩
+
+theorem u32ExactLE_surj (bs : List AbstractByte) (hLen : bs.length = 4)
+    (hInit : Anneal.BitValidity.allBytesInitialized bs = true) :
+    Exists fun x => u32ExactLE.decode bs = some x := by
+  obtain ⟨⟨bits, prov⟩, hLE⟩ := decodeLittleEndianBytes_isSome_of_init bs hInit
+  have hMod := Anneal.BitValidity.decodeLittleEndianBytes_lt_scalarModulus bs bits prov hLE
+  have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+  rw [hLenDef, hLen, Anneal.Scalars.scalarModulus_eq_two_pow] at hMod
+  have hLt : bits < 256 ^ 4 := by
+    have h256 : (256 : Nat) ^ 4 = 2 ^ (8 * 4) := rfl
+    rw [h256]
+    exact hMod
+  exact ⟨⟨bits, hLt⟩, u32ExactLE_decode_of bs bits prov hLen hLE hLt⟩
+
+/-- Every initialized 8-byte window decodes under `u32PairExactLE`. -/
+theorem u32PairExactLE_surj (bs : List AbstractByte) (hLen : bs.length = 8)
+    (hInit : Anneal.BitValidity.allBytesInitialized bs = true) :
+    Exists fun p => u32PairExactLE.decode bs = some p := by
+  have hTakeLen : (bs.take 4).length = 4 := by rw [List.length_take, hLen]; rfl
+  have hDropLen : (bs.drop 4).length = 4 := by rw [List.length_drop, hLen]
+  obtain ⟨x, hx⟩ := u32ExactLE_surj (bs.take 4) hTakeLen (allBytesInitialized_take 4 bs hInit)
+  obtain ⟨y, hy⟩ := u32ExactLE_surj (bs.drop 4) hDropLen (allBytesInitialized_drop 4 bs hInit)
+  refine ⟨(x, y), ?_⟩
+  unfold u32PairExactLE Anneal.SepLogicLenses.ByteLensCodec.prod
+  have h8 : Nat.beq bs.length (4 + 4) = true := by rw [hLen]; rfl
+  simp only [h8, hx, hy]
+
+/-- `(u32, u32)` is `zerocopy::FromBytes` at any unindexed tuple layout. -/
+theorem u32Pair_isFromBytes {layouts : LayoutTable} {idx : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = none) :
+    Anneal.BitValidity.IsFromBytes layouts (u32PairTy idx) :=
+  (u32PairMirCodec layouts idx hLookup).isFromBytes u32PairExactLE_surj
+
+/-- `(u32, u32)` is `zerocopy::FromBytes` under its captured rustc layout. -/
+theorem u32PairLayout_isFromBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    Anneal.BitValidity.IsFromBytes layouts (u32PairTy idx) :=
+  (u32PairLayoutMirCodec layouts idx l mem hLookup hSize hFields).isFromBytes
+    u32PairExactLE_surj
+
+theorem encodeValueToBytes_u32_inv {layouts : LayoutTable} {v : Value} {bs : List AbstractByte}
+    (h : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v = some bs) :
+    bs.length = 4 ∧ Anneal.BitValidity.allBytesInitialized bs = true := by
+  cases v with
+  | scalar sv =>
+    change (match Nat.beq sv.sizeBytes 4 with
+      | true => encodeScalarBytes sv none
+      | false => none) = some bs at h
+    cases hSz : Nat.beq sv.sizeBytes 4 with
+    | false => rw [hSz] at h; exact nomatch h
+    | true =>
+      rw [hSz] at h
+      have hSzEq : sv.sizeBytes = 4 := Nat.eq_of_beq_eq_true hSz
+      unfold encodeScalarBytes at h
+      rw [hSzEq] at h
+      injection h with hBs
+      subst hBs
+      exact ⟨Anneal.SepLogicLenses.ByteLensCodec.length_encodeLE sv.bits 4 none,
+        allBytesInitialized_encodeLittleEndianBytes 4 sv.bits⟩
+  | _ => exact nomatch h
+
+theorem writeAbstractBytesAt_8_0_4 :
+    ∀ (b1 b2 : List AbstractByte), b1.length = 4 → b2.length = 4 →
+      (match writeAbstractBytesAt (replicateUninitBytes 8) 0 b1 with
+       | some buf' => writeAbstractBytesAt buf' 4 b2
+       | none => none) = some (b1 ++ b2)
+  | [_, _, _, _], [_, _, _, _], _, _ => rfl
+  | [], _, h1, _ => nomatch h1
+  | [_], _, h1, _ => nomatch h1
+  | [_, _], _, h1, _ => nomatch h1
+  | [_, _, _], _, h1, _ => nomatch h1
+  | _ :: _ :: _ :: _ :: _ :: _, _, h1, _ => nomatch h1
+  | [_, _, _, _], [], _, h2 => nomatch h2
+  | [_, _, _, _], [_], _, h2 => nomatch h2
+  | [_, _, _, _], [_, _], _, h2 => nomatch h2
+  | [_, _, _, _], [_, _, _], _, h2 => nomatch h2
+  | [_, _, _, _], _ :: _ :: _ :: _ :: _ :: _, _, h2 => nomatch h2
+
+theorem writeAbstractBytesAt_8_4_0 :
+    ∀ (b1 b2 : List AbstractByte), b1.length = 4 → b2.length = 4 →
+      (match writeAbstractBytesAt (replicateUninitBytes 8) 4 b1 with
+       | some buf' => writeAbstractBytesAt buf' 0 b2
+       | none => none) = some (b2 ++ b1)
+  | [_, _, _, _], [_, _, _, _], _, _ => rfl
+  | [], _, h1, _ => nomatch h1
+  | [_], _, h1, _ => nomatch h1
+  | [_, _], _, h1, _ => nomatch h1
+  | [_, _, _], _, h1, _ => nomatch h1
+  | _ :: _ :: _ :: _ :: _ :: _, _, h1, _ => nomatch h1
+  | [_, _, _, _], [], _, h2 => nomatch h2
+  | [_, _, _, _], [_], _, h2 => nomatch h2
+  | [_, _, _, _], [_, _], _, h2 => nomatch h2
+  | [_, _, _, _], [_, _, _], _, h2 => nomatch h2
+  | [_, _, _, _], _ :: _ :: _ :: _ :: _ :: _, _, h2 => nomatch h2
+
+/-- `(u32, u32)` is `zerocopy::IntoBytes` at any unindexed tuple layout. -/
+theorem u32Pair_isIntoBytes {layouts : LayoutTable} {idx : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = none) :
+    Anneal.BitValidity.IsIntoBytes layouts (u32PairTy idx) := by
+  refine ⟨8, (u32PairMirCodec layouts idx hLookup).tySize_eq, ?_⟩
+  intro v bs hEnc
+  cases v with
+  | aggregate varIdx fieldVals =>
+    cases varIdx with
+    | succ _ => exact nomatch hEnc
+    | zero =>
+      cases fieldVals with
+      | nil => exact nomatch hEnc
+      | cons v1 rest1 =>
+        cases rest1 with
+        | nil => exact nomatch hEnc
+        | cons v2 rest2 =>
+          cases rest2 with
+          | cons _ _ => exact nomatch hEnc
+          | nil =>
+            change (match LayoutTable.lookup layouts idx with
+              | some l => _
+              | none =>
+                encodeSeqFieldsWith
+                  (fun k fv => encodeValueToBytes 15 layouts { kind := k, layoutIdx := 0 } fv)
+                  [.uint .u32, .uint .u32] [v1, v2]) = some bs at hEnc
+            rw [hLookup] at hEnc
+            dsimp only [encodeSeqFieldsWith] at hEnc
+            cases h1 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v1 with
+            | none => rw [h1] at hEnc; exact nomatch hEnc
+            | some b1 =>
+              rw [h1] at hEnc
+              cases h2 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v2 with
+              | none => rw [h2] at hEnc; exact nomatch hEnc
+              | some b2 =>
+                rw [h2] at hEnc
+                dsimp only at hEnc
+                rw [appendAbstractBytes_eq_append, appendAbstractBytes_eq_append,
+                  List.append_nil] at hEnc
+                injection hEnc with hBs
+                subst hBs
+                obtain ⟨hL1, hI1⟩ := encodeValueToBytes_u32_inv h1
+                obtain ⟨hL2, hI2⟩ := encodeValueToBytes_u32_inv h2
+                refine ⟨by show (b1 ++ b2).length = 8; rw [List.length_append, hL1, hL2],
+                  allBytesInitialized_append b1 b2 hI1 hI2⟩
+  | _ => exact nomatch hEnc
+
+/-- `(u32, u32)` is `zerocopy::IntoBytes` under its captured rustc layout
+(`l.size.bytes = 8`, `l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem`). -/
+theorem u32PairLayout_isIntoBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    Anneal.BitValidity.IsIntoBytes layouts (u32PairTy idx) := by
+  refine ⟨8, (u32PairLayoutMirCodec layouts idx l mem hLookup hSize hFields).tySize_eq, ?_⟩
+  intro v bs hEnc
+  cases v with
+  | aggregate varIdx fieldVals =>
+    cases varIdx with
+    | succ _ => exact nomatch hEnc
+    | zero =>
+      cases fieldVals with
+      | nil => exact nomatch hEnc
+      | cons v1 rest1 =>
+        cases rest1 with
+        | nil => exact nomatch hEnc
+        | cons v2 rest2 =>
+          cases rest2 with
+          | cons _ _ => exact nomatch hEnc
+          | nil =>
+            change (match LayoutTable.lookup layouts idx with
+              | some l => _
+              | none => _) = some bs at hEnc
+            rw [hLookup] at hEnc
+            dsimp only at hEnc
+            rw [hFields, hSize] at hEnc
+            dsimp only [encodeFieldsAtOffsetsWith, rigidTyKindByteSize, intCastTargetBytes] at hEnc
+            cases h1 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v1 with
+            | none => rw [h1] at hEnc; exact nomatch hEnc
+            | some b1 =>
+              rw [h1] at hEnc
+              dsimp only at hEnc
+              cases h2 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v2 with
+              | none =>
+                cases hW1 : writeAbstractBytesAt (replicateUninitBytes 8) 0 b1 with
+                | none => rw [hW1] at hEnc; exact nomatch hEnc
+                | some buf' => rw [hW1, h2] at hEnc; exact nomatch hEnc
+              | some b2 =>
+                obtain ⟨hL1, hI1⟩ := encodeValueToBytes_u32_inv h1
+                obtain ⟨hL2, hI2⟩ := encodeValueToBytes_u32_inv h2
+                have hW := writeAbstractBytesAt_8_0_4 b1 b2 hL1 hL2
+                cases hW1 : writeAbstractBytesAt (replicateUninitBytes 8) 0 b1 with
+                | none => rw [hW1] at hW; exact nomatch hW
+                | some buf' =>
+                  rw [hW1] at hW hEnc
+                  dsimp only at hW hEnc
+                  rw [h2] at hEnc
+                  dsimp only at hEnc
+                  cases hW2 : writeAbstractBytesAt buf' 4 b2 with
+                  | none => rw [hW2] at hW; exact nomatch hW
+                  | some buf'' =>
+                    rw [hW2] at hW hEnc
+                    injection hW with hBuf
+                    injection hEnc with hBs
+                    subst hBs
+                    subst hBuf
+                    exact ⟨by show (b1 ++ b2).length = 8; rw [List.length_append, hL1, hL2],
+                      allBytesInitialized_append b1 b2 hI1 hI2⟩
+  | _ => exact nomatch hEnc
+
+/-- Reordered `(u32, u32)` 8-byte little-endian codec for `FieldsShape.arbitrary [4, 0]`:
+places field `1` (`y`) at byte offset `0` and field `0` (`x`) at byte offset `4`. -/
+def u32PairReorderedExactLE :
+    Anneal.SepLogicLenses.ByteLensCodec
+      ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 where
+  encode p := u32PairExactLE.encode (p.2, p.1)
+  decode bs :=
+    match u32PairExactLE.decode bs with
+    | some (y, x) => some (x, y)
+    | none => none
+  encode_len p := u32PairExactLE.encode_len (p.2, p.1)
+  decode_encode p := by
+    show (match u32PairExactLE.decode (u32PairExactLE.encode (p.2, p.1)) with
+      | some (y, x) => some (x, y)
+      | none => none) = some p
+    rw [u32PairExactLE.decode_encode (p.2, p.1)]
+
+theorem u32PairReorderedExactLE_provenanceFree
+    (p : {v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) :
+    provenanceFree (u32PairReorderedExactLE.encode p) = true :=
+  u32PairExactLE_provenanceFree (p.2, p.1)
+
+/-- Under `u32PairReorderedExactLE`, field `0` (`x`) sits at byte offset `4` and
+field `1` (`y`) sits at byte offset `0` (`FieldsTyped u32ExactLE 4 u32ExactLE 0`). -/
+theorem u32PairReorderedExactLE_encode_fieldsTyped
+    (x y : {v : Nat // v < 256 ^ 4}) :
+    Anneal.SepLogicLenses.FieldsTyped u32ExactLE 4 u32ExactLE 0
+      (u32PairReorderedExactLE.encode (x, y)) ∧
+    Anneal.SepLogicLenses.TypedAt u32ExactLE 4 x
+      (u32PairReorderedExactLE.encode (x, y)) ∧
+    Anneal.SepLogicLenses.TypedAt u32ExactLE 0 y
+      (u32PairReorderedExactLE.encode (x, y)) := by
+  have ⟨_, h0, h4⟩ := u32PairExactLE_encode_fieldsTyped y x
+  exact ⟨⟨⟨x, h4⟩, ⟨y, h0⟩⟩, h4, h0⟩
+
+theorem encodeValueToBytes_u32PairReorderedLayout {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨4⟩, ⟨0⟩] mem)
+    (x y : {v : Nat // v < 256 ^ 4}) :
+    encodeValueToBytes defaultCodecFuel layouts (u32PairTy idx)
+        (.aggregate 0 [.scalar ⟨x.val, 4⟩, .scalar ⟨y.val, 4⟩]) =
+      some (u32PairReorderedExactLE.encode (x, y)) := by
+  show (match LayoutTable.lookup layouts idx with
+    | some l => _
+    | none => _) = some (u32ExactLE.encode y ++ u32ExactLE.encode x)
+  rw [hLookup]
+  dsimp only
+  rw [hFields, hSize]
+  rfl
+
+theorem decodeValueFromBytes_u32PairReorderedLayout {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨4⟩, ⟨0⟩] mem) (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts (u32PairTy idx) bs =
+      (u32PairReorderedExactLE.decode bs).map
+        (fun p => Value.aggregate 0 [.scalar ⟨p.1.val, 4⟩, .scalar ⟨p.2.val, 4⟩]) := by
+  have hLenDef : ∀ s : List AbstractByte, Trusted.Sequence.length s = s.length :=
+    fun _ => rfl
+  have hDecU32 : ∀ s : List AbstractByte,
+      decodeValueFromBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } s =
+        Option.map (u32MirCodec layouts).toValue (u32ExactLE.decode s) :=
+    (u32MirCodec layouts).decode_eq_map
+  show (match LayoutTable.lookup layouts idx with
+    | some l => _
+    | none => _) = _
+  rw [hLookup]
+  dsimp only
+  rw [hFields, hSize]
+  dsimp only [decodeFieldsAtOffsetsWith, sliceAbstractBytes, rigidTyByteSize,
+    rigidTyKindByteSize, intCastTargetBytes]
+  simp only [hLenDef, takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop, hDecU32]
+  unfold u32PairReorderedExactLE u32PairExactLE Anneal.SepLogicLenses.ByteLensCodec.prod
+  dsimp only
+  have hD0 : dropAbstractBytes 0 bs = bs := rfl
+  simp only [hD0]
+  cases h8 : bs.length.beq 8 with
+  | false => rfl
+  | true =>
+    have hLen : bs.length = 8 := Nat.eq_of_beq_eq_true h8
+    have hDropLen : (bs.drop 4).length = 4 := by rw [List.length_drop, hLen]
+    have hTakeDrop : (bs.drop 4).take 4 = bs.drop 4 :=
+      List.take_of_length_le (by rw [hDropLen]; exact Nat.le_refl 4)
+    have hB1 : (Nat.add 4 4).ble bs.length = true := by rw [hLen]; rfl
+    have hB2 : (Nat.add 0 4).ble bs.length = true := by rw [hLen]; rfl
+    rw [hB1, hB2, hTakeDrop]
+    dsimp only
+    cases u32ExactLE.decode (bs.take 4) <;> cases u32ExactLE.decode (bs.drop 4) <;> rfl
+
+/-- **`(u32, u32)` as a `MirTypedByteCodec` under a reordered layout
+(`FieldsShape.arbitrary [4, 0]`)**. -/
+def u32PairReorderedLayoutMirCodec (layouts : LayoutTable) (idx : Nat) (l : TypeLayout)
+    (mem : List Nat) (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size.bytes = 8) (hFields : l.fields = .arbitrary [⟨4⟩, ⟨0⟩] mem) :
+    MirTypedByteCodec layouts (u32PairTy idx)
+      ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 where
+  codec := u32PairReorderedExactLE
+  toValue p := .aggregate 0 [.scalar ⟨p.1.val, 4⟩, .scalar ⟨p.2.val, 4⟩]
+  ofValue v :=
+    match v with
+    | .aggregate 0 [v1, v2] =>
+      match (u32MirCodec layouts).ofValue v1, (u32MirCodec layouts).ofValue v2 with
+      | some x, some y => some (x, y)
+      | _, _ => none
+    | _ => none
+  ofValue_toValue p := by
+    obtain ⟨x, y⟩ := p
+    have hx : (u32MirCodec layouts).ofValue (.scalar ⟨x.val, 4⟩) = some x :=
+      (u32MirCodec layouts).ofValue_toValue x
+    have hy : (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) = some y :=
+      (u32MirCodec layouts).ofValue_toValue y
+    show (match (u32MirCodec layouts).ofValue (.scalar ⟨x.val, 4⟩),
+                (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) with
+      | some a, some b => some (a, b)
+      | _, _ => none) = some (x, y)
+    rw [hx, hy]
+  tySize_eq := by
+    unfold rigidTyByteSize u32PairTy
+    dsimp only
+    rw [hLookup]
+    exact congrArg some hSize
+  encode_toValue p := encodeValueToBytes_u32PairReorderedLayout hLookup hSize hFields p.1 p.2
+  decode_eq_map := decodeValueFromBytes_u32PairReorderedLayout hLookup hSize hFields
+  encode_provenanceFree := u32PairReorderedExactLE_provenanceFree
+
+theorem u32PairReorderedLayout_isFromBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨4⟩, ⟨0⟩] mem) :
+    Anneal.BitValidity.IsFromBytes layouts (u32PairTy idx) := by
+  refine (u32PairReorderedLayoutMirCodec layouts idx l mem hLookup hSize hFields).isFromBytes ?_
+  intro bs hLen hInit
+  obtain ⟨⟨y, x⟩, hDec⟩ := u32PairExactLE_surj bs hLen hInit
+  refine ⟨(x, y), ?_⟩
+  show (match u32PairExactLE.decode bs with
+    | some (y, x) => some (x, y)
+    | none => none) = some (x, y)
+  rw [hDec]
+
+theorem u32PairReorderedLayout_isTryFromBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨4⟩, ⟨0⟩] mem) :
+    Anneal.BitValidity.IsTryFromBytes layouts (u32PairTy idx)
+      (fun v => Exists fun p =>
+        (u32PairReorderedLayoutMirCodec layouts idx l mem hLookup hSize hFields).toValue p = v ∧
+        (u32PairReorderedLayoutMirCodec layouts idx l mem hLookup hSize hFields).ofValue v =
+          some p) :=
+  (u32PairReorderedLayoutMirCodec layouts idx l mem hLookup hSize hFields).isTryFromBytes
+
+theorem u32PairReorderedLayout_isIntoBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨4⟩, ⟨0⟩] mem) :
+    Anneal.BitValidity.IsIntoBytes layouts (u32PairTy idx) := by
+  refine ⟨8, (u32PairReorderedLayoutMirCodec layouts idx l mem hLookup hSize hFields).tySize_eq, ?_⟩
+  intro v bs hEnc
+  cases v with
+  | aggregate varIdx fieldVals =>
+    cases varIdx with
+    | succ _ => exact nomatch hEnc
+    | zero =>
+      cases fieldVals with
+      | nil => exact nomatch hEnc
+      | cons v1 rest1 =>
+        cases rest1 with
+        | nil => exact nomatch hEnc
+        | cons v2 rest2 =>
+          cases rest2 with
+          | cons _ _ => exact nomatch hEnc
+          | nil =>
+            change (match LayoutTable.lookup layouts idx with
+              | some l => _
+              | none => _) = some bs at hEnc
+            rw [hLookup] at hEnc
+            dsimp only at hEnc
+            rw [hFields, hSize] at hEnc
+            dsimp only [encodeFieldsAtOffsetsWith, rigidTyKindByteSize, intCastTargetBytes] at hEnc
+            cases h1 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v1 with
+            | none => rw [h1] at hEnc; exact nomatch hEnc
+            | some b1 =>
+              rw [h1] at hEnc
+              dsimp only at hEnc
+              cases h2 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v2 with
+              | none =>
+                cases hW1 : writeAbstractBytesAt (replicateUninitBytes 8) 4 b1 with
+                | none => rw [hW1] at hEnc; exact nomatch hEnc
+                | some buf' => rw [hW1, h2] at hEnc; exact nomatch hEnc
+              | some b2 =>
+                obtain ⟨hL1, hI1⟩ := encodeValueToBytes_u32_inv h1
+                obtain ⟨hL2, hI2⟩ := encodeValueToBytes_u32_inv h2
+                have hW := writeAbstractBytesAt_8_4_0 b1 b2 hL1 hL2
+                cases hW1 : writeAbstractBytesAt (replicateUninitBytes 8) 4 b1 with
+                | none => rw [hW1] at hW; exact nomatch hW
+                | some buf' =>
+                  rw [hW1] at hW hEnc
+                  dsimp only at hW hEnc
+                  rw [h2] at hEnc
+                  dsimp only at hEnc
+                  cases hW2 : writeAbstractBytesAt buf' 0 b2 with
+                  | none => rw [hW2] at hW; exact nomatch hW
+                  | some buf'' =>
+                    rw [hW2] at hW hEnc
+                    injection hW with hBuf
+                    injection hEnc with hBs
+                    subst hBs
+                    subst hBuf
+                    exact ⟨by show (b2 ++ b1).length = 8; rw [List.length_append, hL2, hL1],
+                      allBytesInitialized_append b2 b1 hI2 hI1⟩
+  | _ => exact nomatch hEnc
+
+/-! ### Heterogeneous Padded Tuple Layouts: `(u8, u32)` with Alignment Padding (`[1..4)`) -/
+
+/-- MIR tuple type `(u8, u32)` at layout index `idx`. -/
+def u8U32Ty (idx : Nat := 0) : Ty :=
+  { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := idx }
+
+/-- **Trusted encoder for padded `(u8, u32)`**: under a captured rustc layout of
+size `8` with field offsets `[0, 4]`, `encodeValueToBytes` writes the 1-byte `u8`
+at offset `0` and the 4-byte `u32` at offset `4`, leaving the 3 alignment-padding
+bytes `[1, 2, 3]` as `.uninit`. -/
+theorem encodeValueToBytes_u8U32PaddedLayout {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    (x : {v : Nat // v < 256 ^ 1}) (y : {v : Nat // v < 256 ^ 4}) :
+    encodeValueToBytes defaultCodecFuel layouts (u8U32Ty idx)
+        (.aggregate 0 [.scalar ⟨x.val, 1⟩, .scalar ⟨y.val, 4⟩]) =
+      some (u8ExactLE.encode x ++ [.uninit, .uninit, .uninit] ++ u32ExactLE.encode y) := by
+  show (match LayoutTable.lookup layouts idx with
+    | some l => _
+    | none => _) =
+    some (u8ExactLE.encode x ++ [.uninit, .uninit, .uninit] ++ u32ExactLE.encode y)
+  rw [hLookup]
+  dsimp only
+  rw [hFields, hSize]
+  rfl
+
+/-- **Padded `(u8, u32)` `FieldsTyped` bridge**: for *any* 3-byte padding slice
+`pad` (including `[.uninit, .uninit, .uninit]`), the 8-byte buffer
+`u8ExactLE.encode x ++ pad ++ u32ExactLE.encode y` satisfies
+`SepLogicLenses.FieldsTyped u8ExactLE 0 u32ExactLE 4`. -/
+theorem u8U32Padded_encode_fieldsTyped
+    (x : {v : Nat // v < 256 ^ 1}) (y : {v : Nat // v < 256 ^ 4})
+    (pad : List AbstractByte) (hPad : pad.length = 3) :
+    Anneal.SepLogicLenses.FieldsTyped u8ExactLE 0 u32ExactLE 4
+      (u8ExactLE.encode x ++ pad ++ u32ExactLE.encode y) ∧
+    Anneal.SepLogicLenses.TypedAt u8ExactLE 0 x
+      (u8ExactLE.encode x ++ pad ++ u32ExactLE.encode y) ∧
+    Anneal.SepLogicLenses.TypedAt u32ExactLE 4 y
+      (u8ExactLE.encode x ++ pad ++ u32ExactLE.encode y) := by
+  have h0 :
+      Anneal.SepLogicLenses.TypedAt u8ExactLE 0 x
+        (u8ExactLE.encode x ++ pad ++ u32ExactLE.encode y) := by
+    have h :=
+      Anneal.SepLogicLenses.typedAt_append_encode u8ExactLE []
+        (pad ++ u32ExactLE.encode y) x
+    simp only [List.nil_append, List.length_nil] at h
+    rw [List.append_assoc]
+    exact h
+  have h4 :
+      Anneal.SepLogicLenses.TypedAt u32ExactLE 4 y
+        (u8ExactLE.encode x ++ pad ++ u32ExactLE.encode y) := by
+    have h :=
+      Anneal.SepLogicLenses.typedAt_append_encode u32ExactLE
+        (u8ExactLE.encode x ++ pad) [] y
+    have hPreLen : (u8ExactLE.encode x ++ pad).length = 4 := by
+      rw [List.length_append, u8ExactLE.encode_len x, hPad]
+    rw [hPreLen, List.append_nil] at h
+    exact h
+  exact ⟨⟨⟨x, h0⟩, ⟨y, h4⟩⟩, h0, h4⟩
+
+/-- **Trusted decoder for padded `(u8, u32)`**: under a captured rustc layout of
+size `8` with field offsets `[0, 4]`, `decodeValueFromBytes` checks `bs.length = 8`,
+decodes `bs.take 1` as `u8` and `(bs.drop 4).take 4` as `u32`, and ignores the 3
+padding bytes `(bs.drop 1).take 3` (which may be `.uninit` or arbitrary bytes). -/
+theorem decodeValueFromBytes_u8U32PaddedLayout {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts (u8U32Ty idx) bs =
+      match bs.length.beq 8 with
+      | false => none
+      | true =>
+        match u8ExactLE.decode (bs.take 1), u32ExactLE.decode (bs.drop 4) with
+        | some x, some y => some (.aggregate 0 [.scalar ⟨x.val, 1⟩, .scalar ⟨y.val, 4⟩])
+        | _, _ => none := by
+  have hLenDef : ∀ s : List AbstractByte, Trusted.Sequence.length s = s.length :=
+    fun _ => rfl
+  have hDecU8 : ∀ s : List AbstractByte,
+      decodeValueFromBytes 15 layouts { kind := .uint .u8, layoutIdx := 0 } s =
+        Option.map (u8MirCodec layouts).toValue (u8ExactLE.decode s) :=
+    (u8MirCodec layouts).decode_eq_map
+  have hDecU32 : ∀ s : List AbstractByte,
+      decodeValueFromBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } s =
+        Option.map (u32MirCodec layouts).toValue (u32ExactLE.decode s) :=
+    (u32MirCodec layouts).decode_eq_map
+  show (match LayoutTable.lookup layouts idx with
+    | some l => _
+    | none => _) = _
+  rw [hLookup]
+  dsimp only
+  rw [hFields, hSize]
+  dsimp only [decodeFieldsAtOffsetsWith, sliceAbstractBytes, rigidTyByteSize,
+    rigidTyKindByteSize, intCastTargetBytes]
+  simp only [hLenDef, takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop, hDecU8, hDecU32]
+  have hD0 : dropAbstractBytes 0 bs = bs := rfl
+  simp only [hD0]
+  cases h8 : bs.length.beq 8 with
+  | false => rfl
+  | true =>
+    have hLen : bs.length = 8 := Nat.eq_of_beq_eq_true h8
+    have hDropLen : (bs.drop 4).length = 4 := by rw [List.length_drop, hLen]
+    have hTakeDrop : (bs.drop 4).take 4 = bs.drop 4 :=
+      List.take_of_length_le (by rw [hDropLen]; exact Nat.le_refl 4)
+    have hB1 : (Nat.add 0 1).ble bs.length = true := by rw [hLen]; rfl
+    have hB2 : (Nat.add 4 4).ble bs.length = true := by rw [hLen]; rfl
+    rw [hB1, hB2, hTakeDrop]
+    dsimp only
+    cases u8ExactLE.decode (bs.take 1) <;> cases u32ExactLE.decode (bs.drop 4) <;> rfl
+
+/-- **Padded `(u8, u32)` is `zerocopy::FromBytes`**: every fully initialized
+8-byte window decodes (the 3 initialized padding bytes at `[1..4)` are ignored). -/
+theorem u8U32Padded_isFromBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    Anneal.BitValidity.IsFromBytes layouts (u8U32Ty idx) := by
+  refine ⟨8, ?_, ?_⟩
+  · unfold rigidTyByteSize u8U32Ty
+    dsimp only
+    rw [hLookup]
+    exact congrArg some hSize
+  · intro bs hLen hInit
+    have hLenL : bs.length = 8 := hLen
+    rw [decodeValueFromBytes_u8U32PaddedLayout hLookup hSize hFields bs]
+    have h8 : bs.length.beq 8 = true := by rw [hLenL]; rfl
+    have hTake1 : (bs.take 1).length = 1 := by rw [List.length_take, hLenL]; rfl
+    have hDrop4 : (bs.drop 4).length = 4 := by rw [List.length_drop, hLenL]
+    obtain ⟨x, hx⟩ := u8ExactLE_surj (bs.take 1) hTake1 (allBytesInitialized_take 1 bs hInit)
+    obtain ⟨y, hy⟩ := u32ExactLE_surj (bs.drop 4) hDrop4 (allBytesInitialized_drop 4 bs hInit)
+    rw [h8, hx, hy]
+    exact ⟨_, rfl⟩
+
+/-- **Padded `(u8, u32)` is `zerocopy::TryFromBytes`**. -/
+theorem u8U32Padded_isTryFromBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    Anneal.BitValidity.IsTryFromBytes layouts (u8U32Ty idx)
+      (fun v => Exists fun (x : {v : Nat // v < 256 ^ 1}) =>
+        Exists fun (y : {v : Nat // v < 256 ^ 4}) =>
+          v = .aggregate 0 [.scalar ⟨x.val, 1⟩, .scalar ⟨y.val, 4⟩]) := by
+  refine ⟨8, ?_, ?_⟩
+  · unfold rigidTyByteSize u8U32Ty
+    dsimp only
+    rw [hLookup]
+    exact congrArg some hSize
+  · intro bs v hDec
+    rw [decodeValueFromBytes_u8U32PaddedLayout hLookup hSize hFields bs] at hDec
+    cases h8 : bs.length.beq 8 with
+    | false => rw [h8] at hDec; exact nomatch hDec
+    | true =>
+      rw [h8] at hDec
+      dsimp only at hDec
+      cases hx : u8ExactLE.decode (bs.take 1) with
+      | none => rw [hx] at hDec; exact nomatch hDec
+      | some x =>
+        rw [hx] at hDec
+        cases hy : u32ExactLE.decode (bs.drop 4) with
+        | none => rw [hy] at hDec; exact nomatch hDec
+        | some y =>
+          rw [hy] at hDec
+          injection hDec with hV
+          exact ⟨x, y, hV.symm⟩
+
+/-- **Padded `(u8, u32)` is NOT `zerocopy::IntoBytes`**: because bytes `[1, 2, 3]`
+are alignment padding left `.uninit` by `encodeValueToBytes`, `(u8, u32)` violates
+`IsIntoBytes` even though it satisfies `IsFromBytes` and `IsTryFromBytes`. -/
+theorem u8U32Padded_not_isIntoBytes {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    ¬ Anneal.BitValidity.IsIntoBytes layouts (u8U32Ty idx) := by
+  intro ⟨_, _, hEnc⟩
+  have h0 := encodeValueToBytes_u8U32PaddedLayout hLookup hSize hFields
+    ⟨0, by decide⟩ ⟨0, by decide⟩
+  obtain ⟨_, hInit⟩ := hEnc _ _ h0
+  exact nomatch hInit
 
 end Anneal.PureLift.V2026_06_01Bridge
