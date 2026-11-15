@@ -649,7 +649,7 @@ def _is_symbol_end(stripped: str, end: int) -> bool:
     return not _is_ident_char(ch)
 
 
-def _has_mir_body_ident(stripped: str) -> bool:
+def _has_mir_body_ident(stripped: str, first_body: int = -1) -> bool:
     """Exactly `_MIR_BODY_RE.search(stripped) is not None`, without a full regex scan.
 
     A match never spans a newline (no identifier part does) and always contains a
@@ -662,7 +662,7 @@ def _has_mir_body_ident(stripped: str) -> bool:
     if p_mir == -1:
         return False
     n = len(stripped)
-    pos = stripped.find(".body", p_mir + 4)
+    pos = first_body if first_body >= p_mir + 4 else stripped.find(".body", p_mir + 4)
     while pos != -1:
         if _is_symbol_end(stripped, pos + 5):
             line_start = stripped.rfind("\n", 0, pos) + 1
@@ -687,7 +687,8 @@ def _active_simp_keywords(
     unfiltered first occurrences: a window anchored at an occurrence that is not
     itself a simp entry can still be the only one reaching a long (`> 2048` char)
     simp list holding a real entry. `has_mir_body` is exact (`_has_mir_body_ident`)
-    and only gates rule-2 checks, never window anchors.
+    and only gates rule-2 checks; `kw_offsets` is cleared only when all three simp
+    rules (1, 2, 3) are absent from `stripped`.
     """
     kw_offsets: dict[str, int] = {}
     if check_rule1:
@@ -701,7 +702,7 @@ def _active_simp_keywords(
     has_mir_body = False
     if p_body != -1 and stripped.find("Mir.", 0) != -1:
         kw_offsets[".body"] = p_body
-        has_mir_body = _has_mir_body_ident(stripped)
+        has_mir_body = _has_mir_body_ident(stripped, first_body=p_body)
     has_bitwise = False
     p_bw = stripped.find("bitwise", 0)
     if p_bw != -1:
@@ -713,6 +714,13 @@ def _active_simp_keywords(
         if p != -1:
             kw_offsets["bitwiseOrBits"] = p
             has_bitwise = True
+    if (
+        not has_mir_body
+        and not has_bitwise
+        and "wpMirExecSym" not in kw_offsets
+        and "Sequence.length" not in kw_offsets
+    ):
+        kw_offsets.clear()
     return kw_offsets, has_mir_body, has_bitwise
 
 
@@ -1056,7 +1064,7 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
         cand0 = stripped[start_pos:first_ce]
         if (
             ":" in cand0
-            and "|" not in cand0
+            and ("|" not in cand0 or _EQN_ALT_LINE_RE.search(cand0) is None)
             and "let " not in cand0
             and "where" not in cand0
             and "«" not in cand0
@@ -1468,6 +1476,14 @@ def extract_private_decls(
 _SIBLING_PRIVATE_CACHE: dict[str, tuple[int, int, int, list[PrivateDecl]]] = {}
 _DIR_LEAN_FILES_CACHE: dict[str, tuple[int, list[Path]]] = {}
 _FILE_TEXTS_CACHE: dict[str, tuple[Any, ...]] = {}
+_FILE_TEXTS_CACHE_MAX = 128
+
+
+def _put_file_texts_cache(key: str, val: tuple[Any, ...]) -> None:
+    _FILE_TEXTS_CACHE.pop(key, None)
+    while len(_FILE_TEXTS_CACHE) >= _FILE_TEXTS_CACHE_MAX:
+        _FILE_TEXTS_CACHE.pop(next(iter(_FILE_TEXTS_CACHE)))
+    _FILE_TEXTS_CACHE[key] = val
 
 # Each hook invocation is a fresh process, so sibling declarations are persisted per
 # directory (`sibling_index_path`) instead of re-reading and re-lexing every sibling
@@ -1594,17 +1610,25 @@ def _extract_sibling_private_decls_fast(
     except (OSError, ValueError):
         return []
     file_crc = _text_crc(raw)
-    if cached is not None and cached[:3] == (st.st_mtime_ns, st.st_size, file_crc):
+    if cached is not None and (abs(cached[0]), cached[1], cached[2]) == (
+        st.st_mtime_ns,
+        st.st_size,
+        file_crc,
+    ):
         decls = cached[3]
-        if persisted is not None and not racy:
-            persisted[key] = _index_entry(st, file_crc, decls)
+        if not racy:
+            _SIBLING_PRIVATE_CACHE[key] = (st.st_mtime_ns, st.st_size, file_crc, decls)
+            if persisted is not None:
+                persisted[key] = _index_entry(st, file_crc, decls)
         return decls
 
     _FILE_TEXTS_CACHE.pop(key, None)
     decls = []
     if "private" in raw:
         stripped = strip_lean_comments_and_strings(raw)
-        _FILE_TEXTS_CACHE[key] = (st.st_mtime_ns, st.st_size, raw, stripped)
+        _put_file_texts_cache(
+            key, (-st.st_mtime_ns if racy else st.st_mtime_ns, st.st_size, raw, stripped)
+        )
         decls = extract_private_decls(
             stripped, file_label=sibling_path.name, lazy_norm=True, file_path=key
         )
@@ -1621,7 +1645,12 @@ def _extract_sibling_private_decls_fast(
                     _body_key1(raw, stripped, d.body_start, end),
                     _body_key2(raw, stripped, d.body_start, end, has_b),
                 )
-    _SIBLING_PRIVATE_CACHE[key] = (st.st_mtime_ns, st.st_size, file_crc, decls)
+    _SIBLING_PRIVATE_CACHE[key] = (
+        -st.st_mtime_ns if racy else st.st_mtime_ns,
+        st.st_size,
+        file_crc,
+        decls,
+    )
     if persisted is not None and not racy:
         persisted[key] = _index_entry(st, file_crc, decls)
     return decls
@@ -1644,7 +1673,8 @@ def _file_texts(path_str: str) -> tuple[str, str] | None:
         st = p.stat()
     except (OSError, ValueError):
         return None
-    if not _is_racy(st):
+    racy = _is_racy(st)
+    if not racy:
         cached = _FILE_TEXTS_CACHE.get(path_str)
         if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
             return cached[2], cached[3]
@@ -1654,9 +1684,13 @@ def _file_texts(path_str: str) -> tuple[str, str] | None:
         return None
     cached = _FILE_TEXTS_CACHE.get(path_str)
     if cached is not None and cached[2] == raw:
+        if not racy and cached[0] != st.st_mtime_ns:
+            _put_file_texts_cache(path_str, (st.st_mtime_ns, st.st_size, cached[2], cached[3]))
         return cached[2], cached[3]
     stripped = strip_lean_comments_and_strings(raw)
-    _FILE_TEXTS_CACHE[path_str] = (st.st_mtime_ns, st.st_size, raw, stripped)
+    _put_file_texts_cache(
+        path_str, (-st.st_mtime_ns if racy else st.st_mtime_ns, st.st_size, raw, stripped)
+    )
     return raw, stripped
 
 
@@ -2017,19 +2051,15 @@ def _scan_text_meta(
 
     st = stripped if stripped is not None else strip_lean_comments_and_strings(text)
     first_simp = st.find("simp", 0)
-    has_unfold_or_delta = ("unfold" in st) or ("delta" in st)
-    if first_simp != -1 or has_unfold_or_delta:
-        active_kws, has_mir_body, has_bitwise = _active_simp_keywords(
-            st,
-            simp_start=(first_simp + 4) if first_simp != -1 else 0,
-            check_rule1=(first_simp != -1),
-        )
-    else:
-        active_kws, has_mir_body, has_bitwise = {}, False, False
+    active_kws, has_mir_body, has_bitwise = _active_simp_keywords(
+        st,
+        simp_start=(first_simp + 4) if first_simp != -1 else 0,
+        check_rule1=(first_simp != -1),
+    )
 
     # Rules 2 & 3 on `unfold` / `delta` targets need such a tactic plus an exact
     # `Mir.<...>.body` identifier or a raw bitwise name (every target finding is one).
-    scan_unfold = has_unfold_or_delta and (has_mir_body or has_bitwise)
+    scan_unfold = (has_mir_body or has_bitwise) and (("unfold" in st) or ("delta" in st))
     has_profiler = "trace.profiler.threshold" in st
     first_private = st.find("private", 0)
     private_specs_list: list[tuple[str, str, str, tuple[int, int, int, int], int, int, int]] = []
@@ -2070,9 +2100,7 @@ def _scan_text_meta(
         private_specs,
     )
     if idx_key:
-        if len(_FILE_TEXTS_CACHE) >= 128:
-            _FILE_TEXTS_CACHE.clear()
-        _FILE_TEXTS_CACHE[idx_key] = (text, *res[:2], dict(active_kws), *res[3:])
+        _put_file_texts_cache(idx_key, (text, *res[:2], dict(active_kws), *res[3:]))
     return res
 
 
@@ -2328,9 +2356,7 @@ def scan_lean_file(
     text = path.read_bytes().decode("utf-8", errors="replace")
     stripped = strip_lean_comments_and_strings(text)
     if cacheable:
-        if len(_FILE_TEXTS_CACHE) >= 128:
-            _FILE_TEXTS_CACHE.clear()
-        _FILE_TEXTS_CACHE[key] = (st.st_mtime_ns, st.st_size, text, stripped)
+        _put_file_texts_cache(key, (st.st_mtime_ns, st.st_size, text, stripped))
     return scan_lean_text(
         text,
         file_path=path,

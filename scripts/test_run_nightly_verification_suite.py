@@ -297,8 +297,31 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         auto_file = [lr, "--", "lake", "env", "lean", "X.lean"]
         self.assertEqual(suite._lean_run_wrapper_flags(auto_file), ("file", None, True))
         self.assertEqual(suite._outer_timeout_sec(auto_file, 60), 180 + grace)
+        auto_file_nosep = [lr, "lake", "env", "lean", "X.lean"]
+        self.assertEqual(suite._lean_run_wrapper_flags(auto_file_nosep), ("file", None, True))
+        self.assertEqual(suite._outer_timeout_sec(auto_file_nosep, 60), 180 + grace)
         auto_build = [lr, "--", "lake", "build", "Anneal"]
+        self.assertEqual(suite._lean_run_wrapper_flags(auto_build), ("build", None, True))
         self.assertEqual(suite._outer_timeout_sec(auto_build, 60), 900 + 900 + grace)
+        # Inner command `--` and inner flags (e.g. `cargo test -- --no-slot-lock --timeout 5`)
+        # must never be mistaken for wrapper flags.
+        inner_sep = [
+            lr,
+            "--mode",
+            "build",
+            "--timeout",
+            "600",
+            "cargo",
+            "test",
+            "--",
+            "--no-slot-lock",
+            "--mode",
+            "file",
+            "--timeout",
+            "5",
+        ]
+        self.assertEqual(suite._lean_run_wrapper_flags(inner_sep), ("build", 600, True))
+        self.assertEqual(suite._outer_timeout_sec(inner_sep, 600), 600 + 600 + grace)
         # A wrapped step never gets a shorter outer deadline than its own budget.
         for profile in ("quick", "nightly"):
             for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):
@@ -411,6 +434,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "public import Anneal.ByteCodec\n"
                 "meta import all Anneal.Mir.Cast  -- trailing\n"
                 "import «Anneal».BitValidity import Foo.«a b».c\n"
+                "import Bar.«x--y».«z/-w» -- comment after guillemets\n"
                 "\n"
                 "theorem t : True := by\n"
                 "  trivial\n"
@@ -419,9 +443,46 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             )
             self.assertEqual(
                 suite._lean_header_imports(f),
-                ["Anneal.ByteCodec", "Anneal.Mir.Cast", "Anneal.BitValidity", "Foo.a b.c"],
+                [
+                    "Anneal.ByteCodec",
+                    "Anneal.Mir.Cast",
+                    "Anneal.BitValidity",
+                    "Foo.a b.c",
+                    "Bar.x--y.z/-w",
+                ],
             )
             self.assertIsNone(suite._lean_header_imports(Path(tmp) / "missing.lean"))
+
+    def test_terminate_step_grants_grace_window_to_same_group_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "cleaned"
+            # Leader exits immediately on SIGTERM while its same-group child takes 0.25s
+            # to write `marker` before exiting cleanly on SIGTERM.
+            child_code = (
+                "import pathlib, signal, sys, time\n"
+                "def handler(s, f):\n"
+                "    time.sleep(0.25)\n"
+                f"    pathlib.Path({str(marker)!r}).write_text('grace-ok')\n"
+                "    sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, handler)\n"
+                "time.sleep(60)\n"
+            )
+            leader_code = (
+                "import signal, subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                "signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))\n"
+                "time.sleep(60)\n"
+            )
+            res = suite._run_step(
+                name="leader_exits_first",
+                category="cat7_python_and_ci_tests",
+                cmd=[sys.executable, "-c", leader_code],
+                cwd=REPO_ROOT,
+                timeout_sec=1,
+            )
+            self.assertEqual(res["status"], "TIMEOUT")
+            self.assertTrue(marker.is_file(), "same-group child was SIGKILLed before grace window")
+            self.assertEqual(marker.read_text(), "grace-ok")
 
 
 if __name__ == "__main__":

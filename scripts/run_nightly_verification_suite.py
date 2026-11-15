@@ -1054,31 +1054,52 @@ STEP_TERMINATE_GRACE_SEC = 10
 STEP_PIPE_DRAIN_SEC = 5
 
 
+_LEAN_RUN_VALUE_OPTS: frozenset[str] = frozenset(
+    (
+        "--concurrency",
+        "-W",
+        "--mode",
+        "--memory-max-mb",
+        "--timeout",
+        "--verify-bundle-ff",
+        "--check-unstable-ff",
+        "--ref",
+        "--repo-dir",
+        "--local-rev",
+    )
+)
+
+
 def _is_lean_run_wrapped(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "anneal-lean-run"
 
 
 def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
     """`(mode, timeout_sec, slot_lock)` from the `anneal-lean-run` options preceding
-    `--` (an `auto` mode resolves like the wrapper: `lake env lean` is `file`)."""
-    try:
-        sep = cmd.index("--")
-    except ValueError:
-        sep = len(cmd)
-    opts, inner = cmd[1:sep], cmd[sep + 1 :]
+    `--` or the first positional command token (an `auto` mode resolves like the
+    wrapper: `lean` or `lake env lean` without `--run` is `file`)."""
     mode = "auto"
     timeout: int | None = None
-    slot_lock = "--no-slot-lock" not in opts
-    i = 0
-    while i < len(opts):
-        opt = opts[i]
-        val: str | None = None
-        if "=" in opt and opt.startswith("--"):
-            opt, val = opt.split("=", 1)
-        elif opt in ("--mode", "--timeout") and i + 1 < len(opts):
-            val = opts[i + 1]
+    slot_lock = True
+    i = 1
+    n = len(cmd)
+    while i < n:
+        tok = cmd[i]
+        if tok == "--":
             i += 1
-        if opt == "--mode" and val is not None:
+            break
+        if not tok.startswith("-") or tok == "-":
+            break
+        opt = tok
+        val: str | None = None
+        if "=" in tok and tok.startswith("-"):
+            opt, val = tok.split("=", 1)
+        elif opt in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
+            val = cmd[i + 1]
+            i += 1
+        if opt == "--no-slot-lock":
+            slot_lock = False
+        elif opt == "--mode" and val is not None:
             mode = val
         elif opt == "--timeout" and val is not None:
             try:
@@ -1086,9 +1107,12 @@ def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
             except ValueError:
                 timeout = None
         i += 1
+    inner = cmd[i:]
     if mode not in ("file", "build"):
-        is_lean_file = (inner[:1] and Path(inner[0]).name == "lean") or (
-            len(inner) >= 3 and Path(inner[0]).name == "lake" and inner[1] == "env"
+        is_lean_file = (bool(inner) and Path(inner[0]).name == "lean") or (
+            len(inner) >= 3
+            and Path(inner[0]).name == "lake"
+            and inner[1] == "env"
             and Path(inner[2]).name == "lean"
         )
         mode = "file" if is_lean_file and "--run" not in inner else "build"
@@ -1137,23 +1161,39 @@ def _signal_process_group(pgid: int, sig: int) -> None:
         pass
 
 
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def _terminate_step(proc: subprocess.Popen[str]) -> None:
     """Stop a step started with `start_new_session=True`: `SIGTERM` its whole process
     group (an `anneal-lean-run` wrapper forwards it to the separate-session group it
-    created and reaps it), wait `STEP_TERMINATE_GRACE_SEC`, then `SIGKILL` the group.
-    A bare `Popen.kill()` would `SIGKILL` only the direct child, orphaning the build
-    (still holding RAM, while the wrapper's released build slot admits the next step)."""
+    created and reaps it), wait up to `STEP_TERMINATE_GRACE_SEC` for the entire group
+    to exit, then `SIGKILL` any survivors. A bare `Popen.kill()` would `SIGKILL` only
+    the direct child, orphaning the build (still holding RAM, while the wrapper's
+    released build slot admits the next step)."""
     pgid = proc.pid
+    deadline = time.monotonic() + STEP_TERMINATE_GRACE_SEC
     _signal_process_group(pgid, signal.SIGTERM)
     try:
-        proc.wait(timeout=STEP_TERMINATE_GRACE_SEC)
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         pass
-    _signal_process_group(pgid, signal.SIGKILL)
-    try:
-        proc.wait(timeout=STEP_TERMINATE_GRACE_SEC)
-    except subprocess.TimeoutExpired:
-        pass
+    while _process_group_alive(pgid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if proc.poll() is None or _process_group_alive(pgid):
+        _signal_process_group(pgid, signal.SIGKILL)
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=STEP_TERMINATE_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _as_text(data: str | bytes | None) -> str:
@@ -1308,11 +1348,20 @@ _LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
 
 
 def _strip_lean_comments(text: str) -> str:
-    """`text` with `--` line comments and (nested) `/- ... -/` block comments blanked."""
+    """`text` with `--` line comments and (nested) `/- ... -/` block comments blanked,
+    while preserving `«...»` guillemet identifiers that contain `--` or `/-`."""
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
-        if text.startswith("--", i):
+        if text[i] == "«":
+            end_g = text.find("»", i + 1)
+            if end_g != -1 and text.find("\n", i + 1, end_g) == -1:
+                out.append(text[i : end_g + 1])
+                i = end_g + 1
+            else:
+                out.append("«")
+                i += 1
+        elif text.startswith("--", i):
             j = text.find("\n", i)
             i = n if j == -1 else j
             out.append(" ")

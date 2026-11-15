@@ -1689,6 +1689,16 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         self.assertFalse(proof_health._has_mir_body_ident("Mir.x.bodyX\nMir.y.body_lemma\n"))
         self.assertTrue(proof_health._has_mir_body_ident("foo.body Mir.C.«match».body\n"))
         self.assertTrue(proof_health._has_mir_body_ident("Anneal.Mir.C.I.body.eq_def\n"))
+        # When Rules 1, 2, and 3 are all absent from `stripped`, `.body` does not anchor windows.
+        kws_none, has_mb, has_bw = proof_health._active_simp_keywords("open Mir.Foo\nsimp [x.body]\n")
+        self.assertEqual((kws_none, has_mb, has_bw), ({}, False, False))
+        # When Rule 3 (or Rule 1) is present, `.body` stays in `kw_offsets` to anchor long lists.
+        kws_bw, has_mb2, has_bw2 = proof_health._active_simp_keywords(
+            "open Mir.Foo\nsimp [x.body, bitwiseAndBits]\n"
+        )
+        self.assertIn(".body", kws_bw)
+        self.assertFalse(has_mb2)
+        self.assertTrue(has_bw2)
         pad = "-- padding line without tactic keywords\n" * 250
         src = pad + "open Mir.Foo\ntheorem a : True := by\n  unfold x.body\n  delta\n    Mir.C.«match».body\n"
         self.assertEqual(scan(src), [(R2, 255, "Mir.C.«match».body")])
@@ -1746,6 +1756,53 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         second = proof_health._scan_text_meta(text)[2]
         self.assertIn("Sequence.length", second)
         self.assertEqual(scan(text), [(R1, 802, "Trusted.Sequence.length")])
+
+    def test_racy_sibling_edit_never_poisons_post_window_cache_and_fifo_eviction(self) -> None:
+        # A sibling scanned while `_is_racy` is True and then overwritten in the same
+        # timestamp tick at the same size must be re-read once `_is_racy` becomes False,
+        # rather than serving the pre-rewrite entry from `_SIBLING_PRIVATE_CACHE` or
+        # `_FILE_TEXTS_CACHE`.
+        with tempfile.TemporaryDirectory() as tmp:
+            sib = Path(tmp) / "Sib.lean"
+            tgt = Path(tmp) / "Tgt.lean"
+            sib.write_text(
+                "private theorem h (n : Nat) : n = 0 := sorry\n"
+                "private def d (x : Nat) : Nat := x + 1\n",
+                encoding="utf-8",
+            )
+            tgt.write_text(
+                "private theorem g (m : Nat) : m = 1 := sorry\n"
+                "private def e (y : Nat) : Nat := y + 2\n",
+                encoding="utf-8",
+            )
+            settle(sib, tgt)
+            st0 = sib.stat()
+            clear_in_process_caches()
+            real_is_racy = proof_health._is_racy
+            proof_health._is_racy = lambda st: True
+            try:
+                self.assertEqual(proof_health.scan_lean_file(tgt, scan_siblings=True), [])
+            finally:
+                proof_health._is_racy = real_is_racy
+            # Same-tick, same-size rewrite of `Sib.lean` while it was racy:
+            sib.write_text(
+                "private theorem h (n : Nat) : n = 1 := sorry\n"
+                "private def d (x : Nat) : Nat := x + 2\n",
+                encoding="utf-8",
+            )
+            os.utime(sib, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+            self.assertEqual((sib.stat().st_mtime_ns, sib.stat().st_size), (st0.st_mtime_ns, st0.st_size))
+            # Now `_is_racy` is False (settled stamp); scan must detect both sibling duplicates.
+            findings = proof_health.scan_lean_file(tgt, scan_siblings=True)
+            self.assertEqual([(f.rule, f.line, f.symbol) for f in findings], [(R5, 1, "g"), (R5, 2, "e")])
+
+        # FIFO eviction on `_FILE_TEXTS_CACHE` preserves recent entries instead of wiping all.
+        clear_in_process_caches()
+        for i in range(proof_health._FILE_TEXTS_CACHE_MAX + 5):
+            proof_health._put_file_texts_cache(f"k{i}", (i,))
+        self.assertEqual(len(proof_health._FILE_TEXTS_CACHE), proof_health._FILE_TEXTS_CACHE_MAX)
+        self.assertNotIn("k0", proof_health._FILE_TEXTS_CACHE)
+        self.assertIn(f"k{proof_health._FILE_TEXTS_CACHE_MAX + 4}", proof_health._FILE_TEXTS_CACHE)
 
 
 class TestTranscriptLatencyTelemetry(unittest.TestCase):
