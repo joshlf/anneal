@@ -1074,4 +1074,1165 @@ theorem rigidTy_predicate_characterizations_and_sizes (r : RigidTy) :
           fun hWide => ⟨isThinPtrRigidTy_eq_false_of_isWidePtrRigidTy hWide,
                         rigidTyKindByteSize_eq_sixteen_of_isWidePtrRigidTy hWide⟩⟩
 
+/-! ## 6. Symbolic-Padding Struct Codecs, `PlacedCodecSpine`, `ofPlacedCodecSpine` & `CompactEnumVal` (`[adv ep1-A0]`) -/
+
+#guard u8ExhaustiveCompactSpec.isValidDiscr 0 == true
+#guard u8ExhaustiveCompactSpec.isValidDiscr 255 == true
+#guard u8ExhaustiveCompactSpec.isValidDiscr 256 == false
+#guard sparseU16EnumSpec.isValidDiscr 0 == true
+#guard sparseU16EnumSpec.isValidDiscr 1000 == true
+#guard sparseU16EnumSpec.isValidDiscr 65535 == true
+#guard sparseU16EnumSpec.isValidDiscr 1 == false
+#guard nonZeroU32EnumSpec.isValidDiscr 0 == false
+#guard nonZeroU32EnumSpec.isValidDiscr 1 == true
+
+def u8u32UnitPermutedTightLayout : TypeLayout :=
+  { size := ⟨5⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨4⟩, ⟨0⟩, ⟨5⟩] [1, 0, 2], variants := .single 0, isUninhabited := false }
+
+def u8u32UnitPermutedTightLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u8u32UnitPermutedTightLayout] }
+
+theorem u8u32UnitPermuted_trail0_intoBytes_and_trail3_not_intoBytes :
+    IsIntoBytes u8u32UnitPermutedTightLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    IsFromBytes u8u32UnitPermutedTightLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    ¬ IsIntoBytes u8u32UnitPermutedLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } ∧
+    IsFromBytes u8u32UnitPermutedLayouts
+      { kind := .tuple [.uint .u8, .uint .u32, .tuple []], layoutIdx := 0 } := by
+  have h0 := MirValueCodec.u8u32UnitPermutedArbitraryTuple_trail_zero_isIntoBytes_and_transmute
+    u8u32UnitPermutedTightLayouts 0
+    u8u32UnitPermutedTightLayout [1, 0, 2] rfl rfl rfl
+  have h0Fb := MirValueCodec.u8u32UnitPermutedArbitraryTuple_isFromBytes_all_trail
+    u8u32UnitPermutedTightLayouts 0 0
+    u8u32UnitPermutedTightLayout [1, 0, 2] rfl rfl rfl
+  have h3 := u8u32UnitPermutedLayouts_not_isIntoBytes_but_isFromBytes
+  exact ⟨h0.2.1, h0Fb.2.1, h3.1, h3.2⟩
+
+/-- info: 'Anneal.ByteCodec.laidOutPairSymbolicPad_field_windows' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutPairSymbolicPad_field_windows
+
+/-- info: 'Anneal.ByteCodec.laidOutPairSymbolicPad_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutPairSymbolicPad_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.laidOutPairSymbolicPad_hasZeroValid' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutPairSymbolicPad_hasZeroValid
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPadPerm_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPadPerm_isInitCodec_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPadPerm_isInitCodec_iff
+
+/-- info: 'Anneal.ByteCodec.FieldPerm.toListPerm' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms FieldPerm.toListPerm
+
+/-- info: 'Anneal.ByteCodec.FieldPerm.symm_apply_eq_unapply' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms FieldPerm.symm_apply_eq_unapply
+
+/-- info: 'Anneal.ByteCodec.exists_pads_of_sequentialFieldPlacement' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms exists_pads_of_sequentialFieldPlacement
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPad_cons_windows' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPad_cons_windows
+
+/-- info: 'Anneal.ByteCodec.SymbolicStructSpine.window_bytes' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms SymbolicStructSpine.window_bytes
+
+/-- info: 'Anneal.ByteCodec.SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms SymbolicStructSpine.exists_repad_of_sequentialFieldPlacement
+
+/-- info: 'Anneal.ByteCodec.memSort_perm' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms memSort_perm
+
+/-- info: 'Anneal.ByteCodec.memSort_pairwise' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms memSort_pairwise
+
+/-- info: 'Anneal.ByteCodec.placed_end_le_of_memKey_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms placed_end_le_of_memKey_le
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.windows_memSort' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.windows_memSort
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.repad_sequentialPads_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.repad_sequentialPads_spec
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.uintPairArbitraryTuple' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.uintPairArbitraryTuple
+
+/-- info: 'Anneal.ByteCodec.uintPairArbitraryTuple_pad_pos_not_intoBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms uintPairArbitraryTuple_pad_pos_not_intoBytes
+
+/-- info: 'Anneal.ByteCodec.u8u32UnitPermutedLayouts_not_isIntoBytes_but_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8u32UnitPermutedLayouts_not_isIntoBytes_but_isFromBytes
+
+/-- info: 'Anneal.ByteCodec.CompactEnumSpec.isValidDiscr_eq_true_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms CompactEnumSpec.isValidDiscr_eq_true_iff
+
+/-- info: 'Anneal.ByteCodec.CompactEnumVal.byteCodec_decode_eq_some_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms CompactEnumVal.byteCodec_decode_eq_some_iff
+
+/-- info: 'Anneal.ByteCodec.CompactEnumVal.byteCodec_equiv_enumRepr' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms CompactEnumVal.byteCodec_equiv_enumRepr
+
+/-- info: 'Anneal.ByteCodec.compactEnumSpec_rejects_duplicate_unsorted_and_out_of_range' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms compactEnumSpec_rejects_duplicate_unsorted_and_out_of_range
+
+/-- info: 'Anneal.ByteCodec.u8ExhaustiveCompactSpec_full_zerocopy_traits' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8ExhaustiveCompactSpec_full_zerocopy_traits
+
+/-- info: 'Anneal.ByteCodec.u8ExhaustiveMirValueCodec_full_bitValidity' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8ExhaustiveMirValueCodec_full_bitValidity
+
+/-! ## 7. General $k$-Field `MirValueCodec.ofPlacedCodecSpine` Non-Vacuity (`[adv ep1-B1]`)
+
+The general constructor derives every Trusted `encodeValueToBytes` / `decodeValueFromBytes`
+obligation from the `LayoutTable` entry, per-field `TupleFieldCodec`s, and a sequential placement.
+These tests instantiate it on two layouts unrelated to `u8u32UnitPermutedArbitraryTuple`
+(an interior-padded pair and a tight, genuinely permuted 4-field tuple), cross-check Trusted's
+padding-ignoring decoder against the realized codec by kernel evaluation, and show that the
+placement hypothesis rejects overlapping layouts.
+-/
+
+/-- Declaration-order `(u8, u32)` pair placed at offsets `[0, 4]` (3 interior padding bytes). -/
+def u8u32PairPlaced :
+    PlacedCodecSpine
+      [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+       { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }] :=
+  .cons (0, ⟨1, 1⟩)
+    (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u8) (MirValueCodec.uintByteSize_pos .u8))
+    (.cons (4, ⟨4, 4⟩)
+      (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u32) (MirValueCodec.uintByteSize_pos .u32))
+      .nil)
+
+/-- `(u8, u32)` at `u8u32PairLayouts` through the general constructor (no pair-specific proof). -/
+def u8u32PairGeneral :
+    MirValueCodec u8u32PairLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 0 }
+      (FieldTuple
+        [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+         { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }])
+      8 :=
+  MirValueCodec.ofPlacedCodecSpine u8u32PairLayouts 0 u8u32PairLayout [0, 1] u8u32PairPlaced 8
+    (.cons (TupleFieldCodec.uint _ .u8) (.cons (TupleFieldCodec.uint _ .u32) .nil)) rfl rfl rfl
+    (.cons (Nat.le_refl 0) (.cons (by decide) (.nil (by decide))))
+
+theorem u8u32PairGeneral_not_isIntoBytes_but_isFromBytes :
+    ¬ IsIntoBytes u8u32PairLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 0 } ∧
+    IsFromBytes u8u32PairLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 0 } :=
+  ⟨(MirValueCodec.ofPlacedCodecSpine_pad_pos_not_intoBytes u8u32PairPlaced 8 rfl u8u32PairGeneral rfl
+      (by decide) (⟨0, by decide⟩, ⟨0, by decide⟩, ())).2.2,
+   (MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads u8u32PairPlaced 8 rfl u8u32PairGeneral rfl
+      ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+       FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, trivial⟩).2.1⟩
+
+/-- `u8 = 7` at byte `0`, three `.uninit` padding bytes, then `u32 = 1` little-endian at byte `4`. -/
+def u8u32PairPaddedBytes : List AbstractByte :=
+  [.init (UInt8.ofNat 7) none, .uninit, .uninit, .uninit,
+   .init (UInt8.ofNat 1) none, .init (UInt8.ofNat 0) none, .init (UInt8.ofNat 0) none,
+   .init (UInt8.ofNat 0) none]
+
+/-- Trusted's decoder ignores the `.uninit` padding bytes (kernel evaluation). -/
+example :
+    decodeValueFromBytes defaultCodecFuel u8u32PairLayouts
+        { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 0 } u8u32PairPaddedBytes =
+      some (.aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨1, 4⟩]) :=
+  rfl
+
+/-- The realized general codec decodes the same padded bytes to the same `Value` (kernel evaluation). -/
+example :
+    (u8u32PairGeneral.codec.decode u8u32PairPaddedBytes).map u8u32PairGeneral.toValue =
+      some (.aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨1, 4⟩]) :=
+  rfl
+
+/-- Uninitialized bytes inside a field window are rejected by both decoders. -/
+example :
+    decodeValueFromBytes defaultCodecFuel u8u32PairLayouts
+        { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 0 }
+        (u8u32PairPaddedBytes.set 5 .uninit) = none ∧
+      u8u32PairGeneral.codec.decode (u8u32PairPaddedBytes.set 5 .uninit) = none :=
+  ⟨rfl, rfl⟩
+
+/-- `(u8, u16, u32, u8)` placed at `[6, 4, 0, 7]`: memory order `u32, u16, u8, u8`, size 8, no padding. -/
+def tightQuadPlaced :
+    PlacedCodecSpine
+      [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+       { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u16) },
+       { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) },
+       { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) }] :=
+  .cons (6, ⟨1, 1⟩)
+    (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u8) (MirValueCodec.uintByteSize_pos .u8))
+    (.cons (4, ⟨2, 2⟩)
+      (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u16) (MirValueCodec.uintByteSize_pos .u16))
+      (.cons (0, ⟨4, 4⟩)
+        (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u32) (MirValueCodec.uintByteSize_pos .u32))
+        (.cons (7, ⟨1, 1⟩)
+          (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u8) (MirValueCodec.uintByteSize_pos .u8))
+          .nil)))
+
+def tightQuadLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨6⟩, ⟨4⟩, ⟨0⟩, ⟨7⟩] [2, 1, 0, 3], variants := .single 0, isUninhabited := false }
+
+def tightQuadLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [tightQuadLayout] }
+
+/-- The tight, permuted 4-field tuple through the general constructor. -/
+def tightQuadCodec :
+    MirValueCodec tightQuadLayouts
+      { kind := .tuple [.uint .u8, .uint .u16, .uint .u32, .uint .u8], layoutIdx := 0 }
+      (FieldTuple
+        [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+         { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u16) },
+         { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) },
+         { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) }])
+      8 :=
+  MirValueCodec.ofPlacedCodecSpine tightQuadLayouts 0 tightQuadLayout [2, 1, 0, 3] tightQuadPlaced 8
+    (.cons (TupleFieldCodec.uint _ .u8) (.cons (TupleFieldCodec.uint _ .u16)
+      (.cons (TupleFieldCodec.uint _ .u32) (.cons (TupleFieldCodec.uint _ .u8) .nil)))) rfl rfl rfl
+    (.cons (Nat.le_refl 0) (.cons (Nat.le_refl 4) (.cons (Nat.le_refl 6)
+      (.cons (Nat.le_refl 7) (.nil (Nat.le_refl 8))))))
+
+theorem tightQuad_isIntoBytes_and_isFromBytes :
+    IsIntoBytes tightQuadLayouts
+      { kind := .tuple [.uint .u8, .uint .u16, .uint .u32, .uint .u8], layoutIdx := 0 } ∧
+    IsFromBytes tightQuadLayouts
+      { kind := .tuple [.uint .u8, .uint .u16, .uint .u32, .uint .u8], layoutIdx := 0 } :=
+  ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed tightQuadPlaced 8 rfl
+      tightQuadCodec rfl rfl (by decide)
+      ⟨FixedByteCodec.uintBitsLE_isInitCodec _ _, FixedByteCodec.uintBitsLE_isInitCodec _ _,
+       FixedByteCodec.uintBitsLE_isInitCodec _ _, FixedByteCodec.uintBitsLE_isInitCodec _ _,
+       trivial⟩).2.1,
+   (MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads tightQuadPlaced 8 rfl tightQuadCodec rfl
+      ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+       FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+       FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+       FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, trivial⟩).2.1⟩
+
+/-- Every field of the tight permuted tuple lands at its declared offset (kernel evaluation). -/
+example :
+    tightQuadCodec.codec.encode (⟨0xAA, by decide⟩, ⟨0x2211, by decide⟩, ⟨0x66554433, by decide⟩,
+        ⟨0xBB, by decide⟩, ()) =
+      [.init (UInt8.ofNat 0x33) none, .init (UInt8.ofNat 0x44) none, .init (UInt8.ofNat 0x55) none,
+       .init (UInt8.ofNat 0x66) none, .init (UInt8.ofNat 0x11) none, .init (UInt8.ofNat 0x22) none,
+       .init (UInt8.ofNat 0xAA) none, .init (UInt8.ofNat 0xBB) none] :=
+  rfl
+
+/-- The placement hypothesis is not vacuous: overlapping fields (`[0, 4)` and `[2, 6)`) are rejected. -/
+theorem overlapping_placement_not_sequential :
+    ¬ SequentialFieldPlacement 0 [⟨4, 4⟩, ⟨4, 4⟩] [0, 2] 8 := by
+  intro h
+  cases h with
+  | cons _ hTail =>
+    cases hTail with
+    | cons hBase _ => exact absurd hBase (by decide)
+
+/-! ### `[adv ep1-B2]` Single-Variant `.adt` Structs: the Precise Fallback Condition
+
+Trusted decodes a single-variant struct by its typed field windows (`byArgs`) and, only when that
+fails, by a fallback decoder. `AdtDecodeFallbackSound` asks exactly that the fallback cannot rescue a
+rejected buffer. These tests show it holds for an in-order struct (which `AdtDecodeFallbackNone`
+excludes) and is genuinely necessary (Trusted's span fallback accepts an invalid `bool`).
+-/
+
+/-- The in-order `(u8, u32)` struct at `u8u32PairLayouts` (`.memory`, no `fieldLayouts`). -/
+theorem u8u32PairAdt_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound u8u32PairLayouts u8u32PairLayout 0 u8u32PairPlaced 8 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective rfl rfl rfl
+    ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+     FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, trivial⟩
+    (by decide)
+
+/-- `struct S { a: u8, b: u32 }` (in declaration order) through the general `.adt` constructor. -/
+def u8u32PairAdtCodec :
+    MirValueCodec u8u32PairLayouts { kind := .adt "S" [.uint .u8, .uint .u32], layoutIdx := 0 }
+      (FieldTuple
+        [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+         { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }])
+      8 :=
+  MirValueCodec.adtOfPlacedCodecSpine u8u32PairLayouts "S" 0 u8u32PairLayout 0 [0, 1]
+    u8u32PairPlaced 8 (.cons (TupleFieldCodec.uint _ .u8) (.cons (TupleFieldCodec.uint _ .u32) .nil))
+    rfl rfl rfl rfl rfl u8u32PairAdt_fallbackSound
+    (.cons (Nat.le_refl 0) (.cons (by decide) (.nil (by decide))))
+
+/--
+End-to-end `BitValidity` proof for the in-order `.adt "S" [.uint .u8, .uint .u32]` struct:
+satisfies `IsFromBytes` while failing `IsIntoBytes` due to the 3 inter-field `.uninit` padding bytes.
+-/
+theorem u8u32PairAdt_not_isIntoBytes_but_isFromBytes :
+    ¬ IsIntoBytes u8u32PairLayouts { kind := .adt "S" [.uint .u8, .uint .u32], layoutIdx := 0 } ∧
+    IsFromBytes u8u32PairLayouts { kind := .adt "S" [.uint .u8, .uint .u32], layoutIdx := 0 } :=
+  ⟨(MirValueCodec.ofPlacedCodecSpine_pad_pos_not_intoBytes u8u32PairPlaced 8 rfl u8u32PairAdtCodec rfl
+      (by decide) (⟨0, by decide⟩, ⟨0, by decide⟩, ())).2.2,
+   (MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads u8u32PairPlaced 8 rfl u8u32PairAdtCodec rfl
+      ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _,
+       FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, trivial⟩).2.1⟩
+
+/-- `AdtDecodeFallbackNone` is too strong for in-order structs: the span fallback decodes zero bytes. -/
+theorem u8u32PairAdt_not_fallbackNone :
+    ¬ MirValueCodec.AdtDecodeFallbackNone u8u32PairLayouts u8u32PairLayout 0
+      (u8u32PairPlaced.placed.map fun p => ({ bytes := p.1 } : Size)) 8 := by
+  intro h
+  have h0 := h (zeroInitBytes 8) rfl
+  rw [show MirValueCodec.adtDecodeFallback u8u32PairLayouts u8u32PairLayout 0
+      (u8u32PairPlaced.placed.map fun p => ({ bytes := p.1 } : Size)) (zeroInitBytes 8) =
+      some (.aggregate 0 [.scalar ⟨0, 4⟩, .scalar ⟨0, 4⟩]) from rfl] at h0
+  nomatch h0
+
+/-- An in-order `(bool, u8)` struct entry (`.memory`, no `fieldLayouts`). -/
+def boolU8Layout : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false }
+
+def boolU8Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [boolU8Layout] }
+
+def boolU8Placed : PlacedCodecSpine [Bool, UInt8] :=
+  .cons (0, ⟨1, 1⟩) FixedByteCodec.boolByte (.cons (1, ⟨1, 1⟩) FixedByteCodec.u8 .nil)
+
+/--
+Trusted's `.adt` decoder accepts the invalid `bool` byte `2` in an in-order struct without
+`fieldLayouts`: the typed field decode rejects it, but the padding-inclusive span fallback reads it as a
+raw scalar (kernel evaluation).
+-/
+example :
+    decodeValueFromBytes defaultCodecFuel boolU8Layouts
+        { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 }
+        [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] =
+      some (.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨7, 1⟩]) :=
+  rfl
+
+/-- Hence the fallback condition fails, so no `boolByte`-field codec exists for this entry. -/
+theorem boolU8Adt_not_fallbackSound :
+    ¬ MirValueCodec.AdtDecodeFallbackSound boolU8Layouts boolU8Layout 0 boolU8Placed 2 := by
+  intro h
+  have h0 := h [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] rfl rfl
+  rw [show MirValueCodec.adtDecodeFallback boolU8Layouts boolU8Layout 0
+      (boolU8Placed.placed.map fun p => ({ bytes := p.1 } : Size))
+      [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] =
+      some (.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨7, 1⟩]) from rfl] at h0
+  nomatch h0
+
+/--
+`[adv ep1-A2]` Populated `fieldLayouts` (`[1, 2]`) for the in-order `(bool, u8)` struct:
+entry `1` is the `.primitive` scalar-niche `bool` layout (`⟨0, 1⟩`) and entry `2` is `u8`.
+With `fieldLayouts` populated, Trusted's fallback uses `decodeFieldsByLayoutIdxs`, which enforces
+`bool`'s `0 ..= 1` niche and rejects `[.init 2 none, .init 7 none]`, so
+`AdtDecodeFallbackSound.of_fieldLayouts` holds and `adtOfPlacedCodecSpine` constructs a genuine
+`MirValueCodec` for `.adt "S" [.bool, .uint .u8]`!
+-/
+def boolPrimitiveFieldLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def u8PrimitiveFieldLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def boolU8WithFieldLayoutsEntry : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [1, 2] }
+
+def boolU8WithFieldLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [boolU8WithFieldLayoutsEntry, boolPrimitiveFieldLayout, u8PrimitiveFieldLayout] }
+
+/-- Kernel evaluation: with `fieldLayouts = [1, 2]` populated, `bool = 2` is rejected (`none`)! -/
+example :
+    decodeValueFromBytes defaultCodecFuel boolU8WithFieldLayouts
+        { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 }
+        [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] =
+      none :=
+  rfl
+
+/-- `FieldLayoutsDecodeSound` and `AdtDecodeFallbackSound` for the in-order `(bool, u8)` struct. -/
+theorem boolU8WithFieldLayouts_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound boolU8WithFieldLayouts boolU8WithFieldLayoutsEntry 0
+      boolU8Placed 2 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts
+    (.cons_primitive_bool rfl rfl rfl rfl rfl rfl
+      (.cons_primitive_surjective rfl rfl rfl rfl rfl (by decide)
+        FixedByteCodec.u8_isSurjectiveInitDecoder .nil))
+
+/-- `MirValueCodec` for the in-order `struct S { a: bool, b: u8 }` with populated `fieldLayouts`. -/
+def boolU8WithFieldLayoutsAdtCodec :
+    MirValueCodec boolU8WithFieldLayouts { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 }
+      (FieldTuple [Bool, UInt8]) 2 :=
+  MirValueCodec.adtOfPlacedCodecSpine boolU8WithFieldLayouts "S" 0 boolU8WithFieldLayoutsEntry 0
+    [0, 1] boolU8Placed 2 (.cons (TupleFieldCodec.bool _) (.cons (TupleFieldCodec.u8 _) .nil))
+    rfl rfl rfl rfl rfl boolU8WithFieldLayouts_fallbackSound
+    (.cons (Nat.le_refl 0) (.cons (Nat.le_refl 1) (.nil (Nat.le_refl 2))))
+
+/--
+The in-order `struct S { a: bool, b: u8 }` with populated `fieldLayouts` satisfies `IsIntoBytes`
+and `IsFromZeros`, while failing `IsFromBytes` because `0x02` is rejected.
+-/
+theorem boolU8WithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromBytes :
+    IsIntoBytes boolU8WithFieldLayouts { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 } ∧
+    IsFromZeros boolU8WithFieldLayouts { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 } ∧
+    ¬ IsFromBytes boolU8WithFieldLayouts { kind := .adt "S" [.bool, .uint .u8], layoutIdx := 0 } := by
+  refine ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed
+      boolU8Placed 2 rfl boolU8WithFieldLayoutsAdtCodec rfl rfl rfl
+      ⟨FixedByteCodec.boolByte_isInitCodec, FixedByteCodec.u8_isInitCodec, trivial⟩).2.1,
+    (MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      boolU8Placed 2 rfl boolU8WithFieldLayoutsAdtCodec rfl
+      ⟨FixedByteCodec.boolByte_hasZeroValid, FixedByteCodec.u8_hasZeroValid, trivial⟩).2.1,
+    ?_⟩
+  rintro ⟨sz, hSz, hAll⟩
+  injection hSz with hSzEq
+  subst hSzEq
+  obtain ⟨v, hv⟩ := hAll [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 7) none] rfl rfl
+  nomatch hv
+
+/--
+`[adv ep1-A2]` Reordered 2-field `.scalarPair` struct `struct Pair(u8, u32)` (`u32 @ 0`, `u8 @ 4`,
+`size = 8`, `l.backendRepr = .scalarPair ...`): exercises `AdtDecodeFallbackSound.of_scalarPair_surjective`.
+-/
+def u8u32ScalarPairPermutedLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 8 false) ⟨0, 255⟩)
+      (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .arbitrary [⟨4⟩, ⟨0⟩] [1, 0], variants := .single 0, isUninhabited := false }
+
+def u8u32ScalarPairPermutedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u8u32ScalarPairPermutedLayout] }
+
+def u8u32ScalarPairPermutedPlaced :
+    PlacedCodecSpine
+      [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u8) },
+       { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }] :=
+  .cons (4, ⟨1, 1⟩) (FixedByteCodec.uintBitsLE 1 (by decide))
+    (.cons (0, ⟨4, 4⟩) (FixedByteCodec.uintBitsLE 4 (by decide)) .nil)
+
+/-- `AdtDecodeFallbackSound.of_scalarPair_surjective` on the reordered `.scalarPair` struct. -/
+theorem u8u32ScalarPairPermuted_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound u8u32ScalarPairPermutedLayouts
+      u8u32ScalarPairPermutedLayout 0 u8u32ScalarPairPermutedPlaced 8 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_scalarPair_surjective rfl rfl rfl rfl
+    (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide))
+    (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide))
+
+/-! ### `[adv ep1-B3]` Span-Fallback `.scalar` Structs With Marker Fields & Niche Newtypes
+
+Trusted uses the span fallback for every shape except a 1-field `.scalar` and a 2-field
+`.scalarPair` struct, so `struct W(u32, PhantomData<T>)` (2 fields, `.scalar`) needs
+`AdtDecodeFallbackSound.of_span_surjective`; and the `.scalar` fallback enforces the scalar's valid
+range, so `struct B(bool)` needs only `AdtDecodeFallbackSound.of_scalar` (not surjectivity).
+-/
+
+/-- `struct W(u32, PhantomData<T>)`: `u32 @ 0`, marker ZST `@ 4`, size 4, `.scalar` backend repr. -/
+def u32MarkerLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false }
+
+def u32MarkerLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u32MarkerLayout] }
+
+def u32MarkerPlaced :
+    PlacedCodecSpine [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }, Unit] :=
+  .cons (0, ⟨4, 4⟩)
+    (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u32) (MirValueCodec.uintByteSize_pos .u32))
+    (.cons (4, ⟨0, 1⟩) FixedByteCodec.unit .nil)
+
+/-- The 2-field `.scalar` shape takes Trusted's span fallback (neither special-cased branch). -/
+example : MirValueCodec.usesSpanFallback
+    (u32MarkerPlaced.placed.map fun p => ({ bytes := p.1 } : Size)) u32MarkerLayout.backendRepr = true :=
+  rfl
+
+/-- `AdtDecodeFallbackSound` for `struct W(u32, PhantomData<T>)` via `of_span_surjective`. -/
+theorem u32Marker_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound u32MarkerLayouts u32MarkerLayout 0 u32MarkerPlaced 4 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_span_surjective rfl rfl rfl
+    ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, FixedByteCodec.unit_isSurjectiveInitDecoder,
+     trivial⟩
+    (by decide)
+
+/-- `MirValueCodec` for `struct W(u32, PhantomData<T>)` through the general `.adt` constructor. -/
+def u32MarkerAdtCodec :
+    MirValueCodec u32MarkerLayouts { kind := .adt "W" [.uint .u32, .tuple []], layoutIdx := 0 }
+      (FieldTuple [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }, Unit]) 4 :=
+  MirValueCodec.adtOfPlacedCodecSpine u32MarkerLayouts "W" 0 u32MarkerLayout 0 [0, 1]
+    u32MarkerPlaced 4 (.cons (TupleFieldCodec.uint _ .u32) (.cons (TupleFieldCodec.unit _) .nil))
+    rfl rfl rfl rfl rfl u32Marker_fallbackSound
+    (.cons (Nat.le_refl 0) (.cons (Nat.le_refl 4) (.nil (Nat.le_refl 4))))
+
+/-- `struct W(u32, PhantomData<T>)` is tight: `IsIntoBytes` and `IsFromBytes`. -/
+theorem u32MarkerAdt_isIntoBytes_and_isFromBytes :
+    IsIntoBytes u32MarkerLayouts { kind := .adt "W" [.uint .u32, .tuple []], layoutIdx := 0 } ∧
+    IsFromBytes u32MarkerLayouts { kind := .adt "W" [.uint .u32, .tuple []], layoutIdx := 0 } :=
+  ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed u32MarkerPlaced 4 rfl
+      u32MarkerAdtCodec rfl rfl (by decide)
+      ⟨FixedByteCodec.uintBitsLE_isInitCodec _ _, FixedByteCodec.unit_isInitCodec, trivial⟩).2.1,
+   (MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads u32MarkerPlaced 4 rfl u32MarkerAdtCodec rfl
+      ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, FixedByteCodec.unit_isSurjectiveInitDecoder,
+       trivial⟩).2.1⟩
+
+/-- `struct B(bool)` with `bool`'s `.scalar` niche (`0 ..= 1`) and no `fieldLayouts`. -/
+def boolNewtypeLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false }
+
+def boolNewtypeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [boolNewtypeLayout] }
+
+def boolNewtypePlaced : PlacedCodecSpine [Bool] :=
+  .cons (0, ⟨1, 1⟩) FixedByteCodec.boolByte .nil
+
+/-- The `.scalar` fallback enforces the niche: Trusted rejects `bool = 2` (kernel evaluation). -/
+example :
+    decodeValueFromBytes defaultCodecFuel boolNewtypeLayouts
+        { kind := .adt "B" [.bool], layoutIdx := 0 } [.init (UInt8.ofNat 2) none] = none :=
+  rfl
+
+/-- `AdtDecodeFallbackSound` for `struct B(bool)` via `of_scalar`. -/
+theorem boolNewtype_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound boolNewtypeLayouts boolNewtypeLayout 0 boolNewtypePlaced 1 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_scalar rfl rfl rfl
+    (fun slice _ h => MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes slice h)
+
+/-- `MirValueCodec` for the niche newtype `struct B(bool)`. -/
+def boolNewtypeAdtCodec :
+    MirValueCodec boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } (FieldTuple [Bool]) 1 :=
+  MirValueCodec.adtOfPlacedCodecSpine boolNewtypeLayouts "B" 0 boolNewtypeLayout 0 [0]
+    boolNewtypePlaced 1 (.cons (TupleFieldCodec.bool _) .nil)
+    rfl rfl rfl rfl rfl boolNewtype_fallbackSound
+    (.cons (Nat.le_refl 0) (.nil (Nat.le_refl 1)))
+
+/-- `struct B(bool)`: `IsIntoBytes` and `IsFromZeros`, but not `IsFromBytes` (`0x02` is rejected). -/
+theorem boolNewtypeAdt_isIntoBytes_and_isFromZeros_not_isFromBytes :
+    IsIntoBytes boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } ∧
+    IsFromZeros boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } ∧
+    ¬ IsFromBytes boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } := by
+  refine ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed
+      boolNewtypePlaced 1 rfl boolNewtypeAdtCodec rfl rfl rfl
+      ⟨FixedByteCodec.boolByte_isInitCodec, trivial⟩).2.1,
+    (MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      boolNewtypePlaced 1 rfl boolNewtypeAdtCodec rfl
+      ⟨FixedByteCodec.boolByte_hasZeroValid, trivial⟩).2.1, ?_⟩
+  rintro ⟨sz, hSz, hAll⟩
+  injection hSz with hSzEq
+  subst hSzEq
+  obtain ⟨v, hv⟩ := hAll [.init (UInt8.ofNat 2) none] rfl rfl
+  nomatch hv
+
+/-! ### `[adv ep1-A3]` Reordered 3-Field `(bool, i32, ())` Struct With Populated `fieldLayouts` & Non-Bool Scalar Niche Acceptance
+
+Exercises:
+1. `TupleFieldCodec.int` (signed `i32` field in a struct/tuple);
+2. `FieldLayoutsDecodeSound.cons_zst_unit` (0-byte ZST `()` / `PhantomData<T>` field in `fieldLayouts`);
+3. `FieldLayoutsDecodeSound.cons_primitive_scalar` / `cons_primitive_bool` alongside `cons_primitive_surjective` and `cons_zst_unit` on a reordered 3-field struct (`i32 @ 0`, `bool @ 4`, `() @ 5`, total size `5`, `fieldLayouts = [1, 2, 3]`);
+4. `MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes` on a non-boolean scalar niche (`NonZeroU8` range `⟨1, 255⟩`) at the fallback level only (`[adv ep1-B4]`: that spine has no `TupleFieldCodecs`, see `nonZeroU8Newtype_no_tupleFieldCodecs`).
+-/
+
+def i32PrimitiveFieldLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 true) ⟨0, 4294967295⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def unitZstFieldLayout : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
+
+def boolI32UnitWithFieldLayoutsEntry : TypeLayout :=
+  { size := ⟨5⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨4⟩, ⟨0⟩, ⟨5⟩] [1, 0, 2], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [1, 2, 3] }
+
+def boolI32UnitWithFieldLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [boolI32UnitWithFieldLayoutsEntry, boolPrimitiveFieldLayout,
+                i32PrimitiveFieldLayout, unitZstFieldLayout] }
+
+def boolI32UnitPlaced :
+    PlacedCodecSpine
+      [Bool, { bits : Nat // bits < 2 ^ (8 * MirValueCodec.intByteSize .i32) }, Unit] :=
+  .cons (4, ⟨1, 1⟩) FixedByteCodec.boolByte
+    (.cons (0, ⟨4, 4⟩) (FixedByteCodec.uintBitsLE 4 (by decide))
+      (.cons (5, ⟨0, 1⟩) FixedByteCodec.unit .nil))
+
+/--
+`FieldLayoutsDecodeSound` and `AdtDecodeFallbackSound` for the reordered 3-field `(bool, i32, ())`
+struct with populated `fieldLayouts = [1, 2, 3]`, composing `cons_primitive_bool`,
+`cons_primitive_surjective`, and `cons_zst_unit`.
+-/
+theorem boolI32UnitWithFieldLayouts_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound boolI32UnitWithFieldLayouts
+      boolI32UnitWithFieldLayoutsEntry 0 boolI32UnitPlaced 5 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts
+    (.cons_primitive_bool rfl rfl rfl rfl rfl rfl
+      (.cons_primitive_surjective rfl rfl rfl rfl rfl (by decide)
+        (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide))
+        (.cons_zst_unit rfl rfl .nil)))
+
+/-- `MirValueCodec` for the reordered 3-field `(bool, i32, ())` struct with populated `fieldLayouts`. -/
+def boolI32UnitWithFieldLayoutsAdtCodec :
+    MirValueCodec boolI32UnitWithFieldLayouts
+      { kind := .adt "S3" [.bool, .int .i32, .tuple []], layoutIdx := 0 }
+      (FieldTuple [Bool, { bits : Nat // bits < 2 ^ (8 * MirValueCodec.intByteSize .i32) }, Unit]) 5 :=
+  MirValueCodec.adtOfPlacedCodecSpine boolI32UnitWithFieldLayouts "S3" 0
+    boolI32UnitWithFieldLayoutsEntry 0 [1, 0, 2] boolI32UnitPlaced 5
+    (.cons (TupleFieldCodec.bool _)
+      (.cons (TupleFieldCodec.int _ .i32)
+        (.cons (TupleFieldCodec.unit _) .nil)))
+    rfl rfl rfl rfl rfl boolI32UnitWithFieldLayouts_fallbackSound
+    (.cons (Nat.le_refl 0) (.cons (Nat.le_refl 4) (.cons (Nat.le_refl 5) (.nil (Nat.le_refl 5)))))
+
+/--
+The tight reordered 3-field `struct S3(bool, i32, ())` with populated `fieldLayouts = [1, 2, 3]`
+satisfies `IsIntoBytes` and `IsFromZeros`, while failing `IsFromBytes` because `bool = 2` at byte
+offset `4` is rejected by both the primary window decoder and the `fieldLayouts` fallback.
+-/
+theorem boolI32UnitWithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromBytes :
+    let ty : Ty := { kind := .adt "S3" [.bool, .int .i32, .tuple []], layoutIdx := 0 }
+    IsIntoBytes boolI32UnitWithFieldLayouts ty ∧
+    IsFromZeros boolI32UnitWithFieldLayouts ty ∧
+    ¬ IsFromBytes boolI32UnitWithFieldLayouts ty := by
+  intro ty
+  refine ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed
+      boolI32UnitPlaced 5 rfl boolI32UnitWithFieldLayoutsAdtCodec rfl rfl (by decide)
+      ⟨FixedByteCodec.boolByte_isInitCodec,
+       FixedByteCodec.uintBitsLE_isInitCodec 4 (by decide),
+       FixedByteCodec.unit_isInitCodec,
+       trivial⟩).2.1,
+    (MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      boolI32UnitPlaced 5 rfl boolI32UnitWithFieldLayoutsAdtCodec rfl
+      ⟨FixedByteCodec.boolByte_hasZeroValid,
+       FixedByteCodec.uintBitsLE_hasZeroValid 4 (by decide),
+       FixedByteCodec.unit_hasZeroValid,
+       trivial⟩).2.1,
+    ?_⟩
+  rintro ⟨sz, hSz, hAll⟩
+  injection hSz with hSzEq
+  subst hSzEq
+  obtain ⟨v, hv⟩ := hAll
+    [.init (UInt8.ofNat 0) none, .init (UInt8.ofNat 0) none,
+     .init (UInt8.ofNat 0) none, .init (UInt8.ofNat 0) none,
+     .init (UInt8.ofNat 2) none] rfl rfl
+  nomatch hv
+
+/--
+Non-boolean scalar niche acceptance: `NonZeroU8` (`range = ⟨1, 255⟩`) newtype `.scalar` fallback
+soundness discharged directly by `MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes`.
+This is a fallback-level fact only: `nonZeroU8NewtypePlaced` has no `TupleFieldCodecs`
+(`nonZeroU8Newtype_no_tupleFieldCodecs`), so it cannot complete an `adtOfPlacedCodecSpine` codec.
+-/
+def nonZeroU8NewtypeLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨1, 255⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false }
+
+def nonZeroU8NewtypePlaced :
+    PlacedCodecSpine [{ bits : Nat // bits < 2 ^ (8 * 1) ∧ wrappingRangeContains ⟨1, 255⟩ bits = true }] :=
+  .cons (0, ⟨1, 1⟩) (FixedByteCodec.scalarValidRange 1 (by decide) ⟨1, 255⟩) .nil
+
+/-- `AdtDecodeFallbackSound.of_scalar` for `NonZeroU8` via `scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes`
+(fallback level only; see `nonZeroU8Newtype_no_tupleFieldCodecs`). -/
+theorem nonZeroU8Newtype_fallbackSound (layouts : LayoutTable) :
+    MirValueCodec.AdtDecodeFallbackSound layouts nonZeroU8NewtypeLayout 0 nonZeroU8NewtypePlaced 1 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_scalar rfl rfl rfl
+    (fun slice _ h =>
+      MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes
+        (.int 8 false) ⟨1, 255⟩ 1 (by decide) rfl rfl slice h)
+
+/-! ### `[adv ep1-B4]` Integer Niches (`NonZero*`) Have No `TupleFieldCodec`
+
+`nonZeroU8Newtype_fallbackSound` holds, but the `scalarValidRange` spine `nonZeroU8NewtypePlaced`
+admits no `TupleFieldCodecs` at `[.uint .u8]` (Trusted's typed integer decode is niche-blind:
+`TupleFieldCodec.uint_isSurjectiveInitDecoder`) nor at any ADT kind (no structural byte size:
+`TupleFieldCodec.not_adt`), so it can never complete an `adtOfPlacedCodecSpine` codec. At the Trusted
+level the type-argument path `.adt "NonZeroU8" [.uint .u8]` accepts `0x00`, while the
+niche-enforcing `.adt "NonZeroU8" []` path rejects it (the supported end-to-end route is
+`MirValueCodec.scalarNicheNewtypeNonPtr`). `bool` is the contrast case: its kind enforces the niche.
+-/
+
+def nonZeroU8NewtypeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [nonZeroU8NewtypeLayout] }
+
+/-- The type-argument decode path `.adt "NonZeroU8" [.uint .u8]` accepts `0x00` (niche bypassed). -/
+theorem nonZeroU8Newtype_typeArg_path_accepts_zero :
+    decodeValueFromBytes defaultCodecFuel nonZeroU8NewtypeLayouts
+        { kind := .adt "NonZeroU8" [.uint .u8], layoutIdx := 0 } [.init (UInt8.ofNat 0) none] =
+      some (.aggregate 0 [.scalar ⟨0, 1⟩]) := rfl
+
+/-- The niche-enforcing decode path `.adt "NonZeroU8" []` rejects `0x00`. -/
+theorem nonZeroU8Newtype_niche_path_rejects_zero :
+    decodeValueFromBytes defaultCodecFuel nonZeroU8NewtypeLayouts
+        { kind := .adt "NonZeroU8" [], layoutIdx := 0 } [.init (UInt8.ofNat 0) none] = none := rfl
+
+/-- No `TupleFieldCodec` at `.uint .u8` for the `NonZeroU8` niche codec (`0 ∉ ⟨1, 255⟩`). -/
+theorem nonZeroU8_no_uint_tupleFieldCodec (layouts : LayoutTable) :
+    ¬ Nonempty (TupleFieldCodec layouts (.uint .u8)
+      (FixedByteCodec.scalarValidRange 1 (by decide) ⟨1, 255⟩)) :=
+  TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range layouts .u8 (by decide) ⟨1, 255⟩
+    (bits := 0) (by decide) rfl
+
+/-- `nonZeroU8NewtypePlaced` admits no `TupleFieldCodecs` at `[.uint .u8]` nor at any ADT kind. -/
+theorem nonZeroU8Newtype_no_tupleFieldCodecs (layouts : LayoutTable) (k : RigidTy)
+    (hk : k = .uint .u8 ∨ ∃ defPath args, k = .adt defPath args) :
+    ¬ Nonempty (TupleFieldCodecs layouts [k] nonZeroU8NewtypePlaced) := by
+  intro ⟨fcs⟩
+  cases fcs with
+  | cons f _ =>
+    rcases hk with rfl | ⟨defPath, args, rfl⟩
+    · exact nonZeroU8_no_uint_tupleFieldCodec layouts ⟨f⟩
+    · exact TupleFieldCodec.not_adt layouts defPath args _ ⟨f⟩
+
+/-- `TupleFieldCodec.u8` and `TupleFieldCodec.uint .u8` accept the same windows (acceptance is fixed by kind). -/
+theorem u8_uint_same_acceptance (layouts : LayoutTable) (bs : List AbstractByte) :
+    (∃ x, FixedByteCodec.u8.decode bs = some x) ↔
+      (∃ y, (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u8)
+        (MirValueCodec.uintByteSize_pos .u8)).decode bs = some y) :=
+  TupleFieldCodec.decode_isSome_iff_of_sameKind (TupleFieldCodec.u8 layouts)
+    (TupleFieldCodec.uint layouts .u8) bs
+
+/-- Contrast: the `.bool` kind enforces its niche, so a non-surjective `TupleFieldCodec` exists there. -/
+theorem bool_tupleFieldCodec_niche_enforcing (layouts : LayoutTable) :
+    ¬ FixedByteCodec.boolByte.IsSurjectiveInitDecoder ∧
+      Nonempty (TupleFieldCodec layouts .bool FixedByteCodec.boolByte) :=
+  ⟨FixedByteCodec.boolByte_not_isSurjectiveInitDecoder, ⟨TupleFieldCodec.bool layouts⟩⟩
+
+/-! ### `[adv ep1-A4]` End-to-End Multi-Field `NonZeroU8` Struct Codec on the `l.fieldLayouts` Path (`args = []`)
+
+While `TupleFieldCodec` (the `byArgs` path `args.length = offsets.length`) cannot carry integer niches
+(`nonZeroU8_no_uint_tupleFieldCodec`, `nonZeroU8Newtype_no_tupleFieldCodecs`), a non-generic Rust struct
+`struct NonZeroPair { a: NonZeroU8, b: u8, _marker: () }` has MIR type `.adt "NonZeroPair" []`
+(`args = []`, so `args.length ≠ offsets.length`) and populated `l.fieldLayouts = [1, 2, 3]`.
+On this path, `FieldLayoutCodec.scalarValidRange`, `FieldLayoutCodec.unit`, and
+`MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine` construct a full $k$-field `MirValueCodec` that
+enforces `NonZeroU8`'s `1 ..= 255` niche (`¬ IsFromZeros`, `¬ IsFromBytes`), proves `IsTryFromBytes`,
+and supports typed transmutation (`MirValueCodec.transmute_typed`)!
+-/
+
+def nonZeroU8PrimitiveFieldLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨1, 255⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def unitPrimitiveFieldLayout : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def nonZeroU8U8UnitEntry : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨1⟩, ⟨0⟩, ⟨2⟩] [1, 0, 2], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [1, 2, 3] }
+
+def nonZeroU8U8UnitLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [nonZeroU8U8UnitEntry, nonZeroU8PrimitiveFieldLayout,
+                u8PrimitiveFieldLayout, unitPrimitiveFieldLayout] }
+
+def nonZeroU8U8UnitPlaced :
+    PlacedCodecSpine
+      [{ bits : Nat // bits < 2 ^ (8 * 1) ∧ wrappingRangeContains ⟨1, 255⟩ bits = true },
+       { bits : Nat // bits < 2 ^ (8 * 1) ∧ wrappingRangeContains ⟨0, 255⟩ bits = true },
+       Unit] :=
+  .cons (1, ⟨1, 1⟩) (FixedByteCodec.scalarValidRange 1 (by decide) ⟨1, 255⟩)
+    (.cons (0, ⟨1, 1⟩) (FixedByteCodec.scalarValidRange 1 (by decide) ⟨0, 255⟩)
+      (.cons (2, ⟨0, 1⟩) FixedByteCodec.unit .nil))
+
+/-- `FieldLayoutCodecs` for the reordered 3-field `(NonZeroU8, u8, ())` struct (`u8` at offset 0, `NonZeroU8` at offset 1, `()` at offset 2). -/
+def nonZeroU8U8UnitFieldLayoutCodecs :
+    MirValueCodec.FieldLayoutCodecs nonZeroU8U8UnitLayouts [1, 2, 3] nonZeroU8U8UnitPlaced :=
+  .cons
+    (MirValueCodec.FieldLayoutCodec.scalarValidRange nonZeroU8U8UnitLayouts 1 nonZeroU8PrimitiveFieldLayout
+      1 (.int 8 false) 0 ⟨1, 255⟩ (by decide) rfl rfl rfl rfl rfl rfl rfl rfl)
+    (.cons
+      (MirValueCodec.FieldLayoutCodec.scalarValidRange nonZeroU8U8UnitLayouts 2 u8PrimitiveFieldLayout
+        1 (.int 8 false) 0 ⟨0, 255⟩ (by decide) rfl rfl rfl rfl rfl rfl rfl rfl)
+      (.cons
+        (MirValueCodec.FieldLayoutCodec.unit nonZeroU8U8UnitLayouts 3 unitPrimitiveFieldLayout 0
+          rfl rfl rfl rfl rfl)
+        .nil))
+
+/--
+`FieldLayoutCodecs.toFieldLayoutsDecodeSound` automatically produces `FieldLayoutsDecodeSound` for
+`nonZeroU8U8UnitPlaced`.
+-/
+theorem nonZeroU8U8Unit_fieldLayoutsDecodeSound :
+    MirValueCodec.FieldLayoutsDecodeSound nonZeroU8U8UnitLayouts nonZeroU8U8UnitPlaced [1, 2, 3] :=
+  nonZeroU8U8UnitFieldLayoutCodecs.toFieldLayoutsDecodeSound
+
+/--
+End-to-end `MirValueCodec` for the non-generic 3-field `struct NonZeroPair { a: NonZeroU8, b: u8, c: () }`
+(`{ kind := .adt "NonZeroPair" [], layoutIdx := 0 }`) constructed via
+`MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine`.
+-/
+def nonZeroU8U8UnitAdtCodec :
+    MirValueCodec nonZeroU8U8UnitLayouts { kind := .adt "NonZeroPair" [], layoutIdx := 0 }
+      (FieldTuple
+        [{ bits : Nat // bits < 2 ^ (8 * 1) ∧ wrappingRangeContains ⟨1, 255⟩ bits = true },
+         { bits : Nat // bits < 2 ^ (8 * 1) ∧ wrappingRangeContains ⟨0, 255⟩ bits = true },
+         Unit]) 2 :=
+  MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine nonZeroU8U8UnitLayouts "NonZeroPair" [] 0
+    nonZeroU8U8UnitEntry 0 [1, 0, 2] nonZeroU8U8UnitPlaced 2 nonZeroU8U8UnitFieldLayoutCodecs
+    (by decide) rfl rfl rfl rfl rfl rfl
+    (.cons (Nat.le_refl 0) (.cons (Nat.le_refl 1) (.cons (Nat.le_refl 2) (.nil (Nat.le_refl 2)))))
+
+/--
+The reordered 3-field `struct NonZeroPair { a: NonZeroU8, b: u8, c: () }` (`args = []`,
+`fieldLayouts = [1, 2, 3]`) satisfies `IsTryFromBytes`, while rejecting `[0x07, 0x00]` (`a = 0` at
+offset 1) and therefore failing both `IsFromZeros` and `IsFromBytes`!
+-/
+theorem nonZeroU8U8UnitAdt_isTryFromBytes_not_isFromZeros_not_isFromBytes :
+    let ty : Ty := { kind := .adt "NonZeroPair" [], layoutIdx := 0 }
+    IsTryFromBytes nonZeroU8U8UnitLayouts ty ∧
+    ¬ IsFromZeros nonZeroU8U8UnitLayouts ty ∧
+    ¬ IsFromBytes nonZeroU8U8UnitLayouts ty := by
+  intro ty
+  refine ⟨nonZeroU8U8UnitAdtCodec.isTryFromBytes_trivial, ?_, ?_⟩
+  · rintro ⟨sz, v, hSz, hZero⟩
+    injection hSz with hSzEq
+    subst hSzEq
+    nomatch hZero
+  · rintro ⟨sz, hSz, hAll⟩
+    injection hSz with hSzEq
+    subst hSzEq
+    obtain ⟨v, hv⟩ := hAll [.init (UInt8.ofNat 7) none, .init (UInt8.ofNat 0) none] rfl rfl
+    nomatch hv
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.decode_isSome_iff_of_sameKind' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.decode_isSome_iff_of_sameKind
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8_no_uint_tupleFieldCodec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8_no_uint_tupleFieldCodec
+
+/-- info: 'Anneal.ByteCodecTests.u8_uint_same_acceptance' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8_uint_same_acceptance
+
+/-- info: 'Anneal.ByteCodecTests.bool_tupleFieldCodec_niche_enforcing' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms bool_tupleFieldCodec_niche_enforcing
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutCodec.scalarValidRange' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutCodec.scalarValidRange
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutCodec.unit' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutCodec.unit
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutCodecs.toFieldLayoutsDecodeSound' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutCodecs.toFieldLayoutsDecodeSound
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfFieldLayoutsPlacedCodecSpine
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8U8UnitAdt_isTryFromBytes_not_isFromZeros_not_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8U8UnitAdt_isTryFromBytes_not_isFromZeros_not_isFromBytes
+
+/-- info: 'Anneal.ByteCodec.FixedByteCodec.scalarValidRange_contains_of_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms FixedByteCodec.scalarValidRange_contains_of_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.decode_isSome_of_sameKind' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.decode_isSome_of_sameKind
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.isSurjectiveInitDecoder_of_sameKind' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.isSurjectiveInitDecoder_of_sameKind
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.uint_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.uint_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.int_isSurjectiveInitDecoder' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.int_isSurjectiveInitDecoder
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.uint_not_scalarValidRange_of_out_of_range
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.int_not_scalarValidRange_of_out_of_range' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.int_not_scalarValidRange_of_out_of_range
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.not_of_kindSize_none' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.not_of_kindSize_none
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.not_adt' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.not_adt
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_typeArg_path_accepts_zero' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_typeArg_path_accepts_zero
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_niche_path_rejects_zero' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_niche_path_rejects_zero
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_no_tupleFieldCodecs' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_no_tupleFieldCodecs
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.int' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.int
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.int' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.int
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound.cons_zst_unit' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutsDecodeSound.cons_zst_unit
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_scalar' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_scalar
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_scalarValidRange' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_scalarValidRange
+
+/-- info: 'Anneal.ByteCodecTests.boolI32UnitWithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms boolI32UnitWithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromBytes
+
+/-- info: 'Anneal.ByteCodecTests.nonZeroU8Newtype_fallbackSound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nonZeroU8Newtype_fallbackSound
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_span_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_span_surjective
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_scalar' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_scalar
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_scalarPair' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_scalarPair
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes
+
+/-- info: 'Anneal.ByteCodecTests.u32MarkerAdt_isIntoBytes_and_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u32MarkerAdt_isIntoBytes_and_isFromBytes
+
+/-- info: 'Anneal.ByteCodecTests.boolNewtypeAdt_isIntoBytes_and_isFromZeros_not_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms boolNewtypeAdt_isIntoBytes_and_isFromZeros_not_isFromBytes
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_scalar_surjective' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_scalar_surjective
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_scalarPair_surjective' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_scalarPair_surjective
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_fieldLayouts
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_surjective
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_bool' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.FieldLayoutsDecodeSound.cons_primitive_bool
+
+/-- info: 'Anneal.ByteCodecTests.boolU8WithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms boolU8WithFieldLayoutsAdt_isIntoBytes_and_isFromZeros_not_isFromBytes
+
+/-- info: 'Anneal.ByteCodec.decodeFieldsBySpan_some_initAt' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeFieldsBySpan_some_initAt
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.decodeAt_isSome_of_initAt' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.decodeAt_isSome_of_initAt
+
+/-- info: 'Anneal.ByteCodecTests.u8u32PairAdt_not_isIntoBytes_but_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8u32PairAdt_not_isIntoBytes_but_isFromBytes
+
+/-- info: 'Anneal.ByteCodecTests.boolU8Adt_not_fallbackSound' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms boolU8Adt_not_fallbackSound
+
+/-! ### Axiom pins for the general constructor and the newly `Classical.choice`-free theorems -/
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_encode_toValue' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine_encode_toValue
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_encode_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine_encode_witness
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_decode_eq_map' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine_decode_eq_map
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.writeWindows_realizedCodec_encode' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.writeWindows_realizedCodec_encode
+
+/-- info: 'Anneal.ByteCodec.PlacedCodecSpine.realizedCodec_decode_eq_decodeAt' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms PlacedCodecSpine.realizedCodec_decode_eq_decodeAt
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.uint' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.uint
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.mapEquiv' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.mapEquiv
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.u8' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.u8
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.bool' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.bool
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.u8ListFixed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.u8ListFixed
+
+/-- info: 'Anneal.ByteCodec.TupleFieldCodec.u8Array' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TupleFieldCodec.u8Array
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine_encode_toValue' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine_encode_toValue
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine_encode_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine_encode_witness
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.adtOfPlacedCodecSpine_decode_eq_map' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.adtOfPlacedCodecSpine_decode_eq_map
+
+/--
+Concrete parametric equivalence instance: `u8u32PairLayouts` `(u8, u32)` tuple codec constructed
+via `uintPairArbitraryTuple` and via `ofPlacedCodecSpine` agree on every value and every byte buffer.
+-/
+theorem u8u32Pair_uintPairArbitraryTuple_eq_ofPlacedCodecSpine :
+    let mPair := MirValueCodec.uintPairArbitraryTuple u8u32PairLayouts .u8 .u32 3 0 0
+      u8u32PairLayout [0, 1] rfl rfl rfl
+    let mGen := MirValueCodec.uintPairArbitraryTupleOfPlacedCodecSpine u8u32PairLayouts .u8 .u32
+      3 0 0 u8u32PairLayout [0, 1] rfl rfl rfl
+    (∀ x₁ x₂, mPair.toValue (x₁, x₂) = mGen.toValue (x₁, x₂, ())) ∧
+    (∀ x₁ x₂, mPair.codec.encode (x₁, x₂) = mGen.codec.encode (x₁, x₂, ())) ∧
+    (∀ bs, (mPair.codec.decode bs).map (fun p => (p.1, p.2, ())) = mGen.codec.decode bs) :=
+  MirValueCodec.uintPairArbitraryTuple_eq_ofPlacedCodecSpine
+    u8u32PairLayouts .u8 .u32 3 0 0 u8u32PairLayout [0, 1] rfl rfl rfl
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone.of_sentinel_fieldLayouts' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackNone.of_sentinel_fieldLayouts
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackNone.of_reordered_head' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackNone.of_reordered_head
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.uintPairArbitraryTuple_eq_ofPlacedCodecSpine' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.uintPairArbitraryTuple_eq_ofPlacedCodecSpine
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.u8u32UnitPermutedArbitraryTuple' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.u8u32UnitPermutedArbitraryTuple
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.ofPlacedCodecSpine_pad_pos_not_intoBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.ofPlacedCodecSpine_pad_pos_not_intoBytes
+
+/-- info: 'Anneal.ByteCodec.laidOutStructSymbolicPadPerm_encode_uninit_of_pad_pos' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms laidOutStructSymbolicPadPerm_encode_uninit_of_pad_pos
+
+/-- info: 'Anneal.ByteCodec.uintPairArbitraryTuple_isFromBytes_all_pads' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms uintPairArbitraryTuple_isFromBytes_all_pads
+
+/-- info: 'Anneal.ByteCodec.uintPairArbitraryTuple_encode_eq_symbolicPad' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms uintPairArbitraryTuple_encode_eq_symbolicPad
+
+/-- info: 'Anneal.ByteCodec.u8u32PairLayouts_not_isIntoBytes_but_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u8u32PairLayouts_not_isIntoBytes_but_isFromBytes
+
+/-- info: 'Anneal.ByteCodec.pinnedZeroPadPair_isIntoBytes_and_transmute_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms pinnedZeroPadPair_isIntoBytes_and_transmute_sound
+
 end Anneal.ByteCodecTests

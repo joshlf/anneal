@@ -166,6 +166,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_bit_validity_stage1",
             "tests_mir_byte_codec",
             "tests_mir_cast_stage1",
+            "tests_mir_adt_and_control",
             "lake_build_correspondence",
             "lake_build_minirust_spec",
             "lake_build_lean_miri_spec",
@@ -207,8 +208,22 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             for mod in imports:
                 if mod.split(".")[0] in suite.CORE_THEORY_LIBS + ("Correspondence", "MiniRustSpec"):
                     self.assertIn(mod, built, f"{rel} imports {mod}, which must be pre-built")
-        self.assertTrue({"Anneal.ByteCodec", "Anneal.Mir.Cast"} <= built)
+        self.assertTrue({"Anneal.ByteCodec", "Anneal.Mir.Cast", "Anneal.Mir.AdtAndControl"} <= built)
         self.assertEqual(sorted(built), sorted(suite._MIR_TEST_MODULE_FALLBACK))
+        # The exact standalone `tests/mir` suites the nightly runs, including the
+        # `Anneal.Mir.AdtAndControl` kernel-regression / axiom-pin suite.
+        self.assertEqual(
+            sorted(rel for _step, rel in suite.MIR_STANDALONE_LEAN_TESTS),
+            sorted(
+                f"tests/mir/{name}.lean"
+                for name in (
+                    "BitValidityStage1Tests",
+                    "ByteCodecTests",
+                    "CastStage1Tests",
+                    "AdtAndControlTests",
+                )
+            ),
+        )
 
     def test_timeout_propagation_and_calibrated_step_timeouts(self) -> None:
         nightly_by_name = {
@@ -223,6 +238,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_bit_validity_stage1": 300,
             "tests_mir_byte_codec": 300,
             "tests_mir_cast_stage1": 300,
+            "tests_mir_adt_and_control": 300,
             "lake_build_correspondence": 900,
             "lake_build_minirust_spec": 1200,
             "lake_build_lean_miri_spec": 1800,

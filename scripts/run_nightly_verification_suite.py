@@ -1369,12 +1369,14 @@ def _run_step(
 
 
 # Standalone `nightly` Lean test files. `lake env lean` never builds imports, so each
-# module they import needs an up-to-date `.olean` before they run; `Anneal.ByteCodec`
-# and `Anneal.Mir.Cast` are outside the `Trusted`/`Anneal`/`MiniRust` import closure.
+# module they import needs an up-to-date `.olean` before they run; `Anneal.ByteCodec`,
+# `Anneal.Mir.Cast` and `Anneal.Mir.AdtAndControl` are outside the
+# `Trusted`/`Anneal`/`MiniRust` import closure.
 MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_bit_validity_stage1", "tests/mir/BitValidityStage1Tests.lean"),
     ("tests_mir_byte_codec", "tests/mir/ByteCodecTests.lean"),
     ("tests_mir_cast_stage1", "tests/mir/CastStage1Tests.lean"),
+    ("tests_mir_adt_and_control", "tests/mir/AdtAndControlTests.lean"),
 )
 CORE_THEORY_LIBS: tuple[str, ...] = ("Trusted", "Anneal", "MiniRust")
 _LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
@@ -1389,6 +1391,7 @@ _MIR_TEST_MODULE_FALLBACK: tuple[str, ...] = (
     "Anneal.BitValidity",
     "Anneal.ByteCodec",
     "Anneal.Mir.Cast",
+    "Anneal.Mir.AdtAndControl",
 )
 _LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
 
@@ -1629,7 +1632,9 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             wrap="build",
         )
         # Cold `+Anneal.BitValidity +Anneal.ByteCodec +Anneal.Mir.Cast` after the core
-        # build measures ~96 s on an 8-core capsule.
+        # build measures ~96 s on an 8-core capsule; rebuilding `Anneal.Mir.AdtAndControl`
+        # (28.8k lines, also imported by `MiniRustSpec` via `DeinitBridge`, so
+        # `lake_build_minirust_spec` reuses it) adds ~200 s.
         add(
             "lake_build_mir_test_modules",
             "cat1_trusted_boundary",
