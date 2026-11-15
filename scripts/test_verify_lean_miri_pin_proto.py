@@ -369,6 +369,14 @@ class VendorTamperTests(TempCase):
             "strict mode: UPSTREAM_PIN.json declares 6 patched_files entries",
             "SHA-256 mismatch for Miri/Interpreter/ExecutionMachine.lean",
         )
+        with self.subTest("4-key schema omitting upstream_git_blob falls back to LOCKED_DEINIT_BLOBS"):
+            pin = ws.pin()
+            for entry in pin["patched_files"]:
+                entry.pop("upstream_git_blob", None)
+            ws.write_pin(pin)
+            v4 = V.verify_vendor(ws.root, allow_deinit_patch=True)
+            self.assertEqual(len(v4.patched_files), 6)
+            self.assertEqual(v4.git_objects["Miri"], "tree")
 
     def test_patch_subset_of_allowlist_accepted(self) -> None:
         ws = self.workspace()
@@ -705,7 +713,19 @@ class VendorTamperTests(TempCase):
             outside = self.tmp / "Place.olean"
             outside.write_bytes(blobs["Miri/Interpreter/Place.olean"])
             os.symlink(outside, olean / "Miri/Interpreter/Place.olean")
-            self.assertRejected(lambda: V.verify_vendor(ws.root, olean_dir=olean), "cannot hash closure artifact Miri/Interpreter/Place.olean")
+            self.assertRejected(lambda: V.verify_vendor(ws.root, olean_dir=olean), "invalid file mode for Miri/Interpreter/Place.olean")
+            (olean / "Miri/Interpreter/Place.olean").unlink()
+            (olean / "Miri/Interpreter/Place.olean").write_bytes(blobs["Miri/Interpreter/Place.olean"])
+        with self.subTest("hard-linked olean"):
+            hard = self.tmp / "Place-hard.olean"
+            os.link(olean / "Miri/Interpreter/Place.olean", hard)
+            self.assertRejected(lambda: V.verify_vendor(ws.root, olean_dir=olean), "invalid file mode for Miri/Interpreter/Place.olean")
+            hard.unlink()
+        with self.subTest("unlisted olean in olean_dir"):
+            rogue = olean / "Miri/Interpreter/Rogue.olean"
+            rogue.write_bytes(b"rogue-olean")
+            self.assertRejected(lambda: V.verify_vendor(ws.root, olean_dir=olean), "unlisted .olean file found: Miri/Interpreter/Rogue.olean")
+            rogue.unlink()
         with self.subTest("closure without ExecutionMachine / without vendored source"):
             pin["execution_machine_closure"] = [{"path": "Miri/Evil.olean", "sha256": "0" * 64}]
             ws.write_pin(pin)
@@ -727,7 +747,7 @@ class VendorTamperTests(TempCase):
             blob = V.git_blob_sha1(originals[rel])
             self.assertTrue(any(blob.startswith(p) for p in pre_images), rel)
             pin["patched_files"].append(
-                {"path": rel, "upstream_sha256": _sha256(originals[rel]), "patched_sha256": _sha256(patched), "patch_reason": "joshlf d9b41b58b deinitMovedPlace", "upstream_git_blob": blob}
+                {"path": rel, "upstream_sha256": _sha256(originals[rel]), "patched_sha256": _sha256(patched), "patch_reason": "joshlf d9b41b58b deinitMovedPlace"}
             )
         ws.write_pin(pin)
         self.assertEqual(len(V.verify_vendor(ws.root, allow_deinit_patch=True).patched_files), 6)

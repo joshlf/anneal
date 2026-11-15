@@ -614,6 +614,37 @@ theorem internTys_good : ∀ {tt : TypeTable} (_ : tt.Good) (tys : List Ty), (in
   | _, h, [] => h
   | _, h, ty :: tys => internTys_good (internTy_good h ty) tys
 
+/-- Intern a list of structural `RigidTy`s (bottom-up post-order) into `kinds`
+without adding `Ty` entries (used for `CapturedMir.traitImpls` type arguments). -/
+def internKinds (tt : TypeTable) (ks : List RigidTy) : TypeTable :=
+  { kinds := insertAll tt.kinds (RigidTy.postorderList ks), types := tt.types }
+
+theorem internKinds_extends (tt : TypeTable) (ks : List RigidTy) :
+    tt.Extends (internKinds tt ks) :=
+  ⟨insertAll_prefix _ _, ⟨[], by simp [internKinds]⟩⟩
+
+theorem internKinds_good {tt : TypeTable} (h : tt.Good) (ks : List RigidTy) :
+    (internKinds tt ks).Good := by
+  obtain ⟨hk, ht, hc⟩ := h
+  refine ⟨canonical_insertAll _ _ hk, ht, ?_⟩
+  intro t htm x hx
+  exact mem_insertAll.mpr (Or.inl (hc t htm hx))
+
+theorem RigidTy.postorder_sub_postorderList : ∀ {k : RigidTy} {ks : List RigidTy},
+    k ∈ ks → RigidTy.postorder k ⊆ RigidTy.postorderList ks
+  | _, [], h => by cases h
+  | _, _ :: ks, h => by
+    intro x hx
+    simp only [RigidTy.postorderList, List.mem_append]
+    cases h with
+    | head => exact Or.inl hx
+    | tail _ h' => exact Or.inr (RigidTy.postorder_sub_postorderList h' hx)
+
+theorem mem_internKinds_postorder {tt : TypeTable} {ks : List RigidTy} {k : RigidTy}
+    (hk : k ∈ ks) : RigidTy.postorder k ⊆ (internKinds tt ks).kinds := by
+  intro x hx
+  exact mem_insertAll.mpr (Or.inr (RigidTy.postorder_sub_postorderList hk hx))
+
 /-! ### `Ty` ↔ `TyId` -/
 
 /-- Encode a `Ty` as its interned `TyId`. -/
@@ -852,6 +883,13 @@ def bodyTys (b : CapturedMir) : List Ty :=
 
 def progTys (p : V2026Prog) : List Ty := p.bodies.flatMap bodyTys
 
+/-- Structural `RigidTy` arguments appearing in `CapturedMir.traitImpls`. -/
+def bodyTraitKinds (b : CapturedMir) : List RigidTy :=
+  b.traitImpls.flatMap (fun ti => ti.traitRef.args)
+
+def progTraitKinds (p : V2026Prog) : List RigidTy :=
+  p.bodies.flatMap bodyTraitKinds
+
 /-! ### Encoder -/
 
 def encodeProjElem (tt : TypeTable) : ProjectionElem → RefProjectionElem
@@ -950,8 +988,10 @@ def encodeBody (tt : TypeTable) (b : CapturedMir) : RefBody :=
     typeParamCount := b.typeParamCount, genericParams := b.genericParams
     traitImpls := b.traitImpls }
 
-/-- The program's canonical type table. -/
-def collectProgTypes (p : V2026Prog) : TypeTable := internTys initTypeTable (progTys p)
+/-- The program's canonical type table (interning all `Ty` occurrences plus all
+`CapturedMir.traitImpls` `RigidTy` arguments in bottom-up post-order). -/
+def collectProgTypes (p : V2026Prog) : TypeTable :=
+  internKinds (internTys initTypeTable (progTys p)) (progTraitKinds p)
 
 /-- Total encoder `V2026Prog → RefProg`. -/
 def encodeProg (p : V2026Prog) : RefProg :=
@@ -1270,8 +1310,9 @@ theorem encodeProg_types_canonical (p : V2026Prog) :
     nth? (encodeProg p).types.kinds 0 = some (.tuple []) ∧
     nth? (encodeProg p).types.kinds 1 = some .bool ∧
     nth? (encodeProg p).types.kinds 2 = some (.uint .usize) := by
-  have hg := internTys_good initTypeTable_good (progTys p)
-  obtain ⟨⟨l, hl⟩, _⟩ := internTys_extends initTypeTable (progTys p)
+  have hg := internKinds_good (internTys_good initTypeTable_good (progTys p)) (progTraitKinds p)
+  obtain ⟨⟨l, hl⟩, _⟩ :=
+    (internTys_extends initTypeTable (progTys p)).trans (internKinds_extends _ (progTraitKinds p))
   refine ⟨hg.2.1, hg.1, ?_, hg.2.2, ?_, ?_, ?_⟩
   · intro i j ty₁ ty₂ hi hj
     constructor
@@ -1280,6 +1321,16 @@ theorem encodeProg_types_canonical (p : V2026Prog) :
   all_goals
     show nth? (collectProgTypes p).kinds _ = _
     simp only [collectProgTypes]; rw [hl]; rfl
+
+/-- Every `RigidTy` argument in every `CapturedMir.traitImpls` entry of `p` has
+its full bottom-up `RigidTy.postorder` interned in `(encodeProg p).types.kinds`. -/
+theorem encodeProg_traitImpl_kinds_interned (p : V2026Prog) (b : CapturedMir)
+    (hb : b ∈ p.bodies) (ti : TraitImplEntry) (hti : ti ∈ b.traitImpls)
+    (k : RigidTy) (hk : k ∈ ti.traitRef.args) :
+    RigidTy.postorder k ⊆ (encodeProg p).types.kinds := by
+  have hmem : k ∈ progTraitKinds p :=
+    List.mem_flatMap.mpr ⟨b, hb, List.mem_flatMap.mpr ⟨ti, hti, hk⟩⟩
+  exact mem_internKinds_postorder hmem
 
 /-! ### Anti-laundering: constructor tags are preserved -/
 
@@ -2724,6 +2775,8 @@ def constSem (sty : Option SemTy) (v : ConstValue) : Option SemOperand :=
     match v with
     | .zeroSized => some (.const [] ty)
     | .scalar (.int si) => some (.const (encodeLittleEndianBytes si.bits si.sizeBytes .none) ty)
+    | .scalar (.ptr p sz) =>
+      some (.const (encodeLittleEndianBytes p.offsetBytes sz (some (p.allocId, p.tag))) ty)
     | _ => none
 
 def annealResolveOperand (b : CapturedMir) : Operand → Option SemOperand
@@ -3471,6 +3524,59 @@ theorem simulationInv_bijective (p : V2026Prog) :
       · cases hr
       · rename_i f; cases f <;> cases hr
 
+/-- Well-formedness of a `V2026_06_01` program (`M_anneal` input): entry body
+exists, every body is at `MirPhaseTag.runtimePostCleanup`, and every local
+declaration resolves in its body's `LayoutTable`. -/
+def ProgWellFormed (p : V2026Prog) : Prop :=
+  p.entry < p.bodies.length ∧
+  ∀ b ∈ p.bodies,
+    b.phase = .runtimePostCleanup ∧
+    ∀ d ∈ b.localDecls, ∃ st, annealResolveTy b.layouts d.ty = some st
+
+/-- Reference program well-formedness (`M_ref` input): canonical type table,
+entry body in bounds, every body at `MirPhaseTag.runtimePostCleanup`, and
+every local declaration `TyId` answers `.ok (.layout k l)` under demand-time
+`evalLayoutQuery`. -/
+def RefProgWellFormed (rp : RefProg) : Prop :=
+  rp.types.Good ∧
+  rp.entry < rp.bodies.length ∧
+  ∀ rb ∈ rp.bodies,
+    rb.phase = .runtimePostCleanup ∧
+    ∀ rd ∈ rb.localDecls, ∃ k l, evalLayoutQuery rp.types rb.layouts (.localLayout rd.ty) = .ok (.layout k l)
+
+/-- Encoding a well-formed `V2026Prog` produces a well-formed `RefProg`
+(`WellFormed p → RefWellFormed (encodeProg p)`). -/
+theorem refProgWellFormed_encodeProg (p : V2026Prog) (h : ProgWellFormed p) :
+    RefProgWellFormed (encodeProg p) := by
+  obtain ⟨hent, hb⟩ := h
+  refine ⟨internKinds_good (internTys_good initTypeTable_good (progTys p)) (progTraitKinds p), ?_, ?_⟩
+  · simp only [encodeProg_bodies, encodeProg_entry, List.length_map]; exact hent
+  · intro rb hrb
+    simp only [encodeProg_bodies, List.mem_map] at hrb
+    obtain ⟨b, hbm, rfl⟩ := hrb
+    obtain ⟨hph, hd⟩ := hb b hbm
+    have hcov := bodyCovered_decls (encodeProg_body_covered p b hbm)
+    refine ⟨hph, ?_⟩
+    intro rd hrd
+    simp only [encodeBody, List.mem_map] at hrd
+    obtain ⟨d, hdm, rfl⟩ := hrd
+    obtain ⟨⟨k, l⟩, hty⟩ := hd d hdm
+    have href : refResolveTy (encodeProg p).types b.layouts (encodeType (collectProgTypes p) d.ty) =
+        some (k, l) := by
+      rw [encodeProg_types, refResolveTy_encode b.layouts (hcov d hdm), hty]
+    simp only [refResolveTy] at href
+    cases hq : evalLayoutQuery (encodeProg p).types b.layouts (.localLayout (encodeType (collectProgTypes p) d.ty)) with
+    | missingHook => rw [hq] at href; cases href
+    | blocked => rw [hq] at href; cases href
+    | ok a =>
+      rw [hq] at href
+      cases a with
+      | layout k' l' =>
+        simp only [Option.some.injEq, Prod.mk.injEq] at href
+        obtain ⟨rfl, rfl⟩ := href
+        exact ⟨_, _, hq⟩
+      | _ => cases href
+
 
 /-- Run a strategy variant of `M_ref` (no budget) for at most `fuel` steps. -/
 def refRunWith (S : OperandStrategy) (rp : RefProg) : Nat → PState → StepOut
@@ -3557,6 +3663,20 @@ def d1MoveThenRead : V2026Prog := prog1 <| mkBody "d1" 0 [tU8, tU8, tU8]
 
 theorem canary_D1_direct_move_ub :
     bothObs d1MoveThenRead = (.ub .invalidUninitBytes, .ub .invalidUninitBytes) := by decide
+
+/-- Non-vacuity witness for `ProgWellFormed` and `RefProgWellFormed`. -/
+theorem refProgWellFormed_nonvacuous :
+    ProgWellFormed d1MoveThenRead ∧ RefProgWellFormed (encodeProg d1MoveThenRead) := by
+  have hwf : ProgWellFormed d1MoveThenRead := by
+    refine ⟨by decide, ?_⟩
+    intro b hb
+    simp only [d1MoveThenRead, prog1, List.mem_singleton] at hb
+    subst hb
+    refine ⟨rfl, ?_⟩
+    intro d hd
+    simp only [mkBody, List.mem_map, List.mem_cons, List.not_mem_nil, or_false] at hd
+    rcases hd with ⟨ty, rfl | rfl | rfl, rfl⟩ <;> exact ⟨(kU8, lay kU8), rfl⟩
+  exact ⟨hwf, refProgWellFormed_encodeProg d1MoveThenRead hwf⟩
 
 def d1ZstMove : V2026Prog := prog1 <| mkBody "d1z" 0 [tUnit, tUnit, tUnit]
   [blk [asg (loc 1) (.use cUnit), asg (loc 2) (.use (.move (loc 1))),
@@ -3996,6 +4116,90 @@ theorem deinitMovedPlace_preserves_tb_tags (pb : Nat) (st : PState) (p : SemPlac
             obtain ⟨e', h1, h2, h3⟩ := loadMPlace_preserves_frozen hl i e hi hf
             exact ⟨e', by rw [hb4]; exact h1, h2, h3⟩
 
+/-- **`deinitMovedPlace_assignUse_preserves_tb_tags`**: for `StatementKind.assign`
+via `twoPhaseAssignUse` (`refCopyRuntimePlaceNoValidate`), moving any place `p`
+into an unprojected immediate destination local `dest` preserves every `.frozen`
+Tree Borrows entry of `st.borrows` (closing the gap between `twoPhaseReadOperand`
+and `StatementKind.assign` in `canary_D5`). -/
+theorem deinitMovedPlace_assignUse_preserves_tb_tags (pb : Nat) (st : PState)
+    (p dest : SemPlace) (st₁ : PState)
+    (h : twoPhaseAssignUse true pb st (.move p) dest = .ok st₁)
+    (hdest : ∀ st₀, (∃ b ty, evalPlaceToOp pb st₀ dest = .ok (.immediate b, ty)) ∨
+      evalPlaceToOp pb st₀ dest = .error (.ub .deadLocal) ∨
+      evalPlaceToOp pb st₀ dest = .error .unsupported) :
+    ∀ i e, nth? st.borrows i = some e → e.perm = .frozen →
+      ∃ e', nth? st₁.borrows i = some e' ∧ e'.tag = e.tag ∧ e'.perm = .frozen := by
+  rw [twoPhaseAssignUse_true_eq] at h
+  simp only [annealAssignUse] at h
+  have hw : ∀ (st₀ : PState) (b : Bytes), writePlace pb st₀ dest b = .ok st₁ →
+      st₁.borrows = st₀.borrows := by
+    intro st₀ b hw₀
+    unfold writePlace at hw₀
+    rcases hdest st₀ with ⟨db, dty, hd⟩ | hd | hd
+    · rw [hd] at hw₀; exact setLocalE_borrows hw₀
+    · rw [hd] at hw₀; cases hw₀
+    · rw [hd] at hw₀; cases hw₀
+  cases he : evalPlaceToOp pb (clearLatch st) p with
+  | error err => rw [he] at h; cases h
+  | ok r =>
+    obtain ⟨o, ty⟩ := r
+    rw [he] at h
+    cases o with
+    | immediate bb =>
+      simp only at h
+      cases hp : p.projs with
+      | cons _ _ => rw [hp] at h; cases h
+      | nil =>
+        rw [hp] at h; simp only at h
+        cases hs : setLocalE (clearLatch st) p.local_ (.imm (uninitBytes bb.length)) with
+        | error err => rw [hs] at h; cases h
+        | ok st₂ =>
+          rw [hs] at h; simp only at h
+          cases hv : checkValid ty bb with
+          | error err => rw [hv] at h; cases h
+          | ok u =>
+            rw [hv] at h; simp only at h
+            have hb₁ := hw (clearLatch st₂) bb h
+            have hb₂ := setLocalE_borrows hs
+            intro i e hi hf
+            refine ⟨e, ?_, rfl, hf⟩
+            rw [hb₁]; show nth? st₂.borrows i = some e; rw [hb₂]; exact hi
+    | indirect src =>
+      simp only at h
+      cases hm : usesMemoryPath ty (.indirect src) with
+      | true =>
+        rw [hm] at h; simp only at h
+        cases hc : copyMemPath pb (clearLatch st) src dest with
+        | error err => rw [hc] at h; cases h
+        | ok st₂ =>
+          unfold copyMemPath at hc
+          cases hl : loadMPlace (clearLatch st) src with
+          | error err => rw [hl] at hc; cases hc
+          | ok r' =>
+            obtain ⟨bb, st₃⟩ := r'
+            rw [hl] at hc; simp only at hc
+            rcases hdest st₃ with ⟨db, dty, hd⟩ | hd | hd <;> rw [hd] at hc <;> cases hc
+      | false =>
+        rw [hm] at h; simp only at h
+        cases hl : loadMPlace (clearLatch st) src with
+        | error err => rw [hl] at h; cases h
+        | ok r' =>
+          obtain ⟨bb, st₂⟩ := r'
+          rw [hl] at h; simp only at h
+          cases hv : checkValid ty bb with
+          | error err => rw [hv] at h; cases h
+          | ok u =>
+            rw [hv] at h; simp only at h
+            cases hd : deinitMPlaceRaw st₂ src with
+            | error err => rw [hd] at h; cases h
+            | ok st₃ =>
+              rw [hd] at h; simp only at h
+              have hb₁ := hw st₃ bb h
+              have hb₃ := deinitMPlaceRaw_borrows hd
+              intro i e hi hf
+              obtain ⟨e', h1, h2, h3⟩ := loadMPlace_preserves_frozen hl i e hi hf
+              exact ⟨e', by rw [hb₁, hb₃]; exact h1, h2, h3⟩
+
 /-- A Tree Borrows **write** through a tag that is foreign to an overlapping,
 unprotected `.frozen` entry disables it. -/
 theorem treeBorrowNodeAccess_foreign_write_frozen :
@@ -4115,6 +4319,49 @@ theorem miriMoveDeinitWiring_proto (dm : Bool) (pb : Nat) (st : PState) :
             rw [hs] at h; simp only [Except.ok.injEq, Prod.mk.injEq] at h
             obtain ⟨_, _, rfl⟩ := h; exact ⟨rfl, rfl⟩
       | indirect mp₀ => simp only [Except.ok.injEq, Prod.mk.injEq] at h; cases h.1
+
+
+/-! ## Part 10b — Live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge
+and formal proof of Finding 5
+
+1. For unprojected root locals (`place.projection = []`), live
+   `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` deinitializes the moved
+   slot to `.uninit` (`set? locals l .uninit`) while `.copy` preserves `locals`.
+2. For any projected place (`place.projection = e :: es`, including `.deref` and
+   `.field`), live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` treats
+   `.move` **identically** to `.copy` (kernel-proving Finding 5 of
+   `PROTOTYPE_REPORT.md` §3). -/
+
+theorem trusted_evalOperand_root_move_deinits
+    (locals locals' : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (l : Local) (v : Trusted.Rustc.V2026_06_01.MirSemantics.Value)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (localDecls : List LocalDecl)
+    (hget : Trusted.Sequence.get? locals l = some (.init v))
+    (hset : Trusted.Sequence.set? locals l .uninit = some locals') :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand locals (.move ⟨l, []⟩)
+      borrows globals layouts callerLocals localDecls = .ok v locals' ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand locals (.copy ⟨l, []⟩)
+      borrows globals layouts callerLocals localDecls = .ok v locals := by
+  constructor
+  · simp [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand, hget, hset]
+  · simp [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand, hget,
+      Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+
+theorem trusted_evalOperand_projected_move_eq_copy
+    (locals : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (l : Local) (e : ProjectionElem) (es : List ProjectionElem)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (localDecls : List LocalDecl) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand locals (.move ⟨l, e :: es⟩)
+      borrows globals layouts callerLocals localDecls =
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand locals (.copy ⟨l, e :: es⟩)
+      borrows globals layouts callerLocals localDecls := by
+  cases e <;> rfl
 
 
 /-! ## Part 11 — Axiom guards (kernel axioms ⊆ {propext, Quot.sound}) -/
@@ -4270,6 +4517,30 @@ theorem miriMoveDeinitWiring_proto (dm : Bool) (pb : Nat) (st : PState) :
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.miriMoveDeinitWiring_proto' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms miriMoveDeinitWiring_proto
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.encodeProg_traitImpl_kinds_interned' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeProg_traitImpl_kinds_interned
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.refProgWellFormed_encodeProg' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms refProgWellFormed_encodeProg
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.refProgWellFormed_nonvacuous' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms refProgWellFormed_nonvacuous
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.deinitMovedPlace_assignUse_preserves_tb_tags' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms deinitMovedPlace_assignUse_preserves_tb_tags
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.trusted_evalOperand_root_move_deinits' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms trusted_evalOperand_root_move_deinits
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.trusted_evalOperand_projected_move_eq_copy' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms trusted_evalOperand_projected_move_eq_copy
 
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_D1_direct_move_ub' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in

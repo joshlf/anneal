@@ -169,7 +169,8 @@ UPSTREAM_PINS_COMMIT_KEYS = ("miri_commit", "rustc_commit", "rustc_apfloat_commi
 UPSTREAM_PINS_KEYS = UPSTREAM_PINS_COMMIT_KEYS + ("source_lock_sha256",)
 VENDOR_TREE_KEYS = ("file_count", "manifest_sha256", "files")
 FILE_ENTRY_KEYS = ("path", "sha256")
-PATCHED_FILE_KEYS = ("path", "upstream_sha256", "patched_sha256", "patch_reason", "upstream_git_blob")
+PATCHED_FILE_KEYS = ("path", "upstream_sha256", "patched_sha256", "patch_reason")
+PATCHED_FILE_OPTIONAL_KEYS = ("upstream_git_blob",)
 CLOSURE_REQUIRED_KEYS = ("path", "sha256")
 CLOSURE_OPTIONAL_KEYS = ("module",)
 CLOSURE_ROOT_OLEAN = "Miri/Interpreter/ExecutionMachine.olean"
@@ -212,6 +213,15 @@ LOCKED_UPSTREAM_IDENTITY: Mapping[str, Any] = {
         "upstream/.pins/rustc_apfloat.commit": "e3e2ad8b3762b9b9dffa17c6ec9f9ad3544d54f5",
         "upstream/source-lock.json": "503d1c21ca5096c1cdbec40d235da58c1f12efd0",
     },
+}
+
+LOCKED_DEINIT_BLOBS = {
+    "Miri/Interpreter/MachineHooks.lean": "673eabdf0fbee9a4ea6b08311973c0b5469cb222",
+    "Miri/Interpreter/LocalAccess.lean": "7a032dfea7048c153c07f263cfb88e19ccf9ac22",
+    "Miri/Interpreter/OperandMachine.lean": "579beda13592aad81242dea8b9a4d86201e29a92",
+    "Miri/Interpreter/Place.lean": "327fd613c9852fef27d764e591060d6a335ca191",
+    "Miri/Interpreter/PlaceMachine.lean": "1b3e5cedb4ad98392086ef6867f156a15a74ef5f",
+    "Miri/Interpreter/ExecutionMachine.lean": "66048728edfdb3295f3cfcefb97b041236715bfa",
 }
 
 _HEX40_RE = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -833,7 +843,7 @@ def _validate_patched_files(pin: Mapping[str, Any], allow_deinit_patch: bool, c:
         if not isinstance(entry, dict):
             c.err("patch", f"{label} must be an object")
             continue
-        _check_exact_keys(entry, PATCHED_FILE_KEYS, (), label, c, category="patch")
+        _check_exact_keys(entry, PATCHED_FILE_KEYS, PATCHED_FILE_OPTIONAL_KEYS, label, c, category="patch")
         path = entry.get("path")
         problem = relpath_problem(path)
         if problem is not None:
@@ -856,9 +866,17 @@ def _validate_patched_files(pin: Mapping[str, Any], allow_deinit_patch: bool, c:
         if not isinstance(reason, str) or not reason.strip():
             c.err("patch", f"{label}: patch_reason for {path!r} must be a non-empty string")
             valid = False
-        if not _is_hex40(blob):
-            c.err("patch", f"{label}: upstream_git_blob for {path!r} is not 40 lowercase hex digits")
-            valid = False
+        if "upstream_git_blob" in entry:
+            if not _is_hex40(blob):
+                c.err("patch", f"{label}: upstream_git_blob for {path!r} is not 40 lowercase hex digits")
+                valid = False
+            elif path in LOCKED_DEINIT_BLOBS and blob != LOCKED_DEINIT_BLOBS[path]:
+                c.err("patch", f"{label}: upstream_git_blob {blob} for {path!r} != locked pre-image blob {LOCKED_DEINIT_BLOBS[path]}")
+        else:
+            blob = LOCKED_DEINIT_BLOBS.get(path, "")
+            if not _is_hex40(blob):
+                c.err("patch", f"{label}: upstream_git_blob for {path!r} is not 40 lowercase hex digits")
+                valid = False
         if path in patched:
             c.err("patch", f"{label}: duplicate patched_files entry for {path!r}")
             continue
@@ -1193,7 +1211,9 @@ def _verify_closure(closure: Optional[List[Tuple[str, str]]], olean_dir: Optiona
         return ClosureVerification("skipped", len(closure), None)
     if _lstat_real_dir(olean_dir, f"olean dir {olean_dir}", c, "closure") is None:
         return ClosureVerification("skipped", len(closure), str(olean_dir))
+    closure_rels = set()
     for rel, pinned in closure:
+        closure_rels.add(rel)
         parts = rel.split("/")
         broken = False
         for i in range(1, len(parts)):
@@ -1202,19 +1222,44 @@ def _verify_closure(closure: Optional[List[Tuple[str, str]]], olean_dir: Optiona
                 st = os.lstat(sub)
             except OSError:
                 break  # reported by the hash below
-            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-                c.err("closure", f"{'/'.join(parts[:i])}/ inside the olean dir is a symlink or not a directory")
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or (st.st_mode & 0o022):
+                c.err("closure", f"{'/'.join(parts[:i])}/ inside the olean dir is a symlink, not a directory, or world-writable")
                 broken = True
                 break
         if broken:
             continue
+        path = olean_dir / rel
         try:
-            actual = sha256_file(olean_dir / rel)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or (st.st_mode & 0o022) or st.st_nlink != 1:
+                c.err("closure", f"invalid file mode for {rel}")
+                continue
+            actual = _hash_open_file(path, want_blob=False, expect=st)[0]
         except (OSError, ValueError) as exc:
             c.err("closure", f"cannot hash closure artifact {rel}: {exc}")
             continue
         if actual != pinned:
             c.err("closure", f".olean SHA-256 mismatch for {rel}: pinned {pinned}, on disk {actual}")
+    for root, dirs, files in os.walk(olean_dir, topdown=True, followlinks=False):
+        kept_dirs = []
+        for d in sorted(dirs):
+            dp = Path(root) / d
+            rel_d = dp.relative_to(olean_dir).as_posix()
+            try:
+                dst = os.lstat(dp)
+            except OSError:
+                continue
+            if stat.S_ISLNK(dst.st_mode) or not stat.S_ISDIR(dst.st_mode) or (dst.st_mode & 0o022):
+                c.err("closure", f"{rel_d}/ inside the olean dir is a symlink, not a directory, or world-writable")
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
+        for f in sorted(files):
+            if f.endswith(".olean"):
+                p = Path(root) / f
+                rel = p.relative_to(olean_dir).as_posix()
+                if rel not in closure_rels:
+                    c.err("closure", f"unlisted .olean file found: {rel}")
     return ClosureVerification("verified", len(closure), str(olean_dir))
 
 

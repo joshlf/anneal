@@ -8,7 +8,7 @@
 > `lean-miri/**`, `minirust/**`, `lakefile.toml`, or `theory/Anneal.lean` is modified, and no
 > `vendor/lean-miri/` is created.
 
-Status: **round A0** (initial build of the N = 4 adversarial loop). Recommendation (§6):
+Status: **round B1** (first cross-family adversarial critique & hardening pass of the N = 4 loop). Recommendation (§6):
 **CONDITIONAL GO**.
 
 ## 1. Architecture
@@ -37,23 +37,23 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 | 7 | 28 executable canary theorems covering `D1`–`D9`. |
 | 8 | Falsification witnesses. |
 | 9 | Tree Borrows theorems. |
-| 10 | The wiring claim. |
-| 11 | 66 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
+| 10 | The wiring claim (`miriMoveDeinitWiring_proto`) and Part 10b live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge theorems (`trusted_evalOperand_root_move_deinits`, `trusted_evalOperand_projected_move_eq_copy`). |
+| 11 | 72 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
 | 12 | A `run_cmd` audit of **every** declaration in the module. Its axioms must be ⊆ {propext, Quot.sound}; otherwise elaboration fails. This was checked with a planted `Classical.choice` probe. |
 
-### 1.2 Inventory (A0)
+### 1.2 Inventory (B1)
 
 | Metric | Value |
 |---|---|
-| Lean LOC | 4,410 |
-| `theorem`s | 159 |
-| `def`/`abbrev`s | 242 |
-| `#guard_msgs` axiom guards | 66, all `[propext]` or `[propext, Quot.sound]` |
+| Lean LOC | 4,682 |
+| `theorem`s | 169 |
+| `def`/`abbrev`s | 247 |
+| `#guard_msgs` axiom guards | 72, all `[propext]` or `[propext, Quot.sound]` |
 | `sorry` / `admit` / `axiom` / `native_decide` / `partial` / `unsafe` | 0 |
 | `Classical.choice` anywhere in the module | 0 (enforced by the Part 12 audit) |
-| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), 32 s wall |
-| Receipt 3 (`unittest`) | 55 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), 58 s wall |
-| Verifier LOC / test LOC / tests | 1,761 / 1,170 / 55 (plus 1 opt-in test that applies the real `d9b41b58b` diff) |
+| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~33 s wall |
+| Receipt 3 (`unittest`) | 55 tests, OK, ~58 s wall |
+| Verifier LOC / test LOC / tests | 1,806 / 1,190 / 55 (including 4-key `LOCKED_DEINIT_BLOBS` fallback and closure `.olean` scan/hardlink subtests) |
 
 ### 1.3 Headline theorems
 
@@ -62,9 +62,10 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
   `decodePlace_encodePlace`, `decodeOperand_encodeOperand`, `decodeRvalue_encodeRvalue`,
   `decodeStmt_encodeStmt`, `decodeTerminator_encodeTerminator`, `decodeBody_encodeBody`,
   `decodeProg_encodeProg` (∀ p, `decodeProg (encodeProg p) = some p`), and `encodeProg_injective`.
-* **`encodeProg_types_canonical`.** Both tables are duplicate-free. For interned types, `TyId`
-  equality ↔ `Ty` equality. Every interned type's post-order kinds are interned. The built-ins sit
+* **`encodeProg_types_canonical` & `encodeProg_traitImpl_kinds_interned`.** Both tables are duplicate-free. For interned types, `TyId`
+  equality ↔ `Ty` equality. Every interned type's post-order kinds — as well as every `RigidTy` argument in `CapturedMir.traitImpls` (added in B1) — are interned in `kinds`. The built-ins sit
   at `KindId` 0/1/2.
+* **Well-formedness transfer (`refProgWellFormed_encodeProg`, `refProgWellFormed_nonvacuous`, added in B1).** Encoding any `ProgWellFormed` program yields a `RefProgWellFormed` reference program whose local declarations resolve via demand-time `evalLayoutQuery`, witnessed non-vacuously on `d1MoveThenRead`.
 * **`encodeStmt_no_dormant_noops`.** `(encodeStmt tt s).kind = .nop ↔ s.kind = .nop`, and the
   constructor tag is preserved. `encodeTermKind_tag` and `encodeRvalue_tag` do the same for
   terminators and rvalues.
@@ -103,8 +104,8 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
   * `eagerInEvalOperandStrategy_ne_eager` follows from it.
   * `batched_call_args_lose_move_deinit` covers `kani#5172`.
 * **Tree Borrows:**
-  * `deinitMovedPlace_preserves_tb_tags` is universal. A successful `move p` leaves the borrow
-    table exactly as `copy p` (a pure read) does, and every `.frozen` entry stays `.frozen`. It
+  * `deinitMovedPlace_preserves_tb_tags` is universal for `twoPhaseReadOperand`, and `deinitMovedPlace_assignUse_preserves_tb_tags` (added in B1) proves universal `.frozen` preservation for `twoPhaseAssignUse` (`refCopyRuntimePlaceNoValidate`) into immediate local destinations (covering `StatementKind.assign` in `canary_D5`). A successful `move p` leaves the borrow
+    table as `copy p` (a pure read) does, and every `.frozen` entry stays `.frozen`. It
     rests on `tbAccessAux_read_preserves_frozen`.
   * The contrast is `tbAccessAux_write_disables_foreign_frozen`, which is universal.
   * `assign_or_deinit_stmt_kills_sibling_frozen` is state-level: `[.frozen]` stays `[.frozen]`
@@ -112,6 +113,9 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 * **`miriMoveDeinitWiring_proto`.** Covers flag threading, latch reset on non-moves, the latch set
   by indirect moves, the unprojected immediate move (local becomes `.uninit`, latch cleared), and
   the `takePendingMoveDeinit` read-and-clear.
+* **Live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge (added in B1):**
+  * `trusted_evalOperand_root_move_deinits`: proves root-local `.move ⟨l, []⟩` deinitialization (`set? locals l .uninit`) vs `.copy ⟨l, []⟩` preservation on the real TCB `evalOperand`.
+  * `trusted_evalOperand_projected_move_eq_copy`: kernel-proves Finding 5 (`evalOperand locals (.move ⟨l, e :: es⟩) … = evalOperand locals (.copy ⟨l, e :: es⟩) …` for every projection head `e`).
 
 ## 2. `D1`–`D9` canary matrix
 
