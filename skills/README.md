@@ -13,12 +13,13 @@ or proving verification obligations with Anneal. See [`../AGENTS.md`](../AGENTS.
 for standing repository rules and [`../docs/agent-harness-setup.md`](../docs/agent-harness-setup.md)
 for configuring Claude Code, Gemini CLI, Antigravity, and Codex to load these skills.
 
-## Historical maintainer imports
+## Provenance
 
 Vendor only documents used to run a skill, including the references its
-instructions load. The table records the historical maintainer imports and their original paths
-and revisions. These identifiers do not imply that the corresponding commits
-are available in the public distribution. Public releases select package versions
+instructions load. For imported skills, the table records the original upstream
+paths and revisions. Repository-owned skills are labeled in the Source column.
+These historical identifiers do not imply that the corresponding commits are
+available in the public distribution. Public releases select package versions
 independently; a matching skill name does not establish byte correspondence.
 The matching-public-bytes links identify only packages whose complete local
 path/byte/mode inventory matches that public release. Other rows retain only
@@ -78,5 +79,3 @@ Anneal-specific conventions in repository-owned files (`AGENTS.md`,
 `skills/anneal-prove/`, `skills/anneal-lsp/`, `skills/anneal-doc-audit/`,
 `skills/architectural-design/`, `skills/source-control/`, and
 `skills/trust-review/`).
-
-*Updated by an AI agent acting on joshlf's behalf.*
