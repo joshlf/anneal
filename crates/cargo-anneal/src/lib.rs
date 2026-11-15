@@ -2657,10 +2657,16 @@ pub fn parse_cgroup_memory_stat_used_bytes(stat_text: &str) -> Option<u64> {
     }
 }
 
-/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 `memory.max`
+/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 memory bound
 /// between this process's cgroup (`0::<rel>` in `proc_self_cgroup`) and
 /// `cgroup_root`, where headroom subtracts non-reclaimable `anon + shmem` from
 /// `memory.stat` (falling back to `memory.current` when `memory.stat` is absent).
+///
+/// Each level's bound is the smaller of `memory.max` (the OOM-kill limit) and
+/// `memory.high` (the throttling threshold above which the kernel stalls the
+/// cgroup in direct reclaim), with `"max"` meaning unbounded for either file,
+/// so a slice whose `memory.high` sits below its `memory.max` (as systemd
+/// `user.slice` commonly configures) caps concurrency before workers thrash.
 pub fn cgroup_memory_limits_kib(
     cgroup_root: &Path,
     proc_self_cgroup: &str,
@@ -2714,10 +2720,15 @@ pub fn cgroup_memory_limits_kib(
             if leaf_used_bytes.is_none() && lvl_used.is_some() {
                 leaf_used_bytes = lvl_used;
             }
-            if let Some(max) = read_u64_file(&dir.join("memory.max")) {
+            let level_bound = min_opt_u64(
+                read_u64_file(&dir.join("memory.max")),
+                read_u64_file(&dir.join("memory.high")),
+            );
+            if let Some(bound) = level_bound {
                 let used = lvl_used.or(leaf_used_bytes).unwrap_or(0);
-                limit_kib = min_opt_u64(limit_kib, Some(max / 1024));
-                headroom_kib = min_opt_u64(headroom_kib, Some(max.saturating_sub(used) / 1024));
+                limit_kib = min_opt_u64(limit_kib, Some(bound / 1024));
+                headroom_kib =
+                    min_opt_u64(headroom_kib, Some(bound.saturating_sub(used) / 1024));
             }
         }
         if dir == cgroup_root || !dir.pop() {
@@ -2778,8 +2789,9 @@ pub fn resolve_lake_build_threads_env(
     Some(resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores))
 }
 
-/// Probes host `/proc/meminfo` intersected with `/proc/self/cgroup` (`memory.max`
-/// and `memory.stat` `anon + shmem`) in KiB.
+/// Probes host `/proc/meminfo` intersected with `/proc/self/cgroup` (the
+/// tighter of each level's `memory.max` / `memory.high`, minus `memory.stat`
+/// `anon + shmem`) in KiB.
 pub fn probe_effective_memory_kib() -> (Option<u64>, Option<u64>) {
     let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
         .map(|s| parse_meminfo_kib(&s))
@@ -3734,6 +3746,76 @@ mod tests {
         assert_eq!(
             envs_override.get("LEAN_NUM_THREADS"),
             Some(&Some("16".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&cg_root);
+    }
+
+    #[test]
+    fn cgroup_memory_limits_honor_memory_high_throttle_threshold_below_memory_max() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cg_root = env::temp_dir().join(format!(
+            "cargo-anneal-cgroup-high-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let slice = cg_root.join("user.slice");
+        let service = slice.join("rshelld.service");
+        let leaf = service.join("server");
+        fs::create_dir_all(&leaf).expect("create cgroup test hierarchy");
+
+        // Mirrors a systemd capsule: `user.slice` throttles at `memory.high`
+        // (19 GiB) below its `memory.max` (20 GiB); the service and leaf are
+        // unbounded (`"max"` for both files).
+        fs::write(slice.join("memory.max"), format!("{}\n", 20 * GIB)).unwrap();
+        fs::write(slice.join("memory.high"), format!("{}\n", 19 * GIB)).unwrap();
+        fs::write(
+            slice.join("memory.stat"),
+            format!("anon {}\nfile {}\nshmem {}\n", 3 * GIB, 6 * GIB, GIB),
+        )
+        .unwrap();
+        for dir in [&service, &leaf] {
+            fs::write(dir.join("memory.max"), "max\n").unwrap();
+            fs::write(dir.join("memory.high"), "max\n").unwrap();
+        }
+        let proc_self_cgroup = "0::/user.slice/rshelld.service/server\n";
+
+        // `memory.high` (19 GiB) is the binding bound; headroom = 19 - (3 + 1) = 15 GiB
+        // (reclaimable `file` cache is not subtracted).
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, proc_self_cgroup),
+            (Some(19 * GIB_KIB), Some(15 * GIB_KIB))
+        );
+
+        // A leaf `memory.high` below every `memory.max` binds even when the leaf's
+        // `memory.max` is `"max"`; the leaf has no `memory.stat`, so its own
+        // `memory.current` (2 GiB) is subtracted.
+        fs::write(leaf.join("memory.high"), format!("{}\n", 6 * GIB)).unwrap();
+        fs::write(leaf.join("memory.current"), format!("{}\n", 2 * GIB)).unwrap();
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, proc_self_cgroup),
+            (Some(6 * GIB_KIB), Some(4 * GIB_KIB))
+        );
+        // ...and therefore bounds the default Lake concurrency: 4096 MiB / 1536 -> 2
+        // jobs, and 6144 MiB / 2048 -> at most 3 jobs.
+        assert_eq!(
+            resolve_default_lake_jobs(Some(6 * GIB_KIB), Some(4 * GIB_KIB), 8),
+            2
+        );
+
+        // With every `memory.high` back at `"max"`, `memory.max` (20 GiB) binds again.
+        fs::write(leaf.join("memory.high"), "max\n").unwrap();
+        fs::write(slice.join("memory.high"), "max\n").unwrap();
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, proc_self_cgroup),
+            (Some(20 * GIB_KIB), Some(16 * GIB_KIB))
         );
 
         let _ = fs::remove_dir_all(&cg_root);

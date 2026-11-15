@@ -9073,6 +9073,60 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
             self.assertIn("✖ [12/64] Building Mir.ItreeDiff.broken_cand", report_md)
             self.assertIn("✔ [63/64] Built Mir.Foo", report_md)
             self.assertNotIn("healthy miri stdout", report_md)
+            # Each diagnostic block is labelled so readers can tell the streams apart,
+            # in error_lines -> stderr_tail -> stdout_tail order.
+            labels = [
+                "  - `error_lines` (`✖` / `error:` across stdout + stderr):",
+                "  - `stderr_tail`:",
+                "  - `stdout_tail`:",
+            ]
+            positions = [report_md.find(label) for label in labels]
+            self.assertTrue(all(p >= 0 for p in positions), positions)
+            self.assertEqual(positions, sorted(positions))
+            # The raw ``` inside stdout_tail cannot break out of its fence.
+            self.assertIn("````text\n✔ [63/64] Built Mir.Foo\n```\nfence in stdout\n````", report_md)
+
+    def test_error_lines_capture_rustc_error_codes_from_cargo_run_compile_failures(
+        self,
+    ) -> None:
+        # `run_harness` drives the harness through `cargo run`; a compile failure
+        # reports `error[E0308]: ...` (no `error:` substring) before the summary line.
+        stderr = "\n".join(
+            [
+                "   Compiling anneal-difftest v0.1.0",
+                "error[E0308]: mismatched types",
+                "  --> crates/anneal-difftest/src/miri_eval.rs:42:5",
+                "warning: unused variable `error`",
+                "error: could not compile `anneal-difftest` (lib) due to 1 previous error",
+            ]
+        )
+        stdout_tail, stderr_tail, error_lines = (
+            campaign.extract_harness_output_diagnostics("", stderr)
+        )
+        self.assertEqual(stdout_tail, "")
+        self.assertEqual(stderr_tail, stderr.strip())
+        self.assertEqual(
+            error_lines,
+            [
+                "error[E0308]: mismatched types",
+                "error: could not compile `anneal-difftest` (lib) due to 1 previous error",
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "out.json"
+            failed_proc = subprocess.CompletedProcess(
+                args=[], returncode=101, stdout="", stderr=stderr
+            )
+            with mock.patch.object(
+                campaign.subprocess, "run", return_value=failed_proc
+            ), mock.patch.object(campaign.sys, "stderr", io.StringIO()):
+                self.assertIsNone(
+                    campaign.run_harness(Path(tmp), "miri-difftest", [], json_path)
+                )
+        diag = campaign.LAST_HARNESS_DIAGNOSTICS["miri-difftest"]
+        self.assertEqual(diag["oracle_error_reason"], "process_exit_101")
+        self.assertIn("error[E0308]: mismatched types", diag["error_lines"])
 
 
 if __name__ == "__main__":

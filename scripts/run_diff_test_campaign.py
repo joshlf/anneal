@@ -546,6 +546,11 @@ def is_int_map(val: Any, expected_keys: tuple[str, ...] | None = None) -> bool:
     return all(isinstance(k, str) and is_nonneg_int(v) for k, v in val.items())
 
 
+# Lake `✖` markers, Lake / Lean `error:` lines, and rustc `error[E0308]:` lines
+# (the harness runs under `cargo run`, whose compile errors carry no `error:`).
+_HARNESS_ERROR_LINE_RE = re.compile(r"✖|error(\[[A-Za-z]+\d+\])?:", re.IGNORECASE)
+
+
 def extract_harness_output_diagnostics(
     stdout: str | None, stderr: str | None
 ) -> tuple[str, str, list[str]]:
@@ -557,7 +562,7 @@ def extract_harness_output_diagnostics(
     matched: list[str] = []
     seen: set[str] = set()
     for line in [*stdout_lines, *stderr_lines]:
-        if ("✖" in line or "error:" in line.lower()) and line not in seen:
+        if _HARNESS_ERROR_LINE_RE.search(line) and line not in seen:
             seen.add(line)
             matched.append(line)
     return stdout_tail, stderr_tail, matched[-30:]
@@ -7838,16 +7843,19 @@ def render_oracle_campaign_report(
             )
             err_text = "\n".join(err_lines).strip()
             if err_text and err_text not in (tail, stdout_tail):
+                lines.append("  - `error_lines` (`✖` / `error:` across stdout + stderr):")
                 fence = markdown_code_fence_for(err_text)
                 lines.append(f"{fence}text")
                 lines.append(err_text)
                 lines.append(fence)
             if tail:
+                lines.append("  - `stderr_tail`:")
                 fence = markdown_code_fence_for(tail)
                 lines.append(f"{fence}text")
                 lines.append(tail)
                 lines.append(fence)
             if stdout_tail and stdout_tail != tail:
+                lines.append("  - `stdout_tail`:")
                 fence = markdown_code_fence_for(stdout_tail)
                 lines.append(f"{fence}text")
                 lines.append(stdout_tail)
