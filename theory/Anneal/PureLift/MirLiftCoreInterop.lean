@@ -7,6 +7,7 @@
 -- those terms.
 
 import Anneal.MirLiftCore
+import Anneal.SepLogicLenses
 import Anneal.PureLift.BlockCfg
 import Anneal.PureLift.Canaries
 
@@ -68,6 +69,13 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    (`StepPath`, interconvertible with `StepsTo`) of any MirLiftCore machine,
    and `pure_lift_stepsTo` / `pure_lift_mirWpConverges` turn
    `pure_lift_sound` into a fuel-free segment / live `MirWpConverges`.
+8. **Trusted byte windows** (Episode 2 readiness): provenance-free trusted
+   `AbstractByte` windows are exactly the `.uninit` / `.rawByte` spatial cells
+   (`cellsOfAbstractBytes`, `abstractBytesOfCells`), and
+   `spatialCodecOfByteLensCodec` lifts any provenance-free
+   `SepLogicLenses.ByteLensCodec` to a `SpatialCodec` over an arbitrary value
+   domain (exercised on MIR `Value` with the trusted little-endian `u32`
+   codec), with no change to the PureLift core.
 
 All results are exercised non-vacuously at the end of the file on concrete
 PureLift CFGs with symbolic data (`testCfgStep` countdown, and the `S6`
@@ -1101,6 +1109,208 @@ theorem pure_lift_mirWpConverges {Val : Type} {body : CapturedMir}
 
 end AdapterBridge
 
+/-! ## Episode 2 Readiness: Trusted `AbstractByte` Windows as Spatial Cells
+
+`SpatialPin` stores frozen loans as `List (CellVal Val)`. Provenance-free
+trusted bytes (`.uninit`, `.init b none`) are exactly the `.uninit` / `.rawByte`
+cells, so any `SepLogicLenses.ByteLensCodec α n` with provenance-free encodings
+lifts, through `SpatialCodec.ofSubdomain`, to a `SpatialCodec` over an arbitrary
+value domain (for example MIR `Value`) that encodes `α`'s image as a raw byte
+window and every other value as `[.init v]`; no change to the PureLift core is
+needed. -/
+
+section ByteWindows
+
+variable {Val : Type}
+
+/-- A provenance-free trusted byte as a spatial cell; a byte carrying pointer
+provenance has no raw-byte cell. -/
+def cellOfAbstractByte : AbstractByte → Option (CellVal Val)
+  | .uninit => some .uninit
+  | .init b none => some (.rawByte b)
+  | .init _ (some _) => none
+
+/-- A raw-byte or uninitialized spatial cell as a trusted byte. -/
+def abstractByteOfCell : CellVal Val → Option AbstractByte
+  | .uninit => some .uninit
+  | .rawByte b => some (.init b none)
+  | .init _ => none
+
+def cellsOfAbstractBytes (bs : List AbstractByte) : Option (List (CellVal Val)) :=
+  bs.foldr
+    (fun b acc =>
+      match cellOfAbstractByte b, acc with
+      | some c, some cs => some (c :: cs)
+      | _, _ => none)
+    (some [])
+
+def abstractBytesOfCells (cs : List (CellVal Val)) : Option (List AbstractByte) :=
+  cs.foldr
+    (fun c acc =>
+      match abstractByteOfCell c, acc with
+      | some b, some bs => some (b :: bs)
+      | _, _ => none)
+    (some [])
+
+/-- True iff no byte of `bs` carries pointer provenance. -/
+def provenanceFree (bs : List AbstractByte) : Bool :=
+  bs.all (fun b =>
+    match b with
+    | .init _ (some _) => false
+    | _ => true)
+
+theorem cellsOfAbstractBytes_cons (b : AbstractByte) (bs : List AbstractByte) :
+    cellsOfAbstractBytes (Val := Val) (b :: bs) =
+      (match cellOfAbstractByte b, cellsOfAbstractBytes bs with
+       | some c, some cs => some (c :: cs)
+       | _, _ => none) := rfl
+
+theorem abstractBytesOfCells_cons (c : CellVal Val) (cs : List (CellVal Val)) :
+    abstractBytesOfCells (c :: cs) =
+      (match abstractByteOfCell c, abstractBytesOfCells cs with
+       | some b, some bs => some (b :: bs)
+       | _, _ => none) := rfl
+
+/-- Provenance-free byte windows convert to cells. -/
+theorem cellsOfAbstractBytes_isSome :
+    ∀ (bs : List AbstractByte), provenanceFree bs = true →
+      Exists fun cs => cellsOfAbstractBytes (Val := Val) bs = some cs
+  | [], _ => ⟨[], rfl⟩
+  | b :: bs, h => by
+    cases b with
+    | uninit =>
+      have hbs : provenanceFree bs = true := h
+      obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome bs hbs
+      rw [cellsOfAbstractBytes_cons, hcs]
+      exact ⟨_, rfl⟩
+    | init x p =>
+      cases p with
+      | none =>
+        have hbs : provenanceFree bs = true := h
+        obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome bs hbs
+        rw [cellsOfAbstractBytes_cons, hcs]
+        exact ⟨_, rfl⟩
+      | some _ =>
+        have hF : false = true := h
+        exact Bool.noConfusion hF
+
+/-- Converting a byte window to cells and back is the identity. -/
+theorem abstractBytesOfCells_cellsOfAbstractBytes :
+    ∀ (bs : List AbstractByte) (cs : List (CellVal Val)),
+      cellsOfAbstractBytes bs = some cs → abstractBytesOfCells cs = some bs
+  | [], cs, h => by
+    injection h with h
+    subst h
+    rfl
+  | b :: bs, cs, h => by
+    rw [cellsOfAbstractBytes_cons] at h
+    cases hb : cellOfAbstractByte (Val := Val) b with
+    | none =>
+      rw [hb] at h
+      exact nomatch h
+    | some c =>
+      cases hcs : cellsOfAbstractBytes (Val := Val) bs with
+      | none =>
+        rw [hb, hcs] at h
+        exact nomatch h
+      | some cs' =>
+        rw [hb, hcs] at h
+        injection h with h
+        subst h
+        rw [abstractBytesOfCells_cons,
+          abstractBytesOfCells_cellsOfAbstractBytes bs cs' hcs]
+        cases b with
+        | uninit =>
+          injection hb with hc
+          subst hc
+          rfl
+        | init x p =>
+          cases p with
+          | none =>
+            injection hb with hc
+            subst hc
+            rfl
+          | some _ => exact nomatch hb
+
+/-- Cells produced from bytes are never value cells. -/
+theorem cellsOfAbstractBytes_ne_init :
+    ∀ (bs : List AbstractByte) (cs : List (CellVal Val)) (w : Val),
+      cellsOfAbstractBytes bs = some cs → cs ≠ [.init w]
+  | [], _, _, h, hEq => by
+    injection h with h
+    subst h
+    exact nomatch hEq
+  | b :: bs, cs, w, h, hEq => by
+    rw [cellsOfAbstractBytes_cons] at h
+    cases hb : cellOfAbstractByte (Val := Val) b with
+    | none =>
+      rw [hb] at h
+      exact nomatch h
+    | some c =>
+      cases hcs : cellsOfAbstractBytes (Val := Val) bs with
+      | none =>
+        rw [hb, hcs] at h
+        exact nomatch h
+      | some cs' =>
+        rw [hb, hcs] at h
+        injection h with h
+        subst h
+        injection hEq with hc _
+        subst hc
+        cases b with
+        | uninit => exact nomatch hb
+        | init x p =>
+          cases p with
+          | none => exact nomatch hb
+          | some _ => exact nomatch hb
+
+/-- **`ByteLensCodec` as a `SpatialCodec`**: a provenance-free trusted byte codec
+on `α`, embedded into `Val` by the prism `(toVal, ofVal?)`, encodes `α`'s image
+as its raw byte window and falls back to `[.init v]` elsewhere. -/
+def spatialCodecOfByteLensCodec {α : Type} {n : Nat} (cid : Nat)
+    (c : Anneal.SepLogicLenses.ByteLensCodec α n)
+    (hProv : ∀ a, provenanceFree (c.encode a) = true)
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v) :
+    SpatialCodec Val :=
+  SpatialCodec.ofSubdomain cid toVal ofVal? toVal_ofVal?
+    (fun a => (cellsOfAbstractBytes (c.encode a)).getD [])
+    (fun cells =>
+      match abstractBytesOfCells cells with
+      | some bs => c.decode bs
+      | none => none)
+    (fun a => by
+      obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
+        (hProv a)
+      show (match abstractBytesOfCells ((cellsOfAbstractBytes (c.encode a)).getD []) with
+        | some bs => c.decode bs
+        | none => none) = some a
+      rw [hcs]
+      show (match abstractBytesOfCells cs with
+        | some bs => c.decode bs
+        | none => none) = some a
+      rw [abstractBytesOfCells_cellsOfAbstractBytes (c.encode a) cs hcs]
+      exact c.decode_encode a)
+    (fun a w _ hEq => by
+      obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
+        (hProv a)
+      have hEq' : (cellsOfAbstractBytes (c.encode a)).getD [] = [.init w] := hEq
+      rw [hcs] at hEq'
+      exact cellsOfAbstractBytes_ne_init (c.encode a) cs w hcs hEq')
+
+/-- Trusted little-endian encodings carry no pointer provenance. -/
+theorem provenanceFree_encodeLittleEndianBytes :
+    ∀ (sz bits : Nat), provenanceFree (encodeLittleEndianBytes bits sz none) = true
+  | 0, _ => rfl
+  | sz + 1, bits => by
+    show provenanceFree
+      (.init (UInt8.ofNat bits) none :: encodeLittleEndianBytes (Nat.div bits 256) sz none) =
+        true
+    simp only [provenanceFree, List.all_cons, Bool.true_and]
+    exact provenanceFree_encodeLittleEndianBytes sz (Nat.div bits 256)
+
+end ByteWindows
+
 section LiveMir
 
 variable {State Ret : Type}
@@ -1248,6 +1458,49 @@ theorem liftBlockToJoin_of_blockCfg_segment
   have hConv := MirLiftCore.LiftBlockConverges.iff_pureMirConverges.mp (hQ _ hJI)
   rw [hEq]
   exact hConv
+
+/-- A `runBlockCfgToBlock` arrival is a MirLiftCore `StepsTo` segment of the
+embedded CFG machine. -/
+theorem stepsTo_of_runBlockCfgToBlock_reached
+    {stepBb : Nat → State → BlockStepResult State Ret} {target bound : Nat}
+    {s s' : BlockMachineState State Ret}
+    (h : runBlockCfgToBlock stepBb target bound s = .reached s') :
+    PureMirExec.StepsTo (blockCfgStep stepBb) s (· = s') :=
+  PureMirExec.stepsTo_of_runToTarget_reached h
+
+/-- **Verified PureLift header-targeted runs become MirLiftCore join paths**:
+under a fork-free per-block VC, a `runBlockCfgToBlock` arrival `s'` at the
+PureLift join block satisfies `MachineInv` (`runBlockCfgToBlock_sound`), so the
+MIR join correspondence `hJoin` may use the PureLift block invariant at the
+join; with a per-step simulation into live MIR this yields
+`MirLiftCore.LiftBlockToJoin`, i.e. the MIR join block is proved once for every
+downstream continuation. -/
+theorem liftBlockToJoin_of_runBlockCfgToBlock
+    {stepBb : Nat → State → BlockStepResult State Ret} {body : CapturedMir}
+    {BlockInv : Nat → State → Prop} {PostRet : Ret → Prop}
+    (hLocal : LocalBlockVC (forkFree stepBb) BlockInv PostRet)
+    {R : BlockMachineState State Ret → MachineState → Prop}
+    (hSim : SegmentSim (blockCfgStep stepBb) (PureMirExec.mirStep body) R)
+    {joinPb bound : Nat} {s s' : BlockMachineState State Ret}
+    (hs : MachineInv BlockInv PostRet s)
+    (hRun : runBlockCfgToBlock stepBb joinPb bound s = .reached s')
+    {bbIdx joinBb : BasicBlockIdx} {env : MirLiftCore.PureEnv}
+    {JoinInv : MirLiftCore.PureEnv → Prop}
+    (hR : R s (({ bb := bbIdx, stmtIdx := 0, env := env } :
+      PureMirExec.PureState).toMachineState emptyMemory))
+    (hJoin : ∀ ms', MachineInv BlockInv PostRet s' → s'.bb = joinPb → R s' ms' →
+      ms' = ({ bb := joinBb, stmtIdx := 0, env := ms'.frame.locals } :
+        PureMirExec.PureState).toMachineState emptyMemory ∧
+      JoinInv ms'.frame.locals) :
+    MirLiftCore.LiftBlockToJoin body bbIdx env joinBb JoinInv := by
+  have hSound := runBlockCfgToBlock_sound stepBb BlockInv PostRet hLocal joinPb
+    bound s hs
+  rw [hRun] at hSound
+  refine liftBlockToJoin_of_blockCfg_segment hSim
+    (stepsTo_of_runBlockCfgToBlock_reached hRun) hR ?_
+  intro s'' ms' hEq hR'
+  subst hEq
+  exact hJoin ms' hSound.2 hSound.1 hR'
 
 end LiveMir
 
@@ -1735,6 +1988,26 @@ theorem liveInterop_liftBlockToJoin_canary :
   · subst hMs
     exact ⟨rfl, rfl⟩
 
+/-- **Non-vacuity of `liftBlockToJoin_of_runBlockCfgToBlock`**: the verified
+countdown CFG (`countdown_localBlockVC`) runs from block `0` to its join block
+`2` by header-targeted stepping, and the live MIR join path follows from the
+segment simulation `liveInterop_forwardSim` with the join correspondence
+read off the PureLift invariant at the join. -/
+theorem liveInterop_liftBlockToJoin_of_runBlockCfgToBlock_canary :
+    MirLiftCore.LiftBlockToJoin liveInteropMirBody 0 liveInteropEnv 1
+      (· = liveInteropEnv) :=
+  liftBlockToJoin_of_runBlockCfgToBlock countdown_localBlockVC
+    liveInterop_forwardSim.segmentSim (s := ⟨fun v => v, 0, 0⟩)
+    ⟨Or.inl rfl, fun _ hv => hv⟩
+    (rfl : runBlockCfgToBlock testCfgStep 2 5 ⟨fun v => v, 0, 0⟩ =
+      .reached ⟨fun v => v, 2, 0⟩)
+    ⟨rfl, rfl, Or.inl ⟨rfl, rfl⟩⟩
+    (fun ms' _ _ hR' => by
+      rcases hR'.2.2 with ⟨hBad, _⟩ | ⟨_, hMs⟩
+      · exact nomatch hBad
+      · subst hMs
+        exact ⟨rfl, rfl⟩)
+
 /-- **Non-vacuity of `runMirToBlock_of_stepInv`**: `liveInteropMirBody` satisfies
 a `StepInv` over `{liveInteropMs 0, liveInteropMs 1}`, and `runMirToBlock` from
 `liveInteropMs 0` to block `1` reaches `liveInteropMs 1` with the invariant and
@@ -1865,6 +2138,67 @@ theorem sampleBranchBlockCfg_wpConverges_of_blockInv :
     0 ⟨[⟨.bool true, .unborrowed⟩], [], [], [], [], 0⟩
     (Or.inl ⟨rfl, rfl⟩) (· = ⟨.nat 10, []⟩)).mpr
     ⟨4, ⟨.nat 10, []⟩, rfl, rfl⟩
+
+
+/-! ### Trusted byte windows: a `u32` `SpatialCodec` over MIR `Value` -/
+
+/-- `u32` scalars as MIR values. -/
+def u32ToValue (a : {n : Nat // n < 256 ^ 4}) : Value :=
+  .scalar { bits := a.val, sizeBytes := 4 }
+
+/-- MIR values that are in-range `u32` scalars. -/
+def u32OfValue? (v : Value) : Option {n : Nat // n < 256 ^ 4} :=
+  match v with
+  | .scalar sc =>
+    if sc.sizeBytes = 4 then
+      if h : sc.bits < 256 ^ 4 then some ⟨sc.bits, h⟩ else none
+    else none
+  | _ => none
+
+theorem u32ToValue_ofValue? (v : Value) (a : {n : Nat // n < 256 ^ 4})
+    (h : u32OfValue? v = some a) : u32ToValue a = v := by
+  unfold u32OfValue? at h
+  split at h
+  · rename_i sc
+    split at h
+    · rename_i hs
+      split at h
+      · injection h with h
+        subst h
+        cases sc
+        simp only at hs
+        subst hs
+        rfl
+      · exact nomatch h
+    · exact nomatch h
+  · exact nomatch h
+
+/-- The trusted little-endian `u32` byte codec of `SepLogicLenses` as a
+`SpatialCodec` over MIR `Value`. -/
+def u32ValueSpatialCodec : SpatialCodec Value :=
+  spatialCodecOfByteLensCodec 32 Anneal.SepLogicLenses.ByteLensCodec.u32LE
+    (fun a => provenanceFree_encodeLittleEndianBytes 4 a.val)
+    u32ToValue u32OfValue? u32ToValue_ofValue?
+
+/-- **Episode 2 readiness canary**: a `u32` MIR scalar encodes to its
+little-endian raw byte window, a single-byte mutation of that window decodes to
+the updated scalar, an `.uninit` byte or an out-of-range window (`2 ^ 32`)
+fails to decode, and a non-`u32` value falls back to a value cell. -/
+theorem u32ValueSpatialCodec_canaries :
+    u32ValueSpatialCodec.encode (.scalar { bits := 0x01020304, sizeBytes := 4 }) =
+      [.rawByte 4, .rawByte 3, .rawByte 2, .rawByte 1] ∧
+    u32ValueSpatialCodec.decode [.rawByte 5, .rawByte 3, .rawByte 2, .rawByte 1] =
+      some (.scalar { bits := 0x01020305, sizeBytes := 4 }) ∧
+    u32ValueSpatialCodec.decode [.rawByte 5, .uninit, .rawByte 2, .rawByte 1] =
+      none ∧
+    u32ValueSpatialCodec.decode
+      [.rawByte 0, .rawByte 0, .rawByte 0, .rawByte 0, .rawByte 1] = none ∧
+    u32ValueSpatialCodec.encode (.scalar { bits := 7, sizeBytes := 1 }) =
+      [.init (.scalar { bits := 7, sizeBytes := 1 })] ∧
+    hasUninitCell
+      (u32ValueSpatialCodec.encode (.scalar { bits := 0x01020304, sizeBytes := 4 })) =
+      false := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Canaries
 
