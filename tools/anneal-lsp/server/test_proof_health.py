@@ -76,6 +76,26 @@ def clear_in_process_caches() -> None:
     proof_health._NORM_SIG_CACHE.clear()
 
 
+def drop_scan_memo() -> None:
+    """Forget memoized scan inputs (`scan_lean_file` texts and the `_scan_text_meta`
+    lexing index) but keep sibling caches warm: the state of a just-edited file, or
+    of every fresh PostToolUse hook process, whose text was never scanned before."""
+    prefixes = (proof_health._SCAN_META_KEY_PREFIX, proof_health._SCAN_FILE_KEY_PREFIX)
+    for key in [k for k in proof_health._FILE_TEXTS_CACHE if k.startswith(prefixes)]:
+        del proof_health._FILE_TEXTS_CACHE[key]
+
+
+def uncached(fn):
+    """`fn` wrapped to run without the scan memo (see `drop_scan_memo`), so timing
+    loops measure real lexing and scanning instead of repeated memo hits."""
+
+    def run():
+        drop_scan_memo()
+        return fn()
+
+    return run
+
+
 class TestStripLeanCommentsAndStrings(unittest.TestCase):
     def test_line_and_nested_block_comments_preserve_lines(self) -> None:
         src = (
@@ -1474,7 +1494,7 @@ class TestPerformanceAndDogfood(unittest.TestCase):
 
         findings = proof_health.scan_lean_text(text, scan_siblings=False)
         self.assertEqual([(f.rule, f.line) for f in findings], [(R1, planted_line)])
-        elapsed_ms = best_of_ms(lambda: proof_health.scan_lean_text(text, scan_siblings=False))
+        elapsed_ms = best_of_ms(uncached(lambda: proof_health.scan_lean_text(text, scan_siblings=False)))
         self.assertLess(elapsed_ms, 5.0, f"6,000-line synthetic scan took {elapsed_ms:.2f} ms")
 
     def test_definition_heavy_files_have_no_quadratic_blowup(self) -> None:
@@ -1499,7 +1519,7 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         for label, text in (("indented", "".join(indented)), ("large", "".join(large))):
             self.assertEqual(proof_health.scan_lean_text(text, scan_siblings=False), [])
             elapsed_ms = best_of_ms(
-                lambda: proof_health.scan_lean_text(text, scan_siblings=False), budget_ms=15.0
+                uncached(lambda: proof_health.scan_lean_text(text, scan_siblings=False)), budget_ms=15.0
             )
             self.assertLess(elapsed_ms, 15.0, f"{label} definitions took {elapsed_ms:.2f} ms")
 
@@ -1509,35 +1529,52 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         adt_and_control = REPO_ROOT / "theory" / "Anneal" / "Mir" / "AdtAndControl.lean"
         sym_reflect = REPO_ROOT / "theory" / "Anneal" / "Rustc" / "V2026_06_01" / "SymReflect.lean"
 
+        def min_of_3_after_warmup(fn) -> float:
+            fn()
+            samples = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                fn()
+                samples.append((time.perf_counter() - t0) * 1000.0)
+            return min(samples)
+
         for path in (bit_validity, mir_cast, adt_and_control, sym_reflect):
             self.assertTrue(path.is_file(), f"Missing {path}")
             line_count = path.read_text(encoding="utf-8", errors="replace").count("\n") + 1
             scaled_budget_ms = min(15.0, max(5.0, 2.0 * (line_count / 1000.0)))
-            # 1 warmup pass, then minimum across 3 warm iterations (with best_of_ms fallback)
-            proof_health.scan_lean_file(path, scan_siblings=True)
-            warm_samples: list[float] = []
-            for _ in range(3):
-                t0 = time.perf_counter()
-                proof_health.scan_lean_file(path, scan_siblings=True)
-                warm_samples.append((time.perf_counter() - t0) * 1000.0)
-            elapsed_ms = min(warm_samples)
-            if elapsed_ms >= scaled_budget_ms:
-                elapsed_ms = best_of_ms(
-                    lambda p=path: proof_health.scan_lean_file(p, scan_siblings=True),
-                    runs=3,
-                    budget_ms=scaled_budget_ms,
-                )
+
+            def warm(p: Path = path) -> object:
+                return proof_health.scan_lean_file(p, scan_siblings=True)
+
+            # Warm rescans of an unchanged file (the long-lived LSP daemon) hit the
+            # `(mtime_ns, size)`-validated text memo and the lexing index.
+            warm_ms = min_of_3_after_warmup(warm)
+            if warm_ms >= scaled_budget_ms:
+                warm_ms = best_of_ms(warm, runs=3, budget_ms=scaled_budget_ms)
             self.assertLess(
-                elapsed_ms,
+                warm_ms,
                 scaled_budget_ms,
-                f"{path.name} ({line_count} lines) scan took {elapsed_ms:.2f} ms (budget {scaled_budget_ms:.2f} ms)",
+                f"{path.name} ({line_count} lines) warm scan took {warm_ms:.2f} ms "
+                f"(budget {scaled_budget_ms:.2f} ms)",
             )
             if path in (bit_validity, mir_cast):
-                self.assertLess(
-                    elapsed_ms,
-                    5.0,
-                    f"{path.name} scan took {elapsed_ms:.2f} ms (must be < 5.0 ms)",
-                )
+                self.assertLess(warm_ms, 5.0, f"{path.name} warm scan took {warm_ms:.2f} ms")
+
+            # An edited file (and every fresh PostToolUse hook process) never hits the
+            # memo: it pays decode + comment/string stripping + every scan pass. Guard
+            # that real cost against algorithmic regressions (per-line regexes,
+            # quadratic passes) with a load-tolerant ~1 ms per 1,000 lines budget.
+            uncached_budget_ms = max(8.0, 1.25 * (line_count / 1000.0))
+            cold = uncached(warm)
+            uncached_ms = min_of_3_after_warmup(cold)
+            if uncached_ms >= uncached_budget_ms:
+                uncached_ms = best_of_ms(cold, runs=3, budget_ms=uncached_budget_ms)
+            self.assertLess(
+                uncached_ms,
+                uncached_budget_ms,
+                f"{path.name} ({line_count} lines) uncached scan took {uncached_ms:.2f} ms "
+                f"(budget {uncached_budget_ms:.2f} ms)",
+            )
 
         self.assertEqual(proof_health.scan_lean_file(bit_validity), [])
 
@@ -1604,6 +1641,111 @@ class TestPerformanceAndDogfood(unittest.TestCase):
                 (R5, "dup_multiline"),
             ],
         )
+
+    def test_large_file_windows_match_unfiltered_scan(self) -> None:
+        # Files over 8,192 chars only search simp lists reachable from keyword-anchored
+        # windows. Every case below is reported by the unfiltered scan and must stay
+        # reported: `.eq_` inside a qualified name makes any entry tail acceptable,
+        # `unfold`/`delta` target lists may run far past 2,048 chars, and a window
+        # anchored at a non-entry occurrence can be the only one reaching a long list.
+        pad = "-- padding line without tactic keywords\n" * 250
+        filler = ",\n    ".join(f"lemma_{i}" for i in range(300))
+        defs = "\n    ".join(f"defn_{i}" for i in range(300))
+        cases = [
+            (
+                "theorem a : True := by\n  simpa [\n    Mir.Crate.foo.body_lemma,\n    Mir.eq_1.body a\n  ]\n",
+                [(R2, 254, "Mir.eq_1.body")],
+            ),
+            ("theorem a : True := by\n  simp [Foo.eq_1.wpMirExecSym x]\n", [(R1, 252, "Foo.eq_1.wpMirExecSym")]),
+            (
+                f"theorem a : True := by\n  unfold\n    {defs}\n    bitwiseOrBits\n    Mir.Crate.foo.body\n",
+                [(R3, 553, "bitwiseOrBits"), (R2, 554, "Mir.Crate.foo.body")],
+            ),
+            (
+                "theorem a : True := by\n  delta " + " ".join(f"defn_{i}" for i in range(300)) + " bitwiseAndBits\n",
+                [(R3, 252, "bitwiseAndBits")],
+            ),
+            (
+                f"theorem a : True := by\n  simp only [(wpMirExecSym x),\n    {filler},\n    wpMirExecSym]\n",
+                [(R1, 553, "wpMirExecSym")],
+            ),
+            (
+                f"theorem a : True := by\n  simp only [foo.body x,\n    {filler},\n    bitwiseAndBits]\n  exact Mir.x\n",
+                [(R3, 553, "bitwiseAndBits")],
+            ),
+        ]
+        for body, expected in cases:
+            src = pad + body
+            self.assertGreater(len(src), 8192)
+            drop_scan_memo()
+            self.assertEqual(scan(src), expected, body[:60])
+            self.assertEqual(scan(src), expected, "memoized rescan must agree")
+
+    def test_exact_mir_body_gate_only_skips_impossible_rule2_work(self) -> None:
+        # `Mir.` and `.body` far apart (no `Mir.<...>.body` identifier) cannot yield a
+        # rule-2 finding; a real identifier anywhere (even qualified or guillemet-quoted
+        # segments) must keep rule-2 checks on for simp lists and `unfold` targets.
+        self.assertFalse(proof_health._has_mir_body_ident("open Mir.Foo\nx.body\n"))
+        self.assertFalse(proof_health._has_mir_body_ident("Mir.x.bodyX\nMir.y.body_lemma\n"))
+        self.assertTrue(proof_health._has_mir_body_ident("foo.body Mir.C.«match».body\n"))
+        self.assertTrue(proof_health._has_mir_body_ident("Anneal.Mir.C.I.body.eq_def\n"))
+        pad = "-- padding line without tactic keywords\n" * 250
+        src = pad + "open Mir.Foo\ntheorem a : True := by\n  unfold x.body\n  delta\n    Mir.C.«match».body\n"
+        self.assertEqual(scan(src), [(R2, 255, "Mir.C.«match».body")])
+
+    def test_scan_lean_file_memo_never_serves_text_mode_sibling_texts(self) -> None:
+        # Sibling lexing reads files in text mode (`\r` becomes `\n`), while
+        # `scan_lean_file` decodes bytes (a lone `\r` stays whitespace inside a `--`
+        # comment). Scanning `b.lean` first caches `a.lean`'s text-mode text; a later
+        # `scan_lean_file(a.lean)` must still see the bytes-decoded text.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.lean"
+            b = Path(tmp) / "b.lean"
+            a.write_bytes(
+                b"private theorem a_priv (n : Nat) : n = n := rfl\n"
+                b"-- note\r  simp [wpMirExecSym]\n"
+            )
+            b.write_text("private theorem b_priv (m : Nat) : m + 0 = m := rfl\n", encoding="utf-8")
+            settle(a, b)
+            clear_in_process_caches()
+            fresh = proof_health.scan_lean_file(a, scan_siblings=False)
+            self.assertEqual(fresh, [])
+            clear_in_process_caches()
+            proof_health.scan_lean_file(b, scan_siblings=True)  # caches a.lean as a sibling
+            self.assertEqual(proof_health.scan_lean_file(a, scan_siblings=False), fresh)
+
+    def test_scan_lean_file_memo_skips_racy_files(self) -> None:
+        # A file stamped within `RACY_MTIME_WINDOW_NS` may be rewritten within the same
+        # timestamp tick at the same size; caching it would serve stale text later.
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r.lean"
+            f.write_text("theorem t : True := by\n  simp [abcdefghijkl]\n", encoding="utf-8")
+            settle(f)
+            mtime_ns = f.stat().st_mtime_ns
+            clear_in_process_caches()
+            real_is_racy = proof_health._is_racy
+            proof_health._is_racy = lambda st: True
+            try:
+                self.assertEqual(proof_health.scan_lean_file(f, scan_siblings=False), [])
+            finally:
+                proof_health._is_racy = real_is_racy
+            size = f.stat().st_size
+            f.write_text("theorem t : True := by\n  simp [wpMirExecSym]\n", encoding="utf-8")
+            os.utime(f, ns=(mtime_ns, mtime_ns))
+            self.assertEqual(f.stat().st_size, size)  # same size, same stamp, new text
+            self.assertEqual(
+                [(x.rule, x.symbol) for x in proof_health.scan_lean_file(f, scan_siblings=False)],
+                [(R1, "wpMirExecSym")],
+            )
+
+    def test_scan_text_meta_memo_returns_fresh_keyword_dicts(self) -> None:
+        text = ("-- pad\n" * 800) + "theorem t : True := by\n  simp [Trusted.Sequence.length]\n"
+        drop_scan_memo()
+        first = proof_health._scan_text_meta(text)[2]
+        first.clear()
+        second = proof_health._scan_text_meta(text)[2]
+        self.assertIn("Sequence.length", second)
+        self.assertEqual(scan(text), [(R1, 802, "Trusted.Sequence.length")])
 
 
 class TestTranscriptLatencyTelemetry(unittest.TestCase):

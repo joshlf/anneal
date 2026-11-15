@@ -22,12 +22,14 @@ Profiles (`--profile`):
   census-only  Fast (<5s) static/ledger completeness & correspondence census plus
                lightweight offline lints (`correspondence_gaps.toml` / `minirust.lock.toml` /
                `check_semantic_sources.py`). Zero heavy Cargo/Lake builds.
-  quick        Runs `census-only` plus `check_trusted.py --fast`, Python test suites
+  quick        Runs `census-only` plus a pre-flight `lake build Trusted Anneal MiniRust`,
+               `check_trusted.py --fast`, Python test suites
                (`ci/`, `scripts/`, `tools/anneal-lsp/`), `anneal-minirust-gen --check`,
                `cargo anneal correspondence-bugs lint`, `minirust-sync verify-lock`,
                and `cargo test --workspace --lib --bins --locked`.
-  nightly      Runs `quick` plus `check_trusted.py --self-test`, standalone `tests/mir/*`
-               Lean suites, `lake build Correspondence`, `lake build MiniRustSpec`,
+  nightly      Runs `quick` plus `check_trusted.py --self-test`, a `lake build +<Module>`
+               of every workspace module imported by the standalone `tests/mir/*` Lean
+               suites, those suites, `lake build Correspondence`, `lake build MiniRustSpec`,
                `lake --dir examples build LeanMiriSpec`, domain crate integration tests,
                `cargo-anneal` end-to-end suites, and real-world Fuchsia/Fxfs example
                crate verifications.
@@ -47,6 +49,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1040,10 +1043,73 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 WRAPPER_TIMEOUT_GRACE_SEC = 30
+# `anneal-lean-run --mode build` first queues for a host build slot for up to
+# `max(30, --timeout)` seconds (`acquire_build_slot`), and only then starts the
+# command's own `--timeout` clock; its `file` mode never queues.
+LEAN_RUN_SLOT_WAIT_FLOOR_SEC = 30
+LEAN_RUN_DEFAULT_TIMEOUT_SEC = {"file": 180, "build": 900}
+# SIGTERM -> SIGKILL escalation window for a timed-out step's process group, so
+# `anneal-lean-run` can forward the signal and reap its own (separate-session) scope.
+STEP_TERMINATE_GRACE_SEC = 10
+STEP_PIPE_DRAIN_SEC = 5
 
 
 def _is_lean_run_wrapped(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "anneal-lean-run"
+
+
+def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
+    """`(mode, timeout_sec, slot_lock)` from the `anneal-lean-run` options preceding
+    `--` (an `auto` mode resolves like the wrapper: `lake env lean` is `file`)."""
+    try:
+        sep = cmd.index("--")
+    except ValueError:
+        sep = len(cmd)
+    opts, inner = cmd[1:sep], cmd[sep + 1 :]
+    mode = "auto"
+    timeout: int | None = None
+    slot_lock = "--no-slot-lock" not in opts
+    i = 0
+    while i < len(opts):
+        opt = opts[i]
+        val: str | None = None
+        if "=" in opt and opt.startswith("--"):
+            opt, val = opt.split("=", 1)
+        elif opt in ("--mode", "--timeout") and i + 1 < len(opts):
+            val = opts[i + 1]
+            i += 1
+        if opt == "--mode" and val is not None:
+            mode = val
+        elif opt == "--timeout" and val is not None:
+            try:
+                timeout = int(val)
+            except ValueError:
+                timeout = None
+        i += 1
+    if mode not in ("file", "build"):
+        is_lean_file = (inner[:1] and Path(inner[0]).name == "lean") or (
+            len(inner) >= 3 and Path(inner[0]).name == "lake" and inner[1] == "env"
+            and Path(inner[2]).name == "lean"
+        )
+        mode = "file" if is_lean_file and "--run" not in inner else "build"
+    if timeout is not None and timeout <= 0:
+        timeout = None
+    return mode, timeout, slot_lock
+
+
+def _outer_timeout_sec(cmd: list[str], timeout_sec: int) -> int:
+    """Outer Python deadline for a step: the step budget itself for direct commands,
+    and for `anneal-lean-run` wrapped ones the wrapper's worst-case lifetime (build
+    slot queueing + its own `--timeout` + termination) plus a grace margin, so the
+    wrapper's structured exit-124 diagnostic always wins the race."""
+    if not _is_lean_run_wrapped(cmd):
+        return timeout_sec
+    mode, inner_timeout, slot_lock = _lean_run_wrapper_flags(cmd)
+    inner = inner_timeout if inner_timeout is not None else LEAN_RUN_DEFAULT_TIMEOUT_SEC[mode]
+    worst = inner
+    if mode == "build" and slot_lock:
+        worst += max(LEAN_RUN_SLOT_WAIT_FLOOR_SEC, inner)
+    return max(timeout_sec, worst) + WRAPPER_TIMEOUT_GRACE_SEC
 
 
 def _ensure_toolchain_path(env: dict[str, str]) -> None:
@@ -1051,7 +1117,10 @@ def _ensure_toolchain_path(env: dict[str, str]) -> None:
     so cron/automation invocations with minimal `PATH` still locate `lake` and `cargo`."""
     raw_path = env.get("PATH", "")
     parts = [p for p in raw_path.split(os.pathsep) if p]
-    home = Path.home()
+    try:
+        home = Path.home()
+    except (KeyError, RuntimeError):
+        return
     prepend: list[str] = []
     for rel in (".elan/bin", ".cargo/bin", ".local/bin"):
         cand = str(home / rel)
@@ -1059,6 +1128,40 @@ def _ensure_toolchain_path(env: dict[str, str]) -> None:
             prepend.append(cand)
     if prepend:
         env["PATH"] = os.pathsep.join([*prepend, *parts])
+
+
+def _signal_process_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _terminate_step(proc: subprocess.Popen[str]) -> None:
+    """Stop a step started with `start_new_session=True`: `SIGTERM` its whole process
+    group (an `anneal-lean-run` wrapper forwards it to the separate-session group it
+    created and reaps it), wait `STEP_TERMINATE_GRACE_SEC`, then `SIGKILL` the group.
+    A bare `Popen.kill()` would `SIGKILL` only the direct child, orphaning the build
+    (still holding RAM, while the wrapper's released build slot admits the next step)."""
+    pgid = proc.pid
+    _signal_process_group(pgid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=STEP_TERMINATE_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_process_group(pgid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=STEP_TERMINATE_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _as_text(data: str | bytes | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
 
 
 def _run_step(
@@ -1074,68 +1177,58 @@ def _run_step(
     _ensure_toolchain_path(env)
     if env_overrides:
         env.update(env_overrides)
-    outer_timeout = (
-        timeout_sec + WRAPPER_TIMEOUT_GRACE_SEC if _is_lean_run_wrapped(cmd) else timeout_sec
-    )
+    outer_timeout = _outer_timeout_sec(cmd, timeout_sec)
+    timed_out = False
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
             env=env,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=outer_timeout,
-            check=False,
+            errors="replace",
+            start_new_session=True,
         )
-        elapsed = round(time.monotonic() - t0, 2)
-        if proc.returncode == 0:
-            status = "PASS"
-        elif proc.returncode == 124:
-            status = "TIMEOUT"
-        else:
-            status = "FAIL"
-        combined_out = (proc.stdout + "\n" + proc.stderr).strip()
-        tail_lines = "\n".join(combined_out.splitlines()[-40:]) if status != "PASS" else ""
-        if status == "TIMEOUT" and not tail_lines:
-            tail_lines = f"Timed out after {timeout_sec}s"
-        # Extract any `[...-AUDIT]` lines when running `MiniRustSpec`
-        audit_tags = [
-            line.strip()
-            for line in combined_out.splitlines()
-            if any(
-                tag in line
-                for tag in (
-                    "[ANCHOR-AUDIT]",
-                    "[SIMULATION-AUDIT]",
-                    "[WITNESS-AUDIT]",
-                    "[POINTER-AUDIT]",
-                    "[REF-AUDIT]",
-                    "[TB-AUDIT]",
-                    "[PROV-AUDIT]",
-                    "[DEINIT-AUDIT]",
-                    "[IMPORT-ISOLATION]",
-                    "[ADT-AUDIT-COVERAGE]",
-                    "[ANNEAL-AXIOMS]",
-                )
-            )
-        ]
+    except OSError as exc:
         return {
             "name": name,
             "category": category,
-            "status": status,
-            "exit_code": proc.returncode,
-            "duration_sec": elapsed,
+            "status": "FAIL",
+            "exit_code": 127,
+            "duration_sec": round(time.monotonic() - t0, 2),
             "command": " ".join(cmd),
-            "audit_tags": audit_tags,
-            "failure_excerpt": tail_lines,
+            "audit_tags": [],
+            "failure_excerpt": f"Failed to launch {cmd[0] if cmd else '<empty>'}: {exc}",
         }
-    except subprocess.TimeoutExpired as exc:
-        elapsed = round(time.monotonic() - t0, 2)
-        out_str = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err_str = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        combined_out = (out_str + "\n" + err_str).strip()
+    try:
+        try:
+            out, err = proc.communicate(timeout=outer_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_step(proc)
+            try:
+                out, err = proc.communicate(timeout=STEP_PIPE_DRAIN_SEC)
+            except subprocess.TimeoutExpired as drain_exc:
+                # An escaped descendant still holds the pipes open: keep what was read.
+                out, err = _as_text(drain_exc.output), _as_text(drain_exc.stderr)
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+    except BaseException:
+        # Ctrl-C / SystemExit: never leave the detached step group running.
+        _terminate_step(proc)
+        raise
+    elapsed = round(time.monotonic() - t0, 2)
+    out, err = _as_text(out), _as_text(err)
+    combined_out = (out + "\n" + err).strip()
+    if timed_out:
         tail_lines = "\n".join(combined_out.splitlines()[-39:])
-        excerpt = f"{tail_lines}\nTimed out after {timeout_sec}s".strip()
+        excerpt = (
+            f"{tail_lines}\nTimed out after {elapsed}s (step budget {timeout_sec}s, "
+            f"outer deadline {outer_timeout}s)"
+        ).strip()
         return {
             "name": name,
             "category": category,
@@ -1146,19 +1239,179 @@ def _run_step(
             "audit_tags": [],
             "failure_excerpt": excerpt,
         }
+    returncode = proc.returncode
+    if returncode == 0:
+        status = "PASS"
+    elif returncode == 124:
+        status = "TIMEOUT"
+    else:
+        status = "FAIL"
+    tail_lines = "\n".join(combined_out.splitlines()[-40:]) if status != "PASS" else ""
+    if status == "TIMEOUT" and not tail_lines:
+        tail_lines = f"Timed out after {timeout_sec}s"
+    # Extract any `[...-AUDIT]` lines when running `MiniRustSpec`
+    audit_tags = [
+        line.strip()
+        for line in combined_out.splitlines()
+        if any(
+            tag in line
+            for tag in (
+                "[ANCHOR-AUDIT]",
+                "[SIMULATION-AUDIT]",
+                "[WITNESS-AUDIT]",
+                "[POINTER-AUDIT]",
+                "[REF-AUDIT]",
+                "[TB-AUDIT]",
+                "[PROV-AUDIT]",
+                "[DEINIT-AUDIT]",
+                "[IMPORT-ISOLATION]",
+                "[ADT-AUDIT-COVERAGE]",
+                "[ANNEAL-AXIOMS]",
+            )
+        )
+    ]
+    return {
+        "name": name,
+        "category": category,
+        "status": status,
+        "exit_code": returncode,
+        "duration_sec": elapsed,
+        "command": " ".join(cmd),
+        "audit_tags": audit_tags,
+        "failure_excerpt": tail_lines,
+    }
+
+
+# Standalone `nightly` Lean test files. `lake env lean` never builds imports, so each
+# module they import needs an up-to-date `.olean` before they run; `Anneal.ByteCodec`
+# and `Anneal.Mir.Cast` are outside the `Trusted`/`Anneal`/`MiniRust` import closure.
+MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
+    ("tests_mir_bit_validity_stage1", "tests/mir/BitValidityStage1Tests.lean"),
+    ("tests_mir_byte_codec", "tests/mir/ByteCodecTests.lean"),
+    ("tests_mir_cast_stage1", "tests/mir/CastStage1Tests.lean"),
+)
+CORE_THEORY_LIBS: tuple[str, ...] = ("Trusted", "Anneal", "MiniRust")
+_LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
+    "Trusted",
+    "Anneal",
+    "MiniRust",
+    "Correspondence",
+    "MiniRustSpec",
+)
+# Used only if a test header is unreadable (the unit tests keep it in sync).
+_MIR_TEST_MODULE_FALLBACK: tuple[str, ...] = (
+    "Anneal.BitValidity",
+    "Anneal.ByteCodec",
+    "Anneal.Mir.Cast",
+)
+_LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
+
+
+def _strip_lean_comments(text: str) -> str:
+    """`text` with `--` line comments and (nested) `/- ... -/` block comments blanked."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j
+            out.append(" ")
+        elif text.startswith("/-", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/-", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("-/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(" ")
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _lean_header_imports(path: Path, max_chars: int = 16384) -> list[str] | None:
+    """Module names imported by the header of Lean file `path` (`[module] [prelude]`
+    followed by `[public] [meta] import [all] <Module>` commands), or `None` if the
+    file cannot be read."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            head = fh.read(max_chars)
+    except OSError:
+        return None
+    tokens = _LEAN_HEADER_TOKEN_RE.findall(_strip_lean_comments(head))
+    mods: list[str] = []
+    i = 0
+    if tokens[i : i + 1] == ["module"]:
+        i += 1
+    if tokens[i : i + 1] == ["prelude"]:
+        i += 1
+    while i < len(tokens):
+        j = i
+        while j < len(tokens) and tokens[j] in ("public", "meta", "private"):
+            j += 1
+        if j >= len(tokens) or tokens[j] != "import":
+            break
+        j += 1
+        if j < len(tokens) and tokens[j] in ("all", "runtime"):
+            j += 1
+        if j >= len(tokens):
+            break
+        mods.append(tokens[j].replace("«", "").replace("»", ""))
+        i = j + 1
+    return mods
+
+
+def _local_lean_libs(repo_root: Path) -> tuple[str, ...]:
+    try:
+        cfg = tomllib.loads((repo_root / "lakefile.toml").read_text(encoding="utf-8"))
+        names = tuple(
+            str(lib["name"]) for lib in cfg.get("lean_lib", []) if isinstance(lib, dict) and lib.get("name")
+        )
+        return names or _LOCAL_LEAN_LIB_FALLBACK
+    except (OSError, ValueError, TypeError, KeyError):
+        return _LOCAL_LEAN_LIB_FALLBACK
+
+
+def mir_test_prebuild_modules(repo_root: Path) -> list[str]:
+    """Workspace modules imported by `MIR_STANDALONE_LEAN_TESTS`, in first-seen order;
+    `lake build +<Module>` builds each with its transitive imports."""
+    libs = set(_local_lean_libs(repo_root))
+    mods: list[str] = []
+    for _step, rel in MIR_STANDALONE_LEAN_TESTS:
+        imports = _lean_header_imports(repo_root / rel)
+        if imports is None:
+            imports = list(_MIR_TEST_MODULE_FALLBACK)
+        for mod in imports:
+            if mod.split(".", 1)[0] in libs and mod not in mods:
+                mods.append(mod)
+    return mods or list(_MIR_TEST_MODULE_FALLBACK)
 
 
 def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, list[str], int]]:
-    """Return ordered `(step_name, category, cmd, timeout_sec)` for `profile`."""
+    """Return ordered `(step_name, category, cmd, timeout_sec)` for `profile`.
+
+    `quick` and `nightly` start with `lake_build_core_theory` (`Trusted`, `Anneal`,
+    `MiniRust` `.olean`s) before any trusted-boundary or Lean step; `nightly` also
+    builds every workspace module imported by the standalone `tests/mir` files
+    (`lake_build_mir_test_modules`) right before running them. A step wrapped in
+    `anneal-lean-run` receives its step budget as the wrapper's own `--timeout`, so
+    the two can never drift apart (`_outer_timeout_sec` adds the wrapper's slot
+    queueing and a grace margin on top).
+    """
     lean_run = str(repo_root / "scripts/anneal-lean-run")
     has_lean_run = Path(lean_run).is_file() and os.access(lean_run, os.X_OK)
+    steps: list[tuple[str, str, list[str], int]] = []
 
-    def wrap_lean_build(cmd: list[str], timeout_sec: int = 900) -> list[str]:
-        if has_lean_run:
-            return [
+    def add(name: str, category: str, cmd: list[str], timeout_sec: int, wrap: str | None = None) -> None:
+        if wrap is not None and has_lean_run:
+            cmd = [
                 lean_run,
                 "--mode",
-                "build",
+                wrap,
                 "--concurrency",
                 "1",
                 "--timeout",
@@ -1166,286 +1419,226 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
                 "--",
                 *cmd,
             ]
-        return cmd
+        steps.append((name, category, cmd, timeout_sec))
 
-    def wrap_lean_file(cmd: list[str], timeout_sec: int = 300) -> list[str]:
-        if has_lean_run:
-            return [
-                lean_run,
-                "--mode",
-                "file",
-                "--concurrency",
-                "1",
-                "--timeout",
-                str(timeout_sec),
-                "--",
-                *cmd,
-            ]
-        return cmd
-
-    steps: list[tuple[str, str, list[str], int]] = [
-        (
-            "lean_miri_semantic_source_lint",
-            "cat2_correspondence_suites",
-            [sys.executable, "-B", "lean-miri/vendor/tools/check_semantic_sources.py"],
-            60,
-        ),
-        (
-            "ci_check_non_stable_version",
-            "cat7_python_and_ci_tests",
-            ["bash", "./ci/check_non_stable_version.sh"],
-            30,
-        ),
-    ]
+    add(
+        "lean_miri_semantic_source_lint",
+        "cat2_correspondence_suites",
+        [sys.executable, "-B", "lean-miri/vendor/tools/check_semantic_sources.py"],
+        60,
+    )
+    add("ci_check_non_stable_version", "cat7_python_and_ci_tests", ["bash", "./ci/check_non_stable_version.sh"], 30)
 
     if profile in ("quick", "nightly"):
-        steps.extend(
+        # Cold `Trusted Anneal MiniRust` builds measure ~210 s on an 8-core capsule.
+        add(
+            "lake_build_core_theory",
+            "cat1_trusted_boundary",
+            ["lake", "build", *CORE_THEORY_LIBS],
+            900,
+            wrap="build",
+        )
+        add(
+            "check_trusted_fast",
+            "cat1_trusted_boundary",
+            [sys.executable, "-B", "trusted/audit/check_trusted.py", "--fast"],
+            600,
+            wrap="build",
+        )
+        add(
+            "ci_python_unit_tests",
+            "cat7_python_and_ci_tests",
+            [sys.executable, "-B", "-m", "unittest", "discover", "-s", "ci", "-p", "test_*.py"],
+            120,
+        )
+        add(
+            "scripts_python_unit_tests",
+            "cat7_python_and_ci_tests",
+            [sys.executable, "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
+            180,
+        )
+        add(
+            "anneal_lsp_python_unit_tests",
+            "cat7_python_and_ci_tests",
             [
-                (
-                    "lake_build_core_theory",
-                    "cat1_trusted_boundary",
-                    wrap_lean_build(["lake", "build", "Trusted", "Anneal", "MiniRust"], timeout_sec=900),
-                    900,
-                ),
-                (
-                    "check_trusted_fast",
-                    "cat1_trusted_boundary",
-                    wrap_lean_build(
-                        [sys.executable, "-B", "trusted/audit/check_trusted.py", "--fast"],
-                        timeout_sec=600,
-                    ),
-                    600,
-                ),
-                (
-                    "ci_python_unit_tests",
-                    "cat7_python_and_ci_tests",
-                    [sys.executable, "-B", "-m", "unittest", "discover", "-s", "ci", "-p", "test_*.py"],
-                    120,
-                ),
-                (
-                    "scripts_python_unit_tests",
-                    "cat7_python_and_ci_tests",
-                    [sys.executable, "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
-                    180,
-                ),
-                (
-                    "anneal_lsp_python_unit_tests",
-                    "cat7_python_and_ci_tests",
-                    [
-                        sys.executable,
-                        "-B",
-                        "-m",
-                        "unittest",
-                        "discover",
-                        "-s",
-                        "tools/anneal-lsp/server",
-                        "-p",
-                        "test_*.py",
-                    ],
-                    120,
-                ),
-                (
-                    "minirust_gen_freshness_check",
-                    "cat2_correspondence_suites",
-                    ["cargo", "run", "-q", "-p", "anneal-minirust-gen", "--", "generate", "--check"],
-                    180,
-                ),
-                (
-                    "correspondence_bugs_lint",
-                    "cat2_correspondence_suites",
-                    [
-                        "cargo",
-                        "run",
-                        "-q",
-                        "-p",
-                        "cargo-anneal",
-                        "--",
-                        "correspondence-bugs",
-                        "lint",
-                        "--gaps-toml",
-                        "theory/Correspondence/correspondence_gaps.toml",
-                        "--matrix-toml",
-                        "theory/Correspondence/correspondence_matrix.toml",
-                        "--miri-manifest",
-                        "tests/miri-diff/manifest.toml",
-                    ],
-                    180,
-                ),
-                (
-                    "minirust_sync_verify_lock",
-                    "cat2_correspondence_suites",
-                    [
-                        "cargo",
-                        "run",
-                        "-q",
-                        "-p",
-                        "cargo-anneal",
-                        "--",
-                        "minirust-sync",
-                        "verify-lock",
-                        "--lock-toml",
-                        "theory/MiniRust/upstream-minirust.lock.toml",
-                    ],
-                    180,
-                ),
-                (
-                    "rust_workspace_unit_tests",
-                    "cat3_rust_unit_tests",
-                    wrap_lean_build(
-                        ["cargo", "test", "--workspace", "--lib", "--bins", "--locked"],
-                        timeout_sec=600,
-                    ),
-                    600,
-                ),
-            ]
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tools/anneal-lsp/server",
+                "-p",
+                "test_*.py",
+            ],
+            120,
+        )
+        add(
+            "minirust_gen_freshness_check",
+            "cat2_correspondence_suites",
+            ["cargo", "run", "-q", "-p", "anneal-minirust-gen", "--", "generate", "--check"],
+            180,
+        )
+        add(
+            "correspondence_bugs_lint",
+            "cat2_correspondence_suites",
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "cargo-anneal",
+                "--",
+                "correspondence-bugs",
+                "lint",
+                "--gaps-toml",
+                "theory/Correspondence/correspondence_gaps.toml",
+                "--matrix-toml",
+                "theory/Correspondence/correspondence_matrix.toml",
+                "--miri-manifest",
+                "tests/miri-diff/manifest.toml",
+            ],
+            180,
+        )
+        add(
+            "minirust_sync_verify_lock",
+            "cat2_correspondence_suites",
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "cargo-anneal",
+                "--",
+                "minirust-sync",
+                "verify-lock",
+                "--lock-toml",
+                "theory/MiniRust/upstream-minirust.lock.toml",
+            ],
+            180,
+        )
+        add(
+            "rust_workspace_unit_tests",
+            "cat3_rust_unit_tests",
+            ["cargo", "test", "--workspace", "--lib", "--bins", "--locked"],
+            600,
+            wrap="build",
         )
 
     if profile == "nightly":
-        steps.extend(
+        add(
+            "check_trusted_self_test",
+            "cat1_trusted_boundary",
+            [sys.executable, "-B", "trusted/audit/check_trusted.py", "--self-test"],
+            600,
+            wrap="build",
+        )
+        # Cold `+Anneal.BitValidity +Anneal.ByteCodec +Anneal.Mir.Cast` after the core
+        # build measures ~96 s on an 8-core capsule.
+        add(
+            "lake_build_mir_test_modules",
+            "cat1_trusted_boundary",
+            ["lake", "build", *(f"+{mod}" for mod in mir_test_prebuild_modules(repo_root))],
+            900,
+            wrap="build",
+        )
+        for step_name, rel in MIR_STANDALONE_LEAN_TESTS:
+            add(step_name, "cat1_trusted_boundary", ["lake", "env", "lean", rel], 300, wrap="file")
+        add(
+            "lake_build_correspondence",
+            "cat2_correspondence_suites",
+            ["lake", "build", "Correspondence"],
+            900,
+            wrap="build",
+        )
+        add(
+            "lake_build_minirust_spec",
+            "cat2_correspondence_suites",
+            ["lake", "build", "MiniRustSpec"],
+            1200,
+            wrap="build",
+        )
+        add(
+            "lake_build_lean_miri_spec",
+            "cat2_correspondence_suites",
+            ["lake", "--dir", "examples", "build", "LeanMiriSpec"],
+            1800,
+            wrap="build",
+        )
+        add(
+            "domain_integration_tests_anneal_mir",
+            "cat4_rust_domain_integration_tests",
+            ["cargo", "test", "-p", "anneal-mir", "--tests", "--locked"],
+            300,
+            wrap="build",
+        )
+        add(
+            "domain_integration_tests_minirust_gen_and_specr",
+            "cat4_rust_domain_integration_tests",
             [
-                (
-                    "check_trusted_self_test",
-                    "cat1_trusted_boundary",
-                    wrap_lean_build(
-                        [sys.executable, "-B", "trusted/audit/check_trusted.py", "--self-test"],
-                        timeout_sec=600,
-                    ),
-                    600,
-                ),
-                (
-                    "tests_mir_bit_validity_stage1",
-                    "cat1_trusted_boundary",
-                    wrap_lean_file(
-                        ["lake", "env", "lean", "tests/mir/BitValidityStage1Tests.lean"],
-                        timeout_sec=300,
-                    ),
-                    300,
-                ),
-                (
-                    "tests_mir_byte_codec",
-                    "cat1_trusted_boundary",
-                    wrap_lean_file(
-                        ["lake", "env", "lean", "tests/mir/ByteCodecTests.lean"],
-                        timeout_sec=300,
-                    ),
-                    300,
-                ),
-                (
-                    "tests_mir_cast_stage1",
-                    "cat1_trusted_boundary",
-                    wrap_lean_file(
-                        ["lake", "env", "lean", "tests/mir/CastStage1Tests.lean"],
-                        timeout_sec=300,
-                    ),
-                    300,
-                ),
-                (
-                    "lake_build_correspondence",
-                    "cat2_correspondence_suites",
-                    wrap_lean_build(["lake", "build", "Correspondence"], timeout_sec=900),
-                    900,
-                ),
-                (
-                    "lake_build_minirust_spec",
-                    "cat2_correspondence_suites",
-                    wrap_lean_build(["lake", "build", "MiniRustSpec"], timeout_sec=1200),
-                    1200,
-                ),
-                (
-                    "lake_build_lean_miri_spec",
-                    "cat2_correspondence_suites",
-                    wrap_lean_build(
-                        ["lake", "--dir", "examples", "build", "LeanMiriSpec"],
-                        timeout_sec=1800,
-                    ),
-                    1800,
-                ),
-                (
-                    "domain_integration_tests_anneal_mir",
-                    "cat4_rust_domain_integration_tests",
-                    wrap_lean_build(
-                        ["cargo", "test", "-p", "anneal-mir", "--tests", "--locked"],
-                        timeout_sec=300,
-                    ),
-                    300,
-                ),
-                (
-                    "domain_integration_tests_minirust_gen_and_specr",
-                    "cat4_rust_domain_integration_tests",
-                    wrap_lean_build(
-                        [
-                            "cargo",
-                            "test",
-                            "-p",
-                            "anneal-minirust-gen",
-                            "-p",
-                            "anneal-specr-lean",
-                            "-p",
-                            "anneal-spec",
-                            "--tests",
-                            "--locked",
-                        ],
-                        timeout_sec=300,
-                    ),
-                    300,
-                ),
-                (
-                    "domain_integration_tests_anneal_difftest",
-                    "cat4_rust_domain_integration_tests",
-                    wrap_lean_build(
-                        [
-                            "cargo",
-                            "test",
-                            "--manifest-path",
-                            "crates/anneal-difftest/Cargo.toml",
-                            "--lib",
-                            "--bins",
-                            "--tests",
-                            "--locked",
-                        ],
-                        timeout_sec=900,
-                    ),
-                    900,
-                ),
-                (
-                    "cargo_anneal_e2e_minirust_correspondence",
-                    "cat5_cargo_anneal_e2e_suites",
-                    wrap_lean_build(
-                        [
-                            "cargo",
-                            "test",
-                            "-p",
-                            "cargo-anneal",
-                            "--test",
-                            "end_to_end_minirust_correspondence",
-                            "--locked",
-                        ],
-                        timeout_sec=600,
-                    ),
-                    600,
-                ),
-                (
-                    "cargo_anneal_e2e_pipeline_and_adoption",
-                    "cat5_cargo_anneal_e2e_suites",
-                    wrap_lean_build(
-                        [
-                            "cargo",
-                            "test",
-                            "-p",
-                            "cargo-anneal",
-                            "--test",
-                            "end_to_end_pipeline",
-                            "--test",
-                            "end_to_end_rust_only_adoption",
-                            "--test",
-                            "end_to_end_trace_observer",
-                            "--locked",
-                        ],
-                        timeout_sec=900,
-                    ),
-                    900,
-                ),
-            ]
+                "cargo",
+                "test",
+                "-p",
+                "anneal-minirust-gen",
+                "-p",
+                "anneal-specr-lean",
+                "-p",
+                "anneal-spec",
+                "--tests",
+                "--locked",
+            ],
+            300,
+            wrap="build",
+        )
+        add(
+            "domain_integration_tests_anneal_difftest",
+            "cat4_rust_domain_integration_tests",
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                "crates/anneal-difftest/Cargo.toml",
+                "--lib",
+                "--bins",
+                "--tests",
+                "--locked",
+            ],
+            900,
+            wrap="build",
+        )
+        add(
+            "cargo_anneal_e2e_minirust_correspondence",
+            "cat5_cargo_anneal_e2e_suites",
+            [
+                "cargo",
+                "test",
+                "-p",
+                "cargo-anneal",
+                "--test",
+                "end_to_end_minirust_correspondence",
+                "--locked",
+            ],
+            600,
+            wrap="build",
+        )
+        add(
+            "cargo_anneal_e2e_pipeline_and_adoption",
+            "cat5_cargo_anneal_e2e_suites",
+            [
+                "cargo",
+                "test",
+                "-p",
+                "cargo-anneal",
+                "--test",
+                "end_to_end_pipeline",
+                "--test",
+                "end_to_end_rust_only_adoption",
+                "--test",
+                "end_to_end_trace_observer",
+                "--locked",
+            ],
+            900,
+            wrap="build",
         )
 
     return steps

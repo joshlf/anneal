@@ -649,58 +649,19 @@ def _is_symbol_end(stripped: str, end: int) -> bool:
     return not _is_ident_char(ch)
 
 
-def _has_unfold_entry_tail_at(stripped: str, end: int) -> bool:
-    """Fast necessary condition for `stripped[...:end]` to pass `_is_simp_unfold_entry`:
-    either followed by an `.eq_` suffix, or (after whitespace) by `)`, `,`, `:`, or `]`."""
-    if not _is_symbol_end(stripped, end):
+def _has_mir_body_ident(stripped: str) -> bool:
+    """Exactly `_MIR_BODY_RE.search(stripped) is not None`, without a full regex scan.
+
+    A match never spans a newline (no identifier part does) and always contains a
+    `Mir.` before its final `.body`, which ends the symbol (`_is_symbol_end`). So it
+    suffices to regex-scan the lines holding such a `.body` with an earlier `Mir.`.
+    Every rule-2 finding (simp entry or `unfold`/`delta` target) is a `_MIR_BODY_RE`
+    match at the same offset of `stripped`, so `False` soundly skips rule 2.
+    """
+    p_mir = stripped.find("Mir.", 0)
+    if p_mir == -1:
         return False
     n = len(stripped)
-    if end < n and stripped[end] == ".":
-        return True
-    k = end
-    while k < n and stripped[k] in " \t\r\n":
-        k += 1
-    return k >= n or stripped[k] in "),:]"
-
-
-def _has_unfold_entry_head_before(stripped: str, pos: int) -> bool:
-    """Fast necessary condition for `stripped[pos:...]` (optionally preceded by a
-    dotted namespace prefix) to stand as a `simp`/`dsimp` entry after `[` or `,`."""
-    j = pos
-    while j > 0 and (_is_ident_char(stripped[j - 1]) or stripped[j - 1] == "."):
-        j -= 1
-    if j > 0 and stripped[j - 1] in "«»":
-        return True
-    k = j - 1
-    while k >= 0 and stripped[k] in " \t\r\n@(↓↑":
-        k -= 1
-    return k >= 0 and stripped[k] in "[,"
-
-
-def _first_unfold_entry_offset(stripped: str, kw: str, start: int = 0) -> int:
-    """First offset `>= start` where `kw` has valid simp-entry head and tail tokens."""
-    klen = len(kw)
-    pos = stripped.find(kw, start)
-    while pos != -1:
-        end = pos + klen
-        if _has_unfold_entry_tail_at(stripped, end) and _has_unfold_entry_head_before(
-            stripped, pos
-        ):
-            return pos
-        pos = stripped.find(kw, end)
-    return -1
-
-
-def _first_mir_body_offsets(stripped: str, start: int = 0) -> tuple[int, int]:
-    """Return `(first_any_mir_body_dot_body, first_simp_entry_mir_body_dot_body)`.
-    Avoids false `has_mir_body = True` when `Mir.` and `.body` appear at unrelated
-    positions in a file without any `Mir.<...>.body` identifier."""
-    p_mir = stripped.find("Mir.", start)
-    if p_mir == -1:
-        return -1, -1
-    n = len(stripped)
-    first_any = -1
-    first_simp = -1
     pos = stripped.find(".body", p_mir + 4)
     while pos != -1:
         if _is_symbol_end(stripped, pos + 5):
@@ -708,55 +669,50 @@ def _first_mir_body_offsets(stripped: str, start: int = 0) -> tuple[int, int]:
             if stripped.find("Mir.", line_start, pos) != -1:
                 nl = stripped.find("\n", pos + 5)
                 line_end = n if nl == -1 else nl
-                for bm in _MIR_BODY_RE.finditer(stripped, line_start, line_end):
-                    b_pos = bm.end(1) - 5
-                    if first_any == -1:
-                        first_any = b_pos
-                    if (
-                        first_simp == -1
-                        and _has_unfold_entry_tail_at(stripped, b_pos + 5)
-                        and _has_unfold_entry_head_before(stripped, bm.start(1))
-                    ):
-                        first_simp = b_pos
-                        return first_any, first_simp
+                if _MIR_BODY_RE.search(stripped, line_start, line_end) is not None:
+                    return True
                 pos = stripped.find(".body", line_end)
                 continue
         pos = stripped.find(".body", pos + 5)
-    return first_any, first_simp
+    return False
 
 
 def _active_simp_keywords(
     stripped: str, simp_start: int = 0, check_rule1: bool = True
 ) -> tuple[dict[str, int], bool, bool]:
-    """Map of candidate keywords to their first simp-entry offset in `stripped`, plus
-    `(has_mir_body, has_bitwise)`. Avoids scanning twice for the same keyword."""
+    """Map of candidate keywords to their first offset in `stripped`, plus
+    `(has_mir_body, has_bitwise)`. Avoids scanning twice for the same keyword.
+
+    The offsets anchor `_candidate_search_windows` and must stay exactly the
+    unfiltered first occurrences: a window anchored at an occurrence that is not
+    itself a simp entry can still be the only one reaching a long (`> 2048` char)
+    simp list holding a real entry. `has_mir_body` is exact (`_has_mir_body_ident`)
+    and only gates rule-2 checks, never window anchors.
+    """
     kw_offsets: dict[str, int] = {}
     if check_rule1:
-        p = _first_unfold_entry_offset(stripped, "wpMirExecSym", simp_start)
+        p = stripped.find("wpMirExecSym", simp_start)
         if p != -1:
             kw_offsets["wpMirExecSym"] = p
-        p = _first_unfold_entry_offset(stripped, "Sequence.length", simp_start)
+        p = stripped.find("Sequence.length", simp_start)
         if p != -1:
             kw_offsets["Sequence.length"] = p
-    first_any_mb, first_simp_mb = _first_mir_body_offsets(stripped, 0)
-    has_mir_body = first_any_mb != -1
-    if first_simp_mb != -1:
-        kw_offsets[".body"] = first_simp_mb
+    p_body = stripped.find(".body", 0)
+    has_mir_body = False
+    if p_body != -1 and stripped.find("Mir.", 0) != -1:
+        kw_offsets[".body"] = p_body
+        has_mir_body = _has_mir_body_ident(stripped)
     has_bitwise = False
     p_bw = stripped.find("bitwise", 0)
     if p_bw != -1:
         p = stripped.find("bitwiseAndBits", p_bw)
         if p != -1:
+            kw_offsets["bitwiseAndBits"] = p
             has_bitwise = True
-            p_simp = _first_unfold_entry_offset(stripped, "bitwiseAndBits", p)
-            if p_simp != -1:
-                kw_offsets["bitwiseAndBits"] = p_simp
         p = stripped.find("bitwiseOrBits", p_bw)
         if p != -1:
+            kw_offsets["bitwiseOrBits"] = p
             has_bitwise = True
-            p_simp = _first_unfold_entry_offset(stripped, "bitwiseOrBits", p)
-            if p_simp != -1:
-                kw_offsets["bitwiseOrBits"] = p_simp
     return kw_offsets, has_mir_body, has_bitwise
 
 
@@ -812,10 +768,11 @@ def _candidate_search_windows(
     raw_spans: list[tuple[int, int]] = []
     for kw, first_pos in kw_offsets.items():
         klen = len(kw)
+        check_before = kw[0] != "."
         pos = first_pos
         while pos != -1:
-            if not _has_unfold_entry_tail_at(stripped, pos + klen) or not _has_unfold_entry_head_before(
-                stripped, pos
+            if not _is_symbol_end(stripped, pos + klen) or (
+                check_before and pos > 0 and _is_ident_char(stripped[pos - 1])
             ):
                 pos = stripped.find(kw, pos + klen)
                 continue
@@ -826,10 +783,8 @@ def _candidate_search_windows(
                     hdr_start = _step_back_simp_header_start(stripped, last_open)
                     if stripped.find("simp", hdr_start, last_open) != -1:
                         raw_spans.append((hdr_start, last_open + 1))
-                elif (
-                    stripped.rfind("[", w_start, last_open) != -1
-                    and stripped.find("simp", w_start, pos) != -1
-                    and stripped.count("[", w_start, pos) > stripped.count("]", w_start, pos)
+                elif stripped.find("simp", w_start, pos) != -1 and (
+                    stripped.count("[", w_start, pos) > stripped.count("]", w_start, pos)
                 ):
                     raw_spans.append((w_start, pos + klen))
             pos = stripped.find(kw, pos + klen)
@@ -959,138 +914,96 @@ def _iter_simp_brackets(
             pos = stripped.find("simp", pos + 4, win_end)
 
 
-def _unfold_search_windows(
-    stripped: str,
-    target_kws: tuple[str, ...] | None,
-    max_unfold_len: int = 2048,
-) -> list[tuple[int, int]]:
-    n = len(stripped)
-    if not target_kws or n <= 8192:
-        return [(0, n)]
-    raw_spans: list[tuple[int, int]] = []
-    for tkw in target_kws:
-        tlen = len(tkw)
-        pos = stripped.find(tkw, 0)
-        while pos != -1:
-            if _is_symbol_end(stripped, pos + tlen):
-                w_start = pos - max_unfold_len if pos > max_unfold_len else 0
-                raw_spans.append((w_start, pos + tlen))
-            pos = stripped.find(tkw, pos + tlen)
-    if not raw_spans:
-        return []
-    raw_spans.sort()
-    merged: list[tuple[int, int]] = [raw_spans[0]]
-    for st, en in raw_spans[1:]:
-        prev_st, prev_en = merged[-1]
-        if st <= prev_en:
-            if en > prev_en:
-                merged[-1] = (prev_st, en)
-        else:
-            merged.append((st, en))
-    return merged
-
-
-def _iter_unfold_targets(
-    stripped: str,
-    *,
-    target_kws: tuple[str, ...] | None = None,
-) -> Iterable[tuple[str, int, str]]:
+def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
     """Yield `(tactic_kw, token_offset, token)` for every identifier passed to an
     `unfold` or `delta` tactic, across both single-line and indented multiline target
     lists, while rejecting `.unfold`/`.delta` field projections and honoring Lean
     identifier characters (`at'`, `in?`) on stop-word checks.
     """
     n = len(stripped)
-    windows = _unfold_search_windows(stripped, target_kws)
-    if not windows:
-        return
     for kw in ("unfold", "delta"):
         klen = len(kw)
-        seen_kw: set[int] = set()
-        for win_start, win_end in windows:
-            pos = stripped.find(kw, win_start, win_end)
-            while pos != -1:
-                end_kw = pos + klen
-                if (
-                    pos in seen_kw
-                    or (pos > 0 and (_is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "."))
-                    or end_kw >= n
-                    or stripped[end_kw] not in " \t\r\n"
-                ):
-                    pos = stripped.find(kw, end_kw, win_end)
-                    continue
-                seen_kw.add(pos)
-                line_start = stripped.rfind("\n", 0, pos) + 1
-                k_ind = line_start
-                while k_ind < pos and stripped[k_ind] in " \t":
-                    k_ind += 1
-                line_indent = k_ind - line_start
+        pos = stripped.find(kw, 0)
+        while pos != -1:
+            end_kw = pos + klen
+            if (
+                (pos > 0 and (_is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "."))
+                or end_kw >= n
+                or stripped[end_kw] not in " \t\r\n"
+            ):
+                pos = stripped.find(kw, end_kw)
+                continue
+            line_start = stripped.rfind("\n", 0, pos) + 1
+            k_ind = line_start
+            while k_ind < pos and stripped[k_ind] in " \t":
+                k_ind += 1
+            line_indent = k_ind - line_start
 
-                cur = end_kw
-                saw_target = False
-                while cur < n:
-                    while cur < n and stripped[cur] in " \t\r":
-                        cur += 1
-                    if cur >= n:
-                        break
-                    if stripped[cur] == "\n":
-                        nxt_line = cur + 1
-                        k = nxt_line
-                        while k < n and stripped[k] in " \t":
-                            k += 1
-                        if k >= n:
-                            cur = k
-                            break
-                        if stripped[k] in "\r\n":
-                            cur = k
-                            continue
-                        if k - nxt_line <= line_indent:
-                            break
+            cur = end_kw
+            saw_target = False
+            while cur < n:
+                while cur < n and stripped[cur] in " \t\r":
+                    cur += 1
+                if cur >= n:
+                    break
+                if stripped[cur] == "\n":
+                    nxt_line = cur + 1
+                    k = nxt_line
+                    while k < n and stripped[k] in " \t":
+                        k += 1
+                    if k >= n:
                         cur = k
-                    ch = stripped[cur]
-                    if not saw_target:
-                        # Optional `(config := ...)` or `+opt` / `-opt` flags before targets.
-                        if ch == "(":
-                            depth = 1
-                            cur += 1
-                            while cur < n and depth > 0:
-                                c2 = stripped[cur]
-                                if c2 == "(":
-                                    depth += 1
-                                elif c2 == ")":
-                                    depth -= 1
-                                cur += 1
-                            if depth != 0:
-                                break
-                            continue
-                        if ch in "+-" and cur + 1 < n and (
-                            stripped[cur + 1].isalpha() or stripped[cur + 1] == "_"
-                        ):
-                            cur += 2
-                            while cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
-                                cur += 1
-                            continue
-                    if not (_is_ident_char(ch) or ch == "«"):
                         break
-                    tok_start = cur
-                    while cur < n:
-                        c2 = stripped[cur]
-                        if c2 == "«":
-                            g_end = stripped.find("»", cur + 1)
-                            if g_end == -1 or stripped.find("\n", cur + 1, g_end) != -1:
-                                cur += 1
-                                break
-                            cur = g_end + 1
-                        elif _is_ident_char(c2) or c2 == ".":
+                    if stripped[k] in "\r\n":
+                        cur = k
+                        continue
+                    if k - nxt_line <= line_indent:
+                        break
+                    cur = k
+                ch = stripped[cur]
+                if not saw_target:
+                    # Optional `(config := ...)` or `+opt` / `-opt` flags before targets.
+                    if ch == "(":
+                        depth = 1
+                        cur += 1
+                        while cur < n and depth > 0:
+                            c2 = stripped[cur]
+                            if c2 == "(":
+                                depth += 1
+                            elif c2 == ")":
+                                depth -= 1
                             cur += 1
-                        else:
+                        if depth != 0:
                             break
-                    tok = stripped[tok_start:cur]
-                    if not tok or tok in _UNFOLD_STOP_WORDS:
+                        continue
+                    if ch in "+-" and cur + 1 < n and (
+                        stripped[cur + 1].isalpha() or stripped[cur + 1] == "_"
+                    ):
+                        cur += 2
+                        while cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
+                            cur += 1
+                        continue
+                if not (_is_ident_char(ch) or ch == "«"):
+                    break
+                tok_start = cur
+                while cur < n:
+                    c2 = stripped[cur]
+                    if c2 == "«":
+                        g_end = stripped.find("»", cur + 1)
+                        if g_end == -1 or stripped.find("\n", cur + 1, g_end) != -1:
+                            cur += 1
+                            break
+                        cur = g_end + 1
+                    elif _is_ident_char(c2) or c2 == ".":
+                        cur += 1
+                    else:
                         break
-                    saw_target = True
-                    yield kw, tok_start, tok
-                pos = stripped.find(kw, end_kw, win_end)
+                tok = stripped[tok_start:cur]
+                if not tok or tok in _UNFOLD_STOP_WORDS:
+                    break
+                saw_target = True
+                yield kw, tok_start, tok
+            pos = stripped.find(kw, end_kw)
 
 
 def _line_indent_at(stripped: str, pos: int) -> int:
@@ -2067,6 +1980,14 @@ def _duplicate_private_findings(
 _ORIG_EXTRACT_PRIVATE_DECLS = extract_private_decls
 
 
+# `_FILE_TEXTS_CACHE` key prefixes for entries that are not sibling texts. A NUL can
+# never occur in a path, so these never collide with the `str(path)` keys under which
+# `_file_texts` / `_extract_sibling_private_decls_fast` store text-mode
+# (newline-translated) sibling texts whose declaration offsets assume that decoding.
+_SCAN_META_KEY_PREFIX = "\x00meta:"
+_SCAN_FILE_KEY_PREFIX = "\x00scan:"
+
+
 def _scan_text_meta(
     text: str, stripped: str | None = None
 ) -> tuple[
@@ -2075,22 +1996,24 @@ def _scan_text_meta(
     dict[str, int],
     bool,
     bool,
-    tuple[str, ...],
+    bool,
     bool,
     int,
     tuple[tuple[str, str, str, tuple[int, int, int, int], int, int, int], ...],
 ]:
     """Return `(stripped, first_simp, active_kws, has_mir_body, has_bitwise,
-    unfold_kws, has_profiler, first_private, private_specs)` for `text`, caching
-    the immutable keyword and declaration-header index in `_FILE_TEXTS_CACHE` for
-    large texts (`>= 4096` chars)."""
+    scan_unfold, has_profiler, first_private, private_specs)` for `text`, caching
+    the keyword and declaration-header index in `_FILE_TEXTS_CACHE` for large texts
+    (`>= 4096` chars) so rescanning identical text skips the lexing. A cache hit is
+    verified against the full text and returns a fresh `active_kws` dict."""
     n = len(text)
     idx_key = ""
     if n >= 4096:
-        idx_key = f"_idx:{n}:{hash(text[:128])}:{hash(text[-128:])}"
+        idx_key = f"{_SCAN_META_KEY_PREFIX}{n}:{hash(text[:128])}:{hash(text[-128:])}"
         cached = _FILE_TEXTS_CACHE.get(idx_key)
         if cached is not None and len(cached) == 10 and cached[0] == text:
-            return cached[1:]  # type: ignore[return-value]
+            hit = cached[1:]
+            return (hit[0], hit[1], dict(hit[2]), *hit[3:])  # type: ignore[return-value]
 
     st = stripped if stripped is not None else strip_lean_comments_and_strings(text)
     first_simp = st.find("simp", 0)
@@ -2104,16 +2027,9 @@ def _scan_text_meta(
     else:
         active_kws, has_mir_body, has_bitwise = {}, False, False
 
-    unfold_kws_list: list[str] = []
-    if has_unfold_or_delta:
-        if has_mir_body:
-            unfold_kws_list.append(".body")
-        if has_bitwise:
-            if "bitwiseAndBits" in st:
-                unfold_kws_list.append("bitwiseAndBits")
-            if "bitwiseOrBits" in st:
-                unfold_kws_list.append("bitwiseOrBits")
-    unfold_kws = tuple(unfold_kws_list)
+    # Rules 2 & 3 on `unfold` / `delta` targets need such a tactic plus an exact
+    # `Mir.<...>.body` identifier or a raw bitwise name (every target finding is one).
+    scan_unfold = has_unfold_or_delta and (has_mir_body or has_bitwise)
     has_profiler = "trace.profiler.threshold" in st
     first_private = st.find("private", 0)
     private_specs_list: list[tuple[str, str, str, tuple[int, int, int, int], int, int, int]] = []
@@ -2148,7 +2064,7 @@ def _scan_text_meta(
         active_kws,
         has_mir_body,
         has_bitwise,
-        unfold_kws,
+        scan_unfold,
         has_profiler,
         first_private,
         private_specs,
@@ -2156,7 +2072,7 @@ def _scan_text_meta(
     if idx_key:
         if len(_FILE_TEXTS_CACHE) >= 128:
             _FILE_TEXTS_CACHE.clear()
-        _FILE_TEXTS_CACHE[idx_key] = (text, *res)
+        _FILE_TEXTS_CACHE[idx_key] = (text, *res[:2], dict(active_kws), *res[3:])
     return res
 
 
@@ -2175,7 +2091,7 @@ def scan_lean_text(
         active_kws,
         has_mir_body,
         has_bitwise,
-        unfold_kws,
+        scan_unfold,
         has_profiler,
         first_private,
         private_specs,
@@ -2265,8 +2181,8 @@ def scan_lean_text(
                     )
 
     # Rules 2 & 3 inside `unfold` / `delta` tactics (single-line and multiline)
-    if unfold_kws:
-        for tactic_kw, tok_off, tok in _iter_unfold_targets(stripped, target_kws=unfold_kws):
+    if scan_unfold:
+        for tactic_kw, tok_off, tok in _iter_unfold_targets(stripped):
             if has_mir_body and ".body" in tok and "Mir." in tok:
                 bm = _MIR_BODY_RE.fullmatch(tok)
                 if bm is not None:
@@ -2389,12 +2305,16 @@ def scan_lean_file(
     scan_siblings: bool = True,
 ) -> list[ProofHealthFinding]:
     path = Path(file_path)
-    key = str(path)
+    key = _SCAN_FILE_KEY_PREFIX + str(path)
     try:
         st = path.stat()
     except (OSError, ValueError):
         st = None
-    if st is not None and not _is_racy(st):
+    # Racy files (modified within `RACY_MTIME_WINDOW_NS`) are neither served from nor
+    # stored in the cache: a second same-size write within one coarse timestamp tick
+    # would leave `(mtime_ns, size)` unchanged while the content differs.
+    cacheable = st is not None and not _is_racy(st)
+    if cacheable:
         cached = _FILE_TEXTS_CACHE.get(key)
         if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
             return scan_lean_text(
@@ -2407,7 +2327,7 @@ def scan_lean_file(
     # either way and a stray `\r` is whitespace to every rule.
     text = path.read_bytes().decode("utf-8", errors="replace")
     stripped = strip_lean_comments_and_strings(text)
-    if st is not None:
+    if cacheable:
         if len(_FILE_TEXTS_CACHE) >= 128:
             _FILE_TEXTS_CACHE.clear()
         _FILE_TEXTS_CACHE[key] = (st.st_mtime_ns, st.st_size, text, stripped)

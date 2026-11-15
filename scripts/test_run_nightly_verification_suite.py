@@ -12,9 +12,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import re
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -180,6 +183,32 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             ["lake", "build", "Trusted", "Anneal", "MiniRust"],
         )
 
+        # `lake env lean` never builds imports: every `tests_mir_*` file's workspace
+        # imports must be built (`lake build +<Module>`) before it runs. `Anneal.ByteCodec`
+        # and `Anneal.Mir.Cast` are outside the `Trusted`/`Anneal`/`MiniRust` closure, so
+        # on a cold checkout `lake_build_core_theory` alone leaves them without `.olean`s.
+        self.assertNotIn("lake_build_mir_test_modules", quick_names)
+        self.assertNotIn("lake_build_mir_test_modules", census_names)
+        by_name = dict((s[0], s) for s in nightly_steps)
+        mods_step = by_name["lake_build_mir_test_modules"]
+        sep = mods_step[2].index("--") if "--" in mods_step[2] else -1
+        inner = mods_step[2][sep + 1 :]
+        self.assertEqual(inner[:2], ["lake", "build"])
+        built = {t[1:] for t in inner[2:] if t.startswith("+")}
+        mods_idx = nightly_names.index("lake_build_mir_test_modules")
+        self.assertLess(core_idx, mods_idx)
+        import_re = re.compile(r"^import\s+(\S+)", re.MULTILINE)
+        for step_name, rel in suite.MIR_STANDALONE_LEAN_TESTS:
+            self.assertLess(mods_idx, nightly_names.index(step_name))
+            self.assertEqual(by_name[step_name][2][-4:], ["lake", "env", "lean", rel])
+            imports = import_re.findall((REPO_ROOT / rel).read_text(encoding="utf-8"))
+            self.assertTrue(imports, rel)
+            for mod in imports:
+                if mod.split(".")[0] in suite.CORE_THEORY_LIBS + ("Correspondence", "MiniRustSpec"):
+                    self.assertIn(mod, built, f"{rel} imports {mod}, which must be pre-built")
+        self.assertTrue({"Anneal.ByteCodec", "Anneal.Mir.Cast"} <= built)
+        self.assertEqual(sorted(built), sorted(suite._MIR_TEST_MODULE_FALLBACK))
+
     def test_timeout_propagation_and_calibrated_step_timeouts(self) -> None:
         nightly_by_name = {
             name: (cat, cmd, timeout_sec)
@@ -200,6 +229,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "cargo_anneal_e2e_minirust_correspondence": 600,
             "cargo_anneal_e2e_pipeline_and_adoption": 900,
         }
+        expected_timeouts["lake_build_mir_test_modules"] = 900
         for step_name, exp_timeout in expected_timeouts.items():
             self.assertIn(step_name, nightly_by_name)
             _cat, cmd, timeout_sec = nightly_by_name[step_name]
@@ -208,6 +238,17 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertIn("--timeout", cmd)
             t_idx = cmd.index("--timeout")
             self.assertEqual(int(cmd[t_idx + 1]), timeout_sec)
+
+        # Every wrapped step in every profile hands its exact step budget to the wrapper.
+        for profile in ("census-only", "quick", "nightly"):
+            for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):
+                if not suite._is_lean_run_wrapped(cmd):
+                    continue
+                mode, inner_timeout, slot_lock = suite._lean_run_wrapper_flags(cmd)
+                self.assertEqual(inner_timeout, timeout_sec, f"{profile}/{name}")
+                self.assertTrue(slot_lock, f"{profile}/{name}")
+                expected_mode = "file" if name.startswith("tests_mir_") else "build"
+                self.assertEqual(mode, expected_mode, f"{profile}/{name}")
 
     def test_run_step_wrapper_timeout_grace_and_exit_124_classification(self) -> None:
         # When a wrapped command exits with 124 (inner anneal-lean-run timeout),
@@ -234,6 +275,153 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             cand = Path.home() / rel
             if cand.is_dir():
                 self.assertIn(str(cand), minimal_env["PATH"].split(":"))
+
+    def test_outer_timeout_covers_wrapper_slot_wait_and_grace(self) -> None:
+        lr = str(REPO_ROOT / "scripts/anneal-lean-run")
+        grace = suite.WRAPPER_TIMEOUT_GRACE_SEC
+        # Direct commands: the step budget is the only deadline.
+        self.assertEqual(suite._outer_timeout_sec(["cargo", "test"], 600), 600)
+        # `--mode build` may queue up to `max(30, T)` s for a build slot before its own
+        # `T`-second clock starts, so the outer deadline must exceed `T + max(30, T)`.
+        build = [lr, "--mode", "build", "--concurrency", "1", "--timeout", "1200", "--", "lake", "build"]
+        self.assertEqual(suite._outer_timeout_sec(build, 1200), 1200 + 1200 + grace)
+        short = [lr, "--mode", "build", "--timeout", "10", "--", "lake", "build"]
+        self.assertEqual(suite._outer_timeout_sec(short, 10), 10 + 30 + grace)
+        # `file` mode and `--no-slot-lock` never queue.
+        file_cmd = [lr, "--mode", "file", "--timeout", "300", "--", "lake", "env", "lean", "X.lean"]
+        self.assertEqual(suite._outer_timeout_sec(file_cmd, 300), 300 + grace)
+        nolock = [lr, "--mode", "build", "--no-slot-lock", "--timeout=900", "--", "lake", "build"]
+        self.assertEqual(suite._lean_run_wrapper_flags(nolock), ("build", 900, False))
+        self.assertEqual(suite._outer_timeout_sec(nolock, 900), 900 + grace)
+        # `auto` resolves like the wrapper; without `--timeout` the wrapper defaults apply.
+        auto_file = [lr, "--", "lake", "env", "lean", "X.lean"]
+        self.assertEqual(suite._lean_run_wrapper_flags(auto_file), ("file", None, True))
+        self.assertEqual(suite._outer_timeout_sec(auto_file, 60), 180 + grace)
+        auto_build = [lr, "--", "lake", "build", "Anneal"]
+        self.assertEqual(suite._outer_timeout_sec(auto_build, 60), 900 + 900 + grace)
+        # A wrapped step never gets a shorter outer deadline than its own budget.
+        for profile in ("quick", "nightly"):
+            for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):
+                outer = suite._outer_timeout_sec(cmd, timeout_sec)
+                if suite._is_lean_run_wrapped(cmd):
+                    mode, _t, _lock = suite._lean_run_wrapper_flags(cmd)
+                    slot = max(30, timeout_sec) if mode == "build" else 0
+                    self.assertEqual(outer, timeout_sec + slot + grace, f"{profile}/{name}")
+                else:
+                    self.assertEqual(outer, timeout_sec, f"{profile}/{name}")
+
+    def _assert_pid_gone(self, pid: int, what: str) -> None:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                return
+            if state == "Z":
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        self.fail(f"{what} (pid {pid}) survived the step timeout")
+
+    def test_run_step_timeout_terminates_whole_step_process_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "pids"
+            # A same-group grandchild (as `cargo` children are) must not outlive the step.
+            script = (
+                "import subprocess, sys, time\n"
+                f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                "print('partial-output-before-timeout', flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            t0 = time.monotonic()
+            res = suite._run_step(
+                name="hung_step",
+                category="cat7_python_and_ci_tests",
+                cmd=[sys.executable, "-c", script],
+                cwd=REPO_ROOT,
+                timeout_sec=2,
+            )
+            self.assertLess(time.monotonic() - t0, 30.0)
+            self.assertEqual(res["status"], "TIMEOUT")
+            self.assertEqual(res["exit_code"], 124)
+            self.assertIn("partial-output-before-timeout", res["failure_excerpt"])
+            self.assertIn("Timed out after", res["failure_excerpt"])
+            self._assert_pid_gone(int(pid_file.read_text()), "same-group grandchild")
+
+    def test_run_step_timeout_lets_wrapper_reap_its_separate_session_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "pids"
+            # Mirrors `anneal-lean-run`: the build runs in its own session and is only
+            # reaped by the wrapper's SIGTERM handler, so a bare SIGKILL of the wrapper
+            # (what `subprocess.run(timeout=...)` does) would orphan it.
+            script = (
+                "import os, signal, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+                "                         start_new_session=True)\n"
+                f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                "def on_term(signum, frame):\n"
+                "    os.killpg(child.pid, signal.SIGKILL)\n"
+                "    child.wait()\n"
+                "    sys.exit(128 + signum)\n"
+                "signal.signal(signal.SIGTERM, on_term)\n"
+                "time.sleep(60)\n"
+            )
+            res = suite._run_step(
+                name="hung_wrapper",
+                category="cat2_correspondence_suites",
+                cmd=[sys.executable, "-c", script],
+                cwd=REPO_ROOT,
+                timeout_sec=2,
+            )
+            self.assertEqual(res["status"], "TIMEOUT")
+            self._assert_pid_gone(int(pid_file.read_text()), "separate-session build scope")
+
+    def test_run_step_reports_launch_failure_and_undecodable_output(self) -> None:
+        missing = suite._run_step(
+            name="missing_tool",
+            category="cat7_python_and_ci_tests",
+            cmd=[str(REPO_ROOT / "scripts" / "no-such-tool-ep2")],
+            cwd=REPO_ROOT,
+            timeout_sec=5,
+        )
+        self.assertEqual(missing["status"], "FAIL")
+        self.assertEqual(missing["exit_code"], 127)
+        garbage = suite._run_step(
+            name="binary_output",
+            category="cat7_python_and_ci_tests",
+            cmd=[sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff\\xfe bad'); sys.exit(3)"],
+            cwd=REPO_ROOT,
+            timeout_sec=10,
+        )
+        self.assertEqual(garbage["status"], "FAIL")
+        self.assertEqual(garbage["exit_code"], 3)
+        self.assertIn("bad", garbage["failure_excerpt"])
+
+    def test_lean_header_imports_parses_module_system_and_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "T.lean"
+            f.write_text(
+                "/- header /- nested -/ comment -/\n"
+                "module\n"
+                "-- line comment import Fake.Module\n"
+                "public import Anneal.ByteCodec\n"
+                "meta import all Anneal.Mir.Cast  -- trailing\n"
+                "import «Anneal».BitValidity import Foo.«a b».c\n"
+                "\n"
+                "theorem t : True := by\n"
+                "  trivial\n"
+                "import Not.A.Header.Import\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                suite._lean_header_imports(f),
+                ["Anneal.ByteCodec", "Anneal.Mir.Cast", "Anneal.BitValidity", "Foo.a b.c"],
+            )
+            self.assertIsNone(suite._lean_header_imports(Path(tmp) / "missing.lean"))
 
 
 if __name__ == "__main__":
