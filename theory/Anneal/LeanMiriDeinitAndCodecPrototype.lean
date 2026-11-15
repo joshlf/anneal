@@ -2306,11 +2306,11 @@ structure OperandStrategy : Type where
   readOperand : Nat → PState → SemOperand → Except Fault (Bytes × PState)
   assignUse : Nat → PState → SemOperand → DestPlace → Except Fault PState
   /-- Call-argument evaluation (`Call.evalCalleeAndArgs` + `passArgument`), given the
-  call's destination place; by default every argument is evaluated *and
-  consumed* left to right through `readOperand` (the patched-`evalOperand`
-  route that `M_ref` models). -/
-  callArgs : Nat → PState → List SemOperand → SemPlace → Except Fault (List Bytes × PState) :=
-    fun pb st ops _ => readOperandsWith readOperand pb st ops
+  resolved callee (`some bodyIdx` or `none`) and the call's destination place; by
+  default every argument is evaluated *and consumed* left to right through
+  `readOperand` before callee resolution (`kani#5172`). -/
+  callArgs : Nat → PState → Option Nat → List SemOperand → SemPlace → Except Fault (List Bytes × PState) :=
+    fun pb st _ ops _ => readOperandsWith readOperand pb st ops
 
 def eagerStrategy : OperandStrategy :=
   { readOperand := annealReadOperand, assignUse := annealAssignUse }
@@ -2427,11 +2427,19 @@ def execStmt (S : OperandStrategy) (pb : Nat) (st : PState) : SemStmt → Except
         | .ok (mp, st₁) =>
           match createRef st₁ mutbl mp with
           | .error e => .error e
-          | .ok (b, st₂) => writeDest st₂ d b
+          | .ok (b, st₂) =>
+            let d' := match d, p.projs with
+              | .imm l, [] => if Nat.beq l p.local_ then .mem mp else d
+              | _, _ => d
+            writeDest st₂ d' b
       | .rawPtr p =>
         match placeToMPlace pb st p with
         | .error e => .error e
-        | .ok (mp, st₁) => writeDest st₁ d (ptrBytes mp.alloc (mp.tag.getD 0) mp.offset)
+        | .ok (mp, st₁) =>
+          let d' := match d, p.projs with
+            | .imm l, [] => if Nat.beq l p.local_ then .mem mp else d
+            | _, _ => d
+          writeDest st₁ d' (ptrBytes mp.alloc (mp.tag.getD 0) mp.offset)
       | .unsupported => .error .unsupported
   | .deinit p =>
     match evalPlaceToOp pb st p with
@@ -2546,7 +2554,7 @@ def execTerm (S : OperandStrategy) (pb : Nat) (st : PState) : SemTerm → StepOu
     match resolveDest pb st dest with
     | .error e => .fault e
     | .ok (d, _) =>
-      match S.callArgs pb st args dest with
+      match S.callArgs pb st callee args dest with
       | .error e => .fault e
       | .ok (bs, st₁) =>
         match callee with
@@ -3834,6 +3842,30 @@ theorem canary_D6_indirect_self_move_ok :
 theorem canary_D6_field_swap_self_aggregate_ok :
     bothObs d6Swap = (.returned (some 2) 1, .returned (some 2) 1) := by decide
 
+/-- Self-referential raw pointer assignment `_1 = &raw mut _1; _0 = copy (*_1)`
+where `_1` starts as `.imm`: `placeToMPlace` forces `_1` into `.mem 0` after
+`resolveDest` returns `.imm 1`, so `execStmt` upgrades the destination to `.mem 0`
+and writes the pointer into `heap[0]` (rather than demoting `_1` back to `.imm`
+and leaving `heap[0]` uninitialized). -/
+def d6SelfRawPtr : V2026Prog := prog1 <| mkBody "d6raw" 0 [tU8, tRaw]
+  [blk [asg (loc 1) (.rawPtr .mut (loc 1)),
+        asg (loc 0) (.use (.copy (drf 1)))] .return_]
+
+theorem canary_D6_self_rawPtr_assign_deref_ok :
+    bothObs d6SelfRawPtr = (.returned (some 0) 1, .returned (some 0) 1) := by decide
+
+/-- Self-referential shared borrow assignment `_1 = &_1; _0 = copy (*_1)`:
+`createRef` creates a `.frozen` borrow tag `1` on `alloc = 0`, and writing the
+new reference into `_1` (upgraded to `.mem 0`) performs a Tree Borrows `.Write`
+through the root tag that disables tag `1`, so dereferencing `*_1` faults with
+`.ub .treeBorrows`. -/
+def d6SelfSharedRef : V2026Prog := prog1 <| mkBody "d6ref" 0 [tU8, tRef]
+  [blk [asg (loc 1) (.ref .shared (loc 1)),
+        asg (loc 0) (.use (.copy (drf 1)))] .return_]
+
+theorem canary_D6_self_shared_ref_assign_tb_ub :
+    bothObs d6SelfSharedRef = (.ub .treeBorrows, .ub .treeBorrows) := by decide
+
 /-! ### `D7` — call-argument moves and `kani#5172` ordering -/
 
 def d7Callee : CapturedMir := mkBody "callee" 2 [tU8, tU8, tRaw]
@@ -4137,11 +4169,20 @@ def leanMiriPassArgs : PState → List FnArgM → Except Fault (List Bytes × PS
           | .error e => .error e
           | .ok (bs, st₃) => .ok (b :: bs, st₃)
 
-def leanMiriCallArgsUpstream (pb : Nat) (st : PState) (args : List SemOperand) (dest : SemPlace) :
-    Except Fault (List Bytes × PState) :=
+/-- In upstream `Call.lean`, `evalCalleeAndArgs` (`Call.lean:181-206`) runs
+`evalFnCallArgumentAt` on all arguments (producing `FnArg` handles without
+reading/validating bytes) and then resolves the callee via `h.resolve`
+(`Call.lean:199`) *before* `initStackFrame` runs `passArgument` (`Call.lean:221`).
+Thus an unresolved callee (`callee = none`) fails with `.unsupported` before
+`leanMiriPassArgs` ever reads or validates the argument bytes! -/
+def leanMiriCallArgsUpstream (pb : Nat) (st : PState) (callee : Option Nat)
+    (args : List SemOperand) (dest : SemPlace) : Except Fault (List Bytes × PState) :=
   match leanMiriEvalFnCallArgs pb (moveDefinitelyDisjoint args dest) st args with
   | .error e => .error e
-  | .ok (fas, st₁) => leanMiriPassArgs st₁ fas
+  | .ok (fas, st₁) =>
+    match callee with
+    | none => .error .unsupported
+    | some _ => leanMiriPassArgs st₁ fas
 
 /-- `M_ref` with the *unpatched* `Call.lean` argument path (everything else as
 patched by `d9b41b58b`). -/
@@ -4198,18 +4239,23 @@ theorem call_inPlace_writeUninit_disables_sibling_frozen :
       .ub .treeBorrows := by
   decide
 
-/-- **The 7th-file requirement, stated precisely (corrects B2, extended in B3).**
+/-- **The 7th-file requirement, stated precisely (corrects B2, extended in B3 and B4).**
 (1) On `D7` (the moved argument `_1` is memory-backed because `_2 = &raw mut
 _1`), the unpatched `Call.lean` path *agrees* with `M_anneal`: the `InPlace`
 argument is deinitialized by `protectInPlaceFunctionArgument` before the callee
 runs, so the callee's raw-pointer read is UB.
-(2) The genuine value-level divergences are on `.immediate → FnArg.Copy`:
+(2) The genuine divergences of unpatched `Call.lean` are:
     (a) in `d7ImmProg`, a moved immediate argument is still readable in the
         caller after the call returns (`5` vs UB);
     (b) in `d7MoveThenCopySameCallProg`, `call f(move _1, copy _1)` has
         `moveDefinitelyDisjoint = true` (because `moveDefinitelyDisjoint`
         ignores `.Copy` arguments), so `copy _1` in the same call reads `5` and
-        returns `10` instead of faulting with `.ub .invalidUninitBytes`! -/
+        returns `10` instead of faulting with `.ub .invalidUninitBytes`;
+    (c) in `d7Unresolved (.move (loc 1))` (`kani#5172` invariant), `evalCalleeAndArgs`
+        (`Call.lean:186-199`) resolves the callee *after* `evalFnCallArgumentAt`
+        (which only forms `FnArg` handles without reading/validating bytes) and
+        *before* `passArgument`, reporting `.unsupported` instead of
+        `.ub .invalidUninitBytes`! -/
 theorem call_move_arg_upstream_call_path :
     annealObs (d7Prog (.move (loc 1))) [] 40 = .ub .invalidUninitBytes ∧
     refObsWith leanMiriUpstreamCallStrategy (encodeProg (d7Prog (.move (loc 1)))) [] 40 =
@@ -4218,7 +4264,9 @@ theorem call_move_arg_upstream_call_path :
     refObs true (encodeProg d7ImmProg) [] 40 = .ub .invalidUninitBytes ∧
     refObsWith leanMiriUpstreamCallStrategy (encodeProg d7ImmProg) [] 40 = .returned (some 5) 1 ∧
     refObsWith leanMiriUpstreamCallStrategy (encodeProg d7MoveThenCopySameCallProg) [] 40 =
-      .returned (some 10) 1 := by
+      .returned (some 10) 1 ∧
+    refObsWith leanMiriUpstreamCallStrategy (encodeProg (d7Unresolved (.move (loc 1)))) [] 40 =
+      .unsupported := by
   decide
 
 /-- Hence the unpatched call path is not the reference strategy. -/
@@ -5850,6 +5898,14 @@ theorem reachable_latch_clear_nonvacuous : reachableLatchWitness = true := by
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.reachable_latch_clear_nonvacuous' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms reachable_latch_clear_nonvacuous
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_D6_self_rawPtr_assign_deref_ok' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_D6_self_rawPtr_assign_deref_ok
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_D6_self_shared_ref_assign_tb_ub' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_D6_self_shared_ref_assign_tb_ub
 
 /-! ## Part 12 — Whole-environment audit
 

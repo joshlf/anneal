@@ -1444,11 +1444,12 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
     little-endian ELF object, or `None` if `path` has no ELF magic at all (e.g.
     a shell script). Malformed or unsupported ELF objects raise `ValueError`.
 
-    Only the ELF header, program headers, the PT_DYNAMIC segment and the
-    individual NUL-terminated dynamic strings that are referenced are read:
+    Only the ELF header, program headers, the PT_INTERP/PT_DYNAMIC segments and
+    the individual NUL-terminated dynamic strings that are referenced are read:
     the dynamic string table of `libleanshared.so` alone is ~24 MiB (every
     exported symbol name), so it is never slurped."""
     with open(path, "rb") as fh:
+        file_size = os.fstat(fh.fileno()).st_size
         ehdr = fh.read(64)
         if ehdr[:4] != b"\x7fELF":
             return None
@@ -1460,22 +1461,43 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
         e_phentsize, e_phnum = struct.unpack_from("<HH", ehdr, 0x36)
         if e_phentsize < 56 or e_phnum > 4096:
             raise ValueError("malformed ELF program header table")
+        if e_phoff + e_phentsize * e_phnum > file_size:
+            raise ValueError("truncated ELF program header table")
         fh.seek(e_phoff)
         phdrs = fh.read(e_phentsize * e_phnum)
         if len(phdrs) < e_phentsize * e_phnum:
             raise ValueError("truncated ELF program header table")
         loads: List[Tuple[int, int, int]] = []
         dynamic: Optional[Tuple[int, int]] = None
+        interp: Optional[Tuple[int, int]] = None
         for i in range(e_phnum):
             p_type, _flags, p_offset, p_vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
                 "<IIQQQQQQ", phdrs, i * e_phentsize
             )
             if p_type == 1:  # PT_LOAD
+                if p_offset + p_filesz > file_size:
+                    raise ValueError("PT_LOAD segment overruns EOF")
                 loads.append((p_vaddr, p_offset, p_filesz))
             elif p_type == 2:  # PT_DYNAMIC
                 if dynamic is not None:
                     raise ValueError("more than one PT_DYNAMIC segment")
                 dynamic = (p_offset, p_filesz)
+            elif p_type == 3:  # PT_INTERP
+                if interp is not None:
+                    raise ValueError("more than one PT_INTERP segment")
+                if p_filesz == 0 or p_filesz > 4096 or p_offset + p_filesz > file_size:
+                    raise ValueError("malformed or truncated PT_INTERP segment")
+                interp = (p_offset, p_filesz)
+        if interp is not None:
+            fh.seek(interp[0])
+            iraw = fh.read(interp[1])
+            if not iraw.endswith(b"\0") or b"\0" in iraw[:-1]:
+                raise ValueError("unterminated or embedded-NUL PT_INTERP path")
+            ipath = iraw[:-1].decode("utf-8", "surrogateescape")
+            if not os.path.isabs(ipath) or ".." in ipath.split("/"):
+                raise ValueError(f"invalid PT_INTERP path {ipath!r}")
+            if dynamic is None:
+                raise ValueError("PT_INTERP present without PT_DYNAMIC")
         if dynamic is None:
             return ((), ())
         if dynamic[1] > (1 << 20):
@@ -1733,9 +1755,6 @@ def _verify_toolchain_impl(
     for n in lib_names:
         if _SYSTEM_SONAME_RE.match(n):
             c.err("toolchain", f"system soname planted in a toolchain RUNPATH directory: lib/lean/{n}")
-    # ld.so resolution of every DT_NEEDED soname through DT_RUNPATH must land on
-    # a verified file (checked before anything in the toolchain is executed).
-    _check_runpath_shadowing(toolchain_dir, real_root, candidates, files, c)
 
     pin_status = "not-requested"
     active_pin: Optional[Mapping[str, Any]] = None
@@ -1754,6 +1773,26 @@ def _verify_toolchain_impl(
             c.warn("toolchain", f"no locked release pin for {name!r} on {host_platform_triple()!r}; digests computed but not pinned (pass --toolchain-pin-json)")
     elif resolved_by == "elan":
         c.warn("toolchain", f"no locked release pin for {name!r}; digests computed but not pinned (pass --toolchain-pin-json)")
+
+    # Determine the trusted/pinned set BEFORE `_check_runpath_shadowing`: in A3,
+    # passing `files` (which includes every `lib/lean/*.so*` on disk) exempted
+    # any `.so` planted inside `lib/lean/` from `hit_rel not in files` and parsed
+    # attacker-planted `lib/lean/*.so*` as trusted `elf_rels`.
+    if active_pin is not None and isinstance(active_pin.get("files"), Mapping):
+        pinned_files = {rel: sha for rel, sha in files.items() if rel in active_pin["files"]}
+    else:
+        for n in lib_names:
+            if _SHARED_OBJECT_RE.search(n) and not _SHADOW_LEAN_LIB_RE.match(n) and not _SYSTEM_SONAME_RE.match(n):
+                c.err("toolchain", f"unpinned non-Lean shared library in lib/lean/: lib/lean/{n}")
+        pinned_files = {
+            rel: sha
+            for rel, sha in files.items()
+            if rel in ("bin/lean", "bin/lake") or _SHADOW_LEAN_LIB_RE.match(Path(rel).name)
+        }
+    elf_rels = [rel for rel in candidates if rel in pinned_files]
+    # ld.so resolution of every DT_NEEDED soname through DT_RUNPATH must land on
+    # a pinned/verified file (checked before anything in the toolchain is executed).
+    _check_runpath_shadowing(toolchain_dir, real_root, elf_rels, pinned_files, c)
 
     if active_pin is not None:
         errors_before_lock = len(c.errors)

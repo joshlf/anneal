@@ -354,6 +354,7 @@ class LiveCheckoutTests(TempCase):
         self.assertEqual(V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}).pin_status, "locked-verified")
         for planted_rel, needle in (
             ("lib/libm.so.6", "RUNPATH shadowing: bin/lean needs 'libm.so.6', which ld.so can resolve to the unpinned toolchain file lib/libm.so.6"),
+            ("lib/lean/libm.so.6", "RUNPATH shadowing: bin/lean needs 'libm.so.6', which ld.so can resolve to the unpinned toolchain file lib/lean/libm.so.6"),
             ("lib/librt.so.1", "RUNPATH shadowing: lib/lean/libleanshared.so needs 'librt.so.1', which ld.so can resolve to the unpinned toolchain file lib/librt.so.1"),
             ("lib/libleanshared_1.so", "RUNPATH shadowing: bin/lean needs 'libleanshared_1.so', which ld.so can resolve to the unpinned toolchain file lib/libleanshared_1.so"),
         ):
@@ -1185,6 +1186,29 @@ class ToolchainTests(TempCase):
         # check and reaches the exec gate (EM_BPF, so it cannot actually run).
         self.assertRejected(self.verify, "cannot execute `bin/lean --version`", absent=("RUNPATH", "SHA-256 mismatch", "skipped `bin/lean --version`"))
 
+    def test_runpath_shadow_planted_inside_lib_lean_rejected_and_not_executed(self) -> None:
+        # In A3, `_verify_toolchain_impl` added every `lib/lean/*.so*` on disk into
+        # `files` BEFORE calling `_check_runpath_shadowing`, so `hit_rel not in files`
+        # was always False for any `.so` planted inside `lib/lean/`, and unpinned
+        # `verify_toolchain(..., toolchain_pin_json=None)` silently accepted and
+        # executed with `lib/lean/libz.so.1`!
+        self.repin_bin_lean(make_elf64(["libleanshared.so", "libz.so.1"], ["$ORIGIN/../lib/lean"]))
+        planted = self.tc / "lib" / "lean" / "libz.so.1"
+        planted.write_bytes(b"\x7fELF-trojan-zlib-in-lib-lean")
+        os.chmod(planted, 0o644)
+        self.assertRejected(
+            self.verify,
+            "RUNPATH shadowing: bin/lean needs 'libz.so.1', which ld.so can resolve to the unpinned toolchain file lib/lean/libz.so.1",
+            "skipped `bin/lean --version`",
+            absent=("SHA-256 mismatch",),
+        )
+        self.assertRejected(
+            lambda: self.verify(toolchain_pin_json=None),
+            "unpinned non-Lean shared library in lib/lean/: lib/lean/libz.so.1",
+            "RUNPATH shadowing: bin/lean needs 'libz.so.1', which ld.so can resolve to the unpinned toolchain file lib/lean/libz.so.1",
+            "skipped `bin/lean --version`",
+        )
+
 
 class ElfDynamicParserTests(TempCase):
     def put(self, data: bytes, name: str = "obj.so") -> Path:
@@ -1212,6 +1236,7 @@ class ElfDynamicParserTests(TempCase):
             ("big-endian", good[:5] + b"\x02" + good[6:], "unsupported ELF object"),
             ("truncated ELF header", good[:40], "unsupported ELF object"),
             ("truncated program headers", good[: 64 + 30], "truncated ELF program header table"),
+            ("PT_LOAD overruns EOF", good[:-8], "PT_LOAD segment overruns EOF"),
         )
         for label, data, needle in cases:
             with self.subTest(label):

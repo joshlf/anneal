@@ -8,7 +8,7 @@
 > `lean-miri/**`, `minirust/**`, `lakefile.toml`, or `theory/Anneal.lean` is modified, and no
 > `vendor/lean-miri/` is created.
 
-Status: **round A3** (sixth critique-and-fix pass of the N = 4 loop, after B3). Recommendation (§6):
+Status: **round B4** (seventh critique-and-fix pass of the N = 4 loop, after A3). Recommendation (§6):
 **CONDITIONAL GO**.
 
 ## 1. Architecture
@@ -34,28 +34,28 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 | 5 | Shared byte-level machine `PState`. Frames hold `imm`/`mem` slots, the heap holds real `AbstractByte`s, the borrow table holds real `BorrowEntry`s, and `pendingMoveDeinit` is LeanMiri's latch. `M_anneal` performs eager, value-level move deinit (`annealReadOperand`, `annealAssignUse`). `M_ref` uses the `d9b41b58b` two-phase protocol (`refEvalOperand` → `refReadImmediate` / `refCopyRuntimePlaceNoValidate`, `takePendingMoveDeinit`). Statements and terminators cover assign (`use`/`binaryOp`/`aggregate`/`ref`/`rawPtr`), `Deinit`, `StorageLive`/`StorageDead`, `goto`, `return`, `switchInt`, `assert` with `UnwindAction.cleanup`, `call` (arguments first, then callee resolution), and `unwindResume`. Everything else fails closed with `.unsupported`. |
 | 6 | Fetch/resolve for both machines. `M_anneal` resolves deep `Ty`s against `CapturedMir.layouts`; `M_ref` resolves `TyId`s via `evalLayoutQuery`. Also defines the step budget (`RefState.stepsExecuted`/`maxSteps`), runs, and observations. |
 | 6b | The codec-driven resolution correspondence and the whole-program equivalence. |
-| 7 | 31 executable canary theorems covering `D1`–`D9` (including B2 call-destination-before-arg-move, bad-call-destination, and B3 same-call `move _1` + `copy _1` canaries). |
-| 8 | Falsification witnesses. Includes the faithful model of LeanMiri's unpatched `Call.lean` argument path (`leanMiriEvalFnCallArg`, `moveDefinitelyDisjoint`, `leanMiriPassArgs` with B3's real `storeMPlace` Tree Borrows `.Write` for `protectInPlaceFunctionArgument`'s `writeUninit`), plus `call_move_arg_upstream_call_path`, `call_inPlace_writeUninit_disables_sibling_frozen`, and `leanMiriUpstreamCallStrategy_ne_eager`. |
+| 7 | 33 executable canary theorems covering `D1`–`D9` (including B2 call-destination-before-arg-move, bad-call-destination, B3 same-call `move _1` + `copy _1`, and B4 self-referential `_1 = &raw mut _1` and `_1 = &_1` canaries). |
+| 8 | Falsification witnesses. Includes the faithful model of LeanMiri's unpatched `Call.lean` argument path (`leanMiriEvalFnCallArg`, `moveDefinitelyDisjoint`, `leanMiriPassArgs` with B3's real `storeMPlace` Tree Borrows `.Write` for `protectInPlaceFunctionArgument`'s `writeUninit`, and B4's `evalCalleeAndArgs` callee-resolution-before-`passArgument` `kani#5172` ordering), plus `call_move_arg_upstream_call_path`, `call_inPlace_writeUninit_disables_sibling_frozen`, and `leanMiriUpstreamCallStrategy_ne_eager`. |
 | 9 | Tree Borrows theorems. |
 | 10 | The wiring claim (`miriMoveDeinitWiring_proto`) and Part 10b live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge theorems (`trusted_evalOperand_root_move_deinits`, `trusted_evalOperand_projected_move_eq_copy`). |
 | 10c | A1 hardening: pointer constants fail closed (`constSem_ptr_fails_closed`, `canary_const_ptr_fails_closed`), the universal assignment Tree Borrows theorem with its non-vacuity witness, and destination-first assignment evaluation (`DestPlace`, `resolveDest`, `writeDest`). |
 | 10d | Step-boundary & whole-step latch invariants (`twoPhaseReadOperand_true_latch_clear`, `twoPhaseAssignUse_true_latch_clear`, and B3's `refStepCore_true_preserves_latch_clear` and `annealStep_preserves_latch_clear`). A3 closes them under entry states and run loops, so the latch is clear in every **reachable** state: `annealInit_latch_clear`, `refInit_latch_clear`, `annealRun_preserves_latch_clear`, `refStep_true_preserves_latch_clear`, `refRunFuel_true_preserves_latch_clear`, `annealReachable_latch_clear`, `refReachable_latch_clear`. The non-vacuity witness `reachable_latch_clear_nonvacuous` reaches the `D5` pre-move state in both machines. There, phase 1 (`refEvalOperand true`) *sets* the latch, and the full step clears it. |
-| 11 | 93 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
+| 11 | 95 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
 | 12 | A `run_cmd` audit of **every** declaration in the module. Its axioms must be ⊆ {propext, Quot.sound}; otherwise elaboration fails. This was checked with a planted `Classical.choice` probe. |
 
-### 1.2 Inventory (A3)
+### 1.2 Inventory (B4)
 
 | Metric | Value |
 |---|---|
-| Lean LOC | 5,878 |
-| `theorem`s | 213 |
-| `def`/`abbrev`s | 270 |
-| `#guard_msgs` axiom guards | 93 (58 `[propext]`, 35 `[propext, Quot.sound]`) |
+| Lean LOC | 5,934 |
+| `theorem`s | 215 |
+| `def`/`abbrev`s | 272 |
+| `#guard_msgs` axiom guards | 95 (60 `[propext]`, 35 `[propext, Quot.sound]`) |
 | `sorry` / `admit` / `axiom` / `native_decide` / `partial` / `unsafe` | 0 |
 | `Classical.choice` anywhere in the module | 0 (enforced by the Part 12 audit) |
 | Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~34 s wall |
-| Receipt 3 (`unittest`) | 68 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~86 s wall |
-| Verifier LOC / test LOC / tests | 2,045 / 1,499 / 68. B3 rejects `DT_RUNPATH` `$ORIGIN/../lib` shadowing of `lib/lean/libleanshared*.so` and enforces `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`. A3 adds ELF `DT_NEEDED` × `DT_RUNPATH`/`DT_RPATH` resolution for every pinned ELF object, plus a glibc-soname denylist. |
+| Receipt 3 (`unittest`) | 69 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~86 s wall |
+| Verifier LOC / test LOC / tests | 2,084 / 1,524 / 69. B3 rejects `DT_RUNPATH` `$ORIGIN/../lib` shadowing of `lib/lean/libleanshared*.so` and enforces `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`. A3 adds ELF `DT_NEEDED` × `DT_RUNPATH`/`DT_RPATH` resolution for every pinned ELF object, plus a glibc-soname denylist. B4 fixes the `lib/lean/` self-inclusion bypass in `_check_runpath_shadowing` and validates `PT_LOAD` EOF bounds and `PT_INTERP` headers in `elf_dynamic_info`. |
 
 ### 1.3 Headline theorems
 
@@ -279,7 +279,10 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
       * Tests run on byte-for-byte copies of the real v4.34.1 binaries
         (`test_live_elf_runpath_shadowing_of_real_binaries_rejected`) and on synthetic ELF images.
         The synthetic images use `EM_BPF`, so they can never be executed.
-11. **(B2, corrected in A2, extended in B3) `Call.lean` is a 7th file the deinit patch must touch.**
+    * **(B4) Closing A3's `lib/lean/` self-inclusion bypass in `_check_runpath_shadowing` & `PT_LOAD`/`PT_INTERP` bounds in `elf_dynamic_info`.**
+      * In A3, `_verify_toolchain_impl` added *every* `lib/lean/*.so*` on disk into `candidates` and `files` before calling `_check_runpath_shadowing(toolchain_dir, real_root, candidates, files, c)`. Because `_check_runpath_shadowing` checked `if hit_rel not in files:`, any `.so` planted inside `lib/lean/` (which is on `DT_RUNPATH` via `$ORIGIN/../lib/lean` and `$ORIGIN`) was already in `files` and therefore bypassed `_check_runpath_shadowing` completely (and was even parsed as a trusted `elf_rels` object); when `active_pin is None`, non-glibc libraries planted in `lib/lean/` (such as `lib/lean/libz.so.1`) were silently accepted and loaded during `bin/lean --version`. B4 resolves `active_pin` *before* `_check_runpath_shadowing`, restricts `pinned_files` to `active_pin["files"]` (or Lean's own `_SHADOW_LEAN_LIB_RE` libraries when unpinned), and tests `lib/lean/` RUNPATH shadowing in both `LiveCheckoutTests` and `ToolchainTests` (`test_runpath_shadow_planted_inside_lib_lean_rejected_and_not_executed`).
+      * B4 also hardens `elf_dynamic_info` to verify `p_offset + p_filesz <= file_size` on every `PT_LOAD` segment and to validate `PT_INTERP` segments (requiring a single NUL-terminated absolute path without `..` and requiring `PT_DYNAMIC` whenever `PT_INTERP` is present).
+11. **(B2, corrected in A2, extended in B3 and B4) `Call.lean` is a 7th file the deinit patch must touch.**
     * B2 found that `Call.evalFnCallArgumentAt` (`lean-miri/vendor/Miri/Interpreter/Call.lean:164-175`)
       routes `.Move place` through `evalPlace` + `placeToOp` / `forceAllocation`, bypassing the
       patched `evalOperand`.
@@ -291,21 +294,28 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
     * Upstream LeanMiri therefore *does* deinitialize memory-backed moved arguments
       (`FnArg.InPlace`) before the callee runs, as Miri's `machine.rs`
       `protect_in_place_function_argument` does. B2's "D7 falsely returns 5" is wrong.
-    * A2 & B3 model the unpatched call path faithfully:
+    * A2, B3 & B4 model the unpatched call path faithfully:
       * the destination is evaluated first (`Call.lean:453`);
       * all arguments are evaluated as `FnArg.Copy` (lazy `OpTy`) or `FnArg.InPlace`, using
-        `moveDefinitelyDisjoint`;
+        `moveDefinitelyDisjoint` (`Call.lean:186-188`);
+      * the callee is resolved inside `evalCalleeAndArgs` (`Call.lean:199`) *before* `initStackFrame`
+        calls `passArgument` (`Call.lean:221`), which B4 models by passing `callee : Option Nat` to
+        `OperandStrategy.callArgs`;
       * then each argument gets `passArgument`: the copy, followed by the in-place `writeUninit`
         (which B3 fixes from A2's TB-silent `deinitMPlaceRaw` to `storeMPlace`, matching
         `TypedMachineBindings.lean:17` `PlaceMachine.writeMemory access (fun _ => false) .uninit`).
     * It proves `call_move_arg_upstream_call_path` and `call_inPlace_writeUninit_disables_sibling_frozen`:
       * On `D7` the unpatched path agrees with `M_anneal` (UB).
       * On `.immediate → FnArg.Copy`: (a) in `d7ImmProg` (`_1 = 5; _2 = calleeImm(move _1); _0 = copy _1`),
-        the moved immediate is never deinitialized (`5` vs UB); and (b) in
+        the moved immediate is never deinitialized (`5` vs UB); (b) in
         `d7MoveThenCopySameCallProg` (`_1 = 5; _0 = calleeAdd(move _1, copy _1)`),
         `moveDefinitelyDisjoint` returns `true` because it ignores `.Copy` arguments, so `copy _1` in
         the same call reads `5` and returns `10` instead of faulting with `.ub .invalidUninitBytes`
-        (`canary_D7_call_move_then_copy_arg_ub`).
+        (`canary_D7_call_move_then_copy_arg_ub`); and (c) in `d7Unresolved (.move (loc 1))`
+        (`kani#5172` invariant, B4), `evalCalleeAndArgs` fails on `h.resolve` (`.unsupported`)
+        *after* `evalFnCallArgumentAt` (which only constructs `FnArg` handles without reading or
+        validating bytes) and *before* `passArgument` (which reads/validates bytes), returning
+        `.unsupported` instead of `.ub .invalidUninitBytes`.
       * On `d7MoveDerefSiblingFrozenProg` (`_1 = 5; _3 = &_1; _2 = &raw mut _1; _4 = calleeImm(move (*_2)); _0 = copy (*_3)`),
         `moveDefinitelyDisjoint` is `false` on `.deref`, so `move (*_2)` is passed `.InPlace` and
         `protectInPlaceFunctionArgument`'s `writeUninit` performs a foreign Tree Borrows `.Write`
@@ -315,6 +325,13 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
       `PATCH_ALLOWLIST` to 7 files. The prototype keeps the brief's 6-file allowlist.
     * The protector retag of `protectInPlaceFunctionArgument` is not modeled. Its `writeUninit`
       through the protected tag is a Tree Borrows write, the same divergence as finding 1.
+    * **(B4) Self-referential `.ref` / `.rawPtr` assignment destination promotion (`_1 = &raw mut _1` and `_1 = &_1`).**
+      When a pointer or reference local `_1` starts in `.imm`, `resolveDest` at statement entry
+      resolves `dest = _1` to `.imm 1`. If the RHS is `&raw mut _1` or `&_1`, `placeToMPlace`
+      promotes `_1` from `.imm` to `.mem 0`. B4 upgrades `d = .imm 1` to `.mem mp` in `execStmt`'s
+      `.ref` and `.rawPtr` arms so `writeDest` writes into `heap[0]` (and runs `tbAccess .write` on
+      `alloc = 0`) instead of demoting `_1` back to `.imm`, proved by
+      `canary_D6_self_rawPtr_assign_deref_ok` and `canary_D6_self_shared_ref_assign_tb_ub`.
 12. **Modeling limits, stated rather than hidden:**
    * Projections into immediates fail closed, so the patch's "projected immediate →
      `forceAllocation`" branch of `evalOperand` is unreachable in the prototype.
@@ -347,15 +364,16 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
   that ld.so could load from a `RUNPATH`/`RPATH` directory, and any directory that resolves outside
   the toolchain root (`_check_runpath_shadowing`). It also rejects glibc sonames planted in `lib/`
   or `lib/lean/`.
-* **Tests.** There are 68 unit tests. They cover a live end-to-end run and every tamper vector of
+* **Tests.** There are 69 unit tests. They cover a live end-to-end run and every tamper vector of
   the brief. They also cover B2 pre-execution digest verification, B3 `$ORIGIN/../lib` shadowing,
-  and A3 ELF-derived `RUNPATH` resolution on real and synthetic ELF images.
+  A3 ELF-derived `RUNPATH` resolution on real and synthetic ELF images, and B4 `lib/lean/`
+  self-inclusion `RUNPATH` shadowing and `PT_LOAD`/`PT_INTERP` bounds.
   The Lean hygiene tests check for forbidden tokens, that every `#print axioms` is guarded with an
   allowed axiom list, and that receipt 1 compiles.
 
-## 5. Receipts (A3)
+## 5. Receipts (B4)
 
-See the A3 board post for the exact outputs of the four receipt commands. All four exit 0, and
+See the B4 board post for the exact outputs of the four receipt commands. All four exit 0, and
 `git diff --name-only 8e1523cb..HEAD` lists only the four prototype files.
 
 ## 6. Recommendation and Track A integration plan
