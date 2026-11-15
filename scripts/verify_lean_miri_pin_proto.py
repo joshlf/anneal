@@ -114,6 +114,7 @@ import argparse  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import platform  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
 import stat  # noqa: E402
@@ -258,6 +259,40 @@ _ARTIFACT_DIRS = frozenset({".lake", "lake-packages", "__pycache__", ".git"})
 
 #: Toolchain files that must always be present and pinned.
 TOOLCHAIN_REQUIRED_FILES = ("bin/lean", "bin/lake", "lib/lean/libleanshared.so")
+
+# Compiled-in release digests of the official elan toolchain pinned by the
+# repository's `lean-toolchain` (cl/1021969520). Like LOCKED_UPSTREAM_IDENTITY,
+# this makes the *default* run (no --toolchain-pin-json) fail closed on any
+# added, deleted or modified `bin/lean`, `bin/lake` or `lib/lean/*.so` -- in
+# particular a substituted companion `libleanshared_{1,2}.so` while
+# `libleanshared.so` is untouched. Without it the default run would only
+# compute (trust-on-first-use) digests. An explicit --toolchain-pin-json takes
+# precedence; test-only --toolchain-dir overrides are never matched against it.
+LOCKED_TOOLCHAIN_PINS: Mapping[str, Mapping[str, Any]] = {
+    "leanprover/lean4:v4.34.1": {
+        "platform": "x86_64-unknown-linux-gnu",
+        "files": {
+            "bin/lake": "6f53827dab18010d6c690d14c8401cacabc1db958edb3552a877ed4cf1dd995d",
+            "bin/lean": "e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550",
+            "lib/lean/libInit_shared.so": "07f8c1156271ab6ec36c14c3031b5572329325d5f73dde3e89a1615d88f4e5cb",
+            "lib/lean/libLake_shared.so": "ef0eb8942cd68ffb61ae573850a7181f70860580959e296c6e1a0e31ec50a38a",
+            "lib/lean/libleanshared.so": "6b30cc963d065fc9d2f87f7e9cbe0682b23000ae5425bccd769c5d477fa74f13",
+            "lib/lean/libleanshared_1.so": "69e900c025f40bf05c14f5b9ec48071b3130e34c96a7c45ee2eb5b6f307e19e6",
+            "lib/lean/libleanshared_2.so": "38d0a03750b2e8d51161885ad597a8b4f6d3b85215c5a52aecd2b3753273cf3f",
+        },
+        "versions": {
+            "bin/lean": "Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)",
+            "bin/lake": "Lake version 5.0.0-src+5045d00 (Lean version 4.34.1)",
+        },
+    },
+}
+
+
+def host_platform_triple() -> Optional[str]:
+    """`<machine>-unknown-linux-gnu` on Linux hosts (the elan release triple), else `None`."""
+    if sys.platform.startswith("linux"):
+        return f"{platform.machine()}-unknown-linux-gnu"
+    return None
 TOOLCHAIN_PIN_KEYS = ("toolchain", "files")
 TOOLCHAIN_PIN_OPTIONAL_KEYS = ("versions",)
 
@@ -324,7 +359,7 @@ class ToolchainVerification:
     files: Mapping[str, str]  # relpath -> sha256
     libleanshared: Tuple[str, ...]
     pin_json: Optional[str]
-    pin_status: str  # "verified" | "not-requested"
+    pin_status: str  # "verified" | "locked-verified" | "not-requested"
     resolved_by: str = "elan"  # "elan" | "override" (test-only --toolchain-dir)
     warnings: Tuple[str, ...] = ()
 
@@ -1567,6 +1602,19 @@ def _verify_toolchain_impl(
         if pin is not None:
             _compare_toolchain_pin(pin, name, files, {"bin/lean": lean_version, "bin/lake": lake_version}, c)
             pin_status = "verified"
+    elif resolved_by == "elan" and name in LOCKED_TOOLCHAIN_PINS:
+        locked = LOCKED_TOOLCHAIN_PINS[name]
+        if host_platform_triple() == locked["platform"]:
+            locked_pin = {"toolchain": name, "files": dict(locked["files"]), "versions": dict(locked["versions"])}
+            errors_before_lock = len(c.errors)
+            _compare_toolchain_pin(locked_pin, name, files, {"bin/lean": lean_version, "bin/lake": lake_version}, c)
+            for i in range(errors_before_lock, len(c.errors)):
+                c.errors[i] = c.errors[i].replace("[toolchain-pin]", "[toolchain-pin] (locked release pin)", 1)
+            pin_status = "locked-verified"
+        else:
+            c.warn("toolchain", f"no locked release pin for {name!r} on {host_platform_triple()!r}; digests computed but not pinned (pass --toolchain-pin-json)")
+    elif resolved_by == "elan":
+        c.warn("toolchain", f"no locked release pin for {name!r}; digests computed but not pinned (pass --toolchain-pin-json)")
 
     if home is not None and environ.get("PATH"):
         for tool in ("lean", "lake"):

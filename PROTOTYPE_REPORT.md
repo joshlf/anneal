@@ -8,7 +8,7 @@
 > `lean-miri/**`, `minirust/**`, `lakefile.toml`, or `theory/Anneal.lean` is modified, and no
 > `vendor/lean-miri/` is created.
 
-Status: **round B1** (first cross-family adversarial critique & hardening pass of the N = 4 loop). Recommendation (§6):
+Status: **round A1** (second critique-and-fix pass of the N = 4 loop, after B1). Recommendation (§6):
 **CONDITIONAL GO**.
 
 ## 1. Architecture
@@ -38,22 +38,23 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 | 8 | Falsification witnesses. |
 | 9 | Tree Borrows theorems. |
 | 10 | The wiring claim (`miriMoveDeinitWiring_proto`) and Part 10b live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge theorems (`trusted_evalOperand_root_move_deinits`, `trusted_evalOperand_projected_move_eq_copy`). |
-| 11 | 72 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
+| 10c | A1 hardening: pointer constants fail closed (`constSem_ptr_fails_closed`, `canary_const_ptr_fails_closed`), the universal assignment Tree Borrows theorem with its non-vacuity witness, and destination-first assignment evaluation (`DestPlace`, `resolveDest`, `writeDest`). |
+| 11 | 78 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
 | 12 | A `run_cmd` audit of **every** declaration in the module. Its axioms must be ⊆ {propext, Quot.sound}; otherwise elaboration fails. This was checked with a planted `Classical.choice` probe. |
 
-### 1.2 Inventory (B1)
+### 1.2 Inventory (A1)
 
 | Metric | Value |
 |---|---|
-| Lean LOC | 4,682 |
-| `theorem`s | 169 |
-| `def`/`abbrev`s | 247 |
-| `#guard_msgs` axiom guards | 72, all `[propext]` or `[propext, Quot.sound]` |
+| Lean LOC | 4,897 |
+| `theorem`s | 177 |
+| `def`/`abbrev`s | 254 |
+| `#guard_msgs` axiom guards | 78, all `[propext]` or `[propext, Quot.sound]` |
 | `sorry` / `admit` / `axiom` / `native_decide` / `partial` / `unsafe` | 0 |
 | `Classical.choice` anywhere in the module | 0 (enforced by the Part 12 audit) |
-| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~33 s wall |
-| Receipt 3 (`unittest`) | 55 tests, OK, ~58 s wall |
-| Verifier LOC / test LOC / tests | 1,806 / 1,190 / 55 (including 4-key `LOCKED_DEINIT_BLOBS` fallback and closure `.olean` scan/hardlink subtests) |
+| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), 37 s wall |
+| Receipt 3 (`unittest`) | 57 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), 64 s wall |
+| Verifier LOC / test LOC / tests | 1,854 / 1,242 / 57 (A1 adds `LOCKED_TOOLCHAIN_PINS` plus 2 locked-pin tests; 1 opt-in real-diff test) |
 
 ### 1.3 Headline theorems
 
@@ -104,9 +105,17 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
   * `eagerInEvalOperandStrategy_ne_eager` follows from it.
   * `batched_call_args_lose_move_deinit` covers `kani#5172`.
 * **Tree Borrows:**
-  * `deinitMovedPlace_preserves_tb_tags` is universal for `twoPhaseReadOperand`, and `deinitMovedPlace_assignUse_preserves_tb_tags` (added in B1) proves universal `.frozen` preservation for `twoPhaseAssignUse` (`refCopyRuntimePlaceNoValidate`) into immediate local destinations (covering `StatementKind.assign` in `canary_D5`). A successful `move p` leaves the borrow
-    table as `copy p` (a pure read) does, and every `.frozen` entry stays `.frozen`. It
-    rests on `tbAccessAux_read_preserves_frozen`.
+  * `deinitMovedPlace_preserves_tb_tags` is universal for `twoPhaseReadOperand`. A successful
+    `move p` leaves the borrow table exactly as `copy p` (a pure read) does, and every `.frozen`
+    entry stays `.frozen`. It rests on `tbAccessAux_read_preserves_frozen`.
+  * `deinitMovedPlace_assignUse_preserves_tb_tags` (rewritten in A1) is universal for
+    `StatementKind.assign dest (move p)` through `refCopyRuntimePlaceNoValidate`. For every state,
+    source place and pre-resolved destination (immediate or memory, either copy branch), a
+    successful move leaves every `.frozen` entry that does not overlap the destination window
+    literally unchanged. It rests on `tbAccessAux_read_frozen_unchanged`,
+    `tbAccessAux_nonoverlap_unchanged` and `writeDest_nonoverlap_unchanged`.
+    `deinitMovedPlace_assignUse_preserves_tb_tags_nonvacuous` shows its premises hold on the `D5`
+    move.
   * The contrast is `tbAccessAux_write_disables_foreign_frozen`, which is universal.
   * `assign_or_deinit_stmt_kills_sibling_frozen` is state-level: `[.frozen]` stays `[.frozen]`
     after `_4 = move (*_2)`, but becomes `[.disabled]` after `*_2 = 9` or `Deinit(*_2)`.
@@ -192,7 +201,45 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
    * It fails closed on added, deleted or modified companions (`libleanshared_evil.so`,
      `libleanshared_1.so` tamper, deleted `libleanshared_2.so`), on any symlink in the toolchain,
      and on world-writable modes.
-7. **Modeling limits, stated rather than hidden:**
+7. **(A1) B1 forged stack pointers from pointer constants.**
+   * B1 resolved `ConstValue.scalar (.ptr p sz)` to bytes with provenance `(p.allocId, p.tag)`.
+     Trusted defines `ProvenancePtr.tag := allocId`.
+   * A *global* allocation id was thereby read as an index into the heap of stack locals.
+     `constPtrForgeProg` (`_1 = (7, 8); _2 = const ptr{alloc 0}; _0 = *_2`) returned `7` by reading
+     the stack local `_1`.
+   * A1 restores fail-closed resolution: `constSem_ptr_fails_closed`, and
+     `canary_const_ptr_fails_closed` gives `.unsupported` in both machines.
+   * Track A must model global allocations in a separate id space before admitting pointer
+     constants.
+8. **(A1) B1's assignment Tree Borrows theorem was vacuous.**
+   * Its hypothesis `hdest : ∀ st₀, evalPlaceToOp pb st₀ dest = .ok (.immediate …) ∨ … errors`
+     quantifies over *all* states.
+   * For any destination with empty projections there is a state in which the local is
+     memory-backed, which makes `hdest` false. It holds only for destinations that always fail, and
+     those make the `= .ok st₁` premise impossible.
+   * A1 replaces it with the universal statement in §1.3 and adds an executable non-vacuity
+     witness.
+9. **(A1) Destination-first assignment order.**
+   * rustc's `eval_rvalue_into_place` evaluates `dest = self.eval_place(place)?` *before* the
+     rvalue, and the patch's `copyRuntimePlaceNoValidate` receives an already-resolved
+     `RuntimePlace`.
+   * A0/B1 resolved the destination *after* the operand had been read and deinitialized, inside
+     `writePlace`.
+   * Both machines now evaluate the destination first (`resolveDest` → `DestPlace`), then the
+     rvalue, then `writeDest`. All theorems and canaries were re-proved.
+   * Remaining limit: the `Call` destination is still resolved at `return_` time. Miri evaluates
+     it before pushing the callee frame.
+10. **(A1) The default verifier run was trust-on-first-use for the toolchain.**
+    * Without `--toolchain-pin-json`, receipt 2 only *computed* the `libleanshared*.so` digests, so
+      a substituted companion `libleanshared_1.so` would have passed.
+    * The verifier now compiles in `LOCKED_TOOLCHAIN_PINS` (release digests of
+      `leanprover/lean4:v4.34.1`, `x86_64-unknown-linux-gnu`) and enforces them by default
+      (`pin_status: locked-verified`). An explicit `--toolchain-pin-json` takes precedence.
+    * New tests:
+      * `test_locked_release_pin_rejects_substituted_elan_toolchain`;
+      * `test_live_locked_pin_detects_real_companion_libleanshared_tamper`, which copies the real
+        233 MB toolchain libraries and tampers only `libleanshared_1.so`.
+11. **Modeling limits, stated rather than hidden:**
    * Projections into immediates fail closed, so the patch's "projected immediate →
      `forceAllocation`" branch of `evalOperand` is unreachable in the prototype.
    * Protectors are not modeled (`isProtected = false`).
@@ -215,14 +262,17 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
   to recompute the `Miri` tree). The optional `execution_machine_closure` is verified when
   `.olean`s are supplied.
 * **Toolchain.** It runs `lean-toolchain` ↔ `build_lean_toolchain` drift detection, and invokes
-  `bin/lean --version` / `bin/lake --version` with `stdin=DEVNULL` and a timeout.
+  `bin/lean --version` / `bin/lake --version` with `stdin=DEVNULL` and a timeout. Since A1, the
+  default run compares `bin/lean`, `bin/lake` and every `lib/lean/*.so` against the compiled-in
+  `LOCKED_TOOLCHAIN_PINS` release digests and fails closed on additions, deletions or
+  modifications.
 * **Tests.** There are 55 unit tests: a live end-to-end run and every tamper vector of the brief.
   The Lean hygiene tests check for forbidden tokens, that every `#print axioms` is guarded with an
   allowed axiom list, and that receipt 1 compiles.
 
-## 5. Receipts (A0)
+## 5. Receipts (A1)
 
-See the A0 board post for the exact outputs of the four receipt commands. All four exit 0, and
+See the A1 board post for the exact outputs of the four receipt commands. All four exit 0, and
 `git diff --name-only 8e1523cb..HEAD` lists only the four prototype files.
 
 ## 6. Recommendation and Track A integration plan

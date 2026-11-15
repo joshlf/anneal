@@ -2053,6 +2053,27 @@ def writePlace (ptrBits : Nat) (st : PState) (dest : SemPlace) (b : Bytes) : Exc
   | .ok (.immediate _, _) => setLocalE st dest.local_ (.imm b)
   | .ok (.indirect mp, _) => storeMPlace st mp b
 
+/-- An assignment destination, evaluated **before** the rvalue (rustc
+`eval_rvalue_into_place` first runs `let dest = self.eval_place(place)?`, and
+`copyRuntimePlaceNoValidate` receives an already-resolved `RuntimePlace`). -/
+inductive DestPlace : Type where
+  | imm (l : Local)
+  | mem (mp : MPlace)
+
+/-- Resolve an assignment destination (and its type) against the current state. -/
+def resolveDest (ptrBits : Nat) (st : PState) (dest : SemPlace) : Except Fault (DestPlace × SemTy) :=
+  match evalPlaceToOp ptrBits st dest with
+  | .error e => .error e
+  | .ok (.immediate _, ty) => .ok (.imm dest.local_, ty)
+  | .ok (.indirect mp, ty) => .ok (.mem mp, ty)
+
+/-- Write to a pre-resolved destination (memory destinations are Tree Borrows
+writes). -/
+def writeDest (st : PState) (d : DestPlace) (b : Bytes) : Except Fault PState :=
+  match d with
+  | .imm l => setLocalE st l (.imm b)
+  | .mem mp => storeMPlace st mp b
+
 /-- `copyRuntimePlaceNoValidate`'s padded (memory-copy) branch is taken for
 memory-repr values read from memory. -/
 def usesMemoryPath (ty : SemTy) : OpTy → Bool
@@ -2067,15 +2088,13 @@ def placesOverlap (a b : MPlace) : Bool :=
 
 /-- Memory-copy path (`copy.memoryCopy`), rejecting overlapping source and
 destination windows (`mem_copy(.., nonoverlapping = true)`). -/
-def copyMemPath (ptrBits : Nat) (st : PState) (src : MPlace) (dest : SemPlace) :
-    Except Fault PState :=
-  match loadMPlace st src with
-  | .error e => .error e
-  | .ok (b, st₁) =>
-    match evalPlaceToOp ptrBits st₁ dest with
+def copyMemPath (st : PState) (src : MPlace) (d : DestPlace) : Except Fault PState :=
+  match d with
+  | .imm _ => .error .unsupported
+  | .mem dmp =>
+    match loadMPlace st src with
     | .error e => .error e
-    | .ok (.immediate _, _) => .error .unsupported
-    | .ok (.indirect dmp, _) =>
+    | .ok (b, st₁) =>
       match placesOverlap src dmp with
       | true => .error (.ub .overlappingCopy)
       | false => storeMPlace st₁ dmp b
@@ -2126,26 +2145,26 @@ def annealReadOperand (ptrBits : Nat) (st : PState) (op : SemOperand) :
           | .error e => .error e
           | .ok st₂ => .ok (b, st₂)
 
-def annealAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand) (dest : SemPlace) :
+def annealAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand) (d : DestPlace) :
     Except Fault PState :=
   match op with
   | .const b ty =>
     match checkValid ty b with
     | .error e => .error e
-    | .ok () => writePlace ptrBits (clearLatch st) dest b
+    | .ok () => writeDest (clearLatch st) d b
   | .copy p =>
     match evalPlaceToOp ptrBits (clearLatch st) p with
     | .error e => .error e
     | .ok (o, ty) =>
       match o, usesMemoryPath ty o with
-      | .indirect src, true => copyMemPath ptrBits (clearLatch st) src dest
+      | .indirect src, true => copyMemPath (clearLatch st) src d
       | _, _ =>
         match readOpBytes (clearLatch st) o with
         | .error e => .error e
         | .ok (b, st₁) =>
           match checkValid ty b with
           | .error e => .error e
-          | .ok () => writePlace ptrBits st₁ dest b
+          | .ok () => writeDest st₁ d b
   | .move p =>
     match evalPlaceToOp ptrBits (clearLatch st) p with
     | .error e => .error e
@@ -2157,12 +2176,12 @@ def annealAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand) (dest : SemP
         | .ok st₁ =>
           match checkValid ty b with
           | .error e => .error e
-          | .ok () => writePlace ptrBits (clearLatch st₁) dest b
+          | .ok () => writeDest (clearLatch st₁) d b
       | _ :: _ => .error .unsupported
     | .ok (.indirect src, ty) =>
       match usesMemoryPath ty (.indirect src) with
       | true =>
-        match copyMemPath ptrBits (clearLatch st) src dest with
+        match copyMemPath (clearLatch st) src d with
         | .error e => .error e
         | .ok st₁ => deinitMPlaceRaw st₁ src
       | false =>
@@ -2174,7 +2193,7 @@ def annealAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand) (dest : SemP
           | .ok () =>
             match deinitMPlaceRaw st₁ src with
             | .error e => .error e
-            | .ok st₂ => writePlace ptrBits st₂ dest b
+            | .ok st₂ => writeDest st₂ d b
 
 /-! ### `M_ref`: LeanMiri with the `d9b41b58b` two-phase protocol -/
 
@@ -2231,11 +2250,11 @@ def refReadImmediate (dm : Bool) (st : PState) (o : OpTy) (ty : SemTy) :
 /-- `Place.copyRuntimePlaceNoValidate`: consume the latch; immediate branch
 deinitializes the source before the destination write, memory branch after
 the copy. -/
-def refCopyRuntimePlaceNoValidate (dm : Bool) (ptrBits : Nat) (st : PState) (o : OpTy)
-    (ty : SemTy) (dest : SemPlace) : Except Fault PState :=
+def refCopyRuntimePlaceNoValidate (dm : Bool) (st : PState) (o : OpTy)
+    (ty : SemTy) (d : DestPlace) : Except Fault PState :=
   match o, usesMemoryPath ty o with
   | .indirect src, true =>
-    match copyMemPath ptrBits (takePendingMoveDeinit dm st).2 src dest with
+    match copyMemPath (takePendingMoveDeinit dm st).2 src d with
     | .error e => .error e
     | .ok st₁ =>
       match (takePendingMoveDeinit dm st).1 with
@@ -2252,8 +2271,8 @@ def refCopyRuntimePlaceNoValidate (dm : Bool) (ptrBits : Nat) (st : PState) (o :
         | true, .indirect src =>
           match deinitMPlaceRaw st₁ src with
           | .error e => .error e
-          | .ok st₂ => writePlace ptrBits st₂ dest b
-        | _, _ => writePlace ptrBits st₁ dest b
+          | .ok st₂ => writeDest st₂ d b
+        | _, _ => writeDest st₁ d b
 
 def twoPhaseReadOperand (dm : Bool) (ptrBits : Nat) (st : PState) (op : SemOperand) :
     Except Fault (Bytes × PState) :=
@@ -2262,15 +2281,15 @@ def twoPhaseReadOperand (dm : Bool) (ptrBits : Nat) (st : PState) (op : SemOpera
   | .ok (o, ty, st₁) => refReadImmediate dm st₁ o ty
 
 def twoPhaseAssignUse (dm : Bool) (ptrBits : Nat) (st : PState) (op : SemOperand)
-    (dest : SemPlace) : Except Fault PState :=
+    (d : DestPlace) : Except Fault PState :=
   match refEvalOperand dm ptrBits st op with
   | .error e => .error e
-  | .ok (o, ty, st₁) => refCopyRuntimePlaceNoValidate dm ptrBits st₁ o ty dest
+  | .ok (o, ty, st₁) => refCopyRuntimePlaceNoValidate dm st₁ o ty d
 
 /-- How a machine evaluates and consumes operands. -/
 structure OperandStrategy : Type where
   readOperand : Nat → PState → SemOperand → Except Fault (Bytes × PState)
-  assignUse : Nat → PState → SemOperand → SemPlace → Except Fault PState
+  assignUse : Nat → PState → SemOperand → DestPlace → Except Fault PState
 
 def eagerStrategy : OperandStrategy := ⟨annealReadOperand, annealAssignUse⟩
 
@@ -2363,39 +2382,41 @@ def jump (st : PState) (bb : Nat) : PState :=
   | fr :: rest => { st with frames := { fr with block := bb, stmt := 0 } :: rest }
 
 def execStmt (S : OperandStrategy) (pb : Nat) (st : PState) : SemStmt → Except Fault PState
-  | .assign dest (.use op) => S.assignUse pb st op dest
-  | .assign dest (.binaryOp o l r) =>
-    match S.readOperand pb st l with
+  | .assign dest rv =>
+    match resolveDest pb st dest with
     | .error e => .error e
-    | .ok (lb, st₁) =>
-      match S.readOperand pb st₁ r with
-      | .error e => .error e
-      | .ok (rb, st₂) =>
-        match evalBinOpBytes o lb rb with
+    | .ok (d, dty) =>
+      match rv with
+      | .use op => S.assignUse pb st op d
+      | .binaryOp o l r =>
+        match S.readOperand pb st l with
         | .error e => .error e
-        | .ok res => writePlace pb st₂ dest res
-  | .assign dest (.aggregate ops) =>
-    match readOperands S pb st ops with
-    | .error e => .error e
-    | .ok (bs, st₁) =>
-      match evalPlaceToOp pb st₁ dest with
-      | .error e => .error e
-      | .ok (_, dty) =>
-        match buildAggregate dty.2 bs with
+        | .ok (lb, st₁) =>
+          match S.readOperand pb st₁ r with
+          | .error e => .error e
+          | .ok (rb, st₂) =>
+            match evalBinOpBytes o lb rb with
+            | .error e => .error e
+            | .ok res => writeDest st₂ d res
+      | .aggregate ops =>
+        match readOperands S pb st ops with
         | .error e => .error e
-        | .ok b => writePlace pb st₁ dest b
-  | .assign dest (.ref mutbl p) =>
-    match placeToMPlace pb st p with
-    | .error e => .error e
-    | .ok (mp, st₁) =>
-      match createRef st₁ mutbl mp with
-      | .error e => .error e
-      | .ok (b, st₂) => writePlace pb st₂ dest b
-  | .assign dest (.rawPtr p) =>
-    match placeToMPlace pb st p with
-    | .error e => .error e
-    | .ok (mp, st₁) => writePlace pb st₁ dest (ptrBytes mp.alloc (mp.tag.getD 0) mp.offset)
-  | .assign _ .unsupported => .error .unsupported
+        | .ok (bs, st₁) =>
+          match buildAggregate dty.2 bs with
+          | .error e => .error e
+          | .ok b => writeDest st₁ d b
+      | .ref mutbl p =>
+        match placeToMPlace pb st p with
+        | .error e => .error e
+        | .ok (mp, st₁) =>
+          match createRef st₁ mutbl mp with
+          | .error e => .error e
+          | .ok (b, st₂) => writeDest st₂ d b
+      | .rawPtr p =>
+        match placeToMPlace pb st p with
+        | .error e => .error e
+        | .ok (mp, st₁) => writeDest st₁ d (ptrBytes mp.alloc (mp.tag.getD 0) mp.offset)
+      | .unsupported => .error .unsupported
   | .deinit p =>
     match evalPlaceToOp pb st p with
     | .error e => .error e
@@ -2581,8 +2602,8 @@ theorem twoPhaseReadOperand_true_eq (pb : Nat) (st : PState) (op : SemOperand) :
           | error e => rfl
           | ok u => rfl
 
-theorem twoPhaseAssignUse_true_eq (pb : Nat) (st : PState) (op : SemOperand) (dest : SemPlace) :
-    twoPhaseAssignUse true pb st op dest = annealAssignUse pb st op dest := by
+theorem twoPhaseAssignUse_true_eq (pb : Nat) (st : PState) (op : SemOperand) (d : DestPlace) :
+    twoPhaseAssignUse true pb st op d = annealAssignUse pb st op d := by
   cases op with
   | const b ty =>
     simp only [twoPhaseAssignUse, refEvalOperand, refCopyRuntimePlaceNoValidate,
@@ -2603,7 +2624,7 @@ theorem twoPhaseAssignUse_true_eq (pb : Nat) (st : PState) (op : SemOperand) (de
         cases hm : usesMemoryPath ty (.indirect src) with
         | true =>
           simp only
-          cases copyMemPath pb (clearLatch st) src dest <;> rfl
+          cases copyMemPath (clearLatch st) src d <;> rfl
         | false =>
           simp only [readOpBytes]
           cases loadMPlace (clearLatch st) src with
@@ -2636,7 +2657,7 @@ theorem twoPhaseAssignUse_true_eq (pb : Nat) (st : PState) (op : SemOperand) (de
         cases hm : usesMemoryPath ty (.indirect src) with
         | true =>
           simp only
-          cases copyMemPath pb (clearLatch st) src dest <;> rfl
+          cases copyMemPath (clearLatch st) src d <;> rfl
         | false =>
           simp only [readOpBytes]
           cases loadMPlace (clearLatch st) src with
@@ -2655,15 +2676,15 @@ theorem twoPhaseStrategy_true_eq_eager : twoPhaseStrategy true = eagerStrategy :
   unfold twoPhaseStrategy eagerStrategy
   congr 1
   · funext pb st op; exact twoPhaseReadOperand_true_eq pb st op
-  · funext pb st op dest; exact twoPhaseAssignUse_true_eq pb st op dest
+  · funext pb st op d; exact twoPhaseAssignUse_true_eq pb st op d
 
 /-- `deinitMovedPlace_false_id`: with `deinitMoves = false`, `Operand.move`
 is *identical* to `Operand.copy` at `evalOperand` and at both consumers
 (upstream `lean-miri` behavior: `copy_move_same`). -/
-theorem deinitMovedPlace_false_id (pb : Nat) (st : PState) (p : SemPlace) (dest : SemPlace) :
+theorem deinitMovedPlace_false_id (pb : Nat) (st : PState) (p : SemPlace) (d : DestPlace) :
     refEvalOperand false pb st (.move p) = refEvalOperand false pb st (.copy p) ∧
     twoPhaseReadOperand false pb st (.move p) = twoPhaseReadOperand false pb st (.copy p) ∧
-    twoPhaseAssignUse false pb st (.move p) dest = twoPhaseAssignUse false pb st (.copy p) dest := by
+    twoPhaseAssignUse false pb st (.move p) d = twoPhaseAssignUse false pb st (.copy p) d := by
   have h : refEvalOperand false pb st (.move p) = refEvalOperand false pb st (.copy p) := by
     simp only [refEvalOperand, Bool.false_eq_true, ite_false]
   refine ⟨h, ?_, ?_⟩
@@ -2691,7 +2712,7 @@ def eagerInEvalOperandReadOperand (ptrBits : Nat) (st : PState) (op : SemOperand
   | _ => twoPhaseReadOperand true ptrBits st op
 
 def eagerInEvalOperandAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand)
-    (dest : SemPlace) : Except Fault PState :=
+    (d : DestPlace) : Except Fault PState :=
   match op with
   | .move p =>
     match evalPlaceToOp ptrBits (clearLatch st) p with
@@ -2699,9 +2720,9 @@ def eagerInEvalOperandAssignUse (ptrBits : Nat) (st : PState) (op : SemOperand)
     | .ok (.indirect mp, ty) =>
       match deinitMPlaceRaw (clearLatch st) mp with
       | .error e => .error e
-      | .ok st₁ => refCopyRuntimePlaceNoValidate true ptrBits st₁ (.indirect mp) ty dest
-    | .ok (.immediate _, _) => twoPhaseAssignUse true ptrBits st op dest
-  | _ => twoPhaseAssignUse true ptrBits st op dest
+      | .ok st₁ => refCopyRuntimePlaceNoValidate true st₁ (.indirect mp) ty d
+    | .ok (.immediate _, _) => twoPhaseAssignUse true ptrBits st op d
+  | _ => twoPhaseAssignUse true ptrBits st op d
 
 def eagerInEvalOperandStrategy : OperandStrategy :=
   ⟨eagerInEvalOperandReadOperand, eagerInEvalOperandAssignUse⟩
@@ -2775,8 +2796,6 @@ def constSem (sty : Option SemTy) (v : ConstValue) : Option SemOperand :=
     match v with
     | .zeroSized => some (.const [] ty)
     | .scalar (.int si) => some (.const (encodeLittleEndianBytes si.bits si.sizeBytes .none) ty)
-    | .scalar (.ptr p sz) =>
-      some (.const (encodeLittleEndianBytes p.offsetBytes sz (some (p.allocId, p.tag))) ty)
     | _ => none
 
 def annealResolveOperand (b : CapturedMir) : Operand → Option SemOperand
@@ -3530,7 +3549,7 @@ declaration resolves in its body's `LayoutTable`. -/
 def ProgWellFormed (p : V2026Prog) : Prop :=
   p.entry < p.bodies.length ∧
   ∀ b ∈ p.bodies,
-    b.phase = .runtimePostCleanup ∧
+    b.phase = .runtimePostCleanup ∧ b.wellFormed = true ∧
     ∀ d ∈ b.localDecls, ∃ st, annealResolveTy b.layouts d.ty = some st
 
 /-- Reference program well-formedness (`M_ref` input): canonical type table,
@@ -3554,7 +3573,7 @@ theorem refProgWellFormed_encodeProg (p : V2026Prog) (h : ProgWellFormed p) :
   · intro rb hrb
     simp only [encodeProg_bodies, List.mem_map] at hrb
     obtain ⟨b, hbm, rfl⟩ := hrb
-    obtain ⟨hph, hd⟩ := hb b hbm
+    obtain ⟨hph, _, hd⟩ := hb b hbm
     have hcov := bodyCovered_decls (encodeProg_body_covered p b hbm)
     refine ⟨hph, ?_⟩
     intro rd hrd
@@ -3672,7 +3691,7 @@ theorem refProgWellFormed_nonvacuous :
     intro b hb
     simp only [d1MoveThenRead, prog1, List.mem_singleton] at hb
     subst hb
-    refine ⟨rfl, ?_⟩
+    refine ⟨rfl, rfl, ?_⟩
     intro d hd
     simp only [mkBody, List.mem_map, List.mem_cons, List.not_mem_nil, or_false] at hd
     rcases hd with ⟨ty, rfl | rfl | rfl, rfl⟩ <;> exact ⟨(kU8, lay kU8), rfl⟩
@@ -4116,29 +4135,141 @@ theorem deinitMovedPlace_preserves_tb_tags (pb : Nat) (st : PState) (p : SemPlac
             obtain ⟨e', h1, h2, h3⟩ := loadMPlace_preserves_frozen hl i e hi hf
             exact ⟨e', by rw [hb4]; exact h1, h2, h3⟩
 
-/-- **`deinitMovedPlace_assignUse_preserves_tb_tags`**: for `StatementKind.assign`
-via `twoPhaseAssignUse` (`refCopyRuntimePlaceNoValidate`), moving any place `p`
-into an unprojected immediate destination local `dest` preserves every `.frozen`
-Tree Borrows entry of `st.borrows` (closing the gap between `twoPhaseReadOperand`
-and `StatementKind.assign` in `canary_D5`). -/
-theorem deinitMovedPlace_assignUse_preserves_tb_tags (pb : Nat) (st : PState)
-    (p dest : SemPlace) (st₁ : PState)
-    (h : twoPhaseAssignUse true pb st (.move p) dest = .ok st₁)
-    (hdest : ∀ st₀, (∃ b ty, evalPlaceToOp pb st₀ dest = .ok (.immediate b, ty)) ∨
-      evalPlaceToOp pb st₀ dest = .error (.ub .deadLocal) ∨
-      evalPlaceToOp pb st₀ dest = .error .unsupported) :
-    ∀ i e, nth? st.borrows i = some e → e.perm = .frozen →
-      ∃ e', nth? st₁.borrows i = some e' ∧ e'.tag = e.tag ∧ e'.perm = .frozen := by
+/-- A `.frozen` entry is left *literally unchanged* by any Tree Borrows read. -/
+theorem tbAccessAux_read_frozen_unchanged (all : List BorrowEntry) (a : Nat) (tag : Option Nat)
+    (off len : Nat) :
+    ∀ (es es' : List BorrowEntry), tbAccessAux .read all a tag off len es = some es' →
+      ∀ i e, nth? es i = some e → e.perm = .frozen → nth? es' i = some e
+  | [], _, _, i, e, hi, _ => by simp [nth?] at hi
+  | x :: xs, es', h, i, e, hi, hf => by
+    simp only [tbAccessAux] at h
+    cases hr : tbAccessAux .read all a tag off len xs with
+    | none => rw [hr] at h; cases h
+    | some xs' =>
+      rw [hr] at h; simp only at h
+      cases i with
+      | succ j =>
+        simp only [nth?] at hi
+        have ih := tbAccessAux_read_frozen_unchanged all a tag off len xs xs' hr j e hi hf
+        cases hc : (Nat.beq x.targetLocal a && byteRangesOverlapBool x.rangeOffset x.rangeLen off len) <;>
+          rw [hc] at h <;> simp only at h
+        · cases h; exact ih
+        · cases hub : treeBorrowTransitionIsUB
+              (treeBorrowNodeAccess .read (tbRelatedness all tag x) x.perm false) <;>
+            rw [hub] at h <;> simp only at h
+          · cases h; exact ih
+          · cases h
+      | zero =>
+        simp only [nth?, Option.some.injEq] at hi; subst hi
+        cases hc : (Nat.beq x.targetLocal a && byteRangesOverlapBool x.rangeOffset x.rangeLen off len) <;>
+          rw [hc] at h <;> simp only at h
+        · cases h; rfl
+        · rw [hf, treeBorrowNodeAccess_read_frozen] at h
+          simp only [treeBorrowTransitionIsUB] at h
+          cases h
+          cases x; simp only at hf; subst hf; rfl
+
+/-- Entries not overlapping an access window are left *literally unchanged*
+by any Tree Borrows access (read or write). -/
+theorem tbAccessAux_nonoverlap_unchanged (kind : TreeBorrowAccessKind) (all : List BorrowEntry)
+    (a : Nat) (tag : Option Nat) (off len : Nat) :
+    ∀ (es es' : List BorrowEntry), tbAccessAux kind all a tag off len es = some es' →
+      ∀ i e, nth? es i = some e →
+        (Nat.beq e.targetLocal a && byteRangesOverlapBool e.rangeOffset e.rangeLen off len) = false →
+        nth? es' i = some e
+  | [], _, _, i, e, hi, _ => by simp [nth?] at hi
+  | x :: xs, es', h, i, e, hi, hno => by
+    simp only [tbAccessAux] at h
+    cases hr : tbAccessAux kind all a tag off len xs with
+    | none => rw [hr] at h; cases h
+    | some xs' =>
+      rw [hr] at h; simp only at h
+      cases i with
+      | succ j =>
+        simp only [nth?] at hi
+        have ih := tbAccessAux_nonoverlap_unchanged kind all a tag off len xs xs' hr j e hi hno
+        cases hc : (Nat.beq x.targetLocal a && byteRangesOverlapBool x.rangeOffset x.rangeLen off len) <;>
+          rw [hc] at h <;> simp only at h
+        · cases h; exact ih
+        · cases hub : treeBorrowTransitionIsUB
+              (treeBorrowNodeAccess kind (tbRelatedness all tag x) x.perm false) <;>
+            rw [hub] at h <;> simp only at h
+          · cases h; exact ih
+          · cases h
+      | zero =>
+        simp only [nth?, Option.some.injEq] at hi; subst hi
+        rw [hno] at h; simp only at h
+        cases h; rfl
+
+theorem loadMPlace_frozen_unchanged {st st' : PState} {mp : MPlace} {b : Bytes}
+    (h : loadMPlace st mp = .ok (b, st')) (i : Nat) (e : BorrowEntry)
+    (hi : nth? st.borrows i = some e) (hf : e.perm = .frozen) : nth? st'.borrows i = some e := by
+  unfold loadMPlace at h
+  cases hg : heapGet st mp.alloc with
+  | none => rw [hg] at h; cases h
+  | some bs =>
+    rw [hg] at h; simp only at h
+    cases hb : Nat.ble (mp.offset + mp.size) bs.length with
+    | false => rw [hb] at h; cases h
+    | true =>
+      rw [hb] at h; simp only at h
+      cases ht : tbAccess .read st.borrows mp.alloc mp.tag mp.offset mp.size with
+      | none => rw [ht] at h; cases h
+      | some bs' =>
+        rw [ht] at h; simp only [Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨_, rfl⟩ := h
+        exact tbAccessAux_read_frozen_unchanged _ _ _ _ _ _ _ ht i e hi hf
+
+theorem storeMPlace_nonoverlap_unchanged {st st' : PState} {mp : MPlace} {w : Bytes}
+    (h : storeMPlace st mp w = .ok st') (i : Nat) (e : BorrowEntry)
+    (hi : nth? st.borrows i = some e)
+    (hno : (Nat.beq e.targetLocal mp.alloc &&
+      byteRangesOverlapBool e.rangeOffset e.rangeLen mp.offset mp.size) = false) :
+    nth? st'.borrows i = some e := by
+  unfold storeMPlace at h
+  cases hg : heapGet st mp.alloc with
+  | none => rw [hg] at h; cases h
+  | some bs =>
+    rw [hg] at h; simp only at h
+    cases hb : (Nat.ble (mp.offset + mp.size) bs.length && Nat.beq w.length mp.size) with
+    | false => rw [hb] at h; cases h
+    | true =>
+      rw [hb] at h; simp only at h
+      cases ht : tbAccess .write st.borrows mp.alloc mp.tag mp.offset mp.size with
+      | none => rw [ht] at h; cases h
+      | some bs' =>
+        rw [ht] at h; simp only at h
+        rw [putHeap_borrows h]
+        exact tbAccessAux_nonoverlap_unchanged _ _ _ _ _ _ _ _ ht i e hi hno
+
+/-- Does a Tree Borrows entry overlap a pre-resolved destination window? -/
+def entryOverlapsDest (e : BorrowEntry) : DestPlace → Bool
+  | .imm _ => false
+  | .mem mp =>
+    Nat.beq e.targetLocal mp.alloc && byteRangesOverlapBool e.rangeOffset e.rangeLen mp.offset mp.size
+
+theorem writeDest_nonoverlap_unchanged {st st' : PState} {d : DestPlace} {b : Bytes}
+    (h : writeDest st d b = .ok st') (i : Nat) (e : BorrowEntry)
+    (hi : nth? st.borrows i = some e) (hno : entryOverlapsDest e d = false) :
+    nth? st'.borrows i = some e := by
+  cases d with
+  | imm l => simp only [writeDest] at h; rw [setLocalE_borrows h]; exact hi
+  | mem mp => exact storeMPlace_nonoverlap_unchanged h i e hi hno
+
+/-- **`deinitMovedPlace_assignUse_preserves_tb_tags`** (`StatementKind.assign
+dest (move p)` through `copyRuntimePlaceNoValidate`): for *every* state, source
+place and pre-resolved destination, a successful move leaves every `.frozen`
+Tree Borrows entry that does not overlap the destination window *literally
+unchanged* — the move's read is a read and its deinit is not a Tree Borrows
+access; only the destination store can touch overlapping entries (as it must,
+and exactly as the corresponding `copy` would). -/
+theorem deinitMovedPlace_assignUse_preserves_tb_tags (pb : Nat) (st : PState) (p : SemPlace)
+    (d : DestPlace) (st₁ : PState) (h : twoPhaseAssignUse true pb st (.move p) d = .ok st₁) :
+    ∀ i e, nth? st.borrows i = some e → e.perm = .frozen → entryOverlapsDest e d = false →
+      nth? st₁.borrows i = some e := by
+  intro i e hi hf hno
   rw [twoPhaseAssignUse_true_eq] at h
   simp only [annealAssignUse] at h
-  have hw : ∀ (st₀ : PState) (b : Bytes), writePlace pb st₀ dest b = .ok st₁ →
-      st₁.borrows = st₀.borrows := by
-    intro st₀ b hw₀
-    unfold writePlace at hw₀
-    rcases hdest st₀ with ⟨db, dty, hd⟩ | hd | hd
-    · rw [hd] at hw₀; exact setLocalE_borrows hw₀
-    · rw [hd] at hw₀; cases hw₀
-    · rw [hd] at hw₀; cases hw₀
   cases he : evalPlaceToOp pb (clearLatch st) p with
   | error err => rw [he] at h; cases h
   | ok r =>
@@ -4159,46 +4290,52 @@ theorem deinitMovedPlace_assignUse_preserves_tb_tags (pb : Nat) (st : PState)
           | error err => rw [hv] at h; cases h
           | ok u =>
             rw [hv] at h; simp only at h
-            have hb₁ := hw (clearLatch st₂) bb h
             have hb₂ := setLocalE_borrows hs
-            intro i e hi hf
-            refine ⟨e, ?_, rfl, hf⟩
-            rw [hb₁]; show nth? st₂.borrows i = some e; rw [hb₂]; exact hi
+            exact writeDest_nonoverlap_unchanged h i e (by
+              show nth? st₂.borrows i = some e; rw [hb₂]; exact hi) hno
     | indirect src =>
       simp only at h
       cases hm : usesMemoryPath ty (.indirect src) with
       | true =>
         rw [hm] at h; simp only at h
-        cases hc : copyMemPath pb (clearLatch st) src dest with
+        cases hc : copyMemPath (clearLatch st) src d with
         | error err => rw [hc] at h; cases h
         | ok st₂ =>
-          unfold copyMemPath at hc
-          cases hl : loadMPlace (clearLatch st) src with
-          | error err => rw [hl] at hc; cases hc
-          | ok r' =>
-            obtain ⟨bb, st₃⟩ := r'
-            rw [hl] at hc; simp only at hc
-            rcases hdest st₃ with ⟨db, dty, hd⟩ | hd | hd <;> rw [hd] at hc <;> cases hc
+          rw [hc] at h; simp only at h
+          rw [deinitMPlaceRaw_borrows h]
+          cases d with
+          | imm l => simp only [copyMemPath] at hc; cases hc
+          | mem dmp =>
+            simp only [copyMemPath] at hc
+            cases hl : loadMPlace (clearLatch st) src with
+            | error err => rw [hl] at hc; cases hc
+            | ok r' =>
+              obtain ⟨bb, st₃⟩ := r'
+              rw [hl] at hc; simp only at hc
+              have h3 := loadMPlace_frozen_unchanged hl i e hi hf
+              cases hov : placesOverlap src dmp with
+              | true => rw [hov] at hc; cases hc
+              | false =>
+                rw [hov] at hc; simp only at hc
+                exact storeMPlace_nonoverlap_unchanged hc i e h3 hno
       | false =>
         rw [hm] at h; simp only at h
         cases hl : loadMPlace (clearLatch st) src with
         | error err => rw [hl] at h; cases h
         | ok r' =>
-          obtain ⟨bb, st₂⟩ := r'
+          obtain ⟨bb, st₃⟩ := r'
           rw [hl] at h; simp only at h
+          have h3 := loadMPlace_frozen_unchanged hl i e hi hf
           cases hv : checkValid ty bb with
           | error err => rw [hv] at h; cases h
           | ok u =>
             rw [hv] at h; simp only at h
-            cases hd : deinitMPlaceRaw st₂ src with
+            cases hd : deinitMPlaceRaw st₃ src with
             | error err => rw [hd] at h; cases h
-            | ok st₃ =>
+            | ok st₄ =>
               rw [hd] at h; simp only at h
-              have hb₁ := hw st₃ bb h
-              have hb₃ := deinitMPlaceRaw_borrows hd
-              intro i e hi hf
-              obtain ⟨e', h1, h2, h3⟩ := loadMPlace_preserves_frozen hl i e hi hf
-              exact ⟨e', by rw [hb₁, hb₃]; exact h1, h2, h3⟩
+              exact writeDest_nonoverlap_unchanged h i e
+                (by rw [deinitMPlaceRaw_borrows hd]; exact h3) hno
 
 /-- A Tree Borrows **write** through a tag that is foreign to an overlapping,
 unprotected `.frozen` entry disables it. -/
@@ -4363,6 +4500,61 @@ theorem trusted_evalOperand_projected_move_eq_copy
       borrows globals layouts callerLocals localDecls := by
   cases e <;> rfl
 
+
+/-! ## Part 10c — A1 hardening: fail-closed pointer constants, destination-first
+assignments, and a non-vacuity witness for the assignment Tree Borrows theorem -/
+
+/-- Pointer constants (`ConstValue.scalar (.ptr ..)`) refer to *global*
+allocations, which the shared machine does not model; resolving them into the
+heap of stack locals would let a constant forge a pointer to a local (allocation
+ids of globals and stack locals are different namespaces). They therefore fail
+closed in both machines. -/
+theorem constSem_ptr_fails_closed (sty : Option SemTy) (p : ProvenancePtr) (sz : Nat) :
+    constSem sty (.scalar (.ptr p sz)) = none := by
+  cases sty <;> rfl
+
+/-- `_1 = (7, 8); _2 = const ptr{alloc 0, off 0}; _0 = copy (*_2)`: under the
+B1 resolution this read the stack local `_1` (heap allocation `0`) through a
+*global* pointer constant and returned `7`; it now fails closed. -/
+def constPtrForgeProg : V2026Prog := prog1 <| mkBody "constptr" 0 [tU8, tPair, tRaw]
+  [blk [asg (loc 1) (.aggregate .tuple [cU8 7, cU8 8]),
+        asg (loc 2) (.use (.constant ⟨tRaw, .scalar (.ptr ⟨0, 0⟩ 8)⟩)),
+        asg (loc 0) (.use (.copy (drf 2)))] .return_]
+
+theorem canary_const_ptr_fails_closed :
+    bothObs constPtrForgeProg = (.unsupported, .unsupported) := by decide
+
+/-- The `D5` state just before `_4 = move (*_2)` (`_1` in memory with a sibling
+`.frozen` shared borrow `_3` and the raw pointer `_2`). -/
+def d5PreMoveState : Option PState :=
+  let p := d5Prog (asg (loc 4) (.use (.move (drf 2)))) (.use (.copy (loc 4)))
+  match annealInit p [] with
+  | .ok st =>
+    match annealRun p 3 st with
+    | .running st' => some st'
+    | _ => none
+  | .error _ => none
+
+def d5MoveOp : SemOperand := .move ⟨2, (.rawPtr .mut kU8, lay (.rawPtr .mut kU8)), [.deref]⟩
+
+/-- Executable check of all premises and the conclusion of
+`deinitMovedPlace_assignUse_preserves_tb_tags` on the `D5` move. -/
+def tbAssignWitness : Bool :=
+  match d5PreMoveState with
+  | some st =>
+    match twoPhaseAssignUse true 64 st d5MoveOp (.imm 4), nth? st.borrows 0 with
+    | .ok st₁, some e =>
+      decide (e.perm = .frozen) && !(entryOverlapsDest e (.imm 4)) &&
+        decide ((nth? st₁.borrows 0).map BorrowEntry.perm = some .frozen) &&
+        decide (st₁.borrows.length = st.borrows.length)
+    | _, _ => false
+  | none => false
+
+/-- Non-vacuity: the premises of `deinitMovedPlace_assignUse_preserves_tb_tags`
+are satisfiable (the `D5` move into `_4` succeeds with a sibling `.frozen`
+borrow that does not overlap the destination, which stays `.frozen`). -/
+theorem deinitMovedPlace_assignUse_preserves_tb_tags_nonvacuous : tbAssignWitness = true := by
+  decide
 
 /-! ## Part 11 — Axiom guards (kernel axioms ⊆ {propext, Quot.sound}) -/
 
@@ -4653,6 +4845,30 @@ theorem trusted_evalOperand_projected_move_eq_copy
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_D9_subslice_move_window' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_D9_subslice_move_window
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.constSem_ptr_fails_closed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms constSem_ptr_fails_closed
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.canary_const_ptr_fails_closed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_const_ptr_fails_closed
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.deinitMovedPlace_assignUse_preserves_tb_tags_nonvacuous' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms deinitMovedPlace_assignUse_preserves_tb_tags_nonvacuous
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.tbAccessAux_read_frozen_unchanged' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms tbAccessAux_read_frozen_unchanged
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.tbAccessAux_nonoverlap_unchanged' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms tbAccessAux_nonoverlap_unchanged
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.writeDest_nonoverlap_unchanged' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms writeDest_nonoverlap_unchanged
 
 /-! ## Part 12 — Whole-environment audit
 

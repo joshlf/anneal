@@ -230,8 +230,37 @@ class LiveCheckoutTests(TempCase):
             self.assertEqual(t.files[f"lib/lean/{lib}"], _sha256((LIVE_TOOLCHAIN_DIR / "lib" / "lean" / lib).read_bytes()))
         self.assertIn(f"version {REPO_LEAN_VERSION}", t.lean_version)
         self.assertIn(f"(Lean version {REPO_LEAN_VERSION})", t.lake_version)
+        # The default run is checked against the compiled-in release pin.
+        if V.host_platform_triple() == V.LOCKED_TOOLCHAIN_PINS[REPO_TOOLCHAIN]["platform"]:
+            self.assertEqual(t.pin_status, "locked-verified")
+            self.assertEqual(dict(t.files), dict(V.LOCKED_TOOLCHAIN_PINS[REPO_TOOLCHAIN]["files"]))
         summary = result.to_json_dict()
         self.assertEqual((summary["verified_vendor_files"], summary["verified_aux_files"]), (608, 9))
+
+    @unittest.skipUnless(HAVE_LIVE_TOOLCHAIN, f"elan toolchain {LIVE_TOOLCHAIN_DIR} not installed")
+    def test_live_locked_pin_detects_real_companion_libleanshared_tamper(self) -> None:
+        if V.host_platform_triple() != V.LOCKED_TOOLCHAIN_PINS[REPO_TOOLCHAIN]["platform"]:
+            self.skipTest("the locked release pin is for x86_64 Linux")
+        # Byte-for-byte copy of the real binaries and shared libraries under a
+        # temporary elan home (the real toolchain is never modified).
+        elan = self.tmp / "elan"
+        dst = elan / "toolchains" / V.toolchain_dir_name(REPO_TOOLCHAIN)
+        (dst / "bin").mkdir(parents=True)
+        (dst / "lib" / "lean").mkdir(parents=True)
+        for rel in ("bin/lean", "bin/lake"):
+            shutil.copy2(LIVE_TOOLCHAIN_DIR / rel, dst / rel)
+        for so in sorted((LIVE_TOOLCHAIN_DIR / "lib" / "lean").glob("*.so")):
+            shutil.copy2(so, dst / "lib" / "lean" / so.name)
+        for d in (dst, dst / "bin", dst / "lib", dst / "lib" / "lean"):
+            os.chmod(d, 0o755)
+        self.assertEqual(V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}).pin_status, "locked-verified")
+        # Tamper ONLY the companion libleanshared_1.so; libleanshared.so stays byte-identical.
+        with open(dst / "lib" / "lean" / "libleanshared_1.so", "ab") as fh:
+            fh.write(b"\0")
+        self.assertRejected(
+            lambda: V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}),
+            "(locked release pin) SHA-256 mismatch for lib/lean/libleanshared_1.so",
+        )
 
     @unittest.skipUnless(HAVE_LIVE_TOOLCHAIN, f"elan toolchain {LIVE_TOOLCHAIN_DIR} not installed")
     def test_live_toolchain_pin_dump_and_verify_roundtrip(self) -> None:
@@ -885,6 +914,26 @@ class ToolchainTests(TempCase):
                 self.pin.write_text(json.dumps(doc))
                 self.assertRejected(self.verify, needle)
 
+    def test_locked_release_pin_rejects_substituted_elan_toolchain(self) -> None:
+        if V.host_platform_triple() != V.LOCKED_TOOLCHAIN_PINS[REPO_TOOLCHAIN]["platform"]:
+            self.skipTest("the locked release pin is for x86_64 Linux")
+        elan = self.tmp / "elan"
+        installed = elan / "toolchains" / V.toolchain_dir_name(REPO_TOOLCHAIN)
+        installed.parent.mkdir(parents=True)
+        shutil.copytree(self.tc, installed, symlinks=True)
+        # Default run (no explicit pin): the compiled-in release pin rejects a
+        # substituted toolchain installed under the pinned elan name.
+        for needle in (
+            "(locked release pin) SHA-256 mismatch for lib/lean/libleanshared_1.so",
+            "(locked release pin) SHA-256 mismatch for bin/lean",
+            "(locked release pin) pinned toolchain file deleted or unverifiable: lib/lean/libLake_shared.so",
+        ):
+            with self.subTest(needle):
+                self.assertRejected(lambda: V.verify_toolchain(self.ws.root, elan_home=elan, environ={}), needle)
+        # An explicit pin takes precedence over the locked release pin.
+        t = V.verify_toolchain(self.ws.root, elan_home=elan, environ={}, toolchain_pin_json=self.pin)
+        self.assertEqual(t.pin_status, "verified")
+
     def test_elan_home_resolution_and_override_detection(self) -> None:
         elan = self.tmp / "elan"
         installed = elan / "toolchains" / V.toolchain_dir_name(REPO_TOOLCHAIN)
@@ -896,9 +945,12 @@ class ToolchainTests(TempCase):
         shadow = self.tmp / "shadow-bin"
         shadow.mkdir()
         shutil.copy2(self.tc / "bin" / "lean", shadow / "lean")
-        shadowed = V.verify_toolchain(self.ws.root, elan_home=elan, environ={"PATH": str(shadow)})
+        shadowed = V.verify_toolchain(self.ws.root, elan_home=elan, environ={"PATH": str(shadow)}, toolchain_pin_json=self.pin)
         self.assertTrue(any("`lean` on PATH resolves to" in w for w in shadowed.warnings), shadowed.warnings)
-        self.assertEqual(V.verify_toolchain(self.ws.root, environ={"ELAN_HOME": str(elan)}).toolchain_dir, str(installed))
+        self.assertEqual(
+            V.verify_toolchain(self.ws.root, environ={"ELAN_HOME": str(elan)}, toolchain_pin_json=self.pin).toolchain_dir,
+            str(installed),
+        )
         self.assertRejected(
             lambda: V.verify_toolchain(self.ws.root, elan_home=elan, environ={"ELAN_TOOLCHAIN": "leanprover/lean4:v4.0.0"}),
             "ELAN_TOOLCHAIN='leanprover/lean4:v4.0.0' overrides",
