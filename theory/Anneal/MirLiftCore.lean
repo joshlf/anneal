@@ -9987,7 +9987,7 @@ theorem LiftBlockToJoin.of_lookup {body : CapturedMir} {bbIdx joinBb : BasicBloc
 theorem LiftBlockToJoin.by_cases {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
     {env : PureEnv} {JoinInv : PureEnv → Prop} (C : Prop) [Decidable C]
     (h_pos : C → LiftBlockToJoin body bbIdx env joinBb JoinInv)
-    (h_neg : ¬ C → LiftBlockToJoin body bbIdx env joinBb JoinInv) :
+    (h_neg : Not C → LiftBlockToJoin body bbIdx env joinBb JoinInv) :
     LiftBlockToJoin body bbIdx env joinBb JoinInv :=
   if hC : C then h_pos hC else h_neg hC
 
