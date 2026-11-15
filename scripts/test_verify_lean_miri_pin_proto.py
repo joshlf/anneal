@@ -39,6 +39,7 @@ import os  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
 import stat  # noqa: E402
+import struct  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
@@ -163,6 +164,52 @@ def make_fake_toolchain(base: Path, *, version: str = REPO_LEAN_VERSION, name: s
     return root
 
 
+def make_elf64(
+    needed: Sequence[str],
+    runpath: Sequence[str] = (),
+    *,
+    rpath: Sequence[str] = (),
+    rpath_tag: int = 29,
+    machine: int = 247,
+    strtab_outside_load: bool = False,
+    unterminated: bool = False,
+    strsz_overrun: bool = False,
+    omit_strtab: bool = False,
+) -> bytes:
+    """Minimal ELF64 little-endian ET_DYN image: one PT_LOAD covering the whole
+    file plus a PT_DYNAMIC segment with DT_NEEDED*, DT_RUNPATH (29) / DT_RPATH
+    (15), DT_STRTAB, DT_STRSZ, DT_NULL. `rpath` adds a DT_RPATH entry *before*
+    the `runpath` entry. Each boolean flag corrupts exactly one property so the
+    fail-closed paths of `elf_dynamic_info` can be exercised. `machine` defaults
+    to EM_BPF (247): no test can ever execute a synthetic image (ENOEXEC)."""
+    strtab = bytearray(b"\0")
+    dyn: List[Tuple[int, int]] = []
+    for name in needed:
+        dyn.append((1, len(strtab)))
+        strtab += name.encode() + b"\0"
+    if rpath:
+        dyn.append((15, len(strtab)))
+        strtab += ":".join(rpath).encode() + b"\0"
+    if runpath:
+        dyn.append((rpath_tag, len(strtab)))
+        strtab += ":".join(runpath).encode() + b"\0"
+    if unterminated:
+        del strtab[-1]
+    dyn_off = 64 + 2 * 56
+    dyn_slots = len(dyn) + 3  # + DT_STRTAB, DT_STRSZ, DT_NULL
+    str_off = dyn_off + 16 * dyn_slots
+    total = str_off + len(strtab)
+    if not omit_strtab:
+        dyn.append((5, str_off + (0x100000 if strtab_outside_load else 0)))
+        dyn.append((10, len(strtab) + (64 if strsz_overrun else 0)))
+    dyn.append((0, 0))
+    body = b"".join(struct.pack("<qQ", tag, val) for tag, val in dyn).ljust(16 * dyn_slots, b"\0")
+    ehdr = struct.pack("<4sBBBBB7sHHIQQQIHHHHHH", b"\x7fELF", 2, 1, 1, 0, 0, bytes(7), 3, machine, 1, 0, 64, 0, 0, 64, 56, 2, 64, 0, 0)
+    ph_load = struct.pack("<IIQQQQQQ", 1, 4, 0, 0, 0, total, total, 0x1000)
+    ph_dyn = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_off, dyn_off, 16 * dyn_slots, 16 * dyn_slots, 8)
+    return ehdr + ph_load + ph_dyn + body + bytes(strtab)
+
+
 class TempCase(unittest.TestCase):
     """Per-test temporary directory + rejection assertion helpers."""
 
@@ -261,6 +308,62 @@ class LiveCheckoutTests(TempCase):
             lambda: V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}),
             "(locked release pin) SHA-256 mismatch for lib/lean/libleanshared_1.so",
         )
+
+    @unittest.skipUnless(HAVE_LIVE_TOOLCHAIN, f"elan toolchain {LIVE_TOOLCHAIN_DIR} not installed")
+    def test_live_elf_dynamic_info_of_all_pinned_objects(self) -> None:
+        # Covers libleanshared.so, whose dynamic string table is ~24 MiB (it is
+        # never slurped: only the referenced NUL-terminated strings are read).
+        bin_runpath = ("$ORIGIN/../lib", "$ORIGIN/../lib/lean")
+        lib_runpath = ("$ORIGIN/..", "$ORIGIN")
+        expected = {
+            "bin/lean": (bin_runpath, ("libleanshared.so", "libleanshared_1.so", "libleanshared_2.so", "libInit_shared.so", "libc.so.6", "libm.so.6")),
+            "bin/lake": (bin_runpath, ("libLake_shared.so", "libleanshared.so", "libInit_shared.so", "libc.so.6")),
+            "lib/lean/libleanshared.so": (lib_runpath, ("libc.so.6", "librt.so.1", "ld-linux-x86-64.so.2")),
+            "lib/lean/libleanshared_1.so": (lib_runpath, ("libc.so.6",)),
+            "lib/lean/libleanshared_2.so": (lib_runpath, ("libc.so.6",)),
+            "lib/lean/libInit_shared.so": (lib_runpath, ("libc.so.6",)),
+            "lib/lean/libLake_shared.so": (lib_runpath, ("libleanshared.so", "libInit_shared.so")),
+        }
+        if V.host_platform_triple() != V.LOCKED_TOOLCHAIN_PINS[REPO_TOOLCHAIN]["platform"]:
+            self.skipTest("expected DT_NEEDED sets are for the x86_64 Linux release")
+        for rel, (runpath, must_need) in expected.items():
+            with self.subTest(rel):
+                needed, got_runpath = V.elf_dynamic_info(LIVE_TOOLCHAIN_DIR / rel)
+                self.assertEqual(got_runpath, runpath)
+                for soname in must_need:
+                    self.assertIn(soname, needed)
+        self.assertIsNone(V.elf_dynamic_info(REPO_ROOT / "lean-toolchain"))
+
+    @unittest.skipUnless(HAVE_LIVE_TOOLCHAIN, f"elan toolchain {LIVE_TOOLCHAIN_DIR} not installed")
+    def test_live_elf_runpath_shadowing_of_real_binaries_rejected(self) -> None:
+        if V.host_platform_triple() != V.LOCKED_TOOLCHAIN_PINS[REPO_TOOLCHAIN]["platform"]:
+            self.skipTest("the locked release pin is for x86_64 Linux")
+        # Byte-for-byte copy of the real ELF binaries and libraries (the real
+        # toolchain is never modified); the DT_RUNPATH of bin/lean is
+        # `$ORIGIN/../lib:$ORIGIN/../lib/lean`, searched before /lib.
+        elan = self.tmp / "elan"
+        dst = elan / "toolchains" / V.toolchain_dir_name(REPO_TOOLCHAIN)
+        (dst / "bin").mkdir(parents=True)
+        (dst / "lib" / "lean").mkdir(parents=True)
+        for rel in ("bin/lean", "bin/lake"):
+            shutil.copy2(LIVE_TOOLCHAIN_DIR / rel, dst / rel)
+        for so in sorted((LIVE_TOOLCHAIN_DIR / "lib" / "lean").glob("*.so")):
+            shutil.copy2(so, dst / "lib" / "lean" / so.name)
+        for d in (dst, dst / "bin", dst / "lib", dst / "lib" / "lean"):
+            os.chmod(d, 0o755)
+        self.assertEqual(V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}).pin_status, "locked-verified")
+        for planted_rel, needle in (
+            ("lib/libm.so.6", "RUNPATH shadowing: bin/lean needs 'libm.so.6', which ld.so can resolve to the unpinned toolchain file lib/libm.so.6"),
+            ("lib/librt.so.1", "RUNPATH shadowing: lib/lean/libleanshared.so needs 'librt.so.1', which ld.so can resolve to the unpinned toolchain file lib/librt.so.1"),
+            ("lib/libleanshared_1.so", "RUNPATH shadowing: bin/lean needs 'libleanshared_1.so', which ld.so can resolve to the unpinned toolchain file lib/libleanshared_1.so"),
+        ):
+            with self.subTest(planted_rel):
+                planted = dst / planted_rel
+                planted.write_bytes(b"\x7fELF-trojan")
+                os.chmod(planted, 0o644)
+                self.assertRejected(lambda: V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}), needle)
+                planted.unlink()
+        self.assertEqual(V.verify_toolchain(REPO_ROOT, elan_home=elan, environ={}).pin_status, "locked-verified")
 
     @unittest.skipUnless(HAVE_LIVE_TOOLCHAIN, f"elan toolchain {LIVE_TOOLCHAIN_DIR} not installed")
     def test_live_toolchain_pin_dump_and_verify_roundtrip(self) -> None:
@@ -987,6 +1090,133 @@ class ToolchainTests(TempCase):
             "skipped `bin/lean --version`",
         )
         self.assertFalse(canary.exists(), "bin/lean was executed despite RUNPATH shadowing in lib/!")
+
+
+    def test_system_soname_planted_in_runpath_dir_rejected_and_not_executed(self) -> None:
+        canary = self.tmp / "system-soname-executed"
+        (self.tc / "bin" / "lean").write_text(f"#!/bin/sh\necho pwned > {str(canary)!r}\necho 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n")
+        os.chmod(self.tc / "bin" / "lean", 0o755)
+        V.write_toolchain_pin(V.verify_toolchain(self.ws.root, toolchain_dir=self.tc), self.pin)
+        if canary.exists():
+            canary.unlink()
+        for rel in ("lib/libc.so.6", "lib/libm.so.6", "lib/lean/libpthread.so.0", "lib/ld-linux-x86-64.so.2"):
+            with self.subTest(rel):
+                planted = self.tc / rel
+                planted.write_bytes(b"\x7fELF-trojan")
+                os.chmod(planted, 0o644)
+                self.assertRejected(self.verify, f"system soname planted in a toolchain RUNPATH directory: {rel}", "skipped `bin/lean --version`")
+                self.assertFalse(canary.exists(), f"bin/lean was executed despite a planted {rel}")
+                planted.unlink()
+
+    def repin_bin_lean(self, data: bytes, extra_libs: Optional[Dict[str, bytes]] = None) -> None:
+        """Install `data` as bin/lean (plus optional extra `lib/lean/` files) and
+        re-pin only those digests, so the pin compare passes and the defect under
+        test is the only one left."""
+        (self.tc / "bin" / "lean").write_bytes(data)
+        os.chmod(self.tc / "bin" / "lean", 0o755)
+        doc = json.loads(self.pin.read_text(encoding="utf-8"))
+        doc["files"]["bin/lean"] = hashlib.sha256(data).hexdigest()
+        for name, body in (extra_libs or {}).items():
+            self.lib(name).write_bytes(body)
+            os.chmod(self.lib(name), 0o644)
+            doc["files"][f"lib/lean/{name}"] = hashlib.sha256(body).hexdigest()
+        self.pin.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def test_elf_runpath_resolution_clean_synthetic_binary_reaches_exec_gate(self) -> None:
+        # Positive control: a pinned ELF bin/lean whose DT_NEEDED sonames resolve
+        # (via its DT_RUNPATH) only to pinned files -- or fall through to the
+        # system because they are absent -- passes the RUNPATH check and reaches
+        # the `--version` gate. e_machine = EM_BPF, so no host can execute it.
+        self.repin_bin_lean(make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "${ORIGIN}/../lib/lean"], machine=247))
+        self.assertRejected(
+            self.verify,
+            "cannot execute `bin/lean --version`",
+            absent=("RUNPATH", "DT_", "cannot parse", "SHA-256 mismatch", "skipped `bin/lean --version`"),
+        )
+
+    def test_elf_runpath_escape_unsupported_token_path_needed_and_generic_shadow_rejected(self) -> None:
+        outside = self.tmp / "evil-lib"
+        outside.mkdir()
+        # A non-Lean, non-glibc soname: only the generic DT_NEEDED x DT_RUNPATH
+        # resolution can catch it (neither static name list mentions libz).
+        planted = self.tc / "lib" / "libz.so.1"
+        planted.write_bytes(b"\x7fELF-trojan-zlib")
+        os.chmod(planted, 0o644)
+        cases = (
+            (["libleanshared.so"], [str(outside)], f"bin/lean: DT_RUNPATH entry {str(outside)!r} resolves outside the toolchain root"),
+            (["libleanshared.so"], ["$ORIGIN/../.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/../..' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["$LIB/x"], "bin/lean: unsupported DT_RUNPATH entry '$LIB/x'"),
+            (["libleanshared.so"], ["lib/lean"], "bin/lean: unsupported DT_RUNPATH entry 'lib/lean'"),
+            (["/tmp/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '/tmp/evil.so' is a path"),
+            (["libz.so.1"], ["$ORIGIN/../lib"], "RUNPATH shadowing: bin/lean needs 'libz.so.1', which ld.so can resolve to the unpinned toolchain file lib/libz.so.1"),
+        )
+        for needed, runpath, needle in cases:
+            with self.subTest(needed=needed, runpath=runpath):
+                self.repin_bin_lean(make_elf64(needed, runpath))
+                self.assertRejected(self.verify, needle, "skipped `bin/lean --version`", absent=("SHA-256 mismatch",))
+        # DT_RPATH (15) is resolved exactly like DT_RUNPATH here.
+        self.repin_bin_lean(make_elf64(["libz.so.1"], ["$ORIGIN/../lib"], rpath_tag=15))
+        self.assertRejected(self.verify, "which ld.so can resolve to the unpinned toolchain file lib/libz.so.1", absent=("SHA-256 mismatch",))
+
+    def test_unparseable_elf_in_pinned_set_fails_closed(self) -> None:
+        self.repin_bin_lean(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], unterminated=True))
+        self.assertRejected(self.verify, "cannot parse the ELF dynamic section of bin/lean: unterminated", "skipped `bin/lean --version`", absent=("SHA-256 mismatch",))
+
+    def test_runpath_shadow_hidden_behind_ignored_dt_rpath_rejected(self) -> None:
+        # ld.so ignores DT_RPATH when DT_RUNPATH is present. A first-hit scan in
+        # dynamic-section order would see DT_RPATH's lib/lean/libz.so.1 (pinned)
+        # first and stop, while ld.so actually loads the planted lib/libz.so.1.
+        planted = self.tc / "lib" / "libz.so.1"
+        planted.write_bytes(b"\x7fELF-trojan-zlib")
+        os.chmod(planted, 0o644)
+        self.repin_bin_lean(
+            make_elf64(["libz.so.1"], ["$ORIGIN/../lib"], rpath=["$ORIGIN/../lib/lean"]),
+            extra_libs={"libz.so.1": b"pinned-zlib"},
+        )
+        self.assertEqual(V.elf_dynamic_info(self.tc / "bin" / "lean"), (("libz.so.1",), ("$ORIGIN/../lib/lean", "$ORIGIN/../lib")))
+        self.assertRejected(
+            self.verify,
+            "RUNPATH shadowing: bin/lean needs 'libz.so.1', which ld.so can resolve to the unpinned toolchain file lib/libz.so.1",
+            "skipped `bin/lean --version`",
+            absent=("SHA-256 mismatch", "unpinned toolchain file added", "lib/lean/libz.so.1,"),
+        )
+        planted.unlink()
+        # Control: the same pinned set without the planted file passes the RUNPATH
+        # check and reaches the exec gate (EM_BPF, so it cannot actually run).
+        self.assertRejected(self.verify, "cannot execute `bin/lean --version`", absent=("RUNPATH", "SHA-256 mismatch", "skipped `bin/lean --version`"))
+
+
+class ElfDynamicParserTests(TempCase):
+    def put(self, data: bytes, name: str = "obj.so") -> Path:
+        path = self.tmp / name
+        path.write_bytes(data)
+        return path
+
+    def test_synthetic_elf_needed_runpath_and_rpath_parsed(self) -> None:
+        self.assertEqual(
+            V.elf_dynamic_info(self.put(make_elf64(["libfoo.so", "libc.so.6"], ["$ORIGIN/../lib", "${ORIGIN}"]))),
+            (("libfoo.so", "libc.so.6"), ("$ORIGIN/../lib", "${ORIGIN}")),
+        )
+        self.assertEqual(V.elf_dynamic_info(self.put(make_elf64(["libbar.so"], ["/opt/a", "/opt/b"], rpath_tag=15))), (("libbar.so",), ("/opt/a", "/opt/b")))
+        self.assertEqual(V.elf_dynamic_info(self.put(make_elf64([], []))), ((), ()))
+        self.assertIsNone(V.elf_dynamic_info(self.put(b"#!/bin/sh\necho hi\n", "script")))
+
+    def test_malformed_or_unsupported_elf_raises(self) -> None:
+        good = make_elf64(["libfoo.so"], ["$ORIGIN"])
+        cases = (
+            ("DT_STRTAB outside every PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], strtab_outside_load=True), "not inside a PT_LOAD"),
+            ("unterminated dynamic string", make_elf64(["libfoo.so"], ["$ORIGIN"], unterminated=True), "unterminated"),
+            ("DT_STRSZ overruns PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], strsz_overrun=True), "overruns"),
+            ("DT_NEEDED without DT_STRTAB", make_elf64(["libfoo.so"], ["$ORIGIN"], omit_strtab=True), "without DT_STRTAB"),
+            ("ELFCLASS32", good[:4] + b"\x01" + good[5:], "unsupported ELF object"),
+            ("big-endian", good[:5] + b"\x02" + good[6:], "unsupported ELF object"),
+            ("truncated ELF header", good[:40], "unsupported ELF object"),
+            ("truncated program headers", good[: 64 + 30], "truncated ELF program header table"),
+        )
+        for label, data, needle in cases:
+            with self.subTest(label):
+                with self.assertRaisesRegex(ValueError, needle):
+                    V.elf_dynamic_info(self.put(data))
 
 
 # ---------------------------------------------------------------------------

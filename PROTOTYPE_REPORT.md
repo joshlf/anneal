@@ -8,7 +8,7 @@
 > `lean-miri/**`, `minirust/**`, `lakefile.toml`, or `theory/Anneal.lean` is modified, and no
 > `vendor/lean-miri/` is created.
 
-Status: **round B3** (fifth critique-and-fix pass of the N = 4 loop, after A2). Recommendation (§6):
+Status: **round A3** (sixth critique-and-fix pass of the N = 4 loop, after B3). Recommendation (§6):
 **CONDITIONAL GO**.
 
 ## 1. Architecture
@@ -39,23 +39,23 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 | 9 | Tree Borrows theorems. |
 | 10 | The wiring claim (`miriMoveDeinitWiring_proto`) and Part 10b live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` bridge theorems (`trusted_evalOperand_root_move_deinits`, `trusted_evalOperand_projected_move_eq_copy`). |
 | 10c | A1 hardening: pointer constants fail closed (`constSem_ptr_fails_closed`, `canary_const_ptr_fails_closed`), the universal assignment Tree Borrows theorem with its non-vacuity witness, and destination-first assignment evaluation (`DestPlace`, `resolveDest`, `writeDest`). |
-| 10d | Step-boundary & whole-step latch invariants (`twoPhaseReadOperand_true_latch_clear`, `twoPhaseAssignUse_true_latch_clear`, and B3's `refStepCore_true_preserves_latch_clear` and `annealStep_preserves_latch_clear`). |
-| 11 | 88 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
+| 10d | Step-boundary & whole-step latch invariants (`twoPhaseReadOperand_true_latch_clear`, `twoPhaseAssignUse_true_latch_clear`, and B3's `refStepCore_true_preserves_latch_clear` and `annealStep_preserves_latch_clear`). A3 closes them under entry states and run loops, so the latch is clear in every **reachable** state: `annealInit_latch_clear`, `refInit_latch_clear`, `annealRun_preserves_latch_clear`, `refStep_true_preserves_latch_clear`, `refRunFuel_true_preserves_latch_clear`, `annealReachable_latch_clear`, `refReachable_latch_clear`. The non-vacuity witness `reachable_latch_clear_nonvacuous` reaches the `D5` pre-move state in both machines. There, phase 1 (`refEvalOperand true`) *sets* the latch, and the full step clears it. |
+| 11 | 93 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
 | 12 | A `run_cmd` audit of **every** declaration in the module. Its axioms must be ⊆ {propext, Quot.sound}; otherwise elaboration fails. This was checked with a planted `Classical.choice` probe. |
 
-### 1.2 Inventory (B3)
+### 1.2 Inventory (A3)
 
 | Metric | Value |
 |---|---|
-| Lean LOC | 5,729 |
-| `theorem`s | 205 |
-| `def`/`abbrev`s | 269 |
-| `#guard_msgs` axiom guards | 88, all `[propext]` or `[propext, Quot.sound]` |
+| Lean LOC | 5,878 |
+| `theorem`s | 213 |
+| `def`/`abbrev`s | 270 |
+| `#guard_msgs` axiom guards | 93 (58 `[propext]`, 35 `[propext, Quot.sound]`) |
 | `sorry` / `admit` / `axiom` / `native_decide` / `partial` / `unsafe` | 0 |
 | `Classical.choice` anywhere in the module | 0 (enforced by the Part 12 audit) |
-| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~39 s wall |
-| Receipt 3 (`unittest`) | 59 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~75 s wall |
-| Verifier LOC / test LOC / tests | 1,885 / 1,269 / 59 (B3 rejects `DT_RUNPATH` `$ORIGIN/../lib` shadowing of `lib/lean/libleanshared*.so` and enforces `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`) |
+| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~34 s wall |
+| Receipt 3 (`unittest`) | 68 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~86 s wall |
+| Verifier LOC / test LOC / tests | 2,045 / 1,499 / 68. B3 rejects `DT_RUNPATH` `$ORIGIN/../lib` shadowing of `lib/lean/libleanshared*.so` and enforces `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`. A3 adds ELF `DT_NEEDED` × `DT_RUNPATH`/`DT_RPATH` resolution for every pinned ELF object, plus a glibc-soname denylist. |
 
 ### 1.3 Headline theorems
 
@@ -255,6 +255,30 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
       `_run_version` if any `libleanshared*`, `libInit_shared*`, or `libLake_shared*` file is present
       (`test_runpath_shadowing_in_parent_lib_dir_rejected_and_not_executed`), and requires all
       `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`.
+    * **(A3) B3's name-list scan was incomplete. A3 replaces it with ELF-derived `DT_NEEDED` ×
+      `DT_RUNPATH` resolution.**
+      * The gap: `bin/lean` and `bin/lake` also `DT_NEEDED` the glibc sonames `libc.so.6`,
+        `libm.so.6`, `libpthread.so.0` and `libdl.so.2`. `lib/lean/libleanshared.so` additionally
+        needs `librt.so.1` and `ld-linux-x86-64.so.2`. ld.so searches `DT_RUNPATH` *before* the
+        system paths. A planted `toolchain/lib/libm.so.6` (or `lib/lean/libpthread.so.0`) is
+        therefore loaded into `bin/lean --version` and into every Lean process, yet it passed B3's
+        `libleanshared*|libInit_shared*|libLake_shared*` regex.
+      * A3 adds a stdlib ELF64 parser, `elf_dynamic_info`. It walks program headers →
+        `PT_DYNAMIC` → `DT_NEEDED` / `DT_RUNPATH` / `DT_RPATH`, and reads only the referenced
+        strings, because the `.dynstr` of `libleanshared.so` is ~24 MiB.
+      * A3 adds `_check_runpath_shadowing`, which over-approximates ld.so:
+        * Every `RUNPATH`/`RPATH` directory of every pinned ELF object must resolve inside the
+          toolchain root, and only `$ORIGIN` is expanded.
+        * Every such directory is searched for every `DT_NEEDED` soname of every pinned object.
+        * Any existing unpinned entry is rejected before anything is executed.
+        * The result does not depend on entry order, on `DT_RUNPATH`-over-`DT_RPATH` precedence, or
+          on `DT_RPATH` inheritance. `test_runpath_shadow_hidden_behind_ignored_dt_rpath_rejected`
+          defeats a first-hit scan.
+      * Malformed or unsupported ELF objects fail closed.
+      * A static glibc-soname denylist for `lib/` and `lib/lean/` is kept as defense in depth.
+      * Tests run on byte-for-byte copies of the real v4.34.1 binaries
+        (`test_live_elf_runpath_shadowing_of_real_binaries_rejected`) and on synthetic ELF images.
+        The synthetic images use `EM_BPF`, so they can never be executed.
 11. **(B2, corrected in A2, extended in B3) `Call.lean` is a 7th file the deinit patch must touch.**
     * B2 found that `Call.evalFnCallArgumentAt` (`lean-miri/vendor/Miri/Interpreter/Call.lean:164-175`)
       routes `.Move place` through `evalPlace` + `placeToOp` / `forceAllocation`, bypassing the
@@ -318,15 +342,20 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
   every entry in `TOOLCHAIN_REQUIRED_FILES`) *before* executing `bin/lean --version` / `bin/lake
   --version`, checks ancestor directories for `.elan` overrides, and rejects `lib/libleanshared*.so`
   in `toolchain_dir/lib` that would shadow `lib/lean/libleanshared*.so` via `DT_RUNPATH`
-  `$ORIGIN/../lib:$ORIGIN/../lib/lean` (B3).
-* **Tests.** There are 56 unit tests: a live end-to-end run and every tamper vector of the brief
-  (including B2 pre-execution digest verification and B3 `$ORIGIN/../lib` `DT_RUNPATH` shadowing).
+  `$ORIGIN/../lib:$ORIGIN/../lib/lean` (B3). (A3) It parses each pinned ELF object's
+  `DT_NEEDED` / `DT_RUNPATH` / `DT_RPATH` (`elf_dynamic_info`). It rejects any unpinned file
+  that ld.so could load from a `RUNPATH`/`RPATH` directory, and any directory that resolves outside
+  the toolchain root (`_check_runpath_shadowing`). It also rejects glibc sonames planted in `lib/`
+  or `lib/lean/`.
+* **Tests.** There are 68 unit tests. They cover a live end-to-end run and every tamper vector of
+  the brief. They also cover B2 pre-execution digest verification, B3 `$ORIGIN/../lib` shadowing,
+  and A3 ELF-derived `RUNPATH` resolution on real and synthetic ELF images.
   The Lean hygiene tests check for forbidden tokens, that every `#print axioms` is guarded with an
   allowed axiom list, and that receipt 1 compiles.
 
-## 5. Receipts (B3)
+## 5. Receipts (A3)
 
-See the B3 board post for the exact outputs of the four receipt commands. All four exit 0, and
+See the A3 board post for the exact outputs of the four receipt commands. All four exit 0, and
 `git diff --name-only 8e1523cb..HEAD` lists only the four prototype files.
 
 ## 6. Recommendation and Track A integration plan

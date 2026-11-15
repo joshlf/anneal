@@ -5352,6 +5352,131 @@ theorem annealStep_preserves_latch_clear (p : V2026Prog) (st st' : PState)
   rw [← anneal_corresponds_to_miri_proto] at h
   exact refStepCore_true_preserves_latch_clear p st st' h0 h
 
+/-! ### Reachable-state latch invariant (entry states + bounded runs)
+
+B3's whole-step invariant is relative to a clear incoming latch; closing it
+under the entry states and the run loops makes it a property of **every
+reachable** `M_anneal` / `M_ref` statement-boundary state: `pendingMoveDeinit`
+latched by phase 1 (`evalOperand`) is always consumed by phase 2
+(`readImmediate` / `copyRuntimePlaceNoValidate`) inside the same step. -/
+
+theorem annealInit_latch_clear (p : V2026Prog) (args : List Bytes) (st : PState)
+    (h : annealInit p args = .ok st) : st.pendingMoveDeinit = false := by
+  unfold annealInit at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · cases h; rfl
+
+theorem refInit_latch_clear (rp : RefProg) (args : List Bytes) (st : PState)
+    (h : refInit rp args = .ok st) : st.pendingMoveDeinit = false := by
+  unfold refInit at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · cases h; rfl
+
+theorem annealRun_preserves_latch_clear (p : V2026Prog) :
+    ∀ (n : Nat) (st st' : PState), st.pendingMoveDeinit = false →
+      annealRun p n st = .running st' → st'.pendingMoveDeinit = false
+  | 0, st, st', h0, h => by
+    rw [annealRun.eq_1] at h
+    cases h; exact h0
+  | n + 1, st, st', h0, h => by
+    rw [annealRun.eq_2] at h
+    cases hs : annealStep p st with
+    | running st₁ =>
+      rw [hs] at h
+      exact annealRun_preserves_latch_clear p n st₁ st'
+        (annealStep_preserves_latch_clear p st st₁ h0 hs) h
+    | returned b => rw [hs] at h; cases h
+    | panicked => rw [hs] at h; cases h
+    | fault f => rw [hs] at h; cases h
+
+theorem refStep_true_preserves_latch_clear (p : V2026Prog) (rs rs' : RefState)
+    (h0 : rs.core.pendingMoveDeinit = false)
+    (h : refStep true (encodeProg p) rs = .running rs') :
+    rs'.core.pendingMoveDeinit = false := by
+  unfold refStep at h
+  cases hb : Nat.blt rs.stepsExecuted rs.maxSteps with
+  | false => rw [hb] at h; cases h
+  | true =>
+    rw [hb] at h
+    cases hc : refStepCore true (encodeProg p) rs.core with
+    | running st' =>
+      rw [hc] at h; cases h
+      exact refStepCore_true_preserves_latch_clear p rs.core st' h0 hc
+    | returned b => rw [hc] at h; cases h
+    | panicked => rw [hc] at h; cases h
+    | fault f =>
+      rw [hc] at h
+      cases f with
+      | ub why => cases h
+      | unsupported => cases h
+
+theorem refRunFuel_true_preserves_latch_clear (p : V2026Prog) :
+    ∀ (n : Nat) (rs rs' : RefState), rs.core.pendingMoveDeinit = false →
+      refRunFuel true (encodeProg p) n rs = .running rs' → rs'.core.pendingMoveDeinit = false
+  | 0, rs, rs', h0, h => by
+    rw [refRunFuel.eq_1] at h
+    cases h; exact h0
+  | n + 1, rs, rs', h0, h => by
+    rw [refRunFuel.eq_2] at h
+    cases hs : refStep true (encodeProg p) rs with
+    | running rs₁ =>
+      rw [hs] at h
+      exact refRunFuel_true_preserves_latch_clear p n rs₁ rs'
+        (refStep_true_preserves_latch_clear p rs rs₁ h0 hs) h
+    | returned b => rw [hs] at h; cases h
+    | panicked => rw [hs] at h; cases h
+    | ub why => rw [hs] at h; cases h
+    | blocked => rw [hs] at h; cases h
+    | exhaustedStepLimit => rw [hs] at h; cases h
+
+/-- **Reachable-state latch invariant (`M_anneal`)**: every `.running` state of a
+bounded run from an entry state has `pendingMoveDeinit = false`. -/
+theorem annealReachable_latch_clear (p : V2026Prog) (args : List Bytes) (n : Nat)
+    (st₀ st : PState) (hi : annealInit p args = .ok st₀)
+    (hr : annealRun p n st₀ = .running st) : st.pendingMoveDeinit = false :=
+  annealRun_preserves_latch_clear p n st₀ st (annealInit_latch_clear p args st₀ hi) hr
+
+/-- **Reachable-state latch invariant (`M_ref`, `deinitMoves = true`)**: every
+`.running` state of a bounded `refRunFuel` from an entry state of
+`encodeProg p` (any step budget) has `pendingMoveDeinit = false`. -/
+theorem refReachable_latch_clear (p : V2026Prog) (args : List Bytes) (n maxSteps : Nat)
+    (st₀ : PState) (rs : RefState) (hi : refInit (encodeProg p) args = .ok st₀)
+    (hr : refRunFuel true (encodeProg p) n ⟨st₀, 0, maxSteps⟩ = .running rs) :
+    rs.core.pendingMoveDeinit = false :=
+  refRunFuel_true_preserves_latch_clear p n ⟨st₀, 0, maxSteps⟩ rs
+    (refInit_latch_clear (encodeProg p) args st₀ hi) hr
+
+/-- Executable non-vacuity check for the reachable-state latch invariant on the
+`D5` indirect move `_4 = move (*_2)`: (1) the pre-move state is reachable in both
+machines (`annealInit` + 3 `annealRun` steps, and `refInit (encodeProg p)` + 3
+`refRunFuel` steps reach the same state with a clear latch); (2) phase 1 of
+`M_ref` (`refEvalOperand true`) **sets** the latch mid-step, so the invariant is
+not a constant (a mutant step that stopped after phase 1 would leak it); and
+(3) the full `M_ref` step consumes it again. -/
+def reachableLatchWitness : Bool :=
+  let p := d5Prog (asg (loc 4) (.use (.move (drf 2)))) (.use (.copy (loc 4)))
+  match d5PreMoveState, refInit (encodeProg p) [] with
+  | some st, .ok r₀ =>
+    match refRunFuel true (encodeProg p) 3 ⟨r₀, 0, 100⟩, refEvalOperand true 64 st d5MoveOp,
+        refStepCore true (encodeProg p) st with
+    | .running rs, .ok (.indirect _, _, stMid), .running st' =>
+      decide (rs.core.frames.length = st.frames.length) &&
+        decide (rs.core.heap.length = st.heap.length) &&
+        decide (rs.core.borrows.length = st.borrows.length) && decide (rs.stepsExecuted = 3) &&
+        !rs.core.pendingMoveDeinit && !st.pendingMoveDeinit && stMid.pendingMoveDeinit &&
+        !st'.pendingMoveDeinit
+    | _, _, _ => false
+  | _, _ => false
+
+theorem reachable_latch_clear_nonvacuous : reachableLatchWitness = true := by
+  decide
+
 /-! ## Part 11 — Axiom guards (kernel axioms ⊆ {propext, Quot.sound}) -/
 
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.decodeType_encodeType' depends on axioms: [propext, Quot.sound] -/
@@ -5705,6 +5830,26 @@ theorem annealStep_preserves_latch_clear (p : V2026Prog) (st st' : PState)
 /-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.annealStep_preserves_latch_clear' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms annealStep_preserves_latch_clear
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.annealInit_latch_clear' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms annealInit_latch_clear
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.refInit_latch_clear' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms refInit_latch_clear
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.annealReachable_latch_clear' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms annealReachable_latch_clear
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.refReachable_latch_clear' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms refReachable_latch_clear
+
+/-- info: 'Anneal.LeanMiriDeinitAndCodecPrototype.reachable_latch_clear_nonvacuous' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachable_latch_clear_nonvacuous
 
 /-! ## Part 12 — Whole-environment audit
 

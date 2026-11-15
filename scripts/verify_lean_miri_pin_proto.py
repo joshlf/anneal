@@ -118,6 +118,7 @@ import platform  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
 import stat  # noqa: E402
+import struct  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
@@ -236,6 +237,14 @@ _REPOSITORY_RE = re.compile(r"\Ahttps://[A-Za-z0-9.\-]+/[A-Za-z0-9._\-/]+\Z")
 _SHARED_OBJECT_RE = re.compile(r"\.so(\.[0-9]+)*\Z")
 _LIBLEANSHARED_RE = re.compile(r"\Alibleanshared.*\.so(\.[0-9]+)*\Z")
 _SHADOW_LEAN_LIB_RE = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(\.[0-9]+)*\Z")
+#: glibc / loader sonames that `bin/lean`, `bin/lake` and `lib/lean/*.so` list in
+#: DT_NEEDED. ld.so searches DT_RUNPATH (`$ORIGIN/../lib`, `$ORIGIN/../lib/lean`,
+#: `$ORIGIN/..`, `$ORIGIN`) *before* the system default directories, so any of
+#: these planted in a toolchain RUNPATH directory is loaded into every Lean
+#: process. (`lib/glibc/` holds link-time stubs and is not on any RUNPATH.)
+_SYSTEM_SONAME_RE = re.compile(
+    r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(\.[0-9]+)*)\Z"
+)
 
 #: Planted build-artifact detection inside `lean-miri/vendor/`.
 _ARTIFACT_SUFFIXES = (
@@ -1430,6 +1439,149 @@ def _run_version(binary: Path, label: str, timeout: float, c: _Collector) -> Opt
     return out.splitlines()[0]
 
 
+def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
+    """Return `(DT_NEEDED sonames, DT_RUNPATH + DT_RPATH entries)` of a 64-bit
+    little-endian ELF object, or `None` if `path` has no ELF magic at all (e.g.
+    a shell script). Malformed or unsupported ELF objects raise `ValueError`.
+
+    Only the ELF header, program headers, the PT_DYNAMIC segment and the
+    individual NUL-terminated dynamic strings that are referenced are read:
+    the dynamic string table of `libleanshared.so` alone is ~24 MiB (every
+    exported symbol name), so it is never slurped."""
+    with open(path, "rb") as fh:
+        ehdr = fh.read(64)
+        if ehdr[:4] != b"\x7fELF":
+            return None
+        if len(ehdr) < 64 or ehdr[4] != 2 or ehdr[5] != 1:
+            # Fail closed: an ELF object we cannot parse is never silently
+            # exempted from the DT_RUNPATH shadowing check.
+            raise ValueError("unsupported ELF object (only complete ELF64 little-endian headers are parsed)")
+        (e_phoff,) = struct.unpack_from("<Q", ehdr, 0x20)
+        e_phentsize, e_phnum = struct.unpack_from("<HH", ehdr, 0x36)
+        if e_phentsize < 56 or e_phnum > 4096:
+            raise ValueError("malformed ELF program header table")
+        fh.seek(e_phoff)
+        phdrs = fh.read(e_phentsize * e_phnum)
+        if len(phdrs) < e_phentsize * e_phnum:
+            raise ValueError("truncated ELF program header table")
+        loads: List[Tuple[int, int, int]] = []
+        dynamic: Optional[Tuple[int, int]] = None
+        for i in range(e_phnum):
+            p_type, _flags, p_offset, p_vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
+                "<IIQQQQQQ", phdrs, i * e_phentsize
+            )
+            if p_type == 1:  # PT_LOAD
+                loads.append((p_vaddr, p_offset, p_filesz))
+            elif p_type == 2:  # PT_DYNAMIC
+                if dynamic is not None:
+                    raise ValueError("more than one PT_DYNAMIC segment")
+                dynamic = (p_offset, p_filesz)
+        if dynamic is None:
+            return ((), ())
+        if dynamic[1] > (1 << 20):
+            raise ValueError("oversized PT_DYNAMIC segment")
+        fh.seek(dynamic[0])
+        raw = fh.read(dynamic[1])
+        if len(raw) < dynamic[1]:
+            raise ValueError("truncated PT_DYNAMIC segment")
+        entries: List[Tuple[int, int]] = []
+        strtab = strsz = None
+        for j in range(0, len(raw) - 15, 16):
+            tag, val = struct.unpack_from("<qQ", raw, j)
+            if tag == 0:  # DT_NULL
+                break
+            entries.append((tag, val))
+            if tag == 5:  # DT_STRTAB (virtual address)
+                strtab = val
+            elif tag == 10:  # DT_STRSZ
+                strsz = val
+        if strtab is None or strsz is None:
+            if any(t in (1, 15, 29) for t, _ in entries):
+                raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
+            return ((), ())
+        file_off = None
+        for vaddr, offset, filesz in loads:
+            if vaddr <= strtab < vaddr + filesz:
+                if strtab + strsz > vaddr + filesz:
+                    raise ValueError("DT_STRTAB/DT_STRSZ overruns its PT_LOAD segment")
+                file_off = strtab - vaddr + offset
+                break
+        if file_off is None:
+            raise ValueError("DT_STRTAB is not inside a PT_LOAD segment")
+
+        def string_at(index: int) -> str:
+            if index >= strsz:
+                raise ValueError("dynamic string index out of DT_STRSZ bounds")
+            fh.seek(file_off + index)
+            chunk = fh.read(min(4096, strsz - index))
+            end = chunk.find(b"\0")
+            if end < 0:
+                raise ValueError("unterminated (or > 4 KiB) dynamic string")
+            return chunk[:end].decode("utf-8", "surrogateescape")
+
+        needed = tuple(string_at(v) for t, v in entries if t == 1)  # DT_NEEDED
+        runpath: List[str] = []
+        for t, v in entries:
+            if t in (15, 29):  # DT_RPATH, DT_RUNPATH
+                runpath.extend(e for e in string_at(v).split(":") if e)
+    return needed, tuple(runpath)
+
+
+def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequence[str], files: Mapping[str, str], c: _Collector) -> None:
+    """Reject any unpinned toolchain file that ld.so could load, via a
+    DT_RUNPATH/DT_RPATH directory, for a DT_NEEDED soname of a pinned ELF object.
+
+    ld.so searches an object's DT_RUNPATH (or, when it has none, the DT_RPATH
+    chain of it *and of every object that loaded it*) before the system default
+    paths, so e.g. bin/lean's `$ORIGIN/../lib` makes `lib/libm.so.6` win over
+    `/lib/x86_64-linux-gnu/libm.so.6`. This check over-approximates the loader:
+    every RUNPATH/RPATH directory of every checked object is searched for every
+    DT_NEEDED soname of every checked object, so the verdict is independent of
+    entry order, of DT_RUNPATH-over-DT_RPATH precedence and of DT_RPATH
+    inheritance; every existing entry found must be a pinned/verified file. All
+    RUNPATH/RPATH directories must resolve inside the toolchain root."""
+    needs: List[Tuple[str, str]] = []
+    search_dirs: List[Path] = []
+    for rel in elf_rels:
+        path = toolchain_dir / rel
+        try:
+            info = elf_dynamic_info(path)
+        except (OSError, ValueError, struct.error) as exc:
+            c.err("toolchain", f"cannot parse the ELF dynamic section of {rel}: {exc}")
+            continue
+        if info is None:
+            continue
+        needed, runpath = info
+        origin = str(path.parent)
+        for entry in runpath:
+            expanded = entry.replace("${ORIGIN}", origin).replace("$ORIGIN", origin)
+            if "$" in expanded or not os.path.isabs(expanded):
+                c.err("toolchain", f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
+                continue
+            real = os.path.realpath(expanded)
+            if real != real_root and not real.startswith(real_root + os.sep):
+                c.err("toolchain", f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
+                continue
+            directory = Path(os.path.normpath(expanded))
+            if directory not in search_dirs:
+                search_dirs.append(directory)
+        for soname in needed:
+            if "/" in soname or soname in ("", ".", ".."):
+                c.err("toolchain", f"{rel}: DT_NEEDED entry {soname!r} is a path")
+                continue
+            needs.append((rel, soname))
+    for rel, soname in needs:
+        for directory in search_dirs:
+            hit = directory / soname
+            if os.path.lexists(hit):
+                hit_rel = os.path.relpath(hit, toolchain_dir).replace(os.sep, "/")
+                if hit_rel not in files:
+                    c.err(
+                        "toolchain",
+                        f"RUNPATH shadowing: {rel} needs {soname!r}, which ld.so can resolve to the unpinned toolchain file {hit_rel}",
+                    )
+
+
 def _check_toolchain_path(root: Path, real_root: str, rel: str, *, want_dir: bool, c: _Collector) -> Optional[os.stat_result]:
     """lstat every component of `rel` below `root`; reject symlinks and bad
     modes. Returns the final `lstat` only when every component is clean."""
@@ -1555,6 +1707,8 @@ def _verify_toolchain_impl(
     for n in parent_lib_names:
         if _SHADOW_LEAN_LIB_RE.match(n):
             c.err("toolchain", f"RUNPATH shadowing library in lib/ (shadows lib/lean/): lib/{n}")
+        if _SYSTEM_SONAME_RE.match(n):
+            c.err("toolchain", f"system soname planted in a toolchain RUNPATH directory: lib/{n}")
     candidates = ["bin/lean", "bin/lake"]
     lib_dir = toolchain_dir / "lib" / "lean"
     try:
@@ -1576,6 +1730,12 @@ def _verify_toolchain_impl(
         except (OSError, ValueError) as exc:
             c.err("toolchain", f"cannot hash {rel}: {exc}")
     libleanshared = tuple(n for n in lib_names if _LIBLEANSHARED_RE.match(n))
+    for n in lib_names:
+        if _SYSTEM_SONAME_RE.match(n):
+            c.err("toolchain", f"system soname planted in a toolchain RUNPATH directory: lib/lean/{n}")
+    # ld.so resolution of every DT_NEEDED soname through DT_RUNPATH must land on
+    # a verified file (checked before anything in the toolchain is executed).
+    _check_runpath_shadowing(toolchain_dir, real_root, candidates, files, c)
 
     pin_status = "not-requested"
     active_pin: Optional[Mapping[str, Any]] = None
