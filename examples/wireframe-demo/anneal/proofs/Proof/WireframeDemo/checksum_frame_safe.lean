@@ -16,7 +16,6 @@ open Trusted.VerificationResult
 open Anneal.Scalars
 open Anneal.ITreeWP
 open Anneal.MirFuelFree
-open Anneal.MirLoops
 open Anneal.PureMirExec
 open Anneal.SepLogicLenses
 open Anneal.FunctionalTranslation
@@ -26,8 +25,9 @@ open Specs.WireframeDemo.checksum_frame_safe
 
 /-!
 Stateful loop proof for `wireframe_demo::checksum_frame_safe`. The
-`while i < 4` loop is proved with `mirNoCallWpConverges_forRangeUp` over the
-invariant `checksumLoopInv`; the entry segment (`bb0` to the loop header
+`while i < 4` loop is proved with `mirNoCallWpConverges_forRangeUp_inv` over
+`checksumLoopInv` and `PureMirExec.forRangeUp_induction`
+(`forRangeUp_checksumWordStep_eq`); the entry segment (`bb0` to the loop header
 `bb1`), every iteration (`bb1` back to `bb1`), and the exit (`bb1` to the
 return) are each evaluated by `runCfgToBlock` with target `bb1`, so the proof
 states no step counts. `StorageLive` consults the active function-entry
@@ -103,6 +103,16 @@ def checksumWordStep (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) {hi : Nat}
     (i : Nat) (_ : 0 ≤ i) (_ : i < hi) (acc : Nat) : Nat :=
   acc + checksumWordAt b0 b1 b2 b3 b4 b5 b6 b7 i
 
+private theorem checksumWordStep_le {b0 b1 b2 b3 b4 b5 b6 b7 i a : Nat}
+    (hb0 : b0 < 256) (hb1 : b1 < 256) (hb2 : b2 < 256) (hb3 : b3 < 256)
+    (hb4 : b4 < 256) (hb5 : b5 < 256) (hb6 : b6 < 256) (hb7 : b7 < 256)
+    {hi : Nat} {hlo : 0 ≤ i} {hlt : i < hi} (ha : a ≤ 65535 * i) :
+    checksumWordStep b0 b1 b2 b3 b4 b5 b6 b7 i hlo hlt a ≤ 65535 * (i + 1) := by
+  have hw : checksumWordAt b0 b1 b2 b3 b4 b5 b6 b7 i ≤ 65535 := by
+    unfold checksumWordAt; repeat' split
+    all_goals omega
+  unfold checksumWordStep; omega
+
 /-- Closed-form accumulator after `i` loop iterations. -/
 def checksumPrefix (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) : Nat → Nat
   | 0 => 0
@@ -110,37 +120,18 @@ def checksumPrefix (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) : Nat → Nat
     checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 i +
       checksumWordAt b0 b1 b2 b3 b4 b5 b6 b7 i
 
-private theorem checksumPrefix_le {b0 b1 b2 b3 b4 b5 b6 b7 : Nat}
-    (hb0 : b0 < 256) (hb1 : b1 < 256) (hb2 : b2 < 256) (hb3 : b3 < 256)
-    (hb4 : b4 < 256) (hb5 : b5 < 256) (hb6 : b6 < 256) (hb7 : b7 < 256) :
-    ∀ i, checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 i ≤ i * 65535
-  | 0 => Nat.le_refl 0
-  | i + 1 => by
-    have ih := checksumPrefix_le hb0 hb1 hb2 hb3 hb4 hb5 hb6 hb7 i
-    have hw : checksumWordAt b0 b1 b2 b3 b4 b5 b6 b7 i ≤ 65535 := by
-      unfold checksumWordAt
-      repeat' split
-      all_goals omega
-    show checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 i +
-      checksumWordAt b0 b1 b2 b3 b4 b5 b6 b7 i ≤ (i + 1) * 65535
-    omega
-
-private theorem checksumPrefix_four (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
-    checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 4 =
+/-- The MIR loop's accumulator is the functional `Anneal.PureMirExec.forRangeUp` fold,
+discharged structurally via `Anneal.PureMirExec.forRangeUp_induction`. -/
+theorem forRangeUp_checksumWordStep_eq (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
+    Anneal.PureMirExec.forRangeUp 0 4 0 (checksumWordStep b0 b1 b2 b3 b4 b5 b6 b7) =
       bigEndianWordSum4 b0 b1 b2 b3 b4 b5 b6 b7 := by
+  rw [Anneal.PureMirExec.forRangeUp_induction 0 4 0 _
+    (fun i a => a = checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 i)
+    (Nat.zero_le 4) rfl (fun _ _ _ _ h => by rw [h]; rfl)]
   show 0 + (b0 * 256 + b1) + (b2 * 256 + b3) + (b4 * 256 + b5) +
     (b6 * 256 + b7) = _
   unfold bigEndianWordSum4
-  omega
-
-/-- The MIR loop's accumulator is the functional `forRangeUp` fold. -/
-theorem forRangeUp_checksumWordStep_eq (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
-    forRangeUp 0 4 0 (checksumWordStep b0 b1 b2 b3 b4 b5 b6 b7) =
-      bigEndianWordSum4 b0 b1 b2 b3 b4 b5 b6 b7 := by
-  rw [forRangeUp_induction 0 4 0 _
-    (fun i a => a = checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 i)
-    (by decide) rfl (fun _ _ _ _ h => by rw [h]; rfl)]
-  exact checksumPrefix_four b0 b1 b2 b3 b4 b5 b6 b7
+  rw [Nat.zero_add]
 
 /-- Machine state at loop header `bb1` with index `_2 = i` and accumulator
 `_3 = a`; loop temporaries are uninitialised before the first iteration. -/
@@ -157,11 +148,9 @@ def checksumLoopState (mem : Memory) (i a : Nat)
         .uninit, t v20, t v21, .uninit, .uninit, .uninit, t v25, t v26, t v27] }
     memory := mem }
 
-/-- Loop invariant at `bb1` for `mirNoCallWpConverges_forRangeUp`. -/
-def checksumLoopInv (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) (mem : Memory)
-    (i : Nat) (a : Nat) (s : MachineState) : Prop :=
-  i ≤ 4 ∧
-  a = checksumPrefix b0 b1 b2 b3 b4 b5 b6 b7 i ∧
+/-- Loop invariant at `bb1` for `mirNoCallWpConverges_forRangeUp_inv`. -/
+def checksumLoopInv (mem : Memory) (i a : Nat) (s : MachineState) : Prop :=
+  a ≤ 65535 * i ∧
   ∃ v6 v8 v9 v10 v12 v14 v15 v16 v17 v18 v20 v21 v25 v26 v27,
     s = checksumLoopState mem i a
       v6 v8 v9 v10 v12 v14 v15 v16 v17 v18 v20 v21 v25 v26 v27
@@ -197,16 +186,13 @@ theorem safe_noCallWpConverges
   refine Anneal.MirFuelFree.MirNoCallWpConverges.bind
     (mirStepsConverges_of_runCfgToBlock_constructive (target := 1)
       Mir.WireframeDemo.checksum_frame_safe.body
-      (checksumLoopInv b0 b1 b2 b3 b4 b5 b6 b7 mem₀ 0 0) _ rfl _ ?entry)
-    (fun s₀ h_init => mirNoCallWpConverges_forRangeUp 0 4 0
-      (checksumWordStep b0 b1 b2 b3 b4 b5 b6 b7) _
-      (checksumLoopInv b0 b1 b2 b3 b4 b5 b6 b7 mem₀) s₀ _ h_init ?iter ?exit)
+      (checksumLoopInv mem₀ 0 0) _ rfl _ ?entry)
+    (fun s₀ h_init => mirNoCallWpConverges_forRangeUp_inv _ 0 4 0
+      (checksumWordStep b0 b1 b2 b3 b4 b5 b6 b7)
+      (checksumLoopInv mem₀) s₀ _ (Nat.zero_le 4) h_init ?iter ?exit)
   case' iter =>
-    rintro i h_i_le h_i_lt a s ⟨_, h_a,
+    rintro i _ h_i_lt a s ⟨h_a,
       v6, v8, v9, v10, v12, v14, v15, v16, v17, v18, v20, v21, v25, v26, v27, rfl⟩
-    have h_ab : a ≤ 196605 := by
-      have := checksumPrefix_le hb0 hb1 hb2 hb3 hb4 hb5 hb6 hb7 i
-      omega
     refine mirStepsConverges_of_runCfgToBlock_constructive (target := 1) _ _ _ rfl _ ?_
     have hi4 : i = 0 ∨ i = 1 ∨ i = 2 ∨ i = 3 :=
       match i, h_i_lt with
@@ -215,11 +201,10 @@ theorem safe_noCallWpConverges
       | _ + 4, h => False.elim (Nat.not_lt_zero _ (Nat.lt_of_add_lt_add_right h))
     rcases hi4 with rfl | rfl | rfl | rfl
   case' exit =>
-    rintro i a s h_ge ⟨h_le, h_a,
+    intro s h_exit_inv
+    rw [forRangeUp_checksumWordStep_eq] at h_exit_inv
+    rcases h_exit_inv with ⟨-,
       v6, v8, v9, v10, v12, v14, v15, v16, v17, v18, v20, v21, v25, v26, v27, rfl⟩
-    obtain rfl : i = 4 := Nat.le_antisymm h_le h_ge
-    rw [checksumPrefix_four] at h_a
-    subst h_a
     refine mirNoCallWpConverges_of_runCfgToBlock_constructive (target := 1) _ _ rfl _ ?_
   case' entry => cases ap -- `StorageLive` checks the active protectors if any
   all_goals -- evaluate every segment (entry, iterations, exit) to `bb1`
@@ -254,13 +239,13 @@ theorem safe_noCallWpConverges
       Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Bool.decEq,
       instDecidableEqBool]
   case entry.nil | entry.cons => -- the temporaries are still uninitialised
-    exact ⟨rfl, Nat.zero_le 4, rfl, .unit, .unit, .unit, .unit, .unit, .unit, .unit, .unit,
+    exact ⟨rfl, Nat.zero_le _, .unit, .unit, .unit, .unit, .unit, .unit, .unit, .unit,
       .unit, .unit, .unit, .unit, .unit, .unit, .unit, rfl⟩
   case exit => exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 mem₀ rfl⟩
-  all_goals -- iterations: `omega` discharges the symbolic overflow checks
+  all_goals -- iterations: `omega` discharges the symbolic overflow checks and bound step
     simp (disch := omega) only [Nat.add_eq, Nat.mul_eq, wrapScalarBits_eq_of_lt,
       bitwiseOrBits_32_mul256_add, nat_ble_eq_false_of_lt]
-    exact ⟨rfl, by decide, by rw [h_a]; rfl,
+    exact ⟨rfl, checksumWordStep_le hb0 hb1 hb2 hb3 hb4 hb5 hb6 hb7 h_a,
       _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, rfl⟩
 
 /-- Universal stateful verification certificate for `checksum_frame_safe`. -/

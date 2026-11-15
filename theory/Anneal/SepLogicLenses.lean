@@ -15705,18 +15705,18 @@ theorem valueCodec_uintLE_bridge (vc : ValueCodec Nat) {sz : Nat} (hsz : 0 < sz)
     ⟨_, prov, hds, hdec v.val⟩⟩
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) fixed-width unsigned scalar `Nat`
-`ValueCodec` (agreeing with `ValueCodec.scalarNat` on `encode`, `decode`, and
-`default`, while proving `decode_encode` via `Nat.beq_refl` rather than classical
-`beq_self_eq_true`). -/
+`ValueCodec` whose `encode`, `decode`, and `default` fields are definitionally
+(`rfl`) identical to `ValueCodec.scalarNat`, while proving `decode_encode` via
+`nat_beq_self_eq_true` (`decide_eq_true rfl`) rather than classical `beq_self_eq_true`. -/
 def scalarNatValueCodec (sizeBytes : Nat) : ValueCodec Nat where
   encode n := .scalar { bits := n, sizeBytes := sizeBytes }
   decode
-    | .scalar sc => if Nat.beq sc.sizeBytes sizeBytes then some sc.bits else none
+    | .scalar sc => if sc.sizeBytes == sizeBytes then some sc.bits else none
     | _ => none
   default := 0
   decode_encode n := by
-    show (if Nat.beq sizeBytes sizeBytes = true then some n else none) = some n
-    rw [Nat.beq_refl, ite_eq_left rfl]
+    show (if (sizeBytes == sizeBytes) = true then some n else none) = some n
+    rw [nat_beq_self_eq_true, ite_eq_left rfl]
 
 /-- **Concrete scalar `ValueCodec` ↔ `uintLE` bridge**: `scalarNatValueCodec sz`
 encodes and decodes identically to `ByteLensCodec.uintLE sz` across trusted
@@ -15731,15 +15731,16 @@ theorem scalarNatValueCodec_uintLE_bridge {sz : Nat} (hsz : 0 < sz)
     (fun n => (scalarNatValueCodec sz).decode_encode n) v
 
 /-- **Concrete `ValueCodec.rustBool` ↔ `ByteLensCodec.u8` bridge**: the live
-`ValueCodec.rustBool` encodes `b : Bool` to a 1-byte scalar whose trusted byte
-encoding equals `ByteLensCodec.u8.encode (UInt8.ofNat (boolToScalar b).bits)` and
-round-trips through `decodeScalarBytes` and `ValueCodec.rustBool.decode`. -/
+`ValueCodec.rustBool` encodes `b : Bool` to `.scalar (boolToScalar b)`, whose
+trusted byte encoding equals `ByteLensCodec.u8.encode (UInt8.ofNat (boolToScalar b).bits)`
+and round-trips through `decodeScalarBytes` and `ValueCodec.rustBool.decode`. -/
 theorem rustBool_u8_bridge (b : Bool) :
     let byte : UInt8 := UInt8.ofNat (boolToScalar b).bits
-    encodeScalarBytes (boolToScalar b) none = some (u8.encode byte) ∧
+    (ValueCodec.rustBool.encode b = .scalar (boolToScalar b) ∧
+      encodeScalarBytes (boolToScalar b) none = some (u8.encode byte)) ∧
       ∃ sc prov, decodeScalarBytes (u8.encode byte) = some (sc, prov) ∧
         ValueCodec.rustBool.decode (.scalar sc) = some b := by
-  cases b <;> exact ⟨rfl, _, none, rfl, rfl⟩
+  cases b <;> exact ⟨⟨rfl, rfl⟩, _, none, rfl, rfl⟩
 
 /-- Contiguous product of two fixed-width codecs (exact-width decode). -/
 def prod {α β : Type} {n₁ n₂ : Nat} (c₁ : ByteLensCodec α n₁) (c₂ : ByteLensCodec β n₂) :
@@ -21427,8 +21428,9 @@ entry for a caller-frame slot (the shape of `&mut T` arguments created by the
 harness): it discharges `SepLensStateInv` for the singleton binding `[(rp, v)]`
 from the entry's field values, via `ExclusiveActiveBorrow.toTree`, without
 unfolding `lookupBorrow` at the call site. `LiftLensStmt.pureAssign_checked` /
-`LiftLensStmt.pureAssign_uninit_checked` and `LiftLensBlock.goto_return` are
-single-pass statement and shared-return-block lifting rules. -/
+`LiftLensStmt.pureAssign_uninit_checked` and `LiftLensBlockToJoin`
+(`LiftLensBlockToJoin.toReturn`) provide single-pass statement lifting and
+CPS join / `return`-block sharing across all `LiftLensBlock` terminators. -/
 
 /-- `lookupBorrow` on a one-entry borrow table whose tag matches. -/
 theorem lookupBorrow_singleton_of_tag {entry : BorrowEntry} {tag : Nat} (h_tag : entry.tag = tag) :
@@ -21479,12 +21481,14 @@ theorem sepLensStateInv_single_root_borrow
         exact ⟨h_off, h_frame, h_slot, hExcl.toTree⟩
       pairwise_disjoint := List.Pairwise.cons (fun _ h => nomatch h) List.Pairwise.nil }
 
-/-! ### Single-pass lens-lifting combinators
+/-! ### Single-pass & join-sharing lens-lifting combinators
 
 `LiftLensStmt.pureAssign_checked` computes the post-assignment environment with the
 single-pass `setSpineChecked?` (instead of the two-pass
-`(set? env loc s).bind forcePureEnv?`), and `LiftLensBlock.goto_return` lifts a
-statement-free `return` block once for every predecessor that jumps to it. -/
+`(set? env loc s).bind forcePureEnv?`), and `LiftLensBlockToJoin`
+(`LiftLensBlockToJoin.toReturn`) lifts a shared join or statement-free `return`
+block once across all predecessors (`LiftLensBlock.goto_return` is the
+single-predecessor shorthand). -/
 
 /-- Single-pass form of `LiftPureAssign.mk` for a pure root-local assignment. -/
 theorem LiftLensStmt.pureAssign_checked {localDecls : List LocalDecl} {layouts : LayoutTable}
@@ -21526,6 +21530,26 @@ theorem LiftLensBlockToJoin.refl {body : CapturedMir} {joinBb : BasicBlockIdx}
     (hInv : JoinInv env entries) :
     LiftLensBlockToJoin body joinBb env entries joinBb JoinInv :=
   fun _ _ k => k env entries hInv
+
+theorem LiftLensBlockToJoin.trans {body : CapturedMir} {bb₀ bb₁ bb₂ : BasicBlockIdx}
+    {env₀ : PureEnv} {entries₀ : List (RawPtrVal × Value)}
+    {MidInv JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (h₁ : LiftLensBlockToJoin body bb₀ env₀ entries₀ bb₁ MidInv)
+    (h₂ : ∀ env₁ entries₁, MidInv env₁ entries₁ →
+      LiftLensBlockToJoin body bb₁ env₁ entries₁ bb₂ JoinInv) :
+    LiftLensBlockToJoin body bb₀ env₀ entries₀ bb₂ JoinInv :=
+  fun retVal entriesFinal k =>
+    h₁ retVal entriesFinal fun env₁ entries₁ hMid =>
+      h₂ env₁ entries₁ hMid retVal entriesFinal k
+
+theorem LiftLensBlockToJoin.mono {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
+    {env : PureEnv} {entries : List (RawPtrVal × Value)}
+    {Inv₁ Inv₂ : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hImp : ∀ e es, Inv₁ e es → Inv₂ e es)
+    (h : LiftLensBlockToJoin body bbIdx env entries joinBb Inv₁) :
+    LiftLensBlockToJoin body bbIdx env entries joinBb Inv₂ :=
+  fun retVal entriesFinal k =>
+    h retVal entriesFinal fun e es h₁ => k e es (hImp e es h₁)
 
 theorem LiftLensBlockToJoin.goto {body : CapturedMir} {bbIdx target joinBb : BasicBlockIdx}
     {bb : BasicBlockData} {env env₁ : PureEnv}
@@ -21570,6 +21594,41 @@ theorem LiftLensBlockToJoin.switchInt {body : CapturedMir} {bbIdx target joinBb 
     LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv :=
   fun retVal entriesFinal k =>
     .switchInt hPhase hBb hTerm hStmts hDiscr hTarget (hNext retVal entriesFinal k)
+
+theorem LiftLensBlockToJoin.drop_local {body : CapturedMir} {bbIdx target joinBb : BasicBlockIdx}
+    {bb : BasicBlockData} {loc : Local} {unwind : UnwindAction} {oldSlot : LocalSlot}
+    {env env₁ env₂ : PureEnv}
+    {entries entries₁ : List (RawPtrVal × Value)}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .drop { local_ := loc, projection := [] } target unwind)
+    (hStmts : LiftLensStmts body.localDecls body.layouts env entries bb.statements env₁ entries₁)
+    (hGet : get? env₁ loc = .some oldSlot)
+    (hLive : oldSlot ≠ .dead)
+    (hSet : set? env₁ loc .uninit = .some env₂)
+    (hNext : LiftLensBlockToJoin body target env₂ entries₁ joinBb JoinInv) :
+    LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv :=
+  fun retVal entriesFinal k =>
+    .drop_local hPhase hBb hTerm hStmts hGet hLive hSet (hNext retVal entriesFinal k)
+
+/-- Single-pass `setSpineChecked?` variant of `LiftLensBlockToJoin.drop_local`. -/
+theorem LiftLensBlockToJoin.drop_local_checked {body : CapturedMir}
+    {bbIdx target joinBb : BasicBlockIdx} {bb : BasicBlockData}
+    {loc : Local} {unwind : UnwindAction} {oldSlot : LocalSlot}
+    {env env₁ env₂ : PureEnv}
+    {entries entries₁ : List (RawPtrVal × Value)}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .drop { local_ := loc, projection := [] } target unwind)
+    (hStmts : LiftLensStmts body.localDecls body.layouts env entries bb.statements env₁ entries₁)
+    (hGet : get? env₁ loc = .some oldSlot)
+    (hLive : oldSlot ≠ .dead)
+    (hSet : setSpineChecked? env₁ loc .uninit = .some env₂)
+    (hNext : LiftLensBlockToJoin body target env₂ entries₁ joinBb JoinInv) :
+    LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv :=
+  .drop_local hPhase hBb hTerm hStmts hGet hLive (set?_of_setSpineChecked? hSet) hNext
 
 theorem LiftLensBlockToJoin.toBlock {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
     {env : PureEnv} {entries entriesFinal : List (RawPtrVal × Value)} {retVal : Value}
@@ -22102,6 +22161,56 @@ theorem mirNoCallWpConverges_of_runCfgToBlock_constructive
   rw [wpMirNoCallSym_eq_wpMirNoCallBounded]
   exact wpCoalBounded_of_runCfgSteps_constructive body post h_phase k
     (.running true .none s) (.running s) ⟨rfl, trivial⟩ h_wp
+
+private theorem mirNoCallWpConverges_forRangeUpAux {α : Type}
+    (body : CapturedMir) (lo hi : Nat)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (LoopInv : Nat → α → MachineState → Prop)
+    (post : MirOutcome → Prop)
+    (h_body : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s, LoopInv i a s →
+      Anneal.MirFuelFree.MirStepsConverges body s
+        (LoopInv (i + 1) (step i hlo hlt a)) (fun _ => False)) :
+    ∀ (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (acc : α) (s : MachineState),
+      LoopInv i acc s →
+      (∀ s_exit, LoopInv hi (forRangeUpAux lo hi step i rem hlo hsum acc) s_exit →
+        Anneal.MirFuelFree.MirNoCallWpConverges body s_exit post) →
+      Anneal.MirFuelFree.MirNoCallWpConverges body s post
+  | i, 0, _, hsum, _, s, hinv, hexit => by
+    have h_eq : i = hi := (Nat.add_zero i).symm.trans hsum
+    subst h_eq
+    exact hexit s hinv
+  | i, rem + 1, hlo, hsum, acc, s, hinv, hexit =>
+    have hlt : i < hi :=
+      Nat.lt_of_lt_of_le (Nat.lt_add_of_pos_right (Nat.succ_pos rem)) (Nat.le_of_eq hsum)
+    have hsum' : (i + 1) + rem = hi := (Nat.add_right_comm i 1 rem).trans hsum
+    Anneal.MirFuelFree.MirNoCallWpConverges.bind
+      (Anneal.MirFuelFree.MirStepsConverges.mono (fun _ h => h) (fun _ => False.elim)
+        (h_body i hlo hlt acc s hinv))
+      fun s' hinv' =>
+        mirNoCallWpConverges_forRangeUpAux body lo hi step LoopInv post h_body
+          (i + 1) rem (Nat.le_succ_of_le hlo) hsum' (step i hlo hlt acc) s' hinv' hexit
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) call-forbidding range-loop rule
+delivering `LoopInv hi (PureMirExec.forRangeUp lo hi init step)` directly at loop exit
+(so callers discharge the exit postcondition via `PureMirExec.forRangeUp_induction`
+without duplicating the fold in `LoopInv`). -/
+theorem mirNoCallWpConverges_forRangeUp_inv {α : Type}
+    (body : CapturedMir) (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (LoopInv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState) (post : MirOutcome → Prop)
+    (h_le : lo ≤ hi)
+    (h_init : LoopInv lo init s₀)
+    (h_body : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s, LoopInv i a s →
+      Anneal.MirFuelFree.MirStepsConverges body s
+        (LoopInv (i + 1) (step i hlo hlt a)) (fun _ => False))
+    (h_exit : ∀ s_exit, LoopInv hi (Anneal.PureMirExec.forRangeUp lo hi init step) s_exit →
+      Anneal.MirFuelFree.MirNoCallWpConverges body s_exit post) :
+    Anneal.MirFuelFree.MirNoCallWpConverges body s₀ post := by
+  unfold Anneal.PureMirExec.forRangeUp at h_exit
+  rw [dite_eq_left h_le] at h_exit
+  exact mirNoCallWpConverges_forRangeUpAux body lo hi step LoopInv post h_body
+    lo (hi - lo) (Nat.le_refl lo) (Nat.add_sub_of_le h_le) init s₀ h_init h_exit
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) stateful verification discharge from `MirWpConverges`,
 routing directly through `treeSafe_and_ret_of_mirWpConverges` without `DWLP`. -/
