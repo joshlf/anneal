@@ -99,8 +99,49 @@ inductive StdValRefines (tagOf : LoanId → Nat) : StdVal → Value → Prop whe
       StdValRefines tagOf vf mv →
       StdValRefines tagOf (.choice (.symBool false) vt vf) mv
   | ref {lid : LoanId} {path : SubPath} {p : ProvenancePtr} {sz : Nat} :
-      p.allocId = tagOf lid →
+      path = [] → p.allocId = tagOf lid → p.offsetBytes = 0 →
       StdValRefines tagOf (.refVal lid path) (.ptr p sz)
+
+/-- Extract `(lid, path)` from a `StdVal.refVal lid path`. -/
+def stdRefVal? (v : StdVal) : Option (LoanId × SubPath) :=
+  match v with
+  | ⟨_, .refVal lid path⟩ => some (lid, path)
+  | _ => none
+
+/-- Inversion for `StdValRefines` on a borrow handle: `path = []`, and `mv` is a
+pointer with provenance tag `tagOf lid` and zero byte offset. -/
+theorem StdValRefines.ref_inv {tagOf : LoanId → Nat} {v : StdVal} {mv : Value}
+    (h : StdValRefines tagOf v mv) {lid : LoanId} {path : SubPath}
+    (hr : stdRefVal? v = some (lid, path)) :
+    path = [] ∧ Exists fun p => Exists fun sz =>
+      mv = .ptr p sz ∧ p.allocId = tagOf lid ∧ p.offsetBytes = 0 := by
+  cases h with
+  | ref hp ha ho =>
+    injection hr with hr
+    injection hr with hlid hpath
+    subst hlid
+    subst hpath
+    exact ⟨hp, _, _, rfl, ha, ho⟩
+  | _ => exact nomatch hr
+
+/-- `tagOf` maps distinct `LoanId`s to distinct provenance tags. -/
+def TagOfInjective (tagOf : LoanId → Nat) : Prop :=
+  ∀ l1 l2 : LoanId, tagOf l1 = tagOf l2 → l1 = l2
+
+/-- Under an injective provenance-tag mapping, distinct loan handles never
+refine the same runtime pointer, and every refined handle has empty sub-path
+offset (`path = []`). -/
+theorem StdValRefines.ref_disjoint_of_injective {tagOf : LoanId → Nat}
+    (hInj : TagOfInjective tagOf) {l1 l2 : LoanId} {p1 p2 : SubPath} {mv : Value}
+    (h1 : StdValRefines tagOf (.refVal l1 p1) mv)
+    (h2 : StdValRefines tagOf (.refVal l2 p2) mv) :
+    l1 = l2 ∧ p1 = p2 := by
+  obtain ⟨hp1, ptr1, sz1, hmv1, ha1, _⟩ := h1.ref_inv (lid := l1) (path := p1) rfl
+  obtain ⟨hp2, ptr2, sz2, hmv2, ha2, _⟩ := h2.ref_inv (lid := l2) (path := p2) rfl
+  rw [hmv1] at hmv2
+  injection hmv2 with hPtr _
+  subst hPtr
+  exact ⟨hInj l1 l2 (ha1.symm.trans ha2), hp1.trans hp2.symm⟩
 
 /-- A symbolic branch join under oracle `b` is refined by every refinement of
 its selected arm (`zipStdVal` builds a `.choice` on symbolic conditions). -/
@@ -334,6 +375,17 @@ def findBorrowEntry? (tag : Nat) : List BorrowEntry → Option BorrowEntry
   | [] => none
   | e :: es => if Nat.beq e.tag tag then some e else findBorrowEntry? tag es
 
+/-- `findBorrowEntry?` agrees identically with the trusted Tree Borrows table
+lookup `lookupBorrow`. -/
+theorem findBorrowEntry?_eq_lookupBorrow (tag : Nat) :
+    ∀ (es : List BorrowEntry), findBorrowEntry? tag es = lookupBorrow es tag
+  | [] => rfl
+  | e :: es => by
+    unfold findBorrowEntry? lookupBorrow
+    cases Nat.beq e.tag tag with
+    | true => rfl
+    | false => exact findBorrowEntry?_eq_lookupBorrow tag es
+
 /-- Tree Borrows states whose child writes are never undefined behavior:
 `Unique`, unconflicted `ReservedFrz`, and `ReservedIM`. A conflicted
 `ReservedFrz` is excluded (conservatively) because a child write through it is
@@ -360,9 +412,19 @@ def BorrowAt (ms : MachineState) (tag : Nat) (l : Local) (path : SubPath)
     fieldPathOfProjection? e.targetProjection = some path ∧
     ok e.perm = true
 
-/-- Value of the live MIR place `_l.path` in the active stack frame. -/
-def placeValue? (ms : MachineState) (l : Local) (path : SubPath) : Option Value :=
+/-- Look up a MIR local slot in the active stack frame, falling back to
+`ms.memory.callerLocals` for caller-owned places (`l ≥ ms.frame.locals.length`),
+matching the trusted `readPlaceByProjection` / `writePlaceByProjection`
+resolution in `Trusted.Rustc.V2026_06_01.MirSemantics`. -/
+def lookupLocalSlot? (ms : MachineState) (l : Local) : Option LocalSlot :=
   match ms.frame.locals[l]? with
+  | some slot => some slot
+  | none => ms.memory.callerLocals[l]?
+
+/-- Value of the live MIR place `_l.path` in the active stack frame or
+`ms.memory.callerLocals`. -/
+def placeValue? (ms : MachineState) (l : Local) (path : SubPath) : Option Value :=
+  match lookupLocalSlot? ms l with
   | some (.init v) => (valuePathLens path).get v
   | _ => none
 
@@ -429,12 +491,13 @@ theorem mirSpatialModel_disjoint_siblings (tagOf : LoanId → Nat) (l : Local)
   rw [h]
   rfl
 
-/-- `ownSubPlace` depends only on the place's local slot and the Tree Borrows
-table: any machine step that preserves both preserves the ownership claim. -/
+/-- `ownSubPlace` depends only on the place's resolved local slot and the Tree
+Borrows table: any machine step that preserves both preserves the ownership
+claim. -/
 theorem mirSpatialModel_ownSubPlace_congr (tagOf : LoanId → Nat)
     {ms ms' : MachineState} {l : Local} {path : SubPath} {owner : LoanId}
     {perm : PermTree} {v : StdVal}
-    (hSlot : ms'.frame.locals[l]? = ms.frame.locals[l]?)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l)
     (hBorrows : ms'.memory.borrows = ms.memory.borrows)
     (h : (mirSpatialModel tagOf).ownSubPlace ms l path owner perm v) :
     (mirSpatialModel tagOf).ownSubPlace ms' l path owner perm v := by
@@ -451,16 +514,25 @@ theorem mirSpatialModel_ownSubPlace_congr (tagOf : LoanId → Nat)
 
 /-! ## 5. `OperationalAdapter` over Live MIR and the Adequacy Theorem -/
 
+/-- Post-return caller machine state with the callee frame popped (`locals := []`)
+and final memory `mem`, so `lookupLocalSlot?` resolves caller-owned `&mut` root
+places in `mem.callerLocals`. -/
+def callerExitState (mem : Memory) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [] }, memory := mem }
+
 /-- `PureLift` output `out` is realized by the next live step of `body` from
-`ms`: a normal root `return` whose value refines `out.ret`. The finals of root
-`&mut` parameters (`out.mutFinals`) are not related here: they live in the
-caller's `Memory.callerLocals`, and every bridge regression uses by-value
-parameters, for which `PureLift` produces `mutFinals = []`. -/
+`ms`: a normal root `return` whose value refines `out.ret` and whose final
+memory realizes `out.mutFinals` against `rootAddrs` via
+`spatialFinalBindingsHold` (checking `out.mutFinals = []` when `rootAddrs = []`,
+and checking each root `&mut` parameter's final value and live mutation-granting
+Tree Borrows entry in `mem.callerLocals` otherwise). -/
 def MirReturnRel (tagOf : LoanId → Nat) (body : CapturedMir)
-    (out : FuncOut StdVal) (ms : MachineState) : Prop :=
+    (out : FuncOut StdVal) (ms : MachineState)
+    (rootAddrs : List (LoanId × Local × SubPath) := []) : Prop :=
   Exists fun mv => Exists fun mem =>
     PureMirExec.mirStep body ms = .done (.normal (mv, mem)) ∧
-    StdValRefines tagOf out.ret mv
+    StdValRefines tagOf out.ret mv ∧
+    spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out (callerExitState mem)
 
 /-- Every unborrowed `PureLift` local `i` is refined by the live MIR local
 `_(i+1)` (MIR local `_0` is the return place). -/
@@ -480,28 +552,36 @@ def mirStateRel (tagOf : LoanId → Nat) (bindings : List (LoanId × Local × Su
 
 /-- `PureLift` `OperationalAdapter` over the live trusted `V2026_06_01` MIR
 machine: `ExecutesTo` is exact `k`-step reachability of `PureMirExec.mirStep
-body`. -/
+body`, and `FinalLoansRel` checks both `out.ret` and `spatialFinalBindingsHold`
+for `rootAddrs`. -/
 def mirOperationalAdapter (tagOf : LoanId → Nat) (body : CapturedMir)
-    (bindings : List (LoanId × Local × SubPath)) :
+    (bindings : List (LoanId × Local × SubPath))
+    (rootAddrs : List (LoanId × Local × SubPath) := []) :
     OperationalAdapter MachineState StdVal :=
   stepOperationalAdapter (PureMirExec.mirStep body)
-    (mirStateRel tagOf bindings) (MirReturnRel tagOf body)
+    (mirStateRel tagOf bindings) (fun out ms => MirReturnRel tagOf body out ms rootAddrs)
 
 /-- Fuel-free post-condition of a lifted MIR run: a normal return whose value
-refines a `PureLift` output satisfying `post`. -/
+refines `out.ret`, whose final memory realizes `out.mutFinals` against
+`rootAddrs` via `spatialFinalBindingsHold`, and where `out` satisfies `post`. -/
 def LiftedMirPost (tagOf : LoanId → Nat) (post : FuncOut StdVal → Prop)
-    (o : MirOutcome) : Prop :=
+    (o : MirOutcome)
+    (rootAddrs : List (LoanId × Local × SubPath) := []) : Prop :=
   Exists fun out => Exists fun mv => Exists fun mem =>
-    o = .normal (mv, mem) ∧ StdValRefines tagOf out.ret mv ∧ post out
+    o = .normal (mv, mem) ∧ StdValRefines tagOf out.ret mv ∧
+    spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out (callerExitState mem) ∧
+    post out
 
 /-- **Adequacy over live `V2026_06_01` MIR (`mir_pure_lift_sound`)**:
 `pure_lift_sound` instantiated with `mirOperationalAdapter` proves that `body`
 converges from `m0` (fuel-free `MirFuelFree.MirWpConverges`) to a normal return
-refining a `PureLift` output that satisfies the `PureLift` specification. -/
+refining `out.ret` and realizing `out.mutFinals` at `rootAddrs` for a `PureLift`
+output `out` that satisfies `post`. -/
 theorem mir_pure_lift_sound (tagOf : LoanId → Nat) (body : CapturedMir)
     (bindings : List (LoanId × Local × SubPath))
     (params : List (ParamInput StdVal)) (plan : FlowPlan StdVal)
     (retExpr : RvalOp StdVal) (post : FuncOut StdVal → Prop) (m0 : MachineState)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
     (hInit : Exists fun st0 =>
       initFnState stdValAlg params = .ok st0 ∧ mirStateRel tagOf bindings st0 m0)
     (hSpec : HoldsFnSpec (evalFnValue stdValAlg params plan retExpr) post)
@@ -510,15 +590,18 @@ theorem mir_pure_lift_sound (tagOf : LoanId → Nat) (body : CapturedMir)
       evalFnValue stdValAlg params plan retExpr = .ok out →
       Exists fun k => Exists fun mFinal =>
         StepPath (PureMirExec.mirStep body) m0 k mFinal ∧
-        MirReturnRel tagOf body out mFinal) :
-    Anneal.MirFuelFree.MirWpConverges body m0 (LiftedMirPost tagOf post) :=
-  pure_lift_mirWpConverges (mirStateRel tagOf bindings) (MirReturnRel tagOf body)
-    stdValAlg params plan retExpr post m0 hInit hSpec hSim (LiftedMirPost tagOf post)
+        MirReturnRel tagOf body out mFinal rootAddrs) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  pure_lift_mirWpConverges (mirStateRel tagOf bindings)
+    (fun out ms => MirReturnRel tagOf body out ms rootAddrs)
+    stdValAlg params plan retExpr post m0 hInit hSpec hSim
+    (fun o => LiftedMirPost tagOf post o rootAddrs)
     (fun _ out hRel hPost =>
       match hRel with
-      | ⟨mv, mem, hDone, hRef⟩ =>
+      | ⟨mv, mem, hDone, hRef, hFinals⟩ =>
         PureMirExec.mirWpConverges_of_wpConverges
-          (PureMirExec.WpConverges.of_done hDone ⟨out, mv, mem, rfl, hRef, hPost⟩))
+          (PureMirExec.WpConverges.of_done hDone ⟨out, mv, mem, rfl, hRef, hFinals, hPost⟩))
 
 /-- A bounded live run that halts yields an exact step path to the halting
 state. -/
@@ -544,28 +627,33 @@ theorem exists_stepPath_of_evalFuel_halted {σ α : Type}
 /-- **`mir_pure_lift_sound` from one bounded live run**: if the `PureLift`
 evaluation succeeds with output `out` satisfying `post`, the entry state is
 related, and a bounded run of the live MIR machine halts normally with a value
-refining `out.ret`, then `body` converges fuel-free to `LiftedMirPost`. -/
+refining `out.ret` and final memory realizing `out.mutFinals` at `rootAddrs`,
+then `body` converges fuel-free to `LiftedMirPost`. -/
 theorem mir_pure_lift_sound_of_evalFuel (tagOf : LoanId → Nat) (body : CapturedMir)
     (bindings : List (LoanId × Local × SubPath))
     (params : List (ParamInput StdVal)) (plan : FlowPlan StdVal)
     (retExpr : RvalOp StdVal) (post : FuncOut StdVal → Prop) (m0 : MachineState)
     (out : FuncOut StdVal) (mv : Value) (mem : Memory) (fuel : Nat)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
     (hInit : Exists fun st0 =>
       initFnState stdValAlg params = .ok st0 ∧ mirStateRel tagOf bindings st0 m0)
     (hEval : evalFnValue stdValAlg params plan retExpr = .ok out)
     (hPost : post out)
     (hRun : PureMirExec.evalFuel (PureMirExec.mirStep body) fuel m0 =
       .halted (.normal (mv, mem)))
-    (hRef : StdValRefines tagOf out.ret mv) :
-    Anneal.MirFuelFree.MirWpConverges body m0 (LiftedMirPost tagOf post) := by
-  refine mir_pure_lift_sound tagOf body bindings params plan retExpr post m0 hInit
+    (hRef : StdValRefines tagOf out.ret mv)
+    (hFinals : spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out
+      (callerExitState mem)) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) := by
+  refine mir_pure_lift_sound tagOf body bindings params plan retExpr post m0 rootAddrs hInit
     (by rw [hEval]; exact hPost) ?_
   intro _ out' _ _ hEval'
   rw [hEval] at hEval'
   injection hEval' with hOut
   subst hOut
   obtain ⟨n, t, hPath, hDone⟩ := exists_stepPath_of_evalFuel_halted hRun
-  exact ⟨n, t, hPath, mv, mem, hDone, hRef⟩
+  exact ⟨n, t, hPath, mv, mem, hDone, hRef, hFinals⟩
 
 /-- Run `k` silent steps of a deterministic machine (`none` if it halts or
 faults first). -/
@@ -838,7 +926,7 @@ operational encoding `encodeValueToBytes` of its value, or `size` `.uninit`
 bytes for a live but uninitialized local (`MaybeUninit` storage). -/
 def placeByteWindow? (layouts : LayoutTable) (ty : Ty) (ms : MachineState)
     (l : Local) (path : SubPath) : Option (List AbstractByte) :=
-  match ms.frame.locals[l]?, path with
+  match lookupLocalSlot? ms l, path with
   | some (.init v), _ =>
     match (valuePathLens path).get v with
     | some sub => encodeValueToBytes defaultCodecFuel layouts ty sub
@@ -848,6 +936,25 @@ def placeByteWindow? (layouts : LayoutTable) (ty : Ty) (ms : MachineState)
     | some sz => some (replicateUninitBytes sz)
     | none => none
   | _, _ => none
+
+/-- Mid-pin state relation connecting a spatially pinned loan `lid` (in phase
+`LoanPhase.spatialPinned bid codec`) and its raw-byte `SpatialBlock` in
+`st.spatial` to the live MIR byte window `placeByteWindow? layouts ty ms l path`
+and live mutation-granting Tree Borrows entry `BorrowAt ms (tagOf lid) l path
+mutGranting`. -/
+def spatialPinnedBlockHolds (tagOf : LoanId → Nat) (layouts : LayoutTable)
+    (ty : Ty) (lid : LoanId) (bid : BlockId) (codec : SpatialCodec StdVal)
+    (l : Local) (path : SubPath) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  Exists fun e => Exists fun blk => Exists fun rest => Exists fun bs =>
+    findLoan lid st.loans = some e ∧
+    (match e.phase with
+     | .spatialPinned b c => b = bid ∧ c.codecId = codec.codecId
+     | _ => False) ∧
+    findSpatialBlock st.spatial bid = some (blk, rest) ∧
+    blk.originLoan = lid ∧
+    abstractBytesOfCells blk.cells = some bs ∧
+    placeByteWindow? layouts ty ms l path = some bs ∧
+    BorrowAt ms (tagOf lid) l path mutGranting
 
 /-- **Frozen block = live MIR byte window**: when the MIR place `_l.path` holds
 `toValue x`, freezing any `PureLift` value that embeds `x` produces exactly
@@ -867,7 +974,7 @@ theorem spatialCodec_freeze_eq_placeByteWindow
   have hWin : placeByteWindow? layouts ty ms l path = some (m.codec.encode x) := by
     unfold placeValue? at hPlace
     unfold placeByteWindow?
-    cases hSlot : ms.frame.locals[l]? with
+    cases hSlot : lookupLocalSlot? ms l with
     | none => rw [hSlot] at hPlace; exact nomatch hPlace
     | some slot =>
       rw [hSlot] at hPlace
@@ -1210,5 +1317,100 @@ theorem bool_tryFromBytes_not_fromBytes (layouts : LayoutTable) :
     ¬ Anneal.BitValidity.IsFromBytes layouts boolTy :=
   ⟨(boolMirCodec layouts).isTryFromBytes,
    (boolMirCodec layouts).not_isFromBytes [.init (UInt8.ofNat 2) none] rfl rfl rfl⟩
+
+/-- Concatenating two provenance-free byte windows preserves
+`provenanceFree`. -/
+theorem provenanceFree_append :
+    ∀ (bs1 bs2 : List AbstractByte),
+      provenanceFree bs1 = true → provenanceFree bs2 = true →
+      provenanceFree (bs1 ++ bs2) = true
+  | [], _, _, h2 => h2
+  | b :: rest, bs2, h1, h2 => by
+    cases b with
+    | uninit => exact provenanceFree_append rest bs2 h1 h2
+    | init _ p =>
+      cases p with
+      | none => exact provenanceFree_append rest bs2 h1 h2
+      | some _ => exact nomatch h1
+
+/-- Multi-field aggregate `(u32, u32)` 8-byte little-endian codec built via
+`SepLogicLenses.ByteLensCodec.prod`. -/
+def u32PairExactLE :
+    Anneal.SepLogicLenses.ByteLensCodec
+      ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 :=
+  Anneal.SepLogicLenses.ByteLensCodec.prod u32ExactLE u32ExactLE
+
+theorem u32PairExactLE_provenanceFree
+    (p : {v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) :
+    provenanceFree (u32PairExactLE.encode p) = true :=
+  provenanceFree_append _ _
+    (provenanceFree_encodeLittleEndianBytes 4 p.1.val)
+    (provenanceFree_encodeLittleEndianBytes 4 p.2.val)
+
+/-- Embedding of `(u32, u32)` codec pairs into `StdVal.pair`. -/
+def u32PairEmbed (p : {v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) : StdVal :=
+  .pair (.nat p.1.val) (.nat p.2.val)
+
+/-- Partial inverse of `u32PairEmbed`. -/
+def u32PairEmbed? (v : StdVal) :
+    Option ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) :=
+  match v with
+  | ⟨_, .pairBranch _ _ (.nat a) (.nat b)⟩ =>
+    if ha : a < 256 ^ 4 then
+      if hb : b < 256 ^ 4 then some (⟨a, ha⟩, ⟨b, hb⟩) else none
+    else none
+  | _ => none
+
+theorem u32PairEmbed_embed? (v : StdVal)
+    (p : {v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4})
+    (h : u32PairEmbed? v = some p) : u32PairEmbed p = v := by
+  cases v with
+  | mk f t =>
+    cases t with
+    | pairBranch fl fr ta tb =>
+      cases ta with
+      | nat a =>
+        cases tb with
+        | nat b =>
+          unfold u32PairEmbed? at h
+          dsimp only at h
+          by_cases ha : a < 256 ^ 4
+          · rw [dite_eq_left ha] at h
+            by_cases hb : b < 256 ^ 4
+            · rw [dite_eq_left hb] at h
+              injection h with h
+              subst h
+              rfl
+            · rw [dite_eq_right hb] at h
+              exact nomatch h
+          · rw [dite_eq_right ha] at h
+            exact nomatch h
+        | _ => exact nomatch h
+      | _ => exact nomatch h
+    | _ => exact nomatch h
+
+/-- Multi-field `(u32, u32)` `SpatialCodec` over `StdVal` (codec id `64`). -/
+def u32PairSpatialCodec : SpatialCodec StdVal :=
+  spatialCodecOfByteLensCodec 64 u32PairExactLE u32PairExactLE_provenanceFree
+    u32PairEmbed u32PairEmbed? u32PairEmbed_embed?
+
+/-- **Multi-field aggregate `FieldsTyped` bridge**: every encoded `(u32, u32)`
+window satisfies `SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4` at
+disjoint field offsets `0` and `4`. -/
+theorem u32PairExactLE_encode_fieldsTyped
+    (x y : {v : Nat // v < 256 ^ 4}) :
+    Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4
+      (u32PairExactLE.encode (x, y)) ∧
+    Anneal.SepLogicLenses.TypedAt u32ExactLE 0 x (u32PairExactLE.encode (x, y)) ∧
+    Anneal.SepLogicLenses.TypedAt u32ExactLE 4 y (u32PairExactLE.encode (x, y)) := by
+  have h0 : Anneal.SepLogicLenses.TypedAt u32ExactLE 0 x (u32PairExactLE.encode (x, y)) := by
+    have h := Anneal.SepLogicLenses.typedAt_append_encode u32ExactLE [] (u32ExactLE.encode y) x
+    simp only [List.nil_append, List.length_nil] at h
+    exact h
+  have h4 : Anneal.SepLogicLenses.TypedAt u32ExactLE 4 y (u32PairExactLE.encode (x, y)) := by
+    have h := Anneal.SepLogicLenses.typedAt_append_encode u32ExactLE (u32ExactLE.encode x) [] y
+    rw [u32ExactLE.encode_len x, List.append_nil] at h
+    exact h
+  exact ⟨⟨⟨x, h0⟩, ⟨y, h4⟩⟩, h0, h4⟩
 
 end Anneal.PureLift.V2026_06_01Bridge

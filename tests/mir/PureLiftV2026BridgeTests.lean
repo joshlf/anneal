@@ -182,8 +182,8 @@ theorem sibling_split_rel :
      ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩,
       fun _ => ⟨_, rfl, .nat (by decide)⟩,
       (fun h => nomatch h),
-      fun _ => ⟨_, rfl, .ref rfl⟩,
-      fun _ => ⟨_, rfl, .ref rfl⟩,
+      fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+      fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
       trivial⟩⟩
 
 /-- The two sibling loans are disjoint in `mirSpatialModel`. -/
@@ -198,9 +198,102 @@ theorem sibling_sound :
       (LiftedMirPost tagOfLoan (fun out => out.ret = .pair (.nat 10) (.nat 20))) :=
   mir_pure_lift_sound_of_evalFuel tagOfLoan siblingBody [] siblingParams siblingPlan
     (.use (.localSub 2 [])) _ siblingMs0 ⟨.pair (.nat 10) (.nat 20), []⟩
-    (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]) _ 16
+    (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]) _ 16 []
     ⟨siblingSt0, sibling_init, sibling_entry_rel⟩ sibling_pureLift_eval rfl rfl
-    (.pair (.nat (by decide)) (.nat (by decide)))
+    (.pair (.nat (by decide)) (.nat (by decide))) rfl
+
+/-! ### Test 1b: Root `&mut (u32, u32)` Parameter with Caller-Local Writeback (`spatialFinalBindingsHold`) -/
+
+def unitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+
+/-- `fn sibling_mut_param(p: &mut (u32, u32)) {
+  let x = &mut (*p).0; let y = &mut (*p).1; *x = 100; *y = 200;
+}` where `p` (`_1`) points to caller-owned local `4` in `ms.memory.callerLocals`. -/
+def siblingMutParamBody : CapturedMir :=
+  mkBody 1
+    [decl .mut unitTy, decl .not refPairTy, decl .not refU32Ty, decl .not refU32Ty]
+    [mkBb
+      [mkSt (.storageLive 2),
+       mkSt (.assign (pl 2) (.ref (.mut false) (pl 1 [.deref, .field 0 u32Ty]))),
+       mkSt (.storageLive 3),
+       mkSt (.assign (pl 3) (.ref (.mut false) (pl 1 [.deref, .field 1 u32Ty]))),
+       mkSt (.assign (pl 2 [.deref]) (.use (u32C 100))),
+       mkSt (.assign (pl 3 [.deref]) (.use (u32C 200))),
+       mkSt (.storageDead 3),
+       mkSt (.storageDead 2),
+       mkSt (.assign (pl 0) (.aggregate .tuple []))]
+      .return_]
+
+/-- Initial machine state for `siblingMutParamBody`: `_1` holds `.ptr ⟨1, 0⟩ 8`,
+where Tree Borrows tag `1` (`unique`) targets caller-owned local `4` (`≥
+ms.frame.locals.length = 4`) in `memory.callerLocals`. -/
+def siblingMutParamMs0 : MachineState :=
+  let base := initMachineState siblingMutParamBody [.ptr ⟨1, 0⟩ 8]
+  { base with
+    memory :=
+      { base.memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 4, targetProjection := [], perm := .unique }]
+        nextTag := 2
+        callerLocals :=
+          [.dead, .dead, .dead, .dead,
+           .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩])] } }
+
+def siblingMutParams : List (ParamInput StdVal) :=
+  [⟨.mutRef 0 [], .pair (.nat 7) (.nat 9)⟩]
+
+def siblingMutPlan : FlowPlan StdVal :=
+  .seq (.act (.borrow 1 .mutBorrow (.derefSub 0 [0])))
+    (.seq (.act (.borrow 2 .mutBorrow (.derefSub 0 [1])))
+      (.seq (.act (.assign (.derefSub 1 []) (.constVal (.nat 100))))
+        (.seq (.act (.assign (.derefSub 2 []) (.constVal (.nat 200))))
+          (.seq (.act (.endLoan 2)) (.act (.endLoan 1))))))
+
+def siblingMutSt0 : SymState StdVal :=
+  ⟨[⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.pair (.nat 7) (.nat 9), .unborrowed⟩, .rootParam 0⟩],
+   [], [], [], 0⟩
+
+theorem siblingMut_init :
+    initFnState stdValAlg siblingMutParams = .ok siblingMutSt0 := rfl
+
+theorem siblingMut_entry_rel :
+    mirStateRel tagOfLoan [(0, 4, [])] siblingMutSt0 siblingMutParamMs0 :=
+  ⟨⟨⟨trivial, trivial⟩,
+    ⟨⟨rfl, ⟨_, rfl, .pair (.nat (by decide)) (.nat (by decide))⟩,
+      ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+   mirLocalsRel_of_localsRefine
+     ⟨fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+theorem siblingMut_pureLift_eval :
+    evalFnValue stdValAlg siblingMutParams siblingMutPlan (.constVal .unit) =
+      .ok ⟨.unit, [.pair (.nat 100) (.nat 200)]⟩ := rfl
+
+def siblingMutParamMemFinal : Memory :=
+  match Anneal.PureMirExec.evalFuel (Anneal.PureMirExec.mirStep siblingMutParamBody) 16
+      siblingMutParamMs0 with
+  | .halted (.normal (_, mem)) => mem
+  | _ => siblingMutParamMs0.memory
+
+/-- **Test 1b (adequacy with `out.mutFinals` and `spatialFinalBindingsHold`)**:
+`siblingMutParamBody` converges fuel-free on live MIR to a normal return whose
+final `memory.callerLocals[4]` holds `(100, 200)` with a live mutation-granting
+Tree Borrows entry for the caller's root `&mut` loan (`rootAddrs = [(0, 4, [])]`). -/
+theorem siblingMut_sound :
+    Anneal.MirFuelFree.MirWpConverges siblingMutParamBody siblingMutParamMs0
+      (fun o =>
+        LiftedMirPost tagOfLoan
+          (fun out =>
+            out.ret = .unit ∧ out.mutFinals = [.pair (.nat 100) (.nat 200)])
+          o [(0, 4, [])]) :=
+  mir_pure_lift_sound_of_evalFuel tagOfLoan siblingMutParamBody [(0, 4, [])]
+    siblingMutParams siblingMutPlan (.constVal .unit) _ siblingMutParamMs0
+    ⟨.unit, [.pair (.nat 100) (.nat 200)]⟩ (.aggregate 0 []) siblingMutParamMemFinal 16 [(0, 4, [])]
+    ⟨siblingMutSt0, siblingMut_init, siblingMut_entry_rel⟩
+    siblingMut_pureLift_eval ⟨rfl, rfl⟩ rfl .unitAgg
+    ⟨⟨⟨.aggregate 0 [.scalar ⟨100, 4⟩, .scalar ⟨200, 4⟩], rfl,
+       .pair (.nat (by decide)) (.nat (by decide))⟩,
+      ⟨_, rfl, rfl, rfl, rfl⟩⟩, rfl⟩
 
 /-! ## Test 2: Diamond Conditional Borrow Join (`BackTarget.choice`) -/
 
@@ -322,14 +415,14 @@ theorem diamond_join_rel (c : Bool) :
       ⟨fun _ => ⟨_, rfl, .choiceFalse (.symBool false)⟩,
        fun _ => ⟨_, rfl, .choiceFalse (.nat (by decide))⟩,
        fun _ => ⟨_, rfl, .choiceFalse (.nat (by decide))⟩, (fun h => nomatch h),
-       fun _ => ⟨_, rfl, .ref rfl⟩, trivial⟩⟩
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
   · exact ⟨⟨⟨trivial, trivial⟩,
       ⟨⟨rfl, ⟨_, rfl, .choiceTrue (.nat (by decide))⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
      mirLocalsRel_of_localsRefine
       ⟨fun _ => ⟨_, rfl, .choiceTrue (.symBool true)⟩,
        fun _ => ⟨_, rfl, .choiceTrue (.nat (by decide))⟩,
        fun _ => ⟨_, rfl, .choiceTrue (.nat (by decide))⟩, (fun h => nomatch h),
-       fun _ => ⟨_, rfl, .ref rfl⟩, trivial⟩⟩
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
 
 /-- Live return of the diamond for oracle `c`. -/
 def diamondMirRet (c : Bool) : Value :=
@@ -354,13 +447,13 @@ theorem diamond_sound (c : Bool) :
           (zipStdVal (.symBool c) (.nat 4) (.nat 50)))) := by
   cases c
   · exact mir_pure_lift_sound_of_evalFuel tagOfLoan diamondBody [] (diamondParams false)
-      diamondPlan (.use (.localSub 3 [])) _ (diamondMs0 false) _ (diamondMirRet false) _ 16
+      diamondPlan (.use (.localSub 3 [])) _ (diamondMs0 false) _ (diamondMirRet false) _ 16 []
       ⟨_, diamond_init false, diamond_entry_rel false⟩ (diamond_pureLift_eval false) rfl rfl
-      (diamond_ret_refines false)
+      (diamond_ret_refines false) rfl
   · exact mir_pure_lift_sound_of_evalFuel tagOfLoan diamondBody [] (diamondParams true)
-      diamondPlan (.use (.localSub 3 [])) _ (diamondMs0 true) _ (diamondMirRet true) _ 16
+      diamondPlan (.use (.localSub 3 [])) _ (diamondMs0 true) _ (diamondMirRet true) _ 16 []
       ⟨_, diamond_init true, diamond_entry_rel true⟩ (diamond_pureLift_eval true) rfl rfl
-      (diamond_ret_refines true)
+      (diamond_ret_refines true) rfl
 
 /-- **Test 2 (join decomposition)**: the same convergence factors through the
 live join block: `runMirToBlock` reaches `bb3` in a state related to the
@@ -525,8 +618,96 @@ theorem zc_sound :
     Anneal.MirFuelFree.MirWpConverges zcBody zcMs0
       (LiftedMirPost tagOfLoan (fun out => out.ret = .nat zcV1)) :=
   mir_pure_lift_sound_of_evalFuel tagOfLoan zcBody [] zcParams (zcPlanWith zcCellsAfter)
-    (.use (.localSub 1 [])) _ zcMs0 ⟨.nat zcV1, []⟩ (.scalar ⟨zcV1, 4⟩) _ 16
-    ⟨_, rfl, zc_entry_rel⟩ zc_pureLift_eval rfl rfl (.nat (by decide))
+    (.use (.localSub 1 [])) _ zcMs0 ⟨.nat zcV1, []⟩ (.scalar ⟨zcV1, 4⟩) _ 16 []
+    ⟨_, rfl, zc_entry_rel⟩ zc_pureLift_eval rfl rfl (.nat (by decide)) rfl
+
+/-! ### Test 3b: 4-State Lockstep `spatialPinnedBlockHolds` Diagram & Multi-Field Aggregate `FieldsTyped` -/
+
+def zcSt0 : SymState StdVal :=
+  ⟨[⟨.nat zcV0, .unborrowed⟩], [], [], [], [], 0⟩
+
+def zcStBorrowed : SymState StdVal :=
+  ⟨[⟨.nat zcV0, .unborrowed⟩, ⟨.nat zcV0, .mutLocked 0⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat zcV0, .unborrowed⟩, .direct (.localReg 1) []⟩],
+   [], [], [], 0⟩
+
+def zcStPinned : SymState StdVal :=
+  ⟨[⟨.nat zcV0, .unborrowed⟩, ⟨.nat zcV0, .mutLocked 0⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .spatialPinned 0 zcCodec, ⟨.nat zcV0, .unborrowed⟩, .direct (.localReg 1) []⟩],
+   [], [],
+   [⟨0, 0, .readWrite, 0, 0, [.rawByte 0x44, .rawByte 0x33, .rawByte 0x22, .rawByte 0x11]⟩],
+   1⟩
+
+def zcStWritten : SymState StdVal :=
+  ⟨[⟨.nat zcV0, .unborrowed⟩, ⟨.nat zcV0, .mutLocked 0⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .spatialPinned 0 zcCodec, ⟨.nat zcV0, .unborrowed⟩, .direct (.localReg 1) []⟩],
+   [], [],
+   [⟨0, 0, .readWrite, 0, 0, zcCellsAfter⟩],
+   1⟩
+
+def zcStUnpinned : SymState StdVal :=
+  ⟨[⟨.nat zcV0, .unborrowed⟩, ⟨.nat zcV0, .mutLocked 0⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat zcV1, .unborrowed⟩, .direct (.localReg 1) []⟩],
+   [], [], [], 1⟩
+
+/-- **4-state lockstep commuting diagram for `SpatialPin` over live MIR**:
+1. Before freeze: `mirStateRel tagOfLoan [(0, 2, [])] zcStBorrowed zcMsPinned`
+2. After `freezeToSpatialInState`: `spatialPinnedBlockHolds ... zcStPinned zcMsPinned`
+3. After `mutateSpatialInState` and live store `mirStep zcBody zcMsPinned = .cont zcMsWritten`:
+   `spatialPinnedBlockHolds ... zcStWritten zcMsWritten`
+4. After `reabsorbFromSpatialInState`: `mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten`. -/
+theorem zc_lockstep_pin_lifecycle :
+    mirStateRel tagOfLoan [(0, 2, [])] zcStBorrowed zcMsPinned ∧
+    freezeToSpatialInState stdValAlg 0 zcCodec zcStBorrowed = .ok zcStPinned ∧
+    spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 2 [] zcStPinned zcMsPinned ∧
+    mutateSpatialInState 0 0 zcCellsAfter zcStPinned = .ok zcStWritten ∧
+    spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 2 [] zcStWritten zcMsWritten ∧
+    reabsorbFromSpatialInState stdValAlg 0 zcCodec zcStWritten = .ok zcStUnpinned ∧
+    mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten :=
+  ⟨⟨⟨⟨trivial, trivial⟩,
+     ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+       trivial⟩⟩,
+   rfl,
+   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
+   rfl,
+   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
+   rfl,
+   ⟨⟨⟨trivial, trivial⟩,
+     ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+       trivial⟩⟩⟩
+
+/-- **Multi-field aggregate `(u32, u32)` freeze → byte-slice mutation → unpin**
+connected to `SepLogicLenses.FieldsTyped`: freezing `(7, 9)` yields an 8-byte
+block satisfying `FieldsTyped u32ExactLE 0 u32ExactLE 4`, mutating the second
+field's 4 bytes (`offset 4..8`) to `zcV1` preserves field 0 (`7`), and unpins to
+`(.pair (.nat 7) (.nat zcV1))`. -/
+theorem zcPair_fieldsTyped_and_field1_mutation_canary :
+    let p0 : {v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4} :=
+      (⟨7, by decide⟩, ⟨9, by decide⟩)
+    let cellsAfter : List (CellVal StdVal) :=
+      [.rawByte 7, .rawByte 0, .rawByte 0, .rawByte 0,
+       .rawByte 0xAB, .rawByte 0x33, .rawByte 0x22, .rawByte 0x11]
+    let pairPlan : FlowPlan StdVal :=
+      .seq (.act (.assign (.localSub 1 []) (.use (.localSub 0 []))))
+        (.seq (.act (.borrow 2 .mutBorrow (.localSub 1 [])))
+          (.seq (.act (.freezeSpatial 0 u32PairSpatialCodec))
+            (.seq (.act (.mutateSpatial 0 0 cellsAfter))
+              (.seq (.act (.reabsorbSpatial 0 u32PairSpatialCodec))
+                (.act (.endLoan 0))))))
+    Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4
+      (u32PairExactLE.encode p0) ∧
+    evalFnValue stdValAlg [⟨.byVal, .pair (.nat 7) (.nat 9)⟩] pairPlan
+      (.use (.localSub 1 [])) =
+      .ok ⟨.pair (.nat 7) (.nat zcV1), []⟩ :=
+  ⟨(u32PairExactLE_encode_fieldsTyped ⟨7, by decide⟩ ⟨9, by decide⟩).1, rfl⟩
 
 /-! ## Test 4: Negative Falsification Canaries -/
 
@@ -641,5 +822,44 @@ theorem refines_rejects_wrong_value :
   injection hEq with hEq
   injection hEq with h11
   exact absurd h11 (by decide)
+
+/-- **(e) Pointer offset and sub-path hygiene in `StdValRefines.ref`**: a borrow
+handle `.refVal lid path` never refines a pointer with non-zero `offsetBytes` or
+a handle with non-empty `path`. -/
+theorem refines_rejects_nonzero_ptr_offset_and_subpath :
+    ¬ StdValRefines tagOfLoan (.refVal 0 []) (.ptr ⟨1, 4⟩ 8) ∧
+    ¬ StdValRefines tagOfLoan (.refVal 0 [0]) (.ptr ⟨1, 0⟩ 8) := by
+  refine ⟨?_, ?_⟩
+  · intro h
+    obtain ⟨_, p, _, hEq, _, hOff⟩ := h.ref_inv (lid := 0) (path := []) rfl
+    injection hEq with hPtr _
+    subst hPtr
+    exact absurd hOff (by decide)
+  · intro h
+    obtain ⟨hp, _⟩ := h.ref_inv (lid := 0) (path := [0]) rfl
+    exact nomatch hp
+
+/-- **(f) `tagOfLoan` is injective, so distinct loan handles never refine the
+same runtime pointer**. -/
+theorem tagOfLoan_injective : TagOfInjective tagOfLoan := by
+  intro l1 l2 h
+  exact Nat.add_right_cancel h
+
+theorem tagOfLoan_disjoint_refs (mv : Value) :
+    ¬ (StdValRefines tagOfLoan (.refVal 0 []) mv ∧
+       StdValRefines tagOfLoan (.refVal 1 []) mv) := by
+  rintro ⟨h0, h1⟩
+  have hEq := (StdValRefines.ref_disjoint_of_injective tagOfLoan_injective h0 h1).1
+  exact absurd hEq (by decide)
+
+/-- **(g) Width-1 subdomain no-retyping canary (`boolSpatialCodec`)**: mutating a
+frozen 1-byte `bool` block to a 1-cell `[.init (.nat 99)]` slice cannot retype
+the `bool` loan to `.nat 99` via the subdomain fallback; `decode` returns `none`
+and reabsorption fails. -/
+theorem bool_retype_init_cell_rejected :
+    (boolSpatialCodec zcLayouts).decode [.init (.nat 99)] = none ∧
+    evalFnValue stdValAlg [⟨.byVal, .bool true⟩]
+      (boolPlanWith [.init (.nat 99)]) (.use (.localSub 1 [])) = .fail :=
+  ⟨rfl, rfl⟩
 
 end PureLiftV2026BridgeTests
