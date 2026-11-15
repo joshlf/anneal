@@ -12,12 +12,13 @@ This directory contains the agent skills required when working on
 `joshlf/anneal`. See [`../AGENTS.md`](../AGENTS.md) for standing repository
 rules and the routing table that maps tasks to these skills.
 
-## Historical maintainer imports
+## Provenance
 
 Vendor only documents used to run a skill, including the references its
-instructions load. The table records the historical maintainer imports and their original paths
-and revisions. These identifiers do not imply that the corresponding commits
-are available in the public distribution. Public releases select package versions
+instructions load. For imported skills, the table records the original upstream
+paths and revisions. Repository-owned skills are labeled in the Source column.
+These historical identifiers do not imply that the corresponding commits are
+available in the public distribution. Public releases select package versions
 independently; a matching skill name does not establish byte correspondence.
 The matching-public-bytes links identify only packages whose complete local
 path/byte/mode inventory matches that public release. Other rows retain only
@@ -70,5 +71,3 @@ packages unmodified so they can be updated cleanly from upstream; place
 Anneal-specific conventions in repository-owned files (`AGENTS.md`,
 `skills/architectural-design/`, `skills/source-control/`, and
 `skills/trust-review/`).
-
-*Updated by an AI agent acting on joshlf's behalf.*
