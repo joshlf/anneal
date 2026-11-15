@@ -118,7 +118,8 @@ def NonOverlappingPtrs (src dst : RawPtrVal) (count : Nat) : Prop :=
 
 /--
 Executable Tree Borrows tag transition for a read (`isWrite = false`) or write
-(`isWrite = true`) through `rp`.
+(`isWrite = true`) through `rp`. A write invalidates conflicting borrows of the
+written local in the frame that owns it (`entry.targetFrameDepth`).
 -/
 def stepTreeBorrowAccess?
     (mem : Memory) (rp : RawPtrVal) (isWrite : Bool) : Option Memory :=
@@ -134,7 +135,7 @@ def stepTreeBorrowAccess?
         { mem with
           borrows :=
             invalidateConflictingBorrows
-              mem.borrows entry.targetLocal (some rp.tag) }
+              mem.borrows entry.targetLocal (some rp.tag) entry.targetFrameDepth }
 
 /-- 5. Tree Borrows access obligation for read or write through `rp`. -/
 def HasTreeBorrowAccess
@@ -206,7 +207,7 @@ theorem evalOperand_deref_of_obligations
       locals (.copy { local_ := ptrLocal, projection := [.deref] })
       mem.borrows mem.globals = .ok v locals := by
   unfold evalOperand
-  simp only [hPtr, hLookup, hTarget, hProj]
+  simp only [hPtr, hLookup, hProj]
   cases hPerm : entry.perm <;> simp_all [readProjectedValue]
 
 theorem evalStoreRawPtr_of_obligations
@@ -248,12 +249,13 @@ theorem evalRvalue_offset_of_validSliceRange
     (lhsOp rhsOp : Operand) (rp : RawPtrVal) (sz delta totalLen : Nat)
     (hRange : ValidSliceRange rp delta totalLen)
     (hLhs :
-      evalOperand locals lhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls =
+      evalOperand locals lhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls
+          mem.callStack =
         .ok (.ptr rp.toProvenancePtr sz) locals)
     (hRhs :
-      evalOperand locals rhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls =
+      evalOperand locals rhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls
+          mem.callStack =
         .ok (.scalar ⟨delta, 8⟩) locals)
-    (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = .none)
     (hStride : pointeeElemByteStride localDecls emptyLayoutTable lhsOp = .some 1)
     (hOffset :
       evalBinOpOffset rp.toProvenancePtr sz ⟨delta, 8⟩ 1
@@ -267,7 +269,7 @@ theorem evalRvalue_offset_of_validSliceRange
     rp.offset + delta ≤ totalLen := by
   refine ⟨?_, hRange⟩
   unfold evalRvalue evalPtrOffsetBinOp
-  simp [hLhs, hRhs, hLookup, hStride, hOffset]
+  simp [hLhs, hRhs, hStride, hOffset]
 
 theorem nonOverlappingPtrs_zero (src dst : RawPtrVal) :
     NonOverlappingPtrs src dst 0 :=
@@ -287,13 +289,16 @@ theorem evalCopyNonOverlapping_zero_of_obligations
     (src dst : RawPtrVal) (srcVal dstVal : Value)
     (hNonoverlap : NonOverlappingPtrs src dst 0)
     (hSrc :
-      evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
+      evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
         .ok srcVal s.frame.locals)
     (hDst :
-      evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
+      evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
         .ok dstVal s.frame.locals)
     (hCnt :
-      evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
+      evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
         .ok (.scalar ⟨0, 8⟩) s.frame.locals) :
     evalCopyNonOverlapping s srcOp dstOp countOp =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
@@ -306,6 +311,13 @@ theorem evalCopyNonOverlapping_zero_of_obligations
 Bridge theorem connecting `NonOverlappingPtrs`, `HasTreeBorrowAccess`, and
 `LiveAllocAt` directly to `MirSemantics.evalCopyNonOverlapping` for `count = 1`
 at base offset `0`.
+
+`hFrame` requires both borrow targets to lie in the active frame
+(`copyEntriesTargetActiveFrame`, which holds trivially when the root frame is
+active, i.e. `s.memory.callStack = []`); a copy through a tag minted in a
+suspended caller frame fails closed with `.unsupported`
+(`DIV-MR-CALL-TARGET-LOCAL`). The destination invalidation is scoped to the
+active frame depth `length s.memory.callStack`.
 -/
 theorem evalCopyNonOverlapping_one_of_obligations
     (s : MachineState) (srcOp dstOp countOp : Operand)
@@ -315,13 +327,16 @@ theorem evalCopyNonOverlapping_one_of_obligations
     (hSrcOff : src.offset = 0)
     (hDstOff : dst.offset = 0)
     (hSrc :
-      evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
+      evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
         .ok (.ptr src.toProvenancePtr sz) s.frame.locals)
     (hDst :
-      evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
+      evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
         .ok (.ptr dst.toProvenancePtr sz) s.frame.locals)
     (hCnt :
-      evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
+      evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
         .ok (.scalar ⟨1, 8⟩) s.frame.locals)
     (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = none)
     (hSrcLookup :
@@ -338,7 +353,9 @@ theorem evalCopyNonOverlapping_one_of_obligations
     (hDstVal : get? s.frame.locals dstEntry.targetLocal = some (.init oldDstVal))
     (hWrite :
       set? s.frame.locals dstEntry.targetLocal (.init copiedVal) =
-        some locals') :
+        some locals')
+    (hFrame :
+      copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true) :
     evalCopyNonOverlapping s srcOp dstOp countOp =
       MirStepNode.step
         (advanceStmt s locals'
@@ -346,7 +363,8 @@ theorem evalCopyNonOverlapping_one_of_obligations
             borrows :=
               invalidateConflictingBorrows
                 s.memory.borrows dstEntry.targetLocal
-                (some dst.toProvenancePtr.tag) }) ∧
+                (some dst.toProvenancePtr.tag)
+                (length s.memory.callStack) }) ∧
     NonOverlappingPtrs src dst 1 := by
   refine ⟨?_, hNonoverlap⟩
   have hSrcZero : src.toProvenancePtr.offsetBytes = 0 := hSrcOff
@@ -355,7 +373,7 @@ theorem evalCopyNonOverlapping_one_of_obligations
     evalCopyNonOverlappingPermOk evalCopySingleDirect writePlaceValue
   simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
         hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
-        hDstProj, hDstVal, hWrite, readProjectedValue]
+        hDstProj, hDstVal, hWrite, hFrame, readProjectedValue]
 
 /-! ## 3. Slice-Split, Unaligned Raw-Pointer, and Array-to-Slice Obligations -/
 

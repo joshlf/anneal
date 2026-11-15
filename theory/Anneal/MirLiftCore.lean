@@ -89,7 +89,7 @@ theorem evalStmt_preserves_frame {bbIdx stmtIdx env mem stmt decls layouts ms'}
   (h_step : evalStmt { frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := env }, memory := mem } stmt decls layouts = .step ms') :
   ms'.frame.blockIdx = bbIdx ∧ ms'.frame.stmtIdx = stmtIdx + 1 := by
   cases h_k : stmt.kind <;> (
-    unfold evalStmt at h_step
+    unfold evalStmt evalForeignFrameDerefWrite evalSetDiscriminantLocal at h_step
     rw [h_k] at h_step h_pure
     dsimp [isPureStatement] at h_pure
     first | contradiction | (
@@ -638,7 +638,8 @@ matching the protector-free `StatementKind.assign` transition of `evalStmt`.
 def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
     (dst : Place) (val : Value)
     (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable) : Option (PureEnv × List BorrowEntry) :=
+    (layouts : LayoutTable := emptyLayoutTable)
+    (targetFrameDepth : Nat := 0) : Option (PureEnv × List BorrowEntry) :=
   match dst.projection with
   | [] =>
     match get? locals dst.local_ with
@@ -646,7 +647,8 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
     | some _ =>
       match set? locals dst.local_ (.init val) with
       | some locals' =>
-        some (locals', invalidateConflictingBorrows borrows dst.local_ .none)
+        some (locals',
+          invalidateConflictingBorrows borrows dst.local_ .none targetFrameDepth)
       | none => none
     | none => none
   | .deref :: _ => none
@@ -675,7 +677,7 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
               (proj :: rest)
           some (locals',
             invalidateConflictingBorrowsAtProj borrows dst.local_ .none
-              resolvedLocalProj)
+              resolvedLocalProj 0 0 targetFrameDepth)
         | none => none
       | _ => none
     | _ => none
@@ -708,17 +710,24 @@ new caller frame onto `mem.callStack`. This is
 `(enterTailCalleeFrame ..).memory`.
 -/
 @[reducible]
-def tailCallFrameMem (mem : Memory) (calleeBody : CapturedMir) : Memory :=
-  { mem with activeCallee := some calleeBody }
+def tailCallFrameMem (mem : Memory) (calleeNumLocals : Nat)
+    (calleeBody : CapturedMir) : Memory :=
+  { mem with
+    borrows :=
+      disableFrameBorrows mem.borrows (length mem.callStack) calleeNumLocals
+    activeCallee := some calleeBody }
 
 /--
-Memory after `TerminatorKind.return_` pops `caller` (with remaining stack
-`rest`) and resumes `caller.callerBody`.
+Memory after `TerminatorKind.return_` tears down the returning callee's locals
+(`disableFrameBorrows`), pops `caller` (with remaining stack `rest`), and
+restores `caller.callerBody` and protectors prior to `writeReturnDestination`.
 -/
 @[reducible]
-def returnFrameMem (mem : Memory) (caller : SavedCallerFrame)
-    (rest : List SavedCallerFrame) : Memory :=
+def returnFrameMem (mem : Memory) (calleeNumLocals : Nat)
+    (caller : SavedCallerFrame) (rest : List SavedCallerFrame) : Memory :=
   { mem with
+    borrows :=
+      disableFrameBorrows mem.borrows (length mem.callStack) calleeNumLocals
     callStack := rest
     activeCallee := some caller.callerBody
     activeProtectors := restoreCallerProtectors caller }
@@ -763,7 +772,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {allocId : AllocId} {mem₁ : Memory} {borrows' : List BorrowEntry} :
       isReifyFnPointerCoercion coercionKind = true →
       stringEq coercionKind "UnsafeFnPointer" = false →
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnItem env₁ →
       isZstFnItemValue fnItem = true →
       targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi →
@@ -777,7 +786,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       internFnPtr mem defPath typeArgs (some targetTy.kind) = (allocId, mem₁) →
       assignLocalPlace env₁ mem₁.borrows dst
           (.ptr { allocId := allocId, offsetBytes := 0 } 8)
-          cur.localDecls cur.layouts =
+          cur.localDecls cur.layouts (length mem₁.callStack) =
         some (env₂, borrows') →
       mem₁.activeProtectors = [] →
       post env₂ { mem₁ with borrows := borrows' } →
@@ -797,7 +806,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       evalUnsafeFnPointer env op targetTy mem cur.localDecls cur.layouts =
         .ok (.ptr ptrVal 8) env₁ mem →
       assignLocalPlace env₁ mem.borrows dst (.ptr ptrVal 8)
-          cur.localDecls cur.layouts =
+          cur.localDecls cur.layouts (length mem.callStack) =
         some (env₂, borrows') →
       mem.activeProtectors = [] →
       post env₂ { mem with borrows := borrows' } →
@@ -815,7 +824,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       evalFnPtrToPtr env op targetTy mem cur.localDecls cur.layouts =
         .ok (.ptr ptrVal 8) env₁ mem →
       assignLocalPlace env₁ mem.borrows dst (.ptr ptrVal 8)
-          cur.localDecls cur.layouts =
+          cur.localDecls cur.layouts (length mem.callStack) =
         some (env₂, borrows') →
       mem.activeProtectors = [] →
       post env₂ { mem with borrows := borrows' } →
@@ -829,12 +838,14 @@ Unprojected `assignLocalPlace` reduction when `dst.projection = []` and
 theorem assignLocalPlace_unprojected {env₁ env₂ : PureEnv}
     {borrows : List BorrowEntry} {dst : Place} {slot : LocalSlot} {val : Value}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {targetFrameDepth : Nat}
     (h_proj : dst.projection = [])
     (h_slot : get? env₁ dst.local_ = some slot)
     (h_live : slotLive slot = true)
     (h_set : set? env₁ dst.local_ (.init val) = some env₂) :
-    assignLocalPlace env₁ borrows dst val localDecls layouts =
-      some (env₂, invalidateConflictingBorrows borrows dst.local_ .none) := by
+    assignLocalPlace env₁ borrows dst val localDecls layouts targetFrameDepth =
+      some (env₂,
+        invalidateConflictingBorrows borrows dst.local_ .none targetFrameDepth) := by
   rcases dst with ⟨dstLoc, dstProj⟩
   dsimp only at h_proj h_slot h_set
   subst h_proj
@@ -866,7 +877,7 @@ theorem LiftStmtMem.reifyFnPointer {cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (h_kind : isReifyFnPointerCoercion coercionKind = true)
     (h_unsafe : stringEq coercionKind "UnsafeFnPointer" = false)
     (h_op :
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnItem env₁)
     (h_zst : isZstFnItemValue fnItem = true)
     (h_ty : targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi)
@@ -890,7 +901,10 @@ theorem LiftStmtMem.reifyFnPointer {cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (h_prot : mem₁.activeProtectors = [])
     (h_next :
       post env₂
-        { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows dst.local_ .none }) :
+        { mem₁ with
+          borrows :=
+            invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+              (length mem₁.callStack) }) :
     LiftStmtMem cur bbIdx stmtIdx env mem post
       { kind := .assign dst (.cast (.pointerCoercion coercionKind) op targetTy),
         span := span } :=
@@ -981,7 +995,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .goto target, span := span }
   | switchInt {discr : Operand} {targets : SwitchTargets} {span : String}
       {sc : ScalarInt} {env' : PureEnv} :
-      evalOperand env discr mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env discr mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.scalar sc) env' →
       post (.frame (lookupSwitchTarget sc.bits targets.branches targets.otherwise)
         0 env' mem) →
@@ -989,7 +1003,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .switchInt discr targets, span := span }
   | assert {cond : Operand} {expected : Bool} {target : BasicBlockIdx}
       {unwind : UnwindAction} {span : String} {sc : ScalarInt} {env' : PureEnv} :
-      evalOperand env cond mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env cond mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.scalar sc) env' →
       Nat.beq sc.bits (match expected with | true => 1 | false => 0) = true →
       post (.frame target 0 env' mem) →
@@ -1014,25 +1028,36 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       post (.frame target 0 env mem) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .drop place target unwind, span := span }
-  /-- Return from the root frame (empty call stack). -/
+  /--
+  Return from the root frame (empty call stack) when no active function-entry
+  protector blocks deallocating the root frame's locals.
+  -/
   | return_ {span : String} {retVal : Value} :
       get? env 0 = some (.init retVal) →
       mem.callStack = [] →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          0 (length env) = false →
       post (.ret retVal) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .return_, span := span }
   /--
-  Return from an inlined callee: write `_0` into the saved caller's
-  `destination` and resume the caller at its return target.
+  Return from an inlined callee: verify no active function-entry protector
+  blocks deallocating the callee's locals, disable callee borrows via
+  `returnFrameMem`, write `_0` into the saved caller's `destination` via
+  `writeReturnDestination`, and resume the caller at its return target.
   -/
   | returnToCaller {span : String} {retVal : Value} {caller : SavedCallerFrame}
-      {rest : List SavedCallerFrame} {callerEnv : PureEnv} :
+      {rest : List SavedCallerFrame} {callerEnv : PureEnv} {mem' : Memory} :
       get? env 0 = some (.init retVal) →
       mem.callStack = caller :: rest →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       caller.isDiverging = false →
-      writePlaceValue caller.frame.locals mem.borrows caller.destination retVal =
-        .ok callerEnv →
-      post (.frame caller.returnTarget 0 callerEnv (returnFrameMem mem caller rest)) →
+      writeReturnDestination caller.frame.locals
+          (returnFrameMem mem (length env) caller rest) caller.destination retVal
+          caller.callerBody.localDecls caller.callerBody.layouts =
+        .ok callerEnv mem' →
+      post (.frame caller.returnTarget 0 callerEnv mem') →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .return_, span := span }
   /--
@@ -1045,7 +1070,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
       {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCallee? func = some (defPath, typeArgs) →
-      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       post (.frame 0 0 (initLocals calleeBody argVals)
@@ -1063,13 +1088,13 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
       {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnVal envAfterFunc →
       isZstFnItemValue fnVal = true →
       extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
         some (defPath, typeArgs) →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       post (.frame 0 0 (initLocals calleeBody argVals)
@@ -1089,7 +1114,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
       {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.ptr ptrVal 8) envAfterFunc →
       ptrVal.offsetBytes = 0 →
       lookupBorrow mem.borrows ptrVal.tag = none →
@@ -1097,7 +1122,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy cur.localDecls cur.layouts func) = true →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
           mem.traitImpls calleeBody →
@@ -1127,7 +1152,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           func (length (lhsOp :: rhsOps)) cur.localDecls cur.layouts =
         .ok resolvedTarget envAfterFunc →
       evalOperands envAfterFunc (lhsOp :: rhsOps) mem.borrows mem.globals
-          cur.layouts mem.callerLocals =
+          cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok [.scalar lhs, .scalar rhs] env' →
       lookupCallee mem.callees cur.layouts resolvedTarget.defPath
           resolvedTarget.typeArgs mem.traitImpls = none →
@@ -1149,11 +1174,13 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
       {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCallee? func = some (defPath, typeArgs) →
-      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
   /--
@@ -1165,17 +1192,19 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
       {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnVal envAfterFunc →
       isZstFnItemValue fnVal = true →
       extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
         some (defPath, typeArgs) →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
   /--
@@ -1186,7 +1215,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
       {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.ptr ptrVal 8) envAfterFunc →
       ptrVal.offsetBytes = 0 →
       lookupBorrow mem.borrows ptrVal.tag = none →
@@ -1194,7 +1223,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy cur.localDecls cur.layouts func) = true →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
           mem.traitImpls calleeBody →
@@ -1202,8 +1231,10 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
             fnSig := fnEntry.fnSig, isIndirect := true }
           calleeBody (length argVals) = true →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
 
@@ -1298,7 +1329,9 @@ theorem evalStmt_assign_of_evalRvalue {bbIdx : BasicBlockIdx} {stmtIdx : Nat}
     {val : Value} {borrows' : List BorrowEntry}
     (h_rv : evalRvalue env rv mem localDecls layouts = .ok val env₁ mem₁)
     (h_prot : mem₁.activeProtectors = [])
-    (h_write : assignLocalPlace env₁ mem₁.borrows dst val localDecls layouts = some (env₂, borrows')) :
+    (h_write :
+      assignLocalPlace env₁ mem₁.borrows dst val localDecls layouts
+        (length mem₁.callStack) = some (env₂, borrows')) :
     evalStmt
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         { kind := .assign dst rv, span := span } localDecls layouts =
@@ -1398,7 +1431,7 @@ theorem evalRvalue_reifyFnPointer {env env₁ : PureEnv} {mem mem₁ : Memory}
     {allocId : AllocId}
     (h_kind : isReifyFnPointerCoercion coercionKind = true)
     (h_unsafe : stringEq coercionKind "UnsafeFnPointer" = false)
-    (h_op : evalOperand env op mem.borrows mem.globals layouts mem.callerLocals =
+    (h_op : evalOperand env op mem.borrows mem.globals layouts mem.callerLocals (callStack := mem.callStack) =
       .ok fnItem env₁)
     (h_zst : isZstFnItemValue fnItem = true)
     (h_ty : targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi)
@@ -1502,7 +1535,7 @@ theorem resolveCallTarget_fnItem (s : MachineState) (func : Operand)
     (h_nonConst : extractCalleeDefPath? func = none)
     (h_eval :
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals
-          bodyLayouts s.memory.callerLocals =
+          bodyLayouts s.memory.callerLocals (callStack := s.memory.callStack) =
         .ok fnVal localsAfterFunc)
     (h_zst : isZstFnItemValue fnVal = true)
     (h_target :
@@ -1612,22 +1645,29 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     dsimp only []
     rw [h_read]
     exact h_next
-  | return_ h_ret h_stack h_post =>
+  | return_ h_ret h_stack h_noDealloc h_post =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_ret]
     dsimp only []
     rw [h_stack]
+    dsimp only [Trusted.Sequence.length, List.length] at h_noDealloc ⊢
+    rw [h_noDealloc]
     exact h_post
-  | returnToCaller h_ret h_stack h_div h_write h_next =>
+  | returnToCaller h_ret h_stack h_noDealloc h_div h_write h_next =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_ret]
     dsimp only []
+    rw [h_noDealloc]
+    dsimp only []
+    unfold returnFrameMem at h_write
+    revert h_write
     rw [h_stack]
     dsimp only []
     rw [h_div]
     dsimp only []
+    intro h_write
     rw [h_write]
     exact h_next
   | callDirect h_callee h_args h_ctx h_next =>
@@ -1693,7 +1733,7 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     dsimp only []
     rw [h_write]
     exact h_next
-  | tailCallDirect h_callee h_args h_ctx h_next =>
+  | tailCallDirect h_callee h_args h_ctx h_noDealloc h_next =>
     rename_i func argOps span defPath typeArgs argVals env' calleeBody
     have h_res :=
       resolveCallTarget_of_extractCallee
@@ -1703,10 +1743,10 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps span cur _ env argVals env' calleeBody h_res h_args h_ctx
-        (checkCalleeTargetCompatible_direct _ _ _ _ _)
+        (checkCalleeTargetCompatible_direct _ _ _ _ _) h_noDealloc
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
-  | tailCallFnItem h_const h_func h_zst h_target h_args h_ctx h_next =>
+  | tailCallFnItem h_const h_func h_zst h_target h_args h_ctx h_noDealloc h_next =>
     rename_i func argOps span fnVal envAfterFunc defPath typeArgs argVals env'
       calleeBody
     have h_res :=
@@ -1718,11 +1758,11 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps span cur _ envAfterFunc argVals env' calleeBody h_res h_args
-        h_ctx (checkCalleeTargetCompatible_direct _ _ _ _ _)
+        h_ctx (checkCalleeTargetCompatible_direct _ _ _ _ _) h_noDealloc
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
   | tailCallIndirect h_const h_func h_off h_noBorrow h_fnPtr h_compat h_args
-      h_ctx h_target h_next =>
+      h_ctx h_target h_noDealloc h_next =>
     rename_i func argOps span ptrVal envAfterFunc fnEntry argVals env' calleeBody
     have h_res :=
       resolveCallTarget_indirect_fnPtr
@@ -1733,7 +1773,7 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps span cur _ envAfterFunc argVals env' calleeBody h_res h_args
-        h_ctx h_target
+        h_ctx h_target h_noDealloc
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
 
@@ -2022,17 +2062,16 @@ theorem hasProtectedWriteConflict_nil
     (targetLocal : LocalIdx)
     (writerTag : Option Nat)
     (writeProj : List ProjectionElem)
-    (writeRangeOff writeRangeLen : Nat) :
-    hasProtectedWriteConflict borrows .nil targetLocal writerTag writeProj writeRangeOff writeRangeLen = false := by
+    (writeRangeOff writeRangeLen : Nat)
+    {targetFrameDepth : Nat} :
+    hasProtectedWriteConflict borrows .nil targetLocal writerTag writeProj
+      writeRangeOff writeRangeLen targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons entry rest ih =>
     unfold hasProtectedWriteConflict
-    rw [isBorrowProtected_nil]
-    dsimp only [Bool.and]
-    cases Nat.beq entry.targetLocal targetLocal <;>
-      cases borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen <;>
-      exact ih
+    simp only [isBorrowProtected_nil, Bool.false_and, Bool.and_false]
+    exact ih
 
 theorem readProjectedValue_nil (locals : List LocalSlot) (v : Value) :
     readProjectedValue locals v [] = .ok v := rfl
@@ -2059,8 +2098,9 @@ theorem readProjectedValue_index
 def evalOperandFallback (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot)
-    (localDecls : List LocalDecl := .nil) : PlaceReadResult :=
-  evalOperand locals op borrows globals layouts callerLocals localDecls
+    (localDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : PlaceReadResult :=
+  evalOperand locals op borrows globals layouts callerLocals localDecls callStack
 
 def evalDerefGlobalFallback
     (globals : List CapturedAllocation) (ptrVal : ProvenancePtr) (sz : Nat)
@@ -2098,12 +2138,14 @@ def evalThinPtrElemDerefReadFallback
 
 def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil) : PlaceReadResult :=
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : PlaceReadResult :=
   match op with
   | .constant c =>
     match c.val with
     | .indirect _ _ =>
       evalOperandFallback locals (.constant c) borrows globals body.layouts callerLocals localDecls
+        callStack
     | .unevaluated _ => .unsupported
     | cv =>
       match evalConstValue cv c.ty globals body.layouts with
@@ -2112,8 +2154,10 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
   | .copy p =>
     match p.projection with
     | .deref :: restProj =>
-      match localDecls with
-      | .nil =>
+      match localDecls, callStack with
+      | .nil, _ :: _ =>
+        evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals .nil callStack
+      | .nil, .nil =>
         match get? locals p.local_ with
         | .some (.init (.ptr ptrVal sz)) =>
           match lookupBorrow borrows ptrVal.tag with
@@ -2162,12 +2206,14 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
           evalSliceFatPtrDerefRead locals ptrVal ptrSz lenSc restProj borrows globals
             body.layouts callerLocals .none
         | _ => .ub
-      | d :: ds =>
+      | d :: ds, _ =>
         evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals (d :: ds)
+          callStack
     | _ =>
       match placeTouchesUnion localDecls body.layouts p with
       | true =>
         evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals localDecls
+          callStack
       | false =>
         match get? locals p.local_ with
         | .some (.init rootVal) =>
@@ -2193,6 +2239,7 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
       match placeTouchesUnion localDecls body.layouts p with
       | true =>
         evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+          callStack
       | false =>
         match get? locals p.local_ with
         | .some (.init rootVal) =>
@@ -2203,13 +2250,16 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub
-    | _ => evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+    | _ =>
+      evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+        callStack
 
 theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl) :
-    evalOperandFast body locals op borrows globals callerLocals localDecls =
-      evalOperand locals op borrows globals body.layouts callerLocals localDecls := by
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandFast body locals op borrows globals callerLocals localDecls callStack =
+      evalOperand locals op borrows globals body.layouts callerLocals localDecls callStack := by
   cases op with
   | constant c =>
     rcases c with ⟨ty, val⟩
@@ -2222,7 +2272,7 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
     | cons hd tl =>
       cases hd with
       | deref =>
-        cases localDecls <;> rfl
+        cases localDecls <;> cases callStack <;> rfl
       | field _ _ | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
       | opaqueCast _ | unwrapUnsafeBinder _ =>
         dsimp only [evalOperandFast, evalOperand, evalOperandFallback]
@@ -2262,13 +2312,14 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
 def evalOperandsFast
     (body : CapturedMir) (locals : List LocalSlot) (ops : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil) : OperandsEvalResult :=
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : OperandsEvalResult :=
   match ops with
   | .nil => .ok .nil locals
   | op :: rest =>
-    match evalOperandFast body locals op borrows globals callerLocals localDecls with
+    match evalOperandFast body locals op borrows globals callerLocals localDecls callStack with
     | .ok v locals₁ =>
-      match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls with
+      match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls callStack with
       | .ok vs locals₂ => .ok (v :: vs) locals₂
       | .ub => .ub
       | .unsupported => .unsupported
@@ -2278,31 +2329,33 @@ def evalOperandsFast
 theorem evalOperandsFast_eq
     (body : CapturedMir) (locals : List LocalSlot) (ops : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl) :
-    evalOperandsFast body locals ops borrows globals callerLocals localDecls =
-      evalOperands locals ops borrows globals body.layouts callerLocals localDecls := by
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandsFast body locals ops borrows globals callerLocals localDecls callStack =
+      evalOperands locals ops borrows globals body.layouts callerLocals localDecls callStack := by
   induction ops generalizing locals with
   | nil => rfl
   | cons op rest ih =>
     change
-      (match evalOperandFast body locals op borrows globals callerLocals localDecls with
+      (match evalOperandFast body locals op borrows globals callerLocals localDecls callStack with
        | .ok v locals₁ =>
-         match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls with
+         match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls callStack with
          | .ok vs locals₂ => OperandsEvalResult.ok (v :: vs) locals₂
          | .ub => OperandsEvalResult.ub
          | .unsupported => OperandsEvalResult.unsupported
        | .ub => OperandsEvalResult.ub
        | .unsupported => OperandsEvalResult.unsupported) =
-      (match evalOperand locals op borrows globals body.layouts callerLocals localDecls with
+      (match evalOperand locals op borrows globals body.layouts callerLocals localDecls callStack with
        | .ok v locals₁ =>
-         match evalOperands locals₁ rest borrows globals body.layouts callerLocals localDecls with
+         match evalOperands locals₁ rest borrows globals body.layouts callerLocals localDecls
+             callStack with
          | .ok vs locals₂ => OperandsEvalResult.ok (v :: vs) locals₂
          | .ub => OperandsEvalResult.ub
          | .unsupported => OperandsEvalResult.unsupported
        | .ub => OperandsEvalResult.ub
        | .unsupported => OperandsEvalResult.unsupported)
     rw [evalOperandFast_eq]
-    cases evalOperand locals op borrows globals body.layouts callerLocals localDecls with
+    cases evalOperand locals op borrows globals body.layouts callerLocals localDecls callStack with
     | ok v locals₁ =>
       dsimp only
       rw [ih locals₁]
@@ -2383,7 +2436,8 @@ def evalRvalueFast
     RvalueEvalResult :=
   match rv with
   | .use op =>
-    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok v locals' =>
       match validateLoadedValue body.layouts body.localDecls op v with
       | false => .ub
@@ -2407,7 +2461,8 @@ def evalRvalueFast
   | .cast ck op targetTy =>
     match ck with
     | .intToInt =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok (.scalar sc) locals' =>
         match Nat.beq sc.sizeBytes 0 with
         | true => .unsupported
@@ -2428,16 +2483,19 @@ def evalRvalueFast
       | .ub => .ub
       | .unsupported => .unsupported
     | .transmute =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ub => .ub
       | .unsupported => .unsupported
       | .ok v locals' =>
         evalByteCastAfterOperand body op targetTy v locals' mem
     | _ => evalRvalueFallback locals (.cast ck op targetTy) mem body.localDecls body.layouts
   | .binaryOp op lhsOp rhsOp =>
-    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok lhsVal locals₁ =>
-      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
@@ -2464,6 +2522,7 @@ def evalRvalueFast
                   (layoutPointerBytes body.layouts)
                   ptrVal
                   sz
+                  mem.callStack
               with
               | .some lhsAddrSc =>
                 evalScalarBinOp op lhsAddrSc offsetSc locals₂ mem false
@@ -2482,6 +2541,7 @@ def evalRvalueFast
                 (layoutPointerBytes body.layouts)
                 ptrVal
                 sz
+                mem.callStack
             with
             | .some rhsAddrSc =>
               evalScalarBinOp op lhsSc rhsAddrSc locals₂ mem false
@@ -2500,7 +2560,8 @@ def evalRvalueFast
                 body.layouts
                 ptrBytes
                 lhsPtr
-                lhsSz,
+                lhsSz
+                mem.callStack,
               ptrAddressScalar?
                 locals₂
                 mem.borrows
@@ -2510,6 +2571,7 @@ def evalRvalueFast
                 ptrBytes
                 rhsPtr
                 rhsSz
+                mem.callStack
             with
             | .some lhsAddrSc, .some rhsAddrSc =>
               evalScalarBinOp op lhsAddrSc rhsAddrSc locals₂ mem false
@@ -2535,7 +2597,8 @@ def evalRvalueFast
   | .unaryOp uop op =>
     match uop with
     | .not =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok (.scalar sc) locals' =>
         evalUnaryNot sc (operandTy body.localDecls body.layouts op) locals' mem
       | .ok _ _ => .unsupported
@@ -2552,36 +2615,36 @@ theorem evalRvalueFast_eq
   | use op =>
     dsimp only [evalRvalueFast, evalRvalue]
     rw [evalOperandFast_eq]
-    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
   | cast ck op targetTy =>
     cases ck with
     | intToInt =>
       dsimp only [evalRvalueFast, evalRvalue]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ok v _ => cases v <;> rfl
       | _ => rfl
     | transmute =>
       dsimp only [evalRvalueFast, evalRvalue, evalByteCast]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
     | _ => rfl
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalueFast, evalRvalue]
     rw [evalOperandFast_eq]
-    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v locals₁ =>
       dsimp only
       rw [evalOperandFast_eq]
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
   | unaryOp uop op =>
     cases uop with
     | not =>
       dsimp only [evalRvalueFast, evalRvalue]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ok v _ => cases v <;> rfl
       | _ => rfl
     | neg => rfl
@@ -2593,7 +2656,8 @@ def evalRvalueSymTreeFast
     SymTree RvalueEvalResult :=
   match rv with
   | .use op =>
-    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok v locals' =>
       .leaf (match validateLoadedValue body.layouts body.localDecls op v with
       | false => .ub
@@ -2629,6 +2693,7 @@ def evalRvalueSymTreeFast
           perm :=
             sharedBorrowPerm body.localDecls body.layouts
               { local_ := p.local_, projection := .nil }
+          targetFrameDepth := length mem.callStack
         }
         let mem' := {
           mem with
@@ -2638,7 +2703,8 @@ def evalRvalueSymTreeFast
         .leaf (.ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem')
     | _, _ => .leaf (evalRvalueFallback locals (.ref bk p) mem body.localDecls body.layouts)
   | .cast .transmute op targetTy =>
-    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
     | .ok v locals' =>
@@ -2646,15 +2712,18 @@ def evalRvalueSymTreeFast
   | .aggregate ak ops =>
     match ak with
     | .tuple =>
-      match evalOperandsFast body locals ops mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandsFast body locals ops mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok vals locals' => .leaf (.ok (.aggregate 0 vals) locals' mem)
       | .ub => .leaf .ub
       | .unsupported => .leaf .unsupported
     | _ => .leaf (evalRvalueFallback locals (.aggregate ak ops) mem body.localDecls body.layouts)
   | .binaryOp op lhsOp rhsOp =>
-    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok lhsVal locals₁ =>
-      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
@@ -2694,6 +2763,7 @@ def evalRvalueSymTreeFast
                   (layoutPointerBytes body.layouts)
                   ptrVal
                   sz
+                  mem.callStack
               with
               | .some lhsAddrSc =>
                 evalScalarBinOpSymTree op lhsAddrSc offsetSc locals₂ mem false
@@ -2712,6 +2782,7 @@ def evalRvalueSymTreeFast
                 (layoutPointerBytes body.layouts)
                 ptrVal
                 sz
+                mem.callStack
             with
             | .some rhsAddrSc =>
               evalScalarBinOpSymTree op lhsSc rhsAddrSc locals₂ mem false
@@ -2730,7 +2801,8 @@ def evalRvalueSymTreeFast
                 body.layouts
                 ptrBytes
                 lhsPtr
-                lhsSz,
+                lhsSz
+                mem.callStack,
               ptrAddressScalar?
                 locals₂
                 mem.borrows
@@ -2740,6 +2812,7 @@ def evalRvalueSymTreeFast
                 ptrBytes
                 rhsPtr
                 rhsSz
+                mem.callStack
             with
             | .some lhsAddrSc, .some rhsAddrSc =>
               evalScalarBinOpSymTree op lhsAddrSc rhsAddrSc locals₂ mem false
@@ -2766,7 +2839,8 @@ def evalRvalueSymTreeFast
   | .unaryOp uop op =>
     match uop with
     | .not =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok (.scalar sc) locals' =>
         evalUnaryNotSymTree sc (operandTy body.localDecls body.layouts op) locals' mem
       | .ok _ _ => .leaf .unsupported
@@ -2783,7 +2857,7 @@ theorem evalRvalueSymTreeFast_eq
   | use op =>
     dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
     rw [evalOperandFast_eq]
-    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
   | ref bk p =>
     cases bk with
     | shared =>
@@ -2802,25 +2876,25 @@ theorem evalRvalueSymTreeFast_eq
       dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalueFallback,
         evalRvalue, evalByteCast]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
     | _ => rfl
   | aggregate ak ops =>
     cases ak with
     | tuple =>
       dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
       rw [evalOperandsFast_eq]
-      cases evalOperands locals ops mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperands locals ops mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
     | _ => rfl
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
     rw [evalOperandFast_eq]
-    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v locals₁ =>
       dsimp only
       rw [evalOperandFast_eq]
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok v₂ locals₂ =>
@@ -2836,7 +2910,7 @@ theorem evalRvalueSymTreeFast_eq
     | not =>
       dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ok v _ => cases v <;> rfl
       | _ => rfl
     | neg => rfl
@@ -2857,10 +2931,12 @@ def finishAssignStmtNodeFast
         match set? locals₁ dst.local_ (.init val) with
         | .some locals₂ =>
           match hasProtectedWriteConflict mem₁.borrows mem₁.activeProtectors
-              dst.local_ .none .nil with
+              dst.local_ .none .nil 0 0 (length mem₁.callStack) with
           | true => MirStepNode.fail .ub
           | false =>
-            let borrows' := invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+            let borrows' :=
+              invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+                (length mem₁.callStack)
             MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
@@ -2925,19 +3001,20 @@ def evalStmtFast
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
               s.memory.borrows
               (protHead :: protTail)
               loc
+              (length s.memory.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -2949,19 +3026,20 @@ def evalStmtFast
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
               s.memory.borrows
               (protHead :: protTail)
               loc
+              (length s.memory.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .nop => MirStepNode.step (advanceStmt s s.frame.locals)
@@ -3016,19 +3094,20 @@ def evalStmtSymTreeFast
            | .nil =>
              MirStepNode.step
                (advanceStmt s locals'
-                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
            | protHead :: protTail =>
              match
                hasProtectedLocalBorrow
                  s.memory.borrows
                  (protHead :: protTail)
                  loc
+                 (length s.memory.callStack)
              with
              | true => MirStepNode.fail .ub
              | false =>
                MirStepNode.step
                  (advanceStmt s locals'
-                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .storageDead loc =>
@@ -3041,19 +3120,20 @@ def evalStmtSymTreeFast
            | .nil =>
              MirStepNode.step
                (advanceStmt s locals'
-                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
            | protHead :: protTail =>
              match
                hasProtectedLocalBorrow
                  s.memory.borrows
                  (protHead :: protTail)
                  loc
+                 (length s.memory.callStack)
              with
              | true => MirStepNode.fail .ub
              | false =>
                MirStepNode.step
                  (advanceStmt s locals'
-                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .nop => .leaf (MirStepNode.step (advanceStmt s s.frame.locals))
@@ -3085,12 +3165,23 @@ def evalTerminatorSymTreeFast
     match s.memory.callStack with
     | .nil =>
       match get? s.frame.locals 0 with
-      | .some (.init retVal) => .leaf (MirStepNode.retNormal retVal s.memory)
+      | .some (.init retVal) =>
+        .leaf
+          (match
+            hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length s.memory.callStack) (length s.frame.locals)
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.retNormal retVal
+              { s.memory with
+                borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                  (length s.frame.locals) })
       | _ => .leaf (MirStepNode.fail .ub)
     | _ :: _ => evalTerminatorFallback s term body
   | .switchInt discr targets =>
     match evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       (lookupSwitchTargetTree sc.bits targets.branches targets.otherwise).bind
         (fun target =>
@@ -3102,7 +3193,7 @@ def evalTerminatorSymTreeFast
     | .unsupported => .leaf MirStepNode.unsupported
   | .assert cond expected target unwind =>
     match evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
       .branch (Nat.beq sc.bits expectedBit)
@@ -3131,7 +3222,13 @@ theorem evalTerminatorSymTreeFast_eq
     | nil =>
       cases get? s.frame.locals 0 with
       | none => rfl
-      | some slot => cases slot <;> rfl
+      | some slot =>
+        cases slot with
+        | dead => rfl
+        | uninit => rfl
+        | init _ =>
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              0 (length s.frame.locals) <;> rfl
     | cons _ _ => rfl
   | switchInt discr targets =>
     show evalTerminatorSymTreeFast body s { kind := .switchInt discr targets, span := span } =
@@ -3145,7 +3242,7 @@ theorem evalTerminatorSymTreeFast_eq
     dsimp only
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rfl
     | unsupported => rfl
     | ok v _ => cases v <;> rfl
@@ -3658,19 +3755,30 @@ def evalTerminatorCfg
     match s.memory.callStack with
     | .nil =>
       match get? s.frame.locals 0 with
-      | .some (.init retVal) => .halted ok (.normal (retVal, s.memory))
+      | .some (.init retVal) =>
+        match
+          hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals)
+        with
+        | true => .faulted
+        | false =>
+          .halted ok
+            (.normal (retVal,
+              { s.memory with
+                borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                  (length s.frame.locals) }))
       | _ => .faulted
     | _ :: _ => .faulted
   | .switchInt discr targets =>
     match evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       let target := lookupSwitchTarget sc.bits targets.branches targets.otherwise
       .running ok .none { s with frame := { blockIdx := target, stmtIdx := 0, locals := locals' } }
     | _ => .faulted
   | .assert cond expected target _ =>
     match evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
       .running (Bool.and ok (Nat.beq sc.bits expectedBit)) .none
@@ -3781,17 +3889,23 @@ theorem cfgOk_evalTerminatorCfg_false
     | nil =>
       cases get? s.frame.locals 0 with
       | none => rfl
-      | some slot => cases slot <;> rfl
+      | some slot =>
+        cases slot with
+        | dead => rfl
+        | uninit => rfl
+        | init _ =>
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) <;> rfl
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg]
     cases evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | ok v _ => cases v <;> rfl
     | _ => rfl
   | assert cond expected target unwind =>
     dsimp only [evalTerminatorCfg]
     cases evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | ok v _ => cases v <;> rfl
     | _ => rfl
   | _ => rfl
@@ -3968,15 +4082,19 @@ theorem wpCoalBounded_evalTerminatorCfg
         | dead => rintro ⟨⟩ _
         | uninit => rintro ⟨⟩ _
         | init retVal =>
-          intro _ h_wp
-          dsimp only [stepNodeWP, MirStepNode.retNormal] at h_wp ⊢
-          rw [runCfgSteps_halted] at h_wp
-          exact h_wp.2
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
+          | true => rintro ⟨⟩ _
+          | false =>
+            intro _ h_wp
+            dsimp only [stepNodeWP, MirStepNode.retNormal] at h_wp ⊢
+            rw [runCfgSteps_halted] at h_wp
+            exact h_wp.2
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -4003,7 +4121,7 @@ theorem wpCoalBounded_evalTerminatorCfg
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -4453,15 +4571,19 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
         | dead => rintro ⟨⟩ _
         | uninit => rintro ⟨⟩ _
         | init retVal =>
-          intro _ h_wp
-          dsimp only [stepNodeStepsWP, MirStepNode.retNormal] at h_wp ⊢
-          rw [runCfgSteps_halted] at h_wp
-          exact h_wp.2
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
+          | true => rintro ⟨⟩ _
+          | false =>
+            intro _ h_wp
+            dsimp only [stepNodeStepsWP, MirStepNode.retNormal] at h_wp ⊢
+            rw [runCfgSteps_halted] at h_wp
+            exact h_wp.2
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -4488,7 +4610,7 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>

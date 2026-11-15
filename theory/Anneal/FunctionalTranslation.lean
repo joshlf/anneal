@@ -715,6 +715,7 @@ def inspectBinarySwitch
                 s.memory.globals
                 currentBody.layouts
                 s.memory.callerLocals
+                (callStack := s.memory.callStack)
             with
             | .ok (.scalar sc) locals' =>
               let cond := !(Nat.beq sc.bits matchVal)
@@ -779,7 +780,8 @@ theorem stepMirFn_of_inspectBinarySwitch
                         s.memory.borrows
                         s.memory.globals
                         (s.memory.activeCallee.getD body).layouts
-                        s.memory.callerLocals with
+                        s.memory.callerLocals
+                        (callStack := s.memory.callStack) with
                   | ub => rw [h_op] at h; nomatch h
                   | unsupported => rw [h_op] at h; nomatch h
                   | ok v locals' =>
@@ -1971,6 +1973,9 @@ private theorem lookupBorrow_tag_eq
       subst h_hd
       exact Nat.eq_of_beq_eq_true h_eq
 
+/-- A write through `tag` (scoped to the frame `entry.targetFrameDepth` that owns
+its target local) keeps an `.active` or `.reserved` entry `.active` and leaves
+its target local unchanged. -/
 private theorem lookupBorrow_invalidate_self_active
     (borrows : List BorrowEntry) (tag : Nat)
     {entry : BorrowEntry}
@@ -1978,19 +1983,21 @@ private theorem lookupBorrow_invalidate_self_active
     (h_perm : entry.perm = .active ∨ entry.perm = .reserved) :
     ∃ entry',
       lookupBorrow
-        (invalidateConflictingBorrows borrows entry.targetLocal (some tag))
+        (invalidateConflictingBorrows borrows entry.targetLocal (some tag)
+          entry.targetFrameDepth)
         tag = some entry' ∧
       entry'.targetLocal = entry.targetLocal ∧
       entry'.perm = .active := by
   have h_etag : entry.tag = tag := lookupBorrow_tag_eq h_look
   rw [lookupBorrow_invalidateConflictingBorrows, h_look]
   dsimp only [Option.map]
-  refine ⟨updateBorrowPerm entry entry.targetLocal (some tag), rfl, ?_, ?_⟩
+  refine ⟨updateBorrowPerm entry entry.targetLocal (some tag) entry.targetFrameDepth,
+    rfl, ?_, ?_⟩
   · unfold updateBorrowPerm
-    simp only [Nat.beq_refl]
+    simp only [Nat.beq_refl, Bool.true_and]
     exact (applyTreeBorrowTransition_fields _ _).2.1
   · unfold updateBorrowPerm
-    simp only [Nat.beq_refl, treeBorrowWriterRelatedness, h_etag]
+    simp only [Nat.beq_refl, Bool.true_and, treeBorrowWriterRelatedness, h_etag]
     rcases h_perm with hp | hp <;> simp [hp]
 
 @[simp]
@@ -2152,7 +2159,8 @@ theorem memoryPtrMutLens_writeBack_sep
   let m₁ : Memory :=
     { m with
       borrows :=
-        invalidateConflictingBorrows m.borrows entry.targetLocal (some rp.tag) }
+        invalidateConflictingBorrows m.borrows entry.targetLocal (some rp.tag)
+          entry.targetFrameDepth }
   have h_tb : stepTreeBorrowAccess? m rp true = some m₁ := by
     simp [stepTreeBorrowAccess?, h_look₂, h_perm, m₁]
   have h_ml₁ : memoryLocals m₁ = memoryLocals m := rfl
@@ -2235,7 +2243,8 @@ theorem memoryPtrMutLens_writeBack_agreeOnDisjointAllocs
   let m₁ : Memory :=
     { m with
       borrows :=
-        invalidateConflictingBorrows m.borrows entry.targetLocal (some rp.tag) }
+        invalidateConflictingBorrows m.borrows entry.targetLocal (some rp.tag)
+          entry.targetFrameDepth }
   have h_tb : stepTreeBorrowAccess? m rp true = some m₁ := by
     simp [stepTreeBorrowAccess?, h_look₂, h_perm, m₁]
   have h_ml₁ : memoryLocals m₁ = memoryLocals m := rfl

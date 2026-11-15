@@ -14,6 +14,7 @@ import Trusted.Rustc.V2026_06_01.Layout
 import Anneal.BitValidity
 import Anneal.ByteCodec
 import Anneal.MirFuelFree
+import Anneal.Mir.IeeeFloatCast
 
 open Trusted.MirAst
 open Trusted.MirSemantics
@@ -110,9 +111,9 @@ theorem ptr_to_usize_cast_step_correspondence
     (op : Operand)
     (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
     (localDecls : List LocalDecl)
-    (h_eval : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_eval : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal 8) locals') :
-    (match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    (match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
      | .ok (.ptr p _) locs =>
        let addr := Nat.add (Nat.mul p.allocId pageOffsetModulus) p.offsetBytes
        ok (.scalar ⟨addr, 8⟩) locs mem
@@ -152,9 +153,9 @@ theorem int_to_ptr_cast_step_correspondence
     (op : Operand)
     (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
     (localDecls : List LocalDecl)
-    (h_eval : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_eval : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals') :
-    (match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    (match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
      | .ok (.scalar s) locs =>
        let p : ProvenancePtr := {
          allocId := Nat.div s.bits pageOffsetModulus
@@ -4344,7 +4345,7 @@ theorem trusted_evalByteCast_eq
     (v : Value)
     (srcTy dstTy : Ty)
     (srcSize dstSize : Nat)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_dst_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts dstTy) =
       some dstSize)
@@ -4386,7 +4387,7 @@ theorem trusted_evalByteCast_size_mismatch
     (v : Value)
     (srcTy dstTy : Ty)
     (srcSize dstSize : Nat)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_dst_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts dstTy) =
       some dstSize)
@@ -4415,7 +4416,7 @@ theorem trusted_evalByteCast_of_encode
     (srcTy dstTy : Ty)
     (size : Nat)
     (bs : List AbstractByte)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_dst_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts dstTy) =
       some size)
@@ -4491,7 +4492,7 @@ theorem trusted_tyByteSize_adt_primitive_none
 theorem trusted_evalByteCast_dst_size_none
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (v : Value) (dstTy : Ty)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_dst_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts dstTy) =
       none) :
@@ -4507,7 +4508,7 @@ theorem trusted_evalByteCast_src_size_none
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (v : Value) (srcTy dstTy : Ty)
     (dstSize : Nat)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_dst_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts dstTy) =
       some dstSize)
@@ -4599,7 +4600,7 @@ theorem trusted_evalByteCast_u8_to_bool_iff
     (srcLIdx dstLIdx : Nat)
     (bits : Nat)
     (h_bits : bits < 256)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 1⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .uint .u8, layoutIdx := srcLIdx }) :
@@ -4671,7 +4672,7 @@ theorem trusted_evalByteCast_u32_to_char_iff
     (srcLIdx dstLIdx : Nat)
     (bits : Nat)
     (h_bits : bits < scalarModulus 4)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 4⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .uint .u32, layoutIdx := srcLIdx }) :
@@ -4789,7 +4790,7 @@ theorem trusted_evalByteCast_thin_rawPtr_to_ref_preserves_provenance
     (h_thin1 : isThinPointee pt1 = true)
     (h_thin2 : isThinPointee pt2 = true)
     (h_off : p.offsetBytes < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .rawPtr m1 pt1, layoutIdx := srcLIdx }) :
@@ -4821,7 +4822,7 @@ theorem trusted_evalByteCast_u64_to_ref_ub
     (h_pw : layoutPointerBytes layouts = 8)
     (h_thin : isThinPointee pointee = true)
     (h_bits : bits < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 8⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .uint .u64, layoutIdx := srcLIdx }) :
@@ -4856,7 +4857,7 @@ theorem trusted_evalByteCast_u64_zero_to_ref_ub
     (srcLIdx dstLIdx : Nat)
     (h_pw : layoutPointerBytes layouts = 8)
     (h_thin : isThinPointee pointee = true)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨0, 8⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .uint .u64, layoutIdx := srcLIdx }) :
@@ -4892,7 +4893,7 @@ theorem trusted_evalByteCast_thin_rawPtr_preserves_provenance
     (h_thin1 : isThinPointee pt1 = true)
     (h_thin2 : isThinPointee pt2 = true)
     (h_off : p.offsetBytes < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .rawPtr m1 pt1, layoutIdx := srcLIdx }) :
@@ -5301,7 +5302,7 @@ theorem trusted_evalByteCast_scalar_to_adt_eq
     (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
     (hValidAdt : layoutValidForAdt l = true)
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -5499,7 +5500,7 @@ theorem trusted_evalByteCast_scalar_transmute_correspondence
     (h_src : src.isPtr = false)
     (h_dst : dst.isPtr = false)
     (h_valid : src.validBits .bits64 bits)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -5549,11 +5550,11 @@ theorem trusted_evalByteCast_int_uint_roundtrip
     (layouts : LayoutTable)
     (intLIdx uintLIdx : Nat)
     (h_bits : bits < scalarModulus (w.byteSize .bits64))
-    (h_op₁ : evalOperand locals₁ op₁ mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op₁ : evalOperand locals₁ op₁ mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, w.byteSize .bits64⟩) locals₁')
     (h_ty₁ : operandTy localDecls layouts op₁ =
       .some { kind := .int w.toTrustedIntTy, layoutIdx := intLIdx })
-    (h_op₂ : evalOperand locals₂ op₂ mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op₂ : evalOperand locals₂ op₂ mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, w.byteSize .bits64⟩) locals₂')
     (h_ty₂ : operandTy localDecls layouts op₂ =
       .some { kind := .uint w.toTrustedUintTy, layoutIdx := uintLIdx }) :
@@ -5696,7 +5697,7 @@ theorem trusted_evalByteCast_thin_ptr_transmute_correspondence
     (h_thin2 : isThinPointee pt2 = true)
     (h_src_valid : src.validBits .bits64 p.offsetBytes)
     (h_dst_valid : dst.validBits .bits64 p.offsetBytes)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -5764,7 +5765,7 @@ theorem trusted_evalByteCast_int_to_thin_rawPtr_transmute_correspondence
     (h_sz : src.sizeBytes .bits64 = 8)
     (h_thin2 : isThinPointee pt2 = true)
     (h_bits : bits < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -5831,7 +5832,7 @@ theorem trusted_evalByteCast_int_to_thin_ref_transmute_divergence
     (h_sz : src.sizeBytes .bits64 = 8)
     (h_thin2 : isThinPointee pt2 = true)
     (h_bits : bits < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -5897,7 +5898,7 @@ theorem trusted_evalByteCast_thin_ptr_to_int_transmute_ub
     (h_int : dst.isIntegral = true)
     (h_sz : dst.sizeBytes .bits64 = 8)
     (h_src_valid : src.validBits .bits64 p.offsetBytes)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -5965,7 +5966,7 @@ theorem trusted_evalByteCast_null_offset_ref_divergence
     (h_pw : layoutPointerBytes layouts = 8)
     (h_thin1 : isThinPointee pt1 = true)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr { allocId := allocId, offsetBytes := 0 } 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .rawPtr m1 pt1, layoutIdx := srcLIdx }) :
@@ -5989,9 +5990,9 @@ rewritten). -/
 theorem recoverExposedPtrValue?_nil_borrows
     (locals : List LocalSlot) (globals : List CapturedAllocation) (callerLocals : List LocalSlot)
     (exposed : List AllocId) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (ptrBytes addrBits : Nat) :
+    (ptrBytes addrBits : Nat) (callStack : List SavedCallerFrame) :
     recoverExposedPtrValue? locals .nil globals callerLocals exposed localDecls layouts ptrBytes
-        addrBits =
+        addrBits callStack =
       match
         (match lookupGlobalAlloc globals (Nat.div addrBits 65536) with
          | .some alloc =>
@@ -6035,7 +6036,7 @@ theorem trusted_transmute_int_to_rawPtr_vs_pointerWithExposedProvenance
     (h_sz : src.sizeBytes .bits64 = 8)
     (h_thin2 : isThinPointee pt2 = true)
     (h_bits : bits < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -6066,7 +6067,7 @@ theorem trusted_transmute_int_to_rawPtr_vs_pointerWithExposedProvenance
       (.cast .pointerWithExposedProvenance op { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
       mem localDecls layouts =
         match recoverExposedPtrValue? locals' mem.borrows mem.globals mem.callerLocals
-            mem.exposedAllocIds localDecls layouts 8 bits with
+            mem.exposedAllocIds localDecls layouts 8 bits mem.callStack with
         | .some v => ok v locals' mem
         | .none => unsupported := by
     show evalPointerWithExposedProvenance locals op _ mem localDecls layouts = _
@@ -6204,8 +6205,9 @@ theorem trusted_exposedPostState_frame (mem : Memory) (e : List Nat) :
     mem'.activeCallee = mem.activeCallee ∧ mem'.activeProtectors = mem.activeProtectors ∧
     mem'.fnPtrs = mem.fnPtrs ∧
     (∀ locals op layouts localDecls,
-      evalOperand locals op mem'.borrows mem'.globals layouts mem'.callerLocals localDecls =
-        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls) :=
+      evalOperand locals op mem'.borrows mem'.globals layouts mem'.callerLocals localDecls mem'.callStack =
+        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+          mem.callStack) :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ _ _ _ => rfl⟩
 
 /-- **`PtrToInt` exposes provenance in `Trusted` (exact memory post-state).** For every caller
@@ -6225,10 +6227,10 @@ theorem trusted_pointerExposeProvenance_eval
     (outBytes fullAddr : Nat)
     (h_tgt : exposeTargetBytes? (layoutPointerBytes layouts) ty = some outBytes)
     (h_src : isExposePtrSourceTy (operandTy localDecls layouts op) = true)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p (layoutPointerBytes layouts)) locals')
     (h_addr : ptrAddress? locals' mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) p = some fullAddr) :
+      (layoutPointerBytes layouts) p mem.callStack = some fullAddr) :
     evalRvalue locals (.cast .pointerExposeProvenance op ty) mem localDecls layouts =
       ok (.scalar ⟨wrapScalarBits
             (wrapScalarBits fullAddr (scalarModulus (layoutPointerBytes layouts)))
@@ -6265,7 +6267,7 @@ theorem trusted_pointerExposeProvenance_address_model_bridge
     (h_src : isExposePtrSourceTy (operandTy localDecls layouts op) = true)
     (h_off : p.offsetBytes < scalarModulus 8)
     (h_lookup : lookupBorrow mem.borrows p.tag = none)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals') :
     evalRvalue locals (.cast .pointerExposeProvenance op { kind := .uint .usize, layoutIdx := lIdx })
         mem localDecls layouts =
@@ -6278,7 +6280,7 @@ theorem trusted_pointerExposeProvenance_address_model_bridge
   refine ⟨?_, (ptrToInt_intToPtr_roundtrip .bits64 .usize p exposed rfl h_off h_off).1,
     trusted_recordExposedAllocId_eq_exposeProv exposed p.allocId, ?_⟩
   · have h_addr : ptrAddress? locals' mem.borrows mem.callerLocals localDecls layouts
-        (layoutPointerBytes layouts) p = some (ptrToAddress p) := by
+        (layoutPointerBytes layouts) p mem.callStack = some (ptrToAddress p) := by
       unfold ptrAddress?
       rw [h_lookup]
       rfl
@@ -6326,9 +6328,9 @@ theorem trusted_vs_anneal_expose_withExposed_roundtrip_agreement
     (h_borrows : mem.borrows = [])
     (h_glob : lookupGlobalAlloc mem.globals p.allocId = none)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress p, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -6400,9 +6402,9 @@ theorem trusted_vs_anneal_expose_withExposed_in_alloc_offset_agreement
     (h_borrows : mem.borrows = [])
     (h_glob : lookupGlobalAlloc mem.globals allocId = none)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr { allocId := allocId, offsetBytes := off₁ } 8) locals')
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress { allocId := allocId, offsetBytes := off₂ }, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -6484,7 +6486,7 @@ theorem trusted_vs_anneal_expose_other_alloc_isolation_agreement
     (h_unexp_t : isExposedAllocId mem.exposedAllocIds q.allocId = false)
     (h_unexp_a : isExposedBool q.allocId exposed = false)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress q, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -6628,9 +6630,9 @@ theorem trusted_vs_anneal_expose_withExposed_deterministic_least_exposed
     (h_borrows : mem.borrows = [])
     (h_glob : lookupGlobalAlloc mem.globals p.allocId = none)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress p, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -6695,9 +6697,9 @@ theorem trusted_vs_anneal_expose_withExposed_deterministic_from_empty_agreement
     (h_borrows : mem.borrows = [])
     (h_glob : lookupGlobalAlloc mem.globals p.allocId = none)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress p, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -6746,9 +6748,9 @@ theorem trusted_vs_anneal_expose_withExposed_in_alloc_offset_deterministic_least
     (h_borrows : mem.borrows = [])
     (h_glob : lookupGlobalAlloc mem.globals allocId = none)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr { allocId := allocId, offsetBytes := off₁ } 8) locals')
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress { allocId := allocId, offsetBytes := off₂ }, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -6827,7 +6829,7 @@ theorem trusted_vs_anneal_expose_other_alloc_deterministic_divergence
     (h_glob_q : lookupGlobalAlloc mem.globals q.allocId = none)
     (h_unexp_t : isExposedAllocId mem.exposedAllocIds q.allocId = false)
     (h_thin2 : isThinPointee pt2 = true)
-    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨ptrToAddress q, 8⟩) locals₃)
     (h_ty2 : operandTy localDecls layouts op2 =
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
@@ -7065,7 +7067,7 @@ theorem trusted_transmute_thin_rawPtr_eq_ptrToPtr_cast
     (h_thin2 : isThinPointee pt2 = true)
     (h_src_valid : src.validBits .bits64 p.offsetBytes)
     (h_lookup : lookupBorrow mem.borrows p.tag = none)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -7134,7 +7136,7 @@ theorem trusted_evalByteCast_size_mismatch_transmute_correspondence
     (h_thin1 : isThinPointee pt1 = true)
     (h_thin2 : isThinPointee pt2 = true)
     (h_ne : src.sizeBytes .bits64 ≠ dst.sizeBytes .bits64)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -8301,7 +8303,7 @@ theorem trusted_evalByteCast_overwrite_provenance_no_forge_agreement
     (h_thin : isThinPointee pt = true)
     (h_i : i < 8)
     (h_b : b.prov = none ∨ ∃ f a, b.prov = some f ∧ optAlloc = some a ∧ f.allocId ≠ a)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_ty : operandTy localDecls layouts op = some srcTy)
     (h_src_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts srcTy) =
@@ -8828,7 +8830,7 @@ theorem trusted_evalByteCast_union_rawOverlay_no_forge_agreement
   intro bytes op
   let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
   have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
-  have hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+  have hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (unionRawOverlayValue count (bytes.map CastByte.toTrustedAbstractByte)) locals := by
     unfold evalOperand
     dsimp only [op]
@@ -8902,7 +8904,7 @@ theorem trusted_evalByteCast_move_union_rawOverlay_no_forge_agreement
   intro bytes op
   let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
   have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
-  have hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+  have hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (unionRawOverlayValue count (bytes.map CastByte.toTrustedAbstractByte)) locals' := by
     unfold evalOperand
     dsimp only [op]
@@ -9173,17 +9175,17 @@ theorem trusted_union_field_read_rawOverlay_no_forge_agreement
         .bits64 .rawPtr
     readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
         [.field idx rawFieldTy] = .ok outVal ∧
-    evalOperand locals (.copy rawPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    evalOperand locals (.copy rawPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok outVal locals ∧
-    evalOperand locals (.move rawPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    evalOperand locals (.move rawPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok outVal locals ∧
     evalPlaceRead locals rawPlace mem.borrows mem.globals layouts mem.callerLocals localDecls =
       .ok outVal locals ∧
     readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
         [.field idx refFieldTy] = .ub ∧
-    evalOperand locals (.copy refPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    evalOperand locals (.copy refPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ub ∧
-    evalOperand locals (.move refPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    evalOperand locals (.move refPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ub ∧
     evalPlaceRead locals refPlace mem.borrows mem.globals layouts mem.callerLocals localDecls =
       .ub := by
@@ -9270,9 +9272,9 @@ theorem trusted_union_rawOverlay_intact_ptr_roundtrip
       ok (.ptr pCanon 8) locals mem ∧
     readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
         [.field idx ptrTy] = .ok (.ptr pCanon 8) ∧
-    evalOperand locals (.copy fPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    evalOperand locals (.copy fPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr pCanon 8) locals ∧
-    evalOperand locals (.move fPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    evalOperand locals (.move fPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr pCanon 8) locals ∧
     evalPlaceRead locals fPlace mem.borrows mem.globals layouts mem.callerLocals localDecls =
       .ok (.ptr pCanon 8) locals := by
@@ -9303,7 +9305,7 @@ theorem trusted_union_rawOverlay_intact_ptr_roundtrip
     cases isRef <;> exact h0
   let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
   have hOp : evalOperand locals (.copy ⟨loc, .nil⟩) mem.borrows mem.globals layouts
-      mem.callerLocals localDecls = .ok (unionRawOverlayValue count tBytes) locals := by
+      mem.callerLocals localDecls mem.callStack = .ok (unionRawOverlayValue count tBytes) locals := by
     unfold evalOperand; dsimp only; rw [hGet]; rfl
   have hTy : operandTy localDecls layouts (.copy ⟨loc, .nil⟩) = some uTy := by
     unfold operandTy placeTy; dsimp only; rw [hDecl]
@@ -9372,7 +9374,7 @@ theorem trusted_evalByteCast_thin_ptr_to_union_rawOverlay
     (hVar : uL.variants = .single 0)
     (hFields : uL.fields = .union count)
     (hSz : uL.size.bytes = 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       some { kind := (match isRef with | true => .ref m pt | false => .rawPtr m pt),
@@ -9447,7 +9449,7 @@ theorem trusted_evalByteCast_thin_rawPtr_to_union_rawOverlay
     (hVar : uL.variants = .single 0)
     (hFields : uL.fields = .union count)
     (hSz : uL.size.bytes = 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       some { kind := .rawPtr m pt, layoutIdx := srcLIdx }) :
@@ -9491,7 +9493,7 @@ theorem trusted_ptr_union_ptr_roundtrip
     (hVar : uL.variants = .single 0)
     (hFields : uL.fields = .union count)
     (hSz : uL.size.bytes = 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       some { kind := (match isRef1 with | true => .ref m pt | false => .rawPtr m pt),
@@ -9514,10 +9516,10 @@ theorem trusted_ptr_union_ptr_roundtrip
     evalRvalue locals₂ (.cast .transmute (.copy ⟨uLoc, .nil⟩) ptrTy) mem₂ localDecls layouts =
       ok (.ptr p 8) locals₂ mem₂ ∧
     evalOperand locals₂ (.copy fPlace) mem₂.borrows mem₂.globals layouts mem₂.callerLocals
-        localDecls =
+        localDecls mem₂.callStack =
       .ok (.ptr p 8) locals₂ ∧
     evalOperand locals₂ (.move fPlace) mem₂.borrows mem₂.globals layouts mem₂.callerLocals
-        localDecls =
+        localDecls mem₂.callStack =
       .ok (.ptr p 8) locals₂ ∧
     evalPlaceRead locals₂ fPlace mem₂.borrows mem₂.globals layouts mem₂.callerLocals localDecls =
       .ok (.ptr p 8) locals₂ := by
@@ -9976,7 +9978,7 @@ theorem trusted_evalByteCast_provFree_ptr_eq
     (h_thin1 : isThinPointee pt1 = true)
     (h_dst_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts dstTy) =
       some 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 8⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -10011,7 +10013,7 @@ theorem trusted_evalByteCast_provFree_ptr_to_int_transmute_correspondence
     (h_thin1 : isThinPointee pt1 = true)
     (h_int : dst.isIntegral = true) (h_sz : dst.sizeBytes .bits64 = 8)
     (h_src_valid : src.validBits .bits64 bits)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok ((CastVal.ptr { allocId := 0, offsetBytes := bits } none).toTrustedValue .bits64 src)
         locals')
     (h_ty : operandTy localDecls layouts op =
@@ -10076,7 +10078,7 @@ theorem trusted_evalByteCast_provFree_ptr_to_rawPtr_transmute_correspondence
     (h_src : src.isPtr = true)
     (h_thin1 : isThinPointee pt1 = true) (h_thin2 : isThinPointee pt2 = true)
     (h_src_valid : src.validBits .bits64 bits)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok ((CastVal.ptr { allocId := 0, offsetBytes := bits } none).toTrustedValue .bits64 src)
         locals')
     (h_ty : operandTy localDecls layouts op =
@@ -10139,7 +10141,7 @@ theorem evalTransmuteSameSize_into_from_bytes_trusted_agreement
     (hWt : CastVal.WellTyped .bits64 src val)
     (hProvPtr : ∀ p a, val = .ptr p (some a) → dst.isPtr = true)
     (hThin1 : isThinPointee pt1 = true) (hThin2 : isThinPointee pt2 = true)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (val.toTrustedValue .bits64 src) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
@@ -10172,7 +10174,7 @@ theorem evalTransmuteSameSize_into_from_bytes_trusted_agreement
   | ptr p prov =>
     rcases hWt with ⟨hSrcPtr, hSrcValid, hProv⟩
     rcases hProv with rfl | ⟨rfl, hZeroAlloc⟩
-    · have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    · have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
           .ok (.ptr p 8) locals' := hOp
       have hDstPtr := hProvPtr p p.allocId rfl
       have hDstValid : dst.validBits .bits64 p.offsetBytes := by
@@ -10250,7 +10252,7 @@ theorem evalTransmuteSameSize_ok_of_into_from_bytes
       (∀ p a, val = .ptr p (some a) → dst.isPtr = true) →
       ∀ (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
         (localDecls : List LocalDecl),
-        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
           .ok (val.toTrustedValue .bits64 src) locals' →
         operandTy localDecls layouts op =
           some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx } →
@@ -10346,7 +10348,7 @@ theorem evalTransmuteSameSize_ok_of_checkIntoFromBytes
     (pw = .bits64 →
       ∀ (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
         (localDecls : List LocalDecl),
-        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
           .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals' →
         operandTy localDecls layouts op =
           some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx } →
@@ -10408,7 +10410,7 @@ theorem evalByteCast_ok_of_into_from_bytes
     (hSrcNorm : normalizeCodecTy (resolveTyWithLocalDecls localDecls layouts srcTy) =
       resolveTyWithLocalDecls localDecls layouts srcTy)
     (hSrcNu : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts srcTy) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (hTy : operandTy localDecls layouts op = some srcTy)
     (hEnc : encodeValueToBytes defaultCodecFuel layouts
@@ -10460,7 +10462,7 @@ theorem evalByteCast_ok_of_checkIntoFromBytes
     (hSrcNorm : normalizeCodecTy (resolveTyWithLocalDecls localDecls layouts srcTy) =
       resolveTyWithLocalDecls localDecls layouts srcTy)
     (hSrcNu : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts srcTy) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (hTy : operandTy localDecls layouts op = some srcTy)
     (hEnc : encodeValueToBytes defaultCodecFuel layouts
@@ -11022,7 +11024,7 @@ theorem tryTransmute_repr_u8_enum_validRange_iff
     (hSz1 : l.size.bytes = 1)
     (hRepr : l.backendRepr = .scalar (.initialized (.int 8 false) ⟨0, maxTag⟩))
     (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 1⟩) locals')
     (_hTy : operandTy localDecls layouts op =
       some { kind := .uint .u8, layoutIdx := srcLIdx }) :
@@ -11243,7 +11245,7 @@ theorem tryTransmute_adt_primitive_scalarLayout_eq
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
     (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (_hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11302,7 +11304,7 @@ theorem tryTransmute_nonZero_evalByteCast_iff
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
     (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11364,7 +11366,7 @@ theorem tryTransmute_enumRange_evalByteCast_iff
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
     (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11467,7 +11469,7 @@ theorem tryTransmute_adt_newtype_scalarLayout_eq
     (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11547,7 +11549,7 @@ theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
         .scalar (.initialized (.int bitsWidth signed) ⟨1, scalarModulus l.size.bytes - 1⟩))
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11607,7 +11609,7 @@ theorem trusted_evalByteCast_generic_nonZero_enforces_niche_vs_legacy_decoder
     (hSz : l.size.bytes = 4)
     (hRepr :
       l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩))
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 4⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := .uint .u32, layoutIdx := srcLIdx }) :
@@ -11670,7 +11672,7 @@ theorem tryTransmute_adt_multiple_enum_scalarLayout_eq
       ∀ tag < scalarModulus l.size.bytes,
         wrappingRangeContains validRange tag = true →
         ∃ varMemOrder, Trusted.Sequence.get? variantShapes tag = some (.arbitrary [] varMemOrder))
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11745,7 +11747,7 @@ theorem tryTransmute_adt_multiple_enumRange_evalByteCast_iff
       ∀ tag < scalarModulus l.size.bytes,
         wrappingRangeContains ⟨lo, hi⟩ tag = true →
         ∃ varMemOrder, Trusted.Sequence.get? variantShapes tag = some (.arbitrary [] varMemOrder))
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -11794,7 +11796,7 @@ theorem tryTransmute_repr_u8_multiple_enum_validRange_iff
       ∀ tag < 256,
         wrappingRangeContains ⟨0, maxTag⟩ tag = true →
         ∃ varMemOrder, Trusted.Sequence.get? variantShapes tag = some (.arbitrary [] varMemOrder))
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 1⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := .uint .u8, layoutIdx := srcLIdx }) :
@@ -11928,7 +11930,7 @@ theorem tryTransmute_adt_fieldLayout_inner_primitive_scalarLayout_eq
     (hFRepr : fl.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
     (hLSz : l.size.bytes = src.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -12003,7 +12005,7 @@ theorem evalByteCast_tryTransmute_of_into_tryFrom_bytes
     (hSrcNorm : normalizeCodecTy (resolveTyWithLocalDecls localDecls layouts srcTy) =
       resolveTyWithLocalDecls localDecls layouts srcTy)
     (hSrcNu : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts srcTy) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (hTy : operandTy localDecls layouts op = some srcTy)
     (hEnc : encodeValueToBytes defaultCodecFuel layouts
@@ -12071,7 +12073,7 @@ theorem evalByteCast_tryTransmute_of_checkInto_tryFrom_bytes
     (hSrcNorm : normalizeCodecTy (resolveTyWithLocalDecls localDecls layouts srcTy) =
       resolveTyWithLocalDecls localDecls layouts srcTy)
     (hSrcNu : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts srcTy) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (hTy : operandTy localDecls layouts op = some srcTy)
     (hEnc : encodeValueToBytes defaultCodecFuel layouts
@@ -12122,7 +12124,7 @@ theorem evalByteCast_adt_primitive_to_scalar_unsupported
     (hFields : l.fields = .primitive)
     (hLSz : l.size.bytes = dst.sizeBytes .bits64)
     (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := .adt defPath args, layoutIdx := srcLIdx }) :
@@ -12183,7 +12185,7 @@ theorem evalByteCast_adt_multiple_enum_to_scalar_ok
     (hLSz : l.size.bytes = dst.sizeBytes .bits64)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
     (hGetVar : Trusted.Sequence.get? variantShapes varIdx = some (.arbitrary [] varMemOrder))
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate varIdx []) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := .adt defPath args, layoutIdx := srcLIdx }) :
@@ -12257,7 +12259,7 @@ theorem evalByteCast_ok_of_checkIntoFromBytesNicheAware
     (hSrcNorm : normalizeCodecTy (resolveTyWithLocalDecls localDecls layouts srcTy) =
       resolveTyWithLocalDecls localDecls layouts srcTy)
     (hSrcNu : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts srcTy) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (hTy : operandTy localDecls layouts op = some srcTy)
     (hEnc : encodeValueToBytes defaultCodecFuel layouts
@@ -13011,7 +13013,7 @@ theorem trusted_evalByteCast_u64_to_fnPtr_ub
     (srcLIdx dstLIdx bits : Nat)
     (h_pw : layoutPointerBytes layouts = 8)
     (h_bits : bits < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 8⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .uint .u64, layoutIdx := srcLIdx }) :
@@ -13055,7 +13057,7 @@ theorem trusted_evalByteCast_u64_to_thin_rawPtr_strips_provenance
     (h_pw : layoutPointerBytes layouts = 8)
     (h_thin : isThinPointee pt = true)
     (h_bits : bits < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, 8⟩) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .uint .u64, layoutIdx := srcLIdx }) :
@@ -13091,7 +13093,7 @@ theorem trusted_evalByteCast_thin_rawPtr_to_fnPtr_preserves_provenance
     (h_pw : layoutPointerBytes layouts = 8)
     (h_thin1 : isThinPointee pt1 = true)
     (h_off : p.offsetBytes < scalarModulus 8)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr p 8) locals')
     (h_ty : operandTy localDecls layouts op =
       .some { kind := .rawPtr m1 pt1, layoutIdx := srcLIdx }) :
@@ -13132,7 +13134,7 @@ theorem trusted_evalByteCast_overwrite_provenance_no_forge_agreement_fnPtr
     (h_pw : layoutPointerBytes layouts = 8)
     (h_i : i < 8)
     (h_b : b.prov = none ∨ ∃ f a, b.prov = some f ∧ optAlloc = some a ∧ f.allocId ≠ a)
-    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok v locals')
     (h_ty : operandTy localDecls layouts op = some srcTy)
     (h_src_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts srcTy) =
@@ -13683,7 +13685,7 @@ theorem trusted_evalByteCast_scalarNicheNewtypeNonPtr_eq_filter
     (hVar : l.variants = .single varIdx)
     (hRepr : l.backendRepr = .scalar (.initialized pk range))
     (hWidth : primitiveKindByteWidth pk = some sz)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, sz⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -13703,7 +13705,7 @@ theorem trusted_evalByteCast_scalarNicheNewtypeNonPtr_eq_filter
     unfold layoutValidForAdt
     rw [hFields]
   have hLSz : l.size.bytes = src.sizeBytes .bits64 := hSize.trans hSrcSz.symm
-  have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+  have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals' := by
     rw [hSrcSz]; exact hOp
   have hBc : evalByteCast locals op dstTy mem localDecls layouts = res := by
@@ -13750,7 +13752,7 @@ theorem trusted_evalByteCast_scalarNicheNewtypeNonPtr_iff
     (hWidth : primitiveKindByteWidth pk = some sz)
     (hNotChar : Bool.and (Nat.beq sz 4)
       (Bool.and (Nat.beq range.start 0) (Nat.beq range.end_ 0x10FFFF)) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, sz⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -13907,7 +13909,7 @@ theorem trusted_evalByteCast_scalarNicheNewtype_iff
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz)
     (hNotChar : Bool.and (Nat.beq sz 4)
       (Bool.and (Nat.beq range.start 0) (Nat.beq range.end_ 0x10FFFF)) = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar ⟨bits, sz⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
@@ -14372,14 +14374,15 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_backing_iff
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat)
     (entry : BorrowEntry) (rootVal : Value)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hBacking :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection n
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -14410,7 +14413,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_backing_iff
   refine rvalueOk_and_ub_four_iff_of_bool_match _ _ _ _ rfl ?_
   unfold evalUnsizeCoercion
   dsimp only [slicePtrTargetKind] at *
-  rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
   cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
     simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hBacking, hAlign,
       LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -14427,14 +14430,15 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_misaligned_ub
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat)
     (entry : BorrowEntry) (rootVal : Value)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hBacking :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection n
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -14453,7 +14457,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_misaligned_ub
           mem localDecls layouts = .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hBacking, hMisalign,
         Bool.and_true, Bool.not_false] <;> rfl
@@ -14470,7 +14474,7 @@ theorem trusted_evalUnsizeCoercion_spec_none_ub
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
@@ -14493,7 +14497,7 @@ theorem trusted_evalUnsizeCoercion_spec_none_ub
       cases isDstRef <;> cases dstMut <;>
         simp only [hOp, Nat.beq_refl, hB, hTy, hSpec] <;> rfl
     | some entry =>
-      rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+      rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
       cases isDstRef <;> cases dstMut <;> cases perm <;>
         simp only [hOp, Nat.beq_refl, hB, hTy, hSpec] <;> rfl
   exact ⟨hUb, hUb⟩
@@ -14507,14 +14511,15 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_zst_unit_iff
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat)
     (entry : BorrowEntry) (rootVal : Value)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hNoAgg :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection n
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -14538,7 +14543,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_zst_unit_iff
         | false => .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hNoAgg, hUnit,
         LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -14552,7 +14557,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_perm_ub
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (entry : BorrowEntry)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hBadPerm : unsizeBorrowPermValid entry.perm dstMut = false) :
@@ -14569,7 +14574,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_perm_ub
           mem localDecls layouts = .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hBadPerm) <;>
       simp only [hOp, Bool.and_false, Bool.not_true, Nat.beq_refl, hBorrow] <;> rfl
   exact ⟨hUb, hUb⟩
@@ -14580,14 +14585,15 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_uninit_ub
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat) (entry : BorrowEntry)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
-    (hUninit : get? locals' entry.targetLocal = .some .uninit) :
+    (hUninit : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some .uninit) :
     evalUnsizeCoercion locals op
         { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
         mem localDecls layouts = .ub ∧
@@ -14601,7 +14607,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_uninit_ub
           mem localDecls layouts = .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, hSpec, Bool.and_true, Bool.not_false, Nat.beq_refl, hBorrow, hTy, hUninit] <;> rfl
   exact ⟨hUb, hUb⟩
@@ -14635,7 +14641,7 @@ theorem trusted_evalUnsizeCoercion_global_alloc_iff
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat) (alloc : CapturedAllocation)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .some alloc)
@@ -14679,7 +14685,7 @@ theorem trusted_evalUnsizeCoercion_allocId_zero_iff
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (offsetBytes n : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ⟨0, offsetBytes⟩ (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows 0 = .none)
     (hNoGlobal : lookupGlobalAlloc mem.globals 0 = .none)
@@ -14721,7 +14727,7 @@ theorem trusted_evalUnsizeCoercion_unbacked_nonzero_allocId
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hNoGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .none)
@@ -14750,10 +14756,12 @@ theorem trusted_evalUnsizeCoercion_unbacked_nonzero_allocId
         LWidePtr.encodeProv, Bool.and_true] <;> rfl
   exact ⟨hOk, hOk⟩
 
-/-- Cross-frame `callerLocals` root resolution for stack-borrowed `evalUnsizeCoercion`:
-when `get? locals' entry.targetLocal = .none` and
-`get? mem.callerLocals entry.targetLocal = .some (.init rootVal)`, the backing aggregate is
-resolved from `mem.callerLocals`. -/
+/-- Cross-frame root resolution for stack-borrowed `evalUnsizeCoercion`: when the borrow's target
+`(entry.targetFrameDepth, entry.targetLocal)` is not a slot of the active frame
+(`activeFrameSlot? … = .none`) and the owning frame's slot is initialized
+(`foreignFrameSlot? mem.callStack mem.callerLocals … = .some (.init rootVal)`, which is
+`get? mem.callerLocals entry.targetLocal` for the root frame `mem.callStack = []`), the backing
+aggregate is resolved from that frame. -/
 theorem trusted_evalUnsizeCoercion_callerLocals_backing_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -14761,15 +14769,18 @@ theorem trusted_evalUnsizeCoercion_callerLocals_backing_iff
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat)
     (entry : BorrowEntry) (rootVal : Value)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
-    (hNoLocal : get? locals' entry.targetLocal = .none)
-    (hCallerRoot : get? mem.callerLocals entry.targetLocal = .some (.init rootVal))
+    (hNoLocal : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .none)
+    (hCallerRoot :
+      foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal =
+        .some (.init rootVal))
     (hBacking :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection n
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -14806,7 +14817,7 @@ theorem trusted_evalUnsizeCoercion_callerLocals_backing_iff
         | false => .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hNoLocal, hCallerRoot, hBacking, hAlign,
         LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -14821,12 +14832,13 @@ theorem trusted_evalUnsizeCoercion_untyped_stack_borrow
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (entry : BorrowEntry) (rootVal : Value)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hUntyped : operandTy localDecls layouts op = .none)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hBacking :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection 0
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -14857,7 +14869,7 @@ theorem trusted_evalUnsizeCoercion_untyped_stack_borrow
           (layoutPointerBytes layouts)) locals' mem := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hUntyped, hRoot, hBacking, hAlign, hBound,
         LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -14874,12 +14886,13 @@ theorem trusted_evalUnsizeCoercion_untyped_stack_borrow_iff
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (entry : BorrowEntry) (rootVal : Value)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hUntyped : operandTy localDecls layouts op = .none)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hBacking :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection 0
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -14920,7 +14933,7 @@ theorem trusted_evalUnsizeCoercion_untyped_stack_borrow_iff
         | false => .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hUntyped, hRoot, hBacking, hAlign,
         LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -14933,7 +14946,7 @@ theorem trusted_evalUnsizeCoercion_untyped_global_alloc
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (alloc : CapturedAllocation) (elemSz offIdx elemCount : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hUntyped : operandTy localDecls layouts op = .none)
@@ -14977,7 +14990,7 @@ theorem trusted_evalUnsizeCoercion_untyped_unbacked_ub
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hUntyped : operandTy localDecls layouts op = .none)
@@ -15000,14 +15013,14 @@ theorem trusted_evalUnsizeCoercion_untyped_unbacked_ub
   exact ⟨hUb, hUb⟩
 
 /-- Stack-borrowed `evalUnsizeCoercion` faults with `.ub` when the borrowed local slot is `.dead`
-(`StorageDead`), or when `get? locals' entry.targetLocal = .none` and `mem.callerLocals` has no
-initialized slot (`Places.lean:13395–13401`). -/
+(`StorageDead`), or when the target is not a slot of the active frame and the owning frame
+(`foreignFrameSlot?`, i.e. `mem.callerLocals` for the root frame) has no initialized slot (`Places.lean:13395–13401`). -/
 theorem trusted_evalUnsizeCoercion_stack_borrow_dead_or_missing_ub
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat) (entry : BorrowEntry)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
@@ -15015,11 +15028,15 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_dead_or_missing_ub
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
     (hDeadOrMissing :
-      get? locals' entry.targetLocal = .some .dead ∨
-      (get? locals' entry.targetLocal = .none ∧
-        (get? mem.callerLocals entry.targetLocal = .none ∨
-         get? mem.callerLocals entry.targetLocal = .some .uninit ∨
-         get? mem.callerLocals entry.targetLocal = .some .dead))) :
+      activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+          .some .dead ∨
+      (activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal = .none ∧
+        (foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+            entry.targetLocal = .none ∨
+         foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+            entry.targetLocal = .some .uninit ∨
+         foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+            entry.targetLocal = .some .dead))) :
     evalUnsizeCoercion locals op
         { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
         mem localDecls layouts = .ub ∧
@@ -15033,7 +15050,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_dead_or_missing_ub
           mem localDecls layouts = .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     dsimp only at hPerm hDeadOrMissing
     rcases hDeadOrMissing with hDead | ⟨hNoLoc, hC | hC | hC⟩
     · cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
@@ -15053,14 +15070,15 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_nested_ptr_ok
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal nestedPtr : ProvenancePtr) (n nestedSz : Nat)
     (entry : BorrowEntry) (rootVal : Value)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hTy : operandTy localDecls layouts op = .some srcTy)
     (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
       .some n)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hNoAgg :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection n
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -15083,7 +15101,7 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_nested_ptr_ok
         .ok (LWidePtr.encodeProv ptrVal n (layoutPointerBytes layouts)) locals' mem := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hNoAgg, hNestedPtr,
         LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -15097,12 +15115,13 @@ theorem trusted_evalUnsizeCoercion_untyped_zst_unit_iff
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (entry : BorrowEntry) (rootVal : Value)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
     (hUntyped : operandTy localDecls layouts op = .none)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      .some (.init rootVal))
     (hNoAgg :
       readSliceBackingAggregate? locals' rootVal entry.targetProjection 0
         (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
@@ -15137,7 +15156,7 @@ theorem trusted_evalUnsizeCoercion_untyped_zst_unit_iff
         | false => .ub := by
     unfold evalUnsizeCoercion
     dsimp only [slicePtrTargetKind] at *
-    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
       simp only [hOp, Nat.beq_refl, hBorrow, hUntyped, hRoot, hNoAgg, hUnit,
         LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
@@ -15152,7 +15171,7 @@ theorem trusted_evalUnsizeCoercion_untyped_global_alloc_ub
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (alloc : CapturedAllocation)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hUntyped : operandTy localDecls layouts op = .none)
@@ -15270,7 +15289,7 @@ theorem rawPtrUnsizeArrayToSliceLen?_eq_none_of_len_ge
 theorem trusted_evalUnsizeCoercion_scalar_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (sc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals')
     (hSz : sc.sizeBytes = layoutPointerBytes layouts) :
     (∀ n,
@@ -15346,7 +15365,7 @@ theorem trusted_evalUnsizeCoercion_scalar_to_ref_ub
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx) (sc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals')
     (hSz : sc.sizeBytes = layoutPointerBytes layouts) :
     let targetTy : Ty := { kind := .ref dstMut (.slice dstElem), layoutIdx := dstLIdx }
@@ -15389,7 +15408,7 @@ def mutToConstPointerStep (locals : List LocalSlot) (op : Operand) (targetTy : T
     (localDecls : List LocalDecl) (layouts : LayoutTable) : RvalueEvalResult :=
   let ptrBytes := layoutPointerBytes layouts
   let shapeOpt := mutToConstTargetShape? (operandTy localDecls layouts op) targetTy
-  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
   | .ok (.ptr ptrVal sz) locals' =>
     match Nat.beq sz ptrBytes, shapeOpt with
     | true, .some .none => .ok (.ptr ptrVal ptrBytes) locals' mem
@@ -15496,7 +15515,7 @@ target shape is thin. -/
 theorem trusted_evalRvalue_mutToConstPointer_thin_ptr_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals') :
     (evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op targetTy) mem localDecls
         layouts = .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals' mem ↔
@@ -15535,7 +15554,7 @@ theorem trusted_evalRvalue_mutToConstPointer_wide_ptr_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals') :
     (evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op targetTy) mem localDecls
         layouts =
@@ -15579,7 +15598,7 @@ characterization; on success the address is canonicalized modulo `2^(8 * ptrByte
 theorem trusted_evalRvalue_mutToConstPointer_thin_scalar_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (sc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals') :
     (evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op targetTy) mem localDecls
         layouts =
@@ -15621,7 +15640,7 @@ are canonicalized modulo `2^(8 * ptrBytes)`. -/
 theorem trusted_evalRvalue_mutToConstPointer_wide_scalar_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (addrSc metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals') :
     (evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op targetTy) mem localDecls
         layouts =
@@ -15681,7 +15700,7 @@ theorem trusted_evalRvalue_mutToConstPointer_dyn_ptr_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal vtPtr : ProvenancePtr)
     (sz vtSz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal sz :: .ptr vtPtr vtSz :: .nil)) locals') :
     (evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op targetTy) mem localDecls
         layouts =
@@ -15732,7 +15751,7 @@ theorem trusted_evalRvalue_mutToConstPointer_dyn_scalar_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (addrSc : ScalarInt)
     (vtPtr : ProvenancePtr) (vtSz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .ptr vtPtr vtSz :: .nil)) locals') :
     (evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op targetTy) mem localDecls
         layouts =
@@ -15782,7 +15801,7 @@ theorem trusted_evalRvalue_mutToConstPointer_dyn_scalar_iff
 def arrayToPointerStep (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) : RvalueEvalResult :=
   let ptrBytes := layoutPointerBytes layouts
-  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
   | .ok (.ptr ptrVal sz) locals' =>
     match Nat.beq sz ptrBytes, arrayToPointerElemLen? (operandTy localDecls layouts op) targetTy with
     | true, .some elemLenOpt =>
@@ -15838,7 +15857,7 @@ theorem arrayToPointerElemLen?_wide_target_eq_none
 theorem trusted_evalRvalue_arrayToPointer_ptr_eq
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals') :
     evalRvalue locals (.cast (.pointerCoercion "ArrayToPointer") op targetTy) mem localDecls
         layouts =
@@ -15859,7 +15878,7 @@ theorem trusted_evalRvalue_arrayToPointer_ptr_eq
 theorem trusted_evalRvalue_arrayToPointer_scalar_eq
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (sc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals') :
     evalRvalue locals (.cast (.pointerCoercion "ArrayToPointer") op targetTy) mem localDecls
         layouts =
@@ -15879,7 +15898,7 @@ theorem trusted_evalRvalue_arrayToPointer_stack_borrow
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (elemLenOpt : Option Nat) (parentEntry : BorrowEntry)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hLen : arrayToPointerElemLen? (operandTy localDecls layouts op) targetTy = .some elemLenOpt)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some parentEntry) :
@@ -15896,7 +15915,7 @@ theorem trusted_evalRvalue_arrayToPointer_unborrowed
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (elemLenOpt : Option Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hLen : arrayToPointerElemLen? (operandTy localDecls layouts op) targetTy = .some elemLenOpt)
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none) :
@@ -15911,7 +15930,7 @@ theorem trusted_evalRvalue_arrayToPointer_scalar
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (sc : ScalarInt)
     (elemLenOpt : Option Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals')
     (hSz : sc.sizeBytes = layoutPointerBytes layouts)
     (hLen : arrayToPointerElemLen? (operandTy localDecls layouts op) targetTy = .some elemLenOpt) :
@@ -15927,7 +15946,7 @@ source/target types are not an array-to-element pointer pair (`arrayToPointerEle
 theorem trusted_evalRvalue_arrayToPointer_ptr_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals')
     (hBad : sz ≠ layoutPointerBytes layouts ∨
       arrayToPointerElemLen? (operandTy localDecls layouts op) targetTy = .none) :
@@ -15952,14 +15971,16 @@ def narrowProjBySubslice (containerProj : List ProjectionElem) (lo hi : Nat) :
 stack borrow whose backing aggregate holds `elemOffset + n ≤ length elems` elements (with
 `elemOffset = rawElemOffset + baseIdx`), and which is not already the exact `[0 .. length elems)`
 subslice, `deriveStackElemThinPtr` allocates a *fresh* borrow tag `mem.nextTag` whose projection is
-the container projection narrowed by `.subslice elemOffset (elemOffset + n) false`, and returns the
-thin pointer `⟨mem.nextTag, 0⟩` (offset `0` inside the narrowed window). -/
+the container projection narrowed by `.subslice elemOffset (elemOffset + n) false` (inheriting the
+parent's owning frame `targetFrameDepth` and `allocDead`), and returns the thin pointer
+`⟨mem.nextTag, 0⟩` (offset `0` inside the narrowed window). -/
 theorem deriveStackElemThinPtr_fresh_subslice
     (locals : List LocalSlot) (mem : Memory) (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry)
     (n ptrBytes : Nat) (rootVal : Value) (containerProj : List ProjectionElem) (baseIdx : Nat)
     (elems : List Value) (rawElemOffset : Nat)
     (hPerm : parentEntry.perm ≠ .disabled)
-    (hRoot : get? locals parentEntry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth
+        parentEntry.targetLocal = .some (.init rootVal))
     (hRead : readSliceBackingAggregate? locals rootVal
         (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection)) n =
       .some (containerProj, baseIdx, elems))
@@ -15978,10 +15999,12 @@ theorem deriveStackElemThinPtr_fresh_subslice
                 normalizeSubsliceProjections
                   (narrowProjBySubslice containerProj (Nat.add rawElemOffset baseIdx)
                     (Nat.add (Nat.add rawElemOffset baseIdx) n))
-              perm := parentEntry.perm } :: mem.borrows
+              perm := parentEntry.perm
+              targetFrameDepth := parentEntry.targetFrameDepth
+              allocDead := parentEntry.allocDead } :: mem.borrows
           nextTag := Nat.add mem.nextTag 1 } := by
   unfold deriveStackElemThinPtr
-  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
   dsimp only at hPerm hRoot hRead ⊢
   cases perm
   all_goals first
@@ -15997,7 +16020,8 @@ theorem deriveStackElemThinPtr_already_subslice
     (n ptrBytes : Nat) (rootVal : Value) (containerProj : List ProjectionElem) (baseIdx : Nat)
     (elems : List Value) (rawElemOffset : Nat)
     (hPerm : parentEntry.perm ≠ .disabled)
-    (hRoot : get? locals parentEntry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth
+        parentEntry.targetLocal = .some (.init rootVal))
     (hRead : readSliceBackingAggregate? locals rootVal
         (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection)) n =
       .some (containerProj, baseIdx, elems))
@@ -16009,7 +16033,7 @@ theorem deriveStackElemThinPtr_already_subslice
     deriveStackElemThinPtr locals mem ptrVal parentEntry (.some n) ptrBytes =
       .ok (.ptr ptrVal ptrBytes) locals mem := by
   unfold deriveStackElemThinPtr
-  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
   dsimp only at hPerm hRoot hRead ⊢
   cases perm
   all_goals first
@@ -16026,7 +16050,8 @@ theorem deriveStackElemThinPtr_uninit_union_field_array_iff
     (n ptrBytes : Nat) (rootVal : Value) (fIdx : Nat) (fTy : Ty) (rest : List ProjectionElem)
     (cap : Nat)
     (hPerm : parentEntry.perm ≠ .disabled)
-    (hRoot : get? locals parentEntry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth
+        parentEntry.targetLocal = .some (.init rootVal))
     (hNorm : normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection) =
       .field fIdx fTy :: rest)
     (hNoAgg : readSliceBackingAggregate? locals rootVal (.field fIdx fTy :: rest) n = .none)
@@ -16044,7 +16069,7 @@ theorem deriveStackElemThinPtr_uninit_union_field_array_iff
         | true => .ok (.ptr ptrVal ptrBytes) locals mem
         | false => .ub := by
     unfold deriveStackElemThinPtr
-    rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
     dsimp only at hPerm hRoot hNorm ⊢
     cases perm
     all_goals first
@@ -16059,11 +16084,13 @@ theorem deriveStackElemThinPtr_disabled_or_uninit_or_dead_ub
     (locals : List LocalSlot) (mem : Memory) (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry)
     (elemCountOpt : Option Nat) (ptrBytes : Nat)
     (hBad : parentEntry.perm = .disabled ∨
-      get? locals parentEntry.targetLocal = .some .uninit ∨
-      get? locals parentEntry.targetLocal = .some .dead) :
+      activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal =
+        .some .uninit ∨
+      activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal =
+        .some .dead) :
     deriveStackElemThinPtr locals mem ptrVal parentEntry elemCountOpt ptrBytes = .ub := by
   unfold deriveStackElemThinPtr
-  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
   dsimp only at hBad ⊢
   rcases hBad with rfl | hSlot | hSlot
   · rfl
@@ -16082,7 +16109,7 @@ def isReifyZstValue : Value → Bool
 def reifyFnPointerStep (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (coercionKind : String) :
     RvalueEvalResult :=
-  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals [] mem.callStack with
   | .ub => .ub
   | .unsupported => .unsupported
   | .ok v locals' =>
@@ -16156,7 +16183,7 @@ theorem trusted_evalRvalue_reifyFnPointer_ok
     (defPath : DefPath) (typeArgs : List RigidTy)
     (hReify : isReifyFnPointerCoercion k = true)
     (hNotUnsafe : stringEq k "UnsafeFnPointer" = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ok v locals')
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals [] mem.callStack = .ok v locals')
     (hZst : isReifyZstValue v = true)
     (hTy : targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi)
     (hAbi : callConvEq fnAbi .rustIntrinsic = false)
@@ -16196,7 +16223,7 @@ theorem trusted_evalRvalue_reifyFnPointer_ub
     (localDecls : List LocalDecl) (layouts : LayoutTable) (k : String) (v : Value)
     (hReify : isReifyFnPointerCoercion k = true)
     (hNotUnsafe : stringEq k "UnsafeFnPointer" = false)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ok v locals')
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals [] mem.callStack = .ok v locals')
     (hBad : isReifyZstValue v = false ∨
       (∀ fnInputs fnOutput fnSafety fnAbi,
         targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi →
@@ -16462,7 +16489,7 @@ theorem trusted_evalRvalue_unsafeFnPointer_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
     (dstInputs : List RigidTy) (dstOutput : RigidTy) (dstAbi : CallConv)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals')
     (hTy : targetTy.kind = .fnPtr dstInputs dstOutput .unsafe_ dstAbi) :
     (evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op targetTy) mem localDecls
@@ -16508,7 +16535,7 @@ theorem trusted_evalRvalue_unsafeFnPointer_safe_target_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
     (dstInputs : List RigidTy) (dstOutput : RigidTy) (dstAbi : CallConv)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals')
     (hTy : targetTy.kind = .fnPtr dstInputs dstOutput .safe dstAbi) :
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op targetTy) mem localDecls
@@ -16585,7 +16612,7 @@ operand `.ptr ptrVal sz`: succeeds with `.ptr ptrVal 8` (provenance preserved) i
 theorem trusted_evalRvalue_fnPtrToPtr_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals') :
     (evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts =
         .ok (.ptr ptrVal 8) locals' mem ↔
@@ -16622,7 +16649,7 @@ slice/`str`/`dyn` raw-pointer target faults with `.ub`. -/
 theorem trusted_evalRvalue_fnPtrToPtr_wide_target_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals')
     (hNotThin : isThinRawPtrTy targetTy = false) :
     evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts = .ub :=
@@ -16773,7 +16800,7 @@ faults with `.ub` otherwise. -/
 theorem trusted_evalRvalue_fnPtrToPtr_structural_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals') :
     (evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts =
         .ok (.ptr ptrVal 8) locals' mem ↔
@@ -16977,7 +17004,7 @@ theorem trusted_evalRvalue_unsafeFnPointer_structural_iff
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
     (dstInputs : List RigidTy) (dstOutput : RigidTy) (dstAbi : CallConv)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals')
     (hTy : targetTy.kind = .fnPtr dstInputs dstOutput .unsafe_ dstAbi) :
     (evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op targetTy) mem localDecls
@@ -17019,7 +17046,7 @@ theorem evalRvalue_cast_ptrToPtr_eq
 theorem trusted_evalRvalue_ptrToPtr_thin_ptr_eq
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals') :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
       match Nat.beq sz (layoutPointerBytes layouts) with
@@ -17046,7 +17073,7 @@ theorem trusted_evalRvalue_ptrToPtr_wide_ptr_eq
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals') :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
       match Bool.and (Nat.beq sz (layoutPointerBytes layouts))
@@ -17083,7 +17110,7 @@ theorem trusted_evalRvalue_ptrToPtr_wide_to_thin_stack_borrow
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (metaSc : ScalarInt) (parentEntry : BorrowEntry)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil))
         locals')
     (hMeta : metaSc.sizeBytes = layoutPointerBytes layouts)
@@ -17101,7 +17128,7 @@ theorem trusted_evalRvalue_ptrToPtr_wide_to_thin_unborrowed
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil))
         locals')
     (hMeta : metaSc.sizeBytes = layoutPointerBytes layouts)
@@ -17127,7 +17154,7 @@ theorem trusted_evalRvalue_ptrToPtr_wide_to_wide
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil))
         locals')
     (hMeta : metaSc.sizeBytes = layoutPointerBytes layouts)
@@ -17145,7 +17172,7 @@ theorem trusted_evalRvalue_ptrToPtr_slice_to_dyn_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil))
         locals')
     (hMeta : metaSc.sizeBytes = layoutPointerBytes layouts)
@@ -17162,7 +17189,7 @@ theorem trusted_evalRvalue_ptrToPtr_wide_ptr_width_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals')
     (hBad : sz ≠ layoutPointerBytes layouts ∨ metaSc.sizeBytes ≠ layoutPointerBytes layouts) :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
@@ -17180,7 +17207,7 @@ the canonical address (metadata stripped); slice/`str` targets return the canoni
 theorem trusted_evalRvalue_ptrToPtr_wide_scalar_eq
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (addrSc metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals') :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
       match Bool.and (Nat.beq addrSc.sizeBytes (layoutPointerBytes layouts))
@@ -17216,7 +17243,7 @@ returns the canonical address `.scalar ⟨wrap addrSc.bits, ptrBytes⟩`, discar
 theorem trusted_evalRvalue_ptrToPtr_wide_scalar_to_thin
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (addrSc metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals')
     (hAddr : addrSc.sizeBytes = layoutPointerBytes layouts)
     (hMeta : metaSc.sizeBytes = layoutPointerBytes layouts)
@@ -17232,7 +17259,7 @@ pointer): both words are canonicalized modulo `2^(8 * ptrBytes)`; the metadata v
 theorem trusted_evalRvalue_ptrToPtr_wide_scalar_to_wide
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (addrSc metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals')
     (hAddr : addrSc.sizeBytes = layoutPointerBytes layouts)
     (hMeta : metaSc.sizeBytes = layoutPointerBytes layouts)
@@ -17252,7 +17279,7 @@ faults with `.ub` (no metadata can be synthesized). -/
 theorem trusted_evalRvalue_ptrToPtr_thin_to_wide_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (sz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal sz) locals')
     (hNoThin : thinRawPtrPointee? targetTy = .none) :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
@@ -17267,7 +17294,7 @@ pointers at the target pointer width. Consequently, on any layout whose pointer 
 theorem trusted_evalRvalue_ptrToPtr_ptr8_width_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal 8) locals')
     (hPb : layoutPointerBytes layouts ≠ 8) :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
@@ -17280,7 +17307,7 @@ theorem trusted_evalRvalue_ptrToPtr_dyn_ptr_eq
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal vtPtr : ProvenancePtr)
     (sz vtSz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal sz :: .ptr vtPtr vtSz :: .nil)) locals') :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
       match Bool.and (Nat.beq sz (layoutPointerBytes layouts))
@@ -17306,7 +17333,7 @@ directly and returns `.ok (.ptr ptrVal ptrBytes) locals' mem`. -/
 theorem trusted_evalRvalue_ptrToPtr_dyn_to_thin
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal vtPtr : ProvenancePtr)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0
         (.ptr ptrVal (layoutPointerBytes layouts) ::
           .ptr vtPtr (layoutPointerBytes layouts) :: .nil)) locals')
@@ -17321,7 +17348,7 @@ and the vtable pointer `.ptr vtPtr ptrBytes`. -/
 theorem trusted_evalRvalue_ptrToPtr_dyn_to_dyn
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal vtPtr : ProvenancePtr)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0
         (.ptr ptrVal (layoutPointerBytes layouts) ::
           .ptr vtPtr (layoutPointerBytes layouts) :: .nil)) locals')
@@ -17341,7 +17368,7 @@ theorem trusted_evalRvalue_ptrToPtr_dyn_to_slice_ub
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal vtPtr : ProvenancePtr)
     (sz vtSz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal sz :: .ptr vtPtr vtSz :: .nil)) locals')
     (hSlice : wideRawPtrIsDyn? targetTy = .some false) :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
@@ -17371,7 +17398,7 @@ theorem trusted_evalRvalue_ptrToPtr_thin_array_stack_borrow
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (dstElem : RigidTy) (arrLen : Nat) (parentEntry : BorrowEntry)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hThin : thinRawPtrPointee? targetTy = .some dstElem)
     (hArr : arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem = .some arrLen)
@@ -17391,7 +17418,7 @@ theorem trusted_evalRvalue_ptrToPtr_thin_nonarray_or_unborrowed
     (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
     (dstElem : RigidTy)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hThin : thinRawPtrPointee? targetTy = .some dstElem)
     (hId : arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem = .none ∨
@@ -17655,7 +17682,7 @@ theorem trusted_evalUnsizeCoercion_global_alloc_structural_iff
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat) (alloc : CapturedAllocation)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .some alloc)
@@ -17882,7 +17909,7 @@ theorem trusted_evalUnsizeCoercion_untyped_global_alloc_div_ok
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
     (ptrVal : ProvenancePtr) (alloc : CapturedAllocation) (elemSz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
     (hUntyped : operandTy localDecls layouts op = .none)
@@ -17927,5 +17954,255 @@ theorem trusted_evalUnsizeCoercion_untyped_global_alloc_div_ok
     (Nat.ble_eq_true_of_le hOffLe) hSz hSzNz hAlignOff hAlignRem).2
 
 end WidePtrSliceAndFnPtrCast
+
+/-! ### 10. IEEE-754 `binary32` / `binary64` Numeric Casts (`CastKind.{floatToInt, intToFloat, floatToFloat}`)
+
+Step-level correspondence of `Trusted.MirSemantics.evalRvalue` for the three
+numeric float cast kinds `CastKind.floatToInt`, `CastKind.intToFloat`, and
+`CastKind.floatToFloat`, which `evalRvalue` dispatches to `evalFloatCastRvalue`
+(`f32` / `f64` only: `f16` / `f128` fail closed with `.unsupported`).
+
+The pure bit-level theory of the trusted evaluators (`evalFloatToIntSaturating`,
+`evalIntToFloatRoundTiesToEven`, `evalFloatToFloatRoundTiesToEven`) lives in
+`Anneal.Mir.IeeeFloatCast`: correct rounding
+(`IeeeFloatCast.roundRatioTiesToEven_correctly_rounded`), overflow
+characterization (`IeeeFloatCast.roundRatioTiesToEven_overflow_iff`), saturation
+soundness and monotonicity (`IeeeFloatCast.evalFloatToIntSaturating_sound`,
+`IeeeFloatCast.floatToIntValue_monotone`), the `b/585733184` ties-to-even versus
+half-away-from-zero separation (`IeeeFloatCast.b585733184_ties_to_even_separation`),
+`f32 → f64` exactness and `f64 → f32` round trip
+(`IeeeFloatCast.f32ToF64_exact_and_roundtrip`), and quiet-NaN outputs
+(`IeeeFloatCast.convertFloatBits_nan_quiet`). The theorems below lift these to
+`evalRvalue`.
+-/
+
+/-- `evalRvalue (.cast .floatToInt op dstTy)` on an `f32` / `f64` operand and an
+integer target computes `evalFloatToIntSaturating` at the operand's static type
+and the layout table's pointer width. -/
+theorem evalRvalue_cast_floatToInt_eq
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    {fmt : IeeeFormat} {tgt : FloatIntTarget}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok (.scalar sc) locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy)
+    (hFmt : ieeeFormatOfTy? srcTy = .some fmt)
+    (hTgt : floatIntTargetOfTy? dstTy = .some tgt)
+    (hSz : sc.sizeBytes = fmt.byteWidth) :
+    evalRvalue locals (.cast .floatToInt op dstTy) mem localDecls layouts =
+      .ok (.scalar (evalFloatToIntSaturating fmt sc.bits tgt (floatPtrWidthOfLayouts layouts)))
+        locals' mem := by
+  show evalFloatCastRvalue locals .floatToInt op dstTy mem localDecls layouts = _
+  unfold evalFloatCastRvalue
+  rw [hOp]
+  simp only [evalFloatCast, hSrc, hFmt, hTgt, hSz, Nat.beq_refl]
+
+/-- `evalRvalue (.cast .intToFloat op dstTy)` on an integer operand of the source
+type's width and an `f32` / `f64` target computes
+`evalIntToFloatRoundTiesToEven`. -/
+theorem evalRvalue_cast_intToFloat_eq
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    {fmt : IeeeFormat} {src : FloatIntTarget}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok (.scalar sc) locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy)
+    (hInt : floatIntTargetOfTy? srcTy = .some src)
+    (hFmt : ieeeFormatOfTy? dstTy = .some fmt)
+    (hSz : sc.sizeBytes * 8 = src.bitWidth (floatPtrWidthOfLayouts layouts)) :
+    evalRvalue locals (.cast .intToFloat op dstTy) mem localDecls layouts =
+      .ok (.scalar ⟨evalIntToFloatRoundTiesToEven src.isSigned
+          (src.bitWidth (floatPtrWidthOfLayouts layouts)) sc.bits fmt, fmt.byteWidth⟩)
+        locals' mem := by
+  show evalFloatCastRvalue locals .intToFloat op dstTy mem localDecls layouts = _
+  unfold evalFloatCastRvalue
+  rw [hOp]
+  simp only [evalFloatCast, hSrc, hFmt, hInt, Nat.mul_eq, hSz, Nat.beq_refl]
+
+/-- `evalRvalue (.cast .floatToFloat op dstTy)` between `f32` / `f64` computes
+`evalFloatToFloatRoundTiesToEven`. -/
+theorem evalRvalue_cast_floatToFloat_eq
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    {src dst : IeeeFormat}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok (.scalar sc) locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy)
+    (hSrcFmt : ieeeFormatOfTy? srcTy = .some src)
+    (hDstFmt : ieeeFormatOfTy? dstTy = .some dst)
+    (hSz : sc.sizeBytes = src.byteWidth) :
+    evalRvalue locals (.cast .floatToFloat op dstTy) mem localDecls layouts =
+      .ok (.scalar ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits, dst.byteWidth⟩)
+        locals' mem := by
+  show evalFloatCastRvalue locals .floatToFloat op dstTy mem localDecls layouts = _
+  unfold evalFloatCastRvalue
+  rw [hOp]
+  simp only [evalFloatCast, hSrc, hSrcFmt, hDstFmt, hSz, Nat.beq_refl]
+
+/-- Float casts whose float side has no modeled IEEE-754 format (`f16`, `f128`,
+or a non-float type) fail closed: `evalRvalue` returns `.unsupported` for every
+float cast kind. -/
+theorem evalRvalue_cast_float_unsupported_of_no_format
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {v : Value}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok v locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy) :
+    (ieeeFormatOfTy? srcTy = .none →
+      evalRvalue locals (.cast .floatToInt op dstTy) mem localDecls layouts = .unsupported ∧
+      evalRvalue locals (.cast .floatToFloat op dstTy) mem localDecls layouts = .unsupported) ∧
+    (ieeeFormatOfTy? dstTy = .none →
+      evalRvalue locals (.cast .intToFloat op dstTy) mem localDecls layouts = .unsupported ∧
+      evalRvalue locals (.cast .floatToFloat op dstTy) mem localDecls layouts = .unsupported) := by
+  refine ⟨fun hNo => ⟨?_, ?_⟩, fun hNo => ⟨?_, ?_⟩⟩
+  all_goals
+    first
+    | show evalFloatCastRvalue locals .floatToInt op dstTy mem localDecls layouts = _
+    | show evalFloatCastRvalue locals .floatToFloat op dstTy mem localDecls layouts = _
+    | show evalFloatCastRvalue locals .intToFloat op dstTy mem localDecls layouts = _
+    unfold evalFloatCastRvalue
+    rw [hOp]
+    cases v <;> simp [evalFloatCast, hSrc, hNo]
+
+/-- **Float-to-int soundness at the step level**: the `evalRvalue` result is the
+two's-complement encoding, at the target width, of the source float truncated
+toward zero and saturated to the target range (`NaN ↦ 0`, `±∞` saturate). -/
+theorem evalRvalue_cast_floatToInt_sound
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    {fmt : IeeeFormat} {tgt : FloatIntTarget}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok (.scalar sc) locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy)
+    (hFmt : ieeeFormatOfTy? srcTy = .some fmt)
+    (hTgt : floatIntTargetOfTy? dstTy = .some tgt)
+    (hSz : sc.sizeBytes = fmt.byteWidth) :
+    ∃ out : ScalarInt,
+      evalRvalue locals (.cast .floatToInt op dstTy) mem localDecls layouts =
+        .ok (.scalar out) locals' mem ∧
+      out.sizeBytes * 8 = tgt.bitWidth (floatPtrWidthOfLayouts layouts) ∧
+      intValueOfBits tgt.isSigned (tgt.bitWidth (floatPtrWidthOfLayouts layouts)) out.bits =
+        floatToIntValue (decodeBits fmt sc.bits)
+          (tgt.minValue (floatPtrWidthOfLayouts layouts))
+          (tgt.maxValue (floatPtrWidthOfLayouts layouts)) ∧
+      (IeeeFloatCast.isNaNBits fmt sc.bits = true → out.bits = 0) := by
+  refine ⟨_, evalRvalue_cast_floatToInt_eq hOp hSrc hFmt hTgt hSz, ?_, ?_, ?_⟩
+  · exact (IeeeFloatCast.evalFloatToIntSaturating_sound fmt sc.bits tgt _).1
+  · exact (IeeeFloatCast.evalFloatToIntSaturating_sound fmt sc.bits tgt _).2.2.1
+  · exact IeeeFloatCast.evalFloatToIntSaturating_nan fmt sc.bits tgt _
+
+/-- **Float-to-float soundness at the step level**: a finite source value is
+rounded with `roundTiesToEven` into the target format, and a NaN source yields a
+quiet NaN. -/
+theorem evalRvalue_cast_floatToFloat_sound
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    {src dst : IeeeFormat}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok (.scalar sc) locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy)
+    (hSrcFmt : ieeeFormatOfTy? srcTy = .some src)
+    (hDstFmt : ieeeFormatOfTy? dstTy = .some dst)
+    (hSz : sc.sizeBytes = src.byteWidth) :
+    ∃ out : ScalarInt,
+      evalRvalue locals (.cast .floatToFloat op dstTy) mem localDecls layouts =
+        .ok (.scalar out) locals' mem ∧
+      out.sizeBytes = dst.byteWidth ∧
+      (∀ (neg : Bool) (n d : Nat), decodeBits src sc.bits = .finite neg n d →
+        out.bits = roundRatioTiesToEven dst neg n d) ∧
+      (IeeeFloatCast.isNaNBits src sc.bits = true →
+        IeeeFloatCast.isNaNBits dst out.bits = true ∧
+          IeeeFloatCast.isQuietNaNBits dst out.bits = true) := by
+  refine ⟨_, evalRvalue_cast_floatToFloat_eq hOp hSrc hSrcFmt hDstFmt hSz, rfl, ?_, ?_⟩
+  · exact fun neg n d h =>
+      (IeeeFloatCast.evalFloatToFloatRoundTiesToEven_sound).2.2.2.2.2.2.2 src dst sc.bits neg n d h
+  · exact (IeeeFloatCast.evalFloatToFloatRoundTiesToEven_sound).2.1 src dst sc.bits
+
+/-- **Int-to-float exactness at the step level**: an integer operand whose
+magnitude fits in the target significand (`|v| < 2^(fractionBits + 1)`) converts
+exactly. -/
+theorem evalRvalue_cast_intToFloat_exact
+    {locals locals' : List LocalSlot} {op : Operand} {dstTy srcTy : Ty} {mem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sc : ScalarInt}
+    {fmt : IeeeFormat} {src : FloatIntTarget}
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+        mem.callStack = .ok (.scalar sc) locals')
+    (hSrc : operandTy localDecls layouts op = .some srcTy)
+    (hInt : floatIntTargetOfTy? srcTy = .some src)
+    (hFmt : ieeeFormatOfTy? dstTy = .some fmt)
+    (hSz : sc.sizeBytes * 8 = src.bitWidth (floatPtrWidthOfLayouts layouts))
+    (hFits : (intValueOfBits src.isSigned (src.bitWidth (floatPtrWidthOfLayouts layouts))
+        sc.bits).natAbs < 2 ^ (fmt.fractionBits + 1)) :
+    ∃ out : ScalarInt,
+      evalRvalue locals (.cast .intToFloat op dstTy) mem localDecls layouts =
+        .ok (.scalar out) locals' mem ∧
+      out.sizeBytes = fmt.byteWidth ∧
+      IeeeFloatCast.floatKindDenotesInt (decodeBits fmt out.bits)
+        (intValueOfBits src.isSigned (src.bitWidth (floatPtrWidthOfLayouts layouts)) sc.bits) := by
+  refine ⟨_, evalRvalue_cast_intToFloat_eq hOp hSrc hInt hFmt hSz, rfl, ?_⟩
+  exact (IeeeFloatCast.evalIntToFloatRoundTiesToEven_sound).1 _ _ _ fmt hFits
+
+/-! ### 10.1 Concrete `evalRvalue` Float-Cast Witnesses -/
+
+/-- `f32` operand type (`layoutIdx` `0`). -/
+def floatCastF32Ty : Ty := { kind := .float .f32, layoutIdx := 0 }
+/-- `f64` operand type (`layoutIdx` `0`). -/
+def floatCastF64Ty : Ty := { kind := .float .f64, layoutIdx := 0 }
+/-- `f16` operand type (`layoutIdx` `0`), not modeled. -/
+def floatCastF16Ty : Ty := { kind := .float .f16, layoutIdx := 0 }
+/-- `i32` operand type (`layoutIdx` `0`). -/
+def floatCastI32Ty : Ty := { kind := .int .i32, layoutIdx := 0 }
+/-- `u32` operand type (`layoutIdx` `0`). -/
+def floatCastU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+/-- `u64` operand type (`layoutIdx` `0`). -/
+def floatCastU64Ty : Ty := { kind := .uint .u64, layoutIdx := 0 }
+
+/-- Single immutable local of type `ty`. -/
+def floatCastDecls (ty : Ty) : List LocalDecl :=
+  [{ mutability := .not, ty := ty, debugName := none }]
+
+/-- `evalRvalue (.cast kind (copy _0) dstTy)` with `_0 : srcTy` holding the
+scalar `⟨bits, size⟩`, in `emptyMemory` and `emptyLayoutTable`. -/
+def floatCastRun (kind : CastKind) (srcTy dstTy : Ty) (bits size : Nat) : RvalueEvalResult :=
+  evalRvalue [.init (.scalar ⟨bits, size⟩)] (.cast kind (.copy ⟨0, []⟩) dstTy) emptyMemory
+    (floatCastDecls srcTy) emptyLayoutTable
+
+/-- End-to-end `Trusted.MirSemantics.evalRvalue` float casts (kernel-checked by
+`rfl`): `2.1f64 as i32 = 2`, `-2.1f64 as i32 = -2`, `NaN as u32 = 0`,
+`f64::INFINITY as i32 = i32::MAX`, `16777217u32 as f32 = 16777216.0` (tie to
+even), `-1i32 as f64 = -1.0`, `(2^53 + 1) as f64 = 2^53` (tie to even), `sNaN`
+`f64 → f32` quietized, `f64 → f32` underflow to `+0.0`, and exact
+`f32::MAX → f64`. -/
+theorem evalRvalue_float_cast_end_to_end :
+    floatCastRun .floatToInt floatCastF64Ty floatCastI32Ty 0x400599999999999A 8 =
+      .ok (.scalar ⟨2, 4⟩) [.init (.scalar ⟨0x400599999999999A, 8⟩)] emptyMemory ∧
+    floatCastRun .floatToInt floatCastF64Ty floatCastI32Ty 0xC00599999999999A 8 =
+      .ok (.scalar ⟨0xFFFFFFFE, 4⟩) [.init (.scalar ⟨0xC00599999999999A, 8⟩)] emptyMemory ∧
+    floatCastRun .floatToInt floatCastF64Ty floatCastU32Ty 0x7FF8000000000000 8 =
+      .ok (.scalar ⟨0, 4⟩) [.init (.scalar ⟨0x7FF8000000000000, 8⟩)] emptyMemory ∧
+    floatCastRun .floatToInt floatCastF64Ty floatCastI32Ty 0x7FF0000000000000 8 =
+      .ok (.scalar ⟨0x7FFFFFFF, 4⟩) [.init (.scalar ⟨0x7FF0000000000000, 8⟩)] emptyMemory ∧
+    floatCastRun .intToFloat floatCastU32Ty floatCastF32Ty 16777217 4 =
+      .ok (.scalar ⟨0x4B800000, 4⟩) [.init (.scalar ⟨16777217, 4⟩)] emptyMemory ∧
+    floatCastRun .intToFloat floatCastI32Ty floatCastF64Ty 0xFFFFFFFF 4 =
+      .ok (.scalar ⟨0xBFF0000000000000, 8⟩) [.init (.scalar ⟨0xFFFFFFFF, 4⟩)] emptyMemory ∧
+    floatCastRun .intToFloat floatCastU64Ty floatCastF64Ty 9007199254740993 8 =
+      .ok (.scalar ⟨0x4340000000000000, 8⟩) [.init (.scalar ⟨9007199254740993, 8⟩)] emptyMemory ∧
+    floatCastRun .floatToFloat floatCastF64Ty floatCastF32Ty 0x7FF0000000000001 8 =
+      .ok (.scalar ⟨0x7FC00000, 4⟩) [.init (.scalar ⟨0x7FF0000000000001, 8⟩)] emptyMemory ∧
+    floatCastRun .floatToFloat floatCastF64Ty floatCastF32Ty 0x358DEE7A4AD4B81F 8 =
+      .ok (.scalar ⟨0, 4⟩) [.init (.scalar ⟨0x358DEE7A4AD4B81F, 8⟩)] emptyMemory ∧
+    floatCastRun .floatToFloat floatCastF32Ty floatCastF64Ty 0x7F7FFFFF 4 =
+      .ok (.scalar ⟨0x47EFFFFFE0000000, 8⟩) [.init (.scalar ⟨0x7F7FFFFF, 4⟩)] emptyMemory :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Fail-closed boundary: `f16` (and `f128`) casts and width-mismatched operands
+are `.unsupported`. -/
+theorem evalRvalue_float_cast_unsupported_witnesses :
+    floatCastRun .floatToInt floatCastF16Ty floatCastI32Ty 0x3C00 2 = .unsupported ∧
+    floatCastRun .floatToFloat floatCastF32Ty floatCastF16Ty 0x3F800000 4 = .unsupported ∧
+    floatCastRun .intToFloat floatCastU32Ty floatCastF16Ty 1 4 = .unsupported ∧
+    floatCastRun .floatToInt floatCastF64Ty floatCastI32Ty 0x3FF0000000000000 4 = .unsupported :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end Anneal.Mir.Cast

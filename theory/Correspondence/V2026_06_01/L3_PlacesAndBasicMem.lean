@@ -378,7 +378,8 @@ For EVERY array `elems : List Value`, EVERY initial index scalar `idxSc : Scalar
 EVERY in-bounds element `elemVal : Value` (`get? elems idxSc.bits = some elemVal`),
 and EVERY memory state `mem : Memory`, evaluating `Rvalue.ref .shared` on
 `{ local_ := 0, projection := [.index 1] }` resolves `[.index 1]` at borrow creation
-time to `[.constantIndex idxSc.bits 0 false]`, and subsequent projection read after
+time to `[.constantIndex idxSc.bits 0 false]` (stamping the active frame depth
+`targetFrameDepth := length mem.callStack` on the new root borrow), and subsequent projection read after
 `StorageDead(1)` (`localsAfterDead = [.init (.aggregate 0 elems), .dead]`) succeeds
 with `ProjReadResult.ok elemVal`.
 -/
@@ -390,6 +391,7 @@ theorem mir_dynamic_index_borrow_after_storage_dead_corresponds
     let expectedEntry : BorrowEntry := {
       tag := mem.nextTag
       targetLocal := 0
+      targetFrameDepth := length mem.callStack
       targetProjection := [.constantIndex idxSc.bits 0 false]
       perm := .frozen
     }
@@ -769,8 +771,12 @@ Universal characterization of signed and element-scaled `BinOp.offset` in
    `offsetBytes = 4`;
 3. Out-of-bounds positive offset (`newOffset > bound`), negative offset
    underflowing below `0` (`byteDelta > ptrVal.offsetBytes`), signed `isize`
-   overflow (`count * stride >= 2^63`), or a `.disabled` borrow tag in
-   `mem.borrows` faults with `.none` / `.ub`.
+   overflow (`count * stride >= 2^63`), or a non-zero offset through a tag whose
+   allocation was deallocated (`BorrowEntry.allocDead`, bound `0`) faults with
+   `.none` / `.ub`;
+4. Pointer arithmetic is independent of the Tree Borrows permission
+   (`DIV-LM-D6-OFFSET-DISABLED-TAG`): a `.disabled` tag on a live allocation keeps
+   the allocation's bounds and the aliasing UB is deferred to dereference.
 -/
 theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
     (allocId : Nat) :
@@ -813,12 +819,24 @@ theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
     -- 5. Signed isize overflow (count * stride >= 2^63) is UB
     evalBinOpOffset { allocId := allocId, offsetBytes := 0 } 8
       ⟨isizeHalfMod, 8⟩ 1 (.some 16) = .none ∧
-    -- 6. Disabled borrow tag on pointer operand is UB
+    -- 6. Non-zero offset through a tag whose allocation was deallocated
+    --    (`allocDead`, as stamped by `StorageDead` together with `.disabled`) is UB
+    evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨1, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp)
+      { mem16 with
+        borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled,
+                      allocDead := true }] }
+      u32PtrDecl = .ub ∧
+    -- 7. A `.disabled` tag on a live allocation keeps that allocation's bounds
+    --    (`DIV-LM-D6-OFFSET-DISABLED-TAG`: the aliasing UB is deferred to dereference)
     evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨0, 8⟩)]
       (.binaryOp .offset lhsOp rhsOp)
       { mem16 with borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled }] }
-      u32PtrDecl = .ub := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+      u32PtrDecl =
+      .ok (.ptr { allocId := 9, offsetBytes := 0 } 8)
+        [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨0, 8⟩)]
+        { mem16 with borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled }] } := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 **Theorem L3.21 (`mir_structural_completeness_brief_1_4_corresponds`)**:

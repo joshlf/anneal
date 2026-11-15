@@ -363,6 +363,7 @@ theorem mir_dynamic_index_borrow_resolved_at_creation_survives_storage_dead
     let resolvedEntry : BorrowEntry := {
       tag := mem.nextTag
       targetLocal := 0
+      targetFrameDepth := length mem.callStack
       targetProjection := [.constantIndex idxSc.bits 0 false]
       perm := .frozen
     }
@@ -700,7 +701,11 @@ theorem mir_evalConstValue_and_global_deref_read_corresponds
 /--
 **Theorem L3.20 (`mir_binop_offset_signed_scaled_and_bounds_corresponds`)**:
 Universal characterization of signed and element-scaled `BinOp.offset` in
-`Trusted.Rustc.V2026_08_01.MirSemantics.{evalBinOpOffset,evalRvalue}`.
+`Trusted.Rustc.V2026_08_01.MirSemantics.{evalBinOpOffset,evalRvalue}`. Pointer
+arithmetic checks allocation bounds only: a non-zero offset through a tag whose
+allocation was deallocated (`BorrowEntry.allocDead`) is UB, while a `.disabled`
+tag on a live allocation keeps that allocation's bounds
+(`DIV-LM-D6-OFFSET-DISABLED-TAG`).
 -/
 theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
     (allocId : Nat) :
@@ -743,12 +748,24 @@ theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
     -- 5. Signed isize overflow (count * stride >= 2^63) is UB
     evalBinOpOffset { allocId := allocId, offsetBytes := 0 } 8
       ⟨isizeHalfMod, 8⟩ 1 (.some 16) = .none ∧
-    -- 6. Disabled borrow tag on pointer operand is UB
+    -- 6. Non-zero offset through a tag whose allocation was deallocated
+    --    (`allocDead`, as stamped by `StorageDead` together with `.disabled`) is UB
+    evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨1, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp)
+      { mem16 with
+        borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled,
+                      allocDead := true }] }
+      u32PtrDecl = .ub ∧
+    -- 7. A `.disabled` tag on a live allocation keeps that allocation's bounds
+    --    (`DIV-LM-D6-OFFSET-DISABLED-TAG`: the aliasing UB is deferred to dereference)
     evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨0, 8⟩)]
       (.binaryOp .offset lhsOp rhsOp)
       { mem16 with borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled }] }
-      u32PtrDecl = .ub := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+      u32PtrDecl =
+      .ok (.ptr { allocId := 9, offsetBytes := 0 } 8)
+        [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨0, 8⟩)]
+        { mem16 with borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled }] } := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 **Theorem L3.21 (`mir_structural_completeness_brief_1_4_corresponds`)**:

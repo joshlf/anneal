@@ -232,6 +232,13 @@ theorem borrowEntry_active_eta {entry : BorrowEntry}
   change entry.perm = .unique at h
   rw [← h]
 
+@[simp]
+private theorem applyTreeBorrowTransition_targetFrameDepth
+    (entry : BorrowEntry) (outcome : TreeBorrowTransition) :
+    (applyTreeBorrowTransition entry outcome).targetFrameDepth =
+      entry.targetFrameDepth := by
+  cases outcome <;> rfl
+
 /-! ## 1. From `sepConj` and `DisjointFootprints` to `IndependentLenses` -/
 
 /--
@@ -387,20 +394,32 @@ General commutativity of `updateBorrowPerm` on distinct target allocations
 -/
 theorem updateBorrowPerm_comm
     (entry : BorrowEntry) {loc₁ loc₂ : Local} (hNe : loc₁ ≠ loc₂)
-    (w₁ w₂ : Option Nat) :
-    updateBorrowPerm (updateBorrowPerm entry loc₁ w₁) loc₂ w₂ =
-      updateBorrowPerm (updateBorrowPerm entry loc₂ w₂) loc₁ w₁ := by
+    (w₁ w₂ : Option Nat) {d₁ d₂ : Nat} :
+    updateBorrowPerm (updateBorrowPerm entry loc₁ w₁ d₁) loc₂ w₂ d₂ =
+      updateBorrowPerm (updateBorrowPerm entry loc₂ w₂ d₂) loc₁ w₁ d₁ := by
   unfold updateBorrowPerm
-  cases h₁ : Nat.beq entry.targetLocal loc₁
-  · cases h₂ : Nat.beq entry.targetLocal loc₂
-    · simp only [h₁]
-    · simp only [h₁, applyTreeBorrowTransition_fields]
-  · have hEq₁ : entry.targetLocal = loc₁ := Nat.eq_of_beq_eq_true h₁
-    have h₂ : Nat.beq entry.targetLocal loc₂ = false := by
-      cases h : Nat.beq entry.targetLocal loc₂
-      · rfl
-      · exact False.elim (hNe (hEq₁.symm.trans (Nat.eq_of_beq_eq_true h)))
-    simp only [h₁, h₂, applyTreeBorrowTransition_fields]
+  cases hd₁ : Nat.beq entry.targetFrameDepth d₁ <;>
+    cases hd₂ : Nat.beq entry.targetFrameDepth d₂
+  · simp only [hd₁, hd₂, Bool.false_and]
+  · cases h₂ : Nat.beq entry.targetLocal loc₂ <;>
+      simp only [hd₁, hd₂, h₂, Bool.false_and, Bool.true_and,
+        applyTreeBorrowTransition_targetFrameDepth]
+  · cases h₁ : Nat.beq entry.targetLocal loc₁ <;>
+      simp only [hd₁, hd₂, h₁, Bool.false_and, Bool.true_and,
+        applyTreeBorrowTransition_targetFrameDepth]
+  · cases h₁ : Nat.beq entry.targetLocal loc₁
+    · cases h₂ : Nat.beq entry.targetLocal loc₂ <;>
+        simp only [hd₁, hd₂, h₁, h₂, Bool.true_and,
+          applyTreeBorrowTransition_fields,
+          applyTreeBorrowTransition_targetFrameDepth]
+    · have hEq₁ : entry.targetLocal = loc₁ := Nat.eq_of_beq_eq_true h₁
+      have h₂ : Nat.beq entry.targetLocal loc₂ = false := by
+        cases h : Nat.beq entry.targetLocal loc₂
+        · rfl
+        · exact False.elim (hNe (hEq₁.symm.trans (Nat.eq_of_beq_eq_true h)))
+      simp only [hd₁, hd₂, h₁, h₂, Bool.true_and,
+        applyTreeBorrowTransition_fields,
+        applyTreeBorrowTransition_targetFrameDepth]
 
 /--
 General commutativity of `invalidateConflictingBorrows` on distinct target
@@ -408,11 +427,11 @@ allocations `loc₁ ≠ loc₂`.
 -/
 theorem invalidateConflictingBorrows_comm
     (borrows : List BorrowEntry) {loc₁ loc₂ : Local} (hNe : loc₁ ≠ loc₂)
-    (w₁ w₂ : Option Nat) :
+    (w₁ w₂ : Option Nat) {d₁ d₂ : Nat} :
     invalidateConflictingBorrows
-      (invalidateConflictingBorrows borrows loc₁ w₁) loc₂ w₂ =
+      (invalidateConflictingBorrows borrows loc₁ w₁ d₁) loc₂ w₂ d₂ =
     invalidateConflictingBorrows
-      (invalidateConflictingBorrows borrows loc₂ w₂) loc₁ w₁ := by
+      (invalidateConflictingBorrows borrows loc₂ w₂ d₂) loc₁ w₁ d₁ := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -460,7 +479,7 @@ theorem ExclusiveActiveBorrow.of_borrows_eq
   exclusive_on_alloc := by rw [hBorrows]; exact h.exclusive_on_alloc
 
 theorem invalidateConflictingBorrows_eq_self_of_exclusive
-    {borrows : List BorrowEntry} {allocId tag : Nat}
+    {borrows : List BorrowEntry} {allocId tag : Nat} {targetFrameDepth : Nat}
     (hExcl :
       ∀ b ∈ borrows,
         b.targetLocal = allocId →
@@ -470,15 +489,19 @@ theorem invalidateConflictingBorrows_eq_self_of_exclusive
             b.rangeOffset = 0 ∧
             b.rangeLen = 0) ∨
           b.perm = .disabled) :
-    invalidateConflictingBorrows borrows allocId (.some tag) = borrows := by
+    invalidateConflictingBorrows borrows allocId (.some tag) targetFrameDepth =
+      borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail :
-        invalidateConflictingBorrows tl allocId (.some tag) = tl :=
+        invalidateConflictingBorrows tl allocId (.some tag) targetFrameDepth = tl :=
       ih (fun b hb => hExcl b (List.Mem.tail hd hb))
     simp only [invalidateConflictingBorrows_cons, hTail]
     unfold updateBorrowPerm
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
@@ -499,7 +522,7 @@ theorem invalidateConflictingBorrows_eq_self_of_exclusive
             hDis, borrowEntry_disabled_eta hDis]
 
 theorem invalidateConflictingBorrowsAtProj_eq_self_of_exclusive
-    {borrows : List BorrowEntry} {allocId tag : Nat}
+    {borrows : List BorrowEntry} {allocId tag : Nat} {targetFrameDepth : Nat}
     (writeProj : List ProjectionElem)
     (writeRangeOff writeRangeLen : Nat)
     (hExcl :
@@ -507,17 +530,21 @@ theorem invalidateConflictingBorrowsAtProj_eq_self_of_exclusive
         b.targetLocal = allocId →
           (b.tag = tag ∧ b.perm = .active) ∨ b.perm = .disabled) :
     invalidateConflictingBorrowsAtProj
-      borrows allocId (.some tag) writeProj writeRangeOff writeRangeLen =
-      borrows := by
+      borrows allocId (.some tag) writeProj writeRangeOff writeRangeLen
+      targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail :
         invalidateConflictingBorrowsAtProj
-          tl allocId (.some tag) writeProj writeRangeOff writeRangeLen = tl :=
+          tl allocId (.some tag) writeProj writeRangeOff writeRangeLen
+          targetFrameDepth = tl :=
       ih (fun b hb => hExcl b (List.Mem.tail hd hb))
     simp only [invalidateConflictingBorrowsAtProj_cons, hTail]
     unfold updateBorrowPermAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
@@ -1922,7 +1949,7 @@ theorem SepLensStateInv.attachProtector
 theorem hasTreeReadUB_eq_false_of_tree
     (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
-    {allocId tag : Nat}
+    {allocId tag : Nat} {targetFrameDepth : Nat}
     (readProj : List ProjectionElem)
     (readRangeOff readRangeLen : Nat)
     (hTree :
@@ -1933,19 +1960,22 @@ theorem hasTreeReadUB_eq_false_of_tree
           (isBorrowDescendantOrSelf allBorrows tag b.tag = false ∧
             b.perm = .disabled)) :
     hasTreeReadUB allBorrows borrows activeProtectors allocId (.some tag)
-      readProj readRangeOff readRangeLen = false := by
+      readProj readRangeOff readRangeLen targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold hasTreeReadUB borrowEntryReadUB
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => exact hTail
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
-    | false => dsimp only; exact hTail
+    | false => exact hTail
     | true =>
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
       cases borrowEntryOverlapsWrite hd readProj readRangeOff readRangeLen with
-      | false => dsimp only; exact hTail
+      | false => exact hTail
       | true =>
         rcases hTree hd (List.Mem.head tl) hTargetEq with
           ⟨hDesc, hPerm⟩ | ⟨hNotDesc, hDis⟩
@@ -1970,10 +2000,11 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_tree
             b.perm = .active) ∨
           (isBorrowDescendantOrSelf allBorrows tag b.tag = false ∧
             b.perm = .disabled))
+    {targetFrameDepth : Nat}
     (activeProtectors : List Nat := .nil) :
     freezeTreeBorrowsOnReadAtProj
       allBorrows borrows allocId (.some tag)
-      readProj readRangeOff readRangeLen activeProtectors = borrows := by
+      readProj readRangeOff readRangeLen activeProtectors targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -1981,6 +2012,9 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_tree
     unfold freezeTreeBorrowsOnReadAtProj
     rw [hTail]
     unfold updateBorrowPermOnReadAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
@@ -1989,13 +2023,10 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_tree
       cases borrowEntryOverlapsWrite hd readProj readRangeOff readRangeLen with
       | false => rfl
       | true =>
-        dsimp only
         rcases hTree hd (List.Mem.head tl) hTargetEq with
           ⟨hDesc, _⟩ | ⟨hNotDesc, hDis⟩
-        · rw [hDesc]
-        · rw [hNotDesc]
-          dsimp only
-          simp [treeBorrowNodeAccess, hDis,
+        · simp [hDesc]
+        · simp [hNotDesc, treeBorrowNodeAccess, hDis,
             borrowEntry_disabled_eta hDis]
 
 /--
@@ -2005,7 +2036,7 @@ active ancestors-or-self of the writer tag or are non-ancestor disabled entries.
 theorem hasProtectedTreeWriteConflict_eq_false_of_tree
     (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
-    {allocId tag : Nat}
+    {allocId tag : Nat} {targetFrameDepth : Nat}
     (writeProj : List ProjectionElem)
     (writeRangeOff writeRangeLen : Nat)
     (hTree :
@@ -2017,12 +2048,15 @@ theorem hasProtectedTreeWriteConflict_eq_false_of_tree
             b.perm = .disabled)) :
     hasProtectedTreeWriteConflict
       allBorrows borrows activeProtectors allocId (.some tag)
-      writeProj writeRangeOff writeRangeLen = false := by
+      writeProj writeRangeOff writeRangeLen targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold hasProtectedTreeWriteConflict
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => simp [hTail]
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false =>
       simp [hTail]
@@ -2055,7 +2089,7 @@ writes keep them `.active`) or are non-ancestor disabled entries.
 -/
 theorem invalidateTreeBorrowsAtProj_eq_self_of_tree
     (allBorrows borrows : List BorrowEntry)
-    {allocId tag : Nat}
+    {allocId tag : Nat} {targetFrameDepth : Nat}
     (writeProj : List ProjectionElem)
     (writeRangeOff writeRangeLen : Nat)
     (hTree :
@@ -2067,7 +2101,7 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_tree
             b.perm = .disabled)) :
     invalidateTreeBorrowsAtProj
       allBorrows borrows allocId (.some tag)
-      writeProj writeRangeOff writeRangeLen = borrows := by
+      writeProj writeRangeOff writeRangeLen targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -2076,10 +2110,12 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_tree
     rw [hTail]
     unfold updateBorrowPermTreeAtProj
     unfold updateBorrowPermAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
-      dsimp only
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
       rcases hTree hd (List.Mem.head tl) hTargetEq with
@@ -2104,11 +2140,12 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_tree
 
 theorem hasProtectedWriteConflict_eq_false_of_lt_frame
     {borrows : List BorrowEntry} {frameLen dstLoc : Nat}
+    {targetFrameDepth : Nat}
     (activeProtectors : List Nat)
     (hAbove : ∀ b ∈ borrows, frameLen ≤ b.targetLocal)
     (hLt : dstLoc < frameLen) :
-    hasProtectedWriteConflict borrows activeProtectors dstLoc .none .nil =
-      false := by
+    hasProtectedWriteConflict borrows activeProtectors dstLoc .none .nil 0 0
+      targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -2140,9 +2177,11 @@ theorem targetLocal_ne_of_lt_frame
 
 theorem invalidateConflictingBorrows_eq_self_of_lt_frame
     {borrows : List BorrowEntry} {frameLen dstLoc : Nat}
+    {targetFrameDepth : Nat}
     (hAbove : ∀ b ∈ borrows, frameLen ≤ b.targetLocal)
     (hLt : dstLoc < frameLen) :
-    invalidateConflictingBorrows borrows dstLoc .none = borrows := by
+    invalidateConflictingBorrows borrows dstLoc .none targetFrameDepth =
+      borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -2155,6 +2194,37 @@ theorem invalidateConflictingBorrows_eq_self_of_lt_frame
       | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true h))
     simp [invalidateConflictingBorrows_cons, updateBorrowPerm, hBeq,
       ih (fun b hb => hAbove b (List.Mem.tail hd hb))]
+
+theorem hasFrameDeallocProtectorConflict_eq_false_of_lt_frame
+    {borrows : List BorrowEntry} {frameLen depth : Nat}
+    (activeProtectors : List Nat)
+    (hAbove : ∀ b ∈ borrows, frameLen ≤ b.targetLocal) :
+    hasFrameDeallocProtectorConflict borrows activeProtectors depth frameLen =
+      false := by
+  induction borrows with
+  | nil => cases activeProtectors <;> rfl
+  | cons hd tl ih =>
+    have hHdAbove : frameLen ≤ hd.targetLocal :=
+      hAbove hd (List.Mem.head tl)
+    have hBlt : Nat.blt hd.targetLocal frameLen = false := by
+      simp [Nat.blt]; omega
+    unfold hasFrameDeallocProtectorConflict
+    cases activeProtectors <;>
+      simp [hBlt, ih (fun b hb => hAbove b (List.Mem.tail hd hb))]
+
+theorem disableFrameBorrows_eq_self_of_lt_frame
+    {borrows : List BorrowEntry} {frameLen depth : Nat}
+    (hAbove : ∀ b ∈ borrows, frameLen ≤ b.targetLocal) :
+    disableFrameBorrows borrows depth frameLen = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons hd tl ih =>
+    have hHdAbove : frameLen ≤ hd.targetLocal :=
+      hAbove hd (List.Mem.head tl)
+    have hBlt : Nat.blt hd.targetLocal frameLen = false := by
+      simp [Nat.blt]; omega
+    unfold disableFrameBorrows
+    simp [hBlt, ih (fun b hb => hAbove b (List.Mem.tail hd hb))]
 
 /-! ### Variable-Headed Pure Lens-State Lifting Judgments -/
 
@@ -3011,17 +3081,16 @@ theorem LiftLensRvalue.evalRvalue_eq
     rcases hOp.evalOperand_eq m.borrows m.globals m.callerLocals with
       ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     rw [hVal]
-    dsimp only
-    exact hOp.not_deref m.borrows m
+    cases hOp <;> cases m.borrows <;> rfl
   | use_deref hDeref hVal =>
     rcases hDeref.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     rw [hVal]
     dsimp only
@@ -3038,7 +3107,7 @@ theorem LiftLensRvalue.evalRvalue_eq
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
     | move_deref _ _ =>
       cases hB : m.borrows with
       | nil => rfl
@@ -3051,13 +3120,13 @@ theorem LiftLensRvalue.evalRvalue_eq
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
   | use_deref_field hField hVal =>
     rcases hField.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     rw [hVal]
     dsimp only
@@ -3074,7 +3143,7 @@ theorem LiftLensRvalue.evalRvalue_eq
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
     | move_deref_field _ _ _ =>
       cases hB : m.borrows with
       | nil => rfl
@@ -3087,7 +3156,7 @@ theorem LiftLensRvalue.evalRvalue_eq
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
   | copyForDeref_deref hGetPtr hLookVal =>
     have hDeref :
         LiftDerefRead env entries
@@ -3096,7 +3165,7 @@ theorem LiftLensRvalue.evalRvalue_eq
     rcases hDeref.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, _, hFreeze⟩
     refine ⟨?_, rfl⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     cases hB : m.borrows with
     | nil => rfl
@@ -3109,13 +3178,13 @@ theorem LiftLensRvalue.evalRvalue_eq
         dsimp only
         rw [hNoUb]
         dsimp only
-        rw [hFr, ← hB]
+        rw [hFr, ← hB, ← hInv.callStack_nil]
   | binaryOp hLhs hRhs hEvalOp =>
     rcases hLhs.evalOperand_eq hInv with ⟨hEval₁, hLen₁⟩
     rcases hRhs.evalOperand_eq (by rw [hLen₁]; exact hInv) with
       ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval₁]
     dsimp only
@@ -3130,14 +3199,14 @@ theorem LiftLensRvalue.evalRvalue_eq
   | unaryOp_not hOp hNot =>
     rcases hOp.evalOperand_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
     exact hNot m
   | unaryOp_neg hOp hSz =>
     rcases hOp.evalOperand_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
     dsimp only
@@ -3145,7 +3214,7 @@ theorem LiftLensRvalue.evalRvalue_eq
   | cast_intToInt hOp hSz hTarget =>
     rcases hOp.evalOperand_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
     dsimp only
@@ -3156,13 +3225,13 @@ theorem LiftLensRvalue.evalRvalue_eq
   | aggregate_tuple hOps =>
     rcases hOps.evalOperands_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
   | aggregate_adt hOps =>
     rcases hOps.evalOperands_eq hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue evalAggregateAdt
+    unfold evalRvalue evalAggregateAdt; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
 
@@ -3205,10 +3274,11 @@ private theorem hasProtectedWriteConflict_singleton_eq_false
     {b₁ entry : BorrowEntry} {tag : Nat}
     {activeProtectors : List Nat} {targetLocal : Local}
     {proj : List ProjectionElem} {off len : Nat}
+    {targetFrameDepth : Nat}
     (hLook : lookupBorrow [b₁] tag = .some entry)
     (hPerm : entry.perm = .active) :
     hasProtectedWriteConflict [b₁] activeProtectors targetLocal (.some tag)
-      proj off len = false := by
+      proj off len targetFrameDepth = false := by
   rcases lookupBorrow_mem_and_tag hLook with ⟨hMem, hTag⟩
   rcases List.mem_singleton.mp hMem with rfl
   simp [hasProtectedWriteConflict, borrowEntryWriteConflicts, hTag, hPerm,
@@ -3292,7 +3362,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
       rw [hEnv₁None]
     | cons _ _ =>
       simp only [hGetPtr, ProvenancePtr.tag, hLookB, hPerm]
-      unfold writeStackThinPtrTypedDeref
+      unfold writeStackThinPtrTypedDeref activeFrameTargetLocals?
       dsimp only
       rw [hEnv₁None]
       split <;> rfl
@@ -3381,7 +3451,8 @@ theorem LiftDerefWrite.evalStmt_field_eq
                 (.some rp.tag)
                 [.field fieldIdx fieldTy]
                 entry.rangeOffset
-                entry.rangeLen = false := by
+                entry.rangeLen
+                entry.targetFrameDepth = false := by
             rw [hT, ← hB]
             exact hasProtectedTreeWriteConflict_eq_false_of_tree
               s.memory.borrows s.memory.borrows (pHead :: pTail) _ _ _
@@ -3444,7 +3515,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
   dsimp only
   rw [hEnv, hEvalRv]
   dsimp only
-  rw [hEvalPlaceWriteUb]
+  rw [hInv.callStack_nil, hEvalPlaceWriteUb]
   dsimp only
   cases hCL : s.memory.callerLocals with
   | nil => rw [hCL] at hCaller; nomatch hCaller
@@ -3455,7 +3526,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
     rw [derefWriteTreeUB_eq_false_of_no_ancestor_ub hGetPtr hLookB
       (hExcl.no_ancestor_write_ub entry hLookB)]
     dsimp only
-    rw [hInvalEq]
+    rw [hInvalEq, ← hInv.callStack_nil]
 
 /--
 Explicit-memory soundness of `LiftDerefWrite`: under `SepLensStateInv`, the
@@ -3507,7 +3578,7 @@ theorem LiftDerefWrite.evalStmt_eq
         rw [hEnv₁None]
       | cons _ _ =>
         simp only [hGetPtr, ProvenancePtr.tag, hLookB, hPerm]
-        unfold writeStackThinPtrTypedDeref
+        unfold writeStackThinPtrTypedDeref activeFrameTargetLocals?
         dsimp only
         rw [hEnv₁None]
         split
@@ -3592,7 +3663,8 @@ theorem LiftDerefWrite.evalStmt_eq
                   (.some rp.tag)
                   []
                   entry.rangeOffset
-                  entry.rangeLen = false := by
+                  entry.rangeLen
+                  entry.targetFrameDepth = false := by
               rw [hT, ← hB]
               exact hasProtectedTreeWriteConflict_eq_false_of_tree
                 s.memory.borrows s.memory.borrows (pHead :: pTail) _ _ _
@@ -3660,7 +3732,7 @@ theorem LiftDerefWrite.evalStmt_eq
     dsimp only
     rw [hEnv, hEvalRv]
     dsimp only
-    rw [hEvalPlaceWriteUb]
+    rw [hInv.callStack_nil, hEvalPlaceWriteUb]
     dsimp only
     cases hCL : s.memory.callerLocals with
     | nil => rw [hCL] at hCaller; nomatch hCaller
@@ -3671,7 +3743,7 @@ theorem LiftDerefWrite.evalStmt_eq
       rw [derefWriteTreeUB_eq_false_of_no_ancestor_ub hGetPtr hLookB
         (hExcl.no_ancestor_write_ub entry hLookB)]
       dsimp only
-      rw [hInvalEq]
+      rw [hInvalEq, ← hInv.callStack_nil]
   | field hRv hGetPtr hLookVal hWriteProj =>
     rcases LiftDerefWrite.evalStmt_field_eq
         hRv hGetPtr hLookVal hWriteProj hEnv hInv with
@@ -3740,7 +3812,8 @@ private theorem evalStmt_retag_of_attachInPlace
         MirStepNode.step (advanceStmt s env) := by
   have hOp :
       evalOperand s.frame.locals (.copy { local_ := ptrLoc, projection := [] })
-        s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls =
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+        s.memory.callStack =
         .ok rp.toMirValue env := by
     simp [hEnv, evalOperand, readProjectedValue, hGetPtr]
   have hFn := evalFnEntryRetag_of_attachInPlace s localDecls layouts
@@ -3854,7 +3927,8 @@ theorem LiftLensStmt.evalStmt_step
         rw [← hLen₁]
         exact (List.getElem?_eq_some_iff.mp hGetDst).1
       have hInval :
-          invalidateConflictingBorrows s.memory.borrows dstLoc_ .none =
+          invalidateConflictingBorrows s.memory.borrows dstLoc_ .none
+              (length s.memory.callStack) =
             s.memory.borrows :=
         invalidateConflictingBorrows_eq_self_of_lt_frame
           hInv.borrows_above_frame hLtFrame
@@ -3894,8 +3968,12 @@ theorem LiftLensStmt.evalStmt_step
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
-      have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
+      have hDisable :=
+        disableLocalBorrows_eq_self_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ _ hNe
+      have hProt := fun ap =>
+        hasProtectedLocalBorrow_eq_false_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
@@ -3906,8 +3984,12 @@ theorem LiftLensStmt.evalStmt_step
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
-      have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
+      have hDisable :=
+        disableLocalBorrows_eq_self_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ _ hNe
+      have hProt := fun ap =>
+        hasProtectedLocalBorrow_eq_false_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
@@ -4008,7 +4090,8 @@ theorem mirWpConverges_of_liftLensStmts
       rw [← hPrefixLen]
       exact ih (prefixStmts ++ [stmt]) m₀ m₁ Φ hAppend hInv₁ hFrame₁ hKeys₁ hCont
 
-/-- A root-frame `return_` terminator halts with `_0`'s value and the memory. -/
+/-- A root-frame `return_` terminator halts with `_0`'s value and `m` when all
+borrows in `m` target caller-owned referents (`env.length ≤ b.targetLocal`). -/
 theorem mirWpConverges_return_of_lens
     {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
     {env : PureEnv} {m : Memory} {retVal : Value} {Φ : MirOutcome → Prop}
@@ -4018,6 +4101,7 @@ theorem mirWpConverges_return_of_lens
     (hRet : get? env 0 = .some (.init retVal))
     (hStack : m.callStack = [])
     (hCallee : m.activeCallee = .none)
+    (hAbove : ∀ b ∈ m.borrows, env.length ≤ b.targetLocal)
     (hPost : Φ (.normal (retVal, m))) :
     MirWpConverges body
       { frame := {
@@ -4037,6 +4121,9 @@ theorem mirWpConverges_return_of_lens
   simp only [beq_self_eq_true, ↓reduceIte]
   unfold evalTerminator
   rw [hTerm, hRet, hStack]
+  dsimp only [length]
+  rw [hasFrameDeallocProtectorConflict_eq_false_of_lt_frame _ hAbove,
+    disableFrameBorrows_eq_self_of_lt_frame hAbove]
   rfl
 
 /-- A `goto` terminator continues at the first statement of its target. -/
@@ -4084,6 +4171,7 @@ theorem mirWpConverges_assert_of_lens
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm : bb.terminator.kind = .assert cond expected target unwind)
     (hCallee : m.activeCallee = .none)
+    (hStack : m.callStack = [])
     (hEval :
       evalOperand env cond m.borrows m.globals body.layouts m.callerLocals =
         .ok (.scalar sc) env')
@@ -4110,7 +4198,7 @@ theorem mirWpConverges_assert_of_lens
   unfold length
   simp only [beq_self_eq_true, ↓reduceIte]
   unfold evalTerminator
-  rw [hTerm]
+  rw [hTerm, hStack]
   dsimp only
   rw [hEval]
   dsimp only
@@ -4130,6 +4218,7 @@ theorem mirWpConverges_switchInt_of_lens
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm : bb.terminator.kind = .switchInt discr targets)
     (hCallee : m.activeCallee = .none)
+    (hStack : m.callStack = [])
     (hEval :
       evalOperand env discr m.borrows m.globals body.layouts m.callerLocals =
         .ok (.scalar sc) env')
@@ -4156,7 +4245,7 @@ theorem mirWpConverges_switchInt_of_lens
   unfold length
   simp only [beq_self_eq_true, ↓reduceIte]
   unfold evalTerminator
-  rw [hTerm]
+  rw [hTerm, hStack]
   dsimp only
   rw [hEval]
   dsimp only
@@ -4332,7 +4421,7 @@ theorem mirWpConverges_of_liftLensBlock
       (List.nil_append _).symm hInv hFrame hKeys
       (fun m' hInv' hFrame' _ =>
         mirWpConverges_return_of_lens hPhase hBb hTerm hRet
-          hInv'.callStack_nil hInv'.activeCallee_none
+          hInv'.callStack_nil hInv'.activeCallee_none hInv'.borrows_above_frame
           (hPost m' (by rw [← hLen]; exact hInv') hFrame'))
   | goto hPhase hBb hTerm hStmts _ ih =>
     intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
@@ -4352,7 +4441,7 @@ theorem mirWpConverges_of_liftLensBlock
       (fun m' hInv' hFrame' hKeys' => ?_)
     rcases hCond.evalOperand_eq hInv' with ⟨hEval, hLen₂⟩
     exact mirWpConverges_assert_of_lens hPhase hBb hTerm
-      hInv'.activeCallee_none hEval hBit
+      hInv'.activeCallee_none hInv'.callStack_nil hEval hBit
       (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
         (fun m_final hInvF hFrameF =>
           hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
@@ -4364,7 +4453,7 @@ theorem mirWpConverges_of_liftLensBlock
       (fun m' hInv' hFrame' hKeys' => ?_)
     rcases hDiscr.evalOperand_eq hInv' with ⟨hEval, hLen₂⟩
     exact mirWpConverges_switchInt_of_lens hPhase hBb hTerm
-      hInv'.activeCallee_none hEval hTarget
+      hInv'.activeCallee_none hInv'.callStack_nil hEval hTarget
       (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
         (fun m_final hInvF hFrameF =>
           hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
@@ -5334,13 +5423,13 @@ def stepTreeBorrowHierarchyAccess?
         borrows :=
           freezeTreeBorrowsOnReadAtProj m.borrows m.borrows entry.targetLocal
             (.some rp.tag) entry.targetProjection entry.rangeOffset
-            entry.rangeLen }
+            entry.rangeLen .nil entry.targetFrameDepth }
     | _, true =>
       .some { m with
         borrows :=
           invalidateTreeBorrowsAtProj m.borrows m.borrows entry.targetLocal
             (.some rp.tag) entry.targetProjection entry.rangeOffset
-            entry.rangeLen }
+            entry.rangeLen entry.targetFrameDepth }
   | .none => .none
 
 /--
@@ -5907,6 +5996,7 @@ theorem hasTreeReadUB_eq_false_of_treeField
     (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     {allocId tag : Nat} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {targetFrameDepth : Nat}
     (hTree :
       ∀ b ∈ borrows,
         b.targetLocal = allocId →
@@ -5917,27 +6007,30 @@ theorem hasTreeReadUB_eq_false_of_treeField
           (isBorrowDescendantOrSelf allBorrows tag b.tag = false ∧
             b.perm = .disabled)) :
     hasTreeReadUB allBorrows borrows activeProtectors allocId (.some tag)
-      [.field fieldIdx fieldTy] 0 0 = false := by
+      [.field fieldIdx fieldTy] 0 0 targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold hasTreeReadUB borrowEntryReadUB
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => exact hTail
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
-    | false => dsimp only; exact hTail
+    | false => exact hTail
     | true =>
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
       rcases hTree hd (List.Mem.head tl) hTargetEq with
         ⟨hDesc, hPerm⟩ | ⟨hNoOverlap, _⟩ | ⟨hNotDesc, hDis⟩
       · cases borrowEntryOverlapsWrite hd [.field fieldIdx fieldTy] 0 0 with
-        | false => dsimp only; exact hTail
+        | false => exact hTail
         | true =>
           simp [hDesc, hPerm, TreeBorrowPerm.active, treeBorrowNodeAccess,
             treeBorrowPermTransition, hTail]
       · rw [hNoOverlap]; exact hTail
       · cases borrowEntryOverlapsWrite hd [.field fieldIdx fieldTy] 0 0 with
-        | false => dsimp only; exact hTail
+        | false => exact hTail
         | true =>
           simp [hNotDesc, hDis, treeBorrowNodeAccess, hTail]
 
@@ -5953,10 +6046,11 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField
             b.perm = .active) ∨
           (isBorrowDescendantOrSelf allBorrows tag b.tag = false ∧
             b.perm = .disabled))
+    {targetFrameDepth : Nat}
     (activeProtectors : List Nat := .nil) :
     freezeTreeBorrowsOnReadAtProj
       allBorrows borrows allocId (.some tag)
-      [.field fieldIdx fieldTy] 0 0 activeProtectors = borrows := by
+      [.field fieldIdx fieldTy] 0 0 activeProtectors targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -5964,6 +6058,9 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField
     unfold freezeTreeBorrowsOnReadAtProj
     rw [hTail]
     unfold updateBorrowPermOnReadAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
@@ -5973,20 +6070,18 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField
         ⟨hDesc, _⟩ | ⟨hNoOverlap, _⟩ | ⟨hNotDesc, hDis⟩
       · cases borrowEntryOverlapsWrite hd [.field fieldIdx fieldTy] 0 0 with
         | false => rfl
-        | true => dsimp only; rw [hDesc]
-      · rw [hNoOverlap]
+        | true => simp [hDesc]
+      · rw [hNoOverlap]; rfl
       · cases borrowEntryOverlapsWrite hd [.field fieldIdx fieldTy] 0 0 with
         | false => rfl
         | true =>
-          dsimp only
-          rw [hNotDesc]
-          dsimp only
-          simp [treeBorrowNodeAccess, hDis,
+          simp [hNotDesc, treeBorrowNodeAccess, hDis,
             borrowEntry_disabled_eta hDis]
 
 theorem invalidateTreeBorrowsAtProj_eq_self_of_treeField
     (allBorrows borrows : List BorrowEntry)
     {allocId tag : Nat} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {targetFrameDepth : Nat}
     (hTree :
       ∀ b ∈ borrows,
         b.targetLocal = allocId →
@@ -5998,7 +6093,7 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_treeField
             b.perm = .disabled)) :
     invalidateTreeBorrowsAtProj
       allBorrows borrows allocId (.some tag)
-      [.field fieldIdx fieldTy] 0 0 = borrows := by
+      [.field fieldIdx fieldTy] 0 0 targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -6007,10 +6102,12 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_treeField
     rw [hTail]
     unfold updateBorrowPermTreeAtProj
     unfold updateBorrowPermAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
-      dsimp only
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
       rcases hTree hd (List.Mem.head tl) hTargetEq with
@@ -7483,6 +7580,7 @@ theorem hasTreeReadUB_eq_false_of_treeField_prefix
     (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     {allocId tag : Nat} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {targetFrameDepth : Nat}
     (tailProj : List ProjectionElem)
     (hTree :
       ∀ b ∈ borrows,
@@ -7494,14 +7592,17 @@ theorem hasTreeReadUB_eq_false_of_treeField_prefix
           (isBorrowDescendantOrSelf allBorrows tag b.tag = false ∧
             b.perm = .disabled)) :
     hasTreeReadUB allBorrows borrows activeProtectors allocId (.some tag)
-      (.field fieldIdx fieldTy :: tailProj) 0 0 = false := by
+      (.field fieldIdx fieldTy :: tailProj) 0 0 targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold hasTreeReadUB borrowEntryReadUB
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => exact hTail
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
-    | false => dsimp only; exact hTail
+    | false => exact hTail
     | true =>
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
@@ -7509,7 +7610,7 @@ theorem hasTreeReadUB_eq_false_of_treeField_prefix
         ⟨hDesc, hPerm⟩ | ⟨hNoOverlap, _⟩ | ⟨hNotDesc, hDis⟩
       · cases borrowEntryOverlapsWrite hd
             (.field fieldIdx fieldTy :: tailProj) 0 0 with
-        | false => dsimp only; exact hTail
+        | false => exact hTail
         | true =>
           simp [hDesc, hPerm, TreeBorrowPerm.active, treeBorrowNodeAccess,
             treeBorrowPermTransition, hTail]
@@ -7517,7 +7618,7 @@ theorem hasTreeReadUB_eq_false_of_treeField_prefix
         exact hTail
       · cases borrowEntryOverlapsWrite hd
             (.field fieldIdx fieldTy :: tailProj) 0 0 with
-        | false => dsimp only; exact hTail
+        | false => exact hTail
         | true =>
           simp [hNotDesc, hDis, treeBorrowNodeAccess, hTail]
 
@@ -7534,10 +7635,11 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField_prefix
             b.perm = .active) ∨
           (isBorrowDescendantOrSelf allBorrows tag b.tag = false ∧
             b.perm = .disabled))
+    {targetFrameDepth : Nat}
     (activeProtectors : List Nat := .nil) :
     freezeTreeBorrowsOnReadAtProj
       allBorrows borrows allocId (.some tag)
-      (.field fieldIdx fieldTy :: tailProj) 0 0 activeProtectors = borrows := by
+      (.field fieldIdx fieldTy :: tailProj) 0 0 activeProtectors targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -7545,6 +7647,9 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField_prefix
     unfold freezeTreeBorrowsOnReadAtProj
     rw [hTail]
     unfold updateBorrowPermOnReadAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
@@ -7555,21 +7660,19 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField_prefix
       · cases borrowEntryOverlapsWrite hd
             (.field fieldIdx fieldTy :: tailProj) 0 0 with
         | false => rfl
-        | true => dsimp only; rw [hDesc]
-      · rw [borrowEntryOverlapsWrite_field_prefix_eq_false hNoOverlap]
+        | true => simp [hDesc]
+      · rw [borrowEntryOverlapsWrite_field_prefix_eq_false hNoOverlap]; rfl
       · cases borrowEntryOverlapsWrite hd
             (.field fieldIdx fieldTy :: tailProj) 0 0 with
         | false => rfl
         | true =>
-          dsimp only
-          rw [hNotDesc]
-          dsimp only
-          simp [treeBorrowNodeAccess, hDis,
+          simp [hNotDesc, treeBorrowNodeAccess, hDis,
             borrowEntry_disabled_eta hDis]
 
 theorem invalidateTreeBorrowsAtProj_eq_self_of_treeField_prefix
     (allBorrows borrows : List BorrowEntry)
     {allocId tag : Nat} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {targetFrameDepth : Nat}
     (tailProj : List ProjectionElem)
     (hTree :
       ∀ b ∈ borrows,
@@ -7582,7 +7685,7 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_treeField_prefix
             b.perm = .disabled)) :
     invalidateTreeBorrowsAtProj
       allBorrows borrows allocId (.some tag)
-      (.field fieldIdx fieldTy :: tailProj) 0 0 = borrows := by
+      (.field fieldIdx fieldTy :: tailProj) 0 0 targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
@@ -7590,10 +7693,12 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_treeField_prefix
     unfold invalidateTreeBorrowsAtProj
     rw [hTail]
     unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => rfl
+    | true =>
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => rfl
     | true =>
-      dsimp only
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
       rcases hTree hd (List.Mem.head tl) hTargetEq with
@@ -7634,6 +7739,7 @@ theorem hasProtectedTreeWriteConflict_eq_false_of_treeField_prefix
     (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     {allocId tag : Nat} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {targetFrameDepth : Nat}
     (tailProj : List ProjectionElem)
     (hTree :
       ∀ b ∈ borrows,
@@ -7646,12 +7752,16 @@ theorem hasProtectedTreeWriteConflict_eq_false_of_treeField_prefix
             b.perm = .disabled)) :
     hasProtectedTreeWriteConflict
       allBorrows borrows activeProtectors allocId (.some tag)
-      (.field fieldIdx fieldTy :: tailProj) 0 0 = false := by
+      (.field fieldIdx fieldTy :: tailProj) 0 0 targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
     have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold hasProtectedTreeWriteConflict
+    cases Nat.beq hd.targetFrameDepth targetFrameDepth with
+    | false => simp [hTail]
+    | true =>
+    dsimp only [Bool.true_and]
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false => simp [hTail]
     | true =>
@@ -8442,17 +8552,16 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     rcases hOp.evalOperand_eq m.borrows m.globals m.callerLocals with
       ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     rw [hVal]
-    dsimp only
-    exact hOp.not_deref m.borrows m
+    cases hOp <;> cases m.borrows <;> rfl
   | use_deref hDeref hVal =>
     rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     rw [hVal]
     dsimp only
@@ -8469,7 +8578,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
     | move_deref _ _ =>
       cases hB : m.borrows with
       | nil => rfl
@@ -8482,13 +8591,13 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
   | use_deref_field hField hVal =>
     rcases hField.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     rw [hVal]
     dsimp only
@@ -8505,7 +8614,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
     | move_deref_field _ _ _ =>
       cases hB : m.borrows with
       | nil => rfl
@@ -8518,7 +8627,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           dsimp only
           rw [hNoUb]
           dsimp only
-          rw [hFr, ← hB]
+          rw [hFr, ← hB, ← hInv.callStack_nil]
   | copyForDeref_deref hGetPtr hLookVal =>
     have hDeref :
         LiftDerefRead env entries
@@ -8527,7 +8636,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, _, hFreeze⟩
     refine ⟨?_, rfl⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     simp only [hEval]
     cases hB : m.borrows with
     | nil => rfl
@@ -8540,13 +8649,13 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
         dsimp only
         rw [hNoUb]
         dsimp only
-        rw [hFr, ← hB]
+        rw [hFr, ← hB, ← hInv.callStack_nil]
   | binaryOp hLhs hRhs hEvalOp =>
     rcases hLhs.evalOperand_eq_subplace hInv with ⟨hEval₁, hLen₁⟩
     rcases hRhs.evalOperand_eq_subplace (by rw [hLen₁]; exact hInv)
       with ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval₁]
     dsimp only
@@ -8561,14 +8670,14 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
   | unaryOp_not hOp hNot =>
     rcases hOp.evalOperand_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
     exact hNot m
   | unaryOp_neg hOp hSz =>
     rcases hOp.evalOperand_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
     dsimp only
@@ -8576,7 +8685,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
   | cast_intToInt hOp hSz hTarget =>
     rcases hOp.evalOperand_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
     dsimp only
@@ -8586,13 +8695,13 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
   | aggregate_tuple hOps =>
     rcases hOps.evalOperands_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue
+    unfold evalRvalue; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
   | aggregate_adt hOps =>
     rcases hOps.evalOperands_eq_subplace hInv with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
-    unfold evalRvalue evalAggregateAdt
+    unfold evalRvalue evalAggregateAdt; rw [hInv.callStack_nil]
     dsimp only
     rw [hEval]
 
@@ -8653,7 +8762,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           rw [hEnv₁None]
         | cons _ _ =>
           simp only [hGetPtr, ProvenancePtr.tag, hLookB, hPerm]
-          unfold writeStackThinPtrTypedDeref
+          unfold writeStackThinPtrTypedDeref activeFrameTargetLocals?
           dsimp only
           rw [hEnv₁None]
           split
@@ -8713,7 +8822,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
                     entry.targetLocal (.some rp.tag) []
-                    entry.rangeOffset entry.rangeLen = false := by
+                    entry.rangeOffset entry.rangeLen
+                    entry.targetFrameDepth = false := by
                 rw [hT, ← hB]
                 exact hasProtectedTreeWriteConflict_eq_false_of_tree
                   s.memory.borrows s.memory.borrows (pHead :: pTail) _ _ _
@@ -8769,7 +8879,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
       dsimp only
       rw [hEnv, hEvalRv]
       dsimp only
-      rw [hEvalPlaceWriteUb]
+      rw [hInv.callStack_nil, hEvalPlaceWriteUb]
       dsimp only
       cases hCL : s.memory.callerLocals with
       | nil => rw [hCL] at hCaller; nomatch hCaller
@@ -8780,7 +8890,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
         rw [derefWriteTreeUB_eq_false_of_no_ancestor_ub hGetPtr hLookB
           (hExcl.no_ancestor_write_ub entry hLookB)]
         dsimp only
-        rw [hInvalEq, hSub]
+        rw [hInvalEq, hSub, ← hInv.callStack_nil]
     | field outerIdx outerTy =>
       rw [hSub] at hRest
       rcases hRest with ⟨hField, hExcl⟩
@@ -8801,7 +8911,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           simp [hGetPtr, ProvenancePtr.tag, hLookB, hPerm, hP, hOff, hEnv₁None]
         | cons _ _ =>
           simp only [hGetPtr, ProvenancePtr.tag, hLookB, hPerm]
-          unfold writeStackThinPtrTypedDeref
+          unfold writeStackThinPtrTypedDeref activeFrameTargetLocals?
           dsimp only
           rw [hEnv₁None]
           split
@@ -8888,7 +8998,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
                     entry.targetLocal (.some rp.tag)
                     [.field outerIdx outerTy]
-                    entry.rangeOffset entry.rangeLen = false := by
+                    entry.rangeOffset entry.rangeLen
+                    entry.targetFrameDepth = false := by
                 rw [hRO, hRL, hT, ← hB]
                 exact hasProtectedTreeWriteConflict_eq_false_of_treeField_prefix
                   s.memory.borrows s.memory.borrows (pHead :: pTail) []
@@ -8943,7 +9054,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
       dsimp only
       rw [hEnv, hEvalRv]
       dsimp only
-      rw [hEvalPlaceWriteUb]
+      rw [hInv.callStack_nil, hEvalPlaceWriteUb]
       dsimp only
       cases hCL : s.memory.callerLocals with
       | nil => rw [hCL] at hCaller; nomatch hCaller
@@ -8954,7 +9065,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
         rw [derefWriteTreeUB_eq_false_of_no_ancestor_ub hGetPtr hLookB
           (hExcl.no_ancestor_write_ub entry hLookB)]
         dsimp only
-        rw [hInvalEq, hSub]
+        rw [hInvalEq, hSub, ← hInv.callStack_nil]
   | field hRv hGetPtr hLookVal hWriteProj =>
     rename_i _ ptrLoc subIdx subTy rv rp oldAgg fieldVal newAgg
     rcases hRv.evalRvalue_eq_subplace hInv with ⟨hEvalRv, hLen₁⟩
@@ -8983,7 +9094,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           rw [hEnv₁None]
         | cons _ _ =>
           simp only [hGetPtr, ProvenancePtr.tag, hLookB, hPerm]
-          unfold writeStackThinPtrTypedDeref
+          unfold writeStackThinPtrTypedDeref activeFrameTargetLocals?
           dsimp only
           rw [hEnv₁None]
           split <;> rfl
@@ -9043,7 +9154,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
                     entry.targetLocal (.some rp.tag)
                     [.field subIdx subTy]
-                    entry.rangeOffset entry.rangeLen = false := by
+                    entry.rangeOffset entry.rangeLen
+                    entry.targetFrameDepth = false := by
                 rw [hT, ← hB]
                 exact hasProtectedTreeWriteConflict_eq_false_of_tree
                   s.memory.borrows s.memory.borrows (pHead :: pTail) _ _ _
@@ -9095,7 +9207,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               hExcl.ancestors_active_or_disabled
       refine ⟨rp, oldAgg, newAgg, hLookVal, rfl, hLen₁, ?_⟩
       unfold evalStmt
-      dsimp only; rw [hEnv, hEvalRv]; dsimp only; rw [hEvalPlaceWriteUb]
+      dsimp only; rw [hEnv, hEvalRv]; dsimp only; rw [hInv.callStack_nil, hEvalPlaceWriteUb]
       dsimp only
       cases hCL : s.memory.callerLocals with
       | nil => rw [hCL] at hCaller; nomatch hCaller
@@ -9106,7 +9218,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
         rw [derefWriteTreeUB_eq_false_of_no_ancestor_ub hGetPtr hLookB
           (hExcl.no_ancestor_write_ub entry hLookB)]
         dsimp only
-        rw [hInvalEq, hSub]
+        rw [hInvalEq, hSub, ← hInv.callStack_nil]
     | field outerIdx outerTy =>
       rw [hSub] at hRest
       rcases hRest with ⟨hField, hExcl⟩
@@ -9127,7 +9239,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           simp [hGetPtr, ProvenancePtr.tag, hLookB, hPerm, hP, hOff, hEnv₁None]
         | cons _ _ =>
           simp only [hGetPtr, ProvenancePtr.tag, hLookB, hPerm]
-          unfold writeStackThinPtrTypedDeref
+          unfold writeStackThinPtrTypedDeref activeFrameTargetLocals?
           dsimp only
           rw [hEnv₁None]
           split <;> rfl
@@ -9214,7 +9326,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
                     entry.targetLocal (.some rp.tag)
                     [.field outerIdx outerTy, .field subIdx subTy]
-                    entry.rangeOffset entry.rangeLen = false := by
+                    entry.rangeOffset entry.rangeLen
+                    entry.targetFrameDepth = false := by
                 rw [hRO, hRL, hT, ← hB]
                 exact hasProtectedTreeWriteConflict_eq_false_of_treeField_prefix
                   s.memory.borrows s.memory.borrows (pHead :: pTail)
@@ -9266,7 +9379,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               hExcl.ancestors_disjoint_or_disabled
       refine ⟨rp, oldAgg, newAgg, hLookVal, rfl, hLen₁, ?_⟩
       unfold evalStmt
-      dsimp only; rw [hEnv, hEvalRv]; dsimp only; rw [hEvalPlaceWriteUb]
+      dsimp only; rw [hEnv, hEvalRv]; dsimp only; rw [hInv.callStack_nil, hEvalPlaceWriteUb]
       dsimp only
       cases hCL : s.memory.callerLocals with
       | nil => rw [hCL] at hCaller; nomatch hCaller
@@ -9277,7 +9390,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
         rw [derefWriteTreeUB_eq_false_of_no_ancestor_ub hGetPtr hLookB
           (hExcl.no_ancestor_write_ub entry hLookB)]
         dsimp only
-        rw [hInvalEq, hSub]
+        rw [hInvalEq, hSub, ← hInv.callStack_nil]
 
 /--
 Field-granular `I-10` write alias-erasure theorem: under
@@ -9509,7 +9622,8 @@ theorem LiftLensStmt.evalStmt_step_subplace
         rw [← hLen₁]
         exact (List.getElem?_eq_some_iff.mp hGetDst).1
       have hInval :
-          invalidateConflictingBorrows s.memory.borrows dstLoc_ .none =
+          invalidateConflictingBorrows s.memory.borrows dstLoc_ .none
+              (length s.memory.callStack) =
             s.memory.borrows :=
         invalidateConflictingBorrows_eq_self_of_lt_frame
           hInv.borrows_above_frame hLtFrame
@@ -9542,8 +9656,12 @@ theorem LiftLensStmt.evalStmt_step_subplace
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
-      have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
+      have hDisable :=
+        disableLocalBorrows_eq_self_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ _ hNe
+      have hProt := fun ap =>
+        hasProtectedLocalBorrow_eq_false_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
@@ -9554,8 +9672,12 @@ theorem LiftLensStmt.evalStmt_step_subplace
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
-      have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
+      have hDisable :=
+        disableLocalBorrows_eq_self_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ _ hNe
+      have hProt := fun ap =>
+        hasProtectedLocalBorrow_eq_false_of_forall_ne
+          (targetFrameDepth := length s.memory.callStack) _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
@@ -9673,7 +9795,7 @@ theorem mirWpConverges_of_liftLensBlock_subplace
       (List.nil_append _).symm hInv hFrame hKeys
       (fun m' hInv' hFrame' _ =>
         mirWpConverges_return_of_lens hPhase hBb hTerm hRet
-          hInv'.callStack_nil hInv'.activeCallee_none
+          hInv'.callStack_nil hInv'.activeCallee_none hInv'.borrows_above_frame
           (hPost m' (by rw [← hLen]; exact hInv') hFrame'))
   | goto hPhase hBb hTerm hStmts _ ih =>
     intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
@@ -9694,7 +9816,7 @@ theorem mirWpConverges_of_liftLensBlock_subplace
       (fun m' hInv' hFrame' hKeys' => by
         rcases hCond.evalOperand_eq_subplace hInv' with ⟨hEval, _⟩
         exact mirWpConverges_assert_of_lens hPhase hBb hTerm
-          hInv'.activeCallee_none hEval hBit
+          hInv'.activeCallee_none hInv'.callStack_nil hEval hBit
           (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
             (fun m_final hInvF hFrameF =>
               hPost m_final (by rw [← hLen₁, ← hLen₂]; exact hInvF) hFrameF)))
@@ -9708,7 +9830,7 @@ theorem mirWpConverges_of_liftLensBlock_subplace
         rcases hDiscr.evalOperand_eq_subplace hInv' with
           ⟨hEval, _⟩
         exact mirWpConverges_switchInt_of_lens hPhase hBb hTerm
-          hInv'.activeCallee_none hEval hTarget
+          hInv'.activeCallee_none hInv'.callStack_nil hEval hTarget
           (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
             (fun m_final hInvF hFrameF =>
               hPost m_final (by rw [← hLen₁, ← hLen₂]; exact hInvF) hFrameF)))
@@ -11978,6 +12100,8 @@ private theorem add_assign_retag_exec_subplace
       rangeLen := entry.rangeLen
       protector := .some m₀.nextProtector
       parentTag := .some x_ptr.tag
+      targetFrameDepth := entry.targetFrameDepth
+      allocDead := entry.allocDead
     }
     let child₁ : BorrowEntry := { child₀ with perm := .active }
     let m₁ : Memory := {
@@ -11998,14 +12122,14 @@ private theorem add_assign_retag_exec_subplace
     have hReadUB₀ :
         hasTreeReadUB m₀.borrows m₀.borrows m₀.activeProtectors
           entry.targetLocal (.some x_ptr.tag) entry.targetProjection
-          entry.rangeOffset entry.rangeLen = false := by
+          entry.rangeOffset entry.rangeLen entry.targetFrameDepth = false := by
       rw [hT, hRO, hRL]
       exact hasTreeReadUB_eq_false_of_tree m₀.borrows m₀.borrows m₀.activeProtectors
         _ _ _ hExcl.ancestors_active_or_disabled
     have hFreeze₀ :
         freezeTreeBorrowsOnReadAtProj m₀.borrows m₀.borrows entry.targetLocal
           (.some x_ptr.tag) entry.targetProjection entry.rangeOffset entry.rangeLen
-          m₀.activeProtectors = m₀.borrows := by
+          m₀.activeProtectors entry.targetFrameDepth = m₀.borrows := by
       rw [hT, hRO, hRL]
       exact freezeTreeBorrowsOnReadAtProj_eq_self_of_tree m₀.borrows m₀.borrows
         _ _ _ hExcl.ancestors_active_or_disabled m₀.activeProtectors
@@ -12056,7 +12180,8 @@ private theorem add_assign_retag_exec_subplace
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, get?,
           List.getElem?_cons_zero, List.getElem?_cons_succ,
           ProvenancePtr.tag, hLookChild, add_assign_retag, add_assign]
-        dsimp only [child₀, needsThinPtrElemResolution, ProvenancePtr.offsetBytes]
+        dsimp only [child₀, activeFrameSlot?, foreignFrameSlot?,
+          needsThinPtrElemResolution, ProvenancePtr.offsetBytes, get?]
         dsimp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, childPtr] at hNoneElem
         rw [hT, hNoneElem, hCallerElem, hP]
@@ -12070,7 +12195,7 @@ private theorem add_assign_retag_exec_subplace
             writePlaceValue env₁ (child₀ :: m₀.borrows)
               { local_ := 1, projection := [.deref] } newVal
               add_assign_retag.localDecls add_assign_retag.layouts = .ub := by
-          unfold writePlaceValue writeStackThinPtrTypedDeref
+          unfold writePlaceValue writeStackThinPtrTypedDeref activeFrameTargetLocals?
           simp only [env₁, childPtr, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, get?,
             List.getElem?_cons_zero, List.getElem?_cons_succ,
@@ -12104,7 +12229,8 @@ private theorem add_assign_retag_exec_subplace
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, get?,
             List.getElem?_cons_zero, List.getElem?_cons_succ,
             ProvenancePtr.tag, hLookChild]
-          dsimp only [child₀, needsThinPtrElemResolution, ProvenancePtr.offsetBytes]
+          dsimp only [child₀, activeFrameSlot?, needsThinPtrElemResolution,
+            ProvenancePtr.offsetBytes, get?]
           dsimp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, childPtr] at hNoneElem
           rw [hT, hNoneElem, hP, hCallerElem]
@@ -12135,7 +12261,7 @@ private theorem add_assign_retag_exec_subplace
           have hTailNoConf :
               hasProtectedTreeWriteConflict (child₀ :: m₀.borrows) m₀.borrows
                 (m₀.nextProtector :: m₀.activeProtectors) x_ptr.allocId
-                (.some m₀.nextTag) [] 0 0 = false :=
+                (.some m₀.nextTag) [] 0 0 entry.targetFrameDepth = false :=
             hasProtectedTreeWriteConflict_eq_false_of_tree
               (child₀ :: m₀.borrows) m₀.borrows
               (m₀.nextProtector :: m₀.activeProtectors) _ _ _ hTreeChild
@@ -12181,7 +12307,8 @@ private theorem add_assign_retag_exec_subplace
           unfold invalidateTreeBorrowsAtProj
           have hTailInv :
               invalidateTreeBorrowsAtProj (child₀ :: m₀.borrows) m₀.borrows
-                x_ptr.allocId (.some m₀.nextTag) [] 0 0 = m₀.borrows :=
+                x_ptr.allocId (.some m₀.nextTag) [] 0 0
+                entry.targetFrameDepth = m₀.borrows :=
             invalidateTreeBorrowsAtProj_eq_self_of_tree
               (child₀ :: m₀.borrows) m₀.borrows _ _ _ hTreeChild
           dsimp only [child₀] at hTailInv
@@ -12203,6 +12330,7 @@ private theorem add_assign_retag_exec_subplace
       · rw [stepMirFn_of_isRuntimeMirPhase _ 0 1 env₁ m₁ hInv₀.activeCallee_none rfl rfl]
         dsimp only [get?, List.getElem?_cons_zero, List.getElem?_cons_succ, length, Nat.beq, m₁]
         unfold evalStmt
+        rw [hInv₀.callStack_nil]
         dsimp only [evalRvalue]
         dsimp only [add_assign_retag, add_assign] at hLhsOk hWriteLocalUb
         rw [hLhsOk]
@@ -12235,7 +12363,7 @@ private theorem add_assign_retag_exec_subplace
           dsimp only
           rw [hDerefUb]
           dsimp only
-          rw [hInval, ← hWriteSub]
+          rw [hInval, ← hWriteSub, ← hInv₀.callStack_nil]
           rfl
       · refine MirWpConverges.step_tau (s' := {
           frame := { blockIdx := 0, stmtIdx := 3, locals := env₂ }
@@ -12257,6 +12385,20 @@ private theorem add_assign_retag_exec_subplace
           dsimp only [get?, List.getElem?_cons_zero, List.getElem?_cons_succ,
             List.getElem?_nil, length, Nat.beq, evalTerminator, env₂, m_pre]
           rw [hInv₀.callStack_nil]
+          change (if (3 == 3) = true then
+              match hasFrameDeallocProtectorConflict (child₁ :: m₀.borrows)
+                  (m₀.nextProtector :: m₀.activeProtectors) 0 3 with
+              | true => MirStepNode.fail .ub
+              | false =>
+                MirStepNode.retNormal .unit
+                  { m_pre with
+                    callStack := []
+                    borrows := disableFrameBorrows (child₁ :: m₀.borrows) 0 3 }
+            else MirStepNode.fail .ub) = _
+          rw [hasFrameDeallocProtectorConflict_eq_false_of_lt_frame _ hAboveChild₁,
+            disableFrameBorrows_eq_self_of_lt_frame hAboveChild₁]
+          dsimp only [m_pre]
+          rw [← hInv₀.callStack_nil]
           rfl
   | field fieldIdx fieldTy =>
     rw [hSub] at hRest
@@ -12274,6 +12416,8 @@ private theorem add_assign_retag_exec_subplace
           rangeLen := entry.rangeLen
           protector := .some m₀.nextProtector
           parentTag := .some x_ptr.tag
+          targetFrameDepth := entry.targetFrameDepth
+          allocDead := entry.allocDead
         } : BorrowEntry) :: m₀.borrows, 3 ≤ b.targetLocal := by
       intro b hb
       rcases List.mem_cons.mp hb with rfl | hb₀
@@ -12311,6 +12455,8 @@ private theorem add_assign_retag_exec_subplace
       rangeLen := entry.rangeLen
       protector := .some m₀.nextProtector
       parentTag := .some x_ptr.tag
+      targetFrameDepth := entry.targetFrameDepth
+      allocDead := entry.allocDead
     }
     let child₁ : BorrowEntry := { child₀ with perm := .active }
     let m₁ : Memory := {
@@ -12326,14 +12472,14 @@ private theorem add_assign_retag_exec_subplace
     have hReadUB₀ :
         hasTreeReadUB m₀.borrows m₀.borrows m₀.activeProtectors
           entry.targetLocal (.some x_ptr.tag) entry.targetProjection
-          entry.rangeOffset entry.rangeLen = false := by
+          entry.rangeOffset entry.rangeLen entry.targetFrameDepth = false := by
       rw [hT, hP, hRO, hRL]
       exact hasTreeReadUB_eq_false_of_treeField_prefix m₀.borrows m₀.borrows
         m₀.activeProtectors [] hExcl.ancestors_disjoint_or_disabled
     have hFreeze₀ :
         freezeTreeBorrowsOnReadAtProj m₀.borrows m₀.borrows entry.targetLocal
           (.some x_ptr.tag) entry.targetProjection entry.rangeOffset entry.rangeLen
-          m₀.activeProtectors = m₀.borrows := by
+          m₀.activeProtectors entry.targetFrameDepth = m₀.borrows := by
       rw [hT, hP, hRO, hRL]
       exact freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField_prefix
         m₀.borrows m₀.borrows []
@@ -12387,7 +12533,8 @@ private theorem add_assign_retag_exec_subplace
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, get?,
           List.getElem?_cons_zero, List.getElem?_cons_succ,
           ProvenancePtr.tag, hLookChild, add_assign_retag, add_assign]
-        dsimp only [child₀, needsThinPtrElemResolution, ProvenancePtr.offsetBytes]
+        dsimp only [child₀, activeFrameSlot?, foreignFrameSlot?,
+          needsThinPtrElemResolution, ProvenancePtr.offsetBytes, get?]
         dsimp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, childPtr] at hNoneElem
         rw [hT, hNoneElem, hCallerElem, hP]
@@ -12403,7 +12550,7 @@ private theorem add_assign_retag_exec_subplace
             writePlaceValue env₁ (child₀ :: m₀.borrows)
               { local_ := 1, projection := [.deref] } newVal
               add_assign_retag.localDecls add_assign_retag.layouts = .ub := by
-          unfold writePlaceValue writeStackThinPtrTypedDeref
+          unfold writePlaceValue writeStackThinPtrTypedDeref activeFrameTargetLocals?
           simp only [env₁, childPtr, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, get?,
             List.getElem?_cons_zero, List.getElem?_cons_succ,
@@ -12448,7 +12595,7 @@ private theorem add_assign_retag_exec_subplace
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, get?,
             List.getElem?_cons_zero, List.getElem?_cons_succ,
             ProvenancePtr.tag, hLookChild]
-          dsimp only [child₀, ProvenancePtr.offsetBytes]
+          dsimp only [child₀, activeFrameSlot?, ProvenancePtr.offsetBytes, get?]
           dsimp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr, childPtr] at hNoneElem
           rw [hT, hNoneElem, hP, hCallerElem]
@@ -12486,7 +12633,8 @@ private theorem add_assign_retag_exec_subplace
           have hTailNoConf :
               hasProtectedTreeWriteConflict (child₀ :: m₀.borrows) m₀.borrows
                 (m₀.nextProtector :: m₀.activeProtectors) x_ptr.allocId
-                (.some m₀.nextTag) [.field fieldIdx fieldTy] 0 0 = false :=
+                (.some m₀.nextTag) [.field fieldIdx fieldTy] 0 0
+                entry.targetFrameDepth = false :=
             hasProtectedTreeWriteConflict_eq_false_of_treeField_prefix
               (child₀ :: m₀.borrows) m₀.borrows
               (m₀.nextProtector :: m₀.activeProtectors) [] hTreeChild
@@ -12532,8 +12680,8 @@ private theorem add_assign_retag_exec_subplace
           unfold invalidateTreeBorrowsAtProj
           have hTailInv :
               invalidateTreeBorrowsAtProj (child₀ :: m₀.borrows) m₀.borrows
-                x_ptr.allocId (.some m₀.nextTag) [.field fieldIdx fieldTy] 0 0 =
-                m₀.borrows :=
+                x_ptr.allocId (.some m₀.nextTag) [.field fieldIdx fieldTy] 0 0
+                entry.targetFrameDepth = m₀.borrows :=
             invalidateTreeBorrowsAtProj_eq_self_of_treeField_prefix
               (child₀ :: m₀.borrows) m₀.borrows [] hTreeChild
           dsimp only [child₀] at hTailInv
@@ -12555,6 +12703,7 @@ private theorem add_assign_retag_exec_subplace
       · rw [stepMirFn_of_isRuntimeMirPhase _ 0 1 env₁ m₁ hInv₀.activeCallee_none rfl rfl]
         dsimp only [get?, List.getElem?_cons_zero, List.getElem?_cons_succ, length, Nat.beq, m₁]
         unfold evalStmt
+        rw [hInv₀.callStack_nil]
         dsimp only [evalRvalue]
         dsimp only [add_assign_retag, add_assign] at hLhsOk hWriteLocalUb
         rw [hLhsOk]
@@ -12587,7 +12736,7 @@ private theorem add_assign_retag_exec_subplace
           dsimp only
           rw [hDerefUb]
           dsimp only
-          rw [hInval, ← hWriteSub]
+          rw [hInval, ← hWriteSub, ← hInv₀.callStack_nil]
           rfl
       · refine MirWpConverges.step_tau (s' := {
           frame := { blockIdx := 0, stmtIdx := 3, locals := env₂ }
@@ -12609,6 +12758,20 @@ private theorem add_assign_retag_exec_subplace
           dsimp only [get?, List.getElem?_cons_zero, List.getElem?_cons_succ,
             List.getElem?_nil, length, Nat.beq, evalTerminator, env₂, m_pre]
           rw [hInv₀.callStack_nil]
+          change (if (3 == 3) = true then
+              match hasFrameDeallocProtectorConflict (child₁ :: m₀.borrows)
+                  (m₀.nextProtector :: m₀.activeProtectors) 0 3 with
+              | true => MirStepNode.fail .ub
+              | false =>
+                MirStepNode.retNormal .unit
+                  { m_pre with
+                    callStack := []
+                    borrows := disableFrameBorrows (child₁ :: m₀.borrows) 0 3 }
+            else MirStepNode.fail .ub) = _
+          rw [hasFrameDeallocProtectorConflict_eq_false_of_lt_frame _ hAboveChild₁,
+            disableFrameBorrows_eq_self_of_lt_frame hAboveChild₁]
+          dsimp only [m_pre]
+          rw [← hInv₀.callStack_nil]
           rfl
 
 /--

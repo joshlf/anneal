@@ -412,6 +412,37 @@ structure BorrowEntry : Type where
       when reborrowed from a dereferenced pointer with provenance `pTag`; `none`
       for root borrows of a stack local). -/
   parentTag : Option Nat := .none
+  /-- Depth of the stack frame owning `targetLocal`: `0` is the root frame and
+      `length Memory.callStack` is the active frame, so the pair
+      `(targetFrameDepth, targetLocal)` identifies the borrowed local uniquely
+      across every inline call frame (a callee's `_1` and its caller's `_1` are
+      distinct allocations). Root borrows (`Rvalue.ref` / `Rvalue.rawPtr` of a
+      local) record the active frame's depth; reborrows and retags inherit their
+      parent's depth.
+
+      Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+      `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+      <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+      > "At any point during the execution of a function, each local is either
+      > allocated or unallocated." -/
+  targetFrameDepth : Nat := 0
+  /-- `true` once the allocation backing `targetLocal` has been deallocated
+      (`StorageDead`, the implicit free of a repeated `StorageLive`, or the
+      returning frame's teardown at `TerminatorKind.return_`). Distinguishes a
+      dangling tag of a freed allocation from a tag whose Tree Borrows `perm`
+      was `.disabled` by a foreign write while its allocation stays live: only
+      the former loses the allocation's byte bounds for `BinOp.Offset`.
+
+      Reference (MiniRust `spec/lang/step/statements.md` at commit
+      `d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+      <https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/lang/step/statements.md#L166-L169>
+
+      > "fn storage_live(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult {
+      >     // First remove the old storage, if any.
+      >     // This means the same address may be re-used for the new stoage.
+      >     self.storage_dead(mem, local)?;" -/
+  allocDead : Bool := false
 
 /--
 Saved caller activation record pushed onto `Memory.callStack` when executing a
@@ -618,6 +649,251 @@ structure MachineState : Type where
   frame : StackFrame
   /-- Heap, borrow-tag, and call-stack memory state. -/
   memory : Memory
+
+/--
+Depth of the active stack frame of `s`: `0` for the root frame, and in general
+`length s.memory.callStack`, because every inline `TerminatorKind.call` pushes
+exactly one `SavedCallerFrame` and every `TerminatorKind.return_` pops one.
+`BorrowEntry.targetFrameDepth` uses the same numbering.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "At any point during the execution of a function, each local is either
+> allocated or unallocated."
+-/
+def currentFrameDepth (s : MachineState) : Nat := length s.memory.callStack
+
+/--
+`Memory.callStack` index of the saved frame at depth `d` when the active frame
+has depth `depth` (`d < depth`): the most recent caller (depth `depth - 1`) is
+at index `0` and the root frame (depth `0`) at index `depth - 1`.
+-/
+@[reducible]
+def frameIndexOfDepth (depth d : Nat) : Nat := Nat.sub (Nat.sub depth 1) d
+
+/--
+Saved caller frame at depth `d` on `callStack` (`.none` unless
+`d < length callStack`, i.e. unless the frame at depth `d` is a suspended
+caller of the active frame).
+-/
+def savedFrameAtDepth? (callStack : List SavedCallerFrame) (d : Nat) :
+    Option SavedCallerFrame :=
+  match Nat.blt d (length callStack) with
+  | true => get? callStack (frameIndexOfDepth (length callStack) d)
+  | false => .none
+
+/--
+Frame-qualified lookup of borrow target `(d, loc)` in the **active** frame
+(`DIV-MR-CALL-TARGET-LOCAL`): the active frame's slot `get? locals loc` when the
+target frame is the active frame, and `.none` when it is a suspended caller
+frame (or a frame that already returned).
+
+With an empty `callStack` (the root frame is active) the lookup is exactly
+`get? locals loc`, as for the single-frame borrow table: every live borrow then
+targets depth `0`, and every tag minted in a frame that has since returned was
+disabled by that frame's `TerminatorKind.return_` (`disableFrameBorrows`), so
+every access through it faults before the slot is consulted.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "At any point during the execution of a function, each local is either
+> allocated or unallocated."
+-/
+def activeFrameSlot?
+    (locals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (d loc : Nat) :
+    Option LocalSlot :=
+  match callStack with
+  | .nil => get? locals loc
+  | _ :: _ =>
+    match Nat.beq d (length callStack) with
+    | true => get? locals loc
+    | false => .none
+
+/--
+Frame-qualified lookup of borrow target `(d, loc)` **outside** the active
+frame (`DIV-MR-CALL-TARGET-LOCAL`): the slot of local `loc` in the suspended
+caller frame at depth `d`, falling back to the root frame's caller-owned
+referent slots `callerLocals` (addressed at `loc ≥ length` of the root locals)
+only for the root frame (`d = 0`).
+
+With an empty `callStack` this is exactly `get? callerLocals loc`, the
+caller-owned referent fallback of the single-frame borrow table.
+
+Reference (The Rust Reference, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Shared references point to memory which is owned by some other value."
+> "Mutable references point to memory which is owned by some other value."
+-/
+def foreignFrameSlot?
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (d loc : Nat) :
+    Option LocalSlot :=
+  match callStack with
+  | .nil => get? callerLocals loc
+  | _ :: _ =>
+    match savedFrameAtDepth? callStack d with
+    | .some sf =>
+      match get? sf.frame.locals loc with
+      | .some slot => .some slot
+      | .none =>
+        match d with
+        | .zero => get? callerLocals loc
+        | .succ _ => .none
+    | .none => .none
+
+/--
+Frame-qualified local slot of borrow target `(d, loc)` in any live frame:
+`activeFrameSlot?`, then `foreignFrameSlot?`.
+
+With an empty `callStack` this is `get? locals loc` with the caller-owned
+referent fallback `get? callerLocals loc`.
+-/
+def readFrameLocalSlot
+    (locals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (d loc : Nat) :
+    Option LocalSlot :=
+  match activeFrameSlot? locals callStack d loc with
+  | .some slot => .some slot
+  | .none => foreignFrameSlot? callStack callerLocals d loc
+
+/--
+With an empty `callStack`, `activeFrameSlot?` is the single-frame lookup
+`get? locals loc`.
+-/
+@[simp]
+theorem activeFrameSlot?_nil (locals : List LocalSlot) (d loc : Nat) :
+    activeFrameSlot? locals .nil d loc = get? locals loc := rfl
+
+/--
+With an empty `callStack`, `foreignFrameSlot?` is the caller-owned referent
+lookup `get? callerLocals loc`.
+-/
+@[simp]
+theorem foreignFrameSlot?_nil (callerLocals : List LocalSlot) (d loc : Nat) :
+    foreignFrameSlot? .nil callerLocals d loc = get? callerLocals loc := rfl
+
+/--
+Location of the slot list owning a foreign (non-active-frame) borrow target, as
+resolved by `foreignFrameTarget?`.
+-/
+inductive ForeignFrameTarget : Type where
+  /-- The target local lives in `callStack[idx].frame.locals`. -/
+  | savedFrame (idx : Nat) (locals : List LocalSlot) : ForeignFrameTarget
+  /-- The target local is a caller-owned referent slot of the root frame
+      (`Memory.callerLocals`). -/
+  | callerReferent (locals : List LocalSlot) : ForeignFrameTarget
+
+/--
+Slot list of the foreign (non-active-frame) borrow target `(d, loc)`, mirroring
+`foreignFrameSlot?`: the suspended caller frame at depth `d` when it has a slot
+`loc`, the root frame's caller-owned referent slots `callerLocals` when `d = 0`
+otherwise (or whenever `callStack` is empty), and `.none` for a frame that is
+not a suspended caller of the active frame.
+-/
+def foreignFrameTarget?
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (d loc : Nat) :
+    Option ForeignFrameTarget :=
+  match callStack with
+  | .nil => .some (.callerReferent callerLocals)
+  | _ :: _ =>
+    match savedFrameAtDepth? callStack d with
+    | .some sf =>
+      match get? sf.frame.locals loc with
+      | .some _ =>
+        .some (.savedFrame (frameIndexOfDepth (length callStack) d) sf.frame.locals)
+      | .none =>
+        match d with
+        | .zero => .some (.callerReferent callerLocals)
+        | .succ _ => .none
+    | .none => .none
+
+/-- Slot list of a `ForeignFrameTarget`. -/
+def ForeignFrameTarget.locals : ForeignFrameTarget → List LocalSlot
+  | .savedFrame _ locals => locals
+  | .callerReferent locals => locals
+
+/--
+Commit the updated slot list `locals'` of a foreign borrow target back into
+`mem`: the saved frame at `callStack[idx]`, or `mem.callerLocals`.
+-/
+def commitForeignFrameLocals
+    (mem : Memory)
+    (target : ForeignFrameTarget)
+    (locals' : List LocalSlot) :
+    Option Memory :=
+  match target with
+  | .callerReferent _ => .some { mem with callerLocals := locals' }
+  | .savedFrame idx _ =>
+    match get? mem.callStack idx with
+    | .some sf =>
+      match set? mem.callStack idx { sf with frame := { sf.frame with locals := locals' } } with
+      | .some callStack' => .some { mem with callStack := callStack' }
+      | .none => .none
+    | .none => .none
+
+/--
+Frame-qualified update of the slot of borrow target `(d, loc)` to `slot`,
+returning the updated active-frame `locals`, `callStack`, and `callerLocals`
+(`.none` when no live frame owns `(d, loc)`). The slot written is exactly the
+one read by `readFrameLocalSlot`.
+-/
+def writeFrameLocalSlot
+    (locals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (d loc : Nat)
+    (slot : LocalSlot) :
+    Option (List LocalSlot × List SavedCallerFrame × List LocalSlot) :=
+  match activeFrameSlot? locals callStack d loc with
+  | .some _ =>
+    match set? locals loc slot with
+    | .some locals' => .some (locals', callStack, callerLocals)
+    | .none => .none
+  | .none =>
+    match foreignFrameTarget? callStack callerLocals d loc with
+    | .some (.savedFrame idx frameLocals) =>
+      match set? frameLocals loc slot, get? callStack idx with
+      | .some frameLocals', .some sf =>
+        match set? callStack idx { sf with frame := { sf.frame with locals := frameLocals' } } with
+        | .some callStack' => .some (locals, callStack', callerLocals)
+        | .none => .none
+      | _, _ => .none
+    | .some (.callerReferent referents) =>
+      match set? referents loc slot with
+      | .some referents' => .some (locals, callStack, referents')
+      | .none => .none
+    | .none => .none
+
+/--
+`localDecls` and `layouts` of the body executing in the frame at depth `d`:
+`activeBody` for the active frame (`d = length callStack`) and the saved
+`callerBody` for a suspended caller frame. `.none` for a frame that already
+returned. With an empty `callStack`, depth `0` is the active frame.
+-/
+def frameLocalDeclsAndLayoutsAtDepth
+    (callStack : List SavedCallerFrame)
+    (activeDecls : List LocalDecl)
+    (activeLayouts : LayoutTable)
+    (d : Nat) :
+    Option (List LocalDecl × LayoutTable) :=
+  match Nat.beq d (length callStack) with
+  | true => .some (activeDecls, activeLayouts)
+  | false =>
+    match savedFrameAtDepth? callStack d with
+    | .some sf => .some (sf.callerBody.localDecls, sf.callerBody.layouts)
+    | .none => .none
 
 /--
 External or unresolved procedure-call interaction request emitted by

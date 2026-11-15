@@ -170,9 +170,9 @@ macro_rules
              (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.dropProjected (by rfl)
              (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.returnToCaller (by rfl) (by rfl)
-             (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callDirect (by rfl) (by rfl)
              (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callFnItem (by rfl) (by rfl)
@@ -182,17 +182,17 @@ macro_rules
          | apply Anneal.MirLiftCore.LiftTerminator.callExactDiv (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallDirect (by rfl)
-             (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallFnItem (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallIndirect (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-             (by rfl)
+             (by rfl) (by rfl)
          dsimp only [Anneal.MirLiftCore.FrameStep.Continues,
            Anneal.MirLiftCore.callFrameMem,
            Anneal.MirLiftCore.tailCallFrameMem,
            Anneal.MirLiftCore.returnFrameMem,
-           restoreCallerProtectors, lookupSwitchTarget,
+           disableFrameBorrows, restoreCallerProtectors, lookupSwitchTarget,
            Option.getD, List.set, Nat.add]))
 
 /-- Lift a whole execution from an entry `LiftFrame` goal to the root return. -/

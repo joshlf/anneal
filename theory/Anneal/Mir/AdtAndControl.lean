@@ -9213,6 +9213,30 @@ theorem readPlaceState_below_evalOperand_copy {slots : List LocalSlotState}
     exact evalOperand_copy_proj_of_noUnion locals loc hd tl borrows globals layouts
       callerLocals localDecls rootVal val hNotDeref hNoUnion hRoot hProj
 
+/-- `callStack`-generalized form of `readPlaceState_below_evalOperand_copy`: because a
+successful `readPlaceState` has no `Deref`, Trusted's `evalOperand (.copy place)` is
+independent of the active inline call stack `callStack`. -/
+theorem readPlaceState_below_evalOperand_copy_cs {slots : List LocalSlotState}
+    {locals : List LocalSlot} {place : Place} {val : Value}
+    (hRel : SlotsRefine SlotBelow slots locals) (hRead : readPlaceState slots place = .ok val)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := [])
+    (callStack : List SavedCallerFrame := .nil)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
+      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj]) :
+    evalOperand locals (.copy place) borrows globals layouts callerLocals localDecls
+      callStack = .ok val locals := by
+  have hNoDeref : OperandNonDeref (.copy place) := by
+    intro r hEq
+    have hD : projectionHasDeref place.projection = true := by
+      simp [hEq, projectionHasDeref]
+    simp only [readPlaceState, hD] at hRead
+    nomatch hRead
+  rw [evalOperand_eq_nil_callStack_of_nonDeref locals (.copy place) borrows globals layouts
+    callerLocals localDecls callStack hNoDeref]
+  exact readPlaceState_below_evalOperand_copy hRel hRead borrows globals layouts
+    callerLocals localDecls hNoUnion
+
 /-- Trusted's `evalStmt` on `.retag` faults when the retagged place's local is uninitialized or
 dead (its `evalOperand (.copy place)` read faults), for every `localDecls` / `layouts`, exactly
 where Anneal's retag of a reference-holding place fails too. -/
@@ -9223,7 +9247,7 @@ theorem evalStmt_retag_uninit_or_dead_ub (s : MachineState) (kind : RetagKind) (
       s.frame.locals[place.local_]? = some .dead) :
     evalStmt s ⟨.retag kind place, span⟩ localDecls layouts = .fail .ub := by
   have hOp : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ub := by
+      s.memory.callerLocals localDecls s.memory.callStack = .ub := by
     rcases place with ⟨loc, _ | ⟨hd, tl⟩⟩
     · rcases hT with hT | hT <;> simp [evalOperand, get?_eq_getElem?, hT]
     · cases hd with
@@ -9433,7 +9457,8 @@ private theorem evalStmt_retag_borrow_ok {s : MachineState} {kind : RetagKind} {
     {span : String} {localDecls : List LocalDecl} {layouts : LayoutTable}
     {p : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
     (hOp : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals
-      layouts s.memory.callerLocals localDecls = .ok (.ptr p sz) s.frame.locals)
+      layouts s.memory.callerLocals localDecls s.memory.callStack =
+        .ok (.ptr p sz) s.frame.locals)
     (hLook : lookupBorrow s.memory.borrows p.tag = some entry)
     (hPerm : entry.perm ≠ .disabled)
     (hTy : retagKeepsFrameTy kind localDecls layouts place) :
@@ -9518,8 +9543,8 @@ theorem evalStmt_retag_ref_refines {ctx : RetagCtx} {kind : RetagKind} {place : 
   obtain ⟨st, p, sz, hSt, hLive, hProj, hChecks⟩ := evalRetagPlace_ref_sound hKind h
   have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
   refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks, fun entry hLook hPerm => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   rw [evalStmt_retag_borrow_ok hOp hLook hPerm hTy]
   cases kind <;> exact ⟨_, rfl⟩
 
@@ -9541,8 +9566,8 @@ theorem evalStmt_retag_disabled_ub {ctx : RetagCtx} {kind : RetagKind} {place : 
   obtain ⟨st, p, sz, hSt, hLive, hProj, _⟩ := evalRetagPlace_ref_sound hKind h
   have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
   refine ⟨p, sz, hRead, fun hLook => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   cases kind with
   | raw => exact absurd rfl hKind
   | _ =>
@@ -9567,7 +9592,8 @@ theorem evalStmt_retag_fat_frozen_mut_ub (s : MachineState) (kind : RetagKind) (
     {lIdx : Nat} {p : ProvenancePtr} {lenSc : ScalarInt} {locals' : List LocalSlot}
     {entry : BorrowEntry}
     (hOp : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.aggregate 0 [.ptr p 8, .scalar lenSc]) locals')
+      s.memory.callerLocals localDecls s.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar lenSc]) locals')
     (hMutTy : placeTy localDecls layouts place = some { kind := .ref .mut inner, layoutIdx := lIdx })
     (hInhab : rigidTyIsUninhabited 16 inner = false)
     (hLook : lookupBorrow s.memory.borrows p.tag = some entry) (hFrz : entry.perm = .frozen) :
@@ -9661,14 +9687,14 @@ theorem evalStmt_retag_ref_typed_reborrow (s : MachineState) {kind : RetagKind}
     (localDecls : List LocalDecl) (layouts : LayoutTable) {m : Mutability} {inner : RigidTy}
     {lIdx : Nat} {p : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
     (hOp : evalOperand s.frame.locals (.copy ⟨loc, []⟩) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr p sz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr p sz) s.frame.locals)
     (hTy : placeTy localDecls layouts ⟨loc, []⟩ = some { kind := .ref m inner, layoutIdx := lIdx })
     (hInhab : rigidTyIsUninhabited 16 inner = false)
     (hLook : lookupBorrow s.memory.borrows p.tag = some entry) (hPerm : entry.perm ≠ .disabled)
     (hNoReadUB : retagPerm kind m inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
       hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
-        entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset entry.rangeLen =
-        false)
+        entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset entry.rangeLen
+        entry.targetFrameDepth = false)
     (hLt : loc < s.frame.locals.length) :
     ∃ borrows', evalStmt s ⟨.retag kind ⟨loc, []⟩, span⟩ localDecls layouts =
         .step (advanceStmt s
@@ -9678,6 +9704,8 @@ theorem evalStmt_retag_ref_typed_reborrow (s : MachineState) {kind : RetagKind}
       lookupBorrow borrows' s.memory.nextTag = some
         { tag := s.memory.nextTag
           targetLocal := entry.targetLocal
+          targetFrameDepth := entry.targetFrameDepth
+          allocDead := entry.allocDead
           targetProjection := entry.targetProjection
           perm := retagPerm kind m inner
           rangeOffset := entry.rangeOffset
@@ -9717,14 +9745,14 @@ theorem evalStmt_retag_ref_fnEntry_reborrow (s : MachineState) (loc : Nat) (span
     (localDecls : List LocalDecl) (layouts : LayoutTable) {m : Mutability} {inner : RigidTy}
     {lIdx : Nat} {p : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
     (hOp : evalOperand s.frame.locals (.copy ⟨loc, []⟩) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr p sz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr p sz) s.frame.locals)
     (hTy : placeTy localDecls layouts ⟨loc, []⟩ = some { kind := .ref m inner, layoutIdx := lIdx })
     (hInhab : rigidTyIsUninhabited 16 inner = false)
     (hLook : lookupBorrow s.memory.borrows p.tag = some entry) (hPerm : entry.perm ≠ .disabled)
     (hNoReadUB : fnEntryRetagPerm m inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
       hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
-        entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset entry.rangeLen =
-        false)
+        entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset entry.rangeLen
+        entry.targetFrameDepth = false)
     (hLt : loc < s.frame.locals.length) :
     ∃ borrows', evalStmt s ⟨.retag .fnEntry ⟨loc, []⟩, span⟩ localDecls layouts =
         .step (advanceStmt s
@@ -9738,6 +9766,8 @@ theorem evalStmt_retag_ref_fnEntry_reborrow (s : MachineState) (loc : Nat) (span
       lookupBorrow borrows' s.memory.nextTag = some
         { tag := s.memory.nextTag
           targetLocal := entry.targetLocal
+          targetFrameDepth := entry.targetFrameDepth
+          allocDead := entry.allocDead
           targetProjection := entry.targetProjection
           perm := fnEntryRetagPerm m inner
           rangeOffset := entry.rangeOffset
@@ -9787,7 +9817,7 @@ theorem evalStmt_retag_ref_frozen_mut_reborrows {ctx : RetagCtx} {kind : RetagKi
         (retagPerm kind .mut inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
           hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
             entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset
-            entry.rangeLen = false) →
+            entry.rangeLen entry.targetFrameDepth = false) →
         ∃ borrows', evalStmt s ⟨.retag kind ⟨loc, []⟩, span⟩ localDecls layouts =
             .step (advanceStmt s
               (s.frame.locals.set loc
@@ -9796,6 +9826,8 @@ theorem evalStmt_retag_ref_frozen_mut_reborrows {ctx : RetagCtx} {kind : RetagKi
           lookupBorrow borrows' s.memory.nextTag = some
             { tag := s.memory.nextTag
               targetLocal := entry.targetLocal
+              targetFrameDepth := entry.targetFrameDepth
+              allocDead := entry.allocDead
               targetProjection := entry.targetProjection
               perm := retagPerm kind .mut inner
               rangeOffset := entry.rangeOffset
@@ -9812,8 +9844,8 @@ theorem evalStmt_retag_ref_frozen_mut_reborrows {ctx : RetagCtx} {kind : RetagKi
     cases st <;> simp [projectFieldSlot, slotStateToFieldSlot, PartialAggregate.toFieldSlot] at hProj
     exact congrArg LocalSlotState.init hProj
   refine ⟨p, sz, hRead, fun hLook hNoReadUB => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack
   have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
   have hLt : loc < s.frame.locals.length := by
     rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
@@ -9846,7 +9878,7 @@ theorem evalStmt_retag_ref_typed_refines_upToTag {ctx : RetagCtx} {kind : RetagK
         (retagPerm kind m inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
           hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
             entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset
-            entry.rangeLen = false) →
+            entry.rangeLen entry.targetFrameDepth = false) →
         ∃ borrows', evalStmt s ⟨.retag kind ⟨loc, []⟩, span⟩ localDecls layouts =
             .step (advanceStmt s
               (s.frame.locals.set loc
@@ -9855,6 +9887,8 @@ theorem evalStmt_retag_ref_typed_refines_upToTag {ctx : RetagCtx} {kind : RetagK
           lookupBorrow borrows' s.memory.nextTag = some
             { tag := s.memory.nextTag
               targetLocal := entry.targetLocal
+              targetFrameDepth := entry.targetFrameDepth
+              allocDead := entry.allocDead
               targetProjection := entry.targetProjection
               perm := retagPerm kind m inner
               rangeOffset := entry.rangeOffset
@@ -9872,8 +9906,8 @@ theorem evalStmt_retag_ref_typed_refines_upToTag {ctx : RetagCtx} {kind : RetagK
     exact congrArg LocalSlotState.init hProj
   refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks,
     fun entry hLook hPerm hNoReadUB => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack
   have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
   have hLt : loc < s.frame.locals.length := by
     rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
@@ -9900,7 +9934,7 @@ theorem evalStmt_retag_ref_fnEntry_refines_upToTag {ctx : RetagCtx} {loc : Nat}
         (fnEntryRetagPerm m inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
           hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
             entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset
-            entry.rangeLen = false) →
+            entry.rangeLen entry.targetFrameDepth = false) →
         ∃ borrows', evalStmt s ⟨.retag .fnEntry ⟨loc, []⟩, span⟩ localDecls layouts =
             .step (advanceStmt s
               (s.frame.locals.set loc
@@ -9913,6 +9947,8 @@ theorem evalStmt_retag_ref_fnEntry_refines_upToTag {ctx : RetagCtx} {loc : Nat}
           lookupBorrow borrows' s.memory.nextTag = some
             { tag := s.memory.nextTag
               targetLocal := entry.targetLocal
+              targetFrameDepth := entry.targetFrameDepth
+              allocDead := entry.allocDead
               targetProjection := entry.targetProjection
               perm := fnEntryRetagPerm m inner
               rangeOffset := entry.rangeOffset
@@ -9930,8 +9966,8 @@ theorem evalStmt_retag_ref_fnEntry_refines_upToTag {ctx : RetagCtx} {loc : Nat}
     exact congrArg LocalSlotState.init hProj
   refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks,
     fun entry hLook hPerm hNoReadUB => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack
   have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
   have hLt : loc < s.frame.locals.length := by
     rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
@@ -9963,8 +9999,8 @@ theorem evalStmt_retag_raw_refines {ctx : RetagCtx} {place : Place} {ty : RetagT
           .step (advanceStmt s s.frame.locals) := by
   obtain ⟨hb, p, sz, hRead, hAddr⟩ := evalRetagPlace_raw_sound h
   refine ⟨hb, p, sz, hRead, hAddr, fun entry hLook hPerm => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   exact evalStmt_retag_borrow_ok hOp hLook hPerm hTy
 
 /-- **Stage-1 `Retag(Raw)` of a raw-pointer-typed place is a no-op
@@ -9979,7 +10015,7 @@ theorem evalStmt_retag_raw_rawPtr_steps (s : MachineState) (place : Place) (span
     {lIdx : Nat} {val : Value} {locals' : List LocalSlot}
     (hPTy : placeTy localDecls layouts place = some { kind := .rawPtr m inner, layoutIdx := lIdx })
     (hOp : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok val locals') :
+      s.memory.callerLocals localDecls s.memory.callStack = .ok val locals') :
     evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts = .step (advanceStmt s locals') := by
   simp only [evalStmt, hOp, hPTy]
 
@@ -10002,8 +10038,8 @@ theorem evalStmt_retag_raw_rawPtr_refines {ctx : RetagCtx} {place : Place} {ty :
       evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts =
         .step (advanceStmt s s.frame.locals) := by
   obtain ⟨hb, p, sz, hRead, hAddr⟩ := evalRetagPlace_raw_sound h
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   exact ⟨hb, p, sz, hRead, hAddr,
     evalStmt_retag_raw_rawPtr_steps s place span localDecls layouts hPTy hOp⟩
 
@@ -10037,8 +10073,8 @@ theorem evalStmt_retag_raw_global_refines {ctx : RetagCtx} {place : Place} {ty :
           .step (advanceStmt s s.frame.locals) := by
   obtain ⟨_, p, sz, hRead, _⟩ := evalRetagPlace_raw_sound h
   refine ⟨p, sz, hRead, fun alloc hNoB hG hBounds => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   cases hPTy : placeTy localDecls layouts place with
   | none => exact absurd hPTy hTyped
   | some pTy =>
@@ -10137,8 +10173,8 @@ theorem evalStmt_retag_raw_untracked_divergence {ctx : RetagCtx} {place : Place}
         evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts = .fail .ub) := by
   obtain ⟨_, p, sz, hRead, _⟩ := evalRetagPlace_raw_sound h
   refine ⟨p, sz, hRead, fun hNoB hNoG => ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   simp only [evalStmt, hOp]
   split
   · rename_i m inner l heq; exact absurd heq (hNotRawPtr m inner l)
@@ -10167,8 +10203,8 @@ theorem evalStmt_retag_raw_scalar_addr_reject {ctx : RetagCtx} {place : Place}
       simp [placeTouchesUnion_nil_proj]) :
     evalRetagPlace ctx .raw place ty b = false ∧
       evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts = .fail .ub := by
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   refine ⟨?_, by simp only [evalStmt, hOp, hUntyped]⟩
   unfold evalRetagPlace
   split
@@ -10193,8 +10229,8 @@ theorem evalStmt_retag_raw_scalar_rawPtr_conservative {ctx : RetagCtx} {place : 
     evalRetagPlace ctx .raw place ty b = false ∧
       evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts =
         .step (advanceStmt s s.frame.locals) := by
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   refine ⟨?_, evalStmt_retag_raw_rawPtr_steps s place span localDecls layouts hPTy hOp⟩
   unfold evalRetagPlace
   split
@@ -10236,8 +10272,8 @@ theorem evalStmt_retag_noRef_scalar_divergence {ctx : RetagCtx} {kind : RetagKin
     cases hD : projectionHasDeref place.projection with
     | false => rfl
     | true => simp only [readPlaceState, hD] at hRead; nomatch hRead
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   exact ⟨(evalRetagPlace_noRef hKind hNoRef).mpr
       ⟨hLive, hND, hIdx, checkPlaceSlotOk_of_readPlaceState hRead⟩,
     by simp only [evalStmt, hOp, hUntyped]⟩
@@ -10265,8 +10301,8 @@ theorem evalStmt_retag_noRef_scalar_agree {ctx : RetagCtx} {kind : RetagKind}
     (localDecls := []) (layouts := layouts) hKind hNoRef hRead hIdx hRel rfl
     (by simp [placeTouchesUnion_nil_decls])
   refine ⟨hA, ?_⟩
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
   simp only [evalStmt, hOp]
   split
   · rename_i m inner l heq
@@ -11218,7 +11254,8 @@ theorem evalCopySingleDirect_whole_local_refines {ptrBits : Nat} {env : CopyEnv}
     evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ =
         .step (advanceStmt s (locals₃.set dl (.init v))
           { s.memory with
-            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+              (length s.memory.callStack) }) ∧
       SlotsRefine SlotBelow slots' (locals₃.set dl (.init v)) := by
   obtain ⟨dstSt, hDstLive, hDstNotDead⟩ := copyWholeLocal_live_of_not_copyTargetDead hDstW hLive.2
   have hEq := evalCopyNonOverlappingState_whole_local_copies_slot hChk hSrcW hDstW hLive
@@ -11624,8 +11661,8 @@ theorem evalAdtDiscriminant_refines_evalRvalue {slots : List LocalSlotState}
     evalAdtDiscriminant_init_agrees_trusted spec wf hEnum h locals mem place localDecls layouts hTy
   refine ⟨?_, hD⟩
   unfold evalRvalue
-  simp only [readPlaceState_below_evalOperand_copy hRel hRead mem.borrows mem.globals layouts
-    mem.callerLocals localDecls hNoUnion]
+  simp only [readPlaceState_below_evalOperand_copy_cs hRel hRead mem.borrows mem.globals layouts
+    mem.callerLocals localDecls mem.callStack hNoUnion]
   exact hT
 
 /-- Trusted's `evalRvalue` on `WrapUnsafeBinder` of a copied non-union place (no `Deref`) returns
@@ -11641,8 +11678,8 @@ theorem evalRvalue_wrapUnsafeBinder_copy {slots : List LocalSlotState} {locals :
     evalRvalue locals (.wrapUnsafeBinder (.copy place) ty) mem localDecls layouts =
       .ok v locals mem := by
   have hNoDeref := readPlaceState_ok_noDeref hRead
-  have hOp := readPlaceState_below_evalOperand_copy hRel hRead mem.borrows mem.globals layouts
-    mem.callerLocals localDecls hNoUnion
+  have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead mem.borrows mem.globals layouts
+    mem.callerLocals localDecls mem.callStack hNoUnion
   obtain ⟨loc, proj⟩ := place
   unfold evalRvalue
   simp only [hOp, hValid]
@@ -13587,10 +13624,9 @@ private theorem evalDirectRustIntrinsic_of_nonSelect
   rw [hClass]
   cases kind <;> first | contradiction | rfl
 
-/-- Shared `.call` refinement helper for `evalLoweredTerminator_refines_trusted` and
-`evalLoweredTerminator_at_end_refines_trusted`: under `LTerminator.Refinable`, a successful
-lowered `.call` step refines Trusted's `evalTerminator`. -/
-theorem evalLoweredTerminator_call_refines_evalTerminator
+/-- Internal strengthening of `evalLoweredTerminator_call_refines_evalTerminator` recording that
+every `.goto` transition preserves `s'.memory = s.memory` and `.returned` is impossible. -/
+private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat}
     {slots slots1 : List LocalSlotState} {unwinding : Option Nat}
     {s : MachineState} {locals1 : List LocalSlot} {sIdx : Nat} {span : String}
@@ -13615,10 +13651,9 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
         TrustedStep
           (evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
             (some cm)) s' ∧
-        StateCorr env next slots' s'
-    | .returned v =>
-      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
-        (some cm) = .retNormal v s.memory
+        StateCorr env next slots' s' ∧
+        s'.memory = s.memory
+    | .returned _ => False
     | .panicked _ =>
       evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
         (some cm) = .retOutcome .panic
@@ -13688,7 +13723,7 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
                           (target := { defPath := defPath, typeArgs := typeArgs, isIndirect := false })
                           (locals' := locals2) (destination := dest) (targetBb := targetBb) hKind hEv
                       refine ⟨{ s with frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals } },
-                        Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3⟩
+                        Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3, rfl⟩
                       have hDir :=
                         evalDirectRustIntrinsic_of_nonSelect
                           (s := { s with frame := ⟨bb, sIdx, locals1⟩ })
@@ -13707,7 +13742,7 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
                             writeIntrinsicReturn { s with frame := ⟨bb, sIdx, locals1⟩ }
                               locals2 dest targetBb rv := by
                         simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
-                          hResTgt, hLayouts, hCorr.globals, hTOps, hNoCallee,
+                          hResTgt, hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee,
                           isDirectExactDivTarget, hNotEx, hDir]
                         exact hNonSel
                       rw [hStepEval]
@@ -13730,7 +13765,7 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
               subst hBodyCall
               obtain ⟨_, _, hUnrF, hAbT⟩ := hSupp
               simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-                hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbT]
+                hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee, hUnrF, hAbT]
           | panicUnwind =>
             simp only [evalLoweredIntrinsicCall] at hBodyCall
             cases t with
@@ -13743,7 +13778,8 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
                 simp only [startPanic] at hBodyCall
                 cases hBodyCall
                 simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-                  hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT, applyUnwindAction]
+                  hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
+                  applyUnwindAction]
               | continue_ =>
                 simp only [startPanic] at hBodyCall
                 split at hBodyCall
@@ -13758,9 +13794,9 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
                 · nomatch hBodyCall
                 · obtain rfl := cfgGoto_eq_some hBodyCall
                   refine ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals2 } },
-                    Or.inl ?_, hCorr.jump c locals2 hRel2⟩
+                    Or.inl ?_, hCorr.jump c locals2 hRel2, rfl⟩
                   simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-                    hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
+                    hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
                     applyUnwindAction]
           | exactDiv =>
             simp only [evalLoweredIntrinsicCall] at hBodyCall
@@ -13799,9 +13835,9 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
                           simp only [Option.map_eq_some_iff] at hEv
                           obtain ⟨retScalar, hDiv, rfl⟩ := hEv
                           refine ⟨{ s with frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals } },
-                            Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3⟩
+                            Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3, rfl⟩
                           simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
-                            hResTgt, hDecls, hLayouts, hCorr.globals, hTOps, hNoCallee,
+                            hResTgt, hDecls, hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee,
                             isDirectExactDivTarget, hExPath]
                           rw [resolveIntrinsicIsSigned_defPath_irrel _ { defPath := "", typeArgs := typeArgs, isIndirect := false } _ _ _ _ _ rfl, hSignSynth]
                           simp only [hDiv, hWPV]
@@ -13815,20 +13851,89 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
             exact False.elim (hValOp rfl)
     · nomatch hBodyCall
 
-/-- **`evalLoweredTerminator_refines_trusted`**: under `BodyCorr` and `StateCorr`, every
-successful lowered terminator step is matched by Trusted's `stepMirFn`: a jump is a Trusted
-`.step`/`.emitStep` to a corresponding state (preserving `StateCorr` on `Goto`, `SwitchInt`,
-`Assert`-pass, `Assert` cleanup jumps, and direct inline-intrinsic `Call`s), `Return` is Trusted's
-`.retNormal` of the same value, and a panic that unwinds out of the body (or aborts) is Trusted's
-`.panic` (or `.abort`) outcome. In particular Trusted never faults with `.ub` where Anneal
-succeeds. -/
-theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm : CapturedMir}
-    {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
-    {step : CfgStep} (hBody : BodyCorr env body cm) (hCorr : StateCorr env bb slots s)
-    (h : evalLoweredTerminator env body bb slots unwinding = some step) :
+/-- Shared `.call` refinement helper for `evalLoweredTerminator_refines_trusted` and
+`evalLoweredTerminator_at_end_refines_trusted`: under `LTerminator.Refinable`, a successful
+lowered `.call` step refines Trusted's `evalTerminator`. -/
+theorem evalLoweredTerminator_call_refines_evalTerminator
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat}
+    {slots slots1 : List LocalSlotState} {unwinding : Option Nat}
+    {s : MachineState} {locals1 : List LocalSlot} {sIdx : Nat} {span : String}
+    {inCleanup : Bool} {func : Operand} {args : List Operand}
+    {dest : Place} {destTy : Ty} {t : Option Nat} {u : UnwindAction}
+    {step : CfgStep}
+    (hLayouts : cm.layouts = env.layouts)
+    (hDecls : cm.localDecls = env.localDecls)
+    (hUb : env.ubChecks = true)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hRef : (LTerminator.call func args dest destTy t u).Refinable)
+    (hCorr : StateCorr env bb slots s)
+    (hRel1 : SlotsRefine SlotBelow slots1 locals1)
+    (hBodyCall : evalLoweredCall env body bb inCleanup func args slots1 dest destTy t u unwinding =
+      some step)
+    (hDestOk : NoUninitExplosionOnProj env.arityOf destTy dest.projection := by
+      first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial) :
+    let sEnd : MachineState := { s with frame := ⟨bb, sIdx, locals1⟩ }
     match step with
-    | .goto next slots' _ => ∃ s', TrustedStep (stepMirFn cm s) s' ∧ StateCorr env next slots' s'
-    | .returned v => stepMirFn cm s = .retNormal v s.memory
+    | .goto next slots' _ =>
+      ∃ s',
+        TrustedStep
+          (evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+            (some cm)) s' ∧
+        StateCorr env next slots' s'
+    | .returned v =>
+      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+        (some cm) = .retNormal v s.memory
+    | .panicked _ =>
+      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+        (some cm) = .retOutcome .panic
+    | .terminated _ =>
+      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+        (some cm) = .retOutcome .abort := by
+  intro sEnd
+  have hAux := evalLoweredTerminator_call_refines_evalTerminator_aux
+    (sIdx := sIdx) (span := span) hLayouts hDecls hUb hCallTgt hRef hCorr hRel1 hBodyCall hDestOk
+  dsimp only at hAux
+  cases step with
+  | goto next slots' unw =>
+    obtain ⟨s', hS, hC, _⟩ := hAux
+    exact ⟨s', hS, hC⟩
+  | returned v => exact False.elim hAux
+  | panicked _ => exact hAux
+  | terminated _ => exact hAux
+
+private theorem hasFrameDeallocProtectorConflict_nil_borrows
+    (activeProtectors : List Nat) (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict [] activeProtectors depth nLocals = false := by
+  cases activeProtectors <;> rfl
+
+private theorem memory_with_disableFrameBorrows_eq_of_nil
+    {m : Memory} (hBorrows : m.borrows = []) (depth nLocals : Nat) :
+    { m with borrows := disableFrameBorrows m.borrows depth nLocals } = m := by
+  cases m
+  simp only at hBorrows
+  subst hBorrows
+  rfl
+
+/-- Internal strengthening of `evalLoweredTerminator_refines_trusted` recording that every `.goto`
+transition preserves `s'.memory = s.memory` and `.returned v` disables the root frame's borrows
+under `hasFrameDeallocProtectorConflict = false`. -/
+private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body : LBody}
+    {cm : CapturedMir} {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat}
+    {s : MachineState} {step : CfgStep}
+    (hBody : BodyCorr env body cm) (hCorr : StateCorr env bb slots s)
+    (h : evalLoweredTerminator env body bb slots unwinding = some step)
+    (hNoProt :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors 0
+        (length s.frame.locals) = false := by
+      cases s.memory.activeProtectors <;> cases s.memory.borrows <;> rfl) :
+    match step with
+    | .goto next slots' _ =>
+      ∃ s', TrustedStep (stepMirFn cm s) s' ∧ StateCorr env next slots' s' ∧ s'.memory = s.memory
+    | .returned v =>
+      stepMirFn cm s =
+        .retNormal v
+          { s.memory with
+            borrows := disableFrameBorrows s.memory.borrows 0 (length s.frame.locals) }
     | .panicked _ => stepMirFn cm s = .retOutcome .panic
     | .terminated _ => stepMirFn cm s = .retOutcome .abort := by
   unfold evalLoweredTerminator at h
@@ -13848,7 +13953,7 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
         rw [hT] at h
         simp only at h
         obtain rfl := cfgGoto_eq_some h
-        refine ⟨_, Or.inl ?_, hCorr.jump t s.frame.locals hCorr.slots⟩
+        refine ⟨_, Or.inl ?_, hCorr.jump t s.frame.locals hCorr.slots, rfl⟩
         simp only [LTerminator.toTrusted, evalTerminator]
       | switchInt discr bytes targets =>
         rw [hT] at hRef
@@ -13862,9 +13967,9 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
               obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots slots'
                 s.frame.locals discr (.scalar sc) s.memory.borrows env.globals env.layouts
                 s.memory.callerLocals hCorr.slots hRef hOp
-              refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel⟩
+              refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel, rfl⟩
               simp only [LTerminator.toTrusted, evalTerminator, hBody.layouts, hCorr.globals,
-                hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
+                hCorr.stack, hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
             · nomatch h
           · nomatch h
         · nomatch h
@@ -13880,7 +13985,8 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
               obtain ⟨rootVal, hRoot, hProj⟩ := readPlaceState_below_refines hCorr.slots hRead
               simp only [readProjectedValue, ProjReadResult.ok.injEq] at hProj
               subst hProj
-              simp only [LTerminator.toTrusted, evalTerminator, hRoot, hCorr.stack]
+              simp only [LTerminator.toTrusted, evalTerminator, hRoot, hCorr.stack,
+                show length ([] : List SavedCallerFrame) = 0 from rfl, hNoProt]
             · nomatch h
           · nomatch h
       | unreachable => rw [hT] at h; nomatch h
@@ -13894,7 +14000,8 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
           obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots slots'
             s.frame.locals cond (.scalar sc) s.memory.borrows env.globals env.layouts
             s.memory.callerLocals hCorr.slots hRef hOp
-          simp only [LTerminator.toTrusted, evalTerminator, hBody.layouts, hCorr.globals, hTOp]
+          simp only [LTerminator.toTrusted, evalTerminator, hBody.layouts, hCorr.globals,
+            hCorr.stack, hTOp]
           split at h
           · rename_i hBool
             obtain ⟨bits, sz⟩ := sc
@@ -13907,7 +14014,7 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
               dsimp only
               split at h
               · obtain rfl := cfgGoto_eq_some h
-                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel⟩
+                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
               · nomatch h
             · -- `false` asserted to be `true`: the assertion fails
               rw [show (((0 : Nat) == 1) == true) = false from rfl] at h
@@ -13932,7 +14039,7 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
                   · nomatch h
                   · obtain rfl := cfgGoto_eq_some h
                     exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                      Or.inl rfl, hCorr.jump c locals' hRel⟩
+                      Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
               · nomatch h
             · -- `true` asserted to be `false`: the assertion fails
               rw [show (((1 : Nat) == 1) == false) = false from rfl] at h
@@ -13957,7 +14064,7 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
                   · nomatch h
                   · obtain rfl := cfgGoto_eq_some h
                     exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                      Or.inl rfl, hCorr.jump c locals' hRel⟩
+                      Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
               · nomatch h
             · -- `true` asserted to be `true`: the assertion passes
               rw [show (((1 : Nat) == 1) == true) = true from rfl] at h
@@ -13965,7 +14072,7 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
               dsimp only
               split at h
               · obtain rfl := cfgGoto_eq_some h
-                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel⟩
+                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
               · nomatch h
           · nomatch h
         · nomatch h
@@ -13983,13 +14090,17 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
           by_cases hPN : dest.projection = []
           · rw [hPN]; trivial
           · exact hBody.projCallArity bb b func args dest destTy t u hb hT hPN
-        have hCall := evalLoweredTerminator_call_refines_evalTerminator
+        have hCall := evalLoweredTerminator_call_refines_evalTerminator_aux
           (sIdx := 0) (span := span) (inCleanup := b.isCleanup)
           hBody.layouts hBody.localDecls hBody.ubChecksTrue hBody.callTargetDefault
           hRef hCorr hCorr.slots h hDestOk
         dsimp only at hCall
         rw [hFrameEq] at hCall
-        cases step <;> exact hCall
+        cases step with
+        | goto _ _ _ => exact hCall
+        | returned _ => exact False.elim hCall
+        | panicked _ => exact hCall
+        | terminated _ => exact hCall
       | unwindResume =>
         rw [hT] at h
         simp only at h
@@ -14005,6 +14116,41 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
           simp [LTerminator.toTrusted, evalTerminator]
         · nomatch h
 
+/-- **`evalLoweredTerminator_refines_trusted`**: under `BodyCorr` and `StateCorr` (with no
+function-entry protector conflict on frame teardown at `Return`, automatic whenever
+`s.memory.activeProtectors = []` or `s.memory.borrows = []`), every successful lowered terminator
+step is matched by Trusted's `stepMirFn`: a jump is a Trusted `.step`/`.emitStep` to a
+corresponding state (preserving `StateCorr` on `Goto`, `SwitchInt`, `Assert`-pass, `Assert`
+cleanup jumps, and direct inline-intrinsic `Call`s), `Return` is Trusted's `.retNormal` of the same
+value with the returning root frame's borrows disabled (`disableFrameBorrows`), and a panic that
+unwinds out of the body (or aborts) is Trusted's `.panic` (or `.abort`) outcome. In particular
+Trusted never faults with `.ub` where Anneal succeeds. -/
+theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm : CapturedMir}
+    {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {step : CfgStep} (hBody : BodyCorr env body cm) (hCorr : StateCorr env bb slots s)
+    (h : evalLoweredTerminator env body bb slots unwinding = some step)
+    (hNoProt :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors 0
+        (length s.frame.locals) = false := by
+      cases s.memory.activeProtectors <;> cases s.memory.borrows <;> rfl) :
+    match step with
+    | .goto next slots' _ => ∃ s', TrustedStep (stepMirFn cm s) s' ∧ StateCorr env next slots' s'
+    | .returned v =>
+      stepMirFn cm s =
+        .retNormal v
+          { s.memory with
+            borrows := disableFrameBorrows s.memory.borrows 0 (length s.frame.locals) }
+    | .panicked _ => stepMirFn cm s = .retOutcome .panic
+    | .terminated _ => stepMirFn cm s = .retOutcome .abort := by
+  have hAux := evalLoweredTerminator_refines_trusted_aux hBody hCorr h hNoProt
+  cases step with
+  | goto next slots' _ =>
+    obtain ⟨s', hS, hC, _⟩ := hAux
+    exact ⟨s', hS, hC⟩
+  | returned _ => exact hAux
+  | panicked _ => exact hAux
+  | terminated _ => exact hAux
+
 /-- Trusted's reflexive-transitive closure of continuing steps (`.step` / `.emitStep`) of
 `stepMirFn`: a Trusted execution prefix that never faults. -/
 inductive TrustedRun (cm : CapturedMir) : MachineState → MachineState → Prop where
@@ -14013,30 +14159,30 @@ inductive TrustedRun (cm : CapturedMir) : MachineState → MachineState → Prop
       TrustedStep (stepMirFn cm s) s' → TrustedRun cm s' s'' → TrustedRun cm s s''
 
 /-- **`runLoweredCfgSteps_refines_trusted`**: under `BodyCorr` (with the empty statement list
-evaluating to the identity) and `StateCorr`, every successful fuel-bounded lowered CFG run is
-matched by a fault-free Trusted execution of `stepMirFn` (equivalently `stepMirState` on
-`.running` states) that reaches a corresponding state when fuel runs out, Trusted's
-`.retNormal` of the same value on `Return`, and Trusted's `.panic` / `.abort` outcome when a
-panic unwinds out of the body or aborts. Trusted never faults with `.ub` along the way. -/
+evaluating to the identity) and `StateCorr` (with `hBorrows : s.memory.borrows = [] := by rfl`
+discharged automatically on initial machine states so root `Return` frame-borrow teardown is the
+identity on `s'.memory`), every successful fuel-bounded lowered CFG run is matched by a fault-free
+Trusted execution of `stepMirFn` (equivalently `stepMirState` on `.running` states) that reaches a
+corresponding state when fuel runs out, Trusted's `.retNormal` of the same value on `Return`, and
+Trusted's `.panic` / `.abort` outcome when a panic unwinds out of the body or aborts. Trusted never
+faults with `.ub` along the way. -/
 theorem runLoweredCfgSteps_refines_trusted {env : CfgEnv} {body : LBody} {cm : CapturedMir}
-    (hBody : BodyCorr env body cm) (hStmts : ∀ slots, env.evalStmts [] slots = some slots) :
-    ∀ (fuel bb : Nat) (slots : List LocalSlotState) (unwinding : Option Nat) (s : MachineState)
-      (o : CfgOutcome), StateCorr env bb slots s →
-      runLoweredCfgSteps env body fuel bb slots unwinding = some o →
-      match o with
-      | .outOfFuel bb' slots' _ => ∃ s', TrustedRun cm s s' ∧ StateCorr env bb' slots' s'
-      | .returned v => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retNormal v s'.memory
-      | .panicked _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .panic
-      | .terminated _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .abort := by
-  intro fuel
-  induction fuel with
+    (hBody : BodyCorr env body cm) (hStmts : ∀ slots, env.evalStmts [] slots = some slots)
+    (fuel bb : Nat) (slots : List LocalSlotState) (unwinding : Option Nat) (s : MachineState)
+    (o : CfgOutcome) (hCorr : StateCorr env bb slots s)
+    (h : runLoweredCfgSteps env body fuel bb slots unwinding = some o)
+    (hBorrows : s.memory.borrows = [] := by rfl) :
+    match o with
+    | .outOfFuel bb' slots' _ => ∃ s', TrustedRun cm s s' ∧ StateCorr env bb' slots' s'
+    | .returned v => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retNormal v s'.memory
+    | .panicked _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .panic
+    | .terminated _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .abort := by
+  induction fuel generalizing bb slots unwinding s hCorr hBorrows with
   | zero =>
-    intro bb slots unwinding s o hCorr h
     simp only [runLoweredCfgSteps, Option.some.injEq] at h
     subst h
     exact ⟨s, .refl s, hCorr⟩
   | succ fuel ih =>
-    intro bb slots unwinding s o hCorr h
     simp only [runLoweredCfgSteps] at h
     cases hb : body.blocks[bb]? with
     | none => rw [hb] at h; nomatch h
@@ -14050,12 +14196,18 @@ theorem runLoweredCfgSteps_refines_trusted {env : CfgEnv} {body : LBody} {cm : C
       | none => rw [hT] at h; nomatch h
       | some step =>
         rw [hT] at h
-        have hRef := evalLoweredTerminator_refines_trusted hBody hCorr hT
+        have hNoProt :
+            hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors 0
+              (length s.frame.locals) = false := by
+          rw [hBorrows]
+          exact hasFrameDeallocProtectorConflict_nil_borrows _ _ _
+        have hRef := evalLoweredTerminator_refines_trusted_aux hBody hCorr hT hNoProt
         cases step with
         | goto next slots' unwinding' =>
           simp only at h hRef
-          obtain ⟨s', hStep, hCorr'⟩ := hRef
-          have hRest := ih next slots' unwinding' s' o hCorr' h
+          obtain ⟨s', hStep, hCorr', hMem⟩ := hRef
+          have hBorrows' : s'.memory.borrows = [] := by rw [hMem, hBorrows]
+          have hRest := ih next slots' unwinding' s' hCorr' h hBorrows'
           cases o with
           | outOfFuel bb' slots'' _ =>
             obtain ⟨s'', hRun, hC⟩ := hRest
@@ -14072,6 +14224,7 @@ theorem runLoweredCfgSteps_refines_trusted {env : CfgEnv} {body : LBody} {cm : C
         | returned v =>
           simp only [Option.some.injEq] at h
           subst h
+          rw [memory_with_disableFrameBorrows_eq_of_nil hBorrows] at hRef
           exact ⟨s, .refl s, hRef⟩
         | panicked b =>
           simp only [Option.some.injEq] at h
@@ -15210,10 +15363,10 @@ theorem stepMirFn_at_end_eq_evalTerminator {cm : CapturedMir} {bb : Nat}
   simp only [hCallee, Option.getD_none, get?_eq_getElem?, hcm, hNone,
     length_eq_list_length, BEq.rfl, ↓reduceIte]
 
-/-- **`evalLoweredTerminator_at_end_refines_trusted`**: generalizes
-`evalLoweredTerminator_refines_trusted` to a state sitting at the end of a block's statement list
-(`stmtIdx = tStmts.length`). -/
-theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBody}
+/-- Internal strengthening of `evalLoweredTerminator_at_end_refines_trusted` recording that every
+`.goto` transition preserves `s'.memory = s.memory` and `.returned v` disables the root frame's
+borrows under `hasFrameDeallocProtectorConflict = false`. -/
+private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} {body : LBody}
     {cm : CapturedMir} {bb : Nat} {slots slots1 : List LocalSlotState} {unwinding : Option Nat}
     {s : MachineState} {locals1 : List LocalSlot} {tStmts : List Statement} {span : String}
     {b : LBlock} {step : CfgStep}
@@ -15234,13 +15387,20 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
         b.terminator = .call func args dest dty t u →
         dest.projection ≠ [] →
         NoUninitExplosionOnProj env.arityOf dty dest.projection := by
-      intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction) :
+      intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction)
+    (hNoProt :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors 0
+        (length locals1) = false := by
+      cases s.memory.activeProtectors <;> cases s.memory.borrows <;> rfl) :
     match step with
     | .goto next slots' _ =>
       ∃ s', TrustedStep (stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ }) s' ∧
-        StateCorr env next slots' s'
+        StateCorr env next slots' s' ∧ s'.memory = s.memory
     | .returned v =>
-      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retNormal v s.memory
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } =
+        .retNormal v
+          { s.memory with
+            borrows := disableFrameBorrows s.memory.borrows 0 (length locals1) }
     | .panicked _ =>
       stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retOutcome .panic
     | .terminated _ =>
@@ -15260,7 +15420,7 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
       rw [hT] at h
       simp only at h
       obtain rfl := cfgGoto_eq_some h
-      exact ⟨_, Or.inl rfl, hCorr.jump t locals1 hRel1⟩
+      exact ⟨_, Or.inl rfl, hCorr.jump t locals1 hRel1, rfl⟩
     | switchInt discr bytes targets =>
       rw [hT] at hRef h
       simp only at h
@@ -15272,9 +15432,9 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
             obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots1 slots'
               locals1 discr (.scalar sc) s.memory.borrows env.globals env.layouts
               s.memory.callerLocals hRel1 hRef hOp
-            refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel⟩
+            refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel, rfl⟩
             simp only [LTerminator.toTrusted, evalTerminator, hLayouts, hCorr.globals,
-              hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
+              hCorr.stack, hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
           · nomatch h
         · nomatch h
       · nomatch h
@@ -15290,7 +15450,8 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
             obtain ⟨rootVal, hRoot, hProj⟩ := readPlaceState_below_refines hRel1 hRead
             simp only [readProjectedValue, ProjReadResult.ok.injEq] at hProj
             subst hProj
-            simp only [LTerminator.toTrusted, evalTerminator, hRoot, hCorr.stack]
+            simp only [LTerminator.toTrusted, evalTerminator, hRoot, hCorr.stack,
+              show length ([] : List SavedCallerFrame) = 0 from rfl, hNoProt]
           · nomatch h
         · nomatch h
     | unreachable => rw [hT] at h; nomatch h
@@ -15303,7 +15464,8 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
         obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots1 slots'
           locals1 cond (.scalar sc) s.memory.borrows env.globals env.layouts
           s.memory.callerLocals hRel1 hRef hOp
-        simp only [LTerminator.toTrusted, evalTerminator, hLayouts, hCorr.globals, hTOp]
+        simp only [LTerminator.toTrusted, evalTerminator, hLayouts, hCorr.globals,
+          hCorr.stack, hTOp]
         split at h
         · rename_i hBool
           obtain ⟨bits, sz⟩ := sc
@@ -15315,7 +15477,7 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
             dsimp only
             split at h
             · obtain rfl := cfgGoto_eq_some h
-              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel⟩
+              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
             · nomatch h
           · rw [show (((0 : Nat) == 1) == true) = false from rfl] at h
             simp only [Bool.false_eq_true, ↓reduceIte] at h
@@ -15339,7 +15501,7 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
                 · nomatch h
                 · obtain rfl := cfgGoto_eq_some h
                   exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                    Or.inl rfl, hCorr.jump c locals' hRel⟩
+                    Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
             · nomatch h
           · rw [show (((1 : Nat) == 1) == false) = false from rfl] at h
             simp only [Bool.false_eq_true, ↓reduceIte] at h
@@ -15363,14 +15525,14 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
                 · nomatch h
                 · obtain rfl := cfgGoto_eq_some h
                   exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                    Or.inl rfl, hCorr.jump c locals' hRel⟩
+                    Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
             · nomatch h
           · rw [show (((1 : Nat) == 1) == true) = true from rfl] at h
             simp only [↓reduceIte] at h
             dsimp only
             split at h
             · obtain rfl := cfgGoto_eq_some h
-              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel⟩
+              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
             · nomatch h
         · nomatch h
       · nomatch h
@@ -15381,10 +15543,14 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
         by_cases hPN : dest.projection = []
         · rw [hPN]; trivial
         · exact hProjArity func args dest destTy t u hT hPN
-      have hCall := evalLoweredTerminator_call_refines_evalTerminator
+      have hCall := evalLoweredTerminator_call_refines_evalTerminator_aux
         (sIdx := tStmts.length) (span := span) (inCleanup := b.isCleanup)
         hLayouts hDecls hUb hCallTgt hRef hCorr hRel1 h hDestOk
-      cases step <;> exact hCall
+      cases step with
+      | goto _ _ _ => exact hCall
+      | returned _ => exact False.elim hCall
+      | panicked _ => exact hCall
+      | terminated _ => exact hCall
     | unwindResume =>
       rw [hT] at h
       simp only at h
@@ -15400,29 +15566,83 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
         simp [LTerminator.toTrusted, evalTerminator]
       · nomatch h
 
+/-- **`evalLoweredTerminator_at_end_refines_trusted`**: generalizes
+`evalLoweredTerminator_refines_trusted` to a state sitting at the end of a block's statement list
+(`stmtIdx = tStmts.length`), with `hNoProt` ruling out a function-entry protector conflict on frame
+teardown at `Return` (automatic whenever `s.memory.activeProtectors = []` or
+`s.memory.borrows = []`). -/
+theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBody}
+    {cm : CapturedMir} {bb : Nat} {slots slots1 : List LocalSlotState} {unwinding : Option Nat}
+    {s : MachineState} {locals1 : List LocalSlot} {tStmts : List Statement} {span : String}
+    {b : LBlock} {step : CfgStep}
+    (hPhase : ∀ tag, cm.phase ≠ .other tag)
+    (hLayouts : cm.layouts = env.layouts)
+    (hb : body.blocks[bb]? = some b)
+    (hRef : b.terminator.Refinable)
+    (hcm : cm.basicBlocks[bb]? = some ⟨tStmts, ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩)
+    (hCorr : StateCorr env bb slots s)
+    (hRel1 : SlotsRefine SlotBelow slots1 locals1)
+    (h : evalLoweredTerminator env body bb slots1 unwinding = some step)
+    (hDecls : cm.localDecls = env.localDecls := by rfl)
+    (hUb : env.ubChecks = true := by rfl)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01? := by rfl)
+    (hProjArity :
+      ∀ (func : Operand) (args : List Operand) (dest : Place) (dty : Ty)
+        (t : Option Nat) (u : UnwindAction),
+        b.terminator = .call func args dest dty t u →
+        dest.projection ≠ [] →
+        NoUninitExplosionOnProj env.arityOf dty dest.projection := by
+      intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction)
+    (hNoProt :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors 0
+        (length locals1) = false := by
+      cases s.memory.activeProtectors <;> cases s.memory.borrows <;> rfl) :
+    match step with
+    | .goto next slots' _ =>
+      ∃ s', TrustedStep (stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ }) s' ∧
+        StateCorr env next slots' s'
+    | .returned v =>
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } =
+        .retNormal v
+          { s.memory with
+            borrows := disableFrameBorrows s.memory.borrows 0 (length locals1) }
+    | .panicked _ =>
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retOutcome .panic
+    | .terminated _ =>
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retOutcome .abort := by
+  have hAux := evalLoweredTerminator_at_end_refines_trusted_aux
+    hPhase hLayouts hb hRef hcm hCorr hRel1 h hDecls hUb hCallTgt hProjArity hNoProt
+  cases step with
+  | goto next slots' _ =>
+    obtain ⟨s', hS, hC, _⟩ := hAux
+    exact ⟨s', hS, hC⟩
+  | returned _ => exact hAux
+  | panicked _ => exact hAux
+  | terminated _ => exact hAux
+
 /-- **`runLoweredCfgSteps_with_stmts_refines_trusted`**: multi-block fuel-bounded CFG execution
 over blocks with non-empty statement lists (`BodyCorrWithStmts`) is matched by a fault-free
 `TrustedRun` execution of `stepMirFn` across both statements and terminators, preserving
-`StateCorr` and the target-block cleanup/unwinding invariant on every block transition. -/
+`StateCorr` and the target-block cleanup/unwinding invariant on every block transition (with
+`hBorrows : s.memory.borrows = [] := by rfl` discharged automatically on initial machine states so
+root `Return` frame-borrow teardown is the identity on `s'.memory`). -/
 theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBody}
-    {cm : CapturedMir} (hBody : BodyCorrWithStmts env body cm) :
-    ∀ (fuel bb : Nat) (slots : List LocalSlotState) (unwinding : Option Nat) (s : MachineState)
-      (o : CfgOutcome), StateCorr env bb slots s →
-      runLoweredCfgSteps env body fuel bb slots unwinding = some o →
-      match o with
-      | .outOfFuel bb' slots' _ => ∃ s', TrustedRun cm s s' ∧ StateCorr env bb' slots' s'
-      | .returned v => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retNormal v s'.memory
-      | .panicked _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .panic
-      | .terminated _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .abort := by
-  intro fuel
-  induction fuel with
+    {cm : CapturedMir} (hBody : BodyCorrWithStmts env body cm)
+    (fuel bb : Nat) (slots : List LocalSlotState) (unwinding : Option Nat) (s : MachineState)
+    (o : CfgOutcome) (hCorr : StateCorr env bb slots s)
+    (h : runLoweredCfgSteps env body fuel bb slots unwinding = some o)
+    (hBorrows : s.memory.borrows = [] := by rfl) :
+    match o with
+    | .outOfFuel bb' slots' _ => ∃ s', TrustedRun cm s s' ∧ StateCorr env bb' slots' s'
+    | .returned v => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retNormal v s'.memory
+    | .panicked _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .panic
+    | .terminated _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .abort := by
+  induction fuel generalizing bb slots unwinding s hCorr hBorrows with
   | zero =>
-    intro bb slots unwinding s o hCorr h
     simp only [runLoweredCfgSteps, Option.some.injEq] at h
     subst h
     exact ⟨s, .refl s, hCorr⟩
   | succ fuel ih =>
-    intro bb slots unwinding s o hCorr h
     simp only [runLoweredCfgSteps] at h
     cases hb : body.blocks[bb]? with
     | none => rw [hb] at h; nomatch h
@@ -15440,16 +15660,23 @@ theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBo
         | none => rw [hT] at h; nomatch h
         | some step =>
           rw [hT] at h
-          have hRef := evalLoweredTerminator_at_end_refines_trusted
+          have hNoProt :
+              hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors 0
+                (length locals1) = false := by
+            rw [hBorrows]
+            exact hasFrameDeallocProtectorConflict_nil_borrows _ _ _
+          have hRef := evalLoweredTerminator_at_end_refines_trusted_aux
             hBody.phase hBody.layouts hb hTermRef hcm hCorr hRel1 hT
             hBody.localDecls hBody.ubChecksTrue hBody.callTargetDefault
             (fun func args dest dty t u hTerm hPN =>
               hBody.projCallArity bb block func args dest dty t u hb hTerm hPN)
+            hNoProt
           cases step with
           | goto next slots' unwinding' =>
             simp only at h hRef
-            obtain ⟨s', hStep, hCorr'⟩ := hRef
-            have hRest := ih next slots' unwinding' s' o hCorr' h
+            obtain ⟨s', hStep, hCorr', hMem⟩ := hRef
+            have hBorrows' : s'.memory.borrows = [] := by rw [hMem, hBorrows]
+            have hRest := ih next slots' unwinding' s' hCorr' h hBorrows'
             cases o with
             | outOfFuel bb' slots'' _ =>
               obtain ⟨s'', hRun, hC⟩ := hRest
@@ -15466,6 +15693,7 @@ theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBo
           | returned v =>
             simp only [Option.some.injEq] at h
             subst h
+            rw [memory_with_disableFrameBorrows_eq_of_nil hBorrows] at hRef
             exact ⟨{ s with frame := ⟨bb, tStmts.length, locals1⟩ }, hRunStmts, hRef⟩
           | panicked b =>
             simp only [Option.some.injEq] at h
@@ -17596,7 +17824,7 @@ theorem evalRvalue_use_copy_of_evalOperand {locals : List LocalSlot} {p : Nat}
     {rest : List ProjectionElem} {v : Value} {mem : Memory} {localDecls : List LocalDecl}
     {layouts : LayoutTable}
     (hOp : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
-      mem.callerLocals localDecls = .ok v locals)
+      mem.callerLocals localDecls mem.callStack = .ok v locals)
     (hValid : validateLoadedValue layouts localDecls (.copy ⟨p, .deref :: rest⟩) v = true)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
       derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
@@ -17616,7 +17844,8 @@ theorem evalRvalue_use_copy_of_evalOperand {locals : List LocalSlot} {p : Nat}
       exact ⟨_, rfl⟩
 
 /-- **`Deref` reads refine Trusted's `evalRvalue` (`evalDerefPlaceRead_refines_evalRvalue`)**: under
-the hypotheses of `evalDerefPlaceRead_refines_evalOperand`, when (with two or more borrow entries)
+the hypotheses of `evalDerefPlaceRead_refines_evalOperand` on a single-frame memory
+(`hCS : mem.callStack = []`), when (with two or more borrow entries)
 the read through `_p`'s tag is not Tree Borrows UB (`2 ≤ mem.borrows.length → derefReadTreeUB … =
 false`), Trusted's `Rvalue.use (copy (*_p).rest)` evaluates to the same value without changing the
 frame (Trusted may only freeze the read tags of its borrow table). -/
@@ -17632,10 +17861,12 @@ theorem evalDerefPlaceRead_refines_evalRvalue {cx : SubplaceCtx}
     (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
     (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v) (layouts : LayoutTable)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem [] layouts = .ok v locals mem' := by
   have hOp := evalDerefPlaceRead_refines_evalOperand hRel hRest hPtr hTy hRes hEntry hPerm hThin
     hRead mem.globals layouts mem.callerLocals
+  rw [← hCS] at hOp
   have hV : validateLoadedValue layouts [] (.copy ⟨p, .deref :: rest⟩) v = true := by
     simp [validateLoadedValue, operandTy, placeTy]
   exact evalRvalue_use_copy_of_evalOperand hOp hV hNoTreeUB
@@ -17721,7 +17952,7 @@ theorem evalDerefPlaceRead_refines_evalOperand_typed {cx : SubplaceCtx}
   cases hpe : entry.perm with
   | disabled => exact absurd hpe hPerm
   | _ =>
-    dsimp only
+    dsimp only [activeFrameSlot?]
     rw [ht]
     dsimp only
     unfold evalStackThinPtrTypedDerefRead
@@ -17756,7 +17987,8 @@ theorem evalDerefPlaceRead_refines_evalOperand_typed {cx : SubplaceCtx}
 
 /-- **Typed `Deref` reads refine Trusted's typed `evalRvalue`
 (`evalDerefPlaceRead_refines_evalRvalue_typed`)**: under the hypotheses of
-`evalDerefPlaceRead_refines_evalOperand_typed`, Trusted's load validation of the read scalar
+`evalDerefPlaceRead_refines_evalOperand_typed` on a single-frame memory (`hCS : mem.callStack = []`),
+Trusted's load validation of the read scalar
 (`validateLoadedValue`), and Tree-Borrows-UB-freedom of the read (`derefReadTreeUB … = false`),
 Trusted's typed `Rvalue.use (copy (*_p))` evaluates to the scalar Anneal reads from `*_p`, without
 changing the frame. -/
@@ -17783,12 +18015,14 @@ theorem evalDerefPlaceRead_refines_evalRvalue_typed {cx : SubplaceCtx}
       (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar sc) = true)
     (hLoad : validateLoadedValue layouts localDecls (.copy ⟨p, [.deref]⟩) (.scalar sc) = true)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p [] mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p [] mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.use (.copy ⟨p, [.deref]⟩)) mem localDecls layouts =
-      .ok (.scalar sc) locals mem' :=
-  evalRvalue_use_copy_of_evalOperand
-    (evalDerefPlaceRead_refines_evalOperand_typed hRel hPtr hTy hRes hEntry hPerm hRead hDecls
-      hPTy hScalar hWidth hOff hAlign hNoUnion hValid mem.globals mem.callerLocals) hLoad hNoTreeUB
+      .ok (.scalar sc) locals mem' := by
+  have hOp := evalDerefPlaceRead_refines_evalOperand_typed hRel hPtr hTy hRes hEntry hPerm hRead
+    hDecls hPTy hScalar hWidth hOff hAlign hNoUnion hValid mem.globals mem.callerLocals
+  rw [← hCS] at hOp
+  exact evalRvalue_use_copy_of_evalOperand hOp hLoad hNoTreeUB
 
 /-- **`Deref` writes refine Trusted's `writePlaceValue` (`evalDerefPlaceWrite_refines_writePlaceValue`)**:
 on below-related frames, if Anneal writes `v` through `(*_p).rest` into an initialized target and
@@ -17872,7 +18106,8 @@ theorem evalDerefPlaceWrite_refines_writePlaceValue {arityOf : Ty → VariantIdx
         simp [writePlaceValue, get?_eq_getElem?, hp, hEntry, hpe, htp, hThin, hTT, hWP, hSet]
 
 /-- **`Deref` assignments refine Trusted's `evalStmt` (`evalStmt_assign_deref_refines`)**: with no
-active function-entry protector, when Trusted evaluates the rvalue to `v` without changing the
+active function-entry protector on a single-frame memory (`hCS : s.memory.callStack = []`), when
+Trusted evaluates the rvalue to `v` without changing the
 frame and the write through `_p`'s tag is not Tree Borrows UB at a strict ancestor
 (`derefWriteTreeUB … = false`: no `frozen` or `disabled` ancestor of the writer's tag), a successful
 Anneal write of `v` through `(*_p).rest` (as above) is matched by Stage-1 Trusted's `evalStmt`
@@ -17894,7 +18129,8 @@ theorem evalStmt_assign_deref_refines {arityOf : Ty → VariantIdx → Bool → 
     (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
     (hTgt : slots[entry.targetLocal]? = some (.init root))
     (hW : evalDerefPlaceWrite arityOf rootTyOf cx slots ⟨p, .deref :: rest⟩ v = .ok slots')
-    (hNoTreeUB : derefWriteTreeUB s.frame.locals s.memory.borrows ⟨p, .deref :: rest⟩ = false) :
+    (hNoTreeUB : derefWriteTreeUB s.frame.locals s.memory.borrows ⟨p, .deref :: rest⟩ = false)
+    (hCS : s.memory.callStack = [] := by rfl) :
     ∃ locals', evalStmt s ⟨.assign ⟨p, .deref :: rest⟩ rv, span⟩ =
         MirStepNode.step (advanceStmt s locals'
           { s.memory with
@@ -17904,7 +18140,7 @@ theorem evalStmt_assign_deref_refines {arityOf : Ty → VariantIdx → Bool → 
   obtain ⟨locals', hWV, hRel'⟩ := evalDerefPlaceWrite_refines_writePlaceValue hWF hRel hRest hPtr
     hTy hRes hEntry hPerm hThin hTgt hW
   refine ⟨locals', ?_, hRel'⟩
-  simp only [evalStmt, hv, evalPlaceWrite, hprot, hWV, hNoTreeUB, derefWriteUnionProtectorUB,
+  simp only [evalStmt, hv, evalPlaceWrite, hprot, hCS, hWV, hNoTreeUB, derefWriteUnionProtectorUB,
     Bool.or_false]
 
 theorem appendProjections_nil_right :
@@ -18015,7 +18251,7 @@ theorem evalDerefPlaceWrite_refines_writePlaceValue_typed
     all_goals
       dsimp only
       rw [hcons]
-      dsimp only
+      dsimp only [activeFrameTargetLocals?]
       rw [← hcons]
       unfold writeStackThinPtrTypedDeref
       rw [hPTy, hOff, htOld]
@@ -18053,7 +18289,8 @@ theorem evalDerefPlaceWrite_refines_writePlaceValue_typed
 
 /-- **Typed `Deref` assignments refine Trusted's typed `evalStmt`
 (`evalStmt_assign_deref_refines_typed`)**: with non-empty `localDecls` and no active function-entry
-protector, when Trusted's typed `evalRvalue` evaluates `rv` to `.scalar wSc` without changing the
+protector on a single-frame memory (`hCS : s.memory.callStack = []`), when Trusted's typed `evalRvalue`
+evaluates `rv` to `.scalar wSc` without changing the
 frame and the write through `_p`'s tag is not Tree Borrows UB at a strict ancestor
 (`derefWriteTreeUB … = false`), a successful Anneal write of `.scalar wSc` through `*_p` is matched
 by Stage-1 Trusted's typed `evalStmt` stepping the `.assign` with the written frame and the
@@ -18089,7 +18326,8 @@ theorem evalStmt_assign_deref_refines_typed
       ⟨entry.targetLocal, entry.targetProjection⟩ = false)
     (hValid : validateValueForTy? layouts
       (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar wSc) = true)
-    (hNoTreeUB : derefWriteTreeUB s.frame.locals s.memory.borrows ⟨p, [.deref]⟩ = false) :
+    (hNoTreeUB : derefWriteTreeUB s.frame.locals s.memory.borrows ⟨p, [.deref]⟩ = false)
+    (hCS : s.memory.callStack = [] := by rfl) :
     ∃ locals', evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals'
           { s.memory with
@@ -18099,7 +18337,7 @@ theorem evalStmt_assign_deref_refines_typed
   obtain ⟨locals', hWP, hRel'⟩ := evalDerefPlaceWrite_refines_writePlaceValue_typed hWF hRel hPtr
     hTy hRes hEntry hPerm hTgt hOld hW hDecls hPTy hPos hWidth hOff hAlign hNoUnion hValid
   refine ⟨locals', ?_, hRel'⟩
-  simp only [evalStmt, hv, evalPlaceWrite, hprot, hWP, hNoTreeUB, derefWriteUnionProtectorUB,
+  simp only [evalStmt, hv, evalPlaceWrite, hprot, hCS, hWP, hNoTreeUB, derefWriteUnionProtectorUB,
     Bool.or_false]
 
 /-! ### Section 4g: Sub-place and array-window `CopyNonOverlapping` (`eval_copy_nonoverlapping`) -/
@@ -18742,7 +18980,8 @@ theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → 
     ∃ locals₄, evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         locals₃ = .step (advanceStmt s locals₄
           { s.memory with
-            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+              (length s.memory.callStack) }) ∧
       SlotsRefine SlotBelow slots' locals₄ := by
   have hDp : projectionHasDeref (dh :: dt) = false := by
     cases dh with
@@ -18811,25 +19050,27 @@ theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → 
 
 /-- **Trusted's `evalStmt` reaches `evalCopySingleDirect` (`evalStmt_copyNonOverlapping_singleDirect`)**:
 for a `copy_nonoverlapping(src, dst, 1)` whose operands evaluate (without changing the frame) to
-pointers with usable borrow entries (a readable source, a writable destination) at offset `0`
+pointers with usable borrow entries targeting the active frame
+(`hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true`) at offset `0`
 outside unions, Trusted's statement step is exactly its single-element direct copy. -/
 theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp countOp : Operand)
     (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable)
     {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat} {countSc : ScalarInt}
     {srcEntry dstEntry : BorrowEntry}
     (hSrc : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr srcPtr srcSz) s.frame.locals)
     (hDst : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr dstPtr dstSz) s.frame.locals)
     (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.scalar countSc) s.frame.locals)
     (hOne : countSc.bits = 1)
     (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
     (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
     (hSrcP : srcEntry.perm ≠ .disabled) (hDstP : dstEntry.perm = .active ∨ dstEntry.perm = .reserved)
     (hSrcU : resolveUnionEndpoint? localDecls layouts s.frame.locals srcEntry = none)
     (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
-    (hSrcOff : srcPtr.offsetBytes = 0) (hDstOff : dstPtr.offsetBytes = 0) :
+    (hSrcOff : srcPtr.offsetBytes = 0) (hDstOff : dstPtr.offsetBytes = 0)
+    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
     evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
       evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         s.frame.locals := by
@@ -18838,7 +19079,7 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
       evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry 1
         s.frame.locals := by
     unfold evalCopyNonOverlappingWithCount
-    simp only [hSrcE, hDstE]
+    simp only [hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
     | disabled => exact absurd hs hSrcP
     | _ => rcases hDstP with hd | hd <;> simp [hd]
@@ -18850,7 +19091,9 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
 (`evalStmt_copyNonOverlapping_subplace_refines`)**: on below-related frames, a successful Anneal
 single-element sub-place copy of an initialized source value into a sub-place of another
 initialized local is matched by Trusted's `evalStmt` on `copy_nonoverlapping(src, dst, 1)` — whose
-pointer operands carry borrow entries naming exactly the two resolved sub-places — stepping with
+pointer operands carry borrow entries targeting the active frame
+(`hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true`) and naming
+exactly the two resolved sub-places — stepping with
 the written frame, and the frames stay related by `SlotsRefine SlotBelow`. -/
 theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
     {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots slots' : List LocalSlotState}
@@ -18869,11 +19112,11 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
     (layouts : LayoutTable) {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat}
     {countSc : ScalarInt} {srcEntry dstEntry : BorrowEntry}
     (hSrcOp : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr srcPtr srcSz) s.frame.locals)
     (hDstOp : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr dstPtr dstSz) s.frame.locals)
     (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.scalar countSc) s.frame.locals)
     (hOne : countSc.bits = 1)
     (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
     (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
@@ -18889,14 +19132,16 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
         operandPointeeTy localDecls layouts dstOp = some dstPt ∧
         sameRigidTyShape srcPt.kind dstPt.kind = true)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨dl, dh :: dt⟩ = false)
-    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true) :
+    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true)
+    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
     ∃ locals₄, evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩
         localDecls layouts = .step (advanceStmt s locals₄
           { s.memory with
-            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+              (length s.memory.callStack) }) ∧
       SlotsRefine SlotBelow slots' locals₄ := by
   rw [evalStmt_copyNonOverlapping_singleDirect s srcOp dstOp countOp span localDecls layouts hSrcOp
-    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff]
+    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff hActive]
   exact evalCopyNonOverlappingSubplace_refines hRel hSrcR hDstR hNe hSrcRead hSrcSlot hDstRoot hDh
     hDt h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry hTagNe hSrcEntry hDstEntry
     hPointee hNoUnion hValid
@@ -18955,7 +19200,8 @@ theorem evalCopyNonOverlappingSubplace_window_refines
         count locals₃ =
       .step (advanceStmt s (locals₃.set dl (.init newDstVal))
         { s.memory with
-          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+            (length s.memory.callStack) }) ∧
     SlotsRefine SlotBelow slots' (locals₃.set dl (.init newDstVal)) := by
   unfold evalCopyNonOverlappingSubplace at h
   split at h
@@ -19113,11 +19359,11 @@ theorem evalStmt_copyNonOverlapping_window_refines
     (layouts : LayoutTable) {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat}
     {countSc : ScalarInt} {srcEntry dstEntry : BorrowEntry}
     (hSrcOp : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr srcPtr srcSz) s.frame.locals)
     (hDstOp : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr dstPtr dstSz) s.frame.locals)
     (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.scalar countSc) s.frame.locals)
     (hCountBits : countSc.bits = count)
     (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
     (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
@@ -19132,12 +19378,14 @@ theorem evalStmt_copyNonOverlapping_window_refines
     (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
     (hNotAdt : ∀ fn args idx, placeTy localDecls layouts ⟨dl, []⟩ ≠ some { kind := .adt fn args, layoutIdx := idx })
     (hDstValid : localDecls ≠ [] → validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩)
-      (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true) :
+      (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true)
+    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
     let newDstVal := Value.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)
     evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
       .step (advanceStmt s (s.frame.locals.set dl (.init newDstVal))
         { s.memory with
-          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+            (length s.memory.callStack) }) ∧
     SlotsRefine SlotBelow slots' (s.frame.locals.set dl (.init newDstVal)) := by
   have hPermOk : evalCopyNonOverlappingWithCount s srcOp dstOp localDecls layouts
       (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) count s.frame.locals =
@@ -19146,7 +19394,7 @@ theorem evalStmt_copyNonOverlapping_window_refines
     unfold evalCopyNonOverlappingWithCount
     have hCntNe0 : Nat.beq count 0 = false :=
       ((beq_cases count 0).resolve_left (fun ⟨_, hEq⟩ => by omega)).1
-    simp only [hCntNe0, hSrcE, hDstE]
+    simp only [hCntNe0, hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
     | disabled => exact absurd hs hSrcP
     | _ => rcases hDstP with hd | hd <;> simp [hd]
@@ -19823,7 +20071,9 @@ theorem witness_trusted_window_copy (s : MachineState) (srcOp dstOp : Operand) :
     evalCopyNonOverlappingPermOk s srcOp dstOp [] emptyLayoutTable srcPtr dstPtr srcEntry dstEntry
         2 locals₃ =
       .step (advanceStmt s locals₄
-        { s.memory with borrows := invalidateConflictingBorrows s.memory.borrows 1 (some 2) }) ∧
+        { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows 1 (some 2)
+            (length s.memory.callStack) }) ∧
     SlotsRefine SlotBelow slots' locals₄ := by
   exact evalCopyNonOverlappingSubplace_window_refines
     (arityOf := fun _ _ _ => none) (rootTyOf := fun _ => witnessU32) (ts := false) (ptrBits := 64)
@@ -19889,7 +20139,8 @@ theorem evalCopyNonOverlappingSubplace_window_same_or_disjoint_refines
         count locals₃ =
       .step (advanceStmt s (locals₃.set dl (.init newDstVal))
         { s.memory with
-          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+            (length s.memory.callStack) }) ∧
     SlotsRefine SlotBelow slots' (locals₃.set dl (.init newDstVal)) := by
   unfold evalCopyNonOverlappingSubplace at h
   split at h
@@ -20054,11 +20305,11 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
     (layouts : LayoutTable) {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat}
     {countSc : ScalarInt} {srcEntry dstEntry : BorrowEntry}
     (hSrcOp : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr srcPtr srcSz) s.frame.locals)
     (hDstOp : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.ptr dstPtr dstSz) s.frame.locals)
     (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+      s.memory.callerLocals localDecls s.memory.callStack = .ok (.scalar countSc) s.frame.locals)
     (hCountBits : countSc.bits = count)
     (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
     (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
@@ -20074,12 +20325,14 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
     (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
     (hNotAdt : ∀ fn args idx, placeTy localDecls layouts ⟨dl, []⟩ ≠ some { kind := .adt fn args, layoutIdx := idx })
     (hDstValid : localDecls ≠ [] → validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩)
-      (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true) :
+      (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true)
+    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
     let newDstVal := Value.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)
     evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
       .step (advanceStmt s (s.frame.locals.set dl (.init newDstVal))
         { s.memory with
-          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+            (length s.memory.callStack) }) ∧
     SlotsRefine SlotBelow slots' (s.frame.locals.set dl (.init newDstVal)) := by
   have hPermOk : evalCopyNonOverlappingWithCount s srcOp dstOp localDecls layouts
       (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) count s.frame.locals =
@@ -20088,7 +20341,7 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
     unfold evalCopyNonOverlappingWithCount
     have hCntNe0 : Nat.beq count 0 = false :=
       ((beq_cases count 0).resolve_left (fun ⟨_, hEq⟩ => by omega)).1
-    simp only [hCntNe0, hSrcE, hDstE]
+    simp only [hCntNe0, hSrcE, hDstE, hActive]
     cases hs : srcEntry.perm with
     | disabled => exact absurd hs hSrcP
     | _ => rcases hDstP with hd | hd <;> simp [hd]
@@ -20200,7 +20453,7 @@ theorem evalDerefPlaceRead_refines_evalOperand_typed_proj {cx : SubplaceCtx}
   cases hpe : entry.perm with
   | disabled => exact absurd hpe hPerm
   | _ =>
-    dsimp only
+    dsimp only [activeFrameSlot?]
     rw [ht]
     dsimp only
     unfold evalStackThinPtrTypedDerefRead
@@ -20228,8 +20481,8 @@ theorem evalDerefPlaceRead_refines_evalOperand_typed_proj {cx : SubplaceCtx}
 /-- **Projected typed `Deref` reads refine Trusted's typed `evalRvalue`
 (`evalDerefPlaceRead_refines_evalRvalue_typed_proj`)**: lifts
 `evalDerefPlaceRead_refines_evalOperand_typed_proj` through Stage-1 Trusted's `evalRvalue` on
-`.use (.copy ⟨p, .deref :: rHead :: rTail⟩)` when the read through `_p`'s tag is not Tree Borrows
-UB (`derefReadTreeUB … = false`). -/
+`.use (.copy ⟨p, .deref :: rHead :: rTail⟩)` on a single-frame memory (`hCS : mem.callStack = []`)
+when the read through `_p`'s tag is not Tree Borrows UB (`derefReadTreeUB … = false`). -/
 theorem evalDerefPlaceRead_refines_evalRvalue_typed_proj {cx : SubplaceCtx}
     {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat}
     {rHead : ProjectionElem} {rTail : List ProjectionElem} {sc : ScalarInt}
@@ -20270,13 +20523,15 @@ theorem evalDerefPlaceRead_refines_evalRvalue_typed_proj {cx : SubplaceCtx}
     (hLoad : validateLoadedValue layouts localDecls (.copy ⟨p, .deref :: rHead :: rTail⟩)
       (.scalar sc) = true)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p (rHead :: rTail) mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p (rHead :: rTail) mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.use (.copy ⟨p, .deref :: rHead :: rTail⟩)) mem localDecls layouts =
-      .ok (.scalar sc) locals mem' :=
-  evalRvalue_use_copy_of_evalOperand
-    (evalDerefPlaceRead_refines_evalOperand_typed_proj hRel hRest hPtr hTy hRes hEntry hPerm hRead
-      hDecls hPtTy hAccTy hPtNotScalar hAccNotNever hAccNotUnitTuple hAccNotFnDef hScalar hWidth
-      hDerefAlign hAlign hResT hNoUnion hValid mem.globals mem.callerLocals) hLoad hNoTreeUB
+      .ok (.scalar sc) locals mem' := by
+  have hOp := evalDerefPlaceRead_refines_evalOperand_typed_proj hRel hRest hPtr hTy hRes hEntry
+    hPerm hRead hDecls hPtTy hAccTy hPtNotScalar hAccNotNever hAccNotUnitTuple hAccNotFnDef hScalar
+    hWidth hDerefAlign hAlign hResT hNoUnion hValid mem.globals mem.callerLocals
+  rw [← hCS] at hOp
+  exact evalRvalue_use_copy_of_evalOperand hOp hLoad hNoTreeUB
 
 /-- **Projected typed `Deref` writes refine Trusted's typed `writePlaceValue`
 (`evalDerefPlaceWrite_refines_writePlaceValue_typed_proj`)**: with non-empty `localDecls` and a
@@ -20405,7 +20660,7 @@ theorem evalDerefPlaceWrite_refines_writePlaceValue_typed_proj
     all_goals
       dsimp only
       rw [hcons]
-      dsimp only
+      dsimp only [activeFrameTargetLocals?]
       rw [← hcons]
       unfold writeStackThinPtrTypedDeref
       rw [hPtTy, hAccTy, hSynthFalse, htOld]
@@ -20437,7 +20692,8 @@ theorem evalDerefPlaceWrite_refines_writePlaceValue_typed_proj
 /-- **Projected typed `Deref` assignments refine Trusted's typed `evalStmt`
 (`evalStmt_assign_deref_refines_typed_proj`)**: lifts
 `evalDerefPlaceWrite_refines_writePlaceValue_typed_proj` through Stage-1 Trusted's `evalStmt` on
-`.assign ⟨p, .deref :: rHead :: rTail⟩ rv` when the write through `_p`'s tag is not Tree Borrows
+`.assign ⟨p, .deref :: rHead :: rTail⟩ rv` on a single-frame memory (`hCS : s.memory.callStack = []`)
+when the write through `_p`'s tag is not Tree Borrows
 UB at a strict ancestor (`derefWriteTreeUB … = false`), with the layout-aware deref-write borrow
 update (`invalidateDerefWriteBorrowsWithLayouts`). -/
 theorem evalStmt_assign_deref_refines_typed_proj
@@ -20482,7 +20738,8 @@ theorem evalStmt_assign_deref_refines_typed_proj
     (hValid : validateValueForTy? layouts
       (some (resolveTyWithLocalDecls localDecls layouts accTy)) (.scalar wSc) = true)
     (hNoTreeUB : derefWriteTreeUB s.frame.locals s.memory.borrows
-      ⟨p, .deref :: rHead :: rTail⟩ = false) :
+      ⟨p, .deref :: rHead :: rTail⟩ = false)
+    (hCS : s.memory.callStack = [] := by rfl) :
     ∃ locals', evalStmt s ⟨.assign ⟨p, .deref :: rHead :: rTail⟩ rv, span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals'
           { s.memory with
@@ -20493,7 +20750,7 @@ theorem evalStmt_assign_deref_refines_typed_proj
     hRest hPtr hTy hRes hEntry hPerm hTgt hOld hW hDecls hPtTy hAccTy hPtNotScalar hAccNotNever hPos
     hWidth hDerefAlign hAlign hResT hNoUnion hValid
   refine ⟨locals', ?_, hRel'⟩
-  simp only [evalStmt, hv, evalPlaceWrite, hprot, hWP, hNoTreeUB, derefWriteUnionProtectorUB,
+  simp only [evalStmt, hv, evalPlaceWrite, hprot, hCS, hWP, hNoTreeUB, derefWriteUnionProtectorUB,
     Bool.or_false]
 
 /-- Whole-pair witness context: type `100` is `(u32, u32)` (`8`-byte, `4`-aligned), and `_1` holds
@@ -20767,7 +21024,9 @@ theorem witness_trusted_window_copy_resolved_and_same_local (s : MachineState) (
         { tag := 1, targetLocal := 0, targetProjection := [], perm := .active }
         { tag := 2, targetLocal := 1, targetProjection := [], perm := .active } 2 locals₃ =
       .step (advanceStmt s [.init (.aggregate 0 srcElems), .init (.aggregate 0 crossDstElems)]
-        { s.memory with borrows := invalidateConflictingBorrows s.memory.borrows 1 (some 2) })) ∧
+        { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows 1 (some 2)
+            (length s.memory.callStack) })) ∧
     (evalCopyNonOverlappingSubplace (fun _ _ _ => none) (fun _ => witnessU32) false 64 witnessArrSlots resolve
         ⟨0x1000, some (1, 0)⟩ ⟨0x1008, some (1, 0)⟩ 2 4 4 =
       some [.init (.aggregate 0 sameDstElems), .init (.aggregate 0 dstElems)] ∧
@@ -20776,7 +21035,9 @@ theorem witness_trusted_window_copy_resolved_and_same_local (s : MachineState) (
         { tag := 1, targetLocal := 0, targetProjection := [], perm := .active }
         { tag := 2, targetLocal := 0, targetProjection := [], perm := .active } 2 locals₃ =
       .step (advanceStmt s [.init (.aggregate 0 sameDstElems), .init (.aggregate 0 dstElems)]
-        { s.memory with borrows := invalidateConflictingBorrows s.memory.borrows 0 (some 2) })) := by
+        { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows 0 (some 2)
+            (length s.memory.callStack) })) := by
   have hCross : evalCopyNonOverlappingSubplace (fun _ _ _ => none) (fun _ => witnessU32) false 64
       witnessArrSlots
       (fun p ow => resolveSyntheticSubplace witnessArrCtx witnessArrSlots p ⟨false, 1⟩ ow)
@@ -20840,10 +21101,12 @@ the borrow table and returns the frame unchanged; only a `move` of a bare local 
 slot. This is the Trusted counterpart of `evalDerefOperand_move_deref`. -/
 theorem evalOperand_move_deref_eq_copy (locals : List LocalSlot) (p : Nat)
     (rest : List ProjectionElem) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (layouts : LayoutTable) (callerLocals : List LocalSlot) (localDecls : List LocalDecl) :
-    evalOperand locals (.move ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals localDecls =
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame := []) :
+    evalOperand locals (.move ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals localDecls
+        callStack =
       evalOperand locals (.copy ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals
-        localDecls := rfl
+        localDecls callStack := rfl
 
 /-- **`Rvalue.use (move (*_p).rest)` is `Rvalue.use (copy (*_p).rest)` in Trusted
 (`evalRvalue_use_move_deref_eq_copy`)**: the load validation and the Tree-Borrows read freeze of
@@ -20853,7 +21116,7 @@ theorem evalRvalue_use_move_deref_eq_copy (locals : List LocalSlot) (p : Nat)
     (layouts : LayoutTable) :
     evalRvalue locals (.use (.move ⟨p, .deref :: rest⟩)) mem localDecls layouts =
       evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem localDecls layouts := by
-  simp only [evalRvalue, evalOperand_move_deref_eq_copy]
+  simp only [evalRvalue]
   rcases hb : mem.borrows with _ | ⟨b₁, _ | ⟨b₂, bs⟩⟩ <;> rfl
 
 /-- **`Operand.move` through `Deref` refines Trusted (`evalDerefOperand_move_refines_evalOperand`)**:
@@ -20983,7 +21246,7 @@ theorem evalDerefOperand_move_refines_evalOperand_typed_proj {cx : SubplaceCtx}
 
 /-- **`Rvalue.use (move (*_p).rest)` refines Trusted's `evalRvalue`
 (`evalDerefPlaceRead_refines_evalRvalue_move`)**: the `move` analogue of
-`evalDerefPlaceRead_refines_evalRvalue`. -/
+`evalDerefPlaceRead_refines_evalRvalue` on a single-frame memory (`hCS : mem.callStack = []`). -/
 theorem evalDerefPlaceRead_refines_evalRvalue_move {cx : SubplaceCtx}
     {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
     {v : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {mem : Memory}
@@ -20996,16 +21259,17 @@ theorem evalDerefPlaceRead_refines_evalRvalue_move {cx : SubplaceCtx}
     (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
     (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v) (layouts : LayoutTable)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.use (.move ⟨p, .deref :: rest⟩)) mem [] layouts =
       .ok v locals mem' := by
   rw [evalRvalue_use_move_deref_eq_copy]
   exact evalDerefPlaceRead_refines_evalRvalue hRel hRest hPtr hTy hRes hEntry hPerm hThin hRead
-    layouts hNoTreeUB
+    layouts hNoTreeUB hCS
 
 /-- **Typed `Rvalue.use (move (*_p))` refines Trusted's typed `evalRvalue`
 (`evalDerefPlaceRead_refines_evalRvalue_typed_move`)**: the `move` analogue of
-`evalDerefPlaceRead_refines_evalRvalue_typed`. -/
+`evalDerefPlaceRead_refines_evalRvalue_typed` on a single-frame memory (`hCS : mem.callStack = []`). -/
 theorem evalDerefPlaceRead_refines_evalRvalue_typed_move {cx : SubplaceCtx}
     {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {sc : ScalarInt}
     {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {mem : Memory}
@@ -21029,15 +21293,17 @@ theorem evalDerefPlaceRead_refines_evalRvalue_typed_move {cx : SubplaceCtx}
       (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar sc) = true)
     (hLoad : validateLoadedValue layouts localDecls (.move ⟨p, [.deref]⟩) (.scalar sc) = true)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p [] mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p [] mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.use (.move ⟨p, [.deref]⟩)) mem localDecls layouts =
       .ok (.scalar sc) locals mem' := by
   rw [evalRvalue_use_move_deref_eq_copy]
   exact evalDerefPlaceRead_refines_evalRvalue_typed hRel hPtr hTy hRes hEntry hPerm hRead hDecls
-    hPTy hScalar hWidth hOff hAlign hNoUnion hValid hLoad hNoTreeUB
+    hPTy hScalar hWidth hOff hAlign hNoUnion hValid hLoad hNoTreeUB hCS
 
 /-- **Projected typed `Rvalue.use (move (*_p).(rHead :: rTail))` refines Trusted's typed
-`evalRvalue` (`evalDerefPlaceRead_refines_evalRvalue_typed_proj_move`)**. -/
+`evalRvalue` (`evalDerefPlaceRead_refines_evalRvalue_typed_proj_move`)** on a single-frame memory
+(`hCS : mem.callStack = []`). -/
 theorem evalDerefPlaceRead_refines_evalRvalue_typed_proj_move {cx : SubplaceCtx}
     {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat}
     {rHead : ProjectionElem} {rTail : List ProjectionElem} {sc : ScalarInt}
@@ -21079,13 +21345,14 @@ theorem evalDerefPlaceRead_refines_evalRvalue_typed_proj_move {cx : SubplaceCtx}
     (hLoad : validateLoadedValue layouts localDecls (.move ⟨p, .deref :: rHead :: rTail⟩)
       (.scalar sc) = true)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p (rHead :: rTail) mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p (rHead :: rTail) mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.use (.move ⟨p, .deref :: rHead :: rTail⟩)) mem localDecls
         layouts = .ok (.scalar sc) locals mem' := by
   rw [evalRvalue_use_move_deref_eq_copy]
   exact evalDerefPlaceRead_refines_evalRvalue_typed_proj hRel hRest hPtr hTy hRes hEntry hPerm
     hRead hDecls hPtTy hAccTy hPtNotScalar hAccNotNever hAccNotUnitTuple hAccNotFnDef hScalar
-    hWidth hDerefAlign hAlign hResT hNoUnion hValid hLoad hNoTreeUB
+    hWidth hDerefAlign hAlign hResT hNoUnion hValid hLoad hNoTreeUB hCS
 
 /-- **Non-vacuity of the `move`-through-`Deref` refinement
 (`witness_trusted_deref_move_proj_typed`)**: on the projected witness frame of
@@ -21447,7 +21714,7 @@ theorem evalRvalue_copyForDeref_of_evalOperand {locals : List LocalSlot} {p : Na
     {rest : List ProjectionElem} {v : Value} {mem : Memory} {localDecls : List LocalDecl}
     {layouts : LayoutTable}
     (hOp : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
-      mem.callerLocals localDecls = .ok v locals)
+      mem.callerLocals localDecls mem.callStack = .ok v locals)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
       derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
     ∃ mem', evalRvalue locals (.copyForDeref ⟨p, .deref :: rest⟩) mem localDecls layouts =
@@ -21467,7 +21734,8 @@ theorem evalRvalue_copyForDeref_of_evalOperand {locals : List LocalSlot} {p : Na
 
 /-- **Anneal `Deref` read refines Stage-1 Trusted's `Rvalue.copyForDeref`
 (`evalDerefPlaceRead_refines_copyForDeref`)**: ties the intermediate pointer read of Section 4k's
-two-level `CopyForDeref` split (`resolvePlace_deref_deref_split`) directly to Stage-1 Trusted's
+two-level `CopyForDeref` split (`resolvePlace_deref_deref_split`) on a single-frame memory
+(`hCS : mem.callStack = []`) directly to Stage-1 Trusted's
 `evalRvalue (.copyForDeref ⟨p, .deref :: rest⟩)`. -/
 theorem evalDerefPlaceRead_refines_copyForDeref {cx : SubplaceCtx}
     {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
@@ -21481,12 +21749,14 @@ theorem evalDerefPlaceRead_refines_copyForDeref {cx : SubplaceCtx}
     (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
     (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v) (layouts : LayoutTable)
     (hNoTreeUB : 2 ≤ mem.borrows.length →
-      derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
+      derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false)
+    (hCS : mem.callStack = [] := by rfl) :
     ∃ mem', evalRvalue locals (.copyForDeref ⟨p, .deref :: rest⟩) mem [] layouts =
-      .ok v locals mem' :=
-  evalRvalue_copyForDeref_of_evalOperand
-    (evalDerefPlaceRead_refines_evalOperand hRel hRest hPtr hTy hRes hEntry hPerm hThin hRead
-      mem.globals layouts mem.callerLocals) hNoTreeUB
+      .ok v locals mem' := by
+  have hOp := evalDerefPlaceRead_refines_evalOperand hRel hRest hPtr hTy hRes hEntry hPerm hThin
+    hRead mem.globals layouts mem.callerLocals
+  rw [← hCS] at hOp
+  exact evalRvalue_copyForDeref_of_evalOperand hOp hNoTreeUB
 
 /-! ### Section 4l: Stage-1 Tree Borrows preconditions and `Retag` witnesses
 
@@ -21876,6 +22146,60 @@ Every public theorem of this module is in the axiom audit of `MiniRustSpec.Audit
 `[ADT-AUDIT-COVERAGE]`). -/
 
 /-! ### Section 5a: `V2026_06_01` Adapter Round-Trip, Linked Precedence & Call-Destination Lemmas -/
+
+/-- Non-`Deref` operand lists evaluate identically under any `callStack` (`evalOperands` ignores
+`callStack` unless an operand starts with `ProjectionElem.deref`). -/
+theorem evalOperands_eq_nil_callStack_of_nonDeref :
+    ∀ (locals : List LocalSlot) (args : List Operand) (borrows : List BorrowEntry)
+      (globals : List CapturedAllocation) (layouts : LayoutTable) (callerLocals : List LocalSlot)
+      (localDecls : List LocalDecl) (callStack : List SavedCallerFrame),
+      (∀ arg ∈ args, OperandNonDeref arg) →
+      evalOperands locals args borrows globals layouts callerLocals localDecls callStack =
+        evalOperands locals args borrows globals layouts callerLocals localDecls := by
+  intro locals args borrows globals layouts callerLocals localDecls callStack hND
+  induction args generalizing locals with
+  | nil => rfl
+  | cons op ops ih =>
+    have h1 := hND op (.head ops)
+    have h2 : ∀ a ∈ ops, OperandNonDeref a := fun a ha => hND a (.tail op ha)
+    simp only [evalOperands,
+      evalOperand_eq_nil_callStack_of_nonDeref locals op borrows globals layouts callerLocals
+        localDecls callStack h1]
+    cases evalOperand locals op borrows globals layouts callerLocals localDecls with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v locals' =>
+      dsimp only
+      rw [ih locals' h2]
+
+private theorem evalOperandState_below_refines_callStack
+    (slots slots' : List LocalSlotState) (locals : List LocalSlot) (op : Operand) (v : Value)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame)
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hND : OperandNonDeref op)
+    (hEval : evalOperandState slots op layouts globals = (.ok v, slots')) :
+    ∃ locals',
+      evalOperand locals op borrows globals layouts callerLocals [] callStack = .ok v locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  rw [evalOperand_eq_nil_callStack_of_nonDeref _ _ _ _ _ _ _ _ hND]
+  exact evalOperandState_below_refines slots slots' locals op v borrows globals layouts
+    callerLocals hRel hND hEval
+
+private theorem evalOperandsState_below_refines_callStack
+    (args : List Operand) (slots slots' : List LocalSlotState) (locals : List LocalSlot)
+    (avs : List Value) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame)
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hND : ∀ op ∈ args, OperandNonDeref op)
+    (hEval : evalOperandsState layouts globals slots args = some (avs, slots')) :
+    ∃ locals',
+      evalOperands locals args borrows globals layouts callerLocals [] callStack =
+        .ok avs locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  rw [evalOperands_eq_nil_callStack_of_nonDeref _ _ _ _ _ _ _ _ hND]
+  exact evalOperandsState_below_refines args slots slots' locals avs borrows globals layouts
+    callerLocals hRel hND hEval
 
 /-- Round-trip: every `LIntrinsicOp` mapped to `some kind` by `toRustIntrinsicKind?` is recovered
 by `fromRustIntrinsicKind?`. -/
@@ -22323,9 +22647,9 @@ theorem evalLoweredTerminator_call_unreachableUnchecked_ub_parity
           · rw [hCallTgt]
             simp [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
               extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall]
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots slotsAfterArgs
       s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+      s.memory.callStack hCorr.slots hArgsND hArgsEval
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .unreachableUnchecked hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -22395,9 +22719,9 @@ theorem evalLoweredTerminator_call_exactDiv_ub_parity
             split
             · rfl
             · simp [evalLIntrinsicValue, hSignSynth, hDivNone]
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots slotsAfterArgs
       s.frame.locals [.scalar lhs, .scalar rhs] s.memory.borrows env.globals env.layouts
-      s.memory.callerLocals hCorr.slots hArgsND hArgsEval
+      s.memory.callerLocals s.memory.callStack hCorr.slots hArgsND hArgsEval
     have hNoCallee := hCorr.noIntrinsicCallee "core::intrinsics::exact_div" typeArgs .exactDiv hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -22450,9 +22774,9 @@ theorem evalLoweredTerminator_call_abort_bypasses_cleanup
       ↓reduceIte, hArgsEval, hAcc, Option.isSome_none, Bool.false_and, hCallTgt,
       extractLCallTarget_V2026_06_01?, extractCalleeDefPath?, extractCalleeTypeArgs,
       lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall, hUnwOk]
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots slotsAfterArgs
       s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+      s.memory.callStack hCorr.slots hArgsND hArgsEval
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .abort hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -22505,9 +22829,9 @@ theorem evalLoweredTerminator_call_panicUnwind_cleanup
       extractLCallTarget_V2026_06_01?, extractCalleeDefPath?, extractCalleeTypeArgs,
       lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall, startPanic,
       cfgGoto, hcb, hCleanCb, Option.isSome_some]
-  · obtain ⟨locals2, hTOps, hRel2⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+  · obtain ⟨locals2, hTOps, hRel2⟩ := evalOperandsState_below_refines_callStack args slots slotsAfterArgs
       s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+      s.memory.callStack hCorr.slots hArgsND hArgsEval
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .panicUnwind hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -22560,9 +22884,9 @@ theorem evalLoweredTerminator_call_panicUnwind_unreachable_ub
             simp [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
               extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower,
               evalLoweredIntrinsicCall, startPanic]
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots slotsAfterArgs
       s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+      s.memory.callStack hCorr.slots hArgsND hArgsEval
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .panicUnwind hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -23069,10 +23393,19 @@ def LTerminator.MultiRefinable (table : LCallTable) : LTerminator → Prop
   | .unwindResume => True
   | .unwindTerminate => True
 
+@[simp]
+private theorem placeTouchesUnion_emptyLayoutTable
+    (localDecls : List LocalDecl) (p : Place) :
+    placeTouchesUnion localDecls emptyLayoutTable p = false := by
+  unfold placeTouchesUnion emptyLayoutTable
+  rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+  · rfl
+  · cases hd <;> cases localDecls <;> rfl
+
 /-- Multi-callee body correspondence for an active or linked body `(env, body, cm)` sharing crate
 `layouts` and `globals`: allows non-empty statements (`TrustedRun` on `stepMirFn rootCm` whenever
 `s.memory.activeCallee.getD rootCm = cm`) and `LTerminator.MultiRefinable table` (including
-projected non-`Deref` call destinations under `projCallArity`, `[adv ep2-A1]`). -/
+projected non-`Deref` call destinations under `projCallArity` and `projCallNoUnion`, `[adv ep2-A1]`). -/
 structure MultiBodyCorr (table : LCallTable) (rootCm : CapturedMir)
     (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
     (env : CfgEnv) (body : LBody) (cm : CapturedMir) : Prop where
@@ -23105,6 +23438,17 @@ structure MultiBodyCorr (table : LCallTable) (rootCm : CapturedMir)
       dest.projection ≠ [] →
       NoUninitExplosionOnProj env.arityOf dty dest.projection) := by
     intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction
+  projCallNoUnion :
+    (∀ (i : Nat) (b : LBlock) (func : Operand) (args : List Operand) (dest : Place)
+      (dty : Ty) (t : Option Nat) (u : UnwindAction),
+      body.blocks[i]? = some b →
+      b.terminator = .call func args dest dty t u →
+      placeTouchesUnion cm.localDecls cm.layouts dest = false) := by
+    intros
+    first
+    | exact placeTouchesUnion_emptyLayoutTable _ _
+    | simp [placeTouchesUnion_nil_proj, placeTouchesUnion_emptyLayoutTable]
+    | contradiction
 
 /-- Correspondence between Anneal's `LCallTable` and Trusted's `Memory.callees` / `traitImpls`. -/
 structure CallTableCorr (table : LCallTable) (rootCm : CapturedMir)
@@ -23129,6 +23473,11 @@ structure CallerFrameCorr (table : LCallTable) (rootCm : CapturedMir)
   slots : SlotsRefine SlotBelow cf.slotsAfterArgs tf.frame.locals
   destEq : cf.destination = tf.destination
   destOk : NoUninitExplosionOnProj cf.callerEnv.arityOf cf.destTy cf.destination.projection
+  destNoUnion :
+    placeTouchesUnion tf.callerBody.localDecls tf.callerBody.layouts tf.destination = false := by
+    first
+    | exact placeTouchesUnion_emptyLayoutTable _ _
+    | simp [placeTouchesUnion_nil_proj, placeTouchesUnion_emptyLayoutTable]
   unwindEq : cf.returnUnwind = tf.returnUnwind
   targetRel :
     match cf.returnTarget with
@@ -23164,8 +23513,8 @@ theorem CallStackCorr.length_eq {table : LCallTable} {rootCm : CapturedMir}
     | nil => nomatch h
     | cons _ tfs => exact congrArg Nat.succ (ih h.2)
 
-/-- Full multi-frame machine correspondence between Anneal's `LMultiFrameState` and Trusted's
-`MachineState` rooted at `rootCm`. -/
+/-- Full multi-frame machine correspondence between Anneal's borrow-free `LMultiFrameState` and
+Trusted's `MachineState` rooted at `rootCm` (including `borrows : s.memory.borrows = []`). -/
 structure MultiFrameStateCorr (table : LCallTable) (rootCm : CapturedMir)
     (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
     (st : LMultiFrameState) (s : MachineState) (activeCm : CapturedMir) : Prop where
@@ -23177,6 +23526,7 @@ structure MultiFrameStateCorr (table : LCallTable) (rootCm : CapturedMir)
   stack : CallStackCorr table rootCm sharedLayouts sharedGlobals st.stack s.memory.callStack
   globals : s.memory.globals = sharedGlobals
   tableCorr : CallTableCorr table rootCm sharedLayouts sharedGlobals s.memory.callees s.memory.traitImpls
+  borrows : s.memory.borrows = [] := by rfl
 
 /-- At `stmtIdx = tStmts.length` with `s.memory.activeCallee.getD rootCm = activeCm`, Trusted's
 `stepMirFn rootCm` evaluates the block's terminator in `(some activeCm)`. -/
@@ -23200,10 +23550,10 @@ theorem stepMirFn_multi_at_end_eq_evalTerminator {rootCm activeCm : CapturedMir}
 
 /-- **`unwindLCallStack` refines `Trusted.unwindFromCallStack`
 (`unwindLCallStack_refines_unwindFromCallStack`)**: across arbitrarily many `.continue_` caller
-frames, any successful `unwindLCallStack` transition matches `unwindFromCallStack` — resuming a
-catching `.cleanup cleanupBb` caller frame in `MultiFrameStateCorr` (restoring its protectors and
-`activeCallee`), halting with `.panic` at the root frame, or halting with `.abort` at a
-`.terminate` frame. -/
+frames, any successful `unwindLCallStack` transition on a borrow-free memory (`mem.borrows = []`)
+matches `unwindFromCallStack` — resuming a catching `.cleanup cleanupBb` caller frame in
+`MultiFrameStateCorr` (restoring its protectors and `activeCallee`), halting with `.panic` at the
+root frame, or halting with `.abort` at a `.terminate` frame. -/
 theorem unwindLCallStack_refines_unwindFromCallStack
     {table : LCallTable} {rootCm : CapturedMir}
     {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation} :
@@ -23213,6 +23563,7 @@ theorem unwindLCallStack_refines_unwindFromCallStack
       mem.globals = sharedGlobals →
       CallTableCorr table rootCm sharedLayouts sharedGlobals mem.callees mem.traitImpls →
       unwindLCallStack panicBb cfs = some res →
+      (hBorrows : mem.borrows = [] := by rfl) →
       match res with
       | .next st' =>
         ∃ s' activeCm',
@@ -23226,7 +23577,7 @@ theorem unwindLCallStack_refines_unwindFromCallStack
   intro panicBb cfs
   induction cfs generalizing panicBb with
   | nil =>
-    intro tfs mem res hStack _ _ hUnw
+    intro tfs mem res hStack _ _ hUnw _
     cases tfs with
     | nil =>
       simp only [unwindLCallStack, Option.some.injEq] at hUnw
@@ -23234,7 +23585,7 @@ theorem unwindLCallStack_refines_unwindFromCallStack
       rfl
     | cons _ _ => nomatch hStack
   | cons cf restCfs ih =>
-    intro tfs mem res hStack hGlob hTab hUnw
+    intro tfs mem res hStack hGlob hTab hUnw hBorrows
     cases tfs with
     | nil => nomatch hStack
     | cons tf restTfs =>
@@ -23260,7 +23611,7 @@ theorem unwindLCallStack_refines_unwindFromCallStack
                 callStack := restTfs
                 activeCallee := some tf.callerBody
                 activeProtectors := restoreCallerProtectors tf }
-              res hRest hGlob hTab hUnw
+              res hRest hGlob hTab hUnw hBorrows
         | cleanup cleanupBb =>
           rw [hU] at hUnw
           dsimp only at hUnw
@@ -23276,6 +23627,7 @@ theorem unwindLCallStack_refines_unwindFromCallStack
               let sNext : MachineState :=
                 { frame := { tf.frame with blockIdx := cleanupBb, stmtIdx := 0 }
                   memory := { mem with
+                              borrows := disableFramesAbove mem.borrows (length restTfs)
                               callStack := restTfs
                               activeCallee := some tf.callerBody
                               activeProtectors := restoreCallerProtectors tf } }
@@ -23290,6 +23642,7 @@ theorem unwindLCallStack_refines_unwindFromCallStack
                   stack := hRest
                   globals := hGlob
                   tableCorr := hTab
+                  borrows := by simp [sNext, hBorrows, disableFramesAbove]
                 }
 
 /-- Exceeding `table.maxCallDepth` reports `some (.done (.maxCallDepthExceeded st.bb table.maxCallDepth))`
@@ -23352,6 +23705,248 @@ theorem stepLoweredWithCallTable_diverging_return_ub
     | ub => rfl
     | unsupported => rfl
   · simp only [evalTerminator, hRet0, hTStack, hTDiv]
+    cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+      (length (tf :: restTfs)) (length s.frame.locals) <;> rfl
+
+private theorem Memory.with_borrows_nil_eq_self (mem : Memory) (hBorrows : mem.borrows = []) :
+    { mem with borrows := [] } = mem := by
+  rcases mem with ⟨a, b, borrows, d, e, f, g, h, i, j, k, l, m⟩
+  dsimp only at hBorrows
+  subst hBorrows
+  rfl
+
+private theorem writeReturnDestination_bare_of_nil_borrows
+    (locals locals' : List LocalSlot) (callerMem : Memory) (loc : Local) (t : LocalSlot)
+    (rv : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hBorrows : callerMem.borrows = [])
+    (hGetT : get? locals loc = some t)
+    (hTNotDead : t ≠ .dead)
+    (hSet : set? locals loc (.init rv) = some locals') :
+    writeReturnDestination locals callerMem ⟨loc, []⟩ rv localDecls layouts =
+      .ok locals' callerMem := by
+  have hMemId := Memory.with_borrows_nil_eq_self callerMem hBorrows
+  cases t with
+  | dead => exact False.elim (hTNotDead rfl)
+  | uninit | init _ =>
+    unfold writeReturnDestination
+    dsimp only
+    rw [hBorrows]
+    dsimp only [hasProtectedWriteConflict, invalidateConflictingBorrows]
+    rw [hMemId, hGetT]
+    dsimp only
+    rw [hSet]
+
+private theorem writeReturnDestination_proj_of_noUnion_nil_borrows
+    (locals locals' : List LocalSlot) (callerMem : Memory) (loc : Local)
+    (pHead : ProjectionElem) (pTail : List ProjectionElem)
+    (rv rootVal rootVal' : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hBorrows : callerMem.borrows = [])
+    (hNotDeref : pHead ≠ .deref)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, pHead :: pTail⟩ = false)
+    (hGetT : get? locals loc = some (.init rootVal))
+    (hEvW : evalValueProjWrite locals rootVal (pHead :: pTail) rv = .ok rootVal')
+    (hSet : set? locals loc (.init rootVal') = some locals') :
+    writeReturnDestination locals callerMem ⟨loc, pHead :: pTail⟩ rv localDecls layouts =
+      .ok locals' callerMem := by
+  have hMemId := Memory.with_borrows_nil_eq_self callerMem hBorrows
+  have hPop : fieldShellChainPopulated rootVal (pHead :: pTail) = true :=
+    fieldShellChainPopulated_of_evalValueProjWrite_ok locals (pHead :: pTail) rootVal rv
+      rootVal' hEvW
+  have hShell : ensureNestedFieldShells rootVal (pHead :: pTail) = rootVal :=
+    ensureNestedFieldShells_eq_self_of_populated (pHead :: pTail) rootVal hPop
+  have hWP : writeProjectedValue locals rootVal (pHead :: pTail) rv = .ok rootVal' :=
+    evalValueProjWrite_refines_writeProjectedValue (pHead :: pTail) locals rootVal rv
+      rootVal' hEvW
+  have hWriteL :
+      writeProjectedForLocal locals localDecls layouts loc rootVal (pHead :: pTail) rv =
+        .ok rootVal' :=
+    (writeProjectedForLocal_of_placeTouchesUnion_false locals localDecls layouts loc rootVal
+      (pHead :: pTail) rv hNoUnion).trans hWP
+  cases pHead with
+  | deref => exact False.elim (hNotDeref rfl)
+  | _ =>
+    unfold writeReturnDestination
+    dsimp only
+    rw [hGetT, hBorrows]
+    dsimp only [hasProtectedWriteConflict, invalidateConflictingBorrowsAtProj]
+    rw [hMemId, hShell, hWriteL]
+    dsimp only
+    rw [hSet]
+
+/-- Return-destination write refinement (`writeReturnDestination` vs `writePlaceState`): on a
+borrow-free caller memory whose destination does not touch a union (`placeTouchesUnion = false`),
+any successful `writePlaceState` on `caller.destination` refines `writeReturnDestination`. -/
+theorem writePlaceState_dest_below_refines_writeReturnDestination
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {slots slots' : List LocalSlotState}
+    {locals : List LocalSlot} {dst : Place} {dstTy : Ty} {rv : Value} {callerMem : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hDestOk : NoUninitExplosionOnProj arityOf dstTy dst.projection)
+    (hNoUnion : placeTouchesUnion localDecls layouts dst = false)
+    (hBorrows : callerMem.borrows = [])
+    (hWrite : writePlaceState arityOf slots dst dstTy rv = .ok slots') :
+    ∃ locals',
+      writeReturnDestination locals callerMem dst rv localDecls layouts =
+        .ok locals' callerMem ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  rcases dst with ⟨loc, _ | ⟨pHead, pTail⟩⟩
+  · unfold writePlaceState at hWrite
+    simp only [projectionHasDeref, get?_eq_getElem?] at hWrite
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+    · simp only [get?_eq_getElem?] at hA
+      rw [hA] at hWrite
+      nomatch hWrite
+    · simp only [get?_eq_getElem?] at hA hT
+      rw [hA] at hWrite
+      have hNotDead : a ≠ .dead := by
+        intro hD; subst hD; nomatch hWrite
+      have hTNotDead : t ≠ .dead := by
+        intro hTD; subst hTD
+        cases a with
+        | dead => exact hNotDead rfl
+        | _ => simp [SlotBelow] at hAT
+      have hSlots' : slots' = slots.set loc (.init rv) := by
+        cases a with
+        | dead => exact absurd rfl hNotDead
+        | uninit | init _ | partialShell _ =>
+          simp only [writeToFieldSlot, fieldSlotToLocalSlotState, SlotWriteResult.ok.injEq] at hWrite
+          exact hWrite.symm
+      subst hSlots'
+      have hLt : loc < locals.length := (List.getElem?_eq_some_iff.mp hT).1
+      have hSet : set? locals loc (.init rv) = some (locals.set loc (.init rv)) :=
+        set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+      exact ⟨locals.set loc (.init rv),
+        writeReturnDestination_bare_of_nil_borrows locals (locals.set loc (.init rv)) callerMem
+          loc t rv localDecls layouts hBorrows (by simp [get?_eq_getElem?, hT]) hTNotDead hSet,
+        SlotsRefine.set (a := .init rv) (t := .init rv) rfl loc hRel⟩
+  · have hSame := sameScalarLocals_of_slotBelow hRel
+    unfold writePlaceState at hWrite
+    cases hDeref : projectionHasDeref (pHead :: pTail) with
+    | true => rw [hDeref] at hWrite; nomatch hWrite
+    | false =>
+      rw [hDeref] at hWrite
+      dsimp only at hWrite
+      have hNotDeref : pHead ≠ .deref := by
+        intro hD; subst hD; simp [projectionHasDeref] at hDeref
+      rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨st, t, hGetS, hGetT, hAT⟩
+      · rw [hNoneS] at hWrite; nomatch hWrite
+      · rw [hGetS] at hWrite
+        cases st with
+        | dead => nomatch hWrite
+        | uninit =>
+          dsimp only at hWrite
+          have hImpossible :
+              ∀ next, writeToFieldSlot (slotsToTrustedLocals slots) arityOf .uninit
+                dstTy (pHead :: pTail) rv ≠ .ok next := by
+            intro next hOk
+            cases pHead with
+            | field _ _ => simp [writeToFieldSlot, hDestOk.1] at hOk
+            | downcast _ _ =>
+              rcases pTail with _ | ⟨p2, _⟩
+              · simp [writeToFieldSlot] at hOk
+              · cases p2 with
+                | field _ _ => simp [writeToFieldSlot, hDestOk.1] at hOk
+                | _ => simp [writeToFieldSlot] at hOk
+            | _ => simp [writeToFieldSlot] at hOk
+          split at hWrite
+          · rename_i next hOk
+            exact absurd hOk (hImpossible next)
+          · nomatch hWrite
+          · nomatch hWrite
+        | init existingVal =>
+          dsimp only at hWrite
+          cases t with
+          | init rootVal =>
+            cases hWT : writeToFieldSlot (slotsToTrustedLocals slots) arityOf
+                (.init existingVal) dstTy (pHead :: pTail) rv with
+            | ub => rw [hWT] at hWrite; nomatch hWrite
+            | unsupported => rw [hWT] at hWrite; nomatch hWrite
+            | ok nextSlot =>
+              rw [hWT] at hWrite
+              simp only [SlotWriteResult.ok.injEq] at hWrite
+              subst hWrite
+              obtain ⟨rootVal', hEvW, hNextB, hNotU⟩ :=
+                writeToFieldSlot_noExplode_below_refines hSame (pHead :: pTail).length
+                  (pHead :: pTail) (Nat.le_refl _) (.init existingVal) nextSlot rootVal dstTy rv
+                  hDestOk hAT hWT
+              have hLt : loc < locals.length :=
+                (List.getElem?_eq_some_iff.mp (by simpa [get?_eq_getElem?] using hGetT)).1
+              have hSet : set? locals loc (.init rootVal') = some (locals.set loc (.init rootVal')) :=
+                set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+              have hSB : SlotBelow (fieldSlotToLocalSlotState nextSlot) (.init rootVal') := by
+                cases nextSlot with
+                | uninit => exact absurd rfl hNotU
+                | init v => exact hNextB
+                | nested var adt disc fs =>
+                  simp only [fieldSlotToLocalSlotState]
+                  cases hTry : PartialAggregate.tryIntoValue? ⟨var, adt, disc, fs⟩ with
+                  | none => exact hNextB
+                  | some fullVal =>
+                    cases rootVal' with
+                    | aggregate tv tfs =>
+                      obtain ⟨hV, hBs⟩ := hNextB
+                      obtain ⟨_, vals, hF, rfl⟩ :=
+                        (tryIntoValue?_eq_some_iff ⟨var, adt, disc, fs⟩ fullVal).mp hTry
+                      simp only at hF
+                      subst hF
+                      have hEq := FieldListBelow.eq_of_map_init hBs
+                      subst hEq
+                      show Value.aggregate _ vals = .aggregate tv vals
+                      rw [← hV]; rfl
+                    | _ => exact absurd hNextB id
+              exact ⟨locals.set loc (.init rootVal'),
+                writeReturnDestination_proj_of_noUnion_nil_borrows locals
+                  (locals.set loc (.init rootVal')) callerMem loc pHead pTail rv rootVal rootVal'
+                  localDecls layouts hBorrows hNotDeref hNoUnion hGetT hEvW hSet,
+                SlotsRefine.set hSB loc hRel⟩
+          | _ => simp [SlotBelow] at hAT
+        | partialShell shell =>
+          dsimp only at hWrite
+          cases t with
+          | init rootVal =>
+            cases hWT : writeToFieldSlot (slotsToTrustedLocals slots) arityOf
+                shell.toFieldSlot dstTy (pHead :: pTail) rv with
+            | ub => rw [hWT] at hWrite; nomatch hWrite
+            | unsupported => rw [hWT] at hWrite; nomatch hWrite
+            | ok nextSlot =>
+              rw [hWT] at hWrite
+              simp only [SlotWriteResult.ok.injEq] at hWrite
+              subst hWrite
+              obtain ⟨rootVal', hEvW, hNextB, hNotU⟩ :=
+                writeToFieldSlot_noExplode_below_refines hSame (pHead :: pTail).length
+                  (pHead :: pTail) (Nat.le_refl _) shell.toFieldSlot nextSlot rootVal dstTy rv
+                  hDestOk hAT hWT
+              have hLt : loc < locals.length :=
+                (List.getElem?_eq_some_iff.mp (by simpa [get?_eq_getElem?] using hGetT)).1
+              have hSet : set? locals loc (.init rootVal') = some (locals.set loc (.init rootVal')) :=
+                set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+              have hSB : SlotBelow (fieldSlotToLocalSlotState nextSlot) (.init rootVal') := by
+                cases nextSlot with
+                | uninit => exact absurd rfl hNotU
+                | init v => exact hNextB
+                | nested var adt disc fs =>
+                  simp only [fieldSlotToLocalSlotState]
+                  cases hTry : PartialAggregate.tryIntoValue? ⟨var, adt, disc, fs⟩ with
+                  | none => exact hNextB
+                  | some fullVal =>
+                    cases rootVal' with
+                    | aggregate tv tfs =>
+                      obtain ⟨hV, hBs⟩ := hNextB
+                      obtain ⟨_, vals, hF, rfl⟩ :=
+                        (tryIntoValue?_eq_some_iff ⟨var, adt, disc, fs⟩ fullVal).mp hTry
+                      simp only at hF
+                      subst hF
+                      have hEq := FieldListBelow.eq_of_map_init hBs
+                      subst hEq
+                      show Value.aggregate _ vals = .aggregate tv vals
+                      rw [← hV]; rfl
+                    | _ => exact absurd hNextB id
+              exact ⟨locals.set loc (.init rootVal'),
+                writeReturnDestination_proj_of_noUnion_nil_borrows locals
+                  (locals.set loc (.init rootVal')) callerMem loc pHead pTail rv rootVal rootVal'
+                  localDecls layouts hBorrows hNotDeref hNoUnion hGetT hEvW hSet,
+                SlotsRefine.set hSB loc hRel⟩
+          | _ => simp [SlotBelow] at hAT
 
 /-- Helper: return-pop refinement when `evalLoweredTerminator` yields `some (.returned v)` in
 `stepLoweredWithCallTable`. -/
@@ -23407,9 +24002,14 @@ private theorem returnPop_refines_trusted
     | nil =>
       simp only [Option.some.injEq] at hPop
       subst hPop
+      have hMemId := Memory.with_borrows_nil_eq_self s.memory hCorr.borrows
       dsimp only [sEnd]
       rw [hStepEnd]
-      simp [evalTerminator, get?_eq_getElem?, hRoot0, hTS]
+      unfold evalTerminator
+      dsimp only
+      rw [get?_eq_getElem?, hRoot0, hCorr.borrows, hasFrameDeallocProtectorConflict_nil_borrows]
+      dsimp only [disableFrameBorrows]
+      rw [hMemId, hTS]
     | cons _ _ => rw [hTS] at hCorrStack; nomatch hCorrStack
   | cons caller restStack =>
     dsimp only at hPop
@@ -23446,25 +24046,45 @@ private theorem returnPop_refines_trusted
                 obtain rfl := cfgGoto_eq_some hG
                 simp only [Option.some.injEq] at hPop
                 subst hPop
-                obtain ⟨updatedCallerLocals, hWPV, hRelCaller⟩ :=
-                  writePlaceState_dest_below_refines (borrows := s.memory.borrows)
-                    hCF.slots hCF.destOk hWr
-                rw [hCF.destEq] at hWPV
+                let callerMem : Memory :=
+                  { s.memory with
+                    borrows :=
+                      disableFrameBorrows s.memory.borrows (length (tf :: restTfs))
+                        (length locals1)
+                    callStack := restTfs
+                    activeCallee := some tf.callerBody
+                    activeProtectors := restoreCallerProtectors tf }
+                have hCallerBorrows : callerMem.borrows = [] := by
+                  simp [callerMem, hCorr.borrows, disableFrameBorrows]
+                have hDestNoUnion' :
+                    placeTouchesUnion tf.callerBody.localDecls tf.callerBody.layouts
+                      caller.destination = false := by
+                  rw [hCF.destEq]
+                  exact hCF.destNoUnion
+                obtain ⟨updatedCallerLocals, hWRD, hRelCaller⟩ :=
+                  writePlaceState_dest_below_refines_writeReturnDestination
+                    (callerMem := callerMem)
+                    (localDecls := tf.callerBody.localDecls)
+                    (layouts := tf.callerBody.layouts)
+                    hCF.slots hCF.destOk hDestNoUnion' hCallerBorrows hWr
+                rw [hCF.destEq] at hWRD
                 let sNext : MachineState :=
                   { frame :=
                       { tf.frame with
                         blockIdx := tf.returnTarget
                         stmtIdx := 0
                         locals := updatedCallerLocals }
-                    memory :=
-                      { s.memory with
-                        callStack := restTfs
-                        activeCallee := some tf.callerBody
-                        activeProtectors := restoreCallerProtectors tf } }
+                    memory := callerMem }
+                have hNoDeallocConf :
+                    hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+                      (length (tf :: restTfs)) (length locals1) = false := by
+                  rw [hCorr.borrows]
+                  exact hasFrameDeallocProtectorConflict_nil_borrows _ _ _
                 refine ⟨sNext, tf.callerBody, Or.inl ?_, ?_⟩
                 · dsimp only [sEnd]
                   rw [hStepEnd]
-                  simp [evalTerminator, get?_eq_getElem?, hRoot0, hTS, hNotDiv, hWPV, sNext]
+                  simp only [evalTerminator, get?_eq_getElem?, hRoot0, hTS, hNoDeallocConf,
+                    hNotDiv, callerMem, hWRD, sNext]
                 · exact {
                     block := hTFRet
                     stmt := rfl
@@ -23474,6 +24094,7 @@ private theorem returnPop_refines_trusted
                     stack := hRestCorr
                     globals := hCorr.globals
                     tableCorr := hCorr.tableCorr
+                    borrows := hCallerBorrows
                   }
 
 /-- Single-step refinement postcondition for `stepLoweredWithCallTable`.
@@ -23528,7 +24149,7 @@ def MultiOutcomeRefines (table : LCallTable) (rootCm : CapturedMir)
 /-- **`stepLoweredWithCallTable` refines `TrustedRun rootCm` (`stepLoweredWithCallTable_refines_trusted`)**:
 every single-block step of `stepLoweredWithCallTable` is matched by a fault-free `TrustedRun rootCm`
 across the block's statements followed by the matching `stepMirFn rootCm` transition — pushing a
-normal or diverging callee frame, popping a returning callee frame (`writePlaceValue` +
+normal or diverging callee frame, popping a returning callee frame (`writeReturnDestination` +
 `restoreCallerProtectors`), unwinding across caller frames (`unwindFromCallStack`), jumping within
 the active frame, or halting with `.retNormal` / `.retOutcome .panic` / `.retOutcome .abort`; an
 explicit `maxCallDepthExceeded` stop is a corresponding checkpoint whose Trusted call stack already
@@ -23574,6 +24195,7 @@ theorem stepLoweredWithCallTable_refines_trusted
           intro pbb hUnw hEqMatch
           have hURef := unwindLCallStack_refines_unwindFromCallStack pbb st.stack
             s.memory.callStack s.memory mStep hCorr.stack hCorr.globals hCorr.tableCorr hUnw
+            hCorr.borrows
           cases mStep with
           | next st' =>
             obtain ⟨sNext, activeCm', hRunNext, hCorrNext⟩ := hURef
@@ -23628,9 +24250,9 @@ theorem stepLoweredWithCallTable_refines_trusted
                 · obtain rfl := cfgGoto_eq_some hSw
                   simp only [Option.some.injEq] at h
                   subst h
-                  obtain ⟨locals', hTOp, hRel'⟩ := evalOperandState_below_refines slots1 slots'
-                    locals1 discr (.scalar sc) s.memory.borrows st.activeEnv.globals
-                    st.activeEnv.layouts s.memory.callerLocals hRel1 hRef hOp
+                  obtain ⟨locals', hTOp, hRel'⟩ := evalOperandState_below_refines_callStack slots1
+                    slots' locals1 discr (.scalar sc) s.memory.borrows st.activeEnv.globals
+                    st.activeEnv.layouts s.memory.callerLocals s.memory.callStack hRel1 hRef hOp
                   let tgt := targetForValue targets.values targets.targets targets.otherwise sc.bits
                   let sNext : MachineState := { s with frame := ⟨tgt, 0, locals'⟩ }
                   have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
@@ -23688,9 +24310,9 @@ theorem stepLoweredWithCallTable_refines_trusted
             simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at hEvT
             split at hEvT
             · rename_i sc slots' hOp
-              obtain ⟨locals', hTOp, hRel'⟩ := evalOperandState_below_refines slots1 slots'
-                locals1 cond (.scalar sc) s.memory.borrows st.activeEnv.globals
-                st.activeEnv.layouts s.memory.callerLocals hRel1 hRef hOp
+              obtain ⟨locals', hTOp, hRel'⟩ := evalOperandState_below_refines_callStack slots1
+                slots' locals1 cond (.scalar sc) s.memory.borrows st.activeEnv.globals
+                st.activeEnv.layouts s.memory.callerLocals s.memory.callStack hRel1 hRef hOp
               split at hEvT
               · rename_i hBool
                 obtain ⟨bits, sz⟩ := sc
@@ -23844,6 +24466,9 @@ theorem stepLoweredWithCallTable_refines_trusted
             · rw [hPN]; trivial
             · exact hCorr.body.projCallArity st.bb block func args dest destTy target
                 unwind hb hT hPN
+          have hDestNoUnion :
+              placeTouchesUnion activeCm.localDecls activeCm.layouts dest = false :=
+            hCorr.body.projCallNoUnion st.bb block func args dest destTy target unwind hb hT
           rw [hT] at h hRef hStepEnd
           obtain ⟨hArgsND, _hDestNoDeref, defPath, typeArgs, layoutIdx, rfl, hCallDisj⟩ := hRef
           rw [hCorr.body.callTargetLinked] at h
@@ -23889,9 +24514,10 @@ theorem stepLoweredWithCallTable_refines_trusted
                               obtain ⟨calleeCm, hTCm, hLocCnt, hCalleeBody⟩ :=
                                 hCorr.tableCorr.linked defPath typeArgs callee hLk
                               obtain ⟨locals2, hTOps, hRel2⟩ :=
-                                evalOperandsState_below_refines args slots1 slots2 locals1 avs
-                                  s.memory.borrows st.activeEnv.globals st.activeEnv.layouts
-                                  s.memory.callerLocals hRel1 hArgsND hArgsEval
+                                evalOperandsState_below_refines_callStack args slots1 slots2
+                                  locals1 avs s.memory.borrows st.activeEnv.globals
+                                  st.activeEnv.layouts s.memory.callerLocals s.memory.callStack
+                                  hRel1 hArgsND hArgsEval
                               rw [hCorr.body.envLayouts, hCorr.body.envGlobals] at hTOps
                               have hInitRel : SlotsRefine SlotBelow
                                   (initLCalleeSlots callee.localCount avs)
@@ -23920,11 +24546,13 @@ theorem stepLoweredWithCallTable_refines_trusted
                                     slots := hRel2
                                     destEq := rfl
                                     destOk := hDestOk
+                                    destNoUnion := hDestNoUnion
                                     unwindEq := rfl
                                     targetRel := ⟨rfl, rfl⟩
                                   }, hCorr.stack⟩
                                   globals := hCorr.globals
                                   tableCorr := hCorr.tableCorr
+                                  borrows := hCorr.borrows
                                 }
                               | none =>
                                 let sNext := pushDivergingCalleeFrame sEnd activeCm locals2 dest
@@ -23947,11 +24575,13 @@ theorem stepLoweredWithCallTable_refines_trusted
                                     slots := hRel2
                                     destEq := rfl
                                     destOk := hDestOk
+                                    destNoUnion := hDestNoUnion
                                     unwindEq := rfl
                                     targetRel := rfl
                                   }, hCorr.stack⟩
                                   globals := hCorr.globals
                                   tableCorr := hCorr.tableCorr
+                                  borrows := hCorr.borrows
                                 }
           · -- Inline intrinsic (unlinked in `table`)
             cases hLk : table.lookup defPath typeArgs with
@@ -23989,9 +24619,9 @@ theorem stepLoweredWithCallTable_refines_trusted
                         rename_i hIntrEval_dummy1 hIntrEval_dummy2 hIntrEval_dummy3
                         have hIntrEval := hCallEv
                         obtain ⟨locals2, hTOps, hRel2⟩ :=
-                          evalOperandsState_below_refines args slots1 slots2 locals1 avs
+                          evalOperandsState_below_refines_callStack args slots1 slots2 locals1 avs
                             s.memory.borrows st.activeEnv.globals st.activeEnv.layouts
-                            s.memory.callerLocals hRel1 hArgsND hArgsEval
+                            s.memory.callerLocals s.memory.callStack hRel1 hArgsND hArgsEval
                         rw [hCorr.body.envLayouts, hCorr.body.envGlobals] at hTOps
                         have hNoCallee := hCorr.tableCorr.unlinkedIntrinsic defPath typeArgs op
                           hLk hLowerOp
@@ -25663,9 +26293,9 @@ theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
               extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower]
             rw [evalLoweredIntrinsicCall_of_value hVal, hUb, hNone]
             split <;> rfl
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
-      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots
+      slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
+      s.memory.callerLocals s.memory.callStack hCorr.slots hArgsND hArgsEval
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs op hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -26295,9 +26925,9 @@ theorem evalLoweredTerminator_call_resolved_value_intrinsic_ub_parity
     (evalLoweredTerminator_call_value_intrinsic_fault_parity hb hT hCallTgt hUb hSupp hVal
       hLayouts hDecls hCorr hArgsND hArgsEval hNone span).1
   refine ⟨hAnnealNone, ?_⟩
-  obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
-    s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-    hCorr.slots hArgsND hArgsEval
+  obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines_callStack args slots
+    slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
+    s.memory.callerLocals s.memory.callStack hCorr.slots hArgsND hArgsEval
   have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs op hLower
   have hResTgt :
       ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -26466,9 +27096,14 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
             · rfl
             · simp only [evalLoweredIntrinsicCall, hMemNone]; split <;> rfl
             · simp only [evalLoweredIntrinsicCall, hMemNone]; split <;> rfl
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
-      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots
+      slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
+      s.memory.callerLocals hCorr.slots hArgsND hArgsEval
+    have hTOpsCS :
+        evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
+            s.memory.callerLocals [] s.memory.callStack = .ok avs locals2 :=
+      (evalOperands_eq_nil_callStack_of_nonDeref _ _ _ _ _ _ _ s.memory.callStack hArgsND).trans
+        hTOps
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs op hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -26478,7 +27113,7 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hCorr.globals, hTOps, hNoCallee, isDirectExactDivTarget, hNotEx,
+        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, isDirectExactDivTarget, hNotEx,
         evalDirectRustIntrinsic?, hNotRust]⟩
 
 /-- **Target-presence boundary Part 2 (`evalLoweredTerminator_call_value_without_target_extCall`)**:
@@ -26537,9 +27172,14 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
               extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower]
             rw [evalLoweredIntrinsicCall_of_value hVal]
             split <;> rfl
-  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
-      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
-      hCorr.slots hArgsND hArgsEval
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots
+      slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
+      s.memory.callerLocals hCorr.slots hArgsND hArgsEval
+    have hTOpsCS :
+        evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
+            s.memory.callerLocals [] s.memory.callStack = .ok avs locals2 :=
+      (evalOperands_eq_nil_callStack_of_nonDeref _ _ _ _ _ _ _ s.memory.callStack hArgsND).trans
+        hTOps
     have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs op hLower
     have hResTgt :
         ∀ (decls : List LocalDecl) (lays : LayoutTable),
@@ -26549,7 +27189,7 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hCorr.globals, hTOps, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
 
 /-! #### 5g.2: `three_way_compare` `Ordering` ADT Encoding (`orderingVariant?`, `intrinsic.rs:108-136`) -/
 
@@ -28175,7 +28815,8 @@ above a catching `.cleanup cleanupBb` frame `(cfCatch, tfCatch)`:
    which evaluated `func` and `args` — including `Operand.move` deinitializations — before pushing
    the callee and never mutated caller frames below the top frame);
 2. `Trusted.unwindFromCallStack` pops `tPre` and resumes `tfCatch` at `cleanupBb` with
-   `locals = tfCatch.frame.locals` and `activeProtectors = restoreCallerProtectors tfCatch`. -/
+   `locals = tfCatch.frame.locals`, `borrows = disableFramesAbove mem.borrows (length restTfs)`,
+   and `activeProtectors = restoreCallerProtectors tfCatch`. -/
 theorem unwindLCallStack_cleanup_exact :
     ∀ (pre : List LCallerFrame) (tPre : List SavedCallerFrame)
       (cfCatch : LCallerFrame) (tfCatch : SavedCallerFrame)
@@ -28199,6 +28840,7 @@ theorem unwindLCallStack_cleanup_exact :
         .running {
           frame := { tfCatch.frame with blockIdx := cleanupBb, stmtIdx := 0 }
           memory := { mem with
+                      borrows := disableFramesAbove mem.borrows (length restTfs)
                       callStack := restTfs
                       activeCallee := some tfCatch.callerBody
                       activeProtectors := restoreCallerProtectors tfCatch } }

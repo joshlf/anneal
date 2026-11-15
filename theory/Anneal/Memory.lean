@@ -276,11 +276,12 @@ theorem stepForeignWriteByteRange_none_of_hasProtectedWriteConflict
     (h_write_len : Nat.beq writeRangeLen 0 = false)
     (h_conflict :
       hasProtectedWriteConflict [entry] activeProtectors targetLocal none
-        writeProj writeRangeOff writeRangeLen = true) :
+        writeProj writeRangeOff writeRangeLen entry.targetFrameDepth = true) :
     stepForeignWriteByteRange { activeLifetimes := activeProtectors }
       (BorrowEntry.toByteRangePerm entry) targetLocal
       writeRangeOff writeRangeLen = none := by
   unfold hasProtectedWriteConflict at h_conflict
+  simp only [Nat.beq_refl, Bool.true_and] at h_conflict
   rw [borrowEntryOverlapsWrite_eq_byteRangesOverlapBool
     entry writeProj writeRangeOff writeRangeLen h_entry_len h_write_len,
     isBorrowProtected_eq_isProtected] at h_conflict
@@ -313,8 +314,9 @@ theorem updateBorrowPermAtProj_non_overlapping_unchanged
     (h_disjoint :
       borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = false) :
     updateBorrowPermAtProj entry targetLocal none writeProj
-      writeRangeOff writeRangeLen = entry := by
+      writeRangeOff writeRangeLen entry.targetFrameDepth = entry := by
   unfold updateBorrowPermAtProj
+  simp only [Nat.beq_refl, Bool.true_and]
   cases Nat.beq entry.targetLocal targetLocal <;>
     simp [h_disjoint, treeBorrowWriterRelatedness]
 
@@ -329,9 +331,10 @@ theorem stepForeignWriteByteRange_agrees_with_updateBorrowPermAtProj
       (BorrowEntry.toByteRangePerm entry) targetLocal writeRangeOff writeRangeLen =
       some (BorrowEntry.toByteRangePerm
         (updateBorrowPermAtProj entry targetLocal none writeProj
-          writeRangeOff writeRangeLen)) := by
+          writeRangeOff writeRangeLen entry.targetFrameDepth)) := by
   rw [isBorrowProtected_eq_isProtected] at h_unprot
   unfold stepForeignWriteByteRange updateBorrowPermAtProj
+  simp only [Nat.beq_refl, Bool.true_and]
   rw [byteRangeOverlapsWrite_toByteRangePerm,
     borrowEntryOverlapsWrite_eq_byteRangesOverlapBool
       entry writeProj writeRangeOff writeRangeLen h_entry_len h_write_len]
@@ -357,10 +360,11 @@ theorem disjoint_byte_range_operational_non_interference
       (BorrowEntry.toByteRangePerm entry) targetLocal writeRangeOff writeRangeLen =
       some (BorrowEntry.toByteRangePerm entry) ∧
     updateBorrowPermAtProj entry targetLocal none writeProj
-      writeRangeOff writeRangeLen = entry := by
+      writeRangeOff writeRangeLen entry.targetFrameDepth = entry := by
   refine ⟨disjoint_byte_range_non_interference _ _ _ _ _ h_disjoint, ?_⟩
   rw [byteRangeOverlapsWrite_toByteRangePerm] at h_disjoint
   unfold updateBorrowPermAtProj
+  simp only [Nat.beq_refl, Bool.true_and]
   rw [borrowEntryOverlapsWrite_eq_byteRangesOverlapBool
     entry writeProj writeRangeOff writeRangeLen h_entry_len h_write_len]
   cases h_loc : Nat.beq entry.targetLocal targetLocal

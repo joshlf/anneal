@@ -2119,4 +2119,427 @@ def evalSliceSizeOfVal
     | true => .none
     | false => .some ⟨totalBytes, 8⟩
 
+/-!
+## Pure IEEE-754 `binary32` / `binary64` numeric casts
+
+`CastKind.floatToInt`, `CastKind.intToFloat`, and `CastKind.floatToFloat` on
+`f32` / `f64` operate on raw bit patterns (`ScalarInt.bits`) with exact
+rational decoding (`decodeBits`) and correctly rounded `roundTiesToEven`
+re-encoding (`roundRatioTiesToEven`). Every definition below is a structural or
+`Decidable`-instance computation over `Nat` / `Int` (no host `Float`, no
+`extern`, no `Classical.choice`), so concrete casts reduce in the Lean kernel.
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "Casting from a float to an integer will round the float towards zero
+> - NaN will return 0
+> - Values larger than the maximum integer value, including INFINITY, will
+>   saturate to the maximum value of the integer type.
+> - Values smaller than the minimum integer value, including NEG_INFINITY, will
+>   saturate to the minimum value of the integer type."
+>
+> "Casting from an integer to float will produce the closest possible float *
+> - if necessary, rounding is according to roundTiesToEven mode ***
+> - on overflow, infinity (of the same sign as the input) is produced"
+>
+> "Casting from an f32 to an f64 is perfect and lossless"
+>
+> "Casting from an f64 to an f32 will produce the closest possible f32 **
+> - if necessary, rounding is according to roundTiesToEven mode ***
+> - on overflow, infinity (of the same sign as the input) is produced"
+>
+> "*** as defined in IEEE 754-2008 §4.3.1: pick the nearest floating point
+> number, preferring the one with an even least significant digit if exactly
+> halfway between two floating point numbers."
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The following rules apply when a NaN value is returned from an arithmetic
+> operation:
+> - The result has a non-deterministic sign.
+> - The quiet bit and payload are non-deterministically chosen from the
+>   following set of options:
+>   - Preferred NaN: The quiet bit is set and the payload is all-zero.
+>   - Quieting NaN propagation: The quiet bit is set and the payload is copied
+>     from any input operand that is a NaN. If the inputs and outputs do not
+>     have the same payload size (i.e., for as casts), then
+>     - If the output is smaller than the input, low-order bits of the payload
+>       get dropped.
+>     - If the output is larger than the input, the payload gets filled up with
+>       0s in the low-order bits."
+
+Modeling choice: Rust leaves the sign, quiet bit, and payload of a NaN result
+non-deterministic. `evalFloatToFloatRoundTiesToEven` deterministically picks
+one admissible option, "Quieting NaN propagation" with the input's sign (the
+`rustc_apfloat` / Miri `convert` rule), so a proof about this model covers that
+choice only, not every NaN bit pattern Rust permits.
+-/
+
+/--
+The IEEE-754 interchange formats of Rust's `f32` (`binary32`) and `f64`
+(`binary64`).
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+-/
+inductive IeeeFormat : Type where
+  /-- IEEE-754 `binary32` (Rust `f32`). -/
+  | binary32 : IeeeFormat
+  /-- IEEE-754 `binary64` (Rust `f64`). -/
+  | binary64 : IeeeFormat
+deriving DecidableEq
+
+namespace IeeeFormat
+
+/-- Total bit width (`32` / `64`). -/
+def width : IeeeFormat → Nat
+  | .binary32 => 32
+  | .binary64 => 64
+
+/-- Exponent field width (`8` / `11`). -/
+def exponentBits : IeeeFormat → Nat
+  | .binary32 => 8
+  | .binary64 => 11
+
+/-- Trailing significand (fraction) field width (`23` / `52`). -/
+def fractionBits : IeeeFormat → Nat
+  | .binary32 => 23
+  | .binary64 => 52
+
+/-- Exponent bias (`127` / `1023`). -/
+def bias : IeeeFormat → Nat
+  | .binary32 => 127
+  | .binary64 => 1023
+
+/-- Byte width of the corresponding Rust scalar (`4` / `8`). -/
+def byteWidth : IeeeFormat → Nat
+  | .binary32 => 4
+  | .binary64 => 8
+
+/-- Minimum normal unbiased exponent (`1 - bias`). -/
+def minExponent (f : IeeeFormat) : Int := 1 - (f.bias : Int)
+
+/-- Maximum finite unbiased exponent (`bias`). -/
+def maxExponent (f : IeeeFormat) : Int := (f.bias : Int)
+
+end IeeeFormat
+
+/-- IEEE-754 `binary32` bit pattern (Rust `f32::to_bits`). -/
+abbrev F32Bits : Type := BitVec 32
+
+/-- IEEE-754 `binary64` bit pattern (Rust `f64::to_bits`). -/
+abbrev F64Bits : Type := BitVec 64
+
+/-- Raw sign / biased-exponent / fraction fields of an IEEE-754 bit pattern. -/
+structure FloatComponents : Type where
+  /-- Sign bit. -/
+  neg : Bool
+  /-- Biased exponent field. -/
+  exponent : Nat
+  /-- Trailing significand field. -/
+  fraction : Nat
+deriving DecidableEq
+
+/-- Split a bit pattern into its sign, biased exponent, and fraction fields. -/
+def unpackBits (f : IeeeFormat) (bits : Nat) : FloatComponents :=
+  { neg := Nat.beq ((bits / 2 ^ (f.width - 1)) % 2) 1
+    exponent := (bits / 2 ^ f.fractionBits) % 2 ^ f.exponentBits
+    fraction := bits % 2 ^ f.fractionBits }
+
+/-- Exact classification of an IEEE-754 bit pattern. Finite nonzero values carry
+the exact rational magnitude `num / den` (`den` a power of two). -/
+inductive FloatKind : Type where
+  /-- Signed zero. -/
+  | zero (neg : Bool) : FloatKind
+  /-- Finite nonzero value `(-1)^neg * num / den`. -/
+  | finite (neg : Bool) (num den : Nat) : FloatKind
+  /-- Signed infinity. -/
+  | inf (neg : Bool) : FloatKind
+  /-- NaN with sign, quiet bit, and full fraction payload. -/
+  | nan (neg : Bool) (quiet : Bool) (payload : Nat) : FloatKind
+deriving DecidableEq
+
+/-- Scale the rational `n / d` by `2 ^ e`. -/
+def powScale (n d : Nat) : Int → Nat × Nat
+  | .ofNat k => (n * 2 ^ k, d)
+  | .negSucc k => (n, d * 2 ^ (k + 1))
+
+/--
+Exact decoding of an IEEE-754 bit pattern: all-ones exponent fields are
+infinities (zero fraction) and NaNs (quiet bit = most significant fraction
+bit); zero exponent fields are signed zeros and subnormals
+`fraction * 2^(minExponent - fractionBits)`; every other exponent field is the
+normal value `(2^fractionBits + fraction) * 2^(exponent - bias - fractionBits)`.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+-/
+def decodeBits (f : IeeeFormat) (bits : Nat) : FloatKind :=
+  let c := unpackBits f bits
+  if c.exponent = 2 ^ f.exponentBits - 1 then
+    if c.fraction = 0 then .inf c.neg
+    else .nan c.neg (Nat.beq ((c.fraction / 2 ^ (f.fractionBits - 1)) % 2) 1) c.fraction
+  else if c.exponent = 0 then
+    if c.fraction = 0 then .zero c.neg
+    else
+      let nd := powScale c.fraction 1 (f.minExponent - (f.fractionBits : Int))
+      .finite c.neg nd.1 nd.2
+  else
+    let nd := powScale (2 ^ f.fractionBits + c.fraction) 1
+      ((c.exponent : Int) - (f.bias : Int) - (f.fractionBits : Int))
+    .finite c.neg nd.1 nd.2
+
+/--
+Nearest integer to `n / d`, ties to even (IEEE 754-2008 `roundTiesToEven` on
+the integer quotient).
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "*** as defined in IEEE 754-2008 §4.3.1: pick the nearest floating point
+> number, preferring the one with an even least significant digit if exactly
+> halfway between two floating point numbers."
+-/
+def roundQuotientTiesToEven (n d : Nat) : Nat :=
+  let q := n / d
+  let r := n % d
+  if r * 2 > d ∨ (r * 2 = d ∧ q % 2 = 1) then q + 1 else q
+
+/-- `floor (log2 (n / d))` for nonzero `n`, `d`. -/
+def ratioExponent (n d : Nat) : Int :=
+  if d ≤ n then ((n / d).log2 : Int)
+  else
+    let k := (d / n).log2
+    if d ≤ n * 2 ^ k then -(k : Int) else -((k : Int) + 1)
+
+/-- Bit pattern of a signed zero. -/
+def zeroBits (f : IeeeFormat) (neg : Bool) : Nat := if neg then 2 ^ (f.width - 1) else 0
+
+/-- Bit pattern with the given sign, biased exponent, and fraction. -/
+def encodeBits (f : IeeeFormat) (neg : Bool) (exponent fraction : Nat) : Nat :=
+  zeroBits f neg + exponent * 2 ^ f.fractionBits + fraction
+
+/-- Bit pattern of a signed infinity. -/
+def infBits (f : IeeeFormat) (neg : Bool) : Nat :=
+  encodeBits f neg (2 ^ f.exponentBits - 1) 0
+
+/-- Bit pattern of the preferred (canonical positive quiet) NaN. -/
+def preferredNaNBits (f : IeeeFormat) : Nat :=
+  encodeBits f false (2 ^ f.exponentBits - 1) (2 ^ (f.fractionBits - 1))
+
+/--
+Correctly rounded (`roundTiesToEven`) encoding of the exact rational
+`(-1)^neg * n / d` in format `f`: gradual underflow comes from clamping the
+working exponent to `minExponent` (subnormals), a rounding carry-out bumps the
+exponent, and overflow produces the infinity of the same sign. A zero
+magnitude yields the zero of sign `neg`. The `preferredNaNBits` branches
+(`d = 0`, or a significand outside the normal or subnormal range after
+rounding) are unreachable from decoded finite inputs and integer inputs.
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "Casting from an integer to float will produce the closest possible float *
+> - if necessary, rounding is according to roundTiesToEven mode ***
+> - on overflow, infinity (of the same sign as the input) is produced"
+>
+> "*** as defined in IEEE 754-2008 §4.3.1: pick the nearest floating point
+> number, preferring the one with an even least significant digit if exactly
+> halfway between two floating point numbers."
+-/
+def roundRatioTiesToEven (f : IeeeFormat) (neg : Bool) (n d : Nat) : Nat :=
+  if d = 0 then preferredNaNBits f
+  else if n = 0 then zeroBits f neg
+  else
+    let exponent := max (ratioExponent n d) f.minExponent
+    if exponent > f.maxExponent then infBits f neg
+    else
+      let scaled := powScale n d ((f.fractionBits : Int) - exponent)
+      let significand := roundQuotientTiesToEven scaled.1 scaled.2
+      let carry := decide (2 ^ (f.fractionBits + 1) ≤ significand)
+      let significand' := if carry then significand / 2 else significand
+      let exponent' := if carry then exponent + 1 else exponent
+      if exponent' > f.maxExponent then infBits f neg
+      else if significand' < 2 ^ f.fractionBits then
+        if exponent' = f.minExponent then encodeBits f neg 0 significand'
+        else preferredNaNBits f
+      else if 2 ^ (f.fractionBits + 1) ≤ significand' then preferredNaNBits f
+      else encodeBits f neg (exponent' + (f.bias : Int)).toNat (significand' - 2 ^ f.fractionBits)
+
+/-- Target integer type of a `CastKind.floatToInt` cast. -/
+inductive FloatIntTarget : Type where
+  /-- Signed integer target. -/
+  | signed (w : IntTy) : FloatIntTarget
+  /-- Unsigned integer target. -/
+  | unsigned (w : UintTy) : FloatIntTarget
+
+/-- Target pointer width (the width of `isize` / `usize`). -/
+inductive FloatPtrWidth : Type where
+  /-- 32-bit targets. -/
+  | bits32 : FloatPtrWidth
+  /-- 64-bit targets. -/
+  | bits64 : FloatPtrWidth
+
+/-- Pointer width in bits. -/
+def FloatPtrWidth.bits : FloatPtrWidth → Nat
+  | .bits32 => 32
+  | .bits64 => 64
+
+/-- Bit width of an integer target. -/
+def FloatIntTarget.bitWidth (pw : FloatPtrWidth) : FloatIntTarget → Nat
+  | .signed w => w.bitWidth pw.bits
+  | .unsigned w => w.bitWidth pw.bits
+
+/-- Signedness of an integer target. -/
+def FloatIntTarget.isSigned : FloatIntTarget → Bool
+  | .signed _ => true
+  | .unsigned _ => false
+
+/--
+Minimum representable value (`-(2^(w-1))` signed, `0` unsigned).
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The signed two's complement integer types consist of: ... i8 -(2^7) 2^7-1"
+-/
+def FloatIntTarget.minValue (pw : FloatPtrWidth) (t : FloatIntTarget) : Int :=
+  if t.isSigned then -((2 ^ (t.bitWidth pw - 1) : Nat) : Int) else 0
+
+/--
+Maximum representable value (`2^(w-1) - 1` signed, `2^w - 1` unsigned).
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The unsigned integer types consist of: ... u8 0 2^8-1"
+-/
+def FloatIntTarget.maxValue (pw : FloatPtrWidth) (t : FloatIntTarget) : Int :=
+  if t.isSigned then ((2 ^ (t.bitWidth pw - 1) : Nat) : Int) - 1
+  else ((2 ^ t.bitWidth pw : Nat) : Int) - 1
+
+/-- Clamp `v` into `[lo, hi]`. -/
+def clampInt (lo hi v : Int) : Int := max lo (min hi v)
+
+/-- Truncation toward zero of `(-1)^neg * n / d`. -/
+def truncRatio (neg : Bool) (n d : Nat) : Int :=
+  if neg then -((n / d : Nat) : Int) else ((n / d : Nat) : Int)
+
+/--
+Mathematical result of a Rust saturating float-to-int `as` cast: NaN ↦ `0`,
+`±∞` ↦ the maximum / minimum, and finite values truncate toward zero and clamp
+into `[lo, hi]`.
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "Casting from a float to an integer will round the float towards zero
+> - NaN will return 0
+> - Values larger than the maximum integer value, including INFINITY, will
+>   saturate to the maximum value of the integer type.
+> - Values smaller than the minimum integer value, including NEG_INFINITY, will
+>   saturate to the minimum value of the integer type."
+-/
+def floatToIntValue (k : FloatKind) (lo hi : Int) : Int :=
+  match k with
+  | .nan _ _ _ => 0
+  | .inf neg => if neg then lo else hi
+  | .zero _ => 0
+  | .finite neg n d => clampInt lo hi (truncRatio neg n d)
+
+/-- Canonical two's-complement encoding of `v` at width `w`. -/
+def encodeTwosComplement (w : Nat) (v : Int) : Nat :=
+  (v % ((2 ^ w : Nat) : Int)).toNat
+
+/--
+Rust `as` float-to-int cast (`CastKind.floatToInt`) on a raw `src`-format bit
+pattern, returning a canonical two's-complement `ScalarInt` of the target
+width (`floatToIntValue`).
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "Casting from a float to an integer will round the float towards zero"
+-/
+def evalFloatToIntSaturating (src : IeeeFormat) (bits : Nat) (target : FloatIntTarget)
+    (pw : FloatPtrWidth) : ScalarInt :=
+  let w := target.bitWidth pw
+  ⟨encodeTwosComplement w
+      (floatToIntValue (decodeBits src bits) (target.minValue pw) (target.maxValue pw)),
+    w / 8⟩
+
+/-- Integer value of a `w`-bit two's-complement (signed) or unsigned bit pattern. -/
+def intValueOfBits (signed : Bool) (w bits : Nat) : Int :=
+  let b := bits % 2 ^ w
+  if signed = true ∧ 2 ^ (w - 1) ≤ b then (b : Int) - ((2 ^ w : Nat) : Int) else (b : Int)
+
+/--
+Rust `as` int-to-float cast (`CastKind.intToFloat`): the closest `dst` float to
+the source integer, rounding with `roundTiesToEven` and overflowing to the
+infinity of the source's sign (`roundRatioTiesToEven`).
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "Casting from an integer to float will produce the closest possible float *
+> - if necessary, rounding is according to roundTiesToEven mode ***
+> - on overflow, infinity (of the same sign as the input) is produced"
+-/
+def evalIntToFloatRoundTiesToEven (signed : Bool) (w bits : Nat) (dst : IeeeFormat) : Nat :=
+  let v := intValueOfBits signed w bits
+  roundRatioTiesToEven dst (decide (v < 0)) v.natAbs 1
+
+/--
+Rust `as` float-to-float cast (`CastKind.floatToFloat`) on a raw `src`-format
+bit pattern: signed zeros and infinities map to the same-signed zero and
+infinity, finite values are correctly rounded with `roundTiesToEven`
+(`roundRatioTiesToEven`; exact for `f32 → f64`), and a NaN keeps its sign while
+its payload is quieted and shifted to the `dst` precision ("Quieting NaN
+propagation": low-order payload bits are dropped when narrowing and filled with
+zeros when widening) with the `dst` quiet bit set.
+
+Reference (The Rust Reference, "Numeric cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#numeric-cast>
+
+> "Casting from an f32 to an f64 is perfect and lossless"
+>
+> "Casting from an f64 to an f32 will produce the closest possible f32 **
+> - if necessary, rounding is according to roundTiesToEven mode ***
+> - on overflow, infinity (of the same sign as the input) is produced"
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "Quieting NaN propagation: The quiet bit is set and the payload is copied from
+> any input operand that is a NaN. If the inputs and outputs do not have the
+> same payload size (i.e., for as casts), then
+> - If the output is smaller than the input, low-order bits of the payload get
+>   dropped.
+> - If the output is larger than the input, the payload gets filled up with 0s
+>   in the low-order bits."
+
+Modeling choice: the NaN result is one deterministic admissible choice among
+the non-deterministic NaN bit patterns Rust permits (see the section comment).
+-/
+def evalFloatToFloatRoundTiesToEven (src dst : IeeeFormat) (bits : Nat) : Nat :=
+  match decodeBits src bits with
+  | .zero neg => zeroBits dst neg
+  | .finite neg n d => roundRatioTiesToEven dst neg n d
+  | .inf neg => infBits dst neg
+  | .nan neg _ payload =>
+    let quiet := Nat.lor payload (2 ^ (src.fractionBits - 1))
+    let payload' :=
+      if src.fractionBits ≤ dst.fractionBits then
+        quiet * 2 ^ (dst.fractionBits - src.fractionBits)
+      else quiet / 2 ^ (src.fractionBits - dst.fractionBits)
+    encodeBits dst neg (2 ^ dst.exponentBits - 1) (Nat.lor payload' (2 ^ (dst.fractionBits - 1)))
+
 end Trusted.Rustc.V2026_06_01.MirSemantics

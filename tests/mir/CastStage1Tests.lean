@@ -12,11 +12,12 @@ open Anneal.BitValidity
 open Anneal.Mir.Cast
 
 /-!
-# Concrete Non-Vacuity Tests for `Anneal.Mir.Cast` Sections 8.5–8.7
+# Concrete Non-Vacuity Tests for `Anneal.Mir.Cast` Sections 8.5–8.7 and 10
 
 Instantiates the Stage-1 provenance no-forge pointer characterizations (§8.5),
-function-pointer bridges (§8.6), and `ByteCodec.scalarNicheNewtype` step-level
-`evalByteCast` / `evalRvalue` bridges (§8.7) on a concrete 64-bit `LayoutTable`,
+function-pointer bridges (§8.6), `ByteCodec.scalarNicheNewtype` step-level
+`evalByteCast` / `evalRvalue` bridges (§8.7), and the IEEE-754 `f32` / `f64`
+numeric-cast step theorems (§10) on a concrete 64-bit `LayoutTable`,
 `LocalDecl` list, `LocalSlot` environment, and `emptyMemory`.
 -/
 
@@ -197,5 +198,81 @@ example :=
   trusted_decodeTypedValueFromBytes_scalarNicheNewtype_charRange_surrogate_divergence
     castStage1Layouts "CharWrapper" [.char] 2 charRangeNewtypeLayout 32 false 0 [0]
     rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-! ## Section 10: IEEE-754 `f32` / `f64` Numeric Casts (`CastKind.{floatToInt, intToFloat, floatToFloat}`) -/
+
+/-- Float-cast locals: `_0 : f64 = π`, `_1 : f32 = -0.0`, `_2 : i64 = -123`, `_3 : u64 = 2^53 + 3`,
+`_4 : f64 = -1e39`, `_5 : isize = -1`. -/
+def floatLocalDecls : List LocalDecl := [
+  { mutability := .not, ty := { kind := .float .f64, layoutIdx := 0 }, debugName := none },
+  { mutability := .not, ty := { kind := .float .f32, layoutIdx := 0 }, debugName := none },
+  { mutability := .not, ty := { kind := .int .i64, layoutIdx := 0 }, debugName := none },
+  { mutability := .not, ty := { kind := .uint .u64, layoutIdx := 0 }, debugName := none },
+  { mutability := .not, ty := { kind := .float .f64, layoutIdx := 0 }, debugName := none },
+  { mutability := .not, ty := { kind := .int .isize, layoutIdx := 0 }, debugName := none }
+]
+
+def floatLocals : List LocalSlot := [
+  .init (.scalar ⟨0x400921FB54442D18, 8⟩),
+  .init (.scalar ⟨0x80000000, 4⟩),
+  .init (.scalar ⟨scalarModulus 8 - 123, 8⟩),
+  .init (.scalar ⟨9007199254740995, 8⟩),
+  .init (.scalar ⟨0xC8078287F49C4A1D, 8⟩),
+  .init (.scalar ⟨scalarModulus 8 - 1, 8⟩)
+]
+
+def floatI8Ty : Ty := { kind := .int .i8, layoutIdx := 0 }
+def floatU8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+def floatF32Ty : Ty := { kind := .float .f32, layoutIdx := 0 }
+def floatF64Ty : Ty := { kind := .float .f64, layoutIdx := 0 }
+def floatF128Ty : Ty := { kind := .float .f128, layoutIdx := 0 }
+
+/-- Non-vacuity of the step-level soundness theorems: every hypothesis is discharged by `rfl` on a
+concrete `evalRvalue` environment (64-bit `castStage1Layouts`). -/
+example :=
+  evalRvalue_cast_floatToInt_sound (locals := floatLocals) (op := .copy ⟨0, []⟩) (dstTy := floatI8Ty)
+    (mem := emptyMemory) (localDecls := floatLocalDecls) (layouts := castStage1Layouts)
+    (fmt := .binary64) (tgt := .signed .i8) rfl rfl rfl rfl rfl
+
+example :=
+  evalRvalue_cast_floatToFloat_sound (locals := floatLocals) (op := .copy ⟨0, []⟩)
+    (dstTy := floatF32Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
+    (layouts := castStage1Layouts) (src := .binary64) (dst := .binary32) rfl rfl rfl rfl rfl
+
+example :=
+  evalRvalue_cast_intToFloat_exact (locals := floatLocals) (op := .copy ⟨2, []⟩)
+    (dstTy := floatF64Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
+    (layouts := castStage1Layouts) (fmt := .binary64) (src := .signed .i64) rfl rfl rfl rfl rfl
+    (by decide +kernel)
+
+/-- Concrete `evalRvalue` float casts on `castStage1Layouts`: `π as i8 = 3`, `π as f32`
+(round to nearest), `-0.0f32 as u8 = 0`, `-0.0f32 as f64 = -0.0`, `-123i64 as f64`,
+`(2^53 + 3) as f64 = 2^53 + 4` (tie to even), `-1e39f64 as i8 = i8::MIN` and `as f32 = -∞`
+(saturation / overflow), and `-1isize as f32 = -1.0` (64-bit `isize`). -/
+theorem step_float_casts_concrete :
+    evalRvalue floatLocals (.cast .floatToInt (.copy ⟨0, []⟩) floatI8Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = ok (.scalar ⟨3, 1⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨0, []⟩) floatF32Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = ok (.scalar ⟨0x40490FDB, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .floatToInt (.copy ⟨1, []⟩) floatU8Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = ok (.scalar ⟨0, 1⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨1, []⟩) floatF64Ty) emptyMemory
+        floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0x8000000000000000, 8⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .intToFloat (.copy ⟨2, []⟩) floatF64Ty) emptyMemory
+        floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0xC05EC00000000000, 8⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .intToFloat (.copy ⟨3, []⟩) floatF64Ty) emptyMemory
+        floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0x4340000000000002, 8⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .floatToInt (.copy ⟨4, []⟩) floatI8Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = ok (.scalar ⟨0x80, 1⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨4, []⟩) floatF32Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = ok (.scalar ⟨0xFF800000, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .intToFloat (.copy ⟨5, []⟩) floatF32Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = ok (.scalar ⟨0xBF800000, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨0, []⟩) floatF128Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.CastStage1Tests
