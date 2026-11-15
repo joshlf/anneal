@@ -1002,6 +1002,40 @@ theorem whileLoop_stepsTo_forRangeUp {α : Type} (alg : ValAlgebra Val)
         (blockCfgStep_whileBody alg cond body retExpr w st s' hBody)
         (PureMirExec.StepsTo.refl ⟨rfl, rfl, hAbs'⟩))
 
+/-- **Counted loops to exit block `2` via `forRangeUp`**: composing
+`whileLoop_stepsTo_forRangeUp` with one false-header transition reaches exit
+block `2` in a state satisfying `abs hi (PureMirExec.forRangeUp lo hi init f)`. -/
+theorem whileLoop_stepsTo_exit_forRangeUp {α : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (lo hi : Nat) (init : α) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (abs : Nat → α → SymState Val → Prop)
+    (hIter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s, abs i a s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some true) ∧
+      Exists fun s' => evalPlan alg body s = .ok (.continuing s') ∧
+        abs (i + 1) (f i hlo hlt a) s')
+    (hExit : ∀ s, abs hi (PureMirExec.forRangeUp lo hi init f) s →
+      Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false)
+    (wrap : FuncOut Val → FuncOut Val) (s₀ : SymState Val) (hle : lo ≤ hi)
+    (hInit : abs lo init s₀) :
+    PureMirExec.StepsTo
+      (blockCfgStep (stepBasicBlock alg (whileLoopBlocks cond body retExpr)))
+      ⟨wrap, 0, s₀⟩
+      (fun t => t.wrap = wrap ∧ t.bb = 2 ∧
+        abs hi (PureMirExec.forRangeUp lo hi init f) t.st) := by
+  refine (whileLoop_stepsTo_forRangeUp alg cond body retExpr lo hi init f abs
+    hIter wrap s₀ hle hInit).trans ?_
+  intro t ht
+  obtain ⟨hWrap, hBb, hAbs⟩ := ht
+  obtain ⟨cv, hCond, hBool⟩ := hExit t.st hAbs
+  cases t with
+  | mk w bb st =>
+    dsimp only at hWrap hBb hCond hAbs
+    subst hWrap
+    subst hBb
+    exact PureMirExec.StepsTo.step
+      (blockCfgStep_whileHeader_false alg cond body retExpr w st cv hCond hBool)
+      (PureMirExec.StepsTo.refl ⟨rfl, rfl, hAbs⟩)
+
 end Loops
 
 /-! ## Refinement into Live MIR (`runMirToBlock`, `MirWpConverges`, `LiftBlockToJoin`) -/
@@ -1401,42 +1435,141 @@ theorem allBytesInitialized_abstractBytesOfCells :
     have hUninit := hasUninitCell_cellsOfAbstractBytes bs cs hConv
     rw [hUninit, Bool.not_not]
 
+/-- Fallback cell encoding for values outside the subdomain of an `n`-byte
+codec: uses 2 value cells `[.init v, .init v]` when `n = 1` and 1 value cell
+`[.init v]` when `n ≠ 1`, so the fallback cell count is never `n` (preventing
+width-1 byte codecs such as `bool` or `u8` from sharing width `1` with a
+fallback `[.init w]` cell). -/
+def byteLensFallbackCells (n : Nat) (v : Val) : List (CellVal Val) :=
+  if Nat.beq n 1 then [.init v, .init v] else [.init v]
+
+/-- Extract the fallback value when `cells` has the fallback shape for width `n`
+(length 2 when `n = 1`, length 1 when `n ≠ 1`). -/
+def decodeByteLensFallback? (n : Nat) (cells : List (CellVal Val)) : Option Val :=
+  if Nat.beq n 1 then
+    match cells with
+    | [.init w, .init _] => some w
+    | _ => none
+  else
+    match cells with
+    | [.init w] => some w
+    | _ => none
+
+theorem decodeByteLensFallback?_fallback (n : Nat) (v : Val) :
+    decodeByteLensFallback? n (byteLensFallbackCells n v) = some v := by
+  unfold byteLensFallbackCells decodeByteLensFallback?
+  cases Nat.beq n 1 <;> rfl
+
+theorem decodeByteLensFallback?_of_cellsOfAbstractBytes (n : Nat) :
+    ∀ (bs : List AbstractByte) (cs : List (CellVal Val)),
+      cellsOfAbstractBytes (Val := Val) bs = some cs →
+      decodeByteLensFallback? n cs = none
+  | [], cs, h => by
+    injection h with h
+    subst h
+    unfold decodeByteLensFallback?
+    cases Nat.beq n 1 <;> rfl
+  | b :: bs, cs, h => by
+    rw [cellsOfAbstractBytes_cons] at h
+    cases hb : cellOfAbstractByte (Val := Val) b with
+    | none => rw [hb] at h; exact nomatch h
+    | some c =>
+      cases hcs : cellsOfAbstractBytes (Val := Val) bs with
+      | none => rw [hb, hcs] at h; exact nomatch h
+      | some cs' =>
+        rw [hb, hcs] at h
+        injection h with h
+        subst h
+        cases b with
+        | uninit =>
+          injection hb with hc
+          subst hc
+          unfold decodeByteLensFallback?
+          cases Nat.beq n 1 <;> rfl
+        | init x p =>
+          cases p with
+          | none =>
+            injection hb with hc
+            subst hc
+            unfold decodeByteLensFallback?
+            cases Nat.beq n 1 <;> rfl
+          | some _ => exact nomatch hb
+
+theorem decodeByteLensFallback?_of_length_eq (n : Nat)
+    (cells : List (CellVal Val)) (hLen : cells.length = n) :
+    decodeByteLensFallback? n cells = none := by
+  unfold decodeByteLensFallback?
+  cases hBeq : Nat.beq n 1 with
+  | true =>
+    have hn1 : n = 1 := Nat.eq_of_beq_eq_true hBeq
+    subst hn1
+    cases cells with
+    | nil => rfl
+    | cons c1 rest1 =>
+      cases rest1 with
+      | nil => cases c1 <;> rfl
+      | cons _ _ => nomatch hLen
+  | false =>
+    cases cells with
+    | nil => rfl
+    | cons c1 rest1 =>
+      cases rest1 with
+      | nil =>
+        subst hLen
+        exact nomatch hBeq
+      | cons _ _ => cases c1 <;> rfl
+
 /-- **`ByteLensCodec` as a `SpatialCodec`**: a provenance-free trusted byte codec
 on `α` of fixed width `n`, embedded into `Val` by the prism `(toVal, ofVal?)`,
 encodes `α`'s image as its `n`-byte raw byte window (enforcing exact width
-`bs.length == n` on decode) and falls back to `[.init v]` elsewhere. -/
+`bs.length == n` on decode) and falls back to `byteLensFallbackCells n v`
+(whose length is never `n`) elsewhere. -/
 def spatialCodecOfByteLensCodec {α : Type} {n : Nat} (cid : Nat)
     (c : Anneal.SepLogicLenses.ByteLensCodec α n)
     (hProv : ∀ a, provenanceFree (c.encode a) = true)
     (toVal : α → Val) (ofVal? : Val → Option α)
     (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v) :
-    SpatialCodec Val :=
-  SpatialCodec.ofSubdomain cid toVal ofVal? toVal_ofVal?
-    (fun a => (cellsOfAbstractBytes (c.encode a)).getD [])
-    (fun cells =>
+    SpatialCodec Val where
+  codecId := cid
+  encode v :=
+    match ofVal? v with
+    | some a => (cellsOfAbstractBytes (c.encode a)).getD []
+    | none => byteLensFallbackCells n v
+  decode cells :=
+    match decodeByteLensFallback? n cells with
+    | some w =>
+      match ofVal? w with
+      | none => some w
+      | some _ => none
+    | none =>
       match abstractBytesOfCells cells with
-      | some bs => if Nat.beq bs.length n then c.decode bs else none
-      | none => none)
-    (fun a => by
+      | some bs =>
+        if Nat.beq bs.length n then
+          match c.decode bs with
+          | some a => some (toVal a)
+          | none => none
+        else none
+      | none => none
+  decode_encode v := by
+    cases hv : ofVal? v with
+    | none =>
+      dsimp only
+      rw [decodeByteLensFallback?_fallback]
+      dsimp only
+      rw [hv]
+    | some a =>
+      dsimp only
       obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
         (hProv a)
-      show (match abstractBytesOfCells ((cellsOfAbstractBytes (c.encode a)).getD []) with
-        | some bs => if Nat.beq bs.length n then c.decode bs else none
-        | none => none) = some a
       rw [hcs]
-      show (match abstractBytesOfCells cs with
-        | some bs => if Nat.beq bs.length n then c.decode bs else none
-        | none => none) = some a
+      dsimp only [Option.getD]
+      rw [decodeByteLensFallback?_of_cellsOfAbstractBytes n (c.encode a) cs hcs]
+      dsimp only
       rw [abstractBytesOfCells_cellsOfAbstractBytes (c.encode a) cs hcs]
-      show (if Nat.beq (c.encode a).length n then c.decode (c.encode a) else none) = some a
+      dsimp only
       rw [c.encode_len a, Nat.beq_refl]
-      exact c.decode_encode a)
-    (fun a w _ hEq => by
-      obtain ⟨cs, hcs⟩ := cellsOfAbstractBytes_isSome (Val := Val) (c.encode a)
-        (hProv a)
-      have hEq' : (cellsOfAbstractBytes (c.encode a)).getD [] = [.init w] := hEq
-      rw [hcs] at hEq'
-      exact cellsOfAbstractBytes_ne_init (c.encode a) cs w hcs hEq')
+      rw [c.decode_encode a]
+      exact congrArg some (toVal_ofVal? v a hv)
 
 /-- Every value in the subdomain `ofVal? v = some a` encodes to an exact
 `n`-cell window under `spatialCodecOfByteLensCodec`. -/
@@ -1448,7 +1581,7 @@ theorem spatialCodecOfByteLensCodec_encode_length {α : Type} {n : Nat}
     (v : Val) (a : α) (hv : ofVal? v = some a) :
     ((spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
         toVal_ofVal?).encode v).length = n := by
-  unfold spatialCodecOfByteLensCodec SpatialCodec.ofSubdomain
+  unfold spatialCodecOfByteLensCodec
   dsimp only
   rw [hv]
   dsimp only
@@ -1459,23 +1592,6 @@ theorem spatialCodecOfByteLensCodec_encode_length {α : Type} {n : Nat}
   rw [cellsOfAbstractBytes_length (c.encode a) cs hcs]
   exact c.encode_len a
 
-theorem decode_wrong_length_aux {α : Type} {n : Nat}
-    (c : Anneal.SepLogicLenses.ByteLensCodec α n)
-    (toVal : α → Val)
-    (cells : List (CellVal Val)) (hLen : Nat.beq cells.length n = false) :
-    (match
-      (match abstractBytesOfCells cells with
-       | some bs => if Nat.beq bs.length n then c.decode bs else none
-       | none => none) with
-     | some a => some (toVal a)
-     | none => none) = none := by
-  cases hBytes : abstractBytesOfCells cells with
-  | none => rfl
-  | some bs =>
-    dsimp only
-    rw [abstractBytesOfCells_length cells bs hBytes, hLen]
-    rfl
-
 /-- Any non-fallback cell slice whose length differs from `n` is rejected by
 `spatialCodecOfByteLensCodec.decode`. -/
 theorem spatialCodecOfByteLensCodec_decode_wrong_length {α : Type} {n : Nat}
@@ -1484,23 +1600,57 @@ theorem spatialCodecOfByteLensCodec_decode_wrong_length {α : Type} {n : Nat}
     (toVal : α → Val) (ofVal? : Val → Option α)
     (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
     (cells : List (CellVal Val)) (hLen : Nat.beq cells.length n = false)
-    (hNoInit : ∀ w, cells ≠ [.init w]) :
+    (hNoFallback : decodeByteLensFallback? n cells = none) :
     (spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
       toVal_ofVal?).decode cells = none := by
-  unfold spatialCodecOfByteLensCodec SpatialCodec.ofSubdomain
-    decodeSubdomainCells
+  unfold spatialCodecOfByteLensCodec
   dsimp only
-  cases cells with
-  | nil => exact decode_wrong_length_aux c toVal [] hLen
-  | cons hd tl =>
-    cases hd with
-    | uninit => exact decode_wrong_length_aux c toVal (.uninit :: tl) hLen
-    | rawByte b => exact decode_wrong_length_aux c toVal (.rawByte b :: tl) hLen
-    | init w =>
-      cases tl with
-      | nil => exact absurd rfl (hNoInit w)
-      | cons hd2 tl2 =>
-        exact decode_wrong_length_aux c toVal (.init w :: hd2 :: tl2) hLen
+  rw [hNoFallback]
+  dsimp only
+  cases hBytes : abstractBytesOfCells cells with
+  | none => rfl
+  | some bs =>
+    dsimp only
+    rw [abstractBytesOfCells_length cells bs hBytes, hLen]
+    rfl
+
+/-- **No-retyping / In-subdomain preservation**: on any cell slice of length `n`
+(such as a spatial block frozen from an in-subdomain value and mutated via
+`mutateSpatialInState`), `spatialCodecOfByteLensCodec.decode` never takes the
+fallback branch; if it succeeds with `some v'`, then `cells` is a pure byte
+window (`abstractBytesOfCells cells = some bs`) and `v' = toVal a` for some
+decoded `a : α`. -/
+theorem spatialCodecOfByteLensCodec_decode_in_subdomain {α : Type} {n : Nat}
+    (cid : Nat) (c : Anneal.SepLogicLenses.ByteLensCodec α n)
+    (hProv : ∀ a, provenanceFree (c.encode a) = true)
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (cells : List (CellVal Val)) (v' : Val)
+    (hLen : cells.length = n)
+    (hDec : (spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
+      toVal_ofVal?).decode cells = some v') :
+    Exists fun bs => Exists fun a =>
+      abstractBytesOfCells cells = some bs ∧
+      c.decode bs = some a ∧
+      v' = toVal a := by
+  unfold spatialCodecOfByteLensCodec at hDec
+  dsimp only at hDec
+  rw [decodeByteLensFallback?_of_length_eq n cells hLen] at hDec
+  dsimp only at hDec
+  cases hBytes : abstractBytesOfCells cells with
+  | none => rw [hBytes] at hDec; exact nomatch hDec
+  | some bs =>
+    rw [hBytes] at hDec
+    dsimp only at hDec
+    have hBsLen : bs.length = n :=
+      (abstractBytesOfCells_length cells bs hBytes).trans hLen
+    rw [hBsLen, Nat.beq_refl] at hDec
+    cases hC : c.decode bs with
+    | none => rw [hC] at hDec; exact nomatch hDec
+    | some a =>
+      rw [hC] at hDec
+      injection hDec with hEq
+      exact ⟨bs, a, rfl, hC, hEq.symm⟩
 
 /-- If `c.encode a` is fully initialized (`BitValidity.allBytesInitialized`),
 then `spatialCodecOfByteLensCodec` encodes `v` (with `ofVal? v = some a`) to an
@@ -1515,7 +1665,7 @@ theorem spatialCodecOfByteLensCodec_hasUninitCell_false {α : Type} {n : Nat}
     hasUninitCell
       ((spatialCodecOfByteLensCodec cid c hProv toVal ofVal?
           toVal_ofVal?).encode v) = false := by
-  unfold spatialCodecOfByteLensCodec SpatialCodec.ofSubdomain
+  unfold spatialCodecOfByteLensCodec
   dsimp only
   rw [hv]
   dsimp only
@@ -1784,6 +1934,54 @@ theorem liftBlockToJoin_of_whileCutpoint {Val : Type}
   intro s' ms' hEq hR'
   subst hEq
   exact hJoin stFinal ms' hInvF hCondF hR'
+
+/-- **Verified PureLift counted `forRangeUp` loops become MirLiftCore join paths**:
+for a counted `while` loop (`whileLoopBlocks cond bodyPlan retExpr`) driven by
+`whileLoop_stepsTo_exit_forRangeUp` over `[lo, hi)`, any entry state `s₀`
+satisfying `abs lo init s₀` reaches exit block `2` in a state `stFinal`
+satisfying `abs hi (PureMirExec.forRangeUp lo hi init f) stFinal`; under a
+per-step simulation into live MIR, this yields `MirLiftCore.LiftBlockToJoin` at
+the MIR loop exit block. -/
+theorem liftBlockToJoin_of_whileForRangeUp {Val α : Type}
+    (alg : ValAlgebra Val) (cond : RvalOp Val) (bodyPlan : FlowPlan Val)
+    (retExpr : RvalOp Val)
+    (lo hi : Nat) (init : α) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (abs : Nat → α → SymState Val → Prop)
+    (hIter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s, abs i a s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some true) ∧
+      Exists fun s' => evalPlan alg bodyPlan s = .ok (.continuing s') ∧
+        abs (i + 1) (f i hlo hlt a) s')
+    (hExit : ∀ s, abs hi (PureMirExec.forRangeUp lo hi init f) s →
+      Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false)
+    {body : CapturedMir}
+    {R : BlockMachineState (SymState Val) (FuncOut Val) → MachineState → Prop}
+    (hSim : SegmentSim
+      (blockCfgStep (stepBasicBlock alg (whileLoopBlocks cond bodyPlan retExpr)))
+      (PureMirExec.mirStep body) R)
+    (wrap : FuncOut Val → FuncOut Val) (s₀ : SymState Val) (hle : lo ≤ hi)
+    (hInit : abs lo init s₀)
+    {bbIdx joinBb : BasicBlockIdx} {env : MirLiftCore.PureEnv}
+    {JoinInv : MirLiftCore.PureEnv → Prop}
+    (hR : R ⟨wrap, 0, s₀⟩ (({ bb := bbIdx, stmtIdx := 0, env := env } :
+      PureMirExec.PureState).toMachineState emptyMemory))
+    (hJoin : ∀ stFinal ms',
+      abs hi (PureMirExec.forRangeUp lo hi init f) stFinal →
+      R ⟨wrap, 2, stFinal⟩ ms' →
+      ms' = ({ bb := joinBb, stmtIdx := 0, env := ms'.frame.locals } :
+        PureMirExec.PureState).toMachineState emptyMemory ∧
+      JoinInv ms'.frame.locals) :
+    MirLiftCore.LiftBlockToJoin body bbIdx env joinBb JoinInv := by
+  refine liftBlockToJoin_of_blockCfg_segment hSim
+    (whileLoop_stepsTo_exit_forRangeUp alg cond bodyPlan retExpr lo hi init f
+      abs hIter hExit wrap s₀ hle hInit) hR ?_
+  intro s' ms' hs' hR'
+  cases s' with
+  | mk w bb stFinal =>
+    obtain ⟨hWrap, hBb, hAbs⟩ := hs'
+    dsimp only at hWrap hBb hAbs
+    subst hWrap
+    subst hBb
+    exact hJoin stFinal ms' hAbs hR'
 
 end LiveMir
 
@@ -2567,10 +2765,12 @@ def boolValueSpatialCodec : SpatialCodec Value :=
     provenanceFree_boolByteLensCodec
     boolToValue boolOfValue? boolToValue_ofValue?
 
-/-- **Episode 2 `TryFromBytes` / `bool` bit-validity canary**: valid `bool`
-scalars (`false`, `true`) encode to `[.rawByte 0]` / `[.rawByte 1]` and decode
-back, while `.uninit`, invalid bit-pattern `0x02`, and wrong-width windows
-decode to `none`. -/
+/-- **Episode 2 `TryFromBytes` / `bool` bit-validity & no-retyping canary**:
+valid `bool` scalars (`false`, `true`) encode to `[.rawByte 0]` / `[.rawByte 1]`
+and decode back, while `.uninit`, invalid bit-pattern `0x02`, wrong-width
+windows, and width-1 value cells `[.init w]` all decode to `none`; and every
+1-cell slice that decodes under `boolValueSpatialCodec` produces a valid Rust
+`bool` scalar (`spatialCodecOfByteLensCodec_decode_in_subdomain`). -/
 theorem boolValueSpatialCodec_canaries :
     boolValueSpatialCodec.encode (.scalar (boolToScalar false)) = [.rawByte 0] ∧
     boolValueSpatialCodec.encode (.scalar (boolToScalar true)) = [.rawByte 1] ∧
@@ -2580,8 +2780,19 @@ theorem boolValueSpatialCodec_canaries :
       some (.scalar (boolToScalar true)) ∧
     boolValueSpatialCodec.decode [.rawByte 2] = none ∧
     boolValueSpatialCodec.decode [.uninit] = none ∧
-    boolValueSpatialCodec.decode [.rawByte 0, .rawByte 0] = none :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    boolValueSpatialCodec.decode [.rawByte 0, .rawByte 0] = none ∧
+    (∀ w : Value, boolValueSpatialCodec.decode [.init w] = none) ∧
+    (∀ (cell : CellVal Value) (v' : Value),
+      boolValueSpatialCodec.decode [cell] = some v' →
+      Exists fun b : Bool => v' = .scalar (boolToScalar b)) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   fun _ => rfl,
+   fun cell v' hDec => by
+     obtain ⟨_, b, _, _, hEq⟩ :=
+       spatialCodecOfByteLensCodec_decode_in_subdomain 33 boolByteLensCodec
+         provenanceFree_boolByteLensCodec boolToValue boolOfValue?
+         boolToValue_ofValue? [cell] v' rfl hDec
+     exact ⟨b, hEq⟩⟩
 
 
 /-! ### Non-vacuity of the remaining composition theorems -/
@@ -2616,59 +2827,121 @@ theorem countdown_transfer_canaries (n k : Nat) :
   subst ht
   exact ⟨j, hPath⟩
 
-/-- Simulation relation for the zero-iteration `S6` loop at `*x = n = 3`: the
-loop header (block `0`) corresponds to `bb0` and the exit block `2` to `bb1` of
-`liveInteropMirBody`. -/
-def countUpExitRel (s : BlockMachineState (SymState StdVal) (FuncOut StdVal))
+/-- Simulation relation for the multi-iteration symbolic `S6` loop (`*x = i ≤ n`
+with `n - i` iterations): while inside the loop (`bb = 0` or `bb = 1`), the
+state satisfies `countUpInv n` (or `i < n` at `bb = 1`) and stutters on `bb0`
+of `liveInteropMirBody`; when the loop exits (`bb = 2` at `*x = n`), it steps
+`bb0 → bb1` of `liveInteropMirBody`. -/
+def countUpLoopRel (n : Nat)
+    (s : BlockMachineState (SymState StdVal) (FuncOut StdVal))
     (ms : MachineState) : Prop :=
-  s.wrap = (fun o => o) ∧ s.st = countUpState 3 3 ∧
-    ((s.bb = 0 ∧ ms = liveInteropMs 0) ∨ (s.bb = 2 ∧ ms = liveInteropMs 1))
+  s.wrap = (fun o => o) ∧
+    ((s.bb = 0 ∧ countUpInv n s.st ∧ ms = liveInteropMs 0) ∨
+     (s.bb = 1 ∧ (Exists fun j => j < n ∧ s.st = countUpState n j) ∧
+       ms = liveInteropMs 0) ∨
+     (s.bb = 2 ∧ s.st = countUpState n n ∧ ms = liveInteropMs 1))
 
-/-- The zero-iteration loop CFG simulates into `liveInteropMirBody`. -/
-theorem countUpExit_segmentSim :
+/-- The symbolic `n - i`-iteration `S6` loop CFG simulates into
+`liveInteropMirBody` for every bound `n`. -/
+theorem countUpLoop_segmentSim (n : Nat) :
     SegmentSim
       (blockCfgStep (stepBasicBlock stdValAlg
         (whileLoopBlocks countUpCond countUpBody (.constVal .unit))))
-      (PureMirExec.mirStep liveInteropMirBody) countUpExitRel := by
+      (PureMirExec.mirStep liveInteropMirBody) (countUpLoopRel n) := by
   intro s t s' hR hCont
-  obtain ⟨hWrap, hSt, hCase⟩ := hR
+  obtain ⟨hWrap, hCase⟩ := hR
   cases s with
   | mk w bb st =>
-    dsimp only at hWrap hSt hCase
+    dsimp only at hWrap hCase
     subst hWrap
-    subst hSt
-    rcases hCase with ⟨hBb, hT⟩ | ⟨hBb, hT⟩
+    rcases hCase with ⟨hBb, ⟨j, hj, hSt⟩, hT⟩ | ⟨hBb, ⟨j, hlt, hSt⟩, hT⟩ | ⟨hBb, hSt, hT⟩
     · subst hBb
+      subst hSt
       subst hT
-      rw [blockCfgStep_whileHeader_false stdValAlg countUpCond countUpBody
-        (.constVal .unit) (fun o => o) (countUpState 3 3) (.bool (Nat.blt 3 3))
-        (countUp_eval_cond 3 3) rfl] at hCont
+      cases hb : Nat.blt j n with
+      | true =>
+        have hlt : j < n := Nat.le_of_ble_eq_true hb
+        rw [blockCfgStep_whileHeader_true stdValAlg countUpCond countUpBody
+          (.constVal .unit) (fun o => o) (countUpState n j) (.bool (Nat.blt j n))
+          (countUp_eval_cond n j) (by rw [hb]; rfl)] at hCont
+        injection hCont with hEq
+        subst hEq
+        exact PureMirExec.StepsTo.refl ⟨rfl, Or.inr (Or.inl ⟨rfl, ⟨j, hlt, rfl⟩, rfl⟩)⟩
+      | false =>
+        have hge : n ≤ j := Nat.ge_of_not_lt (fun hlt =>
+          Bool.noConfusion ((Nat.ble_eq_true_of_le hlt).symm.trans hb))
+        have hEqJ : j = n := Nat.le_antisymm hj hge
+        subst hEqJ
+        rw [blockCfgStep_whileHeader_false stdValAlg countUpCond countUpBody
+          (.constVal .unit) (fun o => o) (countUpState j j) (.bool (Nat.blt j j))
+          (countUp_eval_cond j j) (by rw [hb]; rfl)] at hCont
+        injection hCont with hEq
+        subst hEq
+        exact PureMirExec.StepsTo.step liveInterop_mirStep_bb0
+          (PureMirExec.StepsTo.refl ⟨rfl, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩)
+    · subst hBb
+      subst hSt
+      subst hT
+      rw [blockCfgStep_whileBody stdValAlg countUpCond countUpBody
+        (.constVal .unit) (fun o => o) (countUpState n j) (countUpState n (j + 1))
+        (countUp_eval_body n j)] at hCont
       injection hCont with hEq
       subst hEq
-      exact PureMirExec.StepsTo.step liveInterop_mirStep_bb0
-        (PureMirExec.StepsTo.refl ⟨rfl, rfl, Or.inr ⟨rfl, rfl⟩⟩)
+      exact PureMirExec.StepsTo.refl ⟨rfl, Or.inl ⟨rfl, ⟨j + 1, hlt, rfl⟩, rfl⟩⟩
     · subst hBb
+      subst hSt
       subst hT
       rw [blockCfgStep_whileExit stdValAlg countUpCond countUpBody
-        (.constVal .unit) (fun o => o) (countUpState 3 3) .unit rfl rfl rfl] at hCont
+        (.constVal .unit) (fun o => o) (countUpState n n) .unit rfl rfl rfl] at hCont
       exact nomatch hCont
 
-/-- **Non-vacuity of `liftBlockToJoin_of_whileCutpoint`**: the `S6` loop
-verified by its cutpoint invariant (here, the zero-iteration instance
-`*x = n = 3`) yields the live MIR join path of `liveInteropMirBody` from `bb0`
-to `bb1`. -/
-theorem countUp_liftBlockToJoin_of_whileCutpoint_canary :
+/-- **Non-vacuity of `liftBlockToJoin_of_whileCutpoint` (multi-iteration symbolic
+bounds `i ≤ n`)**: for every `i ≤ n`, the `n - i`-iteration `S6` loop verified
+by `countUpInv n`, `countUpRank n`, and `countUp_cutpoint_step n` yields the
+live MIR join path of `liveInteropMirBody` from `bb0` to `bb1`. -/
+theorem countUp_liftBlockToJoin_of_whileCutpoint_canary (n i : Nat) (hi : i ≤ n) :
     MirLiftCore.LiftBlockToJoin liveInteropMirBody 0 liveInteropEnv 1
       (· = liveInteropEnv) :=
   liftBlockToJoin_of_whileCutpoint stdValAlg countUpCond countUpBody
-    (.constVal .unit) (· = countUpState 3 3) (fun _ => 0)
-    (fun s hs => by
-      subst hs
-      exact ⟨.bool (Nat.blt 3 3), countUp_eval_cond 3 3, Or.inl ⟨rfl, rfl⟩⟩)
-    countUpExit_segmentSim (fun o => o) (countUpState 3 3) rfl
-    ⟨rfl, rfl, Or.inl ⟨rfl, rfl⟩⟩
+    (.constVal .unit) (countUpInv n) (countUpRank n) (countUp_cutpoint_step n)
+    (countUpLoop_segmentSim n) (fun o => o) (countUpState n i) ⟨i, hi, rfl⟩
+    ⟨rfl, Or.inl ⟨rfl, ⟨i, hi, rfl⟩, rfl⟩⟩
     (fun _ ms' _ _ hR' => by
-      rcases hR'.2.2 with ⟨hBad, _⟩ | ⟨_, hMs⟩
+      rcases hR'.2 with ⟨hBad, _⟩ | ⟨hBad, _⟩ | ⟨_, _, hMs⟩
+      · exact nomatch hBad
+      · exact nomatch hBad
+      · subst hMs
+        exact ⟨rfl, rfl⟩)
+
+/-- **Non-vacuity of `liftBlockToJoin_of_whileForRangeUp` (multi-iteration
+symbolic bounds `i ≤ n`)**: for every `i ≤ n`, the `S6` loop driven by
+MirLiftCore's `forRangeUp` over `[i, n)` yields the live MIR join path of
+`liveInteropMirBody` from `bb0` to `bb1`. -/
+theorem countUp_liftBlockToJoin_of_whileForRangeUp_canary (n i : Nat) (hi : i ≤ n) :
+    MirLiftCore.LiftBlockToJoin liveInteropMirBody 0 liveInteropEnv 1
+      (· = liveInteropEnv) :=
+  liftBlockToJoin_of_whileForRangeUp stdValAlg countUpCond countUpBody
+    (.constVal .unit) i n i (fun _ _ _ a => a + 1)
+    (fun j a s => a = j ∧ s = countUpState n j)
+    (fun j _ hlt a s hs => by
+      obtain ⟨ha, hsEq⟩ := hs
+      subst ha
+      subst hsEq
+      have hb : Nat.blt a n = true := Nat.ble_eq_true_of_le hlt
+      refine ⟨⟨.bool (Nat.blt a n), countUp_eval_cond n a, ?_⟩,
+        countUpState n (a + 1), countUp_eval_body n a, rfl, rfl⟩
+      rw [hb]
+      rfl)
+    (fun s hs => by
+      obtain ⟨_, hsEq⟩ := hs
+      subst hsEq
+      exact ⟨.bool (Nat.blt n n), countUp_eval_cond n n,
+        by rw [nat_blt_self_eq_false]; rfl⟩)
+    (countUpLoop_segmentSim n) (fun o => o) (countUpState n i) hi ⟨rfl, rfl⟩
+    ⟨rfl, Or.inl ⟨rfl, ⟨i, hi, rfl⟩, rfl⟩⟩
+    (fun _ ms' _ hR' => by
+      rcases hR'.2 with ⟨hBad, _⟩ | ⟨hBad, _⟩ | ⟨_, _, hMs⟩
+      · exact nomatch hBad
       · exact nomatch hBad
       · subst hMs
         exact ⟨rfl, rfl⟩)
@@ -2739,7 +3012,7 @@ theorem u32ValueSpatialCodec_width_canaries :
     spatialCodecOfByteLensCodec_decode_wrong_length 32
       Anneal.SepLogicLenses.ByteLensCodec.u32LE
       (fun x => provenanceFree_encodeLittleEndianBytes 4 x.val)
-      u32ToValue u32OfValue? u32ToValue_ofValue? _ rfl (fun _ h => nomatch h)⟩
+      u32ToValue u32OfValue? u32ToValue_ofValue? _ rfl rfl⟩
 
 end Canaries
 
