@@ -908,7 +908,7 @@ def commitCopyDstPlaceWrite
             s.memory.borrows
             dstTargetLocal
             (.some dstTag)
-            (length s.memory.callStack)
+            0
         MirStepNode.step
           (advanceStmt
             s
@@ -1707,17 +1707,173 @@ def copyEntriesTargetActiveFrame
       (Nat.beq dstEntry.targetFrameDepth (length callStack))
 
 /--
+Tree Borrows read-then-write check and permission transition for a single-element
+direct `copy_nonoverlapping` from `(srcPtr, srcEntry)` to `(dstPtr, dstEntry)`:
+checks source read UB (`hasTreeReadUB`), applies the source read transition
+(`freezeTreeBorrowsOnReadAtProj` / `updateBorrowPermOnReadAtProj`), checks
+destination ancestor write UB (`treeBorrowAncestorsChildAccessUB .write`) and
+active function-entry protectors (`hasProtectedTreeWriteConflict` /
+`hasProtectedWriteConflict`), and applies the projection- and tree-aware write
+transition (`invalidateTreeBorrowsAtProj` / `invalidateConflictingBorrowsAtProj`
+/ `invalidateConflictingBorrows`). Returns `.none` on any Tree Borrows UB.
+-/
+def borrowsAfterCopySingleDirect
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) :
+    Option (List BorrowEntry) :=
+  let readUB : Bool :=
+    match borrows with
+    | b₁ :: b₂ :: restBorrows =>
+      let allBorrows := b₁ :: b₂ :: restBorrows
+      hasTreeReadUB
+        allBorrows
+        allBorrows
+        activeProtectors
+        srcEntry.targetLocal
+        (.some srcPtr.tag)
+        srcEntry.targetProjection
+        srcEntry.rangeOffset
+        srcEntry.rangeLen
+        srcEntry.targetFrameDepth
+    | _ => false
+  match readUB with
+  | true => .none
+  | false =>
+    let borrowsAfterRead : List BorrowEntry :=
+      match borrows with
+      | .nil => .nil
+      | single :: .nil =>
+        updateBorrowPermOnReadAtProj
+          (single :: .nil)
+          single
+          srcEntry.targetLocal
+          (.some srcPtr.tag)
+          srcEntry.targetProjection
+          srcEntry.rangeOffset
+          srcEntry.rangeLen
+          activeProtectors
+          srcEntry.targetFrameDepth :: .nil
+      | b₁ :: b₂ :: restBorrows =>
+        let allBorrows := b₁ :: b₂ :: restBorrows
+        freezeTreeBorrowsOnReadAtProj
+          allBorrows
+          allBorrows
+          srcEntry.targetLocal
+          (.some srcPtr.tag)
+          srcEntry.targetProjection
+          srcEntry.rangeOffset
+          srcEntry.rangeLen
+          activeProtectors
+          srcEntry.targetFrameDepth
+    let dstWriteTreeUB : Bool :=
+      match borrowsAfterRead with
+      | .nil => false
+      | single :: .nil =>
+        match lookupBorrow (single :: .nil) dstPtr.tag with
+        | .some dEntryAfter =>
+          match dEntryAfter.perm with
+          | .frozen | .disabled => true
+          | _ => false
+        | .none => true
+      | b₁ :: b₂ :: restBorrows =>
+        let allBorrows := b₁ :: b₂ :: restBorrows
+        match lookupBorrow allBorrows dstPtr.tag with
+        | .some dEntryAfter =>
+          match dEntryAfter.perm with
+          | .frozen | .disabled => true
+          | _ => treeBorrowAncestorsChildAccessUB .write allBorrows dEntryAfter.parentTag
+        | .none => true
+    match dstWriteTreeUB with
+    | true => .none
+    | false =>
+      let protConflict : Bool :=
+        match activeProtectors with
+        | .nil => false
+        | _ :: _ =>
+          match borrowsAfterRead with
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            hasProtectedTreeWriteConflict
+              allBorrows
+              allBorrows
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstPtr.tag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+          | _ =>
+            hasProtectedWriteConflict
+              borrowsAfterRead
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstPtr.tag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+      match protConflict with
+      | true => .none
+      | false =>
+        let borrows' : List BorrowEntry :=
+          match borrowsAfterRead with
+          | .nil => .nil
+          | single :: .nil =>
+            let b := single :: .nil
+            match dstEntry.targetProjection with
+            | .nil =>
+              match Nat.beq dstEntry.rangeLen 0 with
+              | true =>
+                invalidateConflictingBorrows
+                  b
+                  dstEntry.targetLocal
+                  (.some dstPtr.tag)
+                  dstEntry.targetFrameDepth
+              | false =>
+                invalidateConflictingBorrowsAtProj
+                  b
+                  dstEntry.targetLocal
+                  (.some dstPtr.tag)
+                  .nil
+                  dstEntry.rangeOffset
+                  dstEntry.rangeLen
+                  dstEntry.targetFrameDepth
+            | pHead :: pTail =>
+              invalidateConflictingBorrowsAtProj
+                b
+                dstEntry.targetLocal
+                (.some dstPtr.tag)
+                (pHead :: pTail)
+                dstEntry.rangeOffset
+                dstEntry.rangeLen
+                dstEntry.targetFrameDepth
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            invalidateTreeBorrowsAtProj
+              allBorrows
+              allBorrows
+              dstEntry.targetLocal
+              (.some dstPtr.tag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+        .some borrows'
+
+/--
 Frame-qualified single-element direct value copy (`count == 1`, `srcStart == 0`,
 `dstStart == 0`) for `copy_nonoverlapping` when at least one of `srcEntry` or
 `dstEntry` targets a suspended caller frame (`copyEntriesTargetActiveFrame = false`,
 `DIV-MR-CALL-TARGET-LOCAL`). Reads the source value from `(srcEntry.targetFrameDepth,
 srcEntry.targetLocal)` (`readFrameLocalSlot`), checks disjointness on the pair
-`(targetFrameDepth, targetLocal)` and `targetProjection`, checks function-entry
-lifetime protectors at `dstEntry.targetFrameDepth`, writes the converted value to
-`(dstEntry.targetFrameDepth, dstEntry.targetLocal)` (`writeFrameLocalSlot`,
-updating `Memory.callStack` when targeting a saved caller frame), and invalidates
-conflicting borrows at `dstEntry.targetFrameDepth`. Non-unit counts or non-zero
-byte offsets across frames fail closed with `MirStepNode.unsupported`.
+`(targetFrameDepth, targetLocal)` and `targetProjection`, applies the Tree Borrows
+read-then-write check and transition (`borrowsAfterCopySingleDirect`), and writes
+the converted value to `(dstEntry.targetFrameDepth, dstEntry.targetLocal)`
+(`writeFrameLocalSlot`). Non-unit counts or non-zero byte offsets across frames
+fail closed with `MirStepNode.unsupported`.
 -/
 def evalForeignFrameCopySingleDirect
     (s : MachineState)
@@ -1809,36 +1965,17 @@ def evalForeignFrameCopySingleDirect
           match convertedOpt with
           | .none => MirStepNode.fail .ub
           | .some finalVal =>
-            let protConflict : Bool :=
-              match s.memory.activeProtectors with
-              | .nil => false
-              | _ :: _ =>
-                match s.memory.borrows with
-                | b₁ :: b₂ :: restBorrows =>
-                  let allBorrows := b₁ :: b₂ :: restBorrows
-                  hasProtectedTreeWriteConflict
-                    allBorrows
-                    allBorrows
-                    s.memory.activeProtectors
-                    dstEntry.targetLocal
-                    (.some dstPtr.tag)
-                    dstEntry.targetProjection
-                    dstEntry.rangeOffset
-                    dstEntry.rangeLen
-                    dstEntry.targetFrameDepth
-                | _ =>
-                  hasProtectedWriteConflict
-                    s.memory.borrows
-                    s.memory.activeProtectors
-                    dstEntry.targetLocal
-                    (.some dstPtr.tag)
-                    dstEntry.targetProjection
-                    dstEntry.rangeOffset
-                    dstEntry.rangeLen
-                    dstEntry.targetFrameDepth
-            match protConflict with
-            | true => MirStepNode.fail .ub
-            | false =>
+            match
+              borrowsAfterCopySingleDirect
+                s.memory.borrows
+                s.memory.activeProtectors
+                srcPtr
+                dstPtr
+                srcEntry
+                dstEntry
+            with
+            | .none => MirStepNode.fail .ub
+            | .some borrows' =>
               let dstRootSlotOpt :=
                 readFrameLocalSlot
                   locals₃
@@ -1881,12 +2018,6 @@ def evalForeignFrameCopySingleDirect
                     (.init newDstRootVal)
                 with
                 | .some (locals₄, callStack', callerLocals') =>
-                  let borrows' :=
-                    invalidateConflictingBorrows
-                      s.memory.borrows
-                      dstEntry.targetLocal
-                      (.some dstPtr.tag)
-                      dstEntry.targetFrameDepth
                   MirStepNode.step
                     (advanceStmt
                       s
@@ -3562,7 +3693,9 @@ def foreignFrameDerefWrite
     (mem₁ : Memory)
     (dst : Place)
     (restProj : List ProjectionElem)
-    (val : Value) :
+    (val : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
     FrameWriteResult :=
   match get? locals₁ dst.local_ with
   | .some (.init ptrOrFatVal) =>
@@ -3582,6 +3715,10 @@ def foreignFrameDerefWrite
           with
           | .none => .ub
           | .some target =>
+            let (writeDecls, writeLayouts) :=
+              match target with
+              | .savedFrame _ _ => (localDecls, layouts)
+              | .callerReferent _ => (.nil, emptyLayoutTable)
             match
               evalCallerPlaceWrite
                 locals₁
@@ -3590,22 +3727,51 @@ def foreignFrameDerefWrite
                 dst
                 val
                 mem₁.activeProtectors
-                .nil
-                emptyLayoutTable
+                writeDecls
+                writeLayouts
                 mem₁.callStack
             with
             | .ok targetLocals' =>
-              match derefWriteTreeUB locals₁ mem₁.borrows dst with
+              let (targetDecls, targetLayouts) :=
+                foreignFrameDeclsAndLayouts
+                  mem₁.callStack
+                  layouts
+                  entry.targetFrameDepth
+                  entry.targetLocal
+              match
+                Bool.or
+                  (derefWriteTreeUB locals₁ mem₁.borrows dst)
+                  (derefWriteUnionProtectorUB
+                    targetDecls
+                    targetLayouts
+                    locals₁
+                    mem₁.borrows
+                    mem₁.activeProtectors
+                    dst
+                    restProj
+                    mem₁.callStack)
+              with
               | true => .ub
               | false =>
                 let borrows' :=
-                  invalidateDerefWriteBorrows
-                    locals₁
-                    mem₁.borrows
-                    dst
-                    restProj
-                    mem₁.callerLocals
-                    mem₁.callStack
+                  match targetDecls with
+                  | .nil =>
+                    invalidateDerefWriteBorrows
+                      locals₁
+                      mem₁.borrows
+                      dst
+                      restProj
+                      mem₁.callerLocals
+                      mem₁.callStack
+                  | _ :: _ =>
+                    invalidateDerefWriteBorrowsWithLayouts
+                      targetDecls
+                      targetLayouts
+                      locals₁
+                      mem₁.borrows
+                      dst
+                      restProj
+                      mem₁.callStack
                 match commitForeignFrameLocals mem₁ target targetLocals' with
                 | .some mem₂ => .ok locals₁ { mem₂ with borrows := borrows' }
                 | .none => .ub
@@ -3616,9 +3782,9 @@ def foreignFrameDerefWrite
   | _ => .ub
 
 /--
-`StatementKind.assign` step for a dereferencing write whose pointer targets a
-local outside the active frame (`foreignFrameDerefWrite`), advancing to the
-next statement.
+`StatementKind.assign` / `StatementKind.setDiscriminant` step for a
+dereferencing write whose pointer targets a local outside the active frame
+(`foreignFrameDerefWrite`), advancing to the next statement.
 -/
 def evalForeignFrameDerefWrite
     (s : MachineState)
@@ -3626,11 +3792,73 @@ def evalForeignFrameDerefWrite
     (mem₁ : Memory)
     (dst : Place)
     (restProj : List ProjectionElem)
-    (val : Value) :
+    (val : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
     MirStepNode :=
-  match foreignFrameDerefWrite locals₁ mem₁ dst restProj val with
+  match foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts with
   | .ok locals₂ mem₂ => MirStepNode.step (advanceStmt s locals₂ mem₂)
   | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+
+/--
+Dereferencing `SetDiscriminant` write of `newVal` to `p = ⟨ptrLoc, .deref :: rest⟩`:
+tries the active-frame write `evalPlaceWrite` (with Tree Borrows and union
+protector checks) and falls back on `.ub` to `evalForeignFrameDerefWrite` so
+both suspended caller-frame locals (`Memory.callStack`) and root-frame
+caller-owned referents (`Memory.callerLocals`) are updated consistently with
+`StatementKind.assign` (`DIV-MR-CALL-TARGET-LOCAL`).
+-/
+def evalSetDiscriminantDerefWrite
+    (s : MachineState)
+    (locals₁ : List LocalSlot)
+    (p : Place)
+    (rest : List ProjectionElem)
+    (newVal : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match
+    evalPlaceWrite
+      locals₁
+      s.memory.borrows
+      p
+      newVal
+      s.memory.activeProtectors
+      localDecls
+      layouts
+      s.memory.callStack
+  with
+  | .ok locals₂ =>
+    match
+      Bool.or
+        (derefWriteTreeUB locals₁ s.memory.borrows p)
+        (derefWriteUnionProtectorUB
+          localDecls
+          layouts
+          locals₁
+          s.memory.borrows
+          s.memory.activeProtectors
+          p
+          rest
+          s.memory.callStack)
+    with
+    | true => MirStepNode.fail .ub
+    | false =>
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { s.memory with
+            borrows :=
+              invalidateDerefWriteBorrowsWithLayouts
+                localDecls
+                layouts
+                locals₁
+                s.memory.borrows
+                p
+                rest
+                s.memory.callStack })
+  | .ub =>
+    evalForeignFrameDerefWrite s locals₁ s.memory p rest newVal localDecls layouts
   | .unsupported => MirStepNode.unsupported
 
 /--
@@ -3983,50 +4211,7 @@ def evalStmt
         let newVal : Value := .aggregate variantIdx fields
         match proj with
         | .deref =>
-          match
-            evalPlaceWrite
-              locals₁
-              s.memory.borrows
-              p
-              newVal
-              s.memory.activeProtectors
-              localDecls
-              layouts
-              s.memory.callStack
-          with
-          | .ok locals₂ =>
-            match
-              Bool.or
-                (derefWriteTreeUB locals₁ s.memory.borrows p)
-                (derefWriteUnionProtectorUB
-                  localDecls
-                  layouts
-                  locals₁
-                  s.memory.borrows
-                  s.memory.activeProtectors
-                  p
-                  rest
-                  s.memory.callStack)
-            with
-            | true => MirStepNode.fail .ub
-            | false =>
-              MirStepNode.step
-                (advanceStmt s locals₂
-                  { s.memory with
-                    borrows :=
-                      invalidateDerefWriteBorrowsWithLayouts
-                        localDecls
-                        layouts
-                        locals₁
-                        s.memory.borrows
-                        p
-                        rest
-                        s.memory.callStack })
-          | .ub =>
-            match derefTargetsSuspendedFrame locals₁ s.memory.borrows s.memory.callStack p with
-            | true => MirStepNode.unsupported
-            | false => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
+          evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts
         | _ =>
           let depth := length s.memory.callStack
           let resolvedLocalProj :=
@@ -4070,7 +4255,70 @@ def evalStmt
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
       | .ok _ _ => MirStepNode.fail .ub
-      | .ub => MirStepNode.fail .ub
+      | .ub =>
+        match proj, rest with
+        | .deref, .nil =>
+          match get? s.frame.locals p.local_ with
+          | .some (.init (.ptr ptrVal _)) =>
+            match lookupBorrow s.memory.borrows ptrVal.tag with
+            | .some entry =>
+              match entry.perm, entry.targetProjection, Nat.beq ptrVal.offsetBytes 0 with
+              | .frozen, _, _ => MirStepNode.fail .ub
+              | .disabled, _, _ => MirStepNode.fail .ub
+              | _, _ :: _, _ => MirStepNode.fail .ub
+              | _, _, false => MirStepNode.fail .ub
+              | _, .nil, true =>
+                let pointeeAdtOk : Bool :=
+                  match placeTyResolved localDecls layouts p with
+                  | .some { kind := .adt _ _, .. } => true
+                  | .some _ => false
+                  | .none => true
+                match
+                  activeFrameSlot?
+                    s.frame.locals
+                    s.memory.callStack
+                    entry.targetFrameDepth
+                    entry.targetLocal
+                with
+                | .some .uninit =>
+                  match
+                    Bool.and
+                      pointeeAdtOk
+                      (setDiscriminantUninitDeclOk localDecls entry.targetLocal)
+                  with
+                  | true =>
+                    evalSetDiscriminantDerefWrite
+                      s s.frame.locals p .nil (.aggregate variantIdx .nil) localDecls layouts
+                  | false => MirStepNode.unsupported
+                | .some _ => MirStepNode.fail .ub
+                | .none =>
+                  match
+                    foreignFrameSlot?
+                      s.memory.callStack
+                      s.memory.callerLocals
+                      entry.targetFrameDepth
+                      entry.targetLocal
+                  with
+                  | .some .uninit =>
+                    let (targetDecls, _) :=
+                      foreignFrameDeclsAndLayouts
+                        s.memory.callStack
+                        layouts
+                        entry.targetFrameDepth
+                        entry.targetLocal
+                    match
+                      Bool.and
+                        pointeeAdtOk
+                        (setDiscriminantUninitDeclOk targetDecls entry.targetLocal)
+                    with
+                    | true =>
+                      evalSetDiscriminantDerefWrite
+                        s s.frame.locals p .nil (.aggregate variantIdx .nil) localDecls layouts
+                    | false => MirStepNode.unsupported
+                  | _ => MirStepNode.fail .ub
+            | .none => MirStepNode.fail .ub
+          | _ => MirStepNode.fail .ub
+        | _, _ => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
   | .assign dst rv =>
     match evalRvalue s.frame.locals rv s.memory localDecls layouts with
@@ -4185,7 +4433,7 @@ def evalStmt
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
           | _ :: _ =>
-            evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val
+            evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
         | .unsupported => MirStepNode.unsupported
       | proj :: rest =>
         match get? locals₁ dst.local_ with
@@ -4581,7 +4829,7 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       | _ =>
         dsimp only
         rw [hDis]
-  · cases localDecls <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
+  · cases localDecls <;> cases restProj <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
     cases otherVal with

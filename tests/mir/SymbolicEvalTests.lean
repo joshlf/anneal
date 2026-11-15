@@ -2170,13 +2170,22 @@ theorem externalSpecSliceCaller_verified :
   rintro (⟨retVal, memAfter⟩ | _ | _) h_post
   · rcases h_post with ⟨_, _, h_ens⟩
     obtain rfl := h_ens p len rfl
-    let mem₁ : Memory :=
+    let mem₀ : Memory :=
       { memAfter with
         callees := [coreSliceLenMir]
         traitImpls := []
         callStack := []
         activeCallee := .none
         activeProtectors := [] }
+    let mem₁ : Memory :=
+      { mem₀ with
+        borrows :=
+          (invalidateDirectDestWriteBorrows mem₀
+            [ .uninit
+            , .init (.ptr p 8)
+            , .init (.scalar { bits := len, sizeBytes := 8 })
+            , .uninit ]
+            { local_ := 3, projection := [] }).borrows }
     change wpMirExecFrameAndTraitsModularSym _ 14 externalSpecSliceCallerMir
       (.running
         { frame :=

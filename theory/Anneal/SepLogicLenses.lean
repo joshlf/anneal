@@ -2972,6 +2972,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq
         rw [hEnvNone, hT, hCaller]
         dsimp only
         rw [hRead]
+        all_goals rfl
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · injection hCopy with hPlace
@@ -3007,6 +3008,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq
         rw [hEnvNone, hT, hCaller]
         dsimp only
         rw [hRead]
+        all_goals rfl
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · nomatch hCopy
@@ -8235,6 +8237,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
+          all_goals rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8307,6 +8310,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
+          all_goals rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -8364,6 +8368,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only
           rw [hRead]
+          all_goals rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8400,6 +8405,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
           rw [hEl]
           dsimp only [readProjectedValue]
           rw [hRead]
+          all_goals rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8439,6 +8445,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only
           rw [hRead]
+          all_goals rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -8475,6 +8482,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
           rw [hEl]
           dsimp only [readProjectedValue]
           rw [hRead]
+          all_goals rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy

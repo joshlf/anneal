@@ -738,4 +738,259 @@ theorem div8_set_discriminant_uninit_end_to_end :
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel⟩
 
+/-! ## 9. Pass A1 Cross-Frame & Tree Borrows Regression Witnesses -/
+
+def ptrConstCharDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .not .char, layoutIdx := 0 }, debugName := none }
+def refMutOptionU32Decl : LocalDecl :=
+  { mutability := .mut,
+    ty := { kind := .ref .mut (.adt "core::option::Option" [.uint .u32]), layoutIdx := 0 },
+    debugName := none }
+def ptrMutOptionU32Decl : LocalDecl :=
+  { mutability := .mut,
+    ty := { kind := .rawPtr .mut (.adt "core::option::Option" [.uint .u32]), layoutIdx := 0 },
+    debugName := none }
+def pairU32T : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+def pairU32Decl : LocalDecl := { mutability := .mut, ty := pairU32T, debugName := none }
+
+/-- A1-1: Cross-frame `evalOperand` `.copy` / `.move` deref of raw-overwritten `char` validates
+surrogates (`0xD800` -> `.ub`, `0x41` / `0x10FFFF` -> `.ok`). -/
+def calleeDerefPtrCharMir (useMove : Bool) : CapturedMir :=
+  singleBlockBody "witness::callee_deref_ptr_char" 1
+    [charDecl, ptrConstCharDecl]
+    [.assign (locPlace 0)
+       (.use (match useMove with
+              | true => .move (derefPlace 1)
+              | false => .copy (derefPlace 1)))]
+
+def callerCrossFrameCharLoadMir (code : Nat) : CapturedMir :=
+  mkMirBody "witness::caller_cross_frame_char_load" 1
+    [charDecl, charDecl, ptrMutU32Decl, ptrConstCharDecl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1))),
+          mkStmt (.assign (derefPlace 2) (.use (constU32 code))),
+          mkStmt (.assign (locPlace 3) (.rawPtr .not (locPlace 1)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_deref_ptr_char")
+         [.move (locPlace 3)] (locPlace 0) (some 1) .continue_),
+       isCleanup := false },
+     { statements := [mkStmt (.storageDead 3), mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+theorem a1_cross_frame_char_raw_overwrite_end_to_end :
+    trustedFaultsUB (callerCrossFrameCharLoadMir 0xD800) [calleeDerefPtrCharMir false]
+      [.scalar ⟨0x41, 4⟩] = true ∧
+    trustedFaultsUB (callerCrossFrameCharLoadMir 0xD800) [calleeDerefPtrCharMir true]
+      [.scalar ⟨0x41, 4⟩] = true ∧
+    runTrustedScalar? (callerCrossFrameCharLoadMir 0x41) [calleeDerefPtrCharMir false]
+      [.scalar ⟨0x41, 4⟩] = .some (0x41, 4) ∧
+    runTrustedScalar? (callerCrossFrameCharLoadMir 0x10FFFF) [calleeDerefPtrCharMir true]
+      [.scalar ⟨0x41, 4⟩] = .some (0x10FFFF, 4) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- A1-2: `writeIntrinsicReturn` & `resumeExternalCall` destination Tree Borrows invalidation and
+root-frame `callerLocals` deref write support. -/
+def intrinsicDirectWriteInvalidatesBorrowMir : CapturedMir :=
+  mkMirBody "witness::intrinsic_direct_write_invalidates_borrow" 1
+    [u32Decl, u32Decl, refSharedU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.assign (locPlace 2) (.ref .shared (locPlace 1)))],
+       terminator := mkTerm (.call
+         (fnDefOp "core::intrinsics::wrapping_add" [.uint .u32])
+         [.copy (locPlace 1), constU32 1]
+         (locPlace 1) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0) (.use (.copy (derefPlace 2)))),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def intrinsicDerefWriteInvalidatesSiblingMir (readStaleShared : Bool) : CapturedMir :=
+  mkMirBody "witness::intrinsic_deref_write_invalidates_sibling" 1
+    [u32Decl, u32Decl, refMutU32Decl, refSharedU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1))),
+          mkStmt (.assign (locPlace 3) (.ref .shared (derefPlace 2)))],
+       terminator := mkTerm (.call
+         (fnDefOp "core::intrinsics::wrapping_add" [.uint .u32])
+         [constU32 10, constU32 20]
+         (derefPlace 2) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0)
+           (.use (.copy (match readStaleShared with
+                         | true => derefPlace 3
+                         | false => locPlace 1)))),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def rootCallerLocalsIntrinsicDerefMir : CapturedMir :=
+  mkMirBody "witness::root_caller_locals_intrinsic_deref" 1
+    [u32Decl, refMutU32Decl]
+    [{ statements := [],
+       terminator := mkTerm (.call
+         (fnDefOp "core::intrinsics::wrapping_add" [.uint .u32])
+         [constU32 10, constU32 20]
+         (derefPlace 1) (some 1) .continue_),
+       isCleanup := false },
+     { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (derefPlace 1))))],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def rootCallerLocalsMachineState : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.ptr { allocId := 9, offsetBytes := 0 } 8)] }
+    memory := { emptyMemory with
+                borrows := [{ tag := 9, targetLocal := 2, targetProjection := [],
+                              perm := .active, targetFrameDepth := 0 }]
+                callerLocals := [.dead, .dead, .init (.scalar ⟨5, 4⟩)] } }
+
+theorem a1_intrinsic_and_extcall_dest_borrows_end_to_end :
+    trustedFaultsUB intrinsicDirectWriteInvalidatesBorrowMir [] [.scalar ⟨7, 4⟩] = true ∧
+    trustedFaultsUB (intrinsicDerefWriteInvalidatesSiblingMir true) [] [.scalar ⟨7, 4⟩] = true ∧
+    runTrustedScalar? (intrinsicDerefWriteInvalidatesSiblingMir false) [] [.scalar ⟨7, 4⟩] =
+      .some (30, 4) ∧
+    runScalarFuel rootCallerLocalsIntrinsicDerefMir 10 rootCallerLocalsMachineState =
+      .some (30, 4) ∧
+    (match resumeExternalCall
+        { frame := { blockIdx := 0, stmtIdx := 0,
+                     locals := [.uninit, .init (.scalar ⟨7, 4⟩)] }
+          memory := { emptyMemory with
+                      borrows := [{ tag := 4, targetLocal := 1, targetProjection := [],
+                                    perm := .frozen, targetFrameDepth := 0 }] } }
+        [.uninit, .init (.scalar ⟨7, 4⟩)]
+        (locPlace 1) 1 .continue_
+        (.returned (.scalar ⟨8, 4⟩)
+          { emptyMemory with
+            borrows := [{ tag := 4, targetLocal := 1, targetProjection := [],
+                          perm := .frozen, targetFrameDepth := 0 }] }) with
+     | .running s' => s'.memory.borrows.map (·.perm)
+     | _ => []) = [.disabled] := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, rfl⟩
+
+/-- A1-3: Cross-frame `SetDiscriminant(*out, variantIdx)` on both initialized and `.uninit` enum
+referents. -/
+def calleeSetDiscrSomeMir : CapturedMir :=
+  singleBlockBody "witness::callee_set_discr_some" 1
+    [isizeDecl, refMutOptionU32Decl]
+    [.setDiscriminant (derefPlace 1) 1,
+     .assign (locPlace 0) (.use (constIsize 0))]
+
+def callerSetDiscrCrossFrameInitMir : CapturedMir :=
+  mkMirBody "witness::caller_set_discr_cross_frame_init" 1
+    [isizeDecl, optionU32Decl, refMutOptionU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_set_discr_some")
+         [.move (locPlace 2)] { local_ := 0, projection := [] } (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0) (.discriminant (locPlace 1))),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def calleeSetDiscrPtrNoneMir : CapturedMir :=
+  singleBlockBody "witness::callee_set_discr_ptr_none" 1
+    [isizeDecl, ptrMutOptionU32Decl]
+    [.setDiscriminant (derefPlace 1) 0,
+     .assign (locPlace 0) (.use (constIsize 9))]
+
+def callerSetDiscrCrossFrameUninitMir : CapturedMir :=
+  mkMirBody "witness::caller_set_discr_cross_frame_uninit" 1
+    [isizeDecl, u32Decl, optionU32Decl, ptrMutOptionU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.assign (locPlace 3) (.rawPtr .mut (locPlace 2)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_set_discr_ptr_none")
+         [.move (locPlace 3)] (locPlace 0) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0) (.discriminant (locPlace 2))),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+theorem a1_cross_frame_set_discriminant_deref_end_to_end :
+    runTrustedScalar? callerSetDiscrCrossFrameInitMir [calleeSetDiscrSomeMir]
+      [.aggregate 0 [.scalar ⟨0, 4⟩]] = .some (1, 8) ∧
+    runTrustedScalar? callerSetDiscrCrossFrameUninitMir [calleeSetDiscrPtrNoneMir]
+      [.scalar ⟨0, 4⟩] = .some (0, 8) := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-- A1-4: Cross-frame `copy_nonoverlapping` preserves parent `&mut` tag on child `*mut` write and
+preserves sibling field borrow `&pair.1` on `copy_nonoverlapping` into `&raw mut pair.0`. -/
+def calleeCopyU32Mir : CapturedMir :=
+  singleBlockBody "witness::callee_copy_u32" 2
+    [u32Decl, ptrConstU32Decl, ptrMutU32Decl]
+    [.intrinsic (.copyNonOverlapping (.copy (locPlace 1)) (.copy (locPlace 2)) (constUsize 1)),
+     .assign (locPlace 0) (.use (constU32 0))]
+
+def callerChildPtrCopyPreservesParentMir : CapturedMir :=
+  mkMirBody "witness::caller_child_ptr_copy_preserves_parent" 1
+    [u32Decl, u32Decl, u32Decl, refMutU32Decl, ptrMutU32Decl, ptrConstU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.storageLive 4),
+          mkStmt (.storageLive 5),
+          mkStmt (.assign (locPlace 2) (.use (constU32 99))),
+          mkStmt (.assign (locPlace 3) (.ref (.mut false) (locPlace 1))),
+          mkStmt (.assign (locPlace 4) (.rawPtr .mut (derefPlace 3))),
+          mkStmt (.assign (locPlace 5) (.rawPtr .not (locPlace 2)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_copy_u32")
+         [.move (locPlace 5), .move (locPlace 4)] (locPlace 0) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0) (.use (.copy (derefPlace 3)))),
+          mkStmt (.storageDead 5),
+          mkStmt (.storageDead 4),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def callerFieldCopyPreservesSiblingBorrowMir : CapturedMir :=
+  mkMirBody "witness::caller_field_copy_preserves_sibling_borrow" 1
+    [u32Decl, pairU32Decl, u32Decl, refSharedU32Decl, ptrMutU32Decl, ptrConstU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.storageLive 4),
+          mkStmt (.storageLive 5),
+          mkStmt (.assign (locPlace 2) (.use (constU32 88))),
+          mkStmt (.assign (locPlace 3) (.ref .shared { local_ := 1, projection := [.field 1 u32T] })),
+          mkStmt (.assign (locPlace 4) (.rawPtr .mut { local_ := 1, projection := [.field 0 u32T] })),
+          mkStmt (.assign (locPlace 5) (.rawPtr .not (locPlace 2)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_copy_u32")
+         [.move (locPlace 5), .move (locPlace 4)] (locPlace 0) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0) (.use (.copy (derefPlace 3)))),
+          mkStmt (.storageDead 5),
+          mkStmt (.storageDead 4),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+theorem a1_foreign_copy_nonoverlapping_tree_borrows_end_to_end :
+    runTrustedScalar? callerChildPtrCopyPreservesParentMir [calleeCopyU32Mir]
+      [.scalar ⟨11, 4⟩] = .some (99, 4) ∧
+    runTrustedScalar? callerFieldCopyPreservesSiblingBorrowMir [calleeCopyU32Mir]
+      [.aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨77, 4⟩]] = .some (77, 4) := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
 end Anneal.TcbCorrespondenceDiv8Tests

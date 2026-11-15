@@ -12764,6 +12764,26 @@ theorem StateCorr.jump {env : CfgEnv} {bb : Nat} {slots slots' : List LocalSlotS
     StateCorr env t slots' { s with frame := { blockIdx := t, stmtIdx := 0, locals := locals' } } :=
   ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
 
+private theorem StateCorr.jumpDirectDest {env : CfgEnv} {bb : Nat}
+    {slots slots' : List LocalSlotState} {s : MachineState}
+    (hCorr : StateCorr env bb slots s) (t : Nat)
+    (localsAfterArgs updatedLocals : List LocalSlot) (dest : Place)
+    (hRel : SlotsRefine SlotBelow slots' updatedLocals) :
+    StateCorr env t slots' {
+      frame := { blockIdx := t, stmtIdx := 0, locals := updatedLocals }
+      memory := invalidateDirectDestWriteBorrows s.memory localsAfterArgs dest
+    } := by
+  unfold invalidateDirectDestWriteBorrows
+  cases s.memory.borrows with
+  | nil => exact hCorr.jump t updatedLocals hRel
+  | cons _ _ =>
+    cases dest.projection with
+    | nil =>
+      exact ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
+    | cons hd _ =>
+      cases hd <;>
+        exact ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
+
 /-- Left-to-right operand list evaluation `evalOperandsState` refines Trusted's `evalOperands`
 under `SlotsRefine SlotBelow` when no operand begins with `.deref`. -/
 theorem evalOperandsState_below_refines :
@@ -13199,6 +13219,30 @@ theorem writePlaceState_dest_below_refines_callStack {arityOf : Ty → VariantId
       | false =>
         cases pHead <;> first | rfl | simp [projectionHasDeref] at hDeref
   exact ⟨locals', hCS.trans hWPV, hRel'⟩
+
+private theorem writeIntrinsicReturn_of_writePlaceState_ok
+    {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {s : MachineState}
+    {locals' updatedLocals : List LocalSlot}
+    {dest : Place} {destTy : Ty} {targetBb : BasicBlockIdx} {rv : Value}
+    (hWr : writePlaceState arityOf slots dest destTy rv = .ok slots')
+    (hWPV :
+      writePlaceValue locals' s.memory.borrows dest rv (callStack := s.memory.callStack) =
+        .ok updatedLocals) :
+    writeIntrinsicReturn s locals' dest targetBb rv =
+      MirStepNode.step {
+        frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows s.memory locals' dest
+      } := by
+  rcases dest with ⟨loc, _ | ⟨pHead, pTail⟩⟩
+  · simp [writeIntrinsicReturn, hWPV]
+  · unfold writePlaceState at hWr
+    cases hD : projectionHasDeref (pHead :: pTail) with
+    | true => rw [hD] at hWr; nomatch hWr
+    | false =>
+      cases pHead with
+      | deref => simp [projectionHasDeref] at hD
+      | _ => simp [writeIntrinsicReturn, hWPV]
 
 /-- `resolveIntrinsicIsSigned` depends only on `target.typeArgs`, never on `target.defPath` or
 `target.isIndirect`. -/
@@ -13676,7 +13720,7 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
           (evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
             (some cm)) s' ∧
         StateCorr env next slots' s' ∧
-        s'.memory = s.memory
+        (s.memory.borrows = [] → s'.memory = s.memory)
     | .returned _ => False
     | .panicked _ =>
       evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
@@ -13747,8 +13791,10 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                           (s := { s with frame := ⟨bb, sIdx, locals1⟩ })
                           (target := { defPath := defPath, typeArgs := typeArgs, isIndirect := false })
                           (locals' := locals2) (destination := dest) (targetBb := targetBb) hKind hEv
-                      refine ⟨{ s with frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals } },
-                        Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3, rfl⟩
+                      refine ⟨{ frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+                                memory := invalidateDirectDestWriteBorrows s.memory locals2 dest },
+                        Or.inl ?_, hCorr.jumpDirectDest targetBb locals2 updatedLocals dest hRel3,
+                        fun hB => by simp [invalidateDirectDestWriteBorrows, hB]⟩
                       have hDir :=
                         evalDirectRustIntrinsic_of_nonSelect
                           (s := { s with frame := ⟨bb, sIdx, locals1⟩ })
@@ -13771,7 +13817,7 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                           isDirectExactDivTarget, hNotEx, hDir]
                         exact hNonSel
                       rw [hStepEval]
-                      simp [writeIntrinsicReturn, hWPV]
+                      exact writeIntrinsicReturn_of_writePlaceState_ok hWr hWPV
           · cases op with
           | unreachableUnchecked =>
             nomatch hBodyCall
@@ -13819,7 +13865,7 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                 · nomatch hBodyCall
                 · obtain rfl := cfgGoto_eq_some hBodyCall
                   refine ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals2 } },
-                    Or.inl ?_, hCorr.jump c locals2 hRel2, rfl⟩
+                    Or.inl ?_, hCorr.jump c locals2 hRel2, fun _ => rfl⟩
                   simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
                     hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
                     applyUnwindAction]
@@ -13860,13 +13906,16 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                         · rename_i isSigned hSignSynth
                           simp only [Option.map_eq_some_iff] at hEv
                           obtain ⟨retScalar, hDiv, rfl⟩ := hEv
-                          refine ⟨{ s with frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals } },
-                            Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3, rfl⟩
+                          refine ⟨{ frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+                                    memory := invalidateDirectDestWriteBorrows s.memory locals2 dest },
+                            Or.inl ?_, hCorr.jumpDirectDest targetBb locals2 updatedLocals dest hRel3,
+                            fun hB => by simp [invalidateDirectDestWriteBorrows, hB]⟩
                           simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
                             hResTgt, hDecls, hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee,
                             isDirectExactDivTarget, hExPath]
                           rw [resolveIntrinsicIsSigned_defPath_irrel _ { defPath := "", typeArgs := typeArgs, isIndirect := false } _ _ _ _ _ rfl, hSignSynth]
-                          simp only [hDiv, writeIntrinsicReturn, hWPV]
+                          simp only [hDiv]
+                          exact writeIntrinsicReturn_of_writePlaceState_ok hWr hWPV
                         · cases hEv
                       · cases v1 <;> cases v2 <;> cases hEv
           | ctlz | ctlzNonzero | cttz | cttzNonzero | ctpop | bswap | bitreverse
@@ -13954,7 +14003,10 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
       cases s.memory.activeProtectors <;> cases s.memory.borrows <;> rfl) :
     match step with
     | .goto next slots' _ =>
-      ∃ s', TrustedStep (stepMirFn cm s) s' ∧ StateCorr env next slots' s' ∧ s'.memory = s.memory
+      ∃ s',
+        TrustedStep (stepMirFn cm s) s' ∧
+        StateCorr env next slots' s' ∧
+        (s.memory.borrows = [] → s'.memory = s.memory)
     | .returned v =>
       stepMirFn cm s =
         .retNormal v
@@ -13979,7 +14031,7 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
         rw [hT] at h
         simp only at h
         obtain rfl := cfgGoto_eq_some h
-        refine ⟨_, Or.inl ?_, hCorr.jump t s.frame.locals hCorr.slots, rfl⟩
+        refine ⟨_, Or.inl ?_, hCorr.jump t s.frame.locals hCorr.slots, fun _ => rfl⟩
         simp only [LTerminator.toTrusted, evalTerminator]
       | switchInt discr bytes targets =>
         rw [hT] at hRef
@@ -13993,7 +14045,7 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
               obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots slots'
                 s.frame.locals discr (.scalar sc) s.memory.borrows env.globals env.layouts
                 s.memory.callerLocals hCorr.slots hRef hOp
-              refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel, rfl⟩
+              refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel, fun _ => rfl⟩
               simp only [LTerminator.toTrusted, evalTerminator, hBody.layouts, hCorr.globals,
                 hCorr.stack, hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
             · nomatch h
@@ -14040,7 +14092,7 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
               dsimp only
               split at h
               · obtain rfl := cfgGoto_eq_some h
-                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
+                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, fun _ => rfl⟩
               · nomatch h
             · -- `false` asserted to be `true`: the assertion fails
               rw [show (((0 : Nat) == 1) == true) = false from rfl] at h
@@ -14065,7 +14117,7 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
                   · nomatch h
                   · obtain rfl := cfgGoto_eq_some h
                     exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                      Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
+                      Or.inl rfl, hCorr.jump c locals' hRel, fun _ => rfl⟩
               · nomatch h
             · -- `true` asserted to be `false`: the assertion fails
               rw [show (((1 : Nat) == 1) == false) = false from rfl] at h
@@ -14090,7 +14142,7 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
                   · nomatch h
                   · obtain rfl := cfgGoto_eq_some h
                     exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                      Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
+                      Or.inl rfl, hCorr.jump c locals' hRel, fun _ => rfl⟩
               · nomatch h
             · -- `true` asserted to be `true`: the assertion passes
               rw [show (((1 : Nat) == 1) == true) = true from rfl] at h
@@ -14098,7 +14150,7 @@ private theorem evalLoweredTerminator_refines_trusted_aux {env : CfgEnv} {body :
               dsimp only
               split at h
               · obtain rfl := cfgGoto_eq_some h
-                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
+                exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, fun _ => rfl⟩
               · nomatch h
           · nomatch h
         · nomatch h
@@ -14232,7 +14284,7 @@ theorem runLoweredCfgSteps_refines_trusted {env : CfgEnv} {body : LBody} {cm : C
         | goto next slots' unwinding' =>
           simp only at h hRef
           obtain ⟨s', hStep, hCorr', hMem⟩ := hRef
-          have hBorrows' : s'.memory.borrows = [] := by rw [hMem, hBorrows]
+          have hBorrows' : s'.memory.borrows = [] := by rw [hMem hBorrows, hBorrows]
           have hRest := ih next slots' unwinding' s' hCorr' h hBorrows'
           cases o with
           | outOfFuel bb' slots'' _ =>
@@ -15421,7 +15473,7 @@ private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} 
     match step with
     | .goto next slots' _ =>
       ∃ s', TrustedStep (stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ }) s' ∧
-        StateCorr env next slots' s' ∧ s'.memory = s.memory
+        StateCorr env next slots' s' ∧ (s.memory.borrows = [] → s'.memory = s.memory)
     | .returned v =>
       stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } =
         .retNormal v
@@ -15446,7 +15498,7 @@ private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} 
       rw [hT] at h
       simp only at h
       obtain rfl := cfgGoto_eq_some h
-      exact ⟨_, Or.inl rfl, hCorr.jump t locals1 hRel1, rfl⟩
+      exact ⟨_, Or.inl rfl, hCorr.jump t locals1 hRel1, fun _ => rfl⟩
     | switchInt discr bytes targets =>
       rw [hT] at hRef h
       simp only at h
@@ -15458,7 +15510,7 @@ private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} 
             obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots1 slots'
               locals1 discr (.scalar sc) s.memory.borrows env.globals env.layouts
               s.memory.callerLocals hRel1 hRef hOp
-            refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel, rfl⟩
+            refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel, fun _ => rfl⟩
             simp only [LTerminator.toTrusted, evalTerminator, hLayouts, hCorr.globals,
               hCorr.stack, hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
           · nomatch h
@@ -15503,7 +15555,7 @@ private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} 
             dsimp only
             split at h
             · obtain rfl := cfgGoto_eq_some h
-              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
+              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, fun _ => rfl⟩
             · nomatch h
           · rw [show (((0 : Nat) == 1) == true) = false from rfl] at h
             simp only [Bool.false_eq_true, ↓reduceIte] at h
@@ -15527,7 +15579,7 @@ private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} 
                 · nomatch h
                 · obtain rfl := cfgGoto_eq_some h
                   exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                    Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
+                    Or.inl rfl, hCorr.jump c locals' hRel, fun _ => rfl⟩
             · nomatch h
           · rw [show (((1 : Nat) == 1) == false) = false from rfl] at h
             simp only [Bool.false_eq_true, ↓reduceIte] at h
@@ -15551,14 +15603,14 @@ private theorem evalLoweredTerminator_at_end_refines_trusted_aux {env : CfgEnv} 
                 · nomatch h
                 · obtain rfl := cfgGoto_eq_some h
                   exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
-                    Or.inl rfl, hCorr.jump c locals' hRel, rfl⟩
+                    Or.inl rfl, hCorr.jump c locals' hRel, fun _ => rfl⟩
             · nomatch h
           · rw [show (((1 : Nat) == 1) == true) = true from rfl] at h
             simp only [↓reduceIte] at h
             dsimp only
             split at h
             · obtain rfl := cfgGoto_eq_some h
-              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, rfl⟩
+              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel, fun _ => rfl⟩
             · nomatch h
         · nomatch h
       · nomatch h
@@ -15701,7 +15753,7 @@ theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBo
           | goto next slots' unwinding' =>
             simp only at h hRef
             obtain ⟨s', hStep, hCorr', hMem⟩ := hRef
-            have hBorrows' : s'.memory.borrows = [] := by rw [hMem, hBorrows]
+            have hBorrows' : s'.memory.borrows = [] := by rw [hMem hBorrows, hBorrows]
             have hRest := ih next slots' unwinding' s' hCorr' h hBorrows'
             cases o with
             | outOfFuel bb' slots'' _ =>
@@ -24730,8 +24782,8 @@ theorem stepLoweredWithCallTable_refines_trusted
                                           isDirectExactDivTarget, hNotEx]
                                         erw [hDir]
                                         exact hNonSel
-                                      rw [hStepEval]
-                                      simp [writeIntrinsicReturn, hWPV, sEnd, sNext]
+                                      rw [hStepEval, writeIntrinsicReturn_of_writePlaceState_ok hWr hWPV]
+                                      simp [invalidateDirectDestWriteBorrows, hCorr.borrows, sNext]
                                     exact ⟨sNext, activeCm,
                                       hRun1.trans (.step hTS (.refl sNext)),
                                       { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩
@@ -24856,7 +24908,9 @@ theorem stepLoweredWithCallTable_refines_trusted
                                             rw [resolveIntrinsicIsSigned_defPath_irrel _
                                               { defPath := "", typeArgs := typeArgs, isIndirect := false }
                                               _ _ _ _ _ rfl, hSignSynth]
-                                            simp [hDiv, writeIntrinsicReturn, hWPV, sNext]
+                                            simp only [hDiv]
+                                            rw [writeIntrinsicReturn_of_writePlaceState_ok hWr hWPV]
+                                            simp [invalidateDirectDestWriteBorrows, hCorr.borrows, sNext]
                                           exact ⟨sNext, activeCm,
                                             hRun1.trans (.step hTS (.refl sNext)),
                                             { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩

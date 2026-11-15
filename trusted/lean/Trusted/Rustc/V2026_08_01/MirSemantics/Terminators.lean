@@ -670,7 +670,7 @@ def writeReturnDestination
                 dst
                 restProj
                 mem.callStack }
-    | .ub => foreignFrameDerefWrite callerLocals mem dst restProj retVal
+    | .ub => foreignFrameDerefWrite callerLocals mem dst restProj retVal localDecls layouts
     | .unsupported => .unsupported
   | proj :: rest =>
     let resolvedLocalProj :=
@@ -949,6 +949,42 @@ def applyUnwindAction
     }
 
 /--
+Update `mem.borrows` after a direct (non-deref) destination write to `dst` in
+the active frame (`depth = length mem.callStack`), leaving `mem` syntactically
+unchanged when `mem.borrows = .nil` or `dst.projection = .deref :: _`.
+-/
+@[reducible]
+def invalidateDirectDestWriteBorrows
+    (mem : Memory)
+    (locals : List LocalSlot)
+    (dst : Place) :
+    Memory :=
+  match mem.borrows with
+  | .nil => mem
+  | bHead :: bTail =>
+    let borrows := bHead :: bTail
+    let depth := length mem.callStack
+    match dst.projection with
+    | .nil =>
+      { mem with borrows := invalidateConflictingBorrows borrows dst.local_ .none depth }
+    | .deref :: _ => mem
+    | proj :: rest =>
+      let resolvedLocalProj :=
+        match resolveBorrowProjectionElems locals (proj :: rest) with
+        | .some rp => rp
+        | .none => proj :: rest
+      { mem with
+        borrows :=
+          invalidateConflictingBorrowsAtProj
+            borrows
+            dst.local_
+            .none
+            resolvedLocalProj
+            0
+            0
+            depth }
+
+/--
 Resume after an external `TerminatorKind.call` response `ans : MirCallAns`,
 writing `retVal` to `destination` and updating `Memory` on normal return, or
 dispatching `unwind` / `.abort` on abnormal return.
@@ -963,27 +999,41 @@ def resumeExternalCall
     MirExecState :=
   match ans with
   | .returned retVal memAfter =>
-    match
-      writePlaceValue
-        localsAfterArgs
-        memAfter.borrows
-        destination
-        retVal
-        (callStack := memAfter.callStack)
-    with
-    | .ok updatedLocals =>
-      .running {
-        frame := {
-          s.frame with
-          blockIdx := targetBb
-          stmtIdx := 0
-          locals := updatedLocals
-        }
-        memory := memAfter
-      }
-    | .ub =>
-      match memAfter.callStack, destination.projection with
-      | _ :: _, .deref :: restProj =>
+    match destination.projection with
+    | .deref :: restProj =>
+      match
+        evalPlaceWrite
+          localsAfterArgs
+          memAfter.borrows
+          destination
+          retVal
+          memAfter.activeProtectors
+          .nil
+          emptyLayoutTable
+          memAfter.callStack
+      with
+      | .ok updatedLocals =>
+        match derefWriteTreeUB localsAfterArgs memAfter.borrows destination with
+        | true => .faulted .ub
+        | false =>
+          let borrows' :=
+            invalidateDerefWriteBorrows
+              localsAfterArgs
+              memAfter.borrows
+              destination
+              restProj
+              memAfter.callerLocals
+              memAfter.callStack
+          .running {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := { memAfter with borrows := borrows' }
+          }
+      | .ub =>
         match foreignFrameDerefWrite localsAfterArgs memAfter destination restProj retVal with
         | .ok updatedLocals mem' =>
           .running {
@@ -997,8 +1047,35 @@ def resumeExternalCall
           }
         | .ub => .faulted .ub
         | .unsupported => .faulted .unsupported
-      | _, _ => .faulted .ub
-    | .unsupported => .faulted .unsupported
+      | .unsupported => .faulted .unsupported
+    | _ =>
+      match
+        evalPlaceWrite
+          localsAfterArgs
+          memAfter.borrows
+          destination
+          retVal
+          memAfter.activeProtectors
+          .nil
+          emptyLayoutTable
+          memAfter.callStack
+      with
+      | .ok updatedLocals =>
+        .running {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
+          }
+          memory := {
+            memAfter with
+            borrows :=
+              (invalidateDirectDestWriteBorrows memAfter localsAfterArgs destination).borrows
+          }
+        }
+      | .ub => .faulted .ub
+      | .unsupported => .faulted .unsupported
   | .panicked memAfter =>
     applyUnwindAction s localsAfterArgs memAfter unwind
   | .aborted => .halted .abort
@@ -2171,27 +2248,41 @@ def writeIntrinsicReturn
     (targetBb : BasicBlockIdx)
     (retVal : Value) :
     MirStepNode :=
-  match
-    writePlaceValue
-      locals'
-      s.memory.borrows
-      destination
-      retVal
-      (callStack := s.memory.callStack)
-  with
-  | .ok updatedLocals =>
-    MirStepNode.step {
-      frame := {
-        s.frame with
-        blockIdx := targetBb
-        stmtIdx := 0
-        locals := updatedLocals
-      }
-      memory := s.memory
-    }
-  | .ub =>
-    match s.memory.callStack, destination.projection with
-    | _ :: _, .deref :: restProj =>
+  match destination.projection with
+  | .deref :: restProj =>
+    match
+      evalPlaceWrite
+        locals'
+        s.memory.borrows
+        destination
+        retVal
+        s.memory.activeProtectors
+        .nil
+        emptyLayoutTable
+        s.memory.callStack
+    with
+    | .ok updatedLocals =>
+      match derefWriteTreeUB locals' s.memory.borrows destination with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let borrows' :=
+          invalidateDerefWriteBorrows
+            locals'
+            s.memory.borrows
+            destination
+            restProj
+            s.memory.callerLocals
+            s.memory.callStack
+        MirStepNode.step {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
+          }
+          memory := { s.memory with borrows := borrows' }
+        }
+    | .ub =>
       match foreignFrameDerefWrite locals' s.memory destination restProj retVal with
       | .ok updatedLocals mem' =>
         MirStepNode.step {
@@ -2205,8 +2296,28 @@ def writeIntrinsicReturn
         }
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
-    | _, _ => MirStepNode.fail .ub
-  | .unsupported => MirStepNode.unsupported
+    | .unsupported => MirStepNode.unsupported
+  | _ =>
+    match
+      writePlaceValue
+        locals'
+        s.memory.borrows
+        destination
+        retVal
+        (callStack := s.memory.callStack)
+    with
+    | .ok updatedLocals =>
+      MirStepNode.step {
+        frame := {
+          s.frame with
+          blockIdx := targetBb
+          stmtIdx := 0
+          locals := updatedLocals
+        }
+        memory := invalidateDirectDestWriteBorrows s.memory locals' destination
+      }
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
 
 /--
 Write an optional scalar intrinsic result `resOpt` to `destination` and advance

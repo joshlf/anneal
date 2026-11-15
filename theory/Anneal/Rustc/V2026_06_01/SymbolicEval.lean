@@ -1760,7 +1760,7 @@ def finishAssignStmtNode
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
         | _ :: _ =>
-          evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val
+          evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
       | .unsupported => MirStepNode.unsupported
     | proj :: rest =>
       match get? locals₁ dst.local_ with

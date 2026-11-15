@@ -10237,19 +10237,7 @@ def evalOperand
               | .none =>
                 match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
                 | .some (.init targetRootVal) =>
-                  match
-                    needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
-                  with
-                  | false =>
-                    let fullProj :=
-                      match entry.targetProjection with
-                      | .nil => restProj
-                      | ph :: pt => ph :: appendProjections pt restProj
-                    match readProjectedValue locals targetRootVal fullProj with
-                    | .ok fieldVal => .ok fieldVal locals
-                    | .ub => .ub
-                    | .unsupported => .unsupported
-                  | true =>
+                  let runTypedForeignRead : PlaceReadResult :=
                     let (targetDecls, targetLayouts) :=
                       foreignFrameDeclsAndLayouts
                         callStack
@@ -10271,6 +10259,28 @@ def evalOperand
                         targetLayouts
                         { local_ := entry.targetLocal, projection := entry.targetProjection })
                       targetDecls
+                  match
+                    foreignFrameTarget?
+                      callStack
+                      callerLocals
+                      entry.targetFrameDepth
+                      entry.targetLocal
+                  with
+                  | .some (.savedFrame _ _) => runTypedForeignRead
+                  | _ =>
+                    match
+                      needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+                    with
+                    | false =>
+                      let fullProj :=
+                        match entry.targetProjection with
+                        | .nil => restProj
+                        | ph :: pt => ph :: appendProjections pt restProj
+                      match readProjectedValue locals targetRootVal fullProj with
+                      | .ok fieldVal => .ok fieldVal locals
+                      | .ub => .ub
+                      | .unsupported => .unsupported
+                    | true => runTypedForeignRead
                 | _ => .ub
           | .none =>
             let globalAlignTyOpt : Option Ty :=
@@ -10497,19 +10507,7 @@ def evalOperand
               | .none =>
                 match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
                 | .some (.init targetRootVal) =>
-                  match
-                    needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
-                  with
-                  | false =>
-                    let fullProj :=
-                      match entry.targetProjection with
-                      | .nil => restProj
-                      | ph :: pt => ph :: appendProjections pt restProj
-                    match readProjectedValue locals targetRootVal fullProj with
-                    | .ok fieldVal => .ok fieldVal locals
-                    | .ub => .ub
-                    | .unsupported => .unsupported
-                  | true =>
+                  let runTypedForeignRead : PlaceReadResult :=
                     let (targetDecls, targetLayouts) :=
                       foreignFrameDeclsAndLayouts
                         callStack
@@ -10531,6 +10529,28 @@ def evalOperand
                         targetLayouts
                         { local_ := entry.targetLocal, projection := entry.targetProjection })
                       targetDecls
+                  match
+                    foreignFrameTarget?
+                      callStack
+                      callerLocals
+                      entry.targetFrameDepth
+                      entry.targetLocal
+                  with
+                  | .some (.savedFrame _ _) => runTypedForeignRead
+                  | _ =>
+                    match
+                      needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+                    with
+                    | false =>
+                      let fullProj :=
+                        match entry.targetProjection with
+                        | .nil => restProj
+                        | ph :: pt => ph :: appendProjections pt restProj
+                      match readProjectedValue locals targetRootVal fullProj with
+                      | .ok fieldVal => .ok fieldVal locals
+                      | .ub => .ub
+                      | .unsupported => .unsupported
+                    | true => runTypedForeignRead
                 | _ => .ub
           | .none =>
             let globalAlignTyOpt : Option Ty :=
@@ -11873,7 +11893,11 @@ def writeCallerPlaceValue
                 layouts
                 pointeeTyOpt
                 accessedTyOpt
-                .nil
+                (foreignFrameDeclsAndLayouts
+                  callStack
+                  layouts
+                  entry.targetFrameDepth
+                  entry.targetLocal).1
       | .none => .ub
     | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
       let sliceAlignTyOpt : Option Ty :=

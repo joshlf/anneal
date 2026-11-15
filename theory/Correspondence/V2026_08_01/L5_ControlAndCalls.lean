@@ -4238,6 +4238,29 @@ theorem mir_evalTerminator_pointee_resolution_fails_closed
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
 
+private theorem evalSignedDiv_ok_mem_eq
+    {a b sz : Nat} {locals locals' : List LocalSlot} {mem mem' : Memory} {v : Value}
+    (h : evalSignedDiv a b sz locals mem = .ok v locals' mem') :
+    mem' = mem := by
+  unfold evalSignedDiv at h
+  dsimp (config := { zeta := true }) only at h
+  split at h
+  · cases h
+  · cases h; rfl
+
+private theorem evalExactDiv_ok_mem_eq
+    {lhs rhs : ScalarInt} {locals locals' : List LocalSlot} {mem mem' : Memory}
+    {isSigned : Bool} {v : Value}
+    (h : evalExactDiv lhs rhs locals mem isSigned = .ok v locals' mem') :
+    mem' = mem := by
+  unfold evalExactDiv at h
+  dsimp (config := { zeta := true }) only at h
+  repeat' (first
+    | (cases h; done)
+    | (cases h; rfl)
+    | exact evalSignedDiv_ok_mem_eq h
+    | split at h)
+
 /--
 **Theorem L5.31 (`mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds`)**:
 Completes the positive and negative (`.ub`) correspondence for missing-pointee
@@ -4560,14 +4583,15 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
       hEx, resolveIntrinsicIsSigned, operandTy, placeTy]
     split
     · next retVal localsAfter memAfter h_ex =>
-      simp only [h_ex, writeIntrinsicReturn]
+      have hMemNil : memAfter.borrows = [] := by
+        rw [evalExactDiv_ok_mem_eq h_ex]
+      simp only [h_ex, writeIntrinsicReturn, invalidateDirectDestWriteBorrows, hMemNil]
       have h_wpv :
-          writePlaceValue localsAfter memAfter.borrows { local_ := 0, projection := .nil } retVal
+          writePlaceValue localsAfter [] { local_ := 0, projection := .nil } retVal
               (callStack := memAfter.callStack) =
-            writePlaceValue localsAfter memAfter.borrows { local_ := 0, projection := .nil } retVal := rfl
+            writePlaceValue localsAfter [] { local_ := 0, projection := .nil } retVal := rfl
       rw [h_wpv]
-      cases writePlaceValue localsAfter memAfter.borrows { local_ := 0, projection := .nil } retVal <;>
-        cases memAfter.callStack <;> rfl
+      cases writePlaceValue localsAfter [] { local_ := 0, projection := .nil } retVal <;> rfl
     · next h_ex => simp only [h_ex]
     · next h_ex => simp only [h_ex]
   · have h : classifyRustIntrinsic? "core::intrinsics::saturating_add" = .some .saturatingAdd := rfl

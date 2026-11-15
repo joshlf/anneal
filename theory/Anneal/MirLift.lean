@@ -192,6 +192,7 @@ macro_rules
            Anneal.MirLiftCore.callFrameMem,
            Anneal.MirLiftCore.tailCallFrameMem,
            Anneal.MirLiftCore.returnFrameMem,
+           invalidateDirectDestWriteBorrows,
            disableFrameBorrows, restoreCallerProtectors, lookupSwitchTarget,
            Option.getD, List.set, Nat.add]))
 

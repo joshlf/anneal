@@ -89,7 +89,7 @@ theorem evalStmt_preserves_frame {bbIdx stmtIdx env mem stmt decls layouts ms'}
   (h_step : evalStmt { frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := env }, memory := mem } stmt decls layouts = .step ms') :
   ms'.frame.blockIdx = bbIdx ∧ ms'.frame.stmtIdx = stmtIdx + 1 := by
   cases h_k : stmt.kind <;> (
-    unfold evalStmt evalForeignFrameDerefWrite evalSetDiscriminantLocal at h_step
+    unfold evalStmt evalSetDiscriminantDerefWrite evalForeignFrameDerefWrite evalSetDiscriminantLocal at h_step
     rw [h_k] at h_step h_pure
     dsimp [isPureStatement] at h_pure
     first | contradiction | (
@@ -1160,10 +1160,14 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       resolveIntrinsicIsSigned resolvedTarget cur.localDecls cur.layouts
           (lhsOp :: rhsOps) = some isSigned →
       evalExactDiv lhs rhs isSigned = some retScalar →
-      writePlaceValue env' mem.borrows destination (.scalar retScalar)
-          (callStack := mem.callStack) =
+      (match destination.projection with
+       | .deref :: _ => PlaceWriteResult.ub
+       | _ =>
+         writePlaceValue env' mem.borrows destination (.scalar retScalar)
+           (callStack := mem.callStack)) =
         .ok updatedEnv →
-      post (.frame targetBb 0 updatedEnv mem) →
+      post (.frame targetBb 0 updatedEnv
+        (invalidateDirectDestWriteBorrows mem env' destination)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .call func (lhsOp :: rhsOps) destination (some targetBb) unwind,
           span := span }
@@ -1731,9 +1735,15 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     rw [h_signed]
     dsimp only []
     rw [h_div]
-    dsimp only [writeIntrinsicReturn]
-    rw [h_write]
-    exact h_next
+    rename_i func lhsOp rhsOps destination _ _ _ _ _ _ _ _ _ _ _
+    rcases destination with ⟨dLoc, _ | ⟨dHd, dTl⟩⟩
+    · dsimp only [writeIntrinsicReturn] at h_write ⊢
+      rw [h_write]
+      exact h_next
+    · cases dHd <;>
+      first
+      | (cases h_write; done)
+      | (dsimp only [writeIntrinsicReturn] at h_write ⊢; rw [h_write]; exact h_next)
   | tailCallDirect h_callee h_args h_ctx h_noDealloc h_next =>
     rename_i func argOps span defPath typeArgs argVals env' calleeBody
     have h_res :=

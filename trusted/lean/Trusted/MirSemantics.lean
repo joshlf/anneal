@@ -102,14 +102,17 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   preventsDeallocation copyEntriesTargetActiveFrame
-  evalForeignFrameCopySingleDirect setDiscriminantUninitDeclOk
+  borrowsAfterCopySingleDirect evalForeignFrameCopySingleDirect
+  setDiscriminantUninitDeclOk
   evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
   foreignFrameDerefWrite evalForeignFrameDerefWrite
+  evalSetDiscriminantDerefWrite
   evalStmt lookupSwitchTarget findCallee?
   extractCalleeDefPath? restoreCallerProtectors hasFrameDeallocProtectorConflict
   disableFrameBorrows disableFramesAbove writeReturnDestination pushCalleeFrame
   pushDivergingCalleeFrame enterTailCalleeFrame unwindFromCallStack
-  applyUnwindAction resumeExternalCall resumeExternalDivergingCall
+  applyUnwindAction invalidateDirectDestWriteBorrows
+  resumeExternalCall resumeExternalDivergingCall
   resumeExternalTailCall isDirectExactDivTarget RustIntrinsicKind
   classifyRustIntrinsic? rigidTyIsSigned intrinsicIntSignedness?
   resolveIntrinsicIsSigned resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
