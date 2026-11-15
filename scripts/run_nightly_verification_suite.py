@@ -1068,6 +1068,28 @@ _LEAN_RUN_VALUE_OPTS: frozenset[str] = frozenset(
         "--local-rev",
     )
 )
+_LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
+    (
+        "--probe",
+        "--print-limits",
+        "--json",
+        "--no-slot-lock",
+        "--sync-if-behind",
+        "-h",
+        "--help",
+    )
+)
+_LEAN_RUN_LONG_OPTS: tuple[str, ...] = tuple(
+    sorted(o for o in (_LEAN_RUN_VALUE_OPTS | _LEAN_RUN_BOOL_OPTS) if o.startswith("--"))
+)
+
+
+def _resolve_lean_run_opt(opt: str) -> str:
+    """Resolve `argparse` long-option prefix abbreviations (e.g. `--time` -> `--timeout`)."""
+    if opt in _LEAN_RUN_VALUE_OPTS or opt in _LEAN_RUN_BOOL_OPTS or not opt.startswith("--"):
+        return opt
+    matches = [cand for cand in _LEAN_RUN_LONG_OPTS if cand.startswith(opt)]
+    return matches[0] if len(matches) == 1 else opt
 
 
 def _is_lean_run_wrapped(cmd: list[str]) -> bool:
@@ -1094,9 +1116,12 @@ def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
         val: str | None = None
         if "=" in tok and tok.startswith("-"):
             opt, val = tok.split("=", 1)
-        elif opt in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
-            val = cmd[i + 1]
-            i += 1
+            opt = _resolve_lean_run_opt(opt)
+        else:
+            opt = _resolve_lean_run_opt(opt)
+            if opt in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
+                val = cmd[i + 1]
+                i += 1
         if opt == "--no-slot-lock":
             slot_lock = False
         elif opt == "--mode" and val is not None:
@@ -1121,7 +1146,9 @@ def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
     return mode, timeout, slot_lock
 
 
-def _outer_timeout_sec(cmd: list[str], timeout_sec: int) -> int:
+def _outer_timeout_sec(
+    cmd: list[str], timeout_sec: int, env: dict[str, str] | None = None
+) -> int:
     """Outer Python deadline for a step: the step budget itself for direct commands,
     and for `anneal-lean-run` wrapped ones the wrapper's worst-case lifetime (build
     slot queueing + its own `--timeout` + termination) plus a grace margin, so the
@@ -1129,6 +1156,16 @@ def _outer_timeout_sec(cmd: list[str], timeout_sec: int) -> int:
     if not _is_lean_run_wrapped(cmd):
         return timeout_sec
     mode, inner_timeout, slot_lock = _lean_run_wrapper_flags(cmd)
+    if inner_timeout is None:
+        env_map = os.environ if env is None else env
+        raw_env_timeout = env_map.get("ANNEAL_LEAN_TIMEOUT_SEC", "").strip()
+        if raw_env_timeout:
+            try:
+                parsed = int(raw_env_timeout)
+                if parsed > 0:
+                    inner_timeout = parsed
+            except ValueError:
+                pass
     inner = inner_timeout if inner_timeout is not None else LEAN_RUN_DEFAULT_TIMEOUT_SEC[mode]
     worst = inner
     if mode == "build" and slot_lock:
@@ -1217,7 +1254,7 @@ def _run_step(
     _ensure_toolchain_path(env)
     if env_overrides:
         env.update(env_overrides)
-    outer_timeout = _outer_timeout_sec(cmd, timeout_sec)
+    outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
     timed_out = False
     try:
         proc = subprocess.Popen(

@@ -216,13 +216,18 @@ def _is_ident_char(ch: str) -> bool:
 _BLANK_BYTES_TABLE = bytes(10 if i == 10 else 32 for i in range(256))
 
 
+def _blank_multiline(seg: str) -> str:
+    """`seg` (already known to contain `\\n`) with non-newlines replaced by spaces."""
+    if seg.isascii():
+        return seg.encode("ascii").translate(_BLANK_BYTES_TABLE).decode("ascii")
+    return "\n".join([" " * len(part) for part in seg.split("\n")])
+
+
 def _blank(seg: str) -> str:
     """`seg` with every character except newlines replaced by a space."""
     if "\n" not in seg:
         return " " * len(seg)
-    if seg.isascii():
-        return seg.encode("ascii").translate(_BLANK_BYTES_TABLE).decode("ascii")
-    return "\n".join([" " * len(part) for part in seg.split("\n")])
+    return _blank_multiline(seg)
 
 
 def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) -> str:
@@ -245,42 +250,82 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
     app = out.append  # bound once: the loop runs once per comment/string token
     find = text.find
     pos = 0
-    i_blk = find("/-", 0)
     i_lin = find("--", 0)
+    if i_lin == -1:
+        i_lin = n
+    i_blk = find("/-", 0)
+    if i_blk == -1:
+        i_blk = n
     i_str = find('"', 0)
+    if i_str == -1:
+        i_str = n
     i_gui = find("«", 0)
+    if i_gui == -1:
+        i_gui = n
     while pos < n:
-        if i_blk != -1 and i_blk < pos:
-            i_blk = find("/-", pos)
-        if i_lin != -1 and i_lin < pos:
+        if i_lin < pos:
             i_lin = find("--", pos)
-        if i_str != -1 and i_str < pos:
+            if i_lin == -1:
+                i_lin = n
+        if i_blk < pos:
+            i_blk = find("/-", pos)
+            if i_blk == -1:
+                i_blk = n
+        if i_str < pos:
             i_str = find('"', pos)
-        if i_gui != -1 and i_gui < pos:
+            if i_str == -1:
+                i_str = n
+        if i_gui < pos:
             i_gui = find("«", pos)
+            if i_gui == -1:
+                i_gui = n
 
-        nxt = n
-        kind = 0
-        if 0 <= i_blk < nxt:
+        nxt = i_lin
+        if i_blk < nxt:
             nxt = i_blk
-            kind = 1
-        if 0 <= i_lin < nxt:
-            nxt = i_lin
-            kind = 2
-        if 0 <= i_str < nxt:
+        if i_str < nxt:
             nxt = i_str
-            kind = 3
-        if 0 <= i_gui < nxt:
+        if i_gui < nxt:
             nxt = i_gui
-            kind = 4
 
-        if kind == 0:
+        if nxt == n:
             app(text[pos:])
             break
         if nxt > pos:
             app(text[pos:nxt])
 
-        if kind == 4:
+        if nxt == i_lin:
+            # `--` line comment up to (not including) the newline
+            nl = find("\n", nxt + 2)
+            end = n if nl == -1 else nl
+            app(" " * (end - nxt))
+            pos = end
+            continue
+
+        if nxt == i_blk:
+            # `/- ... -/` block comment with arbitrary nesting depth
+            depth = 1
+            cur = nxt + 2
+            while depth > 0 and cur < n:
+                c = find("-/", cur)
+                if c == -1:
+                    cur = n
+                    break
+                o = find("/-", cur, c)
+                if o != -1:
+                    depth += 1
+                    cur = o + 2
+                else:
+                    depth -= 1
+                    cur = c + 2
+            if find("\n", nxt, cur) == -1:
+                app(" " * (cur - nxt))
+            else:
+                app(_blank_multiline(text[nxt:cur]))
+            pos = cur
+            continue
+
+        if nxt == i_gui:
             # `'«'` is a character literal, not an opening guillemet identifier; blank
             # it when stripping literals so a `»` inside a trailing `--` comment never pairs.
             if (
@@ -302,37 +347,6 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
             else:
                 app("«")
                 pos = nxt + 1
-            continue
-
-        if kind == 2:
-            # `--` line comment up to (not including) the newline
-            nl = find("\n", nxt + 2)
-            end = n if nl == -1 else nl
-            app(" " * (end - nxt))
-            pos = end
-            continue
-
-        if kind == 1:
-            # `/- ... -/` block comment with arbitrary nesting depth
-            depth = 1
-            cur = nxt + 2
-            while depth > 0 and cur < n:
-                c = find("-/", cur)
-                if c == -1:
-                    cur = n
-                    break
-                o = find("/-", cur, c)
-                if o != -1:
-                    depth += 1
-                    cur = o + 2
-                else:
-                    depth -= 1
-                    cur = c + 2
-            if find("\n", nxt, cur) == -1:
-                app(" " * (cur - nxt))
-            else:
-                app(_blank(text[nxt:cur]))
-            pos = cur
             continue
 
         # Raw string literal `r"..."` / `r#"..."#` and quote character literals `'"'` /
@@ -372,7 +386,6 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
             ):
                 app('"' if keep_strings else " ")
                 pos = nxt + 1
-                i_str = find('"', pos)
                 continue
         q = find('"', nxt + 1)
         if q == -1:
@@ -399,7 +412,7 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
         elif find("\n", nxt, cur) == -1:
             app(" " * (cur - nxt))
         else:
-            app(_blank(text[nxt:cur]))
+            app(_blank_multiline(text[nxt:cur]))
         pos = cur
     return "".join(out)
 
@@ -1015,6 +1028,8 @@ def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
 
 
 def _line_indent_at(stripped: str, pos: int) -> int:
+    if pos <= 0 or stripped[pos - 1] == "\n":
+        return 0
     line_start = stripped.rfind("\n", 0, pos) + 1
     k = line_start
     n = len(stripped)
@@ -1059,24 +1074,34 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
     max_end = min(n, start_pos + 2500)
     # Fast C `str.find(":=")` path before running regexes across all 2,500 chars:
     # check boundaries only on the short `[start_pos:first_ce]` slice when unambiguous.
-    # Any `|` defers to the full walk below: with a `«` later before the boundary it
-    # demands a top-level `:` (a `[inst : C] | ...` header has none) and balanced
-    # nesting order, which these whole-slice substring and count checks cannot see.
+    # If `cand0` contains `|`, it is only eligible for this whole-slice check when
+    # `stripped[first_ce:max_end]` is also free of `«` (so the non-guillemet branch at
+    # line 1091 would run anyway) and no equation-arm line precedes `first_ce` without
+    # an earlier `match` / `fun`.
     first_ce = stripped.find(":=", start_pos, max_end)
     if first_ce != -1:
         cand0 = stripped[start_pos:first_ce]
         if (
             ":" in cand0
-            and "|" not in cand0
             and "let " not in cand0
             and "where" not in cand0
             and "«" not in cand0
             and cand0.count("(") == cand0.count(")")
             and cand0.count("{") == cand0.count("}")
             and cand0.count("[") == cand0.count("]")
-            and _next_decl_boundary(stripped, start_pos, first_ce, decl_indent) == first_ce
         ):
-            return cand0, first_ce + 2
+            pipe_ok = "|" not in cand0
+            if not pipe_ok and stripped.find("«", first_ce, max_end) == -1:
+                m_alt = _EQN_ALT_LINE_RE.search(cand0)
+                pipe_ok = (
+                    m_alt is None
+                    or _MATCH_OR_FUN_RE.search(cand0, 0, m_alt.start()) is not None
+                )
+            if pipe_ok and (
+                "\n" not in cand0
+                or _next_decl_boundary(stripped, start_pos, first_ce, decl_indent) == first_ce
+            ):
+                return cand0, first_ce + 2
 
     limit = _next_decl_boundary(stripped, start_pos, max_end, decl_indent)
     eqn_end = False
@@ -1095,12 +1120,12 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
             if colon_eq == -1:
                 break
             candidate = stripped[start_pos:colon_eq]
+            if "let " in candidate or "where" in candidate:
+                break
             if (
                 candidate.count("(") == candidate.count(")")
                 and candidate.count("{") == candidate.count("}")
                 and candidate.count("[") == candidate.count("]")
-                and "let " not in candidate
-                and "where" not in candidate
             ):
                 return (candidate, colon_eq + 2) if ":" in candidate else ("", -1)
             search_pos = colon_eq + 2
@@ -1775,21 +1800,23 @@ def _duplicate_private_findings(
     stripped: str,
 ) -> list[ProofHealthFinding]:
     # Only run full alpha-renaming signature normalization on declarations whose
-    # 4-tuple structural fingerprint `(colons, parens, braces, equals)` collides
-    # with at least one other local or sibling declaration.
-    fp_counts: dict[tuple[int, int, int, int], int] = {}
+    # `(_sig_class(kind), sig_fp)` collides with at least one other local or sibling
+    # declaration of the same class (`def` vs `prop`).
+    fp_counts: dict[tuple[str, tuple[int, int, int, int]], int] = {}
     has_legacy_decls = False
     for d in ext_decls + local_decls:
         if d.sig_fp != (0, 0, 0, 0):
-            fp_counts[d.sig_fp] = fp_counts.get(d.sig_fp, 0) + 1
+            fk = (_sig_class(d.kind), d.sig_fp)
+            fp_counts[fk] = fp_counts.get(fk, 0) + 1
         elif d.norm_sig:
             has_legacy_decls = True
 
     def sig_key(d: PrivateDecl) -> tuple[str, str] | None:
-        if not (has_legacy_decls or fp_counts.get(d.sig_fp, 0) >= 2):
+        cls = _sig_class(d.kind)
+        if not (has_legacy_decls or fp_counts.get((cls, d.sig_fp), 0) >= 2):
             return None
         ns = d.ensure_norm_sig()
-        return (_sig_class(d.kind), ns) if ns else None
+        return (cls, ns) if ns else None
 
     # Binderless definitions (`"_v0" not in norm_sig`) hash their comment-stripped,
     # whitespace-free UTF-8 bytes directly in C (`bytes.translate`), which separates

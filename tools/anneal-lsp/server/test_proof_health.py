@@ -1821,13 +1821,20 @@ class TestPerformanceAndDogfood(unittest.TestCase):
             "private theorem t (x : Nat) ) (h : a | b : True := by\n  exact «x»\n",
         ):
             self.assertEqual(proof_health._decl_header_span(hdr, start, 0), ("", -1), hdr)
-        # A set-builder `|` header with a real top-level `:` keeps its header.
+        # A set-builder `|` header with a real top-level `:` keeps its header, and
+        # guillemet-free `||` / inline `match` headers stay on the fast path.
         set_builder = "private theorem t {s : Set Nat} (h : s = {x | x > 0}) : s = s := by\n  exact «q»\n"
         self.assertEqual(
             proof_health._decl_header_span(set_builder, start, 0),
             (" {s : Set Nat} (h : s = {x | x > 0}) : s = s ", set_builder.index(":= by") + 2),
         )
         self.assertEqual(scan(set_builder + set_builder.replace(" t ", " u ", 1)), [(R5, 3, "u")])
+        no_gui_or = "private theorem t (a b : Bool) (h : (a || b) = true) : True := trivial\n"
+        self.assertEqual(
+            proof_health._decl_header_span(no_gui_or, start, 0),
+            (" (a b : Bool) (h : (a || b) = true) : True ", no_gui_or.index(":= trivial") + 2),
+        )
+        self.assertEqual(scan(no_gui_or + no_gui_or.replace(" t ", " u ", 1)), [(R5, 2, "u")])
 
 
 class TestTranscriptLatencyTelemetry(unittest.TestCase):

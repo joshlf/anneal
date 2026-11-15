@@ -322,6 +322,19 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         ]
         self.assertEqual(suite._lean_run_wrapper_flags(inner_sep), ("build", 600, True))
         self.assertEqual(suite._outer_timeout_sec(inner_sep, 600), 600 + 600 + grace)
+        # `argparse` long-option prefix abbreviations (`--time`, `--no-slot`, `--conc`) and
+        # `ANNEAL_LEAN_TIMEOUT_SEC` env fallback when `--timeout` is omitted.
+        abbrev = [lr, "--mo", "build", "--no-slot", "--conc=1", "--time", "450", "--", "lake", "build"]
+        self.assertEqual(suite._lean_run_wrapper_flags(abbrev), ("build", 450, False))
+        self.assertEqual(suite._outer_timeout_sec(abbrev, 300), 450 + grace)
+        self.assertEqual(
+            suite._outer_timeout_sec(auto_build, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "1500"}),
+            1500 + 1500 + grace,
+        )
+        self.assertEqual(
+            suite._outer_timeout_sec(auto_file, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "240"}),
+            240 + grace,
+        )
         # A wrapped step never gets a shorter outer deadline than its own budget.
         for profile in ("quick", "nightly"):
             for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):
