@@ -1836,6 +1836,20 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         )
         self.assertEqual(scan(no_gui_or + no_gui_or.replace(" t ", " u ", 1)), [(R5, 2, "u")])
 
+    def test_rule5_fingerprint_prefilter_is_kind_agnostic(self) -> None:
+        # Renaming a guillemet binder (`«p:q»` -> `_v0`) drops the punctuation inside
+        # it, so the alpha-equivalent theorems `a` and `b` have different structural
+        # fingerprints. They are still compared because the defs `c` / `d` share those
+        # fingerprints: the pre-filter counts collisions across all kinds, and a
+        # per-kind count would silently drop both reported duplicates.
+        src = (
+            "private theorem a («p:q» : Nat) : «p:q» = «p:q» := rfl\n"
+            "private theorem b (x : Nat) : x = x := rfl\n"
+            "private def c («r:s» : Nat) : «r:s» = «r:s» := rfl\n"
+            "private def d (y : Nat) : y = y := rfl\n"
+        )
+        self.assertEqual(scan(src), [(R5, 2, "b"), (R5, 4, "d")])
+
 
 class TestTranscriptLatencyTelemetry(unittest.TestCase):
     def test_compute_unbatched_tool_latencies_events_and_jsonl(self) -> None:

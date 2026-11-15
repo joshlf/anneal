@@ -1800,23 +1800,24 @@ def _duplicate_private_findings(
     stripped: str,
 ) -> list[ProofHealthFinding]:
     # Only run full alpha-renaming signature normalization on declarations whose
-    # `(_sig_class(kind), sig_fp)` collides with at least one other local or sibling
-    # declaration of the same class (`def` vs `prop`).
-    fp_counts: dict[tuple[str, tuple[int, int, int, int]], int] = {}
+    # 4-tuple structural fingerprint `(colons, parens, braces, equals)` collides
+    # with at least one other local or sibling declaration. The count is deliberately
+    # kind-agnostic: renaming a guillemet binder (`«p:q»` -> `_v0`) drops the
+    # punctuation inside it, so equal normalized signatures need not have equal
+    # fingerprints, and a per-kind count would skip duplicates reported today.
+    fp_counts: dict[tuple[int, int, int, int], int] = {}
     has_legacy_decls = False
     for d in ext_decls + local_decls:
         if d.sig_fp != (0, 0, 0, 0):
-            fk = (_sig_class(d.kind), d.sig_fp)
-            fp_counts[fk] = fp_counts.get(fk, 0) + 1
+            fp_counts[d.sig_fp] = fp_counts.get(d.sig_fp, 0) + 1
         elif d.norm_sig:
             has_legacy_decls = True
 
     def sig_key(d: PrivateDecl) -> tuple[str, str] | None:
-        cls = _sig_class(d.kind)
-        if not (has_legacy_decls or fp_counts.get((cls, d.sig_fp), 0) >= 2):
+        if not (has_legacy_decls or fp_counts.get(d.sig_fp, 0) >= 2):
             return None
         ns = d.ensure_norm_sig()
-        return (cls, ns) if ns else None
+        return (_sig_class(d.kind), ns) if ns else None
 
     # Binderless definitions (`"_v0" not in norm_sig`) hash their comment-stripped,
     # whitespace-free UTF-8 bytes directly in C (`bytes.translate`), which separates
