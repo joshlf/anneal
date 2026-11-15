@@ -337,14 +337,15 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             240 + grace,
         )
         # Explicit `--timeout 0` on the command line overrides `ANNEAL_LEAN_TIMEOUT_SEC`
-        # (falling back to the mode default 900s/180s), and `-- --` double separators strip cleanly.
+        # (falling back to the mode default 900s/180s), and `-- --` leaves the second
+        # `--` in `inner` (so `detect_mode` resolves to `"build"`, matching `anneal-lean-run`).
         explicit_zero = [lr, "--timeout", "0", "--", "lake", "build", "Anneal"]
         self.assertEqual(
             suite._outer_timeout_sec(explicit_zero, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "1500"}),
             900 + 900 + grace,
         )
         double_sep = [lr, "--", "--", "lake", "env", "lean", "X.lean"]
-        self.assertEqual(suite._lean_run_wrapper_flags(double_sep), ("file", None, True))
+        self.assertEqual(suite._lean_run_wrapper_flags(double_sep), ("build", None, True))
         # A wrapped step never gets a shorter outer deadline than its own budget.
         for profile in ("quick", "nightly"):
             for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):

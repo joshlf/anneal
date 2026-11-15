@@ -1109,8 +1109,6 @@ def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool
         tok = cmd[i]
         if tok == "--":
             i += 1
-            if i < n and cmd[i] == "--":
-                i += 1
             break
         if not tok.startswith("-") or tok == "-":
             break
