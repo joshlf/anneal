@@ -24,7 +24,9 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    refines both live returns. Test 2b simulates the diamond block for block:
    a 4-block `PureLift` `BlockCfg` is matched by header-targeted live runs
    into `bb1`/`bb2` and `bb3` under `mirCfgStateRel` (the joined loan realized
-   on the live machine at `bb3`), and `mir_blockCfg_sound` concludes.
+   on the live machine at `bb3`), and `mir_blockCfg_sound` concludes. Test 2c
+   runs a 3-block `while` loop with a back-edge through
+   `CfgCertificate.whileLoop` and `mir_cfgCertificate_sound`.
 3. **Hybrid `SpatialPin` freeze → `zerocopy` byte write → unpin**: the frozen
    block is the place's trusted byte window (`TypedAt`), the spatial mutation
    writes exactly the bytes produced by the live raw-pointer `*mut u8` store,
@@ -38,10 +40,13 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    and the live store, and unpinning restores the full two-loan relation.
    Test 3e repeats the whole-tuple bridge at the body's own tuple type and
    captured rustc layout (`u32PairLayoutMirCodec`, `FieldsShape.arbitrary
-   [0, 4]`), with a reordered-layout falsification canary.
+   [0, 4]`), with a reordered-layout falsification canary, the `zerocopy`
+   marker traits across layouts, and the padded `(u8, u32)` trichotomy.
 4. **Negative canaries**: overlapping `&mut` borrows are rejected by `PermTree`
    (and their conflicting accesses are Tree Borrows UB on live MIR); unpinning
-   `.uninit` bytes or the invalid `bool` pattern `0x02` fails.
+   `.uninit` bytes or the invalid `bool` pattern `0x02` fails. Test 4c shows a
+   live padded `(u8, u32)` place cannot complete the pin lifecycle: its
+   window-faithful freeze is refused and no block mirroring its window unpins.
 
 Like a real `anneal-rustc-capture` body, every fixture carries its own layout
 table (`fixtureLayouts`), in which the `(u32, u32)` locals point at their own
@@ -2107,5 +2112,115 @@ theorem pinned_mutate_wrong_length_rejected :
       zc_freeze_general (by decide),
    mutateSpatialInState_fail_of_length_ne rfl (u32_isIntoBytes zcLayouts)
       zc_freeze_general (by decide)⟩
+
+/-! ### Test 4c: Padded `(u8, u32)` Pin over Live MIR — Freeze Accepted, Unpin Refused -/
+
+/-- `*mut (u8, u32)`. -/
+def rawU8U32Ty : Ty := { kind := .rawPtr .mut (.tuple [.uint .u8, .uint .u32]), layoutIdx := 0 }
+
+/-- `fn pin_padded(a: u8, b: u32) -> (u8, u32) { let mut p = (a, b);
+let q = &raw mut p; p }` over the captured padded layout table `u8U32Layouts`
+(`p : (u8, u32)` at layout entry `1`: size `8`, offsets `[0, 4]`, padding
+`[1..4)`). -/
+def paddedPinBody : CapturedMir :=
+  { mkBody 2
+      [decl .mut (u8U32Ty 1), decl .not u8Ty, decl .not u32Ty, decl .mut (u8U32Ty 1),
+       decl .not rawU8U32Ty]
+      [mkBb
+        [mkSt (.storageLive 3),
+         mkSt (.assign (pl 3) (.aggregate .tuple [.copy (pl 1), .copy (pl 2)])),
+         mkSt (.storageLive 4),
+         mkSt (.assign (pl 4) (.rawPtr .mut (pl 3))),
+         mkSt (.storageDead 4),
+         mkSt (.assign (pl 0) (.use (.copy (pl 3)))),
+         mkSt (.storageDead 3)]
+        .return_] with
+    layouts := u8U32Layouts }
+
+def pdMs0 : MachineState :=
+  initMachineState paddedPinBody [.scalar ⟨7, 1⟩, .scalar ⟨zcV0, 4⟩]
+
+/-- Live state right after `q = &raw mut p`: the `unique` tag `1` is rooted at
+the whole padded place `_3`. -/
+def pdMsPinned : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 4,
+        locals :=
+          [.uninit, .init (.scalar ⟨7, 1⟩), .init (.scalar ⟨zcV0, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨zcV0, 4⟩]), .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { pdMs0.memory with
+        borrows := [{ tag := 1, targetLocal := 3, targetProjection := [], perm := .unique }]
+        nextTag := 2 } }
+
+theorem pd_pinned_path :
+    StepPath (Anneal.PureMirExec.mirStep paddedPinBody) pdMs0 4 pdMsPinned :=
+  stepPath_of_runSilentSteps rfl
+
+/-- `PureLift` state after `p = (a, b); q = &mut p` (loan `0` on the whole of `p`). -/
+def pdStBorrowed : SymState StdVal :=
+  ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩,
+    ⟨.pair (.nat 7) (.nat zcV0), .mutLocked 0⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.pair (.nat 7) (.nat zcV0), .unborrowed⟩, .direct (.localReg 2) []⟩],
+   [], [], [], 0⟩
+
+theorem pd_borrowed_eval :
+    evalPlan stdValAlg
+        (.seq (.act (.assign (.localSub 2 [])
+            (.binary stdMkPair (.localSub 0 []) (.localSub 1 []))))
+          (.act (.borrow 3 .mutBorrow (.localSub 2 []))))
+        ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩], [], [], [], [], 0⟩ =
+      .ok (.continuing pdStBorrowed) := rfl
+
+/-- The padded whole-tuple codec at the body's own `(u8, u32)` type and layouts. -/
+def pdCodec :
+    MirTypedByteCodec u8U32Layouts (u8U32Ty 1)
+      ({v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}) 8 :=
+  u8U32PaddedMirCodec u8U32Layouts 1 u8U32RustcLayout [0, 1] rfl rfl rfl
+
+/-- `p = (a, b)`; `q = &mut p` (loan `0`); pin; unpin; end; return `p`. -/
+def pdPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.localSub 2 []) (.binary stdMkPair (.localSub 0 []) (.localSub 1 []))))
+    (.seq (.act (.borrow 3 .mutBorrow (.localSub 2 [])))
+      (.seq (.act (.freezeSpatial 0 u8U32PaddedSpatialCodec))
+        (.seq (.act (.reabsorbSpatial 0 u8U32PaddedSpatialCodec))
+          (.act (.endLoan 0)))))
+
+/-- **(k) Padded aggregates cannot complete the `SpatialPin` lifecycle (live
+MIR)**: at the padded `(u8, u32)` place `_3` of `paddedPinBody`, the loan is
+realized on the live machine (a mutation-granting tag rooted at `_3`), but the
+place's trusted window carries three `.uninit` padding bytes, and the
+window-faithful codec's frozen cells are exactly that window. Hence:
+1. freezing is refused (`u8U32Padded_freeze_refused`, from the live window);
+2. even a block related to the live window by *any* codec can never be
+   unpinned (`u8U32Padded_unpin_blocked`);
+3. the lifted pin → unpin function fails in `PureLift`.
+This is the `SpatialPin` face of `u8U32Padded_not_isIntoBytes`; contrast Test 3,
+where the `IsIntoBytes` `u32` window pins and unpins. -/
+theorem padded_pin_refused :
+    placeByteWindow? u8U32Layouts (u8U32Ty 1) pdMsPinned 3 [] =
+      some (u8ExactLE.encode ⟨7, by decide⟩ ++ [.uninit, .uninit, .uninit] ++
+        u32ExactLE.encode ⟨zcV0, by decide⟩) ∧
+    BorrowAt pdMsPinned (tagOfLoan 0) 3 [] mutGranting ∧
+    abstractBytesOfCells (u8U32PaddedSpatialCodec.encode (.pair (.nat 7) (.nat zcV0))) =
+      placeByteWindow? u8U32Layouts (u8U32Ty 1) pdMsPinned 3 [] ∧
+    hasUninitCell (u8U32PaddedSpatialCodec.encode (.pair (.nat 7) (.nat zcV0))) = true ∧
+    freezeToSpatialInState stdValAlg 0 u8U32PaddedSpatialCodec pdStBorrowed = .fail ∧
+    (∀ (st : SymState StdVal) (ms : MachineState) (bid : BlockId) (c c' : SpatialCodec StdVal),
+      spatialPinnedBlockHolds tagOfLoan u8U32Layouts (u8U32Ty 1) 0 bid c 3 [] st ms →
+      unpinFromSpatialInState stdValAlg 0 c' st = .fail) ∧
+    evalFnValue stdValAlg [⟨.byVal, .nat 7⟩, ⟨.byVal, .nat zcV0⟩] pdPlan
+      (.use (.localSub 2 [])) = .fail := by
+  have hFreeze := spatialCodec_freeze_eq_placeByteWindow pdCodec 40 u8U32Embed u8U32Embed?
+    u8U32Embed_embed? pdMsPinned 3 [] (.pair (.nat 7) (.nat zcV0))
+    (⟨7, by decide⟩, ⟨zcV0, by decide⟩) rfl rfl
+  exact ⟨rfl, ⟨_, rfl, rfl, rfl, rfl⟩, hFreeze.2.1.trans hFreeze.1.symm, rfl,
+    u8U32Padded_freeze_refused (layouts := u8U32Layouts) (idx := 1) (l := u8U32RustcLayout)
+      (mem := [0, 1]) rfl rfl rfl stdValAlg 0 (ms := pdMsPinned) (lc := 3) (path := [])
+      (x := (⟨7, by decide⟩, ⟨zcV0, by decide⟩)) ⟨_, rfl, rfl⟩ rfl,
+    fun _ _ _ _ c' h =>
+      u8U32Padded_unpin_blocked (layouts := u8U32Layouts) (idx := 1) (l := u8U32RustcLayout)
+        (mem := [0, 1]) rfl rfl rfl h stdValAlg c',
+    rfl⟩
 
 end PureLiftV2026BridgeTests

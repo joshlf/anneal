@@ -51,7 +51,9 @@ machine state:
    into the live step function under `mirCfgStateRel` (each block-entry
    `PureLift` state realized on the live machine at the matching MIR block
    header) into the same conclusion, with no `CfgCertificate`;
-   `mir_cfgCertificate_sound` is its certificate-driven corollary.
+   `mir_cfgCertificate_sound` is its certificate-driven corollary, and
+   `CfgCertificate.whileLoop` packages `cfg_certificate_while_sound` as a
+   3-block loop certificate with a back-edge.
 5. **Byte-window `SpatialCodec`s (`MirTypedByteCodec`).** A fixed-width
    `SepLogicLenses.ByteLensCodec α n` that agrees with the trusted operational
    byte codec `encodeValueToBytes` / `decodeValueFromBytes` at MIR type `ty`
@@ -93,6 +95,20 @@ machine state:
    `mutate_preserves_bindings`, `unpin_preserves_bindings`, and
    `unpin_restores_mirStateRel_frame`, which restores the full relation for the
    unpinned loan together with every disjoint sibling binding.
+8. **Captured rustc layouts and the padding boundary.** Whole `(u32, u32)`
+   tuples are covered under in-order and reordered captured layouts
+   (`u32PairLayoutMirCodec`, `u32PairReorderedLayoutMirCodec`, with `FromBytes`
+   / `IntoBytes` / `TryFromBytes`). The padded `(u8, u32)` layout is `FromBytes`
+   and `TryFromBytes` but not `IntoBytes` (`u8U32Padded_*`): every trusted
+   encoding of it carries `.uninit` padding
+   (`encodeValueToBytes_u8U32Padded_not_init`). Since `SpatialPin` neither
+   freezes nor reabsorbs cells carrying `.uninit`
+   (`freezeToSpatialInState_ok_noUninit`,
+   `reabsorbFromSpatialInState_ok_noUninit`), a place whose live window is
+   partially uninitialized can neither be frozen with its window-faithful codec
+   (`freeze_fail_of_window_not_init`) nor be unpinned from a block mirroring its
+   window (`unpin_fail_of_window_not_init`); `u8U32Padded_freeze_refused` and
+   `u8U32Padded_unpin_blocked` instantiate both for padded `(u8, u32)`.
 
 End-to-end regressions over concrete `CapturedMir` bodies live in
 `tests/mir/PureLiftV2026BridgeTests.lean`.
@@ -2125,6 +2141,144 @@ def CfgCertificate.whileLoop {Val : Type} (alg : ValAlgebra Val)
             exact cfg_certificate_while_sound alg cond body retExpr loopFuel
               st0 sFinal retVal hRun hClean hRet hFree
 
+/-- A successful `reabsorbFromSpatialInState` found its pinned block free of
+`.uninit` cells: `SpatialPin` never decodes a partially initialized block. -/
+theorem reabsorbFromSpatialInState_ok_noUninit {Val : Type} {alg : ValAlgebra Val}
+    {lid : LoanId} {codec : SpatialCodec Val} {st st' : SymState Val}
+    (h : reabsorbFromSpatialInState alg lid codec st = .ok st') :
+    Exists fun e => Exists fun bid => Exists fun c => Exists fun blk =>
+    Exists fun rest =>
+      findLoan lid st.loans = some e ∧ e.phase = .spatialPinned bid c ∧
+      findSpatialBlock st.spatial bid = some (blk, rest) ∧
+      hasUninitCell blk.cells = false := by
+  obtain ⟨locals, loans, rgs, deps, sp, tag⟩ := st
+  unfold reabsorbFromSpatialInState at h
+  dsimp only at h
+  cases hU : hasUniqueLoanId lid loans with
+  | false => simp only [hU, Bool.not_false, ↓reduceIte] at h; exact nomatch h
+  | true =>
+    simp only [hU, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+    cases hF : findLoan lid loans with
+    | none => simp only [hF] at h; exact nomatch h
+    | some e =>
+      simp only [hF] at h
+      cases hP : e.phase with
+      | spatialPinned bid c =>
+        simp only [hP] at h
+        cases hId : (c.codecId != codec.codecId) with
+        | true => simp only [hId, ↓reduceIte] at h; exact nomatch h
+        | false =>
+          simp only [hId, Bool.false_eq_true, ↓reduceIte] at h
+          cases hB : findSpatialBlock sp bid with
+          | none => simp only [hB] at h; exact nomatch h
+          | some p =>
+            obtain ⟨blk, rest⟩ := p
+            simp only [hB] at h
+            refine ⟨e, bid, c, blk, rest, rfl, hP, hB, ?_⟩
+            cases hUn : hasUninitCell blk.cells with
+            | false => rfl
+            | true =>
+              simp only [hUn, Bool.not_true, Bool.and_false, Bool.false_eq_true,
+                ↓reduceIte] at h
+              exact nomatch h
+      | activeShared => simp only [hP] at h; exact nomatch h
+      | activeMut => simp only [hP] at h; exact nomatch h
+      | ended => simp only [hP] at h; exact nomatch h
+
+/-- **Unpin is refused while the live window carries `.uninit` bytes**: if the
+mid-pin relation holds and the pinned place's live trusted byte window is not
+fully initialized, then `unpinFromSpatialInState` fails for every codec, since
+the pinned block mirrors that window cell for cell and `SpatialPin` never
+decodes a block with `.uninit` cells. -/
+theorem unpin_fail_of_window_not_init {layouts : LayoutTable} {ty : Ty}
+    {tagOf : LoanId → Nat} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l : Local} {path : SubPath} {st : SymState StdVal} {ms : MachineState}
+    {bs : List AbstractByte}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hWin : placeByteWindow? layouts ty ms l path = some bs)
+    (hNotInit : Anneal.BitValidity.allBytesInitialized bs = false)
+    (alg : ValAlgebra StdVal) (codec' : SpatialCodec StdVal) :
+    unpinFromSpatialInState alg lid codec' st = .fail := by
+  cases hU : unpinFromSpatialInState alg lid codec' st with
+  | fail => rfl
+  | ok st' =>
+    obtain ⟨e, blk, rest, bs0, hFind, hPhase, hBlk, _, _, _, _, hBytes, hWin0, _⟩ := hPin
+    obtain ⟨e1, bid1, c1, blk1, rest1, hFind1, hPhase1, hBlk1, hNoUninit⟩ :=
+      reabsorbFromSpatialInState_ok_noUninit hU
+    rw [hFind] at hFind1
+    injection hFind1 with hEq
+    subst hEq
+    rw [hPhase1] at hPhase
+    obtain ⟨hBid, _, _⟩ := hPhase
+    subst hBid
+    rw [hBlk] at hBlk1
+    injection hBlk1 with hPair
+    injection hPair with hBlkEq _
+    subst hBlkEq
+    rw [hWin] at hWin0
+    injection hWin0 with hBsEq
+    subst hBsEq
+    have hInit := allBytesInitialized_abstractBytesOfCells blk.cells bs hBytes
+    rw [hNotInit, hNoUninit] at hInit
+    exact nomatch hInit
+
+/-- A successful `freezeToSpatialInState` wrote an `.uninit`-free cell window:
+`SpatialPin` never freezes cells carrying `.uninit`. -/
+theorem freezeToSpatialInState_ok_noUninit {Val : Type} {alg : ValAlgebra Val}
+    {lid : LoanId} {codec : SpatialCodec Val} {st st' : SymState Val}
+    (h : freezeToSpatialInState alg lid codec st = .ok st') :
+    Exists fun e =>
+      findLoan lid st.loans = some e ∧ hasUninitCell (codec.encode e.cell.val) = false := by
+  obtain ⟨locals, loans, rgs, deps, sp, tag⟩ := st
+  unfold freezeToSpatialInState at h
+  dsimp only at h
+  split at h
+  · exact nomatch h
+  · split at h
+    · exact nomatch h
+    · rename_i e hFind
+      split at h
+      · exact nomatch h
+      · split at h
+        · exact nomatch h
+        · rename_i hUn
+          refine ⟨e, hFind, ?_⟩
+          cases hc : hasUninitCell (codec.encode e.cell.val) with
+          | false => rfl
+          | true => exact absurd hc hUn
+
+/-- **Freeze is refused when the live window is not fully initialized**: for a
+MIR-typed codec, freezing a loan whose value embeds `x` while the live place
+holds `toValue x` fails whenever the place's trusted byte window carries
+`.uninit` bytes (e.g. alignment padding): the frozen cells would be exactly
+that window (`spatialCodec_freeze_eq_placeByteWindow`), and
+`freezeToSpatialInState` refuses cells with `.uninit`. -/
+theorem freeze_fail_of_window_not_init {layouts : LayoutTable} {ty : Ty} {α : Type}
+    {n : Nat} (m : MirTypedByteCodec layouts ty α n) (cid : Nat)
+    (embed : α → StdVal) (embed? : StdVal → Option α)
+    (embed_embed? : ∀ (v : StdVal) (x : α), embed? v = some x → embed x = v)
+    (alg : ValAlgebra StdVal) (lid : LoanId) {st : SymState StdVal} {ms : MachineState}
+    {l : Local} {path : SubPath} {x : α}
+    (hLoan : Exists fun e => findLoan lid st.loans = some e ∧ embed? e.cell.val = some x)
+    (hPlace : placeValue? ms l path = some (m.toValue x))
+    (hNotInit : ∀ bs, placeByteWindow? layouts ty ms l path = some bs →
+      Anneal.BitValidity.allBytesInitialized bs = false) :
+    freezeToSpatialInState alg lid (m.spatialCodec cid embed embed? embed_embed?) st =
+      .fail := by
+  cases hF : freezeToSpatialInState alg lid (m.spatialCodec cid embed embed? embed_embed?) st with
+  | fail => rfl
+  | ok st' =>
+    obtain ⟨e, hFind, hNoUn⟩ := freezeToSpatialInState_ok_noUninit hF
+    obtain ⟨e0, hFind0, hx⟩ := hLoan
+    rw [hFind] at hFind0
+    injection hFind0 with hEq
+    subst hEq
+    obtain ⟨hWin, hCells, _⟩ := spatialCodec_freeze_eq_placeByteWindow m cid embed embed?
+      embed_embed? ms l path e.cell.val x hx hPlace
+    have hInit := allBytesInitialized_abstractBytesOfCells _ _ hCells
+    rw [hNoUn, hNotInit _ hWin] at hInit
+    exact nomatch hInit
+
 end PinLifecycle
 
 /-! ### Concrete codecs: exact-width little-endian `u32` and Rust `bool` -/
@@ -3752,5 +3906,322 @@ theorem u8U32Padded_not_isIntoBytes {layouts : LayoutTable} {idx : Nat}
     ⟨0, by decide⟩ ⟨0, by decide⟩
   obtain ⟨_, hInit⟩ := hEnc _ _ h0
   exact nomatch hInit
+
+theorem writeAbstractBytesAt_8_0_1_4 :
+    ∀ (b1 b2 : List AbstractByte), b1.length = 1 → b2.length = 4 →
+      (match writeAbstractBytesAt (replicateUninitBytes 8) 0 b1 with
+       | some buf' => writeAbstractBytesAt buf' 4 b2
+       | none => none) = some (b1 ++ [.uninit, .uninit, .uninit] ++ b2)
+  | [_], [_, _, _, _], _, _ => rfl
+  | [], _, h1, _ => nomatch h1
+  | _ :: _ :: _, _, h1, _ => nomatch h1
+  | [_], [], _, h2 => nomatch h2
+  | [_], [_], _, h2 => nomatch h2
+  | [_], [_, _], _, h2 => nomatch h2
+  | [_], [_, _, _], _, h2 => nomatch h2
+  | [_], _ :: _ :: _ :: _ :: _ :: _, _, h2 => nomatch h2
+
+theorem encodeValueToBytes_u8_inv {layouts : LayoutTable} {v : Value} {bs : List AbstractByte}
+    (h : encodeValueToBytes 15 layouts { kind := .uint .u8, layoutIdx := 0 } v = some bs) :
+    bs.length = 1 := by
+  cases v with
+  | scalar sv =>
+    change (match Nat.beq sv.sizeBytes 1 with
+      | true => encodeScalarBytes sv none
+      | false => none) = some bs at h
+    cases hSz : Nat.beq sv.sizeBytes 1 with
+    | false => rw [hSz] at h; exact nomatch h
+    | true =>
+      rw [hSz] at h
+      have hSzEq : sv.sizeBytes = 1 := Nat.eq_of_beq_eq_true hSz
+      unfold encodeScalarBytes at h
+      rw [hSzEq] at h
+      injection h with hBs
+      subst hBs
+      exact Anneal.SepLogicLenses.ByteLensCodec.length_encodeLE sv.bits 1 none
+  | _ => exact nomatch h
+
+/-- **Every trusted encoding of padded `(u8, u32)` carries `.uninit` padding**:
+under its captured rustc layout, any successful `encodeValueToBytes` is
+`b1 ++ [.uninit, .uninit, .uninit] ++ b2`, hence never fully initialized. -/
+theorem encodeValueToBytes_u8U32Padded_not_init {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    {v : Value} {bs : List AbstractByte}
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts (u8U32Ty idx) v = some bs) :
+    Anneal.BitValidity.allBytesInitialized bs = false := by
+  cases v with
+  | aggregate varIdx fieldVals =>
+    cases varIdx with
+    | succ _ => exact nomatch hEnc
+    | zero =>
+      cases fieldVals with
+      | nil => exact nomatch hEnc
+      | cons v1 rest1 =>
+        cases rest1 with
+        | nil => exact nomatch hEnc
+        | cons v2 rest2 =>
+          cases rest2 with
+          | cons _ _ => exact nomatch hEnc
+          | nil =>
+            change (match LayoutTable.lookup layouts idx with
+              | some l => _
+              | none => _) = some bs at hEnc
+            rw [hLookup] at hEnc
+            dsimp only at hEnc
+            rw [hFields, hSize] at hEnc
+            dsimp only [encodeFieldsAtOffsetsWith, rigidTyKindByteSize, intCastTargetBytes] at hEnc
+            cases h1 : encodeValueToBytes 15 layouts { kind := .uint .u8, layoutIdx := 0 } v1 with
+            | none => rw [h1] at hEnc; exact nomatch hEnc
+            | some b1 =>
+              rw [h1] at hEnc
+              dsimp only at hEnc
+              cases h2 : encodeValueToBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } v2 with
+              | none =>
+                cases hW1 : writeAbstractBytesAt (replicateUninitBytes 8) 0 b1 with
+                | none => rw [hW1] at hEnc; exact nomatch hEnc
+                | some buf' => rw [hW1, h2] at hEnc; exact nomatch hEnc
+              | some b2 =>
+                have hL1 := encodeValueToBytes_u8_inv h1
+                obtain ⟨hL2, _⟩ := encodeValueToBytes_u32_inv h2
+                have hW := writeAbstractBytesAt_8_0_1_4 b1 b2 hL1 hL2
+                cases hW1 : writeAbstractBytesAt (replicateUninitBytes 8) 0 b1 with
+                | none => rw [hW1] at hW; exact nomatch hW
+                | some buf' =>
+                  rw [hW1] at hW hEnc
+                  dsimp only at hW hEnc
+                  rw [h2] at hEnc
+                  dsimp only at hEnc
+                  cases hW2 : writeAbstractBytesAt buf' 4 b2 with
+                  | none => rw [hW2] at hW; exact nomatch hW
+                  | some buf'' =>
+                    rw [hW2] at hW hEnc
+                    injection hW with hBuf
+                    injection hEnc with hBs
+                    subst hBs
+                    subst hBuf
+                    match b1, hL1 with
+                    | [.uninit], _ => rfl
+                    | [.init _ _], _ => rfl
+  | _ => exact nomatch hEnc
+
+/-- **Every live window of a padded `(u8, u32)` place is partially
+uninitialized**: initialized places carry the three `.uninit` padding bytes and
+uninitialized storage is all `.uninit`. -/
+theorem placeByteWindow?_u8U32Padded_not_init {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    {ms : MachineState} {lc : Local} {path : SubPath} {bs : List AbstractByte}
+    (hWin : placeByteWindow? layouts (u8U32Ty idx) ms lc path = some bs) :
+    Anneal.BitValidity.allBytesInitialized bs = false := by
+  unfold placeByteWindow? at hWin
+  split at hWin
+  · split at hWin
+    · exact encodeValueToBytes_u8U32Padded_not_init hLookup hSize hFields hWin
+    · exact nomatch hWin
+  · have hTy : rigidTyByteSize layouts (u8U32Ty idx) = some 8 := by
+      unfold rigidTyByteSize u8U32Ty
+      dsimp only
+      rw [hLookup]
+      exact congrArg some hSize
+    rw [hTy] at hWin
+    injection hWin with hWin
+    subst hWin
+    rfl
+  · exact nomatch hWin
+
+/-- **A pinned padded `(u8, u32)` place can never be unpinned**: whatever the
+live state, the place's window carries `.uninit` alignment padding (the reason
+it is not `IsIntoBytes`, `u8U32Padded_not_isIntoBytes`), the pinned block
+mirrors that window, and `SpatialPin` refuses to decode `.uninit` cells. -/
+theorem u8U32Padded_unpin_blocked {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    {tagOf : LoanId → Nat} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {lc : Local} {path : SubPath} {st : SymState StdVal} {ms : MachineState}
+    (hPin : spatialPinnedBlockHolds tagOf layouts (u8U32Ty idx) lid bid codec lc path st ms)
+    (alg : ValAlgebra StdVal) (codec' : SpatialCodec StdVal) :
+    unpinFromSpatialInState alg lid codec' st = .fail := by
+  have hEx : Exists fun bs => placeByteWindow? layouts (u8U32Ty idx) ms lc path = some bs := by
+    obtain ⟨_, _, _, bs, _, _, _, _, _, _, _, _, hWin, _⟩ := hPin
+    exact ⟨bs, hWin⟩
+  obtain ⟨_, hWin⟩ := hEx
+  exact unpin_fail_of_window_not_init hPin hWin
+    (placeByteWindow?_u8U32Padded_not_init hLookup hSize hFields hWin) alg codec'
+
+
+
+/-- Padded `(u8, u32)` 8-byte codec mirroring rustc's layout: the `u8` at offset
+`0`, three `.uninit` alignment-padding bytes, and the `u32` at offset `4`;
+decoding ignores the padding bytes. -/
+def u8U32PaddedLE :
+    Anneal.SepLogicLenses.ByteLensCodec
+      ({v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}) 8 where
+  encode p := u8ExactLE.encode p.1 ++ [.uninit, .uninit, .uninit] ++ u32ExactLE.encode p.2
+  decode bs :=
+    match bs.length.beq 8 with
+    | false => none
+    | true =>
+      match u8ExactLE.decode (bs.take 1), u32ExactLE.decode (bs.drop 4) with
+      | some x, some y => some (x, y)
+      | _, _ => none
+  encode_len p := by
+    rw [List.length_append, List.length_append, u8ExactLE.encode_len, u32ExactLE.encode_len]
+    rfl
+  decode_encode p := by
+    obtain ⟨x, y⟩ := p
+    have hLen :
+        (u8ExactLE.encode x ++ [AbstractByte.uninit, .uninit, .uninit] ++ u32ExactLE.encode y).length = 8 := by
+      rw [List.length_append, List.length_append, u8ExactLE.encode_len, u32ExactLE.encode_len]
+      rfl
+    have h8 :
+        (u8ExactLE.encode x ++ [AbstractByte.uninit, .uninit, .uninit] ++
+          u32ExactLE.encode y).length.beq 8 = true := by
+      rw [hLen]
+      rfl
+    have hTake :
+        (u8ExactLE.encode x ++ [AbstractByte.uninit, .uninit, .uninit] ++ u32ExactLE.encode y).take 1 =
+          u8ExactLE.encode x := by
+      rw [List.append_assoc]
+      exact List.take_left' (u8ExactLE.encode_len x)
+    have hDrop :
+        (u8ExactLE.encode x ++ [AbstractByte.uninit, .uninit, .uninit] ++ u32ExactLE.encode y).drop 4 =
+          u32ExactLE.encode y :=
+      List.drop_left' (by rw [List.length_append, u8ExactLE.encode_len]; rfl)
+    dsimp only
+    rw [h8]
+    dsimp only
+    rw [hTake, hDrop, u8ExactLE.decode_encode, u32ExactLE.decode_encode]
+
+theorem u8U32PaddedLE_provenanceFree
+    (p : {v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}) :
+    provenanceFree (u8U32PaddedLE.encode p) = true :=
+  provenanceFree_append _ _
+    (provenanceFree_append _ _ (provenanceFree_encodeLittleEndianBytes 1 p.1.val) rfl)
+    (provenanceFree_encodeLittleEndianBytes 4 p.2.val)
+
+/-- **Padded `(u8, u32)` as a `MirTypedByteCodec` under its captured rustc
+layout**: the codec's encoding keeps the alignment padding `.uninit`, exactly
+as the trusted encoder does, so its `SpatialCodec` (`u8U32PaddedSpatialCodec`)
+is the cell image of the live window — which `freezeToSpatialInState` refuses
+(`u8U32Padded_freeze_refused`). -/
+def u8U32PaddedMirCodec (layouts : LayoutTable) (idx : Nat) (l : TypeLayout)
+    (mem : List Nat) (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size.bytes = 8) (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    MirTypedByteCodec layouts (u8U32Ty idx)
+      ({v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}) 8 where
+  codec := u8U32PaddedLE
+  toValue p := .aggregate 0 [.scalar ⟨p.1.val, 1⟩, .scalar ⟨p.2.val, 4⟩]
+  ofValue v :=
+    match v with
+    | .aggregate 0 [v1, v2] =>
+      match (u8MirCodec layouts).ofValue v1, (u32MirCodec layouts).ofValue v2 with
+      | some x, some y => some (x, y)
+      | _, _ => none
+    | _ => none
+  ofValue_toValue p := by
+    obtain ⟨x, y⟩ := p
+    have hx : (u8MirCodec layouts).ofValue (.scalar ⟨x.val, 1⟩) = some x :=
+      (u8MirCodec layouts).ofValue_toValue x
+    have hy : (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) = some y :=
+      (u32MirCodec layouts).ofValue_toValue y
+    show (match (u8MirCodec layouts).ofValue (.scalar ⟨x.val, 1⟩),
+                (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) with
+      | some a, some b => some (a, b)
+      | _, _ => none) = some (x, y)
+    rw [hx, hy]
+  tySize_eq := by
+    unfold rigidTyByteSize u8U32Ty
+    dsimp only
+    rw [hLookup]
+    exact congrArg some hSize
+  encode_toValue p := encodeValueToBytes_u8U32PaddedLayout hLookup hSize hFields p.1 p.2
+  decode_eq_map bs := by
+    rw [decodeValueFromBytes_u8U32PaddedLayout hLookup hSize hFields bs]
+    unfold u8U32PaddedLE
+    dsimp only
+    cases bs.length.beq 8 with
+    | false => rfl
+    | true =>
+      dsimp only
+      cases u8ExactLE.decode (bs.take 1) <;> cases u32ExactLE.decode (bs.drop 4) <;> rfl
+  encode_provenanceFree := u8U32PaddedLE_provenanceFree
+
+/-- Embedding of padded `(u8, u32)` codec pairs into `StdVal.pair`. -/
+def u8U32Embed (p : {v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}) : StdVal :=
+  .pair (.nat p.1.val) (.nat p.2.val)
+
+/-- Partial inverse of `u8U32Embed`. -/
+def u8U32Embed? (v : StdVal) :
+    Option ({v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}) :=
+  match v with
+  | ⟨_, .pairBranch _ _ (.nat a) (.nat b)⟩ =>
+    if ha : a < 256 ^ 1 then
+      if hb : b < 256 ^ 4 then some (⟨a, ha⟩, ⟨b, hb⟩) else none
+    else none
+  | _ => none
+
+theorem u8U32Embed_embed? (v : StdVal)
+    (p : {v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4})
+    (h : u8U32Embed? v = some p) : u8U32Embed p = v := by
+  cases v with
+  | mk f t =>
+    cases t with
+    | pairBranch fl fr ta tb =>
+      cases ta with
+      | nat a =>
+        cases tb with
+        | nat b =>
+          unfold u8U32Embed? at h
+          dsimp only at h
+          by_cases ha : a < 256 ^ 1
+          · rw [dite_eq_left ha] at h
+            by_cases hb : b < 256 ^ 4
+            · rw [dite_eq_left hb] at h
+              injection h with h
+              subst h
+              rfl
+            · rw [dite_eq_right hb] at h
+              exact nomatch h
+          · rw [dite_eq_right ha] at h
+            exact nomatch h
+        | _ => exact nomatch h
+      | _ => exact nomatch h
+    | _ => exact nomatch h
+
+/-- Padded `(u8, u32)` `SpatialCodec` over `StdVal` (codec id `40`); its frozen
+cells keep the three alignment-padding bytes `.uninit`. -/
+def u8U32PaddedSpatialCodec : SpatialCodec StdVal :=
+  spatialCodecOfByteLensCodec 40 u8U32PaddedLE u8U32PaddedLE_provenanceFree
+    u8U32Embed u8U32Embed? u8U32Embed_embed?
+
+theorem u8U32PaddedMirCodec_spatialCodec_eq {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem) :
+    (u8U32PaddedMirCodec layouts idx l mem hLookup hSize hFields).spatialCodec 40
+      u8U32Embed u8U32Embed? u8U32Embed_embed? = u8U32PaddedSpatialCodec := rfl
+
+/-- **A padded `(u8, u32)` place cannot be frozen with its window-faithful
+codec**: the live window of the place carries `.uninit` alignment padding, so
+freezing a loan embedding the place's value with `u8U32PaddedSpatialCodec` (the
+`SpatialCodec` of `u8U32PaddedMirCodec`) is refused. -/
+theorem u8U32Padded_freeze_refused {layouts : LayoutTable} {idx : Nat}
+    {l : TypeLayout} {mem : List Nat}
+    (hLookup : LayoutTable.lookup layouts idx = some l) (hSize : l.size.bytes = 8)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] mem)
+    (alg : ValAlgebra StdVal) (lid : LoanId) {st : SymState StdVal} {ms : MachineState}
+    {lc : Local} {path : SubPath}
+    {x : {v : Nat // v < 256 ^ 1} × {v : Nat // v < 256 ^ 4}}
+    (hLoan : Exists fun e => findLoan lid st.loans = some e ∧ u8U32Embed? e.cell.val = some x)
+    (hPlace : placeValue? ms lc path =
+      some (.aggregate 0 [.scalar ⟨x.1.val, 1⟩, .scalar ⟨x.2.val, 4⟩])) :
+    freezeToSpatialInState alg lid u8U32PaddedSpatialCodec st = .fail :=
+  freeze_fail_of_window_not_init (u8U32PaddedMirCodec layouts idx l mem hLookup hSize hFields)
+    40 u8U32Embed u8U32Embed? u8U32Embed_embed? alg lid hLoan hPlace
+    (fun _ hWin => placeByteWindow?_u8U32Padded_not_init hLookup hSize hFields hWin)
 
 end Anneal.PureLift.V2026_06_01Bridge
