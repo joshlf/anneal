@@ -22,10 +22,15 @@ issues permitted by the host. Do not invent findings or inflate severity to
 appear exhaustive. A final coverage sweep, not a comment count, ends review.
 
 Keep the trust pass below distinct from general review. In a single-turn
-review, perform it first. Report blocked coverage or checks in supported
-summary fields; an incomplete review is not approval. When authoring changes,
-complete the local review-fix loop before publication, use fresh-context
-reviewers when available, and disclose any self-review fallback.
+review, perform it first. Report assessments and blocked checks in permitted
+summary or status fields, or another already authorized channel. If none
+exists, omit the narrative, not the assessment; return only valid findings.
+A completed clean review may return empty findings. Use the
+[shared reporting fallback](../skills/change-review/SKILL.md#report-within-the-hosts-constraints)
+for incomplete reviews; findings-only output alone is not completion evidence
+or approval. When authoring changes, complete local preflight before
+publication, use fresh-context reviewers when available, and disclose any
+self-review fallback.
 
 ## Dedicated Trust-Boundary Review Pass
 
@@ -53,9 +58,9 @@ treat any violation as a blocking finding:
      discharge proof obligations.
 2. **Changes inside `trusted/`, `ci/`, `.github/`, and pinned root manifests
    (TCB and harness audit):** Whenever a PR touches these paths (or
-   `Cargo.toml`, `Cargo.lock`, `flake.nix`, or `flake.lock`), include a
-   `### Trust-Boundary Assessment` section (or the host's supported summary
-   fields when it requires a fixed schema) in the review and verify:
+   `Cargo.toml`, `Cargo.lock`, `flake.nix`, or `flake.lock`), perform a
+   trust-boundary assessment and report it using the fallback above. Use a
+   `### Trust-Boundary Assessment` section when the host permits prose. Verify:
    - **`trusted/lean/` & `trusted/rustc-capture/`:** Semantic rules and MIR
      capture must fail closed (including `tcx.dcx().has_errors()` guards),
      perform no unverified semantic normalization in Rust, maintain

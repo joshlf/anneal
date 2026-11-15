@@ -31,16 +31,25 @@ Authors must complete the local review-fix loop in
 [`change-review`](../skills/change-review/SKILL.md) before publishing a
 candidate or revision. Use fresh-context reviewers when available, keep trust
 review separate, verify findings, and review the final candidate after fixes.
-Include the reviewed comparison, coverage, checks, and capability limits in
-the PR description or update. An explicitly authorized unfinished handoff
-must remain visibly incomplete; it is not an exception to the merge policy.
+Prepare a receipt of the reviewed comparison, coverage, checks, and
+capability limits before pushing. Include it in the initial PR description
+when creating the PR after the push, or update the existing PR after verifying
+the pushed head. For an authorized branch-only push, include it in the task
+handoff instead. An explicitly authorized unfinished handoff must remain
+visibly incomplete; it is not an exception to the merge policy.
 
 Hosted reviewers follow the `Code Review Rules` in
 [`AGENTS.md`](../AGENTS.md). Review the entire change, continue after the first
 few findings, verify and deduplicate findings, and make a final omissions
 sweep before reporting. Preserve the provider's output and severity rules;
 these instructions do not create a setting for unlimited findings or override
-a service limit. Missing coverage must not be presented as approval.
+a service limit. Use the
+[shared reporting fallback](../skills/change-review/SKILL.md#report-within-the-hosts-constraints)
+when a fixed schema cannot carry an assessment. The fallback waives only the
+narrative output, not review work. A findings-only response cannot establish
+completion by itself: obtain separate completion evidence before accepting it
+as approval, or obtain a review that can report completion. Missing coverage
+must not be presented as approval.
 
 Local preflight and hosted review are separate checks. A local clean result,
 review receipt, or green diagnostics run is not Codex approval. After changing
