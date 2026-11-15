@@ -54,6 +54,13 @@ An unreviewed change to them cannot authorize bypassing existing trust or merge
 requirements. Review policy changes themselves need review under the existing
 governing contract.
 
+Review and receipt preparation precede a push; receipt posting follows once
+the destination exists. This preserves the initial stacked-PR sequence of
+push, create with a prepared body, and link. Branch-only publication uses the
+task handoff rather than requiring an unauthorized PR. A failed PR write does
+not undo a successful push: report the partial result, retain the receipt,
+and revalidate its candidate and base before retrying.
+
 ## Host limits and evidence
 
 The [official Codex GitHub integration documentation][codex-github] describes
@@ -63,6 +70,16 @@ host follows links or supports skill loading, subagents, hooks, or arbitrary
 output sections. Recheck host behavior before adding provider-specific
 controls. Repository instructions do not override the service's severity,
 output, or resource limits.
+
+A required assessment and its rendered narrative are separate obligations.
+When no schema field or already authorized channel can carry the narrative,
+the reviewer may omit it, but must still perform the assessment. A completed
+clean review may return an empty findings collection. Incomplete review stays
+non-approving: use a supported failure path when available, otherwise preserve
+its limits for the next authorized handoff. A findings-only response is not
+completion evidence; the maintainer needs that evidence separately before
+accepting it as approval. This fallback does not authorize invented findings,
+extra output fields, or new publication channels.
 
 The local preflight deliberately covers actionable correctness defects beyond
 a hosted review's reporting threshold. Do not inflate severity, weaken checks,
@@ -88,6 +105,16 @@ the instructions; these are design checks, not behavioral evidence:
 - Hosted output restrictions must not cause fabricated code locations,
   inflated severity, or false approval. Review-only helpers must not edit,
   publish, or recursively impose another author-preflight loop on themselves.
+- A completed clean trust-sensitive review on a findings-only host with no
+  summary, status field, or authorized side channel must permit empty findings
+  without a narrative assessment. The same empty output from an incomplete
+  review must not establish completion or approval. Check both cases without
+  inventing fields or findings, and preserve the reporting limits.
+- Initial single-branch and stacked-PR publication must allow a prepared
+  receipt before push and include it in the PR body at creation. Branch-only
+  publication must deliver it in the task handoff. A failed PR create or
+  update must preserve the receipt and report the already-published branch
+  without claiming the PR write succeeded.
 - A clean local review must not authorize publication or bypass Codex approval,
   human approval, CI, stack ordering, or the governing trust model.
 

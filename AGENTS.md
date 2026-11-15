@@ -47,8 +47,10 @@ Apply these rules to all work in this repository:
 ## Review before publication
 
 Before pushing authored changes, opening a pull request, marking it ready, or
-publishing a revision, complete
-[`change-review`](skills/change-review/SKILL.md).
+publishing a revision, complete the local preflight in
+[`change-review`](skills/change-review/SKILL.md). Prepare its review receipt
+before pushing; attach it when creating or updating the PR after the push,
+or include it in the handoff for an authorized branch-only publication.
 Review the whole intended change locally, resolve findings, run applicable
 checks, and review the final candidate again after fixes. Use fresh-context
 reviewers when the available tools support them; disclose any self-review
@@ -81,9 +83,15 @@ These rules apply to hosted reviews, including Codex, and local reviews:
   suppress valid findings merely to keep the review short. Verify suspected
   defects and deduplicate the same root cause; do not invent issues to appear
   exhaustive. Keep unresolved trust questions distinct from confirmed bugs.
-- State material coverage gaps and unavailable checks in the host's supported
-  summary or status fields. Do not invent a code finding to carry a process
-  note. An interrupted or incomplete review is not approval; zero findings
+- Report assessments, coverage gaps, and unavailable checks in permitted
+  summary or status fields, or another already authorized reporting channel.
+  If none exists, omit the narrative, not the assessment, and keep the
+  findings schema valid. A completed clean review may return empty findings;
+  do not invent findings or fields to carry process notes. For incomplete
+  review, use a supported failure or abstention path when available;
+  otherwise retain the limitation for the next authorized handoff. A
+  findings-only response does not attest to completion and must not be
+  accepted as approval without separate completion evidence. Zero findings
   does not prove that the change is correct.
 
 The shared procedure is [`change-review`](skills/change-review/SKILL.md).

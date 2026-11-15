@@ -102,9 +102,29 @@ change may correctly produce no findings.
 
 Keep findings concise enough to act on: location, violated invariant,
 conditions, consequence, and evidence or remaining uncertainty. Respect the
-host's severity threshold and output schema. Use supported summary or status
-fields for coverage gaps rather than fabricated inline findings. Do not raise
-severity just to bypass a reporting threshold.
+host's severity threshold and output schema. Do not raise severity just to
+bypass a reporting threshold.
+
+## Report within the host's constraints
+
+Always perform the required assessments. Use permitted prose, summary or
+status fields, or another already authorized reporting channel for trust
+assessments, coverage gaps, and unavailable checks. If none exists, omit this
+narrative from the response and return only schema-supported findings. A
+completed clean review may return an empty findings collection. This is a
+presentation exception, not permission to skip assessment or manufacture
+findings, locations, fields, or severity. It grants no additional authority
+to publish comments or use another service.
+
+If review is incomplete or a blocking trust question remains, use a supported
+failure or abstention path when available. If the host provides no such path,
+keep the response schema-valid, retain the incomplete assessment in working
+notes, and report the limitation at the next authorized handoff. Do not call
+that result approval. A findings-only response does not attest to completion;
+accepting it as approval requires completion evidence tied to the reviewed
+comparison, such as a supported host completion signal or an authorized
+reviewer handoff. Lack of a narrative field alone does not make a completed
+review incomplete.
 
 ## Authors: resolve, recheck, and repeat
 
@@ -144,12 +164,24 @@ base, conflict resolution, or further edit requires reassessing the affected
 comparison and completing review for the new candidate. Never reuse an old
 clean verdict solely because the branch name is unchanged.
 
-Include a compact review receipt in the PR description or update: reviewed
-base and candidate identity, pass coverage, reviewer capability and any
-self-review fallback, findings and their disposition, checks actually run,
-and remaining limits. Do not publish private reasoning traces or unnecessary
-raw transcripts. Distinguish completed checks, author review, independent
-review, and untested expectations about effectiveness.
+Prepare a compact review receipt before publication: reviewed base and
+candidate identity, pass coverage, reviewer capability and any self-review
+fallback, findings and their disposition, checks actually run, and remaining
+limits. Keep the prepared receipt in task notes until its publication
+destination exists; an initial branch push does not require an existing PR.
+
+After a push, verify that the remote head matches the reviewed candidate.
+Include the prepared receipt in the initial PR description when creating the
+PR, or update the existing PR's description or discussion as part of the
+publication handoff. For an authorized branch-only push, include the receipt
+in the task handoff instead; do not create a PR without authorization. If the
+push succeeds but the PR create or update fails, report partial publication
+and retain the receipt for the next authorized retry. Revalidate the candidate
+and base before reusing it.
+
+Do not publish private reasoning traces or unnecessary raw transcripts.
+Distinguish completed checks, author review, independent review, and untested
+expectations about effectiveness.
 
 Local preflight never substitutes for the actual current-change Codex
 approval, human approval, CI, and stack requirements in
