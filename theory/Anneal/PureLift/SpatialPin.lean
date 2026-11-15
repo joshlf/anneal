@@ -59,6 +59,123 @@ theorem valueCellCodec_lawful {Val : Type} :
     LawfulCodec (@valueCellCodec Val) :=
   (@valueCellCodec Val).decode_encode
 
+/-- Decode helper for `SpatialCodec.ofSubdomain`: returns `some w` on the
+single-cell fallback `[.init w]` when `ofVal? w = none`, and delegates to
+`decodeSub` (mapped by `toVal`) otherwise. -/
+def decodeSubdomainCells {Val α : Type}
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (decodeSub : List (CellVal Val) → Option α)
+    (cells : List (CellVal Val)) : Option Val :=
+  match cells with
+  | [.init w] =>
+    match ofVal? w with
+    | none => some w
+    | some _ =>
+      match decodeSub [.init w] with
+      | some a => some (toVal a)
+      | none => none
+  | _ =>
+    match decodeSub cells with
+    | some a => some (toVal a)
+    | none => none
+
+theorem decodeSubdomainCells_of_not_fallback {Val α : Type}
+    (toVal : α → Val) (ofVal? : Val → Option α)
+    (decodeSub : List (CellVal Val) → Option α)
+    (cells : List (CellVal Val))
+    (hNotFallback : ∀ w : Val, ofVal? w = none → cells ≠ [.init w]) :
+    decodeSubdomainCells toVal ofVal? decodeSub cells =
+      match decodeSub cells with
+      | some a => some (toVal a)
+      | none => none := by
+  cases cells with
+  | nil => rfl
+  | cons c rest =>
+    cases c with
+    | init w =>
+      cases rest with
+      | nil =>
+        dsimp only [decodeSubdomainCells]
+        cases hOf : ofVal? w with
+        | none => exact False.elim (hNotFallback w hOf rfl)
+        | some _ => rfl
+      | cons _ _ => rfl
+    | uninit => rfl
+    | rawByte _ => rfl
+
+/-- Lift a partial/subdomain representation codec `(encodeSub, decodeSub)` on a
+carrier `α` (embedded into `Val` via prism `(toVal, ofVal?)`, such as a
+fixed-width byte codec `ByteLensCodec α n` / `FixedByteCodec α n`) to a total
+`SpatialCodec Val`. Values in `α`'s image encode via `encodeSub a` (for example,
+as `[.rawByte ...]` windows), while values outside `α`'s image fall back to
+`[.init v]`. -/
+def SpatialCodec.ofSubdomain {Val α : Type}
+    (cid : Nat)
+    (toVal : α → Val)
+    (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (encodeSub : α → List (CellVal Val))
+    (decodeSub : List (CellVal Val) → Option α)
+    (decodeSub_encodeSub : ∀ a : α, decodeSub (encodeSub a) = some a)
+    (encodeSub_not_fallback :
+      ∀ (a : α) (w : Val), ofVal? w = none → encodeSub a ≠ [.init w]) :
+    SpatialCodec Val where
+  codecId := cid
+  encode v :=
+    match ofVal? v with
+    | some a => encodeSub a
+    | none => [.init v]
+  decode cells := decodeSubdomainCells toVal ofVal? decodeSub cells
+  decode_encode v := by
+    cases hOf : ofVal? v with
+    | none =>
+      dsimp only [decodeSubdomainCells]
+      rw [hOf]
+    | some a =>
+      dsimp only
+      rw [decodeSubdomainCells_of_not_fallback toVal ofVal? decodeSub
+            (encodeSub a) (encodeSub_not_fallback a)]
+      rw [decodeSub_encodeSub a]
+      dsimp only
+      rw [toVal_ofVal? v a hOf]
+
+theorem SpatialCodec.ofSubdomain_encode_toVal {Val α : Type}
+    (cid : Nat)
+    (toVal : α → Val)
+    (ofVal? : Val → Option α)
+    (ofVal?_toVal : ∀ a : α, ofVal? (toVal a) = some a)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (encodeSub : α → List (CellVal Val))
+    (decodeSub : List (CellVal Val) → Option α)
+    (decodeSub_encodeSub : ∀ a : α, decodeSub (encodeSub a) = some a)
+    (encodeSub_not_fallback :
+      ∀ (a : α) (w : Val), ofVal? w = none → encodeSub a ≠ [.init w])
+    (a : α) :
+    (SpatialCodec.ofSubdomain cid toVal ofVal? toVal_ofVal? encodeSub decodeSub
+      decodeSub_encodeSub encodeSub_not_fallback).encode (toVal a) =
+      encodeSub a := by
+  dsimp only [SpatialCodec.ofSubdomain]
+  rw [ofVal?_toVal a]
+
+theorem SpatialCodec.ofSubdomain_decode_encodeSub {Val α : Type}
+    (cid : Nat)
+    (toVal : α → Val)
+    (ofVal? : Val → Option α)
+    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
+    (encodeSub : α → List (CellVal Val))
+    (decodeSub : List (CellVal Val) → Option α)
+    (decodeSub_encodeSub : ∀ a : α, decodeSub (encodeSub a) = some a)
+    (encodeSub_not_fallback :
+      ∀ (a : α) (w : Val), ofVal? w = none → encodeSub a ≠ [.init w])
+    (a : α) :
+    (SpatialCodec.ofSubdomain cid toVal ofVal? toVal_ofVal? encodeSub decodeSub
+      decodeSub_encodeSub encodeSub_not_fallback).decode (encodeSub a) =
+      some (toVal a) := by
+  dsimp only [SpatialCodec.ofSubdomain]
+  rw [decodeSubdomainCells_of_not_fallback toVal ofVal? decodeSub
+        (encodeSub a) (encodeSub_not_fallback a)]
+  rw [decodeSub_encodeSub a]
+
 /-- Constructive separation-logic assertion over a spatial heaplet. -/
 def SpatialProp (Val : Type) : Type :=
   List (SpatialBlock Val) → Prop
@@ -325,9 +442,8 @@ def collidingIdCodec : SpatialCodec LensTestVal where
 
 /-- Freezing and immediately reabsorbing an untouched loan preserves its value
 and binds decoding to the original `pinnedCodec`, ignoring any colliding codec
-passed at reabsorption. -/
-theorem spatial_roundtrip_and_codec_binding_test :
-    let v : LensTestVal := .node (.atom 3) (.ref 9 [])
+passed at reabsorption, for every `v : LensTestVal`. -/
+theorem spatial_roundtrip_and_codec_binding_test (v : LensTestVal) :
     let st0 : SymState LensTestVal :=
       { locals := [⟨v, .mutLocked 0⟩]
         loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
@@ -347,8 +463,29 @@ theorem spatial_roundtrip_and_codec_binding_test :
           stReabsorbed.spatial.isEmpty = true
         | none => False
       | .fail => False
-    | .fail => False :=
-  ⟨rfl, rfl, rfl⟩
+    | .fail => False := by
+  change
+    (match
+       (if !replaceableVal lensTestValAlg
+             [⟨0, .spatialPinned 0 valueCellCodec, ⟨v, .unborrowed⟩,
+               .direct (.localReg 0) []⟩]
+             v v then
+          .fail
+        else
+          .ok
+            ⟨[⟨v, .mutLocked 0⟩],
+             [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩],
+             [], [], [], 1⟩ : EvalOutcome (SymState LensTestVal)) with
+     | .ok stReabsorbed =>
+       match findLoan 0 stReabsorbed.loans with
+       | some e =>
+         e.cell.val = v ∧
+         e.phase.isActiveMut = true ∧
+         stReabsorbed.spatial.isEmpty = true
+       | none => False
+     | .fail => False)
+  rw [lensTest_replaceableVal_self]
+  exact ⟨rfl, rfl, rfl⟩
 
 /-- `reabsorbFromSpatialInState` rejects `.uninit` cells even when the pinned
 codec's `decode` function returns `some` on `[.uninit]`. -/
@@ -550,5 +687,99 @@ theorem round11_blocksDisjoint_same_origin_loan :
     let b2 : SpatialBlock LensTestVal := ⟨2, 0, .readWrite, 2, 0, []⟩
     ¬ blocksDisjoint [b1] [b2] :=
   fun h => (h _ _ (List.Mem.head _) (List.Mem.head _)).2 rfl
+
+def boolAtomToVal (b : Bool) : LensTestVal :=
+  .atom (if b then 1 else 0)
+
+def boolAtomOfVal? (v : LensTestVal) : Option Bool :=
+  match v with
+  | ⟨_, .atom 0⟩ => some false
+  | ⟨_, .atom 1⟩ => some true
+  | _ => none
+
+theorem boolAtom_ofVal?_toVal (b : Bool) :
+    boolAtomOfVal? (boolAtomToVal b) = some b := by
+  cases b <;> rfl
+
+theorem boolAtom_toVal_ofVal? (v : LensTestVal) (b : Bool)
+    (h : boolAtomOfVal? v = some b) :
+    boolAtomToVal b = v := by
+  cases v with
+  | mk f t =>
+    cases t with
+    | atom n =>
+      cases n with
+      | zero =>
+        injection h with hb
+        subst hb
+        rfl
+      | succ n1 =>
+        cases n1 with
+        | zero =>
+          injection h with hb
+          subst hb
+          rfl
+        | succ _ => nomatch h
+    | branch _ _ _ _ => nomatch h
+    | choice _ _ _ _ _ _ => nomatch h
+    | ref _ _ => nomatch h
+
+def boolRawByteEncode (b : Bool) : List (CellVal LensTestVal) :=
+  [.rawByte (if b then 1 else 0)]
+
+def boolRawByteDecode (cells : List (CellVal LensTestVal)) : Option Bool :=
+  match cells with
+  | [.rawByte b] =>
+    if b == 0 then some false
+    else if b == 1 then some true
+    else none
+  | _ => none
+
+theorem boolRawByte_decode_encode (b : Bool) :
+    boolRawByteDecode (boolRawByteEncode b) = some b := by
+  cases b <;> rfl
+
+theorem boolRawByte_not_fallback (b : Bool) (w : LensTestVal)
+    (_ : boolAtomOfVal? w = none) :
+    boolRawByteEncode b ≠ [.init w] := by
+  cases b <;> intro h <;> nomatch h
+
+/-- Subdomain raw-byte spatial codec built via `SpatialCodec.ofSubdomain`:
+encodes boolean atoms (`0`/`1`) as `[.rawByte 0]`/`[.rawByte 1]` and falls back
+to `[.init v]` outside the boolean subdomain. -/
+def boolRawByteSpatialCodec : SpatialCodec LensTestVal :=
+  SpatialCodec.ofSubdomain 42 boolAtomToVal boolAtomOfVal?
+    boolAtom_toVal_ofVal? boolRawByteEncode boolRawByteDecode
+    boolRawByte_decode_encode boolRawByte_not_fallback
+
+theorem spatial_subdomain_byte_codec_tests :
+    boolRawByteSpatialCodec.encode (.atom 0) = [.rawByte 0] ∧
+    boolRawByteSpatialCodec.encode (.atom 1) = [.rawByte 1] ∧
+    boolRawByteSpatialCodec.encode (.atom 7) = [.init (.atom 7)] ∧
+    boolRawByteSpatialCodec.decode [.rawByte 1] = some (.atom 1) ∧
+    boolRawByteSpatialCodec.decode [.rawByte 9] = none ∧
+    let st0 : SymState LensTestVal :=
+      { locals := [⟨.atom 0, .mutLocked 0⟩]
+        loans :=
+          [⟨0, .activeMut, ⟨.atom 0, .unborrowed⟩, .direct (.localReg 0) []⟩]
+        regionGroups := []
+        regionDeposits := []
+        spatial := []
+        nextSpatialTag := 0 }
+    (match freezeToSpatialInState lensTestValAlg 0 boolRawByteSpatialCodec st0 with
+     | .ok stPinned =>
+       stPinned.spatial = [⟨0, 0, .readWrite, 0, 0, [.rawByte 0]⟩] ∧
+       (match mutateSpatialInState 0 0 [.rawByte 1] stPinned with
+        | .ok stMut =>
+          match reabsorbFromSpatialInState lensTestValAlg 0
+              boolRawByteSpatialCodec stMut with
+          | .ok stDone =>
+            match findLoan 0 stDone.loans with
+            | some e => e.cell.val = .atom 1
+            | none => False
+          | .fail => False
+        | .fail => False)
+     | .fail => False) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩⟩
 
 end Anneal.PureLift

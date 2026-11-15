@@ -287,6 +287,10 @@ def installRegionGroups {Val : Type} (alg : ValAlgebra Val)
           match spec.fwdOuts pureVals inMutVals with
           | none => none
           | some outVals =>
+            -- Forward output cells must not fabricate or duplicate non-copyable
+            -- handles that were not present in the locked mutable inputs.
+            if !replaceableVals alg stLocked.loans inMutVals outVals then none
+            else
             match allocateRegionGroupOutputs alg spec.groupId 0
                     spec.outDsts outVals stLocked with
             | none => none
@@ -386,6 +390,11 @@ def stepAction {Val : Type} (alg : ValAlgebra Val)
         | none => .fail
         | some retVal =>
           if summary.returnsMutBorrow then
+            -- A returned mutable borrow cell is a projection of the locked
+            -- mutable inputs, so it must not fabricate or duplicate non-copyable
+            -- handles that were not in `mutVals`.
+            if !replaceableVals alg stLocked.loans mutVals [retVal] then .fail
+            else
             let newEntry : LoanEntry Val :=
               ⟨newLid, .activeMut, ⟨retVal, .unborrowed⟩,
                 .lensCall targets (summary.back pureVals mutVals)⟩
@@ -1333,7 +1342,8 @@ def stepPlanOp {Val : Type} (alg : ValAlgebra Val) (op : FlowPlanOp Val)
           match endRegionGroupsInState alg cleanupGroups st1 with
           | .fail => .fail
           | .ok st2 =>
-            let valClean := stateCleanAtReturn st2
+            let out : FuncOut Val := ⟨retVal, collectRootMutVals st2.loans⟩
+            let valClean := stateCleanAtReturn st2 && handleFreeOut alg out
             let mutOut := synthesizeMutReturnFromVal alg retVal st2
             let noMutOut :=
               match mutOut with
@@ -1341,10 +1351,7 @@ def stepPlanOp {Val : Type} (alg : ValAlgebra Val) (op : FlowPlanOp Val)
               | some _ => false
             if !valClean && noMutOut then .fail
             else
-              .ok (.returned
-                ⟨retVal, collectRootMutVals st2.loans⟩
-                valClean
-                mutOut)) :: stk
+              .ok (.returned out valClean mutOut)) :: stk
   | .whileLoopOp fuel cond =>
     match stk with
     | ihBody :: rest =>
@@ -1477,44 +1484,45 @@ def buildInitState {Val : Type} (alg : ValAlgebra Val)
     (β := List (Nat × PermTree) → SymState Val → Option (SymState Val))
     (fun _ s => some s)
     (fun p _ ih rPerms st0 =>
-      match st0 with
-      | ⟨locals, loans, rgs, deps, sp, tag⟩ =>
-        match p.mode with
-        | .byVal =>
-          -- A by-value parameter carries no borrow: a decodable handle in it
-          -- would alias a parameter loan, or a loan allocated later.
-          match collectHandles alg p.val with
-          | some [] =>
+      -- Neither a by-value parameter nor the initial pointed-to value of a
+      -- reference parameter may carry a decodable frame-loan handle, which
+      -- would alias a parameter loan or a loan allocated later in the body.
+      match collectHandles alg p.val with
+      | some [] =>
+        match st0 with
+        | ⟨locals, loans, rgs, deps, sp, tag⟩ =>
+          match p.mode with
+          | .byVal =>
             let st' : SymState Val :=
               ⟨locals ++ [⟨p.val, .unborrowed⟩], loans, rgs, deps, sp, tag⟩
             ih rPerms st'
-          | _ => none
-        | .sharedRef rootId path =>
-          let lid := loans.length
-          let rp := getRootPerm rootId rPerms
-          match aliasedSharedParamVal alg path rp loans p.val,
-                acquirePerm .shared lid path rp with
-          | none, _ => none
-          | _, none => none
-          | some val, some rp' =>
-            let entry : LoanEntry Val :=
-              ⟨lid, .activeShared, ⟨val, .unborrowed⟩, .rootParam lid⟩
-            let st' : SymState Val :=
-              ⟨locals ++ [⟨alg.encodeSharedRef lid [], .unborrowed⟩],
-               loans ++ [entry], rgs, deps, sp, tag⟩
-            ih (setRootPerm rootId rp' rPerms) st'
-        | .mutRef rootId path =>
-          let lid := loans.length
-          let rp := getRootPerm rootId rPerms
-          match acquirePerm .mutBorrow lid path rp with
-          | none => none
-          | some rp' =>
-            let entry : LoanEntry Val :=
-              ⟨lid, .activeMut, ⟨p.val, .unborrowed⟩, .rootParam lid⟩
-            let st' : SymState Val :=
-              ⟨locals ++ [⟨alg.encodeRef lid [], .unborrowed⟩],
-               loans ++ [entry], rgs, deps, sp, tag⟩
-            ih (setRootPerm rootId rp' rPerms) st')
+          | .sharedRef rootId path =>
+            let lid := loans.length
+            let rp := getRootPerm rootId rPerms
+            match aliasedSharedParamVal alg path rp loans p.val,
+                  acquirePerm .shared lid path rp with
+            | none, _ => none
+            | _, none => none
+            | some val, some rp' =>
+              let entry : LoanEntry Val :=
+                ⟨lid, .activeShared, ⟨val, .unborrowed⟩, .rootParam lid⟩
+              let st' : SymState Val :=
+                ⟨locals ++ [⟨alg.encodeSharedRef lid [], .unborrowed⟩],
+                 loans ++ [entry], rgs, deps, sp, tag⟩
+              ih (setRootPerm rootId rp' rPerms) st'
+          | .mutRef rootId path =>
+            let lid := loans.length
+            let rp := getRootPerm rootId rPerms
+            match acquirePerm .mutBorrow lid path rp with
+            | none => none
+            | some rp' =>
+              let entry : LoanEntry Val :=
+                ⟨lid, .activeMut, ⟨p.val, .unborrowed⟩, .rootParam lid⟩
+              let st' : SymState Val :=
+                ⟨locals ++ [⟨alg.encodeRef lid [], .unborrowed⟩],
+                 loans ++ [entry], rgs, deps, sp, tag⟩
+              ih (setRootPerm rootId rp' rPerms) st'
+      | _ => none)
     params rootPerms st
 
 def initFnState {Val : Type} (alg : ValAlgebra Val)

@@ -3215,4 +3215,101 @@ theorem round13_writeback_regions_and_join_regressions_tests :
       | none => False)) :=
   ⟨rfl, rfl, rfl, rfl, rfl, ⟨trivial, trivial⟩⟩
 
+/-! ## Round 14 Regression Tests for Call/Region Handle Hygiene & CFG Completeness -/
+
+/-- A `returnsMutBorrow = true` call summary whose forward function fabricates a
+handle `.refVal 0 []` not present in its mutable arguments. -/
+def round14ForgeMutBorrowSummary : CallSummary StdVal where
+  returnsMutBorrow := true
+  fwd _ _ := some (.refVal 0 [])
+  back _ _ _ := some [.nat 5]
+
+/-- A `RegionGroupSpec` whose `fwdOuts` fabricates a handle `.refVal 0 []` not
+present in its locked mutable inputs. -/
+def round14ForgeRegionOutSpec : RegionGroupSpec StdVal where
+  groupId := 0
+  requiredChildren := []
+  inputPlaces := [.derefSub 0 []]
+  outDsts := [1]
+  fwdOuts := fun _ _ => some [.refVal 0 []]
+  backFn := fun _ _ _ _ => some ([.nat 5], [])
+
+/-- Output-free region group `gid` whose backward function deposits `dep`. -/
+def round14DepositRegionSpec (gid : RegionGroupId)
+    (children : List RegionGroupId) (dep : List StdVal) :
+    RegionGroupSpec StdVal where
+  groupId := gid
+  requiredChildren := children
+  inputPlaces := []
+  outDsts := []
+  fwdOuts := fun _ _ => some []
+  backFn := fun _ _ _ _ => some ([], dep)
+
+/-- Round 14 regression tests for:
+1. Reference entry parameters (`.mutRef` and `.sharedRef`) rejecting initial
+   pointed-to values that smuggle decodable borrow handles,
+2. `PrimAction.call` (`returnsMutBorrow = true`) and `PrimAction.callMultiRegion`
+   rejecting fabricated or duplicated non-copyable handles in `summary.fwd`,
+   `spec.fwdOuts`, and `endRegionGroupInState` `newDeposits`,
+3. `stepBasicBlock` rejecting handle-bearing outputs on `.ret` and early-return
+   wrappers (`.returned` and `.guardedContinuing`), and
+4. Bidirectional single-block equivalence `cfg_certificate_step_iff`. -/
+theorem round14_handle_hygiene_and_cfg_complete_regressions_tests :
+    -- 1. Reference parameters cannot smuggle handles inside pointed-to `p.val`:
+    initFnState stdValAlg [⟨.mutRef 0 [], .refVal 0 []⟩] = .fail ∧
+    initFnState stdValAlg
+      [⟨.mutRef 0 [], .nat 5⟩, ⟨.sharedRef 1 [], .refVal 0 []⟩] = .fail ∧
+    -- 2. Mutable-borrow call `fwd`, region `fwdOuts`, and region `newDeposits`
+    -- cannot fabricate handles:
+    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
+      (.seq
+        (.act (.call 1 round14ForgeMutBorrowSummary [] [.derefSub 0 []]))
+        (.act (.endLoan 1)))
+      (.constVal .unit) = .fail ∧
+    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
+      (.seq
+        (.act (.callMultiRegion [] [round14ForgeRegionOutSpec]))
+        (.act (.endRegionGroup 0)))
+      (.constVal .unit) = .fail ∧
+    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
+      (.seq
+        (.act (.callMultiRegion []
+          [ round14DepositRegionSpec 0 [1] []
+          , round14DepositRegionSpec 1 [] [.refVal 0 []] ]))
+        (.seq (.act (.endRegionGroup 1)) (.act (.endRegionGroup 0))))
+      (.constVal .unit) = .fail ∧
+    -- 3. `stepBasicBlock` rejects returning a handle directly or via an
+    -- early-return branch wrapper:
+    (match initFnState stdValAlg
+        [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩] with
+     | .ok st0 =>
+       runBlockCfg
+         (stepBasicBlock stdValAlg [⟨.skip, .ret (.use (.localSub 1 []))⟩])
+         0 st0 1 = .fault ∧
+       runBlockCfg
+         (stepBasicBlock stdValAlg
+           [ ⟨.branch (.use (.localSub 0 []))
+                (.earlyReturn [] [] (.use (.localSub 1 [])))
+                .skip,
+              .goto 1⟩
+           , ⟨.skip, .ret (.constVal .unit)⟩ ])
+         0 st0 2 = .fault
+     | .fail => False) ∧
+    -- 4. Bidirectional `cfg_certificate_step_iff`:
+    (∀ st0 out,
+      initFnState stdValAlg [⟨.byVal, .nat 0⟩] = .ok st0 →
+      (runBlockCfg
+        (stepBasicBlock stdValAlg
+          [⟨.act (.assign (.localSub 1 []) (.constVal (.nat 42))),
+            .ret (.use (.localSub 1 []))⟩])
+        0 st0 1 = .ret out ↔
+       evalFnValue stdValAlg [⟨.byVal, .nat 0⟩]
+         (.act (.assign (.localSub 1 []) (.constVal (.nat 42))))
+         (.use (.localSub 1 [])) = .ok out)) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩,
+   fun st0 out hInit =>
+     cfg_certificate_step_iff stdValAlg [⟨.byVal, .nat 0⟩]
+       (.act (.assign (.localSub 1 []) (.constVal (.nat 42))))
+       (.use (.localSub 1 [])) st0 out hInit⟩
+
 end Anneal.PureLift

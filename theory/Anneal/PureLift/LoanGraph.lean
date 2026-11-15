@@ -654,6 +654,41 @@ def updateLoan {Val : Type} (lid : LoanId)
     (fun e ih => if e.id == lid then f e :: ih else e :: ih)
     []
 
+/-- Enumerate fields `0 .. n - 1` of `w` and concatenate their handles via `ih`. -/
+def collectFieldsFuel {Val : Type} (alg : ValAlgebra Val)
+    (ih : Val → Option (List LoanId)) (w : Val) (n : Nat) :
+    Option (List LoanId) :=
+  natFold (some [])
+    (fun idx acc =>
+      match acc, alg.getField idx w with
+      | some ls, some field =>
+        match ih field with
+        | some ls' => some (ls ++ ls')
+        | none => none
+      | some ls, none => some ls
+      | none, _ => none)
+    n
+
+/-- Single step of `collectHandles` for `w`, given recursive handle collector
+`ih` for strict sub-values. -/
+def collectHandlesStep {Val : Type} (alg : ValAlgebra Val)
+    (ih : Val → Option (List LoanId)) (w : Val) : Option (List LoanId) :=
+  match alg.decodeRef w with
+  | some (lid, _) => some [lid]
+  | none =>
+    let fromFields := collectFieldsFuel alg ih w (alg.sizeBound w)
+    (alg.branchParts w).foldr
+      (fun part acc =>
+        match acc, ih part with
+        | some ls, some ls' => some (ls ++ ls')
+        | _, _ => none)
+      fromFields
+
+/-- Bounded handle scan with fuel `k`. -/
+def collectHandlesFuel {Val : Type} (alg : ValAlgebra Val) (k : Nat) (v : Val) :
+    Option (List LoanId) :=
+  natFold (fun _ => none) (fun _ ih w => collectHandlesStep alg ih w) k v
+
 /-- Loan IDs named by the borrow handles in `v`, or `none` if `v` nests more
 deeply than its traversal budget `alg.sizeBound v + 1`. The scan visits:
 - the value itself, which is a leaf if it decodes as a handle
@@ -664,29 +699,7 @@ deeply than its traversal budget `alg.sizeBound v + 1`. The scan visits:
   which `projectBranchVal` can expose again. -/
 def collectHandles {Val : Type} (alg : ValAlgebra Val) (v : Val) :
     Option (List LoanId) :=
-  natFold (fun _ => none)
-    (fun _ ih w =>
-      match alg.decodeRef w with
-      | some (lid, _) => some [lid]
-      | none =>
-        let fromFields : Option (List LoanId) :=
-          natFold (some [])
-            (fun idx acc =>
-              match acc, alg.getField idx w with
-              | some ls, some field =>
-                match ih field with
-                | some ls' => some (ls ++ ls')
-                | none => none
-              | some ls, none => some ls
-              | none, _ => none)
-            (alg.sizeBound w)
-        (alg.branchParts w).foldr
-          (fun part acc =>
-            match acc, ih part with
-            | some ls, some ls' => some (ls ++ ls')
-            | _, _ => none)
-          fromFields)
-    (alg.sizeBound v + 1) v
+  collectHandlesFuel alg (alg.sizeBound v + 1) v
 
 /-- True iff `v` contains no decodable borrow handle (`collectHandles`). -/
 def handleFreeVal {Val : Type} (alg : ValAlgebra Val) (v : Val) : Bool :=
@@ -761,6 +774,191 @@ def replaceableVals {Val : Type} (alg : ValAlgebra Val)
 def replaceableVal {Val : Type} (alg : ValAlgebra Val)
     (loans : List (LoanEntry Val)) (vOld vNew : Val) : Bool :=
   replaceableVals alg loans [vOld] [vNew]
+
+theorem list_all_replaceable_self {Val : Type} (loans : List (LoanEntry Val))
+    (lids : List LoanId) :
+    ∀ (xs : List LoanId),
+      xs.all (fun lid =>
+        handleCopyable loans lid ||
+          Nat.ble (countNat lid lids) (countNat lid lids)) = true
+  | [] => rfl
+  | lid :: rest => by
+    change
+      ((handleCopyable loans lid ||
+        Nat.ble (countNat lid lids) (countNat lid lids)) &&
+       rest.all (fun x =>
+         handleCopyable loans x ||
+           Nat.ble (countNat x lids) (countNat x lids))) = true
+    rw [Nat.ble_eq_true_of_le (Nat.le_refl (countNat lid lids))]
+    rw [Bool.or_true, list_all_replaceable_self loans lids rest]
+    rfl
+
+/-- Reflexivity of `replaceableVals` whenever `collectHandlesList` succeeds. -/
+theorem replaceableVals_self_of_collectHandlesList {Val : Type}
+    (alg : ValAlgebra Val) (loans : List (LoanEntry Val)) (vs : List Val)
+    (lids : List LoanId) (h : collectHandlesList alg vs = some lids) :
+    replaceableVals alg loans vs vs = true := by
+  unfold replaceableVals
+  rw [h]
+  exact list_all_replaceable_self loans lids lids
+
+/-- Reflexivity of `replaceableVal` whenever `collectHandles` succeeds. -/
+theorem replaceableVal_self_of_collectHandles {Val : Type}
+    (alg : ValAlgebra Val) (loans : List (LoanEntry Val)) (v : Val)
+    (lids : List LoanId) (h : collectHandles alg v = some lids) :
+    replaceableVal alg loans v v = true := by
+  apply replaceableVals_self_of_collectHandlesList alg loans [v] (lids ++ [])
+  change
+    (match collectHandles alg v, some ([] : List LoanId) with
+     | some ls, some rest => some (ls ++ rest)
+     | _, _ => none) = some (lids ++ [])
+  rw [h]
+
+theorem collectFieldsFuel_zero {Val : Type} (alg : ValAlgebra Val)
+    (ih : Val → Option (List LoanId)) (w : Val) :
+    collectFieldsFuel alg ih w 0 = some [] := rfl
+
+theorem collectFieldsFuel_succ {Val : Type} (alg : ValAlgebra Val)
+    (ih : Val → Option (List LoanId)) (w : Val) (n : Nat) :
+    collectFieldsFuel alg ih w (n + 1) =
+      (match collectFieldsFuel alg ih w n, alg.getField n w with
+       | some ls, some field =>
+         match ih field with
+         | some ls' => some (ls ++ ls')
+         | none => none
+       | some ls, none => some ls
+       | none, _ => none) := rfl
+
+theorem lensTest_collectFields_none (ih : LensTestVal → Option (List LoanId))
+    (w : LensTestVal) (hNone : ∀ idx, lensTestGetField idx w = none) :
+    ∀ (n : Nat),
+      collectFieldsFuel lensTestValAlg ih w n = some []
+  | 0 => rfl
+  | n' + 1 => by
+    rw [collectFieldsFuel_succ, lensTest_collectFields_none ih w hNone n']
+    dsimp only [lensTestValAlg]
+    rw [hNone n']
+
+theorem lensTest_collectFields_branch (ih : LensTestVal → Option (List LoanId))
+    (fl fr : Nat) (l : LensTestTree fl) (r : LensTestTree fr)
+    (lsL lsR : List LoanId)
+    (hL : ih ⟨fl, l⟩ = some lsL) (hR : ih ⟨fr, r⟩ = some lsR) :
+    ∀ (m : Nat),
+      collectFieldsFuel lensTestValAlg ih
+        ⟨fl + fr + 1, .branch fl fr l r⟩ (m + 2) = some (lsL ++ lsR)
+  | 0 => by
+    change
+      collectFieldsFuel lensTestValAlg ih
+        ⟨fl + fr + 1, .branch fl fr l r⟩ ((0 + 1) + 1) = some (lsL ++ lsR)
+    rw [collectFieldsFuel_succ, collectFieldsFuel_succ, collectFieldsFuel_zero]
+    have hG0 :
+        lensTestValAlg.getField 0 ⟨fl + fr + 1, .branch fl fr l r⟩ =
+          some ⟨fl, l⟩ := rfl
+    have hG1 :
+        lensTestValAlg.getField 1 ⟨fl + fr + 1, .branch fl fr l r⟩ =
+          some ⟨fr, r⟩ := rfl
+    rw [hG0, hG1]
+    dsimp only
+    rw [hL]
+    dsimp only [List.nil_append]
+    rw [hR]
+  | m' + 1 => by
+    change
+      collectFieldsFuel lensTestValAlg ih
+        ⟨fl + fr + 1, .branch fl fr l r⟩ ((m' + 2) + 1) = some (lsL ++ lsR)
+    rw [collectFieldsFuel_succ,
+        lensTest_collectFields_branch ih fl fr l r lsL lsR hL hR m']
+    rfl
+
+theorem lensTestTree_collectHandlesFuel :
+    ∀ {f : Nat} (t : LensTestTree f) (k : Nat),
+      f ≤ k →
+      Exists fun lids =>
+        collectHandlesFuel lensTestValAlg (k + 1) ⟨f, t⟩ = some lids := by
+  intro f t
+  induction t with
+  | atom n =>
+    intro k _
+    exact ⟨[], rfl⟩
+  | ref lid path =>
+    intro k _
+    exact ⟨[lid], rfl⟩
+  | branch fl fr l r ihl ihr =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fl + fr ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hFl : fl ≤ k' := Nat.le_trans (Nat.le_add_right fl fr) hSub
+      have hFr : fr ≤ k' := Nat.le_trans (Nat.le_add_left fr fl) hSub
+      cases ihl k' hFl with
+      | intro lsL hL =>
+        cases ihr k' hFr with
+        | intro lsR hR =>
+          refine ⟨lsL ++ lsR, ?_⟩
+          cases fr with
+          | zero => nomatch (lensTestTree_fuel_pos r)
+          | succ fr' =>
+            exact lensTest_collectFields_branch
+              (collectHandlesFuel lensTestValAlg (k' + 1))
+              fl (fr' + 1) l r lsL lsR hL hR (fl + fr')
+  | choice fc ft ff c vt vf _ iht ihf =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fc + ft + ff ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hSub12 : fc + ft ≤ k' :=
+        Nat.le_trans (Nat.le_add_right (fc + ft) ff) hSub
+      have hFt : ft ≤ k' := Nat.le_trans (Nat.le_add_left ft fc) hSub12
+      have hFf : ff ≤ k' := Nat.le_trans (Nat.le_add_left ff (fc + ft)) hSub
+      cases iht k' hFt with
+      | intro lsT hT =>
+        cases ihf k' hFf with
+        | intro lsF hF =>
+          refine ⟨lsF ++ lsT, ?_⟩
+          have hNone :
+              ∀ idx,
+                lensTestGetField idx
+                  ⟨fc + ft + ff + 1, .choice fc ft ff c vt vf⟩ = none := by
+            intro idx
+            cases idx with
+            | zero => rfl
+            | succ idx' => cases idx' <;> rfl
+          change
+            (match
+               (match
+                  collectFieldsFuel lensTestValAlg
+                    (collectHandlesFuel lensTestValAlg (k' + 1))
+                    ⟨fc + ft + ff + 1, .choice fc ft ff c vt vf⟩
+                    (fc + ft + ff + 1),
+                  collectHandlesFuel lensTestValAlg (k' + 1) ⟨ff, vf⟩ with
+                | some ls, some ls' => some (ls ++ ls')
+                | _, _ => none),
+               collectHandlesFuel lensTestValAlg (k' + 1) ⟨ft, vt⟩ with
+             | some ls, some ls' => some (ls ++ ls')
+             | _, _ => none) = some (lsF ++ lsT)
+          rw [lensTest_collectFields_none
+                (collectHandlesFuel lensTestValAlg (k' + 1))
+                ⟨fc + ft + ff + 1, .choice fc ft ff c vt vf⟩ hNone
+                (fc + ft + ff + 1),
+              hF, hT]
+          rfl
+
+/-- `collectHandles` is total on all `LensTestVal` values. -/
+theorem lensTest_collectHandles_total (v : LensTestVal) :
+    Exists fun lids => collectHandles lensTestValAlg v = some lids := by
+  cases v with
+  | mk f t =>
+    exact lensTestTree_collectHandlesFuel t f (Nat.le_refl f)
+
+/-- `replaceableVal` is reflexive on all `LensTestVal` values. -/
+theorem lensTest_replaceableVal_self (loans : List (LoanEntry LensTestVal))
+    (v : LensTestVal) :
+    replaceableVal lensTestValAlg loans v v = true := by
+  cases lensTest_collectHandles_total v with
+  | intro lids h =>
+    exact replaceableVal_self_of_collectHandles lensTestValAlg loans v lids h
 
 /-- True iff some step of `target` is a `.choiceJoin` whose condition is
 symbolic (`alg.asBool cond = none`). -/
@@ -1536,6 +1734,13 @@ def endRegionGroupInState {Val : Type} (alg : ValAlgebra Val)
         match g.backFn outVals childSplit.1 with
         | none => .fail
         | some (updatedInputs, newDeposits) =>
+          -- Newly deposited values must not fabricate or duplicate non-copyable
+          -- handles that were not present in the retired outputs or child
+          -- deposits.
+          if !replaceableVals alg stRetired.loans
+               (outVals ++ childSplit.1) newDeposits then
+            .fail
+          else
           -- Output loans are already `.ended` in `stRetired`, so their
           -- permission flavors are checked against the pre-retirement phases
           -- in `st.loans`.

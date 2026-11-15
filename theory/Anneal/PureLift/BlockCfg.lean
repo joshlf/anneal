@@ -193,7 +193,7 @@ def stepBasicBlock {Val : Type} (alg : ValAlgebra Val)
     match evalPlan alg bb.body st with
     | .fail => .fault
     | .ok (.returned out valClean _) =>
-      if !valClean then .fault else .ret out
+      if !valClean || !handleFreeOut alg out then .fault else .ret out
     | .ok (.guardedContinuing wrapOut st' valClean _) =>
       if !valClean then .fault
       else
@@ -219,7 +219,8 @@ def stepBasicBlock {Val : Type} (alg : ValAlgebra Val)
           else
             match evalRval alg retExpr st' with
             | some rv =>
-              .ret (wrapOut ⟨rv, collectRootMutVals st'.loans⟩)
+              let out := wrapOut ⟨rv, collectRootMutVals st'.loans⟩
+              if !handleFreeOut alg out then .fault else .ret out
             | none => .fault
     | .ok (.continuing st') =>
       match bb.term with
@@ -238,7 +239,9 @@ def stepBasicBlock {Val : Type} (alg : ValAlgebra Val)
         if !stateCleanAtReturn st' then .fault
         else
           match evalRval alg retExpr st' with
-          | some rv => .ret ⟨rv, collectRootMutVals st'.loans⟩
+          | some rv =>
+            let out : FuncOut Val := ⟨rv, collectRootMutVals st'.loans⟩
+            if !handleFreeOut alg out then .fault else .ret out
           | none => .fault
 
 /-- Run a block-indexed CFG for `fuel` basic-block transitions. -/
@@ -448,7 +451,6 @@ theorem cfg_certificate_step_sound {Val : Type} (alg : ValAlgebra Val)
         intro hFalse
         nomatch hFalse
       | true =>
-        dsimp
         cases handleFreeOut alg out' with
         | false =>
           dsimp
@@ -520,6 +522,121 @@ theorem cfg_certificate_step_sound {Val : Type} (alg : ValAlgebra Val)
               injection hEq with hOut
               rw [← hOut]
 
+/-- Converse of `cfg_certificate_step_sound`: any `.ret out` of the 1-block CFG
+`[⟨plan, .ret retExpr⟩]` comes from `evalFnValue alg params plan retExpr = .ok
+out`, because `stepBasicBlock` enforces the same `valClean`, `stateCleanAtReturn`,
+and `handleFreeOut` checks at return as `evalFnValue`. -/
+theorem cfg_certificate_step_complete {Val : Type} (alg : ValAlgebra Val)
+    (params : List (ParamInput Val)) (plan : FlowPlan Val)
+    (retExpr : RvalOp Val) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hRun :
+      runBlockCfg (stepBasicBlock alg [⟨plan, .ret retExpr⟩]) 0 st0 1 =
+        .ret out) :
+    evalFnValue alg params plan retExpr = .ok out := by
+  dsimp [evalFnValue]
+  rw [hInit]
+  dsimp
+  rw [runBlockCfg_succ] at hRun
+  dsimp [stepBasicBlock, listGetOpt] at hRun
+  revert hRun
+  cases hPlan : evalPlan alg plan st0 with
+  | fail =>
+    intro hFalse
+    nomatch hFalse
+  | ok flow =>
+    cases flow with
+    | returned out' valClean _ =>
+      dsimp
+      cases valClean with
+      | false =>
+        dsimp
+        intro hFalse
+        nomatch hFalse
+      | true =>
+        cases handleFreeOut alg out' with
+        | false =>
+          dsimp
+          intro hFalse
+          nomatch hFalse
+        | true =>
+          dsimp
+          intro hEq
+          injection hEq with hOut
+          rw [hOut]
+    | continuing stF =>
+      dsimp
+      cases hClean : stateCleanAtReturn stF with
+      | false =>
+        dsimp
+        intro hFalse
+        nomatch hFalse
+      | true =>
+        dsimp
+        cases hRet : evalRval alg retExpr stF with
+        | none =>
+          dsimp
+          intro hFalse
+          nomatch hFalse
+        | some retVal =>
+          dsimp
+          cases handleFreeOut alg ⟨retVal, collectRootMutVals stF.loans⟩ with
+          | false =>
+            dsimp
+            intro hFalse
+            nomatch hFalse
+          | true =>
+            dsimp
+            intro hEq
+            injection hEq with hOut
+            rw [← hOut]
+    | guardedContinuing guards stF valClean _ =>
+      dsimp
+      cases valClean with
+      | false =>
+        dsimp
+        intro hFalse
+        nomatch hFalse
+      | true =>
+        dsimp
+        cases hClean : stateCleanAtReturn stF with
+        | false =>
+          dsimp
+          intro hFalse
+          nomatch hFalse
+        | true =>
+          dsimp
+          cases hRet : evalRval alg retExpr stF with
+          | none =>
+            dsimp
+            intro hFalse
+            nomatch hFalse
+          | some retVal =>
+            dsimp
+            cases handleFreeOut alg
+                (guards ⟨retVal, collectRootMutVals stF.loans⟩) with
+            | false =>
+              dsimp
+              intro hFalse
+              nomatch hFalse
+            | true =>
+              dsimp
+              intro hEq
+              injection hEq with hOut
+              rw [← hOut]
+
+/-- Bidirectional single-block CFG equivalence (`cfg_certificate_step_iff`):
+from initialized state `st0`, the 1-block CFG `[⟨plan, .ret retExpr⟩]` returns
+`out` in 1 step iff `evalFnValue alg params plan retExpr = .ok out`. -/
+theorem cfg_certificate_step_iff {Val : Type} (alg : ValAlgebra Val)
+    (params : List (ParamInput Val)) (plan : FlowPlan Val)
+    (retExpr : RvalOp Val) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0) :
+    runBlockCfg (stepBasicBlock alg [⟨plan, .ret retExpr⟩]) 0 st0 1 = .ret out ↔
+      evalFnValue alg params plan retExpr = .ok out :=
+  ⟨cfg_certificate_step_complete alg params plan retExpr st0 out hInit,
+   cfg_certificate_step_sound alg params plan retExpr st0 out hInit⟩
+
 /-- Single-block `CfgCertificate`: the 1-block CFG `[⟨plan, .ret retExpr⟩]`
 run for one step, certified by `cfg_certificate_step_sound`. -/
 def CfgCertificate.singleBlock {Val : Type} (alg : ValAlgebra Val)
@@ -542,7 +659,9 @@ theorem cfg_seq_blocks_equiv {Val : Type} (alg : ValAlgebra Val)
     (h1 : evalPlan alg p1 st0 = .ok (.continuing st1))
     (h2 : evalPlan alg p2 st1 = .ok (.continuing stF))
     (hClean : stateCleanAtReturn stF = true)
-    (hRet : evalRval alg retExpr stF = some retVal) :
+    (hRet : evalRval alg retExpr stF = some retVal)
+    (hFree :
+      handleFreeOut alg ⟨retVal, collectRootMutVals stF.loans⟩ = true) :
     runBlockCfg
       (stepBasicBlock alg [⟨p1, .goto 1⟩, ⟨p2, .ret retExpr⟩])
       0 st0 2 =
@@ -564,6 +683,9 @@ theorem cfg_seq_blocks_equiv {Val : Type} (alg : ValAlgebra Val)
     rw [hClean]
     dsimp
     rw [hRet]
+    dsimp
+    rw [hFree]
+    rfl
   have hRight :
       evalPlan alg (.seq p1 p2) st0 = .ok (.continuing stF) := by
     rw [evalPlan_seq alg p1 p2 st0 hWf1 hWf2]
@@ -575,9 +697,9 @@ theorem cfg_seq_blocks_equiv {Val : Type} (alg : ValAlgebra Val)
 CFG `[⟨.skip, .branch cond 1 2⟩, ⟨body, .goto 0⟩, ⟨.skip, .ret retExpr⟩]`
 (block `0` branches to body block `1` on `true` and to exit block `2` on
 `false`), every execution of `runWhileFlowSteps alg cond (evalPlan alg body)
-fuel st` that terminates in `.ok (.continuing stFinal)` with a clean return
-state reaches `.ret` in `runBlockCfg` within `2 * fuel + 2` basic-block steps
-with the same `FuncOut Val`. -/
+fuel st` that terminates in `.ok (.continuing stFinal)` with a clean,
+handle-free return state reaches `.ret` in `runBlockCfg` within `2 * fuel + 2`
+basic-block steps with the same `FuncOut Val`. -/
 theorem cfg_certificate_while_sound {Val : Type} (alg : ValAlgebra Val)
     (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val) :
     ∀ (fuel : Nat) (st stFinal : SymState Val) (retVal : Val),
@@ -585,6 +707,7 @@ theorem cfg_certificate_while_sound {Val : Type} (alg : ValAlgebra Val)
         .ok (.continuing stFinal) →
       stateCleanAtReturn stFinal = true →
       evalRval alg retExpr stFinal = some retVal →
+      handleFreeOut alg ⟨retVal, collectRootMutVals stFinal.loans⟩ = true →
       runBlockCfg
         (stepBasicBlock alg
           [⟨.skip, .branch cond 1 2⟩,
@@ -592,7 +715,7 @@ theorem cfg_certificate_while_sound {Val : Type} (alg : ValAlgebra Val)
            ⟨.skip, .ret retExpr⟩])
         0 st (2 * fuel + 2) =
         .ret ⟨retVal, collectRootMutVals stFinal.loans⟩
-  | 0, st, stFinal, retVal, hWhile, hClean, hRet => by
+  | 0, st, stFinal, retVal, hWhile, hClean, hRet, hFree => by
     rw [runWhileFlowSteps_zero] at hWhile
     revert hWhile
     cases hCond : evalRval alg cond st with
@@ -637,7 +760,10 @@ theorem cfg_certificate_while_sound {Val : Type} (alg : ValAlgebra Val)
           rw [hClean]
           dsimp
           rw [hRet]
-  | k + 1, st, stFinal, retVal, hWhile, hClean, hRet => by
+          dsimp
+          rw [hFree]
+          rfl
+  | k + 1, st, stFinal, retVal, hWhile, hClean, hRet, hFree => by
     rw [runWhileFlowSteps_succ] at hWhile
     revert hWhile
     cases hCond : evalRval alg cond st with
@@ -679,6 +805,9 @@ theorem cfg_certificate_while_sound {Val : Type} (alg : ValAlgebra Val)
             rw [hClean]
             dsimp
             rw [hRet]
+            dsimp
+            rw [hFree]
+            rfl
           have hArith : 2 * (k + 1) + 2 = (2 * k + 2) + 1 + 1 := by
             rw [Nat.mul_add]
           rw [hArith, runBlockCfg_succ, hStep1]
@@ -708,7 +837,7 @@ theorem cfg_certificate_while_sound {Val : Type} (alg : ValAlgebra Val)
               intro hRec
               have ih :=
                 cfg_certificate_while_sound alg cond body retExpr k st'
-                  stFinal retVal hRec hClean hRet
+                  stFinal retVal hRec hClean hRet hFree
               have hStep1 :
                   stepBasicBlock alg
                     [⟨.skip, .branch cond 1 2⟩,
