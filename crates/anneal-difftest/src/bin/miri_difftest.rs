@@ -72,8 +72,16 @@ fn parse_u64_or_hex(raw: &str) -> Result<u64, String> {
 }
 
 fn parse_cli_args() -> Result<MiriDiffTestArgs, String> {
+    parse_cli_args_from(env::args().skip(1))
+}
+
+fn parse_cli_args_from<I, S>(iter: I) -> Result<MiriDiffTestArgs, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut cfg = MiriDiffTestArgs::default();
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = iter.into_iter().map(|s| s.as_ref().to_string()).collect();
     let mut count: Option<usize> = None;
     let mut saw_batch_shape = false;
     let mut i = 0usize;
@@ -152,6 +160,9 @@ fn parse_cli_args() -> Result<MiriDiffTestArgs, String> {
         }
         if cfg.identity {
             return Err("--count cannot be used with --identity".to_string());
+        }
+        if cfg.reproduce.is_some() {
+            return Err("--count cannot be used with --reproduce".to_string());
         }
         cfg.batches = 1;
         cfg.batch_size = count;
@@ -390,4 +401,23 @@ fn main() {
 
     let md_report = render_eval_report_markdown(&eval_report);
     print!("{md_report}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_count_shorthand_sets_single_batch_and_rejects_conflicting_modes() {
+        let cfg = parse_cli_args_from(["--seed", "0x42649b91", "--count", "128"]).unwrap();
+        assert_eq!(cfg.batches, 1);
+        assert_eq!(cfg.batch_size, 128);
+        assert_eq!(cfg.seed, 0x4264_9b91);
+
+        assert!(parse_cli_args_from(["--count", "0"]).is_err());
+        assert!(parse_cli_args_from(["--count", "16", "--batches", "2"]).is_err());
+        assert!(parse_cli_args_from(["--count", "16", "--batch-size", "8"]).is_err());
+        assert!(parse_cli_args_from(["--count", "16", "--identity"]).is_err());
+        assert!(parse_cli_args_from(["--count", "16", "--reproduce", "repro.rs"]).is_err());
+    }
 }

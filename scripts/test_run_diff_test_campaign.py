@@ -9128,6 +9128,28 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
         self.assertEqual(diag["oracle_error_reason"], "process_exit_101")
         self.assertIn("error[E0308]: mismatched types", diag["error_lines"])
 
+        # Non-E bracketed errors and fatal OOM/panic crash lines without `error:` are
+        # captured, while ordinary source lines like `my_error[end]` are ignored.
+        crash_stderr = "\n".join(
+            [
+                "let v = my_error[end];",
+                "error[internal]: unexpected compiler failure",
+                "out of memory",
+                "PANIC at Lean.Kernel.whnf",
+                "thread 'main' panicked at src/main.rs:10:5: boom",
+            ]
+        )
+        _, _, crash_errs = campaign.extract_harness_output_diagnostics("", crash_stderr)
+        self.assertEqual(
+            crash_errs,
+            [
+                "error[internal]: unexpected compiler failure",
+                "out of memory",
+                "PANIC at Lean.Kernel.whnf",
+                "thread 'main' panicked at src/main.rs:10:5: boom",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

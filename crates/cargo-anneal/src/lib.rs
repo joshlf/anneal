@@ -2711,21 +2711,22 @@ pub fn cgroup_memory_limits_kib(
             .or_else(|| read_u64_file(&d.join("memory.current")))
     };
 
-    let mut leaf_used_bytes: Option<u64> = None;
+    let mut descendant_used_bytes: Option<u64> = None;
     let mut limit_kib: Option<u64> = None;
     let mut headroom_kib: Option<u64> = None;
     while dir.starts_with(cgroup_root) {
         if dir.is_dir() {
             let lvl_used = read_level_used(&dir);
-            if leaf_used_bytes.is_none() && lvl_used.is_some() {
-                leaf_used_bytes = lvl_used;
+            if let Some(u) = lvl_used {
+                descendant_used_bytes =
+                    Some(descendant_used_bytes.map_or(u, |prev| prev.max(u)));
             }
             let level_bound = min_opt_u64(
                 read_u64_file(&dir.join("memory.max")),
                 read_u64_file(&dir.join("memory.high")),
             );
             if let Some(bound) = level_bound {
-                let used = lvl_used.or(leaf_used_bytes).unwrap_or(0);
+                let used = lvl_used.or(descendant_used_bytes).unwrap_or(0);
                 limit_kib = min_opt_u64(limit_kib, Some(bound / 1024));
                 headroom_kib =
                     min_opt_u64(headroom_kib, Some(bound.saturating_sub(used) / 1024));
@@ -3641,6 +3642,27 @@ mod tests {
         );
         assert_eq!(limit3, Some(8 * GIB_KIB));
         assert_eq!(headroom3, Some(0)); // user.slice had memory.current = 10 GiB > 8 GiB -> saturating 0
+
+        // When an ancestor has a bound without readable usage files, it subtracts the
+        // tightest (maximum) usage observed across all descendants on the path, not
+        // merely the leaf's usage.
+        let _ = fs::remove_file(slice_dir.join("memory.current"));
+        fs::write(
+            app_dir.join("memory.stat"),
+            format!("anon {}\nshmem {}\n", 5 * GIB_KIB * 1024, GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(slice_dir.join("memory.max"), format!("{}\n", 16 * GIB_KIB * 1024)).unwrap();
+        fs::write(scope_dir.join("memory.max"), "max\n").unwrap();
+        let (limit_anc, headroom_anc) =
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/app.slice/lean.scope\n");
+        assert_eq!(limit_anc, Some(16 * GIB_KIB));
+        assert_eq!(
+            headroom_anc,
+            Some(10 * GIB_KIB),
+            "ancestor without own usage must subtract max descendant usage (6 GiB at app.slice > 2 GiB at leaf)"
+        );
+        let _ = fs::remove_file(app_dir.join("memory.stat"));
 
         // When all levels have `"max"`, both limit and headroom are None.
         fs::write(slice_dir.join("memory.max"), "max\n").unwrap();
