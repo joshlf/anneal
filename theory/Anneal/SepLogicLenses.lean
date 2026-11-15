@@ -139,7 +139,8 @@ model. No proof here destructures the `Memory` record.
    while preserving the active parent `&mut s` and active sibling field borrows
    (`&mut s.0` at field `0` and `&mut s.2` at field `2`) in `R_frame`.
 4. **Section 4 (byte lenses).** Fixed-width `ByteLensCodec`s (`u8`, `u16LE`,
-   `u32LE`, `prod`, `padRight`, `laidOutPair`, bridged to `ValueCodec.scalarNat`)
+   `u32LE`, `prod`, `padRight`, `laidOutPair`, bridged to scalar and boolean
+   `ValueCodec`s via `scalarNatValueCodec_uintLE_bridge` and `rustBool_u8_bridge`)
    and relational `TypedAt` / `CanonicalAt` / `DisjointSlice` / `FieldsTyped`
    views over the trusted `sliceAbstractBytes` / `writeAbstractBytesAt`, with
    `O(1)` frame laws, padded-struct laws, `LawfulMutLens` / `IndependentLenses`
@@ -152,10 +153,14 @@ model. No proof here destructures the `Memory` record.
    `split_at_mut_unique_write_perm`), and the stage-2-only soundness boundary
    (`LatchEquiv`, `trustedFnSpec_run_stage2Only_same_verdicts`,
    `stage1_write_release_observable_ub_separation`).
-6. **Section 6 (entry and single-pass lifting).** `sepLensStateInv_single_root_borrow`
-   builds `SepLensStateInv` for one parentless active root borrow of a caller
-   slot; `LiftLensStmt.pureAssign_checked` and `LiftLensBlock.goto_return` lift
-   assignments with single-pass `setSpineChecked?` and share `return` blocks.
+6. **Section 6 (entry, join-sharing, and constructive adequacy combinators).**
+   `sepLensStateInv_single_root_borrow` builds `SepLensStateInv` for one
+   parentless active root borrow of a caller slot; `LiftLensStmt.pureAssign_checked`
+   and `LiftLensBlockToJoin` (`LiftLensBlockToJoin.toReturn`) lift assignments
+   with single-pass `setSpineChecked?` and share join / `return` blocks once
+   across predecessors; constructive (`⊆ {propext, Quot.sound}`) `wpBlockLinear`,
+   `runCfgToBlock`, `evalMirSpecBool`, and `u16` signature combinators discharge
+   companion and loop obligations without classical choice.
 -/
 
 /-! ## 0. Elementary List & Borrow-Table Helpers -/
@@ -15507,10 +15512,10 @@ primitives (closed forms `sliceAbstractBytes_eq`, `writeAbstractBytesAt_eq_splic
 
 * `ByteLensCodec α width` is a fixed-width byte codec (`unit`, `u8`, `uintLE`,
   `u16LE`, `u32LE`, `prod`, `padUninit`, `padRight`, and the padded pair
-  `laidOutPair`), bridged to scalar `ValueCodec`s such as `ValueCodec.scalarNat`
-  through the trusted `encodeScalarBytes` / `decodeScalarBytes`
-  (`encodeScalarBytes_uintLE_encode`, `decodeScalarBytes_uintLE_encode`,
-  `valueCodec_uintLE_bridge`).
+  `laidOutPair`), bridged to scalar and boolean `ValueCodec`s through the trusted
+  `encodeScalarBytes` / `decodeScalarBytes` (`encodeScalarBytes_uintLE_encode`,
+  `decodeScalarBytes_uintLE_encode`, `valueCodec_uintLE_bridge`,
+  `scalarNatValueCodec_uintLE_bridge`, `rustBool_u8_bridge`).
 * `TypedAt c base v mem` is *relational* (the `width`-byte window at `base`
   decodes to `v`), so padding may hold arbitrary bytes; `CanonicalAt` is the
   exact-encoding variant. Frame laws (`TypedAt.frame_write`,
@@ -15685,7 +15690,7 @@ theorem decodeScalarBytes_uintLE_encode {sz : Nat} (hsz : 0 < sz)
     exact hds _ ((uintLE (k + 1)).encode_len v) he
 
 /-- **Bridge to `ValueCodec`**: for every value codec that encodes `n` as the scalar
-`{ bits := n, sizeBytes := sz }` and decodes it back (such as `ValueCodec.scalarNat sz`),
+`{ bits := n, sizeBytes := sz }` and decodes it back (such as `scalarNatValueCodec sz`),
 the trusted scalar byte encoding of `vc.encode v` is the `uintLE sz` encoding of `v`,
 and decoding those bytes with `decodeScalarBytes` and then `vc` recovers `v`. -/
 theorem valueCodec_uintLE_bridge (vc : ValueCodec Nat) {sz : Nat} (hsz : 0 < sz)
@@ -15698,6 +15703,43 @@ theorem valueCodec_uintLE_bridge (vc : ValueCodec Nat) {sz : Nat} (hsz : 0 < sz)
   obtain ⟨prov, hds⟩ := decodeScalarBytes_uintLE_encode hsz v
   exact ⟨⟨_, henc v.val, encodeScalarBytes_uintLE_encode hsz v⟩,
     ⟨_, prov, hds, hdec v.val⟩⟩
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) fixed-width unsigned scalar `Nat`
+`ValueCodec` (agreeing with `ValueCodec.scalarNat` on `encode`, `decode`, and
+`default`, while proving `decode_encode` via `Nat.beq_refl` rather than classical
+`beq_self_eq_true`). -/
+def scalarNatValueCodec (sizeBytes : Nat) : ValueCodec Nat where
+  encode n := .scalar { bits := n, sizeBytes := sizeBytes }
+  decode
+    | .scalar sc => if Nat.beq sc.sizeBytes sizeBytes then some sc.bits else none
+    | _ => none
+  default := 0
+  decode_encode n := by
+    show (if Nat.beq sizeBytes sizeBytes = true then some n else none) = some n
+    rw [Nat.beq_refl, ite_eq_left rfl]
+
+/-- **Concrete scalar `ValueCodec` ↔ `uintLE` bridge**: `scalarNatValueCodec sz`
+encodes and decodes identically to `ByteLensCodec.uintLE sz` across trusted
+`encodeScalarBytes` / `decodeScalarBytes` for every `sz > 0`. -/
+theorem scalarNatValueCodec_uintLE_bridge {sz : Nat} (hsz : 0 < sz)
+    (v : {v : Nat // v < 256 ^ sz}) :
+    (∃ sc, (scalarNatValueCodec sz).encode v.val = .scalar sc ∧
+        encodeScalarBytes sc none = some ((uintLE sz).encode v)) ∧
+      ∃ sc prov, decodeScalarBytes ((uintLE sz).encode v) = some (sc, prov) ∧
+        (scalarNatValueCodec sz).decode (.scalar sc) = some v.val :=
+  valueCodec_uintLE_bridge (scalarNatValueCodec sz) hsz (fun _ => rfl)
+    (fun n => (scalarNatValueCodec sz).decode_encode n) v
+
+/-- **Concrete `ValueCodec.rustBool` ↔ `ByteLensCodec.u8` bridge**: the live
+`ValueCodec.rustBool` encodes `b : Bool` to a 1-byte scalar whose trusted byte
+encoding equals `ByteLensCodec.u8.encode (UInt8.ofNat (boolToScalar b).bits)` and
+round-trips through `decodeScalarBytes` and `ValueCodec.rustBool.decode`. -/
+theorem rustBool_u8_bridge (b : Bool) :
+    let byte : UInt8 := UInt8.ofNat (boolToScalar b).bits
+    encodeScalarBytes (boolToScalar b) none = some (u8.encode byte) ∧
+      ∃ sc prov, decodeScalarBytes (u8.encode byte) = some (sc, prov) ∧
+        ValueCodec.rustBool.decode (.scalar sc) = some b := by
+  cases b <;> exact ⟨rfl, _, none, rfl, rfl⟩
 
 /-- Contiguous product of two fixed-width codecs (exact-width decode). -/
 def prod {α β : Type} {n₁ n₂ : Nat} (c₁ : ByteLensCodec α n₁) (c₂ : ByteLensCodec β n₂) :
@@ -21466,8 +21508,98 @@ theorem LiftLensStmt.pureAssign_uninit_checked {localDecls : List LocalDecl}
       { kind := .assign { local_ := dst, projection := [] } rv, span := span } env₂ entries :=
   LiftLensStmt.pureAssign_checked hRv hGet (fun h => nomatch h) hSet
 
-/-- `goto retBb` into a statement-free `return` block, lifted once and shared by
-every predecessor (`LiftLensBlock.goto` followed by `LiftLensBlock.return_`). -/
+/-- Postcondition-parametric lens-state lifting from `bbIdx` to a shared join block
+`joinBb` under invariant `JoinInv` (the stateful `SepLogicLenses` counterpart to
+`MirLiftCore.LiftBlockToJoin`), so `joinBb` is lifted once across all predecessors. -/
+def LiftLensBlockToJoin (body : CapturedMir) (bbIdx : BasicBlockIdx)
+    (env : PureEnv) (entries : List (RawPtrVal × Value))
+    (joinBb : BasicBlockIdx)
+    (JoinInv : PureEnv → List (RawPtrVal × Value) → Prop) : Prop :=
+  ∀ (retVal : Value) (entriesFinal : List (RawPtrVal × Value)),
+    (∀ envJ entriesJ, JoinInv envJ entriesJ →
+      LiftLensBlock body joinBb envJ entriesJ retVal entriesFinal) →
+    LiftLensBlock body bbIdx env entries retVal entriesFinal
+
+theorem LiftLensBlockToJoin.refl {body : CapturedMir} {joinBb : BasicBlockIdx}
+    {env : PureEnv} {entries : List (RawPtrVal × Value)}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hInv : JoinInv env entries) :
+    LiftLensBlockToJoin body joinBb env entries joinBb JoinInv :=
+  fun _ _ k => k env entries hInv
+
+theorem LiftLensBlockToJoin.goto {body : CapturedMir} {bbIdx target joinBb : BasicBlockIdx}
+    {bb : BasicBlockData} {env env₁ : PureEnv}
+    {entries entries₁ : List (RawPtrVal × Value)}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .goto target)
+    (hStmts : LiftLensStmts body.localDecls body.layouts env entries bb.statements env₁ entries₁)
+    (hNext : LiftLensBlockToJoin body target env₁ entries₁ joinBb JoinInv) :
+    LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv :=
+  fun retVal entriesFinal k => .goto hPhase hBb hTerm hStmts (hNext retVal entriesFinal k)
+
+theorem LiftLensBlockToJoin.assert {body : CapturedMir} {bbIdx target joinBb : BasicBlockIdx}
+    {bb : BasicBlockData} {cond : Operand} {expected : Bool} {unwind : UnwindAction}
+    {env env₁ env₂ : PureEnv} {sc : ScalarInt}
+    {entries entries₁ : List (RawPtrVal × Value)}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .assert cond expected target unwind)
+    (hStmts : LiftLensStmts body.localDecls body.layouts env entries bb.statements env₁ entries₁)
+    (hCond : LiftLensOperandAny .nil body.layouts env₁ entries₁ cond (.scalar sc) env₂)
+    (hBit : sc.bits = assertBit expected)
+    (hNext : LiftLensBlockToJoin body target env₂ entries₁ joinBb JoinInv) :
+    LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv :=
+  fun retVal entriesFinal k =>
+    .assert hPhase hBb hTerm hStmts hCond hBit (hNext retVal entriesFinal k)
+
+theorem LiftLensBlockToJoin.switchInt {body : CapturedMir} {bbIdx target joinBb : BasicBlockIdx}
+    {bb : BasicBlockData} {discr : Operand} {targets : SwitchTargets}
+    {env env₁ env₂ : PureEnv} {sc : ScalarInt}
+    {entries entries₁ : List (RawPtrVal × Value)}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .switchInt discr targets)
+    (hStmts : LiftLensStmts body.localDecls body.layouts env entries bb.statements env₁ entries₁)
+    (hDiscr : LiftLensOperandAny .nil body.layouts env₁ entries₁ discr (.scalar sc) env₂)
+    (hTarget : lookupSwitchTarget sc.bits targets.branches targets.otherwise = target)
+    (hNext : LiftLensBlockToJoin body target env₂ entries₁ joinBb JoinInv) :
+    LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv :=
+  fun retVal entriesFinal k =>
+    .switchInt hPhase hBb hTerm hStmts hDiscr hTarget (hNext retVal entriesFinal k)
+
+theorem LiftLensBlockToJoin.toBlock {body : CapturedMir} {bbIdx joinBb : BasicBlockIdx}
+    {env : PureEnv} {entries entriesFinal : List (RawPtrVal × Value)} {retVal : Value}
+    {JoinInv : PureEnv → List (RawPtrVal × Value) → Prop}
+    (hPath : LiftLensBlockToJoin body bbIdx env entries joinBb JoinInv)
+    (hJoin : ∀ envJ entriesJ, JoinInv envJ entriesJ →
+      LiftLensBlock body joinBb envJ entriesJ retVal entriesFinal) :
+    LiftLensBlock body bbIdx env entries retVal entriesFinal :=
+  hPath retVal entriesFinal hJoin
+
+/-- Discharge `LiftLensBlock` by lifting paths from `bbIdx` to a shared
+statement-free `return` block `retBb`, lifting `retBb` itself once across all
+predecessors. -/
+theorem LiftLensBlockToJoin.toReturn {body : CapturedMir} {bbIdx retBb : BasicBlockIdx}
+    {retBlock : BasicBlockData} {env : PureEnv}
+    {entries entriesFinal : List (RawPtrVal × Value)} {retVal : Value}
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    (hRetBb : get? body.basicBlocks retBb = .some retBlock)
+    (hRetTerm : retBlock.terminator.kind = .return_)
+    (hRetNil : retBlock.statements = [])
+    (hPath : LiftLensBlockToJoin body bbIdx env entries retBb
+      (fun envJ entriesJ =>
+        get? envJ 0 = .some (.init retVal) ∧ entriesJ = entriesFinal)) :
+    LiftLensBlock body bbIdx env entries retVal entriesFinal :=
+  hPath retVal entriesFinal fun _ _ ⟨hRet, hEq⟩ =>
+    hEq ▸ .return_ hPhase hRetBb hRetTerm (hRetNil ▸ .nil) hRet
+
+/-- Compose a single `goto retBb` predecessor directly with a statement-free
+`return` block (for genuine multi-predecessor sharing of `retBb`, use
+`LiftLensBlockToJoin.toReturn`). -/
 theorem LiftLensBlock.goto_return {body : CapturedMir} {bbIdx retBb : BasicBlockIdx}
     {bb retBlock : BasicBlockData} {env env' : PureEnv}
     {entries entries' : List (RawPtrVal × Value)} {retVal : Value}
@@ -21480,8 +21612,8 @@ theorem LiftLensBlock.goto_return {body : CapturedMir} {bbIdx retBb : BasicBlock
     (hRetNil : retBlock.statements = [])
     (hRet : get? env' 0 = .some (.init retVal)) :
     LiftLensBlock body bbIdx env entries retVal entries' :=
-  .goto hPhase hBb hTerm hStmts
-    (.return_ hPhase hRetBb hRetTerm (by rw [hRetNil]; exact .nil) hRet)
+  LiftLensBlockToJoin.toReturn hPhase hRetBb hRetTerm hRetNil
+    (.goto hPhase hBb hTerm hStmts (.refl ⟨hRet, rfl⟩))
 
 /-! ### Constructive `MirBoolPredicateHolds` adequacy & signature combinators -/
 

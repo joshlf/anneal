@@ -37,9 +37,11 @@ private theorem advance_cursor_lift
         cursorValue (if step ≤ limit - offset then offset + step else offset) limit)] := by
   have h_sub_wrap : wrapScalarBits (Nat.sub limit offset) (scalarModulus 2) = limit - offset :=
     wrapScalarBits_eq_of_lt (by change limit - offset < 65536; omega)
+  -- Lift the shared statement-free `return` block `bb5` once across both branches.
+  apply LiftLensBlockToJoin.toReturn (retBb := 5) rfl rfl rfl rfl
   -- bb0: `StorageLive(_3..=_9); _4 = copy ((*_1).1); _5 = copy ((*_1).0);
   -- _6 = SubWithOverflow(copy _4, copy _5); assert(!move (_6.1)) -> bb1`
-  apply LiftLensBlock.assert (sc := ⟨0, 1⟩) rfl rfl rfl
+  apply LiftLensBlockToJoin.assert (sc := ⟨0, 1⟩) rfl rfl rfl
   · repeat apply LiftLensStmts.cons (.storageLive (.mk rfl (set?_of_setSpineChecked? rfl)))
     apply LiftLensStmts.cons (.pureAssign_uninit_checked
       (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl) rfl) rfl rfl)
@@ -54,7 +56,7 @@ private theorem advance_cursor_lift
   · rfl
   -- bb1: `_3 = move (_6.0); _7 = Le(copy _2, copy _3);
   -- switchInt(move _7) -> [0: bb4, otherwise: bb2]`, lifted once for both outcomes.
-  apply LiftLensBlock.switchInt (target := if step ≤ limit - offset then 2 else 4) rfl rfl rfl
+  apply LiftLensBlockToJoin.switchInt (target := if step ≤ limit - offset then 2 else 4) rfl rfl rfl
   · apply LiftLensStmts.cons
       (.pureAssign_uninit_checked (.use_pure (.move_field rfl rfl rfl) rfl) rfl rfl)
     exact .cons (.pureAssign_uninit_checked
@@ -68,7 +70,7 @@ private theorem advance_cursor_lift
     have h_add : offset + step < scalarModulus 2 := by change offset + step < 65536; omega
     -- bb2: `_8 = copy ((*_1).0); _9 = AddWithOverflow(copy _8, copy _2);
     -- assert(!move (_9.1)) -> bb3`
-    apply LiftLensBlock.assert (sc := ⟨0, 1⟩) rfl rfl rfl
+    apply LiftLensBlockToJoin.assert (sc := ⟨0, 1⟩) rfl rfl rfl
     · apply LiftLensStmts.cons (.pureAssign_uninit_checked
         (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl) rfl) rfl rfl)
       exact .cons (.pureAssign_uninit_checked (.binaryOp
@@ -81,15 +83,15 @@ private theorem advance_cursor_lift
     · exact .pure (.move_field rfl rfl rfl)
     · rfl
     -- bb3: `((*_1).0) = move (_9.0); _0 = const true; goto -> bb5`
-    exact .goto_return rfl rfl rfl (.cons
+    exact .goto rfl rfl rfl (.cons
       (.derefWrite (.field (.use_pure (.move_field rfl rfl rfl) rfl) (rp := cursorRp) rfl rfl rfl))
       (.cons (.pureAssign_uninit_checked (.use_pure .const_scalar rfl) rfl rfl) .nil))
-      rfl rfl rfl rfl
+      (.refl ⟨rfl, rfl⟩)
   · rw [ite_eq_right h_le, ite_eq_right h_le, ite_eq_right h_le]
     -- bb4: `_0 = const false; goto -> bb5`
-    exact .goto_return rfl rfl rfl
+    exact .goto rfl rfl rfl
       (.cons (.pureAssign_uninit_checked (.use_pure .const_scalar rfl) rfl rfl) .nil)
-      rfl rfl rfl rfl
+      (.refl ⟨rfl, rfl⟩)
 
 /-- Stateful verification certificate for `wireframe_demo::advance_cursor`
 via `SepLogicLenses`. -/

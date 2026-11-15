@@ -29,7 +29,7 @@ the three `switchInt` guards), and `verified` proves `bb9` once under `RetInv`.
 `encodeByteCastSourceBytes` / `decodeTypedValueFromBytes`); the `bool` flag byte
 `b1` is a valid `bool` image only for `b1 ≤ 1`. -/
 private theorem evalByteCastAfterOperand_wireHeader
-    (b1 b2 b3 : Nat) (hb1 : b1 = 0 ∨ b1 = 1) (hb2 : b2 < 256) (hb3 : b3 < 256)
+    (b1 b2 b3 : Nat) (hb1 : b1 ≤ 1) (hb2 : b2 < 256) (hb3 : b3 < 256)
     (locals' : List LocalSlot) (mem : Memory) :
     evalByteCastAfterOperand Mir.WireframeDemo.decode_wire_header.body
       (.copy { local_ := 1, projection := [] })
@@ -39,8 +39,8 @@ private theorem evalByteCastAfterOperand_wireHeader
       .scalar { bits := b2 + 256 * b3, sizeBytes := 2 }]) locals' mem := by
   have h_b1 : decodeScalarLayoutBytesNoForge
       (ScalarLayout.initialized (.int 8 false) { start := 0, end_ := 1 })
-      [.init (UInt8.ofNat b1) none] = some (.scalar { bits := b1, sizeBytes := 1 }) := by
-    rcases hb1 with rfl | rfl <;> rfl
+      [.init (UInt8.ofNat b1) none] = some (.scalar { bits := b1, sizeBytes := 1 }) :=
+    match b1, hb1 with | 0, _ => rfl | 1, _ => rfl | _ + 2, h => nomatch h
   conv => lhs; whnf
   show (match (match (match (match decodeScalarLayoutBytesNoForge
         (ScalarLayout.initialized (.int 8 false) { start := 0, end_ := 1 })
@@ -109,7 +109,7 @@ private theorem lift_path (b0 b1 b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) 
   refine LiftStmtsToJoin.cons_eval_checked_ready hr (by rfl) rfl
     ((evalPureStmtChecked_eq_evalPureStmtNorm _ _ _ _ _).trans
       (evalPureStmtNorm_assign_local_of_setSpineChecked? rfl
-        (evalByteCastAfterOperand_wireHeader b1 b2 b3 (by omega) hb2 hb3 _ _)
+        (evalByteCastAfterOperand_wireHeader b1 b2 b3 h1 hb2 hb3 _ _)
         rfl (fun h => nomatch h) rfl))
     (LiftStmtsToJoin.eval_rest_checked_ready hr (by rfl) (by rfl)
       (LiftStmtsToJoin.term_switchInt_cases_ready (thenBb := 8) (elseBb := 7)

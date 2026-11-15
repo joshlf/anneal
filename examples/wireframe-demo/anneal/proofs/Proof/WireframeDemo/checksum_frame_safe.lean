@@ -208,9 +208,12 @@ theorem safe_noCallWpConverges
       have := checksumPrefix_le hb0 hb1 hb2 hb3 hb4 hb5 hb6 hb7 i
       omega
     refine mirStepsConverges_of_runCfgToBlock_constructive (target := 1) _ _ _ rfl _ ?_
-    rcases i with _ | _ | _ | _ | i
-    rotate_left 4
-    · exact False.elim (Nat.not_lt_zero i (Nat.lt_of_add_lt_add_right h_i_lt))
+    have hi4 : i = 0 ∨ i = 1 ∨ i = 2 ∨ i = 3 :=
+      match i, h_i_lt with
+      | 0, _ => .inl rfl | 1, _ => .inr (.inl rfl)
+      | 2, _ => .inr (.inr (.inl rfl)) | 3, _ => .inr (.inr (.inr rfl))
+      | _ + 4, h => False.elim (Nat.not_lt_zero _ (Nat.lt_of_add_lt_add_right h))
+    rcases hi4 with rfl | rfl | rfl | rfl
   case' exit =>
     rintro i a s h_ge ⟨h_le, h_a,
       v6, v8, v9, v10, v12, v14, v15, v16, v17, v18, v20, v21, v25, v26, v27, rfl⟩
