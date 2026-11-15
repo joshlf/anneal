@@ -184,4 +184,67 @@ theorem fixedU32_live_window_canary (layouts : LayoutTable) :
       [.init 6 none, .init 0 none, .init 0 none, .init 0 none] rfl rfl).2 ⟨6, by decide⟩ rfl,
     rfl⟩
 
+/-! ## `FixedByteCodec.scalarValidRange` (`NonZeroU32`) → `SpatialCodec StdVal` -/
+
+/-- `NonZeroU32` wrapping range `1..=u32::MAX`. -/
+def nonZeroU32Range : WrappingRange :=
+  { start := 1, end_ := 2 ^ (8 * 4) - 1 }
+
+/-- `FixedByteCodec` for `NonZeroU32` (`scalarValidRange 4 _ nonZeroU32Range`). -/
+def fixedNonZeroU32Codec :
+    FixedByteCodec
+      { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true }
+      4 :=
+  FixedByteCodec.scalarValidRange 4 (by decide) nonZeroU32Range
+
+def fixedNonZeroU32Embed
+    (x : { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true }) :
+    StdVal :=
+  .nat x.val
+
+def fixedNonZeroU32Embed? (v : StdVal) :
+    Option
+      { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true } :=
+  match stdNatVal? v with
+  | some k =>
+    if hk : k < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range k = true then
+      some ⟨k, hk⟩
+    else none
+  | none => none
+
+theorem fixedNonZeroU32Embed_embed? (v : StdVal)
+    (x : { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true })
+    (h : fixedNonZeroU32Embed? v = some x) : fixedNonZeroU32Embed x = v := by
+  cases v with
+  | mk fuel tree =>
+    cases tree with
+    | nat k =>
+      unfold fixedNonZeroU32Embed? at h
+      dsimp only [stdNatVal?] at h
+      by_cases hk : k < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range k = true
+      · rw [dite_eq_left hk] at h
+        injection h with h
+        subst h
+        rfl
+      · rw [dite_eq_right hk] at h
+        exact nomatch h
+    | _ => exact nomatch h
+
+/-- `NonZeroU32` `SpatialCodec StdVal` lifted from `FixedByteCodec.scalarValidRange`. -/
+def fixedNonZeroU32SpatialCodec : SpatialCodec StdVal :=
+  spatialCodecOfFixedByteCodec 133 fixedNonZeroU32Codec
+    (fun x => provenanceFree_encodeLittleEndianBytes 4 x.val)
+    fixedNonZeroU32Embed fixedNonZeroU32Embed? fixedNonZeroU32Embed_embed?
+
+theorem fixedNonZeroU32_canary :
+    fixedNonZeroU32SpatialCodec.encode (.nat 7) =
+      [.rawByte 7, .rawByte 0, .rawByte 0, .rawByte 0] ∧
+    fixedNonZeroU32SpatialCodec.decode
+      [.rawByte 7, .rawByte 0, .rawByte 0, .rawByte 0] = some (.nat 7) ∧
+    fixedNonZeroU32SpatialCodec.decode
+      [.rawByte 0, .rawByte 0, .rawByte 0, .rawByte 0] = none ∧
+    fixedNonZeroU32SpatialCodec.decode
+      [.uninit, .rawByte 0, .rawByte 0, .rawByte 0] = none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
 end Anneal.PureLift.FixedByteCodecBridge

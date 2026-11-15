@@ -660,9 +660,12 @@ def zcStUnpinned : SymState StdVal :=
 /-- **4-state lockstep commuting diagram for `SpatialPin` over live MIR**:
 1. Before freeze: `mirStateRel tagOfLoan [(0, 2, [])] zcStBorrowed zcMsPinned`
 2. After `freezeToSpatialInState`: `spatialPinnedBlockHolds ... zcStPinned zcMsPinned`
+   (by `freeze_spatialPinnedBlockHolds`)
 3. After `mutateSpatialInState` and live store `mirStep zcBody zcMsPinned = .cont zcMsWritten`:
    `spatialPinnedBlockHolds ... zcStWritten zcMsWritten`
-4. After `reabsorbFromSpatialInState`: `mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten`. -/
+   (by `mutate_spatialPinnedBlockHolds`)
+4. After `reabsorbFromSpatialInState`: `mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten`
+   (by `unpin_restores_mirStateRel`). -/
 theorem zc_lockstep_pin_lifecycle :
     mirStateRel tagOfLoan [(0, 2, [])] zcStBorrowed zcMsPinned ∧
     freezeToSpatialInState stdValAlg 0 zcCodec zcStBorrowed = .ok zcStPinned ∧
@@ -670,26 +673,34 @@ theorem zc_lockstep_pin_lifecycle :
     mutateSpatialInState 0 0 zcCellsAfter zcStPinned = .ok zcStWritten ∧
     spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 2 [] zcStWritten zcMsWritten ∧
     reabsorbFromSpatialInState stdValAlg 0 zcCodec zcStWritten = .ok zcStUnpinned ∧
-    mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten :=
-  ⟨⟨⟨⟨trivial, trivial⟩,
+    mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten := by
+  have hPin :
+      spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 2 [] zcStPinned zcMsPinned :=
+    freeze_spatialPinnedBlockHolds (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+      tagOfLoan stdValAlg 0 (st := zcStBorrowed) (x := ⟨zcV0, by decide⟩) rfl ⟨_, rfl, rfl⟩ rfl
+      ⟨_, rfl, rfl, rfl, rfl⟩
+  have hWritten :
+      spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 2 [] zcStWritten zcMsWritten :=
+    mutate_spatialPinnedBlockHolds (tag := 0) (newCells := zcCellsAfter) hPin rfl rfl rfl
+      ⟨_, rfl, rfl, rfl, rfl⟩
+  have hUnpinned :
+      mirStateRel tagOfLoan [(0, 2, [])] zcStUnpinned zcMsWritten :=
+    unpin_restores_mirStateRel (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+      (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec (y := ⟨zcV1, by decide⟩)
+      hWritten rfl rfl (.nat (by decide))
+      (mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         (fun h => nomatch h),
+         fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+         trivial⟩)
+  exact ⟨⟨⟨⟨trivial, trivial⟩,
      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
     mirLocalsRel_of_localsRefine
       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩,
        (fun h => nomatch h),
        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
        trivial⟩⟩,
-   rfl,
-   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
-   rfl,
-   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
-   rfl,
-   ⟨⟨⟨trivial, trivial⟩,
-     ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
-    mirLocalsRel_of_localsRefine
-      ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩,
-       (fun h => nomatch h),
-       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
-       trivial⟩⟩⟩
+   rfl, hPin, rfl, hWritten, rfl, hUnpinned⟩
 
 /-- **Multi-field aggregate `(u32, u32)` freeze → byte-slice mutation → unpin**
 connected to `SepLogicLenses.FieldsTyped`: freezing `(7, 9)` yields an 8-byte
@@ -737,7 +748,7 @@ theorem zc_unpin_general :
       decodeValueFromBytes defaultCodecFuel zcLayouts u32Ty bs =
         some ((u32MirCodec zcLayouts).toValue x) ∧
       findLoan 0 zcStUnpinned.loans = some e' ∧ e'.phase = .activeMut ∧
-      e'.cell.val = u32Embed x :=
+      e'.cell.val = u32Embed x ∧ isUnborrowed e'.cell.perm = true :=
   unpin_eq_live_mir_decode (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
     (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec
     (zc_lockstep_pin_lifecycle.2.2.2.2.1) rfl
@@ -864,20 +875,34 @@ def fpStUnpinned : SymState StdVal :=
 /-- **Field-granular hybrid pin over live MIR**:
 1. the general freeze bridge materializes the field window of `_3.1` as the
    pinned block (`freeze_spatialPinnedBlockHolds`, path `[1]`);
-2. the `PureLift` spatial mutation and the live field store keep the relation;
-3. the general unpin bridge restores loan `0` to the value the trusted decoder
-   reads from the live field window (`unpin_eq_live_mir_decode`). -/
+2. the general mutation bridge (`mutate_spatialPinnedBlockHolds`) and the live
+   field store keep `spatialPinnedBlockHolds`;
+3. the general unpin bridges (`unpin_eq_live_mir_decode`,
+   `unpin_restores_mirStateRel`) restore loan `0` to the value the trusted
+   decoder reads from the live field window and re-establish `mirStateRel`;
+4. the whole-tuple byte windows of `_3` in `fpMsPinned` and `fpMsWritten`
+   satisfy `SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4` at field
+   offsets `0` and `4` (`placeByteWindow?_u32Pair_fieldsTyped`). -/
 theorem fp_pin_lifecycle :
     spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStPinned fpMsPinned ∧
     mutateSpatialInState 0 0 zcCellsAfter fpStPinned = .ok fpStWritten ∧
     spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStWritten fpMsWritten ∧
     unpinFromSpatialInState stdValAlg 0 zcCodec fpStWritten = .ok fpStUnpinned ∧
+    mirStateRel tagOfLoan [(0, 3, [1])] fpStUnpinned fpMsWritten ∧
     (Exists fun x => Exists fun bs => Exists fun e' =>
       placeByteWindow? zcLayouts u32Ty fpMsWritten 3 [1] = some bs ∧
       decodeValueFromBytes defaultCodecFuel zcLayouts u32Ty bs =
         some ((u32MirCodec zcLayouts).toValue x) ∧
       findLoan 0 fpStUnpinned.loans = some e' ∧ e'.phase = .activeMut ∧
-      e'.cell.val = u32Embed x) := by
+      e'.cell.val = u32Embed x ∧ isUnborrowed e'.cell.perm = true) ∧
+    (Exists fun bsPin =>
+      placeByteWindow? zcLayouts (u32PairTy 99) fpMsPinned 3 [] = some bsPin ∧
+      bsPin = u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩) ∧
+      Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4 bsPin) ∧
+    (Exists fun bsWr =>
+      placeByteWindow? zcLayouts (u32PairTy 99) fpMsWritten 3 [] = some bsWr ∧
+      bsWr = u32PairExactLE.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩) ∧
+      Anneal.SepLogicLenses.FieldsTyped u32ExactLE 0 u32ExactLE 4 bsWr) := by
   have hPinned :
       spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStPinned fpMsPinned :=
     freeze_spatialPinnedBlockHolds (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
@@ -886,10 +911,23 @@ theorem fp_pin_lifecycle :
   have hWritten :
       spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStWritten
         fpMsWritten :=
-    ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩
-  exact ⟨hPinned, rfl, hWritten, rfl,
+    mutate_spatialPinnedBlockHolds (tag := 0) (newCells := zcCellsAfter) hPinned rfl rfl rfl
+      ⟨_, rfl, rfl, rfl, rfl⟩
+  have hUnpinnedRel :
+      mirStateRel tagOfLoan [(0, 3, [1])] fpStUnpinned fpMsWritten :=
+    unpin_restores_mirStateRel (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+      (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec (y := ⟨zcV1, by decide⟩)
+      hWritten rfl rfl (.nat (by decide))
+      (mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         (fun h => nomatch h), fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩)
+  exact ⟨hPinned, rfl, hWritten, rfl, hUnpinnedRel,
     unpin_eq_live_mir_decode (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
-      (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec hWritten rfl⟩
+      (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec hWritten rfl,
+    placeByteWindow?_u32Pair_fieldsTyped rfl fpMsPinned 3 []
+      ⟨7, by decide⟩ ⟨zcV0, by decide⟩ rfl,
+    placeByteWindow?_u32Pair_fieldsTyped rfl fpMsWritten 3 []
+      ⟨7, by decide⟩ ⟨zcV1, by decide⟩ rfl⟩
 
 /-- `PureLift` result: `(7, zcV1)`. -/
 theorem fp_pureLift_eval :
@@ -1078,8 +1116,44 @@ theorem pinned_relation_rejects_colliding_codec :
   intro ⟨e, _, _, _, hFind, hPhase, _⟩
   injection hFind with he
   subst he
-  obtain ⟨_, hC⟩ := hPhase
+  obtain ⟨_, hC, _⟩ := hPhase
   have hEnc := congrArg (fun c : SpatialCodec StdVal => c.encode (.nat zcV0)) hC
   exact nomatch hEnc
+
+/-- Freeze a `NonZeroU32` value, overwrite its 4 bytes with `cells`, unpin, and
+return it. -/
+def nonZeroU32PlanWith (cells : List (CellVal StdVal)) : FlowPlan StdVal :=
+  .seq (.act (.assign (.localSub 1 []) (.use (.localSub 0 []))))
+    (.seq (.act (.borrow 2 .mutBorrow (.localSub 1 [])))
+      (.seq (.act (.freezeSpatial 0 nonZeroU32SpatialCodec))
+        (.seq (.act (.mutateSpatial 0 0 cells))
+          (.seq (.act (.reabsorbSpatial 0 nonZeroU32SpatialCodec))
+            (.act (.endLoan 0))))))
+
+/-- **(i) Unpinning `0` at a `NonZeroU32` niche codec fails**: all-zero bytes
+`[0, 0, 0, 0]` violate the `0 < v` niche of `nonZeroU32ExactLE` /
+`nonZeroU32SpatialCodec` and fail to unpin (`.fail`), while `[42, 0, 0, 0]`
+unpins to `.nat 42` (non-vacuity). -/
+theorem zero_nonZeroU32_unpin_rejected :
+    nonZeroU32ExactLE.decode [.init 0 none, .init 0 none, .init 0 none, .init 0 none] = none ∧
+    nonZeroU32SpatialCodec.decode [.rawByte 0, .rawByte 0, .rawByte 0, .rawByte 0] = none ∧
+    evalFnValue stdValAlg [⟨.byVal, .nat 7⟩]
+        (nonZeroU32PlanWith [.rawByte 0, .rawByte 0, .rawByte 0, .rawByte 0])
+        (.use (.localSub 1 [])) = .fail ∧
+    evalFnValue stdValAlg [⟨.byVal, .nat 7⟩]
+        (nonZeroU32PlanWith [.rawByte 42, .rawByte 0, .rawByte 0, .rawByte 0])
+        (.use (.localSub 1 [])) = .ok ⟨.nat 42, []⟩ :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **(j) Wrong-width spatial mutations on a pinned block are rejected**:
+instantiating `mutateSpatialInState_fail_of_length_ne` on `zc_freeze_general`. -/
+theorem pinned_mutate_wrong_length_rejected :
+    mutateSpatialInState 0 0 [.rawByte 1, .rawByte 2, .rawByte 3] zcStPinned = .fail ∧
+    mutateSpatialInState 0 0
+      [.rawByte 1, .rawByte 2, .rawByte 3, .rawByte 4, .rawByte 5] zcStPinned = .fail :=
+  ⟨mutateSpatialInState_fail_of_length_ne rfl (u32_isIntoBytes zcLayouts)
+      zc_freeze_general (by decide),
+   mutateSpatialInState_fail_of_length_ne rfl (u32_isIntoBytes zcLayouts)
+      zc_freeze_general (by decide)⟩
 
 end PureLiftV2026BridgeTests
