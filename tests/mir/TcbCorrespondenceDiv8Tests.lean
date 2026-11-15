@@ -993,4 +993,223 @@ theorem a1_foreign_copy_nonoverlapping_tree_borrows_end_to_end :
       [.aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨77, 4⟩]] = .some (77, 4) := by
   refine ⟨by decide +kernel, by decide +kernel⟩
 
+/-! ## 10. Pass B2 Cross-Frame Layout, Alignment, Protector & Byte-Offset Regression Witnesses -/
+
+def arr4U32T : Ty := { kind := .array (.uint .u32) 4, layoutIdx := 0 }
+def arr4U32Decl : LocalDecl := { mutability := .mut, ty := arr4U32T, debugName := none }
+def ptrMutArr4U32Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut (.array (.uint .u32) 4), layoutIdx := 0 },
+    debugName := none }
+def sliceU32T : Ty := { kind := .slice (.uint .u32), layoutIdx := 0 }
+def ptrMutSliceU32Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 0 },
+    debugName := none }
+
+/-- B2-1: `evalRvalueRawPtr` `fallbackByByteOffset` threads `callStack := mem.callStack` into
+`boundMem`, so reborrowing a subslice from an offset pointer into an `.uninit` caller allocation
+uses the caller frame's allocation bound (`16` bytes) rather than colliding with the callee's `.dead`
+local of the same index (`0` bytes), while still rejecting out-of-bounds subslices (`4 + 16 > 16`). -/
+def b2CallerUninitArr4Frame : SavedCallerFrame := {
+  callerBody := mkMirBody "witness::b2_caller_uninit_arr4" 0 [u32Decl, arr4U32Decl] []
+  frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+  destination := locPlace 0
+}
+
+def b2CalleeDeadLocal1Decls : List LocalDecl :=
+  [ptrMutU32Decl, arr4U32Decl, ptrMutArr4U32Decl]
+
+def b2CalleeDeadLocal1Locals (offBytes : Nat) : List LocalSlot :=
+  [.uninit, .dead, .init (.ptr { allocId := 12, offsetBytes := offBytes } 8)]
+
+def b2CallerArr4BorrowEntry : BorrowEntry :=
+  { tag := 12, targetLocal := 1, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+
+def b2RawPtrSubsliceMem : Memory :=
+  { emptyMemory with
+    borrows := [b2CallerArr4BorrowEntry]
+    callStack := [b2CallerUninitArr4Frame] }
+
+theorem b2_1_raw_ptr_fallback_byte_offset_cross_frame :
+    (match evalRvalue (b2CalleeDeadLocal1Locals 4)
+        (.rawPtr .mut { local_ := 2, projection := [.deref, .constantIndex 1 4 false] })
+        b2RawPtrSubsliceMem b2CalleeDeadLocal1Decls emptyLayoutTable with
+     | .ok (.ptr p 8) _ _ => some p.offsetBytes
+     | _ => none) = some 8 ∧
+    evalRvalue (b2CalleeDeadLocal1Locals 16)
+      (.rawPtr .mut { local_ := 2, projection := [.deref, .constantIndex 1 4 false] })
+      b2RawPtrSubsliceMem b2CalleeDeadLocal1Decls emptyLayoutTable = .ub := by
+  refine ⟨rfl, rfl⟩
+
+/-- B2-2: `evalCallerPlaceWrite` passes `callerLocals` and `callStack` to
+`resolveDerefWriteFullProj`, so writing through an element-offset pointer (`offsetBytes = 4` on
+`targetProjection = [.constantIndex 0 0 false]`) into an intermediate caller frame at
+`targetFrameDepth = 1` resolves to `[.constantIndex 1 0 false]` (disjoint from a protected sibling
+borrow at `[.constantIndex 0 0 false]`) instead of failing to look up the caller frame and falsely
+faulting `.ub`. -/
+def b2RootDummyFrame : SavedCallerFrame := {
+  callerBody := callerBody
+  frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar ⟨0, 4⟩)] }
+  destination := locPlace 0
+}
+
+def b2MidArrLocals : List LocalSlot :=
+  [.init (.scalar ⟨0, 4⟩), .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩])]
+
+def b2MidCallerFrame : SavedCallerFrame := {
+  callerBody := callerBody
+  frame := { blockIdx := 0, stmtIdx := 0, locals := b2MidArrLocals }
+  destination := locPlace 0
+}
+
+def b2ProtectedElem0Borrow : BorrowEntry :=
+  { tag := 20, targetLocal := 1, targetProjection := [.constantIndex 0 0 false],
+    perm := .frozen, protector := .some 7, targetFrameDepth := 1 }
+
+def b2ElemOffsetWriteBorrow : BorrowEntry :=
+  { tag := 21, targetLocal := 1, targetProjection := [.constantIndex 0 0 false],
+    perm := .active, targetFrameDepth := 1 }
+
+def b2LeafFrameLocals (offBytes : Nat) : List LocalSlot :=
+  [.uninit, .init (.ptr { allocId := 21, offsetBytes := offBytes } 8)]
+
+theorem b2_2_eval_caller_place_write_protector_depth_gt_zero :
+    evalCallerPlaceWrite
+      (b2LeafFrameLocals 4)
+      b2MidArrLocals
+      [b2ElemOffsetWriteBorrow, b2ProtectedElem0Borrow]
+      (derefPlace 1)
+      (.scalar ⟨99, 4⟩)
+      [7]
+      []
+      emptyLayoutTable
+      [b2MidCallerFrame, b2RootDummyFrame] =
+    .ok [.init (.scalar ⟨0, 4⟩), .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩])] ∧
+    evalCallerPlaceWrite
+      (b2LeafFrameLocals 0)
+      b2MidArrLocals
+      [b2ElemOffsetWriteBorrow, b2ProtectedElem0Borrow]
+      (derefPlace 1)
+      (.scalar ⟨99, 4⟩)
+      [7]
+      []
+      emptyLayoutTable
+      [b2MidCallerFrame, b2RootDummyFrame] = .ub := by
+  refine ⟨rfl, rfl⟩
+
+/-- B2-3: Cross-frame per-body `LayoutTable` isolation (`targetLayouts`) across
+`evalStackThinPtrTypedDerefRead`, `writeStackThinPtrTypedDeref`, `checkTargetPlaceAlign`,
+`borrowPlaceByteOffset?`, and slice fat-pointer writes/reborrows.
+In `b2CallerCustomPairMir`, `layoutIdx = 0` is an 8-byte `CustomPair` struct with field offsets
+`[0, 4]`; in `b2CalleeReadWriteOffsetPtrMir`, `layoutIdx = 0` is a 4-byte primitive `u32`. -/
+def customPairT : Ty := { kind := .adt "witness::CustomPair" [], layoutIdx := 0 }
+def customPairDecl : LocalDecl := { mutability := .mut, ty := customPairT, debugName := none }
+def ptrMutCustomPairDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut customPairT.kind, layoutIdx := 0 },
+    debugName := none }
+
+def u32PrimLayout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+def customPairLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [1, 1] }
+
+def b2CallerPairLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [customPairLayout, u32PrimLayout] }
+
+def b2CalleeU32OnlyLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u32PrimLayout] }
+
+def b2CalleeReadWriteOffsetPtrMir : CapturedMir :=
+  singleBlockBody "witness::b2_callee_rw_offset_ptr" 1
+    [u32Decl, ptrMutU32Decl, u32Decl]
+    [.storageLive 2,
+     .assign (locPlace 2) (.use (.copy (derefPlace 1))),
+     .assign (derefPlace 1) (.use (constU32 77)),
+     .assign (locPlace 0) (.use (.copy (locPlace 2))),
+     .storageDead 2]
+    b2CalleeU32OnlyLayouts
+
+def b2CallerCustomPairMir : CapturedMir :=
+  { (mkMirBody "witness::b2_caller_custom_pair" 1
+      [u32Decl, customPairDecl, ptrMutCustomPairDecl, ptrMutU32Decl, ptrMutU32Decl, u32Decl]
+      [{ statements :=
+           [mkStmt (.storageLive 2),
+            mkStmt (.storageLive 3),
+            mkStmt (.storageLive 4),
+            mkStmt (.storageLive 5),
+            mkStmt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1))),
+            mkStmt (.assign (locPlace 3)
+              (.cast .ptrToPtr (.copy (locPlace 2)) { kind := .rawPtr .mut (.uint .u32), layoutIdx := 1 })),
+            mkStmt (.assign (locPlace 4)
+              (.binaryOp .offset (.copy (locPlace 3)) (constUsize 1)))],
+         terminator := mkTerm (.call (fnDefOp "witness::b2_callee_rw_offset_ptr")
+           [.move (locPlace 4)] (locPlace 5) (some 1) .continue_),
+         isCleanup := false },
+       { statements :=
+           [mkStmt (.assign (locPlace 0)
+              (.binaryOp .add (.copy (locPlace 5))
+                (.copy { local_ := 1, projection := [.field 1 { kind := .uint .u32, layoutIdx := 1 }] }))),
+            mkStmt (.storageDead 5),
+            mkStmt (.storageDead 4),
+            mkStmt (.storageDead 3),
+            mkStmt (.storageDead 2)],
+         terminator := mkTerm .return_,
+         isCleanup := false }]) with
+    layouts := b2CallerPairLayouts }
+
+def packedWrapLayout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+
+def b2CallerPackedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [packedWrapLayout, u32PrimLayout] }
+
+def packedWrapT : Ty := { kind := .adt "witness::PackedWrap" [], layoutIdx := 0 }
+def packedWrapDecl : LocalDecl := { mutability := .mut, ty := packedWrapT, debugName := none }
+
+def b2CallerPackedFrame : SavedCallerFrame := {
+  callerBody :=
+    { (mkMirBody "witness::b2_caller_packed" 0 [u32Decl, packedWrapDecl] []) with
+      layouts := b2CallerPackedLayouts }
+  frame := { blockIdx := 0, stmtIdx := 0,
+             locals := [.init (.scalar ⟨0, 4⟩), .init (.aggregate 0 [.scalar ⟨55, 4⟩])] }
+  destination := locPlace 0
+}
+
+def b2PackedBorrowEntry : BorrowEntry :=
+  { tag := 30, targetLocal := 1, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+
+theorem b2_3_cross_frame_target_layouts_and_slice_align_end_to_end :
+    runTrustedScalar? b2CallerCustomPairMir [b2CalleeReadWriteOffsetPtrMir]
+      [.aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨22, 4⟩]] = .some (99, 4) ∧
+    borrowPlaceByteOffset?
+      [.uninit] [] [u32Decl] b2CalleeU32OnlyLayouts
+      { b2PackedBorrowEntry with
+        targetProjection := [.field 1 { kind := .uint .u32, layoutIdx := 1 }] }
+      [{ b2CallerPackedFrame with
+         callerBody := { b2CallerPackedFrame.callerBody with
+                         localDecls := [u32Decl, customPairDecl]
+                         layouts := b2CallerPairLayouts }
+         frame := { blockIdx := 0, stmtIdx := 0,
+                    locals := [.init (.scalar ⟨0, 4⟩),
+                               .init (.aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨22, 4⟩])] } }] =
+      .some 4 ∧
+    writeCallerPlaceValue
+      [.uninit,
+       .init (.aggregate 0 [.ptr { allocId := 30, offsetBytes := 0 } 8, .scalar ⟨1, 8⟩])]
+      [.init (.scalar ⟨0, 4⟩), .init (.aggregate 0 [.scalar ⟨55, 4⟩])]
+      [b2PackedBorrowEntry]
+      { local_ := 1, projection := [.deref, .constantIndex 0 1 false] }
+      (.scalar ⟨99, 4⟩)
+      [u32Decl,
+       { mutability := .mut, ty := { kind := .ref .mut (.slice (.uint .u32)), layoutIdx := 0 },
+         debugName := none }]
+      b2CalleeU32OnlyLayouts
+      [b2CallerPackedFrame] = .ub := by
+  refine ⟨by decide +kernel, rfl, rfl⟩
+
 end Anneal.TcbCorrespondenceDiv8Tests

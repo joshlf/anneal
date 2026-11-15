@@ -6429,17 +6429,19 @@ def checkTargetPlaceAlign
     (tyOpt : Option Ty)
     (entry : BorrowEntry)
     (ptrVal : ProvenancePtr)
-    (targetRootValOpt : Option Value) :
+    (targetRootValOpt : Option Value)
+    (targetLayouts : LayoutTable := layouts)
+    (localDecls : List LocalDecl := targetDecls) :
     Bool :=
   match tyOpt, get? targetDecls entry.targetLocal with
   | .some ty, .some decl =>
-    let reqAlign := tyByteAlign targetDecls layouts ty
+    let reqAlign := tyByteAlign localDecls layouts ty
     match Nat.ble reqAlign 1 with
     | true => true
     | false =>
       checkTargetPlaceAlignWalk
         targetDecls
-        layouts
+        targetLayouts
         reqAlign
         ptrVal.offsetBytes
         (.some decl.ty)
@@ -9429,7 +9431,8 @@ def evalStackThinPtrTypedDerefRead
     (pointeeTyOpt : Option Ty)
     (accessedTyOpt : Option Ty)
     (targetTyOpt : Option Ty := .none)
-    (targetDecls : List LocalDecl := localDecls) :
+    (targetDecls : List LocalDecl := localDecls)
+    (targetLayouts : LayoutTable := layouts) :
     PlaceReadResult :=
   let isSyntheticFieldOnScalarPointee : Bool :=
     match stripTransparentProjections restProj, pointeeTyOpt with
@@ -9462,7 +9465,9 @@ def evalStackThinPtrTypedDerefRead
         alignTyOpt
         entry
         ptrVal
-        (.some targetRootVal))
+        (.some targetRootVal)
+        targetLayouts
+        localDecls)
   with
   | false => .ub
   | true =>
@@ -9491,7 +9496,7 @@ def evalStackThinPtrTypedDerefRead
       | .none =>
         placeTyResolved
           effTargetDecls
-          layouts
+          targetLayouts
           { local_ := entry.targetLocal, projection := entry.targetProjection }
     match isSyntheticFieldOnScalarPointee, entry.targetProjection with
     | true, .nil =>
@@ -9512,7 +9517,7 @@ def evalStackThinPtrTypedDerefRead
               readProjectedForLocal
                 locals
                 effTargetDecls
-                layouts
+                targetLayouts
                 entry.targetLocal
                 targetRootVal
                 rawFullProj
@@ -9542,7 +9547,7 @@ def evalStackThinPtrTypedDerefRead
             entry
             ptrVal
             restProj
-            layouts
+            targetLayouts
             resolvedAccTyOpt
             effTargetTyOpt
             codecDecls
@@ -9555,7 +9560,7 @@ def evalStackThinPtrTypedDerefRead
             ptrVal
             restProj
             effTargetDecls
-            layouts
+            targetLayouts
             effPointeeTyOpt
             reqBytesOpt
         with
@@ -9571,7 +9576,7 @@ def evalStackThinPtrTypedDerefRead
             readProjectedForLocal
               locals
               effTargetDecls
-              layouts
+              targetLayouts
               entry.targetLocal
               targetRootVal
               fullProj
@@ -9580,12 +9585,12 @@ def evalStackThinPtrTypedDerefRead
             let subTyOpt : Option Ty :=
               placeTyResolved
                 effTargetDecls
-                layouts
+                targetLayouts
                 { local_ := entry.targetLocal, projection := fullProj }
             let decodeFromResolvedOrTarget : Ty → Option Value := fun accTy =>
               match
                 decodeSubValueAtByteOffset?
-                  layouts
+                  targetLayouts
                   subTyOpt
                   fieldVal
                   residualBytes
@@ -9770,23 +9775,23 @@ def evalSliceFatPtrDerefRead
       match entry.perm with
       | .disabled => .ub
       | _ =>
-        let targetRootAndDeclsOpt : Option (Value × List LocalDecl) :=
+        let targetRootDeclsLayoutsOpt : Option (Value × List LocalDecl × LayoutTable) :=
           match activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal with
-          | .some (.init v) => .some (v, localDecls)
+          | .some (.init v) => .some (v, localDecls, layouts)
           | .some _ => .none
           | .none =>
             match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
             | .some (.init v) =>
-              .some
-                (v,
-                  (foreignFrameDeclsAndLayouts
-                    callStack
-                    layouts
-                    entry.targetFrameDepth
-                    entry.targetLocal).1)
+              let (td, tl) :=
+                foreignFrameDeclsAndLayouts
+                  callStack
+                  layouts
+                  entry.targetFrameDepth
+                  entry.targetLocal
+              .some (v, td, tl)
             | _ => .none
-        match targetRootAndDeclsOpt with
-        | .some (targetRootVal, targetDecls) =>
+        match targetRootDeclsLayoutsOpt with
+        | .some (targetRootVal, targetDecls, targetLayouts) =>
           match
             checkTargetPlaceAlign
               targetDecls
@@ -9795,6 +9800,8 @@ def evalSliceFatPtrDerefRead
               entry
               ptrVal
               (.some targetRootVal)
+              targetLayouts
+              localDecls
           with
           | false => .ub
           | true =>
@@ -9982,6 +9989,7 @@ def evalPlaceRead
                   targetLayouts
                   { local_ := entry.targetLocal, projection := entry.targetProjection })
                 targetDecls
+                targetLayouts
             | _ => .ub
       | .none =>
         match checkDerefAlign localDecls layouts globalAlignTyOpt ptrVal.offsetBytes with
@@ -10259,6 +10267,7 @@ def evalOperand
                         targetLayouts
                         { local_ := entry.targetLocal, projection := entry.targetProjection })
                       targetDecls
+                      targetLayouts
                   match
                     foreignFrameTarget?
                       callStack
@@ -10529,6 +10538,7 @@ def evalOperand
                         targetLayouts
                         { local_ := entry.targetLocal, projection := entry.targetProjection })
                       targetDecls
+                      targetLayouts
                   match
                     foreignFrameTarget?
                       callStack
@@ -11035,7 +11045,8 @@ def writeStackThinPtrTypedDeref
     (layouts : LayoutTable)
     (pointeeTyOpt : Option Ty)
     (accessedTyOpt : Option Ty)
-    (targetDecls : List LocalDecl := localDecls) :
+    (targetDecls : List LocalDecl := localDecls)
+    (targetLayouts : LayoutTable := layouts) :
     PlaceWriteResult :=
   let isSyntheticFieldOnScalarPointee : Bool :=
     match stripTransparentProjections restProj, pointeeTyOpt with
@@ -11073,7 +11084,9 @@ def writeStackThinPtrTypedDeref
           alignTyOpt
           entry
           ptrVal
-          targetRootValOpt)
+          targetRootValOpt
+          targetLayouts
+          localDecls)
         (validateValueForTy? layouts resolvedAccTyOpt val))
   with
   | false => .ub
@@ -11100,7 +11113,7 @@ def writeStackThinPtrTypedDeref
           readProjectedForLocal
             indexLocals
             effTargetDecls
-            layouts
+            targetLayouts
             entry.targetLocal
             targetRootVal
             rawFullProj
@@ -11119,7 +11132,7 @@ def writeStackThinPtrTypedDeref
                 writeProjectedForLocal
                   indexLocals
                   effTargetDecls
-                  layouts
+                  targetLayouts
                   entry.targetLocal
                   targetRootVal
                   (pHead :: pTail)
@@ -11150,7 +11163,7 @@ def writeStackThinPtrTypedDeref
                 writeProjectedForLocal
                   indexLocals
                   effTargetDecls
-                  layouts
+                  targetLayouts
                   entry.targetLocal
                   targetRootVal
                   (pHead :: pTail)
@@ -11169,7 +11182,7 @@ def writeStackThinPtrTypedDeref
               normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
             match
               projectionChainByteOffset?
-                layouts
+                targetLayouts
                 (.some rootDecl.ty)
                 (.some targetRootVal)
                 .none
@@ -11183,8 +11196,8 @@ def writeStackThinPtrTypedDeref
                 spliceSubValueAtByteOffset?
                   localDecls
                   effTargetDecls
-                  layouts
-                  (.some (resolveTyWithLocalDecls effTargetDecls layouts rootDecl.ty))
+                  targetLayouts
+                  (.some (resolveTyWithLocalDecls effTargetDecls targetLayouts rootDecl.ty))
                   targetRootVal
                   (Nat.add baseOff ptrVal.offsetBytes)
                   resolvedAccTyOpt
@@ -11212,7 +11225,7 @@ def writeStackThinPtrTypedDeref
               ptrVal
               restProj
               effTargetDecls
-              layouts
+              targetLayouts
               effPointeeTyOpt
               reqBytesOpt
           match resolvedProjOpt with
@@ -11224,7 +11237,7 @@ def writeStackThinPtrTypedDeref
               readProjectedForLocal
                 indexLocals
                 effTargetDecls
-                layouts
+                targetLayouts
                 entry.targetLocal
                 targetRootVal
                 entry.targetProjection
@@ -11233,13 +11246,13 @@ def writeStackThinPtrTypedDeref
               let baseSubTyOpt :=
                 placeTyResolved
                   effTargetDecls
-                  layouts
+                  targetLayouts
                   { local_ := entry.targetLocal, projection := entry.targetProjection }
               match
                 spliceSubValueAtByteOffset?
                   localDecls
                   effTargetDecls
-                  layouts
+                  targetLayouts
                   baseSubTyOpt
                   oldBaseVal
                   ptrVal.offsetBytes
@@ -11252,7 +11265,7 @@ def writeStackThinPtrTypedDeref
               match
                 placeTouchesUnion
                   effTargetDecls
-                  layouts
+                  targetLayouts
                   { local_ := entry.targetLocal, projection := entry.targetProjection }
               with
               | true => spliceIntoRootViaEntryOffset
@@ -11263,7 +11276,7 @@ def writeStackThinPtrTypedDeref
             readProjectedForLocal
               indexLocals
               effTargetDecls
-              layouts
+              targetLayouts
               entry.targetLocal
               targetRootVal
               fullProj
@@ -11272,7 +11285,7 @@ def writeStackThinPtrTypedDeref
             match
               placeTouchesUnion
                 effTargetDecls
-                layouts
+                targetLayouts
                 { local_ := entry.targetLocal, projection := fullProj }
             with
             | false => .ub
@@ -11280,7 +11293,7 @@ def writeStackThinPtrTypedDeref
               let subTyOpt : Option Ty :=
                 placeTyResolved
                   effTargetDecls
-                  layouts
+                  targetLayouts
                   { local_ := entry.targetLocal, projection := fullProj }
               let directUnionInitOk : Bool :=
                 match Nat.beq residualBytes 0, resolvedAccTyOpt, subTyOpt with
@@ -11299,7 +11312,7 @@ def writeStackThinPtrTypedDeref
             let subTyOpt : Option Ty :=
               placeTyResolved
                 effTargetDecls
-                layouts
+                targetLayouts
                 { local_ := entry.targetLocal, projection := fullProj }
             let storeValOpt : Option Value :=
               match resolvedAccTyOpt with
@@ -11316,7 +11329,7 @@ def writeStackThinPtrTypedDeref
                     spliceSubValueAtByteOffset?
                       localDecls
                       effTargetDecls
-                      layouts
+                      targetLayouts
                       subTyOpt
                       oldVal
                       residualBytes
@@ -11328,7 +11341,7 @@ def writeStackThinPtrTypedDeref
                     spliceSubValueAtByteOffset?
                       localDecls
                       effTargetDecls
-                      layouts
+                      targetLayouts
                       subTyOpt
                       oldVal
                       residualBytes
@@ -11402,7 +11415,7 @@ def writeStackThinPtrTypedDeref
                       spliceSubValueAtByteOffset?
                         localDecls
                         effTargetDecls
-                        layouts
+                        targetLayouts
                         subTyOpt
                         oldVal
                         0
@@ -11418,11 +11431,11 @@ def writeStackThinPtrTypedDeref
             match resolvedAccTyOpt, get? effTargetDecls entry.targetLocal with
             | .some { kind := .never, .. }, _ => .none
             | .some accTy, .some decl =>
-              let declTy := resolveTyWithLocalDecls effTargetDecls layouts decl.ty
+              let declTy := resolveTyWithLocalDecls effTargetDecls targetLayouts decl.ty
               match rigidTyEq accTy.kind declTy.kind with
               | true => .some val
               | false =>
-                match tyByteSize localDecls layouts accTy, tyByteSize effTargetDecls layouts declTy with
+                match tyByteSize localDecls layouts accTy, tyByteSize effTargetDecls targetLayouts declTy with
                 | .some wB, .some dB =>
                   match Nat.beq wB dB with
                   | false => .none
@@ -11434,11 +11447,11 @@ def writeStackThinPtrTypedDeref
                         match effTargetDecls with
                         | .nil => localDecls
                         | _ :: _ => effTargetDecls
-                      decodeSubValueAtByteOffset? layouts (.some accTy) val 0 declTy codecDecls
+                      decodeSubValueAtByteOffset? targetLayouts (.some accTy) val 0 declTy codecDecls
                 | _, _ => .none
             | .none, .some decl =>
-              let declTy := resolveTyWithLocalDecls effTargetDecls layouts decl.ty
-              match val, tyByteSize effTargetDecls layouts declTy with
+              let declTy := resolveTyWithLocalDecls effTargetDecls targetLayouts decl.ty
+              match val, tyByteSize effTargetDecls targetLayouts declTy with
               | .scalar wSc, .some dB =>
                 match Nat.beq wSc.sizeBytes dB with
                 | true => .some val
@@ -11882,6 +11895,12 @@ def writeCallerPlaceValue
                   | _ => .ub
                 | _ => .ub
             | _ :: _ =>
+              let (targetDecls, targetLayouts) :=
+                foreignFrameDeclsAndLayouts
+                  callStack
+                  layouts
+                  entry.targetFrameDepth
+                  entry.targetLocal
               writeStackThinPtrTypedDeref
                 frameLocals
                 callerLocals
@@ -11893,11 +11912,8 @@ def writeCallerPlaceValue
                 layouts
                 pointeeTyOpt
                 accessedTyOpt
-                (foreignFrameDeclsAndLayouts
-                  callStack
-                  layouts
-                  entry.targetFrameDepth
-                  entry.targetLocal).1
+                targetDecls
+                targetLayouts
       | .none => .ub
     | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
       let sliceAlignTyOpt : Option Ty :=
@@ -11923,25 +11939,44 @@ def writeCallerPlaceValue
             | .none =>
               match get? callerLocals entry.targetLocal with
               | .some (.init targetRootVal) =>
+                let (targetDecls, targetLayouts) :=
+                  foreignFrameDeclsAndLayouts
+                    callStack
+                    layouts
+                    entry.targetFrameDepth
+                    entry.targetLocal
                 match
-                  writeSliceFatPtrTargetValue
-                    frameLocals
-                    targetRootVal
-                    entry.targetProjection
+                  checkTargetPlaceAlign
+                    targetDecls
+                    layouts
+                    sliceAlignTyOpt
+                    entry
                     ptrVal
-                    ptrSz
-                    lenSc
-                    restProj
-                    val
+                    (.some targetRootVal)
+                    targetLayouts
+                    localDecls
                 with
-                | .ok targetRootVal' =>
+                | false => .ub
+                | true =>
                   match
-                    set? callerLocals entry.targetLocal (.init targetRootVal')
+                    writeSliceFatPtrTargetValue
+                      frameLocals
+                      targetRootVal
+                      entry.targetProjection
+                      ptrVal
+                      ptrSz
+                      lenSc
+                      restProj
+                      val
                   with
-                  | .some callerLocals' => .ok callerLocals'
-                  | .none => .ub
-                | .ub => .ub
-                | .unsupported => .unsupported
+                  | .ok targetRootVal' =>
+                    match
+                      set? callerLocals entry.targetLocal (.init targetRootVal')
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .ub => .ub
+                  | .unsupported => .unsupported
               | _ => .ub
         | .none => .ub
     | _ => .ub
@@ -11996,6 +12031,8 @@ def evalCallerPlaceWrite
                   ptrOrFatVal
                   entry
                   restProj
+                  callerLocals
+                  callStack
               match borrows with
               | b₁ :: b₂ :: restBorrows =>
                 let allBorrows := b₁ :: b₂ :: restBorrows
@@ -14908,8 +14945,8 @@ def borrowPlaceByteOffset?
   match normProj with
   | .nil => .some 0
   | _ :: _ =>
-    let (rootValOpt, targetDecls, rootTyOpt) :
-        Option Value × List LocalDecl × Option Ty :=
+    let (rootValOpt, targetDecls, targetLayouts, rootTyOpt) :
+        Option Value × List LocalDecl × LayoutTable × Option Ty :=
       match activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal with
       | .some slot =>
         let vOpt :=
@@ -14920,7 +14957,7 @@ def borrowPlaceByteOffset?
           match get? localDecls entry.targetLocal with
           | .some decl => .some (resolveTyWithLocalDecls localDecls layouts decl.ty)
           | .none => .none
-        (vOpt, localDecls, tyOpt)
+        (vOpt, localDecls, layouts, tyOpt)
       | .none =>
         let vOpt :=
           match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
@@ -14936,9 +14973,9 @@ def borrowPlaceByteOffset?
           match get? targetDecls entry.targetLocal with
           | .some decl => .some (resolveTyWithLocalDecls targetDecls targetLayouts decl.ty)
           | .none => .none
-        (vOpt, targetDecls, tyOpt)
+        (vOpt, targetDecls, targetLayouts, tyOpt)
     projectionChainByteOffset?
-      layouts
+      targetLayouts
       rootTyOpt
       rootValOpt
       .none
@@ -15817,17 +15854,24 @@ def evalSliceFatPtrDerefBorrow
         match permOk with
         | false => .ub
         | true =>
-          let targetRootOpt : Option Value :=
+          let targetRootDeclsLayoutsOpt : Option (Value × List LocalDecl × LayoutTable) :=
             match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
-            | .some (.init v) => .some v
+            | .some (.init v) => .some (v, localDecls, layouts)
             | .some _ => .none
             | .none =>
               match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
-              | .some (.init v) => .some v
+              | .some (.init v) =>
+                let (td, tl) :=
+                  foreignFrameDeclsAndLayouts
+                    mem.callStack
+                    layouts
+                    parentEntry.targetFrameDepth
+                    parentEntry.targetLocal
+                .some (v, td, tl)
               | _ => .none
-          match targetRootOpt with
+          match targetRootDeclsLayoutsOpt with
           | .none => .ub
-          | .some targetRootVal =>
+          | .some (targetRootVal, targetDecls, targetLayouts) =>
             let expSzOpt : Option Nat :=
               match pointeeTyOpt with
               | .some { kind := .slice elemKind, layoutIdx := pIdx } =>
@@ -15981,12 +16025,14 @@ def evalSliceFatPtrDerefBorrow
                           | false => true
                           | true =>
                             checkTargetPlaceAlign
-                              localDecls
+                              targetDecls
                               layouts
                               accessedTyOpt
                               entry
                               { allocId := tag, offsetBytes := 0 }
                               (.some targetRootVal)
+                              targetLayouts
+                              localDecls
                         match Bool.and tailValid resAlignOk with
                         | false => .ub
                         | true =>
@@ -16652,7 +16698,8 @@ def resolveRefDerefTargetCore?
     (effPointeeTyOpt : Option Ty)
     (accessedTyOpt : Option Ty)
     (isSyntheticFieldOnScalarPointee : Bool := false)
-    (localDecls : List LocalDecl := targetDecls) :
+    (localDecls : List LocalDecl := targetDecls)
+    (targetLayouts : LayoutTable := layouts) :
     Option (Option (List ProjectionElem × Nat)) :=
   let rawFull :=
     match parentEntry.targetProjection with
@@ -16675,15 +16722,15 @@ def resolveRefDerefTargetCore?
     | _ :: _ => effTargetDecls
   let resolvedAccTyOpt : Option Ty :=
     match accessedTyOpt with
-    | .some accTy => .some (resolveTyWithLocalDecls codecDecls layouts accTy)
+    | .some accTy => .some (resolveTyWithLocalDecls localDecls layouts accTy)
     | .none => .none
   let accBytesOpt : Option Nat :=
     match resolvedAccTyOpt with
     | .some accTy =>
-      match tyByteSize codecDecls layouts accTy with
+      match tyByteSize localDecls layouts accTy with
       | .some sz => .some sz
       | .none =>
-        match tyByteSize localDecls layouts accTy with
+        match tyByteSize codecDecls targetLayouts accTy with
         | .some sz => .some sz
         | .none => tyByteSize .nil layouts accTy
     | .none => .none
@@ -16703,7 +16750,7 @@ def resolveRefDerefTargetCore?
           parentPtr
           resolvedRest
           effTargetDecls
-          layouts
+          targetLayouts
           effPointeeTyOpt
           reqBytesOpt
       with
@@ -16715,7 +16762,7 @@ def resolveRefDerefTargetCore?
             readProjectedForLocal
               locals
               codecDecls
-              layouts
+              targetLayouts
               parentEntry.targetLocal
               targetRootVal
               rawFull
@@ -16732,11 +16779,11 @@ def resolveRefDerefTargetCore?
             let rawSubTyOpt :=
               placeTyResolved
                 effTargetDecls
-                layouts
+                targetLayouts
                 { local_ := parentEntry.targetLocal, projection := rawFull }
             match
               decodeSubValueAtByteOffset?
-                layouts
+                targetLayouts
                 rawSubTyOpt
                 (.aggregate aggVar aggFields)
                 parentPtr.offsetBytes
@@ -16755,7 +16802,7 @@ def resolveRefDerefTargetCore?
       readProjectedForLocal
         locals
         codecDecls
-        layouts
+        targetLayouts
         parentEntry.targetLocal
         targetRootVal
         fullProj
@@ -16766,7 +16813,7 @@ def resolveRefDerefTargetCore?
       let subTyOpt : Option Ty :=
         placeTyResolved
           effTargetDecls
-          layouts
+          targetLayouts
           { local_ := parentEntry.targetLocal, projection := fullProj }
       let widthOk : Bool :=
         match resolvedAccTyOpt with
@@ -16826,9 +16873,9 @@ def resolveRefDerefTargetCore?
                         let subElemTy :=
                           resolveTyWithLocalDecls
                             codecDecls
-                            layouts
-                            { kind := subEk, layoutIdx := unresolvedLayoutIdx layouts }
-                        match tyByteSize codecDecls layouts subElemTy, accBytesOpt with
+                            targetLayouts
+                            { kind := subEk, layoutIdx := unresolvedLayoutIdx targetLayouts }
+                        match tyByteSize codecDecls targetLayouts subElemTy, accBytesOpt with
                         | .some elemSz, .some reqBytes =>
                           Nat.ble
                             (Nat.add residualOffset reqBytes)
@@ -16845,7 +16892,7 @@ def resolveRefDerefTargetCore?
                              | _ => false)
                         | .none, .some _ => false
                     | false =>
-                      match tyByteSize codecDecls layouts subTy, accBytesOpt with
+                      match tyByteSize codecDecls targetLayouts subTy, accBytesOpt with
                       | .some subBytes, .some reqBytes =>
                         Nat.ble (Nat.add residualOffset reqBytes) subBytes
                       | .none, .some reqBytes =>
@@ -16854,7 +16901,7 @@ def resolveRefDerefTargetCore?
                 | .none =>
                   match
                     decodeSubValueAtByteOffset?
-                      layouts
+                      targetLayouts
                       .none
                       (.aggregate aggVar subElems)
                       residualOffset
@@ -16907,7 +16954,8 @@ def resolveRefDerefTarget?
     (effPointeeTyOpt : Option Ty)
     (accessedTyOpt : Option Ty)
     (isSyntheticFieldOnScalarPointee : Bool := false)
-    (localDecls : List LocalDecl := targetDecls) :
+    (localDecls : List LocalDecl := targetDecls)
+    (targetLayouts : LayoutTable := layouts) :
     Option (Option (List ProjectionElem × Nat)) :=
   let rawFull :=
     match parentEntry.targetProjection with
@@ -16937,6 +16985,8 @@ def resolveRefDerefTarget?
       parentEntry
       parentPtr
       (.some targetRootVal)
+      targetLayouts
+      localDecls
   with
   | false => .none
   | true =>
@@ -16953,6 +17003,7 @@ def resolveRefDerefTarget?
         accessedTyOpt
         isSyntheticFieldOnScalarPointee
         localDecls
+        targetLayouts
     with
     | .none => .none
     | .some .none => .some .none
@@ -16969,7 +17020,9 @@ def resolveRefDerefTarget?
               accessedTyOpt
               { parentEntry with targetProjection := fullProj }
               { parentPtr with offsetBytes := residualOffset }
-              (.some targetRootVal))
+              (.some targetRootVal)
+              targetLayouts
+              localDecls)
       match refTargetAlignOk with
       | false => .none
       | true => .some (.some (fullProj, residualOffset))
@@ -16989,7 +17042,8 @@ def resolveRawPtrDerefTarget?
     (effPointeeTyOpt : Option Ty)
     (accessedTyOpt : Option Ty)
     (isSyntheticFieldOnScalarPointee : Bool)
-    (localDecls : List LocalDecl := targetDecls) :
+    (localDecls : List LocalDecl := targetDecls)
+    (targetLayouts : LayoutTable := layouts) :
     Option (List ProjectionElem × Nat) :=
   let rawFull :=
     match parentEntry.targetProjection with
@@ -17013,10 +17067,10 @@ def resolveRawPtrDerefTarget?
   let reqBytesOpt : Option Nat :=
     match resolvedRest, accessedTyOpt with
     | .nil, .some accTy =>
-      match tyByteSize codecDecls layouts accTy with
+      match tyByteSize localDecls layouts accTy with
       | .some sz => .some sz
       | .none =>
-        match tyByteSize localDecls layouts accTy with
+        match tyByteSize codecDecls targetLayouts accTy with
         | .some sz => .some sz
         | .none => tyByteSize .nil layouts accTy
     | _, _ => .none
@@ -17031,7 +17085,7 @@ def resolveRawPtrDerefTarget?
         parentPtr
         resolvedRest
         effTargetDecls
-        layouts
+        targetLayouts
         effPointeeTyOpt
         reqBytesOpt
     with
@@ -17042,7 +17096,7 @@ def resolveRawPtrDerefTarget?
         readProjectedForLocal
           locals
           codecDecls
-          layouts
+          targetLayouts
           parentEntry.targetLocal
           targetRootVal
           rawFull
@@ -17072,13 +17126,13 @@ def resolveRawPtrDerefTarget?
         let rawSubTyOpt :=
           placeTyResolved
             effTargetDecls
-            layouts
+            targetLayouts
             { local_ := parentEntry.targetLocal, projection := rawFull }
-        let resolvedAccTy := resolveTyWithLocalDecls codecDecls layouts accTy
+        let resolvedAccTy := resolveTyWithLocalDecls localDecls layouts accTy
         match
           resolvedRest,
           decodeSubValueAtByteOffset?
-            layouts
+            targetLayouts
             rawSubTyOpt
             (.aggregate aggVar aggFields)
             parentPtr.offsetBytes
@@ -17430,24 +17484,24 @@ def evalRvalueRefDeref
           match resolveBorrowProjectionElems locals restProj with
           | .none => .ub
           | .some resolvedRest =>
-            let targetRootAndDeclsOpt : Option (Value × List LocalDecl) :=
+            let targetRootDeclsLayoutsOpt : Option (Value × List LocalDecl × LayoutTable) :=
               match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
-              | .some (.init v) => .some (v, localDecls)
+              | .some (.init v) => .some (v, localDecls, layouts)
               | .some _ => .none
               | .none =>
                 match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
                 | .some (.init v) =>
-                  .some
-                    (v,
-                      (foreignFrameDeclsAndLayouts
-                        mem.callStack
-                        layouts
-                        parentEntry.targetFrameDepth
-                        parentEntry.targetLocal).1)
+                  let (td, tl) :=
+                    foreignFrameDeclsAndLayouts
+                      mem.callStack
+                      layouts
+                      parentEntry.targetFrameDepth
+                      parentEntry.targetLocal
+                  .some (v, td, tl)
                 | _ => .none
-            match targetRootAndDeclsOpt with
+            match targetRootDeclsLayoutsOpt with
             | .none => .ub
-            | .some (targetRootVal, targetDecls) =>
+            | .some (targetRootVal, targetDecls, targetLayouts) =>
               match
                 resolveRefDerefTarget?
                   locals
@@ -17461,6 +17515,7 @@ def evalRvalueRefDeref
                   accessedTyOpt
                   isSyntheticFieldOnScalarPointee
                   localDecls
+                  targetLayouts
               with
               | .none => .ub
               | .some .none => .unsupported
@@ -17594,7 +17649,26 @@ def evalRvalueRefDeref
             parentEntry
             parentPtr
             (.some rootVal)
-        | _ => true
+        | .some _ => true
+        | .none =>
+          match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
+          | .some (.init rootVal) =>
+            let (targetDecls, targetLayouts) :=
+              foreignFrameDeclsAndLayouts
+                mem.callStack
+                layouts
+                parentEntry.targetFrameDepth
+                parentEntry.targetLocal
+            checkTargetPlaceAlign
+              targetDecls
+              layouts
+              sliceAlignTyOpt
+              parentEntry
+              parentPtr
+              (.some rootVal)
+              targetLayouts
+              localDecls
+          | _ => true
       | .none =>
         match lookupGlobalAlloc mem.globals parentPtr.allocId with
         | .some alloc =>
@@ -17753,19 +17827,19 @@ def evalRvalueRawPtr
             match lookupBorrow mem.borrows parentPtr.tag with
             | .some parentEntry =>
                 let rawPerm := parentEntry.perm
-                let targetSlotAndDeclsOpt : Option (LocalSlot × List LocalDecl) :=
+                let targetSlotDeclsLayoutsOpt : Option (LocalSlot × List LocalDecl × LayoutTable) :=
                   match activeFrameSlot? locals mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal with
-                  | .some slot => .some (slot, localDecls)
+                  | .some slot => .some (slot, localDecls, layouts)
                   | .none =>
                     match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
                     | .some slot =>
-                      .some
-                        (slot,
-                          (foreignFrameDeclsAndLayouts
-                            mem.callStack
-                            layouts
-                            parentEntry.targetFrameDepth
-                            parentEntry.targetLocal).1)
+                      let (td, tl) :=
+                        foreignFrameDeclsAndLayouts
+                          mem.callStack
+                          layouts
+                          parentEntry.targetFrameDepth
+                          parentEntry.targetLocal
+                      .some (slot, td, tl)
                     | .none => .none
                 let fallbackByByteOffset (checkDead : Bool) (rejectSubslice : Bool) :
                     RvalueEvalResult :=
@@ -17818,7 +17892,8 @@ def evalRvalueRawPtr
                               { emptyMemory with
                                 globals := mem.globals
                                 borrows := { parentEntry with perm := .active } :: .nil
-                                callerLocals := mem.callerLocals }
+                                callerLocals := mem.callerLocals
+                                callStack := mem.callStack }
                             let boundOpt :=
                               ptrAllocByteBound? locals boundMem localDecls layouts parentPtr
                             let endSpanInBounds : Bool :=
@@ -17856,10 +17931,10 @@ def evalRvalueRawPtr
                                     nextTag := Nat.add tag 1
                                   }
                                   .ok (.ptr { allocId := tag, offsetBytes := newPtr.offsetBytes } ptrSz) locals mem'
-                match targetSlotAndDeclsOpt with
+                match targetSlotDeclsLayoutsOpt with
                 | .none => fallbackByByteOffset true true
-                | .some (.dead, _) => fallbackByByteOffset true true
-                | .some (.uninit, targetDecls) =>
+                | .some (.dead, _, _) => fallbackByByteOffset true true
+                | .some (.uninit, targetDecls, targetLayouts) =>
                   match
                     needsThinPtrElemResolution
                       parentEntry.targetProjection
@@ -17908,7 +17983,7 @@ def evalRvalueRawPtr
                           | .some subSpan =>
                             match get? targetDecls parentEntry.targetLocal with
                             | .some decl =>
-                              match tyByteSize targetDecls layouts decl.ty with
+                              match tyByteSize targetDecls targetLayouts decl.ty with
                               | .some allocSz =>
                                 Nat.ble (Nat.add fieldOff subSpan) allocSz
                               | .none => true
@@ -17939,7 +18014,7 @@ def evalRvalueRawPtr
                       }
                       .ok (.ptr { allocId := tag, offsetBytes := 0 } ptrSz) locals mem'
                   | _, _ => fallbackByByteOffset false false
-                | .some (.init targetRootVal, targetDecls) =>
+                | .some (.init targetRootVal, targetDecls, targetLayouts) =>
                   match
                     resolveRawPtrDerefTarget?
                       locals
@@ -17953,6 +18028,7 @@ def evalRvalueRawPtr
                       accessedTyOpt
                       isSyntheticFieldOnScalarPointee
                       localDecls
+                      targetLayouts
                   with
                   | .some (fullProj, residualOffset) =>
                     let tag := mem.nextTag
@@ -18096,7 +18172,26 @@ def evalRvalueRawPtr
                   parentEntry
                   parentPtr
                   (.some rootVal)
-              | _ => true
+              | .some _ => true
+              | .none =>
+                match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
+                | .some (.init rootVal) =>
+                  let (targetDecls, targetLayouts) :=
+                    foreignFrameDeclsAndLayouts
+                      mem.callStack
+                      layouts
+                      parentEntry.targetFrameDepth
+                      parentEntry.targetLocal
+                  checkTargetPlaceAlign
+                    targetDecls
+                    layouts
+                    sliceAlignTyOpt
+                    parentEntry
+                    parentPtr
+                    (.some rootVal)
+                    targetLayouts
+                    localDecls
+                | _ => true
             | .none =>
               match lookupGlobalAlloc mem.globals parentPtr.allocId with
               | .some alloc =>
