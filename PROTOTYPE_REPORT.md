@@ -8,7 +8,8 @@
 > `lean-miri/**`, `minirust/**`, `lakefile.toml`, or `theory/Anneal.lean` is modified, and no
 > `vendor/lean-miri/` is created.
 
-Status: **round B4** (seventh critique-and-fix pass of the N = 4 loop, after A3). Recommendation (§6):
+Status: **round A4 — final** (eighth and last critique-and-fix pass of the N = 4 loop, after B4).
+Recommendation (§6):
 **CONDITIONAL GO**.
 
 ## 1. Architecture
@@ -43,19 +44,19 @@ All definitions use the real `Trusted.Rustc.V2026_06_01` types (`RigidTy`, `Ty`,
 | 11 | 95 `#guard_msgs (whitespace := lax) in #print axioms` guards. |
 | 12 | A `run_cmd` audit of **every** declaration in the module. Its axioms must be ⊆ {propext, Quot.sound}; otherwise elaboration fails. This was checked with a planted `Classical.choice` probe. |
 
-### 1.2 Inventory (B4)
+### 1.2 Inventory (A4, final)
 
 | Metric | Value |
 |---|---|
-| Lean LOC | 5,934 |
+| Lean LOC | 5,941 |
 | `theorem`s | 215 |
 | `def`/`abbrev`s | 272 |
 | `#guard_msgs` axiom guards | 95 (60 `[propext]`, 35 `[propext, Quot.sound]`) |
 | `sorry` / `admit` / `axiom` / `native_decide` / `partial` / `unsafe` | 0 |
 | `Classical.choice` anywhere in the module | 0 (enforced by the Part 12 audit) |
-| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~34 s wall |
-| Receipt 3 (`unittest`) | 69 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~86 s wall |
-| Verifier LOC / test LOC / tests | 2,084 / 1,524 / 69. B3 rejects `DT_RUNPATH` `$ORIGIN/../lib` shadowing of `lib/lean/libleanshared*.so` and enforces `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`. A3 adds ELF `DT_NEEDED` × `DT_RUNPATH`/`DT_RPATH` resolution for every pinned ELF object, plus a glibc-soname denylist. B4 fixes the `lib/lean/` self-inclusion bypass in `_check_runpath_shadowing` and validates `PT_LOAD` EOF bounds and `PT_INTERP` headers in `elf_dynamic_info`. |
+| Receipt 1 (`anneal-lean-run … lake env lean`) | exit 0, no output (0 errors, 0 warnings), ~38 s wall |
+| Receipt 3 (`unittest`) | 70 tests, OK (1 opt-in skip: real `d9b41b58b` diff via `ANNEAL_PROTO_DEINIT_PATCH_DIFF`), ~84 s wall |
+| Verifier LOC / test LOC / tests | 2,102 / 1,548 / 70. B3 rejects `DT_RUNPATH` `$ORIGIN/../lib` shadowing of `lib/lean/libleanshared*.so` and enforces `TOOLCHAIN_REQUIRED_FILES` in `_load_toolchain_pin`. A3 adds ELF `DT_NEEDED` × `DT_RUNPATH`/`DT_RPATH` resolution for every pinned ELF object, plus a glibc-soname denylist. B4 fixes the `lib/lean/` self-inclusion bypass in `_check_runpath_shadowing` and validates `PT_LOAD` EOF bounds and `PT_INTERP` headers in `elf_dynamic_info`. A4 applies glibc `fillin_rpath` / `is_dst` semantics: empty components are the current working directory and are rejected, and only `$ORIGIN` / `${ORIGIN}` DSTs are expanded. |
 
 ### 1.3 Headline theorems
 
@@ -142,11 +143,13 @@ Each row runs a real `CapturedMir`, with layouts from Trusted's `RigidTy.compute
 | D4 | `copy` keeps source; `copy _1 + move _1`; `move _1 + copy _1`; `move _1 + move _1` | `canary_D4_*` (4) | 5, 10, UB, UB in both | PR #257 `D7a`/`D7b`/`D7c` |
 | D5 | `_3 = &_1; _2 = &raw mut _1; _4 = move (*_2)` | `canary_D5_indirect_move_{delivers_value,reread_ub}`, `canary_D5_move_preserves_sibling_frozen` | 5; UB; `*_3` passes TB, then UB on uninit bytes | `D5`; `DIV-LM-D6-OFFSET-DISABLED-TAG` naming |
 | D5 | contrast `*_2 = 9` / `Deinit(*_2)` then `*_3` | `canary_D5_{assign,deinit}_disables_sibling_frozen` | `Obs.ub .treeBorrows` in both | — |
-| D6 | `_1 = move _1`; `*_2 = move *_2`; `_1 = (move _1.1, move _1.0)` | `canary_D6_*` (3) | 5, 5, 2 in both | PR #257 `D8` |
+| D6 | `_1 = move _1`; `*_2 = move *_2`; `_1 = (move _1.1, move _1.0)` | `canary_D6_{direct_self_move,indirect_self_move,field_swap_self_aggregate}_ok` | 5, 5, 2 in both | PR #257 `D8` |
+| D6 | (B4) `_1 = &raw mut _1; _0 = copy (*_1)` / `_1 = &_1; _0 = copy (*_1)`. Both are ill-typed in rustc MIR, so they test byte-level semantics only. | `canary_D6_self_rawPtr_assign_deref_ok` / `canary_D6_self_shared_ref_assign_tb_ub` | 0 / 0; `Obs.ub .treeBorrows` in both, as in Miri, where `Retag(_1)` writes back through the base tag | — |
 | D7 | `call callee(move _1, copy _2)`, callee reads `*_2` | `canary_D7_call_arg_move_deinit_before_callee` / `_copy_ok` | UB / UB; 5 / 5 | `kani#5172` |
 | D7 | `call unresolved(move _uninit)` vs `call unresolved(const 1)` | `canary_D7_uninit_arg_ub_before_unsupported` / `canary_D7_unresolved_callee_unsupported` | UB (before `.unsupported`); `.unsupported` | `kani#5172`, sibling `DIV-MR-CALL-TARGET-LOCAL` ordering |
+| D7 | (B3) `_1 = 5; _0 = calleeAdd(move _1, copy _1)` | `canary_D7_call_move_then_copy_arg_ub` | UB / UB (unpatched `Call.lean`: 10) | finding 11 |
 | D7 | `*_2 = call callee(move _2)` & `call unresolved(1) -> (*_uninit_ptr)` | `canary_D7_call_dest_resolved_before_arg_move` / `canary_D7_call_bad_dest_ub_before_unsupported` | 42 / 42; `Obs.ub .invalidPointer` | `Miri/Interpreter/Call.lean:453` dest-first |
-| D7 | unpatched `Call.lean` path: `D7` (memory-backed move arg) vs `_2 = calleeImm(move _1); _0 = copy _1` (immediate move arg) | `call_move_arg_upstream_call_path` | `D7`: UB in `M_anneal` and in upstream `Call.lean`. Immediate move arg: UB in `M_anneal` and `M_ref`, but 5 upstream | finding 11 (7th file) |
+| D7 | unpatched `Call.lean` path: `D7` (memory-backed move arg) vs `_2 = calleeImm(move _1); _0 = copy _1` (immediate move arg) | `call_move_arg_upstream_call_path` | `D7`: UB in `M_anneal` and in upstream `Call.lean`. Upstream diverges in three cases. A moved immediate arg gives 5, where `M_anneal` and `M_ref` give UB. Same-call `move _1, copy _1` gives 10. `call unresolved(move _uninit)` gives `.unsupported`, because the callee is resolved before `passArgument` validates. | finding 11 (7th file) |
 | D8 | `assert(move _1)` fails → `cleanup bb2` reads `_1` / `_2` | `canary_D8_assert_cleanup_{moved_cond_ub,unmoved_ok}` | UB / UB; panicked / panicked | `D8` |
 | D8 | unwinding `call panicky(move _1)` → `cleanup bb2` | `canary_D8_unwinding_call_{moved_arg_ub,unmoved_ok}` | UB / UB; panicked / panicked | `D8` |
 | D9 | `move _1[1]`; read `_1[0]`, `_1[3]`, `_1[1]` | `canary_D9_elem_move_{neighbors_ok,reread_ub}` | 10, 13, UB in both | `D9` |
@@ -282,6 +285,20 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
     * **(B4) Closing A3's `lib/lean/` self-inclusion bypass in `_check_runpath_shadowing` & `PT_LOAD`/`PT_INTERP` bounds in `elf_dynamic_info`.**
       * In A3, `_verify_toolchain_impl` added *every* `lib/lean/*.so*` on disk into `candidates` and `files` before calling `_check_runpath_shadowing(toolchain_dir, real_root, candidates, files, c)`. Because `_check_runpath_shadowing` checked `if hit_rel not in files:`, any `.so` planted inside `lib/lean/` (which is on `DT_RUNPATH` via `$ORIGIN/../lib/lean` and `$ORIGIN`) was already in `files` and therefore bypassed `_check_runpath_shadowing` completely (and was even parsed as a trusted `elf_rels` object); when `active_pin is None`, non-glibc libraries planted in `lib/lean/` (such as `lib/lean/libz.so.1`) were silently accepted and loaded during `bin/lean --version`. B4 resolves `active_pin` *before* `_check_runpath_shadowing`, restricts `pinned_files` to `active_pin["files"]` (or Lean's own `_SHADOW_LEAN_LIB_RE` libraries when unpinned), and tests `lib/lean/` RUNPATH shadowing in both `LiveCheckoutTests` and `ToolchainTests` (`test_runpath_shadow_planted_inside_lib_lean_rejected_and_not_executed`).
       * B4 also hardens `elf_dynamic_info` to verify `p_offset + p_filesz <= file_size` on every `PT_LOAD` segment and to validate `PT_INTERP` segments (requiring a single NUL-terminated absolute path without `..` and requiring `PT_DYNAMIC` whenever `PT_INTERP` is present).
+      * (A4 note) With an active pin (locked or explicit), a file planted in `lib/lean/` was already
+        rejected before execution by the pin comparison (`unpinned toolchain file added`). B4's change
+        is defense in depth for unpinned (trust-on-first-use) runs only.
+    * **(A4) glibc `DT_RUNPATH` semantics.**
+      * A3's parser dropped empty `RUNPATH`/`RPATH` components. glibc's `fillin_rpath` treats an empty
+        element as the current working directory: `_run_version` runs with `cwd = bin/`, and users run
+        Lean processes from arbitrary directories.
+      * A3 also expanded `$ORIGIN` inside non-DST strings such as `$ORIGINX/lib`. glibc's `is_dst`
+        leaves those literal, which makes them CWD-relative directories.
+      * A4 keeps empty components and rejects them. It expands only glibc-recognised
+        `$ORIGIN` / `${ORIGIN}` tokens and rejects any other `$`
+        (`test_glibc_runpath_semantics_empty_component_and_non_dst_origin_rejected`).
+      * Neither pattern occurs in the locked v4.34.1 binaries, so the locked default run was never
+        exposed. Explicit or trust-on-first-use pins of other toolchains were exposed.
 11. **(B2, corrected in A2, extended in B3 and B4) `Call.lean` is a 7th file the deinit patch must touch.**
     * B2 found that `Call.evalFnCallArgumentAt` (`lean-miri/vendor/Miri/Interpreter/Call.lean:164-175`)
       routes `.Move place` through `evalPlace` + `placeToOp` / `forceAllocation`, bypassing the
@@ -323,6 +340,11 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
     * **Track A must also patch `Call.evalFnCallArgumentAt`** so that `.Move` immediates go through
       the patched `evalOperand` (or are deinitialized). This requires growing the closed
       `PATCH_ALLOWLIST` to 7 files. The prototype keeps the brief's 6-file allowlist.
+      * The same patch must close divergence (b): consume a moved place before later same-call
+        `.Copy` reads of it.
+      * It must also close divergence (c): read and validate argument operands before `h.resolve` /
+        body loading (`kani#5172`). Otherwise `FaultEquivalenceClaim` has to be stated modulo
+        LeanMiri `.unsupported` outcomes.
     * The protector retag of `protectInPlaceFunctionArgument` is not modeled. Its `writeUninit`
       through the protected tag is a Tree Borrows write, the same divergence as finding 1.
     * **(B4) Self-referential `.ref` / `.rawPtr` assignment destination promotion (`_1 = &raw mut _1` and `_1 = &_1`).**
@@ -338,6 +360,23 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
    * Protectors are not modeled (`isProtected = false`).
    * Pointer loads during nested `deref` walks are raw (no TB).
    * `retag`, `setDiscriminant`, intrinsics, casts and drops are `.unsupported` in both machines.
+13. **(A4) Pin scope gap: the core-library `.olean`s and the other `bin/` tools are not pinned.**
+    * The prototype pins exactly what the brief and cl/1021969520 scope: `bin/lean`, `bin/lake` and
+      `lib/lean/*.so`, i.e. the code the verifier itself executes.
+    * The `.olean` gap:
+      * `lib/lean/` of v4.34.1 also holds 2,520 core `.olean` files for `Init`, `Std`, `Lean` and
+        `Lake`. With their `.ilean`, `.ir` and `.olean.{private,server}` companions the directory is
+        2.8 GiB.
+      * Every proof here imports them.
+      * Lean does not kernel-recheck imported declarations. A tampered `Init/*.olean` could
+        therefore add an unproved theorem that `#print axioms` would never report.
+    * The tools gap: `bin/` also ships `leanc`, `clang`, `ld.lld`, `leantar`, `leanchecker`,
+      `cadical`, `leanir`, `leanmake` and `llvm-ar`. Lake runs some of them (native builds,
+      artifact caches).
+    * Track A should pin a manifest digest of `lib/lean/**` and of `bin/*` in
+      `LOCKED_TOOLCHAIN_PINS`. Hashing about 2.8 GiB per run needs a cache keyed by
+      inode/size/mtime. Alternatively, replay the imported environment with the pinned
+      `bin/leanchecker` in CI.
 
 ## 4. Pin verifier (`scripts/verify_lean_miri_pin_proto.py`)
 
@@ -363,23 +402,29 @@ columns are nonetheless computed independently by the kernel, as a non-vacuity c
   `DT_NEEDED` / `DT_RUNPATH` / `DT_RPATH` (`elf_dynamic_info`). It rejects any unpinned file
   that ld.so could load from a `RUNPATH`/`RPATH` directory, and any directory that resolves outside
   the toolchain root (`_check_runpath_shadowing`). It also rejects glibc sonames planted in `lib/`
-  or `lib/lean/`.
-* **Tests.** There are 69 unit tests. They cover a live end-to-end run and every tamper vector of
-  the brief. They also cover B2 pre-execution digest verification, B3 `$ORIGIN/../lib` shadowing,
-  A3 ELF-derived `RUNPATH` resolution on real and synthetic ELF images, and B4 `lib/lean/`
-  self-inclusion `RUNPATH` shadowing and `PT_LOAD`/`PT_INTERP` bounds.
+  or `lib/lean/`. (A4) `RUNPATH` entries are read with glibc semantics: empty (CWD) components
+  are rejected, and only `$ORIGIN` / `${ORIGIN}` DSTs are expanded. The pin does not cover the
+  core `.olean`s or the other `bin/` tools (finding 13).
+* **Tests.** There are 70 unit tests. They cover a live end-to-end run and every tamper vector of
+  the brief. They also cover:
+  * B2 pre-execution digest verification;
+  * B3 `$ORIGIN/../lib` shadowing;
+  * A3 ELF-derived `RUNPATH` resolution on real and synthetic ELF images;
+  * B4 `lib/lean/` self-inclusion `RUNPATH` shadowing and `PT_LOAD`/`PT_INTERP` bounds;
+  * A4 glibc empty-component and non-DST `$ORIGIN` handling.
   The Lean hygiene tests check for forbidden tokens, that every `#print axioms` is guarded with an
   allowed axiom list, and that receipt 1 compiles.
 
-## 5. Receipts (B4)
+## 5. Receipts (A4, final)
 
-See the B4 board post for the exact outputs of the four receipt commands. All four exit 0, and
+See the A4 final board post for the exact outputs of the four receipt commands. All four exit 0, and
 `git diff --name-only 8e1523cb..HEAD` lists only the four prototype files.
 
 ## 6. Recommendation and Track A integration plan
 
 **CONDITIONAL GO** for `ws-lean-miri-deinit-pin-and-correspondence-codec`. The conditions are
-findings 1, 3, 4 and 5.
+findings 1, 3, 4, 5 and 11 (the `Call.lean` 7th-file patch). Finding 13 (pin scope) is a
+recommended hardening.
 
 File-by-file plan. Patch in place at the repository root `lean-miri/`. This removes
 `joshlf-mir-vendor`'s 113,855-line duplicate `vendor/lean-miri/`.
@@ -388,13 +433,17 @@ File-by-file plan. Patch in place at the repository root `lean-miri/`. This remo
    apply `d9b41b58b`. In addition:
    (a) give the deinit write TB/race-silent hooks (finding 1);
    (b) either consume call arguments one at a time or make the latch per-operand (finding 3);
-   (c) patch `Miri/Interpreter/Call.lean` `evalFnCallArgumentAt` so moved immediate arguments are
-       deinitialized (finding 11). This 7th file must be added to `PATCH_ALLOWLIST`.
+   (c) patch `Miri/Interpreter/Call.lean`. `evalFnCallArgumentAt` must deinitialize moved
+       immediate arguments, and same-call `.Copy` reads of a moved place must observe the move.
+       Argument operands must be validated before `h.resolve` / body loading (`kani#5172`)
+       (finding 11, divergences (a)–(c)). This 7th file must be added to `PATCH_ALLOWLIST`.
 2. `lean-miri/UPSTREAM_PIN.json`: add `patched_files`, with six entries carrying
    `upstream_sha256`, `patched_sha256`, `upstream_git_blob` and `patch_reason`, and optionally
    `execution_machine_closure`.
 3. `scripts/verify_lean_miri_pin.py` and `ci/`: promote the prototype verifier and wire it into
    `trusted/audit/check_trusted.py`, including the toolchain pin JSON and all `libleanshared*.so`.
+   Extend the locked pin to a `lib/lean/**` + `bin/*` manifest, or add a pinned `leanchecker`
+   replay (finding 13).
 4. `trusted/lean/Trusted/Correspondence.lean` (new, TCB): `TypeTable`, `RefProg`, `encodeProg` /
    `decodeProg`, `LayoutQuery`, and the claim statements (`CorrespondenceClaim`,
    `FaultEquivalenceClaim`, `MiriMoveDeinitWiringClaim`) over `V2026_06_01`.

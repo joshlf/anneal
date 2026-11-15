@@ -1186,6 +1186,27 @@ class ToolchainTests(TempCase):
         # check and reaches the exec gate (EM_BPF, so it cannot actually run).
         self.assertRejected(self.verify, "cannot execute `bin/lean --version`", absent=("RUNPATH", "SHA-256 mismatch", "skipped `bin/lean --version`"))
 
+    def test_glibc_runpath_semantics_empty_component_and_non_dst_origin_rejected(self) -> None:
+        # glibc `fillin_rpath`: an empty RUNPATH element is the current working
+        # directory (and `_run_version` runs with cwd = bin/); glibc `is_dst`:
+        # `$ORIGINX` / `$ORIGIN_` are not DSTs and stay CWD-relative literals. A3
+        # dropped empty elements and expanded `$ORIGIN` inside `$ORIGINX`.
+        for runpath, needle in (
+            (["$ORIGIN/../lib/lean", ""], "bin/lean: empty DT_RUNPATH/DT_RPATH component (glibc ld.so searches the current working directory)"),
+            ([""], "bin/lean: empty DT_RUNPATH/DT_RPATH component"),
+            (["", "$ORIGIN/../lib/lean"], "bin/lean: empty DT_RUNPATH/DT_RPATH component"),
+            (["$ORIGINX/../lib/lean"], "bin/lean: unsupported DT_RUNPATH entry '$ORIGINX/../lib/lean'"),
+            (["$ORIGIN_/../lib/lean"], "bin/lean: unsupported DT_RUNPATH entry '$ORIGIN_/../lib/lean'"),
+            (["${ORIGIN/../lib/lean"], "bin/lean: unsupported DT_RUNPATH entry '${ORIGIN/../lib/lean'"),
+        ):
+            with self.subTest(runpath=runpath):
+                self.repin_bin_lean(make_elf64(["libleanshared.so"], runpath))
+                self.assertRejected(self.verify, needle, "skipped `bin/lean --version`", absent=("SHA-256 mismatch",))
+        # Control: real DSTs (`${ORIGIN}`, `$ORIGIN` followed by `/`) are accepted
+        # and the run reaches the exec gate (EM_BPF, so it cannot actually run).
+        self.repin_bin_lean(make_elf64(["libleanshared.so"], ["${ORIGIN}/../lib/lean", "$ORIGIN/../lib"]))
+        self.assertRejected(self.verify, "cannot execute `bin/lean --version`", absent=("RUNPATH", "DT_", "SHA-256 mismatch"))
+
     def test_runpath_shadow_planted_inside_lib_lean_rejected_and_not_executed(self) -> None:
         # In A3, `_verify_toolchain_impl` added every `lib/lean/*.so*` on disk into
         # `files` BEFORE calling `_check_runpath_shadowing`, so `hit_rel not in files`
@@ -1223,6 +1244,9 @@ class ElfDynamicParserTests(TempCase):
         )
         self.assertEqual(V.elf_dynamic_info(self.put(make_elf64(["libbar.so"], ["/opt/a", "/opt/b"], rpath_tag=15))), (("libbar.so",), ("/opt/a", "/opt/b")))
         self.assertEqual(V.elf_dynamic_info(self.put(make_elf64([], []))), ((), ()))
+        # Empty components survive parsing (glibc: empty element = current directory).
+        self.assertEqual(V.elf_dynamic_info(self.put(make_elf64(["libfoo.so"], ["$ORIGIN", ""]))), (("libfoo.so",), ("$ORIGIN", "")))
+        self.assertEqual(V.elf_dynamic_info(self.put(make_elf64(["libfoo.so"], [""]))), (("libfoo.so",), ("",)))
         self.assertIsNone(V.elf_dynamic_info(self.put(b"#!/bin/sh\necho hi\n", "script")))
 
     def test_malformed_or_unsupported_elf_raises(self) -> None:

@@ -3858,7 +3858,14 @@ theorem canary_D6_self_rawPtr_assign_deref_ok :
 `createRef` creates a `.frozen` borrow tag `1` on `alloc = 0`, and writing the
 new reference into `_1` (upgraded to `.mem 0`) performs a Tree Borrows `.Write`
 through the root tag that disables tag `1`, so dereferencing `*_1` faults with
-`.ub .treeBorrows`. -/
+`.ub .treeBorrows`.
+
+(A4) Scope note: this program and `d6SelfRawPtr` are ill-typed in rustc MIR
+(`&T` vs `&&T`; `*mut T` vs `*mut *mut T`), so both canaries exercise only the
+byte-level machines. The outcome still matches Miri. There, `Rvalue::Ref` does
+not retag, but the following `Retag(_1)` writes the retagged pointer back into
+`_1`'s own bytes through the base tag. That foreign write disables the fresh
+`.frozen` tag, just as the fused `createRef`-then-`writeDest` order does here. -/
 def d6SelfSharedRef : V2026Prog := prog1 <| mkBody "d6ref" 0 [tU8, tRef]
   [blk [asg (loc 1) (.ref .shared (loc 1)),
         asg (loc 0) (.use (.copy (drf 1)))] .return_]

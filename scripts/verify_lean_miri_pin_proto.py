@@ -245,6 +245,10 @@ _SHADOW_LEAN_LIB_RE = re.compile(r"\A(libleanshared|libInit_shared|libLake_share
 _SYSTEM_SONAME_RE = re.compile(
     r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(\.[0-9]+)*)\Z"
 )
+#: glibc `is_dst`: `$ORIGIN` / `${ORIGIN}` is a dynamic string token only when
+#: not followed by an identifier character; `$ORIGINX/lib` stays a literal,
+#: i.e. a relative (current-working-directory-based) search directory.
+_ORIGIN_DST_RE = re.compile(r"\$(?:\{ORIGIN\}|ORIGIN(?![A-Za-z0-9_]))")
 
 #: Planted build-artifact detection inside `lean-miri/vendor/`.
 _ARTIFACT_SUFFIXES = (
@@ -1545,7 +1549,9 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
         runpath: List[str] = []
         for t, v in entries:
             if t in (15, 29):  # DT_RPATH, DT_RUNPATH
-                runpath.extend(e for e in string_at(v).split(":") if e)
+                # Empty components are kept: glibc's `fillin_rpath` searches the
+                # current working directory for an empty RUNPATH/RPATH element.
+                runpath.extend(string_at(v).split(":"))
     return needed, tuple(runpath)
 
 
@@ -1561,7 +1567,10 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
     DT_NEEDED soname of every checked object, so the verdict is independent of
     entry order, of DT_RUNPATH-over-DT_RPATH precedence and of DT_RPATH
     inheritance; every existing entry found must be a pinned/verified file. All
-    RUNPATH/RPATH directories must resolve inside the toolchain root."""
+    RUNPATH/RPATH directories must resolve inside the toolchain root. Entries are
+    interpreted like glibc's `fillin_rpath` / `is_dst`: an empty component means
+    the current working directory and is rejected, and only `$ORIGIN` /
+    `${ORIGIN}` tokens not followed by an identifier character are expanded."""
     needs: List[Tuple[str, str]] = []
     search_dirs: List[Path] = []
     for rel in elf_rels:
@@ -1576,8 +1585,17 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
         needed, runpath = info
         origin = str(path.parent)
         for entry in runpath:
-            expanded = entry.replace("${ORIGIN}", origin).replace("$ORIGIN", origin)
-            if "$" in expanded or not os.path.isabs(expanded):
+            if entry == "":
+                c.err("toolchain", f"{rel}: empty DT_RUNPATH/DT_RPATH component (glibc ld.so searches the current working directory)")
+                continue
+            # Only glibc-recognised `$ORIGIN` DSTs are expanded; any other `$`
+            # (`$LIB`, `$PLATFORM`, `$ORIGINX`, `${ORIGIN`) or a relative result
+            # (resolved against the CWD by ld.so) is rejected.
+            if "$" in _ORIGIN_DST_RE.sub("", entry):
+                c.err("toolchain", f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
+                continue
+            expanded = _ORIGIN_DST_RE.sub(lambda _m: origin, entry)
+            if not os.path.isabs(expanded):
                 c.err("toolchain", f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
                 continue
             real = os.path.realpath(expanded)
