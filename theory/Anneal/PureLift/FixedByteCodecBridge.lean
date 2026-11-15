@@ -247,4 +247,59 @@ theorem fixedNonZeroU32_canary :
       [.uninit, .rawByte 0, .rawByte 0, .rawByte 0] = none :=
   ⟨rfl, rfl, rfl, rfl⟩
 
+/-! ## `NonZeroU32` against the trusted niche decoder (`MirValueCodec.scalarNicheNewtype`) -/
+
+/-- `rustc` layout of `core::num::NonZeroU32`: a 4-byte scalar newtype whose
+valid range `1..=u32::MAX` makes `0` a niche. -/
+def nonZeroU32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 },
+    backendRepr := .scalar (.initialized (.int 32 false) nonZeroU32Range),
+    fields := .arbitrary [{ bytes := 0 }] [0],
+    variants := .single 0,
+    isUninhabited := false }
+
+/-- Layout table holding `nonZeroU32Layout` at index `0`. -/
+def nonZeroU32Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [nonZeroU32Layout] }
+
+/-- MIR type `core::num::NonZeroU32` at layout index `0`. -/
+def nonZeroU32Ty : Ty := { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 }
+
+/-- `ByteCodec.MirValueCodec.scalarNicheNewtype` for `NonZeroU32`, lifted to a
+`MirTypedByteCodec`: its `FixedByteCodec.scalarValidRange` agrees pointwise
+with the trusted niche-checking decoder. -/
+def fixedNonZeroU32MirCodec :
+    MirTypedByteCodec nonZeroU32Layouts nonZeroU32Ty
+      { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true }
+      4 :=
+  mirTypedByteCodecOfMirValueCodec
+    (MirValueCodec.scalarNicheNewtype nonZeroU32Layouts "core::num::NonZeroU32" 0
+      nonZeroU32Layout 4 32 false 0 [0] nonZeroU32Range (by decide) rfl rfl rfl rfl rfl rfl
+      rfl rfl)
+    (fun x => provenanceFree_encodeLittleEndianBytes 4 x.val)
+
+/-- **`0` for `NonZeroU32` fails exactly as in the trusted semantics**: a live
+`NonZeroU32` local holding `7` freezes to its trusted byte window, the trusted
+decoder rejects the all-zero window, so unpinning `[0, 0, 0, 0]` fails while
+`[42, 0, 0, 0]` unpins to `42`, and `NonZeroU32` is not `zerocopy::FromBytes`. -/
+theorem fixedNonZeroU32_live_niche_canary :
+    let m := fixedNonZeroU32MirCodec
+    let sc := m.spatialCodec 134 fixedNonZeroU32Embed fixedNonZeroU32Embed?
+      fixedNonZeroU32Embed_embed?
+    let ms : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 0,
+            locals := [.init (.aggregate 0 [.scalar ⟨7, 4⟩])] },
+        memory := emptyMemory }
+    placeByteWindow? nonZeroU32Layouts nonZeroU32Ty ms 0 [] =
+      some [.init 7 none, .init 0 none, .init 0 none, .init 0 none] ∧
+    decodeValueFromBytes defaultCodecFuel nonZeroU32Layouts nonZeroU32Ty
+      [.init 0 none, .init 0 none, .init 0 none, .init 0 none] = none ∧
+    sc.decode [.rawByte 0, .rawByte 0, .rawByte 0, .rawByte 0] = none ∧
+    sc.decode [.rawByte 42, .rawByte 0, .rawByte 0, .rawByte 0] = some (.nat 42) ∧
+    ¬ Anneal.BitValidity.IsFromBytes nonZeroU32Layouts nonZeroU32Ty := by
+  intro m sc ms
+  exact ⟨rfl, rfl, rfl, rfl,
+    m.not_isFromBytes [.init 0 none, .init 0 none, .init 0 none, .init 0 none] rfl rfl rfl⟩
+
 end Anneal.PureLift.FixedByteCodecBridge

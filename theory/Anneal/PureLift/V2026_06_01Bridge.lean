@@ -70,9 +70,21 @@ machine state:
    (the new block is the place's trusted byte window).
    `unpin_eq_live_mir_decode`: from the relation at a `zerocopy::IntoBytes`
    type, a successful `unpinFromSpatialInState` restores the loan to the value
-   the trusted decoder reads from the live window. Supporting inversions:
-   `freezeToSpatialInState_ok_inv`, `reabsorbFromSpatialInState_ok_inv`,
-   `findSpatialBlock_append_fresh`, `findLoan_updateLoan_self`.
+   the trusted decoder reads from the live window, and
+   `unpin_restores_mirStateRel` re-establishes `mirStateRel`;
+   `mutate_spatialPinnedBlockHolds` carries the relation across a spatial
+   mutation and the matching live store. Supporting inversions:
+   `freezeToSpatialInState_ok_inv`, `mutateSpatialInState_ok_inv`,
+   `reabsorbFromSpatialInState_ok_inv`, `findSpatialBlock_append_fresh`,
+   `findSpatialBlock_mutateSpatialBlockAt`, `findLoan_updateLoan_self`.
+7. **Frame rules (unpinned-sibling isolation).** `spatialBindingsHold_transfer`:
+   loan bindings survive any symbolic step that leaves their loans untouched and
+   any live step that leaves their places' values (`placeValue?`, finer than the
+   whole local slot, so sibling-field stores qualify) and the Tree Borrows table
+   unchanged. Instances: `freeze_preserves_bindings`,
+   `mutate_preserves_bindings`, `unpin_preserves_bindings`, and
+   `unpin_restores_mirStateRel_frame`, which restores the full relation for the
+   unpinned loan together with every disjoint sibling binding.
 
 End-to-end regressions over concrete `CapturedMir` bodies live in
 `tests/mir/PureLiftV2026BridgeTests.lean`.
@@ -1633,6 +1645,224 @@ theorem unpin_restores_mirStateRel {layouts : LayoutTable} {ty : Ty} {α : Type}
   · intro i c hc hU
     rw [hLocEq] at hc
     exact hLocals i c hc hU
+
+/-! ### Frame Rules: Other Loan Bindings Survive the Pin Lifecycle -/
+
+/-- Fold step of `listFold`. -/
+def listFoldStep {α β : Type} (cons : α → List α → β → β) (x : α)
+    (acc : List α × β) : List α × β :=
+  match acc with
+  | (tail, ih) => (x :: tail, cons x tail ih)
+
+theorem listFold_eq_fold {α β : Type} (nil : β) (cons : α → List α → β → β)
+    (xs : List α) : listFold nil cons xs = (xs.foldr (listFoldStep cons) ([], nil)).2 := rfl
+
+theorem foldr_listFoldStep_fst {α β : Type} (nil : β) (cons : α → List α → β → β) :
+    ∀ xs : List α, (xs.foldr (listFoldStep cons) ([], nil)).1 = xs
+  | [] => rfl
+  | x :: xs => by
+    rw [List.foldr_cons]
+    have ih := foldr_listFoldStep_fst nil cons xs
+    revert ih
+    generalize xs.foldr (listFoldStep cons) ([], nil) = acc
+    obtain ⟨t, r⟩ := acc
+    intro ih
+    dsimp only at ih
+    subst ih
+    rfl
+
+/-- `listFold` unfolds on a cons cell, passing the actual tail. -/
+theorem listFold_cons {α β : Type} (nil : β) (cons : α → List α → β → β) (x : α)
+    (xs : List α) : listFold nil cons (x :: xs) = cons x xs (listFold nil cons xs) := by
+  rw [listFold_eq_fold, listFold_eq_fold, List.foldr_cons]
+  have hfst := foldr_listFoldStep_fst nil cons xs
+  revert hfst
+  generalize xs.foldr (listFoldStep cons) ([], nil) = acc
+  obtain ⟨t, r⟩ := acc
+  intro hfst
+  dsimp only at hfst
+  subst hfst
+  rfl
+
+/-- `ownSubPlace` of `mirSpatialModel` depends only on the bound place's live
+value and the live Tree Borrows table (finer than
+`mirSpatialModel_ownSubPlace_congr`: the rest of the local, e.g. a sibling
+field, may change). -/
+theorem mirSpatialModel_ownSubPlace_transfer (tagOf : LoanId → Nat)
+    {ms ms' : MachineState} {l : Local} {path : SubPath} {owner : LoanId}
+    {perm : PermTree} {v : StdVal}
+    (hPlace : placeValue? ms' l path = placeValue? ms l path)
+    (hBorrows : ms'.memory.borrows = ms.memory.borrows)
+    (h : (mirSpatialModel tagOf).ownSubPlace ms l path owner perm v) :
+    (mirSpatialModel tagOf).ownSubPlace ms' l path owner perm v := by
+  have hAt : ∀ tag ok, BorrowAt ms' tag l path ok = BorrowAt ms tag l path ok := by
+    intro tag ok
+    unfold BorrowAt
+    rw [hBorrows]
+  simp only [mirSpatialModel] at h ⊢
+  simp only [hPlace, hAt]
+  exact h
+
+/-- **Frame rule for loan bindings**: `spatialBindingsHold` survives any
+symbolic step that leaves the bound loans untouched together with any live MIR
+step that leaves every bound place's value and the Tree Borrows table
+unchanged. -/
+theorem spatialBindingsHold_transfer (tagOf : LoanId → Nat)
+    {st st' : SymState StdVal} {ms ms' : MachineState}
+    (hBorrows : ms'.memory.borrows = ms.memory.borrows) :
+    ∀ bindings : List (LoanId × Local × SubPath),
+      (∀ b, b ∈ bindings → findLoan b.1 st'.loans = findLoan b.1 st.loans) →
+      (∀ b, b ∈ bindings → placeValue? ms' b.2.1 b.2.2 = placeValue? ms b.2.1 b.2.2) →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms'
+  | [], _, _, h => h
+  | (lid, l, path) :: bs, hL, hP, h => by
+    obtain ⟨hDisj, hFold⟩ := h
+    have hDisjTail : spatialBindingsDisjoint (mirSpatialModel tagOf) bs := by
+      have h' := hDisj
+      unfold spatialBindingsDisjoint at h'
+      rw [listFold_cons] at h'
+      exact h'.2
+    rw [listFold_cons] at hFold
+    obtain ⟨hHead, hTail⟩ := hFold
+    have ih := spatialBindingsHold_transfer tagOf hBorrows bs
+      (fun b hb => hL b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hP b (List.mem_cons_of_mem _ hb)) ⟨hDisjTail, hTail⟩
+    refine ⟨hDisj, ?_⟩
+    rw [listFold_cons]
+    refine ⟨?_, ih.2⟩
+    have hLid : findLoan lid st'.loans = findLoan lid st.loans :=
+      hL (lid, l, path) (List.mem_cons_self ..)
+    have hPl : placeValue? ms' l path = placeValue? ms l path :=
+      hP (lid, l, path) (List.mem_cons_self ..)
+    rw [hLid]
+    cases hF : findLoan lid st.loans with
+    | none => rw [hF] at hHead; exact hHead
+    | some e =>
+      rw [hF] at hHead
+      exact ⟨hHead.1, mirSpatialModel_ownSubPlace_transfer tagOf hPl hBorrows hHead.2⟩
+
+/-- A successful freeze of `lid` leaves every other loan untouched. -/
+theorem findLoan_freeze_ne {Val : Type} {alg : ValAlgebra Val} {lid lid' : LoanId}
+    {codec : SpatialCodec Val} {st st' : SymState Val}
+    (h : freezeToSpatialInState alg lid codec st = .ok st') (hNe : lid' ≠ lid) :
+    findLoan lid' st'.loans = findLoan lid' st.loans := by
+  obtain ⟨_, _, _, _, _, hLoans, _⟩ := freezeToSpatialInState_ok_inv h
+  rw [hLoans]
+  exact findLoan_updateLoan_ne hNe
+    (fun x => ⟨x.id, .spatialPinned st.nextSpatialTag codec, x.cell, x.target⟩)
+    (fun _ => rfl) st.loans
+
+/-- A successful spatial mutation leaves every loan untouched. -/
+theorem findLoan_mutate {Val : Type} {bid : BlockId} {tag : Nat}
+    {newCells : List (CellVal Val)} {st st' : SymState Val} (lid' : LoanId)
+    (h : mutateSpatialInState bid tag newCells st = .ok st') :
+    findLoan lid' st'.loans = findLoan lid' st.loans := by
+  rw [(mutateSpatialInState_ok_inv h).2.1]
+
+/-- A successful unpin of `lid` leaves every other loan untouched. -/
+theorem findLoan_unpin_ne {Val : Type} {alg : ValAlgebra Val} {lid lid' : LoanId}
+    {codec : SpatialCodec Val} {st st' : SymState Val}
+    (h : unpinFromSpatialInState alg lid codec st = .ok st') (hNe : lid' ≠ lid) :
+    findLoan lid' st'.loans = findLoan lid' st.loans := by
+  obtain ⟨_, _, _, _, _, v', _, _, _, _, _, hLoans⟩ := reabsorbFromSpatialInState_ok_inv h
+  rw [hLoans]
+  exact findLoan_updateLoan_ne hNe
+    (fun x => ⟨x.id, .activeMut, ⟨v', x.cell.perm⟩, x.target⟩) (fun _ => rfl) st.loans
+
+/-- **Unpinned-sibling isolation through freeze** (on a fixed live state). -/
+theorem freeze_preserves_bindings (tagOf : LoanId → Nat) {alg : ValAlgebra StdVal}
+    {lid : LoanId} {codec : SpatialCodec StdVal} {st st' : SymState StdVal}
+    {ms : MachineState} (bindings : List (LoanId × Local × SubPath))
+    (hFreeze : freezeToSpatialInState alg lid codec st = .ok st')
+    (hNotIn : ∀ b, b ∈ bindings → b.1 ≠ lid)
+    (h : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms) :
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms :=
+  spatialBindingsHold_transfer tagOf rfl bindings
+    (fun b hb => findLoan_freeze_ne hFreeze (hNotIn b hb)) (fun _ _ => rfl) h
+
+/-- **Unpinned-sibling isolation through a spatial mutation and a live store**:
+bindings of other loans survive `mutateSpatialInState` together with any live
+store that leaves their places and the Tree Borrows table unchanged. -/
+theorem mutate_preserves_bindings (tagOf : LoanId → Nat) {bid : BlockId} {tag : Nat}
+    {newCells : List (CellVal StdVal)} {st st' : SymState StdVal} {ms ms' : MachineState}
+    (bindings : List (LoanId × Local × SubPath))
+    (hMut : mutateSpatialInState bid tag newCells st = .ok st')
+    (hBorrows : ms'.memory.borrows = ms.memory.borrows)
+    (hPlaces : ∀ b, b ∈ bindings → placeValue? ms' b.2.1 b.2.2 = placeValue? ms b.2.1 b.2.2)
+    (h : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms) :
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms' :=
+  spatialBindingsHold_transfer tagOf hBorrows bindings
+    (fun b _ => findLoan_mutate b.1 hMut) hPlaces h
+
+/-- **Unpinned-sibling isolation through unpin** (on a fixed live state). -/
+theorem unpin_preserves_bindings (tagOf : LoanId → Nat) {alg : ValAlgebra StdVal}
+    {lid : LoanId} {codec : SpatialCodec StdVal} {st st' : SymState StdVal}
+    {ms : MachineState} (bindings : List (LoanId × Local × SubPath))
+    (hUnpin : unpinFromSpatialInState alg lid codec st = .ok st')
+    (hNotIn : ∀ b, b ∈ bindings → b.1 ≠ lid)
+    (h : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms) :
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms :=
+  spatialBindingsHold_transfer tagOf rfl bindings
+    (fun b hb => findLoan_unpin_ne hUnpin (hNotIn b hb)) (fun _ _ => rfl) h
+
+/-- Extending a disjoint binding list by a binding disjoint from every existing
+one keeps it disjoint. -/
+theorem spatialBindingsDisjoint_cons (tagOf : LoanId → Nat) (lid : LoanId) (l : Local)
+    (path : SubPath) (bindings : List (LoanId × Local × SubPath))
+    (hNew : ∀ b, b ∈ bindings → (mirSpatialModel tagOf).disjointSubPlaces l path b.2.1 b.2.2)
+    (hOld : spatialBindingsDisjoint (mirSpatialModel tagOf) bindings) :
+    spatialBindingsDisjoint (mirSpatialModel tagOf) ((lid, l, path) :: bindings) := by
+  have key : ∀ bs : List (LoanId × Local × SubPath),
+      (∀ b, b ∈ bs → (mirSpatialModel tagOf).disjointSubPlaces l path b.2.1 b.2.2) →
+      listFold True
+        (fun entry _ ihInner =>
+          match entry with
+          | (_, addr2, path2) =>
+            (mirSpatialModel tagOf).disjointSubPlaces l path addr2 path2 ∧ ihInner)
+        bs := by
+    intro bs
+    induction bs with
+    | nil => intro _; trivial
+    | cons b bs ih =>
+      intro h
+      rw [listFold_cons]
+      exact ⟨h b (List.mem_cons_self ..), ih (fun b' hb' => h b' (List.mem_cons_of_mem _ hb'))⟩
+  unfold spatialBindingsDisjoint
+  rw [listFold_cons]
+  exact ⟨key bindings hNew, hOld⟩
+
+/-- **`unpinFromSpatialInState` restores the full relation with unpinned
+siblings**: unpinning `lid` at `ms` re-establishes `mirStateRel` for the
+unpinned binding together with every other loan binding that held during the
+pin and is disjoint from the pinned place. -/
+theorem unpin_restores_mirStateRel_frame {layouts : LayoutTable} {ty : Ty} {α : Type}
+    {n : Nat} (m : MirTypedByteCodec layouts ty α n) (cid : Nat)
+    (embed : α → StdVal) (embed? : StdVal → Option α)
+    (embed_embed? : ∀ (v : StdVal) (x : α), embed? v = some x → embed x = v)
+    (hInto : Anneal.BitValidity.IsIntoBytes layouts ty)
+    (tagOf : LoanId → Nat) (alg : ValAlgebra StdVal) (lid : LoanId) (bid : BlockId)
+    (codec' : SpatialCodec StdVal)
+    {st st' : SymState StdVal} {ms : MachineState} {l : Local} {path : SubPath} {y : α}
+    (bindings : List (LoanId × Local × SubPath))
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid
+      (m.spatialCodec cid embed embed? embed_embed?) l path st ms)
+    (hUnpin : unpinFromSpatialInState alg lid codec' st = .ok st')
+    (hPlace : placeValue? ms l path = some (m.toValue y))
+    (hRef : StdValRefines tagOf (embed y) (m.toValue y))
+    (hLocals : mirLocalsRel tagOf st ms)
+    (hOthers : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNotIn : ∀ b, b ∈ bindings → b.1 ≠ lid)
+    (hDisj : ∀ b, b ∈ bindings → (mirSpatialModel tagOf).disjointSubPlaces l path b.2.1 b.2.2) :
+    mirStateRel tagOf ((lid, l, path) :: bindings) st' ms := by
+  obtain ⟨⟨_, hSingle⟩, hLocals'⟩ :=
+    unpin_restores_mirStateRel m cid embed embed? embed_embed? hInto tagOf alg lid bid codec'
+      hPin hUnpin hPlace hRef hLocals
+  have hOthers' := unpin_preserves_bindings tagOf bindings hUnpin hNotIn hOthers
+  refine ⟨⟨spatialBindingsDisjoint_cons tagOf lid l path bindings hDisj hOthers.1, ?_⟩,
+    hLocals'⟩
+  rw [listFold_cons] at hSingle ⊢
+  exact ⟨hSingle.1, hOthers'.2⟩
 
 end PinLifecycle
 

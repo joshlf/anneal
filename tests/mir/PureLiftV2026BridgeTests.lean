@@ -29,7 +29,10 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    4-state lockstep diagram; Test 3c instantiates the general
    `freeze_spatialPinnedBlockHolds` / `unpin_eq_live_mir_decode` bridges, also
    for a field-granular pin of `p.1` inside a live `(u32, u32)` aggregate whose
-   sibling field and Tree Borrows table the store leaves untouched.
+   sibling field and Tree Borrows table the store leaves untouched. Test 3d
+   pins `p.1` while a sibling loan `&mut p.0` stays live and is used after the
+   unpin; the general frame rules carry its binding through freeze, mutation
+   and the live store, and unpinning restores the full two-loan relation.
 4. **Negative canaries**: overlapping `&mut` borrows are rejected by `PermTree`
    (and their conflicting accesses are Tree Borrows UB on live MIR); unpinning
    `.uninit` bytes or the invalid `bool` pattern `0x02` fails.
@@ -950,6 +953,216 @@ theorem fp_sound :
     (.use (.localSub 2 [])) _ fpMs0 ⟨.pair (.nat 7) (.nat zcV1), []⟩
     (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV1, 4⟩]) _ 16 []
     ⟨_, rfl, fp_entry_rel⟩ fp_pureLift_eval rfl rfl
+    (.pair (.nat (by decide)) (.nat (by decide))) rfl
+
+/-! ### Test 3d: Hybrid Pin with an Active Unpinned Sibling Loan (General Frame Rules) -/
+
+/-- `fn patch_with_sibling(a: u32, b: u32) -> (u32, u32) { let mut p = (a, b);
+let x = &mut p.0; let q = &raw mut p.1; let r = q as *mut u8;
+unsafe { *r = 0xAB }; *x = 9; p }`: the sibling loan `x` stays live across the
+raw byte store into `p.1` and is used afterwards. -/
+def sibPinBody : CapturedMir :=
+  mkBody 2
+    [decl .mut pairTy, decl .not u32Ty, decl .not u32Ty, decl .mut pairTy,
+     decl .not refU32Ty, decl .not rawU32Ty, decl .not rawU8Ty]
+    [mkBb
+      [mkSt (.storageLive 3),
+       mkSt (.assign (pl 3) (.aggregate .tuple [.copy (pl 1), .copy (pl 2)])),
+       mkSt (.storageLive 4),
+       mkSt (.assign (pl 4) (.ref (.mut false) (pl 3 [.field 0 u32Ty]))),
+       mkSt (.storageLive 5),
+       mkSt (.assign (pl 5) (.rawPtr .mut (pl 3 [.field 1 u32Ty]))),
+       mkSt (.storageLive 6),
+       mkSt (.assign (pl 6) (.cast .ptrToPtr (.copy (pl 5)) rawU8Ty)),
+       mkSt (.assign (pl 6 [.deref]) (.use (u8C 0xAB))),
+       mkSt (.storageDead 6),
+       mkSt (.storageDead 5),
+       mkSt (.assign (pl 4 [.deref]) (.use (u32C 9))),
+       mkSt (.storageDead 4),
+       mkSt (.assign (pl 0) (.use (.copy (pl 3)))),
+       mkSt (.storageDead 3)]
+      .return_]
+
+def spMs0 : MachineState :=
+  initMachineState sibPinBody [.scalar ⟨7, 4⟩, .scalar ⟨zcV0, 4⟩]
+
+/-- Live state right before the store: tag `1` (`reserved`) roots the sibling
+loan at `_3.0`, tag `2` (`unique`) roots the raw pointers at `_3.1`. -/
+def spMsPinned : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 8,
+        locals :=
+          [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨zcV0, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV0, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] }
+    memory :=
+      { spMs0.memory with
+        borrows :=
+          [{ tag := 2, targetLocal := 3, targetProjection := [.field 1 u32Ty],
+             perm := .unique },
+           { tag := 1, targetLocal := 3, targetProjection := [.field 0 u32Ty],
+             perm := .reservedFrz false }]
+        nextTag := 3 } }
+
+/-- Live state right after the store `*r = 0xAB`. -/
+def spMsWritten : MachineState :=
+  { spMsPinned with
+    frame :=
+      { blockIdx := 0, stmtIdx := 9,
+        locals :=
+          [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨zcV0, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV1, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] } }
+
+theorem sp_pinned_path :
+    StepPath (Anneal.PureMirExec.mirStep sibPinBody) spMs0 8 spMsPinned :=
+  stepPath_of_runSilentSteps rfl
+
+theorem sp_store_step :
+    Anneal.PureMirExec.mirStep sibPinBody spMsPinned = .cont spMsWritten := rfl
+
+def spParams : List (ParamInput StdVal) := [⟨.byVal, .nat 7⟩, ⟨.byVal, .nat zcV0⟩]
+
+/-- `p = (a, b)`; `x = &mut p.0` (loan `0`); `q = &mut p.1` (loan `1`); pin,
+write, and unpin loan `1`; end it; `*x = 9`; end loan `0`; return `p`. -/
+def spPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.localSub 2 []) (.binary stdMkPair (.localSub 0 []) (.localSub 1 []))))
+    (.seq (.act (.borrow 3 .mutBorrow (.localSub 2 [0])))
+      (.seq (.act (.borrow 4 .mutBorrow (.localSub 2 [1])))
+        (.seq (.act (.freezeSpatial 1 zcCodec))
+          (.seq (.act (.mutateSpatial 0 0 zcCellsAfter))
+            (.seq (.act (.reabsorbSpatial 1 zcCodec))
+              (.seq (.act (.endLoan 1))
+                (.seq (.act (.assign (.derefSub 3 []) (.constVal (.nat 9))))
+                  (.act (.endLoan 0)))))))))
+
+/-- `PureLift` state after both sibling loans are taken. -/
+def spStBorrowed : SymState StdVal :=
+  ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩,
+    ⟨.pair (.nat 7) (.nat zcV0), .split [([0], .mutLocked 0), ([1], .mutLocked 1)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩, ⟨.refVal 1 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat 7, .unborrowed⟩, .direct (.localReg 2) [0]⟩,
+    ⟨1, .activeMut, ⟨.nat zcV0, .unborrowed⟩, .direct (.localReg 2) [1]⟩],
+   [], [], [], 0⟩
+
+theorem sp_borrowed_eval :
+    evalPlan stdValAlg
+        (.seq (.act (.assign (.localSub 2 [])
+            (.binary stdMkPair (.localSub 0 []) (.localSub 1 []))))
+          (.seq (.act (.borrow 3 .mutBorrow (.localSub 2 [0])))
+            (.act (.borrow 4 .mutBorrow (.localSub 2 [1])))))
+        ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩], [], [], [], [], 0⟩ =
+      .ok (.continuing spStBorrowed) := rfl
+
+def spStPinned : SymState StdVal :=
+  match freezeToSpatialInState stdValAlg 1 zcCodec spStBorrowed with
+  | .ok st => st
+  | .fail => spStBorrowed
+
+def spStWritten : SymState StdVal :=
+  match mutateSpatialInState 0 0 zcCellsAfter spStPinned with
+  | .ok st => st
+  | .fail => spStPinned
+
+def spStUnpinned : SymState StdVal :=
+  match unpinFromSpatialInState stdValAlg 1 zcCodec spStWritten with
+  | .ok st => st
+  | .fail => spStWritten
+
+/-- Both sibling loans are realized on the live machine before the pin. -/
+theorem sp_borrowed_rel :
+    mirStateRel tagOfLoan [(0, 3, [0]), (1, 3, [1])] spStBorrowed spMsPinned :=
+  ⟨⟨⟨⟨Or.inr rfl, trivial⟩, ⟨trivial, trivial⟩⟩,
+    ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
+     ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩⟩,
+   mirLocalsRel_of_localsRefine
+     ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+      (fun h => nomatch h), fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+      fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+/-- The sibling binding alone (a sub-relation of `sp_borrowed_rel`). -/
+theorem sp_sibling_rel :
+    spatialBindingsHold (mirSpatialModel tagOfLoan) [(0, 3, [0])] spStBorrowed spMsPinned :=
+  ⟨⟨trivial, trivial⟩, ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩
+
+/-- **Hybrid pin with an active unpinned sibling, over live MIR, by the general
+frame rules**:
+1. freezing loan `1` materializes the live window of `_3.1`
+   (`freeze_spatialPinnedBlockHolds`) while loan `0`'s binding to `_3.0`
+   survives (`freeze_preserves_bindings`);
+2. the spatial mutation plus the live raw store keep the pin relation
+   (`mutate_spatialPinnedBlockHolds`) and loan `0`'s binding, since the store
+   leaves `_3.0` and the Tree Borrows table unchanged
+   (`mutate_preserves_bindings`);
+3. unpinning loan `1` restores the full two-loan relation
+   (`unpin_restores_mirStateRel_frame`). -/
+theorem sp_pin_lifecycle_with_sibling :
+    (spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 1 0 zcCodec 3 [1] spStPinned spMsPinned ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(0, 3, [0])] spStPinned spMsPinned) ∧
+    (spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 1 0 zcCodec 3 [1] spStWritten
+        spMsWritten ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(0, 3, [0])] spStWritten spMsWritten) ∧
+    mirStateRel tagOfLoan [(1, 3, [1]), (0, 3, [0])] spStUnpinned spMsWritten := by
+  have hFreeze : freezeToSpatialInState stdValAlg 1 zcCodec spStBorrowed = .ok spStPinned := rfl
+  have hMut : mutateSpatialInState 0 0 zcCellsAfter spStPinned = .ok spStWritten := rfl
+  have hUnpin : unpinFromSpatialInState stdValAlg 1 zcCodec spStWritten = .ok spStUnpinned := rfl
+  have hMem : ∀ b, b ∈ [((0 : LoanId), (3 : Local), ([0] : SubPath))] →
+      b = (0, 3, [0]) := by
+    intro b hb
+    cases hb with
+    | head => rfl
+    | tail _ h => exact nomatch h
+  have hPinned :
+      spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 1 0 zcCodec 3 [1] spStPinned
+        spMsPinned :=
+    freeze_spatialPinnedBlockHolds (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+      tagOfLoan stdValAlg 1 (st := spStBorrowed) (x := ⟨zcV0, by decide⟩) hFreeze
+      ⟨_, rfl, rfl⟩ rfl ⟨_, rfl, rfl, rfl, rfl⟩
+  have hSibPinned :=
+    freeze_preserves_bindings tagOfLoan [(0, 3, [0])] hFreeze
+      (fun b hb => by rw [hMem b hb]; decide) sp_sibling_rel
+  have hWritten :
+      spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 1 0 zcCodec 3 [1] spStWritten
+        spMsWritten :=
+    mutate_spatialPinnedBlockHolds hPinned hMut rfl rfl ⟨_, rfl, rfl, rfl, rfl⟩
+  have hSibWritten :=
+    mutate_preserves_bindings tagOfLoan [(0, 3, [0])] hMut (ms' := spMsWritten) rfl
+      (fun b hb => by rw [hMem b hb]) hSibPinned
+  have hLocals : mirLocalsRel tagOfLoan spStWritten spMsWritten :=
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       (fun h => nomatch h), fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩
+  exact ⟨⟨hPinned, hSibPinned⟩, ⟨hWritten, hSibWritten⟩,
+    unpin_restores_mirStateRel_frame (u32MirCodec zcLayouts) 32 u32Embed u32Embed?
+      u32Embed_embed? (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 1 0 zcCodec
+      (y := ⟨zcV1, by decide⟩) [(0, 3, [0])] hWritten hUnpin rfl (.nat (by decide)) hLocals
+      hSibWritten (fun b hb => by rw [hMem b hb]; decide)
+      (fun b hb => by
+        rw [hMem b hb]
+        exact mirSpatialModel_disjoint_siblings tagOfLoan 3 (by decide) [] [])⟩
+
+/-- `PureLift` result: `(9, zcV1)`. -/
+theorem sp_pureLift_eval :
+    evalFnValue stdValAlg spParams spPlan (.use (.localSub 2 [])) =
+      .ok ⟨.pair (.nat 9) (.nat zcV1), []⟩ := rfl
+
+theorem sp_entry_rel :
+    mirStateRel tagOfLoan []
+      ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩], [], [], [], [], 0⟩ spMs0 :=
+  ⟨⟨trivial, trivial⟩,
+   mirLocalsRel_of_localsRefine
+     ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+
+/-- **Test 3d (adequacy)**: the hybrid pin with an active unpinned sibling loan
+converges on live MIR to a normal return refining `(9, zcV1)`. -/
+theorem sp_sound :
+    Anneal.MirFuelFree.MirWpConverges sibPinBody spMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .pair (.nat 9) (.nat zcV1))) :=
+  mir_pure_lift_sound_of_evalFuel tagOfLoan sibPinBody [] spParams spPlan
+    (.use (.localSub 2 [])) _ spMs0 ⟨.pair (.nat 9) (.nat zcV1), []⟩
+    (.aggregate 0 [.scalar ⟨9, 4⟩, .scalar ⟨zcV1, 4⟩]) _ 24 []
+    ⟨_, rfl, sp_entry_rel⟩ sp_pureLift_eval rfl rfl
     (.pair (.nat (by decide)) (.nat (by decide))) rfl
 
 /-! ## Test 4: Negative Falsification Canaries -/
