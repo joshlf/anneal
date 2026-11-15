@@ -1287,4 +1287,122 @@ theorem a2_1_cross_frame_aggregate_read_write_use_active_layouts :
       .ok [.init (.scalar ⟨0, 4⟩), .init (.aggregate 0 [.scalar ⟨33, 4⟩, .scalar ⟨44, 4⟩])] := by
   refine ⟨rfl, rfl⟩
 
+/-! ## 12. Pass B3 Cross-Frame Field-Offset Sub-Projection & Enclosing Field Layout Witnesses -/
+
+/-- `b3OuterLayout`: 12-byte `Outer { pad: u32, arr: [u32; 2] }` at `b3CallerLayouts[3]`, with
+field 0 (`u32`, `layoutIdx = 0`) at byte offset `0` and field 1 (`[u32; 2]`, `layoutIdx = 2`) at
+byte offset `4`. Note that `b3CallerLayouts[1]` is the 4-byte `a2WrapLayout`, whereas in
+`a2CalleeLayouts`, `layoutIdx = 1` is the 8-byte `a2PairLayout` (`Pair { a: u32, b: u32 }`). -/
+def b3OuterLayout : TypeLayout :=
+  { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0, 2] }
+
+def b3CallerLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [u32PrimLayout, a2WrapLayout, a2Arr2Layout, b3OuterLayout] }
+
+def b3OuterT : Ty := { kind := .adt "witness::Outer" [], layoutIdx := 3 }
+def b3OuterDecl : LocalDecl := { mutability := .mut, ty := b3OuterT, debugName := none }
+def b3PtrMutOuterDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut b3OuterT.kind, layoutIdx := 0 },
+    debugName := none }
+
+def b3CallerOuterLocals : List LocalSlot :=
+  [.init (.scalar ⟨0, 4⟩),
+   .init (.aggregate 0 [.scalar ⟨99, 4⟩, .aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨22, 4⟩]])]
+
+def b3CallerOuterFrame : SavedCallerFrame := {
+  callerBody := { (mkMirBody "witness::b3_caller_outer" 0 [u32Decl, b3OuterDecl] []) with
+                  layouts := b3CallerLayouts }
+  frame := { blockIdx := 0, stmtIdx := 0, locals := b3CallerOuterLocals }
+  destination := locPlace 0
+}
+
+def b3CallerOuterEntry : BorrowEntry :=
+  { tag := 50, targetLocal := 1, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+
+def b3CalleeOffsetPtrLocals : List LocalSlot :=
+  [.uninit, .init (.ptr { allocId := 50, offsetBytes := 4 } 8), .uninit]
+
+def b3CalleeSubfieldReadWriteMir : CapturedMir :=
+  singleBlockBody "witness::b3_callee_subfield_rw" 1
+    [u32Decl, a2PtrMutPairDecl, a2PairDecl, u32Decl]
+    [.storageLive 3,
+     .assign (locPlace 3) (.use (.copy { local_ := 1, projection := [.deref, .field 1 u32T] })),
+     .assign { local_ := 1, projection := [.deref, .field 1 u32T] } (.use (constU32 77)),
+     .assign (locPlace 0) (.use (.copy (locPlace 3))),
+     .storageDead 3]
+    a2CalleeLayouts
+
+def b3CallerOuterOffsetPairMir : CapturedMir :=
+  { (mkMirBody "witness::b3_caller_outer_offset_pair" 1
+      [u32Decl, b3OuterDecl, b3PtrMutOuterDecl, ptrMutU32Decl, ptrMutU32Decl, a2PtrMutPairDecl, u32Decl]
+      [{ statements :=
+           [mkStmt (.storageLive 2),
+            mkStmt (.storageLive 3),
+            mkStmt (.storageLive 4),
+            mkStmt (.storageLive 5),
+            mkStmt (.storageLive 6),
+            mkStmt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1))),
+            mkStmt (.assign (locPlace 3)
+              (.cast .ptrToPtr (.copy (locPlace 2)) { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 })),
+            mkStmt (.assign (locPlace 4)
+              (.binaryOp .offset (.copy (locPlace 3)) (constUsize 1))),
+            mkStmt (.assign (locPlace 5)
+              (.cast .ptrToPtr (.copy (locPlace 4)) { kind := .rawPtr .mut a2PairT.kind, layoutIdx := 0 }))],
+         terminator := mkTerm (.call (fnDefOp "witness::b3_callee_subfield_rw")
+           [.move (locPlace 5)] (locPlace 6) (some 1) .continue_),
+         isCleanup := false },
+       { statements :=
+           [mkStmt (.assign (locPlace 0)
+              (.binaryOp .add (.copy (locPlace 6))
+                (.copy { local_ := 1,
+                         projection := [.field 1 a2Arr2T, .constantIndex 1 2 false] }))),
+            mkStmt (.storageDead 6),
+            mkStmt (.storageDead 5),
+            mkStmt (.storageDead 4),
+            mkStmt (.storageDead 3),
+            mkStmt (.storageDead 2)],
+         terminator := mkTerm .return_,
+         isCleanup := false }]) with
+    layouts := b3CallerLayouts }
+
+/-- B3-1: When `callee` holds a byte-offset pointer `p : *const Pair` / `*mut Pair` (`offsetBytes = 4`
+on `caller`'s `_1 : Outer { pad: u32, arr: [u32; 2] }`, where `Pair@1` is 8 bytes in
+`a2CalleeLayouts` while `b3CallerLayouts[1]` is the unrelated 4-byte `Wrap@1` and `Outer.arr` is at
+`b3CallerLayouts[2]`) and projects a sub-field `(*p).1` (`restProj = [.field 1 u32T]`):
+1. `resolveStackThinPtrFieldOffsetProj?` resolves `expectedElemBytes = 8` using `pointeeDecls` /
+   `pointeeLayouts` (`a2CalleeLayouts`), so reading `(*p).1` returns `22` and writing `(*p).1 = 88`
+   updates `outer.arr[1]` to `88` (on A2 `949abed9`, `resolveStackThinPtrFieldOffsetProj?` looked up
+   `Pair@1` in `b3CallerLayouts`, got `expectedElemBytes = 4`, descended into `arr[0]`, and faulted
+   `.ub`).
+2. `scanArbitraryLayoutFields?` stamps `leafProjTy` with the enclosing field's `flIdx = 2` and array
+   shape `{ kind := .array (.uint .u32) 2, layoutIdx := 2 }` from `b3CallerLayouts`, so reborrowing
+   `&(*p).1` records a `targetProjection` whose field `layoutIdx` belongs to `b3CallerLayouts` (`2`,
+   not `1`), and end-to-end `stepMirFn` execution of `b3CallerOuterOffsetPairMir` returns `99`. -/
+theorem b3_1_cross_frame_field_offset_subproj_and_enclosing_field_layouts :
+    evalPlaceRead b3CalleeOffsetPtrLocals
+        { local_ := 1, projection := [.deref, .field 1 u32T] }
+        [b3CallerOuterEntry] [] a2CalleeLayouts []
+        [u32Decl, a2PtrConstPairDecl, a2PairDecl] [b3CallerOuterFrame] =
+      .ok (.scalar ⟨22, 4⟩) b3CalleeOffsetPtrLocals ∧
+    writeCallerPlaceValue b3CalleeOffsetPtrLocals b3CallerOuterLocals [b3CallerOuterEntry]
+        { local_ := 1, projection := [.deref, .field 1 u32T] } (.scalar ⟨88, 4⟩)
+        [u32Decl, a2PtrMutPairDecl, a2PairDecl] a2CalleeLayouts [b3CallerOuterFrame] =
+      .ok [.init (.scalar ⟨0, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨99, 4⟩,
+                                .aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨88, 4⟩]])] ∧
+    (match evalRvalue b3CalleeOffsetPtrLocals
+        (.ref .shared { local_ := 1, projection := [.deref, .field 1 u32T] })
+        { emptyMemory with borrows := [b3CallerOuterEntry], callStack := [b3CallerOuterFrame] }
+        [refSharedU32Decl, a2PtrConstPairDecl, a2PairDecl] a2CalleeLayouts with
+     | .ok _ _ mem' => mem'.borrows.head?.map (·.targetProjection)
+     | _ => none) =
+      some [.field 1 { kind := .array (.uint .u32) 2, layoutIdx := 2 }, .field 1 u32T] ∧
+    runTrustedScalar? b3CallerOuterOffsetPairMir [b3CalleeSubfieldReadWriteMir]
+      [.aggregate 0 [.scalar ⟨99, 4⟩, .aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨22, 4⟩]]] =
+      some (99, 4) := by
+  refine ⟨rfl, rfl, rfl, by decide +kernel⟩
+
 end Anneal.TcbCorrespondenceDiv8Tests
