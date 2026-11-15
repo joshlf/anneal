@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -388,18 +389,38 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 category="cat7_python_and_ci_tests",
                 cmd=[sys.executable, "-c", script],
                 cwd=REPO_ROOT,
-                timeout_sec=2,
+                timeout_sec=3,  # ample slack for two interpreter start-ups under load
             )
             self.assertLess(time.monotonic() - t0, 30.0)
             self.assertEqual(res["status"], "TIMEOUT")
             self.assertEqual(res["exit_code"], 124)
             self.assertIn("partial-output-before-timeout", res["failure_excerpt"])
             self.assertIn("Timed out after", res["failure_excerpt"])
+            self.assertTrue(pid_file.is_file(), "step was killed before it spawned its child")
             self._assert_pid_gone(int(pid_file.read_text()), "same-group grandchild")
 
-    def test_run_step_timeout_lets_wrapper_reap_its_separate_session_scope(self) -> None:
+    def _spawn_ready_step(self, script: str, ready: Path) -> subprocess.Popen[bytes]:
+        """Start `script` exactly as `_run_step` does (own session) and wait until it
+        creates `ready`, so signal tests never race interpreter start-up."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 60.0
+        while not ready.exists():
+            if proc.poll() is not None or time.monotonic() > deadline:
+                suite._terminate_step(proc)
+                self.fail(f"step never became ready (exit {proc.returncode})")
+            time.sleep(0.02)
+        return proc
+
+    def test_terminate_step_lets_wrapper_reap_its_separate_session_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pid_file = Path(tmp) / "pids"
+            ready = Path(tmp) / "ready"
             # Mirrors `anneal-lean-run`: the build runs in its own session and is only
             # reaped by the wrapper's SIGTERM handler, so a bare SIGKILL of the wrapper
             # (what `subprocess.run(timeout=...)` does) would orphan it.
@@ -413,17 +434,23 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "    child.wait()\n"
                 "    sys.exit(128 + signum)\n"
                 "signal.signal(signal.SIGTERM, on_term)\n"
+                f"open({str(ready)!r}, 'w').close()\n"
                 "time.sleep(60)\n"
             )
-            res = suite._run_step(
-                name="hung_wrapper",
-                category="cat2_correspondence_suites",
-                cmd=[sys.executable, "-c", script],
-                cwd=REPO_ROOT,
-                timeout_sec=2,
-            )
-            self.assertEqual(res["status"], "TIMEOUT")
+            proc = self._spawn_ready_step(script, ready)
+            suite._terminate_step(proc)
+            self.assertEqual(proc.returncode, 128 + 15)  # exited through its handler
             self._assert_pid_gone(int(pid_file.read_text()), "separate-session build scope")
+
+        # End to end: a hung wrapper is still reported as a TIMEOUT through `_run_step`.
+        res = suite._run_step(
+            name="hung_wrapper",
+            category="cat2_correspondence_suites",
+            cmd=[sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=REPO_ROOT,
+            timeout_sec=1,
+        )
+        self.assertEqual((res["status"], res["exit_code"]), ("TIMEOUT", 124))
 
     def test_run_step_reports_launch_failure_and_undecodable_output(self) -> None:
         missing = suite._run_step(
@@ -478,8 +505,11 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
     def test_terminate_step_grants_grace_window_to_same_group_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "cleaned"
-            # Leader exits immediately on SIGTERM while its same-group child takes 0.25s
-            # to write `marker` before exiting cleanly on SIGTERM.
+            child_ready = Path(tmp) / "child_ready"
+            ready = Path(tmp) / "ready"
+            # The leader exits immediately on SIGTERM while its same-group child takes
+            # 0.25 s to write `marker` before exiting cleanly: escalating to SIGKILL as
+            # soon as the leader is gone would kill the child mid-cleanup.
             child_code = (
                 "import pathlib, signal, sys, time\n"
                 "def handler(s, f):\n"
@@ -487,22 +517,21 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 f"    pathlib.Path({str(marker)!r}).write_text('grace-ok')\n"
                 "    sys.exit(0)\n"
                 "signal.signal(signal.SIGTERM, handler)\n"
+                f"open({str(child_ready)!r}, 'w').close()\n"
                 "time.sleep(60)\n"
             )
             leader_code = (
-                "import signal, subprocess, sys, time\n"
-                f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                "import os, signal, subprocess, sys, time\n"
                 "signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                f"while not os.path.exists({str(child_ready)!r}):\n"
+                "    time.sleep(0.01)\n"
+                f"open({str(ready)!r}, 'w').close()\n"
                 "time.sleep(60)\n"
             )
-            res = suite._run_step(
-                name="leader_exits_first",
-                category="cat7_python_and_ci_tests",
-                cmd=[sys.executable, "-c", leader_code],
-                cwd=REPO_ROOT,
-                timeout_sec=1,
-            )
-            self.assertEqual(res["status"], "TIMEOUT")
+            proc = self._spawn_ready_step(leader_code, ready)
+            suite._terminate_step(proc)
+            self.assertEqual(proc.returncode, 0)
             self.assertTrue(marker.is_file(), "same-group child was SIGKILLed before grace window")
             self.assertEqual(marker.read_text(), "grace-ok")
 
