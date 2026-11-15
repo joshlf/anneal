@@ -12,6 +12,21 @@ Follow [`AGENTS.md`](../AGENTS.md) and the applicable skills in
 [`skills/`](../skills/README.md) when authoring or reviewing changes in this
 repository.
 
+## Complete-change review
+
+Apply the `Code Review Rules` in [`AGENTS.md`](../AGENTS.md) and the shared
+[`change-review`](../skills/change-review/SKILL.md) procedure. Review every
+changed path and relevant interaction; keep investigating after the first few
+findings. Verify and deduplicate findings, then report all supported actionable
+issues permitted by the host. Do not invent findings or inflate severity to
+appear exhaustive. A final coverage sweep, not a comment count, ends review.
+
+Keep the trust pass below distinct from general review. In a single-turn
+review, perform it first. Report blocked coverage or checks in supported
+summary fields; an incomplete review is not approval. When authoring changes,
+complete the local review-fix loop before publication, use fresh-context
+reviewers when available, and disclose any self-review fallback.
+
 ## Dedicated Trust-Boundary Review Pass
 
 In addition to general code review, evaluate every pull request against
@@ -39,7 +54,8 @@ treat any violation as a blocking finding:
 2. **Changes inside `trusted/`, `ci/`, `.github/`, and pinned root manifests
    (TCB and harness audit):** Whenever a PR touches these paths (or
    `Cargo.toml`, `Cargo.lock`, `flake.nix`, or `flake.lock`), include a
-   `### Trust-Boundary Assessment` section in the review and verify:
+   `### Trust-Boundary Assessment` section (or the host's supported summary
+   fields when it requires a fixed schema) in the review and verify:
    - **`trusted/lean/` & `trusted/rustc-capture/`:** Semantic rules and MIR
      capture must fail closed (including `tcx.dcx().has_errors()` guards),
      perform no unverified semantic normalization in Rust, maintain
