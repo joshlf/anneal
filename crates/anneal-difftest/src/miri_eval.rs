@@ -2347,6 +2347,22 @@ fn enclosing_confirm_namespace_slice<'a>(confirm_src: &'a str, theorem_pos: usiz
 /// all taken from the namespace section that holds `fn_name`'s theorems
 /// ([`enclosing_confirm_namespace_slice`]). The snippet therefore names no
 /// definition local to the confirm module that it does not also contain.
+fn find_line_starting_with(src: &str, header: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(rel) = src[offset..].find(header) {
+        let idx = offset + rel;
+        let at_line_start = idx == 0 || src.as_bytes()[idx - 1] == b'\n';
+        let after = idx + header.len();
+        let at_header_end = after == src.len()
+            || matches!(src.as_bytes()[after], b'\n' | b'\r' | b' ');
+        if at_line_start && at_header_end {
+            return Some(idx);
+        }
+        offset = idx + 1;
+    }
+    None
+}
+
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     let theorem_headers = [
         format!("theorem confirm_tag_{fn_name} :"),
@@ -2356,7 +2372,7 @@ fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     ];
     let Some(first_theorem_pos) = theorem_headers
         .iter()
-        .filter_map(|h| confirm_src.find(h.as_str()))
+        .filter_map(|h| find_line_starting_with(confirm_src, h))
         .min()
     else {
         return String::new();
@@ -2366,10 +2382,11 @@ fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     // modules preserve each group's exact kernel-checked `linkedCallees`.
     let scope_src = enclosing_confirm_namespace_slice(confirm_src, first_theorem_pos);
 
-    // Each block runs from its header to the first blank line; the generated
-    // blocks contain no blank lines.
+    // Each block runs from its line-anchored header to the first blank line;
+    // anchoring at line start prevents `-- Anneal's panic message: ...` comments
+    // from spoofing another candidate's theorem header.
     let extract_block = |header: &str| -> Option<String> {
-        let start_idx = scope_src.find(header)?;
+        let start_idx = find_line_starting_with(scope_src, header)?;
         let rest = &scope_src[start_idx..];
         let end_rel = rest.find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
         Some(rest[..end_rel].trim().to_string())
@@ -4713,6 +4730,27 @@ where
     })
 }
 
+/// Cleans Stage 2 `MiriOracleConfirm_*` / `MiriOracleConfirmFallback_*` scratch
+/// modules on `Ok`, while preserving them on `Err` so the
+/// `(kernel confirmation modules in <oracle_dir>)` diagnostic never points at
+/// files that were deleted right before returning the error.
+fn finalize_stage2_confirm_scratch(
+    oracle_dir: &Path,
+    stage: Result<ChunkedMiriConfirm, String>,
+) -> Result<ChunkedMiriConfirm, String> {
+    let ok = stage.map_err(|e| {
+        format!(
+            "{e}\n(kernel confirmation modules in {})",
+            oracle_dir.display()
+        )
+    })?;
+    clean_oracle_files_with_prefixes(
+        oracle_dir,
+        &["MiriOracleConfirm_", "MiriOracleConfirmFallback_"],
+    );
+    Ok(ok)
+}
+
 fn run_linked_difftest_oracle_pipeline(
     config: &DifftestOracleConfig,
     items: &[OracleItemSpec],
@@ -5134,15 +5172,15 @@ fn run_linked_difftest_oracle_pipeline(
                 )
             },
         );
-        clean_oracle_files_with_prefixes(
-            &oracle_dir,
-            &["MiriOracleConfirm_", "MiriOracleConfirmFallback_"],
-        );
+        // Preserve `MiriOracleConfirm_*` / `MiriOracleConfirmFallback_*` on `Err`
+        // so the `(kernel confirmation modules in <oracle_dir>)` note points at the
+        // actual rejecting `.lean` module on disk for post-mortem debugging; clean
+        // scratch modules only once `stage` has succeeded.
         let ChunkedMiriConfirm {
             confirmed: confirmed_items,
             confirmed_groups,
             unconfirmed: unconfirmed_names,
-        } = stage.map_err(|e| format!("{e}\n(kernel confirmation modules in {})", oracle_dir.display()))?;
+        } = finalize_stage2_confirm_scratch(&oracle_dir, stage)?;
         for (name, reason) in &unconfirmed_names {
             eprintln!(
                 "miri-difftest: Stage 2 kernel confirmation of `{name}` exhausted a resource; \
@@ -11729,5 +11767,89 @@ pub fn cand_shadow() -> u32 {
             let err = stage_for(rejecting).expect_err("a verbatim rfl rejection must fail closed");
             assert!(err.contains("Tactic `rfl` failed"), "{err}");
         }
+    }
+
+    #[test]
+    fn stage2_scratch_preserved_on_rejection_and_extract_confirm_theorems_anchors_line_starts() {
+        // 1. On kernel rejection (`Err`), `finalize_stage2_confirm_scratch` leaves the
+        //    rejecting `MiriOracleConfirmFallback_*.lean` module on disk at the path cited
+        //    in `(kernel confirmation modules in <oracle_dir>)`, and cleans scratch files
+        //    only on `Ok`.
+        let tmp = env::temp_dir().join(format!(
+            "anneal-ep1-a4-stage2-scratch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&tmp).expect("create temp oracle dir");
+        let chunk_mod = tmp.join("MiriOracleConfirm_000.lean");
+        let fb_mod = tmp.join("MiriOracleConfirmFallback_bad_item.lean");
+        fs::write(&chunk_mod, "-- chunk\n").unwrap();
+        fs::write(&fb_mod, "-- fallback reproducer\n").unwrap();
+
+        let err = finalize_stage2_confirm_scratch(
+            &tmp,
+            Err("Lean kernel confirmation rejected `bad_item` in oracle/MiriOracleConfirmFallback_bad_item.lean".to_string()),
+        )
+        .expect_err("rejection must propagate");
+        assert!(err.contains(&tmp.display().to_string()), "{err}");
+        assert!(
+            chunk_mod.is_file() && fb_mod.is_file(),
+            "rejecting confirm scratch modules must stay on disk when Stage 2 fails closed"
+        );
+
+        let ok = finalize_stage2_confirm_scratch(
+            &tmp,
+            Ok(ChunkedMiriConfirm {
+                confirmed: Vec::new(),
+                confirmed_groups: Vec::new(),
+                unconfirmed: BTreeMap::new(),
+            }),
+        )
+        .expect("ok stage cleans scratch files");
+        assert!(ok.confirmed.is_empty());
+        assert!(!chunk_mod.exists() && !fb_mod.exists());
+        let _ = fs::remove_dir_all(&tmp);
+
+        // 2. `extract_confirm_theorems` anchors `theorem confirm_*_<fn> :` at line
+        //    starts so a panic-message comment in an earlier group can never spoof
+        //    another candidate's theorem or `linkedCallees` namespace.
+        let g0_entry: MiriConfirmEntry = (
+            OracleItemSpec::with_fuel("cand_decoy".to_string(), 100),
+            "X.cand_decoy".to_string(),
+            AnnealOutcome::Panic { span: None },
+        );
+        let g1_entry: MiriConfirmEntry = (
+            OracleItemSpec::with_fuel("cand_real".to_string(), 100),
+            "X.cand_real".to_string(),
+            AnnealOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4,
+            },
+        );
+        let frames = BTreeMap::new();
+        let mut messages = BTreeMap::new();
+        messages.insert(
+            "cand_decoy".to_string(),
+            b"spoof theorem confirm_tag_cand_real : fake".to_vec(),
+        );
+        let confirm_src = render_multi_group_anneal_confirm_module(
+            "X",
+            &[
+                (vec![g0_entry], vec!["X.helper_wrong".to_string()]),
+                (vec![g1_entry], vec!["X.helper_right".to_string()]),
+            ],
+            &frames,
+            &messages,
+        )
+        .expect("render multi-group confirm");
+        let extracted = extract_confirm_theorems(&confirm_src, "cand_real");
+        assert!(extracted.contains("Mir.X.helper_right.body"), "{extracted}");
+        assert!(
+            !extracted.contains("Mir.X.helper_wrong.body"),
+            "panic comment in group 0 must not hijack cand_real's namespace: {extracted}"
+        );
     }
 }

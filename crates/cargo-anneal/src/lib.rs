@@ -2995,7 +2995,16 @@ fn build_lake_build_command_with_inputs(
 pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Command {
     let cargo_lake_jobs = env::var("CARGO_ANNEAL_LAKE_JOBS").ok();
     let lean_threads_set = env::var_os("LEAN_NUM_THREADS").is_some();
-    let (total_kib, avail_kib) = probe_effective_memory_kib();
+    let has_explicit_threads = lean_threads_set
+        || cargo_lake_jobs
+            .as_deref()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .is_some_and(|n| n >= 1);
+    let (total_kib, avail_kib) = if has_explicit_threads {
+        (None, None)
+    } else {
+        probe_effective_memory_kib()
+    };
     let cpu_cores = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4);
