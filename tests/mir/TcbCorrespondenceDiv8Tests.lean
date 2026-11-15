@@ -1405,4 +1405,52 @@ theorem b3_1_cross_frame_field_offset_subproj_and_enclosing_field_layouts :
       some (99, 4) := by
   refine ⟨rfl, rfl, rfl, by decide +kernel⟩
 
+/-! ## 13. Pass B4 Fallback `fieldLayouts = []` Owning-Frame `defaultLeafTy` Re-Homing Witness -/
+
+/-- `b4OuterNoFieldLayouts`: 8-byte two-field struct whose `TypeLayout` omits `fieldLayouts`
+(`fieldLayouts := []`), exercising the `(.none, .none)` fallback branch of
+`scanArbitraryLayoutFields?`. In `b4CallerLayouts`, `Wrap` is at `layoutIdx = 2` (and `layoutIdx = 1`
+is `a2PairLayout`), whereas in `b4CalleeLayouts`, `Wrap` is at `layoutIdx = 1`. -/
+def b4OuterNoFieldLayouts : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+def b4CallerLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [u32PrimLayout, a2PairLayout, a2WrapLayout, b4OuterNoFieldLayouts] }
+
+def b4CalleeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [u32PrimLayout, a2WrapLayout] }
+
+def b4WrapCalleeT : Ty := { kind := .adt "witness::Wrap" [], layoutIdx := 1 }
+def b4WrapCalleeDecl : LocalDecl := { mutability := .mut, ty := b4WrapCalleeT, debugName := none }
+def b4RefSharedWrapCalleeDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .ref .not b4WrapCalleeT.kind, layoutIdx := 0 },
+    debugName := none }
+def b4PtrConstWrapCalleeDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .not b4WrapCalleeT.kind, layoutIdx := 0 },
+    debugName := none }
+def b4CallerWrapDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .adt "witness::Wrap" [], layoutIdx := 2 }, debugName := none }
+
+theorem b4_1_resolve_leaf_ty_in_target_decls_fallback_no_field_layouts :
+    resolveLeafTyInTargetDecls [u32Decl, b3OuterDecl, b4CallerWrapDecl] b4CallerLayouts b4WrapCalleeT =
+      { kind := .adt "witness::Wrap" [], layoutIdx := 2 } ∧
+    resolveStackThinPtrTargetProjWithResidual?
+        b3CalleeOffsetPtrLocals
+        (.aggregate 0 [.scalar ⟨99, 4⟩, .scalar ⟨22, 4⟩])
+        b3CallerOuterEntry
+        { allocId := 50, offsetBytes := 4 }
+        []
+        [u32Decl, b3OuterDecl, b4CallerWrapDecl]
+        b4CallerLayouts
+        (some b4WrapCalleeT)
+        (some 4)
+        [b4RefSharedWrapCalleeDecl, b4PtrConstWrapCalleeDecl, b4WrapCalleeDecl]
+        b4CalleeLayouts =
+      some ([.field 1 { kind := .adt "witness::Wrap" [], layoutIdx := 2 }], 0) := by
+  refine ⟨rfl, rfl⟩
+
 end Anneal.TcbCorrespondenceDiv8Tests

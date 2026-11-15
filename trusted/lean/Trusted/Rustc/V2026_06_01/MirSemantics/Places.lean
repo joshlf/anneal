@@ -5020,6 +5020,23 @@ def resolveSeqContainerElemTyOpt
   | .none => .none
 
 /--
+Resolve a leaf `Ty` `ty` (which may originate from an active callee's
+`pointeeTyOpt`) in the owning frame's `(localDecls, layouts)` table: when
+`localDecls` declares a matching type or array element of `ty.kind`, its
+`layoutIdx` in `layouts` is used even if `ty.layoutIdx` happened to be in bounds
+of `layouts.entries`.
+-/
+@[reducible]
+def resolveLeafTyInTargetDecls
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Ty :=
+  match findDeclOrContainerElemTyWithKind? localDecls layouts ty.kind with
+  | .some declTy => { ty with layoutIdx := declTy.layoutIdx }
+  | .none => resolveTyWithLocalDecls localDecls layouts ty
+
+/--
 Resolve a non-zero intra-allocation byte offset `offsetBytes` from a field-based
 `BorrowEntry` projection `normTargetProj` ending in `.field _ leafFieldTy` onto
 the sibling or nested field at `startByteOff + offsetBytes` (plus any
@@ -5149,7 +5166,7 @@ def resolveStackThinPtrFieldOffsetProj?
           | true =>
             let defaultLeafTy : Ty :=
               match pointeeTyOpt with
-              | .some pt => resolveTyWithLocalDecls pointeeDecls pointeeLayouts pt
+              | .some pt => resolveLeafTyInTargetDecls localDecls layouts pt
               | .none => resolveTyWithLocalDecls localDecls layouts leafFieldTy
             let leafIsAggregate : Bool :=
               match defaultLeafTy.kind with
@@ -5394,7 +5411,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                 | true =>
                   let defaultLeafTy : Ty :=
                     match pointeeTyOpt with
-                    | .some pt => resolveTyWithLocalDecls pointeeDecls pointeeLayouts pt
+                    | .some pt => resolveLeafTyInTargetDecls localDecls layouts pt
                     | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                   match
                     resolveAggregateAtByteOffset?
@@ -5507,7 +5524,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                 | .some (.aggregate eVar eFields) =>
                   let defaultLeafTy : Ty :=
                     match pointeeTyOpt with
-                    | .some pt => resolveTyWithLocalDecls pointeeDecls pointeeLayouts pt
+                    | .some pt => resolveLeafTyInTargetDecls localDecls layouts pt
                     | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                   match
                     resolveAggregateAtByteOffset?
@@ -5615,7 +5632,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                       | true =>
                         let defaultLeafTy : Ty :=
                           match pointeeTyOpt with
-                          | .some pt => resolveTyWithLocalDecls pointeeDecls pointeeLayouts pt
+                          | .some pt => resolveLeafTyInTargetDecls localDecls layouts pt
                           | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                         match
                           resolveAggregateAtByteOffset?
@@ -5748,7 +5765,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                     | .some (.aggregate eVar eFields) =>
                       let defaultLeafTy : Ty :=
                         match pointeeTyOpt with
-                        | .some pt => resolveTyWithLocalDecls pointeeDecls pointeeLayouts pt
+                        | .some pt => resolveLeafTyInTargetDecls localDecls layouts pt
                         | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                       match
                         resolveAggregateAtByteOffset?
