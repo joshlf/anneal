@@ -2583,6 +2583,164 @@ theorem boolValueSpatialCodec_canaries :
     boolValueSpatialCodec.decode [.rawByte 0, .rawByte 0] = none :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+
+/-! ### Non-vacuity of the remaining composition theorems -/
+
+/-- The countdown VC for the original (fork-free) step function. -/
+theorem countdown_localBlockVC_orig :
+    LocalBlockVC testCfgStep countdownInv (· = 100) :=
+  forkFree_eq_of_noFork testCfgStep testCfgStep_noFork ▸ countdown_localBlockVC
+
+/-- **Non-vacuity of `evalFuel_blockCfgStep_ne_faulted`,
+`wpConverges_blockCfgStep_postRet`, `localBlockVC_forkFree`, and
+`StepsTo.exists_stepPath`** on the countdown CFG (symbolic start value `n` and
+fuel `k`). -/
+theorem countdown_transfer_canaries (n k : Nat) :
+    PureMirExec.evalFuel (blockCfgStep testCfgStep) k ⟨fun v => v, 0, n⟩ ≠
+      .faulted ∧
+    PureMirExec.WpConverges (blockCfgStep testCfgStep) ⟨fun v => v, 0, n⟩
+      (fun v => v = 100 ∧ v = 100) ∧
+    LocalBlockVC (forkFree testCfgStep) countdownInv (· = 100) ∧
+    (Exists fun j =>
+      StepPath (blockCfgStep testCfgStep) ⟨fun v => v, 0, 0⟩ j ⟨fun v => v, 2, 0⟩) := by
+  refine ⟨evalFuel_blockCfgStep_ne_faulted testCfgStep countdownInv (· = 100)
+      countdown_localBlockVC ⟨fun v => v, 0, n⟩ (Or.inl rfl) k,
+    wpConverges_blockCfgStep_postRet testCfgStep countdownInv (· = 100)
+      countdown_localBlockVC_orig (Or.inl rfl) (countdown_wpConverges n),
+    localBlockVC_forkFree testCfgStep countdownInv (· = 100)
+      countdown_localBlockVC_orig (fun bb st _ => testCfgStep_noFork bb st), ?_⟩
+  obtain ⟨j, t, hPath, ht⟩ := StepsTo.exists_stepPath
+    (stepsTo_of_runBlockCfgToBlock_reached
+      (rfl : runBlockCfgToBlock testCfgStep 2 5 ⟨fun v => v, 0, 0⟩ =
+        .reached ⟨fun v => v, 2, 0⟩))
+  subst ht
+  exact ⟨j, hPath⟩
+
+/-- Simulation relation for the zero-iteration `S6` loop at `*x = n = 3`: the
+loop header (block `0`) corresponds to `bb0` and the exit block `2` to `bb1` of
+`liveInteropMirBody`. -/
+def countUpExitRel (s : BlockMachineState (SymState StdVal) (FuncOut StdVal))
+    (ms : MachineState) : Prop :=
+  s.wrap = (fun o => o) ∧ s.st = countUpState 3 3 ∧
+    ((s.bb = 0 ∧ ms = liveInteropMs 0) ∨ (s.bb = 2 ∧ ms = liveInteropMs 1))
+
+/-- The zero-iteration loop CFG simulates into `liveInteropMirBody`. -/
+theorem countUpExit_segmentSim :
+    SegmentSim
+      (blockCfgStep (stepBasicBlock stdValAlg
+        (whileLoopBlocks countUpCond countUpBody (.constVal .unit))))
+      (PureMirExec.mirStep liveInteropMirBody) countUpExitRel := by
+  intro s t s' hR hCont
+  obtain ⟨hWrap, hSt, hCase⟩ := hR
+  cases s with
+  | mk w bb st =>
+    dsimp only at hWrap hSt hCase
+    subst hWrap
+    subst hSt
+    rcases hCase with ⟨hBb, hT⟩ | ⟨hBb, hT⟩
+    · subst hBb
+      subst hT
+      rw [blockCfgStep_whileHeader_false stdValAlg countUpCond countUpBody
+        (.constVal .unit) (fun o => o) (countUpState 3 3) (.bool (Nat.blt 3 3))
+        (countUp_eval_cond 3 3) rfl] at hCont
+      injection hCont with hEq
+      subst hEq
+      exact PureMirExec.StepsTo.step liveInterop_mirStep_bb0
+        (PureMirExec.StepsTo.refl ⟨rfl, rfl, Or.inr ⟨rfl, rfl⟩⟩)
+    · subst hBb
+      subst hT
+      rw [blockCfgStep_whileExit stdValAlg countUpCond countUpBody
+        (.constVal .unit) (fun o => o) (countUpState 3 3) .unit rfl rfl rfl] at hCont
+      exact nomatch hCont
+
+/-- **Non-vacuity of `liftBlockToJoin_of_whileCutpoint`**: the `S6` loop
+verified by its cutpoint invariant (here, the zero-iteration instance
+`*x = n = 3`) yields the live MIR join path of `liveInteropMirBody` from `bb0`
+to `bb1`. -/
+theorem countUp_liftBlockToJoin_of_whileCutpoint_canary :
+    MirLiftCore.LiftBlockToJoin liveInteropMirBody 0 liveInteropEnv 1
+      (· = liveInteropEnv) :=
+  liftBlockToJoin_of_whileCutpoint stdValAlg countUpCond countUpBody
+    (.constVal .unit) (· = countUpState 3 3) (fun _ => 0)
+    (fun s hs => by
+      subst hs
+      exact ⟨.bool (Nat.blt 3 3), countUp_eval_cond 3 3, Or.inl ⟨rfl, rfl⟩⟩)
+    countUpExit_segmentSim (fun o => o) (countUpState 3 3) rfl
+    ⟨rfl, rfl, Or.inl ⟨rfl, rfl⟩⟩
+    (fun _ ms' _ _ hR' => by
+      rcases hR'.2.2 with ⟨hBad, _⟩ | ⟨_, hMs⟩
+      · exact nomatch hBad
+      · subst hMs
+        exact ⟨rfl, rfl⟩)
+
+/-- Single-block certificate of a parameterless function returning `100`. -/
+def ret100Cert : CfgCertificate stdValAlg :=
+  CfgCertificate.singleBlock stdValAlg .skip (.constVal (.nat 100))
+
+/-- Block invariant of `ret100Cert`: the entry block with the empty frame. -/
+def ret100Inv (bb : Nat) (st : SymState StdVal) : Prop :=
+  bb = 0 ∧ st = ⟨[], [], [], [], [], 0⟩
+
+theorem ret100_localBlockVC :
+    LocalBlockVC (stepBasicBlock stdValAlg ret100Cert.blocks) ret100Inv
+      (fun _ => True) := by
+  intro bb st hInv
+  obtain ⟨hBb, hSt⟩ := hInv
+  subst hBb
+  subst hSt
+  exact trivial
+
+theorem ret100_noFork : ∀ bb st, ret100Inv bb st →
+    ∀ mergeRet thenBb elseBb st',
+      stepBasicBlock stdValAlg ret100Cert.blocks bb st ≠
+        .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st hInv mergeRet thenBb elseBb st' h
+  obtain ⟨hBb, hSt⟩ := hInv
+  subst hBb
+  subst hSt
+  exact nomatch h
+
+/-- The `ret100Cert` CFG machine forward-simulates into `liveInteropMirBody`,
+whose `bb0: goto bb1; bb1: return` returns `_0 = 100`. -/
+theorem ret100_forwardSim :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg ret100Cert.blocks))
+      (PureMirExec.mirStep liveInteropMirBody)
+      (fun s ms => s = ⟨fun o => o, 0, ⟨[], [], [], [], [], 0⟩⟩ ∧ ms = liveInteropMs 0)
+      (fun out o => out = ⟨.nat 100, []⟩ ∧ o = liveInteropMirOutcome) := by
+  intro s ms hR
+  obtain ⟨hS, hMs⟩ := hR
+  subst hS
+  subst hMs
+  exact PureMirExec.WpConverges.of_cont liveInterop_mirStep_bb0
+    (PureMirExec.WpConverges.of_done rfl ⟨rfl, rfl⟩)
+
+/-- **Non-vacuity of `mirWpConverges_of_cfgCertificate`**: the single-block
+certificate of a function returning `100` refines live `liveInteropMirBody`. -/
+theorem ret100_mirWpConverges_of_cfgCertificate_canary :
+    Anneal.MirFuelFree.MirWpConverges liveInteropMirBody (liveInteropMs 0)
+      (fun o => Exists fun (v : FuncOut StdVal) =>
+        v.ret = .nat 100 ∧ (v = ⟨.nat 100, []⟩ ∧ o = liveInteropMirOutcome)) :=
+  mirWpConverges_of_cfgCertificate stdValAlg ret100Cert [] ⟨[], [], [], [], [], 0⟩
+    (fun out => out.ret = .nat 100) rfl rfl ret100Inv (fun _ => True)
+    ret100_localBlockVC ret100_noFork ⟨rfl, rfl⟩ ret100_forwardSim ⟨rfl, rfl⟩
+
+/-- **Non-vacuity of `spatialCodecOfByteLensCodec_encode_length` and
+`spatialCodecOfByteLensCodec_decode_wrong_length`** for `u32` MIR scalars. -/
+theorem u32ValueSpatialCodec_width_canaries :
+    (∀ v a, u32OfValue? v = some a → (u32ValueSpatialCodec.encode v).length = 4) ∧
+    (∀ b0 b1 b2 : UInt8,
+      u32ValueSpatialCodec.decode [.rawByte b0, .rawByte b1, .rawByte b2] = none) :=
+  ⟨fun v a hv =>
+    spatialCodecOfByteLensCodec_encode_length 32
+      Anneal.SepLogicLenses.ByteLensCodec.u32LE
+      (fun x => provenanceFree_encodeLittleEndianBytes 4 x.val)
+      u32ToValue u32OfValue? u32ToValue_ofValue? v a hv,
+   fun _ _ _ =>
+    spatialCodecOfByteLensCodec_decode_wrong_length 32
+      Anneal.SepLogicLenses.ByteLensCodec.u32LE
+      (fun x => provenanceFree_encodeLittleEndianBytes 4 x.val)
+      u32ToValue u32OfValue? u32ToValue_ofValue? _ rfl (fun _ h => nomatch h)⟩
+
 end Canaries
 
 end Anneal.PureLift.MirLiftCoreInterop
