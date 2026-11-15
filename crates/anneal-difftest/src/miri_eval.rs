@@ -3636,10 +3636,36 @@ fn resolve_miri_lean_rss_budget_kib(stage_cap_mib: u64, jobs: usize) -> u64 {
     )
 }
 
-/// `root` and all of its live descendants, from a `/proc/*/stat` snapshot.
+/// Parses `(ppid, pgrp)` from `/proc/<pid>/stat` contents (`pid (comm) state ppid pgrp ...`).
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_ppid_pgrp(stat: &str) -> Option<(u32, u32)> {
+    let after_comm = stat.rfind(')').map(|i| &stat[i + 1..])?;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    let pgrp = fields.next()?.parse::<u32>().ok()?;
+    Some((ppid, pgrp))
+}
+
+/// Whether `root` is currently the leader of its own POSIX process group
+/// (`pgrp == root`), as set by `CommandExt::process_group(0)` in
+/// [`run_lean_with_rss_budget`].
+#[cfg(target_os = "linux")]
+fn process_is_pgrp_leader(root: u32) -> bool {
+    fs::read_to_string(format!("/proc/{root}/stat"))
+        .ok()
+        .and_then(|s| parse_proc_stat_ppid_pgrp(&s))
+        .is_some_and(|(_ppid, pgrp)| pgrp == root)
+}
+
+/// `root`, all of its live `ppid` descendants, and (when `root` is a
+/// process-group leader, `pgrp == root`) every member of process group `root`
+/// (which catches reparented grandchildren whose intermediate parent exited).
 #[cfg(target_os = "linux")]
 fn process_tree_pids(root: u32) -> Vec<u32> {
     let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut pgrp_members: Vec<u32> = Vec::new();
+    let mut root_is_leader = false;
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
@@ -3648,16 +3674,15 @@ fn process_tree_pids(root: u32) -> Vec<u32> {
             let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
                 continue;
             };
-            // `pid (comm) state ppid ...`, where `comm` may contain spaces or `)`.
-            let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+            let Some((ppid, pgrp)) = parse_proc_stat_ppid_pgrp(&stat) else {
                 continue;
             };
-            if let Some(ppid) = after_comm
-                .split_whitespace()
-                .nth(1)
-                .and_then(|p| p.parse::<u32>().ok())
-            {
-                children.entry(ppid).or_default().push(pid);
+            children.entry(ppid).or_default().push(pid);
+            if pid == root && pgrp == root {
+                root_is_leader = true;
+            }
+            if pgrp == root {
+                pgrp_members.push(pid);
             }
         }
     }
@@ -3674,11 +3699,18 @@ fn process_tree_pids(root: u32) -> Vec<u32> {
         }
         i += 1;
     }
+    if root_is_leader {
+        for pid in pgrp_members {
+            if seen.insert(pid) {
+                tree.push(pid);
+            }
+        }
+    }
     tree
 }
 
-/// Total resident set (KiB, `VmRSS`) of `root` and its descendants, or `None`
-/// where `/proc` is unavailable (the budget is then not enforced).
+/// Total resident set (KiB, `VmRSS`) of `root` and its descendants / process
+/// group, or `None` where `/proc` is unavailable (the budget is then not enforced).
 fn process_tree_rss_kib(root: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -3692,7 +3724,7 @@ fn process_tree_rss_kib(root: u32) -> Option<u64> {
                         .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
                 });
             if let Some(rss) = rss {
-                total = Some(total.unwrap_or(0) + rss);
+                total = Some(total.unwrap_or(0).saturating_add(rss));
             }
         }
         total
@@ -3704,9 +3736,10 @@ fn process_tree_rss_kib(root: u32) -> Option<u64> {
     }
 }
 
-/// SIGKILLs `child` and every descendant (`lake env lean` runs `lean` as a
-/// grandchild of the harness, so killing `lake` alone would orphan the
-/// runaway `lean`).
+/// SIGKILLs `child`, its entire process group (when `child` is a process-group
+/// leader, atomically catching concurrent forks and reparented grandchildren
+/// with zero PID-reuse hazard while `child` remains un-reaped), and every
+/// `ppid` descendant.
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(target_os = "linux")]
     {
@@ -3715,6 +3748,17 @@ fn kill_process_tree(child: &mut std::process::Child) {
         }
         const SIGKILL: i32 = 9;
         let root = child.id();
+        if process_is_pgrp_leader(root)
+            && let Ok(pgid) = i32::try_from(root)
+            && pgid > 0
+        {
+            // SAFETY: `child` has not been `wait()`ed yet, so `pgid == child.id()`
+            // cannot have been recycled; `kill(-pgid, SIGKILL)` atomically signals
+            // every member of `child`'s dedicated process group inside the kernel.
+            unsafe {
+                kill(-pgid, SIGKILL);
+            }
+        }
         for pid in process_tree_pids(root).into_iter().rev() {
             if pid != root
                 && let Ok(pid) = i32::try_from(pid)
@@ -3735,13 +3779,13 @@ fn kill_process_tree(child: &mut std::process::Child) {
 struct BudgetedOutput {
     output: std::process::Output,
     /// Process-tree RSS (KiB) observed when the budget was exceeded and the
-    /// tree was killed.
+    /// tree was killed (never set if the child had already exited cleanly).
     budget_exceeded_kib: Option<u64>,
 }
 
-/// Runs `cmd` to completion capturing stdout / stderr like
-/// [`Command::output`], but SIGKILLs its whole process tree as soon as the
-/// tree's resident set exceeds `budget_kib` (sampled every
+/// Runs `cmd` to completion in its own POSIX process group, capturing stdout /
+/// stderr like [`Command::output`], and SIGKILLs the whole process group / tree
+/// as soon as its resident set exceeds `budget_kib` (sampled every
 /// [`LEAN_RSS_POLL_INTERVAL`]), so a runaway Lean kernel reduction is contained
 /// to its own run instead of OOM-killing the enclosing cgroup.
 fn run_lean_with_rss_budget(
@@ -3749,6 +3793,11 @@ fn run_lean_with_rss_budget(
     budget_kib: Option<u64>,
 ) -> std::io::Result<BudgetedOutput> {
     use std::io::Read;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3789,9 +3838,25 @@ fn run_lean_with_rss_budget(
             && let Some(rss) = process_tree_rss_kib(child.id())
             && rss > budget
         {
-            budget_exceeded_kib = Some(rss);
+            // Re-check `try_wait` before killing so a process that exited while
+            // `/proc` was scanned keeps its genuine exit status (`exit 0` or a
+            // normal `exit 1` kernel rejection) rather than being misattributed
+            // to the RSS watchdog.
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(err) => {
+                    kill_process_tree(&mut child);
+                    let _ = child.wait();
+                    return Err(err);
+                }
+            }
             kill_process_tree(&mut child);
-            break child.wait()?;
+            let waited = child.wait()?;
+            if !waited.success() {
+                budget_exceeded_kib = Some(rss);
+            }
+            break waited;
         }
         std::thread::sleep(LEAN_RSS_POLL_INTERVAL);
     };
@@ -4244,6 +4309,36 @@ fn aggregate_miri_probe_stage(
     stage.errors
 }
 
+const LEAN_RESOURCE_MARKERS: [&str; 6] = [
+    "out of memory",
+    "(deterministic) timeout",
+    "maximum number of heartbeats",
+    "maximum recursion depth",
+    "deep recursion",
+    "stack overflow",
+];
+
+const LEAN_KERNEL_REJECTION_MARKERS: [&str; 8] = [
+    "the rfl tactic failed",
+    "type mismatch",
+    "application type mismatch",
+    "unknown identifier",
+    "unknown constant",
+    "unknown module prefix",
+    "failed to synthesize",
+    "unsolved goals",
+];
+
+fn lean_output_has_non_resource_kernel_rejection(stdout: &str, stderr: &str) -> bool {
+    let lower = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if LEAN_RESOURCE_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    LEAN_KERNEL_REJECTION_MARKERS
+        .iter()
+        .any(|m| lower.contains(m))
+}
+
 /// Whether a failed Lean kernel confirmation run ran out of a resource
 /// (Lean's `-M` memory cap, `maxHeartbeats`, recursion depth, the stack, or
 /// termination by a signal such as the OOM killer) rather than rejecting a
@@ -4254,16 +4349,8 @@ fn aggregate_miri_probe_stage(
 /// compiled `#eval` probe and the kernel, or an elaboration or import error)
 /// is a harness inconsistency that must abort the run.
 fn lean_confirm_failure_is_resource_exhaustion(signal_terminated: bool, output: &str) -> bool {
-    const RESOURCE_MARKERS: [&str; 6] = [
-        "out of memory",
-        "(deterministic) timeout",
-        "maximum number of heartbeats",
-        "maximum recursion depth",
-        "deep recursion",
-        "stack overflow",
-    ];
     let lower = output.to_ascii_lowercase();
-    signal_terminated || RESOURCE_MARKERS.iter().any(|m| lower.contains(m))
+    signal_terminated || LEAN_RESOURCE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// One `(spec, module suffix, Anneal outcome)` entry to kernel-confirm.
@@ -4284,22 +4371,38 @@ struct LeanConfirmRun {
 impl LeanConfirmRun {
     /// Converts a [`run_lean_with_rss_budget`] result. A run killed for
     /// exceeding `budget_kib` is reported as signal-terminated with an
-    /// `out of memory` note, i.e. as resource exhaustion, never as a kernel
-    /// rejection.
+    /// `out of memory` note, EXCEPT when the process already exited cleanly
+    /// (`exit 0`) or exited with a normal non-signal status (`exit 1`) after
+    /// emitting an explicit kernel / elaboration rejection (`the rfl tactic
+    /// failed`, `type mismatch`, etc.) without any resource marker — so a
+    /// genuine soundness failure racing with the RSS sampler always fails closed.
     fn from_budgeted_output(run: &BudgetedOutput, budget_kib: u64) -> Self {
         let out = &run.output;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if let Some(observed_kib) = run.budget_exceeded_kib {
+        if out.status.success() {
+            return Self {
+                success: true,
+                signal_terminated: false,
+                status: out.status.to_string(),
+                stdout,
+                stderr,
+            };
+        }
+        let raced_kernel_rejection = out.status.code().is_some()
+            && lean_output_has_non_resource_kernel_rejection(&stdout, &stderr);
+        let killed_by_budget = run.budget_exceeded_kib.filter(|_| !raced_kernel_rejection);
+        if let Some(observed_kib) = killed_by_budget {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
             }
             stderr.push_str(&rss_budget_kill_note(budget_kib, observed_kib));
         }
         Self {
-            success: out.status.success() && run.budget_exceeded_kib.is_none(),
-            signal_terminated: out.status.code().is_none() || run.budget_exceeded_kib.is_some(),
+            success: false,
+            signal_terminated: out.status.code().is_none() || killed_by_budget.is_some(),
             status: out.status.to_string(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stdout,
             stderr,
         }
     }
@@ -4363,7 +4466,7 @@ fn run_chunked_miri_confirm_stage<W, R>(
 ) -> Result<ChunkedMiriConfirm, String>
 where
     W: Fn(&str, &[MiriConfirmEntry]) -> Result<(), String>,
-    R: Fn(&str) -> Result<LeanConfirmRun, String> + Sync,
+    R: Fn(&str, bool) -> Result<LeanConfirmRun, String> + Sync,
 {
     let chunk_size = chunk_size.max(1);
     let jobs = jobs.max(1);
@@ -4379,12 +4482,16 @@ where
             write_module(&file_name, chunk)?;
             prepared.push((file_name, chunk));
         }
+        let wave_concurrency_gt_one = wave.len() > 1;
         let outputs: Vec<Result<LeanConfirmRun, String>> = std::thread::scope(|s| {
             let handles: Vec<_> = prepared
                 .iter()
                 .map(|(file_name, _)| {
                     let run_module = &run_module;
-                    s.spawn(move || run_module(file_name))
+                    // When a wave only has 1 chunk (`wave.len() == 1`), no sibling
+                    // confirm worker runs alongside it, so it gets the full
+                    // single-worker RSS budget (`is_serial = true`).
+                    s.spawn(move || run_module(file_name, !wave_concurrency_gt_one))
                 })
                 .collect();
             handles
@@ -4403,22 +4510,22 @@ where
                 confirmed_groups.push(chunk.to_vec());
                 continue;
             }
-            let single_runs: Vec<(&MiriConfirmEntry, String, LeanConfirmRun)> = if chunk.len() == 1
-            {
-                vec![(&chunk[0], file_name, out)]
-            } else {
-                let mut runs = Vec::with_capacity(chunk.len());
-                for entry in chunk {
-                    let fb_name = format!(
-                        "MiriOracleConfirmFallback_{}.lean",
-                        sanitize_lean_file_stem(&entry.0.name)
-                    );
-                    write_module(&fb_name, std::slice::from_ref(entry))?;
-                    let run = run_module(&fb_name)?;
-                    runs.push((entry, fb_name, run));
-                }
-                runs
-            };
+            let single_runs: Vec<(&MiriConfirmEntry, String, LeanConfirmRun)> =
+                if chunk.len() == 1 && !wave_concurrency_gt_one {
+                    vec![(&chunk[0], file_name, out)]
+                } else {
+                    let mut runs = Vec::with_capacity(chunk.len());
+                    for entry in chunk {
+                        let fb_name = format!(
+                            "MiriOracleConfirmFallback_{}.lean",
+                            sanitize_lean_file_stem(&entry.0.name)
+                        );
+                        write_module(&fb_name, std::slice::from_ref(entry))?;
+                        let run = run_module(&fb_name, true)?;
+                        runs.push((entry, fb_name, run));
+                    }
+                    runs
+                };
             for (entry, module_name, run) in single_runs {
                 if run.success {
                     confirmed.push(entry.clone());
@@ -4680,13 +4787,19 @@ fn run_linked_difftest_oracle_pipeline(
                 .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
             clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe"]);
 
-            let probe_rss_budget_kib =
+            let wave_probe_rss_budget_kib =
                 resolve_miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, lean_jobs);
             let probe_errors = aggregate_miri_probe_stage(
                 &surviving_items,
                 MIRI_PROBE_CHUNK_SIZE,
                 lean_jobs,
                 |chunk_idx, run_kind, _label, chunk| {
+                    let probe_rss_budget_kib = match run_kind {
+                        MiriStageRunKind::Chunk => wave_probe_rss_budget_kib,
+                        MiriStageRunKind::Fallback | MiriStageRunKind::Remainder => {
+                            resolve_miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, 1)
+                        }
+                    };
                     let file_name = miri_probe_module_file_name(chunk_idx, run_kind, chunk);
                     let probe_path = oracle_dir.join(&file_name);
                     let rel_probe_path = format!("oracle/{file_name}");
@@ -4852,19 +4965,24 @@ fn run_linked_difftest_oracle_pipeline(
 
         let _lean_guard = acquire_live_lean_oracle_lock();
         let lean_jobs = resolve_miri_lean_jobs().max(1);
-        let confirm_rss_budget_kib =
+        let wave_confirm_rss_budget_kib =
             resolve_miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, lean_jobs);
         let stage = run_chunked_miri_confirm_stage(
             &to_confirm,
             MIRI_CONFIRM_CHUNK_SIZE,
             lean_jobs,
             |file_name, entries| write_confirm_module_at(&oracle_dir.join(file_name), entries),
-            |file_name| {
+            |file_name, is_serial| {
+                let budget_kib = if is_serial {
+                    resolve_miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, 1)
+                } else {
+                    wave_confirm_rss_budget_kib
+                };
                 run_lean_confirm_file(
                     &lake_bin,
                     &dot_anneal,
                     &format!("oracle/{file_name}"),
-                    confirm_rss_budget_kib,
+                    budget_kib,
                 )
             },
         );
@@ -10685,7 +10803,7 @@ pub fn cand_shadow() -> u32 {
             (0..40).map(|i| entry(&format!("div_{i:02}"))).collect();
         let written: std::sync::Mutex<BTreeMap<String, Vec<String>>> =
             std::sync::Mutex::new(BTreeMap::new());
-        let ran: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let ran: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
 
         let stage = run_chunked_miri_confirm_stage(
             &to_confirm,
@@ -10698,8 +10816,8 @@ pub fn cand_shadow() -> u32 {
                 );
                 Ok(())
             },
-            |file_name| {
-                ran.lock().unwrap().push(file_name.to_string());
+            |file_name, is_serial| {
+                ran.lock().unwrap().push((file_name.to_string(), is_serial));
                 let names = written
                     .lock()
                     .unwrap()
@@ -10758,6 +10876,18 @@ pub fn cand_shadow() -> u32 {
         assert!(fallback_modules.iter().all(|names| names.len() == 1));
         let ran = ran.into_inner().unwrap();
         assert_eq!(ran.len(), 3 + 16 + 8);
+        // Wave 0 runs 2 chunks concurrently (`is_serial == false`); wave 1 has a
+        // single trailing chunk (`is_serial == true`); every per-entry fallback runs
+        // serially (`is_serial == true`) so it receives the full 1-worker RSS budget.
+        for (mod_name, is_serial) in &ran {
+            if mod_name == "MiriOracleConfirm_000.lean"
+                || mod_name == "MiriOracleConfirm_001.lean"
+            {
+                assert!(!is_serial, "{mod_name} ran in a 2-worker wave");
+            } else {
+                assert!(*is_serial, "{mod_name} ran alone and must get serial RSS budget");
+            }
+        }
         assert_eq!(
             stage.unconfirmed.keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["div_20"]
@@ -10783,7 +10913,7 @@ pub fn cand_shadow() -> u32 {
             MIRI_CONFIRM_CHUNK_SIZE,
             1,
             |_file_name, _entries| Ok(()),
-            |file_name| {
+            |file_name, _is_serial| {
                 if file_name.starts_with("MiriOracleConfirm_") || file_name.contains("div_01") {
                     let mut stdout: String = (0..30)
                         .map(|k| format!("info: elaborating theorem {k}\n"))
@@ -10819,7 +10949,7 @@ pub fn cand_shadow() -> u32 {
             MIRI_CONFIRM_CHUNK_SIZE,
             1,
             |_file_name, _entries| Ok(()),
-            |_file_name| Err("failed to execute 'lake env lean'".to_string()),
+            |_file_name, _is_serial| Err("failed to execute 'lake env lean'".to_string()),
         )
         .expect_err("spawn failures must propagate");
         assert!(spawn_err.contains("failed to execute"));
@@ -11086,5 +11216,78 @@ pub fn cand_shadow() -> u32 {
                 Some(s) => panic!("grandchild {grandchild} survived the tree kill (state {s})"),
             }
         }
+
+        // 4. Process-group isolation catches reparented orphans whose intermediate
+        //    parent exited (so `ppid != root`), both in RSS measurement and SIGKILL.
+        let pid_file = env::temp_dir().join(format!(
+            "anneal-miri-orphan-pgrp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut orphan_cmd = Command::new("sh");
+        orphan_cmd.arg("-c").arg(format!(
+            "(sleep 60 </dev/null >/dev/null 2>&1 & echo $! > '{}'); sleep 60",
+            pid_file.display()
+        ));
+        let orphan_killed =
+            run_lean_with_rss_budget(&mut orphan_cmd, Some(1)).expect("run orphan tree");
+        assert!(orphan_killed.budget_exceeded_kib.is_some());
+        if let Ok(raw_pid) = fs::read_to_string(&pid_file)
+            && let Ok(orphan_pid) = raw_pid.trim().parse::<u32>()
+        {
+            let deadline2 = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state = fs::read_to_string(format!("/proc/{orphan_pid}/stat"))
+                    .ok()
+                    .and_then(|s| s.rfind(')').and_then(|i| s[i + 1..].trim_start().chars().next()));
+                match state {
+                    None | Some('Z') | Some('X') => break,
+                    Some(_) if Instant::now() < deadline2 => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Some(s) => panic!("reparented grandchild {orphan_pid} survived pgrp kill ({s})"),
+                }
+            }
+        }
+        let _ = fs::remove_file(&pid_file);
+
+        // 5. Exit-vs-kill race safety: a process that already exited `0` stays
+        //    `success = true`, and a process that exited `1` with an explicit kernel
+        //    `rfl` rejection (rather than dying to SIGKILL) is NEVER masked as an
+        //    `"out of memory guard"` resource exhaustion.
+        use std::os::unix::process::ExitStatusExt;
+        let raced_ok = BudgetedOutput {
+            output: std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            budget_exceeded_kib: Some(5 * 1024 * 1024),
+        };
+        let confirm_ok = LeanConfirmRun::from_budgeted_output(&raced_ok, 4 * 1024 * 1024);
+        assert!(confirm_ok.success && !confirm_ok.signal_terminated);
+        assert!(!confirm_ok.stderr.contains("out of memory guard"));
+
+        let raced_reject = BudgetedOutput {
+            output: std::process::Output {
+                status: std::process::ExitStatus::from_raw(1 << 8), // normal exit(1)
+                stdout: b"MiriOracleConfirm_000.lean:10:2: error: The rfl tactic failed\n".to_vec(),
+                stderr: Vec::new(),
+            },
+            budget_exceeded_kib: Some(5 * 1024 * 1024),
+        };
+        let confirm_reject = LeanConfirmRun::from_budgeted_output(&raced_reject, 4 * 1024 * 1024);
+        assert!(!confirm_reject.success);
+        assert!(!confirm_reject.signal_terminated);
+        assert!(
+            !lean_confirm_failure_is_resource_exhaustion(
+                confirm_reject.signal_terminated,
+                &format!("{}\n{}", confirm_reject.stdout, confirm_reject.stderr)
+            ),
+            "a raced normal-exit `rfl` rejection must fail closed, never downgrade: {confirm_reject:?}"
+        );
     }
 }

@@ -2766,6 +2766,26 @@ pub fn parse_cgroup_v1_memory_stat_used_bytes(stat_text: &str) -> Option<u64> {
     sum("total_rss", "total_shmem").or_else(|| sum("rss", "shmem"))
 }
 
+/// Parses `hierarchical_memory_limit` (in bytes, when `< CGROUP_V1_UNLIMITED_BYTES`)
+/// from cgroup v1 `memory.stat`. In bind-mounted Kubernetes / Docker v1
+/// containers whose memory cap is set on an enclosing pod cgroup rather than
+/// the container leaf, `memory.limit_in_bytes` at the container mount root
+/// reads `unlimited`, while `hierarchical_memory_limit` in `memory.stat`
+/// exposes the effective ancestor limit.
+pub fn parse_cgroup_v1_memory_stat_limit_bytes(stat_text: &str) -> Option<u64> {
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some("hierarchical_memory_limit"), Some(val), None) =
+            (parts.next(), parts.next(), parts.next())
+            && let Ok(v) = val.parse::<u64>()
+            && v < CGROUP_V1_UNLIMITED_BYTES
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// cgroup v1 counterpart of [`cgroup_memory_limits_kib`], used when the
 /// unified hierarchy exposes no memory bound (legacy or hybrid hosts and
 /// containers): walks this process's `memory` controller path (the
@@ -2820,16 +2840,20 @@ pub fn cgroup_v1_memory_limits_kib(
     let mut headroom_kib: Option<u64> = None;
     while dir.starts_with(memory_root) {
         if dir.is_dir() {
-            let lvl_used = fs::read_to_string(dir.join("memory.stat"))
-                .ok()
-                .and_then(|s| parse_cgroup_v1_memory_stat_used_bytes(&s))
+            let stat_text = fs::read_to_string(dir.join("memory.stat")).ok();
+            let lvl_used = stat_text
+                .as_deref()
+                .and_then(parse_cgroup_v1_memory_stat_used_bytes)
                 .or_else(|| read_u64_file(&dir.join("memory.usage_in_bytes")));
             if let Some(u) = lvl_used {
                 descendant_used_bytes = Some(descendant_used_bytes.map_or(u, |prev| prev.max(u)));
             }
-            if let Some(bound) = read_u64_file(&dir.join("memory.limit_in_bytes"))
-                .filter(|&b| b < CGROUP_V1_UNLIMITED_BYTES)
-            {
+            let direct_bound = read_u64_file(&dir.join("memory.limit_in_bytes"))
+                .filter(|&b| b < CGROUP_V1_UNLIMITED_BYTES);
+            let hier_bound = stat_text
+                .as_deref()
+                .and_then(parse_cgroup_v1_memory_stat_limit_bytes);
+            if let Some(bound) = min_opt_u64(direct_bound, hier_bound) {
                 let used = lvl_used.or(descendant_used_bytes).unwrap_or(0);
                 limit_kib = min_opt_u64(limit_kib, Some(bound / 1024));
                 headroom_kib =
@@ -2903,15 +2927,15 @@ pub fn probe_effective_memory_kib() -> (Option<u64>, Option<u64>) {
         .map(|s| parse_meminfo_kib(&s))
         .unwrap_or((None, None));
     if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
-        let (mut cg_limit, mut cg_headroom) =
+        let (v2_limit, v2_headroom) =
             cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
-        if cg_limit.is_none() && cg_headroom.is_none() {
-            // Legacy / hybrid cgroup v1 hosts expose the memory controller
-            // separately; without this, `/proc/meminfo` (the whole host) would
-            // size Lean concurrency inside a memory-limited v1 container.
-            (cg_limit, cg_headroom) =
-                cgroup_v1_memory_limits_kib(Path::new("/sys/fs/cgroup/memory"), &self_cgroup);
-        }
+        // Intersect with cgroup v1 (`/sys/fs/cgroup/memory`, a single non-dir stat on
+        // pure v2 hosts) so both pure-v1 containers and hybrid v1+v2 hosts whose tightest
+        // memory cap lives on the v1 `memory` controller hierarchy are honored.
+        let (v1_limit, v1_headroom) =
+            cgroup_v1_memory_limits_kib(Path::new("/sys/fs/cgroup/memory"), &self_cgroup);
+        let cg_limit = min_opt_u64(v2_limit, v1_limit);
+        let cg_headroom = min_opt_u64(v2_headroom, v1_headroom);
         total_kib = min_opt_u64(total_kib, cg_limit);
         avail_kib = min_opt_u64(avail_kib, cg_headroom);
     }
@@ -4048,6 +4072,23 @@ mod tests {
             cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
             (None, None)
         );
+        // Bind-mounted pod container where `memory.limit_in_bytes` is unlimited at the
+        // container leaf, while `memory.stat`'s `hierarchical_memory_limit` exposes the
+        // enclosing pod's 3 GiB cap.
+        fs::write(
+            memory_root.join("memory.stat"),
+            format!(
+                "hierarchical_memory_limit {}\ntotal_rss {}\ntotal_shmem 0\n",
+                3 * GIB,
+                GIB
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "4:memory:/kubepods/pod-xyz/ctr\n"),
+            (Some(3 * GIB_KIB), Some(2 * GIB_KIB))
+        );
+        fs::remove_file(memory_root.join("memory.stat")).unwrap();
         // The unified-hierarchy walk sees no `memory.max` in a v1 mount layout, which
         // is what makes `probe_effective_memory_kib` fall back to v1.
         assert_eq!(
