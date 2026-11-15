@@ -16,3 +16,4 @@ import Anneal.PureLift.BlockCfg
 import Anneal.PureLift.Adapter
 import Anneal.PureLift.Canaries
 import Anneal.PureLift.MirLiftCoreInterop
+import Anneal.PureLift.V2026_06_01Bridge
