@@ -546,6 +546,41 @@ def is_int_map(val: Any, expected_keys: tuple[str, ...] | None = None) -> bool:
     return all(isinstance(k, str) and is_nonneg_int(v) for k, v in val.items())
 
 
+def extract_harness_output_diagnostics(
+    stdout: str | None, stderr: str | None
+) -> tuple[str, str, list[str]]:
+    """Extracts 20-line tails for stdout/stderr and up to 30 `✖` / `error:` lines."""
+    stdout_lines = stdout.strip().splitlines() if stdout else []
+    stderr_lines = stderr.strip().splitlines() if stderr else []
+    stdout_tail = "\n".join(stdout_lines[-20:])
+    stderr_tail = "\n".join(stderr_lines[-20:])
+    matched: list[str] = []
+    seen: set[str] = set()
+    for line in [*stdout_lines, *stderr_lines]:
+        if ("✖" in line or "error:" in line.lower()) and line not in seen:
+            seen.add(line)
+            matched.append(line)
+    return stdout_tail, stderr_tail, matched[-30:]
+
+
+def _build_harness_diagnostics(
+    exit_code: int,
+    oracle_error_reason: str | None,
+    stdout_tail: str,
+    stderr_tail: str,
+    error_lines: list[str],
+    elapsed_s: float,
+) -> dict[str, Any]:
+    return {
+        "exit_code": exit_code,
+        "oracle_error_reason": oracle_error_reason,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "error_lines": list(error_lines),
+        "elapsed_s": elapsed_s,
+    }
+
+
 def run_harness(
     repo_root: Path, bin_name: str, harness_args: list[str], json_path: Path
 ) -> dict[str, Any] | None:
@@ -572,68 +607,87 @@ def run_harness(
         cmd, cwd=str(repo_root), env=env, text=True, capture_output=True
     )
     elapsed_s = round(time.monotonic() - t0, 3)
-    stderr_lines = res.stderr.strip().splitlines() if res.stderr else []
-    stderr_tail = "\n".join(stderr_lines[-20:])
+    stdout_tail, stderr_tail, error_lines = extract_harness_output_diagnostics(
+        res.stdout, res.stderr
+    )
     if res.returncode != 0:
-        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
-            "exit_code": res.returncode,
-            "oracle_error_reason": f"process_exit_{res.returncode}",
-            "stderr_tail": stderr_tail,
-            "elapsed_s": elapsed_s,
-        }
-        sys.stderr.write(f"{bin_name} failed (exit {res.returncode}):\n{res.stderr}\n")
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = _build_harness_diagnostics(
+            res.returncode,
+            f"process_exit_{res.returncode}",
+            stdout_tail,
+            stderr_tail,
+            error_lines,
+            elapsed_s,
+        )
+        if res.stdout and res.stdout.strip():
+            sys.stderr.write(
+                f"{bin_name} failed (exit {res.returncode}):\n"
+                f"stderr:\n{res.stderr}\nstdout:\n{res.stdout}\n"
+            )
+        else:
+            sys.stderr.write(f"{bin_name} failed (exit {res.returncode}):\n{res.stderr}\n")
         return None
     try:
         summary = _strict_json_loads(
             json_path.read_text(encoding="utf-8"), reject_duplicate_keys=True
         )
     except (OSError, UnicodeDecodeError, ValueError) as e:
-        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
-            "exit_code": res.returncode,
-            "oracle_error_reason": f"unreadable_json: {e}",
-            "stderr_tail": stderr_tail,
-            "elapsed_s": elapsed_s,
-        }
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = _build_harness_diagnostics(
+            res.returncode,
+            f"unreadable_json: {e}",
+            stdout_tail,
+            stderr_tail,
+            error_lines,
+            elapsed_s,
+        )
         sys.stderr.write(f"{bin_name} produced unreadable JSON: {e}\n")
         return None
     if not isinstance(summary, dict):
-        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
-            "exit_code": res.returncode,
-            "oracle_error_reason": "non_object_json",
-            "stderr_tail": stderr_tail,
-            "elapsed_s": elapsed_s,
-        }
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = _build_harness_diagnostics(
+            res.returncode,
+            "non_object_json",
+            stdout_tail,
+            stderr_tail,
+            error_lines,
+            elapsed_s,
+        )
         sys.stderr.write(f"{bin_name} produced a non-object JSON summary\n")
         return None
     for key in HARNESS_INT_KEYS:
         val = summary.get(key)
         if val is not None and (isinstance(val, bool) or not isinstance(val, int)):
-            LAST_HARNESS_DIAGNOSTICS[bin_name] = {
-                "exit_code": res.returncode,
-                "oracle_error_reason": f"non_integer_{key}",
-                "stderr_tail": stderr_tail,
-                "elapsed_s": elapsed_s,
-            }
+            LAST_HARNESS_DIAGNOSTICS[bin_name] = _build_harness_diagnostics(
+                res.returncode,
+                f"non_integer_{key}",
+                stdout_tail,
+                stderr_tail,
+                error_lines,
+                elapsed_s,
+            )
             sys.stderr.write(f"{bin_name} produced non-integer {key}={val!r}\n")
             return None
     elapsed = summary.get("elapsed_ms")
     if elapsed is not None and (
         isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
     ):
-        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
-            "exit_code": res.returncode,
-            "oracle_error_reason": "non_numeric_elapsed_ms",
-            "stderr_tail": stderr_tail,
-            "elapsed_s": elapsed_s,
-        }
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = _build_harness_diagnostics(
+            res.returncode,
+            "non_numeric_elapsed_ms",
+            stdout_tail,
+            stderr_tail,
+            error_lines,
+            elapsed_s,
+        )
         sys.stderr.write(f"{bin_name} produced non-numeric elapsed_ms={elapsed!r}\n")
         return None
-    LAST_HARNESS_DIAGNOSTICS[bin_name] = {
-        "exit_code": 0,
-        "oracle_error_reason": None,
-        "stderr_tail": stderr_tail,
-        "elapsed_s": elapsed_s,
-    }
+    LAST_HARNESS_DIAGNOSTICS[bin_name] = _build_harness_diagnostics(
+        0,
+        None,
+        stdout_tail,
+        stderr_tail,
+        error_lines,
+        elapsed_s,
+    )
     return summary
 
 
@@ -7775,10 +7829,28 @@ def render_oracle_campaign_report(
                 f"reason=`{diag.get('oracle_error_reason')}`"
             )
             tail = str(diag.get("stderr_tail") or "").strip()
+            stdout_tail = str(diag.get("stdout_tail") or "").strip()
+            raw_error_lines = diag.get("error_lines")
+            err_lines = (
+                [str(e) for e in raw_error_lines if str(e).strip()]
+                if isinstance(raw_error_lines, list)
+                else []
+            )
+            err_text = "\n".join(err_lines).strip()
+            if err_text and err_text not in (tail, stdout_tail):
+                fence = markdown_code_fence_for(err_text)
+                lines.append(f"{fence}text")
+                lines.append(err_text)
+                lines.append(fence)
             if tail:
                 fence = markdown_code_fence_for(tail)
                 lines.append(f"{fence}text")
                 lines.append(tail)
+                lines.append(fence)
+            if stdout_tail and stdout_tail != tail:
+                fence = markdown_code_fence_for(stdout_tail)
+                lines.append(f"{fence}text")
+                lines.append(stdout_tail)
                 lines.append(fence)
 
     lines.extend(
@@ -8129,7 +8201,9 @@ def main(argv: list[str] | None = None) -> int:
                 LAST_HARNESS_DIAGNOSTICS["miri-difftest"] = {
                     "exit_code": 0 if miri is not None else 1,
                     "oracle_error_reason": None if miri is not None else "harness_returned_none",
+                    "stdout_tail": "",
                     "stderr_tail": "",
+                    "error_lines": [],
                     "elapsed_s": (
                         round(float(miri["elapsed_ms"]) / 1000.0, 3)
                         if isinstance(miri, dict) and isinstance(miri.get("elapsed_ms"), (int, float))
@@ -8150,7 +8224,9 @@ def main(argv: list[str] | None = None) -> int:
                 LAST_HARNESS_DIAGNOSTICS["itree-difftest"] = {
                     "exit_code": 0 if itree is not None else 1,
                     "oracle_error_reason": None if itree is not None else "harness_returned_none",
+                    "stdout_tail": "",
                     "stderr_tail": "",
+                    "error_lines": [],
                     "elapsed_s": (
                         round(float(itree["elapsed_ms"]) / 1000.0, 3)
                         if isinstance(itree, dict) and isinstance(itree.get("elapsed_ms"), (int, float))

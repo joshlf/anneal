@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub use cargo_anneal::cgroup_memory_limits_kib;
 use cargo_anneal::{
     ANNEAL_CAPTURE_FILTER_ENV, AnnealOutcome, CaptureDriverConfig, ComparisonVerdict,
     DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
@@ -26,8 +27,8 @@ use cargo_anneal::{
     MiriToolchain, NotComparedReason, OracleItemSpec, ScaffoldConfig, SourcePos, SourceSpan,
     aggregate_unit_manifests, build_lake_build_command, compare_miri_and_anneal,
     derive_item_module_suffix, discover_zero_arg_pub_fns, normalize_path_against,
-    parse_anneal_probe_output, resolve_rustc_wrapper, run_miri_oracle,
-    scaffold_workspace_with_config, source_files_match,
+    parse_anneal_probe_output, probe_effective_memory_kib, resolve_default_lake_jobs,
+    resolve_rustc_wrapper, run_miri_oracle, scaffold_workspace_with_config, source_files_match,
 };
 
 use crate::mutators_miri::{
@@ -2624,12 +2625,190 @@ fn resolve_lake_bin() -> PathBuf {
     PathBuf::from("lake")
 }
 
-fn run_lake_build_with_bin(
+/// Maximum number of corpus candidate items per Stage 1 `Mir.*` build chunk and
+/// `MiriOracleProbe_{chunk_idx:03}.lean` evaluation module.
+pub const MIRI_PROBE_CHUNK_SIZE: usize = 64;
+
+/// Maximum number of candidate items per Stage 2 `MiriOracleConfirm_{chunk_idx:03}.lean`
+/// kernel confirmation chunk.
+pub const MIRI_CONFIRM_CHUNK_SIZE: usize = 16;
+
+/// Maximum consecutive failed per-candidate fallback runs (with zero fallback
+/// successes so far) before [`run_isolated_miri_stage`] trips its circuit
+/// breaker and skips remaining per-candidate retries.
+pub const MIRI_FALLBACK_CIRCUIT_BREAKER: usize = 4;
+
+/// Maps effective total / available memory (in KiB) to a `lake env lean` chunk
+/// worker count for `miri-difftest`: 1 worker when available memory is below
+/// 24 GiB (or unknown) or total memory is at most 36 GiB, at most 2 workers up
+/// to 64 GiB total (or below 48 GiB available), and at most 4 workers above that.
+pub fn miri_lean_jobs_for_memory(total_kib: Option<u64>, avail_kib: Option<u64>) -> usize {
+    const GIB: u64 = 1024 * 1024;
+    if total_kib.is_none() && avail_kib.is_none() {
+        return 1;
+    }
+    let by_total = match total_kib {
+        None => 4,
+        Some(t) if t <= 36 * GIB => 1,
+        Some(t) if t <= 64 * GIB => 2,
+        Some(_) => 4,
+    };
+    let by_avail = match avail_kib {
+        None => 1,
+        Some(a) if a < 24 * GIB => 1,
+        Some(a) if a < 48 * GIB => 2,
+        Some(_) => 4,
+    };
+    by_total.min(by_avail)
+}
+
+/// Pure helper for [`resolve_miri_lean_jobs`] accepting explicit `ANNEAL_MIRI_LEAN_JOBS`
+/// and effective memory values for deterministic testing.
+pub fn resolve_miri_lean_jobs_with_env(
+    anneal_miri_lean_jobs: Option<&str>,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+) -> usize {
+    if let Some(val) = anneal_miri_lean_jobs
+        && let Ok(parsed) = val.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return parsed.min(8);
+    }
+    miri_lean_jobs_for_memory(total_kib, avail_kib)
+}
+
+/// Resolves the maximum number of concurrent `lake env lean` chunk workers (and
+/// sequential chunk `lake build` threads) for `miri-difftest` from
+/// `ANNEAL_MIRI_LEAN_JOBS` (capped at 8) or host `/proc/meminfo` intersected
+/// with enclosing cgroup v2 memory limits (`memory.max` & `memory.stat` `anon + shmem`).
+pub fn resolve_miri_lean_jobs() -> usize {
+    let override_env = env::var("ANNEAL_MIRI_LEAN_JOBS").ok();
+    let (total_kib, avail_kib) = probe_effective_memory_kib();
+    resolve_miri_lean_jobs_with_env(override_env.as_deref(), total_kib, avail_kib)
+}
+
+fn resolve_miri_stage0_threads() -> usize {
+    if let Ok(val) = env::var("ANNEAL_MIRI_LEAN_JOBS")
+        && let Ok(parsed) = val.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return parsed.min(8);
+    }
+    if let Ok(val) = env::var("CARGO_ANNEAL_LAKE_JOBS")
+        && let Ok(parsed) = val.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return parsed.min(16);
+    }
+    let (total_kib, avail_kib) = probe_effective_memory_kib();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let mem_jobs = resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores);
+    if let Ok(caller_threads) = env::var("LEAN_NUM_THREADS")
+        && let Ok(parsed) = caller_threads.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return mem_jobs.min(parsed);
+    }
+    mem_jobs
+}
+
+fn is_lean_diag_highlight_line(line: &str) -> bool {
+    line.contains('✖') || line.to_ascii_lowercase().contains("error:")
+}
+
+/// Extracts up to `max_lines` unique diagnostic lines (`✖` or `error:`) across
+/// `stdout` and `stderr`, preserving order.
+pub(crate) fn extract_lean_error_lines(
+    stdout: &str,
+    stderr: &str,
+    max_lines: usize,
+) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let mut matched: Vec<String> = Vec::new();
+    for raw in stdout.lines().chain(stderr.lines()) {
+        let trimmed = raw.trim_end_matches('\r');
+        if is_lean_diag_highlight_line(trimmed) && !matched.iter().any(|m| m == trimmed) {
+            matched.push(trimmed.to_string());
+        }
+    }
+    if matched.len() > max_lines {
+        matched.split_off(matched.len() - max_lines)
+    } else {
+        matched
+    }
+}
+
+/// Truncates a multi-line Lean log to its first 20 and last 20 lines while
+/// preserving any `✖` / `error:` lines that would otherwise be elided from the middle.
+fn truncate_lean_diag(msg: &str) -> String {
+    let lines: Vec<&str> = msg.lines().collect();
+    if lines.len() <= 40 {
+        return msg.to_string();
+    }
+    let middle = &lines[20..lines.len() - 20];
+    let middle_errors: Vec<&str> = middle
+        .iter()
+        .copied()
+        .filter(|l| is_lean_diag_highlight_line(l))
+        .take(20)
+        .collect();
+    if middle_errors.is_empty() {
+        format!(
+            "{}\n... ({} lines elided) ...\n{}",
+            lines[..20].join("\n"),
+            middle.len(),
+            lines[lines.len() - 20..].join("\n")
+        )
+    } else {
+        format!(
+            "{}\n... ({} lines elided; key error lines preserved below) ...\n{}\n... (end of preserved middle errors) ...\n{}",
+            lines[..20].join("\n"),
+            middle.len(),
+            middle_errors.join("\n"),
+            lines[lines.len() - 20..].join("\n")
+        )
+    }
+}
+
+/// Formats a `lake` / `lean` subprocess failure including highlighted `✖` / `error:`
+/// lines as well as both `stdout` and `stderr` (since Lake 5 logs build failures to `stdout`).
+pub(crate) fn format_lean_command_failure(header: &str, stdout: &str, stderr: &str) -> String {
+    let highlights = extract_lean_error_lines(stdout, stderr, 30);
+    let mut out = String::from(header);
+    if !highlights.is_empty() {
+        out.push_str("\nerror_lines:\n");
+        out.push_str(&highlights.join("\n"));
+    }
+    out.push_str("\nstdout:\n");
+    if stdout.trim().is_empty() {
+        out.push_str("(empty)");
+    } else {
+        out.push_str(&truncate_lean_diag(stdout.trim_end()));
+    }
+    out.push_str("\nstderr:\n");
+    if stderr.trim().is_empty() {
+        out.push_str("(empty)");
+    } else {
+        out.push_str(&truncate_lean_diag(stderr.trim_end()));
+    }
+    out
+}
+
+fn run_lake_build_with_bin_and_threads(
     lake_bin: &Path,
     dot_anneal_dir: &Path,
     targets: &[&str],
+    threads: Option<usize>,
 ) -> Result<(), String> {
     let mut cmd = build_lake_build_command(lake_bin, dot_anneal_dir);
+    if let Some(n) = threads {
+        cmd.env("LEAN_NUM_THREADS", n.max(1).to_string());
+    }
     for target in targets {
         cmd.arg(target);
     }
@@ -2644,10 +2823,14 @@ fn run_lake_build_with_bin(
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "lake build failed with status {} in {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status,
-            dot_anneal_dir.display()
+        return Err(format_lean_command_failure(
+            &format!(
+                "lake build failed with status {} in {}",
+                output.status,
+                dot_anneal_dir.display()
+            ),
+            &stdout,
+            &stderr,
         ));
     }
     Ok(())
@@ -3120,31 +3303,331 @@ fn acquire_live_lean_oracle_lock() -> (
     (guard, lock_file)
 }
 
+/// Lean's per-process memory cap (`lean -M`, in MiB) for Stage 1 probe
+/// evaluation runs of `oracle/MiriOracleProbe_*.lean`.
+const PROBE_LEAN_MEMORY_MB: &str = "8192";
+
 /// Lean's per-process memory cap (`lean -M`, in MiB) for kernel confirmation
-/// runs of `oracle/MiriOracleConfirm.lean`.
+/// runs of `oracle/MiriOracleConfirm*.lean`.
 const CONFIRM_LEAN_MEMORY_MB: &str = "4096";
 
-/// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB oracle/MiriOracleConfirm.lean`
-/// in `dot_anneal`.
-fn run_lean_confirm_module(
+/// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB <rel_oracle_path>` in `dot_anneal`
+/// with `LEAN_NUM_THREADS=1` so concurrent confirm chunk workers never multiply threads.
+fn run_lean_confirm_file(
     lake_bin: &Path,
     dot_anneal: &Path,
+    rel_oracle_path: &str,
 ) -> Result<std::process::Output, String> {
     Command::new(lake_bin)
         .current_dir(dot_anneal)
+        .env("LEAN_NUM_THREADS", "1")
         .arg("env")
         .arg("lean")
         .arg("-M")
         .arg(CONFIRM_LEAN_MEMORY_MB)
-        .arg("oracle/MiriOracleConfirm.lean")
+        .arg(rel_oracle_path)
         .output()
         .map_err(|err| {
             format!(
                 "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
-                 oracle/MiriOracleConfirm.lean': {err}",
+                 {rel_oracle_path}': {err}",
                 lake_bin.display()
             )
         })
+}
+
+fn sanitize_lean_file_stem(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("item");
+    }
+    if out != raw {
+        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+        for &b in raw.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        out.push_str(&format!("_{h:08x}"));
+    }
+    out
+}
+
+fn clean_oracle_files_with_prefixes(oracle_dir: &Path, prefixes: &[&str]) {
+    let Ok(entries) = fs::read_dir(oracle_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if prefixes.iter().any(|p| name.starts_with(p)) && path.is_file() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Outcome of [`run_isolated_miri_stage`].
+#[derive(Debug)]
+struct IsolatedMiriStage<X> {
+    /// Per-item results for every item whose chunk or per-candidate fallback succeeded.
+    results: BTreeMap<String, X>,
+    /// Per-item isolated diagnostic for every item that failed (or was skipped after
+    /// [`MIRI_FALLBACK_CIRCUIT_BREAKER`] consecutive fallback failures with 0 successes).
+    failed_reasons: BTreeMap<String, String>,
+    /// Diagnostics emitted across failed chunks and fallback attempts.
+    errors: Vec<String>,
+}
+
+/// Runs one chunked `miri-difftest` Lean stage (`Mir.*` build or `MiriOracleProbe`
+/// evaluation) with per-candidate fallback isolation and a circuit breaker.
+fn run_isolated_miri_stage<C, X, K, F>(
+    stage_label: &str,
+    items: &[C],
+    chunk_size: usize,
+    jobs: usize,
+    item_key: K,
+    run_chunk: F,
+) -> IsolatedMiriStage<X>
+where
+    C: Clone + Sync,
+    X: Send,
+    K: Fn(&C) -> &str,
+    F: Fn(usize, bool, &str, &[C]) -> Result<BTreeMap<String, X>, String> + Sync,
+{
+    let chunk_size = chunk_size.max(1);
+    let jobs = jobs.max(1);
+    let mut results: BTreeMap<String, X> = BTreeMap::new();
+    let mut failed_reasons: BTreeMap<String, String> = BTreeMap::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut failed_chunks: Vec<(usize, String, &[C])> = Vec::new();
+
+    let accept = |results: &mut BTreeMap<String, X>,
+                  slice: &[C],
+                  res: Result<BTreeMap<String, X>, String>,
+                  label: &str|
+     -> Result<(), String> {
+        let mut map = res.map_err(|e| format!("{label}: {}", truncate_lean_diag(&e)))?;
+        if let Some(missing) = slice.iter().find(|&c| !map.contains_key(item_key(c))) {
+            return Err(format!(
+                "{label}: Lean stage produced no result for `{}`",
+                item_key(missing)
+            ));
+        }
+        for c in slice {
+            if let Some(x) = map.remove(item_key(c)) {
+                results.insert(item_key(c).to_string(), x);
+            }
+        }
+        Ok(())
+    };
+
+    let chunks: Vec<&[C]> = items.chunks(chunk_size).collect();
+    for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
+        let wave_res: Vec<(usize, String, Result<BTreeMap<String, X>, String>)> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &chunk)| {
+                        let chunk_idx = wave_idx * jobs + i;
+                        let label = format!("{stage_label}_{chunk_idx:03}");
+                        let run_chunk = &run_chunk;
+                        let worker_label = label.clone();
+                        let handle =
+                            s.spawn(move || run_chunk(chunk_idx, false, &worker_label, chunk));
+                        (chunk_idx, label, handle)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(chunk_idx, label, h)| {
+                        let res = h
+                            .join()
+                            .unwrap_or_else(|_| Err("Lean chunk worker panicked".to_string()));
+                        (chunk_idx, label, res)
+                    })
+                    .collect()
+            });
+        for (&chunk, (chunk_idx, label, res)) in wave.iter().zip(wave_res) {
+            if let Err(e) = accept(&mut results, chunk, res, &label) {
+                errors.push(e.clone());
+                failed_chunks.push((chunk_idx, e, chunk));
+            }
+        }
+    }
+
+    let mut fallback_successes = 0usize;
+    let mut fallback_failures = 0usize;
+    let mut skipped_fallbacks = 0usize;
+    let mut first_fallback_err: Option<String> = None;
+
+    for (chunk_idx, chunk_err, chunk) in failed_chunks {
+        if chunk.len() == 1 {
+            let key = item_key(&chunk[0]).to_string();
+            if fallback_successes == 0 {
+                fallback_failures += 1;
+                if first_fallback_err.is_none() {
+                    first_fallback_err = Some(chunk_err.clone());
+                }
+            }
+            failed_reasons.insert(key, chunk_err);
+            continue;
+        }
+        for item in chunk {
+            let key = item_key(item).to_string();
+            if results.contains_key(&key) || failed_reasons.contains_key(&key) {
+                continue;
+            }
+            if fallback_successes == 0 && fallback_failures >= MIRI_FALLBACK_CIRCUIT_BREAKER {
+                skipped_fallbacks += 1;
+                let root_cause = first_fallback_err.as_deref().unwrap_or(chunk_err.as_str());
+                failed_reasons.insert(
+                    key,
+                    format!(
+                        "{stage_label}: per-candidate fallback skipped after \
+                         {MIRI_FALLBACK_CIRCUIT_BREAKER} consecutive fallback failures \
+                         (systematic Lean failure); first failure: {root_cause}"
+                    ),
+                );
+                continue;
+            }
+            let label = format!("{stage_label}Fallback_{}", sanitize_lean_file_stem(&key));
+            let single = std::slice::from_ref(item);
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_chunk(chunk_idx, true, &label, single)
+            }))
+            .unwrap_or_else(|_| Err("Lean fallback worker panicked".to_string()));
+            match accept(&mut results, single, res, &label) {
+                Ok(()) => fallback_successes += 1,
+                Err(e) => {
+                    fallback_failures += 1;
+                    if first_fallback_err.is_none() {
+                        first_fallback_err = Some(e.clone());
+                    }
+                    errors.push(e.clone());
+                    failed_reasons.insert(key, e);
+                }
+            }
+        }
+    }
+    if skipped_fallbacks > 0 {
+        errors.push(format!(
+            "{stage_label}: skipped {skipped_fallbacks} per-candidate fallback run(s) after \
+             {MIRI_FALLBACK_CIRCUIT_BREAKER} consecutive fallback failures (systematic Lean failure)"
+        ));
+    }
+
+    for item in items {
+        let key = item_key(item);
+        if !results.contains_key(key) && !failed_reasons.contains_key(key) {
+            failed_reasons.insert(
+                key.to_string(),
+                format!("{stage_label}: missing result for `{key}`"),
+            );
+        }
+    }
+
+    IsolatedMiriStage {
+        results,
+        failed_reasons,
+        errors,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MiriProbeItemStatus {
+    Present {
+        outcome: AnnealOutcome,
+        panic_frame: Option<String>,
+        panic_message: Option<Vec<u8>>,
+    },
+    MissingProbeLine,
+}
+
+fn parse_miri_probe_chunk_stdout(
+    chunk: &[(OracleItemSpec, String)],
+    stdout: &str,
+) -> Result<BTreeMap<String, MiriProbeItemStatus>, String> {
+    let mut parsed_outcomes = parse_anneal_probe_output(stdout)?;
+    let mut parsed_frames = parse_anneal_panic_frames(stdout)?;
+    let mut parsed_messages = parse_anneal_panic_messages(stdout)?;
+    let mut out = BTreeMap::new();
+    for (item, _) in chunk {
+        if let Some(outcome) = parsed_outcomes.remove(&item.name) {
+            out.insert(
+                item.name.clone(),
+                MiriProbeItemStatus::Present {
+                    outcome,
+                    panic_frame: parsed_frames.remove(&item.name),
+                    panic_message: parsed_messages.remove(&item.name),
+                },
+            );
+        } else {
+            out.insert(item.name.clone(), MiriProbeItemStatus::MissingProbeLine);
+        }
+    }
+    Ok(out)
+}
+
+fn aggregate_miri_probe_stage(
+    surviving_items: &[(OracleItemSpec, String)],
+    chunk_size: usize,
+    lean_jobs: usize,
+    eval_chunk: impl Fn(usize, bool, &str, &[(OracleItemSpec, String)]) -> Result<String, String> + Sync,
+    anneal_outcomes: &mut BTreeMap<String, AnnealOutcome>,
+    anneal_panic_frames: &mut BTreeMap<String, String>,
+    anneal_panic_messages: &mut BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let stage = run_isolated_miri_stage(
+        "MiriOracleProbe",
+        surviving_items,
+        chunk_size,
+        lean_jobs,
+        |(spec, _): &(OracleItemSpec, String)| spec.name.as_str(),
+        |chunk_idx, is_fallback, label, chunk| {
+            let stdout = eval_chunk(chunk_idx, is_fallback, label, chunk)?;
+            parse_miri_probe_chunk_stdout(chunk, &stdout)
+        },
+    );
+    for (item, _) in surviving_items {
+        if let Some(status) = stage.results.get(&item.name) {
+            match status {
+                MiriProbeItemStatus::Present {
+                    outcome,
+                    panic_frame,
+                    panic_message,
+                } => {
+                    anneal_outcomes.insert(item.name.clone(), outcome.clone());
+                    if let Some(frame) = panic_frame {
+                        anneal_panic_frames.insert(item.name.clone(), frame.clone());
+                    }
+                    if let Some(msg) = panic_message {
+                        anneal_panic_messages.insert(item.name.clone(), msg.clone());
+                    }
+                }
+                MiriProbeItemStatus::MissingProbeLine => {
+                    anneal_outcomes.insert(
+                        item.name.clone(),
+                        AnnealOutcome::CaptureOrLeanError(format!(
+                            "Lean probe output omitted ANNEAL_PROBE line for '{}'",
+                            item.name
+                        )),
+                    );
+                }
+            }
+        } else if let Some(err) = stage.failed_reasons.get(&item.name) {
+            anneal_outcomes.insert(item.name.clone(), AnnealOutcome::CaptureOrLeanError(err.clone()));
+        }
+    }
+    stage.errors
 }
 
 /// Whether a failed Lean kernel confirmation run ran out of a resource
@@ -3314,63 +3797,190 @@ fn run_linked_difftest_oracle_pipeline(
     let mut anneal_panic_frames: BTreeMap<String, String> = BTreeMap::new();
     let mut anneal_panic_messages: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
+    clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe", "MiriOracleConfirm"]);
+
     if !present_items.is_empty() {
         let _lean_guard = acquire_live_lean_oracle_lock();
-        run_lake_build_with_bin(
-            &lake_bin,
-            &dot_anneal,
-            &["Mir", "Anneal.Rustc.V2026_06_01.SymbolicEval"],
-        )?;
+        let stage0_threads = resolve_miri_stage0_threads();
+        let lean_jobs = resolve_miri_lean_jobs();
 
-        fs::create_dir_all(&oracle_dir)
-            .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
-        let probe_path = oracle_dir.join("MiriOracleProbe.lean");
-        let probe_src =
-            render_linked_anneal_probe_module(&crate_camel, &present_items, &helper_module_suffixes);
-        fs::write(&probe_path, &probe_src)
-            .map_err(|err| format!("failed to write {}: {}", probe_path.display(), err))?;
-
-        let probe_out = Command::new(&lake_bin)
-            .current_dir(&dot_anneal)
-            .arg("env")
-            .arg("lean")
-            .arg("oracle/MiriOracleProbe.lean")
-            .output()
-            .map_err(|err| {
-                format!(
-                    "failed to execute '{} env lean oracle/MiriOracleProbe.lean': {}",
-                    lake_bin.display(),
-                    err
-                )
-            })?;
-        if !probe_out.status.success() {
-            let stdout = String::from_utf8_lossy(&probe_out.stdout);
-            let stderr = String::from_utf8_lossy(&probe_out.stderr);
-            return Err(format!(
-                "Lean probe evaluation failed in {} ({}):\n{}\n{}",
-                dot_anneal.display(),
-                probe_out.status,
-                stdout,
-                stderr
-            ));
+        // Stage 0: Pre-build only shared base modules (`SymbolicEval`, optional
+        // `Mir.Common`, and reachable helper `Mir.<suffix>` modules). Never pass
+        // the umbrella `"Mir"` target, which fans out across all 800+ corpus
+        // candidate modules simultaneously and triggers cgroup OOM kills.
+        let mut base_targets: Vec<String> =
+            vec!["Anneal.Rustc.V2026_06_01.SymbolicEval".to_string()];
+        if dot_anneal.join("generated/Mir/Common.lean").is_file() {
+            base_targets.push("Mir.Common".to_string());
+        }
+        let mut dedup_helpers: Vec<String> = Vec::new();
+        for helper_suffix in &helper_module_suffixes {
+            let target = format!("Mir.{helper_suffix}");
+            if !base_targets.contains(&target) && !dedup_helpers.contains(&target) {
+                dedup_helpers.push(target);
+            }
+        }
+        if dedup_helpers.len() <= MIRI_PROBE_CHUNK_SIZE {
+            base_targets.extend(dedup_helpers);
+            let base_refs: Vec<&str> = base_targets.iter().map(String::as_str).collect();
+            run_lake_build_with_bin_and_threads(
+                &lake_bin,
+                &dot_anneal,
+                &base_refs,
+                Some(stage0_threads),
+            )?;
+        } else {
+            let base_refs: Vec<&str> = base_targets.iter().map(String::as_str).collect();
+            run_lake_build_with_bin_and_threads(
+                &lake_bin,
+                &dot_anneal,
+                &base_refs,
+                Some(stage0_threads),
+            )?;
+            for helper_chunk in dedup_helpers.chunks(MIRI_PROBE_CHUNK_SIZE) {
+                let helper_refs: Vec<&str> = helper_chunk.iter().map(String::as_str).collect();
+                run_lake_build_with_bin_and_threads(
+                    &lake_bin,
+                    &dot_anneal,
+                    &helper_refs,
+                    Some(lean_jobs),
+                )?;
+            }
         }
 
-        let stdout = String::from_utf8_lossy(&probe_out.stdout);
-        let mut parsed = parse_anneal_probe_output(&stdout)?;
-        anneal_panic_frames = parse_anneal_panic_frames(&stdout)?;
-        anneal_panic_messages = parse_anneal_panic_messages(&stdout)?;
-        for (item, _) in &present_items {
-            if let Some(outcome) = parsed.remove(&item.name) {
-                anneal_outcomes.insert(item.name.clone(), outcome);
-            } else {
+        // Stage 1a: Build corpus candidate `Mir.<cand_suffix>` targets in chunks
+        // of `MIRI_PROBE_CHUNK_SIZE` (sequentially across chunks so `.lake`
+        // metadata never contends, with `LEAN_NUM_THREADS` capped at `<= 4` by
+        // memory/cgroup headroom or `ANNEAL_MIRI_LEAN_JOBS`). A failing chunk
+        // isolates per-candidate with `MIRI_FALLBACK_CIRCUIT_BREAKER`.
+        let mir_chunk_build_threads = if env::var("ANNEAL_MIRI_LEAN_JOBS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .is_some_and(|n| n >= 1)
+        {
+            lean_jobs
+        } else {
+            stage0_threads.min(4)
+        };
+        let mir_build_stage = run_isolated_miri_stage(
+            "MiriMirBuild",
+            &present_items,
+            MIRI_PROBE_CHUNK_SIZE,
+            1,
+            |(spec, _): &(OracleItemSpec, String)| spec.name.as_str(),
+            |_chunk_idx, _is_fallback, _label, chunk| {
+                let mut targets: Vec<String> = Vec::with_capacity(chunk.len());
+                for (item, cand_suffix) in chunk {
+                    let suffix = if cand_suffix.is_empty() {
+                        format!("{crate_camel}.{}", item.name)
+                    } else {
+                        cand_suffix.clone()
+                    };
+                    let target = format!("Mir.{suffix}");
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+                let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+                run_lake_build_with_bin_and_threads(
+                    &lake_bin,
+                    &dot_anneal,
+                    &target_refs,
+                    Some(mir_chunk_build_threads),
+                )?;
+                Ok(chunk
+                    .iter()
+                    .map(|(spec, _)| (spec.name.clone(), ()))
+                    .collect())
+            },
+        );
+        for err in &mir_build_stage.errors {
+            eprintln!("miri-difftest: Stage 1a Lean Mir module build failure: {err}");
+        }
+        let mut surviving_items: Vec<(OracleItemSpec, String)> =
+            Vec::with_capacity(present_items.len());
+        for (item, suffix) in &present_items {
+            if let Some(reason) = mir_build_stage.failed_reasons.get(&item.name) {
                 anneal_outcomes.insert(
                     item.name.clone(),
-                    AnnealOutcome::CaptureOrLeanError(format!(
-                        "Lean probe output omitted ANNEAL_PROBE line for '{}'",
-                        item.name
-                    )),
+                    AnnealOutcome::CaptureOrLeanError(reason.clone()),
                 );
+            } else {
+                surviving_items.push((item.clone(), suffix.clone()));
             }
+        }
+
+        // Stage 1b: Evaluate `oracle/MiriOracleProbe_{chunk_idx:03}.lean` per
+        // surviving chunk across up to `lean_jobs` concurrent workers, each
+        // bounded to `LEAN_NUM_THREADS=1`.
+        if !surviving_items.is_empty() {
+            fs::create_dir_all(&oracle_dir)
+                .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+            clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe"]);
+
+            let probe_errors = aggregate_miri_probe_stage(
+                &surviving_items,
+                MIRI_PROBE_CHUNK_SIZE,
+                lean_jobs,
+                |chunk_idx, is_fallback, _label, chunk| {
+                    let file_name = if is_fallback {
+                        let stem = chunk
+                            .first()
+                            .map(|(s, _)| sanitize_lean_file_stem(&s.name))
+                            .unwrap_or_else(|| format!("chunk_{chunk_idx:03}"));
+                        format!("MiriOracleProbeFallback_{stem}.lean")
+                    } else {
+                        format!("MiriOracleProbe_{chunk_idx:03}.lean")
+                    };
+                    let probe_path = oracle_dir.join(&file_name);
+                    let rel_probe_path = format!("oracle/{file_name}");
+                    let probe_src = render_linked_anneal_probe_module(
+                        &crate_camel,
+                        chunk,
+                        &helper_module_suffixes,
+                    );
+                    fs::write(&probe_path, &probe_src).map_err(|err| {
+                        format!("failed to write {}: {}", probe_path.display(), err)
+                    })?;
+
+                    let probe_out = Command::new(&lake_bin)
+                        .current_dir(&dot_anneal)
+                        .env("LEAN_NUM_THREADS", "1")
+                        .arg("env")
+                        .arg("lean")
+                        .arg("-M")
+                        .arg(PROBE_LEAN_MEMORY_MB)
+                        .arg(&rel_probe_path)
+                        .output()
+                        .map_err(|err| {
+                            format!(
+                                "failed to execute '{} env lean -M {PROBE_LEAN_MEMORY_MB} {rel_probe_path}': {err}",
+                                lake_bin.display()
+                            )
+                        })?;
+                    if !probe_out.status.success() {
+                        let stdout = String::from_utf8_lossy(&probe_out.stdout);
+                        let stderr = String::from_utf8_lossy(&probe_out.stderr);
+                        return Err(format_lean_command_failure(
+                            &format!(
+                                "Lean probe evaluation failed in {} ({}) for {rel_probe_path}",
+                                dot_anneal.display(),
+                                probe_out.status
+                            ),
+                            &stdout,
+                            &stderr,
+                        ));
+                    }
+                    Ok(String::from_utf8_lossy(&probe_out.stdout).into_owned())
+                },
+                &mut anneal_outcomes,
+                &mut anneal_panic_frames,
+                &mut anneal_panic_messages,
+            );
+            for err in &probe_errors {
+                eprintln!("miri-difftest: Stage 1b Lean probe failure: {err}");
+            }
+            clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbeFallback_"]);
         }
     }
 
@@ -3442,89 +4052,165 @@ fn run_linked_difftest_oracle_pipeline(
     } else {
         fs::create_dir_all(&oracle_dir)
             .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+        clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleConfirm"]);
         let confirm_path = oracle_dir.join("MiriOracleConfirm.lean");
-        let write_confirm_module = |entries: &[(OracleItemSpec, String, AnnealOutcome)]| {
-            let entry_specs: Vec<OracleItemSpec> =
-                entries.iter().map(|(spec, _, _)| spec.clone()).collect();
-            let entry_helper_suffixes = confirm_helper_module_suffixes(
-                &lib_rs,
-                &crate_camel,
-                &subject_pairs,
-                &helper_module_suffixes,
-                &entry_specs,
-            );
-            let src = render_linked_anneal_confirm_module(
-                &crate_camel,
-                entries,
-                &entry_helper_suffixes,
-                &anneal_panic_frames,
-                &anneal_panic_messages,
-            )?;
-            fs::write(&confirm_path, &src)
-                .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))
-        };
-        write_confirm_module(&to_confirm)?;
+        let write_confirm_module_at =
+            |dest: &Path, entries: &[(OracleItemSpec, String, AnnealOutcome)]| -> Result<(), String> {
+                let entry_specs: Vec<OracleItemSpec> =
+                    entries.iter().map(|(spec, _, _)| spec.clone()).collect();
+                let entry_helper_suffixes = confirm_helper_module_suffixes(
+                    &lib_rs,
+                    &crate_camel,
+                    &subject_pairs,
+                    &helper_module_suffixes,
+                    &entry_specs,
+                );
+                let src = render_linked_anneal_confirm_module(
+                    &crate_camel,
+                    entries,
+                    &entry_helper_suffixes,
+                    &anneal_panic_frames,
+                    &anneal_panic_messages,
+                )?;
+                fs::write(dest, &src)
+                    .map_err(|err| format!("failed to write {}: {}", dest.display(), err))
+            };
 
         let _lean_guard = acquire_live_lean_oracle_lock();
-        let batch_out = run_lean_confirm_module(&lake_bin, &dot_anneal)?;
-        if batch_out.status.success() {
-            Some(confirm_path.clone())
-        } else {
-            // Re-confirm one item at a time. An item whose kernel confirmation
-            // exhausts a resource (`lean -M`, heartbeats, recursion depth, or a
-            // signal) is reported with `kernel_confirmed = false`; any other
-            // failure means the kernel rejected a theorem that the compiled
-            // probe produced (or the module did not elaborate), which is a
-            // harness inconsistency, so the run still fails closed.
-            let mut confirmed_items = Vec::new();
-            let mut unconfirmed_names = BTreeSet::new();
-            let single_runs: Vec<(&(OracleItemSpec, String, AnnealOutcome), std::process::Output)> =
-                if to_confirm.len() == 1 {
-                    vec![(&to_confirm[0], batch_out)]
-                } else {
-                    let mut runs = Vec::with_capacity(to_confirm.len());
-                    for entry in &to_confirm {
-                        write_confirm_module(std::slice::from_ref(entry))?;
-                        runs.push((entry, run_lean_confirm_module(&lake_bin, &dot_anneal)?));
+        let lean_jobs = resolve_miri_lean_jobs().max(1);
+        let confirm_chunks: Vec<&[(OracleItemSpec, String, AnnealOutcome)]> =
+            to_confirm.chunks(MIRI_CONFIRM_CHUNK_SIZE).collect();
+
+        let mut confirmed_items: Vec<(OracleItemSpec, String, AnnealOutcome)> =
+            Vec::with_capacity(to_confirm.len());
+        let mut unconfirmed_names: BTreeSet<String> = BTreeSet::new();
+
+        for (wave_idx, wave) in confirm_chunks.chunks(lean_jobs).enumerate() {
+            let mut prepared_wave: Vec<(usize, String, &[(OracleItemSpec, String, AnnealOutcome)])> =
+                Vec::with_capacity(wave.len());
+            for (i, &chunk) in wave.iter().enumerate() {
+                let chunk_idx = wave_idx * lean_jobs + i;
+                let file_name = format!("MiriOracleConfirm_{chunk_idx:03}.lean");
+                write_confirm_module_at(&oracle_dir.join(&file_name), chunk)?;
+                prepared_wave.push((chunk_idx, format!("oracle/{file_name}"), chunk));
+            }
+            let wave_outputs: Vec<Result<std::process::Output, String>> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = prepared_wave
+                        .iter()
+                        .map(|(_idx, rel_path, _chunk)| {
+                            let lake_bin = &lake_bin;
+                            let dot_anneal = &dot_anneal;
+                            s.spawn(move || run_lean_confirm_file(lake_bin, dot_anneal, rel_path))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                Err("Lean confirm chunk worker panicked".to_string())
+                            })
+                        })
+                        .collect()
+                });
+
+            for ((_chunk_idx, _rel_path, chunk), chunk_out_res) in
+                prepared_wave.into_iter().zip(wave_outputs)
+            {
+                let batch_out = match chunk_out_res {
+                    Ok(out) => out,
+                    Err(e) => {
+                        clean_oracle_files_with_prefixes(
+                            &oracle_dir,
+                            &["MiriOracleConfirm_", "MiriOracleConfirmFallback_"],
+                        );
+                        return Err(e);
                     }
-                    runs
                 };
-            for (entry, out) in single_runs {
-                if out.status.success() {
-                    confirmed_items.push(entry.clone());
+                if batch_out.status.success() {
+                    confirmed_items.extend_from_slice(chunk);
                     continue;
                 }
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let signal_terminated = out.status.code().is_none();
-                if lean_confirm_failure_is_resource_exhaustion(
-                    signal_terminated,
-                    &format!("{stdout}\n{stderr}"),
-                ) {
-                    unconfirmed_names.insert(entry.0.name.clone());
-                } else {
-                    return Err(format!(
-                        "Lean kernel confirmation rejected `{}` in {} ({}):\n{}\n{}",
-                        entry.0.name,
-                        confirm_path.display(),
-                        out.status,
-                        stdout,
-                        stderr
-                    ));
+                // Re-confirm one item at a time for this failing chunk. An item
+                // whose kernel confirmation exhausts a resource (`lean -M`,
+                // heartbeats, recursion depth, or a signal) is reported with
+                // `kernel_confirmed = false`; any other failure means the kernel
+                // rejected a theorem that the compiled probe produced (or the
+                // module did not elaborate), which is a harness inconsistency,
+                // so the run still fails closed.
+                let single_runs: Vec<(&(OracleItemSpec, String, AnnealOutcome), std::process::Output)> =
+                    if chunk.len() == 1 {
+                        vec![(&chunk[0], batch_out)]
+                    } else {
+                        let mut runs = Vec::with_capacity(chunk.len());
+                        for entry in chunk {
+                            let fb_name = format!(
+                                "MiriOracleConfirmFallback_{}.lean",
+                                sanitize_lean_file_stem(&entry.0.name)
+                            );
+                            write_confirm_module_at(
+                                &oracle_dir.join(&fb_name),
+                                std::slice::from_ref(entry),
+                            )?;
+                            runs.push((
+                                entry,
+                                run_lean_confirm_file(
+                                    &lake_bin,
+                                    &dot_anneal,
+                                    &format!("oracle/{fb_name}"),
+                                )?,
+                            ));
+                        }
+                        runs
+                    };
+                for (entry, out) in single_runs {
+                    if out.status.success() {
+                        confirmed_items.push(entry.clone());
+                        continue;
+                    }
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let signal_terminated = out.status.code().is_none();
+                    if lean_confirm_failure_is_resource_exhaustion(
+                        signal_terminated,
+                        &format!("{stdout}\n{stderr}"),
+                    ) {
+                        unconfirmed_names.insert(entry.0.name.clone());
+                    } else {
+                        clean_oracle_files_with_prefixes(
+                            &oracle_dir,
+                            &["MiriOracleConfirm_", "MiriOracleConfirmFallback_"],
+                        );
+                        return Err(format_lean_command_failure(
+                            &format!(
+                                "Lean kernel confirmation rejected `{}` in {} ({})",
+                                entry.0.name,
+                                confirm_path.display(),
+                                out.status
+                            ),
+                            &stdout,
+                            &stderr,
+                        ));
+                    }
                 }
             }
-            for rep in &mut reports {
-                if unconfirmed_names.contains(&rep.name) {
-                    rep.kernel_confirmed = false;
-                }
+        }
+
+        clean_oracle_files_with_prefixes(
+            &oracle_dir,
+            &["MiriOracleConfirm_", "MiriOracleConfirmFallback_"],
+        );
+        for rep in &mut reports {
+            if unconfirmed_names.contains(&rep.name) {
+                rep.kernel_confirmed = false;
             }
-            if confirmed_items.is_empty() {
-                let _ = fs::remove_file(&confirm_path);
-                None
-            } else {
-                write_confirm_module(&confirmed_items)?;
-                Some(confirm_path.clone())
-            }
+        }
+        if confirmed_items.is_empty() {
+            let _ = fs::remove_file(&confirm_path);
+            None
+        } else {
+            write_confirm_module_at(&confirm_path, &confirmed_items)?;
+            Some(confirm_path.clone())
         }
     };
 
@@ -8598,5 +9284,319 @@ pub fn cand_shadow() -> u32 {
             ],
             "helpers: {helpers:?}"
         );
+    }
+
+    #[test]
+    fn miri_lean_jobs_and_cgroup_memory_limits_handle_thresholds_overrides_and_stat() {
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        // 32–36 GiB capsules clamp to 1 worker regardless of available memory.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(32 * GIB_KIB), Some(30 * GIB_KIB)),
+            1
+        );
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(36 * GIB_KIB), Some(35 * GIB_KIB)),
+            1
+        );
+        // Large host with < 24 GiB headroom -> 1 worker.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(128 * GIB_KIB), Some(20 * GIB_KIB)),
+            1
+        );
+        // Up to 64 GiB total or < 48 GiB headroom -> 2 workers.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(64 * GIB_KIB), Some(60 * GIB_KIB)),
+            2
+        );
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(128 * GIB_KIB), Some(40 * GIB_KIB)),
+            2
+        );
+        // > 64 GiB total and >= 48 GiB headroom -> 4 workers.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(128 * GIB_KIB), Some(96 * GIB_KIB)),
+            4
+        );
+        // Missing memory info defaults conservatively to 1.
+        assert_eq!(miri_lean_jobs_for_memory(None, None), 1);
+        assert_eq!(miri_lean_jobs_for_memory(Some(128 * GIB_KIB), None), 1);
+
+        // `ANNEAL_MIRI_LEAN_JOBS` overrides memory heuristics and caps at 8.
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("6"), Some(32 * GIB_KIB), Some(16 * GIB_KIB)),
+            6
+        );
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("24"), Some(32 * GIB_KIB), Some(16 * GIB_KIB)),
+            8
+        );
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("0"), Some(64 * GIB_KIB), Some(50 * GIB_KIB)),
+            2
+        );
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("bogus"), Some(64 * GIB_KIB), Some(50 * GIB_KIB)),
+            2
+        );
+
+        // `cgroup_memory_limits_kib` walks hierarchy, handles `"max"`, and uses `anon + shmem`.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!(
+            "anneal-miri-cgroup-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let scope = root.join("user.slice/app.slice/miri.scope");
+        fs::create_dir_all(&scope).unwrap();
+        fs::write(root.join("user.slice/memory.max"), "max\n").unwrap();
+        fs::write(
+            root.join("user.slice/app.slice/memory.max"),
+            format!("{}\n", 48 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("user.slice/app.slice/memory.current"),
+            format!("{}\n", 18 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            scope.join("memory.max"),
+            format!("{}\n", 40 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            scope.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\n",
+                4 * GIB_KIB * 1024,
+                28 * GIB_KIB * 1024,
+                2 * GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+        let (limit, headroom) =
+            cgroup_memory_limits_kib(&root, "0::/user.slice/app.slice/miri.scope\n");
+        assert_eq!(limit, Some(40 * GIB_KIB));
+        // Leaf headroom = 40 - (4 + 2) = 34 GiB; app.slice headroom (via memory.current) = 48 - 18 = 30 GiB.
+        assert_eq!(headroom, Some(30 * GIB_KIB));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunked_miri_probe_stage_partitions_over_64_items_and_aggregates_frames_messages_and_omissions()
+     {
+        let items: Vec<(OracleItemSpec, String)> = (0..150)
+            .map(|i| {
+                let name = format!("cand_{i:03}");
+                (
+                    OracleItemSpec::with_fuel(name.clone(), 400),
+                    format!("MiriDiffCorpus.{name}"),
+                )
+            })
+            .collect();
+
+        let observed_chunks: std::sync::Mutex<Vec<(usize, bool, usize)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut outcomes = BTreeMap::new();
+        let mut frames = BTreeMap::new();
+        let mut messages = BTreeMap::new();
+
+        let errors = aggregate_miri_probe_stage(
+            &items,
+            MIRI_PROBE_CHUNK_SIZE,
+            2,
+            |chunk_idx, is_fallback, _label, chunk| {
+                observed_chunks
+                    .lock()
+                    .unwrap()
+                    .push((chunk_idx, is_fallback, chunk.len()));
+                let mut out = String::new();
+                for (spec, _) in chunk {
+                    if spec.name == "cand_130" {
+                        // Deliberately omit ANNEAL_PROBE line for cand_130 in chunk 2.
+                        continue;
+                    } else if spec.name == "cand_070" {
+                        out.push_str(&format!(
+                            "ANNEAL_PROBE\t{}\tpanic\tsrc/lib.rs:70:5:70:20\n\
+                             ANNEAL_PANIC_FRAME\t{}\tmiri_diff_corpus::cand_070\n\
+                             ANNEAL_PANIC_MESSAGE\t{}\t[98, 111, 111, 109]\n",
+                            spec.name, spec.name, spec.name
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "ANNEAL_PROBE\t{}\tpass:scalar:42:4\tnone\n",
+                            spec.name
+                        ));
+                    }
+                }
+                Ok(out)
+            },
+            &mut outcomes,
+            &mut frames,
+            &mut messages,
+        );
+
+        assert!(errors.is_empty(), "unexpected probe stage errors: {errors:?}");
+        let mut recorded = observed_chunks.into_inner().unwrap();
+        recorded.sort_by_key(|&(idx, _, _)| idx);
+        assert_eq!(
+            recorded,
+            vec![(0, false, 64), (1, false, 64), (2, false, 22)],
+            "150 items must split into 64 + 64 + 22 chunks without fallback"
+        );
+        assert_eq!(outcomes.len(), 150);
+        assert_eq!(
+            outcomes.get("cand_000"),
+            Some(&AnnealOutcome::PassScalar {
+                bits: 42,
+                size_bytes: 4
+            })
+        );
+        assert!(matches!(
+            outcomes.get("cand_070"),
+            Some(AnnealOutcome::Panic { .. })
+        ));
+        assert_eq!(
+            frames.get("cand_070").map(String::as_str),
+            Some("miri_diff_corpus::cand_070")
+        );
+        assert_eq!(messages.get("cand_070").map(Vec::as_slice), Some(&b"boom"[..]));
+        match outcomes.get("cand_130") {
+            Some(AnnealOutcome::CaptureOrLeanError(msg)) => {
+                assert!(
+                    msg.contains("Lean probe output omitted ANNEAL_PROBE line for 'cand_130'"),
+                    "unexpected missing-probe error: {msg}"
+                );
+            }
+            other => panic!("expected CaptureOrLeanError for omitted probe line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn isolated_miri_stage_isolates_single_bad_candidate_and_trips_circuit_breaker_on_systematic_failure()
+     {
+        // 1. Single bad candidate in chunk 0 (out of 70 items across 2 chunks) is isolated
+        //    to CaptureOrLeanError with stdout + stderr `✖` / `error:` diagnostics while all
+        //    other 69 candidates succeed.
+        let items: Vec<(OracleItemSpec, String)> = (0..70)
+            .map(|i| {
+                let name = format!("item_{i:03}");
+                (
+                    OracleItemSpec::with_fuel(name.clone(), 200),
+                    format!("MiriDiffCorpus.{name}"),
+                )
+            })
+            .collect();
+
+        let stage = run_isolated_miri_stage(
+            "MiriMirBuild",
+            &items,
+            MIRI_PROBE_CHUNK_SIZE,
+            1,
+            |(spec, _)| spec.name.as_str(),
+            |_chunk_idx, _is_fallback, _label, chunk| {
+                if chunk.iter().any(|(s, _)| s.name == "item_017") {
+                    let stdout = (0..25)
+                        .map(|k| format!("✔ [{k}/64] Built Mir.MiriDiffCorpus.ok_{k}"))
+                        .chain([
+                            "✖ [25/64] Building Mir.MiriDiffCorpus.item_017".to_string(),
+                            "error: .anneal/generated/Mir/MiriDiffCorpus/item_017.lean:12:4: type mismatch".to_string(),
+                        ])
+                        .chain((26..55).map(|k| format!("info: trailing build line {k}")))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let stderr = "error: Lake build failed with 1 target error";
+                    return Err(format_lean_command_failure(
+                        "lake build failed with status exit status: 1",
+                        &stdout,
+                        stderr,
+                    ));
+                }
+                Ok(chunk.iter().map(|(s, _)| (s.name.clone(), ())).collect())
+            },
+        );
+        assert_eq!(stage.results.len(), 69);
+        assert_eq!(stage.failed_reasons.len(), 1);
+        let bad_diag = stage
+            .failed_reasons
+            .get("item_017")
+            .expect("item_017 must fail");
+        assert!(
+            bad_diag.contains("✖ [25/64] Building Mir.MiriDiffCorpus.item_017"),
+            "stdout `✖` line in middle of log must be preserved: {bad_diag}"
+        );
+        assert!(
+            bad_diag.contains("item_017.lean:12:4: type mismatch"),
+            "stdout `error:` line in middle of log must be preserved: {bad_diag}"
+        );
+        assert!(
+            bad_diag.contains("Lake build failed with 1 target error"),
+            "stderr `error:` line must be preserved: {bad_diag}"
+        );
+
+        // 2. Systematic failure across 20 items (chunk_size = 8 -> 3 chunks) trips circuit
+        //    breaker after `MIRI_FALLBACK_CIRCUIT_BREAKER` (4) consecutive fallback failures
+        //    with 0 successes: total invocations = 3 chunks + 4 fallbacks = 7 (not 3 + 20).
+        let sys_items: Vec<(OracleItemSpec, String)> = (0..20)
+            .map(|i| {
+                let name = format!("sys_{i:02}");
+                (OracleItemSpec::with_fuel(name.clone(), 200), name)
+            })
+            .collect();
+        let calls = AtomicUsize::new(0);
+        let sys_stage: IsolatedMiriStage<()> = run_isolated_miri_stage(
+            "MiriOracleProbe",
+            &sys_items,
+            8,
+            2,
+            |(spec, _)| spec.name.as_str(),
+            |_chunk_idx, _is_fallback, _label, _chunk| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(format_lean_command_failure(
+                    "lake env lean failed",
+                    "✖ broken toolchain",
+                    "error: unknown package `Trusted`",
+                ))
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3 + MIRI_FALLBACK_CIRCUIT_BREAKER,
+            "expected 3 chunk runs + {MIRI_FALLBACK_CIRCUIT_BREAKER} fallback runs before circuit breaker"
+        );
+        assert!(sys_stage.results.is_empty());
+        assert_eq!(sys_stage.failed_reasons.len(), 20);
+        assert!(
+            sys_stage
+                .failed_reasons
+                .get("sys_19")
+                .is_some_and(|r| r.contains("consecutive fallback failures")
+                    && r.contains("unknown package `Trusted`"))
+        );
+
+        // 3. Stale `MiriOracleProbe*` and `MiriOracleConfirm*` artifacts are cleaned without
+        //    touching unrelated files.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_oracle = env::temp_dir().join(format!(
+            "anneal-miri-oracle-clean-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp_oracle).unwrap();
+        fs::write(tmp_oracle.join("MiriOracleProbe.lean"), "-- old").unwrap();
+        fs::write(tmp_oracle.join("MiriOracleProbe_007.olean"), "old").unwrap();
+        fs::write(tmp_oracle.join("MiriOracleConfirm_001.lean"), "-- old").unwrap();
+        fs::write(tmp_oracle.join("KeepMe.txt"), "keep").unwrap();
+        clean_oracle_files_with_prefixes(&tmp_oracle, &["MiriOracleProbe", "MiriOracleConfirm"]);
+        assert!(!tmp_oracle.join("MiriOracleProbe.lean").exists());
+        assert!(!tmp_oracle.join("MiriOracleProbe_007.olean").exists());
+        assert!(!tmp_oracle.join("MiriOracleConfirm_001.lean").exists());
+        assert!(tmp_oracle.join("KeepMe.txt").is_file());
+        let _ = fs::remove_dir_all(&tmp_oracle);
     }
 }

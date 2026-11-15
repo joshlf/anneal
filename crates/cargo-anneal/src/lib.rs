@@ -2589,6 +2589,210 @@ pub fn run_lake_verify_targets(dot_anneal_dir: &Path, targets: &[String]) -> Res
     Ok(())
 }
 
+/// Parses `(MemTotal, MemAvailable)` in KiB from `/proc/meminfo` contents.
+///
+/// When `MemAvailable:` is absent (as on older kernels), falls back to
+/// `MemFree: + Cached:`.
+pub fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str| {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    let total = field("MemTotal:");
+    let avail = field("MemAvailable:").or_else(|| {
+        field("MemFree:").map(|free| free.saturating_add(field("Cached:").unwrap_or(0)))
+    });
+    (total, avail)
+}
+
+fn read_u64_file(path: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "max" {
+        return None;
+    }
+    trimmed.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn min_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+/// Parses non-reclaimable working-set usage (`anon + shmem`, in bytes) from
+/// cgroup v2 `memory.stat` contents. Returns `None` if neither `anon` nor
+/// `shmem` is present.
+pub fn parse_cgroup_memory_stat_used_bytes(stat_text: &str) -> Option<u64> {
+    let mut anon: Option<u64> = None;
+    let mut shmem: Option<u64> = None;
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(val_str) = parts.next() else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        match key {
+            "anon" => anon = val_str.parse::<u64>().ok(),
+            "shmem" => shmem = val_str.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    if anon.is_none() && shmem.is_none() {
+        None
+    } else {
+        Some(anon.unwrap_or(0).saturating_add(shmem.unwrap_or(0)))
+    }
+}
+
+/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 `memory.max`
+/// between this process's cgroup (`0::<rel>` in `proc_self_cgroup`) and
+/// `cgroup_root`, where headroom subtracts non-reclaimable `anon + shmem` from
+/// `memory.stat` (falling back to `memory.current` when `memory.stat` is absent).
+pub fn cgroup_memory_limits_kib(
+    cgroup_root: &Path,
+    proc_self_cgroup: &str,
+) -> (Option<u64>, Option<u64>) {
+    if !cgroup_root.is_dir() {
+        return (None, None);
+    }
+    let Some(raw_rel) = proc_self_cgroup
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("0::"))
+    else {
+        return (None, None);
+    };
+    let rel = raw_rel
+        .trim()
+        .strip_suffix(" (deleted)")
+        .unwrap_or(raw_rel.trim())
+        .trim()
+        .trim_start_matches('/');
+    if Path::new(rel).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return (None, None);
+    }
+
+    let mut dir = if rel.is_empty() {
+        cgroup_root.to_path_buf()
+    } else {
+        cgroup_root.join(rel)
+    };
+
+    let read_level_used = |d: &Path| -> Option<u64> {
+        fs::read_to_string(d.join("memory.stat"))
+            .ok()
+            .and_then(|s| parse_cgroup_memory_stat_used_bytes(&s))
+            .or_else(|| read_u64_file(&d.join("memory.current")))
+    };
+
+    let mut leaf_used_bytes: Option<u64> = None;
+    let mut limit_kib: Option<u64> = None;
+    let mut headroom_kib: Option<u64> = None;
+    while dir.starts_with(cgroup_root) {
+        if dir.is_dir() {
+            let lvl_used = read_level_used(&dir);
+            if leaf_used_bytes.is_none() && lvl_used.is_some() {
+                leaf_used_bytes = lvl_used;
+            }
+            if let Some(max) = read_u64_file(&dir.join("memory.max")) {
+                let used = lvl_used.or(leaf_used_bytes).unwrap_or(0);
+                limit_kib = min_opt_u64(limit_kib, Some(max / 1024));
+                headroom_kib = min_opt_u64(headroom_kib, Some(max.saturating_sub(used) / 1024));
+            }
+        }
+        if dir == cgroup_root || !dir.pop() {
+            break;
+        }
+    }
+    (limit_kib, headroom_kib)
+}
+
+/// Computes the default Lake worker concurrency (`LEAN_NUM_THREADS`) from
+/// effective total / available memory (in KiB) and logical CPU count:
+/// `(effective_avail_mib / 1536).clamp(1, 6)` bounded by
+/// `(effective_total_mib / 2048).max(1)` and `cpu_cores`, defaulting to `2`
+/// when memory info is unavailable.
+pub fn resolve_default_lake_jobs(
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> usize {
+    let cpu_cap = cpu_cores.clamp(1, 6);
+    if total_kib.is_none() && avail_kib.is_none() {
+        return 2.min(cpu_cap);
+    }
+    let by_avail = avail_kib
+        .map(|k| ((k / 1024) / 1536).clamp(1, 6) as usize)
+        .unwrap_or(2);
+    let by_total = total_kib
+        .map(|k| ((k / 1024) / 2048).clamp(1, 6) as usize)
+        .unwrap_or(6);
+    by_avail.min(by_total).min(cpu_cap)
+}
+
+/// Resolves the `LEAN_NUM_THREADS` value that `build_lake_build_command` should
+/// set given `CARGO_ANNEAL_LAKE_JOBS`, whether `LEAN_NUM_THREADS` is already
+/// present in the caller's environment, and effective memory/CPU budgets.
+///
+/// - When `CARGO_ANNEAL_LAKE_JOBS` parses to an integer `>= 1`, returns
+///   `Some(parsed.min(16))`.
+/// - Otherwise, if `lean_num_threads_is_set` is `true`, returns `None` so the
+///   caller's explicit `LEAN_NUM_THREADS` is preserved.
+/// - Otherwise, returns `Some(resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores))`.
+pub fn resolve_lake_build_threads_env(
+    cargo_anneal_lake_jobs: Option<&str>,
+    lean_num_threads_is_set: bool,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> Option<usize> {
+    if let Some(raw) = cargo_anneal_lake_jobs
+        && let Ok(parsed) = raw.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return Some(parsed.min(16));
+    }
+    if lean_num_threads_is_set {
+        return None;
+    }
+    Some(resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores))
+}
+
+/// Probes host `/proc/meminfo` intersected with `/proc/self/cgroup` (`memory.max`
+/// and `memory.stat` `anon + shmem`) in KiB.
+pub fn probe_effective_memory_kib() -> (Option<u64>, Option<u64>) {
+    let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
+        .map(|s| parse_meminfo_kib(&s))
+        .unwrap_or((None, None));
+    if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
+        let (cg_limit, cg_headroom) =
+            cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
+        total_kib = min_opt_u64(total_kib, cg_limit);
+        avail_kib = min_opt_u64(avail_kib, cg_headroom);
+    }
+    (total_kib, avail_kib)
+}
+
 /// Lake environment variables that `cargo anneal` sets for `lake build` unless
 /// the caller has already set them.
 ///
@@ -2606,17 +2810,56 @@ pub const LAKE_CACHE_ENV_DEFAULTS: &[(&str, &str)] = &[
     ("LAKE_RESTORE_ARTIFACTS", "true"),
 ];
 
-/// Build the `lake build` command for `dot_anneal_dir`, applying
-/// `LAKE_CACHE_ENV_DEFAULTS` for variables the environment leaves unset.
-pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Command {
+fn build_lake_build_command_with_inputs(
+    lake_bin: &Path,
+    dot_anneal_dir: &Path,
+    is_cache_env_set: impl Fn(&str) -> bool,
+    cargo_lake_jobs: Option<&str>,
+    lean_threads_set: bool,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> Command {
     let mut cmd = Command::new(lake_bin);
     cmd.arg("build").current_dir(dot_anneal_dir);
     for (key, value) in LAKE_CACHE_ENV_DEFAULTS {
-        if env::var_os(key).is_none() {
+        if !is_cache_env_set(key) {
             cmd.env(key, value);
         }
     }
+    if let Some(jobs) = resolve_lake_build_threads_env(
+        cargo_lake_jobs,
+        lean_threads_set,
+        total_kib,
+        avail_kib,
+        cpu_cores,
+    ) {
+        cmd.env("LEAN_NUM_THREADS", jobs.to_string());
+    }
     cmd
+}
+
+/// Build the `lake build` command for `dot_anneal_dir`, applying
+/// `LAKE_CACHE_ENV_DEFAULTS` for variables the environment leaves unset and
+/// bounding Lake worker concurrency via `LEAN_NUM_THREADS` (note: Lean v4.34.1
+/// `lake build` has no `-j` CLI flag).
+pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Command {
+    let cargo_lake_jobs = env::var("CARGO_ANNEAL_LAKE_JOBS").ok();
+    let lean_threads_set = env::var_os("LEAN_NUM_THREADS").is_some();
+    let (total_kib, avail_kib) = probe_effective_memory_kib();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    build_lake_build_command_with_inputs(
+        lake_bin,
+        dot_anneal_dir,
+        |key| env::var_os(key).is_some(),
+        cargo_lake_jobs.as_deref(),
+        lean_threads_set,
+        total_kib,
+        avail_kib,
+        cpu_cores,
+    )
 }
 
 pub(crate) fn run_trusted_boundary_verify_audit(
@@ -3193,7 +3436,307 @@ mod tests {
                 );
             }
         }
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["build".to_string()]);
+        assert!(
+            !args.iter().any(|a| a.starts_with("-j")),
+            "Lean v4.34.1 `lake build` has no `-j` CLI flag: {args:?}"
+        );
+        if env::var("CARGO_ANNEAL_LAKE_JOBS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .is_some_and(|n| n >= 1)
+        {
+            assert!(
+                envs.iter().any(|(k, v)| k == "LEAN_NUM_THREADS" && v.is_some()),
+                "CARGO_ANNEAL_LAKE_JOBS must set LEAN_NUM_THREADS on the command"
+            );
+        } else if env::var_os("LEAN_NUM_THREADS").is_some() {
+            assert!(
+                !envs.iter().any(|(k, _)| k == "LEAN_NUM_THREADS"),
+                "explicit caller LEAN_NUM_THREADS must be preserved when CARGO_ANNEAL_LAKE_JOBS is unset"
+            );
+        } else {
+            assert!(
+                envs.iter().any(|(k, v)| {
+                    k == "LEAN_NUM_THREADS"
+                        && v.as_deref()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .is_some_and(|n| (1..=6).contains(&n))
+                }),
+                "default LEAN_NUM_THREADS in 1..=6 must be set when unset in env: {envs:?}"
+            );
+        }
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/ws/.anneal")));
+    }
+
+    #[test]
+    fn default_lake_jobs_and_cgroup_memory_clamping_handle_stat_max_and_overrides() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const MIB_KIB: u64 = 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        // 1. `parse_meminfo_kib` reads MemTotal + MemAvailable and falls back to MemFree + Cached.
+        assert_eq!(
+            parse_meminfo_kib(
+                "MemTotal:       19996672 kB\nMemFree:         2000000 kB\nMemAvailable:   15631360 kB\n"
+            ),
+            (Some(19_996_672), Some(15_631_360))
+        );
+        assert_eq!(
+            parse_meminfo_kib("MemTotal: 8388608 kB\nMemFree: 1048576 kB\nCached: 2097152 kB\n"),
+            (Some(8_388_608), Some(3_145_728))
+        );
+        assert_eq!(parse_meminfo_kib("unparseable\n"), (None, None));
+
+        // 2. `resolve_default_lake_jobs` clamps by available memory (1536 MiB/job in 1..=6),
+        //    total memory (2048 MiB/job), and CPU cores, defaulting to 2 when memory is unknown.
+        assert_eq!(resolve_default_lake_jobs(None, None, 8), 2);
+        assert_eq!(resolve_default_lake_jobs(None, None, 1), 1);
+        assert_eq!(
+            resolve_default_lake_jobs(Some(16 * GIB_KIB), Some(1024 * MIB_KIB), 8),
+            1,
+            "< 1536 MiB available must clamp to 1 job"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(16 * GIB_KIB), Some(3072 * MIB_KIB), 8),
+            2,
+            "3072 MiB available -> 2 jobs"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(16 * GIB_KIB), Some(6144 * MIB_KIB), 8),
+            4,
+            "6144 MiB available -> 4 jobs"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(32 * GIB_KIB), Some(24 * GIB_KIB), 8),
+            6,
+            ">= 9 GiB available on >= 12 GiB host clamps at 6 jobs"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(4 * GIB_KIB), Some(16 * GIB_KIB), 8),
+            2,
+            "total memory cap (4096 / 2048 = 2) bounds jobs even when avail is larger"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(32 * GIB_KIB), Some(24 * GIB_KIB), 3),
+            3,
+            "CPU core count bounds jobs"
+        );
+
+        // 3. `resolve_lake_build_threads_env`: CARGO_ANNEAL_LAKE_JOBS overrides (capped at 16),
+        //    invalid values fall through, and explicit caller LEAN_NUM_THREADS is preserved.
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("5"), true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            Some(5)
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("32"), false, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            Some(16),
+            "CARGO_ANNEAL_LAKE_JOBS must cap at 16"
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("0"), true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            None,
+            "CARGO_ANNEAL_LAKE_JOBS=0 is invalid and must preserve caller LEAN_NUM_THREADS"
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("not-a-number"), true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            None
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(None, true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            None,
+            "caller LEAN_NUM_THREADS must be preserved when CARGO_ANNEAL_LAKE_JOBS is unset"
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(None, false, Some(16 * GIB_KIB), Some(6144 * MIB_KIB), 8),
+            Some(4)
+        );
+
+        // 4. `cgroup_memory_limits_kib` walks from leaf up to cgroup_root, handles `"max"`,
+        //    subtracts `anon + shmem` from `memory.stat` (ignoring reclaimable `file` cache),
+        //    and falls back to `memory.current` when `memory.stat` is absent.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cg_root = env::temp_dir().join(format!(
+            "cargo-anneal-cgroup-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let slice_dir = cg_root.join("user.slice");
+        let app_dir = slice_dir.join("app.slice");
+        let scope_dir = app_dir.join("lean.scope");
+        fs::create_dir_all(&scope_dir).expect("create cgroup test hierarchy");
+
+        // Root and app.slice have `"max"` (unbounded).
+        fs::write(cg_root.join("memory.max"), "max\n").unwrap();
+        fs::write(app_dir.join("memory.max"), "max\n").unwrap();
+        // user.slice has 16 GiB max and no memory.stat, falling back to memory.current = 10 GiB -> 6 GiB headroom.
+        fs::write(slice_dir.join("memory.max"), format!("{}\n", 16 * GIB_KIB * 1024)).unwrap();
+        fs::write(
+            slice_dir.join("memory.current"),
+            format!("{}\n", 10 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        // lean.scope has 12 GiB max (tightest limit), memory.current = 11 GiB (due to 9 GiB file cache),
+        // but memory.stat has anon = 1 GiB + shmem = 1 GiB -> 2 GiB non-reclaimable -> 10 GiB headroom at leaf.
+        fs::write(scope_dir.join("memory.max"), format!("{}\n", 12 * GIB_KIB * 1024)).unwrap();
+        fs::write(
+            scope_dir.join("memory.current"),
+            format!("{}\n", 11 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            scope_dir.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\n",
+                GIB_KIB * 1024,
+                9 * GIB_KIB * 1024,
+                GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+
+        let (limit_kib, headroom_kib) = cgroup_memory_limits_kib(
+            &cg_root,
+            "1:name=systemd:/foo\n0::/user.slice/app.slice/lean.scope (deleted)\n",
+        );
+        assert_eq!(limit_kib, Some(12 * GIB_KIB));
+        assert_eq!(
+            headroom_kib,
+            Some(6 * GIB_KIB),
+            "leaf headroom is 10 GiB (via anon+shmem), parent user.slice headroom is 6 GiB (via memory.current fallback)"
+        );
+
+        // If user.slice also has `"max"`, leaf's `memory.stat` headroom (12 - 2 = 10 GiB) wins over `memory.current`.
+        fs::write(slice_dir.join("memory.max"), "max\n").unwrap();
+        let (limit2, headroom2) =
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/app.slice/lean.scope\n");
+        assert_eq!(limit2, Some(12 * GIB_KIB));
+        assert_eq!(headroom2, Some(10 * GIB_KIB));
+
+        // Missing leaf directory still walks upward through intermediate slice limits.
+        fs::write(slice_dir.join("memory.max"), format!("{}\n", 8 * GIB_KIB * 1024)).unwrap();
+        let (limit3, headroom3) = cgroup_memory_limits_kib(
+            &cg_root,
+            "0::/user.slice/app.slice/nonexistent-leaf.scope\n",
+        );
+        assert_eq!(limit3, Some(8 * GIB_KIB));
+        assert_eq!(headroom3, Some(0)); // user.slice had memory.current = 10 GiB > 8 GiB -> saturating 0
+
+        // When all levels have `"max"`, both limit and headroom are None.
+        fs::write(slice_dir.join("memory.max"), "max\n").unwrap();
+        fs::write(scope_dir.join("memory.max"), "max\n").unwrap();
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/app.slice/lean.scope\n"),
+            (None, None)
+        );
+        // Path traversal is rejected.
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/../../etc\n"),
+            (None, None)
+        );
+        // Unknown available memory with known total falls back conservatively to 2 (bounded by total).
+        assert_eq!(resolve_default_lake_jobs(Some(32 * GIB_KIB), None, 8), 2);
+        assert_eq!(resolve_default_lake_jobs(Some(1 * GIB_KIB), None, 8), 1);
+
+        // 5. `build_lake_build_command_with_inputs` deterministically configures `Command`
+        //    env vars (`LAKE_CACHE_ENV_DEFAULTS` + `LEAN_NUM_THREADS`) and never passes `-j`.
+        use std::collections::BTreeMap;
+        let cmd_default = build_lake_build_command_with_inputs(
+            Path::new("lake"),
+            Path::new("/tmp/ws/.anneal"),
+            |_| false,
+            None,
+            false,
+            Some(16 * GIB_KIB),
+            Some(4608 * MIB_KIB),
+            8,
+        );
+        let envs_default: BTreeMap<String, Option<String>> = cmd_default
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs_default.get("LEAN_NUM_THREADS"),
+            Some(&Some("3".to_string()))
+        );
+        assert_eq!(
+            envs_default.get("LAKE_ARTIFACT_CACHE"),
+            Some(&Some("true".to_string()))
+        );
+        assert_eq!(
+            envs_default.get("LAKE_RESTORE_ARTIFACTS"),
+            Some(&Some("true".to_string()))
+        );
+        assert!(
+            !cmd_default
+                .get_args()
+                .any(|a| a.to_string_lossy().starts_with("-j"))
+        );
+
+        let cmd_preserve_caller = build_lake_build_command_with_inputs(
+            Path::new("lake"),
+            Path::new("/tmp/ws/.anneal"),
+            |k| k == "LAKE_ARTIFACT_CACHE",
+            None,
+            true,
+            Some(16 * GIB_KIB),
+            Some(4608 * MIB_KIB),
+            8,
+        );
+        let envs_preserve: BTreeMap<String, Option<String>> = cmd_preserve_caller
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(!envs_preserve.contains_key("LEAN_NUM_THREADS"));
+        assert!(!envs_preserve.contains_key("LAKE_ARTIFACT_CACHE"));
+        assert_eq!(
+            envs_preserve.get("LAKE_RESTORE_ARTIFACTS"),
+            Some(&Some("true".to_string()))
+        );
+
+        let cmd_override = build_lake_build_command_with_inputs(
+            Path::new("lake"),
+            Path::new("/tmp/ws/.anneal"),
+            |_| false,
+            Some("99"),
+            true,
+            Some(16 * GIB_KIB),
+            Some(1024 * MIB_KIB),
+            2,
+        );
+        let envs_override: BTreeMap<String, Option<String>> = cmd_override
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs_override.get("LEAN_NUM_THREADS"),
+            Some(&Some("16".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&cg_root);
     }
 
     #[test]
