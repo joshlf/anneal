@@ -104,11 +104,17 @@ theorem decodeSubdomainCells_of_not_fallback {Val α : Type}
     | rawByte _ => rfl
 
 /-- Lift a partial/subdomain representation codec `(encodeSub, decodeSub)` on a
-carrier `α` (embedded into `Val` via prism `(toVal, ofVal?)`, such as a
-fixed-width byte codec `ByteLensCodec α n` / `FixedByteCodec α n`) to a total
+carrier `α` (embedded into `Val` via prism `(toVal, ofVal?)`) to a total
 `SpatialCodec Val`. Values in `α`'s image encode via `encodeSub a` (for example,
 as `[.rawByte ...]` windows), while values outside `α`'s image fall back to
-`[.init v]`. -/
+`[.init v]`.
+
+Caveat: `mutateSpatialInState` preserves only the cell count, so if some
+`encodeSub` window has width `1` (the fallback width), a same-width spatial
+write can move a block between the subdomain and the fallback (retyping the
+pinned value). Fixed-width byte codecs should instead use a fallback whose
+width differs from the window width, as
+`MirLiftCoreInterop.spatialCodecOfByteLensCodec` does. -/
 def SpatialCodec.ofSubdomain {Val α : Type}
     (cid : Nat)
     (toVal : α → Val)

@@ -36,11 +36,15 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    *equals* `runBlockCfg` of the fork-free CFG `forkFree stepBb` at every fuel,
    and `runBlockCfg_of_forkFree_ret` transports every fork-free return back to
    the original CFG; on CFGs without symbolic forks the embedding is complete
-   (`wpConverges_blockCfgStep_iff_of_noFork`).
+   (`wpConverges_blockCfgStep_iff_of_noFork`), and on CFGs that do not fork on
+   the states of a per-block invariant it is complete from those states
+   (`wpConverges_blockCfgStep_iff_of_blockInv`).
 2. **Partial correctness transfer** (`modular_block_cfg_sound`):
    `wpConverges_blockCfgStep_postRet` strengthens any fuel-free convergence
    proof of the embedded CFG with PureLift's `PostRet`, and
-   `evalFuel_blockCfgStep_ne_faulted` rules out machine faults.
+   `evalFuel_blockCfgStep_ne_faulted` rules out machine faults;
+   `wpConverges_of_cfgCertificate` turns a `CfgCertificate` plus a function
+   specification into fuel-free convergence of its CFG.
 3. **Fuel-free total correctness.** `StepInv` / `wpConverges_of_stepInv_rank`
    (generic over every `PureMirExec.Step` machine) and
    `wpConverges_blockCfgStep_of_rank` / `runBlockCfg_total_of_rank` turn
@@ -56,15 +60,19 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    structured `while` run by a fuel-free `StepsTo` segment of the 3-block loop
    CFG of `cfg_certificate_while_sound`; `while_cutpoint_wpConverges` composes it
    with `runWhileFlowSteps_cutpoint_sound`, and
-   `whileLoop_stepsTo_forRangeUp` drives the same CFG with MirLiftCore's
-   structural `stepsTo_forRangeUp` rule.
+   `whileLoop_stepsTo_forRangeUp` / `whileLoop_stepsTo_exit_forRangeUp` drive
+   the same CFG with MirLiftCore's structural `stepsTo_forRangeUp` rule.
 6. **Refinement into live MIR** (`runMirToBlock`, `LiftBlockToJoin`):
    `wpConverges_of_forwardSim` transports convergence of any machine along a
-   forward simulation; `mirWpConverges_of_blockCfg_forwardSim` and
-   `liftBlockToJoin_of_blockCfg_segment` instantiate it for live MIR, so a
-   verified PureLift CFG plus per-step MIR simulation obligations (each
-   dischargeable by `stepsTo_of_runMirToBlock_reached`) yields
-   `MirWpConverges` / `LiftBlockToJoin` for the MIR body.
+   forward simulation; `mirWpConverges_of_blockCfg_forwardSim`,
+   `mirWpConverges_of_cfgCertificate`, and `liftBlockToJoin_of_blockCfg_segment`
+   instantiate it for live MIR, so a verified PureLift CFG plus per-step MIR
+   simulation obligations (each dischargeable by
+   `stepsTo_of_runMirToBlock_reached`) yields `MirWpConverges` /
+   `LiftBlockToJoin` for the MIR body; `liftBlockToJoin_of_runBlockCfgToBlock`,
+   `liftBlockToJoin_of_whileCutpoint`, and `liftBlockToJoin_of_whileForRangeUp`
+   derive the PureLift segment (and the join invariant) from header-targeted
+   runs, loop cutpoints, and counted loops.
 7. **Adequacy bridge** (`Adapter.pure_lift_sound`): `stepOperationalAdapter`
    realizes PureLift's `OperationalAdapter` by exact `k`-step paths
    (`StepPath`, interconvertible with `StepsTo`) of any MirLiftCore machine,
@@ -72,11 +80,14 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    `pure_lift_sound` into a fuel-free segment / live `MirWpConverges`.
 8. **Trusted byte windows** (Episode 2 readiness): provenance-free trusted
    `AbstractByte` windows are exactly the `.uninit` / `.rawByte` spatial cells
-   (`cellsOfAbstractBytes`, `abstractBytesOfCells`), and
-   `spatialCodecOfByteLensCodec` lifts any provenance-free
-   `SepLogicLenses.ByteLensCodec` to a `SpatialCodec` over an arbitrary value
-   domain (exercised on MIR `Value` with the trusted little-endian `u32`
-   codec), with no change to the PureLift core.
+   (`cellsOfAbstractBytes`, `abstractBytesOfCells`, with exact round trips,
+   length preservation, and `hasUninitCell` ↔ `BitValidity.allBytesInitialized`),
+   and `spatialCodecOfByteLensCodec` lifts any provenance-free
+   `SepLogicLenses.ByteLensCodec α n` to a `SpatialCodec` over an arbitrary
+   value domain that decodes only exact-width windows and never retypes an
+   in-image block (exercised on MIR `Value` with the trusted little-endian
+   `u32` codec and a `bool` codec rejecting invalid bit patterns), with no
+   change to the PureLift core.
 
 All results are exercised non-vacuously at the end of the file on concrete
 PureLift CFGs with symbolic data (`testCfgStep` countdown, and the `S6`
@@ -1149,10 +1160,13 @@ end AdapterBridge
 `SpatialPin` stores frozen loans as `List (CellVal Val)`. Provenance-free
 trusted bytes (`.uninit`, `.init b none`) are exactly the `.uninit` / `.rawByte`
 cells, so any `SepLogicLenses.ByteLensCodec α n` with provenance-free encodings
-lifts, through `SpatialCodec.ofSubdomain`, to a `SpatialCodec` over an arbitrary
-value domain (for example MIR `Value`) that encodes `α`'s image as a raw byte
-window and every other value as `[.init v]`; no change to the PureLift core is
-needed. -/
+lifts (`spatialCodecOfByteLensCodec`) to a `SpatialCodec` over an arbitrary
+value domain (for example MIR `Value`) that encodes `α`'s image as its exact
+`n`-byte raw window and every other value as `byteLensFallbackCells n v`, whose
+width is never `n`. Since `mutateSpatialInState` preserves cell counts, a block
+frozen from an in-image value decodes only through the byte codec
+(`spatialCodecOfByteLensCodec_decode_in_subdomain`), so spatial byte writes can
+never retype it; no change to the PureLift core is needed. -/
 
 section ByteWindows
 
