@@ -968,6 +968,7 @@ def resumeExternalCall
         memAfter.borrows
         destination
         retVal
+        (callStack := memAfter.callStack)
     with
     | .ok updatedLocals =>
       .running {
@@ -979,7 +980,23 @@ def resumeExternalCall
         }
         memory := memAfter
       }
-    | .ub => .faulted .ub
+    | .ub =>
+      match memAfter.callStack, destination.projection with
+      | _ :: _, .deref :: restProj =>
+        match foreignFrameDerefWrite localsAfterArgs memAfter destination restProj retVal with
+        | .ok updatedLocals mem' =>
+          .running {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := mem'
+          }
+        | .ub => .faulted .ub
+        | .unsupported => .faulted .unsupported
+      | _, _ => .faulted .ub
     | .unsupported => .faulted .unsupported
   | .panicked memAfter =>
     applyUnwindAction s localsAfterArgs memAfter unwind
@@ -2153,7 +2170,14 @@ def writeIntrinsicReturn
     (targetBb : BasicBlockIdx)
     (retVal : Value) :
     MirStepNode :=
-  match writePlaceValue locals' s.memory.borrows destination retVal with
+  match
+    writePlaceValue
+      locals'
+      s.memory.borrows
+      destination
+      retVal
+      (callStack := s.memory.callStack)
+  with
   | .ok updatedLocals =>
     MirStepNode.step {
       frame := {
@@ -2164,7 +2188,23 @@ def writeIntrinsicReturn
       }
       memory := s.memory
     }
-  | .ub => MirStepNode.fail .ub
+  | .ub =>
+    match s.memory.callStack, destination.projection with
+    | _ :: _, .deref :: restProj =>
+      match foreignFrameDerefWrite locals' s.memory destination restProj retVal with
+      | .ok updatedLocals mem' =>
+        MirStepNode.step {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
+          }
+          memory := mem'
+        }
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+    | _, _ => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
 
 /--
@@ -3131,19 +3171,7 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
                 | .nil => false
               match evalExactDiv lhs rhs isSigned with
               | .some retScalar =>
-                match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-                | .ok updatedLocals =>
-                  MirStepNode.step {
-                    frame := {
-                      s.frame with
-                      blockIdx := targetBb
-                      stmtIdx := 0
-                      locals := updatedLocals
-                    }
-                    memory := s.memory
-                  }
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
+                writeIntrinsicReturn s locals' destination targetBb (.scalar retScalar)
               | .none => MirStepNode.fail .ub
             | _ => MirStepNode.unsupported
           | false =>
@@ -3421,19 +3449,7 @@ def evalTerminator
               | .some isSigned =>
                 match evalExactDiv lhs rhs isSigned with
                 | .some retScalar =>
-                  match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-                  | .ok updatedLocals =>
-                    MirStepNode.step {
-                      frame := {
-                        s.frame with
-                        blockIdx := targetBb
-                        stmtIdx := 0
-                        locals := updatedLocals
-                      }
-                      memory := s.memory
-                    }
-                  | .ub => MirStepNode.fail .ub
-                  | .unsupported => MirStepNode.unsupported
+                  writeIntrinsicReturn s locals' destination targetBb (.scalar retScalar)
                 | .none => MirStepNode.fail .ub
             | _ => MirStepNode.fail .ub
           | false =>

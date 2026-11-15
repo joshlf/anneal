@@ -13176,6 +13176,30 @@ theorem writePlaceState_dest_below_refines {arityOf : Ty → VariantIdx → Bool
                 SlotsRefine.set hSB loc hRel⟩
           | _ => simp [SlotBelow] at hAT
 
+theorem writePlaceState_dest_below_refines_callStack {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {locals : List LocalSlot}
+    {borrows : List BorrowEntry} {callStack : List SavedCallerFrame}
+    {dest : Place} {destTy : Ty} {rv : Value}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hDestOk : NoUninitExplosionOnProj arityOf destTy dest.projection)
+    (hWrite : writePlaceState arityOf slots dest destTy rv = .ok slots') :
+    ∃ locals',
+      writePlaceValue locals borrows dest rv (callStack := callStack) = .ok locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  obtain ⟨locals', hWPV, hRel'⟩ :=
+    writePlaceState_dest_below_refines (borrows := borrows) hRel hDestOk hWrite
+  have hCS :
+      writePlaceValue locals borrows dest rv (callStack := callStack) =
+        writePlaceValue locals borrows dest rv := by
+    rcases dest with ⟨loc, _ | ⟨pHead, pTail⟩⟩
+    · rfl
+    · unfold writePlaceState at hWrite
+      cases hDeref : projectionHasDeref (pHead :: pTail) with
+      | true => rw [hDeref] at hWrite; nomatch hWrite
+      | false =>
+        cases pHead <;> first | rfl | simp [projectionHasDeref] at hDeref
+  exact ⟨locals', hCS.trans hWPV, hRel'⟩
+
 /-- `resolveIntrinsicIsSigned` depends only on `target.typeArgs`, never on `target.defPath` or
 `target.isIndirect`. -/
 theorem resolveIntrinsicIsSigned_defPath_irrel (t1 t2 : ResolvedCallTarget)
@@ -13710,7 +13734,8 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                       rw [hWr] at hBodyCall
                       obtain rfl := cfgGoto_eq_some hBodyCall
                       obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
-                        writePlaceState_dest_below_refines (borrows := s.memory.borrows)
+                        writePlaceState_dest_below_refines_callStack
+                          (borrows := s.memory.borrows) (callStack := s.memory.callStack)
                           hRel2 hDestOk hWr
                       obtain ⟨kind, hKind, hNotEx, hClass⟩ :=
                         trustedSupportsIntrinsicDefPath_of_isValueDirectIntrinsic hValOp hSupp
@@ -13821,7 +13846,8 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                       rw [hWr] at hBodyCall
                       obtain rfl := cfgGoto_eq_some hBodyCall
                       obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
-                        writePlaceState_dest_below_refines (borrows := s.memory.borrows)
+                        writePlaceState_dest_below_refines_callStack
+                          (borrows := s.memory.borrows) (callStack := s.memory.callStack)
                           hRel2 hDestOk hWr
                       obtain ⟨hExPath, _⟩ := hSupp
                       dsimp only [evalLIntrinsicValue] at hEv
@@ -13840,7 +13866,7 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                             hResTgt, hDecls, hLayouts, hCorr.globals, hCorr.stack, hTOps, hNoCallee,
                             isDirectExactDivTarget, hExPath]
                           rw [resolveIntrinsicIsSigned_defPath_irrel _ { defPath := "", typeArgs := typeArgs, isIndirect := false } _ _ _ _ _ rfl, hSignSynth]
-                          simp only [hDiv, hWPV]
+                          simp only [hDiv, writeIntrinsicReturn, hWPV]
                         · cases hEv
                       · cases v1 <;> cases v2 <;> cases hEv
           | ctlz | ctlzNonzero | cttz | cttzNonzero | ctpop | bswap | bitreverse
@@ -24658,8 +24684,9 @@ theorem stepLoweredWithCallTable_refines_trusted
                                     simp only [Option.some.injEq] at h
                                     subst h
                                     obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
-                                      writePlaceState_dest_below_refines
-                                        (borrows := s.memory.borrows) hRel2 hDestOk hWr
+                                      writePlaceState_dest_below_refines_callStack
+                                        (borrows := s.memory.borrows)
+                                        (callStack := s.memory.callStack) hRel2 hDestOk hWr
                                     obtain ⟨kind, hKind, hNotEx, hClass⟩ :=
                                       trustedSupportsIntrinsicDefPath_of_isValueDirectIntrinsic
                                         hValOp hSupp
@@ -24802,8 +24829,9 @@ theorem stepLoweredWithCallTable_refines_trusted
                                       simp only [Option.some.injEq] at h
                                       subst h
                                       obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
-                                        writePlaceState_dest_below_refines
-                                          (borrows := s.memory.borrows) hRel2 hDestOk hWr
+                                        writePlaceState_dest_below_refines_callStack
+                                          (borrows := s.memory.borrows)
+                                          (callStack := s.memory.callStack) hRel2 hDestOk hWr
                                       obtain ⟨hExPath, _⟩ := hSupp
                                       rw [← hCorr.body.localDecls, hCorr.body.envLayouts] at hEv
                                       dsimp only [evalLIntrinsicValue] at hEv
@@ -24828,7 +24856,7 @@ theorem stepLoweredWithCallTable_refines_trusted
                                             rw [resolveIntrinsicIsSigned_defPath_irrel _
                                               { defPath := "", typeArgs := typeArgs, isIndirect := false }
                                               _ _ _ _ _ rfl, hSignSynth]
-                                            simp [hDiv, hWPV, sNext]
+                                            simp [hDiv, writeIntrinsicReturn, hWPV, sNext]
                                           exact ⟨sNext, activeCm,
                                             hRun1.trans (.step hTS (.refl sNext)),
                                             { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩

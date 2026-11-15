@@ -815,7 +815,7 @@ def evalCopySingleDirect
                     s.memory.borrows
                     dstEntry.targetLocal
                     (.some dstPtr.tag)
-                    (length s.memory.callStack)
+                    dstEntry.targetFrameDepth
                 MirStepNode.step
                   (advanceStmt
                     s
@@ -1689,12 +1689,10 @@ def evalCopyNonOverlappingPermOk
 /--
 `copy_nonoverlapping` source and destination borrow targets both lie in the
 active frame. With an empty `callStack` (root frame active) this always holds
-(every live tag then targets depth `0`). Inside an inline callee, a source or
-destination tag minted in a suspended caller frame
-(`BorrowEntry.targetFrameDepth < length callStack`) is not modeled by the
-byte-level copy, which addresses `locals₃` and `Memory.callerLocals` only, so
-`evalCopyNonOverlappingWithCount` fails closed with `.unsupported` instead of
-copying from or into the active frame's local of the same index
+(every live tag then targets depth `0`). Inside an inline callee, when a source
+or destination tag was minted in a suspended caller frame
+(`BorrowEntry.targetFrameDepth < length callStack`), `evalCopyNonOverlappingWithCount`
+routes single-element direct copies through `evalForeignFrameCopySingleDirect`
 (`DIV-MR-CALL-TARGET-LOCAL`).
 -/
 def copyEntriesTargetActiveFrame
@@ -1707,6 +1705,198 @@ def copyEntriesTargetActiveFrame
     Bool.and
       (Nat.beq srcEntry.targetFrameDepth (length callStack))
       (Nat.beq dstEntry.targetFrameDepth (length callStack))
+
+/--
+Frame-qualified single-element direct value copy (`count == 1`, `srcStart == 0`,
+`dstStart == 0`) for `copy_nonoverlapping` when at least one of `srcEntry` or
+`dstEntry` targets a suspended caller frame (`copyEntriesTargetActiveFrame = false`,
+`DIV-MR-CALL-TARGET-LOCAL`). Reads the source value from `(srcEntry.targetFrameDepth,
+srcEntry.targetLocal)` (`readFrameLocalSlot`), checks disjointness on the pair
+`(targetFrameDepth, targetLocal)` and `targetProjection`, checks function-entry
+lifetime protectors at `dstEntry.targetFrameDepth`, writes the converted value to
+`(dstEntry.targetFrameDepth, dstEntry.targetLocal)` (`writeFrameLocalSlot`,
+updating `Memory.callStack` when targeting a saved caller frame), and invalidates
+conflicting borrows at `dstEntry.targetFrameDepth`. Non-unit counts or non-zero
+byte offsets across frames fail closed with `MirStepNode.unsupported`.
+-/
+def evalForeignFrameCopySingleDirect
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    MirStepNode :=
+  match
+    Bool.and
+      (Nat.beq countBits 1)
+      (Bool.and
+        (Nat.beq srcPtr.offsetBytes 0)
+        (Nat.beq dstPtr.offsetBytes 0))
+  with
+  | false => MirStepNode.unsupported
+  | true =>
+    let overlaps :=
+      match Nat.beq srcPtr.tag dstPtr.tag with
+      | true => true
+      | false =>
+        match
+          Bool.and
+            (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+            (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+        with
+        | false => false
+        | true =>
+          projectionsOverlap
+            srcEntry.targetProjection
+            dstEntry.targetProjection
+    match overlaps with
+    | true => MirStepNode.fail .ub
+    | false =>
+      match
+        readFrameLocalSlot
+          locals₃
+          s.memory.callStack
+          s.memory.callerLocals
+          srcEntry.targetFrameDepth
+          srcEntry.targetLocal
+      with
+      | .some (.init srcRootVal) =>
+        match
+          readProjectedValue
+            locals₃
+            srcRootVal
+            srcEntry.targetProjection
+        with
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+        | .ok copiedVal =>
+          let convertedOpt : Option Value :=
+            match
+              operandPointeeTy localDecls layouts src,
+              operandPointeeTy localDecls layouts dst
+            with
+            | .some srcPt, .some dstPt =>
+              match sameRigidTyShape srcPt.kind dstPt.kind with
+              | true => .some copiedVal
+              | false =>
+                match
+                  rigidTyByteSize layouts srcPt,
+                  rigidTyByteSize layouts dstPt
+                with
+                | .some sSz, .some dSz =>
+                  match Nat.beq sSz dSz with
+                  | false => .none
+                  | true =>
+                    match
+                      encodeValueToBytes
+                        defaultCodecFuel
+                        layouts
+                        srcPt
+                        copiedVal
+                    with
+                    | .some bs =>
+                      decodeValueFromBytes
+                        defaultCodecFuel
+                        layouts
+                        dstPt
+                        bs
+                    | .none => .none
+                | _, _ => .some copiedVal
+            | _, _ => .some copiedVal
+          match convertedOpt with
+          | .none => MirStepNode.fail .ub
+          | .some finalVal =>
+            let protConflict : Bool :=
+              match s.memory.activeProtectors with
+              | .nil => false
+              | _ :: _ =>
+                match s.memory.borrows with
+                | b₁ :: b₂ :: restBorrows =>
+                  let allBorrows := b₁ :: b₂ :: restBorrows
+                  hasProtectedTreeWriteConflict
+                    allBorrows
+                    allBorrows
+                    s.memory.activeProtectors
+                    dstEntry.targetLocal
+                    (.some dstPtr.tag)
+                    dstEntry.targetProjection
+                    dstEntry.rangeOffset
+                    dstEntry.rangeLen
+                    dstEntry.targetFrameDepth
+                | _ =>
+                  hasProtectedWriteConflict
+                    s.memory.borrows
+                    s.memory.activeProtectors
+                    dstEntry.targetLocal
+                    (.some dstPtr.tag)
+                    dstEntry.targetProjection
+                    dstEntry.rangeOffset
+                    dstEntry.rangeLen
+                    dstEntry.targetFrameDepth
+            match protConflict with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let dstRootSlotOpt :=
+                readFrameLocalSlot
+                  locals₃
+                  s.memory.callStack
+                  s.memory.callerLocals
+                  dstEntry.targetFrameDepth
+                  dstEntry.targetLocal
+              let newDstRootRes : PlaceReadResult :=
+                match dstEntry.targetProjection with
+                | .nil =>
+                  match dstRootSlotOpt with
+                  | .some .dead => .ub
+                  | .some _ => .ok finalVal locals₃
+                  | .none => .ub
+                | pHead :: pTail =>
+                  match dstRootSlotOpt with
+                  | .some (.init dstRootVal) =>
+                    match
+                      writeProjectedValue
+                        locals₃
+                        dstRootVal
+                        (pHead :: pTail)
+                        finalVal
+                    with
+                    | .ok dstRootVal' => .ok dstRootVal' locals₃
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                  | _ => .ub
+              match newDstRootRes with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok newDstRootVal _ =>
+                match
+                  writeFrameLocalSlot
+                    locals₃
+                    s.memory.callStack
+                    s.memory.callerLocals
+                    dstEntry.targetFrameDepth
+                    dstEntry.targetLocal
+                    (.init newDstRootVal)
+                with
+                | .some (locals₄, callStack', callerLocals') =>
+                  let borrows' :=
+                    invalidateConflictingBorrows
+                      s.memory.borrows
+                      dstEntry.targetLocal
+                      (.some dstPtr.tag)
+                      dstEntry.targetFrameDepth
+                  MirStepNode.step
+                    (advanceStmt
+                      s
+                      locals₄
+                      { s.memory with
+                        borrows := borrows'
+                        callStack := callStack'
+                        callerLocals := callerLocals' })
+                | .none => MirStepNode.fail .ub
+      | _ => MirStepNode.fail .ub
 
 /--
 Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement with
@@ -1737,7 +1927,19 @@ def evalCopyNonOverlappingWithCount
         | _, .disabled => MirStepNode.fail .ub
         | _, _ =>
           match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
-          | false => MirStepNode.unsupported
+          | false =>
+            evalForeignFrameCopySingleDirect
+              s
+              src
+              dst
+              localDecls
+              layouts
+              srcPtr
+              dstPtr
+              srcEntry
+              dstEntry
+              countBits
+              locals₃
           | true =>
             evalCopyNonOverlappingPermOk
               s

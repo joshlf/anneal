@@ -1073,7 +1073,7 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
     unfold evalTerminator
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
-      hExact, writePlaceValue, set?]
+      hExact, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold emptyMemory at hUb
     unfold evalTerminator
@@ -1084,7 +1084,7 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
     unfold evalTerminator
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
-      hExact, writePlaceValue, set?]
+      hExact, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold emptyMemory at hUb
     unfold evalTerminator
@@ -4558,7 +4558,18 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       hEx, resolveIntrinsicIsSigned, operandTy, placeTy]
-    rfl
+    split
+    · next retVal localsAfter memAfter h_ex =>
+      simp only [h_ex, writeIntrinsicReturn]
+      have h_wpv :
+          writePlaceValue localsAfter memAfter.borrows { local_ := 0, projection := .nil } retVal
+              (callStack := memAfter.callStack) =
+            writePlaceValue localsAfter memAfter.borrows { local_ := 0, projection := .nil } retVal := rfl
+      rw [h_wpv]
+      cases writePlaceValue localsAfter memAfter.borrows { local_ := 0, projection := .nil } retVal <;>
+        cases memAfter.callStack <;> rfl
+    · next h_ex => simp only [h_ex]
+    · next h_ex => simp only [h_ex]
   · have h : classifyRustIntrinsic? "core::intrinsics::saturating_add" = .some .saturatingAdd := rfl
     have hEx : stringEq "core::intrinsics::saturating_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm

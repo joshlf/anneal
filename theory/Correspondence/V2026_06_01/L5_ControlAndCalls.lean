@@ -2448,7 +2448,7 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
     unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
-      hOk, writePlaceValue, set?]
+      hOk, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
@@ -2457,7 +2457,7 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
     unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
-      hOk, writePlaceValue, set?]
+      hOk, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,

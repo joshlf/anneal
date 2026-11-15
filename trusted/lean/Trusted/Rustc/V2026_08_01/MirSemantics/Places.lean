@@ -9776,7 +9776,14 @@ def evalSliceFatPtrDerefRead
           | .some _ => .none
           | .none =>
             match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
-            | .some (.init v) => .some (v, .nil)
+            | .some (.init v) =>
+              .some
+                (v,
+                  (foreignFrameDeclsAndLayouts
+                    callStack
+                    layouts
+                    entry.targetFrameDepth
+                    entry.targetLocal).1)
             | _ => .none
         match targetRootAndDeclsOpt with
         | .some (targetRootVal, targetDecls) =>
@@ -9954,6 +9961,12 @@ def evalPlaceRead
           | .none =>
             match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
             | .some (.init targetRootVal) =>
+              let (targetDecls, targetLayouts) :=
+                foreignFrameDeclsAndLayouts
+                  callStack
+                  layouts
+                  entry.targetFrameDepth
+                  entry.targetLocal
               evalStackThinPtrTypedDerefRead
                 locals
                 targetRootVal
@@ -9964,8 +9977,11 @@ def evalPlaceRead
                 layouts
                 pointeeTyOpt
                 accessedTyOpt
-                .none
-                .nil
+                (placeTyResolved
+                  targetDecls
+                  targetLayouts
+                  { local_ := entry.targetLocal, projection := entry.targetProjection })
+                targetDecls
             | _ => .ub
       | .none =>
         match checkDerefAlign localDecls layouts globalAlignTyOpt ptrVal.offsetBytes with
@@ -10234,6 +10250,12 @@ def evalOperand
                     | .ub => .ub
                     | .unsupported => .unsupported
                   | true =>
+                    let (targetDecls, targetLayouts) :=
+                      foreignFrameDeclsAndLayouts
+                        callStack
+                        layouts
+                        entry.targetFrameDepth
+                        entry.targetLocal
                     evalStackThinPtrTypedDerefRead
                       locals
                       targetRootVal
@@ -10244,8 +10266,11 @@ def evalOperand
                       layouts
                       pointeeTyOpt
                       accessedTyOpt
-                      .none
-                      .nil
+                      (placeTyResolved
+                        targetDecls
+                        targetLayouts
+                        { local_ := entry.targetLocal, projection := entry.targetProjection })
+                      targetDecls
                 | _ => .ub
           | .none =>
             let globalAlignTyOpt : Option Ty :=
@@ -10485,6 +10510,12 @@ def evalOperand
                     | .ub => .ub
                     | .unsupported => .unsupported
                   | true =>
+                    let (targetDecls, targetLayouts) :=
+                      foreignFrameDeclsAndLayouts
+                        callStack
+                        layouts
+                        entry.targetFrameDepth
+                        entry.targetLocal
                     evalStackThinPtrTypedDerefRead
                       locals
                       targetRootVal
@@ -10495,8 +10526,11 @@ def evalOperand
                       layouts
                       pointeeTyOpt
                       accessedTyOpt
-                      .none
-                      .nil
+                      (placeTyResolved
+                        targetDecls
+                        targetLayouts
+                        { local_ := entry.targetLocal, projection := entry.targetProjection })
+                      targetDecls
                 | _ => .ub
           | .none =>
             let globalAlignTyOpt : Option Ty :=
@@ -14868,7 +14902,17 @@ def borrowPlaceByteOffset?
           match foreignFrameSlot? callStack callerLocals entry.targetFrameDepth entry.targetLocal with
           | .some (.init v) => .some v
           | _ => .none
-        (vOpt, .nil, .none)
+        let (targetDecls, targetLayouts) :=
+          foreignFrameDeclsAndLayouts
+            callStack
+            layouts
+            entry.targetFrameDepth
+            entry.targetLocal
+        let tyOpt :=
+          match get? targetDecls entry.targetLocal with
+          | .some decl => .some (resolveTyWithLocalDecls targetDecls targetLayouts decl.ty)
+          | .none => .none
+        (vOpt, targetDecls, tyOpt)
     projectionChainByteOffset?
       layouts
       rootTyOpt
@@ -17368,7 +17412,14 @@ def evalRvalueRefDeref
               | .some _ => .none
               | .none =>
                 match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
-                | .some (.init v) => .some (v, .nil)
+                | .some (.init v) =>
+                  .some
+                    (v,
+                      (foreignFrameDeclsAndLayouts
+                        mem.callStack
+                        layouts
+                        parentEntry.targetFrameDepth
+                        parentEntry.targetLocal).1)
                 | _ => .none
             match targetRootAndDeclsOpt with
             | .none => .ub
@@ -17683,7 +17734,14 @@ def evalRvalueRawPtr
                   | .some slot => .some (slot, localDecls)
                   | .none =>
                     match foreignFrameSlot? mem.callStack mem.callerLocals parentEntry.targetFrameDepth parentEntry.targetLocal with
-                    | .some slot => .some (slot, .nil)
+                    | .some slot =>
+                      .some
+                        (slot,
+                          (foreignFrameDeclsAndLayouts
+                            mem.callStack
+                            layouts
+                            parentEntry.targetFrameDepth
+                            parentEntry.targetLocal).1)
                     | .none => .none
                 let fallbackByByteOffset (checkDead : Bool) (rejectSubslice : Bool) :
                     RvalueEvalResult :=

@@ -177,4 +177,565 @@ theorem set_discriminant_on_uninit_adt :
           [.init (.aggregate 1 [])] emptyMemory) := by
   refine ⟨rfl, rfl, rfl⟩
 
+/-! ## End-to-End `stepMirFn` Witness & Canary Execution Suite -/
+
+/-- Fuel-bounded execution of `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`, returning
+`.some (bits, sizeBytes)` on normal scalar return. -/
+def runScalarFuel (body : CapturedMir) : Nat → MachineState → Option (Nat × Nat)
+  | 0, _ => .none
+  | fuel + 1, s =>
+    match stepMirFn body s with
+    | .tau (.running s') => runScalarFuel body fuel s'
+    | .ret (.normal (.scalar sc, _)) => .some (sc.bits, sc.sizeBytes)
+    | _ => .none
+
+/-- Fuel-bounded fault check on `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`, returning
+`true` when execution faults with `.ub` (`MirStepNode.fail .ub` or `.tau (.faulted .ub)`). -/
+def faultsUBFuel (body : CapturedMir) : Nat → MachineState → Bool
+  | 0, _ => false
+  | fuel + 1, s =>
+    match stepMirFn body s with
+    | .tau next =>
+      match next with
+      | .running s' => faultsUBFuel body fuel s'
+      | .faulted .ub => true
+      | _ => false
+    | .vis op _ =>
+      match op with
+      | .inl (.fail .ub) => true
+      | _ => false
+    | _ => false
+
+/-- Run `body` from `initMachineStateWithCallees body args callees` and return scalar result. -/
+def runTrustedScalar? (body : CapturedMir) (callees : List CapturedMir) (args : List Value)
+    (fuel : Nat := 40) : Option (Nat × Nat) :=
+  runScalarFuel body fuel (initMachineStateWithCallees body args callees)
+
+/-- Check whether `body` faults with `.ub` from `initMachineStateWithCallees body args callees`. -/
+def trustedFaultsUB (body : CapturedMir) (callees : List CapturedMir) (args : List Value)
+    (fuel : Nat := 40) : Bool :=
+  faultsUBFuel body fuel (initMachineStateWithCallees body args callees)
+
+def u32Decl : LocalDecl := { mutability := .mut, ty := u32T, debugName := none }
+def u64T : Ty := { kind := .uint .u64, layoutIdx := 0 }
+def u64Decl : LocalDecl := { mutability := .mut, ty := u64T, debugName := none }
+def usizeT : Ty := { kind := .uint .usize, layoutIdx := 0 }
+def isizeT : Ty := { kind := .int .isize, layoutIdx := 0 }
+def isizeDecl : LocalDecl := { mutability := .mut, ty := isizeT, debugName := none }
+def charT : Ty := { kind := .char, layoutIdx := 0 }
+def charDecl : LocalDecl := { mutability := .mut, ty := charT, debugName := none }
+def refSharedU32Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .ref .not (.uint .u32), layoutIdx := 0 }, debugName := none }
+def refMutU32Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }, debugName := none }
+def ptrConstU32Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }, debugName := none }
+def ptrMutU32Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }, debugName := none }
+def ptrMutU64Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }, debugName := none }
+def ptrMutCharDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut .char, layoutIdx := 0 }, debugName := none }
+def optionU32T : Ty := { kind := .adt "core::option::Option" [.uint .u32], layoutIdx := 0 }
+def optionU32Decl : LocalDecl := { mutability := .mut, ty := optionU32T, debugName := none }
+def refSharedOptionU32Decl : LocalDecl :=
+  { mutability := .mut,
+    ty := { kind := .ref .not (.adt "core::option::Option" [.uint .u32]), layoutIdx := 0 },
+    debugName := none }
+def unsafeCellU32T : Ty := { kind := .adt "core::cell::UnsafeCell" [.uint .u32], layoutIdx := 0 }
+def unsafeCellU32Decl : LocalDecl := { mutability := .mut, ty := unsafeCellU32T, debugName := none }
+def refSharedUnsafeCellU32Decl : LocalDecl :=
+  { mutability := .mut,
+    ty := { kind := .ref .not (.adt "core::cell::UnsafeCell" [.uint .u32]), layoutIdx := 0 },
+    debugName := none }
+def refMutUnsafeCellU32Decl : LocalDecl :=
+  { mutability := .mut,
+    ty := { kind := .ref .mut (.adt "core::cell::UnsafeCell" [.uint .u32]), layoutIdx := 0 },
+    debugName := none }
+
+def unsafeCellU32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0] }
+
+def unsafeCellU32Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [unsafeCellU32Layout] }
+
+def locPlace (n : Nat) : Place := { local_ := n, projection := [] }
+def derefPlace (n : Nat) : Place := { local_ := n, projection := [.deref] }
+def derefField0U32Place (n : Nat) : Place :=
+  { local_ := n, projection := [.deref, .field 0 u32T] }
+def somePayloadPlace (n : Nat) : Place :=
+  { local_ := n, projection := [.downcast (some "Some") 1, .field 0 u32T] }
+def constU32 (n : Nat) : Operand :=
+  .constant { ty := u32T, val := .scalar (.int ⟨n, 4⟩) }
+def constU64 (n : Nat) : Operand :=
+  .constant { ty := u64T, val := .scalar (.int ⟨n, 8⟩) }
+def constUsize (n : Nat) : Operand :=
+  .constant { ty := usizeT, val := .scalar (.int ⟨n, 8⟩) }
+def constIsize (n : Nat) : Operand :=
+  .constant { ty := isizeT, val := .scalar (.int ⟨n, 8⟩) }
+def fnDefOp (dp : DefPath) (typeArgs : List RigidTy := []) : Operand :=
+  .constant { ty := { kind := .fnDef dp typeArgs, layoutIdx := 0 }, val := .zeroSized }
+def mkStmt (k : StatementKind) : Statement := { kind := k, span := "" }
+def mkTerm (k : TerminatorKind) : Terminator := { kind := k, span := "" }
+
+def singleBlockBody (dp : DefPath) (argCount : Nat) (decls : List LocalDecl)
+    (stmts : List StatementKind) (layouts : LayoutTable := emptyLayoutTable) : CapturedMir :=
+  { (mkMirBody dp argCount decls
+      [{ statements := stmts.map mkStmt, terminator := mkTerm .return_, isCleanup := false }]) with
+    layouts := layouts }
+
+/-- 1a. `DIV-MR-CALL-TARGET-LOCAL` read witness (`callerRefMutSilentWrongLocalMir` +
+`calleeReadRefWithLocalMir`). -/
+def calleeReadRefWithLocalMir : CapturedMir :=
+  singleBlockBody "witness::callee_read_ref_with_local" 2
+    [u32Decl, u32Decl, refMutU32Decl]
+    [.retag .fnEntry (locPlace 2),
+     .assign (locPlace 0) (.binaryOp .add (.copy (derefPlace 2)) (constU32 37))]
+
+def callerRefMutSilentWrongLocalMir : CapturedMir :=
+  mkMirBody "witness::caller_ref_mut_silent_wrong_local" 1
+    [u32Decl, u32Decl, refMutU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_read_ref_with_local")
+         [constU32 100, .move (locPlace 2)] (locPlace 0) (some 1) .continue_),
+       isCleanup := false },
+     { statements := [mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+/-- 1b. `DIV-MR-CALL-TARGET-LOCAL` write-back witness (`callerWriteBackMir` +
+`calleeWriteRefWithLocalMir`). -/
+def calleeWriteRefWithLocalMir : CapturedMir :=
+  singleBlockBody "witness::write_ref_with_local" 2
+    [u32Decl, u32Decl, refMutU32Decl]
+    [.retag .fnEntry (locPlace 2),
+     .assign (derefPlace 2) (.binaryOp .add (.copy (derefPlace 2)) (constU32 37)),
+     .assign (locPlace 0) (.use (.copy (locPlace 1)))]
+
+def callerWriteBackMir : CapturedMir :=
+  mkMirBody "witness::caller_write_back" 1
+    [u32Decl, u32Decl, refMutU32Decl, u32Decl, u32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1)))],
+       terminator := mkTerm (.call (fnDefOp "witness::write_ref_with_local")
+         [constU32 100, .move (locPlace 2)] (locPlace 3) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.storageLive 4),
+          mkStmt (.assign (locPlace 4) (.binaryOp .mul (.copy (locPlace 1)) (constU32 1000))),
+          mkStmt (.assign (locPlace 0) (.binaryOp .add (.copy (locPlace 4)) (.copy (locPlace 3)))),
+          mkStmt (.storageDead 4),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+/-- 1c. `DIV-MR-CALL-TARGET-LOCAL` cross-frame `copy_nonoverlapping` canary:
+`calleeCopyNonOverlappingMir` copies `1` element from `src` (`&raw const caller._1`) to
+`dst` (`&raw mut caller._2`) while its own `_1 = 100` and `_2 = 200` share the same local
+indices. -/
+def calleeCopyNonOverlappingMir : CapturedMir :=
+  singleBlockBody "witness::callee_copy_nonoverlapping" 4
+    [u32Decl, u32Decl, u32Decl, ptrConstU32Decl, ptrMutU32Decl]
+    [.intrinsic (.copyNonOverlapping (.copy (locPlace 3)) (.copy (locPlace 4)) (constUsize 1)),
+     .assign (locPlace 0) (.binaryOp .add (.copy (locPlace 1)) (.copy (locPlace 2)))]
+
+def callerCopyNonOverlappingMir : CapturedMir :=
+  mkMirBody "witness::caller_copy_nonoverlapping" 1
+    [u32Decl, u32Decl, u32Decl, ptrConstU32Decl, ptrMutU32Decl, u32Decl, u32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.storageLive 4),
+          mkStmt (.storageLive 5),
+          mkStmt (.assign (locPlace 2) (.use (constU32 0))),
+          mkStmt (.assign (locPlace 3) (.rawPtr .not (locPlace 1))),
+          mkStmt (.assign (locPlace 4) (.rawPtr .mut (locPlace 2)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_copy_nonoverlapping")
+         [constU32 100, constU32 200, .move (locPlace 3), .move (locPlace 4)]
+         (locPlace 5) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.storageLive 6),
+          mkStmt (.assign (locPlace 6) (.binaryOp .mul (.copy (locPlace 2)) (constU32 1000))),
+          mkStmt (.assign (locPlace 0) (.binaryOp .add (.copy (locPlace 6)) (.copy (locPlace 5)))),
+          mkStmt (.storageDead 6),
+          mkStmt (.storageDead 5),
+          mkStmt (.storageDead 4),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+/-- 1d. `DIV-MR-CALL-TARGET-LOCAL` cross-frame inline intrinsic destination canary:
+`calleeIntrinsicDestDerefMir` calls `core::intrinsics::wrapping_add` with `destination = *_2`
+(where `_2 : &mut u32` points to the caller's `_1` at depth `0` while the callee's own `_1` is
+`100`). -/
+def calleeIntrinsicDestDerefMir : CapturedMir :=
+  mkMirBody "witness::callee_intrinsic_dest_deref" 2
+    [u32Decl, u32Decl, refMutU32Decl]
+    [{ statements := [mkStmt (.retag .fnEntry (locPlace 2))],
+       terminator := mkTerm (.call (fnDefOp "core::intrinsics::wrapping_add" [.uint .u32])
+         [.copy (derefPlace 2), constU32 37] (derefPlace 2) (some 1) .continue_),
+       isCleanup := false },
+     { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 1))))],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def callerIntrinsicDestDerefMir : CapturedMir :=
+  mkMirBody "witness::caller_intrinsic_dest_deref" 1
+    [u32Decl, u32Decl, refMutU32Decl, u32Decl, u32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_intrinsic_dest_deref")
+         [constU32 100, .move (locPlace 2)] (locPlace 3) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.storageLive 4),
+          mkStmt (.assign (locPlace 4) (.binaryOp .mul (.copy (locPlace 1)) (constU32 1000))),
+          mkStmt (.assign (locPlace 0) (.binaryOp .add (.copy (locPlace 4)) (.copy (locPlace 3)))),
+          mkStmt (.storageDead 4),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+theorem div1_call_target_local_end_to_end :
+    runTrustedScalar? callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir]
+      [.scalar ⟨5, 4⟩] = .some (42, 4) ∧
+    runTrustedScalar? callerWriteBackMir [calleeWriteRefWithLocalMir]
+      [.scalar ⟨5, 4⟩] = .some (42100, 4) ∧
+    runTrustedScalar? callerCopyNonOverlappingMir [calleeCopyNonOverlappingMir]
+      [.scalar ⟨42, 4⟩] = .some (42300, 4) ∧
+    runTrustedScalar? callerIntrinsicDestDerefMir [calleeIntrinsicDestDerefMir]
+      [.scalar ⟨5, 4⟩] = .some (42100, 4) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- 2. `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` end-to-end witness. -/
+def calleeScalarAssignLocal1Mir : CapturedMir :=
+  singleBlockBody "witness::callee_scalar_assign_local1" 1
+    [u32Decl, u32Decl]
+    [.assign (locPlace 1) (.binaryOp .add (.copy (locPlace 1)) (constU32 1)),
+     .assign (locPlace 0) (.use (.copy (locPlace 1)))]
+
+def callerBorrowAcrossScalarCallMir : CapturedMir :=
+  mkMirBody "witness::caller_borrow_across_scalar_call" 1
+    [u32Decl, u32Decl, refMutU32Decl, u32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.storageLive 3),
+          mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1))),
+          mkStmt (.assign (derefPlace 2) (.use (constU32 41)))],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_scalar_assign_local1")
+         [constU32 0] (locPlace 3) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (derefPlace 2)) (.copy (locPlace 3)))),
+          mkStmt (.storageDead 3),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+theorem div2_caller_borrow_across_scalar_call_end_to_end :
+    runTrustedScalar? callerBorrowAcrossScalarCallMir [calleeScalarAssignLocal1Mir]
+      [.scalar ⟨5, 4⟩] = .some (42, 4) := by
+  decide +kernel
+
+/-- 3. `DIV-MR-TB-TWOPHASE-DIRECT-WRITE` end-to-end witness & `UnsafeCell` survival canary. -/
+def twoPhaseDirectWriteMir : CapturedMir :=
+  singleBlockBody "witness::twophase_direct_write" 1
+    [u32Decl, u32Decl, refMutU32Decl]
+    [.storageLive 2,
+     .assign (locPlace 2) (.ref (.mut true) (locPlace 1)),
+     .retag .twoPhase (locPlace 2),
+     .assign (locPlace 1) (.use (constU32 99)),
+     .assign (locPlace 0) (.use (.copy (derefPlace 2))),
+     .storageDead 2]
+
+def unsafeCellDirectWriteSurvivesMir : CapturedMir :=
+  singleBlockBody "witness::unsafe_cell_direct_write_survives" 1
+    [u32Decl, unsafeCellU32Decl, refMutUnsafeCellU32Decl, refSharedUnsafeCellU32Decl,
+     u32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .assign (locPlace 2) (.ref (.mut false) (locPlace 1)),
+     .assign (locPlace 3) (.ref .shared (locPlace 1)),
+     .assign (locPlace 1) (.aggregate (.adt "core::cell::UnsafeCell" 0 none) [constU32 44]),
+     .assign (locPlace 4) (.use (.copy (derefField0U32Place 2))),
+     .assign (locPlace 5) (.use (.copy (derefField0U32Place 3))),
+     .assign (locPlace 0) (.binaryOp .add (.copy (locPlace 4)) (.copy (locPlace 5))),
+     .storageDead 5, .storageDead 4, .storageDead 3, .storageDead 2]
+    unsafeCellU32Layouts
+
+theorem div3_twophase_direct_write_end_to_end :
+    trustedFaultsUB twoPhaseDirectWriteMir [] [.scalar ⟨5, 4⟩] = true ∧
+    runTrustedScalar? unsafeCellDirectWriteSurvivesMir []
+      [.aggregate 0 [.scalar ⟨5, 4⟩]] = .some (88, 4) := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-- 4–5. `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC` & `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` end-to-end
+witnesses and canaries. -/
+def retagFnEntryLocalDeallocUbMir : CapturedMir :=
+  singleBlockBody "witness::retag_fn_entry_local_dealloc_ub" 1
+    [u32Decl, u32Decl, refSharedU32Decl]
+    [.storageLive 2,
+     .assign (locPlace 2) (.ref .shared (locPlace 1)),
+     .retag .fnEntry (locPlace 2),
+     .assign (locPlace 0) (.use (.copy (derefPlace 2)))]
+
+def callerOfFnEntryLocalDeallocMir : CapturedMir :=
+  mkMirBody "witness::caller_of_fn_entry_local_dealloc" 1
+    [u32Decl, u32Decl]
+    [{ statements := [],
+       terminator := mkTerm (.call (fnDefOp "witness::retag_fn_entry_local_dealloc_ub")
+         [.copy (locPlace 1)] (locPlace 0) (some 1) .continue_),
+       isCleanup := false },
+     { statements := [],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def calleeReturnRawPtrToLocalMir : CapturedMir :=
+  singleBlockBody "witness::callee_return_raw_ptr_to_local" 1
+    [ptrMutU32Decl, u32Decl]
+    [.assign (locPlace 0) (.rawPtr .mut (locPlace 1))]
+
+def callerDerefReturnedCalleeRawPtrMir : CapturedMir :=
+  mkMirBody "witness::caller_deref_returned_callee_raw_ptr" 1
+    [u32Decl, u32Decl, ptrMutU32Decl]
+    [{ statements := [mkStmt (.storageLive 2)],
+       terminator := mkTerm (.call (fnDefOp "witness::callee_return_raw_ptr_to_local")
+         [.copy (locPlace 1)] (locPlace 2) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0) (.use (.copy (derefPlace 2)))),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def calleeRetConst42Mir : CapturedMir :=
+  singleBlockBody "witness::callee_ret_const42" 0
+    [u32Decl]
+    [.assign (locPlace 0) (.use (constU32 42))]
+
+def callerRetDestConflictMir (protectBorrow : Bool) : CapturedMir :=
+  mkMirBody "witness::caller_ret_dest_conflict" 1
+    [u32Decl, u32Decl, refSharedU32Decl]
+    [{ statements :=
+         [mkStmt (.storageLive 2),
+          mkStmt (.assign (locPlace 2) (.ref .shared (locPlace 1)))] ++
+         (match protectBorrow with
+          | true => [mkStmt (.retag .fnEntry (locPlace 2))]
+          | false => []),
+       terminator := mkTerm (.call (fnDefOp "witness::callee_ret_const42")
+         [] (locPlace 1) (some 1) .continue_),
+       isCleanup := false },
+     { statements :=
+         [mkStmt (.assign (locPlace 0)
+            (.use (.copy (match protectBorrow with | true => locPlace 1 | false => derefPlace 2)))),
+          mkStmt (.storageDead 2)],
+       terminator := mkTerm .return_,
+       isCleanup := false }]
+
+def unsafeCellProtectedInteriorMutMir : CapturedMir :=
+  singleBlockBody "witness::unsafe_cell_protected_interior_mut" 1
+    [u32Decl, unsafeCellU32Decl, refSharedUnsafeCellU32Decl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 2) (.ref .shared (locPlace 1)),
+     .retag .fnEntry (locPlace 2),
+     .assign (locPlace 3) (.rawPtr .mut (derefField0U32Place 2)),
+     .assign (derefPlace 3) (.use (constU32 77)),
+     .assign (locPlace 0) (.use (.copy (derefField0U32Place 2))),
+     .storageDead 3, .storageDead 2]
+    unsafeCellU32Layouts
+
+def unsafeCellProtectedStorageDeadMir : CapturedMir :=
+  singleBlockBody "witness::unsafe_cell_protected_storage_dead" 1
+    [u32Decl, unsafeCellU32Decl, refSharedUnsafeCellU32Decl, unsafeCellU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 3) (.use (.copy (locPlace 1))),
+     .assign (locPlace 2) (.ref .shared (locPlace 3)),
+     .retag .fnEntry (locPlace 2),
+     .assign (locPlace 0) (.use (.copy (derefField0U32Place 2))),
+     .storageDead 3]
+    unsafeCellU32Layouts
+
+theorem div4_5_fnentry_dealloc_and_unsafecell_end_to_end :
+    trustedFaultsUB retagFnEntryLocalDeallocUbMir [] [.scalar ⟨5, 4⟩] = true ∧
+    trustedFaultsUB callerOfFnEntryLocalDeallocMir [retagFnEntryLocalDeallocUbMir]
+      [.scalar ⟨5, 4⟩] = true ∧
+    trustedFaultsUB callerDerefReturnedCalleeRawPtrMir [calleeReturnRawPtrToLocalMir]
+      [.scalar ⟨5, 4⟩] = true ∧
+    trustedFaultsUB (callerRetDestConflictMir false) [calleeRetConst42Mir]
+      [.scalar ⟨5, 4⟩] = true ∧
+    trustedFaultsUB (callerRetDestConflictMir true) [calleeRetConst42Mir]
+      [.scalar ⟨5, 4⟩] = true ∧
+    runTrustedScalar? unsafeCellProtectedInteriorMutMir []
+      [.aggregate 0 [.scalar ⟨5, 4⟩]] = .some (77, 4) ∧
+    runTrustedScalar? unsafeCellProtectedStorageDeadMir []
+      [.aggregate 0 [.scalar ⟨5, 4⟩]] = .some (5, 4) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- 6. `DIV-LM-RAW-OVERWRITE-CHAR-COPY` end-to-end witness and deref-move canary. -/
+def rawOverwriteCharLoadMir (code : Nat) (useMove : Bool) : CapturedMir :=
+  singleBlockBody "witness::raw_overwrite_char_load" 1
+    [charDecl, charDecl, ptrMutU32Decl, charDecl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .assign (derefPlace 2) (.use (constU32 code)),
+     .assign (locPlace 3) (.use (match useMove with | true => .move (locPlace 1) | false => .copy (locPlace 1))),
+     .assign (locPlace 0) (.use (.copy (locPlace 3))),
+     .storageDead 3, .storageDead 2]
+
+def rawOverwriteCharDerefMoveMir (code : Nat) : CapturedMir :=
+  singleBlockBody "witness::raw_overwrite_char_deref_move" 1
+    [charDecl, charDecl, ptrMutU32Decl, ptrMutCharDecl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .assign (derefPlace 2) (.use (constU32 code)),
+     .assign (locPlace 3) (.rawPtr .mut (locPlace 1)),
+     .assign (locPlace 0) (.use (.move (derefPlace 3))),
+     .storageDead 3, .storageDead 2]
+
+theorem div6_raw_overwrite_char_end_to_end :
+    trustedFaultsUB (rawOverwriteCharLoadMir 0xD800 false) [] [.scalar ⟨0x41, 4⟩] = true ∧
+    trustedFaultsUB (rawOverwriteCharLoadMir 0xDFFF false) [] [.scalar ⟨0x41, 4⟩] = true ∧
+    trustedFaultsUB (rawOverwriteCharLoadMir 0x110000 false) [] [.scalar ⟨0x41, 4⟩] = true ∧
+    trustedFaultsUB (rawOverwriteCharLoadMir 0xD800 true) [] [.scalar ⟨0x41, 4⟩] = true ∧
+    trustedFaultsUB (rawOverwriteCharDerefMoveMir 0xD800) [] [.scalar ⟨0x41, 4⟩] = true ∧
+    runTrustedScalar? (rawOverwriteCharLoadMir 0x41 false) [] [.scalar ⟨0x41, 4⟩] = .some (0x41, 4) ∧
+    runTrustedScalar? (rawOverwriteCharLoadMir 0xD7FF false) [] [.scalar ⟨0x41, 4⟩] = .some (0xD7FF, 4) ∧
+    runTrustedScalar? (rawOverwriteCharLoadMir 0xE000 true) [] [.scalar ⟨0x41, 4⟩] = .some (0xE000, 4) ∧
+    runTrustedScalar? (rawOverwriteCharLoadMir 0x10FFFF true) [] [.scalar ⟨0x41, 4⟩] = .some (0x10FFFF, 4) ∧
+    runTrustedScalar? (rawOverwriteCharDerefMoveMir 0x10FFFF) [] [.scalar ⟨0x41, 4⟩] = .some (0x10FFFF, 4) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel⟩
+
+/-- 7. `DIV-LM-D6-OFFSET-DISABLED-TAG` end-to-end 4-witness suite and storage-revival canary. -/
+def lm31OffsetDisabledLiveMir : CapturedMir :=
+  singleBlockBody "witness::lm31_offset_disabled_live_stride" 1
+    [u64Decl, u64Decl, ptrMutU64Decl, ptrMutU64Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .assign (locPlace 1) (.use (constU64 7)),
+     .assign (locPlace 3) (.binaryOp .offset (.move (locPlace 2)) (constUsize 1)),
+     .assign (locPlace 0) (.use (constU64 1)),
+     .storageDead 3, .storageDead 2]
+
+def lm31OffsetDisabledNegMir : CapturedMir :=
+  singleBlockBody "witness::lm31_offset_disabled_live_neg_isize" 1
+    [u64Decl, u64Decl, ptrMutU64Decl, ptrMutU64Decl, ptrMutU64Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .assign (locPlace 3) (.binaryOp .offset (.copy (locPlace 2)) (constUsize 1)),
+     .assign (locPlace 1) (.use (constU64 7)),
+     .assign (locPlace 4) (.binaryOp .offset (.move (locPlace 3)) (constIsize 18446744073709551615)),
+     .assign (locPlace 0) (.use (constU64 1)),
+     .storageDead 4, .storageDead 3, .storageDead 2]
+
+def lm31OffsetDisabledUsizeMaxMir : CapturedMir :=
+  singleBlockBody "witness::lm31_offset_disabled_usize_max" 1
+    [u64Decl, u64Decl, ptrMutU64Decl, ptrMutU64Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .assign (locPlace 1) (.use (constU64 7)),
+     .assign (locPlace 3) (.binaryOp .offset (.copy (locPlace 2)) (constUsize 18446744073709551615)),
+     .assign (locPlace 0) (.use (constU64 1)),
+     .storageDead 3, .storageDead 2]
+
+def lm31OffsetDisabledDeadZeroMir : CapturedMir :=
+  singleBlockBody "witness::lm31_offset_disabled_dead_zero_at_8" 1
+    [u64Decl, u64Decl, ptrMutU64Decl, ptrMutU64Decl, ptrMutU64Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .assign (locPlace 3) (.binaryOp .offset (.copy (locPlace 2)) (constUsize 1)),
+     .storageDead 1,
+     .assign (locPlace 4) (.binaryOp .offset (.copy (locPlace 3)) (constUsize 0)),
+     .assign (locPlace 0) (.use (constU64 1)),
+     .storageDead 4, .storageDead 3, .storageDead 2]
+
+def stmtDivRevivePtrOffsetMir (offCount : Nat) : CapturedMir :=
+  singleBlockBody "witness::stmt_div_revive_ptr_offset" 1
+    [u64Decl, u64Decl, ptrMutU64Decl, ptrMutU64Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (locPlace 1) (.use (constU64 10)),
+     .assign (locPlace 2) (.rawPtr .mut (locPlace 1)),
+     .storageDead 1,
+     .storageLive 1,
+     .assign (locPlace 3) (.binaryOp .offset (.copy (locPlace 2)) (constIsize offCount)),
+     .assign (locPlace 0) (.use (constU64 0)),
+     .storageDead 3, .storageDead 2, .storageDead 1]
+
+theorem div7_offset_disabled_tag_end_to_end :
+    runTrustedScalar? lm31OffsetDisabledLiveMir [] [.scalar ⟨42, 8⟩] = .some (1, 8) ∧
+    runTrustedScalar? lm31OffsetDisabledNegMir [] [.scalar ⟨42, 8⟩] = .some (1, 8) ∧
+    trustedFaultsUB lm31OffsetDisabledUsizeMaxMir [] [.scalar ⟨42, 8⟩] = true ∧
+    runTrustedScalar? lm31OffsetDisabledDeadZeroMir [] [.scalar ⟨42, 8⟩] = .some (1, 8) ∧
+    trustedFaultsUB (stmtDivRevivePtrOffsetMir 1) [] [.scalar ⟨10, 8⟩] = true ∧
+    runTrustedScalar? (stmtDivRevivePtrOffsetMir 0) [] [.scalar ⟨10, 8⟩] = .some (0, 8) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- 8. `DIV-LM-ENUM-SET-DISCR-UNINIT` end-to-end witnesses and borrow/protector canaries. -/
+def setDiscrUninitObsMir (variantIdx : Nat) : CapturedMir :=
+  singleBlockBody "witness::set_discriminant_uninit_obs" 1
+    [isizeDecl, u32Decl, optionU32Decl]
+    [.storageLive 2,
+     .setDiscriminant (locPlace 2) variantIdx,
+     .assign (locPlace 0) (.discriminant (locPlace 2)),
+     .storageDead 2]
+
+def setDiscrUninitPayloadMir : CapturedMir :=
+  singleBlockBody "witness::set_discriminant_uninit_payload" 1
+    [u32Decl, u32Decl, optionU32Decl]
+    [.storageLive 2,
+     .setDiscriminant (locPlace 2) 1,
+     .assign (locPlace 0) (.use (.copy (somePayloadPlace 2))),
+     .storageDead 2]
+
+def setDiscrInvalidatesBorrowMir : CapturedMir :=
+  singleBlockBody "witness::set_discr_invalidates_borrow" 1
+    [isizeDecl, optionU32Decl, refSharedOptionU32Decl]
+    [.storageLive 2,
+     .assign (locPlace 2) (.ref .shared (locPlace 1)),
+     .setDiscriminant (locPlace 1) 1,
+     .assign (locPlace 0) (.discriminant (derefPlace 2)),
+     .storageDead 2]
+
+def setDiscrProtectedConflictMir (uninitSlot : Bool) : CapturedMir :=
+  singleBlockBody "witness::set_discr_protected_conflict" 1
+    [isizeDecl, optionU32Decl, refSharedOptionU32Decl, optionU32Decl]
+    ([.storageLive 2, .storageLive 3] ++
+     (match uninitSlot with
+      | true =>
+        [.assign (locPlace 2) (.ref .shared (locPlace 3)),
+         .retag .fnEntry (locPlace 2),
+         .setDiscriminant (locPlace 3) 1,
+         .assign (locPlace 0) (.discriminant (locPlace 3))]
+      | false =>
+        [.assign (locPlace 2) (.ref .shared (locPlace 1)),
+         .retag .fnEntry (locPlace 2),
+         .setDiscriminant (locPlace 1) 1,
+         .assign (locPlace 0) (.discriminant (locPlace 1))]) ++
+     [.storageDead 3, .storageDead 2])
+
+theorem div8_set_discriminant_uninit_end_to_end :
+    runTrustedScalar? (setDiscrUninitObsMir 1) [] [.scalar ⟨5, 4⟩] = .some (1, 8) ∧
+    runTrustedScalar? (setDiscrUninitObsMir 0) [] [.scalar ⟨5, 4⟩] = .some (0, 8) ∧
+    trustedFaultsUB setDiscrUninitPayloadMir [] [.scalar ⟨5, 4⟩] = true ∧
+    trustedFaultsUB setDiscrInvalidatesBorrowMir [] [.aggregate 0 []] = true ∧
+    trustedFaultsUB (setDiscrProtectedConflictMir true) [] [.aggregate 0 []] = true ∧
+    trustedFaultsUB (setDiscrProtectedConflictMir false) [] [.aggregate 0 []] = true := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
+
 end Anneal.TcbCorrespondenceDiv8Tests

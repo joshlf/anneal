@@ -1160,7 +1160,8 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       resolveIntrinsicIsSigned resolvedTarget cur.localDecls cur.layouts
           (lhsOp :: rhsOps) = some isSigned →
       evalExactDiv lhs rhs isSigned = some retScalar →
-      writePlaceValue env' mem.borrows destination (.scalar retScalar) =
+      writePlaceValue env' mem.borrows destination (.scalar retScalar)
+          (callStack := mem.callStack) =
         .ok updatedEnv →
       post (.frame targetBb 0 updatedEnv mem) →
       LiftTerminator cur bbIdx stmtIdx env mem post
@@ -1730,7 +1731,7 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     rw [h_signed]
     dsimp only []
     rw [h_div]
-    dsimp only []
+    dsimp only [writeIntrinsicReturn]
     rw [h_write]
     exact h_next
   | tailCallDirect h_callee h_args h_ctx h_noDealloc h_next =>

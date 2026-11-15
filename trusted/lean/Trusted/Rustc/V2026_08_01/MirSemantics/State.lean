@@ -896,6 +896,28 @@ def frameLocalDeclsAndLayoutsAtDepth
     | .none => .none
 
 /--
+`localDecls` and `layouts` of the foreign (non-active-frame) borrow target
+`(d, loc)` resolved by `foreignFrameSlot?`: `(sf.callerBody.localDecls, sf.callerBody.layouts)`
+when `loc` is a local of the suspended caller frame `sf` at depth `d`, and
+`(.nil, defaultLayouts)` when `callStack` is empty or `(d, loc)` falls back to
+the root frame's caller-owned referent slots `callerLocals`.
+-/
+def foreignFrameDeclsAndLayouts
+    (callStack : List SavedCallerFrame)
+    (defaultLayouts : LayoutTable)
+    (d loc : Nat) :
+    List LocalDecl × LayoutTable :=
+  match callStack with
+  | .nil => (.nil, defaultLayouts)
+  | _ :: _ =>
+    match savedFrameAtDepth? callStack d with
+    | .some sf =>
+      match get? sf.frame.locals loc with
+      | .some _ => (sf.callerBody.localDecls, sf.callerBody.layouts)
+      | .none => (.nil, sf.callerBody.layouts)
+    | .none => (.nil, defaultLayouts)
+
+/--
 External or unresolved procedure-call interaction request emitted by
 `TerminatorKind.call` and `TerminatorKind.tailCall` when no transparent
 `CapturedMir` body is registered in `Memory.callees`.

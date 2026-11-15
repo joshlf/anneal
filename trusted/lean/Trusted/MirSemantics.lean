@@ -25,6 +25,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   currentFrameDepth frameIndexOfDepth savedFrameAtDepth? activeFrameSlot?
   foreignFrameSlot? readFrameLocalSlot ForeignFrameTarget foreignFrameTarget?
   commitForeignFrameLocals writeFrameLocalSlot frameLocalDeclsAndLayoutsAtDepth
+  foreignFrameDeclsAndLayouts
   MirCallReq MirCallAns MirFailE MirObsE MirCallE MirEffect MirReturn MirOutcome
   MirExecState MirStepNode
   ProjReadResult ProjWriteResult PlaceReadResult OperandEvalResult
@@ -100,7 +101,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   invalidateDerefWriteBorrowsWithLayouts appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
-  preventsDeallocation copyEntriesTargetActiveFrame setDiscriminantUninitDeclOk
+  preventsDeallocation copyEntriesTargetActiveFrame
+  evalForeignFrameCopySingleDirect setDiscriminantUninitDeclOk
   evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
   foreignFrameDerefWrite evalForeignFrameDerefWrite
   evalStmt lookupSwitchTarget findCallee?
