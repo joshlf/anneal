@@ -69,7 +69,8 @@ Execute trust-boundary review as a dedicated pass:
    host permits prose. Otherwise use permitted summary or status fields, or
    another already authorized reporting channel. If none exists, omit the
    narrative, not the assessment, and return only schema-supported findings.
-   Follow the [reporting fallback](../change-review/SKILL.md#report-within-the-hosts-constraints)
+   Follow the [reporting
+   fallback](../change-review/SKILL.md#report-within-the-hosts-constraints)
    for findings-only output and incomplete reviews; never fabricate a finding
    to carry the assessment.
 
@@ -109,10 +110,18 @@ intentional or accidental enforcement bypasses:
      `rustc` flags, `RUSTC_WRAPPER`, linker behavior, or dependency sources.
 2. **Filesystem, module-discovery, and artifact evasion:**
    - Check that no `.lean` files are placed in directories or naming layouts
-     outside the trees scanned by `anneal-audit` (`trusted/lean/` and
-     `theory/`), and that no symlinks, hardlinks, git submodules, or
-     pre-compiled `.olean`, `.ilean`, or `.ir` artifacts are introduced into the
-     source tree.
+     outside the trees verified by `anneal-audit` (`trusted/lean/`, `theory/`,
+     and the SHA-256-pinned `vendor/lean-miri/` reference model), and that no
+     symlinks, hardlinks, git submodules, or pre-compiled `.olean`, `.ilean`,
+     or `.ir` artifacts are introduced into the source tree.
+   - For any change touching `vendor/lean-miri/` (which bypasses Phase 1
+     syntactic preflight and belongs to the correspondence TCB), verify the
+     upstream commit and tree pin (`LOCKED_MIRI_COMMIT`,
+     `vendor_tree.manifest_sha256`), the closed `LOCKED_PATCHED_MIRI_FILES`
+     allowlist, the `LOCKED_UPSTREAM_PIN_SHA256` digest lock in
+     [`trusted/audit/src/lib.rs`](../../trusted/audit/src/lib.rs), and human
+     audit of any compile-time code (`run_cmd`, `initialize`, custom tactic
+     `elab`s) in vendored or patched modules.
    - Watch for path-normalization tricks, case-collision filenames, or Unicode
      homoglyphs and bidirectional/invisible control characters in module or
      identifier names.
@@ -207,12 +216,17 @@ affected components against these requirements:
   [`boundary_audit.rs`](../../trusted/audit/tests/boundary_audit.rs) verifying
   that prohibited inputs are rejected with policy exit code `1`.
 - **Cryptographic lock synchronization:** When `Cargo.toml`, `Cargo.lock`,
-  `flake.nix`, `flake.lock`, the Lean binary, or `Init.*` prelude files change,
-  verify that
-  [`trusted/root-manifest.sha256`](../../trusted/root-manifest.sha256) and
+  `flake.nix`, `flake.lock`, the Lean binary, sysroot `.olean` files, or
+  `vendor/lean-miri/` change, verify that
+  [`trusted/root-manifest.sha256`](../../trusted/root-manifest.sha256),
   [`foundation-lock.json`](../../trusted/lean/foundation-lock.json)
-  (`trusted/lean/foundation-lock.json`) are updated in lockstep and that the
-  underlying dependency or toolchain change is audited.
+  (`trusted/lean/foundation-lock.json`),
+  [`UPSTREAM_PIN.json`](../../vendor/lean-miri/UPSTREAM_PIN.json), and the
+  corresponding `LOCKED_*` constants in
+  [`trusted/audit/src/lib.rs`](../../trusted/audit/src/lib.rs)
+  (`LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256`, `LOCKED_UPSTREAM_PIN_SHA256`,
+  `LOCKED_MIRI_COMMIT`, `LOCKED_PATCHED_MIRI_FILES`) are updated in lockstep
+  and that the underlying dependency, toolchain, or vendored change is audited.
 
 ### 4. CLI orchestrator and dependencies (`trusted/cargo-anneal/`, `Cargo.*`)
 
