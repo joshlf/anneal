@@ -45,6 +45,8 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       (by rcases h_ret with ⟨h, rfl⟩ | ⟨-, rfl⟩; exact h; exact Nat.le_refl _)
   apply Hold.val
   refine hold_mirBool_of_blockLinear_constructive _ _ rfl rfl ?_
+  -- Step the companion CFG for symbolic `ret`: `whnf` evaluates each closure-capture deref
+  -- in place, `h_le_req`/`h_le_max` prune the dead `false` arms, and `bb2`'s `||` is split.
   repeat (first
       | dsimp only [
           Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.layouts,

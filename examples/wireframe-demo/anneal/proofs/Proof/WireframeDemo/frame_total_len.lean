@@ -34,6 +34,8 @@ private theorem ensures_holds (b1 b2 : Nat) (hb1 : b1 ≤ 16) (hb2 : b2 ≤ 1024
     wrapScalarBits_eq_of_lt h_sum
   apply Hold.val
   refine hold_mirBool_of_blockLinear_constructive _ _ rfl rfl ?_
+  -- Step the companion CFG: `whnf` evaluates each closure-capture deref in place, and the
+  -- overflow / equality branches on `b1 + b2` are rewritten with `h_ov`, `h_wrap`, `Nat.beq_refl`.
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_ensures_frame_total_len.layouts,
@@ -78,7 +80,7 @@ private theorem wpReq_inversion (b1 b2 : Nat)
       [.scalar { bits := b1, sizeBytes := 2 }, .scalar { bits := b2, sizeBytes := 2 }]) :
     b1 ≤ 16 ∧ b2 ≤ 1024 := by
   have h_hold :=
-    holdBoolReq_of_mirBool
+    holdBoolReq_of_mirBool_constructive
       Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.body
       [.scalar { bits := b1, sizeBytes := 2 }, .scalar { bits := b2, sizeBytes := 2 }]
       rfl rfl h_req

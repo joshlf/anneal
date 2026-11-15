@@ -21604,7 +21604,7 @@ theorem wpCfgStep_eq_constructive
                 dsimp only
                 have h_bi_eq : s.frame.blockIdx = blockIdx := Nat.eq_of_beq_eq_true h_bi
                 have h_si_eq : s.frame.stmtIdx = length pfx := Nat.eq_of_beq_eq_true h_si
-                have h_eq : bb.statements = pfx := by simpa using h_stmts
+                have h_eq : bb.statements = pfx := h_stmts.trans (List.append_nil pfx)
                 subst h_eq
                 dsimp only [wpExecGen, stepMirSymTreeFast]
                 rw [h_ac]
@@ -21652,7 +21652,8 @@ theorem wpCfgStep_eq_constructive
                 rcases Prod.mk.injEq _ _ _ _ ▸ h_tup with ⟨rfl, h_tup2⟩
                 rcases Prod.mk.injEq _ _ _ _ ▸ h_tup2 with ⟨rfl, h_tup3⟩
                 rcases Prod.mk.injEq _ _ _ _ ▸ h_tup3 with ⟨rfl, rfl⟩
-                refine ⟨bb, pfx ++ [stmt], h_bb, ?_, by simp [h_stmts, List.append_assoc], rfl⟩
+                refine ⟨bb, pfx ++ [stmt], h_bb, ?_,
+                  h_stmts.trans (List.append_assoc pfx [stmt] rest).symm, rfl⟩
                 exact (length_append_singleton pfx stmt).symm
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) entry-block initialization for `wpBlockLinear`. -/
@@ -21691,6 +21692,80 @@ theorem hold_mirBool_of_blockLinear_constructive
   rw [wpMirExecSym_eq_gen,
       wpStartBlock0_eq_constructive False body (entryBB body) _ (defaultSpecSteps body) args h_phase h_bb0]
   exact h.val
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) necessity bridge, dual to
+`treeSafe_and_ret_of_mirWpConverges`: all-prefix fault freedom of
+`ITree.cofix (stepMirState body) st` together with `post` on every reachable return implies
+the dual fuel-bounded `wpMirExecOrExhaustedSym` at every fuel, by structural recursion on
+the fuel along `Reaches` (no `DWLP` coinduction). -/
+theorem wpMirExecOrExhaustedSym_of_treeSafe_ret
+    (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      TreeSafe (ITree.cofix (stepMirState body) st) →
+      (∀ tr out, ReachesRet (ITree.cofix (stepMirState body) st) tr out → post out) →
+      wpMirExecOrExhaustedSym fuel body st post
+  | 0, _, _, _ => True.intro
+  | fuel' + 1, st, h_safe, h_ret => by
+    unfold wpMirExecOrExhaustedSym
+    rw [evalSymNodeTree_eq, stepMirExecSymTree_eval, evalNodeWP_eq]
+    have h_obs := ITree.observe_cofix (stepMirState body) st
+    cases h_step : stepMirState body st with
+    | ret out =>
+      rw [h_step] at h_obs
+      exact h_ret [] out ⟨_, .refl _, h_obs⟩
+    | tau st' =>
+      rw [h_step] at h_obs
+      exact wpMirExecOrExhaustedSym_of_treeSafe_ret body post fuel' st'
+        (fun tr u h_r => h_safe tr u (.tau h_obs h_r))
+        (fun tr out ⟨u, h_r, h_u⟩ => h_ret tr out ⟨u, .tau h_obs h_r, h_u⟩)
+    | vis i k =>
+      rw [h_step] at h_obs
+      rcases i with fk | obs | req
+      · -- A fault request is reachable from the root: contradicts `TreeSafe`.
+        exact h_safe [] _ (.refl _) ⟨_, _, _, .refl _, h_obs, trivial⟩
+      · -- Observations step through their unique `PUnit` answer.
+        exact wpMirExecOrExhaustedSym_of_treeSafe_ret body post fuel' (k PUnit.unit)
+          (fun _ u h_r => h_safe _ u (.vis h_obs id PUnit.unit h_r))
+          (fun _ out ⟨u, h_r, h_u⟩ => h_ret _ out ⟨u, .vis h_obs id PUnit.unit h_r, h_u⟩)
+      · -- Unlinked calls are answered demonically: every response is reachable.
+        rcases req with ⟨_⟩
+        intro o
+        exact wpMirExecOrExhaustedSym_of_treeSafe_ret body post fuel' (k o)
+          (fun _ u h_r => h_safe _ u (.vis h_obs id o h_r))
+          (fun _ out ⟨u, h_r, h_u⟩ => h_ret _ out ⟨u, .vis h_obs id o h_r, h_u⟩)
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) inversion of a `MirBoolPredicateHolds`
+hypothesis (such as a `requires` companion) into the single-pass symbolic
+`holdBoolMirSym` formula at any fuel. -/
+theorem holdBoolMirSym_of_mirBoolPredicateHolds_constructive
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
+    (h : MirBoolPredicateHolds specBody args) :
+    holdBoolMirSym fuel specBody args := by
+  obtain ⟨h_safe, h_ret⟩ := h args rfl
+  refine wpMirExecOrExhaustedSym_of_treeSafe_ret specBody _ fuel _ h_safe ?_
+  intro tr out h_r
+  cases out with
+  | normal p => exact h_ret (tr, .normal p) h_r rfl p.1 p.2 rfl
+  | panic => trivial
+  | abort => trivial
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) `wpBlockLinear` inversion of
+`MirBoolPredicateHolds`, dual to `hold_mirBool_of_blockLinear_constructive`. -/
+theorem holdBoolReq_of_mirBool_constructive
+    (body : CapturedMir) (args : List Value)
+    (h_phase : body.phase = .runtimeOptimized)
+    (h_bb0 : get? body.basicBlocks 0 = some (entryBB body))
+    (h : MirBoolPredicateHolds body args) :
+    Hold
+      (wpBlockLinear True body (entryBB body).terminator
+        (mirSafePost (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }))
+        0 0 (defaultSpecSteps body) (entryBB body).statements
+        (initLocalsAux 0 body.localDecls args)
+        (initMachineState body args).memory) := by
+  refine ⟨?_⟩
+  rw [← wpStartBlock0_eq_constructive True body (entryBB body) _ (defaultSpecSteps body) args
+      h_phase h_bb0, ← wpMirExecOrExhaustedSym_eq_gen]
+  exact holdBoolMirSym_of_mirBoolPredicateHolds_constructive (defaultSpecSteps body) body args h
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) `runCfgSteps` soundness for `wpCoalBounded`. -/
 theorem wpCoalBounded_of_runCfgSteps_constructive
@@ -21815,7 +21890,7 @@ theorem wpCoalBounded_of_runCfgSteps_constructive
               | nil =>
                 dsimp only at h_ok1 h_wp
                 rw [h_bi, h_si] at h_ok1 h_wp
-                have h_eq : bb.statements = pfx := by simpa using h_stmts
+                have h_eq : bb.statements = pfx := h_stmts.trans (List.append_nil pfx)
                 rw [← h_eq, get?_length_none]
                 dsimp only
                 rw [nat_beq_self_eq_true, ite_eq_left rfl]
@@ -21830,7 +21905,7 @@ theorem wpCoalBounded_of_runCfgSteps_constructive
                   (.some (blockIdx, Nat.add (length pfx) 1, rest, bb.terminator))
                   (evalStmtFast body s stmt)
                   ⟨bb, pfx ++ [stmt], h_bb, (length_append_singleton pfx stmt).symm,
-                    by simp [h_stmts, List.append_assoc], rfl⟩
+                    h_stmts.trans (List.append_assoc pfx [stmt] rest).symm, rfl⟩
                   h_ok1 ih h_wp
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) `evalMirSpecBool` bridge for `MirBoolPredicateHolds`. -/

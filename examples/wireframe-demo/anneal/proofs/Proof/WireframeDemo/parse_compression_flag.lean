@@ -28,10 +28,11 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
       [.scalar { bits := b, sizeBytes := 1 }]) :
     b = 0 ∨ b = 1 := by
   have h_hold :=
-    holdBoolReq_of_mirBool
+    holdBoolReq_of_mirBool_constructive
       Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body
       [.scalar { bits := b, sizeBytes := 1 }] rfl rfl h_req.2
   revert h_hold
+  -- Step the companion CFG; `whnf` evaluates the closure-capture read `*(*_8).0` in place.
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
