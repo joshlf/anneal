@@ -1212,4 +1212,79 @@ theorem b2_3_cross_frame_target_layouts_and_slice_align_end_to_end :
       [b2CallerPackedFrame] = .ub := by
   refine ⟨by decide +kernel, rfl, rfl⟩
 
+/-! ## 11. Pass A2 Dual-Table (Active vs. Owning Frame) `LayoutTable` Regression Witnesses -/
+
+/-- `a2CalleeLayouts[1]`: 8-byte two-field `Pair { a: u32, b: u32 }` (fields at byte offsets
+`0` and `4`, both `u32` at `a2CalleeLayouts[0]`). -/
+def a2PairLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0] }
+
+/-- `a2CallerLayouts[1]`: an unrelated 4-byte single-field `Wrap { x: u32 }`. -/
+def a2WrapLayout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }] [0],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0] }
+
+/-- `a2CallerLayouts[2]`: `[u32; 2]`. -/
+def a2Arr2Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .array { bytes := 4 } 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0] }
+
+def a2CalleeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u32PrimLayout, a2PairLayout] }
+
+def a2CallerLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [u32PrimLayout, a2WrapLayout, a2Arr2Layout] }
+
+def a2PairT : Ty := { kind := .adt "witness::Pair" [], layoutIdx := 1 }
+def a2PairDecl : LocalDecl := { mutability := .mut, ty := a2PairT, debugName := none }
+def a2PtrConstPairDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .not a2PairT.kind, layoutIdx := 0 },
+    debugName := none }
+def a2PtrMutPairDecl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut a2PairT.kind, layoutIdx := 0 },
+    debugName := none }
+def a2Arr2T : Ty := { kind := .array (.uint .u32) 2, layoutIdx := 2 }
+def a2Arr2Decl : LocalDecl := { mutability := .mut, ty := a2Arr2T, debugName := none }
+
+/-- Saved caller frame (depth `0`, body tables `a2CallerLayouts`): `_1 : [u32; 2] = [11, 22]`. -/
+def a2CallerArr2Frame : SavedCallerFrame := {
+  callerBody := { (mkMirBody "witness::a2_caller_arr2" 0 [u32Decl, a2Arr2Decl] []) with
+                  layouts := a2CallerLayouts }
+  frame := { blockIdx := 0, stmtIdx := 0,
+             locals := [.init (.scalar ⟨0, 4⟩),
+                        .init (.aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨22, 4⟩])] }
+  destination := locPlace 0
+}
+
+/-- Caller-minted raw tag `40` targeting the caller's `_1` at depth `0`. -/
+def a2CallerArr2Entry : BorrowEntry :=
+  { tag := 40, targetLocal := 1, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+
+/-- Callee locals: `_1 = ptr(tag 40, offset 0)`. -/
+def a2CalleePtrLocals : List LocalSlot :=
+  [.uninit, .init (.ptr { allocId := 40, offsetBytes := 0 } 8), .uninit]
+
+/-- A2-1: B2 resolved the accessed/pointee type of cross-frame typed thin-pointer derefs in the
+owning (caller) frame's `LayoutTable` inside `decodeSubValueAtByteOffset?`,
+`decodeAtBorrowTargetOffset?`, `spliceSubValueAtByteOffset?`, and
+`resolveStackThinPtrTargetProjWithResidual?`, so `Pair@1` was decoded/encoded with the caller's
+unrelated `Wrap@1`. A callee read of a whole `Pair` through `*const Pair` into the caller's
+`[u32; 2]` must decode both fields in the callee's table (B2 returned the truncated one-field
+aggregate `[11]`), and a write of `Pair { 33, 44 }` through `*mut Pair` must update both caller
+elements (B2 faulted `.ub`). -/
+theorem a2_1_cross_frame_aggregate_read_write_use_active_layouts :
+    evalPlaceRead a2CalleePtrLocals (derefPlace 1) [a2CallerArr2Entry] [] a2CalleeLayouts []
+        [u32Decl, a2PtrConstPairDecl, a2PairDecl] [a2CallerArr2Frame] =
+      .ok (.aggregate 0 [.scalar ⟨11, 4⟩, .scalar ⟨22, 4⟩]) a2CalleePtrLocals ∧
+    writeCallerPlaceValue a2CalleePtrLocals a2CallerArr2Frame.frame.locals [a2CallerArr2Entry]
+        (derefPlace 1) (.aggregate 0 [.scalar ⟨33, 4⟩, .scalar ⟨44, 4⟩])
+        [u32Decl, a2PtrMutPairDecl, a2PairDecl] a2CalleeLayouts [a2CallerArr2Frame] =
+      .ok [.init (.scalar ⟨0, 4⟩), .init (.aggregate 0 [.scalar ⟨33, 4⟩, .scalar ⟨44, 4⟩])] := by
+  refine ⟨rfl, rfl⟩
+
 end Anneal.TcbCorrespondenceDiv8Tests

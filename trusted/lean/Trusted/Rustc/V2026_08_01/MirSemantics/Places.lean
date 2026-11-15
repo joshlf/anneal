@@ -5197,14 +5197,16 @@ def resolveStackThinPtrTargetProjWithResidual?
     (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable)
     (pointeeTyOpt : Option Ty := .none)
-    (reqBytesOpt : Option Nat := .none) :
+    (reqBytesOpt : Option Nat := .none)
+    (pointeeDecls : List LocalDecl := localDecls)
+    (pointeeLayouts : LayoutTable := layouts) :
     Option (List ProjectionElem × Nat) :=
   let effReqBytesOpt : Option Nat :=
     match reqBytesOpt with
     | .some n => .some n
     | .none =>
       match pointeeTyOpt with
-      | .some pt => tyByteSize localDecls layouts pt
+      | .some pt => tyByteSize pointeeDecls pointeeLayouts pt
       | .none => .none
   let leafIsAgg : Bool :=
     match pointeeTyOpt with
@@ -5263,7 +5265,7 @@ def resolveStackThinPtrTargetProjWithResidual?
     let staticSubOk : Bool :=
       match projHasSubslice cleanRest, pointeeTyOpt with
       | true, .some pt =>
-        match resolveProjectedTyResolved localDecls layouts pt cleanRest with
+        match resolveProjectedTyResolved pointeeDecls pointeeLayouts pt cleanRest with
         | .some _ => true
         | .none => false
       | _, _ => true
@@ -5415,7 +5417,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                   let staticSubOk : Bool :=
                     match projHasSubslice cleanRest, pointeeTyOpt with
                     | true, .some pt =>
-                      match resolveProjectedTyResolved localDecls layouts pt cleanRest with
+                      match resolveProjectedTyResolved pointeeDecls pointeeLayouts pt cleanRest with
                       | .some _ => true
                       | .none => false
                     | _, _ => true
@@ -5636,7 +5638,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                         let staticSubOk : Bool :=
                           match projHasSubslice cleanRest, pointeeTyOpt with
                           | true, .some pt =>
-                            match resolveProjectedTyResolved localDecls layouts pt cleanRest with
+                            match resolveProjectedTyResolved pointeeDecls pointeeLayouts pt cleanRest with
                             | .some _ => true
                             | .none => false
                           | _, _ => true
@@ -9233,6 +9235,10 @@ def isLayoutFaithfulAggregate
 Attempt to read a value of static type `accTy` at byte offset `offsetBytes`
 within `baseVal` by encoding `baseVal` to `List AbstractByte`, slicing the
 `size_of::<accTy>()` bytes starting at `offsetBytes`, and decoding at `accTy`.
+`baseTyOpt` is resolved in `(localDecls, layouts)` while `accTy` is resolved in
+`(accDecls, accLayouts)` (both defaulting to the base tables), so a cross-frame
+access can resolve the accessed type in the active frame's `LayoutTable` and the
+borrow target's type in the owning frame's `LayoutTable`.
 -/
 def decodeSubValueAtByteOffset?
     (layouts : LayoutTable)
@@ -9240,10 +9246,12 @@ def decodeSubValueAtByteOffset?
     (baseVal : Value)
     (offsetBytes : Nat)
     (accTy : Ty)
-    (localDecls : List LocalDecl := .nil) :
+    (localDecls : List LocalDecl := .nil)
+    (accLayouts : LayoutTable := layouts)
+    (accDecls : List LocalDecl := localDecls) :
     Option Value :=
-  let rAccTy := resolveTyWithLocalDecls localDecls layouts accTy
-  match tyByteSize localDecls layouts rAccTy with
+  let rAccTy := resolveTyWithLocalDecls accDecls accLayouts accTy
+  match tyByteSize accDecls accLayouts rAccTy with
   | .none => .none
   | .some reqBytes =>
     let encodedOpt : Option (List AbstractByte) :=
@@ -9262,7 +9270,7 @@ def decodeSubValueAtByteOffset?
       match sliceAbstractBytes encodedBytes offsetBytes reqBytes with
       | .none => .none
       | .some sliceBytes =>
-        decodeTypedValueFromBytes defaultCodecFuel layouts rAccTy sliceBytes
+        decodeTypedValueFromBytes defaultCodecFuel accLayouts rAccTy sliceBytes
 
 /--
 Byte-offset decoding fallback for a typed thin-pointer dereference read:
@@ -9281,7 +9289,9 @@ def decodeAtBorrowTargetOffset?
     (accessedTyOpt : Option Ty)
     (targetTyOpt : Option Ty)
     (localDecls : List LocalDecl := .nil)
-    (pointeeTyOpt : Option Ty := .none) :
+    (pointeeTyOpt : Option Ty := .none)
+    (accLayouts : LayoutTable := layouts)
+    (accDecls : List LocalDecl := localDecls) :
     Option Value :=
   match restProj with
   | .nil =>
@@ -9298,6 +9308,7 @@ def decodeAtBorrowTargetOffset?
       with
       | .ok baseVal =>
         decodeSubValueAtByteOffset? layouts targetTyOpt baseVal ptrVal.offsetBytes accTy localDecls
+          accLayouts accDecls
       | _ => .none
     | .none => .none
   | pHead :: pTail =>
@@ -9315,13 +9326,14 @@ def decodeAtBorrowTargetOffset?
       | .ok baseVal =>
         match
           decodeSubValueAtByteOffset? layouts targetTyOpt baseVal ptrVal.offsetBytes pt localDecls
+            accLayouts accDecls
         with
         | .some decodedPt =>
           match
             readProjectedValueUnionAware
               locals
-              localDecls
-              layouts
+              accDecls
+              accLayouts
               decodedPt
               pt
               (pHead :: pTail)
@@ -9552,6 +9564,8 @@ def evalStackThinPtrTypedDerefRead
             effTargetTyOpt
             codecDecls
             effPointeeTyOpt
+            layouts
+            localDecls
         match
           resolveStackThinPtrTargetProjWithResidual?
             locals
@@ -9563,6 +9577,8 @@ def evalStackThinPtrTypedDerefRead
             targetLayouts
             effPointeeTyOpt
             reqBytesOpt
+            localDecls
+            layouts
         with
         | .none =>
           match fallbackDecode with
@@ -9596,6 +9612,8 @@ def evalStackThinPtrTypedDerefRead
                   residualBytes
                   accTy
                   codecDecls
+                  layouts
+                  localDecls
               with
               | .some v => .some v
               | .none => fallbackDecode
@@ -9655,7 +9673,7 @@ def evalStackThinPtrTypedDerefRead
                           let unitOkForNonZst : Bool :=
                             match fieldVal with
                             | .unit =>
-                              match tyByteSize codecDecls layouts accTy with
+                              match tyByteSize localDecls layouts accTy with
                               | .some (.succ _) => false
                               | _ => true
                             | _ => true
@@ -10929,6 +10947,9 @@ into `oldSubVal` (of static type `subTyOpt`) by encoding both to
 `List AbstractByte`, writing the patch slice via `writeAbstractBytesAt`, and
 decoding back to `oldSubVal`'s representation. Returns `.none` on out-of-bounds
 width/offset or when either aggregate lacks a layout-faithful byte codec.
+`accTyOpt` / `newVal` are resolved in `accLayouts` (defaulting to `layouts`), so a
+cross-frame write encodes the written value with the active frame's `LayoutTable`
+while `subTyOpt` / `oldSubVal` use the owning frame's `layouts`.
 -/
 def spliceSubValueAtByteOffset?
     (localDecls targetDecls : List LocalDecl)
@@ -10937,14 +10958,15 @@ def spliceSubValueAtByteOffset?
     (oldSubVal : Value)
     (offsetBytes : Nat)
     (accTyOpt : Option Ty)
-    (newVal : Value) :
+    (newVal : Value)
+    (accLayouts : LayoutTable := layouts) :
     Option Value :=
   let patchBytesOpt : Option (List AbstractByte) :=
     match newVal with
     | .unit =>
       match accTyOpt with
       | .some accTy =>
-        match tyByteSize localDecls layouts accTy with
+        match tyByteSize localDecls accLayouts accTy with
         | .some 0 => .some .nil
         | _ => .none
       | .none => .some .nil
@@ -10953,9 +10975,9 @@ def spliceSubValueAtByteOffset?
     | .aggregate varIdx fields =>
       match accTyOpt with
       | .some accTy =>
-        match resolveFaithfulAggregateTy? localDecls layouts accTy varIdx fields with
+        match resolveFaithfulAggregateTy? localDecls accLayouts accTy varIdx fields with
         | .some resolvedAccTy =>
-          encodeTypedValueToBytes layouts resolvedAccTy newVal
+          encodeTypedValueToBytes accLayouts resolvedAccTy newVal
         | .none => .none
       | .none => .none
   match patchBytesOpt with
@@ -11202,6 +11224,7 @@ def writeStackThinPtrTypedDeref
                   (Nat.add baseOff ptrVal.offsetBytes)
                   resolvedAccTyOpt
                   val
+                  layouts
               with
               | .some splicedRoot => commitAtProj .nil splicedRoot
               | .none => .ub
@@ -11228,6 +11251,8 @@ def writeStackThinPtrTypedDeref
               targetLayouts
               effPointeeTyOpt
               reqBytesOpt
+              localDecls
+              layouts
           match resolvedProjOpt with
         | .none =>
           match restProj with
@@ -11258,6 +11283,7 @@ def writeStackThinPtrTypedDeref
                   ptrVal.offsetBytes
                   resolvedAccTyOpt
                   val
+                  layouts
               with
               | .some splicedBase => commitAtProj entry.targetProjection splicedBase
               | .none => .ub
@@ -11335,6 +11361,7 @@ def writeStackThinPtrTypedDeref
                       residualBytes
                       resolvedAccTyOpt
                       val
+                      layouts
                 | _ =>
                   match Nat.beq residualBytes 0 with
                   | false =>
@@ -11347,6 +11374,7 @@ def writeStackThinPtrTypedDeref
                       residualBytes
                       resolvedAccTyOpt
                       val
+                      layouts
                   | true =>
                     let directStoreOpt : Option (Option Value) :=
                       match resolvedAccTyOpt, subTyOpt with
@@ -11421,6 +11449,7 @@ def writeStackThinPtrTypedDeref
                         0
                         resolvedAccTyOpt
                         val
+                        layouts
             match storeValOpt with
             | .none => .ub
             | .some storeVal => commitAtProj fullProj storeVal
@@ -11447,7 +11476,8 @@ def writeStackThinPtrTypedDeref
                         match effTargetDecls with
                         | .nil => localDecls
                         | _ :: _ => effTargetDecls
-                      decodeSubValueAtByteOffset? targetLayouts (.some accTy) val 0 declTy codecDecls
+                      decodeSubValueAtByteOffset? layouts (.some accTy) val 0 declTy localDecls
+                        targetLayouts codecDecls
                 | _, _ => .none
             | .none, .some decl =>
               let declTy := resolveTyWithLocalDecls effTargetDecls targetLayouts decl.ty
@@ -16730,7 +16760,7 @@ def resolveRefDerefTargetCore?
       match tyByteSize localDecls layouts accTy with
       | .some sz => .some sz
       | .none =>
-        match tyByteSize codecDecls targetLayouts accTy with
+        match tyByteSize codecDecls layouts accTy with
         | .some sz => .some sz
         | .none => tyByteSize .nil layouts accTy
     | .none => .none
@@ -16753,6 +16783,8 @@ def resolveRefDerefTargetCore?
           targetLayouts
           effPointeeTyOpt
           reqBytesOpt
+          localDecls
+          layouts
       with
       | .some (fp, resOff) => .some (fp, resOff)
       | .none =>
@@ -16789,6 +16821,8 @@ def resolveRefDerefTargetCore?
                 parentPtr.offsetBytes
                 accTy
                 codecDecls
+                layouts
+                localDecls
             with
             | .some _ =>
               .some (normalizeSubsliceProjections rawFull, parentPtr.offsetBytes)
@@ -16907,6 +16941,8 @@ def resolveRefDerefTargetCore?
                       residualOffset
                       accTy
                       codecDecls
+                      layouts
+                      localDecls
                   with
                   | .some _ => true
                   | .none =>
@@ -17070,7 +17106,7 @@ def resolveRawPtrDerefTarget?
       match tyByteSize localDecls layouts accTy with
       | .some sz => .some sz
       | .none =>
-        match tyByteSize codecDecls targetLayouts accTy with
+        match tyByteSize codecDecls layouts accTy with
         | .some sz => .some sz
         | .none => tyByteSize .nil layouts accTy
     | _, _ => .none
@@ -17088,6 +17124,8 @@ def resolveRawPtrDerefTarget?
         targetLayouts
         effPointeeTyOpt
         reqBytesOpt
+        localDecls
+        layouts
     with
     | .some (fp, resOff) => .some (fp, resOff)
     | .none =>
@@ -17138,6 +17176,8 @@ def resolveRawPtrDerefTarget?
             parentPtr.offsetBytes
             resolvedAccTy
             codecDecls
+            layouts
+            localDecls
         with
         | .nil, .some _ =>
           .some (normalizeSubsliceProjections rawFull, parentPtr.offsetBytes)
