@@ -21767,147 +21767,6 @@ theorem holdBoolReq_of_mirBool_constructive
       h_phase h_bb0, ← wpMirExecOrExhaustedSym_eq_gen]
   exact holdBoolMirSym_of_mirBoolPredicateHolds_constructive (defaultSpecSteps body) body args h
 
-/-- Constructive (`⊆ {propext, Quot.sound}`) `runCfgSteps` soundness for `wpCoalBounded`. -/
-theorem wpCoalBounded_of_runCfgSteps_constructive
-    (body : CapturedMir) (post : MirOutcome → Prop)
-    (h_phase : body.phase = .runtimeOptimized) :
-    ∀ (fuel : Nat) (cfg : CfgExecState) (st : MirExecState),
-      CfgValid body cfg st →
-      cfgStateWP post (runCfgSteps body cfg fuel) →
-      wpCoalBounded (fuel + 1) mirNoCallWP (stepMirState body)
-        (fun out _ => post out) st PUnit.unit := by
-  intro fuel
-  induction fuel with
-  | zero =>
-    intro cfg st h_valid h_wp
-    dsimp only [runCfgSteps] at h_wp
-    cases cfg with
-    | running _ _ _ => exact False.elim h_wp
-    | faulted => exact False.elim h_wp
-    | halted ok out =>
-      change st = .halted out at h_valid
-      subst h_valid
-      exact h_wp.2
-  | succ fuel' ih =>
-    intro cfg st h_valid h_wp
-    rw [runCfgSteps_step] at h_wp
-    have h_ok1 : cfgOk (stepCfgState body cfg) = true :=
-      cfgOk_of_runCfgSteps_true body fuel' (stepCfgState body cfg)
-        (by
-          cases h_end : runCfgSteps body (stepCfgState body cfg) fuel' with
-          | halted ok out =>
-            rw [h_end] at h_wp
-            exact h_wp.1
-          | running _ _ _ =>
-            rw [h_end] at h_wp
-            exact False.elim h_wp
-          | faulted =>
-            rw [h_end] at h_wp
-            exact False.elim h_wp)
-    have h_ok0 : cfgOk cfg = true := by
-      cases h_c : cfgOk cfg with
-      | true => rfl
-      | false =>
-        rw [cfgOk_stepCfgState_false body cfg h_c] at h_ok1
-        nomatch h_ok1
-    cases cfg with
-    | faulted => nomatch h_ok0
-    | halted ok out =>
-      change st = .halted out at h_valid
-      subst h_valid
-      change ok = true at h_ok0
-      subst h_ok0
-      dsimp only [stepCfgState] at h_wp
-      rw [runCfgSteps_halted] at h_wp
-      exact h_wp.2
-    | running ok cur s =>
-      change ok = true at h_ok0
-      subst h_ok0
-      rcases h_valid with ⟨rfl, h_cur⟩
-      dsimp only [stepCfgState] at h_ok1 h_wp
-      cases h_ac : s.memory.activeCallee with
-      | some _ =>
-        rw [h_ac] at h_ok1
-        nomatch h_ok1
-      | none =>
-        rw [h_ac] at h_ok1 h_wp
-        dsimp only at h_ok1 h_wp
-        rw [wpCoalBounded_succ_eq]
-        dsimp only [stepMirState, stepMirFn]
-        rw [h_ac]
-        dsimp only [Option.getD]
-        rw [h_phase]
-        dsimp only
-        cases cur with
-        | none =>
-          cases h_si : Nat.beq s.frame.stmtIdx 0 with
-          | false =>
-            rw [h_si] at h_ok1
-            nomatch h_ok1
-          | true =>
-            rw [h_si] at h_ok1 h_wp
-            dsimp only [lookupBlock] at h_ok1 h_wp
-            have h_si_eq : s.frame.stmtIdx = 0 := Nat.eq_of_beq_eq_true h_si
-            cases h_bb : get? body.basicBlocks s.frame.blockIdx with
-            | none =>
-              rw [h_bb] at h_ok1
-              nomatch h_ok1
-            | some bb =>
-              rw [h_bb] at h_ok1 h_wp
-              rcases bb with ⟨stmts, term, isCleanup⟩
-              rw [h_si_eq]
-              cases stmts with
-              | nil =>
-                dsimp only [dispatchBlockCfg, get?, GetElem?.getElem?,
-                  List.instGetElem?NatLtLength, List.get?Internal, length, BEq.beq,
-                  instBEqOfDecidableEq, Nat.decEq, instDecidableEqNat, decide] at h_ok1 h_wp ⊢
-                exact wpCoalBounded_evalTerminatorCfg body post fuel' s term h_ok1 ih h_wp
-              | cons stmt rest =>
-                dsimp only [dispatchBlockCfg, get?, GetElem?.getElem?,
-                  List.instGetElem?NatLtLength, List.get?Internal] at h_ok1 h_wp ⊢
-                rw [← evalStmtFast_eq body s stmt]
-                exact wpCoalBounded_stepNodeToCfg body post fuel'
-                  (.some (s.frame.blockIdx, 1, rest, term))
-                  (evalStmtFast body s stmt)
-                  ⟨⟨stmt :: rest, term, isCleanup⟩, [stmt], h_bb, rfl, rfl, rfl⟩
-                  h_ok1 ih h_wp
-        | some tup =>
-          rcases tup with ⟨blockIdx, stmtIdx, stmts, term⟩
-          rcases h_cur with ⟨bb, pfx, h_bb, rfl, h_stmts, rfl⟩
-          cases h_bi : Nat.beq s.frame.blockIdx blockIdx with
-          | false =>
-            cases stmts <;> (dsimp only at h_ok1; rw [h_bi] at h_ok1; nomatch h_ok1)
-          | true =>
-            have h_bi_eq : s.frame.blockIdx = blockIdx := Nat.eq_of_beq_eq_true h_bi
-            cases h_si : Nat.beq s.frame.stmtIdx (length pfx) with
-            | false =>
-              cases stmts <;> (dsimp only at h_ok1; rw [h_bi, h_si] at h_ok1; nomatch h_ok1)
-            | true =>
-              have h_si_eq : s.frame.stmtIdx = length pfx := Nat.eq_of_beq_eq_true h_si
-              rw [h_bi_eq, h_bb, h_si_eq]
-              dsimp only
-              cases stmts with
-              | nil =>
-                dsimp only at h_ok1 h_wp
-                rw [h_bi, h_si] at h_ok1 h_wp
-                have h_eq : bb.statements = pfx := h_stmts.trans (List.append_nil pfx)
-                rw [← h_eq, get?_length_none]
-                dsimp only
-                rw [nat_beq_self_eq_true, ite_eq_left rfl]
-                exact wpCoalBounded_evalTerminatorCfg body post fuel' s bb.terminator h_ok1 ih h_wp
-              | cons stmt rest =>
-                dsimp only at h_ok1 h_wp
-                rw [h_bi, h_si] at h_ok1 h_wp
-                rw [h_stmts, get?_append_cons]
-                dsimp only
-                rw [← evalStmtFast_eq body s stmt]
-                exact wpCoalBounded_stepNodeToCfg body post fuel'
-                  (.some (blockIdx, Nat.add (length pfx) 1, rest, bb.terminator))
-                  (evalStmtFast body s stmt)
-                  ⟨bb, pfx ++ [stmt], h_bb, (length_append_singleton pfx stmt).symm,
-                    h_stmts.trans (List.append_assoc pfx [stmt] rest).symm, rfl⟩
-                  h_ok1 ih h_wp
-
 /-- Constructive (`⊆ {propext, Quot.sound}`) `runCfgSteps` soundness for `wpMirExecStepsSym`
 (replacing `beq_self_eq_true` on `Nat` with `nat_beq_self_eq_true`). -/
 theorem wpMirExecStepsSym_of_runCfgSteps_constructive
@@ -22039,6 +21898,54 @@ theorem wpMirExecStepsSym_of_runCfgSteps_constructive
                   ⟨bb, pfx ++ [stmt], h_bb, (length_append_singleton pfx stmt).symm,
                     h_stmts.trans (List.append_assoc pfx [stmt] rest).symm, rfl⟩
                   h_ok1 ih h_wp
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) bridge from the call-forbidding segment WP with
+an empty mid-state predicate to the call-forbidding bounded WP one step later. -/
+theorem wpCoalBounded_succ_of_wpMirExecStepsSym_false
+    (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpMirExecStepsSym fuel body st (stepsExecMid (fun _ => False) post) post →
+      wpCoalBounded (fuel + 1) mirNoCallWP (stepMirState body)
+        (fun out _ => post out) st PUnit.unit
+  | 0, st, h => by
+    cases st with
+    | running _ => exact False.elim h
+    | halted out => exact h
+    | faulted _ => exact False.elim h
+  | fuel' + 1, st, h => by
+    rw [wpMirExecStepsSym_succ_eq] at h
+    rw [wpCoalBounded_succ_eq]
+    unfold stepNodeStepsWP at h
+    unfold stepNodeWP
+    cases h_step : stepMirState body st with
+    | ret out => rw [h_step] at h; exact h
+    | tau st' =>
+      rw [h_step] at h
+      exact wpCoalBounded_succ_of_wpMirExecStepsSym_false body post fuel' st' h
+    | vis i k =>
+      rw [h_step] at h
+      exact mirNoCallWP.mono
+        (fun o _ h_o => wpCoalBounded_succ_of_wpMirExecStepsSym_false body post fuel' (k o) h_o) h
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) `runCfgSteps` soundness for `wpCoalBounded`,
+derived from `wpMirExecStepsSym_of_runCfgSteps_constructive` with an empty mid-state
+predicate (a halting run is a halting segment). -/
+theorem wpCoalBounded_of_runCfgSteps_constructive
+    (body : CapturedMir) (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized) :
+    ∀ (fuel : Nat) (cfg : CfgExecState) (st : MirExecState),
+      CfgValid body cfg st →
+      cfgStateWP post (runCfgSteps body cfg fuel) →
+      wpCoalBounded (fuel + 1) mirNoCallWP (stepMirState body)
+        (fun out _ => post out) st PUnit.unit := by
+  intro fuel cfg st h_valid h_wp
+  refine wpCoalBounded_succ_of_wpMirExecStepsSym_false body post fuel st
+    (wpMirExecStepsSym_of_runCfgSteps_constructive body _ post h_phase fuel cfg st h_valid ?_)
+  revert h_wp
+  cases runCfgSteps body cfg fuel with
+  | halted ok out => exact id
+  | running _ _ _ => exact False.elim
+  | faulted => exact False.elim
 
 /-- Constructive (`⊆ {propext, Quot.sound}`) segment convergence via `runCfgToBlock`. -/
 theorem mirStepsConverges_of_runCfgToBlock_constructive
