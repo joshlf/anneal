@@ -58,7 +58,21 @@ machine state:
    marker traits `IsTryFromBytes` / `IsIntoBytes` / `IsFromBytes` are derived
    for the codec's type (`MirTypedByteCodec.isTryFromBytes`, `.isIntoBytes`,
    `.isFromBytes`, `.not_isFromBytes`). Instances: `u32MirCodec` (exact-width
-   little-endian `u32`) and `boolMirCodec` (Rust `bool`, rejecting `0x02`).
+   little-endian `u32`) and `boolMirCodec` (Rust `bool`, rejecting `0x02`);
+   `FixedByteCodecBridge.mirTypedByteCodecOfMirValueCodec` lifts every
+   provenance-free `ByteCodec.MirValueCodec` (a `FixedByteCodec` agreeing with
+   the trusted codec) to a `MirTypedByteCodec`.
+6. **State-level pin lifecycle over live MIR.** `spatialPinnedBlockHolds`
+   relates a pinned loan (with its exact codec) and its writable block to the
+   live byte window and live mutation-granting tag of the pinned place.
+   `freeze_spatialPinnedBlockHolds`: a successful `freezeToSpatialInState` of a
+   loan embedding `x`, while the live place holds `toValue x`, establishes it
+   (the new block is the place's trusted byte window).
+   `unpin_eq_live_mir_decode`: from the relation at a `zerocopy::IntoBytes`
+   type, a successful `unpinFromSpatialInState` restores the loan to the value
+   the trusted decoder reads from the live window. Supporting inversions:
+   `freezeToSpatialInState_ok_inv`, `reabsorbFromSpatialInState_ok_inv`,
+   `findSpatialBlock_append_fresh`, `findLoan_updateLoan_self`.
 
 End-to-end regressions over concrete `CapturedMir` bodies live in
 `tests/mir/PureLiftV2026BridgeTests.lean`.
@@ -938,20 +952,23 @@ def placeByteWindow? (layouts : LayoutTable) (ty : Ty) (ms : MachineState)
   | _, _ => none
 
 /-- Mid-pin state relation connecting a spatially pinned loan `lid` (in phase
-`LoanPhase.spatialPinned bid codec`) and its raw-byte `SpatialBlock` in
-`st.spatial` to the live MIR byte window `placeByteWindow? layouts ty ms l path`
-and live mutation-granting Tree Borrows entry `BorrowAt ms (tagOf lid) l path
-mutGranting`. -/
+`LoanPhase.spatialPinned bid codec`, with exactly the codec `codec`, since codec
+IDs alone do not determine a decoder) and its writable, unsplit raw-byte
+`SpatialBlock` in `st.spatial` (located by `findSpatialBlock`, as
+`reabsorbFromSpatialInState` does) to the live MIR byte window
+`placeByteWindow? layouts ty ms l path` and live mutation-granting Tree Borrows
+entry `BorrowAt ms (tagOf lid) l path mutGranting`. -/
 def spatialPinnedBlockHolds (tagOf : LoanId → Nat) (layouts : LayoutTable)
     (ty : Ty) (lid : LoanId) (bid : BlockId) (codec : SpatialCodec StdVal)
     (l : Local) (path : SubPath) (st : SymState StdVal) (ms : MachineState) : Prop :=
   Exists fun e => Exists fun blk => Exists fun rest => Exists fun bs =>
     findLoan lid st.loans = some e ∧
     (match e.phase with
-     | .spatialPinned b c => b = bid ∧ c.codecId = codec.codecId
+     | .spatialPinned b c => b = bid ∧ c = codec
      | _ => False) ∧
     findSpatialBlock st.spatial bid = some (blk, rest) ∧
-    blk.originLoan = lid ∧
+    blk.originLoan = lid ∧ blk.perm = .readWrite ∧ blk.provenanceTag = bid ∧
+    blk.activeSubSplits = 0 ∧
     abstractBytesOfCells blk.cells = some bs ∧
     placeByteWindow? layouts ty ms l path = some bs ∧
     BorrowAt ms (tagOf lid) l path mutGranting
@@ -991,6 +1008,298 @@ theorem spatialCodec_freeze_eq_placeByteWindow
   · have h := Anneal.SepLogicLenses.typedAt_append_encode m.codec [] [] x
     simp only [List.nil_append, List.append_nil, List.length_nil] at h
     exact h
+
+/-! ### State-Level `freezeToSpatialInState` / `unpinFromSpatialInState` Bridges -/
+
+section PinLifecycle
+
+theorem findLoan_cons {Val : Type} (lid : LoanId) (e : LoanEntry Val)
+    (es : List (LoanEntry Val)) :
+    findLoan lid (e :: es) = if e.id == lid then some e else findLoan lid es := rfl
+
+theorem updateLoan_cons {Val : Type} (lid : LoanId) (f : LoanEntry Val → LoanEntry Val)
+    (e : LoanEntry Val) (es : List (LoanEntry Val)) :
+    updateLoan lid f (e :: es) =
+      if e.id == lid then f e :: updateLoan lid f es else e :: updateLoan lid f es := rfl
+
+/-- Updating loan `lid` with an identifier-preserving `f` maps its lookup. -/
+theorem findLoan_updateLoan_self {Val : Type} (lid : LoanId)
+    (f : LoanEntry Val → LoanEntry Val) (hf : ∀ e, (f e).id = e.id) :
+    ∀ loans : List (LoanEntry Val),
+      findLoan lid (updateLoan lid f loans) = (findLoan lid loans).map f
+  | [] => rfl
+  | e :: es => by
+    rw [updateLoan_cons, findLoan_cons]
+    cases h : e.id == lid with
+    | true => simp only [↓reduceIte, findLoan_cons, hf e, h, Option.map_some]
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte, findLoan_cons, h]
+      exact findLoan_updateLoan_self lid f hf es
+
+theorem countSpatialBlockId_cons {Val : Type} (bid : BlockId) (b : SpatialBlock Val)
+    (bs : List (SpatialBlock Val)) :
+    countSpatialBlockId bid (b :: bs) =
+      if b.blockId == bid then countSpatialBlockId bid bs + 1
+      else countSpatialBlockId bid bs := rfl
+
+/-- Fold step of `findSpatialBlock`. -/
+def spatialFindStep {Val : Type} (bid : BlockId) (b : SpatialBlock Val)
+    (acc : Bool × Option (SpatialBlock Val) × List (SpatialBlock Val)) :
+    Bool × Option (SpatialBlock Val) × List (SpatialBlock Val) :=
+  match acc with
+  | (dup, foundOpt, rest) =>
+    if b.blockId == bid then
+      match foundOpt with
+      | some _ => (true, foundOpt, rest)
+      | none => (dup, some b, rest)
+    else
+      (dup, foundOpt, b :: rest)
+
+/-- Result extraction of `findSpatialBlock`. -/
+def spatialFindFinish {Val : Type} :
+    Bool × Option (SpatialBlock Val) × List (SpatialBlock Val) →
+      Option (SpatialBlock Val × List (SpatialBlock Val))
+  | (false, some found, updated) => some (found, updated)
+  | _ => none
+
+theorem findSpatialBlock_eq_fold {Val : Type} (blocks : List (SpatialBlock Val))
+    (bid : BlockId) :
+    findSpatialBlock blocks bid =
+      spatialFindFinish (blocks.foldr (spatialFindStep bid) (false, none, [])) := rfl
+
+theorem foldr_spatialFindStep_fresh {Val : Type} (bid : BlockId) (blk : SpatialBlock Val) :
+    ∀ sp : List (SpatialBlock Val), countSpatialBlockId bid sp = 0 →
+      sp.foldr (spatialFindStep bid) (false, some blk, []) = (false, some blk, sp)
+  | [], _ => rfl
+  | b :: bs, hFresh => by
+    rw [countSpatialBlockId_cons] at hFresh
+    cases h : b.blockId == bid with
+    | true => rw [h] at hFresh; exact nomatch hFresh
+    | false =>
+      rw [h] at hFresh
+      rw [List.foldr_cons, foldr_spatialFindStep_fresh bid blk bs hFresh]
+      unfold spatialFindStep
+      simp only [h, Bool.false_eq_true, ↓reduceIte]
+
+/-- Appending a block with a fresh identifier makes `findSpatialBlock` return it
+together with the untouched prefix. -/
+theorem findSpatialBlock_append_fresh {Val : Type} (sp : List (SpatialBlock Val))
+    (blk : SpatialBlock Val) (hFresh : countSpatialBlockId blk.blockId sp = 0) :
+    findSpatialBlock (sp ++ [blk]) blk.blockId = some (blk, sp) := by
+  rw [findSpatialBlock_eq_fold, List.foldr_append, List.foldr_cons, List.foldr_nil]
+  have hb : (blk.blockId == blk.blockId) = true := decide_eq_true rfl
+  have hStep : spatialFindStep blk.blockId blk (false, none, []) = (false, some blk, []) := by
+    unfold spatialFindStep
+    simp only [hb, ↓reduceIte]
+  rw [hStep, foldr_spatialFindStep_fresh blk.blockId blk sp hFresh]
+  rfl
+
+/-- Structure of a successful `freezeToSpatialInState`. -/
+theorem freezeToSpatialInState_ok_inv {Val : Type} {alg : ValAlgebra Val} {lid : LoanId}
+    {codec : SpatialCodec Val} {st st' : SymState Val}
+    (h : freezeToSpatialInState alg lid codec st = .ok st') :
+    Exists fun e =>
+      findLoan lid st.loans = some e ∧
+      countSpatialBlockId st.nextSpatialTag st.spatial = 0 ∧
+      st'.loans =
+        updateLoan lid (fun x => ⟨x.id, .spatialPinned st.nextSpatialTag codec, x.cell, x.target⟩)
+          st.loans ∧
+      st'.spatial =
+        st.spatial ++
+          [⟨st.nextSpatialTag, lid, .readWrite, st.nextSpatialTag, 0, codec.encode e.cell.val⟩] := by
+  obtain ⟨locals, loans, rgs, deps, sp, tag⟩ := st
+  unfold freezeToSpatialInState at h
+  dsimp only at h
+  split at h
+  · exact nomatch h
+  · split at h
+    · exact nomatch h
+    · rename_i e hFind
+      split at h
+      · exact nomatch h
+      · split at h
+        · exact nomatch h
+        · split at h
+          · exact nomatch h
+          · rename_i hNo
+            injection h with h
+            subst h
+            refine ⟨e, hFind, ?_, rfl, rfl⟩
+            cases hc : countSpatialBlockId tag sp with
+            | zero => rfl
+            | succ k => exact absurd (by simp [hasSpatialBlockId, hc]) hNo
+
+/-- Structure of a successful `reabsorbFromSpatialInState`
+(`unpinFromSpatialInState`): the pinned codec decodes the located block. -/
+theorem reabsorbFromSpatialInState_ok_inv {Val : Type} {alg : ValAlgebra Val} {lid : LoanId}
+    {codec : SpatialCodec Val} {st st' : SymState Val}
+    (h : reabsorbFromSpatialInState alg lid codec st = .ok st') :
+    Exists fun e => Exists fun bid => Exists fun c => Exists fun blk =>
+    Exists fun rest => Exists fun v' =>
+      findLoan lid st.loans = some e ∧ e.phase = .spatialPinned bid c ∧
+      findSpatialBlock st.spatial bid = some (blk, rest) ∧
+      c.decode blk.cells = some v' ∧
+      st'.loans =
+        updateLoan lid (fun x => ⟨x.id, .activeMut, ⟨v', x.cell.perm⟩, x.target⟩) st.loans := by
+  obtain ⟨locals, loans, rgs, deps, sp, tag⟩ := st
+  unfold reabsorbFromSpatialInState at h
+  dsimp only at h
+  cases hU : hasUniqueLoanId lid loans with
+  | false => simp only [hU, Bool.not_false, ↓reduceIte] at h; exact nomatch h
+  | true =>
+    simp only [hU, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+    cases hF : findLoan lid loans with
+    | none => simp only [hF] at h; exact nomatch h
+    | some e =>
+      simp only [hF] at h
+      cases hP : e.phase with
+      | spatialPinned bid c =>
+        simp only [hP] at h
+        cases hId : (c.codecId != codec.codecId) with
+        | true => simp only [hId, ↓reduceIte] at h; exact nomatch h
+        | false =>
+          simp only [hId, Bool.false_eq_true, ↓reduceIte] at h
+          cases hB : findSpatialBlock sp bid with
+          | none => simp only [hB] at h; exact nomatch h
+          | some p =>
+            obtain ⟨blk, rest⟩ := p
+            simp only [hB] at h
+            cases hW : blk.perm with
+            | readOnly =>
+              simp only [hW, Bool.and_false, Bool.false_and, Bool.false_eq_true,
+                ↓reduceIte] at h
+              exact nomatch h
+            | readWrite =>
+              simp only [hW] at h
+              cases hD : c.decode blk.cells with
+              | none => simp only [hD, ite_self] at h; exact nomatch h
+              | some v' =>
+                simp only [hD] at h
+                refine ⟨e, bid, c, blk, rest, v', rfl, hP, hB, hD, ?_⟩
+                split at h
+                · split at h
+                  · exact nomatch h
+                  · injection h with h
+                    subst h
+                    rfl
+                · exact nomatch h
+      | activeShared => simp only [hP] at h; exact nomatch h
+      | activeMut => simp only [hP] at h; exact nomatch h
+      | ended => simp only [hP] at h; exact nomatch h
+
+theorem replicateUninitBytes_length : ∀ n : Nat, (replicateUninitBytes n).length = n
+  | 0 => rfl
+  | k + 1 => congrArg Nat.succ (replicateUninitBytes_length k)
+
+/-- Every trusted byte window of a place at a `zerocopy::IntoBytes` type has the
+type's byte width (both the encoding of an initialized place and the `.uninit`
+window of live uninitialized storage). -/
+theorem placeByteWindow?_length {layouts : LayoutTable} {ty : Ty} {n : Nat}
+    (hSize : rigidTyByteSize layouts ty = some n)
+    (hInto : Anneal.BitValidity.IsIntoBytes layouts ty)
+    {ms : MachineState} {l : Local} {path : SubPath} {bs : List AbstractByte}
+    (h : placeByteWindow? layouts ty ms l path = some bs) : bs.length = n := by
+  obtain ⟨sz, hSz, hEnc⟩ := hInto
+  rw [hSize] at hSz
+  injection hSz with hSz
+  subst hSz
+  unfold placeByteWindow? at h
+  split at h
+  · split at h
+    · exact (hEnc _ bs h).1
+    · exact nomatch h
+  · rw [hSize] at h
+    injection h with h
+    subst h
+    exact replicateUninitBytes_length n
+  · exact nomatch h
+
+/-- **`freezeToSpatialInState` materializes the live byte window**: freezing a
+loan whose value embeds `x` with a MIR-typed spatial codec, while the live MIR
+place `_l.path` holds `toValue x` under a live mutation-granting tag for the
+loan, establishes the mid-pin relation `spatialPinnedBlockHolds` against the
+same machine state: the new block's bytes are exactly the place's trusted
+operational byte window. -/
+theorem freeze_spatialPinnedBlockHolds {layouts : LayoutTable} {ty : Ty} {α : Type}
+    {n : Nat} (m : MirTypedByteCodec layouts ty α n) (cid : Nat)
+    (embed : α → StdVal) (embed? : StdVal → Option α)
+    (embed_embed? : ∀ (v : StdVal) (x : α), embed? v = some x → embed x = v)
+    (tagOf : LoanId → Nat) (alg : ValAlgebra StdVal) (lid : LoanId)
+    {st st' : SymState StdVal} {ms : MachineState} {l : Local} {path : SubPath} {x : α}
+    (hFreeze :
+      freezeToSpatialInState alg lid (m.spatialCodec cid embed embed? embed_embed?) st =
+        .ok st')
+    (hLoan : Exists fun e => findLoan lid st.loans = some e ∧ embed? e.cell.val = some x)
+    (hPlace : placeValue? ms l path = some (m.toValue x))
+    (hBorrow : BorrowAt ms (tagOf lid) l path mutGranting) :
+    spatialPinnedBlockHolds tagOf layouts ty lid st.nextSpatialTag
+      (m.spatialCodec cid embed embed? embed_embed?) l path st' ms := by
+  obtain ⟨e, hFind, hFresh, hLoans, hSpatial⟩ := freezeToSpatialInState_ok_inv hFreeze
+  obtain ⟨e0, hFind0, hx⟩ := hLoan
+  rw [hFind] at hFind0
+  injection hFind0 with hEq
+  subst hEq
+  obtain ⟨hWin, hCells, _⟩ := spatialCodec_freeze_eq_placeByteWindow m cid embed embed?
+    embed_embed? ms l path e.cell.val x hx hPlace
+  refine ⟨⟨e.id, .spatialPinned st.nextSpatialTag (m.spatialCodec cid embed embed? embed_embed?),
+      e.cell, e.target⟩,
+    ⟨st.nextSpatialTag, lid, .readWrite, st.nextSpatialTag, 0,
+      (m.spatialCodec cid embed embed? embed_embed?).encode e.cell.val⟩,
+    st.spatial, m.codec.encode x, ?_, ⟨rfl, rfl⟩, ?_, rfl, rfl, rfl, rfl, hCells, hWin, hBorrow⟩
+  · rw [hLoans, findLoan_updateLoan_self lid
+      (fun x => ⟨x.id, .spatialPinned st.nextSpatialTag
+        (m.spatialCodec cid embed embed? embed_embed?), x.cell, x.target⟩)
+      (fun _ => rfl), hFind]
+    rfl
+  · rw [hSpatial]
+    exact findSpatialBlock_append_fresh st.spatial _ hFresh
+
+/-- **`unpinFromSpatialInState` decodes exactly the live MIR window**: if the
+mid-pin relation holds against `ms` for a MIR-typed spatial codec at a
+`zerocopy::IntoBytes` type, then a successful unpin restores loan `lid` to an
+active mutable loan whose value is `embed x`, where the trusted decoder
+`decodeValueFromBytes` reads `toValue x` from the live place's byte window. -/
+theorem unpin_eq_live_mir_decode {layouts : LayoutTable} {ty : Ty} {α : Type}
+    {n : Nat} (m : MirTypedByteCodec layouts ty α n) (cid : Nat)
+    (embed : α → StdVal) (embed? : StdVal → Option α)
+    (embed_embed? : ∀ (v : StdVal) (x : α), embed? v = some x → embed x = v)
+    (hInto : Anneal.BitValidity.IsIntoBytes layouts ty)
+    (tagOf : LoanId → Nat) (alg : ValAlgebra StdVal) (lid : LoanId) (bid : BlockId)
+    (codec' : SpatialCodec StdVal)
+    {st st' : SymState StdVal} {ms : MachineState} {l : Local} {path : SubPath}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid
+      (m.spatialCodec cid embed embed? embed_embed?) l path st ms)
+    (hUnpin : unpinFromSpatialInState alg lid codec' st = .ok st') :
+    Exists fun x => Exists fun bs => Exists fun e' =>
+      placeByteWindow? layouts ty ms l path = some bs ∧
+      decodeValueFromBytes defaultCodecFuel layouts ty bs = some (m.toValue x) ∧
+      findLoan lid st'.loans = some e' ∧ e'.phase = .activeMut ∧ e'.cell.val = embed x := by
+  obtain ⟨e, blk, rest, bs, hFind, hPhase, hBlk, _, _, _, _, hBytes, hWin, _⟩ := hPin
+  obtain ⟨e1, bid1, c, blk1, rest1, v', hFind1, hPhase1, hBlk1, hDec, hLoans⟩ :=
+    reabsorbFromSpatialInState_ok_inv hUnpin
+  rw [hFind] at hFind1
+  injection hFind1 with hEq
+  subst hEq
+  rw [hPhase1] at hPhase
+  obtain ⟨hBid, hC⟩ := hPhase
+  subst hBid
+  subst hC
+  rw [hBlk] at hBlk1
+  injection hBlk1 with hPair
+  injection hPair with hBlkEq _
+  subst hBlkEq
+  have hBsLen : bs.length = n := placeByteWindow?_length m.tySize_eq hInto hWin
+  have hLen : blk.cells.length = n :=
+    (abstractBytesOfCells_length blk.cells bs hBytes).symm.trans hBsLen
+  obtain ⟨x, hv', hMir⟩ :=
+    (m.spatialCodec_unpin_iff_mir_decode cid embed embed? embed_embed? blk.cells bs hBytes
+      hLen).1 v' hDec
+  refine ⟨x, bs, ⟨e.id, .activeMut, ⟨v', e.cell.perm⟩, e.target⟩, hWin, hMir, ?_, rfl, hv'⟩
+  rw [hLoans, findLoan_updateLoan_self lid
+    (fun x => ⟨x.id, .activeMut, ⟨v', x.cell.perm⟩, x.target⟩) (fun _ => rfl), hFind]
+  rfl
+
+end PinLifecycle
 
 /-! ### Concrete codecs: exact-width little-endian `u32` and Rust `bool` -/
 
@@ -1334,7 +1643,10 @@ theorem provenanceFree_append :
       | some _ => exact nomatch h1
 
 /-- Multi-field aggregate `(u32, u32)` 8-byte little-endian codec built via
-`SepLogicLenses.ByteLensCodec.prod`. -/
+`SepLogicLenses.ByteLensCodec.prod`. It is a `PureLift`-side codec only: it is
+not a `MirTypedByteCodec` (no trusted tuple layout is assumed), so pair windows
+are related to live MIR field by field (the regression suite pins the field
+place `_3.1` with the `u32` codec against its live field window). -/
 def u32PairExactLE :
     Anneal.SepLogicLenses.ByteLensCodec
       ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 :=

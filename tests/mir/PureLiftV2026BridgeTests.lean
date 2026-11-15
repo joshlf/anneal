@@ -13,7 +13,10 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
 1. **Sibling-field disjoint `&mut` reborrows** (`&mut p.0`, `&mut p.1`): the
    `PermTree` split and the two `LoanGraph` loans are realized on the live Tree
    Borrows table (two `reserved` tags rooted at `_3.0` and `_3.1`), and the
-   lifted function converges on live MIR to the refined pair.
+   lifted function converges on live MIR to the refined pair. Test 1b repeats
+   it through a root `&mut (u32, u32)` parameter backed by
+   `Memory.callerLocals`, checking `out.mutFinals` with
+   `spatialFinalBindingsHold`.
 2. **Diamond conditional borrow join** (`if c { &mut p.0 } else { &mut p.1 }`):
    one symbolic `PureLift` run with `symBool c` builds a `BackTarget.choice`
    loan whose `.choice` value is realized at the live join block `bb3`
@@ -22,7 +25,11 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
 3. **Hybrid `SpatialPin` freeze → `zerocopy` byte write → unpin**: the frozen
    block is the place's trusted byte window (`TypedAt`), the spatial mutation
    writes exactly the bytes produced by the live raw-pointer `*mut u8` store,
-   and unpinning decodes them as the trusted decoder does.
+   and unpinning decodes them as the trusted decoder does. Test 3b checks the
+   4-state lockstep diagram; Test 3c instantiates the general
+   `freeze_spatialPinnedBlockHolds` / `unpin_eq_live_mir_decode` bridges, also
+   for a field-granular pin of `p.1` inside a live `(u32, u32)` aggregate whose
+   sibling field and Tree Borrows table the store leaves untouched.
 4. **Negative canaries**: overlapping `&mut` borrows are rejected by `PermTree`
    (and their conflicting accesses are Tree Borrows UB on live MIR); unpinning
    `.uninit` bytes or the invalid `bool` pattern `0x02` fails.
@@ -672,9 +679,9 @@ theorem zc_lockstep_pin_lifecycle :
        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
        trivial⟩⟩,
    rfl,
-   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
+   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
    rfl,
-   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
+   ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
    rfl,
    ⟨⟨⟨trivial, trivial⟩,
      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
@@ -708,6 +715,204 @@ theorem zcPair_fieldsTyped_and_field1_mutation_canary :
       (.use (.localSub 1 [])) =
       .ok ⟨.pair (.nat 7) (.nat zcV1), []⟩ :=
   ⟨(u32PairExactLE_encode_fieldsTyped ⟨7, by decide⟩ ⟨9, by decide⟩).1, rfl⟩
+
+/-! ### Test 3c: General Freeze / Unpin Bridges and a Field-Granular Pin on Live MIR -/
+
+/-- **General freeze bridge, instantiated**: the mid-pin relation after the
+`PureLift` freeze follows from `freeze_spatialPinnedBlockHolds` (the live place
+`_2` holds `zcV0`, and loan `0`'s tag is live and `unique`), not from unfolding
+the post-freeze state. -/
+theorem zc_freeze_general :
+    spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 2 [] zcStPinned zcMsPinned :=
+  freeze_spatialPinnedBlockHolds (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+    tagOfLoan stdValAlg 0 (st := zcStBorrowed) (x := ⟨zcV0, by decide⟩) rfl ⟨_, rfl, rfl⟩ rfl
+    ⟨_, rfl, rfl, rfl, rfl⟩
+
+/-- **General unpin bridge, instantiated**: unpinning after the live store
+yields exactly the value the trusted decoder reads from the live window of `_2`
+(`u32` is `zerocopy::IntoBytes`). -/
+theorem zc_unpin_general :
+    Exists fun x => Exists fun bs => Exists fun e' =>
+      placeByteWindow? zcLayouts u32Ty zcMsWritten 2 [] = some bs ∧
+      decodeValueFromBytes defaultCodecFuel zcLayouts u32Ty bs =
+        some ((u32MirCodec zcLayouts).toValue x) ∧
+      findLoan 0 zcStUnpinned.loans = some e' ∧ e'.phase = .activeMut ∧
+      e'.cell.val = u32Embed x :=
+  unpin_eq_live_mir_decode (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+    (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec
+    (zc_lockstep_pin_lifecycle.2.2.2.2.1) rfl
+
+/-- `fn patch_field(a: u32, b: u32) -> (u32, u32) { let mut p = (a, b);
+let q = &raw mut p.1; let r = q as *mut u8; unsafe { *r = 0xAB }; p }`: a
+localized raw byte-window store into one field of a typed aggregate. -/
+def fieldPinBody : CapturedMir :=
+  mkBody 2
+    [decl .mut pairTy, decl .not u32Ty, decl .not u32Ty, decl .mut pairTy,
+     decl .not rawU32Ty, decl .not rawU8Ty]
+    [mkBb
+      [mkSt (.storageLive 3),
+       mkSt (.assign (pl 3) (.aggregate .tuple [.copy (pl 1), .copy (pl 2)])),
+       mkSt (.storageLive 4),
+       mkSt (.assign (pl 4) (.rawPtr .mut (pl 3 [.field 1 u32Ty]))),
+       mkSt (.storageLive 5),
+       mkSt (.assign (pl 5) (.cast .ptrToPtr (.copy (pl 4)) rawU8Ty)),
+       mkSt (.assign (pl 5 [.deref]) (.use (u8C 0xAB))),
+       mkSt (.storageDead 5),
+       mkSt (.storageDead 4),
+       mkSt (.assign (pl 0) (.use (.copy (pl 3)))),
+       mkSt (.storageDead 3)]
+      .return_]
+
+def fpMs0 : MachineState :=
+  initMachineState fieldPinBody [.scalar ⟨7, 4⟩, .scalar ⟨zcV0, 4⟩]
+
+/-- Live state right before the field store: the raw pointers carry the
+`unique` tag `1` rooted at the field place `_3.1`. -/
+def fpMsPinned : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 6,
+        locals :=
+          [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨zcV0, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV0, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { fpMs0.memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 3, targetProjection := [.field 1 u32Ty],
+             perm := .unique }]
+        nextTag := 2 } }
+
+/-- Live state right after the field store `*r = 0xAB`. -/
+def fpMsWritten : MachineState :=
+  { fpMsPinned with
+    frame :=
+      { blockIdx := 0, stmtIdx := 7,
+        locals :=
+          [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨zcV0, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV1, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨1, 0⟩ 8)] } }
+
+theorem fp_pinned_path :
+    StepPath (Anneal.PureMirExec.mirStep fieldPinBody) fpMs0 6 fpMsPinned :=
+  stepPath_of_runSilentSteps rfl
+
+theorem fp_store_step :
+    Anneal.PureMirExec.mirStep fieldPinBody fpMsPinned = .cont fpMsWritten := rfl
+
+/-- **Field-local store with sibling and Tree Borrows frames**: the store
+rewrites exactly the field window of `_3.1` (to the same post-store cells as
+Test 3), leaves the sibling field `_3.0` and the Tree Borrows table unchanged,
+and keeps the `unique` tag rooted at `_3.1`. -/
+theorem fp_store_frame :
+    placeByteWindow? zcLayouts u32Ty fpMsPinned 3 [1] = some zcWindowBefore ∧
+    placeByteWindow? zcLayouts u32Ty fpMsWritten 3 [1] = some zcWindowAfter ∧
+    placeValue? fpMsWritten 3 [0] = placeValue? fpMsPinned 3 [0] ∧
+    fpMsWritten.memory.borrows = fpMsPinned.memory.borrows ∧
+    BorrowAt fpMsWritten 1 3 [1] mutGranting :=
+  ⟨rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩
+
+def fpParams : List (ParamInput StdVal) := [⟨.byVal, .nat 7⟩, ⟨.byVal, .nat zcV0⟩]
+
+/-- `p = (a, b)`; `q = &mut p.1` (loan `0`); pin, write, unpin; end; return `p`. -/
+def fpPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.localSub 2 []) (.binary stdMkPair (.localSub 0 []) (.localSub 1 []))))
+    (.seq (.act (.borrow 3 .mutBorrow (.localSub 2 [1])))
+      (.seq (.act (.freezeSpatial 0 zcCodec))
+        (.seq (.act (.mutateSpatial 0 0 zcCellsAfter))
+          (.seq (.act (.reabsorbSpatial 0 zcCodec))
+            (.act (.endLoan 0))))))
+
+/-- `PureLift` state after `q = &mut p.1`. -/
+def fpStBorrowed : SymState StdVal :=
+  ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩,
+    ⟨.pair (.nat 7) (.nat zcV0), .split [([1], .mutLocked 0)]⟩, ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat zcV0, .unborrowed⟩, .direct (.localReg 2) [1]⟩],
+   [], [], [], 0⟩
+
+theorem fp_borrowed_eval :
+    evalPlan stdValAlg
+        (.seq (.act (.assign (.localSub 2 [])
+            (.binary stdMkPair (.localSub 0 []) (.localSub 1 []))))
+          (.act (.borrow 3 .mutBorrow (.localSub 2 [1]))))
+        ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩], [], [], [], [], 0⟩ =
+      .ok (.continuing fpStBorrowed) := rfl
+
+/-- The field loan is realized on the live machine before the freeze. -/
+theorem fp_borrowed_rel :
+    mirStateRel tagOfLoan [(0, 3, [1])] fpStBorrowed fpMsPinned :=
+  ⟨⟨⟨trivial, trivial⟩,
+    ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+   mirLocalsRel_of_localsRefine
+     ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+      (fun h => nomatch h), fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+def fpStPinned : SymState StdVal :=
+  match freezeToSpatialInState stdValAlg 0 zcCodec fpStBorrowed with
+  | .ok st => st
+  | .fail => fpStBorrowed
+
+def fpStWritten : SymState StdVal :=
+  match mutateSpatialInState 0 0 zcCellsAfter fpStPinned with
+  | .ok st => st
+  | .fail => fpStPinned
+
+def fpStUnpinned : SymState StdVal :=
+  match unpinFromSpatialInState stdValAlg 0 zcCodec fpStWritten with
+  | .ok st => st
+  | .fail => fpStWritten
+
+/-- **Field-granular hybrid pin over live MIR**:
+1. the general freeze bridge materializes the field window of `_3.1` as the
+   pinned block (`freeze_spatialPinnedBlockHolds`, path `[1]`);
+2. the `PureLift` spatial mutation and the live field store keep the relation;
+3. the general unpin bridge restores loan `0` to the value the trusted decoder
+   reads from the live field window (`unpin_eq_live_mir_decode`). -/
+theorem fp_pin_lifecycle :
+    spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStPinned fpMsPinned ∧
+    mutateSpatialInState 0 0 zcCellsAfter fpStPinned = .ok fpStWritten ∧
+    spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStWritten fpMsWritten ∧
+    unpinFromSpatialInState stdValAlg 0 zcCodec fpStWritten = .ok fpStUnpinned ∧
+    (Exists fun x => Exists fun bs => Exists fun e' =>
+      placeByteWindow? zcLayouts u32Ty fpMsWritten 3 [1] = some bs ∧
+      decodeValueFromBytes defaultCodecFuel zcLayouts u32Ty bs =
+        some ((u32MirCodec zcLayouts).toValue x) ∧
+      findLoan 0 fpStUnpinned.loans = some e' ∧ e'.phase = .activeMut ∧
+      e'.cell.val = u32Embed x) := by
+  have hPinned :
+      spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStPinned fpMsPinned :=
+    freeze_spatialPinnedBlockHolds (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+      tagOfLoan stdValAlg 0 (st := fpStBorrowed) (x := ⟨zcV0, by decide⟩) rfl ⟨_, rfl, rfl⟩
+      rfl ⟨_, rfl, rfl, rfl, rfl⟩
+  have hWritten :
+      spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0 zcCodec 3 [1] fpStWritten
+        fpMsWritten :=
+    ⟨_, _, _, _, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨_, rfl, rfl, rfl, rfl⟩⟩
+  exact ⟨hPinned, rfl, hWritten, rfl,
+    unpin_eq_live_mir_decode (u32MirCodec zcLayouts) 32 u32Embed u32Embed? u32Embed_embed?
+      (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 0 0 zcCodec hWritten rfl⟩
+
+/-- `PureLift` result: `(7, zcV1)`. -/
+theorem fp_pureLift_eval :
+    evalFnValue stdValAlg fpParams fpPlan (.use (.localSub 2 [])) =
+      .ok ⟨.pair (.nat 7) (.nat zcV1), []⟩ := rfl
+
+theorem fp_entry_rel :
+    mirStateRel tagOfLoan []
+      ⟨[⟨.nat 7, .unborrowed⟩, ⟨.nat zcV0, .unborrowed⟩], [], [], [], [], 0⟩ fpMs0 :=
+  ⟨⟨trivial, trivial⟩,
+   mirLocalsRel_of_localsRefine
+     ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+
+/-- **Test 3c (adequacy)**: the field-granular pin → field store → unpin
+function converges on live MIR to a normal return refining `(7, zcV1)`. -/
+theorem fp_sound :
+    Anneal.MirFuelFree.MirWpConverges fieldPinBody fpMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .pair (.nat 7) (.nat zcV1))) :=
+  mir_pure_lift_sound_of_evalFuel tagOfLoan fieldPinBody [] fpParams fpPlan
+    (.use (.localSub 2 [])) _ fpMs0 ⟨.pair (.nat 7) (.nat zcV1), []⟩
+    (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV1, 4⟩]) _ 16 []
+    ⟨_, rfl, fp_entry_rel⟩ fp_pureLift_eval rfl rfl
+    (.pair (.nat (by decide)) (.nat (by decide))) rfl
 
 /-! ## Test 4: Negative Falsification Canaries -/
 
@@ -861,5 +1066,20 @@ theorem bool_retype_init_cell_rejected :
     evalFnValue stdValAlg [⟨.byVal, .bool true⟩]
       (boolPlanWith [.init (.nat 99)]) (.use (.localSub 1 [])) = .fail :=
   ⟨rfl, rfl⟩
+
+/-- **(h) The mid-pin relation pins the exact codec, not just its identifier**:
+a codec sharing the pinned `u32` codec's identifier (`32`) but encoding and
+decoding single value cells does not satisfy `spatialPinnedBlockHolds`
+(codec identifiers alone cannot determine the decoder that
+`unpinFromSpatialInState` will run). -/
+theorem pinned_relation_rejects_colliding_codec :
+    ¬ spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 0 0
+      { valueCellCodec with codecId := 32 } 2 [] zcStPinned zcMsPinned := by
+  intro ⟨e, _, _, _, hFind, hPhase, _⟩
+  injection hFind with he
+  subst he
+  obtain ⟨_, hC⟩ := hPhase
+  have hEnc := congrArg (fun c : SpatialCodec StdVal => c.encode (.nat zcV0)) hC
+  exact nomatch hEnc
 
 end PureLiftV2026BridgeTests
