@@ -275,4 +275,82 @@ theorem step_float_casts_concrete :
         floatLocalDecls castStage1Layouts = unsupported :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- `evalFloatCast` at `castStage1Layouts` on a single scalar operand of byte width `sz`. -/
+def fcast (ck : CastKind) (src dst : RigidTy) (bits sz : Nat) : Option Value :=
+  evalFloatCast ck (some { kind := src, layoutIdx := 0 }) { kind := dst, layoutIdx := 0 }
+    castStage1Layouts (.scalar ⟨bits, sz⟩)
+
+/-- IEEE-754 `roundTiesToEven` subnormal and overflow boundaries for `f64 as f32`
+(cross-checked against host binary32 rounding): exact ties at `1.5·2⁻¹⁴⁹` / `2.5·2⁻¹⁴⁹` round to
+the even subnormal `2·2⁻¹⁴⁹` (sign-symmetric), `0.75·2⁻¹⁴⁹` rounds up to the least subnormal, the
+largest subnormal rounds up into the least normal, `f32::MAX + ½ulp` (a tie with an odd
+significand) overflows to `+∞`, and the value just below that tie stays at `f32::MAX`. -/
+theorem fcast_f64_to_f32_ties_subnormal_and_overflow :
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x36A8000000000000 8 = some (.scalar ⟨0x2, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x36B4000000000000 8 = some (.scalar ⟨0x2, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0xB6A8000000000000 8 =
+      some (.scalar ⟨0x80000002, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x3698000000000000 8 = some (.scalar ⟨0x1, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x380FFFFFE0000000 8 =
+      some (.scalar ⟨0x800000, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x47EFFFFFF0000000 8 =
+      some (.scalar ⟨0x7F800000, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x47EFFFFFEFFFFFFF 8 =
+      some (.scalar ⟨0x7F7FFFFF, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x3FF0000010000000 8 =
+      some (.scalar ⟨0x3F800000, 4⟩) ∧
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x3FF0000010000004 8 =
+      some (.scalar ⟨0x3F800001, 4⟩) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- NaN quieting (one admissible deterministic choice under Rust's non-deterministic NaN
+semantics, matching IEEE-754 / x86 `cvtsd2ss` / `cvtss2sd`): signaling NaNs are quieted, the
+`f32 → f64` payload is preserved (shifted into the high significand bits) together with the sign,
+and the `f64 → f32` payload is truncated to its top bits. Exact widening keeps the least `f32`
+subnormal exact. -/
+theorem fcast_nan_quieting_and_exact_widening :
+    fcast .floatToFloat (.float .f64) (.float .f32) 0x7FF0000000000001 8 =
+      some (.scalar ⟨0x7FC00000, 4⟩) ∧
+    fcast .floatToFloat (.float .f32) (.float .f64) 0x7F800001 4 =
+      some (.scalar ⟨0x7FF8000020000000, 8⟩) ∧
+    fcast .floatToFloat (.float .f32) (.float .f64) 0xFFC00000 4 =
+      some (.scalar ⟨0xFFF8000000000000, 8⟩) ∧
+    fcast .floatToFloat (.float .f32) (.float .f64) 0x00000001 4 =
+      some (.scalar ⟨0x36A0000000000000, 8⟩) := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Saturating `as` casts at the integer extremes: `NaN → 0`, `2³¹f32 as i32 = i32::MAX`,
+`2147483520f32 as i32` exact, `-2⁶³f64 as i64 = i64::MIN`, `+∞ as u8 = 255`,
+`1e39f64 as u128 = u128::MAX`, and `-0.5 as isize = 0` (truncation toward zero). -/
+theorem fcast_float_to_int_saturation_extremes :
+    fcast .floatToInt (.float .f32) (.int .i32) 0x7FC00000 4 = some (.scalar ⟨0, 4⟩) ∧
+    fcast .floatToInt (.float .f32) (.int .i32) 0x4F000000 4 = some (.scalar ⟨0x7FFFFFFF, 4⟩) ∧
+    fcast .floatToInt (.float .f32) (.int .i32) 0x4EFFFFFF 4 = some (.scalar ⟨0x7FFFFF80, 4⟩) ∧
+    fcast .floatToInt (.float .f64) (.int .i64) 0xC3E0000000000000 8 =
+      some (.scalar ⟨0x8000000000000000, 8⟩) ∧
+    fcast .floatToInt (.float .f64) (.uint .u8) 0x7FF0000000000000 8 = some (.scalar ⟨0xFF, 1⟩) ∧
+    fcast .floatToInt (.float .f64) (.uint .u128) 0x48078287F49C4A1D 8 =
+      some (.scalar ⟨2 ^ 128 - 1, 16⟩) ∧
+    fcast .floatToInt (.float .f64) (.int .isize) 0xBFE0000000000000 8 = some (.scalar ⟨0, 8⟩) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `roundTiesToEven` integer-to-float at the format limits: `u128::MAX as f32 = +∞` (it exceeds
+`f32::MAX + ½ulp`), `u128::MAX as f64 = 2¹²⁸`, `i128::MIN as f32 = -2¹²⁷` exactly,
+`u64::MAX as f32 = 2⁶⁴`, `i64::MAX as f32 = 2⁶³`, and the `2²⁴ + 1` / `2²⁴ + 3` (`f32`) and
+`2⁵³ + 1` (`f64`) ties rounding to the even neighbour. -/
+theorem fcast_int_to_float_limits_and_ties :
+    fcast .intToFloat (.uint .u128) (.float .f32) (2 ^ 128 - 1) 16 = some (.scalar ⟨0x7F800000, 4⟩) ∧
+    fcast .intToFloat (.uint .u128) (.float .f64) (2 ^ 128 - 1) 16 =
+      some (.scalar ⟨0x47F0000000000000, 8⟩) ∧
+    fcast .intToFloat (.int .i128) (.float .f32) (2 ^ 127) 16 = some (.scalar ⟨0xFF000000, 4⟩) ∧
+    fcast .intToFloat (.uint .u64) (.float .f32) 0xFFFFFFFFFFFFFFFF 8 =
+      some (.scalar ⟨0x5F800000, 4⟩) ∧
+    fcast .intToFloat (.int .i64) (.float .f32) 0x7FFFFFFFFFFFFFFF 8 =
+      some (.scalar ⟨0x5F000000, 4⟩) ∧
+    fcast .intToFloat (.int .i32) (.float .f32) 16777217 4 = some (.scalar ⟨0x4B800000, 4⟩) ∧
+    fcast .intToFloat (.int .i32) (.float .f32) 16777219 4 = some (.scalar ⟨0x4B800002, 4⟩) ∧
+    fcast .intToFloat (.uint .u64) (.float .f64) (2 ^ 53 + 1) 8 =
+      some (.scalar ⟨0x4340000000000000, 8⟩) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.CastStage1Tests
