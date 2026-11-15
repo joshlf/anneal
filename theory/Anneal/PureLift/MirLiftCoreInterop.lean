@@ -33,7 +33,8 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    `evalFuel_blockCfgStep` proves `PureMirExec.evalFuel` of the embedding
    *equals* `runBlockCfg` of the fork-free CFG `forkFree stepBb` at every fuel,
    and `runBlockCfg_of_forkFree_ret` transports every fork-free return back to
-   the original CFG.
+   the original CFG; on CFGs without symbolic forks the embedding is complete
+   (`wpConverges_blockCfgStep_iff_of_noFork`).
 2. **Partial correctness transfer** (`modular_block_cfg_sound`):
    `wpConverges_blockCfgStep_postRet` strengthens any fuel-free convergence
    proof of the embedded CFG with PureLift's `PostRet`, and
@@ -62,10 +63,16 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    verified PureLift CFG plus per-step MIR simulation obligations (each
    dischargeable by `stepsTo_of_runMirToBlock_reached`) yields
    `MirWpConverges` / `LiftBlockToJoin` for the MIR body.
+7. **Adequacy bridge** (`Adapter.pure_lift_sound`): `stepOperationalAdapter`
+   realizes PureLift's `OperationalAdapter` by exact `k`-step paths
+   (`StepPath`, interconvertible with `StepsTo`) of any MirLiftCore machine,
+   and `pure_lift_stepsTo` / `pure_lift_mirWpConverges` turn
+   `pure_lift_sound` into a fuel-free segment / live `MirWpConverges`.
 
 All results are exercised non-vacuously at the end of the file on concrete
 PureLift CFGs with symbolic data (`testCfgStep` countdown, and the `S6`
-count-up loop over `StdVal` with symbolic bounds).
+count-up loop over `StdVal` with symbolic bounds) and on the live two-block
+`CapturedMir` body `liveInteropMirBody`.
 -/
 
 namespace Anneal.PureLift.MirLiftCoreInterop
@@ -636,6 +643,40 @@ theorem runBlockCfg_total_of_rank
     (wpConverges_blockCfgStep_of_rank stepBb BlockInv PostRet hLocal rank
       hRankJump hRankWrapped ⟨fun v => v, bb, st⟩ ⟨hInv, fun _ hv => hv⟩)
 
+/-- A CFG without symbolic forks is its own fork-free CFG. -/
+theorem forkFree_eq_of_noFork (stepBb : Nat → State → BlockStepResult State Ret)
+    (hNoFork : ∀ bb st mergeRet thenBb elseBb st',
+      stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st') :
+    forkFree stepBb = stepBb := by
+  funext bb st
+  dsimp only [forkFree]
+  cases h : stepBb bb st with
+  | jump _ _ => rfl
+  | jumpWrapped _ _ _ => rfl
+  | branchJump mergeRet thenBb elseBb st' =>
+    exact absurd h (hNoFork bb st mergeRet thenBb elseBb st')
+  | ret _ => rfl
+  | fault => rfl
+
+/-- **Completeness for fork-free CFGs**: on a CFG without symbolic forks, the
+embedded machine converges exactly when `runBlockCfg` returns at some fuel, so
+`runBlockCfg_of_wpConverges` is an equivalence. -/
+theorem wpConverges_blockCfgStep_iff_of_noFork
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (hNoFork : ∀ bb st mergeRet thenBb elseBb st',
+      stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st')
+    (bb : Nat) (st : State) (P : Ret → Prop) :
+    PureMirExec.WpConverges (blockCfgStep stepBb) ⟨fun v => v, bb, st⟩ P ↔
+      Exists fun k => Exists fun v => runBlockCfg stepBb bb st k = .ret v ∧ P v := by
+  refine ⟨runBlockCfg_of_wpConverges stepBb, ?_⟩
+  intro h
+  obtain ⟨k, v, hRun, hP⟩ := h
+  refine ⟨k, v, ?_, hP⟩
+  rw [evalFuel_blockCfgStep, forkFree_eq_of_noFork stepBb hNoFork]
+  dsimp only
+  rw [hRun]
+  rfl
+
 end BlockMachine
 
 /-! ## Loops: `runWhileFlowSteps_cutpoint_sound` and `forRangeUp` -/
@@ -882,6 +923,110 @@ theorem whileLoop_stepsTo_forRangeUp {α : Type} (alg : ValAlgebra Val)
 end Loops
 
 /-! ## Refinement into Live MIR (`runMirToBlock`, `MirWpConverges`, `LiftBlockToJoin`) -/
+
+/-! ## `OperationalAdapter` over `PureMirExec.Step` Machines (`pure_lift_sound` as a Fuel-Free Segment) -/
+
+section AdapterBridge
+
+variable {σ α : Type}
+
+/-- Exact `k`-step path of a deterministic `PureMirExec.Step` machine. -/
+inductive StepPath (step : σ → PureMirExec.Step σ α) : σ → Nat → σ → Prop where
+  | refl (s : σ) : StepPath step s 0 s
+  | cons {s s' t : σ} {k : Nat} (hStep : step s = .cont s')
+      (hRest : StepPath step s' k t) : StepPath step s (k + 1) t
+
+theorem StepPath.trans {step : σ → PureMirExec.Step σ α} :
+    ∀ {s t u : σ} {k₁ k₂ : Nat},
+      StepPath step s k₁ t → StepPath step t k₂ u → StepPath step s (k₁ + k₂) u
+  | _, _, _, _, _, .refl _, h₂ => by
+    rw [Nat.zero_add]
+    exact h₂
+  | _, _, _, _, k₂, .cons (k := k) hStep hRest, h₂ => by
+    rw [Nat.add_right_comm k 1 k₂]
+    exact .cons hStep (StepPath.trans hRest h₂)
+
+/-- A `k`-step path is a MirLiftCore `StepsTo` segment. -/
+theorem StepPath.stepsTo {step : σ → PureMirExec.Step σ α} {s t : σ} {k : Nat}
+    (h : StepPath step s k t) : PureMirExec.StepsTo step s (· = t) := by
+  induction h with
+  | refl _ => exact .refl rfl
+  | cons hStep _ ih => exact .step hStep ih
+
+/-- Every MirLiftCore `StepsTo` segment is a `k`-step path for some `k`. -/
+theorem StepsTo.exists_stepPath {step : σ → PureMirExec.Step σ α} {s : σ}
+    {mid : σ → Prop} (h : PureMirExec.StepsTo step s mid) :
+    Exists fun k => Exists fun t => StepPath step s k t ∧ mid t := by
+  induction h with
+  | refl hm => exact ⟨0, _, .refl _, hm⟩
+  | step hs _ ih =>
+    obtain ⟨k, t, hPath, hm⟩ := ih
+    exact ⟨k + 1, t, .cons hs hPath, hm⟩
+
+/-- PureLift `OperationalAdapter` whose `ExecutesTo` is exact `k`-step
+reachability of a MirLiftCore machine (for example live MIR
+`PureMirExec.mirStep body`). -/
+def stepOperationalAdapter {Val : Type} (step : σ → PureMirExec.Step σ α)
+    (StateRel : SymState Val → σ → Prop) (FinalLoansRel : FuncOut Val → σ → Prop) :
+    OperationalAdapter σ Val where
+  ExecutesTo := StepPath step
+  StateRel := StateRel
+  FinalLoansRel := FinalLoansRel
+  exec_zero := StepPath.refl
+  exec_trans := StepPath.trans
+
+/-- **PureLift adequacy as a fuel-free segment**: `pure_lift_sound` over
+`stepOperationalAdapter step` yields a MirLiftCore `StepsTo` segment from `m0`
+to a machine state related to some PureLift output that satisfies `post`. -/
+theorem pure_lift_stepsTo {Val : Type} (step : σ → PureMirExec.Step σ α)
+    (StateRel : SymState Val → σ → Prop) (FinalLoansRel : FuncOut Val → σ → Prop)
+    (alg : ValAlgebra Val) (params : List (ParamInput Val)) (plan : FlowPlan Val)
+    (retExpr : RvalOp Val) (post : FuncOut Val → Prop) (m0 : σ)
+    (hInit : Exists fun st0 => initFnState alg params = .ok st0 ∧ StateRel st0 m0)
+    (hSpec : HoldsFnSpec (evalFnValue alg params plan retExpr) post)
+    (hSim : ∀ st0 out,
+      initFnState alg params = .ok st0 → StateRel st0 m0 →
+      evalFnValue alg params plan retExpr = .ok out →
+      Exists fun k => Exists fun mFinal =>
+        StepPath step m0 k mFinal ∧ FinalLoansRel out mFinal) :
+    PureMirExec.StepsTo step m0
+      (fun m => Exists fun out => FinalLoansRel out m ∧ post out) := by
+  obtain ⟨_, mFinal, out, hExec, hRel, hPost⟩ :=
+    pure_lift_sound (stepOperationalAdapter step StateRel FinalLoansRel) alg params
+      plan retExpr post m0 hInit hSpec hSim
+  refine (StepPath.stepsTo hExec).mono ?_
+  intro m hm
+  subst hm
+  exact ⟨out, hRel, hPost⟩
+
+/-- **PureLift adequacy refines live MIR**: `pure_lift_sound` over
+`stepOperationalAdapter (PureMirExec.mirStep body)` composes with any live
+`MirWpConverges` proof for the related final machine states (for example one
+built with MirLiftCore's `LiftBlockConverges` judgments). -/
+theorem pure_lift_mirWpConverges {Val : Type} {body : CapturedMir}
+    (StateRel : SymState Val → MachineState → Prop)
+    (FinalLoansRel : FuncOut Val → MachineState → Prop)
+    (alg : ValAlgebra Val) (params : List (ParamInput Val)) (plan : FlowPlan Val)
+    (retExpr : RvalOp Val) (post : FuncOut Val → Prop) (m0 : MachineState)
+    (hInit : Exists fun st0 => initFnState alg params = .ok st0 ∧ StateRel st0 m0)
+    (hSpec : HoldsFnSpec (evalFnValue alg params plan retExpr) post)
+    (hSim : ∀ st0 out,
+      initFnState alg params = .ok st0 → StateRel st0 m0 →
+      evalFnValue alg params plan retExpr = .ok out →
+      Exists fun k => Exists fun mFinal =>
+        StepPath (PureMirExec.mirStep body) m0 k mFinal ∧ FinalLoansRel out mFinal)
+    (Post : MirOutcome → Prop)
+    (hHalt : ∀ ms out, FinalLoansRel out ms → post out →
+      Anneal.MirFuelFree.MirWpConverges body ms Post) :
+    Anneal.MirFuelFree.MirWpConverges body m0 Post :=
+  PureMirExec.mirWpConverges_of_stepsTo_bind
+    (pure_lift_stepsTo (PureMirExec.mirStep body) StateRel FinalLoansRel alg params
+      plan retExpr post m0 hInit hSpec hSim)
+    (fun ms hms =>
+      match hms with
+      | ⟨out, hRel, hPost⟩ => hHalt ms out hRel hPost)
+
+end AdapterBridge
 
 section LiveMir
 
@@ -1483,6 +1628,56 @@ theorem liveInterop_runMirToBlock_stepInv_canary :
     · exact Or.inr rfl
     · exact rfl
   exact ⟨hInv, runMirToBlock_of_stepInv hInv 1 (liveInteropMs 0) (Or.inl rfl)⟩
+
+/-! ### `pure_lift_sound` on live MIR and fork-free completeness -/
+
+/-- One live MIR step of `liveInteropMirBody`: `bb0: goto bb1`. -/
+theorem liveInterop_mirStep_bb0 :
+    PureMirExec.mirStep liveInteropMirBody (liveInteropMs 0) =
+      .cont (liveInteropMs 1) := rfl
+
+/-- **Non-vacuity of `pure_lift_mirWpConverges`**: PureLift's adequacy theorem
+`pure_lift_sound`, instantiated with `stepOperationalAdapter` over live
+`PureMirExec.mirStep liveInteropMirBody`, proves fuel-free `MirWpConverges`
+of the MIR body from the PureLift evaluation of a function returning `100`. -/
+theorem liveInterop_pure_lift_mirWpConverges_canary :
+    Anneal.MirFuelFree.MirWpConverges liveInteropMirBody (liveInteropMs 0)
+      (· = liveInteropMirOutcome) :=
+  pure_lift_mirWpConverges (Val := StdVal) (body := liveInteropMirBody)
+    (fun _ ms => ms = liveInteropMs 0)
+    (fun out ms => ms = liveInteropMs 1 ∧ out = ⟨.nat 100, []⟩)
+    stdValAlg [] .skip (.constVal (.nat 100)) (fun out => out.ret = .nat 100)
+    (liveInteropMs 0) ⟨⟨[], [], [], [], [], 0⟩, rfl, rfl⟩ rfl
+    (fun _ out _ _ hEval => by
+      change EvalOutcome.ok ⟨StdVal.nat 100, []⟩ = .ok out at hEval
+      injection hEval with hOut
+      exact ⟨1, liveInteropMs 1,
+        .cons liveInterop_mirStep_bb0 (.refl _), rfl, hOut.symm⟩)
+    (· = liveInteropMirOutcome)
+    (fun ms _ hRel _ => by
+      rw [hRel.1]
+      exact PureMirExec.mirWpConverges_of_wpConverges
+        (PureMirExec.WpConverges.of_done rfl rfl))
+
+/-- `testCfgStep` has no symbolic forks. -/
+theorem testCfgStep_noFork : ∀ bb st mergeRet thenBb elseBb st',
+    testCfgStep bb st ≠ .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st mergeRet thenBb elseBb st' h
+  match bb, st with
+  | 0, 0 => exact nomatch h
+  | 0, _ + 1 => exact nomatch h
+  | 1, _ => exact nomatch h
+  | 2, _ => exact nomatch h
+  | _ + 3, _ => exact nomatch h
+
+/-- **Non-vacuity of `wpConverges_blockCfgStep_iff_of_noFork`**: a concrete
+`runBlockCfg` return of the fork-free countdown is a fuel-free convergence of
+the embedded machine. -/
+theorem countdown_wpConverges_of_runBlockCfg :
+    PureMirExec.WpConverges (blockCfgStep testCfgStep) ⟨fun v => v, 0, 3⟩
+      (· = 100) :=
+  (wpConverges_blockCfgStep_iff_of_noFork testCfgStep testCfgStep_noFork 0 3
+    (· = 100)).mpr ⟨10, 100, rfl, rfl⟩
 
 end Canaries
 

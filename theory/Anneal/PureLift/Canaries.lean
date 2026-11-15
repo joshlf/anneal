@@ -674,6 +674,78 @@ def stdValAlg : ValAlgebra StdVal where
   sameAggregateShape_ext := stdVal_sameAggregateShape_ext
   sameAggregateShape_setField := stdVal_sameAggregateShape_setField
 
+/-- Fields of a `StdVal` pair are strict subtrees. -/
+theorem stdVal_getField_sizeBound_lt (f : FieldIdx) (v c : StdVal)
+    (hGet : stdValAlg.getField f v = some c) :
+    stdValAlg.sizeBound c < stdValAlg.sizeBound v := by
+  cases v with
+  | mk fv tv =>
+    cases f with
+    | zero =>
+      cases tv with
+      | pairBranch fl fr l r =>
+        injection hGet with hc
+        subst hc
+        exact Nat.lt_succ_of_le (Nat.le_add_right fl fr)
+      | unit => exact nomatch hGet
+      | nat _ => exact nomatch hGet
+      | bool _ => exact nomatch hGet
+      | symBool _ => exact nomatch hGet
+      | refVal _ _ => exact nomatch hGet
+      | choice _ _ _ _ _ _ => exact nomatch hGet
+    | succ f' =>
+      cases f' with
+      | zero =>
+        cases tv with
+        | pairBranch fl fr l r =>
+          injection hGet with hc
+          subst hc
+          exact Nat.lt_succ_of_le (Nat.le_add_left fr fl)
+        | unit => exact nomatch hGet
+        | nat _ => exact nomatch hGet
+        | bool _ => exact nomatch hGet
+        | symBool _ => exact nomatch hGet
+        | refVal _ _ => exact nomatch hGet
+        | choice _ _ _ _ _ _ => exact nomatch hGet
+      | succ _ => exact nomatch hGet
+
+/-- Arms of a `StdVal` choice are strict subtrees. -/
+theorem stdVal_branchParts_sizeBound_lt (v c : StdVal)
+    (hMem : List.Mem c (stdValAlg.branchParts v)) :
+    stdValAlg.sizeBound c < stdValAlg.sizeBound v := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | choice fc ft ff cnd vt vf =>
+      cases hMem with
+      | head =>
+        exact Nat.lt_succ_of_le
+          (Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff))
+      | tail _ hRest =>
+        cases hRest with
+        | head => exact Nat.lt_succ_of_le (Nat.le_add_left ff (fc + ft))
+        | tail _ hNil => exact nomatch hNil
+    | unit => exact nomatch hMem
+    | nat _ => exact nomatch hMem
+    | bool _ => exact nomatch hMem
+    | symBool _ => exact nomatch hMem
+    | pairBranch _ _ _ _ => exact nomatch hMem
+    | refVal _ _ => exact nomatch hMem
+
+/-- `stdValAlg` satisfies `SizeBoundDecreasing`, so its handle scan never
+fails closed and `replaceableVal` is reflexive on every `StdVal`. -/
+theorem stdVal_sizeBoundDecreasing : SizeBoundDecreasing stdValAlg :=
+  ⟨stdVal_getField_sizeBound_lt, stdVal_branchParts_sizeBound_lt⟩
+
+theorem stdVal_collectHandles_total (v : StdVal) :
+    Exists fun lids => collectHandles stdValAlg v = some lids :=
+  collectHandles_total_of_sizeBoundDecreasing stdValAlg stdVal_sizeBoundDecreasing v
+
+theorem stdVal_replaceableVal_self (loans : List (LoanEntry StdVal)) (v : StdVal) :
+    replaceableVal stdValAlg loans v v = true :=
+  replaceableVal_self_of_sizeBoundDecreasing stdValAlg stdVal_sizeBoundDecreasing
+    loans v
+
 def stdAdd (v1 v2 : StdVal) : Option StdVal :=
   match v1, v2 with
   | ⟨_, .nat n1⟩, ⟨_, .nat n2⟩ => some (.nat (n1 + n2))

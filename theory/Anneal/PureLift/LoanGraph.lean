@@ -829,136 +829,177 @@ theorem collectFieldsFuel_succ {Val : Type} (alg : ValAlgebra Val)
        | some ls, none => some ls
        | none, _ => none) := rfl
 
-theorem lensTest_collectFields_none (ih : LensTestVal → Option (List LoanId))
-    (w : LensTestVal) (hNone : ∀ idx, lensTestGetField idx w = none) :
-    ∀ (n : Nat),
-      collectFieldsFuel lensTestValAlg ih w n = some []
-  | 0 => rfl
-  | n' + 1 => by
-    rw [collectFieldsFuel_succ, lensTest_collectFields_none ih w hNone n']
-    dsimp only [lensTestValAlg]
-    rw [hNone n']
+/-- `sizeBound` strictly decreases from a value to each of its fields and to
+each arm of a symbolic choice (`branchParts`). Under this measure the budget
+`sizeBound v + 1` of `collectHandles` always suffices, so the handle scan never
+fails closed (`collectHandles_total_of_sizeBoundDecreasing`) and
+`replaceableVal` is reflexive (`replaceableVal_self_of_sizeBoundDecreasing`). -/
+def SizeBoundDecreasing {Val : Type} (alg : ValAlgebra Val) : Prop :=
+  (∀ (f : FieldIdx) (v c : Val), alg.getField f v = some c →
+    alg.sizeBound c < alg.sizeBound v) ∧
+  (∀ (v c : Val), List.Mem c (alg.branchParts v) →
+    alg.sizeBound c < alg.sizeBound v)
 
-theorem lensTest_collectFields_branch (ih : LensTestVal → Option (List LoanId))
-    (fl fr : Nat) (l : LensTestTree fl) (r : LensTestTree fr)
-    (lsL lsR : List LoanId)
-    (hL : ih ⟨fl, l⟩ = some lsL) (hR : ih ⟨fr, r⟩ = some lsR) :
-    ∀ (m : Nat),
-      collectFieldsFuel lensTestValAlg ih
-        ⟨fl + fr + 1, .branch fl fr l r⟩ (m + 2) = some (lsL ++ lsR)
-  | 0 => by
-    change
-      collectFieldsFuel lensTestValAlg ih
-        ⟨fl + fr + 1, .branch fl fr l r⟩ ((0 + 1) + 1) = some (lsL ++ lsR)
-    rw [collectFieldsFuel_succ, collectFieldsFuel_succ, collectFieldsFuel_zero]
-    have hG0 :
-        lensTestValAlg.getField 0 ⟨fl + fr + 1, .branch fl fr l r⟩ =
-          some ⟨fl, l⟩ := rfl
-    have hG1 :
-        lensTestValAlg.getField 1 ⟨fl + fr + 1, .branch fl fr l r⟩ =
-          some ⟨fr, r⟩ := rfl
-    rw [hG0, hG1]
-    dsimp only
-    rw [hL]
-    dsimp only [List.nil_append]
-    rw [hR]
-  | m' + 1 => by
-    change
-      collectFieldsFuel lensTestValAlg ih
-        ⟨fl + fr + 1, .branch fl fr l r⟩ ((m' + 2) + 1) = some (lsL ++ lsR)
-    rw [collectFieldsFuel_succ,
-        lensTest_collectFields_branch ih fl fr l r lsL lsR hL hR m']
-    rfl
+/-- The field scan of `collectHandles` succeeds whenever the recursive scan
+succeeds on every field. -/
+theorem collectFieldsFuel_some {Val : Type} (alg : ValAlgebra Val)
+    (ih : Val → Option (List LoanId)) (w : Val)
+    (hIh : ∀ (idx : Nat) (c : Val), alg.getField idx w = some c →
+      Exists fun ls => ih c = some ls) :
+    ∀ (n : Nat), Exists fun ls => collectFieldsFuel alg ih w n = some ls
+  | 0 => ⟨[], rfl⟩
+  | n + 1 => by
+    cases collectFieldsFuel_some alg ih w hIh n with
+    | intro ls hls =>
+      rw [collectFieldsFuel_succ, hls]
+      cases hG : alg.getField n w with
+      | none => exact ⟨ls, rfl⟩
+      | some c =>
+        cases hIh n c hG with
+        | intro ls' hls' =>
+          refine ⟨ls ++ ls', ?_⟩
+          dsimp only
+          rw [hls']
 
-theorem lensTestTree_collectHandlesFuel :
-    ∀ {f : Nat} (t : LensTestTree f) (k : Nat),
-      f ≤ k →
-      Exists fun lids =>
-        collectHandlesFuel lensTestValAlg (k + 1) ⟨f, t⟩ = some lids := by
-  intro f t
-  induction t with
-  | atom n =>
-    intro k _
-    exact ⟨[], rfl⟩
-  | ref lid path =>
-    intro k _
-    exact ⟨[lid], rfl⟩
-  | branch fl fr l r ihl ihr =>
-    intro k hLe
-    cases k with
-    | zero => nomatch hLe
-    | succ k' =>
-      have hSub : fl + fr ≤ k' := Nat.le_of_succ_le_succ hLe
-      have hFl : fl ≤ k' := Nat.le_trans (Nat.le_add_right fl fr) hSub
-      have hFr : fr ≤ k' := Nat.le_trans (Nat.le_add_left fr fl) hSub
-      cases ihl k' hFl with
-      | intro lsL hL =>
-        cases ihr k' hFr with
-        | intro lsR hR =>
-          refine ⟨lsL ++ lsR, ?_⟩
-          cases fr with
-          | zero => nomatch (lensTestTree_fuel_pos r)
-          | succ fr' =>
-            exact lensTest_collectFields_branch
-              (collectHandlesFuel lensTestValAlg (k' + 1))
-              fl (fr' + 1) l r lsL lsR hL hR (fl + fr')
-  | choice fc ft ff c vt vf _ iht ihf =>
-    intro k hLe
-    cases k with
-    | zero => nomatch hLe
-    | succ k' =>
-      have hSub : fc + ft + ff ≤ k' := Nat.le_of_succ_le_succ hLe
-      have hSub12 : fc + ft ≤ k' :=
-        Nat.le_trans (Nat.le_add_right (fc + ft) ff) hSub
-      have hFt : ft ≤ k' := Nat.le_trans (Nat.le_add_left ft fc) hSub12
-      have hFf : ff ≤ k' := Nat.le_trans (Nat.le_add_left ff (fc + ft)) hSub
-      cases iht k' hFt with
-      | intro lsT hT =>
-        cases ihf k' hFf with
-        | intro lsF hF =>
-          refine ⟨lsF ++ lsT, ?_⟩
-          have hNone :
-              ∀ idx,
-                lensTestGetField idx
-                  ⟨fc + ft + ff + 1, .choice fc ft ff c vt vf⟩ = none := by
-            intro idx
-            cases idx with
-            | zero => rfl
-            | succ idx' => cases idx' <;> rfl
-          change
-            (match
-               (match
-                  collectFieldsFuel lensTestValAlg
-                    (collectHandlesFuel lensTestValAlg (k' + 1))
-                    ⟨fc + ft + ff + 1, .choice fc ft ff c vt vf⟩
-                    (fc + ft + ff + 1),
-                  collectHandlesFuel lensTestValAlg (k' + 1) ⟨ff, vf⟩ with
+/-- The choice-arm scan of `collectHandles` succeeds whenever its seed and the
+recursive scan of every arm succeed. -/
+theorem foldr_handleParts_some {Val : Type} (ih : Val → Option (List LoanId)) :
+    ∀ (parts : List Val) (init : Option (List LoanId)),
+      (Exists fun ls => init = some ls) →
+      (∀ c, List.Mem c parts → Exists fun ls => ih c = some ls) →
+      Exists fun ls =>
+        parts.foldr
+          (fun part acc =>
+            match acc, ih part with
+            | some ls, some ls' => some (ls ++ ls')
+            | _, _ => none)
+          init = some ls
+  | [], _, hInit, _ => hInit
+  | p :: rest, init, hInit, hParts => by
+    cases foldr_handleParts_some ih rest init hInit
+        (fun c hc => hParts c (List.Mem.tail p hc)) with
+    | intro ls hls =>
+      cases hParts p (List.Mem.head rest) with
+      | intro ls' hls' =>
+        refine ⟨ls ++ ls', ?_⟩
+        change
+          (match List.foldr
+              (fun part acc =>
+                match acc, ih part with
                 | some ls, some ls' => some (ls ++ ls')
-                | _, _ => none),
-               collectHandlesFuel lensTestValAlg (k' + 1) ⟨ft, vt⟩ with
-             | some ls, some ls' => some (ls ++ ls')
-             | _, _ => none) = some (lsF ++ lsT)
-          rw [lensTest_collectFields_none
-                (collectHandlesFuel lensTestValAlg (k' + 1))
-                ⟨fc + ft + ff + 1, .choice fc ft ff c vt vf⟩ hNone
-                (fc + ft + ff + 1),
-              hF, hT]
-          rfl
+                | _, _ => none)
+              init rest, ih p with
+           | some ls, some ls' => some (ls ++ ls')
+           | _, _ => none) = some (ls ++ ls')
+        rw [hls, hls']
+
+/-- **Budget sufficiency of the handle scan**: under `SizeBoundDecreasing`,
+`collectHandlesFuel alg k v` succeeds for every budget `k` above
+`sizeBound v`. -/
+theorem collectHandlesFuel_some_of_sizeBoundDecreasing {Val : Type}
+    (alg : ValAlgebra Val) (hDec : SizeBoundDecreasing alg) :
+    ∀ (k : Nat) (v : Val), alg.sizeBound v < k →
+      Exists fun lids => collectHandlesFuel alg k v = some lids
+  | 0, _, h => absurd h (Nat.not_lt_zero _)
+  | k + 1, v, h => by
+    have hRec : ∀ c, alg.sizeBound c < alg.sizeBound v →
+        Exists fun ls => collectHandlesFuel alg k c = some ls := fun c hc =>
+      collectHandlesFuel_some_of_sizeBoundDecreasing alg hDec k c
+        (Nat.lt_of_lt_of_le hc (Nat.le_of_lt_succ h))
+    change Exists fun lids =>
+      collectHandlesStep alg (collectHandlesFuel alg k) v = some lids
+    unfold collectHandlesStep
+    cases alg.decodeRef v with
+    | some r => exact ⟨[r.1], rfl⟩
+    | none =>
+      exact foldr_handleParts_some (collectHandlesFuel alg k) (alg.branchParts v)
+        (collectFieldsFuel alg (collectHandlesFuel alg k) v (alg.sizeBound v))
+        (collectFieldsFuel_some alg (collectHandlesFuel alg k) v
+          (fun idx c hG => hRec c (hDec.1 idx v c hG)) (alg.sizeBound v))
+        (fun c hc => hRec c (hDec.2 v c hc))
+
+/-- **The handle scan never fails closed** under `SizeBoundDecreasing`. -/
+theorem collectHandles_total_of_sizeBoundDecreasing {Val : Type}
+    (alg : ValAlgebra Val) (hDec : SizeBoundDecreasing alg) (v : Val) :
+    Exists fun lids => collectHandles alg v = some lids :=
+  collectHandlesFuel_some_of_sizeBoundDecreasing alg hDec
+    (alg.sizeBound v + 1) v (Nat.lt_succ_self _)
+
+/-- `replaceableVal` is reflexive under `SizeBoundDecreasing`: writing a value
+back unchanged never introduces a handle. -/
+theorem replaceableVal_self_of_sizeBoundDecreasing {Val : Type}
+    (alg : ValAlgebra Val) (hDec : SizeBoundDecreasing alg)
+    (loans : List (LoanEntry Val)) (v : Val) :
+    replaceableVal alg loans v v = true :=
+  match collectHandles_total_of_sizeBoundDecreasing alg hDec v with
+  | ⟨lids, h⟩ => replaceableVal_self_of_collectHandles alg loans v lids h
+
+/-- Fields of a `LensTestVal` aggregate are strict subtrees. -/
+theorem lensTest_getField_sizeBound_lt (f : FieldIdx) (v c : LensTestVal)
+    (hGet : lensTestValAlg.getField f v = some c) :
+    lensTestValAlg.sizeBound c < lensTestValAlg.sizeBound v := by
+  cases v with
+  | mk fv tv =>
+    cases f with
+    | zero =>
+      cases tv with
+      | branch fl fr l r =>
+        injection hGet with hc
+        subst hc
+        exact Nat.lt_succ_of_le (Nat.le_add_right fl fr)
+      | atom _ => exact nomatch hGet
+      | choice _ _ _ _ _ _ => exact nomatch hGet
+      | ref _ _ => exact nomatch hGet
+    | succ f' =>
+      cases f' with
+      | zero =>
+        cases tv with
+        | branch fl fr l r =>
+          injection hGet with hc
+          subst hc
+          exact Nat.lt_succ_of_le (Nat.le_add_left fr fl)
+        | atom _ => exact nomatch hGet
+        | choice _ _ _ _ _ _ => exact nomatch hGet
+        | ref _ _ => exact nomatch hGet
+      | succ _ => exact nomatch hGet
+
+/-- Arms of a `LensTestVal` choice are strict subtrees. -/
+theorem lensTest_branchParts_sizeBound_lt (v c : LensTestVal)
+    (hMem : List.Mem c (lensTestValAlg.branchParts v)) :
+    lensTestValAlg.sizeBound c < lensTestValAlg.sizeBound v := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | choice fc ft ff cnd vt vf =>
+      cases hMem with
+      | head =>
+        exact Nat.lt_succ_of_le
+          (Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff))
+      | tail _ hRest =>
+        cases hRest with
+        | head => exact Nat.lt_succ_of_le (Nat.le_add_left ff (fc + ft))
+        | tail _ hNil => exact nomatch hNil
+    | atom _ => exact nomatch hMem
+    | branch _ _ _ _ => exact nomatch hMem
+    | ref _ _ => exact nomatch hMem
+
+/-- `lensTestValAlg` satisfies `SizeBoundDecreasing`: fields and choice arms
+are strict subtrees, whose `fuel` is the exact node count. -/
+theorem lensTest_sizeBoundDecreasing : SizeBoundDecreasing lensTestValAlg :=
+  ⟨lensTest_getField_sizeBound_lt, lensTest_branchParts_sizeBound_lt⟩
 
 /-- `collectHandles` is total on all `LensTestVal` values. -/
 theorem lensTest_collectHandles_total (v : LensTestVal) :
-    Exists fun lids => collectHandles lensTestValAlg v = some lids := by
-  cases v with
-  | mk f t =>
-    exact lensTestTree_collectHandlesFuel t f (Nat.le_refl f)
+    Exists fun lids => collectHandles lensTestValAlg v = some lids :=
+  collectHandles_total_of_sizeBoundDecreasing lensTestValAlg
+    lensTest_sizeBoundDecreasing v
 
 /-- `replaceableVal` is reflexive on all `LensTestVal` values. -/
 theorem lensTest_replaceableVal_self (loans : List (LoanEntry LensTestVal))
     (v : LensTestVal) :
-    replaceableVal lensTestValAlg loans v v = true := by
-  cases lensTest_collectHandles_total v with
-  | intro lids h =>
-    exact replaceableVal_self_of_collectHandles lensTestValAlg loans v lids h
+    replaceableVal lensTestValAlg loans v v = true :=
+  replaceableVal_self_of_sizeBoundDecreasing lensTestValAlg
+    lensTest_sizeBoundDecreasing loans v
 
 /-- True iff some step of `target` is a `.choiceJoin` whose condition is
 symbolic (`alg.asBool cond = none`). -/
