@@ -29,7 +29,10 @@ Apply these rules to all work in this repository:
   in the appropriate comment syntax for the file type) using the file's
   creation year. Preserve the original creation year when modifying an existing
   file. Files whose syntax requires leading metadata or forbids comments (such
-  as JSON files or `SKILL.md` files with leading YAML frontmatter) are exempt.
+  as JSON files or `SKILL.md` files with leading YAML frontmatter), as well as
+  vendored upstream files under `vendor/lean-miri/` (which retain upstream's
+  Apache-2.0 and MIT licenses in `vendor/lean-miri/LICENSE-*` and are pinned by
+  SHA-256 digest in `vendor/lean-miri/UPSTREAM_PIN.json`), are exempt.
 <!-- TODO-check-disable -->
 - **`TODO` markers:** Do not leave `TODO` markers in code, documentation, or
   commit messages unless you intend to block merging;
@@ -147,13 +150,22 @@ placing or modifying code, check whether it belongs inside `trusted/` or
 outside it (`theory/`):
 
 - Only primitive semantic and theorem definitions required to state or gate
-  `Trusted.CrateTheorem` and `VerificationResult` (`trusted/lean/`) and
+  `Trusted.CrateTheorem` and `VerificationResult` (`trusted/lean/`), the
+  reference-correspondence specification (`trusted/correspondence/`), and
   effectful components—the `.olean` kernel-environment inspector
   (`trusted/audit/`), the CLI orchestrator and boundary audit runner
   (`trusted/cargo-anneal/`), and the `rustc` MIR/attribute serializer and pure
   proof-script generator (`trusted/rustc-capture/`)—belong in `trusted/`.
-- All code outside `trusted/` (`theory/`) must be pure, effect-free Lean
-  definitions and proofs checked by the Lean kernel.
+- All first-party code outside `trusted/` (`theory/` and `correspondence/`) must
+  be pure, effect-free Lean definitions and proofs checked by the Lean kernel.
+- `vendor/lean-miri/` holds the pinned upstream `lean-miri` reference model
+  used only by Anneal's repository CI correspondence audit (never packaged into
+  the user toolchain archive or imported by `trusted/lean/` or `theory/`).
+  `trusted/audit/` verifies every file in `vendor/lean-miri/` against its
+  locked SHA-256 digest in `vendor/lean-miri/UPSTREAM_PIN.json`, compiles only
+  the 160-module `Miri.Interpreter.ExecutionMachine` slice (excluding
+  `Miri.Input.NativeMathHost`), and rejects any reachable `partial` or `unsafe`
+  constant in the correspondence dependency cone.
 
 When reviewing code or auditing changes before committing, run a dedicated
 [`trust-review`](skills/trust-review/SKILL.md) pass both to verify that code

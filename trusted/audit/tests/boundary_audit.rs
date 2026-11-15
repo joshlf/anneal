@@ -1049,3 +1049,323 @@ fn enforces_module_level_trust_tiers_and_namespace_hygiene() {
         "unexpected error: {err_opaque}"
     );
 }
+
+/// Verifies that `verify_upstream_pin` and `Checker::run()` enforce
+/// `vendor/lean-miri/UPSTREAM_PIN.json` and reject whole-directory deletion,
+/// missing manifests, modified or unlisted `.lean` files, symlinks,
+/// unauthorized `patched_files`, and invalid `execution_machine_closure`
+/// entries with policy exit code `1`.
+#[test]
+fn verifies_upstream_pin_and_rejects_tampering() {
+    let checkout = repo_root();
+    let pin = anneal_audit::verify_upstream_pin(&checkout.join("vendor/lean-miri")).unwrap();
+    assert_eq!(pin.schema_version, 2);
+    assert_eq!(pin.vendor_tree.file_count, 608);
+    assert!(pin.patched_files.is_empty());
+    assert_eq!(pin.execution_machine_closure.len(), 160);
+
+    // 1. Deleting `vendor/` in a repository checkout fails `Checker::run()`
+    // with policy exit code `1` (`miri-pin`).
+    let mut fix_missing_dir = TempFixture::new(None);
+    fs::copy(
+        checkout.join("Cargo.toml"),
+        fix_missing_dir.root.join("Cargo.toml"),
+    )
+    .unwrap();
+    fs::copy(
+        checkout.join("Cargo.lock"),
+        fix_missing_dir.root.join("Cargo.lock"),
+    )
+    .unwrap();
+    fs::copy(
+        checkout.join("flake.nix"),
+        fix_missing_dir.root.join("flake.nix"),
+    )
+    .unwrap();
+    fs::copy(
+        checkout.join("flake.lock"),
+        fix_missing_dir.root.join("flake.lock"),
+    )
+    .unwrap();
+    fs::copy(
+        checkout.join("trusted/root-manifest.sha256"),
+        fix_missing_dir.root.join("trusted/root-manifest.sha256"),
+    )
+    .unwrap();
+    fs::copy(
+        checkout.join("trusted/audit/Cargo.toml"),
+        fix_missing_dir.root.join("trusted/audit/Cargo.toml"),
+    )
+    .unwrap();
+    copy_dir_all(
+        &checkout.join("trusted/rustc-capture"),
+        &fix_missing_dir.root.join("trusted/rustc-capture"),
+    )
+    .unwrap();
+    copy_dir_all(
+        &checkout.join("trusted/cargo-anneal"),
+        &fix_missing_dir.root.join("trusted/cargo-anneal"),
+    )
+    .unwrap();
+    let err_no_vendor = fix_missing_dir
+        .check_expected(Some(1), Some("miri-pin"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_no_vendor
+            .message
+            .contains("expected regular vendor directory"),
+        "unexpected error: {err_no_vendor}"
+    );
+
+    // Prepare a mutable copy of `vendor/lean-miri` for tampering tests.
+    let tmp = tempfile::tempdir().unwrap();
+    let vendor_copy = tmp.path().join("vendor/lean-miri");
+    copy_dir_all(&checkout.join("vendor/lean-miri"), &vendor_copy).unwrap();
+    anneal_audit::verify_upstream_pin(&vendor_copy).unwrap();
+
+    // 2. Modified `.lean` file digest mismatch is rejected.
+    let target_lean = vendor_copy.join("Miri.lean");
+    let orig_lean = fs::read(&target_lean).unwrap();
+    fs::write(&target_lean, b"-- tampered\n").unwrap();
+    let err_tamper = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_tamper.code, 1);
+    assert!(
+        err_tamper
+            .message
+            .contains("vendor file SHA-256 mismatch for Miri.lean"),
+        "unexpected error: {err_tamper}"
+    );
+    fs::write(&target_lean, &orig_lean).unwrap();
+
+    // 3. Unlisted `.lean` file is rejected.
+    let rogue_lean = vendor_copy.join("Miri/Rogue.lean");
+    fs::write(&rogue_lean, b"def x := 1\n").unwrap();
+    let err_unlisted = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_unlisted.code, 1);
+    assert!(
+        err_unlisted
+            .message
+            .contains("unlisted Lean file in vendor/lean-miri: Miri/Rogue.lean"),
+        "unexpected error: {err_unlisted}"
+    );
+    fs::remove_file(&rogue_lean).unwrap();
+
+    // 4. Symlink inside `vendor/lean-miri` is rejected.
+    #[cfg(unix)]
+    {
+        let link_path = vendor_copy.join("Miri/Symlink.lean");
+        std::os::unix::fs::symlink(&target_lean, &link_path).unwrap();
+        let err_symlink = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+        assert_eq!(err_symlink.code, 1);
+        assert!(
+            err_symlink
+                .message
+                .contains("symlink forbidden in vendor/lean-miri"),
+            "unexpected error: {err_symlink}"
+        );
+        fs::remove_file(&link_path).unwrap();
+    }
+
+    // 5. Unauthorized `patched_files` entry in `UPSTREAM_PIN.json` is rejected.
+    let pin_path = vendor_copy.join("UPSTREAM_PIN.json");
+    let orig_pin_bytes = fs::read(&pin_path).unwrap();
+    let mut pin_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+    pin_json["patched_files"] = json!([{
+        "path": "Miri.lean",
+        "upstream_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "patched_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "rationale": "unauthorized patch"
+    }]);
+    fs::write(&pin_path, serde_json::to_vec(&pin_json).unwrap()).unwrap();
+    let err_unauth_patch = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_unauth_patch.code, 1);
+    assert!(
+        err_unauth_patch
+            .message
+            .contains("unauthorized patched file in UPSTREAM_PIN.json: Miri.lean"),
+        "unexpected error: {err_unauth_patch}"
+    );
+
+    // 6. Forbidden `Miri.Input.NativeMathHost` or empty
+    // `execution_machine_closure` is rejected.
+    let mut pin_closure_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+    pin_closure_json["execution_machine_closure"] = json!([{
+        "module": "Miri.Input.NativeMathHost",
+        "path": "Miri/Input/NativeMathHost.lean",
+        "olean_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }]);
+    fs::write(&pin_path, serde_json::to_vec(&pin_closure_json).unwrap()).unwrap();
+    let err_bad_closure = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_bad_closure.code, 1);
+    assert!(
+        err_bad_closure
+            .message
+            .contains("invalid execution_machine_closure entry for Miri.Input.NativeMathHost"),
+        "unexpected error: {err_bad_closure}"
+    );
+
+    pin_closure_json["execution_machine_closure"] = json!([]);
+    fs::write(&pin_path, serde_json::to_vec(&pin_closure_json).unwrap()).unwrap();
+    let err_empty_closure = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_empty_closure.code, 1);
+    assert!(
+        err_empty_closure
+            .message
+            .contains("expected 160 execution_machine_closure entries in UPSTREAM_PIN.json, got 0"),
+        "unexpected error: {err_empty_closure}"
+    );
+
+    // 7. Modifying `UPSTREAM_PIN.json` without updating
+    // `LOCKED_UPSTREAM_PIN_SHA256` is rejected.
+    let mut pin_notes_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+    pin_notes_json["notes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("extra note"));
+    fs::write(&pin_path, serde_json::to_vec(&pin_notes_json).unwrap()).unwrap();
+    let err_pin_sha = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_pin_sha.code, 1);
+    assert!(
+        err_pin_sha
+            .message
+            .contains("UPSTREAM_PIN.json SHA-256 differs from locked digest"),
+        "unexpected error: {err_pin_sha}"
+    );
+
+    // 8. Missing `UPSTREAM_PIN.json` is rejected with policy exit code `1`.
+    fs::remove_file(&pin_path).unwrap();
+    let err_missing_pin = anneal_audit::verify_upstream_pin(&vendor_copy).unwrap_err();
+    assert_eq!(err_missing_pin.code, 1);
+    assert!(
+        err_missing_pin
+            .message
+            .contains("missing UPSTREAM_PIN.json"),
+        "unexpected error: {err_missing_pin}"
+    );
+}
+
+/// Verifies that `"correspondence-audit"` rejects a `.vendorMiri` module that
+/// declares a constant in the reserved `Trusted` or `Anneal` root namespace
+/// (including a `private` declaration) or declares an `axiom`, while a benign
+/// vendor constant passes those checks and fails only later when the
+/// `Miri.Interpreter.ExecutionMachine` cone is missing.
+#[test]
+fn rejects_vendor_constants_in_reserved_namespaces() {
+    let fix = TempFixture::new(None);
+    let mut checker = Checker::new(&fix.root, None).unwrap();
+    checker.run().unwrap();
+    let trusted_lib = checker.stage.join("lib");
+    let vendor_src = checker.stage.join("src/fake-miri");
+    let vendor_lib = checker.stage.join("fake-miri-lib");
+    let cases: [(&str, &str, Option<&str>); 8] = [
+        (
+            "Miri.SpoofTrusted",
+            "namespace Trusted\ndef Spoof : Nat := 0\nend Trusted\n",
+            Some(
+                "external module Miri.SpoofTrusted cannot declare constant \
+                 Trusted.Spoof in reserved Trusted namespace",
+            ),
+        ),
+        (
+            "Miri.SpoofAnneal",
+            "namespace Anneal\ndef Spoof : Nat := 0\nend Anneal\n",
+            Some(
+                "external module Miri.SpoofAnneal cannot declare constant \
+                 Anneal.Spoof in reserved Anneal namespace",
+            ),
+        ),
+        (
+            "Miri.SpoofPrivate",
+            "namespace Trusted\nprivate def hidden : Nat := 0\nend Trusted\n",
+            Some("in reserved Trusted namespace"),
+        ),
+        (
+            "Miri.SpoofAxiom",
+            "namespace Miri.SpoofAxiom\naxiom spoofAx : False\nend Miri.SpoofAxiom\n",
+            Some("vendor Miri module Miri.SpoofAxiom cannot declare axiom Miri.SpoofAxiom.spoofAx"),
+        ),
+        (
+            "Miri.Interpreter.ExecutionMachine",
+            "namespace Miri.Interpreter.ExecutionMachine\nunsafe def step : Nat := 0\nend Miri.Interpreter.ExecutionMachine\n",
+            Some(
+                "unsafe/partial constant Miri.Interpreter.ExecutionMachine.step \
+                 from Miri.Interpreter.ExecutionMachine in correspondence dependency cone",
+            ),
+        ),
+        (
+            "Miri.Interpreter.ExecutionMachine",
+            "namespace Miri.Interpreter.ExecutionMachine\npartial def step (n : Nat) : Nat := step n\nend Miri.Interpreter.ExecutionMachine\n",
+            Some(
+                "opaque/partial vendor Miri constant Miri.Interpreter.ExecutionMachine.step \
+                 from Miri.Interpreter.ExecutionMachine in correspondence dependency cone",
+            ),
+        ),
+        (
+            "Miri.Interpreter.ExecutionMachine",
+            "namespace Miri.Interpreter.ExecutionMachine\nopaque step : Nat := 0\nend Miri.Interpreter.ExecutionMachine\n",
+            Some(
+                "opaque/partial vendor Miri constant Miri.Interpreter.ExecutionMachine.step \
+                 from Miri.Interpreter.ExecutionMachine in correspondence dependency cone",
+            ),
+        ),
+        (
+            "Miri.Benign",
+            "namespace Miri.Benign\ndef ok : Nat := 0\nend Miri.Benign\n",
+            None,
+        ),
+    ];
+    for (module, body, expected) in cases {
+        let rel = module.replace('.', "/");
+        let src = vendor_src.join(format!("{rel}.lean"));
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, format!("prelude\nimport Init.Core\n{body}")).unwrap();
+        let out = vendor_lib.join(format!("{rel}.olean"));
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        checker
+            .process(
+                &format!("compile-{module}"),
+                &[
+                    "-j1".to_string(),
+                    "-M2048".to_string(),
+                    "-t0".to_string(),
+                    "-R".to_string(),
+                    vendor_src.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    out.to_string_lossy().into_owned(),
+                    src.to_string_lossy().into_owned(),
+                ],
+            )
+            .unwrap();
+        let err = checker
+            .inspect(InspectorRequest::CorrespondenceAudit {
+                search_path: vec![trusted_lib.clone(), vendor_lib.clone()],
+                trusted: vec!["Trusted".to_string()],
+                corr_trusted: Vec::new(),
+                theory: Vec::new(),
+                corr_theory: Vec::new(),
+                vendor_miri: vec![module.to_string()],
+                module_tiers: BTreeMap::from([("Trusted".to_string(), TrustTier::Vetted)]),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, 1, "unexpected error code for {module}: {err}");
+        assert_eq!(err.phase, "correspondence-audit", "unexpected phase: {err}");
+        match expected {
+            Some(message) => assert!(
+                err.message.contains(message),
+                "unexpected error for {module}: {err}"
+            ),
+            None => {
+                assert!(
+                    !err.message.contains("reserved"),
+                    "benign vendor module {module} was rejected: {err}"
+                );
+                assert!(
+                    err.message.contains(
+                        "unknown declaration origin: Miri.Interpreter.ExecutionMachine.step"
+                    ),
+                    "unexpected error for {module}: {err}"
+                );
+            }
+        }
+    }
+}

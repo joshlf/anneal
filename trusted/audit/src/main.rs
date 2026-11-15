@@ -38,6 +38,11 @@ struct Cli {
     /// Emit the full JSON audit report instead of a human-readable summary.
     #[arg(long)]
     json: bool,
+
+    /// Optional directory for caching verified `Miri.*` `.olean` artifacts
+    /// across runs (overrides `ANNEAL_MIRI_CACHE_DIR`).
+    #[arg(long)]
+    miri_cache_dir: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -84,6 +89,9 @@ fn run(raw_args: Vec<OsString>) -> Result<u8, (u8, String)> {
             format!("Trusted check could not initialize staging directory: {e}"),
         )
     })?;
+    if let Some(cache_dir) = cli.miri_cache_dir {
+        checker.set_miri_cache_dir(Some(cache_dir));
+    }
 
     match checker.run() {
         Ok(report) => {

@@ -45,8 +45,9 @@ Anneal divides its repository into two zones with strictly separated roles:
 
 | Zone | Directory | Role | Trust status |
 | :--- | :--- | :--- | :--- |
-| **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and reference semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
-| **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics invoked by generated proof scripts. | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
+| **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and operational semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
+| **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics (`theory/`). | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
+| **Vendored reference model** | `vendor/lean-miri/` | Pinned snapshot of `proofs-rs/lean-miri` used by Anneal's MIR correspondence architecture ([`docs/mir-correspondence-design.md`](mir-correspondence-design.md)). Never shipped in the user toolchain archive. | **In the correspondence TCB.** Pinned byte-for-byte in `vendor/lean-miri/UPSTREAM_PIN.json` (locked by SHA-256 in `trusted/audit/`); only the 160-module `Miri.Interpreter.ExecutionMachine` slice (excluding `Miri.Input.NativeMathHost`) is compiled and verified by `.olean` SHA-256, and every constant in the vendored execution cone is checked to be pure. |
 
 ### How CI auditing and user-machine verification fit together
 
@@ -266,7 +267,7 @@ effective TCB cannot practically reside inside the `trusted/` subdirectory:
   standard prelude) live outside the repository altogether.
 
 To include these files in `trusted/`'s effective TCB without relocating them,
-`trusted/` stores their SHA-256 digests in two checked-in lock files:
+`trusted/` stores their SHA-256 digests in checked-in lock manifests:
 
 - **[`trusted/root-manifest.sha256`](../trusted/root-manifest.sha256):** Pins
   the SHA-256 digests of the repository's root build files (`Cargo.toml`,
@@ -276,6 +277,16 @@ To include these files in `trusted/`'s effective TCB without relocating them,
   (`trusted/lean/foundation-lock.json`): Pins the SHA-256 digests of the `lean`
   executable and all `Init.*` prelude source and `.olean` companion files,
   verified by both the Nix toolchain build (`flake.nix`) and `anneal-audit`.
+- **[`UPSTREAM_PIN.json`](../vendor/lean-miri/UPSTREAM_PIN.json)**
+  (`vendor/lean-miri/UPSTREAM_PIN.json`):
+  Pins the upstream commit and SHA-256 digest of every file in
+  `vendor/lean-miri/` (together with any consumer-side patch records and the
+  160-module `Miri.Interpreter.ExecutionMachine` slice), verified against
+  `LOCKED_UPSTREAM_PIN_SHA256` inside `trusted/audit/src/lib.rs`. The initial
+  vendor commit imports upstream `lean-miri` unmodified (`patched_files: []`)
+  so any subsequent consumer-side patches (such as opt-in runtime move
+  deinitialization via `deinitMovedPlace`) are reviewed as explicit diffs in
+  `patched_files` and `LOCKED_PATCHED_MIRI_FILES`.
 
 Because CI and `anneal-audit` reject any mismatch against these files, changing
 a root manifest or toolchain artifact requires a corresponding diff inside
