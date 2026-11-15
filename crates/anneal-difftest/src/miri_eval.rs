@@ -2903,6 +2903,7 @@ fn is_lean_diag_highlight_line(line: &str) -> bool {
         || lower.trim() == "out of memory"
         || lower.contains("out of memory:")
         || lower.contains(": out of memory")
+        || lower.contains("lean panic:")
         || lower.contains("lean assertion violation")
         || lower.contains("panic at ")
         || lower.contains("panicked at ")
@@ -3656,10 +3657,11 @@ fn proc_starttime(pid: u32) -> Option<u64> {
         .map(|(_, starttime)| starttime)
 }
 
-/// `root` and its live `ppid` descendants (`pid -> starttime`) from one
-/// `/proc/*/stat` snapshot; empty once `root` itself is gone.
+/// `root` and its live `ppid` descendants (`(pid, starttime)`) in breadth-first
+/// parent-before-child order from one `/proc/*/stat` snapshot; empty once
+/// `root` itself is gone.
 #[cfg(target_os = "linux")]
-fn process_tree_snapshot(root: u32) -> BTreeMap<u32, u64> {
+fn process_tree_snapshot(root: u32) -> Vec<(u32, u64)> {
     let mut children: BTreeMap<u32, Vec<(u32, u64)>> = BTreeMap::new();
     let mut root_starttime = None;
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -3679,20 +3681,22 @@ fn process_tree_snapshot(root: u32) -> BTreeMap<u32, u64> {
             children.entry(ppid).or_default().push((pid, starttime));
         }
     }
-    let mut tree = BTreeMap::new();
     let Some(root_starttime) = root_starttime else {
-        return tree;
+        return Vec::new();
     };
-    tree.insert(root, root_starttime);
-    let mut queue = vec![root];
-    while let Some(pid) = queue.pop() {
+    let mut seen = BTreeSet::from([root]);
+    let mut bfs = vec![(root, root_starttime)];
+    let mut i = 0;
+    while i < bfs.len() {
+        let (pid, _) = bfs[i];
+        i += 1;
         for &(kid, starttime) in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
-            if tree.insert(kid, starttime).is_none() {
-                queue.push(kid);
+            if seen.insert(kid) {
+                bfs.push((kid, starttime));
             }
         }
     }
-    tree
+    bfs
 }
 
 /// Every process of one budgeted run seen so far, keyed by pid with its
@@ -3708,7 +3712,11 @@ fn process_tree_snapshot(root: u32) -> BTreeMap<u32, u64> {
 /// unrelated process.
 struct TrackedProcessTree {
     root: u32,
-    seen: BTreeMap<u32, u64>,
+    /// `pid -> (starttime, discovery_seq)` so kills run newest-first by
+    /// `(starttime, discovery_seq)` rather than numerical PID (which wraps
+    /// past `pid_max`).
+    seen: BTreeMap<u32, (u64, u64)>,
+    next_seq: u64,
 }
 
 impl TrackedProcessTree {
@@ -3716,21 +3724,36 @@ impl TrackedProcessTree {
         Self {
             root,
             seen: BTreeMap::new(),
+            next_seq: 0,
         }
+    }
+
+    fn record_process(&mut self, pid: u32, starttime: u64) {
+        if let Some((prev_start, _)) = self.seen.get(&pid)
+            && *prev_start == starttime
+        {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.seen.insert(pid, (starttime, seq));
     }
 
     /// Drops tracked processes that exited (or whose pid now names another
     /// process) and returns the live tracked pids. With `rescan`, first adds the
-    /// current `ppid` tree of `root`; only valid while `root` is un-reaped
-    /// (after reaping, its pid may name an unrelated process).
+    /// current `ppid` tree of `root` in BFS parent-before-child order; only
+    /// valid while `root` is un-reaped (after reaping, its pid may name an
+    /// unrelated process).
     fn live_pids(&mut self, rescan: bool) -> Vec<u32> {
         #[cfg(target_os = "linux")]
         {
             if rescan {
-                self.seen.extend(process_tree_snapshot(self.root));
+                for (pid, starttime) in process_tree_snapshot(self.root) {
+                    self.record_process(pid, starttime);
+                }
             }
             self.seen
-                .retain(|&pid, &mut starttime| proc_starttime(pid) == Some(starttime));
+                .retain(|&pid, &mut (starttime, _)| proc_starttime(pid) == Some(starttime));
             self.seen.keys().copied().collect()
         }
         #[cfg(not(target_os = "linux"))]
@@ -3738,6 +3761,27 @@ impl TrackedProcessTree {
             let _ = rescan;
             Vec::new()
         }
+    }
+
+    fn tracked_descendant_order_snapshot(&self) -> Vec<u32> {
+        let root = self.root;
+        let mut entries: Vec<(u64, u64, u32)> = self
+            .seen
+            .iter()
+            .filter_map(|(&pid, &(starttime, seq))| {
+                (pid != root).then_some((starttime, seq, pid))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.cmp(a));
+        entries.into_iter().map(|(_, _, pid)| pid).collect()
+    }
+
+    /// Live non-root tracked pids ordered newest-first by `(starttime, discovery_seq)`
+    /// so leaf descendants (`lean`) always die before intermediate parents (`lake`),
+    /// even when Linux wraps PIDs past `pid_max`.
+    fn descendant_kill_order(&mut self, rescan: bool) -> Vec<u32> {
+        let _ = self.live_pids(rescan);
+        self.tracked_descendant_order_snapshot()
     }
 
     /// Total resident set (KiB, `VmRSS`) of the live tracked processes, or
@@ -3759,9 +3803,10 @@ impl TrackedProcessTree {
         total
     }
 
-    /// SIGKILLs every live tracked process other than `root` (newest pids
-    /// first, so `lean` dies before `lake` can react). Pass `rescan = false`
-    /// once `root` has been reaped.
+    /// SIGKILLs every live tracked process other than `root` (newest processes
+    /// first by `(starttime, discovery_seq)`, so `lean` dies before `lake` can
+    /// react even across PID wraparound). Pass `rescan = false` once `root` has
+    /// been reaped.
     fn kill_descendants(&mut self, rescan: bool) {
         #[cfg(target_os = "linux")]
         {
@@ -3769,16 +3814,14 @@ impl TrackedProcessTree {
                 fn kill(pid: i32, sig: i32) -> i32;
             }
             const SIGKILL: i32 = 9;
-            let root = self.root;
-            for pid in self.live_pids(rescan).into_iter().rev() {
-                if pid != root
-                    && let Ok(pid) = i32::try_from(pid)
+            for pid in self.descendant_kill_order(rescan) {
+                if let Ok(pid) = i32::try_from(pid)
                     && pid > 0
                 {
                     // SAFETY: `kill(2)` takes plain integers and has no
-                    // memory-safety preconditions; `live_pids` just re-verified
-                    // that `pid` still names the tracked process (same
-                    // `starttime`), and an already-exited pid fails with ESRCH.
+                    // memory-safety preconditions; `descendant_kill_order` just
+                    // re-verified that `pid` still names the tracked process
+                    // (same `starttime`), and an already-exited pid fails with ESRCH.
                     unsafe {
                         kill(pid, SIGKILL);
                     }
@@ -3991,13 +4034,24 @@ struct IsolatedMiriStage<X> {
 /// Execution kind passed to `run_chunk` in [`run_isolated_miri_stage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MiriStageRunKind {
-    /// Initial chunk run (`{stage_label}_{chunk_idx:03}`).
-    Chunk,
+    /// Initial chunk run (`{stage_label}_{chunk_idx:03}`) inside a wave of
+    /// `wave_jobs` concurrent workers.
+    Chunk { wave_jobs: usize },
     /// Single-candidate fallback run (`{stage_label}Fallback_<stem>`).
     Fallback,
     /// One-shot multi-candidate remainder retry after the circuit breaker trips
     /// (`{stage_label}Remainder_{chunk_idx:03}`).
     Remainder,
+}
+
+impl MiriStageRunKind {
+    /// Number of concurrent workers sharing cgroup headroom during this run.
+    fn active_workers(self) -> usize {
+        match self {
+            Self::Chunk { wave_jobs } => wave_jobs.max(1),
+            Self::Fallback | Self::Remainder => 1,
+        }
+    }
 }
 
 fn miri_probe_module_file_name(
@@ -4006,7 +4060,7 @@ fn miri_probe_module_file_name(
     chunk: &[(OracleItemSpec, String)],
 ) -> String {
     match run_kind {
-        MiriStageRunKind::Chunk => format!("MiriOracleProbe_{chunk_idx:03}.lean"),
+        MiriStageRunKind::Chunk { .. } => format!("MiriOracleProbe_{chunk_idx:03}.lean"),
         MiriStageRunKind::Remainder => format!("MiriOracleProbeRemainder_{chunk_idx:03}.lean"),
         MiriStageRunKind::Fallback => {
             let stem = chunk
@@ -4074,6 +4128,7 @@ where
 
     let chunks: Vec<&[C]> = items.chunks(chunk_size).collect();
     for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
+        let wave_jobs = wave.len().max(1);
         let wave_res: Vec<(usize, String, Result<BTreeMap<String, X>, String>)> =
             std::thread::scope(|s| {
                 let handles: Vec<_> = wave
@@ -4085,7 +4140,12 @@ where
                         let run_chunk = &run_chunk;
                         let worker_label = label.clone();
                         let handle = s.spawn(move || {
-                            run_chunk(chunk_idx, MiriStageRunKind::Chunk, &worker_label, chunk)
+                            run_chunk(
+                                chunk_idx,
+                                MiriStageRunKind::Chunk { wave_jobs },
+                                &worker_label,
+                                chunk,
+                            )
                         });
                         (chunk_idx, label, handle)
                     })
@@ -4334,8 +4394,12 @@ fn aggregate_miri_probe_stage(
     stage.errors
 }
 
-const LEAN_RESOURCE_MARKERS: [&str; 6] = [
+const LEAN_RESOURCE_MARKERS: [&str; 8] = [
     "out of memory",
+    // Lean 4's `-M` flag reports `(kernel) excessive memory consumption detected`
+    // or `excessive memory consumption detected at '...'` rather than `out of memory`.
+    "excessive memory consumption",
+    "memory allocation failed",
     "(deterministic) timeout",
     "maximum number of heartbeats",
     "maximum recursion depth",
@@ -4343,13 +4407,22 @@ const LEAN_RESOURCE_MARKERS: [&str; 6] = [
     "stack overflow",
 ];
 
-const LEAN_KERNEL_REJECTION_MARKERS: [&str; 8] = [
+const LEAN_KERNEL_REJECTION_MARKERS: [&str; 14] = [
+    // Lean v4.34.1 tactic `rfl` prints `Tactic `rfl` failed: The left-hand side ...
+    // is not definitionally equal to the right-hand side ...`; older Lean 4 printed
+    // `The rfl tactic failed`, and term-mode `rfl` prints `Not a definitional equality`.
+    "tactic `rfl` failed",
     "the rfl tactic failed",
+    "not definitionally equal",
+    "not a definitional equality",
     "type mismatch",
     "application type mismatch",
+    "declaration type mismatch",
+    "(kernel) constant",
     "unknown identifier",
     "unknown constant",
     "unknown module prefix",
+    "unknown namespace",
     "failed to synthesize",
     "unsolved goals",
 ];
@@ -4359,17 +4432,28 @@ fn is_lean_message_header(line: &str, kind: &str) -> bool {
     lower.trim_start().starts_with(&format!("{kind}:")) || lower.contains(&format!(": {kind}:"))
 }
 
-/// The `error:` message blocks of a Lake / Lean run: each block starts at an
-/// `error:` header line (`<file>:<line>:<col>: error: ...` or a bare `error:`)
-/// and runs until the next `error:` / `warning:` / `info:` header.
-fn lean_error_blocks(stdout: &str, stderr: &str) -> Vec<String> {
-    let mut blocks: Vec<String> = Vec::new();
+fn is_lean_runtime_crash_boundary(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('✖') {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("lean panic:")
+        || lower.starts_with("lean assertion violation")
+        || lower.starts_with("panic at ")
+        || lower.starts_with("panicked at ")
+        || lower.starts_with("thread '")
+        || lower.starts_with("fatal runtime error:")
+}
+
+fn collect_stream_lean_error_blocks(stream: &str, blocks: &mut Vec<String>) {
     let mut current: Option<String> = None;
-    for line in stdout.lines().chain(stderr.lines()) {
+    for line in stream.lines() {
         let starts_error = is_lean_message_header(line, "error");
         if starts_error
             || is_lean_message_header(line, "warning")
             || is_lean_message_header(line, "info")
+            || is_lean_runtime_crash_boundary(line)
         {
             blocks.extend(current.take());
             if starts_error {
@@ -4381,6 +4465,19 @@ fn lean_error_blocks(stdout: &str, stderr: &str) -> Vec<String> {
         }
     }
     blocks.extend(current);
+}
+
+/// The `error:` message blocks of a Lake / Lean run: each block starts at an
+/// `error:` header line (`<file>:<line>:<col>: error: ...` or a bare `error:`)
+/// and runs until the next `error:` / `warning:` / `info:` / runtime-crash
+/// header or the end of that stream (`stdout` and `stderr` are parsed
+/// separately so a headerless `stderr` runtime OOM line such as
+/// `LEAN PANIC: out of memory` never merges into a preceding `stdout` `error:`
+/// block).
+fn lean_error_blocks(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    collect_stream_lean_error_blocks(stdout, &mut blocks);
+    collect_stream_lean_error_blocks(stderr, &mut blocks);
     blocks
 }
 
@@ -4510,9 +4607,9 @@ fn resource_exhaustion_reason(module_name: &str, run: &LeanConfirmRun) -> String
 /// heartbeats ([`lean_output_has_unexplained_kernel_rejection`]).
 ///
 /// `write_module(file_name, entries)` renders a module and
-/// `run_module(file_name, is_serial)` checks it, where `is_serial` says no
-/// sibling confirm worker runs concurrently (a single-chunk wave or a
-/// per-entry fallback), so the run may use a single worker's RSS budget.
+/// `run_module(file_name, active_workers)` checks it, where `active_workers`
+/// is the exact number of concurrent confirm workers sharing cgroup headroom
+/// (`wave.len()` for a chunk wave, `1` for a per-entry fallback).
 fn run_chunked_miri_confirm_stage<W, R>(
     to_confirm: &[MiriConfirmEntry],
     chunk_size: usize,
@@ -4522,7 +4619,7 @@ fn run_chunked_miri_confirm_stage<W, R>(
 ) -> Result<ChunkedMiriConfirm, String>
 where
     W: Fn(&str, &[MiriConfirmEntry]) -> Result<(), String>,
-    R: Fn(&str, bool) -> Result<LeanConfirmRun, String> + Sync,
+    R: Fn(&str, usize) -> Result<LeanConfirmRun, String> + Sync,
 {
     let chunk_size = chunk_size.max(1);
     let jobs = jobs.max(1);
@@ -4538,16 +4635,16 @@ where
             write_module(&file_name, chunk)?;
             prepared.push((file_name, chunk));
         }
-        let wave_concurrency_gt_one = wave.len() > 1;
+        let wave_jobs = wave.len().max(1);
         let outputs: Vec<Result<LeanConfirmRun, String>> = std::thread::scope(|s| {
             let handles: Vec<_> = prepared
                 .iter()
                 .map(|(file_name, _)| {
                     let run_module = &run_module;
-                    // When a wave only has 1 chunk (`wave.len() == 1`), no sibling
-                    // confirm worker runs alongside it, so it gets the full
-                    // single-worker RSS budget (`is_serial = true`).
-                    s.spawn(move || run_module(file_name, !wave_concurrency_gt_one))
+                    // Pass the actual wave concurrency (`wave_jobs`, e.g. `1` for a
+                    // trailing chunk or `3` for a 3-chunk wave on a 4-worker machine)
+                    // so the RSS budget is never over-divided by idle worker slots.
+                    s.spawn(move || run_module(file_name, wave_jobs))
                 })
                 .collect();
             handles
@@ -4567,7 +4664,7 @@ where
                 continue;
             }
             let single_runs: Vec<(&MiriConfirmEntry, String, LeanConfirmRun)> =
-                if chunk.len() == 1 && !wave_concurrency_gt_one {
+                if chunk.len() == 1 && wave_jobs == 1 {
                     vec![(&chunk[0], file_name, out)]
                 } else {
                     let mut runs = Vec::with_capacity(chunk.len());
@@ -4577,7 +4674,7 @@ where
                             sanitize_lean_file_stem(&entry.0.name)
                         );
                         write_module(&fb_name, std::slice::from_ref(entry))?;
-                        let run = run_module(&fb_name, true)?;
+                        let run = run_module(&fb_name, 1)?;
                         runs.push((entry, fb_name, run));
                     }
                     runs
@@ -4845,19 +4942,15 @@ fn run_linked_difftest_oracle_pipeline(
                 .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
             clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe"]);
 
-            let wave_probe_rss_budget_kib =
-                resolve_miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, lean_jobs);
             let probe_errors = aggregate_miri_probe_stage(
                 &surviving_items,
                 MIRI_PROBE_CHUNK_SIZE,
                 lean_jobs,
                 |chunk_idx, run_kind, _label, chunk| {
-                    let probe_rss_budget_kib = match run_kind {
-                        MiriStageRunKind::Chunk => wave_probe_rss_budget_kib,
-                        MiriStageRunKind::Fallback | MiriStageRunKind::Remainder => {
-                            resolve_miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, 1)
-                        }
-                    };
+                    let probe_rss_budget_kib = resolve_miri_lean_rss_budget_kib(
+                        PROBE_LEAN_RSS_BUDGET_MIB,
+                        run_kind.active_workers(),
+                    );
                     let file_name = miri_probe_module_file_name(chunk_idx, run_kind, chunk);
                     let probe_path = oracle_dir.join(&file_name);
                     let rel_probe_path = format!("oracle/{file_name}");
@@ -5023,19 +5116,16 @@ fn run_linked_difftest_oracle_pipeline(
 
         let _lean_guard = acquire_live_lean_oracle_lock();
         let lean_jobs = resolve_miri_lean_jobs().max(1);
-        let wave_confirm_rss_budget_kib =
-            resolve_miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, lean_jobs);
         let stage = run_chunked_miri_confirm_stage(
             &to_confirm,
             MIRI_CONFIRM_CHUNK_SIZE,
             lean_jobs,
             |file_name, entries| write_confirm_module_at(&oracle_dir.join(file_name), entries),
-            |file_name, is_serial| {
-                let budget_kib = if is_serial {
-                    resolve_miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, 1)
-                } else {
-                    wave_confirm_rss_budget_kib
-                };
+            |file_name, active_workers| {
+                let budget_kib = resolve_miri_lean_rss_budget_kib(
+                    CONFIRM_LEAN_RSS_BUDGET_MIB,
+                    active_workers,
+                );
                 run_lean_confirm_file(
                     &lake_bin,
                     &dot_anneal,
@@ -10329,12 +10419,22 @@ pub fn cand_shadow() -> u32 {
         assert_eq!(
             recorded,
             vec![
-                (0, MiriStageRunKind::Chunk, 64),
-                (1, MiriStageRunKind::Chunk, 64),
-                (2, MiriStageRunKind::Chunk, 22),
+                (0, MiriStageRunKind::Chunk { wave_jobs: 2 }, 64),
+                (1, MiriStageRunKind::Chunk { wave_jobs: 2 }, 64),
+                (2, MiriStageRunKind::Chunk { wave_jobs: 1 }, 22),
             ],
-            "150 items must split into 64 + 64 + 22 chunks without fallback"
+            "150 items must split into 64 + 64 (2-worker wave) + 22 (1-worker trailing wave)"
         );
+        assert_eq!(
+            MiriStageRunKind::Chunk { wave_jobs: 2 }.active_workers(),
+            2
+        );
+        assert_eq!(
+            MiriStageRunKind::Chunk { wave_jobs: 1 }.active_workers(),
+            1
+        );
+        assert_eq!(MiriStageRunKind::Fallback.active_workers(), 1);
+        assert_eq!(MiriStageRunKind::Remainder.active_workers(), 1);
         assert_eq!(outcomes.len(), 150);
         assert_eq!(
             outcomes.get("cand_000"),
@@ -10537,7 +10637,8 @@ pub fn cand_shadow() -> u32 {
         let (stage, calls) = run_with_broken(&["c_01", "c_02", "c_03", "c_04", "c_05", "c_06"]);
         assert_eq!(calls.len(), 2 + 10, "calls: {calls:?}");
         assert!(calls.iter().all(|&(_, kind, len)| {
-            kind == MiriStageRunKind::Chunk || (kind == MiriStageRunKind::Fallback && len == 1)
+            matches!(kind, MiriStageRunKind::Chunk { wave_jobs: 1 })
+                || (kind == MiriStageRunKind::Fallback && len == 1)
         }));
         assert_eq!(stage.results.len(), 14);
         assert_eq!(
@@ -10558,8 +10659,8 @@ pub fn cand_shadow() -> u32 {
         assert_eq!(
             calls,
             vec![
-                (0, MiriStageRunKind::Chunk, 10),
-                (1, MiriStageRunKind::Chunk, 10),
+                (0, MiriStageRunKind::Chunk { wave_jobs: 1 }, 10),
+                (1, MiriStageRunKind::Chunk { wave_jobs: 1 }, 10),
                 (0, MiriStageRunKind::Fallback, 1),
                 (0, MiriStageRunKind::Fallback, 1),
                 (0, MiriStageRunKind::Fallback, 1),
@@ -10861,7 +10962,7 @@ pub fn cand_shadow() -> u32 {
             (0..40).map(|i| entry(&format!("div_{i:02}"))).collect();
         let written: std::sync::Mutex<BTreeMap<String, Vec<String>>> =
             std::sync::Mutex::new(BTreeMap::new());
-        let ran: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+        let ran: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
 
         let stage = run_chunked_miri_confirm_stage(
             &to_confirm,
@@ -10874,8 +10975,8 @@ pub fn cand_shadow() -> u32 {
                 );
                 Ok(())
             },
-            |file_name, is_serial| {
-                ran.lock().unwrap().push((file_name.to_string(), is_serial));
+            |file_name, active_workers| {
+                ran.lock().unwrap().push((file_name.to_string(), active_workers));
                 let names = written
                     .lock()
                     .unwrap()
@@ -10934,18 +11035,32 @@ pub fn cand_shadow() -> u32 {
         assert!(fallback_modules.iter().all(|names| names.len() == 1));
         let ran = ran.into_inner().unwrap();
         assert_eq!(ran.len(), 3 + 16 + 8);
-        // Wave 0 runs 2 chunks concurrently (`is_serial == false`); wave 1 has a
-        // single trailing chunk (`is_serial == true`); every per-entry fallback runs
-        // serially (`is_serial == true`) so it receives the full 1-worker RSS budget.
-        for (mod_name, is_serial) in &ran {
+        // Wave 0 runs 2 chunks concurrently (`active_workers == 2`); wave 1 has a
+        // single trailing chunk (`active_workers == 1`); every per-entry fallback runs
+        // serially (`active_workers == 1`) so it receives the full 1-worker RSS budget.
+        for (mod_name, active_workers) in &ran {
             if mod_name == "MiriOracleConfirm_000.lean"
                 || mod_name == "MiriOracleConfirm_001.lean"
             {
-                assert!(!is_serial, "{mod_name} ran in a 2-worker wave");
+                assert_eq!(*active_workers, 2, "{mod_name} ran in a 2-worker wave");
             } else {
-                assert!(*is_serial, "{mod_name} ran alone and must get serial RSS budget");
+                assert_eq!(*active_workers, 1, "{mod_name} ran alone and must get 1-worker RSS budget");
             }
         }
+        // A partial 3-chunk wave under `jobs = 4` passes `active_workers = 3` (never 4).
+        let partial_workers: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        run_chunked_miri_confirm_stage(
+            &to_confirm,
+            MIRI_CONFIRM_CHUNK_SIZE,
+            4,
+            |_f, _e| Ok(()),
+            |_f, active_workers| {
+                partial_workers.lock().unwrap().push(active_workers);
+                Ok(ok())
+            },
+        )
+        .expect("3-chunk wave on 4-job budget");
+        assert_eq!(partial_workers.into_inner().unwrap(), vec![3, 3, 3]);
         assert_eq!(
             stage.unconfirmed.keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["div_20"]
@@ -11092,7 +11207,7 @@ pub fn cand_shadow() -> u32 {
             ),
         ];
         assert_eq!(
-            miri_probe_module_file_name(0, MiriStageRunKind::Chunk, &sample_chunk),
+            miri_probe_module_file_name(0, MiriStageRunKind::Chunk { wave_jobs: 1 }, &sample_chunk),
             "MiriOracleProbe_000.lean"
         );
         assert_eq!(
@@ -11342,7 +11457,10 @@ pub fn cand_shadow() -> u32 {
         };
         // Wait for the subshell to exit, reparenting `orphan` away from `parent`.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while process_tree_snapshot(parent.id()).contains_key(&orphan) {
+        while process_tree_snapshot(parent.id())
+            .iter()
+            .any(|&(pid, _)| pid == orphan)
+        {
             assert!(Instant::now() < deadline, "subshell never exited");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -11354,6 +11472,22 @@ pub fn cand_shadow() -> u32 {
         let _ = parent.wait();
         wait_dead(orphan, "reparented descendant");
         let _ = fs::remove_file(&pid_file);
+
+        // 4b. PID-wraparound kill order: when Linux wraps PIDs past `pid_max`, a
+        //     newer grandchild (`lean`, pid 1420) has a numerically smaller PID
+        //     than an older intermediate parent (`lake`, pid 4_194_300), even
+        //     within the same 10ms `starttime` tick. Ordering by `(starttime, seq)`
+        //     still kills the leaf child before its parent.
+        let mut wrapped = TrackedProcessTree::new(4_194_299);
+        wrapped.record_process(4_194_299, 50_000);
+        wrapped.record_process(4_194_300, 50_000); // intermediate parent
+        wrapped.record_process(1_420, 50_000); // wrapped leaf child in same tick
+        wrapped.record_process(900, 50_001); // even newer grandchild in next tick
+        assert_eq!(
+            wrapped.tracked_descendant_order_snapshot(),
+            vec![900, 1_420, 4_194_300],
+            "leaf descendants must die before older parents even across PID wraparound"
+        );
 
         // 5. A clean exit observed after an over-budget sample stays a success.
         use std::os::unix::process::ExitStatusExt;
@@ -11373,17 +11507,63 @@ pub fn cand_shadow() -> u32 {
     #[test]
     fn unexplained_kernel_rejections_fail_stage2_closed_even_when_killed_or_exhausted() {
         let killed_note = rss_budget_kill_note(4 * 1024 * 1024, 4200 * 1024);
-        // Block-level classification.
+        // Exact Lean v4.34.1 `:= by rfl` rejection (`Tactic \`rfl\` failed: ...`).
+        let lean_v434_tactic_rfl_rejection = "oracle/MiriOracleConfirm_000.lean:12:2: error: \
+             Tactic `rfl` failed: The left-hand side\n  1\nis not definitionally equal to the \
+             right-hand side\n  2\n\n⊢ 1 = 2\n";
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            lean_v434_tactic_rfl_rejection,
+            &killed_note
+        ));
+        // Exact Lean v4.34.1 term-mode `rfl` rejection (`Not a definitional equality`)
+        // and legacy Lean 4 `The rfl tactic failed` wording.
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            "oracle/MiriOracleConfirm_000.lean:12:0: error: Not a definitional equality: \
+             the left-hand side\n  1\nis not definitionally equal to the right-hand side\n  2\n",
+            &killed_note
+        ));
         assert!(lean_output_has_unexplained_kernel_rejection(
             "oracle/MiriOracleConfirm_000.lean:12:2: error: The rfl tactic failed. Possible \
              reasons:\n  the left-hand side and right-hand side are not definitionally equal\n",
             &killed_note
         ));
-        // A typeclass search that ran out of heartbeats reports `failed to synthesize`
-        // and the timeout in one block: exhaustion, not rejection.
+        // Cross-stream isolation: a headerless C++ runtime OOM line on `stderr`
+        // (`LEAN PANIC: out of memory`) or a runtime crash line after an `error:`
+        // block must NEVER merge into the preceding `stdout` `rfl` error block and
+        // mask a kernel rejection.
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            lean_v434_tactic_rfl_rejection,
+            "LEAN PANIC: out of memory\n"
+        ));
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            &format!("{lean_v434_tactic_rfl_rejection}LEAN PANIC: out of memory\n"),
+            ""
+        ));
+        // Exact Lean v4.34.1 `-M` cap error (`(kernel) excessive memory consumption detected`
+        // and elaborator `excessive memory consumption detected at ...`) is classified as
+        // resource exhaustion (`exit 1`, `signal_terminated = false`), never as a rejection.
+        let lean_v434_minus_m_err =
+            "oracle/MiriOracleConfirmFallback_y.lean:1:4: error: (kernel) excessive memory \
+             consumption detected\n";
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            lean_v434_minus_m_err,
+            ""
+        ));
+        assert!(lean_confirm_failure_is_resource_exhaustion(
+            false,
+            lean_v434_minus_m_err
+        ));
+        // A typeclass search that ran out of heartbeats or `-M` memory reports
+        // `failed to synthesize` together with the resource diagnostic in one block:
+        // exhaustion, not rejection.
         assert!(!lean_output_has_unexplained_kernel_rejection(
             "x.lean:3:0: error: failed to synthesize\n  Decidable p\n(deterministic) timeout at \
              `typeclass`, maximum number of heartbeats (20000) has been reached\n",
+            ""
+        ));
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            "x.lean:3:0: error: failed to synthesize\n  Decidable p\nexcessive memory \
+             consumption detected at `typeclass`\n",
             ""
         ));
         // The watchdog's own note and pure resource errors are not rejections, nor is a
@@ -11404,8 +11584,9 @@ pub fn cand_shadow() -> u32 {
             ""
         ));
 
-        // Stage level: a budget-killed (or OOM-killed) run that already printed a kernel
-        // rejection fails closed; a killed run without one is downgraded with its reason.
+        // Stage level: a budget-killed (or OOM-killed) run that already printed a Lean v4.34.1
+        // `Tactic \`rfl\` failed` rejection fails closed; a killed run or a `-M` exit(1) run
+        // without an unexplained rejection is downgraded with its reason.
         let entry = |name: &str| -> MiriConfirmEntry {
             (
                 OracleItemSpec::with_fuel(name.to_string(), 100),
@@ -11428,32 +11609,48 @@ pub fn cand_shadow() -> u32 {
             MIRI_CONFIRM_CHUNK_SIZE,
             1,
             |_file_name, _entries| Ok(()),
-            |_file_name, _is_serial| {
-                Ok(killed_run(
-                    "oracle/MiriOracleConfirm_000.lean:12:2: error: The rfl tactic failed\n",
-                ))
-            },
+            |_file_name, _active_workers| Ok(killed_run(lean_v434_tactic_rfl_rejection)),
         )
-        .expect_err("a printed kernel rejection must fail closed despite the kill");
+        .expect_err("a printed Lean v4.34.1 `Tactic rfl failed` rejection must fail closed despite the kill");
         assert!(
             rejected.contains("Lean kernel confirmation rejected `div_a`")
-                && rejected.contains("The rfl tactic failed"),
+                && rejected.contains("Tactic `rfl` failed"),
             "{rejected}"
         );
         let downgraded = run_chunked_miri_confirm_stage(
-            &[entry("div_b")],
-            MIRI_CONFIRM_CHUNK_SIZE,
+            &[entry("div_b"), entry("div_c")],
+            1,
             1,
             |_file_name, _entries| Ok(()),
-            |_file_name, _is_serial| Ok(killed_run("")),
+            |file_name, _active_workers| {
+                if file_name.contains("000") {
+                    Ok(killed_run(""))
+                } else {
+                    Ok(LeanConfirmRun {
+                        success: false,
+                        signal_terminated: false,
+                        status: "exit status: 1".to_string(),
+                        stdout: lean_v434_minus_m_err.to_string(),
+                        stderr: String::new(),
+                    })
+                }
+            },
         )
-        .expect("a kill without a rejection is resource exhaustion");
+        .expect("RSS watchdog kill and `-M` excessive memory consumption without rejection both downgrade");
         assert!(downgraded.confirmed.is_empty());
         assert!(
             downgraded
                 .unconfirmed
                 .get("div_b")
                 .is_some_and(|reason| reason.contains("out of memory guard")),
+            "{:?}",
+            downgraded.unconfirmed
+        );
+        assert!(
+            downgraded
+                .unconfirmed
+                .get("div_c")
+                .is_some_and(|reason| reason.contains("excessive memory consumption")),
             "{:?}",
             downgraded.unconfirmed
         );

@@ -549,7 +549,7 @@ def is_int_map(val: Any, expected_keys: tuple[str, ...] | None = None) -> bool:
 # Lake `✖` markers, Lake / Lean `error:` lines, and rustc `error[E0308]:` lines
 # (the harness runs under `cargo run`, whose compile errors carry no `error:`).
 _HARNESS_ERROR_LINE_RE = re.compile(
-    r"✖|error(?:\[[A-Za-z0-9_-]+\])?:|\bout of memory\b|lean assertion violation|\bpanic(?:ked)? at\b",
+    r"✖|error(?:\[[A-Za-z0-9_-]+\])?:|\bout of memory\b|\blean panic:|lean assertion violation|\bpanic(?:ked)? at\b",
     re.IGNORECASE,
 )
 

@@ -9135,6 +9135,7 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
                 "let v = my_error[end];",
                 "error[internal]: unexpected compiler failure",
                 "out of memory",
+                "LEAN PANIC: stack overflow",
                 "PANIC at Lean.Kernel.whnf",
                 "thread 'main' panicked at src/main.rs:10:5: boom",
             ]
@@ -9145,6 +9146,7 @@ class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
             [
                 "error[internal]: unexpected compiler failure",
                 "out of memory",
+                "LEAN PANIC: stack overflow",
                 "PANIC at Lean.Kernel.whnf",
                 "thread 'main' panicked at src/main.rs:10:5: boom",
             ],
