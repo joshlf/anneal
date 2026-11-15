@@ -79,7 +79,9 @@ executions in $M_{\text{anneal}}$ distinguish at least two failure outcomes:
 - **`undefined`:** The program executed a construct that $M_{\text{anneal}}$
   models and violated Rust's operational rules (exhibiting undefined behavior).
 - **`unsupported`:** The program reached a construct, type, operation, or
-  execution mode that $M_{\text{anneal}}$ does not model.
+  execution mode that $M_{\text{anneal}}$ does not model, or an execution that
+  $M_{\text{anneal}}$ conservatively rejects because it enforces a simpler rule
+  than full Rust.
 
 For verification soundness, both `undefined` and `unsupported` act as failure
 outcomes: a program verified by Anneal is not permitted to reach either outcome.
@@ -90,18 +92,65 @@ engineering diagnostics:
   modeled semantics.
 - Reporting `unsupported` tells the user (and Anneal developers) that the
   program may be valid Rust, but uses a feature that $M_{\text{anneal}}$ does
-  not yet implement.
+  not yet implement or falls outside a simplified rule that
+  $M_{\text{anneal}}$ enforces.
 
 ### Step 3: Lock the correspondence theorem in CI and grow $M_{\text{anneal}}$
 
 Third, we state and prove a single correspondence theorem in CI before
 implementing the bulk of MIR:
 
-> **Correspondence Theorem (Informal):** For every program $p$ (and initial
-> input state), if $p$ is well-formed according to $M_{\text{anneal}}$ (meaning
-> its execution never reaches `undefined` or `unsupported`), then $p$ is also
-> well-formed according to $M_{\text{ref}}$ and has the exact same observable
-> behavior in $M_{\text{ref}}$ as in $M_{\text{anneal}}$.
+> **Correspondence Theorem (Informal):** For every program $p$ and every input
+> query $q$, if $p$ is well-formed on $q$ according to $M_{\text{anneal}}$
+> (meaning that no execution of $p$ from $q$ reaches `undefined` or
+> `unsupported`), then $p$ is also well-formed on $q$ according to
+> $M_{\text{ref}}$, and every observable behavior that $M_{\text{ref}}$ permits
+> for $p$ on $q$ is also a behavior of $p$ on $q$ in $M_{\text{anneal}}$.
+
+Two features of this statement carry its soundness.
+
+First, both models execute the same input. The theorem quantifies universally
+over input queries $q$ (function arguments and initial caller-visible memory)
+in a representation that both models share, and each model constructs its
+initial state directly from $q$ (in Anneal's design, `initState` for
+$M_{\text{anneal}}$ and `initRefState` for $M_{\text{ref}}$). If the models
+represented inputs differently, the theorem would instead have to quantify over
+a total, structure-preserving relation between the two input representations.
+A conversion function or an unverified precondition on $q$ could otherwise
+filter out or sanitize exactly the inputs that trigger UB, leaving every
+remaining reference execution trivially safe.
+
+Second, behavioral inclusion runs from $M_{\text{ref}}$ into
+$M_{\text{anneal}}$. Writing $\mathsf{Behavior}(p, q)$ for the set of
+observable behaviors (including divergence) that a model permits for $p$ on
+$q$, sound specification transfer requires behavioral refinement:
+
+$$
+\mathsf{Behavior}_{\text{ref}}(p, q) \subseteq
+\mathsf{Behavior}_{\text{anneal}}(p, q)
+$$
+
+This is the backward-simulation direction of the `Abstracts` relation that
+Anneal's verified lowering uses ([`docs/architecture.md`](architecture.md)),
+with $M_{\text{ref}}$ in the role of the concrete semantics and
+$M_{\text{anneal}}$ in the role of its abstraction. A specification proved for
+every behavior of $M_{\text{anneal}}$ then holds for every behavior that
+$M_{\text{ref}}$ permits, while $M_{\text{anneal}}$ remains free to
+over-approximate (for example, by admitting several outcomes for a
+nondeterministic choice). When $M_{\text{anneal}}$ is deterministic and does
+not over-approximate any outcome, the theorem can state the stronger
+bidirectional equivalence, under which each model permits a behavior if and
+only if the other does:
+
+$$
+\mathsf{Behavior}_{\text{anneal}}(p, q) = \mathsf{Behavior}_{\text{ref}}(p, q)
+$$
+
+The opposite inclusion alone,
+$\mathsf{Behavior}_{\text{anneal}}(p, q) \subseteq
+\mathsf{Behavior}_{\text{ref}}(p, q)$, would be unsound: if $M_{\text{ref}}$
+admitted an extra nondeterministic outcome, a postcondition proved over every
+behavior of $M_{\text{anneal}}$ would say nothing about that outcome.
 
 Initially, $M_{\text{anneal}}$ can return `unsupported` for almost every MIR
 construct. Because reaching `unsupported` falsifies the hypothesis that $p$ is
@@ -119,11 +168,21 @@ rules (returning normal progress or `undefined`) one MIR feature at a time:
    branch of $M_{\text{anneal}}$ from `unsupported` to an active execution
    rule, the Lean 4 kernel requires the pull request to prove that the new rule
    never succeeds on an execution where $M_{\text{ref}}$ faults, and never
-   computes a behavior that disagrees with $M_{\text{ref}}$.
+   omits a behavior that $M_{\text{ref}}$ permits.
 
-If implementing a new MIR feature in $M_{\text{anneal}}$ omits a UB check (for
-example, forgetting a division-by-zero, shift-overflow, alignment, or aliasing
-guard) or miscomputes a result, the correspondence proof fails to compile in CI.
+If implementing a new MIR feature in $M_{\text{anneal}}$ omits a UB check that
+$M_{\text{ref}}$ enforces (for example, a division-by-zero, shift-overflow,
+alignment, or aliasing guard) or miscomputes a result, so that
+$M_{\text{anneal}}$ no longer permits the behavior that $M_{\text{ref}}$
+permits, the correspondence proof fails to compile in CI.
+
+The proof detects divergences between $M_{\text{anneal}}$ and
+$M_{\text{ref}}$; it cannot detect an error that both share. If
+$M_{\text{ref}}$ omits the same UB check or encodes the same mistaken rule, if
+$M_{\text{ref}}$ was transcribed incorrectly, or if the trusted boundary
+definitions that state the theorem are wrong, the two models can agree and the
+proof still compiles. The upfront human TCB audit of $M_{\text{ref}}$ and of
+those boundary definitions remains responsible for such shared errors.
 
 ## 3. Why order matters: avoiding the retrofit trap
 
@@ -144,38 +203,68 @@ later fails in two ways:
 
 Landing $M_{\text{ref}}$ and locking the single whole-program correspondence
 theorem on a minimal skeleton inverts these incentives. Human reviewers inspect
-the correspondence theorem statement once when the codebase is small. Every
-subsequent feature addition must satisfy that unchanged theorem statement.
+the correspondence theorem statement, together with the boundary definitions
+that give it meaning, once when the codebase is small. Every subsequent feature
+addition must satisfy that unchanged theorem statement, and any later change
+to the statement or to those boundary definitions requires the same human
+review.
 
 ## 4. Subtleties and formal failure modes
 
 A machine-checked theorem is only as strong as its statement and its boundary
 definitions. Even with the Lean 4 kernel checking every proof, a correspondence
 theorem can be "technically true" while failing to establish what a human
-intuitively expects. The design of $M_{\text{anneal}}$, $M_{\text{ref}}$, and
-the correspondence theorem must guard against the following failure modes from
-the beginning and across all future additions.
+intuitively expects.
+
+**Human comprehension of the correspondence theorem statement and every
+definition in its transitive dependency cone is therefore paramount.** It must
+be crystal clear to a human reviewer that the correspondence theorem means in
+mathematical terms what they intend it to mean in intuitive terms. Non-obvious
+subtleties, clever encodings, or indirect formulations in the theorem statement
+or its transitive boundary definitions are unacceptable: any complexity needed
+to relate the two models belongs in the untrusted proof, while every definition
+that controls the meaning of the theorem must be maximally direct, self-evident
+to a human auditing the file, and documented so that every boundary condition is
+explicit rather than subtle.
+
+In particular, the design of $M_{\text{anneal}}$, $M_{\text{ref}}$, and the
+correspondence theorem must guard against the following failure modes from the
+beginning and across all future additions.
 
 ### 4.1 One-way soundness asymmetry
 
 The correspondence implication runs from $M_{\text{anneal}}$ to
-$M_{\text{ref}}$:
+$M_{\text{ref}}$ for every program $p$ and input query $q$:
 
-$$\mathsf{WellFormed}_{\text{anneal}}(p) \implies \mathsf{WellFormed}_{\text{ref}}(p) \;\land\; \mathsf{SameBehavior}(p)$$
+$$
+\mathsf{WellFormed}_{\text{anneal}}(p, q) \implies
+\mathsf{WellFormed}_{\text{ref}}(p, q) \;\land\;
+\mathsf{Behavior}_{\text{ref}}(p, q) \subseteq
+\mathsf{Behavior}_{\text{anneal}}(p, q)
+$$
 
 This asymmetry is deliberate:
 
 - **$M_{\text{anneal}}$ may never be more permissive than $M_{\text{ref}}$:**
   If $M_{\text{ref}}$ exhibits UB on an execution, $M_{\text{anneal}}$ must
   report either `undefined` or `unsupported`. A theorem that instead assumed
-  $\mathsf{WellFormed}_{\text{ref}}(p)$ as a hypothesis would pass vacuously on
-  every input where $M_{\text{anneal}}$ omitted a UB guard enforced by
-  $M_{\text{ref}}$.
-- **$M_{\text{anneal}}$ may be more restrictive than $M_{\text{ref}}$:**
-  Whenever $M_{\text{anneal}}$ returns `unsupported` (because a construct is
-  not yet implemented) or `undefined` (because $M_{\text{anneal}}$ enforces a
-  simpler, more conservative rule than $M_{\text{ref}}$), soundness is
-  preserved.
+  $\mathsf{WellFormed}_{\text{ref}}(p, q)$ as a hypothesis would pass
+  vacuously on every input where $M_{\text{anneal}}$ omitted a UB guard
+  enforced by $M_{\text{ref}}$.
+- **The implication tolerates a more restrictive $M_{\text{anneal}}$:**
+  $M_{\text{anneal}}$ may reject an execution that $M_{\text{ref}}$ accepts,
+  either because a construct is not yet implemented or because
+  $M_{\text{anneal}}$ conservatively enforces a simpler rule than full Rust.
+  Soundness is preserved in both cases, and in both cases $M_{\text{anneal}}$
+  must report `unsupported`, not `undefined`. `undefined` is reserved for
+  executions that actually exhibit UB; reporting it for a valid program would
+  falsely tell the user that the program has UB. The bidirectional fault
+  equivalence of Section 4.6 narrows this latitude further: it permits
+  $M_{\text{anneal}}$ to report `unsupported` only where $M_{\text{ref}}$ also
+  does.
+- **Behaviors are included in the opposite direction:** Every behavior that
+  $M_{\text{ref}}$ permits must also be a behavior of $M_{\text{anneal}}$,
+  while $M_{\text{anneal}}$ may permit more (see Step 3).
 
 ### 4.2 Requiring $M_{\text{ref}}$ to model everything in $M_{\text{anneal}}$
 
@@ -184,16 +273,25 @@ compiler intrinsics or inline assembly). Consequently, $M_{\text{ref}}$ also
 distinguishes between well-defined executions and unmodeled or faulting
 executions.
 
-Initially, $\mathsf{WellFormed}_{\text{ref}}(p)$ requires that $p$ is completely
-supported and UB-free in $M_{\text{ref}}$. That means $M_{\text{anneal}}$ is not
-allowed to treat a construct as well-formed unless $M_{\text{ref}}$ also models
-it and agrees it is well-formed. Starting with this strict requirement keeps
-the theorem statement simple and prevents an escape hatch where
-$M_{\text{anneal}}$ could implement a construct with no reference oracle
-checking its soundness. If Anneal later needs to support constructs (such as
-additional compiler intrinsics) beyond $M_{\text{ref}}$'s initial coverage, we
-can explicitly extend $M_{\text{ref}}$ or update the theorem statement at that
-point under direct human review.
+$\mathsf{WellFormed}_{\text{ref}}(p, q)$ requires that $p$ is completely
+supported and UB-free in $M_{\text{ref}}$ on $q$. That means
+$M_{\text{anneal}}$ is not allowed to treat a construct as well-formed unless
+$M_{\text{ref}}$ also models it and agrees it is well-formed. This strict
+requirement keeps the theorem statement simple and prevents an escape hatch
+where $M_{\text{anneal}}$ could implement a construct with no reference oracle
+checking its soundness.
+
+The requirement does not lapse as coverage grows. To support a construct (such
+as an additional compiler intrinsic) beyond $M_{\text{ref}}$'s initial
+coverage, we extend $M_{\text{ref}}$ itself, through its extension hooks or an
+audited extension suitable for upstreaming, or we compose a second, explicit
+reference model for that construct. Either way, the extension joins the
+human-audited TCB, and the theorem statement does not change. We never exempt
+a construct from correspondence while presenting it as correspondence-checked:
+an exemption would leave bugs in $M_{\text{anneal}}$'s rules for that
+construct unchecked while CI still passes. If a construct is ever deliberately
+left without a reference, it must be surfaced as trusted, human-audited
+semantics rather than as correspondence-checked semantics.
 
 ### 4.3 Program representation and translation ($\tau_{\text{prog}}$)
 
@@ -221,10 +319,30 @@ If $\tau_{\text{prog}}$ is buggy, the correspondence theorem can become useless:
   $M_{\text{ref}}$, or synthesizing storage/cleanup instructions that were not
   present in the source MIR).
 
-Where $M_{\text{anneal}}$ and $M_{\text{ref}}$ do not share an identical AST,
-$\tau_{\text{prog}}$ must be kept minimal and audited as part of the TCB, backed
-by structural invertibility (such as a round-trip bijection on the supported
-syntax) and negative test cases that reject semantic remapping.
+Round-trip invertibility, such as a decoder that recovers every source program
+from its translation, rules out collapsing distinct programs onto a trivial
+default. It does not by itself rule out semantic laundering. A translation that
+permutes operators bijectively still round-trips: if the encoder maps `.add` to
+the reference's `.addUnchecked` and `.addUnchecked` to `.add`, and the decoder
+swaps them back, every program decodes exactly, yet the theorem now describes a
+different reference program.
+
+Anneal therefore keeps semantic content out of $\tau_{\text{prog}}$. In
+Anneal's three-stage pipeline ([`docs/architecture.md`](architecture.md)),
+$M_{\text{anneal}}$ is the Stage 2 captured MIR operational semantics in
+`trusted/lean/` over which `Trusted.CrateTheorem` is stated, whereas Stage 3's
+normalized `StableAst` and weakest-precondition calculi in `theory/` sit above
+Stage 2 and are linked to $M_{\text{anneal}}$ by kernel-checked `Abstracts`
+backward simulations inside `theory/`. Because $\tau_{\text{prog}}$ translates
+between two unnormalized Stage 2 MIR representations, the two models share
+operator constructors directly and mirror each statement and terminator
+constructor one-to-one, which confines $\tau_{\text{prog}}$ to bookkeeping such
+as type-table indexing without giving up Stage 3 normalization. Kernel-checked
+constructor-preservation theorems lock each semantic constructor through the
+translation, and end-to-end semantic canaries pin the meaning of the shared
+constructors: for example, an unchecked addition that overflows must exhibit
+UB, whereas a wrapping addition of the same operands must not. The remaining
+translation is still kept minimal and audited as part of the TCB.
 
 ### 4.4 Behavior representation and projection ($\pi$)
 
@@ -280,19 +398,20 @@ non-terminating and nondeterministic executions:
   state or an explicit failure outcome.
 - **Demonic nondeterminism:** When $M_{\text{ref}}$ models nondeterministic
   choices (such as memory allocator addresses),
-  $\mathsf{WellFormed}_{\text{anneal}}(p)$ must imply that *all* permitted
-  executions in $M_{\text{ref}}$ are well-formed and match $M_{\text{anneal}}$'s
-  behavior. If $M_{\text{anneal}}$ is deterministic, it cannot arbitrarily pick
-  one lucky choice when the program's branch or safety depends on that choice;
-  the correspondence theorem automatically forces $M_{\text{anneal}}$ to either
-  return `unsupported` on operations that observe the nondeterminism or model
-  the nondeterministic choice itself.
+  $\mathsf{WellFormed}_{\text{anneal}}(p, q)$ must imply that *all* permitted
+  executions in $M_{\text{ref}}$ are well-formed and that each of their
+  behaviors is a behavior of $M_{\text{anneal}}$. If $M_{\text{anneal}}$ is
+  deterministic, it cannot arbitrarily pick one lucky choice when the
+  program's branch or safety depends on that choice; the correspondence
+  theorem automatically forces $M_{\text{anneal}}$ to either return
+  `unsupported` on operations that observe the nondeterminism or model the
+  nondeterministic choice itself.
 
 ### 4.6 Guarding against antecedent collapse and outcome misclassification
 
 Because both `undefined` and `unsupported` falsify
-$\mathsf{WellFormed}_{\text{anneal}}(p)$, the correspondence theorem by itself
-does not prevent two bugs in $M_{\text{anneal}}$:
+$\mathsf{WellFormed}_{\text{anneal}}(p, q)$, the correspondence theorem by
+itself does not prevent two bugs in $M_{\text{anneal}}$:
 
 1. **Antecedent collapse (vacuous `unsupported` or `undefined`):** If a pull
    request claims to add support for a MIR construct, but a bug in
@@ -321,3 +440,53 @@ with concrete canary tests in CI:
   constructs and proving that $M_{\text{anneal}}$ evaluates them to
   `unsupported` (not `ok` and not `undefined`) until support for those
   constructs is intentionally added.
+
+Canaries alone cannot cover a supported domain. For a construct parameterized
+by operators, integer widths, signedness, or modes, one positive canary
+witnesses a single execution: an implementation could special-case that
+program and return `unsupported` for the rest of the claimed domain while the
+correspondence theorem and every canary still pass. Anneal therefore pairs
+concrete boundary-case canaries with a staged support gate in $M_{\text{ref}}$
+and fault equivalence along corresponding executions.
+
+Because an imported reference interpreter may already evaluate constructs that
+$M_{\text{anneal}}$ has not yet enabled (or that $M_{\text{anneal}}$
+conservatively rejects under Section 4.1), $M_{\text{ref}}$'s correspondence
+wrapper applies an explicit, human-audited support gate that reports
+`unsupported` outside the currently claimed support domain and delegates every
+construct inside that domain to the reference interpreter. Along corresponding
+executions (indexed by any shared nondeterministic choice trace $\sigma$), each
+model must reach the same fault classification
+$k \in \{\mathsf{undefined}, \mathsf{unsupported}\}$. When both models are
+deterministic on the supported domain, this per-execution fault correspondence
+reduces to bidirectional fault-reachability equivalence for every program $p$
+and input query $q$:
+
+$$
+\mathsf{Reaches}_{\text{anneal}}(p, q, \mathsf{fault}\;k) \iff
+\mathsf{Reaches}_{\text{ref}}(p, q, \mathsf{fault}\;k)
+\quad \text{for } k \in \{\mathsf{undefined}, \mathsf{unsupported}\}
+$$
+
+When a model permits nondeterministic choices, comparing fault outcomes along
+corresponding executions (rather than merely existential reachability over $p$
+and $q$) ensures that $M_{\text{anneal}}$ cannot report `unsupported` on one
+branch merely because a different nondeterministic branch of the same input
+triggers `unsupported`, and cannot swap `undefined` and `unsupported` on any
+execution.
+
+Because fault equivalence quantifies over all inputs and corresponding
+executions inside the gated reference domain, it forbids $M_{\text{anneal}}$
+from returning `unsupported` (or `undefined`) on any execution where
+$M_{\text{ref}}$ succeeds, and from reporting one failure outcome where
+$M_{\text{ref}}$ reports the other. $M_{\text{ref}}$'s staged support gate
+thereby serves as the single audited support predicate: $M_{\text{anneal}}$
+reports `unsupported` if and only if $M_{\text{ref}}$'s gated semantics does, so
+widening the supported domain means widening the coverage that $M_{\text{ref}}$
+exposes to the theorem, under human review. The CI canaries then guard that
+staged support predicate itself against collapse. For each parameterized
+construct, they cover positive and boundary cases across its parameters (such as
+each integer width and signedness, the extremes of each operand range, a zero
+divisor, or a shift amount equal to the bit width), proving that concrete
+executions reach `ok` or `undefined` (never `unsupported`) so that a staged gate
+or implementation narrower than the claimed domain fails CI.
