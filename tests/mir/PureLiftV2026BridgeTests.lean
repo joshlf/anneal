@@ -212,6 +212,145 @@ theorem sibling_sound :
     ⟨siblingSt0, sibling_init, sibling_entry_rel⟩ sibling_pureLift_eval rfl rfl
     (.pair (.nat (by decide)) (.nat (by decide))) rfl
 
+/-- **Test 1 (`CfgCertificate` adequacy via `mir_cfgCertificate_sound`)**:
+verifies `siblingBody` through `CfgCertificate.singleBlock` and
+`mir_cfgCertificate_sound`. -/
+def siblingCert : CfgCertificate stdValAlg :=
+  CfgCertificate.singleBlock stdValAlg siblingPlan (.use (.localSub 2 []))
+
+def siblingCfgInv (bb : Nat) (st : SymState StdVal) : Prop :=
+  bb = 0 ∧ st = siblingSt0
+
+theorem sibling_cfgCertificate_sound :
+    Anneal.MirFuelFree.MirWpConverges siblingBody siblingMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .pair (.nat 10) (.nat 20))) :=
+  mir_cfgCertificate_sound tagOfLoan siblingBody siblingCert siblingParams
+    siblingSt0 (fun out => out.ret = .pair (.nat 10) (.nat 20))
+    (fun _ => []) (fun _ => 0)
+    (fun bb st ms => bb = 0 ∧ st = siblingSt0 ∧ ms = siblingMs0) []
+    sibling_init rfl siblingCfgInv (fun _ => True)
+    (fun _ _ ⟨hBb, hSt⟩ => by subst hBb; subst hSt; exact trivial)
+    (fun _ _ ⟨hBb, hSt⟩ _ _ _ _ h => by subst hBb; subst hSt; exact nomatch h)
+    ⟨rfl, rfl⟩
+    (fun s ms ⟨hW, _, _, _, hBb, hSt, hMs⟩ => by
+      cases s with
+      | mk w bb st =>
+        dsimp only at hW hBb hSt hMs
+        have hwEq : w = (fun o => o) := funext hW
+        subst hwEq
+        subst hBb
+        subst hSt
+        subst hMs
+        exact ⟨16, _, rfl, _, _, rfl,
+          .pair (.nat (by decide)) (.nat (by decide)), rfl⟩)
+    ⟨fun _ => rfl, rfl, rfl, sibling_entry_rel, rfl, rfl, rfl⟩
+
+/-- Symbolic-input `PureLift` state after the two sibling reborrows. -/
+def siblingSymStSplit (a b : Nat) : SymState StdVal :=
+  ⟨[⟨.nat a, .unborrowed⟩, ⟨.nat b, .unborrowed⟩,
+    ⟨.pair (.nat a) (.nat b), .split [([0], .mutLocked 0), ([1], .mutLocked 1)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩, ⟨.refVal 1 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat a, .unborrowed⟩, .direct (.localReg 2) [0]⟩,
+    ⟨1, .activeMut, ⟨.nat b, .unborrowed⟩, .direct (.localReg 2) [1]⟩],
+   [], [], [], 0⟩
+
+/-- Symbolic-input live MIR state after the two sibling reborrows (`stmtIdx = 6`). -/
+def siblingSymMsSplit (a b : Nat) : MachineState :=
+  let ms0 := initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]
+  { frame :=
+      { blockIdx := 0, stmtIdx := 6,
+        locals :=
+          [.uninit, .init (.scalar ⟨a, 4⟩), .init (.scalar ⟨b, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] }
+    memory :=
+      { ms0.memory with
+        borrows :=
+          [{ tag := 2, targetLocal := 3, targetProjection := [.field 1 u32Ty],
+             perm := .reservedFrz false },
+           { tag := 1, targetLocal := 3, targetProjection := [.field 0 u32Ty],
+             perm := .reservedFrz false }]
+        nextTag := 3 } }
+
+/-- Symbolic-input live MIR state after `*x = 10` (`stmtIdx = 7`). -/
+def siblingSymMsAfterX (a b : Nat) : MachineState :=
+  let ms0 := initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]
+  { frame :=
+      { blockIdx := 0, stmtIdx := 7,
+        locals :=
+          [.uninit, .init (.scalar ⟨a, 4⟩), .init (.scalar ⟨b, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨b, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] }
+    memory :=
+      { ms0.memory with
+        borrows :=
+          [{ tag := 2, targetLocal := 3, targetProjection := [.field 1 u32Ty],
+             perm := .reservedFrz false },
+           { tag := 1, targetLocal := 3, targetProjection := [.field 0 u32Ty],
+             perm := .active }]
+        nextTag := 3 } }
+
+/-- **Test 1 (symbolic-input split realization & adequacy)**: for *all* symbolic
+inputs `a, b < 256 ^ 4`, `siblingBody` reaches `siblingSymMsSplit a b` realizing
+`siblingSymStSplit a b` under `mirStateRel`, and converges fuel-free from
+`initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]` to a normal
+return refining the `PureLift` output `(10, 20)`. -/
+theorem sibling_symbolic_sound (a b : Nat) (ha : a < 256 ^ 4) (hb : b < 256 ^ 4) :
+    mirStateRel tagOfLoan [(0, 3, [0]), (1, 3, [1])]
+      (siblingSymStSplit a b) (siblingSymMsSplit a b) ∧
+    Anneal.MirFuelFree.MirWpConverges siblingBody
+      (initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩])
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .pair (.nat 10) (.nat 20))) := by
+  refine ⟨?_, ?_⟩
+  · exact ⟨⟨⟨⟨Or.inr rfl, trivial⟩, ⟨trivial, trivial⟩⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat ha⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩,
+       ⟨⟨rfl, ⟨_, rfl, .nat hb⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩⟩,
+     mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .nat ha⟩,
+       fun _ => ⟨_, rfl, .nat hb⟩,
+       (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
+       trivial⟩⟩
+  · have hPath1 :
+        StepPath (Anneal.PureMirExec.mirStep siblingBody)
+          (initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]) 6
+          (siblingSymMsSplit a b) :=
+      stepPath_of_runSilentSteps rfl
+    have hPath2 :
+        StepPath (Anneal.PureMirExec.mirStep siblingBody)
+          (siblingSymMsSplit a b) 1 (siblingSymMsAfterX a b) :=
+      stepPath_of_runSilentSteps rfl
+    have hRun3 :
+        Anneal.PureMirExec.evalFuel (Anneal.PureMirExec.mirStep siblingBody) 8
+          (siblingSymMsAfterX a b) =
+        .halted (.normal (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩],
+          { (initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]).memory with
+            borrows :=
+              [{ tag := 2, targetLocal := 3, targetProjection := [.field 1 u32Ty], perm := .disabled },
+               { tag := 1, targetLocal := 3, targetProjection := [.field 0 u32Ty], perm := .disabled }]
+            nextTag := 3 })) := rfl
+    obtain ⟨n, mFinal, hPath3, hDone⟩ := exists_stepPath_of_evalFuel_halted hRun3
+    refine mir_pure_lift_sound tagOfLoan siblingBody []
+      [⟨.byVal, .nat a⟩, ⟨.byVal, .nat b⟩] siblingPlan
+      (.use (.localSub 2 [])) (fun out => out.ret = .pair (.nat 10) (.nat 20))
+      (initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]) []
+      ⟨⟨[⟨.nat a, .unborrowed⟩, ⟨.nat b, .unborrowed⟩], [], [], [], [], 0⟩, rfl,
+       ⟨⟨trivial, trivial⟩,
+        mirLocalsRel_of_localsRefine
+          ⟨fun _ => ⟨_, rfl, .nat ha⟩, fun _ => ⟨_, rfl, .nat hb⟩, trivial⟩⟩⟩
+      rfl ?_
+    intro _ out _ _ hEval
+    have hEvalEq :
+        evalFnValue stdValAlg [⟨.byVal, .nat a⟩, ⟨.byVal, .nat b⟩] siblingPlan
+          (.use (.localSub 2 [])) = .ok ⟨.pair (.nat 10) (.nat 20), []⟩ := rfl
+    rw [hEvalEq] at hEval
+    injection hEval with hOut
+    subst hOut
+    exact ⟨6 + (1 + n), mFinal, hPath1.trans (hPath2.trans hPath3),
+      .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩], _, hDone,
+      .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+
 /-! ### Test 1b: Root `&mut (u32, u32)` Parameter with Caller-Local Writeback (`spatialFinalBindingsHold`) -/
 
 def unitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
@@ -478,6 +617,95 @@ theorem diamond_sound_via_join (c : Bool) :
   cases c
   · exact Anneal.PureMirExec.mirWpConverges_of_wpConverges ⟨16, _, rfl, _, rfl⟩
   · exact Anneal.PureMirExec.mirWpConverges_of_wpConverges ⟨16, _, rfl, _, rfl⟩
+
+/-- Symbolic-input post-join `PureLift` state for arbitrary `x, y : Nat`. -/
+def diamondSymStJoin (c : Bool) (x y : Nat) : SymState StdVal :=
+  ⟨[⟨.choice (.symBool c) (.symBool c) (.symBool c), .unborrowed⟩,
+    ⟨.choice (.symBool c) (.nat x) (.nat x), .unborrowed⟩,
+    ⟨.choice (.symBool c) (.nat y) (.nat y), .unborrowed⟩,
+    ⟨.pair (.choice (.symBool c) (.nat x) (.nat x)) (.choice (.symBool c) (.nat y) (.nat y)),
+      .split [([0], .mutLocked 0), ([1], .mutLocked 0)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.choice (.symBool c) (.nat x) (.nat y), .unborrowed⟩,
+     BackTarget.choice (.symBool c) (.direct (.localReg 3) [0]) (.direct (.localReg 3) [1])⟩],
+   [], [], [], 0⟩
+
+/-- Symbolic-input live MIR state at the join block `bb3` for arbitrary `x, y : Nat`. -/
+def diamondSymMsJoin (c : Bool) (x y : Nat) : MachineState :=
+  let ms0 :=
+    initMachineState diamondBody [.scalar ⟨if c then 1 else 0, 1⟩, .scalar ⟨x, 4⟩, .scalar ⟨y, 4⟩]
+  { frame :=
+      { blockIdx := 3, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨if c then 1 else 0, 1⟩), .init (.scalar ⟨x, 4⟩),
+           .init (.scalar ⟨y, 4⟩), .init (.aggregate 0 [.scalar ⟨x, 4⟩, .scalar ⟨y, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { ms0.memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 4,
+             targetProjection := [.field (if c then 0 else 1) u32Ty],
+             perm := .reservedFrz false }]
+        nextTag := 2 } }
+
+/-- **Test 2 (symbolic-input join realization & adequacy)**: for *all* symbolic
+inputs `c : Bool` and `x, y < 256 ^ 4`, `runMirToBlock diamondBody 3` reaches the
+join block `bb3` in a state satisfying `mirStateRel` against `diamondSymStJoin c x y`
+(`BackTarget.choice`), and `diamondBody` converges fuel-free (`MirWpConverges`) to
+`LiftedMirPost` refining the symbolic post-join pair. -/
+theorem diamond_symbolic_sound (c : Bool) (x y : Nat) (hx : x < 256 ^ 4) (hy : y < 256 ^ 4) :
+    let ms0 :=
+      initMachineState diamondBody [.scalar ⟨if c then 1 else 0, 1⟩, .scalar ⟨x, 4⟩, .scalar ⟨y, 4⟩]
+    Anneal.PureMirExec.runMirToBlock diamondBody 3 ms0 =
+      .reached (diamondSymMsJoin c x y) ∧
+    mirStateRel tagOfLoan [(0, 4, if c then [0] else [1])]
+      (diamondSymStJoin c x y) (diamondSymMsJoin c x y) ∧
+    Anneal.MirFuelFree.MirWpConverges diamondBody ms0
+      (LiftedMirPost tagOfLoan (fun out =>
+        out.ret = .pair (zipStdVal (.symBool c) (.nat 50) (.nat x))
+          (zipStdVal (.symBool c) (.nat y) (.nat 50)))) := by
+  intro ms0
+  cases c
+  · refine ⟨rfl, ?_, ?_⟩
+    · exact ⟨⟨⟨trivial, trivial⟩,
+        ⟨⟨rfl, ⟨_, rfl, .choiceFalse (.nat hy)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+       mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .choiceFalse (.symBool false)⟩,
+         fun _ => ⟨_, rfl, .choiceFalse (.nat hx)⟩,
+         fun _ => ⟨_, rfl, .choiceFalse (.nat hy)⟩, (fun h => nomatch h),
+         fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+    · exact mir_pure_lift_sound_of_evalFuel tagOfLoan diamondBody []
+        [⟨.byVal, .symBool false⟩, ⟨.byVal, .nat x⟩, ⟨.byVal, .nat y⟩]
+        diamondPlan (.use (.localSub 3 [])) _ ms0 _
+        (.aggregate 0 [.scalar ⟨x, 4⟩, .scalar ⟨50, 4⟩]) _ 16 []
+        ⟨_, rfl,
+         ⟨⟨trivial, trivial⟩,
+          mirLocalsRel_of_localsRefine
+            ⟨fun _ => ⟨_, rfl, .symBool false⟩,
+             fun _ => ⟨_, rfl, .nat hx⟩,
+             fun _ => ⟨_, rfl, .nat hy⟩, trivial⟩⟩⟩
+        rfl rfl rfl
+        (.pair (.choiceFalse (.nat hx)) (.choiceFalse (.nat (by decide)))) rfl
+  · refine ⟨rfl, ?_, ?_⟩
+    · exact ⟨⟨⟨trivial, trivial⟩,
+        ⟨⟨rfl, ⟨_, rfl, .choiceTrue (.nat hx)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+       mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .choiceTrue (.symBool true)⟩,
+         fun _ => ⟨_, rfl, .choiceTrue (.nat hx)⟩,
+         fun _ => ⟨_, rfl, .choiceTrue (.nat hy)⟩, (fun h => nomatch h),
+         fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+    · exact mir_pure_lift_sound_of_evalFuel tagOfLoan diamondBody []
+        [⟨.byVal, .symBool true⟩, ⟨.byVal, .nat x⟩, ⟨.byVal, .nat y⟩]
+        diamondPlan (.use (.localSub 3 [])) _ ms0 _
+        (.aggregate 0 [.scalar ⟨50, 4⟩, .scalar ⟨y, 4⟩]) _ 16 []
+        ⟨_, rfl,
+         ⟨⟨trivial, trivial⟩,
+          mirLocalsRel_of_localsRefine
+            ⟨fun _ => ⟨_, rfl, .symBool true⟩,
+             fun _ => ⟨_, rfl, .nat hx⟩,
+             fun _ => ⟨_, rfl, .nat hy⟩, trivial⟩⟩⟩
+        rfl rfl rfl
+        (.pair (.choiceTrue (.nat (by decide))) (.choiceTrue (.nat hy))) rfl
 
 /-! ## Test 3: Hybrid `SpatialPin` Freeze → `zerocopy` Byte Write → Unpin -/
 
@@ -955,6 +1183,56 @@ theorem fp_sound :
     ⟨_, rfl, fp_entry_rel⟩ fp_pureLift_eval rfl rfl
     (.pair (.nat (by decide)) (.nat (by decide))) rfl
 
+/-- **Test 3c (symbolic-input adequacy)**: for *every* symbolic first field
+`a < 256 ^ 4`, `fieldPinBody` from `initMachineState fieldPinBody [.scalar ⟨a, 4⟩, .scalar ⟨zcV0, 4⟩]`
+converges fuel-free to a normal return refining `(.pair (.nat a) (.nat zcV1))`. -/
+theorem fp_symbolic_sound (a : Nat) (ha : a < 256 ^ 4) :
+    Anneal.MirFuelFree.MirWpConverges fieldPinBody
+      (initMachineState fieldPinBody [.scalar ⟨a, 4⟩, .scalar ⟨zcV0, 4⟩])
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .pair (.nat a) (.nat zcV1))) :=
+  mir_pure_lift_sound_of_evalFuel tagOfLoan fieldPinBody []
+    [⟨.byVal, .nat a⟩, ⟨.byVal, .nat zcV0⟩] fpPlan
+    (.use (.localSub 2 [])) _
+    (initMachineState fieldPinBody [.scalar ⟨a, 4⟩, .scalar ⟨zcV0, 4⟩])
+    ⟨.pair (.nat a) (.nat zcV1), []⟩
+    (.aggregate 0 [.scalar ⟨a, 4⟩, .scalar ⟨zcV1, 4⟩]) _ 16 []
+    ⟨_, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .nat ha⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩⟩
+    rfl rfl rfl (.pair (.nat ha) (.nat (by decide))) rfl
+
+/-- **Whole-tuple `u32PairMirCodec` freeze / unpin bridge on live MIR**:
+instantiating `spatialCodec_freeze_eq_placeByteWindow` and
+`spatialCodec_unpin_iff_mir_decode` on `u32PairMirCodec zcLayouts 99 rfl` at the
+whole tuple place `_3 []` of `fpMsPinned` and `fpMsWritten`. -/
+theorem fp_whole_pair_mirTypedByteCodec_bridge :
+    let mPair := u32PairMirCodec zcLayouts 99 rfl
+    let cellsWr : List (CellVal StdVal) :=
+      [.rawByte 7, .rawByte 0, .rawByte 0, .rawByte 0,
+       .rawByte 0xAB, .rawByte 0x33, .rawByte 0x22, .rawByte 0x11]
+    (placeByteWindow? zcLayouts (u32PairTy 99) fpMsPinned 3 [] =
+      some (mPair.codec.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩)) ∧
+     abstractBytesOfCells (u32PairSpatialCodec.encode (.pair (.nat 7) (.nat zcV0))) =
+      some (mPair.codec.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩)) ∧
+     Anneal.SepLogicLenses.TypedAt mPair.codec 0
+      (⟨7, by decide⟩, ⟨zcV0, by decide⟩)
+      (mPair.codec.encode (⟨7, by decide⟩, ⟨zcV0, by decide⟩))) ∧
+    u32PairSpatialCodec.decode cellsWr = some (.pair (.nat 7) (.nat zcV1)) ∧
+    decodeValueFromBytes defaultCodecFuel zcLayouts (u32PairTy 99)
+      (mPair.codec.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩)) =
+      some (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨zcV1, 4⟩]) := by
+  intro mPair cellsWr
+  exact ⟨spatialCodec_freeze_eq_placeByteWindow mPair 64 u32PairEmbed u32PairEmbed?
+      u32PairEmbed_embed? fpMsPinned 3 [] (.pair (.nat 7) (.nat zcV0))
+      (⟨7, by decide⟩, ⟨zcV0, by decide⟩) rfl rfl,
+    ((mPair.spatialCodec_unpin_iff_mir_decode 64 u32PairEmbed u32PairEmbed?
+      u32PairEmbed_embed? cellsWr
+      (mPair.codec.encode (⟨7, by decide⟩, ⟨zcV1, by decide⟩)) rfl rfl).2
+      (⟨7, by decide⟩, ⟨zcV1, by decide⟩) rfl),
+    rfl⟩
+
 /-! ### Test 3d: Hybrid Pin with an Active Unpinned Sibling Loan (General Frame Rules) -/
 
 /-- `fn patch_with_sibling(a: u32, b: u32) -> (u32, u32) { let mut p = (a, b);
@@ -1102,7 +1380,8 @@ theorem sp_pin_lifecycle_with_sibling :
     (spatialPinnedBlockHolds tagOfLoan zcLayouts u32Ty 1 0 zcCodec 3 [1] spStWritten
         spMsWritten ∧
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(0, 3, [0])] spStWritten spMsWritten) ∧
-    mirStateRel tagOfLoan [(1, 3, [1]), (0, 3, [0])] spStUnpinned spMsWritten := by
+    mirStateRel tagOfLoan [(1, 3, [1]), (0, 3, [0])] spStUnpinned spMsWritten ∧
+    mirStateRel tagOfLoan [(0, 3, [0]), (1, 3, [1])] spStUnpinned spMsWritten := by
   have hFreeze : freezeToSpatialInState stdValAlg 1 zcCodec spStBorrowed = .ok spStPinned := rfl
   have hMut : mutateSpatialInState 0 0 zcCellsAfter spStPinned = .ok spStWritten := rfl
   have hUnpin : unpinFromSpatialInState stdValAlg 1 zcCodec spStWritten = .ok spStUnpinned := rfl
@@ -1133,14 +1412,16 @@ theorem sp_pin_lifecycle_with_sibling :
       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
        (fun h => nomatch h), fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩,
        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩
-  exact ⟨⟨hPinned, hSibPinned⟩, ⟨hWritten, hSibWritten⟩,
+  have hUnpinFrame :=
     unpin_restores_mirStateRel_frame (u32MirCodec zcLayouts) 32 u32Embed u32Embed?
       u32Embed_embed? (u32_isIntoBytes zcLayouts) tagOfLoan stdValAlg 1 0 zcCodec
       (y := ⟨zcV1, by decide⟩) [(0, 3, [0])] hWritten hUnpin rfl (.nat (by decide)) hLocals
       hSibWritten (fun b hb => by rw [hMem b hb]; decide)
       (fun b hb => by
         rw [hMem b hb]
-        exact mirSpatialModel_disjoint_siblings tagOfLoan 3 (by decide) [] [])⟩
+        exact mirSpatialModel_disjoint_siblings tagOfLoan 3 (by decide) [] [])
+  exact ⟨⟨hPinned, hSibPinned⟩, ⟨hWritten, hSibWritten⟩,
+    hUnpinFrame, mirStateRel_swap tagOfLoan (1, 3, [1]) (0, 3, [0]) [] hUnpinFrame⟩
 
 /-- `PureLift` result: `(9, zcV1)`. -/
 theorem sp_pureLift_eval :

@@ -1864,6 +1864,107 @@ theorem unpin_restores_mirStateRel_frame {layouts : LayoutTable} {ty : Ty} {α :
   rw [listFold_cons] at hSingle ⊢
   exact ⟨hSingle.1, hOthers'.2⟩
 
+/-- Swapping the first two entries of `bindings` preserves `mirStateRel` (since
+`mirSpatialModel.disjointSubPlaces` is symmetric). -/
+theorem mirStateRel_swap (tagOf : LoanId → Nat)
+    (b1 b2 : LoanId × Local × SubPath)
+    (rest : List (LoanId × Local × SubPath))
+    {st : SymState StdVal} {ms : MachineState}
+    (h : mirStateRel tagOf (b1 :: b2 :: rest) st ms) :
+    mirStateRel tagOf (b2 :: b1 :: rest) st ms := by
+  obtain ⟨⟨hDisj, hFold⟩, hLocals⟩ := h
+  obtain ⟨lid1, l1, p1⟩ := b1
+  obtain ⟨lid2, l2, p2⟩ := b2
+  unfold spatialBindingsDisjoint at hDisj
+  rw [listFold_cons] at hDisj
+  dsimp only at hDisj
+  rw [listFold_cons, listFold_cons] at hDisj
+  dsimp only at hDisj
+  obtain ⟨⟨h12, h1Rest⟩, h2Rest, hRestDisj⟩ := hDisj
+  rw [listFold_cons] at hFold
+  dsimp only at hFold
+  rw [listFold_cons] at hFold
+  dsimp only at hFold
+  obtain ⟨hB1, hB2, hRestFold⟩ := hFold
+  refine ⟨⟨?_, ?_⟩, hLocals⟩
+  · unfold spatialBindingsDisjoint
+    rw [listFold_cons]
+    dsimp only
+    rw [listFold_cons, listFold_cons]
+    dsimp only
+    exact ⟨⟨mirSpatialModel_disjoint_symm tagOf h12, h2Rest⟩, h1Rest, hRestDisj⟩
+  · rw [listFold_cons]
+    dsimp only
+    rw [listFold_cons]
+    dsimp only
+    exact ⟨hB2, hB1, hRestFold⟩
+
+/-- Block-level state relation between an embedded `PureLift` CFG machine state
+`s : BlockMachineState (SymState StdVal) (FuncOut StdVal)` and a live `V2026_06_01`
+`MachineState`: `s.wrap` is the identity wrapper, `ms` sits at the header of
+`mirBb s.bb` (`stmtIdx = 0`), `mirStateRel tagOf (bindingsAt s.bb) s.st ms`
+holds, and `extra s.bb s.st ms` holds. -/
+def mirCfgStateRel (tagOf : LoanId → Nat)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop := fun _ _ _ => True)
+    (s : BlockMachineState (SymState StdVal) (FuncOut StdVal))
+    (ms : MachineState) : Prop :=
+  (∀ o, s.wrap o = o) ∧
+  ms.frame.blockIdx = mirBb s.bb ∧
+  ms.frame.stmtIdx = 0 ∧
+  mirStateRel tagOf (bindingsAt s.bb) s.st ms ∧
+  extra s.bb s.st ms
+
+/-- Outcome-level return relation matching `LiftedMirPost`: a normal return
+whose value refines `out.ret` and whose final memory realizes `out.mutFinals` at
+`rootAddrs` via `spatialFinalBindingsHold`. -/
+def MirOutcomeRel (tagOf : LoanId → Nat)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (out : FuncOut StdVal) (o : MirOutcome) : Prop :=
+  Exists fun mv => Exists fun mem =>
+    o = .normal (mv, mem) ∧ StdValRefines tagOf out.ret mv ∧
+    spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out (callerExitState mem)
+
+/-- **Compositional `CfgCertificate` adequacy over live `V2026_06_01` MIR
+(`mir_cfgCertificate_sound`)**: connects `MirLiftCoreInterop.wpConverges_of_cfgCertificate`
+and `wpConverges_of_forwardSim` to `mirCfgStateRel` and `LiftedMirPost`. -/
+theorem mir_cfgCertificate_sound (tagOf : LoanId → Nat) (body : CapturedMir)
+    (cert : CfgCertificate stdValAlg)
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue stdValAlg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState StdVal → Prop) (PostRet : FuncOut StdVal → Prop)
+    (hLocal : LocalBlockVC (stepBasicBlock stdValAlg cert.blocks) BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock stdValAlg cert.blocks bb st ≠
+          .branchJump mergeRet thenBb elseBb st')
+    (hInv0 : BlockInv cert.entryBb st0)
+    (hSim : ForwardSim (blockCfgStep (stepBasicBlock stdValAlg cert.blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs))
+    {m0 : MachineState}
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨fun o => o, cert.entryBb, st0⟩ m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) := by
+  have hWp :=
+    wpConverges_of_forwardSim hSim
+      (wpConverges_of_cfgCertificate stdValAlg cert params st0 post hInit hSpec
+        BlockInv PostRet hLocal hNoFork hInv0)
+      m0 hR0
+  exact PureMirExec.mirWpConverges_of_wpConverges
+    (PureMirExec.WpConverges.mono
+      (fun o ⟨out, hPost, mv, mem, ho, hRef, hFin⟩ =>
+        ⟨out, mv, mem, ho, hRef, hFin, hPost⟩)
+      hWp)
+
 end PinLifecycle
 
 /-! ### Concrete codecs: exact-width little-endian `u32` and Rust `bool` -/
@@ -2296,6 +2397,169 @@ theorem appendAbstractBytes_eq_append :
     ∀ (xs ys : List AbstractByte), appendAbstractBytes xs ys = xs ++ ys
   | [], _ => rfl
   | x :: xs, ys => congrArg (x :: ·) (appendAbstractBytes_eq_append xs ys)
+
+theorem takeAbstractBytes_eq_take :
+    ∀ (n : Nat) (bs : List AbstractByte), takeAbstractBytes n bs = bs.take n
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, b :: bs => congrArg (b :: ·) (takeAbstractBytes_eq_take k bs)
+
+theorem dropAbstractBytes_eq_drop :
+    ∀ (n : Nat) (bs : List AbstractByte), dropAbstractBytes n bs = bs.drop n
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, _ :: bs => dropAbstractBytes_eq_drop k bs
+
+/-- `(u32, u32)` as a genuine `MirTypedByteCodec` at any layout index `idx`
+without an explicit offset table (`LayoutTable.lookup layouts idx = none`), so
+whole-tuple places inherit `freeze_spatialPinnedBlockHolds`,
+`mutate_spatialPinnedBlockHolds`, `unpin_eq_live_mir_decode`,
+`unpin_restores_mirStateRel`, and the `BitValidity` marker-trait bridges. -/
+def u32PairMirCodec (layouts : LayoutTable) (idx : Nat)
+    (hLookup : LayoutTable.lookup layouts idx = none) :
+    MirTypedByteCodec layouts (u32PairTy idx)
+      ({v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4}) 8 where
+  codec := u32PairExactLE
+  toValue p := .aggregate 0 [.scalar ⟨p.1.val, 4⟩, .scalar ⟨p.2.val, 4⟩]
+  ofValue v :=
+    match v with
+    | .aggregate 0 [v1, v2] =>
+      match (u32MirCodec layouts).ofValue v1, (u32MirCodec layouts).ofValue v2 with
+      | some x, some y => some (x, y)
+      | _, _ => none
+    | _ => none
+  ofValue_toValue p := by
+    obtain ⟨x, y⟩ := p
+    have hx : (u32MirCodec layouts).ofValue (.scalar ⟨x.val, 4⟩) = some x :=
+      (u32MirCodec layouts).ofValue_toValue x
+    have hy : (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) = some y :=
+      (u32MirCodec layouts).ofValue_toValue y
+    show (match (u32MirCodec layouts).ofValue (.scalar ⟨x.val, 4⟩),
+                (u32MirCodec layouts).ofValue (.scalar ⟨y.val, 4⟩) with
+      | some a, some b => some (a, b)
+      | _, _ => none) = some (x, y)
+    rw [hx, hy]
+  tySize_eq := by
+    unfold rigidTyByteSize u32PairTy
+    dsimp only
+    rw [hLookup]
+    rfl
+  encode_toValue p := by
+    obtain ⟨x, y⟩ := p
+    show (match LayoutTable.lookup layouts idx with
+      | some l => _
+      | none =>
+        encodeSeqFieldsWith
+          (fun k fv => encodeValueToBytes 15 layouts { kind := k, layoutIdx := 0 } fv)
+          [.uint .u32, .uint .u32]
+          [.scalar ⟨x.val, 4⟩, .scalar ⟨y.val, 4⟩]) =
+      some (u32ExactLE.encode x ++ u32ExactLE.encode y)
+    rw [hLookup]
+    show some (appendAbstractBytes (u32ExactLE.encode x)
+      (appendAbstractBytes (u32ExactLE.encode y) [])) =
+      some (u32ExactLE.encode x ++ u32ExactLE.encode y)
+    rw [appendAbstractBytes_eq_append, appendAbstractBytes_eq_append, List.append_nil]
+  decode_eq_map bs := by
+    have hLenDef : ∀ s : List AbstractByte, Trusted.Sequence.length s = s.length :=
+      fun _ => rfl
+    have hDecU32 : ∀ s : List AbstractByte,
+        decodeValueFromBytes 15 layouts { kind := .uint .u32, layoutIdx := 0 } s =
+          Option.map (u32MirCodec layouts).toValue (u32ExactLE.decode s) :=
+      (u32MirCodec layouts).decode_eq_map
+    show (match LayoutTable.lookup layouts idx with
+      | some l =>
+        match Nat.beq (Trusted.Sequence.length bs) l.size.bytes with
+        | false => none
+        | true =>
+          match l.fields with
+          | .arbitrary offsets _ =>
+            match decodeFieldsAtOffsetsWith
+              (fun k s => decodeValueFromBytes 15 layouts { kind := k, layoutIdx := 0 } s)
+              (fun k => rigidTyByteSize layouts { kind := k, layoutIdx := 0 })
+              bs offsets [.uint .u32, .uint .u32] with
+            | some vals => some (.aggregate 0 vals)
+            | none => none
+          | _ =>
+            match decodeSeqFieldsWith
+              (fun k s => decodeValueFromBytes 15 layouts { kind := k, layoutIdx := 0 } s)
+              (fun k => rigidTyByteSize layouts { kind := k, layoutIdx := 0 })
+              [.uint .u32, .uint .u32] bs with
+            | some vals => some (.aggregate 0 vals)
+            | none => none
+      | none =>
+        match decodeSeqFieldsWith
+          (fun k s => decodeValueFromBytes 15 layouts { kind := k, layoutIdx := 0 } s)
+          (fun k => rigidTyByteSize layouts { kind := k, layoutIdx := 0 })
+          [.uint .u32, .uint .u32] bs with
+        | some vals => some (.aggregate 0 vals)
+        | none => none) =
+      Option.map
+        (fun p : {v : Nat // v < 256 ^ 4} × {v : Nat // v < 256 ^ 4} =>
+          Value.aggregate 0 [.scalar ⟨p.1.val, 4⟩, .scalar ⟨p.2.val, 4⟩])
+        (u32PairExactLE.decode bs)
+    rw [hLookup]
+    unfold u32PairExactLE Anneal.SepLogicLenses.ByteLensCodec.prod
+    dsimp only [decodeSeqFieldsWith, rigidTyByteSize, rigidTyKindByteSize, intCastTargetBytes]
+    rw [hLenDef bs, takeAbstractBytes_eq_take 4 bs, dropAbstractBytes_eq_drop 4 bs,
+      hLenDef (bs.drop 4), takeAbstractBytes_eq_take 4 (bs.drop 4),
+      dropAbstractBytes_eq_drop 4 (bs.drop 4)]
+    rw [hDecU32 (bs.take 4), hDecU32 ((bs.drop 4).take 4)]
+    cases h8 : Nat.beq bs.length (4 + 4) with
+    | true =>
+      have hLen : bs.length = 8 := Nat.eq_of_beq_eq_true h8
+      have hBle1 : Nat.ble 4 bs.length = true := by rw [hLen]; rfl
+      have hDropLen : (bs.drop 4).length = 4 := by rw [List.length_drop, hLen]
+      have hBle2 : Nat.ble 4 (bs.drop 4).length = true := by rw [hDropLen]; rfl
+      have hTakeDrop : (bs.drop 4).take 4 = bs.drop 4 :=
+        List.take_of_length_le (by rw [hDropLen]; exact Nat.le_refl 4)
+      have hDropDrop : (bs.drop 4).drop 4 = [] :=
+        List.drop_eq_nil_of_le (by rw [hDropLen]; exact Nat.le_refl 4)
+      rw [hBle1, hBle2, hTakeDrop, hDropDrop]
+      dsimp only
+      cases u32ExactLE.decode (bs.take 4) <;> cases u32ExactLE.decode (bs.drop 4) <;> rfl
+    | false =>
+      dsimp only [Option.map]
+      cases hBle1 : Nat.ble 4 bs.length with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases u32ExactLE.decode (bs.take 4) with
+        | none => rfl
+        | some a =>
+          dsimp only [Option.map]
+          cases hBle2 : Nat.ble 4 (bs.drop 4).length with
+          | false => rfl
+          | true =>
+            dsimp only
+            cases u32ExactLE.decode ((bs.drop 4).take 4) with
+            | none => rfl
+            | some b =>
+              dsimp only [Option.map]
+              cases hDropDrop : (bs.drop 4).drop 4 with
+              | cons _ _ => rfl
+              | nil =>
+                have hLe1 : 4 ≤ bs.length := Nat.le_of_ble_eq_true hBle1
+                have hLe2 : 4 ≤ (bs.drop 4).length := Nat.le_of_ble_eq_true hBle2
+                have hLe3 : (bs.drop 4).length ≤ 4 := List.drop_eq_nil_iff.mp hDropDrop
+                rw [List.length_drop] at hLe2 hLe3
+                have hEq8 : bs.length = 4 + 4 := by omega
+                have hTrue : Nat.beq bs.length (4 + 4) = true := Nat.beq_eq.mpr hEq8
+                rw [h8] at hTrue
+                exact nomatch hTrue
+  encode_provenanceFree := u32PairExactLE_provenanceFree
+
+theorem u32PairMirCodec_spatialCodec_eq {layouts : LayoutTable} {idx : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = none) :
+    (u32PairMirCodec layouts idx hLookup).spatialCodec 64
+      u32PairEmbed u32PairEmbed? u32PairEmbed_embed? = u32PairSpatialCodec := rfl
+
+theorem u32Pair_isTryFromBytes {layouts : LayoutTable} {idx : Nat}
+    (hLookup : LayoutTable.lookup layouts idx = none) :
+    Anneal.BitValidity.IsTryFromBytes layouts (u32PairTy idx)
+      (fun v => Exists fun p =>
+        (u32PairMirCodec layouts idx hLookup).toValue p = v ∧
+        (u32PairMirCodec layouts idx hLookup).ofValue v = some p) :=
+  (u32PairMirCodec layouts idx hLookup).isTryFromBytes
 
 /-- **Live MIR tuple byte window = `u32PairExactLE.encode` (`FieldsTyped`)**:
 when the live MIR place `_l.path` holds `.aggregate 0 [.scalar ⟨x.val, 4⟩,
