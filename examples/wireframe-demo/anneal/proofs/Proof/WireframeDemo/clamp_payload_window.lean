@@ -17,15 +17,18 @@ open Trusted.VerificationResult
 open Anneal.Scalars
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
+open Anneal.SepLogicLenses
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Anneal.FunctionalTranslation
 
-private theorem nat_beq_eq_false_of_ne {a b : Nat} (h : a ≠ b) :
-    Nat.beq a b = false := by
-  cases hb : Nat.beq a b
-  · rfl
-  · exact absurd (Nat.eq_of_beq_eq_true hb) h
+/-- On the `clamp` result `ret`, `ret == requested` failing forces `ret = max_window`. -/
+private theorem beq_max_of_beq_requested_false {b1 b2 ret : Nat}
+    (h_ret : (b1 ≤ b2 ∧ ret = b1) ∨ (b2 < b1 ∧ ret = b2)) (h : Nat.beq ret b1 = false) :
+    Nat.beq ret b2 = true := by
+  rcases h_ret with ⟨-, rfl⟩ | ⟨-, rfl⟩
+  · rw [Nat.beq_refl] at h; nomatch h
+  · exact Nat.beq_refl _
 
 private theorem ensures_holds (b1 b2 ret : Nat)
     (h_ret : (b1 ≤ b2 ∧ ret = b1) ∨ (b2 < b1 ∧ ret = b2)) :
@@ -34,146 +37,86 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       [.scalar { bits := b1, sizeBytes := 2 },
        .scalar { bits := b2, sizeBytes := 2 },
        .scalar { bits := ret, sizeBytes := 2 }] := by
+  have h_le_req : Nat.ble ret b1 = true :=
+    Nat.ble_eq_true_of_le
+      (by rcases h_ret with ⟨-, rfl⟩ | ⟨h, rfl⟩; exact Nat.le_refl _; exact Nat.le_of_lt h)
+  have h_le_max : Nat.ble ret b2 = true :=
+    Nat.ble_eq_true_of_le
+      (by rcases h_ret with ⟨h, rfl⟩ | ⟨-, rfl⟩; exact h; exact Nat.le_refl _)
   apply Hold.val
-  refine hold_mirBool_of_blockLinear _ _ rfl rfl ?_
-  rcases h_ret with ⟨h_le, rfl⟩ | ⟨h_gt, rfl⟩
-  all_goals
-    repeat (first
+  refine hold_mirBool_of_blockLinear_constructive _ _ rfl rfl ?_
+  -- Step the companion CFG for symbolic `ret`: `whnf` evaluates each closure-capture deref
+  -- in place, `h_le_req`/`h_le_max` prune the dead `false` arms, and `bb2`'s `||` is split.
+  repeat (first
       | dsimp only [
-        Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.layouts,
-        Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.body,
-        defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-        wpBlockLinear, wpCfgStep, dispatchBlock,
-        evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-        finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast,
-        evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-        mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
-        sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
-        resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
-        scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-        mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-        evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-        MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-        initMachineState, initLocals, initLocalsAux, emptyMemory,
-        readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
-        appendProjections, stripTransparentProjections, projectionsOverlap,
-        projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
-        borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
-        natListContainsBool, invalidateConflictingBorrows,
-        invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-        freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-        updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-        isBorrowDescendantOrSelfAux, boolToScalar,
-        GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-        HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-        List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-        get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, Bool.not,
-        ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-        Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-      | simp (disch := omega) only [nat_ble_eq_true_of_le, Nat.beq_refl,
-        nat_beq_eq_false_of_ne])
-    exact ⟨boolTruePost_normal_one _⟩
+          Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.layouts,
+          Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.body, defaultSpecSteps,
+          entryBB, dummyBB, lookupBlock, wpBlockLinear, wpCfgStep, dispatchBlock,
+          evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode,
+          advanceStmt, evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast,
+          derefReadTreeUB, hasTreeReadUB, borrowEntryReadUB, treeBorrowTransitionIsUB,
+          placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls, isUnresolvedLayoutIdx,
+          isUnionLayout, LayoutTable.lookup, evalOperandsFast, evalConstValue,
+          evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0,
+          operandIsSigned, operandTy, sharedBorrowPerm, stringEq, tyIsFreeze, placeTy,
+          resolveProjectedTy, pointeeTyOf, tyIsSigned, evalTerminatorSymTreeFast,
+          lookupSwitchTargetTree, MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
+          initMachineState, initLocalsAux, readProjectedValue_nil, readProjectedValue_field,
+          ProvenancePtr.tag, lookupBorrow, stripTransparentProjections, projectionsOverlap,
+          projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
+          borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
+          natListContainsBool, invalidateConflictingBorrows, updateBorrowPerm,
+          freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj,
+          isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, disableLocalBorrows,
+          treeBorrowWriterRelatedness, applyTreeBorrowTransition, treeBorrowNodeAccess,
+          treeBorrowPermTransition, treeBorrowProtectorCheck, treeBorrowChildRead,
+          treeBorrowForeignRead, treeBorrowForeignWrite, GetElem?.getElem?, List.get?Internal,
+          List.length, List.set, Option.getD, get?, set?, length, Nat.add, Nat.mul, Nat.beq,
+          Bool.and, Bool.or, Bool.not, ite, dite, Nat.decLt, Nat.decLe, Bool.decEq,
+          instDecidableEqBool]
+      | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf
+      | rw [h_le_req]
+      | rw [h_le_max]
+      | rw [beq_max_of_beq_requested_false h_ret ‹Nat.beq ret b1 = false›]
+      | (cases h_eq : Nat.beq ret b1 <;> dsimp only []))
+  all_goals exact ⟨boolTruePost_normal_one _⟩
 
-private theorem wpReq_inversion (v1 v2 : Value)
-    (h_req : MirBoolPredicateHolds
-      Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body [v1, v2]) :
-    ∃ b1 b2 : Nat,
-      v1 = .scalar { bits := b1, sizeBytes := 2 } ∧
-      v2 = .scalar { bits := b2, sizeBytes := 2 } ∧
-      b1 ≤ 65535 ∧ b2 ≤ 1024 := by
-  have h_hold :=
-    holdBoolReq_of_mirBool
-      Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body
-      [v1, v2] rfl rfl h_req
-  revert h_hold
-  -- Each round unfolds the companion further, then refutes a branch or splits
-  -- `v1` / `v2` on its shape and bound.
-  repeat (
-    dsimp only [
-      Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.layouts,
-      Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body,
-      defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-      wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-      stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-      finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast,
-      evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-      mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
-      sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
-      resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
-      scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-      mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-      evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-      MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-      initMachineState, initLocals, initLocalsAux, emptyMemory, mirSafePost,
-      readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
-      appendProjections, stripTransparentProjections, projectionsOverlap,
-      projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
-      borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
-      natListContainsBool, invalidateConflictingBorrows,
-      invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-      freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-      updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-      isBorrowDescendantOrSelfAux, boolToScalar,
-      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-      HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-      List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-      ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-      Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-    first
-    | (rintro ⟨h_val⟩; injection h_val with h_sc; injection h_sc with h_bits _; nomatch h_bits)
-    | (rcases v1 with _ | ⟨b1, _ | _ | _ | sz1⟩ | _ | _ <;>
-        (dsimp only [finishAssignSymTree, evalSymNodeTree, Nat.beq]; try rintro ⟨⟨⟩⟩);
-       cases h_ble1 : Nat.ble b1 65535)
-    | (rcases v2 with _ | ⟨b2, _ | _ | _ | sz2⟩ | _ | _ <;>
-        (dsimp only [finishAssignSymTree, evalSymNodeTree, Nat.beq]; try rintro ⟨⟨⟩⟩);
-       cases h_ble2 : Nat.ble b2 1024;
-       case true =>
-         intro _
-         exact ⟨b1, b2, rfl, rfl,
-           Nat.le_of_ble_eq_true h_ble1, Nat.le_of_ble_eq_true h_ble2⟩))
+/-- Universal verification certificate for `clamp_payload_window` (`polyClaim`:
+the signature-typed claim at the empty type substitution) across all
+`requested : u16` and `max_window : u16`.
 
-/-- Universal verification certificate for `clamp_payload_window` across all
-`requested : u16` and `max_window ≤ 1024`.
-
-The body is call-free and alias-free (`checkPureMir`), so it is lifted with the
-`#mir_lift` rules applied explicitly; the `switchInt` on `requested <=
-max_window` is resolved by a case split, and the step budget is synthesized
-structurally by the rules (no fuel constant appears in this proof). -/
-theorem verified : VerificationResult Obligations.WireframeDemo.clamp_payload_window.claim := by
+The `u16` signature pins both arguments to 2-byte scalars, so the call-free,
+alias-free body (`checkPureMir`) is lifted with `liftBlock_switchInt_diamond_toJoin`
+to the shared `return` block `bb3`, which is lifted once. The step budget is
+synthesized structurally (no fuel constant appears in this proof). -/
+theorem verified : Obligations.WireframeDemo.clamp_payload_window.polyClaim := by
+  intro typeArgs h_ty
+  cases typeArgs with
+  | cons _ _ => nomatch h_ty
+  | nil =>
+  simp only [Obligations.WireframeDemo.clamp_payload_window.claimFor, CapturedMir.instantiate_nil]
   refine verifyMirNoPanic_of_pureExec _ rfl fun args h_pre => ?_
-  rcases h_pre with ⟨h_len, h_req⟩
-  obtain ⟨v1, v2, rfl⟩ : ∃ v1 v2, args = [v1, v2] := by
-    rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
-    all_goals first | exact ⟨_, _, rfl⟩ | nomatch h_len
-  obtain ⟨b1, b2, rfl, rfl, -, -⟩ := wpReq_inversion v1 v2 h_req
-  -- bb0: `_3 = Le(_1, _2); switchInt(_3) -> [0: bb2, otherwise: bb1]`
-  apply lift_PureMirConverges (by rfl)
-  apply LiftBlock.of_lookup (by rfl)
-  repeat apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-  by_cases h : b1 ≤ b2
-  · -- `requested <= max_window`: bb1 `_0 = copy _1; goto bb3`; bb3 `return`.
-    apply LiftStmtsTerminator.term_switchInt (target := 1) (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-    · change 1 = lookupSwitchTarget (boolToScalar (Nat.ble b1 b2)).bits [(0, 2)] 1
-      rw [Nat.ble_eq_true_of_le h]
-      rfl
-    apply LiftBlock.of_lookup (by rfl)
-    apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-    apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftBlock.of_lookup (by rfl)
-    apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-    exact ensures_holds b1 b2 b1 (Or.inl ⟨h, rfl⟩)
-  · -- `requested > max_window`: bb2 `_0 = copy _2; goto bb3`; bb3 `return`.
-    apply LiftStmtsTerminator.term_switchInt (target := 2) (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-    · change 2 = lookupSwitchTarget (boolToScalar (Nat.ble b1 b2)).bits [(0, 2)] 1
-      rw [Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (Nat.lt_of_not_le h)]
-      rfl
-    apply LiftBlock.of_lookup (by rfl)
-    apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-    apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftBlock.of_lookup (by rfl)
-    apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
-    exact ensures_holds b1 b2 b2 (Or.inr ⟨Nat.lt_of_not_le h, rfl⟩)
+  obtain ⟨b1, b2, rfl, hb1, hb2⟩ :=
+    u16_pair_of_argsMatchSignature rfl rfl rfl rfl rfl rfl rfl rfl h_pre.2
+  -- Both arms of the `requested <= max_window` diamond reach the shared `return`
+  -- block bb3 with `_0 = min(requested, max_window)`, so bb3 is lifted once.
+  refine LiftBlockToJoin.pureMirConverges (joinBb := 3)
+    (JoinInv := fun env => ∃ r, ((b1 ≤ b2 ∧ r = b1) ∨ (b2 < b1 ∧ r = b2)) ∧
+      get? env 0 = some (.init (.scalar ⟨r, 2⟩))) ?_ ?_
+  · refine liftBlock_switchInt_diamond_toJoin (thenBb := 1) (elseBb := 2) (b1 ≤ b2)
+      (by rfl) (by rfl) (by rfl) rfl (by rfl)
+      (fun h => ⟨by rw [Nat.ble_eq_true_of_le h]; rfl,
+        liftBlock_goto_toJoin (by rfl) (by rfl) (by rfl) rfl
+          (LiftBlockToJoin.refl ⟨b1, Or.inl ⟨h, rfl⟩, rfl⟩)⟩)
+      (fun h => ⟨by rw [nat_ble_eq_false_of_not_le h]; rfl,
+        liftBlock_goto_toJoin (by rfl) (by rfl) (by rfl) rfl
+          (LiftBlockToJoin.refl ⟨b2, Or.inr ⟨Nat.lt_of_not_le h, rfl⟩, rfl⟩)⟩)
+  · rintro env ⟨r, h_r, h_ret⟩
+    exact LiftBlockConverges.of_lookup (by rfl)
+      (LiftStmtsConverges.term_return_ready (by rfl) (by rfl) rfl rfl h_ret
+        ⟨ensures_holds b1 b2 r h_r,
+          u16_retMatchesSignature _ rfl rfl rfl rfl rfl rfl rfl
+            (by rcases h_r with ⟨-, rfl⟩ | ⟨-, rfl⟩; exact hb1; exact hb2)⟩)
 
 /-- Non-vacuity witness confirming `clamp_payload_window`'s `requires` contract
 is satisfiable (`requested = 512`, `max_window = 1024`). -/
@@ -182,6 +125,6 @@ theorem nonVacuousRequires :
       Obligations.WireframeDemo.clamp_payload_window.rustRequires a := by
   refine ⟨[.scalar { bits := 512, sizeBytes := 2 }, .scalar { bits := 1024, sizeBytes := 2 }],
     ⟨rfl, ?_⟩⟩
-  exact mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl
+  exact mirBoolPredicateHolds_of_evalMirSpecBool_true_constructive _ _ rfl rfl
 
 end Proof.WireframeDemo.clamp_payload_window
