@@ -1059,12 +1059,15 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
     max_end = min(n, start_pos + 2500)
     # Fast C `str.find(":=")` path before running regexes across all 2,500 chars:
     # check boundaries only on the short `[start_pos:first_ce]` slice when unambiguous.
+    # Any `|` defers to the full walk below: with a `«` later before the boundary it
+    # demands a top-level `:` (a `[inst : C] | ...` header has none) and balanced
+    # nesting order, which these whole-slice substring and count checks cannot see.
     first_ce = stripped.find(":=", start_pos, max_end)
     if first_ce != -1:
         cand0 = stripped[start_pos:first_ce]
         if (
             ":" in cand0
-            and ("|" not in cand0 or _EQN_ALT_LINE_RE.search(cand0) is None)
+            and "|" not in cand0
             and "let " not in cand0
             and "where" not in cand0
             and "«" not in cand0

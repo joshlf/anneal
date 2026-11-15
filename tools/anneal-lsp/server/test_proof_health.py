@@ -1804,6 +1804,31 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         self.assertNotIn("k0", proof_health._FILE_TEXTS_CACHE)
         self.assertIn(f"k{proof_health._FILE_TEXTS_CACHE_MAX + 4}", proof_health._FILE_TEXTS_CACHE)
 
+    def test_decl_header_fast_path_defers_any_pipe_to_the_full_walk(self) -> None:
+        # With a `«` later before the declaration boundary, the full header walk only
+        # accepts a top-level `:` reached through correctly nested brackets. A `|`
+        # header whose colons are all nested (`[inst : C] ||`) or whose brackets are
+        # out of order has no complete header, so these private theorems are not
+        # duplicates of each other; a whole-slice fast path must not invent headers.
+        pair = (
+            "private theorem t [inst : C] || := by\n  exact «q»\n"
+            "private theorem u [inst : C] || := by\n  exact «q»\n"
+        )
+        self.assertEqual(scan(pair), [])
+        start = len("private theorem t")
+        for hdr in (
+            "private theorem t [inst : C] || := by\n  exact «q»\n",
+            "private theorem t (x : Nat) ) (h : a | b : True := by\n  exact «x»\n",
+        ):
+            self.assertEqual(proof_health._decl_header_span(hdr, start, 0), ("", -1), hdr)
+        # A set-builder `|` header with a real top-level `:` keeps its header.
+        set_builder = "private theorem t {s : Set Nat} (h : s = {x | x > 0}) : s = s := by\n  exact «q»\n"
+        self.assertEqual(
+            proof_health._decl_header_span(set_builder, start, 0),
+            (" {s : Set Nat} (h : s = {x | x > 0}) : s = s ", set_builder.index(":= by") + 2),
+        )
+        self.assertEqual(scan(set_builder + set_builder.replace(" t ", " u ", 1)), [(R5, 3, "u")])
+
 
 class TestTranscriptLatencyTelemetry(unittest.TestCase):
     def test_compute_unbatched_tool_latencies_events_and_jsonl(self) -> None:
