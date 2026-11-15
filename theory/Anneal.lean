@@ -21,6 +21,7 @@ import Anneal.PureMirExec
 import Anneal.MirLiftCore
 import Anneal.MirLiftBench
 import Anneal.SepLogicLenses
+import Anneal.PureLift
 
 namespace Anneal
 
