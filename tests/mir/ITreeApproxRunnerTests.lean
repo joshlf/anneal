@@ -723,6 +723,50 @@ heartbeats for the full one) use small absolute floors.
 #guard_msgs (whitespace := lax) in
 #print axioms approxReaches_of_reaches
 
+/-- info: 'Anneal.ITree.ReachesApprox.trans' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.trans
+
+/-- info: 'Anneal.ITree.ReachesApprox.trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.trunc
+
+/-- info: 'Anneal.ITree.ReachesApprox.truncBy' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.truncBy
+
+/-- info: 'Anneal.ITree.ReachesApprox.toReachesRetApprox' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.toReachesRetApprox
+
+/-- info: 'Anneal.ITree.ReachesRetApprox.exists_reachesApprox' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesRetApprox.exists_reachesApprox
+
+/-- info: 'Anneal.ITree.ReachesApprox.mono' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.mono
+
+/-- info: 'Anneal.ITree.approxReaches_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReaches_mono
+
+/-- info: 'Anneal.ITree.reaches_of_approxReaches_cofix' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reaches_of_approxReaches_cofix
+
+/-- info: 'Anneal.ITree.reaches_of_approxReaches_iter' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reaches_of_approxReaches_iter
+
+/-- info: 'Anneal.ITree.reaches_of_approxReaches_interp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reaches_of_approxReaches_interp
+
+/-- info: 'Anneal.ITree.reaches_of_approxReaches_interpState' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reaches_of_approxReaches_interpState
+
 /-- info: 'Anneal.ITree.cofix_eq_iff_approxCofix' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms cofix_eq_iff_approxCofix
@@ -779,6 +823,50 @@ nothing else; the walker equality bridges above carry the content choice-free.
 /-- info: 'Anneal.ITree.interpState_eutt_of_interpStateApprox_eq' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms interpState_eutt_of_interpStateApprox_eq
+
+/-- info: 'Anneal.ITree.eutt_ret_of_tauStar_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms eutt_ret_of_tauStar_ret
+
+/-- info: 'Anneal.ITree.evalTauApprox_eutt_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_eutt_ret
+
+/-- info: 'Anneal.ITree.approxReachesRet_nil_eutt_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReachesRet_nil_eutt_ret
+
+/-- info: 'Anneal.ITree.evalTauApprox_approxCofix_eutt_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_approxCofix_eutt_ret
+
+/-- info: 'Anneal.ITree.evalTauApprox_iterApprox_eutt_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_iterApprox_eutt_ret
+
+/-- info: 'Anneal.ITree.evalTauApprox_interpApprox_eutt_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_interpApprox_eutt_ret
+
+/-- info: 'Anneal.ITree.evalTauApprox_interpStateApprox_eutt_ret' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_interpStateApprox_eutt_ret
+
+/-- info: 'Anneal.ITree.Eutt.reaches' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Eutt.reaches
+
+/-- info: 'Anneal.ITree.Eutt.reachesRet' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Eutt.reachesRet
+
+/-- info: 'Anneal.ITree.Eutt.reachesRet_iff' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Eutt.reachesRet_iff
+
+/-- info: 'Anneal.ITree.Eutt.exists_approxReachesRet_iff' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Eutt.exists_approxReachesRet_iff
 
 /-! ### Fuel-Free Observation-Driven Replay \& Entrypoints (`TraceCheck`) -/
 
@@ -893,6 +981,86 @@ nothing else; the walker equality bridges above carry the content choice-free.
 /-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull_tag_ok_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms diagnoseRawByteTraceWithCalleesFull_tag_ok_obsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceWithin_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceWithin_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceAuto_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceAuto_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceWithin_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceWithin_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceWithin_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceWithin_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceAuto_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceAuto_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceFast_imp_within_of_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceFast_imp_within_of_le
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceWithin_isSome_of_checkFullMirTraceFast_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reconstructFullMirTraceWithin_isSome_of_checkFullMirTraceFast_le
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullObservedTraceBounded_imp_fuelFree_of_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullObservedTraceBounded_imp_fuelFree_of_le
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullBounded_imp_fuelFree_of_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFullBounded_imp_fuelFree_of_le
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullBounded_imp_fuelFree_of_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullBounded_imp_fuelFree_of_le
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceWithin_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseFullMirTraceWithin_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceFastWithin_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseFullMirTraceFastWithin_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFull_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFull_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFull_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullFast_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullFast_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullFast_tagName' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullFast_tagName
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFull_tag_ok_iff_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFull_tag_ok_iff_check
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull_tag_ok_iff_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFull_tag_ok_iff_check
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErased_tag_ok_iff_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErased_tag_ok_iff_check
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErased_tag_ok_iff_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesObsErased_tag_ok_iff_check
 
 /-! ## 2. Definitional-Closure Audit (`#audit_closure`)
 
@@ -1080,6 +1248,36 @@ elab "#audit_closure " prof:ident root:ident : command => do
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFull
 /-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErased: clean -/
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesObsErased
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.stepFullMirEventFastWithin: clean -/
+#guard_msgs in #audit_closure checker stepFullMirEventFastWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirFinishWithin: clean -/
+#guard_msgs in #audit_closure checker checkFullMirFinishWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceWithin: clean -/
+#guard_msgs in #audit_closure checker checkFullMirTraceWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceAuto: clean -/
+#guard_msgs in #audit_closure checker checkFullMirTraceAuto
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseStepFullMirEventWithin: clean -/
+#guard_msgs in #audit_closure checker diagnoseStepFullMirEventWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseStepFullMirEventFastWithin: clean -/
+#guard_msgs in #audit_closure checker diagnoseStepFullMirEventFastWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFinishFullMirTraceWithin: clean -/
+#guard_msgs in #audit_closure checker diagnoseFinishFullMirTraceWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceWithin: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullMirTraceWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceFastWithin: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullMirTraceFastWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceAuto: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullMirTraceAuto
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceFastAuto: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullMirTraceFastAuto
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceFullFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceObsErasedFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFullFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErasedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesObsErasedFast
 
 /-! ## 3. Nested `interpState` over `interp` over `iter` (`CofixA` Walkers vs `.observe`) -/
 
@@ -2489,6 +2687,59 @@ theorem counterIter_k2_approxReaches_complete :
   rcases counterIter_k2_reaches_fuelFree with ⟨u, hu, _⟩
   exact ⟨u, hu, approxReaches_of_reaches hu 5⟩
 
+/-- Kleene depth monotonicity (`approxReaches_mono`), `ReachesApprox.toReachesRetApprox`,
+and walker-level `reaches_of_approxReaches_iter` on `counterIter_k2_approxReaches`. -/
+theorem counterIter_k2_approxReaches_kleene_mono :
+    (∃ b' : CofixA CounterE Nat (1 + (20 - 7)),
+      approxReaches (ofITree 20 (ITree.iter (counterIterBody 2) (0, 0)))
+        counterIterTrace2 b' ∧
+      CofixA.truncBy (20 - 7) b' = (CofixA.ret 7 : CofixA CounterE Nat 1)) ∧
+    ReachesRetApprox (iterApprox (counterIterBodyApprox 2) 7 (0, 0))
+      counterIterTrace2 7 ∧
+    (∃ u, Reaches (ITree.iter (counterIterBody 2) (0, 0)) counterIterTrace2 u ∧
+      (CofixA.ret 7 : CofixA CounterE Nat 1) = ofITree 1 u) := by
+  have h7 : approxReaches (ofITree 7 (ITree.iter (counterIterBody 2) (0, 0)))
+      counterIterTrace2 (CofixA.ret 7 : CofixA CounterE Nat 1) := by
+    rw [ofITree_iter, iterApprox_congr (fun i m => ofITree_counterIterBody 2 i m)]
+    exact counterIter_k2_approxReaches
+  exact ⟨approxReaches_mono (by decide) h7,
+    counterIter_k2_approxReaches.toReachesRetApprox,
+    reaches_of_approxReaches_iter (fun i d => (ofITree_counterIterBody 2 i d).symm)
+      counterIter_k2_approxReaches⟩
+
+instance : DecidableEq EmptyE.I := fun i => nomatch i
+instance (i : EmptyE.I) : Decidable (FaultEffect.isFault (E := EmptyE) i) := nomatch i
+
+/-- Genuine `.tau`-erasing `Eutt` adequacy from a single finite-depth `evalTauApprox`
+check on `nestedPipelineApprox`: `nestedPipelineITree 4 100` takes `4 * 4 = 16`
+`.tau` steps before `.ret (110, 110)` (so `evalTauApprox (ofITree 1 (nestedPipelineITree 4 100)) = none ≠
+some (110, 110)` and `nestedPipelineITree 4 100 ≠ .ret (110, 110)`), yet `evalTauApprox_eutt_ret`
+proves `Eutt (nestedPipelineITree 4 100) (.ret (110, 110))` from `nestedPipeline_k4_rfl`
+at depth `17`, and `Eutt.reachesRet_iff` / `Eutt.exists_approxReachesRet_iff` transport
+reachability across that `.tau`-erasing equivalence. -/
+theorem nestedPipeline_k4_eutt_ret_and_strict_ineq :
+    nestedPipelineITree 4 100 ≠ ITree.ret (110, 110) ∧
+    Eutt (nestedPipelineITree 4 100) (ITree.ret (110, 110)) ∧
+    (ReachesRet (nestedPipelineITree 4 100) [] (110, 110) ↔
+      ReachesRet (ITree.ret (E := EmptyE) (110, 110)) [] (110, 110)) ∧
+    ((∃ n, approxReachesRet n (ofITree n (nestedPipelineITree 4 100)) [] (110, 110) = true) ↔
+      (∃ n, approxReachesRet n
+        (ofITree n (ITree.ret (E := EmptyE) (110, 110))) [] (110, 110) = true)) := by
+  have h_neq : nestedPipelineITree 4 100 ≠ ITree.ret (110, 110) := by
+    intro h_eq
+    have h1 : evalTauApprox (ofITree 1 (nestedPipelineITree 4 100)) =
+        evalTauApprox (ofITree 1 (ITree.ret (E := EmptyE) (110, 110))) :=
+      congrArg (fun t => evalTauApprox (ofITree 1 t)) h_eq
+    rw [ofITree_nestedPipeline 4 100 1, ofITree_ret] at h1
+    nomatch h1
+  have h_ev : evalTauApprox (ofITree 17 (nestedPipelineITree 4 100)) = some (110, 110) := by
+    rw [ofITree_nestedPipeline]
+    exact nestedPipeline_k4_rfl
+  have h_eutt : Eutt (nestedPipelineITree 4 100) (ITree.ret (110, 110)) :=
+    evalTauApprox_eutt_ret h_ev
+  exact ⟨h_neq, h_eutt, h_eutt.reachesRet_iff,
+    h_eutt.exists_approxReachesRet_iff [] (110, 110)⟩
+
 /-! ### Fuel-Free Equality \& `Eutt` Congruence of the Walkers -/
 
 /-- `stateHandler` with its addition commuted. -/
@@ -3027,5 +3278,41 @@ theorem countTo_k32_obsErased_from_full_fuelFree :
 /-- info: 'Anneal.Mir.ITreeApproxRunnerTests.countTo_k32_obsErased_from_full_fuelFree' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms countTo_k32_obsErased_from_full_fuelFree
+
+/-- Canary 11 (exact per-segment diagnostic agreement vs global budget, and converse
+bounded-to-fuel-free completeness):
+1. At `k = 4` (`9` events, `35` total transitions) with per-segment budget `intra = 8`:
+   the first segment requires `9 > 8` transitions so both `checkFullMirTraceWithin`
+   and `diagnoseFullMirTraceWithin` reject (`= false` and `.tagName = "out_of_fuel"`,
+   agreeing via `diagnoseFullMirTraceWithin_isOk`), even though the 10-segment global
+   budget `10 * 8 = 80 ≥ 35` is accepted by `diagnoseMirExecBounded 80`.
+2. `diagnoseRawByteTraceFull` and `diagnoseRawByteTraceFullFast` agree identically with
+   `checkRawByteTraceFull` (`diagnoseRawByteTraceFull_isOk`,
+   `diagnoseRawByteTraceFull_tag_ok_iff_check`).
+3. Converse completeness (`checkRawByteTraceFullBounded_imp_fuelFree_of_le`): on
+   `mkCountToFullRawTrace 1` (`12 ≤ 11` false, while `mkCountToFullRawTrace 0` takes
+   `8 ≤ 11 = defaultIntraEventSteps mirCountTo []` transitions), acceptance by
+   `checkRawByteTraceFullBounded 8` implies fuel-free `checkRawByteTraceFull` acceptance. -/
+theorem canary_per_segment_diag_agreement_and_converse :
+    checkFullMirTraceWithin mirLoopWithOracleCall 8
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 4))))
+      (loopObs (mkLoopFullRawTrace 4)).events
+      (loopObs (mkLoopFullRawTrace 4)).outcome = false ∧
+    (diagnoseFullMirTraceWithin mirLoopWithOracleCall 8
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 4))))
+      (loopObs (mkLoopFullRawTrace 4)).events
+      (loopObs (mkLoopFullRawTrace 4)).outcome).tagName = "out_of_fuel" ∧
+    (diagnoseMirExecBounded 80 true mirLoopWithOracleCall
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 4))))
+      (loopObs (mkLoopFullRawTrace 4)).events
+      (loopObs (mkLoopFullRawTrace 4)).outcome).tagName = "ok" ∧
+    (diagnoseRawByteTraceFullFast mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4)).tagName = "ok" ∧
+    checkRawByteTraceFull mirCountTo [] emptyShadowProvenanceTable
+      (mkCountToFullRawTrace 0) = true := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, ?_⟩
+  exact checkRawByteTraceFullBounded_imp_fuelFree_of_le (fuel := 8)
+    mirCountTo [] emptyShadowProvenanceTable (mkCountToFullRawTrace 0)
+    (by decide) (by decide +kernel)
 
 end Anneal.Mir.ITreeApproxRunnerTests

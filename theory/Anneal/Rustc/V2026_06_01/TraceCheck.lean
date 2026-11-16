@@ -7970,25 +7970,40 @@ observed trace.
 * With `checkBranches = true` every `switchInt` emits a `MirObsE` event, so between
   two consecutive visible events a frame instance only follows `goto` / `drop` /
   `return` edges, the success edge of `assert`, and the return edges of the inlined
-  calls it makes. None of these depends on the values of locals, so a silent
-  segment that revisits a basic block of the same frame instance repeats itself
-  forever unless it leaves through a failing `assert` or an unwinding callee. One
-  frame instance therefore spends at most `blockStepCount` of its body per segment,
-  each frame it calls multiplies by `blockStepCount + 1` (`calleesStepProduct`,
-  covering repeated and nested inlined calls), and the `inlinedCallees.length + 1`
-  factor of `defaultIntraEventSteps` covers inlined frames still pending when the
-  segment starts.
-* `reconstructFullMirTraceAuto` recurses structurally on `events` and spends at
-  most `defaultIntraEventSteps` transitions per segment (the visible transition
-  included); its soundness needs no bound at all (`reconstructFullMirTraceWithin_sound`),
-  and a larger budget never loses an accepted trace
-  (`reconstructFullMirTraceWithin_mono`). Segments that the bound does not cover
-  are silent loops that exit only through a failing `assert` or an unwinding callee
-  (for example an overflow-checked counter that eventually panics) and inlined
-  recursion pending deeper than `inlinedCallees.length` frames; on those the checker
-  returns `false`, while the fuel-free diagnosis (which runs the global budget
-  `defaultTraceSteps`) reports `outOfFuel` or, if the whole run still fits the
-  global budget, a sound `ok` (`diagnoseRawByteTraceFull_tag_ok_sound`).
+  calls it makes. For an acyclic direct call graph of depth `k ≤ inlinedCallees.length`
+  where `S(b) = blockStepCount b`, finishing all pending callees and remaining caller
+  blocks telescopes to at most
+  `S(c_k) + ∑_{j=1}^{k-1} S(c_j) ∏_{i=j+1}^k (S(c_i) + 1) + S(body) ∏_{i=1}^k (S(c_i) + 1)
+   = (S(body) + 1) ∏_{i=1}^k (S(c_i) + 1) - 1`
+  transitions; the extra `inlinedCallees.length + 1` factor in `defaultIntraEventSteps`
+  provides slack for repeated inlined frames already on `callStack` when the segment
+  begins (and for the final `.halted out => .ret out` transition after an unwinding
+  or aborting external call).
+* Segments that can exceed `defaultIntraEventSteps` under `checkBranches = true` are:
+  (i) silent loops that exit without `switchInt` through a failing `assert` or an
+      unwinding callee (`isUnwindingPanicDefPath` caught by `.cleanup`),
+  (ii) indirect inlined calls (`TerminatorKind.call` / `TerminatorKind.tailCall`
+       whose `func` operand is a function-pointer local resolved via `s.memory.fnPtrs`),
+       which can dispatch to different callees on successive visits to the same
+       basic block as the function-pointer local is updated,
+  (iii) inlined `TerminatorKind.tailCall` (`enterTailCalleeFrame`), which replaces
+        `activeCallee` at `blockIdx = 0` without pushing a `SavedCallerFrame`, and
+  (iv) recursive inlined call chains deeper than `inlinedCallees.length` frames.
+  On those segments `reconstructFullMirTraceAuto`, `checkFullMirTraceAuto`, and
+  `diagnoseFullMirTraceAuto` soundly reject (`none` / `false` / `.outOfFuel`).
+* `reconstructFullMirTraceAuto`, `checkFullMirTraceAuto`, and `diagnoseFullMirTraceAuto`
+  all recurse structurally on `events : List ObservedEvent` as the outer recursion and
+  spend at most `defaultIntraEventSteps` transitions per segment (the visible transition
+  included). `checkFullMirTraceWithin` / `checkFullMirTraceAuto` is tail-recursive and
+  never allocates `List (Event MirEffect)` pairs, while agreeing identically with
+  `(reconstructFullMirTraceWithin ...).isSome` (`checkFullMirTraceWithin_eq`) and
+  `(diagnoseFullMirTraceWithin ...).isOk` (`diagnoseFullMirTraceWithin_isOk`,
+  `diagnoseRawByteTraceFull_isOk`). Its soundness needs no bound at all
+  (`reconstructFullMirTraceWithin_sound`, `checkFullMirTraceWithin_sound`), a larger
+  per-segment budget never loses an accepted trace (`reconstructFullMirTraceWithin_mono`,
+  `checkFullMirTraceWithin_mono`), and any global-budget `checkFullMirTraceFast fuel`
+  acceptance with `fuel ≤ intra` is also accepted by `checkFullMirTraceWithin`
+  (`checkFullMirTraceFast_imp_within_of_le`).
 * `checkBranches = false` erases `switchInt`, so loops between external calls are
   silent and no body-derived bound is complete. The fuel-free branch-erased
   checkers run `checkObsErasedObservedTraceBounded` with the global budget
@@ -8067,7 +8082,8 @@ def defaultRawObsErasedTraceSteps (rootBody : CapturedMir) (rawTrace : RawByteTr
 /--
 One observation-driven replay segment (`checkBranches = true`): runs silent `.tau`
 transitions of `stepMirState body` from `st` and consumes exactly one visible event
-matching `ev`, within at most `fuel` transitions. Returns the recorded
+matching `ev`, within at most `fuel` transitions (using `elimMirVis` on `.vis` nodes
+so no `Eq.ndrec` index transport is generated). Returns the recorded
 `Event MirEffect` and the post-event state.
 -/
 @[reducible]
@@ -8078,26 +8094,65 @@ def stepFullMirEventWithin (body : CapturedMir) :
     match stepMirState body st with
     | .ret _ => none
     | .tau st' => stepFullMirEventWithin body fuel st' ev
-    | .vis (.inl _) _ => none
-    | .vis (.inr (.inl (.emit .silent))) _ => none
-    | .vis (.inr (.inl (.emit (.event tag)))) k =>
-      match ev with
-      | .branch expectedTag =>
-        if Nat.beq tag expectedTag then
-          some (⟨.inr (.inl (.emit (.event tag))), PUnit.unit⟩, k PUnit.unit)
-        else
-          none
-      | _ => none
-    | .vis (.inr (.inr (.call req))) k =>
-      match
-        findActiveCallImpurePtrArgIdx?
-          (execStateActiveBody body st) (execStateCursor st).1 req
-      with
-      | some _ => none
-      | none =>
-        match matchCallObservedEvent req ev with
-        | some ans => some (⟨.inr (.inr (.call req)), ans⟩, k ans)
-        | none => none
+    | .vis i k =>
+      elimMirVis
+        (fun _ _ => none)
+        (fun _ => none)
+        (fun tag kObs =>
+          match ev with
+          | .branch expectedTag =>
+            if Nat.beq tag expectedTag then
+              some (⟨.inr (.inl (.emit (.event tag))), PUnit.unit⟩, kObs PUnit.unit)
+            else
+              none
+          | _ => none)
+        (fun req kCall =>
+          match
+            findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req
+          with
+          | some _ => none
+          | none =>
+            match matchCallObservedEvent req ev with
+            | some ans => some (⟨.inr (.inr (.call req)), ans⟩, kCall ans)
+            | none => none)
+        i k
+
+/-- Allocation-free observation-driven replay segment (`checkBranches = true`):
+runs silent `.tau` transitions of `stepMirState body` from `st` and consumes one
+visible event matching `ev` within at most `fuel` transitions, returning only the
+post-event `MirExecState` without allocating `Event MirEffect`. -/
+@[reducible]
+def stepFullMirEventFastWithin (body : CapturedMir) :
+    Nat → MirExecState → ObservedEvent → Option MirExecState
+  | 0, _, _ => none
+  | fuel + 1, st, ev =>
+    match stepMirState body st with
+    | .ret _ => none
+    | .tau st' => stepFullMirEventFastWithin body fuel st' ev
+    | .vis i k =>
+      elimMirVis
+        (fun _ _ => none)
+        (fun _ => none)
+        (fun tag kObs =>
+          match ev with
+          | .branch expectedTag =>
+            if Nat.beq tag expectedTag then
+              some (kObs PUnit.unit)
+            else
+              none
+          | _ => none)
+        (fun req kCall =>
+          match
+            findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req
+          with
+          | some _ => none
+          | none =>
+            match matchCallObservedEvent req ev with
+            | some ans => some (kCall ans)
+            | none => none)
+        i k
 
 /-- Final observation-driven replay segment: runs silent `.tau` transitions from `st`
 to a terminal `.ret out` matching `outcome`, within at most `fuel` transitions. -/
@@ -8110,6 +8165,17 @@ def finishFullMirTraceWithin (body : CapturedMir) :
     | .ret out => if checkOutcomeMatches outcome out then some out else none
     | .tau st' => finishFullMirTraceWithin body fuel st' outcome
     | .vis _ _ => none
+
+/-- Allocation-free boolean final segment of an observation-driven replay. -/
+@[reducible]
+def checkFullMirFinishWithin (body : CapturedMir) :
+    Nat → MirExecState → ObservedOutcome → Bool
+  | 0, _, _ => false
+  | fuel + 1, st, outcome =>
+    match stepMirState body st with
+    | .ret out => checkOutcomeMatches outcome out
+    | .tau st' => checkFullMirFinishWithin body fuel st' outcome
+    | .vis _ _ => false
 
 /--
 Observation-driven full trace replay (`checkBranches = true`) recursing structurally
@@ -8132,6 +8198,21 @@ def reconstructFullMirTraceWithin (body : CapturedMir) (intra : Nat) :
     | none => none
 
 /--
+Tail-recursive, allocation-free boolean observation-driven full trace checker
+(`checkBranches = true`) recursing structurally on `events` as the outer recursion,
+with at most `intra` `stepMirState` transitions per segment and zero
+`List (Event MirEffect)` allocation.
+-/
+@[reducible]
+def checkFullMirTraceWithin (body : CapturedMir) (intra : Nat) :
+    MirExecState → List ObservedEvent → ObservedOutcome → Bool
+  | st, [], outcome => checkFullMirFinishWithin body intra st outcome
+  | st, ev :: rest, outcome =>
+    match stepFullMirEventFastWithin body intra st ev with
+    | some st' => checkFullMirTraceWithin body intra st' rest outcome
+    | none => false
+
+/--
 Fuel-free observation-driven full trace replay (`checkBranches = true`): recurses
 structurally on `events`, bounding each silent segment by
 `defaultIntraEventSteps body inlinedCallees`.
@@ -8141,6 +8222,107 @@ def reconstructFullMirTraceAuto (body : CapturedMir) (inlinedCallees : List Capt
     (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) :
     Option (List (Event MirEffect) × MirOutcome) :=
   reconstructFullMirTraceWithin body (defaultIntraEventSteps body inlinedCallees)
+    st events outcome
+
+/--
+Tail-recursive, allocation-free fuel-free boolean full trace checker
+(`checkBranches = true`): recurses structurally on `events`, bounding each silent
+segment by `defaultIntraEventSteps body inlinedCallees`.
+-/
+@[reducible]
+def checkFullMirTraceAuto (body : CapturedMir) (inlinedCallees : List CapturedMir)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    Bool :=
+  checkFullMirTraceWithin body (defaultIntraEventSteps body inlinedCallees)
+    st events outcome
+
+theorem stepFullMirEventFastWithin_eq (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (ev : ObservedEvent),
+      stepFullMirEventFastWithin body fuel st ev =
+        (stepFullMirEventWithin body fuel st ev).map Prod.snd := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _; rfl
+  | succ fuel' ih =>
+    intro st ev
+    unfold stepFullMirEventFastWithin stepFullMirEventWithin
+    cases stepMirState body st with
+    | ret _ => rfl
+    | tau st' => exact ih st' ev
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => rfl
+          | event tag =>
+            dsimp only [elimMirVis]
+            cases ev with
+            | branch expectedTag =>
+              dsimp only
+              cases Nat.beq tag expectedTag <;> rfl
+            | _ => rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [elimMirVis]
+          cases findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            cases matchCallObservedEvent req ev <;> rfl
+
+theorem checkFullMirFinishWithin_eq (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (outcome : ObservedOutcome),
+      checkFullMirFinishWithin body fuel st outcome =
+        (finishFullMirTraceWithin body fuel st outcome).isSome := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _; rfl
+  | succ fuel' ih =>
+    intro st outcome
+    unfold checkFullMirFinishWithin finishFullMirTraceWithin
+    cases stepMirState body st with
+    | ret out =>
+      dsimp only
+      cases checkOutcomeMatches outcome out <;> rfl
+    | tau st' => exact ih st' outcome
+    | vis _ _ => rfl
+
+/-- Exact agreement between the tail-recursive allocation-free boolean checker
+`checkFullMirTraceWithin` and `(reconstructFullMirTraceWithin ...).isSome`. -/
+theorem checkFullMirTraceWithin_eq (body : CapturedMir) (intra : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      checkFullMirTraceWithin body intra st events outcome =
+        (reconstructFullMirTraceWithin body intra st events outcome).isSome := by
+  intro st events
+  induction events generalizing st with
+  | nil =>
+    intro outcome
+    unfold checkFullMirTraceWithin reconstructFullMirTraceWithin
+    rw [checkFullMirFinishWithin_eq]
+    cases finishFullMirTraceWithin body intra st outcome <;> rfl
+  | cons ev rest ih =>
+    intro outcome
+    unfold checkFullMirTraceWithin reconstructFullMirTraceWithin
+    rw [stepFullMirEventFastWithin_eq]
+    cases stepFullMirEventWithin body intra st ev with
+    | none => rfl
+    | some pair =>
+      rcases pair with ⟨e, st'⟩
+      dsimp only [Option.map]
+      rw [ih st' outcome]
+      cases reconstructFullMirTraceWithin body intra st' rest outcome <;> rfl
+
+/-- Exact agreement between `checkFullMirTraceAuto` and
+`(reconstructFullMirTraceAuto ...).isSome`. -/
+theorem checkFullMirTraceAuto_eq
+    (body : CapturedMir) (inlinedCallees : List CapturedMir) (st : MirExecState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    checkFullMirTraceAuto body inlinedCallees st events outcome =
+      (reconstructFullMirTraceAuto body inlinedCallees st events outcome).isSome :=
+  checkFullMirTraceWithin_eq body (defaultIntraEventSteps body inlinedCallees)
     st events outcome
 
 theorem stepFullMirEventWithin_sound (body : CapturedMir) :
@@ -8195,16 +8377,18 @@ theorem stepFullMirEventWithin_sound (body : CapturedMir) :
       · cases callReq with
         | call req =>
           simp only [h_step] at h_ok
+          dsimp only [elimMirVis] at h_ok
           cases h_imp :
               findActiveCallImpurePtrArgIdx?
                 (execStateActiveBody body st) (execStateCursor st).1 req with
-          | some _ => simp only [h_imp] at h_ok; nomatch h_ok
+          | some _ => rw [h_imp] at h_ok; nomatch h_ok
           | none =>
-            simp only [h_imp] at h_ok
+            rw [h_imp] at h_ok
+            dsimp only at h_ok
             cases h_match : matchCallObservedEvent req ev with
-            | none => simp only [h_match] at h_ok; nomatch h_ok
+            | none => rw [h_match] at h_ok; nomatch h_ok
             | some ans =>
-              simp only [h_match] at h_ok
+              rw [h_match] at h_ok
               cases h_ok
               rw [h_step] at h_obs
               dsimp only [ITreeF.map] at h_obs
@@ -8427,6 +8611,7 @@ theorem stepFullMirEventWithin_checkFullMirTraceFast (body : CapturedMir) :
           | silent => simp only [h_step] at h_seg; nomatch h_seg
           | event tag =>
             simp only [h_step] at h_seg ⊢
+            dsimp only [elimMirVis] at h_seg
             cases ev with
             | branch expectedTag =>
               dsimp only at h_seg ⊢
@@ -8436,20 +8621,24 @@ theorem stepFullMirEventWithin_checkFullMirTraceFast (body : CapturedMir) :
               · cases h_seg
                 exact checkFullMirTraceFast_mono body _ rest outcome h_rest
                   (Nat.le_add_left g fuel')
-            | _ => nomatch h_seg
+            | extCall _ _ _ => nomatch h_seg
+            | extCallPanic _ _ => nomatch h_seg
+            | extCallAbort _ _ => nomatch h_seg
       · cases callReq with
         | call req =>
           simp only [h_step] at h_seg ⊢
+          dsimp only [elimMirVis] at h_seg
           cases h_imp :
               findActiveCallImpurePtrArgIdx?
                 (execStateActiveBody body st) (execStateCursor st).1 req with
-          | some _ => simp only [h_imp] at h_seg; nomatch h_seg
+          | some _ => rw [h_imp] at h_seg; nomatch h_seg
           | none =>
-            simp only [h_imp] at h_seg ⊢
+            rw [h_imp] at h_seg
+            dsimp only at h_seg ⊢
             cases h_match : matchCallObservedEvent req ev with
-            | none => simp only [h_match] at h_seg; nomatch h_seg
+            | none => rw [h_match] at h_seg; nomatch h_seg
             | some ans =>
-              simp only [h_match] at h_seg ⊢
+              rw [h_match] at h_seg
               cases h_seg
               exact checkFullMirTraceFast_mono body _ rest outcome h_rest
                 (Nat.le_add_left g fuel')
@@ -8532,13 +8721,203 @@ theorem reconstructFullMirTraceAuto_checkFullMirTraceFast
   | some p =>
     exact reconstructFullMirTraceWithin_checkFullMirTraceFast body _ st events outcome p h_rec
 
+/-- Kleene budget monotonicity of the boolean observation-driven checker
+`checkFullMirTraceWithin`. -/
+theorem checkFullMirTraceWithin_mono (body : CapturedMir) {m n : Nat}
+    (h_le : m ≤ n) (st : MirExecState) (events : List ObservedEvent)
+    (outcome : ObservedOutcome)
+    (h_ok : checkFullMirTraceWithin body m st events outcome = true) :
+    checkFullMirTraceWithin body n st events outcome = true := by
+  rw [checkFullMirTraceWithin_eq] at h_ok ⊢
+  cases h_rec : reconstructFullMirTraceWithin body m st events outcome with
+  | none => rw [h_rec] at h_ok; nomatch h_ok
+  | some p =>
+    rw [reconstructFullMirTraceWithin_mono body h_le st events outcome p h_rec]
+    rfl
+
+/-- Soundness of the boolean observation-driven checker `checkFullMirTraceWithin`. -/
+theorem checkFullMirTraceWithin_sound
+    (body : CapturedMir) (intra : Nat) (st : MirExecState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_ok : checkFullMirTraceWithin body intra st events outcome = true) :
+    ∃ tr out,
+      MatchesObservedEvents events tr ∧
+      MatchesObservedOutcome outcome out ∧
+      ReachesRet (ITree.cofix (stepMirState body) st) tr out := by
+  rw [checkFullMirTraceWithin_eq] at h_ok
+  cases h_rec : reconstructFullMirTraceWithin body intra st events outcome with
+  | none => rw [h_rec] at h_ok; nomatch h_ok
+  | some p =>
+    exact ⟨p.1, p.2,
+      reconstructFullMirTraceWithin_sound body intra st events outcome p.1 p.2 h_rec⟩
+
+/-- Soundness of the fuel-free boolean observation-driven checker `checkFullMirTraceAuto`. -/
+theorem checkFullMirTraceAuto_sound
+    (body : CapturedMir) (inlinedCallees : List CapturedMir) (st : MirExecState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_ok : checkFullMirTraceAuto body inlinedCallees st events outcome = true) :
+    ∃ tr out,
+      MatchesObservedEvents events tr ∧
+      MatchesObservedOutcome outcome out ∧
+      ReachesRet (ITree.cofix (stepMirState body) st) tr out :=
+  checkFullMirTraceWithin_sound body _ st events outcome h_ok
+
+/-- `checkFullMirTraceAuto` acceptance implies `checkFullMirTraceFast` acceptance at
+`defaultTraceSteps`. -/
+theorem checkFullMirTraceAuto_checkFullMirTraceFast
+    (body : CapturedMir) (inlinedCallees : List CapturedMir) (st : MirExecState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_ok : checkFullMirTraceAuto body inlinedCallees st events outcome = true) :
+    checkFullMirTraceFast (defaultTraceSteps body inlinedCallees events)
+      body st events outcome = true := by
+  rw [checkFullMirTraceAuto_eq] at h_ok
+  exact reconstructFullMirTraceAuto_checkFullMirTraceFast
+    body inlinedCallees st events outcome h_ok
+
+private def checkFullMirTraceWithinCur (body : CapturedMir) (curBudget intra : Nat)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) : Bool :=
+  match events with
+  | [] => checkFullMirFinishWithin body curBudget st outcome
+  | ev :: rest =>
+    match stepFullMirEventFastWithin body curBudget st ev with
+    | some st' => checkFullMirTraceWithin body intra st' rest outcome
+    | none => false
+
+private theorem checkFullMirTraceWithinCur_self (body : CapturedMir) (intra : Nat)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    checkFullMirTraceWithinCur body intra intra st events outcome =
+      checkFullMirTraceWithin body intra st events outcome := by
+  cases events <;> rfl
+
+private theorem checkFullMirTraceFast_imp_within_aux (body : CapturedMir) :
+    ∀ (fuel curBudget intra : Nat),
+      fuel ≤ curBudget →
+      fuel ≤ intra →
+      ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+        checkFullMirTraceFast fuel body st events outcome = true →
+        checkFullMirTraceWithinCur body curBudget intra st events outcome = true := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _ _ _ _ _ _ h; nomatch h
+  | succ fuel' ih =>
+    intro curBudget intra h_cur h_intra st events outcome h_fast
+    cases curBudget with
+    | zero => omega
+    | succ cur' =>
+      have h_cur' : fuel' ≤ cur' := Nat.le_of_succ_le_succ h_cur
+      have h_intra' : fuel' ≤ intra := Nat.le_of_succ_le h_intra
+      unfold checkFullMirTraceFast at h_fast
+      cases h_step : stepMirState body st with
+      | ret out₀ =>
+        rw [h_step] at h_fast
+        cases events with
+        | nil =>
+          unfold checkFullMirTraceWithinCur checkFullMirFinishWithin
+          rw [h_step]
+          exact h_fast
+        | cons _ _ => nomatch h_fast
+      | tau st₁ =>
+        rw [h_step] at h_fast
+        cases events with
+        | nil =>
+          unfold checkFullMirTraceWithinCur checkFullMirFinishWithin
+          rw [h_step]
+          exact ih cur' intra h_cur' h_intra' st₁ [] outcome h_fast
+        | cons ev rest =>
+          unfold checkFullMirTraceWithinCur stepFullMirEventFastWithin
+          rw [h_step]
+          exact ih cur' intra h_cur' h_intra' st₁ (ev :: rest) outcome h_fast
+      | vis i k =>
+        rw [h_step] at h_fast
+        rcases i with f | (obsReq | callReq)
+        · cases f; nomatch h_fast
+        · cases obsReq with
+          | emit obs =>
+            cases obs with
+            | silent => nomatch h_fast
+            | event tag =>
+              cases events with
+              | nil => nomatch h_fast
+              | cons ev rest =>
+                cases ev with
+                | branch expectedTag =>
+                  unfold checkFullMirTraceWithinCur stepFullMirEventFastWithin
+                  rw [h_step]
+                  dsimp only [elimMirVis] at h_fast ⊢
+                  revert h_fast
+                  cases Nat.beq tag expectedTag <;> intro h_fast
+                  · nomatch h_fast
+                  · change checkFullMirTraceWithin body intra (k PUnit.unit) rest outcome = true
+                    rw [← checkFullMirTraceWithinCur_self]
+                    exact ih intra intra h_intra' h_intra' (k PUnit.unit) rest outcome h_fast
+                | extCall _ _ _ => nomatch h_fast
+                | extCallPanic _ _ => nomatch h_fast
+                | extCallAbort _ _ => nomatch h_fast
+        · cases callReq with
+          | call req =>
+            dsimp only at h_fast
+            cases h_imp :
+                findActiveCallImpurePtrArgIdx?
+                  (execStateActiveBody body st) (execStateCursor st).1 req with
+            | some _ => rw [h_imp] at h_fast; nomatch h_fast
+            | none =>
+              rw [h_imp] at h_fast
+              cases events with
+              | nil => nomatch h_fast
+              | cons ev rest =>
+                change
+                  (match matchCallObservedEvent req ev with
+                   | some ans => checkFullMirTraceFast fuel' body (k ans) rest outcome
+                   | none => false) = true at h_fast
+                unfold checkFullMirTraceWithinCur stepFullMirEventFastWithin
+                rw [h_step]
+                dsimp only [elimMirVis]
+                rw [h_imp]
+                dsimp only
+                cases h_match : matchCallObservedEvent req ev with
+                | none => rw [h_match] at h_fast; nomatch h_fast
+                | some ans =>
+                  rw [h_match] at h_fast
+                  change checkFullMirTraceWithin body intra (k ans) rest outcome = true
+                  rw [← checkFullMirTraceWithinCur_self]
+                  exact ih intra intra h_intra' h_intra' (k ans) rest outcome h_fast
+
+/-- Converse completeness from global-fuel `checkFullMirTraceFast` to observation-driven
+`checkFullMirTraceWithin`: any trace accepted in `fuel ≤ intra` total transitions uses
+at most `fuel ≤ intra` transitions per segment, so `checkFullMirTraceWithin` accepts it. -/
+theorem checkFullMirTraceFast_imp_within_of_le
+    (body : CapturedMir) {fuel intra : Nat} (h_le : fuel ≤ intra)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_fast : checkFullMirTraceFast fuel body st events outcome = true) :
+    checkFullMirTraceWithin body intra st events outcome = true := by
+  rw [← checkFullMirTraceWithinCur_self]
+  exact checkFullMirTraceFast_imp_within_aux body fuel intra intra
+    h_le h_le st events outcome h_fast
+
+/-- Converse completeness from `checkFullMirTraceFast` to
+`reconstructFullMirTraceWithin` when `fuel ≤ intra`. -/
+theorem reconstructFullMirTraceWithin_isSome_of_checkFullMirTraceFast_le
+    (body : CapturedMir) {fuel intra : Nat} (h_le : fuel ≤ intra)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_fast : checkFullMirTraceFast fuel body st events outcome = true) :
+    (reconstructFullMirTraceWithin body intra st events outcome).isSome = true := by
+  rw [← checkFullMirTraceWithin_eq]
+  exact checkFullMirTraceFast_imp_within_of_le body h_le st events outcome h_fast
+
 /-- Fuel-free full (`MirObsE` + `MirCallE`) trace checker (`checkBranches = true`),
-replaying `events` observation-driven from `s` with the automatic per-segment budget
-derived from `body` and the transparent callees `s.memory.callees`. -/
+replaying `events` observation-driven and tail-recursively from `s` with the automatic
+per-segment budget derived from `body` and the transparent callees `s.memory.callees`. -/
 @[reducible]
 def checkFullObservedTrace (body : CapturedMir) (s : MachineState)
     (events : List ObservedEvent) (outcome : ObservedOutcome) : Bool :=
-  (reconstructFullMirTraceAuto body s.memory.callees (.running s) events outcome).isSome
+  checkFullMirTraceAuto body s.memory.callees (.running s) events outcome
+
+theorem checkFullObservedTrace_eq_reconstructAuto
+    (body : CapturedMir) (s : MachineState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    checkFullObservedTrace body s events outcome =
+      (reconstructFullMirTraceAuto body s.memory.callees (.running s) events outcome).isSome :=
+  checkFullMirTraceAuto_eq body s.memory.callees (.running s) events outcome
 
 /-- Fuel-free soundness of `checkFullObservedTrace`. -/
 theorem checkFullObservedTrace_sound
@@ -8548,13 +8927,8 @@ theorem checkFullObservedTrace_sound
     ∃ tr out,
       MatchesObservedEvents events tr ∧
       MatchesObservedOutcome outcome out ∧
-      ReachesRet (mirTree body s) tr out := by
-  unfold checkFullObservedTrace at h_ok
-  cases h_rec : reconstructFullMirTraceAuto body s.memory.callees (.running s) events outcome with
-  | none => rw [h_rec] at h_ok; nomatch h_ok
-  | some p =>
-    exact ⟨p.1, p.2,
-      reconstructFullMirTraceAuto_sound body _ (.running s) events outcome p.1 p.2 h_rec⟩
+      ReachesRet (mirTree body s) tr out :=
+  checkFullMirTraceAuto_sound body s.memory.callees (.running s) events outcome h_ok
 
 /-- `checkFullObservedTrace` acceptance implies `checkFullObservedTraceBounded`
 acceptance at the automatic global budget `defaultTraceSteps`. -/
@@ -8565,7 +8939,18 @@ theorem checkFullObservedTrace_imp_bounded
     checkFullObservedTraceBounded (defaultTraceSteps body s.memory.callees events)
       body s events outcome = true := by
   rw [checkFullObservedTraceBounded_eq_fast]
-  exact reconstructFullMirTraceAuto_checkFullMirTraceFast body _ (.running s) events outcome h_ok
+  exact checkFullMirTraceAuto_checkFullMirTraceFast body _ (.running s) events outcome h_ok
+
+/-- Converse: `checkFullObservedTraceBounded` acceptance at `fuel ≤ defaultIntraEventSteps`
+implies fuel-free `checkFullObservedTrace` acceptance. -/
+theorem checkFullObservedTraceBounded_imp_fuelFree_of_le
+    (body : CapturedMir) (s : MachineState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome) {fuel : Nat}
+    (h_le : fuel ≤ defaultIntraEventSteps body s.memory.callees)
+    (h_ok : checkFullObservedTraceBounded fuel body s events outcome = true) :
+    checkFullObservedTrace body s events outcome = true := by
+  rw [checkFullObservedTraceBounded_eq_fast] at h_ok
+  exact checkFullMirTraceFast_imp_within_of_le body h_le (.running s) events outcome h_ok
 
 /-- Fuel-free branch-erased (`MirCallE`-only) trace checker (`checkBranches = false`)
 with the automatic global budget `defaultObsErasedTraceSteps`. -/
@@ -8614,8 +8999,8 @@ def checkObservedTraceConsistency (checkBranches : Bool) (body : CapturedMir)
     { trace.initMem with callees := trace.inlinedCallees }
   match checkBranches with
   | true =>
-    (reconstructFullMirTraceAuto body trace.inlinedCallees (.running s)
-      trace.events trace.outcome).isSome
+    checkFullMirTraceAuto body trace.inlinedCallees (.running s)
+      trace.events trace.outcome
   | false =>
     checkObsErasedObservedTraceBounded
       (defaultObsErasedTraceSteps body trace.inlinedCallees trace.events)
@@ -8631,8 +9016,8 @@ def checkObservedTraceWithCallees (checkBranches : Bool) (body : CapturedMir)
     trace.inlinedCallees
   match checkBranches with
   | true =>
-    (reconstructFullMirTraceAuto body trace.inlinedCallees (.running s)
-      trace.events trace.outcome).isSome
+    checkFullMirTraceAuto body trace.inlinedCallees (.running s)
+      trace.events trace.outcome
   | false =>
     checkObsErasedObservedTraceBounded
       (defaultObsErasedTraceSteps body trace.inlinedCallees trace.events)
@@ -8695,21 +9080,12 @@ theorem checkRawByteTraceFull_sound
   | none => rw [h_dec] at h_ok; nomatch h_ok
   | some obsTrace =>
     rw [h_dec] at h_ok
-    cases h_rec :
-        reconstructFullMirTraceAuto rootBody obsTrace.inlinedCallees
-          (.running (initMachineStateWithMemory rootBody obsTrace.args
-            { obsTrace.initMem with callees := obsTrace.inlinedCallees }))
-          obsTrace.events obsTrace.outcome with
-    | none =>
-      change (reconstructFullMirTraceAuto rootBody obsTrace.inlinedCallees
-          (.running (initMachineStateWithMemory rootBody obsTrace.args
-            { obsTrace.initMem with callees := obsTrace.inlinedCallees }))
-          obsTrace.events obsTrace.outcome).isSome = true at h_ok
-      rw [h_rec] at h_ok; nomatch h_ok
-    | some p =>
-      rcases reconstructFullMirTraceAuto_sound rootBody _ _ obsTrace.events
-          obsTrace.outcome p.1 p.2 h_rec with ⟨h_evs, h_out, h_reach⟩
-      exact ⟨obsTrace, p.1, p.2, rfl, h_evs, h_out, h_reach⟩
+    rcases checkFullMirTraceAuto_sound rootBody obsTrace.inlinedCallees
+        (.running (initMachineStateWithMemory rootBody obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees }))
+        obsTrace.events obsTrace.outcome h_ok with
+      ⟨tr, out, h_evs, h_out, h_reach⟩
+    exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
 
 /-- Fuel-free end-to-end soundness of `checkRawByteTraceObsErased`: lifts directly
 into fuel-free `ReachesRet (mirObsErasedStatefulTree ...)` with no `fuel` parameter. -/
@@ -8754,21 +9130,12 @@ theorem checkRawByteTraceWithCalleesFull_sound
   | none => rw [h_dec] at h_ok; nomatch h_ok
   | some obsTrace =>
     rw [h_dec] at h_ok
-    cases h_rec :
-        reconstructFullMirTraceAuto rootBody obsTrace.inlinedCallees
-          (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
-            obsTrace.initMem obsTrace.inlinedCallees))
-          obsTrace.events obsTrace.outcome with
-    | none =>
-      change (reconstructFullMirTraceAuto rootBody obsTrace.inlinedCallees
-          (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
-            obsTrace.initMem obsTrace.inlinedCallees))
-          obsTrace.events obsTrace.outcome).isSome = true at h_ok
-      rw [h_rec] at h_ok; nomatch h_ok
-    | some p =>
-      rcases reconstructFullMirTraceAuto_sound rootBody _ _ obsTrace.events
-          obsTrace.outcome p.1 p.2 h_rec with ⟨h_evs, h_out, h_reach⟩
-      exact ⟨obsTrace, p.1, p.2, rfl, h_evs, h_out, h_reach⟩
+    rcases checkFullMirTraceAuto_sound rootBody obsTrace.inlinedCallees
+        (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
+          obsTrace.initMem obsTrace.inlinedCallees))
+        obsTrace.events obsTrace.outcome h_ok with
+      ⟨tr, out, h_evs, h_out, h_reach⟩
+    exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
 
 /-- Fuel-free end-to-end soundness of `checkRawByteTraceWithCalleesObsErased`. -/
 theorem checkRawByteTraceWithCalleesObsErased_sound
@@ -8835,11 +9202,32 @@ theorem checkRawByteTraceFull_imp_bounded
     rw [h_dec] at h_ok
     have h_len := decodeRawByteTrace_events_length h_dec
     have h_cal := decodeRawByteTrace_inlinedCallees h_dec
-    have h_auto := reconstructFullMirTraceAuto_checkFullMirTraceFast rootBody _ _
+    have h_auto := checkFullMirTraceAuto_checkFullMirTraceFast rootBody _ _
       obsTrace.events obsTrace.outcome h_ok
     unfold defaultRawTraceSteps
     rw [← h_len, ← h_cal]
     exact h_auto
+
+/-- Converse: `checkRawByteTraceFullBounded` acceptance at `fuel ≤ defaultIntraEventSteps`
+implies fuel-free `checkRawByteTraceFull` acceptance. -/
+theorem checkRawByteTraceFullBounded_imp_fuelFree_of_le
+    {fuel : Nat} (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_le : fuel ≤ defaultIntraEventSteps rootBody rawTrace.inlinedCallees)
+    (h_ok : checkRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace = true) :
+    checkRawByteTraceFull rootBody calleeSigs table rawTrace = true := by
+  rw [← checkRawByteTraceFullBoundedFast_eq] at h_ok
+  unfold checkRawByteTraceFullBoundedFast at h_ok
+  unfold checkRawByteTraceFull
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    have h_cal := decodeRawByteTrace_inlinedCallees h_dec
+    have h_le' : fuel ≤ defaultIntraEventSteps rootBody obsTrace.inlinedCallees := by
+      rw [h_cal]
+      exact h_le
+    exact checkFullMirTraceFast_imp_within_of_le rootBody h_le' _ _ _ h_ok
 
 /-- The fuel-free `WithCallees` full check implies the `*Bounded` check at the
 automatic global budget `defaultRawTraceSteps`. -/
@@ -8858,11 +9246,34 @@ theorem checkRawByteTraceWithCalleesFull_imp_bounded
     rw [h_dec] at h_ok
     have h_len := decodeRawByteTrace_events_length h_dec
     have h_cal := decodeRawByteTrace_inlinedCallees h_dec
-    have h_auto := reconstructFullMirTraceAuto_checkFullMirTraceFast rootBody _ _
+    have h_auto := checkFullMirTraceAuto_checkFullMirTraceFast rootBody _ _
       obsTrace.events obsTrace.outcome h_ok
     unfold defaultRawTraceSteps
     rw [← h_len, ← h_cal]
     exact h_auto
+
+/-- Converse: `checkRawByteTraceWithCalleesFullBounded` acceptance at
+`fuel ≤ defaultIntraEventSteps` implies fuel-free `checkRawByteTraceWithCalleesFull`
+acceptance. -/
+theorem checkRawByteTraceWithCalleesFullBounded_imp_fuelFree_of_le
+    {fuel : Nat} (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_le : fuel ≤ defaultIntraEventSteps rootBody rawTrace.inlinedCallees)
+    (h_ok :
+      checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace = true) :
+    checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace = true := by
+  rw [← checkRawByteTraceWithCalleesFullBoundedFast_eq] at h_ok
+  unfold checkRawByteTraceWithCalleesFullBoundedFast at h_ok
+  unfold checkRawByteTraceWithCalleesFull
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    have h_cal := decodeRawByteTrace_inlinedCallees h_dec
+    have h_le' : fuel ≤ defaultIntraEventSteps rootBody obsTrace.inlinedCallees := by
+      rw [h_cal]
+      exact h_le
+    exact checkFullMirTraceFast_imp_within_of_le rootBody h_le' _ _ _ h_ok
 
 /-- The fuel-free branch-erased check is exactly the `*Bounded` check at the automatic
 global budget `defaultRawObsErasedTraceSteps`. -/
@@ -8943,10 +9354,525 @@ theorem checkRawByteTraceWithCalleesFull_obsErased_sound
     (checkRawByteTraceWithCalleesObsErasedBounded_of_full _ rootBody calleeSigs table rawTrace
       (checkRawByteTraceWithCalleesFull_imp_bounded rootBody calleeSigs table rawTrace h_ok))
 
-/-- Fuel-free diagnostic replay for `checkRawByteTraceFull`: `diagnoseRawByteTraceFullBounded`
-at the automatic global budget `defaultRawTraceSteps`. -/
+/-- Diagnostic replay of one observation-driven segment (`checkBranches = true`)
+within `fuel` transitions, reporting the exact `TraceReplayDiag` on divergence. -/
+@[reducible]
+def diagnoseStepFullMirEventWithin (body : CapturedMir) :
+    Nat → MirExecState → ObservedEvent → Nat →
+      Except TraceReplayDiag (Event MirEffect × MirExecState)
+  | 0, st, _, _ =>
+    let cur := execStateCursor st
+    .error (.outOfFuel cur.1 cur.2)
+  | fuel + 1, st, ev, remCount =>
+    match stepMirState body st with
+    | .ret _ => .error (.unconsumedEventsRemaining remCount)
+    | .tau st' => diagnoseStepFullMirEventWithin body fuel st' ev remCount
+    | .vis i k =>
+      elimMirVis
+        (fun kind _ =>
+          let cur := execStateCursor st
+          .error (.stepFaulted kind cur.1 cur.2))
+        (fun _ =>
+          let cur := execStateCursor st
+          .error (.stepFaulted .unsupported cur.1 cur.2))
+        (fun actualTag kObs =>
+          let cur := execStateCursor st
+          match ev with
+          | .branch expectedTag =>
+            if Nat.beq actualTag expectedTag then
+              .ok (⟨.inr (.inl (.emit (.event actualTag))), PUnit.unit⟩, kObs PUnit.unit)
+            else
+              .error (.branchTagMismatch actualTag expectedTag cur.1)
+          | _ => .error (.branchTagMismatch actualTag 0 cur.1))
+        (fun req kCall =>
+          let blockIdx := (execStateCursor st).1
+          let activeBody := execStateActiveBody body st
+          match findActiveCallImpurePtrArgIdx? activeBody blockIdx req with
+          | some argIdx => .error (.impureExtCallPtrArg req.defPath 0 argIdx)
+          | none =>
+            match diagnoseCallObservedEvent req blockIdx ev with
+            | .error diag => .error diag
+            | .ok ans => .ok (⟨.inr (.inr (.call req)), ans⟩, kCall ans))
+        i k
+
+/-- Allocation-free diagnostic replay of one observation-driven segment
+(`checkBranches = true`) within `fuel` transitions. -/
+@[reducible]
+def diagnoseStepFullMirEventFastWithin (body : CapturedMir) :
+    Nat → MirExecState → ObservedEvent → Nat → Except TraceReplayDiag MirExecState
+  | 0, st, _, _ =>
+    let cur := execStateCursor st
+    .error (.outOfFuel cur.1 cur.2)
+  | fuel + 1, st, ev, remCount =>
+    match stepMirState body st with
+    | .ret _ => .error (.unconsumedEventsRemaining remCount)
+    | .tau st' => diagnoseStepFullMirEventFastWithin body fuel st' ev remCount
+    | .vis i k =>
+      elimMirVis
+        (fun kind _ =>
+          let cur := execStateCursor st
+          .error (.stepFaulted kind cur.1 cur.2))
+        (fun _ =>
+          let cur := execStateCursor st
+          .error (.stepFaulted .unsupported cur.1 cur.2))
+        (fun actualTag kObs =>
+          let cur := execStateCursor st
+          match ev with
+          | .branch expectedTag =>
+            if Nat.beq actualTag expectedTag then
+              .ok (kObs PUnit.unit)
+            else
+              .error (.branchTagMismatch actualTag expectedTag cur.1)
+          | _ => .error (.branchTagMismatch actualTag 0 cur.1))
+        (fun req kCall =>
+          let blockIdx := (execStateCursor st).1
+          let activeBody := execStateActiveBody body st
+          match findActiveCallImpurePtrArgIdx? activeBody blockIdx req with
+          | some argIdx => .error (.impureExtCallPtrArg req.defPath 0 argIdx)
+          | none =>
+            match diagnoseCallObservedEvent req blockIdx ev with
+            | .error diag => .error diag
+            | .ok ans => .ok (kCall ans))
+        i k
+
+/-- Diagnostic replay of the final silent segment (`events = []`) within `fuel`
+transitions. -/
+@[reducible]
+def diagnoseFinishFullMirTraceWithin (body : CapturedMir) :
+    Nat → MirExecState → ObservedOutcome → TraceReplayDiag
+  | 0, st, _ =>
+    let cur := execStateCursor st
+    .outOfFuel cur.1 cur.2
+  | fuel + 1, st, outcome =>
+    match stepMirState body st with
+    | .ret actualOut =>
+      if checkOutcomeMatches outcome actualOut then
+        .ok [] actualOut
+      else
+        .outcomeMismatch actualOut outcome
+    | .tau st' => diagnoseFinishFullMirTraceWithin body fuel st' outcome
+    | .vis i k =>
+      elimMirVis
+        (fun kind _ =>
+          let cur := execStateCursor st
+          .stepFaulted kind cur.1 cur.2)
+        (fun _ =>
+          let cur := execStateCursor st
+          .stepFaulted .unsupported cur.1 cur.2)
+        (fun actualTag _ =>
+          let cur := execStateCursor st
+          .branchTagMismatch actualTag 0 cur.1)
+        (fun req _ =>
+          let blockIdx := (execStateCursor st).1
+          let activeBody := execStateActiveBody body st
+          match findActiveCallImpurePtrArgIdx? activeBody blockIdx req with
+          | some argIdx => .impureExtCallPtrArg req.defPath 0 argIdx
+          | none => .unexpectedExtCall req.defPath blockIdx)
+        i k
+
+/-- Observation-driven diagnostic replay (`checkBranches = true`) recursing
+structurally on `events : List ObservedEvent` with per-segment budget `intra`. -/
+@[reducible]
+def diagnoseFullMirTraceWithin (body : CapturedMir) (intra : Nat) :
+    MirExecState → List ObservedEvent → ObservedOutcome → TraceReplayDiag
+  | st, [], outcome => diagnoseFinishFullMirTraceWithin body intra st outcome
+  | st, ev :: rest, outcome =>
+    match diagnoseStepFullMirEventWithin body intra st ev (ev :: rest).length with
+    | .error diag => diag
+    | .ok (e, st') =>
+      match diagnoseFullMirTraceWithin body intra st' rest outcome with
+      | .ok trRest out => .ok (e :: trRest) out
+      | diag => diag
+
+/-- Tail-recursive, allocation-free observation-driven diagnostic replay
+(`checkBranches = true`) recursing structurally on `events : List ObservedEvent`
+with per-segment budget `intra`. -/
+@[reducible]
+def diagnoseFullMirTraceFastWithin (body : CapturedMir) (intra : Nat) :
+    MirExecState → List ObservedEvent → ObservedOutcome → TraceReplayDiag
+  | st, [], outcome => diagnoseFinishFullMirTraceWithin body intra st outcome
+  | st, ev :: rest, outcome =>
+    match diagnoseStepFullMirEventFastWithin body intra st ev (ev :: rest).length with
+    | .error diag => diag
+    | .ok st' => diagnoseFullMirTraceFastWithin body intra st' rest outcome
+
+/-- Fuel-free observation-driven diagnostic replay (`checkBranches = true`) with
+per-segment budget `defaultIntraEventSteps body inlinedCallees`. -/
+@[reducible]
+def diagnoseFullMirTraceAuto (body : CapturedMir) (inlinedCallees : List CapturedMir)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    TraceReplayDiag :=
+  diagnoseFullMirTraceWithin body (defaultIntraEventSteps body inlinedCallees)
+    st events outcome
+
+/-- Tail-recursive, allocation-free fuel-free observation-driven diagnostic replay
+(`checkBranches = true`). -/
+@[reducible]
+def diagnoseFullMirTraceFastAuto (body : CapturedMir) (inlinedCallees : List CapturedMir)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    TraceReplayDiag :=
+  diagnoseFullMirTraceFastWithin body (defaultIntraEventSteps body inlinedCallees)
+    st events outcome
+
+theorem diagnoseStepFullMirEventWithin_toOption (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (ev : ObservedEvent) (remCount : Nat),
+      (diagnoseStepFullMirEventWithin body fuel st ev remCount).toOption =
+        stepFullMirEventWithin body fuel st ev := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _ _; rfl
+  | succ fuel' ih =>
+    intro st ev remCount
+    unfold diagnoseStepFullMirEventWithin stepFullMirEventWithin
+    cases stepMirState body st with
+    | ret _ => rfl
+    | tau st' => exact ih st' ev remCount
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => rfl
+          | event actualTag =>
+            dsimp only [elimMirVis]
+            cases ev with
+            | branch expectedTag =>
+              dsimp only
+              cases Nat.beq actualTag expectedTag <;> rfl
+            | _ => rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [elimMirVis]
+          cases findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            have hmatch := diagnoseCallObservedEvent_toOption req (execStateCursor st).1 ev
+            cases hd : diagnoseCallObservedEvent req (execStateCursor st).1 ev with
+            | error _ =>
+              rw [hd] at hmatch
+              rw [← hmatch]
+              rfl
+            | ok ans =>
+              rw [hd] at hmatch
+              rw [← hmatch]
+              rfl
+
+theorem diagnoseStepFullMirEventWithin_error_not_ok (body : CapturedMir) :
+    ∀ {fuel : Nat} {st : MirExecState} {ev : ObservedEvent} {remCount : Nat}
+      {d : TraceReplayDiag},
+      diagnoseStepFullMirEventWithin body fuel st ev remCount = .error d →
+      d.isOk = false := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro _ _ _ d h
+    injection h with h; subst h; rfl
+  | succ fuel' ih =>
+    intro st ev remCount d h
+    unfold diagnoseStepFullMirEventWithin at h
+    cases hs : stepMirState body st with
+    | ret _ =>
+      rw [hs] at h; injection h with h; subst h; rfl
+    | tau st' =>
+      rw [hs] at h; exact ih h
+    | vis i k =>
+      rw [hs] at h
+      rcases i with f | (obsReq | callReq)
+      · cases f; injection h with h; subst h; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => injection h with h; subst h; rfl
+          | event actualTag =>
+            dsimp only [elimMirVis] at h
+            cases ev with
+            | branch expectedTag =>
+              dsimp only at h
+              revert h
+              cases Nat.beq actualTag expectedTag <;> intro h
+              · injection h with h; subst h; rfl
+              · nomatch h
+            | extCall _ _ _ => injection h with h; subst h; rfl
+            | extCallPanic _ _ => injection h with h; subst h; rfl
+            | extCallAbort _ _ => injection h with h; subst h; rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [elimMirVis] at h
+          cases h_imp : findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req with
+          | some _ =>
+            rw [h_imp] at h; injection h with h; subst h; rfl
+          | none =>
+            rw [h_imp] at h
+            dsimp only at h
+            cases hd : diagnoseCallObservedEvent req (execStateCursor st).1 ev with
+            | error d' =>
+              rw [hd] at h; injection h with h; subst h
+              exact diagnoseCallObservedEvent_error_not_ok hd
+            | ok _ =>
+              rw [hd] at h; nomatch h
+
+theorem diagnoseStepFullMirEventFastWithin_eq (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (ev : ObservedEvent) (remCount : Nat),
+      diagnoseStepFullMirEventFastWithin body fuel st ev remCount =
+        (diagnoseStepFullMirEventWithin body fuel st ev remCount).map Prod.snd := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _ _; rfl
+  | succ fuel' ih =>
+    intro st ev remCount
+    unfold diagnoseStepFullMirEventFastWithin diagnoseStepFullMirEventWithin
+    cases stepMirState body st with
+    | ret _ => rfl
+    | tau st' => exact ih st' ev remCount
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => rfl
+          | event actualTag =>
+            dsimp only [elimMirVis]
+            cases ev with
+            | branch expectedTag =>
+              dsimp only
+              cases Nat.beq actualTag expectedTag <;> rfl
+            | _ => rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [elimMirVis]
+          cases findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            cases diagnoseCallObservedEvent req (execStateCursor st).1 ev <;> rfl
+
+theorem diagnoseFinishFullMirTraceWithin_isOk (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (outcome : ObservedOutcome),
+      (diagnoseFinishFullMirTraceWithin body fuel st outcome).isOk =
+        checkFullMirFinishWithin body fuel st outcome := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _; rfl
+  | succ fuel' ih =>
+    intro st outcome
+    unfold diagnoseFinishFullMirTraceWithin checkFullMirFinishWithin
+    cases stepMirState body st with
+    | ret actualOut =>
+      dsimp only
+      cases checkOutcomeMatches outcome actualOut <;> rfl
+    | tau st' => exact ih st' outcome
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs <;> rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [elimMirVis]
+          cases findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req <;> rfl
+
+theorem diagnoseFinishFullMirTraceWithin_eraseTrace (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (outcome : ObservedOutcome),
+      (diagnoseFinishFullMirTraceWithin body fuel st outcome).eraseTrace =
+        diagnoseFinishFullMirTraceWithin body fuel st outcome := by
+  intro fuel
+  induction fuel with
+  | zero => intro _ _; rfl
+  | succ fuel' ih =>
+    intro st outcome
+    unfold diagnoseFinishFullMirTraceWithin
+    cases stepMirState body st with
+    | ret actualOut =>
+      dsimp only
+      cases checkOutcomeMatches outcome actualOut <;> rfl
+    | tau st' => exact ih st' outcome
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs <;> rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [elimMirVis]
+          cases findActiveCallImpurePtrArgIdx?
+              (execStateActiveBody body st) (execStateCursor st).1 req <;> rfl
+
+/-- Exact agreement between `diagnoseFullMirTraceWithin` and
+`checkFullMirTraceWithin` at every per-segment budget `intra`. -/
+theorem diagnoseFullMirTraceWithin_isOk (body : CapturedMir) (intra : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      (diagnoseFullMirTraceWithin body intra st events outcome).isOk =
+        checkFullMirTraceWithin body intra st events outcome := by
+  intro st events
+  induction events generalizing st with
+  | nil =>
+    intro outcome
+    unfold diagnoseFullMirTraceWithin checkFullMirTraceWithin
+    exact diagnoseFinishFullMirTraceWithin_isOk body intra st outcome
+  | cons ev rest ih =>
+    intro outcome
+    unfold diagnoseFullMirTraceWithin checkFullMirTraceWithin
+    rw [stepFullMirEventFastWithin_eq, ← diagnoseStepFullMirEventWithin_toOption body intra st ev (ev :: rest).length]
+    cases h_seg : diagnoseStepFullMirEventWithin body intra st ev (ev :: rest).length with
+    | error d =>
+      exact diagnoseStepFullMirEventWithin_error_not_ok body h_seg
+    | ok pair =>
+      rcases pair with ⟨e, st'⟩
+      dsimp only [Except.toOption, Option.map]
+      exact (diagnose_cons_ok_isOk e
+        (diagnoseFullMirTraceWithin body intra st' rest outcome)).trans
+        (ih st' outcome)
+
+/-- Tail-recursive `diagnoseFullMirTraceFastWithin` equals `eraseTrace` of
+`diagnoseFullMirTraceWithin`. -/
+theorem diagnoseFullMirTraceFastWithin_eq (body : CapturedMir) (intra : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      diagnoseFullMirTraceFastWithin body intra st events outcome =
+        (diagnoseFullMirTraceWithin body intra st events outcome).eraseTrace := by
+  intro st events
+  induction events generalizing st with
+  | nil =>
+    intro outcome
+    unfold diagnoseFullMirTraceFastWithin diagnoseFullMirTraceWithin
+    exact (diagnoseFinishFullMirTraceWithin_eraseTrace body intra st outcome).symm
+  | cons ev rest ih =>
+    intro outcome
+    unfold diagnoseFullMirTraceFastWithin diagnoseFullMirTraceWithin
+    rw [diagnoseStepFullMirEventFastWithin_eq]
+    cases h_seg : diagnoseStepFullMirEventWithin body intra st ev (ev :: rest).length with
+    | error d =>
+      exact (TraceReplayDiag.eraseTrace_eq_self_of_not_isOk
+        (diagnoseStepFullMirEventWithin_error_not_ok body h_seg)).symm
+    | ok pair =>
+      rcases pair with ⟨e, st'⟩
+      dsimp only [Except.map]
+      rw [ih st' outcome]
+      cases diagnoseFullMirTraceWithin body intra st' rest outcome <;> rfl
+
+/-- Exact agreement between `diagnoseFullMirTraceAuto` and `checkFullMirTraceAuto`. -/
+theorem diagnoseFullMirTraceAuto_isOk
+    (body : CapturedMir) (inlinedCallees : List CapturedMir)
+    (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    (diagnoseFullMirTraceAuto body inlinedCallees st events outcome).isOk =
+      checkFullMirTraceAuto body inlinedCallees st events outcome :=
+  diagnoseFullMirTraceWithin_isOk body (defaultIntraEventSteps body inlinedCallees)
+    st events outcome
+
+/-- Fuel-free observation-driven diagnostic replay of a decoded `ObservedTrace`
+(`checkBranches = true`). -/
+@[reducible]
+def diagnoseFullObservedTrace (body : CapturedMir) (trace : ObservedTrace) :
+    TraceReplayDiag :=
+  let mem := { trace.initMem with callees := trace.inlinedCallees }
+  let s := initMachineStateWithMemory body trace.args mem
+  diagnoseFullMirTraceAuto body trace.inlinedCallees (.running s) trace.events trace.outcome
+
+/-- Fuel-free observation-driven diagnostic replay of a decoded `ObservedTrace`
+with `callees` (`checkBranches = true`). -/
+@[reducible]
+def diagnoseFullObservedTraceWithCallees (body : CapturedMir) (trace : ObservedTrace) :
+    TraceReplayDiag :=
+  let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
+  diagnoseFullMirTraceAuto body trace.inlinedCallees (.running s) trace.events trace.outcome
+
+/-- Tail-recursive allocation-free fuel-free diagnostic replay of a decoded
+`ObservedTrace` (`checkBranches = true`). -/
+@[reducible]
+def diagnoseFullObservedTraceFast (body : CapturedMir) (trace : ObservedTrace) :
+    TraceReplayDiag :=
+  let mem := { trace.initMem with callees := trace.inlinedCallees }
+  let s := initMachineStateWithMemory body trace.args mem
+  diagnoseFullMirTraceFastAuto body trace.inlinedCallees (.running s) trace.events trace.outcome
+
+/-- Tail-recursive allocation-free fuel-free diagnostic replay of a decoded
+`ObservedTrace` with `callees` (`checkBranches = true`). -/
+@[reducible]
+def diagnoseFullObservedTraceWithCalleesFast (body : CapturedMir) (trace : ObservedTrace) :
+    TraceReplayDiag :=
+  let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
+  diagnoseFullMirTraceFastAuto body trace.inlinedCallees (.running s) trace.events trace.outcome
+
+/-- Fuel-free diagnostic replay for `checkRawByteTraceFull`, recursing structurally
+on `events` with the automatic per-segment budget `defaultIntraEventSteps` so that
+`(diagnoseRawByteTraceFull ...).isOk = checkRawByteTraceFull ...` holds identically. -/
 @[reducible]
 def diagnoseRawByteTraceFull (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  match diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | .error argIdx => .decodeArgFailed argIdx
+  | .ok args =>
+    match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | .error diag => diag
+    | .ok events =>
+      match decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => .decodeOutcomeFailed
+      | some outcome =>
+        match
+          populateShadowPointerMemory
+            rootBody
+            (calleeSigs ++ rawTrace.inlinedCallees)
+            table
+            rawTrace.rawArgs
+            args
+            rawTrace.initMem
+        with
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+          diagnoseFullObservedTrace rootBody {
+            args := args
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+            inlinedCallees := rawTrace.inlinedCallees
+            events := events
+            outcome := outcome
+          }
+
+/-- Tail-recursive allocation-free fuel-free diagnostic replay for `checkRawByteTraceFull`. -/
+@[reducible]
+def diagnoseRawByteTraceFullFast (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  match diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | .error argIdx => .decodeArgFailed argIdx
+  | .ok args =>
+    match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | .error diag => diag
+    | .ok events =>
+      match decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => .decodeOutcomeFailed
+      | some outcome =>
+        match
+          populateShadowPointerMemory
+            rootBody
+            (calleeSigs ++ rawTrace.inlinedCallees)
+            table
+            rawTrace.rawArgs
+            args
+            rawTrace.initMem
+        with
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+          diagnoseFullObservedTraceFast rootBody {
+            args := args
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+            inlinedCallees := rawTrace.inlinedCallees
+            events := events
+            outcome := outcome
+          }
+
+/-- Global-budget fuel-free diagnostic replay (`diagnoseRawByteTraceFullBounded` at
+`defaultRawTraceSteps`). -/
+@[reducible]
+def diagnoseRawByteTraceFullGlobal (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
   diagnoseRawByteTraceFullBounded (defaultRawTraceSteps rootBody rawTrace)
     rootBody calleeSigs table rawTrace
@@ -8958,9 +9884,86 @@ def diagnoseRawByteTraceObsErased (rootBody : CapturedMir) (calleeSigs : List Ca
   diagnoseRawByteTraceObsErasedBounded (defaultRawObsErasedTraceSteps rootBody rawTrace)
     rootBody calleeSigs table rawTrace
 
-/-- Fuel-free diagnostic replay for `checkRawByteTraceWithCalleesFull`. -/
+/-- Tail-recursive allocation-free fuel-free diagnostic replay for `checkRawByteTraceObsErased`. -/
+@[reducible]
+def diagnoseRawByteTraceObsErasedFast (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  diagnoseRawByteTraceObsErasedBoundedFast (defaultRawObsErasedTraceSteps rootBody rawTrace)
+    rootBody calleeSigs table rawTrace
+
+/-- Fuel-free diagnostic replay for `checkRawByteTraceWithCalleesFull`, recursing
+structurally on `events` with the automatic per-segment budget `defaultIntraEventSteps`. -/
 @[reducible]
 def diagnoseRawByteTraceWithCalleesFull (rootBody : CapturedMir)
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  match diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | .error argIdx => .decodeArgFailed argIdx
+  | .ok args =>
+    match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | .error diag => diag
+    | .ok events =>
+      match decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => .decodeOutcomeFailed
+      | some outcome =>
+        match
+          populateShadowPointerMemory
+            rootBody
+            (calleeSigs ++ rawTrace.inlinedCallees)
+            table
+            rawTrace.rawArgs
+            args
+            rawTrace.initMem
+        with
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+          diagnoseFullObservedTraceWithCallees rootBody {
+            args := args
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+            inlinedCallees := rawTrace.inlinedCallees
+            events := events
+            outcome := outcome
+          }
+
+/-- Tail-recursive allocation-free fuel-free diagnostic replay for
+`checkRawByteTraceWithCalleesFull`. -/
+@[reducible]
+def diagnoseRawByteTraceWithCalleesFullFast (rootBody : CapturedMir)
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  match diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | .error argIdx => .decodeArgFailed argIdx
+  | .ok args =>
+    match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | .error diag => diag
+    | .ok events =>
+      match decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => .decodeOutcomeFailed
+      | some outcome =>
+        match
+          populateShadowPointerMemory
+            rootBody
+            (calleeSigs ++ rawTrace.inlinedCallees)
+            table
+            rawTrace.rawArgs
+            args
+            rawTrace.initMem
+        with
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+          diagnoseFullObservedTraceWithCalleesFast rootBody {
+            args := args
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+            inlinedCallees := rawTrace.inlinedCallees
+            events := events
+            outcome := outcome
+          }
+
+/-- Global-budget fuel-free `WithCallees` diagnostic replay. -/
+@[reducible]
+def diagnoseRawByteTraceWithCalleesFullGlobal (rootBody : CapturedMir)
     (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
     (rawTrace : RawByteTrace) : TraceReplayDiag :=
   diagnoseRawByteTraceWithCalleesFullBounded (defaultRawTraceSteps rootBody rawTrace)
@@ -8974,15 +9977,115 @@ def diagnoseRawByteTraceWithCalleesObsErased (rootBody : CapturedMir)
   diagnoseRawByteTraceWithCalleesObsErasedBounded
     (defaultRawObsErasedTraceSteps rootBody rawTrace) rootBody calleeSigs table rawTrace
 
+/-- Tail-recursive allocation-free fuel-free diagnostic replay for
+`checkRawByteTraceWithCalleesObsErased`. -/
+@[reducible]
+def diagnoseRawByteTraceWithCalleesObsErasedFast (rootBody : CapturedMir)
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  diagnoseRawByteTraceWithCalleesObsErasedBoundedFast
+    (defaultRawObsErasedTraceSteps rootBody rawTrace) rootBody calleeSigs table rawTrace
+
+/-- The fuel-free full diagnosis agrees identically with the fuel-free full check. -/
+theorem diagnoseRawByteTraceFull_isOk
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceFull rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceFull rootBody calleeSigs table rawTrace := by
+  unfold diagnoseRawByteTraceFull checkRawByteTraceFull decodeRawByteTrace
+  rw [← diagnoseDecodeFnArgs_toOption, ← diagnoseDecodeRawEventsAux_toOption calleeSigs table 0]
+  cases hargs : diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | error _ => rfl
+  | ok args =>
+    cases hevs : diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | error d => exact diagnoseDecodeRawEventsAux_error_not_ok hevs
+    | ok events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome =>
+        exact diagnoseFullMirTraceAuto_isOk rootBody rawTrace.inlinedCallees _ events outcome
+
+/-- The fuel-free `WithCallees` full diagnosis agrees identically with the fuel-free
+`WithCallees` full check. -/
+theorem diagnoseRawByteTraceWithCalleesFull_isOk
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace := by
+  unfold diagnoseRawByteTraceWithCalleesFull checkRawByteTraceWithCalleesFull decodeRawByteTrace
+  rw [← diagnoseDecodeFnArgs_toOption, ← diagnoseDecodeRawEventsAux_toOption calleeSigs table 0]
+  cases hargs : diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | error _ => rfl
+  | ok args =>
+    cases hevs : diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | error d => exact diagnoseDecodeRawEventsAux_error_not_ok hevs
+    | ok events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome =>
+        exact diagnoseFullMirTraceAuto_isOk rootBody rawTrace.inlinedCallees _ events outcome
+
+theorem diagnoseRawByteTraceFullFast_eq
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    diagnoseRawByteTraceFullFast rootBody calleeSigs table rawTrace =
+      (diagnoseRawByteTraceFull rootBody calleeSigs table rawTrace).eraseTrace := by
+  unfold diagnoseRawByteTraceFullFast diagnoseRawByteTraceFull
+  cases diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | error _ => rfl
+  | ok args =>
+    cases hevs : diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | error d =>
+      exact (TraceReplayDiag.eraseTrace_eq_self_of_not_isOk
+        (diagnoseDecodeRawEventsAux_error_not_ok hevs)).symm
+    | ok events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome =>
+        exact diagnoseFullMirTraceFastWithin_eq rootBody _ _ events outcome
+
+theorem diagnoseRawByteTraceFullFast_isOk
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceFullFast rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceFull rootBody calleeSigs table rawTrace := by
+  rw [diagnoseRawByteTraceFullFast_eq, TraceReplayDiag.isOk_eraseTrace,
+      diagnoseRawByteTraceFull_isOk]
+
+theorem diagnoseRawByteTraceFullFast_tagName
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceFullFast rootBody calleeSigs table rawTrace).tagName =
+      (diagnoseRawByteTraceFull rootBody calleeSigs table rawTrace).tagName := by
+  rw [diagnoseRawByteTraceFullFast_eq, TraceReplayDiag.tagName_eraseTrace]
+
+/-- Exact equivalence between an `"ok"` tag of `diagnoseRawByteTraceFull` and
+`checkRawByteTraceFull = true`. -/
+theorem diagnoseRawByteTraceFull_tag_ok_iff_check
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceFull rootBody calleeSigs table rawTrace).tagName = "ok" ↔
+      checkRawByteTraceFull rootBody calleeSigs table rawTrace = true := by
+  rw [← diagnoseRawByteTraceFull_isOk]
+  exact ⟨TraceReplayDiag.isOk_of_tagName_eq_ok, TraceReplayDiag.tagName_eq_ok_of_isOk⟩
+
+/-- Exact equivalence between an `"ok"` tag of `diagnoseRawByteTraceWithCalleesFull`
+and `checkRawByteTraceWithCalleesFull = true`. -/
+theorem diagnoseRawByteTraceWithCalleesFull_tag_ok_iff_check
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace).tagName = "ok" ↔
+      checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace = true := by
+  rw [← diagnoseRawByteTraceWithCalleesFull_isOk]
+  exact ⟨TraceReplayDiag.isOk_of_tagName_eq_ok, TraceReplayDiag.tagName_eq_ok_of_isOk⟩
+
 /-- A trace accepted by the fuel-free full check is diagnosed `"ok"`. -/
 theorem diagnoseRawByteTraceFull_tag_ok_of_check
     (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
     (h_ok : checkRawByteTraceFull rootBody calleeSigs table rawTrace = true) :
     (diagnoseRawByteTraceFull rootBody calleeSigs table rawTrace).tagName = "ok" :=
-  TraceReplayDiag.tagName_eq_ok_of_isOk
-    ((diagnoseRawByteTraceFullBounded_isOk _ rootBody calleeSigs table rawTrace).trans
-      (checkRawByteTraceFull_imp_bounded rootBody calleeSigs table rawTrace h_ok))
+  (diagnoseRawByteTraceFull_tag_ok_iff_check rootBody calleeSigs table rawTrace).mpr h_ok
 
 /-- A trace accepted by the fuel-free `WithCallees` full check is diagnosed `"ok"`. -/
 theorem diagnoseRawByteTraceWithCalleesFull_tag_ok_of_check
@@ -8990,9 +10093,8 @@ theorem diagnoseRawByteTraceWithCalleesFull_tag_ok_of_check
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
     (h_ok : checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace = true) :
     (diagnoseRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace).tagName = "ok" :=
-  TraceReplayDiag.tagName_eq_ok_of_isOk
-    ((diagnoseRawByteTraceWithCalleesFullBounded_isOk _ rootBody calleeSigs table rawTrace).trans
-      (checkRawByteTraceWithCalleesFull_imp_bounded rootBody calleeSigs table rawTrace h_ok))
+  (diagnoseRawByteTraceWithCalleesFull_tag_ok_iff_check
+    rootBody calleeSigs table rawTrace).mpr h_ok
 
 /-- The fuel-free branch-erased diagnosis agrees exactly with the fuel-free check. -/
 theorem diagnoseRawByteTraceObsErased_isOk
@@ -9002,6 +10104,16 @@ theorem diagnoseRawByteTraceObsErased_isOk
       checkRawByteTraceObsErased rootBody calleeSigs table rawTrace :=
   (diagnoseRawByteTraceObsErasedBounded_isOk _ rootBody calleeSigs table rawTrace).trans
     (checkRawByteTraceObsErased_eq_bounded rootBody calleeSigs table rawTrace).symm
+
+/-- Exact equivalence between an `"ok"` tag of `diagnoseRawByteTraceObsErased`
+and `checkRawByteTraceObsErased = true`. -/
+theorem diagnoseRawByteTraceObsErased_tag_ok_iff_check
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceObsErased rootBody calleeSigs table rawTrace).tagName = "ok" ↔
+      checkRawByteTraceObsErased rootBody calleeSigs table rawTrace = true := by
+  rw [← diagnoseRawByteTraceObsErased_isOk]
+  exact ⟨TraceReplayDiag.isOk_of_tagName_eq_ok, TraceReplayDiag.tagName_eq_ok_of_isOk⟩
 
 /-- The fuel-free `WithCallees` branch-erased diagnosis agrees exactly with the
 fuel-free check. -/
@@ -9013,6 +10125,17 @@ theorem diagnoseRawByteTraceWithCalleesObsErased_isOk
   (diagnoseRawByteTraceWithCalleesObsErasedBounded_isOk _ rootBody calleeSigs table
       rawTrace).trans
     (checkRawByteTraceWithCalleesObsErased_eq_bounded rootBody calleeSigs table rawTrace).symm
+
+/-- Exact equivalence between an `"ok"` tag of `diagnoseRawByteTraceWithCalleesObsErased`
+and `checkRawByteTraceWithCalleesObsErased = true`. -/
+theorem diagnoseRawByteTraceWithCalleesObsErased_tag_ok_iff_check
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesObsErased
+        rootBody calleeSigs table rawTrace).tagName = "ok" ↔
+      checkRawByteTraceWithCalleesObsErased rootBody calleeSigs table rawTrace = true := by
+  rw [← diagnoseRawByteTraceWithCalleesObsErased_isOk]
+  exact ⟨TraceReplayDiag.isOk_of_tagName_eq_ok, TraceReplayDiag.tagName_eq_ok_of_isOk⟩
 
 /-- Fuel-free soundness of an `"ok"` full diagnosis. -/
 theorem diagnoseRawByteTraceFull_tag_ok_sound
@@ -9027,7 +10150,8 @@ theorem diagnoseRawByteTraceFull_tag_ok_sound
         (mirStatefulTree rootBody obsTrace.args
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
         tr out :=
-  diagnoseRawByteTraceFullBounded_tag_ok_sound _ rootBody calleeSigs table rawTrace h_tag
+  checkRawByteTraceFull_sound rootBody calleeSigs table rawTrace
+    ((diagnoseRawByteTraceFull_tag_ok_iff_check rootBody calleeSigs table rawTrace).mp h_tag)
 
 /-- Fuel-free soundness of an `"ok"` branch-erased diagnosis. -/
 theorem diagnoseRawByteTraceObsErased_tag_ok_sound
@@ -9059,8 +10183,9 @@ theorem diagnoseRawByteTraceWithCalleesFull_tag_ok_sound
         (mirStatefulTreeWithCallees
           rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
         tr out :=
-  diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_sound _ rootBody calleeSigs table
-    rawTrace h_tag
+  checkRawByteTraceWithCalleesFull_sound rootBody calleeSigs table rawTrace
+    ((diagnoseRawByteTraceWithCalleesFull_tag_ok_iff_check
+      rootBody calleeSigs table rawTrace).mp h_tag)
 
 /-- Fuel-free soundness of an `"ok"` `WithCallees` branch-erased diagnosis. -/
 theorem diagnoseRawByteTraceWithCalleesObsErased_tag_ok_sound
@@ -9097,8 +10222,9 @@ theorem diagnoseRawByteTraceFull_tag_ok_obsErased_sound
         (mirObsErasedStatefulTree rootBody obsTrace.args
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
         tr out :=
-  diagnoseRawByteTraceFullBounded_tag_ok_obsErased_sound _ rootBody calleeSigs table
-    rawTrace obsErasedTrace h_tag h_erase
+  checkRawByteTraceFull_obsErased_sound rootBody calleeSigs table rawTrace obsErasedTrace
+    ((diagnoseRawByteTraceFull_tag_ok_iff_check rootBody calleeSigs table rawTrace).mp h_tag)
+    h_erase
 
 /-- `WithCallees` counterpart of `diagnoseRawByteTraceFull_tag_ok_obsErased_sound`. -/
 theorem diagnoseRawByteTraceWithCalleesFull_tag_ok_obsErased_sound
@@ -9116,7 +10242,10 @@ theorem diagnoseRawByteTraceWithCalleesFull_tag_ok_obsErased_sound
         (mirObsErasedStatefulTreeWithCallees
           rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
         tr out :=
-  diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_obsErased_sound _ rootBody calleeSigs table
-    rawTrace obsErasedTrace h_tag h_erase
+  checkRawByteTraceWithCalleesFull_obsErased_sound rootBody calleeSigs table rawTrace
+    obsErasedTrace
+    ((diagnoseRawByteTraceWithCalleesFull_tag_ok_iff_check
+      rootBody calleeSigs table rawTrace).mp h_tag)
+    h_erase
 
 end Anneal.Rustc.V2026_06_01.TraceCheck
