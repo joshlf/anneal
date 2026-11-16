@@ -1858,9 +1858,10 @@ Computable boolean checker for full (`MirObsE` + `MirCallE`) trace consistency
 The definition is intentionally kept as `(reconstructFullMirTrace ...).isSome`
 (equal to the tail-recursive `checkFullMirTraceFast` by `checkFullMirTraceFast_eq`):
 Lean's kernel and elaborator reduce lazily to weak-head normal form, so the
-discarded `Event MirEffect` list is never materialized, and measured `rfl`
-confirmation of `mirLoopWithOracleCall` at `k = 32` (`tests/mir/ITreeApproxRunnerTests.lean`)
-costs `22655` heartbeat units via `reconstructFullMirTrace` versus `23522` via
+discarded `Event MirEffect` list is never materialized. Measured on
+`mirLoopWithOracleCall` at `k = 32` (`tests/mir/ITreeApproxRunnerTests.lean`), the
+`checkRawByteTraceFullBounded_sound ... rfl` application that `cargo-anneal` emits
+costs `13101` heartbeat units via `reconstructFullMirTrace` versus `13667` via
 `checkFullMirTraceFast` (kernel-only `decide +kernel`: `4461` versus `4449`).
 -/
 @[reducible]
@@ -2339,9 +2340,10 @@ Computable boolean checker for branch-erased (`MirCallE`-only) trace consistency
 
 Kept as `(reconstructObsErasedMirTrace ...).isSome` (equal to the tail-recursive
 `checkObsErasedMirTraceFast` by `checkObsErasedMirTraceFast_eq`); lazy weak-head
-reduction never materializes the discarded trace list, and measured `rfl`
-confirmation at `k = 32` costs `22356` heartbeat units versus `23137` via
-`checkObsErasedMirTraceFast` (kernel-only: `4420` versus `4413`).
+reduction never materializes the discarded trace list, and the generated
+`checkRawByteTraceObsErasedBounded_sound ... rfl` application at `k = 32` costs
+`12932` heartbeat units versus `13409` via `checkObsErasedMirTraceFast`
+(kernel-only: `4420` versus `4413`).
 -/
 @[reducible]
 def checkObsErasedObservedTraceBounded
@@ -5616,10 +5618,16 @@ Measured kernel-cost profile (`mirLoopWithOracleCall`, see
 13% of a `checkRawByteTrace*Bounded` confirmation and `stepMirState` for most of
 the remainder; the checker wrapper itself is negligible, so the tail-recursive
 `*Fast` forms below have the same kernel cost as `checkRawByteTrace*Bounded`.
-The elaborator's `rfl` pass (`Meta.isDefEq`), by contrast, costs about 5x the
-kernel re-check (`k = 32`: `23522` versus `4449` heartbeat units) and exceeds the
-default `maxRecDepth` at `k >= 64`; a hypothesis proved `by decide +kernel` is
-checked by the kernel alone, with no additional axioms (no `Lean.ofReduceBool`).
+The elaborator's `rfl` pass (`Meta.isDefEq`) dominates instead: the
+`checkRawByteTrace*Bounded_sound ... rfl` application that `cargo-anneal` emits
+costs about 2.9x the kernel-only check (`k = 32`: `13101` versus `4527` heartbeat
+units; a standalone `theorem ... := rfl` on the checker costs `22654`) and needs
+more than the default `maxRecDepth` at `k >= 64`. A hypothesis proved
+`by decide +kernel` is checked by the kernel alone, with no additional axioms (no
+`Lean.ofReduceBool`). The `diagnoseRawByteTrace*Bounded` tag theorem that
+`cargo-anneal` emits alongside already performs the same evaluation, and
+`diagnoseRawByteTrace*Bounded_tag_ok_sound` turns that `"ok"` tag into the
+consistency certificate without a second evaluation.
 -/
 
 /-- End-to-end full trace checker over `RawByteTrace` running the tail-recursive
@@ -6492,7 +6500,11 @@ def diagnoseRawByteTraceObsErasedBounded
 /--
 End-to-end diagnostic replay of a `RawByteTrace` using
 `diagnoseObservedTraceWithCalleesBounded` so that both `rawTrace.inlinedCallees`
-and `rootBody.traitImpls` are populated.
+and `rootBody.traitImpls` are populated. Like `diagnoseRawByteTraceBounded` (and
+like `decodeRawByteTrace`, which the `checkRawByteTraceWithCallees*Bounded`
+checkers replay), initial memory for registered pointer allocations is populated
+via `populateShadowPointerMemory`, so the diagnosis accepts exactly the traces the
+checkers accept (`diagnoseRawByteTraceWithCalleesFullBounded_isOk`).
 -/
 @[reducible]
 def diagnoseRawByteTraceWithCalleesBounded
@@ -6508,13 +6520,25 @@ def diagnoseRawByteTraceWithCalleesBounded
       match decodeRawObservedOutcome rootBody table rawTrace.outcome with
       | none => .decodeOutcomeFailed
       | some outcome =>
-        diagnoseObservedTraceWithCalleesBounded fuel checkBranches rootBody {
-          args := args
-          initMem := rawTrace.initMem
-          inlinedCallees := rawTrace.inlinedCallees
-          events := events
-          outcome := outcome
-        }
+        match
+          populateShadowPointerMemory
+            rootBody
+            (calleeSigs ++ rawTrace.inlinedCallees)
+            table
+            rawTrace.rawArgs
+            args
+            rawTrace.initMem
+        with
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
+          diagnoseObservedTraceWithCalleesBounded fuel checkBranches rootBody {
+            args := args
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+            inlinedCallees := rawTrace.inlinedCallees
+            events := events
+            outcome := outcome
+          }
 
 /--
 Convenience wrapper for `diagnoseRawByteTraceWithCalleesBounded` with full
@@ -6535,5 +6559,788 @@ def diagnoseRawByteTraceWithCalleesObsErasedBounded
     (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
   diagnoseRawByteTraceWithCalleesBounded fuel false rootBody calleeSigs table rawTrace
+
+/-! ### Agreement of Diagnostic Replay with the Soundness Checkers
+
+`cargo-anneal` emits, per recorded trace, a `checkRawByteTrace*Bounded_sound`
+consistency theorem and a separate `diagnoseRawByteTrace*Bounded` tag theorem,
+each confirmed by its own reduction of the same MIR execution. The theorems below
+prove that the triage diagnosis accepts (`isOk`, equivalently `tagName = "ok"`)
+exactly when the soundness checker accepts, at every fuel, so a confirmed `"ok"`
+tag is itself a sound `ReachesRet` certificate
+(`diagnoseRawByteTraceFullBounded_tag_ok_sound`,
+`diagnoseRawByteTraceObsErasedBounded_tag_ok_sound`).
+-/
+
+private theorem listByteEq_eq_true_iff_eq :
+    ∀ (xs ys : List UInt8), listByteEq xs ys = true ↔ xs = ys
+  | [], [] => ⟨fun _ => rfl, fun _ => rfl⟩
+  | [], _ :: _ => ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
+  | _ :: _, [] => ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
+  | b₁ :: bs₁, b₂ :: bs₂ => by
+    have ih := listByteEq_eq_true_iff_eq bs₁ bs₂
+    simp only [listByteEq]
+    cases hb : Nat.beq b₁.toBitVec.toNat b₂.toBitVec.toNat with
+    | false =>
+      refine ⟨fun h => (nomatch h), fun h => ?_⟩
+      injection h with hb₁ _
+      subst hb₁
+      rw [Nat.beq_refl] at hb
+      nomatch hb
+    | true =>
+      have hByte : b₁ = b₂ :=
+        UInt8.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true hb))
+      subst hByte
+      refine ⟨fun h => ?_, fun h => ?_⟩
+      · rw [ih.mp h]
+      · injection h with _ h'
+        exact ih.mpr h'
+
+/-- `Trusted`'s byte-wise `stringEq` coincides with `String` equality (`==`). -/
+theorem stringEq_eq_beq (a b : String) : stringEq a b = (a == b) := by
+  apply Bool.eq_iff_iff.mpr
+  rw [beq_iff_eq]
+  constructor
+  · intro h
+    unfold stringEq at h
+    exact String.toByteArray_inj.mp
+      (ByteArray.ext (Array.toList_inj.mp ((listByteEq_eq_true_iff_eq _ _).mp h)))
+  · rintro rfl
+    unfold stringEq
+    exact (listByteEq_eq_true_iff_eq _ _).mpr rfl
+
+/-- `diagnoseCallObservedEvent` accepts exactly the call answers of
+`matchCallObservedEvent`. -/
+theorem diagnoseCallObservedEvent_toOption
+    (req : MirCallReq) (blockIdx : Nat) (obsEv : ObservedEvent) :
+    (diagnoseCallObservedEvent req blockIdx obsEv).toOption =
+      matchCallObservedEvent req obsEv := by
+  cases obsEv with
+  | branch _ => rfl
+  | extCall defPath args retVal =>
+    simp only [diagnoseCallObservedEvent, matchCallObservedEvent, stringEq_eq_beq]
+    cases req.defPath == defPath <;> cases valueListEqFuel 16 req.args args <;> rfl
+  | extCallPanic defPath args =>
+    simp only [diagnoseCallObservedEvent, matchCallObservedEvent, stringEq_eq_beq]
+    cases req.defPath == defPath <;> cases valueListEqFuel 16 req.args args <;> rfl
+  | extCallAbort defPath args =>
+    simp only [diagnoseCallObservedEvent, matchCallObservedEvent, stringEq_eq_beq]
+    cases req.defPath == defPath <;> cases valueListEqFuel 16 req.args args <;> rfl
+
+theorem diagnoseCallObservedEvent_error_not_ok
+    {req : MirCallReq} {blockIdx : Nat} {obsEv : ObservedEvent} {d : TraceReplayDiag}
+    (h : diagnoseCallObservedEvent req blockIdx obsEv = .error d) :
+    d.isOk = false := by
+  cases obsEv with
+  | branch _ => injection h with h; subst h; rfl
+  | extCall defPath args retVal =>
+    simp only [diagnoseCallObservedEvent] at h
+    split at h
+    · split at h
+      · nomatch h
+      · injection h with h; subst h; rfl
+    · injection h with h; subst h; rfl
+  | extCallPanic defPath args =>
+    simp only [diagnoseCallObservedEvent] at h
+    split at h
+    · split at h
+      · nomatch h
+      · injection h with h; subst h; rfl
+    · injection h with h; subst h; rfl
+  | extCallAbort defPath args =>
+    simp only [diagnoseCallObservedEvent] at h
+    split at h
+    · split at h
+      · nomatch h
+      · injection h with h; subst h; rfl
+    · injection h with h; subst h; rfl
+
+private theorem diagnose_cons_ok_isOk (ev : Event MirEffect) (d : TraceReplayDiag) :
+    (match d with
+     | .ok trRest out => TraceReplayDiag.ok (ev :: trRest) out
+     | diag => diag).isOk = d.isOk := by
+  cases d <;> rfl
+
+/-- The diagnostic replay with branch checking accepts exactly when
+`checkFullMirTraceFast` does, at every fuel. -/
+theorem diagnoseMirExecBounded_isOk_full (body : CapturedMir) (fuel : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      (diagnoseMirExecBounded fuel true body st events outcome).isOk =
+        checkFullMirTraceFast fuel body st events outcome := by
+  induction fuel with
+  | zero => intro _ _ _; rfl
+  | succ m ih =>
+    intro st events outcome
+    unfold diagnoseMirExecBounded checkFullMirTraceFast
+    cases hs : stepMirState body st with
+    | ret out =>
+      cases events with
+      | nil =>
+        dsimp only
+        cases checkOutcomeMatches outcome out <;> rfl
+      | cons _ _ => rfl
+    | tau st' => exact ih st' events outcome
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => rfl
+          | event tag =>
+            cases events with
+            | nil => rfl
+            | cons ev rest =>
+              cases ev with
+              | branch expectedTag =>
+                dsimp only
+                cases Nat.beq tag expectedTag with
+                | false => rfl
+                | true =>
+                  exact (diagnose_cons_ok_isOk
+                    ⟨.inr (.inl (.emit (.event tag))), PUnit.unit⟩
+                    (diagnoseMirExecBounded m true body (k PUnit.unit) rest outcome)).trans
+                    (ih (k PUnit.unit) rest outcome)
+              | extCall _ _ _ => rfl
+              | extCallPanic _ _ => rfl
+              | extCallAbort _ _ => rfl
+      · cases callReq with
+        | call req =>
+          dsimp only
+          cases findActiveCallImpurePtrArgIdx? (execStateActiveBody body st)
+              (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            cases events with
+            | nil => rfl
+            | cons obsEv rest =>
+              dsimp only
+              have hmatch := diagnoseCallObservedEvent_toOption req (execStateCursor st).1 obsEv
+              cases hd : diagnoseCallObservedEvent req (execStateCursor st).1 obsEv with
+              | error d =>
+                rw [hd] at hmatch
+                rw [← hmatch]
+                exact diagnoseCallObservedEvent_error_not_ok hd
+              | ok ans =>
+                rw [hd] at hmatch
+                rw [← hmatch]
+                exact (diagnose_cons_ok_isOk ⟨.inr (.inr (.call req)), ans⟩
+                  (diagnoseMirExecBounded m true body (k ans) rest outcome)).trans
+                  (ih (k ans) rest outcome)
+
+/-- The branch-erased diagnostic replay accepts exactly when
+`checkObsErasedMirTraceFast` does, at every fuel. -/
+theorem diagnoseMirExecBounded_isOk_obsErased (body : CapturedMir) (fuel : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      (diagnoseMirExecBounded fuel false body st events outcome).isOk =
+        checkObsErasedMirTraceFast fuel body st events outcome := by
+  induction fuel with
+  | zero => intro _ _ _; rfl
+  | succ m ih =>
+    intro st events outcome
+    unfold diagnoseMirExecBounded checkObsErasedMirTraceFast
+    cases hs : stepMirState body st with
+    | ret out =>
+      cases events with
+      | nil =>
+        dsimp only
+        cases checkOutcomeMatches outcome out <;> rfl
+      | cons _ _ => rfl
+    | tau st' => exact ih st' events outcome
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · cases f; rfl
+      · cases obsReq with
+        | emit obs => exact ih (k PUnit.unit) events outcome
+      · cases callReq with
+        | call req =>
+          dsimp only
+          cases findActiveCallImpurePtrArgIdx? (execStateActiveBody body st)
+              (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            dsimp only
+            cases events with
+            | nil => rfl
+            | cons obsEv rest =>
+              dsimp only
+              have hmatch := diagnoseCallObservedEvent_toOption req (execStateCursor st).1 obsEv
+              cases hd : diagnoseCallObservedEvent req (execStateCursor st).1 obsEv with
+              | error d =>
+                rw [hd] at hmatch
+                rw [← hmatch]
+                exact diagnoseCallObservedEvent_error_not_ok hd
+              | ok ans =>
+                rw [hd] at hmatch
+                rw [← hmatch]
+                exact (diagnose_cons_ok_isOk ⟨.inr (.inr (.call req)), ans⟩
+                  (diagnoseMirExecBounded m false body (k ans) rest outcome)).trans
+                  (ih (k ans) rest outcome)
+
+theorem diagnoseDecodeRawArgsAux_toOption
+    (layouts : LayoutTable) (table : ShadowProvenanceTable) :
+    ∀ (argIdx : Nat) (decls : List LocalDecl) (raws : List (List UInt8)),
+      (diagnoseDecodeRawArgsAux layouts table argIdx decls raws).toOption =
+        decodeRawArgsByDecls layouts table decls raws
+  | argIdx, decls, [] => by
+    rw [diagnoseDecodeRawArgsAux.eq_1 layouts table argIdx decls,
+      decodeRawArgsByDecls.eq_1 layouts table decls]
+    rfl
+  | argIdx, decls, raw :: rawRest => by
+    cases decls with
+    | nil => rfl
+    | cons decl declRest =>
+      have ih := diagnoseDecodeRawArgsAux_toOption layouts table (argIdx + 1) declRest rawRest
+      simp only [diagnoseDecodeRawArgsAux, decodeRawArgsByDecls]
+      cases decodeRawValue layouts table decl.ty raw with
+      | none => rfl
+      | some v =>
+        dsimp only
+        cases h : diagnoseDecodeRawArgsAux layouts table (argIdx + 1) declRest rawRest with
+        | error e =>
+          rw [h] at ih
+          rw [← ih]
+          rfl
+        | ok vs =>
+          rw [h] at ih
+          rw [← ih]
+          rfl
+
+theorem diagnoseDecodeFnArgs_toOption
+    (body : CapturedMir) (table : ShadowProvenanceTable) (rawArgs : List (List UInt8)) :
+    (diagnoseDecodeFnArgs body table rawArgs).toOption =
+      decodeFnArgsFromRawBytes body table rawArgs := by
+  unfold diagnoseDecodeFnArgs decodeFnArgsFromRawBytes
+  cases Nat.beq (length rawArgs) body.argCount with
+  | false => rfl
+  | true => exact diagnoseDecodeRawArgsAux_toOption _ _ 0 _ _
+
+theorem diagnoseDecodeRawEvent_toOption
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (evIdx : Nat) (ev : RawObservedEvent) :
+    (diagnoseDecodeRawEvent calleeSigs table evIdx ev).toOption =
+      decodeRawObservedEvent calleeSigs table ev := by
+  cases ev with
+  | branch _ => rfl
+  | extCall defPath rawArgs rawRet =>
+    simp only [diagnoseDecodeRawEvent, decodeRawObservedEvent]
+    cases findCallee? calleeSigs defPath with
+    | none => rfl
+    | some sigBody =>
+      dsimp only
+      cases findCalleeImpurePtrArgIdx? sigBody with
+      | some _ => rfl
+      | none =>
+        dsimp only
+        cases decodeFnArgsFromRawBytes sigBody table rawArgs <;>
+          cases decodeFnRetFromRawBytes sigBody table rawRet <;> rfl
+  | extCallPanic defPath rawArgs =>
+    simp only [diagnoseDecodeRawEvent, decodeRawObservedEvent]
+    cases findCallee? calleeSigs defPath with
+    | none => rfl
+    | some sigBody =>
+      dsimp only
+      cases findCalleeImpurePtrArgIdx? sigBody with
+      | some _ => rfl
+      | none =>
+        dsimp only
+        cases decodeFnArgsFromRawBytes sigBody table rawArgs <;> rfl
+  | extCallAbort defPath rawArgs =>
+    simp only [diagnoseDecodeRawEvent, decodeRawObservedEvent]
+    cases findCallee? calleeSigs defPath with
+    | none => rfl
+    | some sigBody =>
+      dsimp only
+      cases findCalleeImpurePtrArgIdx? sigBody with
+      | some _ => rfl
+      | none =>
+        dsimp only
+        cases decodeFnArgsFromRawBytes sigBody table rawArgs <;> rfl
+
+theorem diagnoseDecodeRawEvent_error_not_ok
+    {calleeSigs : List CapturedMir} {table : ShadowProvenanceTable}
+    {evIdx : Nat} {ev : RawObservedEvent} {d : TraceReplayDiag}
+    (h : diagnoseDecodeRawEvent calleeSigs table evIdx ev = .error d) :
+    d.isOk = false := by
+  cases ev with
+  | branch _ => nomatch h
+  | extCall defPath rawArgs rawRet =>
+    simp only [diagnoseDecodeRawEvent] at h
+    split at h
+    · split at h
+      · injection h with h; subst h; rfl
+      · split at h
+        · nomatch h
+        · injection h with h; subst h; rfl
+    · injection h with h; subst h; rfl
+  | extCallPanic defPath rawArgs =>
+    simp only [diagnoseDecodeRawEvent] at h
+    split at h
+    · split at h
+      · injection h with h; subst h; rfl
+      · split at h
+        · nomatch h
+        · injection h with h; subst h; rfl
+    · injection h with h; subst h; rfl
+  | extCallAbort defPath rawArgs =>
+    simp only [diagnoseDecodeRawEvent] at h
+    split at h
+    · split at h
+      · injection h with h; subst h; rfl
+      · split at h
+        · nomatch h
+        · injection h with h; subst h; rfl
+    · injection h with h; subst h; rfl
+
+theorem diagnoseDecodeRawEventsAux_toOption
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable) :
+    ∀ (evIdx : Nat) (evs : List RawObservedEvent),
+      (diagnoseDecodeRawEventsAux calleeSigs table evIdx evs).toOption =
+        decodeRawObservedEvents calleeSigs table evs
+  | _, [] => rfl
+  | evIdx, ev :: rest => by
+    have ih := diagnoseDecodeRawEventsAux_toOption calleeSigs table (evIdx + 1) rest
+    have hev := diagnoseDecodeRawEvent_toOption calleeSigs table evIdx ev
+    simp only [diagnoseDecodeRawEventsAux, decodeRawObservedEvents]
+    cases hd : diagnoseDecodeRawEvent calleeSigs table evIdx ev with
+    | error d =>
+      rw [hd] at hev
+      rw [← hev]
+      rfl
+    | ok dEv =>
+      rw [hd] at hev
+      rw [← hev]
+      dsimp only
+      cases hr : diagnoseDecodeRawEventsAux calleeSigs table (evIdx + 1) rest with
+      | error d =>
+        rw [hr] at ih
+        rw [← ih]
+        rfl
+      | ok dRest =>
+        rw [hr] at ih
+        rw [← ih]
+        rfl
+
+theorem diagnoseDecodeRawEventsAux_error_not_ok
+    {calleeSigs : List CapturedMir} {table : ShadowProvenanceTable} :
+    ∀ {evIdx : Nat} {evs : List RawObservedEvent} {d : TraceReplayDiag},
+      diagnoseDecodeRawEventsAux calleeSigs table evIdx evs = .error d →
+      d.isOk = false
+  | _, [], _, h => nomatch h
+  | evIdx, ev :: rest, d, h => by
+    simp only [diagnoseDecodeRawEventsAux] at h
+    cases hd : diagnoseDecodeRawEvent calleeSigs table evIdx ev with
+    | error d' =>
+      rw [hd] at h
+      injection h with h
+      subst h
+      exact diagnoseDecodeRawEvent_error_not_ok hd
+    | ok dEv =>
+      rw [hd] at h
+      dsimp only at h
+      cases hr : diagnoseDecodeRawEventsAux calleeSigs table (evIdx + 1) rest with
+      | error d' =>
+        rw [hr] at h
+        injection h with h
+        subst h
+        exact diagnoseDecodeRawEventsAux_error_not_ok hr
+      | ok dRest =>
+        rw [hr] at h
+        nomatch h
+
+private theorem diagnoseRawByteTraceBounded_isOk_aux
+    (fuel : Nat) (checkBranches : Bool) (rootBody : CapturedMir)
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceBounded fuel checkBranches rootBody calleeSigs table rawTrace).isOk =
+      match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+      | some obsTrace =>
+        (diagnoseObservedTraceBounded fuel checkBranches rootBody obsTrace).isOk
+      | none => false := by
+  unfold diagnoseRawByteTraceBounded decodeRawByteTrace
+  rw [← diagnoseDecodeFnArgs_toOption, ← diagnoseDecodeRawEventsAux_toOption calleeSigs table 0]
+  cases hargs : diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | error _ => rfl
+  | ok args =>
+    cases hevs : diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | error d => exact diagnoseDecodeRawEventsAux_error_not_ok hevs
+    | ok events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome => rfl
+
+/-- `diagnoseRawByteTraceFullBounded` accepts exactly when
+`checkRawByteTraceFullBounded` does, at every fuel. -/
+theorem diagnoseRawByteTraceFullBounded_isOk
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold diagnoseRawByteTraceFullBounded
+  rw [diagnoseRawByteTraceBounded_isOk_aux, ← checkRawByteTraceFullBoundedFast_eq]
+  unfold checkRawByteTraceFullBoundedFast
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact diagnoseMirExecBounded_isOk_full rootBody fuel _ _ _
+
+/-- `diagnoseRawByteTraceObsErasedBounded` accepts exactly when
+`checkRawByteTraceObsErasedBounded` does, at every fuel. -/
+theorem diagnoseRawByteTraceObsErasedBounded_isOk
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceObsErasedBounded fuel rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceObsErasedBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold diagnoseRawByteTraceObsErasedBounded
+  rw [diagnoseRawByteTraceBounded_isOk_aux, ← checkRawByteTraceObsErasedBoundedFast_eq]
+  unfold checkRawByteTraceObsErasedBoundedFast
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact diagnoseMirExecBounded_isOk_obsErased rootBody fuel _ _ _
+
+theorem TraceReplayDiag.isOk_of_tagName_eq_ok {d : TraceReplayDiag}
+    (h : d.tagName = "ok") : d.isOk = true := by
+  cases d <;> first | rfl | (simp only [TraceReplayDiag.tagName] at h; contradiction)
+
+/-- A confirmed `"ok"` tag of `diagnoseRawByteTraceFullBounded` (the theorem
+`cargo-anneal` emits for every trace) is a sound `ReachesRet` certificate for
+`mirStatefulTree`, with no second evaluation of the execution. -/
+theorem diagnoseRawByteTraceFullBounded_tag_ok_sound
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_tag :
+      (diagnoseRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace).tagName = "ok") :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTree rootBody obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out := by
+  have h_ok := TraceReplayDiag.isOk_of_tagName_eq_ok h_tag
+  rw [diagnoseRawByteTraceFullBounded_isOk] at h_ok
+  exact checkRawByteTraceFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+
+/-- A confirmed `"ok"` tag of `diagnoseRawByteTraceObsErasedBounded` is a sound
+`ReachesRet` certificate for `mirObsErasedStatefulTree`. -/
+theorem diagnoseRawByteTraceObsErasedBounded_tag_ok_sound
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_tag :
+      (diagnoseRawByteTraceObsErasedBounded fuel rootBody calleeSigs table rawTrace).tagName =
+        "ok") :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTree rootBody obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out := by
+  have h_ok := TraceReplayDiag.isOk_of_tagName_eq_ok h_tag
+  rw [diagnoseRawByteTraceObsErasedBounded_isOk] at h_ok
+  exact checkRawByteTraceObsErasedBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+
+private theorem diagnoseRawByteTraceWithCalleesBounded_isOk_aux
+    (fuel : Nat) (checkBranches : Bool) (rootBody : CapturedMir)
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesBounded
+        fuel checkBranches rootBody calleeSigs table rawTrace).isOk =
+      match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+      | some obsTrace =>
+        (diagnoseObservedTraceWithCalleesBounded fuel checkBranches rootBody obsTrace).isOk
+      | none => false := by
+  unfold diagnoseRawByteTraceWithCalleesBounded decodeRawByteTrace
+  rw [← diagnoseDecodeFnArgs_toOption, ← diagnoseDecodeRawEventsAux_toOption calleeSigs table 0]
+  cases hargs : diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | error _ => rfl
+  | ok args =>
+    cases hevs : diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | error d => exact diagnoseDecodeRawEventsAux_error_not_ok hevs
+    | ok events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome => rfl
+
+/-- `diagnoseRawByteTraceWithCalleesFullBounded` accepts exactly when
+`checkRawByteTraceWithCalleesFullBounded` does, at every fuel. -/
+theorem diagnoseRawByteTraceWithCalleesFullBounded_isOk
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold diagnoseRawByteTraceWithCalleesFullBounded
+  rw [diagnoseRawByteTraceWithCalleesBounded_isOk_aux,
+    ← checkRawByteTraceWithCalleesFullBoundedFast_eq]
+  unfold checkRawByteTraceWithCalleesFullBoundedFast
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact diagnoseMirExecBounded_isOk_full rootBody fuel _ _ _
+
+/-- `diagnoseRawByteTraceWithCalleesObsErasedBounded` accepts exactly when
+`checkRawByteTraceWithCalleesObsErasedBounded` does, at every fuel. -/
+theorem diagnoseRawByteTraceWithCalleesObsErasedBounded_isOk
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesObsErasedBounded
+        fuel rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceWithCalleesObsErasedBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold diagnoseRawByteTraceWithCalleesObsErasedBounded
+  rw [diagnoseRawByteTraceWithCalleesBounded_isOk_aux,
+    ← checkRawByteTraceWithCalleesObsErasedBoundedFast_eq]
+  unfold checkRawByteTraceWithCalleesObsErasedBoundedFast
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact diagnoseMirExecBounded_isOk_obsErased rootBody fuel _ _ _
+
+/-! ### Branch Erasure: Full Acceptance Implies Branch-Erased Acceptance
+
+`cargo-anneal` emits, for each `checkBranches = true` trace, a second
+branch-erased consistency theorem over the same recording with its `.branch`
+events removed, confirmed by a second evaluation. The theorems below show that
+full acceptance already implies branch-erased acceptance of the erased event list
+at the same fuel, so that certificate follows from the full one without
+re-running the MIR execution (`checkRawByteTraceObsErasedBounded_of_full`).
+-/
+
+/-- Remove `.branch` observations from an observed event list. -/
+@[reducible]
+def eraseBranchEvents : List ObservedEvent → List ObservedEvent
+  | [] => []
+  | .branch _ :: rest => eraseBranchEvents rest
+  | .extCall defPath args retVal :: rest =>
+    .extCall defPath args retVal :: eraseBranchEvents rest
+  | .extCallPanic defPath args :: rest => .extCallPanic defPath args :: eraseBranchEvents rest
+  | .extCallAbort defPath args :: rest => .extCallAbort defPath args :: eraseBranchEvents rest
+
+/-- Remove `.branch` observations from a raw recorded event list. -/
+@[reducible]
+def eraseRawBranchEvents : List RawObservedEvent → List RawObservedEvent
+  | [] => []
+  | .branch _ :: rest => eraseRawBranchEvents rest
+  | .extCall defPath rawArgs rawRet :: rest =>
+    .extCall defPath rawArgs rawRet :: eraseRawBranchEvents rest
+  | .extCallPanic defPath rawArgs :: rest =>
+    .extCallPanic defPath rawArgs :: eraseRawBranchEvents rest
+  | .extCallAbort defPath rawArgs :: rest =>
+    .extCallAbort defPath rawArgs :: eraseRawBranchEvents rest
+
+/-- Full replay acceptance implies branch-erased replay acceptance of the erased
+event list at the same fuel. -/
+theorem checkFullMirTraceFast_imp_obsErased (body : CapturedMir) (fuel : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      checkFullMirTraceFast fuel body st events outcome = true →
+      checkObsErasedMirTraceFast fuel body st (eraseBranchEvents events) outcome = true := by
+  induction fuel with
+  | zero => intro _ _ _ h; nomatch h
+  | succ m ih =>
+    intro st events outcome h
+    unfold checkFullMirTraceFast at h
+    unfold checkObsErasedMirTraceFast
+    cases hs : stepMirState body st with
+    | ret out =>
+      simp only [hs] at h ⊢
+      cases events with
+      | nil => exact h
+      | cons _ _ => nomatch h
+    | tau st' =>
+      simp only [hs] at h ⊢
+      exact ih st' events outcome h
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · simp only [hs] at h; nomatch h
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => simp only [hs] at h; nomatch h
+          | event tag =>
+            simp only [hs] at h ⊢
+            cases events with
+            | nil => nomatch h
+            | cons ev rest =>
+              cases ev with
+              | branch expectedTag =>
+                dsimp only at h
+                revert h
+                cases Nat.beq tag expectedTag <;> intro h
+                · nomatch h
+                · exact ih (k PUnit.unit) rest outcome h
+              | extCall _ _ _ => nomatch h
+              | extCallPanic _ _ => nomatch h
+              | extCallAbort _ _ => nomatch h
+      · cases callReq with
+        | call req =>
+          simp only [hs] at h ⊢
+          cases hpol :
+              findActiveCallImpurePtrArgIdx? (execStateActiveBody body st)
+                (execStateCursor st).1 req with
+          | some _ => simp only [hpol] at h; nomatch h
+          | none =>
+            simp only [hpol] at h ⊢
+            cases events with
+            | nil => nomatch h
+            | cons obsEv rest =>
+              cases obsEv with
+              | branch _ => nomatch h
+              | extCall defPath args retVal =>
+                dsimp only at h ⊢
+                cases hm : matchCallObservedEvent req (.extCall defPath args retVal) with
+                | none => simp only [hm] at h; nomatch h
+                | some ans =>
+                  simp only [hm] at h ⊢
+                  exact ih (k ans) rest outcome h
+              | extCallPanic defPath args =>
+                dsimp only at h ⊢
+                cases hm : matchCallObservedEvent req (.extCallPanic defPath args) with
+                | none => simp only [hm] at h; nomatch h
+                | some ans =>
+                  simp only [hm] at h ⊢
+                  exact ih (k ans) rest outcome h
+              | extCallAbort defPath args =>
+                dsimp only at h ⊢
+                cases hm : matchCallObservedEvent req (.extCallAbort defPath args) with
+                | none => simp only [hm] at h; nomatch h
+                | some ans =>
+                  simp only [hm] at h ⊢
+                  exact ih (k ans) rest outcome h
+
+/-- A decoded non-branch raw event is a non-branch observed event. -/
+private theorem eraseBranchEvents_cons_of_decode
+    {calleeSigs : List CapturedMir} {table : ShadowProvenanceTable}
+    {ev : RawObservedEvent} {dEv : ObservedEvent}
+    (hnb : ∀ tag, ev ≠ .branch tag)
+    (h : decodeRawObservedEvent calleeSigs table ev = some dEv) (l : List ObservedEvent) :
+    eraseBranchEvents (dEv :: l) = dEv :: eraseBranchEvents l := by
+  cases ev with
+  | branch tag => exact absurd rfl (hnb tag)
+  | extCall defPath rawArgs rawRet =>
+    simp only [decodeRawObservedEvent] at h
+    split at h
+    · split at h
+      · nomatch h
+      · split at h
+        · injection h with h; subst h; rfl
+        · nomatch h
+    · nomatch h
+  | extCallPanic defPath rawArgs =>
+    simp only [decodeRawObservedEvent] at h
+    split at h
+    · split at h
+      · nomatch h
+      · split at h
+        · injection h with h; subst h; rfl
+        · nomatch h
+    · nomatch h
+  | extCallAbort defPath rawArgs =>
+    simp only [decodeRawObservedEvent] at h
+    split at h
+    · split at h
+      · nomatch h
+      · split at h
+        · injection h with h; subst h; rfl
+        · nomatch h
+    · nomatch h
+
+private theorem decodeRawObservedEvents_cons_erase
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (ev : RawObservedEvent) (hnb : ∀ tag, ev ≠ .branch tag) (rest : List RawObservedEvent)
+    (ih : decodeRawObservedEvents calleeSigs table (eraseRawBranchEvents rest) =
+      (decodeRawObservedEvents calleeSigs table rest).map eraseBranchEvents) :
+    decodeRawObservedEvents calleeSigs table (ev :: eraseRawBranchEvents rest) =
+      (decodeRawObservedEvents calleeSigs table (ev :: rest)).map eraseBranchEvents := by
+  simp only [decodeRawObservedEvents]
+  rw [ih]
+  cases hd : decodeRawObservedEvent calleeSigs table ev with
+  | none => cases decodeRawObservedEvents calleeSigs table rest <;> rfl
+  | some dEv =>
+    cases decodeRawObservedEvents calleeSigs table rest with
+    | none => rfl
+    | some dRest =>
+      simp only [Option.map, eraseBranchEvents_cons_of_decode hnb hd dRest]
+
+/-- Decoding commutes with branch erasure. -/
+theorem decodeRawObservedEvents_eraseRawBranchEvents
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable) :
+    ∀ (evs : List RawObservedEvent),
+      decodeRawObservedEvents calleeSigs table (eraseRawBranchEvents evs) =
+        (decodeRawObservedEvents calleeSigs table evs).map eraseBranchEvents
+  | [] => rfl
+  | .branch tag :: rest => by
+    have ih := decodeRawObservedEvents_eraseRawBranchEvents calleeSigs table rest
+    simp only [eraseRawBranchEvents, decodeRawObservedEvents, decodeRawObservedEvent]
+    rw [ih]
+    cases decodeRawObservedEvents calleeSigs table rest <;> rfl
+  | .extCall defPath rawArgs rawRet :: rest =>
+    decodeRawObservedEvents_cons_erase calleeSigs table (.extCall defPath rawArgs rawRet) (fun _ h => nomatch h) rest
+      (decodeRawObservedEvents_eraseRawBranchEvents calleeSigs table rest)
+  | .extCallPanic defPath rawArgs :: rest =>
+    decodeRawObservedEvents_cons_erase calleeSigs table (.extCallPanic defPath rawArgs) (fun _ h => nomatch h) rest
+      (decodeRawObservedEvents_eraseRawBranchEvents calleeSigs table rest)
+  | .extCallAbort defPath rawArgs :: rest =>
+    decodeRawObservedEvents_cons_erase calleeSigs table (.extCallAbort defPath rawArgs) (fun _ h => nomatch h) rest
+      (decodeRawObservedEvents_eraseRawBranchEvents calleeSigs table rest)
+
+/-- Decoding a branch-erased `RawByteTrace` erases the branches of the decoded
+`ObservedTrace` (arguments, outcome, and populated initial memory are unchanged). -/
+theorem decodeRawByteTrace_eraseRawBranchEvents
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    decodeRawByteTrace rootBody calleeSigs table
+        { rawTrace with events := eraseRawBranchEvents rawTrace.events } =
+      (decodeRawByteTrace rootBody calleeSigs table rawTrace).map
+        (fun t => { t with events := eraseBranchEvents t.events }) := by
+  unfold decodeRawByteTrace
+  dsimp only
+  rw [decodeRawObservedEvents_eraseRawBranchEvents]
+  cases decodeFnArgsFromRawBytes rootBody table rawTrace.rawArgs with
+  | none => rfl
+  | some args =>
+    cases decodeRawObservedEvents calleeSigs table rawTrace.events with
+    | none => rfl
+    | some events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome => rfl
+
+/-- A full (`checkBranches = true`) acceptance of `rawTrace` implies the
+branch-erased acceptance of `rawTrace` with its `.branch` events removed, at the
+same fuel. -/
+theorem checkRawByteTraceObsErasedBounded_of_full
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok : checkRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace = true) :
+    checkRawByteTraceObsErasedBounded fuel rootBody calleeSigs table
+      { rawTrace with events := eraseRawBranchEvents rawTrace.events } = true := by
+  rw [← checkRawByteTraceFullBoundedFast_eq] at h_ok
+  rw [← checkRawByteTraceObsErasedBoundedFast_eq]
+  unfold checkRawByteTraceFullBoundedFast at h_ok
+  unfold checkRawByteTraceObsErasedBoundedFast
+  rw [decodeRawByteTrace_eraseRawBranchEvents]
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    exact checkFullMirTraceFast_imp_obsErased rootBody fuel _ _ _ h_ok
+
+/-- `WithCallees` counterpart of `checkRawByteTraceObsErasedBounded_of_full`. -/
+theorem checkRawByteTraceWithCalleesObsErasedBounded_of_full
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace = true) :
+    checkRawByteTraceWithCalleesObsErasedBounded fuel rootBody calleeSigs table
+      { rawTrace with events := eraseRawBranchEvents rawTrace.events } = true := by
+  rw [← checkRawByteTraceWithCalleesFullBoundedFast_eq] at h_ok
+  rw [← checkRawByteTraceWithCalleesObsErasedBoundedFast_eq]
+  unfold checkRawByteTraceWithCalleesFullBoundedFast at h_ok
+  unfold checkRawByteTraceWithCalleesObsErasedBoundedFast
+  rw [decodeRawByteTrace_eraseRawBranchEvents]
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    exact checkFullMirTraceFast_imp_obsErased rootBody fuel _ _ _ h_ok
 
 end Anneal.Rustc.V2026_06_01.TraceCheck

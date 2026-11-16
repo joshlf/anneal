@@ -34,17 +34,19 @@ Kernel regression, non-vacuity canary, and heartbeat-scaling benchmark suite for
    / `Eq.ndrec` / `Eq.mpr` / `cast` / `Nat.noConfusion` index transports in the
    `CofixA` walkers (with `ofITree` as a positive control that does reach them).
 3. Measured heartbeat benchmarks for nested `interpStateApprox ∘ interpApprox ∘
-   iterApprox` at loop depths `k ∈ {4, 8, 16, 32}` (elaborator `rfl` and
-   kernel-only `decide +kernel`), side by side with the `ITree.observe`-based
-   evaluator on the corresponding coinductive `ITree` (`k ∈ {1, 2, 4, 8}`) and a
-   `(kernel) deterministic timeout` canary for `.observe` at `k = 8` under the
-   budget that the walker meets at `k = 32`.
+   iterApprox` at loop depths `k ∈ {4, 8, 16, 32}` (`by rfl` and kernel-only
+   `decide +kernel`), side by side with the `ITree.observe`-based evaluator on the
+   corresponding coinductive `ITree` (`by rfl` at `k ∈ {1, 2, 3}`, kernel at
+   `k ∈ {1, 2, 4, 8}`) and a `(kernel) deterministic timeout` canary for
+   `.observe` at `k = 8` under the budget that the walker meets at `k = 32`.
 4. A multi-iteration MIR loop (`SwitchInt` branches + external `MirCallE` oracle
-   calls) checked at `k ∈ {4, 8, 16, 32}` by `checkRawByteTrace*Bounded`,
-   `checkRawByteTrace*Approx` (`CofixA` route), and `diagnoseRawByteTrace*Bounded`
-   at the exact minimal fuel, plus kernel-only (`decide +kernel`) end-to-end
-   soundness at `k = 32` and `k = 64` (where elaborator `rfl` exceeds the default
-   `maxRecDepth`).
+   calls) checked at `k ∈ {4, 8, 16, 32}` in the exact theorem shape
+   `cargo-anneal` emits (`checkRawByteTrace*Bounded_sound ... rfl`), kernel-only
+   (`decide +kernel`), through the `checkRawByteTrace*Approx` `CofixA` route, and
+   through `diagnoseRawByteTrace*Bounded`, all at the exact minimal fuel; the
+   consistency theorem is also derived from the diagnostic `"ok"` tag with no
+   second evaluation, and kernel-only soundness succeeds at `k = 64`, where the
+   generated `rfl` application exceeds the default `maxRecDepth`.
 5. Negative non-vacuity canaries: wrong outcome, wrong branch tag, wrong call
    argument, wrong call target, trailing events, impure pointer calls,
    insufficient fuel (exact boundaries for every checker), and the
@@ -54,7 +56,9 @@ Kernel regression, non-vacuity canary, and heartbeat-scaling benchmark suite for
 All heartbeat figures are `maxHeartbeats` units (1000 internal heartbeats) for the
 whole declaration (elaboration plus kernel check), measured with
 `IO.getNumHeartbeats` around synchronous elaboration (`Elab.async false`); every
-guard below is set at most about 1.5x the measured figure.
+guard below is set at most about 1.5x the measured figure, except that the
+near-free derived certificates (`mirLoop_k32_*_from_diag_tag`, measured at `18`
+heartbeats for the full one) use small absolute floors.
 -/
 
 /-! ## 1. Axiom-Hygiene Guards (`#print axioms`) -/
@@ -439,6 +443,78 @@ guard below is set at most about 1.5x the measured figure.
 #guard_msgs (whitespace := lax) in
 #print axioms exists_checkRawByteTraceObsErasedApprox_iff
 
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.stringEq_eq_beq' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stringEq_eq_beq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseCallObservedEvent_toOption' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseCallObservedEvent_toOption
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseMirExecBounded_isOk_full' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseMirExecBounded_isOk_full
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseMirExecBounded_isOk_obsErased' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseMirExecBounded_isOk_obsErased
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseDecodeFnArgs_toOption' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseDecodeFnArgs_toOption
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseDecodeRawEventsAux_toOption' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseDecodeRawEventsAux_toOption
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBounded_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullBounded_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBounded_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErasedBounded_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullBounded_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFullBounded_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErasedBounded_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesObsErasedBounded_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.TraceReplayDiag.isOk_of_tagName_eq_ok' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms TraceReplayDiag.isOk_of_tagName_eq_ok
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBounded_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullBounded_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBounded_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErasedBounded_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceFast_imp_obsErased' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceFast_imp_obsErased
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.decodeRawObservedEvents_eraseRawBranchEvents' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeRawObservedEvents_eraseRawBranchEvents
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.decodeRawByteTrace_eraseRawBranchEvents' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeRawByteTrace_eraseRawBranchEvents
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedBounded_of_full' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedBounded_of_full
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedBounded_of_full' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedBounded_of_full
+
 /-! ## 2. Definitional-Closure Audit (`#audit_closure`)
 
 Kernel `rfl` / `decide` confirmation unfolds every definition reachable from a
@@ -775,47 +851,49 @@ the run ends with one `.ret`. The minimal fuel is therefore `4 * k + 1`
 
 Measured heartbeats (whole declaration):
 
-| `k` | fuel | walker `rfl` | walker `decide +kernel` | `.observe` `decide +kernel` |
-|----:|-----:|-------------:|------------------------:|----------------------------:|
-|   1 |    5 |            – |                      54 |                         122 |
-|   2 |    9 |            – |                      67 |                         404 |
-|   4 |   17 |          370 |                      98 |                        2364 |
-|   8 |   33 |          671 |                     149 |                       17252 |
-|  16 |   65 |         1273 |                     252 |                           – |
-|  32 |  129 |         2478 |                     458 |                           – |
+| `k` | fuel | walker `by rfl` | walker `decide +kernel` | `.observe` `by rfl` | `.observe` `decide +kernel` |
+|----:|-----:|----------------:|------------------------:|--------------------:|----------------------------:|
+|   1 |    5 |               – |                      54 |                 408 |                         122 |
+|   2 |    9 |               – |                      67 |                1731 |                         404 |
+|   3 |   13 |               – |                      80 |                5612 |                        1083 |
+|   4 |   17 |             244 |                      98 |                   – |                        2364 |
+|   8 |   33 |             432 |                     149 |                   – |                       17252 |
+|  16 |   65 |             809 |                     252 |                   – |                           – |
+|  32 |  129 |            1563 |                     458 |                   – |                           – |
 
 For reference, the same walkers written with index-unifying `match`es on
 `CofixA` (whose compiled matchers transport indices with `Eq.ndrec`) measured
-`1543 / 2950 / 5768 / 11399` (`rfl`) and `164 / 270 / 481 / 904` (kernel) at
-`k = 4 / 8 / 16 / 32`.
+`164 / 270 / 481 / 904` (kernel) at `k = 4 / 8 / 16 / 32`.
 
-The walker is linear in `k` (about `13` kernel heartbeats per iteration), while
-the `.observe` evaluator grows roughly cubically (`7.3x` from `k = 4` to `k = 8`,
-the `O(k^3)` nested-`childApprox` blowup): at `k = 4` it already costs about 5x
-what the walker needs at `k = 32`, and at `k = 8` it times out under the walker's
-`k = 32` budget (`nestedPipelineObserve_k8_exceeds_walker_k32_budget`).
-Elaborator `rfl` costs a further constant factor over the kernel because
-`Meta.isDefEq` re-evaluates the term before the kernel re-checks it.
+The walker is linear in `k` (about `13` kernel and `47` `by rfl` heartbeats per
+iteration), while the `.observe` evaluator grows roughly cubically (`7.3x` from
+`k = 4` to `k = 8` in the kernel, `3.2x` from `k = 2` to `k = 3` under `by rfl`,
+the `O(k^3)` nested-`childApprox` blowup): `.observe` `by rfl` at `k = 3` already
+costs 3.6x what the walker needs at `k = 32`, kernel-only `.observe` at `k = 4`
+costs 5x the walker's `k = 32`, and at `k = 8` it times out under the walker's
+`k = 32` kernel budget (`nestedPipelineObserve_k8_exceeds_walker_k32_budget`).
+`by rfl` costs a constant factor over the kernel because `Meta.isDefEq`
+evaluates the term before the kernel re-checks it.
 -/
 
-set_option maxHeartbeats 500 in
+set_option maxHeartbeats 320 in
 theorem nestedPipeline_k4_rfl :
-    evalTauApprox (nestedPipelineApprox 4 100 17) = some (110, 110) :=
+    evalTauApprox (nestedPipelineApprox 4 100 17) = some (110, 110) := by
   rfl
 
-set_option maxHeartbeats 900 in
+set_option maxHeartbeats 570 in
 theorem nestedPipeline_k8_rfl :
-    evalTauApprox (nestedPipelineApprox 8 100 33) = some (136, 136) :=
+    evalTauApprox (nestedPipelineApprox 8 100 33) = some (136, 136) := by
   rfl
 
-set_option maxHeartbeats 1700 in
+set_option maxHeartbeats 1060 in
 theorem nestedPipeline_k16_rfl :
-    evalTauApprox (nestedPipelineApprox 16 100 65) = some (236, 236) :=
+    evalTauApprox (nestedPipelineApprox 16 100 65) = some (236, 236) := by
   rfl
 
-set_option maxHeartbeats 3300 in
+set_option maxHeartbeats 2050 in
 theorem nestedPipeline_k32_rfl :
-    evalTauApprox (nestedPipelineApprox 32 100 129) = some (628, 628) :=
+    evalTauApprox (nestedPipelineApprox 32 100 129) = some (628, 628) := by
   rfl
 
 set_option maxHeartbeats 150 in
@@ -857,6 +935,21 @@ set_option maxHeartbeats 22500 in
 theorem nestedPipelineObserve_k8_kernel :
     evalTauObserve 33 (nestedPipelineITree 8 100) = some (136, 136) := by
   decide +kernel
+
+set_option maxHeartbeats 540 in
+theorem nestedPipelineObserve_k1_rfl :
+    evalTauObserve 5 (nestedPipelineITree 1 100) = some (101, 101) := by
+  rfl
+
+set_option maxHeartbeats 2260 in
+theorem nestedPipelineObserve_k2_rfl :
+    evalTauObserve 9 (nestedPipelineITree 2 100) = some (103, 103) := by
+  rfl
+
+set_option maxHeartbeats 7300 in
+theorem nestedPipelineObserve_k3_rfl :
+    evalTauObserve 13 (nestedPipelineITree 3 100) = some (106, 106) := by
+  rfl
 
 /-- error: (kernel) deterministic timeout -/
 #guard_msgs in
@@ -1175,83 +1268,155 @@ The minimal fuel of `checkRawByteTrace{Full,ObsErased}Bounded`,
 call (the handler-return `.tau` of `silenceMirObs`'s `ITree.trigger`): `7 * k + 11`.
 Every minimum is pinned by `= false` boundary canaries one unit below.
 
-Measured heartbeats (whole declaration; the `*Bounded` checkers through elaborator
-`rfl`, exactly as `cargo-anneal` emits `checkRawByteTrace*Bounded_sound ... rfl`,
-and the `*Approx` checkers kernel-only through `decide +kernel`):
+Measured heartbeats (whole declaration). The `generated` columns are the exact
+shape `cargo-anneal` emits per trace, a `checkRawByteTrace*Bounded_sound ... rfl`
+application proving the `ReachesRet` consistency statement
+(`mirLoop_k*_{full,obsErased}_generated`); the `kernel` columns discharge the same
+hypothesis `by decide +kernel` (`*_generated_kernel`); the `*Approx` columns run the
+policy-exact `CofixA` route kernel-only:
 
-| `k` | fuel (`6k+11`) | `FullBounded` `rfl` | `ObsErasedBounded` `rfl` | `FullApprox` kernel | `ObsErasedApprox` kernel |
-|----:|---------------:|--------------------:|-------------------------:|--------------------:|-------------------------:|
-|   4 |             35 |                8379 |                     8337 |                1674 |                     1700 |
-|   8 |             59 |               10399 |                    10324 |                2101 |                     2147 |
-|  16 |            107 |               14465 |                    14316 |                2964 |                     3048 |
-|  32 |            203 |               22666 |                    22364 |                4722 |                     4885 |
+| `k` | fuel (`6k+11`) | full generated | full kernel | obsErased generated | obsErased kernel | `FullApprox` kernel | `ObsErasedApprox` kernel |
+|----:|---------------:|---------------:|------------:|--------------------:|-----------------:|--------------------:|-------------------------:|
+|   4 |             35 |           4695 |        1630 |                4670 |             1623 |                1646 |                     1670 |
+|   8 |             59 |           5875 |        2026 |                5830 |             2014 |                2054 |                     2096 |
+|  16 |            107 |           8248 |        2828 |                8161 |             2806 |                2878 |                     2956 |
+|  32 |            203 |          13044 |        4465 |               12881 |             4423 |                4561 |                     4709 |
 
-Kernel-only confirmation of the same `checkRawByteTraceFullBounded` obligation at
-`k = 32` costs `4535` heartbeats (`mirLoop_k32_full_kernel_reachesRet`),
-about 5x less than elaborator `rfl`, adds no axioms (no `Lean.ofReduceBool`), and
-is not bounded by `maxRecDepth`: at `k = 64` elaborator `rfl` exceeds the default
-`maxRecDepth` (`mirLoop_k64_full_rfl_exceeds_maxRecDepth`) while `decide +kernel`
-succeeds (`mirLoop_k64_full_kernel_reachesRet`). Replacing the trailing `rfl` of
-the generated `checkRawByteTrace*Bounded_sound` applications with
-`(by decide +kernel)` is the available end-to-end accelerator; the checker
-definitions themselves are not the bottleneck (`decodeRawByteTrace` is about 13%
-and `stepMirState` most of the rest).
+Discharging the generated hypothesis kernel-only is 2.9x cheaper, adds no axioms
+(no `Lean.ofReduceBool`), and does not need the elaborator's `maxRecDepth`: at
+`k = 64` the generated `rfl` application exceeds the default `maxRecDepth`
+(`mirLoop_k64_full_generated_exceeds_maxRecDepth`; generated chunks raise it to
+`100000`) while `decide +kernel` succeeds in `7871`
+(`mirLoop_k64_full_generated_kernel`). A standalone `theorem ... := rfl` on the
+checker is the most expensive form (`22654` at `k = 32`). The checker definitions
+themselves are not the bottleneck (`decodeRawByteTrace` is about 13% and
+`stepMirState` most of the rest).
+
+Every generated chunk also emits a `diagnoseRawByteTrace*Bounded ... tagName = "ok"`
+theorem (`13066` at `k = 32`, `mirLoop_k32_diag_tag_rfl`), which repeats the whole
+evaluation. `diagnoseRawByteTraceFullBounded_isOk` proves that the diagnosis accepts
+exactly when `checkRawByteTraceFullBounded` does, so the consistency theorem follows
+from the already-confirmed tag in `18` heartbeats
+(`mirLoop_k32_full_from_diag_tag`) instead of a second `13044`-heartbeat evaluation.
+Likewise `checkRawByteTraceObsErasedBounded_of_full` derives the branch-erased
+certificate for the same recording with its `.branch` events removed
+(`eraseRawBranchEvents`, `mirLoop_k32_obsErased_from_diag_tag`) instead of a third
+`12881`-heartbeat evaluation, so one evaluation per recording suffices for all
+three theorems a generated chunk emits.
 -/
 
 @[reducible]
 def emptyShadowProvenanceTable : ShadowProvenanceTable := []
 
-set_option maxHeartbeats 11000 in
-theorem mirLoop_k4_full_rfl :
-    checkRawByteTraceFullBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true :=
-  rfl
+/-- The `ReachesRet` consistency statement `cargo-anneal` emits for the full
+(`checkBranches = true`) loop trace at depth `k`. -/
+abbrev LoopFullConsistent (k : Nat) : Prop :=
+  ∃ obsTrace tr out,
+    decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace k) = some obsTrace ∧
+    MatchesObservedEvents obsTrace.events tr ∧
+    MatchesObservedOutcome obsTrace.outcome out ∧
+    ReachesRet
+      (mirStatefulTree mirLoopWithOracleCall obsTrace.args
+        { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+      tr out
 
-set_option maxHeartbeats 13500 in
-theorem mirLoop_k8_full_rfl :
-    checkRawByteTraceFullBounded 59 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 8) = true :=
-  rfl
+/-- The `ReachesRet` consistency statement `cargo-anneal` emits for the
+branch-erased (`checkBranches = false`) loop trace at depth `k`. -/
+abbrev LoopObsErasedConsistent (k : Nat) : Prop :=
+  ∃ obsTrace tr out,
+    decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace k) = some obsTrace ∧
+    MatchesObservedEvents obsTrace.events tr ∧
+    MatchesObservedOutcome obsTrace.outcome out ∧
+    ReachesRet
+      (mirObsErasedStatefulTree mirLoopWithOracleCall obsTrace.args
+        { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+      tr out
+
+set_option maxHeartbeats 6100 in
+theorem mirLoop_k4_full_generated : LoopFullConsistent 4 :=
+  checkRawByteTraceFullBounded_sound 35 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 4) rfl
+
+set_option maxHeartbeats 2120 in
+theorem mirLoop_k4_full_generated_kernel : LoopFullConsistent 4 :=
+  checkRawByteTraceFullBounded_sound 35 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 4) (by decide +kernel)
+
+set_option maxHeartbeats 6080 in
+theorem mirLoop_k4_obsErased_generated : LoopObsErasedConsistent 4 :=
+  checkRawByteTraceObsErasedBounded_sound 35 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) rfl
+
+set_option maxHeartbeats 2110 in
+theorem mirLoop_k4_obsErased_generated_kernel : LoopObsErasedConsistent 4 :=
+  checkRawByteTraceObsErasedBounded_sound 35 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) (by decide +kernel)
+
+set_option maxHeartbeats 7640 in
+theorem mirLoop_k8_full_generated : LoopFullConsistent 8 :=
+  checkRawByteTraceFullBounded_sound 59 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 8) rfl
+
+set_option maxHeartbeats 2640 in
+theorem mirLoop_k8_full_generated_kernel : LoopFullConsistent 8 :=
+  checkRawByteTraceFullBounded_sound 59 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 8) (by decide +kernel)
+
+set_option maxHeartbeats 7580 in
+theorem mirLoop_k8_obsErased_generated : LoopObsErasedConsistent 8 :=
+  checkRawByteTraceObsErasedBounded_sound 59 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) rfl
+
+set_option maxHeartbeats 2620 in
+theorem mirLoop_k8_obsErased_generated_kernel : LoopObsErasedConsistent 8 :=
+  checkRawByteTraceObsErasedBounded_sound 59 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) (by decide +kernel)
 
 set_option maxRecDepth 2048 in
-set_option maxHeartbeats 19000 in
-theorem mirLoop_k16_full_rfl :
-    checkRawByteTraceFullBounded 107 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 16) = true :=
-  rfl
+set_option maxHeartbeats 10720 in
+theorem mirLoop_k16_full_generated : LoopFullConsistent 16 :=
+  checkRawByteTraceFullBounded_sound 107 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 16) rfl
 
-set_option maxRecDepth 4096 in
-set_option maxHeartbeats 29500 in
-theorem mirLoop_k32_full_rfl :
-    checkRawByteTraceFullBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true :=
-  rfl
-
-set_option maxHeartbeats 11000 in
-theorem mirLoop_k4_obsErased_rfl :
-    checkRawByteTraceObsErasedBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true :=
-  rfl
-
-set_option maxHeartbeats 13500 in
-theorem mirLoop_k8_obsErased_rfl :
-    checkRawByteTraceObsErasedBounded 59 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) = true :=
-  rfl
+set_option maxHeartbeats 3680 in
+theorem mirLoop_k16_full_generated_kernel : LoopFullConsistent 16 :=
+  checkRawByteTraceFullBounded_sound 107 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 16) (by decide +kernel)
 
 set_option maxRecDepth 2048 in
-set_option maxHeartbeats 18700 in
-theorem mirLoop_k16_obsErased_rfl :
-    checkRawByteTraceObsErasedBounded 107 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) = true :=
-  rfl
+set_option maxHeartbeats 10610 in
+theorem mirLoop_k16_obsErased_generated : LoopObsErasedConsistent 16 :=
+  checkRawByteTraceObsErasedBounded_sound 107 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) rfl
+
+set_option maxHeartbeats 3650 in
+theorem mirLoop_k16_obsErased_generated_kernel : LoopObsErasedConsistent 16 :=
+  checkRawByteTraceObsErasedBounded_sound 107 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) (by decide +kernel)
 
 set_option maxRecDepth 4096 in
-set_option maxHeartbeats 29000 in
-theorem mirLoop_k32_obsErased_rfl :
-    checkRawByteTraceObsErasedBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = true :=
-  rfl
+set_option maxHeartbeats 16960 in
+theorem mirLoop_k32_full_generated : LoopFullConsistent 32 :=
+  checkRawByteTraceFullBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) rfl
+
+set_option maxHeartbeats 5810 in
+theorem mirLoop_k32_full_generated_kernel : LoopFullConsistent 32 :=
+  checkRawByteTraceFullBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) (by decide +kernel)
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 16750 in
+theorem mirLoop_k32_obsErased_generated : LoopObsErasedConsistent 32 :=
+  checkRawByteTraceObsErasedBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) rfl
+
+set_option maxHeartbeats 5750 in
+theorem mirLoop_k32_obsErased_generated_kernel : LoopObsErasedConsistent 32 :=
+  checkRawByteTraceObsErasedBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) (by decide +kernel)
 
 set_option maxHeartbeats 2200 in
 theorem mirLoop_k4_fullApprox_kernel :
@@ -1384,7 +1549,7 @@ def mkLoopInlinedObsErasedRawTrace (k : Nat) : RawByteTrace := {
   outcome := .normal (encodeU32LeBytes (expectedLoopAccum k))
 }
 
-set_option maxHeartbeats 5500 in
+set_option maxHeartbeats 2200 in
 /-- Multi-frame inlined-callee verification at `k = 4`: with `ffiStepOracleInlinedBody`
 in `inlinedCallees`, all `WithCallees` checkers (`*Bounded`, `*BoundedFast`, and
 `*Approx`) accept at exact minimal fuel `10 * 4 + 11 = 51` and reject at `50`. -/
@@ -1443,45 +1608,10 @@ theorem mirLoop_exact_fuel_boundaries :
       emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = false := by
   decide +kernel
 
-/-- End-to-end `ReachesRet` soundness at $k = 32$ for `checkRawByteTraceFullBounded`
-and `checkRawByteTraceObsErasedBounded` (from the elaborator-`rfl` confirmations)
-and for the `CofixA` route `checkRawByteTraceObsErasedApprox`. -/
-theorem mirLoop_k32_full_reachesRet :
-    ∃ obsTrace tr out,
-      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
-        emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = some obsTrace ∧
-      MatchesObservedEvents obsTrace.events tr ∧
-      MatchesObservedOutcome obsTrace.outcome out ∧
-      ReachesRet
-        (mirStatefulTree mirLoopWithOracleCall obsTrace.args
-          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
-  checkRawByteTraceFullBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) mirLoop_k32_full_rfl
-
-theorem mirLoop_k32_obsErased_reachesRet :
-    ∃ obsTrace tr out,
-      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
-        emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = some obsTrace ∧
-      MatchesObservedEvents obsTrace.events tr ∧
-      MatchesObservedOutcome obsTrace.outcome out ∧
-      ReachesRet
-        (mirObsErasedStatefulTree mirLoopWithOracleCall obsTrace.args
-          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
-  checkRawByteTraceObsErasedBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) mirLoop_k32_obsErased_rfl
-
-theorem mirLoop_k32_obsErasedApprox_reachesRet :
-    ∃ obsTrace tr out,
-      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
-        emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = some obsTrace ∧
-      MatchesObservedEvents obsTrace.events tr ∧
-      MatchesObservedOutcome obsTrace.outcome out ∧
-      ReachesRet
-        (mirObsErasedStatefulTree mirLoopWithOracleCall obsTrace.args
-          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
+/-- End-to-end `ReachesRet` soundness at $k = 32$ for the `CofixA` route
+`checkRawByteTraceObsErasedApprox` (the `*Bounded` routes are the
+`mirLoop_k*_{full,obsErased}_generated` theorems above). -/
+theorem mirLoop_k32_obsErasedApprox_reachesRet : LoopObsErasedConsistent 32 :=
   checkRawByteTraceObsErasedApprox_sound 235 mirLoopWithOracleCall [ffiStepOracleSig]
     emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) mirLoop_k32_obsErasedApprox_kernel
 
@@ -1489,53 +1619,71 @@ theorem mirLoop_k32_obsErasedApprox_reachesRet :
 #guard_msgs (whitespace := lax) in
 #print axioms mirLoop_k32_obsErasedApprox_reachesRet
 
-set_option maxHeartbeats 5900 in
-/-- Kernel-only end-to-end soundness at `k = 32`: the `checkRawByteTraceFullBounded`
-hypothesis is discharged by `decide +kernel` instead of elaborator `rfl`. -/
-theorem mirLoop_k32_full_kernel_reachesRet :
-    ∃ obsTrace tr out,
-      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
-        emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = some obsTrace ∧
-      MatchesObservedEvents obsTrace.events tr ∧
-      MatchesObservedOutcome obsTrace.outcome out ∧
-      ReachesRet
-        (mirStatefulTree mirLoopWithOracleCall obsTrace.args
-          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
-  checkRawByteTraceFullBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) (by decide +kernel)
-
-/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_full_kernel_reachesRet' depends on axioms: [propext, Quot.sound] -/
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_full_generated_kernel' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
-#print axioms mirLoop_k32_full_kernel_reachesRet
+#print axioms mirLoop_k32_full_generated_kernel
+
+set_option maxHeartbeats 40 in
+/-- The full consistency statement at `k = 32`, derived from the `"ok"` diagnostic
+tag theorem that `cargo-anneal` already emits for every trace
+(`mirLoop_k32_diag_tag_rfl`) through `diagnoseRawByteTraceFullBounded_tag_ok_sound`,
+with no second evaluation of the MIR execution. -/
+theorem mirLoop_k32_full_from_diag_tag : LoopFullConsistent 32 :=
+  diagnoseRawByteTraceFullBounded_tag_ok_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) mirLoop_k32_diag_tag_rfl
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_full_from_diag_tag' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_k32_full_from_diag_tag
+
+/-- The recorded branch-erased loop events are exactly the full events with their
+`.branch` observations removed. -/
+theorem mkLoopObsErasedRawEventsAux_eq_erase :
+    ∀ (k i : Nat),
+      mkLoopObsErasedRawEventsAux k i = eraseRawBranchEvents (mkLoopFullRawEventsAux k i)
+  | 0, _ => rfl
+  | k + 1, i => by
+    simp only [mkLoopObsErasedRawEventsAux, eraseRawBranchEvents]
+    rw [mkLoopObsErasedRawEventsAux_eq_erase k (i + 1)]
+
+theorem mkLoopObsErasedRawTrace_eq_erase (k : Nat) :
+    mkLoopObsErasedRawTrace k =
+      { mkLoopFullRawTrace k with events := eraseRawBranchEvents (mkLoopFullRawTrace k).events } := by
+  simp only [mkLoopObsErasedRawTrace, mkLoopObsErasedRawEventsAux_eq_erase]
+
+set_option maxHeartbeats 300 in
+/-- The branch-erased consistency statement at `k = 32`, derived from the full
+acceptance carried by the already-confirmed diagnostic tag
+(`checkRawByteTraceObsErasedBounded_of_full` over `eraseRawBranchEvents`), with no
+further evaluation of the MIR execution. -/
+theorem mirLoop_k32_obsErased_from_diag_tag : LoopObsErasedConsistent 32 := by
+  have h_full : checkRawByteTraceFullBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true := by
+    rw [← diagnoseRawByteTraceFullBounded_isOk]
+    exact TraceReplayDiag.isOk_of_tagName_eq_ok mirLoop_k32_diag_tag_rfl
+  have h := checkRawByteTraceObsErasedBounded_of_full 203 mirLoopWithOracleCall
+    [ffiStepOracleSig] emptyShadowProvenanceTable (mkLoopFullRawTrace 32) h_full
+  rw [← mkLoopObsErasedRawTrace_eq_erase] at h
+  exact checkRawByteTraceObsErasedBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) h
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_obsErased_from_diag_tag' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_k32_obsErased_from_diag_tag
 
 /--
-error: maximum recursion depth has been reached
-use `set_option maxRecDepth <num>` to increase limit
-use `set_option diagnostics true` to get diagnostic information
----
 error: maximum recursion depth has been reached
 use `set_option maxRecDepth <num>` to increase limit
 use `set_option diagnostics true` to get diagnostic information
 -/
 #guard_msgs in
 set_option maxHeartbeats 15000 in
-theorem mirLoop_k64_full_rfl_exceeds_maxRecDepth :
-    checkRawByteTraceFullBounded 395 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 64) = true :=
-  rfl
+theorem mirLoop_k64_full_generated_exceeds_maxRecDepth : LoopFullConsistent 64 :=
+  checkRawByteTraceFullBounded_sound 395 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 64) rfl
 
-set_option maxHeartbeats 10400 in
-theorem mirLoop_k64_full_kernel_reachesRet :
-    ∃ obsTrace tr out,
-      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
-        emptyShadowProvenanceTable (mkLoopFullRawTrace 64) = some obsTrace ∧
-      MatchesObservedEvents obsTrace.events tr ∧
-      MatchesObservedOutcome obsTrace.outcome out ∧
-      ReachesRet
-        (mirStatefulTree mirLoopWithOracleCall obsTrace.args
-          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
+set_option maxHeartbeats 10240 in
+theorem mirLoop_k64_full_generated_kernel : LoopFullConsistent 64 :=
   checkRawByteTraceFullBounded_sound 395 mirLoopWithOracleCall [ffiStepOracleSig]
     emptyShadowProvenanceTable (mkLoopFullRawTrace 64) (by decide +kernel)
 
