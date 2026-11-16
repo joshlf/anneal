@@ -38,13 +38,16 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    `mir_cfgCertificate_sound` with the exact 2-point invariant. Test 2b-asym
    replays an asymmetric 5-block diamond (`bb1 -> bb2` vs. `bb3`, `armSteps =
    Nat.max 2 1 = 2` with `.outOfFuel` at fuel `3` and convergence at fuel `4`),
-   also as a segment (`mirCfg_segmentSim_of_emitsSubIdWraps`) landing exactly on
-   the live join state, and the rejection canaries check that a rejecting
-   wrapper, a block-level leaked handle (`diamondLeakRetBlocks`), or a guarded
+   through `mir_blockCfg_sound`, through `CfgCertificate.asymDiamond` /
+   `mir_asymDiamond_cfgCertificate_sound`, and as a segment
+   (`mirCfg_segmentSim_of_emitsSubIdWraps`) landing exactly on the live join
+   state, while the rejection canaries check that a rejecting wrapper, a
+   block-level leaked handle (`diamondLeakRetBlocks`), or a guarded
    early-return leaked handle rejected by `.convergedJump`'s wrapper
-   (`diamondGuardedLeakBlocks`) faults. Test 2d
-   certifies loops from strong-descent cutpoints
-   (`rank s' < rank s`) with `mir_whileLoop_cfgCertificate_of_cutpoint`,
+   (`diamondGuardedLeakBlocks`) faults in both `stepBasicBlock` and
+   `evalFnValue`. Test 2d certifies loops from strong-descent cutpoints
+   (`rank s' < rank s`) with `mir_whileLoop_cfgCertificate_of_cutpoint` and
+   `mir_whileLoop_cfgCertificate_of_cutpoint_blockRel`,
    including the stride-3 `while i < 5` loop whose live header computes
    `Lt(i, 5)` and whose rank drops `5 → 2 → 0`.
 3. **Hybrid `SpatialPin` freeze → `zerocopy` byte write → unpin**: the frozen
@@ -1173,6 +1176,39 @@ def diamondCert : CfgCertificate stdValAlg :=
 
 theorem diamondCert_blocks_eq : diamondCert.blocks = diamondBlocks := rfl
 
+/-- Unqualified composition of `evalPlan_skip_continuing` and
+`evalPlan_branch_continuing` (from `MirLiftCoreInterop`) with
+`evalPlan_act_continuing` and `evalPlan_seq_continuing` (from
+`V2026_06_01Bridge`), proving that both `diamondCert.plan` and a branch with a
+`.skip` arm produce only `.continuing` flows (regression canary against
+ambiguous duplicate declarations across namespaces). -/
+theorem diamondFullPlan_and_skip_branch_continuing :
+    (∀ s f, evalPlan stdValAlg diamondCert.plan s = .ok f →
+      Exists fun s' => f = .continuing s') ∧
+    (∀ s f,
+      evalPlan stdValAlg
+        (.branch (.use (.localSub 0 [])) diamondArmTruePlan .skip) s = .ok f →
+      Exists fun s' => f = .continuing s') :=
+  ⟨evalPlan_seq_continuing stdValAlg (fun _ _ => rfl)
+     (wfPlan_seq stdValAlg
+       (wfPlan_branch stdValAlg (.use (.localSub 0 []))
+         (fun _ _ => rfl) (fun _ _ => rfl))
+       diamondPostPlan_wf)
+     (evalPlan_act_continuing stdValAlg _)
+     (evalPlan_seq_continuing stdValAlg
+       (wfPlan_branch stdValAlg (.use (.localSub 0 []))
+         (fun _ _ => rfl) (fun _ _ => rfl))
+       diamondPostPlan_wf
+       (evalPlan_branch_continuing stdValAlg (.use (.localSub 0 []))
+         (fun _ _ => rfl) (fun _ _ => rfl)
+         (evalPlan_act_continuing stdValAlg _)
+         (evalPlan_act_continuing stdValAlg _))
+       diamondPostPlan_continuing),
+   evalPlan_branch_continuing stdValAlg (.use (.localSub 0 []))
+     (fun _ _ => rfl) (wfPlan_skip stdValAlg)
+     (evalPlan_act_continuing stdValAlg _)
+     (evalPlan_skip_continuing stdValAlg)⟩
+
 /-- **Test 2b-cert (`CfgCertificate.diamond` / `mir_diamond_cfgCertificate_sound`
 over a symbolic `.convergedJump 1` diamond)**: certifies `diamondBody` from
 symbolic `diamondSt0 c` (`_0 = .symBool c`) through `CfgCertificate.diamond` and
@@ -1334,17 +1370,40 @@ def diamondGuardedLeakBlocks : List (BasicBlock StdVal) :=
    ⟨.seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 50)))) (.act (.endLoan 0)),
      .ret (.use (.localSub 3 []))⟩]
 
-/-- **Live `stepBasicBlock` handle-leak rejection under `.convergedJump`**:
+/-- Structured `FlowPlan` corresponding to `diamondGuardedLeakBlocks`: arm `1`
+contains a guarded `.earlyReturn [0] [] (.use (.localSub 4 []))` of the stale
+borrow handle `_4 = .refVal 0 []`. -/
+def diamondGuardedLeakPlan : FlowPlan StdVal :=
+  .seq diamondPrePlan
+    (.seq
+      (.branch (.use (.localSub 0 []))
+        (.seq diamondArmTruePlan
+          (.branch (.use (.localSub 0 []))
+            (.earlyReturn [0] [] (.use (.localSub 4 [])))
+            .skip))
+        diamondArmFalsePlan)
+      diamondPostPlan)
+
+/-- **Live `stepBasicBlock` and `evalFnValue` handle-leak rejection under
+`.convergedJump`**:
 1. On `diamondLeakRetBlocks`, `bb0` emits `.convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)`,
    and `bb3` faults in `stepBasicBlock` when returning `_4 = .refVal 0 []`, so
-   `runBlockCfg` and `blockCfgStep` fault at fuel `3`.
+   `runBlockCfg`, `blockCfgStep`, and the structured plan evaluation
+   `evalFnValue stdValAlg (diamondParams c) diamondCert.plan (.use (.localSub 4 []))`
+   all fault / fail (`¬ HoldsFnSpec`).
 2. On `diamondGuardedLeakBlocks`, `bb0` emits `.convergedJump 1 wrapJoined 3 (diamondStJoin c)`
    (via `finishConvergedBranch`'s `.guardedContinuing` branch), `bb3` succeeds in
    `stepBasicBlock` with `.ret (diamondSymOut c)`, and `wrapJoined (diamondSymOut c) = none`
-   rejects the merged output, so `runBlockCfg` and `blockCfgStep` fault at fuel `3`
-   and converge to no postcondition `P`. -/
+   rejects the merged output, so `runBlockCfg`, `blockCfgStep`, and the
+   structured plan evaluation `evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan (.use (.localSub 3 []))`
+   all fault / fail (`¬ HoldsFnSpec`) and converge to no postcondition `P`. -/
 theorem diamondLeakBlocks_stepBasicBlock_fault_canaries
     (c : Bool) (P : FuncOut StdVal → Prop) :
+    evalFnValue stdValAlg (diamondParams c) diamondCert.plan
+      (.use (.localSub 4 [])) = .fail ∧
+    ¬ HoldsFnSpec
+      (evalFnValue stdValAlg (diamondParams c) diamondCert.plan
+        (.use (.localSub 4 []))) P ∧
     stepBasicBlock stdValAlg diamondLeakRetBlocks 0 (diamondSt0 c) =
       .convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c) ∧
     stepBasicBlock stdValAlg diamondLeakRetBlocks 3 (diamondStJoin c) = .fault ∧
@@ -1356,6 +1415,11 @@ theorem diamondLeakBlocks_stepBasicBlock_fault_canaries
     ¬ Anneal.PureMirExec.WpConverges
       (blockCfgStep (stepBasicBlock stdValAlg diamondLeakRetBlocks))
       ⟨some, 0, diamondSt0 c, 0⟩ P ∧
+    evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan
+      (.use (.localSub 3 [])) = .fail ∧
+    ¬ HoldsFnSpec
+      (evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan
+        (.use (.localSub 3 []))) P ∧
     stepBasicBlock stdValAlg diamondGuardedLeakBlocks 3 (diamondStJoin c) =
       .ret (diamondSymOut c) ∧
     (Exists fun wrapJoined =>
@@ -1370,6 +1434,14 @@ theorem diamondLeakBlocks_stepBasicBlock_fault_canaries
     ¬ Anneal.PureMirExec.WpConverges
       (blockCfgStep (stepBasicBlock stdValAlg diamondGuardedLeakBlocks))
       ⟨some, 0, diamondSt0 c, 0⟩ P := by
+  have hPlanFailRet :
+      evalFnValue stdValAlg (diamondParams c) diamondCert.plan
+        (.use (.localSub 4 [])) = .fail := by
+    cases c <;> rfl
+  have hPlanFailGuarded :
+      evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan
+        (.use (.localSub 3 [])) = .fail := by
+    cases c <;> rfl
   have hFaultRet :
       runBlockCfg (stepBasicBlock stdValAlg diamondLeakRetBlocks) 0
         (diamondSt0 c) 3 = .fault := by
@@ -1378,12 +1450,16 @@ theorem diamondLeakBlocks_stepBasicBlock_fault_canaries
       runBlockCfg (stepBasicBlock stdValAlg diamondGuardedLeakBlocks) 0
         (diamondSt0 c) 3 = .fault := by
     cases c <;> rfl
-  refine ⟨by cases c <;> rfl,
+  refine ⟨hPlanFailRet,
+    by rw [hPlanFailRet]; exact holdsFnSpec_not_fail P,
+    by cases c <;> rfl,
     by cases c <;> rfl,
     hFaultRet,
     by cases c <;> rfl,
     not_wpConverges_blockCfgStep_of_runBlockCfg_fault
       (stepBasicBlock stdValAlg diamondLeakRetBlocks) hFaultRet P,
+    hPlanFailGuarded,
+    by rw [hPlanFailGuarded]; exact holdsFnSpec_not_fail P,
     by cases c <;> rfl,
     by cases c <;> exact ⟨_, rfl, rfl⟩,
     hFaultGuarded,
@@ -1689,6 +1765,80 @@ theorem asymDiamond_segmentSim_to_join (c : Bool) :
   · exact (Nat.succ_ne_zero 3 h).elim
   · exact hMs
 
+def asymDiamondArmTrue2Plan : FlowPlan StdVal :=
+  .act (.assign (.localSub 1 []) (.constVal (.nat 20)))
+
+def asymDiamondPostPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.derefSub 4 []) (.use (.localSub 1 [])))) (.act (.endLoan 0))
+
+theorem asymDiamondPostPlan_wf : WfPlan stdValAlg asymDiamondPostPlan :=
+  fun _ _ => rfl
+
+theorem asymDiamondPostPlan_continuing :
+    ∀ s f, evalPlan stdValAlg asymDiamondPostPlan s = .ok f →
+      Exists fun s' => f = .continuing s' :=
+  evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+
+/-- 5-block asymmetric diamond `CfgCertificate` for `asymDiamondBlocks`,
+constructed via `CfgCertificate.asymDiamond` at fuel `4`. -/
+def asymDiamondCert : CfgCertificate stdValAlg :=
+  CfgCertificate.asymDiamond stdValAlg diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan asymDiamondArmTrue2Plan diamondArmFalsePlan
+    asymDiamondPostPlan (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl)
+    asymDiamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    asymDiamondPostPlan_continuing
+
+theorem asymDiamondCert_blocks_eq :
+    asymDiamondCert.blocks = asymDiamondBlocks := rfl
+
+/-- **Test 2b-asym-cert (`CfgCertificate.asymDiamond` /
+`mir_asymDiamond_cfgCertificate_sound` over a symbolic `.convergedJump 2`
+asymmetric diamond)**: certifies `asymDiamondBody` from symbolic `diamondSt0 c`
+(`_0 = .symBool c`) through `CfgCertificate.asymDiamond` and
+`mir_asymDiamond_cfgCertificate_sound` from `HoldsFnSpec` of its structured plan
+alone, where block `0` emits `.convergedJump 2 (handleFreeOutOpt stdValAlg) 4
+(asymDiamondStJoin c)`. -/
+theorem asymDiamond_cfgCertificate_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges asymDiamondBody (asymDiamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = asymDiamondSymOut c) o []) :=
+  mir_asymDiamond_cfgCertificate_sound tagOfLoan asymDiamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan asymDiamondArmTrue2Plan diamondArmFalsePlan
+    asymDiamondPostPlan (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl)
+    asymDiamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    asymDiamondPostPlan_continuing
+    (diamondParams c) (diamondSt0 c) (· = asymDiamondSymOut c)
+    (asymDbBindingsAt c) id (asymDbSymExtra c) []
+    (diamond_init c) (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c <;>
+          exact stepsTo_of_runMirToBlock_reached (asymDiamond_runMirToBlock _)
+            ⟨rfl, rfl, asymDiamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, asymDiamond_ret_refines false, rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, asymDiamond_ret_refines true, rfl⟩)
+    ⟨rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .symBool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
 /-! ### Test 2d: Multi-Step Strong-Descent (`rank s' < rank s`, `Δrank ≥ 2`) Loop Cutpoints over Live `V2026_06_01` MIR -/
 
 /-- Strong-descent ranking function on `loopBorrowBody` (`Test 2c`): an
@@ -1952,10 +2102,9 @@ def strideExtra (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
 
 /-- **Test 2d-2 (2-iteration stride-3 strong-descent cutpoint over live
 `V2026_06_01` MIR)**: `strideLoopRank` (`5 - i`) drops `5 → 2 → 0` (`Δrank = 3`
-then `Δrank = 2`), and `mir_whileLoop_cfgCertificate_of_cutpoint` certifies
-`strideLoopBody` end-to-end to `MirWpConverges` returning `27`; the live block
-obligations go through the wrapper-agnostic `mirCfg_forwardSim_of_emitsSubIdWraps`
-(the loop CFG emits no wrappers: `whileLoopBlocks_emitsSubIdWraps`). -/
+then `Δrank = 2`), and `mir_whileLoop_cfgCertificate_of_cutpoint_blockRel`
+certifies `strideLoopBody` end-to-end to `MirWpConverges` returning `27` from
+the wrapper-free `mirCfgBlockRel` obligations directly. -/
 theorem strideLoop_strongDescent_cutpoint_sound :
     Anneal.MirFuelFree.MirWpConverges strideLoopBody strideMs0
       (LiftedMirPost tagOfLoan (fun out => out.ret = .nat 27)) := by
@@ -1983,19 +2132,13 @@ theorem strideLoop_strongDescent_cutpoint_sound :
     ⟨⟨trivial, trivial⟩,
      mirLocalsRel_of_localsRefine
        ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
-  refine mir_whileLoop_cfgCertificate_of_cutpoint tagOfLoan strideLoopBody 5
-    strideCond stridePlanBody (.use (.localSub 1 []))
+  refine mir_whileLoop_cfgCertificate_of_cutpoint_blockRel tagOfLoan
+    strideLoopBody 5 strideCond stridePlanBody (.use (.localSub 1 []))
     stridePlanBody_wf stridePlanBody_continuing
     [⟨.byVal, .nat 0⟩, ⟨.byVal, .nat 7⟩] strideSt0 (fun out => out.ret = .nat 27)
     strideCutInv strideLoopRank strideCutpoint_step strideCutpoint_exit
     (fun _ => []) id strideExtra [] rfl (Or.inl rfl) (Nat.le_refl 5) ?_
-    ⟨subIdWrap_some, rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
-  refine mirCfg_forwardSim_of_emitsSubIdWraps tagOfLoan strideLoopBody
-    (CfgCertificate.whileLoop stdValAlg 5 strideCond stridePlanBody
-      (.use (.localSub 1 [])) stridePlanBody_wf stridePlanBody_continuing).blocks
-    (fun _ => []) id strideExtra []
-    (whileLoopBlocks_emitsSubIdWraps stdValAlg strideCond stridePlanBody
-      (.use (.localSub 1 [])) stridePlanBody_continuing _) ?_
+    ⟨rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
   intro bb st ms ⟨_, _, _, hEx⟩
   rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ |
       ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
