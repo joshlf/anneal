@@ -1868,6 +1868,14 @@ private theorem ofITree_iter_bind_aux {E : Effect.{u}} {I R : Type u}
         rw [vis_bind, ofITree_vis, ofITree_vis]
         exact congrArg (CofixA.vis i) (funext fun o => ih d' (k o) hd')
 
+/-- Depth-invariance of `iterWalkApprox`: any continuation approximant `ofITree d cur`
+of depth `d ≥ n` computes the depth-`n` approximant of the `ITree.iter` bind loop. -/
+theorem iterWalkApprox_ofITree_le {E : Effect.{u}} {I R : Type u}
+    (body : I → ITree E (I ⊕ R)) {n d : Nat} (cur : ITree E (I ⊕ R)) (hd : n ≤ d) :
+    iterWalkApprox (fun i m => ofITree m (body i)) n (ofITree d cur) =
+      ofITree n (cur >>= Sum.elim (fun next => ITree.tau (ITree.iter body next)) ITree.ret) :=
+  (ofITree_iter_bind_aux body n d cur hd).symm
+
 /-- Exact equational bridge for `ITree.iter` on `CofixA`. -/
 @[simp]
 theorem ofITree_iter {E : Effect.{u}} {I R : Type u}
@@ -2245,8 +2253,9 @@ theorem ReachesRetApprox.toReachesRet {E : Effect.{u}} {R : Type u} [FaultEffect
   induction n generalizing t tr with
   | zero => nomatch h
   | succ m ih =>
-    dsimp [ofITree] at h
-    cases ht : t.observe <;> rw [ht] at h
+    revert h
+    dsimp [ofITree]
+    cases ht : t.observe <;> intro h
     · cases h
       exact ⟨t, .refl t, ht⟩
     · cases h with
@@ -2441,6 +2450,24 @@ theorem checkTraceApprox_sound {E : Effect.{u}} {R : Type u}
 
 /-! ### Fuel Monotonicity, Boolean-Checker Completeness \& Walker-Level Adequacy -/
 
+/-- Monotonicity of `ReachesRetApprox` under `CofixA.trunc`: any reachability
+witness on a truncated approximant `a.trunc` lifts to `a`. -/
+theorem ReachesRetApprox.of_trunc {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n : Nat} {a : CofixA E R (n + 1)} {tr : List (Event E)} {r : R}
+    (h : ReachesRetApprox a.trunc tr r) :
+    ReachesRetApprox a tr r := by
+  induction n generalizing tr with
+  | zero => nomatch h
+  | succ m ih =>
+    cases a with
+    | ret _ => cases h; exact .ret _
+    | tau _ =>
+      cases h with
+      | tau h' => exact .tau (ih h')
+    | vis _ _ =>
+      cases h with
+      | vis hnf o h' => exact .vis hnf o (ih h')
+
 /-- One-step fuel monotonicity of `ReachesRetApprox` along `ofITree`: a witness at
 depth `n` persists at depth `n + 1`. -/
 theorem ReachesRetApprox.ofITree_succ {E : Effect.{u}} {R : Type u} [FaultEffect E]
@@ -2450,14 +2477,19 @@ theorem ReachesRetApprox.ofITree_succ {E : Effect.{u}} {R : Type u} [FaultEffect
   induction n generalizing t tr with
   | zero => nomatch h
   | succ m ih =>
-    have hm : ofITree (m + 1 + 1) t =
-        match t.observe with
-        | .ret r => .ret r
-        | .tau t' => .tau (ofITree (m + 1) t')
-        | .vis i k => .vis i (fun o => ofITree (m + 1) (k o)) := rfl
-    rw [hm]
-    dsimp [ofITree] at h
-    cases ht : t.observe <;> rw [ht] at h
+    revert h
+    change
+      ReachesRetApprox
+        (match t.observe with
+         | .ret r => .ret r
+         | .tau t' => .tau (ofITree m t')
+         | .vis i k => .vis i (fun o => ofITree m (k o))) tr r →
+      ReachesRetApprox
+        (match t.observe with
+         | .ret r => .ret r
+         | .tau t' => .tau (ofITree (m + 1) t')
+         | .vis i k => .vis i (fun o => ofITree (m + 1) (k o))) tr r
+    cases t.observe <;> intro h
     · cases h; exact .ret _
     · cases h with
       | tau h' => exact .tau (ih h')
@@ -2472,6 +2504,20 @@ theorem ReachesRetApprox.ofITree_mono {E : Effect.{u}} {R : Type u} [FaultEffect
   induction hnm with
   | refl => exact h
   | step _ ih => exact ih.ofITree_succ
+
+/-- Monotonicity of `evalTauApprox` under `CofixA.trunc`: if `a.trunc` evaluates
+to `some r`, then `a` evaluates to `some r`. -/
+theorem evalTauApprox_of_trunc {E : Effect.{u}} {R : Type u}
+    {n : Nat} {a : CofixA E R (n + 1)} {r : R}
+    (h : evalTauApprox a.trunc = some r) :
+    evalTauApprox a = some r := by
+  induction n with
+  | zero => nomatch h
+  | succ m ih =>
+    cases a with
+    | ret _ => exact h
+    | tau _ => exact ih h
+    | vis _ _ => nomatch h
 
 /-- One-step fuel monotonicity of `evalTauApprox` along `ofITree`. -/
 theorem evalTauApprox_ofITree_succ {E : Effect.{u}} {R : Type u}
@@ -2510,6 +2556,18 @@ theorem checkTauRetApprox_complete {E : Effect.{u}} {R : Type u}
   unfold checkTauRetApprox
   rw [h]
   exact hp
+
+/-- Monotonicity of `checkTauRetApprox` under `CofixA.trunc`. -/
+theorem checkTauRetApprox_of_trunc {E : Effect.{u}} {R : Type u}
+    {n : Nat} {a : CofixA E R (n + 1)} {p : R → Bool}
+    (h : checkTauRetApprox a.trunc p = true) :
+    checkTauRetApprox a p = true := by
+  unfold checkTauRetApprox at h
+  cases hev : evalTauApprox a.trunc with
+  | none => rw [hev] at h; nomatch h
+  | some r =>
+    rw [hev] at h
+    exact checkTauRetApprox_complete (evalTauApprox_of_trunc hev) h
 
 /-- Exact finite-horizon adequacy of `checkTauRetApprox`: `t` silently reaches `.ret r`
 with `p r = true` iff some finite depth `n` is accepted by `checkTauRetApprox`. -/
@@ -2557,6 +2615,16 @@ theorem checkTraceApprox_complete {E : Effect.{u}} {R : Type u}
       else false) = true
     rw [ite_eq_left hnf, dite_eq_left rfl]
     exact ih hp
+
+/-- Monotonicity of `checkTraceApprox` under `CofixA.trunc`. -/
+theorem checkTraceApprox_of_trunc {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)]
+    {n : Nat} {a : CofixA E R (n + 1)} {tr : List (Event E)} {p : R → Bool}
+    (h : checkTraceApprox a.trunc tr p = true) :
+    checkTraceApprox a tr p = true := by
+  rcases checkTraceApprox_sound_reachesRetApprox h with ⟨r, hp, hr⟩
+  exact checkTraceApprox_complete hr.of_trunc hp
 
 /-- Exact finite-horizon adequacy of the boolean checker `checkTraceApprox`:
 `t` reaches some `r` with `p r = true` along `tr` iff some finite depth accepts. -/
@@ -2650,6 +2718,14 @@ theorem evalTauApprox_approxCofix_sound {E : Effect.{u}} {R S : Type u}
   rw [← ofITree_cofix] at h
   exact evalTauApprox_sound_tauStar h
 
+/-- Walker-level `ReachesRet` soundness of `evalTauApprox` on `approxCofix`. -/
+theorem evalTauApprox_approxCofix_sound_reachesRet {E : Effect.{u}} {R S : Type u} [FaultEffect E]
+    (step : S → ITreeF E R S) (s : S) {n : Nat} {r : R}
+    (h : evalTauApprox (approxCofix step n s) = some r) :
+    ReachesRet (ITree.cofix step s) [] r := by
+  rw [← ofITree_cofix] at h
+  exact evalTauApprox_sound_reachesRet h
+
 /-- Walker-level `TauStar` soundness of `evalTauApprox` on `iterApprox`. -/
 theorem evalTauApprox_iterApprox_sound {E : Effect.{u}} {I R : Type u}
     (body : I → ITree E (I ⊕ R)) (bodyA : I → (m : Nat) → CofixA E (I ⊕ R) m)
@@ -2658,6 +2734,15 @@ theorem evalTauApprox_iterApprox_sound {E : Effect.{u}} {I R : Type u}
     ∃ u, TauStar (ITree.iter body init) u ∧ u.observe = .ret r := by
   rw [iterApprox_congr hb, ← ofITree_iter] at h
   exact evalTauApprox_sound_tauStar h
+
+/-- Walker-level `ReachesRet` soundness of `evalTauApprox` on `iterApprox`. -/
+theorem evalTauApprox_iterApprox_sound_reachesRet {E : Effect.{u}} {I R : Type u} [FaultEffect E]
+    (body : I → ITree E (I ⊕ R)) (bodyA : I → (m : Nat) → CofixA E (I ⊕ R) m)
+    (hb : ∀ i m, bodyA i m = ofITree m (body i)) (init : I) {n : Nat} {r : R}
+    (h : evalTauApprox (iterApprox bodyA n init) = some r) :
+    ReachesRet (ITree.iter body init) [] r := by
+  rw [iterApprox_congr hb, ← ofITree_iter] at h
+  exact evalTauApprox_sound_reachesRet h
 
 /-- Walker-level `TauStar` soundness of `evalTauApprox` on `interpApprox`. -/
 theorem evalTauApprox_interpApprox_sound {E₁ E₂ : Effect.{u}} {R : Type u}
@@ -2672,6 +2757,19 @@ theorem evalTauApprox_interpApprox_sound {E₁ E₂ : Effect.{u}} {R : Type u}
   rw [(interpApprox_congr hh n).1, interpApprox_ofITree_le h t hd] at hc
   exact evalTauApprox_sound_tauStar hc
 
+/-- Walker-level `ReachesRet` soundness of `evalTauApprox` on `interpApprox`. -/
+theorem evalTauApprox_interpApprox_sound_reachesRet {E₁ E₂ : Effect.{u}} {R : Type u} [FaultEffect E₂]
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i))
+    (hA : (i : E₁.I) → (m : Nat) → CofixA E₂ (E₁.O i) m)
+    (hh : ∀ i m, hA i m = ofITree m (h i))
+    (t : ITree E₁ R) {n d : Nat} {ta : CofixA E₁ R d}
+    (hta : ofITree d t = ta) (hd : n ≤ d) {r : R}
+    (hc : evalTauApprox (interpApprox hA n ta) = some r) :
+    ReachesRet (ITree.interp h t) [] r := by
+  subst hta
+  rw [(interpApprox_congr hh n).1, interpApprox_ofITree_le h t hd] at hc
+  exact evalTauApprox_sound_reachesRet hc
+
 /-- Walker-level `TauStar` soundness of `evalTauApprox` on `interpStateApprox`. -/
 theorem evalTauApprox_interpStateApprox_sound {E₁ E₂ : Effect.{u}} {S R : Type u}
     (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S))
@@ -2684,5 +2782,19 @@ theorem evalTauApprox_interpStateApprox_sound {E₁ E₂ : Effect.{u}} {S R : Ty
   subst hta
   rw [(interpStateApprox_congr hh n).1, interpStateApprox_ofITree_le h t s hd] at hc
   exact evalTauApprox_sound_tauStar hc
+
+/-- Walker-level `ReachesRet` soundness of `evalTauApprox` on `interpStateApprox`. -/
+theorem evalTauApprox_interpStateApprox_sound_reachesRet
+    {E₁ E₂ : Effect.{u}} {S R : Type u} [FaultEffect E₂]
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S))
+    (hA : (i : E₁.I) → S → (m : Nat) → CofixA E₂ (E₁.O i × S) m)
+    (hh : ∀ i s m, hA i s m = ofITree m (h i s))
+    (t : ITree E₁ R) (s : S) {n d : Nat} {ta : CofixA E₁ R d}
+    (hta : ofITree d t = ta) (hd : n ≤ d) {r : R × S}
+    (hc : evalTauApprox (interpStateApprox hA n ta s) = some r) :
+    ReachesRet (ITree.interpState h t s) [] r := by
+  subst hta
+  rw [(interpStateApprox_congr hh n).1, interpStateApprox_ofITree_le h t s hd] at hc
+  exact evalTauApprox_sound_reachesRet hc
 
 end Anneal.ITree

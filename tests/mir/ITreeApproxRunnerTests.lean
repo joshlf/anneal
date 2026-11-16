@@ -515,6 +515,134 @@ heartbeats for the full one) use small absolute floors.
 #guard_msgs (whitespace := lax) in
 #print axioms checkRawByteTraceWithCalleesObsErasedBounded_of_full
 
+/-- info: 'Anneal.ITree.iterWalkApprox_ofITree_le' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms iterWalkApprox_ofITree_le
+
+/-- info: 'Anneal.ITree.ReachesRetApprox.of_trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesRetApprox.of_trunc
+
+/-- info: 'Anneal.ITree.evalTauApprox_of_trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_of_trunc
+
+/-- info: 'Anneal.ITree.checkTauRetApprox_of_trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTauRetApprox_of_trunc
+
+/-- info: 'Anneal.ITree.checkTraceApprox_of_trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_of_trunc
+
+/-- info: 'Anneal.ITree.evalTauApprox_approxCofix_sound_reachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_approxCofix_sound_reachesRet
+
+/-- info: 'Anneal.ITree.evalTauApprox_iterApprox_sound_reachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_iterApprox_sound_reachesRet
+
+/-- info: 'Anneal.ITree.evalTauApprox_interpApprox_sound_reachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_interpApprox_sound_reachesRet
+
+/-- info: 'Anneal.ITree.evalTauApprox_interpStateApprox_sound_reachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_interpStateApprox_sound_reachesRet
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullBounded_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullBounded_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedBounded_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedBounded_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullApprox_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullApprox_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedApprox_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedApprox_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.exists_checkRawByteTraceWithCalleesObsErasedApprox_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms exists_checkRawByteTraceWithCalleesObsErasedApprox_iff
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErasedBounded_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesObsErasedBounded_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBounded_tag_ok_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullBounded_tag_ok_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBounded_tag_ok_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErasedBounded_tag_ok_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseMirExecBoundedFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseMirExecBoundedFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseMirExecBoundedFast_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseMirExecBoundedFast_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseMirExecBoundedFast_tagName' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseMirExecBoundedFast_tagName
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceBoundedFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceBoundedFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceBoundedFast_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceBoundedFast_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceBoundedFast_tagName' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceBoundedFast_tagName
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBoundedFast_tagName' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullBoundedFast_tagName
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBoundedFast_tagName' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErasedBoundedFast_tagName
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceBoundedFast_eq_of_not_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceBoundedFast_eq_of_not_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox_imp_obsErased' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirTraceApprox_imp_obsErased
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedApprox_of_fullApprox' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedApprox_of_fullApprox
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedApprox_of_fullApprox' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedApprox_of_fullApprox
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBounded_tag_ok_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullBounded_tag_ok_obsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_obsErased_sound
+
 /-! ## 2. Definitional-Closure Audit (`#audit_closure`)
 
 Kernel `rfl` / `decide` confirmation unfolds every definition reachable from a
@@ -647,6 +775,12 @@ elab "#audit_closure " prof:ident root:ident : command => do
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceFullBounded
 /-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBounded: clean -/
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceObsErasedBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseMirExecBoundedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseMirExecBoundedFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBoundedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceFullBoundedFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBoundedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceObsErasedBoundedFast
 /-- info: Trusted.VerificationResult.mirStatefulTree: reaches [Trusted.ITree.ITree.cofix] -/
 #guard_msgs in #audit_closure checker mirStatefulTree
 
@@ -1651,25 +1785,50 @@ theorem mkLoopObsErasedRawTrace_eq_erase (k : Nat) :
       { mkLoopFullRawTrace k with events := eraseRawBranchEvents (mkLoopFullRawTrace k).events } := by
   simp only [mkLoopObsErasedRawTrace, mkLoopObsErasedRawEventsAux_eq_erase]
 
-set_option maxHeartbeats 300 in
-/-- The branch-erased consistency statement at `k = 32`, derived from the full
-acceptance carried by the already-confirmed diagnostic tag
-(`checkRawByteTraceObsErasedBounded_of_full` over `eraseRawBranchEvents`), with no
-further evaluation of the MIR execution. -/
-theorem mirLoop_k32_obsErased_from_diag_tag : LoopObsErasedConsistent 32 := by
-  have h_full : checkRawByteTraceFullBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true := by
-    rw [← diagnoseRawByteTraceFullBounded_isOk]
-    exact TraceReplayDiag.isOk_of_tagName_eq_ok mirLoop_k32_diag_tag_rfl
-  have h := checkRawByteTraceObsErasedBounded_of_full 203 mirLoopWithOracleCall
-    [ffiStepOracleSig] emptyShadowProvenanceTable (mkLoopFullRawTrace 32) h_full
-  rw [← mkLoopObsErasedRawTrace_eq_erase] at h
-  exact checkRawByteTraceObsErasedBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) h
+set_option maxHeartbeats 150 in
+/-- The branch-erased consistency statement at `k = 32`, derived directly in term
+mode from the already-confirmed diagnostic tag (`mirLoop_k32_diag_tag_rfl`) via
+`diagnoseRawByteTraceFullBounded_tag_ok_obsErased_sound` and `rfl` on
+`eraseRawBranchEvents` (with no custom per-trace lemma and no further evaluation
+of the MIR execution). -/
+theorem mirLoop_k32_obsErased_from_diag_tag : LoopObsErasedConsistent 32 :=
+  diagnoseRawByteTraceFullBounded_tag_ok_obsErased_sound 203 mirLoopWithOracleCall
+    [ffiStepOracleSig] emptyShadowProvenanceTable
+    (mkLoopFullRawTrace 32) (mkLoopObsErasedRawTrace 32)
+    mirLoop_k32_diag_tag_rfl rfl
 
 /-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_obsErased_from_diag_tag' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms mirLoop_k32_obsErased_from_diag_tag
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 17000 in
+/-- Tail-recursive allocation-free diagnostic replay `diagnoseRawByteTraceFullBoundedFast`
+at `k = 32` (`tagName = "ok"`). -/
+theorem mirLoop_k32_diag_fast_tag_rfl :
+    (diagnoseRawByteTraceFullBoundedFast 203 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32)).tagName = "ok" := by
+  rfl
+
+/-- Canary 1b: Tail-recursive `diagnoseRawByteTraceFullBoundedFast` returns the
+exact same `.outcomeMismatch` diagnostic as `diagnoseRawByteTraceFullBounded` on
+diverging traces. -/
+theorem canary_fast_diag_matches_on_divergence :
+    let badOutcomeTrace : RawByteTrace :=
+      { mkLoopFullRawTrace 4 with outcome := .normal (encodeU32LeBytes 25) }
+    let badBranchTrace : RawByteTrace :=
+      { mkLoopFullRawTrace 4 with
+        events := .branch 0 :: (mkLoopFullRawEventsAux 4 0).drop 1 }
+    diagnoseRawByteTraceFullBoundedFast 40 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badOutcomeTrace =
+      .outcomeMismatch
+        (.normal (Value.scalar ⟨24, 4⟩, emptyMemory))
+        (.normal (Value.scalar ⟨25, 4⟩)) ∧
+    diagnoseRawByteTraceFullBoundedFast 40 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badBranchTrace = .branchTagMismatch 1 0 1 ∧
+    (diagnoseRawByteTraceFullBoundedFast 34 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4)).tagName = "out_of_fuel" :=
+  ⟨rfl, rfl, rfl⟩
 
 /--
 error: maximum recursion depth has been reached
