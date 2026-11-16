@@ -18,6 +18,11 @@
 //!    to prune the stale generated `Assumptions` module and pass 100%
 //!    `VerifiedUnconditional`, still with zero authored `.lean` files in
 //!    `anneal/proofs/`.
+//!
+//! `end_to_end_rust_only_closure_deref_edge_shapes` additionally pins the
+//! closure-captured companion shapes the four lifecycle items do not cover
+//! (reversed and two-parameter pins, `<=` bounds, `u8` / `u64` widths,
+//! `|ref ret|`, and a modular caller of a `trusted` leaf) on real captured MIR.
 
 use std::env;
 use std::fs;
@@ -351,6 +356,217 @@ pub fn safe_inc_bounded(x: u32) -> u32 {
     assert!(gn_summary.contains("Totals: 4 unconditional, 0 conditional"));
 
     let _ = fs::remove_dir_all(&gn_target_dir);
+    let _ = fs::remove_dir_all(&temp_crate);
+}
+
+/// Real `rustc`-captured `V2026_06_01` `anodized` closure-captured companion
+/// shapes beyond the four lifecycle items above, all discharged by the generated
+/// default proofs with zero authored `.lean` files:
+/// - a reversed constant-on-LHS pin (`requires: 10 == port`),
+/// - a two-parameter short-circuit `&&` pin with a reversed second operand,
+/// - a `<=` upper bound (`checkSymUpperBound1Loop`),
+/// - `u8` / `u64` pin widths and a `|ref ret|` `ensures` binder,
+/// - callers that inline pinned safe and `unsafe` siblings, and
+/// - a modular caller (`dischargeRustModularContractAuto`) of a `trusted`
+///   `unsafe` sibling whose `requires` and `ensures` are both reversed.
+///
+/// A regression in the closure-deref auto-discharge
+/// (`checkOptMirRequiresPinsScalarsForSubject`, `checkSymUpperBound1Loop`,
+/// `checkCalleeEnsuresPinsRet`) therefore fails here on real captured MIR, not
+/// only on the hand-built bodies in `tests/mir/SymbolicEvalTests.lean`.
+#[test]
+fn end_to_end_rust_only_closure_deref_edge_shapes() {
+    let checkout_root = anneal_checkout_root();
+    let wrapper_bin = ensure_rustc_capture_binary(&checkout_root);
+
+    let temp_crate = unique_temp_dir("rust-only-closure-deref-edges");
+    let src_dir = temp_crate.join("src");
+    fs::create_dir_all(&src_dir).expect("create temporary crate src/");
+
+    let anneal_spec_dir = checkout_root.join("crates").join("anneal-spec");
+    let cargo_toml = format!(
+        r#"[package]
+name = "edge_pkg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anneal-spec = {{ path = "{}" }}
+"#,
+        anneal_spec_dir.display()
+    );
+    fs::write(temp_crate.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+
+    let lib_rs = r#"#![allow(dead_code)]
+
+use anneal_spec::*;
+
+#[anneal_spec::spec(
+    requires: 10 == port,
+    ensures: |ret: u32| ret == 42,
+)]
+pub fn rev_pin(port: u32) -> u32 {
+    port + 32
+}
+
+#[anneal_spec::spec(
+    requires: a == 10 && 20 == b,
+    ensures: |ret: u32| 30 == ret,
+)]
+pub fn add_two(a: u32, b: u32) -> u32 {
+    a + b
+}
+
+#[anneal_spec::spec(
+    requires: x <= 100,
+    ensures: |ret: u32| ret <= 101,
+)]
+pub fn le_bound(x: u32) -> u32 {
+    x + 1
+}
+
+#[anneal_spec::spec(
+    requires: x == 5,
+    ensures: |ret: u64| ret == 6,
+)]
+pub fn u64_pin(x: u64) -> u64 {
+    x + 1
+}
+
+#[anneal_spec::spec(
+    requires: x == 200,
+    ensures: |ret: u8| ret == 201,
+)]
+pub fn u8_pin(x: u8) -> u8 {
+    x + 1
+}
+
+#[anneal_spec::spec(
+    requires: x == 7,
+    ensures: |ref ret| *ret == 8,
+)]
+pub fn ref_ens(x: u32) -> u32 {
+    x + 1
+}
+
+#[anneal_spec::spec(
+    requires: port == 10,
+    ensures: |ret: u32| ret == 50,
+)]
+pub fn call_rev(port: u32) -> u32 {
+    let v = rev_pin(port);
+    v + 8
+}
+
+#[anneal_spec::spec(
+    requires: 10 == port,
+    ensures: |ret: u32| 42 == ret,
+)]
+pub unsafe fn ffi_rev(port: u32) -> u32 {
+    port + 32
+}
+
+#[anneal_spec::spec(
+    requires: port == 10,
+    ensures: |ret: u32| ret == 50,
+)]
+pub fn call_ffi_rev(port: u32) -> u32 {
+    let v = unsafe { ffi_rev(port) };
+    v + 8
+}
+
+#[anneal_spec::spec(
+    trusted,
+    requires: 10 == port,
+    ensures: |ret: u32| 42 == ret,
+)]
+pub unsafe fn ffi_trusted_rev(port: u32) -> u32 {
+    port.wrapping_add(999)
+}
+
+#[anneal_spec::spec(
+    requires: port == 10,
+    ensures: |ret: u32| ret == 50,
+)]
+pub fn call_trusted_rev(port: u32) -> u32 {
+    let v = unsafe { ffi_trusted_rev(port) };
+    v + 8
+}
+"#;
+    fs::write(src_dir.join("lib.rs"), lib_rs).expect("write src/lib.rs");
+
+    let mut driver_cfg = CaptureDriverConfig::new(&temp_crate);
+    driver_cfg.rustc_wrapper = Some(wrapper_bin);
+    let (manifest, records) =
+        run_cargo_capture(&driver_cfg).expect("edge-shape run_cargo_capture must succeed");
+    assert!(manifest.compilation_succeeded);
+
+    let scaffold_cfg = ScaffoldConfig {
+        workspace_root: temp_crate.clone(),
+        units_dir: Some(driver_cfg.units_dir.clone()),
+        anneal_repo_root: Some(checkout_root.clone()),
+        init_spec_templates: false,
+        init_proof_templates: false,
+    };
+    let scaffold = scaffold_workspace_with_config(&scaffold_cfg, &records)
+        .expect("edge-shape scaffold_workspace_with_config must succeed");
+    assert_eq!(scaffold.generated_assumption_files.len(), 1);
+    assert_eq!(count_lean_files(&temp_crate.join("anneal/proofs")), 0);
+
+    // The caller of the `trusted` leaf must take the modular route, so the
+    // reversed callee `requires` / `ensures` exercise `checkCalleeEnsuresPinsRet`.
+    let modular_verify = fs::read_to_string(
+        temp_crate.join(".anneal/generated/Verify/EdgePkg/call_trusted_rev.lean"),
+    )
+    .expect("read generated Verify/EdgePkg/call_trusted_rev.lean");
+    assert!(
+        modular_verify.contains("ModularItemProof")
+            && modular_verify.contains("dischargeRustModularContractAuto"),
+        "call_trusted_rev must be discharged through the modular route:\n{modular_verify}"
+    );
+
+    let report = verify_workspace_with_config(
+        &VerifyConfig::new(&temp_crate)
+            .with_anneal_repo_root(&checkout_root)
+            .with_allow_assumptions(true),
+    )
+    .expect("edge-shape verify_workspace_with_config(allow_assumptions = true) must succeed");
+
+    for module in [
+        "Verify.EdgePkg.rev_pin",
+        "Verify.EdgePkg.add_two",
+        "Verify.EdgePkg.le_bound",
+        "Verify.EdgePkg.u64_pin",
+        "Verify.EdgePkg.u8_pin",
+        "Verify.EdgePkg.ref_ens",
+        "Verify.EdgePkg.call_rev",
+        "Verify.EdgePkg.ffi_rev",
+        "Verify.EdgePkg.call_ffi_rev",
+        "Verify.EdgePkg.call_trusted_rev",
+    ] {
+        assert_eq!(
+            report.status_for(module),
+            Some(&VerificationStatus::VerifiedUnconditional),
+            "expected {module} to be VerifiedUnconditional"
+        );
+    }
+    assert_eq!(
+        report.status_for("Verify.EdgePkg.ffi_trusted_rev"),
+        Some(&VerificationStatus::VerifiedConditional {
+            assumptions: vec![
+                "Assumptions.EdgePkg.ffi_trusted_rev.rust_trusted_contract".to_string()
+            ],
+        })
+    );
+
+    let summary = render_verification_report(&report);
+    assert!(
+        summary.contains("Totals: 10 unconditional, 1 conditional"),
+        "unexpected edge-shape summary:\n{summary}"
+    );
+    assert!(summary.contains("TrustedBoundary kernel replay: PASS"));
+
     let _ = fs::remove_dir_all(&temp_crate);
 }
 
