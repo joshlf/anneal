@@ -744,7 +744,9 @@ fn union_fields_of(ty: &Ty) -> Option<&[Ty]> {
 /// size `0` and at least one value, e.g. `()`, `[T; 0]` (even `[!; 0]`), `[(); N]`,
 /// `PhantomData<T>`, a function item, or a struct / tuple / closure / univariant enum / union
 /// built from such types. Uninhabited ZSTs (`!`, `enum Void {}`, `[!; 1]`, `((), !)`) and types
-/// whose layout is unspecified, ill-formed, or too large are not.
+/// whose layout is unspecified, ill-formed, or too large are not: an uninhabited ZST has no
+/// value, and `Trusted.MirSemantics`' `readProjectedValueUnionAware` faults with `.ub` on every
+/// read of one (`tyIsUninhabited`, `kani#5159`), so it never gets a unique value here.
 fn is_inhabited_zst_for(ty: &Ty, ptr_width: PtrWidth) -> bool {
     ty.layout_for(ptr_width).is_ok_and(|layout| layout.size == 0) && ty.is_inhabited_for(ptr_width)
 }
@@ -875,7 +877,8 @@ fn canonical_zst_value_within(
 /// of any non-zero-sized union field, so every non-ZST union field reads as uninitialized
 /// (`InactiveUnionField`), every inhabited zero-sized field reads its unique value, and a
 /// whole-value copy is defined, exactly as for uninitialized union storage in Miri and
-/// `Trusted.MirSemantics`.
+/// `Trusted.MirSemantics` (`kani#5176`; `AdtAndControl.lean`'s
+/// `kani5176_uninit_storage_zst_field` and `kani5176_uninit_storage_int_field_ub`).
 ///
 /// `None` for every other type (including legacy tuple-modeled unions, which carry no
 /// union definition, unions without an inhabited zero-sized field, and types without any
@@ -4484,8 +4487,10 @@ fn decode_mir_value(
 /// into a union value.
 ///
 /// Every union field starts at offset `0` (`FieldsShape::Union`; `Trusted.MirSemantics`'
-/// `decodeUnionFieldsByLayoutIdxs` decodes each field from the prefix `[0 .. size)` of the
-/// shared bytes, and a zero-sized field from no bytes), while a union value in the value tree
+/// `readProjectedValueUnionAware` reads a field of size `n` from the prefix `[0 .. n)` of the
+/// union's storage, ignoring the trailing bytes `[n .. size)`, and a zero-sized field from no
+/// bytes: `AdtAndControl.lean`'s `readUnion_posField_offset0` and
+/// `readDecodedUnion_trailing_bytes_ignored`), while a union value in the value tree
 /// holds a single active field. So, among the union's inhabited fields (an uninhabited field
 /// can never be read, so it does not constrain the representation):
 /// - with no non-zero-sized one, no field can observe any byte: the first inhabited
@@ -6106,7 +6111,15 @@ fn project_mir_value<'a>(
 /// non-zero-sized type (such as `(u32, [(); 2])` or `ManuallyDrop<(u32, ())>`), steps through
 /// `Field` and in-bounds array `Index` / `ConstantIndex` / `Subslice` projections until an
 /// inhabited ZST sub-place is reached (`Trusted.MirSemantics`' `readProjectedValueUnionAware`
-/// decodes any statically bounded zero-sized sub-place inside a union field from zero bytes).
+/// decodes any statically bounded inhabited zero-sized sub-place inside a union field from zero
+/// bytes).
+///
+/// An uninhabited field or container (`!`, `Infallible`, `(Infallible, ())`, `[Infallible; 1]`,
+/// `ManuallyDrop<Infallible>`) yields `Ok(None)`, so the read fails with `InactiveUnionField`:
+/// `readProjectedValueUnionAware` faults with `.ub` on every 0-byte read of an uninhabited
+/// field, through an uninhabited container (`subProjTouchesUninhabited`, e.g.
+/// `(Infallible, ()).1`), or of an uninhabited leaf (`kani#5159`; `AdtAndControl.lean`'s
+/// `readUnion_zeroByte_root_ub_iff` and `readUnion_zeroByte_subProj_iff`).
 fn resolve_inactive_union_zst_subplace<'a, F>(
     field_ty: &'a Ty,
     rest: &'a [ProjectionElem],
@@ -6218,12 +6231,15 @@ where
 /// The zero-sized sub-place occupies no bytes of the union's storage, so in Rust, Miri, and
 /// MiniRust reading it (or any place inside it) accesses no memory and yields its unique value
 /// whatever the union's bytes are; `Trusted.MirSemantics`' `readProjectedValueUnionAware`
-/// likewise decodes a zero-sized field (or zero-sized sub-place) from zero bytes. The read
-/// walks `zst_tail` over that unique value ([`canonical_zst_value`]), so its steps are checked
-/// exactly as on any initialized value: a type mismatch is `TypeMismatch`, an out-of-bounds
-/// `Index` / `ConstantIndex` / `Subslice` of a zero-sized array is `IndexOutOfBounds`, a
-/// `Downcast` to an absent variant of a zero-sized enum is `InactiveVariantProjection`, and a
-/// `Deref` is unsupported. The selected (owned) value is returned as [`ProjectedRef::Owned`].
+/// likewise decodes an inhabited zero-sized field (or zero-sized sub-place) from zero bytes
+/// (`AdtAndControl.lean`'s `readUnion_zeroByte_root` / `readUnion_zeroByte_subProj`), and
+/// faults with `.ub` on an uninhabited one, which [`resolve_inactive_union_zst_subplace`] never
+/// selects (`kani#5159`). The read walks `zst_tail` over that unique value
+/// ([`canonical_zst_value`]), so its steps are checked exactly as on any initialized value: a
+/// type mismatch is `TypeMismatch`, an out-of-bounds `Index` / `ConstantIndex` / `Subslice` of
+/// a zero-sized array is `IndexOutOfBounds`, a `Downcast` to an absent variant of a zero-sized
+/// enum is `InactiveVariantProjection`, and a `Deref` is unsupported. The selected (owned)
+/// value is returned as [`ProjectedRef::Owned`].
 fn project_inactive_zst_union_field<'a>(
     zst_ty: &Ty,
     zst_tail: &[ProjectionElem],

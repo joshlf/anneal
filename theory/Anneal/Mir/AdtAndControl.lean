@@ -345,6 +345,31 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      (`witness_value_returning_intrinsics_run`, `witness_ub_fault_parity`,
      `witness_diverging_abort_vs_panicUnwind`, `witness_two_deep_linked_callees_and_unwind`,
      ..., `witness_diverging_proj_move_cleanup_and_protectors`).
+
+6. **Section 6 — Unions: offset-0 field decoding, `kani#5159` 0-byte field reads, and `kani#5176`
+   `[(); N]` arms** (`ws-mir-lower-union-zst-copy-and-minirust-assert` Episode 1,
+   `crates/anneal-mir/src/lower/rvalue.rs`), against `readProjectedValueUnionAware`:
+   - Offset-0 decoding: an inactive positive-sized field of a union value with storage image
+     `img` reads exactly `img.take fieldSz` (`readUnion_posField_offset0`); unions materialized
+     from bytes round-trip (`decodeUnionBytes_roundtrip`), so their trailing bytes
+     `[fieldSz, unionSz)` never affect a field read (`readDecodedUnion_posField_offset0`,
+     `readDecodedUnion_trailing_bytes_ignored`), as `decode_mir_value` / `decode_union_value` do.
+   - `kani#5159`, two-sided: on a well-formed union value (`UnionImageOk`) and an inactive slot
+     (`UnionSlotInactive`), a 0-byte field read faults with `.ub` iff the field is uninhabited
+     and otherwise returns its canonical value (`readUnion_zeroByte_root`,
+     `readUnion_zeroByte_root_ub_iff`, `readUnion_zeroByte_root_ok_iff`); an uninhabited field of
+     undetermined size such as `(Infallible, ())` faults as well (`readUnion_unsized_root`,
+     `kani5159_uninhabited_field_root_ub`); a statically bounded 0-byte sub-place faults iff the
+     field, a container along the way (`subProjTouchesUninhabited`), or the leaf is uninhabited
+     (`readUnion_zeroByte_subProj`, `readUnion_zeroByte_subProj_iff`), and other projections
+     continue from the canonical value (`readUnion_zeroByte_fieldRoot`).
+   - `kani#5176`: from all-`.uninit` storage, an inhabited 0-byte arm such as `[(); N]` reads its
+     canonical value while a positive-sized integer arm faults with `.ub`
+     (`kani5176_uninit_storage_zst_field`, `kani5176_uninit_storage_int_field_ub`).
+   - Kernel-checked witnesses on `rustc`-shaped layout tables (`kani5159_witness_reads`,
+     `kani5159_witness_general_instances`, `kani5176_witness_reads`,
+     `kani5176_witness_general_instances`), mirrored by
+     `crates/anneal-mir/tests/union_maybe_uninit_and_zst_copy_tests.rs`.
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -29497,5 +29522,1134 @@ theorem witness_diverging_proj_move_cleanup_and_protectors :
     exact ⟨hRej, hRejRet, hAcc,
       runLoweredWithCallTable_refines_trusted 8 stGlobalPtr sGlobalPtr witnessCrossPtrRootCm _
         hCorrC hAcc⟩
+
+/-! ## Section 6: Unions — Offset-0 Field Decoding, `kani#5159` 0-Byte Field Reads, and `kani#5176` `[(); N]` Arms
+
+`ws-mir-lower-union-zst-copy-and-minirust-assert` Episode 1 (`crates/anneal-mir/src/lower/rvalue.rs`),
+stated and proved directly against `Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware`.
+A union has no active field: every field sits at offset `0` and a field read reinterprets the
+union's storage at the field's type. A 0-byte field or sub-place occupies no storage, so its read
+cannot fault on bytes; it faults exactly when no value of the accessed type exists (an uninhabited
+field, container, or leaf: `tyIsUninhabited` / `subProjTouchesUninhabited`, `kani#5159`), and an
+inhabited one reads its unique value even from all-`.uninit` storage (`kani#5176`).
+-/
+
+namespace UnionZst
+
+/-! ### Section 6a: The union field read, its resolved field type, and its gates -/
+
+/-- The resolved type `rFieldTy` at which `readProjectedValueUnionAware` reads union field `idx`
+declared at `fieldTy` (the read's own `let rFieldTy`): `fieldTy` when its layout index is
+resolved, else the union layout's `fieldLayouts[idx]`, else `resolveTyWithLocalDecls`. -/
+def unionFieldReadTy (localDecls : List LocalDecl) (layouts : LayoutTable) (l : TypeLayout)
+    (idx : Nat) (fieldTy : Ty) : Ty :=
+  match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+  | false => fieldTy
+  | true =>
+    match get? l.fieldLayouts idx with
+    | some flIdx => { fieldTy with layoutIdx := flIdx }
+    | none => resolveTyWithLocalDecls localDecls layouts fieldTy
+
+/-- Resolving a union field type keeps its kind. -/
+theorem unionFieldReadTy_kind (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (l : TypeLayout) (idx : Nat) (fieldTy : Ty) :
+    (unionFieldReadTy localDecls layouts l idx fieldTy).kind = fieldTy.kind := by
+  unfold unionFieldReadTy
+  cases isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;> dsimp only
+  cases get? l.fieldLayouts idx <;> dsimp only
+  exact Anneal.Mir.PlaceAndRvalue.resolveTyWithLocalDecls_kind localDecls layouts fieldTy
+
+/-- The canonical value that an inhabited 0-byte read of type `ty` yields in
+`readProjectedValueUnionAware`: its decoding from zero bytes (`decodeTypedValueFromBytes`), or
+`.unit` when the decoder has no layout-free value for `ty` (a fieldless closure, which
+`crates/anneal-mir`'s `canonical_zst_value` also represents as `MirValue::Unit`). -/
+def zeroByteValue (layouts : LayoutTable) (ty : Ty) : Value :=
+  match decodeTypedValueFromBytes defaultCodecFuel layouts ty .nil with
+  | some v => v
+  | none => .unit
+
+/-- Slot `idx` of a union field list holds no direct value for a field of kind `k`
+(`readProjectedValueUnionAware`'s `directFvOpt` is `.none`): the slot is absent, or it holds the
+`.unit` placeholder of a field that is neither `()` nor a function item (for those two the `.unit`
+slot is the field's value). Every typed slot of a union decoded from bytes is inactive
+(`decodeUnionBytes_roundtrip`). -/
+def UnionSlotInactive (fields : List Value) (idx : Nat) (k : RigidTy) : Prop :=
+  get? fields idx = none ∨
+    (get? fields idx = some .unit ∧ k ≠ .tuple [] ∧ ∀ p a, k ≠ .fnDef p a)
+
+/-- The well-formedness gate (`unionImageOk`) that `readProjectedValueUnionAware` applies before
+reading an inactive slot: either no consistency check is needed (no raw-byte overlay and at most
+one non-`.unit` typed slot), or the union value encodes to a storage image. -/
+def UnionImageOk (layouts : LayoutTable) (uIdx count : Nat) (fields : List Value) : Prop :=
+  unionNeedsConsistencyCheck count fields = false ∨
+    ∃ img, encodeByLayoutIdxAux 8 layouts uIdx (.aggregate 0 fields) = some img
+
+/-! ### Section 6b: `kani#5159` — 0-byte union field and sub-place reads -/
+
+/-- **`kani#5159`, 0-byte field root (exact).** For a well-formed union value and an inactive
+slot, reading a 0-byte field `idx < count` faults with `.ub` when the field type is uninhabited
+(`tyIsUninhabited`: `!`, `Infallible`, `enum Void {}`, `[Infallible; 1]`,
+`ManuallyDrop<Infallible>`, ...) and otherwise returns its canonical value (`()`, `[(); N]`,
+`PhantomData<Infallible>`, `[Infallible; 0]`, ...). Before this fix the uninhabited case
+fabricated `.ok .unit`. -/
+theorem readUnion_zeroByte_root
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] =
+      match tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) with
+      | true => .ub
+      | false => .ok (zeroByteValue layouts (unionFieldReadTy localDecls layouts l idx fieldTy)) := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hSz hTk ⊢
+  cases hg : get? l.fieldLayouts idx <;>
+    cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu, hg] at hSz hTk ⊢
+  all_goals
+    cases hC : unionNeedsConsistencyCheck count fields <;>
+    rcases hSlot with hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk])
+  all_goals
+    first
+    | (simp only []; rw [hSz]; simp only []; cases tyIsUninhabited layouts _ <;> rfl)
+    | (rcases hImg with h | ⟨img, hEnc⟩
+       · rw [hC] at h; nomatch h
+       · rw [hEnc]; simp only []
+         cases l.fieldLayouts <;> simp only [] <;> rw [hSz] <;> simp only [] <;>
+           (cases tyIsUninhabited layouts _ <;> rfl))
+
+/-- **`kani#5159`, 0-byte sub-place (exact).** For a well-formed union value and an inactive slot,
+reading a statically bounded (`checkStaticSubProjBounds`) sub-place of 0-byte type `leafTy` inside
+field `idx` (of any size) faults with `.ub` exactly when the field, a container along the
+sub-projection (`subProjTouchesUninhabited`), or the leaf is uninhabited, and otherwise returns the
+leaf's canonical value. For example `_u.pair.1` with `pair : (Infallible, ())` faults although its
+`()` leaf is inhabited. -/
+theorem readUnion_zeroByte_subProj
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
+    (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
+    (hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+      (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = true)
+    (subOff : Nat)
+    (hOff : projectionChainByteOffset? layouts (some (unionFieldReadTy localDecls layouts l idx fieldTy))
+      none none 0 localDecls (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) =
+        some subOff)
+    (leafTy : Ty)
+    (hLeaf : resolveProjectedTyResolved localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+      (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = some leafTy)
+    (hSz : tyByteSize localDecls layouts leafTy = some 0) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) =
+      match
+        Bool.or (tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy))
+          (Bool.or
+            (subProjTouchesUninhabited localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+              (normalizeSubsliceProjections (stripTransparentProjections idxResolved)))
+            (tyIsUninhabited layouts leafTy))
+      with
+      | true => .ub
+      | false => .ok (zeroByteValue layouts leafTy) := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hTk hBounds hOff hLeaf ⊢
+  cases hg : get? l.fieldLayouts idx <;>
+    cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu, hg] at hTk hBounds hOff hLeaf ⊢
+  all_goals
+    cases hC : unionNeedsConsistencyCheck count fields <;>
+    rcases hSlot with hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk])
+  all_goals
+    first
+    | (simp only []; rw [hRes]; simp only []; rw [hBounds]; simp only []; rw [hOff, hLeaf];
+       simp only []; rw [hSz]; simp only []
+       split
+       · rename_i res heq
+         split at heq
+         · rename_i hB; cases heq; rw [hB]
+         · rename_i hB; cases heq; rw [hB]; rfl
+       · rename_i heq
+         split at heq <;> nomatch heq)
+    | (rcases hImg with h | ⟨img, hEnc⟩
+       · rw [hC] at h; nomatch h
+       · rw [hEnc]; simp only []
+         cases l.fieldLayouts <;> simp only [] <;> rw [hRes] <;> simp only [] <;> rw [hBounds] <;>
+           simp only [] <;> rw [hOff, hLeaf] <;> simp only [] <;> rw [hSz] <;> simp only [] <;>
+           (split
+            · rename_i res heq
+              split at heq
+              · rename_i hB; cases heq; rw [hB]
+              · rename_i hB; cases heq; rw [hB]; rfl
+            · rename_i heq
+              split at heq <;> nomatch heq))
+
+/-- **0-byte field root under a non-static sub-projection.** When the sub-projection is not
+statically bounded (for example, it downcasts), a 0-byte field read faults with `.ub` if the field
+is uninhabited and otherwise continues the projection from the field's canonical value. -/
+theorem readUnion_zeroByte_fieldRoot
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0)
+    (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
+    (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
+    (hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+      (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = false) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) =
+      match tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) with
+      | true => .ub
+      | false =>
+        readProjectedValueUnionAware locals localDecls layouts
+          (zeroByteValue layouts (unionFieldReadTy localDecls layouts l idx fieldTy))
+          (unionFieldReadTy localDecls layouts l idx fieldTy) (p :: ps) := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  conv => lhs; unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hTk hSz hBounds ⊢
+  cases hg : get? l.fieldLayouts idx <;>
+    cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu, hg] at hTk hSz hBounds ⊢
+  all_goals
+    cases hC : unionNeedsConsistencyCheck count fields <;>
+    rcases hSlot with hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk])
+  all_goals
+    first
+    | (simp only []; rw [hRes]; simp only []; rw [hBounds]; simp only []; rw [hSz]; simp only []
+       cases tyIsUninhabited layouts _ <;> rfl)
+    | (rcases hImg with h | ⟨img, hEnc⟩
+       · rw [hC] at h; nomatch h
+       · rw [hEnc]; simp only []
+         cases l.fieldLayouts <;> simp only [] <;> rw [hRes] <;> simp only [] <;> rw [hBounds] <;>
+           simp only [] <;> rw [hSz] <;> simp only [] <;> (cases tyIsUninhabited layouts _ <;> rfl))
+
+/-- **`kani#5159`, field root, two-sided (`.ub`).** Under the hypotheses of
+`readUnion_zeroByte_root`, the read faults with `.ub` iff the field is uninhabited. -/
+theorem readUnion_zeroByte_root_ub_iff
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] = .ub ↔
+      tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true := by
+  rw [readUnion_zeroByte_root locals localDecls layouts baseTy fieldTy fields idx count l d args hKind
+    hLookup hFields hIdx hImg hSlot hSz]
+  cases tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) <;> simp
+
+/-- **`kani#5159`, field root, two-sided (`.ok`).** Under the hypotheses of
+`readUnion_zeroByte_root`, the read returns the field's canonical value (equivalently, returns any
+`.ok` value) iff the field is inhabited. -/
+theorem readUnion_zeroByte_root_ok_iff
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0) :
+    (readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] =
+      .ok (zeroByteValue layouts (unionFieldReadTy localDecls layouts l idx fieldTy)) ↔
+      tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = false) ∧
+    ((∃ v, readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] = .ok v) ↔
+      tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = false) := by
+  rw [readUnion_zeroByte_root locals localDecls layouts baseTy fieldTy fields idx count l d args hKind
+    hLookup hFields hIdx hImg hSlot hSz]
+  cases tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) <;> simp
+
+/-- **Field root of undetermined size.** When `tyByteSize` leaves the field size undetermined
+(for example, the captured layout of an uninhabited tuple `(Infallible, ())`, which
+`layoutMatchesAggregateVariant` rejects), the read faults with `.ub` for an uninhabited field and
+is `.unsupported` otherwise. -/
+theorem readUnion_unsized_root
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = none) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] =
+      match tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) with
+      | true => .ub
+      | false => .unsupported := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hSz hTk ⊢
+  cases hg : get? l.fieldLayouts idx <;>
+    cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu, hg] at hSz hTk ⊢
+  all_goals
+    cases hC : unionNeedsConsistencyCheck count fields <;>
+    rcases hSlot with hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk])
+  all_goals
+    first
+    | (simp only []; rw [hSz]; simp only []; cases tyIsUninhabited layouts _ <;> rfl)
+    | (rcases hImg with h | ⟨img, hEnc⟩
+       · rw [hC] at h; nomatch h
+       · rw [hEnc]; simp only []
+         cases l.fieldLayouts <;> simp only [] <;> rw [hSz] <;> simp only [] <;>
+           (cases tyIsUninhabited layouts _ <;> rfl))
+
+/-- **`kani#5159` (field root).** Reading an uninhabited union field from an inactive slot of a
+well-formed union faults with `.ub` whenever its size is `0` or undetermined. -/
+theorem kani5159_uninhabited_field_root_ub
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (hUninh : tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0 ∨
+      tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = none) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] = .ub := by
+  rcases hSz with hSz | hSz
+  · rw [readUnion_zeroByte_root locals localDecls layouts baseTy fieldTy fields idx count l d args hKind
+      hLookup hFields hIdx hImg hSlot hSz, hUninh]
+  · rw [readUnion_unsized_root locals localDecls layouts baseTy fieldTy fields idx count l d args hKind
+      hLookup hFields hIdx hImg hSlot hSz, hUninh]
+
+/-! ### Section 6c: Offset-0 decoding of positive-sized union fields -/
+
+/-- An in-bounds prefix slice of a byte list is its `take`. -/
+theorem sliceAbstractBytes_zero_take (bs : List AbstractByte) (n : Nat) (h : n ≤ bs.length) :
+    sliceAbstractBytes bs 0 n = some (bs.take n) := by
+  unfold sliceAbstractBytes
+  have hBle : Nat.ble (Nat.add 0 n) (length bs) = true := by
+    change Nat.ble (0 + n) bs.length = true
+    rw [Nat.zero_add]
+    exact Nat.ble_eq.mpr h
+  rw [hBle]
+  dsimp only
+  rw [dropAbstractBytes_eq_drop, List.drop_zero, takeAbstractBytes_eq_take]
+
+/-- A positive `tyByteSize` excludes the (0-byte) `()` and function-item kinds. -/
+theorem tyByteSize_succ_kind (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty) (n : Nat)
+    (h : tyByteSize localDecls layouts ty = some (n + 1)) :
+    ty.kind ≠ .tuple [] ∧ ∀ p a, ty.kind ≠ .fnDef p a := by
+  have hk := Anneal.Mir.PlaceAndRvalue.resolveTyWithLocalDecls_kind localDecls layouts ty
+  unfold tyByteSize tyByteSizeAndAlignAux at h
+  dsimp only at h
+  rw [hk] at h
+  refine ⟨fun hT => ?_, fun p a hF => ?_⟩
+  · rw [hT] at h; simp at h
+  · rw [hF] at h; simp at h
+
+/-- **Offset-0 decoding of a positive-sized union field (exact).** Every union field sits at
+offset `0`: reading an inactive field of size `n + 1` from a union value whose storage image is
+`img` decodes exactly `img.take (n + 1)`, returning `.ok` with the decoded value and `.ub` when
+those bytes are uninitialized or invalid at the field type. -/
+theorem readUnion_posField_offset0
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (img : List AbstractByte)
+    (hEnc : encodeByLayoutIdxAux 8 layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx
+      (.aggregate 0 fields) = some img)
+    (n : Nat)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some (n + 1))
+    (hLe : n + 1 ≤ img.length) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        [.field idx fieldTy] =
+      match decodeTypedValueFromBytes defaultCodecFuel layouts
+          (unionFieldReadTy localDecls layouts l idx fieldTy) (img.take (n + 1)) with
+      | some v => .ok v
+      | none => .ub := by
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  have hSlice := sliceAbstractBytes_zero_take img (n + 1) hLe
+  unfold readProjectedValueUnionAware
+  dsimp only
+  rw [hKind, hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  have hTk := unionFieldReadTy_kind localDecls layouts l idx fieldTy
+  unfold unionFieldReadTy at hSz hTk ⊢
+  cases hg : get? l.fieldLayouts idx <;>
+    cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu, hg] at hSz hTk ⊢
+  all_goals
+    cases hC : unionNeedsConsistencyCheck count fields <;>
+    rcases hSlot with hS | ⟨hS, hNU, hNF⟩ <;> rw [hS] <;> (try rw [hTk]) <;> rw [hEnc] <;>
+    simp only []
+  all_goals (try (cases l.fieldLayouts <;> simp only []))
+  all_goals
+    rw [hSz]; simp only []; rw [hSlice]; simp only []
+    split <;> rename_i heq <;> rw [heq] <;> rfl
+
+/-- `splitUnionTypedAndOverlay` separates `count` inactive slots from a raw-byte overlay. -/
+theorem splitUnionTypedAndOverlay_units_overlay (rawVals : List Value) :
+    ∀ count : Nat,
+      splitUnionTypedAndOverlay count
+          (appendValueList (replicateValue count .unit) [.aggregate 0 rawVals]) =
+        some (replicateValue count .unit, some rawVals)
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, appendValueList, splitUnionTypedAndOverlay,
+      splitUnionTypedAndOverlay_units_overlay rawVals k]
+
+/-- `splitUnionTypedAndOverlay` on `count` inactive slots without an overlay. -/
+theorem splitUnionTypedAndOverlay_units :
+    ∀ count : Nat,
+      splitUnionTypedAndOverlay count (replicateValue count .unit) =
+        some (replicateValue count .unit, none)
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, splitUnionTypedAndOverlay, splitUnionTypedAndOverlay_units k]
+
+/-- Inactive (`.unit`) slots occupy no storage next to a raw-byte overlay. -/
+theorem unionNonUnitNonZstTypedSlotCount_units (layouts : LayoutTable) :
+    ∀ (count : Nat) (fls : List Nat),
+      unionNonUnitNonZstTypedSlotCount layouts count fls (replicateValue count .unit) = 0
+  | 0, _ => rfl
+  | k + 1, [] => unionNonUnitNonZstTypedSlotCount_units layouts k []
+  | k + 1, _ :: fls => unionNonUnitNonZstTypedSlotCount_units layouts k fls
+
+/-- Inactive (`.unit`) slots occupy no layout-free storage. -/
+theorem unionLayoutFreeOccupiedSlotCount_units (h : Bool) :
+    ∀ count : Nat, unionLayoutFreeOccupiedSlotCount h count (replicateValue count .unit) = 0
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, unionLayoutFreeOccupiedSlotCount,
+      unionLayoutFreeOccupiedSlotCount_units h k]
+
+/-- Merging inactive (`.unit`) slots leaves the storage image unchanged. -/
+theorem mergeUnionTypedSlotsAux_units (layouts : LayoutTable)
+    (encodeSlot : Nat → Value → Option (List AbstractByte)) (fallbackLayoutIdx : Nat)
+    (hasOverlay : Bool) (unionSize : Nat) :
+    ∀ (count : Nat) (fls : List Nat) (buf : List AbstractByte) (mask : List Bool),
+      mergeUnionTypedSlotsAux layouts encodeSlot fallbackLayoutIdx hasOverlay unionSize fls
+          (replicateValue count .unit) buf mask = some buf
+  | 0, _, _, _ => by simp only [replicateValue, mergeUnionTypedSlotsAux]
+  | k + 1, [], buf, mask => by
+    simp only [replicateValue, mergeUnionTypedSlotsAux,
+      mergeUnionTypedSlotsAux_units layouts encodeSlot fallbackLayoutIdx hasOverlay unionSize k [] buf
+        mask]
+  | k + 1, _ :: fls, buf, mask => by
+    simp only [replicateValue, mergeUnionTypedSlotsAux,
+      mergeUnionTypedSlotsAux_units layouts encodeSlot fallbackLayoutIdx hasOverlay unionSize k fls buf
+        mask]
+
+/-- `forceValueListOpt` is the identity on value lists (it only forces the spine). -/
+theorem forceValueListOpt_eq : ∀ l : List Value, forceValueListOpt l = some l
+  | [] => rfl
+  | v :: vs => by simp only [forceValueListOpt, forceValueListOpt_eq vs]
+
+/-- A union value whose `count` slots are all inactive encodes to all-`.uninit` storage. -/
+theorem encodeByLayoutIdxAux_units (layouts : LayoutTable) (uIdx : Nat) (uL : TypeLayout)
+    (count : Nat) (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false) (hFields : uL.fields = .union count) :
+    encodeByLayoutIdxAux 8 layouts uIdx (.aggregate 0 (replicateValue count .unit)) =
+      some (replicateUninitBytes uL.size.bytes) := by
+  unfold encodeByLayoutIdxAux
+  rw [hLookup]
+  dsimp only
+  rw [hInhab]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  unfold encodeUnionSlotsIntoBufAux
+  rw [splitUnionTypedAndOverlay_units]
+  dsimp only
+  have h20 : Nat.ble 2 0 = false := rfl
+  cases hFL : uL.fieldLayouts with
+  | nil =>
+    simp only [unionLayoutFreeOccupiedSlotCount_units, h20, Bool.false_and,
+      mergeUnionTypedSlotsAux_units]
+  | cons f fs =>
+    simp only [mergeUnionTypedSlotsAux_units]
+
+/-- A byte whose raw-overlay slot encoding (`encodeRawAbstractByteVals`) round-trips through
+`overlayRawAbstractByteVals`: uninitialized, provenance-free, or carrying the canonical provenance
+`(allocId, allocId)` (`ProvenancePtr.tag`). -/
+def RawOverlayCanonical : AbstractByte → Prop
+  | .uninit => True
+  | .init _ none => True
+  | .init _ (some (a, t)) => t = a
+
+/-- The raw-byte overlay of a canonical image reproduces it over any equally long buffer. -/
+theorem overlayRaw_encodeRaw :
+    ∀ (img buf : List AbstractByte), buf.length = img.length →
+      (∀ b ∈ img, RawOverlayCanonical b) →
+      overlayRawAbstractByteVals (encodeRawAbstractByteVals img) buf = some img
+  | [], [], _, _ => rfl
+  | [], _ :: _, h, _ => by simp at h
+  | _ :: _, [], h, _ => by simp at h
+  | b :: rest, _ :: bufRest, h, hc => by
+    have ih := overlayRaw_encodeRaw rest bufRest (by simpa using h)
+      (fun x hx => hc x (List.mem_cons_of_mem _ hx))
+    have hb := hc b List.mem_cons_self
+    cases b with
+    | uninit => simp [encodeRawAbstractByteVals, overlayRawAbstractByteVals, ih]
+    | init byte prov =>
+      cases prov with
+      | none => simp [encodeRawAbstractByteVals, overlayRawAbstractByteVals, ih]
+      | some pa =>
+        obtain ⟨a, t⟩ := pa
+        simp only [RawOverlayCanonical] at hb
+        subst hb
+        simp [encodeRawAbstractByteVals, overlayRawAbstractByteVals, ih, ProvenancePtr.tag]
+
+/-- A union value of `count` inactive slots and the raw-byte overlay of a canonical image `img`
+of the union's size encodes back to exactly `img`. -/
+theorem encodeByLayoutIdxAux_rawOverlay (layouts : LayoutTable) (uIdx : Nat) (uL : TypeLayout)
+    (count : Nat) (img : List AbstractByte) (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false) (hFields : uL.fields = .union count)
+    (hLen : img.length = uL.size.bytes) (hCanon : ∀ b ∈ img, RawOverlayCanonical b) :
+    encodeByLayoutIdxAux 8 layouts uIdx
+        (.aggregate 0 (appendValueList (replicateValue count .unit)
+          [.aggregate 0 (encodeRawAbstractByteVals img)])) =
+      some img := by
+  unfold encodeByLayoutIdxAux
+  rw [hLookup]
+  dsimp only
+  rw [hInhab]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  unfold encodeUnionSlotsIntoBufAux
+  rw [splitUnionTypedAndOverlay_units_overlay]
+  dsimp only
+  have hLenBuf : (replicateUninitBytes uL.size.bytes).length = img.length := by
+    rw [replicateUninitBytes_eq_replicate, List.length_replicate, hLen]
+  have hOv := overlayRaw_encodeRaw img _ hLenBuf hCanon
+  have h20 : Nat.ble 2 0 = false := rfl
+  have h01 : Nat.ble 0 1 = true := rfl
+  cases hFL : uL.fieldLayouts with
+  | nil =>
+    simp only [unionLayoutFreeOccupiedSlotCount_units, h20, Bool.false_and,
+      unionNonUnitNonZstTypedSlotCount_units, h01, hOv, mergeUnionTypedSlotsAux_units]
+  | cons f fs =>
+    simp only [unionNonUnitNonZstTypedSlotCount_units, h01, hOv, mergeUnionTypedSlotsAux_units]
+
+/-- `abstractByteEq` is sound for equality. -/
+theorem abstractByteEq_eq_true : ∀ {a b : AbstractByte}, abstractByteEq a b = true → a = b
+  | .uninit, .uninit, _ => rfl
+  | .uninit, .init _ _, h => by simp [abstractByteEq] at h
+  | .init _ _, .uninit, h => by simp [abstractByteEq] at h
+  | .init x p, .init y q, h => by
+    unfold abstractByteEq at h
+    rw [Bool.and_eq_true] at h
+    obtain ⟨hxy, hpq⟩ := h
+    have hx : x = y := UInt8.toBitVec_inj.mp (BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true hxy))
+    have hp : p = q := by
+      cases p with
+      | none =>
+        cases q with
+        | none => rfl
+        | some _ => simp [abstractByteProvEq] at hpq
+      | some pa =>
+        cases q with
+        | none => simp [abstractByteProvEq] at hpq
+        | some qa =>
+          obtain ⟨a1, t1⟩ := pa
+          obtain ⟨a2, t2⟩ := qa
+          simp only [abstractByteProvEq, Bool.and_eq_true] at hpq
+          rw [Nat.eq_of_beq_eq_true hpq.1, Nat.eq_of_beq_eq_true hpq.2]
+    rw [hx, hp]
+
+/-- `abstractByteListEq` is sound for equality. -/
+theorem abstractByteListEq_eq_true :
+    ∀ {xs ys : List AbstractByte}, abstractByteListEq xs ys = true → xs = ys
+  | [], [], _ => rfl
+  | [], _ :: _, h => by simp [abstractByteListEq] at h
+  | _ :: _, [], h => by simp [abstractByteListEq] at h
+  | x :: xs, y :: ys, h => by
+    unfold abstractByteListEq at h
+    rw [Bool.and_eq_true] at h
+    rw [abstractByteEq_eq_true h.1, abstractByteListEq_eq_true h.2]
+
+/-- Every in-range slot of `replicateValue count v` is `v`. -/
+theorem get?_replicateValue :
+    ∀ (count i : Nat) (v : Value), i < count → get? (replicateValue count v) i = some v
+  | 0, _, _, h => absurd h (Nat.not_lt_zero _)
+  | _ + 1, 0, _, _ => rfl
+  | k + 1, i + 1, v, h => by
+    have ih := get?_replicateValue k i v (Nat.lt_of_succ_lt_succ h)
+    unfold get? at ih ⊢
+    simpa [replicateValue] using ih
+
+/-- The first `count` slots of `replicateValue count v ++ ys` are `v`. -/
+theorem get?_appendValueList_replicateValue :
+    ∀ (count i : Nat) (v : Value) (ys : List Value), i < count →
+      get? (appendValueList (replicateValue count v) ys) i = some v
+  | 0, _, _, _, h => absurd h (Nat.not_lt_zero _)
+  | _ + 1, 0, _, _, _ => rfl
+  | k + 1, i + 1, v, ys, h => by
+    have ih := get?_appendValueList_replicateValue k i v ys (Nat.lt_of_succ_lt_succ h)
+    unfold get? at ih ⊢
+    simpa [replicateValue, appendValueList] using ih
+
+/-- **Union byte images round-trip.** Decoding a canonical byte image `img` of an inhabited
+`count`-field union (`decodeUnionBytesWithCountOpt`) yields a value whose `count` typed slots are
+all inactive (`.unit`) and which encodes back to exactly `img` (`encodeByLayoutIdxAux`). -/
+theorem decodeUnionBytes_roundtrip (layouts : LayoutTable) (uIdx : Nat) (uL : TypeLayout)
+    (count : Nat) (img : List AbstractByte) (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false) (hFields : uL.fields = .union count)
+    (hLen : img.length = uL.size.bytes) (hCanon : ∀ b ∈ img, RawOverlayCanonical b) :
+    ∃ fs, decodeUnionBytesWithCountOpt layouts uIdx count img = some (.aggregate 0 fs) ∧
+      encodeByLayoutIdxAux 8 layouts uIdx (.aggregate 0 fs) = some img ∧
+      ∀ i, i < count → get? fs i = some .unit := by
+  have hEmpty := encodeByLayoutIdxAux_units layouts uIdx uL count hLookup hInhab hFields
+  unfold decodeUnionBytesWithCountOpt finalizeUnionFieldsWithRawOverlayOpt
+  dsimp only
+  rw [hEmpty]
+  dsimp only
+  cases hEq : abstractByteListEq (replicateUninitBytes uL.size.bytes) img with
+  | true =>
+    have himg := abstractByteListEq_eq_true hEq
+    simp only [forceValueListOpt_eq]
+    exact ⟨_, rfl, by rw [hEmpty, himg], fun i hi => get?_replicateValue count i .unit hi⟩
+  | false =>
+    simp only [forceValueListOpt_eq]
+    exact ⟨_, rfl,
+      encodeByLayoutIdxAux_rawOverlay layouts uIdx uL count img hLookup hInhab hFields hLen hCanon,
+      fun i hi => get?_appendValueList_replicateValue count i .unit _ hi⟩
+
+/-- **`kani#5159`, 0-byte sub-place, two-sided.** Under the hypotheses of
+`readUnion_zeroByte_subProj`, the read faults with `.ub` iff some type along the access is
+uninhabited, and returns the leaf's canonical value (equivalently, returns any `.ok` value) iff
+none is. -/
+theorem readUnion_zeroByte_subProj_iff
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
+    (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hImg : UnionImageOk layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx count fields)
+    (hSlot : UnionSlotInactive fields idx fieldTy.kind)
+    (p : ProjectionElem) (ps idxResolved : List ProjectionElem)
+    (hRes : resolveUnionSubProjIndices locals (p :: ps) = some idxResolved)
+    (hBounds : checkStaticSubProjBounds localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+      (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = true)
+    (subOff : Nat)
+    (hOff : projectionChainByteOffset? layouts (some (unionFieldReadTy localDecls layouts l idx fieldTy))
+      none none 0 localDecls (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) =
+        some subOff)
+    (leafTy : Ty)
+    (hLeaf : resolveProjectedTyResolved localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+      (normalizeSubsliceProjections (stripTransparentProjections idxResolved)) = some leafTy)
+    (hSz : tyByteSize localDecls layouts leafTy = some 0) :
+    (readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) = .ub ↔
+      Bool.or (tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy))
+        (Bool.or
+          (subProjTouchesUninhabited localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+            (normalizeSubsliceProjections (stripTransparentProjections idxResolved)))
+          (tyIsUninhabited layouts leafTy)) = true) ∧
+    (readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) = .ok (zeroByteValue layouts leafTy) ↔
+      Bool.or (tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy))
+        (Bool.or
+          (subProjTouchesUninhabited localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+            (normalizeSubsliceProjections (stripTransparentProjections idxResolved)))
+          (tyIsUninhabited layouts leafTy)) = false) ∧
+    ((∃ v, readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
+        (.field idx fieldTy :: p :: ps) = .ok v) ↔
+      Bool.or (tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy))
+        (Bool.or
+          (subProjTouchesUninhabited localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+            (normalizeSubsliceProjections (stripTransparentProjections idxResolved)))
+          (tyIsUninhabited layouts leafTy)) = false) := by
+  rw [readUnion_zeroByte_subProj locals localDecls layouts baseTy fieldTy fields idx count l d args hKind
+    hLookup hFields hIdx hImg hSlot p ps idxResolved hRes hBounds subOff hOff leafTy hLeaf hSz]
+  cases Bool.or (tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy))
+    (Bool.or
+      (subProjTouchesUninhabited localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy)
+        (normalizeSubsliceProjections (stripTransparentProjections idxResolved)))
+      (tyIsUninhabited layouts leafTy)) <;> simp
+
+/-- **Offset-0 decoding of unions materialized from bytes.** A field of size `n + 1` of the union
+decoded from the canonical image `img` reads `decodeTypedValueFromBytes` of `img.take (n + 1)`, as
+`crates/anneal-mir`'s `decode_mir_value` / `decode_union_value` decode the field at offset `0`. -/
+theorem readDecodedUnion_posField_offset0
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (idx count : Nat) (l : TypeLayout) (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count) (hInhab : l.isUninhabited = false)
+    (hIdx : idx < count)
+    (img : List AbstractByte) (hLen : img.length = l.size.bytes)
+    (hCanon : ∀ b ∈ img, RawOverlayCanonical b)
+    (n : Nat)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some (n + 1))
+    (hLe : n + 1 ≤ img.length) :
+    ∃ fs,
+      decodeUnionBytesWithCountOpt layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx
+          count img = some (.aggregate 0 fs) ∧
+      readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fs) baseTy
+          [.field idx fieldTy] =
+        match decodeTypedValueFromBytes defaultCodecFuel layouts
+            (unionFieldReadTy localDecls layouts l idx fieldTy) (img.take (n + 1)) with
+        | some v => .ok v
+        | none => .ub := by
+  obtain ⟨fs, hDec, hEnc, hUnits⟩ :=
+    decodeUnionBytes_roundtrip layouts _ l count img hLookup hInhab hFields hLen hCanon
+  have hK := tyByteSize_succ_kind localDecls layouts _ n hSz
+  rw [unionFieldReadTy_kind] at hK
+  exact ⟨fs, hDec,
+    readUnion_posField_offset0 locals localDecls layouts baseTy fieldTy fs idx count l d args hKind
+      hLookup hFields hIdx (Or.inr ⟨hUnits idx hIdx, hK.1, hK.2⟩) img hEnc n hSz hLe⟩
+
+/-- **Trailing bytes are ignored.** For a union decoded from `fieldBytes ++ pad`, a field of size
+`fieldBytes.length` reads `fieldBytes` alone: the bytes `[fieldSz, unionSz)` (`.uninit` padding or
+anything else) never affect the read. -/
+theorem readDecodedUnion_trailing_bytes_ignored
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (idx count : Nat) (l : TypeLayout) (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count) (hInhab : l.isUninhabited = false)
+    (hIdx : idx < count)
+    (fieldBytes pad : List AbstractByte) (hLen : (fieldBytes ++ pad).length = l.size.bytes)
+    (hCanon : ∀ b ∈ fieldBytes ++ pad, RawOverlayCanonical b)
+    (n : Nat) (hFb : fieldBytes.length = n + 1)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some (n + 1)) :
+    ∃ fs,
+      decodeUnionBytesWithCountOpt layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx
+          count (fieldBytes ++ pad) = some (.aggregate 0 fs) ∧
+      readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fs) baseTy
+          [.field idx fieldTy] =
+        match decodeTypedValueFromBytes defaultCodecFuel layouts
+            (unionFieldReadTy localDecls layouts l idx fieldTy) fieldBytes with
+        | some v => .ok v
+        | none => .ub := by
+  have hLe : n + 1 ≤ (fieldBytes ++ pad).length := by
+    rw [List.length_append, hFb]; exact Nat.le_add_right _ _
+  have hTake : (fieldBytes ++ pad).take (n + 1) = fieldBytes := by
+    rw [← hFb]; exact List.take_left
+  have h := readDecodedUnion_posField_offset0 locals localDecls layouts baseTy fieldTy idx count l d args
+    hKind hLookup hFields hInhab hIdx (fieldBytes ++ pad) hLen hCanon n hSz hLe
+  rw [hTake] at h
+  exact h
+
+/-! ### Section 6d: `kani#5176` — `[(); N]` arms of uninitialized unions -/
+
+/-- `replicateValue count v` has `count` slots. -/
+theorem length_replicateValue : ∀ (count : Nat) (v : Value), length (replicateValue count v) = count
+  | 0, _ => rfl
+  | k + 1, v => by
+    have ih := length_replicateValue k v
+    unfold length at ih ⊢
+    simp [replicateValue, ih]
+
+/-- Inactive (`.unit`) slots are not counted as typed values. -/
+theorem unionNonUnitTypedSlotCount_units :
+    ∀ count : Nat, unionNonUnitTypedSlotCount count (replicateValue count .unit) = 0
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, unionNonUnitTypedSlotCount, unionNonUnitTypedSlotCount_units k]
+
+/-- A union value with only inactive slots needs no consistency check. -/
+theorem unionNeedsConsistencyCheck_units (count : Nat) :
+    unionNeedsConsistencyCheck count (replicateValue count .unit) = false := by
+  unfold unionNeedsConsistencyCheck
+  rw [length_replicateValue, unionNonUnitTypedSlotCount_units]
+  have h1 : Nat.blt count count = false := by
+    cases h : Nat.blt count count with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true h) (Nat.not_succ_le_self count)
+  rw [h1]
+  rfl
+
+/-- Uninitialized bytes carry no provenance. -/
+theorem abstractBytesHaveProv_replicate_uninit :
+    ∀ n : Nat, abstractBytesHaveProv (List.replicate n AbstractByte.uninit) = false
+  | 0 => rfl
+  | n + 1 => by
+    rw [List.replicate_succ]
+    exact abstractBytesHaveProv_replicate_uninit n
+
+/-- Integers never decode from uninitialized bytes. -/
+theorem decodeTypedValueFromBytes_int_uninit (layouts : LayoutTable) (ty : Ty) (n : Nat)
+    (hInt : (∃ w, ty.kind = .uint w) ∨ (∃ w, ty.kind = .int w)) :
+    decodeTypedValueFromBytes defaultCodecFuel layouts ty (List.replicate (n + 1) .uninit) = none := by
+  have hP := abstractBytesHaveProv_replicate_uninit (n + 1)
+  have hD : ∀ s, decodeScalarBytes (List.replicate (n + 1) AbstractByte.uninit) s = none := by
+    intro s
+    cases h : decodeScalarBytes (List.replicate (n + 1) AbstractByte.uninit) s with
+    | none => rfl
+    | some r =>
+      have hInit := decodeScalarBytes_some_allBytesInitialized _ s r h
+      simp [List.replicate_succ, allBytesInitialized] at hInit
+  rw [show defaultCodecFuel = 15 + 1 from rfl]
+  rcases hInt with ⟨w, hw⟩ | ⟨w, hw⟩
+  · unfold decodeTypedValueFromBytes
+    simp only [normalizeCodecTy, hw]
+    rw [hP]
+    simp only []
+    unfold decodeValueFromBytes
+    simp only [hw]
+    split <;> (try rfl)
+    split <;> (try rfl)
+  · unfold decodeTypedValueFromBytes
+    simp only [normalizeCodecTy, hw]
+    rw [hP]
+    simp only []
+    unfold decodeValueFromBytes
+    simp only [hw]
+    split <;> (try rfl)
+    split <;> (try rfl)
+
+/-- **`kani#5176`, 0-byte arm.** From all-`.uninit` storage (every slot inactive, as for
+`MaybeUninit::uninit()` or a union decoded from uninitialized bytes), an inhabited 0-byte arm such
+as `[(); N]` reads its canonical value. -/
+theorem kani5176_uninit_storage_zst_field
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (idx count : Nat) (l : TypeLayout) (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count)
+    (hIdx : idx < count)
+    (hNU : fieldTy.kind ≠ .tuple []) (hNF : ∀ p a, fieldTy.kind ≠ .fnDef p a)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0)
+    (hInh : tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = false) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 (replicateValue count .unit))
+        baseTy [.field idx fieldTy] =
+      .ok (zeroByteValue layouts (unionFieldReadTy localDecls layouts l idx fieldTy)) := by
+  rw [readUnion_zeroByte_root locals localDecls layouts baseTy fieldTy (replicateValue count .unit) idx
+    count l d args hKind hLookup hFields hIdx (Or.inl (unionNeedsConsistencyCheck_units count))
+    (Or.inr ⟨get?_replicateValue count idx .unit hIdx, hNU, hNF⟩) hSz, hInh]
+
+/-- **`kani#5176`, positive-sized scalar arm.** From all-`.uninit` storage, an integer arm faults
+with `.ub`: its bytes are uninitialized. -/
+theorem kani5176_uninit_storage_int_field_ub
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy fieldTy : Ty) (idx count : Nat) (l : TypeLayout) (d : DefPath) (args : List RigidTy)
+    (hKind : (resolveTyWithLocalDecls localDecls layouts baseTy).kind = .adt d args)
+    (hLookup : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx =
+      some l)
+    (hFields : l.fields = .union count) (hInhab : l.isUninhabited = false)
+    (hIdx : idx < count)
+    (hInt : (∃ w, fieldTy.kind = .uint w) ∨ (∃ w, fieldTy.kind = .int w))
+    (n : Nat)
+    (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some (n + 1))
+    (hLe : n + 1 ≤ l.size.bytes) :
+    readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 (replicateValue count .unit))
+        baseTy [.field idx fieldTy] = .ub := by
+  have hEnc := encodeByLayoutIdxAux_units layouts _ l count hLookup hInhab hFields
+  have hK := tyByteSize_succ_kind localDecls layouts _ n hSz
+  rw [unionFieldReadTy_kind] at hK
+  have hLe' : n + 1 ≤ (replicateUninitBytes l.size.bytes).length := by
+    rw [length_replicateUninitBytes]; exact hLe
+  rw [readUnion_posField_offset0 locals localDecls layouts baseTy fieldTy (replicateValue count .unit)
+    idx count l d args hKind hLookup hFields hIdx
+    (Or.inr ⟨get?_replicateValue count idx .unit hIdx, hK.1, hK.2⟩) _ hEnc n hSz hLe']
+  have hTake : (replicateUninitBytes l.size.bytes).take (n + 1) = List.replicate (n + 1) .uninit := by
+    rw [replicateUninitBytes_eq_replicate, List.take_replicate, Nat.min_eq_left hLe]
+  have hIntR : (∃ w, (unionFieldReadTy localDecls layouts l idx fieldTy).kind = .uint w) ∨
+      (∃ w, (unionFieldReadTy localDecls layouts l idx fieldTy).kind = .int w) := by
+    rw [unionFieldReadTy_kind]; exact hInt
+  rw [hTake, decodeTypedValueFromBytes_int_uninit layouts _ n hIntR]
+
+/-! ### Section 6e: Kernel-checked witnesses on `rustc`-shaped layout tables -/
+
+/-- `core::convert::Infallible` (`enum Infallible {}`). -/
+def wInfK : RigidTy := .adt "core::convert::Infallible" []
+
+/-- A 0-byte, 1-aligned `TypeLayout` of the given shape. -/
+def wZstLayout (fields : FieldsShape) (variants : VariantsShape) (uninhabited : Bool)
+    (fls : List Nat) : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := fields, variants := variants,
+    isUninhabited := uninhabited, fieldLayouts := fls }
+
+/-- `u32`. -/
+def wU32Layout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- The 4-byte union `U` with eleven fields (layout indices `0..=10`). -/
+def wULayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .union 11,
+    variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }
+
+def wLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [
+      wU32Layout,
+      wZstLayout (.arbitrary [] []) (.single 0) false [],
+      wZstLayout .primitive .empty true [],
+      wZstLayout .primitive .empty true [],
+      wZstLayout (.arbitrary [⟨0⟩, ⟨0⟩] [0, 1]) (.single 0) true [3, 1],
+      wZstLayout (.array ⟨0⟩ 1) (.single 0) true [3],
+      wZstLayout (.arbitrary [⟨0⟩] [0]) (.single 0) true [3],
+      wZstLayout (.arbitrary [] []) (.single 0) false [],
+      wZstLayout (.array ⟨0⟩ 0) (.single 0) false [3],
+      wZstLayout (.array ⟨0⟩ 3) (.single 0) false [1],
+      wZstLayout (.union 2) (.single 0) false [4, 1],
+      wULayout] }
+
+def wU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+def wUnitTy : Ty := { kind := .tuple [], layoutIdx := 1 }
+def wNeverTy : Ty := { kind := .never, layoutIdx := 2 }
+def wInfTy : Ty := { kind := wInfK, layoutIdx := 3 }
+def wPairTy : Ty := { kind := .tuple [wInfK, .tuple []], layoutIdx := 4 }
+def wArr1Ty : Ty := { kind := .array wInfK 1, layoutIdx := 5 }
+def wMdTy : Ty := { kind := .adt "core::mem::ManuallyDrop" [wInfK], layoutIdx := 6 }
+def wPhTy : Ty := { kind := .adt "core::marker::PhantomData" [wInfK], layoutIdx := 7 }
+def wArr0Ty : Ty := { kind := .array wInfK 0, layoutIdx := 8 }
+def wZArrTy : Ty := { kind := .array (.tuple []) 3, layoutIdx := 9 }
+def wVTy : Ty := { kind := .adt "V" [], layoutIdx := 10 }
+def wUTy : Ty := { kind := .adt "U" [], layoutIdx := 11 }
+
+def wDecls : List LocalDecl := [{ mutability := .mut, ty := wUTy, debugName := none }]
+
+/-- `U { val: 42 }`: slot `0` holds the active `u32`, every other slot is inactive. -/
+def wUVal : Value := .aggregate 0 (.scalar ⟨42, 4⟩ :: replicateValue 10 .unit)
+
+/-- **`kani#5159` witness reads.** On `U { val: 42 }`: the active `u32` and the inhabited 0-byte
+fields (`()`, `PhantomData<Infallible>`, `[Infallible; 0]`, `[(); 3]`, `[(); 3][2]`, the union
+`V` and `V.y`) read their values, while the uninhabited fields `!`, `Infallible`,
+`(Infallible, ())`, `[Infallible; 1]`, `ManuallyDrop<Infallible>`, the sub-places
+`pair.1`, `arr1[0]`, `md.value`, and `V.p`, `V.p.1` fault with `.ub`. -/
+theorem kani5159_witness_reads :
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 0 wU32Ty] =
+        .ok (.scalar ⟨42, 4⟩) ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 1 wUnitTy] = .ok .unit ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 2 wNeverTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 3 wInfTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 4 wPairTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 4 wPairTy, .field 1 wUnitTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 5 wArr1Ty] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 5 wArr1Ty, .constantIndex 0 1 false] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 6 wMdTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 6 wMdTy, .field 0 wInfTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 7 wPhTy] =
+        .ok (.aggregate 0 []) ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 8 wArr0Ty] =
+        .ok (.aggregate 0 []) ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 9 wZArrTy] =
+        .ok (.aggregate 0 [.unit, .unit, .unit]) ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 9 wZArrTy, .constantIndex 2 3 false] = .ok .unit ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 10 wVTy] =
+        .ok (.aggregate 0 [.unit, .unit]) ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 10 wVTy, .field 1 wUnitTy] = .ok .unit ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 10 wVTy, .field 0 wPairTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 10 wVTy, .field 0 wPairTy, .field 1 wUnitTy] = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
+
+/-- Non-vacuity of the general field-root and sub-projection theorems on `wUVal`. -/
+theorem kani5159_witness_general_instances :
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 3 wInfTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 4 wPairTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 7 wPhTy] =
+      .ok (zeroByteValue wLayouts wPhTy) ∧
+    (readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 10 wVTy, .field 0 wPairTy, .field 1 wUnitTy] = .ub ↔
+      Bool.or (tyIsUninhabited wLayouts wVTy)
+        (Bool.or (subProjTouchesUninhabited wDecls wLayouts wVTy [.field 0 wPairTy, .field 1 wUnitTy])
+          (tyIsUninhabited wLayouts wUnitTy)) = true) ∧
+    tyIsUninhabited wLayouts wVTy = false ∧ tyIsUninhabited wLayouts wUnitTy = false ∧
+    subProjTouchesUninhabited wDecls wLayouts wVTy [.field 0 wPairTy, .field 1 wUnitTy] = true := by
+  have hSlot : ∀ i, 1 ≤ i → i < 11 → ∀ k : RigidTy, k ≠ .tuple [] → (∀ p a, k ≠ .fnDef p a) →
+      UnionSlotInactive (.scalar ⟨42, 4⟩ :: replicateValue 10 .unit) i k := by
+    intro i h1 h2 k hNU hNF
+    refine Or.inr ⟨?_, hNU, hNF⟩
+    obtain ⟨j, rfl⟩ : ∃ j, i = j + 1 := ⟨i - 1, by omega⟩
+    unfold get?
+    simpa using get?_replicateValue 10 j .unit (by omega)
+  refine ⟨?_, ?_, ?_, ?_, rfl, rfl, rfl⟩
+  · exact kani5159_uninhabited_field_root_ub [] wDecls wLayouts wUTy wInfTy _ 3 11 wULayout "U" [] rfl rfl
+      rfl (by decide) (Or.inl rfl) (hSlot 3 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h))
+      rfl (Or.inl rfl)
+  · exact kani5159_uninhabited_field_root_ub [] wDecls wLayouts wUTy wPairTy _ 4 11 wULayout "U" [] rfl
+      rfl rfl (by decide) (Or.inl rfl)
+      (hSlot 4 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h)) rfl (Or.inr rfl)
+  · have h := readUnion_zeroByte_root [] wDecls wLayouts wUTy wPhTy _ 7 11 wULayout "U" [] rfl rfl rfl
+      (by decide) (Or.inl rfl) (hSlot 7 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h))
+      rfl
+    exact h
+  · exact (readUnion_zeroByte_subProj_iff [] wDecls wLayouts wUTy wVTy _ 10 11 wULayout "U" [] rfl rfl
+      rfl (by decide) (Or.inl rfl) (hSlot 10 (by decide) (by decide) _ (by intro h; cases h)
+        (by intro p a h; cases h))
+      (.field 0 wPairTy) [.field 1 wUnitTy] [.field 0 wPairTy, .field 1 wUnitTy] rfl rfl 0 rfl wUnitTy
+      rfl rfl).1
+
+/-! `kani#5176` witness: `#[repr(C)] union PU { payload: Padded, x: u32, z: [(); 2] }` with
+`#[repr(C)] struct Padded { a: u8, b: u32 }` (bytes `1..4` of `payload` are padding). -/
+
+def wU8Layout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def wPaddedLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [12, 0] }
+
+def wPULayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory, fields := .union 3, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [13, 0, 14] }
+
+def wLayouts5176 : LayoutTable :=
+  { wLayouts with
+    entries := wLayouts.entries ++
+      [wU8Layout, wPaddedLayout, wZstLayout (.array ⟨0⟩ 2) (.single 0) false [1], wPULayout] }
+
+def wU8Ty : Ty := { kind := .uint .u8, layoutIdx := 12 }
+def wPaddedTy : Ty := { kind := .adt "Padded" [], layoutIdx := 13 }
+def wZ2Ty : Ty := { kind := .array (.tuple []) 2, layoutIdx := 14 }
+def wPUTy : Ty := { kind := .adt "PU" [], layoutIdx := 15 }
+def wDecls5176 : List LocalDecl := [{ mutability := .mut, ty := wPUTy, debugName := none }]
+
+/-- `PU { payload: Padded { a: 1, b: 2 } }`. -/
+def wPUPayload : Value :=
+  .aggregate 0 [.aggregate 0 [.scalar ⟨1, 1⟩, .scalar ⟨2, 4⟩], .unit, .unit]
+
+/-- **`kani#5176` witness reads.** From all-`.uninit` storage of `PU` (exactly the decoding of eight
+uninitialized bytes), `z` and `z[1]` read their values while `x : u32` and `payload` fault; with
+`payload` active, `z`, `z[1]`, and `payload.b` read their values while `x` faults on the
+padding bytes `1..4` of `payload`; on the bytes of `write_bytes(_, 0x5a, 8)`, `x` reads
+`0x5a5a5a5a`. -/
+theorem kani5176_witness_reads :
+    decodeUnionBytesWithCountOpt wLayouts5176 15 3 (List.replicate 8 .uninit) =
+        some (.aggregate 0 (replicateValue 3 .unit)) ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 (replicateValue 3 .unit))
+        wPUTy [.field 2 wZ2Ty] = .ok (.aggregate 0 [.unit, .unit]) ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 (replicateValue 3 .unit))
+        wPUTy [.field 2 wZ2Ty, .constantIndex 1 2 false] = .ok .unit ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 (replicateValue 3 .unit))
+        wPUTy [.field 1 wU32Ty] = .ub ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 (replicateValue 3 .unit))
+        wPUTy [.field 0 wPaddedTy] = .ub ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 wPUPayload wPUTy [.field 2 wZ2Ty] =
+        .ok (.aggregate 0 [.unit, .unit]) ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 wPUPayload wPUTy
+        [.field 2 wZ2Ty, .constantIndex 1 2 false] = .ok .unit ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 wPUPayload wPUTy
+        [.field 0 wPaddedTy, .field 1 wU32Ty] = .ok (.scalar ⟨2, 4⟩) ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 wPUPayload wPUTy [.field 1 wU32Ty] = .ub ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176
+        (.aggregate 0 (replicateValue 3 .unit ++
+          [.aggregate 0 (encodeRawAbstractByteVals (List.replicate 8 (.init 0x5a none)))]))
+        wPUTy [.field 1 wU32Ty] = .ok (.scalar ⟨0x5a5a5a5a, 4⟩) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
+
+/-- Non-vacuity of the `kani#5176` and trailing-byte theorems on `PU`. -/
+theorem kani5176_witness_general_instances :
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 (replicateValue 3 .unit))
+        wPUTy [.field 2 wZ2Ty] = .ok (zeroByteValue wLayouts5176 wZ2Ty) ∧
+    readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 (replicateValue 3 .unit))
+        wPUTy [.field 1 wU32Ty] = .ub ∧
+    ∃ fs,
+      decodeUnionBytesWithCountOpt wLayouts5176 15 3
+          (List.replicate 4 (.init 0x5a none) ++ List.replicate 4 .uninit) = some (.aggregate 0 fs) ∧
+      readProjectedValueUnionAware [] wDecls5176 wLayouts5176 (.aggregate 0 fs) wPUTy
+          [.field 1 wU32Ty] =
+        match decodeTypedValueFromBytes defaultCodecFuel wLayouts5176 wU32Ty
+            (List.replicate 4 (.init 0x5a none)) with
+        | some v => .ok v
+        | none => .ub := by
+  refine ⟨?_, ?_, ?_⟩
+  · exact kani5176_uninit_storage_zst_field [] wDecls5176 wLayouts5176 wPUTy wZ2Ty 2 3 wPULayout "PU" []
+      rfl rfl rfl (by decide) (by intro h; cases h) (by intro p a h; cases h) rfl rfl
+  · exact kani5176_uninit_storage_int_field_ub [] wDecls5176 wLayouts5176 wPUTy wU32Ty 1 3 wPULayout "PU"
+      [] rfl rfl rfl rfl (by decide) (Or.inl ⟨.u32, rfl⟩) 3 rfl (by decide)
+  · exact readDecodedUnion_trailing_bytes_ignored [] wDecls5176 wLayouts5176 wPUTy wU32Ty 1 3 wPULayout
+      "PU" [] rfl rfl rfl rfl (by decide) _ _ rfl
+      (by intro b hb; simp at hb; rcases hb with rfl | rfl <;> trivial) 3 rfl rfl
+
+end UnionZst
 
 end Anneal.Mir.AdtAndControl
