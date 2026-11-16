@@ -740,6 +740,293 @@ fn union_fields_of(ty: &Ty) -> Option<&[Ty]> {
     }
 }
 
+/// Returns true if `ty` is an *inhabited zero-sized type*: an exact layout of size `0` and at
+/// least one value, e.g. `()`, `[T; 0]` (even `[!; 0]`), `[(); N]`, `PhantomData<T>`, a
+/// function item, or a struct / tuple / closure / univariant enum / union built from such
+/// types. Uninhabited ZSTs (`!`, `enum Void {}`, `[!; 1]`, `((), !)`) and types whose layout
+/// is unspecified, ill-formed, or too large are not.
+///
+/// A place of such a type occupies no bytes, so accessing it reads or writes no memory and
+/// it always holds its unique value ([`canonical_zst_value`]). Both properties are decided
+/// for every supported pointer width (a ZST contains no scalar, so neither ever depends on
+/// it), which keeps this usable where no target width is at hand.
+fn is_inhabited_zst(ty: &Ty) -> bool {
+    [PtrWidth::Bits32, PtrWidth::Bits64].into_iter().all(|pw| {
+        ty.layout_for(pw).is_ok_and(|layout| layout.size == 0) && ty.is_inhabited_for(pw)
+    })
+}
+
+/// The unique value of the inhabited zero-sized type `ty` ([`is_inhabited_zst`]), shaped like
+/// the decoding of zero bytes ([`decode_mir_value`]): `()` / fieldless closures and function
+/// items are `MirValue::Unit`, arrays hold `count` unique element values, structs and tuples
+/// their fields' unique values, a (tagless) zero-sized enum its only present variant, and a
+/// zero-sized union its first inhabited field.
+///
+/// At most `MAX_EVAL_ARRAY_LEN` value nodes are materialized in total (`[[(); 1 << 20]; 1 << 20]`
+/// is a valid ZST), beyond which this fails closed with `EvaluationLimit`.
+fn canonical_zst_value(ty: &Ty) -> Result<MirValue, RvalueEvalError> {
+    if !is_inhabited_zst(ty) {
+        return Err(RvalueEvalError::TypeMismatch(
+            "canonical zero-sized value requested for a type that is not an inhabited ZST",
+        ));
+    }
+    let mut budget = MAX_EVAL_ARRAY_LEN;
+    canonical_zst_value_within(ty, &mut budget)
+}
+
+/// [`canonical_zst_value`] of the (already checked) inhabited ZST `ty`, charging every
+/// materialized value node to `budget`.
+fn canonical_zst_value_within(ty: &Ty, budget: &mut usize) -> Result<MirValue, RvalueEvalError> {
+    let Some(rest) = budget.checked_sub(1) else {
+        return Err(RvalueEvalError::EvaluationLimit {
+            len: MAX_EVAL_ARRAY_LEN.saturating_add(1),
+        });
+    };
+    *budget = rest;
+    let mut fields_of = |field_tys: &[Ty]| -> Result<Vec<MirValue>, RvalueEvalError> {
+        field_tys
+            .iter()
+            .map(|field_ty| canonical_zst_value_within(field_ty, budget))
+            .collect()
+    };
+    match ty {
+        Ty::Tuple(fields) if fields.is_empty() => Ok(MirValue::Unit),
+        Ty::Tuple(fields) => Ok(MirValue::Tuple(fields_of(fields)?)),
+        Ty::FnDef(_) => Ok(MirValue::Unit),
+        Ty::Closure { upvars, .. } if upvars.is_empty() => Ok(MirValue::Unit),
+        Ty::Closure { upvars, .. } => Ok(MirValue::Tuple(fields_of(upvars)?)),
+        Ty::Array(elem, count) => {
+            if *count > *budget {
+                return Err(RvalueEvalError::EvaluationLimit { len: *count });
+            }
+            let elements = (0..*count)
+                .map(|_| canonical_zst_value_within(elem, budget))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MirValue::Array {
+                elements,
+                elem_ty: (**elem).clone(),
+            })
+        }
+        Ty::Adt(def) => match &def.kind {
+            AdtKind::Struct { fields } => Ok(MirValue::adt(def, 0, fields_of(fields)?)),
+            // A zero-sized (tagless) enum always holds its only present variant.
+            AdtKind::Enum { variants, .. } => match def.univariant_index() {
+                Some(v) => Ok(MirValue::adt(def, v, fields_of(&variants[v].fields)?)),
+                None => Err(RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                    ty: ty.clone(),
+                })),
+            },
+            AdtKind::Union { fields } => {
+                // Every field of a zero-sized union is zero-sized: pick the first inhabited one.
+                let Some((idx, field_ty)) = fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, field_ty)| is_inhabited_zst(field_ty))
+                else {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+                        target_ty: ty.clone(),
+                    }));
+                };
+                let value = canonical_zst_value_within(field_ty, budget)?;
+                Ok(MirValue::union_value(def, idx, value))
+            }
+        },
+        Ty::Bool
+        | Ty::Char
+        | Ty::Int(_)
+        | Ty::Uint(_)
+        | Ty::RawPtr(_, _)
+        | Ty::Ref(_, _)
+        | Ty::FnPtr { .. }
+        | Ty::Never
+        | Ty::Slice(_)
+        | Ty::Str => Err(RvalueEvalError::TypeMismatch(
+            "canonical zero-sized value requested for a type that is not an inhabited ZST",
+        )),
+    }
+}
+
+/// For a union `Ty::Adt` with an inhabited zero-sized field ([`is_inhabited_zst`]), the value
+/// of that union when none of its bytes is initialized: its first inhabited zero-sized field
+/// active (`MaybeUninit::<T>::uninit()` is `MaybeUninit { uninit: () }`). Such a union value
+/// holds no bytes of any other field, so every other field reads as uninitialized
+/// (`InactiveUnionField`), every inhabited zero-sized field reads its unique value, and a
+/// whole-union copy is defined, exactly as for a union whose bytes are all uninitialized in
+/// Miri and `Trusted.MirSemantics` (whose union aggregate then holds only `.unit` slots).
+///
+/// `None` for every other type (including legacy tuple-modeled unions, which carry no
+/// union definition, and unions without an inhabited zero-sized field).
+fn uninit_union_value(ty: &Ty) -> Result<Option<MirValue>, RvalueEvalError> {
+    let Ty::Adt(def) = ty else {
+        return Ok(None);
+    };
+    let AdtKind::Union { fields } = &def.kind else {
+        return Ok(None);
+    };
+    let Some((idx, field_ty)) = fields
+        .iter()
+        .enumerate()
+        .find(|(_, field_ty)| is_inhabited_zst(field_ty))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(MirValue::union_value(def, idx, canonical_zst_value(field_ty)?)))
+}
+
+/// The type a `Deref`-free projection `proj` designates starting at `ty`, borrowed from `ty`
+/// and `proj` (`None` when `proj` ends with a `Subslice` window or does not type-check,
+/// mirroring the leaf type [`project_mir_value`] reports).
+fn projection_leaf_ty<'a>(mut ty: &'a Ty, proj: &'a [ProjectionElem]) -> Option<&'a Ty> {
+    let mut window = false;
+    for elem in proj {
+        match elem {
+            ProjectionElem::Field(_, field_ty) => {
+                ty = field_ty;
+                window = false;
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                let Ty::Array(elem_ty, _) = ty else {
+                    return None;
+                };
+                ty = elem_ty;
+                window = false;
+            }
+            ProjectionElem::Subslice { .. } => {
+                if !matches!(ty, Ty::Array(..)) {
+                    return None;
+                }
+                window = true;
+            }
+            ProjectionElem::Downcast(_) => {}
+            ProjectionElem::Deref => return None,
+        }
+    }
+    (!window).then_some(ty)
+}
+
+/// The field types of a struct, tuple, closure, or union `ty` that a `Field` step of a
+/// covering place may select (see [`place_covers_whole_value`]), with whether `ty` is a union.
+fn covering_field_tys(ty: &Ty) -> Option<(&[Ty], bool)> {
+    match ty {
+        Ty::Tuple(fields) => Some((fields, false)),
+        Ty::Closure { upvars, .. } => Some((upvars, false)),
+        Ty::Adt(def) => match &def.kind {
+            AdtKind::Struct { fields } => Some((fields, false)),
+            AdtKind::Union { fields } => Some((fields, true)),
+            AdtKind::Enum { .. } => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns true if a write of the place `rest` inside a value of type `ty` determines that
+/// whole value: `rest` is a chain of `Field` steps through structs, tuples, and closures whose
+/// other fields are all inhabited zero-sized types, `Field` steps selecting a union field
+/// (which then becomes that union's active field), and `ConstantIndex` steps into one-element
+/// arrays (e.g. `.value.value` of a `ManuallyDrop<T>`-wrapped `T`, the place
+/// `MaybeUninit::as_mut_ptr` designates). Enum steps are never covering (a tag or niche lies
+/// outside or inside the written bytes).
+fn place_covers_whole_value(ty: &Ty, rest: &[ProjectionElem]) -> bool {
+    let Some((first, tail)) = rest.split_first() else {
+        return true;
+    };
+    match first {
+        ProjectionElem::Field(idx, field_ty) => {
+            let Some((fields, is_union)) = covering_field_tys(ty) else {
+                return false;
+            };
+            fields.get(*idx) == Some(field_ty)
+                && (is_union
+                    || fields
+                        .iter()
+                        .enumerate()
+                        .all(|(i, sibling)| i == *idx || is_inhabited_zst(sibling)))
+                && place_covers_whole_value(field_ty, tail)
+        }
+        ProjectionElem::ConstantIndex {
+            offset: 0,
+            min_length: 1,
+            from_end: false,
+        } => matches!(ty, Ty::Array(elem, 1) if place_covers_whole_value(elem, tail)),
+        _ => false,
+    }
+}
+
+/// The value of type `ty` whose place `rest` holds `leaf_val` when the place covers the whole
+/// value ([`place_covers_whole_value`]): every other part holds its unique zero-sized value
+/// ([`canonical_zst_value`]) and every union along `rest` has the selected field active.
+/// `None` when `rest` does not cover `ty`.
+fn fill_covering_value(
+    ty: &Ty,
+    rest: &[ProjectionElem],
+    leaf_val: MirValue,
+) -> Result<Option<MirValue>, RvalueEvalError> {
+    if !place_covers_whole_value(ty, rest) {
+        return Ok(None);
+    }
+    let Some((first, tail)) = rest.split_first() else {
+        return Ok(Some(leaf_val));
+    };
+    match (first, ty) {
+        (ProjectionElem::Field(idx, field_ty), _) => {
+            let Some(inner) = fill_covering_value(field_ty, tail, leaf_val)? else {
+                return Ok(None);
+            };
+            let Some((fields, is_union)) = covering_field_tys(ty) else {
+                return Ok(None);
+            };
+            if is_union {
+                let Ty::Adt(def) = ty else {
+                    return Ok(None);
+                };
+                return Ok(Some(MirValue::union_value(def, *idx, inner)));
+            }
+            let mut inner = Some(inner);
+            let mut values = Vec::with_capacity(fields.len());
+            for (i, sibling) in fields.iter().enumerate() {
+                match inner.take_if(|_| i == *idx) {
+                    Some(value) => values.push(value),
+                    None => values.push(canonical_zst_value(sibling)?),
+                }
+            }
+            Ok(Some(match ty {
+                Ty::Adt(def) => MirValue::adt(def, 0, values),
+                _ => MirValue::Tuple(values),
+            }))
+        }
+        (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, 1)) => {
+            Ok(fill_covering_value(elem, tail, leaf_val)?.map(|value| MirValue::Array {
+                elements: vec![value],
+                elem_ty: (**elem).clone(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Returns true if the union `Ty::Adt` value `val` holds no initialized byte: its active field
+/// is an inhabited zero-sized field (`MaybeUninit::uninit()`). The value tree only produces
+/// such a value for a union none of whose bytes is initialized: a union aggregate initializes
+/// no byte outside its (zero-sized) field, uninitialized bytes over every readable byte of a
+/// union leave this value ([`uninit_union_value`]), and writing a zero-sized field of an
+/// initialized union never makes that field active (it stores no bytes). Legacy
+/// tuple-modeled union values (which carry no union definition) are never reported.
+fn union_holds_no_initialized_byte(val: &MirValue) -> bool {
+    let MirValue::Adt {
+        active_field: Some(active),
+        adt_def: Some(def),
+        ..
+    } = val
+    else {
+        return false;
+    };
+    def.is_union()
+        && def
+            .variant_fields(0)
+            .and_then(|fields| fields.get(*active))
+            .is_some_and(is_inhabited_zst)
+}
+
 /// Resolves the static `Ty` of an `Operand` against `local_decls`. A `Copy`/`Move` operand
 /// reads its place by value, so the place must have a sized type
 /// ([`RvalueLowerError::UnsizedType`] for `[T]` / `str`).
@@ -3222,12 +3509,42 @@ fn encode_mir_value(
             check_scalar_ranges(val, ptr_width)?;
             let MirValue::Adt {
                 variant_idx,
+                active_field,
                 fields: values,
                 ..
             } = val
             else {
                 unreachable!()
             };
+            if let AdtKind::Union {
+                fields: union_fields,
+            } = &def.kind
+            {
+                // A union's bytes are those of its active field at offset `0`
+                // (`FieldsShape::Union`). The value tree holds no bytes for the rest of the
+                // union, which an `AbstractByte` image cannot express as uninitialized, so an
+                // active field narrower than the union is unsupported.
+                let (Some(active), [value]) = (active_field, values.as_slice()) else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "transmute operand union value must hold exactly its active field",
+                    ));
+                };
+                let Some(field_ty) = union_fields.get(*active) else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "transmute operand union active field is out of range",
+                    ));
+                };
+                match (field_ty.layout_for(ptr_width), ty.layout_for(ptr_width)) {
+                    (Ok(field_layout), Ok(union_layout))
+                        if field_layout.size == union_layout.size => {}
+                    _ => {
+                        return Err(RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                            ty: ty.clone(),
+                        }));
+                    }
+                }
+                return encode_mir_value(value, field_ty, ptr_width, out);
+            }
             if let Some((niche, payload_ty)) = null_pointer_payload(def, ptr_width) {
                 return encode_null_pointer_niche_value(
                     values,
@@ -3822,6 +4139,9 @@ fn decode_mir_value(
                     target_ty: ty.clone(),
                 }));
             }
+            if def.is_union() {
+                return decode_union_value(bytes, ty, def, ptr_width);
+            }
             if let Some((niche, payload_ty)) = null_pointer_payload(def, ptr_width) {
                 // A null data pointer is the null variant, anything else the payload variant;
                 // the 1-ZST fields occupy no bytes.
@@ -3883,18 +4203,92 @@ fn decode_mir_value(
                 values.push(decode_mir_value(&bytes[offset..offset + size], field, ptr_width)?);
                 offset += size;
             }
-            let value = if def.is_union() {
-                let Some(field) = values.pop() else {
-                    return Err(RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
-                        ty: ty.clone(),
-                    }));
-                };
-                MirValue::union_value(def, 0, field)
-            } else {
-                MirValue::adt(def, variant_idx, values)
-            };
+            let value = MirValue::adt(def, variant_idx, values);
             check_scalar_ranges(&value, ptr_width)?;
             Ok(value)
+        }
+    }
+}
+
+/// Decodes the byte image `bytes` (exactly the size of the union `ty` with definition `def`)
+/// into a union value.
+///
+/// Every union field starts at offset `0` (`FieldsShape::Union`; `Trusted.MirSemantics`'
+/// `decodeUnionFieldsByLayoutIdxs` decodes each field from the prefix `[0 .. size)` of the
+/// shared bytes, and a zero-sized field from no bytes), while a union value in the value tree
+/// holds a single active field. So, among the union's inhabited fields (an uninhabited field
+/// can never be read, so it does not constrain the representation):
+/// - with no non-zero-sized one, no field can observe any byte: the first inhabited
+///   (zero-sized) field becomes active with its unique value;
+/// - with exactly one non-zero-sized one, `f` (`MaybeUninit<T>`'s `value`, or a `#[repr(C)]`
+///   union of one payload and `()` / `[(); N]` fields), `f` is decoded from the prefix
+///   `[0 .. size_of(f))` (trailing union padding constrains no field) and becomes active
+///   under its own index, so every zero-sized field still reads its unique value;
+/// - with several non-zero-sized ones, any single active field would drop the bytes that
+///   the others read (`union { a: u32, b: [u8; 4] }` read as `b` after a transmute from
+///   `u32`), so the union is unsupported.
+///
+/// Any byte pattern is a valid union value, so bytes that the value tree cannot hold as the
+/// active field (`MaybeUninit<bool>` holding `2`) are unsupported (`UnsupportedLayout`), never
+/// an invalid value or an uninhabited target.
+fn decode_union_value(
+    bytes: &[AbstractByte],
+    ty: &Ty,
+    def: &Arc<AdtDef>,
+    ptr_width: PtrWidth,
+) -> Result<MirValue, RvalueEvalError> {
+    let unsupported = || {
+        RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout { ty: ty.clone() })
+    };
+    let AdtKind::Union { fields } = &def.kind else {
+        return Err(unsupported());
+    };
+    if !ty
+        .layout_for(ptr_width)
+        .is_ok_and(|layout| layout.size == bytes.len())
+    {
+        return Err(unsupported());
+    }
+    let mut payload: Option<(usize, &Ty, usize)> = None;
+    for (idx, field_ty) in fields.iter().enumerate() {
+        if !field_ty.is_inhabited_for(ptr_width) {
+            continue;
+        }
+        let Ok(field_layout) = field_ty.layout_for(ptr_width) else {
+            return Err(unsupported());
+        };
+        if field_layout.size == 0 {
+            continue;
+        }
+        if payload.is_some() {
+            return Err(unsupported());
+        }
+        payload = Some((idx, field_ty, field_layout.size));
+    }
+    match payload {
+        Some((idx, field_ty, size)) => {
+            let Some(field_bytes) = bytes.get(..size) else {
+                return Err(unsupported());
+            };
+            let value = decode_mir_value(field_bytes, field_ty, ptr_width)
+                .map(|field_val| MirValue::union_value(def, idx, field_val))
+                .and_then(|value| check_scalar_ranges(&value, ptr_width).map(|()| value));
+            value.map_err(|err| match err {
+                err @ RvalueEvalError::EvaluationLimit { .. } => err,
+                _ => unsupported(),
+            })
+        }
+        None => {
+            let Some((idx, field_ty)) = fields
+                .iter()
+                .enumerate()
+                .find(|(_, field_ty)| is_inhabited_zst(field_ty))
+            else {
+                return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+                    target_ty: ty.clone(),
+                }));
+            };
+            Ok(MirValue::union_value(def, idx, canonical_zst_value(field_ty)?))
         }
     }
 }
@@ -4948,13 +5342,42 @@ where
 }
 
 /// Borrowed target designated by an immutable projection walk over a [`MirValue`]: either a
-/// single [`MirValue`] node or a `Subslice` window `&[MirValue]` with its element type.
+/// single [`MirValue`] node, a `Subslice` window `&[MirValue]` with its element type, or an
+/// owned value the walk synthesized because the value tree does not store it.
 enum ProjectedRef<'a> {
     Value(&'a MirValue),
     ArrayWindow {
         window: &'a [MirValue],
         elem_ty: &'a Ty,
     },
+    /// The unique value of a place inside an inhabited zero-sized union field other than the
+    /// union's active field (see [`project_inactive_zst_union_field`]): the field occupies no
+    /// bytes of the union's storage, so the union value holds no node for it.
+    Owned(MirValue),
+}
+
+impl ProjectedRef<'_> {
+    /// The single projected value (borrowed or owned), or `None` for an array window.
+    fn as_value(&self) -> Option<&MirValue> {
+        match self {
+            ProjectedRef::Value(val) => Some(val),
+            ProjectedRef::Owned(val) => Some(val),
+            ProjectedRef::ArrayWindow { .. } => None,
+        }
+    }
+
+    /// The projected target as an owned value (an array window as the array of its elements),
+    /// without any type check.
+    fn into_owned_value(self) -> MirValue {
+        match self {
+            ProjectedRef::Value(val) => val.clone(),
+            ProjectedRef::ArrayWindow { window, elem_ty } => MirValue::Array {
+                elements: window.to_vec(),
+                elem_ty: elem_ty.clone(),
+            },
+            ProjectedRef::Owned(val) => val,
+        }
+    }
 }
 
 /// Converts a [`ProjectedRef`] into an owned [`MirValue`], checking the returned value or
@@ -4973,6 +5396,16 @@ fn projected_ref_into_mir_value(
                 ));
             }
             Ok(v.clone())
+        }
+        ProjectedRef::Owned(v) => {
+            if let Some(ty) = leaf_ty
+                && !mir_value_matches_ty(&v, ty)
+            {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "projected leaf runtime value does not match expected type",
+                ));
+            }
+            Ok(v)
         }
         ProjectedRef::ArrayWindow { window, elem_ty } => {
             for elem_val in window {
@@ -4997,8 +5430,8 @@ fn projected_ref_into_array_len(
     leaf_ty: Option<&Ty>,
 ) -> Result<usize, RvalueEvalError> {
     match target {
-        ProjectedRef::Value(v) => {
-            let MirValue::Array { elements, .. } = v else {
+        ProjectedRef::Value(_) | ProjectedRef::Owned(_) => {
+            let Some(v @ MirValue::Array { elements, .. }) = target.as_value() else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Len target runtime value must be MirValue::Array",
                 ));
@@ -5328,6 +5761,17 @@ fn project_mir_value<'a>(
                     }
                 }
                 if *active != *idx {
+                    // An inhabited zero-sized field occupies no bytes of the union's storage,
+                    // so reading it (or a place inside it) reads nothing and yields its unique
+                    // value whatever field is active.
+                    if is_inhabited_zst(expected_ty) {
+                        return project_inactive_zst_union_field(
+                            expected_ty,
+                            rest,
+                            read_index,
+                            full_place,
+                        );
+                    }
                     validate_projection_tail(
                         expected_ty,
                         rest,
@@ -5368,6 +5812,39 @@ fn project_mir_value<'a>(
             project_array_window(elements.as_slice(), elem_ty, proj, read_index, full_place)
         }
     }
+}
+
+/// Reads the place `rest` inside an inhabited zero-sized union field of type `field_ty`
+/// ([`is_inhabited_zst`]) that is not the union's active field.
+///
+/// The field occupies no bytes of the union's storage, so in Rust, Miri, and MiniRust reading
+/// it (or any place inside it) accesses no memory and yields its unique value whatever the
+/// union's bytes are; `Trusted.MirSemantics`' `readProjectedValueUnionAware` likewise decodes
+/// a zero-sized field (or zero-sized sub-place) from zero bytes. The read walks `rest` over
+/// that unique value ([`canonical_zst_value`]), so its steps are checked exactly as on any
+/// initialized value: a type mismatch is `TypeMismatch`, an out-of-bounds `Index` /
+/// `ConstantIndex` / `Subslice` of a zero-sized array is `IndexOutOfBounds`, a `Downcast` to an
+/// absent variant of a zero-sized enum is `InactiveVariantProjection`, and a `Deref` is
+/// unsupported. The selected (owned) value is returned as [`ProjectedRef::Owned`].
+fn project_inactive_zst_union_field<'a>(
+    field_ty: &'a Ty,
+    rest: &'a [ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    full_place: &Place,
+) -> Result<(ProjectedRef<'a>, Option<&'a Ty>), RvalueEvalError> {
+    let field_val = canonical_zst_value(field_ty)?;
+    let (projected, _) =
+        project_mir_value(&field_val, Some(field_ty), rest, read_index, full_place, None)?;
+    let leaf_val = projected.into_owned_value();
+    if let Ok(leaf_ty) = validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+        field_ty, rest, None, None, full_place, None,
+    ) && !mir_value_matches_ty(&leaf_val, &leaf_ty)
+    {
+        return Err(RvalueEvalError::TypeMismatch(
+            "projected zero-sized union field value does not match its projected type",
+        ));
+    }
+    Ok((ProjectedRef::Owned(leaf_val), projection_leaf_ty(field_ty, rest)))
 }
 
 /// Traverses `proj` on `val` for a value-tree read.
@@ -5579,6 +6056,12 @@ fn write_projected_array_window(
 /// Intermediate containers along `proj` are checked with [`projected_value_matches_ty`], while
 /// both the replaced leaf value and `new_val` are checked in full with [`mir_value_matches_ty`].
 /// Every error path returns before mutating `val`, so a failed write leaves `val` unchanged.
+///
+/// On a union, a whole write of an inactive field makes it active, except for an inhabited
+/// zero-sized field, which stores no bytes (the union is unchanged, as is a union written
+/// through a place inside such a field). A nested write into another inactive field makes it
+/// active only when the union holds no initialized byte and the written place covers the whole
+/// field ([`fill_covering_value`]); any other one is `UnsupportedPlaceProjection`.
 #[allow(clippy::too_many_arguments)]
 fn write_projected_mir_value(
     val: &mut MirValue,
@@ -5902,6 +6385,14 @@ fn write_projected_mir_value(
                             "written union field runtime type does not match expected type",
                         ));
                     }
+                    // A whole write of an inhabited zero-sized field other than the active one
+                    // stores no bytes, so the union's storage (and with it the active field
+                    // holding those bytes) is unchanged: `u.zst = ()` after `u.val = 42` keeps
+                    // `u.val == 42` readable, as in Miri and `Trusted.MirSemantics` (whose
+                    // write only sets the `.unit` slot of the zero-sized field).
+                    if *active != *idx && is_inhabited_zst(expected_ty) {
+                        return Ok(());
+                    }
                     if fields.len() == 1 {
                         *active = *idx;
                         fields[0] = new_val;
@@ -5930,6 +6421,50 @@ fn write_projected_mir_value(
                             return Err(RvalueEvalError::TypeMismatch(
                                 "written value runtime type does not match projected leaf type",
                             ));
+                        }
+                        // A write into a place inside an inhabited zero-sized field stores no
+                        // bytes either; its steps are checked by applying it to the field's
+                        // unique value (which is then discarded), so e.g. a `Downcast` to an
+                        // absent variant of a zero-sized enum still fails as it would on an
+                        // initialized value.
+                        if is_inhabited_zst(expected_ty) {
+                            let mut field_val = canonical_zst_value(expected_ty)?;
+                            return write_projected_mir_value(
+                                &mut field_val,
+                                Some(expected_ty),
+                                rest,
+                                new_val,
+                                read_index,
+                                ptr_width,
+                                full_place,
+                                None,
+                            );
+                        }
+                        // A write covering the whole of an inactive field of a union that holds
+                        // no initialized byte (`ptr::write(mu.as_mut_ptr(), v)` on
+                        // `MaybeUninit::uninit()`) determines every initialized byte of the
+                        // union: that field becomes active, holding the written value.
+                        if union_field_tys
+                            .and_then(|tys| tys.get(*active))
+                            .is_some_and(is_inhabited_zst)
+                            && let Some(field_val) =
+                                fill_covering_value(expected_ty, rest, new_val)?
+                        {
+                            if !mir_value_matches_ty(&field_val, expected_ty) {
+                                return Err(RvalueEvalError::TypeMismatch(
+                                    "covering union field write does not match the field type",
+                                ));
+                            }
+                            let slot_idx = if fields.len() == 1 { 0 } else { *idx };
+                            let Some(slot) = fields.get_mut(slot_idx) else {
+                                return Err(RvalueEvalError::FieldOutOfBounds {
+                                    field_idx: *idx,
+                                    field_count: fields.len(),
+                                });
+                            };
+                            *slot = field_val;
+                            *active = *idx;
+                            return Ok(());
                         }
                         // A write into a sub-place of an inactive union field (`u.b.0 = x`
                         // while `u.a` is active) is defined in Rust: it overwrites part of the
@@ -6697,8 +7232,8 @@ pub fn eval_lowered_rvalue(
                     place,
                     None,
                 )?;
-                return match target {
-                    ProjectedRef::Value(val @ MirValue::Adt { variant_idx, .. })
+                return match target.as_value() {
+                    Some(val @ MirValue::Adt { variant_idx, .. })
                         if mir_value_head_matches_ty(val, place_ty) =>
                     {
                         if !def.tag_survives_field_deinit() {
@@ -7638,6 +8173,7 @@ impl StatementEvalState {
                     None,
                 )? {
                     (ProjectedRef::Value(val), _) => variant_of(val),
+                    (ProjectedRef::Owned(val), _) => variant_of(&val),
                     (ProjectedRef::ArrayWindow { .. }, _) => Err(RvalueEvalError::TypeMismatch(
                         "Discriminant place must not be an array window",
                     )),
@@ -7661,6 +8197,7 @@ impl StatementEvalState {
                     }
                 }
                 ProjectedShellRef::Init(ProjectedRef::Value(val), _) => variant_of(val),
+                ProjectedShellRef::Init(ProjectedRef::Owned(val), _) => variant_of(&val),
                 ProjectedShellRef::Init(ProjectedRef::ArrayWindow { .. }, _) => {
                     Err(RvalueEvalError::TypeMismatch(
                         "Discriminant place must not be an array window",
@@ -7908,8 +8445,17 @@ impl StatementEvalState {
     /// Writes `new_slot` (`Uninit`, `Partial`, or `Init`) into `(dst_local, dst_proj)` of type
     /// `expected_ty`.
     ///
-    /// An `Init` slot is an ordinary write ([`Self::write_place`]). A non-`Init` slot that the
-    /// value tree cannot hold at the destination is never stored as a guess:
+    /// An `Init` slot is an ordinary write ([`Self::write_place`]). A non-`Init` slot:
+    /// - stored into an inhabited zero-sized place reached through a union field stores no
+    ///   byte of the union's storage, so nothing changes;
+    /// - if uninitialized, copied over a whole union with an inhabited zero-sized field (also
+    ///   an element of an array of such unions) or into a field of such a union covering every
+    ///   byte that the union's inhabited fields can read ([`innermost_union_covered_by`]),
+    ///   leaves that union without initialized bytes ([`uninit_union_value`]), or changes
+    ///   nothing over an uninitialized destination.
+    ///
+    /// Any other non-`Init` slot that the value tree cannot hold at the destination is never
+    /// stored as a guess:
     /// - inside a union field (a union value is one initialized field), it is
     ///   `UnsupportedMemoryAccess`, unless an uninitialized slot lands on an already
     ///   uninitialized destination (no change);
@@ -7956,6 +8502,63 @@ impl StatementEvalState {
                 projection: dst_proj.to_vec(),
             };
             return self.write_place(&dst_place, &cur_ty, val);
+        }
+        let decl_ty = &self.local_decls[dst_local.0];
+        // Storing an uninitialized or partially initialized zero-sized value into an inhabited
+        // zero-sized place reached through a union field stores no bytes of the union's storage,
+        // so nothing changes (the union keeps its value, initialized or not).
+        if proj_traverses_union(decl_ty, dst_proj) && is_inhabited_zst(expected_ty) {
+            validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+                decl_ty, dst_proj, None, None, full_place, None,
+            )?;
+            return Ok(());
+        }
+        if matches!(new_slot, FieldSlot::Uninit) {
+            // Uninitialized bytes copied over a whole union leave a union none of whose bytes
+            // is initialized, which the value tree holds as the union with its inhabited
+            // zero-sized field active (`MaybeUninit::uninit()`), also as an element of an array
+            // of unions (`[MaybeUninit<T>; N]`), which has no per-element uninitialized slots.
+            // Copied over uninitialized bytes, they change nothing.
+            if let Some(uninit) = uninit_union_value(expected_ty)? {
+                if matches!(
+                    self.read_subplace_slot(dst_local, dst_proj, full_place),
+                    Ok(FieldSlot::Uninit)
+                ) {
+                    return Ok(());
+                }
+                return self.write_subplace_slot(
+                    dst_local,
+                    dst_proj,
+                    expected_ty,
+                    FieldSlot::Init(uninit),
+                    src_local,
+                    full_place,
+                );
+            }
+            // The same holds when they are copied into a field of a union (the innermost one
+            // `dst_proj` traverses) covering every byte that any inhabited field of that union
+            // can read, e.g. `copy_nonoverlapping::<u32>(uninit, mu.as_mut_ptr(), 1)` into a
+            // `MaybeUninit<u32>`.
+            if let Some((union_proj_len, union_ty)) =
+                innermost_union_covered_by(decl_ty, dst_proj, expected_ty, self.ptr_width)
+                && let Some(uninit) = uninit_union_value(&union_ty)?
+            {
+                let union_proj = &dst_proj[..union_proj_len];
+                if matches!(
+                    self.read_subplace_slot(dst_local, union_proj, full_place),
+                    Ok(FieldSlot::Uninit)
+                ) {
+                    return Ok(());
+                }
+                return self.write_subplace_slot(
+                    dst_local,
+                    union_proj,
+                    &union_ty,
+                    FieldSlot::Init(uninit),
+                    src_local,
+                    full_place,
+                );
+            }
         }
         if matches!(new_slot, FieldSlot::Uninit) {
             while let Some((
@@ -8759,9 +9362,9 @@ fn write_to_partial_slot(
             if let (FieldSlot::Uninit, Ty::Adt(def)) = (&*slot, declared_ty)
                 && def.is_union()
             {
-                // Writing a whole union field initializes the union with that field active; a
-                // nested write into an uninitialized union field would need a per-byte model of
-                // the overlapping fields.
+                // Writing a whole union field (or a place covering all of it) initializes the
+                // union with that field active; any other nested write into an uninitialized
+                // union field would need a per-byte model of the overlapping fields.
                 let leaf_ty = validate_projection_tail(
                     expected_ty,
                     rest,
@@ -8776,7 +9379,38 @@ fn write_to_partial_slot(
                     ));
                 }
                 if !rest.is_empty() {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
+                    // A nested write inside an inhabited zero-sized field stores no bytes and
+                    // the field holds its unique value, so (like a whole write of that field)
+                    // it leaves the union with that field active; the write's steps are
+                    // checked against that value.
+                    if !is_inhabited_zst(expected_ty) {
+                        // A nested write covering the whole field determines every initialized
+                        // byte of the (uninitialized) union, e.g. `ptr::write(mu.as_mut_ptr(),
+                        // v)`; any other nested write leaves the field partially initialized.
+                        return match fill_covering_value(expected_ty, rest, new_val)? {
+                            Some(field_val) if mir_value_matches_ty(&field_val, expected_ty) => {
+                                *slot =
+                                    FieldSlot::Init(MirValue::union_value(def, *idx, field_val));
+                                Ok(())
+                            }
+                            _ => Err(RvalueEvalError::UnsupportedPlaceProjection(
+                                full_place.clone(),
+                            )),
+                        };
+                    }
+                    let mut field_val = canonical_zst_value(expected_ty)?;
+                    write_projected_mir_value(
+                        &mut field_val,
+                        Some(expected_ty),
+                        rest,
+                        new_val,
+                        read_index,
+                        ptr_width,
+                        full_place,
+                        None,
+                    )?;
+                    *slot = FieldSlot::Init(MirValue::union_value(def, *idx, field_val));
+                    return Ok(());
                 }
                 *slot = FieldSlot::Init(MirValue::union_value(def, *idx, new_val));
                 return Ok(());
@@ -9429,16 +10063,18 @@ fn typed_variant_switch_target(
     full_place: &Place,
     active_downcast: Option<usize>,
 ) -> bool {
+    let Ok((projected, _)) =
+        project_mir_value(val, Some(declared_ty), proj, read_index, full_place, active_downcast)
+    else {
+        return false;
+    };
     matches!(
-        project_mir_value(val, Some(declared_ty), proj, read_index, full_place, active_downcast),
-        Ok((
-            ProjectedRef::Value(MirValue::Adt {
-                adt_def: Some(def),
-                variant_idx,
-                ..
-            }),
-            _,
-        )) if def.is_enum()
+        projected.as_value(),
+        Some(MirValue::Adt {
+            adt_def: Some(def),
+            variant_idx,
+            ..
+        }) if def.is_enum()
             && *variant_idx != variant_index
             && def
                 .variant_fields(variant_index)
@@ -9525,7 +10161,7 @@ fn deinit_in_slot(
                 },
             ) => {
                 // Array elements and union fields have no per-part shells.
-                validate_projection_tail(
+                let leaf_ty = validate_projection_tail(
                     declared_ty,
                     proj,
                     None,
@@ -9533,6 +10169,15 @@ fn deinit_in_slot(
                     full_place,
                     active_downcast,
                 )?;
+                // Uninitialized bytes written over an inhabited zero-sized place inside a union's
+                // storage (`Deinit(u.zst)`, or a zero-sized place within any of its fields) store
+                // nothing, so the union keeps its value.
+                if matches!(val, MirValue::Adt { active_field: Some(_), .. })
+                    && matches!(first, ProjectionElem::Field(..))
+                    && is_inhabited_zst(&leaf_ty)
+                {
+                    return Ok(());
+                }
                 return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
             }
             (ProjectionElem::Field(idx, _), MirValue::Unit) => {
@@ -9869,6 +10514,7 @@ fn retag_projected(
 ) -> Result<(), RvalueEvalError> {
     match target {
         ProjectedRef::Value(val) => retag_value(val, ty, ctx),
+        ProjectedRef::Owned(val) => retag_value(&val, ty, ctx),
         ProjectedRef::ArrayWindow { window, elem_ty } => {
             for element in window {
                 retag_value(element, elem_ty, ctx)?;
@@ -10181,19 +10827,15 @@ fn check_frame_slot_projection(
     }
 }
 
-/// [`slot_union_path_active`] on a frame slot.
+/// [`slot_union_path_active`] on a frame slot, in any [`UnionPathMode`].
 fn frame_slot_union_path_active(
     slot: FrameSlot<'_>,
     proj: &[ProjectionElem],
-    allow_leaf_union_overwrite: bool,
+    mode: UnionPathMode,
 ) -> bool {
     match slot {
-        FrameSlot::Live(SlotRef::Init(val)) => {
-            value_union_path_active(val, proj, allow_leaf_union_overwrite)
-        }
-        FrameSlot::Live(SlotRef::Partial(shell)) => {
-            shell_union_path_active(shell, proj, allow_leaf_union_overwrite)
-        }
+        FrameSlot::Live(SlotRef::Init(val)) => value_union_path_active(val, proj, mode),
+        FrameSlot::Live(SlotRef::Partial(shell)) => shell_union_path_active(shell, proj, mode),
         FrameSlot::Live(SlotRef::Uninit) | FrameSlot::Dead => true,
     }
 }
@@ -10884,7 +11526,10 @@ fn resolve_synthetic_subplace_in<F: FrameView + ?Sized>(
 ///    (unsupported without a byte-level memory model, never a guessed sub-place). On a
 ///    whole-target write (`allow_union_overwrite`), overwriting a leaf union field switches
 ///    that union's active field when designated by an uncast field-borrow tag or when no
-///    active candidate of `pointee_ty` exists;
+///    active candidate of `pointee_ty` exists; only when no such candidate exists either, a
+///    place covering the whole of an inactive field of a union without initialized bytes
+///    (`ptr::write(mu.as_mut_ptr(), v)` on `MaybeUninit::uninit()`) is consistent
+///    ([`UnionPathMode::CoveringOverwrite`]);
 /// 2. a unique remaining candidate is the designated sub-place;
 /// 3. among several, the one whose ordinal the borrow encoded in `tag` for the same pointee
 ///    type is selected ([`decode_subplace_tag`]; a tag that survived a pointer cast to
@@ -10908,7 +11553,7 @@ fn select_subplace_candidate_in<F: FrameView + ?Sized>(
     let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
         Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
     };
-    let consistent_with = |allow_overwrite: bool| -> Vec<usize> {
+    let consistent_with = |mode: UnionPathMode| -> Vec<usize> {
         (0..candidates.len())
             .filter(|&i| {
                 check_frame_slot_projection(
@@ -10920,13 +11565,13 @@ fn select_subplace_candidate_in<F: FrameView + ?Sized>(
                     full_place,
                 )
                 .is_ok()
-                    && frame_slot_union_path_active(slot, &candidates[i], allow_overwrite)
+                    && frame_slot_union_path_active(slot, &candidates[i], mode)
             })
             .collect()
     };
-    let active_consistent = consistent_with(false);
+    let active_consistent = consistent_with(UnionPathMode::ActiveOnly);
     let overwrite_consistent = if allow_union_overwrite {
-        consistent_with(true)
+        consistent_with(UnionPathMode::LeafOverwrite)
     } else {
         Vec::new()
     };
@@ -10936,10 +11581,14 @@ fn select_subplace_candidate_in<F: FrameView + ?Sized>(
     {
         return Some(candidates.swap_remove(ordinal));
     }
+    let covering_consistent;
     let consistent = if !active_consistent.is_empty() || !allow_union_overwrite {
         &active_consistent
-    } else {
+    } else if !overwrite_consistent.is_empty() {
         &overwrite_consistent
+    } else {
+        covering_consistent = consistent_with(UnionPathMode::CoveringOverwrite);
+        &covering_consistent
     };
     let chosen = match consistent.as_slice() {
         [] => return None,
@@ -12186,23 +12835,44 @@ fn compute_subplace_offset_and_tag(
     Ok((total_off, tag))
 }
 
+/// How [`value_union_path_active`] (and its shell / slot variants) treats a `Field` step that
+/// selects an inactive union field which is not an inhabited zero-sized type (an inhabited
+/// zero-sized field puns no byte of the active one, so it is consistent in every mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnionPathMode {
+    /// Inconsistent: a byte memory holds the active field there.
+    ActiveOnly,
+    /// For a whole-target write, a final leaf step (or one followed only by element `0` of an
+    /// array field, whose whole-window coverage the caller checks) is consistent: the write
+    /// overwrites the union's active field.
+    LeafOverwrite,
+    /// [`Self::LeafOverwrite`], and a whole-target write designating a place covering the whole
+    /// of the inactive field ([`place_covers_whole_value`], again possibly followed by element
+    /// `0` of an array) of a union that holds no initialized byte
+    /// ([`union_holds_no_initialized_byte`]) is consistent too: the write determines every
+    /// initialized byte of the union (`ptr::write(mu.as_mut_ptr(), v)` on
+    /// `MaybeUninit::uninit()`).
+    CoveringOverwrite,
+}
+
 /// Returns whether every union `Field` step in `proj` selects the active union field of the
 /// initialized values reached in `slot` (also through partially initialized shells); steps
 /// into uninitialized parts are unconstrained. When `allow_leaf_union_overwrite` is true, a
 /// final leaf `Field` step on an initialized union may select an inactive union field (so a
-/// whole-field write overwrites the union's active field).
+/// whole-field write overwrites the union's active field; [`UnionPathMode::LeafOverwrite`]).
 fn slot_union_path_active(
     slot: &LocalSlotState,
     proj: &[ProjectionElem],
     allow_leaf_union_overwrite: bool,
 ) -> bool {
+    let mode = if allow_leaf_union_overwrite {
+        UnionPathMode::LeafOverwrite
+    } else {
+        UnionPathMode::ActiveOnly
+    };
     match slot {
-        LocalSlotState::Init(val) => {
-            value_union_path_active(val, proj, allow_leaf_union_overwrite)
-        }
-        LocalSlotState::PartialShell(shell) => {
-            shell_union_path_active(shell, proj, allow_leaf_union_overwrite)
-        }
+        LocalSlotState::Init(val) => value_union_path_active(val, proj, mode),
+        LocalSlotState::PartialShell(shell) => shell_union_path_active(shell, proj, mode),
         LocalSlotState::Uninit | LocalSlotState::Dead => true,
     }
 }
@@ -12210,77 +12880,80 @@ fn slot_union_path_active(
 fn shell_union_path_active(
     shell: &PartialAggregate,
     proj: &[ProjectionElem],
-    allow_leaf_union_overwrite: bool,
+    mode: UnionPathMode,
 ) -> bool {
     let Some((first, rest)) = proj.split_first() else {
         return true;
     };
     match first {
-        ProjectionElem::Downcast(_) => {
-            shell_union_path_active(shell, rest, allow_leaf_union_overwrite)
-        }
+        ProjectionElem::Downcast(_) => shell_union_path_active(shell, rest, mode),
         ProjectionElem::Field(idx, _) => match shell.fields.get(*idx) {
-            Some(FieldSlot::Init(val)) => {
-                value_union_path_active(val, rest, allow_leaf_union_overwrite)
-            }
-            Some(FieldSlot::Partial(child)) => {
-                shell_union_path_active(child, rest, allow_leaf_union_overwrite)
-            }
+            Some(FieldSlot::Init(val)) => value_union_path_active(val, rest, mode),
+            Some(FieldSlot::Partial(child)) => shell_union_path_active(child, rest, mode),
             Some(FieldSlot::Uninit) | None => true,
         },
         _ => true,
     }
 }
 
-fn value_union_path_active(
-    val: &MirValue,
-    proj: &[ProjectionElem],
-    allow_leaf_union_overwrite: bool,
-) -> bool {
+fn value_union_path_active(val: &MirValue, proj: &[ProjectionElem], mode: UnionPathMode) -> bool {
+    /// `rest` without a final step into element `0` of an array.
+    fn before_array_start(rest: &[ProjectionElem]) -> Option<&[ProjectionElem]> {
+        match rest.split_last() {
+            Some((
+                ProjectionElem::ConstantIndex {
+                    offset: 0,
+                    from_end: false,
+                    ..
+                },
+                prefix,
+            )) => Some(prefix),
+            _ => None,
+        }
+    }
     let Some((first, rest)) = proj.split_first() else {
         return true;
     };
     match first {
-        ProjectionElem::Downcast(_) => {
-            value_union_path_active(val, rest, allow_leaf_union_overwrite)
-        }
-        ProjectionElem::Field(idx, _) => match val {
+        ProjectionElem::Downcast(_) => value_union_path_active(val, rest, mode),
+        ProjectionElem::Field(idx, field_ty) => match val {
             MirValue::Tuple(fields) => fields
                 .get(*idx)
-                .is_some_and(|child| value_union_path_active(child, rest, allow_leaf_union_overwrite)),
+                .is_some_and(|child| value_union_path_active(child, rest, mode)),
             MirValue::Adt {
                 active_field: None,
                 fields,
                 ..
             } => fields
                 .get(*idx)
-                .is_some_and(|child| value_union_path_active(child, rest, allow_leaf_union_overwrite)),
+                .is_some_and(|child| value_union_path_active(child, rest, mode)),
             MirValue::Adt {
                 active_field: Some(active),
                 fields,
                 ..
             } => {
-                let is_leaf_or_array_start = rest.is_empty()
-                    || matches!(
-                        rest,
-                        [ProjectionElem::ConstantIndex {
-                            offset: 0,
-                            from_end: false,
-                            ..
-                        }]
-                    );
-                if is_leaf_or_array_start && allow_leaf_union_overwrite {
+                let is_leaf_or_array_start =
+                    rest.is_empty() || before_array_start(rest).is_some_and(<[_]>::is_empty);
+                if is_leaf_or_array_start && mode != UnionPathMode::ActiveOnly {
                     return true;
                 }
                 if *active != *idx {
-                    return false;
+                    // An inhabited zero-sized field puns no byte of the active field, so every
+                    // place inside it is consistent with the union's runtime state.
+                    return is_inhabited_zst(field_ty)
+                        || (mode == UnionPathMode::CoveringOverwrite
+                            && union_holds_no_initialized_byte(val)
+                            && (place_covers_whole_value(field_ty, rest)
+                                || before_array_start(rest).is_some_and(|prefix| {
+                                    place_covers_whole_value(field_ty, prefix)
+                                })));
                 }
                 let child = if fields.len() == 1 {
                     fields.first()
                 } else {
                     fields.get(*active)
                 };
-                child.is_some_and(|c| value_union_path_active(c, rest, allow_leaf_union_overwrite))
+                child.is_some_and(|c| value_union_path_active(c, rest, mode))
             }
             _ => true,
         },
@@ -12296,7 +12969,7 @@ fn value_union_path_active(
             else {
                 return false;
             };
-            value_union_path_active(&elements[i], rest, allow_leaf_union_overwrite)
+            value_union_path_active(&elements[i], rest, mode)
         }
         _ => true,
     }
@@ -12370,14 +13043,7 @@ fn read_slot_at_proj(
                 full_place,
                 active_downcast,
             )?;
-            let sub_val = match projected {
-                ProjectedRef::Value(v) => v.clone(),
-                ProjectedRef::ArrayWindow { window, elem_ty } => MirValue::Array {
-                    elements: window.to_vec(),
-                    elem_ty: elem_ty.clone(),
-                },
-            };
-            Ok(FieldSlot::Init(sub_val))
+            Ok(FieldSlot::Init(projected.into_owned_value()))
         }
         SlotRef::Partial(shell) => {
             if !shell_matches_declared_ty(shell, declared_ty) {
@@ -12509,6 +13175,61 @@ fn proj_traverses_union<'a>(mut cur_ty: &'a Ty, proj: &'a [ProjectionElem]) -> b
         }
     }
     false
+}
+
+/// For a destination place `proj` of type `dst_ty` inside a local of type `decl_ty` that
+/// traverses a union field, returns the length of the prefix of `proj` designating the
+/// innermost union traversed, with that union's type, when the destination covers every byte
+/// that an inhabited field of that union can read: it fills the whole traversed field `f`
+/// (`size_of(dst_ty) == size_of(f)`, so it starts at offset `0` of the union), and no
+/// inhabited field of the union is larger than `f` (trailing padding is read by no field).
+/// Storing uninitialized bytes there leaves that union without initialized bytes.
+fn innermost_union_covered_by(
+    decl_ty: &Ty,
+    proj: &[ProjectionElem],
+    dst_ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Option<(usize, Ty)> {
+    let mut cur_ty = decl_ty;
+    let mut innermost: Option<(usize, &Ty, usize)> = None;
+    for (pos, elem) in proj.iter().enumerate() {
+        match elem {
+            ProjectionElem::Downcast(_) => {}
+            ProjectionElem::Field(idx, field_ty) => {
+                if let Ty::Adt(def) = cur_ty
+                    && def.is_union()
+                {
+                    innermost = Some((pos, cur_ty, *idx));
+                }
+                cur_ty = field_ty;
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                let Ty::Array(elem_ty, _) = cur_ty else {
+                    return None;
+                };
+                cur_ty = elem_ty;
+            }
+            ProjectionElem::Subslice { .. } | ProjectionElem::Deref => return None,
+        }
+    }
+    let (pos, union_ty, field_idx) = innermost?;
+    let Ty::Adt(def) = union_ty else {
+        return None;
+    };
+    let AdtKind::Union { fields } = &def.kind else {
+        return None;
+    };
+    let size_of = |ty: &Ty| ty.layout_for(ptr_width).ok().map(|layout| layout.size);
+    let field_size = size_of(fields.get(field_idx)?)?;
+    if size_of(dst_ty)? != field_size {
+        return None;
+    }
+    for field_ty in fields {
+        if field_ty.is_inhabited_for(ptr_width) && size_of(field_ty)? > field_size {
+            return None;
+        }
+    }
+    Some((pos, union_ty.clone()))
 }
 
 /// Writes `FieldSlot::Partial(new_shell)` into `proj` inside `slot` (materializing parent
@@ -12699,7 +13420,10 @@ fn write_partial_shell_in_slot(
 ///   overwritten one;
 /// - a non-`Init` state that the value tree cannot hold in the destination fails closed in an
 ///   array element (`UninitializedLocal`, `c6d2ad74`) and is `UnsupportedMemoryAccess` in a
-///   union field;
+///   union field, except that uninitialized bytes over (every readable byte of) a union with an
+///   inhabited zero-sized field leave it without initialized bytes, also element-wise in an
+///   array of such unions, and zero bytes stored inside a union's storage change nothing (see
+///   [`StatementEvalState::write_subplace_slot`]);
 /// - a zero-byte copy with `count > 1` copies the state between resolved sub-places and is
 ///   otherwise a no-op (it accesses no memory, not even of storage-dead locals);
 /// - any other memory access is `UnsupportedMemoryAccess`.
@@ -13018,21 +13742,31 @@ pub(crate) fn copy_nonoverlapping_values(
                 ) {
                     return Ok(());
                 }
-                if proj_traverses_union(&state.local_decls[dst_local.0], dst_arr_proj) {
-                    return Err(RvalueEvalError::UnsupportedMemoryAccess(UNINIT_UNION_COPY));
+                // Uninitialized elements of a union type with an inhabited zero-sized field are
+                // unions without initialized bytes (`uninit_union_value`), which an initialized
+                // array holds element by element: the window is overwritten with them.
+                if let Some(uninit) = uninit_union_value(elem_ty)? {
+                    MirValue::Array {
+                        elements: vec![uninit; count_usize],
+                        elem_ty: elem_ty.clone(),
+                    }
+                } else {
+                    if proj_traverses_union(&state.local_decls[dst_local.0], dst_arr_proj) {
+                        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNINIT_UNION_COPY));
+                    }
+                    if *dst_start == 0 && count_usize == dst_len_usize {
+                        let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
+                        return state.write_subplace_slot(
+                            dst_local,
+                            dst_arr_proj,
+                            &arr_ty,
+                            FieldSlot::Uninit,
+                            src_local,
+                            &dummy_place,
+                        );
+                    }
+                    return Err(RvalueEvalError::UninitializedLocal(src_local));
                 }
-                if *dst_start == 0 && count_usize == dst_len_usize {
-                    let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
-                    return state.write_subplace_slot(
-                        dst_local,
-                        dst_arr_proj,
-                        &arr_ty,
-                        FieldSlot::Uninit,
-                        src_local,
-                        &dummy_place,
-                    );
-                }
-                return Err(RvalueEvalError::UninitializedLocal(src_local));
             }
             Err(err) => return Err(err),
         };
@@ -14509,6 +15243,224 @@ mod tests {
                 target_ty: Ty::Char,
                 bits: 0xD800,
             }))
+        );
+    }
+
+    /// `decode_mir_value` on unions (Episode 1 `ep1-anneal-mir-union-offset0-and-zst-copy`):
+    /// every field starts at offset `0`, the decoded field keeps its own index, uninhabited
+    /// fields never constrain the representation, trailing union padding is ignored, and
+    /// unions that one active field cannot represent fail closed with `UnsupportedLayout`
+    /// (never an invalid value: any byte pattern is a valid union value). `encode_mir_value`
+    /// mirrors it: a union's bytes are its active field's, which must span the whole union.
+    #[test]
+    fn test_ep1_union_codec_uses_offset_zero_and_the_true_active_field() {
+        let unit = Ty::unit();
+        let u8_ty = Ty::Uint(UintTy::U8);
+        let u32_ty = Ty::Uint(UintTy::U32);
+        let union_of = |name: &str, fields: Vec<Ty>, repr: crate::ir::AdtRepr| {
+            let def = Arc::new(AdtDef::new_union(name, fields).with_repr(repr));
+            (def.clone(), Ty::Adt(def))
+        };
+        let unsupported = |ty: &Ty| {
+            RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout { ty: ty.clone() })
+        };
+        for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+            let bytes4: Vec<AbstractByte> = encode_int_bytes(0x1122_3344, 4).collect();
+            let u32v = MirValue::unsigned(0x1122_3344, UintTy::U32, pw);
+            // `MaybeUninit<u32>`: `uninit: ()` at index 0, `value: ManuallyDrop<u32>` at 1.
+            let md = Arc::new(
+                AdtDef::new_struct("core::mem::ManuallyDrop", vec![u32_ty.clone()])
+                    .with_repr(crate::ir::AdtRepr::transparent()),
+            );
+            let (mu_def, mu_ty) = union_of(
+                "core::mem::MaybeUninit",
+                vec![unit.clone(), Ty::Adt(md.clone())],
+                crate::ir::AdtRepr::transparent(),
+            );
+            let mu_val =
+                MirValue::union_value(&mu_def, 1, MirValue::adt(&md, 0, vec![u32v.clone()]));
+            assert_eq!(decode_mir_value(&bytes4, &mu_ty, pw), Ok(mu_val.clone()));
+            // Encoding stays gated on a canonical byte layout (a single-field union), so the
+            // multi-field `MaybeUninit<u32>` is not encodable whatever field is active.
+            assert_eq!(
+                encode_mir_value(&mu_val, &mu_ty, pw, &mut Vec::new()),
+                Err(unsupported(&mu_ty))
+            );
+            assert_eq!(
+                encode_mir_value(
+                    &MirValue::union_value(&mu_def, 0, MirValue::Unit),
+                    &mu_ty,
+                    pw,
+                    &mut Vec::new()
+                ),
+                Err(unsupported(&mu_ty))
+            );
+            // A canonical single-field union round-trips through its active field's bytes.
+            let (u1_def, u1_ty) = union_of("U1", vec![u32_ty.clone()], crate::ir::AdtRepr::rust());
+            let u1_val = MirValue::union_value(&u1_def, 0, u32v.clone());
+            let mut out = Vec::new();
+            encode_mir_value(&u1_val, &u1_ty, pw, &mut out).unwrap();
+            assert_eq!(out, bytes4);
+            assert_eq!(decode_mir_value(&out, &u1_ty, pw), Ok(u1_val));
+            assert!(matches!(
+                encode_mir_value(
+                    &MirValue::union_value(&u1_def, 1, u32v.clone()),
+                    &u1_ty,
+                    pw,
+                    &mut Vec::new()
+                ),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+            // `union { a: (u32, !), b: u32 }`: the uninhabited `a` never wins.
+            let (ub_def, ub_ty) = union_of(
+                "UB",
+                vec![Ty::Tuple(vec![u32_ty.clone(), Ty::Never]), u32_ty.clone()],
+                crate::ir::AdtRepr::rust(),
+            );
+            assert_eq!(
+                decode_mir_value(&bytes4, &ub_ty, pw),
+                Ok(MirValue::union_value(&ub_def, 1, u32v.clone()))
+            );
+            // `#[repr(C)] union { a: u8, z: [u32; 0] }`: 4 bytes, `a` decoded from byte 0,
+            // the 3 trailing padding bytes are ignored.
+            let (pad_def, pad_ty) = union_of(
+                "Pad",
+                vec![u8_ty.clone(), Ty::Array(Box::new(u32_ty.clone()), 0)],
+                crate::ir::AdtRepr::c(),
+            );
+            assert_eq!(
+                decode_mir_value(&bytes4, &pad_ty, pw),
+                Ok(MirValue::union_value(
+                    &pad_def,
+                    0,
+                    MirValue::unsigned(0x44, UintTy::U8, pw)
+                ))
+            );
+            // ... but its active `u8` does not span the union, so it is not encodable.
+            assert_eq!(
+                encode_mir_value(
+                    &MirValue::union_value(&pad_def, 0, MirValue::unsigned(0x44, UintTy::U8, pw)),
+                    &pad_ty,
+                    pw,
+                    &mut Vec::new()
+                ),
+                Err(unsupported(&pad_ty))
+            );
+            // Pure zero-sized unions: the first inhabited field, never the uninhabited `!`.
+            let zarr = Ty::Array(Box::new(unit.clone()), 2);
+            let (z_def, z_ty) = union_of(
+                "Z",
+                vec![Ty::Never, zarr.clone()],
+                crate::ir::AdtRepr::rust(),
+            );
+            assert_eq!(
+                decode_mir_value(&[], &z_ty, pw),
+                Ok(MirValue::union_value(
+                    &z_def,
+                    1,
+                    MirValue::Array {
+                        elements: vec![MirValue::Unit; 2],
+                        elem_ty: unit.clone(),
+                    }
+                ))
+            );
+            // `union { a: (u32, !), b: () }` (4 bytes): no inhabited field reads a byte.
+            let (zb_def, zb_ty) = union_of(
+                "ZB",
+                vec![Ty::Tuple(vec![u32_ty.clone(), Ty::Never]), unit.clone()],
+                crate::ir::AdtRepr::rust(),
+            );
+            assert_eq!(
+                decode_mir_value(&bytes4, &zb_ty, pw),
+                Ok(MirValue::union_value(&zb_def, 1, MirValue::Unit))
+            );
+            // Only uninhabited fields: no value.
+            let (_, never_ty) = union_of("N", vec![Ty::Never], crate::ir::AdtRepr::rust());
+            assert_eq!(
+                decode_mir_value(&[], &never_ty, pw),
+                Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+                    target_ty: never_ty.clone(),
+                }))
+            );
+            // Two non-zero-sized inhabited fields: one active field would lose the other.
+            let (_, amb_ty) = union_of(
+                "Amb",
+                vec![u32_ty.clone(), Ty::Array(Box::new(u8_ty.clone()), 4)],
+                crate::ir::AdtRepr::rust(),
+            );
+            assert_eq!(decode_mir_value(&bytes4, &amb_ty, pw), Err(unsupported(&amb_ty)));
+            // Bytes that are not a valid `bool` are still a valid union value.
+            let (_, b_ty) = union_of(
+                "B",
+                vec![Ty::Bool, unit.clone()],
+                crate::ir::AdtRepr::rust(),
+            );
+            assert_eq!(
+                decode_mir_value(&[AbstractByte::new(2)], &b_ty, pw),
+                Err(unsupported(&b_ty))
+            );
+            // A byte image of the wrong size is never sliced out of bounds.
+            assert_eq!(decode_mir_value(&bytes4[..3], &mu_ty, pw), Err(unsupported(&mu_ty)));
+            assert_eq!(decode_mir_value(&[], &mu_ty, pw), Err(unsupported(&mu_ty)));
+        }
+    }
+
+    /// `canonical_zst_value` / `is_inhabited_zst`: the unique value of inhabited ZSTs, the
+    /// rejection of uninhabited and non-zero-sized types, and the total materialization budget.
+    #[test]
+    fn test_ep1_canonical_zst_values_and_their_materialization_budget() {
+        let unit = Ty::unit();
+        let units = |n: usize| MirValue::Array {
+            elements: vec![MirValue::Unit; n],
+            elem_ty: Ty::unit(),
+        };
+        assert_eq!(canonical_zst_value(&unit), Ok(MirValue::Unit));
+        assert_eq!(
+            canonical_zst_value(&Ty::Array(Box::new(unit.clone()), 3)),
+            Ok(units(3))
+        );
+        assert_eq!(
+            canonical_zst_value(&Ty::Array(Box::new(Ty::Never), 0)),
+            Ok(MirValue::Array {
+                elements: vec![],
+                elem_ty: Ty::Never,
+            })
+        );
+        for ty in [
+            Ty::Never,
+            Ty::Array(Box::new(Ty::Never), 1),
+            Ty::Tuple(vec![unit.clone(), Ty::Never]),
+            Ty::Uint(UintTy::U8),
+            Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 1),
+        ] {
+            assert!(!is_inhabited_zst(&ty), "{ty:?}");
+            assert!(matches!(
+                canonical_zst_value(&ty),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+        }
+        // `[[(); 2^20]; 2^20]` is a valid ZST of 2^40 unit values: never materialized.
+        let huge = Ty::Array(
+            Box::new(Ty::Array(Box::new(unit.clone()), MAX_EVAL_ARRAY_LEN)),
+            MAX_EVAL_ARRAY_LEN,
+        );
+        assert!(is_inhabited_zst(&huge));
+        assert!(matches!(
+            canonical_zst_value(&huge),
+            Err(RvalueEvalError::EvaluationLimit { .. })
+        ));
+        assert!(matches!(
+            canonical_zst_value(&Ty::Array(Box::new(unit.clone()), MAX_EVAL_ARRAY_LEN)),
+            Err(RvalueEvalError::EvaluationLimit { .. })
+        ));
+        assert_eq!(
+            canonical_zst_value(&Ty::Array(Box::new(unit), MAX_EVAL_ARRAY_LEN - 1)).map(|v| {
+                match v {
+                    MirValue::Array { elements, .. } => elements.len(),
+                    _ => 0,
+                }
+            }),
+            Ok(MAX_EVAL_ARRAY_LEN - 1)
         );
     }
 }
