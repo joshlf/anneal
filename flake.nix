@@ -48,20 +48,21 @@
       rustBuildEnvironment = system:
         let
           pkgs = import nixpkgs { inherit system; };
-          # rustc_private metadata and libLLVM must come from the same pinned
-          # distribution as the compiler used to build the driver. Keep that
-          # distribution unchanged: its Linux binaries use the host ELF loader,
-          # so use Nix's loader and linker for builds and compiler queries.
           rustToolchain = self.packages.${system}.rust-toolchain;
-          rustRuntimeLibraryPath = pkgs.lib.makeLibraryPath (
+          runtimeLibraryPath = pkgs.lib.makeLibraryPath (
             [ rustToolchain ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               pkgs.stdenv.cc.cc.lib
               pkgs.stdenv.cc.libc
               pkgs.zlib
             ]
           );
-          rustCompilerForBuild = if pkgs.stdenv.isLinux then
-            pkgs.writeShellScript "anneal-build-rustc" ''
+
+          # rustc_private metadata and libLLVM must come from the same pinned
+          # distribution as the compiler used to build the driver. Keep that
+          # distribution unchanged: its Linux binaries use the host ELF loader,
+          # so use Nix's loader and linker during development and builds.
+          tool = name: if pkgs.stdenv.isLinux then
+            pkgs.writeShellScript "anneal-build-${name}" ''
               # Copyright 2026 The Fuchsia Authors
               #
               # Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
@@ -71,26 +72,28 @@
               # those terms.
 
               exec ${pkgs.stdenv.cc.bintools.dynamicLinker} \
-                --library-path ${rustRuntimeLibraryPath} \
-                ${rustToolchain}/bin/rustc --sysroot ${rustToolchain} \
+                --library-path ${runtimeLibraryPath} \
+                ${rustToolchain}/bin/${name} --sysroot ${rustToolchain} \
                 -Clinker-features=-lld "$@"
             ''
-          else "${rustToolchain}/bin/rustc";
+          else "${rustToolchain}/bin/${name}";
+        in
+        {
+          inherit rustToolchain runtimeLibraryPath;
+          rustc = tool "rustc";
+          rustdoc = tool "rustdoc";
 
-          # Compiler-session tests query bin/rustc in their sysroot. Keep the
-          # pinned libraries unchanged, but route that query through the same
-          # loader wrapper used to build the driver inside Nix's sandbox.
+          # Typed tests query bin/rustc in their sysroot. Keep the pinned
+          # libraries unchanged, but route that query through the same loader
+          # wrapper used to build the driver inside Nix's sandbox.
           testSysroot = if pkgs.stdenv.isLinux then pkgs.symlinkJoin {
             name = "anneal-test-sysroot";
             paths = [ rustToolchain ];
             postBuild = ''
               rm "$out/bin/rustc"
-              ln -s "${rustCompilerForBuild}" "$out/bin/rustc"
+              ln -s "${tool "rustc"}" "$out/bin/rustc"
             '';
           } else rustToolchain;
-        in
-        {
-          inherit rustToolchain rustRuntimeLibraryPath rustCompilerForBuild testSysroot;
         };
     in
     {
@@ -115,7 +118,8 @@
           };
 
           rust = rustBuildEnvironment system;
-          inherit (rust) rustToolchain rustRuntimeLibraryPath rustCompilerForBuild;
+          rustToolchain = rust.rustToolchain;
+          rustRuntimeLibraryPath = rust.runtimeLibraryPath;
         in
         {
           # Download and unpack the multi-component Rust toolchain as a
@@ -229,7 +233,7 @@
               chmod +w "$sourceRoot/Cargo.lock"
             '';
             cargoLock.lockFile = ./Cargo.lock;
-            RUSTC = rustCompilerForBuild;
+            RUSTC = rust.rustc;
             RUSTFLAGS = "-Lnative=${rustToolchain}/lib"
               + pkgs.lib.optionalString pkgs.stdenv.isLinux
                 " -Clink-arg=-Wl,-rpath,${rustRuntimeLibraryPath}"
@@ -323,9 +327,6 @@
             '';
           };
 
-          # Release regressions need only Python and the pinned YAML parser.
-          release-check-python = pkgs.python3.withPackages (p: [ p.pyyaml ]);
-
           default = self.packages.${system}.omnibus-archive;
         });
 
@@ -333,16 +334,46 @@
         let
           pkgs = import nixpkgs { inherit system; };
           rust = rustBuildEnvironment system;
+          rustToolchain = rust.rustToolchain;
+          python = pkgs.python3.withPackages (p: [
+            p.markdown-it-py
+            p.pyyaml
+          ]);
+          staticPackages = [
+            pkgs.action-validator
+            pkgs.actionlint
+            pkgs.coreutils
+            pkgs.gitMinimal
+            pkgs.jq
+            pkgs.ripgrep
+            pkgs.rustfmt
+            python
+          ];
         in
         {
+          # Static checks need neither the compiler-private Rust distribution
+          # nor Lean. Both shells use the tools pinned by `flake.lock`.
+          static = pkgs.mkShellNoCC {
+            # The default shell gets Cargo from the pinned Rust distribution.
+            packages = staticPackages ++ [ pkgs.cargo ];
+            RUSTFMT = "${pkgs.rustfmt}/bin/rustfmt";
+          };
+
           default = pkgs.mkShell {
-            packages = [
+            packages = staticPackages ++ [
               self.packages.${system}.lean-toolchain
-              self.packages.${system}.rust-toolchain
+              rustToolchain
               self.packages.${system}.rustc-capture
               pkgs.zstd
-              pkgs.jq
             ];
+            RUSTC = rust.rustc;
+            RUSTDOC = rust.rustdoc;
+            RUSTFMT = "${pkgs.rustfmt}/bin/rustfmt";
+            LD_LIBRARY_PATH = "${rustToolchain}/lib";
+            DYLD_LIBRARY_PATH = "${rustToolchain}/lib";
+            RUSTFLAGS = "-Lnative=${rustToolchain}/lib"
+              + pkgs.lib.optionalString pkgs.stdenv.isLinux
+                " -Clink-arg=-Wl,-rpath,${rust.runtimeLibraryPath}";
             ANNEAL_TEST_RUST_SYSROOT = rust.testSysroot;
           };
         });
