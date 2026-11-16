@@ -192,6 +192,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "  callerRefMutSilentWrongLocal_simulation\n"
                     "example : _ ∧ _ := callerRefMutSilentWrongLocal_simulation\n"
                     "example : ?_ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : ?m := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : ?m ∧ ?n := callerRefMutSilentWrongLocal_simulation\n"
                     "example : id (0 = 0) ∧ callerRefMutSilentWrongLocal_simulation = "
                     "callerRefMutSilentWrongLocal_simulation :=\n"
                     "  callerRefMutSilentWrongLocal_simulation\n"

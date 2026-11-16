@@ -1093,7 +1093,7 @@ _LEAN_TOKEN_RE = re.compile(
     | :=
     | [(\[{⟨)\]}⟩:@.;,]
     | «[^»\n]+»
-    | \#?[A-Za-z_0-9][A-Za-z_0-9'!?]*
+    | [\#?]?[A-Za-z_0-9][A-Za-z_0-9'!?]*
     """,
     re.VERBOSE,
 )
@@ -1196,7 +1196,7 @@ def _clean_lean_seg(tok: str) -> str:
 def _is_lean_ident_tok(tok: str) -> bool:
     if tok.startswith("«") and tok.endswith("»"):
         return True
-    if not tok or tok[0] in "@:()[]{}⟨⟩.,;#0123456789":
+    if not tok or tok[0] in "@?:()[]{}⟨⟩.,;#0123456789":
         return False
     return True
 
@@ -1498,9 +1498,11 @@ def _has_statement_pin(
     for active_ns, inline_qual, type_toks in entries:
         # A pin locks nothing if its type is computed from the theorem itself
         # (`type_of% thm`, self-reference), by a tactic (`by ...`), or via holes
-        # (`_` / `?_`) that unify with the RHS type.
+        # (`_`, `?_`, `?m`) that unify with the RHS type.
         if any(
-            _clean_lean_seg(tt) == sym_last or tt in _LEAN_SELF_TYPED_PIN_TOKENS
+            _clean_lean_seg(tt) == sym_last
+            or tt in _LEAN_SELF_TYPED_PIN_TOKENS
+            or tt.startswith("?")
             for tt in type_toks
         ):
             continue
