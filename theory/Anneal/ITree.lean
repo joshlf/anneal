@@ -55,10 +55,18 @@ theorem StrongBisim.refl {E : Effect.{u}} {R : Type u} (t : ITree E R) :
   | tau _ => rfl
   | vis _ _ => exact ⟨rfl, fun _ => rfl⟩
 
-/-- Strong bisimulation coincides with propositional equality on `ITree E R`. -/
-theorem strongBisim_iff_eq {E : Effect.{u}} {R : Type u}
-    (t u : ITree E R) : StrongBisim t u ↔ t = u := by
-  refine ⟨fun h => ?_, fun h => h ▸ StrongBisim.refl t⟩
+/-- Constructive bisimulation-to-equality principle on `ITree E R` via `CoInd.approx_eq`
+(using only `propext` and `Quot.sound`, with zero `Classical.choice`). -/
+theorem ITree.bisim_eq {E : Effect.{u}} {R : Type u}
+    (Rel : ITree E R → ITree E R → Prop)
+    (hstep : ∀ a b, Rel a b →
+      match a.observe, b.observe with
+      | .ret r₁, .ret r₂ => r₁ = r₂
+      | .tau a', .tau b' => Rel a' b'
+      | .vis i₁ k₁, .vis i₂ k₂ =>
+        ∃ h : i₁ = i₂, ∀ o : E.O i₁, Rel (k₁ o) (k₂ (h ▸ o))
+      | _, _ => False)
+    {t u : ITree E R} (h : Rel t u) : t = u := by
   apply CoInd.approx_eq
   intro n
   induction n generalizing t u with
@@ -66,17 +74,23 @@ theorem strongBisim_iff_eq {E : Effect.{u}} {R : Type u}
   | succ k ih =>
     have hUnf : (ITree.fold t.observe).approx (k + 1) =
         (ITree.fold u.observe).approx (k + 1) := by
-      rw [StrongBisim.eq_def] at h
+      have hs := hstep t u h
       cases ht : t.observe <;> cases hu : u.observe <;>
-        simp only [ht, hu] at h
-      · subst h; rfl
+        simp only [ht, hu] at hs
+      · subst hs; rfl
       · dsimp [ITree.fold, CoInd.fold]
-        congr; funext ⟨⟩; exact ih _ _ h
-      · rcases h with ⟨hi, hk⟩
+        congr; funext ⟨⟩; exact ih hs
+      · rcases hs with ⟨hi, hk⟩
         subst hi
         dsimp [ITree.fold, CoInd.fold]
-        congr; funext o; exact ih _ _ (hk o)
+        congr; funext o; exact ih (hk o)
     simpa [ITree.fold_observe] using hUnf
+
+/-- Strong bisimulation coincides with propositional equality on `ITree E R`. -/
+theorem strongBisim_iff_eq {E : Effect.{u}} {R : Type u}
+    (t u : ITree E R) : StrongBisim t u ↔ t = u := by
+  refine ⟨fun h => ?_, fun h => h ▸ StrongBisim.refl t⟩
+  exact ITree.bisim_eq StrongBisim (fun a b hab => by rwa [StrongBisim.eq_def] at hab) h
 
 theorem ITree.eq_of_observe_eq {E : Effect.{u}} {R : Type u}
     {t u : ITree E R} (h : t.observe = u.observe) : t = u := by
@@ -94,9 +108,8 @@ private def bindStep {E : Effect.{u}} {R S : Type u} (k : R → ITree E S) :
 private theorem bind_inr_eq {E : Effect.{u}} {R S : Type u}
     (k : R → ITree E S) (out : ITree E S) :
     ITree.cofix (bindStep k) (.inr out) = out := by
-  rw [← strongBisim_iff_eq]
-  refine StrongBisim.coinduct
-    (fun a b => a = ITree.cofix (bindStep k) (Sum.inr b)) ?_ _ out rfl
+  refine ITree.bisim_eq
+    (fun a b => a = ITree.cofix (bindStep k) (Sum.inr b)) ?_ rfl
   intro a b hab; subst hab
   rw [ITree.observe_cofix]; dsimp only [bindStep]
   cases b.observe with
@@ -141,8 +154,7 @@ theorem vis_bind {E : Effect.{u}} {R S : Type u}
 @[simp]
 theorem bind_ret {E : Effect.{u}} {R : Type u} (t : ITree E R) :
     (t >>= ITree.ret) = t := by
-  rw [← strongBisim_iff_eq]
-  refine StrongBisim.coinduct (fun a b => a = (b >>= ITree.ret)) ?_ _ t rfl
+  refine ITree.bisim_eq (fun a b => a = (b >>= ITree.ret)) ?_ rfl
   intro a b hab; subst hab
   cases hb : b.observe with
   | ret r =>
@@ -158,11 +170,10 @@ theorem bind_ret {E : Effect.{u}} {R : Type u} (t : ITree E R) :
 theorem bind_assoc_itree {E : Effect.{u}} {R S T : Type u}
     (t : ITree E R) (f : R → ITree E S) (g : S → ITree E T) :
     ((t >>= f) >>= g) = (t >>= fun r => f r >>= g) := by
-  rw [← strongBisim_iff_eq]
-  refine StrongBisim.coinduct
+  refine ITree.bisim_eq
     (fun a b => a = b ∨ ∃ x : ITree E R, a = ((x >>= f) >>= g) ∧
       b = (x >>= fun r => f r >>= g))
-    ?_ _ _ (Or.inr ⟨t, rfl, rfl⟩)
+    ?_ (Or.inr ⟨t, rfl, rfl⟩)
   intro a b h
   rcases h with rfl | ⟨x, rfl, rfl⟩
   · cases a.observe with
@@ -216,11 +227,10 @@ theorem iter_unfold {E : Effect.{u}} {I R : Type u}
       | .vis i k => .vis i k
   let cont : I ⊕ R → ITree E R :=
     Sum.elim (fun next => ITree.tau (ITree.iter body next)) ITree.ret
-  rw [← strongBisim_iff_eq]
-  refine StrongBisim.coinduct
+  refine ITree.bisim_eq
     (fun a b => a = b ∨ ∃ cur : ITree E (I ⊕ R),
       a = ITree.cofix stepFn cur ∧ b = (cur >>= cont))
-    ?_ _ _ (Or.inr ⟨body init, rfl, rfl⟩)
+    ?_ (Or.inr ⟨body init, rfl, rfl⟩)
   intro a b h
   rcases h with rfl | ⟨cur, rfl, rfl⟩
   · cases a.observe with
@@ -269,15 +279,14 @@ theorem interp_vis {E₁ E₂ : Effect.{u}} {R : Type u}
     (i : E₁.I) (k : E₁.O i → ITree E₁ R) :
     ITree.interp h (.vis i k) =
       (h i >>= fun o => .tau (ITree.interp h (k o))) := by
-  rw [← strongBisim_iff_eq]
-  refine StrongBisim.coinduct
+  refine ITree.bisim_eq
     (fun a b => a = b ∨
       (a = ITree.interp h (.vis i k) ∧
         b = (h i >>= fun o => .tau (ITree.interp h (k o)))) ∨
       ∃ u : ITree E₂ (E₁.O i),
         a = ITree.cofix (ITree.interpStep h) (.inr ⟨i, u, k⟩) ∧
         b = (u >>= fun o => .tau (ITree.interp h (k o))))
-    ?_ _ _ (Or.inr (Or.inl ⟨rfl, rfl⟩))
+    ?_ (Or.inr (Or.inl ⟨rfl, rfl⟩))
   intro a b hab
   rcases hab with rfl | ⟨rfl, rfl⟩ | ⟨u, rfl, rfl⟩
   · cases a.observe with
@@ -335,15 +344,14 @@ theorem interpState_vis {E₁ E₂ : Effect.{u}} {S R : Type u}
     (i : E₁.I) (k : E₁.O i → ITree E₁ R) (s : S) :
     ITree.interpState h (.vis i k) s =
       (h i s >>= fun (o, s') => .tau (ITree.interpState h (k o) s')) := by
-  rw [← strongBisim_iff_eq]
-  refine StrongBisim.coinduct
+  refine ITree.bisim_eq
     (fun a b => a = b ∨
       (a = ITree.interpState h (.vis i k) s ∧
         b = (h i s >>= fun (o, s') => .tau (ITree.interpState h (k o) s'))) ∨
       ∃ u : ITree E₂ (E₁.O i × S),
         a = ITree.cofix (ITree.interpStateStep h) (.inr ⟨i, u, k⟩) ∧
         b = (u >>= fun (o, s') => .tau (ITree.interpState h (k o) s')))
-    ?_ _ _ (Or.inr (Or.inl ⟨rfl, rfl⟩))
+    ?_ (Or.inr (Or.inl ⟨rfl, rfl⟩))
   intro a b hab
   rcases hab with rfl | ⟨rfl, rfl⟩ | ⟨u, rfl, rfl⟩
   · cases a.observe with
@@ -1437,5 +1445,953 @@ theorem BridgeContract.weakRef {State Obs : Type} {E : Effect.{0}}
       exact WeakRef.stuck_bot _
   · simp only [hp, ↓reduceIte]
     exact WeakRef.fail_top FailureKind.ub _
+
+/-! ## 7. Finite-Depth Approximants (`CofixA`) and Suffix-Free Walkers -/
+
+/--
+Finite-depth interaction-tree approximant (`CofixA E R n`) at horizon `n : Nat`.
+Unlike `CoInd.unfold` / `ITree.observe` (which rebuilds shifted `childApprox`
+towers with `Eq.rec` transports at every step), `CofixA` is an inductive
+family indexed by `Nat` that supports suffix-free structural recursion on the
+output depth `n`.
+-/
+inductive CofixA (E : Effect.{u}) (R : Type u) : Nat → Type u where
+  | zero : CofixA E R 0
+  | ret {n : Nat} (r : R) : CofixA E R (n + 1)
+  | tau {n : Nat} (t : CofixA E R n) : CofixA E R (n + 1)
+  | vis {n : Nat} (i : E.I) (k : E.O i → CofixA E R n) : CofixA E R (n + 1)
+
+namespace CofixA
+
+/-- Depth-indexed pure return approximant (`.zero` at `0`, `.ret r` at `n + 1`). -/
+@[reducible]
+def retApprox {E : Effect.{u}} {R : Type u} (r : R) : (n : Nat) → CofixA E R n
+  | 0 => .zero
+  | _ + 1 => .ret r
+
+/-- Project a depth-`(n + 1)` approximant down to depth `n`. -/
+@[reducible]
+def trunc {E : Effect.{u}} {R : Type u} :
+    {n : Nat} → CofixA E R (n + 1) → CofixA E R n
+  | 0, _ => .zero
+  | _ + 1, .ret r => .ret r
+  | _ + 1, .tau t => .tau (trunc t)
+  | _ + 1, .vis i k => .vis i (fun o => trunc (k o))
+
+/-- Fold one `ITreeF` layer of depth-`n` children into `CofixA E R (n + 1)`. -/
+@[reducible]
+def ofStep {E : Effect.{u}} {R : Type u} {n : Nat} :
+    ITreeF E R (CofixA E R n) → CofixA E R (n + 1)
+  | .ret r => .ret r
+  | .tau t => .tau t
+  | .vis i k => .vis i k
+
+/-- Functorial map across return values of `CofixA`. -/
+@[reducible]
+def map {E : Effect.{u}} {R S : Type u} (f : R → S) :
+    {n : Nat} → CofixA E R n → CofixA E S n
+  | _, .zero => .zero
+  | _, .ret r => .ret (f r)
+  | _, .tau t => .tau (map f t)
+  | _, .vis i k => .vis i (fun o => map f (k o))
+
+end CofixA
+
+/--
+One-layer observation/stepping of `CofixA E R (n + 1)` into `ITreeF E R (CofixA E R n)`
+in $O(1)$ time without rebuilding child towers.
+-/
+@[reducible]
+def approxStep {E : Effect.{u}} {R : Type u} {n : Nat} :
+    CofixA E R (n + 1) → ITreeF E R (CofixA E R n)
+  | .ret r => .ret r
+  | .tau t => .tau t
+  | .vis i k => .vis i k
+
+@[simp]
+theorem approxStep_ofStep {E : Effect.{u}} {R : Type u} {n : Nat}
+    (node : ITreeF E R (CofixA E R n)) :
+    approxStep (CofixA.ofStep node) = node := by
+  cases node <;> rfl
+
+@[simp]
+theorem ofStep_approxStep {E : Effect.{u}} {R : Type u} {n : Nat}
+    (t : CofixA E R (n + 1)) :
+    CofixA.ofStep (approxStep t) = t := by
+  cases t <;> rfl
+
+/-- Project `t : ITree E R` to its depth-`n` finite approximant `CofixA E R n`. -/
+def ofITree {E : Effect.{u}} {R : Type u} : (n : Nat) → ITree E R → CofixA E R n
+  | 0, _ => .zero
+  | n + 1, t =>
+    match t.observe with
+    | .ret r => .ret r
+    | .tau t' => .tau (ofITree n t')
+    | .vis i k => .vis i (fun o => ofITree n (k o))
+
+@[simp]
+theorem ofITree_zero {E : Effect.{u}} {R : Type u} (t : ITree E R) :
+    ofITree 0 t = .zero :=
+  rfl
+
+@[simp]
+theorem ofITree_ret {E : Effect.{u}} {R : Type u} (n : Nat) (r : R) :
+    ofITree (n + 1) (ITree.ret (E := E) r) = .ret r := by
+  dsimp [ofITree]; rw [ITree.observe_ret]
+
+theorem ofITree_ret_all {E : Effect.{u}} {R : Type u} (n : Nat) (r : R) :
+    ofITree n (ITree.ret (E := E) r) = CofixA.retApprox r n := by
+  cases n with
+  | zero => rfl
+  | succ m => exact ofITree_ret m r
+
+@[simp]
+theorem ofITree_tau {E : Effect.{u}} {R : Type u} (n : Nat) (t : ITree E R) :
+    ofITree (n + 1) (.tau t) = .tau (ofITree n t) := by
+  dsimp [ofITree]; rw [ITree.observe_tau]
+
+@[simp]
+theorem ofITree_vis {E : Effect.{u}} {R : Type u}
+    (n : Nat) (i : E.I) (k : E.O i → ITree E R) :
+    ofITree (n + 1) (.vis i k) = .vis i (fun o => ofITree n (k o)) := by
+  dsimp [ofITree]; rw [ITree.observe_vis]
+
+@[simp]
+theorem ofITree_trigger {E : Effect.{u}} (n : Nat) (i : E.I) :
+    ofITree (n + 1) (ITree.trigger i) = .vis i (fun o => CofixA.retApprox o n) := by
+  unfold ITree.trigger
+  rw [ofITree_vis]
+  congr 1; funext o
+  exact ofITree_ret_all n o
+
+theorem approxStep_ofITree {E : Effect.{u}} {R : Type u}
+    (n : Nat) (t : ITree E R) :
+    approxStep (ofITree (n + 1) t) = t.observe.map (ofITree n) := by
+  dsimp [ofITree]
+  cases t.observe <;> rfl
+
+/-- Projective coherence of `ofITree` under `CofixA.trunc`. -/
+@[simp]
+theorem trunc_ofITree {E : Effect.{u}} {R : Type u}
+    (n : Nat) (t : ITree E R) :
+    CofixA.trunc (ofITree (n + 1) t) = ofITree n t := by
+  induction n generalizing t with
+  | zero => rfl
+  | succ m ih =>
+    dsimp [ofITree]
+    cases t.observe with
+    | ret _ => rfl
+    | tau t' => exact congrArg CofixA.tau (ih t')
+    | vis i k =>
+      exact congrArg (CofixA.vis i) (funext fun o => ih (k o))
+
+/-- Exact injectivity and extensionality of `ofITree`: two interaction trees are
+equal iff all of their finite `CofixA` approximants coincide. -/
+theorem ofITree_inj {E : Effect.{u}} {R : Type u} {t u : ITree E R} :
+    (∀ n, ofITree n t = ofITree n u) ↔ t = u := by
+  refine ⟨fun h => ?_, fun h n => h ▸ rfl⟩
+  refine ITree.bisim_eq (fun a b => ∀ n, ofITree n a = ofITree n b) ?_ h
+  intro a b hab
+  have h1 := hab 1
+  dsimp [ofITree] at h1
+  cases ha : a.observe <;> cases hb : b.observe <;>
+     rw [ha, hb] at h1 <;> simp only at h1
+  · injection h1
+  · nomatch h1
+  · nomatch h1
+  · nomatch h1
+  · intro n
+    have hn := hab (n + 1)
+    dsimp [ofITree] at hn
+    rw [ha, hb] at hn
+    injection hn
+  · nomatch h1
+  · nomatch h1
+  · nomatch h1
+  · injection h1 with _ hi _
+    subst hi
+    refine ⟨rfl, fun o n => ?_⟩
+    have hn := hab (n + 1)
+    dsimp [ofITree] at hn
+    rw [ha, hb] at hn
+    injection hn with _ _ hk
+    exact congrFun hk o
+
+/--
+Direct coalgebra unrolling into `CofixA E R n` by structural recursion on `n`
+with zero `ITree.observe` / `CoInd.unfold` overhead.
+-/
+@[reducible]
+def approxCofix {E : Effect.{u}} {R S : Type u}
+    (step : S → ITreeF E R S) : (n : Nat) → S → CofixA E R n
+  | 0, _ => .zero
+  | n + 1, s =>
+    match step s with
+    | .ret r => .ret r
+    | .tau s' => .tau (approxCofix step n s')
+    | .vis i k => .vis i (fun o => approxCofix step n (k o))
+
+/-- Alias for `approxCofix`. -/
+abbrev cofixApprox {E : Effect.{u}} {R S : Type u}
+    (step : S → ITreeF E R S) (n : Nat) (s : S) : CofixA E R n :=
+  approxCofix step n s
+
+/-- `ofITree n (ITree.cofix step s)` coincides with direct `approxCofix step n s`. -/
+@[simp]
+theorem ofITree_cofix {E : Effect.{u}} {R S : Type u}
+    (step : S → ITreeF E R S) (s : S) (n : Nat) :
+    ofITree n (ITree.cofix step s) = approxCofix step n s := by
+  induction n generalizing s with
+  | zero => rfl
+  | succ m ih =>
+    dsimp [ofITree, approxCofix]
+    rw [ITree.observe_cofix]
+    cases step s with
+    | ret _ => rfl
+    | tau s' => exact congrArg CofixA.tau (ih s')
+    | vis i k =>
+      exact congrArg (CofixA.vis i) (funext fun o => ih (k o))
+
+@[simp]
+theorem trunc_approxCofix {E : Effect.{u}} {R S : Type u}
+    (step : S → ITreeF E R S) (s : S) (n : Nat) :
+    CofixA.trunc (approxCofix step (n + 1) s) = approxCofix step n s := by
+  rw [← ofITree_cofix, ← ofITree_cofix, trunc_ofITree]
+
+/--
+Suffix-free monadic bind on `CofixA`, substituting `k r (n + 1)` at each depth-`(n + 1)`
+`.ret r` leaf without `ITree.observe`.
+-/
+@[reducible]
+def bindApprox {E : Effect.{u}} {R S : Type u} :
+    {n : Nat} → CofixA E R n → (R → (m : Nat) → CofixA E S m) → CofixA E S n
+  | _, .zero, _ => .zero
+  | _, @CofixA.ret _ _ m r, k => k r (m + 1)
+  | _, .tau t', k => .tau (bindApprox t' k)
+  | _, .vis i c, k => .vis i (fun o => bindApprox (c o) k)
+
+/-- Suffix-free substitution on `CofixA` (`bindApprox` with arguments flipped). -/
+@[reducible]
+def substApprox {E : Effect.{u}} {R S : Type u}
+    (k : R → (m : Nat) → CofixA E S m) {n : Nat} (t : CofixA E R n) : CofixA E S n :=
+  bindApprox t k
+
+theorem bindApprox_congr {E : Effect.{u}} {R S : Type u}
+    {n : Nat} (t : CofixA E R n)
+    {k₁ k₂ : R → (m : Nat) → CofixA E S m}
+    (hk : ∀ r m, k₁ r m = k₂ r m) :
+    bindApprox t k₁ = bindApprox t k₂ := by
+  induction t with
+  | zero => rfl
+  | ret r => exact hk r _
+  | tau _ ih => exact congrArg CofixA.tau ih
+  | vis i _ ih => exact congrArg (CofixA.vis i) (funext fun o => ih o)
+
+/-- Exact equational bridge for `t >>= k` (`ITree.bind`) on `CofixA`. -/
+@[simp]
+theorem ofITree_bind {E : Effect.{u}} {R S : Type u}
+    (t : ITree E R) (k : R → ITree E S) (n : Nat) :
+    ofITree n (t >>= k) = bindApprox (ofITree n t) (fun r m => ofITree m (k r)) := by
+  induction n generalizing t with
+  | zero => rfl
+  | succ m ih =>
+    cases ht : t.observe with
+    | ret r =>
+      have hEq : t = .ret r := by rw [← ITree.fold_observe t, ht]; rfl
+      subst hEq
+      rw [ret_bind, ofITree_ret]
+    | tau t' =>
+      have hEq : t = .tau t' := by rw [← ITree.fold_observe t, ht]; rfl
+      subst hEq
+      rw [tau_bind, ofITree_tau, ofITree_tau]
+      exact congrArg CofixA.tau (ih t')
+    | vis i c =>
+      have hEq : t = .vis i c := by rw [← ITree.fold_observe t, ht]; rfl
+      subst hEq
+      rw [vis_bind, ofITree_vis, ofITree_vis]
+      exact congrArg (CofixA.vis i) (funext fun o => ih (c o))
+
+@[simp]
+theorem ofITree_map {E : Effect.{u}} {R S : Type u}
+    (f : R → S) (t : ITree E R) (n : Nat) :
+    ofITree n (ITree.map f t) = CofixA.map f (ofITree n t) := by
+  induction n generalizing t with
+  | zero => rfl
+  | succ m ih =>
+    have h_bind : ofITree (m + 1) (ITree.map f t) =
+        bindApprox (ofITree (m + 1) t) (fun r m' => ofITree m' (ITree.ret (f r))) :=
+      ofITree_bind t (fun r => ITree.ret (f r)) (m + 1)
+    rw [h_bind]
+    cases ht : t.observe with
+    | ret r =>
+      have hEq : t = .ret r := by rw [← ITree.fold_observe t, ht]; rfl
+      subst hEq
+      rw [ofITree_ret]
+      dsimp [bindApprox, CofixA.map]
+      exact ofITree_ret m (f r)
+    | tau t' =>
+      have hEq : t = .tau t' := by rw [← ITree.fold_observe t, ht]; rfl
+      subst hEq
+      rw [ofITree_tau]
+      dsimp [bindApprox, CofixA.map]
+      rw [← ofITree_bind t' (fun r => ITree.ret (f r)) m]
+      exact congrArg CofixA.tau (ih t')
+    | vis i c =>
+      have hEq : t = .vis i c := by rw [← ITree.fold_observe t, ht]; rfl
+      subst hEq
+      rw [ofITree_vis]
+      dsimp [bindApprox, CofixA.map]
+      refine congrArg (CofixA.vis i) (funext fun o => ?_)
+      rw [← ofITree_bind (c o) (fun r => ITree.ret (f r)) m]
+      exact ih (c o)
+
+/--
+Suffix-free iteration body walker on `CofixA`: turns `.ret (.inl next)` into
+`.tau` followed by walking `body next n` at the remaining depth `n`, and turns
+`.ret (.inr r)` into `.ret r`. Parameterized over source depth `{d : Nat}` so
+pattern-matching on `cur` avoids index unification with `n`.
+-/
+@[reducible]
+def iterWalkApprox {E : Effect.{u}} {I R : Type u}
+    (body : I → (m : Nat) → CofixA E (I ⊕ R) m) :
+    (n : Nat) → {d : Nat} → CofixA E (I ⊕ R) d → CofixA E R n
+  | 0, _, _ => .zero
+  | n + 1, _, .zero => .tau (iterWalkApprox body n .zero)
+  | n + 1, _, .ret (.inl next) => .tau (iterWalkApprox body n (body next n))
+  | _ + 1, _, .ret (.inr r) => .ret r
+  | n + 1, _, .tau cur' => .tau (iterWalkApprox body n cur')
+  | n + 1, _, .vis i k => .vis i (fun o => iterWalkApprox body n (k o))
+
+/--
+Suffix-free iteration walker (`iterApprox`) computing the depth-`n` approximant
+of `ITree.iter` by pure structural recursion on `n` with zero `ITree.observe`.
+-/
+@[reducible]
+def iterApprox {E : Effect.{u}} {I R : Type u}
+    (body : I → (m : Nat) → CofixA E (I ⊕ R) m) (n : Nat) (init : I) :
+    CofixA E R n :=
+  iterWalkApprox body n (body init n)
+
+theorem iterWalkApprox_congr {E : Effect.{u}} {I R : Type u}
+    {body₁ body₂ : I → (m : Nat) → CofixA E (I ⊕ R) m}
+    (hb : ∀ i m, body₁ i m = body₂ i m) (n : Nat) :
+    ∀ {d : Nat} (cur : CofixA E (I ⊕ R) d),
+      iterWalkApprox body₁ n cur = iterWalkApprox body₂ n cur := by
+  induction n with
+  | zero => intro _ _; rfl
+  | succ m ih =>
+    intro d cur
+    cases cur with
+    | zero => exact congrArg CofixA.tau (ih .zero)
+    | ret sr =>
+      cases sr with
+      | inl next =>
+        dsimp [iterWalkApprox]
+        rw [hb next m]
+        exact congrArg CofixA.tau (ih (body₂ next m))
+      | inr _ => rfl
+    | tau cur' => exact congrArg CofixA.tau (ih cur')
+    | vis i k => exact congrArg (CofixA.vis i) (funext fun o => ih (k o))
+
+theorem iterApprox_congr {E : Effect.{u}} {I R : Type u}
+    {body₁ body₂ : I → (m : Nat) → CofixA E (I ⊕ R) m}
+    (hb : ∀ i m, body₁ i m = body₂ i m) (n : Nat) (init : I) :
+    iterApprox body₁ n init = iterApprox body₂ n init := by
+  unfold iterApprox
+  rw [hb init n]
+  exact iterWalkApprox_congr hb n (body₂ init n)
+
+private theorem ofITree_iter_bind_aux {E : Effect.{u}} {I R : Type u}
+    (body : I → ITree E (I ⊕ R)) (n : Nat) :
+    ∀ (d : Nat) (cur : ITree E (I ⊕ R)), n ≤ d →
+      ofITree n
+        (cur >>= Sum.elim (fun next => ITree.tau (ITree.iter body next)) ITree.ret) =
+        iterWalkApprox (fun i m => ofITree m (body i)) n (ofITree d cur) := by
+  induction n with
+  | zero => intro _ _ _; rfl
+  | succ m ih =>
+    intro d cur hd
+    cases d with
+    | zero => exact absurd hd (Nat.not_succ_le_zero m)
+    | succ d' =>
+      have hd' : m ≤ d' := Nat.le_of_succ_le_succ hd
+      cases hc : cur.observe with
+      | ret sr =>
+        have hEq : cur = .ret sr := by rw [← ITree.fold_observe cur, hc]; rfl
+        subst hEq
+        cases sr with
+        | inl next =>
+          rw [ret_bind, Sum.elim_inl, ofITree_tau, ofITree_ret]
+          dsimp [iterWalkApprox]
+          rw [iter_unfold body next]
+          exact congrArg CofixA.tau (ih m (body next) (Nat.le_refl m))
+        | inr r =>
+          rw [ret_bind, Sum.elim_inr, ofITree_ret, ofITree_ret]
+      | tau cur' =>
+        have hEq : cur = .tau cur' := by rw [← ITree.fold_observe cur, hc]; rfl
+        subst hEq
+        rw [tau_bind, ofITree_tau, ofITree_tau]
+        exact congrArg CofixA.tau (ih d' cur' hd')
+      | vis i k =>
+        have hEq : cur = .vis i k := by rw [← ITree.fold_observe cur, hc]; rfl
+        subst hEq
+        rw [vis_bind, ofITree_vis, ofITree_vis]
+        exact congrArg (CofixA.vis i) (funext fun o => ih d' (k o) hd')
+
+/-- Exact equational bridge for `ITree.iter` on `CofixA`. -/
+@[simp]
+theorem ofITree_iter {E : Effect.{u}} {I R : Type u}
+    (body : I → ITree E (I ⊕ R)) (init : I) (n : Nat) :
+    ofITree n (ITree.iter body init) =
+      iterApprox (fun i m => ofITree m (body i)) n init := by
+  rw [iter_unfold]
+  exact ofITree_iter_bind_aux body n n (body init) (Nat.le_refl n)
+
+/-- One output node of `interpApprox` handler mode at depth `n + 1`.
+Parameterized over an unconstrained handler depth `{dh : Nat}` so pattern-matching
+compiles to primitive `CofixA.casesOn` with zero `Eq.rec` / `Nat.noConfusion`. -/
+@[inline, reducible]
+def interpHandlerNode {E₂ : Effect.{u}} {O R : Type u} {n dh : Nat}
+    (onZero : CofixA E₂ R (n + 1))
+    (onCont : O → CofixA E₂ R n)
+    (onChild : {dh' : Nat} → CofixA E₂ O dh' → CofixA E₂ R n) :
+    CofixA E₂ O dh → CofixA E₂ R (n + 1)
+  | .zero => onZero
+  | .ret o => .tau (onCont o)
+  | .tau u' => .tau (onChild u')
+  | .vis j k₂ => .vis j (fun o₂ => onChild (k₂ o₂))
+
+mutual
+
+/--
+Suffix-free effect interpretation walker (`interpApprox`) computing the depth-`n`
+approximant of `ITree.interp` from any source approximant of depth `d ≥ n`
+by structural recursion on output depth `n` with zero `ITree.observe`.
+-/
+@[reducible]
+def interpApprox {E₁ E₂ : Effect.{u}} {R : Type u}
+    (h : (i : E₁.I) → (m : Nat) → CofixA E₂ (E₁.O i) m) :
+    (n : Nat) → {d : Nat} → CofixA E₁ R d → CofixA E₂ R n
+  | 0, _, _ => .zero
+  | n + 1, _, .zero => .tau (interpApprox h n .zero)
+  | _ + 1, _, .ret r => .ret r
+  | n + 1, _, .tau t' => .tau (interpApprox h n t')
+  | n + 1, _, .vis i k =>
+    interpHandlerNode
+      (.tau (interpApprox h n .zero))
+      (fun o => interpApprox h n (k o))
+      (fun ha => interpHandlerApprox h n ha k)
+      (h i (n + 1))
+
+/-- Handler mode of `interpApprox`, walking `ha : CofixA E₂ (E₁.O i) dh` while retaining
+the pending source continuation `k : E₁.O i → CofixA E₁ R d` without truncating `k`. -/
+@[reducible]
+def interpHandlerApprox {E₁ E₂ : Effect.{u}} {R : Type u}
+    (h : (i : E₁.I) → (m : Nat) → CofixA E₂ (E₁.O i) m) :
+    (n : Nat) → {i : E₁.I} → {dh d : Nat} → CofixA E₂ (E₁.O i) dh →
+      (E₁.O i → CofixA E₁ R d) → CofixA E₂ R n
+  | 0, _, _, _, _, _ => .zero
+  | n + 1, _, _, _, ha, k =>
+    interpHandlerNode
+      (.tau (interpApprox h n .zero))
+      (fun o => interpApprox h n (k o))
+      (fun ha' => interpHandlerApprox h n ha' k)
+      ha
+
+end
+
+theorem interpApprox_congr {E₁ E₂ : Effect.{u}} {R : Type u}
+    {h₁ h₂ : (i : E₁.I) → (m : Nat) → CofixA E₂ (E₁.O i) m}
+    (hh : ∀ i m, h₁ i m = h₂ i m) (n : Nat) :
+    (∀ {d : Nat} (t : CofixA E₁ R d),
+      interpApprox h₁ n t = interpApprox h₂ n t) ∧
+    (∀ {i : E₁.I} {dh d : Nat} (ha : CofixA E₂ (E₁.O i) dh) (k : E₁.O i → CofixA E₁ R d),
+      interpHandlerApprox h₁ n ha k = interpHandlerApprox h₂ n ha k) := by
+  induction n with
+  | zero => exact ⟨fun _ => rfl, fun _ _ => rfl⟩
+  | succ m ih =>
+    obtain ⟨ihS, ihH⟩ := ih
+    have hH : ∀ {i : E₁.I} {dh d : Nat} (ha : CofixA E₂ (E₁.O i) dh)
+        (k : E₁.O i → CofixA E₁ R d),
+        interpHandlerApprox h₁ (m + 1) ha k = interpHandlerApprox h₂ (m + 1) ha k := by
+      intro i dh d ha k
+      cases ha with
+      | zero => exact congrArg CofixA.tau (ihS .zero)
+      | ret o => exact congrArg CofixA.tau (ihS (k o))
+      | tau u' => exact congrArg CofixA.tau (ihH u' k)
+      | vis j k₂ => exact congrArg (CofixA.vis j) (funext fun o₂ => ihH (k₂ o₂) k)
+    refine ⟨?_, hH⟩
+    intro d t
+    cases t with
+    | zero => exact congrArg CofixA.tau (ihS .zero)
+    | ret _ => rfl
+    | tau t' => exact congrArg CofixA.tau (ihS t')
+    | vis i k =>
+      change interpHandlerApprox h₁ (m + 1) (h₁ i (m + 1)) k =
+        interpHandlerApprox h₂ (m + 1) (h₂ i (m + 1)) k
+      rw [hh i (m + 1)]
+      exact hH (h₂ i (m + 1)) k
+
+private theorem interpApprox_ofITree_aux {E₁ E₂ : Effect.{u}} {R : Type u}
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i)) (n : Nat) :
+    (∀ (d : Nat) (t : ITree E₁ R), n ≤ d →
+      interpApprox (fun i m => ofITree m (h i)) n (ofITree d t) =
+        ofITree n (ITree.interp h t)) ∧
+    (∀ (i : E₁.I) (dh d : Nat) (u : ITree E₂ (E₁.O i)) (k : E₁.O i → ITree E₁ R),
+      n ≤ dh → n ≤ d + 1 →
+      interpHandlerApprox (fun i m => ofITree m (h i)) n
+        (ofITree dh u) (fun o => ofITree d (k o)) =
+        ofITree n (u >>= fun o => .tau (ITree.interp h (k o)))) := by
+  induction n with
+  | zero =>
+    exact ⟨fun _ _ _ => rfl, fun _ _ _ _ _ _ _ => rfl⟩
+  | succ m ih =>
+    obtain ⟨ihS, ihH⟩ := ih
+    have hH : ∀ (i : E₁.I) (dh d : Nat) (u : ITree E₂ (E₁.O i)) (k : E₁.O i → ITree E₁ R),
+        m + 1 ≤ dh → m + 1 ≤ d + 1 →
+        interpHandlerApprox (fun i m' => ofITree m' (h i)) (m + 1)
+          (ofITree dh u) (fun o => ofITree d (k o)) =
+          ofITree (m + 1) (u >>= fun o => .tau (ITree.interp h (k o))) := by
+      intro i dh d u k hdh hd
+      cases dh with
+      | zero => exact absurd hdh (Nat.not_succ_le_zero m)
+      | succ dh' =>
+        have hdh' : m ≤ dh' := Nat.le_of_succ_le_succ hdh
+        have hd' : m ≤ d := Nat.le_of_succ_le_succ hd
+        cases hu : u.observe with
+        | ret o =>
+          have hEq : u = .ret o := by rw [← ITree.fold_observe u, hu]; rfl
+          subst hEq
+          rw [ofITree_ret, ret_bind, ofITree_tau]
+          exact congrArg CofixA.tau (ihS d (k o) hd')
+        | tau u' =>
+          have hEq : u = .tau u' := by rw [← ITree.fold_observe u, hu]; rfl
+          subst hEq
+          rw [ofITree_tau, tau_bind, ofITree_tau]
+          exact congrArg CofixA.tau (ihH i dh' d u' k hdh' (Nat.le_succ_of_le hd'))
+        | vis j k₂ =>
+          have hEq : u = .vis j k₂ := by rw [← ITree.fold_observe u, hu]; rfl
+          subst hEq
+          rw [ofITree_vis, vis_bind, ofITree_vis]
+          exact congrArg (CofixA.vis j)
+            (funext fun o₂ => ihH i dh' d (k₂ o₂) k hdh' (Nat.le_succ_of_le hd'))
+    refine ⟨fun d t hd => ?_, hH⟩
+    cases d with
+    | zero => exact absurd hd (Nat.not_succ_le_zero m)
+    | succ d' =>
+      have hd' : m ≤ d' := Nat.le_of_succ_le_succ hd
+      cases ht : t.observe with
+      | ret r =>
+        have hEq : t = .ret r := by rw [← ITree.fold_observe t, ht]; rfl
+        subst hEq
+        rw [ofITree_ret, interp_ret, ofITree_ret]
+      | tau t' =>
+        have hEq : t = .tau t' := by rw [← ITree.fold_observe t, ht]; rfl
+        subst hEq
+        rw [ofITree_tau, interp_tau, ofITree_tau]
+        exact congrArg CofixA.tau (ihS d' t' hd')
+      | vis i k =>
+        have hEq : t = .vis i k := by rw [← ITree.fold_observe t, ht]; rfl
+        subst hEq
+        rw [ofITree_vis, interp_vis]
+        exact hH i (m + 1) d' (h i) k (Nat.le_refl (m + 1)) hd
+
+/-- Depth-invariance of `interpApprox`: any source approximant of depth `d ≥ n`
+computes `ofITree n (ITree.interp h t)`. -/
+theorem interpApprox_ofITree_le {E₁ E₂ : Effect.{u}} {R : Type u}
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i)) (t : ITree E₁ R)
+    {n d : Nat} (hd : n ≤ d) :
+    interpApprox (fun i m => ofITree m (h i)) n (ofITree d t) =
+      ofITree n (ITree.interp h t) :=
+  (interpApprox_ofITree_aux h n).1 d t hd
+
+/-- Exact equational bridge for `ITree.interp` on `CofixA`. -/
+@[simp]
+theorem ofITree_interp {E₁ E₂ : Effect.{u}} {R : Type u}
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i)) (t : ITree E₁ R) (n : Nat) :
+    ofITree n (ITree.interp h t) =
+      interpApprox (fun i m => ofITree m (h i)) n (ofITree n t) :=
+  (interpApprox_ofITree_le h t (Nat.le_refl n)).symm
+
+/-- One output node of `interpStateApprox` handler mode at depth `n + 1`.
+Parameterized over an unconstrained handler depth `{dh : Nat}` so pattern-matching
+compiles to primitive `CofixA.casesOn` with zero `Eq.rec` / `Nat.noConfusion`. -/
+@[inline, reducible]
+def interpStateHandlerNode {E₂ : Effect.{u}} {O S R : Type u} {n dh : Nat}
+    (onZero : CofixA E₂ (R × S) (n + 1))
+    (onCont : O → S → CofixA E₂ (R × S) n)
+    (onChild : {dh' : Nat} → CofixA E₂ (O × S) dh' → CofixA E₂ (R × S) n) :
+    CofixA E₂ (O × S) dh → CofixA E₂ (R × S) (n + 1)
+  | .zero => onZero
+  | .ret (o, s') => .tau (onCont o s')
+  | .tau u' => .tau (onChild u')
+  | .vis j k₂ => .vis j (fun o₂ => onChild (k₂ o₂))
+
+mutual
+
+/--
+Suffix-free stateful effect interpretation walker (`interpStateApprox`) computing
+the depth-`n` approximant of `ITree.interpState` from any source approximant of
+depth `d ≥ n` by structural recursion on output depth `n` with zero `ITree.observe`.
+-/
+@[reducible]
+def interpStateApprox {E₁ E₂ : Effect.{u}} {S R : Type u}
+    (h : (i : E₁.I) → S → (m : Nat) → CofixA E₂ (E₁.O i × S) m) :
+    (n : Nat) → {d : Nat} → CofixA E₁ R d → S → CofixA E₂ (R × S) n
+  | 0, _, _, _ => .zero
+  | n + 1, _, .zero, s => .tau (interpStateApprox h n .zero s)
+  | _ + 1, _, .ret r, s => .ret (r, s)
+  | n + 1, _, .tau t', s => .tau (interpStateApprox h n t' s)
+  | n + 1, _, .vis i k, s =>
+    interpStateHandlerNode
+      (.tau (interpStateApprox h n .zero s))
+      (fun o s' => interpStateApprox h n (k o) s')
+      (fun ha => interpStateHandlerApprox h n s ha k)
+      (h i s (n + 1))
+
+/-- Handler mode of `interpStateApprox`, walking `ha : CofixA E₂ (E₁.O i × S) dh` while
+retaining `k : E₁.O i → CofixA E₁ R d` without truncating `k`. -/
+@[reducible]
+def interpStateHandlerApprox {E₁ E₂ : Effect.{u}} {S R : Type u}
+    (h : (i : E₁.I) → S → (m : Nat) → CofixA E₂ (E₁.O i × S) m) :
+    (n : Nat) → S → {i : E₁.I} → {dh d : Nat} → CofixA E₂ (E₁.O i × S) dh →
+      (E₁.O i → CofixA E₁ R d) → CofixA E₂ (R × S) n
+  | 0, _, _, _, _, _, _ => .zero
+  | n + 1, s, _, _, _, ha, k =>
+    interpStateHandlerNode
+      (.tau (interpStateApprox h n .zero s))
+      (fun o s' => interpStateApprox h n (k o) s')
+      (fun ha' => interpStateHandlerApprox h n s ha' k)
+      ha
+
+end
+
+theorem interpStateApprox_congr {E₁ E₂ : Effect.{u}} {S R : Type u}
+    {h₁ h₂ : (i : E₁.I) → S → (m : Nat) → CofixA E₂ (E₁.O i × S) m}
+    (hh : ∀ i s m, h₁ i s m = h₂ i s m) (n : Nat) :
+    (∀ {d : Nat} (t : CofixA E₁ R d) (s : S),
+      interpStateApprox h₁ n t s = interpStateApprox h₂ n t s) ∧
+    (∀ (s : S) {i : E₁.I} {dh d : Nat} (ha : CofixA E₂ (E₁.O i × S) dh)
+      (k : E₁.O i → CofixA E₁ R d),
+      interpStateHandlerApprox h₁ n s ha k = interpStateHandlerApprox h₂ n s ha k) := by
+  induction n with
+  | zero => exact ⟨fun _ _ => rfl, fun _ {_} {_} {_} _ _ => rfl⟩
+  | succ m ih =>
+    obtain ⟨ihS, ihH⟩ := ih
+    have hH : ∀ (s : S) {i : E₁.I} {dh d : Nat} (ha : CofixA E₂ (E₁.O i × S) dh)
+        (k : E₁.O i → CofixA E₁ R d),
+        interpStateHandlerApprox h₁ (m + 1) s ha k =
+          interpStateHandlerApprox h₂ (m + 1) s ha k := by
+      intro s i dh d ha k
+      cases ha with
+      | zero => exact congrArg CofixA.tau (ihS .zero s)
+      | ret os => exact congrArg CofixA.tau (ihS (k os.1) os.2)
+      | tau u' => exact congrArg CofixA.tau (ihH s u' k)
+      | vis j k₂ => exact congrArg (CofixA.vis j) (funext fun o₂ => ihH s (k₂ o₂) k)
+    refine ⟨?_, hH⟩
+    intro d t s
+    cases t with
+    | zero => exact congrArg CofixA.tau (ihS .zero s)
+    | ret _ => rfl
+    | tau t' => exact congrArg CofixA.tau (ihS t' s)
+    | vis i k =>
+      change interpStateHandlerApprox h₁ (m + 1) s (h₁ i s (m + 1)) k =
+        interpStateHandlerApprox h₂ (m + 1) s (h₂ i s (m + 1)) k
+      rw [hh i s (m + 1)]
+      exact hH s (h₂ i s (m + 1)) k
+
+private theorem interpStateApprox_ofITree_aux {E₁ E₂ : Effect.{u}} {S R : Type u}
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S)) (n : Nat) :
+    (∀ (d : Nat) (t : ITree E₁ R) (s : S), n ≤ d →
+      interpStateApprox (fun i st m => ofITree m (h i st)) n (ofITree d t) s =
+        ofITree n (ITree.interpState h t s)) ∧
+    (∀ (s : S) (i : E₁.I) (dh d : Nat) (u : ITree E₂ (E₁.O i × S)) (k : E₁.O i → ITree E₁ R),
+      n ≤ dh → n ≤ d + 1 →
+      interpStateHandlerApprox (fun i st m => ofITree m (h i st)) n s
+        (ofITree dh u) (fun o => ofITree d (k o)) =
+        ofITree n (u >>= fun (o, s') => .tau (ITree.interpState h (k o) s'))) := by
+  induction n with
+  | zero =>
+    exact ⟨fun _ _ _ _ => rfl, fun _ _ _ _ _ _ _ _ => rfl⟩
+  | succ m ih =>
+    obtain ⟨ihS, ihH⟩ := ih
+    have hH : ∀ (s : S) (i : E₁.I) (dh d : Nat) (u : ITree E₂ (E₁.O i × S))
+        (k : E₁.O i → ITree E₁ R),
+        m + 1 ≤ dh → m + 1 ≤ d + 1 →
+        interpStateHandlerApprox (fun i st m' => ofITree m' (h i st)) (m + 1) s
+          (ofITree dh u) (fun o => ofITree d (k o)) =
+          ofITree (m + 1) (u >>= fun (o, s') => .tau (ITree.interpState h (k o) s')) := by
+      intro s i dh d u k hdh hd
+      cases dh with
+      | zero => exact absurd hdh (Nat.not_succ_le_zero m)
+      | succ dh' =>
+        have hdh' : m ≤ dh' := Nat.le_of_succ_le_succ hdh
+        have hd' : m ≤ d := Nat.le_of_succ_le_succ hd
+        cases hu : u.observe with
+        | ret os =>
+          rcases os with ⟨o, s'⟩
+          have hEq : u = .ret (o, s') := by rw [← ITree.fold_observe u, hu]; rfl
+          subst hEq
+          rw [ofITree_ret, ret_bind, ofITree_tau]
+          exact congrArg CofixA.tau (ihS d (k o) s' hd')
+        | tau u' =>
+          have hEq : u = .tau u' := by rw [← ITree.fold_observe u, hu]; rfl
+          subst hEq
+          rw [ofITree_tau, tau_bind, ofITree_tau]
+          exact congrArg CofixA.tau (ihH s i dh' d u' k hdh' (Nat.le_succ_of_le hd'))
+        | vis j k₂ =>
+          have hEq : u = .vis j k₂ := by rw [← ITree.fold_observe u, hu]; rfl
+          subst hEq
+          rw [ofITree_vis, vis_bind, ofITree_vis]
+          exact congrArg (CofixA.vis j)
+            (funext fun o₂ => ihH s i dh' d (k₂ o₂) k hdh' (Nat.le_succ_of_le hd'))
+    refine ⟨fun d t s hd => ?_, hH⟩
+    cases d with
+    | zero => exact absurd hd (Nat.not_succ_le_zero m)
+    | succ d' =>
+      have hd' : m ≤ d' := Nat.le_of_succ_le_succ hd
+      cases ht : t.observe with
+      | ret r =>
+        have hEq : t = .ret r := by rw [← ITree.fold_observe t, ht]; rfl
+        subst hEq
+        rw [ofITree_ret, interpState_ret, ofITree_ret]
+      | tau t' =>
+        have hEq : t = .tau t' := by rw [← ITree.fold_observe t, ht]; rfl
+        subst hEq
+        rw [ofITree_tau, interpState_tau, ofITree_tau]
+        exact congrArg CofixA.tau (ihS d' t' s hd')
+      | vis i k =>
+        have hEq : t = .vis i k := by rw [← ITree.fold_observe t, ht]; rfl
+        subst hEq
+        rw [ofITree_vis, interpState_vis]
+        exact hH s i (m + 1) d' (h i s) k (Nat.le_refl (m + 1)) hd
+
+/-- Depth-invariance of `interpStateApprox`: any source approximant of depth `d ≥ n`
+computes `ofITree n (ITree.interpState h t s)`. -/
+theorem interpStateApprox_ofITree_le {E₁ E₂ : Effect.{u}} {S R : Type u}
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S))
+    (t : ITree E₁ R) (s : S) {n d : Nat} (hd : n ≤ d) :
+    interpStateApprox (fun i st m => ofITree m (h i st)) n (ofITree d t) s =
+      ofITree n (ITree.interpState h t s) :=
+  (interpStateApprox_ofITree_aux h n).1 d t s hd
+
+/-- Exact equational bridge for `ITree.interpState` on `CofixA`. -/
+@[simp]
+theorem ofITree_interpState {E₁ E₂ : Effect.{u}} {S R : Type u}
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S))
+    (t : ITree E₁ R) (s : S) (n : Nat) :
+    ofITree n (ITree.interpState h t s) =
+      interpStateApprox (fun i st m => ofITree m (h i st)) n (ofITree n t) s :=
+  (interpStateApprox_ofITree_le h t s (Nat.le_refl n)).symm
+
+/-! ### Finite-Horizon Reachability (`ReachesRetApprox`) & Evaluators on `CofixA` -/
+
+/-- Finite-depth labeled trace reachability to `.ret r` on `CofixA E R n`. -/
+inductive ReachesRetApprox {E : Effect.{u}} {R : Type u} [FaultEffect E] :
+    {n : Nat} → CofixA E R n → List (Event E) → R → Prop where
+  | ret {n : Nat} (r : R) :
+      ReachesRetApprox (n := n + 1) (.ret r) [] r
+  | tau {n : Nat} {t : CofixA E R n} {tr : List (Event E)} {r : R} :
+      ReachesRetApprox t tr r →
+      ReachesRetApprox (n := n + 1) (.tau t) tr r
+  | vis {n : Nat} {i : E.I} {k : E.O i → CofixA E R n}
+      {tr : List (Event E)} {r : R} :
+      ¬ FaultEffect.isFault i →
+      (o : E.O i) →
+      ReachesRetApprox (k o) tr r →
+      ReachesRetApprox (n := n + 1) (.vis i k) (⟨i, o⟩ :: tr) r
+
+/-- Soundness of `ReachesRetApprox` with respect to `ReachesRet`. -/
+theorem ReachesRetApprox.toReachesRet {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n : Nat} {t : ITree E R} {tr : List (Event E)} {r : R}
+    (h : ReachesRetApprox (ofITree n t) tr r) :
+    ReachesRet t tr r := by
+  induction n generalizing t tr with
+  | zero => nomatch h
+  | succ m ih =>
+    dsimp [ofITree] at h
+    cases ht : t.observe <;> rw [ht] at h
+    · cases h
+      exact ⟨t, .refl t, ht⟩
+    · cases h with
+      | tau h' =>
+        rcases ih h' with ⟨u, hr, hu⟩
+        exact ⟨u, .tau ht hr, hu⟩
+    · cases h with
+      | vis hnf o h' =>
+        rcases ih h' with ⟨u, hr, hu⟩
+        exact ⟨u, .vis ht hnf o hr, hu⟩
+
+/-- Completeness (finite-horizon adequacy) of `ofITree`: every completed
+`ReachesRet t tr r` execution is witnessed at a finite approximant depth `n`. -/
+theorem ReachesRet.exists_ofITree {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {t : ITree E R} {tr : List (Event E)} {r : R}
+    (h : ReachesRet t tr r) :
+    ∃ n, ReachesRetApprox (ofITree n t) tr r := by
+  rcases h with ⟨u, hr, hu⟩
+  induction hr with
+  | @refl t₀ =>
+    refine ⟨1, ?_⟩
+    dsimp [ofITree]; rw [hu]
+    exact .ret r
+  | @tau t₀ t' _ _ ht _ ih =>
+    rcases ih hu with ⟨n, hn⟩
+    refine ⟨n + 1, ?_⟩
+    dsimp [ofITree]; rw [ht]
+    exact .tau hn
+  | @vis t₀ _ i k _ hv hnf o _ ih =>
+    rcases ih hu with ⟨n, hn⟩
+    refine ⟨n + 1, ?_⟩
+    dsimp [ofITree]; rw [hv]
+    exact .vis hnf o hn
+
+/-- Exact adequacy equivalence between `ReachesRet t tr r` and finite-depth
+`ReachesRetApprox (ofITree n t) tr r`. -/
+theorem reachesRet_iff_exists_ofITree {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (t : ITree E R) (tr : List (Event E)) (r : R) :
+    ReachesRet t tr r ↔ ∃ n, ReachesRetApprox (ofITree n t) tr r :=
+  ⟨ReachesRet.exists_ofITree, fun ⟨_, hn⟩ => hn.toReachesRet⟩
+
+/-- Pure silent `.tau` evaluator on `CofixA E R n`. -/
+@[reducible]
+def evalTauApprox {E : Effect.{u}} {R : Type u} :
+    {n : Nat} → CofixA E R n → Option R
+  | _, .zero => none
+  | _, .ret r => some r
+  | _, .tau t => evalTauApprox t
+  | _, .vis _ _ => none
+
+/-- Boolean silent `.tau` return checker on `CofixA E R n`. -/
+@[reducible]
+def checkTauRetApprox {E : Effect.{u}} {R : Type u} {n : Nat}
+    (t : CofixA E R n) (p : R → Bool) : Bool :=
+  match evalTauApprox t with
+  | some r => p r
+  | none => false
+
+/-- Soundness of `evalTauApprox` with respect to `TauStar`. -/
+theorem evalTauApprox_sound_tauStar {E : Effect.{u}} {R : Type u}
+    {n : Nat} {t : ITree E R} {r : R}
+    (h : evalTauApprox (ofITree n t) = some r) :
+    ∃ u, TauStar t u ∧ u.observe = .ret r := by
+  induction n generalizing t with
+  | zero => nomatch h
+  | succ m ih =>
+    dsimp [ofITree] at h
+    cases ht : t.observe <;> rw [ht] at h
+    · injection h with hr; subst hr
+      exact ⟨t, .refl t, ht⟩
+    · rcases ih h with ⟨u, hs, hu⟩
+      exact ⟨u, .step ht hs, hu⟩
+    · nomatch h
+
+/-- Soundness of `evalTauApprox` with respect to `ReachesRet t [] r`. -/
+theorem evalTauApprox_sound_reachesRet {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n : Nat} {t : ITree E R} {r : R}
+    (h : evalTauApprox (ofITree n t) = some r) :
+    ReachesRet t [] r := by
+  rcases evalTauApprox_sound_tauStar h with ⟨u, hs, hu⟩
+  exact ⟨u, Reaches.of_tauStar hs (.refl u), hu⟩
+
+/-- Completeness of `evalTauApprox` with respect to `TauStar`: if `t` silently
+reaches `.ret r`, some finite depth `n` evaluates to `some r`. -/
+theorem tauStar_ret_exists_evalTauApprox {E : Effect.{u}} {R : Type u}
+    {t u : ITree E R} {r : R}
+    (hs : TauStar t u) (hu : u.observe = .ret r) :
+    ∃ n, evalTauApprox (ofITree n t) = some r := by
+  induction hs with
+  | @refl x =>
+    refine ⟨1, ?_⟩
+    dsimp [ofITree, evalTauApprox]; rw [hu]
+  | @step x x' _ hx _ ih =>
+    rcases ih hu with ⟨n, hn⟩
+    refine ⟨n + 1, ?_⟩
+    dsimp [ofITree, evalTauApprox]; rw [hx]; exact hn
+
+theorem tauStar_ret_iff_exists_evalTauApprox {E : Effect.{u}} {R : Type u}
+    (t : ITree E R) (r : R) :
+    (∃ u, TauStar t u ∧ u.observe = .ret r) ↔
+      ∃ n, evalTauApprox (ofITree n t) = some r :=
+  ⟨fun ⟨_, hs, hu⟩ => tauStar_ret_exists_evalTauApprox hs hu,
+   fun ⟨_, hn⟩ => evalTauApprox_sound_tauStar hn⟩
+
+theorem checkTauRetApprox_sound {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n : Nat} {t : ITree E R} {p : R → Bool}
+    (h : checkTauRetApprox (ofITree n t) p = true) :
+    ∃ r, p r = true ∧ ReachesRet t [] r ∧ (∃ u, TauStar t u ∧ u.observe = .ret r) := by
+  unfold checkTauRetApprox at h
+  cases hev : evalTauApprox (ofITree n t) with
+  | none => rw [hev] at h; nomatch h
+  | some r =>
+    rw [hev] at h
+    exact ⟨r, h, evalTauApprox_sound_reachesRet hev, evalTauApprox_sound_tauStar hev⟩
+
+/--
+Computable trace-consistency checker on `CofixA E R n` for any effect `E` with
+decidable request equality and decidable `FaultEffect.isFault`.
+-/
+@[reducible]
+def checkTraceApprox {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] :
+    {n : Nat} → CofixA E R n → List (Event E) → (R → Bool) → Bool
+  | _, .zero, _, _ => false
+  | _, .ret r, tr, p =>
+    match tr with
+    | [] => p r
+    | _ :: _ => false
+  | _, .tau t, tr, p => checkTraceApprox t tr p
+  | _, .vis i k, tr, p =>
+    match tr with
+    | [] => false
+    | ⟨i', o⟩ :: rest =>
+      if ¬ FaultEffect.isFault (E := E) i then
+        if h : i = i' then
+          checkTraceApprox (k (h ▸ o)) rest p
+        else
+          false
+      else
+        false
+
+theorem checkTraceApprox_sound_reachesRetApprox {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)]
+    {n : Nat} {a : CofixA E R n} {tr : List (Event E)} {p : R → Bool}
+    (h : checkTraceApprox a tr p = true) :
+    ∃ r, p r = true ∧ ReachesRetApprox a tr r := by
+  induction a generalizing tr with
+  | zero => nomatch h
+  | ret r =>
+    cases tr with
+    | nil => exact ⟨r, h, .ret r⟩
+    | cons _ _ => nomatch h
+  | tau t ih =>
+    rcases ih h with ⟨r, hp, hr⟩
+    exact ⟨r, hp, .tau hr⟩
+  | vis i k ih =>
+    cases tr with
+    | nil => nomatch h
+    | cons ev rest =>
+      rcases ev with ⟨i', o⟩
+      dsimp [checkTraceApprox] at h
+      split at h
+      · rename_i hnf
+        split at h
+        · rename_i heq
+          subst heq
+          rcases ih o h with ⟨r, hp, hr⟩
+          exact ⟨r, hp, .vis hnf o hr⟩
+        · nomatch h
+      · nomatch h
+
+/-- Soundness of `checkTraceApprox` with respect to `ReachesRet`. -/
+theorem checkTraceApprox_sound {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)]
+    {n : Nat} {t : ITree E R} {tr : List (Event E)} {p : R → Bool}
+    (h : checkTraceApprox (ofITree n t) tr p = true) :
+    ∃ r, p r = true ∧ ReachesRet t tr r := by
+  rcases checkTraceApprox_sound_reachesRetApprox h with ⟨r, hp, hr⟩
+  exact ⟨r, hp, hr.toReachesRet⟩
 
 end Anneal.ITree
