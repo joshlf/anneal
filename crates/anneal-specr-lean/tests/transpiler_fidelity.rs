@@ -65,6 +65,17 @@ fn ensure_examples_minirust_built(examples_dir: &Path, augmented_path: &str) {
     if *built {
         return;
     }
+    let lake_dir = examples_dir.join(".lake");
+    fs::create_dir_all(&lake_dir).expect("create `examples/.lake` directory");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lake_dir.join(".anneal-minirust-build.lock"))
+        .expect("open cross-process `.anneal-minirust-build.lock`");
+    lock_file
+        .lock()
+        .expect("acquire exclusive cross-process lock for `lake build MiniRust`");
     let threads = bounded_lean_threads();
     let status_build = std::process::Command::new("lake")
         .args(["build", "MiniRust"])
@@ -75,6 +86,7 @@ fn ensure_examples_minirust_built(examples_dir: &Path, augmented_path: &str) {
         .env("LEAN_NUM_THREADS", &threads)
         .output()
         .expect("spawn `lake build MiniRust`");
+    let _ = lock_file.unlock();
     assert!(
         status_build.status.success(),
         "`lake build MiniRust` failed:\nstdout: {}\nstderr: {}",
