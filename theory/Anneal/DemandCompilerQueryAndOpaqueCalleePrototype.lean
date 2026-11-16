@@ -2151,8 +2151,10 @@ theorem canary_liveArm_required :
   decide +kernel
 
 /- Opacity witness: at default transparency `whnf` leaves opaque-table lookups
-stuck (no `O(|callees|)` `findCallee?` / `lookupCallee` unfolding); only an
-explicit `.all` transparency sees through the seal. -/
+(`lookupRaw`, `lookup`), the per-table `traitImpls` certificate carrier, and the
+`toList` seal stuck (no `O(|callees|)` `findCallee?` / `lookupCallee` /
+`flatMapTraitImpls` unfolding); only an explicit `.all` transparency sees through
+the seal. -/
 open Lean Meta in
 run_meta do
   let raw := mkApp2 (mkConst ``OpaqueCalleeTable.lookupRaw) (mkConst ``canaryFullTbl)
@@ -2161,7 +2163,10 @@ run_meta do
     (mkConst ``protoLayouts) (mkStrLit "proto::live_f")
     (mkApp (mkConst ``List.nil [Level.zero]) (mkConst ``RigidTy))
     (mkApp (mkConst ``List.nil [Level.zero]) (mkConst ``TraitImplEntry))
-  for (e, head) in [(raw, ``OpaqueCalleeTable.lookupRaw), (full, ``OpaqueCalleeTable.lookup)] do
+  let impls := mkApp (mkConst ``OpaqueCalleeTable.traitImpls) (mkConst ``canaryFullTbl)
+  let asList := mkApp (mkConst ``OpaqueCalleeTable.toList) (mkConst ``canaryFullTbl)
+  for (e, head) in [(raw, ``OpaqueCalleeTable.lookupRaw), (full, ``OpaqueCalleeTable.lookup),
+      (impls, ``OpaqueCalleeTable.traitImpls), (asList, ``OpaqueCalleeTable.toList)] do
     let r ← whnf e
     unless r.isAppOf head do
       throwError "opacity witness failed: whnf unfolded the opaque table to {r}"
@@ -3624,6 +3629,32 @@ def evalLayoutOf (env : CompilerQueryEnv) (dialect : LayoutDialect) (ty : Ty) :
       match computeLayoutV08Bridged tbl ty with
       | some l => .ok (.layout l)
       | none => .err .layoutUncomputable
+
+/-- Exact bidirectional characterization of `evalLayoutOf` in the V2026_06_01 dialect
+(A4: completes the `.ok` characterizations of B4's `_ok_iff` family for `layoutOf`):
+the answer is `l` iff `computeLayoutV06` computes `l`. -/
+theorem evalLayoutOf_v06_ok_iff (env : CompilerQueryEnv) (ty : Ty) (l : TypeLayout) :
+    evalLayoutOf env .v2026_06_01 ty = .ok (.layout l) ↔
+      computeLayoutV06 env.layoutsV06 ty = some l := by
+  simp only [evalLayoutOf]
+  cases computeLayoutV06 env.layoutsV06 ty with
+  | none => simp
+  | some l' => simp
+
+/-- Exact bidirectional characterization of `evalLayoutOf` in the V2026_08_01 dialect
+(A4): the answer is `l` iff the environment carries a V2026_08_01 table whose bridged
+layout of `ty` is `l` (a missing table is `.unsupported`, never `.ok`). -/
+theorem evalLayoutOf_v08_ok_iff (env : CompilerQueryEnv) (ty : Ty) (l : TypeLayout) :
+    evalLayoutOf env .v2026_08_01 ty = .ok (.layout l) ↔
+      ∃ tbl, env.v08Layouts? = some tbl ∧ computeLayoutV08Bridged tbl ty = some l := by
+  simp only [evalLayoutOf]
+  cases env.v08Layouts? with
+  | none => simp
+  | some tbl =>
+    simp only [Option.some.injEq, exists_eq_left']
+    cases computeLayoutV08Bridged tbl ty with
+    | none => simp
+    | some l' => simp
 
 /-- **Universal cross-dialect `evalLayoutOf` agreement**: whenever `env.v08Layouts?`
 holds a V2026_08_01 table whose bridge equals `env.layoutsV06`, `evalLayoutOf`
@@ -6428,6 +6459,15 @@ end ShadowingDemo
  Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_dyn_generic_supertrait_chain
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalLayoutOf_v06_ok_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalLayoutOf_v06_ok_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalLayoutOf_v08_ok_iff' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalLayoutOf_v08_ok_iff
 
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 

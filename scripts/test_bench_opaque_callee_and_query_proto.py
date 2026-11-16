@@ -180,6 +180,64 @@ class AuditScannerTest(unittest.TestCase):
         self.assertEqual(f[0]["classes"], ["CustomHandler", "BEq", "DecidableEq"])
         self.assertEqual(f[1]["targets"], ["Foo"])
 
+    def test_deriving_noncomputable_instance_command(self) -> None:
+        # Lean 4.34.1 `Lean/Parser/Command.lean:307`: `"deriving " >> optional
+        # "noncomputable " >> "instance " >> derivingClasses >> " for " >> ...`
+        # (elaborates: `deriving noncomputable instance BEq, DecidableEq for B`).
+        text = (
+            "deriving noncomputable instance BEq, DecidableEq for Foo, Bar\n"
+            "deriving noncomputable instance BEq for Baz\n"
+            "deriving noncomputable instance DecidableEq for Baz\n"
+        )
+        f = self.audit(text)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["line"], 1)
+        self.assertEqual(f[0]["kind"], "deriving_instance")
+        self.assertEqual(f[0]["classes"], ["BEq", "DecidableEq"])
+        self.assertEqual(f[0]["targets"], ["Foo", "Bar"])
+
+    def test_expose_attribute_on_deriving_classes(self) -> None:
+        # Lean 4.34.1 `Lean/Parser/Command.lean:208-209`: `derivingClass :=
+        # optional ("@[" >> nonReservedSymbol "expose" >> "]") >> withForbidden "for" termParser`
+        # (all four positive forms below elaborate in Lean 4.34.1).
+        text = (
+            "inductive A where | a\n"
+            "  deriving @[expose] BEq, DecidableEq\n"
+            "inductive B where | b\n"
+            "  deriving Repr, @[expose] DecidableEq, @[expose] BEq\n"
+            "deriving instance @[expose] BEq, @[expose] DecidableEq for C\n"
+            "deriving noncomputable instance @[expose] DecidableEq, BEq for D\n"
+            "inductive E where | e\n"
+            "  deriving @[expose] BEq\n"
+            "@[expose] def notAClass : Nat := 1\n"
+            "inductive F where | f\n"
+            "  deriving @[expose] DecidableEq\n"
+        )
+        f = self.audit(text)
+        self.assertEqual([x["line"] for x in f], [2, 4, 5, 6])
+        self.assertEqual(f[0]["classes"], ["BEq", "DecidableEq"])
+        self.assertEqual(f[1]["classes"], ["Repr", "DecidableEq", "BEq"])
+        self.assertEqual([f[2]["targets"], f[3]["targets"]], [["C"], ["D"]])
+        self.assertEqual([f[2]["kind"], f[3]["kind"]], ["deriving_instance", "deriving_instance"])
+
+    def test_bracketed_class_term_arguments(self) -> None:
+        # Each class is a term: skip balanced `[…]` / `{…}` / `⟨…⟩` arguments too,
+        # while a following command's brackets (`omit [DecidableEq α] in`) never
+        # contribute classes.
+        text = (
+            "def M := ReaderT Nat Id\n"
+            "  deriving MonadReader Nat, Handler [o1, o2] ⟨a, b⟩ {c}, BEq, DecidableEq\n"
+            "structure S where\n"
+            "  x : Nat\n"
+            "  deriving BEq\n"
+            "omit [DecidableEq α] in\n"
+            "theorem t : True := trivial\n"
+        )
+        f = self.audit(text)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["line"], 2)
+        self.assertEqual(f[0]["classes"], ["MonadReader", "Handler", "BEq", "DecidableEq"])
+
     def test_guillemet_identifier(self) -> None:
         text = 'def «deriving BEq, DecidableEq» := 1\ndef «a -- b» := 2\ninductive A where | a\n  deriving DecidableEq\n'
         self.assertEqual(self.audit(text), [])
@@ -353,6 +411,16 @@ class RepoConsistencyTest(unittest.TestCase):
         ident_set = {v for k, v, _ in toks if k == "ident"}
         for e in proto_enums:
             self.assertIn(f"instDecidableEq{e}Proto", ident_set, e)
+
+    def test_a4_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in ("evalLayoutOf_v06_ok_iff", "evalLayoutOf_v08_ok_iff"):
+            self.assertIn(name, ident_toks, f"missing A4 theorem: {name}")
+            self.assertIn(f"#print axioms {name}\n", text, f"missing A4 axiom pin: {name}")
+        # the `run_meta` opacity witness covers every sealed table operation
+        for head in ("lookupRaw", "lookup", "traitImpls", "toList"):
+            self.assertIn(f"``OpaqueCalleeTable.{head})", text, f"opacity witness misses {head}")
 
     def test_b4_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")

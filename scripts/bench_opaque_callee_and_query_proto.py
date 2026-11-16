@@ -43,8 +43,10 @@ Lean invocations are wrapped as
 Repository audit (`--repo-audit`): `audit_redundant_beq_decidable_eq` is a
 comment-, nested-block-comment-, string-, raw-string-, char-, and
 guillemet-aware Lean 4 scanner that reports every `deriving` clause and
-`deriving instance` command whose class list combines `BEq` with `DecidableEq`
-(the `instBEqOfDecidableEq` / `LawfulBEq` shadowing hazard of cl/1022563952).
+`deriving [noncomputable] instance` command whose class list (Lean 4.34.1
+`derivingClass` terms, optionally prefixed by `@[expose]`) combines `BEq` with
+`DecidableEq` (the `instBEqOfDecidableEq` / `LawfulBEq` shadowing hazard of
+cl/1022563952).
 """
 
 from __future__ import annotations
@@ -720,9 +722,28 @@ def parse_deriving_instance_targets(toks: list[tuple[str, str, int]], j: int) ->
     return targets, j
 
 
+_BRACKETS = {"(": ")", "[": "]", "{": "}", "⟨": "⟩", "⦃": "⦄"}
+_CLOSING_BRACKETS = frozenset(_BRACKETS.values())
+
+
+def _skip_expose_attr(toks: list[tuple[str, str, int]], j: int) -> int:
+    """Skip the optional `@[expose]` prefix of a Lean 4.34.1 `derivingClass`
+    (`Lean/Parser/Command.lean:208-209`: `optional ("@[" >> nonReservedSymbol
+    "expose" >> "]") >> withForbidden "for" termParser`)."""
+    if (j + 3 < len(toks) and toks[j][:2] == ("punct", "@") and toks[j + 1][:2] == ("punct", "[")
+            and toks[j + 2][:2] == ("ident", "expose") and toks[j + 3][:2] == ("punct", "]")):
+        return j + 4
+    return j
+
+
 def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> list[dict[str, Any]]:
-    """Every `deriving` clause / `deriving instance` command in `text` whose class
-    list contains both `BEq` and `DecidableEq`."""
+    """Every `deriving` clause / `deriving [noncomputable] instance` command in
+    `text` whose class list contains both `BEq` and `DecidableEq`.
+
+    Follows the Lean 4.34.1 grammar (`Lean/Parser/Command.lean`): a class list is
+    `sepBy1 derivingClass ", "` where each `derivingClass` is an optional
+    `@[expose]` followed by a term (`for` forbidden at top level), and the command
+    form is `deriving [noncomputable] instance <classes> for <terms>` (line 307)."""
     toks = tokenize_lean(text)
     findings: list[dict[str, Any]] = []
     i, n = 0, len(toks)
@@ -730,28 +751,32 @@ def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> li
         kind, val, line = toks[i]
         if kind == "ident" and val == "deriving":
             j = i + 1
-            is_instance = j < n and toks[j] == ("ident", "instance", toks[j][2])
-            if is_instance:
-                j += 1
+            is_instance = False
+            if j < n and toks[j][:2] == ("ident", "instance"):
+                is_instance, j = True, j + 1
+            elif j + 1 < n and toks[j][:2] == ("ident", "noncomputable") and toks[j + 1][:2] == ("ident", "instance"):
+                is_instance, j = True, j + 2
             classes: list[str] = []
             while j < n:
+                j = _skip_expose_attr(toks, j)
                 paren_depth = 0
                 while j < n and toks[j] == ("punct", "(", toks[j][2]):
                     paren_depth += 1
                     j += 1
-                if j >= n or toks[j][0] != "ident" or toks[j][1] in ("for", "deriving"):
+                if j >= n or toks[j][0] != "ident" or toks[j][1] in _COMMAND_STOP_WORDS or toks[j][1] == "for":
                     break
                 classes.append(toks[j][1])
                 j += 1
-                # skip class arguments (parenthesized `(bar)` or bare identifiers `bar`)
+                # skip the class term's arguments: balanced bracket groups `(…)`,
+                # `[…]`, `{…}`, `⟨…⟩`, `⦃…⦄` and bare identifiers (`MonadReader Nat`)
                 while j < n:
-                    if toks[j] == ("punct", "(", toks[j][2]):
+                    if toks[j][0] == "punct" and toks[j][1] in _BRACKETS:
                         arg_depth = 1
                         j += 1
                         while j < n and arg_depth > 0:
-                            if toks[j] == ("punct", "(", toks[j][2]):
+                            if toks[j][0] == "punct" and toks[j][1] in _BRACKETS:
                                 arg_depth += 1
-                            elif toks[j] == ("punct", ")", toks[j][2]):
+                            elif toks[j][0] == "punct" and toks[j][1] in _CLOSING_BRACKETS:
                                 arg_depth -= 1
                             j += 1
                     elif toks[j][0] == "ident" and toks[j][1] not in _COMMAND_STOP_WORDS and toks[j][1] != "for":
