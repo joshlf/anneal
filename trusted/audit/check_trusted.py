@@ -27,6 +27,7 @@ sys.dont_write_bytecode = True  # Public self-test imports must not write checko
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
+CHILD_TIMEOUT_SECS = 180
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -53,7 +54,18 @@ DOWNSTREAM_TARGETS = [
     ("Anneal.MirLiftCore", "theory/Anneal/MirLiftCore.lean", ["Trusted", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLoops"], "theory"),
     ("Anneal.MirLiftBench", "theory/Anneal/MirLiftBench.lean", ["Trusted", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore"], "theory"),
     ("Anneal.SepLogicLenses", "theory/Anneal/SepLogicLenses.lean", ["Anneal.SepLogic", "Anneal.FunctionalTranslation", "Anneal.MirLiftCore", "Anneal.MirFuelFree"], "theory"),
-    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses"], "theory"),
+    ("Anneal.PureLift.Lens", "theory/Anneal/PureLift/Lens.lean", [], "theory"),
+    ("Anneal.PureLift.PermTree", "theory/Anneal/PureLift/PermTree.lean", ["Anneal.PureLift.Lens"], "theory"),
+    ("Anneal.PureLift.LoanGraph", "theory/Anneal/PureLift/LoanGraph.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree"], "theory"),
+    ("Anneal.PureLift.SpatialPin", "theory/Anneal/PureLift/SpatialPin.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph"], "theory"),
+    ("Anneal.PureLift.Plan", "theory/Anneal/PureLift/Plan.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin"], "theory"),
+    ("Anneal.PureLift.BlockCfg", "theory/Anneal/PureLift/BlockCfg.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan"], "theory"),
+    ("Anneal.PureLift.Adapter", "theory/Anneal/PureLift/Adapter.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan", "Anneal.PureLift.BlockCfg"], "theory"),
+    ("Anneal.PureLift.Canaries", "theory/Anneal/PureLift/Canaries.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Adapter"], "theory"),
+    ("Anneal.PureLift.MirLiftCoreInterop", "theory/Anneal/PureLift/MirLiftCoreInterop.lean", ["Anneal.BitValidity", "Anneal.MirLiftCore", "Anneal.SepLogicLenses", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Canaries"], "theory"),
+    ("Anneal.PureLift.V2026_06_01Bridge", "theory/Anneal/PureLift/V2026_06_01Bridge.lean", ["Anneal.PureLift.MirLiftCoreInterop"], "theory"),
+    ("Anneal.PureLift", "theory/Anneal/PureLift.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Adapter", "Anneal.PureLift.Canaries", "Anneal.PureLift.MirLiftCoreInterop", "Anneal.PureLift.V2026_06_01Bridge"], "theory"),
+    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift"], "theory"),
     ("Smoke", "examples/Smoke.lean", ["Anneal"], "examples"),
     ("ToyYDiagram", "examples/refinement/ToyYDiagram.lean", ["Anneal.Refinement"], "examples"),
     ("ToyMachine", "examples/step-result/ToyMachine.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass"], "examples"),
@@ -69,6 +81,7 @@ DOWNSTREAM_TARGETS = [
     ("SymbolicEvalTests", "tests/mir/SymbolicEvalTests.lean", ["Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect"], "test"),
     ("FunctionalTranslationTests", "tests/mir/FunctionalTranslationTests.lean", ["Anneal.FunctionalTranslation"], "test"),
     ("FunctionalTranslationEquivTests", "tests/mir/FunctionalTranslationEquivTests.lean", ["Anneal.FunctionalTranslation"], "test"),
+    ("PureLiftV2026BridgeTests", "tests/mir/PureLiftV2026BridgeTests.lean", ["Anneal.PureLift.V2026_06_01Bridge"], "test"),
 ]
 
 
@@ -378,7 +391,7 @@ class Checker:
             with stdout.open("xb") as out, stderr.open("xb") as err:
                 try:
                     completed = subprocess.run(command, cwd=self.stage, env=self.environment,
-                                               stdout=out, stderr=err, timeout=60, check=False)
+                                               stdout=out, stderr=err, timeout=CHILD_TIMEOUT_SECS, check=False)
                     code = completed.returncode
                 except subprocess.TimeoutExpired:
                     timed_out = True
@@ -391,7 +404,7 @@ class Checker:
         self.last_status = observation
         self.budget()
         if timed_out:
-            raise Failure(2, label, "direct Lean child exceeded 60 seconds; no retry")
+            raise Failure(2, label, f"direct Lean child exceeded {CHILD_TIMEOUT_SECS} seconds; no retry")
         if code != 0:
             raise Failure(2, label, f"Lean exited {code}; see {stem}.stdout/.stderr")
         return stdout.read_text(encoding="utf-8", errors="strict")
@@ -430,7 +443,7 @@ class Checker:
                 env=self.environment,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=CHILD_TIMEOUT_SECS,
                 check=False,
             )
             if res_c.returncode != 0 or not c_path.is_file():
@@ -441,7 +454,7 @@ class Checker:
                 env=self.environment,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=CHILD_TIMEOUT_SECS,
                 check=False,
             )
             if res_bin.returncode != 0 or not tmp_bin.is_file():

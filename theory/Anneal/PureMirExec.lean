@@ -2606,6 +2606,165 @@ theorem rootActiveMemory_trustedInitWithMemoryAndCallees
   | nil => exact h_root
   | cons _ _ => exact h_root
 
+section ConstructiveVerificationResult
+
+open Trusted.ITree
+open Anneal.EffectWP
+open Anneal.ITreeWP
+open Anneal.Rustc.V2026_06_01.Lower
+
+/--
+Constructive all-prefix fault-freedom (`¬ FaultNow`) from `wpCoalBounded` over
+`stepMirState body` (avoiding `Classical.choice` from `DWLP` coinduction).
+-/
+theorem not_faultNow_of_wpCoalBounded
+    (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpCoalBounded fuel mirDefaultWP (stepMirState body) (fun out _ => post out) st PUnit.unit →
+      ¬ FaultNow (ITree.cofix (stepMirState body) st)
+  | 0, _, h_wp => False.elim h_wp
+  | fuel' + 1, st, h_wp => by
+    unfold wpCoalBounded at h_wp
+    rintro ⟨t', i, k, h_tau, h_vis, h_fault⟩
+    cases h_tau with
+    | refl =>
+      rw [ITree.observe_cofix] at h_vis
+      cases h_step : stepMirState body st with
+      | ret out =>
+        rw [h_step] at h_vis
+        nomatch h_vis
+      | tau st' =>
+        rw [h_step] at h_vis
+        nomatch h_vis
+      | vis i₀ k₀ =>
+        rw [h_step] at h_wp h_vis
+        dsimp [ITreeF.map] at h_vis
+        injection h_vis with h_i _
+        subst h_i
+        cases i₀ with
+        | inl fk =>
+          cases fk <;> exact h_wp
+        | inr i₂ =>
+          cases i₂ with
+          | inl _ => exact h_fault
+          | inr _ => exact h_fault
+    | @step _ t₁ _ h_obs h_tau' =>
+      rw [ITree.observe_cofix] at h_obs
+      cases h_step : stepMirState body st with
+      | ret out =>
+        rw [h_step] at h_obs
+        nomatch h_obs
+      | tau st' =>
+        rw [h_step] at h_wp h_obs
+        dsimp [ITreeF.map] at h_obs
+        injection h_obs with h_t₁
+        subst h_t₁
+        exact not_faultNow_of_wpCoalBounded body post fuel' st' h_wp ⟨t', i, k, h_tau', h_vis, h_fault⟩
+      | vis _ _ =>
+        rw [h_step] at h_obs
+        nomatch h_obs
+
+/--
+Constructive preservation of `wpCoalBounded` along finite labeled `Reaches`
+transitions on `ITree.cofix (stepMirState body) st`.
+-/
+theorem reaches_wpCoalBounded
+    (body : CapturedMir) (post : MirOutcome → Prop)
+    {t u : ITree MirEffect MirOutcome} {tr : List (Event MirEffect)}
+    (h_reach : Reaches t tr u) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      t = ITree.cofix (stepMirState body) st →
+      wpCoalBounded fuel mirDefaultWP (stepMirState body) (fun out _ => post out) st PUnit.unit →
+      ∃ (fuel' : Nat) (st' : MirExecState),
+        u = ITree.cofix (stepMirState body) st' ∧
+        wpCoalBounded fuel' mirDefaultWP (stepMirState body) (fun out _ => post out) st' PUnit.unit := by
+  induction h_reach with
+  | refl t₀ =>
+    intro fuel st h_eq h_wp
+    exact ⟨fuel, st, h_eq, h_wp⟩
+  | @tau t₀ t₁ u₀ tr₀ h_obs _ ih =>
+    intro fuel st h_eq h_wp
+    cases fuel with
+    | zero => exact False.elim h_wp
+    | succ fuel' =>
+      subst h_eq
+      rw [ITree.observe_cofix] at h_obs
+      unfold wpCoalBounded at h_wp
+      cases h_step : stepMirState body st with
+      | ret _ => rw [h_step] at h_obs; nomatch h_obs
+      | tau st' =>
+        rw [h_step] at h_obs h_wp
+        dsimp [ITreeF.map] at h_obs
+        injection h_obs with h_t₁
+        exact ih fuel' st' h_t₁.symm h_wp
+      | vis _ _ => rw [h_step] at h_obs; nomatch h_obs
+  | @vis t₀ u₀ i k tr₀ h_obs _ o _ ih =>
+    intro fuel st h_eq h_wp
+    cases fuel with
+    | zero => exact False.elim h_wp
+    | succ fuel' =>
+      subst h_eq
+      rw [ITree.observe_cofix] at h_obs
+      unfold wpCoalBounded at h_wp
+      cases h_step : stepMirState body st with
+      | ret _ => rw [h_step] at h_obs; nomatch h_obs
+      | tau _ => rw [h_step] at h_obs; nomatch h_obs
+      | vis i₀ k₀ =>
+        rw [h_step] at h_obs h_wp
+        dsimp [ITreeF.map] at h_obs
+        injection h_obs with h_i h_k
+        subst h_i
+        have h_ko : k o = ITree.cofix (stepMirState body) (k₀ o) := by
+          have := congrFun (eq_of_heq h_k) o
+          exact this.symm
+        cases i₀ with
+        | inl fk =>
+          cases fk <;> exact False.elim h_wp
+        | inr i₂ =>
+          cases i₂ with
+          | inl obs =>
+            cases obs
+            exact ih fuel' (k₀ o) h_ko h_wp
+          | inr req =>
+            cases req
+            exact ih fuel' (k₀ o) h_ko (h_wp o)
+
+/--
+Constructive adequacy of `MirWpConverges` (`⊆ {propext, Quot.sound}`):
+establishes `TreeSafe (mirTree body s)` and `ReachesRet (mirTree body s) tr out → post out`
+by structural induction on `Reaches` and `TauStar` without `DWLP` coinduction.
+-/
+theorem treeSafe_and_ret_of_mirWpConverges
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : MirWpConverges body s post) :
+    TreeSafe (mirTree body s) ∧
+      ∀ tr out, ReachesRet (mirTree body s) tr out → post out := by
+  rcases h with ⟨fuel, h_sym⟩
+  have h_wp : wpCoalBounded fuel mirDefaultWP (stepMirState body) (fun out _ => post out) (.running s) PUnit.unit := by
+    rwa [← wpMirExecSym_eq_wpCoalBounded]
+  refine ⟨?_, ?_⟩
+  · intro tr u h_reach
+    obtain ⟨f', st', rfl, h_wp'⟩ := reaches_wpCoalBounded body post h_reach fuel (.running s) rfl h_wp
+    exact not_faultNow_of_wpCoalBounded body post f' st' h_wp'
+  · rintro tr out ⟨u, h_reach, h_ret⟩
+    obtain ⟨f', st', rfl, h_wp'⟩ := reaches_wpCoalBounded body post h_reach fuel (.running s) rfl h_wp
+    cases f' with
+    | zero => exact False.elim h_wp'
+    | succ f'' =>
+      unfold wpCoalBounded at h_wp'
+      rw [ITree.observe_cofix] at h_ret
+      cases h_step : stepMirState body st' with
+      | ret out' =>
+        rw [h_step] at h_ret h_wp'
+        dsimp [ITreeF.map] at h_ret
+        injection h_ret with h_out
+        subst h_out
+        exact h_wp'
+      | tau _ => rw [h_step] at h_ret; nomatch h_ret
+      | vis _ _ => rw [h_step] at h_ret; nomatch h_ret
+
+end ConstructiveVerificationResult
+
 /--
 Discharge a stateless `VerificationResult c` from panic-forbidding pure
 execution (`PureMirConverges`).
@@ -2618,14 +2777,14 @@ theorem verifyMirNoPanic_of_pureExec
         c.pre args →
         PureMirConverges c.body (initPureState c.body args) (c.post args)) :
     VerificationResult c := by
-  refine verifyMirNoPanic_of_wpConverges c (fun args h_pre => ?_)
-  exact MirWpConverges.mono
-    (fun out h_out => by
-      cases out with
-      | normal rv => exact h_out.2
-      | panic => exact False.elim h_out
-      | abort => exact False.elim h_out)
-    (mirWpConverges_of_pureExec_withCallees h_pure (h_wp args h_pre))
+  refine ⟨fun args h_pre => ?_⟩
+  have ⟨h_safe, h_ret⟩ :=
+    treeSafe_and_ret_of_mirWpConverges
+      (mirWpConverges_of_pureExec_withCallees (callees := c.callees) h_pure (h_wp args h_pre))
+  exact ⟨h_safe, fun outPair h_r _ retVal mem' h_out => by
+    have h_post := h_ret outPair.1 outPair.2 h_r
+    rw [h_out] at h_post
+    exact h_post.2⟩
 
 /--
 Discharge a stateless `VerificationResult c` from partial-correctness pure
@@ -2639,19 +2798,17 @@ theorem verifyMirSafe_of_pureExec
         c.pre args →
         PureMirSafeConverges c.body (initPureState c.body args) (c.post args)) :
     VerificationResult c := by
-  refine verifyMirSafe_of_wpConverges c (fun args h_pre => ?_)
+  refine ⟨fun args h_pre => ?_⟩
   have h := mirSafeWpConverges_of_pureExec
     (mem₀ := (initMachineStateWithCallees c.body args c.callees).memory)
     h_pure (h_wp args h_pre)
     (rootActiveMemory_initMachineStateWithCallees c.body args c.callees)
   rw [← initMachineStateWithCallees_eq_withMemory] at h
-  exact MirWpConverges.mono
-    (fun out h_out => by
-      cases out with
-      | normal rv => exact h_out.2
-      | panic => trivial
-      | abort => trivial)
-    h
+  have ⟨h_safe, h_ret⟩ := treeSafe_and_ret_of_mirWpConverges h
+  exact ⟨h_safe, fun outPair h_r _ retVal mem' h_out => by
+    have h_post := h_ret outPair.1 outPair.2 h_r
+    rw [h_out] at h_post
+    exact h_post.2⟩
 
 /-- Primary alias for stateless pure verification (`verifyMirNoPanic_of_pureExec`). -/
 abbrev verifyMir_of_pureExec := @verifyMirNoPanic_of_pureExec
@@ -2674,21 +2831,19 @@ theorem verifyStatefulMirNoPanic_of_pureExec
               (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
                 c.body args mem c.callees).memory)) :
     StatefulVerificationResult c := by
-  refine verifyStatefulMirNoPanic_of_wpConverges c (fun args mem h_pre => ?_)
-  exact MirWpConverges.mono
-    (fun out h_out => by
-      cases out with
-      | normal rv =>
-        rcases rv with ⟨retVal, mem'⟩
-        rcases h_out with ⟨rfl, h_post⟩
-        exact h_post
-      | panic => exact False.elim h_out
-      | abort => exact False.elim h_out)
-    (mirWpConverges_of_pureExec
-      (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
-          c.body args mem c.callees).memory)
-      h_pure (h_wp args mem h_pre)
-      (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
+  refine ⟨fun args mem h_pre => ?_⟩
+  have ⟨h_safe, h_ret⟩ :=
+    treeSafe_and_ret_of_mirWpConverges
+      (mirWpConverges_of_pureExec
+        (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees).memory)
+        h_pure (h_wp args mem h_pre)
+        (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
+  exact ⟨h_safe, fun outPair h_r _ retVal mem' h_out => by
+    have h_post := h_ret outPair.1 outPair.2 h_r
+    rw [h_out] at h_post
+    rcases h_post with ⟨rfl, hp⟩
+    exact hp⟩
 
 /--
 Discharge a stateful `StatefulVerificationResult c` from partial-correctness
@@ -2707,21 +2862,19 @@ theorem verifyStatefulMirSafe_of_pureExec
               (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
                 c.body args mem c.callees).memory)) :
     StatefulVerificationResult c := by
-  refine verifyStatefulMirSafe_of_wpConverges c (fun args mem h_pre => ?_)
-  exact MirWpConverges.mono
-    (fun out h_out => by
-      cases out with
-      | normal rv =>
-        rcases rv with ⟨retVal, mem'⟩
-        rcases h_out with ⟨rfl, h_post⟩
-        exact h_post
-      | panic => trivial
-      | abort => trivial)
-    (mirSafeWpConverges_of_pureExec
-      (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
-          c.body args mem c.callees).memory)
-      h_pure (h_wp args mem h_pre)
-      (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
+  refine ⟨fun args mem h_pre => ?_⟩
+  have ⟨h_safe, h_ret⟩ :=
+    treeSafe_and_ret_of_mirWpConverges
+      (mirSafeWpConverges_of_pureExec
+        (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees).memory)
+        h_pure (h_wp args mem h_pre)
+        (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
+  exact ⟨h_safe, fun outPair h_r _ retVal mem' h_out => by
+    have h_post := h_ret outPair.1 outPair.2 h_r
+    rw [h_out] at h_post
+    rcases h_post with ⟨rfl, hp⟩
+    exact hp⟩
 
 /-- Primary alias for stateful pure verification (`verifyStatefulMirNoPanic_of_pureExec`). -/
 abbrev verifyStatefulMir_of_pureExec := @verifyStatefulMirNoPanic_of_pureExec

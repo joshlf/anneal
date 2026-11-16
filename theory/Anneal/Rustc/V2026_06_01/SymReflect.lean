@@ -5293,7 +5293,9 @@ theorem checkSymReturnsFalseExt_sound :
       exact symIsReturnFalse_sound fuel body args st hCheck hHold
 
 /-- Match a dereference load statement `.assign ⟨dstLoc, .nil⟩ (.use (.copy ⟨ptrLoc, [.deref]⟩))`
-where `ptrLoc` borrows `.symArg idx` at unsigned integer type `uKind`. -/
+where `ptrLoc` borrows `.symArg idx` at unsigned integer type `uKind`. Loads at any other
+pointee type (signed integers, `bool`, wide pointers) do not match, so closure-captured
+companions over such parameters are outside the automatic pin/bound discharge. -/
 def symMatchDerefSymArgLoad
     (body : CapturedMir)
     (st : SymState)
@@ -5573,6 +5575,163 @@ def symStepDerefLoadSlice
               borrows := borrows₂
             }
           | _, _, _ => .none
+
+theorem nat_beq_uintBytesOfKind_zero (uKind : UintTy) :
+    Nat.beq (uintBytesOfKind uKind) 0 = false := by
+  cases uKind <;> rfl
+
+/-- Step a dereference load statement `.assign ⟨dstLoc, .nil⟩ (.use (.copy ⟨ptrLoc, [.deref]⟩))`
+where `ptrLoc` borrows `.symArg expectedIdx` at unsigned integer type `uKind` of width `expectedSz`
+by propagating `.symArg expectedIdx` into `dstLoc`. -/
+def symStepDerefSymArg
+    (body : CapturedMir)
+    (st : SymState)
+    (expectedIdx expectedSz : Nat) :
+    Option SymState :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .none => .none
+      | .some stmt =>
+        match symMatchDerefSymArgLoad body st stmt with
+        | .none => .none
+        | .some (idx, uKind, dstLoc, borrows₂) =>
+          match
+            Nat.beq idx expectedIdx,
+            Nat.beq (uintBytesOfKind uKind) expectedSz,
+            set? st.slots dstLoc (.symArg expectedIdx)
+          with
+          | true, true, .some slots₂ =>
+            .some {
+              st with
+              stmtIdx := Nat.add st.stmtIdx 1
+              slots := slots₂
+              borrows := borrows₂
+            }
+          | _, _, _ => .none
+
+/-- Unguarded witness-discovery counterpart of `symStepDerefSymArg` used by
+`collectSymPinsLoop` and `extractMirUpperBound1Loop`. -/
+def symStepDerefSymArgAny
+    (body : CapturedMir)
+    (st : SymState) :
+    Option SymState :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .none => .none
+      | .some stmt =>
+        match symMatchDerefSymArgLoad body st stmt with
+        | .none => .none
+        | .some (idx, _uKind, dstLoc, borrows₂) =>
+          match set? st.slots dstLoc (.symArg idx) with
+          | .some slots₂ =>
+            .some {
+              st with
+              stmtIdx := Nat.add st.stmtIdx 1
+              slots := slots₂
+              borrows := borrows₂
+            }
+          | .none => .none
+
+theorem symStepDerefSymArg_stepMirFn_eq
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (expectedIdx expectedSz b : Nat)
+    (hArg : get? args expectedIdx = .some (.scalar { bits := b, sizeBytes := expectedSz }))
+    (h : symStepDerefSymArg body st expectedIdx expectedSz = .some st') :
+    stepMirFn body (concretizeSymState body args st) =
+      MirStepNode.step (concretizeSymState body args st') := by
+  dsimp only [symStepDerefSymArg] at h
+  cases hPhase : body.phase with
+  | other _ => rw [hPhase] at h; nomatch h
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at h
+    dsimp only at h
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none => rw [hBb] at h; nomatch h
+    | some bb =>
+      rw [hBb] at h
+      dsimp only at h
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | none => rw [hStmt] at h; nomatch h
+      | some stmt =>
+        rw [hStmt] at h
+        dsimp only at h
+        cases hMatch : symMatchDerefSymArgLoad body st stmt with
+        | none => rw [hMatch] at h; nomatch h
+        | some tup =>
+          rw [hMatch] at h
+          rcases tup with ⟨idx, uKind, dstLoc, borrows₂⟩
+          dsimp only at h
+          cases hIdx : Nat.beq idx expectedIdx with
+          | false => rw [hIdx] at h; nomatch h
+          | true =>
+            rw [hIdx] at h
+            cases hKindSz : Nat.beq (uintBytesOfKind uKind) expectedSz with
+            | false => rw [hKindSz] at h; nomatch h
+            | true =>
+              rw [hKindSz] at h
+              cases hSet : set? st.slots dstLoc (.symArg expectedIdx) with
+              | none => rw [hSet] at h; nomatch h
+              | some slots₂ =>
+                rw [hSet] at h
+                injection h with hSt'
+                subst hSt'
+                rw [stepMirFn_concretize_stmt body args st bb stmt hNotOther hBb hStmt]
+                have hEv := symMatchDerefSymArgLoad_evalStmt body args st stmt idx uKind dstLoc borrows₂ hMatch
+                have hIdxEq : idx = expectedIdx := Nat.eq_of_beq_eq_true hIdx
+                have hSzEq : uintBytesOfKind uKind = expectedSz := Nat.eq_of_beq_eq_true hKindSz
+                rw [hIdxEq, hArg] at hEv
+                dsimp only at hEv
+                have hSz0 : Nat.beq expectedSz 0 = false := by
+                  rw [← hSzEq]
+                  exact nat_beq_uintBytesOfKind_zero uKind
+                have hSlice := extractValueScalarSlice0?_scalar_self { bits := b, sizeBytes := expectedSz } hSz0
+                dsimp only at hSlice
+                rw [hSzEq, hSlice] at hEv
+                dsimp only at hEv
+                let sc : ScalarInt := { bits := b, sizeBytes := expectedSz }
+                have ⟨_, hSlots2Eq, hSetConc⟩ :=
+                  set?_eq_some_set_of_set?_some (.concrete (.init (.scalar sc))) hSet
+                rw [hSetConc] at hEv
+                dsimp only at hEv
+                rw [hEv]
+                have hConcEq :
+                    concretizeSymSlots args (st.slots.set dstLoc (.concrete (.init (.scalar sc)))) =
+                      concretizeSymSlots args slots₂ := by
+                  rw [hSlots2Eq,
+                      ← concretizeSymSlots_set args (.concrete (.init (.scalar sc))) st.slots dstLoc,
+                      ← concretizeSymSlots_set args (.symArg expectedIdx) st.slots dstLoc]
+                  dsimp only [concretizeSymSlot]
+                  rw [hArg]
+                dsimp only [concretizeSymState, concretizeSymMemory]
+                rw [hConcEq]
+
+theorem symStepDerefSymArg_hold_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (expectedIdx expectedSz b : Nat)
+    (hArg : get? args expectedIdx = .some (.scalar { bits := b, sizeBytes := expectedSz }))
+    (h : symStepDerefSymArg body st expectedIdx expectedSz = .some st')
+    (hHold : evalMirBoolHoldBounded (.succ fuel) body (concretizeSymState body args st)) :
+    evalMirBoolHoldBounded fuel body (concretizeSymState body args st') := by
+  change stepResultHoldBounded fuel body (stepMirFn body (concretizeSymState body args st)) at hHold
+  rw [symStepDerefSymArg_stepMirFn_eq body args st st' expectedIdx expectedSz b hArg h] at hHold
+  exact hHold
 
 def symExtractDerefSlicePinEq
     (body : CapturedMir)
@@ -6490,12 +6649,18 @@ def collectSymPinsLoop :
         | true => (idx, sc) :: collectSymPinsLoop fuel body stTrue
         | false => .nil
       | .none =>
-        match fuel, symExtractDerefSlicePinEq body st with
-        | .succ fuel', .some (idx, sc, stTrue, stFalse) =>
-          match checkSymReturnsFalseExt fuel' body stFalse with
-          | true => (idx, sc) :: collectSymPinsLoop fuel' body stTrue
-          | false => .nil
-        | _, _ => .nil
+        match symExtractDerefSlicePinEq body st with
+        | .some (idx, sc, stTrue, stFalse) =>
+          match fuel with
+          | .zero => .nil
+          | .succ fuel' =>
+            match checkSymReturnsFalseExt fuel' body stFalse with
+            | true => (idx, sc) :: collectSymPinsLoop fuel' body stTrue
+            | false => .nil
+        | .none =>
+          match symStepDerefSymArgAny body st with
+          | .some st' => collectSymPinsLoop fuel body st'
+          | .none => .nil
 
 /-- Look up the `ScalarInt` pinned for argument index `idx` in `pins`. -/
 def lookupScalarPin (idx : Nat) : List (Nat × ScalarInt) → Option ScalarInt
@@ -6530,9 +6695,9 @@ def extractOptMirRequiresPins
   | .some reqBody => extractMirRequiresPins fuel reqBody
   | .none => .nil
 
-/-- Closed-term boolean checker verifying that `optReqBody` pins its parameters
-to `expectedScalars`. -/
-def checkOptMirRequiresPinsScalars
+/-- Direct closed-term boolean checker verifying that `optReqBody` directly pins its
+parameters to `expectedScalars`. -/
+def checkOptMirRequiresPinsScalarsDirect
     (fuel : Nat)
     (optReqBody : Option CapturedMir)
     (expectedScalars : List ScalarInt) :
@@ -6541,18 +6706,30 @@ def checkOptMirRequiresPinsScalars
   | .some reqBody => checkMirRequiresPinsScalarsDirect fuel reqBody expectedScalars
   | .none => Nat.beq (length expectedScalars) 0
 
+/-- Closed-term boolean checker verifying that `optReqBody` pins its parameters
+to `expectedScalars` (supporting both direct scalar comparisons and closure-captured
+reference dereferences). -/
+def checkOptMirRequiresPinsScalars
+    (fuel : Nat)
+    (optReqBody : Option CapturedMir)
+    (expectedScalars : List ScalarInt) :
+    Bool :=
+  match optReqBody with
+  | .some reqBody => checkMirRequiresPinsScalars fuel reqBody expectedScalars
+  | .none => Nat.beq (length expectedScalars) 0
+
 theorem args_eq_nil_of_length_zero :
     ∀ (args : List Value), length args = 0 → args = .nil
   | .nil, _ => rfl
   | _ :: _, h => nomatch h
 
-theorem checkOptMirRequiresPinsScalars_sound
+theorem checkOptMirRequiresPinsScalarsDirect_sound
     (fuel : Nat)
     (optReqBody : Option CapturedMir)
     (expectedScalars : List ScalarInt)
     (args : List Value)
     (h_check :
-      checkOptMirRequiresPinsScalars fuel optReqBody expectedScalars = true)
+      checkOptMirRequiresPinsScalarsDirect fuel optReqBody expectedScalars = true)
     (h_len : length args = length expectedScalars)
     (h_req : OptMirBoolPredicateHolds optReqBody args) :
     args = mapScalarValues expectedScalars := by
@@ -6562,13 +6739,539 @@ theorem checkOptMirRequiresPinsScalars_sound
       checkMirRequiresPinsScalarsDirect_sound
         fuel reqBody expectedScalars args h_check h_len h_req
   | none =>
-    dsimp only [checkOptMirRequiresPinsScalars] at h_check
+    dsimp only [checkOptMirRequiresPinsScalarsDirect] at h_check
     have hExp0 : length expectedScalars = 0 := Nat.eq_of_beq_eq_true h_check
     have hArgs0 : length args = 0 := Eq.trans h_len hExp0
     rw [args_eq_nil_of_length_zero args hArgs0]
     cases expectedScalars with
     | nil => rfl
     | cons _ _ => nomatch hExp0
+
+/-- Every argument in `args` is a `Value.scalar` whose `sizeBytes` matches the
+corresponding `ScalarInt` in `expected`. -/
+def ArgsAreScalarsOfWidths : List Value → List ScalarInt → Prop
+  | .nil, .nil => True
+  | v :: vs, sc :: scs =>
+    (∃ b : Nat, v = .scalar { bits := b, sizeBytes := sc.sizeBytes }) ∧
+      ArgsAreScalarsOfWidths vs scs
+  | _, _ => False
+
+theorem eq_scalar_of_extractValueScalarSlice0?
+    {v : Value}
+    {sc : ScalarInt}
+    (hScalar : ∃ b : Nat, v = .scalar { bits := b, sizeBytes := sc.sizeBytes })
+    (hSlice : extractValueScalarSlice0? v sc.sizeBytes = .some sc) :
+    v = .scalar sc := by
+  rcases hScalar with ⟨b, rfl⟩
+  cases sc with
+  | mk sBits sSz =>
+    cases sSz with
+    | zero => nomatch hSlice
+    | succ k =>
+      have hSelf :=
+        extractValueScalarSlice0?_scalar_self
+          { bits := b, sizeBytes := .succ k }
+          rfl
+      dsimp only at hSlice hSelf
+      rw [hSelf] at hSlice
+      injection hSlice with hEq
+      rw [hEq]
+
+theorem args_eq_mapScalarValues_of_slicePins
+    (args : List Value) :
+    ∀ (expected : List ScalarInt)
+      (remArgs : List Value)
+      (idx : Nat),
+      dropValues idx args = remArgs →
+      ArgsAreScalarsOfWidths remArgs expected →
+      AllScalarSlicePinsHold args (zipIdxScalars idx expected) →
+      remArgs = mapScalarValues expected
+  | .nil, .nil, _, _, _, _ => rfl
+  | .nil, _ :: _, _, _, hW, _ => nomatch hW
+  | _ :: _, .nil, _, _, hW, _ => nomatch hW
+  | sc :: restSc, v :: restArgs, idx, hDrop, ⟨hScalar, hRestW⟩, ⟨⟨vPin, hPin, hSlice⟩, hRestPins⟩ => by
+    rw [get?_eq_head_dropValues args idx, hDrop] at hPin
+    injection hPin with hV
+    subst hV
+    have hVEq : v = .scalar sc := eq_scalar_of_extractValueScalarSlice0? hScalar hSlice
+    subst hVEq
+    have hNextDrop := dropValues_succ_of_cons args idx (.scalar sc) restArgs hDrop
+    dsimp only [mapScalarValues]
+    rw [args_eq_mapScalarValues_of_slicePins args restSc restArgs (.succ idx) hNextDrop hRestW hRestPins]
+
+def checkDeclMatchesUintWidth
+    (layouts : LayoutTable)
+    (decl : LocalDecl)
+    (width : Nat) :
+    Bool :=
+  match decl.ty.kind, sigGet? layouts.entries decl.ty.layoutIdx with
+  | .uint uKind, .some layout =>
+    Bool.and
+      (Nat.beq (uintBytesOfKind uKind) width)
+      (Nat.beq layout.size.bytes width)
+  | _, _ => false
+
+theorem scalar_of_valueValidForTy_uintWidth
+    (layouts : LayoutTable)
+    (decl : LocalDecl)
+    (width : Nat)
+    (v : Value)
+    (hDecl : checkDeclMatchesUintWidth layouts decl width = true)
+    (hVal : valueValidForTy layouts decl.ty v) :
+    ∃ b : Nat, v = .scalar { bits := b, sizeBytes := width } := by
+  dsimp only [checkDeclMatchesUintWidth] at hDecl
+  cases decl with
+  | mk mutab ty dbg =>
+    cases ty with
+    | mk kind layoutIdx =>
+      dsimp only at hDecl hVal
+      cases kind with
+      | uint uKind =>
+        cases hL : sigGet? layouts.entries layoutIdx with
+        | none => rw [hL] at hDecl; nomatch hDecl
+        | some layout =>
+          rw [hL] at hDecl
+          rcases Bool.and_eq_true_iff.1 hDecl with ⟨hKindW, _⟩
+          have hW : uintBytesOfKind uKind = width := Nat.eq_of_beq_eq_true hKindW
+          unfold valueValidForTy valueValidForRigidTy at hVal
+          have hCast : intCastTargetBytes (.uint uKind) = .some (uintBytesOfKind uKind) := by
+            cases uKind <;> rfl
+          rw [hCast, hW] at hVal
+          rcases hVal with ⟨bits, _, hEq⟩
+          exact ⟨bits, hEq⟩
+      | _ => nomatch hDecl
+
+theorem scalar_of_valueMatchesTyAndLayout_uintWidth
+    (body : CapturedMir)
+    (decl : LocalDecl)
+    (width : Nat)
+    (v : Value)
+    (mem : Memory)
+    (hDecl : checkDeclMatchesUintWidth body.layouts decl width = true)
+    (hMatch : valueMatchesTyAndLayout defaultSignatureFuel body decl.ty decl.ty.layoutIdx v mem) :
+    ∃ b : Nat, v = .scalar { bits := b, sizeBytes := width } := by
+  dsimp only [checkDeclMatchesUintWidth] at hDecl
+  cases decl with
+  | mk mutab ty dbg =>
+    cases ty with
+    | mk kind layoutIdx =>
+      dsimp only [valueMatchesTyAndLayout, defaultSignatureFuel] at hDecl hMatch
+      cases kind with
+      | uint uKind =>
+        cases hL : sigGet? body.layouts.entries layoutIdx with
+        | none => rw [hL] at hDecl; nomatch hDecl
+        | some layout =>
+          rw [hL] at hDecl hMatch
+          rcases Bool.and_eq_true_iff.1 hDecl with ⟨_, hLayW⟩
+          have hW : layout.size.bytes = width := Nat.eq_of_beq_eq_true hLayW
+          cases v with
+          | unit => exact False.elim hMatch.2.2
+          | ptr _ _ => exact False.elim hMatch.2.2
+          | aggregate _ _ => exact False.elim hMatch.2.2
+          | scalar sv =>
+            have hSz : sv.sizeBytes = width := Eq.trans hMatch.2.2.1 hW
+            cases sv with
+            | mk bits sz =>
+              dsimp only at hSz
+              subst hSz
+              exact ⟨bits, rfl⟩
+      | _ => nomatch hDecl
+
+def checkParamDeclsMatchWidths
+    (layouts : LayoutTable) :
+    List LocalDecl → List ScalarInt → Bool
+  | _, .nil => true
+  | d :: ds, sc :: scs =>
+    Bool.and
+      (checkDeclMatchesUintWidth layouts d sc.sizeBytes)
+      (checkParamDeclsMatchWidths layouts ds scs)
+  | .nil, _ :: _ => false
+
+def checkSubjectParamsMatchWidths
+    (subjectBody : CapturedMir)
+    (expectedScalars : List ScalarInt) :
+    Bool :=
+  match subjectBody.localDecls with
+  | _ :: paramDecls =>
+    checkParamDeclsMatchWidths subjectBody.layouts paramDecls expectedScalars
+  | .nil => Nat.beq (length expectedScalars) 0
+
+/-- Signature typing obligation for `subjectBody`'s parameters: satisfied by
+`argsMatchCalleeParamTys` (`defaultSpec`) or `argsMatchSignature`
+(`defaultTotalSpec` / `defaultModularSpec`). -/
+def ArgsTypedForSubject (subjectBody : CapturedMir) (args : List Value) : Prop :=
+  argsMatchCalleeParamTys subjectBody args ∨
+  (∃ mem, argsMatchSignature (subjectBody.instantiate .nil) args mem) ∨
+  (∃ mem, argsMatchSignature subjectBody args mem)
+
+/-- Conditional parameter typing obligation: `True` when `directOk = true`
+(direct non-closure companions), and `ArgsTypedForSubject subjectBody args`
+when `directOk = false` (closure-captured `V2026_06_01` `anodized` companions). -/
+def OptArgsTypedForSubject
+    (directOk : Bool)
+    (subjectBody : CapturedMir)
+    (args : List Value) : Prop :=
+  match directOk with
+  | true => True
+  | false => ArgsTypedForSubject subjectBody args
+
+theorem argsAreScalarsOfWidths_of_argsValidForParamDecls
+    (layouts : LayoutTable) :
+    ∀ (decls : List LocalDecl)
+      (args : List Value)
+      (expected : List ScalarInt),
+      length args = length expected →
+      checkParamDeclsMatchWidths layouts decls expected = true →
+      argsValidForParamDecls layouts decls args →
+      ArgsAreScalarsOfWidths args expected
+  | _, .nil, .nil, _, _, _ => True.intro
+  | _, .nil, _ :: _, hLen, _, _ => nomatch hLen
+  | _, _ :: _, .nil, hLen, _, _ => nomatch hLen
+  | .nil, _ :: _, _ :: _, _, hCheck, _ => nomatch hCheck
+  | d :: ds, v :: vs, sc :: scs, hLen, hCheck, ⟨hVal, hRestVal⟩ => by
+    dsimp only [checkParamDeclsMatchWidths] at hCheck
+    rcases Bool.and_eq_true_iff.1 hCheck with ⟨hD, hDs⟩
+    dsimp only [length] at hLen
+    injection hLen with hLenRest
+    exact ⟨scalar_of_valueValidForTy_uintWidth layouts d sc.sizeBytes v hD hVal,
+      argsAreScalarsOfWidths_of_argsValidForParamDecls layouts ds vs scs hLenRest hDs hRestVal⟩
+
+theorem argsAreScalarsOfWidths_of_argsMatchSignatureAux
+    (body : CapturedMir)
+    (mem : Memory) :
+    ∀ (decls : List LocalDecl)
+      (args : List Value)
+      (expected : List ScalarInt),
+      length args = length expected →
+      checkParamDeclsMatchWidths body.layouts decls expected = true →
+      argsMatchSignatureAux defaultSignatureFuel body args decls mem →
+      ArgsAreScalarsOfWidths args expected
+  | _, .nil, .nil, _, _, _ => True.intro
+  | _, .nil, _ :: _, hLen, _, _ => nomatch hLen
+  | _, _ :: _, .nil, hLen, _, _ => nomatch hLen
+  | .nil, _ :: _, _ :: _, _, hCheck, _ => nomatch hCheck
+  | d :: ds, v :: vs, sc :: scs, hLen, hCheck, ⟨hVal, hRestVal⟩ => by
+    dsimp only [checkParamDeclsMatchWidths] at hCheck
+    rcases Bool.and_eq_true_iff.1 hCheck with ⟨hD, hDs⟩
+    dsimp only [length] at hLen
+    injection hLen with hLenRest
+    exact ⟨scalar_of_valueMatchesTyAndLayout_uintWidth body d sc.sizeBytes v mem hD hVal,
+      argsAreScalarsOfWidths_of_argsMatchSignatureAux body mem ds vs scs hLenRest hDs hRestVal⟩
+
+theorem argsAreScalarsOfWidths_of_argsTypedForSubject
+    (subjectBody : CapturedMir)
+    (args : List Value)
+    (expected : List ScalarInt)
+    (hLen : length args = length expected)
+    (hCheck : checkSubjectParamsMatchWidths subjectBody expected = true)
+    (hTyped : ArgsTypedForSubject subjectBody args) :
+    ArgsAreScalarsOfWidths args expected := by
+  cases hDecls : subjectBody.localDecls with
+  | nil =>
+    dsimp only [checkSubjectParamsMatchWidths] at hCheck
+    rw [hDecls] at hCheck
+    have hExp0 : length expected = 0 := Nat.eq_of_beq_eq_true hCheck
+    have hArgs0 : length args = 0 := Eq.trans hLen hExp0
+    rw [args_eq_nil_of_length_zero args hArgs0]
+    cases expected with
+    | nil => exact True.intro
+    | cons _ _ => nomatch hExp0
+  | cons retDecl paramDecls =>
+    dsimp only [checkSubjectParamsMatchWidths] at hCheck
+    rw [hDecls] at hCheck
+    rcases hTyped with hCallee | ⟨mem, hSigInst⟩ | ⟨mem, hSig⟩
+    · dsimp only [argsMatchCalleeParamTys] at hCallee
+      rw [hDecls] at hCallee
+      exact argsAreScalarsOfWidths_of_argsValidForParamDecls
+        subjectBody.layouts paramDecls args expected hLen hCheck hCallee
+    · rw [CapturedMir.instantiate_nil] at hSigInst
+      rcases hSigInst with ⟨_, hAux⟩
+      rw [hDecls] at hAux
+      exact argsAreScalarsOfWidths_of_argsMatchSignatureAux
+        subjectBody mem paramDecls args expected hLen hCheck hAux
+    · rcases hSig with ⟨_, hAux⟩
+      rw [hDecls] at hAux
+      exact argsAreScalarsOfWidths_of_argsMatchSignatureAux
+        subjectBody mem paramDecls args expected hLen hCheck hAux
+
+theorem get?_argsAreScalarsOfWidths :
+    ∀ (args : List Value) (expected : List ScalarInt) (idx : Nat) (sc : ScalarInt),
+      ArgsAreScalarsOfWidths args expected →
+      get? expected idx = .some sc →
+      ∃ b0 : Nat, get? args idx = .some (.scalar { bits := b0, sizeBytes := sc.sizeBytes })
+  | .nil, .nil, _, _, _, hGet => nomatch hGet
+  | .nil, _ :: _, _, _, hW, _ => nomatch hW
+  | _ :: _, .nil, _, _, hW, _ => nomatch hW
+  | _ :: _, _ :: _, .zero, sc, ⟨hScalar, _⟩, hGet => by
+    dsimp only [get?] at hGet ⊢
+    injection hGet with hEq
+    subst hEq
+    rcases hScalar with ⟨b0, rfl⟩
+    exact ⟨b0, rfl⟩
+  | _ :: vs, _ :: scs, .succ idx, sc, ⟨_, hRest⟩, hGet =>
+    get?_argsAreScalarsOfWidths vs scs idx sc hRest hGet
+
+def symPeekDerefArgIdx (body : CapturedMir) (st : SymState) : Option Nat :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .none => .none
+      | .some stmt =>
+        match symMatchDerefSymArgLoad body st stmt with
+        | .some (idx, _, _, _) => .some idx
+        | .none => .none
+
+def symStepDerefSymArgWithExpected
+    (body : CapturedMir)
+    (st : SymState)
+    (expected : List ScalarInt) :
+    Option SymState :=
+  match symPeekDerefArgIdx body st with
+  | .some idx =>
+    match get? expected idx with
+    | .some sc => symStepDerefSymArg body st idx sc.sizeBytes
+    | .none => .none
+  | .none => .none
+
+theorem symStepDerefSymArgWithExpected_hold_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (expected : List ScalarInt)
+    (hWidths : ArgsAreScalarsOfWidths args expected)
+    (h : symStepDerefSymArgWithExpected body st expected = .some st')
+    (hHold : evalMirBoolHoldBounded (.succ fuel) body (concretizeSymState body args st)) :
+    evalMirBoolHoldBounded fuel body (concretizeSymState body args st') := by
+  dsimp only [symStepDerefSymArgWithExpected] at h
+  cases hPeek : symPeekDerefArgIdx body st with
+  | none => rw [hPeek] at h; nomatch h
+  | some idx =>
+    rw [hPeek] at h
+    dsimp only at h
+    cases hGetExp : get? expected idx with
+    | none => rw [hGetExp] at h; nomatch h
+    | some sc =>
+      rw [hGetExp] at h
+      rcases get?_argsAreScalarsOfWidths args expected idx sc hWidths hGetExp with ⟨b0, hb0⟩
+      exact symStepDerefSymArg_hold_sound fuel body args st st' idx sc.sizeBytes b0 hb0 h hHold
+
+/-- Extended symbolic pin-checking loop under `ArgsAreScalarsOfWidths args expected`,
+stepping closure-captured thin-pointer dereferences into `.symArg idx` and reusing
+`symExtractPinEq` (handling symmetric `K == x`, `.copy`/`.move`, intermediate local
+moves, and multi-parameter short-circuit `&&` predicates). -/
+def checkSymPinsExtLoop
+    (expected : List ScalarInt) :
+    Nat → CapturedMir → SymState → List (Nat × ScalarInt) → Bool
+  | _, _, _, .nil => true
+  | .zero, _, _, _ :: _ => false
+  | .succ fuel, body, st, p :: ps =>
+    match symStepConcreteExt body st with
+    | .some st' => checkSymPinsExtLoop expected fuel body st' (p :: ps)
+    | .none =>
+      match symExtractPinEq body st with
+      | .some (idx, sc, stTrue, stFalse) =>
+        match checkSymReturnsFalseExt fuel body stFalse with
+        | false => false
+        | true =>
+          match removeScalarPin idx sc (p :: ps) with
+          | .some pins' => checkSymPinsExtLoop expected fuel body stTrue pins'
+          | .none => checkSymPinsExtLoop expected fuel body stTrue (p :: ps)
+      | .none =>
+        match symStepDerefSymArgWithExpected body st expected with
+        | .some st' => checkSymPinsExtLoop expected fuel body st' (p :: ps)
+        | .none => false
+
+theorem checkSymPinsExtLoop_sound
+    (expected : List ScalarInt) :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (args : List Value)
+      (st : SymState)
+      (pins : List (Nat × ScalarInt)),
+      ArgsAreScalarsOfWidths args expected →
+      checkSymPinsExtLoop expected fuel body st pins = true →
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
+      AllScalarPinsHold args pins
+  | _, _, _, _, .nil, _, _, _ => True.intro
+  | .zero, _, _, _, _ :: _, _, hCheck, _ => nomatch hCheck
+  | .succ fuel, body, args, st, p :: ps, hWidths, hCheck, hHold => by
+    unfold checkSymPinsExtLoop at hCheck
+    cases hStep : symStepConcreteExt body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact checkSymPinsExtLoop_sound expected
+        fuel body args st' (p :: ps) hWidths hCheck
+        (symStepConcreteExt_sound fuel body args st st' hStep hHold)
+    | none =>
+      rw [hStep] at hCheck
+      cases hExt : symExtractPinEq body st with
+      | some tup =>
+        rw [hExt] at hCheck
+        rcases tup with ⟨idx, sc, stTrue, stFalse⟩
+        dsimp only at hCheck
+        cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
+        | false => rw [hFalse] at hCheck; nomatch hCheck
+        | true =>
+          rw [hFalse] at hCheck
+          dsimp only at hCheck
+          have ⟨hPinIdx, hHoldTrue⟩ :
+              get? args idx = .some (.scalar sc) ∧
+                evalMirBoolHoldBounded fuel body (concretizeSymState body args stTrue) := by
+            cases symExtractPinEq_branch_sound fuel body args st idx sc stTrue stFalse hExt hHold with
+            | inl hT => exact hT
+            | inr hF => exact False.elim (checkSymReturnsFalseExt_sound fuel body args stFalse hFalse hF)
+          cases hRem : removeScalarPin idx sc (p :: ps) with
+          | some pins' =>
+            rw [hRem] at hCheck
+            have hRestHold :=
+              checkSymPinsExtLoop_sound expected fuel body args stTrue pins' hWidths hCheck hHoldTrue
+            exact allScalarPinsHold_of_removeScalarPin args idx sc hPinIdx (p :: ps) pins' hRem hRestHold
+          | none =>
+            rw [hRem] at hCheck
+            exact checkSymPinsExtLoop_sound expected fuel body args stTrue (p :: ps) hWidths hCheck hHoldTrue
+      | none =>
+        rw [hExt] at hCheck
+        cases hDeref : symStepDerefSymArgWithExpected body st expected with
+        | none => rw [hDeref] at hCheck; nomatch hCheck
+        | some st' =>
+          rw [hDeref] at hCheck
+          exact checkSymPinsExtLoop_sound expected
+            fuel body args st' (p :: ps) hWidths hCheck
+            (symStepDerefSymArgWithExpected_hold_sound fuel body args st st' expected hWidths hDeref hHold)
+
+def checkOptMirRequiresPinsScalarsExt
+    (fuel : Nat)
+    (optReqBody : Option CapturedMir)
+    (expectedScalars : List ScalarInt) :
+    Bool :=
+  match optReqBody with
+  | .some reqBody =>
+    Bool.and
+      (Nat.beq reqBody.argCount (length expectedScalars))
+      (checkSymPinsExtLoop expectedScalars fuel reqBody (initSymState reqBody) (zipIdxScalars 0 expectedScalars))
+  | .none => Nat.beq (length expectedScalars) 0
+
+theorem checkOptMirRequiresPinsScalarsExt_sound
+    (fuel : Nat)
+    (optReqBody : Option CapturedMir)
+    (expectedScalars : List ScalarInt)
+    (args : List Value)
+    (h_widths : ArgsAreScalarsOfWidths args expectedScalars)
+    (h_check : checkOptMirRequiresPinsScalarsExt fuel optReqBody expectedScalars = true)
+    (h_len : length args = length expectedScalars)
+    (h_req : OptMirBoolPredicateHolds optReqBody args) :
+    args = mapScalarValues expectedScalars := by
+  cases optReqBody with
+  | some reqBody =>
+    dsimp only [checkOptMirRequiresPinsScalarsExt] at h_check
+    rcases Bool.and_eq_true_iff.1 h_check with ⟨hArgEq, hLoop⟩
+    have hHold : evalMirBoolHoldBounded fuel reqBody (initMachineState reqBody args) :=
+      wpBoolOrExhausted_of_mirBoolPredicateHolds fuel reqBody args h_req
+    have hLenSpec : length args = reqBody.argCount :=
+      Eq.trans h_len (Eq.symm (Nat.eq_of_beq_eq_true hArgEq))
+    rw [← concretizeSymState_initSymState reqBody args hLenSpec] at hHold
+    exact args_eq_mapScalarValues args expectedScalars h_len
+      (checkSymPinsExtLoop_sound expectedScalars
+        fuel reqBody args (initSymState reqBody) (zipIdxScalars 0 expectedScalars)
+        h_widths hLoop hHold)
+  | none =>
+    dsimp only [checkOptMirRequiresPinsScalarsExt] at h_check
+    have hExp0 : length expectedScalars = 0 := Nat.eq_of_beq_eq_true h_check
+    have hArgs0 : length args = 0 := Eq.trans h_len hExp0
+    rw [args_eq_nil_of_length_zero args hArgs0]
+    cases expectedScalars with
+    | nil => rfl
+    | cons _ _ => nomatch hExp0
+
+/-- Closed-term check that `optReqBody` pins the parameters of `subjectBody` to
+`expectedScalars`, by one of three routes:
+1. `checkOptMirRequiresPinsScalarsDirect`: direct `.symArg idx == K` comparisons,
+   with no typing obligation;
+2. `checkOptMirRequiresPinsScalarsExt` (`checkSymPinsExtLoop`): `V2026_06_01`
+   `anodized` closure-captured thin-pointer dereferences stepped into
+   `.symArg idx` (including reversed `K == x`, intermediate moves, and
+   short-circuit `&&`); or
+3. `checkOptMirRequiresPinsScalars` (`symExtractDerefSlicePinEq`): an adjacent
+   dereference load compared against a constant.
+Routes 2 and 3 additionally require `checkSubjectParamsMatchWidths`, and
+`checkOptMirRequiresPinsScalars_sound` discharges them only under
+`ArgsTypedForSubject`: a closure dereference reads just a scalar slice of its
+target, which an untyped aggregate argument also satisfies (Pitfall A).
+
+Scope: the closure-captured routes recognize only unsigned-integer (`u8` ..
+`u128`, `usize`) dereference loads (`symMatchDerefSymArgLoad`). Pins on signed
+integers or `bool`, and `s.len()` slice-metadata predicates, are not discharged
+automatically and need an authored proof. -/
+def checkOptMirRequiresPinsScalarsForSubject
+    (fuel : Nat)
+    (subjectBody : CapturedMir)
+    (optReqBody : Option CapturedMir)
+    (expectedScalars : List ScalarInt) :
+    Bool :=
+  Bool.or
+    (checkOptMirRequiresPinsScalarsDirect fuel optReqBody expectedScalars)
+    (Bool.and
+      (checkSubjectParamsMatchWidths subjectBody expectedScalars)
+      (Bool.or
+        (checkOptMirRequiresPinsScalarsExt fuel optReqBody expectedScalars)
+        (checkOptMirRequiresPinsScalars fuel optReqBody expectedScalars)))
+
+theorem checkOptMirRequiresPinsScalars_sound
+    (fuel : Nat)
+    (subjectBody : CapturedMir)
+    (optReqBody : Option CapturedMir)
+    (expectedScalars : List ScalarInt)
+    (args : List Value)
+    (h_check :
+      checkOptMirRequiresPinsScalarsForSubject fuel subjectBody optReqBody expectedScalars = true)
+    (h_len : length args = length expectedScalars)
+    (h_req : OptMirBoolPredicateHolds optReqBody args)
+    (h_typed :
+      OptArgsTypedForSubject
+        (checkOptMirRequiresPinsScalarsDirect fuel optReqBody expectedScalars)
+        subjectBody
+        args) :
+    args = mapScalarValues expectedScalars := by
+  dsimp only [checkOptMirRequiresPinsScalarsForSubject] at h_check
+  cases hDir : checkOptMirRequiresPinsScalarsDirect fuel optReqBody expectedScalars with
+  | true =>
+    exact
+      checkOptMirRequiresPinsScalarsDirect_sound
+        fuel optReqBody expectedScalars args hDir h_len h_req
+  | false =>
+    rw [hDir] at h_check h_typed
+    dsimp only [Bool.or, OptArgsTypedForSubject] at h_check h_typed
+    rcases Bool.and_eq_true_iff.1 h_check with ⟨hWidths, hExtOrSlice⟩
+    have hScalarWidths :=
+      argsAreScalarsOfWidths_of_argsTypedForSubject
+        subjectBody args expectedScalars h_len hWidths h_typed
+    cases hExt : checkOptMirRequiresPinsScalarsExt fuel optReqBody expectedScalars with
+    | true =>
+      exact checkOptMirRequiresPinsScalarsExt_sound
+        fuel optReqBody expectedScalars args hScalarWidths hExt h_len h_req
+    | false =>
+      rw [hExt] at hExtOrSlice
+      dsimp only [Bool.or] at hExtOrSlice
+      cases optReqBody with
+      | some reqBody =>
+        have hPins :=
+          checkMirRequiresPinsScalars_sound
+            fuel reqBody expectedScalars args hExtOrSlice h_len h_req
+        exact args_eq_mapScalarValues_of_slicePins
+          args expectedScalars args 0 rfl hScalarWidths hPins
+      | none =>
+        dsimp only [checkOptMirRequiresPinsScalars] at hExtOrSlice
+        have hExp0 : length expectedScalars = 0 := Nat.eq_of_beq_eq_true hExtOrSlice
+        have hArgs0 : length args = 0 := Eq.trans h_len hExp0
+        rw [args_eq_nil_of_length_zero args hArgs0]
+        cases expectedScalars with
+        | nil => rfl
+        | cons _ _ => nomatch hExp0
 
 /-- Computable check that `subjectBody` evaluates on `args` with `callees`
 within `subjectFuel` steps to a normal return value `retVal` satisfying
@@ -6733,7 +7436,7 @@ def checkMirAutoPinnedSpecWithCallees
   Bool.and
     (Nat.beq subjectBody.argCount (length expected))
     (Bool.and
-      (checkOptMirRequiresPinsScalars specFuel optReqBody expected)
+      (checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody optReqBody expected)
       (checkMirRustPinnedSpecOptWithCallees
         subjectFuel specFuel subjectBody callees optEnsBody (mapScalarValues expected)))
 
@@ -6757,12 +7460,27 @@ theorem dischargeRustPinnedContractAuto
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = c.body.argCount)
-          (OptMirBoolPredicateHolds optReqBody args) := by
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (OptMirBoolPredicateHolds optReqBody args))
+          (OptArgsTypedForSubject
+            (checkOptMirRequiresPinsScalarsDirect
+              specFuel optReqBody (extractOptMirRequiresPins specFuel optReqBody))
+            c.body
+            args) := by
       intro _ h
-      first
-      | exact h
-      | exact ⟨h, True.intro⟩)
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact ⟨h.1, True.intro⟩
+        | exact h
+        | exact ⟨h, True.intro⟩
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoPinnedSpecWithCallees
         subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by rfl)
@@ -6776,7 +7494,7 @@ theorem dischargeRustPinnedContractAuto
       | exact True.intro) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len_body, h_req⟩, h_typed⟩
   dsimp only [checkMirAutoPinnedSpecWithCallees] at h_check
   let expected := extractOptMirRequiresPins specFuel optReqBody
   cases hArgEq : Nat.beq c.body.argCount (length expected) with
@@ -6786,7 +7504,7 @@ theorem dischargeRustPinnedContractAuto
   | true =>
     rw [hArgEq] at h_check
     dsimp only [Bool.and] at h_check
-    cases hPins : checkOptMirRequiresPinsScalars specFuel optReqBody expected with
+    cases hPins : checkOptMirRequiresPinsScalarsForSubject specFuel c.body optReqBody expected with
     | false =>
       rw [hPins] at h_check
       nomatch h_check
@@ -6797,7 +7515,7 @@ theorem dischargeRustPinnedContractAuto
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
       have h_args : args = mapScalarValues expected :=
         checkOptMirRequiresPinsScalars_sound
-          specFuel optReqBody expected args hPins h_len h_req
+          specFuel c.body optReqBody expected args hPins h_len h_req h_typed
       subst h_args
       have h_wp :=
         wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithCallees
@@ -6819,16 +7537,29 @@ theorem dischargeRustTotalPinnedContractAuto
         c.pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = c.body.argCount)
-            (OptMirBoolPredicateHolds optReqBody args))
-          (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact h.1
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
-      | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
-      | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩)
+            (And
+              (Trusted.Sequence.length args = c.body.argCount)
+              (OptMirBoolPredicateHolds optReqBody args))
+            (mem = (initMachineState c.body args).memory))
+          (OptArgsTypedForSubject
+            (checkOptMirRequiresPinsScalarsDirect
+              specFuel optReqBody (extractOptMirRequiresPins specFuel optReqBody))
+            c.body
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+        | exact h
+        | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+        | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoPinnedSpecWithCallees
         subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by rfl)
@@ -6842,7 +7573,7 @@ theorem dischargeRustTotalPinnedContractAuto
       | exact True.intro) :
     TotalVerificationResult c := by
   refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoPinnedSpecWithCallees] at h_check
   let expected := extractOptMirRequiresPins specFuel optReqBody
@@ -6853,7 +7584,7 @@ theorem dischargeRustTotalPinnedContractAuto
   | true =>
     rw [hArgEq] at h_check
     dsimp only [Bool.and] at h_check
-    cases hPins : checkOptMirRequiresPinsScalars specFuel optReqBody expected with
+    cases hPins : checkOptMirRequiresPinsScalarsForSubject specFuel c.body optReqBody expected with
     | false =>
       rw [hPins] at h_check
       nomatch h_check
@@ -6864,7 +7595,7 @@ theorem dischargeRustTotalPinnedContractAuto
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
       have h_args : args = mapScalarValues expected :=
         checkOptMirRequiresPinsScalars_sound
-          specFuel optReqBody expected args hPins h_len h_req
+          specFuel c.body optReqBody expected args hPins h_len h_req h_typed
       subst h_args
       have h_wp :=
         wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
@@ -7008,7 +7739,7 @@ def checkMirAutoPinnedSpecWithSpecCallees
   Bool.and
     (Nat.beq subjectBody.argCount (length expected))
     (Bool.and
-      (checkOptMirRequiresPinsScalars specFuel optReqBody expected)
+      (checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody optReqBody expected)
       (checkMirRustPinnedSpecOptWithSpecCallees
         subjectFuel specFuel subjectBody callees specCallees optEnsBody
         (mapScalarValues expected)))
@@ -7024,12 +7755,27 @@ theorem dischargeRustPinnedContractWithSpecCalleesAuto
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = c.body.argCount)
-          (OptMirBoolPredicateHolds optReqBody args) := by
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (OptMirBoolPredicateHolds optReqBody args))
+          (OptArgsTypedForSubject
+            (checkOptMirRequiresPinsScalarsDirect
+              specFuel optReqBody (extractOptMirRequiresPins specFuel optReqBody))
+            c.body
+            args) := by
       intro _ h
-      first
-      | exact h
-      | exact ⟨h, True.intro⟩)
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact ⟨h.1, True.intro⟩
+        | exact h
+        | exact ⟨h, True.intro⟩
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoPinnedSpecWithSpecCallees
         subjectFuel specFuel c.body c.callees specCallees
@@ -7045,7 +7791,7 @@ theorem dischargeRustPinnedContractWithSpecCalleesAuto
       | exact True.intro) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len_body, h_req⟩, h_typed⟩
   dsimp only [checkMirAutoPinnedSpecWithSpecCallees] at h_check
   let expected := extractOptMirRequiresPins specFuel optReqBody
   cases hArgEq : Nat.beq c.body.argCount (length expected) with
@@ -7055,7 +7801,7 @@ theorem dischargeRustPinnedContractWithSpecCalleesAuto
   | true =>
     rw [hArgEq] at h_check
     dsimp only [Bool.and] at h_check
-    cases hPins : checkOptMirRequiresPinsScalars specFuel optReqBody expected with
+    cases hPins : checkOptMirRequiresPinsScalarsForSubject specFuel c.body optReqBody expected with
     | false =>
       rw [hPins] at h_check
       nomatch h_check
@@ -7066,7 +7812,7 @@ theorem dischargeRustPinnedContractWithSpecCalleesAuto
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
       have h_args : args = mapScalarValues expected :=
         checkOptMirRequiresPinsScalars_sound
-          specFuel optReqBody expected args hPins h_len h_req
+          specFuel c.body optReqBody expected args hPins h_len h_req h_typed
       subst h_args
       have h_wp :=
         wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithSpecCallees
@@ -7091,14 +7837,29 @@ theorem dischargeRustTotalPinnedContractWithSpecCalleesAuto
         c.pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = c.body.argCount)
-            (OptMirBoolPredicateHolds optReqBody args))
-          (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
-      | exact h.1)
+            (And
+              (Trusted.Sequence.length args = c.body.argCount)
+              (OptMirBoolPredicateHolds optReqBody args))
+            (mem = (initMachineState c.body args).memory))
+          (OptArgsTypedForSubject
+            (checkOptMirRequiresPinsScalarsDirect
+              specFuel optReqBody (extractOptMirRequiresPins specFuel optReqBody))
+            c.body
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+        | exact h
+        | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+        | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoPinnedSpecWithSpecCallees
         subjectFuel specFuel c.body c.callees specCallees
@@ -7114,7 +7875,7 @@ theorem dischargeRustTotalPinnedContractWithSpecCalleesAuto
       | exact True.intro) :
     TotalVerificationResult c := by
   refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoPinnedSpecWithSpecCallees] at h_check
   let expected := extractOptMirRequiresPins specFuel optReqBody
@@ -7125,7 +7886,7 @@ theorem dischargeRustTotalPinnedContractWithSpecCalleesAuto
   | true =>
     rw [hArgEq] at h_check
     dsimp only [Bool.and] at h_check
-    cases hPins : checkOptMirRequiresPinsScalars specFuel optReqBody expected with
+    cases hPins : checkOptMirRequiresPinsScalarsForSubject specFuel c.body optReqBody expected with
     | false =>
       rw [hPins] at h_check
       nomatch h_check
@@ -7136,7 +7897,7 @@ theorem dischargeRustTotalPinnedContractWithSpecCalleesAuto
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
       have h_args : args = mapScalarValues expected :=
         checkOptMirRequiresPinsScalars_sound
-          specFuel optReqBody expected args hPins h_len h_req
+          specFuel c.body optReqBody expected args hPins h_len h_req h_typed
       subst h_args
       have h_wp :=
         wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
@@ -7293,7 +8054,7 @@ theorem symExtractUpperBound1_sound
     (boundSc : ScalarInt)
     (stFalse : SymState)
     (hExt : symExtractUpperBound1 body st = .some (boundSc, stFalse))
-    (hFalse : checkSymReturnsFalse fuel body stFalse = true)
+    (hFalse : checkSymReturnsFalseExt fuel body stFalse = true)
     (hHold : evalMirBoolHoldBounded (.succ fuel) body (concretizeSymState body args st)) :
     ∃ b : Nat,
       b ≤ boundSc.bits ∧
@@ -7471,7 +8232,7 @@ theorem symExtractUpperBound1_sound
                                                         cases hBranch with
                                                         | inr hFalseHold =>
                                                           exact False.elim
-                                                            (checkSymReturnsFalse_sound
+                                                            (checkSymReturnsFalseExt_sound
                                                               fuel body args stFalseOut hFalse hFalseHold)
                                                         | inl hTruePair =>
                                                           have hBle : actualSc.bits ≤ scOut.bits := by
@@ -7494,27 +8255,30 @@ theorem symExtractUpperBound1_sound
 def extractMirUpperBound1Loop : Nat → CapturedMir → SymState → Option ScalarInt
   | .zero, _, _ => .none
   | .succ fuel, body, st =>
-    match symStepConcrete body st with
+    match symStepConcreteExt body st with
     | .some st' => extractMirUpperBound1Loop fuel body st'
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (boundSc, stFalse) =>
-        match checkSymReturnsFalse fuel body stFalse with
+        match checkSymReturnsFalseExt fuel body stFalse with
         | true => .some boundSc
         | false => .none
-      | .none => .none
+      | .none =>
+        match symStepDerefSymArgAny body st with
+        | .some st' => extractMirUpperBound1Loop fuel body st'
+        | .none => .none
 
 /-- Extract the 1-argument unsigned upper bound `boundSc` from `reqBody`. -/
 def extractMirUpperBound1 (fuel : Nat) (reqBody : CapturedMir) : Option ScalarInt :=
   extractMirUpperBound1Loop fuel reqBody (initSymState reqBody)
 
-/-- Check that `body` from `st` establishes `arg0 ≤ boundSc.bits` at width `boundSc.sizeBytes`. -/
-def checkSymUpperBound1Loop :
+/-- Direct (non-deref) check that `body` from `st` establishes `arg0 ≤ boundSc.bits` at width `boundSc.sizeBytes`. -/
+def checkSymUpperBound1LoopDirect :
     Nat → CapturedMir → SymState → ScalarInt → Bool
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
-    match symStepConcrete body st with
-    | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+    match symStepConcreteExt body st with
+    | .some st' => checkSymUpperBound1LoopDirect fuel body st' boundSc
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (scOut, stFalse) =>
@@ -7522,29 +8286,29 @@ def checkSymUpperBound1Loop :
           (Bool.and
             (Nat.beq scOut.bits boundSc.bits)
             (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
-          (checkSymReturnsFalse fuel body stFalse)
+          (checkSymReturnsFalseExt fuel body stFalse)
       | .none => false
 
-theorem checkSymUpperBound1Loop_sound :
+theorem checkSymUpperBound1LoopDirect_sound :
     ∀ (fuel : Nat)
       (body : CapturedMir)
       (args : List Value)
       (st : SymState)
       (boundSc : ScalarInt),
-      checkSymUpperBound1Loop fuel body st boundSc = true →
+      checkSymUpperBound1LoopDirect fuel body st boundSc = true →
       evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
       ∃ b : Nat,
         b ≤ boundSc.bits ∧
         get? args 0 = .some (.scalar { bits := b, sizeBytes := boundSc.sizeBytes })
   | .zero, _, _, _, _, hCheck, _ => nomatch hCheck
   | .succ fuel, body, args, st, boundSc, hCheck, hHold => by
-    dsimp only [checkSymUpperBound1Loop] at hCheck
-    cases hStep : symStepConcrete body st with
+    dsimp only [checkSymUpperBound1LoopDirect] at hCheck
+    cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
-      exact checkSymUpperBound1Loop_sound
+      exact checkSymUpperBound1LoopDirect_sound
         fuel body args st' boundSc hCheck
-        (symStepConcrete_sound fuel body args st st' hStep hHold)
+        (symStepConcreteExt_sound fuel body args st st' hStep hHold)
     | none =>
       rw [hStep] at hCheck
       cases hExt : symExtractUpperBound1 body st with
@@ -7577,6 +8341,90 @@ theorem checkSymUpperBound1Loop_sound :
               exact symExtractUpperBound1_sound
                 fuel body args st scOut stFalse hExt hCheck hHold
 
+/-- Check that `body` from `st` establishes `arg0 ≤ boundSc.bits` at width `boundSc.sizeBytes`,
+supporting closure-captured thin-pointer dereferences (`symStepDerefSymArg`). -/
+def checkSymUpperBound1Loop :
+    Nat → CapturedMir → SymState → ScalarInt → Bool
+  | .zero, _, _, _ => false
+  | .succ fuel, body, st, boundSc =>
+    match symStepConcreteExt body st with
+    | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+    | .none =>
+      match symExtractUpperBound1 body st with
+      | .some (scOut, stFalse) =>
+        Bool.and
+          (Bool.and
+            (Nat.beq scOut.bits boundSc.bits)
+            (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
+          (checkSymReturnsFalseExt fuel body stFalse)
+      | .none =>
+        match symStepDerefSymArg body st 0 boundSc.sizeBytes with
+        | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+        | .none => false
+
+theorem checkSymUpperBound1Loop_sound :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (args : List Value)
+      (st : SymState)
+      (boundSc : ScalarInt),
+      checkSymUpperBound1Loop fuel body st boundSc = true →
+      (∃ b0 : Nat, get? args 0 = .some (.scalar { bits := b0, sizeBytes := boundSc.sizeBytes })) →
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
+      ∃ b : Nat,
+        b ≤ boundSc.bits ∧
+        get? args 0 = .some (.scalar { bits := b, sizeBytes := boundSc.sizeBytes })
+  | .zero, _, _, _, _, hCheck, _, _ => nomatch hCheck
+  | .succ fuel, body, args, st, boundSc, hCheck, hArg0, hHold => by
+    dsimp only [checkSymUpperBound1Loop] at hCheck
+    cases hStep : symStepConcreteExt body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact checkSymUpperBound1Loop_sound
+        fuel body args st' boundSc hCheck hArg0
+        (symStepConcreteExt_sound fuel body args st st' hStep hHold)
+    | none =>
+      rw [hStep] at hCheck
+      cases hExt : symExtractUpperBound1 body st with
+      | some pair =>
+        rw [hExt] at hCheck
+        cases pair with
+        | mk scOut stFalse =>
+          dsimp only at hCheck
+          cases hBitsEq : Nat.beq scOut.bits boundSc.bits with
+          | false =>
+            rw [hBitsEq] at hCheck
+            nomatch hCheck
+          | true =>
+            rw [hBitsEq] at hCheck
+            cases hSzEq : Nat.beq scOut.sizeBytes boundSc.sizeBytes with
+            | false =>
+              rw [hSzEq] at hCheck
+              nomatch hCheck
+            | true =>
+              rw [hSzEq] at hCheck
+              dsimp only [Bool.and] at hCheck
+              have hScEq : scOut = boundSc :=
+                scalarInt_eq_of_parts
+                  (Nat.eq_of_beq_eq_true hBitsEq)
+                  (Nat.eq_of_beq_eq_true hSzEq)
+              subst hScEq
+              exact symExtractUpperBound1_sound
+                fuel body args st scOut stFalse hExt hCheck hHold
+      | none =>
+        rw [hExt] at hCheck
+        cases hDeref : symStepDerefSymArg body st 0 boundSc.sizeBytes with
+        | none =>
+          rw [hDeref] at hCheck
+          nomatch hCheck
+        | some st' =>
+          rw [hDeref] at hCheck
+          rcases hArg0 with ⟨b0, hb0⟩
+          exact checkSymUpperBound1Loop_sound
+            fuel body args st' boundSc hCheck ⟨b0, hb0⟩
+            (symStepDerefSymArg_hold_sound
+              fuel body args st st' 0 boundSc.sizeBytes b0 hb0 hDeref hHold)
+
 theorem args_eq_singleton_of_get?_zero :
     ∀ (args : List Value) (v : Value),
       length args = 1 →
@@ -7588,6 +8436,44 @@ theorem args_eq_singleton_of_get?_zero :
     subst hEq
     rfl
   | _ :: _ :: _, _, hLen, _ => nomatch hLen
+
+/-- Direct (non-deref) check that `reqBody` is a 1-argument predicate establishing `arg0 ≤ boundSc.bits`. -/
+def checkMirUpperBound1Direct
+    (fuel : Nat)
+    (reqBody : CapturedMir)
+    (boundSc : ScalarInt) :
+    Bool :=
+  Bool.and
+    (Nat.beq reqBody.argCount 1)
+    (checkSymUpperBound1LoopDirect fuel reqBody (initSymState reqBody) boundSc)
+
+theorem checkMirUpperBound1Direct_sound
+    (fuel : Nat)
+    (reqBody : CapturedMir)
+    (boundSc : ScalarInt)
+    (args : List Value)
+    (h_check : checkMirUpperBound1Direct fuel reqBody boundSc = true)
+    (h_len : length args = 1)
+    (h_req : MirBoolPredicateHolds reqBody args) :
+    ∃ b : Nat,
+      b ≤ boundSc.bits ∧
+      args = [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }] := by
+  dsimp only [checkMirUpperBound1Direct] at h_check
+  cases hArg1 : Nat.beq reqBody.argCount 1 with
+  | false =>
+    rw [hArg1] at h_check
+    nomatch h_check
+  | true =>
+    rw [hArg1] at h_check
+    dsimp only [Bool.and] at h_check
+    have hHold : evalMirBoolHoldBounded fuel reqBody (initMachineState reqBody args) :=
+      wpBoolOrExhausted_of_mirBoolPredicateHolds fuel reqBody args h_req
+    have hLenSpec : length args = reqBody.argCount :=
+      Eq.trans h_len (Eq.symm (Nat.eq_of_beq_eq_true hArg1))
+    rw [← concretizeSymState_initSymState reqBody args hLenSpec] at hHold
+    rcases checkSymUpperBound1LoopDirect_sound
+      fuel reqBody args (initSymState reqBody) boundSc h_check hHold with ⟨b, hBle, hGet0⟩
+    exact ⟨b, hBle, args_eq_singleton_of_get?_zero args _ h_len hGet0⟩
 
 /-- Check that `reqBody` is a 1-argument predicate establishing `arg0 ≤ boundSc.bits`. -/
 def checkMirUpperBound1
@@ -7606,6 +8492,7 @@ theorem checkMirUpperBound1_sound
     (args : List Value)
     (h_check : checkMirUpperBound1 fuel reqBody boundSc = true)
     (h_len : length args = 1)
+    (h_arg0 : ∃ b0 : Nat, get? args 0 = .some (.scalar { bits := b0, sizeBytes := boundSc.sizeBytes }))
     (h_req : MirBoolPredicateHolds reqBody args) :
     ∃ b : Nat,
       b ≤ boundSc.bits ∧
@@ -7624,8 +8511,61 @@ theorem checkMirUpperBound1_sound
       Eq.trans h_len (Eq.symm (Nat.eq_of_beq_eq_true hArg1))
     rw [← concretizeSymState_initSymState reqBody args hLenSpec] at hHold
     rcases checkSymUpperBound1Loop_sound
-      fuel reqBody args (initSymState reqBody) boundSc h_check hHold with ⟨b, hBle, hGet0⟩
+      fuel reqBody args (initSymState reqBody) boundSc h_check h_arg0 hHold with ⟨b, hBle, hGet0⟩
     exact ⟨b, hBle, args_eq_singleton_of_get?_zero args _ h_len hGet0⟩
+
+/-- Check that `reqBody` establishes `arg0 ≤ boundSc.bits` for `subjectBody`
+(either directly or via closure-captured dereference with subject parameter typing). -/
+def checkMirUpperBound1ForSubject
+    (fuel : Nat)
+    (subjectBody reqBody : CapturedMir)
+    (boundSc : ScalarInt) :
+    Bool :=
+  Bool.or
+    (checkMirUpperBound1Direct fuel reqBody boundSc)
+    (Bool.and
+      (checkSubjectParamsMatchWidths subjectBody [boundSc])
+      (checkMirUpperBound1 fuel reqBody boundSc))
+
+theorem checkMirUpperBound1ForSubject_sound
+    (fuel : Nat)
+    (subjectBody reqBody : CapturedMir)
+    (boundSc : ScalarInt)
+    (args : List Value)
+    (h_check : checkMirUpperBound1ForSubject fuel subjectBody reqBody boundSc = true)
+    (h_len : length args = 1)
+    (h_typed :
+      OptArgsTypedForSubject
+        (checkMirUpperBound1Direct fuel reqBody boundSc)
+        subjectBody
+        args)
+    (h_req : MirBoolPredicateHolds reqBody args) :
+    ∃ b : Nat,
+      b ≤ boundSc.bits ∧
+      args = [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }] := by
+  dsimp only [checkMirUpperBound1ForSubject] at h_check
+  cases hDir : checkMirUpperBound1Direct fuel reqBody boundSc with
+  | true =>
+    exact checkMirUpperBound1Direct_sound fuel reqBody boundSc args hDir h_len h_req
+  | false =>
+    rw [hDir] at h_check h_typed
+    dsimp only [Bool.or, OptArgsTypedForSubject] at h_check h_typed
+    cases hWidths : checkSubjectParamsMatchWidths subjectBody [boundSc] with
+    | false =>
+      rw [hWidths] at h_check
+      nomatch h_check
+    | true =>
+      rw [hWidths] at h_check
+      dsimp only [Bool.and] at h_check
+      have hScalars : ArgsAreScalarsOfWidths args [boundSc] :=
+        argsAreScalarsOfWidths_of_argsTypedForSubject subjectBody args [boundSc] h_len hWidths h_typed
+      rcases args with _ | ⟨v0, rest⟩
+      · nomatch h_len
+      · dsimp only [ArgsAreScalarsOfWidths] at hScalars
+        rcases hScalars.1 with ⟨b0, hb0⟩
+        have hArg0 : ∃ b0 : Nat, get? (v0 :: rest) 0 = .some (.scalar { bits := b0, sizeBytes := boundSc.sizeBytes }) :=
+          ⟨b0, congrArg Option.some hb0⟩
+        exact checkMirUpperBound1_sound fuel reqBody boundSc (v0 :: rest) h_check h_len hArg0 h_req
 
 /-- Computable bounded checker that `body` returns `false` (`.scalar ⟨0, 1⟩`)
 within `fuel` steps on concrete state `st`. -/
@@ -7797,7 +8737,7 @@ def checkMirAutoBoundedRange1SpecWithCallees
     Bool.and
       (Nat.beq subjectBody.argCount 1)
       (Bool.and
-        (checkMirUpperBound1 specFuel reqBody boundSc)
+        (checkMirUpperBound1ForSubject specFuel subjectBody reqBody boundSc)
         (checkAllScalarRange1
           specFuel
           reqBody
@@ -7827,9 +8767,26 @@ theorem dischargeRustBoundedRange1Auto
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = c.body.argCount)
-          (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (MirBoolPredicateHolds reqBody args))
+          (OptArgsTypedForSubject
+            (match extractMirUpperBound1 specFuel reqBody with
+             | .some boundSc => checkMirUpperBound1Direct specFuel reqBody boundSc
+             | .none => true)
+            c.body
+            args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithCallees
         subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by rfl)
@@ -7843,15 +8800,15 @@ theorem dischargeRustBoundedRange1Auto
       | exact True.intro) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len_body, h_req⟩, h_typed⟩
   dsimp only [checkMirAutoBoundedRange1SpecWithCallees] at h_check
   cases hExt : extractMirUpperBound1 specFuel reqBody with
   | none =>
     rw [hExt] at h_check
     nomatch h_check
   | some boundSc =>
-    rw [hExt] at h_check
-    dsimp only at h_check
+    rw [hExt] at h_check h_typed
+    dsimp only at h_check h_typed
     cases hArg1 : Nat.beq c.body.argCount 1 with
     | false =>
       rw [hArg1] at h_check
@@ -7859,7 +8816,7 @@ theorem dischargeRustBoundedRange1Auto
     | true =>
       rw [hArg1] at h_check
       dsimp only [Bool.and] at h_check
-      cases hUb : checkMirUpperBound1 specFuel reqBody boundSc with
+      cases hUb : checkMirUpperBound1ForSubject specFuel c.body reqBody boundSc with
       | false =>
         rw [hUb] at h_check
         nomatch h_check
@@ -7868,8 +8825,8 @@ theorem dischargeRustBoundedRange1Auto
         dsimp only [Bool.and] at h_check
         have h_len1 : length args = 1 :=
           Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-        rcases checkMirUpperBound1_sound
-          specFuel reqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        rcases checkMirUpperBound1ForSubject_sound
+          specFuel c.body reqBody boundSc args hUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
         subst hArgs
         have hRun :=
           checkAllScalarRange1_at_sound
@@ -7901,13 +8858,27 @@ theorem dischargeRustTotalBoundedRange1Auto
         c.pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = c.body.argCount)
-            (MirBoolPredicateHolds reqBody args))
-          (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact h.1)
+            (And
+              (Trusted.Sequence.length args = c.body.argCount)
+              (MirBoolPredicateHolds reqBody args))
+            (mem = (initMachineState c.body args).memory))
+          (OptArgsTypedForSubject
+            (match extractMirUpperBound1 specFuel reqBody with
+             | .some boundSc => checkMirUpperBound1Direct specFuel reqBody boundSc
+             | .none => true)
+            c.body
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithCallees
         subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by rfl)
@@ -7921,7 +8892,7 @@ theorem dischargeRustTotalBoundedRange1Auto
       | exact True.intro) :
     TotalVerificationResult c := by
   refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoBoundedRange1SpecWithCallees] at h_check
   cases hExt : extractMirUpperBound1 specFuel reqBody with
@@ -7929,8 +8900,8 @@ theorem dischargeRustTotalBoundedRange1Auto
     rw [hExt] at h_check
     nomatch h_check
   | some boundSc =>
-    rw [hExt] at h_check
-    dsimp only at h_check
+    rw [hExt] at h_check h_typed
+    dsimp only at h_check h_typed
     cases hArg1 : Nat.beq c.body.argCount 1 with
     | false =>
       rw [hArg1] at h_check
@@ -7938,7 +8909,7 @@ theorem dischargeRustTotalBoundedRange1Auto
     | true =>
       rw [hArg1] at h_check
       dsimp only [Bool.and] at h_check
-      cases hUb : checkMirUpperBound1 specFuel reqBody boundSc with
+      cases hUb : checkMirUpperBound1ForSubject specFuel c.body reqBody boundSc with
       | false =>
         rw [hUb] at h_check
         nomatch h_check
@@ -7947,8 +8918,8 @@ theorem dischargeRustTotalBoundedRange1Auto
         dsimp only [Bool.and] at h_check
         have h_len1 : length args = 1 :=
           Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-        rcases checkMirUpperBound1_sound
-          specFuel reqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        rcases checkMirUpperBound1ForSubject_sound
+          specFuel c.body reqBody boundSc args hUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
         subst hArgs
         have hRun :=
           checkAllScalarRange1_at_sound
@@ -7991,7 +8962,7 @@ def checkMirAutoBoundedRange1SpecWithSpecCallees
     Bool.and
       (Nat.beq subjectBody.argCount 1)
       (Bool.and
-        (checkMirUpperBound1 specFuel reqBody boundSc)
+        (checkMirUpperBound1ForSubject specFuel subjectBody reqBody boundSc)
         (checkAllScalarRange1
           specFuel
           reqBody
@@ -8013,9 +8984,26 @@ theorem dischargeRustBoundedRange1WithSpecCalleesAuto
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = c.body.argCount)
-          (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (MirBoolPredicateHolds reqBody args))
+          (OptArgsTypedForSubject
+            (match extractMirUpperBound1 specFuel reqBody with
+             | .some boundSc => checkMirUpperBound1Direct specFuel reqBody boundSc
+             | .none => true)
+            c.body
+            args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithSpecCallees
         subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by rfl)
@@ -8030,15 +9018,15 @@ theorem dischargeRustBoundedRange1WithSpecCalleesAuto
       | exact True.intro) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len_body, h_req⟩, h_typed⟩
   dsimp only [checkMirAutoBoundedRange1SpecWithSpecCallees] at h_check
   cases hExt : extractMirUpperBound1 specFuel reqBody with
   | none =>
     rw [hExt] at h_check
     nomatch h_check
   | some boundSc =>
-    rw [hExt] at h_check
-    dsimp only at h_check
+    rw [hExt] at h_check h_typed
+    dsimp only at h_check h_typed
     cases hArg1 : Nat.beq c.body.argCount 1 with
     | false =>
       rw [hArg1] at h_check
@@ -8046,7 +9034,7 @@ theorem dischargeRustBoundedRange1WithSpecCalleesAuto
     | true =>
       rw [hArg1] at h_check
       dsimp only [Bool.and] at h_check
-      cases hUb : checkMirUpperBound1 specFuel reqBody boundSc with
+      cases hUb : checkMirUpperBound1ForSubject specFuel c.body reqBody boundSc with
       | false =>
         rw [hUb] at h_check
         nomatch h_check
@@ -8055,8 +9043,8 @@ theorem dischargeRustBoundedRange1WithSpecCalleesAuto
         dsimp only [Bool.and] at h_check
         have h_len1 : length args = 1 :=
           Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-        rcases checkMirUpperBound1_sound
-          specFuel reqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        rcases checkMirUpperBound1ForSubject_sound
+          specFuel c.body reqBody boundSc args hUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
         subst hArgs
         have hRun :=
           checkAllScalarRange1_at_sound
@@ -8091,13 +9079,27 @@ theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
         c.pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = c.body.argCount)
-            (MirBoolPredicateHolds reqBody args))
-          (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact h.1)
+            (And
+              (Trusted.Sequence.length args = c.body.argCount)
+              (MirBoolPredicateHolds reqBody args))
+            (mem = (initMachineState c.body args).memory))
+          (OptArgsTypedForSubject
+            (match extractMirUpperBound1 specFuel reqBody with
+             | .some boundSc => checkMirUpperBound1Direct specFuel reqBody boundSc
+             | .none => true)
+            c.body
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_check :
       checkMirAutoBoundedRange1SpecWithSpecCallees
         subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by rfl)
@@ -8112,7 +9114,7 @@ theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
       | exact True.intro) :
     TotalVerificationResult c := by
   refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoBoundedRange1SpecWithSpecCallees] at h_check
   cases hExt : extractMirUpperBound1 specFuel reqBody with
@@ -8120,8 +9122,8 @@ theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
     rw [hExt] at h_check
     nomatch h_check
   | some boundSc =>
-    rw [hExt] at h_check
-    dsimp only at h_check
+    rw [hExt] at h_check h_typed
+    dsimp only at h_check h_typed
     cases hArg1 : Nat.beq c.body.argCount 1 with
     | false =>
       rw [hArg1] at h_check
@@ -8129,7 +9131,7 @@ theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
     | true =>
       rw [hArg1] at h_check
       dsimp only [Bool.and] at h_check
-      cases hUb : checkMirUpperBound1 specFuel reqBody boundSc with
+      cases hUb : checkMirUpperBound1ForSubject specFuel c.body reqBody boundSc with
       | false =>
         rw [hUb] at h_check
         nomatch h_check
@@ -8138,8 +9140,8 @@ theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
         dsimp only [Bool.and] at h_check
         have h_len1 : length args = 1 :=
           Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-        rcases checkMirUpperBound1_sound
-          specFuel reqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        rcases checkMirUpperBound1ForSubject_sound
+          specFuel c.body reqBody boundSc args hUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
         subst hArgs
         have hRun :=
           checkAllScalarRange1_at_sound
@@ -8710,6 +9712,32 @@ theorem symIsReturnTrue_sound
                                 rfl
             | _ => nomatch h
 
+theorem symStepConcreteDeref_true_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (h : symStepConcreteDeref body st = .some st')
+    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
+  rw [symStepConcreteDeref_stepMirFn_eq body args st st' h]
+  exact hTrue
+
+theorem symStepDerefSymArg_true_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (expectedIdx expectedSz b : Nat)
+    (hArg : get? args expectedIdx = .some (.scalar { bits := b, sizeBytes := expectedSz }))
+    (h : symStepDerefSymArg body st expectedIdx expectedSz = .some st')
+    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
+  rw [symStepDerefSymArg_stepMirFn_eq body args st st' expectedIdx expectedSz b hArg h]
+  exact hTrue
+
 /-- Check whether concrete symbolic execution from `st` reaches `Return` with
 `true` (`.scalar ⟨1, 1⟩`) within `fuel` steps. -/
 def checkSymReturnsTrue : Nat → CapturedMir → SymState → Bool
@@ -8717,7 +9745,10 @@ def checkSymReturnsTrue : Nat → CapturedMir → SymState → Bool
   | .succ fuel, body, st =>
     match symStepConcreteInBounds body st with
     | .some st' => checkSymReturnsTrue fuel body st'
-    | .none => symIsReturnTrue body st
+    | .none =>
+      match symStepConcreteDeref body st with
+      | .some st' => checkSymReturnsTrue fuel body st'
+      | .none => symIsReturnTrue body st
 
 theorem checkSymReturnsTrue_sound :
     ∀ (fuel : Nat) (body : CapturedMir) (args : List Value) (st : SymState),
@@ -8735,7 +9766,15 @@ theorem checkSymReturnsTrue_sound :
         (checkSymReturnsTrue_sound fuel body args st' hLen hCheck)
     | none =>
       rw [hStep] at hCheck
-      exact symIsReturnTrue_sound fuel body args st hCheck
+      cases hDeref : symStepConcreteDeref body st with
+      | some st' =>
+        rw [hDeref] at hCheck
+        exact symStepConcreteDeref_true_sound
+          fuel body args st st' hDeref
+          (checkSymReturnsTrue_sound fuel body args st' hLen hCheck)
+      | none =>
+        rw [hDeref] at hCheck
+        exact symIsReturnTrue_sound fuel body args st hCheck
 
 /-- Check whether `op` and RHS bits `b` form a valid non-empty unsigned upper bound
 comparison (`ret <= b`, or `ret < b` with `b > 0`). -/
@@ -9080,14 +10119,20 @@ def checkSymEnsuresUpperBound1Loop :
     match symStepConcreteInBounds body st with
     | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
     | .none =>
-      match symExtractEnsuresUpperBound1 body st with
-      | .some (scOut, stTrue) =>
-        Bool.and
-          (Bool.and
-            (Nat.beq scOut.bits boundSc.bits)
-            (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
-          (checkSymReturnsTrue fuel body stTrue)
-      | .none => false
+      match symStepConcreteDeref body st with
+      | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+      | .none =>
+        match symExtractEnsuresUpperBound1 body st with
+        | .some (scOut, stTrue) =>
+          Bool.and
+            (Bool.and
+              (Nat.beq scOut.bits boundSc.bits)
+              (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
+            (checkSymReturnsTrue fuel body stTrue)
+        | .none =>
+          match symStepDerefSymArg body st 1 boundSc.sizeBytes with
+          | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+          | .none => false
 
 theorem checkSymEnsuresUpperBound1Loop_sound :
     ∀ (fuel : Nat)
@@ -9113,35 +10158,53 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
           fuel body args st' boundSc r hLen hCheck hArg1 hBle)
     | none =>
       rw [hStep] at hCheck
-      cases hExt : symExtractEnsuresUpperBound1 body st with
+      cases hDeref : symStepConcreteDeref body st with
+      | some st' =>
+        rw [hDeref] at hCheck
+        exact symStepConcreteDeref_true_sound
+          fuel body args st st' hDeref
+          (checkSymEnsuresUpperBound1Loop_sound
+            fuel body args st' boundSc r hLen hCheck hArg1 hBle)
       | none =>
-        rw [hExt] at hCheck
-        nomatch hCheck
-      | some pair =>
-        rw [hExt] at hCheck
-        cases pair with
-        | mk scOut stTrue =>
-          dsimp only at hCheck
-          cases hBitsEq : Nat.beq scOut.bits boundSc.bits with
-          | false =>
-            rw [hBitsEq] at hCheck
+        rw [hDeref] at hCheck
+        cases hExt : symExtractEnsuresUpperBound1 body st with
+        | none =>
+          rw [hExt] at hCheck
+          cases hDerefSym : symStepDerefSymArg body st 1 boundSc.sizeBytes with
+          | none =>
+            rw [hDerefSym] at hCheck
             nomatch hCheck
-          | true =>
-            rw [hBitsEq] at hCheck
-            cases hSzEq : Nat.beq scOut.sizeBytes boundSc.sizeBytes with
+          | some st' =>
+            rw [hDerefSym] at hCheck
+            exact symStepDerefSymArg_true_sound
+              fuel body args st st' 1 boundSc.sizeBytes r hArg1 hDerefSym
+              (checkSymEnsuresUpperBound1Loop_sound
+                fuel body args st' boundSc r hLen hCheck hArg1 hBle)
+        | some pair =>
+          rw [hExt] at hCheck
+          cases pair with
+          | mk scOut stTrue =>
+            dsimp only at hCheck
+            cases hBitsEq : Nat.beq scOut.bits boundSc.bits with
             | false =>
-              rw [hSzEq] at hCheck
+              rw [hBitsEq] at hCheck
               nomatch hCheck
             | true =>
-              rw [hSzEq] at hCheck
-              dsimp only [Bool.and] at hCheck
-              have hScEq : scOut = boundSc :=
-                scalarInt_eq_of_parts
-                  (Nat.eq_of_beq_eq_true hBitsEq)
-                  (Nat.eq_of_beq_eq_true hSzEq)
-              subst hScEq
-              exact symExtractEnsuresUpperBound1_sound
-                fuel body args st scOut stTrue r hLen hExt hCheck hArg1 hBle
+              rw [hBitsEq] at hCheck
+              cases hSzEq : Nat.beq scOut.sizeBytes boundSc.sizeBytes with
+              | false =>
+                rw [hSzEq] at hCheck
+                nomatch hCheck
+              | true =>
+                rw [hSzEq] at hCheck
+                dsimp only [Bool.and] at hCheck
+                have hScEq : scOut = boundSc :=
+                  scalarInt_eq_of_parts
+                    (Nat.eq_of_beq_eq_true hBitsEq)
+                    (Nat.eq_of_beq_eq_true hSzEq)
+                subst hScEq
+                exact symExtractEnsuresUpperBound1_sound
+                  fuel body args st scOut stTrue r hLen hExt hCheck hArg1 hBle
 
 /-- Check that `ensBody` is a 2-argument predicate `[x, ret]` satisfied whenever
 `ret` has `sizeBytes = boundSc.sizeBytes` and `bits ≤ boundSc.bits`. -/
@@ -9269,7 +10332,7 @@ def checkMirAutoSymRange1Bound
   Bool.and
     (Bool.and
       (Nat.beq subjectBody.argCount 1)
-      (checkMirUpperBound1 specFuel reqBody (peekMirUpperBound reqBody)))
+      (checkMirUpperBound1ForSubject specFuel subjectBody reqBody (peekMirUpperBound reqBody)))
     (checkOptMirEnsuresUpperBound1 specFuel optEnsBody)
 
 /-- One-call bound-independent symbolic range discharge combinator for
@@ -9284,9 +10347,24 @@ theorem dischargeRustSymRange1Auto
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = c.body.argCount)
-          (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (MirBoolPredicateHolds reqBody args))
+          (OptArgsTypedForSubject
+            (checkMirUpperBound1Direct specFuel reqBody (peekMirUpperBound reqBody))
+            c.body
+            args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_bound :
       checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
     (h_sym :
@@ -9318,7 +10396,7 @@ theorem dischargeRustSymRange1Auto
       | exact True.intro) :
     VerificationResult c := by
   refine verifyMirNoPanicSym c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len_body, h_req⟩, h_typed⟩
   dsimp only [checkMirAutoSymRange1Bound] at h_bound
   cases hArg1 : Nat.beq c.body.argCount 1 with
   | false =>
@@ -9326,7 +10404,7 @@ theorem dischargeRustSymRange1Auto
     nomatch h_bound
   | true =>
     rw [hArg1] at h_bound
-    cases hReqUb : checkMirUpperBound1 specFuel reqBody (peekMirUpperBound reqBody) with
+    cases hReqUb : checkMirUpperBound1ForSubject specFuel c.body reqBody (peekMirUpperBound reqBody) with
     | false =>
       rw [hReqUb] at h_bound
       nomatch h_bound
@@ -9335,8 +10413,8 @@ theorem dischargeRustSymRange1Auto
       dsimp only [Bool.and] at h_bound
       have h_len1 : length args = 1 :=
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-      rcases checkMirUpperBound1_sound
-        specFuel reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+      rcases checkMirUpperBound1ForSubject_sound
+        specFuel c.body reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
       subst hArgs
       let v0 : Value := .scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }
       exact wpMirSym_mono
@@ -9364,13 +10442,25 @@ theorem dischargeRustTotalSymRange1Auto
         c.pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = c.body.argCount)
-            (MirBoolPredicateHolds reqBody args))
-          (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact h.1)
+            (And
+              (Trusted.Sequence.length args = c.body.argCount)
+              (MirBoolPredicateHolds reqBody args))
+            (mem = (initMachineState c.body args).memory))
+          (OptArgsTypedForSubject
+            (checkMirUpperBound1Direct specFuel reqBody (peekMirUpperBound reqBody))
+            c.body
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_bound :
       checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
     (h_sym :
@@ -9402,7 +10492,7 @@ theorem dischargeRustTotalSymRange1Auto
       | exact True.intro) :
     TotalVerificationResult c := by
   refine verifyTotalMirSym c subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoSymRange1Bound] at h_bound
   cases hArg1 : Nat.beq c.body.argCount 1 with
@@ -9411,7 +10501,7 @@ theorem dischargeRustTotalSymRange1Auto
     nomatch h_bound
   | true =>
     rw [hArg1] at h_bound
-    cases hReqUb : checkMirUpperBound1 specFuel reqBody (peekMirUpperBound reqBody) with
+    cases hReqUb : checkMirUpperBound1ForSubject specFuel c.body reqBody (peekMirUpperBound reqBody) with
     | false =>
       rw [hReqUb] at h_bound
       nomatch h_bound
@@ -9420,8 +10510,8 @@ theorem dischargeRustTotalSymRange1Auto
       dsimp only [Bool.and] at h_bound
       have h_len1 : length args = 1 :=
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-      rcases checkMirUpperBound1_sound
-        specFuel reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+      rcases checkMirUpperBound1ForSubject_sound
+        specFuel c.body reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
       subst hArgs
       let v0 : Value := .scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }
       change wpMirSym subjectFuel c.body
@@ -9532,8 +10622,121 @@ def extractCalleeEnsuresRetPin
       (initSymStateWithCallArgs calleeEnsBody callArgs)
   lookupScalarPin (length callArgs) pins
 
-/-- Check that `calleeEnsBody` pins `retVal` to `expectedRet` when invoked with `callArgs`. -/
-def checkCalleeEnsuresPinsRet
+def mirStmtHasCopyDeref (stmt : Statement) : Bool :=
+  match stmt.kind with
+  | .assign ⟨_, .nil⟩ (.use (.copy { projection := .deref :: _, .. })) => true
+  | _ => false
+
+def mirStmtsHaveCopyDeref : List Statement → Bool
+  | .nil => false
+  | s :: ss => Bool.or (mirStmtHasCopyDeref s) (mirStmtsHaveCopyDeref ss)
+
+def mirBlocksHaveCopyDeref : List BasicBlockData → Bool
+  | .nil => false
+  | bb :: bbs => Bool.or (mirStmtsHaveCopyDeref bb.statements) (mirBlocksHaveCopyDeref bbs)
+
+def mirBodyHasCopyDeref (body : CapturedMir) : Bool :=
+  mirBlocksHaveCopyDeref body.basicBlocks
+
+def peekCalleeEnsuresRetWidth (calleeEnsBody : CapturedMir) : Nat :=
+  match get? calleeEnsBody.localDecls calleeEnsBody.argCount with
+  | .some { ty := { kind := .uint uKind, .. }, .. } => uintBytesOfKind uKind
+  | _ => 0
+
+def OptRetIsScalarOfWidth (directOk : Bool) (width : Nat) (retVal : Value) : Prop :=
+  match directOk with
+  | true => True
+  | false => ∃ b : Nat, retVal = .scalar { bits := b, sizeBytes := width }
+
+def checkSymSinglePinExtLoop :
+    Nat → CapturedMir → SymState → Nat → ScalarInt → Bool
+  | .zero, _, _, _, _ => false
+  | .succ fuel, body, st, expectedIdx, expectedSc =>
+    match symStepConcreteExt body st with
+    | .some st' => checkSymSinglePinExtLoop fuel body st' expectedIdx expectedSc
+    | .none =>
+      match symExtractPinEq body st with
+      | .some (idx, sc, stTrue, stFalse) =>
+        match checkSymReturnsFalseExt fuel body stFalse with
+        | false => false
+        | true =>
+          match Nat.beq idx expectedIdx with
+          | true =>
+            Bool.and
+              (Nat.beq sc.bits expectedSc.bits)
+              (Nat.beq sc.sizeBytes expectedSc.sizeBytes)
+          | false => checkSymSinglePinExtLoop fuel body stTrue expectedIdx expectedSc
+      | .none =>
+        match symStepDerefSymArg body st expectedIdx expectedSc.sizeBytes with
+        | .some st' => checkSymSinglePinExtLoop fuel body st' expectedIdx expectedSc
+        | .none => false
+
+theorem checkSymSinglePinExtLoop_sound :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (args : List Value)
+      (st : SymState)
+      (expectedIdx : Nat)
+      (expectedSc : ScalarInt),
+      checkSymSinglePinExtLoop fuel body st expectedIdx expectedSc = true →
+      (∃ b0 : Nat, get? args expectedIdx = .some (.scalar { bits := b0, sizeBytes := expectedSc.sizeBytes })) →
+      evalMirBoolHoldBounded fuel body (concretizeSymState body args st) →
+      get? args expectedIdx = .some (.scalar expectedSc)
+  | .zero, _, _, _, _, _, hCheck, _, _ => nomatch hCheck
+  | .succ fuel, body, args, st, expectedIdx, expectedSc, hCheck, hArg, hHold => by
+    dsimp only [checkSymSinglePinExtLoop] at hCheck
+    cases hStep : symStepConcreteExt body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact checkSymSinglePinExtLoop_sound
+        fuel body args st' expectedIdx expectedSc hCheck hArg
+        (symStepConcreteExt_sound fuel body args st st' hStep hHold)
+    | none =>
+      rw [hStep] at hCheck
+      cases hExt : symExtractPinEq body st with
+      | some tup =>
+        rw [hExt] at hCheck
+        rcases tup with ⟨idx, sc, stTrue, stFalse⟩
+        dsimp only at hCheck
+        cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
+        | false => rw [hFalse] at hCheck; nomatch hCheck
+        | true =>
+          rw [hFalse] at hCheck
+          dsimp only at hCheck
+          have ⟨hPinIdx, hHoldTrue⟩ :
+              get? args idx = .some (.scalar sc) ∧
+                evalMirBoolHoldBounded fuel body (concretizeSymState body args stTrue) := by
+            cases symExtractPinEq_branch_sound fuel body args st idx sc stTrue stFalse hExt hHold with
+            | inl hT => exact hT
+            | inr hF => exact False.elim (checkSymReturnsFalseExt_sound fuel body args stFalse hFalse hF)
+          cases hIdxEq : Nat.beq idx expectedIdx with
+          | true =>
+            rw [hIdxEq] at hCheck
+            rcases Bool.and_eq_true_iff.1 hCheck with ⟨hBits, hSz⟩
+            have hScEq : sc = expectedSc :=
+              scalarInt_eq_of_parts
+                (Nat.eq_of_beq_eq_true hBits)
+                (Nat.eq_of_beq_eq_true hSz)
+            rw [← Nat.eq_of_beq_eq_true hIdxEq, ← hScEq]
+            exact hPinIdx
+          | false =>
+            rw [hIdxEq] at hCheck
+            exact checkSymSinglePinExtLoop_sound
+              fuel body args stTrue expectedIdx expectedSc hCheck hArg hHoldTrue
+      | none =>
+        rw [hExt] at hCheck
+        cases hDeref : symStepDerefSymArg body st expectedIdx expectedSc.sizeBytes with
+        | none => rw [hDeref] at hCheck; nomatch hCheck
+        | some st' =>
+          rw [hDeref] at hCheck
+          rcases hArg with ⟨b0, hb0⟩
+          exact checkSymSinglePinExtLoop_sound
+            fuel body args st' expectedIdx expectedSc hCheck ⟨b0, hb0⟩
+            (symStepDerefSymArg_hold_sound
+              fuel body args st st' expectedIdx expectedSc.sizeBytes b0 hb0 hDeref hHold)
+
+/-- Direct (non-deref) check that `calleeEnsBody` pins `retVal` to `expectedRet` when invoked with `callArgs`. -/
+def checkCalleeEnsuresPinsRetDirect
     (fuel : Nat)
     (calleeEnsBody : CapturedMir)
     (callArgs : List Value)
@@ -9547,6 +10750,29 @@ def checkCalleeEnsuresPinsRet
       (initSymStateWithCallArgs calleeEnsBody callArgs)
       [(length callArgs, expectedRet)])
 
+/-- Check that `calleeEnsBody` pins `retVal` to `expectedRet` when invoked with `callArgs`
+(supporting both direct scalar comparisons and closure-captured dereferences). -/
+def checkCalleeEnsuresPinsRet
+    (fuel : Nat)
+    (calleeEnsBody : CapturedMir)
+    (callArgs : List Value)
+    (expectedRet : ScalarInt) :
+    Bool :=
+  Bool.or
+    (checkCalleeEnsuresPinsRetDirect fuel calleeEnsBody callArgs expectedRet)
+    (Bool.and
+      (mirBodyHasCopyDeref calleeEnsBody)
+      (Bool.and
+        (Nat.beq calleeEnsBody.argCount (.succ (length callArgs)))
+        (Bool.and
+          (Nat.beq (peekCalleeEnsuresRetWidth calleeEnsBody) expectedRet.sizeBytes)
+          (checkSymSinglePinExtLoop
+            fuel
+            calleeEnsBody
+            (initSymStateWithCallArgs calleeEnsBody callArgs)
+            (length callArgs)
+            expectedRet))))
+
 theorem checkCalleeEnsuresPinsRet_sound
     (fuel : Nat)
     (calleeEnsBody : CapturedMir)
@@ -9555,31 +10781,86 @@ theorem checkCalleeEnsuresPinsRet_sound
     (retVal : Value)
     (h_check :
       checkCalleeEnsuresPinsRet fuel calleeEnsBody callArgs expectedRet = true)
+    (h_ret_ty :
+      OptRetIsScalarOfWidth
+        (Bool.not (mirBodyHasCopyDeref calleeEnsBody))
+        (peekCalleeEnsuresRetWidth calleeEnsBody)
+        retVal)
     (h_ens : MirBoolPredicateHolds calleeEnsBody (callArgs ++ [retVal])) :
     retVal = .scalar expectedRet := by
   dsimp only [checkCalleeEnsuresPinsRet] at h_check
-  cases hArgEq : Nat.beq calleeEnsBody.argCount (.succ (length callArgs)) with
-  | false =>
-    rw [hArgEq] at h_check
-    nomatch h_check
+  cases hDir : checkCalleeEnsuresPinsRetDirect fuel calleeEnsBody callArgs expectedRet with
   | true =>
-    rw [hArgEq] at h_check
-    dsimp only [Bool.and] at h_check
-    have hHold :
-        evalMirBoolHoldBounded fuel calleeEnsBody
-          (initMachineState calleeEnsBody (callArgs ++ [retVal])) :=
-      wpBoolOrExhausted_of_mirBoolPredicateHolds
-        fuel calleeEnsBody (callArgs ++ [retVal]) h_ens
-    rw [← concretizeSymState_initSymStateWithCallArgs
-      calleeEnsBody callArgs retVal (Nat.eq_of_beq_eq_true hArgEq)] at hHold
-    have ⟨hPin, _⟩ :=
-      checkSymPinsLoopDirect_sound
-        fuel calleeEnsBody (callArgs ++ [retVal])
-        (initSymStateWithCallArgs calleeEnsBody callArgs)
-        [(length callArgs, expectedRet)]
-        h_check hHold
-    rw [get?_append_singleton_length callArgs retVal] at hPin
-    injection hPin
+    dsimp only [checkCalleeEnsuresPinsRetDirect] at hDir
+    cases hArgEq : Nat.beq calleeEnsBody.argCount (.succ (length callArgs)) with
+    | false =>
+      rw [hArgEq] at hDir
+      nomatch hDir
+    | true =>
+      rw [hArgEq] at hDir
+      dsimp only [Bool.and] at hDir
+      have hHold :
+          evalMirBoolHoldBounded fuel calleeEnsBody
+            (initMachineState calleeEnsBody (callArgs ++ [retVal])) :=
+        wpBoolOrExhausted_of_mirBoolPredicateHolds
+          fuel calleeEnsBody (callArgs ++ [retVal]) h_ens
+      rw [← concretizeSymState_initSymStateWithCallArgs
+        calleeEnsBody callArgs retVal (Nat.eq_of_beq_eq_true hArgEq)] at hHold
+      have ⟨hPin, _⟩ :=
+        checkSymPinsLoopDirect_sound
+          fuel calleeEnsBody (callArgs ++ [retVal])
+          (initSymStateWithCallArgs calleeEnsBody callArgs)
+          [(length callArgs, expectedRet)]
+          hDir hHold
+      rw [get?_append_singleton_length callArgs retVal] at hPin
+      injection hPin
+  | false =>
+    rw [hDir] at h_check
+    dsimp only [Bool.or] at h_check
+    cases hHasDeref : mirBodyHasCopyDeref calleeEnsBody with
+    | false =>
+      rw [hHasDeref] at h_check
+      nomatch h_check
+    | true =>
+      rw [hHasDeref] at h_check h_ret_ty
+      dsimp only [Bool.and, Bool.not, OptRetIsScalarOfWidth] at h_check h_ret_ty
+      cases hArgEq : Nat.beq calleeEnsBody.argCount (.succ (length callArgs)) with
+      | false =>
+        rw [hArgEq] at h_check
+        nomatch h_check
+      | true =>
+        rw [hArgEq] at h_check
+        dsimp only [Bool.and] at h_check
+        cases hWidthEq : Nat.beq (peekCalleeEnsuresRetWidth calleeEnsBody) expectedRet.sizeBytes with
+        | false =>
+          rw [hWidthEq] at h_check
+          nomatch h_check
+        | true =>
+          rw [hWidthEq] at h_check
+          dsimp only [Bool.and] at h_check
+          have hHold :
+              evalMirBoolHoldBounded fuel calleeEnsBody
+                (initMachineState calleeEnsBody (callArgs ++ [retVal])) :=
+            wpBoolOrExhausted_of_mirBoolPredicateHolds
+              fuel calleeEnsBody (callArgs ++ [retVal]) h_ens
+          rw [← concretizeSymState_initSymStateWithCallArgs
+            calleeEnsBody callArgs retVal (Nat.eq_of_beq_eq_true hArgEq)] at hHold
+          rcases h_ret_ty with ⟨b0, hb0⟩
+          rw [Nat.eq_of_beq_eq_true hWidthEq] at hb0
+          have hArg :
+              ∃ b0 : Nat,
+                get? (callArgs ++ [retVal]) (length callArgs) =
+                  .some (.scalar { bits := b0, sizeBytes := expectedRet.sizeBytes }) := by
+            refine ⟨b0, ?_⟩
+            rw [get?_append_singleton_length callArgs retVal, hb0]
+          have hPin :=
+            checkSymSinglePinExtLoop_sound
+              fuel calleeEnsBody (callArgs ++ [retVal])
+              (initSymStateWithCallArgs calleeEnsBody callArgs)
+              (length callArgs) expectedRet
+              h_check hArg hHold
+          rw [get?_append_singleton_length callArgs retVal] at hPin
+          injection hPin
 
 /-- Fuel-bounded recursive step loop for `checkMirRustModularPinnedSpec`. -/
 def checkMirRustModularPinnedSpecLoop
@@ -9675,7 +10956,12 @@ theorem wpMirModularBounded_of_checkMirRustModularPinnedSpec
         C.post req ans →
         ∃ retVal,
           And (ans = .returned retVal req.memory)
-            (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal])))
+            (And
+              (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal]))
+              (OptRetIsScalarOfWidth
+                (Bool.not (mirBodyHasCopyDeref calleeEnsBody))
+                (peekCalleeEnsuresRetWidth calleeEnsBody)
+                retVal)))
     (h_post :
       ∀ (retVal : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optSubjectEnsBody (args ++ [retVal]) →
@@ -9770,10 +11056,10 @@ theorem wpMirModularBounded_of_checkMirRustModularPinnedSpec
                           (optMirBoolPredicateHolds_of_checkBounded
                             specFuel optCalleeReqBody req.args hReq)
                       · intro ans hPost
-                        rcases h_call_post req ans hPost with ⟨retVal, hAns, hEns⟩
+                        rcases h_call_post req ans hPost with ⟨retVal, hAns, hEns, hRetTy⟩
                         have hRet : retVal = .scalar expectedRet :=
                           checkCalleeEnsuresPinsRet_sound
-                            specFuel calleeEnsBody req.args expectedRet retVal hPin hEns
+                            specFuel calleeEnsBody req.args expectedRet retVal hPin hRetTy hEns
                         rw [hAns, hRet]
                         exact ih (k (.returned (.scalar expectedRet) req.memory)) h
 
@@ -9793,7 +11079,7 @@ def checkMirAutoModularPinnedSpec
   Bool.and
     (Nat.beq subjectBody.argCount (length expected))
     (Bool.and
-      (checkOptMirRequiresPinsScalars specFuel optSubjectReqBody expected)
+      (checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody optSubjectReqBody expected)
       (checkMirRustModularPinnedSpec
         subjectFuel specFuel subjectBody optSubjectEnsBody
         calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody
@@ -9818,16 +11104,29 @@ theorem dischargeRustModularContractAuto
         pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = subjectBody.argCount)
-            (OptMirBoolPredicateHolds optSubjectReqBody args))
-          (mem = (initMachineState subjectBody args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact h.1
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
-      | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
-      | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩)
+            (And
+              (Trusted.Sequence.length args = subjectBody.argCount)
+              (OptMirBoolPredicateHolds optSubjectReqBody args))
+            (mem = (initMachineState subjectBody args).memory))
+          (OptArgsTypedForSubject
+            (checkOptMirRequiresPinsScalarsDirect
+              specFuel optSubjectReqBody (extractOptMirRequiresPins specFuel optSubjectReqBody))
+            subjectBody
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+        | exact h
+        | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+        | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_call_pre :
       ∀ req : MirCallReq,
         req.defPath = calleeDefPath →
@@ -9844,11 +11143,26 @@ theorem dischargeRustModularContractAuto
         C.post req ans →
         ∃ retVal,
           And (ans = .returned retVal req.memory)
-            (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal])) := by
+            (And
+              (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal]))
+              (OptRetIsScalarOfWidth
+                (Bool.not (mirBodyHasCopyDeref calleeEnsBody))
+                (peekCalleeEnsuresRetWidth calleeEnsBody)
+                retVal)) := by
       intro _ _ h
       first
-      | exact h
-      | (rcases h with ⟨rv, hAns, _, hEns⟩; exact ⟨rv, hAns, hEns⟩))
+      | (rcases h with ⟨rv, hAns, hEns, hRetTy⟩
+         refine ⟨rv, hAns, hEns, ?_⟩
+         first
+         | exact True.intro
+         | (rcases hRetTy with ⟨b, _, hEq⟩; exact ⟨b, hEq⟩))
+      | (rcases h with ⟨rv, hAns, hRetTy, hEns⟩
+         refine ⟨rv, hAns, hEns, ?_⟩
+         first
+         | exact True.intro
+         | (rcases hRetTy with ⟨b, _, hEq⟩; exact ⟨b, hEq⟩))
+      | (rcases h with ⟨rv, hAns, hEns⟩
+         exact ⟨rv, hAns, hEns, True.intro⟩))
     (h_check :
       checkMirAutoModularPinnedSpec
         subjectFuel specFuel subjectBody optSubjectReqBody optSubjectEnsBody
@@ -9864,7 +11178,7 @@ theorem dischargeRustModularContractAuto
     ModularVerificationResult
       { body := subjectBody, envAssumed := C.holdsOn, pre := pre, post := post, callees := callees } := by
   refine verifyModularContractWithCalleesMirBounded C subjectBody callees pre post subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoModularPinnedSpec] at h_check
   let expected := extractOptMirRequiresPins specFuel optSubjectReqBody
@@ -9875,7 +11189,7 @@ theorem dischargeRustModularContractAuto
   | true =>
     rw [hArgEq] at h_check
     dsimp only [Bool.and] at h_check
-    cases hPins : checkOptMirRequiresPinsScalars specFuel optSubjectReqBody expected with
+    cases hPins : checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody optSubjectReqBody expected with
     | false =>
       rw [hPins] at h_check
       nomatch h_check
@@ -9886,7 +11200,7 @@ theorem dischargeRustModularContractAuto
         Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
       have h_args : args = mapScalarValues expected :=
         checkOptMirRequiresPinsScalars_sound
-          specFuel optSubjectReqBody expected args hPins h_len h_req
+          specFuel subjectBody optSubjectReqBody expected args hPins h_len h_req h_typed
       subst h_args
       let argsPin := mapScalarValues expected
       have h_init_eq :
@@ -9929,7 +11243,7 @@ def checkMirAutoModularBoundedRange1Spec
     Bool.and
       (Nat.beq subjectBody.argCount 1)
       (Bool.and
-        (checkMirUpperBound1 specFuel subjectReqBody boundSc)
+        (checkMirUpperBound1ForSubject specFuel subjectBody subjectReqBody boundSc)
         (checkAllScalarRange1
           specFuel
           subjectReqBody
@@ -9961,13 +11275,27 @@ theorem dischargeRustModularBoundedRange1Auto
         pre args mem →
         And
           (And
-            (Trusted.Sequence.length args = subjectBody.argCount)
-            (MirBoolPredicateHolds subjectReqBody args))
-          (mem = (initMachineState subjectBody args).memory) := by
-      intro _ _ h
-      first
-      | exact h
-      | exact h.1)
+            (And
+              (Trusted.Sequence.length args = subjectBody.argCount)
+              (MirBoolPredicateHolds subjectReqBody args))
+            (mem = (initMachineState subjectBody args).memory))
+          (OptArgsTypedForSubject
+            (match extractMirUpperBound1 specFuel subjectReqBody with
+             | .some boundSc => checkMirUpperBound1Direct specFuel subjectReqBody boundSc
+             | .none => true)
+            subjectBody
+            args) := by
+      intro _ mem h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inr (Or.inl ⟨mem, h.2⟩)
+        | exact Or.inr (Or.inr ⟨mem, h.2⟩)
+        | exact Or.inl h.2
+        | exact Or.inr h.2)
     (h_call_pre :
       ∀ req : MirCallReq,
         req.defPath = calleeDefPath →
@@ -9984,11 +11312,26 @@ theorem dischargeRustModularBoundedRange1Auto
         C.post req ans →
         ∃ retVal,
           And (ans = .returned retVal req.memory)
-            (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal])) := by
+            (And
+              (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal]))
+              (OptRetIsScalarOfWidth
+                (Bool.not (mirBodyHasCopyDeref calleeEnsBody))
+                (peekCalleeEnsuresRetWidth calleeEnsBody)
+                retVal)) := by
       intro _ _ h
       first
-      | exact h
-      | (rcases h with ⟨rv, hAns, _, hEns⟩; exact ⟨rv, hAns, hEns⟩))
+      | (rcases h with ⟨rv, hAns, hEns, hRetTy⟩
+         refine ⟨rv, hAns, hEns, ?_⟩
+         first
+         | exact True.intro
+         | (rcases hRetTy with ⟨b, _, hEq⟩; exact ⟨b, hEq⟩))
+      | (rcases h with ⟨rv, hAns, hRetTy, hEns⟩
+         refine ⟨rv, hAns, hEns, ?_⟩
+         first
+         | exact True.intro
+         | (rcases hRetTy with ⟨b, _, hEq⟩; exact ⟨b, hEq⟩))
+      | (rcases h with ⟨rv, hAns, hEns⟩
+         exact ⟨rv, hAns, hEns, True.intro⟩))
     (h_check :
       checkMirAutoModularBoundedRange1Spec
         subjectFuel specFuel subjectBody subjectReqBody optSubjectEnsBody
@@ -10004,7 +11347,7 @@ theorem dischargeRustModularBoundedRange1Auto
     ModularVerificationResult
       { body := subjectBody, envAssumed := C.holdsOn, pre := pre, post := post, callees := callees } := by
   refine verifyModularContractWithCalleesMirBounded C subjectBody callees pre post subjectFuel (fun args mem hp => ?_)
-  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  rcases h_pre args mem hp with ⟨⟨⟨h_len_body, h_req⟩, h_mem⟩, h_typed⟩
   subst h_mem
   dsimp only [checkMirAutoModularBoundedRange1Spec] at h_check
   cases hExt : extractMirUpperBound1 specFuel subjectReqBody with
@@ -10012,8 +11355,8 @@ theorem dischargeRustModularBoundedRange1Auto
     rw [hExt] at h_check
     nomatch h_check
   | some boundSc =>
-    rw [hExt] at h_check
-    dsimp only at h_check
+    rw [hExt] at h_check h_typed
+    dsimp only at h_check h_typed
     cases hArg1 : Nat.beq subjectBody.argCount 1 with
     | false =>
       rw [hArg1] at h_check
@@ -10021,7 +11364,7 @@ theorem dischargeRustModularBoundedRange1Auto
     | true =>
       rw [hArg1] at h_check
       dsimp only [Bool.and] at h_check
-      cases hUb : checkMirUpperBound1 specFuel subjectReqBody boundSc with
+      cases hUb : checkMirUpperBound1ForSubject specFuel subjectBody subjectReqBody boundSc with
       | false =>
         rw [hUb] at h_check
         nomatch h_check
@@ -10030,8 +11373,8 @@ theorem dischargeRustModularBoundedRange1Auto
         dsimp only [Bool.and] at h_check
         have h_len1 : length args = 1 :=
           Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
-        rcases checkMirUpperBound1_sound
-          specFuel subjectReqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        rcases checkMirUpperBound1ForSubject_sound
+          specFuel subjectBody subjectReqBody boundSc args hUb h_len1 h_typed h_req with ⟨b, hBle, hArgs⟩
         subst hArgs
         have hRun :=
           checkAllScalarRange1_at_sound
@@ -10063,18 +11406,6 @@ theorem dischargeRustModularBoundedRange1Auto
             exact h_post argsB (initMachineState subjectBody argsB).memory retVal mem' hEns)
           callees
           hRun
-
-theorem symStepConcreteDeref_true_sound
-    (fuel : Nat)
-    (body : CapturedMir)
-    (args : List Value)
-    (st st' : SymState)
-    (h : symStepConcreteDeref body st = .some st')
-    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
-    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
-  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
-  rw [symStepConcreteDeref_stepMirFn_eq body args st st' h]
-  exact hTrue
 
 theorem get?_two_eq_of_blt
     (v : Value)
@@ -10370,10 +11701,28 @@ def isNilMirList : List CapturedMir → Bool
   | .nil => true
   | _ :: _ => false
 
+def checkMirRustEqScalar1IdentityBranch
+    (subjectFuel specFuel : Nat)
+    (reqBody subjectBody ensBody : CapturedMir)
+    (callees : List CapturedMir)
+    (expectedSc : ScalarInt) :
+    Bool :=
+  Bool.and
+    (isNilMirList callees)
+    (Bool.and
+      (Nat.beq subjectBody.argCount 1)
+      (Bool.and
+        (checkMirRequiresPinsScalars specFuel reqBody [expectedSc])
+        (Bool.and
+          (checkSymReturnsSymArg0 subjectFuel subjectBody (initSymState subjectBody))
+          (Bool.and
+            (Nat.beq ensBody.argCount 2)
+            (checkSymSliceBoolTrueBounded specFuel ensBody expectedSc (initSymState ensBody))))))
+
 /-- Closed-term checker for `dischargeRustEqScalar1`: succeeds either when
 `subjectBody` returns `args[0]` and `ensBody` is verified by
-`checkSymSliceBoolTrueBounded`, or when `reqBody` directly pins `args` via
-`checkMirRequiresPinsScalarsDirect` and `checkMirRustPinnedSpecWithCallees` holds. -/
+`checkSymSliceBoolTrueBounded`, or when `reqBody` pins `args` for `subjectBody`
+and `checkMirRustPinnedSpecWithCallees` holds. -/
 def checkMirRustEqScalar1SpecWithCallees
     (subjectFuel specFuel : Nat)
     (reqBody subjectBody ensBody : CapturedMir)
@@ -10381,17 +11730,9 @@ def checkMirRustEqScalar1SpecWithCallees
     (expectedSc : ScalarInt) :
     Bool :=
   Bool.or
+    (checkMirRustEqScalar1IdentityBranch subjectFuel specFuel reqBody subjectBody ensBody callees expectedSc)
     (Bool.and
-      (isNilMirList callees)
-      (Bool.and
-        (Nat.beq subjectBody.argCount 1)
-        (Bool.and
-          (checkSymReturnsSymArg0 subjectFuel subjectBody (initSymState subjectBody))
-          (Bool.and
-            (Nat.beq ensBody.argCount 2)
-            (checkSymSliceBoolTrueBounded specFuel ensBody expectedSc (initSymState ensBody))))))
-    (Bool.and
-      (checkMirRequiresPinsScalarsDirect specFuel reqBody [expectedSc])
+      (checkOptMirRequiresPinsScalarsForSubject specFuel subjectBody (.some reqBody) [expectedSc])
       (checkMirRustPinnedSpecWithCallees
         subjectFuel specFuel subjectBody ensBody callees [.scalar expectedSc]))
 
@@ -10402,7 +11743,7 @@ end PinChecker
 /--
 Width-parametric one-call discharge combinator for a 1-argument scalar function
 annotated with `#[spec(requires: x == constVal, ensures: ...)]` against
-`defaultSpec`, using closed-term `checkMirRequiresPinsScalars` (`:= by rfl`).
+`defaultSpec`, using closed-term `checkOptMirRequiresPinsScalarsForSubject` (`:= by rfl`).
 -/
 theorem dischargeRustEqScalar1
     (width : Nat)
@@ -10414,14 +11755,28 @@ theorem dischargeRustEqScalar1
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = 1)
-          (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
-    (h_pins :
-      checkMirRequiresPinsScalars
-        specFuel
-        reqBody
-        [{ bits := constVal, sizeBytes := width }] = true := by rfl)
+          (And
+            (Trusted.Sequence.length args = 1)
+            (MirBoolPredicateHolds reqBody args))
+          (OptArgsTypedForSubject
+            (Bool.or
+              (checkMirRustEqScalar1IdentityBranch
+                subjectFuel specFuel reqBody c.body ensBody c.callees { bits := constVal, sizeBytes := width })
+              (checkOptMirRequiresPinsScalarsDirect
+                specFuel (.some reqBody) [{ bits := constVal, sizeBytes := width }]))
+            c.body
+            args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_check :
       checkMirRustEqScalar1SpecWithCallees
         subjectFuel
@@ -10442,27 +11797,21 @@ theorem dischargeRustEqScalar1
       intro _ _ h; exact h) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len, h_req⟩, h_typed⟩
   let expectedSc : ScalarInt := { bits := constVal, sizeBytes := width }
   dsimp only [checkMirRustEqScalar1SpecWithCallees] at h_check
   cases hBranch1 :
-      Bool.and
-        (isNilMirList c.callees)
-        (Bool.and
-          (Nat.beq c.body.argCount 1)
-          (Bool.and
-            (checkSymReturnsSymArg0 subjectFuel c.body (initSymState c.body))
-            (Bool.and
-              (Nat.beq ensBody.argCount 2)
-              (checkSymSliceBoolTrueBounded specFuel ensBody expectedSc (initSymState ensBody))))) with
+      checkMirRustEqScalar1IdentityBranch subjectFuel specFuel reqBody c.body ensBody c.callees expectedSc with
   | true =>
+    dsimp only [checkMirRustEqScalar1IdentityBranch] at hBranch1
     rcases Bool.and_eq_true_iff.1 hBranch1 with ⟨hNilCallees, hB1⟩
     rcases Bool.and_eq_true_iff.1 hB1 with ⟨hSubjArg1, hB2⟩
-    rcases Bool.and_eq_true_iff.1 hB2 with ⟨hSubjRet0, hB3⟩
-    rcases Bool.and_eq_true_iff.1 hB3 with ⟨hEnsArg2, hEnsTrue⟩
+    rcases Bool.and_eq_true_iff.1 hB2 with ⟨hSlicePins, hB3⟩
+    rcases Bool.and_eq_true_iff.1 hB3 with ⟨hSubjRet0, hB4⟩
+    rcases Bool.and_eq_true_iff.1 hB4 with ⟨hEnsArg2, hEnsTrue⟩
     have hPins :=
       checkMirRequiresPinsScalars_sound
-        specFuel reqBody [expectedSc] args h_pins h_len h_req
+        specFuel reqBody [expectedSc] args hSlicePins h_len h_req
     cases args with
     | nil => nomatch h_len
     | cons v0 restArgs =>
@@ -10502,12 +11851,17 @@ theorem dischargeRustEqScalar1
           subjectFuel c.body v0 (initSymState c.body) (fun rv => c.post [v0] rv)
           (Nat.eq_of_beq_eq_true hSubjArg1) hSubjRet0 hPostV0
   | false =>
-    rw [hBranch1] at h_check
-    dsimp only [Bool.or] at h_check
-    rcases Bool.and_eq_true_iff.1 h_check with ⟨hDirectPins, hDirectCheck⟩
+    change OptArgsTypedForSubject
+      (Bool.or
+        (checkMirRustEqScalar1IdentityBranch subjectFuel specFuel reqBody c.body ensBody c.callees expectedSc)
+        (checkOptMirRequiresPinsScalarsDirect specFuel (.some reqBody) [expectedSc]))
+      c.body args at h_typed
+    rw [hBranch1] at h_check h_typed
+    dsimp only [Bool.or] at h_check h_typed
+    rcases Bool.and_eq_true_iff.1 h_check with ⟨hSubjPins, hDirectCheck⟩
     have h_args : args = [.scalar expectedSc] :=
-      checkMirRequiresPinsScalarsDirect_sound
-        specFuel reqBody [expectedSc] args hDirectPins h_len h_req
+      checkOptMirRequiresPinsScalars_sound
+        specFuel c.body (.some reqBody) [expectedSc] args hSubjPins h_len h_req h_typed
     subst h_args
     have h_wp :=
       wpMirBounded_of_checkMirRustPinnedSpecWithCallees
@@ -10537,7 +11891,7 @@ abbrev dischargeRustEqUsize := @dischargeRustEqU64
 /--
 Width-parametric one-call discharge combinator for a 2-argument scalar function
 annotated with `#[spec(requires: x == c1 && y == c2, ensures: ...)]` against
-`defaultSpec`, using closed-term `checkMirRequiresPinsScalars` (`:= by rfl`).
+`defaultSpec`, using closed-term `checkOptMirRequiresPinsScalarsForSubject` (`:= by rfl`).
 -/
 theorem dischargeRustEqScalar2
     (w1 w2 : Nat)
@@ -10549,13 +11903,32 @@ theorem dischargeRustEqScalar2
       ∀ args : List Value,
         c.pre args →
         And
-          (Trusted.Sequence.length args = 2)
-          (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
+          (And
+            (Trusted.Sequence.length args = 2)
+            (MirBoolPredicateHolds reqBody args))
+          (OptArgsTypedForSubject
+            (checkOptMirRequiresPinsScalarsDirect
+              specFuel (.some reqBody)
+              [ { bits := c1, sizeBytes := w1 }
+              , { bits := c2, sizeBytes := w2 } ])
+            c.body
+            args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_pins :
-      checkMirRequiresPinsScalarsDirect
+      checkOptMirRequiresPinsScalarsForSubject
         specFuel
-        reqBody
+        c.body
+        (.some reqBody)
         [ { bits := c1, sizeBytes := w1 }
         , { bits := c2, sizeBytes := w2 } ] = true := by rfl)
     (h_check :
@@ -10582,16 +11955,16 @@ theorem dischargeRustEqScalar2
       intro _ h; exact h) :
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
-  rcases h_pre args hp with ⟨h_len, h_req⟩
+  rcases h_pre args hp with ⟨⟨h_len, h_req⟩, h_typed⟩
   have h_args :
       args =
         [ .scalar { bits := c1, sizeBytes := w1 }
         , .scalar { bits := c2, sizeBytes := w2 } ] :=
-    checkMirRequiresPinsScalarsDirect_sound
-      specFuel reqBody
+    checkOptMirRequiresPinsScalars_sound
+      specFuel c.body (.some reqBody)
       [ { bits := c1, sizeBytes := w1 }
       , { bits := c2, sizeBytes := w2 } ]
-      args h_pins h_len h_req
+      args h_pins h_len h_req h_typed
   subst h_args
   have h_wp :=
     wpMirBounded_of_checkMirRustPinnedSpecWithCallees
@@ -10825,11 +12198,27 @@ theorem swap_le_u16_lane {lo hi : Nat} (hlo : lo < 256) (hhi : hi < 256) :
 theorem dischargeRustEqScalar1FuelFree
     (width : Nat) (c : Claim) (reqBody ensBody : CapturedMir) (constVal : Nat)
     (h_pre : ∀ args : List Value, c.pre args →
-      And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
-    (h_pins :
-      checkMirRequiresPinsScalars 64 reqBody [{ bits := constVal, sizeBytes := width }] =
-        true := by rfl)
+      And
+        (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds reqBody args))
+        (OptArgsTypedForSubject
+          (Bool.or
+            (checkMirRustEqScalar1IdentityBranch
+              16 64 reqBody c.body ensBody c.callees { bits := constVal, sizeBytes := width })
+            (checkOptMirRequiresPinsScalarsDirect
+              64 (.some reqBody) [{ bits := constVal, sizeBytes := width }]))
+          c.body
+          args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_check :
       checkMirRustEqScalar1SpecWithCallees 16 64 reqBody c.body ensBody c.callees
         { bits := constVal, sizeBytes := width } = true := by rfl)
@@ -10839,7 +12228,7 @@ theorem dischargeRustEqScalar1FuelFree
       c.post args ret := by
       intro _ _ h; exact h) :
     VerificationResult c :=
-  dischargeRustEqScalar1 width c 16 64 reqBody ensBody constVal h_pre h_pins h_check h_post
+  dischargeRustEqScalar1 width c 16 64 reqBody ensBody constVal h_pre h_check h_post
 
 abbrev dischargeRustEqU8FuelFree := @dischargeRustEqScalar1FuelFree 1
 abbrev dischargeRustEqU16FuelFree := @dischargeRustEqScalar1FuelFree 2
@@ -10851,10 +12240,27 @@ abbrev dischargeRustEqUsizeFuelFree := @dischargeRustEqU64FuelFree
 theorem dischargeRustEqScalar2FuelFree
     (w1 w2 : Nat) (c : Claim) (reqBody ensBody : CapturedMir) (c1 c2 : Nat)
     (h_pre : ∀ args : List Value, c.pre args →
-      And (Trusted.Sequence.length args = 2) (MirBoolPredicateHolds reqBody args) := by
-      intro _ h; exact h)
+      And
+        (And (Trusted.Sequence.length args = 2) (MirBoolPredicateHolds reqBody args))
+        (OptArgsTypedForSubject
+          (checkOptMirRequiresPinsScalarsDirect
+            64 (.some reqBody)
+            [{ bits := c1, sizeBytes := w1 }, { bits := c2, sizeBytes := w2 }])
+          c.body
+          args) := by
+      intro _ h
+      refine ⟨?_, ?_⟩
+      · first
+        | exact h.1
+        | exact h
+      · first
+        | exact True.intro
+        | exact Or.inl h.2
+        | exact Or.inr (Or.inl ⟨_, h.2⟩)
+        | exact Or.inr (Or.inr ⟨_, h.2⟩)
+        | exact Or.inr h.2)
     (h_pins :
-      checkMirRequiresPinsScalarsDirect 64 reqBody
+      checkOptMirRequiresPinsScalarsForSubject 64 c.body (.some reqBody)
         [{ bits := c1, sizeBytes := w1 }, { bits := c2, sizeBytes := w2 }] =
         true := by rfl)
     (h_check :
@@ -10873,6 +12279,9 @@ theorem dischargeRustEqScalar2FuelFree
   dischargeRustEqScalar2 w1 w2 c 16 64 reqBody ensBody c1 c2 h_pre h_pins h_check h_post
 
 abbrev dischargeRustEq2U8FuelFree := @dischargeRustEqScalar2FuelFree 1 1
+abbrev dischargeRustEq2U16FuelFree := @dischargeRustEqScalar2FuelFree 2 2
+abbrev dischargeRustEq2U32FuelFree := @dischargeRustEqScalar2FuelFree 4 4
+abbrev dischargeRustEq2U64FuelFree := @dischargeRustEqScalar2FuelFree 8 8
 
 /-- Fuel-free safe-panic symbolic WP discharge combinator. -/
 theorem verifyByWPSafeFuelFree

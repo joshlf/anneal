@@ -6,267 +6,131 @@ import Obligations.WireframeDemo.decode_wire_header
 
 namespace Proof.WireframeDemo.decode_wire_header
 
-set_option maxRecDepth 8192
-set_option maxHeartbeats 400000
-
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Scalars
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
-open Anneal.Rustc.V2026_06_01.Lower
-open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.SepLogicLenses
 open Specs.WireframeDemo.decode_wire_header
 
-private theorem decode_wireHeader (b1 : Nat) (b2 b3 : UInt8)
-    (hb1 : b1 = 0 ∨ b1 = 1) :
-    decodeValueFromBytes defaultCodecFuel
-      Mir.WireframeDemo.decode_wire_header.layouts
-      { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 }
-      [.init 1 none, .init (UInt8.ofNat b1) none, .init b2 none, .init b3 none] =
-    match
-      (match
-        (match
-          (match
-            decodeScalarLayoutBytes
-              (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 })
-              [.init b2 none, .init b3 none]
-           with
-           | none => none
-           | some v => some [v])
-         with
-         | some vs => some (.scalar { bits := b1, sizeBytes := 1 } :: vs)
-         | none => none)
-       with
-       | some vs => some (.scalar { bits := 1, sizeBytes := 1 } :: vs)
-       | none => none)
-    with
-    | some vals => some (.aggregate 0 vals)
-    | none => none := by
-  rcases hb1 with rfl | rfl <;> rfl
+/-!
+`decode_wire_header` via `MirLiftCore` join sharing. CFG: `bb0 → bb1 → {bb3, bb2}`,
+`bb3 → bb4 → {bb6, bb5}`, `bb6 → {bb8, bb7}`, and the exits `bb2`, `bb5`, `bb7`,
+`bb8` all `goto bb9` (`return`). `lift_path` is a single postcondition-parametric
+`LiftBlockToJoin` path from `bb0` to `bb9` over symbolic header bytes (split only at
+the three `switchInt` guards), and `verified` proves `bb9` once under `RetInv`.
+-/
 
+/-- The trusted `transmute` of the `[1, b1, b2, b3] : [u8; 4]` header into
+`WireHeader { version, flag, payload_len }` (byte-cast through
+`encodeByteCastSourceBytes` / `decodeTypedValueFromBytes`); the `bool` flag byte
+`b1` is a valid `bool` image only for `b1 ≤ 1`. -/
 private theorem evalByteCastAfterOperand_wireHeader
-    (b1 b2 b3 : Nat) (hb1 : b1 = 0 ∨ b1 = 1) (hb2 : b2 < 256) (hb3 : b3 < 256)
+    (b1 b2 b3 : Nat) (hb1 : b1 ≤ 1) (hb2 : b2 < 256) (hb3 : b3 < 256)
     (locals' : List LocalSlot) (mem : Memory) :
-    evalByteCastAfterOperand
-      Mir.WireframeDemo.decode_wire_header.body
+    evalByteCastAfterOperand Mir.WireframeDemo.decode_wire_header.body
       (.copy { local_ := 1, projection := [] })
       { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 }
-      (.aggregate 0
-        [ .scalar { bits := 1, sizeBytes := 1 }
-        , .scalar { bits := b1, sizeBytes := 1 }
-        , .scalar { bits := b2, sizeBytes := 1 }
-        , .scalar { bits := b3, sizeBytes := 1 } ])
-      locals' mem =
-    .ok
-      (.aggregate 0
-        [ .scalar { bits := 1, sizeBytes := 1 }
-        , .scalar { bits := b1, sizeBytes := 1 }
-        , .scalar { bits := b2 + 256 * b3, sizeBytes := 2 } ])
-      locals' mem := by
-  let rawBits :=
-    Nat.add (UInt8.ofNat b2).toBitVec.toNat
-      (Nat.mul 256 (Nat.add (UInt8.ofNat b3).toBitVec.toNat 0))
-  have h_ble : Nat.ble rawBits 65535 = true :=
-    Nat.ble_eq_true_of_le (by dsimp [rawBits]; omega)
-  have h_val : rawBits = b2 + 256 * b3 := by
-    dsimp [rawBits]; omega
-  have h_u16 :
-      decodeScalarLayoutBytes
-        (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 })
-        [.init (UInt8.ofNat b2) none, .init (UInt8.ofNat b3) none] =
-      some (.scalar { bits := b2 + 256 * b3, sizeBytes := 2 }) := by
-    change
-      (match Nat.ble rawBits 65535 with
-       | false => Option.none
-       | true => Option.some (Value.scalar { bits := rawBits, sizeBytes := 2 })) = _
-    rw [h_ble, h_val]
-  have h_enc :
-      encodeValueToBytes defaultCodecFuel
-        Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .array (.uint .u8) 4, layoutIdx := 2 }
-        (.aggregate 0
-          [ .scalar { bits := 1, sizeBytes := 1 }
-          , .scalar { bits := b1, sizeBytes := 1 }
-          , .scalar { bits := b2, sizeBytes := 1 }
-          , .scalar { bits := b3, sizeBytes := 1 } ]) =
-      some
-        [ .init 1 none
-        , .init (UInt8.ofNat b1) none
-        , .init (UInt8.ofNat b2) none
-        , .init (UInt8.ofNat b3) none ] := rfl
-  have h_dst :
-      rigidTyByteSize Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 } = some 4 := rfl
-  have h_src :
-      rigidTyByteSize Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .array (.uint .u8) 4, layoutIdx := 2 } = some 4 := rfl
-  have h_op :
-      operandTy Mir.WireframeDemo.decode_wire_header.body.localDecls
-        Mir.WireframeDemo.decode_wire_header.layouts
-        (.copy { local_ := 1, projection := [] }) =
-      some { kind := .array (.uint .u8) 4, layoutIdx := 2 } := rfl
-  have h_lay :
-      Mir.WireframeDemo.decode_wire_header.body.layouts =
-        Mir.WireframeDemo.decode_wire_header.layouts := rfl
-  unfold evalByteCastAfterOperand
-  rw [h_lay, h_dst, h_op]
-  dsimp only
-  rw [h_src, h_enc]
-  dsimp only [length, List.length, Nat.beq]
-  rw [decode_wireHeader b1 _ _ hb1, h_u16]
+      (rawHeaderValue 1 b1 b2 b3) locals' mem =
+    .ok (.aggregate 0 [.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := b1, sizeBytes := 1 },
+      .scalar { bits := b2 + 256 * b3, sizeBytes := 2 }]) locals' mem := by
+  have h_b1 : decodeScalarLayoutBytesNoForge
+      (ScalarLayout.initialized (.int 8 false) { start := 0, end_ := 1 })
+      [.init (UInt8.ofNat b1) none] = some (.scalar { bits := b1, sizeBytes := 1 }) :=
+    match b1, hb1 with | 0, _ => rfl | 1, _ => rfl | _ + 2, h => nomatch h
+  conv => lhs; whnf
+  show (match (match (match (match decodeScalarLayoutBytesNoForge
+        (ScalarLayout.initialized (.int 8 false) { start := 0, end_ := 1 })
+        [.init (UInt8.ofNat b1) none] with
+      | none => none
+      | some v1 => match (match decodeScalarLayoutBytesNoForge
+          (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 })
+          [.init (UInt8.ofNat b2) none, .init (UInt8.ofNat b3) none] with
+          | none => none | some v => some [v]) with
+        | some vs => some (v1 :: vs) | none => none) with
+      | some vs => some (.scalar { bits := 1, sizeBytes := 1 } :: vs) | none => none) with
+    | some vals => some (Value.aggregate 0 vals) | none => none) with
+    | some v' => RvalueEvalResult.ok v' locals' mem | none => .ub) = _
+  rw [h_b1, decodeScalarLayoutBytesNoForge_u16_le b2 b3 hb2 hb3]
 
-private theorem post_of_val_eq (b0 b1 b2 b3 v : Nat)
-    (hv : v = decodedPayloadLen b0 b1 b2 b3) :
-    Obligations.WireframeDemo.decode_wire_header.claim.post
-      [rawHeaderValue b0 b1 b2 b3]
-      (.scalar { bits := v, sizeBytes := 2 }) := by
+/-- Return-join invariant shared by every path into `bb9`: slot `_0` holds a
+value satisfying the claim postcondition. -/
+private abbrev RetInv (args : List Value) (env : PureEnv) : Prop :=
+  ∃ v, get? env 0 = some (.init v) ∧
+    Obligations.WireframeDemo.decode_wire_header.claim.post args v
+
+/-- Every exit block (`bb2`, `bb5`, `bb7`, `bb8`) stores the specified payload
+length, in `Prop`-guard form, into `_0` before jumping to `bb9`. -/
+private theorem retInv_of {b0 b1 b2 b3 v : Nat} {env : PureEnv}
+    (hv : v = if b0 = 1 ∧ b1 ≤ 1 ∧ b2 + 256 * b3 ≤ 1024 then b2 + 256 * b3 else 0)
+    (h_get : get? env 0 = some (.init (.scalar { bits := v, sizeBytes := 2 }))) :
+    RetInv [rawHeaderValue b0 b1 b2 b3] env := by
+  refine ⟨_, h_get, trivial, fun b0' b1' b2' b3' _ _ _ _ h_eq => ?_⟩
+  simp only [rawHeaderValue, List.cons.injEq, Value.aggregate.injEq, Value.scalar.injEq,
+    ScalarInt.mk.injEq, and_true, true_and] at h_eq
+  obtain ⟨rfl, rfl, rfl, rfl⟩ := h_eq
   subst hv
-  refine ⟨trivial, ?_⟩
-  intro b0' b1' b2' b3' _ _ _ _ h_eq
-  injection h_eq with h_hd _
-  injection h_hd with _ h_f
-  injection h_f with h0 h_f1
-  injection h_f1 with h1 h_f2
-  injection h_f2 with h2 h_f3
-  injection h_f3 with h3 _
-  injection h0 with h0'; injection h0' with hb0_eq _
-  injection h1 with h1'; injection h1' with hb1_eq _
-  injection h2 with h2'; injection h2' with hb2_eq _
-  injection h3 with h3'; injection h3' with hb3_eq _
-  subst hb0_eq hb1_eq hb2_eq hb3_eq
-  rfl
+  simp only [decodedPayloadLen, Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq, and_assoc]
 
-private theorem lift_valid_header
-    (b1 b2 b3 : Nat) (hb1 : b1 = 0 ∨ b1 = 1) (hb2 : b2 < 256) (hb3 : b3 < 256) :
-    PureMirConverges Mir.WireframeDemo.decode_wire_header.body
-      (initPureState Mir.WireframeDemo.decode_wire_header.body [rawHeaderValue 1 b1 b2 b3])
-      (Obligations.WireframeDemo.decode_wire_header.claim.post [rawHeaderValue 1 b1 b2 b3]) := by
-  rcases hb1 with rfl | rfl <;>
-  · -- bb0 -> bb1 -> bb3 -> bb4 -> bb6
-    apply lift_PureMirConverges (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_switchInt (target := 3) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_switchInt (target := 6) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    -- bb6: stmt 0 (`_10 = copy _1 as WireHeader (Transmute)`)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
-    · exact evalPureStmtNorm_assign_local_of_evalRvalue rfl
-        (evalByteCastAfterOperand_wireHeader _ b2 b3 (by decide) hb2 hb3 _ _)
-        rfl (fun h => nomatch h) rfl
-    · -- bb6: stmts 1..2
-      -- (`_12 = copy (_10.2); _11 = Gt(move _12, const 1024_u16)`)
-      apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-      cases h_len : Nat.ble (b2 + 256 * b3) 1024
-      · -- payload_len > 1024: bb6 -> bb7 -> bb9
-        have h_nle1024 : ¬ (b2 + 256 * b3 ≤ 1024) := by
-          intro hc; have ht := Nat.ble_eq_true_of_le hc; rw [h_len] at ht; contradiction
-        apply LiftStmtsTerminator.term_switchInt (target := 7) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-        apply LiftBlock.of_lookup rfl
-        apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-        apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-        apply LiftBlock.of_lookup rfl
-        refine LiftStmtsTerminator.term_return ?_ (Or.inr rfl) ?_ rfl
-          (post_of_val_eq 1 _ b2 b3 0 (by
-            dsimp only [decodedPayloadLen]
-            simp only [h_nle1024, decide_true, decide_false, BEq.beq,
-              Bool.and_false, Bool.false_eq_true, ↓reduceIte])); (· rfl); (· rfl)
-      · -- payload_len ≤ 1024: bb6 -> bb8 -> bb9
-        have h_le1024 : b2 + 256 * b3 ≤ 1024 := Nat.le_of_ble_eq_true h_len
-        apply LiftStmtsTerminator.term_switchInt (target := 8) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-        apply LiftBlock.of_lookup rfl
-        apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-        apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-        apply LiftBlock.of_lookup rfl
-        refine LiftStmtsTerminator.term_return ?_ (Or.inr rfl) ?_ rfl
-          (post_of_val_eq 1 _ b2 b3 (b2 + 256 * b3) (by
-            dsimp only [decodedPayloadLen]; simp only [h_le1024, decide_true]; rfl)); (· rfl); (· rfl)
+private theorem ready : checkMirLiftReady Mir.WireframeDemo.decode_wire_header.body = true := rfl
 
-private theorem lift_invalid_b1 (b1' b2 b3 : Nat) :
-    PureMirConverges Mir.WireframeDemo.decode_wire_header.body
-      (initPureState Mir.WireframeDemo.decode_wire_header.body [rawHeaderValue 1 (b1' + 1 + 1) b2 b3])
-      (Obligations.WireframeDemo.decode_wire_header.claim.post [rawHeaderValue 1 (b1' + 1 + 1) b2 b3]) := by
-  have h_c : ¬ (b1' + 1 + 1 ≤ 1) := by omega
-  -- bb0 -> bb1 -> bb3 -> bb4 -> bb5 -> bb9
-  apply lift_PureMirConverges (by rfl)
-  apply LiftBlock.of_lookup rfl
-  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-  apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftBlock.of_lookup rfl
-  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-  apply LiftStmtsTerminator.term_switchInt (target := 3) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftBlock.of_lookup rfl
-  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-  apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftBlock.of_lookup rfl
-  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-  apply LiftStmtsTerminator.term_switchInt (target := 5) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftBlock.of_lookup rfl
-  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-  apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-  apply LiftBlock.of_lookup rfl
-  refine LiftStmtsTerminator.term_return ?_ (Or.inr rfl) ?_ rfl
-    (post_of_val_eq 1 (b1' + 1 + 1) b2 b3 0 (by
-      dsimp only [decodedPayloadLen]
-      simp only [h_c, decide_false, Bool.and_false, Bool.false_and, Bool.false_eq_true, ↓reduceIte])); (· rfl); (· rfl)
+private theorem lift_path (b0 b1 b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) :
+    LiftBlockToJoin Mir.WireframeDemo.decode_wire_header.body 0
+      (initPureEnv Mir.WireframeDemo.decode_wire_header.body [rawHeaderValue b0 b1 b2 b3]) 9
+      (RetInv [rawHeaderValue b0 b1 b2 b3]) := by
+  have hr := ready
+  -- bb0 (`0 < 4` bounds check) -> bb1 (`raw[0] != 1`) -> {bb3, early exit bb2}
+  refine LiftBlockToJoin.of_lookup (by rfl)
+    (LiftStmtsToJoin.eval_rest_checked_ready hr (by rfl) (by rfl)
+      (LiftStmtsToJoin.term_assert_ready hr (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+        (liftBlock_switchInt_diamond_toJoin (thenBb := 3) (elseBb := 2) (b0 = 1)
+          hr (by rfl) (by rfl) (by rfl) (by rfl) ?_ fun h =>
+            ⟨by rw [Bool.eq_false_iff.mpr (h ∘ Nat.eq_of_beq_eq_true)]; rfl,
+              liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+                (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.1).symm rfl))⟩)))
+  intro h
+  subst h
+  refine ⟨rfl, ?_⟩
+  -- bb3 (`1 < 4` bounds check) -> bb4 (`raw[1] > 1`) -> {bb6, early exit bb5}
+  refine LiftBlockToJoin.of_lookup (by rfl)
+    (LiftStmtsToJoin.eval_rest_checked_ready hr (by rfl) (by rfl)
+      (LiftStmtsToJoin.term_assert_ready hr (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+        (liftBlock_switchInt_diamond_toJoin (thenBb := 6) (elseBb := 5) (b1 ≤ 1)
+          hr (by rfl) (by rfl) (by rfl) (by rfl) ?_ fun h =>
+            ⟨by rw [nat_ble_eq_false_of_not_le h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+              (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.2.1).symm rfl))⟩)))
+  intro h1
+  refine ⟨by rw [Nat.ble_eq_true_of_le h1]; rfl, ?_⟩
+  -- bb6: `_10 = transmute raw`, `_12 = _10.2`, `_11 = _12 > 1024` -> {bb8, bb7}
+  refine LiftBlockToJoin.of_lookup (by rfl) ?_
+  refine LiftStmtsToJoin.cons_eval_checked_ready hr (by rfl) rfl
+    ((evalPureStmtChecked_eq_evalPureStmtNorm _ _ _ _ _).trans
+      (evalPureStmtNorm_assign_local_of_setSpineChecked? rfl
+        (evalByteCastAfterOperand_wireHeader b1 b2 b3 h1 hb2 hb3 _ _)
+        rfl (fun h => nomatch h) rfl))
+    (LiftStmtsToJoin.eval_rest_checked_ready hr (by rfl) (by rfl)
+      (LiftStmtsToJoin.term_switchInt_cases_ready (thenBb := 8) (elseBb := 7)
+        hr (by rfl) (by rfl) (by rfl) (by rfl) (b2 + 256 * b3 ≤ 1024) ?_ ?_))
+  · intro h
+    exact ⟨by rw [Nat.ble_eq_true_of_le h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+      (LiftBlockToJoin.refl (retInv_of (ite_eq_left ⟨rfl, h1, h⟩).symm rfl))⟩
+  · intro h
+    exact ⟨by rw [nat_ble_eq_false_of_not_le h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+      (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.2.2).symm rfl))⟩
 
-private theorem lift_invalid_b0 (b0 b1 b2 b3 : Nat) (h_v1 : b0 ≠ 1) :
-    PureMirConverges Mir.WireframeDemo.decode_wire_header.body
-      (initPureState Mir.WireframeDemo.decode_wire_header.body [rawHeaderValue b0 b1 b2 b3])
-      (Obligations.WireframeDemo.decode_wire_header.claim.post [rawHeaderValue b0 b1 b2 b3]) := by
-  have h_cases : b0 = 0 ∨ ∃ b0', b0 = b0' + 1 + 1 := by
-    rcases b0 with _ | _ | b0'
-    · exact Or.inl rfl
-    · exact False.elim (h_v1 rfl)
-    · exact Or.inr ⟨b0', rfl⟩
-  rcases h_cases with rfl | ⟨b0', rfl⟩ <;>
-  · -- bb0 -> bb1 -> bb2 -> bb9
-    apply lift_PureMirConverges (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_switchInt (target := 2) (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-    apply LiftBlock.of_lookup rfl
-    refine LiftStmtsTerminator.term_return ?_ (Or.inr rfl) ?_ rfl
-      (post_of_val_eq _ b1 b2 b3 0 (by
-        first
-        | rfl
-        | (have h_beq_f : (b0' + 1 + 1 == 1) = false := rfl
-           dsimp only [decodedPayloadLen]
-           simp only [h_beq_f, Bool.false_and, Bool.false_eq_true, ↓reduceIte]))); (· rfl); (· rfl)
-
-/-- Universal verification certificate for `decode_wire_header` via
-`MirLiftCore`. -/
+/-- Universal verification certificate for `decode_wire_header` via `MirLiftCore`
+join sharing: one postcondition-parametric entry-to-`bb9` path (`lift_path`) and a
+single proof of the shared return block `bb9` under `RetInv`. -/
 theorem verified : VerificationResult Obligations.WireframeDemo.decode_wire_header.claim := by
-  refine verifyMirNoPanic_of_pureExec _ rfl ?_
-  intro args h_pre
-  rcases h_pre with ⟨_, b0, b1, b2, b3, hb0, hb1, hb2, hb3, h_args⟩
-  rw [h_args]
-  by_cases h_v1 : b0 = 1
-  · subst h_v1
-    by_cases h_c : b1 ≤ 1
-    · exact lift_valid_header b1 b2 b3 (by omega) hb2 hb3
-    · rcases b1 with _ | _ | b1'
-      · omega
-      · omega
-      · exact lift_invalid_b1 b1' b2 b3
-  · exact lift_invalid_b0 b0 b1 b2 b3 h_v1
+  refine verifyMirNoPanic_of_mirLiftReady_toJoin _ 9 RetInv ready ?_ ?_
+  · intro args h_pre
+    rcases h_pre with ⟨_, b0, b1, b2, b3, _, _, hb2, hb3, rfl⟩
+    exact lift_path b0 b1 b2 b3 hb2 hb3
+  · intro args _ env ⟨_, h_get, h_post⟩
+    exact LiftBlockConverges.of_lookup (by rfl)
+      (LiftStmtsConverges.term_return_ready ready (by rfl) rfl rfl h_get h_post)
 
 end Proof.WireframeDemo.decode_wire_header
