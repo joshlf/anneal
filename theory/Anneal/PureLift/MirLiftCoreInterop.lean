@@ -93,7 +93,12 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    `LiftBlockToJoin` for the MIR body; `liftBlockToJoin_of_runBlockCfgToBlock`,
    `liftBlockToJoin_of_whileCutpoint`, and `liftBlockToJoin_of_whileForRangeUp`
    derive the PureLift segment (and the join invariant) from header-targeted
-   runs, loop cutpoints, and counted loops.
+   runs, loop cutpoints, and counted loops. Per-step simulation proofs invert
+   single machine steps with `blockCfgStep_eq_cont_iff` /
+   `blockCfgStep_eq_done_iff` / `blockCfgStep_eq_fault_iff`, and
+   `forwardSim_of_waitFree` (with `stepsTo_of_convergedJump`) discharges every
+   `.convergedJump` delay tick by stuttering, so only `wait = 0` block
+   transitions remain.
 7. **Adequacy bridge** (`Adapter.pure_lift_sound`): `stepOperationalAdapter`
    realizes PureLift's `OperationalAdapter` by exact `k`-step paths
    (`StepPath`, interconvertible with `StepsTo`) of any MirLiftCore machine,
@@ -119,7 +124,10 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    (`evalFuel_blockCfgStep_stepBasicBlock_handleFree`), and sub-identity
    partial wrappers (`SubIdWrap`, satisfied by the `handleFreeOutOpt` guard that
    `stepBasicBlock` puts on joined `.convergedJump` arms), whose halts carry the
-   unwrapped return value (`evalFuel_blockCfgStep_halted_of_subIdWrap`).
+   unwrapped return value (`evalFuel_blockCfgStep_halted_of_subIdWrap`,
+   `blockCfgStep_done_of_subIdWrap`) and which machine steps preserve on CFGs
+   that only emit sub-identity wrappers (`EmitsSubIdWraps`,
+   `subIdWrap_of_blockCfgStep_cont`).
 
 All results are exercised non-vacuously at the end of the file on concrete
 PureLift CFGs with symbolic data (`testCfgStep` countdown, the `S6` count-up
@@ -1538,6 +1546,45 @@ theorem blockCfgStep_eq_fault_iff
         rw [hst]
         dsimp only
         rw [hw]
+
+/-- `stepBb` emits only sub-identity wrappers (`SubIdWrap`) from the states of
+`Inv`: every `.jumpWrapped` / `.convergedJump` wrapper it produces there may
+reject a value but never changes it (as for the `handleFreeOutOpt`-guarded
+`.convergedJump` that `stepBasicBlock` emits for a `.continuing` join). -/
+def EmitsSubIdWraps (stepBb : Nat → State → BlockStepResult State Ret)
+    (Inv : Nat → State → Prop) : Prop :=
+  ∀ bb st, Inv bb st →
+    match stepBb bb st with
+    | .jumpWrapped wrapRet _ _ => SubIdWrap wrapRet
+    | .convergedJump _ wrapRet _ _ => SubIdWrap wrapRet
+    | _ => True
+
+/-- **Sub-identity pending wrappers are preserved by machine steps** from `Inv`
+states of a CFG that emits only sub-identity wrappers there, so a simulation
+relation may require `SubIdWrap s.wrap` (instead of the identity wrapper) and
+still survive `.jumpWrapped` / `.convergedJump` transitions; its halts then
+carry the raw block return (`blockCfgStep_done_of_subIdWrap`). -/
+theorem subIdWrap_of_blockCfgStep_cont
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    {Inv : Nat → State → Prop} (hEmit : EmitsSubIdWraps stepBb Inv)
+    {s s' : BlockMachineState State Ret} (hInv : Inv s.bb s.st)
+    (hWrap : SubIdWrap s.wrap) (h : blockCfgStep stepBb s = .cont s') :
+    SubIdWrap s'.wrap := by
+  have hE := hEmit s.bb s.st hInv
+  rcases (blockCfgStep_eq_cont_iff stepBb s s').mp h with
+    ⟨_, _, hEq⟩ | ⟨_, hStep⟩
+  · subst hEq
+    exact hWrap
+  · rcases hStep with ⟨_, _, _, hEq⟩ | ⟨wrapRet, _, _, hst, hEq⟩ |
+        ⟨_, wrapRet, _, _, hst, hEq⟩
+    · subst hEq
+      exact hWrap
+    · subst hEq
+      rw [hst] at hE
+      exact subIdWrap_composeWrap hWrap hE
+    · subst hEq
+      rw [hst] at hE
+      exact subIdWrap_composeWrap hWrap hE
 
 /-- Any pending `.convergedJump` delay `wait` drains to `wait = 0` via a
 MirLiftCore `StepsTo` segment without changing `wrap`, `bb`, or `st`. -/
@@ -3223,16 +3270,22 @@ theorem wpConverges_blockCfgStep_stepBasicBlock_handleFree {Val : Type}
   wpConverges_blockCfgStep_stepBasicBlock_handleFree_of_subIdWrap alg blocks
     subIdWrap_some h
 
+/-- `FlowPlan.skip` falls through with the unchanged state. -/
 theorem evalPlan_skip {Val : Type} (alg : ValAlgebra Val) (s : SymState Val) :
     evalPlan alg .skip s = .ok (.continuing s) := rfl
 
+/-- `FlowPlan.skip` produces only `.continuing` flows. -/
 theorem evalPlan_skip_continuing {Val : Type} (alg : ValAlgebra Val) :
     ∀ s f, evalPlan alg .skip s = .ok f → Exists fun s' => f = .continuing s' := by
   intro s f h
   injection h with hf
   exact ⟨s, hf.symm⟩
 
-theorem evalPlan_act_continuing {Val : Type} (alg : ValAlgebra Val)
+/-- `FlowPlan.act` produces only `.continuing` flows. `protected`: the
+`V2026_06_01` bridge declares its own `evalPlan_act_continuing`, and its tests
+open both namespaces, so an unprotected copy here makes every unqualified use
+there ambiguous. Refer to this one as `MirLiftCoreInterop.evalPlan_act_continuing`. -/
+protected theorem evalPlan_act_continuing {Val : Type} (alg : ValAlgebra Val)
     (a : PrimAction Val) :
     ∀ s f, evalPlan alg (.act a) s = .ok f →
       Exists fun s' => f = .continuing s' := by
@@ -5359,6 +5412,41 @@ theorem sampleBranchBlockCfg_convergedJump_transition_canary :
   ⟨⟨_, rfl⟩,
    subIdWrap_composeWrap subIdWrap_some (subIdWrap_handleFreeOutOpt stdValAlg)⟩
 
+/-- The 2-local symbolic entry state of `sampleBranchBlockCfg` (`_0` a symbolic
+boolean, `_1 = 0`). -/
+def sampleSymSt2 : SymState StdVal :=
+  ⟨[⟨.symBool true, .unborrowed⟩, ⟨.nat 0, .unborrowed⟩], [], [], [], [], 0⟩
+
+/-- **Non-vacuity of `EmitsSubIdWraps` and `subIdWrap_of_blockCfgStep_cont` on
+live `stepBasicBlock`**: on the symbolic diamond of `sampleBranchBlockCfg`,
+block `0` emits a `.convergedJump` whose wrapper is the sub-identity
+`handleFreeOutOpt` guard, so a sub-identity pending wrapper survives the
+transition into join block `3` (with the `armSteps = 1` delay pending). -/
+theorem sampleBranchBlockCfg_emitsSubIdWraps_canary :
+    EmitsSubIdWraps (stepBasicBlock stdValAlg sampleBranchBlockCfg)
+        (fun bb st => bb = 0 ∧ st = sampleSymSt2) ∧
+    (∀ s', blockCfgStep (stepBasicBlock stdValAlg sampleBranchBlockCfg)
+        ⟨some, 0, sampleSymSt2, 0⟩ = .cont s' →
+      SubIdWrap s'.wrap ∧ s'.bb = 3 ∧ s'.wait = 1) := by
+  have hEmit : EmitsSubIdWraps (stepBasicBlock stdValAlg sampleBranchBlockCfg)
+      (fun bb st => bb = 0 ∧ st = sampleSymSt2) := by
+    intro bb st hInv
+    obtain ⟨hBb, hSt⟩ := hInv
+    subst hBb
+    subst hSt
+    exact subIdWrap_handleFreeOutOpt stdValAlg
+  refine ⟨hEmit, fun s' h =>
+    ⟨subIdWrap_of_blockCfgStep_cont _ hEmit ⟨rfl, rfl⟩ subIdWrap_some h, ?_⟩⟩
+  obtain ⟨stJ, hJ⟩ : Exists fun stJoined =>
+      blockCfgStep (stepBasicBlock stdValAlg sampleBranchBlockCfg)
+          ⟨some, 0, sampleSymSt2, 0⟩ =
+        .cont ⟨composeWrap some (handleFreeOutOpt stdValAlg), 3, stJoined, 1⟩ :=
+    ⟨_, rfl⟩
+  rw [hJ] at h
+  injection h with hEq
+  subst hEq
+  exact ⟨rfl, rfl⟩
+
 /-- **Non-vacuity of the wrapper frame rule** (`wpConverges_blockCfgStep_wrap_iff`)
 on the countdown CFG: under the pending wrapper `(+ 1)` it converges to `101`,
 and under the everywhere-rejecting wrapper it converges to nothing. -/
@@ -5632,7 +5720,7 @@ theorem convergedJump_waitFree_forwardSim_and_stepInversion_canaries :
      ⟨2, ⟨.nat 10, []⟩, rfl, rfl⟩,
    evalPlan_branch_continuing stdValAlg countUpCond
      (wfPlan_act stdValAlg _) (wfPlan_skip stdValAlg)
-     (evalPlan_act_continuing stdValAlg _)
+     (MirLiftCoreInterop.evalPlan_act_continuing stdValAlg _)
      (evalPlan_skip_continuing stdValAlg)⟩
 
 end Canaries
