@@ -4502,6 +4502,30 @@ def DynCallSite.wellFormed (site : DynCallSite) : Bool :=
       !site.lookupOp.traitRef.args.isEmpty
   | none => false
 
+/-- `lastPathSegmentAux prevColon seg bytes`: the last `::`-separated segment of the
+UTF-8 bytes of a `DefPath` (`seg` is the current segment, reversed; `prevColon`
+records a pending single `:`, byte `58`). Structural on `bytes`, so kernel- and
+`decide`-evaluable on literals, like the trusted byte-wise `stringEq`. -/
+def lastPathSegmentAux : Bool → List UInt8 → List UInt8 → List UInt8
+  | prev, seg, [] => (if prev then (58 : UInt8) :: seg else seg).reverse
+  | prev, seg, b :: rest =>
+    if b.toNat = 58 then
+      if prev then lastPathSegmentAux false [] rest else lastPathSegmentAux true seg rest
+    else
+      lastPathSegmentAux false (b :: if prev then (58 : UInt8) :: seg else seg) rest
+
+/-- Last `::`-separated segment (the item name) of a `DefPath`. -/
+def lastPathSegment (p : DefPath) : List UInt8 :=
+  lastPathSegmentAux false [] p.toByteArray.data.toList
+
+/-- The dispatched body implements the called trait method. Rust requires an impl
+item to carry the name of the trait item it implements (and an inherited default
+method *is* the trait item), so a vtable slot whose target's item name differs from
+the called method's is never the right slot: the site's `slotIdx` does not belong
+to the method in its call key. -/
+def implementsCalledMethod (calledMethod target : DefPath) : Bool :=
+  decide (lastPathSegment calledMethod = lastPathSegment target)
+
 /-- Resolve a `dyn` call through the runtime vtable pointer `vtablePtr`:
 `resolveVTableChain` (direct or supertrait-chained `UnOp.vtableMethodLookup`),
 then `abiCompatible`. -/
@@ -4531,7 +4555,9 @@ OpaqueCalleeTable.lookup → stepBranchPruned`. An ill-formed site (call key not
 virtual call on the first vtable's trait) fails closed (`MirStepNode.unsupported`:
 a configuration error, never attributed to the program), a receiver without a
 vtable pointer is UB, missing evidence fails closed, a CFI type-id mismatch is the
-defined CFI trap (`abort`), and every other semantic error is UB. -/
+defined CFI trap (`abort`), and every other semantic error is UB. A resolved slot
+whose target does not implement the called method (`implementsCalledMethod`: the
+site's slot index belongs to another method) also fails closed. -/
 def dynDispatchStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
   if site.wellFormed then
@@ -4539,7 +4565,10 @@ def dynDispatchStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : D
     | none => MirStepNode.fail .ub
     | some vt =>
       match resolveDynTarget env site vt with
-      | .ok target => stepBranchPruned (redirectResolver tbl site.dynKey target) body s
+      | .ok target =>
+        if implementsCalledMethod site.dynKey.1 target.1 then
+          stepBranchPruned (redirectResolver tbl site.dynKey target) body s
+        else MirStepNode.unsupported
       | .err .cfiTypeIdMismatch => MirStepNode.retOutcome .abort
       | .err _ => MirStepNode.fail .ub
       | .unsupported _ => MirStepNode.unsupported
@@ -4572,10 +4601,11 @@ theorem dynDispatchStep_eq_of_resolved {env : CompilerQueryEnv} {tbl : OpaqueCal
     {site : DynCallSite} {body : CapturedMir} {s : MachineState} {vt : ProvenancePtr}
     {target : DefPath × List RigidTy} (hwf : site.wellFormed = true)
     (hvt : site.vtablePtr? s = some vt)
-    (h : resolveDynTarget env site vt = .ok target) :
+    (h : resolveDynTarget env site vt = .ok target)
+    (hname : implementsCalledMethod site.dynKey.1 target.1 = true) :
     dynDispatchStep env tbl site body s =
       stepBranchPruned (redirectResolver tbl site.dynKey target) body s := by
-  simp only [dynDispatchStep, hwf, ite_true, hvt, h]
+  simp only [dynDispatchStep, hwf, ite_true, hvt, h, hname]
 
 /-- An ill-formed site fails closed at every state, whatever the environment,
 table, or receiver. -/
@@ -4619,7 +4649,11 @@ theorem dynDispatchStep_cone_narrow (env : CompilerQueryEnv)
     | some vt =>
       dsimp only
       cases hr : resolveDynTarget env site vt with
-      | ok target => exact stepBranchPruned_congr body s (hcone vt target hvt hr)
+      | ok target =>
+        dsimp only
+        cases hn : implementsCalledMethod site.dynKey.1 target.1 with
+        | false => rfl
+        | true => exact stepBranchPruned_congr body s (hcone vt target hvt hr)
       | err e => cases e <;> rfl
       | unsupported m => rfl
 
@@ -4904,6 +4938,7 @@ theorem dynDemandStep_eq_dynDispatchStep_of_resolved {env : CompilerQueryEnv}
     {tbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir} {s : MachineState}
     {vt : ProvenancePtr} {target : DefPath × List RigidTy} (hwf : site.wellFormed = true)
     (hvt : site.vtablePtr? s = some vt) (hr : resolveDynTarget env site vt = .ok target)
+    (hname : implementsCalledMethod site.dynKey.1 target.1 = true)
     (hu : demandsUnregisteredDyn site body s = false) :
     dynDemandStep env tbl site body s = dynDispatchStep env tbl site body s := by
   unfold dynDemandStep
@@ -4911,7 +4946,7 @@ theorem dynDemandStep_eq_dynDispatchStep_of_resolved {env : CompilerQueryEnv}
   | true => rfl
   | false =>
     simp only [Bool.false_eq_true, ite_false, hu]
-    rw [dynDispatchStep_eq_of_resolved hwf hvt hr,
+    rw [dynDispatchStep_eq_of_resolved hwf hvt hr hname,
       stepBranchPruned_redirect_of_not_demanded tbl site body s target hd]
 
 /-- A step that does not demand the `dyn` key is exactly the trusted `stepMirFn`
@@ -5342,17 +5377,21 @@ theorem canary_dyn_trait_arg_mismatch_fails_closed :
 lowered program). -/
 abbrev DynCallRegistry : Type := List DynCallSite
 
-/-- Look up the registered `DynCallSite` for call key `key` (`(defPath, typeArgs)`). -/
+/-- The registered `DynCallSite` for call key `key` (`(defPath, typeArgs)`), if
+exactly one site is registered for it. An ambiguous key (two or more sites) has no
+site, so a virtual call on it fails closed instead of silently taking whichever
+site comes first (`canary_dyn_registry_ambiguity_fails_closed`), mirroring the
+trusted resolver's demand for a *unique* most-specific `impl`. -/
 def DynCallRegistry.findSite? (reg : DynCallRegistry) (key : DefPath × List RigidTy) :
     Option DynCallSite :=
-  match reg with
-  | [] => none
-  | site :: rest =>
-    if decide (site.dynKey = key) then some site else findSite? rest key
+  match reg.filter (fun site => decide (site.dynKey = key)) with
+  | [site] => some site
+  | _ => none
 
-/-- A registry is well formed when every registered site is well formed. -/
+/-- A registry is well formed when every registered site is well formed and no two
+sites share a call key. -/
 def DynCallRegistry.wellFormed (reg : DynCallRegistry) : Bool :=
-  reg.all DynCallSite.wellFormed
+  reg.all DynCallSite.wellFormed && decide (reg.map (·.dynKey)).Nodup
 
 /-- Multi-site demand-gated dynamic-dispatch step:
 - if the active step at `s` demands a call key registered in `reg`, dispatch via
@@ -5391,12 +5430,12 @@ theorem dynRegistryStep_singleton (env : CompilerQueryEnv) (tbl : OpaqueCalleeTa
     by_cases heq : (k.defPath, k.typeArgs) = site.dynKey
     · have h1 : decide (site.dynKey = (k.defPath, k.typeArgs)) = true := decide_eq_true heq.symm
       have h2 : decide ((k.defPath, k.typeArgs) = site.dynKey) = true := decide_eq_true heq
-      simp only [h1, h2, ite_true]
+      simp only [List.filter_cons, List.filter_nil, h1, h2, ite_true]
     · have h1 : decide (site.dynKey = (k.defPath, k.typeArgs)) = false :=
         decide_eq_false (fun h => heq h.symm)
       have h2 : decide ((k.defPath, k.typeArgs) = site.dynKey) = false := decide_eq_false heq
-      simp only [h1, h2, Bool.false_eq_true, ite_false, Bool.not_false, Bool.and_true]
-      rfl
+      simp only [List.filter_cons, List.filter_nil, h1, h2, Bool.false_eq_true, ite_false,
+        Bool.not_false, Bool.and_true]
 
 /-- Multi-step evaluation with a singleton registry `[site]` equals `evalDynWithOpaqueCallees`. -/
 theorem evalDynRegistryWithOpaqueCallees_singleton (env : CompilerQueryEnv)
@@ -5588,6 +5627,54 @@ theorem canary_dyn_multi_site_registry :
   refine ⟨by decide, by decide +kernel, by decide +kernel, by decide +kernel,
     evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check hExt 16 dynMultiSiteInit
       (by decide +kernel)⟩
+
+/-- Root calling `<dyn Area as Area>::perimeter`. -/
+def dynPerimeterRoot : CapturedMir :=
+  { protoLitIfRoot true "proto::Area::perimeter" [.dynamic "proto::Area"] "proto::g_dead" with
+    argCount := 1, localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩] }
+
+/-- A well-formed site for `<dyn Area as Area>::perimeter` whose lookup reads slot `0`
+of the `Area` vtable, which holds `area`'s implementation. -/
+def dynSlotMismatchSite : DynCallSite :=
+  { dynSite with dynKey := ("proto::Area::perimeter", [.dynamic "proto::Area"]) }
+
+/-- **Slot/method mismatch canary**: `dynSlotMismatchSite` passes B3's
+`DynCallSite.wellFormed` (right trait, right arguments) and its slot resolves, but
+the slot holds `<impl Area for Circle>::area`, not a `perimeter` implementation.
+B3's step ran it anyway — the redirected pruned step halts returning `31`, `area`'s
+value, for a `perimeter` call — while the guarded step fails closed. -/
+theorem canary_dyn_slot_method_mismatch_fails_closed :
+    dynSlotMismatchSite.wellFormed = true ∧
+    resolveDynTarget dynEnv13 dynSlotMismatchSite ⟨7, 0⟩ =
+      .ok ("proto::<impl Area for Circle>::area", []) ∧
+    implementsCalledMethod "proto::Area::perimeter" "proto::<impl Area for Circle>::area" = false ∧
+    implementsCalledMethod "proto::Area::area" "proto::<impl Area for Circle>::area" = true ∧
+    implementsCalledMethod "proto::SubArea::bonus" "proto::<impl SubArea for Circle>::bonus" = true ∧
+    (runSteps (stepBranchPruned (redirectResolver dynFullTbl dynSlotMismatchSite.dynKey
+        ("proto::<impl Area for Circle>::area", [])) dynPerimeterRoot) 12
+        (initMachineState dynPerimeterRoot [.ptr ⟨7, 0⟩ 0]) []).summary =
+      ⟨.halted, [.event 1], some 31, none⟩ ∧
+    (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSlotMismatchSite dynPerimeterRoot 12
+        (initMachineState dynPerimeterRoot [.ptr ⟨7, 0⟩ 0])).summary =
+      ⟨.faulted, [.event 1], none, none⟩ := by
+  decide +kernel
+
+/-- A second site registered for `dynSite`'s call key (pointing at slot `1`). -/
+def dynDuplicateSite : DynCallSite := { dynSite with lookupOp := ⟨dynTraitRef, 1, []⟩ }
+
+/-- **Registry ambiguity canary**: with two sites registered for the same call key,
+B3's first-match lookup silently dispatched through whichever came first; the
+registry is now ill formed (`wellFormed = false`, duplicate key), the key has no
+site, and the virtual call fails closed. The unambiguous registry still runs. -/
+theorem canary_dyn_registry_ambiguity_fails_closed :
+    DynCallRegistry.wellFormed [dynSite, dynDuplicateSite] = false ∧
+    DynCallRegistry.findSite? [dynSite, dynDuplicateSite] dynSite.dynKey = none ∧
+    (evalDynRegistryWithOpaqueCallees dynEnv13 dynFullTbl [dynSite, dynDuplicateSite]
+        dynRoot 12 dynInit).summary = ⟨.faulted, [.event 1], none, none⟩ ∧
+    DynCallRegistry.wellFormed [dynSite] = true ∧
+    (evalDynRegistryWithOpaqueCallees dynEnv13 dynFullTbl [dynSite] dynRoot 12 dynInit).summary =
+      ⟨.halted, [.event 1], some 31, none⟩ := by
+  decide +kernel
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -6023,6 +6110,18 @@ end ShadowingDemo
  Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_dyn_multi_site_registry
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.implementsCalledMethod' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms implementsCalledMethod
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_slot_method_mismatch_fails_closed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_slot_method_mismatch_fails_closed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_registry_ambiguity_fails_closed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_registry_ambiguity_fails_closed
 
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 

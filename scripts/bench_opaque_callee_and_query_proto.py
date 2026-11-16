@@ -70,11 +70,15 @@ PROTOTYPE_NAMESPACE = "Anneal.DemandCompilerQueryAndOpaqueCalleePrototype"
 BENCH_PACKAGE = "AnnealOpaqueCalleeBench"
 BENCH_MODULE = f"{BENCH_PACKAGE}.DemandCompilerQueryAndOpaqueCalleePrototype"
 PROTOTYPE_REL = Path("theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean")
-VARIANTS = ("linear_list", "opaque_o1", "opaque_pruned", "opaque_trait")
+VARIANTS = ("linear_list", "opaque_o1", "opaque_pruned", "linear_trait", "opaque_trait")
 CERT_LABELS = ("cert_gen_live", "cert_gen_dead", "cert_gen_trait")
 # The naive baseline is allowed to exhaust Lean's kernel resources (recorded as
 # data); every opaque-table and certificate measurement must be a checked proof.
-BASELINE_LABELS = ("linear_list",)
+BASELINE_LABELS = ("linear_list", "linear_trait")
+# Each opaque variant is compared against the baseline of the *same* obligation:
+# mono lookups against `linear_list`, trait dispatch against `linear_trait`.
+SPEEDUP_BASELINE = {"opaque_o1": "linear_list", "opaque_pruned": "linear_list",
+                    "opaque_trait": "linear_trait"}
 DEFAULT_SIZES = (4, 16, 64, 128)
 DEFAULT_REPS = 3
 
@@ -235,14 +239,15 @@ def certificate(label: str, name: str, k: int) -> str:
             f'(by decide +kernel) (rfl : benchCallee{k}.defPath = "{p}")')
 
 
-PROBE_PARTS = ("opaque", "linear")
+PROBE_PARTS = ("opaque", "linear", "linear_trait")
 
 
 def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
     """Probe for table size `m` (`m >= 2`). `part = "opaque"` measures the
-    certificates and the opaque variants; `part = "linear"` measures the
-    concrete-list baseline in its own Lean process, so a kernel resource blowup of
-    the baseline can never contaminate the opaque measurements."""
+    certificates and the opaque variants; `part = "linear"` (mono lookups) and
+    `part = "linear_trait"` (trait dispatch) measure the concrete-list baselines,
+    each in its own Lean process, so a kernel resource blowup of one baseline can
+    never contaminate another measurement."""
     if part not in PROBE_PARTS:
         raise ValueError(f"unknown probe part {part!r}")
     if m < 2:
@@ -285,6 +290,11 @@ def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
               f"{taken} ∧ {live_res}")
     pruned_trait = (f"stepTerminatorWith true benchTbl.lookup benchInit {switch_term} (some benchRoot) = "
                     f"{taken} ∧ {trait_res}")
+    # Trait-dispatch baseline T(M): the trusted branch step and the trusted
+    # `TraitImplEntry` resolution over the concrete list (`flatMapTraitImpls`,
+    # `collectMatchingTraitImpls`, `findCallee?` across all M callees) — the same
+    # call resolution `opaque_trait` certifies.
+    linear_trait = f"evalTerminator benchInit {switch_term} (some benchRoot) = {taken} ∧ {trait_res}"
     opaque_live = "(opaqueCalleeTable_lookup_eq_trusted benchList _ _ _ _).symm.trans (lookupCallee_hit_mono certLive rfl)"
     opaque_dead = "(opaqueCalleeTable_lookup_eq_trusted benchList _ _ _ _).symm.trans (lookupCallee_hit_mono certDead rfl)"
     opaque_trait = (
@@ -297,6 +307,8 @@ def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
     for r in range(reps):
         if part == "linear":
             lines.append(f'#bench_hb "linear_list" theorem benchLinear{r} : {unpruned} := ⟨rfl, rfl, rfl⟩')
+        elif part == "linear_trait":
+            lines.append(f'#bench_hb "linear_trait" theorem benchLinearTrait{r} : {linear_trait} := ⟨rfl, rfl⟩')
         else:
             lines.append(f'#bench_hb "opaque_o1" theorem benchOpaque{r} : {unpruned} := '
                          f"⟨rfl, {opaque_live}, {opaque_dead}⟩")
@@ -376,16 +388,18 @@ def summarize(per_size: dict[int, dict[str, dict[str, float]]]) -> dict[str, Any
             "wall_ms_per_callee": linear_slope([float(m) for m in sizes], mss),
             "heartbeat_growth_first_to_last": (hbs[-1] / hbs[0]) if hbs and hbs[0] else None,
         }
-    speedups: dict[str, dict[str, float]] = {}
+    speedups: dict[str, dict[str, Any]] = {}
     for m in sizes:
-        lin = per_size[m]["linear_list"]
-        speedups[str(m)] = {
-            f"{v}_heartbeat_speedup": (lin["heartbeats"] / per_size[m][v]["heartbeats"]) if per_size[m][v]["heartbeats"] else float("inf")
-            for v in ("opaque_o1", "opaque_pruned", "opaque_trait")
-        } | {
-            f"{v}_wall_speedup": (lin["wall_ms"] / per_size[m][v]["wall_ms"]) if per_size[m][v]["wall_ms"] else float("inf")
-            for v in ("opaque_o1", "opaque_pruned", "opaque_trait")
-        }
+        row: dict[str, Any] = {}
+        for v, base in SPEEDUP_BASELINE.items():
+            lin, opq = per_size[m][base], per_size[m][v]
+            row[f"{v}_heartbeat_speedup"] = (lin["heartbeats"] / opq["heartbeats"]) if opq["heartbeats"] else float("inf")
+            row[f"{v}_wall_speedup"] = (lin["wall_ms"] / opq["wall_ms"]) if opq["wall_ms"] else float("inf")
+            # A baseline that Lean rejected (kernel resource exhaustion) only yields a
+            # lower bound: the speedup is over the work done until the failure.
+            row[f"{v}_baseline"] = base
+            row[f"{v}_lower_bound"] = lin.get("status", "ok") != "ok"
+        speedups[str(m)] = row
     return {"scaling": scaling, "speedups": speedups}
 
 
@@ -964,14 +978,18 @@ def render_markdown(bench: dict[str, Any] | None, audit: dict[str, Any] | None) 
             out.append(f"| {v} | {sc['heartbeats_per_callee']:.1f} | {sc['heartbeats_loglog_slope']:.3f} | "
                        f"{g:.2f}x |" if g is not None else f"| {v} | {sc['heartbeats_per_callee']:.1f} | "
                        f"{sc['heartbeats_loglog_slope']:.3f} | n/a |")
+        out.append("\nSpeedups are against the baseline of the same obligation: `opaque_o1` / `opaque_pruned` "
+                   "vs `linear_list` (mono lookups), `opaque_trait` vs `linear_trait` (trait dispatch); "
+                   "`≥` marks a lower bound over a baseline Lean rejected.")
         out.append("\n| M | opaque_o1 Hb speedup | opaque_pruned Hb speedup | opaque_trait Hb speedup | opaque_o1 wall speedup | opaque_pruned wall speedup | opaque_trait wall speedup |")
         out.append("|---|---|---|---|---|---|---|")
         for m in bench["sizes"]:
             sp = bench["speedups"][str(m)]
-            out.append(f"| {m} | {sp['opaque_o1_heartbeat_speedup']:.1f}x | {sp['opaque_pruned_heartbeat_speedup']:.1f}x | "
-                       f"{sp['opaque_trait_heartbeat_speedup']:.1f}x | "
-                       f"{sp['opaque_o1_wall_speedup']:.1f}x | {sp['opaque_pruned_wall_speedup']:.1f}x | "
-                       f"{sp['opaque_trait_wall_speedup']:.1f}x |")
+            def cell(v: str, kind: str) -> str:
+                prefix = "≥" if sp.get(f"{v}_lower_bound") else ""
+                return f"{prefix}{sp[f'{v}_{kind}_speedup']:.1f}x"
+            out.append(f"| {m} | " + " | ".join(cell(v, "heartbeat") for v in ("opaque_o1", "opaque_pruned", "opaque_trait"))
+                       + " | " + " | ".join(cell(v, "wall") for v in ("opaque_o1", "opaque_pruned", "opaque_trait")) + " |")
         co = bench.get("coimport")
         if co is not None:
             out.append(f"\nCo-import check (`{' + '.join(co['imports'])}`): "

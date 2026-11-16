@@ -342,6 +342,21 @@ class RepoConsistencyTest(unittest.TestCase):
         for e in proto_enums:
             self.assertIn(f"instDecidableEq{e}Proto", ident_set, e)
 
+    def test_a3_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "lastPathSegmentAux",
+            "lastPathSegment",
+            "implementsCalledMethod",
+            "dynPerimeterRoot",
+            "dynSlotMismatchSite",
+            "canary_dyn_slot_method_mismatch_fails_closed",
+            "dynDuplicateSite",
+            "canary_dyn_registry_ambiguity_fails_closed",
+        ):
+            self.assertIn(name, ident_toks, f"missing A3 theorem: {name}")
+
     def test_b3_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")
         ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
@@ -488,7 +503,19 @@ class RealLeanBenchmarkTest(unittest.TestCase):
     def test_opaque_beats_linear(self) -> None:
         self.assertLess(self.hb(16, "opaque_o1"), self.hb(16, "linear_list"))
         self.assertLess(self.hb(16, "opaque_pruned"), self.hb(16, "opaque_o1") * 1.05)
-        self.assertLess(self.hb(16, "opaque_trait"), self.hb(16, "linear_list"))
+        self.assertLess(self.hb(16, "opaque_trait"), self.hb(16, "linear_trait"))
+
+    def test_trait_dispatch_baseline_is_like_for_like(self) -> None:
+        # The trait-dispatch certificate must be compared against trusted trait
+        # resolution over the concrete list, which grows with the table, not
+        # against the mono-lookup baseline.
+        self.assertGreater(self.hb(16, "linear_trait"), 2.0 * self.hb(4, "linear_trait"))
+        for m in (4, 16):
+            sp = self.result["speedups"][str(m)]
+            self.assertEqual(sp["opaque_trait_baseline"], "linear_trait")
+            self.assertEqual(sp["opaque_o1_baseline"], "linear_list")
+            self.assertAlmostEqual(sp["opaque_trait_heartbeat_speedup"],
+                                   self.hb(m, "linear_trait") / self.hb(m, "opaque_trait"))
 
     def test_certificate_generation_is_linear_and_amortized(self) -> None:
         self.assertGreater(self.hb(16, "cert_gen_live"), 2.0 * self.hb(4, "cert_gen_live"))
