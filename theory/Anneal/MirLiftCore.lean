@@ -17612,6 +17612,140 @@ theorem mirWpConverges_coneBodies_narrow_of_closed_poly (cone : List DefPath)
     (calleesAgreeOn_coneBodies cone c₁) h_closed
     (noTraitImpl_coneBodies_of_callConeClosedPoly h_closed) h_ac h_cs post h_post
 
+/-- Any clean entry memory (`mem.callees = []` and `mem.traitImpls = body.traitImpls`, e.g.
+`emptyMemory` when `body.traitImpls = []`) satisfies `CalleeInitWf` for every `c : CalleeEnv`
+(both non-empty and empty `[]`). -/
+theorem calleeInitWf_of_clean_mem (body : CapturedMir) (mem : Memory) (c : CalleeEnv)
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls) :
+    CalleeInitWf body mem c :=
+  Or.inr ⟨h_mc, h_mti⟩
+
+/-- **Uniform `rfl`-checkable polymorphic narrowing to `coneBodies cone c₁` (`runCfgWithCallees`)**:
+works uniformly whether `coneBodies cone c₁` is non-empty or empty (`[]`). -/
+theorem runCfgWithCallees_coneBodies_narrow_of_closed_poly_clean (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) (c₁ : CalleeEnv)
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    runCfgWithCallees fuel body args mem (coneBodies cone c₁) =
+      (runCfgWithCallees fuel body args mem c₁).map
+        (MirOutcome.mapMem (Memory.withCallees (coneBodies cone c₁))) :=
+  runCfgWithCallees_coneBodies_narrow_of_closed_poly cone fuel body args mem
+    (calleeInitWf_of_clean_mem body mem c₁ h_mc h_mti)
+    (calleeInitWf_of_clean_mem body mem (coneBodies cone c₁) h_mc h_mti)
+    h_closed h_ac h_cs
+
+/-- **Uniform `rfl`-checkable polymorphic narrowing to `coneBodies cone c₁` (`wpMirExecSym`)**. -/
+theorem wpMirExecSym_coneBodies_narrow_of_closed_poly_clean (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) (c₁ : CalleeEnv)
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees (coneBodies cone c₁)) out) ↔
+      post out) :
+    wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          (coneBodies cone c₁))) post ↔
+      wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          c₁)) post :=
+  wpMirExecSym_coneBodies_narrow_of_closed_poly cone fuel body args mem
+    (calleeInitWf_of_clean_mem body mem c₁ h_mc h_mti)
+    (calleeInitWf_of_clean_mem body mem (coneBodies cone c₁) h_mc h_mti)
+    h_closed h_ac h_cs post h_post
+
+/-- **Uniform `rfl`-checkable polymorphic narrowing to `coneBodies cone c₁` (`MirWpConverges`)**. -/
+theorem mirWpConverges_coneBodies_narrow_of_closed_poly_clean (cone : List DefPath)
+    (body : CapturedMir) (args : List Value) (mem : Memory) (c₁ : CalleeEnv)
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees (coneBodies cone c₁)) out) ↔
+      post out) :
+    MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          (coneBodies cone c₁)) post ↔
+      MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) post :=
+  mirWpConverges_coneBodies_narrow_of_closed_poly cone body args mem
+    (calleeInitWf_of_clean_mem body mem c₁ h_mc h_mti)
+    (calleeInitWf_of_clean_mem body mem (coneBodies cone c₁) h_mc h_mti)
+    h_closed h_ac h_cs post h_post
+
+theorem calleesAgreeOn_nil_of_coneBodies_eq_nil {cone : List DefPath} {c₁ : CalleeEnv}
+    (h_nil : coneBodies cone c₁ = []) : calleesAgreeOn cone c₁ [] :=
+  h_nil ▸ calleesAgreeOn_coneBodies cone c₁
+
+theorem noTraitImpl_nil_of_callConeClosedPoly {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti : List TraitImplEntry}
+    (h_closed : CallConeClosedPoly cone root c₁ ti = true) :
+    ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (ti ++ flatMapTraitImpls []) dp = false := by
+  intro dp hdp
+  have h := noTraitImpl_of_callConeClosedPoly h_closed hdp
+  rw [hasTraitImplForDefPath_append, Bool.or_eq_false_iff] at h ⊢
+  exact ⟨h.1, rfl⟩
+
+/-- **Direct polymorphic narrowing to the empty callee table `[]` (`runCfgWithCallees`)** when
+`coneBodies cone c₁ = []` (e.g. functions calling only polymorphic inline intrinsics such as
+`size_of_val::<[u32]>` or `align_of_val::<[u32]>`). -/
+theorem runCfgWithCallees_nil_narrow_of_closed_poly_clean (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) (c₁ : CalleeEnv)
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_nil : coneBodies cone c₁ = [])
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    runCfgWithCallees fuel body args mem [] =
+      (runCfgWithCallees fuel body args mem c₁).map
+        (MirOutcome.mapMem (Memory.withCallees [])) :=
+  runCfgWithCallees_cone_narrow_of_closed_poly_wf cone fuel body args mem
+    (calleeInitWf_of_clean_mem body mem c₁ h_mc h_mti)
+    (calleeInitWf_of_clean_mem body mem [] h_mc h_mti)
+    (calleesAgreeOn_nil_of_coneBodies_eq_nil h_nil) h_closed
+    (noTraitImpl_nil_of_callConeClosedPoly h_closed) h_ac h_cs
+
+/-- **Direct polymorphic narrowing to the empty callee table `[]` (`wpMirExecSym`)**. -/
+theorem wpMirExecSym_nil_narrow_of_closed_poly_clean (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) (c₁ : CalleeEnv)
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_nil : coneBodies cone c₁ = [])
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees []) out) ↔ post out) :
+    wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          [])) post ↔
+      wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          c₁)) post :=
+  wpMirExecSym_cone_narrow_of_closed_poly_wf cone fuel body args mem
+    (calleeInitWf_of_clean_mem body mem c₁ h_mc h_mti)
+    (calleeInitWf_of_clean_mem body mem [] h_mc h_mti)
+    (calleesAgreeOn_nil_of_coneBodies_eq_nil h_nil) h_closed
+    (noTraitImpl_nil_of_callConeClosedPoly h_closed) h_ac h_cs post h_post
+
+/-- **Direct polymorphic narrowing to the empty callee table `[]` (`MirWpConverges`)**. -/
+theorem mirWpConverges_nil_narrow_of_closed_poly_clean (cone : List DefPath)
+    (body : CapturedMir) (args : List Value) (mem : Memory) (c₁ : CalleeEnv)
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_nil : coneBodies cone c₁ = [])
+    (h_mc : mem.callees = []) (h_mti : mem.traitImpls = body.traitImpls)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees []) out) ↔ post out) :
+    MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem []) post ↔
+      MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) post :=
+  mirWpConverges_cone_narrow_of_closed_poly_wf cone body args mem
+    (calleeInitWf_of_clean_mem body mem c₁ h_mc h_mti)
+    (calleeInitWf_of_clean_mem body mem [] h_mc h_mti)
+    (calleesAgreeOn_nil_of_coneBodies_eq_nil h_nil) h_closed
+    (noTraitImpl_nil_of_callConeClosedPoly h_closed) h_ac h_cs post h_post
+
 end CallConeNarrowing
 
 end Anneal.MirLiftCore

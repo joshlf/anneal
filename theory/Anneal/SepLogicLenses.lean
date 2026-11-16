@@ -25489,6 +25489,588 @@ theorem ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWriteWithLayouts_both_re
       restProjR fatR ptrR hLen₁ hSlotR hExtR hTagR hRoot₁ hDescR₁ hWhole₂
   exact ⟨hL₂, hR₂, hRoot₂⟩
 
+/-! ### Symbolic `encodeUntypedValueToBytes` ↔ `ByteLensCodec.encodeElems` & Borrow-Backed Slice Bridges -/
+
+theorem appendAbstractBytes_eq_append :
+    ∀ (xs ys : List AbstractByte), appendAbstractBytes xs ys = xs ++ ys
+  | [], _ => rfl
+  | x :: xs, ys => congrArg (x :: ·) (appendAbstractBytes_eq_append xs ys)
+
+/--
+**`encodeUntypedValueToBytes_aggregate_map`**: when every element `x` encodes under
+`encodeUntypedValueToBytes fuel (toVal x)` to `some (c.encode x)`, the untyped byte encoding of
+`.aggregate vIdx (xs.map toVal)` at fuel `fuel + 1` is `some (ByteLensCodec.encodeElems c xs)`.
+-/
+theorem encodeUntypedValueToBytes_aggregate_map {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (toVal : α → Value) (fuel vIdx : Nat)
+    (h_enc : ∀ x, encodeUntypedValueToBytes fuel (toVal x) = some (c.encode x)) :
+    ∀ (xs : List α),
+      encodeUntypedValueToBytes (fuel + 1) (.aggregate vIdx (xs.map toVal)) =
+        some (ByteLensCodec.encodeElems c xs)
+  | [] => rfl
+  | x :: xs => by
+    show (match encodeUntypedValueToBytes fuel (toVal x),
+        encodeUntypedValueToBytes (fuel + 1) (.aggregate vIdx (xs.map toVal)) with
+      | some b1, some b2 => some (appendAbstractBytes b1 b2)
+      | _, _ => none) = some (c.encode x ++ ByteLensCodec.encodeElems c xs)
+    rw [h_enc x, encodeUntypedValueToBytes_aggregate_map c toVal fuel vIdx h_enc xs]
+    dsimp only
+    rw [appendAbstractBytes_eq_append]
+
+/-- **`encodeUntypedValueToBytes_uintLE`**: at positive fuel, `.scalar ⟨v.val, sz⟩` (`0 < sz`)
+encodes under `encodeUntypedValueToBytes` to `some ((ByteLensCodec.uintLE sz).encode v)`. -/
+theorem encodeUntypedValueToBytes_uintLE {sz : Nat} (hsz : 0 < sz) (fuel : Nat)
+    (v : {v : Nat // v < 256 ^ sz}) :
+    encodeUntypedValueToBytes (fuel + 1) (.scalar ⟨v.val, sz⟩) =
+      some ((ByteLensCodec.uintLE sz).encode v) :=
+  ByteLensCodec.encodeScalarBytes_uintLE_encode hsz v
+
+private theorem take_length_eq {α : Type} : ∀ (xs : List α), xs.take xs.length = xs
+  | [] => rfl
+  | x :: xs => congrArg (x :: ·) (take_length_eq xs)
+
+/-- **`sliceTypedAt_encodeElems`**: the concatenated element encodings `ByteLensCodec.encodeElems c xs`
+carry the `SliceTypedAt` view of `xs` at offset `0`. -/
+theorem sliceTypedAt_encodeElems {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (aid : AllocId) (xs : List α) :
+    SliceTypedAt c (WidePtrVal.mk ⟨aid, 0⟩ xs.length) xs (ByteLensCodec.encodeElems c xs) := by
+  have hlen := ByteLensCodec.encodeElems_length c xs
+  refine sliceTypedAt_of_decodeElems c aid xs.length 0 xs (ByteLensCodec.encodeElems c xs)
+    (by omega) ?_
+  rw [List.drop_zero, ← hlen, take_length_eq]
+  exact ByteLensCodec.decodeElems_encodeElems c xs
+
+theorem splice_append_left {α : Type} :
+    ∀ (u bs w : List α) (off : Nat),
+      splice (u ++ bs) (u.length + off) w = u ++ splice bs off w
+  | [], bs, w, off => by
+    dsimp only [splice, List.nil_append, List.length_nil]
+    rw [Nat.zero_add]
+  | a :: u, bs, w, off => by
+    simp only [splice, List.cons_append, List.length_cons, Nat.succ_add, List.take_succ_cons,
+      List.drop_succ_cons]
+    exact congrArg (a :: ·) (splice_append_left u bs w off)
+
+theorem splice_encodeElems_set {α : Type} {n : Nat} (c : ByteLensCodec α n) :
+    ∀ (xs : List α) (idx : Nat) (v : α), idx < xs.length →
+      splice (ByteLensCodec.encodeElems c xs) (idx * n) (c.encode v) =
+        ByteLensCodec.encodeElems c (xs.set idx v)
+  | [], _, _, h => absurd h (Nat.not_lt_zero _)
+  | x :: xs, 0, v, _ => by
+    simp only [Nat.zero_mul, splice, List.take_zero, List.nil_append, Nat.zero_add,
+      c.encode_len, ByteLensCodec.encodeElems, List.drop_left' (c.encode_len x),
+      List.set_cons_zero]
+  | x :: xs, idx + 1, v, h => by
+    have hlt : idx < xs.length := Nat.lt_of_succ_lt_succ h
+    have hmul : (idx + 1) * n = (c.encode x).length + idx * n := by
+      rw [c.encode_len, Nat.succ_mul, Nat.add_comm]
+    rw [ByteLensCodec.encodeElems, hmul, splice_append_left,
+      splice_encodeElems_set c xs idx v hlt, List.set_cons_succ, ByteLensCodec.encodeElems]
+
+/--
+**`writeTyped_encodeElems_set`**: writing `v` at byte offset `idx * n` (`idx < xs.length`) into
+`ByteLensCodec.encodeElems c xs` produces `some (ByteLensCodec.encodeElems c (xs.set idx v))`.
+-/
+theorem writeTyped_encodeElems_set {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (xs : List α) {idx : Nat} (h : idx < xs.length) (v : α) :
+    writeTyped c (idx * n) v (ByteLensCodec.encodeElems c xs) =
+      some (ByteLensCodec.encodeElems c (xs.set idx v)) := by
+  have hle : idx * n + n ≤ (ByteLensCodec.encodeElems c xs).length := by
+    rw [ByteLensCodec.encodeElems_length]
+    have h1 : (idx + 1) * n ≤ xs.length * n := Nat.mul_le_mul_right n h
+    rw [Nat.add_mul, Nat.one_mul] at h1
+    exact h1
+  rw [writeTyped_eq_splice c v hle, splice_encodeElems_set c xs idx v h]
+
+@[simp]
+theorem readSliceBackingAggregate?_aggregate_zero_nil (indexLocals : List LocalSlot)
+    (elems : List Value) (minCount : Nat) (expectedElemSzOpt : Option Nat) :
+    readSliceBackingAggregate? indexLocals (.aggregate 0 elems) [] minCount expectedElemSzOpt =
+      some ([], 0, elems) := rfl
+
+/--
+**`WidePtrVal.evalRvalue_len_borrow`**: ground-MIR `Rvalue.len (*place)` theorem for a
+**borrow-backed** slice fat pointer (`lookupBorrow mem.borrows wide.1.tag = some entry` with
+`TreeBorrowPerm.PermitsRead entry.perm` and backing aggregate `.aggregate 0 elems` in
+`entry.targetLocal`), complementing the global-backed `WidePtrVal.evalRvalue_len`.
+-/
+theorem WidePtrVal.evalRvalue_len_borrow (locals locals' : List LocalSlot) (place : Place)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (elems : List Value) (elemOff : Nat) (wide : WidePtrVal)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hBorrow : lookupBorrow mem.borrows wide.1.tag = some entry)
+    (hPerm : TreeBorrowPerm.PermitsRead entry.perm)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals' entry.targetLocal = some (.init (.aggregate 0 elems)))
+    (hElemOff : byteOffsetToElemIdx? wide.1.offsetBytes (inferElemListByteStride elems) =
+      some elemOff)
+    (hFit : elemOff + wide.2 ≤ elems.length) :
+    evalRvalue locals (.len place) mem localDecls layouts =
+      .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem := by
+  have hb : Nat.ble (Nat.add elemOff wide.2) (length elems) = true :=
+    Nat.ble_eq_true_of_le hFit
+  show evalPlaceLen locals place mem localDecls layouts = _
+  unfold evalPlaceLen
+  dsimp (config := { zeta := true }) only
+  rw [hTy]
+  dsimp only
+  rw [hSplit]
+  dsimp only
+  rw [hRead]
+  simp only [WidePtrVal.toValue, Nat.beq_refl, Bool.and_self, hBorrow]
+  cases hp : entry.perm with
+  | disabled => rw [hp] at hPerm; cases hPerm
+  | unique | frozen | reservedFrz _ | reservedIM | cell =>
+    dsimp only
+    rw [hTarget]
+    dsimp only
+    rw [hProj, readSliceBackingAggregate?_aggregate_zero_nil]
+    dsimp only
+    rw [hElemOff]
+    dsimp only
+    rw [show Nat.add elemOff 0 = elemOff from Nat.add_zero elemOff, hb]
+    rfl
+
+/--
+**`ActiveTypedSliceBorrow.len_eq_borrow`**: for a borrow-backed slice lens on `wide.1.tag`
+(`ActiveTypedSliceBorrow c mem.borrows wide.1.tag wide xs bytes`), both `Rvalue.len (*place)` and
+`Rvalue.unaryOp .ptrMetadata ptrOp` evaluate to `.scalar ⟨xs.length, layoutPointerBytes layouts⟩`.
+-/
+theorem ActiveTypedSliceBorrow.len_eq_borrow {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {wide : WidePtrVal} {xs : List α} {bytes : ByteMem} {mem : Memory}
+    (h : ActiveTypedSliceBorrow c mem.borrows wide.1.tag wide xs bytes)
+    (locals locals' : List LocalSlot) (place : Place) (ptrOp : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (elems : List Value) (elemOff : Nat)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hBorrow : lookupBorrow mem.borrows wide.1.tag = some entry)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals' entry.targetLocal = some (.init (.aggregate 0 elems)))
+    (hElemOff : byteOffsetToElemIdx? wide.1.offsetBytes (inferElemListByteStride elems) =
+      some elemOff)
+    (hFit : elemOff + wide.2 ≤ elems.length) :
+    evalRvalue locals (.len place) mem localDecls layouts =
+        .ok (.scalar ⟨xs.length, layoutPointerBytes layouts⟩) locals' mem ∧
+      evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls layouts =
+        .ok (.scalar ⟨xs.length, layoutPointerBytes layouts⟩) locals' mem := by
+  obtain ⟨hs, entry₀, he₀, _, hp₀⟩ := h
+  rw [hBorrow] at he₀
+  cases he₀
+  rw [hs.1]
+  exact ⟨WidePtrVal.evalRvalue_len_borrow locals locals' place mem localDecls layouts initProj elem
+      lIdx entry elems elemOff wide hTy hSplit hRead hBorrow hp₀ hProj hTarget hElemOff hFit,
+    WidePtrVal.evalRvalue_ptrMetadata locals locals' ptrOp mem localDecls layouts wide hOp⟩
+
+theorem dropValues_eq_drop : ∀ (k : Nat) (xs : List Value), dropValues k xs = xs.drop k
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, _ :: xs => dropValues_eq_drop k xs
+
+theorem takeValues_eq_take : ∀ (k : Nat) (xs : List Value), takeValues k xs = xs.take k
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, x :: xs => congrArg (x :: ·) (takeValues_eq_take k xs)
+
+private theorem drop_map_eq {α β : Type} (f : α → β) :
+    ∀ (k : Nat) (xs : List α), (xs.map f).drop k = (xs.drop k).map f
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, _ :: xs => drop_map_eq f k xs
+
+private theorem take_map_eq {α β : Type} (f : α → β) :
+    ∀ (k : Nat) (xs : List α), (xs.map f).take k = (xs.take k).map f
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, x :: xs => congrArg (f x :: ·) (take_map_eq f k xs)
+
+/--
+**`ActiveTypedSliceBorrow.evalPlaceRead_index_borrow`**: ground-MIR `evalPlaceRead` theorem for
+checked element indexing `(*s)[idxLoc]` (`i < wide.2`) on a **borrow-backed** slice lens
+`ActiveTypedSliceBorrow c mem.borrows wide.1.tag wide xs bytes` whose `BorrowEntry` targets
+`entry.targetLocal` holding `.aggregate 0 (backingXs.map toVal)` with
+`(backingXs.drop elemOff).take wide.2 = xs`.
+-/
+theorem ActiveTypedSliceBorrow.evalPlaceRead_index_borrow {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {wide : WidePtrVal} {xs backingXs : List α} {bytes : ByteMem}
+    {mem : Memory} (h : ActiveTypedSliceBorrow c mem.borrows wide.1.tag wide xs bytes)
+    (toVal : α → Value) (locals : List LocalSlot) (slLoc idxLoc : Local) (i idxSz elemOff : Nat)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (elemKind : RigidTy) (pIdx : LayoutIdx) (accessedTyOpt : Option Ty) (entry : BorrowEntry)
+    (hi : i < wide.2)
+    (hSlot : get? locals slLoc =
+      some (.init (WidePtrVal.toValue (layoutPointerBytes layouts) wide)))
+    (hIdx : get? locals idxLoc = some (.init (.scalar ⟨i, idxSz⟩)))
+    (hPtTy : placeTyResolved localDecls layouts { local_ := slLoc, projection := [.deref] } =
+      some { kind := .slice elemKind, layoutIdx := pIdx })
+    (hAccTy : placeTyResolved localDecls layouts
+      { local_ := slLoc, projection := [.deref, .index idxLoc] } = accessedTyOpt)
+    (hDerefAlign : checkDerefAlign localDecls layouts
+      (some { kind := .slice elemKind, layoutIdx := pIdx }) wide.1.offsetBytes = true)
+    (hBorrow : lookupBorrow mem.borrows wide.1.tag = some entry)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init (.aggregate 0 (backingXs.map toVal))))
+    (hTargetAlign : checkTargetPlaceAlign localDecls layouts
+      (some { kind := .slice elemKind, layoutIdx := pIdx }) entry wide.1
+      (some (.aggregate 0 (backingXs.map toVal))) = true)
+    (hKindSz : rigidTyKindByteSize elemKind = some n)
+    (hElemOff : byteOffsetToElemIdx? wide.1.offsetBytes n = some elemOff)
+    (hFit : elemOff + wide.2 ≤ backingXs.length)
+    (hSub : (backingXs.drop elemOff).take wide.2 = xs)
+    (hValOk : validateValueForTy? layouts accessedTyOpt
+      (toVal (xs[i]'(by rw [h.1.length_eq]; exact hi))) = true) :
+    evalPlaceRead locals { local_ := slLoc, projection := [.deref, .index idxLoc] }
+      mem.borrows mem.globals layouts mem.callerLocals localDecls =
+        .ok (toVal (xs[i]'(by rw [h.1.length_eq]; exact hi))) locals := by
+  have hp₀ : TreeBorrowPerm.PermitsRead entry.perm := by
+    obtain ⟨_, entry₀, he₀, _, hp₀⟩ := h
+    rw [hBorrow] at he₀
+    cases he₀
+    exact hp₀
+  have hi' : i < xs.length := by rw [h.1.length_eq]; exact hi
+  have hGetMap := get?_map_of_lt toVal xs i hi'
+  have hBleRem : Nat.ble wide.2 (length (dropValues (Nat.add elemOff 0) (backingXs.map toVal))) =
+      true := by
+    change Nat.ble wide.2 (dropValues (elemOff + 0) (backingXs.map toVal)).length = true
+    rw [Nat.add_zero, dropValues_eq_drop, List.length_drop, List.length_map]
+    exact Nat.ble_eq_true_of_le (by omega)
+  have hSliceElems :
+      takeValues wide.2 (dropValues (Nat.add elemOff 0) (backingXs.map toVal)) = xs.map toVal := by
+    change takeValues wide.2 (dropValues (elemOff + 0) (backingXs.map toVal)) = xs.map toVal
+    rw [Nat.add_zero, dropValues_eq_drop, takeValues_eq_take, drop_map_eq, take_map_eq, hSub]
+  unfold evalPlaceRead
+  dsimp only
+  rw [hAccTy, hPtTy, hSlot]
+  change evalSliceFatPtrDerefRead locals wide.1 (layoutPointerBytes layouts)
+      ⟨wide.2, layoutPointerBytes layouts⟩ [.index idxLoc] mem.borrows mem.globals layouts
+      mem.callerLocals (some { kind := .slice elemKind, layoutIdx := pIdx }) localDecls
+      accessedTyOpt = _
+  unfold evalSliceFatPtrDerefRead
+  dsimp (config := { zeta := true }) only
+  rw [Nat.beq_refl, hDerefAlign, Bool.and_self, Bool.and_self]
+  dsimp (config := { zeta := true }) only
+  rw (config := { occs := .pos [1] }) [hBorrow]
+  dsimp (config := { zeta := true }) only
+  cases hp : entry.perm with
+  | disabled => rw [hp] at hp₀; cases hp₀
+  | unique | frozen | reservedFrz _ | reservedIM | cell =>
+    dsimp (config := { zeta := true }) only
+    rw [hTarget]
+    dsimp (config := { zeta := true }) only
+    rw [hTargetAlign]
+    dsimp (config := { zeta := true }) only
+    rw [hProj, readSliceBackingAggregate?_aggregate_zero_nil]
+    dsimp (config := { zeta := true }) only
+    rw [hKindSz]
+    dsimp (config := { zeta := true }) only
+    rw [hElemOff]
+    dsimp (config := { zeta := true }) only
+    rw [hBleRem]
+    dsimp (config := { zeta := true }) only
+    rw [hSliceElems]
+    simp only [readProjectedValue, hIdx, hGetMap, hValOk]
+
+theorem appendValueList_eq_append :
+    ∀ (xs ys : List Value), appendValueList xs ys = xs ++ ys
+  | [], _ => rfl
+  | x :: xs, ys => congrArg (x :: ·) (appendValueList_eq_append xs ys)
+
+theorem set?_eq_some_set {α : Type} (xs : List α) {i : Nat} (v : α) (h : i < xs.length) :
+    set? xs i v = some (xs.set i v) := by
+  unfold set?
+  exact ite_eq_left h
+
+theorem take_append_set_drop_take_append_drop {α : Type} :
+    ∀ (elemOff : Nat) (elems : List α) (wideLen i : Nat) (val : α),
+      elemOff + wideLen ≤ elems.length → i < wideLen →
+      elems.take elemOff ++ (((elems.drop elemOff).take wideLen).set i val ++
+        elems.drop (elemOff + wideLen)) = elems.set (elemOff + i) val
+  | 0, elems, wideLen, i, val, hFit, hi => by
+    have hlt : i < (elems.take wideLen).length := by
+      rw [List.length_take]
+      omega
+    rw [List.take_zero, List.nil_append, List.drop_zero, Nat.zero_add, Nat.zero_add,
+      ← List.set_append_left i val hlt, List.take_append_drop]
+  | elemOff + 1, [], wideLen, _, _, hFit, _ =>
+    absurd hFit (by dsimp only [List.length_nil]; omega)
+  | elemOff + 1, e :: rest, wideLen, i, val, hFit, hi => by
+    have hFit' : elemOff + wideLen ≤ rest.length := by
+      simp only [List.length_cons] at hFit
+      omega
+    have heq : elemOff + 1 + wideLen = (elemOff + wideLen) + 1 := by omega
+    have heq2 : elemOff + 1 + i = (elemOff + i) + 1 := by omega
+    rw [List.take_succ_cons, List.drop_succ_cons, heq, List.drop_succ_cons, List.cons_append,
+      heq2, List.set_cons_succ]
+    exact congrArg (e :: ·)
+      (take_append_set_drop_take_append_drop elemOff rest wideLen i val hFit' hi)
+
+theorem replaceSubslice_set_window (elems : List Value) (elemOff wideLen i : Nat)
+    (val : Value) (hFit : elemOff + wideLen ≤ elems.length) (hi : i < wideLen) :
+    replaceSubslice elems elemOff (Nat.add elemOff wideLen) false
+      ((takeValues wideLen (dropValues elemOff elems)).set i val) =
+      some (elems.set (elemOff + i) val) := by
+  have hBleEnd : Nat.ble (Nat.add elemOff wideLen) (length elems) = true :=
+    Nat.ble_eq_true_of_le hFit
+  have hBleStart : Nat.ble elemOff (Nat.add elemOff wideLen) = true :=
+    Nat.ble_eq_true_of_le (Nat.le_add_right elemOff wideLen)
+  have hSub : Nat.sub (Nat.add elemOff wideLen) elemOff = wideLen :=
+    Nat.add_sub_cancel_left elemOff wideLen
+  have hLenNew : length ((takeValues wideLen (dropValues elemOff elems)).set i val) = wideLen := by
+    change ((takeValues wideLen (dropValues elemOff elems)).set i val).length = wideLen
+    rw [List.length_set, takeValues_eq_take, dropValues_eq_drop, List.length_take, List.length_drop]
+    omega
+  unfold replaceSubslice
+  dsimp only
+  rw [hBleEnd]
+  dsimp only
+  rw [hBleStart]
+  dsimp only
+  rw [hSub, hLenNew, Nat.beq_refl]
+  dsimp only
+  rw [appendValueList_eq_append, appendValueList_eq_append, takeValues_eq_take,
+    takeValues_eq_take, dropValues_eq_drop, dropValues_eq_drop]
+  exact congrArg some
+    (take_append_set_drop_take_append_drop elemOff elems wideLen i val hFit hi)
+
+private theorem lt_length_of_get?_some {α : Type} :
+    ∀ {xs : List α} {idx : Nat} {v : α}, get? xs idx = some v → idx < xs.length
+  | [], _, _, h => nomatch h
+  | _ :: _, 0, _, _ => Nat.zero_lt_succ _
+  | _ :: xs, _idx + 1, _, h => Nat.succ_lt_succ (lt_length_of_get?_some (xs := xs) h)
+
+private theorem map_set_eq {α β : Type} (f : α → β) :
+    ∀ (xs : List α) (i : Nat) (v : α), (xs.set i v).map f = (xs.map f).set i (f v)
+  | [], _, _ => rfl
+  | _ :: _, 0, _ => rfl
+  | x :: xs, i + 1, v => congrArg (f x :: ·) (map_set_eq f xs i v)
+
+@[simp]
+theorem writeProjectedValue_aggregate_zero_constantIndex_zero (locals : List LocalSlot)
+    (fields : List Value) (i : Nat) (newVal : Value) :
+    writeProjectedValue locals (.aggregate 0 fields) [.constantIndex i 0 false] newVal =
+      (match get? fields i with
+       | some _ =>
+         match set? fields i newVal with
+         | some fields' => .ok (.aggregate 0 fields')
+         | none => .ub
+       | none => .ub) := rfl
+
+theorem writeProjectedValue_aggregate_zero_constantIndex_of_lt (locals : List LocalSlot)
+    (fields : List Value) {i : Nat} (newVal : Value) (hi : i < fields.length) :
+    writeProjectedValue locals (.aggregate 0 fields) [.constantIndex i 0 false] newVal =
+      .ok (.aggregate 0 (fields.set i newVal)) := by
+  have hGet : get? fields i = some fields[i] := List.getElem?_eq_getElem hi
+  rw [writeProjectedValue_aggregate_zero_constantIndex_zero, hGet, set?_eq_some_set fields newVal hi]
+
+theorem writeSliceFatPtrTargetValue_constantIndex_of_lt (locals : List LocalSlot)
+    (elems : List Value) (ptrVal : ProvenancePtr) (wideLen elemOff i : Nat) (val : Value)
+    (hElemOff : byteOffsetToElemIdx? ptrVal.offsetBytes (inferElemListByteStride elems) =
+      some elemOff)
+    (hFit : elemOff + wideLen ≤ elems.length) (hi : i < wideLen) :
+    writeSliceFatPtrTargetValue locals (.aggregate 0 elems) [] ptrVal 8 ⟨wideLen, 8⟩
+        [.constantIndex i 0 false] val =
+      .ok (.aggregate 0 (elems.set (elemOff + i) val)) := by
+  have hiSlice : i < (takeValues wideLen (dropValues elemOff elems)).length := by
+    rw [takeValues_eq_take, dropValues_eq_drop, List.length_take, List.length_drop]
+    omega
+  unfold writeSliceFatPtrTargetValue
+  rw [Nat.beq_refl, Bool.and_self]
+  dsimp (config := { zeta := true }) only
+  rw [readSliceBackingAggregate?_aggregate_zero_nil]
+  dsimp (config := { zeta := true }) only
+  rw [hElemOff]
+  dsimp (config := { zeta := true }) only
+  rw [show Nat.add elemOff 0 = elemOff from Nat.add_zero elemOff,
+    show Nat.ble (Nat.add elemOff wideLen) (length elems) = true from Nat.ble_eq_true_of_le hFit]
+  dsimp (config := { zeta := true }) only
+  rw [writeProjectedValue_aggregate_zero_constantIndex_of_lt locals _ val hiSlice]
+  change (match replaceSubslice elems elemOff (Nat.add elemOff wideLen) false
+      ((takeValues wideLen (dropValues elemOff elems)).set i val) with
+    | some elems' => writeProjectedValue locals (.aggregate 0 elems) [] (.aggregate 0 elems')
+    | none => .ub) = _
+  rw [replaceSubslice_set_window elems elemOff wideLen i val hFit hi]
+  rfl
+
+/--
+**`ActiveTypedSliceMutBorrow.writePlaceValue_constantIndex_borrow`**: symbolic ground-MIR theorem
+for `writePlaceValue` on a borrow-backed slice fat pointer `(*slLoc)[.constantIndex i 0 false] = toVal v`.
+Given `ActiveTypedSliceMutBorrow c borrows wide.1.tag wide xs bytes` whose `BorrowEntry` in
+`borrows` targets `entry.targetLocal` (`entry.targetProjection = []`) holding
+`.aggregate 0 (backingXs.map toVal)` at element offset `elemOff`, `writePlaceValue` succeeds and
+updates `locals[entry.targetLocal]` to `.init (.aggregate 0 ((backingXs.set (elemOff + i) v).map toVal))`.
+-/
+theorem ActiveTypedSliceMutBorrow.writePlaceValue_constantIndex_borrow {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {wide : WidePtrVal}
+    {xs backingXs : List α} {bytes : ByteMem}
+    (h : ActiveTypedSliceMutBorrow c borrows wide.1.tag wide xs bytes)
+    (toVal : α → Value) (locals : List LocalSlot) (slLoc : Local) (i elemOff : Nat) (v : α)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (pointeeTyOpt accessedTyOpt : Option Ty) (entry : BorrowEntry)
+    (hi : i < wide.2)
+    (hSlot : get? locals slLoc = some (.init (WidePtrVal.toValue 8 wide)))
+    (hPtTy : placeTyResolved localDecls layouts { local_ := slLoc, projection := [.deref] } =
+      pointeeTyOpt)
+    (hAccTy : placeTyResolved localDecls layouts
+      { local_ := slLoc, projection := [.deref, .constantIndex i 0 false] } = accessedTyOpt)
+    (hDerefAlign : checkDerefAlign localDecls layouts pointeeTyOpt wide.1.offsetBytes = true)
+    (hValOk : validateValueForTy? layouts accessedTyOpt (toVal v) = true)
+    (hBorrow : lookupBorrow borrows wide.1.tag = some entry)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init (.aggregate 0 (backingXs.map toVal))))
+    (hTargetAlign : checkTargetPlaceAlign localDecls layouts pointeeTyOpt entry wide.1
+      (some (.aggregate 0 (backingXs.map toVal))) = true)
+    (hElemOff : byteOffsetToElemIdx? wide.1.offsetBytes
+      (inferElemListByteStride (backingXs.map toVal)) = some elemOff)
+    (hFit : elemOff + wide.2 ≤ backingXs.length) :
+    writePlaceValue locals borrows
+        { local_ := slLoc, projection := [.deref, .constantIndex i 0 false] }
+        (toVal v) localDecls layouts =
+      .ok (locals.set entry.targetLocal
+        (.init (.aggregate 0 ((backingXs.set (elemOff + i) v).map toVal)))) := by
+  have hp₀ : TreeBorrowPerm.PermitsUniqueWrite entry.perm := by
+    obtain ⟨_, entry₀, he₀, _, hp₀⟩ := h
+    rw [hBorrow] at he₀
+    cases he₀
+    exact hp₀
+  have hFitMap : elemOff + wide.2 ≤ (backingXs.map toVal).length := by
+    rw [List.length_map]; exact hFit
+  have hTargetLt : entry.targetLocal < locals.length := lt_length_of_get?_some hTarget
+  have hSetLocals :
+      set? locals entry.targetLocal
+        (.init (.aggregate 0 ((backingXs.map toVal).set (elemOff + i) (toVal v)))) =
+        some (locals.set entry.targetLocal
+          (.init (.aggregate 0 ((backingXs.set (elemOff + i) v).map toVal)))) := by
+    rw [set?_eq_some_set locals _ hTargetLt, ← map_set_eq]
+  have hWriteTarget := writeSliceFatPtrTargetValue_constantIndex_of_lt locals
+    (backingXs.map toVal) wide.1 wide.2 elemOff i (toVal v) hElemOff hFitMap hi
+  unfold writePlaceValue
+  dsimp (config := { zeta := true }) only
+  rw [hSlot]
+  simp only [WidePtrVal.toValue]
+  rw [hPtTy, hAccTy]
+  cases pointeeTyOpt <;> {
+    dsimp only
+    rw [hDerefAlign, hValOk, Bool.and_self]
+    dsimp only
+    rw [hBorrow]
+    dsimp only
+    cases hp : entry.perm with
+    | frozen => have h0 := hp₀ false; rw [hp] at h0; cases h0
+    | disabled => have h0 := hp₀ false; rw [hp] at h0; cases h0
+    | cell => have h0 := hp₀ false; rw [hp] at h0; cases h0
+    | unique | reservedFrz _ | reservedIM =>
+      dsimp only
+      rw [hTarget]
+      dsimp only
+      rw [hTargetAlign]
+      dsimp only
+      rw [hProj, hWriteTarget]
+      dsimp only
+      rw [hSetLocals]
+  }
+
+/--
+**`ActiveTypedSliceMutBorrow.writePlaceValue_constantIndex_encodeElems_connected`**: symbolic
+end-to-end bridge connecting ground-MIR `writePlaceValue` (`(*slLoc)[.constantIndex i 0 false] = toVal v`),
+`encodeUntypedValueToBytes` on the backing array aggregate in `locals[entry.targetLocal]`,
+`writeTyped` on the encoded byte buffer `ByteLensCodec.encodeElems c backingXs`, and
+`invalidateDerefWriteBorrowsWithLayouts` across writer (`wide.1.tag`), disjoint tight sibling
+(`tag'`), and ancestor (`rootTag`) `ActiveTypedSliceMutBorrow` lenses.
+-/
+theorem ActiveTypedSliceMutBorrow.writePlaceValue_constantIndex_encodeElems_connected
+    {α β : Type} {n m : Nat} {c : ByteLensCodec α n} {c' : ByteLensCodec β m}
+    {borrows : List BorrowEntry} {wide wide' rootWide : WidePtrVal} {tag' rootTag : Nat}
+    {xs backingXs : List α} {ys : List β}
+    (toVal : α → Value) (fuel : Nat)
+    (h_enc : ∀ x, encodeUntypedValueToBytes fuel (toVal x) = some (c.encode x))
+    (locals : List LocalSlot) (slLoc : Local) (i elemOff : Nat) (v : α)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (pointeeTyOpt accessedTyOpt : Option Ty) (entry : BorrowEntry)
+    (h : ActiveTypedSliceMutBorrow c borrows wide.1.tag wide xs
+      (ByteLensCodec.encodeElems c backingXs))
+    (hTight : TightBorrowRange borrows wide.1.tag wide n)
+    (hSib : ActiveTypedSliceMutBorrow c' borrows tag' wide' ys
+      (ByteLensCodec.encodeElems c backingXs))
+    (hSibTight : TightBorrowRange borrows tag' wide' m)
+    (hdisj : DisjointSlice wide.1.offsetBytes (wide.2 * n) wide'.1.offsetBytes (wide'.2 * m))
+    (hRoot : ActiveTypedSliceMutBorrow c borrows rootTag rootWide backingXs
+      (ByteLensCodec.encodeElems c backingXs))
+    (hDesc : isBorrowDescendantOrSelf borrows wide.1.tag rootTag = true)
+    (hRootBase : rootWide.1.offsetBytes = 0)
+    (hLen : 2 ≤ borrows.length)
+    (hi : i < wide.2)
+    (hSlot : get? locals slLoc = some (.init (WidePtrVal.toValue 8 wide)))
+    (hPtTy : placeTyResolved localDecls layouts { local_ := slLoc, projection := [.deref] } =
+      pointeeTyOpt)
+    (hAccTy : placeTyResolved localDecls layouts
+      { local_ := slLoc, projection := [.deref, .constantIndex i 0 false] } = accessedTyOpt)
+    (hDerefAlign : checkDerefAlign localDecls layouts pointeeTyOpt wide.1.offsetBytes = true)
+    (hValOk : validateValueForTy? layouts accessedTyOpt (toVal v) = true)
+    (hBorrow : lookupBorrow borrows wide.1.tag = some entry)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init (.aggregate 0 (backingXs.map toVal))))
+    (hTargetAlign : checkTargetPlaceAlign localDecls layouts pointeeTyOpt entry wide.1
+      (some (.aggregate 0 (backingXs.map toVal))) = true)
+    (hElemOff : byteOffsetToElemIdx? wide.1.offsetBytes
+      (inferElemListByteStride (backingXs.map toVal)) = some elemOff)
+    (hOffBytes : wide.1.offsetBytes = elemOff * n)
+    (hFit : elemOff + wide.2 ≤ backingXs.length) :
+    let dst : Place := { local_ := slLoc, projection := [.deref, .constantIndex i 0 false] }
+    let backingVal' : Value := .aggregate 0 ((backingXs.set (elemOff + i) v).map toVal)
+    let bytes' : ByteMem := ByteLensCodec.encodeElems c (backingXs.set (elemOff + i) v)
+    let borrows' :=
+      invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst
+        [.constantIndex i 0 false]
+    encodeUntypedValueToBytes (fuel + 1) (.aggregate 0 (backingXs.map toVal)) =
+        some (ByteLensCodec.encodeElems c backingXs) ∧
+      writePlaceValue locals borrows dst (toVal v) localDecls layouts =
+        .ok (locals.set entry.targetLocal (.init backingVal')) ∧
+      encodeUntypedValueToBytes (fuel + 1) backingVal' = some bytes' ∧
+      writeTyped c (WidePtrVal.elemOffset wide n i) v (ByteLensCodec.encodeElems c backingXs) =
+        some bytes' ∧
+      ActiveTypedSliceMutBorrow c borrows' wide.1.tag wide (xs.set i v) bytes' ∧
+      ActiveTypedSliceMutBorrow c' borrows' tag' wide' ys bytes' ∧
+      ActiveTypedSliceMutBorrow c borrows' rootTag rootWide (backingXs.set (elemOff + i) v) bytes' := by
+  intro dst backingVal' bytes' borrows'
+  have hIdxLt : elemOff + i < backingXs.length := by omega
+  have hElemOffEq : WidePtrVal.elemOffset wide n i = (elemOff + i) * n := by
+    simp only [WidePtrVal.elemOffset, hOffBytes, Nat.add_mul]
+  have hw : writeTyped c (WidePtrVal.elemOffset wide n i) v
+      (ByteLensCodec.encodeElems c backingXs) = some bytes' := by
+    rw [hElemOffEq]
+    exact writeTyped_encodeElems_set c backingXs hIdxLt v
+  have hwRoot : writeTyped c (WidePtrVal.elemOffset rootWide n (elemOff + i)) v
+      (ByteLensCodec.encodeElems c backingXs) = some bytes' := by
+    have hRootOff : WidePtrVal.elemOffset rootWide n (elemOff + i) = (elemOff + i) * n := by
+      simp only [WidePtrVal.elemOffset, hRootBase, Nat.zero_add]
+    rw [hRootOff]
+    exact writeTyped_encodeElems_set c backingXs hIdxLt v
+  have hRootSl' : SliceTypedAt c rootWide (backingXs.set (elemOff + i) v) bytes' :=
+    SliceTypedAt.write_elem hRoot.1 (by rw [← hRoot.1.length_eq]; exact hIdxLt) v hwRoot
+  obtain ⟨hW, hS⟩ := ActiveTypedSliceMutBorrow.derefWriteWithLayouts_frame localDecls layouts
+    locals dst [.constantIndex i 0 false] (WidePtrVal.toValue 8 wide) wide.1 hLen hSlot rfl rfl
+    h hTight hi v hw hSib hSibTight hdisj
+  have hAnc := ActiveTypedSliceMutBorrow.derefWriteWithLayouts_ancestor localDecls layouts
+    locals dst [.constantIndex i 0 false] (WidePtrVal.toValue 8 wide) wide.1 hLen hSlot rfl rfl
+    hRoot hDesc hRootSl'
+  exact ⟨encodeUntypedValueToBytes_aggregate_map c toVal fuel 0 h_enc backingXs,
+    ActiveTypedSliceMutBorrow.writePlaceValue_constantIndex_borrow h toVal locals slLoc i elemOff v
+      localDecls layouts pointeeTyOpt accessedTyOpt entry hi hSlot hPtTy hAccTy hDerefAlign hValOk
+      hBorrow hProj hTarget hTargetAlign hElemOff hFit,
+    encodeUntypedValueToBytes_aggregate_map c toVal fuel 0 h_enc (backingXs.set (elemOff + i) v),
+    hw, hW, hS, hAnc⟩
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses
