@@ -442,6 +442,15 @@ class ManifestTests(AuditFixtureTestCase):
         self.assert_only_failures(report, {"c_variant_manifest"})
         self.assert_error(report, "c_variant_manifest", "`opaque_negative` never references ProjectionElem.opaqueCast")
 
+        # Even if the theorem's own name contains the variant token (`opaqueCast`), a body that
+        # never references the variant or a helper that does must still be rejected.
+        self.edit(CORR, "negative=opaque_negative", "negative=opaqueCast_vacuous")
+        self.edit(CORR, "`opaque_negative]", "`opaqueCast_vacuous]")
+        self.edit(CORR, "theorem opaque_negative : 1 ≠ 5 := by decide", "theorem opaqueCast_vacuous : 1 ≠ 5 := by decide")
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(report, "c_variant_manifest", "`opaqueCast_vacuous` never references ProjectionElem.opaqueCast")
+
     def test_manifest_theorem_after_the_audit_is_rejected(self) -> None:
         text = correspondence_source().replace("theorem opaque_positive : opaqueCastProj > 2 := by decide\n", "")
         text = text.replace(
@@ -596,6 +605,24 @@ class LensAndBlockerTests(AuditFixtureTestCase):
         report = self.run_checks()
         self.assert_error(report, "d_slice_lens_declarations", "no declaration of `SliceTypedAt.splitAt`")
 
+    def test_dogfood_proofs_checked_when_examples_present(self) -> None:
+        for rel in audit.REQUIRED_DOGFOOD_PROOFS:
+            target = self.root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / rel, target)
+        report = self.run_checks()
+        self.assert_only_failures(report, set())
+        dogfood = report["checks"]["d_slice_lens_declarations"]["details"]["dogfood_companions"]
+        self.assertEqual(sorted(dogfood), sorted(audit.REQUIRED_DOGFOOD_PROOFS))
+        for rel, thms in dogfood.items():
+            self.assertTrue(thms, f"{rel} has no companion theorems")
+        # Hollowing out a dogfood file (removing its slice-lens companion theorems) is caught.
+        fidl_rel = "examples/fuchsia-usercopy/anneal/proofs/Proof/FuchsiaUsercopy/fidl_chunk_padding_len.lean"
+        (self.root / fidl_rel).write_text("theorem verified : True := trivial\n", encoding="utf-8")
+        report = self.run_checks()
+        self.assert_only_failures(report, {"d_slice_lens_declarations"})
+        self.assert_error(report, "d_slice_lens_declarations", f"{fidl_rel}: no companion theorem")
+
     def _assert_blocker_mutant_rejected(self, old: str, new: str, fragment: str) -> None:
         self.edit(SUITE, old, new)
         report = self.run_checks()
@@ -628,9 +655,16 @@ class LensAndBlockerTests(AuditFixtureTestCase):
 
     def test_unsized_blocker_must_keep_blocking_lifters(self) -> None:
         self._assert_blocker_mutant_rejected(
-            '::from_raw_parts(?:_mut)?\\b"\n        ),\n        {"anneal_proof_lifters", "minirust_correspondence", "lean_miri_correspondence"},',
-            '::from_raw_parts(?:_mut)?\\b"\n        ),\n        {"minirust_correspondence", "lean_miri_correspondence"},',
+            '|\\.)to_raw_parts\\b"\n        ),\n        {"anneal_proof_lifters", "minirust_correspondence", "lean_miri_correspondence"},',
+            '|\\.)to_raw_parts\\b"\n        ),\n        {"minirust_correspondence", "lean_miri_correspondence"},',
             "no longer affects anneal_proof_lifters",
+        )
+
+    def test_to_raw_parts_mutant_is_rejected(self) -> None:
+        self._assert_blocker_mutant_rejected(
+            '\n            r"|(?:(?:\\b(?:ptr|NonNull)|>)::_|\\.)to_raw_parts\\b"'.replace("::_", "::"),
+            "",
+            "probe unsized_ptr_to_raw_parts: expected 'unsized_dst_or_ptr_metadata' to block",
         )
 
     def test_dropping_the_signature_guard_is_rejected(self) -> None:

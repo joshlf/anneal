@@ -75,8 +75,8 @@ Coverage manifest (checked by `scripts/audit_mir_coverage_matrix.py --check` and
 final `run_cmd`):
 -/
 -- @mir-variant-coverage StatementKind.constEvalCounter trusted=constEvalCounter_trusted_step_universal,constEvalCounter_stepMirFn_universal,constEvalCounter_nop_statement_equiv minirust=constEvalCounter_minirust_ops_corresponds,constEvalCounter_minirustSpec_fail_closed leanmiri=constEvalCounter_leanMiri_lockstep,constEvalCounter_leanMiri_nop_equiv positive=constEvalCounter_witness_runs,constEvalCounter_leanMiri_witness negative=constEvalCounter_witness_ub_not_masked,constEvalCounter_witness_minirustSpec_rejects
--- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence
--- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject
+-- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence
+-- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal,opaqueCast_trusted_placeTy_and_helpers_universal,opaqueCast_trusted_write_and_borrow_universal minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject
 
 /-
 Source anchors (each is re-read verbatim from the pinned vendored file):
@@ -94,6 +94,8 @@ Source anchors (each is re-read verbatim from the pinned vendored file):
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#| .goto ret unwind => pure (ret, unwind)
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#| .stop _ => throw (.invalidProgram "cannot tailcall as root of stack")
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#evaluated.withCallerLocation, frame.returnPlace, ret, unwind⟩
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#let action ← h.cleanup choice false frame
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#require (action == .normal) "tailcall cleanup must return Normal"
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#require ((← h.frameIndex) == oldIndex) "evaluating this tail call pushed a new stack frame"
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#| none => throw (.undefinedBehavior "calling a function with fewer arguments than it requires")
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#throw (.undefinedBehavior "calling a function with more arguments than it expected")
@@ -247,11 +249,13 @@ def stepStatement {B P U M C PV Pl Rv : Type}
 
 /-- `Call.initFnTailCall` (`Interpreter/Call.lean:436-446`) with the stack effect of the
 `initFnCall` → `initStackFrame` push it performs: pop the active frame (`popRaw`), reject a
-root frame (`ReturnContinuation.stop`), check the argument count against the callee
-(`Call.lean:328-355`), then push the callee with the popped frame's return place and
-continuation. -/
+root frame (`ReturnContinuation.stop`), check the argument count and return-ABI
+compatibility against the callee (`Call.lean:328-355`), push the callee with the popped
+frame's return place and continuation, and require `cleanup` to return `.normal`
+(`Call.lean:445-446`). -/
 def initFnTailCall {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
-    (state : StepState B P U M) : Except StepError (StepState B P U M) :=
+    (state : StepState B P U M) (retAbiCompat : Bool := true)
+    (cleanupNormal : Bool := true) : Except StepError (StepState B P U M) :=
   match state.frames.getLast? with
   | none => .error .emptyStack
   | some frame =>
@@ -260,8 +264,12 @@ def initFnTailCall {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
     | .goto ret unwind =>
       if argCount < calleeArgCount then
         .error (.undefinedBehavior "calling a function with fewer arguments than it requires")
+      else if !retAbiCompat then
+        .error (.undefinedBehavior "AbiMismatchReturn")
       else if calleeArgCount < argCount then
         .error (.undefinedBehavior "calling a function with more arguments than it expected")
+      else if !cleanupNormal then
+        .error (.invalidProgram "tailcall cleanup must return Normal")
       else
         .ok { state with
           frames := state.frames.dropLast ++
@@ -271,9 +279,10 @@ def initFnTailCall {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
 /-- `Call.evalTailCallTerminator` (`Interpreter/Call.lean:464-471`): the tail call must
 leave the frame index unchanged. -/
 def evalTailCallTerminator {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
-    (state : StepState B P U M) : Except StepError (StepState B P U M) :=
+    (state : StepState B P U M) (retAbiCompat : Bool := true)
+    (cleanupNormal : Bool := true) : Except StepError (StepState B P U M) :=
   let oldIndex := state.frames.length - 1
-  match initFnTailCall callee calleeArgCount argCount state with
+  match initFnTailCall callee calleeArgCount argCount state retAbiCompat cleanupNormal with
   | .error e => .error e
   | .ok state' =>
     if state'.frames.length - 1 == oldIndex then .ok state'
@@ -973,6 +982,111 @@ theorem tailCall_trusted_unwind_through (s : MachineState) (calleeBody : Capture
       | .faulted fk => MirStepNode.fail fk :=
   ⟨rfl, rfl⟩
 
+/-- **Trusted direct-call and `.unsupported` fail-closed paths (universal).** Complementing
+`tailCall_trusted_fail_closed_universal` (which covered non-direct `func`), a direct tail
+call (`extractCalleeDefPath? func = some defPath`) whose argument evaluation is `.ub` or
+`.unsupported` fails closed with `MirStepNode.fail .ub` or `MirStepNode.unsupported`; an
+indirect tail call whose callee operand evaluation is `.unsupported` fails closed with
+`MirStepNode.unsupported`; an indirect tail call through a valid function pointer whose
+argument evaluation is `.ub` or `.unsupported` fails closed; and a zero-sized
+`.aggregate 0 []` function-item callee resolves to its target just like `.unit`. -/
+theorem tailCall_trusted_direct_and_unsupported_fail_closed
+    (s : MachineState) (func : Operand) (argOps : List Operand) (span : String)
+    (callerBody : CapturedMir) :
+    (∀ defPath : DefPath, extractCalleeDefPath? func = some defPath →
+      evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
+          callerBody.layouts s.memory.callerLocals = .ub →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
+    (∀ defPath : DefPath, extractCalleeDefPath? func = some defPath →
+      evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
+          callerBody.layouts s.memory.callerLocals = .unsupported →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.unsupported) ∧
+    (extractCalleeDefPath? func = none →
+      evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
+          s.memory.callerLocals = .unsupported →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.unsupported) ∧
+    (∀ (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry),
+      extractCalleeDefPath? func = none →
+      evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
+          s.memory.callerLocals = .ok (.ptr p 8) l →
+      p.offsetBytes = 0 → lookupBorrow s.memory.borrows p.tag = none →
+      lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry →
+      fnEntryCompatibleWithCallSite fnEntry (length argOps)
+          (operandTy callerBody.localDecls callerBody.layouts func) = true →
+      (evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
+            s.memory.callerLocals = .ub →
+        evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
+      (evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
+            s.memory.callerLocals = .unsupported →
+        evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+          MirStepNode.unsupported)) ∧
+    (∀ (l : List LocalSlot) (dp : DefPath) (tys : List RigidTy) (argVals : List Value)
+        (l' : List LocalSlot) (calleeBody : CapturedMir),
+      extractCalleeDefPath? func = none →
+      evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
+          s.memory.callerLocals = .ok (.aggregate 0 []) l →
+      extractFnItemTarget? (operandTy callerBody.localDecls callerBody.layouts func) =
+        some (dp, tys) →
+      evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
+          s.memory.callerLocals = .ok argVals l' →
+      lookupCallee s.memory.callees callerBody.layouts dp tys s.memory.traitImpls =
+        some calleeBody →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+        MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals)) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro defPath hfunc hargs
+    simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc, hargs]
+  · intro defPath hfunc hargs
+    simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc, hargs]
+  · intro hnodirect hfunc
+    simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hnodirect, hfunc]
+  · intro p l fnEntry hnodirect h hoff hbor hfn hcompat
+    refine ⟨?_, ?_⟩ <;> intro hargs <;>
+      simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
+        hnodirect, h, hoff, hbor, hfn, hcompat, Nat.beq_refl, Bool.and_self, hargs]
+  · intro l dp tys argVals l' calleeBody hnodirect h hfi hargs hfind
+    simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
+      hnodirect, h, hfi, hargs, hfind, checkCalleeTargetCompatible_direct]
+
+/-- **Trusted return-through fail-closed paths (universal).** When the tail-callee executes
+`.return_`, an uninitialized, dead, or missing `_0` slot faults with `.ub`; and when `_0` is
+initialized to `retVal` under a non-diverging `caller :: rest`, a destination write
+(`writePlaceValue`) that faults with `.ub` or `.unsupported` fails closed on both in-table
+and external (`resumeExternalTailCall`) tail-call returns. -/
+theorem tailCall_trusted_return_through_fail_closed
+    (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value) (f : StackFrame)
+    (retVal : Value) (span : String) (cb : Option CapturedMir) :
+    ((get? f.locals 0 = some .uninit ∨ get? f.locals 0 = some .dead ∨ get? f.locals 0 = none) →
+      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          ⟨.return_, span⟩ cb = MirStepNode.fail .ub) ∧
+    (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame),
+      get? f.locals 0 = some (.init retVal) →
+      s.memory.callStack = caller :: rest → caller.isDiverging = false →
+      writePlaceValue caller.frame.locals s.memory.borrows caller.destination retVal = .ub →
+      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          ⟨.return_, span⟩ cb = MirStepNode.fail .ub ∧
+      resumeExternalTailCall
+          (.returned retVal (enterTailCalleeFrame s.memory calleeBody argVals).memory) =
+        .faulted .ub) ∧
+    (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame),
+      get? f.locals 0 = some (.init retVal) →
+      s.memory.callStack = caller :: rest → caller.isDiverging = false →
+      writePlaceValue caller.frame.locals s.memory.borrows caller.destination retVal =
+        .unsupported →
+      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          ⟨.return_, span⟩ cb = MirStepNode.unsupported ∧
+      resumeExternalTailCall
+          (.returned retVal (enterTailCalleeFrame s.memory calleeBody argVals).memory) =
+        .faulted .unsupported) := by
+  refine ⟨?_, ?_, ?_⟩
+  · rintro (h0 | h0 | h0) <;> simp only [evalTerminator, h0]
+  · intro caller rest h0 hcs hdiv hw
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resumeExternalTailCall, h0, enterTailCalleeFrame, hcs, hdiv, hw]
+  · intro caller rest h0 hcs hdiv hw
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resumeExternalTailCall, h0, enterTailCalleeFrame, hcs, hdiv, hw]
+
 /-- A body whose block ends in a terminator rejected by `MiniRustSpec`'s fragment check is
 not in the `MiniRustSpec` fragment. -/
 theorem inFragment_false_of_term {body : CapturedMir} {bb : BasicBlockData}
@@ -1152,6 +1266,25 @@ theorem tailCall_leanMiri_arity_ub {B P U M : Type} (m : LeanMiri.StepState B P 
     simp [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hlast, hgoto, this, hlt]
   · refine ⟨"calling a function with fewer arguments than it requires", ?_⟩
     simp [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hlast, hgoto, hgt]
+
+/-- **LeanMiri return-ABI and cleanup checks (universal).** On a frame with a caller
+continuation (`goto`) and matching argument count `n`, an incompatible return ABI
+(`retAbiCompat = false`, `Call.lean:345-346`) faults with `.undefinedBehavior "AbiMismatchReturn"`,
+whereas a frame cleanup that fails to return `.normal` (`cleanupNormal = false`,
+`Call.lean:445-446`) raises `.invalidProgram "tailcall cleanup must return Normal"`
+(`isUB = false`). -/
+theorem tailCall_leanMiri_ret_abi_and_cleanup_universal {B P U M : Type}
+    (m : LeanMiri.StepState B P U M) (callee : B) (n : Nat) (cleanupNormal : Bool)
+    (f : LeanMiri.Frame B P U) (ret : Option Nat) (u : U)
+    (hlast : m.frames.getLast? = some f) (hgoto : f.returnContinuation = .goto ret u) :
+    LeanMiri.evalTailCallTerminator callee n n m false cleanupNormal =
+        .error (.undefinedBehavior "AbiMismatchReturn") ∧
+      (LeanMiri.StepError.undefinedBehavior "AbiMismatchReturn").isUB = true ∧
+      LeanMiri.evalTailCallTerminator callee n n m true false =
+        .error (.invalidProgram "tailcall cleanup must return Normal") ∧
+      (LeanMiri.StepError.invalidProgram "tailcall cleanup must return Normal").isUB = false := by
+  refine ⟨?_, rfl, ?_, rfl⟩ <;>
+    simp [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hlast, hgoto, Nat.lt_irrefl]
 
 /-- **LeanMiri call contrast (universal).** A returning Trusted `call` (`pushCalleeFrame`)
 and the transcribed call push both grow the stack by one frame and stay shape-related —
@@ -1592,6 +1725,174 @@ theorem opaqueCast_trusted_place_read_universal (locals : List LocalSlot) (l : N
       cases v <;> rfl
     simp only [evalOperand, hu, hv, hread]
 
+/-- **Trusted place typing, offset, union, and shell helpers (universal).** `.opaqueCast t`
+switches the static type in `placeTy`, `resolveProjectedTyResolved`, `placeTyResolved`,
+`projectionChainByteOffset?` (also clearing `activeVariant`), `tyProjTouchesUnion`,
+`checkStaticSubProjBounds`, and `wrapFullWidthInitChain?` to `t` (resolved through
+`localDecls` / `layouts`); it is transparent in `isScalarCompatibleProj`,
+`subsliceChainValidOnVal`, `splitLastDeref?`, `ensureNestedFieldShells`, and
+`fieldShellChainPopulated`; and at the head of an assignment into an `.uninit` local,
+`uninitFieldWriteShell?` returns `none` (failing closed instead of materializing a default
+shell). -/
+theorem opaqueCast_trusted_placeTy_and_helpers_universal
+    (locals : List LocalSlot) (decls : List LocalDecl) (layouts : LayoutTable)
+    (l : Nat) (decl : LocalDecl) (baseTy t : Ty) (v leafVal : Value)
+    (curTyOpt : Option Ty) (curValOpt : Option Value) (activeVariant : Option VariantIdx)
+    (accOff : Nat) (nextProj : ProjectionElem) (rest : List ProjectionElem)
+    (hdecl : get? decls l = some decl) :
+    placeTy decls layouts ⟨l, .opaqueCast t :: rest⟩ = resolveProjectedTy layouts t rest ∧
+      resolveProjectedTyResolved decls layouts baseTy (.opaqueCast t :: rest) =
+        resolveProjectedTyResolved decls layouts (resolveTyWithLocalDecls decls layouts t) rest ∧
+      placeTyResolved decls layouts ⟨l, .opaqueCast t :: rest⟩ =
+        resolveProjectedTyResolved decls layouts (resolveTyWithLocalDecls decls layouts t) rest ∧
+      projectionChainByteOffset? layouts curTyOpt curValOpt activeVariant accOff decls
+          (.opaqueCast t :: rest) =
+        projectionChainByteOffset? layouts (some (resolveTyWithLocalDecls decls layouts t))
+          curValOpt none accOff decls rest ∧
+      tyProjTouchesUnion decls layouts baseTy (.opaqueCast t :: rest) =
+        tyProjTouchesUnion decls layouts (resolveTyWithLocalDecls decls layouts t) rest ∧
+      checkStaticSubProjBounds decls layouts baseTy (.opaqueCast t :: rest) =
+        checkStaticSubProjBounds decls layouts (resolveTyWithLocalDecls decls layouts t) rest ∧
+      wrapFullWidthInitChain? decls layouts baseTy (.opaqueCast t :: rest) leafVal =
+        wrapFullWidthInitChain? decls layouts (resolveTyWithLocalDecls decls layouts t)
+          rest leafVal ∧
+      isScalarCompatibleProj (.opaqueCast t :: rest) = isScalarCompatibleProj rest ∧
+      subsliceChainValidOnVal locals v (.opaqueCast t :: rest) =
+        subsliceChainValidOnVal locals v rest ∧
+      splitLastDeref? (.opaqueCast t :: rest) = splitLastDeref? rest ∧
+      ensureNestedFieldShells v (.opaqueCast t :: nextProj :: rest) =
+        ensureNestedFieldShells v (nextProj :: rest) ∧
+      fieldShellChainPopulated v (.opaqueCast t :: nextProj :: rest) =
+        fieldShellChainPopulated v (nextProj :: rest) ∧
+      uninitFieldWriteShell? decls layouts l (.opaqueCast t) rest = none := by
+  refine ⟨?_, rfl, ?_, rfl, rfl, rfl, rfl, rfl, ?_, rfl, ?_, ?_, rfl⟩
+  · simp [placeTy, hdecl, resolveProjectedTy]
+  · simp [placeTyResolved, hdecl, resolveProjectedTyResolved]
+  · cases v <;> rfl
+  · cases v <;> rfl
+  · cases v <;> rfl
+
+/-- **Trusted `evalPlaceRead`, `writePlaceValue`, `evalPlaceWrite`, and
+`resolveBorrowWriteLocalProj` (universal).** On non-union places with `e ≠ .deref`,
+`evalPlaceRead`, `writePlaceValue`, and `evalPlaceWrite` (with any active protectors)
+through `.opaqueCast t :: e :: r` agree with `e :: r` when `decls = []` (or when `placeTy` /
+`placeTyResolved` agrees); writing through `.opaqueCast t :: r` into an `.uninit` or `.dead`
+local faults with `.ub`, and before a `.deref` on an initialized non-union local fails
+closed with `.unsupported`; and `resolveBorrowWriteLocalProj` preserves `.opaqueCast t` in
+front of the resolved path on non-union or zero-sized places (so `stripTransparentProjections`
+agrees with the cast-free path) while truncating at the enclosing union under `t` on
+non-ZST union writes. -/
+theorem opaqueCast_trusted_write_and_borrow_universal
+    (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    (activeProtectors : List Nat) (l : Nat) (t : Ty) (val : Value) :
+    (∀ (e : ProjectionElem) (r : List ProjectionElem), (∀ r', e :: r ≠ .deref :: r') →
+      evalPlaceRead locals ⟨l, .opaqueCast t :: e :: r⟩ borrows globals layouts callerLocals [] =
+        evalPlaceRead locals ⟨l, e :: r⟩ borrows globals layouts callerLocals [] ∧
+      writePlaceValue locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val [] layouts =
+        writePlaceValue locals borrows ⟨l, e :: r⟩ val [] layouts ∧
+      evalPlaceWrite locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val activeProtectors [] layouts =
+        evalPlaceWrite locals borrows ⟨l, e :: r⟩ val activeProtectors [] layouts) ∧
+    (∀ (r : List ProjectionElem),
+      (get? locals l = some .uninit ∨ get? locals l = some .dead ∨ get? locals l = none) →
+      writePlaceValue locals borrows ⟨l, .opaqueCast t :: r⟩ val [] layouts = .ub) ∧
+    (∀ (v : Value) (r : List ProjectionElem), get? locals l = some (.init v) →
+      writePlaceValue locals borrows ⟨l, .opaqueCast t :: .deref :: r⟩ val [] layouts =
+        .unsupported) ∧
+    (∀ (r : List ProjectionElem),
+      placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: r⟩ = false →
+      placeTouchesUnion decls layouts ⟨l, r⟩ = false →
+      resolveBorrowWriteLocalProj decls layouts locals l (.opaqueCast t :: r) =
+        .opaqueCast t :: resolveBorrowWriteLocalProj decls layouts locals l r ∧
+      stripTransparentProjections
+          (resolveBorrowWriteLocalProj decls layouts locals l (.opaqueCast t :: r)) =
+        stripTransparentProjections (resolveBorrowWriteLocalProj decls layouts locals l r)) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro e r hnd
+    have hread : ∀ v, readProjectedValue locals v (.opaqueCast t :: e :: r) =
+        readProjectedValue locals v (e :: r) := fun v =>
+      (opaqueCast_trusted_traversal_universal locals v v t (e :: r)).1
+    have hwrite : ∀ v, writeProjectedValue locals v (.opaqueCast t :: e :: r) val =
+        writeProjectedValue locals v (e :: r) val := fun v =>
+      (opaqueCast_trusted_traversal_universal locals v val t (e :: r)).2.1
+    have hpty : ∀ p, placeTyResolved [] layouts p = none := fun _ => by
+      simp [placeTyResolved, get?]
+    have hprot : ∀ (ps : List Nat) (q : List ProjectionElem),
+        hasProtectedWriteConflict borrows ps l none (.opaqueCast t :: q) =
+          hasProtectedWriteConflict borrows ps l none q := by
+      intro ps q
+      induction borrows with
+      | nil => rfl
+      | cons b bs ih =>
+        simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap,
+          stripTransparentProjections, ih]
+    have hres_er :
+        (match resolveBorrowProjectionElems locals (.opaqueCast t :: e :: r) with
+         | some rp => rp
+         | none => .opaqueCast t :: e :: r) =
+        .opaqueCast t ::
+          (match resolveBorrowProjectionElems locals (e :: r) with
+           | some rp => rp
+           | none => e :: r) := by
+      simp only [resolveBorrowProjectionElems]
+      cases resolveBorrowProjectionElems locals (e :: r) <;> rfl
+    have hwv :
+        writePlaceValue locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val [] layouts =
+          writePlaceValue locals borrows ⟨l, e :: r⟩ val [] layouts := by
+      cases e with
+      | deref => exact absurd rfl (hnd r)
+      | _ => simp only [writePlaceValue, writeProjectedForLocal, hwrite]
+    refine ⟨?_, hwv, ?_⟩
+    · cases e with
+      | deref => exact absurd rfl (hnd r)
+      | _ => simp only [evalPlaceRead, readProjectedForLocal, hpty, hread]
+    · cases activeProtectors with
+      | nil => exact hwv
+      | cons ph pt =>
+        cases e with
+        | deref => exact absurd rfl (hnd r)
+        | _ =>
+          change
+            (match hasProtectedWriteConflict borrows (ph :: pt) l none
+                (match resolveBorrowProjectionElems locals (.opaqueCast t :: _ :: r) with
+                 | some rp => rp
+                 | none => .opaqueCast t :: _ :: r) with
+             | true => PlaceWriteResult.ub
+             | false =>
+               writePlaceValue locals borrows ⟨l, .opaqueCast t :: _ :: r⟩ val [] layouts) =
+            (match hasProtectedWriteConflict borrows (ph :: pt) l none
+                (match resolveBorrowProjectionElems locals (_ :: r) with
+                 | some rp => rp
+                 | none => _ :: r) with
+             | true => PlaceWriteResult.ub
+             | false => writePlaceValue locals borrows ⟨l, _ :: r⟩ val [] layouts)
+          rw [hres_er, hprot, hwv]
+  · intro r hslot
+    rcases hslot with h | h | h <;> simp only [writePlaceValue, h]
+  · intro v r hv
+    have hw : writeProjectedValue locals v (.opaqueCast t :: .deref :: r) val = .unsupported := by
+      rw [(opaqueCast_trusted_traversal_universal locals v val t (.deref :: r)).2.1]
+      cases v <;> rfl
+    simp only [writePlaceValue, hv, writeProjectedForLocal, hw]
+  · intro r hu1 hu2
+    have hres :
+        (match resolveBorrowProjectionElems locals (.opaqueCast t :: r) with
+         | some rp => rp
+         | none => .opaqueCast t :: r) =
+        .opaqueCast t ::
+          (match resolveBorrowProjectionElems locals r with
+           | some rp => rp
+           | none => r) := by
+      simp only [resolveBorrowProjectionElems]
+      cases resolveBorrowProjectionElems locals r <;> rfl
+    have heq : resolveBorrowWriteLocalProj decls layouts locals l (.opaqueCast t :: r) =
+        .opaqueCast t :: resolveBorrowWriteLocalProj decls layouts locals l r := by
+      rw [resolveBorrowWriteLocalProj_of_not_union decls layouts locals l (.opaqueCast t :: r) hu1,
+        resolveBorrowWriteLocalProj_of_not_union decls layouts locals l r hu2]
+      exact hres
+    exact ⟨heq, by rw [heq, stripTransparentProjections]⟩
+
 private theorem borrowProjSteps_erase : ∀ p : List ProjectionElem,
     MiniRustSpec.Correspondence.borrowProjSteps (eraseOpaqueCasts p) =
       MiniRustSpec.Correspondence.borrowProjSteps p
@@ -1801,10 +2102,12 @@ run_cmd do
       [("trusted", [`tailCall_trusted_direct_enters_without_push, `tailCall_trusted_vs_call_depth,
           `tailCall_trusted_return_through, `tailCall_trusted_external,
           `tailCall_trusted_external_resume_is_return, `tailCall_trusted_fail_closed_universal,
-          `tailCall_trusted_non_function_value_ub, `tailCall_trusted_unwind_through]),
+          `tailCall_trusted_non_function_value_ub, `tailCall_trusted_unwind_through,
+          `tailCall_trusted_direct_and_unsupported_fail_closed,
+          `tailCall_trusted_return_through_fail_closed]),
        ("minirust", [`tailCall_minirust_corresponds]),
        ("leanmiri", [`tailCall_leanMiri_shape_lockstep, `tailCall_leanMiri_root_stop_diverges,
-          `tailCall_leanMiri_arity_ub]),
+          `tailCall_leanMiri_arity_ub, `tailCall_leanMiri_ret_abi_and_cleanup_universal]),
        ("positive", [`tailCall_leanMiri_witness, `tailCall_witness_nested_runs, `tailCall_witness_root_runs,
           `tailCall_witness_external, `tailCall_witness_indirect_and_zst]),
        ("negative", [`tailCall_witness_ub_cases, `tailCall_witness_direct_arity_divergence])]),
@@ -1812,7 +2115,9 @@ run_cmd do
       [tr ++ `MirAst.ProjectionElem.opaqueCast],
       [lm ++ `projectOpaqueCast, lm ++ `placeProjectOpaqueCast],
       [("trusted", [`opaqueCast_trusted_traversal_universal, `opaqueCast_trusted_retype_universal,
-          `opaqueCast_trusted_overlap_universal, `opaqueCast_trusted_place_read_universal]),
+          `opaqueCast_trusted_overlap_universal, `opaqueCast_trusted_place_read_universal,
+          `opaqueCast_trusted_placeTy_and_helpers_universal,
+          `opaqueCast_trusted_write_and_borrow_universal]),
        ("minirust", [`opaqueCast_minirust_corresponds]),
        ("leanmiri", [`opaqueCast_leanMiri_phase_boundary]),
        ("positive", [`opaqueCast_witness_read_write, `opaqueCast_witness_projected_move]),

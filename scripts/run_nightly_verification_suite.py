@@ -588,6 +588,7 @@ RUST_CONSTRUCT_BLOCKERS: list[tuple[str, re.Pattern[str], set[str]]] = [
             r"|\b(?:Pointee|DynMetadata|PointerMetadata)\b"
             r"|\bptr::metadata\b"
             r"|(?:\b(?:ptr|NonNull)|>)::from_raw_parts(?:_mut)?\b"
+            r"|(?:(?:\b(?:ptr|NonNull)|>)::|\.)to_raw_parts\b"
         ),
         {"anneal_proof_lifters", "minirust_correspondence", "lean_miri_correspondence"},
     ),
@@ -657,17 +658,75 @@ def _rust_block_header_spans(cleaned: str) -> list[tuple[int, int, str]]:
     return spans
 
 
+def _strip_rust_comments_and_strings(rs_text: str) -> str:
+    """Return `rs_text` with `//` line comments and nested `/* ... */` block comments blanked to
+    spaces, and string literal interiors (`"..."` and `r#*"..."#*`) blanked to spaces (outer quotes
+    and newlines preserved) so comments and string literals never inject unbalanced braces, fake
+    `fn` / `impl` headers, or false blocker matches."""
+    out: list[str] = []
+    i = 0
+    n = len(rs_text)
+    raw_str_re = re.compile(r'(?<![\w\'"])b?r(#*)"')
+    char_re = re.compile(r"'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]{1,6}\}|.)|[^\\'\n])'")
+    while i < n:
+        if rs_text.startswith("//", i):
+            end = rs_text.find("\n", i + 2)
+            end = n if end == -1 else end
+            out.append(" " * (end - i))
+            i = end
+        elif rs_text.startswith("/*", i):
+            depth = 1
+            k = i + 2
+            while k < n and depth > 0:
+                if rs_text.startswith("/*", k):
+                    depth += 1
+                    k += 2
+                elif rs_text.startswith("*/", k):
+                    depth -= 1
+                    k += 2
+                else:
+                    k += 1
+            out.append(re.sub(r"[^\n]", " ", rs_text[i:k]))
+            i = k
+        elif rs_text[i] == "'":
+            cm = char_re.match(rs_text, i) if i == 0 or not (rs_text[i - 1].isalnum() or rs_text[i - 1] == "_") else None
+            if cm:
+                out.append("'" + " " * (cm.end() - i - 2) + "'")
+                i = cm.end()
+            else:
+                out.append("'")
+                i += 1
+        elif (rm := raw_str_re.match(rs_text, i)) is not None:
+            close = '"' + rm.group(1)
+            end = rs_text.find(close, rm.end())
+            if end == -1:
+                out.append(rs_text[i:rm.end()] + re.sub(r"[^\n]", " ", rs_text[rm.end():]))
+                i = n
+            else:
+                out.append(rs_text[i:rm.end()] + re.sub(r"[^\n]", " ", rs_text[rm.end():end]) + close)
+                i = end + len(close)
+        elif rs_text[i] == '"':
+            k = i + 1
+            while k < n and rs_text[k] != '"':
+                k += 2 if rs_text[k] == "\\" else 1
+            if k >= n:
+                out.append('"' + re.sub(r"[^\n]", " ", rs_text[i + 1 :]))
+                i = n
+            else:
+                out.append('"' + re.sub(r"[^\n]", " ", rs_text[i + 1 : k]) + '"')
+                i = k + 1
+        else:
+            out.append(rs_text[i])
+            i += 1
+    return "".join(out)
+
+
 def _extract_rust_fn_units(rs_text: str) -> list[tuple[str, list[str], str]]:
     """Extract `(fn_name, statements, signature_context)` from a Rust source file using brace
     balancing. `signature_context` is the function's own signature (generics, parameters,
     return type, `where` clause) preceded by the headers of its enclosing `impl` / `trait`
     blocks, so signature-level constructs such as `T: ?Sized` bounds are visible."""
-    # Strip line comments to avoid unbalanced braces in comments
-    cleaned_lines = []
-    for line in rs_text.splitlines():
-        code_part = line.split("//", 1)[0]
-        cleaned_lines.append(code_part)
-    cleaned = "\n".join(cleaned_lines)
+    cleaned = _strip_rust_comments_and_strings(rs_text)
     block_spans = _rust_block_header_spans(cleaned)
 
     fn_Header_re = re.compile(

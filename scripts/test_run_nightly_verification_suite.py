@@ -256,6 +256,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "ptr::from_raw_parts_mut(p, n)",
             "NonNull::from_raw_parts(nn, n)",
             "<*const [u8]>::from_raw_parts(p, n)",
+            "p.to_raw_parts()",
+            "<*const [u8]>::to_raw_parts(p)",
         )
         neither = (
             "v.len()",
@@ -302,6 +304,18 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             suite._extract_rust_functions(SLICE_VS_DST_CORPUS),
             [(name, stmts) for name, stmts, _sig in units],
         )
+        commented = """
+        /* Nested /* block comment with { and impl<T: ?Sized> W<T> { fn ghost() {} } */ end */
+        pub fn real_fn(p: *const u8, n: usize) -> usize {
+            let _url = "http://example.com // not a comment { size_of_val ?Sized";
+            let s = unsafe { core::slice::from_raw_parts(p, n) };
+            s.len()
+        }
+        """
+        c_units = suite._extract_rust_fn_units(commented)
+        self.assertEqual([u[0] for u in c_units], ["real_fn"])
+        self.assertNotIn("?Sized", c_units[0][2])
+        self.assertFalse(any("size_of_val" in stmt for stmt in c_units[0][1]))
 
     def test_correspondence_divergence_switch_to_pass_detection(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)

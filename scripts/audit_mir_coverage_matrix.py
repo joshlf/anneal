@@ -206,6 +206,15 @@ REQUIRED_LENS_LEMMAS: tuple[str, ...] = (
     "SliceTypedAt.of_splitAt",
     "DisjointSlice.adjacent",
 )
+REQUIRED_DOGFOOD_PROOFS: tuple[str, ...] = (
+    "examples/fxfs-storage-boundary/anneal/proofs/Proof/FxfsStorageBoundary/vmo_subslice_bounds_valid.lean",
+    "examples/fxfs-storage-boundary/anneal/proofs/Proof/FxfsStorageBoundary/zerocopy_check_slice_len.lean",
+    "examples/fxfs-storage-boundary/anneal/proofs/Proof/FxfsStorageBoundary/vmo_buffer_as_ref_unchecked.lean",
+    "examples/fuchsia-usercopy/anneal/proofs/Proof/FuchsiaUsercopy/assume_initialized_until_split_len.lean",
+    "examples/fuchsia-usercopy/anneal/proofs/Proof/FuchsiaUsercopy/fidl_chunk_padding_len.lean",
+    "examples/fuchsia-usercopy/anneal/proofs/Proof/FuchsiaUsercopy/hermetic_copy_bytes_copied.lean",
+    "examples/fuchsia-usercopy/anneal/proofs/Proof/FuchsiaUsercopy/usercopy_copyin_bracketed.lean",
+)
 DEFAULT_LIFTED_SLICE_BLOCKER = "slice_wide_ptr_lifted"
 DEFAULT_UNSIZED_DST_BLOCKER = "unsized_dst_or_ptr_metadata"
 LIFTERS_LAYER = "anneal_proof_lifters"
@@ -311,6 +320,28 @@ impl<T: ?Sized> W<T> {
 }
 """,
         True,
+    ),
+    BlockerProbe(
+        "unsized_ptr_to_raw_parts",
+        """
+pub fn probe(p: *const [u8]) -> (*const (), usize) {
+    let parts = p.to_raw_parts();
+    parts
+}
+""",
+        True,
+    ),
+    BlockerProbe(
+        "lifted_slice_with_comment_and_string_dst_tokens",
+        """
+/* impl<T: ?Sized> Ghost<T> { fn ghost() { core::mem::size_of_val(&0); } } */
+pub fn probe(p: *const u8, n: usize) -> usize {
+    let _msg = "http://example.com size_of_val T: ?Sized ptr::from_raw_parts";
+    let s = unsafe { core::slice::from_raw_parts(p, n) };
+    s.len()
+}
+""",
+        False,
     ),
 )
 
@@ -1156,7 +1187,39 @@ class _Audit:
         for nm in REQUIRED_LENS_LEMMAS:
             if nm not in found_lemmas:
                 res.errors.append(f"no declaration of `{nm}` under {LENS_THEORY_DIR}/")
-        res.details = {"definitions": found_defs, "lemmas": found_lemmas}
+        dogfood_report: dict[str, list[str]] = {}
+        if (self.root / "examples").is_dir():
+            lens_re = re.compile(r"\b(?:" + "|".join(re.escape(x) for x in REQUIRED_LENS_DEFINITIONS) + r")\b")
+            wide_re = _word_re("WidePtrVal")
+            for rel in REQUIRED_DOGFOOD_PROOFS:
+                d_stripped = self.lean(rel)
+                if d_stripped is None:
+                    res.errors.append(f"{rel}: missing or unreadable dogfood proof")
+                    continue
+                d_code, d_errs = d_stripped
+                for err in d_errs:
+                    res.errors.append(f"{rel}: {err}")
+                for label, pattern in FORBIDDEN_CODE_PATTERNS:
+                    for m in pattern.finditer(d_code):
+                        res.errors.append(f"{rel}:{_line_of(d_code, m.start())}: forbidden `{label}` in code")
+                d_lines = d_code.split("\n")
+                d_decls = scan_lean_declarations(d_code)
+                has_verified = any(d.kind == "theorem" and d.written_name == "verified" for d in d_decls)
+                if not has_verified:
+                    res.errors.append(f"{rel}: missing `theorem verified`")
+                companions: list[str] = []
+                for d in d_decls:
+                    if d.kind != "theorem" or d.written_name == "verified":
+                        continue
+                    body = "\n".join(d_lines[d.start_line : d.end_line])
+                    if lens_re.search(body) and wide_re.search(body):
+                        companions.append(d.written_name)
+                if not companions:
+                    res.errors.append(
+                        f"{rel}: no companion theorem referencing `WidePtrVal` and one of {list(REQUIRED_LENS_DEFINITIONS)}"
+                    )
+                dogfood_report[rel] = companions
+        res.details = {"definitions": found_defs, "lemmas": found_lemmas, "dogfood_companions": dogfood_report}
         return res
 
     def check_blocker_separation(self) -> CheckResult:
@@ -1330,13 +1393,22 @@ class _Audit:
 
 class _VariantMentions:
     """Transitive "declaration references the variant" relation within one file: a declaration
-    references it if its own code (name included) matches the variant pattern or it uses (by
-    written, short or qualified name) a declaration of the same file that does."""
+    references it if its own code (excluding a theorem/lemma's own declaration name, so a tautology
+    named `tailCall_vacuous : 1 = 1 := rfl` cannot self-match) matches the variant pattern or it
+    uses (by written, short or qualified name) a declaration of the same file that does."""
 
     def __init__(self, decls: list[LeanDecl], code_lines: list[str]) -> None:
         self.decls = decls
         self.index = {id(d): idx for idx, d in enumerate(decls)}
-        self.text = ["\n".join(code_lines[d.start_line : d.end_line]) for d in decls]
+        self.text: list[str] = []
+        for d in decls:
+            span_lines = list(code_lines[d.start_line : d.end_line])
+            if span_lines and d.kind in ("theorem", "lemma"):
+                m_decl = _DECL_RE.match(span_lines[0])
+                if m_decl and m_decl.group("name"):
+                    s, e = m_decl.span("name")
+                    span_lines[0] = span_lines[0][:s] + (" " * (e - s)) + span_lines[0][e:]
+            self.text.append("\n".join(span_lines))
         self.by_name: dict[str, list[int]] = {}
         for idx, d in enumerate(decls):
             for key in {d.written_name, d.written_name.rsplit(".", 1)[-1], d.qualified_name}:
