@@ -99,6 +99,11 @@ def _git_head_sha(repo_root: Path, ref: str = "HEAD") -> str:
 # Stage A: Syntactic & Authority Completeness Denominators
 # ---------------------------------------------------------------------------
 
+# One entry per constructor of the corresponding `inductive` in `file`, using the exact Lean
+# constructor names: `scripts/audit_mir_coverage_matrix.py --check` requires exact set equality with
+# the parsed `Trusted.Rustc.V2026_06_01.MirAst` inductives (94 constructors). rustc variants that
+# `trusted/rustc-capture` lowers onto an existing constructor are not separate entries (like
+# `FakeRead` -> `.placeMention`, `AggregateKind::CoroutineClosure` -> `.closure`).
 MIR_AST_CATEGORIES: list[dict[str, Any]] = [
     {
         "category": "StatementKind",
@@ -114,7 +119,8 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("intrinsic", "proved_corresponding"),
             ("nop", "proved_corresponding"),
             ("coverage", "supported_and_tested"),
-            ("constEvalCounter", "supported_untested"),
+            # Trusted / MiniRust / LeanMiri correspondence: tests/mir/MirUntestedVariantCorrespondenceTests.lean
+            ("constEvalCounter", "proved_corresponding"),
             ("backwardIncompatibleDropHint", "unsupported_fail_closed"),
         ],
     },
@@ -137,9 +143,10 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("assert", "proved_corresponding"),
             ("call", "proved_corresponding"),
             ("drop", "supported_and_tested"),
-            ("tailCall", "supported_untested"),
-            ("resume", "unsupported_fail_closed"),
-            ("terminate", "unsupported_fail_closed"),
+            # Trusted / MiniRust / LeanMiri correspondence: tests/mir/MirUntestedVariantCorrespondenceTests.lean
+            ("tailCall", "proved_corresponding"),
+            ("unwindResume", "unsupported_fail_closed"),
+            ("unwindTerminate", "unsupported_fail_closed"),
             ("inlineAsm", "unsupported_fail_closed"),
         ],
     },
@@ -153,7 +160,8 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("constantIndex", "proved_corresponding"),
             ("subslice", "proved_corresponding"),
             ("downcast", "proved_corresponding"),
-            ("opaqueCast", "supported_untested"),
+            # Phase boundary, not a gap: rustc's validator rejects OpaqueCast at MirPhase::Runtime (after PostAnalysisNormalize) and both vendored Miri paths throw "OpaqueCast after borrowck" (Projection.lean `.invariant` / PlaceDynamic.lean `.invalidProgram`), while Trusted treats it as a value-transparent retype.
+            ("opaqueCast", "supported_and_tested"),
             ("unwrapUnsafeBinder", "unsupported_fail_closed"),
         ],
     },
@@ -244,9 +252,9 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("tuple", "proved_corresponding"),
             ("adt", "proved_corresponding"),
             ("rawPtr", "supported_and_tested"),
+            # Also covers rustc's `AggregateKind::CoroutineClosure`, which `mir_lower.rs` lowers to `.closure`.
             ("closure", "unsupported_fail_closed"),
             ("coroutine", "unsupported_fail_closed"),
-            ("coroutineClosure", "unsupported_fail_closed"),
         ],
     },
 ]
@@ -493,6 +501,34 @@ def compute_stage_a_syntactic_completeness(repo_root: Path) -> dict[str, Any]:
 # Construct patterns scanned on Rust function bodies to identify unsupported/blocker
 # features across the 4 layers (`trusted_mir`, `anneal_proof_lifters`,
 # `minirust_correspondence`, `lean_miri_correspondence`).
+#
+# Slice wide pointers vs. unsized DSTs (formerly one `wide_ptr_or_unsized_dst` blocker):
+# Episode 1 lifted `[T]` wide pointers (data pointer + element-count metadata) into the proof
+# lifters (`theory/Anneal/SepLogicLenses.lean`, section `SliceWidePtrLenses`: `WidePtrVal`,
+# `SliceTypedAt`, `ActiveTypedSliceBorrow`, `ActiveTypedSliceMutBorrow`, `SliceTypedAt.splitAt`).
+# Raw slice construction (`slice::from_raw_parts(_mut)`, `ptr::slice_from_raw_parts(_mut)`,
+# `NonNull::slice_from_raw_parts`) therefore no longer blocks `anneal_proof_lifters`, but its
+# MiniRust / LeanMiri correspondence is unproved, so it keeps blocking those two layers (as
+# `slice_from_raw_parts` did before; `slice::from_raw_parts`, the same construction behind a
+# reference, is now recognized too). Plain slice operations (`.len()`, `split_at(_mut)`,
+# indexing, `PtrMetadata` of a `&[T]`) never matched a blocker and still do not. Generic
+# unsized DSTs stay unlifted: `?Sized`
+# bounds, `size_of_val(_raw)` / `align_of_val(_raw)` / `Layout::for_value(_raw)`, `Pointee` /
+# `DynMetadata` / `ptr::metadata` / zerocopy's `PointerMetadata`, and the generic
+# `ptr::from_raw_parts(_mut)` / `NonNull::from_raw_parts` / `<*const T>::from_raw_parts`
+# constructors (anchored on `ptr::` / `NonNull::` / `>::`, so `slice::from_raw_parts` and
+# `slice_from_raw_parts` never match them). `dyn Trait` keeps its own `dyn_trait_dispatch` blocker.
+LIFTED_SLICE_WIDE_PTR_BLOCKER = "slice_wide_ptr_lifted"
+UNSIZED_DST_BLOCKER = "unsized_dst_or_ptr_metadata"
+# Blocker patterns only scan body statements, but `T: ?Sized` bounds sit in signatures and
+# `impl` / `trait` headers. So that the split never newly reports a function verifiable on
+# `anneal_proof_lifters` while it is generic over an unsized type, a function whose body hits a
+# key blocker below is also checked for the mapped guard blocker in its signature context (own
+# signature plus enclosing `impl` / `trait` headers, e.g. `fn f<T: ?Sized>` or
+# `impl<T: ?Sized> Ptr<T>`); a match is attributed to its entry statement. Other functions keep
+# body-only scanning (unchanged accounting).
+SIGNATURE_GUARDED_BLOCKERS: dict[str, str] = {LIFTED_SLICE_WIDE_PTR_BLOCKER: UNSIZED_DST_BLOCKER}
+
 RUST_CONSTRUCT_BLOCKERS: list[tuple[str, re.Pattern[str], set[str]]] = [
     (
         "float_arith_or_cast",
@@ -539,8 +575,20 @@ RUST_CONSTRUCT_BLOCKERS: list[tuple[str, re.Pattern[str], set[str]]] = [
         {"anneal_proof_lifters", "minirust_correspondence", "lean_miri_correspondence"},
     ),
     (
-        "wide_ptr_or_unsized_dst",
-        re.compile(r"\?\s*Sized\b|\bslice_from_raw_parts(?:_mut)?\b|\bsize_of_val(?:_raw)?\b|\balign_of_val(?:_raw)?\b|\bPointerMetadata\b"),
+        LIFTED_SLICE_WIDE_PTR_BLOCKER,
+        re.compile(r"\b(?:slice::from_raw_parts(?:_mut)?|slice_from_raw_parts(?:_mut)?)\b"),
+        {"minirust_correspondence", "lean_miri_correspondence"},
+    ),
+    (
+        UNSIZED_DST_BLOCKER,
+        re.compile(
+            r"\?\s*Sized\b"
+            r"|\b(?:size|align)_of_val(?:_raw)?\b"
+            r"|\bLayout::for_value(?:_raw)?\b"
+            r"|\b(?:Pointee|DynMetadata|PointerMetadata)\b"
+            r"|\bptr::metadata\b"
+            r"|(?:\b(?:ptr|NonNull)|>)::from_raw_parts(?:_mut)?\b"
+        ),
         {"anneal_proof_lifters", "minirust_correspondence", "lean_miri_correspondence"},
     ),
     (
@@ -566,19 +614,66 @@ RUST_CONSTRUCT_BLOCKERS: list[tuple[str, re.Pattern[str], set[str]]] = [
 ]
 
 
-def _extract_rust_functions(rs_text: str) -> list[tuple[str, list[str]]]:
-    """Extract `(fn_name, statements)` from a Rust source file using brace balancing."""
+_RUST_IMPL_OR_TRAIT_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*(?:pub(?:\([^)\n]*\))?[ \t]+)?(?:default[ \t]+)?(?:unsafe[ \t]+)?(?:auto[ \t]+)?(?:impl|trait)\b"
+)
+
+
+def _rust_block_header_spans(cleaned: str) -> list[tuple[int, int, str]]:
+    """`(body_open, body_close, header)` for every `impl` / `trait` item block in `cleaned`
+    (`header` runs from the item keyword up to, excluding, the block's opening `{`)."""
+    spans: list[tuple[int, int, str]] = []
+    n = len(cleaned)
+    for m in _RUST_IMPL_OR_TRAIT_HEADER_RE.finditer(cleaned):
+        idx = m.end()
+        depth = 0
+        open_idx = -1
+        while idx < n:
+            ch = cleaned[idx]
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth = max(0, depth - 1)
+            elif ch == ";" and depth == 0:
+                break
+            elif ch == "{" and depth == 0:
+                open_idx = idx
+                break
+            idx += 1
+        if open_idx == -1:
+            continue
+        brace = 0
+        close_idx = open_idx
+        while close_idx < n:
+            ch = cleaned[close_idx]
+            if ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace -= 1
+                if brace == 0:
+                    break
+            close_idx += 1
+        spans.append((open_idx, close_idx, cleaned[m.start() : open_idx]))
+    return spans
+
+
+def _extract_rust_fn_units(rs_text: str) -> list[tuple[str, list[str], str]]:
+    """Extract `(fn_name, statements, signature_context)` from a Rust source file using brace
+    balancing. `signature_context` is the function's own signature (generics, parameters,
+    return type, `where` clause) preceded by the headers of its enclosing `impl` / `trait`
+    blocks, so signature-level constructs such as `T: ?Sized` bounds are visible."""
     # Strip line comments to avoid unbalanced braces in comments
     cleaned_lines = []
     for line in rs_text.splitlines():
         code_part = line.split("//", 1)[0]
         cleaned_lines.append(code_part)
     cleaned = "\n".join(cleaned_lines)
+    block_spans = _rust_block_header_spans(cleaned)
 
     fn_Header_re = re.compile(
         r"(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[<(]"
     )
-    results: list[tuple[str, list[str]]] = []
+    results: list[tuple[str, list[str], str]] = []
     pos = 0
     n = len(cleaned)
     while pos < n:
@@ -635,10 +730,17 @@ def _extract_rust_functions(rs_text: str) -> list[tuple[str, list[str]]]:
         ]
         if not raw_stmts:
             raw_stmts = ["return ()"]
-        results.append((fn_name, raw_stmts))
+        enclosing = [hdr for open_i, close_i, hdr in block_spans if open_i < m.start() < close_i]
+        signature_context = "\n".join([*enclosing, cleaned[m.start() : body_start]])
+        results.append((fn_name, raw_stmts, signature_context))
         pos = end_idx + 1
 
     return results
+
+
+def _extract_rust_functions(rs_text: str) -> list[tuple[str, list[str]]]:
+    """Extract `(fn_name, statements)` from a Rust source file using brace balancing."""
+    return [(fn_name, stmts) for fn_name, stmts, _sig in _extract_rust_fn_units(rs_text)]
 
 
 def analyze_corpus_completeness(
@@ -678,7 +780,7 @@ def analyze_corpus_completeness(
             text = rs_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for _fn_name, stmts in _extract_rust_functions(text):
+        for _fn_name, stmts, signature_context in _extract_rust_fn_units(text):
             total_fns += 1
             w = len(stmts)
             total_stmts += w
@@ -694,6 +796,21 @@ def analyze_corpus_completeness(
                         for layer in affected_layers:
                             fn_blockers_by_layer[layer].add(b_name)
                 stmt_blockers.append(hit_list)
+
+            # `SIGNATURE_GUARDED_BLOCKERS`: a body hit on a guarded blocker also checks its guard
+            # blocker against the signature context, attributing a match to the entry statement.
+            body_hit_names = {b_name for s_hits in stmt_blockers for b_name, _aff in s_hits}
+            for guarded, guard in SIGNATURE_GUARDED_BLOCKERS.items():
+                if guarded not in body_hit_names or not stmt_blockers:
+                    continue
+                if any(b_name == guard for b_name, _aff in stmt_blockers[0]):
+                    continue
+                for b_name, pattern, affected_layers in RUST_CONSTRUCT_BLOCKERS:
+                    if b_name == guard and pattern.search(signature_context):
+                        stmt_blockers[0].append((b_name, affected_layers))
+                        for layer in affected_layers:
+                            fn_blockers_by_layer[layer].add(b_name)
+                        break
 
             # Record blocker attribution for `anneal_proof_lifters` (our primary proof-lifting frontier)
             lifter_blockers = fn_blockers_by_layer["anneal_proof_lifters"]
@@ -1371,12 +1488,16 @@ def _run_step(
 # Standalone `nightly` Lean test files. `lake env lean` never builds imports, so each
 # module they import needs an up-to-date `.olean` before they run; `Anneal.ByteCodec`,
 # `Anneal.Mir.Cast` and `Anneal.Mir.AdtAndControl` are outside the
-# `Trusted`/`Anneal`/`MiniRust` import closure.
+# `Trusted`/`Anneal`/`MiniRust` import closure, and so are the `Correspondence` /
+# `MiniRustSpec` modules imported by `MirUntestedVariantCorrespondenceTests.lean`
+# (`Anneal.SepLogicLenses`, `Anneal.MirLoops` and `Anneal.MirFuelFree` are inside it).
 MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_bit_validity_stage1", "tests/mir/BitValidityStage1Tests.lean"),
     ("tests_mir_byte_codec", "tests/mir/ByteCodecTests.lean"),
     ("tests_mir_cast_stage1", "tests/mir/CastStage1Tests.lean"),
     ("tests_mir_adt_and_control", "tests/mir/AdtAndControlTests.lean"),
+    ("tests_mir_slice_wide_ptr_lens", "tests/mir/MirSliceWidePtrLensTests.lean"),
+    ("tests_mir_untested_variant_correspondence", "tests/mir/MirUntestedVariantCorrespondenceTests.lean"),
 )
 CORE_THEORY_LIBS: tuple[str, ...] = ("Trusted", "Anneal", "MiniRust")
 _LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
@@ -1386,12 +1507,20 @@ _LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
     "Correspondence",
     "MiniRustSpec",
 )
-# Used only if a test header is unreadable (the unit tests keep it in sync).
+# Used only if a test header is unreadable (the unit tests keep it in sync): the first-seen
+# ordered union of the workspace-library imports of every `MIR_STANDALONE_LEAN_TESTS` header.
 _MIR_TEST_MODULE_FALLBACK: tuple[str, ...] = (
     "Anneal.BitValidity",
     "Anneal.ByteCodec",
     "Anneal.Mir.Cast",
     "Anneal.Mir.AdtAndControl",
+    "Anneal.SepLogicLenses",
+    "Anneal.MirLoops",
+    "Trusted",
+    "Anneal.MirFuelFree",
+    "Correspondence.V2026_06_01.L3_PlacesAndBasicMem",
+    "Correspondence.V2026_06_01.L5_ControlAndCalls",
+    "MiniRustSpec.Correspondence.Translate",
 )
 _LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
 
@@ -1634,12 +1763,19 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
         # Cold `+Anneal.BitValidity +Anneal.ByteCodec +Anneal.Mir.Cast` after the core
         # build measures ~96 s on an 8-core capsule; rebuilding `Anneal.Mir.AdtAndControl`
         # (28.8k lines, also imported by `MiniRustSpec` via `DeinitBridge`, so
-        # `lake_build_minirust_spec` reuses it) adds ~200 s.
+        # `lake_build_minirust_spec` reuses it) adds ~200 s. The `Correspondence.V2026_06_01`
+        # L3/L5 and `MiniRustSpec.Correspondence.Translate` imports of
+        # `MirUntestedVariantCorrespondenceTests.lean` add 40 modules outside the core closure
+        # (~96k lines: 34 `MiniRustSpec` modules, ~86k lines, mostly generated spec items plus
+        # `Interp` and `Translate`; 6 `Correspondence` modules, ~9.8k lines), estimated
+        # line-proportionally against the `lake_build_correspondence` / `lake_build_minirust_spec`
+        # closures at another ~250-400 s cold (~700 s in total). Those `.olean`s are reused by both
+        # later steps, so the budget rises to 1500 s to keep ~2x headroom without adding wall time.
         add(
             "lake_build_mir_test_modules",
             "cat1_trusted_boundary",
             ["lake", "build", *(f"+{mod}" for mod in mir_test_prebuild_modules(repo_root))],
-            900,
+            1500,
             wrap="build",
         )
         for step_name, rel in MIR_STANDALONE_LEAN_TESTS:

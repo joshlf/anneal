@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,14 +27,83 @@ import run_nightly_verification_suite as suite  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+UNTESTED_VARIANT_TEST = "tests/mir/MirUntestedVariantCorrespondenceTests.lean"
+# Workspace-library imports of `MirUntestedVariantCorrespondenceTests.lean` (its header is
+# `import Trusted`, `Anneal.MirFuelFree`, the two `Correspondence.V2026_06_01` layers,
+# `MiniRustSpec.Correspondence.Translate` and `Lean.Elab.Command`).
+UNTESTED_VARIANT_TEST_WORKSPACE_IMPORTS = (
+    "Trusted",
+    "Anneal.MirFuelFree",
+    "Correspondence.V2026_06_01.L3_PlacesAndBasicMem",
+    "Correspondence.V2026_06_01.L5_ControlAndCalls",
+    "MiniRustSpec.Correspondence.Translate",
+)
+
+# Synthetic Stage-B corpus separating Episode 1's lifted slice wide pointers from unlifted
+# unsized DSTs (8 functions; statement counts in comments).
+SLICE_VS_DST_CORPUS = """
+pub fn slice_only(p: *mut u32, n: usize, k: usize) -> usize {
+    let s = unsafe { core::slice::from_raw_parts(p, n) };
+    let w = core::ptr::slice_from_raw_parts_mut(p, n);
+    let (a, b) = unsafe { (*w).split_at_mut(k) };
+    s.len() + a.len() + b.len()
+}
+
+pub fn pure_add(a: u32, b: u32) -> u32 {
+    let c = a + b;
+    c
+}
+
+pub fn unsized_body(x: &[u8]) -> usize {
+    let n = x.len();
+    let bytes = core::mem::size_of_val(x);
+    n + bytes
+}
+
+pub fn qsized_generic<T: ?Sized>(_t: &T, p: *const u8, n: usize) -> usize {
+    let w = core::ptr::slice_from_raw_parts(p, n);
+    let m = n + 1;
+    m
+}
+
+pub fn generic_from_raw_parts(p: *const u8, n: usize) -> usize {
+    let m = n * 2;
+    let w: *const [u8] = core::ptr::from_raw_parts(p, n);
+    m
+}
+
+pub fn qsized_without_slice_op<T: ?Sized>(_t: &T) -> usize {
+    let m = 3;
+    m
+}
+
+pub struct W<T: ?Sized>(core::marker::PhantomData<T>);
+impl<T: ?Sized> W<T> {
+    pub fn impl_qsized(&self, p: *const u8, n: usize) -> usize {
+        let w = core::ptr::slice_from_raw_parts(p, n);
+        let m = n;
+        m
+    }
+}
+
+pub fn dyn_dispatch(x: &u32) -> u32 {
+    let d: &dyn Fooable = x;
+    let y = *x;
+    y
+}
+"""
 
 
 class NightlyVerificationSuiteTests(unittest.TestCase):
     def test_stage_a_syntactic_completeness_on_repo(self) -> None:
         stage_a = suite.compute_stage_a_syntactic_completeness(REPO_ROOT)
         mir = stage_a["anneal_mir_ast"]
-        self.assertEqual(mir["total_variants"], 95)
-        self.assertGreaterEqual(mir["proved_corresponding"], 65)
+        # Exactly the `Trusted.Rustc.V2026_06_01.MirAst` constructors (checked against the Lean
+        # inductives by `scripts/audit_mir_coverage_matrix.py`).
+        self.assertEqual(mir["total_variants"], 94)
+        self.assertGreaterEqual(mir["proved_corresponding"], 73)
+        self.assertEqual(mir["supported_untested"], 0)
+        self.assertEqual(mir["untested_variants"], [])
         self.assertEqual(
             mir["total_variants"],
             mir["proved_corresponding"]
@@ -41,6 +111,15 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             + mir["supported_untested"]
             + mir["unsupported_fail_closed"],
         )
+        statuses = {
+            f"{entry['category']}.{name}": status
+            for entry in suite.MIR_AST_CATEGORIES
+            for name, status in entry["variants"]
+        }
+        self.assertEqual(statuses["StatementKind.constEvalCounter"], "proved_corresponding")
+        self.assertEqual(statuses["TerminatorKind.tailCall"], "proved_corresponding")
+        # Explicit phase boundary (rejected after borrowck by rustc and Miri).
+        self.assertEqual(statuses["ProjectionElem.opaqueCast"], "supported_and_tested")
         self.assertGreaterEqual(mir["stage1_lowered_lintrinsic_op_variants"], 30)
 
         mr = stage_a["minirust_authority"]
@@ -102,6 +181,127 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(blockers["float_arith_or_cast"]["blocked_fn_count"], 2)
             self.assertEqual(blockers["inline_asm"]["sole_blocker_fn_count"], 0)
             self.assertEqual(blockers["inline_asm"]["blocked_fn_count"], 1)
+
+    def test_stage_b_separates_lifted_slice_wide_ptrs_from_unsized_dsts(self) -> None:
+        lifted = suite.LIFTED_SLICE_WIDE_PTR_BLOCKER
+        unsized = suite.UNSIZED_DST_BLOCKER
+        layers = {name: aff for name, _pat, aff in suite.RUST_CONSTRUCT_BLOCKERS}
+        self.assertNotIn("wide_ptr_or_unsized_dst", layers)
+        self.assertNotIn("anneal_proof_lifters", layers[lifted])
+        self.assertEqual(layers[lifted], {"minirust_correspondence", "lean_miri_correspondence"})
+        self.assertEqual(
+            layers[unsized],
+            {"anneal_proof_lifters", "minirust_correspondence", "lean_miri_correspondence"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            sample_rs = Path(tmp) / "slice_vs_dst.rs"
+            sample_rs.write_text(SLICE_VS_DST_CORPUS, encoding="utf-8")
+            res = suite.analyze_corpus_completeness("slice_vs_dst", [sample_rs], alpha=0.5)
+        self.assertEqual(res["total_fns"], 8)
+        self.assertEqual(res["total_stmt_units"], 4 + 2 + 3 + 3 + 3 + 2 + 3 + 3)
+        counts = {
+            layer: (d["fully_verifiable_fns"], d["partially_covered_fns"], d["uncovered_fns"])
+            for layer, d in res["layers"].items()
+        }
+        # Lifters: `slice_only` (raw slice construction + split_at_mut + len), `pure_add` and
+        # `qsized_without_slice_op` (no slice exemption claimed, so body-only scanning as
+        # before) verify; size_of_val, generic `ptr::from_raw_parts`, a lifted slice op inside a
+        # `T: ?Sized` fn or `impl<T: ?Sized>`, and `dyn` are partial (entry statement blocked
+        # for the signature-guarded two).
+        self.assertEqual(counts["anneal_proof_lifters"], (3, 5, 0))
+        # Raw slice construction still blocks both correspondence layers.
+        self.assertEqual(counts["minirust_correspondence"], (2, 6, 0))
+        self.assertEqual(counts["lean_miri_correspondence"], (2, 6, 0))
+        self.assertEqual(counts["trusted_mir"], (7, 1, 0))
+        lifters = res["layers"]["anneal_proof_lifters"]
+        # Entry prefixes of the 5 blocked fns (3 stmts each): `unsized_body` 1,
+        # `generic_from_raw_parts` 1, and 0 for the signature-guarded `qsized_generic` /
+        # `impl_qsized` (blocked at entry) and `dyn_dispatch`.
+        self.assertAlmostEqual(lifters["within_blocked_fns_cfg_prefix_pct"], round(100.0 * 2 / 15, 2))
+        self.assertAlmostEqual(lifters["within_blocked_fns_stmt_coverage_pct"], round(100.0 * 10 / 15, 2))
+        top = {b["construct"]: b for b in res["top_marginal_unlock_blockers"]}
+        self.assertEqual(set(top), {unsized, "dyn_trait_dispatch"})
+        self.assertNotIn(lifted, top)
+        self.assertEqual(top[unsized]["blocked_fn_count"], 4)
+        self.assertEqual(top[unsized]["sole_blocker_fn_count"], 4)
+        self.assertEqual(top[unsized]["uncovered_stmt_count"], 4)
+        self.assertEqual(top["dyn_trait_dispatch"]["sole_blocker_fn_count"], 1)
+        self.assertEqual(res["top_marginal_unlock_blockers"][0]["construct"], unsized)
+
+    def test_lifted_slice_and_unsized_dst_patterns_do_not_overlap(self) -> None:
+        patterns = {name: pat for name, pat, _aff in suite.RUST_CONSTRUCT_BLOCKERS}
+        lifted = patterns[suite.LIFTED_SLICE_WIDE_PTR_BLOCKER]
+        unsized = patterns[suite.UNSIZED_DST_BLOCKER]
+        lifted_only = (
+            "let s = unsafe { core::slice::from_raw_parts(p, n) }",
+            "slice::from_raw_parts_mut(p, n)",
+            "ptr::slice_from_raw_parts(p, n)",
+            "core::ptr::slice_from_raw_parts_mut(p, n)",
+            "NonNull::slice_from_raw_parts(nn, n)",
+        )
+        unsized_only = (
+            "fn f<T: ?Sized>(t: &T)",
+            "T: ? Sized",
+            "core::mem::size_of_val(x)",
+            "mem::size_of_val_raw(p)",
+            "align_of_val(x)",
+            "core::mem::align_of_val_raw(p)",
+            "Layout::for_value(x)",
+            "Layout::for_value_raw(p)",
+            "<T as Pointee>::Metadata",
+            "DynMetadata<dyn Foo>",
+            "Dst::PointerMetadata::from_elem_count(n)",
+            "core::ptr::metadata(p)",
+            "core::ptr::from_raw_parts(p, n)",
+            "ptr::from_raw_parts_mut(p, n)",
+            "NonNull::from_raw_parts(nn, n)",
+            "<*const [u8]>::from_raw_parts(p, n)",
+        )
+        neither = (
+            "v.len()",
+            "s.split_at_mut(2)",
+            "let (a, b) = s.split_at(k)",
+            "Vec::from_raw_parts(p, n, c)",
+            "String::from_raw_parts(p, n, c)",
+            "std::fs::metadata(path)",
+            "myslice::from_raw_parts(p)",
+            "from_raw_parts(p, n)",
+            "x.as_ptr()",
+            "fn g<T: Sized>(t: T)",
+        )
+        for text in lifted_only:
+            self.assertRegex(text, lifted)
+            self.assertNotRegex(text, unsized)
+        for text in unsized_only:
+            self.assertRegex(text, unsized)
+            self.assertNotRegex(text, lifted)
+        for text in neither:
+            self.assertNotRegex(text, lifted)
+            self.assertNotRegex(text, unsized)
+
+    def test_rust_fn_units_carry_signature_and_enclosing_headers(self) -> None:
+        units = suite._extract_rust_fn_units(SLICE_VS_DST_CORPUS)
+        by_name = {name: (stmts, sig) for name, stmts, sig in units}
+        self.assertEqual(
+            [name for name, _s, _g in units],
+            [
+                "slice_only",
+                "pure_add",
+                "unsized_body",
+                "qsized_generic",
+                "generic_from_raw_parts",
+                "qsized_without_slice_op",
+                "impl_qsized",
+                "dyn_dispatch",
+            ],
+        )
+        self.assertIn("?Sized", by_name["qsized_generic"][1])
+        self.assertIn("impl<T: ?Sized> W<T>", by_name["impl_qsized"][1])
+        self.assertNotIn("?Sized", by_name["slice_only"][1])
+        self.assertEqual(
+            suite._extract_rust_functions(SLICE_VS_DST_CORPUS),
+            [(name, stmts) for name, stmts, _sig in units],
+        )
 
     def test_correspondence_divergence_switch_to_pass_detection(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)
@@ -167,6 +367,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_byte_codec",
             "tests_mir_cast_stage1",
             "tests_mir_adt_and_control",
+            "tests_mir_slice_wide_ptr_lens",
+            "tests_mir_untested_variant_correspondence",
             "lake_build_correspondence",
             "lake_build_minirust_spec",
             "lake_build_lean_miri_spec",
@@ -200,18 +402,29 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         mods_idx = nightly_names.index("lake_build_mir_test_modules")
         self.assertLess(core_idx, mods_idx)
         import_re = re.compile(r"^import\s+(\S+)", re.MULTILINE)
+        workspace_libs = suite.CORE_THEORY_LIBS + ("Correspondence", "MiniRustSpec")
         for step_name, rel in suite.MIR_STANDALONE_LEAN_TESTS:
             self.assertLess(mods_idx, nightly_names.index(step_name))
             self.assertEqual(by_name[step_name][2][-4:], ["lake", "env", "lean", rel])
-            imports = import_re.findall((REPO_ROOT / rel).read_text(encoding="utf-8"))
+            path = REPO_ROOT / rel
+            if not path.is_file():
+                # Only the Episode 2 correspondence suite may be absent (written concurrently);
+                # its declared header is then covered by `_MIR_TEST_MODULE_FALLBACK`.
+                self.assertEqual(rel, UNTESTED_VARIANT_TEST)
+                imports = list(UNTESTED_VARIANT_TEST_WORKSPACE_IMPORTS)
+            else:
+                imports = import_re.findall(path.read_text(encoding="utf-8"))
             self.assertTrue(imports, rel)
             for mod in imports:
-                if mod.split(".")[0] in suite.CORE_THEORY_LIBS + ("Correspondence", "MiniRustSpec"):
+                if mod.split(".")[0] in workspace_libs:
                     self.assertIn(mod, built, f"{rel} imports {mod}, which must be pre-built")
         self.assertTrue({"Anneal.ByteCodec", "Anneal.Mir.Cast", "Anneal.Mir.AdtAndControl"} <= built)
+        self.assertTrue(set(UNTESTED_VARIANT_TEST_WORKSPACE_IMPORTS) <= built)
         self.assertEqual(sorted(built), sorted(suite._MIR_TEST_MODULE_FALLBACK))
+        self.assertEqual(len(suite._MIR_TEST_MODULE_FALLBACK), len(set(suite._MIR_TEST_MODULE_FALLBACK)))
         # The exact standalone `tests/mir` suites the nightly runs, including the
-        # `Anneal.Mir.AdtAndControl` kernel-regression / axiom-pin suite.
+        # `Anneal.Mir.AdtAndControl` kernel-regression / axiom-pin suite, Episode 1's slice-lens
+        # witnesses and Episode 2's untested-variant correspondence suite.
         self.assertEqual(
             sorted(rel for _step, rel in suite.MIR_STANDALONE_LEAN_TESTS),
             sorted(
@@ -221,9 +434,33 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "ByteCodecTests",
                     "CastStage1Tests",
                     "AdtAndControlTests",
+                    "MirSliceWidePtrLensTests",
+                    "MirUntestedVariantCorrespondenceTests",
                 )
             ),
         )
+
+    def test_mir_test_prebuild_modules_fallback_when_a_header_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copy2(REPO_ROOT / "lakefile.toml", root / "lakefile.toml")
+            (root / "tests/mir").mkdir(parents=True)
+            for _step, rel in suite.MIR_STANDALONE_LEAN_TESTS:
+                if rel != UNTESTED_VARIANT_TEST:
+                    shutil.copy2(REPO_ROOT / rel, root / rel)
+            # The correspondence suite is absent: the fallback fills in its imports, keeping
+            # the first-seen order of the full union.
+            self.assertEqual(suite.mir_test_prebuild_modules(root), list(suite._MIR_TEST_MODULE_FALLBACK))
+            (root / UNTESTED_VARIANT_TEST).write_text(
+                "import Trusted\nimport Anneal.MirFuelFree\n"
+                "import Correspondence.V2026_06_01.L3_PlacesAndBasicMem\n"
+                "import Correspondence.V2026_06_01.L5_ControlAndCalls\n"
+                "import MiniRustSpec.Correspondence.Translate\nimport Lean.Elab.Command\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(suite.mir_test_prebuild_modules(root), list(suite._MIR_TEST_MODULE_FALLBACK))
+        if (REPO_ROOT / UNTESTED_VARIANT_TEST).is_file():
+            self.assertEqual(suite.mir_test_prebuild_modules(REPO_ROOT), list(suite._MIR_TEST_MODULE_FALLBACK))
 
     def test_timeout_propagation_and_calibrated_step_timeouts(self) -> None:
         nightly_by_name = {
@@ -239,6 +476,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_byte_codec": 300,
             "tests_mir_cast_stage1": 300,
             "tests_mir_adt_and_control": 300,
+            "tests_mir_slice_wide_ptr_lens": 300,
+            "tests_mir_untested_variant_correspondence": 300,
             "lake_build_correspondence": 900,
             "lake_build_minirust_spec": 1200,
             "lake_build_lean_miri_spec": 1800,
@@ -246,7 +485,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "cargo_anneal_e2e_minirust_correspondence": 600,
             "cargo_anneal_e2e_pipeline_and_adoption": 900,
         }
-        expected_timeouts["lake_build_mir_test_modules"] = 900
+        # Raised from 900 s: also pre-builds the `Correspondence` L3/L5 and
+        # `MiniRustSpec.Correspondence.Translate` closure of the correspondence suite.
+        expected_timeouts["lake_build_mir_test_modules"] = 1500
         for step_name, exp_timeout in expected_timeouts.items():
             self.assertIn(step_name, nightly_by_name)
             _cat, cmd, timeout_sec = nightly_by_name[step_name]
