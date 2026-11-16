@@ -29,14 +29,20 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    `CfgCertificate.whileLoop` and `mir_cfgCertificate_sound`. Test 2b-sym
    replays the diamond from one symbolic entry state, where `stepBasicBlock`
    joins both arms into a single `.convergedJump 1` (one delay tick, pending
-   `handleFreeOutOpt` guard) that `mirCfg_forwardSim_of_waitFree`,
-   `mirCfg_forwardSim_of_emitsSubIdWraps`, and `CfgCertificate.diamond` /
-   `mir_diamond_cfgCertificate_sound` match with one header-targeted live run,
+   `handleFreeOutOpt` guard) that `mirCfg_forwardSim_of_waitFree` and
+   `mirCfg_forwardSim_of_emitsSubIdWraps` match with one header-targeted live
+   run. Test 2b-cert certifies the same live body through `CfgCertificate.diamond`
+   from the plan's `HoldsFnSpec` alone (`mir_diamond_cfgCertificate_sound`), for
+   the symbolic oracle (`.convergedJump`) and the concrete one (path
+   `0 → 1/2 → 3`), and through the `LocalBlockVC` route of
+   `mir_cfgCertificate_sound` with the exact 2-point invariant. Test 2b-asym
    replays an asymmetric 5-block diamond (`bb1 -> bb2` vs. `bb3`, `armSteps =
    Nat.max 2 1 = 2` with `.outOfFuel` at fuel `3` and convergence at fuel `4`),
-   and checks that a rejecting wrapper, a block-level leaked handle
-   (`diamondLeakRetBlocks`), or a guarded early-return leaked handle rejected by
-   `.convergedJump`'s wrapper (`diamondGuardedLeakBlocks`) faults. Test 2d
+   also as a segment (`mirCfg_segmentSim_of_emitsSubIdWraps`) landing exactly on
+   the live join state, and the rejection canaries check that a rejecting
+   wrapper, a block-level leaked handle (`diamondLeakRetBlocks`), or a guarded
+   early-return leaked handle rejected by `.convergedJump`'s wrapper
+   (`diamondGuardedLeakBlocks`) faults. Test 2d
    certifies loops from strong-descent cutpoints
    (`rank s' < rank s`) with `mir_whileLoop_cfgCertificate_of_cutpoint`,
    including the stride-3 `while i < 5` loop whose live header computes
@@ -1170,8 +1176,10 @@ theorem diamondCert_blocks_eq : diamondCert.blocks = diamondBlocks := rfl
 /-- **Test 2b-cert (`CfgCertificate.diamond` / `mir_diamond_cfgCertificate_sound`
 over a symbolic `.convergedJump 1` diamond)**: certifies `diamondBody` from
 symbolic `diamondSt0 c` (`_0 = .symBool c`) through `CfgCertificate.diamond` and
-`mir_cfgCertificate_sound`, where block `0` genuinely emits `.convergedJump 1
-(handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)`. -/
+`mir_cfgCertificate_sound_of_invClosedNoFork`, where block `0` genuinely emits
+`.convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)`
+(`diamondBlocks_convergedJump`). Only `HoldsFnSpec` of the structured plan and
+the per-block live obligations are supplied: no block step is precomputed. -/
 theorem diamond_cfgCertificate_sound (c : Bool) :
     Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
       (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) :=
@@ -1184,11 +1192,9 @@ theorem diamond_cfgCertificate_sound (c : Bool) :
     (evalPlan_act_continuing stdValAlg _)
     (evalPlan_act_continuing stdValAlg _)
     diamondPostPlan_continuing
-    (diamondParams c) (diamondSt0 c) (diamondStJoin c) (diamondSymOut c)
-    (· = diamondSymOut c)
+    (diamondParams c) (diamondSt0 c) (· = diamondSymOut c)
     (dbBindingsAt c) id (dbSymExtra c) []
-    (diamond_init c) (by cases c <;> rfl) rfl
-    (diamondBlocks_convergedJump c) (by cases c <;> rfl)
+    (diamond_init c) (by cases c <;> exact rfl)
     (fun bb st ms ⟨_, _, _, hExtra⟩ => by
       rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
       · subst hBb; subst hSt; subst hMs
@@ -1200,6 +1206,93 @@ theorem diamond_cfgCertificate_sound (c : Bool) :
         · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines false, rfl⟩
         · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines true, rfl⟩)
     ⟨rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- **`LocalBlockVC` route of `mir_cfgCertificate_sound` through a
+`.convergedJump`**: with both block steps of the symbolic diamond computed
+(`diamondBlocks_convergedJump`, and `bb3` returning `diamondSymOut c`), the exact
+2-point invariant `diamondSymBlockInv` satisfies `LocalBlockVC` with `PostRet :=
+(· = diamondSymOut c)` (the pending `handleFreeOutOpt` guard must, and does,
+accept the handle-free return unchanged) and never forks, so
+`mir_cfgCertificate_sound` transports `diamondCert` to live `MirWpConverges`
+along `dbSym_forwardSim`. -/
+theorem diamond_cfgCertificate_sound_localBlockVC (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) := by
+  have hStep3 :
+      stepBasicBlock stdValAlg diamondCert.blocks 3 (diamondStJoin c) =
+        .ret (diamondSymOut c) := by
+    cases c <;> rfl
+  have hWrap :
+      handleFreeOutOpt stdValAlg (diamondSymOut c) = some (diamondSymOut c) := by
+    cases c <;> rfl
+  exact mir_cfgCertificate_sound tagOfLoan diamondBody diamondCert
+    (diamondParams c) (diamondSt0 c) (· = diamondSymOut c)
+    (dbBindingsAt c) id (dbSymExtra c) [] (diamond_init c)
+    (by cases c <;> exact rfl)
+    (diamondSymBlockInv (diamondSt0 c) (diamondStJoin c)) (· = diamondSymOut c)
+    (diamondSymBlockInv_localBlockVC stdValAlg diamondCert.blocks _ _ 1
+      (handleFreeOutOpt stdValAlg) _ (diamondBlocks_convergedJump c) hStep3 hWrap)
+    (diamondSymBlockInv_noFork stdValAlg diamondCert.blocks _ _ 1
+      (handleFreeOutOpt stdValAlg) _ (diamondBlocks_convergedJump c) hStep3)
+    (Or.inl ⟨rfl, rfl⟩) (dbSym_forwardSim c)
+    ⟨subIdWrap_some, rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- Concrete-oracle parameters of `diamond` (`c : bool` passed as `.bool c`). -/
+def dbParams (c : Bool) : List (ParamInput StdVal) :=
+  [⟨.byVal, .bool c⟩, ⟨.byVal, .nat 3⟩, ⟨.byVal, .nat 4⟩]
+
+/-- **Test 2b-cert (concrete condition)**: the same `CfgCertificate.diamond`
+certifies the concrete diamond (`_0 = .bool c`, path `0 → 1/2 → 3`, no
+`.convergedJump`) through the same `mir_diamond_cfgCertificate_sound`, with the
+3-point live block relation of Test 2b (`dbExtra`). -/
+theorem db_cfgCertificate_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = dbOut c) o []) :=
+  mir_diamond_cfgCertificate_sound tagOfLoan diamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan diamondArmFalsePlan diamondPostPlan
+    (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) diamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    diamondPostPlan_continuing
+    (dbParams c) (dbSt0 c) (· = dbOut c)
+    (dbBindingsAt c) id (dbExtra c) []
+    rfl (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 2 (diamondMs0 false) =
+              .reached (dbMsArm false))
+            ⟨rfl, rfl, db_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 1 (diamondMs0 true) =
+              .reached (dbMsArm true))
+            ⟨rfl, rfl, db_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      · subst hSt; subst hMs
+        cases c
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm false) =
+              .reached (diamondMsJoin false))
+            ⟨rfl, rfl, db_rel_join false, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm true) =
+              .reached (diamondMsJoin true))
+            ⟨rfl, rfl, db_rel_join true, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩)
+    ⟨rfl, rfl, ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .bool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
 
 /-- Wrapper-level unit test for `handleFreeOutOpt stdValAlg` inside
 `runBlockCfg`: block `0` emits `.convergedJump 1 (handleFreeOutOpt stdValAlg) 3
@@ -1552,6 +1645,50 @@ theorem asymDiamond_sound (c : Bool) :
          fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
      Or.inl ⟨rfl, rfl, rfl⟩⟩
 
+/-- `runBlockCfgToBlock` reaches the asymmetric join `bb4` only after the
+`.convergedJump 2` step and both delay ticks (`wait = 2 → 1 → 0`), with the
+`handleFreeOutOpt` guard pending. -/
+theorem asymDiamond_runBlockCfgToBlock (c : Bool) :
+    runBlockCfgToBlock (stepBasicBlock stdValAlg asymDiamondBlocks) 4 8
+      ⟨some, 0, diamondSt0 c, 0⟩ =
+      .reached ⟨composeWrap some (handleFreeOutOpt stdValAlg), 4,
+        asymDiamondStJoin c, 0⟩ := by
+  cases c <;> rfl
+
+/-- **Segment form of Test 2b-asym (`mirCfg_segmentSim_of_emitsSubIdWraps`)**:
+the wrapper-agnostic segment simulation carries the PureLift segment
+`bb0 → bb4` (one `.convergedJump 2` and two stuttering delay ticks) to a live
+MIR segment that lands exactly on the MIR join state `asymDiamondMsJoin c`. -/
+theorem asymDiamond_segmentSim_to_join (c : Bool) :
+    Anneal.PureMirExec.StepsTo (Anneal.PureMirExec.mirStep asymDiamondBody)
+      (asymDiamondMs0 c) (· = asymDiamondMsJoin c) := by
+  have hSeg := stepsTo_of_segmentSim
+    (mirCfg_segmentSim_of_emitsSubIdWraps tagOfLoan asymDiamondBody
+      asymDiamondBlocks (asymDbBindingsAt c) id (asymDbSymExtra c)
+      (asymDiamond_emitsSubIdWraps c)
+      (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+        rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;>
+            exact stepsTo_of_runMirToBlock_reached (asymDiamond_runMirToBlock _)
+              ⟨rfl, rfl, asymDiamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;> exact trivial))
+    (stepsTo_of_runBlockCfgToBlock_reached (asymDiamond_runBlockCfgToBlock c))
+    (asymDiamondMs0 c)
+    ⟨subIdWrap_some, rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .symBool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+  refine hSeg.mono ?_
+  intro ms ⟨s, hs, _, _, _, _, hExtra⟩
+  subst hs
+  rcases hExtra with ⟨h, _, _⟩ | ⟨_, _, hMs⟩
+  · exact (Nat.succ_ne_zero 3 h).elim
+  · exact hMs
+
 /-! ### Test 2d: Multi-Step Strong-Descent (`rank s' < rank s`, `Δrank ≥ 2`) Loop Cutpoints over Live `V2026_06_01` MIR -/
 
 /-- Strong-descent ranking function on `loopBorrowBody` (`Test 2c`): an
@@ -1816,7 +1953,9 @@ def strideExtra (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
 /-- **Test 2d-2 (2-iteration stride-3 strong-descent cutpoint over live
 `V2026_06_01` MIR)**: `strideLoopRank` (`5 - i`) drops `5 → 2 → 0` (`Δrank = 3`
 then `Δrank = 2`), and `mir_whileLoop_cfgCertificate_of_cutpoint` certifies
-`strideLoopBody` end-to-end to `MirWpConverges` returning `27`. -/
+`strideLoopBody` end-to-end to `MirWpConverges` returning `27`; the live block
+obligations go through the wrapper-agnostic `mirCfg_forwardSim_of_emitsSubIdWraps`
+(the loop CFG emits no wrappers: `whileLoopBlocks_emitsSubIdWraps`). -/
 theorem strideLoop_strongDescent_cutpoint_sound :
     Anneal.MirFuelFree.MirWpConverges strideLoopBody strideMs0
       (LiftedMirPost tagOfLoan (fun out => out.ret = .nat 27)) := by
@@ -1851,29 +1990,43 @@ theorem strideLoop_strongDescent_cutpoint_sound :
     strideCutInv strideLoopRank strideCutpoint_step strideCutpoint_exit
     (fun _ => []) id strideExtra [] rfl (Or.inl rfl) (Nat.le_refl 5) ?_
     ⟨subIdWrap_some, rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
-  refine mirCfg_forwardSim_of_waitFree tagOfLoan strideLoopBody
+  refine mirCfg_forwardSim_of_emitsSubIdWraps tagOfLoan strideLoopBody
     (CfgCertificate.whileLoop stdValAlg 5 strideCond stridePlanBody
       (.use (.localSub 1 [])) stridePlanBody_wf stridePlanBody_continuing).blocks
-    (fun _ => []) id strideExtra [] ?_
-  intro w bb st ms ⟨hW, _, _, _, hEx⟩
+    (fun _ => []) id strideExtra []
+    (whileLoopBlocks_emitsSubIdWraps stdValAlg strideCond stridePlanBody
+      (.use (.localSub 1 [])) stridePlanBody_continuing _) ?_
+  intro bb st ms ⟨_, _, _, hEx⟩
   rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ |
       ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   · exact stepsTo_of_runMirToBlock_reached
       (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 1 strideMs0 = .reached strideMsBody0)
-      ⟨hW, rfl, rfl, hRelB0, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      ⟨rfl, rfl, hRelB0, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
   · exact stepsTo_of_runMirToBlock_reached
       (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 0 strideMsBody0 = .reached strideMs1)
-      ⟨hW, rfl, rfl, hRel1, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
+      ⟨rfl, rfl, hRel1, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
   · exact stepsTo_of_runMirToBlock_reached
       (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 1 strideMs1 = .reached strideMsBody1)
-      ⟨hW, rfl, rfl, hRelB1, Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)))⟩
+      ⟨rfl, rfl, hRelB1, Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)))⟩
   · exact stepsTo_of_runMirToBlock_reached
       (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 0 strideMsBody1 = .reached strideMs2)
-      ⟨hW, rfl, rfl, hRel2, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))))⟩
+      ⟨rfl, rfl, hRel2, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))))⟩
   · exact stepsTo_of_runMirToBlock_reached
       (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 2 strideMs2 = .reached strideMsExit)
-      ⟨hW, rfl, rfl, hRelEx, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))))⟩
+      ⟨rfl, rfl, hRelEx, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))))⟩
   · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+
+/-- The structured stride loop plan runs both iterations and falls through in
+`strideSt2`, and `evalPlan_whileLoop_continuing` (from
+`stridePlanBody_continuing`) shows that it can only ever fall through, which is
+the `.continuing`-only premise that loop-bodied certificate arms need. -/
+theorem strideLoop_plan_continuing :
+    evalPlan stdValAlg (.whileLoop 5 strideCond stridePlanBody) strideSt0 =
+      .ok (.continuing strideSt2) ∧
+    ∀ s f, evalPlan stdValAlg (.whileLoop 5 strideCond stridePlanBody) s = .ok f →
+      Exists fun s' => f = .continuing s' :=
+  ⟨rfl, evalPlan_whileLoop_continuing stdValAlg 5 strideCond stridePlanBody_wf
+    stridePlanBody_continuing⟩
 
 /-! ## Test 3: Hybrid `SpatialPin` Freeze → `zerocopy` Byte Write → Unpin -/
 
