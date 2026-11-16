@@ -1184,7 +1184,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "witness_symbol": "tailCall_leanMiri_root_stop_diverges",
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
-        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep, and 1-frame modular-root UnwindResume (.panic vs Miri's topmost-frame UB) is characterized in tailCall_leanMiri_unwind_verdicts.",
+        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep, and 1-frame modular-root UnwindResume (.panic vs Miri's topmost-frame UB) is characterized in tailCall_leanMiri_modular_root_unwind.",
         "summary": "At a whole-program root (ReturnContinuation.stop) Miri raises invalidProgram (rustc bug!(\"can't tailcall as root\")) and at a 1-frame stack UnwindResume is UB (\"unwinding past the topmost stack frame\"), whereas Anneal's modular root tail call steps into the callee and unwinds to .panic.",
     },
     {
@@ -1197,6 +1197,17 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Intentional: rustc's MIR type checker rules out ill-arity FnDef calls; both semantics report UB.",
         "summary": "An ill-arity direct tail call is UB at the call in Miri, while Anneal enters the callee and faults one step later when it reads the dead parameter (both UB, different steps).",
+    },
+    {
+        "id": "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
+        "authority": "LeanMiriSpec",
+        "category": "actionable_anneal_bug",
+        "severity": "P1_soundness",
+        "witness_symbol": "tailCall_witness_dangling_caller_local_divergence",
+        "file": UNTESTED_VARIANT_TEST_FILE,
+        "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "switch_to_pass_criterion": "Disable (or remove) every borrow entry targeting the replaced tail-caller frame in enterTailCalleeFrame, matching Miri's tail-call cleanup (CallMachine.cleanup deallocates the popped frame's memory-backed locals), so the witness's *p faults with .ub instead of returning 137.",
+        "summary": "enterTailCalleeFrame discards the tail-caller's locals but keeps borrow entries whose un-namespaced targetLocal now names the callee's local: a raw pointer to the tail-caller's x = 42 passed to the callee silently reads the callee's same-index local (137) and returns normally, whereas Miri's tail-call cleanup deallocates x and the dereference is a use-after-free (UB).",
     },
 ]
 

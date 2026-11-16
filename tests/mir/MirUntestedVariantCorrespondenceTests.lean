@@ -65,6 +65,11 @@ Semantic subtleties made explicit (never papered over):
   non-unwinding call-site/callee ABI Miri forces the inherited unwind action to
   `Unreachable`, whereas Trusted keeps the saved caller's `returnUnwind`: the stack shapes
   stay related iff that action already was `unreachable` (`tailCall_leanMiri_nounwind_callee`).
+  Miri's tail call also *cleans up* the popped tail-caller frame, deallocating its
+  memory-backed locals, whereas Trusted keeps every borrow entry into the replaced frame with
+  an un-namespaced `targetLocal`: a raw pointer to a tail-caller local passed to the callee
+  silently reads the callee's same-index local in Trusted but is a use-after-free (UB) in Miri
+  (`tailCall_witness_dangling_caller_local_divergence`, a Trusted soundness gap).
 * `opaqueCast` is value-transparent and type-switching in Trusted (`readProjectedValue`,
   `writeProjectedValue`, `projectionsOverlap` ignore it; `resolveProjectedTy` and the
   union-aware readers retype to the cast type), whereas both Miri projection paths throw
@@ -90,7 +95,7 @@ Coverage manifest (checked by `scripts/audit_mir_coverage_matrix.py --check` and
 final `run_cmd`):
 -/
 -- @mir-variant-coverage StatementKind.constEvalCounter trusted=constEvalCounter_trusted_step_universal,constEvalCounter_stepMirFn_universal,constEvalCounter_nop_statement_equiv minirust=constEvalCounter_minirust_ops_corresponds,constEvalCounter_minirustSpec_fail_closed leanmiri=constEvalCounter_leanMiri_lockstep,constEvalCounter_leanMiri_nop_equiv positive=constEvalCounter_witness_runs,constEvalCounter_leanMiri_witness negative=constEvalCounter_witness_ub_not_masked,constEvalCounter_witness_minirustSpec_rejects
--- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_checks_classification,tailCall_leanMiri_nounwind_callee,tailCall_leanMiri_unwind_verdicts,tailCall_abi_mismatch_corresponds,tailCall_leanMiri_calling_conv_ub_corresponds,tailCall_leanMiri_call_pushes positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi,tailCall_leanMiri_witness_checks,tailCall_leanMiri_witness_unwind
+-- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_checks_classification,tailCall_leanMiri_nounwind_callee,tailCall_leanMiri_unwind_verdicts,tailCall_leanMiri_modular_root_unwind,tailCall_leanMiri_cleanup_frees_caller_locals,tailCall_abi_mismatch_corresponds,tailCall_leanMiri_calling_conv_ub_corresponds,tailCall_leanMiri_call_pushes positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi,tailCall_leanMiri_witness_checks,tailCall_leanMiri_witness_unwind,tailCall_witness_dangling_caller_local_divergence
 -- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal,opaqueCast_trusted_placeTy_and_helpers_universal,opaqueCast_trusted_write_and_borrow_universal,opaqueCast_trusted_place_rw_with_decls,opaqueCast_trusted_stmt_placeMention_and_deinit_universal,opaqueCast_trusted_root_dispatch_divergence minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move,opaqueCast_witness_place_rw_with_decls negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject,opaqueCast_witness_type_switch,opaqueCast_witness_root_dispatch
 
 /-
@@ -120,6 +125,10 @@ Source anchors (each is re-read verbatim from the pinned vendored file):
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#evaluated.withCallerLocation, frame.returnPlace, ret, unwind⟩
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#let action ← h.cleanup choice false frame
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#require (action == .normal) "tailcall cleanup must return Normal"
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/CallMachine.lean#| .goto .. => true | .stop cleanup => cleanup
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/CallMachine.lean#if !cleanup then return .noCleanup
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/CallMachine.lean#for slot in frame.locals do
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/CallMachine.lean#if let .live (.indirect place) := slot.value then h.storage.deallocateStack place.ptr
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#require ((← h.frameIndex) == oldIndex) "evaluating this tail call pushed a new stack frame"
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#| none => throw (.undefinedBehavior "calling a function with fewer arguments than it requires")
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#throw (.undefinedBehavior "calling a function with more arguments than it expected")
@@ -426,6 +435,14 @@ def unwindResume {B P M : Type} (state : StepState B P UnwindAction M)
       match frame.returnContinuation with
       | .goto _ unwind => unwindToBlock unwind
       | .stop _ => .error (.invalidProgram "Stop continuation requires normal root return")
+
+/-- `CallMachine.cleanup` (`Interpreter/CallMachine.lean:75-86`), run by `initFnTailCall` on
+the popped tail-caller frame (`h.cleanup choice false frame`): a frame is cleaned up iff its
+continuation is `goto` (or `stop true`), and cleaning it up deallocates every live
+memory-backed local (`deallocateStack`) before the machine's `afterPop`. -/
+def cleanupDeallocatesLocals {U : Type} : ReturnContinuation U → Bool
+  | .goto .. => true
+  | .stop cleanup => cleanup
 
 /-- Whether a Miri error is a UB verdict. -/
 def StepError.isUB : StepError → Bool
@@ -1641,11 +1658,8 @@ modular-root topmost-frame divergence).**
     `cleanup bb` resumes the caller at `bb`, `continue_` keeps unwinding);
   - non-unwinding callee (`nounwindAs := some .unreachable`): Miri is UB for **every**
     inherited action, Trusted only for `unreachable` (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
-* At a modular root (`s0.memory.callStack = []`, `StackShapeRel (.goto ret u) [] m0`, where
-  `m0.frames.length = 1`): after the tail call (`m'.frames.length = 1`), Miri's
-  `returnFromCurrentFrame` faults with UB `"unwinding past the topmost stack frame"`, whereas
-  Trusted's modular-root model (`MODEL-LM-TAILCALL-MODULAR-ROOT`) halts cleanly with
-  `MirStepNode.retOutcome .panic` / `.halted .panic`. -/
+* The modular-root case (`callStack = []`, a one-frame LeanMiri stack) is
+  `tailCall_leanMiri_modular_root_unwind`. -/
 theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value)
     (rootCont : LeanMiri.ReturnContinuation UnwindAction)
@@ -1673,23 +1687,7 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
     execNode (resumeExternalTailCall
         (.panicked (enterTailCalleeFrame s.memory calleeBody argVals).memory)) =
       evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
-        ⟨.unwindResume, span⟩ cb ∧
-    (∀ (s0 : MachineState) (m0 : LeanMiri.StepState B P UnwindAction M)
-        (ret : Option Nat) (u : UnwindAction),
-      s0.memory.callStack = [] →
-      StackShapeRel (.goto ret u) s0.memory.callStack m0 →
-      (∃ m', LeanMiri.evalTailCallTerminator callee n n m0 = .ok m' ∧
-        LeanMiri.unwindResume m' =
-          .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
-      (∃ m', LeanMiri.evalTailCallTerminator callee n n m0 { nounwindAs := some .unreachable } =
-          .ok m' ∧
-        LeanMiri.unwindResume m' =
-          .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
-      evalTerminator ⟨f, (enterTailCalleeFrame s0.memory calleeBody argVals).memory⟩
-          ⟨.unwindResume, span⟩ cb = MirStepNode.retOutcome .panic ∧
-      resumeExternalTailCall
-          (.panicked (enterTailCalleeFrame s0.memory calleeBody argVals).memory) =
-        .halted .panic) := by
+        ⟨.unwindResume, span⟩ cb := by
   obtain ⟨init, last, hfr, hlast, hmap⟩ := shape_last hrel
   have hact : activeCont rootCont s.memory.callStack =
       .goto (if caller.isDiverging then none else some caller.returnTarget)
@@ -1715,7 +1713,7 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
         LeanMiri.unwindToBlock ur := by
     intro ur
     simp [LeanMiri.unwindResume, hlen]
-  refine ⟨⟨_, ?_, hres caller.returnUnwind⟩, ⟨_, ?_, hres .unreachable⟩, ?_, ?_, ?_⟩
+  refine ⟨⟨_, ?_, hres caller.returnUnwind⟩, ⟨_, ?_, hres .unreachable⟩, ?_, ?_⟩
   · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr,
       List.getLast?_concat, hlast, hpass, Nat.lt_irrefl, ite_false, List.dropLast_concat]
     simp
@@ -1729,35 +1727,87 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
   · simp [resumeExternalTailCall, evalTerminator, enterTailCalleeFrame, hcs]
     cases unwindFromCallStack rest (unwindCallerMem s.memory caller rest) <;>
       cases caller.returnUnwind <;> rfl
-  · intro s0 m0 ret u hnil0 hrel0
-    obtain ⟨init0, last0, hfr0, hlast0, hmap0⟩ := shape_last hrel0
-    have hact0 : activeCont (.goto ret u) s0.memory.callStack = .goto ret u := by
-      rw [hnil0]; rfl
-    rw [hact0] at hlast0
-    have hinit0 : init0 = [] := by
-      unfold StackShapeRel at hrel0
-      have hl0 := congrArg List.length hrel0
-      simp [hfr0, hnil0] at hl0
-      exact hl0
-    subst hinit0
-    have hres0 : ∀ (ur : UnwindAction),
-        LeanMiri.unwindResume
-            ({ m0 with frames :=
-                [{ body := callee, returnContinuation := .goto ret ur,
-                   returnPlace := last0.returnPlace, location := .mir ⟨0, 0⟩ }] } :
-              LeanMiri.StepState B P UnwindAction M) =
-          .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
-      intro ur
-      simp [LeanMiri.unwindResume]
-    refine ⟨⟨_, ?_, hres0 u⟩, ⟨_, ?_, hres0 .unreachable⟩,
-      by simp [evalTerminator, enterTailCalleeFrame, hnil0, unwindFromCallStack],
-      by simp [resumeExternalTailCall, enterTailCalleeFrame, hnil0, unwindFromCallStack]⟩
-    · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
-        List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
-      simp
-    · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
-        List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
-      simp
+
+/-- **Modular-root unwind (universal; documented modeling divergence).** At a modular root
+(`s.memory.callStack = []`, LeanMiri root continuation `goto ret u`, hence a one-frame
+LeanMiri stack) the tail call keeps one frame, so Miri's `returnFromCurrentFrame` rejects an
+unwind with UB "unwinding past the topmost stack frame" (for unwinding and non-unwinding
+callees alike), whereas Trusted's modular root lets the panic escape to its external caller
+(`.halted .panic`, both in-table and through `resumeExternalTailCall`) — the same
+modular-root modeling choice as `MODEL-LM-TAILCALL-MODULAR-ROOT`. -/
+theorem tailCall_leanMiri_modular_root_unwind {B P M : Type}
+    (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value)
+    (m : LeanMiri.StepState B P UnwindAction M) (callee : B) (n : Nat)
+    (ret : Option Nat) (u : UnwindAction) (hnil : s.memory.callStack = [])
+    (hrel : StackShapeRel (.goto ret u) s.memory.callStack m)
+    (f : StackFrame) (span : String) (cb : Option CapturedMir) :
+    (∃ m', LeanMiri.evalTailCallTerminator callee n n m = .ok m' ∧
+      LeanMiri.unwindResume m' =
+        .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    (∃ m', LeanMiri.evalTailCallTerminator callee n n m { nounwindAs := some .unreachable } =
+        .ok m' ∧
+      LeanMiri.unwindResume m' =
+        .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+    evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+        ⟨.unwindResume, span⟩ cb = MirStepNode.retOutcome .panic ∧
+    resumeExternalTailCall (.panicked (enterTailCalleeFrame s.memory calleeBody argVals).memory) =
+      .halted .panic := by
+  have hpass : LeanMiri.passArgsError (fun _ => true) n 0 n = none :=
+    passArgsError_all_ok _ n n 0 (by omega) (fun _ _ _ => rfl)
+  obtain ⟨init0, last0, hfr0, hlast0, hmap0⟩ := shape_last hrel
+  have hact0 : activeCont (.goto ret u) s.memory.callStack = .goto ret u := by
+    rw [hnil]; rfl
+  rw [hact0] at hlast0
+  have hinit0 : init0 = [] := by
+    unfold StackShapeRel at hrel
+    have hl0 := congrArg List.length hrel
+    simp [hfr0, hnil] at hl0
+    exact hl0
+  subst hinit0
+  have hres0 : ∀ (ur : UnwindAction),
+      LeanMiri.unwindResume
+          ({ m with frames :=
+              [{ body := callee, returnContinuation := .goto ret ur,
+                 returnPlace := last0.returnPlace, location := .mir ⟨0, 0⟩ }] } :
+            LeanMiri.StepState B P UnwindAction M) =
+        .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
+    intro ur
+    simp [LeanMiri.unwindResume]
+  refine ⟨⟨_, ?_, hres0 u⟩, ⟨_, ?_, hres0 .unreachable⟩,
+    by simp [evalTerminator, enterTailCalleeFrame, hnil, unwindFromCallStack],
+    by simp [resumeExternalTailCall, enterTailCalleeFrame, hnil, unwindFromCallStack]⟩
+  · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
+      List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
+    simp
+  · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
+      List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
+    simp
+
+/-- **Tail-caller cleanup (universal).** Whenever the transcribed tail call succeeds, the
+popped tail-caller frame has a `goto` continuation (a `stop` root is rejected), so Miri's
+`h.cleanup choice false frame` (`CallMachine.cleanup`) deallocates every live memory-backed
+local of the tail-caller before the callee runs. Trusted's `enterTailCalleeFrame` instead
+replaces the frame's locals by the callee's (`initLocals`) while keeping the whole borrow
+table, so every borrow entry into the replaced frame survives with its un-namespaced
+`targetLocal` — a later dereference reads the *callee's* same-index local instead of
+faulting (`tailCall_witness_dangling_caller_local_divergence`). -/
+theorem tailCall_leanMiri_cleanup_frees_caller_locals {B P U M : Type}
+    (m m' : LeanMiri.StepState B P U M) (callee : B) (k n : Nat) (ck : LeanMiri.CallChecks U)
+    (h : LeanMiri.evalTailCallTerminator callee k n m ck = .ok m')
+    (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value) :
+    (∃ f, m.frames.getLast? = some f ∧
+      LeanMiri.cleanupDeallocatesLocals f.returnContinuation = true) ∧
+    (enterTailCalleeFrame s.memory calleeBody argVals).memory.borrows = s.memory.borrows ∧
+    (enterTailCalleeFrame s.memory calleeBody argVals).frame.locals =
+      initLocals calleeBody argVals := by
+  refine ⟨?_, rfl, rfl⟩
+  unfold LeanMiri.evalTailCallTerminator LeanMiri.initFnTailCall at h
+  cases hl : m.frames.getLast? with
+  | none => simp [hl] at h
+  | some f =>
+    cases hc : f.returnContinuation with
+    | stop c => simp [hl, hc] at h
+    | goto ret u => exact ⟨f, rfl, by simp [LeanMiri.cleanupDeallocatesLocals, hc]⟩
 
 /-- **ABI mismatch correspondence (universal).** For an indirect tail call through a
 registered function pointer whose reified calling convention `sigAbi` differs from the
@@ -2053,6 +2103,25 @@ theorem tailCall_witness_direct_arity_divergence :
         .error (.undefinedBehavior "calling a function with fewer arguments than it requires") :=
   ⟨rfl, rfl, rfl⟩
 
+/-- `*mut u32`. -/
+def tyPtrMutU32 : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+
+def ptrDecl (name : String) : LocalDecl :=
+  { mutability := .mut, ty := tyPtrMutU32, debugName := some name }
+
+/-- `fn gread(p: *mut u32, y: u32) -> u32 { _0 = copy (*p); return }`. -/
+def gReadBody : CapturedMir :=
+  mkBody "w::gread" 2 [u32Decl "_0", ptrDecl "p", u32Decl "y"]
+    [blk [st (.assign (lc 0) (.use (.copy ⟨1, [.deref]⟩)))] .return_]
+
+/-- `fn fdangle() -> u32 { let mut x = 42; let p = &raw mut x; become gread(p, 137) }`
+(`_1 = p`, `_2 = x`): the tail-callee receives a raw pointer into the tail-caller's frame. -/
+def fDangleBody : CapturedMir :=
+  mkBody "w::fdangle" 0 [u32Decl "_0", ptrDecl "p", u32Decl "x"]
+    [blk [st (.storageLive 1), st (.storageLive 2), assignU32 2 42,
+          st (.assign (lc 1) (.rawPtr .mut (lc 2)))]
+      (.tailCall (fnItem "w::gread") [.copy (lc 1), cU32 137])]
+
 /-- Witness LeanMiri frames: `main` (whole-program root) below `f` (returning to `bb1`). -/
 def lmFrame (b : String) (c : LeanMiri.ReturnContinuation UnwindAction) :
     LeanMiri.Frame String Nat UnwindAction :=
@@ -2162,6 +2231,28 @@ theorem tailCall_leanMiri_witness_unwind :
     resumeExternalTailCall (.panicked (initMachineState fExtBody [.scalar ⟨7, 4⟩]).memory) =
       .halted .panic :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Documented divergence (dangling tail-caller local; Trusted soundness gap).** `fdangle`
+passes `p = &raw mut x` (a pointer into its own frame) to the tail-callee `gread`, which
+reads `*p`. Trusted's tail call (`enterTailCalleeFrame`) discards `fdangle`'s locals but keeps
+`p`'s borrow entry, whose un-namespaced `targetLocal = 2` now names `gread`'s own `_2 = y`:
+the run halts *normally* with `137` (neither `x = 42` nor UB). Miri's tail call cleans up the
+popped `goto` frame (`tailCall_leanMiri_cleanup_frees_caller_locals`), deallocating its
+memory-backed locals — `x` included — so `*p` is a use-after-free (UB). Tracked as
+`DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL`. -/
+theorem tailCall_witness_dangling_caller_local_divergence :
+    depth? (execN fDangleBody 5
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) = some 0 ∧
+      haltedVal? (execN fDangleBody 7
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
+        some (.scalar ⟨137, 4⟩) ∧
+      LeanMiri.evalTailCallTerminator "w::gread" 2 2
+          (⟨[lmFrame "w::fdangle" (.goto (some 3) .continue_)], ()⟩ :
+            LeanMiri.StepState String Nat UnwindAction Unit) =
+        .ok ⟨[lmFrame "w::gread" (.goto (some 3) .continue_)], ()⟩ ∧
+      LeanMiri.cleanupDeallocatesLocals
+        (lmFrame "w::fdangle" (.goto (some 3) .continue_)).returnContinuation = true :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end TailCall
 
@@ -3133,13 +3224,14 @@ run_cmd do
           `tailCall_leanMiri_arity_ub, `tailCall_leanMiri_ret_abi_and_cleanup_universal,
           `tailCall_leanMiri_arg_abi_universal, `tailCall_leanMiri_checks_classification,
           `tailCall_leanMiri_nounwind_callee, `tailCall_leanMiri_unwind_verdicts,
+          `tailCall_leanMiri_modular_root_unwind, `tailCall_leanMiri_cleanup_frees_caller_locals,
           `tailCall_abi_mismatch_corresponds,
           `tailCall_leanMiri_calling_conv_ub_corresponds, `tailCall_leanMiri_call_pushes]),
        ("positive", [`tailCall_leanMiri_witness, `tailCall_witness_nested_runs, `tailCall_witness_root_runs,
           `tailCall_witness_external, `tailCall_witness_indirect_and_zst]),
        ("negative", [`tailCall_witness_ub_cases, `tailCall_witness_direct_arity_divergence,
           `tailCall_leanMiri_witness_arg_abi, `tailCall_leanMiri_witness_checks,
-          `tailCall_leanMiri_witness_unwind])]),
+          `tailCall_leanMiri_witness_unwind, `tailCall_witness_dangling_caller_local_divergence])]),
     ("opaqueCast",
       [tr ++ `MirAst.ProjectionElem.opaqueCast],
       [lm ++ `projectOpaqueCast, lm ++ `placeProjectOpaqueCast],

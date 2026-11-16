@@ -363,7 +363,11 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         divs = suite.discover_correspondence_divergences(REPO_ROOT)
         actionable = {d["id"]: d for d in divs["actionable_anneal_bugs"]}
         modeling = {d["id"]: d for d in divs["intentional_modeling_choices"]}
-        for div_id in ("DIV-LM-TAILCALL-NOUNWIND-UNWIND", "DIV-TR-OPAQUECAST-ROOT-DISPATCH"):
+        for div_id in (
+            "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
+            "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
+            "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
+        ):
             self.assertIn(div_id, actionable)
             self.assertEqual(actionable[div_id]["file"], suite.UNTESTED_VARIANT_TEST_FILE)
         for div_id in ("MODEL-LM-TAILCALL-MODULAR-ROOT", "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"):

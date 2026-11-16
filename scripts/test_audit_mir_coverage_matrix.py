@@ -180,7 +180,7 @@ def retarget_fixture_divergences(dest: Path) -> None:
     """The synthetic correspondence file replaces the real one, so point the suite copy's
     Pillar 3 divergences witnessed by that file at the stand-in's manifest theorems."""
     real = audit.load_suite_module(REPO_ROOT).TRACKED_CORRESPONDENCE_DIVERGENCES
-    stand_ins = ("tail_leanmiri_root", "opaque_trusted_read", "tail_negative_root", "tail_negative_arity")
+    stand_ins = ("tail_leanmiri_root", "opaque_trusted_read", "tail_negative_root", "tail_negative_arity", "tail_positive")
     path = dest / SUITE
     text = path.read_text(encoding="utf-8")
     witnessed_here = [d for d in real if d["file"] == CORR]
@@ -515,6 +515,20 @@ class ManifestTests(AuditFixtureTestCase):
         self.assert_error(report, "c_variant_manifest", "duplicate divergence witness `tail_negative_root`")
         tracked = audit.run_audit(self.base)["checks"]["c_variant_manifest"]["details"]["tracked_divergences"]
         self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", tracked)
+
+    def test_public_theorem_outside_the_manifest_is_rejected(self) -> None:
+        # A public helper theorem escapes the run_cmd non-vacuity audit; a private one is fine.
+        self.edit(
+            CORR,
+            "def tailCallTerm",
+            "theorem tail_unaudited_helper : 1 = 1 := rfl\n"
+            "private theorem tail_private_helper : 2 = 2 := rfl\n\ndef tailCallTerm",
+        )
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(report, "c_variant_manifest", "public theorem `tail_unaudited_helper` is not a manifest theorem")
+        errors = report["checks"]["c_variant_manifest"]["errors"]
+        self.assertFalse(any("tail_private_helper" in e for e in errors), errors)
 
     def test_divergence_theorem_outside_the_manifest_is_rejected(self) -> None:
         # Neither in the manifest (so not non-vacuity-audited) nor trackable in Pillar 3.

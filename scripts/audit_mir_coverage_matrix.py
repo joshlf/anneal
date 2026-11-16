@@ -1182,6 +1182,20 @@ class _Audit:
                         unlisted.append(literal)
         for literal in unlisted:
             res.errors.append(f"{rel}: the run_cmd audit names theorem `{literal}`, which no @mir-variant-coverage line lists")
+        # Every public theorem of this file must be a manifest theorem, so none escapes the run_cmd
+        # non-vacuity audit (helper lemmas must be `private`).
+        for d in decls:
+            if d.kind not in ("theorem", "lemma") or d.start_line >= len(code_lines):
+                continue
+            head = code_lines[d.start_line]
+            m_head = _DECL_RE.match(head)
+            if m_head and re.search(r"(?<![\w'!?])private(?![\w'!?])", head[: m_head.start("kind")]):
+                continue
+            if not any(_decl_matches(d, nm) for nm in manifest_names):
+                res.errors.append(
+                    f"{rel}: public theorem `{d.written_name}` is not a manifest theorem "
+                    "(list it in a @mir-variant-coverage line or make it `private`)"
+                )
         # A divergence theorem/lemma/def outside the manifest would escape both the run_cmd
         # non-vacuity audit and the Pillar 3 registry cross-check below.
         for d in decls:
