@@ -159,6 +159,15 @@ class AuditScannerTest(unittest.TestCase):
         self.assertEqual([x["line"] for x in f], [2, 5, 6])
         self.assertEqual(f[2]["targets"], ["Foo", "Bar"])
 
+    def test_deriving_instance_parameterized_targets(self) -> None:
+        text = (
+            "deriving instance BEq, DecidableEq for Option α, (Prod β γ), List (Option δ)\n"
+            "inductive AfterTarget where | a\n"
+        )
+        f = self.audit(text)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["targets"], ["Option", "Prod", "List"])
+
     def test_guillemet_identifier(self) -> None:
         text = 'def «deriving BEq, DecidableEq» := 1\ndef «a -- b» := 2\ninductive A where | a\n  deriving DecidableEq\n'
         self.assertEqual(self.audit(text), [])
@@ -324,26 +333,47 @@ class RepoConsistencyTest(unittest.TestCase):
                 while j < len(toks) and toks[j][1] != "for":
                     j += 1
                 if j < len(toks) and toks[j][1] == "for":
-                    j += 1
-                    while j < len(toks):
-                        while j < len(toks) and toks[j] == ("punct", "(", toks[j][2]):
-                            j += 1
-                        if j >= len(toks) or toks[j][0] != "ident":
-                            break
-                        derived.append(toks[j][1])
-                        j += 1
-                        while j < len(toks) and toks[j] == ("punct", ")", toks[j][2]):
-                            j += 1
-                        if j < len(toks) and toks[j] == ("punct", ",", toks[j][2]):
-                            j += 1
-                            continue
-                        break
+                    targets, _ = bench.parse_deriving_instance_targets(toks, j + 1)
+                    derived.extend(targets)
         self.assertGreater(len(derived), 50)
         for target in derived:
             self.assertNotIn(target.rsplit(".", 1)[-1], all_trusted_enums, target)
         ident_set = {v for k, v, _ in toks if k == "ident"}
         for e in proto_enums:
             self.assertIn(f"instDecidableEq{e}Proto", ident_set, e)
+
+    def test_b3_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "collectMatchingTraitImplsWith_cons_hit_poly",
+            "collectMatchingTraitImplsWith_cons_hit_default",
+            "lookupCallee_trait_hit_poly_cert",
+            "lookupCallee_trait_default_hit_cert",
+            "protoSpecTbl_traitImpls",
+            "canary_trait_poly_and_default_cert_no_toList",
+            "envExtends_allows_incoherent_v08_upgrade_canary",
+            "CoherentEnvExtends",
+            "withBridgedV08Layouts_coherentExtends",
+            "coherentEnvExtends_of_v08_present",
+            "evalLayoutOf_dialect_invariant_of_coherentExtends",
+            "dynArgMismatchSite",
+            "canary_dyn_trait_arg_mismatch_fails_closed",
+            "DynCallRegistry",
+            "DynCallRegistry.findSite?",
+            "DynCallRegistry.wellFormed",
+            "dynRegistryStep",
+            "evalDynRegistryWithOpaqueCallees",
+            "dynRegistryStep_singleton",
+            "evalDynRegistryWithOpaqueCallees_singleton",
+            "dynRegistryStep_eq_trusted_of_no_dyn",
+            "dynRegistryStepPreservedB",
+            "dynRegistryStep_preserved_of_check",
+            "evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check",
+            "dynTwoSiteRegistry",
+            "canary_dyn_multi_site_registry",
+        ):
+            self.assertIn(name, ident_toks, f"missing B3 theorem: {name}")
 
     def test_a2_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")
@@ -451,16 +481,18 @@ class RealLeanBenchmarkTest(unittest.TestCase):
         self.assertGreater(self.hb(16, "linear_list"), 2.0 * self.hb(4, "linear_list"))
 
     def test_opaque_flat(self) -> None:
-        for v in ("opaque_o1", "opaque_pruned"):
+        for v in ("opaque_o1", "opaque_pruned", "opaque_trait"):
             self.assertLess(self.hb(16, v), 1.5 * self.hb(4, v), v)
             self.assertLess(self.result["scaling"][v]["heartbeats_loglog_slope"], 0.25, v)
 
     def test_opaque_beats_linear(self) -> None:
         self.assertLess(self.hb(16, "opaque_o1"), self.hb(16, "linear_list"))
         self.assertLess(self.hb(16, "opaque_pruned"), self.hb(16, "opaque_o1") * 1.05)
+        self.assertLess(self.hb(16, "opaque_trait"), self.hb(16, "linear_list"))
 
     def test_certificate_generation_is_linear_and_amortized(self) -> None:
         self.assertGreater(self.hb(16, "cert_gen_live"), 2.0 * self.hb(4, "cert_gen_live"))
+        self.assertGreater(self.hb(16, "cert_gen_trait"), self.hb(4, "cert_gen_trait"))
 
     def test_worktree_untouched_by_benchmark(self) -> None:
         self.assertEqual(self.before, self.after)

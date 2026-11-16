@@ -70,8 +70,8 @@ PROTOTYPE_NAMESPACE = "Anneal.DemandCompilerQueryAndOpaqueCalleePrototype"
 BENCH_PACKAGE = "AnnealOpaqueCalleeBench"
 BENCH_MODULE = f"{BENCH_PACKAGE}.DemandCompilerQueryAndOpaqueCalleePrototype"
 PROTOTYPE_REL = Path("theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean")
-VARIANTS = ("linear_list", "opaque_o1", "opaque_pruned")
-CERT_LABELS = ("cert_gen_live", "cert_gen_dead")
+VARIANTS = ("linear_list", "opaque_o1", "opaque_pruned", "opaque_trait")
+CERT_LABELS = ("cert_gen_live", "cert_gen_dead", "cert_gen_trait")
 # The naive baseline is allowed to exhaust Lean's kernel resources (recorded as
 # data); every opaque-table and certificate measurement must be a checked proof.
 BASELINE_LABELS = ("linear_list",)
@@ -249,8 +249,12 @@ def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
         raise ValueError("table size must be at least 2 (live + dead callee)")
     live, dead = m - 1, m - 2
     lines = [PROBE_HEADER]
+    lines.append(
+        f'def benchTraitEntry : TraitImplEntry := ⟨⟨"bench::Trait::method", [protoCircleTy]⟩, "{callee_path(live)}"⟩'
+    )
     for i in range(m):
-        lines.append(f'def benchCallee{i} : CapturedMir := protoLeaf "{callee_path(i)}" {i} 0 []')
+        traits = "[benchTraitEntry]" if i == live else "[]"
+        lines.append(f'def benchCallee{i} : CapturedMir := protoLeaf "{callee_path(i)}" {i} 0 {traits}')
     # The table as a cons chain of suffix definitions (`benchSuffix{j} = benchCallee{j} :: benchSuffix{j+1}`).
     lines.append(f"def benchSuffix{m} : List CapturedMir := []")
     for i in range(m - 1, -1, -1):
@@ -262,8 +266,13 @@ def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
     if part == "opaque":
         lines.append(certificate("cert_gen_live", "certLive", live))
         lines.append(certificate("cert_gen_dead", "certDead", dead))
+        lines.append(
+            '#bench_hb "cert_gen_trait" theorem certTraitImpls : '
+            "benchTbl.traitImpls = [benchTraitEntry] := by unfold benchTbl; rw [traitImpls_ofList]; decide +kernel"
+        )
     live_res = f'lookupCallee benchList protoLayouts "{callee_path(live)}" [] [] = some benchCallee{live}'
     dead_res = f'lookupCallee benchList protoLayouts "{callee_path(dead)}" [] [] = some benchCallee{dead}'
+    trait_res = f'lookupCallee benchList protoLayouts "bench::Trait::method" [protoCircleTy] [] = some benchCallee{live}'
     switch_term = "⟨.switchInt (protoBoolConst true) ⟨[(0, 2)], 1⟩, \"root:if\"⟩"
     taken = ("MirStepNode.emitStep (.event 1) { benchInit with frame := "
              "{ blockIdx := 1, stmtIdx := 0, locals := benchInit.frame.locals } }")
@@ -274,8 +283,17 @@ def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
     # Pruned obligation P(M): the pruned branch step and the live call resolution only.
     pruned = (f"stepTerminatorWith true benchTbl.lookup benchInit {switch_term} (some benchRoot) = "
               f"{taken} ∧ {live_res}")
+    pruned_trait = (f"stepTerminatorWith true benchTbl.lookup benchInit {switch_term} (some benchRoot) = "
+                    f"{taken} ∧ {trait_res}")
     opaque_live = "(opaqueCalleeTable_lookup_eq_trusted benchList _ _ _ _).symm.trans (lookupCallee_hit_mono certLive rfl)"
     opaque_dead = "(opaqueCalleeTable_lookup_eq_trusted benchList _ _ _ _).symm.trans (lookupCallee_hit_mono certDead rfl)"
+    opaque_trait = (
+        "(opaqueCalleeTable_lookup_eq_trusted benchList _ _ _ _).symm.trans "
+        "(lookupCallee_trait_hit_cert (winner := benchTraitEntry) (by decide) certTraitImpls "
+        f"(by rw [List.nil_append, collectMatchingTraitImplsWith_cons_hit_mono (c := benchCallee{live}) "
+        "(by decide) rfl (by decide) certLive (by decide) rfl]) "
+        "(by decide) certLive (by decide) rfl)"
+    )
     for r in range(reps):
         if part == "linear":
             lines.append(f'#bench_hb "linear_list" theorem benchLinear{r} : {unpruned} := ⟨rfl, rfl, rfl⟩')
@@ -284,6 +302,8 @@ def generate_probe(m: int, reps: int, part: str = "opaque") -> str:
                          f"⟨rfl, {opaque_live}, {opaque_dead}⟩")
             lines.append(f'#bench_hb "opaque_pruned" theorem benchPruned{r} : {pruned} := '
                          f"⟨stepTerminatorWith_litSwitch _ _ _ _ _ _ _, {opaque_live}⟩")
+            lines.append(f'#bench_hb "opaque_trait" theorem benchTrait{r} : {pruned_trait} := '
+                         f"⟨stepTerminatorWith_litSwitch _ _ _ _ _ _ _, {opaque_trait}⟩")
     return "\n".join(lines) + "\n"
 
 
@@ -361,10 +381,10 @@ def summarize(per_size: dict[int, dict[str, dict[str, float]]]) -> dict[str, Any
         lin = per_size[m]["linear_list"]
         speedups[str(m)] = {
             f"{v}_heartbeat_speedup": (lin["heartbeats"] / per_size[m][v]["heartbeats"]) if per_size[m][v]["heartbeats"] else float("inf")
-            for v in ("opaque_o1", "opaque_pruned")
+            for v in ("opaque_o1", "opaque_pruned", "opaque_trait")
         } | {
             f"{v}_wall_speedup": (lin["wall_ms"] / per_size[m][v]["wall_ms"]) if per_size[m][v]["wall_ms"] else float("inf")
-            for v in ("opaque_o1", "opaque_pruned")
+            for v in ("opaque_o1", "opaque_pruned", "opaque_trait")
         }
     return {"scaling": scaling, "speedups": speedups}
 
@@ -632,6 +652,60 @@ def _last_component(name: str) -> str:
     return name.rsplit(".", 1)[-1]
 
 
+_COMMAND_STOP_WORDS = {
+    "deriving", "inductive", "structure", "class", "def", "abbrev", "opaque",
+    "theorem", "lemma", "example", "instance", "axiom", "constant", "variable",
+    "universe", "namespace", "section", "end", "open", "import", "mutual",
+    "attribute", "local", "scoped", "private", "protected", "noncomputable",
+    "unsafe", "partial", "elab", "macro", "syntax", "notation", "infix",
+    "infixl", "infixr", "prefix", "postfix", "run_cmd",
+}
+
+
+def parse_deriving_instance_targets(toks: list[tuple[str, str, int]], j: int) -> tuple[list[str], int]:
+    """Parse comma-separated target types after `deriving instance ... for`,
+    handling parenthesized targets `(Foo α)` and parameterized targets `Foo α, Bar`."""
+    n = len(toks)
+    targets: list[str] = []
+    while j < n:
+        tp_depth = 0
+        while j < n and toks[j] == ("punct", "(", toks[j][2]):
+            tp_depth += 1
+            j += 1
+        if j >= n or toks[j][0] != "ident" or toks[j][1] in _COMMAND_STOP_WORDS:
+            break
+        targets.append(toks[j][1])
+        j += 1
+        # Consume optional type arguments and matching closing parens until `,` or next command.
+        while j < n:
+            tk_kind, tk_val, _ = toks[j]
+            if tp_depth == 0 and tk_kind == "punct" and tk_val == ",":
+                break
+            if tp_depth == 0 and (
+                (tk_kind == "ident" and tk_val in _COMMAND_STOP_WORDS)
+                or (tk_kind == "punct" and tk_val in ("@", "#"))
+            ):
+                break
+            if tk_kind == "punct" and tk_val == "(":
+                tp_depth += 1
+                j += 1
+            elif tk_kind == "punct" and tk_val == ")":
+                if tp_depth > 0:
+                    tp_depth -= 1
+                    j += 1
+                else:
+                    break
+            elif tk_kind == "ident":
+                j += 1
+            else:
+                break
+        if j < n and toks[j] == ("punct", ",", toks[j][2]):
+            j += 1
+            continue
+        break
+    return targets, j
+
+
 def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> list[dict[str, Any]]:
     """Every `deriving` clause / `deriving instance` command in `text` whose class
     list contains both `BEq` and `DecidableEq`."""
@@ -674,23 +748,7 @@ def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> li
                 break
             targets: list[str] = []
             if is_instance and j < n and toks[j][1] == "for":
-                j += 1
-                while j < n:
-                    tp_depth = 0
-                    while j < n and toks[j] == ("punct", "(", toks[j][2]):
-                        tp_depth += 1
-                        j += 1
-                    if j >= n or toks[j][0] != "ident":
-                        break
-                    targets.append(toks[j][1])
-                    j += 1
-                    while tp_depth > 0 and j < n and toks[j] == ("punct", ")", toks[j][2]):
-                        tp_depth -= 1
-                        j += 1
-                    if j < n and toks[j] == ("punct", ",", toks[j][2]):
-                        j += 1
-                        continue
-                    break
+                targets, j = parse_deriving_instance_targets(toks, j + 1)
             last = {_last_component(c) for c in classes}
             if "BEq" in last and "DecidableEq" in last:
                 findings.append({
@@ -906,12 +964,14 @@ def render_markdown(bench: dict[str, Any] | None, audit: dict[str, Any] | None) 
             out.append(f"| {v} | {sc['heartbeats_per_callee']:.1f} | {sc['heartbeats_loglog_slope']:.3f} | "
                        f"{g:.2f}x |" if g is not None else f"| {v} | {sc['heartbeats_per_callee']:.1f} | "
                        f"{sc['heartbeats_loglog_slope']:.3f} | n/a |")
-        out.append("\n| M | opaque_o1 Hb speedup | opaque_pruned Hb speedup | opaque_o1 wall speedup | opaque_pruned wall speedup |")
-        out.append("|---|---|---|---|---|")
+        out.append("\n| M | opaque_o1 Hb speedup | opaque_pruned Hb speedup | opaque_trait Hb speedup | opaque_o1 wall speedup | opaque_pruned wall speedup | opaque_trait wall speedup |")
+        out.append("|---|---|---|---|---|---|---|")
         for m in bench["sizes"]:
             sp = bench["speedups"][str(m)]
             out.append(f"| {m} | {sp['opaque_o1_heartbeat_speedup']:.1f}x | {sp['opaque_pruned_heartbeat_speedup']:.1f}x | "
-                       f"{sp['opaque_o1_wall_speedup']:.1f}x | {sp['opaque_pruned_wall_speedup']:.1f}x |")
+                       f"{sp['opaque_trait_heartbeat_speedup']:.1f}x | "
+                       f"{sp['opaque_o1_wall_speedup']:.1f}x | {sp['opaque_pruned_wall_speedup']:.1f}x | "
+                       f"{sp['opaque_trait_wall_speedup']:.1f}x |")
         co = bench.get("coimport")
         if co is not None:
             out.append(f"\nCo-import check (`{' + '.join(co['imports'])}`): "

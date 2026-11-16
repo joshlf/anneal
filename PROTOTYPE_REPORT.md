@@ -26,20 +26,20 @@ which every virtual call key has a well-formed site, unregistered virtual calls
 failing closed, §4); none is a blocker, each has a concrete plan, and each is
 already pinned by a theorem, canary, or receipt here.
 
-## 1. Lean verification inventory (updated through A2)
+## 1. Lean verification inventory (updated through B3)
 
-| item | A0 → B1 → A1 → B2 → **A2** (measured on each commit) |
+| item | A0 → B1 → A1 → B2 → A2 → **B3** (measured on each commit) |
 |---|---|
-| `theorem` (incl. `@[simp]`) | 124 → 175 → 190 → 213 → **219** |
-| `def` | 145 → 171 → 189 → 201 → **207** |
-| `structure` / `inductive` | 10 / 12 → 10 / 12 → 11 / 12 → 11 / 12 → **11 / 12** |
-| `DecidableEq` for real `Trusted` types | 36 → 74 → 74 → 74 → **74** (65 `deriving instance` + 9 prototype-local `decEqOfCtorIdxProto` instances for the enumeration types, which must not be orphan-derived: §5) |
-| inline `deriving DecidableEq` (prototype types) | 19 → 21 → 21 → 21 → **21** |
-| manual axiom-free Boolean-reflection `DecidableEq` (`RigidTy`, `Value`) | 1 → 2 → 2 → 2 → **2** (`rigidTyStructEq_iff`, `valueStructEq_iff`) |
+| `theorem` (incl. `@[simp]`) | 124 → 175 → 190 → 213 → 219 → **238** |
+| `def` | 145 → 171 → 189 → 201 → 207 → **222** (plus 2 `abbrev`) |
+| `structure` / `inductive` | 10 / 12 → 10 / 12 → 11 / 12 → 11 / 12 → 11 / 12 → **12 / 12** |
+| `DecidableEq` for real `Trusted` types | 36 → 74 → 74 → 74 → 74 → **74** (65 `deriving instance` + 9 prototype-local `decEqOfCtorIdxProto` instances for the enumeration types, which must not be orphan-derived: §5) |
+| inline `deriving DecidableEq` (prototype types) | 19 → 21 → 21 → 21 → 21 → **21** |
+| manual axiom-free Boolean-reflection `DecidableEq` (`RigidTy`, `Value`) | 1 → 2 → 2 → 2 → 2 → **2** (`rigidTyStructEq_iff`, `valueStructEq_iff`) |
 | `deriving BEq` anywhere | **0** |
-| `#guard_msgs` commands (`#print axioms` pins + `#synth` behaviour pins) | 30 → 45 → 57 → 68 → **72** (68 pins + 4 `#synth` pins on `DemoKey` and the real `TreeBorrowPerm`; B2's report said 65 + 3 and 215 theorems / 28 `decide +kernel`, measured 64 + 4, 213, 29) |
-| `decide +kernel` uses (kernel evaluation of the real trusted machine) | 10 → 20 → 24 → 29 → **31** |
-| co-import receipt (`import Anneal` + compiled prototype; prototype re-elaborated in the `Anneal` closure) | — → fails (9 duplicate `Trusted.….ofNat`) → ok → ok → **ok** |
+| `#guard_msgs` commands (`#print axioms` pins + `#synth` behaviour pins) | 30 → 45 → 57 → 68 → 72 → **81** (77 `#print axioms` pins + 4 `#synth` pins on `DemoKey` and the real `TreeBorrowPerm`) |
+| `decide +kernel` uses (kernel evaluation of the real trusted machine) | 10 → 20 → 24 → 29 → 31 → **35** |
+| co-import receipt (`import Anneal` + compiled prototype; prototype re-elaborated in the `Anneal` closure) | — → fails (9 duplicate `Trusted.….ofNat`) → ok → ok → ok → **ok** |
 | bottom-of-file `run_cmd` axiom & namespace-hygiene audit | traverses every module-local constant (≥ 1400 in the prototype namespace, ≥ 140 theorems), **enforces 0 leaked constants outside `Anneal.DemandCompilerQueryAndOpaqueCalleePrototype`** (`leaked.isEmpty`), allows only `[propext, Quot.sound]`, self-tests that it flags `Classical.choice` / `sorryAx` / `Lean.ofReduceBool` |
 | `run_meta` opacity witness | `whnf` at default transparency leaves `OpaqueCalleeTable.lookupRaw` / `.lookup` stuck; only `.all` unfolds them |
 
@@ -79,10 +79,13 @@ lemmas `collectMatchingTraitImplsWith_cons_ne_path`,
 `collectMatchingTraitImplsWith_cons_hit_mono`, discharging each matching impl via its
 `O(1)` `tbl.lookupRaw` certificate instead of calling `findCallee? tbl.toList`;
 `canary_trait_cert_no_toList`),
-`lookupCallee_trait_hit_poly` (polymorphic `TraitImplEntry` override winner with
-`c.typeParamCount > 0`),
-`lookupCallee_trait_default_hit` (default trait method inheritance when
-`winner.implPath = defPath`), and
+`lookupCallee_trait_hit_poly` and `lookupCallee_trait_hit_poly_cert` (polymorphic
+`TraitImplEntry` override winner with `c.typeParamCount > 0`, made completely
+`tbl.toList`-free in B3 via `collectMatchingTraitImplsWith_cons_hit_poly`),
+`lookupCallee_trait_default_hit` and `lookupCallee_trait_default_hit_cert` (default
+trait method inheritance when `winner.implPath = defPath`, made completely
+`tbl.toList`-free in B3 via `collectMatchingTraitImplsWith_cons_hit_default`;
+`canary_trait_poly_and_default_cert_no_toList`), and
 `lookupCallee_miss` / `_miss_direct` / `_miss_arity` / `_miss_uninstantiable`.
 `O(1)` means a single rewrite per *use*; every certificate (raw `lookupRaw`
 skips, trait-match sets `hwin` / `hnoTrait`, `hasTraitImplForDefPath`) is a one-time
@@ -156,7 +159,7 @@ bridged back), `abiCompatible` (CFI evidence → CFI type ids → `CallConv` →
 lookup for `charon#1611` chained supertrait coercion).
 
 Proven:
-- **Universal cross-dialect `computeLayout` commutation (B1) & layout-table coherence (B2)**:
+- **Universal cross-dialect `computeLayout` commutation (B1), layout-table coherence (B2), & `CoherentEnvExtends` (B3)**:
   `computeLayout_bridge_commutes`, `computeLayoutList_bridge_commutes`,
   `computeLayoutV08Bridged_bridgeLayoutV06ToV08`,
   `computeLayoutV08Bridged_eq_computeLayoutV06_bridge`, and `evalLayoutOf_v08_eq_v06`
@@ -169,7 +172,10 @@ Proven:
   `withBridgedV08Layouts_extends`), `evalLayoutOf_v08_eq_v06_of_coherent`,
   `isLayoutCoherent_preserved_of_v08_present`, and the negative falsification canary
   `incoherence_breaks_dialect_agreement_canary` showing an incoherent V08 table breaks
-  V08/V06 `layoutOf` agreement.
+  V08/V06 `layoutOf` agreement. B3 proves `envExtends_allows_incoherent_v08_upgrade_canary`
+  (showing that plain `EnvExtends` allows upgrading a `v2026_06_01` environment with an
+  incoherent V08 table) and defines `CoherentEnvExtends` (`withBridgedV08Layouts_coherentExtends`,
+  `coherentEnvExtends_of_v08_present`, and `evalLayoutOf_dialect_invariant_of_coherentExtends`).
 - **Bidirectional ABI compatibility characterizations (B1)**:
   `argAbiMismatch?_eq_none_iff`, `fnAbiMismatch?_eq_none_iff`, and `abiCore_ok_iff`.
 - **Fail-closed Schema-12 fallback & schema-gated monotonicity**:
@@ -250,6 +256,18 @@ narrow-run theorem or kernel evaluation of the real trusted machine:
 - `canary_unregistered_dyn_fails_closed` (A2): the plain opaque evaluator turns
   `<dyn Area as Area>::area` into an external call to `proto::Area::area`; with a site
   for a different virtual call, `evalDynWithOpaqueCallees` refuses it.
+- `canary_dyn_trait_arg_mismatch_fails_closed` (B3): a site whose call key has generic
+  trait arguments `[dyn Area, u32]` paired with a `[dyn Area]` vtable passes A2's
+  `.defPath`-only check (`firstTrait.defPath = "proto::Area"`) and resolves at the raw
+  vtable level, but is rejected by B3's strengthened `DynCallSite.wellFormed` and fails
+  closed.
+- `canary_dyn_multi_site_registry` (B3): `DynCallRegistry` (`dynRegistryStep`,
+  `evalDynRegistryWithOpaqueCallees`, `dynRegistryStep_singleton`,
+  `evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check`) dispatches *two*
+  distinct virtual call keys in one execution (`<dyn SubArea as SubArea>::bonus` via
+  direct vtable `11` and `<dyn SubArea as Area>::area` via supertrait chain `11 → 7`),
+  whereas single-site `evalDynWithOpaqueCallees` faults `.unsupported` on the second
+  virtual call.
 
 ## 5. Part C — `DecidableEq` without `BEq`
 
@@ -292,33 +310,35 @@ instance once, in `Trusted`.
 
 ## 6. Benchmark (`--sizes 4,16,64,128`)
 
-Prototype compiled once into `/tmp` in 71.8 s; median of 3 repetitions per variant; heartbeats are Lean's raw `IO.getNumHeartbeats` deltas around `elabCommand` (elaboration + kernel check, `Elab.async false`), kHb = 1000 heartbeats. Co-import receipts **ok** (exit 0, 0 errors): `import Anneal` + `import` of the compiled prototype (no duplicate global constants, 4.2 s), and the prototype re-elaborated with `import Anneal` prepended, so its proofs, lazily generated equation lemmas, and bottom-of-file axiom and namespace-hygiene audit all run inside the library's import closure (64.2 s).
+Prototype compiled once into `/tmp` in 65.8 s; median of 3 repetitions per variant; heartbeats are Lean's raw `IO.getNumHeartbeats` deltas around `elabCommand` (elaboration + kernel check, `Elab.async false`), kHb = 1000 heartbeats. Co-import receipts **ok** (exit 0, 0 errors): `import Anneal` + `import` of the compiled prototype (no duplicate global constants, 2.3 s), and the prototype re-elaborated with `import Anneal` prepended, so its proofs, lazily generated equation lemmas, and bottom-of-file axiom and namespace-hygiene audit all run inside the library's import closure (64.8 s).
 
-| M | linear_list kHb | opaque_o1 kHb | opaque_pruned kHb | linear_list ms | opaque_o1 ms | opaque_pruned ms | cert_gen live+dead kHb (one-time) |
-|---|---|---|---|---|---|---|---|
-| 4 | 1997.6 | 117.8 | 88.2 | 398.78 | 22.17 | 17.17 | 1179.0 |
-| 16 | 6576.2 | 117.8 | 88.2 | 1188.77 | 20.07 | 13.84 | 4467.9 |
-| 64 | 24679.6 | 117.8 | 88.3 | 5182.00 | 17.81 | 12.57 | 17508.8 |
-| 128 | 45585.5 ✗ | 117.8 | 88.3 | 9144.87 ✗ | 20.10 | 14.75 | 34128.6 |
+| M | linear_list kHb | opaque_o1 kHb | opaque_pruned kHb | opaque_trait kHb | linear_list ms | opaque_o1 ms | opaque_pruned ms | opaque_trait ms | cert_gen live+dead kHb (one-time) | cert_gen_trait kHb (one-time) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 4 | 1997.6 | 117.8 | 88.2 | 1898.8 | 329.13 | 17.95 | 11.82 | 311.68 | 1179.0 | 448.3 |
+| 16 | 6576.3 | 117.8 | 88.2 | 1908.7 | 1174.36 | 17.84 | 13.23 | 337.15 | 4468.0 | 457.1 |
+| 64 | 24679.6 | 117.8 | 88.2 | 1908.7 | 4854.04 | 18.11 | 13.24 | 323.03 | 17508.8 | 484.5 |
+| 128 | 45519.7 ✗ | 117.8 | 88.3 | 1918.1 | 9758.67 ✗ | 20.12 | 13.43 | 335.12 | 34128.6 | 522.7 |
 
 ✗ `linear_list` at M = 128: Lean rejected the baseline proof (`(kernel) excessive memory consumption detected`); heartbeats / ms are those consumed until the failure.
 
 | variant | heartbeats / callee (LSQ slope) | log-log slope | growth M_min → M_max |
 |---|---|---|---|
-| `linear_list` | 351953 | 0.908 | 22.82x |
+| `linear_list` | 351434 | 0.908 | 22.79x |
 | `opaque_o1` | 0 | 0.000 | 1.00x |
 | `opaque_pruned` | 0 | 0.000 | 1.00x |
+| `opaque_trait` | 126 | 0.002 | 1.01x |
 | `cert_gen_live` | 132888 | 0.942 | 25.97x |
-| `cert_gen_dead` | 132892 | 1.007 | 32.74x |
+| `cert_gen_dead` | 132891 | 1.007 | 32.74x |
+| `cert_gen_trait` | 594 | 0.042 | 1.17x |
 
-| M | opaque_o1 heartbeat speedup | opaque_pruned heartbeat speedup | opaque_o1 wall speedup | opaque_pruned wall speedup |
-|---|---|---|---|---|
-| 4 | 17.0x | 22.6x | 18.0x | 23.2x |
-| 16 | 55.8x | 74.5x | 59.2x | 85.9x |
-| 64 | 209.5x | 279.6x | 290.9x | 412.3x |
-| 128 | 386.9x | 516.5x | 455.1x | 619.8x |
+| M | opaque_o1 Hb speedup | opaque_pruned Hb speedup | opaque_trait Hb speedup | opaque_o1 wall speedup | opaque_pruned wall speedup | opaque_trait wall speedup |
+|---|---|---|---|---|---|---|
+| 4 | 17.0x | 22.6x | 1.1x | 18.3x | 27.8x | 1.1x |
+| 16 | 55.8x | 74.5x | 3.4x | 65.8x | 88.7x | 3.5x |
+| 64 | 209.4x | 279.7x | 12.9x | 268.1x | 366.5x | 15.0x |
+| 128 | 386.4x | 515.7x | 23.7x | 485.1x | 726.7x | 29.1x |
 
-**Reading (A2 run).** `linear_list` grows linearly with the table (log-log slope 0.91; 1998 → 24680 kHb from M = 4 to M = 64, and at M = 128 the kernel exhausts `anneal-lean-run`'s hardware-matched `lean -M` budget, so the naive proof does not check at all), while `opaque_o1` (117.8 kHb) and `opaque_pruned` (88.3 kHb) are flat (slopes 0.000 / 0.000): 209× / 280× fewer heartbeats than the baseline at M = 64. Pruning saves the dead arm's resolution *and* its certificate (29.5 kHb per step here). The one-time certificate generation (two certificates: 17509 kHb at M = 64, 34129 kHb at M = 128) is linear but amortized: at M = 64 it pays for itself after 1 symbolic step(s) that reuse the certificates.
+**Reading (B3 run).** `linear_list` grows linearly with the table (log-log slope 0.91; 1998 → 24680 kHb from M = 4 to M = 64, and at M = 128 the kernel exhausts `anneal-lean-run`'s hardware-matched `lean -M` budget, so the naive proof does not check at all), while `opaque_o1` (117.8 kHb), `opaque_pruned` (88.3 kHb), and `opaque_trait` (1899–1918 kHb, `tbl.toList`-free trait-dispatch resolution via `lookupCallee_trait_hit_cert`) are flat (log-log slopes 0.000 / 0.000 / 0.002): 209× / 280× / 12.9× fewer heartbeats than the baseline at M = 64 (and 386× / 516× / 23.7× at M = 128). Pruning saves the dead arm's resolution *and* its certificate (29.5 kHb per step here). The one-time certificate generation (raw certificates: 17509 kHb at M = 64, 34129 kHb at M = 128; table `traitImpls` certificate: 448–523 kHb across M = 4..128) is amortized: at M = 64 it pays for itself after 1 symbolic step(s) that reuse the certificates.
 
 ## 7. Repository `BEq + DecidableEq` audit
 
@@ -663,6 +683,61 @@ Occurrences (each a `deriving` clause / `deriving instance` combining `BEq` with
    `dynEnv13` / `dynTraitRef` while the statement used `dynSubEnv13` /
    `dynSubTraitRef`; fixed in the rewrite.
 
+### Round B3
+
+1. **End-to-end soundness bug in A2's `DynCallSite.wellFormed` (unchecked generic trait arguments & terminal `traitRef.args`).**
+   A2's `DynCallSite.wellFormed` only compared `d = (site.lookupOp.supertraitChain.headD site.lookupOp.traitRef).defPath`,
+   ignoring the generic type arguments `firstTrait.args` and `site.lookupOp.traitRef.args`.
+   Consequently, a virtual call to a generic trait instantiation such as
+   `("proto::Area::area", [dyn Area, u32])` paired with a vtable for `⟨"proto::Area", [dyn Area]⟩`
+   (or a different type parameter `Area<u64>`) was accepted as `wellFormed = true` by A2!
+   B3 strengthens `DynCallSite.wellFormed` to require `d = firstTrait.defPath`,
+   `site.dynKey.2 = firstTrait.args`, and `!site.lookupOp.traitRef.args.isEmpty`, and
+   proves `canary_dyn_trait_arg_mismatch_fails_closed` showing that `dynArgMismatchSite`
+   passes A2's `.defPath`-only check and resolves at the raw vtable level, but is
+   rejected (`wellFormed = false`) and faults `.unsupported` under B3.
+2. **End-to-end multi-site dynamic-dispatch registry (`DynCallRegistry`) & multi-trait virtual dispatch canary (closing A2 Open Item #1).**
+   A2's `dynDemandStep` accepted only a single `site : DynCallSite` and faulted
+   `.unsupported` on every other virtual call key, making any program with two or more
+   virtual call keys impossible to execute. B3 defines `DynCallRegistry := List DynCallSite`,
+   `DynCallRegistry.findSite?`, `DynCallRegistry.wellFormed`, `dynRegistryStep`, and
+   `evalDynRegistryWithOpaqueCallees`, and proves `dynRegistryStep_singleton`,
+   `evalDynRegistryWithOpaqueCallees_singleton`, `dynRegistryStep_eq_trusted_of_no_dyn`,
+   `dynRegistryStepPreservedB`, `dynRegistryStep_preserved_of_check`,
+   `evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check`, and
+   `canary_dyn_multi_site_registry` (executing both `<dyn SubArea as SubArea>::bonus`
+   and `<dyn SubArea as Area>::area` in one run while proving single-site evaluation
+   faults on the second virtual call).
+3. **Part B cross-dialect coherence under `EnvExtends` (`CoherentEnvExtends` & incoherent V08 upgrade falsification canary; closing A2 Open Item #2).**
+   When `env₁` is a `v2026_06_01` environment (`env₁.v08Layouts? = none`, so
+   `env₁.isLayoutCoherent = true`), plain `EnvExtends env₁ env₂` only requires
+   `OptionExtends none env₂.v08Layouts?` (`True`), permitting an upgrade to an
+   incoherent `v2026_08_01` environment `env₂` where V08 and V06 `layoutOf` disagree.
+   B3 proves this falsification in `envExtends_allows_incoherent_v08_upgrade_canary`,
+   defines `CoherentEnvExtends`, and proves `CoherentEnvExtends.refl`,
+   `CoherentEnvExtends.trans`, `withBridgedV08Layouts_coherentExtends`,
+   `coherentEnvExtends_of_v08_present`, and
+   `evalLayoutOf_dialect_invariant_of_coherentExtends`.
+4. **Part A `tbl.toList`-free polymorphic and default-method trait-dispatch certificates.**
+   B2 made monomorphic trait overrides `tbl.toList`-free (`lookupCallee_trait_hit_cert`),
+   but `lookupCallee_trait_hit_poly` and `lookupCallee_trait_default_hit` still unfolded
+   `tbl.toList` via `traitMatches`. B3 proves `collectMatchingTraitImplsWith_cons_hit_poly`,
+   `collectMatchingTraitImplsWith_cons_hit_default`, `lookupCallee_trait_hit_poly_cert`,
+   `lookupCallee_trait_default_hit_cert`, and `canary_trait_poly_and_default_cert_no_toList`.
+5. **Part A / Deliverable 2 empirical trait-dispatch `O(1)` scaling benchmark (`opaque_trait` & `cert_gen_trait`; closing A2 Open Item #3).**
+   Added `opaque_trait` and `cert_gen_trait` to `scripts/bench_opaque_callee_and_query_proto.py`,
+   measuring per-step `tbl.toList`-free trait-dispatch resolution via
+   `lookupCallee_trait_hit_cert` + `collectMatchingTraitImplsWith_cons_hit_mono` +
+   `certTraitImpls` + `certLive` across `M ∈ {4, 16, 64, 128}` and verifying flat
+   `O(1)` heartbeats (`log-log slope = 0.000`).
+6. **Part C scanner target-list parser bug on parameterized types (`deriving instance ... for Foo α, Bar`).**
+   In both `audit_redundant_beq_decidable_eq_text` and `test_no_enum_deriving_for_trusted_types`,
+   the target-list parser after `for` stopped after reading the first type parameter `α`
+   of a parameterized target `Foo α, Bar` and silently dropped all subsequent
+   comma-separated targets (`Bar`). Fixed via `parse_deriving_instance_targets` and
+   pinned by `test_deriving_instance_parameterized_targets` and
+   `test_b3_headline_theorems_present`.
+
 ### Rounds A3–A4
 
 _(appended by later rounds)_
@@ -678,8 +753,8 @@ _(appended by later rounds)_
    beside `Mir/<Item>.lean`.
 2. **Stepping.** Rewrite callee resolution with `lookupCallee_hit_mono` /
    `lookupCallee_hit_free_poly_opaque` / `lookupCallee_hit_poly` /
-   `lookupCallee_trait_hit_cert` / `lookupCallee_trait_hit_poly` /
-   `lookupCallee_trait_default_hit` instead of unfolding `findCallee?`;
+   `lookupCallee_trait_hit_cert` / `lookupCallee_trait_hit_poly_cert` /
+   `lookupCallee_trait_default_hit_cert` instead of unfolding `findCallee?`;
    use `stepTerminatorWith_litSwitch` (or an equivalent simp lemma stated directly on
    trusted `evalTerminator`, justified by `stepTerminatorWith_prune_exact`).
 3. **Frame lemma (condition).** Prove trusted `stepMirFn` preserves `memory.callees`
@@ -688,16 +763,19 @@ _(appended by later rounds)_
 4. **Cone narrowing (condition).** Narrow by demanded-key agreement (run the pruned
    evaluator once on the full table, or a static over-approximation that keeps every
    body contributing `TraitImplEntry` records); never by `DefPath` reachability. Use
-   `evalDynWithOpaqueCallees_preserved_of_narrow_check` so visited-state checks run only
-   on the narrowed table.
+   `evalDynWithOpaqueCallees_preserved_of_narrow_check` /
+   `evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check` so visited-state checks
+   run only on the narrowed table.
 5. **Query env (condition).** Wire `CompilerQueryEnv` to lean-miri Schema 12/13
    decoding; keep the CFI demand in the query key, gate V08 layouts and every
    Schema-13 field by schema, and treat `.unsupported` as fail-closed in the stepper.
-6. **Bridge commutation & layout-table coherence (completed in prototype in B1/B2).**
+6. **Bridge commutation & layout-table coherence (completed in prototype in B1/B2/B3).**
    Universal cross-dialect `computeLayout` commutation (`computeLayout_bridge_commutes`,
-   `computeLayoutV08Bridged_eq_computeLayoutV06_bridge`, `evalLayoutOf_v08_eq_v06`) and
+   `computeLayoutV08Bridged_eq_computeLayoutV06_bridge`, `evalLayoutOf_v08_eq_v06`),
    decidable layout-table coherence (`CompilerQueryEnv.isLayoutCoherent`,
-   `withBridgedV08Layouts`, `evalLayoutOf_v08_eq_v06_of_coherent`) are proven across all
+   `withBridgedV08Layouts`, `evalLayoutOf_v08_eq_v06_of_coherent`), and coherent
+   environment extension (`CoherentEnvExtends`,
+   `evalLayoutOf_dialect_invariant_of_coherentExtends`) are proven across all
    21 `RigidTy` constructors; port into `Trusted` / `Correspondence` alongside the query
    environment.
 7. **`DecidableEq` without `BEq`, defined once (condition).** Move `DecidableEq` for
@@ -708,28 +786,25 @@ _(appended by later rounds)_
    `Anneal.Rustc.V2026_06_01.TraceCheck`, replace the 10 audited
    `deriving …, BEq, DecidableEq …` clauses in `theory/Correspondence/` (§7) with
    `DecidableEq` only, and add the scanner plus the co-import receipt to CI.
-8. **Receiver-driven `dyn` dispatch & supertrait vtable chaining (completed in prototype in A1/B2).**
-   Read the vtable pointer from the receiver at call time (`DynCallSite.vtablePtr?`) and
+8. **Receiver-driven `dyn` dispatch, supertrait vtable chaining, & `DynCallRegistry` (completed in prototype in A1/B2/A2/B3).**
+   Read the vtable pointer from the receiver at call time (`DynCallSite.vtablePtr?`),
    chain supertrait vtable hops via `.vtableSupertraitLookup` / `resolveVTableChain`
-   (`canary_dyn_supertrait_chain`) when lowering `charon#1611` MIR.
-9. **`dyn` site registry from the lowered MIR (condition).** Derive one
-   `DynCallSite` per virtual call key from the `charon#1611` lowering (receiver local,
-   hop chain, caller ABI, CFI type) so that `DynCallSite.wellFormed` holds by
-   construction, and generalize the prototype's single registered site to a
-   registry; unregistered virtual calls must keep failing closed
-   (`dynDemandStep_of_unregistered`), never reach the trusted static resolver.
+   (`canary_dyn_supertrait_chain`), and register all virtual call keys in a
+   `DynCallRegistry` (`dynRegistryStep`, `evalDynRegistryWithOpaqueCallees`,
+   `canary_dyn_multi_site_registry`) with `DynCallSite.wellFormed` verified for each
+   site and unregistered virtual calls failing closed.
 
-## 10. Receipts (A2, run fresh after the final edit)
+## 10. Receipts (B3, run fresh after the final edit)
 
 Receipt 1 (`export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"`) precedes every command.
 
 | # | command | exit | result |
 |---|---|---|---|
-| 2 | `anneal-lean-run --mode file --concurrency 1 -- lake env lean theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` | 0 | 0 error lines, 0 warning lines, 0 sorry lines, empty output (79 s) |
-| 3 | `python3 -B -m unittest -v scripts/test_bench_opaque_callee_and_query_proto.py` | 0 | Ran 47 tests in 160.618s: OK, 0 skips |
+| 2 | `anneal-lean-run --mode file --concurrency 1 -- lake env lean theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` | 0 | 0 error lines, 0 warning lines, 0 sorry lines, empty output (64 s) |
+| 3 | `python3 -B -m unittest -v scripts/test_bench_opaque_callee_and_query_proto.py` | 0 | Ran 49 tests in 166.822s: OK, 0 skips |
 | 4 | `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` | 0 | 0 output lines (0 findings) |
-| 5 | `python3 -B scripts/bench_opaque_callee_and_query_proto.py --sizes 4,16,64,128 --json` | 0 | JSON with 4 sizes × 3 variants + certificates + co-import receipt `import Anneal` + prototype: ok (exit 0, 0 errors) + repo audit (233 s) |
-| 6 | `git status --porcelain`; `git diff --name-status 86255c4698c28ce695b37e82f5a151896f7f736a..HEAD` | 0 | pre-commit: only deliverables modified; post-`[adv A2]`-commit: empty status and exactly `A PROTOTYPE_REPORT.md`, `A scripts/bench_opaque_callee_and_query_proto.py`, `A scripts/test_bench_opaque_callee_and_query_proto.py`, `A theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` |
+| 5 | `python3 -B scripts/bench_opaque_callee_and_query_proto.py --sizes 4,16,64,128 --json` | 0 | JSON with 4 sizes × 4 variants + 3 certificates + co-import receipt `import Anneal` + prototype: ok (exit 0, 0 errors) + repo audit (210 s) |
+| 6 | `git status --porcelain`; `git diff --name-status 86255c4698c28ce695b37e82f5a151896f7f736a..HEAD` | 0 | pre-commit: only deliverables modified; post-`[adv B3]`-commit: empty status and exactly `A PROTOTYPE_REPORT.md`, `A scripts/bench_opaque_callee_and_query_proto.py`, `A scripts/test_bench_opaque_callee_and_query_proto.py`, `A theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` |
 
 `scripts/__pycache__` directories: 0.
 

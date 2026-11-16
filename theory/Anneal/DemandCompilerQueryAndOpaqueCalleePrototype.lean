@@ -1100,9 +1100,9 @@ theorem collectMatchingTraitImplsWith_cons_ne_args
     {rest : List TraitImplEntry} {defPath : DefPath} {typeArgs : List RigidTy}
     {acc : List (TraitImplEntry × Option (List RigidTy))}
     (hpath : stringEq entry.traitRef.defPath defPath = true)
-    (hargs : match entry.traitRef.args with
+    (hargs : (match entry.traitRef.args with
       | [] => true
-      | _ :: _ => (matchRigidTyPrefix entry.traitRef.args typeArgs []).isNone) :
+      | _ :: _ => (matchRigidTyPrefix entry.traitRef.args typeArgs []).isNone) = true) :
     collectMatchingTraitImplsWith lookupRaw (entry :: rest) defPath typeArgs acc =
       collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs acc := by
   rw [collectMatchingTraitImplsWith]
@@ -1155,6 +1155,100 @@ theorem lookupCallee_trait_hit_cert {tbl : OpaqueCalleeTable} {callerLayouts : L
     (hmono : c.typeParamCount = 0) :
     tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra = some c := by
   apply lookupCallee_trait_hit hfirst ?_ himpl hoverride hmono
+  rw [traitMatches_eq_opaque]
+  unfold traitMatchesOpaque
+  rw [htraits, hcollect]
+  exact hwin
+
+/-- A matching polymorphic `TraitImplEntry` override rewrites its body lookup in `O(1)`
+via its `lookupRaw` certificate (`himpl : lookupRaw entry.implPath = some c`). -/
+theorem collectMatchingTraitImplsWith_cons_hit_poly
+    {lookupRaw : DefPath → Option CapturedMir} {entry : TraitImplEntry}
+    {rest : List TraitImplEntry} {defPath : DefPath} {typeArgs : List RigidTy}
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    {a : RigidTy} {as : List RigidTy} {subst : List (Nat × RigidTy)}
+    {methodTypeArgs implHeaderArgs : List RigidTy} {c : CapturedMir}
+    (hpath : stringEq entry.traitRef.defPath defPath = true)
+    (htr : entry.traitRef.args = a :: as)
+    (hmatch : matchRigidTyPrefix (a :: as) typeArgs [] = some (subst, methodTypeArgs))
+    (hex : extractImplTypeArgs subst subst.length = some implHeaderArgs)
+    (himpl : lookupRaw entry.implPath = some c)
+    (hov : stringEq entry.implPath defPath = false)
+    (harity : ((implHeaderArgs ++ methodTypeArgs).length == c.typeParamCount) = true) :
+    collectMatchingTraitImplsWith lookupRaw (entry :: rest) defPath typeArgs acc =
+      collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs
+        (upsertMatchingTraitImpl entry (some (implHeaderArgs ++ methodTypeArgs)) acc) := by
+  rw [collectMatchingTraitImplsWith]
+  simp only [hpath, ite_true, htr, hmatch, hex, himpl, hov, harity]
+
+/-- A matching default-method `TraitImplEntry` (`stringEq entry.implPath defPath = true`)
+rewrites its body lookup in `O(1)` via the default method's `lookupRaw` certificate. -/
+theorem collectMatchingTraitImplsWith_cons_hit_default
+    {lookupRaw : DefPath → Option CapturedMir} {entry : TraitImplEntry}
+    {rest : List TraitImplEntry} {defPath : DefPath} {typeArgs : List RigidTy}
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    {a : RigidTy} {as : List RigidTy} {subst : List (Nat × RigidTy)}
+    {methodTypeArgs implHeaderArgs : List RigidTy} {c : CapturedMir}
+    (hpath : stringEq entry.traitRef.defPath defPath = true)
+    (htr : entry.traitRef.args = a :: as)
+    (hmatch : matchRigidTyPrefix (a :: as) typeArgs [] = some (subst, methodTypeArgs))
+    (hex : extractImplTypeArgs subst subst.length = some implHeaderArgs)
+    (himpl : lookupRaw entry.implPath = some c)
+    (hdef : stringEq entry.implPath defPath = true)
+    (harity : (typeArgs.length == c.typeParamCount) = true) :
+    collectMatchingTraitImplsWith lookupRaw (entry :: rest) defPath typeArgs acc =
+      collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs
+        (upsertMatchingTraitImpl entry (some typeArgs) acc) := by
+  rw [collectMatchingTraitImplsWith]
+  simp only [hpath, ite_true, htr, hmatch, hex, himpl, hdef, harity]
+
+/-- **`O(1)` certificate (polymorphic `TraitImplEntry` override hit, `tbl.toList`-free)**:
+given a per-table `tbl.traitImpls = impls` certificate and `winner`'s `lookupRaw`
+certificate, resolves a polymorphic trait override without ever unfolding `tbl.toList`. -/
+theorem lookupCallee_trait_hit_poly_cert {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra impls : List TraitImplEntry} {winner : TraitImplEntry} {implArgs : List RigidTy}
+    {matches_ : List (TraitImplEntry × Option (List RigidTy))} {c : CapturedMir}
+    {argLayouts : List TypeLayout}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (htraits : tbl.traitImpls = impls)
+    (hcollect : collectMatchingTraitImplsWith tbl.lookupRaw (extra ++ impls)
+      defPath (firstArg :: restArgs) [] = matches_)
+    (hwin : filterMostSpecificTraitImpls matches_ matches_ = [(winner, some implArgs)])
+    (himpl : tbl.lookupRaw winner.implPath = some c)
+    (hoverride : winner.implPath ≠ defPath)
+    (hpoly : (c.typeParamCount == 0 && implArgs.isEmpty) = false)
+    (harity : implArgs.length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts implArgs = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate (implArgs.zip argLayouts)) := by
+  apply lookupCallee_trait_hit_poly hfirst ?_ himpl hoverride hpoly harity hlay
+  rw [traitMatches_eq_opaque]
+  unfold traitMatchesOpaque
+  rw [htraits, hcollect]
+  exact hwin
+
+/-- **`O(1)` certificate (default trait method inheritance hit, `tbl.toList`-free)**:
+given a per-table `tbl.traitImpls = impls` certificate and the default method's
+`lookupRaw` certificate, resolves default trait method inheritance without ever
+unfolding `tbl.toList`. -/
+theorem lookupCallee_trait_default_hit_cert {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra impls : List TraitImplEntry} {winner : TraitImplEntry} {implArgs : List RigidTy}
+    {matches_ : List (TraitImplEntry × Option (List RigidTy))} {c : CapturedMir}
+    {argLayouts : List TypeLayout}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (htraits : tbl.traitImpls = impls)
+    (hcollect : collectMatchingTraitImplsWith tbl.lookupRaw (extra ++ impls)
+      defPath (firstArg :: restArgs) [] = matches_)
+    (hwin : filterMostSpecificTraitImpls matches_ matches_ = [(winner, some implArgs)])
+    (hdefault : winner.implPath = defPath)
+    (hbody : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) := by
+  apply lookupCallee_trait_default_hit (implArgs := implArgs) hfirst ?_ hdefault hbody harity hlay
   rw [traitMatches_eq_opaque]
   unfold traitMatchesOpaque
   rw [htraits, hcollect]
@@ -2369,6 +2463,68 @@ theorem canary_trait_cert_no_toList :
     rfl
   exact lookupCallee_trait_hit_cert (winner := protoAreaEntry) (by decide)
     multiFullTbl_traitImpls hcollect (by decide) himpl (by decide) rfl
+
+/-- One-time `traitImpls` certificate for `protoSpecTbl`. -/
+theorem protoSpecTbl_traitImpls : protoSpecTbl.traitImpls = [] := by
+  unfold protoSpecTbl
+  rw [traitImpls_ofList]
+  rfl
+
+/-- **`tbl.toList`-free polymorphic & default-method trait-dispatch certificate canary**:
+resolves both `<Wrapper<bool> as Area>::area` (polymorphic `TraitImplEntry` override)
+and `<Square as Area>::area` (default trait method inheritance) on `protoSpecTbl`
+using `lookupCallee_trait_hit_poly_cert`, `lookupCallee_trait_default_hit_cert`,
+`collectMatchingTraitImplsWith_cons_hit_poly`,
+`collectMatchingTraitImplsWith_cons_hit_default`, and `collectMatchingTraitImplsWith_cons_ne_args`
+without ever unfolding `protoSpecTbl.toList`. -/
+theorem canary_trait_poly_and_default_cert_no_toList :
+    protoSpecTbl.lookup protoLayouts "proto::Area::area"
+        [.adt "proto::Wrapper" [.bool]] protoSpecExtra =
+      some (protoWrapperGenericArea.instantiate [(.bool, protoBoolLayout)]) ∧
+    protoSpecTbl.lookup protoLayouts "proto::Area::area"
+        [.adt "proto::Square" []] protoSpecExtra =
+      some (protoDefaultArea.instantiate [(.adt "proto::Square" [], protoUnitLayout)]) := by
+  have hdefRaw : protoSpecTbl.lookupRaw "proto::Area::area" = some protoDefaultArea := by
+    unfold protoSpecTbl
+    exact lookupRaw_ofList_cons_hit rfl
+  have hgenRaw : protoSpecTbl.lookupRaw "proto::<impl<T> Area for Wrapper<T>>::area" =
+      some protoWrapperGenericArea := by
+    unfold protoSpecTbl
+    rw [lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hcollectPoly :
+      collectMatchingTraitImplsWith protoSpecTbl.lookupRaw (protoSpecExtra ++ [])
+        "proto::Area::area" [.adt "proto::Wrapper" [.bool]] [] =
+          [(protoWrapperGenericEntry, some [.bool])] := by
+    unfold protoSpecExtra
+    rw [List.append_nil,
+      collectMatchingTraitImplsWith_cons_hit_poly (c := protoWrapperGenericArea)
+        (subst := [(0, .bool)]) (methodTypeArgs := []) (implHeaderArgs := [.bool])
+        (by decide) rfl (by decide) (by decide) hgenRaw (by decide) (by decide),
+      collectMatchingTraitImplsWith_cons_ne_args (by decide) (by decide),
+      collectMatchingTraitImplsWith_cons_ne_args (by decide) (by decide)]
+    rfl
+  have hcollectDef :
+      collectMatchingTraitImplsWith protoSpecTbl.lookupRaw (protoSpecExtra ++ [])
+        "proto::Area::area" [.adt "proto::Square" []] [] =
+          [(protoSquareDefaultEntry, some [.adt "proto::Square" []])] := by
+    unfold protoSpecExtra
+    rw [List.append_nil,
+      collectMatchingTraitImplsWith_cons_ne_args (by decide) (by decide),
+      collectMatchingTraitImplsWith_cons_ne_args (by decide) (by decide),
+      collectMatchingTraitImplsWith_cons_hit_default (c := protoDefaultArea)
+        (subst := []) (methodTypeArgs := []) (implHeaderArgs := [])
+        (by decide) rfl (by decide) (by decide) hdefRaw (by decide) (by decide)]
+    rfl
+  refine ⟨?_, ?_⟩
+  · exact lookupCallee_trait_hit_poly_cert (winner := protoWrapperGenericEntry)
+      (implArgs := [.bool]) (argLayouts := [protoBoolLayout])
+      (by decide) protoSpecTbl_traitImpls hcollectPoly (by decide) hgenRaw
+      (by decide) rfl rfl (by decide)
+  · exact lookupCallee_trait_default_hit_cert (winner := protoSquareDefaultEntry)
+      (implArgs := [.adt "proto::Square" []]) (argLayouts := [protoUnitLayout])
+      (by decide) protoSpecTbl_traitImpls hcollectDef (by decide) rfl hdefRaw
+      rfl (by decide)
 
 /-! ## Part B: multi-version demand-time `CompilerQueryEnv` -/
 
@@ -3919,6 +4075,78 @@ theorem incoherence_breaks_dialect_agreement_canary :
         evalCompilerQuery (badEnv.withBridgedV08Layouts .v2026_08_01) (.layoutOf .v2026_08_01 refU32) := by
   decide
 
+/-- **Negative `EnvExtends` coherence canary**: when `env₁` is a `v2026_06_01`
+environment (`env₁.v08Layouts? = none`, so `env₁.isLayoutCoherent = true` vacuously),
+plain `EnvExtends env₁ env₂` only requires `OptionExtends none env₂.v08Layouts?`
+(`True`) and therefore allows upgrading `env₁` to an *incoherent* `v2026_08_01`
+environment `env₂` (`env₂.isLayoutCoherent = false`) whose V08 `layoutOf` answer
+disagrees with `env₁`'s V06 `layoutOf` answer. -/
+theorem envExtends_allows_incoherent_v08_upgrade_canary :
+    let env₁ : CompilerQueryEnv :=
+      { schema := .v2026_06_01
+        layoutsV06 := protoLayouts
+        layoutsV08 := none
+        fnAbis := [], cfiTags := none, syncRegions := none, vtables := none }
+    let env₂ : CompilerQueryEnv :=
+      { schema := .v2026_08_01
+        layoutsV06 := protoLayouts
+        layoutsV08 := some { bridgeLayoutV06ToV08 protoLayouts with pointerBits := 32 }
+        fnAbis := [], cfiTags := none, syncRegions := none, vtables := none }
+    let refU32 : Ty := ⟨.ref .not (.uint .u32), 0⟩
+    env₁.isLayoutCoherent = true ∧
+      EnvExtends env₁ env₂ ∧
+      env₂.isLayoutCoherent = false ∧
+      evalCompilerQuery env₂ (.layoutOf .v2026_08_01 refU32) ≠
+        evalCompilerQuery env₁ (.layoutOf .v2026_06_01 refU32) := by
+  refine ⟨by decide, ?_, by decide, by decide⟩
+  exact ⟨by decide, rfl, (fun _ h => nomatch h), rfl, (fun _ h => nomatch h),
+    (fun _ h => nomatch h), (fun _ h => nomatch h)⟩
+
+/-- **Layout-coherent environment extension**: strengthens `EnvExtends env₁ env₂`
+with cross-dialect layout coherence of `env₂` (`env₂.isLayoutCoherent = true`),
+closing the `v2026_06_01 → v2026_08_01` upgrade gap where `env₁.v08Layouts? = none`. -/
+structure CoherentEnvExtends (env₁ env₂ : CompilerQueryEnv) : Prop where
+  extends_ : EnvExtends env₁ env₂
+  coherent₂ : env₂.isLayoutCoherent = true
+
+theorem CoherentEnvExtends.refl (env : CompilerQueryEnv) (hcoh : env.isLayoutCoherent = true) :
+    CoherentEnvExtends env env :=
+  ⟨EnvExtends.refl env, hcoh⟩
+
+theorem CoherentEnvExtends.trans {env₁ env₂ env₃ : CompilerQueryEnv}
+    (h₁₂ : CoherentEnvExtends env₁ env₂) (h₂₃ : CoherentEnvExtends env₂ env₃) :
+    CoherentEnvExtends env₁ env₃ :=
+  ⟨EnvExtends.trans h₁₂.extends_ h₂₃.extends_, h₂₃.coherent₂⟩
+
+/-- Upgrading any layout-coherent environment via `withBridgedV08Layouts` is a
+`CoherentEnvExtends`, even when `env.schema = .v2026_06_01` (`env.v08Layouts? = none`). -/
+theorem withBridgedV08Layouts_coherentExtends (env : CompilerQueryEnv)
+    (newSchema : CompilerSchemaVersion) (hs : SchemaLe env.schema newSchema)
+    (hcoh : env.isLayoutCoherent = true) :
+    CoherentEnvExtends env (env.withBridgedV08Layouts newSchema) :=
+  ⟨withBridgedV08Layouts_extends env newSchema hs hcoh,
+    withBridgedV08Layouts_isLayoutCoherent env newSchema⟩
+
+/-- When `env₁` already has active V08 layouts (`env₁.v08Layouts? = some _`) and is
+layout-coherent, any `EnvExtends env₁ env₂` is automatically a `CoherentEnvExtends`. -/
+theorem coherentEnvExtends_of_v08_present {env₁ env₂ : CompilerQueryEnv}
+    (h : EnvExtends env₁ env₂) (hcoh : env₁.isLayoutCoherent = true)
+    {tblV08 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable}
+    (hv08 : env₁.v08Layouts? = some tblV08) :
+    CoherentEnvExtends env₁ env₂ :=
+  ⟨h, isLayoutCoherent_preserved_of_v08_present h hcoh hv08⟩
+
+/-- **Cross-dialect + schema-upgrade `layoutOf` invariance**: under
+`CoherentEnvExtends env₁ env₂`, any supported `.v2026_08_01` `layoutOf` query on
+`env₂` agrees with the `.v2026_06_01` `layoutOf` query on `env₁`. -/
+theorem evalLayoutOf_dialect_invariant_of_coherentExtends {env₁ env₂ : CompilerQueryEnv}
+    (h : CoherentEnvExtends env₁ env₂) (ty : Ty)
+    (hsup : ∀ m, evalCompilerQuery env₂ (.layoutOf .v2026_08_01 ty) ≠ .unsupported m) :
+    evalCompilerQuery env₂ (.layoutOf .v2026_08_01 ty) =
+      evalCompilerQuery env₁ (.layoutOf .v2026_06_01 ty) := by
+  rw [evalLayoutOf_v08_eq_v06_of_coherent env₂ h.coherent₂ ty hsup]
+  simp only [evalCompilerQuery, evalLayoutOf, h.extends_.layoutsV06_eq]
+
 /-- **Sync guard specification**: for any non-empty access (`0 < len`), the guard
 rejects `r` if and only if `r` is a non-empty region (`0 < r.size`) of the same
 allocation overlapping `[offset, offset + len)`. -/
@@ -4257,14 +4485,21 @@ def dynSelfTrait? (key : DefPath × List RigidTy) : Option DefPath :=
   | .dynamic d :: _ => some d
   | _ => none
 
-/-- A `dyn` call site is well formed when its call key is a virtual call whose
-receiver type `dyn D` names the trait of the *first* vtable the lookup reads (the
-receiver's own vtable): the head of `supertraitChain`, or `traitRef` when no
-supertrait hop is needed. Without this link a site could dispatch a `dyn A` call
-through a `dyn B` vtable chain (`canary_dyn_site_mismatch_fails_closed`). -/
+/-- A `dyn` call site is well formed when:
+1. its call key is a virtual call whose receiver type `dyn D` names the trait of
+   the *first* vtable the lookup reads (`firstTrait.defPath`),
+2. the call key's full generic argument list `site.dynKey.2` (`Self = dyn D` plus
+   any generic trait parameters) equals `firstTrait.args` (preventing a generic
+   trait call `Conv<u32>::into` from reading a `Conv<u64>` vtable;
+   `canary_dyn_trait_arg_mismatch_fails_closed`), and
+3. the terminal trait reference `site.lookupOp.traitRef.args` is non-empty. -/
 def DynCallSite.wellFormed (site : DynCallSite) : Bool :=
+  let firstTrait := site.lookupOp.supertraitChain.headD site.lookupOp.traitRef
   match dynSelfTrait? site.dynKey with
-  | some d => decide (d = (site.lookupOp.supertraitChain.headD site.lookupOp.traitRef).defPath)
+  | some d =>
+    decide (d = firstTrait.defPath) &&
+      decide (site.dynKey.2 = firstTrait.args) &&
+      !site.lookupOp.traitRef.args.isEmpty
   | none => false
 
 /-- Resolve a `dyn` call through the runtime vtable pointer `vtablePtr`:
@@ -5072,6 +5307,288 @@ theorem canary_unregistered_dyn_fails_closed :
       ⟨.faulted, [.event 1], none, none⟩ := by
   decide +kernel
 
+/-- Root calling `<dyn Area as Area<u32>>::area` (`typeArgs = [dyn Area, u32]`). -/
+def dynArgMismatchRoot : CapturedMir :=
+  { protoLitIfRoot true "proto::Area::area" [.dynamic "proto::Area", .uint .u32] "proto::g_dead" with
+    argCount := 1, localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩] }
+
+/-- Site whose `dynKey` has generic trait arguments `[dyn Area, u32]` while its
+vtable lookup targets `⟨"proto::Area", [dyn Area]⟩`: `firstTrait.defPath` matches
+`"proto::Area"` (so A2's `.defPath`-only `wellFormed` check returned `true`),
+but `dynKey.2 ≠ firstTrait.args`. -/
+def dynArgMismatchSite : DynCallSite :=
+  { dynSite with dynKey := ("proto::Area::area", [.dynamic "proto::Area", .uint .u32]) }
+
+/-- **Generic trait-argument mismatch canary**: `dynArgMismatchSite` has matching
+trait `DefPath` `"proto::Area"` and resolves at the raw vtable level, but its generic
+argument list `[dyn Area, u32]` does not match the vtable's `[dyn Area]`, so B3's
+strengthened `DynCallSite.wellFormed` rejects it (`false`) and execution fails closed
+(`.faulted` via `MirStepNode.unsupported`). -/
+theorem canary_dyn_trait_arg_mismatch_fails_closed :
+    decide ((dynSelfTrait? dynArgMismatchSite.dynKey) =
+      some (dynArgMismatchSite.lookupOp.supertraitChain.headD
+        dynArgMismatchSite.lookupOp.traitRef).defPath) = true ∧
+    dynArgMismatchSite.wellFormed = false ∧
+    resolveDynTarget dynEnv13 dynArgMismatchSite ⟨7, 0⟩ =
+      .ok ("proto::<impl Area for Circle>::area", []) ∧
+    (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynArgMismatchSite dynArgMismatchRoot 12
+        (initMachineState dynArgMismatchRoot [.ptr ⟨7, 0⟩ 0])).summary =
+      ⟨.faulted, [.event 1], none, none⟩ := by
+  decide +kernel
+
+/-! ### Multi-site dynamic-dispatch registry (`DynCallRegistry`) -/
+
+/-- A registry of virtual call sites (one `DynCallSite` per virtual call key in the
+lowered program). -/
+abbrev DynCallRegistry : Type := List DynCallSite
+
+/-- Look up the registered `DynCallSite` for call key `key` (`(defPath, typeArgs)`). -/
+def DynCallRegistry.findSite? (reg : DynCallRegistry) (key : DefPath × List RigidTy) :
+    Option DynCallSite :=
+  match reg with
+  | [] => none
+  | site :: rest =>
+    if decide (site.dynKey = key) then some site else findSite? rest key
+
+/-- A registry is well formed when every registered site is well formed. -/
+def DynCallRegistry.wellFormed (reg : DynCallRegistry) : Bool :=
+  reg.all DynCallSite.wellFormed
+
+/-- Multi-site demand-gated dynamic-dispatch step:
+- if the active step at `s` demands a call key registered in `reg`, dispatch via
+  that site's `dynDispatchStep`;
+- if it demands an unregistered virtual call key (`dynSelfTrait?.isSome`), fail
+  closed (`MirStepNode.unsupported`);
+- otherwise step directly via `stepBranchPruned tbl.lookup`. -/
+def dynRegistryStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (reg : DynCallRegistry)
+    (body : CapturedMir) (s : MachineState) : MirStepNode :=
+  match demandedKey? body s with
+  | some k =>
+    match reg.findSite? (k.defPath, k.typeArgs) with
+    | some site => dynDispatchStep env tbl site body s
+    | none =>
+      if (dynSelfTrait? (k.defPath, k.typeArgs)).isSome then
+        MirStepNode.unsupported
+      else
+        stepBranchPruned tbl.lookup body s
+  | none =>
+    stepBranchPruned tbl.lookup body s
+
+/-- Fuel-bounded multi-step evaluation with a `DynCallRegistry`. -/
+def evalDynRegistryWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) (body : CapturedMir) (fuel : Nat) (s : MachineState) : RunResult :=
+  runSteps (dynRegistryStep env tbl reg body) fuel s []
+
+/-- A singleton registry `[site]` steps identically to single-site `dynDemandStep`. -/
+theorem dynRegistryStep_singleton (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (site : DynCallSite) (body : CapturedMir) (s : MachineState) :
+    dynRegistryStep env tbl [site] body s = dynDemandStep env tbl site body s := by
+  unfold dynRegistryStep dynDemandStep demandsDynSite demandsUnregisteredDyn DynCallRegistry.findSite?
+  cases hk : demandedKey? body s with
+  | none => rfl
+  | some k =>
+    dsimp only
+    by_cases heq : (k.defPath, k.typeArgs) = site.dynKey
+    · have h1 : decide (site.dynKey = (k.defPath, k.typeArgs)) = true := decide_eq_true heq.symm
+      have h2 : decide ((k.defPath, k.typeArgs) = site.dynKey) = true := decide_eq_true heq
+      simp only [h1, h2, ite_true]
+    · have h1 : decide (site.dynKey = (k.defPath, k.typeArgs)) = false :=
+        decide_eq_false (fun h => heq h.symm)
+      have h2 : decide ((k.defPath, k.typeArgs) = site.dynKey) = false := decide_eq_false heq
+      simp only [h1, h2, Bool.false_eq_true, ite_false, Bool.not_false, Bool.and_true]
+      rfl
+
+/-- Multi-step evaluation with a singleton registry `[site]` equals `evalDynWithOpaqueCallees`. -/
+theorem evalDynRegistryWithOpaqueCallees_singleton (env : CompilerQueryEnv)
+    (tbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir)
+    (fuel : Nat) (s : MachineState) :
+    evalDynRegistryWithOpaqueCallees env tbl [site] body fuel s =
+      evalDynWithOpaqueCallees env tbl site body fuel s := by
+  unfold evalDynRegistryWithOpaqueCallees evalDynWithOpaqueCallees
+  exact runSteps_congr_visited fuel s [] (fun s' _ => dynRegistryStep_singleton env tbl site body s')
+
+/-- A step that demands no registered site and no unregistered virtual call is
+literally the trusted `stepMirFn` under the `memory.callees` frame condition. -/
+theorem dynRegistryStep_eq_trusted_of_no_dyn (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState)
+    (hnone : ∀ k, demandedKey? body s = some k →
+      reg.findSite? (k.defPath, k.typeArgs) = none ∧
+      (dynSelfTrait? (k.defPath, k.typeArgs)).isSome = false)
+    (hframe : tbl.toList = s.memory.callees) :
+    dynRegistryStep env tbl reg body s = stepMirFn body s := by
+  unfold dynRegistryStep
+  cases hk : demandedKey? body s with
+  | none => exact stepBranchPruned_eq_trusted tbl body s hframe
+  | some k =>
+    obtain ⟨hfind, hvirt⟩ := hnone k hk
+    simp only [hfind, hvirt, Bool.false_eq_true, ite_false]
+    exact stepBranchPruned_eq_trusted tbl body s hframe
+
+/-- Decidable per-state preservation certificate for `dynRegistryStep`. -/
+def dynRegistryStepPreservedB (env₁ : CompilerQueryEnv) (narrowTbl fullTbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState) : Bool :=
+  match demandedKey? body s with
+  | none => true
+  | some k =>
+    match reg.findSite? (k.defPath, k.typeArgs) with
+    | some site =>
+      match site.vtablePtr? s with
+      | none => true
+      | some vt =>
+        match resolveDynTarget env₁ site vt with
+        | .ok target =>
+          decide (k.apply (redirectResolver narrowTbl site.dynKey target) =
+            k.apply (redirectResolver fullTbl site.dynKey target))
+        | .err _ => true
+        | .unsupported _ => false
+    | none =>
+      if (dynSelfTrait? (k.defPath, k.typeArgs)).isSome then true
+      else decide (narrowTbl.lookupKey k = fullTbl.lookupKey k)
+
+/-- Single-step preservation of `dynRegistryStep` when `dynRegistryStepPreservedB` holds. -/
+theorem dynRegistryStep_preserved_of_check {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {reg : DynCallRegistry}
+    {body : CapturedMir} {s : MachineState} (h : EnvExtends env₁ env₂)
+    (hc : dynRegistryStepPreservedB env₁ narrowTbl fullTbl reg body s = true) :
+    dynRegistryStep env₂ narrowTbl reg body s = dynRegistryStep env₁ fullTbl reg body s := by
+  unfold dynRegistryStep
+  unfold dynRegistryStepPreservedB at hc
+  cases hk : demandedKey? body s with
+  | none =>
+    exact stepBranchPruned_congr body s (fun k hk' => by rw [hk] at hk'; nomatch hk')
+  | some k =>
+    rw [hk] at hc
+    dsimp only at hc ⊢
+    cases hf : reg.findSite? (k.defPath, k.typeArgs) with
+    | some site =>
+      rw [hf] at hc
+      dsimp only at hc
+      apply dynDispatchStep_preserved h
+      · intro vt hvt m hm
+        simp only [hvt, hm, Bool.false_eq_true] at hc
+      · intro vt target hvt hr k' hk'
+        rw [hk] at hk'
+        cases hk'
+        simp only [hvt, hr, decide_eq_true_eq] at hc
+        exact hc
+    | none =>
+      rw [hf] at hc
+      dsimp only at hc
+      cases hv : (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
+      | true => rfl
+      | false =>
+        simp only [Bool.false_eq_true, ite_false]
+        simp only [hv, Bool.false_eq_true, ite_false, decide_eq_true_eq] at hc
+        exact stepBranchPruned_congr body s (fun k' hk' => by
+          rw [hk] at hk'
+          cases hk'
+          exact hc)
+
+/-- Multi-step preservation of `evalDynRegistryWithOpaqueCallees` checked along the
+narrowed run (`runVisited` steps only `narrowTbl`). -/
+theorem evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check
+    {env₁ env₂ : CompilerQueryEnv} {narrowTbl fullTbl : OpaqueCalleeTable}
+    {reg : DynCallRegistry} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hcheck : (runVisited (dynRegistryStep env₂ narrowTbl reg body) fuel s).all
+      (dynRegistryStepPreservedB env₁ narrowTbl fullTbl reg body) = true) :
+    evalDynRegistryWithOpaqueCallees env₂ narrowTbl reg body fuel s =
+      evalDynRegistryWithOpaqueCallees env₁ fullTbl reg body fuel s := by
+  symm
+  exact runSteps_congr_visited fuel s []
+    (fun s' hs' => (dynRegistryStep_preserved_of_check h (List.all_eq_true.mp hcheck s' hs')).symm)
+
+/-- `<impl SubArea for Circle>::bonus() -> u32 { 10 }`. -/
+def protoCircleBonus : CapturedMir :=
+  protoLeaf "proto::<impl SubArea for Circle>::bonus" 10 0
+    [⟨⟨"proto::SubArea::bonus", [protoCircleTy]⟩, "proto::<impl SubArea for Circle>::bonus"⟩]
+
+/-- Schema-13 environment where vtable `11` (`dyn SubArea` for `Circle`) has its own
+method `<impl SubArea for Circle>::bonus` at slot `0` *and* links supertrait `Area`
+to vtable `7` (`dyn Area` for `Circle`). -/
+def dynMultiSiteEnv13 : CompilerQueryEnv :=
+  { dynSubEnv13 with
+    fnAbis := [
+      ("proto::<impl Area for Circle>::area", protoRetU32Abi),
+      ("proto::<impl Area for Square>::area", protoRetU32Abi),
+      ("proto::<impl SubArea for Circle>::bonus", protoRetU32Abi) ],
+    vtables := some [
+      ⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])], []⟩,
+      ⟨9, dynTraitRef, [("proto::<impl Area for Square>::area", [])], []⟩,
+      ⟨11, dynSubTraitRef, [("proto::<impl SubArea for Circle>::bonus", [])],
+        [(dynTraitRef, 7)]⟩ ] }
+
+/-- Call site for the subtrait's own virtual method `<dyn SubArea as SubArea>::bonus`
+(direct vtable `11` slot `0`, no supertrait hop). -/
+def dynSubBonusSite : DynCallSite :=
+  { vtableLocal := 1
+    lookupOp := ⟨dynSubTraitRef, 0, []⟩
+    callerAbi := protoRetU32Abi
+    cfiCallSite := none
+    dynKey := ("proto::SubArea::bonus", [.dynamic "proto::SubArea"]) }
+
+/-- Two-site registry covering both `<dyn SubArea as SubArea>::bonus` (direct) and
+`<dyn SubArea as Area>::area` (supertrait hop `SubArea → Area`). -/
+def dynTwoSiteRegistry : DynCallRegistry := [dynSubBonusSite, dynSubSite]
+
+/-- Program making *two distinct virtual calls* in one execution:
+`bb0` calls `<dyn SubArea as SubArea>::bonus` (jumping to `bb1`) and `bb1` calls
+`<dyn SubArea as Area>::area` (jumping to `bb2: return`). -/
+def dynMultiSiteRoot : CapturedMir :=
+  { defPath := "proto::dyn_multi_site_root", phase := .runtimePostCleanup, role := .subject,
+    argCount := 1,
+    localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩],
+    basicBlocks := [
+      protoCallBlock "proto::SubArea::bonus" [.dynamic "proto::SubArea"] 1,
+      protoCallBlock "proto::Area::area" [.dynamic "proto::SubArea"] 2,
+      ⟨[], ⟨.return_, "multi:ret"⟩, false⟩ ],
+    fnAbi := protoRetU32Abi, layouts := protoLayouts, allocations := [] }
+
+/-- Initial state of `dynMultiSiteRoot` with a `dyn SubArea` receiver (vtable `11`). -/
+def dynMultiSiteInit : MachineState := initMachineState dynMultiSiteRoot [.ptr ⟨11, 0⟩ 0]
+
+/-- Narrowed callee table for `dynMultiSiteRoot` (holding `protoCircleBonus` and `protoCircleArea`). -/
+def dynMultiSiteNarrowTbl : OpaqueCalleeTable := .ofList [protoCircleBonus, protoCircleArea]
+
+/-- Full callee table for `dynMultiSiteRoot` (adding unused callees `protoLiveF`, `protoGDead`, `protoSquareArea`). -/
+def dynMultiSiteFullTbl : OpaqueCalleeTable :=
+  .ofList [protoLiveF, protoGDead, protoCircleBonus, protoCircleArea, protoSquareArea]
+
+/-- **Multi-site dynamic-dispatch registry canary**:
+1. `dynTwoSiteRegistry` is well formed (`true`).
+2. `evalDynRegistryWithOpaqueCallees` executes *both* virtual call keys
+   (`<dyn SubArea as SubArea>::bonus` via direct vtable `11` and
+   `<dyn SubArea as Area>::area` via supertrait chain `11 → 7`) and halts returning `31`.
+3. Single-site `evalDynWithOpaqueCallees` with only `dynSubBonusSite` or only
+   `dynSubSite` fails closed (`.faulted`) at whichever virtual call key is unregistered.
+4. The multi-site run is preserved under `EnvExtends` and call-cone narrowing
+   (`dynMultiSiteNarrowTbl` vs. `dynMultiSiteFullTbl`) via
+   `evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check`. -/
+theorem canary_dyn_multi_site_registry :
+    dynTwoSiteRegistry.wellFormed = true ∧
+    (evalDynRegistryWithOpaqueCallees dynMultiSiteEnv13 dynMultiSiteNarrowTbl
+        dynTwoSiteRegistry dynMultiSiteRoot 16 dynMultiSiteInit).summary =
+      ⟨.halted, [], some 31, none⟩ ∧
+    (evalDynWithOpaqueCallees dynMultiSiteEnv13 dynMultiSiteFullTbl
+        dynSubBonusSite dynMultiSiteRoot 16 dynMultiSiteInit).summary =
+      ⟨.faulted, [], none, none⟩ ∧
+    (evalDynWithOpaqueCallees dynMultiSiteEnv13 dynMultiSiteFullTbl
+        dynSubSite dynMultiSiteRoot 16 dynMultiSiteInit).summary =
+      ⟨.faulted, [], none, none⟩ ∧
+    evalDynRegistryWithOpaqueCallees
+        { dynMultiSiteEnv13 with syncRegions := some [⟨3, 4, 8⟩] }
+        dynMultiSiteNarrowTbl dynTwoSiteRegistry dynMultiSiteRoot 16 dynMultiSiteInit =
+      evalDynRegistryWithOpaqueCallees
+        dynMultiSiteEnv13 dynMultiSiteFullTbl dynTwoSiteRegistry dynMultiSiteRoot 16
+        dynMultiSiteInit := by
+  have hExt : EnvExtends dynMultiSiteEnv13
+      { dynMultiSiteEnv13 with syncRegions := some [⟨3, 4, 8⟩] } :=
+    ⟨by decide, rfl, OptionExtends.refl _, rfl, OptionExtends.refl _, (fun _ h => nomatch h),
+      OptionExtends.refl _⟩
+  refine ⟨by decide, by decide +kernel, by decide +kernel, by decide +kernel,
+    evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check hExt 16 dynMultiSiteInit
+      (by decide +kernel)⟩
+
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
 namespace ShadowingDemo
@@ -5462,6 +5979,50 @@ end ShadowingDemo
 /-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_unregistered_dyn_fails_closed' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_unregistered_dyn_fails_closed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_trait_hit_poly_cert' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_trait_hit_poly_cert
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_trait_default_hit_cert' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_trait_default_hit_cert
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_trait_poly_and_default_cert_no_toList' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_trait_poly_and_default_cert_no_toList
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.envExtends_allows_incoherent_v08_upgrade_canary' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms envExtends_allows_incoherent_v08_upgrade_canary
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalLayoutOf_dialect_invariant_of_coherentExtends' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalLayoutOf_dialect_invariant_of_coherentExtends
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_trait_arg_mismatch_fails_closed' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_trait_arg_mismatch_fails_closed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynRegistryStep_singleton' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynRegistryStep_singleton
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_multi_site_registry' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_multi_site_registry
 
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 
