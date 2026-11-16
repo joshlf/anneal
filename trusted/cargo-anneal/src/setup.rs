@@ -54,6 +54,16 @@ pub(crate) fn install_at(
         .map_err(|e| format!("failed to install Anneal toolchain: {e}"))
 }
 
+/// Resolves an already installed bundle without downloading or executing it.
+pub fn installed() -> Option<PathBuf> {
+    // Verification discovery must not turn a missing installation into an
+    // implicit download or installation. None lets the caller use its
+    // explicit development tool or sibling executable instead.
+    CONFIG
+        .resolve_installation_dir(exocrate::Location::UserGlobal)
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

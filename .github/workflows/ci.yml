@@ -331,6 +331,12 @@ jobs:
           print(f"XDG_CACHE_HOME={os.environ['XDG_CACHE_HOME']}")
           print(f"ANNEAL_TEST_INSTALL_ROOT={root}")
           print(f"ANNEAL_TEST_RUST_SYSROOT={root / 'rust'}")
+          print(f"ANNEAL_LEAN={root / 'lean/bin/lean'}")
+          print(f"ANNEAL_CAPTURE={root / 'bin/anneal-rustc-capture'}")
+          print(f"ANNEAL_SYSROOT={root / 'rust'}")
+          print(f"ANNEAL_MVP_LEAN={root / 'lean/bin/lean'}")
+          print(f"ANNEAL_MVP_CAPTURE={root / 'bin/anneal-rustc-capture'}")
+          print(f"ANNEAL_MVP_SYSROOT={root / 'rust'}")
           print(f"RUSTC={root / 'rust/bin/rustc'}")
           print(f"RUSTDOC={root / 'rust/bin/rustdoc'}")
           print(f"LD_LIBRARY_PATH={root / 'rust/lib'}")
@@ -395,7 +401,21 @@ jobs:
         run: |
           set -euo pipefail
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/workspace.log") 2>&1
+          cargo run --locked -p cargo-anneal --example regenerate_bundle -- \
+            --root . --check
           cargo test --workspace --locked
+
+      - name: Verify production Starnix fixture and mutations
+        id: starnix
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/starnix-e2e.log") 2>&1
+          python3 ci/verify_starnix_e2e.py \
+            --cli "$ANNEAL_TEST_CARGO_ANNEAL" \
+            --capture "$ANNEAL_CAPTURE" \
+            --sysroot "$ANNEAL_SYSROOT" \
+            --lean "$ANNEAL_LEAN" \
+            --artifacts-dir "$ANNEAL_TEST_DIAGNOSTICS/starnix-evidence"
 
       - name: Check crate packaging
         id: package

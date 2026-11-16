@@ -277,12 +277,21 @@ To include these files in `trusted/`'s effective TCB without relocating them,
   (`trusted/lean/foundation-lock.json`): Pins the SHA-256 digests of the `lean`
   executable and all `Init.*` prelude source and `.olean` companion files,
   verified by both the Nix toolchain build (`flake.nix`) and `anneal-audit`.
+- **[`library-lock.json`](../trusted/audit/library-lock.json)**
+  (`trusted/audit/library-lock.json`): Pins the SHA-256 digests of additional
+  Lean standard-library modules (`Init.*` outside `foundation-lock.json`)
+  admitted exclusively during external target verification (`targetAudit`).
+  Repository `trusted/lean/` and `theory/` modules cannot import
+  `library-lock.json` modules; target proofs that import them have every
+  logically reached declaration replayed through the Lean kernel against the
+  `foundation-lock.json` base without adding logical assumptions.
 - **[`UPSTREAM_PIN.json`](../vendor/lean-miri/UPSTREAM_PIN.json)**
   (`vendor/lean-miri/UPSTREAM_PIN.json`):
   Pins the upstream commit and SHA-256 digest of every file in
   `vendor/lean-miri/` (together with any consumer-side patch records and the
   160-module `Miri.Interpreter.ExecutionMachine` slice), verified against
-  `LOCKED_UPSTREAM_PIN_SHA256` inside `trusted/audit/src/lib.rs`. The initial
+  `LOCKED_UPSTREAM_PIN_SHA256` inside `trusted/cargo-anneal/src/lib.rs`
+  (re-exported by `trusted/audit/src/lib.rs`). The initial
   vendor commit imports upstream `lean-miri` unmodified (`patched_files: []`)
   so any subsequent consumer-side patches (such as opt-in runtime move
   deinitialization via `deinitMovedPlace`) are reviewed as explicit diffs in

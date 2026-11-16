@@ -1899,3 +1899,25 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
         "unexpected error: {err_forbidden_anneal}"
     );
 }
+
+/// Repository auditing (`Checker::run`) restricts imports in `trusted/lean/` and
+/// `theory/` to `foundation-lock.json` even when `trusted/audit/library-lock.json`
+/// is present (`library-lock.json` applies exclusively to `targetAudit`).
+#[test]
+fn rejects_library_lock_imports_in_repository_audit() {
+    let checkout = repo_root();
+    let mut fix = TempFixture::new(Some(
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.Data.BitVec.Lemmas\n",
+    ));
+    fs::copy(
+        checkout.join("trusted/audit/library-lock.json"),
+        fix.root.join("trusted/audit/library-lock.json"),
+    )
+    .unwrap();
+    let err = fix.check_expected(Some(1), Some("preflight"), Some(false)).unwrap_err();
+    assert!(
+        err.message
+            .contains("foreign/missing import Init.Data.BitVec.Lemmas in Trusted"),
+        "unexpected error: {err}"
+    );
+}
