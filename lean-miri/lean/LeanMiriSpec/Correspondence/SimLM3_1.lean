@@ -68,9 +68,11 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    `step_deref_raw_subrange_write_into_bool_or_char_correspondence`,
    `step_raw_overwritten_deref_invalid_bool_or_char_simulation`,
    `step_raw_overwritten_direct_copy_invalid_bool_simulation`, with the direct
-   `char` load boundary `step_raw_overwritten_direct_copy_invalid_char_divergence`).
+   `char` loads `step_raw_overwritten_direct_copy_invalid_char_simulation` /
+   `step_raw_overwritten_direct_copy_valid_char_simulation`, resolving
+   `DIV-LM-RAW-OVERWRITE-CHAR-COPY`).
 3. **`BinOp.Offset`, Relational Comparisons & `UnOp.PtrMetadata`
-   (`step_binOp_offset_simulation`, `step_binOp_offset_disabled_divergence`,
+   (`step_binOp_offset_simulation`, `step_binOp_offset_disabled_simulation`,
    `step_binOp_offset_move_simulation`,
    `step_binOp_offset_zero_any_stride_lm3_1_simulation`,
    `step_binOp_offset_oob_dangling_miri_ub`,
@@ -107,12 +109,13 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    scalars, uninitialized/dead/use-after-move UB, same-allocation tracked
    pointers, `< 65536`-offset cross-local `Eq`/`Ne`, and `< 2 ^ 32` low-integer
    thresholds vs. tracked pointers including null `0` and `NonNull::dangling()`).
-   Remaining boundaries: in-bounds offsets of a `.disabled` parent borrow
-   (`step_binOp_offset_disabled_divergence`,
-   `step_binOp_offset_disabled_stride_divergence`,
-   `step_binOp_offset_disabled_neg_isize_divergence`: Anneal raises `.ub` while
-   `lean-miri` steps; a disabled `usize` count of at least `2 ^ 63` is UB in both,
-   `step_binOp_offset_usize_wrap_disabled_ub_simulation`), in-bounds unsigned
+   In-bounds offsets of a `.disabled` parent borrow on a live allocation step in
+   lockstep (`step_binOp_offset_disabled_simulation`,
+   `step_binOp_offset_disabled_stride_simulation`,
+   `step_binOp_offset_disabled_neg_isize_simulation`, `step_binOp_offset_d6_lockstep`,
+   resolving `DIV-LM-D6-OFFSET-DISABLED-TAG`), and a disabled `usize` count of at least
+   `2 ^ 63` is UB in both (`step_binOp_offset_usize_wrap_disabled_ub_simulation`).
+   Remaining boundaries: in-bounds unsigned
    wrap-around `usize` `Offset` counts of at least `2 ^ 63`
    (`step_binOp_offset_usize_wrap_divergence`: Anneal steps backward while
    `lean-miri` raises `"PointerArithOverflow"`), and the three genuine
@@ -31512,6 +31515,76 @@ theorem step_binOp_offset_d6_lockstep_of_not_disabled
     · rw [hrhs_u] at hrhs_i; cases hrhs_i
     · omega
 
+/-- **`step_binOp_offset_d6_lockstep` (`LM-3.1` D6 Permission-Agnostic Lockstep Corollary,
+`DIV-LM-D6-OFFSET-DISABLED-TAG`)**: the permission-agnostic generalization of
+`step_binOp_offset_d6_lockstep_of_not_disabled` (covering `.disabled` borrow entries), again an
+immediate corollary of `step_binOp_offset_d6_partition`. For a borrow entry `e` of ANY Tree
+Borrows permission whose allocation is still live while its target local is live (`hlive`: a
+`.disabled` entry has `e.allocDead = false` unless `e.localIdx` is `.dead`), whenever the RHS count
+avoids the unsigned `usize` wrap-around divergence (`rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63`),
+`stepMirFn` and `Miri.Interpreter.Step.step` are unconditionally in `StepRelLM3_1` lockstep (either
+both stepping or both raising UB): pointer arithmetic performs no memory access, so neither
+machine consults the Tree Borrows permission. -/
+theorem step_binOp_offset_d6_lockstep
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl tgtDecl : LocalDecl}
+    {ptrMut dstMut : Mutability} {pointeeKind : RigidTy} {rhsTy : Ty}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hprim_pt : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarCopyOrMoveOperand body topFrame rhsOp rhsTy)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {sc : MirAst.ScalarInt} {locals_rhs : List LocalSlot}
+    {e : AllocMapEntry}
+    (hptr_slot : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hrhs_eval : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
+      .ok (.scalar sc) locals_rhs)
+    (hdst_live : get? locals_rhs dstIdx ≠ some .dead)
+    (he_mem : e ∈ allocMap)
+    (he_tag : e.tag = ptrVal.tag)
+    (hno_uwrap : rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (hlive : e.perm = .disabled → get? s.frame.locals e.localIdx ≠ some .dead →
+      e.allocDead = false)
+    (hreach : sc.bits = 0 →
+      ptrVal.offsetBytes = 0 ∨
+      get? s.frame.locals e.localIdx = some .dead ∨
+      ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases step_binOp_offset_d6_partition hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr
+      hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag
+      hdecl_tgt
+      (fun hc0 => by
+        rcases hreach hc0 with hoff0 | hd | hle
+        · exact Or.inl hoff0
+        · exact Or.inr (Or.inl hd)
+        · exact Or.inr (Or.inr (Or.inr hle)))
+      hlive hptr8 with
+    ⟨hrel, _⟩ | ⟨hrel, _⟩ | ⟨hrhs_u, hge63, _⟩
+  · exact hrel
+  · exact hrel
+  · rcases hno_uwrap with hrhs_i | hlt63
+    · rw [hrhs_u] at hrhs_i; cases hrhs_i
+    · omega
+
 /-! ## 11. Composed `StateRelLM3_1` Statement Simulation (`step_stmt_lm3_1_state_simulation`) -/
 
 /-- Statement forms covered by `step_stmt_lm3_1_state_simulation` across
@@ -31560,6 +31633,10 @@ raw pointers and memory-backed locals):
   (`step_binOp_offset_d6_lockstep_of_not_disabled`) for any non-`.disabled` borrow entry
   when `rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63` (stepping in lockstep when in-bounds
   and failing with `.ub` in both machines when OOB, dead, or overflowing)
+* `binOpOffsetAnyPermLockstep`: the permission-agnostic generalization
+  (`step_binOp_offset_d6_lockstep`, `DIV-LM-D6-OFFSET-DISABLED-TAG`) admitting `.disabled`
+  borrow entries whose allocation is still live while the target local is live, under the
+  same `rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63` guard
 * `derefReadOobUb` / `derefWriteOobUb`: `_d = (copy|move) *_p` / `*_p = .use op`
   past the end of the live allocation (UB in both machines)
 * `derefReadMisalignedUb` / `derefWriteMisalignedUb`: in-bounds but misaligned
@@ -31599,14 +31676,13 @@ dedicated UB theorem it delegates to (`step_rawPtr_cmp_ub_lm3_1_simulation`,
 `WitLM3_1` show that those premises are satisfiable. The conditions exclude the
 states outside the composed fragment: use-after-`StorageDead` revival
 (`StateRelLM3_1Revived`, `step_deref_revived_local_ub_simulation`), raw byte
-overwrites of `bool`/`char` locals (`RawOverwrittenScalarState`), and the
-documented boundaries (in-bounds `Offset` of `.disabled` sources
-`step_binOp_offset_disabled_stride_divergence`,
-`step_binOp_offset_disabled_neg_isize_divergence`, and the Stage-1 instance
-`step_binOp_offset_disabled_divergence`; unsigned wrap-around `Offset` counts
-`step_binOp_offset_usize_wrap_divergence`; direct `char` loads
-`step_raw_overwritten_direct_copy_invalid_char_divergence`, provenance-tracked
-comparisons, and exposure casts). -/
+overwrites of `bool`/`char` locals (`RawOverwrittenScalarState`, whose direct `char` loads
+are certified separately by `step_raw_overwritten_direct_copy_invalid_char_simulation` /
+`step_raw_overwritten_direct_copy_valid_char_simulation`), and the documented boundaries
+(unsigned wrap-around `Offset` counts `step_binOp_offset_usize_wrap_divergence`, `.disabled`
+entries of a dead allocation whose target local was revived, provenance-tracked comparisons,
+and exposure casts). In-bounds `Offset` of `.disabled` sources on live allocations
+(`DIV-LM-D6-OFFSET-DISABLED-TAG`) is inside the fragment via `binOpOffsetAnyPermLockstep`. -/
 inductive WellTypedLM3_1StateStmt
     (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
     (allocMap : List AllocMapEntry) : Statement → Prop where
@@ -32376,6 +32452,39 @@ inductive WellTypedLM3_1StateStmt
           ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)) →
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩
+  | binOpOffsetAnyPermLockstep
+      (dstIdx ptrIdx : Local) (opKind : Place → MirAst.Operand) (rhsOp : MirAst.Operand)
+      (dstDecl ptrDecl tgtDecl : LocalDecl) (ptrMut dstMut : Mutability)
+      (pointeeKind : RigidTy) (rhsTy : Ty)
+      (ptrVal : ProvenancePtr) (sc : MirAst.ScalarInt) (locals_rhs : List LocalSlot)
+      (e : AllocMapEntry) (span : String) :
+      (opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move) →
+      get? body.localDecls dstIdx = some dstDecl →
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind →
+      dstDecl.ty.kind = .rawPtr dstMut pointeeKind →
+      IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 } →
+      (rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize) →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        WellTypedScalarCopyOrMoveOperand body topFrame rhsOp rhsTy) →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
+        s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
+        .ok (.scalar sc) locals_rhs →
+      get? locals_rhs dstIdx ≠ some .dead →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      (rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63) →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      (e.perm = .disabled → get? s.frame.locals e.localIdx ≠ some .dead →
+        e.allocDead = false) →
+      (sc.bits = 0 →
+        ptrVal.offsetBytes = 0 ∨
+        get? s.frame.locals e.localIdx = some .dead ∨
+        ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat) →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩
   | rawPtrDeref
       (dstIdx ptrIdx : Local) (dstDecl ptrDecl : LocalDecl)
       (rawMut ptrMut dstMut : Mutability) (pointeeKind dstPointee : RigidTy)
@@ -32872,6 +32981,13 @@ theorem step_stmt_lm3_1_state_simulation
     exact ⟨allocMap, step_binOp_offset_d6_lockstep_of_not_disabled hstate hphase hopKind
       hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
       hptr_slot hrhs_eval hdst_live he_mem he_tag hperm hno_uwrap hdecl_tgt hreach hlay_coh.1⟩
+  | binOpOffsetAnyPermLockstep dstIdx ptrIdx opKind rhsOp dstDecl ptrDecl tgtDecl
+      ptrMut dstMut pointeeKind rhsTy ptrVal sc locals_rhs e span
+      hopKind hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
+      hptr_slot hrhs_eval hdst_live he_mem he_tag hno_uwrap hdecl_tgt hlive hreach =>
+    exact ⟨allocMap, step_binOp_offset_d6_lockstep hstate hphase hopKind
+      hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
+      hptr_slot hrhs_eval hdst_live he_mem he_tag hno_uwrap hdecl_tgt hlive hreach hlay_coh.1⟩
   | rawPtrDeref dstIdx ptrIdx dstDecl ptrDecl rawMut ptrMut dstMut pointeeKind dstPointee
       span hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm =>
     exact ⟨allocMap, step_rawPtr_deref_lm3_1_simulation hstate hphase hbb hstmt

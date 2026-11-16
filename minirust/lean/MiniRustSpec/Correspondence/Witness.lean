@@ -9100,12 +9100,16 @@ theorem deadCallDest_minirust_ub_before_callee :
 
 /-- Counterexample 6 (`StorageLive(_2); _2.0 = negI8Callee(copy _1); _0 = copy (_2.0);
 StorageDead(_2); Return` where `_2 : (i8, bool)` is live but uninitialized):
-when `negI8Callee(5i8)` returns `-5i8`, Anneal's `writePlaceValue` faults with UB
-because projected field assignment into `.uninit` local `_2` is forbidden in
-Anneal's value-slot model (`uninitProjCallDest_anneal_ub`), whereas MiniRust's
-byte-level stack allocation writes `[-5i8]` to byte `0` of `_2` and returns
-`-5i8` (`251`) cleanly (`uninitProjCallDest_minirust_ret`)! Thus `ti.contains dst`
-(`tupleInitOk`) in `callDestOk` is strictly required for forward UB soundness. -/
+historically, when `negI8Callee(5i8)` returned `-5i8`, Anneal's `writePlaceValue`
+faulted with UB because projected field assignment into `.uninit` local `_2` was
+forbidden in Anneal's value-slot model, whereas MiniRust's byte-level stack
+allocation writes `[-5i8]` to byte `0` of `_2` and returns `-5i8` (`251`) cleanly
+(`uninitProjCallDest_minirust_ret`), so `ti.contains dst` (`tupleInitOk`) in
+`callDestOk` was required for forward UB soundness. Since Episode 1's
+`writeReturnDestination` (`uninitFieldWriteShell?`) hardening, Anneal also returns
+`251` without UB (`uninitProjCallDest_anneal_ret`, `uninitProjCallDest_agreement`),
+so `tupleInitOk` is now a conservative (not strictly required) side-condition for
+this caller shape. -/
 def uninitProjCallDestCaller : CapturedMir where
   defPath := "witness::uninit_proj_call_dest_caller"
   phase := .runtimePostCleanup
@@ -9150,7 +9154,7 @@ def uninitProjCallDestMInit : Mach :=
   multiMachineWithCtx ctxCalleeDivZero uninitProjCallDestProg 2 uninitProjCallDestCaller
     uninitProjCallDestFn uninitProjCallDestS0.frame.locals uninitProjCallDestFn.start
 
-theorem uninitProjCallDest_anneal_ub :
+theorem uninitProjCallDest_anneal_ret :
     (∃ mem, ReachesRet
       (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) []
       (.normal (.scalar ⟨251, 1⟩, mem))) ∧
@@ -9421,15 +9425,15 @@ fully initialized before `_2.0 = negI8Callee(copy _1)`): with `writeReturnDestin
 (`uninitFieldWriteShell?`), Anneal initializes `_2`'s field `0` shell and returns
 `-5i8` (`251`) without UB, agreeing with MiniRust, which returns `-5i8` at step `9`
 and then stops with a `specPanic` in the external caller frame, never raising UB. -/
-theorem uninitProjCallDest_ub_transfer_fails :
+theorem uninitProjCallDest_agreement :
     (∃ mem, ReachesRet
       (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) []
       (.normal (.scalar ⟨251, 1⟩, mem))) ∧
     MirNoUBTree
       (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) ∧
     ¬ ∃ (n : Nat) (msg : String), Interp.steps n uninitProjCallDestMInit = .error (.ub msg) :=
-  ⟨uninitProjCallDest_anneal_ub.1,
-    uninitProjCallDest_anneal_ub.2,
+  ⟨uninitProjCallDest_anneal_ret.1,
+    uninitProjCallDest_anneal_ret.2,
     never_ub_of_nonUb_stop (N := 10) (by decide +kernel) (by decide +kernel)⟩
 
 /-- Diverging callee `fn spin_u32_callee(x: u32) -> u32 { loop {} }`. -/

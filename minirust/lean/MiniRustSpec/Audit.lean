@@ -917,7 +917,7 @@ open MiniRustSpec.Correspondence.Witness in
   deadCallDest_minirust_ub_before_callee
   uninitProjCallDest_rejected
   uninitProjCallDest_translate
-  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_anneal_ret
   uninitProjCallDest_minirust_ret
   diamondCall_inFragment
   diamondCall_maxStackLocals
@@ -934,7 +934,7 @@ open MiniRustSpec.Correspondence.Witness in
   callDestArgAlias_noUB_transfer_fails
   callProjMoveReuse_noUB
   callProjMoveReuse_noUB_transfer_fails
-  uninitProjCallDest_ub_transfer_fails
+  uninitProjCallDest_agreement
   liveCallDestSpin_inFragment
   liveCallDestSpin_translate
   liveCallDestSpin_translateInProg
@@ -2209,7 +2209,7 @@ open MiniRustSpec.Correspondence.Witness in
   deadCallDest_minirust_ub_before_callee
   uninitProjCallDest_rejected
   uninitProjCallDest_translate
-  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_anneal_ret
   uninitProjCallDest_minirust_ret
   diamondCall_inFragment
   diamondCall_maxStackLocals
@@ -2226,7 +2226,7 @@ open MiniRustSpec.Correspondence.Witness in
   callDestArgAlias_noUB_transfer_fails
   callProjMoveReuse_noUB
   callProjMoveReuse_noUB_transfer_fails
-  uninitProjCallDest_ub_transfer_fails
+  uninitProjCallDest_agreement
   liveCallDestSpin_inFragment
   liveCallDestSpin_translate
   liveCallDestSpin_translateInProg

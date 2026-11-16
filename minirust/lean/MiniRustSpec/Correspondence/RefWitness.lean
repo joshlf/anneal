@@ -2906,7 +2906,7 @@ theorem treeBorrowsFrozenAndDisabledUb :
       some (.inr "Tree Borrows: local read of Disabled reference") :=
   ⟨by decide +kernel, by decide +kernel⟩
 
-/-- Ground-truth `TreeBorrowsMemory` counterpart to `twoPhaseDirectWriteTreeBorrowsGap`:
+/-- Ground-truth `TreeBorrowsMemory` counterpart to `twoPhaseDirectWriteTreeBorrows`:
 writing directly through the root allocation tag (`[]`) is a foreign write to an
 unprotected `Freeze` `&mut u32` child (`[0]`, `Reserved`), transitioning it to
 `Disabled`, so reading through the child afterwards raises

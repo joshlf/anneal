@@ -123,24 +123,69 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             },
         )
         self.assertEqual(divs["known_miri_diff_manifest_bugs"], [])
+        for d in divs["resolved_correspondence_divergences"]:
+            self.assertEqual(d["status"], "resolved")
+            self.assertFalse(d["live_in_source"])
+            self.assertTrue(d["resolution_live_in_source"], d["id"])
+
+        actionable_items = [
+            item
+            for item in suite.TRACKED_CORRESPONDENCE_DIVERGENCES
+            if item["category"] != "intentional_modeling_choice"
+        ]
+        self.assertEqual(len(actionable_items), 8)
+        for item in actionable_items:
+            self.assertTrue(item.get("resolution_symbol"), item["id"])
+            self.assertTrue(item["resolution_symbol"].endswith("_simulation"), item["id"])
+
+        def write_synthetic_checkout(
+            root: Path, *, live_ids: set[str] = frozenset(), missing_ids: set[str] = frozenset()
+        ) -> None:
+            for item in actionable_items:
+                if item["id"] in missing_ids:
+                    continue
+                path = root / item.get("resolution_file", item["file"])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"theorem {item['resolution_symbol']} : True := trivial\n")
+                    if item["id"] in live_ids:
+                        fh.write(f"theorem {item['witness_symbol']} : True := trivial\n")
 
         # Regression check: reintroducing a live `*_divergence` witness symbol in a
         # synthetic checkout must immediately flip `actionable_anneal_bugs_count` back > 0.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
-            rel_file = Path("lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean")
-            (tmp_root / rel_file.parent).mkdir(parents=True, exist_ok=True)
-            (tmp_root / rel_file).write_text(
-                "theorem step_raw_overwritten_direct_copy_invalid_char_divergence : True := trivial\n",
-                encoding="utf-8",
-            )
+            write_synthetic_checkout(tmp_root, live_ids={"DIV-LM-RAW-OVERWRITE-CHAR-COPY"})
             synth_divs = suite.discover_correspondence_divergences(tmp_root)
             self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 1)
             self.assertEqual(
-                [d["id"] for d in synth_divs["actionable_anneal_bugs"]],
-                ["DIV-LM-RAW-OVERWRITE-CHAR-COPY"],
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "open")],
             )
             self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 7)
+
+        # Fail-closed check: a witness that vanished WITHOUT its positive replacement
+        # theorem (bare rename / deletion) is not counted as resolved.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, missing_ids={"DIV-LM-D6-OFFSET-DISABLED-TAG"})
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 1)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 7)
+
+        # An empty checkout (all witness files missing) must not report 8 resolutions.
+        with tempfile.TemporaryDirectory() as tmp:
+            synth_divs = suite.discover_correspondence_divergences(Path(tmp))
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 8)
+            self.assertEqual(synth_divs["resolved_correspondence_divergences"], [])
+            self.assertEqual(
+                {d["status"] for d in synth_divs["actionable_anneal_bugs"]},
+                {"resolution_missing"},
+            )
 
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

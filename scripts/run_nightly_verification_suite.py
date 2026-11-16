@@ -230,6 +230,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("pointerWithExposedProvenance", "proved_corresponding"),
             ("pointerCoercion", "supported_and_tested"),
             ("subtype", "supported_and_tested"),
+            # Float casts: evidence is the kernel-checked IEEE-754 reference-model
+            # agreement in `theory/Anneal/Mir/IeeeFloatCast.lean` (ties-to-even,
+            # saturating float->int, NaN quietization, subnormal single rounding) plus
+            # `tests/mir/CastStage1Tests.lean`; there is not yet a MiniRustSpec /
+            # LeanMiriSpec step-simulation theorem for `FloatToInt`/`IntToFloat`/
+            # `FloatToFloat` (LeanMiriSpec only translates the cast kinds).
             ("floatToInt", "proved_corresponding"),
             ("intToFloat", "proved_corresponding"),
             ("floatToFloat", "proved_corresponding"),
@@ -868,7 +874,12 @@ def compute_stage_b_empirical_corpora(
 # `TRACKED_CORRESPONDENCE_DIVERGENCES` as switch-to-pass regression guards; once
 # their `witness_symbol` divergence theorems are replaced by positive
 # `*_simulation` theorems, `discover_correspondence_divergences` classifies them
-# under `resolved_correspondence_divergences`.
+# under `resolved_correspondence_divergences`. Resolution is fail-closed: an entry
+# with a `resolution_symbol` only counts as resolved when the old witness is gone
+# AND the named replacement theorem is live in `resolution_file` (default: `file`);
+# otherwise (e.g. the witness file was deleted, moved, or the witness was renamed
+# without a replacement) it stays in `actionable_anneal_bugs` with
+# `status == "resolution_missing"`.
 # Known Tree Borrows follow-up (not an open tracked bug here):
 # `DIV-MR-TB-DIRECT-LOCAL-ACCESS` — general Tree Borrows ancestor/child Read vs.
 # Write state transitions on direct local reads/writes beyond unprotected Freeze
@@ -882,6 +893,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P0_soundness",
         "witness_symbol": "callerRefMutSilentWrongLocal_divergence",
+        "resolution_symbol": "callerRefMutSilentWrongLocal_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Rebind BorrowEntry.targetLocal across frames in Trusted.MirSemantics.Terminators.evalTerminator so callerRefMutSilentWrongLocal_divergence switches to 3-way agreement (42).",
@@ -893,6 +905,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_false_positive_ub",
         "witness_symbol": "callerBorrowAcrossScalarCall_divergence",
+        "resolution_symbol": "callerBorrowAcrossScalarCall_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Statements",
         "switch_to_pass_criterion": "Scope invalidateConflictingBorrows to the active frame so callee root assignments do not disable caller borrows across scalar calls.",
@@ -904,6 +917,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "twoPhaseDirectWriteTreeBorrowsGap",
+        "resolution_symbol": "twoPhaseDirectWriteTreeBorrows_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Update updateBorrowPerm on direct root write (writerTag = none) to disable unprotected Freeze Reserved borrows, switching twoPhaseDirectWriteTreeBorrowsGap to UB agreement with MachTB.",
@@ -915,6 +929,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "retagFnEntryLocalDeallocUb",
+        "resolution_symbol": "retagFnEntryLocalDealloc_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Check active FnEntry protectors on callee-owned locals during Return frame teardown before releasing protectors, matching MachTB deallocAllM.",
@@ -926,6 +941,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_false_positive_ub",
         "witness_symbol": "unsafeCellProtectedInteriorMut",
+        "resolution_symbol": "unsafeCellProtectedInteriorMut_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/TbWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Exempt !Freeze Cell/ReservedIM entries from hasProtectedWriteConflict so unsafeCellProtectedInteriorMut returns 77 across Anneal, Mach, and MachTB.",
@@ -937,6 +953,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "step_raw_overwritten_direct_copy_invalid_char_divergence",
+        "resolution_symbol": "step_raw_overwritten_direct_copy_invalid_char_simulation",
         "file": "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Re-validate char Unicode scalar validity on direct Use(Copy) of raw-overwritten char locals (matching bool re-validation in step_raw_overwritten_direct_copy_invalid_bool_simulation).",
@@ -948,6 +965,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_false_positive_ub",
         "witness_symbol": "step_binOp_offset_disabled_divergence",
+        "resolution_symbol": "step_binOp_offset_disabled_simulation",
         "file": "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Scalars",
         "switch_to_pass_criterion": "Align BinOp.Offset allocation bounds check with Miri ptrOffsetInbounds (which checks live allocation bounds independent of Tree Borrows .disabled permission).",
@@ -959,6 +977,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_precision",
         "witness_symbol": "step_setDiscriminant_uninit_divergence",
+        "resolution_symbol": "step_setDiscriminant_uninit_simulation",
         "file": "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Statements",
         "switch_to_pass_criterion": "Initialize discriminant tag on SetDiscriminant when target enum slot is .uninit, matching Miri's writeDiscriminant.",
@@ -992,13 +1011,36 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
             text = fpath.read_text(encoding="utf-8", errors="replace")
             present = bool(re.search(rf"\b(?:theorem|def)\s+{re.escape(symbol)}\b", text))
 
+        resolution_symbol = item.get("resolution_symbol")
+        resolution_present: bool | None = None
+        if resolution_symbol:
+            rpath = repo_root / item.get("resolution_file", item["file"])
+            resolution_present = False
+            if rpath.is_file():
+                rtext = rpath.read_text(encoding="utf-8", errors="replace")
+                resolution_present = bool(
+                    re.search(
+                        rf"\b(?:theorem|lemma)\s+{re.escape(resolution_symbol)}\b", rtext
+                    )
+                )
+
         record = dict(item)
         record["live_in_source"] = present
+        record["resolution_live_in_source"] = resolution_present
         if item["category"] == "intentional_modeling_choice":
+            record["status"] = "modeling_choice"
             modeling_choices.append(record)
         elif present:
+            record["status"] = "open"
+            actionable_open.append(record)
+        elif resolution_symbol and not resolution_present:
+            # Fail closed: the divergence witness vanished without its positive
+            # replacement theorem (deleted/moved file or bare rename), so the
+            # divergence is NOT proven resolved.
+            record["status"] = "resolution_missing"
             actionable_open.append(record)
         else:
+            record["status"] = "resolved"
             actionable_resolved.append(record)
 
     # Also parse `theory/Correspondence/correspondence_gaps.toml`

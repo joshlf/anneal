@@ -290,9 +290,9 @@ concrete real-step instances in the `Wit*` modules:
   (`evalRvalue_reborrow_rawPtr_int_divergence`), dangling-reference copies
   validated eagerly by `lean-miri`
   (`step_safeRef_copy_dangling_validity_divergence`,
-  `step_safeRef_use_dangling_post_validity_divergence`), and `StorageDead` on a
-  local carrying a protected `Cell` borrow
-  (`sim_lm3_3_storage_dead_protected_cell_divergence`).
+  `step_safeRef_use_dangling_post_validity_divergence`). (`StorageDead` on a local
+  carrying a protected `Cell` borrow now steps in lockstep:
+  `sim_lm3_3_storage_dead_protected_cell_simulation`.)
 * `LM-4.2` (Stage-1 `Trusted` behavior that `lean-miri/lean/**` cannot change):
   * `CopyNonOverlapping` from an uninitialized source and through a frozen
     borrow (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,

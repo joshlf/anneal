@@ -4695,14 +4695,19 @@ theorem w4_protected_reservedFrz_conflict_ub :
 /-- **Stage-1 `StorageDead` with active `CallId` protector** (`LM-3.3` `D15`,
 `SimLM3_3.sim_lm3_3_storage_dead_and_live_protector_step`): across all 6-state
 `TreeBorrowPerm` permissions `perm`:
-* when `activeProtectors = [1]`, Anneal's whole program faults with undefined
+* when `activeProtectors = [1]` and `preventsDeallocation perm = true`
+  (`perm ≠ .cell ∧ perm ≠ .disabled`), Anneal's whole program faults with undefined
   behavior (`MirReachesUB ∧ ¬ TreeSafe`), and for every non-`Cell` permission
   (`perm ≠ .cell`), `lean-miri`'s `BorrowTree.deallocateBorrowRange` also rejects
   the protected deallocation (`status ≠ Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated`);
 * when `activeProtectors = []`, `StorageDead(_1)` steps cleanly, disabling the
   local borrow in `TreeBorrowsRel` lockstep with `deallocateBorrowRange`;
-* on a protected `Cell` (`perm = .cell`), Stage-1 Anneal faults (`MirReachesUB`)
-  while `deallocateBorrowRange` succeeds (`sim_lm3_3_storage_dead_protected_cell_divergence`). -/
+* on a protected `Cell` (`perm = .cell`), BOTH Stage-1 Anneal `StorageDead` and
+  `deallocateBorrowRange` succeed (`sim_lm3_3_storage_dead_protected_cell_simulation`).
+  (A protected `.disabled` entry in a live allocation is not claimed here: Anneal treats
+  `.disabled` as not preventing deallocation, which matches Tree Borrows only because a
+  strongly protected tag cannot become `Disabled` without earlier UB; Anneal reaches
+  protected `.disabled` entries only after the allocation was already deallocated.) -/
 theorem w4_storage_dead_protected_ub (perm : TreeBorrowPerm) :
     (preventsDeallocation perm = true →
       MirReachesUB (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true)) ∧

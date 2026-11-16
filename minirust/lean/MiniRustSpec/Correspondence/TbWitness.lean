@@ -34,13 +34,13 @@ and MiniRust `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`):
    (`"Tree Borrows: local read of Disabled reference"`) while returning `1` on
    `BasicMemory`.
 3. **`UnsafeCell<u32>` shared-reference interior mutability (`Permission::Cell`)**
-   (`unsafeCellUnprotInteriorMut`, `unsafeCellProtectedInteriorMut`):
+   (`unsafeCellUnprotInteriorMut`, `unsafeCellProtectedInteriorMutMir`):
    unprotected `&UnsafeCell<u32>` interior mutation returns `77` in all three
    semantics, and function-entry strongly protected `Retag([fn entry], r)` on
    `r: &UnsafeCell<u32>` (`PermissionProt::Cell`, `prevents_deallocation = false`)
    succeeds across a foreign raw write and callee local teardown on both `Mach`
    and `MachTB` (`77`), contrasting with `retagFnEntryProtectorWrite` and
-   `retagFnEntryLocalDeallocUb` on `Freeze` `&u32` / `&mut u32`. Under the
+   `retagFnEntryLocalDealloc` on `Freeze` `&u32` / `&mut u32`. Under the
    six-state `TreeBorrowPerm` (`LM-3.3`), Anneal also returns `77`: `&_1` on
    `!Freeze` `UnsafeCell<u32>` records `.cell` (`sharedBorrowPerm`), and the
    function-entry retag records a protected `.cell` child (`fnEntryRetagPerm`),

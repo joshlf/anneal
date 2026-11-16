@@ -7067,14 +7067,15 @@ theorem wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps :
         rfl rfl (by decide) (by decide)
     exact ⟨m₁, hs₁, hm₁⟩
 
-/-- `Runtime(PostCleanup)` MIR body exercising `step_binOp_offset_disabled_divergence`:
+/-- `Runtime(PostCleanup)` MIR body exercising `step_binOp_offset_disabled_simulation`
+(`DIV-LM-D6-OFFSET-DISABLED-TAG`, formerly a divergence witness):
 1. `_2 = &raw mut _1`;
 2. `_3 = copy _2 as *mut u8`;
 3. `StorageDead(_1)` (disables the borrow entry for `_1` in Anneal and frees
    `lm31AllocId1` in `lean-miri`);
-4. `_4 = Offset(copy _3, const 0_usize)`: zero-byte `BinOp.Offset` on a disabled
-   raw pointer faults with `MirStepNode.fail .ub` in Anneal while `lean-miri`'s
-   `ptrOffsetInbounds` short-circuits at `delta == 0` and steps cleanly. -/
+4. `_4 = Offset(copy _3, const 0_usize)`: zero-byte `BinOp.Offset` on the disabled
+   raw pointer now steps in BOTH Anneal (pointer arithmetic does not consult the Tree
+   Borrows permission) and `lean-miri` (`ptrOffsetInbounds` short-circuits at `delta == 0`). -/
 def lm31OffsetDisabledBody : CapturedMir where
   defPath := "lm_3_1_witness::offset_disabled_zero"
   phase := .runtimePostCleanup
@@ -10096,21 +10097,22 @@ Boundary)**: real-step executions from `StateRel` in which `_2`'s raw-pointer ta
 lockstep, in parts 1–3 by a direct write `_1 = const 7_u64` to the promoted `_1`
 (`step_direct_write_promoted_lm3_1_simulation`, `updateAllocMapOnWrite`) while `_1` stays live,
 and in part 4 by `StorageDead(_1)` (`step_storageDead_lm3_1_simulation`):
-1. `lm31OffsetDisabledLiveBody`: `Offset(move _2, const 1_usize)` (stride `8`) faults with
-   `.ub` in Anneal while `lean-miri` steps to `offsetBytes = 8`
-   (`step_binOp_offset_disabled_stride_divergence`).
+1. `lm31OffsetDisabledLiveBody`: `Offset(move _2, const 1_usize)` (stride `8`) steps in
+   lockstep in BOTH Anneal and `lean-miri` to `offsetBytes = 8`
+   (`step_binOp_offset_disabled_stride_simulation`; composed-fragment version
+   `wit_lm3_1_binOp_offset_disabled_live_composed`).
 2. `lm31OffsetDisabledNegBody`: after `Offset(copy _2, const 1_usize)` reaches
    `offsetBytes = 8` in lockstep, the direct write disables the tag and
-   `Offset(move _3, const -1_isize)` faults with `.ub` in Anneal while `lean-miri` steps back to
-   `offsetBytes = 0` (`step_binOp_offset_disabled_neg_isize_divergence`).
+   `Offset(move _3, const -1_isize)` steps back to `offsetBytes = 0` in lockstep in BOTH
+   machines (`step_binOp_offset_disabled_neg_isize_simulation`).
 3. `lm31OffsetDisabledUsizeMaxBody`: `Offset(copy _2, const usize::MAX)` raises UB in BOTH
    machines (Anneal `.ub`, `lean-miri` `"PointerArithOverflow"`;
    `step_binOp_offset_usize_wrap_disabled_ub_simulation`).
 4. `lm31OffsetDisabledDeadZeroBody`: after `Offset(copy _2, const 1_usize)` reaches
    `offsetBytes = 8` and `StorageDead(_1)` disables the tag and frees the allocation in lockstep,
-   the zero-count `Offset(copy _3, const 0_usize)` of the dangling pointer faults with `.ub` in
-   Anneal while `lean-miri` steps (`step_binOp_offset_disabled_stride_divergence`, zero-count
-   case at a non-zero offset). -/
+   the zero-count `Offset(copy _3, const 0_usize)` of the dangling pointer steps in lockstep in
+   BOTH machines (`step_binOp_offset_disabled_stride_simulation`, zero-count case at a non-zero
+   offset). -/
 theorem wit_lm3_1_binOp_offset_disabled_live_real_steps :
     (let b := lm31OffsetDisabledLiveBody
      let hooks := annealStepHooks b.localDecls b.layouts
@@ -10413,6 +10415,80 @@ theorem wit_lm3_1_binOp_offset_disabled_live_real_steps :
     have hm₄_inj : m₄' = m₄ := (Prod.mk.inj (hm₄_eq.symm.trans hm₄)).1; subst m₄'
     exact ⟨s₁, s₂, s₃, _, m₁, m₂, m₃, m₄, hs₁, hm₁, hs₂, hm₂, hs₃, hm₃, hrel₃, rfl, rfl, hs₄, rfl, hm₄, hrel₄⟩
 
+/-- **`wit_lm3_1_binOp_offset_disabled_live_composed`** (`DIV-LM-D6-OFFSET-DISABLED-TAG`,
+composed-fragment non-vacuity): on `lm31OffsetDisabledLiveBody`, after `_2 = &raw mut _1` and the
+direct write `_1 = const 7_u64` disable `_2`'s raw-pointer tag while `_1` (and its allocation)
+stays live, the disabled-tag `_3 = Offset(move _2, const 1_usize)` is admitted by the composed
+`LM-3.1` fragment via `WellTypedLM3_1StateStmt.binOpOffsetAnyPermLockstep`, so
+`step_stmt_lm3_1_state_simulation` itself (not only the standalone
+`step_binOp_offset_disabled_stride_simulation`) yields `StepRelLM3_1` lockstep for it. -/
+theorem wit_lm3_1_binOp_offset_disabled_live_composed :
+    let b := lm31OffsetDisabledLiveBody
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1
+    ∃ (s₂ : MachineState) (m₂ : AnnealStepState),
+      (entry.updateOnWrite 1 none).perm = .disabled ∧
+      get? s₂.frame.locals 1 = some (.init (.scalar ⟨7, 8⟩)) ∧
+      StateRelLM3_1 b s₂ m₂ (updateAllocMapOnWrite [entry] 1 none) ∧
+      AllocIdSupplyReady m₂.machine.memory ∧
+      WellTypedLM3_1StateStmt b s₂ m₂ (updateAllocMapOnWrite [entry] 1 none)
+        (mkStmt (.assign (local_ 3)
+          (.binaryOp .offset (.move (local_ 2)) (.constant (constUsizeLM31 1))))) ∧
+      ∃ allocMap', StepRelLM3_1 b m₂ allocMap' (stepMirFn b s₂)
+        (Miri.Interpreter.Step.step hooks () m₂) := by
+  intro b hooks entry
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have hrel₀ : StateRel b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩)
+      (mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) :=
+    mkFourLocalScalar_stateRel b u64Ty u64Decl u64Decl rawPtrMutU64Decl rawPtrMutU64Decl
+      ⟨42, 8⟩ lm31Scalar42 rfl rfl lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)
+  have himm₀ := mkFourLocalScalar_all_immediate b u64Ty u64Ty lm31Scalar42
+  let ptr0 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+  let bor := [rawPtrBorrowEntry b.localDecls b.layouts .mut 1 1]
+  let s₁ := mkWitState b 1 [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .uninit] bor 2
+  have hs₁ : stepMirFn b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ := rfl
+  obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_1_of_anneal_step
+    (step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+      (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty) hs₁
+  have htag₀ : (mkFourLocalScalarAnnealPre b ⟨42, 8⟩).memory.nextTag = 1 := rfl
+  have hid₀ : (⟨(mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42).machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁
+  obtain ⟨⟨hsupply₁, _, _⟩, himm_s₁⟩ :=
+    step_rawPtr_addrOf_preserves_supply hrel₀.toLM3_1 rfl rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+      (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩)
+      AllocIdSupplyReady.empty (by decide) (fun h => nomatch h) hm₁
+  have himm₁ : ∀ tf, m₁.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k :=
+    fun tf htf k hne => himm_s₁ _ tf rfl htf k hne (himm₀ _ rfl k)
+  let map₂ := updateAllocMapOnWrite [entry] 1 none
+  let s₂ := mkWitState b 2 [.uninit, .init (.scalar ⟨7, 8⟩), .init ptr0, .uninit]
+    (map₂.map AllocMapEntry.toBorrowEntry) 2
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_1_of_anneal_step
+    (step_direct_write_promoted_lm3_1_simulation hrel₁ hphase rfl rfl
+      (dstDecl := u64Decl) (valTy := u64Ty) rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) rfl
+      (fun tf _ => constU64_wellTyped b tf 7 (by decide)) ⟨entry, .head _, rfl⟩) hs₂
+  obtain ⟨_, himm_s₂⟩ := step_assign_use_preserves hrel₁ (by rintro _ ⟨⟩) rfl rfl hm₂
+  obtain ⟨⟨hsupply₂, _, _⟩, _⟩ := step_assign_use_preserves_supply hrel₁ rfl rfl hsupply₁ hm₂
+  have himm₂ : ∀ tf, m₂.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k := by
+    intro tf htf k hne; obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+    exact himm_s₂ tf₁ tf htf₁ htf k (himm₁ tf₁ htf₁ k hne)
+  have hwt₂ : WellTypedLM3_1StateStmt b s₂ m₂ map₂
+      (mkStmt (.assign (local_ 3)
+        (.binaryOp .offset (.move (local_ 2)) (.constant (constUsizeLM31 1))))) :=
+    .binOpOffsetAnyPermLockstep 3 2 MirAst.Operand.move (.constant (constUsizeLM31 1))
+      rawPtrMutU64Decl rawPtrMutU64Decl u64Decl .mut .mut (.uint .u64) usizeTyLM31
+      { allocId := 1, offsetBytes := 0 } ⟨1, 8⟩ (s₂.frame.locals.set 2 .uninit) _ _
+      (Or.inr rfl) rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (Or.inl rfl)
+      (fun tf _ => .of_wt (constUsize_wellTyped b tf 1 (by decide)))
+      (fun tf htf => ⟨himm₂ tf htf 3 (by decide), himm₂ tf htf 2 (by decide)⟩)
+      rfl rfl (by rintro ⟨⟩) (.head _) rfl (Or.inr (by decide)) rfl
+      (fun _ _ => rfl) (fun h => absurd h (by decide))
+  exact ⟨s₂, m₂, rfl, rfl, hrel₂, hsupply₂, hwt₂,
+    step_stmt_lm3_1_state_simulation hrel₂ hphase rfl rfl hwt₂ hsupply₂⟩
+
 /-! ### 8.10 Sub-Byte `move` Raw Overwrite into `char` & Composed `AllocId`-Free OOB / Misaligned UB Witnesses -/
 
 /-- `Runtime(PostCleanup)` MIR body splicing `0xD8_u8` via `Operand.move` into byte `1`
@@ -10619,9 +10695,9 @@ private theorem rawSubbyteMoveOverwriteChar_reach_state (useDeref : Bool) :
    (`'A' = 0x41 -> 0xD841`) steps in lockstep into `RawOverwrittenScalarState`
    (`step_deref_raw_subrange_write_into_bool_or_char_correspondence`, leaving `_5 = .uninit`),
    after which (1a) `copy *_2` raises UB in BOTH machines
-   (`step_raw_overwritten_deref_invalid_bool_or_char_simulation`) while (1b) `move _1`
-   steps in Anneal (`_1 = .uninit`, `_0 = 0xD841`) and raises `"reading invalid value"` in
-   `lean-miri` (`step_raw_overwritten_direct_copy_invalid_char_divergence`).
+   (`step_raw_overwritten_deref_invalid_bool_or_char_simulation`) and (1b) `move _1`
+   also raises UB in BOTH machines (Anneal's `validateLoadedValue` `char` check, `lean-miri`'s
+   `"reading invalid value"`; `step_raw_overwritten_direct_copy_invalid_char_simulation`).
 2. **5-step composed `step_mir_lm3_1_state_simulation` partial-overlap OOB write UB**:
    `lm31ComposedPartialOobWriteBody` (`*mut u32` write at byte offset `6` of `_1 : u64`)
    driven end-to-end through `step_mir_lm3_1_state_simulation` via

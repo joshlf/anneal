@@ -1929,16 +1929,18 @@ theorem callCrossFrameExposeWithExposed_three_way :
    * `callerRawPtrRetagFnEntry_B3_divergence` (`Retag(FnEntry)` on a `*mut u32`
      parameter attaches a strong protector in Anneal, faulting on `StorageDead`
      of an unrelated callee local, while `Mach` and `MachTB` return `7`);
-   * `callerRefMutSilentWrongLocal_divergence` (cross-frame `&mut u32` argument
-     where Anneal does **not** fault — it succeeds with `MirNoUBTree` and
-     **silently returns the wrong scalar `137`** by reading `callee`'s own `_1`
-     instead of `caller`'s `_1`, while `Mach` and `MachTB` return `42`);
-   * `callerBorrowAcrossScalarCall_divergence` (scalar-only `Call` where both
-     bodies individually satisfy `ptrAliasingOk = true`, yet `callee`'s root
-     assignment `_1 = _1 + 36` disables `caller`'s active borrow `_2 = &raw mut _1`
-     in Anneal's global `borrows` table, faulting after `Return` while `Mach` and
-     `MachTB` return `42` — proving `ptrAliasingProgOk` is strictly required over
-     per-body `ptrAliasingOk`).
+   * `callerRefMutSilentWrongLocal_simulation` (cross-frame `&mut u32` argument,
+     formerly `DIV-MR-CALL-TARGET-LOCAL` where Anneal silently returned the wrong
+     scalar `137` by reading `callee`'s own `_1`; with frame-scoped
+     `BorrowEntry.targetFrameDepth`, Anneal now reads `caller`'s `_1` and returns
+     `42` with `MirNoUBTree`, agreeing with `Mach` and `MachTB`);
+   * `callerBorrowAcrossScalarCall_simulation` (scalar-only `Call` where both
+     bodies individually satisfy `ptrAliasingOk = true`; formerly
+     `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` where `callee`'s root assignment
+     `_1 = _1 + 36` disabled `caller`'s active borrow `_2 = &raw mut _1` in Anneal's
+     global `borrows` table; frame-scoped invalidation now preserves it, so Anneal,
+     `Mach`, and `MachTB` all return `42`, while the static `ptrAliasingProgOk`
+     check conservatively still rejects the program).
 2. **`callerBorrowExposeAndScalarCall_three_way`** provides a positive 2-function
    witness inside the sound unified fragment (`progInFragment = false`,
    `progInFragmentWithIntrinsics = true`), combining `Call`, `&mut`, `&raw mut`,
