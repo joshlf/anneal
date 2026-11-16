@@ -29,11 +29,14 @@ machine state:
    by pointers whose provenance tag is `tagOf lid`. `stdValAlg.branchSplit`
    splits exactly the `.choice` nodes (`stdBranchSplit_eq_some_iff`), and
    refinement passes through it in both directions
-   and `StdValRefines.branchSplit_inv`), `stdValAlg.sameCond` identifies
-   matching symbolic conditions (`stdValAlg_sameCond_symBool_iff`,
-   `StdValRefines.of_sameCond`), and `stdValAlg.sameAggregateShape` identifies
-   matching aggregate shapes (`stdValAlg_sameAggregateShape_pair`,
-   `StdValRefines.of_sameAggregateShape_ext`, `StdValRefines.pair_inv`).
+   (`StdValRefines.of_branchSplit`, `StdValRefines.branchSplit_inv`).
+   `stdValAlg.sameCond` decides equality of symbolic conditions
+   (`stdValAlg_sameCond_symBool_iff`) and `stdValAlg.sameAggregateShape`
+   accepts same-shape pairs (`stdValAlg_sameAggregateShape_pair`); since their
+   `ValAlgebra` laws make the compared values equal, refinement transports
+   along them (`StdValRefines.of_sameCond`,
+   `StdValRefines.of_sameAggregateShape_ext`), and `StdValRefines.pair_inv`
+   inverts refinement of a pair.
 2. **Lawful field lenses over trusted aggregates (`valuePathLens`).**
    `valueFieldLens f` reads field `f` of a `Value.aggregate` and writes it with
    `MirLiftCore.setSpineChecked?` (equal to the trusted `Sequence.set?`);
@@ -78,8 +81,10 @@ machine state:
    `stepBasicBlock_of_branch_true`, `stepBasicBlock_of_branch_false`,
    `stepBasicBlock_of_branch_symbolic`, `stepBasicBlock_of_branch_term`,
    `stepBasicBlock_of_goto_continuing`, `stepBasicBlock_of_goto_term`,
-   `stepBasicBlock_of_ret_continuing`, `stepBasicBlock_of_ret_term`) factor
-   header, arm, and join reasoning across arbitrary diamond shapes; `mir_diamond_cfgCertificate_sound` instantiates them
+   `stepBasicBlock_of_ret_continuing`, `stepBasicBlock_of_ret_term`) factor the
+   header, arm, and join reasoning that the two fixed-shape diamond
+   certificates share (a new shape still needs its own certificate):
+   `mir_diamond_cfgCertificate_sound` instantiates them
    for the 4-block symmetric `CfgCertificate.diamond` (`0 → (1 | 2) → 3`,
    concrete or symbolic `.convergedJump 1` condition) from `HoldsFnSpec` of its
    plan alone, and `mir_asymDiamond_cfgCertificate_sound` instantiates them for
