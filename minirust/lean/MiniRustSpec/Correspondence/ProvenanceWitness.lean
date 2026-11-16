@@ -1702,9 +1702,11 @@ theorem callProtectorConflict_anneal_ub :
 protector (`PermissionProt::Unique`) is active raises Tree Borrows UB
 (`"Tree Borrows: foreign read of protected Unique reference"` in
 `PermissionProt::foreign_write`). On Anneal (`mirCallTreeWithCallees`),
-`*_1 = 10` resolves `r`'s un-namespaced `targetLocal = 1` against
-`callee.frame.locals[1]` (overwriting `r` with `.scalar ⟨10, 4⟩` and disabling
-`raw`'s borrow tag via `invalidateDerefWriteBorrows`), faulting on `*_2 = 20`. -/
+`r` carries `targetFrameDepth = 1` (referencing `caller.locals[1]`), so `*_1 = 10`
+writes `10` into `caller.locals[1]` while `r`'s function-entry `.unique` protector
+is active in `activeProtectors`, and the subsequent foreign write `*_2 = 20` through
+`raw` (`targetFrameDepth = 1`) faults via `hasProtectedWriteConflict` in agreement
+with `MachTB`. -/
 theorem callRefMutProtectorViolation_mach_vs_tb :
     (Interp.steps 15 callProtectorConflictMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =

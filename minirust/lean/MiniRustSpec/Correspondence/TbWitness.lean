@@ -733,16 +733,28 @@ theorem unsafeCellProtectedInteriorMut_tb_direct :
     retAfterTB unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 = tbRetU32 77 := by
   decide +kernel
 
+theorem unsafeCellProtectedInteriorMut_anneal_noUB :
+    MirNoUBTree (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) :=
+  runA_noUB unsafeCellProtectedInteriorMutMir 25 _ _ _ rfl
+
+/-- `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` 3-way `.ok 77` + `MirNoUBTree` simulation
+agreement across Anneal, `Mach`, and `MachTB` (note: general direct-local Tree
+Borrows ancestor/child transitions remain tracked separately as future follow-up
+`DIV-MR-TB-DIRECT-LOCAL-ACCESS` rather than claiming full TB completeness). -/
 theorem unsafeCellProtectedInteriorMut_simulation :
     (translateFn unsafeCellProtectedInteriorMutMir).isSome = true ∧
     (∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMutMir
       (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) []
       (.normal (.scalar ⟨77, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) ∧
     retAfter unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 =
       some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
     retAfterTB unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 = tbRetU32 77 :=
   ⟨unsafeCellProtectedInteriorMut_translate,
    unsafeCellProtectedInteriorMut_anneal_ret,
+   unsafeCellProtectedInteriorMut_anneal_noUB,
    unsafeCellProtectedInteriorMut_minirust_direct,
    unsafeCellProtectedInteriorMut_tb_direct⟩
 
@@ -750,7 +762,7 @@ theorem unsafeCellProtectedInteriorMut_simulation :
 reference (`r = &_1; Retag([fn entry], r)`) on `_1 : UnsafeCell<u32>` also
 survives explicit `StorageDead(_1)` prior to `Return` (`permPreventsDealloc .cell = false`
 in Anneal and `PermissionProt.prevents_deallocation .Cell = false` in `MachTB`),
-with 3-way `.ok 77` agreement across Anneal, `Mach`, and `MachTB`. -/
+with 3-way `.ok 77` + `MirNoUBTree` agreement across Anneal, `Mach`, and `MachTB`. -/
 def unsafeCellProtectedStorageDeadMir : CapturedMir :=
   { ptrBody "witness::unsafe_cell_protected_storage_dead"
       [u32Decl, unsafeCellU32Decl, refSharedUnsafeCellU32Decl, ptrMutU32Decl]
@@ -768,11 +780,14 @@ theorem unsafeCellProtectedStorageDead_simulation :
     (∃ mem, ReachesRet (mirTree unsafeCellProtectedStorageDeadMir
       (initMachineState unsafeCellProtectedStorageDeadMir [initUnsafeCellU32])) []
       (.normal (.scalar ⟨77, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree unsafeCellProtectedStorageDeadMir
+      (initMachineState unsafeCellProtectedStorageDeadMir [initUnsafeCellU32])) ∧
     retAfter unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 =
       some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
     retAfterTB unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 = tbRetU32 77 :=
   ⟨by decide +kernel,
    ⟨_, runA_sound unsafeCellProtectedStorageDeadMir 25 _ _ _ rfl⟩,
+   runA_noUB unsafeCellProtectedStorageDeadMir 25 _ _ _ rfl,
    by decide +kernel,
    by decide +kernel⟩
 

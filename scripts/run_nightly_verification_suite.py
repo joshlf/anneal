@@ -880,11 +880,15 @@ def compute_stage_b_empirical_corpora(
 # otherwise (e.g. the witness file was deleted, moved, or the witness was renamed
 # without a replacement) it stays in `actionable_anneal_bugs` with
 # `status == "resolution_missing"`.
-# Known Tree Borrows follow-up (not an open tracked bug here):
-# `DIV-MR-TB-DIRECT-LOCAL-ACCESS` — general Tree Borrows ancestor/child Read vs.
-# Write state transitions on direct local reads/writes beyond unprotected Freeze
-# Reserved root writes (`DIV-MR-TB-TWOPHASE-DIRECT-WRITE`) remain a future TB
-# correspondence milestone rather than a claim of full Tree Borrows completeness.
+# Known out-of-scope follow-ups (documented here rather than tracked as open
+# Episode 2 bugs in `TRACKED_CORRESPONDENCE_DIVERGENCES`):
+# - `DIV-MR-TB-DIRECT-LOCAL-ACCESS` — general Tree Borrows ancestor/child Read vs.
+#   Write state transitions on direct local reads/writes beyond unprotected Freeze
+#   Reserved root writes (`DIV-MR-TB-TWOPHASE-DIRECT-WRITE`) remain a future TB
+#   correspondence milestone rather than a claim of full Tree Borrows completeness.
+# - `step_binOp_offset_usize_wrap_divergence` (`SimLM3_1.lean`) — pre-existing
+#   `BinOp.Offset` unsigned `usize` rhs >= 2^63 wrap-around on non-disabled pointers
+#   (where `lean-miri` raises `"PointerArithOverflow"` UB while Anneal wraps).
 
 TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
     {
@@ -1065,10 +1069,18 @@ def _strip_lean_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
-_LEAN_DECL_MODIFIERS = r"(?:(?:private|protected|noncomputable|nonrec|partial|unsafe|scoped)\s+)*"
-# Same-line command prefixes such as `set_option maxHeartbeats 400000 in theorem foo`.
+_LEAN_WITNESS_MODIFIERS = (
+    r"(?:(?:private|protected|noncomputable|nonrec|partial|unsafe|scoped|local)\s+|"
+    r"@\[[^\]]*?(?:\[[^\]]*?\][^\]]*?)*\]\s*)*"
+)
+_LEAN_RESOLUTION_MODIFIERS = (
+    r"(?:(?:protected|noncomputable|nonrec|scoped)\s+|"
+    r"@\[[^\]]*?(?:\[[^\]]*?\][^\]]*?)*\]\s*)*"
+)
+# Command prefixes such as `set_option maxHeartbeats 400000 in` or `local attribute [simp] f in`.
 _LEAN_IN_PREFIXES = (
-    r"(?:(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[^\n]*?\s+in\s+)*"
+    r"(?:(?:(?:local|scoped)\s+)?"
+    r"(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[\s\S]*?\s+in\s+)*"
 )
 
 
@@ -1078,19 +1090,101 @@ def _truncate_at_lean_exit(stripped_src: str) -> str:
     return stripped_src[: m.start()] if m else stripped_src
 
 
-def _has_lean_decl(stripped_src: str, symbol: str, *, resolution: bool) -> bool:
-    """Line-anchored declaration scan on comment/string-stripped Lean source.
+def _lean_module_parts(rel_file: str) -> list[str]:
+    """Extract Lean module path components after `lean/` (e.g. `['LeanMiriSpec', 'Correspondence', 'SimLM2_3']`)."""
+    parts = list(Path(rel_file).with_suffix("").parts)
+    if "lean" in parts:
+        idx = parts.index("lean")
+        return parts[idx + 1 :]
+    return parts
 
-    Accepts attributes (including nested brackets), declaration modifiers,
-    same-line `... in` command prefixes, and namespace-qualified names
-    (`theorem Ns.symbol`), and rejects primed / suffixed names (`symbol'`).
+
+def _active_lean_namespace_at(truncated_src: str, pos: int) -> list[str]:
+    """Compute the active `namespace` stack at character offset `pos` in comment/string-stripped Lean source."""
+    stack: list[tuple[str, list[str]]] = []
+    for line in truncated_src[:pos].splitlines():
+        st = line.strip()
+        m_ns = re.match(r"^namespace\s+([^\s]+)$", st)
+        if m_ns:
+            stack.append(("ns", [seg.strip("«»") for seg in m_ns.group(1).split(".") if seg]))
+            continue
+        m_sec = re.match(r"^(?:noncomputable\s+)?section(?:\s+([^\s]+))?$", st)
+        if m_sec:
+            sec_name = [m_sec.group(1).strip("«»")] if m_sec.group(1) else []
+            stack.append(("sec", sec_name))
+            continue
+        m_end = re.match(r"^end(?:\s+([^\s]+))?$", st)
+        if m_end and stack:
+            if not m_end.group(1):
+                stack.pop()
+            else:
+                end_parts = [seg.strip("«»") for seg in m_end.group(1).split(".") if seg]
+                while stack and end_parts:
+                    _, sp = stack.pop()
+                    if sp and len(sp) <= len(end_parts) and end_parts[-len(sp) :] == sp:
+                        end_parts = end_parts[: -len(sp)]
+                    else:
+                        break
+    return [seg for kind, sp in stack if kind == "ns" for seg in sp]
+
+
+def _has_lean_decl(
+    stripped_src: str,
+    symbol: str,
+    *,
+    resolution: bool,
+    rel_file: str = "",
+) -> bool:
+    """Declaration scan on comment/string-stripped Lean source.
+
+    - For `resolution=False` (reintroduced divergence witness check): detects
+      `theorem|lemma|def|abbrev|axiom|opaque|structure|inductive` across multi-line
+      modifiers/attributes, `local`/`scoped` `... in` prefixes, namespace-qualified
+      names, and guillemet-quoted identifiers `«symbol»`.
+    - For `resolution=True` (replacement simulation theorem check): accepts ONLY
+      non-`private`, non-`unsafe`, non-`partial` `theorem`/`lemma` declarations whose
+      effective namespace (`active_namespace + inline_prefix`) is a prefix of the
+      target module's Lean namespace path.
     """
-    kinds = r"(?:theorem|lemma)" if resolution else r"(?:theorem|lemma|def|abbrev)"
-    pat = (
-        rf"(?:^|\n)[ \t]*{_LEAN_IN_PREFIXES}(?:@\[[^\n]*?\]+\s*)*{_LEAN_DECL_MODIFIERS}"
-        rf"{kinds}\s+(?:[^\W\d][\w'!?]*\.)*{re.escape(symbol)}(?![\w'!?])"
+    truncated = _truncate_at_lean_exit(stripped_src)
+    esc = re.escape(symbol)
+    sym_pat = rf"(?:«{esc}»|{esc})(?![\w'!?»])"
+    qual_seg = r"(?:«[^»\n]+»|[^\W\d][\w'!?]*)"
+    if not resolution:
+        kinds = r"(?:theorem|lemma|def|abbrev|axiom|opaque|structure|inductive)"
+        # Avoid spanning across earlier declarations by anchoring each candidate at line start
+        # and matching same/multi-line `in`-prefixes + modifiers right before `kinds`.
+        in_line = (
+            r"(?:(?:(?:local|scoped)\s+)?"
+            r"(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[^\n]*?\s+in\s+)*"
+        )
+        pat = (
+            rf"(?:^|\n)[ \t]*{in_line}{_LEAN_WITNESS_MODIFIERS}"
+            rf"{kinds}\s+(?:{qual_seg}\.)*{sym_pat}"
+        )
+        return bool(re.search(pat, truncated))
+
+    in_line_res = (
+        r"(?:(?:(?:local|scoped)\s+)?"
+        r"(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[^\n]*?\s+in\s+)*"
     )
-    return bool(re.search(pat, _truncate_at_lean_exit(stripped_src)))
+    pat_res = (
+        rf"(?:^|\n)[ \t]*{in_line_res}(?P<mods>{_LEAN_RESOLUTION_MODIFIERS})"
+        rf"(?:theorem|lemma)\s+(?P<qual>(?:{qual_seg}\.)*){sym_pat}"
+    )
+    mod_parts = _lean_module_parts(rel_file) if rel_file else []
+    for m in re.finditer(pat_res, truncated):
+        qual_raw = m.group("qual")
+        inline_segs = [s.strip("«»") for s in qual_raw.split(".") if s]
+        active_ns = _active_lean_namespace_at(truncated, m.start())
+        if inline_segs and inline_segs[0] == "_root_":
+            eff_ns = inline_segs[1:]
+        else:
+            eff_ns = active_ns + inline_segs
+        if mod_parts and (len(eff_ns) > len(mod_parts) or eff_ns != mod_parts[: len(eff_ns)]):
+            continue
+        return True
+    return False
 
 
 def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
@@ -1123,10 +1217,11 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
         resolution_symbol = item.get("resolution_symbol")
         resolution_present: bool | None = None
         if resolution_symbol:
-            rpath = repo_root / item.get("resolution_file", item["file"])
+            rel_r = item.get("resolution_file", item["file"])
+            rpath = repo_root / rel_r
             stripped_r = read_stripped(rpath)
             resolution_present = (
-                _has_lean_decl(stripped_r, resolution_symbol, resolution=True)
+                _has_lean_decl(stripped_r, resolution_symbol, resolution=True, rel_file=rel_r)
                 if stripped_r is not None
                 else False
             )

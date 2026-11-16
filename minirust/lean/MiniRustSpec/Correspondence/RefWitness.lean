@@ -3103,6 +3103,12 @@ theorem twoPhaseDirectWriteTreeBorrows_tb_direct :
       some "Tree Borrows: local read of Disabled reference" := by
   decide +kernel
 
+/-- `DIV-MR-TB-TWOPHASE-DIRECT-WRITE` simulation agreement between Anneal and
+`MachTB` (`TreeBorrowsMemory`), contrasted with `BasicMemory` (`99`).
+Scope note (`DIV-MR-TB-DIRECT-LOCAL-ACCESS` follow-up): general Tree Borrows
+ancestor/child `Read` vs. `Write` transitions on direct local accesses beyond
+unprotected `Freeze` `Reserved` root writes remain a separate future Tree Borrows
+correspondence item rather than a claim of full Tree Borrows completeness here. -/
 theorem twoPhaseDirectWriteTreeBorrows_simulation :
     (translateFn twoPhaseDirectWriteTreeBorrows).isSome = true ∧
     inFragment twoPhaseDirectWriteTreeBorrows = false ∧

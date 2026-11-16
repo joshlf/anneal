@@ -6311,14 +6311,15 @@ def isNonDivergingCall (t : MirAst.Terminator) : Bool :=
   | _ => false
 
 /-- Pointer/borrow local state transfer across a block terminator `t` in a
-multi-function program. In Anneal's `MirSemantics`, all frames share a single
-global `s.memory.borrows` table keyed by un-namespaced `BorrowEntry.targetLocal : Nat`,
-so any root assignment `_k = rv` inside a callee runs
-`invalidateConflictingBorrows mem₁.borrows k .none` across active caller borrows
-whose `targetLocal` happens to equal `k`. Consequently, across a returning `Call`
-terminator, every caller pointer/reference local transitions to `.disabled`
-(forcing fresh borrows after `Return`), while terminators without a returning
-`Call` preserve `env` identically. -/
+multi-function program. Anneal's `MirSemantics` namespaces `s.memory.borrows`
+per call-stack frame via `BorrowEntry.targetFrameDepth` (`targetFrameDepth == 0`
+at the active frame, shifted on `Call`/`Return`), so callee root assignments no
+longer invalidate caller borrows at runtime (`callerBorrowAcrossScalarCall_simulation`).
+This static `ptrAliasingProgOk` dataflow pass conservatively retains its pre-call
+disablement over-approximation across returning `Call` terminators (forcing fresh
+borrows after `Return` inside `progInFragmentWithIntrinsics`; see §12 of
+`ProvenanceWitness.lean`), while terminators without a returning `Call` preserve
+`env` identically. -/
 def ptrTermStep (decls : List MirAst.LocalDecl) (env : List PtrLocalState)
     (t : MirAst.Terminator) : List PtrLocalState :=
   let n := decls.length

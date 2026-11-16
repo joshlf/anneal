@@ -281,6 +281,62 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             )
             self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 3)
 
+        # Asymmetric resolution vs. witness enforcement: `private`/`unsafe`/wrong-namespace
+        # `resolution_symbol` declarations must be rejected (`resolution_missing`), whereas
+        # `local attribute [...] in`, `axiom`/`opaque`, guillemet-quoted `«...»`, and
+        # multi-line `private\ntheorem` witnesses must still be detected as `open`.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={
+                    "DIV-LM-ENUM-SET-DISCR-UNINIT",
+                    "DIV-LM-D6-OFFSET-DISABLED-TAG",
+                    "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC",
+                },
+            )
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "private theorem step_setDiscriminant_uninit_simulation : True := trivial\n"
+                "unsafe theorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            lm31 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+            with lm31.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "theorem BogusNs.step_binOp_offset_disabled_simulation : True := trivial\n"
+                    "private\ntheorem step_raw_overwritten_direct_copy_invalid_char_divergence : "
+                    "True := trivial\n"
+                )
+            ref = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean"
+            with ref.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "namespace Scratch\n"
+                    "theorem retagFnEntryLocalDealloc_simulation : True := trivial\n"
+                    "end Scratch\n"
+                    "axiom «twoPhaseDirectWriteTreeBorrowsGap» : True\n"
+                )
+            prov = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with prov.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "local attribute [simp] id in theorem "
+                    "callerBorrowAcrossScalarCall_divergence : True := trivial\n"
+                )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing"),
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing"),
+                    ("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "open"),
+                    ("DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL", "open"),
+                    ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
+                    ("DIV-MR-TB-TWOPHASE-DIRECT-WRITE", "open"),
+                ],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 2)
+
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / "state_out"
