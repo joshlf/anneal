@@ -11671,17 +11671,6 @@ theorem dischargeRustEqScalar1
         | exact Or.inr (Or.inl ⟨_, h.2⟩)
         | exact Or.inr (Or.inr ⟨_, h.2⟩)
         | exact Or.inr h.2)
-    (h_pins :
-      Bool.or
-        (checkMirRequiresPinsScalars
-          specFuel
-          reqBody
-          [{ bits := constVal, sizeBytes := width }])
-        (checkOptMirRequiresPinsScalarsForSubject
-          specFuel
-          c.body
-          (.some reqBody)
-          [{ bits := constVal, sizeBytes := width }]) = true := by rfl)
     (h_check :
       checkMirRustEqScalar1SpecWithCallees
         subjectFuel
@@ -11701,7 +11690,6 @@ theorem dischargeRustEqScalar1
         c.post args ret := by
       intro _ _ h; exact h) :
     VerificationResult c := by
-  let _ := h_pins
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
   rcases h_pre args hp with ⟨⟨h_len, h_req⟩, h_typed⟩
   let expectedSc : ScalarInt := { bits := constVal, sizeBytes := width }
@@ -12125,11 +12113,6 @@ theorem dischargeRustEqScalar1FuelFree
         | exact Or.inr (Or.inl ⟨_, h.2⟩)
         | exact Or.inr (Or.inr ⟨_, h.2⟩)
         | exact Or.inr h.2)
-    (h_pins :
-      Bool.or
-        (checkMirRequiresPinsScalars 64 reqBody [{ bits := constVal, sizeBytes := width }])
-        (checkOptMirRequiresPinsScalarsForSubject 64 c.body (.some reqBody) [{ bits := constVal, sizeBytes := width }]) =
-        true := by rfl)
     (h_check :
       checkMirRustEqScalar1SpecWithCallees 16 64 reqBody c.body ensBody c.callees
         { bits := constVal, sizeBytes := width } = true := by rfl)
@@ -12139,7 +12122,7 @@ theorem dischargeRustEqScalar1FuelFree
       c.post args ret := by
       intro _ _ h; exact h) :
     VerificationResult c :=
-  dischargeRustEqScalar1 width c 16 64 reqBody ensBody constVal h_pre h_pins h_check h_post
+  dischargeRustEqScalar1 width c 16 64 reqBody ensBody constVal h_pre h_check h_post
 
 abbrev dischargeRustEqU8FuelFree := @dischargeRustEqScalar1FuelFree 1
 abbrev dischargeRustEqU16FuelFree := @dischargeRustEqScalar1FuelFree 2

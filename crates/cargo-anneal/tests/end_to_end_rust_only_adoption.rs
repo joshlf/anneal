@@ -493,6 +493,31 @@ pub fn call_trusted_rev(port: u32) -> u32 {
     let v = unsafe { ffi_trusted_rev(port) };
     v + 8
 }
+
+#[anneal_spec::spec(
+    requires: idx == 3,
+    ensures: |ret: usize| ret == 4,
+)]
+pub fn usize_pin(idx: usize) -> usize {
+    idx + 1
+}
+
+#[anneal_spec::spec(
+    requires: x < 8,
+    ensures: |ret: u32| ret == le_bound(x),
+)]
+pub fn bound_with_spec_callee(x: u32) -> u32 {
+    x + 1
+}
+
+#[anneal_spec::spec(
+    safe_total,
+    requires: 42 == x,
+    ensures: |ret: u32| x.wrapping_add(5) == ret,
+)]
+pub fn total_pin_with_spec_callee(x: u32) -> u32 {
+    x + 5
+}
 "#;
     fs::write(src_dir.join("lib.rs"), lib_rs).expect("write src/lib.rs");
 
@@ -526,6 +551,26 @@ pub fn call_trusted_rev(port: u32) -> u32 {
         "call_trusted_rev must be discharged through the modular route:\n{modular_verify}"
     );
 
+    // Call-containing `ensures` companions must emit the `*WithSpecCalleesAuto`
+    // auto-discharge combinators across both `ItemProof` and `TotalItemProof`.
+    let spec_callee_bound_verify = fs::read_to_string(
+        temp_crate.join(".anneal/generated/Verify/EdgePkg/bound_with_spec_callee.lean"),
+    )
+    .expect("read generated Verify/EdgePkg/bound_with_spec_callee.lean");
+    assert!(
+        spec_callee_bound_verify.contains("dischargeRustBoundedRange1WithSpecCalleesAuto"),
+        "bound_with_spec_callee must emit dischargeRustBoundedRange1WithSpecCalleesAuto:\n{spec_callee_bound_verify}"
+    );
+    let spec_callee_total_verify = fs::read_to_string(
+        temp_crate.join(".anneal/generated/Verify/EdgePkg/total_pin_with_spec_callee.lean"),
+    )
+    .expect("read generated Verify/EdgePkg/total_pin_with_spec_callee.lean");
+    assert!(
+        spec_callee_total_verify.contains("TotalItemProof")
+            && spec_callee_total_verify.contains("dischargeRustTotalPinnedContractWithSpecCalleesAuto"),
+        "total_pin_with_spec_callee must emit TotalItemProof + dischargeRustTotalPinnedContractWithSpecCalleesAuto:\n{spec_callee_total_verify}"
+    );
+
     let report = verify_workspace_with_config(
         &VerifyConfig::new(&temp_crate)
             .with_anneal_repo_root(&checkout_root)
@@ -544,6 +589,9 @@ pub fn call_trusted_rev(port: u32) -> u32 {
         "Verify.EdgePkg.ffi_rev",
         "Verify.EdgePkg.call_ffi_rev",
         "Verify.EdgePkg.call_trusted_rev",
+        "Verify.EdgePkg.usize_pin",
+        "Verify.EdgePkg.bound_with_spec_callee",
+        "Verify.EdgePkg.total_pin_with_spec_callee",
     ] {
         assert_eq!(
             report.status_for(module),
@@ -562,7 +610,7 @@ pub fn call_trusted_rev(port: u32) -> u32 {
 
     let summary = render_verification_report(&report);
     assert!(
-        summary.contains("Totals: 10 unconditional, 1 conditional"),
+        summary.contains("Totals: 13 unconditional, 1 conditional"),
         "unexpected edge-shape summary:\n{summary}"
     );
     assert!(summary.contains("TrustedBoundary kernel replay: PASS"));

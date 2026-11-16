@@ -1635,6 +1635,17 @@ pub fn render_verify_module_with_options(
         ));
         out.push_str(&render_monomorphic_signature_guard(item));
     } else if !authored.has_specs && (bundle.has_rust_safe_total_attr() || authored.is_total) {
+        let req_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_requires.iter().any(|req| {
+                bundle
+                    .spec_companions_with_calls
+                    .contains(&derive_item_module_suffix(req))
+            });
+        let ens_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_ensures.len() == 1
+            && bundle
+                .spec_companions_with_calls
+                .contains(&derive_item_module_suffix(&bundle.inline_ensures[0]));
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             format!("(Option.some Mir.{req_suf}.body)")
@@ -1648,20 +1659,34 @@ pub fn render_verify_module_with_options(
             "Option.none".to_string()
         };
         let mut branches = String::new();
-        if bundle.inline_requires.len() <= 1 && bundle.inline_ensures.len() <= 1 {
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractAuto\n          \
-                         Obligations.{item}.totalClaim 64 64 {opt_req} {opt_ens}\n"
-            ));
+        if !req_uses_spec_callees && bundle.inline_requires.len() <= 1 && bundle.inline_ensures.len() <= 1 {
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractWithSpecCalleesAuto\n          \
+                             Obligations.{item}.totalClaim 64 128 Obligations.{item}.defaultSpecCallees {opt_req} {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractAuto\n          \
+                             Obligations.{item}.totalClaim 64 64 {opt_req} {opt_ens}\n"
+                ));
+            }
         }
-        if bundle.inline_requires.len() == 1 && bundle.inline_ensures.len() <= 1 {
+        if !req_uses_spec_callees && bundle.inline_requires.len() == 1 && bundle.inline_ensures.len() <= 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalSymRange1Auto\n          \
-                         Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
-                       | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
-                         Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n"
-            ));
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1WithSpecCalleesAuto\n          \
+                             Obligations.{item}.totalClaim 64 128 Obligations.{item}.defaultSpecCallees Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalSymRange1Auto\n          \
+                             Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
+                           | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
+                             Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            }
         }
         branches.push_str(&format!(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyTotalMirSym\n          \
@@ -1708,6 +1733,17 @@ pub fn render_verify_module_with_options(
              abbrev Certificate : Prop := VerificationResult Obligations.{item}.claim\n\n"
         ));
     } else {
+        let req_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_requires.iter().any(|req| {
+                bundle
+                    .spec_companions_with_calls
+                    .contains(&derive_item_module_suffix(req))
+            });
+        let ens_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_ensures.len() == 1
+            && bundle
+                .spec_companions_with_calls
+                .contains(&derive_item_module_suffix(&bundle.inline_ensures[0]));
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             format!("(Option.some Mir.{req_suf}.body)")
@@ -1722,25 +1758,41 @@ pub fn render_verify_module_with_options(
         };
         let mut branches = String::new();
         if !authored.has_specs
+            && !req_uses_spec_callees
             && bundle.inline_requires.len() <= 1
             && bundle.inline_ensures.len() <= 1
         {
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto\n          \
-                         Obligations.{item}.claim 64 64 {opt_req} {opt_ens}\n"
-            ));
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractWithSpecCalleesAuto\n          \
+                             Obligations.{item}.claim 64 128 Obligations.{item}.defaultSpecCallees {opt_req} {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto\n          \
+                             Obligations.{item}.claim 64 64 {opt_req} {opt_ens}\n"
+                ));
+            }
         }
         if !authored.has_specs
+            && !req_uses_spec_callees
             && bundle.inline_requires.len() == 1
             && bundle.inline_ensures.len() <= 1
         {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustSymRange1Auto\n          \
-                         Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
-                       | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
-                         Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n"
-            ));
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1WithSpecCalleesAuto\n          \
+                             Obligations.{item}.claim 64 128 Obligations.{item}.defaultSpecCallees Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustSymRange1Auto\n          \
+                             Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
+                           | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
+                             Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            }
         }
         branches.push_str(&format!(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n          \
@@ -3047,6 +3099,32 @@ mod tests {
              defaultSpecCallees (List.append args (List.cons ret List.nil))"
         ));
 
+        let verify_with_spec_callees =
+            render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(verify_with_spec_callees.contains(
+            "dischargeRustPinnedContractWithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.claim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+        assert!(verify_with_spec_callees.contains(
+            "dischargeRustBoundedRange1WithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.claim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+        let total_verify_with_spec_callees = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                is_total: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(total_verify_with_spec_callees.contains(
+            "dischargeRustTotalPinnedContractWithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.totalClaim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+        assert!(total_verify_with_spec_callees.contains(
+            "dischargeRustTotalBoundedRange1WithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.totalClaim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+
         // Without linked spec callees, every companion keeps the plain form.
         bundle.spec_callees.clear();
         let plain = render_obligations_module(bundle);
@@ -3055,6 +3133,10 @@ mod tests {
             "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
              (List.append args (List.cons ret List.nil))"
         ));
+        let plain_verify =
+            render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(plain_verify.contains("dischargeRustPinnedContractAuto"));
+        assert!(!plain_verify.contains("WithSpecCalleesAuto"));
     }
 
     #[test]
