@@ -65,11 +65,24 @@ Semantic subtleties made explicit (never papered over):
   non-unwinding call-site/callee ABI Miri forces the inherited unwind action to
   `Unreachable`, whereas Trusted keeps the saved caller's `returnUnwind`: the stack shapes
   stay related iff that action already was `unreachable` (`tailCall_leanMiri_nounwind_callee`).
-  Miri's tail call also *cleans up* the popped tail-caller frame, deallocating its
-  memory-backed locals, whereas Trusted keeps every borrow entry into the replaced frame with
-  an un-namespaced `targetLocal`: a raw pointer to a tail-caller local passed to the callee
-  silently reads the callee's same-index local in Trusted but is a use-after-free (UB) in Miri
-  (`tailCall_witness_dangling_caller_local_divergence`, a Trusted soundness gap).
+  Both references tear the replaced tail-caller frame down: Miri's tail call *cleans up* the
+  popped frame, deallocating its memory-backed locals, and Trusted's tail call — like its
+  `return_` — rejects a teardown that would deallocate a protected local
+  (`hasFrameDeallocProtectorConflict`, UB) and otherwise disables and marks dead every borrow
+  of the frame's locals (`disableFrameBorrows` over the frame-depth-aware borrow table,
+  `targetFrameDepth` / `allocDead`) before entering the callee. A raw pointer to a tail-caller
+  local passed to the callee is therefore dangling in both, and dereferencing it is UB in both
+  (`tailCall_leanMiri_cleanup_frees_caller_locals`,
+  `tailCall_witness_dangling_caller_local_simulation`): the former Trusted soundness gap
+  `DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL` (an un-namespaced `targetLocal` that silently read
+  the callee's same-index local) is resolved. Unwinding cannot observe the teardown (the
+  catching caller disables every frame above it), so an unwind out of the tail-callee is
+  exactly the tail-caller's own (`tailCall_trusted_unwind_through`). A gap remains at a
+  modular root: Trusted addresses the external caller's memory as depth-`0` slots above the
+  root's own locals, so a root tail call into a callee with *more* locals shadows those
+  caller-owned referents — a dereference of a pointer into the caller's memory reads the
+  callee's own same-index local instead (`tailCall_witness_root_caller_referent_divergence`,
+  a Trusted soundness gap), whereas Miri's tail call leaves the caller's allocation live.
 * `opaqueCast` is value-transparent and type-switching in Trusted (`readProjectedValue`,
   `writeProjectedValue`, `projectionsOverlap` ignore it; `resolveProjectedTy` and the
   union-aware readers retype to the cast type), whereas both Miri projection paths throw
@@ -95,7 +108,7 @@ Coverage manifest (checked by `scripts/audit_mir_coverage_matrix.py --check` and
 final `run_cmd`):
 -/
 -- @mir-variant-coverage StatementKind.constEvalCounter trusted=constEvalCounter_trusted_step_universal,constEvalCounter_stepMirFn_universal,constEvalCounter_nop_statement_equiv minirust=constEvalCounter_minirust_ops_corresponds,constEvalCounter_minirustSpec_fail_closed leanmiri=constEvalCounter_leanMiri_lockstep,constEvalCounter_leanMiri_nop_equiv positive=constEvalCounter_witness_runs,constEvalCounter_leanMiri_witness negative=constEvalCounter_witness_ub_not_masked,constEvalCounter_witness_minirustSpec_rejects
--- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_checks_classification,tailCall_leanMiri_nounwind_callee,tailCall_leanMiri_unwind_verdicts,tailCall_leanMiri_modular_root_unwind,tailCall_leanMiri_cleanup_frees_caller_locals,tailCall_abi_mismatch_corresponds,tailCall_leanMiri_calling_conv_ub_corresponds,tailCall_leanMiri_call_pushes positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi,tailCall_leanMiri_witness_checks,tailCall_leanMiri_witness_unwind,tailCall_witness_dangling_caller_local_divergence
+-- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_checks_classification,tailCall_leanMiri_nounwind_callee,tailCall_leanMiri_unwind_verdicts,tailCall_leanMiri_modular_root_unwind,tailCall_leanMiri_cleanup_frees_caller_locals,tailCall_abi_mismatch_corresponds,tailCall_leanMiri_calling_conv_ub_corresponds,tailCall_leanMiri_call_pushes positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi,tailCall_leanMiri_witness_checks,tailCall_leanMiri_witness_unwind,tailCall_witness_dangling_caller_local_simulation,tailCall_witness_root_caller_referent_divergence
 -- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal,opaqueCast_trusted_placeTy_and_helpers_universal,opaqueCast_trusted_write_and_borrow_universal,opaqueCast_trusted_place_rw_with_decls,opaqueCast_trusted_stmt_placeMention_and_deinit_universal,opaqueCast_trusted_root_dispatch_divergence minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move,opaqueCast_witness_place_rw_with_decls negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject,opaqueCast_witness_type_switch,opaqueCast_witness_root_dispatch
 
 /-
@@ -821,116 +834,220 @@ end ConstEvalCounter
 
 section TailCall
 
+/-- Trusted's frame teardown of the active frame (run by `TerminatorKind.return_`, and by a
+tail call before `enterTailCalleeFrame` replaces the frame): every borrow of one of its locals
+— depth `length s.memory.callStack`, local index `< length s.frame.locals` — is disabled and
+marked dead (`disableFrameBorrows`); every other memory component is unchanged. -/
+def frameTeardownMem (s : MachineState) : Memory :=
+  { s.memory with
+    borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+      (length s.frame.locals) }
+
+/-- The protector guard of Trusted's frame teardown (`hasFrameDeallocProtectorConflict`):
+`true` iff deallocating a local of the active frame would remove a tag that an active
+function-entry protector protects and whose permission prevents deallocation — `return_` and
+a tail call are then UB instead of tearing the frame down. -/
+def frameDeallocConflict (s : MachineState) : Bool :=
+  hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+    (length s.memory.callStack) (length s.frame.locals)
+
+/-- The memory in which Trusted resumes the saved `caller` once it has been popped off the
+call stack — by `return_` (after the frame teardown) or by `unwindFromCallStack`. -/
+def popCallerMem (mem : Memory) (caller : SavedCallerFrame) (rest : List SavedCallerFrame) :
+    Memory :=
+  { mem with callStack := rest, activeCallee := some caller.callerBody,
+             activeProtectors := restoreCallerProtectors caller }
+
+/-- `return_` from a frame holding `retVal` in `_0`, in the vocabulary above: the teardown's
+protector guard, the teardown, then the root halt or the write of the caller's destination in
+the popped caller's memory. -/
+private theorem evalTerminator_return_eq (st : MachineState) (retVal : Value) (span : String)
+    (cb : Option CapturedMir) (h0 : get? st.frame.locals 0 = some (.init retVal)) :
+    evalTerminator st ⟨.return_, span⟩ cb =
+      match frameDeallocConflict st with
+      | true => MirStepNode.fail .ub
+      | false =>
+        match st.memory.callStack with
+        | [] => MirStepNode.retNormal retVal (frameTeardownMem st)
+        | caller :: rest =>
+          match caller.isDiverging with
+          | true => MirStepNode.fail .ub
+          | false =>
+            match writeReturnDestination caller.frame.locals
+                (popCallerMem (frameTeardownMem st) caller rest) caller.destination retVal
+                caller.callerBody.localDecls caller.callerBody.layouts with
+            | .ok upd mem' =>
+              MirStepNode.step
+                { frame := { caller.frame with blockIdx := caller.returnTarget, stmtIdx := 0,
+                                               locals := upd }
+                  memory := mem' }
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported := by
+  unfold frameDeallocConflict
+  simp only [evalTerminator, h0]
+  rfl
+
 /-- **Trusted direct in-table tail call (universal).** A direct `become f(args)` whose
-callee has a linked body enters it at `bb0` with the evaluated arguments, *replacing* the
-active frame: the call stack is unchanged (no `SavedCallerFrame` is pushed), the moved-out
-argument locals of the tail-caller are discarded with its frame, and every other `Memory`
-component is untouched. -/
+callee has a linked body, once the arguments are evaluated, runs the frame teardown's
+protector guard: if deallocating a local of the tail-caller would remove a protected tag, the
+tail call is UB; otherwise it tears the tail-caller's frame down (`frameTeardownMem`: every
+borrow of one of its locals is disabled and marked dead) and enters the callee at `bb0` with
+the evaluated arguments, *replacing* the active frame: the call stack is unchanged (no
+`SavedCallerFrame` is pushed), the moved-out argument locals of the tail-caller are discarded
+with its frame, and every other `Memory` component is untouched. -/
 theorem tailCall_trusted_direct_enters_without_push
     (s : MachineState) (func : Operand) (argOps : List Operand) (span : String)
     (callerBody calleeBody : CapturedMir) (defPath : DefPath) (argVals : List Value)
     (locals' : List LocalSlot)
     (hfunc : extractCalleeDefPath? func = some defPath)
     (hargs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
-      callerBody.layouts s.memory.callerLocals = .ok argVals locals')
+      callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok argVals locals')
     (hfind : lookupCallee s.memory.callees callerBody.layouts defPath
       (extractCalleeTypeArgs func) s.memory.traitImpls = some calleeBody) :
-    evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
-        MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals) ∧
-      (enterTailCalleeFrame s.memory calleeBody argVals).memory =
-        { s.memory with activeCallee := some calleeBody } ∧
-      (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack =
+    (frameDeallocConflict s = true →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+        MirStepNode.fail .ub) ∧
+      (frameDeallocConflict s = false →
+        evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+          MirStepNode.step (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals)) ∧
+      (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory =
+        { s.memory with
+          borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+            (length s.frame.locals),
+          activeCallee := some calleeBody } ∧
+      (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack =
         s.memory.callStack ∧
-      (enterTailCalleeFrame s.memory calleeBody argVals).frame =
+      (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).frame =
         { blockIdx := 0, stmtIdx := 0, locals := initLocals calleeBody argVals } := by
-  refine ⟨?_, rfl, rfl, rfl⟩
-  simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc,
-    hargs, hfind, checkCalleeTargetCompatible_direct]
+  refine ⟨fun hc => ?_, fun hc => ?_, rfl, rfl, rfl⟩ <;>
+    simp only [frameDeallocConflict] at hc <;>
+    simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc, hargs, hc,
+      hfind, checkCalleeTargetCompatible_direct, frameTeardownMem]
 
 /-- **Trusted tail call vs. call (universal contrast).** For the same callee and
 arguments, a returning `call` pushes exactly one `SavedCallerFrame` (whose continuation is
-`targetBb`), whereas `tailCall` leaves the stack depth unchanged. -/
+`targetBb`) and keeps every borrow of the suspended caller, whereas `tailCall` leaves the
+stack depth unchanged and tears the replaced frame down (`disableFrameBorrows`); both enter
+the callee in the same frame. -/
 theorem tailCall_trusted_vs_call_depth
     (s : MachineState) (callerBody calleeBody : CapturedMir) (locals' : List LocalSlot)
     (destination : Place) (targetBb : BasicBlockIdx) (argVals : List Value)
     (unwind : UnwindAction) :
     (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind
         ).memory.callStack.length = s.memory.callStack.length + 1 ∧
-      (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack.length =
+      (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack.length =
         s.memory.callStack.length ∧
+      (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind
+        ).memory.borrows = s.memory.borrows ∧
+      (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.borrows =
+        disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+          (length s.frame.locals) ∧
       (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind).frame =
-        (enterTailCalleeFrame s.memory calleeBody argVals).frame :=
-  ⟨by simp [pushCalleeFrame], rfl, rfl⟩
+        (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).frame :=
+  ⟨by simp [pushCalleeFrame], rfl, rfl, rfl, rfl⟩
 
-/-- **Trusted return-through (universal).** A `return` depends only on `_0` and the
-memory, never on the rest of the active frame. Hence once the tail-callee has produced
-`retVal`, its `return` is *exactly* the transition the tail-caller's own `return` of
-`retVal` would have made: at the root it halts with `retVal`; under a caller it writes
-`caller.destination` and resumes the caller at `caller.returnTarget` (the caller's
-caller of the original tail-caller frame), restoring its protectors; into a diverging
-caller it is UB. -/
+/-- **Trusted return-through (universal).** A `return` depends only on `_0`, on the number
+of locals of the returning frame (the extent of its teardown), and on the memory — never on
+the rest of the frame. Once the tail-callee has produced `retVal`, its `return` (in the memory
+after the tail call, whose borrows into the replaced tail-caller frame are already disabled)
+runs the teardown's protector guard for its own frame and, unless that is UB, tears its frame
+down too (`frameTeardownMem`) and then halts or pops exactly as the tail-caller's own `return`
+of `retVal` would have: at the root it halts with `retVal`; under a caller it writes
+`caller.destination` (`writeReturnDestination`, in the popped caller's memory `popCallerMem`)
+and resumes the caller at `caller.returnTarget` (the caller's caller of the original
+tail-caller frame), restoring its protectors; into a diverging caller it is UB. -/
 theorem tailCall_trusted_return_through
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value) (f : StackFrame)
     (retVal : Value) (span : String) (cb : Option CapturedMir)
     (h0 : get? f.locals 0 = some (.init retVal)) :
     (∀ (f' : StackFrame) (span' : String) (cb' : Option CapturedMir),
-        get? f'.locals 0 = some (.init retVal) →
-        evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+        get? f'.locals 0 = some (.init retVal) → length f'.locals = length f.locals →
+        evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.return_, span⟩ cb =
-          evalTerminator ⟨f', (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          evalTerminator
+            ⟨f', (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.return_, span'⟩ cb') ∧
-      (s.memory.callStack = [] →
-        evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+      (frameDeallocConflict
+          ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩ = false →
+        s.memory.callStack = [] →
+        evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.return_, span⟩ cb =
-          MirStepNode.retNormal retVal (enterTailCalleeFrame s.memory calleeBody argVals).memory) ∧
-      (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame) (upd : List LocalSlot),
+          MirStepNode.retNormal retVal
+            (frameTeardownMem
+              ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩)) ∧
+      (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame) (upd : List LocalSlot)
+          (mem' : Memory),
+        frameDeallocConflict
+            ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩ = false →
         s.memory.callStack = caller :: rest → caller.isDiverging = false →
-        writePlaceValue caller.frame.locals s.memory.borrows caller.destination retVal = .ok upd →
-        evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+        writeReturnDestination caller.frame.locals
+            (popCallerMem
+              (frameTeardownMem
+                ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩)
+              caller rest)
+            caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+          .ok upd mem' →
+        evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.return_, span⟩ cb =
           MirStepNode.step
             { frame := { caller.frame with blockIdx := caller.returnTarget, stmtIdx := 0,
                                            locals := upd }
-              memory := { s.memory with callStack := rest,
-                                        activeCallee := some caller.callerBody,
-                                        activeProtectors := restoreCallerProtectors caller } } ∧
+              memory := mem' } ∧
         toMrStackFrame { caller.frame with blockIdx := caller.returnTarget, stmtIdx := 0,
                                            locals := upd } =
           MrStackFrame.jump_to_block (toMrStackFrame caller.frame) caller.returnTarget) ∧
       (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame),
         s.memory.callStack = caller :: rest → caller.isDiverging = true →
-        evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+        evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.return_, span⟩ cb = MirStepNode.fail .ub) := by
   refine ⟨?_, ?_, ?_, ?_⟩
-  · intro f' span' cb' h0'
-    simp only [evalTerminator, h0, h0']
-  · intro hnil
-    simp only [evalTerminator, h0, enterTailCalleeFrame, hnil]
-  · intro caller rest upd hcs hdiv hw
+  · intro f' span' cb' h0' hlen
+    simp only [evalTerminator, h0, h0', hlen]
+  · intro hc hnil
+    have hnil' : (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack =
+        [] := hnil
+    rw [evalTerminator_return_eq _ retVal span cb h0, hc]
+    simp only [hnil']
+  · intro caller rest upd mem' hc hcs hdiv hw
+    have hcs' : (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack =
+        caller :: rest := hcs
     refine ⟨?_, rfl⟩
-    simp only [evalTerminator, h0, enterTailCalleeFrame, hcs, hdiv, hw]
+    rw [evalTerminator_return_eq _ retVal span cb h0, hc]
+    simp only [hcs', hdiv, hw]
   · intro caller rest hcs hdiv
-    simp only [evalTerminator, h0, enterTailCalleeFrame, hcs, hdiv]
+    have hcs' : (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack =
+        caller :: rest := hcs
+    rw [evalTerminator_return_eq _ retVal span cb h0]
+    split <;> simp only [hcs', hdiv]
 
 /-- **Trusted external tail call (universal).** A direct tail call to a callee without a
-linked body emits the external `MirCallReq` with the evaluated arguments and the current
-memory, resuming with `resumeExternalTailCall`. -/
+linked body runs the teardown's protector guard (UB on a conflict), tears the tail-caller's
+frame down, and emits the external `MirCallReq` with the evaluated arguments and the
+torn-down memory, resuming with `resumeExternalTailCall`. -/
 theorem tailCall_trusted_external
     (s : MachineState) (func : Operand) (argOps : List Operand) (span : String)
     (callerBody : CapturedMir) (defPath : DefPath) (argVals : List Value)
     (locals' : List LocalSlot)
     (hfunc : extractCalleeDefPath? func = some defPath)
     (hargs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
-      callerBody.layouts s.memory.callerLocals = .ok argVals locals')
+      callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok argVals locals')
     (hnone : lookupCallee s.memory.callees callerBody.layouts defPath
       (extractCalleeTypeArgs func) s.memory.traitImpls = none) :
-    evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
-      MirStepNode.extCall
-        { defPath := defPath, typeArgs := extractCalleeTypeArgs func, args := argVals,
-          memory := s.memory }
-        resumeExternalTailCall := by
-  simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc,
-    hargs, hnone]
+    (frameDeallocConflict s = true →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+        MirStepNode.fail .ub) ∧
+      (frameDeallocConflict s = false →
+        evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+          MirStepNode.extCall
+            { defPath := defPath, typeArgs := extractCalleeTypeArgs func, args := argVals,
+              memory := frameTeardownMem s }
+            resumeExternalTailCall) := by
+  refine ⟨fun hc => ?_, fun hc => ?_⟩ <;>
+    simp only [frameDeallocConflict] at hc <;>
+    simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc, hargs, hc,
+      hnone, frameTeardownMem]
 
 /-- The `MirExecState` a step node denotes (`tau`, `ret`, or a fault). -/
 def nodeState : MirStepNode → Option MirExecState
@@ -939,60 +1056,71 @@ def nodeState : MirStepNode → Option MirExecState
   | .vis (.inl (.fail k)) _ => some (.faulted k)
   | _ => none
 
-/-- **Trusted external return-through (universal).** When the external tail-callee returns
-`retVal` with memory `memAfter`, the resumption is *exactly* the `return` of `retVal` from
-any frame in `memAfter` — the external callee, too, returns straight into the caller's
-caller (halting at the root, UB into a diverging caller). Unwinding and aborting follow
-the caller stack (`unwindFromCallStack`) and abort. -/
+/-- **Trusted external return-through (universal).** For every frame `f` holding `retVal` in
+`_0` and every memory `memAfter`, a `return` from `f` is UB when the teardown of `f`'s locals
+conflicts with an active protector, and is otherwise *exactly* the resumption of an external
+tail-callee that returned `retVal` with the torn-down memory: the external callee, too,
+returns straight into the caller's caller (halting at the root, UB into a diverging caller) —
+its frame lives outside the machine, and the tail-caller's frame was torn down when the tail
+call was issued (`tailCall_trusted_external`). Unwinding and aborting follow the caller stack
+(`unwindFromCallStack`) and abort. -/
 theorem tailCall_trusted_external_resume_is_return
     (retVal : Value) (memAfter : Memory) (f : StackFrame) (span : String)
     (cb : Option CapturedMir) (h0 : get? f.locals 0 = some (.init retVal)) :
-    some (resumeExternalTailCall (.returned retVal memAfter)) =
-        nodeState (evalTerminator ⟨f, memAfter⟩ ⟨.return_, span⟩ cb) ∧
+    (frameDeallocConflict ⟨f, memAfter⟩ = true →
+      nodeState (evalTerminator ⟨f, memAfter⟩ ⟨.return_, span⟩ cb) = some (.faulted .ub)) ∧
+      (frameDeallocConflict ⟨f, memAfter⟩ = false →
+        some (resumeExternalTailCall (.returned retVal (frameTeardownMem ⟨f, memAfter⟩))) =
+          nodeState (evalTerminator ⟨f, memAfter⟩ ⟨.return_, span⟩ cb)) ∧
       resumeExternalTailCall (.panicked memAfter) =
         unwindFromCallStack memAfter.callStack memAfter ∧
       resumeExternalTailCall .aborted = .halted .abort := by
-  refine ⟨?_, rfl, rfl⟩
-  simp only [resumeExternalTailCall, evalTerminator, h0]
-  rcases memAfter.callStack with _ | ⟨caller, rest⟩
-  · rfl
-  · dsimp only
-    cases caller.isDiverging
-    · dsimp only
-      cases writePlaceValue caller.frame.locals memAfter.borrows caller.destination retVal <;> rfl
+  refine ⟨fun hc => ?_, fun hc => ?_, rfl, rfl⟩
+  · rw [evalTerminator_return_eq _ retVal span cb h0, hc]
+    rfl
+  · rw [evalTerminator_return_eq _ retVal span cb h0, hc]
+    have hcs : (frameTeardownMem ⟨f, memAfter⟩).callStack = memAfter.callStack := rfl
+    simp only [resumeExternalTailCall, hcs, popCallerMem]
+    rcases memAfter.callStack with _ | ⟨caller, rest⟩
     · rfl
+    · dsimp only
+      cases caller.isDiverging
+      · dsimp only
+        split <;> rename_i heq <;> simp only [heq] <;> rfl
+      · rfl
 
 /-- **Trusted fail-closed tail calls (universal).** Every tail call whose callee or
 arguments cannot be resolved faults with UB: a callee operand whose evaluation is UB or
 yields a non-function value (a scalar, a non-unit aggregate, a pointer with a non-zero
 offset, a pointer that is a stack borrow, an unregistered function pointer, or one whose
 signature/arity/ABI is incompatible with the call site), a resolved callee whose linked
-body is incompatible with the reified signature (`checkCalleeTargetCompatible`), and an
-argument whose evaluation is UB (e.g. moving a dead local). A zero-sized function-item
-operand (`.unit` of `FnDef` type) resolves to its function. -/
+body is incompatible with the reified signature (`checkCalleeTargetCompatible`; UB as well
+when the frame teardown's protector guard fires first), and an argument whose evaluation is
+UB (e.g. moving a dead local). A zero-sized function-item operand (`.unit` of `FnDef` type)
+resolves to its function, which the tail call enters after the frame teardown. -/
 theorem tailCall_trusted_fail_closed_universal
     (s : MachineState) (func : Operand) (argOps : List Operand) (span : String)
     (callerBody : CapturedMir) (hnodirect : extractCalleeDefPath? func = none) :
     (evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-        s.memory.callerLocals = .ub →
+        s.memory.callerLocals (callStack := s.memory.callStack) = .ub →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ (sc : ScalarInt) (l : List LocalSlot),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.scalar sc) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.scalar sc) l →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ (vi : Nat) (v : Value) (vs : List Value) (l : List LocalSlot),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.aggregate vi (v :: vs)) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.aggregate vi (v :: vs)) l →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ (p : ProvenancePtr) (sz : Nat) (l : List LocalSlot),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.ptr p sz) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.ptr p sz) l →
       (sz ≠ 8 ∨ p.offsetBytes ≠ 0 ∨ (lookupBorrow s.memory.borrows p.tag).isSome ∨
         lookupFnPtr s.memory.fnPtrs p.allocId = none) →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.ptr p 8) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.ptr p 8) l →
       p.offsetBytes = 0 → lookupBorrow s.memory.borrows p.tag = none →
       lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
@@ -1001,13 +1129,13 @@ theorem tailCall_trusted_fail_closed_universal
     (∀ (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry) (argVals : List Value)
         (l' : List LocalSlot) (calleeBody : CapturedMir),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.ptr p 8) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.ptr p 8) l →
       p.offsetBytes = 0 → lookupBorrow s.memory.borrows p.tag = none →
       lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy callerBody.localDecls callerBody.layouts func) = true →
       evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok argVals l' →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals l' →
       lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs
           s.memory.traitImpls = some calleeBody →
       checkCalleeTargetCompatible
@@ -1016,24 +1144,25 @@ theorem tailCall_trusted_fail_closed_universal
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ (l : List LocalSlot) (dp : DefPath) (tys : List RigidTy),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok .unit l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok .unit l →
       extractFnItemTarget? (operandTy callerBody.localDecls callerBody.layouts func) =
         some (dp, tys) →
       evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ub →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ub →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ (l : List LocalSlot) (dp : DefPath) (tys : List RigidTy) (argVals : List Value)
         (l' : List LocalSlot) (calleeBody : CapturedMir),
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok .unit l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok .unit l →
       extractFnItemTarget? (operandTy callerBody.localDecls callerBody.layouts func) =
         some (dp, tys) →
       evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok argVals l' →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals l' →
       lookupCallee s.memory.callees callerBody.layouts dp tys s.memory.traitImpls =
         some calleeBody →
+      frameDeallocConflict s = false →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
-        MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals)) := by
+        MirStepNode.step (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals)) := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro h
     simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget,
@@ -1067,14 +1196,18 @@ theorem tailCall_trusted_fail_closed_universal
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
       hnodirect, h, hoff, hbor, hfn, hcompat, Nat.beq_refl, Bool.and_self]
   · intro p l fnEntry argVals l' calleeBody h hoff hbor hfn hcompat hargs hfind hbody
-    simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
-      hnodirect, h, hoff, hbor, hfn, hcompat, Nat.beq_refl, Bool.and_self, hargs, hfind, hbody]
+    cases hc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length s.memory.callStack) (length s.frame.locals) <;>
+      simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
+        hnodirect, h, hoff, hbor, hfn, hcompat, Nat.beq_refl, Bool.and_self, hargs, hc, hfind,
+        hbody]
   · intro l dp tys h hfi hargs
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
       hnodirect, h, hfi, hargs]
-  · intro l dp tys argVals l' calleeBody h hfi hargs hfind
+  · intro l dp tys argVals l' calleeBody h hfi hargs hfind hc
+    simp only [frameDeallocConflict] at hc
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
-      hnodirect, h, hfi, hargs, hfind, checkCalleeTargetCompatible_direct]
+      hnodirect, h, hfi, hargs, hc, hfind, checkCalleeTargetCompatible_direct, frameTeardownMem]
 
 /-- **Trusted non-function callees (universal).** Whatever a non-direct callee operand
 evaluates to, if it is not a pointer and not a zero-sized value of function-item type
@@ -1085,7 +1218,7 @@ theorem tailCall_trusted_non_function_value_ub
     (callerBody : CapturedMir) (hnodirect : extractCalleeDefPath? func = none)
     (v : Value) (l : List LocalSlot)
     (h : evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-      s.memory.callerLocals = .ok v l)
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok v l)
     (hnp : ∀ p sz, v ≠ .ptr p sz)
     (hfi : extractFnItemTarget? (operandTy callerBody.localDecls callerBody.layouts func) = none) :
     evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub := by
@@ -1101,78 +1234,149 @@ theorem tailCall_trusted_non_function_value_ub
       simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
         hnodirect, h, hfi]
 
-/-- **Trusted unwind-through (universal).** Unwinding (`UnwindResume`) out of the
-tail-callee depends only on the memory — which the tail call left unchanged except for the
-active body — so it is exactly the unwind the tail-caller would have performed: it pops into
-the caller's caller with the original call's `returnUnwind` action. -/
+/-- `disableFramesAbove k` already disables every borrow of a frame deeper than `k`, so a
+prior teardown of such a frame is invisible to it. -/
+private theorem disableFramesAbove_disableFrameBorrows (d n k : Nat) (hk : k < d) :
+    ∀ bs : List BorrowEntry,
+      disableFramesAbove (disableFrameBorrows bs d n) k = disableFramesAbove bs k
+  | [] => rfl
+  | e :: rest => by
+    have ih := disableFramesAbove_disableFrameBorrows d n k hk rest
+    cases h : Bool.and (Nat.beq e.targetFrameDepth d) (Nat.blt e.targetLocal n) with
+    | true =>
+      have hd : e.targetFrameDepth = d := by
+        simp only [Bool.and_eq_true] at h
+        exact Nat.eq_of_beq_eq_true h.1
+      have hkd : Nat.blt k e.targetFrameDepth = true := by
+        rw [hd]
+        exact Nat.blt_eq.mpr hk
+      simp only [disableFrameBorrows, h, disableFramesAbove, hkd, ih]
+    | false =>
+      simp only [disableFrameBorrows, h, disableFramesAbove, ih]
+
+/-- Unwinding from a call stack no deeper than `d` cannot observe a teardown of the frame at
+depth `d` (nor the active body): every caller that catches the unwind disables the frames
+above it. -/
+private theorem unwindFromCallStack_teardown (d n : Nat) :
+    ∀ (cs : List SavedCallerFrame) (mem : Memory) (ac : Option CapturedMir), cs.length ≤ d →
+      unwindFromCallStack cs
+          { mem with borrows := disableFrameBorrows mem.borrows d n, activeCallee := ac } =
+        unwindFromCallStack cs mem
+  | [], _, _, _ => rfl
+  | caller :: rest, mem, ac, hlen => by
+    have hlt : length rest < d := by
+      simp only [List.length_cons] at hlen
+      simp only [length]
+      omega
+    have ih := unwindFromCallStack_teardown d n rest (popCallerMem mem caller rest)
+      (some caller.callerBody) (by simp only [List.length_cons] at hlen; omega)
+    cases hu : caller.returnUnwind with
+    | unreachable => simp only [unwindFromCallStack, hu]
+    | terminate => simp only [unwindFromCallStack, hu]
+    | continue_ =>
+      simp only [unwindFromCallStack, hu]
+      exact ih
+    | cleanup bb =>
+      simp only [unwindFromCallStack, hu, disableFramesAbove_disableFrameBorrows d n _ hlt]
+
+/-- **Trusted unwind-through (universal).** Unwinding (`UnwindResume`) out of the tail-callee
+depends only on the memory, which the tail call changed only in the active body and in the
+teardown of the replaced tail-caller frame — and unwinding cannot observe that teardown: a
+caller that catches the unwind disables every frame above it (`disableFramesAbove`), the
+tail-caller's included. So it is *exactly* the unwind the tail-caller would have performed:
+it pops into the caller's caller with the original call's `returnUnwind` action. -/
 theorem tailCall_trusted_unwind_through (s : MachineState) (calleeBody : CapturedMir)
     (argVals : List Value) (f f' : StackFrame) (span span' : String)
     (cb cb' : Option CapturedMir) :
-    evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+    evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
         ⟨.unwindResume, span⟩ cb =
-      evalTerminator ⟨f', (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+      evalTerminator ⟨f', (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
         ⟨.unwindResume, span'⟩ cb' ∧
-    evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+    evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
         ⟨.unwindResume, span⟩ cb =
-      match unwindFromCallStack s.memory.callStack
-          { s.memory with activeCallee := some calleeBody } with
+      evalTerminator s ⟨.unwindResume, span'⟩ cb' ∧
+    evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
+        ⟨.unwindResume, span⟩ cb =
+      match unwindFromCallStack s.memory.callStack s.memory with
       | .running nextState => MirStepNode.step nextState
       | .halted out => MirStepNode.retOutcome out
-      | .faulted fk => MirStepNode.fail fk :=
-  ⟨rfl, rfl⟩
+      | .faulted fk => MirStepNode.fail fk := by
+  have key := unwindFromCallStack_teardown (length s.memory.callStack) (length s.frame.locals)
+    s.memory.callStack s.memory (some calleeBody) (Nat.le_refl _)
+  have h2 : evalTerminator
+      ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
+        ⟨.unwindResume, span⟩ cb =
+      evalTerminator s ⟨.unwindResume, span'⟩ cb' := by
+    simp only [evalTerminator, enterTailCalleeFrame, frameTeardownMem]
+    rw [key]
+  exact ⟨rfl, h2, h2⟩
 
-/-- **Trusted direct-call and `.unsupported` fail-closed paths (universal).** Complementing
-`tailCall_trusted_fail_closed_universal` (which covered non-direct `func`), a direct tail
-call (`extractCalleeDefPath? func = some defPath`) whose argument evaluation is `.ub` or
-`.unsupported` fails closed with `MirStepNode.fail .ub` or `MirStepNode.unsupported`; an
-indirect tail call whose callee operand evaluation is `.unsupported` fails closed with
-`MirStepNode.unsupported`; an indirect tail call through a valid function pointer whose
-argument evaluation is `.ub` or `.unsupported` fails closed; and a zero-sized
-`.aggregate 0 []` function-item callee resolves to its target just like `.unit`. -/
+/-- **Trusted direct-call, `.unsupported`, and teardown-guard fail-closed paths
+(universal).** Complementing `tailCall_trusted_fail_closed_universal` (which covered
+non-direct `func`), a direct tail call (`extractCalleeDefPath? func = some defPath`) whose
+argument evaluation is `.ub` or `.unsupported` fails closed with `MirStepNode.fail .ub` or
+`MirStepNode.unsupported`; an indirect tail call whose callee operand evaluation is
+`.unsupported` fails closed with `MirStepNode.unsupported`; an indirect tail call through a
+valid function pointer whose argument evaluation is `.ub` or `.unsupported` fails closed; a
+zero-sized `.aggregate 0 []` function-item callee resolves to its target just like `.unit`;
+and for *every* callee operand, once the target resolves and the arguments evaluate, a frame
+teardown that would deallocate a protected local of the tail-caller
+(`frameDeallocConflict`) is UB — before the callee is looked up. -/
 theorem tailCall_trusted_direct_and_unsupported_fail_closed
     (s : MachineState) (func : Operand) (argOps : List Operand) (span : String)
     (callerBody : CapturedMir) :
     (∀ defPath : DefPath, extractCalleeDefPath? func = some defPath →
       evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
-          callerBody.layouts s.memory.callerLocals = .ub →
+          callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) = .ub →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
     (∀ defPath : DefPath, extractCalleeDefPath? func = some defPath →
       evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
-          callerBody.layouts s.memory.callerLocals = .unsupported →
+          callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) =
+        .unsupported →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.unsupported) ∧
     (extractCalleeDefPath? func = none →
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .unsupported →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .unsupported →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.unsupported) ∧
     (∀ (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry),
       extractCalleeDefPath? func = none →
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.ptr p 8) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.ptr p 8) l →
       p.offsetBytes = 0 → lookupBorrow s.memory.borrows p.tag = none →
       lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy callerBody.localDecls callerBody.layouts func) = true →
       (evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
-            s.memory.callerLocals = .ub →
+            s.memory.callerLocals (callStack := s.memory.callStack) = .ub →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub) ∧
       (evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
-            s.memory.callerLocals = .unsupported →
+            s.memory.callerLocals (callStack := s.memory.callStack) = .unsupported →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
           MirStepNode.unsupported)) ∧
     (∀ (l : List LocalSlot) (dp : DefPath) (tys : List RigidTy) (argVals : List Value)
         (l' : List LocalSlot) (calleeBody : CapturedMir),
       extractCalleeDefPath? func = none →
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok (.aggregate 0 []) l →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.aggregate 0 []) l →
       extractFnItemTarget? (operandTy callerBody.localDecls callerBody.layouts func) =
         some (dp, tys) →
       evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
-          s.memory.callerLocals = .ok argVals l' →
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals l' →
       lookupCallee s.memory.callees callerBody.layouts dp tys s.memory.traitImpls =
         some calleeBody →
+      frameDeallocConflict s = false →
       evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
-        MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals)) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+        MirStepNode.step (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals)) ∧
+    (∀ (target : ResolvedCallTarget) (l : List LocalSlot) (argVals : List Value)
+        (l' : List LocalSlot),
+      resolveCallTarget s func (length argOps) callerBody.localDecls callerBody.layouts =
+        .ok target l →
+      evalOperands l argOps s.memory.borrows s.memory.globals callerBody.layouts
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals l' →
+      frameDeallocConflict s = true →
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
+        MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro defPath hfunc hargs
     simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hfunc, hargs]
   · intro defPath hfunc hargs
@@ -1183,48 +1387,87 @@ theorem tailCall_trusted_direct_and_unsupported_fail_closed
     refine ⟨?_, ?_⟩ <;> intro hargs <;>
       simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
         hnodirect, h, hoff, hbor, hfn, hcompat, Nat.beq_refl, Bool.and_self, hargs]
-  · intro l dp tys argVals l' calleeBody hnodirect h hfi hargs hfind
+  · intro l dp tys argVals l' calleeBody hnodirect h hfi hargs hfind hc
+    simp only [frameDeallocConflict] at hc
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
-      hnodirect, h, hfi, hargs, hfind, checkCalleeTargetCompatible_direct]
+      hnodirect, h, hfi, hargs, hc, hfind, checkCalleeTargetCompatible_direct, frameTeardownMem]
+  · intro target l argVals l' hres hargs hc
+    simp only [frameDeallocConflict] at hc
+    simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, hres, hargs, hc]
 
 /-- **Trusted return-through fail-closed paths (universal).** When the tail-callee executes
-`.return_`, an uninitialized, dead, or missing `_0` slot faults with `.ub`; and when `_0` is
-initialized to `retVal` under a non-diverging `caller :: rest`, a destination write
-(`writePlaceValue`) that faults with `.ub` or `.unsupported` fails closed on both in-table
-and external (`resumeExternalTailCall`) tail-call returns. -/
+`.return_`, an uninitialized, dead, or missing `_0` slot faults with `.ub`; with `_0`
+initialized to `retVal`, a teardown that would deallocate a protected local of the
+tail-callee's frame (`frameDeallocConflict`) faults with `.ub`; and under a non-diverging
+`caller :: rest`, a destination write (`writeReturnDestination` into the popped caller) that
+faults with `.ub` or `.unsupported` fails closed — on the in-table return (after the
+tail-callee frame's teardown) and on the return of *every* external tail-callee
+(`resumeExternalTailCall`, whose frame teardown happened when the tail call was issued). -/
 theorem tailCall_trusted_return_through_fail_closed
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value) (f : StackFrame)
     (retVal : Value) (span : String) (cb : Option CapturedMir) :
     ((get? f.locals 0 = some .uninit ∨ get? f.locals 0 = some .dead ∨ get? f.locals 0 = none) →
-      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+      evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
+          ⟨.return_, span⟩ cb = MirStepNode.fail .ub) ∧
+    (get? f.locals 0 = some (.init retVal) →
+      frameDeallocConflict
+          ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩ = true →
+      evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
           ⟨.return_, span⟩ cb = MirStepNode.fail .ub) ∧
     (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame),
       get? f.locals 0 = some (.init retVal) →
       s.memory.callStack = caller :: rest → caller.isDiverging = false →
-      writePlaceValue caller.frame.locals s.memory.borrows caller.destination retVal = .ub →
-      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
-          ⟨.return_, span⟩ cb = MirStepNode.fail .ub ∧
-      resumeExternalTailCall
-          (.returned retVal (enterTailCalleeFrame s.memory calleeBody argVals).memory) =
-        .faulted .ub) ∧
+      writeReturnDestination caller.frame.locals
+          (popCallerMem
+            (frameTeardownMem
+              ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩)
+            caller rest)
+          caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+        .ub →
+      evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
+          ⟨.return_, span⟩ cb = MirStepNode.fail .ub) ∧
     (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame),
       get? f.locals 0 = some (.init retVal) →
+      frameDeallocConflict
+          ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩ = false →
       s.memory.callStack = caller :: rest → caller.isDiverging = false →
-      writePlaceValue caller.frame.locals s.memory.borrows caller.destination retVal =
+      writeReturnDestination caller.frame.locals
+          (popCallerMem
+            (frameTeardownMem
+              ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩)
+            caller rest)
+          caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
         .unsupported →
-      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
-          ⟨.return_, span⟩ cb = MirStepNode.unsupported ∧
-      resumeExternalTailCall
-          (.returned retVal (enterTailCalleeFrame s.memory calleeBody argVals).memory) =
-        .faulted .unsupported) := by
-  refine ⟨?_, ?_, ?_⟩
+      evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
+          ⟨.return_, span⟩ cb = MirStepNode.unsupported) ∧
+    (∀ (memAfter : Memory) (caller : SavedCallerFrame) (rest : List SavedCallerFrame),
+      memAfter.callStack = caller :: rest → caller.isDiverging = false →
+      (writeReturnDestination caller.frame.locals (popCallerMem memAfter caller rest)
+          caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+          .ub →
+        resumeExternalTailCall (.returned retVal memAfter) = .faulted .ub) ∧
+      (writeReturnDestination caller.frame.locals (popCallerMem memAfter caller rest)
+          caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+          .unsupported →
+        resumeExternalTailCall (.returned retVal memAfter) = .faulted .unsupported)) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · rintro (h0 | h0 | h0) <;> simp only [evalTerminator, h0]
+  · intro h0 hc
+    rw [evalTerminator_return_eq _ retVal span cb h0, hc]
   · intro caller rest h0 hcs hdiv hw
-    refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resumeExternalTailCall, h0, enterTailCalleeFrame, hcs, hdiv, hw]
-  · intro caller rest h0 hcs hdiv hw
-    refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resumeExternalTailCall, h0, enterTailCalleeFrame, hcs, hdiv, hw]
+    have hcs' : (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack =
+        caller :: rest := hcs
+    rw [evalTerminator_return_eq _ retVal span cb h0]
+    split <;> simp only [hcs', hdiv, hw]
+  · intro caller rest h0 hc hcs hdiv hw
+    have hcs' : (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack =
+        caller :: rest := hcs
+    rw [evalTerminator_return_eq _ retVal span cb h0, hc]
+    simp only [hcs', hdiv, hw]
+  · intro memAfter caller rest hcs hdiv
+    simp only [popCallerMem]
+    refine ⟨fun hw => ?_, fun hw => ?_⟩ <;>
+      simp only [resumeExternalTailCall, hcs, hdiv, hw]
 
 /-- A body whose block ends in a terminator rejected by `MiniRustSpec`'s fragment check is
 not in the `MiniRustSpec` fragment. -/
@@ -1365,12 +1608,12 @@ private theorem shape_last {B P M : Type} {rootCont : LeanMiri.ReturnContinuatio
 /-- **LeanMiri tail-call lockstep (universal).** If the Trusted call stack and the LeanMiri
 frames are shape-related and the active frame has a caller continuation (`goto`: a nested
 frame, or a modular root with an external caller), then after the Trusted tail call
-(`enterTailCalleeFrame`) and the transcribed `Call.evalTailCallTerminator` (matching
-arity), the states are again shape-related with the *same* root continuation: the depth
-is unchanged in both (no frame is pushed, the frame-index check passes), the machine is
-untouched, and the new active LeanMiri frame runs the callee from `bb0[0]` with the
-inherited continuation of the tail-caller — so the callee returns where the tail-caller
-would have returned. -/
+(frame teardown, then `enterTailCalleeFrame`) and the transcribed
+`Call.evalTailCallTerminator` (matching arity), the states are again shape-related with the
+*same* root continuation: the depth is unchanged in both (no frame is pushed, the
+frame-index check passes), the machine is untouched, and the new active LeanMiri frame runs
+the callee from `bb0[0]` with the inherited continuation of the tail-caller — so the callee
+returns where the tail-caller would have returned. -/
 theorem tailCall_leanMiri_shape_lockstep {B P M : Type}
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value)
     (rootCont : LeanMiri.ReturnContinuation UnwindAction)
@@ -1378,8 +1621,8 @@ theorem tailCall_leanMiri_shape_lockstep {B P M : Type}
     (hrel : StackShapeRel rootCont s.memory.callStack m)
     (hgoto : ∃ ret u, activeCont rootCont s.memory.callStack = .goto ret u) :
     ∃ m', LeanMiri.evalTailCallTerminator callee n n m = .ok m' ∧
-      StackShapeRel rootCont (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack
-        m' ∧
+      StackShapeRel rootCont
+        (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack m' ∧
       m'.frames.length = m.frames.length ∧ m'.machine = m.machine ∧
       (∃ f, m'.frames.getLast? = some f ∧ f.body = callee ∧ f.location = .mir ⟨0, 0⟩ ∧
         f.returnContinuation = activeCont rootCont s.memory.callStack) := by
@@ -1404,7 +1647,8 @@ theorem tailCall_leanMiri_shape_lockstep {B P M : Type}
 
 /-- **LeanMiri whole-program-root divergence (universal).** At a Trusted root frame that is
 shape-related to a LeanMiri `stop` frame (the whole-program root), Trusted's tail call
-steps into the callee, whereas the transcribed `Call.initFnTailCall` raises
+(when the frame teardown's protector guard passes) tears the root frame down and steps into
+the callee, whereas the transcribed `Call.initFnTailCall` raises
 `invalidProgram "cannot tailcall as root of stack"` (rustc's `bug!("can't tailcall as
 root")`) — a non-UB rejection; the modular-root relation (`goto`) is covered by
 `tailCall_leanMiri_shape_lockstep`. -/
@@ -1414,19 +1658,21 @@ theorem tailCall_leanMiri_root_stop_diverges {B P M : Type}
     (locals' : List LocalSlot)
     (hfunc : extractCalleeDefPath? func = some defPath)
     (hargs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
-      callerBody.layouts s.memory.callerLocals = .ok argVals locals')
+      callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok argVals locals')
     (hfind : lookupCallee s.memory.callees callerBody.layouts defPath
       (extractCalleeTypeArgs func) s.memory.traitImpls = some calleeBody)
+    (hprot : frameDeallocConflict s = false)
     (hroot : s.memory.callStack = []) (c : Bool)
     (m : LeanMiri.StepState B P UnwindAction M) (callee : B) (k n : Nat)
     (hrel : StackShapeRel (.stop c) s.memory.callStack m) :
     evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) =
-        MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals) ∧
+        MirStepNode.step (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals) ∧
       LeanMiri.evalTailCallTerminator callee k n m =
         .error (.invalidProgram "cannot tailcall as root of stack") ∧
       (LeanMiri.StepError.invalidProgram "cannot tailcall as root of stack").isUB = false := by
   refine ⟨(tailCall_trusted_direct_enters_without_push s func argOps span callerBody calleeBody
-    defPath argVals locals' hfunc hargs hfind).1, ?_, rfl⟩
+    defPath argVals locals' hfunc hargs hfind).2.1 hprot, ?_, rfl⟩
   obtain ⟨init, last, hfr, hlast, _⟩ := shape_last hrel
   rw [hroot] at hlast
   simp only [activeCont] at hlast
@@ -1510,7 +1756,7 @@ theorem tailCall_leanMiri_calling_conv_ub_corresponds {B P U M : Type}
     (callerBody : CapturedMir) (hnodirect : extractCalleeDefPath? func = none)
     (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry)
     (h : evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-        s.memory.callerLocals = .ok (.ptr p 8) l)
+        s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.ptr p 8) l)
     (hoff : p.offsetBytes = 0) (hbor : lookupBorrow s.memory.borrows p.tag = none)
     (hfn : lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry)
     (hcompat : fnEntryCompatibleWithCallSite fnEntry (length argOps)
@@ -1562,14 +1808,14 @@ theorem tailCall_leanMiri_checks_classification {B P U M : Type}
 
 /-- **LeanMiri non-unwinding callee (universal; documented divergence).** When the
 call-site or the callee ABI cannot unwind, Miri forces the inherited continuation's unwind
-action to `Unreachable` (`ur`), whereas Trusted's tail call keeps the saved caller's
-`returnUnwind`. The stack shapes stay related *exactly* when the inherited action already
-was `ur` (e.g. rustc emitted `UnwindAction::Unreachable` at the original call); otherwise
-an unwind (`UnwindResume`) out of the non-unwinding callee under a nested caller
-`s.memory.callStack = caller :: rest` faults with `MirStepNode.fail .ub` in Trusted when
-`u = .unreachable`, but steps to `cleanupBb` (`≠ MirStepNode.fail .ub`) when
-`u = .cleanup cleanupBb` and halts with `.abort` (`≠ MirStepNode.fail .ub`) when
-`u = .terminate`. -/
+action to `Unreachable` (`ur`), whereas Trusted's tail call (frame teardown, then
+`enterTailCalleeFrame`) keeps the saved caller's `returnUnwind`. The stack shapes stay
+related *exactly* when the inherited action already was `ur` (e.g. rustc emitted
+`UnwindAction::Unreachable` at the original call); otherwise an unwind (`UnwindResume`) out
+of the non-unwinding callee under a nested caller `s.memory.callStack = caller :: rest`
+faults with `MirStepNode.fail .ub` in Trusted when `u = .unreachable`, but steps to
+`cleanupBb` (`≠ MirStepNode.fail .ub`) when `u = .cleanup cleanupBb` and halts with `.abort`
+(`≠ MirStepNode.fail .ub`) when `u = .terminate`. -/
 theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value)
     (rootCont : LeanMiri.ReturnContinuation UnwindAction)
@@ -1578,21 +1824,22 @@ theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
     (hact : activeCont rootCont s.memory.callStack = .goto ret u) :
     ∃ m', LeanMiri.evalTailCallTerminator callee n n m { nounwindAs := some ur } = .ok m' ∧
       (∃ f, m'.frames.getLast? = some f ∧ f.returnContinuation = .goto ret ur) ∧
-      (StackShapeRel rootCont (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack
-          m' ↔ u = ur) ∧
+      (StackShapeRel rootCont
+          (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack m' ↔
+        u = ur) ∧
       (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame) (f : StackFrame)
           (span : String) (cb : Option CapturedMir),
         s.memory.callStack = caller :: rest →
         (u = .unreachable →
-          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.unwindResume, span⟩ cb = MirStepNode.fail .ub) ∧
         (∀ cleanupBb : BasicBlockIdx, u = .cleanup cleanupBb →
-          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.unwindResume, span⟩ cb ≠ MirStepNode.fail .ub) ∧
         (u = .terminate →
-          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.unwindResume, span⟩ cb = MirStepNode.retOutcome .abort ∧
-          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+          evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
             ⟨.unwindResume, span⟩ cb ≠ MirStepNode.fail .ub)) := by
   obtain ⟨init, last, hfr, hlast, hmap⟩ := shape_last hrel
   rw [hact] at hlast hmap
@@ -1623,16 +1870,18 @@ theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
       injection hact
     refine ⟨?_, ?_, ?_⟩
     · intro hur
-      simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hur]
+      simp [evalTerminator, enterTailCalleeFrame, frameTeardownMem, hcs, unwindFromCallStack,
+        hu, hur]
     · intro cleanupBb hcl hbad
-      simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hcl,
-        MirStepNode.step, MirStepNode.fail] at hbad
+      simp [evalTerminator, enterTailCalleeFrame, frameTeardownMem, hcs, unwindFromCallStack,
+        hu, hcl, MirStepNode.step, MirStepNode.fail] at hbad
     · intro hterm
       refine ⟨?_, ?_⟩
-      · simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hterm]
+      · simp [evalTerminator, enterTailCalleeFrame, frameTeardownMem, hcs, unwindFromCallStack,
+          hu, hterm]
       · intro hbad
-        simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hterm,
-          MirStepNode.retOutcome, MirStepNode.fail] at hbad
+        simp [evalTerminator, enterTailCalleeFrame, frameTeardownMem, hcs, unwindFromCallStack,
+          hu, hterm, MirStepNode.retOutcome, MirStepNode.fail] at hbad
 
 /-- How `evalTerminator` reports the `MirExecState` reached by `unwindFromCallStack`. -/
 def execNode : MirExecState → MirStepNode
@@ -1640,12 +1889,14 @@ def execNode : MirExecState → MirStepNode
   | .halted out => MirStepNode.retOutcome out
   | .faulted fk => MirStepNode.fail fk
 
-/-- The memory in which Trusted resumes (or keeps unwinding from) the saved `caller` once
-`unwindFromCallStack` has popped it. -/
-def unwindCallerMem (mem : Memory) (caller : SavedCallerFrame) (rest : List SavedCallerFrame) :
-    Memory :=
-  { mem with callStack := rest, activeCallee := some caller.callerBody,
-             activeProtectors := restoreCallerProtectors caller }
+/-- An external callee's panic resumes exactly like an in-table `UnwindResume` in the memory it
+returns. -/
+private theorem execNode_resumeExternalTailCall_panicked (mem : Memory) (f : StackFrame)
+    (span : String) (cb : Option CapturedMir) :
+    execNode (resumeExternalTailCall (.panicked mem)) =
+      evalTerminator ⟨f, mem⟩ ⟨.unwindResume, span⟩ cb := by
+  simp only [resumeExternalTailCall, evalTerminator]
+  cases unwindFromCallStack mem.callStack mem <;> rfl
 
 /-- **Unwinding out of a tail-callee (universal; lockstep, nounwind divergence, and
 modular-root topmost-frame divergence).**
@@ -1653,9 +1904,12 @@ modular-root topmost-frame divergence).**
   `caller.returnUnwind`), Miri's `UnwindResume` out of the tail-callee (`returnFromCurrentFrame
   … true` → `unwindToBlock`, transcribed as `LeanMiri.unwindResume`) resolves the callee frame's
   continuation, while Trusted (`unwindFromCallStack` — for both in-table `UnwindResume` and
-  external `resumeExternalTailCall (.panicked …)`) resolves the saved caller's `returnUnwind`:
+  external `resumeExternalTailCall (.panicked …)`) resolves the saved caller's `returnUnwind`,
+  exactly as the tail-caller's own unwind would (the tail call's frame teardown is subsumed by
+  the catching caller's `disableFramesAbove`):
   - unwinding callee: both resolve the *same* action (`unreachable` is UB, `terminate` aborts,
-    `cleanup bb` resumes the caller at `bb`, `continue_` keeps unwinding);
+    `cleanup bb` resumes the caller at `bb` with every frame above it disabled, `continue_`
+    keeps unwinding);
   - non-unwinding callee (`nounwindAs := some .unreachable`): Miri is UB for **every**
     inherited action, Trusted only for `unreachable` (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
 * The modular-root case (`callStack = []`, a one-frame LeanMiri stack) is
@@ -1674,19 +1928,21 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
         .ok m' ∧
       LeanMiri.unwindResume m' =
         .error (.undefinedBehavior "unwinding past a frame that does not allow unwinding")) ∧
-    evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+    evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
         ⟨.unwindResume, span⟩ cb =
       (match caller.returnUnwind with
        | .unreachable => MirStepNode.fail .ub
        | .terminate => MirStepNode.retOutcome .abort
        | .cleanup bb =>
-         MirStepNode.step { frame := { caller.frame with blockIdx := bb, stmtIdx := 0 },
-                            memory := unwindCallerMem s.memory caller rest }
+         MirStepNode.step
+           { frame := { caller.frame with blockIdx := bb, stmtIdx := 0 },
+             memory := { popCallerMem s.memory caller rest with
+                         borrows := disableFramesAbove s.memory.borrows (length rest) } }
        | .continue_ =>
-         execNode (unwindFromCallStack rest (unwindCallerMem s.memory caller rest))) ∧
+         execNode (unwindFromCallStack rest (popCallerMem s.memory caller rest))) ∧
     execNode (resumeExternalTailCall
-        (.panicked (enterTailCalleeFrame s.memory calleeBody argVals).memory)) =
-      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+        (.panicked (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory)) =
+      evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
         ⟨.unwindResume, span⟩ cb := by
   obtain ⟨init, last, hfr, hlast, hmap⟩ := shape_last hrel
   have hact : activeCont rootCont s.memory.callStack =
@@ -1713,20 +1969,18 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
         LeanMiri.unwindToBlock ur := by
     intro ur
     simp [LeanMiri.unwindResume, hlen]
-  refine ⟨⟨_, ?_, hres caller.returnUnwind⟩, ⟨_, ?_, hres .unreachable⟩, ?_, ?_⟩
+  refine ⟨⟨_, ?_, hres caller.returnUnwind⟩, ⟨_, ?_, hres .unreachable⟩, ?_,
+    execNode_resumeExternalTailCall_panicked _ f span cb⟩
   · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr,
       List.getLast?_concat, hlast, hpass, Nat.lt_irrefl, ite_false, List.dropLast_concat]
     simp
   · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr,
       List.getLast?_concat, hlast, hpass, Nat.lt_irrefl, ite_false, List.dropLast_concat]
     simp
-  · cases hu : caller.returnUnwind <;>
-      simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, execNode,
-        unwindCallerMem] <;>
+  · rw [(tailCall_trusted_unwind_through s calleeBody argVals f f span span cb cb).2.1]
+    cases hu : caller.returnUnwind <;>
+      simp [evalTerminator, hcs, unwindFromCallStack, hu, execNode, popCallerMem] <;>
       rfl
-  · simp [resumeExternalTailCall, evalTerminator, enterTailCalleeFrame, hcs]
-    cases unwindFromCallStack rest (unwindCallerMem s.memory caller rest) <;>
-      cases caller.returnUnwind <;> rfl
 
 /-- **Modular-root unwind (universal; documented modeling divergence).** At a modular root
 (`s.memory.callStack = []`, LeanMiri root continuation `goto ret u`, hence a one-frame
@@ -1748,9 +2002,10 @@ theorem tailCall_leanMiri_modular_root_unwind {B P M : Type}
         .ok m' ∧
       LeanMiri.unwindResume m' =
         .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
-    evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+    evalTerminator ⟨f, (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory⟩
         ⟨.unwindResume, span⟩ cb = MirStepNode.retOutcome .panic ∧
-    resumeExternalTailCall (.panicked (enterTailCalleeFrame s.memory calleeBody argVals).memory) =
+    resumeExternalTailCall
+        (.panicked (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory) =
       .halted .panic := by
   have hpass : LeanMiri.passArgsError (fun _ => true) n 0 n = none :=
     passArgsError_all_ok _ n n 0 (by omega) (fun _ _ _ => rfl)
@@ -1774,8 +2029,9 @@ theorem tailCall_leanMiri_modular_root_unwind {B P M : Type}
     intro ur
     simp [LeanMiri.unwindResume]
   refine ⟨⟨_, ?_, hres0 u⟩, ⟨_, ?_, hres0 .unreachable⟩,
-    by simp [evalTerminator, enterTailCalleeFrame, hnil, unwindFromCallStack],
-    by simp [resumeExternalTailCall, enterTailCalleeFrame, hnil, unwindFromCallStack]⟩
+    by simp [evalTerminator, enterTailCalleeFrame, frameTeardownMem, hnil, unwindFromCallStack],
+    by simp [resumeExternalTailCall, enterTailCalleeFrame, frameTeardownMem, hnil,
+      unwindFromCallStack]⟩
   · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
       List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
     simp
@@ -1783,31 +2039,100 @@ theorem tailCall_leanMiri_modular_root_unwind {B P M : Type}
       List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
     simp
 
-/-- **Tail-caller cleanup (universal).** Whenever the transcribed tail call succeeds, the
-popped tail-caller frame has a `goto` continuation (a `stop` root is rejected), so Miri's
-`h.cleanup choice false frame` (`CallMachine.cleanup`) deallocates every live memory-backed
-local of the tail-caller before the callee runs. Trusted's `enterTailCalleeFrame` instead
-replaces the frame's locals by the callee's (`initLocals`) while keeping the whole borrow
-table, so every borrow entry into the replaced frame survives with its un-namespaced
-`targetLocal` — a later dereference reads the *callee's* same-index local instead of
-faulting (`tailCall_witness_dangling_caller_local_divergence`). -/
+/-- `disableFrameBorrows` disables and marks dead exactly the borrows of the torn-down frame's
+locals and keeps every other borrow. -/
+private theorem disableFrameBorrows_eq_map (d n : Nat) : ∀ bs : List BorrowEntry,
+    disableFrameBorrows bs d n =
+      bs.map (fun e =>
+        if e.targetFrameDepth = d ∧ e.targetLocal < n then
+          { e with perm := .disabled, allocDead := true }
+        else e)
+  | [] => rfl
+  | e :: rest => by
+    have ih := disableFrameBorrows_eq_map d n rest
+    by_cases hc : e.targetFrameDepth = d ∧ e.targetLocal < n
+    · have h1 : Nat.beq e.targetFrameDepth d = true := by
+        rw [hc.1]
+        exact Nat.beq_refl d
+      have hb : Bool.and (Nat.beq e.targetFrameDepth d) (Nat.blt e.targetLocal n) = true := by
+        rw [h1, Nat.blt_eq.mpr hc.2]
+        rfl
+      simp only [disableFrameBorrows, hb, ih, List.map_cons, ite_eq_left hc]
+    · have hb : Bool.and (Nat.beq e.targetFrameDepth d) (Nat.blt e.targetLocal n) = false := by
+        cases h : Bool.and (Nat.beq e.targetFrameDepth d) (Nat.blt e.targetLocal n) with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true] at h
+          exact absurd ⟨Nat.eq_of_beq_eq_true h.1, Nat.blt_eq.mp h.2⟩ hc
+      simp only [disableFrameBorrows, hb, ih, List.map_cons, ite_eq_right hc]
+
+/-- **Tail-caller cleanup (universal; resolved correspondence).** Whenever the transcribed
+tail call succeeds, the popped tail-caller frame has a `goto` continuation (a `stop` root is
+rejected), so Miri's `h.cleanup choice false frame` (`CallMachine.cleanup`) deallocates every
+live memory-backed local of the tail-caller before the callee runs. Trusted's tail call tears
+the same frame down before `enterTailCalleeFrame` replaces its locals by the callee's
+(`initLocals`): the borrow table becomes `disableFrameBorrows` of the old one, which disables
+and marks dead (`allocDead`) *exactly* the borrows of the popped frame's locals (depth
+`length s.memory.callStack`, local index `< length s.frame.locals`) and keeps every other
+borrow — so after the tail call every borrow into the popped frame is disabled and dead, a
+pointer into it is dangling, and dereferencing it is UB
+(`tailCall_witness_dangling_caller_local_simulation`), like Miri's use-after-free. -/
 theorem tailCall_leanMiri_cleanup_frees_caller_locals {B P U M : Type}
     (m m' : LeanMiri.StepState B P U M) (callee : B) (k n : Nat) (ck : LeanMiri.CallChecks U)
     (h : LeanMiri.evalTailCallTerminator callee k n m ck = .ok m')
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value) :
     (∃ f, m.frames.getLast? = some f ∧
       LeanMiri.cleanupDeallocatesLocals f.returnContinuation = true) ∧
-    (enterTailCalleeFrame s.memory calleeBody argVals).memory.borrows = s.memory.borrows ∧
-    (enterTailCalleeFrame s.memory calleeBody argVals).frame.locals =
+    (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.borrows =
+      s.memory.borrows.map (fun e =>
+        if e.targetFrameDepth = length s.memory.callStack ∧ e.targetLocal < length s.frame.locals
+        then { e with perm := .disabled, allocDead := true }
+        else e) ∧
+    (∀ e ∈ (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.borrows,
+      e.targetFrameDepth = length s.memory.callStack → e.targetLocal < length s.frame.locals →
+      e.perm = .disabled ∧ e.allocDead = true) ∧
+    (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).frame.locals =
       initLocals calleeBody argVals := by
-  refine ⟨?_, rfl, rfl⟩
-  unfold LeanMiri.evalTailCallTerminator LeanMiri.initFnTailCall at h
-  cases hl : m.frames.getLast? with
-  | none => simp [hl] at h
-  | some f =>
-    cases hc : f.returnContinuation with
-    | stop c => simp [hl, hc] at h
-    | goto ret u => exact ⟨f, rfl, by simp [LeanMiri.cleanupDeallocatesLocals, hc]⟩
+  have hmap := disableFrameBorrows_eq_map (length s.memory.callStack) (length s.frame.locals)
+    s.memory.borrows
+  refine ⟨?_, hmap, ?_, rfl⟩
+  · unfold LeanMiri.evalTailCallTerminator LeanMiri.initFnTailCall at h
+    cases hl : m.frames.getLast? with
+    | none => simp [hl] at h
+    | some f =>
+      cases hc : f.returnContinuation with
+      | stop c => simp [hl, hc] at h
+      | goto ret u => exact ⟨f, rfl, by simp [LeanMiri.cleanupDeallocatesLocals, hc]⟩
+  · intro e he hd hl
+    change e ∈ disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+      (length s.frame.locals) at he
+    rw [hmap] at he
+    obtain ⟨e0, _, rfl⟩ := List.mem_map.mp he
+    by_cases hc : e0.targetFrameDepth = length s.memory.callStack ∧
+        e0.targetLocal < length s.frame.locals
+    · rw [ite_eq_left hc]
+      exact ⟨rfl, rfl⟩
+    · rw [ite_eq_right hc] at hd hl
+      exact absurd ⟨hd, hl⟩ hc
+
+/-- Typed statement pin of the resolved cleanup correspondence. -/
+example : ∀ {B P U M : Type} (m m' : LeanMiri.StepState B P U M) (callee : B) (k n : Nat)
+    (ck : LeanMiri.CallChecks U),
+    LeanMiri.evalTailCallTerminator callee k n m ck = .ok m' →
+    ∀ (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value),
+    (∃ f, m.frames.getLast? = some f ∧
+      LeanMiri.cleanupDeallocatesLocals f.returnContinuation = true) ∧
+    (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.borrows =
+      s.memory.borrows.map (fun e =>
+        if e.targetFrameDepth = length s.memory.callStack ∧ e.targetLocal < length s.frame.locals
+        then { e with perm := .disabled, allocDead := true }
+        else e) ∧
+    (∀ e ∈ (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.borrows,
+      e.targetFrameDepth = length s.memory.callStack → e.targetLocal < length s.frame.locals →
+      e.perm = .disabled ∧ e.allocDead = true) ∧
+    (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).frame.locals =
+      initLocals calleeBody argVals :=
+  @tailCall_leanMiri_cleanup_frees_caller_locals
 
 /-- **ABI mismatch correspondence (universal).** For an indirect tail call through a
 registered function pointer whose reified calling convention `sigAbi` differs from the
@@ -1820,7 +2145,7 @@ theorem tailCall_abi_mismatch_corresponds {B P M : Type}
     (callerBody : CapturedMir) (hnodirect : extractCalleeDefPath? func = none)
     (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry)
     (h : evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
-      s.memory.callerLocals = .ok (.ptr p 8) l)
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok (.ptr p 8) l)
     (hoff : p.offsetBytes = 0) (hbor : lookupBorrow s.memory.borrows p.tag = none)
     (hfn : lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry)
     (callerIns : List RigidTy) (callerOut : RigidTy) (callerSafety : Safety)
@@ -1848,8 +2173,9 @@ theorem tailCall_abi_mismatch_corresponds {B P M : Type}
 /-- **LeanMiri call contrast (universal).** A returning Trusted `call` (`pushCalleeFrame`)
 and the transcribed call push both grow the stack by one frame and stay shape-related —
 the pushed continuation is the saved caller's `goto targetBb` — whereas a tail call
-(`enterTailCalleeFrame` / `LeanMiri.evalTailCallTerminator`) preserves the depth, so the
-returning call is strictly one frame deeper than the tail call on both sides. -/
+(frame teardown and `enterTailCalleeFrame` / `LeanMiri.evalTailCallTerminator`) preserves the
+depth, so the returning call is strictly one frame deeper than the tail call on both
+sides. -/
 theorem tailCall_leanMiri_call_pushes {B P M : Type}
     (s : MachineState) (callerBody calleeBody : CapturedMir) (locals' : List LocalSlot)
     (destination : Place) (targetBb : BasicBlockIdx) (argVals : List Value)
@@ -1864,12 +2190,14 @@ theorem tailCall_leanMiri_call_pushes {B P M : Type}
         m.frames.length + 1 ∧
       (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind
           ).memory.callStack.length =
-        (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack.length + 1 ∧
+        (enterTailCalleeFrame (frameTeardownMem s) calleeBody argVals).memory.callStack.length +
+          1 ∧
       (∀ (m' : LeanMiri.StepState B P UnwindAction M),
         LeanMiri.evalTailCallTerminator callee n n m = .ok m' →
         (LeanMiri.evalCallPush callee dest (some targetBb) unwind m).frames.length =
           m'.frames.length + 1) := by
-  refine ⟨?_, by simp [LeanMiri.evalCallPush], by simp [pushCalleeFrame, enterTailCalleeFrame], ?_⟩
+  refine ⟨?_, by simp [LeanMiri.evalCallPush],
+    by simp [pushCalleeFrame, enterTailCalleeFrame, frameTeardownMem], ?_⟩
   · unfold StackShapeRel at hrel ⊢
     simp only [LeanMiri.evalCallPush, pushCalleeFrame, List.map_append, hrel, List.map_cons,
       List.reverse_cons, contOfCaller, List.map_nil]
@@ -2232,27 +2560,123 @@ theorem tailCall_leanMiri_witness_unwind :
       .halted .panic :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- **Documented divergence (dangling tail-caller local; Trusted soundness gap).** `fdangle`
-passes `p = &raw mut x` (a pointer into its own frame) to the tail-callee `gread`, which
-reads `*p`. Trusted's tail call (`enterTailCalleeFrame`) discards `fdangle`'s locals but keeps
-`p`'s borrow entry, whose un-namespaced `targetLocal = 2` now names `gread`'s own `_2 = y`:
-the run halts *normally* with `137` (neither `x = 42` nor UB). Miri's tail call cleans up the
-popped `goto` frame (`tailCall_leanMiri_cleanup_frees_caller_locals`), deallocating its
-memory-backed locals — `x` included — so `*p` is a use-after-free (UB). Tracked as
-`DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL`. -/
-theorem tailCall_witness_dangling_caller_local_divergence :
+/-- The borrow table of a running state. -/
+def borrowsOf? : Option MirExecState → Option (List BorrowEntry)
+  | some (.running s) => some s.memory.borrows
+  | _ => none
+
+/-- The active body (`none` for the root body) and program counter of a running state. -/
+def activeAt? : Option MirExecState → Option (Option DefPath × Nat × Nat)
+  | some (.running s) =>
+    some (s.memory.activeCallee.map (·.defPath), s.frame.blockIdx, s.frame.stmtIdx)
+  | _ => none
+
+/-- **Resolved correspondence (dangling tail-caller local; formerly the Trusted soundness gap
+`DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL`).** `fdangle` passes `p = &raw mut x` (borrow tag `1`
+of its own local `_2 = x`) to the tail-callee `gread`, which reads `*p`. After `fdangle`'s
+four statements `p`'s borrow is live (`unique`). Trusted's tail call now tears `fdangle`'s
+frame down before entering `gread` (`tailCall_leanMiri_cleanup_frees_caller_locals`): after
+it the stack is still empty (depth `0`), `gread` runs at `bb0[0]`, and `p`'s borrow is
+`disabled` and `allocDead` — so `gread`'s first statement, the `*p` read, faults with UB
+instead of silently reading `gread`'s own `_2 = 137`. Miri's tail call cleans up the popped
+`goto` frame, deallocating its memory-backed locals — `x` included — so `*p` is a
+use-after-free (UB) there too: both references reject the program at the same read. -/
+theorem tailCall_witness_dangling_caller_local_simulation :
+    borrowsOf? (execN fDangleBody 4
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
+      some [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }] ∧
     depth? (execN fDangleBody 5
         (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) = some 0 ∧
-      haltedVal? (execN fDangleBody 7
+    activeAt? (execN fDangleBody 5
         (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
-        some (.scalar ⟨137, 4⟩) ∧
-      LeanMiri.evalTailCallTerminator "w::gread" 2 2
-          (⟨[lmFrame "w::fdangle" (.goto (some 3) .continue_)], ()⟩ :
-            LeanMiri.StepState String Nat UnwindAction Unit) =
-        .ok ⟨[lmFrame "w::gread" (.goto (some 3) .continue_)], ()⟩ ∧
-      LeanMiri.cleanupDeallocatesLocals
-        (lmFrame "w::fdangle" (.goto (some 3) .continue_)).returnContinuation = true :=
-  ⟨rfl, rfl, rfl, rfl⟩
+      some (some "w::gread", 0, 0) ∧
+    borrowsOf? (execN fDangleBody 5
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
+      some [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .disabled,
+              allocDead := true }] ∧
+    execN fDangleBody 6 (.running (initMachineStateWithCallees fDangleBody [] [gReadBody])) =
+      some (.faulted .ub) ∧
+    LeanMiri.evalTailCallTerminator "w::gread" 2 2
+        (⟨[lmFrame "w::fdangle" (.goto (some 3) .continue_)], ()⟩ :
+          LeanMiri.StepState String Nat UnwindAction Unit) =
+      .ok ⟨[lmFrame "w::gread" (.goto (some 3) .continue_)], ()⟩ ∧
+    LeanMiri.cleanupDeallocatesLocals
+      (lmFrame "w::fdangle" (.goto (some 3) .continue_)).returnContinuation = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Typed statement pin of the dangling tail-caller-local resolution. -/
+example :
+    borrowsOf? (execN fDangleBody 4
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
+      some [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }] ∧
+    depth? (execN fDangleBody 5
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) = some 0 ∧
+    activeAt? (execN fDangleBody 5
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
+      some (some "w::gread", 0, 0) ∧
+    borrowsOf? (execN fDangleBody 5
+        (.running (initMachineStateWithCallees fDangleBody [] [gReadBody]))) =
+      some [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .disabled,
+              allocDead := true }] ∧
+    execN fDangleBody 6 (.running (initMachineStateWithCallees fDangleBody [] [gReadBody])) =
+      some (.faulted .ub) ∧
+    LeanMiri.evalTailCallTerminator "w::gread" 2 2
+        (⟨[lmFrame "w::fdangle" (.goto (some 3) .continue_)], ()⟩ :
+          LeanMiri.StepState String Nat UnwindAction Unit) =
+      .ok ⟨[lmFrame "w::gread" (.goto (some 3) .continue_)], ()⟩ ∧
+    LeanMiri.cleanupDeallocatesLocals
+      (lmFrame "w::fdangle" (.goto (some 3) .continue_)).returnContinuation = true :=
+  tailCall_witness_dangling_caller_local_simulation
+
+/-- `fn fcr(p: *mut u32) -> u32 { become gread(copy p, 137) }`: a modular root with two
+locals that tail-calls the three-local `gread`. -/
+def fCrBody : CapturedMir :=
+  mkBody "w::fcr" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.tailCall (fnItem "w::gread") [.copy (lc 1), cU32 137])]
+
+/-- `fn frd(p: *mut u32) -> u32 { _0 = copy (*p); return }`: the same read without a tail
+call. -/
+def fRdBody : CapturedMir :=
+  mkBody "w::frd" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [st (.assign (lc 0) (.use (.copy ⟨1, [.deref]⟩)))] .return_]
+
+/-- The modular root's external caller owns `*p = 42`: Trusted addresses it as the
+caller-owned referent slot `2` of depth `0` (`≥` the root's two locals), borrowed by tag `1`. -/
+def crMem : Memory :=
+  { callees := [gReadBody], callerLocals := [.uninit, .uninit, .init (.scalar ⟨42, 4⟩)],
+    borrows := [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }],
+    nextTag := 2 }
+
+/-- **Documented divergence (root tail call shadows a caller-owned referent; Trusted
+soundness gap).** At a modular root, Trusted addresses the external caller's memory as
+depth-`0` slots *above* the root's own locals (`foreignFrameSlot?` falls back to
+`callerLocals` only past `length` of the active root frame's locals). A root tail call
+replaces the root frame by a callee with *more* locals, whose own slots then shadow the
+caller-owned referents: `frd(p)` reads the caller's `*p = 42`, but `fcr(p)`, which tail-calls
+`gread(p, 137)`, returns `137` — `gread`'s `*p` reads its own `_2 = y`. The tail call's
+teardown (`disableFrameBorrows … 0 2`) rightly keeps `p`'s caller-owned borrow (slot `2 ≥ 2`),
+but the borrow's `(targetFrameDepth, targetLocal) = (0, 2)` names `gread`'s `_2` once `gread`
+is the depth-`0` frame. In Miri the tail call pops only `fcr`'s frame and the caller's
+allocation stays live, so `*p` reads `42`. -/
+theorem tailCall_witness_root_caller_referent_divergence :
+    haltedVal? (execN fRdBody 2
+        (.running (Trusted.VerificationResult.initMachineStateWithMemory fRdBody
+          [.ptr ⟨1, 0⟩ 8] crMem))) = some (.scalar ⟨42, 4⟩) ∧
+    activeAt? (execN fCrBody 1
+        (.running (Trusted.VerificationResult.initMachineStateWithMemory fCrBody
+          [.ptr ⟨1, 0⟩ 8] crMem))) = some (some "w::gread", 0, 0) ∧
+    borrowsOf? (execN fCrBody 1
+        (.running (Trusted.VerificationResult.initMachineStateWithMemory fCrBody
+          [.ptr ⟨1, 0⟩ 8] crMem))) =
+      some [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }] ∧
+    haltedVal? (execN fCrBody 3
+        (.running (Trusted.VerificationResult.initMachineStateWithMemory fCrBody
+          [.ptr ⟨1, 0⟩ 8] crMem))) = some (.scalar ⟨137, 4⟩) ∧
+    LeanMiri.evalTailCallTerminator "w::gread" 2 2
+        (⟨[lmFrame "w::fcr" (.goto (some 3) .continue_)], ()⟩ :
+          LeanMiri.StepState String Nat UnwindAction Unit) =
+      .ok ⟨[lmFrame "w::gread" (.goto (some 3) .continue_)], ()⟩ :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 end TailCall
 
@@ -2636,19 +3060,19 @@ theorem opaqueCast_trusted_place_rw_with_decls
       writeProjectedValue ls v (.opaqueCast t :: e :: r) val =
         writeProjectedValue ls v (e :: r) val := fun ls v =>
     (opaqueCast_trusted_traversal_universal ls v val t (e :: r)).2.1
-  have hprot : ∀ (bs : List BorrowEntry) (ps : List Nat) (q : List ProjectionElem),
-      hasProtectedWriteConflict bs ps l none (.opaqueCast t :: q) =
-        hasProtectedWriteConflict bs ps l none q := by
-    intro bs ps q
+  have hprot : ∀ (bs : List BorrowEntry) (ps : List Nat) (q : List ProjectionElem) (d : Nat),
+      hasProtectedWriteConflict bs ps l none (.opaqueCast t :: q) 0 0 d =
+        hasProtectedWriteConflict bs ps l none q 0 0 d := by
+    intro bs ps q d
     induction bs with
     | nil => rfl
     | cons b bs ih =>
       simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap,
         stripTransparentProjections, ih]
-  have hinv : ∀ (bs : List BorrowEntry) (q : List ProjectionElem),
-      invalidateConflictingBorrowsAtProj bs l none (.opaqueCast t :: q) =
-        invalidateConflictingBorrowsAtProj bs l none q := by
-    intro bs q
+  have hinv : ∀ (bs : List BorrowEntry) (q : List ProjectionElem) (d : Nat),
+      invalidateConflictingBorrowsAtProj bs l none (.opaqueCast t :: q) 0 0 d =
+        invalidateConflictingBorrowsAtProj bs l none q 0 0 d := by
+    intro bs q d
     induction bs with
     | nil => rfl
     | cons b bs ih =>
@@ -2792,6 +3216,48 @@ private theorem set?_get?_self {α : Type} {xs : List α} {i : Nat} {x : α} (y 
       cases h
   exact ⟨by simp [set?, hlt], by simp [get?, hlt]⟩
 
+private theorem projectionsOverlapAux_nil_right :
+    ∀ p : List ProjectionElem, projectionsOverlapAux p [] = true
+  | [] => rfl
+  | _ :: _ => rfl
+
+/-- With no active protector, no write conflicts with a protected borrow. -/
+private theorem hasProtectedWriteConflict_no_prot (l : Nat) (w : Option Nat)
+    (q : List ProjectionElem) (o n d : Nat) :
+    ∀ bs : List BorrowEntry, hasProtectedWriteConflict bs [] l w q o n d = false
+  | [] => rfl
+  | b :: bs => by
+    simp only [hasProtectedWriteConflict, isBorrowProtected_nil, Bool.false_and, Bool.and_false,
+      hasProtectedWriteConflict_no_prot l w q o n d bs]
+
+/-- A write at a projection that strips to the whole local (e.g. a bare `(_l as T)`) has the
+protector conflicts of a write to the whole local. -/
+private theorem hasProtectedWriteConflict_whole {ps : List Nat} {l d : Nat}
+    {q : List ProjectionElem}
+    (hq : normalizeSubsliceProjections (stripTransparentProjections q) = []) :
+    ∀ bs : List BorrowEntry,
+      hasProtectedWriteConflict bs ps l none q 0 0 d =
+        hasProtectedWriteConflict bs ps l none [] 0 0 d
+  | [] => rfl
+  | b :: bs => by
+    have h0 : normalizeSubsliceProjections (stripTransparentProjections []) = [] := rfl
+    simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap, hq, h0,
+      hasProtectedWriteConflict_whole hq bs]
+
+/-- A write at a projection that strips to the whole local transitions the borrows exactly
+like a write to the whole local. -/
+private theorem invalidateAtProj_whole {l d : Nat} {q : List ProjectionElem}
+    (hq : normalizeSubsliceProjections (stripTransparentProjections q) = []) :
+    ∀ bs : List BorrowEntry,
+      invalidateConflictingBorrowsAtProj bs l none q 0 0 d =
+        invalidateConflictingBorrows bs l none d
+  | [] => rfl
+  | b :: bs => by
+    simp only [invalidateConflictingBorrowsAtProj, invalidateConflictingBorrows,
+      updateBorrowPermAtProj, updateBorrowPerm, treeBorrowWriterRelatedness,
+      borrowEntryOverlapsWrite, projectionsOverlap, hq, projectionsOverlapAux_nil_right,
+      Nat.beq_refl, Bool.not_true, Bool.false_and, invalidateAtProj_whole hq bs]
+
 /-- **Trusted root-dispatch and `.uninit` shell divergence (universal; documented, latent).**
 Trusted dispatches on the *raw* projection list (`[]` vs `proj :: rest`) before any opaque
 cast is looked at, and `uninitFieldWriteShell?` matches only on `proj = .field fieldIdx fieldTy`
@@ -2806,7 +3272,8 @@ differ observably from their post-borrowck erasure:
   field `i`;
 * `Deinit((_l as T))` only read-checks `_l` (still `.init v`); `Deinit(_l)` de-initializes it
   (whereas `SetDiscriminant((_l as T), vIdx)` on an initialized aggregate with `decls = []`
-  agrees with `SetDiscriminant(_l, vIdx)`).
+  agrees with `SetDiscriminant(_l, vIdx)`, including the protector check and the borrow
+  transition of the write at the active frame's depth).
 Unreachable for captured bodies (`MirPhase::Runtime` forbids `OpaqueCast`,
 `opaqueCast_leanMiri_phase_boundary`); tracked as `DIV-TR-OPAQUECAST-ROOT-DISPATCH` in
 `scripts/run_nightly_verification_suite.py`. -/
@@ -2834,7 +3301,9 @@ theorem opaqueCast_trusted_root_dispatch_divergence
         ∃ locals₂, set? locals₁ l (.init val) = some locals₂ ∧
           evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts =
             MirStepNode.step (advanceStmt s locals₂
-              { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows l none }) ∧
+              { mem₁ with
+                borrows := invalidateConflictingBorrows mem₁.borrows l none
+                  (length mem₁.callStack) }) ∧
           evalStmt s ⟨.assign ⟨l, [.opaqueCast t]⟩ rv, span⟩ decls layouts ≠
             evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts)) ∧
     (∀ (s : MachineState) (decls : List LocalDecl) (span : String),
@@ -2883,7 +3352,9 @@ theorem opaqueCast_trusted_root_dispatch_divergence
     obtain ⟨hset, _⟩ := set?_get?_self (LocalSlot.init val) hu
     have hstep : evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts =
         MirStepNode.step (advanceStmt s (locals₁.set l (.init val))
-          { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows l none }) := by
+          { mem₁ with
+            borrows := invalidateConflictingBorrows mem₁.borrows l none
+              (length mem₁.callStack) }) := by
       simp only [evalStmt, hrv, hu, hset, hprot]
     refine ⟨_, hset, hstep, ?_⟩
     rw [hub [], hstep]
@@ -2912,8 +3383,17 @@ theorem opaqueCast_trusted_root_dispatch_divergence
         (.aggregate vIdx fields) = .ok (.aggregate vIdx fields) :=
       (opaqueCast_trusted_traversal_universal s.frame.locals (.aggregate oldVi fields)
         (.aggregate vIdx fields) t []).2.1
+    have hr : resolveBorrowWriteLocalProj [] layouts s.frame.locals l [.opaqueCast t] =
+        [.opaqueCast t] := rfl
+    have hq : normalizeSubsliceProjections (stripTransparentProjections [.opaqueCast t]) = [] :=
+      rfl
     simp only [evalStmt, evalOperand, hv, hrd, writePlaceValue, writeProjectedForLocal,
-      hw, hset]
+      hw, hset, hr, hasProtectedWriteConflict_whole hq, invalidateAtProj_whole hq,
+      evalSetDiscriminantLocal]
+    cases hp : s.memory.activeProtectors with
+    | nil => simp only [hasProtectedWriteConflict_no_prot]
+    | cons ph pt => rfl
+
 private theorem borrowProjSteps_erase : ∀ p : List ProjectionElem,
     MiniRustSpec.Correspondence.borrowProjSteps (eraseOpaqueCasts p) =
       MiniRustSpec.Correspondence.borrowProjSteps p
@@ -3231,7 +3711,8 @@ run_cmd do
           `tailCall_witness_external, `tailCall_witness_indirect_and_zst]),
        ("negative", [`tailCall_witness_ub_cases, `tailCall_witness_direct_arity_divergence,
           `tailCall_leanMiri_witness_arg_abi, `tailCall_leanMiri_witness_checks,
-          `tailCall_leanMiri_witness_unwind, `tailCall_witness_dangling_caller_local_divergence])]),
+          `tailCall_leanMiri_witness_unwind, `tailCall_witness_dangling_caller_local_simulation,
+          `tailCall_witness_root_caller_referent_divergence])]),
     ("opaqueCast",
       [tr ++ `MirAst.ProjectionElem.opaqueCast],
       [lm ++ `projectOpaqueCast, lm ++ `placeProjectOpaqueCast],

@@ -579,12 +579,12 @@ def countStateMemRet (bb : Nat) (stmt : Nat) (i : Nat) (mem : Memory) : MachineS
 
 theorem bb0_converges_mem (n : Nat) (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) :
     MirReachState (countToNBody n) (countStateMem 0 0 0 mem)
-      (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
-  have h_step : stepMirFn (countToNBody n) (countStateMem 0 0 0 mem) = MirStepNode.step (countStateMem 0 1 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+      (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
+  have h_step : stepMirFn (countToNBody n) (countStateMem 0 0 0 mem) = MirStepNode.step (countStateMem 0 1 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem]
       simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?]
-  have h_term : stepMirFn (countToNBody n) (countStateMem 0 1 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) = MirStepNode.step (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+  have h_term : stepMirFn (countToNBody n) (countStateMem 0 1 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) = MirStepNode.step (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem]
       simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length]
@@ -607,12 +607,12 @@ theorem bb1_converges_lt (n : Nat) (i : Nat) (mem : Memory) (h_callee : mem.acti
 
 theorem bb2_converges_mem (n : Nat) (i : Nat) (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) :
     MirReachState (countToNBody n) (countStateMem 2 0 i mem)
-      (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
-  have h_step : stepMirFn (countToNBody n) (countStateMem 2 0 i mem) = MirStepNode.step (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+      (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
+  have h_step : stepMirFn (countToNBody n) (countStateMem 2 0 i mem) = MirStepNode.step (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem]
       simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?]
-  have h_term : stepMirFn (countToNBody n) (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) = MirStepNode.step (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+  have h_term : stepMirFn (countToNBody n) (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) = MirStepNode.step (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem]
       simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length]
@@ -634,16 +634,16 @@ theorem bb1_converges_eqn (n : Nat) (mem : Memory) (h_callee : mem.activeCallee 
 
 theorem bb3_converges_mem (n : Nat) (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) (h_stack : mem.callStack = []) :
     MirWpConverges (countToNBody n) (countStateMem 3 0 n mem)
-      (fun out => out = Outcome.normal (Value.scalar ⟨n, 4⟩, { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none })) := by
-  have h_step : stepMirFn (countToNBody n) (countStateMem 3 0 n mem) = MirStepNode.step (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none }) := by
+      (fun out => out = Outcome.normal (Value.scalar ⟨n, 4⟩, { mem with borrows := disableFrameBorrows (invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack)) (length mem.callStack) 2 })) := by
+  have h_step : stepMirFn (countToNBody n) (countStateMem 3 0 n mem) = MirStepNode.step (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem, countStateMemRet]
       simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, advanceStmt, Trusted.Sequence.set?]
-  have h_term : stepMirFn (countToNBody n) (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none }) = MirStepNode.retNormal (Value.scalar ⟨n, 4⟩) { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none } := by
+  have h_term : stepMirFn (countToNBody n) (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack) }) = MirStepNode.retNormal (Value.scalar ⟨n, 4⟩) { mem with borrows := disableFrameBorrows (invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack)) (length mem.callStack) 2 } := by
       unfold stepMirFn
       dsimp [countStateMemRet]
-      simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length, h_stack]
-  have h_wp_term : MirWpConverges (countToNBody n) (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none }) (fun out => out = Outcome.normal (Value.scalar ⟨n, 4⟩, { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none })) := by
+      simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length, h_stack, hasFrameDeallocProtectorConflict]
+  have h_wp_term : MirWpConverges (countToNBody n) (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack) }) (fun out => out = Outcome.normal (Value.scalar ⟨n, 4⟩, { mem with borrows := disableFrameBorrows (invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack)) (length mem.callStack) 2 })) := by
       apply MirWpConverges.ret_of_step h_term
       rfl
   exact MirWpConverges.step_tau h_step h_wp_term
@@ -659,16 +659,16 @@ theorem countToN_terminates (n : Nat) (hn : n < 4294967296) (mem : Memory) (h_ca
       (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨n, 4⟩, mem')) := by
   have h0 := bb0_converges_mem n mem h_callee h_prot
   apply MirWpConverges.bind_reachState h0
-  have h_loop : MirWpConverges (countToNBody n) (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none })
+  have h_loop : MirWpConverges (countToNBody n) (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) })
     (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨n, 4⟩, mem')) := by
     refine mirWpConverges_forRangeUp 0 n () (fun _ _ _ _ => ()) (countToNBody n)
       (fun i _ s => i ≤ n ∧ ∃ m, s = countStateMem 1 0 i m ∧ m.activeCallee = none ∧ m.activeProtectors = [] ∧ m.callStack = [])
-      (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none })
+      (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) })
       (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨n, 4⟩, mem'))
       ?_
       ?_
       ?_
-    · exact ⟨Nat.zero_le n, { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }, rfl, h_callee, h_prot, h_stack⟩
+    · exact ⟨Nat.zero_le n, { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }, rfl, h_callee, h_prot, h_stack⟩
     · intro i h_le h_lt _ s h_inv
       rcases h_inv with ⟨h_i_le_n, m, h_eq, hm_callee, hm_prot, hm_stack⟩
       subst h_eq
@@ -677,7 +677,7 @@ theorem countToN_terminates (n : Nat) (hn : n < 4294967296) (mem : Memory) (h_ca
       have h12 := MirReachState.trans h1 h2
       have hi_mod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt (by omega)
       rw [hi_mod] at h12
-      exact MirStepsConverges.mono (post₂ := fun _ => False) (fun s' hs' => ⟨Nat.succ_le_of_lt h_lt, { m with borrows := invalidateConflictingBorrows m.borrows 1 none }, hs', hm_callee, hm_prot, hm_stack⟩) (fun _ h => False.elim h) h12
+      exact MirStepsConverges.mono (post₂ := fun _ => False) (fun s' hs' => ⟨Nat.succ_le_of_lt h_lt, { m with borrows := invalidateConflictingBorrows m.borrows 1 none (length m.callStack) }, hs', hm_callee, hm_prot, hm_stack⟩) (fun _ h => False.elim h) h12
     · intro i a s h_ge h_inv
       rcases h_inv with ⟨h_i_le_n, m, h_eq, hm_callee, hm_prot, hm_stack⟩
       subst h_eq
@@ -686,7 +686,7 @@ theorem countToN_terminates (n : Nat) (hn : n < 4294967296) (mem : Memory) (h_ca
       have h1 := bb1_converges_eqn n m hm_callee
       have h3 := bb3_converges_mem n m hm_callee hm_prot hm_stack
       apply MirWpConverges.bind_reachState h1
-      exact MirWpConverges.mono (fun out h => ⟨{ m with borrows := invalidateConflictingBorrows m.borrows 0 none }, h⟩) h3
+      exact MirWpConverges.mono (fun out h => ⟨_, h⟩) h3
   exact h_loop
 
 end Anneal.MirLoops

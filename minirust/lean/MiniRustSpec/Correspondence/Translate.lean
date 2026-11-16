@@ -2983,20 +2983,19 @@ translated direct call). Non-call terminators delegate directly to
 def translateIntrinsicOrNone (decls : List MirAst.LocalDecl) (defPath : String)
     (argOps : List MirAst.Operand) (destination : MirAst.Place)
     (target : Option MirAst.BasicBlockIdx) : Option TerminatorResult :=
-  match defPath.toList with
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','r','a','w','_','e','q'] =>
-      translateRsIntrinsic decls .raw_eq argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','t','p','o','p'] =>
-      translateRsIntrinsic decls .ctpop argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','e','x','a','c','t','_','d','i','v'] =>
-      translateRsIntrinsic decls .exact_div argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','o','l','d','_','p','a','t','h'] =>
-      translateRsIntrinsic decls .cold_path argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','a','b','o','r','t'] =>
-      translateRsIntrinsic decls .abort argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','u','b','_','c','h','e','c','k','s'] =>
-      translateRsIntrinsic decls .ub_checks argOps destination target
-  | _ => none
+  if defPath = "core::intrinsics::raw_eq" then
+    translateRsIntrinsic decls .raw_eq argOps destination target
+  else if defPath = "core::intrinsics::ctpop" then
+    translateRsIntrinsic decls .ctpop argOps destination target
+  else if defPath = "core::intrinsics::exact_div" then
+    translateRsIntrinsic decls .exact_div argOps destination target
+  else if defPath = "core::intrinsics::cold_path" then
+    translateRsIntrinsic decls .cold_path argOps destination target
+  else if defPath = "core::intrinsics::abort" then
+    translateRsIntrinsic decls .abort argOps destination target
+  else if defPath = "core::intrinsics::ub_checks" then
+    translateRsIntrinsic decls .ub_checks argOps destination target
+  else none
 
 def translateTerminatorInProg (fnMap : FnMap) (layouts : Layout.LayoutTable)
     (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
@@ -6312,14 +6311,15 @@ def isNonDivergingCall (t : MirAst.Terminator) : Bool :=
   | _ => false
 
 /-- Pointer/borrow local state transfer across a block terminator `t` in a
-multi-function program. In Anneal's `MirSemantics`, all frames share a single
-global `s.memory.borrows` table keyed by un-namespaced `BorrowEntry.targetLocal : Nat`,
-so any root assignment `_k = rv` inside a callee runs
-`invalidateConflictingBorrows mem₁.borrows k .none` across active caller borrows
-whose `targetLocal` happens to equal `k`. Consequently, across a returning `Call`
-terminator, every caller pointer/reference local transitions to `.disabled`
-(forcing fresh borrows after `Return`), while terminators without a returning
-`Call` preserve `env` identically. -/
+multi-function program. Anneal's `MirSemantics` namespaces `s.memory.borrows`
+per call-stack frame via `BorrowEntry.targetFrameDepth` (`targetFrameDepth == 0`
+at the active frame, shifted on `Call`/`Return`), so callee root assignments no
+longer invalidate caller borrows at runtime (`callerBorrowAcrossScalarCall_simulation`).
+This static `ptrAliasingProgOk` dataflow pass conservatively retains its pre-call
+disablement over-approximation across returning `Call` terminators (forcing fresh
+borrows after `Return` inside `progInFragmentWithIntrinsics`; see §12 of
+`ProvenanceWitness.lean`), while terminators without a returning `Call` preserve
+`env` identically. -/
 def ptrTermStep (decls : List MirAst.LocalDecl) (env : List PtrLocalState)
     (t : MirAst.Terminator) : List PtrLocalState :=
   let n := decls.length

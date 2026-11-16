@@ -81,6 +81,16 @@ open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 
+private theorem memory_eq_of_activeProtectors_nil {m : Memory}
+    (h : m.activeProtectors = []) :
+    { m with activeProtectors := [] } = m := by
+  cases m; dsimp only at h; subst h; rfl
+
+private theorem memory_eq_of_callStack_nil {m : Memory}
+    (h : m.callStack = []) :
+    { m with callStack := [] } = m := by
+  cases m; dsimp only at h; subst h; rfl
+
 /-! ## 1. `Rvalue.Ref` of a Local (`&_t`, `&mut _t`) -/
 
 /-- The Tree Borrows permission Anneal's `evalRvalue (.ref bk ⟨targetIdx, .nil⟩)`
@@ -114,6 +124,7 @@ theorem evalRvalue_ref_live_eq
     let perm : TreeBorrowPerm := refBorrowPerm localDecls layouts bk targetIdx
     let entry : BorrowEntry :=
       { tag := s.memory.nextTag
+        targetFrameDepth := length s.memory.callStack
         targetLocal := targetIdx
         targetProjection := .nil
         perm := perm }
@@ -549,17 +560,20 @@ theorem evalRvalue_ref_simulation
             cases h : Nat.beq targetIdx dstIdx
             · rfl
             · exact absurd (Nat.eq_of_beq_eq_true h).symm hne
+          have hlen_stack : length s.memory.callStack = 0 := by rw [hstack]; rfl
           have hinv_tail := invalidateConflictingBorrows_eq_of_not_mem hbor dstIdx none hnot_dst
           cases slot_d with
           | dead => exact absurd rfl hslot_d_ne
           | uninit =>
-            simp only [set?_eq_some_set hlt_af_d, hprot, invalidateConflictingBorrows_cons,
-              updateBorrowPerm, hbeq, newEntry, refAllocMapEntry,
-              AllocMapEntry.toBorrowEntry, hinv_tail]
+            simp only [set?_eq_some_set hlt_af_d, hlen_stack, hprot,
+              invalidateConflictingBorrows_cons, updateBorrowPerm, Nat.beq, Bool.true_and, hbeq,
+              newEntry, refAllocMapEntry, AllocMapEntry.toBorrowEntry, hinv_tail]
+            cases refBorrowPerm body.localDecls body.layouts bk targetIdx <;> congr 2
           | init v =>
-            simp only [set?_eq_some_set hlt_af_d, hprot, invalidateConflictingBorrows_cons,
-              updateBorrowPerm, hbeq, newEntry, refAllocMapEntry,
-              AllocMapEntry.toBorrowEntry, hinv_tail]
+            simp only [set?_eq_some_set hlt_af_d, hlen_stack, hprot,
+              invalidateConflictingBorrows_cons, updateBorrowPerm, Nat.beq, Bool.true_and, hbeq,
+              newEntry, refAllocMapEntry, AllocMapEntry.toBorrowEntry, hinv_tail]
+            cases refBorrowPerm body.localDecls body.layouts bk targetIdx <;> congr 2
         rw [ha]
         apply StepRelLM3_2.step
         have hretCont_c : tfc.returnContinuation = .stop false := by
@@ -1075,6 +1089,7 @@ theorem evalRvalue_reborrow_root_ok
     (hnodup : (allocMap.map AllocMapEntry.tag).Nodup)
     (hbor : s.memory.borrows = allocMap.map AllocMapEntry.toBorrowEntry)
     (hprot : s.memory.activeProtectors = .nil)
+    (hstack : s.memory.callStack = .nil)
     {bk : BorrowKind} {ptrIdx : Local} {ptrVal : ProvenancePtr} {e : AllocMapEntry}
     (hsp : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
     (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
@@ -1115,6 +1130,7 @@ theorem evalRvalue_reborrow_root_ok
         .some (.some (.nil, 0)) :=
     resolveRefDerefTarget?_prim_scalar_zero s.frame.locals hlay_coh hacc_prim hdecl_t rfl
       htgt_kind hoff0 hsz_sc
+  have htd : e.toBorrowEntry.targetFrameDepth = 0 := rfl
   have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
   have hro : e.toBorrowEntry.rangeOffset = 0 := rfl
   have hrl : e.toBorrowEntry.rangeLen = 0 := rfl
@@ -1123,8 +1139,10 @@ theorem evalRvalue_reborrow_root_ok
   dsimp only [stripTransparentProjections]
   rw [hlay_coh.1, hpt_res, hsp]
   dsimp only [Nat.beq]
-  rw [hcda, Bool.true_and, hlookup]
+  rw [hcda, Bool.true_and, hlookup, hstack]
   dsimp only []
+  rw [htd]
+  dsimp only [activeFrameSlot?]
   rw [htl, hslot_t]
   dsimp only []
   rw [hro, hrl, hperm_eq, hres_tgt]
@@ -1218,7 +1236,7 @@ theorem evalRvalue_reborrow_simulation
             (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
               ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
                 .concrete e.allocId borTag⟩))))) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, hbor, halloc, _⟩ := id hstate
   obtain ⟨himm_d, himm_p⟩ := himm tf hframes
   obtain ⟨slot_d, mls_d, hlt_af_d, hlt_d, hslot_d, _, hmls_d_eq, hloc_d⟩ :=
     hfr.lookup_local hdecl_dst
@@ -1346,7 +1364,7 @@ theorem evalRvalue_reborrow_simulation
           (.ref bk ⟨ptrIdx, .cons .deref .nil⟩) s.memory body.localDecls body.layouts =
           .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8) s.frame.locals mem₁ ∧
           mem₁.activeProtectors = .nil :=
-        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hsp_full he htag hne_dis
+        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hstack hsp_full he htag hne_dis
           hnot_fmut hlay_coh hpt_res hacc_prim hdecl_t
           ((htgt_kind tgtDecl hdecl_t).trans hacc_kind.symm) hoff0 hslot_t hsz_sc
       obtain ⟨mem₁, hrv_a, hprot₁⟩ := hrv_a_ok
@@ -1545,7 +1563,7 @@ theorem evalRvalue_reborrow_simulation
           (.ref bk ⟨ptrIdx, .cons .deref .nil⟩) s.memory body.localDecls body.layouts =
           .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8) s.frame.locals mem₁ ∧
           mem₁.activeProtectors = .nil :=
-        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hsp he htag hne_dis hnot_fmut
+        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hstack hsp he htag hne_dis hnot_fmut
           hlay_coh hpt_res hacc_prim hdecl_t
           ((htgt_kind tgtDecl hdecl_t).trans hacc_kind.symm) hoff0 hslot_t hsz_sc
       obtain ⟨mem₁, hrv₁, hprot₁⟩ := hrv_ok'
@@ -1763,7 +1781,7 @@ theorem evalRvalue_reborrow_dangling_divergence
           (translateTy targetDecl.ty body.layouts) =
         .error (.undefinedBehavior "dereferencing a dangling reference") := by
   have _ := hno_int
-  obtain ⟨tf, hframes, _, _, _, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, _, hcal, hstack, _, _, _, halloc, _⟩ := id hstate
   obtain ⟨hoff0, _, _⟩ := hzero_perm ptrVal e hslot_p he htag
   have ha : stepMirFn body s = MirStepNode.fail .ub := by
     have hlookup := (halloc.borrow_sync e he).2
@@ -1776,7 +1794,8 @@ theorem evalRvalue_reborrow_dangling_divergence
         (checkDerefAlign body.localDecls body.layouts _ ptrVal.offsetBytes)
     · rfl
     · dsimp only []
-      rw [hlookup]; dsimp only [AllocMapEntry.toBorrowEntry, resolveBorrowProjectionElems]
+      rw [hlookup, hstack]
+      dsimp only [AllocMapEntry.toBorrowEntry, activeFrameSlot?, resolveBorrowProjectionElems]
       rw [hdead_t]
       cases e.perm <;> cases bk <;> rfl
   obtain ⟨m', tf', borTag, hstep, hframes', hmach, hval⟩ :=
@@ -1874,7 +1893,7 @@ theorem evalRvalue_reborrow_uninit_target_divergence
         ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId), some (.concrete e.allocId borTag)⟩
         (translateTy targetDecl.ty body.layouts).layout.size = .ok () := by
   have _ := hno_int
-  obtain ⟨tf, hframes, _, _, _, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, _, hcal, hstack, _, _, _, halloc, _⟩ := id hstate
   obtain ⟨hoff0, _, _⟩ := hzero_perm ptrVal e hslot_p he htag
   have ha : stepMirFn body s = MirStepNode.fail .ub := by
     have hlookup := (halloc.borrow_sync e he).2
@@ -1887,7 +1906,8 @@ theorem evalRvalue_reborrow_uninit_target_divergence
         (checkDerefAlign body.localDecls body.layouts _ ptrVal.offsetBytes)
     · rfl
     · dsimp only []
-      rw [hlookup]; dsimp only [AllocMapEntry.toBorrowEntry, resolveBorrowProjectionElems]
+      rw [hlookup, hstack]
+      dsimp only [AllocMapEntry.toBorrowEntry, activeFrameSlot?, resolveBorrowProjectionElems]
       rw [huninit_t]
       cases e.perm <;> cases bk <;> rfl
   obtain ⟨m', tf', borTag, hstep, hframes', hmach, hval⟩ :=
@@ -2297,17 +2317,20 @@ theorem evalRvalue_ref_indirect_simulation
           cases h : Nat.beq targetIdx dstIdx
           · rfl
           · exact absurd (Nat.eq_of_beq_eq_true h).symm hne
+        have hlen_stack : length s.memory.callStack = 0 := by rw [hstack]; rfl
         have hinv_tail := invalidateConflictingBorrows_eq_of_not_mem hbor dstIdx none hnot_dst
         cases slot_d with
         | dead => exact absurd rfl hslot_d_ne
         | uninit =>
-          simp only [set?_eq_some_set hlt_af_d, hprot, invalidateConflictingBorrows_cons,
-            updateBorrowPerm, hbeq, newEntry, refAllocMapEntry,
-            AllocMapEntry.toBorrowEntry, hinv_tail]
+          simp only [set?_eq_some_set hlt_af_d, hlen_stack, hprot,
+            invalidateConflictingBorrows_cons, updateBorrowPerm, Nat.beq, Bool.true_and, hbeq,
+            newEntry, refAllocMapEntry, AllocMapEntry.toBorrowEntry, hinv_tail]
+          cases refBorrowPerm body.localDecls body.layouts bk targetIdx <;> congr 2
         | init _ =>
-          simp only [set?_eq_some_set hlt_af_d, hprot, invalidateConflictingBorrows_cons,
-            updateBorrowPerm, hbeq, newEntry, refAllocMapEntry,
-            AllocMapEntry.toBorrowEntry, hinv_tail]
+          simp only [set?_eq_some_set hlt_af_d, hlen_stack, hprot,
+            invalidateConflictingBorrows_cons, updateBorrowPerm, Nat.beq, Bool.true_and, hbeq,
+            newEntry, refAllocMapEntry, AllocMapEntry.toBorrowEntry, hinv_tail]
+          cases refBorrowPerm body.localDecls body.layouts bk targetIdx <;> congr 2
       rw [ha]
       apply StepRelLM3_2.step
       have h32_e0 := (halloc_b.base_addr_valid e₀ he₀).1
@@ -2834,7 +2857,7 @@ theorem evalRvalue_reborrow_safeRef_simulation
             (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
               ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
                 .concrete e.allocId borTag⟩))))) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, hbor, halloc, _⟩ := id hstate
   obtain ⟨himm_d, himm_r⟩ := himm tf hframes
   obtain ⟨slot_d, mls_d, hlt_af_d, hlt_d, hslot_d, _, hmls_d_eq, hloc_d⟩ :=
     hfr.lookup_local hdecl_dst
@@ -3000,7 +3023,7 @@ theorem evalRvalue_reborrow_safeRef_simulation
           (.ref bk ⟨refIdx, .cons .deref .nil⟩) s.memory body.localDecls body.layouts =
           .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8) s.frame.locals mem₁ ∧
           mem₁.activeProtectors = .nil :=
-        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hsr_full he htag hne_dis
+        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hstack hsr_full he htag hne_dis
           hnot_fmut hlay_coh hpt_res hacc_prim hdecl_t ((htgt_kind tgtDecl hdecl_t).trans hacc_kind.symm)
           hoff0 hslot_t hsz_sc
       obtain ⟨mem₁, hrv_a, hprot₁⟩ := hrv_a_ok
@@ -3145,7 +3168,7 @@ theorem evalRvalue_reborrow_safeRef_simulation
           (.ref bk ⟨refIdx, .cons .deref .nil⟩) s.memory body.localDecls body.layouts =
           .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8) s.frame.locals mem₁ ∧
           mem₁.activeProtectors = .nil :=
-        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hsr he htag hne_dis hnot_fmut
+        evalRvalue_reborrow_root_ok halloc.tags_nodup hbor hprot hstack hsr he htag hne_dis hnot_fmut
           hlay_coh hpt_res hacc_prim hdecl_t ((htgt_kind tgtDecl hdecl_t).trans hacc_kind.symm)
           hoff0 hslot_t hsz_sc
       obtain ⟨mem₁, hrv₁, hprot₁⟩ := hrv_ok'
@@ -3195,7 +3218,7 @@ private theorem evalRvalue_reborrow_safeRef_dangling_both_ub
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, hbor, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, hbor, halloc, _⟩ := id hstate
   have himm_r := himm_ref tf hframes
   obtain ⟨_, mls_d, _, hlt_d, _, _, hmls_d_eq, hloc_d⟩ :=
     hfr.lookup_local hdecl_dst
@@ -3203,6 +3226,7 @@ private theorem evalRvalue_reborrow_safeRef_dangling_both_ub
   · have hlookup : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
       rw [hbor, ← htag]
       exact lookupBorrow_map_toBorrowEntry_of_nodup halloc.tags_nodup he
+    have htd : e.toBorrowEntry.targetFrameDepth = 0 := rfl
     have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
     have htp : e.toBorrowEntry.targetProjection = .nil := rfl
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
@@ -3213,8 +3237,10 @@ private theorem evalRvalue_reborrow_safeRef_dangling_both_ub
         (checkDerefAlign body.localDecls body.layouts _ ptrVal.offsetBytes)
     · rfl
     · dsimp only []
-      rw [hlookup]
+      rw [hlookup, hstack]
       dsimp only []
+      rw [htd]
+      dsimp only [activeFrameSlot?]
       rw [htl, hdead_t]
       dsimp only []
       cases e.toBorrowEntry.perm <;>
@@ -3626,6 +3652,8 @@ private theorem finish_write_immediate_lm3_2_from_mid
       rw [← hs_mem]; exact hbor_m
     have hprot_s : s.memory.activeProtectors = .nil := by
       rw [← hs_mem]; exact hprot_m
+    have hlen_s : length s.memory.callStack = 0 := by
+      rw [← hs_mem, hstack_m]; rfl
     have hbor_inv := invalidateConflictingBorrows_eq_of_not_mem hbor_s dstIdx none hnot_dst
     have hdm_live : tf_mid.locals[dstIdx]? =
         some ⟨.live (.immediate oldImm), mls_dm.layout⟩ := by
@@ -3658,13 +3686,11 @@ private theorem finish_write_immediate_lm3_2_from_mid
       cases slot_dm with
       | dead => exact absurd rfl hsd_ne
       | uninit =>
-        simp only [set?_eq_some_set hlt_af_dm, hprot_s, hbor_inv]
-        congr 2; generalize s.memory = mem at hprot_s ⊢
-        cases mem; dsimp at hprot_s ⊢; subst hprot_s; rfl
+        simp only [set?_eq_some_set hlt_af_dm, hprot_s, hlen_s, hbor_inv]
+        congr 2; exact memory_eq_of_activeProtectors_nil hprot_s
       | init _ =>
-        simp only [set?_eq_some_set hlt_af_dm, hprot_s, hbor_inv]
-        congr 2; generalize s.memory = mem at hprot_s ⊢
-        cases mem; dsimp at hprot_s ⊢; subst hprot_s; rfl
+        simp only [set?_eq_some_set hlt_af_dm, hprot_s, hlen_s, hbor_inv]
+        congr 2; exact memory_eq_of_activeProtectors_nil hprot_s
     rw [ha_ok]
     refine .step _ _ ?_
     have hnew_d : LocalRelLM3_2 m.machine (allocMap.map id) dstDecl body.layouts (.init val)
@@ -4062,7 +4088,7 @@ private theorem step_safeRef_deref_read_invalid_scalar_both_ub
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
   · have hlookup : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
       rw [← htag]; exact (halloc.borrow_sync e he).2
@@ -4115,6 +4141,7 @@ private theorem step_safeRef_deref_read_invalid_scalar_both_ub
       | nil => rw [hld] at hdecl_ref; cases hdecl_ref
       | cons d₀ ds =>
         have hd_eq : body.localDecls = d₀ :: ds := hld
+        have htd : e.toBorrowEntry.targetFrameDepth = 0 := rfl
         have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
         have htp : e.toBorrowEntry.targetProjection = .nil := rfl
         have hperm_eq : e.toBorrowEntry.perm = e.perm := rfl
@@ -4147,11 +4174,13 @@ private theorem step_safeRef_deref_read_invalid_scalar_both_ub
           dsimp only []
           rw [hlookup]
           dsimp only []
+          rw [htd]
+          dsimp only [activeFrameSlot?]
           rw [htl, htarget, hperm_eq]
           cases e.perm <;> first | rfl | exact hbody
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
     simp only [hbb, hstmt]
-    unfold evalStmt evalRvalue; dsimp only []; rw [hop_ub]
+    unfold evalStmt evalRvalue; dsimp only []; rw [hstack, hop_ub]
   · have himm_r := himm_ref tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
       ⟨dstIdx, .nil⟩ (opKind ⟨refIdx, .cons .deref .nil⟩) span m
@@ -4532,9 +4561,10 @@ theorem step_safeRef_deref_read_simulation_explicit
           rcases hopKind with rfl | rfl <;>
           · unfold evalOperand readProjectedValue; dsimp only []
             cases body.localDecls <;>
-            · simp only [hslot_r, hcaller, ← htag, hbor_look, AllocMapEntry.toBorrowEntry]
+            · simp only [hslot_r, hcaller, ← htag, hbor_look, AllocMapEntry.toBorrowEntry,
+                activeFrameSlot?]
               cases e.perm <;> simp [hslot_t]
-        unfold evalStmt evalRvalue; dsimp only []; rw [hop_ub]
+        unfold evalStmt evalRvalue; dsimp only []; rw [hstack, hop_ub]
       have hder_err := annealDerefOperandToMemPlace_safeRef_ptr_dead hstate hdecl_ref href_ty
         hprim0 hptrRel he htag hslot_t (translateTy refDecl.ty body.layouts)
         (st := { m with stack := ⟨#[tfb]⟩ }) rfl
@@ -4614,9 +4644,10 @@ theorem step_safeRef_deref_read_simulation_explicit
             rcases hopKind with rfl | rfl <;>
             · unfold evalOperand readProjectedValue; dsimp only []
               cases body.localDecls <;>
-              · simp only [hslot_r, hcaller, ← htag, hbor_look, AllocMapEntry.toBorrowEntry]
+              · simp only [hslot_r, hcaller, ← htag, hbor_look, AllocMapEntry.toBorrowEntry,
+                  activeFrameSlot?]
                 cases e.perm <;> simp [hslot_t, hs_t]
-          unfold evalStmt evalRvalue; dsimp only []; rw [hop_ub]
+          unfold evalStmt evalRvalue; dsimp only []; rw [hstack, hop_ub]
         obtain ⟨_, hread_err⟩ := hshape_la.uninit_readScalar_err (hun_la hs_t) false
         have hread_m : annealReadMemoryPlace
             ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
@@ -4688,6 +4719,7 @@ theorem step_safeRef_deref_read_simulation_explicit
                 true := hval_acc
             have hcda : checkDerefAlign (d₀ :: ds) body.layouts (some rAccTy_ds)
                 ptrVal.offsetBytes = true := by rw [hoff0]
+            have htd : e.toBorrowEntry.targetFrameDepth = 0 := rfl
             have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
             have htp : e.toBorrowEntry.targetProjection = .nil := rfl
             have hperm_eq : e.toBorrowEntry.perm = e.perm := rfl
@@ -4698,6 +4730,8 @@ theorem step_safeRef_deref_read_simulation_explicit
               dsimp only []
               rw [← htag, hbor_look]
               dsimp only []
+              rw [htd]
+              dsimp only [activeFrameSlot?]
               rw [htl, hslot_t, hs_t, hperm_eq]
               cases hp : e.perm
               all_goals first
@@ -4745,6 +4779,9 @@ theorem step_safeRef_deref_read_simulation_explicit
           have hbool_dst : dstDecl.ty.kind = .bool →
               sc_t.sizeBytes = 1 ∧ (sc_t.bits = 0 ∨ sc_t.bits = 1) :=
             fun hb => hbool_t (htgt_kind_eq.trans hb)
+          have hchar_dst : dstDecl.ty.kind = .char →
+              sc_t.sizeBytes = 4 ∧ isValidCharCode sc_t.bits = true :=
+            fun hc => hchar_t (htgt_kind_eq.trans hc)
           rcases refDecl with ⟨_, ⟨rk, rli⟩, _⟩
           dsimp only at href_ty
           subst href_ty
@@ -4757,7 +4794,11 @@ theorem step_safeRef_deref_read_simulation_explicit
             · rw [hbk]
               obtain ⟨_, hb01⟩ := hbool_dst hbk
               rcases hb01 with hb | hb <;> simp [hb]
-            · cases hk : dstDecl.ty.kind <;> first | rfl | exact absurd hk hbk
+            · by_cases hck : dstDecl.ty.kind = .char
+              · rw [hck]
+                obtain ⟨hsz, hv⟩ := hchar_dst hck
+                simp [hsz, hv]
+              · cases hk : dstDecl.ty.kind <;> first | rfl | exact absurd hk hbk | exact absurd hk hck
         have hrv_anneal :
             evalRvalue s.frame.locals (.use (opKind ⟨refIdx, .cons .deref .nil⟩))
               s.memory body.localDecls body.layouts =
@@ -4765,7 +4806,7 @@ theorem step_safeRef_deref_read_simulation_explicit
               { s.memory with
                 borrows := (allocMap.map (derefReadMapFn allocMap e.localIdx ptrVal.tag)).map
                   AllocMapEntry.toBorrowEntry } := by
-          unfold evalRvalue; dsimp only []; rw [hop_anneal]; dsimp only []; rw [hval_load]
+          unfold evalRvalue; dsimp only []; rw [hstack, hop_anneal]; dsimp only []; rw [hval_load]
           match hm_cases : allocMap with
           | [] => exact False.elim (List.not_mem_nil he)
           | [single] =>
@@ -4774,6 +4815,7 @@ theorem step_safeRef_deref_read_simulation_explicit
             · rw [hbor1]
               simp only [List.map_cons, List.map_nil, derefReadMapFn, id_eq]
               rw [← hbor1]
+              exact congrArg _ (memory_eq_of_callStack_nil hstack).symm
           | e₁ :: e₂ :: rest =>
             have hfrz := freezeDerefReadBorrowsAt_map_toBorrowEntry s.frame.locals e₁ e₂ rest
               (hm_cases ▸ halloc_a.tags_nodup) refIdx ptrVal 8 e (hm_cases ▸ he) htag hslot_r
@@ -4859,8 +4901,10 @@ theorem step_safeRef_deref_read_simulation_explicit
             unfold evalStmt; dsimp only []; rw [hrv_anneal]; dsimp only []; rw [hslot_d]
             cases slot_d with
             | dead => exact absurd rfl hsd_ne
-            | uninit => simp only [set?_eq_some_set hlt_af_d, hprot, hinv_d]
-            | init _ => simp only [set?_eq_some_set hlt_af_d, hprot, hinv_d]
+            | uninit =>
+              simp only [set?_eq_some_set hlt_af_d, hstack, length, List.length_nil, hprot, hinv_d]
+            | init _ =>
+              simp only [set?_eq_some_set hlt_af_d, hstack, length, List.length_nil, hprot, hinv_d]
           rw [ha_ok, hnext_eq]
           apply StepRelLM3_2.step
           have hnew_d :
@@ -5416,7 +5460,20 @@ theorem StateRelLM3_2.validateLoadedValue_wtScalar
               · rw [hb1]; rfl
             | scalarPair _ _ _ _ _ _ hagg _ =>
               rcases hagg with ⟨_, hk⟩ | ⟨_, _, hk⟩ <;> cases hk
-          · cases dk <;> first | rfl | exact absurd rfl hbk
+          · by_cases hck : dk = .char
+            · subst hck
+              cases himm_rel with
+              | unit hzero =>
+                have htr : (translateTy { kind := .char, layoutIdx := dli } body.layouts).layout.size ≠
+                    Miri.ABI.Size.ZERO := by
+                  unfold translateTy; dsimp only []; decide
+                exact absurd hzero htr
+              | scalar sc _ _ _ _ hc_sc =>
+                obtain ⟨hsz, hv⟩ := hc_sc rfl
+                simp [hsz, hv]
+              | scalarPair _ _ _ _ _ _ hagg _ =>
+                rcases hagg with ⟨_, hk⟩ | ⟨_, _, hk⟩ <;> cases hk
+            · cases dk <;> first | rfl | exact absurd rfl hbk | exact absurd rfl hck
 
 theorem evalRvalue_use_scalarOperand_eq_lm3_2
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -5477,7 +5534,7 @@ theorem step_safeRef_deref_write_simulation_explicit
     StepRelLM3_2 body m (derefWriteNextAllocMap s.frame.locals allocMap refIdx)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, hcaller, hbor, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, hcaller, hbor, halloc, _⟩ := id hstate
   have himm_r := himm_ref tf hframes
   have hop_tf := hop tf hframes
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
@@ -5516,7 +5573,7 @@ theorem step_safeRef_deref_write_simulation_explicit
     · unfold evalStmt; dsimp only []
       rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ok]
       dsimp only [evalPlaceWrite, writePlaceValue]
-      rw [hprot]; dsimp only []
+      rw [hprot, hstack]; dsimp only []
       rcases hbad with hs | hs | ⟨_, hs⟩ <;> rw [hslot_r, hs, hcaller]
   rcases hloc_r.ref_immediate_cases href_ty (himm_r mls_r hmls_r) with
     ⟨hsr_dead, hmr_dead⟩ | ⟨hsr_un, hmr_un⟩ |
@@ -5610,12 +5667,13 @@ theorem step_safeRef_deref_write_simulation_explicit
           rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ub]
         · unfold evalStmt; dsimp only []
           rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ok]
-          dsimp only [evalPlaceWrite]; rw [hprot]; dsimp only []
+          dsimp only [evalPlaceWrite]; rw [hprot, hstack]; dsimp only []
           cases hld : body.localDecls with
           | nil => rw [hld] at hdecl_ref; cases hdecl_ref
           | cons d₀ ds =>
             unfold writePlaceValue; dsimp only []
-            rw [hslot_r]; dsimp only []; rw [hbor_look]; dsimp only [AllocMapEntry.toBorrowEntry]
+            rw [hslot_r]; dsimp only []; rw [hbor_look]
+            dsimp only [AllocMapEntry.toBorrowEntry, activeFrameTargetLocals?]
             cases hp : e.perm <;> first | (rw [hcaller]; done) | (
               unfold writeStackThinPtrTypedDeref
               dsimp only []
@@ -5843,7 +5901,7 @@ theorem step_safeRef_deref_write_simulation_explicit
             rw [hpt_res, hslot_r]
             dsimp only []
             rw [hbor_look]
-            dsimp only []
+            dsimp only [activeFrameTargetLocals?]
             rw [hperm_eq]
             rcases hperm_ok with hp | hp <;> rw [hp] <;> exact hbody
         have hinv_lay :
@@ -5865,7 +5923,7 @@ theorem step_safeRef_deref_write_simulation_explicit
           rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ok]
           dsimp only []
           unfold evalPlaceWrite
-          rw [hprot, hwrite_ok]
+          rw [hprot, hstack, hwrite_ok]
           dsimp only [derefWriteUnionProtectorUB, Bool.or]
           simp only [hinv_lay, hinv_bor, hwub]
         have hnext_eq : derefWriteNextAllocMap s.frame.locals allocMap refIdx =
@@ -6046,9 +6104,10 @@ theorem step_storageDead_lm3_2_simulation
       MirStepNode.step
         (advanceStmt s (s.frame.locals.set loc .dead)
           { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) := by
+    have hlen_stack : length s.memory.callStack = 0 := by rw [ht_stack]; rfl
     unfold evalStmt
     dsimp only
-    rw [hslot, set?_eq_some_set hlt_af, ht_prot]
+    rw [hslot, set?_eq_some_set hlt_af, ht_prot, hlen_stack]
   rw [ha]
   have hlive : LocalAllocLive m.machine.memory (topFrame.locals[loc]'hlt_mf).value := by
     rw [hmls_eq]; exact hloc.allocLive
@@ -6070,7 +6129,7 @@ theorem step_storageDead_lm3_2_simulation
       memory := deallocLocalMemory m.machine.memory (topFrame.locals[loc]'hlt_mf).value }
   let fDis : AllocMapEntry → AllocMapEntry := fun e =>
     match Nat.beq e.localIdx loc with
-    | true => { e with perm := .disabled }
+    | true => { e with perm := .disabled, allocDead := true }
     | false => e
   have hf_tag : ∀ e, (fDis e).tag = e.tag := fun e => by
     dsimp only [fDis]; cases Nat.beq e.localIdx loc <;> rfl
@@ -6281,16 +6340,17 @@ theorem step_storageLive_lm3_2_simulation
     rw [ht_bor] at hb
     obtain ⟨e, he, rfl⟩ := List.mem_map.mp hb
     exact hnot_mapped e he
-  have hmem_dis_eq : { s.memory with borrows := disableLocalBorrows s.memory.borrows loc } =
-      s.memory := by
-    rw [hbor_dis_eq]
   have ha : evalStmt s ⟨.storageLive loc, span⟩ body.localDecls body.layouts =
       MirStepNode.step (advanceStmt s (s.frame.locals.set loc .uninit)) := by
+    have hlen_stack : length s.memory.callStack = 0 := by rw [ht_stack]; rfl
     unfold evalStmt
     dsimp only
     rw [hslot, set?_eq_some_set hlt_af]
     dsimp only
-    rw [hmem_dis_eq, ht_prot]
+    rw [ht_prot, hlen_stack]
+    dsimp only
+    rw [hbor_dis_eq]
+    congr 2; exact memory_eq_of_activeProtectors_nil ht_prot
   rw [ha]
   have hty : ∃ ty, topFrame.body.locals[loc]? = some ty := by
     rw [hfr.body_eq, translateBody_locals_getElem? body loc, hdecl]
@@ -6856,15 +6916,17 @@ private theorem decodeSubValueAtByteOffset_scalar_oob_none₂
     (layouts : LayoutTable) (baseTyOpt : Option Ty) (sc : MirAst.ScalarInt)
     (offsetBytes : Nat) (accTy : Ty) (decls : List LocalDecl)
     (hprim : IsPrimScalarTy accTy)
-    (hoob : sc.sizeBytes < offsetBytes + (translateTy accTy layouts).layout.size.bytes.toNat) :
-    decodeSubValueAtByteOffset? layouts baseTyOpt (.scalar sc) offsetBytes accTy decls = none := by
-  have hr_kind := resolveTyWithLocalDecls_kind decls layouts accTy
-  have hr_prim : IsPrimScalarTy (resolveTyWithLocalDecls decls layouts accTy) :=
+    (hoob : sc.sizeBytes < offsetBytes + (translateTy accTy layouts).layout.size.bytes.toNat)
+    (accDecls : List LocalDecl := decls) :
+    decodeSubValueAtByteOffset? layouts baseTyOpt (.scalar sc) offsetBytes accTy decls
+      layouts accDecls = none := by
+  have hr_kind := resolveTyWithLocalDecls_kind accDecls layouts accTy
+  have hr_prim : IsPrimScalarTy (resolveTyWithLocalDecls accDecls layouts accTy) :=
     hprim.of_kind_eq hr_kind
-  have htr_eq : translateTy (resolveTyWithLocalDecls decls layouts accTy) layouts =
+  have htr_eq : translateTy (resolveTyWithLocalDecls accDecls layouts accTy) layouts =
       translateTy accTy layouts := by
     rw [← hr_prim.translateTy_layoutIdx layouts, hr_kind, hprim.translateTy_layoutIdx layouts]
-  have hsz := hr_prim.tyByteSize_eq decls layouts
+  have hsz := hr_prim.tyByteSize_eq accDecls layouts
   rw [htr_eq] at hsz
   unfold decodeSubValueAtByteOffset?
   dsimp only []
@@ -7071,7 +7133,7 @@ private theorem step_safeRef_deref_read_oob_both_ub
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
   · have hlookup : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
       rw [← htag]; exact (halloc.borrow_sync e he).2
@@ -7115,6 +7177,7 @@ private theorem step_safeRef_deref_read_oob_both_ub
       | nil => rw [hld] at hdecl_ref; cases hdecl_ref
       | cons d₀ ds =>
         have hd_eq : body.localDecls = d₀ :: ds := hld
+        have htd : e.toBorrowEntry.targetFrameDepth = 0 := rfl
         have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
         have htp : e.toBorrowEntry.targetProjection = .nil := rfl
         have hperm_eq : e.toBorrowEntry.perm = e.perm := rfl
@@ -7141,16 +7204,17 @@ private theorem step_safeRef_deref_read_oob_both_ub
             have hdec_fb :
                 ∀ targetTyOpt ld ptOpt,
                   decodeAtBorrowTargetOffset? s.frame.locals (.scalar sc) e.toBorrowEntry ptrVal
-                    .nil body.layouts (some rAccTy) targetTyOpt ld ptOpt = none := by
+                    .nil body.layouts (some rAccTy) targetTyOpt ld ptOpt
+                    body.layouts body.localDecls = none := by
               intro targetTyOpt ld ptOpt
               unfold decodeAtBorrowTargetOffset?
               dsimp only [AllocMapEntry.toBorrowEntry, readProjectedForLocal, readProjectedValue]
               exact decodeSubValueAtByteOffset_scalar_oob_none₂ body.layouts targetTyOpt sc
-                ptrVal.offsetBytes rAccTy ld hrAcc_prim (htr_rAcc.symm ▸ hoob_sc)
+                ptrVal.offsetBytes rAccTy ld hrAcc_prim (htr_rAcc.symm ▸ hoob_sc) body.localDecls
             rw [hdec_fb]
             cases hres :
               resolveStackThinPtrTargetProjWithResidual? s.frame.locals (.scalar sc)
-                e.toBorrowEntry ptrVal .nil _ body.layouts _ _ with
+                e.toBorrowEntry ptrVal .nil _ body.layouts _ _ _ _ with
             | none => rfl
             | some pr =>
               have hpr_eq : pr = (.nil, 0) ∧ ptrVal.offsetBytes = 0 := by
@@ -7180,10 +7244,10 @@ private theorem step_safeRef_deref_read_oob_both_ub
               have hdec0 :
                   ∀ targetTyOpt ld,
                     decodeSubValueAtByteOffset? body.layouts targetTyOpt
-                      (.scalar sc) 0 rAccTy ld = none :=
+                      (.scalar sc) 0 rAccTy ld body.layouts body.localDecls = none :=
                 fun targetTyOpt ld =>
                   decodeSubValueAtByteOffset_scalar_oob_none₂ body.layouts targetTyOpt sc 0 rAccTy ld
-                    hrAcc_prim (by rw [htr_rAcc, Nat.zero_add]; exact hoob0)
+                    hrAcc_prim (by rw [htr_rAcc, Nat.zero_add]; exact hoob0) body.localDecls
               have hextract0 :
                   extractScalarSlice? sc 0
                     (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat = none := by
@@ -7213,11 +7277,13 @@ private theorem step_safeRef_deref_read_oob_both_ub
           dsimp only []
           rw [hlookup]
           dsimp only []
+          rw [htd]
+          dsimp only [activeFrameSlot?]
           rw [htl, htarget, hperm_eq]
           cases e.perm <;> first | rfl | exact hbody
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
     simp only [hbb, hstmt]
-    unfold evalStmt evalRvalue; dsimp only []; rw [hop_ub]
+    unfold evalStmt evalRvalue; dsimp only []; rw [hstack, hop_ub]
   · have himm_r := himm_ref tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
       ⟨dstIdx, .nil⟩ (opKind ⟨refIdx, .cons .deref .nil⟩) span m
@@ -7367,7 +7433,7 @@ private theorem step_safeRef_deref_write_oob_both_ub
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, hcaller, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, hcaller, _, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
   · have hlookup : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
       rw [← htag]; exact (halloc.borrow_sync e he).2
@@ -7422,7 +7488,7 @@ private theorem step_safeRef_deref_write_oob_both_ub
             dsimp only []
             cases hres :
               resolveStackThinPtrTargetProjWithResidual? s.frame.locals (.scalar sc_a)
-                e.toBorrowEntry ptrVal .nil _ body.layouts _ _ with
+                e.toBorrowEntry ptrVal .nil _ body.layouts _ _ _ _ with
             | none =>
               dsimp only [readProjectedForLocal, readProjectedValue]
               rw [spliceSubValueAtByteOffset_scalar_oob_none _ _ _ _ _ sc_a sc
@@ -7461,14 +7527,14 @@ private theorem step_safeRef_deref_write_oob_both_ub
         rw [hpt_res, hslot_r]
         dsimp only []
         rw [hlookup]
-        dsimp only []
+        dsimp only [activeFrameTargetLocals?]
         rw [hperm_eq]
         rcases hperm with hp | hp <;> rw [hp] <;> exact hbody
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
     simp only [hbb, hstmt]
     unfold evalStmt; dsimp only []
     rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes (hop tf hframes), hop_ok]
-    dsimp only [evalPlaceWrite]; rw [hprot, hw_ub, hcaller]
+    dsimp only [evalPlaceWrite]; rw [hprot, hstack, hw_ub, hcaller]
   · have himm_r := himm_ref tf hframes
     have hlive_a0 : get? s.frame.locals e.localIdx ≠ some .dead :=
       fun hd => hsl_ne (Option.some.inj (hsl_a.symm.trans hd))
@@ -7598,7 +7664,7 @@ private theorem step_safeRef_deref_read_misaligned_both_ub
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing an unaligned reference")) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, halloc, _⟩ := id hstate
   have himm_r := himm_ref tf hframes
   refine ⟨?_, ?_⟩
   · obtain ⟨slot_r, mls_r, _, _, hslot_rf, hmls_r, _, hloc_r⟩ := hfr.lookup_local hdecl_ref
@@ -7664,6 +7730,7 @@ private theorem step_safeRef_deref_read_misaligned_both_ub
         | nil => rw [hld] at hdecl_ref; cases hdecl_ref
         | cons d₀ ds =>
           have hd_eq : body.localDecls = d₀ :: ds := hld
+          have htd : e'.toBorrowEntry.targetFrameDepth = 0 := rfl
           have htl : e'.toBorrowEntry.targetLocal = e'.localIdx := rfl
           have htp : e'.toBorrowEntry.targetProjection = .nil := rfl
           have hperm_eq : e'.toBorrowEntry.perm = e'.perm := rfl
@@ -7686,11 +7753,13 @@ private theorem step_safeRef_deref_read_misaligned_both_ub
             dsimp only []
             rw [hlookup]
             dsimp only []
+            rw [htd]
+            dsimp only [activeFrameSlot?]
             rw [htl, htarget, hperm_eq]
             cases e'.perm <;> first | rfl | exact hbody
       rw [stepMirFn_eq_of_not_other body s hcal hphase]
       simp only [hbb, hstmt]
-      unfold evalStmt evalRvalue; dsimp only []; rw [hop_ub]
+      unfold evalStmt evalRvalue; dsimp only []; rw [hstack, hop_ub]
   · have himm_r := himm_ref tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
       ⟨dstIdx, .nil⟩ (opKind ⟨refIdx, .cons .deref .nil⟩) span m
@@ -7852,7 +7921,7 @@ private theorem step_safeRef_deref_write_misaligned_both_ub
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing an unaligned reference")) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, hcaller, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, hcaller, _, halloc, _⟩ := id hstate
   have himm_r := himm_ref tf hframes
   refine ⟨?_, ?_⟩
   · obtain ⟨slot_r, mls_r, _, _, hslot_rf, hmls_r, _, hloc_r⟩ := hfr.lookup_local hdecl_ref
@@ -7937,14 +8006,14 @@ private theorem step_safeRef_deref_write_misaligned_both_ub
           rw [hpt_res, hslot_r]
           dsimp only []
           rw [hlookup]
-          dsimp only []
+          dsimp only [activeFrameTargetLocals?]
           rw [hperm_eq]
           rcases hperm with hp | hp <;> rw [hp] <;> exact hbody
       rw [stepMirFn_eq_of_not_other body s hcal hphase]
       simp only [hbb, hstmt]
       unfold evalStmt; dsimp only []
       rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes (hop tf hframes), hop_ok]
-      dsimp only [evalPlaceWrite]; rw [hprot, hw_ub, hcaller]
+      dsimp only [evalPlaceWrite]; rw [hprot, hstack, hw_ub, hcaller]
   · have hlive_a0 : get? s.frame.locals e.localIdx ≠ some .dead :=
       fun hd => hsl_ne (Option.some.inj (hsl_a.symm.trans hd))
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
@@ -8091,7 +8160,7 @@ theorem step_safeRef_deref_write_perm_divergence
       alloc'.readScalar annealTargetDataLayout
         (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)) false =
         .ok (.fromScalarInt msc) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, hcaller, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, hcaller, _, halloc, _⟩ := id hstate
   have hop_tf := hop tf hframes
   refine ⟨?_, ?_⟩
   · have hlookup := (halloc.borrow_sync e he).2
@@ -8101,9 +8170,9 @@ theorem step_safeRef_deref_write_perm_divergence
     unfold evalStmt; dsimp only []
     rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ok]
     dsimp only [evalPlaceWrite, writePlaceValue]
-    rw [hprot]; dsimp only []
+    rw [hprot, hstack]; dsimp only []
     cases body.localDecls <;>
-    · simp only [hslot_r, hlookup]
+    · simp only [hslot_r, hlookup, AllocMapEntry.toBorrowEntry, activeFrameTargetLocals?]
       rcases hperm with hp | hp <;> simp [hp, hcaller]
   · have himm_r := himm_ref tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
@@ -8264,7 +8333,7 @@ theorem step_safeRef_deref_read_disabled_divergence
       m'.stack.frames = #[tf'] ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt msc)))) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, hcaller, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, hcaller, _, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
   · have hlookup := (halloc.borrow_sync e he).2
     rw [htag] at hlookup
@@ -8272,8 +8341,9 @@ theorem step_safeRef_deref_read_disabled_divergence
     simp only [hbb, hstmt]
     rcases hopKind with rfl | rfl <;>
     · unfold evalStmt evalRvalue evalOperand readProjectedValue; dsimp only []
+      rw [hstack]
       cases body.localDecls <;>
-        simp [hslot_r, hlookup, hperm]
+        simp [hslot_r, hlookup, AllocMapEntry.toBorrowEntry, hperm]
   · obtain ⟨himm_dst, himm_ref⟩ := himm tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
       ⟨dstIdx, .nil⟩ (opKind ⟨refIdx, .cons .deref .nil⟩) span m
@@ -9193,17 +9263,18 @@ theorem step_scalar_use_lm3_2_simulation
               body.localDecls body.layouts =
               MirStepNode.step
                 (advanceStmt s (s.frame.locals.set dstIdx (.init (.scalar sc))) s.memory) := by
+            have hlen_stack : length s.memory.callStack = 0 := by rw [hstack]; rfl
             unfold evalStmt; dsimp only []
             rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ok]
             dsimp only []; rw [hslot_d]
             cases slot_d with
             | dead => exact absurd rfl hsd_ne
             | uninit =>
-              simp only [set?_eq_some_set hlt_af_d, hprot, hbor_inv]
-              congr 2; generalize s.memory = mem at hprot ⊢; cases mem; dsimp at hprot ⊢; subst hprot; rfl
+              simp only [set?_eq_some_set hlt_af_d, hprot, hlen_stack, hbor_inv]
+              congr 2; exact memory_eq_of_activeProtectors_nil hprot
             | init _ =>
-              simp only [set?_eq_some_set hlt_af_d, hprot, hbor_inv]
-              congr 2; generalize s.memory = mem at hprot ⊢; cases mem; dsimp at hprot ⊢; subst hprot; rfl
+              simp only [set?_eq_some_set hlt_af_d, hprot, hlen_stack, hbor_inv]
+              congr 2; exact memory_eq_of_activeProtectors_nil hprot
           rw [ha_ok]
           refine .step _ _ ?_
           have hnew_d : LocalRelLM3_2 m.machine (allocMap.map id) dstDecl body.layouts
@@ -9252,7 +9323,7 @@ theorem step_direct_write_promoted_lm3_2_simulation
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   obtain ⟨e₀, he₀, he₀_loc⟩ := hmem_dst
   cases he₀_loc
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, _, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, hbor, _, _⟩ := id hstate
   have hop_tf := hop tf hframes
   have hval_prim : IsPrimScalarTy valTy := by
     rcases hdst_prim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
@@ -9394,16 +9465,17 @@ theorem step_direct_write_promoted_lm3_2_simulation
               { s.memory with
                 borrows := (updateAllocMapOnWrite allocMap e₀.localIdx none).map
                   AllocMapEntry.toBorrowEntry }) := by
+        have hlen_stack : length s.memory.callStack = 0 := by rw [hstack]; rfl
         unfold evalStmt; dsimp only []
         rw [evalRvalue_use_scalarOperand_eq_lm3_2 hstate hframes hop_tf, hop_ok]
         dsimp only []; rw [hslot_d]
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
         | uninit =>
-          simp only [set?_eq_some_set hlt_af_d, hprot, hbor,
+          simp only [set?_eq_some_set hlt_af_d, hprot, hlen_stack, hbor,
             invalidateConflictingBorrows_map_toBorrowEntry]
         | init _ =>
-          simp only [set?_eq_some_set hlt_af_d, hprot, hbor,
+          simp only [set?_eq_some_set hlt_af_d, hprot, hlen_stack, hbor,
             invalidateConflictingBorrows_map_toBorrowEntry]
       rw [ha_ok]
       apply StepRelLM3_2.step
@@ -9621,12 +9693,15 @@ theorem step_terminator_goto_return_lm3_2_simulation
   · obtain ⟨slot0, mls0, _, _, hslot0, hmls0, _, hloc0⟩ := hframe.lookup_local hdecl0
     have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
     have himm0' := himm0 topFrame hframes mls0 hmls0
+    have hhfd : ∀ bs d n, hasFrameDeallocProtectorConflict bs .nil d n = false := by
+      intro bs d n; induction bs <;> rfl
     unfold evalTerminator translateTerminator
       Miri.Interpreter.ControlFlow.evalTerminator
     rw [hret, hstack, annealTerminatorHooks_toControlHooks, hslot0]
     dsimp only [translateTerminatorKind, Id.run, Pure.pure]
     cases hloc0 with
     | ref ptrVal mptr _ mutability pk _ hty0 hptrRel =>
+      rw [hprot, hhfd]; dsimp only []
       have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
       rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
         hframe.location_eq hbb hcleanup hretCont hop0
@@ -9635,10 +9710,11 @@ theorem step_terminator_goto_return_lm3_2_simulation
         (annealControlHooks_cleanupFrame_eq false topFrame _)]
       exact StepRelLM3_2.retRoot decl0 (.ptr ptrVal 8)
         (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
-        s.memory _ hdecl0 hop0 (.ref mutability pk ptrVal mptr hty0 hptrRel) rfl
+        _ _ hdecl0 hop0 (.ref mutability pk ptrVal mptr hty0 hptrRel) rfl
     | lm3_1 hloc0_1 =>
       cases hloc0_1 with
       | rawPtr ptrVal mptr _ mutability pk _ hty0 hptrRel =>
+        rw [hprot, hhfd]; dsimp only []
         have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
         rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup hretCont hop0
@@ -9647,7 +9723,7 @@ theorem step_terminator_goto_return_lm3_2_simulation
           (annealControlHooks_cleanupFrame_eq false topFrame _)]
         exact StepRelLM3_2.retRoot decl0 (.ptr ptrVal 8)
           (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
-          s.memory _ hdecl0 hop0 (.lm3_1 (.rawPtr mutability pk ptrVal mptr hty0 hptrRel)) rfl
+          _ _ hdecl0 hop0 (.lm3_1 (.rawPtr mutability pk ptrVal mptr hty0 hptrRel)) rfl
       | base hbase0 =>
         cases hbase0 with
         | dead _ _ =>
@@ -9661,7 +9737,8 @@ theorem step_terminator_goto_return_lm3_2_simulation
           · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
               hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
             exact StepRelLM3_2.ub _ _
-          · cases himmRel with
+          · rw [hprot, hhfd]; dsimp only []
+            cases himmRel with
             | unit hzero =>
               exact False.elim (hsz0 hzero)
             | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
@@ -9671,7 +9748,7 @@ theorem step_terminator_goto_return_lm3_2_simulation
                 (annealControlHooks_popFrame_singleton hframes)
                 (annealControlHooks_copyReturn_empty _ hretPlace)
                 (annealControlHooks_cleanupFrame_eq false topFrame _)]
-              exact StepRelLM3_2.retRoot decl0 _ _ s.memory _ hdecl0 hop0
+              exact StepRelLM3_2.retRoot decl0 _ _ _ _ hdecl0 hop0
                 (.lm3_1 (.of_immediateRel (.scalar sc msc hsc hsz_sc hbool_sc hchar_sc))) rfl
             | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
               have hop0 := annealControlHooks_returnOperand_scalarPair hframes hget0
@@ -9680,7 +9757,7 @@ theorem step_terminator_goto_return_lm3_2_simulation
                 (annealControlHooks_popFrame_singleton hframes)
                 (annealControlHooks_copyReturn_empty _ hretPlace)
                 (annealControlHooks_cleanupFrame_eq false topFrame _)]
-              exact StepRelLM3_2.retRoot decl0 _ _ s.memory _ hdecl0 hop0
+              exact StepRelLM3_2.retRoot decl0 _ _ _ _ hdecl0 hop0
                 (.lm3_1 (.of_immediateRel (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair))) rfl
   · unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
     rw [hunreach]
@@ -9711,7 +9788,7 @@ theorem step_terminator_switchInt_lm3_2_simulation
     StepObsRelLM3_2 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨topFrame, hframes, _, _, hframe, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨topFrame, hframes, _, _, hframe, hcal, hstack, _, _, _, _, _⟩ := id hstate
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -9733,6 +9810,7 @@ theorem step_terminator_switchInt_lm3_2_simulation
   unfold evalTerminator
   rw [hterm, hm_term]
   dsimp only []
+  rw [hstack]
   rcases evalOperand_scalar_lm3_2_simulation hstate hframes (hdiscr topFrame hframes) hprim none with
     ⟨m', msg, ha_ub, hm_ub⟩ |
     ⟨sc, msc, tf', ha_ok, hm_ok, hstate', himm, _, _⟩
@@ -9821,7 +9899,7 @@ theorem step_terminator_assert_lm3_2_simulation
     StepRelLM3_2 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨topFrame, hframes, _, _, hframe, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨topFrame, hframes, _, _, hframe, hcal, hstack, _, _, _, _, _⟩ := id hstate
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -9835,6 +9913,7 @@ theorem step_terminator_assert_lm3_2_simulation
   unfold evalTerminator
   rw [hterm, hm_term]
   dsimp only [Miri.Interpreter.ControlFlow.evalTerminator]
+  rw [hstack]
   rcases evalOperand_scalar_lm3_2_simulation hstate hframes (hop topFrame hframes)
       (Or.inl hbool) none with
     ⟨m', msg, ha_ub, hm_ub⟩ |
@@ -10568,7 +10647,7 @@ private theorem invalidateConflictingBorrows_treeMap_eq_of_not_mem
       · rfl
       · exact absurd (Nat.eq_of_beq_eq_true h) (hnot hd (List.Mem.head tl))
     simp only [List.map_cons, invalidateConflictingBorrows, updateBorrowPerm,
-      ReborrowMapEntry.toBorrowEntry, hne,
+      ReborrowMapEntry.toBorrowEntry, Nat.beq, Bool.true_and, hne,
       ih (fun e he => hnot e (List.mem_cons_of_mem hd he))]
 
 private theorem freezeDerefRead_treeMap_eq
@@ -10730,10 +10809,10 @@ theorem hasTreeReadUB_treeMap_eq_false
             rTag hd.tag with
         | true =>
           have hne' := hne hb
-          rcases hd with ⟨_, _, _, perm, _⟩
+          rcases hd with ⟨_, _, _, perm, _, _⟩
           cases perm <;> first | rfl | exact absurd rfl hne'
         | false =>
-          rcases hd with ⟨_, _, _, perm, _⟩
+          rcases hd with ⟨_, _, _, perm, _, _⟩
           cases perm <;> rfl
     rw [List.map_cons]
     unfold hasTreeReadUB
@@ -10998,6 +11077,7 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
             .some (.some (.nil, 0)) :=
         resolveRefDerefTarget?_prim_scalar_zero s.frame.locals hlay_coh hacc_prim hdecl_t rfl
           htgt_acc_kind hoff0 hsz_sc
+      have htd : e.toBorrowEntry.targetFrameDepth = 0 := rfl
       have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
       have hro : e.toBorrowEntry.rangeOffset = 0 := rfl
       have hrl : e.toBorrowEntry.rangeLen = 0 := rfl
@@ -11007,8 +11087,10 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
       rw [hlay_coh.1, hpt_res, hsr_full]
       dsimp only [Nat.beq]
       have hslot_t' : get? s.frame.locals e.localIdx = some (.init (.scalar sc_t)) := hslot_t
-      rw [hcda, Bool.true_and, hlook_s]
+      rw [hcda, Bool.true_and, hlook_s, hstack]
       dsimp only []
+      rw [htd]
+      dsimp only [activeFrameSlot?]
       rw [htl, hslot_t']
       dsimp only []
       rw [hro, hrl, hperm_eq, hres_tgt]
@@ -11049,7 +11131,7 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
             s_e.memory body.localDecls body.layouts =
             .ok (.ptr { allocId := s_e.memory.nextTag, offsetBytes := 0 } 8) s_e.frame.locals mem₁ := by
         obtain ⟨mem₁, hrv, _⟩ := evalRvalue_reborrow_root_ok halloc_e.tags_nodup hbor_e hprot_e
-          hsr_full_e he_am htag_am hne_dis hnot_fmut hlay_coh hpt_res hacc_prim hdecl_t
+          hstack_e hsr_full_e he_am htag_am hne_dis hnot_fmut hlay_coh hpt_res hacc_prim hdecl_t
           htgt_acc_kind hoff0 hslot_t hsz_sc
         exact ⟨mem₁, hrv⟩
       obtain ⟨mem₁, hrv_e_eq⟩ := hrv_e
@@ -11088,10 +11170,11 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
         simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
         rw [hrv_s]; dsimp only []
         rw [hslot_d_s]
+        have hlen_stack : length s.memory.callStack = 0 := by rw [hstack]; rfl
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
-        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_tm']
-        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_tm']
+        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot, hlen_stack, hinv_tm']
+        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot, hlen_stack, hinv_tm']
       have hmls_ra' : tfa.locals[refIdx]'hlt_ra =
           ⟨.live (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))),
             mls_r.layout⟩ := by
@@ -11400,9 +11483,10 @@ theorem step_safeRef_deref_read_tree_simulation
       intro ptrVal hget e' he' htag' hdead
       obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
       exact hlive_ref ptrVal hget e he htag' hdead) hlay_coh
-  obtain ⟨tf, hframes, _, _, hfr, hcal_e, _, hprot_e, hcaller_e, hbor_e, halloc_e, _⟩ :=
+  obtain ⟨tf, hframes, _, _, hfr, hcal_e, hstack_e, hprot_e, hcaller_e, hbor_e, halloc_e, _⟩ :=
     id htree.erased_rel
   have hcal : s.memory.activeCallee = none := hcal_e
+  have hstack : s.memory.callStack = .nil := hstack_e
   have hprot : s.memory.activeProtectors = .nil := hprot_e
   have hbor_s : s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry := htree.borrows_eq
   have hnodup_tm : (treeMap.map ReborrowMapEntry.tag).Nodup := by
@@ -11511,14 +11595,14 @@ theorem step_safeRef_deref_read_tree_simulation
           .ub :=
         hop_eq.trans hop_res
       have ha_s : stepMirFn body s = .fail .ub := by
-        rw [hs_step]; unfold evalStmt evalRvalue; dsimp only []; rw [hop_s]
+        rw [hs_step]; unfold evalStmt evalRvalue; dsimp only []; rw [hstack, hop_s]
       have ha_e : stepMirFn body s_e = .fail .ub := by
-        rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hop_res]
+        rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hstack_e, hop_res]
       rw [ha_e] at hsim; rw [ha_s]
       cases hsim with | ub m' msg => exact .ub _ m' msg
     | unsupported =>
       have ha_e : stepMirFn body s_e = .unsupported := by
-        rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hop_res]
+        rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hstack_e, hop_res]
       rw [ha_e] at hsim; cases hsim
     | ok val locals₁ =>
       have hop_s : evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
@@ -11541,7 +11625,7 @@ theorem step_safeRef_deref_read_tree_simulation
             rw [hlb_e] at hop_res
             dsimp only [ReborrowMapEntry.toAllocMapEntry, AllocMapEntry.toBorrowEntry] at hop_res
             cases hbp : e.perm <;> (rw [hbp] at hop_res; try cases hop_res) <;>
-            · dsimp only [] at hop_res
+            · dsimp only [activeFrameSlot?] at hop_res
               cases hgt : get? s.frame.locals e.localIdx with
               | none =>
                 rw [hgt, hcaller_e] at hop_res
@@ -11571,10 +11655,10 @@ theorem step_safeRef_deref_read_tree_simulation
       | false =>
         have ha_s : stepMirFn body s = .fail .ub := by
           rw [hs_step]; unfold evalStmt evalRvalue; dsimp only []
-          rw [hop_s]; dsimp only []; rw [hval_load]
+          rw [hstack, hop_s]; dsimp only []; rw [hval_load]
         have ha_e : stepMirFn body s_e = .fail .ub := by
           rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []
-          rw [hop_res]; dsimp only []; rw [hval_load]
+          rw [hstack_e, hop_res]; dsimp only []; rw [hval_load]
         rw [ha_e] at hsim; rw [ha_s]
         cases hsim with | ub m' msg => exact .ub _ m' msg
       | true =>
@@ -11593,7 +11677,7 @@ theorem step_safeRef_deref_read_tree_simulation
           have hub_s := derefReadTreeUB_treeMap_eq_false s.frame.locals treeMap hnodup_tm refIdx
             ptrVal he htag_am hsr_full hperm_e
             (by rw [← hbor_s]; exact hanc_read ptrVal hsr_full e he htag_am)
-          unfold evalRvalue; dsimp only []; rw [hop_s]; dsimp only []; rw [hval_load]
+          unfold evalRvalue; dsimp only []; rw [hstack, hop_s]; dsimp only []; rw [hval_load]
           rcases hopKind with rfl | rfl <;>
           · rw [hbor_s]
             cases hbm : treeMap.map ReborrowMapEntry.toBorrowEntry with
@@ -11604,6 +11688,7 @@ theorem step_safeRef_deref_read_tree_simulation
               | nil =>
                 rw [hbm] at hfrz; dsimp only [] at hfrz ⊢
                 rw [← hfrz, ← hbm, ← hbor_s]
+                exact congrArg _ (memory_eq_of_callStack_nil hstack).symm
               | cons b₂ rest₂ =>
                 rw [hbm] at hfrz hub_s; dsimp only [] at hfrz ⊢
                 rw [hprot]
@@ -11615,7 +11700,7 @@ theorem step_safeRef_deref_read_tree_simulation
             rw [hslot_d_s, hsd_dead]
           have ha_e : stepMirFn body s_e = .fail .ub := by
             rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []
-            rw [hop_res]; dsimp only []; rw [hval_load]
+            rw [hstack_e, hop_res]; dsimp only []; rw [hval_load]
             rcases hopKind with rfl | rfl <;>
             · cases hb : s_e.memory.borrows with
               | nil => dsimp only []; rw [hslot_d_s, hsd_dead]
@@ -11653,33 +11738,42 @@ theorem step_safeRef_deref_read_tree_simulation
                   { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry }) := by
             rw [hs_step]; unfold evalStmt; dsimp only []; rw [hrv_s]; dsimp only []
             rw [hslot_d_s]
+            have hlen_stack : length s.memory.callStack = 0 := by rw [hstack]; rfl
             cases slot_d with
             | dead => exact absurd rfl hsd_dead
-            | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_s]
-            | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_s]
+            | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot, hlen_stack, hinv_s]
+            | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot, hlen_stack, hinv_s]
           have hprot_se : s_e.memory.activeProtectors = .nil := hprot_e
           have hex_be : ∃ b_e,
               stepMirFn body s_e =
                 .step (advanceStmt s_e (s.frame.locals.set dstIdx (.init val))
                   { s_e.memory with borrows := b_e }) := by
             rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []
-            rw [hop_res]; dsimp only []; rw [hval_load]
+            rw [hstack_e, hop_res]; dsimp only []; rw [hval_load]
             rcases hopKind with rfl | rfl <;>
             · cases hb : s_e.memory.borrows with
               | nil =>
                 dsimp only []; rw [hslot_d_s]
                 cases slot_d with
                 | dead => exact absurd rfl hsd_dead
-                | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
-                | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
-              | cons _ r =>
+                | uninit =>
+                  simp only [set?_eq_some_set hlt_af_d_s, hprot_se]
+                  exact ⟨invalidateConflictingBorrows s_e.memory.borrows dstIdx none (length s_e.memory.callStack), by congr 3⟩
+                | init _ =>
+                  simp only [set?_eq_some_set hlt_af_d_s, hprot_se]
+                  exact ⟨invalidateConflictingBorrows s_e.memory.borrows dstIdx none (length s_e.memory.callStack), by congr 3⟩
+              | cons b₀ r =>
                 cases r with
                 | nil =>
                   dsimp only []; rw [hslot_d_s]
                   cases slot_d with
                   | dead => exact absurd rfl hsd_dead
-                  | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
-                  | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
+                  | uninit =>
+                    simp only [set?_eq_some_set hlt_af_d_s, hprot_se]
+                    exact ⟨invalidateConflictingBorrows s_e.memory.borrows dstIdx none (length s_e.memory.callStack), by congr 3⟩
+                  | init _ =>
+                    simp only [set?_eq_some_set hlt_af_d_s, hprot_se]
+                    exact ⟨invalidateConflictingBorrows s_e.memory.borrows dstIdx none (length s_e.memory.callStack), by congr 3⟩
                 | cons _ _ =>
                   rw [hb] at hub_e
                   dsimp only []
@@ -11747,9 +11841,10 @@ theorem step_safeRef_deref_write_tree_simulation
       intro ptrVal e' tgtDecl hget he' htag' hdecl_t hdead
       obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
       exact hlive_ref ptrVal e tgtDecl hget he htag' hdecl_t hdead) hlay_coh
-  obtain ⟨tf, hframes, _, _, hfr, hcal_e, _, hprot_e, hcaller_e, hbor_e, halloc_e, _⟩ :=
+  obtain ⟨tf, hframes, _, _, hfr, hcal_e, hstack_e, hprot_e, hcaller_e, hbor_e, halloc_e, _⟩ :=
     id htree.erased_rel
   have hcal : s.memory.activeCallee = none := hcal_e
+  have hstack : s.memory.callStack = .nil := hstack_e
   have hprot : s.memory.activeProtectors = .nil := hprot_e
   have hcaller : s.memory.callerLocals = .nil := hcaller_e
   have hbor_s : s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry := htree.borrows_eq
@@ -11846,36 +11941,36 @@ theorem step_safeRef_deref_write_tree_simulation
     · have ha_s : stepMirFn body s = .fail .ub := by
         rw [hs_step]; unfold evalStmt; dsimp only []
         rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-        rw [hprot, hcaller]; unfold writePlaceValue; dsimp only []
+        rw [hprot, hstack, hcaller]; unfold writePlaceValue; dsimp only []
         cases body.localDecls <;> simp only [hslot_r_s, hsr]
       have ha_e : stepMirFn body s_e = .fail .ub := by
         rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
         rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
-        rw [hprot_e, hcaller_e]; unfold writePlaceValue; dsimp only []
+        rw [hprot_e, hstack_e, hcaller_e]; unfold writePlaceValue; dsimp only []
         cases body.localDecls <;> simp only [hslot_r_s, hsr]
       rw [ha_e] at hsim; rw [ha_s]
       cases hsim with | ub m' msg => exact .ub _ m' msg
     · have ha_s : stepMirFn body s = .fail .ub := by
         rw [hs_step]; unfold evalStmt; dsimp only []
         rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-        rw [hprot, hcaller]; unfold writePlaceValue; dsimp only []
+        rw [hprot, hstack, hcaller]; unfold writePlaceValue; dsimp only []
         cases body.localDecls <;> simp only [hslot_r_s, hsr]
       have ha_e : stepMirFn body s_e = .fail .ub := by
         rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
         rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
-        rw [hprot_e, hcaller_e]; unfold writePlaceValue; dsimp only []
+        rw [hprot_e, hstack_e, hcaller_e]; unfold writePlaceValue; dsimp only []
         cases body.localDecls <;> simp only [hslot_r_s, hsr]
       rw [ha_e] at hsim; rw [ha_s]
       cases hsim with | ub m' msg => exact .ub _ m' msg
     · have ha_s : stepMirFn body s = .fail .ub := by
         rw [hs_step]; unfold evalStmt; dsimp only []
         rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-        rw [hprot, hcaller]; unfold writePlaceValue; dsimp only []
+        rw [hprot, hstack, hcaller]; unfold writePlaceValue; dsimp only []
         cases body.localDecls <;> simp only [hslot_r_s, hsr]
       have ha_e : stepMirFn body s_e = .fail .ub := by
         rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
         rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
-        rw [hprot_e, hcaller_e]; unfold writePlaceValue; dsimp only []
+        rw [hprot_e, hstack_e, hcaller_e]; unfold writePlaceValue; dsimp only []
         cases body.localDecls <;> simp only [hslot_r_s, hsr]
       rw [ha_e] at hsim; rw [ha_s]
       cases hsim with | ub m' msg => exact .ub _ m' msg
@@ -11894,18 +11989,18 @@ theorem step_safeRef_deref_write_tree_simulation
         have ha_s : stepMirFn body s = .fail .ub := by
           rw [hs_step]; unfold evalStmt; dsimp only []
           rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res, hcaller]
+          rw [hprot, hstack]; dsimp only []; rw [hwp_eq.trans hwp_res, hcaller]
         have ha_e : stepMirFn body s_e = .fail .ub := by
           rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
           rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot_e]; dsimp only []; rw [hwp_res, hcaller_e]
+          rw [hprot_e, hstack_e]; dsimp only []; rw [hwp_res, hcaller_e]
         rw [ha_e] at hsim; rw [ha_s]
         cases hsim with | ub m' msg => exact .ub _ m' msg
       | unsupported =>
         have ha_e : stepMirFn body s_e = .unsupported := by
           rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
           rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot_e]; dsimp only []; rw [hwp_res]
+          rw [hprot_e, hstack_e]; dsimp only []; rw [hwp_res]
         rw [ha_e] at hsim; cases hsim
       | ok locals₂ =>
         obtain ⟨_, _, _, _, _, _, ⟨e_am, he_am, htag_am, _⟩⟩ := hptrRel
@@ -11944,7 +12039,7 @@ theorem step_safeRef_deref_write_tree_simulation
                 { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry }) := by
           rw [hs_step]; unfold evalStmt; dsimp only []
           rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res]
+          rw [hprot, hstack]; dsimp only []; rw [hwp_eq.trans hwp_res]
           dsimp only [derefWriteUnionProtectorUB, Bool.or]
           simp only [hwub_s, hcaller, hinv_lay_s]
           rw [hinv_s]
@@ -11956,7 +12051,7 @@ theorem step_safeRef_deref_write_tree_simulation
                     ⟨refIdx, .cons .deref .nil⟩ .nil }) := by
           rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
           rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot_e]; dsimp only []; rw [hwp_res]
+          rw [hprot_e, hstack_e]; dsimp only []; rw [hwp_res]
           dsimp only [derefWriteUnionProtectorUB, Bool.or]
           simp only [hwub_e, hinv_lay_e]
         rw [ha_e] at hsim; rw [ha_s]
@@ -12020,6 +12115,9 @@ theorem step_terminator_goto_return_tree_simulation
       hcal, hstack, hprot, hcaller, hbor, halloc, hd_tf⟩
   have hcal' : s.memory.activeCallee = none := hcal
   have hstack' : s.memory.callStack = [] := hstack
+  have hprot' : s.memory.activeProtectors = [] := hprot
+  have hhfd : ∀ bs d n, hasFrameDeallocProtectorConflict bs [] d n = false := by
+    intro bs d n; induction bs <;> rfl
   rw [stepMirFn_eq_of_not_other body s hcal' hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
     simp [hstmt_len]
@@ -12054,6 +12152,7 @@ theorem step_terminator_goto_return_tree_simulation
     have himm0' := himm0 topFrame hframes mls0 hmls0
     cases hloc0 with
     | ref ptrVal mptr _ mutability pk _ hty0 hptrRel =>
+      rw [hprot', hhfd]; dsimp only []
       have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
       rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
         hframe.location_eq hbb hcleanup hretCont hop0
@@ -12062,10 +12161,11 @@ theorem step_terminator_goto_return_tree_simulation
         (annealControlHooks_cleanupFrame_eq false topFrame _)]
       exact StepRelLM3_2Tree.retRoot treeMap decl0 (.ptr ptrVal 8)
         (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
-        s.memory _ hdecl0 hop0 (.ref mutability pk ptrVal mptr hty0 hptrRel) rfl
+        _ _ hdecl0 hop0 (.ref mutability pk ptrVal mptr hty0 hptrRel) rfl
     | lm3_1 hloc0_1 =>
       cases hloc0_1 with
       | rawPtr ptrVal mptr _ mutability pk _ hty0 hptrRel =>
+        rw [hprot', hhfd]; dsimp only []
         have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
         rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup hretCont hop0
@@ -12074,7 +12174,7 @@ theorem step_terminator_goto_return_tree_simulation
           (annealControlHooks_cleanupFrame_eq false topFrame _)]
         exact StepRelLM3_2Tree.retRoot treeMap decl0 (.ptr ptrVal 8)
           (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
-          s.memory _ hdecl0 hop0 (.lm3_1 (.rawPtr mutability pk ptrVal mptr hty0 hptrRel)) rfl
+          _ _ hdecl0 hop0 (.lm3_1 (.rawPtr mutability pk ptrVal mptr hty0 hptrRel)) rfl
       | base hbase0 =>
         cases hbase0 with
         | dead _ _ =>
@@ -12088,7 +12188,8 @@ theorem step_terminator_goto_return_tree_simulation
           · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
               hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
             exact StepRelLM3_2Tree.ub _ _ _
-          · cases himmRel with
+          · rw [hprot', hhfd]; dsimp only []
+            cases himmRel with
             | unit hzero =>
               exact False.elim (hsz0 hzero)
             | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
@@ -12098,7 +12199,7 @@ theorem step_terminator_goto_return_tree_simulation
                 (annealControlHooks_popFrame_singleton hframes)
                 (annealControlHooks_copyReturn_empty _ hretPlace)
                 (annealControlHooks_cleanupFrame_eq false topFrame _)]
-              exact StepRelLM3_2Tree.retRoot treeMap decl0 _ _ s.memory _ hdecl0 hop0
+              exact StepRelLM3_2Tree.retRoot treeMap decl0 _ _ _ _ hdecl0 hop0
                 (.lm3_1 (.of_immediateRel (.scalar sc msc hsc hsz_sc hbool_sc hchar_sc))) rfl
             | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
               have hop0 := annealControlHooks_returnOperand_scalarPair hframes hget0
@@ -12107,7 +12208,7 @@ theorem step_terminator_goto_return_tree_simulation
                 (annealControlHooks_popFrame_singleton hframes)
                 (annealControlHooks_copyReturn_empty _ hretPlace)
                 (annealControlHooks_cleanupFrame_eq false topFrame _)]
-              exact StepRelLM3_2Tree.retRoot treeMap decl0 _ _ s.memory _ hdecl0 hop0
+              exact StepRelLM3_2Tree.retRoot treeMap decl0 _ _ _ _ hdecl0 hop0
                 (.lm3_1 (.of_immediateRel (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair))) rfl
   · unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
     rw [hunreach]
@@ -12257,7 +12358,7 @@ def disableTreeMapLocal (treeMap : List ReborrowMapEntry) (loc : Local) :
     List ReborrowMapEntry :=
   treeMap.map fun e =>
     match Nat.beq e.localIdx loc with
-    | true => { e with perm := .disabled }
+    | true => { e with perm := .disabled, allocDead := true }
     | false => e
 
 private theorem disableLocalBorrows_treeMap_eq
@@ -12269,10 +12370,10 @@ private theorem disableLocalBorrows_treeMap_eq
   | cons hd tl ih =>
     have hdef : disableTreeMapLocal (hd :: tl) loc =
         (match Nat.beq hd.localIdx loc with
-         | true => { hd with perm := .disabled }
+         | true => { hd with perm := .disabled, allocDead := true }
          | false => hd) :: disableTreeMapLocal tl loc := rfl
     rw [hdef, List.map_cons, List.map_cons, disableLocalBorrows, ih]
-    rcases hd with ⟨tag, l, aid, perm, ptag⟩
+    rcases hd with ⟨tag, l, aid, perm, ptag, allocDead⟩
     dsimp only [ReborrowMapEntry.toBorrowEntry]
     cases Nat.beq l loc <;> rfl
 
@@ -12282,7 +12383,13 @@ with `writerTag = none` while preserving `parentTag`. -/
 def updateTreeMapOnDirectWrite (treeMap : List ReborrowMapEntry)
     (targetLocal : Local) : List ReborrowMapEntry :=
   treeMap.map fun e =>
-    { e with perm := (updateBorrowPerm e.toBorrowEntry targetLocal none).perm }
+    let newPerm := (updateBorrowPerm e.toBorrowEntry targetLocal none).perm
+    { e with
+      perm := newPerm
+      allocDead := match e.perm, newPerm with
+        | .disabled, _ => e.allocDead
+        | _, .disabled => false
+        | _, _ => e.allocDead }
 
 private theorem invalidateConflictingBorrows_treeMap_directWrite_eq
     (treeMap : List ReborrowMapEntry) (targetLocal : Local) :
@@ -12293,16 +12400,21 @@ private theorem invalidateConflictingBorrows_treeMap_directWrite_eq
   | nil => rfl
   | cons hd tl ih =>
     have hdef : updateTreeMapOnDirectWrite (hd :: tl) targetLocal =
-        { hd with perm := (updateBorrowPerm hd.toBorrowEntry targetLocal none).perm } ::
+        (let newPerm := (updateBorrowPerm hd.toBorrowEntry targetLocal none).perm
+         { hd with
+           perm := newPerm
+           allocDead := match hd.perm, newPerm with
+             | .disabled, _ => hd.allocDead
+             | _, .disabled => false
+             | _, _ => hd.allocDead }) ::
           updateTreeMapOnDirectWrite tl targetLocal := rfl
     rw [hdef, List.map_cons, List.map_cons, invalidateConflictingBorrows, ih]
     congr 1
-    rcases hd with ⟨tag, loc, aid, perm, ptag⟩
+    rcases hd with ⟨tag, loc, aid, perm, ptag, allocDead⟩
     unfold updateBorrowPerm applyTreeBorrowTransition ReborrowMapEntry.toBorrowEntry
     dsimp only [BEq.beq, treeBorrowWriterRelatedness]
-    cases Nat.beq loc targetLocal
-    · rfl
-    · cases treeBorrowNodeAccess .write .foreignAccess perm false <;> rfl
+    cases Nat.beq loc targetLocal <;>
+      rcases perm with _ | (_ | _) | _ | _ | _ | _ <;> rfl
 
 private theorem StepRelLM3_2.toTree_of_erased
     {body : CapturedMir} {s s_e : MachineState} {m : AnnealStepState}
@@ -12411,12 +12523,14 @@ theorem step_storageLive_lm3_2_tree_simulation
     StepRelLM3_2Tree body m treeMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨_, _, _, _, hfr, hcal, _, hprot, _, hbor_e, _, _⟩ := id htree.erased_rel
+  obtain ⟨_, _, _, _, hfr, hcal, hstack, hprot, _, hbor_e, _, _⟩ := id htree.erased_rel
   obtain ⟨slot, _, hlt_af, _, hslot, _, _, _⟩ := hfr.lookup_local hdecl
   have hcal_s : s.memory.activeCallee = none := hcal
   have hslot_s : get? s.frame.locals loc = some slot := hslot
   have hlt_af_s : loc < s.frame.locals.length := hlt_af
   have hprot_s : s.memory.activeProtectors = .nil := hprot
+  have hlen_s : length s.memory.callStack = 0 := by
+    dsimp only [eraseBorrowParents] at hstack; rw [hstack]; rfl
   have hnot_am : ∀ e ∈ treeMap.map ReborrowMapEntry.toAllocMapEntry, e.localIdx ≠ loc := by
     intro e he; obtain ⟨x, hx, rfl⟩ := List.mem_map.mp he; exact hnot_mapped x hx
   have hdis_s : disableLocalBorrows s.memory.borrows loc = s.memory.borrows := by
@@ -12437,11 +12551,11 @@ theorem step_storageLive_lm3_2_tree_simulation
     dsimp only [eraseBorrowParents] at hdis_e ⊢
     simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
     rw [hslot_s, set?_eq_some_set hlt_af_s]; dsimp only []
-    rw [hdis_e, hprot_s]
+    rw [hprot_s, hlen_s, hdis_e]
   · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
     simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
     rw [hslot_s, set?_eq_some_set hlt_af_s]; dsimp only [advanceStmt, eraseBorrowParents]
-    rw [hdis_s, hprot_s, ← htree.borrows_eq]
+    rw [hprot_s, hlen_s, hdis_s, ← htree.borrows_eq]
 
 /-- **`step_storageDead_lm3_2_tree_simulation`**: `StorageDead(loc)` (`loc ≠ 0`)
 steps in lockstep from any `StateRelLM3_2Tree` state, disabling any `treeMap`
@@ -12459,21 +12573,23 @@ theorem step_storageDead_lm3_2_tree_simulation
     StepRelLM3_2Tree body m (disableTreeMapLocal treeMap loc)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨_, _, _, _, hfr, hcal, _, hprot, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨_, _, _, _, hfr, hcal, hstack, hprot, _, _, _, _⟩ := id htree.erased_rel
   obtain ⟨slot, _, hlt_af, _, hslot, _, _, _⟩ := hfr.lookup_local hdecl
   have hcal_s : s.memory.activeCallee = none := hcal
   have hslot_s : get? s.frame.locals loc = some slot := hslot
   have hlt_af_s : loc < s.frame.locals.length := hlt_af
   have hprot_s : s.memory.activeProtectors = .nil := hprot
+  have hlen_s : length s.memory.callStack = 0 := by
+    dsimp only [eraseBorrowParents] at hstack; rw [hstack]; rfl
   have hskel : SameAllocSkeleton
       (disableAllocMapLocal (treeMap.map ReborrowMapEntry.toAllocMapEntry) loc)
       ((disableTreeMapLocal treeMap loc).map ReborrowMapEntry.toAllocMapEntry) :=
     SameAllocSkeleton.of_tree_maps treeMap
-      (fun e => match Nat.beq e.localIdx loc with | true => { e with perm := .disabled } | false => e)
+      (fun e => match Nat.beq e.localIdx loc with | true => { e with perm := .disabled, allocDead := true } | false => e)
       (fun e => by cases Nat.beq e.localIdx loc <;> rfl)
       (fun e => by cases Nat.beq e.localIdx loc <;> rfl)
       (fun e => by cases Nat.beq e.localIdx loc <;> rfl)
-      (fun e => match Nat.beq e.localIdx loc with | true => { e with perm := .disabled } | false => e)
+      (fun e => match Nat.beq e.localIdx loc with | true => { e with perm := .disabled, allocDead := true } | false => e)
       (fun e => by cases Nat.beq e.localIdx loc <;> rfl)
       (fun e => by cases Nat.beq e.localIdx loc <;> rfl)
       (fun e => by cases Nat.beq e.localIdx loc <;> rfl)
@@ -12486,10 +12602,10 @@ theorem step_storageDead_lm3_2_tree_simulation
       ?_, ?_⟩)
   · rw [stepMirFn_eq_of_not_other body _ hcal hphase]
     dsimp only [eraseBorrowParents]; simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
-    rw [hslot_s, set?_eq_some_set hlt_af_s, hprot_s]
+    rw [hslot_s, set?_eq_some_set hlt_af_s, hprot_s, hlen_s]
   · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
     simp only [hbb, hstmt]; unfold evalStmt; dsimp only [advanceStmt, eraseBorrowParents]
-    rw [hslot_s, set?_eq_some_set hlt_af_s, hprot_s, htree.borrows_eq,
+    rw [hslot_s, set?_eq_some_set hlt_af_s, hprot_s, hlen_s, htree.borrows_eq,
       disableLocalBorrows_treeMap_eq]
 
 /-- **`step_placeMention_local_lm3_2_tree_simulation`**: `PlaceMention(_x)` on a
@@ -12647,10 +12763,12 @@ theorem step_scalar_use_lm3_2_tree_simulation
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   let s_e := eraseBorrowParents s treeMap
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, _, _, _⟩ := id htree.erased_rel
   obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
   have hcal_s : s.memory.activeCallee = none := hcal
   have hprot_s : s.memory.activeProtectors = .nil := hprot
+  have hlen_s : length s.memory.callStack = 0 := by
+    dsimp only [eraseBorrowParents] at hstack; rw [hstack]; rfl
   have hslot_d_s : get? s.frame.locals dstIdx = some slot_d := hslot_d
   have hlt_af_d_s : dstIdx < s.frame.locals.length := hlt_af_d
   have hop_tf := hop tf hframes
@@ -12696,16 +12814,18 @@ theorem step_scalar_use_lm3_2_tree_simulation
         rw [hrv_e, hop_ok]; dsimp only []; rw [hslot_d_s]
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
-        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s]
-        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s]
+        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s]
+        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s]
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         dsimp only [s_e, eraseBorrowParents] at hrv_s hop_eq hop_ok ⊢
         simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
         rw [hrv_s, hop_eq.trans hop_ok]; dsimp only []; rw [hslot_d_s]
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
-        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, htree.borrows_eq, hinv_s]; rfl
-        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, htree.borrows_eq, hinv_s]; rfl
+        | uninit =>
+          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, htree.borrows_eq, hinv_s]; rfl
+        | init _ =>
+          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, htree.borrows_eq, hinv_s]; rfl
 
 /-- **`step_direct_write_promoted_lm3_2_tree_simulation`**: direct scalar
 assignment `_d = .use op` into a borrowed / promoted primitive-scalar local `_d`
@@ -12734,10 +12854,12 @@ theorem step_direct_write_promoted_lm3_2_tree_simulation
   obtain ⟨e₀, he₀, he₀_loc⟩ := hmem_dst
   have hmem_am : ∃ e' ∈ treeMap.map ReborrowMapEntry.toAllocMapEntry, e'.localIdx = dstIdx :=
     ⟨e₀.toAllocMapEntry, List.mem_map_of_mem he₀, he₀_loc⟩
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, _, _, _⟩ := id htree.erased_rel
   obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
   have hcal_s : s.memory.activeCallee = none := hcal
   have hprot_s : s.memory.activeProtectors = .nil := hprot
+  have hlen_s : length s.memory.callStack = 0 := by
+    dsimp only [eraseBorrowParents] at hstack; rw [hstack]; rfl
   have hslot_d_s : get? s.frame.locals dstIdx = some slot_d := hslot_d
   have hlt_af_d_s : dstIdx < s.frame.locals.length := hlt_af_d
   have hop_tf := hop tf hframes
@@ -12752,7 +12874,14 @@ theorem step_direct_write_promoted_lm3_2_tree_simulation
     SameAllocSkeleton.of_tree_maps treeMap
       (fun e => e.updateOnWrite dstIdx none)
       (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
-      (fun e => { e with perm := (updateBorrowPerm e.toBorrowEntry dstIdx none).perm })
+      (fun e =>
+        let newPerm := (updateBorrowPerm e.toBorrowEntry dstIdx none).perm
+        { e with
+          perm := newPerm
+          allocDead := match e.perm, newPerm with
+            | .disabled, _ => e.allocDead
+            | _, .disabled => false
+            | _, _ => e.allocDead })
       (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
   refine StepRelLM3_2.toTree_of_erased
     (step_direct_write_promoted_lm3_2_simulation htree.erased_rel hphase hbb hstmt hdecl_dst
@@ -12787,16 +12916,18 @@ theorem step_direct_write_promoted_lm3_2_tree_simulation
         rw [hrv_e, hop_ok]; dsimp only []; rw [hslot_d_s]
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
-        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s]
-        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s]
+        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s]
+        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s]
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         dsimp only [s_e, eraseBorrowParents] at hrv_s hop_eq hop_ok ⊢
         simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
         rw [hrv_s, hop_eq.trans hop_ok]; dsimp only []; rw [hslot_d_s]
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
-        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, htree.borrows_eq, hinv_s]; rfl
-        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, htree.borrows_eq, hinv_s]; rfl
+        | uninit =>
+          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, htree.borrows_eq, hinv_s]; rfl
+        | init _ =>
+          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, htree.borrows_eq, hinv_s]; rfl
 
 private theorem evalStmt_assign_ref_local_tree_out
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -12825,11 +12956,15 @@ private theorem evalStmt_assign_ref_local_tree_out
   let s_e := eraseBorrowParents s treeMap
   let newEntry := refAllocMapEntry body.localDecls body.layouts bk targetIdx s.memory.nextTag allocId
   let treeMap' := ReborrowMapEntry.ofRoot newEntry :: treeMap
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, _, _, _⟩ := id htree.erased_rel
   obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
   obtain ⟨slot_t, _, _, _, hslot_t, _, _, _⟩ := hfr.lookup_local hdecl_tgt
   have hcal_s : s.memory.activeCallee = none := hcal
   have hprot_s : s.memory.activeProtectors = .nil := hprot
+  have hstack_e : s_e.memory.callStack = .nil := hstack
+  have hstack_s : s.memory.callStack = .nil := hstack
+  have hlen_e : length s_e.memory.callStack = 0 := by rw [hstack_e]; rfl
+  have hlen_s : length s.memory.callStack = 0 := hlen_e
   have hslot_d_s : get? s.frame.locals dstIdx = some slot_d := hslot_d
   have hslot_t_s : get? s.frame.locals targetIdx = some slot_t := hslot_t
   have hlt_af_d_s : dstIdx < s.frame.locals.length := hlt_af_d
@@ -12876,33 +13011,44 @@ private theorem evalStmt_assign_ref_local_tree_out
         have hlt_af_d_e : dstIdx < s_e.frame.locals.length := hlt_af_d
         have hprot_e : s_e.memory.activeProtectors = .nil := hprot
         have hcons_e :
-            { tag := s_e.memory.nextTag, targetLocal := targetIdx, targetProjection := [],
+            { tag := s_e.memory.nextTag,
+              targetLocal := targetIdx, targetProjection := [],
               perm := refBorrowPerm body.localDecls body.layouts bk targetIdx, parentTag := none } ::
               s_e.memory.borrows =
-            newEntry.toBorrowEntry :: s_e.memory.borrows := rfl
+            newEntry.toBorrowEntry :: s_e.memory.borrows := by
+          dsimp only [newEntry, refAllocMapEntry, AllocMapEntry.toBorrowEntry]
+          cases refBorrowPerm body.localDecls body.layouts bk targetIdx <;> rfl
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
-        | uninit => simp only [set?_eq_some_set hlt_af_d_e, hprot_e, hcons_e]; rfl
-        | init _ => simp only [set?_eq_some_set hlt_af_d_e, hprot_e, hcons_e]; rfl
+        | uninit =>
+          simp only [set?_eq_some_set hlt_af_d_e, hprot_e, hlen_e, hcons_e]
+          dsimp only [s_e, eraseBorrowParents] at hprot_e ⊢
+        | init _ =>
+          simp only [set?_eq_some_set hlt_af_d_e, hprot_e, hlen_e, hcons_e]
+          dsimp only [s_e, eraseBorrowParents] at hprot_e ⊢
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
         rw [evalRvalue_ref_live_eq s body.localDecls body.layouts bk targetIdx slot_t hslot_t_s hst_dead]
         dsimp only []; rw [hslot_d_s]
         have hcons_bor :
-            { tag := s.memory.nextTag, targetLocal := targetIdx, targetProjection := [],
+            { tag := s.memory.nextTag,
+              targetLocal := targetIdx, targetProjection := [],
               perm := refBorrowPerm body.localDecls body.layouts bk targetIdx, parentTag := none } ::
               s.memory.borrows =
             treeMap'.map ReborrowMapEntry.toBorrowEntry := by
-          simp [treeMap', htree.borrows_eq, ReborrowMapEntry.ofRoot,
+          simp only [treeMap', List.map_cons, htree.borrows_eq, ReborrowMapEntry.ofRoot,
             ReborrowMapEntry.toBorrowEntry, newEntry, refAllocMapEntry]
+          cases refBorrowPerm body.localDecls body.layouts bk targetIdx <;> rfl
         cases slot_d with
         | dead => exact absurd rfl hsd_dead
         | uninit =>
           dsimp only [s_e, eraseBorrowParents, advanceStmt]
-          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hcons_bor, hinv_s]; rfl
+          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, hcons_bor, hinv_s]
+          congr 2
         | init _ =>
           dsimp only [s_e, eraseBorrowParents, advanceStmt]
-          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hcons_bor, hinv_s]; rfl
+          simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, hcons_bor, hinv_s]
+          congr 2
 
 /-- **`evalRvalue_ref_tree_simulation`**: `_d = &_t` / `_d = &mut _t` on a live
 immediate primitive-scalar local `_t` from any `StateRelLM3_2Tree` state steps
@@ -13001,11 +13147,13 @@ theorem step_safeRef_use_tree_simulation
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   let s_e := eraseBorrowParents s treeMap
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, hprot, _, _, _, _⟩ := id htree.erased_rel
   obtain ⟨slot_s, _, hlt_af_s, _, hslot_s, _, _, _⟩ := hfr.lookup_local hdecl_src
   obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
   have hcal_s : s.memory.activeCallee = none := hcal
   have hprot_s : s.memory.activeProtectors = .nil := hprot
+  have hlen_s : length s.memory.callStack = 0 := by
+    dsimp only [eraseBorrowParents] at hstack; rw [hstack]; rfl
   have hslot_s_s : get? s.frame.locals srcIdx = some slot_s := hslot_s
   have hslot_d_s : get? s.frame.locals dstIdx = some slot_d := hslot_d
   have hlt_af_s_s : srcIdx < s.frame.locals.length := hlt_af_s
@@ -13077,8 +13225,8 @@ theorem step_safeRef_use_tree_simulation
           rw [hslot_s_s]; dsimp only []; rw [hval_load]; dsimp only []; rw [hslot_d_s]
           cases slot_d with
           | dead => exact absurd rfl hsd_dead
-          | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s]
-          | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s]
+          | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s]
+          | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s]
         · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
           simp only [hbb, hstmt]
           unfold evalStmt evalRvalue evalOperand readProjectedValue; dsimp only []
@@ -13087,10 +13235,10 @@ theorem step_safeRef_use_tree_simulation
           | dead => exact absurd rfl hsd_dead
           | uninit =>
             dsimp only [s_e, eraseBorrowParents, advanceStmt]
-            simp only [set?_eq_some_set hlt_af_d_s, hprot_s, htree.borrows_eq, hinv_s]
+            simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, htree.borrows_eq, hinv_s]
           | init _ =>
             dsimp only [s_e, eraseBorrowParents, advanceStmt]
-            simp only [set?_eq_some_set hlt_af_d_s, hprot_s, htree.borrows_eq, hinv_s]
+            simp only [set?_eq_some_set hlt_af_d_s, hprot_s, hlen_s, htree.borrows_eq, hinv_s]
       · have hlt_mv_d : dstIdx < (s.frame.locals.set srcIdx .uninit).length := by
           rw [List.length_set]; exact hlt_af_d_s
         obtain ⟨slot_dm, hget_dm, hsdm_ne⟩ :
@@ -13113,8 +13261,8 @@ theorem step_safeRef_use_tree_simulation
           rw [hval_load]; dsimp only []; rw [hget_dm]
           cases slot_dm with
           | dead => exact absurd rfl hsdm_ne
-          | uninit => simp only [set?_eq_some_set hlt_mv_d, hprot_s]
-          | init _ => simp only [set?_eq_some_set hlt_mv_d, hprot_s]
+          | uninit => simp only [set?_eq_some_set hlt_mv_d, hprot_s, hlen_s]
+          | init _ => simp only [set?_eq_some_set hlt_mv_d, hprot_s, hlen_s]
         · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
           simp only [hbb, hstmt]
           unfold evalStmt evalRvalue evalOperand; dsimp only []
@@ -13124,10 +13272,10 @@ theorem step_safeRef_use_tree_simulation
           | dead => exact absurd rfl hsdm_ne
           | uninit =>
             dsimp only [s_e, eraseBorrowParents, advanceStmt]
-            simp only [set?_eq_some_set hlt_mv_d, hprot_s, htree.borrows_eq, hinv_s]
+            simp only [set?_eq_some_set hlt_mv_d, hprot_s, hlen_s, htree.borrows_eq, hinv_s]
           | init _ =>
             dsimp only [s_e, eraseBorrowParents, advanceStmt]
-            simp only [set?_eq_some_set hlt_mv_d, hprot_s, htree.borrows_eq, hinv_s]
+            simp only [set?_eq_some_set hlt_mv_d, hprot_s, hlen_s, htree.borrows_eq, hinv_s]
 
 /-- **`step_terminator_switchInt_lm3_2_tree_simulation`**: `SwitchInt` terminator
 simulation across `StateRelLM3_2Tree`, stepping both machines in lockstep to
@@ -13153,8 +13301,9 @@ theorem step_terminator_switchInt_lm3_2_tree_simulation
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   let s_e := eraseBorrowParents s treeMap
-  obtain ⟨tf, hframes, _, _, _, hcal, _, _, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨tf, hframes, _, _, _, hcal, hstack, _, _, _, _, _⟩ := id htree.erased_rel
   have hcal_s : s.memory.activeCallee = none := hcal
+  have hstack_s : s.memory.callStack = .nil := hstack
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   have hprim : IsPrimScalarTy ty := by
     rcases hty with h | h | h
@@ -13174,22 +13323,25 @@ theorem step_terminator_switchInt_lm3_2_tree_simulation
     · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
       dsimp only [s_e, eraseBorrowParents] at ha_ub ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ub]
     · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
       dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ub
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hop_eq.trans ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_eq.trans ha_ub]
   · let tgtBlk := lookupSwitchTarget sc.bits targets.branches targets.otherwise
     refine Or.inr ⟨sc.bits,
       { s_e with frame := { blockIdx := tgtBlk, stmtIdx := 0, locals := s.frame.locals } }, ?_, ?_⟩
     · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
       dsimp only [s_e, eraseBorrowParents] at ha_ok ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [ha_ok]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ok]
     · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
       dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ok ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hop_eq.trans ha_ok, ← htree.borrows_eq]
+      unfold evalTerminator; rw [hterm]; dsimp only []
+      rw [hstack_s, hop_eq.trans ha_ok, ← htree.borrows_eq]
+      exact congrArg (fun mem => MirStepNode.emitStep (MirObs.event sc.bits) { frame := _, memory := mem })
+        (memory_eq_of_callStack_nil hstack_s).symm
 
 /-- **`step_terminator_assert_lm3_2_tree_simulation`**: `Assert` terminator
 (`TerminatorKind.assert cond expected target .unreachable`) simulation across
@@ -13212,8 +13364,9 @@ theorem step_terminator_assert_lm3_2_tree_simulation
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   let s_e := eraseBorrowParents s treeMap
-  obtain ⟨tf, hframes, _, _, _, hcal, _, _, _, _, _, _⟩ := id htree.erased_rel
+  obtain ⟨tf, hframes, _, _, _, hcal, hstack, _, _, _, _, _⟩ := id htree.erased_rel
   have hcal_s : s.memory.activeCallee = none := hcal
+  have hstack_s : s.memory.callStack = .nil := hstack
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   have hop_tf := hop tf hframes
   have hop_eq := evalOperand_scalarOperand_borrows_eq hop_tf s.frame.locals s.memory.borrows
@@ -13228,11 +13381,11 @@ theorem step_terminator_assert_lm3_2_tree_simulation
     · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
       dsimp only [s_e, eraseBorrowParents] at ha_ub ⊢
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ub]
     · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
       dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ub
       simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hop_eq.trans ha_ub]
+      unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_eq.trans ha_ub]
   · obtain ⟨sc₀, _, hsc_eq, _, _, _, hsc_bool, _⟩ := himm.of_primitive_scalar (Or.inl hbool)
     injection hsc_eq with hsc_eq'; subst hsc_eq'
     rcases hsc_bool hbool with ⟨hsc_sz1, hsc_bits⟩
@@ -13249,23 +13402,26 @@ theorem step_terminator_assert_lm3_2_tree_simulation
       · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
         dsimp only [s_e, eraseBorrowParents] at ha_ok ⊢
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [ha_ok]
+        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ok]
         cases expected <;> rfl
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ok ⊢
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hop_eq.trans ha_ok, ← htree.borrows_eq]
-        cases expected <;> rfl
+        unfold evalTerminator; rw [hterm]; dsimp only []
+        rw [hstack_s, hop_eq.trans ha_ok, ← htree.borrows_eq]
+        cases expected <;>
+          exact congrArg (fun mem => MirStepNode.step { frame := _, memory := mem })
+            (memory_eq_of_callStack_nil hstack_s).symm
     · refine Or.inl ⟨?_, ?_⟩
       · rw [stepMirFn_eq_of_not_other body s_e hcal hphase]
         dsimp only [s_e, eraseBorrowParents] at ha_ok ⊢
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [ha_ok]
+        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, ha_ok]
         cases expected <;> cases b <;> first | exact absurd rfl h_eq | rfl
       · rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
         dsimp only [s_e, eraseBorrowParents] at hop_eq ha_ok
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hop_eq.trans ha_ok]
+        unfold evalTerminator; rw [hterm]; dsimp only []; rw [hstack_s, hop_eq.trans ha_ok]
         cases expected <;> cases b <;> first | exact absurd rfl h_eq | rfl
 
 /-- State-dependent well-typedness predicate for the `LM-3.2` lockstep statement

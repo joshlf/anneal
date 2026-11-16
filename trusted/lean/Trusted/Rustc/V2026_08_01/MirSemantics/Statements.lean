@@ -715,6 +715,7 @@ def evalCopySingleDirect
                 s.memory.borrows
                 dstEntry.targetLocal
                 (.some dstPtr.tag)
+                (length s.memory.callStack)
             MirStepNode.step
               (advanceStmt
                 s
@@ -814,6 +815,7 @@ def evalCopySingleDirect
                     s.memory.borrows
                     dstEntry.targetLocal
                     (.some dstPtr.tag)
+                    dstEntry.targetFrameDepth
                 MirStepNode.step
                   (advanceStmt
                     s
@@ -854,6 +856,7 @@ def commitCopyDstPlaceWrite
         s.memory.borrows
         dstTargetLocal
         (.some dstTag)
+        (length s.memory.callStack)
     MirStepNode.step
       (advanceStmt
         s
@@ -905,6 +908,7 @@ def commitCopyDstPlaceWrite
             s.memory.borrows
             dstTargetLocal
             (.some dstTag)
+            0
         MirStepNode.step
           (advanceStmt
             s
@@ -1179,6 +1183,7 @@ def evalCopyUnionBytes
                     s.memory.borrows
                     dstEntry.targetLocal
                     (.some dstPtr.tag)
+                    (length s.memory.callStack)
                 MirStepNode.step
                   (advanceStmt
                     s
@@ -1682,6 +1687,349 @@ def evalCopyNonOverlappingPermOk
       | _, _ => MirStepNode.fail .ub
 
 /--
+`copy_nonoverlapping` source and destination borrow targets both lie in the
+active frame. With an empty `callStack` (root frame active) this always holds
+(every live tag then targets depth `0`). Inside an inline callee, when a source
+or destination tag was minted in a suspended caller frame
+(`BorrowEntry.targetFrameDepth < length callStack`), `evalCopyNonOverlappingWithCount`
+routes single-element direct copies through `evalForeignFrameCopySingleDirect`
+(`DIV-MR-CALL-TARGET-LOCAL`).
+-/
+def copyEntriesTargetActiveFrame
+    (callStack : List SavedCallerFrame)
+    (srcEntry dstEntry : BorrowEntry) :
+    Bool :=
+  match callStack with
+  | .nil => true
+  | _ :: _ =>
+    Bool.and
+      (Nat.beq srcEntry.targetFrameDepth (length callStack))
+      (Nat.beq dstEntry.targetFrameDepth (length callStack))
+
+/--
+Tree Borrows read-then-write check and permission transition for a single-element
+direct `copy_nonoverlapping` from `(srcPtr, srcEntry)` to `(dstPtr, dstEntry)`:
+checks source read UB (`hasTreeReadUB`), applies the source read transition
+(`freezeTreeBorrowsOnReadAtProj` / `updateBorrowPermOnReadAtProj`), checks
+destination ancestor write UB (`treeBorrowAncestorsChildAccessUB .write`) and
+active function-entry protectors (`hasProtectedTreeWriteConflict` /
+`hasProtectedWriteConflict`), and applies the projection- and tree-aware write
+transition (`invalidateTreeBorrowsAtProj` / `invalidateConflictingBorrowsAtProj`
+/ `invalidateConflictingBorrows`). Returns `.none` on any Tree Borrows UB.
+-/
+def borrowsAfterCopySingleDirect
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) :
+    Option (List BorrowEntry) :=
+  let readUB : Bool :=
+    match borrows with
+    | b₁ :: b₂ :: restBorrows =>
+      let allBorrows := b₁ :: b₂ :: restBorrows
+      hasTreeReadUB
+        allBorrows
+        allBorrows
+        activeProtectors
+        srcEntry.targetLocal
+        (.some srcPtr.tag)
+        srcEntry.targetProjection
+        srcEntry.rangeOffset
+        srcEntry.rangeLen
+        srcEntry.targetFrameDepth
+    | _ => false
+  match readUB with
+  | true => .none
+  | false =>
+    let borrowsAfterRead : List BorrowEntry :=
+      match borrows with
+      | .nil => .nil
+      | single :: .nil =>
+        updateBorrowPermOnReadAtProj
+          (single :: .nil)
+          single
+          srcEntry.targetLocal
+          (.some srcPtr.tag)
+          srcEntry.targetProjection
+          srcEntry.rangeOffset
+          srcEntry.rangeLen
+          activeProtectors
+          srcEntry.targetFrameDepth :: .nil
+      | b₁ :: b₂ :: restBorrows =>
+        let allBorrows := b₁ :: b₂ :: restBorrows
+        freezeTreeBorrowsOnReadAtProj
+          allBorrows
+          allBorrows
+          srcEntry.targetLocal
+          (.some srcPtr.tag)
+          srcEntry.targetProjection
+          srcEntry.rangeOffset
+          srcEntry.rangeLen
+          activeProtectors
+          srcEntry.targetFrameDepth
+    let dstWriteTreeUB : Bool :=
+      match borrowsAfterRead with
+      | .nil => false
+      | single :: .nil =>
+        match lookupBorrow (single :: .nil) dstPtr.tag with
+        | .some dEntryAfter =>
+          match dEntryAfter.perm with
+          | .frozen | .disabled => true
+          | _ => false
+        | .none => true
+      | b₁ :: b₂ :: restBorrows =>
+        let allBorrows := b₁ :: b₂ :: restBorrows
+        match lookupBorrow allBorrows dstPtr.tag with
+        | .some dEntryAfter =>
+          match dEntryAfter.perm with
+          | .frozen | .disabled => true
+          | _ => treeBorrowAncestorsChildAccessUB .write allBorrows dEntryAfter.parentTag
+        | .none => true
+    match dstWriteTreeUB with
+    | true => .none
+    | false =>
+      let protConflict : Bool :=
+        match activeProtectors with
+        | .nil => false
+        | _ :: _ =>
+          match borrowsAfterRead with
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            hasProtectedTreeWriteConflict
+              allBorrows
+              allBorrows
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstPtr.tag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+          | _ =>
+            hasProtectedWriteConflict
+              borrowsAfterRead
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstPtr.tag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+      match protConflict with
+      | true => .none
+      | false =>
+        let borrows' : List BorrowEntry :=
+          match borrowsAfterRead with
+          | .nil => .nil
+          | single :: .nil =>
+            let b := single :: .nil
+            match dstEntry.targetProjection with
+            | .nil =>
+              match Nat.beq dstEntry.rangeLen 0 with
+              | true =>
+                invalidateConflictingBorrows
+                  b
+                  dstEntry.targetLocal
+                  (.some dstPtr.tag)
+                  dstEntry.targetFrameDepth
+              | false =>
+                invalidateConflictingBorrowsAtProj
+                  b
+                  dstEntry.targetLocal
+                  (.some dstPtr.tag)
+                  .nil
+                  dstEntry.rangeOffset
+                  dstEntry.rangeLen
+                  dstEntry.targetFrameDepth
+            | pHead :: pTail =>
+              invalidateConflictingBorrowsAtProj
+                b
+                dstEntry.targetLocal
+                (.some dstPtr.tag)
+                (pHead :: pTail)
+                dstEntry.rangeOffset
+                dstEntry.rangeLen
+                dstEntry.targetFrameDepth
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            invalidateTreeBorrowsAtProj
+              allBorrows
+              allBorrows
+              dstEntry.targetLocal
+              (.some dstPtr.tag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+        .some borrows'
+
+/--
+Frame-qualified single-element direct value copy (`count == 1`, `srcStart == 0`,
+`dstStart == 0`) for `copy_nonoverlapping` when at least one of `srcEntry` or
+`dstEntry` targets a suspended caller frame (`copyEntriesTargetActiveFrame = false`,
+`DIV-MR-CALL-TARGET-LOCAL`). Reads the source value from `(srcEntry.targetFrameDepth,
+srcEntry.targetLocal)` (`readFrameLocalSlot`), checks disjointness on the pair
+`(targetFrameDepth, targetLocal)` and `targetProjection`, applies the Tree Borrows
+read-then-write check and transition (`borrowsAfterCopySingleDirect`), and writes
+the converted value to `(dstEntry.targetFrameDepth, dstEntry.targetLocal)`
+(`writeFrameLocalSlot`). Non-unit counts or non-zero byte offsets across frames
+fail closed with `MirStepNode.unsupported`.
+-/
+def evalForeignFrameCopySingleDirect
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    MirStepNode :=
+  match
+    Bool.and
+      (Nat.beq countBits 1)
+      (Bool.and
+        (Nat.beq srcPtr.offsetBytes 0)
+        (Nat.beq dstPtr.offsetBytes 0))
+  with
+  | false => MirStepNode.unsupported
+  | true =>
+    let overlaps :=
+      match Nat.beq srcPtr.tag dstPtr.tag with
+      | true => true
+      | false =>
+        match
+          Bool.and
+            (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+            (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+        with
+        | false => false
+        | true =>
+          projectionsOverlap
+            srcEntry.targetProjection
+            dstEntry.targetProjection
+    match overlaps with
+    | true => MirStepNode.fail .ub
+    | false =>
+      match
+        readFrameLocalSlot
+          locals₃
+          s.memory.callStack
+          s.memory.callerLocals
+          srcEntry.targetFrameDepth
+          srcEntry.targetLocal
+      with
+      | .some (.init srcRootVal) =>
+        match
+          readProjectedValue
+            locals₃
+            srcRootVal
+            srcEntry.targetProjection
+        with
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+        | .ok copiedVal =>
+          let convertedOpt : Option Value :=
+            match
+              operandPointeeTy localDecls layouts src,
+              operandPointeeTy localDecls layouts dst
+            with
+            | .some srcPt, .some dstPt =>
+              match sameRigidTyShape srcPt.kind dstPt.kind with
+              | true => .some copiedVal
+              | false =>
+                match
+                  rigidTyByteSize layouts srcPt,
+                  rigidTyByteSize layouts dstPt
+                with
+                | .some sSz, .some dSz =>
+                  match Nat.beq sSz dSz with
+                  | false => .none
+                  | true =>
+                    match
+                      encodeValueToBytes
+                        defaultCodecFuel
+                        layouts
+                        srcPt
+                        copiedVal
+                    with
+                    | .some bs =>
+                      decodeValueFromBytes
+                        defaultCodecFuel
+                        layouts
+                        dstPt
+                        bs
+                    | .none => .none
+                | _, _ => .some copiedVal
+            | _, _ => .some copiedVal
+          match convertedOpt with
+          | .none => MirStepNode.fail .ub
+          | .some finalVal =>
+            match
+              borrowsAfterCopySingleDirect
+                s.memory.borrows
+                s.memory.activeProtectors
+                srcPtr
+                dstPtr
+                srcEntry
+                dstEntry
+            with
+            | .none => MirStepNode.fail .ub
+            | .some borrows' =>
+              let dstRootSlotOpt :=
+                readFrameLocalSlot
+                  locals₃
+                  s.memory.callStack
+                  s.memory.callerLocals
+                  dstEntry.targetFrameDepth
+                  dstEntry.targetLocal
+              let newDstRootRes : PlaceReadResult :=
+                match dstEntry.targetProjection with
+                | .nil =>
+                  match dstRootSlotOpt with
+                  | .some .dead => .ub
+                  | .some _ => .ok finalVal locals₃
+                  | .none => .ub
+                | pHead :: pTail =>
+                  match dstRootSlotOpt with
+                  | .some (.init dstRootVal) =>
+                    match
+                      writeProjectedValue
+                        locals₃
+                        dstRootVal
+                        (pHead :: pTail)
+                        finalVal
+                    with
+                    | .ok dstRootVal' => .ok dstRootVal' locals₃
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                  | _ => .ub
+              match newDstRootRes with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok newDstRootVal _ =>
+                match
+                  writeFrameLocalSlot
+                    locals₃
+                    s.memory.callStack
+                    s.memory.callerLocals
+                    dstEntry.targetFrameDepth
+                    dstEntry.targetLocal
+                    (.init newDstRootVal)
+                with
+                | .some (locals₄, callStack', callerLocals') =>
+                  MirStepNode.step
+                    (advanceStmt
+                      s
+                      locals₄
+                      { s.memory with
+                        borrows := borrows'
+                        callStack := callStack'
+                        callerLocals := callerLocals' })
+                | .none => MirStepNode.fail .ub
+      | _ => MirStepNode.fail .ub
+
+/--
 Execute a `NonDivergingIntrinsic.copyNonOverlapping src dst count` statement with
 pre-resolved count bits.
 -/
@@ -1709,18 +2057,33 @@ def evalCopyNonOverlappingWithCount
         | _, .frozen => MirStepNode.fail .ub
         | _, .disabled => MirStepNode.fail .ub
         | _, _ =>
-          evalCopyNonOverlappingPermOk
-            s
-            src
-            dst
-            localDecls
-            layouts
-            srcPtr
-            dstPtr
-            srcEntry
-            dstEntry
-            countBits
-            locals₃
+          match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
+          | false =>
+            evalForeignFrameCopySingleDirect
+              s
+              src
+              dst
+              localDecls
+              layouts
+              srcPtr
+              dstPtr
+              srcEntry
+              dstEntry
+              countBits
+              locals₃
+          | true =>
+            evalCopyNonOverlappingPermOk
+              s
+              src
+              dst
+              localDecls
+              layouts
+              srcPtr
+              dstPtr
+              srcEntry
+              dstEntry
+              countBits
+              locals₃
       | _, _ => MirStepNode.fail .ub
     | _, _ => MirStepNode.fail .ub
 
@@ -1751,6 +2114,7 @@ def evalCopyNonOverlapping
       layouts
       s.memory.callerLocals
       localDecls
+      s.memory.callStack
   with
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
@@ -1764,6 +2128,7 @@ def evalCopyNonOverlapping
         layouts
         s.memory.callerLocals
         localDecls
+        s.memory.callStack
     with
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
@@ -1777,6 +2142,7 @@ def evalCopyNonOverlapping
           layouts
           s.memory.callerLocals
           localDecls
+          s.memory.callStack
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -1794,23 +2160,61 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
-Test whether any `BorrowEntry` in `borrows` targeting stack local `loc` carries a
-function-entry lifetime protector (`RetagKind.fnEntry`) that is still active in
-`activeProtectors` (`isBorrowProtected`).
+Whether a function-entry-protected tag with Tree Borrows permission `perm`
+prevents deallocating its allocation (`DIV-MR-TB-UNSAFECELL-PROTECTED-IM`):
+exactly the permissions for which a foreign write is undefined behavior while
+protected. `.cell` never prevents deallocation (interior mutability tolerates
+foreign writes) and a `.disabled` tag no longer protects anything; every other
+state does. Every Anneal tag has performed its initial child access when it was
+created (or is a fail-closed protected `.reservedIM`), so MiniRust's
+`had_local_read` flag is `true` for `.reservedFrz` and `.frozen`.
 
-Freeing `loc`'s storage (`StorageDead(loc)`, or the implicit deallocation
-performed by `StorageLive(loc)`) acts as a write to every byte of the local that
-disables every tag minted from it (`disableLocalBorrows`), so the presence of
-such a protected tag makes the deallocation immediate undefined behavior. This
-check subsumes the whole-local foreign-write conflict check
-`hasProtectedWriteConflict borrows activeProtectors loc .none .nil`: unlike a
-foreign write, which tolerates `.reserved` (and already-`.disabled`) tags,
-deallocation rejects every protected tag regardless of its current permission.
-Function-entry protectors only cover memory owned by other frames (argument
-pointees), so with frame-relative `BorrowEntry.targetLocal` indices a protected
-entry can only match a local of the running frame through an index collision
-with a caller-frame local inside an inline callee frame, where the check errs
-on the side of `.ub`.
+Reference (MiniRust `spec/mem/tree_borrows/state_machine_protected.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_protected.md#L126-L140>
+
+> "/// Strongly protected nodes can block deallocation, based on their permission.
+> /// Specifically, they block allocation iff they would cause UB on a foreign write,
+> /// that is, if they have been locally accessed ("used"), with an exception for `Cell`.
+> /// The check for whether the protector is actually strong happens elsewhere.
+> fn prevents_deallocation(&self) -> bool {
+>     match self {
+>         PermissionProt::Unique => true,
+>         PermissionProt::Reserved { had_local_read, .. } | PermissionProt::Frozen { had_local_read } => *had_local_read,
+>
+>         PermissionProt::Disabled => false,
+>
+>         // Cell never prevents deallocation
+>         PermissionProt::Cell => false,
+>     }"
+-/
+@[reducible]
+def preventsDeallocation : TreeBorrowPerm → Bool
+  | .cell => false
+  | .reservedFrz _ => true
+  | .reservedIM => true
+  | .unique => true
+  | .frozen => true
+  | .disabled => false
+
+/--
+Test whether any `BorrowEntry` in `borrows` targeting stack local `loc` of the
+frame at depth `targetFrameDepth` (default `0`) carries a function-entry lifetime
+protector (`RetagKind.fnEntry`) that is still active in `activeProtectors`
+(`isBorrowProtected`) and whose permission prevents deallocation
+(`preventsDeallocation`: every state except `.cell` and `.disabled`).
+
+Freeing `loc`'s storage (`StorageDead(loc)`, the implicit deallocation performed
+by `StorageLive(loc)`, or the frame teardown of `TerminatorKind.return_`) acts as
+a write to every byte of the local that disables every tag minted from it
+(`disableLocalBorrows`), so the presence of such a protected tag makes the
+deallocation immediate undefined behavior. This check subsumes the whole-local
+foreign-write conflict check
+`hasProtectedWriteConflict borrows activeProtectors loc .none .nil 0 0 targetFrameDepth`
+(`hasProtectedLocalBorrow_of_hasProtectedWriteConflict`). A protected `.cell`
+tag of interior-mutable data never blocks deallocation
+(`DIV-MR-TB-UNSAFECELL-PROTECTED-IM`), and tags of another frame's local with
+the same index are not affected (`BorrowEntry.targetFrameDepth`).
 
 Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
 `5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
@@ -1842,22 +2246,31 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 def hasProtectedLocalBorrow
     (borrows : List BorrowEntry)
     (activeProtectors : List Nat)
-    (loc : Local) :
+    (loc : Local)
+    (targetFrameDepth : Nat := 0) :
     Bool :=
   match borrows with
   | .nil => false
   | entry :: rest =>
     match
       Bool.and
-        (Nat.beq entry.targetLocal loc)
-        (isBorrowProtected activeProtectors entry)
+        (Bool.and
+          (Nat.beq entry.targetFrameDepth targetFrameDepth)
+          (Nat.beq entry.targetLocal loc))
+        (Bool.and
+          (isBorrowProtected activeProtectors entry)
+          (preventsDeallocation entry.perm))
     with
     | true => true
-    | false => hasProtectedLocalBorrow rest activeProtectors loc
+    | false => hasProtectedLocalBorrow rest activeProtectors loc targetFrameDepth
 
 /--
-Disable every `BorrowEntry` in `borrows` targeting stack local `loc` (setting its
-Tree Borrows permission to `.disabled`), leaving every other entry unchanged.
+Disable every `BorrowEntry` in `borrows` targeting stack local `loc` of the frame
+at depth `targetFrameDepth` (default `0`), setting its Tree Borrows permission to
+`.disabled` and marking its backing allocation deallocated (`allocDead := true`),
+and leave every other entry unchanged. `allocDead` keeps a later
+`StorageLive(loc)` revival from giving stale tags the new allocation's bounds
+for `BinOp.Offset` (`DIV-LM-D6-OFFSET-DISABLED-TAG`).
 
 `StorageDead(loc)` frees `loc`'s storage and `StorageLive(loc)` allocates fresh
 storage for it (implicitly freeing any previous allocation), so every
@@ -1879,12 +2292,10 @@ of faulting. Because tags are minted from the monotonically increasing
 can share a disabled tag, so stale pointers are never revived into the new
 allocation.
 
-`BorrowEntry.targetLocal` indexes the locals of the frame that minted the tag,
-while the borrow table is shared by every inline call frame on
-`Memory.callStack`, so inside an inline callee frame this also disables
-caller-frame entries whose local index equals `loc`. The approximation is
-conservative: it can only make a later access through such a caller tag fault
-with `.ub` after the callee returns, never hide undefined behavior.
+`(BorrowEntry.targetFrameDepth, BorrowEntry.targetLocal)` identifies the
+borrowed local across every inline call frame on `Memory.callStack`, so
+deallocating a callee local never disables a caller-frame entry whose local
+index happens to equal `loc` (`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`).
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1903,20 +2314,31 @@ Reference (MiniRust `spec/lang/step/statements.md` at commit
 >     // This means the same address may be re-used for the new stoage.
 >     self.storage_dead(mem, local)?;"
 -/
-def disableLocalBorrows : List BorrowEntry → Local → List BorrowEntry
-  | .nil, _ => .nil
-  | entry :: rest, loc =>
-    match Nat.beq entry.targetLocal loc with
-    | true => { entry with perm := .disabled } :: disableLocalBorrows rest loc
-    | false => entry :: disableLocalBorrows rest loc
+def disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (targetFrameDepth : Nat := 0) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | entry :: rest =>
+    match
+      Bool.and
+        (Nat.beq entry.targetFrameDepth targetFrameDepth)
+        (Nat.beq entry.targetLocal loc)
+    with
+    | true =>
+      { entry with perm := .disabled, allocDead := true } ::
+        disableLocalBorrows rest loc targetFrameDepth
+    | false => entry :: disableLocalBorrows rest loc targetFrameDepth
 
 /--
 Definitional simplification equation for `disableLocalBorrows` on the empty
 borrow table.
 -/
 @[simp]
-theorem disableLocalBorrows_nil (loc : Local) :
-    disableLocalBorrows .nil loc = .nil := rfl
+theorem disableLocalBorrows_nil (loc : Local) {targetFrameDepth : Nat} :
+    disableLocalBorrows .nil loc targetFrameDepth = .nil := rfl
 
 /--
 No borrow entry is protected when no function-entry protector is active, so
@@ -1925,16 +2347,35 @@ No borrow entry is protected when no function-entry protector is active, so
 @[simp]
 theorem hasProtectedLocalBorrow_nil_protectors
     (borrows : List BorrowEntry)
-    (loc : Local) :
-    hasProtectedLocalBorrow borrows .nil loc = false := by
+    (loc : Local)
+    {targetFrameDepth : Nat} :
+    hasProtectedLocalBorrow borrows .nil loc targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons entry rest ih =>
     have hProt : isBorrowProtected .nil entry = false := by
       unfold isBorrowProtected
       cases entry.protector <;> rfl
-    simp only [hasProtectedLocalBorrow, hProt, Bool.and_false]
+    simp only [hasProtectedLocalBorrow, hProt, Bool.false_and, Bool.and_false]
     exact ih
+
+/--
+A protected tag whose permission makes a foreign write undefined behavior
+(`borrowEntryWriteConflicts entry .none`) also prevents deallocation.
+-/
+theorem preventsDeallocation_of_borrowEntryWriteConflicts
+    (entry : BorrowEntry)
+    (h : borrowEntryWriteConflicts entry .none = true) :
+    preventsDeallocation entry.perm = true := by
+  revert h
+  unfold borrowEntryWriteConflicts
+  cases entry.perm with
+  | cell => intro h; exact h
+  | reservedFrz c => intro _; rfl
+  | reservedIM => intro _; rfl
+  | unique => intro _; rfl
+  | frozen => intro _; rfl
+  | disabled => intro h; exact h
 
 /--
 `hasProtectedLocalBorrow` subsumes the whole-local foreign-write protector
@@ -1946,14 +2387,20 @@ theorem hasProtectedLocalBorrow_of_hasProtectedWriteConflict
     (borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     (loc : Local)
-    (h : hasProtectedWriteConflict borrows activeProtectors loc .none .nil = true) :
-    hasProtectedLocalBorrow borrows activeProtectors loc = true := by
+    {targetFrameDepth : Nat}
+    (h :
+      hasProtectedWriteConflict borrows activeProtectors loc .none .nil 0 0 targetFrameDepth =
+        true) :
+    hasProtectedLocalBorrow borrows activeProtectors loc targetFrameDepth = true := by
   induction borrows with
   | nil => exact h
   | cons entry rest ih =>
     unfold hasProtectedWriteConflict at h
     unfold hasProtectedLocalBorrow
-    cases hT : Nat.beq entry.targetLocal loc with
+    cases hT :
+        Bool.and
+          (Nat.beq entry.targetFrameDepth targetFrameDepth)
+          (Nat.beq entry.targetLocal loc) with
     | false =>
       simp only [hT, Bool.false_and] at h ⊢
       exact ih h
@@ -1962,7 +2409,15 @@ theorem hasProtectedLocalBorrow_of_hasProtectedWriteConflict
       | false =>
         simp only [hT, hP, Bool.false_and, Bool.and_false] at h ⊢
         exact ih h
-      | true => rfl
+      | true =>
+        cases hW : borrowEntryWriteConflicts entry .none with
+        | false =>
+          simp only [hT, hP, hW, Bool.and_false] at h
+          have hrest := ih h
+          simp only [Bool.true_and]
+          cases preventsDeallocation entry.perm <;> simp only [hrest]
+        | true =>
+          simp only [Bool.true_and, preventsDeallocation_of_borrowEntryWriteConflicts entry hW]
 
 /--
 `hasProtectedLocalBorrow borrows activeProtectors loc` is `false` when no entry
@@ -1972,8 +2427,9 @@ theorem hasProtectedLocalBorrow_eq_false_of_forall_ne
     (borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     (loc : Local)
-    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
-    hasProtectedLocalBorrow borrows activeProtectors loc = false := by
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc)
+    {targetFrameDepth : Nat} :
+    hasProtectedLocalBorrow borrows activeProtectors loc targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons entry rest ih =>
@@ -1982,7 +2438,7 @@ theorem hasProtectedLocalBorrow_eq_false_of_forall_ne
       cases hB : Nat.beq entry.targetLocal loc with
       | false => rfl
       | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
-    simp only [hasProtectedLocalBorrow, hBeq, Bool.false_and]
+    simp only [hasProtectedLocalBorrow, hBeq, Bool.and_false, Bool.false_and]
     exact ih (fun e he => h e (List.Mem.tail entry he))
 
 /--
@@ -1992,8 +2448,9 @@ targets `loc`.
 theorem disableLocalBorrows_eq_self_of_forall_ne
     (borrows : List BorrowEntry)
     (loc : Local)
-    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
-    disableLocalBorrows borrows loc = borrows := by
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc)
+    {targetFrameDepth : Nat} :
+    disableLocalBorrows borrows loc targetFrameDepth = borrows := by
   induction borrows with
   | nil => rfl
   | cons entry rest ih =>
@@ -2002,7 +2459,7 @@ theorem disableLocalBorrows_eq_self_of_forall_ne
       cases hB : Nat.beq entry.targetLocal loc with
       | false => rfl
       | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
-    simp only [disableLocalBorrows, hBeq]
+    simp only [disableLocalBorrows, hBeq, Bool.and_false]
     rw [ih (fun e he => h e (List.Mem.tail entry he))]
 
 /--
@@ -2012,24 +2469,35 @@ retains any access permission.
 -/
 theorem perm_eq_disabled_of_mem_disableLocalBorrows
     (borrows : List BorrowEntry)
-    (loc : Local) :
-    ∀ entry ∈ disableLocalBorrows borrows loc,
-      entry.targetLocal = loc → entry.perm = .disabled := by
+    (loc : Local)
+    {targetFrameDepth : Nat} :
+    ∀ entry ∈ disableLocalBorrows borrows loc targetFrameDepth,
+      entry.targetFrameDepth = targetFrameDepth →
+      entry.targetLocal = loc → entry.perm = .disabled ∧ entry.allocDead = true := by
   induction borrows with
   | nil => intro entry hMem; nomatch hMem
   | cons hd rest ih =>
-    intro entry hMem hT
-    cases hB : Nat.beq hd.targetLocal loc with
+    intro entry hMem hD hT
+    cases hB :
+        Bool.and
+          (Nat.beq hd.targetFrameDepth targetFrameDepth)
+          (Nat.beq hd.targetLocal loc) with
     | true =>
       simp only [disableLocalBorrows, hB] at hMem
       cases hMem with
-      | head => rfl
-      | tail _ hMemRest => exact ih entry hMemRest hT
+      | head => exact ⟨rfl, rfl⟩
+      | tail _ hMemRest => exact ih entry hMemRest hD hT
     | false =>
       simp only [disableLocalBorrows, hB] at hMem
       cases hMem with
-      | head => exact absurd hT (Nat.ne_of_beq_eq_false hB)
-      | tail _ hMemRest => exact ih entry hMemRest hT
+      | head =>
+        have h1 : Nat.beq hd.targetFrameDepth targetFrameDepth = true := by
+          rw [hD]; exact Nat.beq_refl targetFrameDepth
+        have h2 : Nat.beq hd.targetLocal loc = true := by
+          rw [hT]; exact Nat.beq_refl loc
+        rw [h1, h2] at hB
+        exact Bool.noConfusion hB
+      | tail _ hMemRest => exact ih entry hMemRest hD hT
 
 /--
 Resolving provenance tag `tag` in `disableLocalBorrows borrows loc` yields the
@@ -2039,18 +2507,26 @@ entry that `tag` resolves to in `borrows`, disabled exactly when it targets
 theorem lookupBorrow_disableLocalBorrows
     (borrows : List BorrowEntry)
     (loc : Local)
-    (tag : Nat) :
-    lookupBorrow (disableLocalBorrows borrows loc) tag =
+    (tag : Nat)
+    {targetFrameDepth : Nat} :
+    lookupBorrow (disableLocalBorrows borrows loc targetFrameDepth) tag =
       (match lookupBorrow borrows tag with
        | .some entry =>
-         match Nat.beq entry.targetLocal loc with
-         | true => .some { entry with perm := .disabled }
+         match
+           Bool.and
+             (Nat.beq entry.targetFrameDepth targetFrameDepth)
+             (Nat.beq entry.targetLocal loc)
+         with
+         | true => .some { entry with perm := .disabled, allocDead := true }
          | false => .some entry
        | .none => .none) := by
   induction borrows with
   | nil => rfl
   | cons hd rest ih =>
-    cases hB : Nat.beq hd.targetLocal loc <;>
+    cases hB :
+        Bool.and
+          (Nat.beq hd.targetFrameDepth targetFrameDepth)
+          (Nat.beq hd.targetLocal loc) <;>
       cases hT : Nat.beq hd.tag tag <;>
         simp only [disableLocalBorrows, lookupBorrow, hB, hT, ih]
 
@@ -2064,14 +2540,19 @@ theorem lookupBorrow_disableLocalBorrows_of_targetLocal_eq
     (tag : Nat)
     (entry : BorrowEntry)
     (hLookup : lookupBorrow borrows tag = .some entry)
-    (hTarget : entry.targetLocal = loc) :
-    lookupBorrow (disableLocalBorrows borrows loc) tag =
-      .some { entry with perm := .disabled } := by
+    (hTarget : entry.targetLocal = loc)
+    {targetFrameDepth : Nat}
+    (hDepth : entry.targetFrameDepth = targetFrameDepth) :
+    lookupBorrow (disableLocalBorrows borrows loc targetFrameDepth) tag =
+      .some { entry with perm := .disabled, allocDead := true } := by
   rw [lookupBorrow_disableLocalBorrows, hLookup]
   have hB : Nat.beq entry.targetLocal loc = true := by
     rw [hTarget]
     exact Nat.beq_refl loc
-  simp only [hB]
+  have hD : Nat.beq entry.targetFrameDepth targetFrameDepth = true := by
+    rw [hDepth]
+    exact Nat.beq_refl targetFrameDepth
+  simp only [hB, hD, Bool.and_self]
 
 /--
 A provenance tag that resolved to a borrow entry targeting a local other than
@@ -2083,14 +2564,15 @@ theorem lookupBorrow_disableLocalBorrows_of_targetLocal_ne
     (tag : Nat)
     (entry : BorrowEntry)
     (hLookup : lookupBorrow borrows tag = .some entry)
-    (hTarget : entry.targetLocal ≠ loc) :
-    lookupBorrow (disableLocalBorrows borrows loc) tag = .some entry := by
+    (hTarget : entry.targetLocal ≠ loc)
+    {targetFrameDepth : Nat} :
+    lookupBorrow (disableLocalBorrows borrows loc targetFrameDepth) tag = .some entry := by
   rw [lookupBorrow_disableLocalBorrows, hLookup]
   have hB : Nat.beq entry.targetLocal loc = false := by
     cases hB' : Nat.beq entry.targetLocal loc with
     | false => rfl
     | true => exact False.elim (hTarget (Nat.eq_of_beq_eq_true hB'))
-  simp only [hB]
+  simp only [hB, Bool.and_false]
 
 /--
 A provenance tag without a stack borrow entry in `borrows` (e.g. a pointer to a
@@ -2101,8 +2583,9 @@ theorem lookupBorrow_disableLocalBorrows_of_eq_none
     (borrows : List BorrowEntry)
     (loc : Local)
     (tag : Nat)
-    (hLookup : lookupBorrow borrows tag = .none) :
-    lookupBorrow (disableLocalBorrows borrows loc) tag = .none := by
+    (hLookup : lookupBorrow borrows tag = .none)
+    {targetFrameDepth : Nat} :
+    lookupBorrow (disableLocalBorrows borrows loc targetFrameDepth) tag = .none := by
   rw [lookupBorrow_disableLocalBorrows, hLookup]
 
 /--
@@ -2458,6 +2941,7 @@ def evalFnEntryRetag
               parentEntry.targetProjection
               parentEntry.rangeOffset
               parentEntry.rangeLen
+              parentEntry.targetFrameDepth
         match readUB with
         | true => MirStepNode.fail .ub
         | false =>
@@ -2474,9 +2958,12 @@ def evalFnEntryRetag
                 parentEntry.rangeOffset
                 parentEntry.rangeLen
                 s.memory.activeProtectors
+                parentEntry.targetFrameDepth
           let child : BorrowEntry := {
             tag := tag
             targetLocal := parentEntry.targetLocal
+            targetFrameDepth := parentEntry.targetFrameDepth
+            allocDead := parentEntry.allocDead
             targetProjection := parentEntry.targetProjection
             perm := childPerm
             rangeOffset := parentEntry.rangeOffset
@@ -2570,6 +3057,7 @@ def evalNonFnEntryRetag
               parentEntry.targetProjection
               parentEntry.rangeOffset
               parentEntry.rangeLen
+              parentEntry.targetFrameDepth
         match readUB with
         | true => MirStepNode.fail .ub
         | false =>
@@ -2586,9 +3074,12 @@ def evalNonFnEntryRetag
                 parentEntry.rangeOffset
                 parentEntry.rangeLen
                 s.memory.activeProtectors
+                parentEntry.targetFrameDepth
           let child : BorrowEntry := {
             tag := tag
             targetLocal := parentEntry.targetLocal
+            targetFrameDepth := parentEntry.targetFrameDepth
+            allocDead := parentEntry.allocDead
             targetProjection := parentEntry.targetProjection
             perm := childPerm
             rangeOffset := parentEntry.rangeOffset
@@ -2895,7 +3386,8 @@ def derefWriteUnionProtectorUB
     (borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     (dst : Place)
-    (restProj : List ProjectionElem) :
+    (restProj : List ProjectionElem)
+    (callStack : List SavedCallerFrame := .nil) :
     Bool :=
   match activeProtectors with
   | .nil => false
@@ -2908,7 +3400,7 @@ def derefWriteUnionProtectorUB
         match lookupBorrow borrows ptrVal.tag with
         | .some entry =>
           let fullProj :=
-            resolveDerefWriteFullProj locals₁ locals₁ ptrOrFatVal entry restProj
+            resolveDerefWriteFullProj locals₁ locals₁ ptrOrFatVal entry restProj .nil callStack
           match fullProj with
           | .nil => false
           | fHead :: fTail =>
@@ -2927,6 +3419,7 @@ def derefWriteUnionProtectorUB
                 effProj
                 entry.rangeOffset
                 entry.rangeLen
+                entry.targetFrameDepth
             | _ =>
               hasProtectedWriteConflict
                 borrows
@@ -2936,6 +3429,7 @@ def derefWriteUnionProtectorUB
                 effProj
                 entry.rangeOffset
                 entry.rangeLen
+                entry.targetFrameDepth
         | .none => false
       | .none => false
     | _ => false
@@ -2959,7 +3453,8 @@ def invalidateDerefWriteBorrowsWithLayouts
     (locals₁ : List LocalSlot)
     (borrows : List BorrowEntry)
     (dst : Place)
-    (restProj : List ProjectionElem) :
+    (restProj : List ProjectionElem)
+    (callStack : List SavedCallerFrame := .nil) :
     List BorrowEntry :=
   match borrows with
   | .nil => .nil
@@ -2978,6 +3473,8 @@ def invalidateDerefWriteBorrowsWithLayouts
               ptrOrFatVal
               entry
               restProj
+              .nil
+              callStack
           let effProj :=
             resolveDerefBorrowWriteFullProj
               localDecls
@@ -2992,6 +3489,7 @@ def invalidateDerefWriteBorrowsWithLayouts
                 b
                 entry.targetLocal
                 (.some ptrVal.tag)
+                entry.targetFrameDepth
             | false =>
               invalidateConflictingBorrowsAtProj
                 b
@@ -3000,6 +3498,7 @@ def invalidateDerefWriteBorrowsWithLayouts
                 .nil
                 entry.rangeOffset
                 entry.rangeLen
+                entry.targetFrameDepth
           | pHead :: pTail =>
             invalidateConflictingBorrowsAtProj
               b
@@ -3008,6 +3507,7 @@ def invalidateDerefWriteBorrowsWithLayouts
               (pHead :: pTail)
               entry.rangeOffset
               entry.rangeLen
+              entry.targetFrameDepth
         | .none => b
       | .none => b
     | _ => b
@@ -3026,6 +3526,8 @@ def invalidateDerefWriteBorrowsWithLayouts
               ptrOrFatVal
               entry
               restProj
+              .nil
+              callStack
           let effProj :=
             resolveDerefBorrowWriteFullProj
               localDecls
@@ -3040,9 +3542,324 @@ def invalidateDerefWriteBorrowsWithLayouts
             effProj
             entry.rangeOffset
             entry.rangeLen
+            entry.targetFrameDepth
         | .none => allBorrows
       | .none => allBorrows
     | _ => allBorrows
+
+/--
+`SetDiscriminant` may initialize an `.uninit` local only when the local is
+declared at an ADT type (or has no declaration, as in declaration-free test
+bodies); any other declared type fails closed (`DIV-LM-ENUM-SET-DISCR-UNINIT`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L357-L363>
+
+> "/// Write the discriminant for a variant to the enum Place.
+> ///
+> /// This is permitted for both coroutines and ADTs. This does not necessarily
+> /// write to the entire place; instead, it writes to the minimum set of bytes
+> /// as required by the layout for the type.
+> SetDiscriminant { place: Box<Place<'tcx>>, variant_index: VariantIdx },"
+-/
+def setDiscriminantUninitDeclOk
+    (localDecls : List LocalDecl)
+    (loc : Local) :
+    Bool :=
+  match get? localDecls loc with
+  | .some decl =>
+    match decl.ty.kind with
+    | .adt _ _ => true
+    | _ => false
+  | .none => true
+
+/--
+`SetDiscriminant(loc, variantIdx)` on a whole local of the active frame whose
+payload fields are `fields` (`.nil` when the local was `.uninit`, so every
+payload field stays uninitialized; `DIV-LM-ENUM-SET-DISCR-UNINIT`): writing the
+tag is a write to `loc`, so it faults with `.ub` on a protected-write conflict
+(`hasProtectedWriteConflict`) and otherwise applies the foreign-write transition
+to every borrow of `loc` (`invalidateConflictingBorrows`), both scoped to the
+active frame's depth `length s.memory.callStack`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L357-L363>
+
+> "/// Write the discriminant for a variant to the enum Place."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+def evalSetDiscriminantLocal
+    (s : MachineState)
+    (loc : Local)
+    (variantIdx : Nat)
+    (fields : List Value) :
+    MirStepNode :=
+  let depth := length s.memory.callStack
+  match set? s.frame.locals loc (.init (.aggregate variantIdx fields)) with
+  | .some locals' =>
+    match s.memory.activeProtectors with
+    | .nil =>
+      MirStepNode.step
+        (advanceStmt s locals'
+          { s.memory with
+            borrows := invalidateConflictingBorrows s.memory.borrows loc .none depth })
+    | protHead :: protTail =>
+      match
+        hasProtectedWriteConflict
+          s.memory.borrows
+          (protHead :: protTail)
+          loc
+          .none
+          .nil
+          0
+          0
+          depth
+      with
+      | true => MirStepNode.fail .ub
+      | false =>
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with
+              borrows := invalidateConflictingBorrows s.memory.borrows loc .none depth })
+  | .none => MirStepNode.fail .ub
+
+/--
+The pointer stored in `dst.local_` (for `dst = ⟨_, .deref :: _⟩`) is a tracked
+stack borrow whose target local lives in a suspended caller frame rather than
+the active frame (`DIV-MR-CALL-TARGET-LOCAL`). Always `false` when
+`callStack` is empty.
+-/
+def derefTargetsSuspendedFrame
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (callStack : List SavedCallerFrame)
+    (dst : Place) :
+    Bool :=
+  match callStack with
+  | .nil => false
+  | _ :: _ =>
+    match get? locals dst.local_ with
+    | .some (.init ptrOrFatVal) =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow borrows ptrVal.tag with
+        | .some entry =>
+          match activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal with
+          | .some _ => false
+          | .none => true
+        | .none => false
+      | .none => false
+    | _ => false
+
+/--
+Result of a frame-qualified place write that may update the active frame's
+locals and any part of `Memory` (borrow table, suspended caller frames, or the
+root frame's caller-owned referent slots).
+-/
+inductive FrameWriteResult : Type where
+  /-- The write succeeded with active-frame locals `locals` and memory `mem`. -/
+  | ok (locals : List LocalSlot) (mem : Memory) : FrameWriteResult
+  /-- The write is undefined behavior. -/
+  | ub : FrameWriteResult
+  /-- The write uses an unmodeled construct. -/
+  | unsupported : FrameWriteResult
+
+/--
+Dereferencing write `dst = val` (`dst = ⟨ptrLoc, .deref :: restProj⟩`) whose
+pointer targets a local outside the active frame: a local of a suspended caller
+frame or a caller-owned referent of the root frame (`DIV-MR-CALL-TARGET-LOCAL`).
+The write goes to the owning frame's slot list (`foreignFrameTarget?`) through
+`evalCallerPlaceWrite` (protector-checked at the target's frame depth), the
+Tree Borrows ancestor check `derefWriteTreeUB` applies, the borrows of
+`(entry.targetFrameDepth, entry.targetLocal)` receive the write transition
+(`invalidateDerefWriteBorrows`), and the updated slot list is committed back
+into `Memory.callStack` or `Memory.callerLocals` (`commitForeignFrameLocals`).
+A target in the active frame is `.ub` (the active-frame write `evalPlaceWrite`
+already rejected it), and so is a target whose frame already returned.
+
+Reference (The Rust Reference, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Mutable references point to memory which is owned by some other value."
+-/
+def foreignFrameDerefWrite
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (dst : Place)
+    (restProj : List ProjectionElem)
+    (val : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    FrameWriteResult :=
+  match get? locals₁ dst.local_ with
+  | .some (.init ptrOrFatVal) =>
+    match extractDerefPtrVal? ptrOrFatVal with
+    | .some ptrVal =>
+      match lookupBorrow mem₁.borrows ptrVal.tag with
+      | .some entry =>
+        match activeFrameSlot? locals₁ mem₁.callStack entry.targetFrameDepth entry.targetLocal with
+        | .some _ => .ub
+        | .none =>
+          match
+            foreignFrameTarget?
+              mem₁.callStack
+              mem₁.callerLocals
+              entry.targetFrameDepth
+              entry.targetLocal
+          with
+          | .none => .ub
+          | .some target =>
+            let (writeDecls, writeLayouts) :=
+              match target with
+              | .savedFrame _ _ => (localDecls, layouts)
+              | .callerReferent _ => (.nil, emptyLayoutTable)
+            match
+              evalCallerPlaceWrite
+                locals₁
+                target.locals
+                mem₁.borrows
+                dst
+                val
+                mem₁.activeProtectors
+                writeDecls
+                writeLayouts
+                mem₁.callStack
+            with
+            | .ok targetLocals' =>
+              let (targetDecls, targetLayouts) :=
+                foreignFrameDeclsAndLayouts
+                  mem₁.callStack
+                  layouts
+                  entry.targetFrameDepth
+                  entry.targetLocal
+              match
+                Bool.or
+                  (derefWriteTreeUB locals₁ mem₁.borrows dst)
+                  (derefWriteUnionProtectorUB
+                    targetDecls
+                    targetLayouts
+                    locals₁
+                    mem₁.borrows
+                    mem₁.activeProtectors
+                    dst
+                    restProj
+                    mem₁.callStack)
+              with
+              | true => .ub
+              | false =>
+                let borrows' :=
+                  match targetDecls with
+                  | .nil =>
+                    invalidateDerefWriteBorrows
+                      locals₁
+                      mem₁.borrows
+                      dst
+                      restProj
+                      mem₁.callerLocals
+                      mem₁.callStack
+                  | _ :: _ =>
+                    invalidateDerefWriteBorrowsWithLayouts
+                      targetDecls
+                      targetLayouts
+                      locals₁
+                      mem₁.borrows
+                      dst
+                      restProj
+                      mem₁.callStack
+                match commitForeignFrameLocals mem₁ target targetLocals' with
+                | .some mem₂ => .ok locals₁ { mem₂ with borrows := borrows' }
+                | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+      | .none => .ub
+    | .none => .ub
+  | _ => .ub
+
+/--
+`StatementKind.assign` / `StatementKind.setDiscriminant` step for a
+dereferencing write whose pointer targets a local outside the active frame
+(`foreignFrameDerefWrite`), advancing to the next statement.
+-/
+def evalForeignFrameDerefWrite
+    (s : MachineState)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (dst : Place)
+    (restProj : List ProjectionElem)
+    (val : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts with
+  | .ok locals₂ mem₂ => MirStepNode.step (advanceStmt s locals₂ mem₂)
+  | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+
+/--
+Dereferencing `SetDiscriminant` write of `newVal` to `p = ⟨ptrLoc, .deref :: rest⟩`:
+tries the active-frame write `evalPlaceWrite` (with Tree Borrows and union
+protector checks) and falls back on `.ub` to `evalForeignFrameDerefWrite` so
+both suspended caller-frame locals (`Memory.callStack`) and root-frame
+caller-owned referents (`Memory.callerLocals`) are updated consistently with
+`StatementKind.assign` (`DIV-MR-CALL-TARGET-LOCAL`).
+-/
+def evalSetDiscriminantDerefWrite
+    (s : MachineState)
+    (locals₁ : List LocalSlot)
+    (p : Place)
+    (rest : List ProjectionElem)
+    (newVal : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match
+    evalPlaceWrite
+      locals₁
+      s.memory.borrows
+      p
+      newVal
+      s.memory.activeProtectors
+      localDecls
+      layouts
+      s.memory.callStack
+  with
+  | .ok locals₂ =>
+    match
+      Bool.or
+        (derefWriteTreeUB locals₁ s.memory.borrows p)
+        (derefWriteUnionProtectorUB
+          localDecls
+          layouts
+          locals₁
+          s.memory.borrows
+          s.memory.activeProtectors
+          p
+          rest
+          s.memory.callStack)
+    with
+    | true => MirStepNode.fail .ub
+    | false =>
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { s.memory with
+            borrows :=
+              invalidateDerefWriteBorrowsWithLayouts
+                localDecls
+                layouts
+                locals₁
+                s.memory.borrows
+                p
+                rest
+                s.memory.callStack })
+  | .ub =>
+    evalForeignFrameDerefWrite s locals₁ s.memory p rest newVal localDecls layouts
+  | .unsupported => MirStepNode.unsupported
 
 /--
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
@@ -3115,6 +3932,7 @@ def evalStmt
         layouts
         s.memory.callerLocals
         localDecls
+        s.memory.callStack
     with
     | .ok val locals' =>
       let placeTyOpt := placeTy localDecls layouts place
@@ -3276,19 +4094,24 @@ def evalStmt
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+              { s.memory with
+                borrows :=
+                  disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
               s.memory.borrows
               (protHead :: protTail)
               loc
+              (length s.memory.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                { s.memory with
+                  borrows :=
+                    disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -3300,19 +4123,24 @@ def evalStmt
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+              { s.memory with
+                borrows :=
+                  disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
               s.memory.borrows
               (protHead :: protTail)
               loc
+              (length s.memory.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                { s.memory with
+                  borrows :=
+                    disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .deinit p =>
@@ -3343,6 +4171,7 @@ def evalStmt
         layouts
         s.memory.callerLocals
         localDecls
+        s.memory.callStack
     with
     | .ok (.scalar sc) locals' =>
       match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
@@ -3358,15 +4187,15 @@ def evalStmt
     | .nil =>
       match get? s.frame.locals p.local_ with
       | .some (.init (.aggregate _ fields)) =>
-        let newSlot := .init (.aggregate variantIdx fields)
-        match set? s.frame.locals p.local_ newSlot with
-        | .some locals' => MirStepNode.step (advanceStmt s locals')
-        | .none => MirStepNode.fail .ub
+        evalSetDiscriminantLocal s p.local_ variantIdx fields
       | .some (.init _) => MirStepNode.fail .ub
-      | .some .uninit => MirStepNode.fail .ub
+      | .some .uninit =>
+        match setDiscriminantUninitDeclOk localDecls p.local_ with
+        | true => evalSetDiscriminantLocal s p.local_ variantIdx .nil
+        | false => MirStepNode.unsupported
       | .some .dead => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
-    | _ :: _ =>
+    | proj :: rest =>
       match
         evalOperand
           s.frame.locals
@@ -3376,22 +4205,120 @@ def evalStmt
           layouts
           s.memory.callerLocals
           localDecls
+          s.memory.callStack
       with
       | .ok (.aggregate _ fields) locals₁ =>
-        match
-          writePlaceValue
-            locals₁
-            s.memory.borrows
-            p
-            (.aggregate variantIdx fields)
-            localDecls
-            layouts
-        with
-        | .ok locals₂ => MirStepNode.step (advanceStmt s locals₂)
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+        let newVal : Value := .aggregate variantIdx fields
+        match proj with
+        | .deref =>
+          evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts
+        | _ =>
+          let depth := length s.memory.callStack
+          let resolvedLocalProj :=
+            resolveBorrowWriteLocalProj localDecls layouts locals₁ p.local_ (proj :: rest)
+          match
+            hasProtectedWriteConflict
+              s.memory.borrows
+              s.memory.activeProtectors
+              p.local_
+              .none
+              resolvedLocalProj
+              0
+              0
+              depth
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            match
+              writePlaceValue
+                locals₁
+                s.memory.borrows
+                p
+                newVal
+                localDecls
+                layouts
+                s.memory.callStack
+            with
+            | .ok locals₂ =>
+              MirStepNode.step
+                (advanceStmt s locals₂
+                  { s.memory with
+                    borrows :=
+                      invalidateConflictingBorrowsAtProj
+                        s.memory.borrows
+                        p.local_
+                        .none
+                        resolvedLocalProj
+                        0
+                        0
+                        depth })
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported
       | .ok _ _ => MirStepNode.fail .ub
-      | .ub => MirStepNode.fail .ub
+      | .ub =>
+        match proj, rest with
+        | .deref, .nil =>
+          match get? s.frame.locals p.local_ with
+          | .some (.init (.ptr ptrVal _)) =>
+            match lookupBorrow s.memory.borrows ptrVal.tag with
+            | .some entry =>
+              match entry.perm, entry.targetProjection, Nat.beq ptrVal.offsetBytes 0 with
+              | .frozen, _, _ => MirStepNode.fail .ub
+              | .disabled, _, _ => MirStepNode.fail .ub
+              | _, _ :: _, _ => MirStepNode.fail .ub
+              | _, _, false => MirStepNode.fail .ub
+              | _, .nil, true =>
+                let pointeeAdtOk : Bool :=
+                  match placeTyResolved localDecls layouts p with
+                  | .some { kind := .adt _ _, .. } => true
+                  | .some _ => false
+                  | .none => true
+                match
+                  activeFrameSlot?
+                    s.frame.locals
+                    s.memory.callStack
+                    entry.targetFrameDepth
+                    entry.targetLocal
+                with
+                | .some .uninit =>
+                  match
+                    Bool.and
+                      pointeeAdtOk
+                      (setDiscriminantUninitDeclOk localDecls entry.targetLocal)
+                  with
+                  | true =>
+                    evalSetDiscriminantDerefWrite
+                      s s.frame.locals p .nil (.aggregate variantIdx .nil) localDecls layouts
+                  | false => MirStepNode.unsupported
+                | .some _ => MirStepNode.fail .ub
+                | .none =>
+                  match
+                    foreignFrameSlot?
+                      s.memory.callStack
+                      s.memory.callerLocals
+                      entry.targetFrameDepth
+                      entry.targetLocal
+                  with
+                  | .some .uninit =>
+                    let (targetDecls, _) :=
+                      foreignFrameDeclsAndLayouts
+                        s.memory.callStack
+                        layouts
+                        entry.targetFrameDepth
+                        entry.targetLocal
+                    match
+                      Bool.and
+                        pointeeAdtOk
+                        (setDiscriminantUninitDeclOk targetDecls entry.targetLocal)
+                    with
+                    | true =>
+                      evalSetDiscriminantDerefWrite
+                        s s.frame.locals p .nil (.aggregate variantIdx .nil) localDecls layouts
+                    | false => MirStepNode.unsupported
+                  | _ => MirStepNode.fail .ub
+            | .none => MirStepNode.fail .ub
+          | _ => MirStepNode.fail .ub
+        | _, _ => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
   | .assign dst rv =>
     match evalRvalue s.frame.locals rv s.memory localDecls layouts with
@@ -3406,7 +4333,8 @@ def evalStmt
             match mem₁.activeProtectors with
             | .nil =>
               let borrows' :=
-                invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+                invalidateConflictingBorrows
+                  mem₁.borrows dst.local_ .none (length mem₁.callStack)
               MirStepNode.step
                 (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | protHead :: protTail =>
@@ -3417,11 +4345,15 @@ def evalStmt
                   dst.local_
                   .none
                   .nil
+                  0
+                  0
+                  (length mem₁.callStack)
               with
               | true => MirStepNode.fail .ub
               | false =>
                 let borrows' :=
-                  invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+                  invalidateConflictingBorrows
+                    mem₁.borrows dst.local_ .none (length mem₁.callStack)
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
           | .none => MirStepNode.fail .ub
@@ -3436,6 +4368,7 @@ def evalStmt
             mem₁.activeProtectors
             localDecls
             layouts
+            mem₁.callStack
         with
         | .ok locals₂ =>
           match
@@ -3448,7 +4381,8 @@ def evalStmt
                 mem₁.borrows
                 mem₁.activeProtectors
                 dst
-                restProj)
+                restProj
+                mem₁.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
@@ -3460,41 +4394,46 @@ def evalStmt
                 mem₁.borrows
                 dst
                 restProj
+                mem₁.callStack
             MirStepNode.step
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .ub =>
-          match mem₁.callerLocals with
-          | .nil => MirStepNode.fail .ub
+          match mem₁.callStack with
+          | .nil =>
+            match mem₁.callerLocals with
+            | .nil => MirStepNode.fail .ub
+            | _ :: _ =>
+              match
+                evalCallerPlaceWrite
+                  locals₁
+                  mem₁.callerLocals
+                  mem₁.borrows
+                  dst
+                  val
+                  mem₁.activeProtectors
+              with
+              | .ok callerLocals' =>
+                match derefWriteTreeUB locals₁ mem₁.borrows dst with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  let borrows' :=
+                    invalidateDerefWriteBorrows
+                      locals₁
+                      mem₁.borrows
+                      dst
+                      restProj
+                      mem₁.callerLocals
+                  MirStepNode.step
+                    (advanceStmt
+                      s
+                      locals₁
+                      { mem₁ with
+                        borrows := borrows'
+                        callerLocals := callerLocals' })
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
           | _ :: _ =>
-            match
-              evalCallerPlaceWrite
-                locals₁
-                mem₁.callerLocals
-                mem₁.borrows
-                dst
-                val
-                mem₁.activeProtectors
-            with
-            | .ok callerLocals' =>
-              match derefWriteTreeUB locals₁ mem₁.borrows dst with
-              | true => MirStepNode.fail .ub
-              | false =>
-                let borrows' :=
-                  invalidateDerefWriteBorrows
-                    locals₁
-                    mem₁.borrows
-                    dst
-                    restProj
-                    mem₁.callerLocals
-                MirStepNode.step
-                  (advanceStmt
-                    s
-                    locals₁
-                    { mem₁ with
-                      borrows := borrows'
-                      callerLocals := callerLocals' })
-            | .ub => MirStepNode.fail .ub
-            | .unsupported => MirStepNode.unsupported
+            evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
         | .unsupported => MirStepNode.unsupported
       | proj :: rest =>
         match get? locals₁ dst.local_ with
@@ -3527,6 +4466,9 @@ def evalStmt
                     dst.local_
                     .none
                     resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
               | protHead :: protTail =>
@@ -3537,6 +4479,9 @@ def evalStmt
                     dst.local_
                     .none
                     resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
                 with
                 | true => MirStepNode.fail .ub
                 | false =>
@@ -3546,6 +4491,9 @@ def evalStmt
                       dst.local_
                       .none
                       resolvedLocalProj
+                      0
+                      0
+                      (length mem₁.callStack)
                   MirStepNode.step
                     (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | .none => MirStepNode.fail .ub
@@ -3582,6 +4530,9 @@ def evalStmt
                       dst.local_
                       .none
                       resolvedLocalProj
+                      0
+                      0
+                      (length mem₁.callStack)
                   MirStepNode.step
                     (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
                 | protHead :: protTail =>
@@ -3592,6 +4543,9 @@ def evalStmt
                       dst.local_
                       .none
                       resolvedLocalProj
+                      0
+                      0
+                      (length mem₁.callStack)
                   with
                   | true => MirStepNode.fail .ub
                   | false =>
@@ -3601,6 +4555,9 @@ def evalStmt
                         dst.local_
                         .none
                         resolvedLocalProj
+                        0
+                        0
+                        (length mem₁.callStack)
                     MirStepNode.step
                       (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
               | .none => MirStepNode.fail .ub
@@ -3618,9 +4575,10 @@ Universal characterization of `StatementKind.storageDead loc` in `evalStmt`
 1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
    `set? s.frame.locals loc .dead = .some localsDead`) and no borrow entry
    targeting `loc` is protected by `s.memory.activeProtectors`
-   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
-   `evalStmt` steps to `advanceStmt s localsDead { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }`,
-   in which every borrow entry targeting `loc` is `.disabled`.
+   at the active frame's depth
+   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc (length s.memory.callStack) = false`),
+   `evalStmt` steps to `advanceStmt s localsDead { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }`,
+   in which every borrow entry targeting `loc` of the active frame is `.disabled` with a deallocated allocation.
 2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
    `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), `evalStmt`
    faults with `MirStepNode.fail .ub`.
@@ -3637,16 +4595,20 @@ theorem evalStmt_storageDead_purges_borrows
     (layouts : LayoutTable) :
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .dead = .some localsDead →
-      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack) = false →
       evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts =
         MirStepNode.step
           (advanceStmt s localsDead
-            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
-      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
-        entry.targetLocal = loc → entry.perm = .disabled) ∧
+            { s.memory with
+              borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) ∧
+      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc (length s.memory.callStack),
+        entry.targetFrameDepth = length s.memory.callStack →
+        entry.targetLocal = loc → entry.perm = .disabled ∧ entry.allocDead = true) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .dead = .some localsDead →
-      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack) = true →
       evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
@@ -3675,9 +4637,10 @@ Universal characterization of `StatementKind.storageLive loc` in `evalStmt`
 1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
    `set? s.frame.locals loc .uninit = .some localsUninit`) and no borrow entry
    targeting `loc` is protected by `s.memory.activeProtectors`
-   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
-   `evalStmt` steps to `advanceStmt s localsUninit { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }`,
-   in which every borrow entry targeting `loc` is `.disabled`.
+   at the active frame's depth
+   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc (length s.memory.callStack) = false`),
+   `evalStmt` steps to `advanceStmt s localsUninit { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }`,
+   in which every borrow entry targeting `loc` of the active frame is `.disabled` with a deallocated allocation.
 2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
    `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), the implicit
    deallocation of `loc`'s previous storage makes `evalStmt` fault with
@@ -3695,16 +4658,20 @@ theorem evalStmt_storageLive_purges_borrows
     (layouts : LayoutTable) :
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .uninit = .some localsUninit →
-      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack) = false →
       evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts =
         MirStepNode.step
           (advanceStmt s localsUninit
-            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
-      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
-        entry.targetLocal = loc → entry.perm = .disabled) ∧
+            { s.memory with
+              borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) ∧
+      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc (length s.memory.callStack),
+        entry.targetFrameDepth = length s.memory.callStack →
+        entry.targetLocal = loc → entry.perm = .disabled ∧ entry.allocDead = true) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .uninit = .some localsUninit →
-      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack) = true →
       evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
@@ -3743,11 +4710,14 @@ revived by `StorageLive(loc)` and re-initialized) and arbitrary captured global
 allocations `globals`: the disabled stack borrow entry keeps shadowing any
 global allocation that shares the pointer's allocation identifier.
 
-Pointer arithmetic (`evalPtrOffsetBinOp`) and raw address-of (`Rvalue.rawPtr`)
-are deliberately not characterized: `Places.lean` currently faults on any
-disabled tag before inspecting the offset or the access, which is stricter than
-MiniRust and Miri for zero-byte offsets and raw address-of (both defined on
-dangling pointers), and those rules belong to `ws-lm-div-places-ptr`.
+The theorem holds for the borrows of `loc` at any frame depth `d`
+(`entry.targetFrameDepth = d`), and the disabled entry also records the
+deallocation (`allocDead := true`). Pointer arithmetic (`evalPtrOffsetBinOp`) is
+deliberately not characterized here: it checks allocation bounds only, so a
+non-zero offset through such a tag faults because `allocDead` gives the dead
+allocation the byte bound `0`, while a zero-byte offset stays defined
+(`DIV-LM-D6-OFFSET-DISABLED-TAG`). Raw address-of (`Rvalue.rawPtr`) is not
+characterized either.
 -/
 theorem evalStmt_storageRevive_old_ptr_deref_ub
     (s : MachineState)
@@ -3771,16 +4741,19 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     (otherVal : Value)
     (n : Nat)
     (entry : BorrowEntry)
+    (d : Nat)
     (hLookup : lookupBorrow borrows ptrVal.tag = .some entry)
     (hTarget : entry.targetLocal = loc)
+    (hDepth : entry.targetFrameDepth = d)
     (hPtrSlot : get? localsAfter ptrLoc = .some (.init (.ptr ptrVal sz))) :
-    let borrowsAfter := disableLocalBorrows borrows loc
+    let borrowsAfter := disableLocalBorrows borrows loc d
     let derefPlace : Place := { local_ := ptrLoc, projection := .deref :: restProj }
     let sAfter : MachineState :=
       { s with
         frame := { s.frame with locals := localsAfter }
         memory := { s.memory with borrows := borrowsAfter } }
-    lookupBorrow borrowsAfter ptrVal.tag = .some { entry with perm := .disabled } ∧
+    lookupBorrow borrowsAfter ptrVal.tag =
+      .some { entry with perm := .disabled, allocDead := true } ∧
     evalPlaceRead localsAfter derefPlace borrowsAfter globals layouts callerLocals localDecls = .ub ∧
     evalOperand localsAfter (.copy derefPlace) borrowsAfter globals layouts callerLocals localDecls = .ub ∧
     evalOperand localsAfter (.move derefPlace) borrowsAfter globals layouts callerLocals localDecls = .ub ∧
@@ -3802,20 +4775,21 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
       otherVal (.ptr ptrVal sz) (n + 1) localsAfter = MirStepNode.fail .ub := by
   dsimp only
-  have hDis : lookupBorrow (disableLocalBorrows borrows loc) ptrVal.tag =
-      .some { entry with perm := .disabled } :=
+  have hDis : lookupBorrow (disableLocalBorrows borrows loc d) ptrVal.tag =
+      .some { entry with perm := .disabled, allocDead := true } :=
     lookupBorrow_disableLocalBorrows_of_targetLocal_eq borrows loc ptrVal.tag entry hLookup hTarget
+      hDepth
   have hWrite :
-      writePlaceValue localsAfter (disableLocalBorrows borrows loc)
+      writePlaceValue localsAfter (disableLocalBorrows borrows loc d)
         { local_ := ptrLoc, projection := .deref :: restProj } writeVal localDecls layouts = .ub := by
     simp [writePlaceValue, hPtrSlot, hDis]
   have hOpCopy :
       evalOperand localsAfter (.copy { local_ := ptrLoc, projection := .deref :: restProj })
-        (disableLocalBorrows borrows loc) globals layouts callerLocals localDecls = .ub := by
+        (disableLocalBorrows borrows loc d) globals layouts callerLocals localDecls = .ub := by
     cases localDecls <;> simp [evalOperand, hPtrSlot, hDis]
   have hOpMove :
       evalOperand localsAfter (.move { local_ := ptrLoc, projection := .deref :: restProj })
-        (disableLocalBorrows borrows loc) globals layouts callerLocals localDecls = .ub := by
+        (disableLocalBorrows borrows loc d) globals layouts callerLocals localDecls = .ub := by
     cases localDecls <;> simp [evalOperand, hPtrSlot, hDis]
   refine ⟨hDis, ?_, hOpCopy, hOpMove, hWrite, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · cases localDecls <;> simp [evalPlaceRead, hPtrSlot, hDis]
@@ -3855,14 +4829,14 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       | _ =>
         dsimp only
         rw [hDis]
-  · cases localDecls <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
+  · cases localDecls <;> cases restProj <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
     cases otherVal with
     | ptr dstPtr dstSz =>
       dsimp only
       rw [hDis]
-      cases hDst : lookupBorrow (disableLocalBorrows borrows loc) dstPtr.tag <;> rfl
+      cases hDst : lookupBorrow (disableLocalBorrows borrows loc d) dstPtr.tag <;> rfl
     | _ => rfl
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
@@ -3870,7 +4844,7 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     | ptr srcPtr srcSz =>
       dsimp only
       rw [hDis]
-      cases hSrc : lookupBorrow (disableLocalBorrows borrows loc) srcPtr.tag with
+      cases hSrc : lookupBorrow (disableLocalBorrows borrows loc d) srcPtr.tag with
       | none => rfl
       | some srcEntry =>
         dsimp only
@@ -4166,7 +5140,7 @@ theorem evalStmt_assign_uninit_aggregate_field_step
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
         (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-          (.field fieldIdx fieldTy :: rest)) = false) :
+          (.field fieldIdx fieldTy :: rest)) 0 0 (length mem₁.callStack) = false) :
     evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
         (advanceStmt s locals₂
@@ -4174,7 +5148,7 @@ theorem evalStmt_assign_uninit_aggregate_field_step
             borrows :=
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                  (.field fieldIdx fieldTy :: rest)) }) := by
+                  (.field fieldIdx fieldTy :: rest)) 0 0 (length mem₁.callStack) }) := by
   have hEval :
       evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
         match mem₁.activeProtectors with
@@ -4185,12 +5159,12 @@ theorem evalStmt_assign_uninit_aggregate_field_step
                 borrows :=
                   invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                     (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                      (.field fieldIdx fieldTy :: rest)) })
+                      (.field fieldIdx fieldTy :: rest)) 0 0 (length mem₁.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
               (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                (.field fieldIdx fieldTy :: rest))
+                (.field fieldIdx fieldTy :: rest)) 0 0 (length mem₁.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
@@ -4200,7 +5174,7 @@ theorem evalStmt_assign_uninit_aggregate_field_step
                   borrows :=
                     invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                       (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                        (.field fieldIdx fieldTy :: rest)) }) := by
+                        (.field fieldIdx fieldTy :: rest)) 0 0 (length mem₁.callStack) }) := by
     unfold evalStmt
     dsimp only
     rw [hRv]
@@ -4253,7 +5227,7 @@ theorem evalStmt_assign_uninit_aggregate_field_protected_conflict_ub
     (hConflict :
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
         (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-          (.field fieldIdx fieldTy :: rest)) = true) :
+          (.field fieldIdx fieldTy :: rest)) 0 0 (length mem₁.callStack) = true) :
     evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.fail .ub := by
   unfold evalStmt
@@ -4310,7 +5284,7 @@ theorem evalStmt_assign_uninit_union_field_ok
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
                  | .some rp => rp
-                 | .none => .field fieldIdx fieldTy :: .nil) }) := by
+                 | .none => .field fieldIdx fieldTy :: .nil) 0 0 (length mem₁.callStack) }) := by
   have hShell :=
     uninitFieldWriteShell?_field_adt localDecls layouts dstLoc fieldIdx fieldTy
       defPath args layoutIdx hTy
@@ -4367,7 +5341,7 @@ theorem evalStmt_assign_uninit_tuple_field_ok
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
                  | .some rp => rp
-                 | .none => .field fieldIdx fieldTy :: .nil) }) := by
+                 | .none => .field fieldIdx fieldTy :: .nil) 0 0 (length mem₁.callStack) }) := by
   have hShell :=
     uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
       fields layoutIdx hTy
@@ -4472,7 +5446,7 @@ theorem evalStmt_assign_uninit_nested_field_ok
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (match resolveBorrowProjectionElems locals₁ projs with
                  | .some rp => rp
-                 | .none => projs) }) := by
+                 | .none => projs) 0 0 (length mem₁.callStack) }) := by
   dsimp only
   let shell : Value :=
     .aggregate 0 (setOrExtendFields .nil outerIdx (.aggregate 0 .nil))
@@ -4718,7 +5692,7 @@ theorem evalStmt_assign_init_projected_step
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
         (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-          (proj :: rest)) = false) :
+          (proj :: rest)) 0 0 (length mem₁.callStack) = false) :
     evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
         (advanceStmt s locals₂
@@ -4726,7 +5700,7 @@ theorem evalStmt_assign_init_projected_step
             borrows :=
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                  (proj :: rest)) }) := by
+                  (proj :: rest)) 0 0 (length mem₁.callStack) }) := by
   have hWriteShell :
       writeProjectedForLocal locals₁ localDecls layouts dstLoc
         (ensureNestedFieldShells rootVal (proj :: rest))
@@ -4744,12 +5718,12 @@ theorem evalStmt_assign_init_projected_step
                 borrows :=
                   invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                     (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                      (proj :: rest)) })
+                      (proj :: rest)) 0 0 (length mem₁.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
               (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                (proj :: rest))
+                (proj :: rest)) 0 0 (length mem₁.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
@@ -4759,7 +5733,7 @@ theorem evalStmt_assign_init_projected_step
                   borrows :=
                     invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                       (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-                        (proj :: rest)) }) := by
+                        (proj :: rest)) 0 0 (length mem₁.callStack) }) := by
     cases proj with
     | deref => exact False.elim (hNotDeref rfl)
     | _ =>
@@ -4833,7 +5807,7 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (match resolveBorrowProjectionElems locals₁ projs with
                  | .some rp => rp
-                 | .none => projs) }) := by
+                 | .none => projs) 0 0 (length mem₁.callStack) }) := by
   dsimp only
   have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
     intro k; cases k <;> rfl
@@ -5176,7 +6150,8 @@ theorem evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
     (hPerm : perm = .active ∨ perm = .frozen) :
     (let sibEntry : BorrowEntry :=
        { tag := tag, targetLocal := dstLoc,
-         targetProjection := .field borIdx borTy :: .nil, perm := perm }
+         targetProjection := .field borIdx borTy :: .nil, perm := perm,
+         targetFrameDepth := length mem₁.callStack }
      mem₁.borrows = sibEntry :: .nil →
      mem₁.activeProtectors = .nil →
      evalStmt s ⟨.assign ⟨dstLoc, .field writeIdx writeTy :: .nil⟩ rv, span⟩
@@ -5187,7 +6162,7 @@ theorem evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
     (let protEntry : BorrowEntry :=
        { tag := tag, targetLocal := dstLoc,
          targetProjection := .field borIdx borTy :: .nil, perm := perm,
-         protector := .some protId }
+         protector := .some protId, targetFrameDepth := length mem₁.callStack }
      mem₁.borrows = protEntry :: .nil →
      mem₁.activeProtectors = protId :: .nil →
      evalStmt s ⟨.assign ⟨dstLoc, .field writeIdx writeTy :: .nil⟩ rv, span⟩
@@ -5222,7 +6197,7 @@ theorem evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
         projectionsOverlap, stripTransparentProjections,
         normalizeSubsliceProjections, projectionsOverlapAux,
         treeBorrowNodeAccess, treeBorrowPermTransition, applyTreeBorrowTransition,
-        sibEntry]
+        sibEntry, Nat.beq_refl]
   · intro protEntry hBor hAP
     unfold evalStmt
     dsimp only
@@ -5238,7 +6213,7 @@ theorem evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
         borrowEntryOverlapsWrite, projectionsOverlap, stripTransparentProjections,
         normalizeSubsliceProjections, projectionsOverlapAux,
         isBorrowProtected, natListContainsBool, borrowEntryWriteConflicts,
-        protEntry]
+        protEntry, Nat.beq_refl]
 
 private theorem lookupBorrow_mem_of_some
     {borrows : List BorrowEntry} {tag : Nat} {entry : BorrowEntry}
@@ -5367,7 +6342,8 @@ theorem evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protec
          targetProjection := .field borIdx borTy :: .nil, perm := sibPerm }
      mem₁.borrows = writerEntry :: sibEntry :: .nil →
      mem₁.activeProtectors = .nil →
-     writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts = .ok locals₂ →
+     writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts mem₁.callStack =
+       .ok locals₂ →
      evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
        MirStepNode.step
          (advanceStmt s locals₂
@@ -5380,7 +6356,9 @@ theorem evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protec
      mem₁.borrows = writerEntry :: protEntry :: .nil →
      mem₁.activeProtectors = protId :: .nil →
      mem₁.callerLocals = .nil →
-     writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts = .ok locals₂ →
+     mem₁.callStack = .nil →
+     writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts mem₁.callStack =
+       .ok locals₂ →
      evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
        MirStepNode.fail .ub) := by
   intro writerEntry dst
@@ -5424,7 +6402,8 @@ theorem evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protec
         resolveDerefWriteFullProj
           locals₁ locals₁ (.ptr ptrVal ptrSz)
           { tag := ptrVal.tag, targetLocal := uLoc, targetProjection := .nil, perm := .active }
-          (.field writeIdx writeTy :: .nil) = (.field writeIdx writeTy :: .nil) := rfl
+          (.field writeIdx writeTy :: .nil) .nil mem₁.callStack =
+          (.field writeIdx writeTy :: .nil) := rfl
     rw [hFull, hEffNil]
     dsimp only [treeBorrowAncestorsChildAccessUB, Bool.or]
     rcases hSibPerm with rfl | rfl <;>
@@ -5436,13 +6415,17 @@ theorem evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protec
         normalizeSubsliceProjections, projectionsOverlapAux,
         treeBorrowWriterRelatedness, treeBorrowNodeAccess,
         treeBorrowPermTransition, applyTreeBorrowTransition]
-  · intro protEntry hBor hAP hCaller hWOk
+  · intro protEntry hBor hAP hCaller hCS hWOk
     unfold evalStmt
     dsimp only [dst]
     rw [hRv]
     dsimp only
-    cases hEPW : evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts with
+    cases hEPW :
+        evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts
+          mem₁.callStack with
     | ub =>
+      dsimp only
+      rw [hCS]
       dsimp only
       rw [hCaller]
     | unsupported =>
@@ -5462,7 +6445,8 @@ theorem evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protec
           resolveDerefWriteFullProj
             locals₁ locals₁ (.ptr ptrVal ptrSz)
             { tag := ptrVal.tag, targetLocal := uLoc, targetProjection := .nil, perm := .active }
-            (.field writeIdx writeTy :: .nil) = (.field writeIdx writeTy :: .nil) := rfl
+            (.field writeIdx writeTy :: .nil) .nil mem₁.callStack =
+            (.field writeIdx writeTy :: .nil) := rfl
       rw [hFull]
       dsimp only []
       rw [hEffNil]

@@ -127,6 +127,7 @@ structure V2026_08_01_Scorecard : Prop where
       let resolvedEntry : BorrowEntry := {
         tag := mem.nextTag
         targetLocal := 0
+        targetFrameDepth := length mem.callStack
         targetProjection := [.constantIndex idxSc.bits 0 false]
         perm := .frozen
       }

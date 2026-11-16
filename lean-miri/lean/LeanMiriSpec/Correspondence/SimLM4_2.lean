@@ -194,7 +194,7 @@ theorem step_intrinsic_assume_simulation
         MirStepNode.fail .ub := by
       unfold evalStmt
       dsimp only
-      rw [(hop tf hframes).evalOperand_localDecls_eq, ha]
+      rw [hstate.callStack_nil, (hop tf hframes).evalOperand_localDecls_eq, ha]
     rw [ha']
     exact .ub _ _
   · -- The operand is the one-byte scalar `sc` in Anneal and `msc` in `lean-miri`.
@@ -213,7 +213,7 @@ theorem step_intrinsic_assume_simulation
         | false => MirStepNode.fail .ub := by
       unfold evalStmt
       dsimp only
-      rw [(hop tf hframes).evalOperand_localDecls_eq, ha]
+      rw [hstate.callStack_nil, (hop tf hframes).evalOperand_localDecls_eq, ha]
       rfl
     rw [hanneal, hsc1]
     have hbeq1 : Nat.beq 1 1 = true := rfl
@@ -505,10 +505,12 @@ theorem call_intrinsic_rotate_stage1_boundary
         (m', .error (.unsupported msg))) ∨
       (∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior msg)))) := by
-  obtain ⟨_, _, _, _, _, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨_, _, _, _, _, hcal, hstack, _, _, _, _, _⟩ := id hstate
   have hk : k.stage1Unmodeled = true := by rcases hrot with ⟨rfl, _⟩ | ⟨rfl, _⟩ <;> rfl
-  refine ⟨stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len
-    hk hterm hc hcallee, ?_⟩
+  have hstep := stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len
+    hk hterm hc hcallee
+  rw [hstack] at hstep
+  refine ⟨hstep, ?_⟩
   rcases call_intrinsic_rotate_simulation hstate hphase hbb hstmt_none hstmt_len hrot hterm hint
       hshift hc hfind hop₁ hop₂ hdst with ⟨hunsup, _⟩ | ⟨m', msg, hm, _⟩
   · exact .inl hunsup
@@ -614,7 +616,7 @@ theorem call_intrinsic_saturating_simulation
     refine ⟨r', mr, .scalar r' mr hrR ?_ (fun h => absurd h hdstInt.ne_bool)
       (fun h => absurd h hdstInt.ne_char), ?_, ?_⟩
     · rw [hdstInt.translateTy_eq hint body.layouts body.layouts, hrsz]; exact hsz₁
-    · dsimp only; rw [hstage1]; rfl
+    · dsimp only; rw [hstage1]
     · rw [heval]; exact hev
 
 /-! ## 3. `exact_div` -/

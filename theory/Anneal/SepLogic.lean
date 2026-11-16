@@ -282,7 +282,8 @@ theorem borrowToken_active_hasWriteAccess
   exact
     ⟨{ h.state with
        borrows :=
-         invalidateConflictingBorrows h.state.borrows entry.targetLocal (some rp.tag) },
+         invalidateConflictingBorrows h.state.borrows entry.targetLocal (some rp.tag)
+           entry.targetFrameDepth },
      by simp [stepTreeBorrowAccess?, hlookup, hperm]⟩
 
 theorem pointsTo_implies_liveAllocAt
@@ -573,23 +574,28 @@ theorem statefulVerificationResult_frame_disjoint
   exact ⟨hcpost, hsupp mem mem' (hpres args mem retVal mem' hcpre hcpost) hfin⟩
 
 private theorem updateBorrowPerm_tag
-    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) :
-    (updateBorrowPerm entry targetLocal writerTag).tag = entry.tag := by
+    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    {targetFrameDepth : Nat} :
+    (updateBorrowPerm entry targetLocal writerTag targetFrameDepth).tag = entry.tag := by
   unfold updateBorrowPerm
-  cases Nat.beq entry.targetLocal targetLocal
+  cases Bool.and (Nat.beq entry.targetFrameDepth targetFrameDepth)
+      (Nat.beq entry.targetLocal targetLocal)
   · rfl
   · exact (applyTreeBorrowTransition_fields _ _).1
 
 /--
-Looking up `tag` in `invalidateConflictingBorrows borrows targetLocal writerTag`
-maps `updateBorrowPerm` over `lookupBorrow borrows tag`.
+Looking up `tag` in
+`invalidateConflictingBorrows borrows targetLocal writerTag targetFrameDepth`
+maps `updateBorrowPerm` over `lookupBorrow borrows tag` (for every written
+frame depth).
 -/
 theorem lookupBorrow_invalidateConflictingBorrows
     (borrows : List BorrowEntry) (targetLocal : Local)
-    (writerTag : Option Nat) (tag : Nat) :
-    lookupBorrow (invalidateConflictingBorrows borrows targetLocal writerTag) tag =
+    (writerTag : Option Nat) (tag : Nat) {targetFrameDepth : Nat} :
+    lookupBorrow
+        (invalidateConflictingBorrows borrows targetLocal writerTag targetFrameDepth) tag =
       (lookupBorrow borrows tag).map
-        (fun entry => updateBorrowPerm entry targetLocal writerTag) := by
+        (fun entry => updateBorrowPerm entry targetLocal writerTag targetFrameDepth) := by
   induction borrows with
   | nil => rfl
   | cons entry rest ih =>
@@ -601,11 +607,23 @@ theorem lookupBorrow_invalidateConflictingBorrows
 
 theorem updateBorrowPerm_of_targetLocal_ne
     (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
-    (hne : entry.targetLocal ≠ targetLocal) :
-    updateBorrowPerm entry targetLocal writerTag = entry := by
+    (hne : entry.targetLocal ≠ targetLocal) {targetFrameDepth : Nat} :
+    updateBorrowPerm entry targetLocal writerTag targetFrameDepth = entry := by
   unfold updateBorrowPerm
   cases hbeq : Nat.beq entry.targetLocal targetLocal
-  · rfl
+  · simp only [Bool.and_false]
+  · exact absurd (Nat.eq_of_beq_eq_true hbeq) hne
+
+/-- A write to a local in another frame (`entry.targetFrameDepth ≠
+targetFrameDepth`) leaves `entry` unchanged, even when the local indices agree
+(`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`). -/
+theorem updateBorrowPerm_of_targetFrameDepth_ne
+    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    {targetFrameDepth : Nat} (hne : entry.targetFrameDepth ≠ targetFrameDepth) :
+    updateBorrowPerm entry targetLocal writerTag targetFrameDepth = entry := by
+  unfold updateBorrowPerm
+  cases hbeq : Nat.beq entry.targetFrameDepth targetFrameDepth
+  · simp only [Bool.false_and]
   · exact absurd (Nat.eq_of_beq_eq_true hbeq) hne
 
 /--
@@ -615,7 +633,7 @@ distinct from `targetLocal`.
 -/
 theorem agreeOnFootprint_of_disjoint_borrow_update
     (fp : Footprint) (m : Memory) (targetLocal : Local)
-    (writerTag : Option Nat)
+    (writerTag : Option Nat) {targetFrameDepth : Nat}
     (hdisj :
       ∀ tag ∈ fp.tags,
         ∃ entry,
@@ -624,7 +642,8 @@ theorem agreeOnFootprint_of_disjoint_borrow_update
     AgreeOnFootprint fp m
       { m with
         borrows :=
-          invalidateConflictingBorrows m.borrows targetLocal writerTag } := by
+          invalidateConflictingBorrows m.borrows targetLocal writerTag
+            targetFrameDepth } := by
   refine ⟨fun _ _ _ => rfl, fun tag hin => ?_⟩
   rcases hdisj tag hin with ⟨entry, hlookup, hne⟩
   rw [lookupBorrow_invalidateConflictingBorrows, hlookup]

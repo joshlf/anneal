@@ -1020,10 +1020,11 @@ theorem sim_lm3_3_interpreter_deref_write_step
         obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
         have hl := hlive_ref ptrVal e tgtDecl hget he htag' hdecl_t hdead
         exact ⟨hl.1, Or.inl rfl, hl.2.2⟩) hlay_coh
-    obtain ⟨tf, hframes, _, _, hfr, hcal_e, _, hprot_e, hcaller_e, _, halloc_e, _⟩ :=
+    obtain ⟨tf, hframes, _, _, hfr, hcal_e, hstack_e, hprot_e, hcaller_e, _, halloc_e, _⟩ :=
       id htree.erased_rel
-    obtain ⟨_, _, _, _, _, hcal_a, _, hprot_a, hcaller_a, hbor_a, halloc_a, _⟩ := id hstate_act
+    obtain ⟨_, _, _, _, _, hcal_a, hstack_a, hprot_a, hcaller_a, hbor_a, halloc_a, _⟩ := id hstate_act
     have hcal : s.memory.activeCallee = none := hcal_e
+    have hstack : s.memory.callStack = .nil := hstack_e
     have hprot : s.memory.activeProtectors = .nil := hprot_e
     have hcaller : s.memory.callerLocals = .nil := hcaller_e
     have hbor_s : s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry := htree.borrows_eq
@@ -1145,7 +1146,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
             rw [hsr_full]; dsimp only []
             rw [hlook_s, hlook_a]
             dsimp only [ReborrowMapEntry.toBorrowEntry, actAllocEntry,
-              AllocMapEntry.toBorrowEntry, ReborrowMapEntry.toAllocMapEntry]
+              AllocMapEntry.toBorrowEntry, ReborrowMapEntry.toAllocMapEntry, activeFrameSlot?]
             by_cases hdead : get? s.frame.locals e.localIdx = some .dead
             · rw [hdead]
               cases e.perm <;> rfl
@@ -1160,7 +1161,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
             dsimp only []
             rw [hsr_full]; dsimp only []
             rw [hlook_s, hlook_a]
-            dsimp only []
+            dsimp only [activeFrameTargetLocals?]
             by_cases hdead : get? s.frame.locals e.localIdx = some .dead
             · have hdead_s : get? s.frame.locals e.toBorrowEntry.targetLocal = some .dead := hdead
               have hdead_a :
@@ -1193,18 +1194,18 @@ theorem sim_lm3_3_interpreter_deref_write_step
         have ha_s : stepMirFn body s = .fail .ub := by
           rw [hs_step]; unfold evalStmt; dsimp only []
           rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res, hcaller]
+          rw [hprot, hstack]; dsimp only []; rw [hwp_eq.trans hwp_res, hcaller]
         have ha_a : stepMirFn body s_act = .fail .ub := by
           rw [ha_step]; unfold evalStmt; rw [hfa]; dsimp only []
           rw [hrv_a, hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot_a]; dsimp only []; rw [hwp_res, hcaller_a]
+          rw [hprot_a, hstack_a]; dsimp only []; rw [hwp_res, hcaller_a]
         rw [ha_a] at hsim; rw [ha_s]
         cases hsim with | ub m' msg => exact .ub _ m' msg
       | unsupported =>
         have ha_a : stepMirFn body s_act = .unsupported := by
           rw [ha_step]; unfold evalStmt; rw [hfa]; dsimp only []
           rw [hrv_a, hop_res]; dsimp only [evalPlaceWrite]
-          rw [hprot_a]; dsimp only []; rw [hwp_res]
+          rw [hprot_a, hstack_a]; dsimp only []; rw [hwp_res]
         rw [ha_a] at hsim; cases hsim
       | ok locals₂ =>
         rcases hloc_r.ref_immediate_cases href_ty ((himm_ref tf hframes) mls_r hmls_r) with
@@ -1254,7 +1255,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
                   { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry }) := by
             rw [hs_step]; unfold evalStmt; dsimp only []
             rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
-            rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res]
+            rw [hprot, hstack]; dsimp only []; rw [hwp_eq.trans hwp_res]
             dsimp only [derefWriteUnionProtectorUB, Bool.or]
             simp only [hwub_s, hcaller, hinv_lay_s]
             rw [hinv_s]
@@ -1266,7 +1267,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
                       ⟨refIdx, .cons .deref .nil⟩ .nil }) := by
             rw [ha_step]; unfold evalStmt; rw [hfa]; dsimp only []
             rw [hrv_a, hop_res]; dsimp only [evalPlaceWrite]
-            rw [hprot_a]; dsimp only []; rw [hwp_res]
+            rw [hprot_a, hstack_a]; dsimp only []; rw [hwp_res]
             dsimp only [derefWriteUnionProtectorUB, Bool.or]
             simp only [hwub_a, hcaller_a, hinv_lay_a]
           rw [ha_a] at hsim; rw [ha_s]
@@ -1380,23 +1381,22 @@ def storageLiveBody : CapturedMir :=
 
 /-- **`sim_lm3_3_storage_dead_and_live_protector_step`**: across all 6-state
 `TreeBorrowPerm` permissions of tag `1` on `_1`:
-1. when `isProtected = true` (`activeProtectors = [1]`), both `StorageDead(_1)`
-   and `StorageLive(_1)` fault with `.fail .ub` in Stage-1 `stepMirFn`
-   (`hasProtectedLocalBorrow = true`), and for every non-`Cell` permission
-   (`perm ≠ .cell`), Miri's `BorrowTree.deallocateBorrowRange` on
-   `hooksTwoNodeTree perm` with active strong protector also fails
-   (`status ≠ .Deallocated`);
-2. when `isProtected = false` (`activeProtectors = []`), both `StorageDead(_1)`
-   and `StorageLive(_1)` step in `stepMirFn`, disabling `entry 1 perm` to
-   `[entry 1 .disabled]` (`disableLocalBorrows`) while preserving
+1. when `isProtected = true` (`activeProtectors = [1]`) and `preventsDeallocation perm = true`
+   (`perm ≠ .cell ∧ perm ≠ .disabled`), both `StorageDead(_1)` and `StorageLive(_1)` fault with
+   `.fail .ub` in Stage-1 `stepMirFn` (`hasProtectedLocalBorrow = true`), and for every non-`Cell`
+   permission (`perm ≠ .cell`), Miri's `BorrowTree.deallocateBorrowRange` on `hooksTwoNodeTree perm`
+   with active strong protector also fails (`status ≠ .Deallocated`);
+2. when `isProtected = false` (`activeProtectors = []`), both `StorageDead(_1)` and
+   `StorageLive(_1)` step in `stepMirFn`, disabling `entry 1 perm` to
+   `[{ (entry 1 .disabled) with allocDead := true }]` (`disableLocalBorrows`) while preserving
    `TreeBorrowsRel`, and Miri's `BorrowTree.deallocateBorrowRange` succeeds
    (`status = .Deallocated`).
-The protected `Cell` case excluded by `perm ≠ .cell` is a genuine residual
-divergence, certified separately by
-`sim_lm3_3_storage_dead_protected_cell_divergence`. -/
+Protected `Cell` (`&UnsafeCell<T>`) now also steps in lockstep, certified by
+`sim_lm3_3_storage_dead_protected_cell_simulation`. -/
 theorem sim_lm3_3_storage_dead_and_live_protector_step (perm : TreeBorrowPerm) :
-    stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
-    stepMirFn storageLiveBody (childState perm true) = .fail .ub ∧
+    (preventsDeallocation perm = true →
+      stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
+      stepMirFn storageLiveBody (childState perm true) = .fail .ub) ∧
     (perm ≠ .cell →
       ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
@@ -1404,11 +1404,11 @@ theorem sim_lm3_3_storage_dead_and_live_protector_step (perm : TreeBorrowPerm) :
     (∃ s_dead s_live : MachineState,
       stepMirFn storageDeadBody (childState perm false) = .step s_dead ∧
       get? s_dead.frame.locals 1 = some .dead ∧
-      s_dead.memory.borrows = [entry 1 .disabled] ∧
+      s_dead.memory.borrows = [{ (entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
       stepMirFn storageLiveBody (childState perm false) = .step s_live ∧
       get? s_live.frame.locals 1 = some .uninit ∧
-      s_live.memory.borrows = [entry 1 .disabled] ∧
+      s_live.memory.borrows = [{ (entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s_live.memory.borrows [] (basedNormalTree s_live.memory.borrows [])) ∧
     ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
       Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
@@ -1418,36 +1418,39 @@ theorem sim_lm3_3_storage_dead_and_live_protector_step (perm : TreeBorrowPerm) :
   have hdealloc_false :=
     (borrowTree_deallocateBorrowRange_simulation .foreignAccess perm false).2.2
   rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-    refine ⟨rfl, rfl, ?_,
+    refine ⟨?_, ?_,
       ⟨_, _, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩,
              rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩,
       hdealloc_false.mpr ⟨by decide, Or.inl rfl⟩⟩
+  · intro h; cases h
   · intro hne; exact False.elim (hne rfl)
+  · intro _; exact ⟨rfl, rfl⟩
   · intro _ hd; have h := (hdealloc_true.mp hd).2; cases h with | inl h | inr h => cases h
+  · intro _; exact ⟨rfl, rfl⟩
   · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _; exact ⟨rfl, rfl⟩
   · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _; exact ⟨rfl, rfl⟩
   · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _; exact ⟨rfl, rfl⟩
   · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro h; cases h
   · intro _ hd; have h := (hdealloc_true.mp hd).2; cases h with | inl h | inr h => cases h
 
-/-- **`sim_lm3_3_storage_dead_protected_cell_divergence`** (residual Stage-1
-divergence excluded by the `perm ≠ .cell` premise of
-`sim_lm3_3_storage_dead_and_live_protector_step`): when the only borrow of `_1`
-is a *protected* `Cell` (`&UnsafeCell<T>`) tag,
-1. Stage-1 `Trusted` `StorageDead(_1)` / `StorageLive(_1)` fault with `.fail .ub`,
-   because `hasProtectedLocalBorrow` (`Statements.lean:1842-1856`) treats every
-   protected borrow of the local alike, with no `UnsafeCell` exemption;
-2. Miri's `BorrowTree.deallocateBorrowRange` succeeds
-   (`status = .Deallocated`), because the foreign write leaves `Cell`
-   unchanged and the strong-protector `ProtectedDealloc` scan exempts `Cell`
-   (`I-11`). -/
-theorem sim_lm3_3_storage_dead_protected_cell_divergence :
-    stepMirFn storageDeadBody (childState .cell true) = .fail .ub ∧
-    stepMirFn storageLiveBody (childState .cell true) = .fail .ub ∧
+/-- **`sim_lm3_3_storage_dead_protected_cell_simulation`**: when the only borrow of `_1`
+is a *protected* `Cell` (`&UnsafeCell<T>`) tag, both Stage-1 `Trusted`
+`StorageDead(_1)` / `StorageLive(_1)` (`preventsDeallocation .cell = false`) AND Miri's
+`BorrowTree.deallocateBorrowRange` succeed (`status = .Deallocated`). -/
+theorem sim_lm3_3_storage_dead_protected_cell_simulation :
+    (∃ s_dead s_live : MachineState,
+      stepMirFn storageDeadBody (childState .cell true) = .step s_dead ∧
+      get? s_dead.frame.locals 1 = some .dead ∧
+      stepMirFn storageLiveBody (childState .cell true) = .step s_live ∧
+      get? s_live.frame.locals 1 = some .uninit) ∧
     ((hooksTwoNodeTree .cell).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
       Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
       (hooksForChildProtected true).protectedTags).status = .Deallocated :=
-  ⟨rfl, rfl,
+  ⟨⟨_, _, rfl, rfl, rfl, rfl⟩,
     (borrowTree_deallocateBorrowRange_simulation .foreignAccess .cell true).2.2.mpr
       ⟨by decide, Or.inr rfl⟩⟩
 

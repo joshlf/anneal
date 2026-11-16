@@ -212,14 +212,14 @@ theorem liftIndirectCaller_lift :
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   -- Callee bb0 terminator: `return` into the caller's `_0`, resuming at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
   -- bb1[0]: `StorageDead(_1)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   -- bb1 terminator: root `return` of `_0 = 7_u32`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.return_ (by rfl) (by rfl)
+  apply LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
   rfl
 
 /--
@@ -255,19 +255,19 @@ theorem liftDirectCaller_lift :
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- Callee bb0 terminator: `return` into the caller's `_1` at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1 terminator: `tailCall lift_poly_id::<u32>(move _1)`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.tailCallDirect (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, tailCallFrameMem, Option.getD]
+  apply LiftTerminator.tailCallDirect (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, tailCallFrameMem, disableFrameBorrows, Option.getD]
   -- Tail callee bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- Tail callee bb0 terminator: root `return` of `7_u32`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.return_ (by rfl) (by rfl)
+  apply LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
   rfl
 
 /-- The direct generic call returns `7_u32`. -/
@@ -577,8 +577,8 @@ theorem liftPolyLayoutCaller_lift :
   -- `lift_poly_id::<u32>`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallIndirect (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, tailCallFrameMem, Option.getD]
+    (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, tailCallFrameMem, disableFrameBorrows, Option.getD]
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
@@ -586,7 +586,7 @@ theorem liftPolyLayoutCaller_lift :
   -- `lift_poly_id::<u32>` bb0 terminator: return `7_u32` to
   -- `poly_layout_caller` at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1 terminator: projected drop of `_1.0 -> bb2`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
@@ -622,11 +622,11 @@ theorem liftPolyLayoutCaller_lift :
   -- `lift_poly_wrapper_transmute::<u32>` bb0 terminator: return `7_u32` into
   -- `_0` at bb3.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb3 terminator: root return of `7_u32`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.return_ (by rfl) (by rfl)
+  apply LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
   rfl
 
 /--
@@ -1109,15 +1109,15 @@ theorem liftClosureAndTraitCaller_lift :
   -- (`tailCallFnItem`).
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallFnItem (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl)
-  dsimp only [FrameStep.Continues, tailCallFrameMem, Option.getD]
+    (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, tailCallFrameMem, disableFrameBorrows, Option.getD]
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_id::<u32>` bb0 terminator: return `14_u32` into `_3` at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1 terminator: `_4 = move _2(move _3) -> bb2` (trait method via `fnPtrs`).
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
@@ -1130,7 +1130,7 @@ theorem liftClosureAndTraitCaller_lift :
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_id::<u32>` bb0 terminator: return `14_u32` into `_4` at bb2.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb2 terminator: `_0 = exact_div::<u32>(move _4, const 2_u32) -> bb3`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
@@ -1155,7 +1155,7 @@ theorem liftClosureAndTraitCaller_lift :
   dsimp only [FrameStep.Continues]
   -- bb7 terminator: root return of `7_u32`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.return_ (by rfl) (by rfl)
+  apply LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
   rfl
 
 /-- Convergence of `liftClosureAndTraitCallerMir`. -/
@@ -1350,12 +1350,12 @@ theorem liftPolyApplyCaller_lift :
   -- `lift_poly_id::<u32>` bb0 terminator: return `3_u32` into
   -- `lift_poly_apply::<u32>`'s `_0` at bb1 (two frames deep).
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- `lift_poly_apply::<u32>` bb1 terminator: return `3_u32` into projected
   -- destination `_2.0` at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1[0]: `StorageLive(_3)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
@@ -1382,12 +1382,12 @@ theorem liftPolyApplyCaller_lift :
   -- `lift_poly_id::<u8>` bb0 terminator: return `4_u8` into
   -- `lift_poly_apply::<u8>`'s `_0` at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- `lift_poly_apply::<u8>` bb1 terminator: return `4_u8` into projected
   -- destination `_2.1` at bb2.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb2[0]: `StorageLive(_4)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
@@ -1403,7 +1403,7 @@ theorem liftPolyApplyCaller_lift :
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb2 terminator: root return of `3 + 4 = 7_u32`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.return_ (by rfl) (by rfl)
+  apply LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
   rfl
 
 /-- Convergence of `liftPolyApplyCallerMir`. -/

@@ -163,14 +163,25 @@ def treeBorrowWriteNodeRelation (entry : BorrowEntry) (writerTag : Option Nat) :
     | false => .Foreign
 
 /--
-Expected Anneal permission after a write, computed by the specr-generated
-MiniRust unprotected transition
+Expected Anneal permission after a write to local `targetLocal` of the frame at
+depth `targetFrameDepth` (default `0`, the root frame), computed by the
+specr-generated MiniRust unprotected transition
 `MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition`.
+MiniRust runs the transition over the borrow tree of the accessed allocation
+only; in Anneal the pair `(targetFrameDepth, targetLocal)` identifies that
+allocation, so entries on another local, or on a local of another frame
+(`entry.targetFrameDepth ≠ targetFrameDepth`,
+`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`), are unchanged.
 -/
 abbrev mrExpectedWritePerm
-    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) :
+    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (targetFrameDepth : Nat := 0) :
     TreeBorrowPerm :=
-  match Nat.beq entry.targetLocal targetLocal with
+  match
+    Bool.and
+      (Nat.beq entry.targetFrameDepth targetFrameDepth)
+      (Nat.beq entry.targetLocal targetLocal)
+  with
   | false => entry.perm
   | true =>
     match
@@ -194,70 +205,92 @@ theorem mir_updateBorrowPerm_other_local_id
 
 /--
 **Theorem L4.2 (`mir_updateBorrowPerm_self_write_activates_reserved`)**:
-Writing through `writerTag = some entry.tag` transitions `.reserved → .active`.
+Writing to `entry`'s own target (local `entry.targetLocal` of the frame at depth
+`entry.targetFrameDepth`; `updateBorrowPerm` leaves entries of other frames
+unchanged) through `writerTag = some entry.tag` transitions `.reserved → .active`.
 -/
 theorem mir_updateBorrowPerm_self_write_activates_reserved
     (entry : BorrowEntry) (h_res : entry.perm = .reserved) :
-    (updateBorrowPerm entry entry.targetLocal (.some entry.tag)).perm = .active := by
+    (updateBorrowPerm entry entry.targetLocal (.some entry.tag) entry.targetFrameDepth).perm =
+      .active := by
   simp [updateBorrowPerm, Nat.beq_refl, h_res]
 
 /--
 **Theorem L4.3 (`mir_updateBorrowPerm_foreign_ptr_write_disables`)**:
-Writing through a foreign pointer tag `wTag ≠ entry.tag` transitions `perm` to `.disabled`
-for every permission other than `.cell` and `.reservedIM`.
+Writing to `entry`'s own target (local `entry.targetLocal` of the frame at depth
+`entry.targetFrameDepth`) through a foreign pointer tag `wTag ≠ entry.tag`
+transitions `perm` to `.disabled` for every permission other than `.cell` and
+`.reservedIM`.
 -/
 theorem mir_updateBorrowPerm_foreign_ptr_write_disables
     (entry : BorrowEntry) (wTag : Nat)
     (h_foreign : Nat.beq entry.tag wTag = false)
     (h_not_cell : entry.perm ≠ .cell)
     (h_not_im : entry.perm ≠ .reservedIM) :
-    (updateBorrowPerm entry entry.targetLocal (.some wTag)).perm = .disabled := by
+    (updateBorrowPerm entry entry.targetLocal (.some wTag) entry.targetFrameDepth).perm =
+      .disabled := by
   cases hp : entry.perm <;> simp_all [updateBorrowPerm, Nat.beq_refl]
 
 /--
 **Theorem L4.4 (`mir_updateBorrowPerm_direct_local_write`)**:
-Direct write (`writerTag = .none`) to `entry.targetLocal` disables `.active`, `.frozen`,
-and `.reserved` (`ReservedFrz`), while preserving `.reservedIM` and `.cell`.
+Direct write (`writerTag = .none`) to `entry`'s own target (local
+`entry.targetLocal` of the frame at depth `entry.targetFrameDepth`) disables
+`.active`, `.frozen`, and `.reserved` (`ReservedFrz`), while preserving
+`.reservedIM` and `.cell`.
 -/
 theorem mir_updateBorrowPerm_direct_local_write (entry : BorrowEntry) :
-    (entry.perm = .active → (updateBorrowPerm entry entry.targetLocal .none).perm = .disabled) ∧
-    (entry.perm = .frozen → (updateBorrowPerm entry entry.targetLocal .none).perm = .disabled) ∧
-    (entry.perm = .reserved → (updateBorrowPerm entry entry.targetLocal .none).perm = .disabled) ∧
+    (entry.perm = .active →
+      (updateBorrowPerm entry entry.targetLocal .none entry.targetFrameDepth).perm =
+        .disabled) ∧
+    (entry.perm = .frozen →
+      (updateBorrowPerm entry entry.targetLocal .none entry.targetFrameDepth).perm =
+        .disabled) ∧
+    (entry.perm = .reserved →
+      (updateBorrowPerm entry entry.targetLocal .none entry.targetFrameDepth).perm =
+        .disabled) ∧
     (entry.perm = .reservedIM →
-      (updateBorrowPerm entry entry.targetLocal .none).perm = .reservedIM) ∧
-    (entry.perm = .cell → (updateBorrowPerm entry entry.targetLocal .none).perm = .cell) := by
+      (updateBorrowPerm entry entry.targetLocal .none entry.targetFrameDepth).perm =
+        .reservedIM) ∧
+    (entry.perm = .cell →
+      (updateBorrowPerm entry entry.targetLocal .none entry.targetFrameDepth).perm =
+        .cell) := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> intro h <;> simp [updateBorrowPerm, Nat.beq_refl, h]
 
 /--
 **Theorem L4.5 (`mir_updateBorrowPerm_corresponds_to_minirust_write`)**:
 Universal correspondence theorem directly over `Trusted.Rustc.V2026_08_01.MirSemantics.updateBorrowPerm`
-and `MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition`.
+and `MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition`,
+for EVERY target frame depth `targetFrameDepth` (default `0`, the root frame).
 -/
 theorem mir_updateBorrowPerm_corresponds_to_minirust_write
-    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) :
-    (updateBorrowPerm entry targetLocal writerTag).perm =
-      mrExpectedWritePerm entry targetLocal writerTag ∧
-    (updateBorrowPerm entry targetLocal writerTag).tag = entry.tag ∧
-    (updateBorrowPerm entry targetLocal writerTag).targetLocal = entry.targetLocal := by
-  cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag =>
+    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (targetFrameDepth : Nat := 0) :
+    (updateBorrowPerm entry targetLocal writerTag targetFrameDepth).perm =
+      mrExpectedWritePerm entry targetLocal writerTag targetFrameDepth ∧
+    (updateBorrowPerm entry targetLocal writerTag targetFrameDepth).tag = entry.tag ∧
+    (updateBorrowPerm entry targetLocal writerTag targetFrameDepth).targetLocal =
+      entry.targetLocal := by
+  cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag tDepth allocDead =>
   refine ⟨?_, ?_, ?_⟩
-  · cases hloc : Nat.beq tLoc targetLocal
-    · simp [updateBorrowPerm, mrExpectedWritePerm, hloc]
-    · cases writerTag with
-      | none =>
-        rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-          simp [updateBorrowPerm, mrExpectedWritePerm, hloc,
-            toPermissionUnprot, ofPermissionUnprot,
-            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
-            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write]
-      | some wTag =>
-        cases htag : Nat.beq tag wTag <;>
+  · cases hdep : Nat.beq tDepth targetFrameDepth
+    · simp [updateBorrowPerm, mrExpectedWritePerm, hdep]
+    · cases hloc : Nat.beq tLoc targetLocal
+      · simp [updateBorrowPerm, mrExpectedWritePerm, hdep, hloc]
+      · cases writerTag with
+        | none =>
           rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-          simp [updateBorrowPerm, mrExpectedWritePerm, treeBorrowWriteNodeRelation, hloc,
-            toPermissionUnprot, ofPermissionUnprot, htag,
-            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
-            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write,
-            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.local_write]
+            simp [updateBorrowPerm, mrExpectedWritePerm, hdep, hloc,
+              toPermissionUnprot, ofPermissionUnprot,
+              MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
+              MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write]
+        | some wTag =>
+          cases htag : Nat.beq tag wTag <;>
+            rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+            simp [updateBorrowPerm, mrExpectedWritePerm, treeBorrowWriteNodeRelation, hdep, hloc,
+              toPermissionUnprot, ofPermissionUnprot, htag,
+              MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
+              MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write,
+              MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.local_write]
   · unfold updateBorrowPerm
     split
     · rfl
@@ -270,12 +303,19 @@ theorem mir_updateBorrowPerm_corresponds_to_minirust_write
 /--
 **Theorem L4.6 (`mir_updateBorrowPerm_unprot_eq_generated_ops`)**:
 Direct commutative diagram between `MirSemantics.updateBorrowPerm` and
-`MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition` in `PermissionUnprot`.
+`MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition` in `PermissionUnprot`,
+for EVERY target frame depth `targetFrameDepth` (default `0`): an entry on another
+allocation (another local, or a local of another frame) is unchanged.
 -/
 theorem mir_updateBorrowPerm_unprot_eq_generated_ops
-    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) :
-    toPermissionUnprot false (updateBorrowPerm entry targetLocal writerTag).perm =
-      match Nat.beq entry.targetLocal targetLocal with
+    (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (targetFrameDepth : Nat := 0) :
+    toPermissionUnprot false (updateBorrowPerm entry targetLocal writerTag targetFrameDepth).perm =
+      match
+        Bool.and
+          (Nat.beq entry.targetFrameDepth targetFrameDepth)
+          (Nat.beq entry.targetLocal targetLocal)
+      with
       | false => toPermissionUnprot false entry.perm
       | true =>
         match
@@ -284,22 +324,24 @@ theorem mir_updateBorrowPerm_unprot_eq_generated_ops
         with
         | .ok next => next
         | .error _ => toPermissionUnprot false entry.perm := by
-  cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag =>
-  cases hloc : Nat.beq tLoc targetLocal
-  · simp [updateBorrowPerm, hloc]
-  · cases writerTag with
-    | none =>
-      rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-        simp [updateBorrowPerm, hloc, toPermissionUnprot,
-          MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
-          MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write]
-    | some wTag =>
-      cases htag : Nat.beq tag wTag <;>
+  cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag tDepth allocDead =>
+  cases hdep : Nat.beq tDepth targetFrameDepth
+  · simp [updateBorrowPerm, hdep]
+  · cases hloc : Nat.beq tLoc targetLocal
+    · simp [updateBorrowPerm, hdep, hloc]
+    · cases writerTag with
+      | none =>
         rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
-        simp [updateBorrowPerm, treeBorrowWriteNodeRelation, hloc, htag, toPermissionUnprot,
-          MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
-          MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write,
-          MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.local_write]
+          simp [updateBorrowPerm, hdep, hloc, toPermissionUnprot,
+            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
+            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write]
+      | some wTag =>
+        cases htag : Nat.beq tag wTag <;>
+          rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+          simp [updateBorrowPerm, treeBorrowWriteNodeRelation, hdep, hloc, htag, toPermissionUnprot,
+            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.transition,
+            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.foreign_write,
+            MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops.PermissionUnprot.local_write]
 
 /-! ## 3. Universal Theorems Over `updateBorrowPermAtProj`, `invalidateConflictingBorrows`, & Protectors -/
 
@@ -331,17 +373,17 @@ theorem mir_updateBorrowPermAtProj_characterization
     exact updateBorrowPermAtProj_nil_eq_updateBorrowPerm entry targetLocal writerTag h_proj
   · intro h_disj
     unfold updateBorrowPermAtProj
-    cases Nat.beq entry.targetLocal targetLocal <;> simp [h_disj]
+    split <;> simp [h_disj]
   · intro h_disj h_tag
     unfold updateBorrowPermAtProj
-    cases Nat.beq entry.targetLocal targetLocal <;> simp [h_disj, h_tag]
+    split <;> simp [h_disj, h_tag]
   · intro h_proj h_rlen h_neq
     have h_disj : borrowEntryOverlapsWrite entry [.field idxB tyB] 0 0 = false := by
       unfold borrowEntryOverlapsWrite
       rw [h_rlen, h_proj]
       simp [projectionsOverlap, stripTransparentProjections, projectionsOverlapAux, h_neq]
     unfold updateBorrowPermAtProj
-    cases Nat.beq entry.targetLocal targetLocal <;> simp [h_disj]
+    split <;> simp [h_disj]
 
 /--
 **Theorem L4.8 (`mir_invalidateConflictingBorrows_map`)**:
@@ -368,7 +410,16 @@ theorem mir_invalidateConflictingBorrows_map
 
 /--
 **Theorem L4.9 (`mir_attachBorrowProtector_and_hasProtectedWriteConflict`)**:
-Universal characterization of function-entry lifetime protectors.
+Universal characterization of function-entry lifetime protectors. A protected
+live borrow conflicts with a direct root write to its own target (local
+`entry.targetLocal` of the frame at depth `entry.targetFrameDepth`), and
+`evalPlaceWrite` faults with `.ub` under every call stack `callStack` whose active
+frame is that frame (`length callStack = entry.targetFrameDepth`). The hypothesis is
+needed because `evalPlaceWrite` writes local `entry.targetLocal` of the active frame
+(depth `length callStack`), and a protected borrow of the same-numbered local of
+another frame does not conflict with that write
+(`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`); `callStack = .nil` (root frame active)
+gives the root-frame instance.
 -/
 theorem mir_attachBorrowProtector_and_hasProtectedWriteConflict
     (locals : List LocalSlot) (entry : BorrowEntry) (rest : List BorrowEntry)
@@ -391,13 +442,17 @@ theorem mir_attachBorrowProtector_and_hasProtectedWriteConflict
         .none
         .nil
         0
-        0 = true ∧
-      evalPlaceWrite
-        locals
-        ({ entry with protector := .some protId } :: rest)
-        { local_ := entry.targetLocal, projection := .nil }
-        val
-        (protId :: moreProts) = .ub) := by
+        0
+        entry.targetFrameDepth = true ∧
+      ∀ (callStack : List SavedCallerFrame),
+        length callStack = entry.targetFrameDepth →
+        evalPlaceWrite
+          locals
+          ({ entry with protector := .some protId } :: rest)
+          { local_ := entry.targetLocal, projection := .nil }
+          val
+          (protId :: moreProts)
+          (callStack := callStack) = .ub) := by
   refine ⟨?_, ?_, ?_, rfl, ?_⟩
   · simp [attachBorrowProtector, Nat.beq_refl]
   · simp [isBorrowProtected, natListContainsBool, Nat.beq_refl]
@@ -430,11 +485,14 @@ theorem mir_attachBorrowProtector_and_hasProtectedWriteConflict
           .none
           .nil
           0
-          0 = true := by
+          0
+          entry.targetFrameDepth = true := by
       unfold hasProtectedWriteConflict
       simp [Nat.beq_refl, h_ov, h_prot, h_conf]
     refine ⟨h_has, ?_⟩
+    intro callStack h_len
     unfold evalPlaceWrite
+    simp only [h_len]
     simp [h_has]
 
 /-! ## 4. Universal `UnsafeCell` Shared-Borrow Theorem (Closing `GAP-MR-0001`) -/
@@ -448,7 +506,8 @@ For EVERY inner type `innerTy : Ty`, EVERY initialized root value `initVal : Val
 EVERY write value `newVal : Value`, and EVERY memory state `mem : Memory` (with `mem.borrows = []`):
 1. `placeIsFreeze` on a local of type `core::cell::UnsafeCell<innerTy>` evaluates to `false` (`!Freeze`);
 2. Evaluating `Rvalue.ref .shared { local_ := 0, projection := .nil }` via `evalRvalue`
-   assigns `perm := .reserved` (`ReservedIm` / `Cell`) instead of `.frozen`;
+   assigns `perm := .reserved` (`ReservedIm` / `Cell`) instead of `.frozen` (a root borrow, so
+   the entry records the active frame's depth `targetFrameDepth := length mem.callStack`);
 3. Writing `newVal` through the resulting pointer `{ local_ := 1, projection := [.deref] }`
    via `writePlaceValue` succeeds with `.ok [.init newVal, .init ptrVal]`;
 4. `evalAnnealV2026_08_01 .sharedUnsafeCellWrite` agrees unconditionally with
@@ -470,6 +529,7 @@ theorem mir_shared_borrow_unsafe_cell_permits_write
       targetLocal := 0
       targetProjection := .nil
       perm := .cell
+      targetFrameDepth := length mem.callStack
     }
     let ptrVal : Value := .ptr { allocId := mem.nextTag, offsetBytes := 0 } 8
     let memAfterRef : Memory := {
@@ -680,7 +740,9 @@ theorem treeBorrow_transition_corresponds_for_freeze
 /--
 **Theorem L4.14 (`mir_updateBorrowPermTreeAtProj_characterization`)**:
 Universal characterization of Tree Borrows parent/child write transitions in
-`Trusted.Rustc.V2026_08_01.MirSemantics.updateBorrowPermTreeAtProj`.
+`Trusted.Rustc.V2026_08_01.MirSemantics.updateBorrowPermTreeAtProj` for a write to
+`entry`'s own target (local `entry.targetLocal` of the frame at depth
+`entry.targetFrameDepth`; entries of other frames are unchanged).
 -/
 theorem mir_updateBorrowPermTreeAtProj_characterization
     (allBorrows : List BorrowEntry) (entry : BorrowEntry) (wTag : Nat)
@@ -689,19 +751,19 @@ theorem mir_updateBorrowPermTreeAtProj_characterization
       entry.perm = .reserved →
       (updateBorrowPermTreeAtProj
         allBorrows entry entry.targetLocal (.some wTag)
-        writeProj writeRangeOff writeRangeLen).perm = .active) ∧
+        writeProj writeRangeOff writeRangeLen entry.targetFrameDepth).perm = .active) ∧
     (isBorrowDescendantOrSelf allBorrows wTag entry.tag = true →
       entry.perm = .active →
       (updateBorrowPermTreeAtProj
         allBorrows entry entry.targetLocal (.some wTag)
-        writeProj writeRangeOff writeRangeLen).perm = .active) ∧
+        writeProj writeRangeOff writeRangeLen entry.targetFrameDepth).perm = .active) ∧
     (isBorrowDescendantOrSelf allBorrows wTag entry.tag = false →
       Nat.beq entry.tag wTag = false →
       borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = true →
       entry.perm ≠ .cell → entry.perm ≠ .reservedIM →
       (updateBorrowPermTreeAtProj
         allBorrows entry entry.targetLocal (.some wTag)
-        writeProj writeRangeOff writeRangeLen).perm = .disabled) := by
+        writeProj writeRangeOff writeRangeLen entry.targetFrameDepth).perm = .disabled) := by
   refine ⟨?_, ?_, ?_⟩
   · intro h_desc h_perm
     simp [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
@@ -717,7 +779,10 @@ theorem mir_updateBorrowPermTreeAtProj_characterization
 /--
 **Theorem L4.15 (`mir_updateBorrowPermOnReadAtProj_characterization`)**:
 Universal characterization of Tree Borrows read transitions in
-`Trusted.Rustc.V2026_08_01.MirSemantics.updateBorrowPermOnReadAtProj`.
+`Trusted.Rustc.V2026_08_01.MirSemantics.updateBorrowPermOnReadAtProj`. A child/self
+read preserves `entry`; the foreign-read transitions are stated for a read of
+`entry`'s own target (local `entry.targetLocal` of the frame at depth
+`entry.targetFrameDepth`; entries of other frames are unchanged).
 -/
 theorem mir_updateBorrowPermOnReadAtProj_characterization
     (allBorrows : List BorrowEntry) (entry : BorrowEntry) (rTag : Nat)
@@ -731,18 +796,22 @@ theorem mir_updateBorrowPermOnReadAtProj_characterization
       entry.perm = .active →
       (updateBorrowPermOnReadAtProj
         allBorrows entry entry.targetLocal (.some rTag)
-        readProj readRangeOff readRangeLen).perm = .frozen) ∧
+        readProj readRangeOff readRangeLen
+        (targetFrameDepth := entry.targetFrameDepth)).perm = .frozen) ∧
     (isBorrowDescendantOrSelf allBorrows rTag entry.tag = false →
       borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true →
       entry.perm = .reserved →
       (updateBorrowPermOnReadAtProj
         allBorrows entry entry.targetLocal (.some rTag)
-        readProj readRangeOff readRangeLen).perm = .reserved) := by
+        readProj readRangeOff readRangeLen
+        (targetFrameDepth := entry.targetFrameDepth)).perm = .reserved) := by
   refine ⟨?_, ?_, ?_⟩
   · intro h_desc
     unfold updateBorrowPermOnReadAtProj
-    cases borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen <;>
-      simp [Nat.beq_refl, h_desc]
+    split
+    · rfl
+    · cases borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen <;>
+        simp [h_desc]
   · intro h_for h_ov h_perm
     cases hprot : entry.protector <;>
       simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm,

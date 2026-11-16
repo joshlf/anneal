@@ -89,7 +89,7 @@ theorem evalStmt_preserves_frame {bbIdx stmtIdx env mem stmt decls layouts ms'}
   (h_step : evalStmt { frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := env }, memory := mem } stmt decls layouts = .step ms') :
   ms'.frame.blockIdx = bbIdx ∧ ms'.frame.stmtIdx = stmtIdx + 1 := by
   cases h_k : stmt.kind <;> (
-    unfold evalStmt at h_step
+    unfold evalStmt evalSetDiscriminantDerefWrite evalForeignFrameDerefWrite evalSetDiscriminantLocal at h_step
     rw [h_k] at h_step h_pure
     dsimp [isPureStatement] at h_pure
     first | contradiction | (
@@ -638,7 +638,8 @@ matching the protector-free `StatementKind.assign` transition of `evalStmt`.
 def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
     (dst : Place) (val : Value)
     (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable) : Option (PureEnv × List BorrowEntry) :=
+    (layouts : LayoutTable := emptyLayoutTable)
+    (targetFrameDepth : Nat := 0) : Option (PureEnv × List BorrowEntry) :=
   match dst.projection with
   | [] =>
     match get? locals dst.local_ with
@@ -646,7 +647,8 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
     | some _ =>
       match set? locals dst.local_ (.init val) with
       | some locals' =>
-        some (locals', invalidateConflictingBorrows borrows dst.local_ .none)
+        some (locals',
+          invalidateConflictingBorrows borrows dst.local_ .none targetFrameDepth)
       | none => none
     | none => none
   | .deref :: _ => none
@@ -675,7 +677,7 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
               (proj :: rest)
           some (locals',
             invalidateConflictingBorrowsAtProj borrows dst.local_ .none
-              resolvedLocalProj)
+              resolvedLocalProj 0 0 targetFrameDepth)
         | none => none
       | _ => none
     | _ => none
@@ -708,17 +710,24 @@ new caller frame onto `mem.callStack`. This is
 `(enterTailCalleeFrame ..).memory`.
 -/
 @[reducible]
-def tailCallFrameMem (mem : Memory) (calleeBody : CapturedMir) : Memory :=
-  { mem with activeCallee := some calleeBody }
+def tailCallFrameMem (mem : Memory) (calleeNumLocals : Nat)
+    (calleeBody : CapturedMir) : Memory :=
+  { mem with
+    borrows :=
+      disableFrameBorrows mem.borrows (length mem.callStack) calleeNumLocals
+    activeCallee := some calleeBody }
 
 /--
-Memory after `TerminatorKind.return_` pops `caller` (with remaining stack
-`rest`) and resumes `caller.callerBody`.
+Memory after `TerminatorKind.return_` tears down the returning callee's locals
+(`disableFrameBorrows`), pops `caller` (with remaining stack `rest`), and
+restores `caller.callerBody` and protectors prior to `writeReturnDestination`.
 -/
 @[reducible]
-def returnFrameMem (mem : Memory) (caller : SavedCallerFrame)
-    (rest : List SavedCallerFrame) : Memory :=
+def returnFrameMem (mem : Memory) (calleeNumLocals : Nat)
+    (caller : SavedCallerFrame) (rest : List SavedCallerFrame) : Memory :=
   { mem with
+    borrows :=
+      disableFrameBorrows mem.borrows (length mem.callStack) calleeNumLocals
     callStack := rest
     activeCallee := some caller.callerBody
     activeProtectors := restoreCallerProtectors caller }
@@ -763,7 +772,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {allocId : AllocId} {mem₁ : Memory} {borrows' : List BorrowEntry} :
       isReifyFnPointerCoercion coercionKind = true →
       stringEq coercionKind "UnsafeFnPointer" = false →
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnItem env₁ →
       isZstFnItemValue fnItem = true →
       targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi →
@@ -777,7 +786,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       internFnPtr mem defPath typeArgs (some targetTy.kind) = (allocId, mem₁) →
       assignLocalPlace env₁ mem₁.borrows dst
           (.ptr { allocId := allocId, offsetBytes := 0 } 8)
-          cur.localDecls cur.layouts =
+          cur.localDecls cur.layouts (length mem₁.callStack) =
         some (env₂, borrows') →
       mem₁.activeProtectors = [] →
       post env₂ { mem₁ with borrows := borrows' } →
@@ -797,7 +806,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       evalUnsafeFnPointer env op targetTy mem cur.localDecls cur.layouts =
         .ok (.ptr ptrVal 8) env₁ mem →
       assignLocalPlace env₁ mem.borrows dst (.ptr ptrVal 8)
-          cur.localDecls cur.layouts =
+          cur.localDecls cur.layouts (length mem.callStack) =
         some (env₂, borrows') →
       mem.activeProtectors = [] →
       post env₂ { mem with borrows := borrows' } →
@@ -815,7 +824,7 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       evalFnPtrToPtr env op targetTy mem cur.localDecls cur.layouts =
         .ok (.ptr ptrVal 8) env₁ mem →
       assignLocalPlace env₁ mem.borrows dst (.ptr ptrVal 8)
-          cur.localDecls cur.layouts =
+          cur.localDecls cur.layouts (length mem.callStack) =
         some (env₂, borrows') →
       mem.activeProtectors = [] →
       post env₂ { mem with borrows := borrows' } →
@@ -829,12 +838,14 @@ Unprojected `assignLocalPlace` reduction when `dst.projection = []` and
 theorem assignLocalPlace_unprojected {env₁ env₂ : PureEnv}
     {borrows : List BorrowEntry} {dst : Place} {slot : LocalSlot} {val : Value}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {targetFrameDepth : Nat}
     (h_proj : dst.projection = [])
     (h_slot : get? env₁ dst.local_ = some slot)
     (h_live : slotLive slot = true)
     (h_set : set? env₁ dst.local_ (.init val) = some env₂) :
-    assignLocalPlace env₁ borrows dst val localDecls layouts =
-      some (env₂, invalidateConflictingBorrows borrows dst.local_ .none) := by
+    assignLocalPlace env₁ borrows dst val localDecls layouts targetFrameDepth =
+      some (env₂,
+        invalidateConflictingBorrows borrows dst.local_ .none targetFrameDepth) := by
   rcases dst with ⟨dstLoc, dstProj⟩
   dsimp only at h_proj h_slot h_set
   subst h_proj
@@ -866,7 +877,7 @@ theorem LiftStmtMem.reifyFnPointer {cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (h_kind : isReifyFnPointerCoercion coercionKind = true)
     (h_unsafe : stringEq coercionKind "UnsafeFnPointer" = false)
     (h_op :
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnItem env₁)
     (h_zst : isZstFnItemValue fnItem = true)
     (h_ty : targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi)
@@ -890,7 +901,10 @@ theorem LiftStmtMem.reifyFnPointer {cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (h_prot : mem₁.activeProtectors = [])
     (h_next :
       post env₂
-        { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows dst.local_ .none }) :
+        { mem₁ with
+          borrows :=
+            invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+              (length mem₁.callStack) }) :
     LiftStmtMem cur bbIdx stmtIdx env mem post
       { kind := .assign dst (.cast (.pointerCoercion coercionKind) op targetTy),
         span := span } :=
@@ -981,7 +995,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .goto target, span := span }
   | switchInt {discr : Operand} {targets : SwitchTargets} {span : String}
       {sc : ScalarInt} {env' : PureEnv} :
-      evalOperand env discr mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env discr mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.scalar sc) env' →
       post (.frame (lookupSwitchTarget sc.bits targets.branches targets.otherwise)
         0 env' mem) →
@@ -989,7 +1003,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .switchInt discr targets, span := span }
   | assert {cond : Operand} {expected : Bool} {target : BasicBlockIdx}
       {unwind : UnwindAction} {span : String} {sc : ScalarInt} {env' : PureEnv} :
-      evalOperand env cond mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env cond mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.scalar sc) env' →
       Nat.beq sc.bits (match expected with | true => 1 | false => 0) = true →
       post (.frame target 0 env' mem) →
@@ -1014,25 +1028,36 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       post (.frame target 0 env mem) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .drop place target unwind, span := span }
-  /-- Return from the root frame (empty call stack). -/
+  /--
+  Return from the root frame (empty call stack) when no active function-entry
+  protector blocks deallocating the root frame's locals.
+  -/
   | return_ {span : String} {retVal : Value} :
       get? env 0 = some (.init retVal) →
       mem.callStack = [] →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          0 (length env) = false →
       post (.ret retVal) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .return_, span := span }
   /--
-  Return from an inlined callee: write `_0` into the saved caller's
-  `destination` and resume the caller at its return target.
+  Return from an inlined callee: verify no active function-entry protector
+  blocks deallocating the callee's locals, disable callee borrows via
+  `returnFrameMem`, write `_0` into the saved caller's `destination` via
+  `writeReturnDestination`, and resume the caller at its return target.
   -/
   | returnToCaller {span : String} {retVal : Value} {caller : SavedCallerFrame}
-      {rest : List SavedCallerFrame} {callerEnv : PureEnv} :
+      {rest : List SavedCallerFrame} {callerEnv : PureEnv} {mem' : Memory} :
       get? env 0 = some (.init retVal) →
       mem.callStack = caller :: rest →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       caller.isDiverging = false →
-      writePlaceValue caller.frame.locals mem.borrows caller.destination retVal =
-        .ok callerEnv →
-      post (.frame caller.returnTarget 0 callerEnv (returnFrameMem mem caller rest)) →
+      writeReturnDestination caller.frame.locals
+          (returnFrameMem mem (length env) caller rest) caller.destination retVal
+          caller.callerBody.localDecls caller.callerBody.layouts =
+        .ok callerEnv mem' →
+      post (.frame caller.returnTarget 0 callerEnv mem') →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .return_, span := span }
   /--
@@ -1045,7 +1070,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
       {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCallee? func = some (defPath, typeArgs) →
-      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       post (.frame 0 0 (initLocals calleeBody argVals)
@@ -1063,13 +1088,13 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
       {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnVal envAfterFunc →
       isZstFnItemValue fnVal = true →
       extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
         some (defPath, typeArgs) →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       post (.frame 0 0 (initLocals calleeBody argVals)
@@ -1089,7 +1114,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
       {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.ptr ptrVal 8) envAfterFunc →
       ptrVal.offsetBytes = 0 →
       lookupBorrow mem.borrows ptrVal.tag = none →
@@ -1097,7 +1122,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy cur.localDecls cur.layouts func) = true →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
           mem.traitImpls calleeBody →
@@ -1127,7 +1152,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           func (length (lhsOp :: rhsOps)) cur.localDecls cur.layouts =
         .ok resolvedTarget envAfterFunc →
       evalOperands envAfterFunc (lhsOp :: rhsOps) mem.borrows mem.globals
-          cur.layouts mem.callerLocals =
+          cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok [.scalar lhs, .scalar rhs] env' →
       lookupCallee mem.callees cur.layouts resolvedTarget.defPath
           resolvedTarget.typeArgs mem.traitImpls = none →
@@ -1135,9 +1160,14 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       resolveIntrinsicIsSigned resolvedTarget cur.localDecls cur.layouts
           (lhsOp :: rhsOps) = some isSigned →
       evalExactDiv lhs rhs isSigned = some retScalar →
-      writePlaceValue env' mem.borrows destination (.scalar retScalar) =
+      (match destination.projection with
+       | .deref :: _ => PlaceWriteResult.ub
+       | _ =>
+         writePlaceValue env' mem.borrows destination (.scalar retScalar)
+           (callStack := mem.callStack)) =
         .ok updatedEnv →
-      post (.frame targetBb 0 updatedEnv mem) →
+      post (.frame targetBb 0 updatedEnv
+        (invalidateDirectDestWriteBorrows mem env' destination)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .call func (lhsOp :: rhsOps) destination (some targetBb) unwind,
           span := span }
@@ -1149,11 +1179,13 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
       {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCallee? func = some (defPath, typeArgs) →
-      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
   /--
@@ -1165,17 +1197,19 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
       {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok fnVal envAfterFunc →
       isZstFnItemValue fnVal = true →
       extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
         some (defPath, typeArgs) →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
   /--
@@ -1186,7 +1220,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
       {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
         .ok (.ptr ptrVal 8) envAfterFunc →
       ptrVal.offsetBytes = 0 →
       lookupBorrow mem.borrows ptrVal.tag = none →
@@ -1194,7 +1228,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy cur.localDecls cur.layouts func) = true →
       evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals =
+          mem.callerLocals (callStack := mem.callStack) =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
           mem.traitImpls calleeBody →
@@ -1202,8 +1236,10 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
             fnSig := fnEntry.fnSig, isIndirect := true }
           calleeBody (length argVals) = true →
+      hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
+          (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
 
@@ -1298,7 +1334,9 @@ theorem evalStmt_assign_of_evalRvalue {bbIdx : BasicBlockIdx} {stmtIdx : Nat}
     {val : Value} {borrows' : List BorrowEntry}
     (h_rv : evalRvalue env rv mem localDecls layouts = .ok val env₁ mem₁)
     (h_prot : mem₁.activeProtectors = [])
-    (h_write : assignLocalPlace env₁ mem₁.borrows dst val localDecls layouts = some (env₂, borrows')) :
+    (h_write :
+      assignLocalPlace env₁ mem₁.borrows dst val localDecls layouts
+        (length mem₁.callStack) = some (env₂, borrows')) :
     evalStmt
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         { kind := .assign dst rv, span := span } localDecls layouts =
@@ -1398,7 +1436,7 @@ theorem evalRvalue_reifyFnPointer {env env₁ : PureEnv} {mem mem₁ : Memory}
     {allocId : AllocId}
     (h_kind : isReifyFnPointerCoercion coercionKind = true)
     (h_unsafe : stringEq coercionKind "UnsafeFnPointer" = false)
-    (h_op : evalOperand env op mem.borrows mem.globals layouts mem.callerLocals =
+    (h_op : evalOperand env op mem.borrows mem.globals layouts mem.callerLocals (callStack := mem.callStack) =
       .ok fnItem env₁)
     (h_zst : isZstFnItemValue fnItem = true)
     (h_ty : targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi)
@@ -1502,7 +1540,7 @@ theorem resolveCallTarget_fnItem (s : MachineState) (func : Operand)
     (h_nonConst : extractCalleeDefPath? func = none)
     (h_eval :
       evalOperand s.frame.locals func s.memory.borrows s.memory.globals
-          bodyLayouts s.memory.callerLocals =
+          bodyLayouts s.memory.callerLocals (callStack := s.memory.callStack) =
         .ok fnVal localsAfterFunc)
     (h_zst : isZstFnItemValue fnVal = true)
     (h_target :
@@ -1612,22 +1650,29 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     dsimp only []
     rw [h_read]
     exact h_next
-  | return_ h_ret h_stack h_post =>
+  | return_ h_ret h_stack h_noDealloc h_post =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_ret]
     dsimp only []
     rw [h_stack]
+    dsimp only [Trusted.Sequence.length, List.length] at h_noDealloc ⊢
+    rw [h_noDealloc]
     exact h_post
-  | returnToCaller h_ret h_stack h_div h_write h_next =>
+  | returnToCaller h_ret h_stack h_noDealloc h_div h_write h_next =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_ret]
     dsimp only []
+    rw [h_noDealloc]
+    dsimp only []
+    unfold returnFrameMem at h_write
+    revert h_write
     rw [h_stack]
     dsimp only []
     rw [h_div]
     dsimp only []
+    intro h_write
     rw [h_write]
     exact h_next
   | callDirect h_callee h_args h_ctx h_next =>
@@ -1690,10 +1735,16 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     rw [h_signed]
     dsimp only []
     rw [h_div]
-    dsimp only []
-    rw [h_write]
-    exact h_next
-  | tailCallDirect h_callee h_args h_ctx h_next =>
+    rename_i func lhsOp rhsOps destination _ _ _ _ _ _ _ _ _ _ _
+    rcases destination with ⟨dLoc, _ | ⟨dHd, dTl⟩⟩
+    · dsimp only [writeIntrinsicReturn] at h_write ⊢
+      rw [h_write]
+      exact h_next
+    · cases dHd <;>
+      first
+      | (cases h_write; done)
+      | (dsimp only [writeIntrinsicReturn] at h_write ⊢; rw [h_write]; exact h_next)
+  | tailCallDirect h_callee h_args h_ctx h_noDealloc h_next =>
     rename_i func argOps span defPath typeArgs argVals env' calleeBody
     have h_res :=
       resolveCallTarget_of_extractCallee
@@ -1703,10 +1754,10 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps span cur _ env argVals env' calleeBody h_res h_args h_ctx
-        (checkCalleeTargetCompatible_direct _ _ _ _ _)
+        (checkCalleeTargetCompatible_direct _ _ _ _ _) h_noDealloc
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
-  | tailCallFnItem h_const h_func h_zst h_target h_args h_ctx h_next =>
+  | tailCallFnItem h_const h_func h_zst h_target h_args h_ctx h_noDealloc h_next =>
     rename_i func argOps span fnVal envAfterFunc defPath typeArgs argVals env'
       calleeBody
     have h_res :=
@@ -1718,11 +1769,11 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps span cur _ envAfterFunc argVals env' calleeBody h_res h_args
-        h_ctx (checkCalleeTargetCompatible_direct _ _ _ _ _)
+        h_ctx (checkCalleeTargetCompatible_direct _ _ _ _ _) h_noDealloc
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
   | tailCallIndirect h_const h_func h_off h_noBorrow h_fnPtr h_compat h_args
-      h_ctx h_target h_next =>
+      h_ctx h_target h_noDealloc h_next =>
     rename_i func argOps span ptrVal envAfterFunc fnEntry argVals env' calleeBody
     have h_res :=
       resolveCallTarget_indirect_fnPtr
@@ -1733,7 +1784,7 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps span cur _ envAfterFunc argVals env' calleeBody h_res h_args
-        h_ctx h_target
+        h_ctx h_target h_noDealloc
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
 
@@ -2022,17 +2073,16 @@ theorem hasProtectedWriteConflict_nil
     (targetLocal : LocalIdx)
     (writerTag : Option Nat)
     (writeProj : List ProjectionElem)
-    (writeRangeOff writeRangeLen : Nat) :
-    hasProtectedWriteConflict borrows .nil targetLocal writerTag writeProj writeRangeOff writeRangeLen = false := by
+    (writeRangeOff writeRangeLen : Nat)
+    {targetFrameDepth : Nat} :
+    hasProtectedWriteConflict borrows .nil targetLocal writerTag writeProj
+      writeRangeOff writeRangeLen targetFrameDepth = false := by
   induction borrows with
   | nil => rfl
   | cons entry rest ih =>
     unfold hasProtectedWriteConflict
-    rw [isBorrowProtected_nil]
-    dsimp only [Bool.and]
-    cases Nat.beq entry.targetLocal targetLocal <;>
-      cases borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen <;>
-      exact ih
+    simp only [isBorrowProtected_nil, Bool.false_and, Bool.and_false]
+    exact ih
 
 theorem readProjectedValue_nil (locals : List LocalSlot) (v : Value) :
     readProjectedValue locals v [] = .ok v := rfl
@@ -2059,8 +2109,9 @@ theorem readProjectedValue_index
 def evalOperandFallback (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot)
-    (localDecls : List LocalDecl := .nil) : PlaceReadResult :=
-  evalOperand locals op borrows globals layouts callerLocals localDecls
+    (localDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : PlaceReadResult :=
+  evalOperand locals op borrows globals layouts callerLocals localDecls callStack
 
 def evalDerefGlobalFallback
     (globals : List CapturedAllocation) (ptrVal : ProvenancePtr) (sz : Nat)
@@ -2098,12 +2149,14 @@ def evalThinPtrElemDerefReadFallback
 
 def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil) : PlaceReadResult :=
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : PlaceReadResult :=
   match op with
   | .constant c =>
     match c.val with
     | .indirect _ _ =>
       evalOperandFallback locals (.constant c) borrows globals body.layouts callerLocals localDecls
+        callStack
     | .unevaluated _ => .unsupported
     | cv =>
       match evalConstValue cv c.ty globals body.layouts with
@@ -2112,8 +2165,10 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
   | .copy p =>
     match p.projection with
     | .deref :: restProj =>
-      match localDecls with
-      | .nil =>
+      match localDecls, callStack with
+      | .nil, _ :: _ =>
+        evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals .nil callStack
+      | .nil, .nil =>
         match get? locals p.local_ with
         | .some (.init (.ptr ptrVal sz)) =>
           match lookupBorrow borrows ptrVal.tag with
@@ -2162,12 +2217,14 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
           evalSliceFatPtrDerefRead locals ptrVal ptrSz lenSc restProj borrows globals
             body.layouts callerLocals .none
         | _ => .ub
-      | d :: ds =>
+      | d :: ds, _ =>
         evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals (d :: ds)
+          callStack
     | _ =>
       match placeTouchesUnion localDecls body.layouts p with
       | true =>
         evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals localDecls
+          callStack
       | false =>
         match get? locals p.local_ with
         | .some (.init rootVal) =>
@@ -2193,6 +2250,7 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
       match placeTouchesUnion localDecls body.layouts p with
       | true =>
         evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+          callStack
       | false =>
         match get? locals p.local_ with
         | .some (.init rootVal) =>
@@ -2203,13 +2261,16 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub
-    | _ => evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+    | _ =>
+      evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+        callStack
 
 theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl) :
-    evalOperandFast body locals op borrows globals callerLocals localDecls =
-      evalOperand locals op borrows globals body.layouts callerLocals localDecls := by
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandFast body locals op borrows globals callerLocals localDecls callStack =
+      evalOperand locals op borrows globals body.layouts callerLocals localDecls callStack := by
   cases op with
   | constant c =>
     rcases c with ⟨ty, val⟩
@@ -2222,7 +2283,7 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
     | cons hd tl =>
       cases hd with
       | deref =>
-        cases localDecls <;> rfl
+        cases localDecls <;> cases callStack <;> rfl
       | field _ _ | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
       | opaqueCast _ | unwrapUnsafeBinder _ =>
         dsimp only [evalOperandFast, evalOperand, evalOperandFallback]
@@ -2262,13 +2323,14 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
 def evalOperandsFast
     (body : CapturedMir) (locals : List LocalSlot) (ops : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil) : OperandsEvalResult :=
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) : OperandsEvalResult :=
   match ops with
   | .nil => .ok .nil locals
   | op :: rest =>
-    match evalOperandFast body locals op borrows globals callerLocals localDecls with
+    match evalOperandFast body locals op borrows globals callerLocals localDecls callStack with
     | .ok v locals₁ =>
-      match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls with
+      match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls callStack with
       | .ok vs locals₂ => .ok (v :: vs) locals₂
       | .ub => .ub
       | .unsupported => .unsupported
@@ -2278,31 +2340,33 @@ def evalOperandsFast
 theorem evalOperandsFast_eq
     (body : CapturedMir) (locals : List LocalSlot) (ops : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl) :
-    evalOperandsFast body locals ops borrows globals callerLocals localDecls =
-      evalOperands locals ops borrows globals body.layouts callerLocals localDecls := by
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandsFast body locals ops borrows globals callerLocals localDecls callStack =
+      evalOperands locals ops borrows globals body.layouts callerLocals localDecls callStack := by
   induction ops generalizing locals with
   | nil => rfl
   | cons op rest ih =>
     change
-      (match evalOperandFast body locals op borrows globals callerLocals localDecls with
+      (match evalOperandFast body locals op borrows globals callerLocals localDecls callStack with
        | .ok v locals₁ =>
-         match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls with
+         match evalOperandsFast body locals₁ rest borrows globals callerLocals localDecls callStack with
          | .ok vs locals₂ => OperandsEvalResult.ok (v :: vs) locals₂
          | .ub => OperandsEvalResult.ub
          | .unsupported => OperandsEvalResult.unsupported
        | .ub => OperandsEvalResult.ub
        | .unsupported => OperandsEvalResult.unsupported) =
-      (match evalOperand locals op borrows globals body.layouts callerLocals localDecls with
+      (match evalOperand locals op borrows globals body.layouts callerLocals localDecls callStack with
        | .ok v locals₁ =>
-         match evalOperands locals₁ rest borrows globals body.layouts callerLocals localDecls with
+         match evalOperands locals₁ rest borrows globals body.layouts callerLocals localDecls
+             callStack with
          | .ok vs locals₂ => OperandsEvalResult.ok (v :: vs) locals₂
          | .ub => OperandsEvalResult.ub
          | .unsupported => OperandsEvalResult.unsupported
        | .ub => OperandsEvalResult.ub
        | .unsupported => OperandsEvalResult.unsupported)
     rw [evalOperandFast_eq]
-    cases evalOperand locals op borrows globals body.layouts callerLocals localDecls with
+    cases evalOperand locals op borrows globals body.layouts callerLocals localDecls callStack with
     | ok v locals₁ =>
       dsimp only
       rw [ih locals₁]
@@ -2383,7 +2447,8 @@ def evalRvalueFast
     RvalueEvalResult :=
   match rv with
   | .use op =>
-    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok v locals' =>
       match validateLoadedValue body.layouts body.localDecls op v with
       | false => .ub
@@ -2407,7 +2472,8 @@ def evalRvalueFast
   | .cast ck op targetTy =>
     match ck with
     | .intToInt =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok (.scalar sc) locals' =>
         match Nat.beq sc.sizeBytes 0 with
         | true => .unsupported
@@ -2428,16 +2494,19 @@ def evalRvalueFast
       | .ub => .ub
       | .unsupported => .unsupported
     | .transmute =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ub => .ub
       | .unsupported => .unsupported
       | .ok v locals' =>
         evalByteCastAfterOperand body op targetTy v locals' mem
     | _ => evalRvalueFallback locals (.cast ck op targetTy) mem body.localDecls body.layouts
   | .binaryOp op lhsOp rhsOp =>
-    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok lhsVal locals₁ =>
-      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
@@ -2464,6 +2533,7 @@ def evalRvalueFast
                   (layoutPointerBytes body.layouts)
                   ptrVal
                   sz
+                  mem.callStack
               with
               | .some lhsAddrSc =>
                 evalScalarBinOp op lhsAddrSc offsetSc locals₂ mem false
@@ -2482,6 +2552,7 @@ def evalRvalueFast
                 (layoutPointerBytes body.layouts)
                 ptrVal
                 sz
+                mem.callStack
             with
             | .some rhsAddrSc =>
               evalScalarBinOp op lhsSc rhsAddrSc locals₂ mem false
@@ -2500,7 +2571,8 @@ def evalRvalueFast
                 body.layouts
                 ptrBytes
                 lhsPtr
-                lhsSz,
+                lhsSz
+                mem.callStack,
               ptrAddressScalar?
                 locals₂
                 mem.borrows
@@ -2510,6 +2582,7 @@ def evalRvalueFast
                 ptrBytes
                 rhsPtr
                 rhsSz
+                mem.callStack
             with
             | .some lhsAddrSc, .some rhsAddrSc =>
               evalScalarBinOp op lhsAddrSc rhsAddrSc locals₂ mem false
@@ -2535,7 +2608,8 @@ def evalRvalueFast
   | .unaryOp uop op =>
     match uop with
     | .not =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok (.scalar sc) locals' =>
         evalUnaryNot sc (operandTy body.localDecls body.layouts op) locals' mem
       | .ok _ _ => .unsupported
@@ -2552,36 +2626,36 @@ theorem evalRvalueFast_eq
   | use op =>
     dsimp only [evalRvalueFast, evalRvalue]
     rw [evalOperandFast_eq]
-    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
   | cast ck op targetTy =>
     cases ck with
     | intToInt =>
       dsimp only [evalRvalueFast, evalRvalue]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ok v _ => cases v <;> rfl
       | _ => rfl
     | transmute =>
       dsimp only [evalRvalueFast, evalRvalue, evalByteCast]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
     | _ => rfl
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalueFast, evalRvalue]
     rw [evalOperandFast_eq]
-    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v locals₁ =>
       dsimp only
       rw [evalOperandFast_eq]
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
   | unaryOp uop op =>
     cases uop with
     | not =>
       dsimp only [evalRvalueFast, evalRvalue]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ok v _ => cases v <;> rfl
       | _ => rfl
     | neg => rfl
@@ -2593,7 +2667,8 @@ def evalRvalueSymTreeFast
     SymTree RvalueEvalResult :=
   match rv with
   | .use op =>
-    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok v locals' =>
       .leaf (match validateLoadedValue body.layouts body.localDecls op v with
       | false => .ub
@@ -2629,6 +2704,7 @@ def evalRvalueSymTreeFast
           perm :=
             sharedBorrowPerm body.localDecls body.layouts
               { local_ := p.local_, projection := .nil }
+          targetFrameDepth := length mem.callStack
         }
         let mem' := {
           mem with
@@ -2638,7 +2714,8 @@ def evalRvalueSymTreeFast
         .leaf (.ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem')
     | _, _ => .leaf (evalRvalueFallback locals (.ref bk p) mem body.localDecls body.layouts)
   | .cast .transmute op targetTy =>
-    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
     | .ok v locals' =>
@@ -2646,15 +2723,18 @@ def evalRvalueSymTreeFast
   | .aggregate ak ops =>
     match ak with
     | .tuple =>
-      match evalOperandsFast body locals ops mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandsFast body locals ops mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok vals locals' => .leaf (.ok (.aggregate 0 vals) locals' mem)
       | .ub => .leaf .ub
       | .unsupported => .leaf .unsupported
     | _ => .leaf (evalRvalueFallback locals (.aggregate ak ops) mem body.localDecls body.layouts)
   | .binaryOp op lhsOp rhsOp =>
-    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+    match evalOperandFast body locals lhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
     | .ok lhsVal locals₁ =>
-      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals₁ rhsOp mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
@@ -2694,6 +2774,7 @@ def evalRvalueSymTreeFast
                   (layoutPointerBytes body.layouts)
                   ptrVal
                   sz
+                  mem.callStack
               with
               | .some lhsAddrSc =>
                 evalScalarBinOpSymTree op lhsAddrSc offsetSc locals₂ mem false
@@ -2712,6 +2793,7 @@ def evalRvalueSymTreeFast
                 (layoutPointerBytes body.layouts)
                 ptrVal
                 sz
+                mem.callStack
             with
             | .some rhsAddrSc =>
               evalScalarBinOpSymTree op lhsSc rhsAddrSc locals₂ mem false
@@ -2730,7 +2812,8 @@ def evalRvalueSymTreeFast
                 body.layouts
                 ptrBytes
                 lhsPtr
-                lhsSz,
+                lhsSz
+                mem.callStack,
               ptrAddressScalar?
                 locals₂
                 mem.borrows
@@ -2740,6 +2823,7 @@ def evalRvalueSymTreeFast
                 ptrBytes
                 rhsPtr
                 rhsSz
+                mem.callStack
             with
             | .some lhsAddrSc, .some rhsAddrSc =>
               evalScalarBinOpSymTree op lhsAddrSc rhsAddrSc locals₂ mem false
@@ -2766,7 +2850,8 @@ def evalRvalueSymTreeFast
   | .unaryOp uop op =>
     match uop with
     | .not =>
-      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls with
+      match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals body.localDecls
+        mem.callStack with
       | .ok (.scalar sc) locals' =>
         evalUnaryNotSymTree sc (operandTy body.localDecls body.layouts op) locals' mem
       | .ok _ _ => .leaf .unsupported
@@ -2783,7 +2868,7 @@ theorem evalRvalueSymTreeFast_eq
   | use op =>
     dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
     rw [evalOperandFast_eq]
-    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+    cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
   | ref bk p =>
     cases bk with
     | shared =>
@@ -2802,25 +2887,25 @@ theorem evalRvalueSymTreeFast_eq
       dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalueFallback,
         evalRvalue, evalByteCast]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
     | _ => rfl
   | aggregate ak ops =>
     cases ak with
     | tuple =>
       dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
       rw [evalOperandsFast_eq]
-      cases evalOperands locals ops mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls <;> rfl
+      cases evalOperands locals ops mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack <;> rfl
     | _ => rfl
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
     rw [evalOperandFast_eq]
-    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+    cases evalOperand locals lhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v locals₁ =>
       dsimp only
       rw [evalOperandFast_eq]
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok v₂ locals₂ =>
@@ -2836,7 +2921,7 @@ theorem evalRvalueSymTreeFast_eq
     | not =>
       dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
       rw [evalOperandFast_eq]
-      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls with
+      cases evalOperand locals op mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls mem.callStack with
       | ok v _ => cases v <;> rfl
       | _ => rfl
     | neg => rfl
@@ -2857,10 +2942,12 @@ def finishAssignStmtNodeFast
         match set? locals₁ dst.local_ (.init val) with
         | .some locals₂ =>
           match hasProtectedWriteConflict mem₁.borrows mem₁.activeProtectors
-              dst.local_ .none .nil with
+              dst.local_ .none .nil 0 0 (length mem₁.callStack) with
           | true => MirStepNode.fail .ub
           | false =>
-            let borrows' := invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+            let borrows' :=
+              invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+                (length mem₁.callStack)
             MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
@@ -2925,19 +3012,20 @@ def evalStmtFast
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
               s.memory.borrows
               (protHead :: protTail)
               loc
+              (length s.memory.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -2949,19 +3037,20 @@ def evalStmtFast
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
               s.memory.borrows
               (protHead :: protTail)
               loc
+              (length s.memory.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .nop => MirStepNode.step (advanceStmt s s.frame.locals)
@@ -3016,19 +3105,20 @@ def evalStmtSymTreeFast
            | .nil =>
              MirStepNode.step
                (advanceStmt s locals'
-                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
            | protHead :: protTail =>
              match
                hasProtectedLocalBorrow
                  s.memory.borrows
                  (protHead :: protTail)
                  loc
+                 (length s.memory.callStack)
              with
              | true => MirStepNode.fail .ub
              | false =>
                MirStepNode.step
                  (advanceStmt s locals'
-                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .storageDead loc =>
@@ -3041,19 +3131,20 @@ def evalStmtSymTreeFast
            | .nil =>
              MirStepNode.step
                (advanceStmt s locals'
-                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
            | protHead :: protTail =>
              match
                hasProtectedLocalBorrow
                  s.memory.borrows
                  (protHead :: protTail)
                  loc
+                 (length s.memory.callStack)
              with
              | true => MirStepNode.fail .ub
              | false =>
                MirStepNode.step
                  (advanceStmt s locals'
-                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .nop => .leaf (MirStepNode.step (advanceStmt s s.frame.locals))
@@ -3085,12 +3176,23 @@ def evalTerminatorSymTreeFast
     match s.memory.callStack with
     | .nil =>
       match get? s.frame.locals 0 with
-      | .some (.init retVal) => .leaf (MirStepNode.retNormal retVal s.memory)
+      | .some (.init retVal) =>
+        .leaf
+          (match
+            hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length s.memory.callStack) (length s.frame.locals)
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.retNormal retVal
+              { s.memory with
+                borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                  (length s.frame.locals) })
       | _ => .leaf (MirStepNode.fail .ub)
     | _ :: _ => evalTerminatorFallback s term body
   | .switchInt discr targets =>
     match evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       (lookupSwitchTargetTree sc.bits targets.branches targets.otherwise).bind
         (fun target =>
@@ -3102,7 +3204,7 @@ def evalTerminatorSymTreeFast
     | .unsupported => .leaf MirStepNode.unsupported
   | .assert cond expected target unwind =>
     match evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
       .branch (Nat.beq sc.bits expectedBit)
@@ -3131,7 +3233,13 @@ theorem evalTerminatorSymTreeFast_eq
     | nil =>
       cases get? s.frame.locals 0 with
       | none => rfl
-      | some slot => cases slot <;> rfl
+      | some slot =>
+        cases slot with
+        | dead => rfl
+        | uninit => rfl
+        | init _ =>
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              0 (length s.frame.locals) <;> rfl
     | cons _ _ => rfl
   | switchInt discr targets =>
     show evalTerminatorSymTreeFast body s { kind := .switchInt discr targets, span := span } =
@@ -3145,7 +3253,7 @@ theorem evalTerminatorSymTreeFast_eq
     dsimp only
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rfl
     | unsupported => rfl
     | ok v _ => cases v <;> rfl
@@ -3658,19 +3766,30 @@ def evalTerminatorCfg
     match s.memory.callStack with
     | .nil =>
       match get? s.frame.locals 0 with
-      | .some (.init retVal) => .halted ok (.normal (retVal, s.memory))
+      | .some (.init retVal) =>
+        match
+          hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals)
+        with
+        | true => .faulted
+        | false =>
+          .halted ok
+            (.normal (retVal,
+              { s.memory with
+                borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                  (length s.frame.locals) }))
       | _ => .faulted
     | _ :: _ => .faulted
   | .switchInt discr targets =>
     match evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       let target := lookupSwitchTarget sc.bits targets.branches targets.otherwise
       .running ok .none { s with frame := { blockIdx := target, stmtIdx := 0, locals := locals' } }
     | _ => .faulted
   | .assert cond expected target _ =>
     match evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
       .running (Bool.and ok (Nat.beq sc.bits expectedBit)) .none
@@ -3781,17 +3900,23 @@ theorem cfgOk_evalTerminatorCfg_false
     | nil =>
       cases get? s.frame.locals 0 with
       | none => rfl
-      | some slot => cases slot <;> rfl
+      | some slot =>
+        cases slot with
+        | dead => rfl
+        | uninit => rfl
+        | init _ =>
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) <;> rfl
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg]
     cases evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | ok v _ => cases v <;> rfl
     | _ => rfl
   | assert cond expected target unwind =>
     dsimp only [evalTerminatorCfg]
     cases evalOperandFast body s.frame.locals cond s.memory.borrows s.memory.globals
-        s.memory.callerLocals with
+        s.memory.callerLocals (callStack := s.memory.callStack) with
     | ok v _ => cases v <;> rfl
     | _ => rfl
   | _ => rfl
@@ -3968,15 +4093,19 @@ theorem wpCoalBounded_evalTerminatorCfg
         | dead => rintro ⟨⟩ _
         | uninit => rintro ⟨⟩ _
         | init retVal =>
-          intro _ h_wp
-          dsimp only [stepNodeWP, MirStepNode.retNormal] at h_wp ⊢
-          rw [runCfgSteps_halted] at h_wp
-          exact h_wp.2
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
+          | true => rintro ⟨⟩ _
+          | false =>
+            intro _ h_wp
+            dsimp only [stepNodeWP, MirStepNode.retNormal] at h_wp ⊢
+            rw [runCfgSteps_halted] at h_wp
+            exact h_wp.2
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -4003,7 +4132,7 @@ theorem wpCoalBounded_evalTerminatorCfg
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -4453,15 +4582,19 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
         | dead => rintro ⟨⟩ _
         | uninit => rintro ⟨⟩ _
         | init retVal =>
-          intro _ h_wp
-          dsimp only [stepNodeStepsWP, MirStepNode.retNormal] at h_wp ⊢
-          rw [runCfgSteps_halted] at h_wp
-          exact h_wp.2
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
+          | true => rintro ⟨⟩ _
+          | false =>
+            intro _ h_wp
+            dsimp only [stepNodeStepsWP, MirStepNode.retNormal] at h_wp ⊢
+            rw [runCfgSteps_halted] at h_wp
+            exact h_wp.2
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -4488,7 +4621,7 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
     cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
-        body.layouts s.memory.callerLocals with
+        body.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
     | ub => rintro ⟨⟩ _
     | unsupported => rintro ⟨⟩ _
     | ok v locals' =>
@@ -8911,7 +9044,7 @@ def evalPureStmtChecked (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : 
             match mem₁.activeProtectors with
             | [] => some locals₂
             | protHead :: protTail =>
-              match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none .nil with
+              match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none .nil 0 0 (length mem₁.callStack) with
               | true => none
               | false => some locals₂
           | none => none
@@ -8994,7 +9127,7 @@ theorem evalPureStmtChecked_eq_evalPureStmt
                 | nil => rfl
                 | cons ph pt =>
                   dsimp only
-                  cases hasProtectedWriteConflict mem₁.borrows (ph :: pt) dstLoc .none <;> rfl
+                  cases hasProtectedWriteConflict mem₁.borrows (ph :: pt) dstLoc .none [] 0 0 (length mem₁.callStack) <;> rfl
       | cons _ _ =>
         dsimp only
         cases evalPureStmt body bbIdx stmtIdx env { kind := .assign ⟨dstLoc, _ :: _⟩ rv, span := span } with
@@ -13343,7 +13476,9 @@ weakest precondition (`wpMirExecSym`, `MirWpConverges`) whose postcondition igno
   untouched, since `resumeExternal*` read only the caller frame and the answer).
 * `evalRvalue_withCalleeCtx` / `evalStmt_withCalleeCtx`: statements that are not
   function-pointer reifications (`Statement.calleeQueryFree`) commute with every
-  replacement of `(callees, activeCallee, callStack)`.
+  replacement of `(callees, activeCallee, traitImpls)`. `Memory.callStack` is kept:
+  statements read it (the active frame's depth scopes `BorrowEntry.targetFrameDepth`,
+  and dereferencing writes reach suspended caller frames through it).
 * `evalTerminator_withCallees` / `stepMirState_callees_cone_eq`: one-step
   bisimulation under `calleesAgreeOn` and the per-step cone condition `StepConeSafe`.
 * `runMirExecBounded_cone_narrow`, `wpMirExecSym_cone_narrow`,
@@ -13359,11 +13494,12 @@ section CallConeNarrowing
 /-- The type of `Memory.callees`. -/
 abbrev CalleeEnv := List CapturedMir
 
-/-- Replace the callee table, active callee, and call stack of `m`. -/
+/-- Replace the callee table, active callee, and trait-impl table of `m` (but not its
+call stack, which statement evaluation reads). -/
 @[reducible]
 def Memory.withCalleeCtx (c : CalleeEnv) (ac : Option CapturedMir)
-    (cs : List SavedCallerFrame) (ti : List TraitImplEntry) (m : Memory) : Memory :=
-  { m with callees := c, activeCallee := ac, callStack := cs, traitImpls := ti }
+    (ti : List TraitImplEntry) (m : Memory) : Memory :=
+  { m with callees := c, activeCallee := ac, traitImpls := ti }
 
 /-- Replace only the callee table of `m` (the `withCallees` narrowing map). -/
 @[reducible]
@@ -13456,19 +13592,20 @@ private def ccEvalAssignNonDeref
         | .nil =>
           let borrows' :=
             invalidateConflictingBorrowsAtProj
-              mem₁.borrows dstLoc .none resolvedLocalProj
+              mem₁.borrows dstLoc .none resolvedLocalProj 0 0 (length mem₁.callStack)
           MirStepNode.step
             (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | protHead :: protTail =>
           match
             hasProtectedWriteConflict
-              mem₁.borrows (protHead :: protTail) dstLoc .none resolvedLocalProj
+              mem₁.borrows (protHead :: protTail) dstLoc .none resolvedLocalProj 0 0
+              (length mem₁.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             let borrows' :=
               invalidateConflictingBorrowsAtProj
-                mem₁.borrows dstLoc .none resolvedLocalProj
+                mem₁.borrows dstLoc .none resolvedLocalProj 0 0 (length mem₁.callStack)
             MirStepNode.step
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .none => MirStepNode.fail .ub
@@ -13494,19 +13631,20 @@ private def ccEvalAssignNonDeref
           | .nil =>
             let borrows' :=
               invalidateConflictingBorrowsAtProj
-                mem₁.borrows dstLoc .none resolvedLocalProj
+                mem₁.borrows dstLoc .none resolvedLocalProj 0 0 (length mem₁.callStack)
             MirStepNode.step
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
           | protHead :: protTail =>
             match
               hasProtectedWriteConflict
-                mem₁.borrows (protHead :: protTail) dstLoc .none resolvedLocalProj
+                mem₁.borrows (protHead :: protTail) dstLoc .none resolvedLocalProj 0 0
+                (length mem₁.callStack)
             with
             | true => MirStepNode.fail .ub
             | false =>
               let borrows' :=
                 invalidateConflictingBorrowsAtProj
-                  mem₁.borrows dstLoc .none resolvedLocalProj
+                  mem₁.borrows dstLoc .none resolvedLocalProj 0 0 (length mem₁.callStack)
               MirStepNode.step
                 (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .none => MirStepNode.fail .ub
@@ -13530,57 +13668,66 @@ private def ccEvalAssignDst
         match mem₁.activeProtectors with
         | .nil =>
           let borrows' :=
-            invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+            invalidateConflictingBorrows mem₁.borrows dst.local_ .none (length mem₁.callStack)
           MirStepNode.step
             (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | protHead :: protTail =>
           match
             hasProtectedWriteConflict
-              mem₁.borrows (protHead :: protTail) dst.local_ .none .nil
+              mem₁.borrows (protHead :: protTail) dst.local_ .none .nil 0 0
+              (length mem₁.callStack)
           with
           | true => MirStepNode.fail .ub
           | false =>
             let borrows' :=
-              invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+              invalidateConflictingBorrows mem₁.borrows dst.local_ .none (length mem₁.callStack)
             MirStepNode.step
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .deref :: restProj =>
-    match evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts with
+    match
+      evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts
+        mem₁.callStack
+    with
     | .ok locals₂ =>
       match
         Bool.or
           (derefWriteTreeUB locals₁ mem₁.borrows dst)
           (derefWriteUnionProtectorUB
-            localDecls layouts locals₁ mem₁.borrows mem₁.activeProtectors dst restProj)
+            localDecls layouts locals₁ mem₁.borrows mem₁.activeProtectors dst restProj
+            mem₁.callStack)
       with
       | true => MirStepNode.fail .ub
       | false =>
         let borrows' :=
           invalidateDerefWriteBorrowsWithLayouts
-            localDecls layouts locals₁ mem₁.borrows dst restProj
+            localDecls layouts locals₁ mem₁.borrows dst restProj mem₁.callStack
         MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
     | .ub =>
-      match mem₁.callerLocals with
-      | .nil => MirStepNode.fail .ub
+      match mem₁.callStack with
+      | .nil =>
+        match mem₁.callerLocals with
+        | .nil => MirStepNode.fail .ub
+        | _ :: _ =>
+          match
+            evalCallerPlaceWrite
+              locals₁ mem₁.callerLocals mem₁.borrows dst val mem₁.activeProtectors
+          with
+          | .ok callerLocals' =>
+            match derefWriteTreeUB locals₁ mem₁.borrows dst with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let borrows' :=
+                invalidateDerefWriteBorrows
+                  locals₁ mem₁.borrows dst restProj mem₁.callerLocals
+              MirStepNode.step
+                (advanceStmt s locals₁
+                  { mem₁ with borrows := borrows', callerLocals := callerLocals' })
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
       | _ :: _ =>
-        match
-          evalCallerPlaceWrite
-            locals₁ mem₁.callerLocals mem₁.borrows dst val mem₁.activeProtectors
-        with
-        | .ok callerLocals' =>
-          match derefWriteTreeUB locals₁ mem₁.borrows dst with
-          | true => MirStepNode.fail .ub
-          | false =>
-            let borrows' :=
-              invalidateDerefWriteBorrows
-                locals₁ mem₁.borrows dst restProj mem₁.callerLocals
-            MirStepNode.step
-              (advanceStmt s locals₁
-                { mem₁ with borrows := borrows', callerLocals := callerLocals' })
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+        evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
     | .unsupported => MirStepNode.unsupported
   | hd :: tl =>
     ccEvalAssignNonDeref s dst.local_ (hd :: tl) val locals₁ mem₁ localDecls layouts
@@ -13627,71 +13774,131 @@ private def ccProjIsDeref : (hd : ProjectionElem) → Decidable (hd = .deref)
   | .downcast .. => isFalse (fun h => ProjectionElem.noConfusion h)
   | .opaqueCast .. => isFalse (fun h => ProjectionElem.noConfusion h)
   | .unwrapUnsafeBinder .. => isFalse (fun h => ProjectionElem.noConfusion h)
-private theorem rvalCtx_ub {c : CalleeEnv} {ac : Option CapturedMir} {cs : List SavedCallerFrame} {ti : List TraitImplEntry} :
-    RvalueEvalResult.ub = RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti) RvalueEvalResult.ub := rfl
+private theorem rvalCtx_ub {c : CalleeEnv} {ac : Option CapturedMir} {ti : List TraitImplEntry} :
+    RvalueEvalResult.ub = RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti) RvalueEvalResult.ub := rfl
 
-private theorem rvalCtx_unsupported {c : CalleeEnv} {ac : Option CapturedMir} {cs : List SavedCallerFrame} {ti : List TraitImplEntry} :
+private theorem rvalCtx_unsupported {c : CalleeEnv} {ac : Option CapturedMir} {ti : List TraitImplEntry} :
     RvalueEvalResult.unsupported =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti) RvalueEvalResult.unsupported := rfl
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti) RvalueEvalResult.unsupported := rfl
 
 private theorem rvalCtx_ok
-    {c : CalleeEnv} {ac : Option CapturedMir} {cs : List SavedCallerFrame} {ti : List TraitImplEntry}
+    {c : CalleeEnv} {ac : Option CapturedMir} {ti : List TraitImplEntry}
     {v : Value} {l : List LocalSlot} {m₁ m₂ : Memory}
-    (h : m₁ = Memory.withCalleeCtx c ac cs ti m₂) :
+    (h : m₁ = Memory.withCalleeCtx c ac ti m₂) :
     RvalueEvalResult.ok v l m₁ =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti) (RvalueEvalResult.ok v l m₂) :=
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti) (RvalueEvalResult.ok v l m₂) :=
   h ▸ rfl
 
 
-private theorem stepCtx_fail {c : CalleeEnv} {ac : Option CapturedMir} {cs : List SavedCallerFrame} {ti : List TraitImplEntry} {fk : FailureKind} :
-    MirStepNode.fail fk = MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti) (MirStepNode.fail fk) := rfl
+private theorem stepCtx_fail {c : CalleeEnv} {ac : Option CapturedMir} {ti : List TraitImplEntry} {fk : FailureKind} :
+    MirStepNode.fail fk = MirStepNode.mapMem (Memory.withCalleeCtx c ac ti) (MirStepNode.fail fk) := rfl
 
 private theorem stepCtx_step
-    {c : CalleeEnv} {ac : Option CapturedMir} {cs : List SavedCallerFrame} {ti : List TraitImplEntry} {s₁ s₂ : MachineState}
-    (h : s₁ = MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s₂) :
-    MirStepNode.step s₁ = MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti) (MirStepNode.step s₂) :=
+    {c : CalleeEnv} {ac : Option CapturedMir} {ti : List TraitImplEntry} {s₁ s₂ : MachineState}
+    (h : s₁ = MachineState.mapMem (Memory.withCalleeCtx c ac ti) s₂) :
+    MirStepNode.step s₁ = MirStepNode.mapMem (Memory.withCalleeCtx c ac ti) (MirStepNode.step s₂) :=
   h ▸ rfl
+
+/-- Apply a memory transformer to the memory of a `FrameWriteResult`. -/
+def FrameWriteResult.mapMem (f : Memory → Memory) : FrameWriteResult → FrameWriteResult
+  | .ok l m => .ok l (f m)
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- Committing a foreign-frame write (`commitForeignFrameLocals`, which updates a saved
+frame's locals in `Memory.callStack` or `Memory.callerLocals`) commutes with
+`Memory.withCalleeCtx`. -/
+theorem commitForeignFrameLocals_withCalleeCtx (c : CalleeEnv) (ac : Option CapturedMir)
+    (ti : List TraitImplEntry) (m : Memory) (t : ForeignFrameTarget) (l : List LocalSlot) :
+    commitForeignFrameLocals (Memory.withCalleeCtx c ac ti m) t l =
+      (commitForeignFrameLocals m t l).map (Memory.withCalleeCtx c ac ti) := by
+  cases t with
+  | callerReferent _ => rfl
+  | savedFrame idx _ =>
+    unfold commitForeignFrameLocals
+    dsimp only [Memory.withCalleeCtx]
+    cases get? m.callStack idx with
+    | none => rfl
+    | some sf =>
+      dsimp only
+      cases set? m.callStack idx { sf with frame := { sf.frame with locals := l } } <;> rfl
+
+theorem commitForeignFrameLocals_withCalleeCtx' (c : CalleeEnv) (ac : Option CapturedMir)
+    (ti : List TraitImplEntry) (m : Memory) (t : ForeignFrameTarget) (l : List LocalSlot) :
+    commitForeignFrameLocals { m with callees := c, activeCallee := ac, traitImpls := ti } t l =
+      (commitForeignFrameLocals m t l).map (Memory.withCalleeCtx c ac ti) :=
+  commitForeignFrameLocals_withCalleeCtx c ac ti m t l
+
+/-- A dereferencing write into a suspended caller frame (`foreignFrameDerefWrite`) reads
+and commits `Memory.callStack` / `Memory.callerLocals` only. -/
+theorem foreignFrameDerefWrite_withCalleeCtx (c : CalleeEnv) (ac : Option CapturedMir)
+    (ti : List TraitImplEntry) (locals₁ : List LocalSlot) (mem₁ : Memory) (dst : Place)
+    (restProj : List ProjectionElem) (val : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    foreignFrameDerefWrite locals₁ (Memory.withCalleeCtx c ac ti mem₁) dst restProj val
+        localDecls layouts =
+      FrameWriteResult.mapMem (Memory.withCalleeCtx c ac ti)
+        (foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold foreignFrameDerefWrite
+  dsimp only [Memory.withCalleeCtx]
+  repeat' (first | rfl | split)
+  all_goals (
+    simp only [commitForeignFrameLocals_withCalleeCtx'] at *
+    simp only [*, Option.map] at *
+    first
+    | (simp at *; done)
+    | (simp only [Option.some.injEq] at *; subst_vars; rfl))
+
+theorem foreignFrameDerefWrite_withCalleeCtx' (c : CalleeEnv) (ac : Option CapturedMir)
+    (ti : List TraitImplEntry) (locals₁ : List LocalSlot) (m : Memory) (dst : Place)
+    (restProj : List ProjectionElem) (val : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    foreignFrameDerefWrite locals₁ { m with callees := c, activeCallee := ac, traitImpls := ti }
+        dst restProj val localDecls layouts =
+      FrameWriteResult.mapMem (Memory.withCalleeCtx c ac ti)
+        (foreignFrameDerefWrite locals₁ m dst restProj val localDecls layouts) :=
+  foreignFrameDerefWrite_withCalleeCtx c ac ti locals₁ m dst restProj val localDecls layouts
 
 
 theorem evalUnsafeFnPointer_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalUnsafeFnPointer locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalUnsafeFnPointer locals op targetTy mem localDecls layouts) := by
   unfold evalUnsafeFnPointer
   dsimp only [Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem deriveStackElemThinPtr_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (mem : Memory) (ptrVal : ProvenancePtr)
     (parentEntry : BorrowEntry) (elemCountOpt : Option Nat)
     (ptrBytes : Nat) :
-    deriveStackElemThinPtr locals (Memory.withCalleeCtx c ac cs ti mem)
+    deriveStackElemThinPtr locals (Memory.withCalleeCtx c ac ti mem)
         ptrVal parentEntry elemCountOpt ptrBytes =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (deriveStackElemThinPtr locals mem ptrVal parentEntry elemCountOpt ptrBytes) := by
   unfold deriveStackElemThinPtr
   dsimp only [Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalUnsizeCoercion_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalUnsizeCoercion locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalUnsizeCoercion locals op targetTy mem localDecls layouts) := by
   unfold evalUnsizeCoercion
   dsimp only [Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalSliceFatPtrDerefBorrow_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (mem : Memory) (parentPtr : ProvenancePtr)
     (ptrSz : Nat) (lenSc : ScalarInt) (restProj : List ProjectionElem)
     (perm : TreeBorrowPerm) (isMut : Bool) (pointeeTyOpt : Option Ty)
@@ -13699,10 +13906,10 @@ theorem evalSliceFatPtrDerefBorrow_withCalleeCtx
     (localDecls : List LocalDecl) (fullPlaceTyOpt : Option Ty)
     (checkRefElemAlign : Bool) :
     evalSliceFatPtrDerefBorrow locals
-        (Memory.withCalleeCtx c ac cs ti mem)
+        (Memory.withCalleeCtx c ac ti mem)
         parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm
         localDecls fullPlaceTyOpt checkRefElemAlign =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalSliceFatPtrDerefBorrow locals mem
           parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm
           localDecls fullPlaceTyOpt checkRefElemAlign) := by
@@ -13711,17 +13918,17 @@ theorem evalSliceFatPtrDerefBorrow_withCalleeCtx
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalGlobalThinPtrDerefBorrow_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (mem : Memory) (alloc : CapturedAllocation)
     (parentPtr : ProvenancePtr) (ptrSz : Nat) (restProj : List ProjectionElem)
     (isMut : Bool) (pointeeTyOpt : Option Ty) (layouts : LayoutTable)
     (localDecls : List LocalDecl) (rawPtrMode : Bool)
     (fullPlaceTyOpt : Option Ty) :
     evalGlobalThinPtrDerefBorrow locals
-        (Memory.withCalleeCtx c ac cs ti mem)
+        (Memory.withCalleeCtx c ac ti mem)
         alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode
         fullPlaceTyOpt =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalGlobalThinPtrDerefBorrow locals mem
           alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode
           fullPlaceTyOpt) := by
@@ -13730,14 +13937,14 @@ theorem evalGlobalThinPtrDerefBorrow_withCalleeCtx
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalScalarSliceFatPtrDerefRaw_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (mem : Memory) (addrSc lenSc : ScalarInt)
     (restProj : List ProjectionElem) (pointeeTyOpt : Option Ty)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalScalarSliceFatPtrDerefRaw locals
-        (Memory.withCalleeCtx c ac cs ti mem)
+        (Memory.withCalleeCtx c ac ti mem)
         addrSc lenSc restProj pointeeTyOpt localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalScalarSliceFatPtrDerefRaw locals mem
           addrSc lenSc restProj pointeeTyOpt localDecls layouts) := by
   unfold evalScalarSliceFatPtrDerefRaw
@@ -13745,26 +13952,26 @@ theorem evalScalarSliceFatPtrDerefRaw_withCalleeCtx
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalScalarPtrOffsetBinOp_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals₂ : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (lhsOp : Operand) (lhs rhs : ScalarInt) :
     evalScalarPtrOffsetBinOp locals₂
-        (Memory.withCalleeCtx c ac cs ti mem)
+        (Memory.withCalleeCtx c ac ti mem)
         localDecls layouts lhsOp lhs rhs =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs) := by
   unfold evalScalarPtrOffsetBinOp
   dsimp only [Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalPtrOffsetBinOp_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals₂ : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (lhsOp : Operand) (ptrVal : ProvenancePtr)
     (sz : Nat) (offsetSc : ScalarInt) :
-    evalPtrOffsetBinOp locals₂ (Memory.withCalleeCtx c ac cs ti mem)
+    evalPtrOffsetBinOp locals₂ (Memory.withCalleeCtx c ac ti mem)
         localDecls layouts lhsOp ptrVal sz offsetSc =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz
           offsetSc) := by
   unfold evalPtrOffsetBinOp ptrAllocByteBound?
@@ -13772,40 +13979,40 @@ theorem evalPtrOffsetBinOp_withCalleeCtx
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalPlaceLen_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (place : Place) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalPlaceLen locals place (Memory.withCalleeCtx c ac cs ti mem)
+    evalPlaceLen locals place (Memory.withCalleeCtx c ac ti mem)
         localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalPlaceLen locals place mem localDecls layouts) := by
   unfold evalPlaceLen
   dsimp only [Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalPlaceDiscriminant_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (val : Value) (locals' : List LocalSlot) (mem : Memory) (place : Place)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalPlaceDiscriminant val locals'
-        (Memory.withCalleeCtx c ac cs ti mem) place localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) place localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalPlaceDiscriminant val locals' mem place localDecls layouts) := by
   unfold evalPlaceDiscriminant
   dsimp only
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalReifyFnPointer_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (coercionKind : String)
     (h_free : isReifyFnPointerCoercion coercionKind = false ∨
       stringEq coercionKind "UnsafeFnPointer" = true) :
     evalReifyFnPointer locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem)
+        (Memory.withCalleeCtx c ac ti mem)
         localDecls layouts coercionKind =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalReifyFnPointer locals op targetTy mem
           localDecls layouts coercionKind) := by
   unfold evalReifyFnPointer
@@ -13820,7 +14027,7 @@ theorem evalReifyFnPointer_withCalleeCtx
   | true =>
     cases h_s : stringEq coercionKind "UnsafeFnPointer" with
     | true =>
-      exact evalUnsafeFnPointer_withCalleeCtx c ac cs ti
+      exact evalUnsafeFnPointer_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | false =>
       exfalso
@@ -13829,28 +14036,28 @@ theorem evalReifyFnPointer_withCalleeCtx
       · rw [h_s] at h; cases h
 
 theorem evalFnPtrToPtr_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalFnPtrToPtr locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalFnPtrToPtr locals op targetTy mem localDecls layouts) := by
   unfold evalFnPtrToPtr
   dsimp only [Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalByteCast_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalByteCast locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalByteCast locals op targetTy mem localDecls layouts) := by
   unfold evalByteCast
   dsimp only [Memory.withCalleeCtx]
-  cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+  cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
   | ub => rfl
   | unsupported => rfl
   | ok v locals' =>
@@ -13861,10 +14068,10 @@ theorem evalByteCast_withCalleeCtx
     all_goals try rfl
 
 theorem evalSignedDiv_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (a b sz : Nat) (locals : List LocalSlot) (mem : Memory) :
-    evalSignedDiv a b sz locals (Memory.withCalleeCtx c ac cs ti mem) =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+    evalSignedDiv a b sz locals (Memory.withCalleeCtx c ac ti mem) =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalSignedDiv a b sz locals mem) := by
   unfold evalSignedDiv
   dsimp only
@@ -13875,10 +14082,10 @@ theorem evalSignedDiv_withCalleeCtx
       (Nat.sub (scalarModulus sz) 1)) <;> rfl
 
 theorem evalSignedRem_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (a b sz : Nat) (locals : List LocalSlot) (mem : Memory) :
-    evalSignedRem a b sz locals (Memory.withCalleeCtx c ac cs ti mem) =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+    evalSignedRem a b sz locals (Memory.withCalleeCtx c ac ti mem) =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalSignedRem a b sz locals mem) := by
   unfold evalSignedRem
   dsimp only
@@ -13889,12 +14096,12 @@ theorem evalSignedRem_withCalleeCtx
       (Nat.sub (scalarModulus sz) 1)) <;> rfl
 
 theorem evalScalarBinOp_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (op : BinOp) (lhs rhs : ScalarInt) (locals : List LocalSlot)
     (mem : Memory) (isSigned : Bool) :
     evalScalarBinOp op lhs rhs locals
-        (Memory.withCalleeCtx c ac cs ti mem) isSigned =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) isSigned =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalScalarBinOp op lhs rhs locals mem isSigned) := by
   unfold evalScalarBinOp
   cases Nat.beq lhs.sizeBytes 0 with
@@ -13910,24 +14117,24 @@ theorem evalScalarBinOp_withCalleeCtx
         | split)
 
 theorem evalUnaryNot_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (sc : ScalarInt) (optTy : Option Ty) (locals : List LocalSlot)
     (mem : Memory) :
     evalUnaryNot sc optTy locals
-        (Memory.withCalleeCtx c ac cs ti mem) =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalUnaryNot sc optTy locals mem) := by
   unfold evalUnaryNot
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalRvalueRefDeref_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (borrowKind : BorrowKind) (place : Place)
     (restProj : List ProjectionElem) (perm : TreeBorrowPerm) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalueRefDeref locals borrowKind place restProj perm
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalRvalueRefDeref locals borrowKind place restProj perm mem localDecls layouts) := by
   dsimp only [evalRvalueRefDeref, Memory.withCalleeCtx]
   repeat' (first
@@ -13937,12 +14144,12 @@ theorem evalRvalueRefDeref_withCalleeCtx
     | split)
 
 theorem evalRvalueRawPtr_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (mutability : Mutability) (place : Place)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalueRawPtr locals mutability place
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalRvalueRawPtr locals mutability place mem localDecls layouts) := by
   dsimp only [evalRvalueRawPtr, Memory.withCalleeCtx]
   repeat' (first
@@ -13953,12 +14160,12 @@ theorem evalRvalueRawPtr_withCalleeCtx
     | split)
 
 theorem evalCastPtrToPtr_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalCastPtrToPtr locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalCastPtrToPtr locals op targetTy mem localDecls layouts) := by
   dsimp only [evalCastPtrToPtr, Memory.withCalleeCtx]
   repeat' (first
@@ -13967,50 +14174,50 @@ theorem evalCastPtrToPtr_withCalleeCtx
     | split)
 
 theorem evalPointerExposeProvenance_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalPointerExposeProvenance locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalPointerExposeProvenance locals op targetTy mem localDecls layouts) := by
   dsimp only [evalPointerExposeProvenance, Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalPointerWithExposedProvenance_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalPointerWithExposedProvenance locals op targetTy
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalPointerWithExposedProvenance locals op targetTy mem localDecls layouts) := by
   dsimp only [evalPointerWithExposedProvenance, Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalAggregateRawPtr_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (pointeeTy : Ty) (ops : List Operand)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalAggregateRawPtr locals pointeeTy ops
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts) := by
   dsimp only [evalAggregateRawPtr, Memory.withCalleeCtx]
   repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 theorem evalAggregateAdt_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (defPath : DefPath) (variantIdx : VariantIdx)
     (activeField : Option FieldIdx) (ops : List Operand)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalAggregateAdt locals defPath variantIdx activeField ops
-        (Memory.withCalleeCtx c ac cs ti mem) localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+        (Memory.withCalleeCtx c ac ti mem) localDecls layouts =
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalAggregateAdt locals defPath variantIdx activeField ops mem localDecls layouts) := by
   unfold evalAggregateAdt
   dsimp only [Memory.withCalleeCtx]
-  cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
+  cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
   | ub => rfl
   | unsupported => rfl
   | ok vals locals' =>
@@ -14018,18 +14225,18 @@ theorem evalAggregateAdt_withCalleeCtx
     repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
 
 /--
-`evalRvalue` is independent of `Memory.callStack` and `Memory.activeCallee`, and of
+`evalRvalue` is independent of `Memory.activeCallee` and `Memory.traitImpls`, and of
 `Memory.callees` whenever `rv` is not a function-pointer reification cast
 (`Rvalue.calleeQueryFree`): it commutes with `Memory.withCalleeCtx`.
 -/
 theorem evalRvalue_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (h_free : Rvalue.calleeQueryFree rv = true) :
-    evalRvalue locals rv (Memory.withCalleeCtx c ac cs ti mem)
+    evalRvalue locals rv (Memory.withCalleeCtx c ac ti mem)
         localDecls layouts =
-      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac cs ti)
+      RvalueEvalResult.mapMem (Memory.withCalleeCtx c ac ti)
         (evalRvalue locals rv mem localDecls layouts) := by
   cases rv with
   | use op =>
@@ -14046,48 +14253,48 @@ theorem evalRvalue_withCalleeCtx
       | split)
   | threadLocalRef _ => rfl
   | rawPtr mutab place =>
-    exact evalRvalueRawPtr_withCalleeCtx c ac cs ti locals mutab place mem localDecls layouts
+    exact evalRvalueRawPtr_withCalleeCtx c ac ti locals mutab place mem localDecls layouts
   | len place =>
     dsimp only [evalRvalue]
-    exact evalPlaceLen_withCalleeCtx c ac cs ti locals place mem
+    exact evalPlaceLen_withCalleeCtx c ac ti locals place mem
       localDecls layouts
   | cast ck op targetTy =>
     cases ck with
     | pointerCoercion ckStr =>
-      refine evalReifyFnPointer_withCalleeCtx c ac cs ti
+      refine evalReifyFnPointer_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts ckStr ?_
       exact Rvalue.calleeQueryFree_pointerCoercion h_free
     | fnPtrToPtr =>
-      exact evalFnPtrToPtr_withCalleeCtx c ac cs ti
+      exact evalFnPtrToPtr_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | ptrToPtr =>
-      exact evalCastPtrToPtr_withCalleeCtx c ac cs ti
+      exact evalCastPtrToPtr_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | pointerExposeProvenance =>
-      exact evalPointerExposeProvenance_withCalleeCtx c ac cs ti
+      exact evalPointerExposeProvenance_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | pointerWithExposedProvenance =>
-      exact evalPointerWithExposedProvenance_withCalleeCtx c ac cs ti
+      exact evalPointerWithExposedProvenance_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | transmute =>
-      exact evalByteCast_withCalleeCtx c ac cs ti
+      exact evalByteCast_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | subtype =>
-      exact evalByteCast_withCalleeCtx c ac cs ti
+      exact evalByteCast_withCalleeCtx c ac ti
         locals op targetTy mem localDecls layouts
     | _ =>
-      dsimp only [evalRvalue, Memory.withCalleeCtx]
+      dsimp only [evalRvalue, evalFloatCastRvalue, Memory.withCalleeCtx]
       repeat' (first
         | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl
         | split)
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalue, Memory.withCalleeCtx]
-    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok lhsVal locals₁ =>
       dsimp only
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok rhsVal locals₂ =>
@@ -14098,50 +14305,50 @@ theorem evalRvalue_withCalleeCtx
           | scalar rhsSc =>
             cases op with
             | offset =>
-              exact evalScalarPtrOffsetBinOp_withCalleeCtx c ac cs ti
+              exact evalScalarPtrOffsetBinOp_withCalleeCtx c ac ti
                 locals₂ mem localDecls layouts lhsOp lhsSc rhsSc
             | _ =>
-              exact evalScalarBinOp_withCalleeCtx c ac cs ti
+              exact evalScalarBinOp_withCalleeCtx c ac ti
                 _ lhsSc rhsSc locals₂ mem _
           | ptr ptrVal sz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => rfl
             | true =>
               dsimp only
-              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz mem.callStack with
               | none => rfl
               | some rhsAddrSc =>
-                exact evalScalarBinOp_withCalleeCtx c ac cs ti op lhsSc rhsAddrSc locals₂ mem false
+                exact evalScalarBinOp_withCalleeCtx c ac ti op lhsSc rhsAddrSc locals₂ mem false
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
           | scalar rhsSc =>
             cases op with
             | offset =>
-              exact evalPtrOffsetBinOp_withCalleeCtx c ac cs ti
+              exact evalPtrOffsetBinOp_withCalleeCtx c ac ti
                 locals₂ mem localDecls layouts lhsOp ptrVal sz rhsSc
             | _ =>
               cases isPtrRelationalBinOp _ localDecls layouts lhsOp rhsOp with
               | false => rfl
               | true =>
                 dsimp only
-                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz mem.callStack with
                 | none => rfl
                 | some lhsAddrSc =>
-                  exact evalScalarBinOp_withCalleeCtx c ac cs ti _ lhsAddrSc rhsSc locals₂ mem false
+                  exact evalScalarBinOp_withCalleeCtx c ac ti _ lhsAddrSc rhsSc locals₂ mem false
           | ptr rhsPtr rhsSz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => rfl
             | true =>
               dsimp only
-              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz mem.callStack with
               | none =>
-                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz <;> rfl
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz mem.callStack <;> rfl
               | some lhsAddrSc =>
-                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz with
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz mem.callStack with
                 | none => rfl
                 | some rhsAddrSc =>
-                  exact evalScalarBinOp_withCalleeCtx c ac cs ti op lhsAddrSc rhsAddrSc locals₂ mem false
+                  exact evalScalarBinOp_withCalleeCtx c ac ti op lhsAddrSc rhsAddrSc locals₂ mem false
           | _ => rfl
         | aggregate lhsVar lhsFields =>
           cases rhsVal with
@@ -14158,13 +14365,13 @@ theorem evalRvalue_withCalleeCtx
     cases uop with
     | not =>
       dsimp only [evalRvalue, Memory.withCalleeCtx]
-      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok v locals' =>
         cases v with
         | scalar sc =>
-          exact evalUnaryNot_withCalleeCtx c ac cs ti sc _ locals' mem
+          exact evalUnaryNot_withCalleeCtx c ac ti sc _ locals' mem
         | _ => rfl
     | neg =>
       dsimp only [evalRvalue, Memory.withCalleeCtx]
@@ -14181,30 +14388,30 @@ theorem evalRvalue_withCalleeCtx
   | aggregate kind ops =>
     cases kind with
     | rawPtr pointeeTy _ =>
-      exact evalAggregateRawPtr_withCalleeCtx c ac cs ti locals pointeeTy ops mem localDecls layouts
+      exact evalAggregateRawPtr_withCalleeCtx c ac ti locals pointeeTy ops mem localDecls layouts
     | adt defPath variantIdx activeField =>
-      exact evalAggregateAdt_withCalleeCtx c ac cs ti locals defPath variantIdx activeField ops mem localDecls layouts
+      exact evalAggregateAdt_withCalleeCtx c ac ti locals defPath variantIdx activeField ops mem localDecls layouts
     | _ =>
       dsimp only [evalRvalue, Memory.withCalleeCtx]
       repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
   | shallowInitBox _ _ => rfl
   | copyForDeref place =>
     dsimp only [evalRvalue, Memory.withCalleeCtx]
-    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls <;> repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
+    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack <;> repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split)
   | wrapUnsafeBinder op _ =>
     cases op
     all_goals (dsimp only [evalRvalue, Memory.withCalleeCtx]; repeat' (first | exact rvalCtx_ub | exact rvalCtx_unsupported | exact rvalCtx_ok rfl | split))
 
 theorem evalCopySingleDirect_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
     (locals₃ : List LocalSlot) :
     evalCopySingleDirect
-        (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (evalCopySingleDirect
           s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃) := by
   unfold evalCopySingleDirect
@@ -14221,7 +14428,9 @@ private def ccCopyWriteDstVal
     MirStepNode :=
   match writePlaceValue locals₃ s.memory.borrows dstPlace newVal localDecls layouts with
   | .ok locals₄ =>
-    let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag)
+    let borrows' :=
+      invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag)
+        (length s.memory.callStack)
     MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
   | .unsupported => MirStepNode.unsupported
   | .ub =>
@@ -14258,7 +14467,7 @@ private def ccCopyWriteDstVal
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok callerLocals' =>
-        let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag)
+        let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag) 0
         MirStepNode.step
           (advanceStmt s locals₃
             { s.memory with borrows := borrows', callerLocals := callerLocals' })
@@ -14453,67 +14662,43 @@ private def ccEvalCopyNonOverlappingPermOk
         | _, _ => MirStepNode.fail .ub
       | _, _ => MirStepNode.fail .ub
 
-private theorem ccEvalCopyNonOverlappingWithCount_eq
+/-- Trusted's `evalCopyNonOverlappingPermOk` is the `cc` mirror (whose union / byte-path
+pieces are factored through `ccCopyViaBytesBody` / `ccCopyWriteDstVal`), definitionally. -/
+private theorem evalCopyNonOverlappingPermOk_eq_cc
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
-    evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃ =
-      match Nat.beq countBits 0 with
-      | true => MirStepNode.step (advanceStmt s locals₃)
-      | false =>
-        match srcVal, dstVal with
-        | .ptr srcPtr _, .ptr dstPtr _ =>
-          match lookupBorrow s.memory.borrows srcPtr.tag, lookupBorrow s.memory.borrows dstPtr.tag with
-          | .some srcEntry, .some dstEntry =>
-            match srcEntry.perm, dstEntry.perm with
-            | .disabled, _ => MirStepNode.fail .ub
-            | _, .frozen => MirStepNode.fail .ub
-            | _, .disabled => MirStepNode.fail .ub
-            | _, _ =>
-              ccEvalCopyNonOverlappingPermOk s src dst localDecls layouts srcPtr dstPtr
-                srcEntry dstEntry countBits locals₃
-          | _, _ => MirStepNode.fail .ub
-        | _, _ => MirStepNode.fail .ub := by
-  unfold evalCopyNonOverlappingWithCount
-  cases Nat.beq countBits 0 with
-  | true => rfl
-  | false =>
-    cases srcVal with
-    | ptr srcPtr _ =>
-      cases dstVal with
-      | ptr dstPtr _ =>
-        cases lookupBorrow s.memory.borrows srcPtr.tag with
-        | none => rfl
-        | some srcEntry =>
-          cases lookupBorrow s.memory.borrows dstPtr.tag with
-          | none => rfl
-          | some dstEntry =>
-            cases srcEntry.perm <;> cases dstEntry.perm <;> rfl
-      | _ => rfl
-    | _ => rfl
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk s src dst localDecls
+        layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+      ccEvalCopyNonOverlappingPermOk s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        countBits locals₃ := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+    ccEvalCopyNonOverlappingPermOk
+  rfl
 
 private theorem copyWriteDstVal_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
     (dstLoc : Local) (dstTag : Nat) (newVal : Value)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    ccCopyWriteDstVal (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+    ccCopyWriteDstVal (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         locals₃ dstPlace dstLoc dstTag newVal localDecls layouts =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (ccCopyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts) := by
   unfold ccCopyWriteDstVal
   dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
   repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
 
 private theorem copyViaBytesBody_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
     (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
     (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) :
-    ccCopyViaBytesBody (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+    ccCopyViaBytesBody (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits
         locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (ccCopyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
           countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
   unfold ccCopyViaBytesBody
@@ -14521,17 +14706,17 @@ private theorem copyViaBytesBody_withCalleeCtx
   repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | exact copyWriteDstVal_withCalleeCtx .. | split)
 
 private theorem evalCopyUnionBytes_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
     (srcUnionOpt dstUnionOpt : Option UnionPlaceInfo)
     (n : Nat) (locals₃ : List LocalSlot) :
     evalCopyUnionBytes
-        (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
         srcUnionOpt dstUnionOpt n locals₃ =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (evalCopyUnionBytes
           s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
           srcUnionOpt dstUnionOpt n locals₃) := by
@@ -14540,15 +14725,15 @@ private theorem evalCopyUnionBytes_withCalleeCtx
   repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | exact copyWriteDstVal_withCalleeCtx .. | split)
 
 private theorem evalCopyNonOverlappingPermOk_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
     (countBits : Nat) (locals₃ : List LocalSlot) :
     ccEvalCopyNonOverlappingPermOk
-        (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (ccEvalCopyNonOverlappingPermOk
           s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
   unfold ccEvalCopyNonOverlappingPermOk
@@ -14561,18 +14746,53 @@ private theorem evalCopyNonOverlappingPermOk_withCalleeCtx
     | exact copyWriteDstVal_withCalleeCtx ..
     | split)
 
+private theorem evalCopyNonOverlappingPermOk_trusted_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+          s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
+  rw [evalCopyNonOverlappingPermOk_eq_cc, evalCopyNonOverlappingPermOk_eq_cc]
+  exact evalCopyNonOverlappingPermOk_withCalleeCtx c ac ti
+    s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
+
+/-- The frame-qualified single-element copy into or out of a suspended caller frame
+(`evalForeignFrameCopySingleDirect`) reads and writes `Memory.callStack` /
+`Memory.callerLocals` only, so it commutes with `Memory.withCalleeCtx`. -/
+private theorem evalForeignFrameCopySingleDirect_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    evalForeignFrameCopySingleDirect
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalForeignFrameCopySingleDirect
+          s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
+  unfold evalForeignFrameCopySingleDirect
+  dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
+  repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
+
 theorem evalCopyNonOverlappingWithCount_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (src dst : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
     evalCopyNonOverlappingWithCount
-        (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         src dst localDecls layouts srcVal dstVal countBits locals₃ =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (evalCopyNonOverlappingWithCount
           s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
-  rw [ccEvalCopyNonOverlappingWithCount_eq, ccEvalCopyNonOverlappingWithCount_eq]
+  unfold evalCopyNonOverlappingWithCount
   cases Nat.beq countBits 0 with
   | true => rfl
   | false =>
@@ -14589,58 +14809,106 @@ theorem evalCopyNonOverlappingWithCount_withCalleeCtx
           | some dstEntry =>
             dsimp only
             cases srcEntry.perm <;> cases dstEntry.perm <;>
+              cases copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry <;>
               first
               | rfl
-              | exact evalCopyNonOverlappingPermOk_withCalleeCtx c ac cs ti
+              | exact evalCopyNonOverlappingPermOk_trusted_withCalleeCtx c ac ti
+                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
+              | exact evalForeignFrameCopySingleDirect_withCalleeCtx c ac ti
                   s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
       | _ => rfl
     | _ => rfl
 
 theorem evalCopyNonOverlapping_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (src dst count : Operand)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalCopyNonOverlapping
-        (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         src dst count localDecls layouts =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (evalCopyNonOverlapping s src dst count localDecls layouts) := by
   unfold evalCopyNonOverlapping
   dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
-  cases evalOperand s.frame.locals src s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls with
+  cases evalOperand s.frame.locals src s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack with
   | ub => rfl
   | unsupported => rfl
   | ok srcVal locals₁ =>
     dsimp only
-    cases evalOperand locals₁ dst s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls with
+    cases evalOperand locals₁ dst s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok dstVal locals₂ =>
       dsimp only
-      cases evalOperand locals₂ count s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls with
+      cases evalOperand locals₂ count s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok countVal locals₃ =>
         cases countVal with
         | scalar countSc =>
           exact evalCopyNonOverlappingWithCount_withCalleeCtx
-            c ac cs ti s src dst localDecls layouts
+            c ac ti s src dst localDecls layouts
             srcVal dstVal countSc.bits locals₃
         | _ => rfl
 
+/-- `evalSetDiscriminantLocal` reads only the active frame, borrows, and protectors. -/
+theorem evalSetDiscriminantLocal_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (loc : Local) (variantIdx : Nat) (fields : List Value) :
+    evalSetDiscriminantLocal (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        loc variantIdx fields =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalSetDiscriminantLocal s loc variantIdx fields) := by
+  unfold evalSetDiscriminantLocal
+  dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
+  repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
+
+/-- A dereferencing write into a suspended caller frame (`evalForeignFrameDerefWrite`)
+reads and commits `Memory.callStack` / `Memory.callerLocals` only. -/
+theorem evalForeignFrameDerefWrite_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (locals₁ : List LocalSlot) (mem₁ : Memory) (dst : Place)
+    (restProj : List ProjectionElem) (val : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalForeignFrameDerefWrite (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        locals₁ (Memory.withCalleeCtx c ac ti mem₁) dst restProj val localDecls layouts =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold evalForeignFrameDerefWrite
+  rw [foreignFrameDerefWrite_withCalleeCtx]
+  cases foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts <;> rfl
+
+/-- The dereferencing `SetDiscriminant` write (`evalSetDiscriminantDerefWrite`). -/
+theorem evalSetDiscriminantDerefWrite_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (locals₁ : List LocalSlot) (p : Place)
+    (rest : List ProjectionElem) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalSetDiscriminantDerefWrite (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        locals₁ p rest newVal localDecls layouts =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts) := by
+  unfold evalSetDiscriminantDerefWrite
+  dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
+  repeat' (first
+    | exact stepCtx_fail | exact stepCtx_step rfl
+    | exact evalForeignFrameDerefWrite_withCalleeCtx c ac ti s locals₁ s.memory p rest newVal
+        localDecls layouts
+    | split)
+
 /--
-`evalStmt` is independent of `Memory.callStack`, `Memory.activeCallee`, and (for
+`evalStmt` is independent of `Memory.activeCallee`, `Memory.traitImpls`, and (for
 `Statement.calleeQueryFree` statements) `Memory.callees`: it commutes with
-`Memory.withCalleeCtx c ac cs ti` for every replacement triple.
+`Memory.withCalleeCtx c ac ti` for every replacement triple.
 -/
 theorem evalStmt_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (stmt : Statement)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (h_free : Statement.calleeQueryFree stmt = true) :
-    evalStmt (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+    evalStmt (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         stmt localDecls layouts =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (evalStmt s stmt localDecls layouts) := by
   rcases stmt with ⟨kind, span⟩
   cases kind with
@@ -14674,16 +14942,20 @@ theorem evalStmt_withCalleeCtx
       dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
       repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
     | copyNonOverlapping src dst count =>
-      exact evalCopyNonOverlapping_withCalleeCtx c ac cs ti
+      exact evalCopyNonOverlapping_withCalleeCtx c ac ti
         s src dst count localDecls layouts
   | setDiscriminant p variantIdx =>
     unfold evalStmt
     dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
-    repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
+    repeat' (first
+      | exact stepCtx_fail | exact stepCtx_step rfl
+      | exact evalSetDiscriminantLocal_withCalleeCtx c ac ti s _ _ _
+      | exact evalSetDiscriminantDerefWrite_withCalleeCtx c ac ti s _ _ _ _ localDecls layouts
+      | split)
   | assign dst rv =>
     rw [ccEvalStmt_assign_eq, ccEvalStmt_assign_eq]
     dsimp only [MachineState.mapMem]
-    rw [evalRvalue_withCalleeCtx c ac cs ti
+    rw [evalRvalue_withCalleeCtx c ac ti
       s.frame.locals rv s.memory localDecls layouts h_free]
     cases evalRvalue s.frame.locals rv s.memory localDecls layouts with
     | ub => rfl
@@ -14702,7 +14974,11 @@ theorem evalStmt_withCalleeCtx
           subst h_d
           unfold ccEvalAssignDst
           dsimp only [Memory.withCalleeCtx]
-          repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
+          repeat' (first
+            | exact stepCtx_fail | exact stepCtx_step rfl
+            | exact evalForeignFrameDerefWrite_withCalleeCtx c ac ti s _ mem₁ _ _ _ localDecls
+                layouts
+            | split)
         | isFalse h_d =>
           rw [ccEvalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d,
               ccEvalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
@@ -14743,38 +15019,40 @@ theorem MirStepNode.mapMem_comp (f g : Memory → Memory) (n : MirStepNode) :
     · simp only [MirStepNode.mapMem, MirExecState.mapMem_comp]
     · rfl
 
-/-- On successor states, `withCalleeCtx c₂ ac cs` after `withCalleeCtx c ac cs` is
-`withCallees c₂` after `withCalleeCtx c ac cs`. -/
+/-- On successor states, `withCalleeCtx c₂ ac ti` after `withCalleeCtx c ac ti` is
+`withCallees c₂` after `withCalleeCtx c ac ti`. -/
 theorem Memory.withCallees_comp_withCalleeCtx (c c₂ : CalleeEnv) (ac : Option CapturedMir)
-    (cs : List SavedCallerFrame) (ti : List TraitImplEntry) :
-    Memory.withCallees c₂ ∘ Memory.withCalleeCtx c ac cs ti =
-      Memory.withCalleeCtx c₂ ac cs ti ∘ Memory.withCalleeCtx c ac cs ti := rfl
+    (ti : List TraitImplEntry) :
+    Memory.withCallees c₂ ∘ Memory.withCalleeCtx c ac ti =
+      Memory.withCalleeCtx c₂ ac ti ∘ Memory.withCalleeCtx c ac ti := rfl
 
 /-- `MachineState.mapMem (Memory.withCallees c₂) s` is the `withCalleeCtx` replacement
 that keeps `s`'s own active callee and call stack. -/
 theorem MachineState.withCallees_eq_withCalleeCtx (c₂ : CalleeEnv) (s : MachineState) :
     MachineState.mapMem (Memory.withCallees c₂) s =
       MachineState.mapMem
-        (Memory.withCalleeCtx c₂ s.memory.activeCallee s.memory.callStack s.memory.traitImpls) s := rfl
+        (Memory.withCalleeCtx c₂ s.memory.activeCallee s.memory.traitImpls) s := rfl
 
 /-- The identity replacement. -/
 theorem MachineState.withCalleeCtx_self (s : MachineState) :
     MachineState.mapMem
-        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls) s =
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls) s =
       s := rfl
 
 /--
 **Statement frame preservation**: a `Statement.calleeQueryFree` statement never changes
-`Memory.callees`, `Memory.activeCallee`, or `Memory.callStack` in any successor.
+`Memory.callees`, `Memory.activeCallee`, or `Memory.traitImpls` in any successor. (It may
+update a suspended caller frame's `frame.locals` through a dereferencing write, but never a
+saved frame's body: `evalStmt_callerBodies`.)
 -/
 theorem evalStmt_calleeCtx_preserved (s : MachineState) (stmt : Statement)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (h_free : Statement.calleeQueryFree stmt = true) :
     evalStmt s stmt localDecls layouts =
       MirStepNode.mapMem
-        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls)
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
         (evalStmt s stmt localDecls layouts) := by
-  have h := evalStmt_withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls
+  have h := evalStmt_withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls
     s stmt localDecls layouts h_free
   rw [MachineState.withCalleeCtx_self] at h
   exact h
@@ -14787,7 +15065,7 @@ theorem evalStmt_withCallees (c₂ : CalleeEnv) (s : MachineState) (stmt : State
     evalStmt (MachineState.mapMem (Memory.withCallees c₂) s) stmt localDecls layouts =
       MirStepNode.mapMem (Memory.withCallees c₂) (evalStmt s stmt localDecls layouts) := by
   rw [MachineState.withCallees_eq_withCalleeCtx,
-    evalStmt_withCalleeCtx _ _ _ _ s stmt localDecls layouts h_free,
+    evalStmt_withCalleeCtx _ _ _ s stmt localDecls layouts h_free,
     evalStmt_calleeCtx_preserved s stmt localDecls layouts h_free,
     MirStepNode.mapMem_comp, MirStepNode.mapMem_comp, Memory.withCallees_comp_withCalleeCtx]
 
@@ -14952,11 +15230,11 @@ theorem checkCalleeSig_eq_of_findCallee_eq_of_no_traitImpl {c₁ c₂ : CalleeEn
 /-- `internFnPtr` depends only on `Memory.fnPtrs` and `Memory.nextTag`, so it commutes with
 `Memory.withCalleeCtx`. -/
 theorem internFnPtr_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry := [])
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry := [])
     (mem : Memory) (defPath : DefPath) (typeArgs : List RigidTy) (fnSig : Option RigidTy) :
-    internFnPtr (Memory.withCalleeCtx c ac cs ti mem) defPath typeArgs fnSig =
+    internFnPtr (Memory.withCalleeCtx c ac ti mem) defPath typeArgs fnSig =
       let (allocId, mem') := internFnPtr mem defPath typeArgs fnSig
-      (allocId, Memory.withCalleeCtx c ac cs ti mem') := by
+      (allocId, Memory.withCalleeCtx c ac ti mem') := by
   unfold internFnPtr
   dsimp only [Memory.withCalleeCtx]
   cases findFnPtrEntry? mem.fnPtrs defPath typeArgs fnSig <;> rfl
@@ -15080,6 +15358,136 @@ private theorem nodeCC_unwind (c : CalleeEnv) (s : MachineState) (l : List Local
 @[simp] theorem Memory.withCallees_activeProtectors (c : CalleeEnv) (m : Memory) :
     (Memory.withCallees c m).activeProtectors = m.activeProtectors := rfl
 
+theorem commitForeignFrameLocals_withCallees (c : CalleeEnv) (m : Memory)
+    (t : ForeignFrameTarget) (l : List LocalSlot) :
+    commitForeignFrameLocals { m with callees := c } t l =
+      (commitForeignFrameLocals m t l).map (Memory.withCallees c) := by
+  cases t with
+  | callerReferent _ => rfl
+  | savedFrame idx _ =>
+    unfold commitForeignFrameLocals
+    dsimp only
+    cases get? m.callStack idx with
+    | none => rfl
+    | some sf =>
+      dsimp only
+      cases set? m.callStack idx { sf with frame := { sf.frame with locals := l } } <;> rfl
+
+theorem foreignFrameDerefWrite_withCallees (c : CalleeEnv) (locals₁ : List LocalSlot)
+    (mem₁ : Memory) (dst : Place) (restProj : List ProjectionElem) (val : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    foreignFrameDerefWrite locals₁ { mem₁ with callees := c } dst restProj val localDecls layouts =
+      FrameWriteResult.mapMem (Memory.withCallees c)
+        (foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold foreignFrameDerefWrite
+  dsimp only
+  repeat' (first | rfl | split)
+  all_goals (
+    simp only [commitForeignFrameLocals_withCallees] at *
+    simp only [*, Option.map] at *
+    first
+    | (simp at *; done)
+    | (simp only [Option.some.injEq] at *; subst_vars; rfl))
+
+/-- The caller-frame write of `TerminatorKind.return_` (`writeReturnDestination`) commutes
+with `Memory.withCallees`. -/
+theorem writeReturnDestination_withCallees (c : CalleeEnv) (callerLocals : List LocalSlot)
+    (mem : Memory) (dst : Place) (retVal : Value) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    writeReturnDestination callerLocals { mem with callees := c } dst retVal localDecls layouts =
+      FrameWriteResult.mapMem (Memory.withCallees c)
+        (writeReturnDestination callerLocals mem dst retVal localDecls layouts) := by
+  unfold writeReturnDestination
+  dsimp only
+  repeat' (first | rfl | split)
+  all_goals (
+    try simp only [foreignFrameDerefWrite_withCallees] at *
+    try simp only [*, FrameWriteResult.mapMem] at *
+    try (simp at *; done)
+    try (simp only [FrameWriteResult.ok.injEq] at *
+         obtain ⟨h₁, h₂⟩ := ‹_ ∧ _›
+         subst_vars
+         rfl))
+
+/-- The memory with which `TerminatorKind.return_` resumes `caller` before
+`writeReturnDestination`: the returning frame torn down (`disableFrameBorrows`), `caller`
+popped, and its protectors restored. -/
+def ccReturnCallerMem (s : MachineState) (caller : SavedCallerFrame)
+    (restStack : List SavedCallerFrame) : Memory :=
+  { s.memory with
+    borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+      (length s.frame.locals)
+    callStack := restStack
+    activeCallee := .some caller.callerBody
+    activeProtectors := restoreCallerProtectors caller }
+
+/-- `TerminatorKind.return_` arm of `evalTerminator`, with the resumed caller's memory
+named by `ccReturnCallerMem` (`ccEvalReturn_eq`). -/
+def ccEvalReturn (s : MachineState) : MirStepNode :=
+  match get? s.frame.locals 0 with
+  | .some (.init retVal) =>
+    match hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length s.memory.callStack) (length s.frame.locals) with
+    | true => MirStepNode.fail .ub
+    | false =>
+      match s.memory.callStack with
+      | .nil =>
+        MirStepNode.retNormal retVal
+          { s.memory with
+            borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+              (length s.frame.locals) }
+      | caller :: restStack =>
+        match caller.isDiverging with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match writeReturnDestination caller.frame.locals (ccReturnCallerMem s caller restStack)
+              caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts with
+          | .ok updatedCallerLocals mem' =>
+            MirStepNode.step {
+              frame := { caller.frame with
+                blockIdx := caller.returnTarget, stmtIdx := 0, locals := updatedCallerLocals }
+              memory := mem' }
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+  | _ => MirStepNode.fail .ub
+
+theorem ccEvalReturn_eq (s : MachineState) (span : String) (cb : Option CapturedMir) :
+    evalTerminator s ⟨.return_, span⟩ cb = ccEvalReturn s := rfl
+
+/-- `writeReturnDestination_withCallees` at the resumed caller's memory: under
+`Memory.withCallees c₂` that memory is `{ ccReturnCallerMem s caller restStack with callees := c₂ }`. -/
+theorem writeReturnDestination_ccReturnCallerMem_withCallees (c₂ : CalleeEnv) (s : MachineState)
+    (caller : SavedCallerFrame) (restStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot) (dst : Place) (retVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    writeReturnDestination callerLocals
+        (ccReturnCallerMem (MachineState.mapMem (Memory.withCallees c₂) s) caller restStack)
+        dst retVal localDecls layouts =
+      FrameWriteResult.mapMem (Memory.withCallees c₂)
+        (writeReturnDestination callerLocals (ccReturnCallerMem s caller restStack) dst retVal
+          localDecls layouts) :=
+  writeReturnDestination_withCallees c₂ callerLocals (ccReturnCallerMem s caller restStack) dst
+    retVal localDecls layouts
+
+/-- `TerminatorKind.return_` narrowing: the frame teardown, protector check, and caller
+write never consult `Memory.callees`. -/
+theorem evalTerminator_return_withCallees (c₂ : CalleeEnv) (s : MachineState) (span : String)
+    (cb : Option CapturedMir) :
+    evalTerminator (MachineState.mapMem (Memory.withCallees c₂) s) ⟨.return_, span⟩ cb =
+      MirStepNode.mapMem (Memory.withCallees c₂) (evalTerminator s ⟨.return_, span⟩ cb) := by
+  rw [ccEvalReturn_eq, ccEvalReturn_eq]
+  unfold ccEvalReturn
+  simp only [writeReturnDestination_ccReturnCallerMem_withCallees]
+  dsimp only [MachineState.mapMem, Memory.withCallees]
+  repeat' (first | exact nodeCC_fail | rfl | split)
+  all_goals (
+    try simp only [*, FrameWriteResult.mapMem] at *
+    try (simp at *; done)
+    try (simp only [FrameWriteResult.ok.injEq] at *
+         obtain ⟨h₁, h₂⟩ := ‹_ ∧ _›
+         subst_vars
+         rfl))
+
 theorem evalDirectRustIntrinsic?_eq_none_of_classify {s : MachineState}
     {currentBody : Option CapturedMir} {target : ResolvedCallTarget}
     {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable} {argOps : List Operand}
@@ -15092,53 +15500,86 @@ theorem evalDirectRustIntrinsic?_eq_none_of_classify {s : MachineState}
   rw [h]
 
 theorem writeIntrinsicReturn_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (locals' : List LocalSlot) (destination : Place)
     (targetBb : BasicBlockIdx) (retVal : Value) :
-    writeIntrinsicReturn (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+    writeIntrinsicReturn (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         locals' destination targetBb retVal =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (writeIntrinsicReturn s locals' destination targetBb retVal) := by
-  unfold writeIntrinsicReturn
+  unfold writeIntrinsicReturn invalidateDirectDestWriteBorrows
   dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
-  cases writePlaceValue locals' s.memory.borrows destination retVal <;> rfl
+  repeat' (first | exact stepCtx_fail | exact stepCtx_step rfl | split)
+  all_goals (
+    simp only [foreignFrameDerefWrite_withCalleeCtx'] at *
+    simp only [*, FrameWriteResult.mapMem] at *
+    first
+    | (simp at *; done)
+    | (simp only [FrameWriteResult.ok.injEq] at *
+       obtain ⟨h₁, h₂⟩ := ‹_ ∧ _›
+       subst_vars
+       rfl))
 
 theorem writeIntrinsicScalarResult_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (s : MachineState) (locals' : List LocalSlot) (destination : Place)
     (targetBb : BasicBlockIdx) (resOpt : Option ScalarInt) :
-    writeIntrinsicScalarResult (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+    writeIntrinsicScalarResult (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         locals' destination targetBb resOpt =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (writeIntrinsicScalarResult s locals' destination targetBb resOpt) := by
   cases resOpt with
   | none => rfl
   | some sc =>
-    exact writeIntrinsicReturn_withCalleeCtx c ac cs ti s locals' destination targetBb (.scalar sc)
+    exact writeIntrinsicReturn_withCalleeCtx c ac ti s locals' destination targetBb (.scalar sc)
+
+theorem writeIntrinsicReturn_calleeCtx_preserved
+    (s : MachineState) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (retVal : Value) :
+    writeIntrinsicReturn s locals' destination targetBb retVal =
+      MirStepNode.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+        (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  have h := writeIntrinsicReturn_withCalleeCtx
+    s.memory.callees s.memory.activeCallee s.memory.traitImpls s locals' destination targetBb retVal
+  rw [MachineState.withCalleeCtx_self] at h
+  exact h
+
+theorem writeIntrinsicReturn_withCallees
+    (c₂ : CalleeEnv) (s : MachineState) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (retVal : Value) :
+    writeIntrinsicReturn (MachineState.mapMem (Memory.withCallees c₂) s)
+        locals' destination targetBb retVal =
+      MirStepNode.mapMem (Memory.withCallees c₂)
+        (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  rw [MachineState.withCallees_eq_withCalleeCtx,
+    writeIntrinsicReturn_withCalleeCtx _ _ _ s locals' destination targetBb retVal,
+    writeIntrinsicReturn_calleeCtx_preserved s locals' destination targetBb retVal,
+    MirStepNode.mapMem_comp, MirStepNode.mapMem_comp, Memory.withCallees_comp_withCalleeCtx]
 
 theorem evalNonSelectIntrinsicCall_withCalleeCtx
-    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame) (ti : List TraitImplEntry)
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
     (kind : RustIntrinsicKind) (s : MachineState)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
     (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
     (destination : Place) (targetBb : BasicBlockIdx) :
-    evalNonSelectIntrinsicCall kind (MachineState.mapMem (Memory.withCalleeCtx c ac cs ti) s)
+    evalNonSelectIntrinsicCall kind (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
         target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb) := by
   have hMissing : intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti)
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
         (intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps) := by
     unfold intrinsicMissingPointeeStep
     repeat' (first | exact nodeCC_fail | rfl | split)
   have hUnres : ∀ pt, intrinsicUnresolvedLayoutStep pt =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti) (intrinsicUnresolvedLayoutStep pt) := by
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti) (intrinsicUnresolvedLayoutStep pt) := by
     intro pt
     unfold intrinsicUnresolvedLayoutStep
     repeat' (first | exact nodeCC_fail | rfl | split)
   have hWide : ∀ pt, intrinsicWidePointeeStep pt =
-      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs ti) (intrinsicWidePointeeStep pt) := by
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti) (intrinsicWidePointeeStep pt) := by
     intro pt
     unfold intrinsicWidePointeeStep
     repeat' (first | exact nodeCC_fail | rfl | split)
@@ -15191,11 +15632,11 @@ theorem evalNonSelectIntrinsicCall_calleeCtx_preserved
     evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
         argOps argVals locals' destination targetBb =
       MirStepNode.mapMem
-        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls)
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
         (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb) := by
   have h := evalNonSelectIntrinsicCall_withCalleeCtx
-    s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls
+    s.memory.callees s.memory.activeCallee s.memory.traitImpls
     kind s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
   rw [MachineState.withCalleeCtx_self] at h
   exact h
@@ -15211,7 +15652,7 @@ theorem evalNonSelectIntrinsicCall_withCallees
         (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb) := by
   rw [MachineState.withCallees_eq_withCalleeCtx,
-    evalNonSelectIntrinsicCall_withCalleeCtx _ _ _ _ kind s target bodyLocalDecls bodyLayouts
+    evalNonSelectIntrinsicCall_withCalleeCtx _ _ _ kind s target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb,
     evalNonSelectIntrinsicCall_calleeCtx_preserved kind s target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb,
@@ -15273,11 +15714,7 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
     rw [unwindFromCallStack_withCallees]
     cases unwindFromCallStack s.memory.callStack s.memory <;> rfl
   | unwindTerminate => rfl
-  | return_ =>
-    unfold evalTerminator
-    dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory, Memory.withCallees_borrows,
-      Memory.withCallees_callStack]
-    repeat' (first | exact nodeCC_fail | rfl | split)
+  | return_ => exact evalTerminator_return_withCallees c₂ s span (some cur)
   | unreachable => rfl
   | drop place target unwind =>
     unfold evalTerminator
@@ -15309,7 +15746,7 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals with
+            s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -15323,6 +15760,7 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
               cur.layouts argOps argVals locals' destination targetBb unwind <;>
             repeat' (first
               | exact nodeCC_fail | rfl
+              | exact writeIntrinsicReturn_withCallees c₂ s _ _ _ _
               | split)
     | none =>
       unfold evalTerminator
@@ -15339,7 +15777,7 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals with
+            s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -15368,7 +15806,7 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
       obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
       dsimp only
       cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals (callStack := s.memory.callStack) with
       | ub => rfl
       | unsupported => rfl
       | ok argVals locals' =>
@@ -15996,19 +16434,1120 @@ theorem nodeSuccs_of_fixed {P : MachineState → Prop} {g : Memory → Memory} {
       | faulted _ => intro _; trivial
     · trivial
 
+/--
+`cs'` keeps the `callerBody` of every saved frame of `cs`, in order. Statements, intrinsic
+result writes, and the caller write of `TerminatorKind.return_` may update a suspended
+frame's `frame.locals` (`commitForeignFrameLocals` / `writeFrameLocalSlot`, a
+dereferencing write through a pointer into a caller frame) but never its body.
+-/
+def CallerBodiesEq (cs cs' : List SavedCallerFrame) : Prop :=
+  cs'.map SavedCallerFrame.callerBody = cs.map SavedCallerFrame.callerBody
+
+theorem CallerBodiesEq.mem {cs cs' : List SavedCallerFrame} (h : CallerBodiesEq cs cs')
+    {f : SavedCallerFrame} (hf : f ∈ cs') : ∃ f₀, f₀ ∈ cs ∧ f₀.callerBody = f.callerBody := by
+  have hm : f.callerBody ∈ cs'.map SavedCallerFrame.callerBody := List.mem_map.mpr ⟨f, hf, rfl⟩
+  unfold CallerBodiesEq at h
+  rw [h] at hm
+  exact List.mem_map.mp hm
+
+/-! ## Statements and intrinsic / return writes keep every saved caller body
+
+Statement evaluation, inline intrinsic calls, and the return-destination write change the
+call stack only through `commitForeignFrameLocals` / `writeFrameLocalSlot`, which rewrite a
+saved frame's `frame.locals` and nothing else: every saved `callerBody` is unchanged. -/
+
+theorem CallerBodiesEq.refl (cs : List SavedCallerFrame) : CallerBodiesEq cs cs := rfl
+
+theorem CallerBodiesEq.trans {a b c : List SavedCallerFrame} (h₁ : CallerBodiesEq a b)
+    (h₂ : CallerBodiesEq b c) : CallerBodiesEq a c :=
+  Eq.trans h₂ h₁
+
+theorem CallerBodiesEq.of_eq {cs cs' : List SavedCallerFrame} (h : cs' = cs) :
+    CallerBodiesEq cs cs' :=
+  h ▸ rfl
+
+private theorem ns_fail {P : MachineState → Prop} {fk : FailureKind} :
+    NodeSuccs P (MirStepNode.fail fk) := trivial
+
+private theorem ns_unsupported {P : MachineState → Prop} :
+    NodeSuccs P MirStepNode.unsupported := trivial
+
+private theorem ns_step {P : MachineState → Prop} {st : MachineState} (h : P st) :
+    NodeSuccs P (MirStepNode.step st) := h
+
+/-- Replacing a saved frame by one with the same `callerBody` keeps the caller bodies. -/
+private theorem callerBodiesEq_set {xs ys : List SavedCallerFrame} {i : Nat}
+    {sf y : SavedCallerFrame} (hget : get? xs i = some sf) (hset : set? xs i y = some ys)
+    (hy : y.callerBody = sf.callerBody) : CallerBodiesEq xs ys := by
+  unfold set? at hset
+  unfold get? at hget
+  split at hset
+  · rename_i hlt
+    cases hset
+    unfold CallerBodiesEq
+    rw [List.map_set]
+    have hx : xs[i] = sf := by
+      rw [List.getElem?_eq_getElem hlt] at hget
+      exact Option.some.inj hget
+    have hlt' : i < (xs.map SavedCallerFrame.callerBody).length := by simpa using hlt
+    have hmi : (xs.map SavedCallerFrame.callerBody)[i]'hlt' = y.callerBody := by
+      rw [List.getElem_map, hx, hy]
+    rw [← hmi, List.set_getElem_self]
+  · cases hset
+
+theorem commitForeignFrameLocals_callerBodies {mem mem' : Memory} {target : ForeignFrameTarget}
+    {locals' : List LocalSlot} (h : commitForeignFrameLocals mem target locals' = some mem') :
+    CallerBodiesEq mem.callStack mem'.callStack := by
+  unfold commitForeignFrameLocals at h
+  split at h
+  · cases h
+    exact CallerBodiesEq.refl _
+  · split at h
+    · rename_i sf hget
+      split at h
+      · rename_i cs' hset
+        cases h
+        exact callerBodiesEq_set hget hset rfl
+      · cases h
+    · cases h
+
+theorem writeFrameLocalSlot_callerBodies {locals locals' : List LocalSlot}
+    {cs cs' : List SavedCallerFrame} {cl cl' : List LocalSlot} {d loc : Nat} {slot : LocalSlot}
+    (h : writeFrameLocalSlot locals cs cl d loc slot = some (locals', cs', cl')) :
+    CallerBodiesEq cs cs' := by
+  unfold writeFrameLocalSlot at h
+  split at h
+  · split at h
+    · cases h
+      exact CallerBodiesEq.refl _
+    · cases h
+  · split at h
+    · split at h
+      · rename_i frameLocals' sf _ hget
+        split at h
+        · rename_i cs'' hset
+          cases h
+          exact callerBodiesEq_set hget hset rfl
+        · cases h
+      · cases h
+    · split at h
+      · cases h
+        exact CallerBodiesEq.refl _
+      · cases h
+    · cases h
+
+private theorem commitForeignFrameLocals_callerBodies' {mem mem₂ : Memory}
+    {target : ForeignFrameTarget} {locals' : List LocalSlot} {cs : List SavedCallerFrame}
+    (h : commitForeignFrameLocals mem target locals' = some mem₂) (hcs : cs = mem₂.callStack) :
+    CallerBodiesEq mem.callStack cs :=
+  hcs ▸ commitForeignFrameLocals_callerBodies h
+
+theorem foreignFrameDerefWrite_callerBodies {locals₁ locals₂ : List LocalSlot}
+    {mem₁ mem₂ : Memory} {dst : Place} {restProj : List ProjectionElem} {val : Value}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (h : foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts =
+      .ok locals₂ mem₂) :
+    CallerBodiesEq mem₁.callStack mem₂.callStack := by
+  unfold foreignFrameDerefWrite at h
+  repeat' (first
+    | (cases h; done)
+    | (cases h; exact commitForeignFrameLocals_callerBodies' (by assumption) (by rfl))
+    | split at h
+    | (dsimp only at h))
+
+/-- **The return-destination write keeps every saved caller body.** -/
+theorem writeReturnDestination_callerBodies {callerLocals : List LocalSlot} {mem : Memory}
+    {dst : Place} {retVal : Value} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {locals' : List LocalSlot} {mem' : Memory}
+    (h : writeReturnDestination callerLocals mem dst retVal localDecls layouts = .ok locals' mem') :
+    CallerBodiesEq mem.callStack mem'.callStack := by
+  unfold writeReturnDestination at h
+  repeat' (first
+    | (cases h; done)
+    | (cases h; exact CallerBodiesEq.refl _)
+    | exact foreignFrameDerefWrite_callerBodies h
+    | split at h
+    | (dsimp only at h))
+
+/-! ### `evalRvalue` never changes the call stack -/
+
+/-- `r` can only succeed with a memory whose call stack is `cs`. -/
+def RvCS (cs : List SavedCallerFrame) : RvalueEvalResult → Prop
+  | .ok _ _ m => m.callStack = cs
+  | _ => True
+
+private theorem rvCS_ub {cs : List SavedCallerFrame} : RvCS cs .ub := trivial
+
+private theorem rvCS_unsupported {cs : List SavedCallerFrame} : RvCS cs .unsupported := trivial
+
+private theorem rvCS_ok {cs : List SavedCallerFrame} {v : Value} {l : List LocalSlot}
+    {m : Memory} (h : m.callStack = cs) : RvCS cs (.ok v l m) := h
+
+theorem RvCS.callStack_eq {cs : List SavedCallerFrame} {r : RvalueEvalResult} (h : RvCS cs r)
+    {v : Value} {l : List LocalSlot} {m : Memory} (hr : r = .ok v l m) : m.callStack = cs := by
+  subst hr
+  exact h
+
+theorem evalUnsafeFnPointer_rvCS (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalUnsafeFnPointer locals op targetTy mem localDecls layouts) := by
+  unfold evalUnsafeFnPointer
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem deriveStackElemThinPtr_rvCS (locals : List LocalSlot) (mem : Memory)
+    (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry) (elemCountOpt : Option Nat)
+    (ptrBytes : Nat) :
+    RvCS mem.callStack
+      (deriveStackElemThinPtr locals mem ptrVal parentEntry elemCountOpt ptrBytes) := by
+  unfold deriveStackElemThinPtr
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalUnsizeCoercion_rvCS (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalUnsizeCoercion locals op targetTy mem localDecls layouts) := by
+  unfold evalUnsizeCoercion
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalSliceFatPtrDerefBorrow_rvCS (locals : List LocalSlot) (mem : Memory)
+    (parentPtr : ProvenancePtr) (ptrSz : Nat) (lenSc : ScalarInt)
+    (restProj : List ProjectionElem) (perm : TreeBorrowPerm) (isMut : Bool)
+    (pointeeTyOpt : Option Ty) (layouts : LayoutTable) (checkPerm : Bool)
+    (localDecls : List LocalDecl) (accessedTyOpt : Option Ty) (checkResultRefAlign : Bool) :
+    RvCS mem.callStack
+      (evalSliceFatPtrDerefBorrow locals mem parentPtr ptrSz lenSc restProj perm isMut
+        pointeeTyOpt layouts checkPerm localDecls accessedTyOpt checkResultRefAlign) := by
+  unfold evalSliceFatPtrDerefBorrow
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalGlobalThinPtrDerefBorrow_rvCS (locals : List LocalSlot) (mem : Memory)
+    (alloc : CapturedAllocation) (parentPtr : ProvenancePtr) (ptrSz : Nat)
+    (restProj : List ProjectionElem) (isMut : Bool) (pointeeTyOpt : Option Ty)
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (rawPtrMode : Bool)
+    (accessedTyOpt : Option Ty) :
+    RvCS mem.callStack
+      (evalGlobalThinPtrDerefBorrow locals mem alloc parentPtr ptrSz restProj isMut
+        pointeeTyOpt layouts localDecls rawPtrMode accessedTyOpt) := by
+  unfold evalGlobalThinPtrDerefBorrow
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalScalarSliceFatPtrDerefRaw_rvCS (locals : List LocalSlot) (mem : Memory)
+    (addrSc lenSc : ScalarInt) (restProj : List ProjectionElem) (pointeeTyOpt : Option Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack
+      (evalScalarSliceFatPtrDerefRaw locals mem addrSc lenSc restProj pointeeTyOpt localDecls
+        layouts) := by
+  unfold evalScalarSliceFatPtrDerefRaw
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalScalarPtrOffsetBinOp_rvCS (locals₂ : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsOp : Operand)
+    (lhs rhs : ScalarInt) :
+    RvCS mem.callStack
+      (evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs) := by
+  unfold evalScalarPtrOffsetBinOp
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalPtrOffsetBinOp_rvCS (locals₂ : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsOp : Operand)
+    (ptrVal : ProvenancePtr) (sz : Nat) (offsetSc : ScalarInt) :
+    RvCS mem.callStack
+      (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc) := by
+  unfold evalPtrOffsetBinOp
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalPlaceLen_rvCS (locals : List LocalSlot) (place : Place) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalPlaceLen locals place mem localDecls layouts) := by
+  unfold evalPlaceLen
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalPlaceDiscriminant_rvCS (val : Value) (locals' : List LocalSlot) (mem : Memory)
+    (place : Place) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalPlaceDiscriminant val locals' mem place localDecls layouts) := by
+  unfold evalPlaceDiscriminant
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem internFnPtr_callStack (mem : Memory) (defPath : DefPath) (typeArgs : List RigidTy)
+    (fnSig : Option RigidTy) : (internFnPtr mem defPath typeArgs fnSig).2.callStack =
+      mem.callStack := by
+  unfold internFnPtr
+  split <;> rfl
+
+private theorem internFnPtr_callStack' {mem mem' : Memory} {defPath : DefPath}
+    {typeArgs : List RigidTy} {fnSig : Option RigidTy} {a : AllocId}
+    (h : internFnPtr mem defPath typeArgs fnSig = (a, mem')) : mem'.callStack = mem.callStack := by
+  have := internFnPtr_callStack mem defPath typeArgs fnSig
+  rw [h] at this
+  exact this
+
+theorem evalReifyFnPointer_rvCS (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (coercionKind : String) :
+    RvCS mem.callStack
+      (evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind) := by
+  unfold evalReifyFnPointer
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalUnsizeCoercion_rvCS ..
+      | exact deriveStackElemThinPtr_rvCS ..
+      | exact evalUnsafeFnPointer_rvCS ..
+      | exact rvCS_ok (internFnPtr_callStack' (by assumption)))
+    | (dsimp only))
+
+theorem evalFnPtrToPtr_rvCS (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalFnPtrToPtr locals op targetTy mem localDecls layouts) := by
+  unfold evalFnPtrToPtr
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalByteCast_rvCS (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalByteCast locals op targetTy mem localDecls layouts) := by
+  unfold evalByteCast
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+  all_goals try dsimp (config := { zeta := true })
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalSignedDiv_rvCS (a b sz : Nat) (locals : List LocalSlot) (mem : Memory) :
+    RvCS mem.callStack (evalSignedDiv a b sz locals mem) := by
+  unfold evalSignedDiv
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalSignedRem_rvCS (a b sz : Nat) (locals : List LocalSlot) (mem : Memory) :
+    RvCS mem.callStack (evalSignedRem a b sz locals mem) := by
+  unfold evalSignedRem
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalScalarBinOp_rvCS (op : BinOp) (lhs rhs : ScalarInt) (locals : List LocalSlot)
+    (mem : Memory) (isSigned : Bool) :
+    RvCS mem.callStack (evalScalarBinOp op lhs rhs locals mem isSigned) := by
+  unfold evalScalarBinOp
+  cases Nat.beq lhs.sizeBytes 0 with
+  | true => exact rvCS_unsupported
+  | false =>
+    dsimp only
+    cases op <;> dsimp only
+    all_goals
+      repeat' (first
+        | split
+        | with_reducible (first
+          | exact rvCS_ub
+          | exact rvCS_unsupported
+          | exact rvCS_ok rfl
+          | exact evalSignedDiv_rvCS ..
+          | exact evalSignedRem_rvCS ..)
+        | (dsimp only))
+
+theorem evalUnaryNot_rvCS (sc : ScalarInt) (optTy : Option Ty) (locals : List LocalSlot)
+    (mem : Memory) :
+    RvCS mem.callStack (evalUnaryNot sc optTy locals mem) := by
+  unfold evalUnaryNot
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalRvalueRefDeref_rvCS (locals : List LocalSlot) (borrowKind : BorrowKind)
+    (place : Place) (restProj : List ProjectionElem) (perm : TreeBorrowPerm) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack
+      (evalRvalueRefDeref locals borrowKind place restProj perm mem localDecls layouts) := by
+  unfold evalRvalueRefDeref
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalSliceFatPtrDerefBorrow_rvCS ..
+      | exact evalGlobalThinPtrDerefBorrow_rvCS ..))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalSliceFatPtrDerefBorrow_rvCS ..
+      | exact evalGlobalThinPtrDerefBorrow_rvCS ..)
+    | (dsimp only))
+
+theorem evalRvalueRawPtr_rvCS (locals : List LocalSlot) (mutability : Mutability)
+    (place : Place) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalRvalueRawPtr locals mutability place mem localDecls layouts) := by
+  unfold evalRvalueRawPtr
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalSliceFatPtrDerefBorrow_rvCS ..
+      | exact evalGlobalThinPtrDerefBorrow_rvCS ..
+      | exact evalScalarSliceFatPtrDerefRaw_rvCS ..))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalSliceFatPtrDerefBorrow_rvCS ..
+      | exact evalGlobalThinPtrDerefBorrow_rvCS ..
+      | exact evalScalarSliceFatPtrDerefRaw_rvCS ..)
+    | (dsimp only))
+
+theorem evalCastPtrToPtr_rvCS (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalCastPtrToPtr locals op targetTy mem localDecls layouts) := by
+  unfold evalCastPtrToPtr
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact deriveStackElemThinPtr_rvCS ..)
+    | (dsimp only))
+
+theorem evalPointerExposeProvenance_rvCS (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack
+      (evalPointerExposeProvenance locals op targetTy mem localDecls layouts) := by
+  unfold evalPointerExposeProvenance
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalPointerWithExposedProvenance_rvCS (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack
+      (evalPointerWithExposedProvenance locals op targetTy mem localDecls layouts) := by
+  unfold evalPointerWithExposedProvenance
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalAggregateRawPtr_rvCS (locals : List LocalSlot) (pointeeTy : Ty)
+    (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts) := by
+  unfold evalAggregateRawPtr
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalAggregateAdt_rvCS (locals : List LocalSlot) (defPath : DefPath)
+    (variantIdx : VariantIdx) (activeField : Option FieldIdx) (ops : List Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack
+      (evalAggregateAdt locals defPath variantIdx activeField ops mem localDecls layouts) := by
+  unfold evalAggregateAdt
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalFloatCastRvalue_rvCS (locals : List LocalSlot) (kind : CastKind) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalFloatCastRvalue locals kind op targetTy mem localDecls layouts) := by
+  unfold evalFloatCastRvalue
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalUnaryPtrMetadata_rvCS (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalUnaryPtrMetadata locals op mem localDecls layouts) := by
+  unfold evalUnaryPtrMetadata
+  repeat' (first
+    | split
+    | with_reducible (first | exact rvCS_ub | exact rvCS_unsupported | exact rvCS_ok rfl)
+    | (dsimp only))
+
+theorem evalWidePtrRelBinOp_rvCS (op : BinOp) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (locals₂ : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (ptrBytes : Nat) :
+    RvCS mem.callStack
+      (evalWidePtrRelBinOp op lhsThin lhsMeta rhsThin rhsMeta locals₂ mem localDecls layouts
+        ptrBytes) := by
+  unfold evalWidePtrRelBinOp
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalScalarBinOp_rvCS ..)
+    | (dsimp only))
+
+theorem evalWidePtrAggregateRelBinOp_rvCS (op : BinOp) (lhsOp : Operand) (lhsVar : Nat)
+    (lhsFields : List Value) (rhsVar : Nat) (rhsFields : List Value) (locals₂ : List LocalSlot)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack
+      (evalWidePtrAggregateRelBinOp op lhsOp lhsVar lhsFields rhsVar rhsFields locals₂ mem
+        localDecls layouts) := by
+  unfold evalWidePtrAggregateRelBinOp
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalWidePtrRelBinOp_rvCS ..
+      | exact evalScalarBinOp_rvCS ..)
+    | (dsimp only))
+
+/-- `evalRvalue` never changes `Memory.callStack`. -/
+theorem evalRvalue_rvCS (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvCS mem.callStack (evalRvalue locals rv mem localDecls layouts) := by
+  unfold evalRvalue
+  repeat' (first
+    | extract_lets
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalRvalueRefDeref_rvCS ..
+      | exact evalRvalueRawPtr_rvCS ..
+      | exact evalPlaceLen_rvCS ..
+      | exact evalReifyFnPointer_rvCS ..
+      | exact evalFnPtrToPtr_rvCS ..
+      | exact evalCastPtrToPtr_rvCS ..
+      | exact evalPointerExposeProvenance_rvCS ..
+      | exact evalPointerWithExposedProvenance_rvCS ..
+      | exact evalByteCast_rvCS ..
+      | exact evalFloatCastRvalue_rvCS ..
+      | exact evalScalarPtrOffsetBinOp_rvCS ..
+      | exact evalPtrOffsetBinOp_rvCS ..
+      | exact evalScalarBinOp_rvCS ..
+      | exact evalWidePtrAggregateRelBinOp_rvCS ..
+      | exact evalUnaryNot_rvCS ..
+      | exact evalUnaryPtrMetadata_rvCS ..
+      | exact evalPlaceDiscriminant_rvCS ..
+      | exact evalAggregateRawPtr_rvCS ..
+      | exact evalAggregateAdt_rvCS ..))
+  all_goals (try dsimp +zetaDelta only)
+  all_goals repeat' (first
+    | split
+    | with_reducible (first
+      | exact rvCS_ub
+      | exact rvCS_unsupported
+      | exact rvCS_ok rfl
+      | exact evalRvalueRefDeref_rvCS ..
+      | exact evalRvalueRawPtr_rvCS ..
+      | exact evalPlaceLen_rvCS ..
+      | exact evalReifyFnPointer_rvCS ..
+      | exact evalFnPtrToPtr_rvCS ..
+      | exact evalCastPtrToPtr_rvCS ..
+      | exact evalPointerExposeProvenance_rvCS ..
+      | exact evalPointerWithExposedProvenance_rvCS ..
+      | exact evalByteCast_rvCS ..
+      | exact evalFloatCastRvalue_rvCS ..
+      | exact evalScalarPtrOffsetBinOp_rvCS ..
+      | exact evalPtrOffsetBinOp_rvCS ..
+      | exact evalScalarBinOp_rvCS ..
+      | exact evalWidePtrAggregateRelBinOp_rvCS ..
+      | exact evalUnaryNot_rvCS ..
+      | exact evalUnaryPtrMetadata_rvCS ..
+      | exact evalPlaceDiscriminant_rvCS ..
+      | exact evalAggregateRawPtr_rvCS ..
+      | exact evalAggregateAdt_rvCS ..)
+    | (dsimp only))
+
+theorem evalRvalue_callStack {locals locals' : List LocalSlot} {rv : Rvalue} {mem mem' : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {v : Value}
+    (h : evalRvalue locals rv mem localDecls layouts = .ok v locals' mem') :
+    mem'.callStack = mem.callStack :=
+  (evalRvalue_rvCS locals rv mem localDecls layouts).callStack_eq h
+
+
+/-! ### Statement steps, inline intrinsics, and intrinsic return writes -/
+
+private theorem ns_advance {cs : List SavedCallerFrame} {s : MachineState} {l : List LocalSlot}
+    {M : Memory} (h : CallerBodiesEq cs M.callStack) :
+    NodeSuccs (fun s' => CallerBodiesEq cs s'.memory.callStack)
+      (MirStepNode.step (advanceStmt s l M)) := h
+
+private theorem ns_mk {cs : List SavedCallerFrame} {f : StackFrame} {M : Memory}
+    (h : CallerBodiesEq cs M.callStack) :
+    NodeSuccs (fun s' => CallerBodiesEq cs s'.memory.callStack)
+      (MirStepNode.step { frame := f, memory := M }) := h
+
+private theorem cb_of_rvalue {locals locals' : List LocalSlot} {rv : Rvalue} {mem mem' : Memory}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {v : Value} {x : List SavedCallerFrame}
+    (h : evalRvalue locals rv mem localDecls layouts = .ok v locals' mem')
+    (hx : x = mem'.callStack) : CallerBodiesEq mem.callStack x :=
+  CallerBodiesEq.of_eq (hx.trans (evalRvalue_callStack h))
+
+private theorem cb_of_writeFrameLocalSlot {locals locals' : List LocalSlot}
+    {cs cs' : List SavedCallerFrame} {cl cl' : List LocalSlot} {d loc : Nat} {slot : LocalSlot}
+    {x : List SavedCallerFrame}
+    (h : writeFrameLocalSlot locals cs cl d loc slot = some (locals', cs', cl'))
+    (hx : x = cs') : CallerBodiesEq cs x :=
+  hx ▸ writeFrameLocalSlot_callerBodies h
+
+private theorem cb_of_foreignFrameDerefWrite {locals₁ locals₂ : List LocalSlot}
+    {mem₁ mem₂ : Memory} {dst : Place} {restProj : List ProjectionElem} {val : Value}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {x : List SavedCallerFrame}
+    (h : foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts =
+      .ok locals₂ mem₂)
+    (hx : x = mem₂.callStack) : CallerBodiesEq mem₁.callStack x :=
+  hx ▸ foreignFrameDerefWrite_callerBodies h
+
+theorem invalidateDirectDestWriteBorrows_callStack (mem : Memory) (locals : List LocalSlot)
+    (dst : Place) : (invalidateDirectDestWriteBorrows mem locals dst).callStack = mem.callStack := by
+  unfold invalidateDirectDestWriteBorrows
+  try dsimp only
+  repeat' (first | rfl | split)
+
+theorem evalForeignFrameDerefWrite_callerBodies {cs : List SavedCallerFrame} (s : MachineState)
+    (locals₁ : List LocalSlot) (mem₁ : Memory) (dst : Place) (restProj : List ProjectionElem)
+    (val : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : CallerBodiesEq cs mem₁.callStack) :
+    NodeSuccs (fun s' => CallerBodiesEq cs s'.memory.callStack)
+      (evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold evalForeignFrameDerefWrite
+  split
+  · rename_i locals₂ mem₂ hw
+    exact ns_step (h.trans (foreignFrameDerefWrite_callerBodies hw))
+  · exact ns_fail
+  · exact ns_unsupported
+
+theorem evalSetDiscriminantLocal_callerBodies (s : MachineState) (loc : Local)
+    (variantIdx : Nat) (fields : List Value) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalSetDiscriminantLocal s loc variantIdx fields) := by
+  unfold evalSetDiscriminantLocal
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _))
+    | (dsimp only))
+
+theorem evalSetDiscriminantDerefWrite_callerBodies (s : MachineState)
+    (locals₁ : List LocalSlot) (p : Place) (rest : List ProjectionElem) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts) := by
+  unfold evalSetDiscriminantDerefWrite
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _)
+      | exact evalForeignFrameDerefWrite_callerBodies _ _ _ _ _ _ _ _ (CallerBodiesEq.refl _))
+    | (dsimp only))
+
+theorem evalFnEntryRetag_callerBodies (s : MachineState) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (place : Place) (ptrVal : ProvenancePtr) (sz : Nat)
+    (parentEntry : BorrowEntry) (locals' : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalFnEntryRetag s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalFnEntryRetag
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _))
+    | (dsimp only))
+
+theorem evalNonFnEntryRetag_callerBodies (retagKind : RetagKind) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (ptrVal : ProvenancePtr) (sz : Nat) (parentEntry : BorrowEntry) (locals' : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalNonFnEntryRetag retagKind s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalNonFnEntryRetag
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _))
+    | (dsimp only))
+
+theorem evalCopySingleDirect_callerBodies (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) (locals₃ : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        locals₃) := by
+  unfold evalCopySingleDirect
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _))
+    | (dsimp only))
+
+theorem commitCopyDstPlaceWrite_callerBodies (s : MachineState) (dstPlace : Place)
+    (dstTargetLocal : LocalIdx) (dstTag : Nat) (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (commitCopyDstPlaceWrite s dstPlace dstTargetLocal dstTag locals₃ newVal localDecls
+        layouts) := by
+  unfold commitCopyDstPlaceWrite
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _))
+    | (dsimp only))
+
+theorem evalCopyUnionBytes_callerBodies (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) (srcUnionOpt dstUnionOpt : Option UnionPlaceInfo)
+    (n : Nat) (locals₃ : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalCopyUnionBytes s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        srcUnionOpt dstUnionOpt n locals₃) := by
+  unfold evalCopyUnionBytes
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _)
+      | exact commitCopyDstPlaceWrite_callerBodies ..)
+    | (dsimp only))
+
+theorem evalCopyNonOverlappingPermOk_callerBodies (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) (countBits : Nat) (locals₃ : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk s src dst localDecls
+        layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _)
+      | exact evalCopySingleDirect_callerBodies ..
+      | exact evalCopyUnionBytes_callerBodies ..
+      | exact commitCopyDstPlaceWrite_callerBodies ..)
+    | (dsimp only))
+
+theorem evalForeignFrameCopySingleDirect_callerBodies (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) (countBits : Nat) (locals₃ : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalForeignFrameCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry
+        dstEntry countBits locals₃) := by
+  unfold evalForeignFrameCopySingleDirect
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _)
+      | exact ns_advance (cb_of_writeFrameLocalSlot (by assumption) (by rfl))
+      | exact ns_mk (cb_of_writeFrameLocalSlot (by assumption) (by rfl)))
+    | (dsimp only))
+
+theorem evalCopyNonOverlappingWithCount_callerBodies (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcVal dstVal : Value)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
+        locals₃) := by
+  unfold evalCopyNonOverlappingWithCount
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _)
+      | exact evalCopyNonOverlappingPermOk_callerBodies ..
+      | exact evalForeignFrameCopySingleDirect_callerBodies ..)
+    | (dsimp only))
+
+theorem evalCopyNonOverlapping_callerBodies (s : MachineState) (src dst count : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalCopyNonOverlapping s src dst count localDecls layouts) := by
+  unfold evalCopyNonOverlapping
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact evalCopyNonOverlappingWithCount_callerBodies ..)
+    | (dsimp only))
+
+/-- **Statement steps keep every saved caller body.** Every `.running` successor of
+`evalStmt s stmt` has a call stack whose saved caller bodies are those of `s` (statements
+only rewrite saved frames' locals, through `commitForeignFrameLocals` /
+`writeFrameLocalSlot`). -/
+theorem evalStmt_callerBodies (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalStmt s stmt localDecls layouts) := by
+  rcases stmt with ⟨kind, span⟩
+  cases kind with
+  | intrinsic intr =>
+    cases intr with
+    | assume op =>
+      unfold evalStmt
+      dsimp only
+      repeat' (first
+        | split
+        | with_reducible (first
+          | exact ns_fail
+          | exact ns_unsupported
+          | exact ns_advance (CallerBodiesEq.refl _)
+          | exact ns_mk (CallerBodiesEq.refl _))
+        | (dsimp only))
+    | copyNonOverlapping src dst count =>
+      unfold evalStmt
+      dsimp only
+      exact evalCopyNonOverlapping_callerBodies s src dst count localDecls layouts
+  | _ =>
+    unfold evalStmt
+    dsimp only
+    repeat' (first
+      | split
+      | with_reducible (first
+        | exact ns_fail
+        | exact ns_unsupported
+        | exact ns_advance (CallerBodiesEq.refl _)
+        | exact ns_mk (CallerBodiesEq.refl _)
+        | exact ns_advance (cb_of_rvalue (by assumption) (by rfl))
+        | exact evalFnEntryRetag_callerBodies ..
+        | exact evalNonFnEntryRetag_callerBodies ..
+        | exact evalSetDiscriminantLocal_callerBodies ..
+        | exact evalSetDiscriminantDerefWrite_callerBodies ..
+        | exact evalForeignFrameDerefWrite_callerBodies _ _ _ _ _ _ _ _ (cb_of_rvalue (by assumption) (by rfl)))
+      | (dsimp only))
+
+theorem writeIntrinsicReturn_callerBodies (s : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (retVal : Value) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  unfold writeIntrinsicReturn
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact ns_advance (CallerBodiesEq.refl _)
+      | exact ns_mk (CallerBodiesEq.refl _)
+      | exact ns_mk (cb_of_foreignFrameDerefWrite (by assumption) (by rfl))
+      | exact ns_mk (CallerBodiesEq.of_eq (invalidateDirectDestWriteBorrows_callStack ..)))
+    | (dsimp only))
+
+theorem writeIntrinsicScalarResult_callerBodies (s : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (resOpt : Option ScalarInt) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (writeIntrinsicScalarResult s locals' destination targetBb resOpt) := by
+  unfold writeIntrinsicScalarResult
+  split
+  · exact writeIntrinsicReturn_callerBodies ..
+  · exact ns_fail
+
+theorem intrinsicUnresolvedLayoutStep_callerBodies {P : MachineState → Prop} (ty : RigidTy) :
+    NodeSuccs P (intrinsicUnresolvedLayoutStep ty) := by
+  unfold intrinsicUnresolvedLayoutStep
+  split
+  · exact ns_fail
+  · exact ns_unsupported
+
+theorem intrinsicWidePointeeStep_callerBodies {P : MachineState → Prop} (ty : RigidTy) :
+    NodeSuccs P (intrinsicWidePointeeStep ty) := by
+  unfold intrinsicWidePointeeStep
+  split
+  · exact ns_unsupported
+  · exact ns_fail
+
+theorem intrinsicMissingPointeeStep_callerBodies {P : MachineState → Prop}
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand) :
+    NodeSuccs P (intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps) := by
+  unfold intrinsicMissingPointeeStep
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first | exact ns_fail | exact ns_unsupported)
+    | (dsimp only))
+
+/-- **Inline intrinsic calls keep every saved caller body.** -/
+theorem evalNonSelectIntrinsicCall_callerBodies (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalNonSelectIntrinsicCall
+  try dsimp only
+  repeat' (first
+    | split
+    | with_reducible (first
+      | exact ns_fail
+      | exact ns_unsupported
+      | exact writeIntrinsicReturn_callerBodies ..
+      | exact writeIntrinsicScalarResult_callerBodies ..
+      | exact intrinsicUnresolvedLayoutStep_callerBodies ..
+      | exact intrinsicWidePointeeStep_callerBodies ..
+      | exact intrinsicMissingPointeeStep_callerBodies ..)
+    | (dsimp only))
+
+
+theorem NodeSuccs.mono {P Q : MachineState → Prop} {n : MirStepNode}
+    (h : ∀ s, P s → Q s) (hP : NodeSuccs P n) : NodeSuccs Q n := by
+  cases n with
+  | ret _ => trivial
+  | tau st =>
+    cases st with
+    | running s' => exact h s' hP
+    | halted _ => trivial
+    | faulted _ => trivial
+  | vis e k =>
+    rcases e with fk | obs | ⟨req⟩
+    · trivial
+    · revert hP
+      show (match k PUnit.unit with
+        | .running s' => P s'
+        | _ => True) →
+        (match k PUnit.unit with
+        | .running s' => Q s'
+        | _ => True)
+      cases k PUnit.unit with
+      | running s' => exact h s'
+      | halted _ => intro _; trivial
+      | faulted _ => intro _; trivial
+    · trivial
+
+theorem NodeSuccs.and {P Q : MachineState → Prop} {n : MirStepNode}
+    (hP : NodeSuccs P n) (hQ : NodeSuccs Q n) : NodeSuccs (fun s => P s ∧ Q s) n := by
+  cases n with
+  | ret _ => trivial
+  | tau st =>
+    cases st with
+    | running s' => exact ⟨hP, hQ⟩
+    | halted _ => trivial
+    | faulted _ => trivial
+  | vis e k =>
+    rcases e with fk | obs | ⟨req⟩
+    · trivial
+    · revert hP hQ
+      show (match k PUnit.unit with
+        | .running s' => P s'
+        | _ => True) →
+        (match k PUnit.unit with
+        | .running s' => Q s'
+        | _ => True) →
+        (match k PUnit.unit with
+        | .running s' => P s' ∧ Q s'
+        | _ => True)
+      cases k PUnit.unit with
+      | running s' => exact fun hp hq => ⟨hp, hq⟩
+      | halted _ => intro _ _; trivial
+      | faulted _ => intro _ _; trivial
+    · trivial
+
+/-- `ClosedInv` transfers to any state with the same callee table and active callee
+whose saved frames keep their bodies. -/
+theorem closedInv_of_callerBodies {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
+    {s s' : MachineState} (h_inv : ClosedInv cone root c₁ s)
+    (hc : s'.memory.callees = s.memory.callees)
+    (hac : s'.memory.activeCallee = s.memory.activeCallee)
+    (hb : CallerBodiesEq s.memory.callStack s'.memory.callStack) :
+    ClosedInv cone root c₁ s' := by
+  refine ⟨hc.trans h_inv.1, hac ▸ h_inv.2.1, ?_⟩
+  intro f hf
+  obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+  exact he ▸ h_inv.2.2 f₀ hf₀
+
+/-- Successors of a step that fixes `(callees, activeCallee, traitImpls)` and keeps every
+saved frame's body preserve `ClosedInv`. -/
+theorem nodeSuccs_closedInv_of_ctx {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {s : MachineState} {n : MirStepNode}
+    (h_inv : ClosedInv cone root c₁ s)
+    (hfix : n = MirStepNode.mapMem
+      (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls) n)
+    (hb : NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack) n) :
+    NodeSuccs (ClosedInv cone root c₁) n := by
+  refine NodeSuccs.mono ?_
+    (NodeSuccs.and
+      (nodeSuccs_of_fixed (P := fun s' => s' = MachineState.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls) s')
+        hfix (fun _ h => h))
+      hb)
+  rintro s' ⟨hs', hb'⟩
+  have hm : s'.memory =
+      Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls s'.memory :=
+    congrArg MachineState.memory hs'
+  exact closedInv_of_callerBodies h_inv (by rw [hm]) (by rw [hm]) hb'
+
+/-- The caller write of `TerminatorKind.return_` commutes with `Memory.withCalleeCtx`. -/
+theorem writeReturnDestination_withCalleeCtx (c : CalleeEnv) (ac : Option CapturedMir)
+    (ti : List TraitImplEntry) (callerLocals : List LocalSlot) (mem : Memory) (dst : Place)
+    (retVal : Value) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    writeReturnDestination callerLocals (Memory.withCalleeCtx c ac ti mem) dst retVal localDecls
+        layouts =
+      FrameWriteResult.mapMem (Memory.withCalleeCtx c ac ti)
+        (writeReturnDestination callerLocals mem dst retVal localDecls layouts) := by
+  unfold writeReturnDestination
+  dsimp only [Memory.withCalleeCtx]
+  repeat' (first | rfl | split)
+  all_goals (
+    try simp only [foreignFrameDerefWrite_withCalleeCtx'] at *
+    try simp only [*, FrameWriteResult.mapMem] at *
+    try (simp at *; done)
+    try (simp only [FrameWriteResult.ok.injEq] at *
+         obtain ⟨h₁, h₂⟩ := ‹_ ∧ _›
+         subst_vars
+         rfl))
+
+/-- `writeReturnDestination` keeps `callees`, `activeCallee`, and `traitImpls`. -/
+theorem writeReturnDestination_ctx_preserved {callerLocals : List LocalSlot} {mem : Memory}
+    {dst : Place} {retVal : Value} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {locals' : List LocalSlot} {mem' : Memory}
+    (h : writeReturnDestination callerLocals mem dst retVal localDecls layouts = .ok locals' mem') :
+    mem'.callees = mem.callees ∧ mem'.activeCallee = mem.activeCallee ∧
+      mem'.traitImpls = mem.traitImpls := by
+  have hfix : writeReturnDestination callerLocals mem dst retVal localDecls layouts =
+      FrameWriteResult.mapMem
+        (Memory.withCalleeCtx mem.callees mem.activeCallee mem.traitImpls)
+        (writeReturnDestination callerLocals mem dst retVal localDecls layouts) :=
+    writeReturnDestination_withCalleeCtx mem.callees mem.activeCallee mem.traitImpls
+      callerLocals mem dst retVal localDecls layouts
+  rw [h] at hfix
+  simp only [FrameWriteResult.mapMem, FrameWriteResult.ok.injEq] at hfix
+  obtain ⟨_, hm⟩ := hfix
+  exact ⟨by rw [hm], by rw [hm], by rw [hm]⟩
+
+/-- `TerminatorKind.return_` into `caller` preserves `ClosedInv`: the resumed body is the
+popped frame's (in the cone by `ClosedInv`) and the remaining frames keep their bodies. -/
+theorem closedInv_return {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
+    {s : MachineState} {caller : SavedCallerFrame} {rest : List SavedCallerFrame}
+    {retVal : Value} {locals' : List LocalSlot} {mem' : Memory} {F : StackFrame}
+    (h_inv : ClosedInv cone root c₁ s) (h_cs : s.memory.callStack = caller :: rest)
+    (h_w : writeReturnDestination caller.frame.locals (ccReturnCallerMem s caller rest)
+      caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+        .ok locals' mem') :
+    ClosedInv cone root c₁ { frame := F, memory := mem' } := by
+  obtain ⟨hc, hac, _⟩ := writeReturnDestination_ctx_preserved h_w
+  have hb := writeReturnDestination_callerBodies h_w
+  refine ⟨hc.trans h_inv.1, ?_, ?_⟩
+  · show InConeSet cone root c₁ (mem'.activeCallee.getD root)
+    rw [hac]
+    exact h_inv.2.2 caller (by rw [h_cs]; exact List.Mem.head _)
+  · intro f hf
+    obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+    exact he ▸ h_inv.2.2 f₀ (by rw [h_cs]; exact List.Mem.tail _ hf₀)
+
 theorem nodeSuccs_evalStmt {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
     {s : MachineState} {stmt : Statement} {localDecls : List LocalDecl} {layouts : LayoutTable}
     (h_inv : ClosedInv cone root c₁ s) (h_free : Statement.calleeQueryFree stmt = true) :
-    NodeSuccs (ClosedInv cone root c₁) (evalStmt s stmt localDecls layouts) := by
-  refine nodeSuccs_of_fixed (evalStmt_calleeCtx_preserved s stmt localDecls layouts h_free) ?_
-  intro s' hs'
-  have hm : s'.memory =
-      Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls s'.memory :=
-    congrArg MachineState.memory hs'
-  refine ⟨?_, ?_, ?_⟩
-  · rw [hm]; exact h_inv.1
-  · rw [hm]; exact h_inv.2.1
-  · rw [hm]; exact h_inv.2.2
+    NodeSuccs (ClosedInv cone root c₁) (evalStmt s stmt localDecls layouts) :=
+  nodeSuccs_closedInv_of_ctx h_inv (evalStmt_calleeCtx_preserved s stmt localDecls layouts h_free)
+    (evalStmt_callerBodies s stmt localDecls layouts)
 
 theorem closedInv_unwindFromCallStack {cone : List DefPath} {root : CapturedMir}
     {c₁ : CalleeEnv} :
@@ -16069,20 +17608,6 @@ private theorem nodeSuccs_applyUnwind {cone : List DefPath} {root : CapturedMir}
     cases hs'
     exact h_inv
 
-private theorem closedInv_pop {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
-    {s : MachineState} {caller : SavedCallerFrame} {rest : List SavedCallerFrame}
-    {F : StackFrame} {prot : List Nat} (h_inv : ClosedInv cone root c₁ s)
-    (h_cs : s.memory.callStack = caller :: rest) :
-    ClosedInv cone root c₁
-      { frame := F,
-        memory := { s.memory with
-          callStack := rest
-          activeCallee := some caller.callerBody
-          activeProtectors := prot } } := by
-  refine ⟨h_inv.1, h_inv.2.2 caller (by rw [h_cs]; exact List.Mem.head _), ?_⟩
-  intro f hf
-  exact h_inv.2.2 f (by rw [h_cs]; exact List.Mem.tail _ hf)
-
 private theorem inConeSet_of_lookup {cone : List DefPath} {root : CapturedMir}
     {c₁ : CalleeEnv} {L : LayoutTable} {dp : DefPath} {ti : List TraitImplEntry}
     {b : CapturedMir} (h_dp : dp ∈ cone) (h_lk : lookupCallee c₁ L dp [] ti = some b) :
@@ -16131,17 +17656,11 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect {cone : List DefPath}
           (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
             argOps argVals locals' destination targetBb) := by
       intro k
-      refine nodeSuccs_of_fixed
+      exact nodeSuccs_closedInv_of_ctx h_inv
         (evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls bodyLayouts
-          argOps argVals locals' destination targetBb) ?_
-      intro s' hs'
-      have hm : s'.memory =
-          Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s.memory.traitImpls s'.memory :=
-        congrArg MachineState.memory hs'
-      refine ⟨?_, ?_, ?_⟩
-      · rw [hm]; exact h_inv.1
-      · rw [hm]; exact h_inv.2.1
-      · rw [hm]; exact h_inv.2.2
+          argOps argVals locals' destination targetBb)
+        (evalNonSelectIntrinsicCall_callerBodies k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
     cases kind with
     | constEvalSelect => cases h_cl
     | _ => exact h_step _
@@ -16166,9 +17685,9 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
       (closedInv_unwindFromCallStack s.memory.callStack s.memory h_inv.1 h_inv.2.2)
   | unwindTerminate => trivial
   | return_ =>
-    unfold evalTerminator
-    dsimp only
-    repeat' (first | trivial | exact closedInv_pop h_inv ‹_› | split)
+    rw [ccEvalReturn_eq]
+    unfold ccEvalReturn
+    repeat' (first | trivial | exact closedInv_return h_inv ‹_› ‹_› | split)
   | unreachable => trivial
   | drop place target unwind =>
     unfold evalTerminator
@@ -16194,7 +17713,7 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals with
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -16213,7 +17732,16 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
             dsimp only
             repeat' (first
               | trivial | exact h_inv
-              | exact nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect h_inv _ _ _ _ _ _ _ _ _ _ h_cl _ trivial
+              | exact nodeSuccs_closedInv_of_ctx h_inv (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                  (writeIntrinsicReturn_callerBodies _ _ _ _ _)
+              | exact nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect h_inv _ _ _ _ _ _ _ _ _ _ h_cl _
+                  (by
+                    repeat' (first
+                      | trivial | exact h_inv
+                      | exact nodeSuccs_closedInv_of_ctx h_inv
+                          (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                          (writeIntrinsicReturn_callerBodies _ _ _ _ _)
+                      | split))
               | split)
     | none =>
       unfold evalTerminator
@@ -16227,7 +17755,7 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals with
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -16261,7 +17789,7 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
       obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
       dsimp only
       cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals with
+          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
       | ub => trivial
       | unsupported => trivial
       | ok argVals locals' =>
@@ -16271,12 +17799,14 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
             tgt.defPath [] s.memory.traitImpls with
         | some calleeBody =>
           dsimp only
-          cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
-          | false => trivial
-          | true =>
-            rw [h_inv.1] at h_lk
-            exact ⟨h_inv.1, inConeSet_of_lookup h_dp h_lk, h_inv.2.2⟩
-        | none => trivial
+          rw [h_inv.1] at h_lk
+          repeat' (first
+            | trivial
+            | exact ⟨h_inv.1, inConeSet_of_lookup h_dp h_lk, h_inv.2.2⟩
+            | split)
+        | none =>
+          dsimp only
+          repeat' (first | trivial | split)
   | _ => trivial
 
 theorem nodeSuccs_stepMirFn {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
@@ -16634,11 +18164,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
     rw [unwindFromCallStack_withCallees]
     cases unwindFromCallStack s.memory.callStack s.memory <;> rfl
   | unwindTerminate => rfl
-  | return_ =>
-    unfold evalTerminator
-    dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory, Memory.withCallees_borrows,
-      Memory.withCallees_callStack]
-    repeat' (first | exact nodeCC_fail | rfl | split)
+  | return_ => exact evalTerminator_return_withCallees c₂ s span (some cur)
   | unreachable => rfl
   | drop place target unwind =>
     unfold evalTerminator
@@ -16670,7 +18196,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         obtain ⟨h_dp, h_no₁, h_no₂, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals with
+            s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -16684,6 +18210,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
               cur.layouts argOps argVals locals' destination targetBb unwind <;>
             repeat' (first
               | exact nodeCC_fail | rfl
+              | exact writeIntrinsicReturn_withCallees c₂ s _ _ _ _
               | split)
     | none =>
       unfold evalTerminator
@@ -16700,7 +18227,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
         obtain ⟨h_dp, h_no₁, h_no₂, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals with
+            s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -16729,7 +18256,7 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
       obtain ⟨h_dp, h_no₁, h_no₂, _⟩ := hq tgt localsAfterFunc h_res
       dsimp only
       cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals (callStack := s.memory.callStack) with
       | ub => rfl
       | unsupported => rfl
       | ok argVals locals' =>
@@ -17160,20 +18687,6 @@ private theorem nodeSuccs_applyUnwindPoly {cone : List DefPath} {root : Captured
     cases hs'
     exact h_inv
 
-private theorem closedInvPoly_pop {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
-    {ti : List TraitImplEntry} {s : MachineState} {caller : SavedCallerFrame}
-    {rest : List SavedCallerFrame} {F : StackFrame} {prot : List Nat}
-    (h_inv : ClosedInvPoly cone root c₁ ti s) (h_cs : s.memory.callStack = caller :: rest) :
-    ClosedInvPoly cone root c₁ ti
-      { frame := F,
-        memory := { s.memory with
-          callStack := rest
-          activeCallee := some caller.callerBody
-          activeProtectors := prot } } := by
-  refine ⟨h_inv.1, h_inv.2.1, h_inv.2.2.2 caller (by rw [h_cs]; exact List.Mem.head _), ?_⟩
-  intro f hf
-  exact h_inv.2.2.2 f (by rw [h_cs]; exact List.Mem.tail _ hf)
-
 private theorem closedInvPoly_push {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
     {ti : List TraitImplEntry} {s : MachineState} {saved : SavedCallerFrame}
     {b : CapturedMir} {F : StackFrame} (h_inv : ClosedInvPoly cone root c₁ ti s)
@@ -17190,22 +18703,67 @@ private theorem closedInvPoly_push {cone : List DefPath} {root : CapturedMir} {c
   | head => exact h_saved
   | tail _ hf => exact h_inv.2.2.2 f hf
 
+/-- `ClosedInvPoly` transfers to any state with the same callee table, trait-impl table,
+and active callee whose saved frames keep their bodies. -/
+theorem closedInvPoly_of_callerBodies {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti : List TraitImplEntry} {s s' : MachineState}
+    (h_inv : ClosedInvPoly cone root c₁ ti s)
+    (hc : s'.memory.callees = s.memory.callees)
+    (hti : s'.memory.traitImpls = s.memory.traitImpls)
+    (hac : s'.memory.activeCallee = s.memory.activeCallee)
+    (hb : CallerBodiesEq s.memory.callStack s'.memory.callStack) :
+    ClosedInvPoly cone root c₁ ti s' := by
+  refine ⟨hc.trans h_inv.1, hti.trans h_inv.2.1, hac ▸ h_inv.2.2.1, ?_⟩
+  intro f hf
+  obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+  exact he ▸ h_inv.2.2.2 f₀ hf₀
+
+theorem nodeSuccs_closedInvPoly_of_ctx {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti : List TraitImplEntry} {s : MachineState} {n : MirStepNode}
+    (h_inv : ClosedInvPoly cone root c₁ ti s)
+    (hfix : n = MirStepNode.mapMem
+      (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls) n)
+    (hb : NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack) n) :
+    NodeSuccs (ClosedInvPoly cone root c₁ ti) n := by
+  refine NodeSuccs.mono ?_
+    (NodeSuccs.and
+      (nodeSuccs_of_fixed (P := fun s' => s' = MachineState.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls) s')
+        hfix (fun _ h => h))
+      hb)
+  rintro s' ⟨hs', hb'⟩
+  have hm : s'.memory =
+      Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls s'.memory :=
+    congrArg MachineState.memory hs'
+  exact closedInvPoly_of_callerBodies h_inv (by rw [hm]) (by rw [hm]) (by rw [hm]) hb'
+
+theorem closedInvPoly_return {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
+    {ti : List TraitImplEntry} {s : MachineState} {caller : SavedCallerFrame}
+    {rest : List SavedCallerFrame} {retVal : Value} {locals' : List LocalSlot} {mem' : Memory}
+    {F : StackFrame}
+    (h_inv : ClosedInvPoly cone root c₁ ti s) (h_cs : s.memory.callStack = caller :: rest)
+    (h_w : writeReturnDestination caller.frame.locals (ccReturnCallerMem s caller rest)
+      caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+        .ok locals' mem') :
+    ClosedInvPoly cone root c₁ ti { frame := F, memory := mem' } := by
+  obtain ⟨hc, hac, hti⟩ := writeReturnDestination_ctx_preserved h_w
+  have hb := writeReturnDestination_callerBodies h_w
+  refine ⟨hc.trans h_inv.1, hti.trans h_inv.2.1, ?_, ?_⟩
+  · show InConeSetPoly cone root c₁ (mem'.activeCallee.getD root)
+    rw [hac]
+    exact h_inv.2.2.2 caller (by rw [h_cs]; exact List.Mem.head _)
+  · intro f hf
+    obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+    exact he ▸ h_inv.2.2.2 f₀ (by rw [h_cs]; exact List.Mem.tail _ hf₀)
+
 theorem nodeSuccs_evalStmtPoly {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
     {ti : List TraitImplEntry} {s : MachineState} {stmt : Statement}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     (h_inv : ClosedInvPoly cone root c₁ ti s) (h_free : Statement.calleeQueryFree stmt = true) :
-    NodeSuccs (ClosedInvPoly cone root c₁ ti) (evalStmt s stmt localDecls layouts) := by
-  refine nodeSuccs_of_fixed (evalStmt_calleeCtx_preserved s stmt localDecls layouts h_free) ?_
-  intro s' hs'
-  have hm : s'.memory =
-      Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack
-        s.memory.traitImpls s'.memory :=
-    congrArg MachineState.memory hs'
-  refine ⟨?_, ?_, ?_, ?_⟩
-  · rw [hm]; exact h_inv.1
-  · rw [hm]; exact h_inv.2.1
-  · rw [hm]; exact h_inv.2.2.1
-  · rw [hm]; exact h_inv.2.2.2
+    NodeSuccs (ClosedInvPoly cone root c₁ ti) (evalStmt s stmt localDecls layouts) :=
+  nodeSuccs_closedInvPoly_of_ctx h_inv
+    (evalStmt_calleeCtx_preserved s stmt localDecls layouts h_free)
+    (evalStmt_callerBodies s stmt localDecls layouts)
 
 theorem nodeSuccs_evalDirectRustIntrinsic?_poly {cone : List DefPath}
     {root : CapturedMir} {c₁ : CalleeEnv} {ti : List TraitImplEntry} {s : MachineState}
@@ -17230,19 +18788,11 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_poly {cone : List DefPath}
           (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
             argOps argVals locals' destination targetBb) := by
       intro k
-      refine nodeSuccs_of_fixed
+      exact nodeSuccs_closedInvPoly_of_ctx h_inv
         (evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls bodyLayouts
-          argOps argVals locals' destination targetBb) ?_
-      intro s' hs'
-      have hm : s'.memory =
-          Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack
-            s.memory.traitImpls s'.memory :=
-        congrArg MachineState.memory hs'
-      refine ⟨?_, ?_, ?_, ?_⟩
-      · rw [hm]; exact h_inv.1
-      · rw [hm]; exact h_inv.2.1
-      · rw [hm]; exact h_inv.2.2.1
-      · rw [hm]; exact h_inv.2.2.2
+          argOps argVals locals' destination targetBb)
+        (evalNonSelectIntrinsicCall_callerBodies k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
     cases kind with
     | constEvalSelect => cases h_cl
     | _ => exact h_step _
@@ -17266,8 +18816,9 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
       (closedInvPoly_unwindFromCallStack s.memory.callStack s.memory h_inv.1 h_inv.2.1 h_inv.2.2.2)
   | unwindTerminate => trivial
   | return_ =>
-    unfold evalTerminator; dsimp only
-    repeat' (first | trivial | exact closedInvPoly_pop h_inv ‹_› | split)
+    rw [ccEvalReturn_eq]
+    unfold ccEvalReturn
+    repeat' (first | trivial | exact closedInvPoly_return h_inv ‹_› ‹_› | split)
   | unreachable => trivial
   | drop place target unwind =>
     unfold evalTerminator; dsimp only
@@ -17290,7 +18841,7 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
         obtain ⟨h_dp, h_no₁, _, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals with
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -17308,7 +18859,17 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
             dsimp only
             repeat' (first
               | trivial | exact h_inv
-              | exact nodeSuccs_evalDirectRustIntrinsic?_poly h_inv _ _ _ _ _ _ _ _ _ _ h_cl _ trivial
+              | exact nodeSuccs_closedInvPoly_of_ctx h_inv
+                  (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                  (writeIntrinsicReturn_callerBodies _ _ _ _ _)
+              | exact nodeSuccs_evalDirectRustIntrinsic?_poly h_inv _ _ _ _ _ _ _ _ _ _ h_cl _
+                  (by
+                    repeat' (first
+                      | trivial | exact h_inv
+                      | exact nodeSuccs_closedInvPoly_of_ctx h_inv
+                          (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                          (writeIntrinsicReturn_callerBodies _ _ _ _ _)
+                      | split))
               | split)
     | none =>
       unfold evalTerminator; dsimp only
@@ -17321,7 +18882,7 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
         obtain ⟨h_dp, h_no₁, _, _⟩ := hq tgt localsAfterFunc h_res
         dsimp only
         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals with
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -17352,7 +18913,7 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
       obtain ⟨h_dp, h_no₁, _, _⟩ := hq tgt localsAfterFunc h_res
       dsimp only
       cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals with
+          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
       | ub => trivial
       | unsupported => trivial
       | ok argVals locals' =>
@@ -17361,12 +18922,14 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
             tgt.defPath tgt.typeArgs s.memory.traitImpls with
         | some calleeBody =>
           dsimp only
-          cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
-          | false => trivial
-          | true =>
-            rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
-            exact ⟨h_inv.1, h_inv.2.1, inConeSetPoly_of_lookup h_dp h_no₁ h_lk, h_inv.2.2.2⟩
-        | none => trivial
+          rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
+          repeat' (first
+            | trivial
+            | exact ⟨h_inv.1, h_inv.2.1, inConeSetPoly_of_lookup h_dp h_no₁ h_lk, h_inv.2.2.2⟩
+            | split)
+        | none =>
+          dsimp only
+          repeat' (first | trivial | split)
   | _ => trivial
 
 theorem nodeSuccs_stepMirFnPoly {cone : List DefPath} {root : CapturedMir} {c₁ c₂ : CalleeEnv}

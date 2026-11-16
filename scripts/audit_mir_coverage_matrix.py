@@ -1209,8 +1209,11 @@ class _Audit:
                 )
         # Divergences documented here must surface in the nightly suite's Pillar 3 registry, and every
         # registry witness pointing at this file must be a kernel-audited manifest theorem — so a
-        # divergence can neither be buried in this file nor tracked against an unaudited name.
+        # divergence can neither be buried in this file nor tracked against an unaudited name. A
+        # resolved entry (its witness gone from this file) must instead name a manifest theorem as
+        # its `resolution_symbol`, so the switch-to-pass replacement is kernel-audited as well.
         tracked_here: dict[str, str] = {}
+        resolutions_here: dict[str, tuple[str, str]] = {}
         seen_ids: set[str] = set()
         tracked = getattr(self.suite, "TRACKED_CORRESPONDENCE_DIVERGENCES", None) if self.suite is not None else None
         if not isinstance(tracked, list):
@@ -1235,10 +1238,37 @@ class _Audit:
                             f"{SUITE_RELPATH}: duplicate divergence witness `{sym}` ({tracked_here[sym]} and {div_id})"
                         )
                     tracked_here[sym] = div_id
+                    res_sym = item.get("resolution_symbol")
+                    if res_sym and item.get("resolution_file", rel) == rel:
+                        resolutions_here[str(res_sym)] = (div_id, sym)
+            resolution_of = {div_id: res_sym for res_sym, (div_id, _w) in resolutions_here.items()}
+
+            def declared_here(name: str) -> bool:
+                return any(_decl_matches(d, name) for d in decls)
+
             for sym, div_id in sorted(tracked_here.items()):
-                if sym not in manifest_names:
+                if sym in manifest_names:
+                    continue
+                res_sym = resolution_of.get(div_id)
+                if res_sym and res_sym in manifest_names and not declared_here(sym):
+                    continue
+                res.errors.append(
+                    f"{SUITE_RELPATH}: divergence {div_id} witness `{sym}` is not a manifest theorem of {rel}"
+                )
+            for res_sym, (div_id, sym) in sorted(resolutions_here.items()):
+                if "diverge" in res_sym.lower():
                     res.errors.append(
-                        f"{SUITE_RELPATH}: divergence {div_id} witness `{sym}` is not a manifest theorem of {rel}"
+                        f"{SUITE_RELPATH}: divergence {div_id} resolution `{res_sym}` must not be named as a divergence"
+                    )
+                if not declared_here(res_sym):
+                    continue
+                if res_sym not in manifest_names:
+                    res.errors.append(
+                        f"{rel}: resolution theorem `{res_sym}` of {div_id} is declared but is not a manifest theorem"
+                    )
+                if declared_here(sym):
+                    res.errors.append(
+                        f"{rel}: divergence {div_id} declares both its witness `{sym}` and its resolution `{res_sym}`"
                     )
             for nm in sorted(manifest_names):
                 if "diverge" in nm.lower() and nm not in tracked_here:
@@ -1251,6 +1281,7 @@ class _Audit:
             "declarations_scanned": len(decls),
             "trailing_audit_line": None if audit_start is None else audit_start + 1,
             "tracked_divergences": dict(sorted((v, k) for k, v in tracked_here.items())),
+            "tracked_resolutions": dict(sorted((v[0], k) for k, v in resolutions_here.items())),
         }
         return res
 

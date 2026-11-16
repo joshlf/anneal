@@ -2615,16 +2615,16 @@ private theorem ctxWithBorrows_rawReborrowEntry_eq (body : CapturedMir) (ctx : C
 
 private theorem ctxWithBorrows_freezeTreeBorrowsOnReadAtProj_eq (body : CapturedMir) (ctx : Ctx)
     (borrows : List BorrowEntry) (targetLocal : Nat) (readerTag : Option Nat)
-    (targetProj : List ProjectionElem) (off len : Nat) :
+    (targetProj : List ProjectionElem) (off len : Nat) (d : Nat := 0) :
     ctxWithBorrows body ctx
         (MirSemantics.freezeTreeBorrowsOnReadAtProj borrows borrows targetLocal readerTag
-          targetProj off len) =
+          targetProj off len [] d) =
       ctxWithBorrows body ctx borrows := by
-  simp only [ctxWithBorrows, freezeTreeBorrowsOnReadAtProj_eq_map]
+  simp only [ctxWithBorrows, freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _]
   congr 1
   apply borrowTargets_map_eq
   have hf := updateBorrowPermOnReadAtProj_freezeOrSelf borrows targetLocal readerTag
-    targetProj off len
+    targetProj off len d
   exact fun e => ⟨hf.tag e, hf.targetLocal e, hf.targetProjection e⟩
 
 private theorem ctxWithBorrows_refReborrowEntry_eq (body : CapturedMir) (ctx : Ctx)
@@ -2634,13 +2634,14 @@ private theorem ctxWithBorrows_refReborrowEntry_eq (body : CapturedMir) (ctx : C
         (refReborrowEntry tag bkind parentEntry parentTag ::
           MirSemantics.freezeTreeBorrowsOnReadAtProj borrows borrows parentEntry.targetLocal
             (some parentTag) parentEntry.targetProjection parentEntry.rangeOffset
-            parentEntry.rangeLen) =
+            parentEntry.rangeLen [] parentEntry.targetFrameDepth) =
       ctxWithBorrows body ctx
         (rawPtrEntry tag (borrowKindMutbl bkind)
           ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ :: borrows) :=
   ctxWithBorrows_cons_congr body ctx rfl rfl rfl
     (ctxWithBorrows_freezeTreeBorrowsOnReadAtProj_eq body ctx borrows parentEntry.targetLocal
-      (some parentTag) parentEntry.targetProjection parentEntry.rangeOffset parentEntry.rangeLen)
+      (some parentTag) parentEntry.targetProjection parentEntry.rangeOffset parentEntry.rangeLen
+      parentEntry.targetFrameDepth)
 
 private theorem freezeDerefReadBorrowsAt_eq_of_lookup {locals : List LocalSlot}
     {borrows : List BorrowEntry} {r : Nat} {ptrVal : ProvenancePtr} {entry : BorrowEntry}
@@ -2648,7 +2649,8 @@ private theorem freezeDerefReadBorrowsAt_eq_of_lookup {locals : List LocalSlot}
     (hlookup : lookupBorrow borrows ptrVal.tag = some entry) :
     MirSemantics.freezeDerefReadBorrowsAt locals r [] borrows =
       MirSemantics.freezeTreeBorrowsOnReadAtProj borrows borrows entry.targetLocal
-        (some ptrVal.tag) entry.targetProjection entry.rangeOffset entry.rangeLen := by
+        (some ptrVal.tag) entry.targetProjection entry.rangeOffset entry.rangeLen []
+        entry.targetFrameDepth := by
   cases hbs : borrows with
   | nil => rw [hbs] at hlookup; simp [lookupBorrow] at hlookup
   | cons b1 rest =>
@@ -2658,8 +2660,9 @@ private theorem freezeDerefReadBorrowsAt_eq_of_lookup {locals : List LocalSlot}
       obtain ⟨hmem, htag⟩ := lookupBorrow_mem_and_tag hlookup
       have hb1 : entry = b1 := by simpa using hmem
       subst hb1
-      rw [freezeDerefReadBorrowsAt_singleton, freezeTreeBorrowsOnReadAtProj_eq_map,
-        List.map_singleton, updateBorrowPermOnReadAtProj_of_descendant _ _ _ _
+      rw [freezeDerefReadBorrowsAt_singleton, freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _,
+        List.map_singleton, updateBorrowPermOnReadAtProj_of_descendant _ _ _ _ []
+          entry.targetFrameDepth
           (by rw [htag]; exact isBorrowDescendantOrSelf_self _ _)]
     | cons b2 bs =>
       unfold MirSemantics.freezeDerefReadBorrowsAt
@@ -2675,7 +2678,7 @@ private theorem ctxWithBorrows_freezeDerefReadBorrowsAt_eq (body : CapturedMir) 
       ctxWithBorrows body ctx borrows := by
   rw [freezeDerefReadBorrowsAt_eq_of_lookup hrA hlookup]
   exact ctxWithBorrows_freezeTreeBorrowsOnReadAtProj_eq body ctx borrows entry.targetLocal
-    (some ptrVal.tag) entry.targetProjection entry.rangeOffset entry.rangeLen
+    (some ptrVal.tag) entry.targetProjection entry.rangeOffset entry.rangeLen entry.targetFrameDepth
 
 private theorem evalStmt_assign_val_mem (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (rv : Rvalue) (span : String)
@@ -2694,7 +2697,7 @@ private theorem evalStmt_assign_val_mem (s : MachineState) (decls : List LocalDe
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
   refine ⟨fun v mem1 hrv hbor1 hprot1 => ⟨fun hlive => ?_, fun hdead => ?_⟩, fun hu => ?_⟩
   · have hlive' : s.frame.locals[i] ≠ .dead := fun h => hlive (by rw [hs, h])
-    have hinv : invalidateConflictingBorrows mem1.borrows i .none = mem1.borrows :=
+    have hinv : ∀ d, invalidateConflictingBorrows mem1.borrows i .none d = mem1.borrows :=
       invalidateConflictingBorrows_of_ne mem1.borrows i .none hbor1
     simp only [evalStmt, hrv, get?, hs, set?, hi, ↓reduceIte, hprot1, hinv]
     cases hm : mem1
@@ -2711,6 +2714,7 @@ private theorem evalStmt_assign_derefWrite_mem (s : MachineState) (decls : List 
       evalRvalue s.frame.locals rv s.memory decls layouts = .ok v s.frame.locals mem1 →
       mem1.activeProtectors = [] →
       mem1.callerLocals = [] →
+      mem1.callStack = [] →
       writePlaceValue s.frame.locals mem1.borrows ⟨p, [.deref]⟩ v decls layouts = .ok locals' →
       MirSemantics.derefWriteTreeUB s.frame.locals mem1.borrows ⟨p, [.deref]⟩ = false →
       MirSemantics.invalidateDerefWriteBorrowsWithLayouts decls layouts s.frame.locals
@@ -2724,16 +2728,17 @@ private theorem evalStmt_assign_derefWrite_mem (s : MachineState) (decls : List 
       evalRvalue s.frame.locals rv s.memory decls layouts = .ok v s.frame.locals mem1 →
       mem1.activeProtectors = [] →
       mem1.callerLocals = [] →
+      mem1.callStack = [] →
       writePlaceValue s.frame.locals mem1.borrows ⟨p, [.deref]⟩ v decls layouts = .ub →
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) ∧
     (evalRvalue s.frame.locals rv s.memory decls layouts = .ub →
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
-  refine ⟨fun v mem1 locals' hv hprot hcl hw hdub hinv => ?_,
-    fun v mem1 hv hprot hcl hw => ?_, fun hu => ?_⟩
-  · simp only [evalStmt, hv, evalPlaceWrite, hprot, hw, hdub, hinv]
+  refine ⟨fun v mem1 locals' hv hprot hcl hcs hw hdub hinv => ?_,
+    fun v mem1 hv hprot hcl hcs hw => ?_, fun hu => ?_⟩
+  · simp only [evalStmt, hv, evalPlaceWrite, hprot, hcs, hw, hdub, hinv]
     cases hm : mem1
     simp_all [MirStepNode.step]
-  · simp only [evalStmt, hv, evalPlaceWrite, hprot, hw, hcl]
+  · simp only [evalStmt, hv, evalPlaceWrite, hprot, hcs, hw, hcl]
   · simp [evalStmt, hu]
 
 private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
@@ -2780,16 +2785,16 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
   have hw_lt : w < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdw).1
   have hfrz_eq := freezeDerefReadBorrowsAt_eq_of_lookup hrA hlookupR
   have hAfter := hb.freezeRead entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
-    entryR.rangeOffset entryR.rangeLen
+    entryR.rangeOffset entryR.rangeLen entryR.targetFrameDepth
   have hdag1 := hb.freezeRead_dag entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
-    entryR.rangeOffset entryR.rangeLen
+    entryR.rangeOffset entryR.rangeLen entryR.targetFrameDepth
   have hranges : ∀ e ∈ s.memory.borrows, e.rangeLen = 0 :=
     fun e he => by obtain ⟨_, _, _, _, hrl⟩ := hb.perm_eq he; exact hrl
   let env := ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx
   let env1 := stepForeignRead body.localDecls body.localDecls.length env r
   let borrows1 := MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows s.memory.borrows
     entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
-    entryR.rangeOffset entryR.rangeLen
+    entryR.rangeOffset entryR.rangeLen [] entryR.targetFrameDepth
   have hok1 : PtrEnvOk body view borrows1 env1 :=
     hb.alias_ok.foreignRead hb.dag_ordered hranges hdr hr_ptr hvr hlookupR
   have hw_env1 : isWritablePtrState (env1.getD w .disabled) = true := by
@@ -2802,12 +2807,13 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
     · exact hw_env
   have hf := updateBorrowPermOnReadAtProj_freezeOrSelf s.memory.borrows entryR.targetLocal
     (some ptrValR.tag) entryR.targetProjection entryR.rangeOffset entryR.rangeLen
+    entryR.targetFrameDepth
   let entryW' := MirSemantics.updateBorrowPermOnReadAtProj s.memory.borrows entryW
     entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
-    entryR.rangeOffset entryR.rangeLen
+    entryR.rangeOffset entryR.rangeLen [] entryR.targetFrameDepth
   have hlkW' : lookupBorrow borrows1 ptrValW.tag = some entryW' := by
-    change lookupBorrow (MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _) _ = _
-    rw [freezeTreeBorrowsOnReadAtProj_eq_map, hf.lookupBorrow_map, hlookupW]
+    change lookupBorrow (MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ _ _) _ = _
+    rw [freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _, hf.lookupBorrow_map, hlookupW]
     rfl
   obtain ⟨_, _, hprotW, hroffW, hrlenW⟩ := hb.perm_eq (lookupBorrow_mem_and_tag hlookupW).1
   have hroffW' : entryW'.rangeOffset = 0 := (hf.rangeOffset entryW).trans hroffW
@@ -2817,10 +2823,17 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
   have hstd1 : ∀ e ∈ borrows1,
       e.perm = .active ∨ e.perm = .frozen ∨ e.perm = .reserved ∨ e.perm = .disabled := by
     intro e he
-    change e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ at he
-    rw [freezeTreeBorrowsOnReadAtProj_eq_map, List.mem_map] at he
+    change e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ _ _ at he
+    rw [freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _, List.mem_map] at he
     obtain ⟨e0, he0, rfl⟩ := he
     exact hf.perm_std (hb.perm_std he0)
+  have htd_ad1 : ∀ e ∈ borrows1, e.targetFrameDepth = 0 ∧ e.allocDead = false := by
+    intro e he
+    change e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ _ _ at he
+    rw [freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _, List.mem_map] at he
+    obtain ⟨e0, he0, rfl⟩ := he
+    exact ⟨(hf.targetFrameDepth e0).trans (hb.targetFrameDepth_allocDead he0).1,
+      (hf.allocDead e0).trans (hb.targetFrameDepth_allocDead he0).2⟩
   have hpermW_and_anc : (entryW'.perm = .active ∨ entryW'.perm = .reserved) ∧
       MirSemantics.derefWriteTreeUB s.frame.locals borrows1 ⟨w, [.deref]⟩ = false := by
     have hw_ok1 := hok1 w hw_lt
@@ -2884,11 +2897,11 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
     have hfull :
         MirSemantics.resolveDerefWriteFullProj s.frame.locals s.frame.locals
           (.ptr ptrValW 8) entryW' [] = entryW'.targetProjection :=
-      resolveDerefWriteFullProj_of_ptrTargetSpec s.frame.locals s.frame.locals ptrValW 8 entryW' []
-        htspec_w hoff0_w
+      resolveDerefWriteFullProj_of_ptrTargetSpec (callStack := []) s.frame.locals s.frame.locals
+        ptrValW 8 entryW' [] htspec_w hoff0_w
     let upd : BorrowEntry → BorrowEntry := fun e =>
       MirSemantics.updateBorrowPermTreeAtProj borrows1 e entryW'.targetLocal
-        (some ptrValW.tag) entryW'.targetProjection 0 0
+        (some ptrValW.tag) entryW'.targetProjection 0 0 entryW'.targetFrameDepth
     have hmap :
         invalidateDerefWriteBorrows s.frame.locals borrows1 ⟨w, [.deref]⟩ [] =
           borrows1.map upd :=
@@ -2900,12 +2913,12 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
         (upd e).rangeOffset = e.rangeOffset ∧ (upd e).rangeLen = e.rangeLen ∧
         (upd e).protector = e.protector ∧ (upd e).parentTag = e.parentTag := fun e =>
       updateBorrowPermTreeAtProj_fields borrows1 e entryW'.targetLocal
-        (some ptrValW.tag) entryW'.targetProjection 0 0
+        (some ptrValW.tag) entryW'.targetProjection 0 0 entryW'.targetFrameDepth
     have hperm_eq1 : ∀ e ∈ borrows1,
         e.protector = none ∧ e.rangeOffset = 0 ∧ e.rangeLen = 0 := by
       intro e he
-      change e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ at he
-      rw [freezeTreeBorrowsOnReadAtProj_eq_map, List.mem_map] at he
+      change e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ _ _ at he
+      rw [freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _, List.mem_map] at he
       obtain ⟨e0, he0, rfl⟩ := he
       obtain ⟨_, _, hprot0, hroff0, hrlen0⟩ := hb.perm_eq he0
       exact ⟨(hf.protector e0).trans hprot0, (hf.rangeOffset e0).trans hroff0,
@@ -2945,8 +2958,14 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
         obtain ⟨_, hloc, hproj, hroff_u, hrlen_u, hprot_u, _⟩ := hupd_fields e
         obtain ⟨mutbl', hform'⟩ := borrowEntry_form_of_unranged (upd e)
           (updateBorrowPermTreeAtProj_perm_std borrows1 e entryW'.targetLocal
-            ptrValW.tag entryW'.targetProjection (hstd1 e he))
+            ptrValW.tag entryW'.targetProjection entryW'.targetFrameDepth (hstd1 e he))
           (hprot_u.trans hprot_e) (hroff_u.trans hroff_e) (hrlen_u.trans hrlen_e)
+          ((updateBorrowPermTreeAtProj_targetFrameDepth_allocDead borrows1 e
+            entryW'.targetLocal (some ptrValW.tag) entryW'.targetProjection 0 0
+            entryW'.targetFrameDepth).1.trans (htd_ad1 e he).1)
+          ((updateBorrowPermTreeAtProj_targetFrameDepth_allocDead borrows1 e
+            entryW'.targetLocal (some ptrValW.tag) entryW'.targetProjection 0 0
+            entryW'.targetFrameDepth).2.trans (htd_ad1 e he).2)
         refine ⟨mutbl', pointeeIt', relOff', hform', hloc ▸ hk_addr, ?_⟩
         rwa [hloc, hproj]
       entries_place := fun e' he' => by
@@ -3039,7 +3058,8 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
               IsBorrowAncestorOrSelf borrows1 pv_q.tag ea.tag →
               upd ea = ea ∨ upd ea = { ea with perm := .active } := by
             intro ea hloc_ea hproj_ea hanc_q_ea
-            apply updateBorrowPermTreeAtProj_self_or_disjoint_keep
+            apply updateBorrowPermTreeAtProj_self_or_disjoint_keep borrows1 ea
+              entryW'.targetLocal ptrValW.tag entryW'.targetProjection entryW'.targetFrameDepth
             intro hloc
             have hloc_q : e_q.targetLocal = entryW'.targetLocal := hloc_ea ▸ hloc
             have hkeep' : wPeers.contains q = true ∨
@@ -3729,7 +3749,7 @@ theorem borrowPlaceByteOffset?_of_ptrTargetSpec {body : CapturedMir}
         unfold arrayTypeOf at ha ⊢
         rwa [resolveTyWithLocalDecls_kind]
       unfold MirSemantics.borrowPlaceByteOffset? at hcanon ⊢
-      dsimp only [qEntry] at hcanon
+      dsimp only [qEntry, MirSemantics.activeFrameSlot?] at hcanon ⊢
       rw [hstrip, hnorm, hproj, hget_loc, hget_decl]
       rw [hstrip, hnorm, hproj, hget_canon, hget_decl] at hcanon
       dsimp only at hcanon ⊢
@@ -3741,7 +3761,7 @@ theorem borrowPlaceByteOffset?_of_ptrTargetSpec {body : CapturedMir}
       have hvsh := declSlotOk_valueShapeEq hdslot (.inr (.inr ⟨fields, size, align, htu⟩))
       have hall := resolveFieldPath_allFields hres
       unfold MirSemantics.borrowPlaceByteOffset? at hcanon ⊢
-      dsimp only [qEntry] at hcanon
+      dsimp only [qEntry, MirSemantics.activeFrameSlot?] at hcanon ⊢
       rw [hstrip, hnorm, hproj, hget_loc, hget_decl]
       rw [hstrip, hnorm, hproj, hget_canon, hget_decl] at hcanon
       dsimp only at hcanon ⊢
@@ -3909,10 +3929,11 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
     (hq : ⟨entry.targetLocal, entry.targetProjection⟩ ∈ bodyDirectBorrowPlaces body)
     (htspec : ptrTargetSpec body.layouts body.localDecls
       ⟨entry.targetLocal, entry.targetProjection⟩ = some (pointeeIt, relOff))
-    {targetRootVal : Value} (ht : locals[entry.targetLocal]? = some (.init targetRootVal)) :
+    {targetRootVal : Value} (ht : locals[entry.targetLocal]? = some (.init targetRootVal))
+    (hcs : mem.callStack = [] := by rfl) :
     (∀ b, MirSemantics.ptrAllocByteBound? locals mem body.localDecls body.layouts pv =
       some b → b < 2 ^ 63) ∧
-    (entry.perm ≠ .disabled →
+    (entry.allocDead = false →
       ∃ b, MirSemantics.ptrAllocByteBound? locals mem body.localDecls body.layouts pv =
         some b ∧ pointeeIt.size.bytes ≤ b) := by
   obtain ⟨dk, sc, hdk, hvsh, _, _, _⟩ :=
@@ -3928,12 +3949,12 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
   constructor
   · intro b hb
     unfold MirSemantics.ptrAllocByteBound? at hb
-    rw [hlookup] at hb
-    dsimp only at hb
-    cases hperm : entry.perm with
-    | disabled => rw [hperm] at hb; simp only [Option.some.injEq] at hb; omega
-    | unique | reservedFrz _ | reservedIM | cell | frozen =>
-      rw [hperm] at hb
+    rw [hlookup, hcs] at hb
+    dsimp only [MirSemantics.activeFrameSlot?] at hb
+    cases had : entry.allocDead with
+    | true => rw [had] at hb; simp only [Option.some.injEq] at hb; omega
+    | false =>
+      rw [had] at hb
       simp only [hsA, hrlen, Nat.beq_refl] at hb
       obtain ⟨_, hcases⟩ := ptrTargetSpec_cases hdeclsOk htspec
       rcases hcases with ⟨hproj, d', hd', _⟩ |
@@ -4006,101 +4027,100 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
         split at hb
         · simp only [Option.some.injEq] at hb; omega
         · split at hb <;> simp only [Nat.sub_eq, Option.some.injEq] at hb <;> omega
-  · intro hndis
+  · intro had
     unfold MirSemantics.ptrAllocByteBound?
     rw [hlookup]
     dsimp only
-    cases hperm : entry.perm with
-    | disabled => exact absurd hperm hndis
-    | unique | reservedFrz _ | reservedIM | cell | frozen =>
-      simp only [hsA, hrlen, Nat.beq_refl]
-      obtain ⟨_, hcases⟩ := ptrTargetSpec_cases hdeclsOk htspec
-      rcases hcases with ⟨hproj, d', hd', _⟩ |
-        ⟨offset, minLen, fromEnd, d', count, hproj, hd', ha, hpok, hbounds_fe⟩ |
-        ⟨idx, fieldTy, rest, hproj, _, _, d', fields, size, align, _, hd', htu, hres⟩
-      · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
-        have hsz : MirSemantics.tyByteSize body.localDecls body.layouts dk.ty =
-            some pointeeIt.size.bytes := by
-          rw [← tyByteSize_resolveTyWithLocalDecls]; exact hroot_sz hproj
-        rw [hproj]
-        simp only [MirSemantics.stripTransparentProjections,
-          MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeAdjacentSubslices,
-          MirSemantics.normalizeAdjacentSubslicesAux, MirSemantics.splitLastConstantIndex?,
-          MirSemantics.splitLastSubslice?, MirSemantics.splitLastField?, hpl_root, hsz]
-        exact ⟨pointeeIt.size.bytes, rfl, Nat.le_refl _⟩
-      · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
-        obtain ⟨hstride, projTy, hpr, hpr_sz⟩ := hconst_sz offset minLen fromEnd hproj
-        have hsloti := (DeclSlotOk_of_arrayTypeOf ha (.init targetRootVal)).mp
-          (hslots entry.targetLocal dk _ hdk ht)
-        match targetRootVal, hsloti with
-        | .aggregate 0 elems, ⟨hlenE, _⟩ =>
-          rw [hproj] at hpr ⊢
-          have hmin : minLen ≤ count := by
-            simp only [projOk, Bool.and_eq_true, decide_eq_true_eq] at hpok
-            exact hpok.1.1
-          cases fromEnd with
-          | false =>
-            simp only [Bool.false_eq_true, ↓reduceIte] at hbounds_fe
-            have hlt_off : offset < count := hbounds_fe
-            have hstr_el := (resolveSeqContainerElemByteStride_root_congr
-              body.localDecls body.layouts entry.targetLocal hdk elems []).trans hstride
-            have hble : (Nat.ble minLen count && Nat.ble offset count) = true := by
-              simp [Nat.ble_eq, hmin, Nat.le_of_lt hlt_off]
-            simp only [MirSemantics.stripTransparentProjections,
-              MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-              MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el,
-              mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
-            exact ⟨(count - offset) * pointeeIt.size.bytes, rfl, by
-              have : 1 ≤ count - offset := by omega
-              exact Nat.le_trans (by simp) (Nat.mul_le_mul_right pointeeIt.size.bytes this)⟩
-          | true =>
-            simp only [MirSemantics.stripTransparentProjections,
-              MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeSubsliceProjectionsAux,
-              MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-              MirSemantics.splitLastConstantIndex?, MirSemantics.splitLastSubslice?,
-              MirSemantics.splitLastField?, hpr, hpr_sz]
-            exact ⟨pointeeIt.size.bytes, rfl, Nat.le_refl _⟩
-      · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
-        have hsloti := (DeclSlotOk_of_tupleTypeOf htu (.init targetRootVal)).mp
-          (hslots entry.targetLocal dk _ hdk ht)
-        obtain ⟨_, hrel_le⟩ := resolveFieldPath_wf hsloti.1 hres
-        dsimp only [TupleSpec.size] at hrel_le
-        have hts := htspec
-        rw [hproj] at hts
-        simp only [ptrTargetSpec] at hts
-        split at hts <;> try cases hts
-        simp only [Bind.bind, Option.bind, hdk] at hts
-        rw [htu] at hts
-        dsimp only at hts
-        rw [hres] at hts
-        dsimp only at hts
-        injection hts with hpair
-        obtain ⟨_, hrel_eq⟩ := Prod.mk.inj hpair
-        obtain ⟨hsz0, hchain0, projTy, hpr, _⟩ := hfield_sz idx fieldTy rest hproj fields size align htu
-        have hsz : MirSemantics.tyByteSize body.localDecls body.layouts dk.ty = some size := by
-          rw [← tyByteSize_resolveTyWithLocalDecls]; exact hsz0
-        have hall : allFields (.field idx fieldTy :: rest) = true := resolveFieldPath_allFields hres
-        have hall_rest : allFields rest = true := by simpa [allFields] using hall
-        obtain ⟨initF, fIdx, fTy, hslf⟩ := splitLastField?_allFields idx fieldTy hall_rest
-        have hchain : MirSemantics.projectionChainByteOffset? body.layouts
-            (some dk.ty) (some targetRootVal) none 0 body.localDecls
-            (.field idx fieldTy :: rest) = some relOff := by
-          rw [← projectionChainByteOffset?_field_resolveTy,
-            ValueShapeEq.projectionChainByteOffset?_allFields_eq body.layouts body.localDecls
-              hall _ 0 hvsh]
-          simpa [hproj] using hchain0
+    rw [had, hcs]
+    dsimp only [MirSemantics.activeFrameSlot?]
+    simp only [hsA, hrlen, Nat.beq_refl]
+    obtain ⟨_, hcases⟩ := ptrTargetSpec_cases hdeclsOk htspec
+    rcases hcases with ⟨hproj, d', hd', _⟩ |
+      ⟨offset, minLen, fromEnd, d', count, hproj, hd', ha, hpok, hbounds_fe⟩ |
+      ⟨idx, fieldTy, rest, hproj, _, _, d', fields, size, align, _, hd', htu, hres⟩
+    · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
+      have hsz : MirSemantics.tyByteSize body.localDecls body.layouts dk.ty =
+          some pointeeIt.size.bytes := by
+        rw [← tyByteSize_resolveTyWithLocalDecls]; exact hroot_sz hproj
+      rw [hproj]
+      simp only [MirSemantics.stripTransparentProjections,
+        MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeAdjacentSubslices,
+        MirSemantics.normalizeAdjacentSubslicesAux, MirSemantics.splitLastConstantIndex?,
+        MirSemantics.splitLastSubslice?, MirSemantics.splitLastField?, hpl_root, hsz]
+      exact ⟨pointeeIt.size.bytes, rfl, Nat.le_refl _⟩
+    · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
+      obtain ⟨hstride, projTy, hpr, hpr_sz⟩ := hconst_sz offset minLen fromEnd hproj
+      have hsloti := (DeclSlotOk_of_arrayTypeOf ha (.init targetRootVal)).mp
+        (hslots entry.targetLocal dk _ hdk ht)
+      match targetRootVal, hsloti with
+      | .aggregate 0 elems, ⟨hlenE, _⟩ =>
         rw [hproj] at hpr ⊢
-        rw [stripTransparentProjections_allFields hall,
-          normalizeSubsliceProjections_allFields hall,
-          normalizeAdjacentSubslices_allFields hall,
-          splitLastConstantIndex?_allFields hall,
-          splitLastSubslice?_allFields hall,
-          hslf, splitAfterLastSeqProj_allFields hall]
-        dsimp only
-        rw [normalizeSubsliceProjections_allFields hall]
-        have hble_rel : Nat.ble relOff size = true := Nat.ble_eq.mpr (by omega)
-        simp only [readProjectedValue, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
-        exact ⟨size - relOff, rfl, by omega⟩
+        have hmin : minLen ≤ count := by
+          simp only [projOk, Bool.and_eq_true, decide_eq_true_eq] at hpok
+          exact hpok.1.1
+        cases fromEnd with
+        | false =>
+          simp only [Bool.false_eq_true, ↓reduceIte] at hbounds_fe
+          have hlt_off : offset < count := hbounds_fe
+          have hstr_el := (resolveSeqContainerElemByteStride_root_congr
+            body.localDecls body.layouts entry.targetLocal hdk elems []).trans hstride
+          have hble : (Nat.ble minLen count && Nat.ble offset count) = true := by
+            simp [Nat.ble_eq, hmin, Nat.le_of_lt hlt_off]
+          simp only [MirSemantics.stripTransparentProjections,
+            MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
+            MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el,
+            mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
+          exact ⟨(count - offset) * pointeeIt.size.bytes, rfl, by
+            have : 1 ≤ count - offset := by omega
+            exact Nat.le_trans (by simp) (Nat.mul_le_mul_right pointeeIt.size.bytes this)⟩
+        | true =>
+          simp only [MirSemantics.stripTransparentProjections,
+            MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeSubsliceProjectionsAux,
+            MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
+            MirSemantics.splitLastConstantIndex?, MirSemantics.splitLastSubslice?,
+            MirSemantics.splitLastField?, hpr, hpr_sz]
+          exact ⟨pointeeIt.size.bytes, rfl, Nat.le_refl _⟩
+    · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
+      have hsloti := (DeclSlotOk_of_tupleTypeOf htu (.init targetRootVal)).mp
+        (hslots entry.targetLocal dk _ hdk ht)
+      obtain ⟨_, hrel_le⟩ := resolveFieldPath_wf hsloti.1 hres
+      dsimp only [TupleSpec.size] at hrel_le
+      have hts := htspec
+      rw [hproj] at hts
+      simp only [ptrTargetSpec] at hts
+      split at hts <;> try cases hts
+      simp only [Bind.bind, Option.bind, hdk] at hts
+      rw [htu] at hts
+      dsimp only at hts
+      rw [hres] at hts
+      dsimp only at hts
+      injection hts with hpair
+      obtain ⟨_, hrel_eq⟩ := Prod.mk.inj hpair
+      obtain ⟨hsz0, hchain0, projTy, hpr, _⟩ := hfield_sz idx fieldTy rest hproj fields size align htu
+      have hsz : MirSemantics.tyByteSize body.localDecls body.layouts dk.ty = some size := by
+        rw [← tyByteSize_resolveTyWithLocalDecls]; exact hsz0
+      have hall : allFields (.field idx fieldTy :: rest) = true := resolveFieldPath_allFields hres
+      have hall_rest : allFields rest = true := by simpa [allFields] using hall
+      obtain ⟨initF, fIdx, fTy, hslf⟩ := splitLastField?_allFields idx fieldTy hall_rest
+      have hchain : MirSemantics.projectionChainByteOffset? body.layouts
+          (some dk.ty) (some targetRootVal) none 0 body.localDecls
+          (.field idx fieldTy :: rest) = some relOff := by
+        rw [← projectionChainByteOffset?_field_resolveTy,
+          ValueShapeEq.projectionChainByteOffset?_allFields_eq body.layouts body.localDecls
+            hall _ 0 hvsh]
+        simpa [hproj] using hchain0
+      rw [hproj] at hpr ⊢
+      rw [stripTransparentProjections_allFields hall,
+        normalizeSubsliceProjections_allFields hall,
+        normalizeAdjacentSubslices_allFields hall,
+        splitLastConstantIndex?_allFields hall,
+        splitLastSubslice?_allFields hall,
+        hslf, splitAfterLastSeqProj_allFields hall]
+      dsimp only
+      rw [normalizeSubsliceProjections_allFields hall]
+      have hble_rel : Nat.ble relOff size = true := Nat.ble_eq.mpr (by omega)
+      simp only [readProjectedValue, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
+      exact ⟨size - relOff, rfl, by omega⟩
 
 private theorem checkSafeRefDerefOk_of_ptrTargetSpec {body : CapturedMir}
     (hdlo : ptrDeclLayoutsOk body = true)
@@ -4113,17 +4133,19 @@ private theorem checkSafeRefDerefOk_of_ptrTargetSpec {body : CapturedMir}
     {parentEntry : BorrowEntry}
     (hlookup : lookupBorrow s.memory.borrows parentPtr.tag = some parentEntry)
     (hndis : parentEntry.perm ≠ .disabled)
+    (had : parentEntry.allocDead = false)
     (hrlen : parentEntry.rangeLen = 0)
     (hq : ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ ∈ bodyDirectBorrowPlaces body)
     (htspec : ptrTargetSpec body.layouts body.localDecls
       ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ = some (pointeeIt, relOff))
     {targetRootVal : Value}
-    (ht : s.frame.locals[parentEntry.targetLocal]? = some (.init targetRootVal)) :
+    (ht : s.frame.locals[parentEntry.targetLocal]? = some (.init targetRootVal))
+    (hcs : s.memory.callStack = [] := by rfl) :
     (match dp.ty.kind with
      | .ref _ _ =>
        MirSemantics.checkSafeRefDerefOk s.frame.locals parentPtr s.memory.borrows
          s.memory.globals s.memory.callerLocals body.localDecls body.layouts
-         (MirSemantics.placeTyResolved body.localDecls body.layouts ⟨p, [.deref]⟩)
+         (MirSemantics.placeTyResolved body.localDecls body.layouts ⟨p, [.deref]⟩) s.memory.callStack
      | _ => true) = true := by
   cases dp.ty.kind with
   | ref _ _ =>
@@ -4139,12 +4161,12 @@ private theorem checkSafeRefDerefOk_of_ptrTargetSpec {body : CapturedMir}
         some { parentEntry with perm := .active } := by
       simp [boundMem, lookupBorrow, htag_eq]
     obtain ⟨b, hb, hle_b⟩ := (ptrAllocByteBound?_spec hdlo hdeclsOk hslots
-      (pv := ⟨parentPtr.allocId, 0⟩) hlk_bound hrlen hq htspec ht).2 (by simp)
+      (pv := ⟨parentPtr.allocId, 0⟩) hlk_bound hrlen hq htspec ht).2 had
     have hsA : get? s.frame.locals parentEntry.targetLocal = some (.init targetRootVal) := by
       simpa [get?] using ht
     unfold MirSemantics.checkSafeRefDerefOk
-    rw [hpty, hoff0]
-    dsimp only [MirSemantics.checkDerefAlign, Nat.beq_refl]
+    rw [hpty, hoff0, hcs]
+    dsimp only [MirSemantics.checkDerefAlign, Nat.beq_refl, MirSemantics.activeFrameSlot?]
     rw [hp_sz, hlookup]
     dsimp only
     cases hp_perm : parentEntry.perm with
@@ -4631,7 +4653,7 @@ private theorem evalOperand_deref_eq_target_typed {body : CapturedMir}
   cases hpe : entry.perm with
   | disabled => exact absurd hpe hndis
   | _ =>
-    dsimp only [get?]
+    dsimp only [get?, MirSemantics.activeFrameSlot?]
     rw [ht]
     dsimp only [get?]
     unfold MirSemantics.evalStackThinPtrTypedDerefRead
@@ -4739,6 +4761,7 @@ private theorem writePlaceValue_deref_of_ptrTargetSpec {body : CapturedMir}
     dsimp only [get?]
     rw [← hcons]
     unfold MirSemantics.writeStackThinPtrTypedDeref
+    dsimp only [MirSemantics.activeFrameTargetLocals?]
     rw [hpty, hoff0, hsA]
     dsimp only [MirSemantics.stripTransparentProjections, MirSemantics.checkDerefAlign,
       Nat.beq_refl]
@@ -4943,7 +4966,8 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                 obtain ⟨hA1, hA2⟩ := evalStmt_assign_rawPtr_reborrow s body.localDecls body.layouts
                   i mutbl p dp srcMutbl pointeeIt hdp hp_pt span parentPtr hpA
                   (checkSafeRefDerefOk_of_ptrTargetSpec hdlo hdeclsOk hslotsA hdp hp_pt hoff0
-                    hlookup hndis_p hrlen (hbo.entries_place parentEntry he_mem) htspec ht_init)
+                    hlookup hndis_p (hbo.targetFrameDepth_allocDead he_mem).2 hrlen
+                    (hbo.entries_place parentEntry he_mem) htspec ht_init hrel.callStack)
                   hi hbor_i hrel.protectors hptr8
                 by_cases hdead : s.frame.locals[i]? = some .dead
                 · have hvd : view[i]? = some .dead := (hrel.stale.dead_iff i).mp hdead
@@ -5000,7 +5024,8 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                 layoutPointerBytes_of_localDeclOk_isPtrTy
                   (hdeclsOk d (List.mem_of_getElem? hdi)) (by simp [isPtrTy, hpt])
               obtain ⟨hA1, hA2⟩ := evalStmt_assign_rawPtr s body.localDecls body.layouts i mutbl q
-                pointeeIt relOff htspec span hnd hni _ hsq hliveq hi hbor_i hqi hrel.protectors hptr8
+                pointeeIt relOff htspec span hnd hni _ hsq hliveq hi hbor_i hqi hrel.protectors
+                hptr8 hrel.callStack
               by_cases hdead : s.frame.locals[i]? = some .dead
               · have hvd : view[i]? = some .dead := (hrel.stale.dead_iff i).mp hdead
                 obtain ⟨msg, hmsg⟩ := evalStatement_assign_dead hframe i d hdi hvd hal e
@@ -5090,8 +5115,9 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                     (by
                       rw [hrel.protectors]
                       exact hasTreeReadUB_false_of_ancestors_not_disabled _ _ _ _ _ _ _
+                        parentEntry.targetFrameDepth
                         (hbo.ancestors_not_disabled hndis_env hdp (by simp [isPtrTy, hp_pt]) hvp))
-                    hi hbor_i hrel.protectors hptr8
+                    hi hbor_i hrel.protectors hptr8 hrel.callStack
                   by_cases hdead : s.frame.locals[i]? = some .dead
                   · have hvd : view[i]? = some .dead := (hrel.stale.dead_iff i).mp hdead
                     obtain ⟨msg, hmsg⟩ := evalStatement_assign_dead hframe i d hdi hvd hal e
@@ -5150,6 +5176,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                 have hqi : q.local_ ≠ i := fun h => hdst_addr (h ▸ hq_addr)
                 obtain ⟨hA1, hA2⟩ := evalStmt_assign_ref s body.localDecls body.layouts i bkind
                   q pointeeIt relOff htspec span hnd hni _ hsq hliveq hi hbor_i hqi hrel.protectors
+                  hrel.callStack
                 by_cases hdead : s.frame.locals[i]? = some .dead
                 · have hvd : view[i]? = some .dead := (hrel.stale.dead_iff i).mp hdead
                   obtain ⟨msg, hmsg⟩ := evalStatement_assign_dead hframe i d hdi hvd hal e
@@ -5256,7 +5283,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                             subst hpv'
                             exact hbo.ancestors_not_disabled hndis_env hdp
                               (by simp [isPtrTy, hpt]) hvp))
-                      hrel.protectors
+                      hrel.protectors hrel.callStack
                     have hagq : ReadsAgree s.frame.locals view
                         [.copy ⟨entry.targetLocal, entry.targetProjection⟩] :=
                       readsAgree_copy_target hni hkAgree
@@ -5330,9 +5357,9 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                   dsimp only [memFrz, MirSemantics.freezeDerefReadBorrowsAt] at he_mem
                   split at he_mem
                   · split at he_mem
-                    · rw [freezeTreeBorrowsOnReadAtProj_eq_map, List.mem_map] at he_mem
+                    · rw [freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _ _ _, List.mem_map] at he_mem
                       obtain ⟨e0, he0, rfl⟩ := he_mem
-                      rw [(updateBorrowPermOnReadAtProj_freezeOrSelf _ _ _ _ _ _).targetLocal]
+                      rw [(updateBorrowPermOnReadAtProj_freezeOrSelf _ _ _ _ _ _ _).targetLocal]
                       exact hbor_i e0 he0
                     · exact hbor_i e he_mem
                   · exact hbor_i e he_mem
@@ -5672,7 +5699,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                                     exact ⟨entry, relOff, hlookup, hndis_e, htspec,
                                       ⟨.init targetRootVal, ht_init, by simp⟩,
                                       (ptrAllocByteBound?_spec hdlo hdeclsOk hslotsA hlookup hrlen
-                                        (hbo.entries_place entry he_mem) htspec ht_init).1⟩
+                                        (hbo.entries_place entry he_mem) htspec ht_init hrel.callStack).1⟩
                                   · cases hv
                                     have hisPtrD : isPtrTy d.ty = true := by simp [isPtrTy, hpt]
                                     exact hbo.ptrCopy hlo.nlocals hbb hst hdi hisPtrD hdp hisPtrP
@@ -5839,7 +5866,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                         subst hpv'
                         exact hbo.ancestors_not_disabled hndisR_env hdr
                           (by simp [isPtrTy, hptR]) hvpR))
-                  hrel.protectors
+                  hrel.protectors hrel.callStack
                 have hagqR : ReadsAgree s.frame.locals view
                     [.copy ⟨entryR.targetLocal, entryR.targetProjection⟩] :=
                   readsAgree_copy_target hniR hkAgreeR
@@ -5924,11 +5951,11 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                     · exact .inl ⟨hprojI_frz.trans hproj, rfl⟩
                     · exact .inr ⟨ph, pt, rootVal, hprojI_frz.trans hproj,
                         by rwa [hlocI_frz], hwp s.frame.locals⟩
-                  rw [hAok (.scalar wSc) memFrz _ hv' hrel.protectors hrel.callerLocals hw
+                  rw [hAok (.scalar wSc) memFrz _ hv' hrel.protectors hrel.callerLocals hrel.callStack hw
                     hdubI_frz
                     (invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union s.frame.locals
                       memFrz.borrows i ptrValI entryI' hpIA hlookupI_frz
-                      (resolveDerefWriteFullProj_of_ptrTargetSpec s.frame.locals s.frame.locals
+                      (resolveDerefWriteFullProj_of_ptrTargetSpec (callStack := []) s.frame.locals s.frame.locals
                         ptrValI 8 entryI' [] htspecI' hoff0I)
                       (placeTouchesUnion_false_of_inFragment (.inr (.inr (.inr (by simp [htspecI']))))))]
                   obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
@@ -5940,7 +5967,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                       rw [h4.allocs,
                         ctxWithBorrows_invalidateDerefWriteBorrows body ctx s.frame.locals
                           memFrz.borrows i ptrValI entryI' hpIA hlookupI_frz hrlenI_frz hroffI_frz
-                          (resolveDerefWriteFullProj_of_ptrTargetSpec s.frame.locals
+                          (resolveDerefWriteFullProj_of_ptrTargetSpec (callStack := []) s.frame.locals
                             s.frame.locals ptrValI 8 entryI' [] htspecI' hoff0I),
                         ctxWithBorrows_freezeDerefReadBorrowsAt_eq body ctx hpRA hlookupR]
                       exact h3.locs)
@@ -5990,7 +6017,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                           subst hpv'
                           exact hbo.ancestors_not_disabled hndisR_env hdr
                             (by simp [isPtrTy, hptR]) hvpR))
-                    hrel.protectors
+                    hrel.protectors hrel.callStack
                   have hopokR := ptrTargetSpec_operandOk hdeclsOk htspecR
                   obtain ⟨hopR1, hopR2⟩ := evalOperand_frag body.localDecls s.frame.locals hslotsA
                     hnA pointeeIt (.copy ⟨entryR.targetLocal, entryR.targetProjection⟩) hopokR
@@ -6000,7 +6027,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                   | none => exact hAub (hEqUbR (hopR2 hbR))
                   | some bits =>
                     exact hAwub _ memFrz (hEqOkR _ (hopR1 bits hbR)) hrel.protectors
-                      hrel.callerLocals
+                      hrel.callerLocals hrel.callStack
                       (writePlaceValue_deref_not_init s.frame.locals memFrz.borrows i _ hnotIA
                         body.localDecls body.layouts)
                 · exact hAub (evalRvalue_derefRead_ub s.frame.locals hcrv s.memory body.localDecls
@@ -6192,7 +6219,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                 obtain ⟨hAok, hAwub, hAub⟩ := evalStmt_assign_derefWrite_move s body.localDecls
                   body.layouts i rv span hk hr0
                   (moveFrameOk_of_rvalueOk hrvok s.frame.locals s.memory)
-                  hrel.protectors hrel.callerLocals
+                  hrel.protectors hrel.callerLocals hrel.callStack
                 rcases evalPlace_deref hframe hbo hns hfrag i dp .mut pointeeIt hdi hpt with
                   ⟨ptrVal, entry, relOff, m1, hvp, hoff0, hlookup, hk_addr, htspec, hderef, h1,
                     htgt⟩ |
@@ -6283,7 +6310,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                           exact hbo.ancestors_writable hw_env hdi hpt hvp))
                       (invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union
                         (rvPost s.frame.locals rv) s.memory.borrows i ptrVal entry hpL1 hlookup
-                        (resolveDerefWriteFullProj_of_ptrTargetSpec _ _ ptrVal 8 entry [] htspec hoff0)
+                        (resolveDerefWriteFullProj_of_ptrTargetSpec (callStack := []) _ _ ptrVal 8 entry [] htspec hoff0)
                         (placeTouchesUnion_false_of_inFragment (.inr (.inr (.inr (by simp [htspec])))))),
                       hinvL1]
                     obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
@@ -6295,7 +6322,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
                         rw [h4.allocs,
                           ctxWithBorrows_invalidateDerefWriteBorrows body ctx s.frame.locals
                             s.memory.borrows i ptrVal entry hpA hlookup hrlen hroff
-                            (resolveDerefWriteFullProj_of_ptrTargetSpec s.frame.locals
+                            (resolveDerefWriteFullProj_of_ptrTargetSpec (callStack := []) s.frame.locals
                               s.frame.locals ptrVal 8 entry [] htspec hoff0)]
                         exact h3.locs)
                       h3.nonScalar
@@ -6531,9 +6558,11 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
             retagKind i di srcMutbl srcIt span hnotFnEntry hdi hpt href_true hrel.protectors
           have hrub : MirSemantics.hasTreeReadUB s.memory.borrows s.memory.borrows
               s.memory.activeProtectors entry.targetLocal (some ptrVal.tag)
-              entry.targetProjection entry.rangeOffset entry.rangeLen = false := by
+              entry.targetProjection entry.rangeOffset entry.rangeLen
+              entry.targetFrameDepth = false := by
             rw [hrel.protectors]
             exact hasTreeReadUB_false_of_ancestors_not_disabled _ _ _ _ _ _ _
+              entry.targetFrameDepth
               (hbo.ancestors_not_disabled hndis_env hdi hisPtr_i hvi)
           rw [hAok ptrVal entry (hiAgree.trans hvi) hoff0 hlk hndis hrub]
           obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3_retag.shape
@@ -6609,7 +6638,8 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
           exact fun j hj => hstale_end.agree ((readsOk_spec hreadsD discr (by simp)).2 j hj))
       obtain ⟨hAok, hAnone⟩ := evalRelOperand_frag body.localDecls s.frame.locals hslotsA hnA
         (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
-      have hdeq := evalOperand_decls_eq_nil_of_RelOperandOk body.localDecls s.frame.locals
+      have hdeq := evalOperand_decls_eq_nil_of_RelOperandOk (callStack := s.memory.callStack)
+        body.localDecls s.frame.locals
         (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
       have hmove := evalOperand_move s.frame.locals discr hsimple s.memory.borrows s.memory.globals
         body.layouts s.memory.callerLocals []
@@ -6682,8 +6712,12 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
         obtain ⟨msg, hmsg⟩ := hRet.2 hs0
         exact StepRelN.ub' msg (by simp [htt, Interp.evalTerminator, hmsg])
       | .init v, hv0, hs0, hsA =>
-        have hA : evalTerminator s bb.terminator (some body) = MirStepNode.retNormal v s.memory := by
-          simp [MirSemantics.evalTerminator, hk, get?, hsA, hrel.callStack]
+        have hA : evalTerminator s bb.terminator (some body) =
+            MirStepNode.retNormal v { s.memory with
+              borrows := MirSemantics.disableFrameBorrows s.memory.borrows 0 s.frame.locals.length } := by
+          simp [MirSemantics.evalTerminator, hk, get?, hsA, hrel.callStack, hrel.protectors,
+            MirSemantics.hasFrameDeallocProtectorConflict]
+          rfl
         rw [hA]
         obtain ⟨m', R, hm', hs', hR⟩ := hRet.1 v hs0
         have hv0' : SlotOk (tyOf d0 body.layouts) (.init v) :=
@@ -10351,10 +10385,11 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
             exact fun j hj => hstale_end.agree ((readsOk_spec hreadsD discr (by simp)).2 j hj))
         obtain ⟨hAok, hAnone⟩ := evalRelOperand_frag curBody.localDecls s.frame.locals hslotsA hnA
           (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
-        have hdeq := evalOperand_decls_eq_nil_of_RelOperandOk curBody.localDecls s.frame.locals
+        have hdeq := evalOperand_decls_eq_nil_of_RelOperandOk (callStack := s.memory.callStack)
+          curBody.localDecls s.frame.locals
           (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
         have hmove := evalOperand_move s.frame.locals discr hsimple s.memory.borrows
-          s.memory.globals curBody.layouts s.memory.callerLocals []
+          s.memory.globals curBody.layouts s.memory.callerLocals [] s.memory.callStack
         obtain ⟨hvOkRe, hvErrRe⟩ := evalValue_rethread vExpr (resetPick m) rootCtx curCtx
           callerFrames (calleeFrameL curFn curCtx curLm curSeg segStmt)
           hshape.threads rfl
@@ -10473,8 +10508,11 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
             exact MultiStepRel.ub' msg hstep
           | .init v, hv0, hs0, hsA =>
             have hA : MirSemantics.evalTerminator s bb.terminator (some curBody) =
-                MirStepNode.retNormal v s.memory := by
-              simp [MirSemantics.evalTerminator, hk, get?, hsA, hcs]
+                MirStepNode.retNormal v { s.memory with
+                  borrows := MirSemantics.disableFrameBorrows s.memory.borrows 0 s.frame.locals.length } := by
+              simp [MirSemantics.evalTerminator, hk, get?, hsA, hcs, hrel.protectors,
+                MirSemantics.hasFrameDeallocProtectorConflict]
+              rfl
             rw [hA]
             obtain ⟨m', R, hm', hs', hR⟩ := hRet.1 v hs0
             have hstep : Interp.step m = .ok m' := by
@@ -10504,7 +10542,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
             | mk kind span => rw [hbt] at hk; exact congrArg (MirAst.Terminator.mk · span) hk
           obtain ⟨hAokRet, hAubRet⟩ :=
             evalTerminator_return_caller_anneal (curBody := curBody) (span := bb.terminator.span)
-              hcs hNotDiv hProtNone hCalleeProts hDest
+              hcs hNotDiv hProtNone hCalleeProts hrel.borrows hCallerEq hDest
           have hMRet :=
             evalReturn_caller_spec hfCur (resetPick_shape hshape) hCallerFrame hNextBlk
               hCalleeRetDecl hallSc hlo hrel.retLive hDest
@@ -11613,7 +11651,7 @@ private theorem findBestExposedStackBorrow_cons_eq
     (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     (addrBits : Nat) (b : BorrowEntry) (rest : List BorrowEntry) :
     MirSemantics.findBestExposedStackBorrow locals globals callerLocals expIds
-      decls layouts 8 addrBits (b :: rest) =
+      decls layouts 8 [] addrBits (b :: rest) =
     exposedStackStepCore
       (MirSemantics.stackLocalAddrPageBase 8) 65536
       (MirSemantics.isExposedAllocId expIds b.tag)
@@ -11635,7 +11673,7 @@ private theorem findBestExposedStackBorrow_cons_eq
         decls layouts { allocId := b.tag, offsetBytes := 0 })
       b.tag b.targetLocal (MirSemantics.exposedPermScore b.perm) addrBits
       (MirSemantics.findBestExposedStackBorrow locals globals callerLocals expIds
-        decls layouts 8 addrBits rest) := rfl
+        decls layouts 8 [] addrBits rest) := rfl
 
 private theorem exposedStackStepCore_nonwinning
     (pageBase pageScale addrBits : Nat)
@@ -11880,7 +11918,7 @@ theorem AnnealExposeRoundTripOk.of_borrows {body : CapturedMir} {s : MachineStat
   have hsuf_gen : ∀ (bs : List BorrowEntry),
       (∀ b ∈ bs, b ∈ s.memory.borrows ∧ b.tag ≠ pv.tag) →
       let res := MirSemantics.findBestExposedStackBorrow localsPost s.memory.globals
-        s.memory.callerLocals expIds body.localDecls body.layouts 8 fullAddr bs
+        s.memory.callerLocals expIds body.localDecls body.layouts 8 [] fullAddr bs
       res.1 = none ∨
         ∃ t o bp ib rs, res.1 = some (t, o, bp, ib, rs) ∧
           bp < MirSemantics.exposedPermScore entry.perm := by
@@ -11920,7 +11958,7 @@ theorem AnnealExposeRoundTripOk.of_borrows {body : CapturedMir} {s : MachineStat
   have hentry_res :
       ∃ ib rs,
         (MirSemantics.findBestExposedStackBorrow localsPost s.memory.globals
-          s.memory.callerLocals expIds body.localDecls body.layouts 8 fullAddr (entry :: suf)).1 =
+          s.memory.callerLocals expIds body.localDecls body.layouts 8 [] fullAddr (entry :: suf)).1 =
         some (entry.tag, 0, MirSemantics.exposedPermScore entry.perm, ib, rs) := by
     rw [findBestExposedStackBorrow_cons_eq, hexp_self, htlive_entry, hboff_post localsPost hloc]
     exact exposedStackStepCore_at_entry (MirSemantics.stackLocalAddrPageBase 8) 65536 fullAddr
@@ -11929,7 +11967,7 @@ theorem AnnealExposeRoundTripOk.of_borrows {body : CapturedMir} {s : MachineStat
       (∀ b ∈ bs, b ∈ s.memory.borrows ∧ b.tag ≠ pv.tag) →
       ∃ ib rs,
         (MirSemantics.findBestExposedStackBorrow localsPost s.memory.globals
-          s.memory.callerLocals expIds body.localDecls body.layouts 8 fullAddr
+          s.memory.callerLocals expIds body.localDecls body.layouts 8 [] fullAddr
           (bs ++ entry :: suf)).1 =
         some (entry.tag, 0, MirSemantics.exposedPermScore entry.perm, ib, rs) := by
     intro bs
@@ -11951,7 +11989,7 @@ theorem AnnealExposeRoundTripOk.of_borrows {body : CapturedMir} {s : MachineStat
   rw [← hsplit] at hbest
   unfold MirSemantics.recoverExposedPtrValue?
   rcases hpair : MirSemantics.findBestExposedStackBorrow localsPost s.memory.globals
-      s.memory.callerLocals expIds body.localDecls body.layouts 8 fullAddr s.memory.borrows with
+      s.memory.callerLocals expIds body.localDecls body.layouts 8 [] fullAddr s.memory.borrows with
     ⟨bestOpt, sawAmbig⟩
   rw [hpair] at hbest
   dsimp only at hbest
@@ -12190,7 +12228,8 @@ theorem ProvenanceRel.expose_step {body : CapturedMir} {ctx : Ctx}
       (a.addr : Int) ≤ tAddr ∧
       tAddr ≤ (a.addr : Int) + (Allocation.size a).bytes)
     (hty : MirSemantics.exposeTargetBytes? 8 targetTy = some 8 := by rfl)
-    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl) :
+    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let locals' := s.frame.locals.set i (.init (.scalar ⟨fullAddr, 8⟩))
     let s' := advanceStmt s locals' (exposeMem s.memory pv.allocId)
     evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy), span⟩
@@ -12203,7 +12242,7 @@ theorem ProvenanceRel.expose_step {body : CapturedMir} {ctx : Ctx}
     ProvenanceRel body ctx s' m4 (pv.tag :: exposedTags) ∧
     ExposedLocalRel body ctx locals' s' m4 i pv tAddr tProv fullAddr := by
   have hA := (evalStmt_assign_expose s body.localDecls body.layouts i p targetTy span hi hbor_i
-    hprot hty hsrc hptr8).1 pv fullAddr hp (hart.ptr_addr _ (fun _ _ => rfl)) hart.addr_lt hnd
+    hprot hty hsrc hptr8).1 pv fullAddr hp (by rw [hcs]; exact hart.ptr_addr _ (fun _ _ => rfl)) hart.addr_lt hnd
   have hM := evalTerminator_intrinsic_expose_ok hplace harg hstore hjump
   have hm1 := evalPlace_local_eq hplace
   subst hm1
@@ -12275,7 +12314,8 @@ theorem ProvenanceRel.withExposed_step {body : CapturedMir} {ctx : Ctx}
         (.Ptr retPtrTy) = .ok m3)
     (hjump : jumpToBlock m3 nb = .ok m4)
     (hbad : MirSemantics.isBadWithExposedTargetTy targetTy = false := by rfl)
-    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl) :
+    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s' := advanceStmt s (s.frame.locals.set i (.init (.ptr pv 8))) s.memory
     evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance (.copy ⟨u, []⟩) targetTy), span⟩
         body.localDecls body.layouts = .tau (.running s') ∧
@@ -12288,7 +12328,7 @@ theorem ProvenanceRel.withExposed_step {body : CapturedMir} {ctx : Ctx}
     ProvenanceRel body ctx s' m4 exposedTags := by
   have hA0 := (evalStmt_assign_withExposed s body.localDecls body.layouts i u targetTy span hi
     hbor_i hprot hbad hsrc hsigned hptr8).1 ⟨fullAddr, 8⟩ (.ptr pv 8)
-    hexp_loc.slot_eq rfl hexp_loc.addr_lt hexp_loc.anneal_roundtrip hnd
+    hexp_loc.slot_eq rfl hexp_loc.addr_lt (by rw [hcs]; exact hexp_loc.anneal_roundtrip) hnd
   have hm1 := evalPlace_local_eq hplace
   subst hm1
   obtain ⟨hs2, hipc2⟩ := evalValue_load_local_shape harg
@@ -12718,7 +12758,8 @@ theorem ProvenanceRel.expose_step_synced {body : CapturedMir} {ctx : Ctx}
         retPlace (.Int tAddr) (.Int usizeIt) = .ok m3)
     (hjump : jumpToBlock m3 nb = .ok m4)
     (hty : MirSemantics.exposeTargetBytes? 8 targetTy = some 8 := by rfl)
-    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl) :
+    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let locals' := (opPost s.frame.locals op).set i
       (.init (.scalar ⟨fullAddr, 8⟩))
     let s' := advanceStmt s locals' (exposeMem s.memory pv.allocId)
@@ -12743,9 +12784,9 @@ theorem ProvenanceRel.expose_step_synced {body : CapturedMir} {ctx : Ctx}
       simpa [MirSemantics.operandTy] using hsrc
     | constant c => simp [copyOp] at hop
   have hA := (evalStmt_assign_expose_op s body.localDecls body.layouts i p op targetTy span
-    hop hi hbor_i hprot hty hsrc hptr8).1 pv fullAddr hp (hart.ptr_addr _ hop_agree) hart.addr_lt hnd
+    hop hi hbor_i hprot hty hsrc hptr8).1 pv fullAddr hp (by rw [hcs]; exact hart.ptr_addr _ hop_agree) hart.addr_lt hnd
   have hstep := hprov.expose_step (targetTy := targetTy) (span := span) hi hbor_i hprot hnd
-    hp hoff0 hart hsrc_copy htgt.toExposedTargetOk hplace harg hstore hjump htgt.in_bounds hty hptr8
+    hp hoff0 hart hsrc_copy htgt.toExposedTargetOk hplace harg hstore hjump htgt.in_bounds hty hptr8 hcs
   rcases hstep with ⟨_, hM, hipc, hshape, hprov_copy, hrel_copy⟩
   have hprov' : ProvenanceRel body ctx
       (advanceStmt s ((opPost s.frame.locals op).set i
@@ -12815,7 +12856,8 @@ theorem ProvenanceRel.withExposed_step_synced {body : CapturedMir} {ctx : Ctx}
         (.Ptr retPtrTy) = .ok m3)
     (hjump : jumpToBlock m3 nb = .ok m4)
     (hbad : MirSemantics.isBadWithExposedTargetTy targetTy = false := by rfl)
-    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl) :
+    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let locals' := (opPost s.frame.locals op).set i (.init (.ptr pv 8))
     let s' := advanceStmt s locals' s.memory
     evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance op targetTy), span⟩
@@ -12843,10 +12885,10 @@ theorem ProvenanceRel.withExposed_step_synced {body : CapturedMir} {ctx : Ctx}
   have hA0 := (evalStmt_assign_withExposed_op s body.localDecls body.layouts i u op targetTy span
     hop hi hbor_i hprot hbad hsrc hsigned hptr8).1 ⟨fullAddr, 8⟩ (.ptr pv 8)
     hsync.toExposedLocalRel.slot_eq rfl hsync.toExposedLocalRel.addr_lt
-    (hsync.toExposedLocalRel.recover_eq _ hop_agree) hnd
+    (by rw [hcs]; exact hsync.toExposedLocalRel.recover_eq _ hop_agree) hnd
   have hstep := hprov.withExposed_step (targetTy := targetTy) (span := span)
     hsync.toExposedLocalRel hi hbor_i hprot hnd hsrc_copy.1 hsrc_copy.2
-    hplace harg hmeta honly hstore hjump hbad hptr8
+    hplace harg hmeta honly hstore hjump hbad hptr8 hcs
   rcases hstep with ⟨_, hint, hM, hipc, hshape, hprov_copy⟩
   exact ⟨hA0, hint, hM, hipc, hshape,
     ⟨hprov_copy.nodup, hprov_copy.anneal_exposed, hprov_copy.sound, hprov_copy.complete⟩⟩
@@ -12907,7 +12949,8 @@ theorem ProvenanceRel.expose_then_withExposed_step {body : CapturedMir} {ctx : C
         jumpToBlock m7 nb2 = .ok m8)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
     (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
-    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl) :
+    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let locals1 := (opPost s.frame.locals op1).set i
       (.init (.scalar ⟨fullAddr, 8⟩))
     let s1 := advanceStmt s locals1 (exposeMem s.memory pv.allocId)
@@ -12928,7 +12971,7 @@ theorem ProvenanceRel.expose_then_withExposed_step {body : CapturedMir} {ctx : C
       ProvenanceRel body ctx s2 m8 [pv.tag] := by
   obtain ⟨hA1, hM1, hipc1, hshape1, hprov1, hsync1⟩ :=
     hprov.expose_step_synced hop1 hi hbor_i hbor_p hprot hnd_i hp hoff0 hart hsrc1 htgt
-      hplace1 harg1 hstore1 hjump1 hty1 hptr8
+      hplace1 harg1 hstore1 hjump1 hty1 hptr8 hcs
   rcases hsync1.load_ok with ⟨m6, harg2⟩
   obtain ⟨m7, m8, hstore2, hjump2⟩ := hstore_jump2 m6 harg2
   have honly : ∀ q ∈ int2ptrCandidates m4.mem.memory.allocations m4.intptrcast.exposed tAddr,
@@ -12945,7 +12988,7 @@ theorem ProvenanceRel.expose_then_withExposed_step {body : CapturedMir} {ctx : C
     simp [opPost_length, hd]
   obtain ⟨hA2, _, hM2, _, hshape2, hprov2⟩ :=
     hprov1.withExposed_step_synced hop2 hsync1 hd1 hbor_d hbor_i hprot hnd_d hsrc2 hsigned2
-      hplace2 harg2 hmeta2 honly hstore2 hjump2 hbad2 hptr8
+      hplace2 harg2 hmeta2 honly hstore2 hjump2 hbad2 hptr8 hcs
   exact ⟨hA1, hM1, hA2, m8, hM2, hshape1.trans hshape2, hprov2⟩
 
 /-- `int2ptrCandidates` transports backwards along `AllocShapeEq`. -/
@@ -13024,7 +13067,8 @@ theorem ProvenanceRel.expose_then_withExposed_reconstructs {body : CapturedMir} 
         jumpToBlock m7 nb2 = .ok m8)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
     (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
-    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl) :
+    (hptr8 : MirSemantics.layoutPointerBytes body.layouts = 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let locals1 := (opPost s.frame.locals op1).set i
       (.init (.scalar ⟨fullAddr, 8⟩))
     let s1 := advanceStmt s locals1 (exposeMem s.memory pv.allocId)
@@ -13048,7 +13092,7 @@ theorem ProvenanceRel.expose_then_withExposed_reconstructs {body : CapturedMir} 
       ProvenanceRel body ctx s2 m8 (pv.tag :: exposedTags) := by
   obtain ⟨hA1, hM1, hipc1, hshape1, hprov1, hsync1⟩ :=
     hprov.expose_step_synced hop1 hi hbor_i hbor_p hprot hnd_i hp hoff0 hart hsrc1 htgt
-      hplace1 harg1 hstore1 hjump1 hty1 hptr8
+      hplace1 harg1 hstore1 hjump1 hty1 hptr8 hcs
   rcases hsync1.load_ok with ⟨m6, harg2⟩
   obtain ⟨m7, m8, hstore2, hjump2⟩ := hstore_jump2 m6 harg2
   have honly : ∀ q ∈ int2ptrCandidates m4.mem.memory.allocations m4.intptrcast.exposed tAddr,
@@ -13068,7 +13112,7 @@ theorem ProvenanceRel.expose_then_withExposed_reconstructs {body : CapturedMir} 
     simp [opPost_length, hd]
   obtain ⟨hA2, hint, hM2, _, hshape2, hprov2⟩ :=
     hprov1.withExposed_step_synced hop2 hsync1 hd1 hbor_d hbor_i hprot hnd_d hsrc2 hsigned2
-      hplace2 harg2 hmeta2 honly hstore2 hjump2 hbad2 hptr8
+      hplace2 harg2 hmeta2 honly hstore2 hjump2 hbad2 hptr8 hcs
   refine ⟨hA1, hM1, hA2, ?_, m6, m8, harg2, hint, hM2, hshape1.trans hshape2, hprov2⟩
   have hd2 : d < (opPost ((opPost s.frame.locals op1).set i
       (.init (.scalar ⟨fullAddr, 8⟩))) op2).length := by
@@ -13981,7 +14025,8 @@ theorem ProvenanceRel.expose_step_from_frameOk {body : CapturedMir} {f : Gen.Fun
     (hsub_static : (bodyDirectBorrowPlaces body).any (fun q => !q.projection.isEmpty) = true →
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
-    (hty : MirSemantics.exposeTargetBytes? 8 targetTy = some 8 := by rfl) :
+    (hty : MirSemantics.exposeTargetBytes? 8 targetTy = some 8 := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     ∃ (entry : BorrowEntry) (relOff : Nat) (m4 : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
       let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
@@ -14095,7 +14140,7 @@ theorem ProvenanceRel.expose_step_from_frameOk {body : CapturedMir} {f : Gen.Fun
       harg
     obtain ⟨hA, hM, hipc, hshape_eq, hprov', hsync'⟩ :=
       hprov.expose_step_synced hop hi hbor_i hbor_p hprot hnd_i hp hoff0 hart hsrc htgt_at
-        hplace harg' hstore hjump hty hptr8
+        hplace harg' hstore hjump hty hptr8 hcs
     have hFragDi : FragTy (tyOf di body.layouts) (itOf di body.layouts) := by
       rw [hTi, hiti]; exact hFragUsize
     have hslot_ok' : DeclSlotOk di (.init (.scalar ⟨tAddr.toNat, 8⟩)) body.layouts := by
@@ -14149,7 +14194,8 @@ theorem ProvenanceRel.withExposed_step_from_frameOk {body : CapturedMir} {f : Ge
       tAddr.toNat = a ∧ some tProv = pr)
     (honly : ∀ q ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed tAddr,
       q = tProv)
-    (hbad : MirSemantics.isBadWithExposedTargetTy targetTy = false := by rfl) :
+    (hbad : MirSemantics.isBadWithExposedTargetTy targetTy = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let locals' := (opPost s.frame.locals op).set d (.init (.ptr pv 8))
     let view' := view.set d (.init (.ptr pv 8))
     let s' := advanceStmt s locals' s.memory
@@ -14207,7 +14253,7 @@ theorem ProvenanceRel.withExposed_step_from_frameOk {body : CapturedMir} {f : Ge
   obtain ⟨m4, hjump, hshape4⟩ := jumpToBlock_callee hshape3 nb
   obtain ⟨hA, hint, hM, hipc, hshape_eq, hprov'⟩ :=
     hprov.withExposed_step_synced hop hsync hd hbor_d hbor_u hprot hnd_d hsrc_u hsigned_u
-      hplace harg rfl honly hstore hjump hbad hptr8
+      hplace harg rfl honly hstore hjump hbad hptr8 hcs
   have hlo3 := hframe.locs.store_ptr d dd hdd hp_ty_d slotd hsd pv tAddr.toNat (some tProv)
     htlt htgt_ctx ptr_d hpd k hpk
   rw [hitd] at hlo3
@@ -14270,7 +14316,8 @@ theorem ProvenanceRel.expose_then_withExposed_from_frameOk {body : CapturedMir} 
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     ∃ (entry : BorrowEntry) (relOff : Nat) (m4 m6 m8 : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
       let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
@@ -14310,7 +14357,7 @@ theorem ProvenanceRel.expose_then_withExposed_from_frameOk {body : CapturedMir} 
       hA1, hM1, hipc1, hshape1, hprov1, hsync1, hframe1, hat1⟩ :=
     hprov.expose_step_from_frameOk (targetTy := targetTy1) (span := span1) (nb := nb1)
       hframe hb hat hstale hop1 hdi hit_i hbor_i hprot hview_i hdp hp_ty hp hview_p
-      hnocomp hsub_static hlen_lt hty1
+      hnocomp hsub_static hlen_lt hty1 hcs
   let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
   let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
   let tProv : Prov := targetProv ctx entry.targetLocal
@@ -14357,7 +14404,7 @@ theorem ProvenanceRel.expose_then_withExposed_from_frameOk {body : CapturedMir} 
   obtain ⟨hA2, m6, m8, harg2, hint, hM2, _, hshape2, hprov2, hframe2, hat2⟩ :=
     hprov1.withExposed_step_from_frameOk (targetTy := targetTy2) (span := span2) (nb := nb2)
       hframe1 hat1 hsync1 hop2 hs1_len hdd hd_ty hbor_d hbor_i hprot hnd1_d hview1_d
-      hsrc_i hsigned_i htAddr_nn htlt htgt_ctx honly hbad2
+      hsrc_i hsigned_i htAddr_nn htlt htgt_ctx honly hbad2 hcs
   refine ⟨entry, relOff, m4, m6, m8, hlookup, htspec, hart, hA1, hM1, hA2, ?_,
     harg2, hint, hM2, hshape1.trans hshape2, hprov2, hframe2, hat2⟩
   have hd_decl : d < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdd).1
@@ -14688,7 +14735,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_from_frameOk
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -14772,7 +14820,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_from_frameOk
     hprov0.expose_then_withExposed_from_frameOk (targetTy1 := targetTy1) (targetTy2 := targetTy2)
       (span1 := span1) (span2 := span2) (nb1 := nb2) (nb2 := nb3)
       hframe0 hb0 hat hstale0 hop1 hop2 hdi hit_i hbor_i hprot hview_i
-      hdp hp_ty hp0 hview_p hdd hd_ty hbor_d hview_d hnocomp0 hnoadj0 hsub_static hlen_lt hty1 hbad2
+      hdp hp_ty hp0 hview_p hdd hd_ty hbor_d hview_d hnocomp0 hnoadj0 hsub_static hlen_lt hty1 hbad2 hcs
   have hshape_mA : AllocShapeEq m.mem.memory.allocations mA.mem.memory.allocations := by
     rw [hmemA]; exact AllocShapeEq.refl _
   exact ⟨entry, relOff, mA, m4, m6, m8, hlk, hsp, hart0, hA0, hmA, hA1, hM1, hA2, hsd,
@@ -15011,7 +15059,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -15081,7 +15130,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk
       (span1 := span1) (span2 := span2)
       hframe hb hat hstale hbb hstA hkA hreadsA hokBA hopA hbits1
       hop1 hop2 hdi hit_i hbor_i hprot hview_i hdp hp_ty hp hview_p
-      hdd hd_ty hbor_d hview_d hnocomp hnoadj hsub_static hlen_lt hty1 hbad2
+      hdd hd_ty hbor_d hview_d hnocomp hnoadj hsub_static hlen_lt hty1 hbad2 hcs
   let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
   have hb0 : BorrowsOk body ctx view (advanceStmt s (opPost s.frame.locals opA)) lm :=
     hb.advance_keep hbb hstA (by simp [ptrStmtStep, hkA])
@@ -15318,7 +15367,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 mLoad : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -15379,7 +15429,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk
       (span1 := span1) (span2 := span2)
       hframe hb hat hstale hbb hstA hkA hreadsA hokBA hopA hbits1
       hop1 hop2 hdi hit_i hi_addr hprot hview_i hdp hp_ty hp hview_p
-      hdd hd_ty hd_addr hcompat hview_d hnocomp hnoadj hsub_static hlen_lt hty1 hbad2
+      hdd hd_ty hd_addr hcompat hview_d hnocomp hnoadj hsub_static hlen_lt hty1 hbad2 hcs
   let s0 := advanceStmt s (opPost s.frame.locals opA)
   let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
   let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
@@ -15455,7 +15505,8 @@ theorem ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     ∃ (entry : BorrowEntry) (relOff : Nat) (m4 m6 m8 : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
       let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
@@ -15494,7 +15545,7 @@ theorem ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
     (fun _ _ _ _ q hq => by
       obtain ⟨_, hmem_nil, _⟩ := hprov.sound q (int2ptrCandidates_exposed hq)
       cases hmem_nil)
-    hsub_static hlen_lt hty1 hbad2
+    hsub_static hlen_lt hty1 hbad2 hcs
 
 /-- Closed 3-segment simulation (`Assume` -> `PointerExposeProvenance` ->
 `PointerWithExposedProvenance`) at `exposedTags = []` with zero dynamic target-slot
@@ -15554,7 +15605,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_
       ptrDeclLayoutsOk body = true ∧ bodyPreservesAddrTaken body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 mLoad : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -15613,7 +15665,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_
     (fun _ _ _ _ q hq => by
       obtain ⟨_, hmem_nil, _⟩ := hprov.sound q (int2ptrCandidates_exposed hq)
       cases hmem_nil)
-    hsub_static hlen_lt hty1 hbad2
+    hsub_static hlen_lt hty1 hbad2 hcs
 
 /-- Fragment-discharged closed 3-segment simulation on `inFragmentWithIntrinsics body = true`
 at `exposedTags = []`: derives `ptrDeclLayoutsOk`, `bodyPreservesAddrTaken`, and
@@ -15666,7 +15718,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_of_inFragmentWi
     (hcompat : exposeSourceCompatible dstMutbl dstIt (some (srcMutbl, srcIt)) = true)
     (hview_d : view[d]? ≠ some .dead)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 mLoad : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -15726,7 +15779,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_of_inFragmentWi
     hdd hd_ty hd_addr hcompat hview_d
     (fun _ => ⟨ptrDeclLayoutsOk_of_inFragmentWithIntrinsics hfrag,
       bodyPreservesAddrTaken_of_inFragmentWithIntrinsics hfrag⟩)
-    (by rw [hpage8]; omega) hty1 hbad2
+    (by rw [hpage8]; omega) hty1 hbad2 hcs
 
 /-- Every provenance-cast-free `inFragment` body satisfies `ptrDeclLayoutsOk`
 directly (and on `hasProvCast body = true`, `inFragmentWithIntrinsics` explicitly
@@ -15848,23 +15901,33 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
         some dk.ty := by
       simp [MirSemantics.placeTyResolved, get?, hdk, MirSemantics.resolveProjectedTyResolved]
     obtain ⟨hsz, hle16⟩ := tyByteSize_of_intTypeOf body.localDecls body.layouts hit
-    refine ⟨bIt.size.bytes, hboff, ?_, by omega⟩
-    unfold MirSemantics.ptrAllocByteBound?
-    rw [hlk_self]
-    dsimp only
-    rw [hget_sl, hb_rlen, hproj]
-    cases sl with
-    | init _ =>
-      simp only [MirSemantics.stripTransparentProjections,
-        MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeAdjacentSubslices,
-        MirSemantics.normalizeAdjacentSubslicesAux, MirSemantics.splitLastConstantIndex?,
-        MirSemantics.splitLastSubslice?, MirSemantics.splitLastField?, hpl_root, hsz]
-    | uninit =>
-      simp only [MirSemantics.stripTransparentProjections,
-        MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeAdjacentSubslices,
-        MirSemantics.normalizeAdjacentSubslicesAux, MirSemantics.splitLastConstantIndex?,
-        MirSemantics.splitLastSubslice?, MirSemantics.splitLastField?, hpl_root, hsz]
-    | dead => exact absurd rfl hsl_nd
+    cases had : b.allocDead with
+    | true =>
+      refine ⟨0, hboff, ?_, by omega⟩
+      unfold MirSemantics.ptrAllocByteBound?
+      dsimp only [emptyMemory]
+      rw [had] at hlk_self
+      rw [hlk_self]
+    | false =>
+      refine ⟨bIt.size.bytes, hboff, ?_, by omega⟩
+      unfold MirSemantics.ptrAllocByteBound?
+      dsimp only [emptyMemory]
+      rw [had] at hlk_self
+      rw [hlk_self]
+      dsimp only [MirSemantics.activeFrameSlot?]
+      rw [hget_sl, hb_rlen, hproj]
+      cases sl with
+      | init _ =>
+        simp only [MirSemantics.stripTransparentProjections,
+          MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeAdjacentSubslices,
+          MirSemantics.normalizeAdjacentSubslicesAux, MirSemantics.splitLastConstantIndex?,
+          MirSemantics.splitLastSubslice?, MirSemantics.splitLastField?, hpl_root, hsz]
+      | uninit =>
+        simp only [MirSemantics.stripTransparentProjections,
+          MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeAdjacentSubslices,
+          MirSemantics.normalizeAdjacentSubslicesAux, MirSemantics.splitLastConstantIndex?,
+          MirSemantics.splitLastSubslice?, MirSemantics.splitLastField?, hpl_root, hsz]
+      | dead => exact absurd rfl hsl_nd
   · dsimp only at hproj hdk
     have hne : b.targetProjection ≠ [] := by rw [hproj]; simp
     obtain ⟨hdlo, hfit_dk, dk', v, hdk', hsv, hdslot⟩ := hsub hne
@@ -15899,39 +15962,65 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
       | false =>
         simp only [Bool.false_eq_true, ↓reduceIte] at hbounds_fe hboff_eq
         have hlt_off : offset < count := hbounds_fe
-        have hstr_el := (resolveSeqContainerElemByteStride_root_congr
-          body.localDecls body.layouts b.targetLocal hdk elems []).trans hstride
-        have hble : (Nat.ble minLen count && Nat.ble offset count) = true := by
-          simp [Nat.ble_eq, hmin, Nat.le_of_lt hlt_off]
-        refine ⟨(count - offset) * bIt.size.bytes, hboff, ?_, ?_⟩
-        · unfold MirSemantics.ptrAllocByteBound?
-          rw [hlk_self]
-          dsimp only
-          simp only [hget_v, hb_rlen, Nat.beq_refl, hproj,
-            MirSemantics.stripTransparentProjections,
-            MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-            MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el,
-            mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
-        · rw [hboff_eq, ← Nat.add_mul, Nat.add_sub_of_le (Nat.le_of_lt hlt_off)]
-          exact hfit_sz
+        cases had : b.allocDead with
+        | true =>
+          refine ⟨0, hboff, ?_, ?_⟩
+          · unfold MirSemantics.ptrAllocByteBound?
+            dsimp only [emptyMemory]
+            rw [had] at hlk_self
+            rw [hlk_self]
+          · have hle : offset * bIt.size.bytes ≤ count * bIt.size.bytes :=
+              Nat.mul_le_mul_right _ (Nat.le_of_lt hlt_off)
+            omega
+        | false =>
+          have hstr_el := (resolveSeqContainerElemByteStride_root_congr
+            body.localDecls body.layouts b.targetLocal hdk elems []).trans hstride
+          have hble : (Nat.ble minLen count && Nat.ble offset count) = true := by
+            simp [Nat.ble_eq, hmin, Nat.le_of_lt hlt_off]
+          refine ⟨(count - offset) * bIt.size.bytes, hboff, ?_, ?_⟩
+          · unfold MirSemantics.ptrAllocByteBound?
+            dsimp only [emptyMemory]
+            rw [had] at hlk_self
+            rw [hlk_self]
+            dsimp only [MirSemantics.activeFrameSlot?]
+            simp only [hget_v, hb_rlen, Nat.beq_refl, hproj,
+              MirSemantics.stripTransparentProjections,
+              MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
+              MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el,
+              mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
+          · rw [hboff_eq, ← Nat.add_mul, Nat.add_sub_of_le (Nat.le_of_lt hlt_off)]
+            exact hfit_sz
       | true =>
         simp only [↓reduceIte] at hbounds_fe hboff_eq
-        refine ⟨bIt.size.bytes, hboff, ?_, ?_⟩
-        · unfold MirSemantics.ptrAllocByteBound?
-          rw [hlk_self]
-          dsimp only
-          rw [hproj] at hpr
-          simp only [hget_v, hb_rlen, Nat.beq_refl, hproj,
-            MirSemantics.stripTransparentProjections,
-            MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeSubsliceProjectionsAux,
-            MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-            MirSemantics.splitLastConstantIndex?, MirSemantics.splitLastSubslice?,
-            MirSemantics.splitLastField?, hpr, hpr_sz]
-        · have hc_le : (count - offset + 1) * bIt.size.bytes ≤ count * bIt.size.bytes :=
-            Nat.mul_le_mul_right _ (by omega)
-          have hsum : bOff + bIt.size.bytes = (count - offset + 1) * bIt.size.bytes := by
-            rw [hboff_eq, Nat.add_mul, Nat.one_mul]
-          omega
+        cases had : b.allocDead with
+        | true =>
+          refine ⟨0, hboff, ?_, ?_⟩
+          · unfold MirSemantics.ptrAllocByteBound?
+            dsimp only [emptyMemory]
+            rw [had] at hlk_self
+            rw [hlk_self]
+          · have hc_le : (count - offset) * bIt.size.bytes ≤ count * bIt.size.bytes :=
+              Nat.mul_le_mul_right _ (Nat.sub_le count offset)
+            omega
+        | false =>
+          refine ⟨bIt.size.bytes, hboff, ?_, ?_⟩
+          · unfold MirSemantics.ptrAllocByteBound?
+            dsimp only [emptyMemory]
+            rw [had] at hlk_self
+            rw [hlk_self]
+            dsimp only [MirSemantics.activeFrameSlot?]
+            rw [hproj] at hpr
+            simp only [hget_v, hb_rlen, Nat.beq_refl, hproj,
+              MirSemantics.stripTransparentProjections,
+              MirSemantics.normalizeSubsliceProjections, MirSemantics.normalizeSubsliceProjectionsAux,
+              MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
+              MirSemantics.splitLastConstantIndex?, MirSemantics.splitLastSubslice?,
+              MirSemantics.splitLastField?, hpr, hpr_sz]
+          · have hc_le : (count - offset + 1) * bIt.size.bytes ≤ count * bIt.size.bytes :=
+              Nat.mul_le_mul_right _ (by omega)
+            have hsum : bOff + bIt.size.bytes = (count - offset + 1) * bIt.size.bytes := by
+              rw [hboff_eq, Nat.add_mul, Nat.one_mul]
+            omega
   · dsimp only at hproj hdk
     have hne : b.targetProjection ≠ [] := by rw [hproj]; simp
     obtain ⟨hdlo, hfit_dk, dk', v, hdk', hsv, hdslot⟩ := hsub hne
@@ -15975,20 +16064,30 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
       rw [hTd] at hf
       simpa [TupleSpec.toMiniRustTy, tyBytes] using hf
     have hble_rel : Nat.ble bOff size = true := Nat.ble_eq.mpr (by omega)
-    refine ⟨size - bOff, hboff, ?_, by omega⟩
-    unfold MirSemantics.ptrAllocByteBound?
-    rw [hlk_self]
-    dsimp only
-    rw [hget_v, hb_rlen, hproj]
-    rw [stripTransparentProjections_allFields hall,
-      normalizeSubsliceProjections_allFields hall,
-      normalizeAdjacentSubslices_allFields hall,
-      splitLastConstantIndex?_allFields hall,
-      splitLastSubslice?_allFields hall,
-      hslf, splitAfterLastSeqProj_allFields hall]
-    dsimp only
-    rw [normalizeSubsliceProjections_allFields hall]
-    simp only [readProjectedValue, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
+    cases had : b.allocDead with
+    | true =>
+      refine ⟨0, hboff, ?_, by omega⟩
+      unfold MirSemantics.ptrAllocByteBound?
+      dsimp only [emptyMemory]
+      rw [had] at hlk_self
+      rw [hlk_self]
+    | false =>
+      refine ⟨size - bOff, hboff, ?_, by omega⟩
+      unfold MirSemantics.ptrAllocByteBound?
+      dsimp only [emptyMemory]
+      rw [had] at hlk_self
+      rw [hlk_self]
+      dsimp only [MirSemantics.activeFrameSlot?]
+      rw [hget_v, hb_rlen, hproj]
+      rw [stripTransparentProjections_allFields hall,
+        normalizeSubsliceProjections_allFields hall,
+        normalizeAdjacentSubslices_allFields hall,
+        splitLastConstantIndex?_allFields hall,
+        splitLastSubslice?_allFields hall,
+        hslf, splitAfterLastSeqProj_allFields hall]
+      dsimp only
+      rw [normalizeSubsliceProjections_allFields hall]
+      simp only [readProjectedValue, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
 
 /-- Standalone borrow-table derivation of `NoCompetingExposedBorrow` for
 `exposedTags ≠ []` when every previously exposed borrow `b ∈ s.memory.borrows`
@@ -16189,7 +16288,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_f
       bodyBorrowTargetsFitPage body = true := by decide)
     (hlen_lt : body.localDecls.length ≤ 2 ^ 47 - MirSemantics.stackLocalAddrPageBase 8 + 1 := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 mLoad : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -16251,7 +16351,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_f
         hframe hb hat hstale hlk hsp (hsep entry hlk) hsub_page)
     hnoadj
     (fun hany => ⟨(hsub_page hany).1, (hsub_page hany).2.1⟩)
-    hlen_lt hty1 hbad2
+    hlen_lt hty1 hbad2 hcs
 
 /-- Fragment-discharged form of
 `ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_frameOk`
@@ -16324,7 +16424,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_of_inF
     (hsub_fit : (bodyDirectBorrowPlaces body).any (fun q => !q.projection.isEmpty) = true →
       bodyBorrowTargetsFitPage body = true := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 mLoad : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -16386,7 +16487,7 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_of_inF
     hdd hd_ty hd_addr hcompat hview_d hsep hnoadj
     (fun hany => ⟨ptrDeclLayoutsOk_of_inFragmentWithIntrinsics hfrag,
       bodyPreservesAddrTaken_of_inFragmentWithIntrinsics hfrag, hsub_fit hany⟩)
-    (by rw [hpage8]; omega) hty1 hbad2
+    (by rw [hpage8]; omega) hty1 hbad2 hcs
 
 /-- Decidable caller-context non-adjacency predicate: for every pair of distinct
 address-taken locals `k1 ≠ k2` in `body`, their closed byte intervals
@@ -16546,7 +16647,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFra
     (hsub_fit : (bodyDirectBorrowPlaces body).any (fun q => !q.projection.isEmpty) = true →
       bodyBorrowTargetsFitPage body = true := by decide)
     (hty1 : MirSemantics.exposeTargetBytes? 8 targetTy1 = some 8 := by rfl)
-    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl) :
+    (hbad2 : MirSemantics.isBadWithExposedTargetTy targetTy2 = false := by rfl)
+    (hcs : s.memory.callStack = [] := by rfl) :
     let s0 := advanceStmt s (opPost s.frame.locals opA)
     ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 mLoad : Mach),
       let fullAddr : Nat := canonicalLocalAddr entry.targetLocal relOff
@@ -16607,6 +16709,6 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFra
     hdd hd_ty hd_addr hcompat hview_d hsep
     (fun _ _ hlk hsp _ hq =>
       hprov.int2ptrCandidates_eq_targetProv_of_ctxSpaced hframe hb hat hspaced hlk hsp hq)
-    hsub_fit hty1 hbad2
+    hsub_fit hty1 hbad2 hcs
 
 end MiniRustSpec.Correspondence

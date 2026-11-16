@@ -215,7 +215,7 @@ def refSharedReadMInit : Mach :=
 theorem refSharedRead_anneal_ret :
     ReachesRet (mirTree refSharedRead refSharedReadS0) []
       (.normal (.scalar ⟨5, 4⟩,
-        { refSharedReadS0.memory with borrows := [rawPtrEntry 1 .not (local_ 1)], nextTag := 2 })) :=
+        { refSharedReadS0.memory with borrows := retBorrows [rawPtrEntry 1 .not (local_ 1)], nextTag := 2 })) :=
   runA_sound refSharedRead 30 _ _ _ rfl
 
 theorem refSharedRead_noUB :
@@ -340,7 +340,7 @@ theorem refMutRoundTrip_anneal_ret :
     ReachesRet (mirTree refMutRoundTrip refMutRoundTripS0) []
       (.normal (.scalar ⟨6, 4⟩,
         { refMutRoundTripS0.memory with
-          borrows := [{ rawPtrEntry 2 .not (local_ 1) with parentTag := some 1 },
+          borrows := retBorrows [{ rawPtrEntry 2 .not (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 3 })) :=
   runA_sound refMutRoundTrip 30 _ _ _ rfl
@@ -496,7 +496,7 @@ theorem refArrayReborrowChain_anneal_ret :
     ReachesRet (mirTree refArrayReborrowChain refArrayReborrowChainS0) []
       (.normal (.scalar ⟨42, 4⟩,
         { refArrayReborrowChainS0.memory with
-          borrows := [{ rawPtrEntry 5 .not (placeConstIdx 1 0 2 false) with parentTag := some 4 },
+          borrows := retBorrows [{ rawPtrEntry 5 .not (placeConstIdx 1 0 2 false) with parentTag := some 4 },
                       { rawPtrEntry 4 .not (placeConstIdx 1 0 2 false) with parentTag := some 3 },
                       { rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false) with
                           perm := .reserved, parentTag := some 1 },
@@ -642,7 +642,7 @@ theorem refPaddedStructReborrow_anneal_ret :
     ReachesRet (mirTree refPaddedStructReborrow refPaddedStructReborrowS0) []
       (.normal (.scalar ⟨1641, 4⟩,
         { refPaddedStructReborrowS0.memory with
-          borrows := [{ rawPtrEntry 4 .not (placeField 1 [(2, u16Ty)]) with parentTag := some 2 },
+          borrows := retBorrows [{ rawPtrEntry 4 .not (placeField 1 [(2, u16Ty)]) with parentTag := some 2 },
                       { rawPtrEntry 3 .not (placeField 1 [(1, u32Ty)]) with parentTag := some 1 },
                       rawPtrEntry 2 .not (placeField 1 [(2, u16Ty)]),
                       rawPtrEntry 1 .mut (placeField 1 [(1, u32Ty)])],
@@ -779,7 +779,7 @@ theorem refMutReborrowWrite_anneal_ret :
     ReachesRet (mirTree refMutReborrowWrite refMutReborrowWriteS0) []
       (.normal (.scalar ⟨15, 4⟩,
         { refMutReborrowWriteS0.memory with
-          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+          borrows := retBorrows [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
                       { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 4 })) :=
@@ -932,7 +932,7 @@ theorem refDisjointReborrowWrite_anneal_ret :
     ReachesRet (mirTree refDisjointReborrowWrite refDisjointReborrowWriteS0) []
       (.normal (.scalar ⟨42, 4⟩,
         { refDisjointReborrowWriteS0.memory with
-          borrows := [{ rawPtrEntry 4 .mut (placeConstIdx 1 1 2 false) with parentTag := some 2 },
+          borrows := retBorrows [{ rawPtrEntry 4 .mut (placeConstIdx 1 1 2 false) with parentTag := some 2 },
                       { rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false) with parentTag := some 1 },
                       rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
                       rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
@@ -1110,7 +1110,7 @@ theorem refLoopCountdown_anneal_ret :
     ReachesRet (mirTree refLoopCountdown refLoopCountdownS0) constBorrowLoopTrace
       (.normal (.scalar ⟨6, 4⟩,
         { refLoopCountdownS0.memory with
-          borrows := [rawPtrEntry 10 .not (local_ 1),
+          borrows := retBorrows [rawPtrEntry 10 .not (local_ 1),
                       { rawPtrEntry 9 .mut (local_ 1) with perm := .frozen, parentTag := some 8 },
                       { rawPtrEntry 8 .mut (local_ 1) with perm := .frozen },
                       { rawPtrEntry 7 .not (local_ 1) with perm := .disabled },
@@ -1599,7 +1599,7 @@ theorem refTwoPhaseBorrowRoundTrip_anneal_ret :
     ReachesRet (mirTree refTwoPhaseBorrowRoundTrip refTwoPhaseBorrowRoundTripS0) []
       (.normal (.scalar ⟨42, 4⟩,
         { refTwoPhaseBorrowRoundTripS0.memory with
-          borrows := [{ rawPtrEntry 2 .not (local_ 1) with perm := .disabled },
+          borrows := retBorrows [{ rawPtrEntry 2 .not (local_ 1) with perm := .disabled },
                       rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 3 })) :=
   runA_sound refTwoPhaseBorrowRoundTrip 30 _ _ _ rfl
@@ -1708,33 +1708,33 @@ the former Anneal/Tree Borrows gap is closed: `&two_phase mut _1` records
 `.reservedFrz false` (`TreeBorrowPerm.reserved`), and `updateBorrowPerm` with
 `writerTag = .none` (the direct write `_1 = 99`) disables an unprotected
 `.reservedFrz false` entry, so reading `*_2` raises UB in Anneal
-(`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`), agreeing with ground-truth
+(`twoPhaseDirectWriteTreeBorrows_anneal_ub`), agreeing with ground-truth
 `TreeBorrowsMemory` (`Permission.foreign_write_unprot_reserved_iff.1`,
 `treeBorrowsDirectWriteDisablesUnprotReserved`, and
-`twoPhaseDirectWriteTreeBorrowsGap_tb_direct`), which transitions unprotected
+`twoPhaseDirectWriteTreeBorrows_tb_direct`), which transitions unprotected
 `Freeze` `Reserved -> Disabled` on foreign writes. Only MiniRust's `BasicMemory`
 (no aliasing model) returns `99`. -/
-def twoPhaseDirectWriteTreeBorrowsGap : CapturedMir :=
-  ptrBody "witness::two_phase_direct_write_tree_borrows_gap"
+def twoPhaseDirectWriteTreeBorrows : CapturedMir :=
+  ptrBody "witness::two_phase_direct_write_tree_borrows"
     [u32Decl, u32Decl, refMutU32Decl]
     [.storageLive 2,
      .assign (local_ 2) (.ref (.mut true) (local_ 1)),
      .assign (local_ 1) (.use (constU32 99)),
      .assign (local_ 0) (.use (.copy (derefPlace 2)))]
 
-theorem twoPhaseDirectWriteTreeBorrowsGap_translate :
-    (translateFn twoPhaseDirectWriteTreeBorrowsGap).isSome = true := by decide +kernel
+theorem twoPhaseDirectWriteTreeBorrows_translate :
+    (translateFn twoPhaseDirectWriteTreeBorrows).isSome = true := by decide +kernel
 
-theorem twoPhaseDirectWriteTreeBorrowsGap_notInFragment :
-    inFragment twoPhaseDirectWriteTreeBorrowsGap = false := by decide +kernel
+theorem twoPhaseDirectWriteTreeBorrows_notInFragment :
+    inFragment twoPhaseDirectWriteTreeBorrows = false := by decide +kernel
 
-theorem twoPhaseDirectWriteTreeBorrowsGap_anneal_ub :
-    ∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrowsGap
-      (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound twoPhaseDirectWriteTreeBorrowsGap 20 _ (by decide)
+theorem twoPhaseDirectWriteTreeBorrows_anneal_ub :
+    ∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrows
+      (initMachineState twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound twoPhaseDirectWriteTreeBorrows 20 _ (by decide)
 
-theorem twoPhaseDirectWriteTreeBorrowsGap_minirust_direct :
-    retAfter twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩] 6 =
+theorem twoPhaseDirectWriteTreeBorrows_minirust_direct :
+    retAfter twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩] 6 =
       some (some { retAlloc with data := scalarBytes u32 99 }, [1]) := by
   decide +kernel
 
@@ -1811,7 +1811,7 @@ theorem childReborrowWriteDisablesParent_anneal_ret :
       (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩,
         { (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with perm := .frozen, parentTag := some 1 },
+          borrows := retBorrows [{ rawPtrEntry 2 .mut (local_ 1) with perm := .frozen, parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 3 })) :=
   runA_sound childReborrowWriteDisablesParent 30 _ _ _ rfl
@@ -2146,7 +2146,7 @@ theorem retagRefReborrowChain_anneal_ret :
     ReachesRet (mirTree retagRefReborrowChain retagRefReborrowChainS0) []
       (.normal (.scalar ⟨12, 4⟩,
         { retagRefReborrowChainS0.memory with
-          borrows := [{ rawPtrEntry 7 .not (local_ 1) with parentTag := some 6 },
+          borrows := retBorrows [{ rawPtrEntry 7 .not (local_ 1) with parentTag := some 6 },
                       { rawPtrEntry 6 .not (local_ 1) with parentTag := some 5 },
                       { rawPtrEntry 5 .mut (local_ 1) with
                         perm := .reservedFrz false, parentTag := some 4 },
@@ -2372,7 +2372,7 @@ theorem retagDisabledRefDiscrepancy_anneal_ret :
       (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩,
         { (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 3 .mut (local_ 1) with
+          borrows := retBorrows [{ rawPtrEntry 3 .mut (local_ 1) with
                         perm := .reservedFrz false, parentTag := some 1 },
                       { rawPtrEntry 2 .mut (local_ 1) with
                         perm := .frozen, parentTag := some 1 },
@@ -2591,7 +2591,7 @@ theorem refRawTransmuteChain_anneal_ret :
     ReachesRet (mirTree refRawTransmuteChain refRawTransmuteChainS0) []
       (.normal (.scalar ⟨15, 4⟩,
         { refRawTransmuteChainS0.memory with
-          borrows := [rawPtrEntry 1 .mut (local_ 1)],
+          borrows := retBorrows [rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 2 })) :=
   runA_sound refRawTransmuteChain 35 _ _ _ rfl
 
@@ -2906,7 +2906,7 @@ theorem treeBorrowsFrozenAndDisabledUb :
       some (.inr "Tree Borrows: local read of Disabled reference") :=
   ⟨by decide +kernel, by decide +kernel⟩
 
-/-- Ground-truth `TreeBorrowsMemory` counterpart to `twoPhaseDirectWriteTreeBorrowsGap`:
+/-- Ground-truth `TreeBorrowsMemory` counterpart to `twoPhaseDirectWriteTreeBorrows`:
 writing directly through the root allocation tag (`[]`) is a foreign write to an
 unprotected `Freeze` `&mut u32` child (`[0]`, `Reserved`), transitioning it to
 `Disabled`, so reading through the child afterwards raises
@@ -3096,12 +3096,33 @@ theorem twoPhaseForeignWriteDiscrepancy_tb_direct :
 witness: `MachTB` transitions unprotected `Freeze` `Reserved` to `Disabled` on
 `_1 = 99` and raises `"Tree Borrows: local read of Disabled reference"` at
 `_0 = copy (*_2)`, agreeing with Anneal's UB under the `LM-3.3` `updateBorrowPerm`
-(`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`: `writerTag = .none` disables the
+(`twoPhaseDirectWriteTreeBorrows_anneal_ub`: `writerTag = .none` disables the
 unprotected `.reservedFrz false` entry), whereas `BasicMemory` returns `99`. -/
-theorem twoPhaseDirectWriteTreeBorrowsGap_tb_direct :
-    ubAfterTB twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩] 5 =
+theorem twoPhaseDirectWriteTreeBorrows_tb_direct :
+    ubAfterTB twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩] 5 =
       some "Tree Borrows: local read of Disabled reference" := by
   decide +kernel
+
+/-- `DIV-MR-TB-TWOPHASE-DIRECT-WRITE` simulation agreement between Anneal and
+`MachTB` (`TreeBorrowsMemory`), contrasted with `BasicMemory` (`99`).
+Scope note (`DIV-MR-TB-DIRECT-LOCAL-ACCESS` follow-up): general Tree Borrows
+ancestor/child `Read` vs. `Write` transitions on direct local accesses beyond
+unprotected `Freeze` `Reserved` root writes remain a separate future Tree Borrows
+correspondence item rather than a claim of full Tree Borrows completeness here. -/
+theorem twoPhaseDirectWriteTreeBorrows_simulation :
+    (translateFn twoPhaseDirectWriteTreeBorrows).isSome = true ∧
+    inFragment twoPhaseDirectWriteTreeBorrows = false ∧
+    (∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrows
+      (initMachineState twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    retAfter twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩] 6 =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) ∧
+    ubAfterTB twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩] 5 =
+      some "Tree Borrows: local read of Disabled reference" :=
+  ⟨twoPhaseDirectWriteTreeBorrows_translate,
+   twoPhaseDirectWriteTreeBorrows_notInFragment,
+   twoPhaseDirectWriteTreeBorrows_anneal_ub,
+   twoPhaseDirectWriteTreeBorrows_minirust_direct,
+   twoPhaseDirectWriteTreeBorrows_tb_direct⟩
 
 /-- Read-only mutable reborrow `_3 = &mut (*_2)` from shared `_2 = &_1`:
 Anneal faults eagerly at `&mut (*_2)` (a `.frozen` parent rejects `.mut`), whereas
@@ -3214,41 +3235,56 @@ theorem retagTrulyDisabledRefUb_tb_direct :
   decide +kernel
 
 /-- Function-entry protector on a callee-owned local (`_2 = &_1; Retag([fn entry], _2);
-_0 = copy (*_2); return`): Anneal discards the callee frame on `return` without
-checking `activeProtectors` against local deallocation (returning `5`), and
-`BasicMemory` has no protectors (returning `5`), whereas `MachTB`'s
-`evalReturnM` runs `deallocAllM` (`StorageDead(_1)`) *before* `end_call`,
-raising `"Tree Borrows: foreign write of protected Frozen reference which had a local read"`
-at `Terminator::Return` (step 6). -/
-def retagFnEntryLocalDeallocUb : CapturedMir :=
-  ptrBody "witness::retag_fn_entry_local_dealloc_ub"
+_0 = copy (*_2); return`): Anneal's `Terminators.evalTerminator` checks
+`checkCalleeLocalDeallocTreeUB` across all callee frame locals at `return`
+before popping `activeProtectors` (`retagFnEntryLocalDealloc_anneal_ub`),
+agreeing with `MachTB`'s `evalReturnM` which runs `deallocAllM` (`StorageDead(_1)`)
+*before* `end_call`, raising
+`"Tree Borrows: foreign write of protected Frozen reference which had a local read"`
+at `Terminator::Return` (step 6), while `BasicMemory` (no protectors) returns `5`. -/
+def retagFnEntryLocalDealloc : CapturedMir :=
+  ptrBody "witness::retag_fn_entry_local_dealloc"
     [u32Decl, u32Decl, refSharedU32Decl]
     [.storageLive 2,
      .assign (local_ 2) (.ref .shared (local_ 1)),
      .retag .fnEntry (local_ 2),
      .assign (local_ 0) (.use (.copy (derefPlace 2)))]
 
-theorem retagFnEntryLocalDeallocUb_translate :
-    (translateFn retagFnEntryLocalDeallocUb).isSome = true := by decide +kernel
+theorem retagFnEntryLocalDealloc_translate :
+    (translateFn retagFnEntryLocalDealloc).isSome = true := by decide +kernel
 
-theorem retagFnEntryLocalDeallocUb_notInFragment :
-    inFragment retagFnEntryLocalDeallocUb = false := by decide +kernel
+theorem retagFnEntryLocalDealloc_notInFragment :
+    inFragment retagFnEntryLocalDealloc = false := by decide +kernel
 
-theorem retagFnEntryLocalDeallocUb_anneal_ret :
-    ∃ mem, ReachesRet (mirTree retagFnEntryLocalDeallocUb
-      (initMachineState retagFnEntryLocalDeallocUb [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨5, 4⟩, mem)) :=
-  ⟨_, runA_sound retagFnEntryLocalDeallocUb 20 _ _ _ rfl⟩
+theorem retagFnEntryLocalDealloc_anneal_ub :
+    ∃ tr u, Reaches (mirTree retagFnEntryLocalDealloc
+      (initMachineState retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound retagFnEntryLocalDealloc 20 _ (by decide)
 
-theorem retagFnEntryLocalDeallocUb_minirust_direct :
-    retAfter retagFnEntryLocalDeallocUb [.scalar ⟨5, 4⟩] 6 =
+theorem retagFnEntryLocalDealloc_minirust_direct :
+    retAfter retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩] 6 =
       some (some { retAlloc with data := scalarBytes u32 5 }, [1]) := by
   decide +kernel
 
-theorem retagFnEntryLocalDeallocUb_tb_direct :
-    ubAfterTB retagFnEntryLocalDeallocUb [.scalar ⟨5, 4⟩] 6 =
+theorem retagFnEntryLocalDealloc_tb_direct :
+    ubAfterTB retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩] 6 =
       some "Tree Borrows: foreign write of protected Frozen reference which had a local read" := by
   decide +kernel
+
+theorem retagFnEntryLocalDealloc_simulation :
+    (translateFn retagFnEntryLocalDealloc).isSome = true ∧
+    inFragment retagFnEntryLocalDealloc = false ∧
+    (∃ tr u, Reaches (mirTree retagFnEntryLocalDealloc
+      (initMachineState retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    retAfter retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩] 6 =
+      some (some { retAlloc with data := scalarBytes u32 5 }, [1]) ∧
+    ubAfterTB retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩] 6 =
+      some "Tree Borrows: foreign write of protected Frozen reference which had a local read" :=
+  ⟨retagFnEntryLocalDealloc_translate,
+   retagFnEntryLocalDealloc_notInFragment,
+   retagFnEntryLocalDealloc_anneal_ub,
+   retagFnEntryLocalDealloc_minirust_direct,
+   retagFnEntryLocalDealloc_tb_direct⟩
 
 theorem retagScalarDiscrepancy_tb_direct :
     retAfterTB retagScalarDiscrepancy [.scalar ⟨5, 4⟩] 4 = tbRetU32 5 := by
@@ -3491,7 +3527,7 @@ theorem retagRawOnRefLocal_anneal_ret :
     ReachesRet (mirTree retagRawOnRefLocal retagRawOnRefLocalS0) []
       (.normal (.scalar ⟨12, 4⟩,
         { retagRawOnRefLocalS0.memory with
-          borrows := [{ rawPtrEntry 4 .not (local_ 1) with parentTag := some 3 },
+          borrows := retBorrows [{ rawPtrEntry 4 .not (local_ 1) with parentTag := some 3 },
                       { rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
                       { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],

@@ -818,12 +818,15 @@ def splitRunS0 : MachineState :=
 
 /-- **Connected trusted `split_at_mut` run.** The lens facts are about the *trusted run*, not a
 side buffer: the initial backing array encodes (trusted `encodeUntypedValueToBytes`) to the
-initial lens buffer `bytes16`; the trusted bounded evaluator runs both writes through
-`evalStmt` (data written into `_0`, borrows updated by `invalidateDerefWriteBorrowsWithLayouts`)
-and returns the final backing array with final borrow table `derefWithLayoutsBorrowsLR`; that
-array encodes to `bytesW2` and decodes back from it at `[u32; 4]`; and over exactly `bytesW2` in
-exactly that table, the root lens views the reassembled `[1, 20, 30, 4]` while both child lenses
-stay live. -/
+initial lens buffer `bytes16`; the trusted evaluator runs both writes through `evalStmt` (data
+written into `_0`, borrows updated by `invalidateDerefWriteBorrowsWithLayouts`), reaching the
+pre-`return_` state whose `_0` is the final backing array and whose borrow table is exactly
+`derefWithLayoutsBorrowsLR`; that array encodes to `bytesW2` and decodes back from it at
+`[u32; 4]`; and over exactly `bytesW2` in exactly that table, the root lens views the reassembled
+`[1, 20, 30, 4]` while both child lenses stay live. The bounded run then returns the final
+backing array, and the root frame's `return_` tears its locals down: every borrow into them is
+disabled and marked `allocDead` (`disableFrameBorrows … 0 (length liveChildLocals)`), so in the
+returned memory the root lens is dangling. -/
 theorem split_at_mut_trusted_run_connected :
     get? splitRunS0.frame.locals 0 = some (.init backing0) ∧
       encodeUntypedValueToBytes defaultCodecFuel backing0 = some bytes16 ∧
@@ -832,8 +835,15 @@ theorem split_at_mut_trusted_run_connected :
           { frame := { blockIdx := 0, stmtIdx := 1, locals := liveChildLocals.set 0 (.init backingL) }
             memory := { borrows := derefWithLayoutsBorrowsL } } ∧
       encodeUntypedValueToBytes defaultCodecFuel backingL = some bytesW1 ∧
+      evalStmt
+          { frame := { blockIdx := 0, stmtIdx := 1, locals := liveChildLocals.set 0 (.init backingL) }
+            memory := { borrows := derefWithLayoutsBorrowsL } } splitStmtR =
+        MirStepNode.step
+          { frame := { blockIdx := 0, stmtIdx := 2, locals := liveChildLocals.set 0 (.init backingLR) }
+            memory := { borrows := derefWithLayoutsBorrowsLR } } ∧
       Anneal.MirFuelFree.runMirExecBounded 4 splitWriterMir (.running splitRunS0) =
-        some (.normal (backingLR, { borrows := derefWithLayoutsBorrowsLR })) ∧
+        some (.normal (backingLR,
+          { borrows := disableFrameBorrows derefWithLayoutsBorrowsLR 0 (length liveChildLocals) })) ∧
       encodeUntypedValueToBytes defaultCodecFuel backingLR = some bytesW2 ∧
       decodeValueFromBytes defaultCodecFuel layouts64 { kind := .array (.uint .u32) 4, layoutIdx := 0 }
         bytesW2 = some backingLR ∧
@@ -842,10 +852,18 @@ theorem split_at_mut_trusted_run_connected :
       ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 78
         (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
       ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 79
-        (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, split_at_mut_evalStmt_withLayouts_end_to_end.2.1,
+        (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 ∧
+      ¬ ActiveTypedSliceBorrow ByteLensCodec.u32LE
+        (disableFrameBorrows derefWithLayoutsBorrowsLR 0 (length liveChildLocals)) 77 wide4
+        [u 1, u 20, u 30, u 4] bytesW2 :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, split_at_mut_evalStmt_withLayouts_end_to_end.2.1,
     split_at_mut_evalStmt_withLayouts_end_to_end.2.2.1,
-    split_at_mut_evalStmt_withLayouts_end_to_end.2.2.2.1⟩
+    split_at_mut_evalStmt_withLayouts_end_to_end.2.2.2.1,
+    by
+      rintro ⟨_, e, he, _, hp⟩
+      cases he
+      unfold TreeBorrowPerm.PermitsRead at hp
+      cases hp⟩
 
 /-- Child wide pointers carrying their own borrow tags `78` and `79`. -/
 def wideL78 : WidePtrVal := WidePtrVal.mk ⟨78, 0⟩ 2
@@ -1434,16 +1452,16 @@ witnesses. -/
 theorem callee_sig_and_fnptr_bridges (s : MachineState) (p : Place) :
     checkCalleeSig fullCallees "cone::helper1" [] (.uint .u32) .rust [] [] =
       checkCalleeSig (coneBodies cone1 fullCallees) "cone::helper1" [] (.uint .u32) .rust [] [] ∧
-    internFnPtr (Memory.withCalleeCtx [helper1Mir] none [] [] emptyMemory) "cone::helper1" [] none =
+    internFnPtr (Memory.withCalleeCtx [helper1Mir] none [] emptyMemory) "cone::helper1" [] none =
       (let (aid, m') := internFnPtr emptyMemory "cone::helper1" [] none
-       (aid, Memory.withCalleeCtx [helper1Mir] none [] [] m')) ∧
+       (aid, Memory.withCalleeCtx [helper1Mir] none [] m')) ∧
     isNonSelectIntrinsicOpt (classifyRustIntrinsic? "cone::helper1") = true ∧
     evalDirectRustIntrinsic? s none
         { defPath := "cone::helper1", typeArgs := [], fnSig := none, isIndirect := false }
         [] emptyLayoutTable [] [] [] p 0 .continue_ = none :=
   ⟨checkCalleeSig_nil_eq_of_findCallee_eq [] (.uint .u32) .rust []
       (cone_agree "cone::helper1" (List.Mem.head _)),
-   internFnPtr_withCalleeCtx [helper1Mir] none [] [] emptyMemory "cone::helper1" [] none,
+   internFnPtr_withCalleeCtx [helper1Mir] none [] emptyMemory "cone::helper1" [] none,
    isNonSelectIntrinsicOpt_of_eq_none rfl,
    evalDirectRustIntrinsic?_eq_none_of_classify rfl⟩
 

@@ -231,11 +231,13 @@ lines again after a successful build, touch
 - `abiArgMismatch_noUB_transfer_fails`, `abiRetMismatch_noUB_transfer_fails`,
   `argCountMismatch_noUB_transfer_fails`,
   `callDestArgAlias_noUB_transfer_fails`,
-  `callProjMoveReuse_noUB_transfer_fails`,
-  `uninitProjCallDest_ub_transfer_fails`, and
+  `callProjMoveReuse_noUB_transfer_fails`, and
   `stmtMoveThenCallArg_ub_transfer_fails` refute the conclusions of the
   transfer theorems for the corresponding rejected callers, so none of these
-  side-conditions of `progInFragment` is vacuous.
+  side-conditions of `progInFragment` is vacuous. (`uninitProjCallDest_agreement`
+  records that the former `tupleInitOk` counterexample now agrees: since
+  Episode 1's `writeReturnDestination` hardening Anneal also returns `-5i8`
+  without UB, so `tupleInitOk` is conservative for that caller shape.)
 
 ## Known limitations
 

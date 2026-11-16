@@ -1166,11 +1166,12 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `frozenWrite` (UB in Anneal only, while returning `9` on both `BasicMemory`
   and `MachTB` because `PtrType::Raw` has `safe_pointee = None` so
   `ReborrowSettings::new` is `None`), `twoPhaseForeignWriteDiscrepancy` and
-  `twoPhaseDirectWriteTreeBorrowsGap` (foreign dereference write faulting in
+  `twoPhaseDirectWriteTreeBorrows` (foreign dereference write faulting in
   both Anneal and `MachTB` vs returning `99` in `BasicMemory`, and direct write
-  `_1 = 99` returning `99` in both Anneal — whose `updateBorrowPerm` leaves
-  `.reserved` unchanged when `writerTag = .none` — and `BasicMemory`, while
-  faulting on `MachTB` with `"Tree Borrows: local read of Disabled reference"`),
+  `_1 = 99` faulting in both Anneal — whose `updateBorrowPerm` disables the
+  unprotected `.reservedFrz false` entry when `writerTag = .none` — and `MachTB`
+  with `"Tree Borrows: local read of Disabled reference"`, while returning `99`
+  on `BasicMemory`; `twoPhaseDirectWriteTreeBorrows_simulation`),
   `frozenRefMutReborrow`, `frozenRefMutReborrowWrite`, and
   `disabledRefReborrow` (`frozenRefMutReborrow` faulting eagerly at `&mut (*_2)`
   in Anneal while returning `5` on both `BasicMemory` and `MachTB` because lazy
@@ -1179,14 +1180,15 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   while returning `9` on `BasicMemory`, and `disabledRefReborrow` faults at the
   reborrow in both Anneal and `MachTB` while returning `9` on `BasicMemory`),
   `retagFnEntryProtectorWrite`,
-  `retagTrulyDisabledRefUb`, `retagFnEntryLocalDeallocUb`, and
+  `retagTrulyDisabledRefUb`, `retagFnEntryLocalDealloc`, and
   `retagScalarDiscrepancy` (`retagFnEntryProtectorWrite` faulting at `_1 = 9` in
   both Anneal and `MachTB` while returning `9` on `BasicMemory`;
   `retagTrulyDisabledRefUb` where a foreign direct write disables `_2` so both
   Anneal and `MachTB` fault at `Retag(Default, _2)`;
-  `retagFnEntryLocalDeallocUb` returning `5` in both Anneal and `BasicMemory`
-  while faulting at `Terminator::Return` on `MachTB` because `deallocAllM`
-  deallocates the strongly protected callee local `_1` before `end_call`; and
+  `retagFnEntryLocalDealloc` faulting at `Terminator::Return` in both Anneal
+  (`checkCalleeLocalDeallocTreeUB`) and `MachTB` (because `deallocAllM`
+  deallocates the strongly protected callee local `_1` before `end_call`) while
+  returning `5` on `BasicMemory` (`retagFnEntryLocalDealloc_simulation`); and
   `Retag(Default, _1)` on a `u32` scalar local faulting in Anneal while
   `Machine::retag_val` treats `Value::Int` as a no-op on both `BasicMemory` and
   `MachTB`), and `transmuteSharedRefToMutWriteDiscrepancy` /
@@ -1205,10 +1207,11 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   witnesses: `pairSplitReborrowOk` vs. `pairParentWriteDisablesChild` (`(u32, u32)`
   disjoint field `&mut` reborrows succeeding across all three vs. parent write
   disabling child `p0` on Anneal and `MachTB`), `unsafeCellUnprotInteriorMut`
-  (`77` across all three) vs. `unsafeCellProtectedInteriorMut` (`Retag([fn entry], r)`
+  (`77` across all three) and `unsafeCellProtectedInteriorMutMir` (`Retag([fn entry], r)`
   on `&UnsafeCell<u32>` returning `77` on `Mach` and `MachTB` via `PermissionProt::Cell`
-  with `prevents_deallocation = false` while faulting in Anneal's
-  `hasProtectedWriteConflict`), `exposeSingleRefMutRoundTrip` (`88` across all
+  with `prevents_deallocation = false`, and in Anneal via the protected `.cell`
+  permission; `unsafeCellProtectedInteriorMut_simulation` and the `StorageDead`
+  canary `unsafeCellProtectedStorageDead_simulation`), `exposeSingleRefMutRoundTrip` (`88` across all
   three), `exposeSharedRefWriteUb` (UB on Anneal and `MachTB` vs. `88` on `Mach`),
   `exposeTwoRefMutAngelicUnsupported` (`88` on Anneal and `Mach` vs.
   `Stop.unsupported` on `MachTB` when two live `&mut` tags meet at `int2ptr`),
@@ -1512,16 +1515,21 @@ These are deliberate and are the first things to lift:
     `retagTrulyDisabledRefUb`, `parentDerefCopyDisablesChild`), writing directly while a function-entry protector
     is active (`retagFnEntryProtectorWrite`), writing directly to a local with an
     unprotected `Freeze` `Reserved` two-phase borrow
-    (`twoPhaseDirectWriteTreeBorrowsGap`, where Anneal's `writerTag = .none`
-    unsoundly preserves `.reserved`), and returning with a function-entry
-    protector attached to a callee-owned local (`retagFnEntryLocalDeallocUb`,
-    where `deallocAllM` runs `StorageDead` before `end_call` while Anneal skips
-    local-teardown protector checks) all raise ground-truth Tree Borrows UB on
-    `MachTB`, whereas on `!Freeze` `&UnsafeCell<T>` with `Retag([fn entry], r)`
-    (`unsafeCellProtectedInteriorMut`), `MachTB` uses `PermissionProt::Cell`
-    (`prevents_deallocation = false`) and succeeds while Anneal's
-    `hasProtectedWriteConflict` over-approximates `writerTag = some _` as
-    conflicting even for `!Freeze` `.reserved` entries.
+    (`twoPhaseDirectWriteTreeBorrows`, where Anneal's `writerTag = .none` now
+    disables the unprotected `.reservedFrz false` entry), and returning with a
+    function-entry protector attached to a callee-owned local
+    (`retagFnEntryLocalDealloc`, where `deallocAllM` runs `StorageDead` before
+    `end_call` and Anneal's `checkCalleeLocalDeallocTreeUB` checks local-teardown
+    protectors) all raise ground-truth Tree Borrows UB on `MachTB` and in Anneal
+    (`twoPhaseDirectWriteTreeBorrows_simulation`,
+    `retagFnEntryLocalDealloc_simulation`), whereas on `!Freeze` `&UnsafeCell<T>`
+    with `Retag([fn entry], r)` (`unsafeCellProtectedInteriorMutMir`), `MachTB` uses
+    `PermissionProt::Cell` (`prevents_deallocation = false`) and Anneal's protected
+    `.cell` permission is exempt from `hasProtectedWriteConflict`, so all three
+    return `77` (`unsafeCellProtectedInteriorMut_simulation`). Remaining Tree
+    Borrows follow-up (`DIV-MR-TB-DIRECT-LOCAL-ACCESS`): general ancestor/child
+    read-vs-write transitions on direct local accesses beyond unprotected `Freeze`
+    `Reserved` root writes are not yet claimed complete.
   - *Misaligned sub-scalar offsets, integer-to-pointer transmutes, and provenance exposure*:
     stride-scaled `BinOp::Offset` and array element byte-offset dereferencing
     agree with MiniRust (`offsetDeref`), and under the places-ptr `Trusted`
@@ -1636,12 +1644,12 @@ These are deliberate and are the first things to lift:
      `callerBorrowExposeAndScalarCall_three_way` witnesses a strict 2-function
      superset combining `Call`, `&mut`, `&raw mut`, `Retag`, `Assume`, and
      provenance casts with 3-way agreement (`92` + `MirNoUBTree`). Across
-     returning `Call`s, `ptrAliasingProgOk` (`ptrTermStep`) disables active caller
-     borrows because Anneal's `Statements.evalStmt` runs
-     `invalidateConflictingBorrows` on the shared `s.memory.borrows` table for
-     every callee root assignment (`callerBorrowAcrossScalarCall_divergence`,
-     where both bodies individually satisfy `ptrAliasingOk = true` yet Anneal
-     faults after `Return` while `Mach` and `MachTB` return `42`). Moreover,
+     returning `Call`s, `ptrAliasingProgOk` (`ptrTermStep`) conservatively disables
+     active caller borrows (historically because Anneal's `Statements.evalStmt` ran
+     `invalidateConflictingBorrows` on the shared `s.memory.borrows` table for every
+     callee root assignment; with frame-scoped `BorrowEntry.targetFrameDepth` Anneal
+     now preserves the caller borrow and returns `42` like `Mach` and `MachTB`,
+     `callerBorrowAcrossScalarCall_simulation`). Moreover,
      because `ptrTermStep` forces a caller that mutates `_1` through a borrow both
      before and after a scalar `Call` to create a fresh borrow after `Return`,
      exposing both the pre-call borrow and the post-call fresh borrow in the same
@@ -1666,15 +1674,14 @@ These are deliberate and are the first things to lift:
      the syntactic translatability check for multi-function programs that pass
      pointers or references across `Call` boundaries
      (`progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable`). Such
-     programs lie outside sound Anneal–MiniRust correspondence because Anneal's
-     `Terminators.evalTerminator` saves caller locals on `s.memory.callStack`
-     without rebinding `BorrowEntry.targetLocal : Nat` across frames — which not
-     only faults on `callRefMutProtectedRoundTrip_three_way` (and overwrites
-     `callee.frame.locals[1]` on `callRefMutProtectorViolation_three_way`), but
-     can **silently return a wrong scalar with `MirNoUBTree`** when the callee's
-     colliding local slot holds a same-typed scalar
-     (`callerRefMutSilentWrongLocal_divergence`: Anneal returns `137` with no UB
-     while `Mach` and `MachTB` return `42`). Single-body programs admitted by
+     programs lie outside the general Anneal–MiniRust correspondence theorem.
+     Historically Anneal's `Terminators.evalTerminator` saved caller locals on
+     `s.memory.callStack` without rebinding `BorrowEntry.targetLocal : Nat` across
+     frames and could silently return a wrong scalar (`137`) with `MirNoUBTree`;
+     with frame-scoped `BorrowEntry.targetFrameDepth` and
+     `readPlaceThroughCallerChain` / `writePlaceThroughCallerChain`, the concrete
+     witnesses now agree 3-way (`callerRefMutSilentWrongLocal_simulation`: `42`;
+     `callRefMutProtectedRoundTrip_three_way`: `84`). Single-body programs admitted by
      Pass B3's unguarded predicate (`progInFragmentWithIntrinsicsB3`) are also
      recorded: `exposeSharedRefWriteUb_B3_divergence` still diverges, while the
      historically named `exposeTwice_B3_divergence`,

@@ -180,11 +180,19 @@ def retarget_fixture_divergences(dest: Path) -> None:
     """The synthetic correspondence file replaces the real one, so point the suite copy's
     Pillar 3 divergences witnessed by that file at the stand-in's manifest theorems."""
     real = audit.load_suite_module(REPO_ROOT).TRACKED_CORRESPONDENCE_DIVERGENCES
-    stand_ins = ("tail_leanmiri_root", "opaque_trusted_read", "tail_negative_root", "tail_negative_arity", "tail_positive")
+    stand_ins = (
+        "tail_leanmiri_root",
+        "opaque_trusted_read",
+        "tail_negative_root",
+        "tail_negative_arity",
+        "tail_positive",
+        "opaque_negative",
+    )
     path = dest / SUITE
     text = path.read_text(encoding="utf-8")
     witnessed_here = [d for d in real if d["file"] == CORR]
     assert witnessed_here, "no tracked divergence is witnessed by the correspondence test"
+    assert len(witnessed_here) <= len(stand_ins), "add a distinct fixture stand-in per divergence"
     for i, item in enumerate(witnessed_here):
         anchor = f'"witness_symbol": "{item["witness_symbol"]}"'
         assert text.count(anchor) == 1, anchor
@@ -515,6 +523,44 @@ class ManifestTests(AuditFixtureTestCase):
         self.assert_error(report, "c_variant_manifest", "duplicate divergence witness `tail_negative_root`")
         tracked = audit.run_audit(self.base)["checks"]["c_variant_manifest"]["details"]["tracked_divergences"]
         self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", tracked)
+
+    def test_resolved_divergence_needs_a_manifest_resolution_theorem(self) -> None:
+        # Switch-to-pass: once the witness (the fixture stand-in `opaque_trusted_read` of
+        # DIV-TR-OPAQUECAST-ROOT-DISPATCH) is replaced by the entry's `resolution_symbol`, which is
+        # a kernel-audited manifest theorem, the registry cross-check accepts the resolved entry.
+        resolution = "opaqueCast_trusted_root_dispatch_simulation"
+        self.edit(CORR, "opaque_trusted_read", resolution, count=-1)
+        report = self.run_checks()
+        self.assert_only_failures(report, set())
+        resolved = report["checks"]["c_variant_manifest"]["details"]["tracked_resolutions"]
+        self.assertEqual(resolved["DIV-TR-OPAQUECAST-ROOT-DISPATCH"], resolution)
+        # Keeping the old witness alongside its resolution is rejected.
+        self.edit(CORR, "def tailCallTerm", "private theorem opaque_trusted_read : 1 = 1 := rfl\n\ndef tailCallTerm")
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(
+            report,
+            "c_variant_manifest",
+            f"declares both its witness `opaque_trusted_read` and its resolution `{resolution}`",
+        )
+
+    def test_resolution_theorem_outside_the_manifest_is_rejected(self) -> None:
+        # A declared `resolution_symbol` must itself be a manifest theorem (non-vacuity audited).
+        resolution = "opaqueCast_trusted_root_dispatch_simulation"
+        self.edit(CORR, "def tailCallTerm", f"theorem {resolution} : 1 = 1 := rfl\n\ndef tailCallTerm")
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(
+            report,
+            "c_variant_manifest",
+            f"resolution theorem `{resolution}` of DIV-TR-OPAQUECAST-ROOT-DISPATCH is declared but is not a manifest theorem",
+        )
+        # A witness that vanished without a manifest resolution theorem is still rejected.
+        self.edit(CORR, f"theorem {resolution} : 1 = 1 := rfl\n", "")
+        self.edit(CORR, "opaque_trusted_read", "opaque_trusted_read_renamed", count=-1)
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(report, "c_variant_manifest", "witness `opaque_trusted_read` is not a manifest theorem")
 
     def test_public_theorem_outside_the_manifest_is_rejected(self) -> None:
         # A public helper theorem escapes the run_cmd non-vacuity audit; a private one is fine.

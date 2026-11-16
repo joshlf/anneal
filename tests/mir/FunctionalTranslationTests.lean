@@ -695,9 +695,13 @@ def advanceCursorMutPlan : TransPlan :=
 
 /--
 `MutRefLocalSpec FrameCursor Bool` connecting `advanceCursorMutMirBody` to pure
-`FrameCursor.advancePure` while certifying the exact Tree Borrows tag `1`
-permission on local `1` at function exit (`.active` when the conditional field
-write executes, `.reservedFrz false` when no write occurs).
+`FrameCursor.advancePure` while certifying the exact Tree Borrows entry of tag
+`1` on local `1` at function exit. Inside the body the tag is `.active` after
+the conditional field write and `.reservedFrz false` when no write occurs (see
+`advanceCursorMutBb3BranchState`); the root `Return` then deallocates the
+frame's locals and disables every tag minted from them (`disableFrameBorrows`,
+`DIV-MR-TB-FNENTRY-LOCAL-DEALLOC`), so at exit the entry is `.disabled` with
+`allocDead := true` on both paths.
 -/
 def advanceCursorMutSpec : MutRefLocalSpec FrameCursor Bool where
   body := advanceCursorMutMirBody
@@ -714,17 +718,14 @@ def advanceCursorMutSpec : MutRefLocalSpec FrameCursor Bool where
     match extraArgs with
     | [.scalar ⟨delta, 4⟩] => FrameCursor.advancePure delta
     | _ => fun c => (c, false)
-  postMem c extraArgs _ mem' :=
-    let wrote :=
-      match extraArgs with
-      | [.scalar ⟨delta, 4⟩] => (FrameCursor.advancePure delta c).2
-      | _ => false
+  postMem _ _ _ mem' :=
     lookupBorrow mem'.borrows 1 =
       some {
         tag := 1
         targetLocal := 1
         targetProjection := []
-        perm := if wrote then .active else .reservedFrz false
+        perm := .disabled
+        allocDead := true
       }
 
 private def advanceCursorMutPreSwitchState
@@ -836,7 +837,7 @@ private theorem advanceCursorMut_wpTransPlan
              { emptyMemory with
                borrows :=
                  [{ tag := 1, targetLocal := 1, targetProjection := [],
-                    perm := if res.2 then .active else .reservedFrz false }]
+                    perm := .disabled, allocDead := true }]
                nextTag := 2 }))
       (initMachineStateWithMemory advanceCursorMutMirBody
         [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) := by
@@ -862,7 +863,8 @@ private theorem advanceCursorMut_wpTransPlan
 Symbolic total & stateful verification of `advanceCursorMutMirBody` against
 `FrameCursor.advancePure` for all `c : FrameCursor` (`c.pos, c.len < 10000`) and
 `delta < 10000` — proved via `TransPlan.splitBranch` tracking the exact Tree
-Borrows `.reservedFrz false` → `.active` activation on the write branch.
+Borrows `.reservedFrz false` → `.active` activation on the write branch, after
+which the root `Return` disables the frame-local tag (`disableFrameBorrows`).
 -/
 theorem advanceCursorMutSpec_total_and_stateful_verified :
     TotalVerificationResult advanceCursorMutSpec.toTotalClaim ∧

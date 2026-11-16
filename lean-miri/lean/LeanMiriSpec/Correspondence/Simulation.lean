@@ -3230,7 +3230,11 @@ theorem WellTypedScalarOperand.validateLoadedValue_eq_true
     by_cases hk : decl.ty.kind = .bool
     · obtain ⟨sc, _, rfl, _, _, _, hbool, _⟩ := himm.of_primitive_scalar (Or.inl hk)
       rcases (hbool hk).2 with hb | hb <;> simp [hk, hb]
-    · cases h : decl.ty.kind <;> simp_all
+    · by_cases hkc : decl.ty.kind = .char
+      · obtain ⟨sc, _, rfl, _, _, _, _, hchar⟩ := himm.of_primitive_scalar (Or.inr (Or.inl hkc))
+        obtain ⟨hsz, hv⟩ := hchar hkc
+        simp [hkc, hsz, hv]
+      · cases h : decl.ty.kind <;> simp_all
 
 
 theorem annealEvalOperand_copy_dead
@@ -4937,7 +4941,7 @@ theorem step_assign_scalar_simulation_ext
       | ub m' msg =>
         have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; rw [hkind]
-          simp [evalRvalue, hbor, hcaller, ha_op]
+          simp [evalRvalue, hstack, hbor, hcaller, ha_op]
         have hm_err : Miri.Interpreter.Step.evalStatement
             (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
             (m', .error (.undefinedBehavior msg)) := by
@@ -4961,7 +4965,7 @@ theorem step_assign_scalar_simulation_ext
               .ok val locals₁ s.memory := by
             unfold evalRvalue
             dsimp only
-            rw [hbor, hcaller, ha_op]
+            rw [hstack, hbor, hcaller, ha_op]
             dsimp only
             rw [hvalid_op]
             cases op with
@@ -5026,7 +5030,7 @@ theorem step_assign_scalar_simulation_ext
       | ub m' msg =>
         have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; rw [hkind]
-          cases huop <;> simp [evalRvalue, hbor, hcaller, ha_op]
+          cases huop <;> simp [evalRvalue, hstack, hbor, hcaller, ha_op]
         have hm_err : Miri.Interpreter.Step.evalStatement
             (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
             (m', .error (.undefinedBehavior msg)) := by
@@ -5052,8 +5056,8 @@ theorem step_assign_scalar_simulation_ext
           have hrv_ok : evalRvalue s.frame.locals (.unaryOp uop op) s.memory body.localDecls body.layouts =
               .ok v' locals₁ s.memory := by
             cases uop with
-            | not => unfold evalRvalue; dsimp only; rw [hbor, hcaller, ha_op]; exact ha_uop
-            | neg => unfold evalRvalue; dsimp only; rw [hbor, hcaller, ha_op]; exact ha_uop
+            | not => unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; exact ha_uop
+            | neg => unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; exact ha_uop
             | ptrMetadata => cases huop
           rw [hrv_ok]
           dsimp only
@@ -5139,7 +5143,7 @@ theorem step_assign_scalar_simulation_ext
       | ub m' msg =>
         have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; rw [hkind]
-          simp [evalRvalue, hbor, hcaller, ha_lhs]
+          simp [evalRvalue, hstack, hbor, hcaller, ha_lhs]
         have hm_err : Miri.Interpreter.Step.evalStatement
             (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
             (m', .error (.undefinedBehavior msg)) := by
@@ -5161,9 +5165,9 @@ theorem step_assign_scalar_simulation_ext
         | ub m'' msg =>
           have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
             unfold evalStmt; rw [hkind]
-            simp [evalRvalue, hbor, hcaller, ha_lhs, ha_rhs]
+            simp [evalRvalue, hstack, hbor, hcaller, ha_lhs, ha_rhs]
           have hm_err : Miri.Interpreter.Step.evalStatement
-              (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
+               (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
               (m'', .error (.undefinedBehavior msg)) := by
             rw [hm_eval]
             unfold Miri.Interpreter.runRvalue
@@ -5207,7 +5211,7 @@ theorem step_assign_scalar_simulation_ext
             have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
               unfold evalStmt; rw [hkind]; dsimp only
               unfold evalRvalue; dsimp only
-              rw [hbor, hcaller, ha_lhs]
+              rw [hstack, hbor, hcaller, ha_lhs]
               dsimp only
               rw [ha_rhs]
               dsimp only
@@ -5236,7 +5240,7 @@ theorem step_assign_scalar_simulation_ext
               have hrv_ok : evalRvalue s.frame.locals (.binaryOp bop lhsOp rhsOp) s.memory body.localDecls body.layouts =
                   .ok v' locals₂ s.memory := by
                 unfold evalRvalue; dsimp only
-                rw [hbor, hcaller, ha_lhs]
+                rw [hstack, hbor, hcaller, ha_lhs]
                 dsimp only
                 rw [ha_rhs]
                 dsimp only
@@ -5498,10 +5502,19 @@ theorem step_terminator_goto_return_simulation
   · obtain ⟨slot0, mls0, _, _, hslot0, hmls0, _, hloc0⟩ := hframe.lookup_local hdecl0
     have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
     have himm0' := himm0 topFrame hframes mls0 hmls0
+    have hmem_ret :
+        { nextAllocId := s.memory.nextAllocId, globals := s.memory.globals,
+          borrows := [], nextTag := s.memory.nextTag, callees := s.memory.callees,
+          traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
+          activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
+          nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
+          fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+      cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
     unfold evalTerminator translateTerminator
       Miri.Interpreter.ControlFlow.evalTerminator
-    rw [hret, hstack, annealTerminatorHooks_toControlHooks, hslot0]
-    dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+    rw [hret, hstack, hbor, hprot, annealTerminatorHooks_toControlHooks, hslot0]
+    dsimp only [translateTerminatorKind, Id.run, Pure.pure,
+      hasFrameDeallocProtectorConflict, disableFrameBorrows]
     cases hloc0 with
     | dead cachedLayout _ =>
       rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
@@ -5514,7 +5527,8 @@ theorem step_terminator_goto_return_simulation
       · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
         exact StepRel.ub _ _
-      · cases himmRel with
+      · rw [hmem_ret]
+        cases himmRel with
         | unit hzero =>
           exact False.elim (hsz0 hzero)
         | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
@@ -5851,7 +5865,7 @@ theorem evalStmt_step_location
           subst h; exact ⟨rfl, rfl⟩
         | cons ph pt =>
           dsimp only
-          cases hasProtectedLocalBorrow s.memory.borrows (ph :: pt) l with
+          cases hasProtectedLocalBorrow s.memory.borrows (ph :: pt) l (length s.memory.callStack) with
           | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
           | false =>
             intro hstep
@@ -5873,7 +5887,7 @@ theorem evalStmt_step_location
           subst h; exact ⟨rfl, rfl⟩
         | cons ph pt =>
           dsimp only
-          cases hasProtectedLocalBorrow s.memory.borrows (ph :: pt) l with
+          cases hasProtectedLocalBorrow s.memory.borrows (ph :: pt) l (length s.memory.callStack) with
           | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
           | false =>
             intro hstep
@@ -5904,7 +5918,7 @@ theorem evalStmt_step_location
               subst h; exact ⟨rfl, rfl⟩
             | cons protHead protTail =>
               dsimp only
-              cases hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx none with
+              cases hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx none [] 0 0 (length mem₁.callStack) with
               | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
               | false =>
                 intro hstep
@@ -5923,7 +5937,7 @@ theorem evalStmt_step_location
               subst h; exact ⟨rfl, rfl⟩
             | cons protHead protTail =>
               dsimp only
-              cases hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx none with
+              cases hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx none [] 0 0 (length mem₁.callStack) with
               | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
               | false =>
                 intro hstep
@@ -5987,7 +6001,11 @@ theorem ValidFrameLocation.preserved
         cases slot with
         | dead => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
         | uninit => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
-        | init _ => exact fun hstep => absurd hstep MirStepNode_retNormal_ne_step
+        | init _ =>
+          dsimp only
+          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors (length []) (length s.frame.locals) with
+          | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
+          | false => exact fun hstep => absurd hstep MirStepNode_retNormal_ne_step
     · unfold evalTerminator at hstep
       rw [hunreach] at hstep
       exact absurd hstep MirStepNode_fail_ne_step
@@ -6065,7 +6083,11 @@ theorem NonAddrTakenImmediate.preserved
           cases slot with
           | dead => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
           | uninit => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
-          | init _ => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
+          | init _ =>
+            dsimp only
+            cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors (length []) (length s.frame.locals) with
+            | true => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
+            | false => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
     · rcases hstate with ⟨topFrame, hframes, _, _, hframe, _, _, _, _, _⟩
       have hm_step := miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none
       unfold translateTerminator Miri.Interpreter.ControlFlow.evalTerminator at hm_step
@@ -6256,6 +6278,39 @@ theorem run_wellTypedBody_bisim
       fun _ _ _ _ hc => (by cases hc),
       ⟨fun _ => ⟨m', msg, rfl⟩, fun _ => rfl⟩,
       Or.inr (Or.inr rfl)⟩
+
+@[simp]
+theorem evalOperand_borrows_nil_callStack_eq
+    (locals : List LocalSlot) (op : MirAst.Operand)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperand locals op .nil globals layouts callerLocals localDecls callStack =
+      evalOperand locals op .nil globals layouts callerLocals localDecls .nil := by
+  cases op with
+  | constant _ => rfl
+  | copy p | move p =>
+    rcases p with ⟨loc, projs⟩
+    cases projs with
+    | nil => rfl
+    | cons hd tl => cases hd <;> rfl
+
+@[simp]
+theorem evalOperands_borrows_nil_callStack_eq
+    (locals : List LocalSlot) (ops : List MirAst.Operand)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperands locals ops .nil globals layouts callerLocals localDecls callStack =
+      evalOperands locals ops .nil globals layouts callerLocals localDecls .nil := by
+  induction ops generalizing locals with
+  | nil => rfl
+  | cons op rest ih =>
+    unfold evalOperands
+    rw [evalOperand_borrows_nil_callStack_eq]
+    cases evalOperand locals op .nil globals layouts callerLocals localDecls .nil with
+    | ub | unsupported => rfl
+    | ok _ locals' => dsimp only []; rw [ih locals']
 
 end LeanMiriSpec.Correspondence
 

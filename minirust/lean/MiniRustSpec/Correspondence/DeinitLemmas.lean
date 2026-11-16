@@ -353,7 +353,8 @@ theorem evalStmt_retag_field {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutT
   cases leafVal with
   | scalar sc =>
     have hop : evalOperand s.frame.locals (.copy ⟨i, .field idx fieldTy :: rest⟩)
-        s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls =
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls
+        s.memory.callStack =
         .ok (.scalar sc) s.frame.locals := by
       rw [evalOperand_copy_nonDeref s.frame.locals ⟨i, .field idx fieldTy :: rest⟩ hnd
         s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls hnu]

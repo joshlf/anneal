@@ -145,6 +145,11 @@ def arrU32_2Decl : LocalDecl := { mutability := .mut, ty := arrU32_2Ty, debugNam
 /-- The place `*_i`. -/
 def derefPlace (i : Nat) : Place := { local_ := i, projection := [.deref] }
 
+/-- Post-return borrow entries after `TerminatorKind.return_` runs
+`disableFrameBorrows` on frame-0 locals. -/
+def retBorrows (entries : List BorrowEntry) : List BorrowEntry :=
+  entries.map fun e => { e with perm := .disabled, allocDead := true }
+
 /-- A body with one `u32` argument `_1` returning `u32` in `_0`, whose only
 block runs `stmts` and returns. -/
 def ptrBody (name : String) (decls : List LocalDecl) (stmts : List StatementKind) :
@@ -241,7 +246,7 @@ entry with tag `1` that `&raw mut _1` pushed. -/
 theorem ptrRoundTrip_anneal_ret :
     ReachesRet (mirTree ptrRoundTrip ptrRoundTripS0) []
       (.normal (.scalar ⟨6, 4⟩,
-        { ptrRoundTripS0.memory with borrows := [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
+        { ptrRoundTripS0.memory with borrows := retBorrows [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
   runA_sound ptrRoundTrip 30 _ _ _ rfl
 
 theorem ptrRoundTrip_noUB :
@@ -405,7 +410,7 @@ theorem arrayParamPtr_anneal_ret :
     ReachesRet (mirTree arrayParamPtr arrayParamPtrS0) []
       (.normal (.scalar ⟨19, 4⟩,
         { arrayParamPtrS0.memory with
-          borrows := [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 true),
+          borrows := retBorrows [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 true),
                       rawPtrEntry 1 .mut (placeConstIdx 1 2 2 true)],
           nextTag := 3 })) :=
   runA_sound arrayParamPtr 40 _ _ _ rfl
@@ -565,7 +570,7 @@ theorem fieldPtr_anneal_ret :
     ReachesRet (mirTree fieldPtr fieldPtrS0) []
       (.normal (.scalar ⟨100, 4⟩,
         { fieldPtrS0.memory with
-          borrows := [rawPtrEntry 1 .mut (placeField 1 [(1, u32Ty)])], nextTag := 2 })) :=
+          borrows := retBorrows [rawPtrEntry 1 .mut (placeField 1 [(1, u32Ty)])], nextTag := 2 })) :=
   runA_sound fieldPtr 30 _ _ _ rfl
 
 theorem fieldPtr_noUB :
@@ -734,7 +739,7 @@ theorem nestedFieldPtr_anneal_ret :
     ReachesRet (mirTree nestedFieldPtr nestedFieldPtrS0) []
       (.normal (.scalar ⟨59, 4⟩,
         { nestedFieldPtrS0.memory with
-          borrows := [rawPtrEntry 2 .mut (placeField 1 [(1, u16Ty)]),
+          borrows := retBorrows [rawPtrEntry 2 .mut (placeField 1 [(1, u16Ty)]),
                       rawPtrEntry 1 .mut (placeField 1 [(0, innerTupleTy), (1, u32Ty)])],
           nextTag := 3 })) :=
   runA_sound nestedFieldPtr 40 _ _ _ rfl
@@ -903,7 +908,7 @@ table still holds the `Active` entry of `&raw mut _1`. -/
 theorem ptrCountdown_anneal_ret :
     ReachesRet (mirTree ptrCountdown ptrCountdownS0) ptrCountdownTrace
       (.normal (.scalar ⟨3, 4⟩,
-        { ptrCountdownS0.memory with borrows := [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
+        { ptrCountdownS0.memory with borrows := retBorrows [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
   runA_sound ptrCountdown 40 _ _ _ rfl
 
 theorem ptrCountdown_noUB : MirNoUBTree (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) :=
@@ -1069,7 +1074,7 @@ theorem constBorrowLoop_anneal_ret :
     ReachesRet (mirTree constBorrowLoop constBorrowLoopS0) constBorrowLoopTrace
       (.normal (.scalar ⟨15, 4⟩,
         { constBorrowLoopS0.memory with
-          borrows := [rawPtrEntry 3 .not (local_ 1), rawPtrEntry 2 .not (local_ 1),
+          borrows := retBorrows [rawPtrEntry 3 .not (local_ 1), rawPtrEntry 2 .not (local_ 1),
                       rawPtrEntry 1 .not (local_ 1)],
           nextTag := 4 })) :=
   runA_sound constBorrowLoop 50 _ _ _ rfl
@@ -1214,7 +1219,7 @@ theorem repointPtr_anneal_ret :
     ReachesRet (mirTree repointPtr repointPtrS0) []
       (.normal (.scalar ⟨105, 4⟩,
         { repointPtrS0.memory with
-          borrows := [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
+          borrows := retBorrows [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
                       rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
           nextTag := 3 })) :=
   runA_sound repointPtr 30 _ _ _ rfl
@@ -2341,7 +2346,7 @@ theorem exposeTwice_anneal_ret :
     ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨0, 4⟩,
         { (initMachineState exposeTwice [.scalar ⟨5, 4⟩]).memory with
-          borrows := [rawPtrEntry 2 .not (local_ 1), rawPtrEntry 1 .not (local_ 1)],
+          borrows := retBorrows [rawPtrEntry 2 .not (local_ 1), rawPtrEntry 1 .not (local_ 1)],
           exposedAllocIds := [2, 1],
           nextTag := 3 })) :=
   runA_sound exposeTwice 30 _ _ _ rfl

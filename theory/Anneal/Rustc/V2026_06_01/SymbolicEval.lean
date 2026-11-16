@@ -1187,12 +1187,10 @@ def finishBinOpOffsetSymTree
      | .some bound =>
        Bool.or
          (Bool.and
-           (Nat.beq ptrVal.allocId 0)
+           (Nat.beq bound 0)
            (Bool.and
-             (Nat.beq bound 0)
-             (Bool.and
-               (Nat.beq newOffset ptrVal.offsetBytes)
-               (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes)))))
+             (Nat.beq newOffset ptrVal.offsetBytes)
+             (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes))))
          (Bool.and
            (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) bound))
            (Bool.and
@@ -1217,12 +1215,10 @@ theorem finishBinOpOffsetSymTree_eval
          | .some bound =>
            Bool.or
              (Bool.and
-               (Nat.beq ptrVal.allocId 0)
+               (Nat.beq bound 0)
                (Bool.and
-                 (Nat.beq bound 0)
-                 (Bool.and
-                   (Nat.beq newOffset ptrVal.offsetBytes)
-                   (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes)))))
+                 (Nat.beq newOffset ptrVal.offsetBytes)
+                 (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes))))
              (Bool.and
                (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) bound))
                (Bool.and
@@ -1309,18 +1305,16 @@ theorem evalBinOpOffsetSymTree_eval
           cases
             Bool.or
               (Bool.and
-                (Nat.beq ptrVal.allocId 0)
+                (Nat.beq bound 0)
                 (Bool.and
-                  (Nat.beq bound 0)
-                  (Bool.and
-                    (Nat.beq
-                      (Nat.sub ptrVal.offsetBytes
-                        (Nat.mul
-                          (Nat.sub (scalarModulus expectedPtrBytes)
-                            (wrapScalarBits offsetSc.bits (scalarModulus expectedPtrBytes)))
-                          elemStride))
-                      ptrVal.offsetBytes)
-                    (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes)))))
+                  (Nat.beq
+                    (Nat.sub ptrVal.offsetBytes
+                      (Nat.mul
+                        (Nat.sub (scalarModulus expectedPtrBytes)
+                          (wrapScalarBits offsetSc.bits (scalarModulus expectedPtrBytes)))
+                        elemStride))
+                    ptrVal.offsetBytes)
+                  (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes))))
               (Bool.and
                 (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) bound))
                 (Bool.and
@@ -1355,15 +1349,13 @@ theorem evalBinOpOffsetSymTree_eval
             cases
               Bool.or
                 (Bool.and
-                  (Nat.beq ptrVal.allocId 0)
+                  (Nat.beq bound 0)
                   (Bool.and
-                    (Nat.beq bound 0)
-                    (Bool.and
-                      (Nat.beq
-                        (Nat.add ptrVal.offsetBytes
-                          (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus expectedPtrBytes)) elemStride))
-                        ptrVal.offsetBytes)
-                      (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes)))))
+                    (Nat.beq
+                      (Nat.add ptrVal.offsetBytes
+                        (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus expectedPtrBytes)) elemStride))
+                      ptrVal.offsetBytes)
+                    (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) ptrVal.offsetBytes))))
                 (Bool.and
                   (Bool.not (Nat.ble (signedHalfModulus expectedPtrBytes) bound))
                   (Bool.and
@@ -1373,7 +1365,11 @@ theorem evalBinOpOffsetSymTree_eval
                         (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus expectedPtrBytes)) elemStride))
                       bound))) <;> rfl
 
-/-- Decision-tree symbolic `evalPtrOffsetBinOp`. -/
+/-- Decision-tree symbolic `evalPtrOffsetBinOp`.
+
+Pointer arithmetic checks allocation bounds only and is independent of the Tree
+Borrows permission of `ptrVal.tag` (`DIV-LM-D6-OFFSET-DISABLED-TAG`), so this
+mirror has no `.disabled`-tag early UB. -/
 def evalPtrOffsetBinOpSymTree
     (locals₂ : List LocalSlot)
     (mem : Memory)
@@ -1384,25 +1380,18 @@ def evalPtrOffsetBinOpSymTree
     (sz : Nat)
     (offsetSc : ScalarInt) :
     SymTree RvalueEvalResult :=
-  let borrowDisabled :=
-    match lookupBorrow mem.borrows ptrVal.tag with
-    | .some { perm := .disabled, .. } => true
-    | _ => false
-  match borrowDisabled with
-  | true => .leaf .ub
-  | false =>
-    match pointeeElemByteStride localDecls layouts lhsOp with
-    | .none => .leaf .ub
-    | .some elemStride =>
-      evalBinOpOffsetSymTree
-        ptrVal
-        sz
-        offsetSc
-        elemStride
-        (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal)
-        locals₂
-        mem
-        (layoutPointerBytes layouts)
+  match pointeeElemByteStride localDecls layouts lhsOp with
+  | .none => .leaf .ub
+  | .some elemStride =>
+    evalBinOpOffsetSymTree
+      ptrVal
+      sz
+      offsetSc
+      elemStride
+      (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal)
+      locals₂
+      mem
+      (layoutPointerBytes layouts)
 
 theorem evalPtrOffsetBinOpSymTree_eval
     (locals₂ : List LocalSlot)
@@ -1416,32 +1405,10 @@ theorem evalPtrOffsetBinOpSymTree_eval
     (evalPtrOffsetBinOpSymTree locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc).eval =
       evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc := by
   unfold evalPtrOffsetBinOpSymTree evalPtrOffsetBinOp
-  have h_stride :
-      (match pointeeElemByteStride localDecls layouts lhsOp with
-       | .none => SymTree.leaf RvalueEvalResult.ub
-       | .some elemStride =>
-         evalBinOpOffsetSymTree ptrVal sz offsetSc elemStride
-           (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal) locals₂ mem
-           (layoutPointerBytes layouts)).eval =
-      match pointeeElemByteStride localDecls layouts lhsOp with
-      | .none => RvalueEvalResult.ub
-      | .some elemStride =>
-        match evalBinOpOffset ptrVal sz offsetSc elemStride
-          (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal)
-          (layoutPointerBytes layouts) with
-        | .some newPtrVal => RvalueEvalResult.ok (Value.ptr newPtrVal sz) locals₂ mem
-        | .none => RvalueEvalResult.ub := by
-    cases pointeeElemByteStride localDecls layouts lhsOp with
-    | none => rfl
-    | some elemStride =>
-      exact evalBinOpOffsetSymTree_eval ptrVal sz offsetSc elemStride _ locals₂ mem (layoutPointerBytes layouts)
-  cases lookupBorrow mem.borrows ptrVal.tag with
-  | none => exact h_stride
-  | some entry =>
-    rcases entry with ⟨_, _, _, perm, _, _, _, _⟩
-    cases perm with
-    | disabled => rfl
-    | _ => exact h_stride
+  cases pointeeElemByteStride localDecls layouts lhsOp with
+  | none => rfl
+  | some elemStride =>
+    exact evalBinOpOffsetSymTree_eval ptrVal sz offsetSc elemStride _ locals₂ mem (layoutPointerBytes layouts)
 
 /-- Decision-tree symbolic `evalRvalue`. -/
 def evalRvalueSymTree
@@ -1452,9 +1419,9 @@ def evalRvalueSymTree
     (layouts : LayoutTable) : SymTree RvalueEvalResult :=
   match rv with
   | .binaryOp op lhsOp rhsOp =>
-    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | .ok lhsVal locals₁ =>
-      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
@@ -1481,6 +1448,7 @@ def evalRvalueSymTree
                   (layoutPointerBytes layouts)
                   ptrVal
                   sz
+                  mem.callStack
               with
               | .some lhsAddrSc =>
                 evalScalarBinOpSymTree op lhsAddrSc offsetSc locals₂ mem false
@@ -1499,6 +1467,7 @@ def evalRvalueSymTree
                 (layoutPointerBytes layouts)
                 ptrVal
                 sz
+                mem.callStack
             with
             | .some rhsAddrSc =>
               evalScalarBinOpSymTree op lhsSc rhsAddrSc locals₂ mem false
@@ -1517,7 +1486,8 @@ def evalRvalueSymTree
                 layouts
                 ptrBytes
                 lhsPtr
-                lhsSz,
+                lhsSz
+                mem.callStack,
               ptrAddressScalar?
                 locals₂
                 mem.borrows
@@ -1527,6 +1497,7 @@ def evalRvalueSymTree
                 ptrBytes
                 rhsPtr
                 rhsSz
+                mem.callStack
             with
             | .some lhsAddrSc, .some rhsAddrSc =>
               evalScalarBinOpSymTree op lhsAddrSc rhsAddrSc locals₂ mem false
@@ -1551,7 +1522,7 @@ def evalRvalueSymTree
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .unaryOp .not op =>
-    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | .ok (.scalar sc) locals' =>
       evalUnaryNotSymTree sc (operandTy localDecls layouts op) locals' mem
     | .ok _ _ => .leaf .unsupported
@@ -1570,12 +1541,12 @@ theorem evalRvalueSymTree_eval
   cases rv with
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalueSymTree, evalRvalue]
-    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok lhsVal locals₁ =>
       dsimp only
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok rhsVal locals₂ =>
@@ -1594,7 +1565,7 @@ theorem evalRvalueSymTree_eval
             | false => rfl
             | true =>
               dsimp only
-              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz mem.callStack with
               | none => rfl
               | some rhsAddrSc =>
                 exact evalScalarBinOpSymTree_eval op lhs rhsAddrSc locals₂ mem false
@@ -1611,7 +1582,7 @@ theorem evalRvalueSymTree_eval
               | false => rfl
               | true =>
                 dsimp only
-                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz mem.callStack with
                 | none => rfl
                 | some lhsAddrSc =>
                   exact evalScalarBinOpSymTree_eval _ lhsAddrSc offsetSc locals₂ mem false
@@ -1621,11 +1592,11 @@ theorem evalRvalueSymTree_eval
             | false => rfl
             | true =>
               dsimp only
-              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz mem.callStack with
               | none =>
-                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz <;> rfl
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz mem.callStack <;> rfl
               | some lhsAddrSc =>
-                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz with
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz mem.callStack with
                 | none => rfl
                 | some rhsAddrSc =>
                   exact evalScalarBinOpSymTree_eval op lhsAddrSc rhsAddrSc locals₂ mem false
@@ -1637,7 +1608,7 @@ theorem evalRvalueSymTree_eval
     cases uop with
     | not =>
       dsimp only [evalRvalueSymTree, evalRvalue]
-      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok v locals' =>
@@ -1689,7 +1660,8 @@ def finishAssignStmtNode
           match mem₁.activeProtectors with
           | .nil =>
             let borrows' :=
-              invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+              invalidateConflictingBorrows
+                mem₁.borrows dst.local_ .none (length mem₁.callStack)
             MirStepNode.step
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
           | protHead :: protTail =>
@@ -1700,11 +1672,15 @@ def finishAssignStmtNode
                 dst.local_
                 .none
                 .nil
+                0
+                0
+                (length mem₁.callStack)
             with
             | true => MirStepNode.fail .ub
             | false =>
               let borrows' :=
-                invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+                invalidateConflictingBorrows
+                  mem₁.borrows dst.local_ .none (length mem₁.callStack)
               MirStepNode.step
                 (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .none => MirStepNode.fail .ub
@@ -1719,54 +1695,72 @@ def finishAssignStmtNode
           mem₁.activeProtectors
           localDecls
           layouts
+          mem₁.callStack
       with
       | .ok locals₂ =>
         match
           Bool.or
             (derefWriteTreeUB locals₁ mem₁.borrows dst)
             (derefWriteUnionProtectorUB
-              localDecls layouts locals₁ mem₁.borrows mem₁.activeProtectors dst restProj)
+              localDecls
+              layouts
+              locals₁
+              mem₁.borrows
+              mem₁.activeProtectors
+              dst
+              restProj
+              mem₁.callStack)
         with
         | true => MirStepNode.fail .ub
         | false =>
           let borrows' :=
             invalidateDerefWriteBorrowsWithLayouts
-              localDecls layouts locals₁ mem₁.borrows dst restProj
+              localDecls
+              layouts
+              locals₁
+              mem₁.borrows
+              dst
+              restProj
+              mem₁.callStack
           MirStepNode.step
             (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .ub =>
-        match mem₁.callerLocals with
-        | .nil => MirStepNode.fail .ub
+        match mem₁.callStack with
+        | .nil =>
+          match mem₁.callerLocals with
+          | .nil => MirStepNode.fail .ub
+          | _ :: _ =>
+            match
+              evalCallerPlaceWrite
+                locals₁
+                mem₁.callerLocals
+                mem₁.borrows
+                dst
+                val
+                mem₁.activeProtectors
+            with
+            | .ok callerLocals' =>
+              match derefWriteTreeUB locals₁ mem₁.borrows dst with
+              | true => MirStepNode.fail .ub
+              | false =>
+                let borrows' :=
+                  invalidateDerefWriteBorrows
+                    locals₁
+                    mem₁.borrows
+                    dst
+                    restProj
+                    mem₁.callerLocals
+                MirStepNode.step
+                  (advanceStmt
+                    s
+                    locals₁
+                    { mem₁ with
+                      borrows := borrows'
+                      callerLocals := callerLocals' })
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported
         | _ :: _ =>
-          match
-            evalCallerPlaceWrite
-              locals₁
-              mem₁.callerLocals
-              mem₁.borrows
-              dst
-              val
-              mem₁.activeProtectors
-          with
-          | .ok callerLocals' =>
-            match derefWriteTreeUB locals₁ mem₁.borrows dst with
-            | true => MirStepNode.fail .ub
-            | false =>
-              let borrows' :=
-                invalidateDerefWriteBorrows
-                  locals₁
-                  mem₁.borrows
-                  dst
-                  restProj
-                  mem₁.callerLocals
-              MirStepNode.step
-                (advanceStmt
-                  s
-                  locals₁
-                  { mem₁ with
-                    borrows := borrows'
-                    callerLocals := callerLocals' })
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
+          evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
       | .unsupported => MirStepNode.unsupported
     | proj :: rest =>
       match get? locals₁ dst.local_ with
@@ -1799,6 +1793,9 @@ def finishAssignStmtNode
                   dst.local_
                   .none
                   resolvedLocalProj
+                  0
+                  0
+                  (length mem₁.callStack)
               MirStepNode.step
                 (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | protHead :: protTail =>
@@ -1809,6 +1806,9 @@ def finishAssignStmtNode
                   dst.local_
                   .none
                   resolvedLocalProj
+                  0
+                  0
+                  (length mem₁.callStack)
               with
               | true => MirStepNode.fail .ub
               | false =>
@@ -1818,6 +1818,9 @@ def finishAssignStmtNode
                     dst.local_
                     .none
                     resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
           | .none => MirStepNode.fail .ub
@@ -1826,7 +1829,16 @@ def finishAssignStmtNode
       | .some .uninit =>
         match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
         | .some rootVal =>
-          match writeProjectedForLocal locals₁ localDecls layouts dst.local_ rootVal (proj :: rest) val with
+          match
+            writeProjectedForLocal
+              locals₁
+              localDecls
+              layouts
+              dst.local_
+              rootVal
+              (proj :: rest)
+              val
+          with
           | .ok rootVal' =>
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
@@ -1845,6 +1857,9 @@ def finishAssignStmtNode
                     dst.local_
                     .none
                     resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
               | protHead :: protTail =>
@@ -1855,6 +1870,9 @@ def finishAssignStmtNode
                     dst.local_
                     .none
                     resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
                 with
                 | true => MirStepNode.fail .ub
                 | false =>
@@ -1864,6 +1882,9 @@ def finishAssignStmtNode
                       dst.local_
                       .none
                       resolvedLocalProj
+                      0
+                      0
+                      (length mem₁.callStack)
                   MirStepNode.step
                     (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | .none => MirStepNode.fail .ub
@@ -1980,6 +2001,7 @@ def evalTerminatorSymTree
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
+        (callStack := s.memory.callStack)
     with
     | .ok (.scalar sc) locals' =>
       (lookupSwitchTargetTree sc.bits targets.branches targets.otherwise).bind
@@ -2003,6 +2025,7 @@ def evalTerminatorSymTree
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
+        (callStack := s.memory.callStack)
     with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
@@ -2032,7 +2055,8 @@ theorem evalTerminatorSymTree_eval
   cases kind with
   | switchInt discr targets =>
     dsimp only [evalTerminatorSymTree, evalTerminator]
-    cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals currentBody.layouts s.memory.callerLocals with
+    cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals currentBody.layouts s.memory.callerLocals
+        (callStack := s.memory.callStack) with
     | ub => rfl
     | unsupported => rfl
     | ok v locals' =>
@@ -2044,7 +2068,8 @@ theorem evalTerminatorSymTree_eval
       | _ => rfl
   | assert cond expected target unwind =>
     dsimp only [evalTerminatorSymTree, evalTerminator]
-    cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals currentBody.layouts s.memory.callerLocals with
+    cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals currentBody.layouts s.memory.callerLocals
+        (callStack := s.memory.callStack) with
     | ub => rfl
     | unsupported => rfl
     | ok v locals' =>
@@ -4809,7 +4834,8 @@ theorem resolveCallTarget_indirect_fnPtr
         s.memory.borrows
         s.memory.globals
         bodyLayouts
-        s.memory.callerLocals =
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
       .ok (.ptr ptrVal 8) localsAfterFunc)
     (h_off : ptrVal.offsetBytes = 0)
     (h_noBorrow : lookupBorrow s.memory.borrows ptrVal.tag = .none)
@@ -4872,7 +4898,8 @@ theorem evalTerminatorSymTree_call_extCall
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
-        s.memory.callerLocals =
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
       .ok argVals locals')
     (h_indirect : resolvedTarget.isIndirect = false)
     (h_callee :
@@ -4935,7 +4962,8 @@ theorem evalTerminatorSymTree_call_inlined_of_calleeCtx
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
-        s.memory.callerLocals =
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
       .ok argVals locals')
     (h_callee :
       CalleeCtx
@@ -4967,6 +4995,14 @@ theorem evalTerminatorSymTree_call_inlined_of_calleeCtx
 /--
 `evalTerminatorSymTree` for an inlined tail call (`TerminatorKind.tailCall`)
 resolved via `CalleeCtx`.
+
+A tail call deallocates the caller's frame before entering the callee: the
+semantics faults with `.ub` when an active protector still guards a tag that
+targets a local of the returning frame (`hasFrameDeallocProtectorConflict`; that
+branch is `evalTerminatorSymTree_tailCall_deallocConflict`), and otherwise
+disables every borrow of the returning frame (`disableFrameBorrows`) in the
+memory handed to the callee. `h_noDeallocConflict` selects the non-faulting
+branch, which the semantics requires for the step to succeed.
 -/
 theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
     (s : MachineState)
@@ -4990,7 +5026,8 @@ theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
-        s.memory.callerLocals =
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
       .ok argVals locals')
     (h_callee :
       CalleeCtx
@@ -5001,22 +5038,85 @@ theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         s.memory.traitImpls
         calleeBody)
     (h_compat :
-      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true) :
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true)
+    (h_noDeallocConflict :
+      hasFrameDeallocProtectorConflict
+        s.memory.borrows
+        s.memory.activeProtectors
+        (length s.memory.callStack)
+        (length s.frame.locals) = false) :
     evalTerminatorSymTree
       s
       { kind := .tailCall func argOps, span := span }
       currentBody =
     .leaf
       (MirStepNode.step
-        (enterTailCalleeFrame s.memory calleeBody argVals)) := by
+        (enterTailCalleeFrame
+          { s.memory with
+            borrows :=
+              disableFrameBorrows
+                s.memory.borrows
+                (length s.memory.callStack)
+                (length s.frame.locals) }
+          calleeBody argVals)) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []
   rw [h_args]
   dsimp only []
+  rw [h_noDeallocConflict]
+  dsimp only []
   rw [lookupCallee_eq_of_calleeCtx h_callee]
   dsimp only []
   rw [h_compat]
+
+/--
+`evalTerminatorSymTree` for a tail call (`TerminatorKind.tailCall`) whose
+returning frame still has a local guarded by an active protector
+(`hasFrameDeallocProtectorConflict`): deallocating the frame is undefined
+behavior, so the step faults with `.ub` whatever the callee resolves to.
+-/
+theorem evalTerminatorSymTree_tailCall_deallocConflict
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (span : String)
+    (currentBody : CapturedMir)
+    (resolvedTarget : ResolvedCallTarget)
+    (localsAfterFunc : List LocalSlot)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (h_res :
+      resolveCallTarget
+        s func (length argOps) currentBody.localDecls currentBody.layouts =
+      .ok resolvedTarget localsAfterFunc)
+    (h_args :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        currentBody.layouts
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
+      .ok argVals locals')
+    (h_deallocConflict :
+      hasFrameDeallocProtectorConflict
+        s.memory.borrows
+        s.memory.activeProtectors
+        (length s.memory.callStack)
+        (length s.frame.locals) = true) :
+    evalTerminatorSymTree
+      s
+      { kind := .tailCall func argOps, span := span }
+      currentBody =
+    .leaf (MirStepNode.fail .ub) := by
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [h_deallocConflict]
 
 /--
 `evalTerminatorSymTree` for a diverging (`target = .none`) inlined call resolved
@@ -5046,7 +5146,8 @@ theorem evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
-        s.memory.callerLocals =
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
       .ok argVals locals')
     (h_callee :
       CalleeCtx
@@ -5103,7 +5204,8 @@ theorem evalTerminatorSymTree_diverging_extCall
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
-        s.memory.callerLocals =
+        s.memory.callerLocals
+        (callStack := s.memory.callStack) =
       .ok argVals locals')
     (h_none :
       lookupCallee

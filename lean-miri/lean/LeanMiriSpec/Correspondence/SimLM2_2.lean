@@ -1127,6 +1127,23 @@ theorem IsImmediateStructTy.not_bool
   | scalarPair _ _ _ _ _ _ _ _ _ _ _ _ hk_or _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ =>
     rcases hk_or with ⟨_, h1⟩ | ⟨_, _, h1⟩ <;> rw [hk] at h1 <;> cases h1
 
+theorem IsImmediateStructTy.not_char
+    {env : StructTypeEnv} {layouts : LayoutTable} {ty : Ty}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    (h : IsImmediateStructTy env layouts ty fields paths) :
+    ty.kind ≠ .char := by
+  intro hk
+  cases h with
+  | scalarWrapper _ p₀ _ _ _ _ _ _ hz _ _ =>
+    obtain ⟨idx, off, hoff⟩ := hz.toValidFieldProjChain.head_offset_ok
+    rcases ty with ⟨kind, lIdx⟩
+    dsimp only at hk
+    subst hk
+    dsimp [translateTy, scalarLayoutData, Miri.ABI.FieldsShape.offset] at hoff
+    cases hoff
+  | scalarPair _ _ _ _ _ _ _ _ _ _ _ _ hk_or _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ =>
+    rcases hk_or with ⟨_, h1⟩ | ⟨_, _, h1⟩ <;> rw [hk] at h1 <;> cases h1
+
 theorem ValidFieldProjChain.resolveProjectedTy_eq
     {layouts : LayoutTable} {baseLay : Miri.Interpreter.LocalLayout}
     {projs : List ProjectionElem} {leafTy : Ty} {totalOff : Miri.ABI.Size}
@@ -1197,7 +1214,7 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
     | immStruct _ _ _ _ hsub _ =>
       have he := hsub.env_eq; rw [henv] at he; cases he
     | primScalar sc msc _ _ himm =>
-      obtain ⟨_, _, hsc_eq, _, _, _, hbool, _⟩ := himm.of_primitive_scalar hprim
+      obtain ⟨_, _, hsc_eq, _, _, _, hbool, hchar⟩ := himm.of_primitive_scalar hprim
       injection hsc_eq with hsc'; subst hsc'
       cases isMove <;> {
         simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
@@ -1205,7 +1222,9 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
         rw [hdecl]
         dsimp only [resolveProjectedTy]
         cases hk : decl.ty.kind <;> try rfl
-        rcases (hbool hk).2 with hb | hb <;> simp [hb]
+        · rcases (hbool hk).2 with hb | hb <;> simp [hb]
+        · obtain ⟨hsz, hv⟩ := hchar hk
+          simp [hsz, hv]
       }
   | projectedScalar isMove idx projs leafTy henv_leaf hproj _ =>
     rcases hproj with ⟨decl, _, _, _, _, _, hdecl, _, _, _, hprim_leaf, hchain⟩
@@ -1213,7 +1232,7 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
     | immStruct _ _ _ _ hsub _ =>
       have he := hsub.env_eq; rw [henv_leaf] at he; cases he
     | primScalar sc msc _ _ himm =>
-      obtain ⟨_, _, hsc_eq, _, _, _, hbool, _⟩ := himm.of_primitive_scalar hprim_leaf
+      obtain ⟨_, _, hsc_eq, _, _, _, hbool, hchar⟩ := himm.of_primitive_scalar hprim_leaf
       injection hsc_eq with hsc'; subst hsc'
       cases isMove <;> {
         simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
@@ -1223,21 +1242,26 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
         rw [hchain.resolveProjectedTy_eq]
         dsimp only
         cases hk : ty.kind <;> try rfl
-        rcases (hbool hk).2 with hb | hb <;> simp [hb]
+        · rcases (hbool hk).2 with hb | hb <;> simp [hb]
+        · obtain ⟨hsz, hv⟩ := hchar hk
+          simp [hsz, hv]
       }
   | immStructLocal isMove idx decl _ _ hdecl hspec =>
     have hnb := hspec.not_bool
+    have hnc := hspec.not_char
     cases isMove <;> {
       simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
       dsimp only [validateLoadedValue, operandTy, placeTy]
       rw [hdecl]
       dsimp only [resolveProjectedTy]
       cases hk : decl.ty.kind <;> try rfl
-      exact absurd hk hnb
+      · exact absurd hk hnb
+      · exact absurd hk hnc
     }
   | projectedSubStruct isMove idx projs _ _ _ _ _ hspec hproj _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     have hnb := hspec.not_bool
+    have hnc := hspec.not_char
     cases isMove <;> {
       simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
       dsimp only [validateLoadedValue, operandTy, placeTy]
@@ -1246,11 +1270,13 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
       rw [hchain.resolveProjectedTy_eq]
       dsimp only
       cases hk : ty.kind <;> try rfl
-      exact absurd hk hnb
+      · exact absurd hk hnb
+      · exact absurd hk hnc
     }
   | projectedScalarWrap isMove idx projs _ _ _ hspec hproj _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     have hnb := hspec.not_bool
+    have hnc := hspec.not_char
     cases isMove <;> {
       simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
       dsimp only [validateLoadedValue, operandTy, placeTy]
@@ -1259,7 +1285,8 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
       rw [hchain.resolveProjectedTy_eq]
       dsimp only
       cases hk : ty.kind <;> try rfl
-      exact absurd hk hnb
+      · exact absurd hk hnb
+      · exact absurd hk hnc
     }
 
 /-- Joint outcome relation for `evalOperand` (Anneal) vs.
@@ -3351,7 +3378,8 @@ private theorem evalRvalue_aggregate_eq
     (locals : List LocalSlot) (ops : List MirAst.Operand)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.aggregate kind ops) mem localDecls layouts =
-      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls
+          mem.callStack with
       | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
       | .ub => .ub
       | .unsupported => .unsupported := by
@@ -3359,7 +3387,8 @@ private theorem evalRvalue_aggregate_eq
   · rfl
   · unfold evalRvalue
     dsimp only [evalAggregateAdt]
-    cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls <;> rfl
+    cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack <;> rfl
 
 private theorem finish_agg_from_mid
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
@@ -3444,7 +3473,7 @@ private theorem finish_agg_from_mid
         evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind (op₀ :: rest)), span⟩
           body.localDecls body.layouts = MirStepNode.fail .ub := by
       unfold evalStmt; dsimp only
-      rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller]
+      rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
       dsimp only [evalOperands]; rw [hev_op₀]; dsimp only
       rw [htail.evalOperands_localDecls_eq, hub_rest]
     have hm_ub :
@@ -3463,7 +3492,7 @@ private theorem finish_agg_from_mid
         MirStepNode.step (advanceStmt s
           (locals_end.set dstIdx (.init (.aggregate 0 (v₀ :: tailVals)))) s.memory) := by
       unfold evalStmt; dsimp only
-      rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller]
+      rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
       dsimp only [evalOperands]; rw [hev_op₀]; dsimp only
       rw [htail.evalOperands_localDecls_eq, hok_rest]
       dsimp only; rw [hdst_end]
@@ -3804,7 +3833,7 @@ theorem evalRvalue_aggregate_tuple_struct_simulation
             evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind (op₀ :: rest)), span⟩
               body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; dsimp only
-          rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller]
+          rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
           dsimp only [evalOperands]; rw [hop₀.evalOperand_localDecls_eq, hev_op₀]
         have hm_ub :
             Miri.Interpreter.Step.evalStatement (annealStepHooksLM2_2 body.localDecls body.layouts) ()
@@ -3846,7 +3875,7 @@ theorem evalRvalue_aggregate_tuple_struct_simulation
               evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind (op₀ :: rest)), span⟩
                 body.localDecls body.layouts = MirStepNode.fail .ub := by
             unfold evalStmt; dsimp only
-            rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller]
+            rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
             dsimp only [evalOperands]; rw [hev_op₀_ld]; dsimp only
             rw [htail.evalOperands_localDecls_eq]
             cases hr : evalOperands locals₁ rest .nil s.memory.globals body.layouts .nil with
@@ -4039,7 +4068,7 @@ theorem evalRvalue_use_nil_borrows
         | true => .ok val locals' mem
       | .ub => .ub
       | .unsupported => .unsupported := by
-  unfold evalRvalue; dsimp only; rw [hbor]
+  unfold evalRvalue; dsimp only; rw [hbor, evalOperand_borrows_nil_callStack_eq]
   cases evalOperand locals op [] mem.globals layouts mem.callerLocals localDecls with
   | ub => rfl
   | unsupported => rfl
@@ -4089,13 +4118,19 @@ private theorem validateLoadedValue_of_memory_repr
     rcases dty : decl.ty with ⟨kind, lIdx⟩
     rw [dty] at hk hmem; dsimp only at hk; subst hk
     cases hmem
+  have hnc : decl.ty.kind ≠ .char := by
+    intro hk
+    rcases dty : decl.ty with ⟨kind, lIdx⟩
+    rw [dty] at hk hmem; dsimp only at hk; subst hk
+    cases hmem
   cases isMove <;> {
     simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
     dsimp only [validateLoadedValue, operandTy, placeTy]
     rw [hdecl]
     dsimp only [resolveProjectedTy]
     cases hk : decl.ty.kind <;> try rfl
-    exact absurd hk hnb
+    · exact absurd hk hnb
+    · exact absurd hk hnc
   }
 
 private theorem ValidAggregateFieldPath.of_append
@@ -7320,14 +7355,16 @@ private theorem evalStmt_assign_projected_step_location
          | .nil =>
            let borrows' :=
              invalidateConflictingBorrowsAtProj mem₁.borrows dstIdx .none resolvedLocalProj
+               0 0 (length mem₁.callStack)
            MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
          | protHead :: protTail =>
            match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail)
-               dstIdx .none resolvedLocalProj with
+               dstIdx .none resolvedLocalProj 0 0 (length mem₁.callStack) with
            | true => MirStepNode.fail .ub
            | false =>
              let borrows' :=
                invalidateConflictingBorrowsAtProj mem₁.borrows dstIdx .none resolvedLocalProj
+                 0 0 (length mem₁.callStack)
              MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
        | .none => MirStepNode.fail .ub) = .step s' →
       s'.frame.blockIdx = s.frame.blockIdx ∧ s'.frame.stmtIdx = s.frame.stmtIdx + 1 := by
@@ -7341,7 +7378,7 @@ private theorem evalStmt_assign_projected_step_location
         intro h; injection h with heq1; injection heq1 with heq2; subst heq2; exact ⟨rfl, rfl⟩
       | cons protHead protTail =>
         dsimp only
-        cases hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx .none _ with
+        cases hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx .none _ 0 0 (length mem₁.callStack) with
         | true => intro h; cases h
         | false =>
           intro h; injection h with heq1; injection heq1 with heq2; subst heq2; exact ⟨rfl, rfl⟩
@@ -7653,10 +7690,19 @@ theorem step_terminator_return_lm2_2_simulation
     exact himm_env 0 himm0 mp lay0 hmls0
   have hctrl_eq :
       (annealTerminatorHooksLM2_2 body.localDecls body.layouts).toControlHooks = annealControlHooks := rfl
+  have hmem_ret :
+      { nextAllocId := s.memory.nextAllocId, globals := s.memory.globals,
+        borrows := [], nextTag := s.memory.nextTag, callees := s.memory.callees,
+        traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
+        activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
+        nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
+        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+    cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
   unfold evalTerminator translateTerminator
     Miri.Interpreter.ControlFlow.evalTerminator
-  rw [hret, hstack, hctrl_eq, hslot0]
-  dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  rw [hret, hstack, hbor, hprot, hctrl_eq, hslot0]
+  dsimp only [translateTerminatorKind, Id.run, Pure.pure,
+    hasFrameDeallocProtectorConflict, disableFrameBorrows]
   cases hloc0 with
   | structDead _ _ _ henv _ | structUninitImm _ _ _ henv _ | structUninitInd _ _ _ _ henv _ _
   | structImm _ _ _ _ _ henv _ _ | structInd _ _ _ _ _ henv _ _ =>
@@ -7674,7 +7720,8 @@ theorem step_terminator_return_lm2_2_simulation
       · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
         exact StepRel.ub _ _
-      · cases himmRel with
+      · rw [hmem_ret]
+        cases himmRel with
         | unit hzero =>
           exact False.elim (hsz0 hzero)
         | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
@@ -7777,7 +7824,15 @@ theorem step_terminator_return_struct_lm2_2_simulation
       (Miri.Interpreter.Step.step (annealStepHooksLM2_2 body.localDecls body.layouts) () m) := by
   rcases hstate with
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
-      hinit_env, himm_env, _, hcal, hstack, _, _, _, _⟩
+      hinit_env, himm_env, _, hcal, hstack, hbor, hprot, _, _⟩
+  have hmem_ret :
+      { nextAllocId := s.memory.nextAllocId, globals := s.memory.globals,
+        borrows := [], nextTag := s.memory.nextTag, callees := s.memory.callees,
+        traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
+        activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
+        nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
+        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+    cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
     simp [hstmt_len]
@@ -7789,8 +7844,9 @@ theorem step_terminator_return_struct_lm2_2_simulation
       (annealTerminatorHooksLM2_2 body.localDecls body.layouts).toControlHooks = annealControlHooks := rfl
   unfold evalTerminator translateTerminator
     Miri.Interpreter.ControlFlow.evalTerminator
-  rw [hret, hstack, hctrl_eq, hslot0]
-  dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  rw [hret, hstack, hbor, hprot, hctrl_eq, hslot0]
+  dsimp only [translateTerminatorKind, Id.run, Pure.pure,
+    hasFrameDeallocProtectorConflict, disableFrameBorrows]
   cases hloc0 with
   | base _ _ henv_none _ =>
     rw [henv0] at henv_none; cases henv_none
@@ -7807,6 +7863,7 @@ theorem step_terminator_return_struct_lm2_2_simulation
     · exact False.elim (hinit_env 0 h0_init hslot0)
     · exact False.elim (himm_env 0 h0_imm mp0 c0 hmls0)
   | structImm fs ps retVal imm0 _ henv _ himmRel =>
+    rw [hmem_ret]
     have hfp := henv0.symm.trans henv
     injection hfp with hfp'; injection hfp' with hfs hps; subst hfs hps
     have hop0 : annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) := by
@@ -7822,6 +7879,7 @@ theorem step_terminator_return_struct_lm2_2_simulation
       (annealControlHooks_cleanupFrame_eq false topFrame _)]
     exact .retRootImm decl0 retVal imm0 s.memory _ hdecl0 hop0 himmRel rfl
   | structInd fs ps retVal mp0 _ henv _ hsmpr =>
+    rw [hmem_ret]
     have hfp := henv0.symm.trans henv
     injection hfp with hfp'; injection hfp' with hfs hps; subst hfs hps
     have hop0 := annealControlHooks_returnOperand_indirect hframes hget0

@@ -238,9 +238,15 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("pointerWithExposedProvenance", "proved_corresponding"),
             ("pointerCoercion", "supported_and_tested"),
             ("subtype", "supported_and_tested"),
-            ("floatToInt", "unsupported_fail_closed"),
-            ("intToFloat", "unsupported_fail_closed"),
-            ("floatToFloat", "unsupported_fail_closed"),
+            # Float casts: evidence is the kernel-checked IEEE-754 reference-model
+            # agreement in `theory/Anneal/Mir/IeeeFloatCast.lean` (ties-to-even,
+            # saturating float->int, NaN quietization, subnormal single rounding) plus
+            # `tests/mir/CastStage1Tests.lean`; there is not yet a MiniRustSpec /
+            # LeanMiriSpec step-simulation theorem for `FloatToInt`/`IntToFloat`/
+            # `FloatToFloat` (LeanMiriSpec only translates the cast kinds).
+            ("floatToInt", "proved_corresponding"),
+            ("intToFloat", "proved_corresponding"),
+            ("floatToFloat", "proved_corresponding"),
             ("fnPtrToPtr", "unsupported_fail_closed"),
         ],
     },
@@ -1048,9 +1054,35 @@ def compute_stage_b_empirical_corpora(
 # ---------------------------------------------------------------------------
 # Pillar 3: Live Correspondence Divergence & Known-Bug Discovery
 # ---------------------------------------------------------------------------
+# Note: All actionable entries below remain permanently registered in
+# `TRACKED_CORRESPONDENCE_DIVERGENCES` as switch-to-pass regression guards; once
+# their `witness_symbol` divergence theorems are replaced by positive
+# `*_simulation` theorems, `discover_correspondence_divergences` classifies them
+# under `resolved_correspondence_divergences`. Resolution is fail-closed: an entry
+# with a `resolution_symbol` only counts as resolved when the old witness is gone
+# AND the named replacement theorem is live in `resolution_file` (default: `file`,
+# in the namespace spelled by its `lean/` module path or by `resolution_namespace`);
+# otherwise (e.g. the witness file was deleted, moved, or the witness was renamed
+# without a replacement) it stays in `actionable_anneal_bugs` with
+# `status == "resolution_missing"`.
+# Known out-of-scope follow-ups (documented here rather than tracked as open
+# Episode 2 bugs in `TRACKED_CORRESPONDENCE_DIVERGENCES`):
+# - `DIV-MR-TB-DIRECT-LOCAL-ACCESS` — general Tree Borrows ancestor/child Read vs.
+#   Write state transitions on direct local reads/writes beyond unprotected Freeze
+#   Reserved root writes (`DIV-MR-TB-TWOPHASE-DIRECT-WRITE`) remain a future TB
+#   correspondence milestone rather than a claim of full Tree Borrows completeness.
+# - `step_binOp_offset_usize_wrap_divergence` (`SimLM3_1.lean`) — pre-existing
+#   `BinOp.Offset` unsigned `usize` rhs >= 2^63 wrap-around on non-disabled pointers
+#   (where `lean-miri` raises `"PointerArithOverflow"` UB while Anneal wraps).
 
 # Episode 2 correspondence file closing `constEvalCounter` / `tailCall` / `opaqueCast`.
 UNTESTED_VARIANT_TEST_FILE = "tests/mir/MirUntestedVariantCorrespondenceTests.lean"
+# Its declarations live in this namespace (its path has no `lean/` source root), so its
+# registry entries name it as `resolution_namespace`: a resolution theorem or statement pin
+# in any other namespace of the file (e.g. a decoy `namespace Scratch`) does not count.
+# Its resolution theorems are pinned in the file itself (`resolution_pin_file`), since no
+# authority audit module imports it.
+UNTESTED_VARIANT_NAMESPACE = "Anneal.MirUntestedVariantCorrespondenceTests"
 
 TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
     {
@@ -1059,6 +1091,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P0_soundness",
         "witness_symbol": "callerRefMutSilentWrongLocal_divergence",
+        "resolution_symbol": "callerRefMutSilentWrongLocal_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Rebind BorrowEntry.targetLocal across frames in Trusted.MirSemantics.Terminators.evalTerminator so callerRefMutSilentWrongLocal_divergence switches to 3-way agreement (42).",
@@ -1070,6 +1103,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_false_positive_ub",
         "witness_symbol": "callerBorrowAcrossScalarCall_divergence",
+        "resolution_symbol": "callerBorrowAcrossScalarCall_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Statements",
         "switch_to_pass_criterion": "Scope invalidateConflictingBorrows to the active frame so callee root assignments do not disable caller borrows across scalar calls.",
@@ -1081,6 +1115,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "twoPhaseDirectWriteTreeBorrowsGap",
+        "resolution_symbol": "twoPhaseDirectWriteTreeBorrows_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Update updateBorrowPerm on direct root write (writerTag = none) to disable unprotected Freeze Reserved borrows, switching twoPhaseDirectWriteTreeBorrowsGap to UB agreement with MachTB.",
@@ -1092,6 +1127,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "retagFnEntryLocalDeallocUb",
+        "resolution_symbol": "retagFnEntryLocalDealloc_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Check active FnEntry protectors on callee-owned locals during Return frame teardown before releasing protectors, matching MachTB deallocAllM.",
@@ -1103,6 +1139,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_false_positive_ub",
         "witness_symbol": "unsafeCellProtectedInteriorMut",
+        "resolution_symbol": "unsafeCellProtectedInteriorMut_simulation",
         "file": "minirust/lean/MiniRustSpec/Correspondence/TbWitness.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Exempt !Freeze Cell/ReservedIM entries from hasProtectedWriteConflict so unsafeCellProtectedInteriorMut returns 77 across Anneal, Mach, and MachTB.",
@@ -1114,6 +1151,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "step_raw_overwritten_direct_copy_invalid_char_divergence",
+        "resolution_symbol": "step_raw_overwritten_direct_copy_invalid_char_simulation",
         "file": "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Re-validate char Unicode scalar validity on direct Use(Copy) of raw-overwritten char locals (matching bool re-validation in step_raw_overwritten_direct_copy_invalid_bool_simulation).",
@@ -1125,6 +1163,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_false_positive_ub",
         "witness_symbol": "step_binOp_offset_disabled_divergence",
+        "resolution_symbol": "step_binOp_offset_disabled_simulation",
         "file": "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Scalars",
         "switch_to_pass_criterion": "Align BinOp.Offset allocation bounds check with Miri ptrOffsetInbounds (which checks live allocation bounds independent of Tree Borrows .disabled permission).",
@@ -1136,6 +1175,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_precision",
         "witness_symbol": "step_setDiscriminant_uninit_divergence",
+        "resolution_symbol": "step_setDiscriminant_uninit_simulation",
         "file": "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean",
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Statements",
         "switch_to_pass_criterion": "Initialize discriminant tag on SetDiscriminant when target enum slot is .uninit, matching Miri's writeDiscriminant.",
@@ -1160,6 +1200,9 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P2_soundness",
         "witness_symbol": "tailCall_leanMiri_nounwind_callee",
+        "resolution_symbol": "tailCall_leanMiri_nounwind_callee_simulation",
+        "resolution_namespace": UNTESTED_VARIANT_NAMESPACE,
+        "resolution_pin_file": UNTESTED_VARIANT_TEST_FILE,
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "When the call-site or callee ABI cannot unwind, rewrite the inherited saved caller's returnUnwind to .unreachable in enterTailCalleeFrame (Miri initStackFrame, Call.lean:261-264), so tailCall_leanMiri_nounwind_callee's `↔ u = ur` collapses to unconditional shape agreement.",
@@ -1171,6 +1214,9 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P3_latent_phase_boundary",
         "witness_symbol": "opaqueCast_trusted_root_dispatch_divergence",
+        "resolution_symbol": "opaqueCast_trusted_root_dispatch_simulation",
+        "resolution_namespace": UNTESTED_VARIANT_NAMESPACE,
+        "resolution_pin_file": UNTESTED_VARIANT_TEST_FILE,
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, evalStmt (.assign / .deinit), and uninitFieldWriteShell?, so (_l as T) and (_l as T).f behave like their post-borrowck erasures _l and _l.f.",
@@ -1204,12 +1250,562 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "category": "actionable_anneal_bug",
         "severity": "P1_soundness",
         "witness_symbol": "tailCall_witness_dangling_caller_local_divergence",
+        "resolution_symbol": "tailCall_witness_dangling_caller_local_simulation",
+        "resolution_namespace": UNTESTED_VARIANT_NAMESPACE,
+        "resolution_pin_file": UNTESTED_VARIANT_TEST_FILE,
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "Disable (or remove) every borrow entry targeting the replaced tail-caller frame in enterTailCalleeFrame, matching Miri's tail-call cleanup (CallMachine.cleanup deallocates the popped frame's memory-backed locals), so the witness's *p faults with .ub instead of returning 137.",
-        "summary": "enterTailCalleeFrame discards the tail-caller's locals but keeps borrow entries whose un-namespaced targetLocal now names the callee's local: a raw pointer to the tail-caller's x = 42 passed to the callee silently reads the callee's same-index local (137) and returns normally, whereas Miri's tail-call cleanup deallocates x and the dereference is a use-after-free (UB).",
+        "summary": "enterTailCalleeFrame discards the tail-caller's locals but keeps borrow entries whose un-namespaced targetLocal now names the callee's local: a raw pointer to the tail-caller's x = 42 passed to the callee silently reads the callee's same-index local (137) and returns normally, whereas Miri's tail-call cleanup deallocates x and the dereference is a use-after-free (UB). Resolved once evalTailCallTerminator tore the tail-caller frame down (disableFrameBorrows before enterTailCalleeFrame): *p now faults with UB (tailCall_witness_dangling_caller_local_simulation).",
+    },
+    {
+        "id": "DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW",
+        "authority": "LeanMiriSpec",
+        "category": "actionable_anneal_bug",
+        "severity": "P1_soundness",
+        "witness_symbol": "tailCall_witness_root_caller_referent_divergence",
+        "resolution_symbol": "tailCall_witness_root_caller_referent_simulation",
+        "resolution_namespace": UNTESTED_VARIANT_NAMESPACE,
+        "resolution_pin_file": UNTESTED_VARIANT_TEST_FILE,
+        "file": UNTESTED_VARIANT_TEST_FILE,
+        "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "switch_to_pass_criterion": "Keep caller-owned referents (Memory.callerLocals) addressable after a root tail call into a callee with more locals, e.g. by giving caller referents a frame identity distinct from the root frame's (targetFrameDepth, targetLocal) pairs, so the witness's *p reads the caller's 42 instead of the tail-callee's own _2.",
+        "summary": "A modular-root tail call into a callee with more locals than the tail-caller makes the callee's own local shadow a caller-owned referent: a pointer argument into the caller (callerLocals slot 2 = 42, borrow at (0, 2)) is read through activeFrameSlot? as the callee's _2 = 137, whereas Miri reads the live caller allocation (42).",
     },
 ]
+
+
+def _strip_lean_comments_and_strings(src: str) -> str:
+    """Strip Lean `--` line comments, nested `/- ... -/` block comments, and literals.
+
+    Replaces stripped spans with spaces while preserving `\\n` so line-anchored
+    declaration matching cannot be spoofed by commented-out theorems, docstrings,
+    or string literals (and handles `'\"'` character literals cleanly).
+    """
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    block_depth = 0
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if block_depth > 0:
+            if ch == "/" and nxt == "-":
+                block_depth += 1
+                out.append("  ")
+                i += 2
+            elif ch == "-" and nxt == "/":
+                block_depth -= 1
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "-":
+            block_depth = 1
+            out.append("  ")
+            i += 2
+            continue
+        if ch == "-" and nxt == "-":
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        # Lean 4 raw string literals (`r"..."`, `r#"..."#`, `r##"..."##`) do not escape `\"`.
+        if ch == "r" and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_'!?»")):
+            j = i + 1
+            while j < n and src[j] == "#":
+                j += 1
+            if j < n and src[j] == '"':
+                hashes = j - (i + 1)
+                closing = '"' + ("#" * hashes)
+                out.append(" " * (j - i + 1))
+                i = j + 1
+                while i < n:
+                    if src.startswith(closing, i):
+                        out.append(" " * len(closing))
+                        i += len(closing)
+                        break
+                    out.append("\n" if src[i] == "\n" else " ")
+                    i += 1
+                continue
+        if ch == '"':
+            out.append(" ")
+            i += 1
+            while i < n:
+                c = src[i]
+                if c == "\\":
+                    out.append("  " if i + 1 < n and src[i + 1] != "\n" else " ")
+                    i += 2
+                    continue
+                if c == '"':
+                    out.append(" ")
+                    i += 1
+                    break
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+        # Handle Lean character literals like `'"'` or `'\''` so `'"'` does not open a string.
+        if ch == "'":
+            if i + 2 < n and src[i + 1] != "\\" and src[i + 2] == "'":
+                out.append("   ")
+                i += 3
+                continue
+            if i + 3 < n and src[i + 1] == "\\" and src[i + 3] == "'":
+                out.append("    ")
+                i += 4
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_LEAN_TOKEN_RE = re.compile(
+    r"""
+    @\[
+    | :=
+    | [(\[{⟨)\]}⟩:@.;,]
+    | «[^»\n]+»
+    | [\#?]?[A-Za-z_0-9][A-Za-z_0-9'!?]*
+    """,
+    re.VERBOSE,
+)
+
+_LEAN_OPEN_BRACKETS = {"@[", "(", "[", "{", "⟨"}
+_LEAN_CLOSE_BRACKETS = {")", "]", "}", "⟩"}
+_LEAN_DECL_MODIFIERS = {
+    "private",
+    "protected",
+    "noncomputable",
+    "nonrec",
+    "partial",
+    "unsafe",
+    "scoped",
+    "local",
+}
+_LEAN_FORBIDDEN_RES_MODS = {"private", "unsafe", "partial"}
+_LEAN_WITNESS_DECL_KINDS = {
+    "theorem",
+    "lemma",
+    "def",
+    "abbrev",
+    "axiom",
+    "opaque",
+    "structure",
+    "inductive",
+    "class",
+}
+_LEAN_RES_DECL_KINDS = {"theorem", "lemma"}
+_LEAN_IN_PREFIX_CMDS = {
+    "open",
+    "set_option",
+    "include",
+    "omit",
+    "variable",
+    "unseal",
+    "seal",
+    "attribute",
+}
+_LEAN_SCOPE_KEYWORDS = {"namespace", "section", "mutual", "end"}
+_LEAN_OTHER_TOP_CMDS = {
+    "import",
+    "prelude",
+    "universe",
+    "universes",
+    "export",
+    "elab",
+    "macro",
+    "macro_rules",
+    "syntax",
+    "notation",
+    "infix",
+    "infixl",
+    "infixr",
+    "prefix",
+    "postfix",
+    "instance",
+    "deriving",
+    "initialize",
+    "builtin_initialize",
+}
+_LEAN_ALL_CMD_BOUNDARIES = (
+    _LEAN_DECL_MODIFIERS
+    | _LEAN_WITNESS_DECL_KINDS
+    | _LEAN_IN_PREFIX_CMDS
+    | _LEAN_SCOPE_KEYWORDS
+    | _LEAN_OTHER_TOP_CMDS
+    | {"example", "@["}
+)
+_LEAN_TRIVIAL_PIN_TYPES = {"_", "True", "Prop", "Bool", "Nat", "Unit", "PUnit"}
+# Tokens that make a pin's type depend on its own RHS (so the pin locks nothing).
+_LEAN_SELF_TYPED_PIN_TOKENS = {"type_of", "by", "_"}
+_LEAN_FORBIDDEN_PIN_ARGS = {
+    "by",
+    "fun",
+    "let",
+    "have",
+    "do",
+    "match",
+    "where",
+    "with",
+    "show",
+    "suffices",
+}
+
+
+def _lean_module_parts(rel_file: str) -> list[str]:
+    """Extract Lean module path components after `lean/` (e.g. `['LeanMiriSpec', 'Correspondence', 'SimLM2_3']`)."""
+    parts = list(Path(rel_file).with_suffix("").parts)
+    if "lean" in parts:
+        idx = parts.index("lean")
+        return parts[idx + 1 :]
+    return parts
+
+
+def _clean_lean_seg(tok: str) -> str:
+    return tok[1:-1] if tok.startswith("«") and tok.endswith("»") else tok
+
+
+def _is_lean_ident_tok(tok: str) -> bool:
+    if tok.startswith("«") and tok.endswith("»"):
+        return True
+    if not tok or tok[0] in "@?:()[]{}⟨⟩.,;#0123456789":
+        return False
+    return True
+
+
+def _is_lean_top_cmd_tok(tok: str, prev_tok: str) -> bool:
+    if prev_tok == ".":
+        return False
+    return tok in _LEAN_ALL_CMD_BOUNDARIES or (tok.startswith("#") and len(tok) > 1)
+
+
+def _read_lean_qname(tokens: list[str], idx: int) -> tuple[list[str], int]:
+    """Read `seg (. seg)*` starting at `idx` (including `.1` field projections so `thm.1` does not match `thm`)."""
+    n = len(tokens)
+    if idx >= n or not (_is_lean_ident_tok(tokens[idx]) or tokens[idx].isdigit()):
+        return [], idx
+    segs = [_clean_lean_seg(tokens[idx])]
+    idx += 1
+    while (
+        idx + 1 < n
+        and tokens[idx] == "."
+        and (_is_lean_ident_tok(tokens[idx + 1]) or tokens[idx + 1].isdigit())
+    ):
+        segs.append(_clean_lean_seg(tokens[idx + 1]))
+        idx += 2
+    return segs, idx
+
+
+def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
+    """Tokenize comment/string-stripped Lean 4 source at bracket depth 0.
+
+    Handles multi-line and same-line commands (`namespace Foo theorem bar ... end Foo`,
+    `section private theorem ...`, `open Foo in private\\ntheorem ...`, `private @[simp,\\n ...]`,
+    `mutual ... end`, `section #exit`, `#exit'` non-truncation) and extracts:
+      - `witness_symbols`: every declared witness-eligible constant name;
+      - `resolutions`: `symbol -> list[(effective_namespace_parts, has_forbidden_modifier)]`;
+      - `pins`: `symbol -> list[(audit_active_namespace_parts, inline_qualifier_parts)]` for
+        valid typed `example ... : <NonTrivialProp> := @?symbol <ident_args>*` statement pins.
+    """
+    tokens = _LEAN_TOKEN_RE.findall(stripped_src)
+    n = len(tokens)
+    depth = 0
+    scope_stack: list[tuple[str, list[str]]] = []
+    pending_mods: set[str] = set()
+    witness_symbols: set[str] = set()
+    resolutions: dict[str, list[tuple[list[str], bool]]] = {}
+    pins: dict[str, list[tuple[list[str], list[str]]]] = {}
+
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        prev = tokens[i - 1] if i > 0 else ""
+        if tok in _LEAN_OPEN_BRACKETS:
+            depth += 1
+            i += 1
+            continue
+        if tok in _LEAN_CLOSE_BRACKETS:
+            if depth > 0:
+                depth -= 1
+            i += 1
+            continue
+        if depth > 0 or prev == ".":
+            i += 1
+            continue
+
+        if tok == "#exit":
+            break
+
+        if tok in _LEAN_DECL_MODIFIERS:
+            nxt = tokens[i + 1] if i + 1 < n else ""
+            if tok in ("local", "scoped") and nxt in (_LEAN_IN_PREFIX_CMDS | _LEAN_OTHER_TOP_CMDS):
+                i += 1
+                continue
+            pending_mods.add(tok)
+            i += 1
+            continue
+
+        if tok in _LEAN_IN_PREFIX_CMDS:
+            j = i + 1
+            d2 = 0
+            while j < n:
+                t2 = tokens[j]
+                p2 = tokens[j - 1] if j > 0 else ""
+                if t2 in _LEAN_OPEN_BRACKETS:
+                    d2 += 1
+                elif t2 in _LEAN_CLOSE_BRACKETS:
+                    if d2 > 0:
+                        d2 -= 1
+                elif d2 == 0 and p2 != ".":
+                    if t2 == "in":
+                        i = j + 1
+                        break
+                    if (
+                        t2 == "#exit"
+                        or t2 in (_LEAN_WITNESS_DECL_KINDS | _LEAN_SCOPE_KEYWORDS | {"example"})
+                        or t2 in _LEAN_DECL_MODIFIERS
+                        or t2 == "@["
+                    ):
+                        pending_mods.clear()
+                        i = j
+                        break
+                j += 1
+            else:
+                break
+            continue
+
+        if tok == "namespace":
+            pending_mods.clear()
+            segs, i = _read_lean_qname(tokens, i + 1)
+            if segs:
+                scope_stack.append(("ns", segs))
+            continue
+
+        if tok == "section":
+            pending_mods.clear()
+            nxt = tokens[i + 1] if i + 1 < n else ""
+            if _is_lean_ident_tok(nxt) and not _is_lean_top_cmd_tok(nxt, ""):
+                scope_stack.append(("sec", [_clean_lean_seg(nxt)]))
+                i += 2
+            else:
+                scope_stack.append(("sec", []))
+                i += 1
+            continue
+
+        if tok == "mutual":
+            pending_mods.clear()
+            scope_stack.append(("mutual", []))
+            i += 1
+            continue
+
+        if tok == "end":
+            pending_mods.clear()
+            nxt = tokens[i + 1] if i + 1 < n else ""
+            if _is_lean_ident_tok(nxt) and not _is_lean_top_cmd_tok(nxt, ""):
+                end_parts, i = _read_lean_qname(tokens, i + 1)
+                while scope_stack and end_parts:
+                    _, sp = scope_stack.pop()
+                    if sp and len(sp) <= len(end_parts) and end_parts[-len(sp) :] == sp:
+                        end_parts = end_parts[: -len(sp)]
+                    else:
+                        break
+            else:
+                if scope_stack:
+                    scope_stack.pop()
+                i += 1
+            continue
+
+        if tok in _LEAN_WITNESS_DECL_KINDS:
+            mods = set(pending_mods)
+            pending_mods.clear()
+            segs, next_i = _read_lean_qname(tokens, i + 1)
+            if segs and not segs[-1].isdigit():
+                sym = segs[-1]
+                witness_symbols.add(sym)
+                if tok in _LEAN_RES_DECL_KINDS:
+                    active_ns = [s for kind, sp in scope_stack if kind == "ns" for s in sp]
+                    inline_ns = segs[:-1]
+                    eff_ns = inline_ns[1:] if (inline_ns and inline_ns[0] == "_root_") else (active_ns + inline_ns)
+                    resolutions.setdefault(sym, []).append((eff_ns, bool(mods & _LEAN_FORBIDDEN_RES_MODS)))
+            i = max(next_i, i + 1)
+            continue
+
+        if tok == "example":
+            mods = set(pending_mods)
+            pending_mods.clear()
+            j = i + 1
+            d2 = 0
+            colon_idx: int | None = None
+            assign_idx: int | None = None
+            let_pending = 0
+            while j < n:
+                t2 = tokens[j]
+                p2 = tokens[j - 1] if j > 0 else ""
+                if t2 in _LEAN_OPEN_BRACKETS:
+                    d2 += 1
+                elif t2 in _LEAN_CLOSE_BRACKETS:
+                    if d2 > 0:
+                        d2 -= 1
+                elif d2 == 0:
+                    if assign_idx is not None and _is_lean_top_cmd_tok(t2, p2):
+                        break
+                    if t2 == ":" and colon_idx is None and assign_idx is None:
+                        colon_idx = j
+                    elif colon_idx is not None and assign_idx is None and p2 != "." and t2 in ("let", "have"):
+                        let_pending += 1
+                    elif t2 == ":=" and assign_idx is None:
+                        if let_pending > 0:
+                            let_pending -= 1
+                        else:
+                            assign_idx = j
+                j += 1
+            end_ex = j
+            if (
+                not (mods & _LEAN_FORBIDDEN_RES_MODS)
+                and colon_idx is not None
+                and assign_idx is not None
+                and colon_idx < assign_idx
+            ):
+                type_toks = tokens[colon_idx + 1 : assign_idx]
+                while len(type_toks) >= 2 and type_toks[0] == "(" and type_toks[-1] == ")":
+                    bal = 0
+                    ok_strip = True
+                    for tt in type_toks[:-1]:
+                        if tt == "(":
+                            bal += 1
+                        elif tt == ")":
+                            bal -= 1
+                            if bal == 0:
+                                ok_strip = False
+                                break
+                    if ok_strip and bal == 1:
+                        type_toks = type_toks[1:-1]
+                    else:
+                        break
+                valid_type = len(type_toks) > 0 and not (
+                    len(type_toks) == 1
+                    and (type_toks[0] in _LEAN_TRIVIAL_PIN_TYPES or type_toks[0].startswith("?"))
+                )
+                rhs_toks = tokens[assign_idx + 1 : end_ex]
+                if valid_type and rhs_toks:
+                    r_idx = 1 if rhs_toks[0] == "@" else 0
+                    qsegs, r_next = _read_lean_qname(rhs_toks, r_idx)
+                    if qsegs and not qsegs[-1].isdigit():
+                        rem = rhs_toks[r_next:]
+                        if all(
+                            (_is_lean_ident_tok(rt) or rt == "_") and rt not in _LEAN_FORBIDDEN_PIN_ARGS
+                            for rt in rem
+                        ):
+                            active_ns = [s for kind, sp in scope_stack if kind == "ns" for s in sp]
+                            pins.setdefault(qsegs[-1], []).append(
+                                (active_ns, qsegs[:-1], tuple(type_toks))
+                            )
+            i = end_ex
+            continue
+
+        if pending_mods:
+            pending_mods.clear()
+        i += 1
+
+    return {
+        "witness_symbols": witness_symbols,
+        "resolutions": resolutions,
+        "pins": pins,
+    }
+
+
+def _has_lean_decl(
+    stripped_src: str,
+    symbol: str,
+    *,
+    resolution: bool,
+    rel_file: str = "",
+    scan: dict[str, Any] | None = None,
+    module_parts: list[str] | None = None,
+) -> bool:
+    """Check whether `symbol` is declared in `stripped_src` under witness or resolution rules.
+
+    `module_parts` overrides the namespace derived from `rel_file`'s path (a registry
+    entry's explicit `resolution_namespace`, for files outside a `lean/` source root)."""
+    parsed = scan if scan is not None else _scan_lean_declarations_and_pins(stripped_src)
+    if not resolution:
+        return symbol in parsed["witness_symbols"]
+    if module_parts is not None:
+        mod_parts = module_parts
+    else:
+        mod_parts = _lean_module_parts(rel_file) if rel_file else []
+    for eff_ns, has_forbidden in parsed["resolutions"].get(symbol, []):
+        if has_forbidden:
+            continue
+        if mod_parts and (len(eff_ns) > len(mod_parts) or eff_ns != mod_parts[: len(eff_ns)]):
+            continue
+        return True
+    return False
+
+
+# Authority audit modules whose `example : <statement> := <theorem>` pins lock the
+# exact statement of each resolution theorem (a pin fails the Lean build if the
+# theorem is ever weakened, e.g. restated as `True`).
+AUTHORITY_AUDIT_FILES: dict[str, str] = {
+    "MiniRustSpec": "minirust/lean/MiniRustSpec/Audit.lean",
+    "LeanMiriSpec": "lean-miri/lean/LeanMiriSpec/Audit.lean",
+}
+
+
+def _has_statement_pin(
+    stripped_audit_src: str,
+    symbol: str,
+    *,
+    rel_res_file: str = "",
+    rel_pin_file: str = "",
+    scan: dict[str, Any] | None = None,
+    res_module_parts: list[str] | None = None,
+    pin_module_parts: list[str] | None = None,
+) -> bool:
+    """True iff `stripped_audit_src` contains a non-trivial typed `example` statement pin
+    whose RHS directly applies `symbol` (without field projections like `.1`, vacuous `: True`
+    or wildcard `: _` types, or decoy inline/enclosing namespaces).
+
+    `res_module_parts` / `pin_module_parts` override the namespaces derived from the
+    resolution / pin file paths (a registry entry's explicit `resolution_namespace`)."""
+    parsed = scan if scan is not None else _scan_lean_declarations_and_pins(stripped_audit_src)
+    entries = parsed["pins"].get(symbol, [])
+    if not entries:
+        return False
+    res_parts = (
+        res_module_parts
+        if res_module_parts is not None
+        else (_lean_module_parts(rel_res_file) if rel_res_file else [])
+    )
+    pin_parts = (
+        pin_module_parts
+        if pin_module_parts is not None
+        else (_lean_module_parts(rel_pin_file) if rel_pin_file else [])
+    )
+    has_res = bool(rel_res_file) or res_module_parts is not None
+    has_pin = bool(rel_pin_file) or pin_module_parts is not None
+    allowed_inline = {"_root_", *res_parts} if has_res else None
+    allowed_audit_ns = {"StatementPins", *pin_parts, *res_parts} if (has_pin or has_res) else None
+    sym_last = _clean_lean_seg(symbol.split(".")[-1])
+    for active_ns, inline_qual, type_toks in entries:
+        # A pin locks nothing if its type is computed from the theorem itself
+        # (`type_of% thm`, self-reference), by a tactic (`by ...`), or via holes
+        # (`_`, `?_`, `?m`) that unify with the RHS type.
+        if any(
+            _clean_lean_seg(tt) == sym_last
+            or tt in _LEAN_SELF_TYPED_PIN_TOKENS
+            or tt.startswith("?")
+            for tt in type_toks
+        ):
+            continue
+        if allowed_inline is not None and any(seg not in allowed_inline for seg in inline_qual):
+            continue
+        if allowed_audit_ns is not None and any(seg not in allowed_audit_ns for seg in active_ns):
+            continue
+        return True
+    return False
 
 
 def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
@@ -1217,22 +1813,93 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
     actionable_open: list[dict[str, Any]] = []
     actionable_resolved: list[dict[str, Any]] = []
     modeling_choices: list[dict[str, Any]] = []
+    scan_cache: dict[Path, tuple[str, dict[str, Any]]] = {}
+
+    def read_scanned(path: Path) -> tuple[str, dict[str, Any]] | None:
+        if path in scan_cache:
+            return scan_cache[path]
+        if not path.is_file():
+            return None
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        stripped = _strip_lean_comments_and_strings(raw)
+        scanned = _scan_lean_declarations_and_pins(stripped)
+        scan_cache[path] = (stripped, scanned)
+        return stripped, scanned
 
     for item in TRACKED_CORRESPONDENCE_DIVERGENCES:
         fpath = repo_root / item["file"]
         symbol = item["witness_symbol"]
-        present = False
-        if fpath.is_file():
-            text = _strip_lean_comments(fpath.read_text(encoding="utf-8", errors="replace"))
-            present = bool(re.search(rf"\b(?:theorem|def)\s+{re.escape(symbol)}\b", text))
+        scanned_f = read_scanned(fpath)
+        present = (
+            _has_lean_decl(scanned_f[0], symbol, resolution=False, scan=scanned_f[1])
+            if scanned_f is not None
+            else False
+        )
+
+        resolution_symbol = item.get("resolution_symbol")
+        resolution_present: bool | None = None
+        rel_r = item.get("resolution_file", item["file"])
+        # Explicit namespace of the resolution theorem (and of its pin, when the pin lives
+        # in the same file) for files outside a `lean/` source root, whose path does not
+        # spell their namespace (`tests/mir/X.lean` declares `namespace Anneal.X`).
+        res_ns = item.get("resolution_namespace")
+        res_ns_parts = [seg for seg in res_ns.split(".") if seg] if res_ns else None
+        if resolution_symbol:
+            scanned_r = read_scanned(repo_root / rel_r)
+            resolution_present = (
+                _has_lean_decl(
+                    scanned_r[0],
+                    resolution_symbol,
+                    resolution=True,
+                    rel_file=rel_r,
+                    scan=scanned_r[1],
+                    module_parts=res_ns_parts,
+                )
+                if scanned_r is not None
+                else False
+            )
+
+        resolution_pinned: bool | None = None
+        if resolution_symbol and resolution_present:
+            rel_pin = item.get("resolution_pin_file", AUTHORITY_AUDIT_FILES.get(item["authority"]))
+            scanned_pin = read_scanned(repo_root / rel_pin) if rel_pin else None
+            resolution_pinned = (
+                _has_statement_pin(
+                    scanned_pin[0],
+                    resolution_symbol,
+                    rel_res_file=rel_r,
+                    rel_pin_file=rel_pin or "",
+                    scan=scanned_pin[1],
+                    res_module_parts=res_ns_parts,
+                    pin_module_parts=res_ns_parts if rel_pin == rel_r else None,
+                )
+                if scanned_pin is not None
+                else False
+            )
 
         record = dict(item)
         record["live_in_source"] = present
+        record["resolution_live_in_source"] = resolution_present
+        record["resolution_statement_pinned"] = resolution_pinned
         if item["category"] == "intentional_modeling_choice":
+            record["status"] = "modeling_choice"
             modeling_choices.append(record)
         elif present:
+            record["status"] = "open"
+            actionable_open.append(record)
+        elif resolution_symbol and not resolution_present:
+            # Fail closed: the divergence witness vanished without its positive
+            # replacement theorem (deleted/moved file or bare rename), so the
+            # divergence is NOT proven resolved.
+            record["status"] = "resolution_missing"
+            actionable_open.append(record)
+        elif resolution_symbol and not resolution_pinned:
+            # Fail closed: the replacement theorem exists but no audit `example`
+            # pin locks its statement, so it could be weakened without notice.
+            record["status"] = "resolution_unpinned"
             actionable_open.append(record)
         else:
+            record["status"] = "resolved"
             actionable_resolved.append(record)
 
     # Also parse `theory/Correspondence/correspondence_gaps.toml`
@@ -2156,9 +2823,27 @@ def render_markdown_report(dashboard: dict[str, Any]) -> str:
         ]
     )
     for div in p3["correspondence_divergences"]["actionable_anneal_bugs"]:
+        if div.get("status") == "resolution_missing":
+            res_sym = div.get("resolution_symbol", "<missing>")
+            res_file = div.get("resolution_file", div["file"])
+            witness_cell = (
+                f"`{div['witness_symbol']}` (`{div['file']}`) — "
+                f"**missing resolution** `{res_sym}` (`{res_file}`)"
+            )
+        elif div.get("status") == "resolution_unpinned":
+            res_sym = div.get("resolution_symbol", "<missing>")
+            pin_file = div.get(
+                "resolution_pin_file", AUTHORITY_AUDIT_FILES.get(div["authority"], "<audit>")
+            )
+            witness_cell = (
+                f"`{div['witness_symbol']}` (`{div['file']}`) — "
+                f"**unpinned resolution** `{res_sym}` (no `example ... := {res_sym}` in `{pin_file}`)"
+            )
+        else:
+            witness_cell = f"`{div['witness_symbol']}` (`{div['file']}`)"
         lines.append(
             f"| `{div['id']}` | `{div['authority']}` | `{div['severity']}` | "
-            f"`{div['witness_symbol']}` (`{div['file']}`) | `{div['anneal_component']}` | "
+            f"{witness_cell} | `{div['anneal_component']}` | "
             f"{div['switch_to_pass_criterion']} |"
         )
 

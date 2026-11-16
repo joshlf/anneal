@@ -534,9 +534,10 @@ does (and as rustc's `write_discriminant` does for direct tags). It does not
 read the destination first, so `SetDiscriminant` on an uninitialized enum local
 forces the local into memory and writes the tag. A dead destination fails in
 `projectWrite`'s `annealForceEnumAllocation` with `"write to dead local"`
-(rustc's `DeadLocal`). Anneal's `evalStmt` is stricter on uninitialized
-destinations; `step_setDiscriminant_uninit_divergence` in `SimLM2_3.lean`
-states that difference. -/
+(rustc's `DeadLocal`). Anneal's `evalStmt` likewise initializes an `.uninit`
+ADT enum local to `.init (.aggregate variantIdx .nil)` with all payload fields
+uninitialized (`DIV-LM-ENUM-SET-DISCR-UNINIT`); `step_setDiscriminant_uninit_simulation`
+in `SimLM2_3.lean` proves lockstep correspondence for that case. -/
 def annealStepHooksLM2_3 (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.StepHooks

@@ -22,6 +22,10 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 export Trusted.Rustc.V2026_06_01.MirSemantics (
   MirObs Value LocalSlot StackFrame TreeBorrowPerm LocalIdx BorrowEntry
   SavedCallerFrame Memory emptyMemory MachineState
+  currentFrameDepth frameIndexOfDepth savedFrameAtDepth? activeFrameSlot?
+  foreignFrameSlot? readFrameLocalSlot ForeignFrameTarget foreignFrameTarget?
+  commitForeignFrameLocals writeFrameLocalSlot frameLocalDeclsAndLayoutsAtDepth
+  foreignFrameDeclsAndLayouts
   MirCallReq MirCallAns MirFailE MirObsE MirCallE MirEffect MirReturn MirOutcome
   MirExecState MirStepNode
   ProjReadResult ProjWriteResult PlaceReadResult OperandEvalResult
@@ -41,6 +45,11 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalSaturatingAdd evalSaturatingSub evalUncheckedAdd evalUncheckedSub
   evalUncheckedMul evalUncheckedDiv evalUncheckedRem evalUncheckedShl
   evalUncheckedShr evalThreeWayCompare evalArithOffset evalSliceSizeOfVal
+  IeeeFormat F32Bits F64Bits FloatComponents unpackBits FloatKind powScale
+  decodeBits roundQuotientTiesToEven ratioExponent zeroBits encodeBits infBits
+  preferredNaNBits roundRatioTiesToEven FloatIntTarget FloatPtrWidth clampInt
+  truncRatio floatToIntValue encodeTwosComplement evalFloatToIntSaturating
+  intValueOfBits evalIntToFloatRoundTiesToEven evalFloatToFloatRoundTiesToEven
   ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
@@ -66,7 +75,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
   inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
   splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
-  startsWithArrayOrSliceProj resolveStackThinPtrTargetProj?
+  startsWithArrayOrSliceProj resolveLeafTyInTargetDecls resolveStackThinPtrTargetProj?
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
   evalOperand evalOperands
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
@@ -83,6 +92,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   borrowBaseAddress? ptrAddress? ptrAddressScalar? recoverExposedPtrValue?
   evalBinOpOffset evalPtrOffsetBinOp evalSliceFatPtrDerefBorrow
   evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
+  activeFrameTargetLocals? ieeeFormatOfTy? floatIntTargetOfTy?
+  floatPtrWidthOfLayouts evalFloatCast evalFloatCastRvalue
   evalRvalue evalRvalueWithMemory advanceStmt
   normalizeSubsliceProjectionsAux normalizeSubsliceProjections
   projectionsOverlap truncateTyProjAtUnion resolveBorrowWriteLocalProj
@@ -90,10 +101,18 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   invalidateDerefWriteBorrowsWithLayouts appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
+  preventsDeallocation copyEntriesTargetActiveFrame
+  borrowsAfterCopySingleDirect evalForeignFrameCopySingleDirect
+  setDiscriminantUninitDeclOk
+  evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
+  foreignFrameDerefWrite evalForeignFrameDerefWrite
+  evalSetDiscriminantDerefWrite
   evalStmt lookupSwitchTarget findCallee?
-  extractCalleeDefPath? restoreCallerProtectors pushCalleeFrame
+  extractCalleeDefPath? restoreCallerProtectors hasFrameDeallocProtectorConflict
+  disableFrameBorrows disableFramesAbove writeReturnDestination pushCalleeFrame
   pushDivergingCalleeFrame enterTailCalleeFrame unwindFromCallStack
-  applyUnwindAction resumeExternalCall resumeExternalDivergingCall
+  applyUnwindAction invalidateDirectDestWriteBorrows
+  resumeExternalCall resumeExternalDivergingCall
   resumeExternalTailCall isDirectExactDivTarget RustIntrinsicKind
   classifyRustIntrinsic? rigidTyIsSigned intrinsicIntSignedness?
   resolveIntrinsicIsSigned resolveIntrinsicShiftSigned findDeclLayoutForRigidTy

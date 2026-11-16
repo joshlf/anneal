@@ -917,7 +917,7 @@ open MiniRustSpec.Correspondence.Witness in
   deadCallDest_minirust_ub_before_callee
   uninitProjCallDest_rejected
   uninitProjCallDest_translate
-  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_anneal_ret
   uninitProjCallDest_minirust_ret
   diamondCall_inFragment
   diamondCall_maxStackLocals
@@ -934,7 +934,7 @@ open MiniRustSpec.Correspondence.Witness in
   callDestArgAlias_noUB_transfer_fails
   callProjMoveReuse_noUB
   callProjMoveReuse_noUB_transfer_fails
-  uninitProjCallDest_ub_transfer_fails
+  uninitProjCallDest_agreement
   liveCallDestSpin_inFragment
   liveCallDestSpin_translate
   liveCallDestSpin_translateInProg
@@ -2209,7 +2209,7 @@ open MiniRustSpec.Correspondence.Witness in
   deadCallDest_minirust_ub_before_callee
   uninitProjCallDest_rejected
   uninitProjCallDest_translate
-  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_anneal_ret
   uninitProjCallDest_minirust_ret
   diamondCall_inFragment
   diamondCall_maxStackLocals
@@ -2226,7 +2226,7 @@ open MiniRustSpec.Correspondence.Witness in
   callDestArgAlias_noUB_transfer_fails
   callProjMoveReuse_noUB
   callProjMoveReuse_noUB_transfer_fails
-  uninitProjCallDest_ub_transfer_fails
+  uninitProjCallDest_agreement
   liveCallDestSpin_inFragment
   liveCallDestSpin_translate
   liveCallDestSpin_translateInProg
@@ -3473,10 +3473,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_notInFragment
   twoPhaseForeignWriteDiscrepancy_anneal_ub
   twoPhaseForeignWriteDiscrepancy_minirust_direct
-  twoPhaseDirectWriteTreeBorrowsGap_translate
-  twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
-  twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
+  twoPhaseDirectWriteTreeBorrows_translate
+  twoPhaseDirectWriteTreeBorrows_notInFragment
+  twoPhaseDirectWriteTreeBorrows_anneal_ub
+  twoPhaseDirectWriteTreeBorrows_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
   frozenRefMutReborrow_minirust_direct
@@ -3689,7 +3689,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   misalignedRef_tb_direct
   danglingRef_tb_direct
   twoPhaseForeignWriteDiscrepancy_tb_direct
-  twoPhaseDirectWriteTreeBorrowsGap_tb_direct
+  twoPhaseDirectWriteTreeBorrows_tb_direct
+  twoPhaseDirectWriteTreeBorrows_simulation
   frozenRefMutReborrow_tb_direct
   frozenRefMutReborrowWrite_translate
   frozenRefMutReborrowWrite_notInFragment
@@ -3705,11 +3706,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagTrulyDisabledRefUb_anneal_ub
   retagTrulyDisabledRefUb_minirust_direct
   retagTrulyDisabledRefUb_tb_direct
-  retagFnEntryLocalDeallocUb_translate
-  retagFnEntryLocalDeallocUb_notInFragment
-  retagFnEntryLocalDeallocUb_anneal_ret
-  retagFnEntryLocalDeallocUb_minirust_direct
-  retagFnEntryLocalDeallocUb_tb_direct
+  retagFnEntryLocalDealloc_translate
+  retagFnEntryLocalDealloc_notInFragment
+  retagFnEntryLocalDealloc_anneal_ub
+  retagFnEntryLocalDealloc_minirust_direct
+  retagFnEntryLocalDealloc_tb_direct
+  retagFnEntryLocalDealloc_simulation
   retagScalarDiscrepancy_tb_direct
   transmuteSharedRefToMutWriteDiscrepancy_tb_direct
   transmuteDanglingIntToRefDiscrepancy_tb_direct
@@ -3970,10 +3972,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_notInFragment
   twoPhaseForeignWriteDiscrepancy_anneal_ub
   twoPhaseForeignWriteDiscrepancy_minirust_direct
-  twoPhaseDirectWriteTreeBorrowsGap_translate
-  twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
-  twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
+  twoPhaseDirectWriteTreeBorrows_translate
+  twoPhaseDirectWriteTreeBorrows_notInFragment
+  twoPhaseDirectWriteTreeBorrows_anneal_ub
+  twoPhaseDirectWriteTreeBorrows_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
   frozenRefMutReborrow_minirust_direct
@@ -4186,7 +4188,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   misalignedRef_tb_direct
   danglingRef_tb_direct
   twoPhaseForeignWriteDiscrepancy_tb_direct
-  twoPhaseDirectWriteTreeBorrowsGap_tb_direct
+  twoPhaseDirectWriteTreeBorrows_tb_direct
+  twoPhaseDirectWriteTreeBorrows_simulation
   frozenRefMutReborrow_tb_direct
   frozenRefMutReborrowWrite_translate
   frozenRefMutReborrowWrite_notInFragment
@@ -4202,11 +4205,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagTrulyDisabledRefUb_anneal_ub
   retagTrulyDisabledRefUb_minirust_direct
   retagTrulyDisabledRefUb_tb_direct
-  retagFnEntryLocalDeallocUb_translate
-  retagFnEntryLocalDeallocUb_notInFragment
-  retagFnEntryLocalDeallocUb_anneal_ret
-  retagFnEntryLocalDeallocUb_minirust_direct
-  retagFnEntryLocalDeallocUb_tb_direct
+  retagFnEntryLocalDealloc_translate
+  retagFnEntryLocalDealloc_notInFragment
+  retagFnEntryLocalDealloc_anneal_ub
+  retagFnEntryLocalDealloc_minirust_direct
+  retagFnEntryLocalDealloc_tb_direct
+  retagFnEntryLocalDealloc_simulation
   retagScalarDiscrepancy_tb_direct
   transmuteSharedRefToMutWriteDiscrepancy_tb_direct
   transmuteDanglingIntToRefDiscrepancy_tb_direct
@@ -4351,8 +4355,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellUnprotInteriorMut_tb_direct
   unsafeCellProtectedInteriorMut_translate
   unsafeCellProtectedInteriorMut_anneal_ret
+  unsafeCellProtectedInteriorMut_anneal_noUB
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
+  unsafeCellProtectedInteriorMut_simulation
+  unsafeCellProtectedStorageDead_simulation
   exposeSingleRefMutRoundTrip_translateIntr
   exposeSingleRefMutRoundTrip_anneal_ret
   exposeSingleRefMutRoundTrip_minirust_direct
@@ -4546,8 +4553,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellUnprotInteriorMut_tb_direct
   unsafeCellProtectedInteriorMut_translate
   unsafeCellProtectedInteriorMut_anneal_ret
+  unsafeCellProtectedInteriorMut_anneal_noUB
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
+  unsafeCellProtectedInteriorMut_simulation
+  unsafeCellProtectedStorageDead_simulation
   exposeSingleRefMutRoundTrip_translateIntr
   exposeSingleRefMutRoundTrip_anneal_ret
   exposeSingleRefMutRoundTrip_minirust_direct
@@ -5015,10 +5025,10 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSharedRefWriteUb_B3_divergence
   callerRawPtrRetagFnEntry_anneal_ub
   callerRawPtrRetagFnEntry_B3_divergence
-  callerRefMutSilentWrongLocal_anneal_137
-  callerRefMutSilentWrongLocal_divergence
-  callerBorrowAcrossScalarCall_anneal_ub
-  callerBorrowAcrossScalarCall_divergence
+  callerRefMutSilentWrongLocal_anneal_ret
+  callerRefMutSilentWrongLocal_simulation
+  callerBorrowAcrossScalarCall_anneal_ret
+  callerBorrowAcrossScalarCall_simulation
   callerBorrowExposeAndScalarCall_anneal_92
   callerBorrowExposeAndScalarCall_three_way
   progSingleExposeSiteOk_nil
@@ -5441,10 +5451,10 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSharedRefWriteUb_B3_divergence
   callerRawPtrRetagFnEntry_anneal_ub
   callerRawPtrRetagFnEntry_B3_divergence
-  callerRefMutSilentWrongLocal_anneal_137
-  callerRefMutSilentWrongLocal_divergence
-  callerBorrowAcrossScalarCall_anneal_ub
-  callerBorrowAcrossScalarCall_divergence
+  callerRefMutSilentWrongLocal_anneal_ret
+  callerRefMutSilentWrongLocal_simulation
+  callerBorrowAcrossScalarCall_anneal_ret
+  callerBorrowAcrossScalarCall_simulation
   callerBorrowExposeAndScalarCall_anneal_92
   callerBorrowExposeAndScalarCall_three_way
   progSingleExposeSiteOk_nil
@@ -5950,9 +5960,175 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   deinitSiblingBinOpWindowReinit_minirust_ret_from_start
   deinitSiblingBinOpWindowReinit_minirust_noUB
 
+/-- Verify that every listed declaration is distinct and strictly `Classical.choice`-free
+(depending at most on `propext` and `Quot.sound`). -/
+elab "#assert_choice_free " ids:ident* : command => do
+  let mut seen : Lean.NameSet := {}
+  for id in ids do
+    let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    if seen.contains n then
+      throwError "duplicate declaration {n} in #assert_choice_free"
+    seen := seen.insert n
+    let axs ← liftCoreM <| Lean.collectAxioms n
+    for a in axs do
+      unless a == ``propext || a == ``Quot.sound do
+        throwError "{n} is not Classical.choice-free: depends on axiom {a}"
+  logInfo m!"MiniRustSpec.Audit: verified Classical.choice-freedom for {ids.size} DIV-MR declarations"
+
+section DivMrAuditPins
+
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.Layout
+open MiniRustSpec
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
+open MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness
+open MiniRustSpec.Correspondence.TbWitness
+open MiniRustSpec.Correspondence.ProvenanceWitness
+
+#assert_choice_free
+  callerRefMutSilentWrongLocalMInit
+  callerRefMutSilentWrongLocalTBInit
+  callerRefMutSilentWrongLocal_simulation
+  callerBorrowAcrossScalarCallMInit
+  callerBorrowAcrossScalarCallTBInit
+  callerBorrowAcrossScalarCall_simulation
+  callRefMutProtectedMInit
+  callRefMutProtectedRoundTrip_three_way
+  twoPhaseDirectWriteTreeBorrows_simulation
+  retagFnEntryLocalDealloc_simulation
+  unsafeCellProtectedInteriorMut_anneal_noUB
+  unsafeCellProtectedInteriorMut_simulation
+  unsafeCellProtectedStorageDead_simulation
+
+namespace StatementPins
+
+example :
+    progInFragmentWithIntrinsicsB3 callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = true ∧
+    progCrossFrameTranslatable callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = true ∧
+    progInFragmentWithIntrinsics callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = false ∧
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
+        [calleeReadRefWithLocalMir])
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
+        [calleeReadRefWithLocalMir]) ∧
+    (Interp.steps 13 callerRefMutSilentWrongLocalMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    (Interp.stepsTB 13 callerRefMutSilentWrongLocalTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 42 :=
+  callerRefMutSilentWrongLocal_simulation
+
+example :
+    ptrAliasingOk callerBorrowAcrossScalarCallMir = true ∧
+    ptrAliasingOk calleeScalarAssignLocal1Mir = true ∧
+    ptrAliasingProgOk callerBorrowAcrossScalarCallMir = false ∧
+    progInFragmentWithIntrinsicsB3 callerBorrowAcrossScalarCallMir [calleeScalarAssignLocal1Mir] = true ∧
+    progInFragmentWithIntrinsics callerBorrowAcrossScalarCallMir [calleeScalarAssignLocal1Mir] = false ∧
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir])
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir]) ∧
+    (Interp.steps 14 callerBorrowAcrossScalarCallMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    (Interp.stepsTB 14 callerBorrowAcrossScalarCallTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 42 :=
+  callerBorrowAcrossScalarCall_simulation
+
+example :
+    progInFragment callerRefMutProtectedMir [calleeAdd37RefMutMir] = false ∧
+    progCrossFrameTranslatable callerRefMutProtectedMir [calleeAdd37RefMutMir] = true ∧
+    progInFragmentWithIntrinsics callerRefMutProtectedMir [calleeAdd37RefMutMir] = false ∧
+    translateProgWithIntrinsics callerRefMutProtectedMir [calleeAdd37RefMutMir] =
+      some callRefMutProtectedProg ∧
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir])
+      tr (.normal (.scalar ⟨84, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir]) ∧
+    (Interp.steps 17 callRefMutProtectedMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 84 }, [1]) ∧
+    (Interp.stepsTB 17 callRefMutProtectedTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 84 :=
+  callRefMutProtectedRoundTrip_three_way
+
+example :
+    (translateFn twoPhaseDirectWriteTreeBorrows).isSome = true ∧
+    inFragment twoPhaseDirectWriteTreeBorrows = false ∧
+    (∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrows
+      (initMachineState twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    retAfter twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩] 6 =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) ∧
+    ubAfterTB twoPhaseDirectWriteTreeBorrows [.scalar ⟨5, 4⟩] 5 =
+      some "Tree Borrows: local read of Disabled reference" :=
+  twoPhaseDirectWriteTreeBorrows_simulation
+
+example :
+    (translateFn retagFnEntryLocalDealloc).isSome = true ∧
+    inFragment retagFnEntryLocalDealloc = false ∧
+    (∃ tr u, Reaches (mirTree retagFnEntryLocalDealloc
+      (initMachineState retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    retAfter retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩] 6 =
+      some (some { retAlloc with data := scalarBytes u32 5 }, [1]) ∧
+    ubAfterTB retagFnEntryLocalDealloc [.scalar ⟨5, 4⟩] 6 =
+      some "Tree Borrows: foreign write of protected Frozen reference which had a local read" :=
+  retagFnEntryLocalDealloc_simulation
+
+example :
+    (translateFn unsafeCellProtectedInteriorMutMir).isSome = true ∧
+    (∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) []
+      (.normal (.scalar ⟨77, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) ∧
+    retAfter unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 =
+      some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
+    retAfterTB unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 = tbRetU32 77 :=
+  unsafeCellProtectedInteriorMut_simulation
+
+example :
+    (translateFn unsafeCellProtectedStorageDeadMir).isSome = true ∧
+    (∃ mem, ReachesRet (mirTree unsafeCellProtectedStorageDeadMir
+      (initMachineState unsafeCellProtectedStorageDeadMir [initUnsafeCellU32])) []
+      (.normal (.scalar ⟨77, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree unsafeCellProtectedStorageDeadMir
+      (initMachineState unsafeCellProtectedStorageDeadMir [initUnsafeCellU32])) ∧
+    retAfter unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 =
+      some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
+    retAfterTB unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 = tbRetU32 77 :=
+  unsafeCellProtectedStorageDead_simulation
+
+end StatementPins
+
+end DivMrAuditPins
+
 /-- Exhaustively verify that every declaration across every imported
-`MiniRustSpec.*` module in the environment depends only on Lean's standard
-axioms (`propext`, `Quot.sound`, `Classical.choice`). -/
+`MiniRustSpec.*` module in the environment — as well as every declaration
+elaborated in `MiniRustSpec.Audit` itself (`env.constants.map₂`) — depends only
+on Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`). -/
 elab "#assert_all_minirustspec_standard_axioms" : command => do
   let env ← getEnv
   let mut checked : Nat := 0
@@ -5966,6 +6142,12 @@ elab "#assert_all_minirustspec_standard_axioms" : command => do
           unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
             throwError "{c} (in {modName}) depends on the non-standard axiom {a}"
         checked := checked + 1
+  for (c, _) in env.constants.map₂.toList do
+    let axs ← liftCoreM <| Lean.collectAxioms c
+    for a in axs do
+      unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+        throwError "{c} (in MiniRustSpec.Audit) depends on the non-standard axiom {a}"
+    checked := checked + 1
   logInfo m!"MiniRustSpec.Audit: exhaustively verified standard axioms for {checked} declarations across all MiniRustSpec.* modules"
 
 #assert_minirustspec_import_isolation

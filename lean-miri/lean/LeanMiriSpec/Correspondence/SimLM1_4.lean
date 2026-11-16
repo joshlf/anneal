@@ -808,12 +808,16 @@ theorem evalOperand_move_simulation
             by_cases hk : srcDecl.ty.kind = .bool
             · obtain ⟨sc, _, rfl, _, _, _, hbool, _⟩ := himmRel.of_primitive_scalar (Or.inl hk)
               rcases (hbool hk).2 with hb | hb <;> simp [hk, hb]
-            · cases h : srcDecl.ty.kind <;> simp_all
+            · by_cases hkc : srcDecl.ty.kind = .char
+              · obtain ⟨sc, _, rfl, _, _, _, _, hchar⟩ := himmRel.of_primitive_scalar (Or.inr (Or.inl hkc))
+                obtain ⟨hsz, hv⟩ := hchar hkc
+                simp [hkc, hsz, hv]
+              · cases h : srcDecl.ty.kind <;> simp_all
           have huse : evalRvalue s.frame.locals (.use (.move ⟨srcIdx, .nil⟩)) s.memory
               body.localDecls body.layouts = .ok v (s.frame.locals.set srcIdx .uninit) s.memory := by
             unfold evalRvalue
             dsimp only
-            rw [hbor, hcaller]
+            rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq]
             have hop_ok : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
                 s.memory.globals body.layouts .nil body.localDecls =
                 .ok v (s.frame.locals.set srcIdx .uninit) := by

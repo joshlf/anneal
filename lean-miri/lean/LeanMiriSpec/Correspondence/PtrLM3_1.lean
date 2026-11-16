@@ -51,6 +51,7 @@ structure AllocMapEntry where
   localIdx : Local
   allocId : Miri.Memory.AllocId
   perm : TreeBorrowPerm
+  allocDead : Bool := false
 
 namespace AllocMapEntry
 
@@ -60,14 +61,21 @@ def toBorrowEntry (e : AllocMapEntry) : BorrowEntry :=
   { tag := e.tag
     targetLocal := e.localIdx
     targetProjection := .nil
-    perm := e.perm }
+    perm := e.perm
+    allocDead := match e.perm with | .disabled => e.allocDead | _ => false }
 
 /-- Update `e.perm` on a write to `targetLocal` (either directly when
 `writerTag = none`, or through pointer tag `some wTag`), mirroring
 `MirSemantics.updateBorrowPerm`. -/
 def updateOnWrite (e : AllocMapEntry) (targetLocal : Local)
     (writerTag : Option Nat) : AllocMapEntry :=
-  { e with perm := (updateBorrowPerm e.toBorrowEntry targetLocal writerTag).perm }
+  { e with
+    perm := (updateBorrowPerm e.toBorrowEntry targetLocal writerTag).perm
+    allocDead := match Nat.beq e.localIdx targetLocal with
+      | false => e.allocDead
+      | true => match e.perm with
+        | .disabled => e.allocDead
+        | _ => false }
 
 /-- Update `e.perm` on a deref read of `targetLocal` through pointer tag `rTag`,
 freezing foreign `.active` borrows to `.frozen` while leaving self reads and
@@ -88,14 +96,18 @@ theorem toBorrowEntry_updateOnWrite (e : AllocMapEntry) (targetLocal : Local)
     (writerTag : Option Nat) :
     (e.updateOnWrite targetLocal writerTag).toBorrowEntry =
       updateBorrowPerm e.toBorrowEntry targetLocal writerTag := by
+  rcases e with ⟨tag, localIdx, allocId, perm, allocDead⟩
   unfold updateOnWrite toBorrowEntry updateBorrowPerm
-  split
-  · rfl
-  · cases treeBorrowNodeAccess .write
-        (treeBorrowWriterRelatedness
-          { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil,
-            perm := e.perm } writerTag)
-        e.perm false <;> rfl
+    treeBorrowWriterRelatedness treeBorrowNodeAccess treeBorrowPermTransition
+    treeBorrowChildWrite treeBorrowForeignWrite treeBorrowProtectorCheck
+    applyTreeBorrowTransition
+  dsimp only [Bool.true_and]
+  cases Nat.beq localIdx targetLocal <;>
+    rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+    cases allocDead <;>
+    (cases writerTag with
+      | none => rfl
+      | some wTag => dsimp only []; cases Nat.beq tag wTag <;> rfl)
 
 end AllocMapEntry
 
@@ -188,8 +200,7 @@ structure AllocMapRel
   borrow_sync :
     ∀ e ∈ allocMap,
       e.tag < s.memory.nextTag ∧
-      lookupBorrow s.memory.borrows e.tag =
-        some { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil, perm := e.perm }
+      lookupBorrow s.memory.borrows e.tag = some e.toBorrowEntry
   /-- Each mapped `allocId` has at most one entry in `m.machine.memory.live`. -/
   live_key_unique :
     ∀ e ∈ allocMap, ∀ la₁ la₂,
@@ -467,6 +478,12 @@ inductive StateRelLM3_1
       StateRelLM3_1 body s m allocMap
 
 namespace StateRelLM3_1
+
+theorem callStack_nil {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} (h : StateRelLM3_1 body s m allocMap) :
+    s.memory.callStack = .nil := by
+  rcases h with ⟨_, _, _, _, _, _, hcs, _, _, _, _, _⟩
+  exact hcs
 
 /-- Every borrow entry in `s.memory.borrows` comes from an `allocMap` entry. -/
 theorem borrows_tracked {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -1744,7 +1761,7 @@ theorem freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry
       cases Nat.beq rTag hd.tag with
       | true => rfl
       | false =>
-        rcases hd with ⟨_, _, _, perm⟩
+        rcases hd with ⟨_, _, _, perm, _⟩
         cases perm <;> rfl
 
 /-- `freezeDerefReadBorrowsAt` on `e₁ :: e₂ :: rest` matches

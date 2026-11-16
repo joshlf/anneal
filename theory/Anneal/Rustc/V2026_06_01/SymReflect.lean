@@ -277,9 +277,11 @@ theorem evalSymConstVal_sound
     (layouts : LayoutTable)
     {callerLocals : List LocalSlot}
     {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
     (v : Value)
     (h : evalSymConstVal cv = .some v) :
-    evalOperand locals (.constant { ty := ty, val := cv }) borrows globals layouts callerLocals localDecls =
+    evalOperand locals (.constant { ty := ty, val := cv }) borrows globals layouts callerLocals localDecls
+        callStack =
       .ok v locals := by
   cases cv with
   | zeroSized =>
@@ -363,9 +365,11 @@ theorem evalSymPlaceCopy_sound_copy
     (layouts : LayoutTable)
     {callerLocals : List LocalSlot}
     {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
     (sv : SymVal)
     (h : evalSymPlaceCopy slots p borrows localDecls layouts = .some sv) :
-    evalOperand (concretizeSymSlots args slots) (.copy p) borrows globals layouts callerLocals localDecls =
+    evalOperand (concretizeSymSlots args slots) (.copy p) borrows globals layouts callerLocals localDecls
+        callStack =
       concretizeSymReadResult args sv slots := by
   cases p with
   | mk loc proj =>
@@ -520,9 +524,12 @@ theorem evalOperand_move_cons_eq_copy
     (globals : List CapturedAllocation)
     (layouts : LayoutTable)
     {callerLocals : List LocalSlot}
-    {localDecls : List LocalDecl} :
-    evalOperand locals (.move ⟨loc, pHead :: pTail⟩) borrows globals layouts callerLocals localDecls =
-      evalOperand locals (.copy ⟨loc, pHead :: pTail⟩) borrows globals layouts callerLocals localDecls := by
+    {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame} :
+    evalOperand locals (.move ⟨loc, pHead :: pTail⟩) borrows globals layouts callerLocals localDecls
+        callStack =
+      evalOperand locals (.copy ⟨loc, pHead :: pTail⟩) borrows globals layouts callerLocals localDecls
+        callStack := by
   cases pHead <;> rfl
 
 /-- Evaluate an `Operand` over symbolic slots `slots`. -/
@@ -573,10 +580,12 @@ theorem evalSymOperand_sound
     (layouts : LayoutTable)
     {callerLocals : List LocalSlot}
     {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
     (sv : SymVal)
     (slots' : List SymSlot)
     (h : evalSymOperand slots op borrows localDecls layouts = .some (sv, slots')) :
-    evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls =
+    evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls
+        callStack =
       concretizeSymReadResult args sv slots' := by
   cases op with
   | copy p =>
@@ -714,7 +723,8 @@ def evalSymOperandsConcrete
 theorem evalSymOperandsConcrete_sound
     (args : List Value)
     {callerLocals : List LocalSlot}
-    {localDecls : List LocalDecl} :
+    {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame} :
     ∀ (ops : List Operand)
       (slots : List SymSlot)
       (borrows : List BorrowEntry)
@@ -723,7 +733,8 @@ theorem evalSymOperandsConcrete_sound
       (vals : List Value)
       (slots' : List SymSlot),
       evalSymOperandsConcrete slots ops borrows localDecls layouts = .some (vals, slots') →
-      evalOperands (concretizeSymSlots args slots) ops borrows globals layouts callerLocals localDecls =
+      evalOperands (concretizeSymSlots args slots) ops borrows globals layouts callerLocals localDecls
+          callStack =
         .ok vals (concretizeSymSlots args slots')
   | .nil, slots, _, _, _, vals, slots', h => by
     injection h with hPair
@@ -1074,6 +1085,7 @@ def freezeSymDerefReadBorrowsAt
         readerEntry.rangeOffset
         readerEntry.rangeLen
         activeProtectors
+        readerEntry.targetFrameDepth
     | .none => borrows
   | _ => borrows
 
@@ -1120,6 +1132,7 @@ def derefSymReadTreeUB
         (appendProjections readerEntry.targetProjection restProj)
         readerEntry.rangeOffset
         readerEntry.rangeLen
+        readerEntry.targetFrameDepth
     | .none => false
   | _ => false
 
@@ -1195,7 +1208,13 @@ def freezeSymPlaceReadBorrows
       slots place.local_ restProj (b₁ :: b₂ :: restBorrows) activeProtectors
   | _, _ => borrows
 
-/-- Validate that a loaded symbolic value complies with `validateLoadedValue`. -/
+/-- Validate that a loaded symbolic value complies with `validateLoadedValue`.
+
+Typed `bool` and `char` loads constrain the loaded scalar (`0`/`1` for `bool`; a
+4-byte Unicode scalar value, `isValidCharCode`, for `char`), so only a concrete
+(or guarded concrete) scalar can be validated at those types: a symbolic argument
+(`.symArg`) or symbolic pair (`.symPair0`) loaded at type `bool` or `char` is
+rejected. At every other type the symbolic value passes through unchanged. -/
 def symValidateLoadedValue
     (layouts : LayoutTable)
     (localDecls : List LocalDecl)
@@ -1208,6 +1227,11 @@ def symValidateLoadedValue
       match sv with
       | .concrete (.scalar sc) => Nat.beq sc.bits 0 || Nat.beq sc.bits 1
       | .symGuarded (.scalar sc) _ => Nat.beq sc.bits 0 || Nat.beq sc.bits 1
+      | _ => false
+    | .some { kind := .char, .. } =>
+      match sv with
+      | .concrete (.scalar sc) => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
+      | .symGuarded (.scalar sc) _ => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
       | _ => false
     | _ => true
   | _ => true
@@ -1228,7 +1252,10 @@ def symPlaceReadTreeUB
 
 /-- Evaluate an `Rvalue` that produces a `SymVal` under the active protectors
 `activeProtectors`. Dereference reads that `evalRvalue` rejects as undefined
-behavior evaluate to `.none`. -/
+behavior evaluate to `.none`. A borrow `Rvalue.ref` of a local of the active
+frame records that frame's depth `frameDepth` (`length mem.callStack` of the
+concrete memory; `0` for the single-frame `SymState`) as the new entry's
+`targetFrameDepth`. -/
 def evalSymRvalueConcrete
     (slots : List SymSlot)
     (borrows : List BorrowEntry)
@@ -1236,7 +1263,8 @@ def evalSymRvalueConcrete
     (activeProtectors : List Nat)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (rv : Rvalue) :
+    (rv : Rvalue)
+    (frameDepth : Nat := 0) :
     Option (SymVal × List SymSlot × List BorrowEntry × Nat) :=
   match rv with
   | .use op =>
@@ -1286,6 +1314,7 @@ def evalSymRvalueConcrete
             targetLocal := place.local_
             targetProjection := resolvedProj
             perm := perm
+            targetFrameDepth := frameDepth
           }
           .some
             (.concrete (.ptr { allocId := nextTag, offsetBytes := 0 } 8),
@@ -1409,6 +1438,14 @@ theorem concretizeSymReadResult_to_rvalue_valid
               exact hValid
             | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
+          | char =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
           | _ => rfl
       | move p =>
         dsimp only [validateLoadedValue]
@@ -1419,6 +1456,14 @@ theorem concretizeSymReadResult_to_rvalue_valid
           cases ty with | mk kind layoutIdx =>
           cases kind with
           | bool =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
+          | char =>
             rw [hTy] at hValid; dsimp only at hValid
             cases v with
             | scalar sc =>
@@ -1441,6 +1486,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | _ => cases get? args idx <;> rfl
     | move p =>
       dsimp only [validateLoadedValue]
@@ -1451,6 +1497,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | _ => cases get? args idx <;> rfl
   | symPair0 v0 idx =>
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
@@ -1465,6 +1512,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | _ => cases get? args idx <;> rfl
     | move p =>
       dsimp only [validateLoadedValue]
@@ -1475,6 +1523,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | _ => cases get? args idx <;> rfl
   | symGuarded v0 idx =>
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
@@ -1497,6 +1546,14 @@ theorem concretizeSymReadResult_to_rvalue_valid
               exact hValid
             | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
+          | char =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v0 with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
           | _ => rfl
       | move p =>
         dsimp only [validateLoadedValue]
@@ -1507,6 +1564,14 @@ theorem concretizeSymReadResult_to_rvalue_valid
           cases ty with | mk kind layoutIdx =>
           cases kind with
           | bool =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v0 with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
+          | char =>
             rw [hTy] at hValid; dsimp only at hValid
             cases v0 with
             | scalar sc =>
@@ -1532,7 +1597,8 @@ theorem evalSymRvalueConcrete_sound
     (nextTag' : Nat)
     (h :
       evalSymRvalueConcrete
-          slots mem.borrows mem.nextTag mem.activeProtectors localDecls layouts rv =
+          slots mem.borrows mem.nextTag mem.activeProtectors localDecls layouts rv
+          (length mem.callStack) =
         .some (sv, slots', borrows', nextTag')) :
     evalRvalue (concretizeSymSlots args slots) rv mem localDecls layouts =
       concretizeSymRvalueResult
@@ -2729,6 +2795,7 @@ theorem symIsReturnFalse_sound
                             cases sz' with
                             | succ _ => nomatch h
                             | zero =>
+                              rw [hasFrameDeallocProtectorConflict.eq_1] at hHold
                               dsimp only [concretizeSymSlot, stepResultHoldBounded, evalNodeWP, MirStepNode.retNormal, mirSafePost] at hHold
                               injection hHold with hSc
                               injection hSc with hBits _
@@ -2920,13 +2987,18 @@ def evalAssignNilRvalueStep
       | .some locals₂ =>
         match mem₁.activeProtectors with
         | .nil =>
-          let borrows' := invalidateConflictingBorrows mem₁.borrows dstLoc .none
+          let borrows' :=
+            invalidateConflictingBorrows mem₁.borrows dstLoc .none (length mem₁.callStack)
           MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | protHead :: protTail =>
-          match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none .nil with
+          match
+            hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none .nil 0 0
+              (length mem₁.callStack)
+          with
           | true => MirStepNode.fail .ub
           | false =>
-            let borrows' := invalidateConflictingBorrows mem₁.borrows dstLoc .none
+            let borrows' :=
+              invalidateConflictingBorrows mem₁.borrows dstLoc .none (length mem₁.callStack)
             MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
@@ -4544,16 +4616,20 @@ def treeBorrowPermIsDisabled : TreeBorrowPerm → Bool
   | .disabled => true
   | _ => false
 
-def isNonBoolOperandTy : Option Ty → Bool
+/-- Test whether an operand type carries no typed-load validity invariant in
+`validateLoadedValue`, i.e. is neither `bool` nor `char` (the types whose loads
+`symValidateLoadedValue` checks against the loaded scalar). -/
+def isNonBoolNonCharOperandTy : Option Ty → Bool
   | .some { kind := .bool, .. } => false
+  | .some { kind := .char, .. } => false
   | _ => true
 
-theorem symValidateLoadedValue_of_isNonBoolOperandTy
+theorem symValidateLoadedValue_of_isNonBoolNonCharOperandTy
     (layouts : LayoutTable)
     (localDecls : List LocalDecl)
     (p : Place)
     (sv : SymVal)
-    (h : isNonBoolOperandTy (operandTy localDecls layouts (.copy p)) = true) :
+    (h : isNonBoolNonCharOperandTy (operandTy localDecls layouts (.copy p)) = true) :
     symValidateLoadedValue layouts localDecls (.copy p) sv = true := by
   dsimp only [symValidateLoadedValue]
   cases hTy : operandTy localDecls layouts (.copy p) with
@@ -4564,6 +4640,7 @@ theorem symValidateLoadedValue_of_isNonBoolOperandTy
     | mk kind layoutIdx =>
       cases kind with
       | bool => nomatch h
+      | char => nomatch h
       | _ => rfl
 
 theorem evalOperand_copy_deref_of_ptr
@@ -4614,7 +4691,7 @@ theorem evalOperand_copy_deref_of_ptr
     nomatch hNotDis
   | cell | reservedIM | reservedFrz _ | unique | frozen =>
     dsimp only
-    rw [hTarget]
+    rw [activeFrameSlot?_nil, hTarget]
 
 theorem evalRvalue_use_copy_deref_ok_of_ptr
     (body : CapturedMir)
@@ -4682,6 +4759,12 @@ theorem evalRvalue_use_copy_deref_ok_of_ptr
       | mk kind layoutIdx =>
         cases kind with
         | bool =>
+          rw [hTy] at hValid
+          dsimp only at hValid
+          cases loadedVal with
+          | scalar sc => exact hValid
+          | unit | ptr _ _ | aggregate _ _ => nomatch hValid
+        | char =>
           rw [hTy] at hValid
           dsimp only at hValid
           cases loadedVal with
@@ -5234,7 +5317,7 @@ def symMatchDerefSymArgLoad
               let op := Operand.copy { local_ := ptrLoc, projection := .deref :: .nil }
               match
                 checkCanonicalUintDerefReadCtx body.localDecls body.layouts ptrLoc uKind entry ptrVal,
-                isNonBoolOperandTy (operandTy body.localDecls body.layouts op),
+                isNonBoolNonCharOperandTy (operandTy body.localDecls body.layouts op),
                 symOperandReadTreeUB st.slots op st.borrows .nil
               with
               | true, true, false =>
@@ -5357,7 +5440,7 @@ theorem symMatchDerefSymArgLoad_evalStmt
                                               | false => rw [hCtx] at hMatch; nomatch hMatch
                                               | true =>
                                                 rw [hCtx] at hMatch
-                                                cases hNonBool : isNonBoolOperandTy (operandTy body.localDecls body.layouts (.copy { local_ := ptrLoc, projection := .deref :: .nil })) with
+                                                cases hNonBool : isNonBoolNonCharOperandTy (operandTy body.localDecls body.layouts (.copy { local_ := ptrLoc, projection := .deref :: .nil })) with
                                                 | false => rw [hNonBool] at hMatch; nomatch hMatch
                                                 | true =>
                                                   rw [hNonBool] at hMatch
@@ -5389,7 +5472,7 @@ theorem symMatchDerefSymArgLoad_evalStmt
                                                         | disabled => rfl
                                                         | cell | reservedIM | reservedFrz _ | unique | frozen =>
                                                           dsimp only
-                                                          rw [get?_concretizeSymSlots args st.slots entry.targetLocal, hTSlot]
+                                                          rw [activeFrameSlot?_nil, get?_concretizeSymSlots args st.slots entry.targetLocal, hTSlot]
                                                           dsimp only [concretizeSymSlot]
                                                           rw [hArg]
                                                       | some v =>
@@ -5433,7 +5516,7 @@ theorem symMatchDerefSymArgLoad_evalStmt
                                                                 body.localDecls
                                                                 (.copy { local_ := ptrLoc, projection := .deref :: .nil })
                                                                 (.concrete (.scalar actualSc)) = true :=
-                                                            symValidateLoadedValue_of_isNonBoolOperandTy
+                                                            symValidateLoadedValue_of_isNonBoolNonCharOperandTy
                                                               body.layouts body.localDecls
                                                               { local_ := ptrLoc, projection := .deref :: .nil }
                                                               (.concrete (.scalar actualSc)) hNonBool
@@ -9625,6 +9708,7 @@ theorem symIsReturnTrue_sound
                               cases sz' with
                               | succ _ => nomatch h
                               | zero =>
+                                rw [hasFrameDeallocProtectorConflict.eq_1]
                                 rfl
             | _ => nomatch h
 
@@ -11539,6 +11623,7 @@ theorem wpCoalBounded_of_symIsReturnSymArg0
                   cases idx0 with
                   | succ _ => nomatch hRet
                   | zero =>
+                    rw [hasFrameDeallocProtectorConflict.eq_1]
                     dsimp only [concretizeSymSlot, get?, MirStepNode.retNormal, mirDefaultWP]
                     intro retVal mem' hOut
                     injection hOut with hPair

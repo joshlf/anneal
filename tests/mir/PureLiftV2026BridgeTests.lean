@@ -359,8 +359,8 @@ theorem sibling_symbolic_sound (a b : Nat) (ha : a < 256 ^ 4) (hb : b < 256 ^ 4)
         .halted (.normal (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩],
           { (initMachineState siblingBody [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]).memory with
             borrows :=
-              [{ tag := 2, targetLocal := 3, targetProjection := [.field 1 u32Ty], perm := .disabled },
-               { tag := 1, targetLocal := 3, targetProjection := [.field 0 u32Ty], perm := .disabled }]
+              [{ tag := 2, targetLocal := 3, targetProjection := [.field 1 u32Ty], perm := .disabled, allocDead := true },
+               { tag := 1, targetLocal := 3, targetProjection := [.field 0 u32Ty], perm := .disabled, allocDead := true }]
             nextTag := 3 })) := rfl
     obtain ⟨n, mFinal, hPath3, hDone⟩ := exists_stepPath_of_evalFuel_halted hRun3
     refine mir_pure_lift_sound tagOfLoan siblingBody []
@@ -1489,6 +1489,7 @@ theorem fp_sound :
     ⟨_, rfl, fp_entry_rel⟩ fp_pureLift_eval rfl rfl
     (.pair (.nat (by decide)) (.nat (by decide))) rfl
 
+set_option maxHeartbeats 400000 in
 /-- **Test 3c (symbolic-input adequacy)**: for *every* symbolic first field
 `a < 256 ^ 4`, `fieldPinBody` from `initMachineState fieldPinBody [.scalar ⟨a, 4⟩, .scalar ⟨zcV0, 4⟩]`
 converges fuel-free to a normal return refining `(.pair (.nat a) (.nat zcV1))`. -/

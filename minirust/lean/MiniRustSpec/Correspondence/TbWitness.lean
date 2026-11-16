@@ -34,13 +34,13 @@ and MiniRust `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`):
    (`"Tree Borrows: local read of Disabled reference"`) while returning `1` on
    `BasicMemory`.
 3. **`UnsafeCell<u32>` shared-reference interior mutability (`Permission::Cell`)**
-   (`unsafeCellUnprotInteriorMut`, `unsafeCellProtectedInteriorMut`):
+   (`unsafeCellUnprotInteriorMut`, `unsafeCellProtectedInteriorMutMir`):
    unprotected `&UnsafeCell<u32>` interior mutation returns `77` in all three
    semantics, and function-entry strongly protected `Retag([fn entry], r)` on
    `r: &UnsafeCell<u32>` (`PermissionProt::Cell`, `prevents_deallocation = false`)
    succeeds across a foreign raw write and callee local teardown on both `Mach`
    and `MachTB` (`77`), contrasting with `retagFnEntryProtectorWrite` and
-   `retagFnEntryLocalDeallocUb` on `Freeze` `&u32` / `&mut u32`. Under the
+   `retagFnEntryLocalDealloc` on `Freeze` `&u32` / `&mut u32`. Under the
    six-state `TreeBorrowPerm` (`LM-3.3`), Anneal also returns `77`: `&_1` on
    `!Freeze` `UnsafeCell<u32>` records `.cell` (`sharedBorrowPerm`), and the
    function-entry retag records a protected `.cell` child (`fnEntryRetagPerm`),
@@ -697,14 +697,14 @@ on both `Mach` and `MachTB`, `r` receives `Permission.Prot .Cell`
 (`unsafe_cells = [(0, 4)], freeze = false`), which permits both foreign writes
 and local teardown before `end_call` (`prevents_deallocation .Cell = false`),
 returning `77` (contrasting with `retagFnEntryProtectorWrite` and
-`retagFnEntryLocalDeallocUb` on `Freeze` `&u32` / `&mut u32`). Anneal agrees and
+`retagFnEntryLocalDealloc` on `Freeze` `&u32` / `&mut u32`). Anneal agrees and
 returns `77` under the six-state `TreeBorrowPerm` (`LM-3.3`): `r = &_1` records
 `.cell` (`sharedBorrowPerm` on `!Freeze` `UnsafeCell<u32>`), `Retag([fn entry], r)`
 (`evalFnEntryRetag`) records a strongly protected `.cell` child (`fnEntryRetagPerm`),
 the foreign raw write `*p = 77` leaves that `.cell` child unchanged (no protector
 conflict), and the final read through `r` only freezes the foreign `&raw mut`
 tag. -/
-def unsafeCellProtectedInteriorMut : CapturedMir :=
+def unsafeCellProtectedInteriorMutMir : CapturedMir :=
   { ptrBody "witness::unsafe_cell_protected_interior_mut"
       [u32Decl, unsafeCellU32Decl, refSharedUnsafeCellU32Decl, ptrMutU32Decl]
       [.storageLive 2, .storageLive 3,
@@ -716,22 +716,80 @@ def unsafeCellProtectedInteriorMut : CapturedMir :=
     fnAbi := fnAbiUnsafeCellU32Arg, layouts := unsafeCellU32Layouts }
 
 theorem unsafeCellProtectedInteriorMut_translate :
-    (translateFn unsafeCellProtectedInteriorMut).isSome = true := by decide +kernel
+    (translateFn unsafeCellProtectedInteriorMutMir).isSome = true := by decide +kernel
 
 theorem unsafeCellProtectedInteriorMut_anneal_ret :
-    ∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMut
-      (initMachineState unsafeCellProtectedInteriorMut [initUnsafeCellU32])) []
+    ∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) []
       (.normal (.scalar ⟨77, 4⟩, mem)) :=
-  ⟨_, runA_sound unsafeCellProtectedInteriorMut 25 _ _ _ rfl⟩
+  ⟨_, runA_sound unsafeCellProtectedInteriorMutMir 25 _ _ _ rfl⟩
 
 theorem unsafeCellProtectedInteriorMut_minirust_direct :
-    retAfter unsafeCellProtectedInteriorMut [initUnsafeCellU32] 9 =
+    retAfter unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 =
       some (some { retAlloc with data := scalarBytes u32 77 }, [1]) := by
   decide +kernel
 
 theorem unsafeCellProtectedInteriorMut_tb_direct :
-    retAfterTB unsafeCellProtectedInteriorMut [initUnsafeCellU32] 9 = tbRetU32 77 := by
+    retAfterTB unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 = tbRetU32 77 := by
   decide +kernel
+
+theorem unsafeCellProtectedInteriorMut_anneal_noUB :
+    MirNoUBTree (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) :=
+  runA_noUB unsafeCellProtectedInteriorMutMir 25 _ _ _ rfl
+
+/-- `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` 3-way `.ok 77` + `MirNoUBTree` simulation
+agreement across Anneal, `Mach`, and `MachTB` (note: general direct-local Tree
+Borrows ancestor/child transitions remain tracked separately as future follow-up
+`DIV-MR-TB-DIRECT-LOCAL-ACCESS` rather than claiming full TB completeness). -/
+theorem unsafeCellProtectedInteriorMut_simulation :
+    (translateFn unsafeCellProtectedInteriorMutMir).isSome = true ∧
+    (∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) []
+      (.normal (.scalar ⟨77, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree unsafeCellProtectedInteriorMutMir
+      (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) ∧
+    retAfter unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 =
+      some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
+    retAfterTB unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 = tbRetU32 77 :=
+  ⟨unsafeCellProtectedInteriorMut_translate,
+   unsafeCellProtectedInteriorMut_anneal_ret,
+   unsafeCellProtectedInteriorMut_anneal_noUB,
+   unsafeCellProtectedInteriorMut_minirust_direct,
+   unsafeCellProtectedInteriorMut_tb_direct⟩
+
+/-- Companion witness confirming that an active strongly protected `.cell`
+reference (`r = &_1; Retag([fn entry], r)`) on `_1 : UnsafeCell<u32>` also
+survives explicit `StorageDead(_1)` prior to `Return` (`permPreventsDealloc .cell = false`
+in Anneal and `PermissionProt.prevents_deallocation .Cell = false` in `MachTB`),
+with 3-way `.ok 77` + `MirNoUBTree` agreement across Anneal, `Mach`, and `MachTB`. -/
+def unsafeCellProtectedStorageDeadMir : CapturedMir :=
+  { ptrBody "witness::unsafe_cell_protected_storage_dead"
+      [u32Decl, unsafeCellU32Decl, refSharedUnsafeCellU32Decl, ptrMutU32Decl]
+      [.storageLive 2, .storageLive 3,
+       .assign (local_ 2) (.ref .shared (local_ 1)),
+       .retag .fnEntry (local_ 2),
+       .assign (local_ 3) (.rawPtr .mut (placeField 1 [(0, u32Ty)])),
+       .assign (derefPlace 3) (.use (constU32 77)),
+       .assign (local_ 0) (.use (.copy (derefFieldPlace 2 0 u32Ty))),
+       .storageDead 1] with
+    fnAbi := fnAbiUnsafeCellU32Arg, layouts := unsafeCellU32Layouts }
+
+theorem unsafeCellProtectedStorageDead_simulation :
+    (translateFn unsafeCellProtectedStorageDeadMir).isSome = true ∧
+    (∃ mem, ReachesRet (mirTree unsafeCellProtectedStorageDeadMir
+      (initMachineState unsafeCellProtectedStorageDeadMir [initUnsafeCellU32])) []
+      (.normal (.scalar ⟨77, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree unsafeCellProtectedStorageDeadMir
+      (initMachineState unsafeCellProtectedStorageDeadMir [initUnsafeCellU32])) ∧
+    retAfter unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 =
+      some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
+    retAfterTB unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 = tbRetU32 77 :=
+  ⟨by decide +kernel,
+   ⟨_, runA_sound unsafeCellProtectedStorageDeadMir 25 _ _ _ rfl⟩,
+   runA_noUB unsafeCellProtectedStorageDeadMir 25 _ _ _ rfl,
+   by decide +kernel,
+   by decide +kernel⟩
 
 /-! ## 4. `IntPtrCast` (`PointerExposeProvenance` / `PointerWithExposedProvenance`) on `MachTB` -/
 

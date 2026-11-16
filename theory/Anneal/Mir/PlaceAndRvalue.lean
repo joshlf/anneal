@@ -1273,6 +1273,59 @@ theorem evalOperand_eq_nil_localDecls_of_noUnion
         dsimp only
         rw [hNoUnion]
 
+/-- **`callStack`-irrelevance of non-`Deref` operands**: Trusted's `evalOperand` consults
+the inline call stack `callStack` only to resolve the frame of a dereferenced stack
+borrow's target (`activeFrameSlot?` / `foreignFrameSlot?`), so a constant, a root place,
+or a non-`Deref` projected place evaluates identically under every `callStack` and under
+the default `callStack = []`. -/
+theorem evalOperand_eq_nil_callStack_of_nonDeref
+    (locals : List LocalSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (hNoDeref : OperandNonDeref op) :
+    evalOperand locals op borrows globals layouts callerLocals localDecls callStack =
+      evalOperand locals op borrows globals layouts callerLocals localDecls := by
+  cases op with
+  | constant c => rfl
+  | copy p =>
+    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+    · rfl
+    · cases hd with
+      | deref => exact False.elim (hNoDeref tl rfl)
+      | _ => rfl
+  | move p =>
+    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+    · rfl
+    · cases hd with
+      | deref => exact False.elim (hNoDeref tl rfl)
+      | _ => rfl
+
+/-- **`callStack`-irrelevance of non-`Deref` writes**: Trusted's `writePlaceValue`
+consults `callStack` only to resolve the frame of a dereferenced stack borrow's target,
+so a write to a root place or a non-`Deref` projected place is identical under every
+`callStack` and under the default `callStack = []`. -/
+theorem writePlaceValue_eq_nil_callStack_of_nonDeref
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (dst : Place)
+    (val : Value)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (callStack : List SavedCallerFrame)
+    (hNoDeref : ∀ r, dst.projection ≠ .deref :: r) :
+    writePlaceValue locals borrows dst val localDecls layouts callStack =
+      writePlaceValue locals borrows dst val localDecls layouts := by
+  rcases dst with ⟨loc, _ | ⟨hd, tl⟩⟩
+  · rfl
+  · cases hd with
+    | deref => exact False.elim (hNoDeref tl rfl)
+    | _ => rfl
+
 /-- With no local declarations, no operand touches a union. -/
 theorem operandTouchesUnion_nil_decls (layouts : LayoutTable) (op : Operand) :
     operandTouchesUnion .nil layouts op = false := by
@@ -4101,8 +4154,8 @@ theorem evalCharToIntByKind_some_implies_valid
 In `Runtime(PostCleanup)` MIR, `rustc` lowers `char as Int` to
 `Rvalue.cast .intToInt op targetTy` on an unsigned 4-byte `RigidTy.char` operand.
 Whenever `op` has type `.char` (`operandTy localDecls layouts op = .some { kind := .char, .. }`)
-and evaluates (under the same `localDecls` that `evalRvalue` threads into
-`evalOperand`) to a 4-byte scalar `.scalar ⟨bits, 4⟩` (without requiring
+and evaluates (under the same `localDecls` and active call stack `mem.callStack` that
+`evalRvalue` threads into `evalOperand`) to a 4-byte scalar `.scalar ⟨bits, 4⟩` (without requiring
 `isValidUnicodeScalar bits = true` as an external hypothesis):
 1. If `evalCharToIntByKind bits targetTy.kind = .some outSc`, then `bits` is a
    valid Unicode scalar value and
@@ -4119,7 +4172,7 @@ theorem evalCharToInt_trusted_evalRvalue_correspondence
     (bits charLayoutIdx : Nat)
     (hOpEval :
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+        locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
         .ok (.scalar ⟨bits, 4⟩) locals')
     (hOpTy :
       Trusted.Rustc.V2026_06_01.MirSemantics.operandTy localDecls layouts op =
@@ -6807,8 +6860,9 @@ For every per-slot refinement relation `R` relating `.uninit` to `.uninit` and
 every Anneal frame `slots` related to the Trusted frame `s.frame.locals`:
 1. if `evalStorageLive slots loc = .some slots'`, then
    `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt` on `.storageLive loc` steps
-   to `advanceStmt s locals'` (disabling the borrows minted from `loc`) for a
-   Trusted frame `locals'` that is again related to `slots'`;
+   to `advanceStmt s locals'` (disabling the borrows minted from `loc` of the
+   active frame, i.e. at depth `length s.memory.callStack`) for a Trusted frame
+   `locals'` that is again related to `slots'`;
 2. if `evalStorageLive` fails closed (out-of-bounds `loc`), Trusted faults with
    `.ub`.
 `anneal-mir` does not model function-entry protectors (`Retag(FnEntry)`), so the
@@ -6831,7 +6885,8 @@ theorem evalStorageLive_trusted_correspondence
             s ⟨.storageLive loc, span⟩ localDecls layouts =
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+              { s.memory with
+                borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) ∧
         SlotsRefine R slots' locals') ∧
     (evalStorageLive slots loc = .none →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -6878,8 +6933,9 @@ theorem evalStorageLive_trusted_correspondence
 For every per-slot refinement relation `R` relating `.dead` to `.dead` and every
 Anneal frame `slots` related to `s.frame.locals`, a successful
 `evalStorageDead slots loc = .some slots'` is matched by Trusted's `evalStmt` on
-`.storageDead loc` stepping to a related frame (absent active protectors), and an
-out-of-bounds `loc` faults on both sides. -/
+`.storageDead loc` stepping to a related frame (absent active protectors; the borrows
+minted from `loc` of the active frame, at depth `length s.memory.callStack`, are
+disabled), and an out-of-bounds `loc` faults on both sides. -/
 theorem evalStorageDead_trusted_correspondence
     (R : LocalSlotState → LocalSlot → Prop)
     (hDead : R .dead .dead)
@@ -6897,7 +6953,8 @@ theorem evalStorageDead_trusted_correspondence
             s ⟨.storageDead loc, span⟩ localDecls layouts =
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+              { s.memory with
+                borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) ∧
         SlotsRefine R slots' locals') ∧
     (evalStorageDead slots loc = .none →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -7013,6 +7070,7 @@ def evalAssume
       layouts
       s.memory.callerLocals
       localDecls
+      s.memory.callStack
   with
   | .ok (.scalar sc) locals' =>
     match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
@@ -7040,14 +7098,14 @@ theorem evalAssume_trusted_correspondence
         s ⟨.intrinsic (.assume op), span⟩ localDecls layouts ∧
     (Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         s.frame.locals op s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-          localDecls =
+          localDecls s.memory.callStack =
         .ok (.scalar ⟨1, 1⟩) locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.intrinsic (.assume op), span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals')) ∧
     (Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         s.frame.locals op s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-          localDecls =
+          localDecls s.memory.callStack =
         .ok (.scalar ⟨0, 1⟩) locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.intrinsic (.assume op), span⟩ localDecls layouts =
@@ -7063,17 +7121,26 @@ theorem evalAssume_trusted_correspondence
     rfl
 
 /-- **`SetDiscriminant` Bare & Projected Correspondence (`evalStmt_setDiscriminant_correspondence`)**:
+Writing the discriminant is a write to the destination local, so Trusted faults with `.ub`
+on a protected-write conflict and otherwise applies the foreign-write transition to the
+borrows of the written place, both scoped to the active frame's depth
+`length s.memory.callStack`. Accordingly each part assumes that the write is not a
+protected-write conflict (`hasProtectedWriteConflict … = false`, which holds trivially
+when no function-entry protector is active) and characterizes the borrow table after the
+step:
 1. On a bare local (`p.projection = .nil`) holding `.init (.aggregate oldVar fields)`,
    `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt` updates the local in place to
    `.init (.aggregate variantIdx fields)` (including 0-field unit enum variants where
-   `fields = .nil`).
+   `fields = .nil`) and invalidates the borrows of `loc`
+   (`invalidateConflictingBorrows`).
 2. On a projected non-`Deref` place (`p.projection = proj :: rest`, `proj ≠ .deref`)
    that is an admissible destination for arbitrary `localDecls` / `layouts`
    (`SetDiscriminantDestOk`: no union field is projected into, and the place is not
    statically typed `bool`/`char`), where reading `proj :: rest` from `rootVal`
    yields `.aggregate oldVar fields` and writing `.aggregate variantIdx fields`
    back along `proj :: rest` yields `rootVal'`, `evalStmt` updates `p.local_` to
-   `.init rootVal'` and steps. -/
+   `.init rootVal'`, invalidates the borrows overlapping the resolved written sub-place
+   (`invalidateConflictingBorrowsAtProj` at `resolveBorrowWriteLocalProj`), and steps. -/
 theorem evalStmt_setDiscriminant_correspondence
     (s : MachineState)
     (loc : Local)
@@ -7088,9 +7155,130 @@ theorem evalStmt_setDiscriminant_correspondence
     (layouts : LayoutTable) :
     (get? s.frame.locals loc = .some (.init (.aggregate oldVar fields)) →
       set? s.frame.locals loc (.init (.aggregate variantIdx fields)) = .some locals' →
+      hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors loc .none .nil 0 0
+        (length s.memory.callStack) = false →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s locals')) ∧
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with
+              borrows :=
+                invalidateConflictingBorrows s.memory.borrows loc .none
+                  (length s.memory.callStack) })) ∧
+    (proj ≠ .deref →
+      SetDiscriminantDestOk localDecls layouts ⟨loc, proj :: rest⟩ →
+      get? s.frame.locals loc = .some (.init rootVal) →
+      evalValueProjRead s.frame.locals rootVal (proj :: rest) =
+        .ok (.aggregate oldVar fields) →
+      evalValueProjWrite s.frame.locals rootVal (proj :: rest)
+        (.aggregate variantIdx fields) = .ok rootVal' →
+      set? s.frame.locals loc (.init rootVal') = .some locals' →
+      hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors loc .none
+        (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals loc (proj :: rest)) 0 0
+        (length s.memory.callStack) = false →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.setDiscriminant ⟨loc, proj :: rest⟩ variantIdx, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with
+              borrows :=
+                invalidateConflictingBorrowsAtProj s.memory.borrows loc .none
+                  (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals loc
+                    (proj :: rest))
+                  0 0 (length s.memory.callStack) })) := by
+  refine ⟨?_, ?_⟩
+  · intro hGet hSet hNoConflict
+    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+    rw [hGet]
+    dsimp only [evalSetDiscriminantLocal]
+    rw [hSet]
+    dsimp only
+    cases hProt : s.memory.activeProtectors with
+    | nil => rfl
+    | cons protHead protTail =>
+      rw [hProt] at hNoConflict
+      dsimp only
+      rw [hNoConflict]
+  · intro hNotDeref hDestOk hGet hRead hWrite hSet hNoConflict
+    have hTrustedRead :=
+      evalValueProjRead_refines_readProjectedValue
+        (proj :: rest) s.frame.locals rootVal (.aggregate oldVar fields) hRead
+    have hTrustedWrite :=
+      evalValueProjWrite_refines_writeProjectedValue
+        (proj :: rest) s.frame.locals rootVal (.aggregate variantIdx fields) rootVal' hWrite
+    have hNoDerefP : ∀ r, (⟨loc, proj :: rest⟩ : Place).projection ≠ .deref :: r :=
+      fun r h => hNotDeref (List.cons.inj h).1
+    have hOp :=
+      (evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals (.copy ⟨loc, proj :: rest⟩)
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+        s.memory.callStack hNoDerefP).trans
+        (evalOperand_copy_proj_of_noUnion s.frame.locals loc proj rest s.memory.borrows
+          s.memory.globals layouts s.memory.callerLocals localDecls rootVal
+          (.aggregate oldVar fields) hNotDeref hDestOk.1 hGet hTrustedRead)
+    have hPW :=
+      (writePlaceValue_eq_nil_callStack_of_nonDeref s.frame.locals s.memory.borrows
+        ⟨loc, proj :: rest⟩ (.aggregate variantIdx fields) localDecls layouts
+        s.memory.callStack hNoDerefP).trans
+        (writePlaceValue_proj_of_noUnion s.frame.locals s.memory.borrows loc proj rest
+          (.aggregate variantIdx fields) rootVal rootVal' locals' localDecls layouts hNotDeref
+          hDestOk.1 (validateValueForTy?_of_not_bool_char layouts _ _ hDestOk.2)
+          hGet hTrustedWrite hSet)
+    cases proj with
+    | deref => exact False.elim (hNotDeref rfl)
+    | _ =>
+      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+      rw [hOp]
+      dsimp only
+      rw [hNoConflict]
+      dsimp only
+      rw [hPW]
+
+/-- No borrow entry conflicts with a protected write when no function-entry protector is
+active (`isBorrowProtected_nil`). -/
+theorem hasProtectedWriteConflict_eq_false_of_nil_protectors
+    (borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    hasProtectedWriteConflict borrows .nil targetLocal writerTag writeProj writeRangeOff
+      writeRangeLen targetFrameDepth = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    unfold hasProtectedWriteConflict
+    simp only [isBorrowProtected_nil, Bool.false_and, Bool.and_false]
+    exact ih
+
+/-- **`SetDiscriminant` Correspondence Without Active Protectors
+(`evalStmt_setDiscriminant_noProt_correspondence`)**: `evalStmt_setDiscriminant_correspondence`
+with its protected-write-conflict side conditions discharged by
+`s.memory.activeProtectors = []` (`anneal-mir` does not model function-entry protectors
+(`Retag(FnEntry)`), so its frame-level refinements below assume no active protector). The
+step updates the active frame's locals and the borrow table only. -/
+theorem evalStmt_setDiscriminant_noProt_correspondence
+    (s : MachineState)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (variantIdx oldVar : VariantIdx)
+    (fields : List Value)
+    (rootVal rootVal' : Value)
+    (locals' : List LocalSlot)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    (get? s.frame.locals loc = .some (.init (.aggregate oldVar fields)) →
+      set? s.frame.locals loc (.init (.aggregate variantIdx fields)) = .some locals' →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with
+              borrows :=
+                invalidateConflictingBorrows s.memory.borrows loc .none
+                  (length s.memory.callStack) })) ∧
     (proj ≠ .deref →
       SetDiscriminantDestOk localDecls layouts ⟨loc, proj :: rest⟩ →
       get? s.frame.locals loc = .some (.init rootVal) →
@@ -7101,33 +7289,24 @@ theorem evalStmt_setDiscriminant_correspondence
       set? s.frame.locals loc (.init rootVal') = .some locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.setDiscriminant ⟨loc, proj :: rest⟩ variantIdx, span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s locals')) := by
-  refine ⟨?_, ?_⟩
-  · intro hGet hSet
-    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-    rw [hGet]
-    dsimp only
-    rw [hSet]
-  · intro hNotDeref hDestOk hGet hRead hWrite hSet
-    have hTrustedRead :=
-      evalValueProjRead_refines_readProjectedValue
-        (proj :: rest) s.frame.locals rootVal (.aggregate oldVar fields) hRead
-    have hTrustedWrite :=
-      evalValueProjWrite_refines_writeProjectedValue
-        (proj :: rest) s.frame.locals rootVal (.aggregate variantIdx fields) rootVal' hWrite
-    have hOp :=
-      evalOperand_copy_proj_of_noUnion s.frame.locals loc proj rest s.memory.borrows
-        s.memory.globals layouts s.memory.callerLocals localDecls rootVal
-        (.aggregate oldVar fields) hNotDeref hDestOk.1 hGet hTrustedRead
-    have hPW :=
-      writePlaceValue_proj_of_noUnion s.frame.locals s.memory.borrows loc proj rest
-        (.aggregate variantIdx fields) rootVal rootVal' locals' localDecls layouts hNotDeref
-        hDestOk.1 (validateValueForTy?_of_not_bool_char layouts _ _ hDestOk.2)
-        hGet hTrustedWrite hSet
-    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-    rw [hOp]
-    dsimp only
-    rw [hPW]
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with
+              borrows :=
+                invalidateConflictingBorrowsAtProj s.memory.borrows loc .none
+                  (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals loc
+                    (proj :: rest))
+                  0 0 (length s.memory.callStack) })) := by
+  have hBase :=
+    evalStmt_setDiscriminant_correspondence s loc proj rest variantIdx oldVar fields rootVal
+      rootVal' locals' span localDecls layouts
+  refine ⟨fun hGet hSet => hBase.1 hGet hSet ?_,
+    fun hNotDeref hDestOk hGet hRead hWrite hSet =>
+      hBase.2 hNotDeref hDestOk hGet hRead hWrite hSet ?_⟩
+  · rw [hNoProt]
+    exact hasProtectedWriteConflict_eq_false_of_nil_protectors _ _ _ _ _ _ _
+  · rw [hNoProt]
+    exact hasProtectedWriteConflict_eq_false_of_nil_protectors _ _ _ _ _ _ _
 
 /-- **`D13b` Uninitialized Array Write Rejection (`evalStmt_assign_uninit_array_proj_ub`)**:
 Writing to an element (`.index` or `.constantIndex`) or window (`.subslice`) of a
@@ -8080,7 +8259,9 @@ theorem evalAssumeState_trusted_correspondence
                 hRel hNoDeref hNoUnion hOp
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-            rw [hTOp]
+            rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
+              s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack
+              hNoDeref, hTOp]
             dsimp only
             rw [hTrue]
         | _ => nomatch hAssume
@@ -8095,7 +8276,9 @@ theorem evalAssumeState_trusted_correspondence
       rw [hFalseOp]
       rfl
     · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-      rw [hTOp]
+      rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
+        s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack
+        hNoDeref, hTOp]
       rfl
 
 /-- Projected discriminant update on an initialized `Value`
@@ -8297,7 +8480,13 @@ Under `SlotsRefine PromotedSlotRefines slots s.frame.locals`:
    back yields `rootVal'`, `evalSetDiscriminantState` returns `.ok (slots.set loc (.init rootVal'))`
    and, whenever the place is an admissible Trusted destination for the given
    `localDecls` / `layouts` (`SetDiscriminantDestOk`), Trusted's `evalStmt` steps to a
-   `PromotedSlotRefines`-related frame. -/
+   `PromotedSlotRefines`-related frame.
+Writing the discriminant is a protector-checked write to `loc` that also applies the
+foreign-write transition to `loc`'s borrows, so Trusted's step updates the borrow table
+(to some `borrows'`) along with the frame. `anneal-mir` does not model function-entry
+protectors (`Retag(FnEntry)`), so the theorem assumes no active protector
+(`s.memory.activeProtectors = []`), under which the write never faults; see
+`evalStmt_setDiscriminant_correspondence` for the protector-precise statement. -/
 theorem evalSetDiscriminantState_trusted_correspondence
     (s : MachineState)
     (slots : List LocalSlotState)
@@ -8310,14 +8499,15 @@ theorem evalSetDiscriminantState_trusted_correspondence
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals) :
+    (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals)
+    (hNoProt : s.memory.activeProtectors = .nil) :
     (get? slots loc = .some (.init (.aggregate oldVar fields)) →
       evalSetDiscriminantState slots ⟨loc, .nil⟩ variantIdx =
         .ok (slots.set loc (.init (.aggregate variantIdx fields))) ∧
-      ∃ locals',
+      ∃ locals' borrows',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
-          MirStepNode.step (advanceStmt s locals') ∧
+          MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
         SlotsRefine PromotedSlotRefines
           (slots.set loc (.init (.aggregate variantIdx fields))) locals') ∧
     (proj ≠ .deref →
@@ -8329,10 +8519,10 @@ theorem evalSetDiscriminantState_trusted_correspondence
         (.aggregate variantIdx fields) = .ok rootVal' →
       evalSetDiscriminantState slots ⟨loc, proj :: rest⟩ variantIdx =
         .ok (slots.set loc (.init rootVal')) ∧
-      ∃ locals',
+      ∃ locals' borrows',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, proj :: rest⟩ variantIdx, span⟩ localDecls layouts =
-          MirStepNode.step (advanceStmt s locals') ∧
+          MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
         SlotsRefine PromotedSlotRefines
           (slots.set loc (.init rootVal')) locals') := by
   have hLocEq : slotsToTrustedLocals slots = s.frame.locals :=
@@ -8357,18 +8547,18 @@ theorem evalSetDiscriminantState_trusted_correspondence
             set? s.frame.locals loc (.init (.aggregate variantIdx fields)) =
               .some (s.frame.locals.set loc (.init (.aggregate variantIdx fields))) :=
           set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-        refine ⟨?_, s.frame.locals.set loc (.init (.aggregate variantIdx fields)), ?_,
+        refine ⟨?_, s.frame.locals.set loc (.init (.aggregate variantIdx fields)), _,
+          (evalStmt_setDiscriminant_noProt_correspondence
+            s loc proj rest variantIdx oldVar fields rootVal rootVal'
+            (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
+            span localDecls layouts hNoProt).1 hGetT hSetT,
           SlotsRefine.set (R := PromotedSlotRefines)
             (a := .init (.aggregate variantIdx fields))
             (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
-        · unfold evalSetDiscriminantState
-          dsimp only
-          rw [hGetS]
-          rfl
-        · exact (evalStmt_setDiscriminant_correspondence
-            s loc proj rest variantIdx oldVar fields rootVal rootVal'
-            (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
-            span localDecls layouts).1 hGetT hSetT
+        unfold evalSetDiscriminantState
+        dsimp only
+        rw [hGetS]
+        rfl
   · intro hNotDeref hDestOk hGetS hRead hWrite
     rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS', hGetT, hAT⟩
     · rw [hNoneS] at hGetS; nomatch hGetS
@@ -8388,23 +8578,23 @@ theorem evalSetDiscriminantState_trusted_correspondence
             set? s.frame.locals loc (.init rootVal') =
               .some (s.frame.locals.set loc (.init rootVal')) :=
           set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-        refine ⟨?_, s.frame.locals.set loc (.init rootVal'), ?_,
-          SlotsRefine.set (R := PromotedSlotRefines)
-            (a := .init rootVal') (t := .init rootVal') rfl loc hRel⟩
-        · unfold evalSetDiscriminantState
-          dsimp only
-          rw [evalValueProjRead_ok_implies_no_deref s.frame.locals (proj :: rest) _ _ hRead]
-          dsimp only
-          rw [hLocEq, hGetS]
-          dsimp only [setDiscriminantInFieldSlot, setDiscriminantProjectedValue]
-          rw [hRead]
-          dsimp only
-          rw [hWrite]
-          rfl
-        · exact (evalStmt_setDiscriminant_correspondence
+        refine ⟨?_, s.frame.locals.set loc (.init rootVal'), _,
+          (evalStmt_setDiscriminant_noProt_correspondence
             s loc proj rest variantIdx oldVar fields rootVal rootVal'
             (s.frame.locals.set loc (.init rootVal'))
-            span localDecls layouts).2 hNotDeref hDestOk hGetT hRead hWrite hSetT
+            span localDecls layouts hNoProt).2 hNotDeref hDestOk hGetT hRead hWrite hSetT,
+          SlotsRefine.set (R := PromotedSlotRefines)
+            (a := .init rootVal') (t := .init rootVal') rfl loc hRel⟩
+        unfold evalSetDiscriminantState
+        dsimp only
+        rw [evalValueProjRead_ok_implies_no_deref s.frame.locals (proj :: rest) _ _ hRead]
+        dsimp only
+        rw [hLocEq, hGetS]
+        dsimp only [setDiscriminantInFieldSlot, setDiscriminantProjectedValue]
+        rw [hRead]
+        dsimp only
+        rw [hWrite]
+        rfl
 
 /-- Stateful place writer over `slots : List LocalSlotState`
 (`StatementEvalState::write_place` in `crates/anneal-mir/src/lower/rvalue.rs:4850-4949`).
@@ -9969,7 +10159,9 @@ theorem evalAssumeState_flat_refines
                 hRel hNoDeref hNoUnion hOp
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-            rw [hTOp]
+            rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
+              s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack
+              hNoDeref, hTOp]
             dsimp only
             rw [hTrue]
         | _ => nomatch hAssume
@@ -9984,7 +10176,9 @@ theorem evalAssumeState_flat_refines
       rw [hFalseOp]
       rfl
     · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-      rw [hTOp]
+      rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
+        s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack
+        hNoDeref, hTOp]
       rfl
 
 /-! ### Episode 2 Pass A2 Extensions: Projected-Deref `PlaceMention`, General `SetDiscriminant` Refinement, and Arbitrary-Depth `NestedShellRefines` -/
@@ -10649,14 +10843,18 @@ to `FlatSlotStateRefines` by inverting `evalSetDiscriminantState` whenever the
 target value is not `.unit` (complementing `evalSetDiscriminantState_unit_vs_trusted_ub`):
 1. On a bare local `⟨loc, .nil⟩` holding `.init existingVal` (`existingVal ≠ .unit`),
    `evalSetDiscriminantState slots ⟨loc, .nil⟩ variantIdx = .ok slots'` implies
-   Trusted's `evalStmt` steps to `advanceStmt s locals'` with
-   `SlotsRefine FlatSlotStateRefines slots' locals'`.
+   Trusted's `evalStmt` steps to `advanceStmt s locals' { s.memory with borrows := borrows' }`
+   with `SlotsRefine FlatSlotStateRefines slots' locals'`.
 2. On a projected place `⟨loc, p :: rest⟩` (`p ≠ .deref`) that is an admissible Trusted
    destination (`SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩`), where
    `get? slots loc = .some (.init rootVal)` and the target value is not `.unit`,
    `evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots'`
-   implies Trusted's `evalStmt` steps to `advanceStmt s locals'` with
-   `SlotsRefine FlatSlotStateRefines slots' locals'`. -/
+   implies Trusted's `evalStmt` steps to `advanceStmt s locals' { s.memory with borrows := borrows' }`
+   with `SlotsRefine FlatSlotStateRefines slots' locals'`.
+The discriminant write updates Trusted's borrow table (the foreign-write transition on
+the written place); as in `evalSetDiscriminantState_trusted_correspondence`, the theorem
+assumes no active function-entry protector (`s.memory.activeProtectors = []`), which
+`anneal-mir` does not model. -/
 theorem evalSetDiscriminantState_general_flat_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -10668,24 +10866,25 @@ theorem evalSetDiscriminantState_general_flat_refines
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (hRel : SlotsRefine FlatSlotStateRefines slots s.frame.locals) :
+    (hRel : SlotsRefine FlatSlotStateRefines slots s.frame.locals)
+    (hNoProt : s.memory.activeProtectors = .nil) :
     (get? slots loc = .some (.init existingVal) →
       existingVal ≠ .unit →
       evalSetDiscriminantState slots ⟨loc, .nil⟩ variantIdx = .ok slots' →
-      ∃ locals',
+      ∃ locals' borrows',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
-          MirStepNode.step (advanceStmt s locals') ∧
+          MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
         SlotsRefine FlatSlotStateRefines slots' locals') ∧
     (p ≠ .deref →
       SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩ →
       get? slots loc = .some (.init rootVal) →
       evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit →
       evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots' →
-      ∃ locals',
+      ∃ locals' borrows',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, p :: rest⟩ variantIdx, span⟩ localDecls layouts =
-          MirStepNode.step (advanceStmt s locals') ∧
+          MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
         SlotsRefine FlatSlotStateRefines slots' locals') := by
   have hSame := sameScalarLocals_of_flatSlotStateRefines hRel
   refine ⟨?_, ?_⟩
@@ -10718,14 +10917,14 @@ theorem evalSetDiscriminantState_general_flat_refines
               set? s.frame.locals loc (.init (.aggregate variantIdx fields)) =
                 .some (s.frame.locals.set loc (.init (.aggregate variantIdx fields))) :=
             set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-          refine ⟨s.frame.locals.set loc (.init (.aggregate variantIdx fields)), ?_,
+          exact ⟨s.frame.locals.set loc (.init (.aggregate variantIdx fields)), _,
+            (evalStmt_setDiscriminant_noProt_correspondence
+              s loc p rest variantIdx oldVar fields rootVal rootVal
+              (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
+              span localDecls layouts hNoProt).1 hGetT hSetT,
             SlotsRefine.set (R := FlatSlotStateRefines)
               (a := .init (.aggregate variantIdx fields))
               (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
-          exact (evalStmt_setDiscriminant_correspondence
-            s loc p rest variantIdx oldVar fields rootVal rootVal
-            (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
-            span localDecls layouts).1 hGetT hSetT
     | _ => nomatch hOk
   · intro hNotDeref hDestOk hGetS hNotUnit hOk
     unfold evalSetDiscriminantState at hOk
@@ -10777,14 +10976,14 @@ theorem evalSetDiscriminantState_general_flat_refines
                   set? s.frame.locals loc (.init rootVal') =
                     .some (s.frame.locals.set loc (.init rootVal')) :=
                 set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-              refine ⟨s.frame.locals.set loc (.init rootVal'), ?_,
+              exact ⟨s.frame.locals.set loc (.init rootVal'), _,
+                (evalStmt_setDiscriminant_noProt_correspondence
+                  s loc p rest variantIdx oldVar fields rootVal rootVal'
+                  (s.frame.locals.set loc (.init rootVal'))
+                  span localDecls layouts hNoProt).2 hNotDeref hDestOk hGetT hRead hWrite hSetT,
                 SlotsRefine.set (R := FlatSlotStateRefines)
                   (a := .init rootVal')
                   (t := .init rootVal') rfl loc hRel⟩
-              exact (evalStmt_setDiscriminant_correspondence
-                s loc p rest variantIdx oldVar fields rootVal rootVal'
-                (s.frame.locals.set loc (.init rootVal'))
-                span localDecls layouts).2 hNotDeref hDestOk hGetT hRead hWrite hSetT
       | _ => nomatch hOk
 
 /-- Trusted's `setOrExtendFields` coincides with `List.set` on in-bounds indices. -/
@@ -10855,8 +11054,9 @@ target inside `w` is not `()` (see `evalSetDiscriminantState_unit_vs_trusted_ub`
 Whenever Anneal's `evalSetDiscriminantState` succeeds and the destination is
 admissible for Trusted's `localDecls` / `layouts` (`SetDiscriminantDestOk`; Anneal's
 flat tuple shell says nothing about Trusted's declared type of `_l`), Trusted's
-`evalStmt` on the `.unit`-padded aggregate steps, and the resulting frames are again
-related by `SlotsRefine FlatSlotStateRefines`. -/
+`evalStmt` on the `.unit`-padded aggregate steps (updating the borrow table to some
+`borrows'`; no active function-entry protector is assumed, as `anneal-mir` does not model
+them), and the resulting frames are again related by `SlotsRefine FlatSlotStateRefines`. -/
 theorem evalSetDiscriminantState_partialShell_field_flat_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -10876,12 +11076,13 @@ theorem evalSetDiscriminantState_partialShell_field_flat_refines
     (hNotUnit : evalValueProjRead s.frame.locals w rest ≠ .ok .unit)
     (hDestOk : SetDiscriminantDestOk localDecls layouts ⟨loc, .field i fieldTy :: rest⟩)
     (hOk :
-      evalSetDiscriminantState slots ⟨loc, .field i fieldTy :: rest⟩ variantIdx = .ok slots') :
-    ∃ locals',
+      evalSetDiscriminantState slots ⟨loc, .field i fieldTy :: rest⟩ variantIdx = .ok slots')
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    ∃ locals' borrows',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, .field i fieldTy :: rest⟩ variantIdx, span⟩
           localDecls layouts =
-        MirStepNode.step (advanceStmt s locals') ∧
+        MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
       SlotsRefine FlatSlotStateRefines slots' locals' := by
   have hSame := sameScalarLocals_of_flatSlotStateRefines hRel
   -- The Trusted counterpart of the partial shell is a padded aggregate.
@@ -10973,10 +11174,11 @@ theorem evalSetDiscriminantState_partialShell_field_flat_refines
       set? s.frame.locals loc (.init (.aggregate 0 (tfs.set i w'))) =
         .some (s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w')))) :=
     set?_eq_some_iff.mpr ⟨hLtLoc, rfl⟩
-  refine ⟨s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w'))),
-    (evalStmt_setDiscriminant_correspondence s loc (.field i fieldTy) rest variantIdx oldVar
-      fields (.aggregate 0 tfs) (.aggregate 0 (tfs.set i w'))
-      (s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w')))) span localDecls layouts).2
+  refine ⟨s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w'))), _,
+    (evalStmt_setDiscriminant_noProt_correspondence s loc (.field i fieldTy) rest variantIdx
+      oldVar fields (.aggregate 0 tfs) (.aggregate 0 (tfs.set i w'))
+      (s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w')))) span localDecls layouts
+      hNoProt).2
       (by intro h; nomatch h) hDestOk hGetT hTRead hTWrite hSetLoc, ?_⟩
   -- The frames stay related.
   have hRef' := flatShellRefines_write sFields tfs i w' hShellRef hLtS
@@ -12595,7 +12797,9 @@ theorem evalStmt_assign_bare_nested_refines
       (locals₁.set loc (.init val)) :=
     SlotsRefine.set (a := .init val) (t := .init val) rfl loc hRel
   refine ⟨locals₁.set loc (.init val),
-    { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows loc .none }, ?_, hRel'⟩
+    { mem₁ with
+      borrows := invalidateConflictingBorrows mem₁.borrows loc .none (length mem₁.callStack) },
+    ?_, hRel'⟩
   cases t with
   | dead =>
     cases a with
@@ -13303,7 +13507,8 @@ theorem evalStorageLive_nested_refines
             s ⟨.storageLive loc, span⟩ localDecls layouts =
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+              { s.memory with
+                borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) ∧
         SlotsRefine NestedSlotStateRefines slots' locals') ∧
     (evalStorageLive slots loc = .none →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -13329,7 +13534,8 @@ theorem evalStorageDead_nested_refines
             s ⟨.storageDead loc, span⟩ localDecls layouts =
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+              { s.memory with
+                borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) ∧
         SlotsRefine NestedSlotStateRefines slots' locals') ∧
     (evalStorageDead slots loc = .none →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -13396,7 +13602,9 @@ theorem evalAssumeState_nested_refines
                 hRel hNoDeref hNoUnion hOp
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-            rw [hTOp]
+            rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
+              s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack
+              hNoDeref, hTOp]
             dsimp only
             rw [hTrue]
         | _ => nomatch hAssume
@@ -13411,14 +13619,19 @@ theorem evalAssumeState_nested_refines
       rw [hFalseOp]
       rfl
     · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
-      rw [hTOp]
+      rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
+        s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack
+        hNoDeref, hTOp]
       rfl
 
 /-- **General Nested-Frame `SetDiscriminant` Refinement on Initialized Roots (`evalSetDiscriminantState_general_nested_refines`)**:
 Lifts `evalSetDiscriminantState_general_flat_refines` from `FlatSlotStateRefines`
 to `SlotsRefine NestedSlotStateRefines` for both bare and projected non-`()`
 initialized targets (projected targets being admissible Trusted destinations,
-`SetDiscriminantDestOk`) on frames that may contain nested tuple partial shells. -/
+`SetDiscriminantDestOk`) on frames that may contain nested tuple partial shells.
+Trusted's step also updates the borrow table (to some `borrows'`), and the theorem
+assumes no active function-entry protector (`s.memory.activeProtectors = []`), which
+`anneal-mir` does not model. -/
 theorem evalSetDiscriminantState_general_nested_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -13430,24 +13643,25 @@ theorem evalSetDiscriminantState_general_nested_refines
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (hRel : SlotsRefine NestedSlotStateRefines slots s.frame.locals) :
+    (hRel : SlotsRefine NestedSlotStateRefines slots s.frame.locals)
+    (hNoProt : s.memory.activeProtectors = .nil) :
     (get? slots loc = .some (.init existingVal) →
       existingVal ≠ .unit →
       evalSetDiscriminantState slots ⟨loc, .nil⟩ variantIdx = .ok slots' →
-      ∃ locals',
+      ∃ locals' borrows',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
-          MirStepNode.step (advanceStmt s locals') ∧
+          MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
         SlotsRefine NestedSlotStateRefines slots' locals') ∧
     (p ≠ .deref →
       SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩ →
       get? slots loc = .some (.init rootVal) →
       evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit →
       evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots' →
-      ∃ locals',
+      ∃ locals' borrows',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, p :: rest⟩ variantIdx, span⟩ localDecls layouts =
-          MirStepNode.step (advanceStmt s locals') ∧
+          MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
         SlotsRefine NestedSlotStateRefines slots' locals') := by
   have hSame := sameScalarLocals_of_nestedSlotStateRefines hRel
   refine ⟨?_, ?_⟩
@@ -13480,14 +13694,14 @@ theorem evalSetDiscriminantState_general_nested_refines
               set? s.frame.locals loc (.init (.aggregate variantIdx fields)) =
                 .some (s.frame.locals.set loc (.init (.aggregate variantIdx fields))) :=
             set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-          refine ⟨s.frame.locals.set loc (.init (.aggregate variantIdx fields)), ?_,
+          exact ⟨s.frame.locals.set loc (.init (.aggregate variantIdx fields)), _,
+            (evalStmt_setDiscriminant_noProt_correspondence
+              s loc p rest variantIdx oldVar fields rootVal rootVal
+              (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
+              span localDecls layouts hNoProt).1 hGetT hSetT,
             SlotsRefine.set (R := NestedSlotStateRefines)
               (a := .init (.aggregate variantIdx fields))
               (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
-          exact (evalStmt_setDiscriminant_correspondence
-            s loc p rest variantIdx oldVar fields rootVal rootVal
-            (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
-            span localDecls layouts).1 hGetT hSetT
     | _ => nomatch hOk
   · intro hNotDeref hDestOk hGetS hNotUnit hOk
     unfold evalSetDiscriminantState at hOk
@@ -13539,14 +13753,14 @@ theorem evalSetDiscriminantState_general_nested_refines
                   set? s.frame.locals loc (.init rootVal') =
                     .some (s.frame.locals.set loc (.init rootVal')) :=
                 set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-              refine ⟨s.frame.locals.set loc (.init rootVal'), ?_,
+              exact ⟨s.frame.locals.set loc (.init rootVal'), _,
+                (evalStmt_setDiscriminant_noProt_correspondence
+                  s loc p rest variantIdx oldVar fields rootVal rootVal'
+                  (s.frame.locals.set loc (.init rootVal'))
+                  span localDecls layouts hNoProt).2 hNotDeref hDestOk hGetT hRead hWrite hSetT,
                 SlotsRefine.set (R := NestedSlotStateRefines)
                   (a := .init rootVal')
                   (t := .init rootVal') rfl loc hRel⟩
-              exact (evalStmt_setDiscriminant_correspondence
-                s loc p rest variantIdx oldVar fields rootVal rootVal'
-                (s.frame.locals.set loc (.init rootVal'))
-                span localDecls layouts).2 hNotDeref hDestOk hGetT hRead hWrite hSetT
       | _ => nomatch hOk
 
 /-- Convert a list of `(FieldIdx, Ty)` steps into `.field` projection elements. -/
@@ -13743,7 +13957,9 @@ reaching an initialized sub-slot `.init w` with trailing projection `tail`
 (`evalValueProjRead s.frame.locals w tail ≠ .ok .unit`) and an admissible Trusted
 destination (`SetDiscriminantDestOk`), every successful
 `evalSetDiscriminantState` step is matched by Trusted's `evalStmt` stepping to a
-`SlotsRefine NestedSlotStateRefines`-related frame. -/
+`SlotsRefine NestedSlotStateRefines`-related frame (and an updated borrow table
+`borrows'`; no active function-entry protector is assumed, as `anneal-mir` does not model
+them). -/
 theorem evalSetDiscriminantState_partialShell_any_depth_nested_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -13767,12 +13983,13 @@ theorem evalSetDiscriminantState_partialShell_any_depth_nested_refines
         ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩)
     (hOk :
       evalSetDiscriminantState slots
-        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots') :
-    ∃ locals',
+        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots')
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    ∃ locals' borrows',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx,
             span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s locals') ∧
+        MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
       SlotsRefine NestedSlotStateRefines slots' locals' := by
   have hSame := sameScalarLocals_of_nestedSlotStateRefines hRel
   rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
@@ -13818,11 +14035,11 @@ theorem evalSetDiscriminantState_partialShell_any_depth_nested_refines
         have hSetLoc :
             set? s.frame.locals loc (.init tv') = .some (s.frame.locals.set loc (.init tv')) :=
           set?_eq_some_iff.mpr ⟨hLtLoc, rfl⟩
-        refine ⟨s.frame.locals.set loc (.init tv'),
-          (evalStmt_setDiscriminant_correspondence
+        exact ⟨s.frame.locals.set loc (.init tv'), _,
+          (evalStmt_setDiscriminant_noProt_correspondence
             s loc (.field i₀ ty₀) (fieldStepsToProjs restSteps ++ tail)
             variantIdx oldVar fields (.aggregate 0 tfs) tv'
-            (s.frame.locals.set loc (.init tv')) span localDecls layouts).2
+            (s.frame.locals.set loc (.init tv')) span localDecls layouts hNoProt).2
             (by intro h; nomatch h) hDestOk hGetT hTRead hTWrite hSetLoc,
           SlotsRefine.set
             (fieldSlotToLocalSlotState_of_nestedFieldRefines nextSlot tv' hNotUninit hNextRef)
@@ -14904,7 +15121,7 @@ theorem evalStmt_assign_uninit_nonUnion_adt_field_ok
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
                  | .some rp => rp
-                 | .none => .field fieldIdx fieldTy :: .nil) }) :=
+                 | .none => .field fieldIdx fieldTy :: .nil) 0 0 (length mem₁.callStack) }) :=
   Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_uninit_union_field_ok
     s dstLoc fieldIdx fieldTy rv span localDecls layouts defPath args layoutIdx val
     locals₁ mem₁ locals₂ hRv hUninit hTy hSet hProt
@@ -14967,7 +15184,7 @@ theorem evalStmt_assign_uninit_nonUnion_adt_nested_field_ok
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                 (match resolveBorrowProjectionElems locals₁ projs with
                  | .some rp => rp
-                 | .none => projs) }) := by
+                 | .none => projs) 0 0 (length mem₁.callStack) }) := by
   have hRestCert :
       projFieldBasesNonUnion layouts
         (certFieldTy layouts { kind := .adt defPath args, layoutIdx := layoutIdx }
@@ -15049,14 +15266,15 @@ theorem evalSetDiscriminantState_general_certified_nested_refines
       .some { kind := .adt defPath args, layoutIdx := lIdx })
     (hGetS : get? slots loc = .some (.init rootVal))
     (hNotUnit : evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit)
-    (hOk : evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots') :
-    ∃ locals',
+    (hOk : evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots')
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    ∃ locals' borrows',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.setDiscriminant ⟨loc, p :: rest⟩ variantIdx, span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s locals') ∧
+        MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
       SlotsRefine NestedSlotStateRefines slots' locals' :=
   (evalSetDiscriminantState_general_nested_refines s slots slots' loc p rest variantIdx
-    rootVal rootVal span localDecls layouts hRel).2 hNotDeref
+    rootVal rootVal span localDecls layouts hRel hNoProt).2 hNotDeref
     (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc (p :: rest)
       declTy defPath args lIdx hRootTy hCert hLeafTy)
     hGetS hNotUnit hOk
@@ -15146,19 +15364,20 @@ theorem evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines
         .some { kind := .adt defPath args, layoutIdx := lIdx })
     (hOk :
       evalSetDiscriminantState slots
-        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots') :
-    ∃ locals',
+        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots')
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    ∃ locals' borrows',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
           s ⟨.setDiscriminant ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx,
             span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s locals') ∧
+        MirStepNode.step (advanceStmt s locals' { s.memory with borrows := borrows' }) ∧
       SlotsRefine NestedSlotStateRefines slots' locals' :=
   evalSetDiscriminantState_partialShell_any_depth_nested_refines s slots slots' loc shell i₀ ty₀
     restSteps tail variantIdx w span localDecls layouts hRel hSlot hChain hNotUnit
     (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc
       (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) declTy defPath args lIdx
       hRootTy hCert hLeafTy)
-    hOk
+    hOk hNoProt
 
 /-- **Certified `readPlaceStateCheckedIndex` ↔ `readProjectedForLocal` / `evalPlaceRead` Refinement on Nested Frames (`readPlaceStateCheckedIndex_evalPlaceRead_certified_nested_refines`)**:
 One-step wrapper around `readPlaceStateCheckedIndex_evalPlaceRead_nested_refines` that discharges
@@ -15264,7 +15483,7 @@ theorem evalAggregateRawPtr_ptr_scalar_ok
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil) locals')
     (hDyn : wideAggregatePointeeIsDyn? pointeeTy = .some false)
     (hMetaSz : metaSc.sizeBytes = layoutPointerBytes layouts) :
@@ -15285,7 +15504,7 @@ theorem evalAggregateRawPtr_scalar_scalar_ok
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (addrSc metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals')
     (hDyn : wideAggregatePointeeIsDyn? pointeeTy = .some false)
     (hAddrSz : addrSc.sizeBytes = layoutPointerBytes layouts)
@@ -15307,7 +15526,7 @@ theorem evalAggregateRawPtr_ptr_unit_ok
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts) :: .unit :: .nil) locals')
     (hUnsized : isUnsizedRawPtrPointee pointeeTy = false) :
     evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts =
@@ -15320,7 +15539,7 @@ theorem evalAggregateRawPtr_ptr_aggregate_nil_ok
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts) :: .aggregate 0 .nil :: .nil) locals')
     (hUnsized : isUnsizedRawPtrPointee pointeeTy = false) :
     evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts =
@@ -15333,7 +15552,7 @@ theorem evalAggregateRawPtr_ptr_unit_unsized_ub
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts) :: .unit :: .nil) locals')
     (hUnsized : isUnsizedRawPtrPointee pointeeTy = true) :
     evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts = .ub := by
@@ -15345,7 +15564,7 @@ theorem evalAggregateRawPtr_ptr_scalar_sized_ub
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil) locals')
     (hDyn : wideAggregatePointeeIsDyn? pointeeTy = .none) :
     evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts = .ub := by
@@ -15359,7 +15578,7 @@ theorem evalRvalue_aggregate_rawPtr_ptr_scalar_ok
     (locals locals' : List LocalSlot) (mutability : Mutability) (pointeeTy : Ty) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil) locals')
     (hDyn : wideAggregatePointeeIsDyn? pointeeTy = .some false)
     (hMetaSz : metaSc.sizeBytes = layoutPointerBytes layouts) :
@@ -15376,7 +15595,7 @@ theorem evalUnaryPtrMetadata_ptr_scalar_ok
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (metaSc : ScalarInt)
-    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil)) locals')
     (hMetaSz : metaSc.sizeBytes = layoutPointerBytes layouts) :
     evalUnaryPtrMetadata locals op mem localDecls layouts =
@@ -15389,7 +15608,7 @@ theorem evalUnaryPtrMetadata_scalar_scalar_ok
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (addrSc metaSc : ScalarInt)
-    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals')
     (hNonWide : isNonWidePtrAggregateTy (operandTy localDecls layouts op) = false)
     (hAddrSz : addrSc.sizeBytes = layoutPointerBytes layouts)
@@ -15404,7 +15623,7 @@ theorem evalUnaryPtrMetadata_ptr_ok
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr)
-    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals') :
     evalUnaryPtrMetadata locals op mem localDecls layouts = .ok .unit locals' mem := by
   unfold evalUnaryPtrMetadata
@@ -15415,7 +15634,7 @@ theorem evalUnaryPtrMetadata_scalar_ok
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (sc : ScalarInt)
-    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals')
     (hThin : isThinPtrMetadataOperandTy (operandTy localDecls layouts op) = true)
     (hSz : sc.sizeBytes = layoutPointerBytes layouts) :
@@ -15428,7 +15647,7 @@ theorem evalUnaryPtrMetadata_ptr_scalar_width_mismatch_ub
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (metaSc : ScalarInt)
-    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil)) locals')
     (hMetaSz : Nat.beq metaSc.sizeBytes (layoutPointerBytes layouts) = false) :
     evalUnaryPtrMetadata locals op mem localDecls layouts = .ub := by
@@ -15440,7 +15659,7 @@ theorem evalRvalue_unaryOp_ptrMetadata_ptr_scalar_ok
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (metaSc : ScalarInt)
-    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar metaSc :: .nil)) locals')
     (hMetaSz : metaSc.sizeBytes = layoutPointerBytes layouts) :
     evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
@@ -15459,16 +15678,19 @@ theorem evalPlaceLen_slice_borrow_ok
     (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
-    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar lenSc :: .nil)) locals')
     (hLenSz : lenSc.sizeBytes = layoutPointerBytes layouts)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hTarget : match get? locals' entry.targetLocal with
+    (hTarget : match activeFrameSlot? locals' mem.callStack entry.targetFrameDepth
+                   entry.targetLocal with
                | .some (.init v) => v = rootVal
-               | .none => match get? mem.callerLocals entry.targetLocal with
-                          | .some (.init v) => v = rootVal
-                          | _ => False
+               | .none =>
+                 match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+                     entry.targetLocal with
+                 | .some (.init v) => v = rootVal
+                 | _ => False
                | _ => False)
     (hReadSlice : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .some (baseProj, baseIdx, elems))
@@ -15481,8 +15703,10 @@ theorem evalPlaceLen_slice_borrow_ok
   split
   · rfl
   · rename_i heq
-    cases hLoc : get? locals' entry.targetLocal <;> simp only [hLoc] at heq
-    · cases hCall : get? mem.callerLocals entry.targetLocal <;> simp only [hCall] at heq
+    cases hLoc : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal <;>
+      simp only [hLoc] at heq
+    · cases hCall : foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+          entry.targetLocal <;> simp only [hCall] at heq
       · revert hTarget; simp only [hLoc, hCall]; intro hTarget; exact False.elim hTarget
       · rename_i ls; cases ls with
         | dead => revert hTarget; simp only [hLoc, hCall]; intro hTarget; exact False.elim hTarget
@@ -15514,16 +15738,19 @@ theorem evalPlaceLen_slice_borrow_ub
     (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
-    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar lenSc :: .nil)) locals')
     (hLenSz : lenSc.sizeBytes = layoutPointerBytes layouts)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hTarget : match get? locals' entry.targetLocal with
+    (hTarget : match activeFrameSlot? locals' mem.callStack entry.targetFrameDepth
+                   entry.targetLocal with
                | .some (.init v) => v = rootVal
-               | .none => match get? mem.callerLocals entry.targetLocal with
-                          | .some (.init v) => v = rootVal
-                          | _ => False
+               | .none =>
+                 match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+                     entry.targetLocal with
+                 | .some (.init v) => v = rootVal
+                 | _ => False
                | _ => False)
     (hReadSlice : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .some (baseProj, baseIdx, elems))
@@ -15534,8 +15761,10 @@ theorem evalPlaceLen_slice_borrow_ub
   simp only [hTy, hSplit, hRead, hLenSz, hBorrow, Nat.beq_refl, Bool.true_and, Bool.and_true, Bool.and_self]
   split
   · rename_i heq
-    cases hLoc : get? locals' entry.targetLocal <;> simp only [hLoc] at heq
-    · cases hCall : get? mem.callerLocals entry.targetLocal <;> simp only [hCall] at heq
+    cases hLoc : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal <;>
+      simp only [hLoc] at heq
+    · cases hCall : foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+          entry.targetLocal <;> simp only [hCall] at heq
       · revert hTarget; simp only [hLoc, hCall]; intro hTarget; exact False.elim hTarget
       · rename_i ls; cases ls with
         | dead => revert hTarget; simp only [hLoc, hCall]; intro hTarget; exact False.elim hTarget
@@ -15567,7 +15796,7 @@ theorem evalPlaceLen_slice_alloc_ok
     (elem : RigidTy) (lIdx : LayoutIdx) (alloc : CapturedAllocation) (sz : Nat)
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
-    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar lenSc :: .nil)) locals')
     (hLenSz : lenSc.sizeBytes = layoutPointerBytes layouts)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
@@ -15601,7 +15830,7 @@ theorem evalPlaceLen_null_len_nonzero_ub
     (elem : RigidTy) (lIdx : LayoutIdx)
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
-    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar lenSc :: .nil)) locals')
     (hLenSz : lenSc.sizeBytes = layoutPointerBytes layouts)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
@@ -15647,10 +15876,10 @@ theorem evalWidePtrAggregateRelBinOp_eq_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .eq lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .eq lhsAddr rhsAddr locals₂ mem false := by
@@ -15671,10 +15900,10 @@ theorem evalWidePtrAggregateRelBinOp_eq_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .eq lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .eq lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -15695,10 +15924,10 @@ theorem evalWidePtrAggregateRelBinOp_ne_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .ne lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .ne lhsAddr rhsAddr locals₂ mem false := by
@@ -15719,10 +15948,10 @@ theorem evalWidePtrAggregateRelBinOp_ne_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .ne lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .ne lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -15743,10 +15972,10 @@ theorem evalWidePtrAggregateRelBinOp_lt_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .lt lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .lt lhsAddr rhsAddr locals₂ mem false := by
@@ -15767,10 +15996,10 @@ theorem evalWidePtrAggregateRelBinOp_lt_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .lt lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .lt lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -15791,10 +16020,10 @@ theorem evalWidePtrAggregateRelBinOp_le_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .le lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .le lhsAddr rhsAddr locals₂ mem false := by
@@ -15815,10 +16044,10 @@ theorem evalWidePtrAggregateRelBinOp_le_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .le lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .le lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -15839,10 +16068,10 @@ theorem evalWidePtrAggregateRelBinOp_gt_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .gt lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .gt lhsAddr rhsAddr locals₂ mem false := by
@@ -15863,10 +16092,10 @@ theorem evalWidePtrAggregateRelBinOp_gt_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .gt lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .gt lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -15887,10 +16116,10 @@ theorem evalWidePtrAggregateRelBinOp_ge_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .ge lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .ge lhsAddr rhsAddr locals₂ mem false := by
@@ -15911,10 +16140,10 @@ theorem evalWidePtrAggregateRelBinOp_ge_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .ge lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .ge lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -15935,10 +16164,10 @@ theorem evalWidePtrAggregateRelBinOp_cmp_addr_ne
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hNe : Nat.beq lhsAddr.bits rhsAddr.bits = false) :
     evalWidePtrAggregateRelBinOp .cmp lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .cmp lhsAddr rhsAddr locals₂ mem false := by
@@ -15959,10 +16188,10 @@ theorem evalWidePtrAggregateRelBinOp_cmp_addr_eq
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
-    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsAddr)
-    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsAddr)
-    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some lhsMetaNorm)
-    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) = .some rhsMetaNorm)
+    (hLhsThinNorm : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsAddr)
+    (hRhsThinNorm : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsAddr)
+    (hLhsMetaNorm : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some lhsMetaNorm)
+    (hRhsMetaNorm : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = .some rhsMetaNorm)
     (hEq : Nat.beq lhsAddr.bits rhsAddr.bits = true) :
     evalWidePtrAggregateRelBinOp .cmp lhsOp 0 (lhsThin :: lhsMeta :: .nil) 0 (rhsThin :: rhsMeta :: .nil) locals₂ mem localDecls layouts =
     evalScalarBinOp .cmp lhsMetaNorm rhsMetaNorm locals₂ mem false := by
@@ -16039,7 +16268,7 @@ theorem trusted_evalRvalue_aggregate_rawPtr_ptr_scalar_eq
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (mutability : Mutability)
     (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (ptrSz : Nat) (metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal ptrSz :: .scalar metaSc :: .nil) locals') :
     evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) ops) mem localDecls layouts =
       match wideAggregatePointeeIsDyn? pointeeTy with
@@ -16063,7 +16292,7 @@ theorem trusted_evalRvalue_aggregate_rawPtr_wide_ptr_iff
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (mutability : Mutability)
     (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (ptrSz : Nat) (metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal ptrSz :: .scalar metaSc :: .nil) locals')
     (hSliceLike : wideAggregatePointeeIsDyn? pointeeTy = .some false) :
     (evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) ops) mem localDecls layouts =
@@ -16088,7 +16317,7 @@ theorem trusted_evalRvalue_aggregate_rawPtr_wide_on_sized_ub
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (mutability : Mutability)
     (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (ptrSz : Nat) (metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal ptrSz :: .scalar metaSc :: .nil) locals')
     (hSized : wideAggregatePointeeIsDyn? pointeeTy = .none) :
     evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) ops) mem localDecls layouts =
@@ -16101,7 +16330,7 @@ theorem trusted_evalRvalue_aggregate_rawPtr_scalar_scalar_eq
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (mutability : Mutability)
     (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (addrSc metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals') :
     evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) ops) mem localDecls layouts =
       match wideAggregatePointeeIsDyn? pointeeTy with
@@ -16127,7 +16356,7 @@ theorem trusted_evalRvalue_aggregate_rawPtr_wide_scalar_iff
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (mutability : Mutability)
     (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (addrSc metaSc : ScalarInt)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals')
     (hSliceLike : wideAggregatePointeeIsDyn? pointeeTy = .some false) :
     (evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) ops) mem localDecls layouts =
@@ -16159,7 +16388,7 @@ theorem trusted_evalRvalue_aggregate_rawPtr_thin_iff
     (locals locals' : List LocalSlot) (pointeeTy : Ty) (mutability : Mutability)
     (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (ptrVal : ProvenancePtr) (ptrSz : Nat)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal ptrSz :: .unit :: .nil) locals') :
     (evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) ops) mem localDecls layouts =
         .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals' mem ↔
@@ -16198,7 +16427,7 @@ theorem trusted_evalRvalue_ptrMetadata_wide_ptr_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (ptrSz : Nat)
     (metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar metaSc :: .nil)) locals') :
     (evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
         .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem ↔
@@ -16227,7 +16456,7 @@ theorem trusted_evalRvalue_ptrMetadata_wide_ptr_iff
 theorem trusted_evalRvalue_ptrMetadata_thin_ptr_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr) (ptrSz : Nat)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal ptrSz) locals') :
     (evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
         .ok .unit locals' mem ↔ ptrSz = layoutPointerBytes layouts) ∧
@@ -16251,7 +16480,7 @@ pointer `.ptr p 8` (as produced by `ReifyFnPointer`, `FnPtrToPtr`, `UnsafeFnPoin
 theorem trusted_evalRvalue_ptrMetadata_fnPtr8_iff_ptrBytes
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.ptr ptrVal 8) locals') :
     (layoutPointerBytes layouts = 8 →
       evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
@@ -16270,7 +16499,7 @@ length word iff both words are pointer-width, `.ub` otherwise. -/
 theorem trusted_evalRvalue_ptrMetadata_wide_scalar_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (addrSc metaSc : ScalarInt)
-    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals')
     (hWideTy : isNonWidePtrAggregateTy (operandTy localDecls layouts op) = false) :
     (evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
@@ -16331,11 +16560,12 @@ def sliceLenBorrowOk (locals' : List LocalSlot) (mem : Memory) (localDecls : Lis
     | .disabled => false
     | _ =>
       let targetRootOpt : Option Value :=
-        match get? locals' entry.targetLocal with
+        match activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal with
         | .some (.init v) => .some v
         | .some _ => .none
         | .none =>
-          match get? mem.callerLocals entry.targetLocal with
+          match foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth
+              entry.targetLocal with
           | .some (.init v) => .some v
           | _ => .none
       match targetRootOpt with
@@ -16379,7 +16609,7 @@ theorem trusted_evalRvalue_len_deref_slice_eq
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
     (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
-        mem.globals layouts mem.callerLocals localDecls =
+        mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil)) locals') :
     evalRvalue locals (.len place) mem localDecls layouts =
       match Bool.and
@@ -16402,7 +16632,7 @@ theorem trusted_evalRvalue_len_deref_slice_iff
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
     (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
-        mem.globals layouts mem.callerLocals localDecls =
+        mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil)) locals') :
     (evalRvalue locals (.len place) mem localDecls layouts =
         .ok (.scalar ⟨lenSc.bits, layoutPointerBytes layouts⟩) locals' mem ↔
@@ -16435,13 +16665,15 @@ theorem sliceLenBorrowOk_disabled (locals' : List LocalSlot) (mem : Memory)
   dsimp only
   rw [hDis] <;> rfl
 
-/-- A live stack borrow whose backing local is `.uninit` is never valid for `Rvalue.len`. -/
+/-- A live stack borrow whose backing local (in the active frame) is `.uninit` is never valid
+for `Rvalue.len`. -/
 theorem sliceLenBorrowOk_uninit (locals' : List LocalSlot) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (ptrVal : ProvenancePtr)
     (lenSc : ScalarInt) (entry : BorrowEntry)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hUninit : get? locals' entry.targetLocal = .some .uninit) :
+    (hUninit : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .some .uninit) :
     sliceLenBorrowOk locals' mem localDecls layouts elem ptrVal lenSc = false := by
   unfold sliceLenBorrowOk
   rw [hBorrow]
@@ -16460,7 +16692,8 @@ theorem sliceLenBorrowOk_dead (locals' : List LocalSlot) (mem : Memory)
     (lenSc : ScalarInt) (entry : BorrowEntry)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hDead : get? locals' entry.targetLocal = .some .dead) :
+    (hDead : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .some .dead) :
     sliceLenBorrowOk locals' mem localDecls layouts elem ptrVal lenSc = false := by
   unfold sliceLenBorrowOk
   rw [hBorrow]
@@ -16472,18 +16705,23 @@ theorem sliceLenBorrowOk_dead (locals' : List LocalSlot) (mem : Memory)
     | exact absurd rfl hPerm
     | (simp only [hDead] <;> rfl)
 
-/-- A live stack borrow whose `targetLocal` is absent from `locals'` and either absent, `.uninit`,
-or `.dead` in `mem.callerLocals` is never valid for `Rvalue.len`. -/
+/-- A live stack borrow whose target is not a slot of the active frame (`activeFrameSlot?`) and
+is either absent, `.uninit`, or `.dead` in its owning foreign frame (`foreignFrameSlot?`, which is
+`mem.callerLocals` when `mem.callStack = []`) is never valid for `Rvalue.len`. -/
 theorem sliceLenBorrowOk_callerLocals_missing (locals' : List LocalSlot) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (ptrVal : ProvenancePtr)
     (lenSc : ScalarInt) (entry : BorrowEntry)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hNoLocal : get? locals' entry.targetLocal = .none)
+    (hNoLocal : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .none)
     (hCallerMissing :
-      get? mem.callerLocals entry.targetLocal = .none ∨
-      get? mem.callerLocals entry.targetLocal = .some .uninit ∨
-      get? mem.callerLocals entry.targetLocal = .some .dead) :
+      foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal
+        = .none ∨
+      foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal
+        = .some .uninit ∨
+      foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal
+        = .some .dead) :
     sliceLenBorrowOk locals' mem localDecls layouts elem ptrVal lenSc = false := by
   unfold sliceLenBorrowOk
   rw [hBorrow]
@@ -16502,7 +16740,8 @@ theorem sliceLenBorrowOk_nested_ptr_eq_false (locals' : List LocalSlot) (mem : M
     (nestedPtr : ProvenancePtr) (nestedSz : Nat)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .some (.init rootVal))
     (hNoAgg : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
         (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .none)
@@ -16527,7 +16766,8 @@ theorem sliceLenBorrowOk_stack_backing (locals' : List LocalSlot) (mem : Memory)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .some (.init rootVal))
     (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
         (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .some (cProj, baseIdx, elems))
@@ -16553,7 +16793,8 @@ theorem sliceLenBorrowOk_zst_unit (locals' : List LocalSlot) (mem : Memory)
     (lenSc : ScalarInt) (entry : BorrowEntry) (rootVal : Value)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hRoot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .some (.init rootVal))
     (hNoAgg : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
         (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .none)
@@ -16570,17 +16811,22 @@ theorem sliceLenBorrowOk_zst_unit (locals' : List LocalSlot) (mem : Memory)
     | exact absurd rfl hPerm
     | (simp only [hRoot, hNoAgg, hUnit] <;> rfl)
 
-/-- Cross-frame `callerLocals` resolution in `sliceLenBorrowOk`: when `get? locals' entry.targetLocal = .none`
-and `get? mem.callerLocals entry.targetLocal = .some (.init rootVal)`, the backing aggregate is
-resolved from `mem.callerLocals`. -/
+/-- Cross-frame resolution in `sliceLenBorrowOk`: when the borrow target is not a slot of the
+active frame (`activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+.none`) but is an initialized slot of another frame or of the root frame's caller-owned referents
+(`foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal =
+.some (.init rootVal)`, which is `get? mem.callerLocals entry.targetLocal` when
+`mem.callStack = []`), the backing aggregate is resolved from that foreign slot. -/
 theorem sliceLenBorrowOk_callerLocals_backing (locals' : List LocalSlot) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (ptrVal : ProvenancePtr)
     (lenSc : ScalarInt) (entry : BorrowEntry) (rootVal : Value)
     (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value) (rawElemOffset : Nat)
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
-    (hNoLocal : get? locals' entry.targetLocal = .none)
-    (hCallerRoot : get? mem.callerLocals entry.targetLocal = .some (.init rootVal))
+    (hNoLocal : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+      = .none)
+    (hCallerRoot : foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal
+      = .some (.init rootVal))
     (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
         (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .some (cProj, baseIdx, elems))
@@ -16598,7 +16844,7 @@ theorem sliceLenBorrowOk_callerLocals_backing (locals' : List LocalSlot) (mem : 
     | exact absurd rfl hPerm
     | (simp only [hNoLocal, hCallerRoot, hBacking, hOff] <;> rfl)
 
-/-- A live stack borrow (in `locals'` or cross-frame `mem.callerLocals`) whose byte offset is not
+/-- A live stack borrow (in the active frame or in a foreign frame) whose byte offset is not
 aligned to the backing element stride (`byteOffsetToElemIdx? = .none`, `Places.lean:14462`) is
 rejected by `sliceLenBorrowOk`. -/
 theorem sliceLenBorrowOk_stack_misaligned (locals' : List LocalSlot) (mem : Memory)
@@ -16608,9 +16854,11 @@ theorem sliceLenBorrowOk_stack_misaligned (locals' : List LocalSlot) (mem : Memo
     (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
     (hPerm : entry.perm ≠ .disabled)
     (hRoot :
-      get? locals' entry.targetLocal = .some (.init rootVal) ∨
-      (get? locals' entry.targetLocal = .none ∧
-        get? mem.callerLocals entry.targetLocal = .some (.init rootVal)))
+      activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal
+        = .some (.init rootVal) ∨
+      (activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal = .none ∧
+        foreignFrameSlot? mem.callStack mem.callerLocals entry.targetFrameDepth entry.targetLocal
+          = .some (.init rootVal)))
     (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
         (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
       .some (cProj, baseIdx, elems))
@@ -16656,7 +16904,7 @@ theorem trusted_evalRvalue_len_deref_global_iff
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
     (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
-        mem.globals layouts mem.callerLocals localDecls =
+        mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar lenSc :: .nil)) locals')
     (hMeta : lenSc.sizeBytes = layoutPointerBytes layouts)
     (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
@@ -16719,7 +16967,7 @@ theorem trusted_evalRvalue_len_deref_wide_scalar_ub
     (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
     (hSplit : splitLastDeref? place.projection = .some initProj)
     (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
-        mem.globals layouts mem.callerLocals localDecls =
+        mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar addrSc :: .scalar lenSc :: .nil)) locals') :
     evalRvalue locals (.len place) mem localDecls layouts = .ub := by
   rw [evalRvalue_len_eq]
@@ -16888,9 +17136,9 @@ theorem trusted_evalRvalue_binaryOp_wide_aggregate_eq
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsVar rhsVar : Nat)
     (lhsFields rhsFields : List Value)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate lhsVar lhsFields) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate rhsVar rhsFields) locals₂) :
     evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
       evalWidePtrAggregateRelBinOp op lhsOp lhsVar lhsFields rhsVar rhsFields locals₂ mem
@@ -16931,22 +17179,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_lt_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .lt lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (boolToScalar (decide (a₁ < a₂ ∨ (a₁ = a₂ ∧ m₁ < m₂))))) locals₂ mem := by
@@ -16988,22 +17236,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_eq_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (boolToScalar (decide (a₁ = a₂ ∧ m₁ = m₂)))) locals₂ mem := by
@@ -17034,22 +17282,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_ne_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .ne lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (boolToScalar (decide (a₁ ≠ a₂ ∨ m₁ ≠ m₂)))) locals₂ mem := by
@@ -17078,22 +17326,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_le_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .le lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (boolToScalar (decide (a₁ < a₂ ∨ (a₁ = a₂ ∧ m₁ ≤ m₂))))) locals₂ mem := by
@@ -17134,22 +17382,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_gt_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .gt lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (boolToScalar (decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ > m₂))))) locals₂ mem := by
@@ -17190,22 +17438,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_ge_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .ge lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (boolToScalar (decide (a₁ > a₂ ∨ (a₁ = a₂ ∧ m₁ ≥ m₂))))) locals₂ mem := by
@@ -17250,22 +17498,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_cmp_lex
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .cmp lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (
@@ -17312,22 +17560,22 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_cmp_ordering
     (locals locals₁ locals₂ : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
     (hLhsMetaTy : isWidePtrMetadata lhsMeta = true)
     (hRhsMetaTy : isWidePtrMetadata rhsMeta = true)
     (hExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp .cmp lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (orderingCmpScalar ((compare a₁ a₂).then (compare m₁ m₂)))) locals₂ mem := by
@@ -17359,9 +17607,9 @@ bitwise, shift, and `offset` operators applied to two 2-word wide aggregates nev
 theorem trusted_evalRvalue_binaryOp_wide_ptr_nonrelational_unsupported
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hNotRel : isRelationalBinOp op = false) :
     evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts = .unsupported := by
@@ -17379,10 +17627,10 @@ computes the synthetic page-offset address `wrapScalarBits (p.allocId * 65536 + 
 theorem resolveWideWordScalar?_unborrowed_ptr
     (p : ProvenancePtr) (locals : List LocalSlot) (borrows : List BorrowEntry)
     (callerLocals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (ptrBytes : Nat)
+    (ptrBytes : Nat) {callStack : List SavedCallerFrame}
     (hNoBorrow : lookupBorrow borrows p.tag = .none) :
     resolveWideWordScalar? (.ptr p ptrBytes) locals borrows callerLocals localDecls layouts
-        ptrBytes =
+        ptrBytes callStack =
       .some { bits := wrapScalarBits (Nat.add (Nat.mul p.allocId 65536) p.offsetBytes)
                 (scalarModulus ptrBytes)
               sizeBytes := ptrBytes } := by
@@ -17396,17 +17644,17 @@ theorem resolveWideWordScalar?_unborrowed_ptr
 theorem resolveWideWordScalar?_stack_borrow_eq_of_same_place
     (p₁ p₂ : ProvenancePtr) (e₁ e₂ : BorrowEntry) (locals : List LocalSlot)
     (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
-    (layouts : LayoutTable) (ptrBytes : Nat)
+    (layouts : LayoutTable) (ptrBytes : Nat) {callStack : List SavedCallerFrame}
     (hB₁ : lookupBorrow borrows p₁.tag = .some e₁)
     (hB₂ : lookupBorrow borrows p₂.tag = .some e₂)
     (hLoc : e₁.targetLocal = e₂.targetLocal)
-    (hPlaceOff : borrowPlaceByteOffset? locals callerLocals localDecls layouts e₁ =
-      borrowPlaceByteOffset? locals callerLocals localDecls layouts e₂)
+    (hPlaceOff : borrowPlaceByteOffset? locals callerLocals localDecls layouts e₁ callStack =
+      borrowPlaceByteOffset? locals callerLocals localDecls layouts e₂ callStack)
     (hOff : p₁.offsetBytes = p₂.offsetBytes) :
     resolveWideWordScalar? (.ptr p₁ ptrBytes) locals borrows callerLocals localDecls layouts
-        ptrBytes =
+        ptrBytes callStack =
       resolveWideWordScalar? (.ptr p₂ ptrBytes) locals borrows callerLocals localDecls layouts
-        ptrBytes := by
+        ptrBytes callStack := by
   unfold resolveWideWordScalar? ptrAddressScalar? ptrAddress? borrowBaseAddress?
   simp only [Nat.beq_refl, hB₁, hB₂, hPlaceOff, hLoc, hOff]
 
@@ -17414,13 +17662,14 @@ theorem resolveWideWordScalar?_stack_borrow_eq_of_same_place
 `ptrBytes` (`sz ≠ ptrBytes`). -/
 theorem resolveWideWordScalar?_width_mismatch_eq_none
     (locals : List LocalSlot) (borrows : List BorrowEntry) (callerLocals : List LocalSlot)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrBytes : Nat) :
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrBytes : Nat)
+    {callStack : List SavedCallerFrame} :
     (∀ p sz, sz ≠ ptrBytes →
-      resolveWideWordScalar? (.ptr p sz) locals borrows callerLocals localDecls layouts ptrBytes =
-        .none) ∧
+      resolveWideWordScalar? (.ptr p sz) locals borrows callerLocals localDecls layouts ptrBytes
+        callStack = .none) ∧
     (∀ sc : ScalarInt, sc.sizeBytes ≠ ptrBytes →
-      resolveWideWordScalar? (.scalar sc) locals borrows callerLocals localDecls layouts ptrBytes =
-        .none) := by
+      resolveWideWordScalar? (.scalar sc) locals borrows callerLocals localDecls layouts ptrBytes
+        callStack = .none) := by
   refine ⟨fun p sz hNe => ?_, fun sc hNe => ?_⟩
   · dsimp only [resolveWideWordScalar?]
     rw [nat_beq_eq_false_of_ne hNe]
@@ -17434,9 +17683,9 @@ still dispatches a relational `op` to `evalWidePtrRelBinOp`. -/
 theorem trusted_evalRvalue_binaryOp_wide_ptr_untyped_rel_eq
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
@@ -17463,9 +17712,9 @@ theorem trusted_evalRvalue_binaryOp_untyped_two_scalars_unsupported
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (sc₁ sc₂ : ScalarInt) (lhsMeta rhsMeta : Value)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar sc₁ :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar sc₂ :: rhsMeta :: .nil)) locals₂)
     (hNotExp : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = false) :
     evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts = .unsupported := by
@@ -17485,19 +17734,19 @@ unresolvable sub-place projection offset), `evalRvalue (.binaryOp op lhsOp rhsOp
 theorem trusted_evalRvalue_binaryOp_wide_ptr_resolve_none_unsupported
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hNone :
       resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) = .none ∨
+          (layoutPointerBytes layouts) mem.callStack = .none ∨
       resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) = .none ∨
+          (layoutPointerBytes layouts) mem.callStack = .none ∨
       resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) = .none ∨
+          (layoutPointerBytes layouts) mem.callStack = .none ∨
       resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) = .none) :
+          (layoutPointerBytes layouts) mem.callStack = .none) :
     evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts = .unsupported := by
   rw [trusted_evalRvalue_binaryOp_wide_aggregate_eq locals locals₁ locals₂ op lhsOp rhsOp mem
     localDecls layouts 0 0 _ _ hL hR]
@@ -17511,19 +17760,19 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_resolve_none_unsupported
     · rw [h1]
     · rw [h2]
       cases resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-        (layoutPointerBytes layouts) <;> rfl
+        (layoutPointerBytes layouts) mem.callStack <;> rfl
     · rw [h3]
       cases resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-        (layoutPointerBytes layouts) <;>
+        (layoutPointerBytes layouts) mem.callStack <;>
         cases resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) <;> rfl
+          (layoutPointerBytes layouts) mem.callStack <;> rfl
     · rw [h4]
       cases resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-        (layoutPointerBytes layouts) <;>
+        (layoutPointerBytes layouts) mem.callStack <;>
         cases resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) <;>
+          (layoutPointerBytes layouts) mem.callStack <;>
         cases resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) <;> rfl
+          (layoutPointerBytes layouts) mem.callStack <;> rfl
 
 /-! ### 3.B.5 Uniform `Ordering` characterization of all seven relational `BinOp`s
 
@@ -17581,13 +17830,13 @@ theorem evalWidePtrRelBinOp_ordering
     (ptrBytes a₁ a₂ m₁ m₂ : Nat)
     (hRel : isRelationalBinOp op = true) (hPb : ptrBytes ≠ 0)
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      ptrBytes = .some ⟨a₁, ptrBytes⟩)
+      ptrBytes mem.callStack = .some ⟨a₁, ptrBytes⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      ptrBytes = .some ⟨a₂, ptrBytes⟩)
+      ptrBytes mem.callStack = .some ⟨a₂, ptrBytes⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      ptrBytes = .some ⟨m₁, ptrBytes⟩)
+      ptrBytes mem.callStack = .some ⟨m₁, ptrBytes⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      ptrBytes = .some ⟨m₂, ptrBytes⟩) :
+      ptrBytes mem.callStack = .some ⟨m₂, ptrBytes⟩) :
     evalWidePtrRelBinOp op lhsThin lhsMeta rhsThin rhsMeta locals₂ mem localDecls layouts
         ptrBytes =
       .ok (.scalar (relOpOrderingScalar op ((compare a₁ a₂).then (compare m₁ m₂)))) locals₂
@@ -17612,9 +17861,9 @@ wide-pointer type, *or* at least one data word is a provenance `.ptr`. -/
 theorem trusted_evalRvalue_binaryOp_wide_ptr_rel_dispatch
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
@@ -17648,9 +17897,9 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_rel_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsThin lhsMeta rhsThin rhsMeta : Value)
     (a₁ a₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (lhsThin :: lhsMeta :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (rhsThin :: rhsMeta :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
     (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
@@ -17659,13 +17908,13 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_rel_ordering
     (hGate : isExplicitWidePtrTy (operandTy localDecls layouts lhsOp) = true ∨
       (∃ p sz, lhsThin = .ptr p sz) ∨ (∃ p sz, rhsThin = .ptr p sz))
     (hA₁ : resolveWideWordScalar? lhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₁, layoutPointerBytes layouts⟩)
     (hA₂ : resolveWideWordScalar? rhsThin locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨a₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨a₂, layoutPointerBytes layouts⟩)
     (hM₁ : resolveWideWordScalar? lhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₁, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₁, layoutPointerBytes layouts⟩)
     (hM₂ : resolveWideWordScalar? rhsMeta locals₂ mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) = .some ⟨m₂, layoutPointerBytes layouts⟩)
+      (layoutPointerBytes layouts) mem.callStack = .some ⟨m₂, layoutPointerBytes layouts⟩)
     (hPb : layoutPointerBytes layouts ≠ 0) :
     evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
       .ok (.scalar (relOpOrderingScalar op ((compare a₁ a₂).then (compare m₁ m₂)))) locals₂
@@ -17691,9 +17940,10 @@ theorem nat_compare_add_left (c x y : Nat) :
 theorem resolveWideWordScalar?_scalar_canonical
     (bits ptrBytes : Nat) (locals : List LocalSlot) (borrows : List BorrowEntry)
     (callerLocals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    {callStack : List SavedCallerFrame}
     (hLt : bits < scalarModulus ptrBytes) :
     resolveWideWordScalar? (.scalar ⟨bits, ptrBytes⟩) locals borrows callerLocals localDecls layouts
-        ptrBytes = .some ⟨bits, ptrBytes⟩ := by
+        ptrBytes callStack = .some ⟨bits, ptrBytes⟩ := by
   dsimp only [resolveWideWordScalar?]
   rw [Nat.beq_refl, wrapScalarBits_eq_self_of_lt hLt]
 
@@ -17702,27 +17952,29 @@ theorem resolveWideWordScalar?_scalar_canonical
 theorem resolveWideWordScalar?_unborrowed_ptr_canonical
     (allocId offset ptrBytes : Nat) (locals : List LocalSlot) (borrows : List BorrowEntry)
     (callerLocals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    {callStack : List SavedCallerFrame}
     (hNoBorrow : lookupBorrow borrows allocId = .none)
     (hLt : Nat.add (Nat.mul allocId 65536) offset < scalarModulus ptrBytes) :
     resolveWideWordScalar? (.ptr ⟨allocId, offset⟩ ptrBytes) locals borrows callerLocals
-        localDecls layouts ptrBytes =
+        localDecls layouts ptrBytes callStack =
       .some ⟨Nat.add (Nat.mul allocId 65536) offset, ptrBytes⟩ := by
   rw [resolveWideWordScalar?_unborrowed_ptr ⟨allocId, offset⟩ locals borrows callerLocals localDecls
-    layouts ptrBytes hNoBorrow, wrapScalarBits_eq_self_of_lt hLt]
+    layouts ptrBytes (callStack := callStack) hNoBorrow, wrapScalarBits_eq_self_of_lt hLt]
 
 /-- A stack-borrowed provenance pointer `⟨tag, offset⟩` (`lookupBorrow borrows tag = .some entry`)
 whose borrowed place has base address `base` resolves to `base + offset` when that does not wrap. -/
 theorem resolveWideWordScalar?_stack_ptr_canonical
     (tag offset ptrBytes base : Nat) (entry : BorrowEntry) (locals : List LocalSlot)
     (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
+    (layouts : LayoutTable) {callStack : List SavedCallerFrame}
     (hB : lookupBorrow borrows tag = .some entry)
-    (hBase : borrowBaseAddress? locals callerLocals localDecls layouts ptrBytes entry = .some base)
+    (hBase : borrowBaseAddress? locals callerLocals localDecls layouts ptrBytes entry callStack =
+      .some base)
     (hLt : Nat.add base offset < scalarModulus ptrBytes) :
     resolveWideWordScalar? (.ptr ⟨tag, offset⟩ ptrBytes) locals borrows callerLocals localDecls
-        layouts ptrBytes = .some ⟨Nat.add base offset, ptrBytes⟩ := by
-  have hAddr : ptrAddress? locals borrows callerLocals localDecls layouts ptrBytes ⟨tag, offset⟩ =
-      .some (Nat.add base offset) := by
+        layouts ptrBytes callStack = .some ⟨Nat.add base offset, ptrBytes⟩ := by
+  have hAddr : ptrAddress? locals borrows callerLocals localDecls layouts ptrBytes ⟨tag, offset⟩
+      callStack = .some (Nat.add base offset) := by
     dsimp only [ptrAddress?, ProvenancePtr.tag]
     rw [hB]
     dsimp only
@@ -17742,10 +17994,10 @@ allocation base cancels). -/
 theorem trusted_evalRvalue_binaryOp_wide_ptr_same_alloc_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (allocId o₁ o₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨allocId, o₁⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨allocId, o₂⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
@@ -17780,10 +18032,10 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_same_stack_place_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (t₁ t₂ o₁ o₂ m₁ m₂ base : Nat)
     (e₁ e₂ : BorrowEntry)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨t₁, o₁⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨t₂, o₂⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
@@ -17791,9 +18043,9 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_same_stack_place_ordering
     (hB₁ : lookupBorrow mem.borrows t₁ = .some e₁)
     (hB₂ : lookupBorrow mem.borrows t₂ = .some e₂)
     (hBase₁ : borrowBaseAddress? locals₂ mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) e₁ = .some base)
+      (layoutPointerBytes layouts) e₁ mem.callStack = .some base)
     (hBase₂ : borrowBaseAddress? locals₂ mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) e₂ = .some base)
+      (layoutPointerBytes layouts) e₂ mem.callStack = .some base)
     (hW₁ : Nat.add base o₁ < scalarModulus (layoutPointerBytes layouts))
     (hW₂ : Nat.add base o₂ < scalarModulus (layoutPointerBytes layouts))
     (hm₁ : m₁ < scalarModulus (layoutPointerBytes layouts))
@@ -17821,10 +18073,10 @@ relational `op`, by `(compare x₁ x₂).then (compare m₁ m₂)`. -/
 theorem trusted_evalRvalue_binaryOp_wide_ptr_scalar_addr_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (x₁ x₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar ⟨x₁, layoutPointerBytes layouts⟩ ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar ⟨x₂, layoutPointerBytes layouts⟩ ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
@@ -17876,10 +18128,10 @@ in-page offsets `o₁, o₂ < 65536` (same or distinct allocations), every relat
 theorem trusted_evalRvalue_binaryOp_wide_ptr_unborrowed_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (a₁ a₂ o₁ o₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨a₁, o₁⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨a₂, o₂⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
@@ -17916,10 +18168,10 @@ comparison depends strictly on `compare a₁ a₂` (both the offsets `o₁, o₂
 theorem trusted_evalRvalue_binaryOp_wide_ptr_diff_alloc_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (a₁ a₂ o₁ o₂ m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨a₁, o₁⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨a₂, o₂⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
@@ -17954,10 +18206,10 @@ wide pointer compares equal to the exposed form of its own address (provenance i
 theorem trusted_evalRvalue_binaryOp_wide_ptr_exposed_addr_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (allocId o x m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨allocId, o⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar ⟨x, layoutPointerBytes layouts⟩ ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)
@@ -17992,10 +18244,10 @@ is untyped (`isExplicitWidePtrTy = false`). -/
 theorem trusted_evalRvalue_binaryOp_wide_ptr_lhs_exposed_addr_ordering
     (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (x allocId o m₁ m₂ : Nat)
-    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.scalar ⟨x, layoutPointerBytes layouts⟩ ::
         .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
-    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.aggregate 0 (.ptr ⟨allocId, o⟩ (layoutPointerBytes layouts) ::
         .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
     (hRel : isRelationalBinOp op = true)

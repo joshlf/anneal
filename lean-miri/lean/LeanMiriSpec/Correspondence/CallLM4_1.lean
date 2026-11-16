@@ -1249,6 +1249,339 @@ theorem BorrowTrackerStackRel.of_releaseCallProtectors
 
 /-! ## 2. Depth-1 `TreeBorrowsStateRel` -/
 
+/-- Frame-depth and root-protector well-formedness of passive Tree Borrows
+entries in the `LM-4.1` multi-frame call-stack fragment:
+1. every `e ∈ borrows` belongs to the root frame (`e.targetFrameDepth = 0`);
+2. at root stack depth (`callStack = []`), `activeProtectors = []`;
+3. at the bottom saved caller frame (`callStack.getLast? = some cf`),
+   `restoreCallerProtectors cf = []`. -/
+structure BorrowsFrameStackValid
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (callStack : List SavedCallerFrame) : Prop where
+  root_depth : ∀ e ∈ borrows, e.targetFrameDepth = 0
+  root_protectors_nil : callStack = [] → activeProtectors = []
+  last_restores_nil : ∀ cf, callStack.getLast? = some cf → restoreCallerProtectors cf = []
+
+theorem BorrowsFrameStackValid.of_empty
+    {borrows : List BorrowEntry} {activeProtectors : List Nat}
+    (hbor : borrows = []) (hprot : activeProtectors = []) :
+    BorrowsFrameStackValid borrows activeProtectors [] := by
+  subst hbor hprot
+  exact
+    { root_depth := fun _ h => nomatch h
+      root_protectors_nil := fun _ => rfl
+      last_restores_nil := fun _ h => nomatch h }
+
+theorem BorrowsFrameStackValid.of_pushFrame
+    {borrows : List BorrowEntry} {activeProtectors : List Nat}
+    {callStack : List SavedCallerFrame} {savedCaller : SavedCallerFrame}
+    (h : BorrowsFrameStackValid borrows activeProtectors callStack)
+    (hcp : savedCaller.callerProtector = none)
+    (hcalleeP : savedCaller.calleeProtectors = activeProtectors) :
+    BorrowsFrameStackValid borrows activeProtectors (savedCaller :: callStack) := by
+  refine
+    { root_depth := h.root_depth
+      root_protectors_nil := fun hnil => nomatch hnil
+      last_restores_nil := ?_ }
+  intro cf hlast
+  cases callStack with
+  | nil =>
+    simp only [List.getLast?_singleton, Option.some.injEq] at hlast
+    subst hlast
+    simp [restoreCallerProtectors, hcp, hcalleeP, h.root_protectors_nil rfl]
+  | cons c₀ cs =>
+    simp only [List.getLast?_cons_cons] at hlast
+    exact h.last_restores_nil cf hlast
+
+theorem BorrowsFrameStackValid.of_popFrame_same
+    {borrows : List BorrowEntry} {activeProtectors : List Nat}
+    {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    (h : BorrowsFrameStackValid borrows activeProtectors (cf :: restStack)) :
+    BorrowsFrameStackValid borrows (restoreCallerProtectors cf) restStack := by
+  refine ⟨h.root_depth, ?_, ?_⟩
+  · intro hnil
+    subst hnil
+    exact h.last_restores_nil cf rfl
+  · intro cf' hlast
+    cases restStack with
+    | nil => cases hlast
+    | cons c₀ cs =>
+      exact h.last_restores_nil cf' (by simp only [List.getLast?_cons_cons]; exact hlast)
+
+theorem hasFrameDeallocProtectorConflict_succ_eq_false
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (activeProtectors : List Nat) (d nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows activeProtectors (d + 1) nLocals = false := by
+  cases activeProtectors with
+  | nil =>
+    unfold hasFrameDeallocProtectorConflict
+    rfl
+  | cons p ps =>
+    induction borrows with
+    | nil =>
+      unfold hasFrameDeallocProtectorConflict
+      rfl
+    | cons e rest ih =>
+      have he0 := h0 e List.mem_cons_self
+      conv => lhs; unfold hasFrameDeallocProtectorConflict
+      dsimp only []
+      rw [he0]
+      have hbeq : Nat.beq 0 (d + 1) = false := rfl
+      rw [hbeq, Bool.false_and, Bool.false_and]
+      dsimp only []
+      exact ih (fun e' he' => h0 e' (List.mem_cons_of_mem _ he'))
+
+theorem disableFrameBorrows_succ_eq
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (d nLocals : Nat) :
+    disableFrameBorrows borrows (d + 1) nLocals = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    have he0 := h0 e List.mem_cons_self
+    unfold disableFrameBorrows
+    rw [he0]
+    have hbeq : Nat.beq 0 (d + 1) = false := rfl
+    rw [hbeq, Bool.false_and]
+    dsimp only []
+    rw [ih (fun e' he' => h0 e' (List.mem_cons_of_mem _ he'))]
+
+theorem disableFramesAbove_eq_of_root_depth
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (d : Nat) :
+    disableFramesAbove borrows d = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    have he0 := h0 e List.mem_cons_self
+    unfold disableFramesAbove
+    rw [he0]
+    have hblt : Nat.blt d 0 = false := rfl
+    rw [hblt]
+    dsimp only []
+    rw [ih (fun e' he' => h0 e' (List.mem_cons_of_mem _ he'))]
+
+theorem hasProtectedWriteConflict_nil_protectors
+    (borrows : List BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (off len depth : Nat) :
+    hasProtectedWriteConflict borrows [] targetLocal writerTag writeProj off len depth = false := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    unfold hasProtectedWriteConflict
+    have hp : isBorrowProtected [] e = false := by
+      unfold isBorrowProtected
+      cases e.protector <;> rfl
+    rw [hp, Bool.false_and, Bool.and_false, Bool.and_false]
+    exact ih
+
+theorem hasProtectedWriteConflict_succ_depth_eq_false
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (activeProtectors : List Nat) (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (off len d : Nat) :
+    hasProtectedWriteConflict borrows activeProtectors targetLocal writerTag writeProj off len (d + 1) =
+      false := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    have he0 := h0 e List.mem_cons_self
+    unfold hasProtectedWriteConflict
+    rw [he0]
+    have hbeq : Nat.beq 0 (d + 1) = false := rfl
+    rw [hbeq, Bool.false_and, Bool.false_and]
+    exact ih (fun e' he' => h0 e' (List.mem_cons_of_mem _ he'))
+
+theorem invalidateConflictingBorrows_succ_depth_eq
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (targetLocal : Local) (writerTag : Option Nat) (d : Nat) :
+    invalidateConflictingBorrows borrows targetLocal writerTag (d + 1) = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    have he0 := h0 e List.mem_cons_self
+    unfold invalidateConflictingBorrows updateBorrowPerm
+    rw [he0]
+    have hbeq : Nat.beq 0 (d + 1) = false := rfl
+    rw [hbeq, Bool.false_and]
+    dsimp only []
+    rw [ih (fun e' he' => h0 e' (List.mem_cons_of_mem _ he'))]
+
+theorem updateBorrowPerm_preserves_meta
+    (e : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) (depth : Nat) :
+    let e' := updateBorrowPerm e targetLocal writerTag depth
+    e'.tag = e.tag ∧ e'.protector = e.protector ∧
+      e'.parentTag = e.parentTag ∧ e'.targetFrameDepth = e.targetFrameDepth := by
+  dsimp only []
+  unfold updateBorrowPerm
+  cases Bool.and (Nat.beq e.targetFrameDepth depth) (Nat.beq e.targetLocal targetLocal) with
+  | false => exact ⟨rfl, rfl, rfl, rfl⟩
+  | true =>
+    unfold applyTreeBorrowTransition
+    cases treeBorrowNodeAccess .write (treeBorrowWriterRelatedness e writerTag) e.perm false <;>
+      exact ⟨rfl, rfl, rfl, rfl⟩
+
+theorem invalidateConflictingBorrows_map_tag
+    (borrows : List BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) (depth : Nat) :
+    (invalidateConflictingBorrows borrows targetLocal writerTag depth).map BorrowEntry.tag =
+      borrows.map BorrowEntry.tag := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    simp only [invalidateConflictingBorrows, List.map_cons,
+      (updateBorrowPerm_preserves_meta e targetLocal writerTag depth).1, ih]
+
+theorem invalidateConflictingBorrows_root_depth_mem
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (targetLocal : Local) (writerTag : Option Nat) (depth : Nat) :
+    ∀ e' ∈ invalidateConflictingBorrows borrows targetLocal writerTag depth,
+      e'.targetFrameDepth = 0 ∧
+      ∃ e ∈ borrows, e'.tag = e.tag ∧ e'.protector = e.protector ∧ e'.parentTag = e.parentTag := by
+  induction borrows with
+  | nil => intro _ h; cases h
+  | cons e rest ih =>
+    intro e' he'
+    simp only [invalidateConflictingBorrows, List.mem_cons] at he'
+    rcases he' with rfl | hrest
+    · obtain ⟨ht, hp, hpar, hd⟩ := updateBorrowPerm_preserves_meta e targetLocal writerTag depth
+      exact ⟨hd.trans (h0 e List.mem_cons_self), e, List.mem_cons_self, ht, hp, hpar⟩
+    · obtain ⟨hd, e₀, he₀, ht, hp, hpar⟩ :=
+        ih (fun x hx => h0 x (List.mem_cons_of_mem _ hx)) e' hrest
+      exact ⟨hd, e₀, List.mem_cons_of_mem _ he₀, ht, hp, hpar⟩
+
+/-- Complete Stage-1 `writeReturnDestination` & invariant-preservation bundle on
+returning from `cf :: restStack` into an unprojected non-dead caller local
+`cf.destination = ⟨destIdx, .nil⟩` under `BorrowsFrameStackValid`. -/
+theorem writeReturnDestination_callee_ok_and_invariants
+    {borrows : List BorrowEntry} {activeProtectors : List Nat}
+    {nextProtector : Nat}
+    {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {bt : Option Miri.Interpreter.MachineHooks.BorrowState}
+    (hbfv : BorrowsFrameStackValid borrows activeProtectors (cf :: restStack))
+    (htb : TreeBorrowsRel borrows activeProtectors (basedNormalTree borrows activeProtectors))
+    (hvalid_caller : ActiveProtectorsValid borrows (restoreCallerProtectors cf))
+    (hcid_bor : ∀ e ∈ borrows, ∀ cid, e.protector = some cid → cid < nextProtector)
+    (hbt : BorrowTrackerStackRel borrows (callerRestoredProtectors [cf]) restStack bt)
+    {destIdx : Local} {slot_d : LocalSlot}
+    (hcf : cf.destination = ⟨destIdx, .nil⟩)
+    (hlt : destIdx < cf.frame.locals.length)
+    (hslot_d : get? cf.frame.locals destIdx = some slot_d)
+    (hne_dead : slot_d ≠ .dead)
+    (callerMem : Memory)
+    (hmem_bor : callerMem.borrows = borrows)
+    (hmem_cs : callerMem.callStack = restStack)
+    (hmem_ap : callerMem.activeProtectors = restoreCallerProtectors cf)
+    (retVal : Value) :
+    let borrows' := invalidateConflictingBorrows borrows destIdx .none (length restStack)
+    writeReturnDestination cf.frame.locals callerMem cf.destination retVal
+      cf.callerBody.localDecls cf.callerBody.layouts =
+      .ok (cf.frame.locals.set destIdx (.init retVal)) { callerMem with borrows := borrows' } ∧
+    TreeBorrowsRel borrows' (restoreCallerProtectors cf)
+      (basedNormalTree borrows' (restoreCallerProtectors cf)) ∧
+    ActiveProtectorsValid borrows' (restoreCallerProtectors cf) ∧
+    (∀ e ∈ borrows', ∀ cid, e.protector = some cid → cid < nextProtector) ∧
+    BorrowTrackerStackRel borrows' (restoreCallerProtectors cf) restStack bt ∧
+    BorrowsFrameStackValid borrows' (restoreCallerProtectors cf) restStack := by
+  dsimp only []
+  have hcp_eq : callerRestoredProtectors [cf] = restoreCallerProtectors cf := by
+    cases hopt : cf.callerProtector <;> simp [callerRestoredProtectors, restoreCallerProtectors, hopt]
+  have hset : set? cf.frame.locals destIdx (.init retVal) =
+      some (cf.frame.locals.set destIdx (.init retVal)) :=
+    set?_eq_some_set hlt _
+  cases restStack with
+  | nil =>
+    have hrest_nil : restoreCallerProtectors cf = [] := hbfv.last_restores_nil cf rfl
+    have hlen_nil : length ([] : List SavedCallerFrame) = 0 := rfl
+    have hconf :
+        hasProtectedWriteConflict callerMem.borrows callerMem.activeProtectors
+          destIdx .none .nil 0 0 (length callerMem.callStack) = false := by
+      rw [hmem_bor, hmem_ap, hrest_nil]
+      exact hasProtectedWriteConflict_nil_protectors borrows destIdx .none .nil 0 0 _
+    have hw :
+        writeReturnDestination cf.frame.locals callerMem cf.destination retVal
+          cf.callerBody.localDecls cf.callerBody.layouts =
+        .ok (cf.frame.locals.set destIdx (.init retVal))
+          { callerMem with
+            borrows := invalidateConflictingBorrows borrows destIdx .none (length ([] : List SavedCallerFrame)) } := by
+      unfold writeReturnDestination
+      rw [hcf]
+      dsimp only []
+      rw [hslot_d]
+      cases slot_d with
+      | dead => exact False.elim (hne_dead rfl)
+      | uninit =>
+        dsimp only []
+        rw [hconf]; dsimp only []
+        rw [hset, hmem_bor, hmem_cs]
+      | init _ =>
+        dsimp only []
+        rw [hconf]; dsimp only []
+        rw [hset, hmem_bor, hmem_cs]
+    have hmem_inv := invalidateConflictingBorrows_root_depth_mem hbfv.root_depth destIdx .none 0
+    rw [hlen_nil] at hw ⊢
+    have hnodup' :
+        ((invalidateConflictingBorrows borrows destIdx .none 0).map BorrowEntry.tag).Nodup := by
+      rw [invalidateConflictingBorrows_map_tag]
+      exact htb.tags_unique
+    refine ⟨hw,
+      basedNormalTree_rel _ _ hnodup',
+      by rw [hrest_nil]; exact ActiveProtectorsValid.nil _,
+      fun e' he' cid hp => by
+        obtain ⟨_, e, he, _, hprot_eq, _⟩ := hmem_inv e' he'
+        exact hcid_bor e he cid (hprot_eq ▸ hp),
+      ?_,
+      ⟨fun e' he' => (hmem_inv e' he').1, fun _ => hrest_nil, fun _ h => nomatch h⟩⟩
+    rw [hcp_eq] at hbt
+    cases hbt with
+    | root _ _ hspec =>
+      refine .root _ _ fun tracker htr e' he' => ?_
+      obtain ⟨_, e, he, htag_eq, hprot_eq, _⟩ := hmem_inv e' he'
+      have hs := hspec tracker htr e he
+      rw [htag_eq]
+      have hp_eq :
+          isBorrowProtected (restoreCallerProtectors cf) e' =
+            isBorrowProtected (restoreCallerProtectors cf) e := by
+        unfold isBorrowProtected; rw [hprot_eq]
+      rw [hp_eq]
+      exact hs
+  | cons c₀ cs =>
+    have hlen_eq : length (c₀ :: cs) = length cs + 1 := rfl
+    have hconf :
+        hasProtectedWriteConflict callerMem.borrows callerMem.activeProtectors
+          destIdx .none .nil 0 0 (length callerMem.callStack) = false := by
+      rw [hmem_bor, hmem_cs, hlen_eq]
+      exact hasProtectedWriteConflict_succ_depth_eq_false hbfv.root_depth _ destIdx .none .nil 0 0 (length cs)
+    have hinv_eq :
+        invalidateConflictingBorrows borrows destIdx .none (length (c₀ :: cs)) = borrows := by
+      rw [hlen_eq]
+      exact invalidateConflictingBorrows_succ_depth_eq hbfv.root_depth destIdx .none (length cs)
+    have hw :
+        writeReturnDestination cf.frame.locals callerMem cf.destination retVal
+          cf.callerBody.localDecls cf.callerBody.layouts =
+        .ok (cf.frame.locals.set destIdx (.init retVal))
+          { callerMem with borrows := borrows } := by
+      unfold writeReturnDestination
+      rw [hcf]
+      dsimp only []
+      rw [hslot_d]
+      cases slot_d with
+      | dead => exact False.elim (hne_dead rfl)
+      | uninit =>
+        dsimp only []
+        rw [hconf]; dsimp only []
+        rw [hset, hmem_bor, hmem_cs, hinv_eq]
+      | init _ =>
+        dsimp only []
+        rw [hconf]; dsimp only []
+        rw [hset, hmem_bor, hmem_cs, hinv_eq]
+    rw [hinv_eq]
+    exact ⟨hw,
+      basedNormalTree_rel _ _ htb.tags_unique,
+      hvalid_caller,
+      hcid_bor,
+      by rw [← hcp_eq]; exact hbt,
+      hbfv.of_popFrame_same⟩
+
 /-- Depth-1 single-frame simulation relation extending `StateRel` with an
 arbitrary Tree Borrows table `s.memory.borrows`, active `CallId` protector set
 `s.memory.activeProtectors`, and Miri `m.machine.borrowTracker` related via
@@ -1281,7 +1614,16 @@ inductive TreeBorrowsStateRel
           first
           | exact BorrowTrackerStackRel.of_none _ _ _
           | exact BorrowTrackerStackRel.of_borrows_nil _ _ _
-          | decide) :
+          | decide)
+      (borrows_frame_valid :
+        BorrowsFrameStackValid s.memory.borrows s.memory.activeProtectors
+          s.memory.callStack := by
+          refine ⟨?_, ?_, ?_⟩ <;>
+            first
+            | (intro _ h; nomatch h)
+            | (intro h; nomatch h)
+            | (intro _; rfl)
+            | decide) :
       TreeBorrowsStateRel body s m
 
 /-! ## 3. Arbitrary-Depth Multi-Frame Simulation Relation (`MultiFrameStateRel` / `CallStackStateRel`) -/
@@ -1641,7 +1983,16 @@ inductive MultiFrameStateRel
           s.memory.callStack m.machine.borrowTracker := by
           first
           | exact BorrowTrackerStackRel.of_none _ _ _
-          | exact BorrowTrackerStackRel.of_borrows_nil _ _ _) :
+          | exact BorrowTrackerStackRel.of_borrows_nil _ _ _)
+      (borrows_frame_valid :
+        BorrowsFrameStackValid s.memory.borrows s.memory.activeProtectors
+          s.memory.callStack := by
+          refine ⟨?_, ?_, ?_⟩ <;>
+            first
+            | (intro _ h; nomatch h)
+            | (intro h; nomatch h)
+            | (intro _; rfl)
+            | decide) :
       MultiFrameStateRel rootBody s m
 
 /-- Alias `CallStackStateRel` for `MultiFrameStateRel`. -/
@@ -1672,13 +2023,15 @@ theorem StateRel.toTreeBorrowsStateRel
     (h : StateRel body s m) :
     TreeBorrowsStateRel body s m := by
   rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hst, hbor, hprot, hcaller, hdisj⟩
-  refine .mk tf hframes hretCont hretPlace hfr (Or.inl hcal) hst hcaller hdisj ?_ ?_ ?_
+  refine .mk tf hframes hretCont hretPlace hfr (Or.inl hcal) hst hcaller hdisj ?_ ?_ ?_ ?_
   · rw [hbor, hprot]
     exact ⟨by decide, by decide, rfl, rfl, rfl⟩
   · rw [hprot]
     exact ActiveProtectorsValid.nil _
   · rw [hbor]
     exact BorrowTrackerStackRel.of_borrows_nil _ _ _
+  · rw [hst]
+    exact BorrowsFrameStackValid.of_empty hbor hprot
 
 /-- Project a depth-1 `TreeBorrowsStateRel` state with an empty borrow table,
 empty active protectors, and `activeCallee = none` back to `StateRel`. -/
@@ -1689,7 +2042,7 @@ theorem TreeBorrowsStateRel.toStateRel_of_empty
     (hbor : s.memory.borrows = .nil)
     (hprot : s.memory.activeProtectors = .nil) :
     StateRel body s m := by
-  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, _, hst, hcaller, hdisj, _, _, _⟩
+  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, _, hst, hcaller, hdisj, _, _, _, _⟩
   exact StateRel.mk tf hframes hretCont hretPlace hfr hcal hst hbor hprot hcaller hdisj
 
 /-- Lift any depth-1 `TreeBorrowsStateRel` state (with valid `nextProtector` bounds)
@@ -1701,7 +2054,7 @@ theorem TreeBorrowsStateRel.toMultiFrameStateRel
     (hcid_act : ∀ cid ∈ s.memory.activeProtectors, cid < s.memory.nextProtector)
     (hcid_bor : ∀ e ∈ s.memory.borrows, ∀ cid, e.protector = some cid → cid < s.memory.nextProtector) :
     MultiFrameStateRel body s m := by
-  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal_ok, hst, _, hdisj, htb, hvalid, hbt⟩
+  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal_ok, hst, _, hdisj, htb, hvalid, hbt, hbfv⟩
   have hact_body : activeMirBody body s = body := by
     unfold activeMirBody
     rcases hcal_ok with hnone | hsome
@@ -1717,7 +2070,7 @@ theorem TreeBorrowsStateRel.toMultiFrameStateRel
     rw [hact_body, hst, hrev]
     exact .root s.frame tf s.memory.activeProtectors hretCont hretPlace hfr
   refine .mk tf hback (fun _ => hcal_ok) (fun hne => False.elim (hne hst))
-    hlinks.toFrameStackRel hlinks ?_ htb hvalid hcid_pos hcid_act hcid_bor hbt
+    hlinks.toFrameStackRel hlinks ?_ htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
   refine ⟨?_, ?_⟩
   · intro mf hmf
     rw [hframes] at hmf
@@ -1747,7 +2100,7 @@ theorem MultiFrameStateRel.toTreeBorrowsStateRel_of_depth1
     (hst : s.memory.callStack = .nil)
     (hcaller : s.memory.callerLocals = .nil) :
     TreeBorrowsStateRel body s m := by
-  rcases h with ⟨_, _, hcal_root, _, _, hlinks, hdisj, htb, hvalid, _, _, _, hbt⟩
+  rcases h with ⟨_, _, hcal_root, _, _, hlinks, hdisj, htb, hvalid, _, _, _, hbt, hbfv⟩
   have hcal_ok := hcal_root hst
   have hact_body : activeMirBody body s = body := by
     unfold activeMirBody
@@ -1764,7 +2117,7 @@ theorem MultiFrameStateRel.toTreeBorrowsStateRel_of_depth1
       apply hdisj.intra_frame rootMf
       rw [hframes]
       exact List.mem_singleton.mpr rfl
-    exact .mk rootMf hframes hretCont hretPlace hfr hcal_ok hst hcaller hd_root htb hvalid hbt
+    exact .mk rootMf hframes hretCont hretPlace hfr hcal_ok hst hcaller hd_root htb hvalid hbt hbfv
 
 /-- **Bidirectional depth-1 bridge (`TreeBorrowsStateRel.iff_multiFrameStateRel_depth1`)**:
 At stack depth 1 (`s.memory.callStack = []`, `s.memory.callerLocals = []`, and
@@ -3494,7 +3847,7 @@ theorem MultiFrameStateRel.frames_ne_empty
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (h : MultiFrameStateRel rootBody s m) :
     m.stack.frames ≠ #[] := by
-  rcases h with ⟨tf, hback, _, _, _, _, _, _, _, _, _, _, _⟩
+  rcases h with ⟨tf, hback, _, _, _, _, _, _, _, _, _, _, _, _⟩
   intro hemp
   rw [hemp] at hback
   cases hback

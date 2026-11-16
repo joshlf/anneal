@@ -155,7 +155,8 @@ import LeanMiriSpec.Audit
 * `LeanMiriSpec.Correspondence.SimLM2_3`: `LM-2.3` correspondence for
   multi-variant enum `Rvalue.Aggregate`
   (`evalRvalue_aggregate_enum_simulation`), `StatementKind.SetDiscriminant`
-  (`step_setDiscriminant_simulation` and `.uninit` divergence),
+  (`step_setDiscriminant_simulation` and the `.uninit` lockstep
+  `step_setDiscriminant_uninit_simulation`, resolving `DIV-LM-ENUM-SET-DISCR-UNINIT`),
   `Rvalue.Discriminant` (`evalRvalue_discriminant_simulation`), `Downcast` +
   `Field` reads and writes (`evalProjection_downcast_field_simulation`,
   `step_downcast_field_write_simulation`, plus inactive-initialized and
@@ -248,8 +249,8 @@ import LeanMiriSpec.Audit
   `UnsafeCell`, `SyncUnsafeCell`, `Cell`, and `RefCell`, and uninhabited vs.
   inhabited `!`-container pointees), `StorageDead`/`StorageLive` protector UB
   vs. unprotected local-borrow disable (`sim_lm3_3_storage_dead_and_live_protector_step`,
-  with the protected-`Cell` residual divergence
-  `sim_lm3_3_storage_dead_protected_cell_divergence`),
+  with protected-`Cell` deallocation now in lockstep,
+  `sim_lm3_3_storage_dead_protected_cell_simulation`),
   deref reborrows, and general 6-state `Miri.Interpreter.Step.step` +
   `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior

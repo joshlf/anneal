@@ -252,13 +252,18 @@ def reborrowWriteMirBody : CapturedMir :=
        terminator := mkTerm .return_
        isCleanup := false }]
 
+/-- The borrow `tag = 1` of the stack local `_1` is `.active` across the body's
+dereference write (`*_2 = 99`) and dereference read (`_0 = *_2`), and is
+disabled with `allocDead := true` when `return_` deallocates the returning
+frame's locals (`DIV-MR-TB-FNENTRY-LOCAL-DEALLOC`). -/
 def reborrowWriteStatefulClaim : StatefulClaim where
   body := reborrowWriteMirBody
   pre args mem := args = [] ∧ mem = emptyMemory
   post _ _ retVal mem' :=
     retVal = .scalar ⟨99, 4⟩ ∧
     lookupBorrow mem'.borrows 1 =
-      some { tag := 1, targetLocal := 1, targetProjection := [], perm := .active }
+      some { tag := 1, targetLocal := 1, targetProjection := [], perm := .disabled,
+             allocDead := true }
 
 theorem reborrowWriteStatefulClaim_verified :
     StatefulVerificationResult reborrowWriteStatefulClaim := by
@@ -589,14 +594,12 @@ private def returnStubMirBody : CapturedMir :=
 def unalignSetRawPtr : RawPtrVal := { allocId := 3, offset := 1, tag := 1 }
 def disjointCallerRawPtr : RawPtrVal := { allocId := 5, offset := 0, tag := 9 }
 
-def unalignSetCallerFrame (v : Value) : SavedCallerFrame := {
+def unalignSetCallerFrame : SavedCallerFrame := {
   callerBody := returnStubMirBody
   frame := {
     blockIdx := 0
     stmtIdx := 0
-    locals :=
-      [.uninit, .uninit, .uninit,
-       .init (.aggregate 0 [.scalar ⟨0, 1⟩, .aggregate 0 [v]])]
+    locals := [.uninit, .uninit, .uninit]
   }
   destination := { local_ := 0, projection := [] }
   returnTarget := 0
@@ -608,7 +611,10 @@ def unalignSetInitMem (oldVal : Value) : Memory := {
      { tag := 2, targetLocal := 4, targetProjection := [], perm := .frozen },
      { tag := 9, targetLocal := 5, targetProjection := [], perm := .frozen }]
   nextTag := 10
-  callStack := [unalignSetCallerFrame oldVal]
+  callStack := [unalignSetCallerFrame]
+  callerLocals :=
+    [.uninit, .uninit, .uninit,
+     .init (.aggregate 0 [.scalar ⟨0, 1⟩, .aggregate 0 [oldVal]])]
 }
 
 def unalignSetMirBody : CapturedMir :=

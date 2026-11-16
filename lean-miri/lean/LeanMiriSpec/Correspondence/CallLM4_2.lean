@@ -1227,6 +1227,56 @@ theorem StateRelLM3_1.write_scalar_return
         rw [List.map_id] at hadv
         exact hadv.relocate rfl targetBb 0
 
+/-- Under `StateRelLM3_1` on an immediate destination local `dstIdx`, Stage-1
+`writeIntrinsicReturn` on `⟨dstIdx, []⟩` equals `intrinsicWriteReturn` (since an
+immediate live local has no active entries in `allocMap`, and a dead local faults
+before `invalidateDirectDestWriteBorrows`). -/
+theorem StateRelLM3_1.writeIntrinsicReturn_eq_intrinsicWriteReturn
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {dstIdx : Local} {dstDecl : LocalDecl}
+    (hdst : get? body.localDecls dstIdx = some dstDecl)
+    (hdstImm : IsImmediateFrameLocal tf dstIdx)
+    (targetBb : BasicBlockIdx) (retVal : Value) :
+    writeIntrinsicReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb retVal =
+      intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb retVal := by
+  obtain ⟨tf₀, hframes₀, _, _, hfr, _, hstack, _, _, hbor, _, _⟩ := id hstate
+  rw [hframes] at hframes₀
+  injection hframes₀ with h₁
+  injection h₁ with htf
+  subst htf
+  obtain ⟨slot, _, _, _, hslot, _, _, _⟩ := hfr.lookup_local hdst
+  unfold writeIntrinsicReturn intrinsicWriteReturn
+  dsimp only [invalidateDirectDestWriteBorrows, intrinsicReturnTo]
+  rw [hstack]
+  dsimp only [length]
+  by_cases hdead : slot = .dead
+  · subst hdead
+    simp [writePlaceValue, hslot]
+  · have hnot_dst := hstate.immediate_not_in_allocMap hframes hslot hdead hdstImm
+    have hinv : invalidateConflictingBorrows s.memory.borrows dstIdx none 0 =
+        s.memory.borrows :=
+      invalidateConflictingBorrows_eq_of_not_mem hbor dstIdx none hnot_dst
+    cases writePlaceValue s.frame.locals s.memory.borrows ⟨dstIdx, []⟩ retVal with
+    | ub => rfl
+    | unsupported => rfl
+    | ok updatedLocals =>
+      dsimp only []
+      cases hb : s.memory.borrows with
+      | nil => rfl
+      | cons bHead bTail =>
+        dsimp only [List.length]
+        rw [hb] at hinv
+        rw [hinv]
+        cases hmem_s : s.memory
+        rw [hmem_s] at hb hstack
+        dsimp only at hb hstack
+        subst hb hstack
+        rfl
+
 /-- `translateCalleeOperand` recognizes every `AnnealIntrinsic` by its
 canonical `DefPath`. -/
 theorem AnnealIntrinsic.ofDefPath?_defPath (k : AnnealIntrinsic) :
@@ -1359,7 +1409,7 @@ theorem step_intrinsic_call_two_simulation
     (annealCall : List Value → List LocalSlot → MirStepNode)
     (hanneal : evalTerminator s bb.terminator (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
-          body.layouts s.memory.callerLocals with
+          body.layouts s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' => annealCall vs locals'
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported)
@@ -1391,7 +1441,7 @@ theorem step_intrinsic_call_two_simulation
         (∃ r mr,
           ImmediateRel dstDecl.ty body.layouts (.scalar r) (.scalar (.fromScalarInt mr)) ∧
           annealCall [.scalar sc₁, .scalar sc₂] s.frame.locals =
-            intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.scalar r) ∧
+            writeIntrinsicReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.scalar r) ∧
           Miri.Interpreter.Intrinsics.eval
             (annealIntrinsicHooks body.localDecls body.layouts) ()
             k.name #[encodeTyId { kind := argKind, layoutIdx := 0 }]
@@ -1405,11 +1455,11 @@ theorem step_intrinsic_call_two_simulation
               pure true) m')) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, _, _⟩ := id hstate
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-  rw [hanneal, miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
+  rw [hanneal, hstack, miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
     translateTerminator_intrinsic_call hterm hc]
   simp only [List.map_cons, List.map_nil]
   rw [controlFlow_evalTerminator_call _ _ _ rfl,
@@ -1494,10 +1544,12 @@ theorem step_intrinsic_call_two_simulation
         rcases StateRelLM3_1.write_scalar_return hstate₃ rfl hdst hdstPrim himm₃ hrelR
             tf.localsIdentity (translateTy dstDecl.ty body.layouts) targetBb with
           ⟨msgw, mw, hwa, hwm⟩ | ⟨locals', tf₄, hwa, hwm, hloc₄, hstate₄⟩
-        · rw [EStateM.bind_eq_error (hev.trans hwm), ha]
+        · rw [EStateM.bind_eq_error (hev.trans hwm), ha,
+            hstate.writeIntrinsicReturn_eq_intrinsicWriteReturn hframes hdst (hdstImm tf hframes)]
           simp only [intrinsicWriteReturn, hwa]
           exact .ub _ _
-        · rw [EStateM.bind_eq_ok (hev.trans hwm), ha]
+        · rw [EStateM.bind_eq_ok (hev.trans hwm), ha,
+            hstate.writeIntrinsicReturn_eq_intrinsicWriteReturn hframes hdst (hdstImm tf hframes)]
           simp only [intrinsicWriteReturn, hwa, intrinsicReturnTo, ↓reduceIte,
             Option.isSome_some]
           rw [EStateM.bind_eq_ok (annealPlaceHooks_frameIndex_eq (m := { m with stack := ⟨#[tf₄]⟩ })
@@ -1539,7 +1591,7 @@ theorem step_intrinsic_call_one_simulation
     (annealCall : List Value → List LocalSlot → MirStepNode)
     (hanneal : evalTerminator s bb.terminator (some body) =
       match evalOperands s.frame.locals [op₁] s.memory.borrows s.memory.globals
-          body.layouts s.memory.callerLocals with
+          body.layouts s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' => annealCall vs locals'
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported)
@@ -1562,7 +1614,7 @@ theorem step_intrinsic_call_one_simulation
         (∃ r mr,
           ImmediateRel dstDecl.ty body.layouts (.scalar r) (.scalar (.fromScalarInt mr)) ∧
           annealCall [.scalar sc₁] s.frame.locals =
-            intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.scalar r) ∧
+            writeIntrinsicReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.scalar r) ∧
           Miri.Interpreter.Intrinsics.eval
             (annealIntrinsicHooks body.localDecls body.layouts) ()
             k.name #[encodeTyId { kind := argKind, layoutIdx := 0 }]
@@ -1575,11 +1627,11 @@ theorem step_intrinsic_call_one_simulation
               pure true) m')) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, _, _⟩ := id hstate
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-  rw [hanneal, miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
+  rw [hanneal, hstack, miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
     translateTerminator_intrinsic_call hterm hc]
   simp only [List.map_cons, List.map_nil]
   rw [controlFlow_evalTerminator_call _ _ _ rfl,
@@ -1627,10 +1679,12 @@ theorem step_intrinsic_call_one_simulation
       rcases StateRelLM3_1.write_scalar_return hstate₂ rfl hdst hdstPrim himm₂ hrelR
           tf.localsIdentity (translateTy dstDecl.ty body.layouts) targetBb with
         ⟨msgw, mw, hwa, hwm⟩ | ⟨locals', tf₄, hwa, hwm, hloc₄, hstate₄⟩
-      · rw [EStateM.bind_eq_error (hev.trans hwm), ha]
+      · rw [EStateM.bind_eq_error (hev.trans hwm), ha,
+          hstate.writeIntrinsicReturn_eq_intrinsicWriteReturn hframes hdst (hdstImm tf hframes)]
         simp only [intrinsicWriteReturn, hwa]
         exact .ub _ _
-      · rw [EStateM.bind_eq_ok (hev.trans hwm), ha]
+      · rw [EStateM.bind_eq_ok (hev.trans hwm), ha,
+          hstate.writeIntrinsicReturn_eq_intrinsicWriteReturn hframes hdst (hdstImm tf hframes)]
         simp only [intrinsicWriteReturn, hwa, intrinsicReturnTo, ↓reduceIte,
           Option.isSome_some]
         rw [EStateM.bind_eq_ok (annealPlaceHooks_frameIndex_eq (m := { m with stack := ⟨#[tf₄]⟩ })
@@ -1828,7 +1882,7 @@ theorem evalTerminator_stage1_bitcount_call
       [argKind] s.memory.traitImpls = none) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁] s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         match vs with
         | .scalar sc :: .nil =>
@@ -1848,7 +1902,7 @@ theorem evalTerminator_stage1_bitcount_call
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
   cases evalOperands s.frame.locals [op₁] s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
+      s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
     simp only [hcallee]
     cases op <;> rfl
@@ -1870,7 +1924,7 @@ theorem evalTerminator_stage1_saturating_call
       s.memory.traitImpls = none) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         match vs with
         | .scalar lhs :: .scalar rhs :: .nil =>
@@ -1884,7 +1938,7 @@ theorem evalTerminator_stage1_saturating_call
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
   cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
+      s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
     simp only [hcallee]
     rcases hsat with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;>
@@ -1908,13 +1962,13 @@ theorem evalTerminator_stage1_exactDiv_call
       [ty.kind] s.memory.traitImpls = none) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         match vs with
         | .scalar lhs :: .scalar rhs :: .nil =>
           match evalExactDiv lhs rhs kind.signed with
           | .some retScalar =>
-            intrinsicWriteReturn s locals' ⟨dstIdx, []⟩ targetBb (.scalar retScalar)
+            writeIntrinsicReturn s locals' ⟨dstIdx, []⟩ targetBb (.scalar retScalar)
           | .none => MirStepNode.fail .ub
         | _ => MirStepNode.fail .ub
       | .ub => MirStepNode.fail .ub
@@ -1923,7 +1977,7 @@ theorem evalTerminator_stage1_exactDiv_call
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
   cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
+      s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
     simp only [hcallee]
     dsimp only [isDirectExactDivTarget, AnnealIntrinsic.defPath, stringEq, listByteEq,
@@ -1961,7 +2015,7 @@ theorem evalTerminator_stage1_unclassified_call_extCall
       s.memory.traitImpls = none) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         MirStepNode.extCall
           { defPath := defPath, typeArgs := typeArgs, args := vs, memory := s.memory }
@@ -1972,7 +2026,7 @@ theorem evalTerminator_stage1_unclassified_call_extCall
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
   cases evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
+      s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
     simp only [hcallee]
     dsimp only [isDirectExactDivTarget]
@@ -2030,7 +2084,7 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
       s.memory.traitImpls = none) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         MirStepNode.extCall
           { defPath := k.defPath, typeArgs := [argKind], args := vs, memory := s.memory }
@@ -2081,7 +2135,7 @@ theorem stepMirFn_stage1_std_offset_alias_extCall
       s.memory.traitImpls = none) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         MirStepNode.extCall
           { defPath := defPath, typeArgs := [argKind], args := vs, memory := s.memory }
@@ -2622,7 +2676,7 @@ theorem evalTerminator_stage1_wrappingAdd_call
       [argKind] s.memory.traitImpls = none) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         match vs with
         | .scalar lhs :: .scalar rhs :: .nil =>
@@ -2634,7 +2688,7 @@ theorem evalTerminator_stage1_wrappingAdd_call
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
   cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
+      s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
     simp only [hcallee]
     rfl

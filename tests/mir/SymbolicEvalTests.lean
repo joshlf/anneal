@@ -515,21 +515,35 @@ def writeAndReadMutMir : CapturedMir :=
         terminator := mkTerm .return_
         isCleanup := false } ]
 
+/--
+Caller-owned backing slot for `hdr: &mut u8` (`targetLocal := 3 ≥ 3 = length locals`
+of `writeAndReadMutMir`, addressed via `Memory.callerLocals` at root depth `0`).
+Under `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC`, a function-entry protector (`protector := some 1`,
+`activeProtectors := [1]`) on a local of the returning frame (`targetLocal < 3`)
+rightly faults with `.ub` on `Return`; placing `*hdr`'s referent in the caller's
+frame matches real Rust `&mut u8` semantics and lets `post` certify the mutated
+caller slot value.
+-/
 def activeMutBorrowEntry : BorrowEntry where
   tag := 1
   perm := .active
-  targetLocal := 2
+  targetLocal := 3
   targetProjection := []
   protector := some 1
   rangeOffset := 0
   rangeLen := 1
 
-def activeMutMem : Memory :=
+def activeMutMemWith (v : Nat) : Memory :=
   { emptyMemory with
     borrows := [activeMutBorrowEntry]
     nextTag := 2
     activeProtectors := [1]
-    nextProtector := 2 }
+    nextProtector := 2
+    callerLocals :=
+      [ .dead, .dead, .dead
+      , .init (.scalar { bits := v, sizeBytes := 1 }) ] }
+
+def activeMutMem : Memory := activeMutMemWith 0
 
 def writeAndReadMutSymClaim : StatefulClaim where
   body := writeAndReadMutMir
@@ -540,18 +554,18 @@ def writeAndReadMutSymClaim : StatefulClaim where
               .scalar { bits := v, sizeBytes := 1 }] ∧
       mem = activeMutMem
   post args _ ret mem' :=
-    (∀ v : Nat,
+    ∀ v : Nat,
       args = [.ptr { allocId := 1, offsetBytes := 0 } 8,
               .scalar { bits := v, sizeBytes := 1 }] →
-      ret = .scalar { bits := v, sizeBytes := 1 }) ∧
-    mem' = activeMutMem
+      ret = .scalar { bits := v, sizeBytes := 1 } ∧
+      mem' = activeMutMemWith v
 
 /-- Fuel-free symbolic stateful verification for ALL `256` values of `ver: u8`. -/
 theorem writeAndReadMutSymClaim_verified :
     StatefulVerificationResult writeAndReadMutSymClaim := by
   refine verifyStatefulMirFuelFree writeAndReadMutSymClaim ?_
-  rintro _ _ ⟨v, hv, rfl, rfl⟩ _ _ ⟨⟩
-  exact ⟨by rintro _ ⟨⟩; rfl, rfl⟩
+  rintro _ _ ⟨v, hv, rfl, rfl⟩ _ _ ⟨⟩ _ ⟨⟩
+  exact ⟨rfl, rfl⟩
 
 def writeAndReadMutPinnedClaim : StatefulClaim where
   body := writeAndReadMutMir
@@ -560,7 +574,7 @@ def writeAndReadMutPinnedClaim : StatefulClaim where
             .scalar { bits := 42, sizeBytes := 1 }] ∧
     mem = activeMutMem
   post _ _ ret mem' :=
-    ret = .scalar { bits := 42, sizeBytes := 1 } ∧ mem' = activeMutMem
+    ret = .scalar { bits := 42, sizeBytes := 1 } ∧ mem' = activeMutMemWith 42
 
 /-- Concrete pinned stateful verification via `dischargeStatefulEqFuelFree` + `⟨rfl, rfl⟩`. -/
 theorem writeAndReadMutPinnedClaim_verified :
@@ -618,11 +632,8 @@ theorem not_uncheckedOverflowTotalClaim_holds :
     ⟨⟨200, 100, by decide, by decide, rfl⟩, rfl⟩
 
 def frozenBorrowMem : Memory :=
-  { emptyMemory with
-    borrows := [{ activeMutBorrowEntry with perm := .frozen }]
-    nextTag := 2
-    activeProtectors := [1]
-    nextProtector := 2 }
+  { activeMutMem with
+    borrows := [{ activeMutBorrowEntry with perm := .frozen }] }
 
 def frozenWriteStatefulClaim : StatefulClaim where
   body := writeAndReadMutMir
@@ -1673,8 +1684,11 @@ def polyIdClaimFor (typeArgs : TypeSubst) : Claim where
   body := polyIdMir.instantiate typeArgs
   pre args :=
     ∃ v : Value, args = [v] ∧
+      -- Typed loads (`Operand.move`) validate `bool` (`0`/`1`) and `char`
+      -- (4-byte Unicode scalar value, `DIV-LM-RAW-OVERWRITE-CHAR-COPY`).
       (match typeArgs with
       | [(.bool, _)] => v = .scalar { bits := 0, sizeBytes := 1 } ∨ v = .scalar { bits := 1, sizeBytes := 1 }
+      | [(.char, _)] => ∃ sc : ScalarInt, v = .scalar sc ∧ sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true
       | _ => True)
   post args ret := args = [ret]
 
@@ -1700,6 +1714,37 @@ theorem polyId_all_typeArgs_verified :
       cases t
       case bool =>
         rcases hv with rfl | rfl <;> rfl
+      case char =>
+        rcases hv with ⟨⟨bits, _⟩, rfl, rfl, h_char⟩
+        unfold wpMirSym wpMirExecSym
+        rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]
+        (conv in stepMirState _ _ => whnf)
+        have h_rv :
+            evalRvalue
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).frame.locals
+              (Rvalue.instantiate polyIdMir.layouts [(.char, l)]
+                (.use (.move { local_ := 1, projection := [] })))
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).memory
+              ((initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }]
+                (polyIdClaimFor [(.char, l)]).callees).memory.activeCallee.getD
+                (polyIdClaimFor [(.char, l)]).body).localDecls
+              ((initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }]
+                (polyIdClaimFor [(.char, l)]).callees).memory.activeCallee.getD
+                (polyIdClaimFor [(.char, l)]).body).layouts =
+            match isValidCharCode bits with
+            | false => .ub
+            | true =>
+              .ok (.scalar { bits := bits, sizeBytes := 4 })
+                [.uninit, .uninit]
+                (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                  [.scalar { bits := bits, sizeBytes := 4 }]
+                  (polyIdClaimFor [(.char, l)]).callees).memory := rfl
+        rw [h_rv, h_char]
+        rfl
       all_goals rfl
 
 /--
@@ -1794,6 +1839,309 @@ def externalSpecSliceCallerClaim : ModularClaim where
       args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }] →
       ret = .scalar { bits := len, sizeBytes := 8 }
 
+private theorem hasProtectedWriteConflict_nil_protectors
+    (borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    hasProtectedWriteConflict borrows [] targetLocal writerTag writeProj
+      writeRangeOff writeRangeLen targetFrameDepth = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    cases hP : entry.protector <;>
+      simp [hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, hP, ih]
+
+private theorem hasFrameDeallocProtectorConflict_of_eq_nil
+    {borrows : List BorrowEntry} {prots : List Nat} {depth nLocals : Nat}
+    (h : prots = []) :
+    hasFrameDeallocProtectorConflict borrows prots depth nLocals = false := by
+  subst h
+  exact hasFrameDeallocProtectorConflict.eq_1 borrows depth nLocals
+
+private theorem hasProtectedWriteConflict_of_eq_nil
+    {borrows : List BorrowEntry} {prots : List Nat} {targetLocal : Local}
+    {writerTag : Option Nat} {writeProj : List ProjectionElem}
+    {writeRangeOff writeRangeLen targetFrameDepth : Nat}
+    (h : prots = []) :
+    hasProtectedWriteConflict borrows prots targetLocal writerTag writeProj
+      writeRangeOff writeRangeLen targetFrameDepth = false := by
+  subst h
+  exact hasProtectedWriteConflict_nil_protectors borrows targetLocal writerTag
+    writeProj writeRangeOff writeRangeLen targetFrameDepth
+
+private theorem writeReturnDestination_nil_of_eq_nil
+    {callerLocals : List LocalSlot} {mem : Memory} {dstLoc : Local}
+    {retVal : Value} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {slot : LocalSlot} {locals' : List LocalSlot}
+    (h_prots : mem.activeProtectors = [])
+    (h_get : Trusted.Sequence.get? callerLocals dstLoc = .some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_set : Trusted.Sequence.set? callerLocals dstLoc (.init retVal) = .some locals') :
+    writeReturnDestination callerLocals mem { local_ := dstLoc, projection := [] }
+      retVal localDecls layouts =
+      .ok locals'
+        { mem with
+          borrows :=
+            invalidateConflictingBorrows mem.borrows dstLoc .none
+              (Trusted.Sequence.length mem.callStack) } := by
+  unfold writeReturnDestination
+  dsimp only
+  rw [h_get]
+  cases slot with
+  | dead => exact absurd rfl h_not_dead
+  | uninit | init _ =>
+    dsimp only
+    rw [hasProtectedWriteConflict_of_eq_nil h_prots]
+    dsimp only
+    rw [h_set]
+
+private theorem evalTerminator_return_root_of_eq_nil
+    {s : MachineState} {term : Terminator} {currentBody : Option CapturedMir} {retVal : Value}
+    (h_kind : term.kind = .return_)
+    (h_ret : Trusted.Sequence.get? s.frame.locals 0 = .some (.init retVal))
+    (h_prots : s.memory.activeProtectors = [])
+    (h_stack : s.memory.callStack = []) :
+    evalTerminator s term currentBody =
+      MirStepNode.retNormal retVal
+        { s.memory with
+          borrows :=
+            disableFrameBorrows s.memory.borrows
+              (Trusted.Sequence.length s.memory.callStack)
+              (Trusted.Sequence.length s.frame.locals) } := by
+  rcases term with ⟨kind, span⟩
+  dsimp only at h_kind
+  subst h_kind
+  unfold evalTerminator
+  dsimp only
+  rw [h_ret]
+  dsimp only
+  rw [hasFrameDeallocProtectorConflict_of_eq_nil h_prots]
+  dsimp only
+  cases h_cs : s.memory.callStack with
+  | nil => rfl
+  | cons _ _ => rw [h_stack] at h_cs; nomatch h_cs
+
+private theorem evalTerminator_return_callee_nil_of_eq_nil
+    {s : MachineState} {term : Terminator} {currentBody : Option CapturedMir}
+    {retVal : Value} {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {dstLoc : Local} {slot : LocalSlot} {locals' : List LocalSlot}
+    (h_kind : term.kind = .return_)
+    (h_ret : Trusted.Sequence.get? s.frame.locals 0 = .some (.init retVal))
+    (h_prots : s.memory.activeProtectors = [])
+    (h_stack : s.memory.callStack = caller :: restStack)
+    (h_not_div : caller.isDiverging = false)
+    (h_restored : restoreCallerProtectors caller = [])
+    (h_dst : caller.destination = { local_ := dstLoc, projection := [] })
+    (h_get : Trusted.Sequence.get? caller.frame.locals dstLoc = .some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_set : Trusted.Sequence.set? caller.frame.locals dstLoc (.init retVal) = .some locals') :
+    evalTerminator s term currentBody =
+      MirStepNode.step
+        { frame :=
+            { caller.frame with
+              blockIdx := caller.returnTarget
+              stmtIdx := 0
+              locals := locals' }
+          memory :=
+            { s.memory with
+              borrows :=
+                invalidateConflictingBorrows
+                  (disableFrameBorrows s.memory.borrows
+                    (Trusted.Sequence.length s.memory.callStack)
+                    (Trusted.Sequence.length s.frame.locals))
+                  dstLoc .none (Trusted.Sequence.length restStack)
+              callStack := restStack
+              activeCallee := .some caller.callerBody
+              activeProtectors := [] } } := by
+  rcases term with ⟨kind, span⟩
+  dsimp only at h_kind
+  subst h_kind
+  unfold evalTerminator
+  dsimp only
+  rw [h_ret]
+  dsimp only
+  rw [hasFrameDeallocProtectorConflict_of_eq_nil h_prots]
+  dsimp only
+  rw [h_stack]
+  dsimp only
+  rw [h_not_div]
+  dsimp only
+  rw [h_dst]
+  rw [writeReturnDestination_nil_of_eq_nil h_restored h_get h_not_dead h_set]
+  dsimp only
+  rw [h_restored]
+
+private theorem stepMirFn_term
+    {body instBody : CapturedMir} {s : MachineState} {bb : BasicBlockData}
+    (h_ctx : s.memory.activeCallee.getD body = instBody)
+    (h_phase : instBody.phase = .runtimePostCleanup)
+    (h_bb : Trusted.Sequence.get? instBody.basicBlocks s.frame.blockIdx = .some bb)
+    (h_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = .none)
+    (h_end : (s.frame.stmtIdx == Trusted.Sequence.length bb.statements) = true) :
+    stepMirFn body s = evalTerminator s bb.terminator (.some instBody) := by
+  unfold stepMirFn
+  dsimp only
+  rw [h_ctx, h_phase, h_bb]
+  dsimp only
+  rw [h_none, h_end]
+  rfl
+
+private theorem step_modular_tau
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {s s' : MachineState} {post : MirOutcome → Prop}
+    (h : stepMirFn body s = MirStepNode.step s')
+    (h_next : wpMirExecFrameAndTraitsModularSym contract fuel body (.running s') post) :
+    wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post := by
+  unfold wpMirExecFrameAndTraitsModularSym
+  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h]
+  exact h_next
+
+private theorem step_modular_retNormal
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {s : MachineState} {v : Value} {m : Memory} {post : MirOutcome → Prop}
+    (h : stepMirFn body s = MirStepNode.retNormal v m)
+    (h_next : post (.normal (v, m))) :
+    wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post := by
+  unfold wpMirExecFrameAndTraitsModularSym
+  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h]
+  exact h_next
+
+private theorem step_noCall_tau
+    {fuel : Nat} {body : CapturedMir} {s s' : MachineState} {post : MirOutcome → Prop}
+    (h : stepMirFn body s = MirStepNode.step s')
+    (h_next : wpMirExecNoCallSym fuel body (.running s') post) :
+    wpMirExecNoCallSym (fuel + 1) body (.running s) post := by
+  unfold wpMirExecNoCallSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h]
+  exact h_next
+
+private theorem step_noCall_retNormal
+    {fuel : Nat} {body : CapturedMir} {s : MachineState} {v : Value} {m : Memory}
+    {post : MirOutcome → Prop}
+    (h : stepMirFn body s = MirStepNode.retNormal v m)
+    (h_next : post (.normal (v, m))) :
+    wpMirExecNoCallSym (fuel + 1) body (.running s) post := by
+  unfold wpMirExecNoCallSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h]
+  exact h_next
+
+private theorem step_modular_return_root
+    {contract : MirCallContract} {fuel : Nat} {body instBody : CapturedMir}
+    {s : MachineState} {bb : BasicBlockData} {retVal : Value}
+    {post : MirOutcome → Prop}
+    (h_ctx : s.memory.activeCallee.getD body = instBody)
+    (h_phase : instBody.phase = .runtimePostCleanup)
+    (h_bb : Trusted.Sequence.get? instBody.basicBlocks s.frame.blockIdx = .some bb)
+    (h_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = .none)
+    (h_end : (s.frame.stmtIdx == Trusted.Sequence.length bb.statements) = true)
+    (h_kind : bb.terminator.kind = .return_)
+    (h_ret : Trusted.Sequence.get? s.frame.locals 0 = .some (.init retVal))
+    (h_prots : s.memory.activeProtectors = [])
+    (h_stack : s.memory.callStack = [])
+    (h_next :
+      post
+        (.normal
+          (retVal,
+           { s.memory with
+             borrows :=
+               disableFrameBorrows s.memory.borrows
+                 (Trusted.Sequence.length s.memory.callStack)
+                 (Trusted.Sequence.length s.frame.locals) }))) :
+    wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post :=
+  step_modular_retNormal
+    (by
+      rw [stepMirFn_term h_ctx h_phase h_bb h_none h_end]
+      exact evalTerminator_return_root_of_eq_nil h_kind h_ret h_prots h_stack)
+    h_next
+
+private theorem step_modular_return_callee_nil
+    {contract : MirCallContract} {fuel : Nat} {body instBody : CapturedMir}
+    {s : MachineState} {bb : BasicBlockData} {retVal : Value}
+    {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {dstLoc : Local} {slot : LocalSlot} {locals' : List LocalSlot}
+    {post : MirOutcome → Prop}
+    (h_ctx : s.memory.activeCallee.getD body = instBody)
+    (h_phase : instBody.phase = .runtimePostCleanup)
+    (h_bb : Trusted.Sequence.get? instBody.basicBlocks s.frame.blockIdx = .some bb)
+    (h_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = .none)
+    (h_end : (s.frame.stmtIdx == Trusted.Sequence.length bb.statements) = true)
+    (h_kind : bb.terminator.kind = .return_)
+    (h_ret : Trusted.Sequence.get? s.frame.locals 0 = .some (.init retVal))
+    (h_prots : s.memory.activeProtectors = [])
+    (h_stack : s.memory.callStack = caller :: restStack)
+    (h_not_div : caller.isDiverging = false)
+    (h_restored : restoreCallerProtectors caller = [])
+    (h_dst : caller.destination = { local_ := dstLoc, projection := [] })
+    (h_get : Trusted.Sequence.get? caller.frame.locals dstLoc = .some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_set : Trusted.Sequence.set? caller.frame.locals dstLoc (.init retVal) = .some locals')
+    (h_next :
+      wpMirExecFrameAndTraitsModularSym contract fuel body
+        (.running
+          { frame :=
+              { caller.frame with
+                blockIdx := caller.returnTarget
+                stmtIdx := 0
+                locals := locals' }
+            memory :=
+              { s.memory with
+                borrows :=
+                  invalidateConflictingBorrows
+                    (disableFrameBorrows s.memory.borrows
+                      (Trusted.Sequence.length s.memory.callStack)
+                      (Trusted.Sequence.length s.frame.locals))
+                    dstLoc .none (Trusted.Sequence.length restStack)
+                callStack := restStack
+                activeCallee := .some caller.callerBody
+                activeProtectors := [] } })
+        post) :
+    wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post :=
+  step_modular_tau
+    (by
+      rw [stepMirFn_term h_ctx h_phase h_bb h_none h_end]
+      exact evalTerminator_return_callee_nil_of_eq_nil
+        h_kind h_ret h_prots h_stack h_not_div h_restored h_dst h_get h_not_dead h_set)
+    h_next
+
+private theorem step_noCall_return_root
+    {fuel : Nat} {body instBody : CapturedMir}
+    {s : MachineState} {bb : BasicBlockData} {retVal : Value}
+    {post : MirOutcome → Prop}
+    (h_ctx : s.memory.activeCallee.getD body = instBody)
+    (h_phase : instBody.phase = .runtimePostCleanup)
+    (h_bb : Trusted.Sequence.get? instBody.basicBlocks s.frame.blockIdx = .some bb)
+    (h_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = .none)
+    (h_end : (s.frame.stmtIdx == Trusted.Sequence.length bb.statements) = true)
+    (h_kind : bb.terminator.kind = .return_)
+    (h_ret : Trusted.Sequence.get? s.frame.locals 0 = .some (.init retVal))
+    (h_prots : s.memory.activeProtectors = [])
+    (h_stack : s.memory.callStack = [])
+    (h_next :
+      post
+        (.normal
+          (retVal,
+           { s.memory with
+             borrows :=
+               disableFrameBorrows s.memory.borrows
+                 (Trusted.Sequence.length s.memory.callStack)
+                 (Trusted.Sequence.length s.frame.locals) }))) :
+    wpMirExecNoCallSym (fuel + 1) body (.running s) post :=
+  step_noCall_retNormal
+    (by
+      rw [stepMirFn_term h_ctx h_phase h_bb h_none h_end]
+      exact evalTerminator_return_root_of_eq_nil h_kind h_ret h_prots h_stack)
+    h_next
+
 /--
 Kernel-checked modular verification via `verifyPolyExternalSpecWithCalleesMirSym`:
 `wpMirFrameAndTraitsModularSym` restores `callees`, `traitImpls`, and `callStack`
@@ -1822,7 +2170,39 @@ theorem externalSpecSliceCaller_verified :
   rintro (⟨retVal, memAfter⟩ | _ | _) h_post
   · rcases h_post with ⟨_, _, h_ens⟩
     obtain rfl := h_ens p len rfl
-    (conv => whnf)
+    let mem₀ : Memory :=
+      { memAfter with
+        callees := [coreSliceLenMir]
+        traitImpls := []
+        callStack := []
+        activeCallee := .none
+        activeProtectors := [] }
+    let mem₁ : Memory :=
+      { mem₀ with
+        borrows :=
+          (invalidateDirectDestWriteBorrows mem₀
+            [ .uninit
+            , .init (.ptr p 8)
+            , .init (.scalar { bits := len, sizeBytes := 8 })
+            , .uninit ]
+            { local_ := 3, projection := [] }).borrows }
+    change wpMirExecFrameAndTraitsModularSym _ 14 externalSpecSliceCallerMir
+      (.running
+        { frame :=
+            { blockIdx := 1
+              stmtIdx := 0
+              locals :=
+                [ .uninit
+                , .init (.ptr p 8)
+                , .init (.scalar { bits := len, sizeBytes := 8 })
+                , .init (.aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }]) ] }
+          memory := mem₁ }) _
+    refine step_modular_tau rfl ?_
+    refine step_modular_tau rfl ?_
+    refine step_modular_return_callee_nil
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by intro h; nomatch h) rfl ?_
+    refine step_modular_tau rfl ?_
+    refine step_modular_return_root rfl rfl rfl rfl rfl rfl rfl rfl rfl ?_
     rintro _ _ ⟨⟩ _ _ ⟨⟩
     rfl
   · exact h_post.elim
@@ -1859,6 +2239,9 @@ theorem externalSpecSliceCaller_linked_verified :
     ?_
     ?_
   · rintro ⟨defPath, typeArgs, args, memory⟩ rfl ⟨_, rfl, _, _, ⟨p, len, h_len_lt, rfl⟩⟩
+    unfold wpMirNoCallSym
+    refine step_noCall_tau rfl ?_
+    refine step_noCall_return_root rfl rfl rfl rfl rfl rfl rfl rfl rfl ?_
     refine ⟨callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs memory _ rfl,
       ⟨p, 8, len, h_len_lt, rfl⟩, ?_⟩
     rintro _ _ ⟨⟩

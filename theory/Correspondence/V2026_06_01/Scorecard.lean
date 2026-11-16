@@ -121,7 +121,8 @@ structure CorrespondenceScorecard : Prop where
        (span : String) (currentBody : Option CapturedMir),
       let bodyLayouts := match currentBody with | .some b => b.layouts | .none => emptyLayoutTable
       (∀ (sc : ScalarInt) (locals' : List LocalSlot),
-        evalOperand s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts s.memory.callerLocals =
+        evalOperand s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts
+            s.memory.callerLocals (callStack := s.memory.callStack) =
           .ok (.scalar sc) locals' →
         let target := MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrLookupSwitchTarget sc.bits targets.branches targets.otherwise
         evalTerminator s ⟨.switchInt discr targets, span⟩ currentBody =
@@ -129,7 +130,8 @@ structure CorrespondenceScorecard : Prop where
             { s with frame := { blockIdx := target, stmtIdx := 0, locals := locals' } } ∧
         toMrStackFrame { blockIdx := target, stmtIdx := 0, locals := locals' } =
           MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.MrStackFrame.jump_to_block (toMrStackFrame s.frame) target) ∧
-      (evalOperand s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts s.memory.callerLocals = .ub →
+      (evalOperand s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts
+          s.memory.callerLocals (callStack := s.memory.callStack) = .ub →
         evalTerminator s ⟨.switchInt discr targets, span⟩ currentBody = MirStepNode.fail .ub))
   /-- M4 (`L6_WholeMachine`): Universal whole-machine PC dispatch, coalgebra simulation, and `Trusted.Refinement.GuardedRefines` correspondence over `MirSemantics.Machine`. -/
   l6_whole_machine_simulation_and_refinement :

@@ -645,8 +645,8 @@ theorem evalCast_intToInt_simulation
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {op : MirAst.Operand} {srcTy dstTy : Ty}
     (dest : Miri.Interpreter.RuntimePlace AnnealProv)
-    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
-      .ok (.scalar sc) locals')
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar sc) locals')
     (hopTy : operandTy localDecls layouts op = some srcTy)
     (hsrc : srcTy.kind = .bool ∨ (∃ k, srcTy.kind = .int k) ∨ (∃ k, srcTy.kind = .uint k))
     (hdst : (∃ k, dstTy.kind = .int k) ∨ (∃ k, dstTy.kind = .uint k))
@@ -980,7 +980,7 @@ theorem step_terminator_switchInt_simulation
   unfold evalTerminator
   rw [hterm]
   dsimp only
-  rw [hbor, hcaller, hm_term]
+  rw [hbor, hcaller, hstack, hm_term]
   generalize ha_op : evalOperand s.frame.locals discr .nil s.memory.globals body.layouts .nil = aOp
     at hop_sim
   generalize hm_op : (annealEvalOperand body.localDecls body.layouts (translateOperand discr) none >>=
@@ -1362,7 +1362,7 @@ theorem step_assign_lm1_2_simulation
       have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
         unfold evalStmt; rw [hkind]; dsimp only
         unfold evalRvalue; dsimp only
-        cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, ha_lhs])
+        cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, hstack, ha_lhs])
       have hm_err : Miri.Interpreter.Step.evalStatement
           (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
           (m', .error (.undefinedBehavior msg)) := by
@@ -1385,7 +1385,7 @@ theorem step_assign_lm1_2_simulation
         have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; rw [hkind]; dsimp only
           unfold evalRvalue; dsimp only
-          cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, ha_lhs]; dsimp only; rw [ha_rhs])
+          cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, hstack, ha_lhs]; dsimp only; rw [ha_rhs])
         have hm_err : Miri.Interpreter.Step.evalStatement
             (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
             (m'', .error (.undefinedBehavior msg)) := by
@@ -1426,7 +1426,7 @@ theorem step_assign_lm1_2_simulation
             unfold evalRvalue; dsimp only
             cases bop <;> first | exact absurd rfl hbop_ne | (
               dsimp only
-              rw [hbor, hcaller, ha_lhs]
+              rw [hbor, hcaller, hstack, ha_lhs]
               dsimp only
               rw [ha_rhs]
               dsimp only
@@ -1457,7 +1457,7 @@ theorem step_assign_lm1_2_simulation
               unfold evalRvalue; dsimp only
               cases bop <;> first | exact absurd rfl hbop_ne | (
                 dsimp only
-                rw [hbor, hcaller, ha_lhs]
+                rw [hbor, hcaller, hstack, ha_lhs]
                 dsimp only
                 rw [ha_rhs]
                 dsimp only
@@ -1546,7 +1546,7 @@ theorem step_assign_lm1_2_simulation
     have ha_ub : aOp = .ub → evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
       intro hub
       unfold evalStmt; rw [hkind]
-      simp [evalRvalue, hbor, hcaller, ha_op, hub]
+      simp [evalRvalue, hbor, hcaller, hstack, ha_op, hub]
     cases hop_sim with
     | ub m' msg =>
       have hm_err : Miri.Interpreter.Step.evalStatement
@@ -1576,8 +1576,8 @@ theorem step_assign_lm1_2_simulation
       obtain ⟨sc, msc, rfl, rfl, hrel, hsz, hbool, _⟩ := himmRel.of_primitive_scalar hprim
       obtain ⟨_, hsz_src⟩ := sizeBytes_eq_of_translateTy hsrc hrel.validBytes hsz
       have hop_a : evalOperand s.frame.locals op s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals body.localDecls = .ok (.scalar sc) locals₁ := by
-        rw [hbor, hcaller]; exact ha_op
+          s.memory.callerLocals body.localDecls s.memory.callStack = .ok (.scalar sc) locals₁ := by
+        rw [hbor, hcaller, hstack]; exact ha_op
       obtain ⟨msc', hrv_ok, _, hcast, hrel'⟩ :=
         evalCast_intToInt_simulation hrel destPlace hop_a hopTy hsrc hdst hsz_src
           (fun h => (hbool h).2) rfl

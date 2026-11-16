@@ -39,6 +39,33 @@ UNTESTED_VARIANT_TEST_WORKSPACE_IMPORTS = (
     "MiniRustSpec.Correspondence.Translate",
 )
 
+# Pillar 3 divergences resolved by `*_simulation` theorems (statement-pinned in their
+# authority audit module, or in `tests/mir/MirUntestedVariantCorrespondenceTests.lean` itself).
+RESOLVED_DIVERGENCE_IDS = frozenset(
+    {
+        "DIV-MR-CALL-TARGET-LOCAL",
+        "DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL",
+        "DIV-MR-TB-TWOPHASE-DIRECT-WRITE",
+        "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC",
+        "DIV-MR-TB-UNSAFECELL-PROTECTED-IM",
+        "DIV-LM-RAW-OVERWRITE-CHAR-COPY",
+        "DIV-LM-D6-OFFSET-DISABLED-TAG",
+        "DIV-LM-ENUM-SET-DISCR-UNINIT",
+        # Episode 2: fixed by the frame-depth-aware tail-call teardown (`disableFrameBorrows`
+        # before `enterTailCalleeFrame` in `evalTailCallTerminator`).
+        "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
+    }
+)
+# Episode 2 divergences that are still live (open actionable Anneal bugs).
+OPEN_DIVERGENCE_IDS = frozenset(
+    {
+        "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
+        "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
+        "DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW",
+    }
+)
+ACTIONABLE_DIVERGENCE_COUNT = len(RESOLVED_DIVERGENCE_IDS) + len(OPEN_DIVERGENCE_IDS)
+
 # Synthetic Stage-B corpus separating Episode 1's lifted slice wide pointers from unlifted
 # unsized DSTs (8 functions; statement counts in comments).
 SLICE_VS_DST_CORPUS = """
@@ -353,45 +380,462 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
 
     def test_correspondence_divergence_switch_to_pass_detection(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)
-        self.assertGreaterEqual(divs["actionable_anneal_bugs_count"], 5)
-        ids = {d["id"] for d in divs["actionable_anneal_bugs"]}
-        self.assertIn("DIV-MR-CALL-TARGET-LOCAL", ids)
-        self.assertIn("DIV-LM-RAW-OVERWRITE-CHAR-COPY", ids)
+        self.assertEqual(divs["actionable_anneal_bugs_count"], len(OPEN_DIVERGENCE_IDS))
+        self.assertEqual(
+            sorted((d["id"], d["status"]) for d in divs["actionable_anneal_bugs"]),
+            sorted((div_id, "open") for div_id in OPEN_DIVERGENCE_IDS),
+        )
+        for d in divs["actionable_anneal_bugs"]:
+            self.assertTrue(d["live_in_source"], d["id"])
+            self.assertEqual(d["file"], suite.UNTESTED_VARIANT_TEST_FILE)
+        self.assertEqual(len(divs["resolved_correspondence_divergences"]), len(RESOLVED_DIVERGENCE_IDS))
+        resolved_ids = {d["id"] for d in divs["resolved_correspondence_divergences"]}
+        self.assertEqual(resolved_ids, RESOLVED_DIVERGENCE_IDS)
         self.assertEqual(divs["known_miri_diff_manifest_bugs"], [])
+        for d in divs["resolved_correspondence_divergences"]:
+            self.assertEqual(d["status"], "resolved")
+            self.assertFalse(d["live_in_source"])
+            self.assertTrue(d["resolution_live_in_source"], d["id"])
+            self.assertTrue(d["resolution_statement_pinned"], d["id"])
+
+        actionable_items = [
+            item
+            for item in suite.TRACKED_CORRESPONDENCE_DIVERGENCES
+            if item["category"] != "intentional_modeling_choice"
+        ]
+        self.assertEqual(len(actionable_items), ACTIONABLE_DIVERGENCE_COUNT)
+        for item in actionable_items:
+            self.assertTrue(item.get("resolution_symbol"), item["id"])
+            self.assertTrue(item["resolution_symbol"].endswith("_simulation"), item["id"])
+        n_actionable = len(actionable_items)
+
+        def write_synthetic_checkout(
+            root: Path,
+            *,
+            live_ids: set[str] = frozenset(),
+            missing_ids: set[str] = frozenset(),
+            unpinned_ids: set[str] = frozenset(),
+        ) -> None:
+            for item in actionable_items:
+                # Statement pins live in the entry's pin module (its `resolution_pin_file`,
+                # else its authority audit module), written even for `missing_ids`, whose
+                # resolution theorem itself is absent.
+                if item["id"] not in unpinned_ids:
+                    audit = root / item.get(
+                        "resolution_pin_file", suite.AUTHORITY_AUDIT_FILES[item["authority"]]
+                    )
+                    audit.parent.mkdir(parents=True, exist_ok=True)
+                    with audit.open("a", encoding="utf-8") as fh:
+                        fh.write(f"example : 0 = 0 :=\n  {item['resolution_symbol']}\n")
+                if item["id"] in missing_ids:
+                    continue
+                path = root / item.get("resolution_file", item["file"])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"theorem {item['resolution_symbol']} : 0 = 0 := rfl\n")
+                    if item["id"] in live_ids:
+                        fh.write(f"theorem {item['witness_symbol']} : 0 = 0 := rfl\n")
+
+        # Fail-closed statement-pin linkage: a resolution theorem whose statement is not
+        # locked by a non-trivial typed audit `example : <Prop> := <theorem>` pin (e.g.
+        # only listed, commented out, applied mid-term, untyped `let _ :=` / `example :=`,
+        # vacuous `: True` / wildcard `: _`, field-projected `.1`, or decoy-qualified
+        # `Scratch.<thm>`) stays actionable as `resolution_unpinned`.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, unpinned_ids={"DIV-MR-CALL-TARGET-LOCAL"})
+            mr_audit = tmp_root / suite.AUTHORITY_AUDIT_FILES["MiniRustSpec"]
+            with mr_audit.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "#assert_standard_axioms\n  callerRefMutSilentWrongLocal_simulation\n"
+                    "-- example : 0 = 0 := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : 0 = 0 := id callerRefMutSilentWrongLocal_simulation\n"
+                    "let _ := @callerRefMutSilentWrongLocal_simulation\n"
+                    "example := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : _ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : True := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : (True) := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : 0 = 0 := callerRefMutSilentWrongLocal_simulation.1\n"
+                    "example : 0 = 0 := Scratch.callerRefMutSilentWrongLocal_simulation\n"
+                    "unsafe example : 0 = 0 := callerRefMutSilentWrongLocal_simulation\n"
+                    # Self-typed pins lock nothing: the type is computed from the RHS.
+                    "example : type_of% callerRefMutSilentWrongLocal_simulation :=\n"
+                    "  callerRefMutSilentWrongLocal_simulation\n"
+                    "example : (by exact type_of% @callerRefMutSilentWrongLocal_simulation) :=\n"
+                    "  callerRefMutSilentWrongLocal_simulation\n"
+                    "example : _ ∧ _ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : ?_ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : ?m := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : ?m ∧ ?n := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : id (0 = 0) ∧ callerRefMutSilentWrongLocal_simulation = "
+                    "callerRefMutSilentWrongLocal_simulation :=\n"
+                    "  callerRefMutSilentWrongLocal_simulation\n"
+                )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-MR-CALL-TARGET-LOCAL", "resolution_unpinned")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 1)
+            with mr_audit.open("a", encoding="utf-8") as fh:
+                fh.write("example : 0 = 0 :=\n  @callerRefMutSilentWrongLocal_simulation\n")
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 0)
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable)
+
+        # A `private` (or `unsafe` / `partial`) modifier on its own line(s) before the
+        # resolution theorem still makes it module-private, so it must not count.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, missing_ids={"DIV-LM-ENUM-SET-DISCR-UNINIT"})
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "@[simp]\nprivate\n\ntheorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing")],
+            )
+
+        # Regression check: reintroducing a live `*_divergence` witness symbol in a
+        # synthetic checkout must immediately flip `actionable_anneal_bugs_count` back > 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, live_ids={"DIV-LM-RAW-OVERWRITE-CHAR-COPY"})
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 1)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "open")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 1)
+
+        # Fail-closed check: a witness that vanished WITHOUT its positive replacement
+        # theorem (bare rename / deletion) is not counted as resolved.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, missing_ids={"DIV-LM-D6-OFFSET-DISABLED-TAG"})
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 1)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 1)
+
+        # An empty checkout (all witness files missing) must not report any resolution.
+        with tempfile.TemporaryDirectory() as tmp:
+            synth_divs = suite.discover_correspondence_divergences(Path(tmp))
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], n_actionable)
+            self.assertEqual(synth_divs["resolved_correspondence_divergences"], [])
+            self.assertEqual(
+                {d["status"] for d in synth_divs["actionable_anneal_bugs"]},
+                {"resolution_missing"},
+            )
+
+        # Comment, nested block-comment, string-literal, and non-theorem (`def`) spoofing
+        # must fail closed (`resolution_missing`), while `abbrev` witness aliases and
+        # character literals (`'"'`) must be handled accurately.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={"DIV-LM-D6-OFFSET-DISABLED-TAG", "DIV-LM-ENUM-SET-DISCR-UNINIT"},
+            )
+            d6_file = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+            with d6_file.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "-- theorem step_binOp_offset_disabled_simulation : True := trivial\n"
+                    "/- outer /- theorem step_binOp_offset_disabled_simulation : True := trivial -/ -/\n"
+                    'def docStr : String := "theorem step_binOp_offset_disabled_simulation"\n'
+                    "def step_binOp_offset_disabled_simulation : Unit := ()\n"
+                )
+            lm23_file = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23_file.parent.mkdir(parents=True, exist_ok=True)
+            lm23_file.write_text(
+                "def quoteChar : Char := '\"'\n"
+                "-- Replaces theorem step_setDiscriminant_uninit_divergence\n"
+                "@[simp] theorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 1)
+
+            # Reintroducing a witness via `abbrev` must also be caught as `open`.
+            with lm23_file.open("a", encoding="utf-8") as fh:
+                fh.write("abbrev step_setDiscriminant_uninit_divergence := True\n")
+            synth_divs2 = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs2["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing"),
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "open"),
+                ],
+            )
+            state_dir = tmp_root / "state_render"
+            _, _, md = suite.run_suite_and_generate_dashboard(
+                repo_root=tmp_root, profile="census-only", state_dir=state_dir
+            )
+            self.assertIn(
+                "**missing resolution** `step_binOp_offset_disabled_simulation`", md
+            )
+
+        # Scanner robustness: namespace-qualified, same-line `... in`-prefixed, and
+        # `nonrec` / attributed witnesses are live (`open`), while a resolution that
+        # only appears after `#exit` or only under a primed name does not count.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={"DIV-LM-ENUM-SET-DISCR-UNINIT", "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC"},
+            )
+            prov = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with prov.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "theorem ProvenanceWitness.callerRefMutSilentWrongLocal_divergence : "
+                    "True := trivial\n"
+                    "set_option maxHeartbeats 400000 in theorem "
+                    "callerBorrowAcrossScalarCall_divergence : True := trivial\n"
+                )
+            ref = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean"
+            with ref.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "open Foo in\n@[reducible] nonrec def twoPhaseDirectWriteTreeBorrowsGap : "
+                    "Nat := 0\n"
+                    "theorem retagFnEntryLocalDealloc_simulation' : True := trivial\n"
+                )
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "#exit\ntheorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing"),
+                    ("DIV-MR-CALL-TARGET-LOCAL", "open"),
+                    ("DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL", "open"),
+                    ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
+                    ("DIV-MR-TB-TWOPHASE-DIRECT-WRITE", "open"),
+                ],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 5)
+
+        # Asymmetric resolution vs. witness enforcement: `private`/`unsafe`/wrong-namespace
+        # `resolution_symbol` declarations must be rejected (`resolution_missing`), whereas
+        # `local attribute [...] in`, `axiom`/`opaque`, guillemet-quoted `«...»`, and
+        # multi-line `private\ntheorem` witnesses must still be detected as `open`.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={
+                    "DIV-LM-ENUM-SET-DISCR-UNINIT",
+                    "DIV-LM-D6-OFFSET-DISABLED-TAG",
+                    "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC",
+                },
+            )
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "private theorem step_setDiscriminant_uninit_simulation : True := trivial\n"
+                "unsafe theorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            lm31 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+            with lm31.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "theorem BogusNs.step_binOp_offset_disabled_simulation : True := trivial\n"
+                    "private\ntheorem step_raw_overwritten_direct_copy_invalid_char_divergence : "
+                    "True := trivial\n"
+                )
+            ref = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean"
+            with ref.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "namespace Scratch\n"
+                    "theorem retagFnEntryLocalDealloc_simulation : True := trivial\n"
+                    "end Scratch\n"
+                    "axiom «twoPhaseDirectWriteTreeBorrowsGap» : True\n"
+                )
+            prov = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with prov.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "local attribute [simp] id in theorem "
+                    "callerBorrowAcrossScalarCall_divergence : True := trivial\n"
+                )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing"),
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing"),
+                    ("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "open"),
+                    ("DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL", "open"),
+                    ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
+                    ("DIV-MR-TB-TWOPHASE-DIRECT-WRITE", "open"),
+                ],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 6)
+
+        # Token-level Lean 4 grammar edge cases: `open Foo in private\ntheorem`,
+        # `private @[simp,\n  reducible]\ntheorem`, `section private theorem ... end`,
+        # and `section #exit\ntheorem` must NOT satisfy `resolution_symbol`, whereas
+        # same-line `namespace Foo theorem <witness> ... end Foo`, `mutual def <witness> ... end`,
+        # `#exit'` non-truncation, and `r#"\"#` raw strings must still detect witnesses as `open`.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={
+                    "DIV-LM-ENUM-SET-DISCR-UNINIT",
+                    "DIV-LM-D6-OFFSET-DISABLED-TAG",
+                    "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC",
+                    "DIV-MR-TB-UNSAFECELL-PROTECTED-IM",
+                },
+            )
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "open Foo in private\n"
+                "theorem step_setDiscriminant_uninit_simulation : 0 = 0 := rfl\n"
+                "private @[simp,\n  reducible]\n"
+                "theorem step_setDiscriminant_uninit_simulation : 0 = 0 := rfl\n",
+                encoding="utf-8",
+            )
+            lm31 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+            with lm31.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "section private theorem step_binOp_offset_disabled_simulation : "
+                    "0 = 0 := rfl end\n"
+                    "#exit'\n"
+                    "theorem step_raw_overwritten_direct_copy_invalid_char_divergence : "
+                    "0 = 0 := rfl\n"
+                )
+            ref = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean"
+            with ref.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "section #exit\n"
+                    "theorem retagFnEntryLocalDealloc_simulation : 0 = 0 := rfl\n"
+                )
+            tb = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/TbWitness.lean"
+            tb.parent.mkdir(parents=True, exist_ok=True)
+            tb.write_text(
+                "mutual def unsafeCellProtectedInteriorMut : Nat := 0 end\n",
+                encoding="utf-8",
+            )
+            prov = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with prov.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    'def rawBackslash := r#"\\"#\n'
+                    "namespace Foo theorem callerRefMutSilentWrongLocal_divergence : "
+                    "0 = 0 := rfl end Foo\n"
+                )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing"),
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing"),
+                    ("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "open"),
+                    ("DIV-MR-CALL-TARGET-LOCAL", "open"),
+                    ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
+                    ("DIV-MR-TB-UNSAFECELL-PROTECTED-IM", "open"),
+                ],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), n_actionable - 6)
 
     def test_episode2_divergences_tracked_with_live_witnesses(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)
         actionable = {d["id"]: d for d in divs["actionable_anneal_bugs"]}
+        resolved = {d["id"]: d for d in divs["resolved_correspondence_divergences"]}
         modeling = {d["id"]: d for d in divs["intentional_modeling_choices"]}
-        for div_id in (
-            "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
-            "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
-            "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
-        ):
-            self.assertIn(div_id, actionable)
-            self.assertEqual(actionable[div_id]["file"], suite.UNTESTED_VARIANT_TEST_FILE)
+        episode2 = {
+            item["id"]: item
+            for item in suite.TRACKED_CORRESPONDENCE_DIVERGENCES
+            if item["file"] == suite.UNTESTED_VARIANT_TEST_FILE
+        }
+        self.assertEqual(
+            {i for i, item in episode2.items() if item["category"] == "actionable_anneal_bug"},
+            {
+                "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
+                "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
+                "DIV-TR-TAILCALL-DANGLING-CALLER-LOCAL",
+                "DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW",
+            },
+        )
+        for div_id, item in episode2.items():
+            if item["category"] != "actionable_anneal_bug":
+                continue
+            # Resolved in the file itself, in its namespace, and statement-pinned there.
+            self.assertEqual(item["resolution_namespace"], suite.UNTESTED_VARIANT_NAMESPACE)
+            self.assertEqual(item["resolution_pin_file"], suite.UNTESTED_VARIANT_TEST_FILE)
+            if div_id in OPEN_DIVERGENCE_IDS:
+                self.assertEqual(actionable[div_id]["status"], "open")
+                self.assertTrue(actionable[div_id]["live_in_source"])
+            else:
+                self.assertIn(div_id, RESOLVED_DIVERGENCE_IDS)
+                self.assertEqual(resolved[div_id]["status"], "resolved")
+                self.assertTrue(resolved[div_id]["resolution_statement_pinned"])
         for div_id in ("MODEL-LM-TAILCALL-MODULAR-ROOT", "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"):
             self.assertIn(div_id, modeling)
             self.assertTrue(modeling[div_id]["live_in_source"])
-        # Switch-to-pass: once a witness theorem is gone (Trusted fixed), its entry resolves.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            target = root / suite.UNTESTED_VARIANT_TEST_FILE
-            target.parent.mkdir(parents=True)
-            text = (REPO_ROOT / suite.UNTESTED_VARIANT_TEST_FILE).read_text(encoding="utf-8")
-            target.write_text(
-                text.replace(
-                    "theorem opaqueCast_trusted_root_dispatch_divergence",
-                    "theorem opaqueCast_trusted_root_dispatch_erasure_commutes",
-                ),
-                encoding="utf-8",
-            )
-            fixed = suite.discover_correspondence_divergences(root)
-            self.assertIn("DIV-LM-TAILCALL-NOUNWIND-UNWIND", {d["id"] for d in fixed["actionable_anneal_bugs"]})
-            self.assertIn(
-                "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
-                {d["id"] for d in fixed["resolved_correspondence_divergences"]},
-            )
+
+        # Switch-to-pass is fail-closed: once Trusted is fixed, the witness theorem must be
+        # replaced by the registered `resolution_symbol`, declared in the file's namespace and
+        # statement-pinned there; a bare rename, a decoy namespace, or a missing pin does not
+        # resolve the entry.
+        text = (REPO_ROOT / suite.UNTESTED_VARIANT_TEST_FILE).read_text(encoding="utf-8")
+        ns_end = f"end {suite.UNTESTED_VARIANT_NAMESPACE}"
+        self.assertEqual(text.count(ns_end), 1)
+        witness = "theorem opaqueCast_trusted_root_dispatch_divergence"
+        self.assertEqual(text.count(witness), 1)
+
+        def status_after(new_text: str) -> str:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                target = root / suite.UNTESTED_VARIANT_TEST_FILE
+                target.parent.mkdir(parents=True)
+                target.write_text(new_text, encoding="utf-8")
+                fixed = suite.discover_correspondence_divergences(root)
+                by_id = {
+                    d["id"]: d
+                    for d in fixed["actionable_anneal_bugs"] + fixed["resolved_correspondence_divergences"]
+                }
+                for div_id in OPEN_DIVERGENCE_IDS - {"DIV-TR-OPAQUECAST-ROOT-DISPATCH"}:
+                    self.assertEqual(by_id[div_id]["status"], "open")
+                return by_id["DIV-TR-OPAQUECAST-ROOT-DISPATCH"]["status"]
+
+        renamed = text.replace(witness, "theorem opaqueCast_trusted_root_dispatch_simulation")
+        pin = "example : 0 = 0 := opaqueCast_trusted_root_dispatch_simulation\n"
+        self.assertEqual(
+            status_after(text.replace(witness, "theorem opaqueCast_trusted_root_dispatch_erasure_commutes")),
+            "resolution_missing",
+        )
+        self.assertEqual(status_after(renamed), "resolution_unpinned")
+        self.assertEqual(
+            status_after(renamed.replace(ns_end, f"namespace Scratch\n{pin}end Scratch\n{ns_end}")),
+            "resolution_unpinned",
+        )
+        self.assertEqual(status_after(renamed.replace(ns_end, f"{pin}{ns_end}")), "resolved")
+        decoy = (
+            "namespace Scratch\n"
+            "theorem opaqueCast_trusted_root_dispatch_simulation : 0 = 0 := rfl\n"
+            "end Scratch\n"
+            "theorem opaqueCast_trusted_root_dispatch_erasure_commutes"
+        )
+        self.assertEqual(
+            status_after(text.replace(witness, decoy).replace(ns_end, f"{pin}{ns_end}")),
+            "resolution_missing",
+        )
 
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -854,12 +1298,13 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 encoding="utf-8",
             )
             divs = suite.discover_correspondence_divergences(root)
-            resolved_ids = {d["id"] for d in divs["resolved_correspondence_divergences"]}
-            open_ids = {d["id"] for d in divs["actionable_anneal_bugs"]}
-            self.assertIn("DIV-LM-TAILCALL-NOUNWIND-UNWIND", resolved_ids)
-            self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", resolved_ids)
-            self.assertNotIn("DIV-LM-TAILCALL-NOUNWIND-UNWIND", open_ids)
-            self.assertNotIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", open_ids)
+            open_by_id = {d["id"]: d for d in divs["actionable_anneal_bugs"]}
+            # Commented-out witnesses are not live, and without their pinned `*_simulation`
+            # replacements the entries fail closed as `resolution_missing` (not `resolved`).
+            for div_id in ("DIV-LM-TAILCALL-NOUNWIND-UNWIND", "DIV-TR-OPAQUECAST-ROOT-DISPATCH"):
+                self.assertFalse(open_by_id[div_id]["live_in_source"])
+                self.assertEqual(open_by_id[div_id]["status"], "resolution_missing")
+            self.assertEqual(divs["resolved_correspondence_divergences"], [])
             by_id = {d["id"]: d for d in divs["intentional_modeling_choices"]}
             self.assertTrue(by_id["MODEL-LM-TAILCALL-MODULAR-ROOT"]["live_in_source"])
             self.assertFalse(by_id["MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"]["live_in_source"])

@@ -8,6 +8,7 @@ import Trusted.Rustc.V2026_06_01.MirAst.Terminators
 import Trusted.Rustc.V2026_06_01.MirAst.Body
 import Trusted.Rustc.V2026_06_01.MirSemantics.State
 import Trusted.Rustc.V2026_06_01.MirSemantics.Places
+import Trusted.Rustc.V2026_06_01.MirSemantics.Statements
 
 namespace Trusted.Rustc.V2026_06_01.MirSemantics
 
@@ -333,6 +334,7 @@ def resolveCallTarget
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
+        (callStack := s.memory.callStack)
     with
     | .ub => .ub
     | .unsupported => .unsupported
@@ -469,6 +471,257 @@ def restoreCallerProtectors (caller : SavedCallerFrame) : List Nat :=
   match caller.callerProtector with
   | .some protId => protId :: caller.calleeProtectors
   | .none => caller.calleeProtectors
+
+/--
+Test whether deallocating the locals `0 .. nLocals - 1` of the frame at depth
+`depth` (the frame teardown of `TerminatorKind.return_` or of a tail call)
+conflicts with an active function-entry protector: some borrow of such a local
+is protected by `activeProtectors` and its permission prevents deallocation
+(`preventsDeallocation`, so a protected `.cell` or `.disabled` tag does not
+block; `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC`, `DIV-MR-TB-UNSAFECELL-PROTECTED-IM`).
+The check runs before the returning frame's protectors are released.
+Definitionally `false` when no protector is active.
+
+Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/memory.md#L209-L215>
+
+> "// Check that allocation is not strongly protected.
+> if extra.root.contains_strong_protector_preventing_deallocation() {
+>     throw_ub!("Tree Borrows: deallocating strongly protected allocation")
+> }"
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "At any point during the execution of a function, each local is either
+> allocated or unallocated."
+-/
+def hasFrameDeallocProtectorConflict
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (depth nLocals : Nat) :
+    Bool :=
+  match activeProtectors with
+  | .nil => false
+  | _ :: _ =>
+    match borrows with
+    | .nil => false
+    | entry :: rest =>
+      match
+        Bool.and
+          (Bool.and
+            (Nat.beq entry.targetFrameDepth depth)
+            (Nat.blt entry.targetLocal nLocals))
+          (Bool.and
+            (isBorrowProtected activeProtectors entry)
+            (preventsDeallocation entry.perm))
+      with
+      | true => true
+      | false => hasFrameDeallocProtectorConflict rest activeProtectors depth nLocals
+
+/--
+Disable every borrow of a local `0 .. nLocals - 1` of the frame at depth `depth`
+(`perm := .disabled`, `allocDead := true`): the frame's locals are deallocated
+when it returns (or is replaced by a tail call), so every tag minted from them
+becomes dangling (`DIV-MR-TB-FNENTRY-LOCAL-DEALLOC`). Borrows of other frames,
+and caller-owned referents of the root frame (`targetLocal ≥ nLocals`), are
+unchanged.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "At any point during the execution of a function, each local is either
+> allocated or unallocated."
+-/
+def disableFrameBorrows
+    (borrows : List BorrowEntry)
+    (depth nLocals : Nat) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | entry :: rest =>
+    match
+      Bool.and
+        (Nat.beq entry.targetFrameDepth depth)
+        (Nat.blt entry.targetLocal nLocals)
+    with
+    | true =>
+      { entry with perm := .disabled, allocDead := true } ::
+        disableFrameBorrows rest depth nLocals
+    | false => entry :: disableFrameBorrows rest depth nLocals
+
+/--
+Disable every borrow of a local of a frame deeper than `depth`
+(`targetFrameDepth > depth`): used when unwinding pops every frame above the
+caller frame at depth `depth` that catches the unwind, so tags minted from the
+popped frames' locals become dangling.
+-/
+def disableFramesAbove
+    (borrows : List BorrowEntry)
+    (depth : Nat) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | entry :: rest =>
+    match Nat.blt depth entry.targetFrameDepth with
+    | true =>
+      { entry with perm := .disabled, allocDead := true } :: disableFramesAbove rest depth
+    | false => entry :: disableFramesAbove rest depth
+
+/--
+Write the returned value `retVal` to the caller's `destination` after the callee
+frame was popped (`caller` is the active frame with locals `callerLocals`, and
+`mem` already has the caller's `callStack` and restored protectors): the write
+behaves like the assignment `destination = move _0` in the caller. A whole
+local or a field projection of the caller is written with the protector check
+(`hasProtectedWriteConflict`) and the foreign-write transition
+(`invalidateConflictingBorrows` / `invalidateConflictingBorrowsAtProj`) scoped
+to the caller's depth `length mem.callStack`; a projection into an
+uninitialized local writes into its default field shell
+(`uninitFieldWriteShell?`); a dereferencing destination goes through
+`evalPlaceWrite` and `invalidateDerefWriteBorrowsWithLayouts`, or
+`foreignFrameDerefWrite` when it targets another frame.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L819>
+
+> "/// Returns from the function.
+> ///
+> /// Like function calls, the exact semantics of returns in Rust are unclear.
+> /// Returning very likely at least assigns the value currently in the return
+> /// place (`_0`) to the place specified in the associated `Call` terminator
+> /// in the calling function, as if assigned via `dest = move _0`."
+-/
+def writeReturnDestination
+    (callerLocals : List LocalSlot)
+    (mem : Memory)
+    (dst : Place)
+    (retVal : Value)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    FrameWriteResult :=
+  let depth := length mem.callStack
+  match dst.projection with
+  | .nil =>
+    match get? callerLocals dst.local_ with
+    | .some .dead => .ub
+    | .some _ =>
+      match
+        hasProtectedWriteConflict
+          mem.borrows
+          mem.activeProtectors
+          dst.local_
+          .none
+          .nil
+          0
+          0
+          depth
+      with
+      | true => .ub
+      | false =>
+        match set? callerLocals dst.local_ (.init retVal) with
+        | .some locals' =>
+          .ok locals'
+            { mem with
+              borrows := invalidateConflictingBorrows mem.borrows dst.local_ .none depth }
+        | .none => .ub
+    | .none => .ub
+  | .deref :: restProj =>
+    match
+      evalPlaceWrite
+        callerLocals
+        mem.borrows
+        dst
+        retVal
+        mem.activeProtectors
+        localDecls
+        layouts
+        mem.callStack
+    with
+    | .ok locals' =>
+      match
+        Bool.or
+          (derefWriteTreeUB callerLocals mem.borrows dst)
+          (derefWriteUnionProtectorUB
+            localDecls
+            layouts
+            callerLocals
+            mem.borrows
+            mem.activeProtectors
+            dst
+            restProj
+            mem.callStack)
+      with
+      | true => .ub
+      | false =>
+        .ok locals'
+          { mem with
+            borrows :=
+              invalidateDerefWriteBorrowsWithLayouts
+                localDecls
+                layouts
+                callerLocals
+                mem.borrows
+                dst
+                restProj
+                mem.callStack }
+    | .ub => foreignFrameDerefWrite callerLocals mem dst restProj retVal localDecls layouts
+    | .unsupported => .unsupported
+  | proj :: rest =>
+    let resolvedLocalProj :=
+      resolveBorrowWriteLocalProj localDecls layouts callerLocals dst.local_ (proj :: rest)
+    match
+      hasProtectedWriteConflict
+        mem.borrows
+        mem.activeProtectors
+        dst.local_
+        .none
+        resolvedLocalProj
+        0
+        0
+        depth
+    with
+    | true => .ub
+    | false =>
+      let rootOpt : Option Value :=
+        match get? callerLocals dst.local_ with
+        | .some (.init rootVal) => .some (ensureNestedFieldShells rootVal (proj :: rest))
+        | .some .uninit => uninitFieldWriteShell? localDecls layouts dst.local_ proj rest
+        | _ => .none
+      match rootOpt with
+      | .none => .ub
+      | .some rootVal =>
+        match
+          writeProjectedForLocal
+            callerLocals
+            localDecls
+            layouts
+            dst.local_
+            rootVal
+            (proj :: rest)
+            retVal
+        with
+        | .ok rootVal' =>
+          match set? callerLocals dst.local_ (.init rootVal') with
+          | .some locals' =>
+            .ok locals'
+              { mem with
+                borrows :=
+                  invalidateConflictingBorrowsAtProj
+                    mem.borrows
+                    dst.local_
+                    .none
+                    resolvedLocalProj
+                    0
+                    0
+                    depth }
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
 
 /--
 Push a `SavedCallerFrame` onto `s.memory.callStack` and enter `calleeBody` at
@@ -649,7 +902,10 @@ def unwindFromCallStack : List SavedCallerFrame → Memory → MirExecState
           blockIdx := cleanupBb
           stmtIdx := 0
         }
-        memory := memCaller
+        memory := {
+          memCaller with
+          borrows := disableFramesAbove memCaller.borrows (length restStack)
+        }
       }
 
 /--
@@ -692,6 +948,42 @@ def applyUnwindAction
     }
 
 /--
+Update `mem.borrows` after a direct (non-deref) destination write to `dst` in
+the active frame (`depth = length mem.callStack`), leaving `mem` syntactically
+unchanged when `mem.borrows = .nil` or `dst.projection = .deref :: _`.
+-/
+@[reducible]
+def invalidateDirectDestWriteBorrows
+    (mem : Memory)
+    (locals : List LocalSlot)
+    (dst : Place) :
+    Memory :=
+  match mem.borrows with
+  | .nil => mem
+  | bHead :: bTail =>
+    let borrows := bHead :: bTail
+    let depth := length mem.callStack
+    match dst.projection with
+    | .nil =>
+      { mem with borrows := invalidateConflictingBorrows borrows dst.local_ .none depth }
+    | .deref :: _ => mem
+    | proj :: rest =>
+      let resolvedLocalProj :=
+        match resolveBorrowProjectionElems locals (proj :: rest) with
+        | .some rp => rp
+        | .none => proj :: rest
+      { mem with
+        borrows :=
+          invalidateConflictingBorrowsAtProj
+            borrows
+            dst.local_
+            .none
+            resolvedLocalProj
+            0
+            0
+            depth }
+
+/--
 Resume after an external `TerminatorKind.call` response `ans : MirCallAns`,
 writing `retVal` to `destination` and updating `Memory` on normal return, or
 dispatching `unwind` / `.abort` on abnormal return.
@@ -706,25 +998,83 @@ def resumeExternalCall
     MirExecState :=
   match ans with
   | .returned retVal memAfter =>
-    match
-      writePlaceValue
-        localsAfterArgs
-        memAfter.borrows
-        destination
-        retVal
-    with
-    | .ok updatedLocals =>
-      .running {
-        frame := {
-          s.frame with
-          blockIdx := targetBb
-          stmtIdx := 0
-          locals := updatedLocals
+    match destination.projection with
+    | .deref :: restProj =>
+      match
+        evalPlaceWrite
+          localsAfterArgs
+          memAfter.borrows
+          destination
+          retVal
+          memAfter.activeProtectors
+          .nil
+          emptyLayoutTable
+          memAfter.callStack
+      with
+      | .ok updatedLocals =>
+        match derefWriteTreeUB localsAfterArgs memAfter.borrows destination with
+        | true => .faulted .ub
+        | false =>
+          let borrows' :=
+            invalidateDerefWriteBorrows
+              localsAfterArgs
+              memAfter.borrows
+              destination
+              restProj
+              memAfter.callerLocals
+              memAfter.callStack
+          .running {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := { memAfter with borrows := borrows' }
+          }
+      | .ub =>
+        match foreignFrameDerefWrite localsAfterArgs memAfter destination restProj retVal with
+        | .ok updatedLocals mem' =>
+          .running {
+            frame := {
+              s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := updatedLocals
+            }
+            memory := mem'
+          }
+        | .ub => .faulted .ub
+        | .unsupported => .faulted .unsupported
+      | .unsupported => .faulted .unsupported
+    | _ =>
+      match
+        evalPlaceWrite
+          localsAfterArgs
+          memAfter.borrows
+          destination
+          retVal
+          memAfter.activeProtectors
+          .nil
+          emptyLayoutTable
+          memAfter.callStack
+      with
+      | .ok updatedLocals =>
+        .running {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
+          }
+          memory := {
+            memAfter with
+            borrows :=
+              (invalidateDirectDestWriteBorrows memAfter localsAfterArgs destination).borrows
+          }
         }
-        memory := memAfter
-      }
-    | .ub => .faulted .ub
-    | .unsupported => .faulted .unsupported
+      | .ub => .faulted .ub
+      | .unsupported => .faulted .unsupported
   | .panicked memAfter =>
     applyUnwindAction s localsAfterArgs memAfter unwind
   | .aborted => .halted .abort
@@ -773,15 +1123,23 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
       match caller.isDiverging with
       | true => .faulted .ub
       | false =>
+        let restoredProtectors := restoreCallerProtectors caller
+        let callerMem : Memory := {
+          memAfter with
+          callStack := restStack
+          activeCallee := .some caller.callerBody
+          activeProtectors := restoredProtectors
+        }
         match
-          writePlaceValue
+          writeReturnDestination
             caller.frame.locals
-            memAfter.borrows
+            callerMem
             caller.destination
             retVal
+            caller.callerBody.localDecls
+            caller.callerBody.layouts
         with
-        | .ok updatedCallerLocals =>
-          let restoredProtectors := restoreCallerProtectors caller
+        | .ok updatedCallerLocals mem' =>
           .running {
             frame := {
               caller.frame with
@@ -789,12 +1147,7 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
               stmtIdx := 0
               locals := updatedCallerLocals
             }
-            memory := {
-              memAfter with
-              callStack := restStack
-              activeCallee := .some caller.callerBody
-              activeProtectors := restoredProtectors
-            }
+            memory := mem'
           }
         | .ub => .faulted .ub
         | .unsupported => .faulted .unsupported
@@ -1894,19 +2247,76 @@ def writeIntrinsicReturn
     (targetBb : BasicBlockIdx)
     (retVal : Value) :
     MirStepNode :=
-  match writePlaceValue locals' s.memory.borrows destination retVal with
-  | .ok updatedLocals =>
-    MirStepNode.step {
-      frame := {
-        s.frame with
-        blockIdx := targetBb
-        stmtIdx := 0
-        locals := updatedLocals
+  match destination.projection with
+  | .deref :: restProj =>
+    match
+      evalPlaceWrite
+        locals'
+        s.memory.borrows
+        destination
+        retVal
+        s.memory.activeProtectors
+        .nil
+        emptyLayoutTable
+        s.memory.callStack
+    with
+    | .ok updatedLocals =>
+      match derefWriteTreeUB locals' s.memory.borrows destination with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let borrows' :=
+          invalidateDerefWriteBorrows
+            locals'
+            s.memory.borrows
+            destination
+            restProj
+            s.memory.callerLocals
+            s.memory.callStack
+        MirStepNode.step {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
+          }
+          memory := { s.memory with borrows := borrows' }
+        }
+    | .ub =>
+      match foreignFrameDerefWrite locals' s.memory destination restProj retVal with
+      | .ok updatedLocals mem' =>
+        MirStepNode.step {
+          frame := {
+            s.frame with
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := updatedLocals
+          }
+          memory := mem'
+        }
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+    | .unsupported => MirStepNode.unsupported
+  | _ =>
+    match
+      writePlaceValue
+        locals'
+        s.memory.borrows
+        destination
+        retVal
+        (callStack := s.memory.callStack)
+    with
+    | .ok updatedLocals =>
+      MirStepNode.step {
+        frame := {
+          s.frame with
+          blockIdx := targetBb
+          stmtIdx := 0
+          locals := updatedLocals
+        }
+        memory := invalidateDirectDestWriteBorrows s.memory locals' destination
       }
-      memory := s.memory
-    }
-  | .ub => MirStepNode.fail .ub
-  | .unsupported => MirStepNode.unsupported
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
 
 /--
 Write an optional scalar intrinsic result `resOpt` to `destination` and advance
@@ -2780,6 +3190,7 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
+          (callStack := s.memory.callStack)
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -2833,6 +3244,7 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
+          (callStack := s.memory.callStack)
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -2870,19 +3282,7 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
                 | .nil => false
               match evalExactDiv lhs rhs isSigned with
               | .some retScalar =>
-                match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-                | .ok updatedLocals =>
-                  MirStepNode.step {
-                    frame := {
-                      s.frame with
-                      blockIdx := targetBb
-                      stmtIdx := 0
-                      locals := updatedLocals
-                    }
-                    memory := s.memory
-                  }
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
+                writeIntrinsicReturn s locals' destination targetBb (.scalar retScalar)
               | .none => MirStepNode.fail .ub
             | _ => MirStepNode.unsupported
           | false =>
@@ -2929,20 +3329,35 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
+        (callStack := s.memory.callStack)
     with
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
     | .ok argVals _ =>
-      match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
-      | .some calleeBody =>
-        match checkCalleeTargetCompatible target calleeBody (length argVals) with
-        | false => MirStepNode.fail .ub
-        | true =>
-          MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals)
-      | .none =>
-        MirStepNode.extCall
-          { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-          resumeExternalTailCall
+      let depth := length s.memory.callStack
+      let nLocals := length s.frame.locals
+      match
+        hasFrameDeallocProtectorConflict
+          s.memory.borrows
+          s.memory.activeProtectors
+          depth
+          nLocals
+      with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let memAfterTeardown : Memory :=
+          { s.memory with borrows := disableFrameBorrows s.memory.borrows depth nLocals }
+        match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible target calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            MirStepNode.step (enterTailCalleeFrame memAfterTeardown calleeBody argVals)
+        | .none =>
+          MirStepNode.extCall
+            { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals,
+              memory := memAfterTeardown }
+            resumeExternalTailCall
 
 /--
 Evaluate basic-block `Terminator` `term` in `s`, producing the next
@@ -2985,6 +3400,7 @@ def evalTerminator
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
+        (callStack := s.memory.callStack)
     with
     | .ok (.scalar sc) locals' =>
       let target :=
@@ -3005,37 +3421,53 @@ def evalTerminator
   | .return_ =>
     match get? s.frame.locals 0 with
     | .some (.init retVal) =>
-      match s.memory.callStack with
-      | .nil => MirStepNode.retNormal retVal s.memory
-      | caller :: restStack =>
-        match caller.isDiverging with
-        | true => MirStepNode.fail .ub
-        | false =>
-          match
-            writePlaceValue
-              caller.frame.locals
-              s.memory.borrows
-              caller.destination
-              retVal
-          with
-          | .ok updatedCallerLocals =>
+      let depth := length s.memory.callStack
+      let nLocals := length s.frame.locals
+      match
+        hasFrameDeallocProtectorConflict
+          s.memory.borrows
+          s.memory.activeProtectors
+          depth
+          nLocals
+      with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let borrows₁ := disableFrameBorrows s.memory.borrows depth nLocals
+        match s.memory.callStack with
+        | .nil => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
+        | caller :: restStack =>
+          match caller.isDiverging with
+          | true => MirStepNode.fail .ub
+          | false =>
             let restoredProtectors := restoreCallerProtectors caller
-            MirStepNode.step {
-              frame := {
-                caller.frame with
-                blockIdx := caller.returnTarget
-                stmtIdx := 0
-                locals := updatedCallerLocals
-              }
-              memory := {
-                s.memory with
-                callStack := restStack
-                activeCallee := .some caller.callerBody
-                activeProtectors := restoredProtectors
-              }
+            let callerMem : Memory := {
+              s.memory with
+              borrows := borrows₁
+              callStack := restStack
+              activeCallee := .some caller.callerBody
+              activeProtectors := restoredProtectors
             }
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
+            match
+              writeReturnDestination
+                caller.frame.locals
+                callerMem
+                caller.destination
+                retVal
+                caller.callerBody.localDecls
+                caller.callerBody.layouts
+            with
+            | .ok updatedCallerLocals mem' =>
+              MirStepNode.step {
+                frame := {
+                  caller.frame with
+                  blockIdx := caller.returnTarget
+                  stmtIdx := 0
+                  locals := updatedCallerLocals
+                }
+                memory := mem'
+              }
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .unreachable => MirStepNode.fail .ub
   | .drop place target _ =>
@@ -3089,6 +3521,7 @@ def evalTerminator
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
+          (callStack := s.memory.callStack)
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -3127,19 +3560,7 @@ def evalTerminator
               | .some isSigned =>
                 match evalExactDiv lhs rhs isSigned with
                 | .some retScalar =>
-                  match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-                  | .ok updatedLocals =>
-                    MirStepNode.step {
-                      frame := {
-                        s.frame with
-                        blockIdx := targetBb
-                        stmtIdx := 0
-                        locals := updatedLocals
-                      }
-                      memory := s.memory
-                    }
-                  | .ub => MirStepNode.fail .ub
-                  | .unsupported => MirStepNode.unsupported
+                  writeIntrinsicReturn s locals' destination targetBb (.scalar retScalar)
                 | .none => MirStepNode.fail .ub
             | _ => MirStepNode.fail .ub
           | false =>
@@ -3194,6 +3615,7 @@ def evalTerminator
           s.memory.globals
           bodyLayouts
           s.memory.callerLocals
+          (callStack := s.memory.callStack)
       with
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
@@ -3259,6 +3681,7 @@ def evalTerminator
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
+        (callStack := s.memory.callStack)
     with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
