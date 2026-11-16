@@ -26,16 +26,24 @@ namespace Anneal.PureLift
 End-to-end kernel-verified test suite exercising `PureLift` across:
 - **Part I (`S1`–`S7`)**: single mutable borrow (`max_assign`), two-reference
   disjoint vs. aliased entry validation (`update_min`), shared vs. mutable
-  aliasing (`shared_max`), two-phase diamond conditional reborrows
-  (`two_phase_reborrow`), borrow-returning functions and lawful backward lenses
-  (`choose_mut`), constructive loops (`count_up`), and modular call composition
-  (`double_bounded`).
+  aliasing (`shared_max`), diamond conditional reborrows
+  (`conditional_reborrow`), borrow-returning functions and lawful backward
+  lenses (`choose_mut`), constructive loops (`count_up`), and modular call
+  composition (`double_bounded`).
 - **Part II (`H1`–`H5`)**: split sibling sub-place borrows and commutative loan
   release (`H1`), multi-region-group staggered termination with outlives order
   and 3-level reborrow chains (`H2`), hybrid functional-spatial pinning and
   reabsorption (`H3`), operational bridges to machine styles `M1`, `M2`, and
   `M3` (`H4`), and nested early return plus Goodhart vacuity rejection canaries
   (`H5`).
+- **Part III**: edge cases and negative tests for `Plan`, `BlockCfg`, and
+  `Adapter` (loops, entry validation, CFG terminators, spatial bindings, and
+  branch joins), followed by focused suites on region-group reuse, handle
+  copies, and join shapes; region deposits, field commutation, and region
+  outputs; field joins, uninitialized locals, handles, and writeback
+  ownership; writeback checks, value returns, and explicit joins; choice
+  writebacks and uneven explicit joins; and branch-wise handle accounting and
+  correlated writebacks.
 -/
 
 /-- Size-indexed representation of `StdVal` trees where the type index records
@@ -204,43 +212,55 @@ def zipStdVal (cond vt vf : StdVal) : StdVal :=
   | some false => vf
   | none => .choice cond vt vf
 
+def projectBranchStdStep (cond : StdVal) (branch : Bool)
+    (ih : StdVal → StdVal) (v0 : StdVal) : StdVal :=
+  match v0 with
+  | ⟨_, .choice fc ft ff c vt vf⟩ =>
+    if stdValEq cond ⟨fc, c⟩ then
+      if branch then ih ⟨ft, vt⟩ else ih ⟨ff, vf⟩
+    else
+      -- The guard may itself depend on `cond`; projecting it can make it
+      -- concrete, in which case `zipStdVal` selects the arm.
+      zipStdVal (ih ⟨fc, c⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
+  | ⟨_, .pairBranch fl fr l r⟩ =>
+    .pair (ih ⟨fl, l⟩) (ih ⟨fr, r⟩)
+  | other => other
+
+def projectBranchStdFuel (cond : StdVal) (branch : Bool)
+    (k : Nat) (v : StdVal) : StdVal :=
+  natFold (fun v0 => v0)
+    (fun _ ih v0 => projectBranchStdStep cond branch ih v0) k v
+
 def projectBranchStdVal (cond : StdVal) (branch : Bool) (v : StdVal) :
     StdVal :=
   match stdAsBool cond with
   | some _ => v
-  | none =>
-    natFold
-      (fun v0 => v0)
-      (fun _ ih v0 =>
-        match v0 with
-        | ⟨_, .choice fc ft ff c vt vf⟩ =>
-          if stdValEq cond ⟨fc, c⟩ then
-            if branch then ⟨ft, vt⟩ else ⟨ff, vf⟩
-          else
-            -- The guard may itself depend on `cond`; projecting it can make it
-            -- concrete, in which case `zipStdVal` selects the arm.
-            zipStdVal (ih ⟨fc, c⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
-        | ⟨_, .pairBranch fl fr l r⟩ =>
-          .pair (ih ⟨fl, l⟩) (ih ⟨fr, r⟩)
-        | other => other)
-      v.fuel v
+  | none => projectBranchStdFuel cond branch v.fuel v
 
+/-- One step of `remapStdVal`: rename a handle to `oldLid` at the root of `v0`
+to `newLid`, and rename the children of `v0` with `ih`. -/
+def remapStdStep (oldLid newLid : LoanId) (ih : StdVal → StdVal)
+    (v0 : StdVal) : StdVal :=
+  match v0 with
+  | ⟨_, .unit⟩ => .unit
+  | ⟨_, .nat n⟩ => .nat n
+  | ⟨_, .bool b⟩ => .bool b
+  | ⟨_, .symBool b⟩ => .symBool b
+  | ⟨_, .pairBranch fl fr a b⟩ => .pair (ih ⟨fl, a⟩) (ih ⟨fr, b⟩)
+  | ⟨_, .refVal lid path⟩ =>
+    if lid == oldLid then .refVal newLid path else .refVal lid path
+  | ⟨_, .choice fc ft ff c vt vf⟩ =>
+    .choice (ih ⟨fc, c⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
+
+/-- `remapStdStep` nested `k` deep; parts of `v` deeper than `k` are left
+unchanged. -/
+def remapStdFuel (oldLid newLid : LoanId) (k : Nat) (v : StdVal) : StdVal :=
+  natFold (fun v0 => v0) (fun _ ih v0 => remapStdStep oldLid newLid ih v0) k v
+
+/-- Rename every handle to loan `oldLid` inside `v` to `newLid`. The fuel
+`v.fuel` exceeds the depth of every node of `v` (`remapStdFuel_eq`). -/
 def remapStdVal (oldLid newLid : LoanId) (v : StdVal) : StdVal :=
-  natFold
-    (fun v0 => v0)
-    (fun _ ih v0 =>
-      match v0 with
-      | ⟨_, .unit⟩ => .unit
-      | ⟨_, .nat n⟩ => .nat n
-      | ⟨_, .bool b⟩ => .bool b
-      | ⟨_, .symBool b⟩ => .symBool b
-      | ⟨_, .pairBranch fl fr a b⟩ =>
-        .pair (ih ⟨fl, a⟩) (ih ⟨fr, b⟩)
-      | ⟨_, .refVal lid path⟩ =>
-        if lid == oldLid then .refVal newLid path else .refVal lid path
-      | ⟨_, .choice fc ft ff c vt vf⟩ =>
-        .choice (ih ⟨fc, c⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩))
-    v.fuel v
+  remapStdFuel oldLid newLid v.fuel v
 
 def stdValGetField (idx : FieldIdx) (v : StdVal) : Option StdVal :=
   match idx, v with
@@ -492,13 +512,16 @@ theorem stdValTree_fuel_pos : ∀ {f : Nat} (_ : StdValTree f), 0 < f
   | _, .choice _ _ _ _ _ _ => Nat.zero_lt_succ _
 
 theorem stdVal_getField_lt_sizeBound (f : FieldIdx) (v c : StdVal)
-    (hGet : stdValGetField f v = some c) : f < v.fuel := by
+    (hGet : stdValGetField f v = some c) : f < v.fuel ∧ c.fuel < v.fuel := by
   cases v with
   | mk fv tv =>
     cases f with
     | zero =>
       cases tv with
-      | pairBranch fl fr l r => exact Nat.zero_lt_succ _
+      | pairBranch fl fr l r =>
+        injection hGet with hEq
+        subst hEq
+        exact ⟨Nat.zero_lt_succ _, Nat.lt_succ_of_le (Nat.le_add_right fl fr)⟩
       | unit => nomatch hGet
       | nat _ => nomatch hGet
       | bool _ => nomatch hGet
@@ -510,9 +533,12 @@ theorem stdVal_getField_lt_sizeBound (f : FieldIdx) (v c : StdVal)
       | zero =>
         cases tv with
         | pairBranch fl fr l r =>
-          exact Nat.succ_lt_succ
-            (Nat.lt_of_lt_of_le (stdValTree_fuel_pos l)
-              (Nat.le_add_right fl fr))
+          injection hGet with hEq
+          subst hEq
+          exact ⟨Nat.succ_lt_succ
+              (Nat.lt_of_lt_of_le (stdValTree_fuel_pos l)
+                (Nat.le_add_right fl fr)),
+            Nat.lt_succ_of_le (Nat.le_add_left fr fl)⟩
         | unit => nomatch hGet
         | nat _ => nomatch hGet
         | bool _ => nomatch hGet
@@ -520,6 +546,82 @@ theorem stdVal_getField_lt_sizeBound (f : FieldIdx) (v c : StdVal)
         | refVal _ _ => nomatch hGet
         | choice _ _ _ _ _ _ => nomatch hGet
       | succ _ => nomatch hGet
+
+theorem projectBranchStdFuel_eq (cond : StdVal) (branch : Bool) :
+    ∀ {n : Nat} (tr : StdValTree n) (k : Nat), n ≤ k →
+      projectBranchStdFuel cond branch k ⟨n, tr⟩ =
+        projectBranchStdFuel cond branch n ⟨n, tr⟩ := by
+  intro n tr
+  induction tr with
+  | unit =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | nat _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | bool _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | symBool _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | refVal _ _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | pairBranch fl fr l r ihl ihr =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fl + fr ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hL : fl ≤ fl + fr := Nat.le_add_right fl fr
+      have hR : fr ≤ fl + fr := Nat.le_add_left fr fl
+      change StdVal.pair (projectBranchStdFuel cond branch k' ⟨fl, l⟩)
+          (projectBranchStdFuel cond branch k' ⟨fr, r⟩) =
+        StdVal.pair (projectBranchStdFuel cond branch (fl + fr) ⟨fl, l⟩)
+          (projectBranchStdFuel cond branch (fl + fr) ⟨fr, r⟩)
+      rw [ihl k' (Nat.le_trans hL hSub), ihr k' (Nat.le_trans hR hSub),
+        ihl _ hL, ihr _ hR]
+  | choice fc ft ff c vt vf ihc iht ihf =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fc + ft + ff ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hC : fc ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_right fc ft) (Nat.le_add_right (fc + ft) ff)
+      have hT : ft ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff)
+      have hF : ff ≤ fc + ft + ff := Nat.le_add_left ff (fc + ft)
+      change
+        (if stdValEq cond ⟨fc, c⟩ then
+           if branch then projectBranchStdFuel cond branch k' ⟨ft, vt⟩
+           else projectBranchStdFuel cond branch k' ⟨ff, vf⟩
+         else
+           zipStdVal (projectBranchStdFuel cond branch k' ⟨fc, c⟩)
+             (projectBranchStdFuel cond branch k' ⟨ft, vt⟩)
+             (projectBranchStdFuel cond branch k' ⟨ff, vf⟩)) =
+        (if stdValEq cond ⟨fc, c⟩ then
+           if branch then
+             projectBranchStdFuel cond branch (fc + ft + ff) ⟨ft, vt⟩
+           else
+             projectBranchStdFuel cond branch (fc + ft + ff) ⟨ff, vf⟩
+         else
+           zipStdVal (projectBranchStdFuel cond branch (fc + ft + ff) ⟨fc, c⟩)
+             (projectBranchStdFuel cond branch (fc + ft + ff) ⟨ft, vt⟩)
+             (projectBranchStdFuel cond branch (fc + ft + ff) ⟨ff, vf⟩))
+      rw [ihc k' (Nat.le_trans hC hSub), iht k' (Nat.le_trans hT hSub),
+        ihf k' (Nat.le_trans hF hSub), ihc _ hC, iht _ hT, ihf _ hF]
 
 theorem stdVal_projectBranchVal_concrete (cond : StdVal) (b branch : Bool)
     (v : StdVal) (hConcrete : stdAsBool cond = some b) :
@@ -529,7 +631,8 @@ theorem stdVal_projectBranchVal_concrete (cond : StdVal) (b branch : Bool)
 
 theorem stdVal_projectBranchVal_zip_true (cond vt vf : StdVal)
     (hSym : stdAsBool cond = none) :
-    projectBranchStdVal cond true (zipStdVal cond vt vf) = vt := by
+    projectBranchStdVal cond true (zipStdVal cond vt vf) =
+      projectBranchStdVal cond true vt := by
   dsimp [projectBranchStdVal, zipStdVal]
   rw [hSym]
   cases cond with
@@ -538,15 +641,20 @@ theorem stdVal_projectBranchVal_zip_true (cond vt vf : StdVal)
     | mk ft tt =>
       cases vf with
       | mk ff tf =>
+        have hT : ft ≤ fc + ft + ff :=
+          Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff)
         change
-          (if stdValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then (⟨ft, tt⟩ : StdVal)
-           else _) = ⟨ft, tt⟩
+          (if stdValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then
+             projectBranchStdFuel ⟨fc, tc⟩ true (fc + ft + ff) ⟨ft, tt⟩
+           else _) =
+          projectBranchStdFuel ⟨fc, tc⟩ true ft ⟨ft, tt⟩
         rw [stdValEq_refl ⟨fc, tc⟩]
-        rfl
+        exact projectBranchStdFuel_eq ⟨fc, tc⟩ true tt (fc + ft + ff) hT
 
 theorem stdVal_projectBranchVal_zip_false (cond vt vf : StdVal)
     (hSym : stdAsBool cond = none) :
-    projectBranchStdVal cond false (zipStdVal cond vt vf) = vf := by
+    projectBranchStdVal cond false (zipStdVal cond vt vf) =
+      projectBranchStdVal cond false vf := by
   dsimp [projectBranchStdVal, zipStdVal]
   rw [hSym]
   cases cond with
@@ -555,11 +663,74 @@ theorem stdVal_projectBranchVal_zip_false (cond vt vf : StdVal)
     | mk ft tt =>
       cases vf with
       | mk ff tf =>
+        have hF : ff ≤ fc + ft + ff := Nat.le_add_left ff (fc + ft)
         change
-          (if stdValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then (⟨ff, tf⟩ : StdVal)
-           else _) = ⟨ff, tf⟩
+          (if stdValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then
+             projectBranchStdFuel ⟨fc, tc⟩ false (fc + ft + ff) ⟨ff, tf⟩
+           else _) =
+          projectBranchStdFuel ⟨fc, tc⟩ false ff ⟨ff, tf⟩
         rw [stdValEq_refl ⟨fc, tc⟩]
+        exact projectBranchStdFuel_eq ⟨fc, tc⟩ false tf (fc + ft + ff) hF
+
+theorem projectBranchStdVal_pair (cond : StdVal) (branch : Bool)
+    (l r : StdVal) :
+    projectBranchStdVal cond branch (.pair l r) =
+      .pair (projectBranchStdVal cond branch l)
+        (projectBranchStdVal cond branch r) := by
+  dsimp [projectBranchStdVal]
+  cases hCond : stdAsBool cond with
+  | some _ => rfl
+  | none =>
+    cases l with
+    | mk fl tl =>
+      cases r with
+      | mk fr tr =>
+        change StdVal.pair
+            (projectBranchStdFuel cond branch (fl + fr) ⟨fl, tl⟩)
+            (projectBranchStdFuel cond branch (fl + fr) ⟨fr, tr⟩) = _
+        rw [projectBranchStdFuel_eq cond branch tl _ (Nat.le_add_right fl fr),
+            projectBranchStdFuel_eq cond branch tr _ (Nat.le_add_left fr fl)]
+
+theorem stdVal_getField_projectBranchVal (cond : StdVal) (branch : Bool)
+    (f : FieldIdx) (s a : StdVal) (hGet : stdValGetField f s = some a) :
+    stdValGetField f (projectBranchStdVal cond branch s) =
+      some (projectBranchStdVal cond branch a) := by
+  cases s with
+  | mk fs ts =>
+    cases f with
+    | zero =>
+      cases ts with
+      | pairBranch fl fr l r =>
+        injection hGet with hEq
+        subst hEq
+        change stdValGetField 0
+            (projectBranchStdVal cond branch (.pair ⟨fl, l⟩ ⟨fr, r⟩)) = _
+        rw [projectBranchStdVal_pair]
         rfl
+      | unit => nomatch hGet
+      | nat _ => nomatch hGet
+      | bool _ => nomatch hGet
+      | symBool _ => nomatch hGet
+      | refVal _ _ => nomatch hGet
+      | choice _ _ _ _ _ _ => nomatch hGet
+    | succ f' =>
+      cases f' with
+      | zero =>
+        cases ts with
+        | pairBranch fl fr l r =>
+          injection hGet with hEq
+          subst hEq
+          change stdValGetField 1
+              (projectBranchStdVal cond branch (.pair ⟨fl, l⟩ ⟨fr, r⟩)) = _
+          rw [projectBranchStdVal_pair]
+          rfl
+        | unit => nomatch hGet
+        | nat _ => nomatch hGet
+        | bool _ => nomatch hGet
+        | symBool _ => nomatch hGet
+        | refVal _ _ => nomatch hGet
+        | choice _ _ _ _ _ _ => nomatch hGet
+      | succ _ => nomatch hGet
 
 /-- `StdVal` aggregates are binary `.pair` nodes, which carry no data besides
 their two fields. -/
@@ -634,24 +805,338 @@ theorem stdVal_decodeRef_getField (f : FieldIdx) (v : StdVal)
     | pairBranch _ _ _ _ => nomatch hDec
     | choice _ _ _ _ _ _ => nomatch hDec
 
-/-- Arms of a `StdVal` choice node. -/
-def stdBranchParts (v : StdVal) : List StdVal :=
+/-- Guard and arms of a `StdVal` choice node. -/
+def stdBranchSplit (v : StdVal) : Option (StdVal × StdVal × StdVal) :=
   match v with
-  | ⟨_, .choice _ ft ff _ vt vf⟩ => [⟨ft, vt⟩, ⟨ff, vf⟩]
-  | _ => []
+  | ⟨_, .choice fc ft ff c vt vf⟩ => some (⟨fc, c⟩, ⟨ft, vt⟩, ⟨ff, vf⟩)
+  | _ => none
 
-theorem stdVal_branchParts_zipVal (cond vt vf : StdVal)
+theorem stdVal_decodeRef_branchSplit (v : StdVal) (r : LoanId × SubPath)
+    (hDec : stdDecodeRef v = some r) : stdBranchSplit v = none := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | refVal _ _ => rfl
+    | unit => nomatch hDec
+    | nat _ => nomatch hDec
+    | bool _ => nomatch hDec
+    | symBool _ => nomatch hDec
+    | pairBranch _ _ _ _ => nomatch hDec
+    | choice _ _ _ _ _ _ => nomatch hDec
+
+theorem stdVal_branchSplit_zipVal (cond vt vf : StdVal)
     (hSym : stdAsBool cond = none) :
-    stdBranchParts (zipStdVal cond vt vf) = [vt, vf] := by
+    stdBranchSplit (zipStdVal cond vt vf) = some (cond, vt, vf) := by
   unfold zipStdVal
   rw [hSym]
   rfl
+
+/-- Key of a `StdVal` condition that `stdSameCond` can compare: the tag of a
+`.symBool` placeholder, the shape of every symbolic condition in this suite.
+Other conditions get no key. -/
+def stdCondKey (v : StdVal) : Option Bool :=
+  match v with
+  | ⟨_, .symBool b⟩ => some b
+  | _ => none
+
+theorem stdCondKey_eq (v : StdVal) (b : Bool) (h : stdCondKey v = some b) :
+    v = .symBool b := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | symBool b' =>
+      injection h with hb
+      subst hb
+      rfl
+    | unit => nomatch h
+    | nat _ => nomatch h
+    | bool _ => nomatch h
+    | pairBranch _ _ _ _ => nomatch h
+    | refVal _ _ => nomatch h
+    | choice _ _ _ _ _ _ => nomatch h
+
+/-- Conservative condition equality for `StdVal`: equal keys (`stdCondKey`).
+Conditions without a key are never reported equal. -/
+def stdSameCond (c1 c2 : StdVal) : Bool :=
+  match stdCondKey c1, stdCondKey c2 with
+  | some b1, some b2 => stdBoolEq b1 b2
+  | _, _ => false
+
+theorem stdVal_sameCond_eq (c1 c2 : StdVal) (h : stdSameCond c1 c2 = true) :
+    c1 = c2 := by
+  unfold stdSameCond at h
+  revert h
+  cases h1 : stdCondKey c1 with
+  | none =>
+    intro h
+    nomatch h
+  | some b1 =>
+    cases h2 : stdCondKey c2 with
+    | none =>
+      intro h
+      nomatch h
+    | some b2 =>
+      intro h
+      rw [stdCondKey_eq c1 b1 h1, stdCondKey_eq c2 b2 h2]
+      cases b1 <;> cases b2 <;> first
+        | rfl
+        | nomatch h
+
+theorem remapStdFuel_succ (oldLid newLid : LoanId) (k : Nat) (v : StdVal) :
+    remapStdFuel oldLid newLid (k + 1) v =
+      remapStdStep oldLid newLid (remapStdFuel oldLid newLid k) v :=
+  rfl
+
+/-- Any fuel at least the size of a value renames it completely. -/
+theorem remapStdFuel_eq (oldLid newLid : LoanId) :
+    ∀ {n : Nat} (tr : StdValTree n) (k : Nat), n ≤ k →
+      remapStdFuel oldLid newLid k ⟨n, tr⟩ =
+        remapStdVal oldLid newLid ⟨n, tr⟩ := by
+  intro n tr
+  induction tr with
+  | unit =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | nat _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | bool _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | symBool _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | refVal _ _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | pairBranch fl fr a b iha ihb =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fl + fr ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hL : fl ≤ fl + fr := Nat.le_add_right fl fr
+      have hR : fr ≤ fl + fr := Nat.le_add_left fr fl
+      change StdVal.pair (remapStdFuel oldLid newLid k' ⟨fl, a⟩)
+          (remapStdFuel oldLid newLid k' ⟨fr, b⟩) =
+        StdVal.pair (remapStdFuel oldLid newLid (fl + fr) ⟨fl, a⟩)
+          (remapStdFuel oldLid newLid (fl + fr) ⟨fr, b⟩)
+      rw [iha k' (Nat.le_trans hL hSub), ihb k' (Nat.le_trans hR hSub),
+        iha _ hL, ihb _ hR]
+  | choice fc ft ff c vt vf ihc iht ihf =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fc + ft + ff ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hC : fc ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_right fc ft) (Nat.le_add_right (fc + ft) ff)
+      have hT : ft ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff)
+      have hF : ff ≤ fc + ft + ff := Nat.le_add_left ff (fc + ft)
+      change StdVal.choice (remapStdFuel oldLid newLid k' ⟨fc, c⟩)
+          (remapStdFuel oldLid newLid k' ⟨ft, vt⟩)
+          (remapStdFuel oldLid newLid k' ⟨ff, vf⟩) =
+        StdVal.choice (remapStdFuel oldLid newLid (fc + ft + ff) ⟨fc, c⟩)
+          (remapStdFuel oldLid newLid (fc + ft + ff) ⟨ft, vt⟩)
+          (remapStdFuel oldLid newLid (fc + ft + ff) ⟨ff, vf⟩)
+      rw [ihc k' (Nat.le_trans hC hSub), iht k' (Nat.le_trans hT hSub),
+        ihf k' (Nat.le_trans hF hSub), ihc _ hC, iht _ hT, ihf _ hF]
+
+theorem remapStdVal_pair (oldLid newLid : LoanId) (a b : StdVal) :
+    remapStdVal oldLid newLid (.pair a b) =
+      .pair (remapStdVal oldLid newLid a) (remapStdVal oldLid newLid b) := by
+  cases a with
+  | mk fa ta =>
+    cases b with
+    | mk fb tb =>
+      change StdVal.pair (remapStdFuel oldLid newLid (fa + fb) ⟨fa, ta⟩)
+          (remapStdFuel oldLid newLid (fa + fb) ⟨fb, tb⟩) = _
+      rw [remapStdFuel_eq oldLid newLid ta _ (Nat.le_add_right fa fb),
+        remapStdFuel_eq oldLid newLid tb _ (Nat.le_add_left fb fa)]
+
+theorem remapStdVal_choice (oldLid newLid : LoanId) (c vt vf : StdVal) :
+    remapStdVal oldLid newLid (.choice c vt vf) =
+      .choice (remapStdVal oldLid newLid c) (remapStdVal oldLid newLid vt)
+        (remapStdVal oldLid newLid vf) := by
+  cases c with
+  | mk fc tc =>
+    cases vt with
+    | mk ft tt =>
+      cases vf with
+      | mk ff tf =>
+        change StdVal.choice (remapStdFuel oldLid newLid (fc + ft + ff) ⟨fc, tc⟩)
+            (remapStdFuel oldLid newLid (fc + ft + ff) ⟨ft, tt⟩)
+            (remapStdFuel oldLid newLid (fc + ft + ff) ⟨ff, tf⟩) = _
+        rw [remapStdFuel_eq oldLid newLid tc _
+            (Nat.le_trans (Nat.le_add_right fc ft)
+              (Nat.le_add_right (fc + ft) ff)),
+          remapStdFuel_eq oldLid newLid tt _
+            (Nat.le_trans (Nat.le_add_left ft fc)
+              (Nat.le_add_right (fc + ft) ff)),
+          remapStdFuel_eq oldLid newLid tf _ (Nat.le_add_left ff (fc + ft))]
+
+theorem remapStdVal_refVal (oldLid newLid lid : LoanId) (path : SubPath) :
+    remapStdVal oldLid newLid (.refVal lid path) =
+      .refVal (if lid == oldLid then newLid else lid) path := by
+  change (if lid == oldLid then StdVal.refVal newLid path
+    else .refVal lid path) = _
+  cases lid == oldLid <;> rfl
+
+theorem stdVal_decodeRef_remapRefInVal (oldLid newLid : LoanId) (v : StdVal) :
+    stdDecodeRef (remapStdVal oldLid newLid v) =
+      (stdDecodeRef v).map
+        (fun r => (if r.1 == oldLid then newLid else r.1, r.2)) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | unit => rfl
+    | nat _ => rfl
+    | bool _ => rfl
+    | symBool _ => rfl
+    | refVal lid path =>
+      change stdDecodeRef (remapStdVal oldLid newLid (.refVal lid path)) = _
+      rw [remapStdVal_refVal]
+      rfl
+    | pairBranch fl fr a b =>
+      change stdDecodeRef (remapStdVal oldLid newLid (.pair ⟨fl, a⟩ ⟨fr, b⟩)) = _
+      rw [remapStdVal_pair]
+      rfl
+    | choice fc ft ff c vt vf =>
+      change stdDecodeRef (remapStdVal oldLid newLid
+          (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+      rw [remapStdVal_choice]
+      rfl
+
+theorem stdVal_branchSplit_remapRefInVal (oldLid newLid : LoanId)
+    (v : StdVal) :
+    stdBranchSplit (remapStdVal oldLid newLid v) =
+      (stdBranchSplit v).map (fun s =>
+        (remapStdVal oldLid newLid s.1, remapStdVal oldLid newLid s.2.1,
+         remapStdVal oldLid newLid s.2.2)) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | unit => rfl
+    | nat _ => rfl
+    | bool _ => rfl
+    | symBool _ => rfl
+    | refVal lid path =>
+      change stdBranchSplit (remapStdVal oldLid newLid (.refVal lid path)) = _
+      rw [remapStdVal_refVal]
+      rfl
+    | pairBranch fl fr a b =>
+      change stdBranchSplit
+          (remapStdVal oldLid newLid (.pair ⟨fl, a⟩ ⟨fr, b⟩)) = _
+      rw [remapStdVal_pair]
+      rfl
+    | choice fc ft ff c vt vf =>
+      change stdBranchSplit (remapStdVal oldLid newLid
+          (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+      rw [remapStdVal_choice]
+      rfl
+
+theorem stdVal_getField_remapRefInVal (oldLid newLid : LoanId) (f : FieldIdx)
+    (v : StdVal) :
+    stdValGetField f (remapStdVal oldLid newLid v) =
+      (stdValGetField f v).map (remapStdVal oldLid newLid) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | unit => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+    | nat _ => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+    | bool _ => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+    | symBool _ => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+    | refVal lid path =>
+      change stdValGetField f
+          (remapStdVal oldLid newLid (.refVal lid path)) = _
+      rw [remapStdVal_refVal]
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+    | pairBranch fl fr a b =>
+      change stdValGetField f
+          (remapStdVal oldLid newLid (.pair ⟨fl, a⟩ ⟨fr, b⟩)) = _
+      rw [remapStdVal_pair]
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+    | choice fc ft ff c vt vf =>
+      change stdValGetField f (remapStdVal oldLid newLid
+          (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+      rw [remapStdVal_choice]
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+
+theorem stdVal_remapRefInVal_leaf (oldLid newLid : LoanId) (v : StdVal)
+    (hDec : stdDecodeRef v = none) (hFields : ∀ f, stdValGetField f v = none)
+    (hSplit : stdBranchSplit v = none) : remapStdVal oldLid newLid v = v := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | unit => rfl
+    | nat _ => rfl
+    | bool _ => rfl
+    | symBool _ => rfl
+    | refVal _ _ => nomatch hDec
+    | pairBranch _ _ _ _ => nomatch hFields 0
+    | choice _ _ _ _ _ _ => nomatch hSplit
+
+def stdSameRefVal (v1 v2 : StdVal) : Bool :=
+  match v1, v2 with
+  | ⟨_, .refVal l1 p1⟩, ⟨_, .refVal l2 p2⟩ =>
+    Nat.beq l1 l2 && lensTestSubPathEq p1 p2
+  | _, _ => false
+
+theorem stdVal_sameRefVal_eq (v1 v2 : StdVal)
+    (h : stdSameRefVal v1 v2 = true) : v1 = v2 := by
+  cases v1 with
+  | mk f1 t1 =>
+    cases v2 with
+    | mk f2 t2 =>
+      cases t1 with
+      | refVal l1 p1 =>
+        cases t2 with
+        | refVal l2 p2 =>
+          change (Nat.beq l1 l2 && lensTestSubPathEq p1 p2) = true at h
+          revert h
+          cases hL : Nat.beq l1 l2 with
+          | false =>
+            intro h
+            nomatch h
+          | true =>
+            intro hP
+            rw [Nat.eq_of_beq_eq_true hL, lensTestSubPathEq_eq p1 p2 hP]
+        | unit => nomatch h
+        | nat _ => nomatch h
+        | bool _ => nomatch h
+        | symBool _ => nomatch h
+        | pairBranch _ _ _ _ => nomatch h
+        | choice _ _ _ _ _ _ => nomatch h
+      | unit => nomatch h
+      | nat _ => nomatch h
+      | bool _ => nomatch h
+      | symBool _ => nomatch h
+      | pairBranch _ _ _ _ => nomatch h
+      | choice _ _ _ _ _ _ => nomatch h
 
 def stdValAlg : ValAlgebra StdVal where
   defaultVal := .unit
   asBool := stdAsBool
   zipVal := zipStdVal
   getField := stdValGetField
+  getField_projectBranchVal := stdVal_getField_projectBranchVal
   setField := stdValSetField
   getField_setField := stdVal_getField_setField
   setField_getField := stdVal_setField_getField
@@ -660,10 +1145,21 @@ def stdValAlg : ValAlgebra StdVal where
   setField_setField_comm := stdVal_setField_setField_comm
   encodeRef lid path := .refVal lid path
   decodeRef := stdDecodeRef
+  decodeRef_encodeRef _ _ := rfl
+  decodeRef_encodeSharedRef _ _ := rfl
   decodeRef_getField := stdVal_decodeRef_getField
-  branchParts := stdBranchParts
-  branchParts_zipVal := stdVal_branchParts_zipVal
+  branchSplit := stdBranchSplit
+  decodeRef_branchSplit := stdVal_decodeRef_branchSplit
+  branchSplit_zipVal := stdVal_branchSplit_zipVal
+  sameCond := stdSameCond
+  sameCond_eq := stdVal_sameCond_eq
+  sameRefVal := stdSameRefVal
+  sameRefVal_eq := stdVal_sameRefVal_eq
   remapRefInVal := remapStdVal
+  decodeRef_remapRefInVal := stdVal_decodeRef_remapRefInVal
+  getField_remapRefInVal := stdVal_getField_remapRefInVal
+  branchSplit_remapRefInVal := stdVal_branchSplit_remapRefInVal
+  remapRefInVal_leaf := stdVal_remapRefInVal_leaf
   projectBranchVal := projectBranchStdVal
   projectBranchVal_concrete := stdVal_projectBranchVal_concrete
   projectBranchVal_zip_true := stdVal_projectBranchVal_zip_true
@@ -674,94 +1170,47 @@ def stdValAlg : ValAlgebra StdVal where
   sameAggregateShape_ext := stdVal_sameAggregateShape_ext
   sameAggregateShape_setField := stdVal_sameAggregateShape_setField
 
-/-- Fields of a `StdVal` pair are strict subtrees. -/
-theorem stdVal_getField_sizeBound_lt (f : FieldIdx) (v c : StdVal)
-    (hGet : stdValAlg.getField f v = some c) :
-    stdValAlg.sizeBound c < stdValAlg.sizeBound v := by
-  cases v with
-  | mk fv tv =>
-    cases f with
-    | zero =>
-      cases tv with
-      | pairBranch fl fr l r =>
-        injection hGet with hc
-        subst hc
-        exact Nat.lt_succ_of_le (Nat.le_add_right fl fr)
-      | unit => exact nomatch hGet
-      | nat _ => exact nomatch hGet
-      | bool _ => exact nomatch hGet
-      | symBool _ => exact nomatch hGet
-      | refVal _ _ => exact nomatch hGet
-      | choice _ _ _ _ _ _ => exact nomatch hGet
-    | succ f' =>
-      cases f' with
-      | zero =>
-        cases tv with
-        | pairBranch fl fr l r =>
-          injection hGet with hc
-          subst hc
-          exact Nat.lt_succ_of_le (Nat.le_add_left fr fl)
-        | unit => exact nomatch hGet
-        | nat _ => exact nomatch hGet
-        | bool _ => exact nomatch hGet
-        | symBool _ => exact nomatch hGet
-        | refVal _ _ => exact nomatch hGet
-        | choice _ _ _ _ _ _ => exact nomatch hGet
-      | succ _ => exact nomatch hGet
+/-- Add a concrete left operand `n1` to `v2`, distributing across any nested
+`.choice` nodes in `v2`. -/
+def stdAddLeafNat (n1 : Nat) (v2 : StdVal) : Option StdVal :=
+  natFold
+    (fun _ => none)
+    (fun _ ih w =>
+      match w with
+      | ⟨_, .nat n2⟩ => some (.nat (n1 + n2))
+      | ⟨_, .choice fc ft ff c vt vf⟩ =>
+        match ih ⟨ft, vt⟩, ih ⟨ff, vf⟩ with
+        | some t', some f' => some (.choice ⟨fc, c⟩ t' f')
+        | _, _ => none
+      | _ => none)
+    v2.fuel v2
 
-/-- Arms of a `StdVal` choice are strict subtrees. -/
-theorem stdVal_branchParts_sizeBound_lt (v c : StdVal)
-    (hMem : List.Mem c (stdValAlg.branchParts v)) :
-    stdValAlg.sizeBound c < stdValAlg.sizeBound v := by
-  cases v with
-  | mk fv tv =>
-    cases tv with
-    | choice fc ft ff cnd vt vf =>
-      cases hMem with
-      | head =>
-        exact Nat.lt_succ_of_le
-          (Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff))
-      | tail _ hRest =>
-        cases hRest with
-        | head => exact Nat.lt_succ_of_le (Nat.le_add_left ff (fc + ft))
-        | tail _ hNil => exact nomatch hNil
-    | unit => exact nomatch hMem
-    | nat _ => exact nomatch hMem
-    | bool _ => exact nomatch hMem
-    | symBool _ => exact nomatch hMem
-    | pairBranch _ _ _ _ => exact nomatch hMem
-    | refVal _ _ => exact nomatch hMem
-
-/-- `stdValAlg` satisfies `SizeBoundDecreasing`, so its handle scan never
-fails closed and `replaceableVal` is reflexive on every `StdVal`. -/
-theorem stdVal_sizeBoundDecreasing : SizeBoundDecreasing stdValAlg :=
-  ⟨stdVal_getField_sizeBound_lt, stdVal_branchParts_sizeBound_lt⟩
-
-theorem stdVal_collectHandles_total (v : StdVal) :
-    Exists fun lids => collectHandles stdValAlg v = some lids :=
-  collectHandles_total_of_sizeBoundDecreasing stdValAlg stdVal_sizeBoundDecreasing v
-
-theorem stdVal_replaceableVal_self (loans : List (LoanEntry StdVal)) (v : StdVal) :
-    replaceableVal stdValAlg loans v v = true :=
-  replaceableVal_self_of_sizeBoundDecreasing stdValAlg stdVal_sizeBoundDecreasing
-    loans v
-
+/-- Add two `StdVal` numbers or symbolic choices of numbers, distributing
+addition across arbitrary nested `.choice` trees and collapsing matching
+choice guards on the same step via `stdValEq`. -/
 def stdAdd (v1 v2 : StdVal) : Option StdVal :=
-  match v1, v2 with
-  | ⟨_, .nat n1⟩, ⟨_, .nat n2⟩ => some (.nat (n1 + n2))
-  | ⟨_, .choice fc _ _ c (.nat n1) (.nat n2)⟩, ⟨_, .nat n3⟩ =>
-    some (.choice ⟨fc, c⟩ (.nat (n1 + n3)) (.nat (n2 + n3)))
-  | ⟨_, .nat n1⟩, ⟨_, .choice fc _ _ c (.nat n3) (.nat n4)⟩ =>
-    some (.choice ⟨fc, c⟩ (.nat (n1 + n3)) (.nat (n1 + n4)))
-  | ⟨_, .choice fc1 _ _ c1 (.nat n1) (.nat n2)⟩,
-    ⟨_, .choice fc2 _ _ c2 (.nat n3) (.nat n4)⟩ =>
-    if stdValEq ⟨fc1, c1⟩ ⟨fc2, c2⟩ then
-      some (.choice ⟨fc1, c1⟩ (.nat (n1 + n3)) (.nat (n2 + n4)))
-    else
-      some (.choice ⟨fc1, c1⟩
-        (.choice ⟨fc2, c2⟩ (.nat (n1 + n3)) (.nat (n1 + n4)))
-        (.choice ⟨fc2, c2⟩ (.nat (n2 + n3)) (.nat (n2 + n4))))
-  | _, _ => none
+  natFold
+    (fun _ _ => none)
+    (fun _ ih w1 w2 =>
+      match w1 with
+      | ⟨_, .nat n1⟩ => stdAddLeafNat n1 w2
+      | ⟨_, .choice fc1 ft1 ff1 c1 vt1 vf1⟩ =>
+        match w2 with
+        | ⟨_, .choice fc2 ft2 ff2 c2 vt2 vf2⟩ =>
+          if stdValEq ⟨fc1, c1⟩ ⟨fc2, c2⟩ then
+            match ih ⟨ft1, vt1⟩ ⟨ft2, vt2⟩, ih ⟨ff1, vf1⟩ ⟨ff2, vf2⟩ with
+            | some t', some f' => some (.choice ⟨fc1, c1⟩ t' f')
+            | _, _ => none
+          else
+            match ih ⟨ft1, vt1⟩ w2, ih ⟨ff1, vf1⟩ w2 with
+            | some t', some f' => some (.choice ⟨fc1, c1⟩ t' f')
+            | _, _ => none
+        | _ =>
+          match ih ⟨ft1, vt1⟩ w2, ih ⟨ff1, vf1⟩ w2 with
+          | some t', some f' => some (.choice ⟨fc1, c1⟩ t' f')
+          | _, _ => none
+      | _ => none)
+    v1.fuel v1 v2
 
 def stdAddNat (k : Nat) (v : StdVal) : Option StdVal :=
   stdAdd v (.nat k)
@@ -847,7 +1296,7 @@ theorem s3_max_assign_shared_aliased_fails (va : Nat) :
       s1MaxAssignPlan
       (.constVal .unit) = .fail := rfl
 
-/-- **S4 (`two_phase_reborrow`)**: Diamond conditional reborrow
+/-- **S4 (`conditional_reborrow`)**: Diamond conditional reborrow
 `let r = if cond { &mut *x } else { &mut *y }; *r += a; endLoan(r); *x += b`. -/
 def s4DiamondReborrowPlan : FlowPlan StdVal :=
   .seq
@@ -862,7 +1311,7 @@ def s4DiamondReborrowPlan : FlowPlan StdVal :=
         (.act (.assign (.derefSub 1 [])
           (.binary stdAdd (.derefSub 1 []) (.localSub 4 []))))))
 
-theorem s4_two_phase_reborrow_symbolic (cond : Bool) (vx vy a b : Nat) :
+theorem s4_conditional_reborrow_symbolic (cond : Bool) (vx vy a b : Nat) :
     evalFnValue stdValAlg
       [⟨.byVal, .symBool cond⟩,
        ⟨.mutRef 0 [], .nat vx⟩,
@@ -1355,85 +1804,170 @@ theorem h3_reject_uninit_reabsorb (v0 v1 : Nat) :
       (.constVal .unit) = .fail := rfl
 
 /-- **H4**: End-to-end operational bridges for machine styles `M1`, `M2`, and
-`M3`. -/
-def m1MaxAssignStep (vx vy : Nat) : Nat → M1StepResult Nat StdVal
-  | 0 => .next 1
-  | _ => .ret ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩
+`M3`. The `M1` and `M2` machines run `max_assign` (`if *x < y { *x = y }`) on
+their own concrete state `(pc, x, y)`; `h4MaxAssignStateRel` ties that state to
+the initial symbolic state through the values of `*x` and `y`. The plan
+compares with the concrete `stdLtBool`, so its result is a concrete value that
+the machine must reproduce. The bridges are instantiated at inputs that take
+each branch, since kernel reduction cannot case-split an `if` on a
+`Nat.blt` of variables. -/
+def h4MaxAssignConcretePlan : FlowPlan StdVal :=
+  .seq
+    (.act (.assign (.localSub 2 [])
+      (.binary stdLtBool (.derefSub 0 []) (.localSub 1 []))))
+    (.branch (.use (.localSub 2 []))
+      (.act (.assign (.derefSub 0 []) (.use (.localSub 1 []))))
+      .skip)
 
-theorem h4_m1_bridge_sound (vx vy : Nat) :
-    let ad := m1OperationalAdapter (m1MaxAssignStep vx vy) (fun _ s => s = 0)
+/-- `max_assign` machine state `(pc, x, y)` at entry (`pc = 0`) agrees with
+the symbolic state on `*x` and `y`. -/
+def h4MaxAssignStateRel (st : SymState StdVal) (s : Nat × Nat × Nat) : Prop :=
+  s.1 = 0 ∧
+    readPlaceVal stdValAlg (.derefSub 0 []) st = some (.nat s.2.1) ∧
+    readPlaceVal stdValAlg (.localSub 1 []) st = some (.nat s.2.2)
+
+/-- `max_assign` as an `M1` step function: step `0` assigns `x := y` when
+`x < y`, and step `1` returns the final `*x`. -/
+def m1MaxAssignStep : Nat × Nat × Nat → M1StepResult (Nat × Nat × Nat) StdVal
+  | (0, x, y) =>
+    .next (1,
+      (match Nat.blt x y with
+       | true => y
+       | false => x), y)
+  | (1, x, _) => .ret ⟨.unit, [.nat x]⟩
+  | _ => .fault
+
+/-- `max_assign` as an `M2` step function that also emits the inputs it
+compares as observations. -/
+def m2MaxAssignStep :
+    Nat × Nat × Nat → M2StepResult (Nat × Nat × Nat) Nat StdVal
+  | (0, x, y) =>
+    .step [x, y] (1,
+      (match Nat.blt x y with
+       | true => y
+       | false => x), y)
+  | (1, x, _) => .terminated ⟨.unit, [.nat x]⟩
+  | _ => .failed
+
+/-- The `M1` machine started on `*x = 3`, `y = 7` (the assigning branch)
+returns `*x = 7`, matching the lifted result. -/
+theorem h4_m1_bridge_sound_assigns :
+    let ad := m1OperationalAdapter m1MaxAssignStep h4MaxAssignStateRel
     Exists fun k => Exists fun mFinal => Exists fun out =>
-      ad.ExecutesTo (.running 0) k mFinal ∧
+      ad.ExecutesTo (.running (0, 3, 7)) k mFinal ∧
       ad.FinalLoansRel out mFinal ∧
-      out = ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩ := by
+      out = ⟨.unit, [.nat 7]⟩ := by
   refine pure_lift_sound
-    (m1OperationalAdapter (m1MaxAssignStep vx vy) (fun _ s => s = 0))
+    (m1OperationalAdapter m1MaxAssignStep h4MaxAssignStateRel)
     stdValAlg
-    [⟨.mutRef 0 [], .nat vx⟩, ⟨.byVal, .nat vy⟩]
-    s1MaxAssignPlan
+    [⟨.mutRef 0 [], .nat 3⟩, ⟨.byVal, .nat 7⟩]
+    h4MaxAssignConcretePlan
     (.constVal .unit)
-    (fun out =>
-      out = ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩)
-    (.running 0)
-    ⟨_, ⟨rfl, rfl⟩⟩
+    (fun out => out = ⟨.unit, [.nat 7]⟩)
+    (.running (0, 3, 7))
+    ⟨_, ⟨rfl, ⟨rfl, rfl, rfl⟩⟩⟩
     rfl
     ?_
   intro _ out _ _ hEval
   injection hEval with hOut
   subst hOut
-  refine ⟨2,
-    ⟨.returned
-      ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩,
-     rfl, rfl⟩⟩
+  exact ⟨2, .returned ⟨.unit, [.nat 7]⟩, rfl, rfl⟩
 
-def m2MaxAssignStep (vx vy : Nat) : Nat → M2StepResult Nat Nat StdVal
-  | 0 => .step [vx, vy] 1
-  | _ =>
-    .terminated
-      ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩
-
-theorem h4_m2_bridge_sound (vx vy : Nat) :
-    let ad := m2OperationalAdapter (m2MaxAssignStep vx vy) (fun _ s => s = 0)
+/-- The `M1` machine started on `*x = 9`, `y = 4` (the skipping branch)
+returns `*x = 9`, matching the lifted result. -/
+theorem h4_m1_bridge_sound_skips :
+    let ad := m1OperationalAdapter m1MaxAssignStep h4MaxAssignStateRel
     Exists fun k => Exists fun mFinal => Exists fun out =>
-      ad.ExecutesTo ⟨0, [], none⟩ k mFinal ∧
+      ad.ExecutesTo (.running (0, 9, 4)) k mFinal ∧
       ad.FinalLoansRel out mFinal ∧
-      out = ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩ := by
+      out = ⟨.unit, [.nat 9]⟩ := by
   refine pure_lift_sound
-    (m2OperationalAdapter (m2MaxAssignStep vx vy) (fun _ s => s = 0))
+    (m1OperationalAdapter m1MaxAssignStep h4MaxAssignStateRel)
     stdValAlg
-    [⟨.mutRef 0 [], .nat vx⟩, ⟨.byVal, .nat vy⟩]
-    s1MaxAssignPlan
+    [⟨.mutRef 0 [], .nat 9⟩, ⟨.byVal, .nat 4⟩]
+    h4MaxAssignConcretePlan
     (.constVal .unit)
-    (fun out =>
-      out = ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩)
-    ⟨0, [], none⟩
-    ⟨_, ⟨rfl, ⟨rfl, rfl, trivial⟩⟩⟩
+    (fun out => out = ⟨.unit, [.nat 9]⟩)
+    (.running (0, 9, 4))
+    ⟨_, ⟨rfl, ⟨rfl, rfl, rfl⟩⟩⟩
     rfl
     ?_
   intro _ out _ _ hEval
   injection hEval with hOut
   subst hOut
-  refine ⟨1 + 1,
-    ⟨⟨1, [] ++ [vx, vy],
-      some ⟨.unit, [zipStdVal (.symBool (Nat.blt vx vy)) (.nat vy) (.nat vx)]⟩⟩,
+  exact ⟨2, .returned ⟨.unit, [.nat 9]⟩, rfl, rfl⟩
+
+/-- The `M2` machine started on `*x = 3`, `y = 7` emits the compared inputs
+and terminates with `*x = 7`, matching the lifted result. -/
+theorem h4_m2_bridge_sound_assigns :
+    let ad := m2OperationalAdapter m2MaxAssignStep h4MaxAssignStateRel
+    Exists fun k => Exists fun mFinal => Exists fun out =>
+      ad.ExecutesTo ⟨(0, 3, 7), [], none⟩ k mFinal ∧
+      ad.FinalLoansRel out mFinal ∧
+      out = ⟨.unit, [.nat 7]⟩ := by
+  refine pure_lift_sound
+    (m2OperationalAdapter m2MaxAssignStep h4MaxAssignStateRel)
+    stdValAlg
+    [⟨.mutRef 0 [], .nat 3⟩, ⟨.byVal, .nat 7⟩]
+    h4MaxAssignConcretePlan
+    (.constVal .unit)
+    (fun out => out = ⟨.unit, [.nat 7]⟩)
+    ⟨(0, 3, 7), [], none⟩
+    ⟨_, ⟨rfl, ⟨rfl, ⟨rfl, rfl, rfl⟩, trivial⟩⟩⟩
+    rfl
+    ?_
+  intro _ out _ _ hEval
+  injection hEval with hOut
+  subst hOut
+  exact ⟨1 + 1,
+    ⟨(1, 7, 7), [] ++ [3, 7], some ⟨.unit, [.nat 7]⟩⟩,
     M2ExecutesTo.trans
       (M2ExecutesTo.step_emit rfl)
       (M2ExecutesTo.step_term rfl),
-    rfl⟩⟩
+    rfl⟩
+
+/-- The `M2` machine started on `*x = 9`, `y = 4` terminates with `*x = 9`,
+matching the lifted result. -/
+theorem h4_m2_bridge_sound_skips :
+    let ad := m2OperationalAdapter m2MaxAssignStep h4MaxAssignStateRel
+    Exists fun k => Exists fun mFinal => Exists fun out =>
+      ad.ExecutesTo ⟨(0, 9, 4), [], none⟩ k mFinal ∧
+      ad.FinalLoansRel out mFinal ∧
+      out = ⟨.unit, [.nat 9]⟩ := by
+  refine pure_lift_sound
+    (m2OperationalAdapter m2MaxAssignStep h4MaxAssignStateRel)
+    stdValAlg
+    [⟨.mutRef 0 [], .nat 9⟩, ⟨.byVal, .nat 4⟩]
+    h4MaxAssignConcretePlan
+    (.constVal .unit)
+    (fun out => out = ⟨.unit, [.nat 9]⟩)
+    ⟨(0, 9, 4), [], none⟩
+    ⟨_, ⟨rfl, ⟨rfl, ⟨rfl, rfl, rfl⟩, trivial⟩⟩⟩
+    rfl
+    ?_
+  intro _ out _ _ hEval
+  injection hEval with hOut
+  subst hOut
+  exact ⟨1 + 1,
+    ⟨(1, 9, 4), [] ++ [9, 4], some ⟨.unit, [.nat 9]⟩⟩,
+    M2ExecutesTo.trans
+      (M2ExecutesTo.step_emit rfl)
+      (M2ExecutesTo.step_term rfl),
+    rfl⟩
 
 def m3SwapHeapStep (cells : List (M3Cell StdVal)) :
     M1StepResult (List (M3Cell StdVal)) StdVal :=
   match cells with
   | [ ⟨0, 0, [], 0, .activeUnique, .init ⟨_, .pairBranch fl fr a b⟩⟩,
-      ⟨0, 0, [0], 1, .activeUnique, .init _⟩,
-      ⟨0, 1, [1], 2, .activeUnique, .init _⟩ ] =>
+      ⟨0, 1, [0], 1, .activeUnique, .init _⟩,
+      ⟨0, 2, [1], 2, .activeUnique, .init _⟩ ] =>
     .next [
       ⟨0, 0, [], 0, .activeUnique, .init (.pair ⟨fr, b⟩ ⟨fl, a⟩)⟩,
-      ⟨0, 0, [0], 1, .disabled, .init ⟨fr, b⟩⟩,
-      ⟨0, 1, [1], 2, .disabled, .init ⟨fl, a⟩⟩ ]
+      ⟨0, 1, [0], 1, .disabled, .init ⟨fr, b⟩⟩,
+      ⟨0, 2, [1], 2, .disabled, .init ⟨fl, a⟩⟩ ]
   | [ ⟨0, 0, [], 0, .activeUnique, .init swapped⟩,
-      ⟨0, 0, [0], 1, .disabled, _⟩,
-      ⟨0, 1, [1], 2, .disabled, _⟩ ] =>
+      ⟨0, 1, [0], 1, .disabled, _⟩,
+      ⟨0, 2, [1], 2, .disabled, _⟩ ] =>
     .ret ⟨swapped, [swapped]⟩
   | _ => .fault
 
@@ -1441,16 +1975,16 @@ theorem h4_m3_tree_borrows_bridge_sound (v0 v1 : Nat) :
     let sp := m3SpatialModel StdVal
     let initHeap : List (M3Cell StdVal) :=
       [ ⟨0, 0, [], 0, .activeUnique, .init (.pair (.nat v0) (.nat v1))⟩,
-        ⟨0, 0, [0], 1, .activeUnique, .init (.nat v0)⟩,
-        ⟨0, 1, [1], 2, .activeUnique, .init (.nat v1)⟩ ]
+        ⟨0, 1, [0], 1, .activeUnique, .init (.nat v0)⟩,
+        ⟨0, 2, [1], 2, .activeUnique, .init (.nat v1)⟩ ]
     let splitPerm : PermTree :=
       .split [([0], .mutLocked 1), ([1], .mutLocked 2)]
     let ad :=
       m3OperationalAdapter m3SwapHeapStep (fun _ _ => True)
         ([(0, (0, 0), [])]) ([(0, (0, 0), [])])
-    sp.ownSubPlace initHeap (0, 0) [0] 0 (getPathPerm [0] splitPerm)
+    sp.ownSubPlace initHeap (0, 1) [0] 0 (getPathPerm [0] splitPerm)
       (.nat v0) ∧
-    sp.ownSubPlace initHeap (0, 1) [1] 0 (getPathPerm [1] splitPerm)
+    sp.ownSubPlace initHeap (0, 2) [1] 0 (getPathPerm [1] splitPerm)
       (.nat v1) ∧
     (Exists fun k => Exists fun mFinal => Exists fun out =>
       ad.ExecutesTo ⟨initHeap, none⟩ k mFinal ∧
@@ -1466,8 +2000,8 @@ theorem h4_m3_tree_borrows_bridge_sound (v0 v1 : Nat) :
     (.use (.localSub 4 []))
     (fun out => out = ⟨.pair (.nat v1) (.nat v0), [.pair (.nat v1) (.nat v0)]⟩)
     ⟨[ ⟨0, 0, [], 0, .activeUnique, .init (.pair (.nat v0) (.nat v1))⟩,
-       ⟨0, 0, [0], 1, .activeUnique, .init (.nat v0)⟩,
-       ⟨0, 1, [1], 2, .activeUnique, .init (.nat v1)⟩ ], none⟩
+       ⟨0, 1, [0], 1, .activeUnique, .init (.nat v0)⟩,
+       ⟨0, 2, [1], 2, .activeUnique, .init (.nat v1)⟩ ], none⟩
     ⟨_,
       ⟨rfl,
         ⟨rfl,
@@ -1481,8 +2015,8 @@ theorem h4_m3_tree_borrows_bridge_sound (v0 v1 : Nat) :
   subst hOut
   refine ⟨1 + 1,
     ⟨⟨[ ⟨0, 0, [], 0, .activeUnique, .init (.pair (.nat v1) (.nat v0))⟩,
-        ⟨0, 0, [0], 1, .disabled, .init (.nat v1)⟩,
-        ⟨0, 1, [1], 2, .disabled, .init (.nat v0)⟩ ],
+        ⟨0, 1, [0], 1, .disabled, .init (.nat v1)⟩,
+        ⟨0, 2, [1], 2, .disabled, .init (.nat v0)⟩ ],
       some ⟨.pair (.nat v1) (.nat v0), [.pair (.nat v1) (.nat v0)]⟩⟩,
     M3ExecutesTo.trans
       (M3ExecutesTo.step_heap rfl)
@@ -1599,7 +2133,19 @@ theorem h5_goodhart_aliased_branch_join_fails (cond : Bool) :
       h5GoodhartAliasedBranchJoinPlan
       (.constVal .unit) = .fail := rfl
 
-/-! ## Part III: Exhaustive Plan, BlockCfg, and Adapter Regression Suite -/
+/-! ## Part III: Plan, BlockCfg, and Adapter Edge Cases -/
+
+/-- `true` iff running `plan` from the entry state of `params` fails (and the
+entry state itself is valid). Tests use it to observe a failure at the step
+that should fail, rather than only at the return boundary. -/
+def planStepFails (params : List (ParamInput StdVal))
+    (plan : FlowPlan StdVal) : Bool :=
+  match initFnState stdValAlg params with
+  | .ok st0 =>
+    match evalPlan stdValAlg plan st0 with
+    | .fail => true
+    | .ok _ => false
+  | .fail => false
 
 /-- Initialize locals `1 ..= 10` to `.nat 1 ..= .nat 10` in order. -/
 def highLocalPrefixPlan : FlowPlan StdVal :=
@@ -1760,13 +2306,18 @@ theorem branch_join_region_groups_merges_backFn (cond : Bool) (vx : Nat) :
 
 theorem branch_join_mismatched_region_groups_rejected
     (cond : Bool) (vx : Nat) :
-    evalFnValue stdValAlg
+    planStepFails
       [⟨.byVal, .symBool cond⟩, ⟨.mutRef 0 [], .nat vx⟩]
       (.branch (.use (.localSub 0 []))
         (.act (.callMultiRegion [] [regionSpecWithAdd 5]))
         (.act (.callMultiRegion []
-          [{ regionSpecWithAdd 50 with groupId := 9 }])))
-      (.constVal .unit) = .fail := rfl
+          [{ regionSpecWithAdd 50 with groupId := 9 }]))) = true ∧
+    planStepFails
+      [⟨.byVal, .symBool cond⟩, ⟨.mutRef 0 [], .nat vx⟩]
+      (.branch (.use (.localSub 0 []))
+        (.act (.callMultiRegion [] [regionSpecWithAdd 5]))
+        (.act (.callMultiRegion [] [regionSpecWithAdd 50]))) = false :=
+  ⟨rfl, rfl⟩
 
 /-- Spatial provenance counter takes `max st1.nextSpatialTag st2.nextSpatialTag`
 across symbolic branch joins so post-join `freezeSpatial` never reuses an
@@ -1845,8 +2396,8 @@ theorem loop_reborrow_with_endLoanAtLocal_verified :
       (.constVal .unit) =
     .ok ⟨.unit, [.nat 4]⟩ := rfl
 
-/-- Concrete `BasicBlock` multi-block execution and `CfgCertificate` soundness
-equivalence with `evalPlan`. -/
+/-- Two-block CFG used to check concrete `BasicBlock` execution against the
+equivalent straight-line plan run by `evalFnValue`. -/
 def sampleTwoBlockCfg : List (BasicBlock StdVal) :=
   [ ⟨.act (.assign (.localSub 1 []) (.constVal (.nat 20))), .goto 1⟩
   , ⟨.act (.assign (.localSub 1 []) (.unary stdInc (.localSub 1 []))),
@@ -1867,8 +2418,8 @@ theorem blockCfg_two_block_exec_and_equiv_test :
      | .fail => False) :=
   ⟨rfl, rfl⟩
 
-/-- `M2ExecutesTo.step_choice` and `m3SpatialModel.disjointSubPlaces`
-exhaustive tests. -/
+/-- Step function for the `M2ExecutesTo.step_choice` and
+`m3SpatialModel.disjointSubPlaces` tests. -/
 def m2ChoiceStep : Nat → M2StepResult Nat Nat StdVal
   | 0 => .choice (fun s' => s' = 1 ∨ s' = 2)
   | _ => .terminated ⟨.nat 99, []⟩
@@ -1943,9 +2494,9 @@ theorem earlyReturn_evaluates_retExpr_before_cleanup (v0 v1 : Nat) :
       (.constVal (.nat 0)) =
     .ok ⟨.nat (v0 + 7), [.pair (.nat (v0 + 7)) (.nat v1)]⟩ := rfl
 
-/-- `applyOneJoinPair` remaps encoded references stored inside loan cell values
+/-- `applyJoinPairs` remaps encoded references stored inside loan cell values
 (`e2.cell.val` and `e.cell.val`) in addition to `st2.locals`. -/
-theorem applyOneJoinPair_remaps_loan_cell_ref_values :
+theorem applyJoinPairs_remaps_loan_cell_ref_values :
     let e0 : LoanEntry StdVal :=
       ⟨0, .activeMut, ⟨.refVal 1 [], .unborrowed⟩, .rootParam 0⟩
     let e1Active : LoanEntry StdVal :=
@@ -1962,7 +2513,7 @@ theorem applyOneJoinPair_remaps_loan_cell_ref_values :
       ⟨2, .activeMut, ⟨.refVal 2 [0], .unborrowed⟩, .direct (.localReg 0) []⟩
     let st2 : SymState StdVal :=
       ⟨[⟨.nat 55, .mutLocked 2⟩], [e0In2, e1Ended, e2Active], [], [], [], 0⟩
-    match applyOneJoinPair stdValAlg 1 2 st1 st2 with
+    match applyJoinPairs stdValAlg [(1, 2)] st1 st2 with
     | some st2' =>
       match findLoan 0 st2'.loans, findLoan 1 st2'.loans with
       | some e0', some e1' =>
@@ -1971,11 +2522,11 @@ theorem applyOneJoinPair_remaps_loan_cell_ref_values :
     | none => False :=
   ⟨rfl, rfl⟩
 
-/-- Exhaustive unit tests for `FlowPlan.whileLoop` (early return propagation,
+/-- Unit tests for `FlowPlan.whileLoop` (early return propagation,
 fuel exhaustion failure, and non-boolean condition failure), `initFnState`
 (duplicate/overlapping parameter `rootId` rejection and disjoint sibling
 sub-path acceptance), and `evalFnReturningMut` negative guards. -/
-theorem plan_whileLoop_initFnState_and_returningMut_exhaustive_tests :
+theorem plan_whileLoop_initFnState_and_returningMut_tests :
     -- 1. `.whileLoop` propagates `.earlyReturn` immediately on iteration 1:
     evalFnValue stdValAlg [⟨.byVal, .bool true⟩]
       (.whileLoop 5 (.use (.localSub 0 []))
@@ -2017,7 +2568,7 @@ theorem plan_whileLoop_initFnState_and_returningMut_exhaustive_tests :
      | .ok _ => False) :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, trivial, trivial⟩
 
-/-- Exhaustive unit tests for `BlockCfg` terminators (`BlockTerm.branch`,
+/-- Unit tests for `BlockCfg` terminators (`BlockTerm.branch`,
 `BlockTerm.goto`, `BlockTerm.ret`), out-of-bounds block IDs (`.fault`), zero
 fuel (`.diverged`), and `cfg_certificate_step_sound`. -/
 def sampleBranchBlockCfg : List (BasicBlock StdVal) :=
@@ -2029,7 +2580,7 @@ def sampleBranchBlockCfg : List (BasicBlock StdVal) :=
   , ⟨.skip, .ret (.use (.localSub 1 []))⟩
   ]
 
-theorem blockCfg_terminators_and_certificate_exhaustive_tests :
+theorem blockCfg_terminators_and_certificate_tests :
     (match initFnState stdValAlg [⟨.byVal, .bool true⟩] with
      | .ok stT =>
        runBlockCfg (stepBasicBlock stdValAlg sampleBranchBlockCfg) 0 stT 4 =
@@ -2060,11 +2611,11 @@ theorem blockCfg_terminators_and_certificate_exhaustive_tests :
     rfl
     rfl
 
-/-- Exhaustive regression tests for:
+/-- Tests for:
 1. `callMultiRegion` inside a `.whileLoop` (replacing inactive
    `RegionGroupEntry` entries across iterations so later iterations are not
    shadowed by iteration `0`, and rejecting duplicate active `groupId`),
-2. `applyOneJoinPair` remapping loan IDs inside nested `StdVal.pair` values,
+2. `applyJoinPairs` remapping loan IDs inside nested `StdVal.pair` values,
    `regionGroups`, and `regionDeposits`,
 3. Multi-argument `.call` returning a mutable borrow over two disjoint sub-paths
    (`[0]` and `[1]`) of the same owner (`releaseLoanPermAtPath`), and
@@ -2107,13 +2658,13 @@ def symbolicMixedEarlyReturnPlan : FlowPlan StdVal :=
     (.act (.assign (.derefSub 1 [])
       (.unary (stdAddNat 5) (.derefSub 1 []))))
 
-theorem round4_region_group_loop_verified :
+theorem region_group_in_loop_verified :
     evalFnValue stdValAlg
       [⟨.mutRef 0 [], .nat 1⟩, ⟨.byVal, .nat 3⟩]
       (loopRegionGroupPlan 3)
       (.constVal .unit) = .ok ⟨.unit, [.nat 3]⟩ := rfl
 
-theorem round4_region_group_dup_verified (v0 v1 : Nat) :
+theorem region_group_duplicate_spec_rejected (v0 v1 : Nat) :
     evalFnValue stdValAlg
       [⟨.mutRef 0 [], .pair (.nat v0) (.nat v1)⟩]
       (.act (.callMultiRegion []
@@ -2123,7 +2674,7 @@ theorem round4_region_group_dup_verified (v0 v1 : Nat) :
               inputPlaces := [.derefSub 0 [1]], outDsts := [2] } ]))
       (.constVal .unit) = .fail := rfl
 
-theorem round4_plan_and_loan_regressions_exhaustive_tests
+theorem plan_and_loan_graph_edge_case_tests
     (cond : Bool) (v0 v1 : Nat) :
     -- 1. `callMultiRegion` in a loop updates across multiple iterations, and
     -- duplicate active `groupId` in the same `callMultiRegion` fails:
@@ -2139,7 +2690,7 @@ theorem round4_plan_and_loan_regressions_exhaustive_tests
         , { regionSpecWithAdd 2 with
               inputPlaces := [.derefSub 0 [1]], outDsts := [2] } ]))
       (.constVal .unit) = .fail) ∧
-    -- 2. `applyOneJoinPair` remaps references nested inside `.pair`,
+    -- 2. `applyJoinPairs` remaps references nested inside `.pair`,
     -- `regionGroups`, and `regionDeposits`:
     (let e0 : LoanEntry StdVal :=
        ⟨0, .activeMut, ⟨.pair (.refVal 1 []) (.nat 0), .unborrowed⟩,
@@ -2165,7 +2716,7 @@ theorem round4_plan_and_loan_regressions_exhaustive_tests
         fun outs deps => some (outs, deps)⟩
      let st2 : SymState StdVal :=
        ⟨[], [e0In2, e1End, e2Act], [rg2], [(5, .refVal 2 [])], [], 0⟩
-     match applyOneJoinPair stdValAlg 1 2 st1 st2 with
+     match applyJoinPairs stdValAlg [(1, 2)] st1 st2 with
      | some st2' =>
        st2'.regionDeposits = [(5, .refVal 1 [])] ∧
        (match findLoan 0 st2'.loans, findRegionGroup 0 st2'.regionGroups with
@@ -2189,13 +2740,13 @@ theorem round4_plan_and_loan_regressions_exhaustive_tests
       (.constVal (.nat 0)) =
       .ok ⟨zipStdVal (.symBool cond) (.nat 1) (.nat 0),
            [zipStdVal (.symBool cond) (.nat 10) (.nat 25)]⟩ :=
-  ⟨⟨round4_region_group_loop_verified,
-    round4_region_group_dup_verified v0 v1⟩,
+  ⟨⟨region_group_in_loop_verified,
+    region_group_duplicate_spec_rejected v0 v1⟩,
    ⟨rfl, ⟨rfl, rfl, rfl, rfl⟩⟩,
    rfl,
    rfl⟩
 
-/-- Exhaustive Round 8 regression tests for `Adapter`, `Plan`, and `Canaries`:
+/-- Tests for `Adapter`, `Plan`, and `Canaries`:
 1. `spatialBindingsHold` ties unborrowed bound loans to `e.id` and `e.phase`
    (`effectiveBoundLoanPerm`), rejecting spatial cells bound to a different
    loan ID or wrong borrow kind,
@@ -2205,7 +2756,7 @@ theorem round4_plan_and_loan_regressions_exhaustive_tests
 3. `projectBranchStdVal` preserves `.choice` nodes guarded by a different
    condition value (`.symBool false` when projecting `.symBool true`) while
    projecting `.choice` nodes guarded by the projected condition. -/
-theorem round8_adapter_plan_and_canary_regressions_exhaustive_tests :
+theorem spatial_binding_deposit_scope_and_projection_tests :
     -- 1. `spatialBindingsHold` checks `e.id` and `e.phase` when `e.cell.perm`
     -- is `.unborrowed`:
     (let loan3 : LoanEntry StdVal :=
@@ -2257,7 +2808,7 @@ theorem round8_adapter_plan_and_canary_regressions_exhaustive_tests :
       | Or.inr h2 => nomatch h2)⟩,
    rfl, rfl, rfl⟩
 
-/-- Exhaustive Round 9 regression tests for `Adapter`, `Plan`, and `Canaries`:
+/-- Tests for `Adapter`, `Plan`, and `Canaries`:
 1. `zipOrKeepSameRef` recursively zips aggregate fields across symbolic branch
    joins so a post-join field projection (`.localSub reg [0]`) succeeds on an
    aggregate left unchanged by both branches,
@@ -2266,8 +2817,8 @@ theorem round8_adapter_plan_and_canary_regressions_exhaustive_tests :
 3. `stdAdd` preserves both choice guards when adding symbolic values under
    distinct conditions `c1 ≠ c2`, and
 4. `m3LookupCell` and `m3SpatialModel.ownSubPlace` reject heaps containing
-   duplicate concrete cells at the same `(allocId, offset, subPath)`. -/
-theorem round9_adapter_plan_and_canary_regressions_exhaustive_tests
+   duplicate or prefix-overlapping concrete cells at `(allocId, offset)`. -/
+theorem aggregate_join_branch_local_loan_and_heap_lookup_tests
     (cond : Bool) (v0 v1 : Nat) :
     -- 1. Post-join field projection `.localSub 1 [0]` on an aggregate local
     -- after a symbolic branch:
@@ -2300,33 +2851,39 @@ theorem round9_adapter_plan_and_canary_regressions_exhaustive_tests
       some (.choice (.symBool true)
         (.choice (.symBool false) (.nat 11) (.nat 21))
         (.choice (.symBool false) (.nat 12) (.nat 22))) ∧
-    -- 4. `m3SpatialModel.ownSubPlace` rejects duplicate cells at `(0, 0, [])`:
+    -- 4. `m3SpatialModel.ownSubPlace` rejects duplicate or prefix-overlapping
+    -- cells at `(0, 0)`:
     (let dupHeap : List (M3Cell StdVal) :=
        [ ⟨0, 0, [], 1, .activeUnique, .init (.nat 10)⟩
        , ⟨0, 0, [], 1, .activeUnique, .init (.nat 20)⟩ ]
-     (m3SpatialModel StdVal).ownSubPlace dupHeap (0, 0) [] 1 .unborrowed
-       (.nat 10) → False) :=
-  ⟨rfl, rfl, rfl, fun h => h⟩
+     let overlapHeap : List (M3Cell StdVal) :=
+       [ ⟨0, 0, [], 1, .activeUnique, .init (.pair (.nat 1) (.nat 2))⟩
+       , ⟨0, 0, [0], 2, .activeUnique, .init (.nat 99)⟩ ]
+     ((m3SpatialModel StdVal).ownSubPlace dupHeap (0, 0) [] 1 .unborrowed
+        (.nat 10) → False) ∧
+     ((m3SpatialModel StdVal).ownSubPlace overlapHeap (0, 0) [] 1 .unborrowed
+        (.pair (.nat 1) (.nat 2)) → False)) :=
+  ⟨rfl, rfl, rfl, ⟨fun h => h, fun h => h⟩⟩
 
 /-- A five-level left-nested pair `((((1, 2), 3), 4), 5), 6)`. -/
 def deepNestedStdVal : StdVal :=
   .pair (.pair (.pair (.pair (.pair (.nat 1) (.nat 2)) (.nat 3)) (.nat 4))
     (.nat 5)) (.nat 6)
 
-/-- Exhaustive Round 10 regression tests for `Plan`, `BlockCfg`, `Adapter`, and
-`Canaries`:
+/-- Tests for `Plan`, `BlockCfg`, and `Adapter`:
 1. Dereferencing a handle local that is itself mutably borrowed fails,
 2. Aliased `.sharedRef` parameters on one root observe a single coherent value
-   (derived from the earlier loan), and a shared parameter that strictly
-   encloses an earlier one is rejected,
-3. `applyOneJoinPair` rejects renaming involving a root-parameter loan,
+   (derived from the earlier loan, or, for a shared parameter that strictly
+   encloses an earlier one, re-derived for the earlier loan from the larger
+   value),
+3. `applyJoinPairs` rejects renaming involving a root-parameter loan,
 4. Returning a `&mut` backed by a local of the current frame fails,
-5. Symbolic joins merge aggregates field by field at any depth (five nested
-   levels, beyond the former fixed cutoff of four),
+5. Symbolic joins merge aggregates field by field at any depth (here, five
+   nested levels),
 6. `CfgCertificate.singleBlock` carries usable CFG-to-plan evidence, and
 7. `spatialFinalBindingsHold` requires each final root cell to keep the root
    loan's tag. -/
-theorem round10_plan_cfg_adapter_regressions_exhaustive_tests
+theorem borrowed_handle_shared_alias_and_frame_escape_tests
     (cond : Bool) (v0 : Nat) :
     -- 1. `*r` through a mutably borrowed handle `r`:
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat v0⟩]
@@ -2340,9 +2897,9 @@ theorem round10_plan_cfg_adapter_regressions_exhaustive_tests
     evalFnValue stdValAlg
       [⟨.sharedRef 0 [], .pair (.nat 1) (.nat 2)⟩, ⟨.sharedRef 0 [1], .nat 9⟩]
       .skip (.use (.derefSub 1 [])) = .ok ⟨.nat 2, []⟩ ∧
-    initFnState stdValAlg
-      [⟨.sharedRef 0 [0], .nat 1⟩, ⟨.sharedRef 0 [], .pair (.nat 1) (.nat 2)⟩]
-      = .fail ∧
+    evalFnValue stdValAlg
+      [⟨.sharedRef 0 [0], .nat 1⟩, ⟨.sharedRef 0 [], .pair (.nat 5) (.nat 6)⟩]
+      .skip (.use (.derefSub 0 [])) = .ok ⟨.nat 5, []⟩ ∧
     -- 3. Explicit join pairs never rename root loans:
     (let cell : PlaceCell StdVal := ⟨.nat 0, .unborrowed⟩
      let st1 : SymState StdVal :=
@@ -2357,8 +2914,8 @@ theorem round10_plan_cfg_adapter_regressions_exhaustive_tests
      let st2' : SymState StdVal :=
        ⟨[], [⟨0, .ended, cell, .direct (.localReg 4) []⟩,
              ⟨1, .activeMut, cell, .direct (.localReg 5) []⟩], [], [], [], 0⟩
-     applyOneJoinPair stdValAlg 0 1 st1 st2 = none ∧
-     (match applyOneJoinPair stdValAlg 0 1 st1' st2' with
+     applyJoinPairs stdValAlg [(0, 1)] st1 st2 = none ∧
+     (match applyJoinPairs stdValAlg [(0, 1)] st1' st2' with
       | some _ => True
       | none => False)) ∧
     -- 4. `&mut` to a local cannot be returned:
@@ -2398,7 +2955,7 @@ theorem round10_plan_cfg_adapter_regressions_exhaustive_tests
        cases hOwn with
        | intro _ hPerm => cases hPerm.1)⟩
 
-/-! ## Round 11 Regression Tests for `Plan`, `Adapter`, and `Canaries` -/
+/-! ### Region-Group Reuse, Handle Copies, and Join Shapes -/
 
 /-- Field accessor for `metaStdValAlg`: only the first component of a
 `StdVal.pair` is a field. -/
@@ -2504,13 +3061,18 @@ theorem metaStd_setField_setField_comm (f g : FieldIdx) (s a b s1 s2 : StdVal)
   | succ _ => nomatch h1
 
 theorem metaStd_getField_lt_sizeBound (f : FieldIdx) (v c : StdVal)
-    (hGet : metaStdGetField f v = some c) : f < v.fuel := by
+    (hGet : metaStdGetField f v = some c) :
+    f < v.fuel ∧ c.fuel < v.fuel := by
   cases f with
   | zero =>
     cases v with
     | mk fv tv =>
       cases tv with
-      | pairBranch fl fr l r => exact Nat.zero_lt_succ _
+      | pairBranch fl fr l r =>
+        injection hGet with hEq
+        subst hEq
+        exact ⟨Nat.zero_lt_succ _,
+          Nat.lt_succ_of_le (Nat.le_add_right fl fr)⟩
       | unit => nomatch hGet
       | nat _ => nomatch hGet
       | bool _ => nomatch hGet
@@ -2533,13 +3095,98 @@ theorem metaStd_decodeRef_getField (f : FieldIdx) (v : StdVal)
     | pairBranch _ _ _ _ => nomatch hDec
     | choice _ _ _ _ _ _ => nomatch hDec
 
+theorem metaStd_getField_remapRefInVal (oldLid newLid : LoanId)
+    (f : FieldIdx) (v : StdVal) :
+    metaStdGetField f (remapStdVal oldLid newLid v) =
+      (metaStdGetField f v).map (remapStdVal oldLid newLid) := by
+  cases f with
+  | succ _ =>
+    -- Only index `0` is ever a field.
+    rfl
+  | zero =>
+    cases v with
+    | mk fv tv =>
+      cases tv with
+      | unit => rfl
+      | nat _ => rfl
+      | bool _ => rfl
+      | symBool _ => rfl
+      | refVal lid path =>
+        change metaStdGetField 0
+            (remapStdVal oldLid newLid (.refVal lid path)) = _
+        rw [remapStdVal_refVal]
+        rfl
+      | pairBranch fl fr a b =>
+        change metaStdGetField 0
+            (remapStdVal oldLid newLid (.pair ⟨fl, a⟩ ⟨fr, b⟩)) = _
+        rw [remapStdVal_pair]
+        rfl
+      | choice fc ft ff c vt vf =>
+        change metaStdGetField 0 (remapStdVal oldLid newLid
+            (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+        rw [remapStdVal_choice]
+        rfl
+
+theorem metaStd_remapRefInVal_leaf (oldLid newLid : LoanId) (v : StdVal)
+    (hDec : stdDecodeRef v = none) (hFields : ∀ f, metaStdGetField f v = none)
+    (hSplit : stdBranchSplit v = none) : remapStdVal oldLid newLid v = v :=
+  stdVal_remapRefInVal_leaf oldLid newLid v hDec
+    (fun f => by
+      cases v with
+      | mk fv tv =>
+        cases tv with
+        | pairBranch _ _ _ _ => exact nomatch hFields 0
+        | unit => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+        | nat _ => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+        | bool _ => cases f with | zero => rfl | succ f' => cases f' <;> rfl
+        | symBool _ =>
+          cases f with
+          | zero => rfl
+          | succ f' => cases f' <;> rfl
+        | refVal _ _ =>
+          cases f with
+          | zero => rfl
+          | succ f' => cases f' <;> rfl
+        | choice _ _ _ _ _ _ =>
+          cases f with
+          | zero => rfl
+          | succ f' => cases f' <;> rfl)
+    hSplit
+
 /-- Test algebra whose aggregates carry non-field metadata: a `StdVal.pair`
 exposes only its first component as a field, and its second component plays the
 role of an outer tag (like a `MirVal.adt` discriminant). It therefore never
-reports two aggregates as field-wise mergeable. -/
+reports two aggregates as field-wise mergeable. Handle renaming still renames
+handles inside the tag (`remapStdVal`); the `ValAlgebra` laws allow that, since
+they constrain only what `getField` and the other observers expose. -/
+theorem metaStd_getField_projectBranchVal (cond : StdVal) (branch : Bool)
+    (f : FieldIdx) (s a : StdVal) (hGet : metaStdGetField f s = some a) :
+    metaStdGetField f (projectBranchStdVal cond branch s) =
+      some (projectBranchStdVal cond branch a) := by
+  cases f with
+  | succ _ => nomatch hGet
+  | zero =>
+    cases s with
+    | mk fs ts =>
+      cases ts with
+      | unit => nomatch hGet
+      | nat _ => nomatch hGet
+      | bool _ => nomatch hGet
+      | symBool _ => nomatch hGet
+      | refVal _ _ => nomatch hGet
+      | choice _ _ _ _ _ _ => nomatch hGet
+      | pairBranch fl fr l r =>
+        injection hGet with hEq
+        subst hEq
+        change metaStdGetField 0
+            (projectBranchStdVal cond branch (.pair ⟨fl, l⟩ ⟨fr, r⟩)) = _
+        rw [projectBranchStdVal_pair]
+        rfl
+
 def metaStdValAlg : ValAlgebra StdVal :=
   { stdValAlg with
     getField := metaStdGetField
+    getField_projectBranchVal := metaStd_getField_projectBranchVal
     setField := metaStdSetField
     getField_setField := metaStd_getField_setField
     setField_getField := metaStd_setField_getField
@@ -2548,12 +3195,14 @@ def metaStdValAlg : ValAlgebra StdVal :=
     setField_setField_comm := metaStd_setField_setField_comm
     getField_lt_sizeBound := metaStd_getField_lt_sizeBound
     decodeRef_getField := metaStd_decodeRef_getField
+    getField_remapRefInVal := metaStd_getField_remapRefInVal
+    remapRefInVal_leaf := metaStd_remapRefInVal_leaf
     sameAggregateShape := fun _ _ => false
     sameAggregateShape_ext := fun _ _ hShape _ => nomatch hShape
     sameAggregateShape_setField := fun _ _ _ _ _ hShape _ => nomatch hShape }
 
 /-- By-value call summary returning its single pure argument. -/
-def round11IdentityByValSummary : CallSummary StdVal where
+def identityByValSummary : CallSummary StdVal where
   returnsMutBorrow := false
   fwd pureVals _ :=
     match pureVals with
@@ -2561,15 +3210,22 @@ def round11IdentityByValSummary : CallSummary StdVal where
     | _ => none
   back _ _ _ := some []
 
+/-- By-value call summary that ignores its argument and returns `.unit`, so
+only the argument check can reject a call. -/
+def dropArgSummary : CallSummary StdVal where
+  returnsMutBorrow := false
+  fwd _ _ := some .unit
+  back _ _ _ := some []
+
 /-- By-value call summary that fabricates a handle to loan `0`. -/
-def round11ForgeHandleSummary : CallSummary StdVal where
+def forgeHandleSummary : CallSummary StdVal where
   returnsMutBorrow := false
   fwd _ _ := some (.refVal 0 [])
   back _ _ _ := some []
 
 /-- Output-free region group `gid` requiring the groups `children`; its
 callback accepts any deposits and deposits nothing. -/
-def round11BareRegionSpec (gid : RegionGroupId)
+def bareRegionSpec (gid : RegionGroupId)
     (children : List RegionGroupId) : RegionGroupSpec StdVal where
   groupId := gid
   requiredChildren := children
@@ -2582,13 +3238,13 @@ def round11BareRegionSpec (gid : RegionGroupId)
 install a second child `1`, either while the parent is still active
 (`endParentFirst = false`) or after the parent ends. Every group is ended
 before returning. -/
-def round11RegionReusePlan (endParentFirst : Bool) : FlowPlan StdVal :=
+def regionReusePlan (endParentFirst : Bool) : FlowPlan StdVal :=
   let reinstallChild : FlowPlan StdVal :=
-    .seq (.act (.callMultiRegion [] [round11BareRegionSpec 1 []]))
+    .seq (.act (.callMultiRegion [] [bareRegionSpec 1 []]))
       (.act (.endRegionGroup 1))
   .seq
     (.act (.callMultiRegion []
-      [round11BareRegionSpec 0 [1], round11BareRegionSpec 1 []]))
+      [bareRegionSpec 0 [1], bareRegionSpec 1 []]))
     (.seq
       (.act (.endRegionGroup 1))
       (match endParentFirst with
@@ -2596,41 +3252,42 @@ def round11RegionReusePlan (endParentFirst : Bool) : FlowPlan StdVal :=
        | false => .seq reinstallChild (.act (.endRegionGroup 0))))
 
 /-- A guard that itself depends on `.symBool true`. -/
-def round11DependentGuard : StdVal :=
+def dependentGuard : StdVal :=
   zipStdVal (.symBool true) (.bool true) (.bool false)
 
 /-- Loan `5` with an active child borrow of its field `[0]`, so the binding of
 its root sub-place sees a `.split` permission. -/
-def round11SplitLoanState : SymState StdVal :=
+def splitLoanState : SymState StdVal :=
   ⟨[], [⟨5, .activeMut,
          ⟨.pair (.nat 1) (.nat 2), .split [([0], .mutLocked 6)]⟩,
          .rootParam 0⟩], [], [], [], 0⟩
 
 /-- One concrete cell at `(0, 0, [])` holding loan `5`'s value under `tag`. -/
-def round11SplitHeap (tag : Nat) : List (M3Cell StdVal) :=
+def splitHeap (tag : Nat) : List (M3Cell StdVal) :=
   [⟨0, 0, [], tag, .activeUnique, .init (.pair (.nat 1) (.nat 2))⟩]
 
 /-- Reinstalling a completed child region group while a parent from an earlier
 invocation still requires it fails, even though the plan later ends every
 group. -/
-theorem round11_region_group_reuse_rejected :
-    evalFnValue stdValAlg [] (round11RegionReusePlan false) (.constVal .unit) =
+theorem region_group_reuse_while_parent_active_rejected :
+    evalFnValue stdValAlg [] (regionReusePlan false) (.constVal .unit) =
       .fail :=
   rfl
 
 /-- Reinstalling child region group `1` after the parent that required it has
-ended succeeds; together with `round11_region_group_reuse_rejected` this shows
-that only the reuse ordering is rejected. -/
-theorem round11_region_group_reuse_after_parent_ends :
-    evalFnValue stdValAlg [] (round11RegionReusePlan true) (.constVal .unit) =
+ended succeeds; together with
+`region_group_reuse_while_parent_active_rejected` this shows that only the
+reuse ordering is rejected. -/
+theorem region_group_reuse_after_parent_ends :
+    evalFnValue stdValAlg [] (regionReusePlan true) (.constVal .unit) =
       .ok ⟨.unit, []⟩ :=
   rfl
 
-/-- Round 11 regression tests for copying borrow handles: a value containing a
-handle to an active mutable loan (or to a loan that does not exist) cannot be
-copied by `assign`, by a by-value call argument, or by a by-value call result,
-while shared and ended handles still can. -/
-theorem round11_mut_handle_copy_regressions_tests :
+/-- Tests for copying borrow handles: a value containing a
+handle to an active mutable loan, an ended loan, or a loan that does not exist
+cannot be copied by `assign`, by a by-value call argument, or by a by-value
+call result, while root-level shared handles (`subPath = []`) can. -/
+theorem mut_handle_copy_tests :
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
       (.act (.assign (.localSub 1 []) (.use (.localSub 0 []))))
       (.constVal .unit) = .fail ∧
@@ -2642,10 +3299,10 @@ theorem round11_mut_handle_copy_regressions_tests :
       (.act (.assign (.localSub 1 []) (.constVal (.refVal 3 []))))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (.act (.call 1 round11IdentityByValSummary [.use (.localSub 0 [])] []))
+      (.act (.call 1 dropArgSummary [.use (.localSub 0 [])] []))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (.act (.call 1 round11ForgeHandleSummary [] []))
+      (.act (.call 1 forgeHandleSummary [] []))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.sharedRef 0 [], .nat 5⟩]
       (.act (.assign (.localSub 1 []) (.use (.localSub 0 []))))
@@ -2654,13 +3311,13 @@ theorem round11_mut_handle_copy_regressions_tests :
       (.seq (.act (.borrow 1 .mutBorrow (.derefSub 0 [])))
         (.seq (.act (.endLoan 1))
           (.act (.assign (.localSub 2 []) (.use (.localSub 1 []))))))
-      (.constVal .unit) = .ok ⟨.unit, [.nat 5]⟩ :=
+      (.constVal .unit) = .fail :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Exhaustive Round 11 regression tests for `Plan`, `Adapter`, and
-`Canaries` (see also `round11_region_group_reuse_rejected`,
-`round11_region_group_reuse_after_parent_ends`, and
-`round11_mut_handle_copy_regressions_tests`):
+/-- Tests for `Plan`, `Adapter`, and
+`Canaries` (see also `region_group_reuse_while_parent_active_rejected`,
+`region_group_reuse_after_parent_ends`, and
+`mut_handle_copy_tests`):
 1. Branch joins merge aggregates field by field only when
    `sameAggregateShape` vouches that no non-field data differs; otherwise the
    whole aggregate goes through `zipVal`,
@@ -2674,7 +3331,7 @@ theorem round11_mut_handle_copy_regressions_tests :
    bound loan's tag, and
 6. `getPath_putPath_diverging` derives sibling-field preservation from
    `getField_setField_other`. -/
-theorem round11_plan_cfg_adapter_regressions_exhaustive_tests :
+theorem aggregate_shape_local_slot_and_guard_tests :
     -- 1. Field-wise merge requires `sameAggregateShape`:
     zipOrKeepSameRef metaStdValAlg (.symBool true)
       (.pair (.nat 1) (.nat 7)) (.pair (.nat 1) (.nat 8)) =
@@ -2704,10 +3361,10 @@ theorem round11_plan_cfg_adapter_regressions_exhaustive_tests :
       (.act (.borrow 0 .mutBorrow (.localSub 0 [])))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.byVal, .nat 5⟩]
-      (.act (.call 3 round11IdentityByValSummary [.constVal (.nat 9)] []))
+      (.act (.call 3 identityByValSummary [.constVal (.nat 9)] []))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.byVal, .nat 5⟩]
-      (.act (.call 1 round11IdentityByValSummary [.constVal (.nat 9)] []))
+      (.act (.call 1 identityByValSummary [.constVal (.nat 9)] []))
       (.use (.localSub 1 [])) = .ok ⟨.nat 9, []⟩ ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
       (.seq
@@ -2736,14 +3393,14 @@ theorem round11_plan_cfg_adapter_regressions_exhaustive_tests :
       (.constVal .unit) = .ok ⟨.unit, [.nat 5]⟩ ∧
     -- 4. Dependent guards are projected:
     projectBranchStdVal (.symBool true) true
-      (.choice round11DependentGuard (.nat 1) (.nat 2)) = .nat 1 ∧
+      (.choice dependentGuard (.nat 1) (.nat 2)) = .nat 1 ∧
     projectBranchStdVal (.symBool true) false
-      (.choice round11DependentGuard (.nat 1) (.nat 2)) = .nat 2 ∧
+      (.choice dependentGuard (.nat 1) (.nat 2)) = .nat 2 ∧
     -- 5. A `.split` root cell must carry the bound loan's tag:
     spatialBindingsHold (m3SpatialModel StdVal) [(5, (0, 0), [])]
-      round11SplitLoanState (round11SplitHeap 5) ∧
+      splitLoanState (splitHeap 5) ∧
     ¬ spatialBindingsHold (m3SpatialModel StdVal) [(5, (0, 0), [])]
-      round11SplitLoanState (round11SplitHeap 999) ∧
+      splitLoanState (splitHeap 999) ∧
     -- 6. Diverging sub-paths are separated by the field laws:
     (∀ (s v s' : StdVal),
       putPath stdValAlg [0, 1] s v = some s' →
@@ -2755,12 +3412,12 @@ theorem round11_plan_cfg_adapter_regressions_exhaustive_tests :
      getPath_putPath_diverging stdValAlg 1 0 [] [] (fun h => nomatch h) [0]
        s v s' hPut⟩
 
-/-! ## Round 12 Regression Tests for Region Deposits and Field Commutation -/
+/-! ### Region Deposits, Field Commutation, and Region Outputs -/
 
 /-- Output-free region group `gid` that locks `input`, writes the number of
 deposits its backward function received back to `input`, and deposits `dep`.
 -/
-def round12CountingRegionSpec (gid : RegionGroupId)
+def countingRegionSpec (gid : RegionGroupId)
     (children : List RegionGroupId) (input : PlaceExpr)
     (dep : List StdVal := [.nat 9]) : RegionGroupSpec StdVal where
   groupId := gid
@@ -2773,28 +3430,28 @@ def round12CountingRegionSpec (gid : RegionGroupId)
 /-- Install independent groups `0` and `1` over `*p.0` and `*p.1`, then end
 them in the order `gids`. Both groups deposit a value that no parent consumes.
 -/
-def round12IndependentGroupsPlan (gids : List RegionGroupId) :
+def independentGroupsPlan (gids : List RegionGroupId) :
     FlowPlan StdVal :=
   .seq
     (.act (.callMultiRegion []
-      [ round12CountingRegionSpec 0 [] (.derefSub 0 [0])
-      , round12CountingRegionSpec 1 [] (.derefSub 0 [1]) ]))
+      [ countingRegionSpec 0 [] (.derefSub 0 [0])
+      , countingRegionSpec 1 [] (.derefSub 0 [1]) ]))
     (listFold .skip (fun gid _ ih => .seq (.act (.endRegionGroup gid)) ih) gids)
 
 /-- Install parent `0` (requiring child `1`) over `*p.0`, child `1` over
 `*p.1.0`, and unrelated group `2` over `*p.1.1`, then end them in the order
 `gids`. Only the child deposits a value. -/
-def round12ChildDepositPlan (gids : List RegionGroupId) : FlowPlan StdVal :=
+def childDepositPlan (gids : List RegionGroupId) : FlowPlan StdVal :=
   .seq
     (.act (.callMultiRegion []
-      [ round12CountingRegionSpec 0 [1] (.derefSub 0 [0]) []
-      , round12CountingRegionSpec 1 [] (.derefSub 0 [1, 0])
-      , round12CountingRegionSpec 2 [] (.derefSub 0 [1, 1]) [] ]))
+      [ countingRegionSpec 0 [1] (.derefSub 0 [0]) []
+      , countingRegionSpec 1 [] (.derefSub 0 [1, 0])
+      , countingRegionSpec 2 [] (.derefSub 0 [1, 1]) [] ]))
     (listFold .skip (fun gid _ ih => .seq (.act (.endRegionGroup gid)) ih) gids)
 
 /-- The value of loan `0` after running `plan` from the entry state of
 `params`, if the plan falls through. -/
-def round12Loan0After (params : List (ParamInput StdVal))
+def loan0After (params : List (ParamInput StdVal))
     (plan : FlowPlan StdVal) : Option StdVal :=
   match initFnState stdValAlg params with
   | .ok st0 =>
@@ -2813,24 +3470,24 @@ def round12Loan0After (params : List (ParamInput StdVal))
    deposit order), and
 3. `putPath_putPath_diverging_comm` makes updates of diverging sub-paths
    order-independent as whole values. -/
-theorem round12_region_deposit_and_commutation_regressions_tests :
+theorem region_deposit_scope_and_commutation_tests :
     -- 1. Independent groups, both orders:
-    round12Loan0After [⟨.mutRef 0 [], .pair (.nat 5) (.nat 5)⟩]
-      (round12IndependentGroupsPlan [0, 1]) =
+    loan0After [⟨.mutRef 0 [], .pair (.nat 5) (.nat 5)⟩]
+      (independentGroupsPlan [0, 1]) =
       some (.pair (.nat 0) (.nat 0)) ∧
-    round12Loan0After [⟨.mutRef 0 [], .pair (.nat 5) (.nat 5)⟩]
-      (round12IndependentGroupsPlan [1, 0]) =
+    loan0After [⟨.mutRef 0 [], .pair (.nat 5) (.nat 5)⟩]
+      (independentGroupsPlan [1, 0]) =
       some (.pair (.nat 0) (.nat 0)) ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .pair (.nat 5) (.nat 5)⟩]
-      (round12IndependentGroupsPlan [0, 1]) (.constVal .unit) = .fail ∧
+      (independentGroupsPlan [0, 1]) (.constVal .unit) = .fail ∧
     -- 2. Only the declared parent sees (and consumes) the child's deposit:
     evalFnValue stdValAlg
       [⟨.mutRef 0 [], .pair (.nat 5) (.pair (.nat 5) (.nat 5))⟩]
-      (round12ChildDepositPlan [1, 2, 0]) (.constVal .unit) =
+      (childDepositPlan [1, 2, 0]) (.constVal .unit) =
       .ok ⟨.unit, [.pair (.nat 1) (.pair (.nat 0) (.nat 0))]⟩ ∧
     evalFnValue stdValAlg
       [⟨.mutRef 0 [], .pair (.nat 5) (.pair (.nat 5) (.nat 5))⟩]
-      (round12ChildDepositPlan [2, 1, 0]) (.constVal .unit) =
+      (childDepositPlan [2, 1, 0]) (.constVal .unit) =
       .ok ⟨.unit, [.pair (.nat 1) (.pair (.nat 0) (.nat 0))]⟩ ∧
     (match endRegionGroupInState stdValAlg 1
         ⟨[], [], [⟨1, true, 0, [], [], [], fun _ _ => some ([], [.nat 9])⟩,
@@ -2859,7 +3516,7 @@ theorem round12_region_deposit_and_commutation_regressions_tests :
 /-- Region group `gid` over `input` with one output bound to `dst`; its
 backward function writes the output's final value back to `input` and makes
 no deposits. -/
-def round12NoDepositRegionSpec (gid : RegionGroupId) (input : PlaceExpr)
+def noDepositRegionSpec (gid : RegionGroupId) (input : PlaceExpr)
     (dst : LocalId) : RegionGroupSpec StdVal where
   groupId := gid
   requiredChildren := []
@@ -2876,17 +3533,17 @@ def round12NoDepositRegionSpec (gid : RegionGroupId) (input : PlaceExpr)
 
 /-- Install group `3` over `*p` with its output in `dst`, set the output to
 `7`, and end the group. -/
-def round12InstallAndEndPlan (dst : LocalId) : FlowPlan StdVal :=
+def installAndEndPlan (dst : LocalId) : FlowPlan StdVal :=
   .seq
     (.act (.callMultiRegion []
-      [round12NoDepositRegionSpec 3 (.derefSub 1 []) dst]))
+      [noDepositRegionSpec 3 (.derefSub 1 []) dst]))
     (.seq
       (.act (.assign (.derefSub dst []) (.constVal (.nat 7))))
       (.act (.endRegionGroup 3)))
 
 /-- A two-block CFG whose entry block branches on local `0` to block `1` on
 both edges. -/
-def round12SameTargetCfg : List (BasicBlock StdVal) :=
+def sameTargetCfg : List (BasicBlock StdVal) :=
   [ ⟨.skip, .branch (.use (.localSub 0 [])) 1 1⟩
   , ⟨.act (.assign (.localSub 1 []) (.constVal (.nat 10))),
      .ret (.use (.localSub 1 []))⟩ ]
@@ -2900,25 +3557,30 @@ groups at joins, and CFG branches with identical successors:
    that is active, left deposits, or is required by an active group, and
 3. A symbolic CFG branch whose successors coincide runs the successor once and
    returns its result unmerged. -/
-theorem round12_region_outputs_joins_and_cfg_regressions_tests :
+theorem region_outputs_joins_and_cfg_branch_tests :
     -- 1. Distinct output destinations:
-    evalFnValue stdValAlg [⟨.mutRef 0 [], .pair (.nat 1) (.nat 2)⟩]
+    planStepFails [⟨.mutRef 0 [], .pair (.nat 1) (.nat 2)⟩]
       (.act (.callMultiRegion []
         [ { regionSpecWithAdd 1 with
               inputPlaces := [.derefSub 0 [0]], outDsts := [1] }
         , { regionSpecWithAdd 2 with
               groupId := 1, inputPlaces := [.derefSub 0 [1]], outDsts := [1] }
-        ]))
-      (.constVal .unit) = .fail ∧
-    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 1⟩]
+        ])) = true ∧
+    planStepFails [⟨.mutRef 0 [], .nat 1⟩]
       (.act (.callMultiRegion []
         [ { regionSpecWithAdd 1 with
               inputPlaces := [.derefSub 0 []], outDsts := [1, 1]
               fwdOuts := fun _ muts =>
                 match muts with
                 | [v] => some [v, v]
-                | _ => none } ]))
-      (.constVal .unit) = .fail ∧
+                | _ => none } ])) = true ∧
+    planStepFails [⟨.mutRef 0 [], .pair (.nat 1) (.nat 2)⟩]
+      (.act (.callMultiRegion []
+        [ { regionSpecWithAdd 1 with
+              inputPlaces := [.derefSub 0 [0]], outDsts := [1] }
+        , { regionSpecWithAdd 2 with
+              groupId := 1, inputPlaces := [.derefSub 0 [1]], outDsts := [2] }
+        ])) = false ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .pair (.nat 1) (.nat 2)⟩]
       (.seq
         (.act (.callMultiRegion []
@@ -2931,30 +3593,32 @@ theorem round12_region_outputs_joins_and_cfg_regressions_tests :
       (.constVal .unit) = .ok ⟨.unit, [.pair (.nat 2) (.nat 4)]⟩ ∧
     -- 2. Branch-local region groups at joins:
     evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
-      (.branch (.use (.localSub 0 [])) (round12InstallAndEndPlan 2) .skip)
+      (.branch (.use (.localSub 0 [])) (installAndEndPlan 2) .skip)
       (.constVal .unit) =
       .ok ⟨.unit, [zipStdVal (.symBool true) (.nat 7) (.nat 5)]⟩ ∧
     evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
-      (.seq (round12InstallAndEndPlan 2)
-        (.branch (.use (.localSub 0 [])) (round12InstallAndEndPlan 2) .skip))
+      (.seq (installAndEndPlan 2)
+        (.branch (.use (.localSub 0 [])) (installAndEndPlan 2) .skip))
       (.constVal .unit) =
       .ok ⟨.unit, [zipStdVal (.symBool true) (.nat 7) (.nat 7)]⟩ ∧
-    evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
-      (.seq
-        (.branch (.use (.localSub 0 []))
-          (.act (.callMultiRegion []
-            [round12NoDepositRegionSpec 3 (.derefSub 1 []) 2]))
-          .skip)
-        (.act (.endRegionGroup 3)))
-      (.constVal .unit) = .fail ∧
-    evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
+    planStepFails [⟨.byVal, .symBool true⟩]
+      (.branch (.use (.localSub 0 []))
+        (.act (.callMultiRegion [] [bareRegionSpec 3 []])) .skip) =
+      true ∧
+    planStepFails [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
       (.branch (.use (.localSub 0 []))
         (.seq
-          (.act (.callMultiRegion [] [round12CountingRegionSpec 3 []
-            (.derefSub 1 [])]))
+          (.act (.callMultiRegion []
+            [countingRegionSpec 3 [] (.derefSub 1 [])]))
           (.act (.endRegionGroup 3)))
-        .skip)
-      (.constVal .unit) = .fail ∧
+        .skip) = true ∧
+    planStepFails [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
+      (.branch (.use (.localSub 0 []))
+        (.seq
+          (.act (.callMultiRegion []
+            [countingRegionSpec 3 [] (.derefSub 1 []) []]))
+          (.act (.endRegionGroup 3)))
+        .skip) = false ∧
     joinRegionGroups stdValAlg (.symBool true)
       [⟨0, true, 0, [], [], [3], fun _ _ => none⟩,
        ⟨3, false, 1, [], [], [], fun _ _ => none⟩]
@@ -2962,58 +3626,55 @@ theorem round12_region_outputs_joins_and_cfg_regressions_tests :
     -- 3. Identical CFG successors:
     (match initFnState stdValAlg [⟨.byVal, .symBool true⟩] with
      | .ok st0 =>
-       runBlockCfg (stepBasicBlock stdValAlg round12SameTargetCfg) 0 st0 2 =
+       runBlockCfg (stepBasicBlock stdValAlg sameTargetCfg) 0 st0 2 =
          .ret ⟨.nat 10, []⟩
      | .fail => False) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-! ## Round 13 Regression Tests for Pre-Review Hardening -/
+/-! ### Field Joins, Uninitialized Locals, Handles, and Writeback Ownership -/
 
-/-- Field-index map for `gapStdValAlg`: field `0` is a pair's first component,
-field `2` its second, and index `1` is a gap. -/
+/-- Field-index map for `gapStdValAlg`: field `1` is a pair's first component,
+field `2` its second, and index `0` is a gap. -/
 def gapIdx (f : FieldIdx) : Option FieldIdx :=
   match f with
-  | 0 => some 0
+  | 1 => some 0
   | 2 => some 1
   | _ => none
 
 theorem gapIdx_inj (f g i : FieldIdx) (hf : gapIdx f = some i)
     (hg : gapIdx g = some i) : f = g := by
   cases f with
-  | zero =>
-    cases g with
-    | zero => rfl
-    | succ g1 =>
-      cases g1 with
-      | zero => nomatch hg
-      | succ g2 =>
-        cases g2 with
-        | zero =>
-          injection hf with hf'
-          injection hg with hg'
-          subst hf'
-          nomatch hg'
-        | succ _ => nomatch hg
+  | zero => nomatch hf
   | succ f1 =>
-    cases f1 with
-    | zero => nomatch hf
-    | succ f2 =>
-      cases f2 with
+    cases g with
+    | zero => nomatch hg
+    | succ g1 =>
+      cases f1 with
       | zero =>
-        cases g with
+        cases g1 with
+        | zero => rfl
+        | succ g2 =>
+          cases g2 with
+          | zero =>
+            injection hf with hf'
+            injection hg with hg'
+            subst hf'
+            nomatch hg'
+          | succ _ => nomatch hg
+      | succ f2 =>
+        cases f2 with
         | zero =>
-          injection hf with hf'
-          injection hg with hg'
-          subst hf'
-          nomatch hg'
-        | succ g1 =>
           cases g1 with
-          | zero => nomatch hg
+          | zero =>
+            injection hf with hf'
+            injection hg with hg'
+            subst hf'
+            nomatch hg'
           | succ g2 =>
             cases g2 with
             | zero => rfl
             | succ _ => nomatch hg
-      | succ _ => nomatch hf
+        | succ _ => nomatch hf
 
 def gapGetField (f : FieldIdx) (v : StdVal) : Option StdVal :=
   match gapIdx f with
@@ -3100,12 +3761,29 @@ theorem gap_setField_setField_comm (f g : FieldIdx) (s a b s1 s2 : StdVal)
         (fun hEq => hNe (gapIdx_inj f g j (hEq ▸ hf) hg)) h1 h2
 
 theorem gap_getField_lt_sizeBound (f : FieldIdx) (v c : StdVal)
-    (hGet : gapGetField f v = some c) : f < v.fuel := by
+    (hGet : gapGetField f v = some c) :
+    f < v.fuel ∧ c.fuel < v.fuel := by
   cases f with
-  | zero => exact stdVal_getField_lt_sizeBound 0 v c hGet
+  | zero => nomatch hGet
   | succ f1 =>
     cases f1 with
-    | zero => nomatch hGet
+    | zero =>
+      cases v with
+      | mk fv tv =>
+        cases tv with
+        | pairBranch fl fr l r =>
+          injection hGet with hEq
+          subst hEq
+          exact ⟨Nat.succ_lt_succ
+            (Nat.lt_of_lt_of_le (stdValTree_fuel_pos l)
+              (Nat.le_add_right fl fr)),
+            Nat.lt_succ_of_le (Nat.le_add_right fl fr)⟩
+        | unit => nomatch hGet
+        | nat _ => nomatch hGet
+        | bool _ => nomatch hGet
+        | symBool _ => nomatch hGet
+        | refVal _ _ => nomatch hGet
+        | choice _ _ _ _ _ _ => nomatch hGet
     | succ f2 =>
       cases f2 with
       | zero =>
@@ -3113,8 +3791,11 @@ theorem gap_getField_lt_sizeBound (f : FieldIdx) (v c : StdVal)
         | mk fv tv =>
           cases tv with
           | pairBranch fl fr l r =>
-            exact Nat.succ_lt_succ
-              (Nat.add_le_add (stdValTree_fuel_pos l) (stdValTree_fuel_pos r))
+            injection hGet with hEq
+            subst hEq
+            exact ⟨Nat.succ_lt_succ
+              (Nat.add_le_add (stdValTree_fuel_pos l) (stdValTree_fuel_pos r)),
+              Nat.lt_succ_of_le (Nat.le_add_left fr fl)⟩
           | unit => nomatch hGet
           | nat _ => nomatch hGet
           | bool _ => nomatch hGet
@@ -3128,7 +3809,7 @@ theorem gap_sameAggregateShape_ext (v1 v2 : StdVal)
     (hFields : ∀ f, gapGetField f v1 = gapGetField f v2) : v1 = v2 :=
   stdVal_sameAggregateShape_ext v1 v2 hShape (fun f =>
     match f with
-    | 0 => hFields 0
+    | 0 => hFields 1
     | 1 => hFields 2
     | _ + 2 => rfl)
 
@@ -3152,12 +3833,49 @@ theorem gap_decodeRef_getField (f : FieldIdx) (v : StdVal)
   | none => rfl
   | some i => exact stdVal_decodeRef_getField i v r hDec
 
+theorem gap_getField_remapRefInVal (oldLid newLid : LoanId) (f : FieldIdx)
+    (v : StdVal) :
+    gapGetField f (remapStdVal oldLid newLid v) =
+      (gapGetField f v).map (remapStdVal oldLid newLid) := by
+  unfold gapGetField
+  cases gapIdx f with
+  | none => rfl
+  | some i => exact stdVal_getField_remapRefInVal oldLid newLid i v
+
+theorem gap_remapRefInVal_leaf (oldLid newLid : LoanId) (v : StdVal)
+    (hDec : stdDecodeRef v = none) (hFields : ∀ f, gapGetField f v = none)
+    (hSplit : stdBranchSplit v = none) : remapStdVal oldLid newLid v = v :=
+  -- `gapGetField (i + 1)` is `stdValGetField i` for the indices `0` and `1`
+  -- that `stdValGetField` can answer.
+  stdVal_remapRefInVal_leaf oldLid newLid v hDec
+    (fun f =>
+      match f with
+      | 0 => hFields 1
+      | 1 => hFields 2
+      | _ + 2 => rfl)
+    hSplit
+
 /-- Test algebra over `StdVal` whose pairs expose their components at field
-indices `0` and `2`, leaving a gap at index `1`. All `ValAlgebra` laws hold,
-so traversals must not stop at the first missing index. -/
+indices `1` and `2`, leaving a gap at index `0`. All `ValAlgebra` laws hold,
+so traversals must neither require field `0` nor stop at the first missing
+index. -/
+theorem gap_getField_projectBranchVal (cond : StdVal) (branch : Bool)
+    (f : FieldIdx) (s a : StdVal) (hGet : gapGetField f s = some a) :
+    gapGetField f (projectBranchStdVal cond branch s) =
+      some (projectBranchStdVal cond branch a) := by
+  unfold gapGetField at hGet
+  unfold gapGetField
+  revert hGet
+  cases gapIdx f with
+  | none =>
+    intro hFalse
+    nomatch hFalse
+  | some i => exact stdVal_getField_projectBranchVal cond branch i s a
+
 def gapStdValAlg : ValAlgebra StdVal :=
   { stdValAlg with
     getField := gapGetField
+    getField_projectBranchVal := gap_getField_projectBranchVal
     setField := gapSetField
     getField_setField := gap_getField_setField
     setField_getField := gap_setField_getField
@@ -3166,28 +3884,30 @@ def gapStdValAlg : ValAlgebra StdVal :=
     setField_setField_comm := gap_setField_setField_comm
     getField_lt_sizeBound := gap_getField_lt_sizeBound
     decodeRef_getField := gap_decodeRef_getField
+    getField_remapRefInVal := gap_getField_remapRefInVal
+    remapRefInVal_leaf := gap_remapRefInVal_leaf
     sameAggregateShape_ext := gap_sameAggregateShape_ext
     sameAggregateShape_setField := gap_sameAggregateShape_setField }
 
 /-- A by-value call summary whose backward function writes `out` back to its
 single mutable argument. -/
-def round13WritebackSummary (out : StdVal) : CallSummary StdVal where
+def writebackSummary (out : StdVal) : CallSummary StdVal where
   returnsMutBorrow := false
   fwd _ _ := some .unit
   back _ _ _ := some [out]
 
 /-- Freeze loan `1` (a reborrow of `*p`), overwrite its spatial cell with
 `cell`, and reabsorb it. -/
-def round13SpatialOverwritePlan (cell : StdVal) : FlowPlan StdVal :=
+def spatialOverwritePlan (cell : StdVal) : FlowPlan StdVal :=
   .seq (.act (.borrow 1 .mutBorrow (.derefSub 0 [])))
     (.seq (.act (.freezeSpatial 1 valueCellCodec))
       (.seq (.act (.mutateSpatial 0 0 [.init cell]))
         (.seq (.act (.reabsorbSpatial 1 valueCellCodec))
           (.act (.endLoan 1)))))
 
-/-- Round 13 regression tests for:
-1. Field-wise joins visit every field index below `sizeBound`, including
-   indices after a gap,
+/-- Tests for:
+1. Field-wise joins apply to aggregates without a field `0` and visit every
+   field index below `sizeBound`, including indices after a gap,
 2. Borrowing or passing as a mutable call argument a local that was never
    written fails,
 3. Values that call summaries write back or that spatial cells reabsorb must
@@ -3195,7 +3915,7 @@ def round13SpatialOverwritePlan (cell : StdVal) : FlowPlan StdVal :=
    still accepted,
 4. By-value entry parameters cannot carry handles, and `evalFnValue` cannot
    return one. -/
-theorem round13_fields_locals_and_handles_regressions_tests :
+theorem field_join_uninit_local_and_handle_tests :
     -- 1. Gap-aware field-wise join:
     zipOrKeepSameRef gapStdValAlg (.symBool true)
       (.pair (.nat 1) (.nat 7)) (.pair (.nat 1) (.nat 8)) =
@@ -3205,23 +3925,23 @@ theorem round13_fields_locals_and_handles_regressions_tests :
     evalFnValue stdValAlg [⟨.byVal, .nat 1⟩]
       (.act (.borrow 2 .shared (.localSub 1 []))) (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.byVal, .nat 1⟩]
-      (.act (.call 1 (round13WritebackSummary (.nat 2)) [] [.localSub 1 []]))
+      (.act (.call 1 (writebackSummary (.nat 2)) [] [.localSub 1 []]))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.byVal, .nat 1⟩]
       (.act (.assign (.localSub 1 [0]) (.constVal (.nat 2))))
       (.constVal .unit) = .fail ∧
     -- 3. Writeback and reabsorb values:
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩, ⟨.byVal, .nat 1⟩]
-      (.act (.call 2 (round13WritebackSummary (.refVal 0 []))
+      (.act (.call 2 (writebackSummary (.refVal 0 []))
         [] [.localSub 1 []]))
       (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩, ⟨.byVal, .nat 1⟩]
-      (.act (.call 2 (round13WritebackSummary (.nat 2)) [] [.localSub 1 []]))
+      (.act (.call 2 (writebackSummary (.nat 2)) [] [.localSub 1 []]))
       (.use (.localSub 1 [])) = .ok ⟨.nat 2, [.nat 5]⟩ ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (round13SpatialOverwritePlan (.refVal 7 [])) (.constVal .unit) = .fail ∧
+      (spatialOverwritePlan (.refVal 7 [])) (.constVal .unit) = .fail ∧
     evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (round13SpatialOverwritePlan (.nat 9)) (.constVal .unit) =
+      (spatialOverwritePlan (.nat 9)) (.constVal .unit) =
       .ok ⟨.unit, [.nat 9]⟩ ∧
     -- 4. No handles through by-value entry parameters or value returns:
     initFnState stdValAlg [⟨.mutRef 0 [], .nat 5⟩, ⟨.byVal, .refVal 0 []⟩] =
@@ -3230,15 +3950,16 @@ theorem round13_fields_locals_and_handles_regressions_tests :
       (.use (.localSub 0 [])) = .fail :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Round 13 regression tests for writeback and region-group ownership:
+/-- Tests for writeback and region-group ownership:
 1. Ending a mutable loan fails while another live loan unconditionally
    targets an overlapping place,
 2. A region group's children must belong to the same call and have a single
    parent, and a hand-built state in which two active groups share a child
    cannot end either of them, and
-3. An explicit join pair is rejected when the renamed branch still holds a
-   stale handle to the target loan ID. -/
-theorem round13_writeback_regions_and_join_regressions_tests :
+3. An explicit join pair renames a loan even when the renamed branch still
+   holds a dead handle to the target loan ID: the ended loan that the handle
+   names moves to a fresh ID (`3`), and the handle moves with it. -/
+theorem writeback_overlap_region_child_and_stale_join_tests :
     -- 1. Overlapping live loan at writeback:
     endLoanInState stdValAlg 0
       ⟨[⟨.pair (.nat 1) (.nat 2), .mutJoined [0] [1]⟩],
@@ -3253,20 +3974,21 @@ theorem round13_writeback_regions_and_join_regressions_tests :
      | .ok st => st.locals.map (fun c => c.val) = [.pair (.nat 7) (.nat 8)]
      | .fail => False) ∧
     -- 2. Region-group parentage:
-    evalFnValue stdValAlg []
+    planStepFails []
       (.act (.callMultiRegion []
-        [ round11BareRegionSpec 0 [2], round11BareRegionSpec 1 [2]
-        , round11BareRegionSpec 2 [] ]))
-      (.constVal .unit) = .fail ∧
-    evalFnValue stdValAlg []
-      (.act (.callMultiRegion [] [round11BareRegionSpec 0 [5]]))
-      (.constVal .unit) = .fail ∧
+        [ bareRegionSpec 0 [2], bareRegionSpec 1 [2]
+        , bareRegionSpec 2 [] ])) = true ∧
+    planStepFails []
+      (.act (.callMultiRegion [] [bareRegionSpec 0 [5]])) = true ∧
+    planStepFails []
+      (.act (.callMultiRegion []
+        [bareRegionSpec 0 [2], bareRegionSpec 2 []])) = false ∧
     endRegionGroupInState stdValAlg 2
       ⟨[], [], [⟨1, false, 0, [], [], [], fun _ _ => some ([], [])⟩,
               ⟨2, true, 1, [], [], [1], fun _ _ => some ([], [])⟩,
               ⟨3, true, 2, [], [], [1], fun _ _ => some ([], [])⟩],
        [(1, .nat 5)], [], 0⟩ = .fail ∧
-    -- 3. Stale handles block an explicit join pair:
+    -- 3. A dead handle to the target ID moves with its ended loan:
     (let e0 : LoanEntry StdVal :=
        ⟨0, .activeMut, ⟨.nat 0, .unborrowed⟩, .rootParam 0⟩
      let st1 : SymState StdVal :=
@@ -3279,250 +4001,673 @@ theorem round13_writeback_regions_and_join_regressions_tests :
         [e0, ⟨1, .ended, ⟨.nat 0, .unborrowed⟩, .direct (.localReg 0) []⟩,
          ⟨2, .activeMut, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩],
         [], [], [], 0⟩
-     (match applyOneJoinPair stdValAlg 1 2 st1 (st2 (.refVal 1 [])) with
-      | some _ => False
-      | none => True) ∧
-     (match applyOneJoinPair stdValAlg 1 2 st1 (st2 (.nat 3)) with
+     (match applyJoinPairs stdValAlg [(1, 2)] st1 (st2 (.refVal 1 [])) with
+      | some st2' =>
+        st2'.locals.map (fun c => c.val) = [.nat 0, .refVal 3 []] ∧
+        (findLoan 1 st2'.loans).map (fun e => e.phase.isActive) = some true ∧
+        (findLoan 3 st2'.loans).map (fun e => e.phase.isEnded) = some true
+      | none => False) ∧
+     (match applyJoinPairs stdValAlg [(1, 2)] st1 (st2 (.nat 3)) with
       | some _ => True
       | none => False)) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, ⟨trivial, trivial⟩⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, ⟨⟨rfl, rfl, rfl⟩, trivial⟩⟩
 
-/-! ## Round 14 Regression Tests for Call/Region Handle Hygiene & CFG Completeness -/
+/-! ### Writeback Checks, Value Returns, and Explicit Joins -/
 
-/-- A `returnsMutBorrow = true` call summary whose forward function fabricates a
-handle `.refVal 0 []` not present in its mutable arguments. -/
-def round14ForgeMutBorrowSummary : CallSummary StdVal where
-  returnsMutBorrow := true
-  fwd _ _ := some (.refVal 0 [])
-  back _ _ _ := some [.nat 5]
-
-/-- A `RegionGroupSpec` whose `fwdOuts` fabricates a handle `.refVal 0 []` not
-present in its locked mutable inputs. -/
-def round14ForgeRegionOutSpec : RegionGroupSpec StdVal where
-  groupId := 0
-  requiredChildren := []
-  inputPlaces := [.derefSub 0 []]
-  outDsts := [1]
-  fwdOuts := fun _ _ => some [.refVal 0 []]
-  backFn := fun _ _ _ _ => some ([.nat 5], [])
-
-/-- Output-free region group `gid` whose backward function deposits `dep`. -/
-def round14DepositRegionSpec (gid : RegionGroupId)
-    (children : List RegionGroupId) (dep : List StdVal) :
-    RegionGroupSpec StdVal where
+/-- Output-free region group `gid` over `input` whose backward function writes
+`out` back to its single input and deposits nothing. -/
+def writeRegionSpec (gid : RegionGroupId) (input : PlaceExpr)
+    (outs : List StdVal) : RegionGroupSpec StdVal where
   groupId := gid
-  requiredChildren := children
-  inputPlaces := []
+  requiredChildren := []
+  inputPlaces := [input]
   outDsts := []
   fwdOuts := fun _ _ => some []
-  backFn := fun _ _ _ _ => some ([], dep)
+  backFn := fun _ _ _ _ => some (outs, [])
 
-/-- A `returnsMutBorrow = true` call summary that forwards its mutable argument
-into the returned loan cell and writes the original `mutVals` back at loan
-termination (ignoring mutations to the returned loan cell). If `fwd` were
-allowed to extract a unique `.activeMut` handle from a locked local into the
-returned loan cell, a nested by-value swap could move that handle into a second
-local before `back` resurrects it from `vOld`. -/
-def round14PassthroughMutBorrowSummary : CallSummary StdVal where
-  returnsMutBorrow := true
-  fwd _ muts :=
-    match muts with
-    | [v] => some v
-    | _ => none
-  back _ muts _ := some muts
+/-- Tests for `LoanGraph` writeback checks:
+1. A writeback is rejected when another live loan's target selects the place
+   through a concrete `.choice`, or an active region group locks it,
+2. Region writebacks may swap unique handles between their targets but not
+   duplicate them, and
+3. Handles hidden inside a symbolic choice's arms count as copies. -/
+theorem writeback_choice_lock_and_handle_tests :
+    -- 1. Concrete-choice target and region-group lock:
+    (let x0 : PlaceCell StdVal :=
+       ⟨.pair (.pair (.nat 1) (.nat 2)) (.nat 3),
+        .split [([0], .mutLocked 1), ([0, 1], .mutLocked 2)]⟩
+     let loan1 : LoanEntry StdVal :=
+       ⟨1, .activeMut, ⟨.pair (.nat 5) (.nat 6), .unborrowed⟩,
+        .direct (.localReg 0) [0]⟩
+     let loan2 (t : BackTarget StdVal) : LoanEntry StdVal :=
+       ⟨2, .activeMut, ⟨.nat 77, .unborrowed⟩, t⟩
+     endLoanInState stdValAlg 1
+       ⟨[x0, ⟨.nat 0, .unborrowed⟩],
+        [loan1, loan2 (.choice (.bool true) (.direct (.localReg 0) [0, 1])
+          (.direct (.localReg 1) []))], [], [], [], 0⟩ = .fail ∧
+     (match endLoanInState stdValAlg 1
+         ⟨[x0, ⟨.nat 0, .unborrowed⟩],
+          [loan1, loan2 (.choice (.bool false) (.direct (.localReg 0) [0, 1])
+            (.direct (.localReg 1) []))], [], [], [], 0⟩ with
+      | .ok _ => True
+      | .fail => False) ∧
+     endLoanInState stdValAlg 1
+       ⟨[⟨.pair (.pair (.nat 1) (.nat 2)) (.nat 3),
+          .split [([0], .mutLocked 1), ([0, 1], .mutLocked 9)]⟩],
+        [loan1],
+        [⟨0, true, 9, [(.localReg 0, [0, 1])], [], [],
+          fun _ _ => some ([.nat 0], [])⟩], [], [], 0⟩ = .fail) ∧
+    -- 2. Swapping two `&mut` handles through a region writeback:
+    (let st (outs : List StdVal) : SymState StdVal :=
+       ⟨[⟨.refVal 3 [], .mutLocked 5⟩, ⟨.refVal 4 [], .mutLocked 5⟩],
+        [⟨3, .activeMut, ⟨.nat 30, .unborrowed⟩, .rootParam 3⟩,
+         ⟨4, .activeMut, ⟨.nat 40, .unborrowed⟩, .rootParam 4⟩,
+         ⟨5, .ended, ⟨.unit, .unborrowed⟩, .regionOut 0 0⟩],
+        [⟨0, true, 5, [(.localReg 0, []), (.localReg 1, [])], [], [],
+          fun _ _ => some (outs, [])⟩], [], [], 0⟩
+     (match endRegionGroupInState stdValAlg 0
+         (st [.refVal 4 [], .refVal 3 []]) with
+      | .ok st' =>
+        st'.locals.map (fun c => c.val) = [.refVal 4 [], .refVal 3 []]
+      | .fail => False) ∧
+     endRegionGroupInState stdValAlg 0 (st [.refVal 3 [], .refVal 3 []]) =
+       .fail) ∧
+    -- 3. Choice arms are scanned for handles:
+    copyableVal stdValAlg [⟨0, .activeMut, ⟨.nat 0, .unborrowed⟩, .rootParam 0⟩]
+      (zipStdVal (.symBool true) (.refVal 0 []) (.refVal 0 [])) = false :=
+  ⟨⟨rfl, trivial, rfl⟩, ⟨rfl, rfl⟩, rfl⟩
 
-/-- Round 14 regression tests for:
-1. Reference entry parameters (`.mutRef` and `.sharedRef`) rejecting initial
-   pointed-to values that smuggle decodable borrow handles,
-2. `PrimAction.call` (`returnsMutBorrow = true`) and `PrimAction.callMultiRegion`
-   rejecting non-copyable handles in `summary.fwd`, `spec.fwdOuts`, and
-   `endRegionGroupInState` `newDeposits` (including when the handle was present
-   in `mutVals` or `outVals`, blocking the passthrough-resurrection and
-   deposit-duplication loopholes),
-3. `stepBasicBlock` rejecting handle-bearing outputs on `.ret` and early-return
-   wrappers (`.returned` and `.guardedContinuing`),
-4. Bidirectional single-block equivalence `cfg_certificate_step_iff`, and
-5. Universal spatial roundtrip `freeze_reabsorb_roundtrip_of_sizeBoundDecreasing`
-   on `stdValAlg` for all `v : StdVal`. -/
-theorem round14_handle_hygiene_and_cfg_complete_regressions_tests :
-    -- 1. Reference parameters cannot smuggle handles inside pointed-to `p.val`:
-    initFnState stdValAlg [⟨.mutRef 0 [], .refVal 0 []⟩] = .fail ∧
+/-- Tests for value returns:
+1. A handle hidden in one arm of a joined return value is rejected, whether
+   it comes from an early return or from a joined local,
+2. Final `&mut` parameter values may not carry handles,
+3. Reference-parameter pointee values may not carry handles, and
+4. A CFG applies the same check as `evalFnValue` to the value of a `.ret`
+   terminator, and to a value merged with an early return that an earlier
+   block left pending on one side of a symbolic branch, whether the block
+   ends in a `.goto` or in a branch on a symbolic condition
+   (`runBlockCfg_stepBasicBlock_handleFree` states the general result). -/
+theorem value_return_tests :
+    -- 1. Hidden handles in joined returns:
+    evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
+      (.branch (.use (.localSub 0 []))
+        (.earlyReturn [] [] (.use (.localSub 1 []))) .skip)
+      (.constVal .unit) = .fail ∧
+    evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.sharedRef 0 [], .nat 5⟩]
+      (.branch (.use (.localSub 0 []))
+        (.act (.assign (.localSub 2 []) (.use (.localSub 1 []))))
+        (.act (.assign (.localSub 2 []) (.constVal (.nat 3)))))
+      (.use (.localSub 2 [])) = .fail ∧
+    -- 2. `*p = &local` leaks a callee handle through `mutFinals`:
+    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩, ⟨.byVal, .nat 7⟩]
+      (.seq (.act (.borrow 2 .shared (.localSub 1 [])))
+        (.seq (.act (.assign (.derefSub 0 []) (.use (.localSub 2 []))))
+          (.act (.endLoan 1))))
+      (.constVal .unit) = .fail ∧
+    -- 3. Handles in reference-parameter pointees:
     initFnState stdValAlg
-      [⟨.mutRef 0 [], .nat 5⟩, ⟨.sharedRef 1 [], .refVal 0 []⟩] = .fail ∧
-    -- 2. Mutable-borrow call `fwd`, region `fwdOuts`, and region `newDeposits`
-    -- cannot fabricate or extract non-copyable handles:
-    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (.seq
-        (.act (.call 1 round14ForgeMutBorrowSummary [] [.derefSub 0 []]))
-        (.act (.endLoan 1)))
-      (.constVal .unit) = .fail ∧
-    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (.seq
-        (.act (.call 1 round14PassthroughMutBorrowSummary [] [.localSub 0 []]))
-        (.act (.endLoan 1)))
-      (.constVal .unit) = .fail ∧
-    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (.seq
-        (.act (.callMultiRegion [] [round14ForgeRegionOutSpec]))
-        (.act (.endRegionGroup 0)))
-      (.constVal .unit) = .fail ∧
-    evalFnValue stdValAlg [⟨.mutRef 0 [], .nat 5⟩]
-      (.seq
-        (.act (.callMultiRegion []
-          [ round14DepositRegionSpec 0 [1] []
-          , round14DepositRegionSpec 1 [] [.refVal 0 []] ]))
-        (.seq (.act (.endRegionGroup 1)) (.act (.endRegionGroup 0))))
-      (.constVal .unit) = .fail ∧
-    endRegionGroupInState stdValAlg 0
-      ⟨[⟨.refVal 0 [], .mutLocked 1⟩],
-       [⟨0, .activeMut, ⟨.nat 5, .unborrowed⟩, .rootParam 0⟩,
-        ⟨1, .activeMut, ⟨.refVal 0 [], .unborrowed⟩, .regionOut 0 0⟩],
-       [⟨0, true, 1, [(.localReg 0, [])], [1], [],
-         fun outs _ => some (outs, outs)⟩],
-       [], [], 0⟩ = .fail ∧
-    -- 3. `stepBasicBlock` rejects returning a handle directly or via an
-    -- early-return branch wrapper:
-    (match initFnState stdValAlg
-        [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩] with
+      [⟨.mutRef 0 [], .refVal 1 []⟩, ⟨.sharedRef 1 [], .nat 5⟩] = .fail ∧
+    -- 4. CFG value returns:
+    (match initFnState stdValAlg [⟨.mutRef 0 [], .nat 5⟩] with
      | .ok st0 =>
        runBlockCfg
-         (stepBasicBlock stdValAlg [⟨.skip, .ret (.use (.localSub 1 []))⟩])
-         0 st0 1 = .fault ∧
-       runBlockCfg
-         (stepBasicBlock stdValAlg
-           [ ⟨.branch (.use (.localSub 0 []))
-                (.earlyReturn [] [] (.use (.localSub 1 [])))
-                .skip,
-              .goto 1⟩
-           , ⟨.skip, .ret (.constVal .unit)⟩ ])
-         0 st0 2 = .fault
+         (stepBasicBlock stdValAlg [⟨.skip, .ret (.use (.localSub 0 []))⟩])
+         0 st0 1 = .fault
      | .fail => False) ∧
-    -- 4. Bidirectional `cfg_certificate_step_iff`:
-    (∀ st0 out,
-      initFnState stdValAlg [⟨.byVal, .nat 0⟩] = .ok st0 →
-      (runBlockCfg
-        (stepBasicBlock stdValAlg
-          [⟨.act (.assign (.localSub 1 []) (.constVal (.nat 42))),
-            .ret (.use (.localSub 1 []))⟩])
-        0 st0 1 = .ret out ↔
-       evalFnValue stdValAlg [⟨.byVal, .nat 0⟩]
-         (.act (.assign (.localSub 1 []) (.constVal (.nat 42))))
-         (.use (.localSub 1 [])) = .ok out)) ∧
-    -- 5. Universal `StdVal` spatial roundtrip via `stdVal_sizeBoundDecreasing`:
-    (@unpinFromSpatialInState StdVal = @reabsorbFromSpatialInState StdVal) ∧
-    (∀ (v : StdVal),
-      let st0 : SymState StdVal :=
-        { locals := [⟨v, .mutLocked 0⟩]
-          loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
-          regionGroups := []
-          regionDeposits := []
-          spatial := []
-          nextSpatialTag := 0 }
-      match freezeToSpatialInState stdValAlg 0 valueCellCodec st0 with
-      | .ok stPinned =>
-        match reabsorbFromSpatialInState stdValAlg 0 valueCellCodec stPinned with
-        | .ok stReabsorbed =>
-          match findLoan 0 stReabsorbed.loans with
-          | some e =>
-            e.cell.val = v ∧
-            e.phase.isActiveMut = true ∧
-            stReabsorbed.spatial.isEmpty = true
-          | none => False
-        | .fail => False
-      | .fail => False) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩,
-   fun st0 out hInit =>
-     cfg_certificate_step_iff stdValAlg [⟨.byVal, .nat 0⟩]
-       (.act (.assign (.localSub 1 []) (.constVal (.nat 42))))
-       (.use (.localSub 1 [])) st0 out hInit,
-   rfl,
-   fun v => by
-     have h := freeze_reabsorb_roundtrip_of_sizeBoundDecreasing stdValAlg
-       stdVal_sizeBoundDecreasing valueCellCodec valueCellCodec rfl v rfl
-     dsimp only at h ⊢
-     cases hFrz : freezeToSpatialInState stdValAlg 0 valueCellCodec
-       (SymState.mk [{ val := v, perm := PermTree.mutLocked 0 }]
-         [LoanEntry.mk 0 LoanPhase.activeMut { val := v, perm := PermTree.unborrowed }
-           (BackTarget.direct (OwnerRef.localReg 0) [])]
-         [] [] [] 0) with
-     | fail => rw [hFrz] at h; nomatch h
-     | ok stPinned =>
-       rw [hFrz] at h; dsimp only at h ⊢
-       cases hReab : reabsorbFromSpatialInState stdValAlg 0 valueCellCodec stPinned with
-       | fail => rw [hReab] at h; nomatch h
-       | ok stReabsorbed =>
-         rw [hReab] at h; dsimp only at h ⊢
-         cases hFind : findLoan 0 stReabsorbed.loans with
-         | none => rw [hFind] at h; nomatch h
-         | some e => rw [hFind] at h; dsimp only at h ⊢; exact h⟩
+    (let params : List (ParamInput StdVal) :=
+       [⟨.byVal, .symBool true⟩, ⟨.sharedRef 0 [], .nat 5⟩]
+     -- Returns the shared parameter's handle if the condition holds.
+     let body : FlowPlan StdVal :=
+       .branch (.use (.localSub 0 []))
+         (.earlyReturn [] [] (.use (.localSub 1 []))) .skip
+     let exit : BasicBlock StdVal := ⟨.skip, .ret (.constVal (.nat 0))⟩
+     (match initFnState stdValAlg params with
+      | .ok st0 =>
+        runBlockCfg (stepBasicBlock stdValAlg [⟨body, .goto 1⟩, exit])
+          0 st0 2 = .fault ∧
+        runBlockCfg
+          (stepBasicBlock stdValAlg
+            [⟨body, .branch (.use (.localSub 0 [])) 1 2⟩, exit, exit])
+          0 st0 2 = .fault
+      | .fail => False) ∧
+     evalFnValue stdValAlg params body (.constVal (.nat 0)) = .fail) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, ⟨⟨rfl, rfl⟩, rfl⟩⟩
 
-/-- Round 15 regression tests:
-1. `joinLoanEntries` rejects merging a `.rootParam` or `.regionOut` target with
-   a non-matching target into a `.choice` target.
-2. `applyOneJoinPair` rejects renaming `.regionOut` loans, duplicate loan IDs,
-   and residual `PermTree` permissions on ended target slots.
-3. `evalFnReturningMut` (`sanitizeMutRetSummary` / `synthesizeMutReturnFromVal`)
-   rejects caller-supplied `vFinal` containing a borrow handle.
-4. `wfPlan_*` and `evalPlan_whileLoop` compose cleanly. -/
-theorem round15_join_special_target_and_mut_ret_hygiene_tests :
-    let eRoot : LoanEntry StdVal :=
-      ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .rootParam 0⟩
-    let eRegOut : LoanEntry StdVal :=
-      ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .regionOut 0 0⟩
-    let eLocal : LoanEntry StdVal :=
-      ⟨0, .activeMut, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩
-    -- 1. `joinLoanEntries` rejects mixing `.rootParam` or `.regionOut` with `.direct`:
-    joinLoanEntries stdValAlg (.symBool true) [eRoot] [eLocal] = none ∧
-    joinLoanEntries stdValAlg (.symBool true) [eRegOut] [eLocal] = none ∧
-    -- 2. `applyOneJoinPair` rejects `.regionOut` loans and residual permissions:
-    let stReg1 : SymState StdVal :=
-      { locals := [⟨.nat 1, .unborrowed⟩]
-        loans :=
-          [ ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .regionOut 0 0⟩
-          , ⟨1, .ended, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ]
-        regionGroups := []
-        regionDeposits := []
-        spatial := []
-        nextSpatialTag := 0 }
-    let stReg2 : SymState StdVal :=
-      { locals := [⟨.nat 1, .mutLocked 1⟩]
-        loans :=
-          [ ⟨0, .ended, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩
-          , ⟨1, .activeMut, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ]
-        regionGroups := []
-        regionDeposits := []
-        spatial := []
-        nextSpatialTag := 0 }
-    let stResidual2 : SymState StdVal :=
-      { locals := [⟨.nat 1, .mutLocked 0⟩]
-        loans :=
-          [ ⟨0, .ended, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩
-          , ⟨1, .activeMut, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ]
-        regionGroups := []
-        regionDeposits := []
-        spatial := []
-        nextSpatialTag := 0 }
-    applyOneJoinPair stdValAlg 0 1 stReg1 stReg2 = none ∧
-    applyOneJoinPair stdValAlg 0 1
-      { stReg1 with
-        loans :=
-          [ ⟨0, .activeMut, ⟨.nat 1, .unborrowed⟩, .direct (.localReg 0) []⟩
-          , ⟨1, .ended, ⟨.nat 2, .unborrowed⟩, .direct (.localReg 0) []⟩ ] }
-      stResidual2 = none ∧
-    -- 3. `evalFnReturningMut` backward closure rejects caller `vFinal` carrying a handle:
-    (match evalFnReturningMut stdValAlg [⟨.mutRef 0 [], .nat 10⟩] .skip 0 with
-     | .ok (fwd, backFn) =>
-       fwd = .nat 10 ∧
-       backFn (.nat 99) = some [.nat 99] ∧
-       backFn (.refVal 0 []) = none
-     | .fail => False) ∧
-    -- 4. `wfPlan_whileLoop` and `evalPlan_whileLoop`:
-    WfPlan stdValAlg
-      (.whileLoop 2 (.constVal (.bool false))
-        (.seq .skip (.act (.assign (.localSub 0 []) (.constVal (.nat 1)))))) :=
-  ⟨rfl, rfl, rfl, rfl, ⟨rfl, rfl, rfl⟩,
-   wfPlan_whileLoop stdValAlg 2 (.constVal (.bool false))
-     (wfPlan_seq stdValAlg (wfPlan_skip stdValAlg)
-       (wfPlan_act stdValAlg (.assign (.localSub 0 []) (.constVal (.nat 1)))))⟩
+/-- Explicit join over arms that allocate different numbers of loans: the
+false arm uses a scratch shared borrow (loan `2`) before its mutable borrow
+(loan `3`), which the pair `(2, 3)` renames to the true arm's loan `2`. -/
+def unevenExplicitJoinPlan : FlowPlan StdVal :=
+  .seq
+    (.branchExplicitJoin (.use (.localSub 0 []))
+      (.act (.borrow 3 .mutBorrow (.derefSub 1 [])))
+      (.seq
+        (.act (.borrow 3 .shared (.localSub 0 [])))
+        (.seq
+          (.act (.endLoan 2))
+          (.act (.borrow 3 .mutBorrow (.derefSub 2 [])))))
+      [(2, 3)])
+    (.seq
+      (.act (.assign (.derefSub 3 []) (.constVal (.nat 50))))
+      (.act (.endLoan 2)))
+
+/-- Tests for explicit joins and branch-local region
+groups:
+1. Explicit join pairs rename the false arm's loans when the condition is
+   concrete `false`, when the arms allocate different numbers of loans, and
+   when one arm returns,
+2. Different branch-local region groups at the same table position join, and
+3. Reinstalling a group fails while its earlier deposits are unconsumed. -/
+theorem explicit_join_and_branch_local_region_tests :
+    -- 1. Explicit joins:
+    evalFnValue stdValAlg
+      [⟨.byVal, .bool false⟩, ⟨.mutRef 0 [], .nat 1⟩, ⟨.mutRef 1 [], .nat 2⟩]
+      explicitJoinRemapLoanIdsPlan (.constVal .unit) =
+      .ok ⟨.unit, [.nat 1, .nat 50]⟩ ∧
+    evalFnValue stdValAlg
+      [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 1⟩,
+       ⟨.mutRef 1 [], .nat 2⟩]
+      unevenExplicitJoinPlan (.constVal .unit) =
+      .ok ⟨.unit, [zipStdVal (.symBool true) (.nat 50) (.nat 1),
+                   zipStdVal (.symBool true) (.nat 2) (.nat 50)]⟩ ∧
+    evalFnValue stdValAlg [⟨.byVal, .symBool true⟩]
+      (.branchExplicitJoin (.use (.localSub 0 []))
+        (.earlyReturn [] [] (.constVal (.nat 1))) .skip [(0, 0)])
+      (.constVal (.nat 2)) =
+      .ok ⟨zipStdVal (.symBool true) (.nat 1) (.nat 2), []⟩ ∧
+    -- 2. Distinct branch-local groups:
+    evalFnValue stdValAlg [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩]
+      (.branch (.use (.localSub 0 []))
+        (.seq
+          (.act (.callMultiRegion []
+            [writeRegionSpec 0 (.derefSub 1 []) [.nat 6]]))
+          (.act (.endRegionGroup 0)))
+        (.seq
+          (.act (.callMultiRegion []
+            [writeRegionSpec 1 (.derefSub 1 []) [.nat 7]]))
+          (.act (.endRegionGroup 1))))
+      (.constVal .unit) =
+      .ok ⟨.unit, [zipStdVal (.symBool true) (.nat 6) (.nat 7)]⟩ ∧
+    -- 3. Leftover deposits block reinstalling their group:
+    planStepFails [⟨.mutRef 0 [], .nat 5⟩]
+      (.seq
+        (.act (.callMultiRegion []
+          [countingRegionSpec 0 [] (.derefSub 0 [])]))
+        (.seq (.act (.endRegionGroup 0))
+          (.act (.callMultiRegion []
+            [countingRegionSpec 0 [] (.derefSub 0 []) []])))) = true ∧
+    planStepFails [⟨.mutRef 0 [], .nat 5⟩]
+      (.seq
+        (.act (.callMultiRegion []
+          [countingRegionSpec 0 [] (.derefSub 0 []) []]))
+        (.seq (.act (.endRegionGroup 0))
+          (.act (.callMultiRegion []
+            [countingRegionSpec 0 [] (.derefSub 0 []) []])))) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Choice Writebacks and Uneven Explicit Joins -/
+
+/-- `let a = &mut x; let b = &mut y; let r = if c { &mut a } else { &mut b };`
+followed by the end of `r`, `b`, and `a`: the reborrow `r` writes the
+unchanged handle back to `a` (or `b`) through a symbolic `.choice` target. -/
+def choiceOverHandlesPlan : FlowPlan StdVal :=
+  .seq (.act (.borrow 3 .mutBorrow (.localSub 1 [])))
+    (.seq (.act (.borrow 4 .mutBorrow (.localSub 2 [])))
+      (.seq
+        (.branch (.use (.localSub 0 []))
+          (.act (.borrow 5 .mutBorrow (.localSub 3 [])))
+          (.act (.borrow 5 .mutBorrow (.localSub 4 []))))
+        (.seq (.act (.endLoan 2))
+          (.seq (.act (.endLoan 1)) (.act (.endLoan 0))))))
+
+/-- Explicit join where the true arm takes a scratch shared borrow (loan `1`)
+before its mutable borrow (loan `2`), and the false arm only takes the mutable
+borrow (loan `1`); the pair `(2, 1)` renames the false arm's loan. -/
+def trueArmScratchPlan : FlowPlan StdVal :=
+  .seq
+    (.branchExplicitJoin (.use (.localSub 0 []))
+      (.seq (.act (.borrow 3 .shared (.localSub 2 [])))
+        (.seq (.act (.endLoan 1))
+          (.act (.borrow 3 .mutBorrow (.derefSub 1 [])))))
+      (.act (.borrow 3 .mutBorrow (.derefSub 1 [])))
+      [(2, 1)])
+    (.act (.endLoan 2))
+
+/-- `true` iff `endLoanInState` succeeds on `st`. -/
+def endLoanOk (lid : LoanId) (st : SymState StdVal) : Bool :=
+  match endLoanInState stdValAlg lid st with
+  | .ok _ => true
+  | .fail => false
+
+/-- Tests for choice writebacks and uneven explicit joins:
+1. Writing an unchanged `&mut` handle back through a symbolic `.choice` target
+   counts the handle once, not once per arm,
+2. Explicit join pairs work when the true arm allocates more loans than the
+   false arm, for symbolic and concrete-`false` conditions, and
+3. A writeback is rejected when another live loan's symbolic `.choice` target
+   overlaps the place in a branch in which the write happens, while two loans
+   with swapped arms (as a branch join produces) still end. -/
+theorem choice_handle_and_explicit_join_padding_tests :
+    -- 1. Choice over handles:
+    evalFnValue stdValAlg
+      [⟨.byVal, .symBool true⟩, ⟨.byVal, .nat 1⟩, ⟨.byVal, .nat 2⟩]
+      choiceOverHandlesPlan (.constVal .unit) = .ok ⟨.unit, []⟩ ∧
+    -- 2. True arm allocates more loans:
+    evalFnValue stdValAlg
+      [⟨.byVal, .symBool true⟩, ⟨.mutRef 0 [], .nat 5⟩, ⟨.byVal, .nat 7⟩]
+      trueArmScratchPlan (.constVal .unit) =
+      .ok ⟨.unit, [zipStdVal (.symBool true) (.nat 5) (.nat 5)]⟩ ∧
+    evalFnValue stdValAlg
+      [⟨.byVal, .bool false⟩, ⟨.mutRef 0 [], .nat 5⟩, ⟨.byVal, .nat 7⟩]
+      trueArmScratchPlan (.constVal .unit) = .ok ⟨.unit, [.nat 5]⟩ ∧
+    -- 3. Symbolic-choice overlap:
+    (let x0 : PlaceCell StdVal :=
+       ⟨.pair (.pair (.nat 1) (.nat 2)) (.nat 3),
+        .split [([0], .mutLocked 1), ([0, 1], .mutLocked 2)]⟩
+     let loan1 : LoanEntry StdVal :=
+       ⟨1, .activeMut, ⟨.pair (.nat 5) (.nat 6), .unborrowed⟩,
+        .direct (.localReg 0) [0]⟩
+     let loan2 (t : BackTarget StdVal) : LoanEntry StdVal :=
+       ⟨2, .activeMut, ⟨.nat 77, .unborrowed⟩, t⟩
+     endLoanOk 1
+       ⟨[x0], [loan1, loan2 (.choice (.symBool true)
+          (.direct (.localReg 0) [0, 1]) (.direct (.localReg 0) [0, 1]))],
+        [], [], [], 0⟩ = false) ∧
+    (let c : StdVal := .symBool true
+     let st : SymState StdVal :=
+       ⟨[⟨.nat 1, .mutJoined [0, 1] []⟩, ⟨.nat 2, .mutJoined [0, 1] []⟩],
+        [⟨0, .activeMut, ⟨zipStdVal c (.nat 10) (.nat 20), .unborrowed⟩,
+          .choice c (.direct (.localReg 0) []) (.direct (.localReg 1) [])⟩,
+         ⟨1, .activeMut, ⟨zipStdVal c (.nat 2) (.nat 1), .unborrowed⟩,
+          .choice c (.direct (.localReg 1) []) (.direct (.localReg 0) [])⟩],
+        [], [], [], 0⟩
+     endLoanOk 0 st = true) :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Branch-Wise Handle Accounting and Correlated Writebacks -/
+
+/-- Region group `0` over locals `0` and `1`, whose callback returns `outs`.
+The locals hold `zipVal c h3 h4` and `zipVal c h4 h3`, the state after
+`if c {} else { mem::swap(&mut a, &mut b) }` for unique handles `h3`, `h4`:
+in each branch each handle occurs once. -/
+def swappedChoiceState (outs : List StdVal) : SymState StdVal :=
+  let c : StdVal := .symBool true
+  ⟨[⟨zipStdVal c (.refVal 3 []) (.refVal 4 []), .mutLocked 5⟩,
+    ⟨zipStdVal c (.refVal 4 []) (.refVal 3 []), .mutLocked 5⟩],
+   [⟨3, .activeMut, ⟨.nat 30, .unborrowed⟩, .rootParam 3⟩,
+    ⟨4, .activeMut, ⟨.nat 40, .unborrowed⟩, .rootParam 4⟩,
+    ⟨5, .ended, ⟨.unit, .unborrowed⟩, .regionOut 0 0⟩],
+   [⟨0, true, 5, [(.localReg 0, []), (.localReg 1, [])], [], [],
+     fun _ _ => some (outs, [])⟩], [], [], 0⟩
+
+/-- `true` iff ending region group `0` succeeds on `st`. -/
+def endGroup0Ok (st : SymState StdVal) : Bool :=
+  match endRegionGroupInState stdValAlg 0 st with
+  | .ok _ => true
+  | .fail => false
+
+/-- Local `0` is split between loan `1` at `[0]` and loan `2` at `[0, 1]`, and
+locals `1` and `2` are borrowed by loans `1` and `2`; `t1` and `t2` are the
+loans' targets. -/
+def correlatedOverlapState (t1 t2 : BackTarget LensTestVal) :
+    SymState LensTestVal :=
+  { locals := [⟨.node (.node (.atom 1) (.atom 2)) (.atom 3),
+                .split [([0], .mutLocked 1), ([0, 1], .mutLocked 2)]⟩,
+               ⟨.atom 9, .mutLocked 1⟩, ⟨.atom 8, .mutLocked 2⟩]
+    loans := [⟨1, .activeMut, ⟨.node (.atom 50) (.atom 60), .unborrowed⟩, t1⟩,
+              ⟨2, .activeMut, ⟨.atom 77, .unborrowed⟩, t2⟩]
+    regionGroups := []
+    regionDeposits := []
+    spatial := []
+    nextSpatialTag := 0 }
+
+/-- `true` iff ending loan `1` succeeds on `st`. -/
+def endLoan1Ok (st : SymState LensTestVal) : Bool :=
+  match endLoanInState lensTestValAlg 1 st with
+  | .ok _ => true
+  | .fail => false
+
+/-- Tests that handle accounting compares counts branch by branch:
+1. A writeback over the conditionally swapped pair cannot write `h3` to both
+   places, although each place holds `h3` in some branch; neither can a
+   single place holding `zipVal c h3 h4` take `h3`,
+2. Writing the pair back unchanged, swapped, or as `[h3, h4]` keeps one of
+   each handle per branch and succeeds, and an unchanged handle may still be
+   written back as `zipVal c h0 h0`, and
+3. Under a guard that `sameCond` cannot identify, the arms count as in any
+   branch: the duplicate is still rejected, and so (conservatively) is the
+   unchanged write, and
+4. Distinct identifiable guards are enumerated independently: writing
+   `zipVal c h3 h4` and `zipVal d h4 h3` over `[h3, h4]` duplicates a handle
+   when `c` and `d` differ, so it is rejected, while the same write under one
+   guard `c` is a conditional swap and succeeds. -/
+theorem branchwise_handle_accounting_tests :
+    let c : StdVal := .symBool true
+    let d : StdVal := .symBool false
+    let g : StdVal := .pair (.symBool true) (.nat 0)
+    let loans := (swappedChoiceState []).loans
+    -- 1. Duplicates are rejected:
+    endGroup0Ok
+      (swappedChoiceState [.refVal 3 [], .refVal 3 []]) = false ∧
+    replaceableVal stdValAlg loans
+      (zipStdVal c (.refVal 3 []) (.refVal 4 [])) (.refVal 3 []) = false ∧
+    -- 2. Permutations within each branch succeed:
+    endGroup0Ok
+      (swappedChoiceState
+        [zipStdVal c (.refVal 3 []) (.refVal 4 []),
+         zipStdVal c (.refVal 4 []) (.refVal 3 [])]) = true ∧
+    endGroup0Ok
+      (swappedChoiceState
+        [zipStdVal c (.refVal 4 []) (.refVal 3 []),
+         zipStdVal c (.refVal 3 []) (.refVal 4 [])]) = true ∧
+    endGroup0Ok
+      (swappedChoiceState [.refVal 3 [], .refVal 4 []]) = true ∧
+    replaceableVal stdValAlg loans
+      (.refVal 3 []) (zipStdVal c (.refVal 3 []) (.refVal 3 [])) = true ∧
+    -- 3. Unidentified guards:
+    replaceableVal stdValAlg loans
+      (zipStdVal g (.refVal 3 []) (.refVal 4 [])) (.refVal 3 []) = false ∧
+    replaceableVal stdValAlg loans
+      (zipStdVal g (.refVal 3 []) (.refVal 4 []))
+      (zipStdVal g (.refVal 3 []) (.refVal 4 [])) = false ∧
+    -- 4. Distinct guards:
+    replaceableVals stdValAlg loans [.refVal 3 [], .refVal 4 []]
+      [zipStdVal c (.refVal 3 []) (.refVal 4 []),
+       zipStdVal d (.refVal 4 []) (.refVal 3 [])] = false ∧
+    replaceableVals stdValAlg loans [.refVal 3 [], .refVal 4 []]
+      [zipStdVal c (.refVal 3 []) (.refVal 4 []),
+       zipStdVal c (.refVal 4 []) (.refVal 3 [])] = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `true` iff ending loan `a` and then loan `b` succeeds on `st`. -/
+def endLoansInOrderOk (a b : LoanId) (st : SymState LensTestVal) : Bool :=
+  match endLoanInState lensTestValAlg a st with
+  | .ok st1 =>
+    match endLoanInState lensTestValAlg b st1 with
+    | .ok _ => true
+    | .fail => false
+  | .fail => false
+
+/-- Tests that a conditional writeback follows other live loans' choices on the
+same guard in the same branch:
+1. Loan `1` writes `x0[0]` when `symL` holds, and loan `2` observes `x0[0, 1]`
+   in that same branch, so ending loan `1` is rejected, as it is when loan
+   `1`'s target is unconditional,
+2. With loan `2`'s arms swapped, the two loans never overlap in one branch,
+   and because `evalBackVal` preserves aggregate fields via `zipOrKeepSameRef`
+   and `projectBranchOrFields`, both loans end in either order,
+3. If loan `2` branches on a different guard, some branch may combine the
+   overlapping arms, so ending loan `1` is rejected, and
+4. The same holds when loan `1` writes `x0[0]` through a `.lensCall` leaf
+   inside the symbolic choice. -/
+theorem conditional_writeback_correlation_tests :
+    let symL : LensTestVal := .node (.atom 0) (.atom 0)
+    let symM : LensTestVal := .node (.atom 0) (.atom 1)
+    let x0 (p : SubPath) : BackTarget LensTestVal := .direct (.localReg 0) p
+    let x1 : BackTarget LensTestVal := .direct (.localReg 1) []
+    let x2 : BackTarget LensTestVal := .direct (.localReg 2) []
+    let lens : BackTarget LensTestVal :=
+      .lensCall [(.localReg 0, [0])] (fun v => some [v])
+    -- 1. Same-branch overlap:
+    endLoan1Ok
+      (correlatedOverlapState (.choice symL (x0 [0]) x1)
+        (.choice symL (x0 [0, 1]) x2)) = false ∧
+    endLoan1Ok
+      (correlatedOverlapState (x0 [0]) (.choice symL (x0 [0, 1]) x2)) =
+      false ∧
+    -- 2. Swapped arms:
+    endLoan1Ok
+      (correlatedOverlapState (.choice symL (x0 [0]) x1)
+        (.choice symL x2 (x0 [0, 1]))) = true ∧
+    endLoansInOrderOk 2 1
+      (correlatedOverlapState (.choice symL (x0 [0]) x1)
+        (.choice symL x2 (x0 [0, 1]))) = true ∧
+    endLoansInOrderOk 1 2
+      (correlatedOverlapState (.choice symL (x0 [0]) x1)
+        (.choice symL x2 (x0 [0, 1]))) = true ∧
+    -- 3. Independent guards:
+    endLoan1Ok
+      (correlatedOverlapState (.choice symL (x0 [0]) x1)
+        (.choice symM (x0 [0, 1]) x2)) = false ∧
+    -- 4. A `.lensCall` leaf under the choice:
+    endLoan1Ok
+      (correlatedOverlapState (.choice symL lens x1)
+        (.choice symL (x0 [0, 1]) x2)) = false ∧
+    endLoan1Ok
+      (correlatedOverlapState (.choice symL lens x1)
+        (.choice symL x2 (x0 [0, 1]))) = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Handle renaming that retargets every handle to `t`, not only those to the
+renamed loan. -/
+def retargetAllRemap (_ t : LoanId) (v : StdVal) : StdVal :=
+  match v with
+  | ⟨_, .refVal _ p⟩ => .refVal t p
+  | other => other
+
+/-- Handle renaming that also changes non-handle data: it adds `1000` to every
+top-level number. -/
+def bumpNatRemap (oldLid newLid : LoanId) (v : StdVal) : StdVal :=
+  match v with
+  | ⟨_, .nat n⟩ => .nat (n + 1000)
+  | other => remapStdVal oldLid newLid other
+
+/-- The `ValAlgebra` laws for `remapRefInVal` exclude unfaithful renamings, so
+no algebra can use one: `retargetAllRemap` breaks `decodeRef_remapRefInVal`
+(renaming loan `2` to `3` must keep a handle to loan `1`), and `bumpNatRemap`
+breaks `remapRefInVal_leaf` (a number has no handle, field, or arm, so it
+must not change). -/
+theorem unfaithful_remaps_break_laws :
+    (¬ ∀ (oldLid newLid : LoanId) (v : StdVal),
+      stdDecodeRef (retargetAllRemap oldLid newLid v) =
+        (stdDecodeRef v).map
+          (fun r => (if r.1 == oldLid then newLid else r.1, r.2))) ∧
+    (¬ ∀ (oldLid newLid : LoanId) (v : StdVal),
+      stdDecodeRef v = none → (∀ f, stdValGetField f v = none) →
+      stdBranchSplit v = none → bumpNatRemap oldLid newLid v = v) :=
+  ⟨(fun h => nomatch h 2 3 (.refVal 1 [])),
+   (fun h =>
+     nomatch h 2 3 (.nat 5) rfl
+       (fun f =>
+         match f with
+         | 0 => rfl
+         | 1 => rfl
+         | _ + 2 => rfl)
+       rfl)⟩
+
+/-- An explicit join renaming the false arm's loan `3` to `2`, after which the
+plan writes through both the renamed loan and the second root parameter. -/
+def explicitJoinRenamePlan : FlowPlan StdVal :=
+  .seq
+    (.branchExplicitJoin (.use (.localSub 0 []))
+      (.act (.borrow 3 .mutBorrow (.derefSub 2 [])))
+      (.seq
+        (.act (.borrow 3 .shared (.localSub 0 [])))
+        (.seq
+          (.act (.endLoan 2))
+          (.act (.borrow 3 .mutBorrow (.derefSub 2 [])))))
+      [(2, 3)])
+    (.seq (.act (.assign (.derefSub 3 []) (.constVal (.nat 50))))
+      (.seq (.act (.assign (.derefSub 1 []) (.constVal (.nat 77))))
+        (.act (.endLoan 2))))
+
+/-- Renaming during an explicit join renames exactly the renamed loan's
+handles: with a concrete `false` condition, the false arm's loan `3` becomes
+loan `2`, and writes through it and through the second root parameter reach
+the right parameters. -/
+theorem explicit_join_rename_tests :
+    let params : List (ParamInput StdVal) :=
+      [⟨.byVal, .bool false⟩, ⟨.mutRef 0 [], .nat 1⟩, ⟨.mutRef 1 [], .nat 2⟩]
+    evalFnValue stdValAlg params explicitJoinRenamePlan (.constVal .unit) =
+      .ok ⟨.unit, [.nat 77, .nat 50]⟩ :=
+  rfl
+
+/-- Explicit join whose arms reborrow `*x` and `*y` in opposite orders: the
+true arm takes loan `2` for `x` and loan `3` for `y`, and the false arm loan
+`2` for `y` and loan `3` for `x`. The pairs `[(2, 3), (3, 2)]` exchange the
+false arm's IDs; afterwards local `3` reborrows `x` and local `4` reborrows
+`y` in both arms. -/
+def swappedLoanIdsJoinPlan : FlowPlan StdVal :=
+  .seq
+    (.branchExplicitJoin (.use (.localSub 0 []))
+      (.seq (.act (.borrow 3 .mutBorrow (.derefSub 1 [])))
+        (.act (.borrow 4 .mutBorrow (.derefSub 2 []))))
+      (.seq (.act (.assign (.localSub 3 []) (.constVal (.nat 0))))
+        (.seq (.act (.borrow 4 .mutBorrow (.derefSub 2 [])))
+          (.act (.borrow 3 .mutBorrow (.derefSub 1 [])))))
+      [(2, 3), (3, 2)])
+    (.seq (.act (.assign (.derefSub 3 []) (.constVal (.nat 10))))
+      (.seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 20))))
+        (.seq (.act (.endLoan 3)) (.act (.endLoan 2)))))
+
+/-- Explicit join where the false arm takes a scratch shared borrow (loan `2`)
+whose dead handle stays in local `3`, as in MIR before `StorageDead`, and then
+the reborrow of `*x` (loan `3`) that the pair `(2, 3)` renames to the true
+arm's loan `2`. -/
+def deadRefExplicitJoinPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.localSub 3 []) (.constVal (.nat 0))))
+    (.seq
+      (.branchExplicitJoin (.use (.localSub 0 []))
+        (.act (.borrow 4 .mutBorrow (.derefSub 1 [])))
+        (.seq (.act (.borrow 3 .shared (.localSub 0 [])))
+          (.seq (.act (.endLoan 2))
+            (.act (.borrow 4 .mutBorrow (.derefSub 1 [])))))
+        [(2, 3)])
+      (.seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 50))))
+        (.act (.endLoan 2))))
+
+/-- The state after an arm that reborrowed local `0` and then local `1`
+(`swapped = false`: loan `2` borrows local `0` and loan `3` local `1`), or the
+same locals in the opposite order (`swapped = true`). Locals `2` and `3` hold
+the handles to the borrows of locals `0` and `1`. -/
+def twoReborrowsState (swapped : Bool) : SymState StdVal :=
+  let l0 : LoanId := if swapped then 3 else 2
+  let l1 : LoanId := if swapped then 2 else 3
+  ⟨[⟨.nat 1, .mutLocked l0⟩, ⟨.nat 2, .mutLocked l1⟩,
+    ⟨.refVal l0 [], .unborrowed⟩, ⟨.refVal l1 [], .unborrowed⟩],
+   [⟨0, .ended, ⟨.unit, .unborrowed⟩, .direct (.localReg 0) []⟩,
+    ⟨1, .ended, ⟨.unit, .unborrowed⟩, .direct (.localReg 0) []⟩,
+    ⟨2, .activeMut, ⟨.nat 1, .unborrowed⟩,
+     .direct (.localReg (if swapped then 1 else 0)) []⟩,
+    ⟨3, .activeMut, ⟨.nat 2, .unborrowed⟩,
+     .direct (.localReg (if swapped then 0 else 1)) []⟩],
+   [], [], [], 0⟩
+
+/-- Explicit join pairs may exchange two loan IDs (`relabelJoinLoans`): the
+pairs `[(2, 3), (3, 2)]` turn the swapped state into the unswapped one, both
+within one arm (`applySelfJoinPairs`) and against the other arm
+(`applyJoinPairs`). The loan that moves out of the way first takes the fresh
+ID `4`, which remains as an ended loan. -/
+theorem explicit_join_swapped_loan_ids_tests :
+    let renamedOk (o : Option (SymState StdVal)) : Prop :=
+      match o with
+      | some st =>
+        st.locals.map (fun c => c.val) =
+          [.nat 1, .nat 2, .refVal 2 [], .refVal 3 []] ∧
+        st.locals.map (fun c => c.perm) =
+          [.mutLocked 2, .mutLocked 3, .unborrowed, .unborrowed] ∧
+        st.loans.map (fun e => (e.id, e.phase.isActive)) =
+          [(0, false), (1, false), (2, true), (3, true), (4, false)]
+      | none => False
+    renamedOk
+      (applySelfJoinPairs stdValAlg [(2, 3), (3, 2)] (twoReborrowsState true)) ∧
+    renamedOk
+      (applyJoinPairs stdValAlg [(2, 3), (3, 2)] (twoReborrowsState false)
+        (twoReborrowsState true)) :=
+  ⟨⟨rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl⟩⟩
+
+/-- `swappedLoanIdsJoinPlan` runs when only the false arm runs, so that its
+loans must be renamed. -/
+theorem explicit_join_swapped_loan_ids_plan_tests :
+    evalFnValue stdValAlg
+      [⟨.byVal, .bool false⟩, ⟨.mutRef 0 [], .nat 1⟩, ⟨.mutRef 1 [], .nat 2⟩]
+      swappedLoanIdsJoinPlan (.constVal .unit) =
+      .ok ⟨.unit, [.nat 10, .nat 20]⟩ :=
+  rfl
+
+/-- `deadRefExplicitJoinPlan` runs when only the false arm runs, so that its
+mutable reborrow must take the ID of its dead scratch borrow. -/
+theorem explicit_join_dead_ref_plan_tests :
+    evalFnValue stdValAlg
+      [⟨.byVal, .bool false⟩, ⟨.mutRef 0 [], .nat 1⟩, ⟨.mutRef 1 [], .nat 2⟩]
+      deadRefExplicitJoinPlan (.constVal .unit) =
+      .ok ⟨.unit, [.nat 50, .nat 2]⟩ :=
+  rfl
+
+/-- Test algebra that never reports two reference representations as equal
+(`sameRefVal := fun _ _ => false`), modeling an algebra whose reference handles
+carry extra non-decoded data so `zipOrKeepSameRef` preserves the conditional
+choice instead of collapsing to the true-arm value. -/
+def opaqueRefStdValAlg : ValAlgebra StdVal :=
+  { stdValAlg with
+    sameRefVal := fun _ _ => false
+    sameRefVal_eq := fun _ _ h => nomatch h }
+
+/-- Regression tests for:
+1. `projectBranchStdVal` and `lensTestProjectBranchVal` recursively projecting
+   the selected arm when a value repeats the projected guard,
+2. `stdAdd` recursing through multi-level nested `.choice` values produced by
+   combining choices under distinct guards, and
+3. `zipOrKeepSameRef` / `joinPlaceCells` preserving the conditional value when
+   `sameRefVal` does not vouch that two reference representations are equal,
+   while collapsing identical references when `sameRefVal` holds. -/
+theorem recursive_projection_nested_add_and_ref_join_tests :
+    let c : StdVal := .symBool true
+    let d : StdVal := .symBool false
+    let lc : LensTestVal := .node (.atom 0) (.atom 0)
+    -- 1. Recursive arm projection in `projectBranchStdVal` and
+    -- `lensTestProjectBranchVal`:
+    projectBranchStdVal c true
+      (.choice c (.choice c (.nat 1) (.nat 2)) (.nat 3)) = .nat 1 ∧
+    projectBranchStdVal c false
+      (.choice c (.nat 1) (.choice c (.nat 2) (.nat 3))) = .nat 3 ∧
+    lensTestProjectBranchVal lc true
+      (.choice lc (.choice lc (.atom 1) (.atom 2)) (.atom 3)) = .atom 1 ∧
+    -- 2. `stdAdd` over nested `.choice` trees:
+    (match stdAdd (.choice c (.nat 1) (.nat 2))
+        (.choice d (.nat 10) (.nat 20)) with
+     | some sum1 =>
+       stdAdd sum1 (.nat 1) =
+         some (.choice c
+           (.choice d (.nat 12) (.nat 22))
+           (.choice d (.nat 13) (.nat 23))) ∧
+       stdAdd (.nat 1) sum1 =
+         some (.choice c
+           (.choice d (.nat 12) (.nat 22))
+           (.choice d (.nat 13) (.nat 23)))
+     | none => False) ∧
+    -- 3. Full-reference equality check in `zipOrKeepSameRef`:
+    zipOrKeepSameRef opaqueRefStdValAlg c (.refVal 0 []) (.refVal 0 []) =
+      .choice c (.refVal 0 []) (.refVal 0 []) ∧
+    zipOrKeepSameRef stdValAlg c (.refVal 0 []) (.refVal 0 []) =
+      .refVal 0 [] ∧
+    -- 4. `projectBranchOrFields` / `projectBranchValList` traverses aggregate
+    -- fields, and ending a joined loan over aggregate pairs (`evalBackVal`)
+    -- preserves `.pair` structure so subsequent field reads (`[0]`) succeed:
+    projectBranchValList stdValAlg c true
+      [.pair (.choice c (.nat 10) (.nat 20)) (.choice c (.nat 30) (.nat 40))] =
+      [.pair (.nat 10) (.nat 30)] ∧
+    evalFnValue stdValAlg
+      [⟨.byVal, c⟩, ⟨.byVal, .pair (.nat 1) (.nat 2)⟩,
+       ⟨.byVal, .pair (.nat 3) (.nat 4)⟩]
+      (.seq
+        (.branch (.use (.localSub 0 []))
+          (.act (.borrow 3 .mutBorrow (.localSub 1 [])))
+          (.act (.borrow 3 .mutBorrow (.localSub 2 []))))
+        (.seq
+          (.act (.endLoan 0))
+          (.act (.assign (.localSub 4 []) (.use (.localSub 1 [0]))))))
+      (.use (.localSub 4 [])) =
+      .ok ⟨.choice c (.nat 1) (.nat 1), []⟩ ∧
+    -- 5. `m3LookupCell` rejects prefix-overlapping cells at the same
+    -- `(allocId, offset)` (`[]` and `[0]`), while accepting disjoint sibling
+    -- sub-paths (`[0]` and `[1]`):
+    m3LookupCell 0 0 []
+      [ ⟨0, 0, [], 1, .activeUnique, .init (StdVal.pair (.nat 1) (.nat 2))⟩
+      , ⟨0, 0, [0], 2, .activeUnique, .init (.nat 99)⟩ ] = none ∧
+    m3LookupCell 0 0 [0]
+      [ ⟨0, 0, [0], 1, .activeUnique, .init (StdVal.nat 1)⟩
+      , ⟨0, 0, [1], 2, .activeUnique, .init (.nat 2)⟩ ] =
+      some ⟨0, 0, [0], 1, .activeUnique, .init (.nat 1)⟩ :=
+  ⟨rfl, rfl, rfl, ⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.PureLift

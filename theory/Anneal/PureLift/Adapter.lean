@@ -28,7 +28,10 @@ two interfaces:
   a concrete memory model (`MachMem` and `Addr`).
 - `OperationalAdapter`: connects `evalFnValue` to a concrete machine's
   multi-step reachability relation `ExecutesTo : Mach → Nat → Mach → Prop` via
-  the adequacy theorem `pure_lift_sound`.
+  the adequacy theorem `pure_lift_sound`. The theorem does not derive the
+  machine run: it assumes that the machine simulates the lifted evaluation
+  (`hSim`) and that the initial states are related (`hInit`), and each use
+  must discharge both for its machine.
 
 Also provides three canonical adapter constructors covering:
 1. Total step-function machines (`M1StepResult`, `m1OperationalAdapter`).
@@ -52,7 +55,10 @@ structure SpatialModel (Val MachMem Addr : Type) where
   disjointSubPlaces : Addr → SubPath → Addr → SubPath → Prop
 
 /-- Constructive finite-step operational adapter connecting `PureLift` symbolic
-evaluation to an arbitrary operational machine `Mach`. -/
+evaluation to an arbitrary operational machine `Mach`. `ExecutesTo m k m'`
+says that `m'` is reachable from `m` in `k` steps; for a nondeterministic
+machine it holds for each reachable state, so statements built from it (such
+as `pure_lift_sound`) assert that some run is good, not that all runs are. -/
 structure OperationalAdapter (Mach Val : Type) where
   ExecutesTo : Mach → Nat → Mach → Prop
   StateRel : SymState Val → Mach → Prop
@@ -62,11 +68,22 @@ structure OperationalAdapter (Mach Val : Type) where
     ExecutesTo m1 k1 m2 → ExecutesTo m2 k2 m3 → ExecutesTo m1 (k1 + k2) m3
 
 /-- Adequacy theorem (`pure_lift_sound`): if `initFnState alg params` produces
-an initial symbolic state `st0` related to `m0` via `ad.StateRel st0 m0`,
-`evalFnValue alg params plan retExpr` satisfies `HoldsFnSpec ... post`, and the
-operational adapter simulates the evaluation from `(st0, m0)`, then `m0` reaches
-a terminal machine state `mFinal` in `k` steps satisfying `FinalLoansRel out
-mFinal` and `post out`. -/
+an initial symbolic state `st0` related to `m0` via `ad.StateRel st0 m0`
+(`hInit`), `evalFnValue alg params plan retExpr` satisfies
+`HoldsFnSpec ... post` (`hSpec`), and the machine simulates the evaluation from
+`(st0, m0)` (`hSim`), then `m0` reaches a terminal machine state `mFinal` in
+`k` steps satisfying `FinalLoansRel out mFinal` and `post out`.
+
+The theorem transfers `post` from the lifted result to the machine; it does
+not derive the machine run. `hSim` and `hInit` are assumptions, and each
+adapter instance must discharge them for its own machine.
+
+The conclusion is existential: some run from `m0` reaches a good final state.
+For a deterministic machine this is the run. For a nondeterministic one, such
+as an `M2` machine whose step offers a `.choice`, `hSim` need exhibit only one
+run, and the theorem says nothing about the other runs the machine may take.
+A claim about every run would need a universal simulation obligation instead.
+The `M2` instances in this suite are deterministic. -/
 theorem pure_lift_sound {Mach Val : Type}
     (ad : OperationalAdapter Mach Val)
     (alg : ValAlgebra Val)
@@ -259,7 +276,9 @@ def subPathDisjoint (p1 p2 : SubPath) : Bool :=
     p1 p2
 
 /-- Look up the unique `M3Cell` at `(aid, off, path)` in `cells`, returning
-`none` if no cell matches or if multiple cells share `(aid, off, path)`. -/
+`none` if no cell matches, if multiple cells share `(aid, off, path)`, or if
+another cell at `(aid, off)` has a prefix-overlapping sub-path
+(`!subPathDisjoint c.subPath path`). -/
 def m3LookupCell {Val : Type} (aid : AllocId) (off : Offset) (path : SubPath)
     (cells : List (M3Cell Val)) : Option (M3Cell Val) :=
   match
@@ -267,11 +286,15 @@ def m3LookupCell {Val : Type} (aid : AllocId) (off : Offset) (path : SubPath)
       (fun c (acc : Bool × Option (M3Cell Val)) =>
         match acc with
         | (dup, foundOpt) =>
-          if c.allocId == aid && c.offset == off &&
-             subPathEq c.subPath path then
-            match foundOpt with
-            | some _ => (true, foundOpt)
-            | none => (dup, some c)
+          if c.allocId == aid && c.offset == off then
+            if subPathEq c.subPath path then
+              match foundOpt with
+              | some _ => (true, foundOpt)
+              | none => (dup, some c)
+            else if !subPathDisjoint c.subPath path then
+              (true, foundOpt)
+            else
+              (dup, foundOpt)
           else
             (dup, foundOpt))
       (false, none)
@@ -286,7 +309,9 @@ def m3LookupCell {Val : Type} (aid : AllocId) (off : Offset) (path : SubPath)
 not applied to `perm` again. The cell's tag must match the loan ID(s) that
 hold the cell. Where no loan in `perm` names the cell itself (`.unborrowed`,
 or `.split` when child borrows cover only strict sub-places), the cell must
-carry the tag of the owning loan `owner`. -/
+carry the tag of the owning loan `owner` with a unique permission. The model
+does not see the owner's phase: callers pass a shared owner's place as
+`.shared` (`effectiveBoundLoanPerm`), which requires a frozen cell. -/
 def m3SpatialModel (Val : Type) :
     SpatialModel Val (List (M3Cell Val)) (AllocId × Offset) where
   ownSubPlace heap addr path owner perm v :=
@@ -330,9 +355,13 @@ def spatialBindingsDisjoint {Val MachMem Addr : Type}
 
 /-- Effective `PermTree` of the place bound to active loan `lid` in `phase`,
 whose child-borrow permission tree (relative to the loan's own value) is
-`cellPerm`: when no child borrow holds the whole place (`getPathPerm []
+`cellPerm`. When no child borrow holds the whole place (`getPathPerm []
 cellPerm` is `.unborrowed`), the place is owned by `lid` itself (`.mutLocked
-lid` for `.activeMut`, `.shared [lid]` for `.activeShared`). -/
+lid` for `.activeMut`, `.shared [lid]` for `.activeShared`). A place under an
+`.activeShared` loan whose child borrows cover only strict sub-places
+(`.split`) is still shared as a whole, so it is also `.shared [lid]`:
+`m3SpatialModel` then requires a frozen cell, not the unique one it requires
+for `.split`. -/
 def effectiveBoundLoanPerm {Val : Type} (lid : LoanId) (phase : LoanPhase Val)
     (cellPerm : PermTree) : PermTree :=
   match getPathPerm [] cellPerm with
@@ -341,6 +370,10 @@ def effectiveBoundLoanPerm {Val : Type} (lid : LoanId) (phase : LoanPhase Val)
     | .activeMut => .mutLocked lid
     | .activeShared => .shared [lid]
     | _ => cellPerm
+  | .split children =>
+    match phase with
+    | .activeShared => .shared [lid]
+    | _ => .split children
   | _ => cellPerm
 
 /-- Spatial loan-ownership invariant connecting symbolic loans in `st.loans` to
@@ -419,10 +452,12 @@ def m3OperationalAdapter {Val : Type}
   exec_trans := M3ExecutesTo.trans
 
 /-- Spatial adequacy theorem (`pure_lift_spatial_sound`): specializes
-`pure_lift_sound` to `m3OperationalAdapter` so that initial `m3SpatialModel`
-sub-place ownership (`spatialBindingsHold`) and disjointness are verified at
-entry and final root mutable sub-place ownership (`spatialFinalBindingsHold`) is
-established in the terminal heap `mFinal.heap`. -/
+`pure_lift_sound` to `m3OperationalAdapter`. The initial `m3SpatialModel`
+sub-place ownership (`spatialBindingsHold`) and disjointness are part of the
+assumed initial relation `hInit`, and final root mutable sub-place ownership
+(`spatialFinalBindingsHold`) in the terminal heap `mFinal.heap` is part of the
+assumed simulation `hSim`; the theorem exposes both in its conclusion but
+derives neither, and each instance must discharge them. -/
 theorem pure_lift_spatial_sound {Val : Type}
     (step : List (M3Cell Val) → M1StepResult (List (M3Cell Val)) Val)
     (stateRel : SymState Val → List (M3Cell Val) → Prop)
@@ -464,14 +499,14 @@ theorem pure_lift_spatial_sound {Val : Type}
         exact ⟨k, ⟨mFinal, ⟨out, hOut.1, hOut.2.1.1, hOut.2.1.2, hOut.2.2⟩⟩⟩
 
 /-!
-## Exhaustive Kernel-Checked Unit Tests for `Adapter`
+## Kernel-Checked Unit Tests for `Adapter`
 -/
 
-/-- Exhaustive unit tests for `m1StepMach`, `m1RunN`, `M2ProductiveOn`,
+/-- Unit tests for `m1StepMach`, `m1RunN`, `M2ProductiveOn`,
 `subPathDisjoint`, `m3LookupCell`, and `m3SpatialModel.ownSubPlace` across all
 `PermTree` constructors, including the owning-loan tag check for `.unborrowed`
 and `.split` cells. -/
-theorem adapter_styles_and_m3SpatialModel_exhaustive_tests :
+theorem adapter_styles_and_m3SpatialModel_tests :
     let stepM1 (s : Nat) : M1StepResult Nat LensTestVal :=
       match s with
       | 0 => .next 1
@@ -541,5 +576,26 @@ theorem adapter_styles_and_m3SpatialModel_exhaustive_tests :
     (fun h => nomatch h.2.1),
     (fun h => nomatch h.2.1),
     rfl⟩
+
+/-- A place under an `.activeShared` loan whose child borrows cover only strict
+sub-places (`.split`) is shared as a whole: `effectiveBoundLoanPerm` maps it to
+`.shared [lid]`, so `m3SpatialModel` accepts a frozen cell and rejects a
+unique one. Under an `.activeMut` loan the `.split` permission is kept. -/
+theorem effectiveBoundLoanPerm_shared_split_tests :
+    let split : PermTree := .split [([0], .mutLocked 4)]
+    let cell (perm : TbPerm) : List (M3Cell LensTestVal) :=
+      [⟨0, 0, [], 3, perm, .init (.atom 1)⟩]
+    let sharedPerm :=
+      effectiveBoundLoanPerm 3 (LoanPhase.activeShared (Val := LensTestVal))
+        split
+    effectiveBoundLoanPerm 3 (LoanPhase.activeShared (Val := LensTestVal))
+      split = .shared [3] ∧
+    effectiveBoundLoanPerm 3 (LoanPhase.activeMut (Val := LensTestVal))
+      split = split ∧
+    (m3SpatialModel LensTestVal).ownSubPlace (cell .frozen) (0, 0) [] 3
+      sharedPerm (.atom 1) ∧
+    ¬ (m3SpatialModel LensTestVal).ownSubPlace (cell .activeUnique) (0, 0) []
+      3 sharedPerm (.atom 1) :=
+  ⟨rfl, rfl, ⟨rfl, rfl, rfl⟩, fun h => nomatch h.2.2⟩
 
 end Anneal.PureLift

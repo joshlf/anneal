@@ -241,29 +241,57 @@ theorem Lens.comp_lawful {S A B : Type} (l1 : Lens S A) (l2 : Lens A B)
   values, including any data that `getField` does not expose, so lens and
   region writebacks to disjoint targets give the same owner value in either
   order,
-- `encodeRef`, `encodeSharedRef`, `decodeRef`, and `remapRefInVal`: first-order
-  borrow handle representation and recursive loan-ID renaming inside values.
-  The law `decodeRef_getField` makes a handle a leaf: a value that decodes as
-  a handle has no fields,
-- `branchParts` and its law `branchParts_zipVal`: the two arms of a symbolic
-  `zipVal` choice. They are not fields, but `projectBranchVal` can expose them
-  again, so a scan for borrow handles must visit them too (the guard is never
-  exposed as a value),
+- `encodeRef`, `encodeSharedRef`, `decodeRef`, and `decodeRefIsShared`:
+  first-order borrow handle representation. The laws `decodeRef_encodeRef` and
+  `decodeRef_encodeSharedRef` make decoding invert encoding, so a handle that
+  a borrow stores names exactly the loan and sub-path it was created for, while
+  `decodeRefIsShared_encodeSharedRef` and `decodeRefIsShared_encodeRef` ensure
+  that whenever `encodeSharedRef` and `encodeRef` differ, `decodeRefIsShared`
+  distinguishes shared-form from mutable-form handle encodings. The
+  laws `decodeRef_getField` and `decodeRef_branchSplit` make a handle a leaf:
+  a value that decodes as a handle has no fields and no branch arms,
+- `branchSplit` and its law `branchSplit_zipVal`: the guard and the two arms
+  of a symbolic `zipVal` choice. The arms are not fields, but
+  `projectBranchVal` can expose them again, so a scan for borrow handles must
+  visit them too. Every choice guard must itself be handle-free, so
+  `branchSplit` can never expose a borrow handle hidden inside a guard,
+- `remapRefInVal oldLid newLid` and its four laws: renaming the handles to loan
+  `oldLid` inside a value into handles to `newLid` (explicit branch joins use
+  it to give loans a common ID). A handle is renamed if it names `oldLid` and
+  kept otherwise (`decodeRef_remapRefInVal`); fields, and the guard and arms
+  of a choice, are renamed recursively (`getField_remapRefInVal` and
+  `branchSplit_remapRefInVal`); and a value with no handle, field, or arm is
+  unchanged (`remapRefInVal_leaf`). Together, the laws fix everything about
+  the result that `decodeRef`, `getField`, and `branchSplit` can observe. They
+  do not constrain data that those operations do not expose, such as an
+  aggregate's tag or what a handle records besides its loan and sub-path,
+- `sameCond` and its law `sameCond_eq`: a conservative test that two
+  conditions are the same value, and so take the same truth value in every
+  branch. Handle accounting and borrow checks use it to follow correlated
+  choices branch by branch. An algebra may always answer `false`, which makes
+  those checks treat every choice as independent,
 - `sizeBound` and its law `getField_lt_sizeBound`: a strict upper bound on
   every field index of a value (the law) and an upper bound on its aggregate
-  nesting depth. Traversals that enumerate fields (branch joins merging
-  aggregates field by field, and the handle scan behind `copyableVal`) visit
-  every index below `sizeBound`, so the law makes them complete; no fixed depth
-  or width cutoff applies. A value nested more deeply than its bound makes the
-  join fall back to `zipVal` and makes the handle scan fail closed.
+  nesting depth. A traversal that enumerates fields (such as the handle scan
+  behind `copyableVal`) can visit every index below `sizeBound`, and the law
+  makes it complete; no fixed depth or width cutoff applies. A value nested
+  more deeply than its bound exhausts the traversal budget, and the traversal
+  must then fail closed or fall back to a conservative result.
 - `sameAggregateShape` and its two laws (`sameAggregateShape_ext`,
   `sameAggregateShape_setField`): a conservative test that two aggregates
-  differ at most in their fields. Branch joins merge two aggregates field by
-  field, rebuilding the result from the true arm's value, only when this test
-  holds. The laws make that rebuild exact: related values whose fields all
-  agree are equal, so the true arm cannot carry tags or other non-field data
-  that the false arm lacks, and field updates keep the relation. An algebra may
-  always answer `false`, which makes joins fall back to `zipVal`. -/
+  differ at most in their fields. If it holds and every field agrees, the
+  values are equal (`sameAggregateShape_ext`), so neither can carry tags or
+  other non-field data that the other lacks; and updating a field of the first
+  value keeps the relation (`sameAggregateShape_setField`). Together, the laws
+  let a client rebuild one related value from the other exactly, by field
+  updates alone. An algebra may always answer `false`, which leaves a client
+  no such rebuild,
+- `sameRefVal` and its law `sameRefVal_eq`: a conservative test that two
+  encoded reference values are equal as full `Val` values (including any
+  non-decoded handle data such as mutability, generation, or reborrow depth).
+  Branch joins collapse two reference values to the first only when
+  `sameRefVal` holds; an algebra may always answer `false`, which preserves
+  the conditional `zipVal` value. -/
 structure ValAlgebra (Val : Type) where
   defaultVal : Val
   asBool : Val → Option Bool
@@ -275,12 +303,21 @@ structure ValAlgebra (Val : Type) where
   projectBranchVal_zip_true :
     ∀ (cond vt vf : Val),
       asBool cond = none →
-      projectBranchVal cond true (zipVal cond vt vf) = vt
+      projectBranchVal cond true (zipVal cond vt vf) =
+        projectBranchVal cond true vt
   projectBranchVal_zip_false :
     ∀ (cond vt vf : Val),
       asBool cond = none →
-      projectBranchVal cond false (zipVal cond vt vf) = vf
+      projectBranchVal cond false (zipVal cond vt vf) =
+        projectBranchVal cond false vf
   getField : FieldIdx → Val → Option Val
+  getField_projectBranchVal :
+    ∀ (cond : Val) (branch : Bool) (f : FieldIdx) (s a : Val),
+      getField f s = some a →
+      getField f (projectBranchVal cond branch s) =
+        some (projectBranchVal cond branch a) := by
+    intro _ _ _ _ _ hGet
+    exact hGet
   setField : FieldIdx → Val → Val → Option Val
   getField_setField :
     ∀ (f : FieldIdx) (s a : Val),
@@ -301,17 +338,64 @@ structure ValAlgebra (Val : Type) where
   encodeRef : LoanId → SubPath → Val
   encodeSharedRef : LoanId → SubPath → Val := encodeRef
   decodeRef : Val → Option (LoanId × SubPath)
+  decodeRefIsShared : Val → Bool := fun _ => true
+  decodeRef_encodeRef :
+    ∀ (lid : LoanId) (path : SubPath),
+      decodeRef (encodeRef lid path) = some (lid, path)
+  decodeRef_encodeSharedRef :
+    ∀ (lid : LoanId) (path : SubPath),
+      decodeRef (encodeSharedRef lid path) = some (lid, path)
+  decodeRefIsShared_encodeSharedRef :
+    ∀ (lid : LoanId) (path : SubPath),
+      decodeRefIsShared (encodeSharedRef lid path) = true := by
+    intro _ _
+    rfl
+  decodeRefIsShared_encodeRef :
+    ∀ (lid : LoanId) (path : SubPath),
+      encodeSharedRef lid path = encodeRef lid path ∨
+      decodeRefIsShared (encodeRef lid path) = false := by
+    intro _ _
+    exact Or.inl rfl
   decodeRef_getField :
     ∀ (f : FieldIdx) (v : Val) (r : LoanId × SubPath),
       decodeRef v = some r → getField f v = none
-  branchParts : Val → List Val
-  branchParts_zipVal :
+  branchSplit : Val → Option (Val × Val × Val)
+  decodeRef_branchSplit :
+    ∀ (v : Val) (r : LoanId × SubPath),
+      decodeRef v = some r → branchSplit v = none
+  branchSplit_zipVal :
     ∀ (cond vt vf : Val), asBool cond = none →
-      branchParts (zipVal cond vt vf) = [vt, vf]
+      branchSplit (zipVal cond vt vf) = some (cond, vt, vf)
+  sameCond : Val → Val → Bool
+  sameCond_eq : ∀ (c1 c2 : Val), sameCond c1 c2 = true → c1 = c2
+  sameRefVal : Val → Val → Bool := fun _ _ => false
+  sameRefVal_eq : ∀ (r1 r2 : Val), sameRefVal r1 r2 = true → r1 = r2 := by
+    intro _ _ h
+    nomatch h
   remapRefInVal : LoanId → LoanId → Val → Val
+  decodeRef_remapRefInVal :
+    ∀ (oldLid newLid : LoanId) (v : Val),
+      decodeRef (remapRefInVal oldLid newLid v) =
+        (decodeRef v).map
+          (fun r => (if r.1 == oldLid then newLid else r.1, r.2))
+  getField_remapRefInVal :
+    ∀ (oldLid newLid : LoanId) (f : FieldIdx) (v : Val),
+      getField f (remapRefInVal oldLid newLid v) =
+        (getField f v).map (remapRefInVal oldLid newLid)
+  branchSplit_remapRefInVal :
+    ∀ (oldLid newLid : LoanId) (v : Val),
+      branchSplit (remapRefInVal oldLid newLid v) =
+        (branchSplit v).map (fun s =>
+          (remapRefInVal oldLid newLid s.1, remapRefInVal oldLid newLid s.2.1,
+           remapRefInVal oldLid newLid s.2.2))
+  remapRefInVal_leaf :
+    ∀ (oldLid newLid : LoanId) (v : Val),
+      decodeRef v = none → (∀ f, getField f v = none) → branchSplit v = none →
+      remapRefInVal oldLid newLid v = v
   sizeBound : Val → Nat
   getField_lt_sizeBound :
-    ∀ (f : FieldIdx) (v c : Val), getField f v = some c → f < sizeBound v
+    ∀ (f : FieldIdx) (v c : Val),
+      getField f v = some c → f < sizeBound v ∧ sizeBound c < sizeBound v
   sameAggregateShape : Val → Val → Bool
   sameAggregateShape_ext :
     ∀ (v1 v2 : Val),
@@ -571,7 +655,7 @@ theorem zipFuncOut_eq_ite {Val : Type} (zipB : Bool → Val → Val → Val)
         rw [hFalse rt rf]
 
 /-!
-## Exhaustive Kernel-Checked Tests for `Lens`
+## Kernel-Checked Tests for `Lens`
 -/
 
 /-- Size-indexed tree representation for `LensTestVal`, enforcing in the type
@@ -616,20 +700,29 @@ def choice (c vt vf : LensTestVal) : LensTestVal :=
 
 end LensTestVal
 
-def remapLensTestVal (oldLid newLid : LoanId)
-    (v : LensTestVal) : LensTestVal :=
-  natFold
-    (fun x => x)
-    (fun _ ih x =>
-      match x with
-      | ⟨_, .atom n⟩ => .atom n
-      | ⟨_, .branch fl fr l r⟩ =>
-        .node (ih ⟨fl, l⟩) (ih ⟨fr, r⟩)
-      | ⟨_, .choice fc ft ff c vt vf⟩ =>
-        .choice (ih ⟨fc, c⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
-      | ⟨_, .ref lid path⟩ =>
-        if lid == oldLid then .ref newLid path else .ref lid path)
-    v.fuel v
+/-- One step of `remapLensTestVal`: rename a handle to `oldLid` at the root of
+`x` to `newLid`, and rename the children of `x` with `ih`. -/
+def remapLensTestStep (oldLid newLid : LoanId)
+    (ih : LensTestVal → LensTestVal) (x : LensTestVal) : LensTestVal :=
+  match x with
+  | ⟨_, .atom n⟩ => .atom n
+  | ⟨_, .branch fl fr l r⟩ => .node (ih ⟨fl, l⟩) (ih ⟨fr, r⟩)
+  | ⟨_, .choice fc ft ff c vt vf⟩ =>
+    .choice (ih ⟨fc, c⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
+  | ⟨_, .ref lid path⟩ =>
+    if lid == oldLid then .ref newLid path else .ref lid path
+
+/-- `remapLensTestStep` nested `k` deep; parts of `v` deeper than `k` are left
+unchanged. -/
+def remapLensTestFuel (oldLid newLid : LoanId) (k : Nat) (v : LensTestVal) :
+    LensTestVal :=
+  natFold (fun x => x) (fun _ ih x => remapLensTestStep oldLid newLid ih x) k v
+
+/-- Rename every handle to loan `oldLid` inside `v` to `newLid`. The fuel
+`v.fuel` exceeds the depth of every node of `v`
+(`remapLensTestFuel_eq`). -/
+def remapLensTestVal (oldLid newLid : LoanId) (v : LensTestVal) : LensTestVal :=
+  remapLensTestFuel oldLid newLid v.fuel v
 
 def lensTestGetField (f : FieldIdx) (v : LensTestVal) : Option LensTestVal :=
   match f, v with
@@ -866,6 +959,30 @@ theorem lensTestSubPathEq_refl (xs : SubPath) :
     rw [Nat.beq_refl x, ih]
     rfl
 
+theorem lensTestSubPathEq_eq :
+    ∀ (xs ys : SubPath), lensTestSubPathEq xs ys = true → xs = ys := by
+  intro xs
+  induction xs with
+  | nil =>
+    intro ys h
+    cases ys with
+    | nil => rfl
+    | cons _ _ => nomatch h
+  | cons x xs' ih =>
+    intro ys h
+    cases ys with
+    | nil => nomatch h
+    | cons y ys' =>
+      change (Nat.beq x y && lensTestSubPathEq xs' ys') = true at h
+      revert h
+      cases hxy : Nat.beq x y with
+      | false =>
+        intro h
+        nomatch h
+      | true =>
+        intro h
+        rw [Nat.eq_of_beq_eq_true hxy, ih ys' h]
+
 def lensTestValEqStep (ih : LensTestVal → LensTestVal → Bool)
     (a b : LensTestVal) : Bool :=
   match a, b with
@@ -957,26 +1074,92 @@ def lensTestZipVal (c vt vf : LensTestVal) : LensTestVal :=
   | some false => vf
   | none => .choice c vt vf
 
+def lensTestProjectBranchStep (c : LensTestVal) (branch : Bool)
+    (ih : LensTestVal → LensTestVal) (v0 : LensTestVal) : LensTestVal :=
+  match v0 with
+  | ⟨_, .choice fc ft ff cond vt vf⟩ =>
+    if lensTestValEq c ⟨fc, cond⟩ then
+      if branch then ih ⟨ft, vt⟩ else ih ⟨ff, vf⟩
+    else
+      -- The guard may itself depend on `c`; projecting it can make it
+      -- concrete, in which case `lensTestZipVal` selects the arm.
+      lensTestZipVal (ih ⟨fc, cond⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
+  | ⟨_, .branch fl fr l r⟩ =>
+    .node (ih ⟨fl, l⟩) (ih ⟨fr, r⟩)
+  | other => other
+
+def lensTestProjectBranchFuel (c : LensTestVal) (branch : Bool)
+    (k : Nat) (v : LensTestVal) : LensTestVal :=
+  natFold (fun v0 => v0)
+    (fun _ ih v0 => lensTestProjectBranchStep c branch ih v0) k v
+
 def lensTestProjectBranchVal (c : LensTestVal) (branch : Bool)
     (v : LensTestVal) : LensTestVal :=
   match lensTestAsBool c with
   | some _ => v
-  | none =>
-    natFold
-      (fun v0 => v0)
-      (fun _ ih v0 =>
-        match v0 with
-        | ⟨_, .choice fc ft ff cond vt vf⟩ =>
-          if lensTestValEq c ⟨fc, cond⟩ then
-            if branch then ⟨ft, vt⟩ else ⟨ff, vf⟩
-          else
-            -- The guard may itself depend on `c`; projecting it can make it
-            -- concrete, in which case `lensTestZipVal` selects the arm.
-            lensTestZipVal (ih ⟨fc, cond⟩) (ih ⟨ft, vt⟩) (ih ⟨ff, vf⟩)
-        | ⟨_, .branch fl fr l r⟩ =>
-          .node (ih ⟨fl, l⟩) (ih ⟨fr, r⟩)
-        | other => other)
-      v.fuel v
+  | none => lensTestProjectBranchFuel c branch v.fuel v
+
+theorem lensTestProjectBranchFuel_eq (c : LensTestVal) (branch : Bool) :
+    ∀ {n : Nat} (tr : LensTestTree n) (k : Nat), n ≤ k →
+      lensTestProjectBranchFuel c branch k ⟨n, tr⟩ =
+        lensTestProjectBranchFuel c branch n ⟨n, tr⟩ := by
+  intro n tr
+  induction tr with
+  | atom _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | ref _ _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | branch fl fr l r ihl ihr =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fl + fr ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hL : fl ≤ fl + fr := Nat.le_add_right fl fr
+      have hR : fr ≤ fl + fr := Nat.le_add_left fr fl
+      change LensTestVal.node (lensTestProjectBranchFuel c branch k' ⟨fl, l⟩)
+          (lensTestProjectBranchFuel c branch k' ⟨fr, r⟩) =
+        LensTestVal.node (lensTestProjectBranchFuel c branch (fl + fr) ⟨fl, l⟩)
+          (lensTestProjectBranchFuel c branch (fl + fr) ⟨fr, r⟩)
+      rw [ihl k' (Nat.le_trans hL hSub), ihr k' (Nat.le_trans hR hSub),
+        ihl _ hL, ihr _ hR]
+  | choice fc ft ff cond vt vf ihc iht ihf =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fc + ft + ff ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hC : fc ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_right fc ft) (Nat.le_add_right (fc + ft) ff)
+      have hT : ft ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff)
+      have hF : ff ≤ fc + ft + ff := Nat.le_add_left ff (fc + ft)
+      change
+        (if lensTestValEq c ⟨fc, cond⟩ then
+           if branch then lensTestProjectBranchFuel c branch k' ⟨ft, vt⟩
+           else lensTestProjectBranchFuel c branch k' ⟨ff, vf⟩
+         else
+           lensTestZipVal (lensTestProjectBranchFuel c branch k' ⟨fc, cond⟩)
+             (lensTestProjectBranchFuel c branch k' ⟨ft, vt⟩)
+             (lensTestProjectBranchFuel c branch k' ⟨ff, vf⟩)) =
+        (if lensTestValEq c ⟨fc, cond⟩ then
+           if branch then
+             lensTestProjectBranchFuel c branch (fc + ft + ff) ⟨ft, vt⟩
+           else
+             lensTestProjectBranchFuel c branch (fc + ft + ff) ⟨ff, vf⟩
+         else
+           lensTestZipVal
+             (lensTestProjectBranchFuel c branch (fc + ft + ff) ⟨fc, cond⟩)
+             (lensTestProjectBranchFuel c branch (fc + ft + ff) ⟨ft, vt⟩)
+             (lensTestProjectBranchFuel c branch (fc + ft + ff) ⟨ff, vf⟩))
+      rw [ihc k' (Nat.le_trans hC hSub), iht k' (Nat.le_trans hT hSub),
+        ihf k' (Nat.le_trans hF hSub), ihc _ hC, iht _ hT, ihf _ hF]
 
 theorem lensTest_projectBranchVal_concrete (cond : LensTestVal)
     (b branch : Bool) (v : LensTestVal)
@@ -987,7 +1170,8 @@ theorem lensTest_projectBranchVal_concrete (cond : LensTestVal)
 
 theorem lensTest_projectBranchVal_zip_true (cond vt vf : LensTestVal)
     (hSym : lensTestAsBool cond = none) :
-    lensTestProjectBranchVal cond true (lensTestZipVal cond vt vf) = vt := by
+    lensTestProjectBranchVal cond true (lensTestZipVal cond vt vf) =
+      lensTestProjectBranchVal cond true vt := by
   dsimp [lensTestProjectBranchVal, lensTestZipVal]
   rw [hSym]
   cases cond with
@@ -996,15 +1180,20 @@ theorem lensTest_projectBranchVal_zip_true (cond vt vf : LensTestVal)
     | mk ft tt =>
       cases vf with
       | mk ff tf =>
+        have hT : ft ≤ fc + ft + ff :=
+          Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff)
         change
-          (if lensTestValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then (⟨ft, tt⟩ : LensTestVal)
-           else _) = ⟨ft, tt⟩
+          (if lensTestValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then
+             lensTestProjectBranchFuel ⟨fc, tc⟩ true (fc + ft + ff) ⟨ft, tt⟩
+           else _) =
+          lensTestProjectBranchFuel ⟨fc, tc⟩ true ft ⟨ft, tt⟩
         rw [lensTestValEq_refl ⟨fc, tc⟩]
-        rfl
+        exact lensTestProjectBranchFuel_eq ⟨fc, tc⟩ true tt (fc + ft + ff) hT
 
 theorem lensTest_projectBranchVal_zip_false (cond vt vf : LensTestVal)
     (hSym : lensTestAsBool cond = none) :
-    lensTestProjectBranchVal cond false (lensTestZipVal cond vt vf) = vf := by
+    lensTestProjectBranchVal cond false (lensTestZipVal cond vt vf) =
+      lensTestProjectBranchVal cond false vf := by
   dsimp [lensTestProjectBranchVal, lensTestZipVal]
   rw [hSym]
   cases cond with
@@ -1013,11 +1202,71 @@ theorem lensTest_projectBranchVal_zip_false (cond vt vf : LensTestVal)
     | mk ft tt =>
       cases vf with
       | mk ff tf =>
+        have hF : ff ≤ fc + ft + ff := Nat.le_add_left ff (fc + ft)
         change
-          (if lensTestValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then (⟨ff, tf⟩ : LensTestVal)
-           else _) = ⟨ff, tf⟩
+          (if lensTestValEq ⟨fc, tc⟩ ⟨fc, tc⟩ then
+             lensTestProjectBranchFuel ⟨fc, tc⟩ false (fc + ft + ff) ⟨ff, tf⟩
+           else _) =
+          lensTestProjectBranchFuel ⟨fc, tc⟩ false ff ⟨ff, tf⟩
         rw [lensTestValEq_refl ⟨fc, tc⟩]
+        exact lensTestProjectBranchFuel_eq ⟨fc, tc⟩ false tf (fc + ft + ff) hF
+
+theorem lensTestProjectBranchVal_node (cond : LensTestVal) (branch : Bool)
+    (l r : LensTestVal) :
+    lensTestProjectBranchVal cond branch (.node l r) =
+      .node (lensTestProjectBranchVal cond branch l)
+        (lensTestProjectBranchVal cond branch r) := by
+  dsimp [lensTestProjectBranchVal]
+  cases hCond : lensTestAsBool cond with
+  | some _ => rfl
+  | none =>
+    cases l with
+    | mk fl tl =>
+      cases r with
+      | mk fr tr =>
+        change LensTestVal.node
+            (lensTestProjectBranchFuel cond branch (fl + fr) ⟨fl, tl⟩)
+            (lensTestProjectBranchFuel cond branch (fl + fr) ⟨fr, tr⟩) = _
+        rw [lensTestProjectBranchFuel_eq cond branch tl _
+              (Nat.le_add_right fl fr),
+            lensTestProjectBranchFuel_eq cond branch tr _
+              (Nat.le_add_left fr fl)]
+
+theorem lensTest_getField_projectBranchVal (cond : LensTestVal)
+    (branch : Bool) (f : FieldIdx) (s a : LensTestVal)
+    (hGet : lensTestGetField f s = some a) :
+    lensTestGetField f (lensTestProjectBranchVal cond branch s) =
+      some (lensTestProjectBranchVal cond branch a) := by
+  cases s with
+  | mk fs ts =>
+    cases f with
+    | zero =>
+      cases ts with
+      | branch fl fr l r =>
+        injection hGet with hEq
+        subst hEq
+        change lensTestGetField 0
+            (lensTestProjectBranchVal cond branch (.node ⟨fl, l⟩ ⟨fr, r⟩)) = _
+        rw [lensTestProjectBranchVal_node]
         rfl
+      | atom _ => nomatch hGet
+      | ref _ _ => nomatch hGet
+      | choice _ _ _ _ _ _ => nomatch hGet
+    | succ f' =>
+      cases f' with
+      | zero =>
+        cases ts with
+        | branch fl fr l r =>
+          injection hGet with hEq
+          subst hEq
+          change lensTestGetField 1
+              (lensTestProjectBranchVal cond branch (.node ⟨fl, l⟩ ⟨fr, r⟩)) = _
+          rw [lensTestProjectBranchVal_node]
+          rfl
+        | atom _ => nomatch hGet
+        | ref _ _ => nomatch hGet
+        | choice _ _ _ _ _ _ => nomatch hGet
+      | succ _ => nomatch hGet
 
 /-- Every `LensTestTree` has positive size. -/
 theorem lensTestTree_fuel_pos : ∀ {f : Nat} (_ : LensTestTree f), 0 < f
@@ -1027,13 +1276,16 @@ theorem lensTestTree_fuel_pos : ∀ {f : Nat} (_ : LensTestTree f), 0 < f
   | _, .ref _ _ => Nat.zero_lt_succ 0
 
 theorem lensTest_getField_lt_sizeBound (f : FieldIdx) (v c : LensTestVal)
-    (hGet : lensTestGetField f v = some c) : f < v.fuel := by
+    (hGet : lensTestGetField f v = some c) : f < v.fuel ∧ c.fuel < v.fuel := by
   cases v with
   | mk fv tv =>
     cases f with
     | zero =>
       cases tv with
-      | branch fl fr l r => exact Nat.zero_lt_succ _
+      | branch fl fr l r =>
+        injection hGet with hEq
+        subst hEq
+        exact ⟨Nat.zero_lt_succ _, Nat.lt_succ_of_le (Nat.le_add_right fl fr)⟩
       | atom _ => nomatch hGet
       | choice _ _ _ _ _ _ => nomatch hGet
       | ref _ _ => nomatch hGet
@@ -1042,9 +1294,12 @@ theorem lensTest_getField_lt_sizeBound (f : FieldIdx) (v c : LensTestVal)
       | zero =>
         cases tv with
         | branch fl fr l r =>
-          exact Nat.succ_lt_succ
-            (Nat.lt_of_lt_of_le (lensTestTree_fuel_pos l)
-              (Nat.le_add_right fl fr))
+          injection hGet with hEq
+          subst hEq
+          exact ⟨Nat.succ_lt_succ
+              (Nat.lt_of_lt_of_le (lensTestTree_fuel_pos l)
+                (Nat.le_add_right fl fr)),
+            Nat.lt_succ_of_le (Nat.le_add_left fr fl)⟩
         | atom _ => nomatch hGet
         | choice _ _ _ _ _ _ => nomatch hGet
         | ref _ _ => nomatch hGet
@@ -1121,18 +1376,338 @@ theorem lensTest_decodeRef_getField (f : FieldIdx) (v : LensTestVal)
     | branch _ _ _ _ => nomatch hDec
     | choice _ _ _ _ _ _ => nomatch hDec
 
-/-- Arms of a `LensTestVal` choice node. -/
-def lensTestBranchParts (v : LensTestVal) : List LensTestVal :=
+/-- Guard and arms of a `LensTestVal` choice node. -/
+def lensTestBranchSplit (v : LensTestVal) :
+    Option (LensTestVal × LensTestVal × LensTestVal) :=
   match v with
-  | ⟨_, .choice _ ft ff _ vt vf⟩ => [⟨ft, vt⟩, ⟨ff, vf⟩]
-  | _ => []
+  | ⟨_, .choice fc ft ff c vt vf⟩ => some (⟨fc, c⟩, ⟨ft, vt⟩, ⟨ff, vf⟩)
+  | _ => none
 
-theorem lensTest_branchParts_zipVal (cond vt vf : LensTestVal)
+theorem lensTest_decodeRef_branchSplit (v : LensTestVal)
+    (r : LoanId × SubPath) (hDec : lensTestDecodeRef v = some r) :
+    lensTestBranchSplit v = none := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | ref _ _ => rfl
+    | atom _ => nomatch hDec
+    | branch _ _ _ _ => nomatch hDec
+    | choice _ _ _ _ _ _ => nomatch hDec
+
+theorem lensTest_branchSplit_zipVal (cond vt vf : LensTestVal)
     (hSym : lensTestAsBool cond = none) :
-    lensTestBranchParts (lensTestZipVal cond vt vf) = [vt, vf] := by
+    lensTestBranchSplit (lensTestZipVal cond vt vf) = some (cond, vt, vf) := by
   unfold lensTestZipVal
   rw [hSym]
   rfl
+
+/-- Key of a `LensTestVal` condition that `lensTestSameCond` can compare: the
+two atoms of a `.node (.atom a) (.atom b)` value. The test suite's symbolic
+conditions have this shape; other conditions get no key. -/
+def lensTestCondKey (v : LensTestVal) : Option (Nat × Nat) :=
+  match v with
+  | ⟨_, .branch _ _ (.atom a) (.atom b)⟩ => some (a, b)
+  | _ => none
+
+theorem lensTestCondKey_eq (v : LensTestVal) (a b : Nat)
+    (h : lensTestCondKey v = some (a, b)) :
+    v = .node (.atom a) (.atom b) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | atom _ => nomatch h
+    | ref _ _ => nomatch h
+    | choice _ _ _ _ _ _ => nomatch h
+    | branch fl fr l r =>
+      cases l with
+      | atom a' =>
+        cases r with
+        | atom b' =>
+          injection h with hPair
+          injection hPair with ha hb
+          subst ha
+          subst hb
+          rfl
+        | ref _ _ => nomatch h
+        | branch _ _ _ _ => nomatch h
+        | choice _ _ _ _ _ _ => nomatch h
+      | ref _ _ => nomatch h
+      | branch _ _ _ _ => nomatch h
+      | choice _ _ _ _ _ _ => nomatch h
+
+/-- Conservative condition equality for `LensTestVal`: equal keys
+(`lensTestCondKey`). Conditions without a key are never reported equal. -/
+def lensTestSameCond (c1 c2 : LensTestVal) : Bool :=
+  match lensTestCondKey c1, lensTestCondKey c2 with
+  | some (a1, b1), some (a2, b2) => Nat.beq a1 a2 && Nat.beq b1 b2
+  | _, _ => false
+
+theorem lensTest_sameCond_eq (c1 c2 : LensTestVal)
+    (h : lensTestSameCond c1 c2 = true) : c1 = c2 := by
+  unfold lensTestSameCond at h
+  revert h
+  cases h1 : lensTestCondKey c1 with
+  | none =>
+    intro h
+    nomatch h
+  | some p1 =>
+    cases p1 with
+    | mk a1 b1 =>
+      cases h2 : lensTestCondKey c2 with
+      | none =>
+        intro h
+        nomatch h
+      | some p2 =>
+        cases p2 with
+        | mk a2 b2 =>
+          change (Nat.beq a1 a2 && Nat.beq b1 b2) = true → c1 = c2
+          cases hA : Nat.beq a1 a2 with
+          | false =>
+            intro h
+            nomatch h
+          | true =>
+            cases hB : Nat.beq b1 b2 with
+            | false =>
+              intro h
+              nomatch h
+            | true =>
+              intro _
+              rw [lensTestCondKey_eq c1 a1 b1 h1,
+                lensTestCondKey_eq c2 a2 b2 h2,
+                Nat.eq_of_beq_eq_true hA, Nat.eq_of_beq_eq_true hB]
+
+theorem remapLensTestFuel_succ (oldLid newLid : LoanId) (k : Nat)
+    (v : LensTestVal) :
+    remapLensTestFuel oldLid newLid (k + 1) v =
+      remapLensTestStep oldLid newLid (remapLensTestFuel oldLid newLid k) v :=
+  rfl
+
+/-- Any fuel at least the size of a value renames it completely. -/
+theorem remapLensTestFuel_eq (oldLid newLid : LoanId) :
+    ∀ {n : Nat} (tr : LensTestTree n) (k : Nat), n ≤ k →
+      remapLensTestFuel oldLid newLid k ⟨n, tr⟩ =
+        remapLensTestVal oldLid newLid ⟨n, tr⟩ := by
+  intro n tr
+  induction tr with
+  | atom _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | ref _ _ =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ _ => rfl
+  | branch fl fr l r ihl ihr =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fl + fr ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hL : fl ≤ fl + fr := Nat.le_add_right fl fr
+      have hR : fr ≤ fl + fr := Nat.le_add_left fr fl
+      change LensTestVal.node (remapLensTestFuel oldLid newLid k' ⟨fl, l⟩)
+          (remapLensTestFuel oldLid newLid k' ⟨fr, r⟩) =
+        LensTestVal.node (remapLensTestFuel oldLid newLid (fl + fr) ⟨fl, l⟩)
+          (remapLensTestFuel oldLid newLid (fl + fr) ⟨fr, r⟩)
+      rw [ihl k' (Nat.le_trans hL hSub), ihr k' (Nat.le_trans hR hSub),
+        ihl _ hL, ihr _ hR]
+  | choice fc ft ff c vt vf ihc iht ihf =>
+    intro k hLe
+    cases k with
+    | zero => nomatch hLe
+    | succ k' =>
+      have hSub : fc + ft + ff ≤ k' := Nat.le_of_succ_le_succ hLe
+      have hC : fc ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_right fc ft) (Nat.le_add_right (fc + ft) ff)
+      have hT : ft ≤ fc + ft + ff :=
+        Nat.le_trans (Nat.le_add_left ft fc) (Nat.le_add_right (fc + ft) ff)
+      have hF : ff ≤ fc + ft + ff := Nat.le_add_left ff (fc + ft)
+      change LensTestVal.choice (remapLensTestFuel oldLid newLid k' ⟨fc, c⟩)
+          (remapLensTestFuel oldLid newLid k' ⟨ft, vt⟩)
+          (remapLensTestFuel oldLid newLid k' ⟨ff, vf⟩) =
+        LensTestVal.choice
+          (remapLensTestFuel oldLid newLid (fc + ft + ff) ⟨fc, c⟩)
+          (remapLensTestFuel oldLid newLid (fc + ft + ff) ⟨ft, vt⟩)
+          (remapLensTestFuel oldLid newLid (fc + ft + ff) ⟨ff, vf⟩)
+      rw [ihc k' (Nat.le_trans hC hSub), iht k' (Nat.le_trans hT hSub),
+        ihf k' (Nat.le_trans hF hSub), ihc _ hC, iht _ hT, ihf _ hF]
+
+theorem remapLensTestVal_node (oldLid newLid : LoanId) (l r : LensTestVal) :
+    remapLensTestVal oldLid newLid (.node l r) =
+      .node (remapLensTestVal oldLid newLid l)
+        (remapLensTestVal oldLid newLid r) := by
+  cases l with
+  | mk fl tl =>
+    cases r with
+    | mk fr tr =>
+      change LensTestVal.node (remapLensTestFuel oldLid newLid (fl + fr) ⟨fl, tl⟩)
+          (remapLensTestFuel oldLid newLid (fl + fr) ⟨fr, tr⟩) = _
+      rw [remapLensTestFuel_eq oldLid newLid tl _ (Nat.le_add_right fl fr),
+        remapLensTestFuel_eq oldLid newLid tr _ (Nat.le_add_left fr fl)]
+
+theorem remapLensTestVal_choice (oldLid newLid : LoanId)
+    (c vt vf : LensTestVal) :
+    remapLensTestVal oldLid newLid (.choice c vt vf) =
+      .choice (remapLensTestVal oldLid newLid c)
+        (remapLensTestVal oldLid newLid vt)
+        (remapLensTestVal oldLid newLid vf) := by
+  cases c with
+  | mk fc tc =>
+    cases vt with
+    | mk ft tt =>
+      cases vf with
+      | mk ff tf =>
+        change LensTestVal.choice
+            (remapLensTestFuel oldLid newLid (fc + ft + ff) ⟨fc, tc⟩)
+            (remapLensTestFuel oldLid newLid (fc + ft + ff) ⟨ft, tt⟩)
+            (remapLensTestFuel oldLid newLid (fc + ft + ff) ⟨ff, tf⟩) = _
+        rw [remapLensTestFuel_eq oldLid newLid tc _
+            (Nat.le_trans (Nat.le_add_right fc ft)
+              (Nat.le_add_right (fc + ft) ff)),
+          remapLensTestFuel_eq oldLid newLid tt _
+            (Nat.le_trans (Nat.le_add_left ft fc)
+              (Nat.le_add_right (fc + ft) ff)),
+          remapLensTestFuel_eq oldLid newLid tf _
+            (Nat.le_add_left ff (fc + ft))]
+
+theorem remapLensTestVal_ref (oldLid newLid lid : LoanId) (path : SubPath) :
+    remapLensTestVal oldLid newLid (.ref lid path) =
+      .ref (if lid == oldLid then newLid else lid) path := by
+  change (if lid == oldLid then LensTestVal.ref newLid path else .ref lid path) =
+    _
+  cases lid == oldLid <;> rfl
+
+theorem lensTest_decodeRef_remapRefInVal (oldLid newLid : LoanId)
+    (v : LensTestVal) :
+    lensTestDecodeRef (remapLensTestVal oldLid newLid v) =
+      (lensTestDecodeRef v).map
+        (fun r => (if r.1 == oldLid then newLid else r.1, r.2)) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | atom _ => rfl
+    | ref lid path =>
+      change lensTestDecodeRef (remapLensTestVal oldLid newLid (.ref lid path)) =
+        _
+      rw [remapLensTestVal_ref]
+      rfl
+    | branch fl fr l r =>
+      change lensTestDecodeRef
+          (remapLensTestVal oldLid newLid (.node ⟨fl, l⟩ ⟨fr, r⟩)) = _
+      rw [remapLensTestVal_node]
+      rfl
+    | choice fc ft ff c vt vf =>
+      change lensTestDecodeRef (remapLensTestVal oldLid newLid
+          (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+      rw [remapLensTestVal_choice]
+      rfl
+
+theorem lensTest_getField_remapRefInVal (oldLid newLid : LoanId)
+    (f : FieldIdx) (v : LensTestVal) :
+    lensTestGetField f (remapLensTestVal oldLid newLid v) =
+      (lensTestGetField f v).map (remapLensTestVal oldLid newLid) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | atom _ =>
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+    | ref lid path =>
+      change lensTestGetField f
+          (remapLensTestVal oldLid newLid (.ref lid path)) = _
+      rw [remapLensTestVal_ref]
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+    | branch fl fr l r =>
+      change lensTestGetField f
+          (remapLensTestVal oldLid newLid (.node ⟨fl, l⟩ ⟨fr, r⟩)) = _
+      rw [remapLensTestVal_node]
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+    | choice fc ft ff c vt vf =>
+      change lensTestGetField f (remapLensTestVal oldLid newLid
+          (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+      rw [remapLensTestVal_choice]
+      cases f with
+      | zero => rfl
+      | succ f' => cases f' <;> rfl
+
+theorem lensTest_branchSplit_remapRefInVal (oldLid newLid : LoanId)
+    (v : LensTestVal) :
+    lensTestBranchSplit (remapLensTestVal oldLid newLid v) =
+      (lensTestBranchSplit v).map (fun s =>
+        (remapLensTestVal oldLid newLid s.1,
+         remapLensTestVal oldLid newLid s.2.1,
+         remapLensTestVal oldLid newLid s.2.2)) := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | atom _ => rfl
+    | ref lid path =>
+      change lensTestBranchSplit
+          (remapLensTestVal oldLid newLid (.ref lid path)) = _
+      rw [remapLensTestVal_ref]
+      rfl
+    | branch fl fr l r =>
+      change lensTestBranchSplit
+          (remapLensTestVal oldLid newLid (.node ⟨fl, l⟩ ⟨fr, r⟩)) = _
+      rw [remapLensTestVal_node]
+      rfl
+    | choice fc ft ff c vt vf =>
+      change lensTestBranchSplit (remapLensTestVal oldLid newLid
+          (.choice ⟨fc, c⟩ ⟨ft, vt⟩ ⟨ff, vf⟩)) = _
+      rw [remapLensTestVal_choice]
+      rfl
+
+theorem lensTest_remapRefInVal_leaf (oldLid newLid : LoanId) (v : LensTestVal)
+    (hDec : lensTestDecodeRef v = none)
+    (hFields : ∀ f, lensTestGetField f v = none)
+    (hSplit : lensTestBranchSplit v = none) :
+    remapLensTestVal oldLid newLid v = v := by
+  cases v with
+  | mk fv tv =>
+    cases tv with
+    | atom _ => rfl
+    | ref _ _ => nomatch hDec
+    | branch _ _ _ _ => nomatch hFields 0
+    | choice _ _ _ _ _ _ => nomatch hSplit
+
+def lensTestSameRefVal (v1 v2 : LensTestVal) : Bool :=
+  match v1, v2 with
+  | ⟨_, .ref l1 p1⟩, ⟨_, .ref l2 p2⟩ =>
+    Nat.beq l1 l2 && lensTestSubPathEq p1 p2
+  | _, _ => false
+
+theorem lensTest_sameRefVal_eq (v1 v2 : LensTestVal)
+    (h : lensTestSameRefVal v1 v2 = true) : v1 = v2 := by
+  cases v1 with
+  | mk f1 t1 =>
+    cases v2 with
+    | mk f2 t2 =>
+      cases t1 with
+      | ref l1 p1 =>
+        cases t2 with
+        | ref l2 p2 =>
+          change (Nat.beq l1 l2 && lensTestSubPathEq p1 p2) = true at h
+          revert h
+          cases hL : Nat.beq l1 l2 with
+          | false =>
+            intro h
+            nomatch h
+          | true =>
+            intro hP
+            rw [Nat.eq_of_beq_eq_true hL, lensTestSubPathEq_eq p1 p2 hP]
+        | atom _ => nomatch h
+        | branch _ _ _ _ => nomatch h
+        | choice _ _ _ _ _ _ => nomatch h
+      | atom _ => nomatch h
+      | branch _ _ _ _ => nomatch h
+      | choice _ _ _ _ _ _ => nomatch h
 
 def lensTestValAlg : ValAlgebra LensTestVal where
   defaultVal := .atom 0
@@ -1143,6 +1718,7 @@ def lensTestValAlg : ValAlgebra LensTestVal where
   projectBranchVal_zip_true := lensTest_projectBranchVal_zip_true
   projectBranchVal_zip_false := lensTest_projectBranchVal_zip_false
   getField := lensTestGetField
+  getField_projectBranchVal := lensTest_getField_projectBranchVal
   setField := lensTestSetField
   getField_setField := lensTest_getField_setField
   setField_getField := lensTest_setField_getField
@@ -1151,10 +1727,21 @@ def lensTestValAlg : ValAlgebra LensTestVal where
   setField_setField_comm := lensTest_setField_setField_comm
   encodeRef lid path := .ref lid path
   decodeRef := lensTestDecodeRef
+  decodeRef_encodeRef _ _ := rfl
+  decodeRef_encodeSharedRef _ _ := rfl
   decodeRef_getField := lensTest_decodeRef_getField
-  branchParts := lensTestBranchParts
-  branchParts_zipVal := lensTest_branchParts_zipVal
+  branchSplit := lensTestBranchSplit
+  decodeRef_branchSplit := lensTest_decodeRef_branchSplit
+  branchSplit_zipVal := lensTest_branchSplit_zipVal
+  sameCond := lensTestSameCond
+  sameCond_eq := lensTest_sameCond_eq
+  sameRefVal := lensTestSameRefVal
+  sameRefVal_eq := lensTest_sameRefVal_eq
   remapRefInVal := remapLensTestVal
+  decodeRef_remapRefInVal := lensTest_decodeRef_remapRefInVal
+  getField_remapRefInVal := lensTest_getField_remapRefInVal
+  branchSplit_remapRefInVal := lensTest_branchSplit_remapRefInVal
+  remapRefInVal_leaf := lensTest_remapRefInVal_leaf
   sizeBound v := v.fuel
   getField_lt_sizeBound := lensTest_getField_lt_sizeBound
   sameAggregateShape := lensTestSameAggregateShape
@@ -1209,18 +1796,18 @@ theorem holdsFnSpec_ok_and_fail_tests :
     ¬ HoldsFnSpec (.fail : EvalOutcome Nat) (fun _ => True) :=
   ⟨rfl, holdsFnSpec_not_fail _⟩
 
-/-- Exhaustive unit tests for `fix2`/`fix4`/`fix8`/`fix16` combinators. -/
-theorem fix_combinators_exhaustive_tests :
+/-- Unit tests for `fix2`/`fix4`/`fix8`/`fix16` combinators. -/
+theorem fix_combinators_tests :
     fix2 (fun n => n + 1) 0 = 2 ∧
     fix4 (fun n => n + 1) 0 = 4 ∧
     fix8 (fun n => n + 1) 0 = 8 ∧
     fix16 (fun n => n + 1) 0 = 16 :=
   ⟨rfl, rfl, rfl, rfl⟩
 
-/-- Exhaustive unit tests for `Lens.id`, `Lens.comp`, `Lens.id_lawful`, and
+/-- Unit tests for `Lens.id`, `Lens.comp`, `Lens.id_lawful`, and
 `Lens.comp_lawful`, including `none` propagation when an outer or inner lens
 fails. -/
-theorem lens_id_and_comp_exhaustive_tests :
+theorem lens_id_and_comp_tests :
     (Lens.id Nat).get 15 = some 15 ∧
     (Lens.id Nat).put 15 20 = some 20 ∧
     (Lens.comp (fieldLens lensTestValAlg 0) (fieldLens lensTestValAlg 1)).get
@@ -1247,9 +1834,9 @@ theorem lens_id_and_comp_exhaustive_tests :
      (lensTestValAlg_fieldLens_lawful 0)
      (lensTestValAlg_fieldLens_lawful 1)⟩
 
-/-- Exhaustive unit tests for `zipValListBool`, `zipValListElem`, `zipFuncOut`,
+/-- Unit tests for `zipValListBool`, `zipValListElem`, `zipFuncOut`,
 and `zipFuncOut_eq_ite`. -/
-theorem zipVal_and_zipFuncOut_exhaustive_tests (c : Bool) :
+theorem zipVal_and_zipFuncOut_tests (c : Bool) :
     let zipB (b : Bool) (x y : Nat) : Nat := if b then x else y
     zipValListBool true [1, 2] [3] = [1, 2] ∧
     zipValListBool false [1, 2] [3] = [3] ∧
@@ -1264,7 +1851,7 @@ theorem zipVal_and_zipFuncOut_exhaustive_tests (c : Bool) :
      (fun _ _ => rfl)
      c ⟨1, [10, 20]⟩ ⟨2, [30]⟩⟩
 
-/-- Exhaustive negative and boundary tests for `getPath`, `putPath`, `asBool`,
+/-- Negative and boundary tests for `getPath`, `putPath`, `asBool`,
 `zipVal`, `projectBranchVal`, `encodeRef`, `decodeRef`, and deep post-update
 `remapRefInVal` on `lensTestValAlg`. -/
 theorem lensTestValAlg_operations_and_failures_tests :
