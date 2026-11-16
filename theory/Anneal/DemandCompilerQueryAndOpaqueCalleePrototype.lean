@@ -62,6 +62,89 @@ exists only to demonstrate the hazard and is a `local instance` confined to one
 section), so `a == b` always elaborates through `instBEqOfDecidableEq` and the core
 `instLawfulBEq` applies (`beq_iff_eq`). -/
 
+/-- Axiom-free `DecidableEq` from an injective constructor index with a left
+inverse (`ofIdx (idx a) = a`). Used for the nine enumeration-shaped `Trusted`
+types instead of `deriving instance DecidableEq`: Lean's enumeration deriving
+handler emits the *global* auxiliaries `T.ofNat` / `T.ofNat_ctorIdx` in the
+derived type's own namespace, so two modules that both derive such an instance can
+never be imported together. `Anneal.Rustc.V2026_06_01.TraceCheck` (imported by the
+`Anneal` root) already derives all nine (a co-import fails with `(kernel) constant
+has already been declared 'Trusted.Rustc.V2026_06_01.MirAst.Mutability.ofNat'`);
+the instances below create constants only inside this namespace. Non-enumeration
+`deriving instance` handlers name everything hygienically in the current
+namespace, so they never collide. -/
+def decEqOfCtorIdxProto {α : Type} (idx : α → Nat) (ofIdx : Nat → α)
+    (h : ∀ a, ofIdx (idx a) = a) : DecidableEq α := fun a b =>
+  if hab : idx a = idx b then isTrue (by rw [← h a, hab, h b])
+  else isFalse (fun e => hab (congrArg idx e))
+
+/-- Left inverse of `AbiPassMode.ctorIdx`. -/
+def abiPassModeOfIdxProto : Nat → AbiPassMode
+  | 0 => .ignore | 1 => .direct | 2 => .pair | _ => .indirect
+
+instance instDecidableEqAbiPassModeProto : DecidableEq AbiPassMode :=
+  decEqOfCtorIdxProto AbiPassMode.ctorIdx abiPassModeOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `UintTy.ctorIdx`. -/
+def uintTyOfIdxProto : Nat → UintTy
+  | 0 => .u8 | 1 => .u16 | 2 => .u32 | 3 => .u64 | 4 => .u128 | _ => .usize
+
+instance instDecidableEqUintTyProto : DecidableEq UintTy :=
+  decEqOfCtorIdxProto UintTy.ctorIdx uintTyOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `IntTy.ctorIdx`. -/
+def intTyOfIdxProto : Nat → IntTy
+  | 0 => .i8 | 1 => .i16 | 2 => .i32 | 3 => .i64 | 4 => .i128 | _ => .isize
+
+instance instDecidableEqIntTyProto : DecidableEq IntTy :=
+  decEqOfCtorIdxProto IntTy.ctorIdx intTyOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `FloatTy.ctorIdx`. -/
+def floatTyOfIdxProto : Nat → FloatTy
+  | 0 => .f16 | 1 => .f32 | 2 => .f64 | _ => .f128
+
+instance instDecidableEqFloatTyProto : DecidableEq FloatTy :=
+  decEqOfCtorIdxProto FloatTy.ctorIdx floatTyOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `Mutability.ctorIdx`. -/
+def mutabilityOfIdxProto : Nat → Mutability
+  | 0 => .not | _ => .mut
+
+instance instDecidableEqMutabilityProto : DecidableEq Mutability :=
+  decEqOfCtorIdxProto Mutability.ctorIdx mutabilityOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `Safety.ctorIdx`. -/
+def safetyOfIdxProto : Nat → Safety
+  | 0 => .safe | _ => .unsafe_
+
+instance instDecidableEqSafetyProto : DecidableEq Safety :=
+  decEqOfCtorIdxProto Safety.ctorIdx safetyOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `UnOp.ctorIdx`. -/
+def unOpOfIdxProto : Nat → UnOp
+  | 0 => .not | 1 => .neg | _ => .ptrMetadata
+
+instance instDecidableEqUnOpProto : DecidableEq UnOp :=
+  decEqOfCtorIdxProto UnOp.ctorIdx unOpOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `BinOp.ctorIdx`. -/
+def binOpOfIdxProto : Nat → BinOp
+  | 0 => .add | 1 => .addUnchecked | 2 => .addWithOverflow | 3 => .sub | 4 => .subUnchecked
+  | 5 => .subWithOverflow | 6 => .mul | 7 => .mulUnchecked | 8 => .mulWithOverflow | 9 => .div
+  | 10 => .rem | 11 => .bitXor | 12 => .bitAnd | 13 => .bitOr | 14 => .shl | 15 => .shlUnchecked
+  | 16 => .shr | 17 => .shrUnchecked | 18 => .eq | 19 => .lt | 20 => .le | 21 => .ne | 22 => .ge
+  | 23 => .gt | 24 => .cmp | _ => .offset
+
+instance instDecidableEqBinOpProto : DecidableEq BinOp :=
+  decEqOfCtorIdxProto BinOp.ctorIdx binOpOfIdxProto (fun a => by cases a <;> rfl)
+
+/-- Left inverse of `RetagKind.ctorIdx`. -/
+def retagKindOfIdxProto : Nat → RetagKind
+  | 0 => .fnEntry | 1 => .twoPhase | 2 => .raw | _ => .default
+
+instance instDecidableEqRetagKindProto : DecidableEq RetagKind :=
+  decEqOfCtorIdxProto RetagKind.ctorIdx retagKindOfIdxProto (fun a => by cases a <;> rfl)
+
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.Size
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.Align
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.WrappingRange
@@ -71,17 +154,10 @@ deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.FieldsShape
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.VariantsShape
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.BackendRepr
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.TypeLayout
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.AbiPassMode
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.ArgAbi
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.CallConv
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.FnAbi
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.Layout.LayoutTable
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.UintTy
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.IntTy
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.FloatTy
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Mutability
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Safety
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.UnOp
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ScalarInt
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.MirObs
@@ -154,52 +230,70 @@ theorem rigidTyStructEq_of_tag_ne {a b : RigidTy} (h : rigidTyTag a ≠ rigidTyT
   cases a <;> cases b <;> first | rfl | exact absurd rfl h
 
 mutual
-/-- `rigidTyStructEq` decides `RigidTy` equality. -/
+/-- `rigidTyStructEq` decides `RigidTy` equality. Each diagonal case is unfolded by
+`show` (definitional unfolding) rather than `simp [rigidTyStructEq]`, so no
+equation lemmas are generated for the catch-all definition: Lean proves the
+catch-all equation `rigidTyStructEq.eq_22` (and `eq_def`) with whatever simp set
+the *ambient import closure* provides, and inside the `Anneal` root closure those
+auto-generated lemmas depend on `Classical.choice` (caught by the module audit). -/
 theorem rigidTyStructEq_iff (a b : RigidTy) : rigidTyStructEq a b = true ↔ a = b :=
   if hTag : rigidTyTag a = rigidTyTag b then
     match a, b, hTag with
-    | .param i n, .param j m, _ => by simp [rigidTyStructEq]
+    | .param i n, .param j m, _ => by
+      show (decide (i = j) && decide (n = m)) = true ↔ _
+      simp
     | .alias d as, .alias e bs, _ => by
       have ih := rigidTyListStructEq_iff as bs
-      simp [rigidTyStructEq, ih]
-    | .bool, .bool, _ => by simp [rigidTyStructEq]
-    | .char, .char, _ => by simp [rigidTyStructEq]
-    | .int w, .int v, _ => by simp [rigidTyStructEq]
-    | .uint w, .uint v, _ => by simp [rigidTyStructEq]
-    | .float w, .float v, _ => by simp [rigidTyStructEq]
-    | .never, .never, _ => by simp [rigidTyStructEq]
-    | .str, .str, _ => by simp [rigidTyStructEq]
+      show (decide (d = e) && rigidTyListStructEq as bs) = true ↔ _
+      simp [ih]
+    | .bool, .bool, _ => by show true = true ↔ _; simp
+    | .char, .char, _ => by show true = true ↔ _; simp
+    | .int w, .int v, _ => by show decide (w = v) = true ↔ _; simp
+    | .uint w, .uint v, _ => by show decide (w = v) = true ↔ _; simp
+    | .float w, .float v, _ => by show decide (w = v) = true ↔ _; simp
+    | .never, .never, _ => by show true = true ↔ _; simp
+    | .str, .str, _ => by show true = true ↔ _; simp
     | .tuple as, .tuple bs, _ => by
       have ih := rigidTyListStructEq_iff as bs
-      simp [rigidTyStructEq, ih]
+      show rigidTyListStructEq as bs = true ↔ _
+      simp [ih]
     | .array x n, .array y m, _ => by
       have ih := rigidTyStructEq_iff x y
-      simp [rigidTyStructEq, ih]
+      show (rigidTyStructEq x y && decide (n = m)) = true ↔ _
+      simp [ih]
     | .slice x, .slice y, _ => by
       have ih := rigidTyStructEq_iff x y
-      simp [rigidTyStructEq, ih]
+      show rigidTyStructEq x y = true ↔ _
+      simp [ih]
     | .ref m x, .ref n y, _ => by
       have ih := rigidTyStructEq_iff x y
-      simp [rigidTyStructEq, ih]
+      show (decide (m = n) && rigidTyStructEq x y) = true ↔ _
+      simp [ih]
     | .rawPtr m x, .rawPtr n y, _ => by
       have ih := rigidTyStructEq_iff x y
-      simp [rigidTyStructEq, ih]
+      show (decide (m = n) && rigidTyStructEq x y) = true ↔ _
+      simp [ih]
     | .adt d as, .adt e bs, _ => by
       have ih := rigidTyListStructEq_iff as bs
-      simp [rigidTyStructEq, ih]
+      show (decide (d = e) && rigidTyListStructEq as bs) = true ↔ _
+      simp [ih]
     | .fnDef d as, .fnDef e bs, _ => by
       have ih := rigidTyListStructEq_iff as bs
-      simp [rigidTyStructEq, ih]
+      show (decide (d = e) && rigidTyListStructEq as bs) = true ↔ _
+      simp [ih]
     | .fnPtr ins o sf cc, .fnPtr jns p tf dd, _ => by
       have ih₁ := rigidTyListStructEq_iff ins jns
       have ih₂ := rigidTyStructEq_iff o p
-      simp [rigidTyStructEq, ih₁, ih₂, Bool.and_assoc]
+      show (rigidTyListStructEq ins jns && rigidTyStructEq o p && decide (sf = tf) &&
+        decide (cc = dd)) = true ↔ _
+      simp [ih₁, ih₂, Bool.and_assoc]
     | .closure d as, .closure e bs, _ => by
       have ih := rigidTyListStructEq_iff as bs
-      simp [rigidTyStructEq, ih]
-    | .dynamic d, .dynamic e, _ => by simp [rigidTyStructEq]
-    | .foreign d, .foreign e, _ => by simp [rigidTyStructEq]
-    | .other d, .other e, _ => by simp [rigidTyStructEq]
+      show (decide (d = e) && rigidTyListStructEq as bs) = true ↔ _
+      simp [ih]
+    | .dynamic d, .dynamic e, _ => by show decide (d = e) = true ↔ _; simp
+    | .foreign d, .foreign e, _ => by show decide (d = e) = true ↔ _; simp
+    | .other d, .other e, _ => by show decide (d = e) = true ↔ _; simp
   else by
     rw [rigidTyStructEq_of_tag_ne hTag]
     exact ⟨(fun h => nomatch h), fun e => absurd (congrArg rigidTyTag e) hTag⟩
@@ -208,13 +302,14 @@ theorem rigidTyStructEq_iff (a b : RigidTy) : rigidTyStructEq a b = true ↔ a =
 theorem rigidTyListStructEq_iff (as bs : List RigidTy) :
     rigidTyListStructEq as bs = true ↔ as = bs :=
   match as, bs with
-  | [], [] => by simp [rigidTyListStructEq]
-  | [], _ :: _ => by simp [rigidTyListStructEq]
-  | _ :: _, [] => by simp [rigidTyListStructEq]
+  | [], [] => by show true = true ↔ _; simp
+  | [], _ :: _ => by show false = true ↔ _; simp
+  | _ :: _, [] => by show false = true ↔ _; simp
   | a :: as, b :: bs => by
     have ih₁ := rigidTyStructEq_iff a b
     have ih₂ := rigidTyListStructEq_iff as bs
-    simp [rigidTyListStructEq, ih₁, ih₂]
+    show (rigidTyStructEq a b && rigidTyListStructEq as bs) = true ↔ _
+    simp [ih₁, ih₂]
 end
 
 /-- Axiom-free manual `DecidableEq` for the nested inductive `RigidTy`
@@ -234,14 +329,12 @@ deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.GenericParamD
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Place
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Operand
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.BinOp
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.NullOp
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.BorrowKind
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.CastKind
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.AggregateKind
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Rvalue
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic
-deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.RetagKind
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.StatementKind
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Statement
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.SwitchTargets
@@ -285,12 +378,15 @@ mutual
 theorem valueStructEq_iff (a b : Value) : valueStructEq a b = true ↔ a = b :=
   if hTag : valueTag a = valueTag b then
     match a, b, hTag with
-    | .unit, .unit, _ => by simp [valueStructEq]
-    | .scalar x, .scalar y, _ => by simp [valueStructEq]
-    | .ptr p₁ s₁, .ptr p₂ s₂, _ => by simp [valueStructEq]
+    | .unit, .unit, _ => by show true = true ↔ _; simp
+    | .scalar x, .scalar y, _ => by show decide (x = y) = true ↔ _; simp
+    | .ptr p₁ s₁, .ptr p₂ s₂, _ => by
+      show (decide (p₁ = p₂) && decide (s₁ = s₂)) = true ↔ _
+      simp
     | .aggregate v₁ fs₁, .aggregate v₂ fs₂, _ => by
       have ih := valueListStructEq_iff fs₁ fs₂
-      simp [valueStructEq, ih]
+      show (decide (v₁ = v₂) && valueListStructEq fs₁ fs₂) = true ↔ _
+      simp [ih]
   else by
     rw [valueStructEq_of_tag_ne hTag]
     exact ⟨(fun h => nomatch h), fun e => absurd (congrArg valueTag e) hTag⟩
@@ -299,13 +395,14 @@ theorem valueStructEq_iff (a b : Value) : valueStructEq a b = true ↔ a = b :=
 theorem valueListStructEq_iff (as bs : List Value) :
     valueListStructEq as bs = true ↔ as = bs :=
   match as, bs with
-  | [], [] => by simp [valueListStructEq]
-  | [], _ :: _ => by simp [valueListStructEq]
-  | _ :: _, [] => by simp [valueListStructEq]
+  | [], [] => by show true = true ↔ _; simp
+  | [], _ :: _ => by show false = true ↔ _; simp
+  | _ :: _, [] => by show false = true ↔ _; simp
   | a :: as, b :: bs => by
     have ih₁ := valueStructEq_iff a b
     have ih₂ := valueListStructEq_iff as bs
-    simp [valueListStructEq, ih₁, ih₂]
+    show (valueStructEq a b && valueListStructEq as bs) = true ↔ _
+    simp [ih₁, ih₂]
 end
 
 /-- Axiom-free manual `DecidableEq` for the nested inductive `Value`. -/
@@ -825,6 +922,58 @@ theorem lookupCallee_hit_poly {tbl : OpaqueCalleeTable} {callerLayouts : LayoutT
       some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) :=
   lookupCallee_hit (resolve_free_poly_or_default hfirst hnoTrait hraw hconcrete)
     (by simp) harity hlay
+
+/-- With no registered `TraitImplEntry` for `defPath`, the trusted
+`collectMatchingTraitImpls` scan returns its accumulator unchanged. -/
+theorem collectMatchingTraitImpls_of_no_impl (callees : List CapturedMir) (defPath : DefPath)
+    (typeArgs : List RigidTy) :
+    ∀ (impls : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      hasTraitImplForDefPath impls defPath = false →
+        collectMatchingTraitImpls callees impls defPath typeArgs acc = acc
+  | [], _, _ => rfl
+  | e :: rest, acc, h => by
+    have he : stringEq e.traitRef.defPath defPath = false := by
+      cases hs : stringEq e.traitRef.defPath defPath
+      · rfl
+      · simp [hasTraitImplForDefPath, hs] at h
+    have hrest : hasTraitImplForDefPath rest defPath = false := by
+      simp only [hasTraitImplForDefPath, he] at h
+      exact h
+    simp only [collectMatchingTraitImpls, he, Bool.false_eq_true, ite_false]
+    exact collectMatchingTraitImpls_of_no_impl callees defPath typeArgs rest acc hrest
+
+/-- Resolution certificate for a *free* generic function: no registered
+`TraitImplEntry` targets `defPath`, so every non-empty `typeArgs` (concrete or
+still-generic `.param` first argument) resolves to the captured body. -/
+theorem resolve_free_poly {tbl : OpaqueCalleeTable} {defPath : DefPath}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {extra : List TraitImplEntry}
+    {c : CapturedMir}
+    (hnoImpl : hasTraitImplForDefPath (extra ++ flatMapTraitImpls tbl.toList) defPath = false)
+    (hraw : tbl.lookupRaw defPath = some c) :
+    resolveCalleeBodyAndArgs? tbl.toList defPath (firstArg :: restArgs) extra =
+      some (c, firstArg :: restArgs) := by
+  rw [OpaqueCalleeTable.lookupRaw_eq] at hraw
+  have hnil : collectMatchingTraitImpls tbl.toList (extra ++ flatMapTraitImpls tbl.toList)
+      defPath (firstArg :: restArgs) = [] :=
+    collectMatchingTraitImpls_of_no_impl _ _ _ _ [] hnoImpl
+  cases firstArg <;>
+    simp only [resolveCalleeBodyAndArgs?, hnil, hraw, hnoImpl, Bool.false_and]
+
+/-- **`O(1)` certificate (free generic function)**: one per-`defPath` certificate
+(`hnoImpl`, independent of the call-site `typeArgs`) plus the raw `lookupRaw`
+certificate rewrite *every* instantiation `defPath::<firstArg, restArgs…>` —
+including still-generic callers (`.param` first argument), which
+`lookupCallee_hit_poly` excludes — to the instantiated body. -/
+theorem lookupCallee_hit_free_poly {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra : List TraitImplEntry} {c : CapturedMir} {argLayouts : List TypeLayout}
+    (hnoImpl : hasTraitImplForDefPath (extra ++ flatMapTraitImpls tbl.toList) defPath = false)
+    (hraw : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) :=
+  lookupCallee_hit (resolve_free_poly hnoImpl hraw) (by simp) harity hlay
 
 /-! ### Literal-discriminant branch pruning over the real trusted step -/
 
@@ -1959,6 +2108,28 @@ theorem canary_trait_specificity_and_default_inheritance :
       (argLayouts := [protoUnitLayout]) (by decide) (by decide +kernel) rfl ?_ rfl (by decide)
     unfold protoSpecTbl
     exact lookupRaw_ofList_cons_hit rfl
+
+/-- **Free generic certificate canary**: `proto::poly` has no `TraitImplEntry` in
+`multiFullTbl` (which does register `impl Area for Circle`), so *one* per-`defPath`
+certificate (`hno`) plus one raw certificate resolve both the concrete
+instantiation `poly::<u32>` and a still-generic caller's `poly::<T>`
+(`.param 0 "T"`, outside `lookupCallee_hit_poly`) to the instantiated body. -/
+theorem canary_free_poly_param_and_concrete :
+    multiFullTbl.lookup protoLayouts "proto::poly" [.uint .u32] [] =
+      some (protoPoly.instantiate [(.uint .u32, protoU32Layout)]) ∧
+    multiFullTbl.lookup protoLayouts "proto::poly" [.param 0 "T"] [] =
+      some (protoPoly.instantiate [(.param 0 "T", protoUnitLayout)]) := by
+  have hno : hasTraitImplForDefPath ([] ++ flatMapTraitImpls multiFullTbl.toList)
+      "proto::poly" = false := by
+    decide +kernel
+  have hraw : multiFullTbl.lookupRaw "proto::poly" = some protoPoly := by
+    unfold multiFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hlayP : instantiationLayouts? protoLayouts [.param 0 "T"] = some [protoUnitLayout] := by
+    decide
+  exact ⟨lookupCallee_hit_free_poly hno hraw rfl canary_u32_instantiationLayouts,
+    lookupCallee_hit_free_poly hno hraw rfl hlayP⟩
 
 /-! ## Part B: multi-version demand-time `CompilerQueryEnv` -/
 
@@ -3596,10 +3767,14 @@ def UnOpExt.query? : UnOpExt → ProvenancePtr → Option CompilerQuery
   | .vtableMethodLookup op, vtablePtr =>
     some (.vtableMethodLookup vtablePtr.allocId op.traitRef op.slotIdx)
 
-/-- A `dyn Trait` method call site. -/
+/-- A `dyn Trait` method call site, lowered as in `charon#1611`: the receiver's
+vtable pointer (`PtrMetadata(recv)`) is held in local `vtableLocal` of the calling
+frame and read *at call time*, so `UnOp.vtableMethodLookup lookupOp` is applied to
+the runtime vtable pointer. Two receivers reaching the same call key dispatch to
+their own `impl`s (`canary_dyn_two_receivers`). -/
 structure DynCallSite : Type where
-  /-- vtable pointer of the `dyn Trait` receiver. -/
-  vtablePtr : ProvenancePtr
+  /-- Local of the calling frame holding the receiver's vtable pointer. -/
+  vtableLocal : Nat
   /-- The `UnOp.vtableMethodLookup` applied to it. -/
   lookupOp : VTableMethodLookupOp
   /-- Caller-side ABI of the trait method signature. -/
@@ -3610,10 +3785,18 @@ structure DynCallSite : Type where
   dynKey : DefPath × List RigidTy
   deriving DecidableEq
 
-/-- Resolve a `dyn` call: `UnOp.vtableMethodLookup`, then `abiCompatible`. -/
-def resolveDynTarget (env : CompilerQueryEnv) (site : DynCallSite) :
+/-- The receiver's runtime vtable pointer at `s`: local `site.vtableLocal` of the
+active frame must hold an initialized pointer (otherwise the `dyn` call is UB). -/
+def DynCallSite.vtablePtr? (site : DynCallSite) (s : MachineState) : Option ProvenancePtr :=
+  match get? s.frame.locals site.vtableLocal with
+  | some (.init (.ptr p _)) => some p
+  | _ => none
+
+/-- Resolve a `dyn` call through the runtime vtable pointer `vtablePtr`:
+`UnOp.vtableMethodLookup`, then `abiCompatible`. -/
+def resolveDynTarget (env : CompilerQueryEnv) (site : DynCallSite) (vtablePtr : ProvenancePtr) :
     QueryResult (DefPath × List RigidTy) :=
-  match (UnOpExt.vtableMethodLookup site.lookupOp).query? site.vtablePtr with
+  match (UnOpExt.vtableMethodLookup site.lookupOp).query? vtablePtr with
   | none => .err .answerKindMismatch
   | some q =>
     match evalCompilerQuery env q with
@@ -3634,25 +3817,30 @@ def redirectResolver (tbl : OpaqueCalleeTable) (dynKey target : DefPath × List 
     if (p, tys) = dynKey then tbl.lookup callerLayouts target.1 target.2 extra
     else tbl.lookup callerLayouts p tys extra
 
-/-- **Unified dynamic-dispatch step**: `UnOp.vtableMethodLookup → abiCompatible →
-OpaqueCalleeTable.lookup → stepBranchPruned`. Missing evidence fails closed
-(`MirStepNode.unsupported`), a CFI type-id mismatch is the defined CFI trap
-(`abort`), and every other semantic error is UB. -/
+/-- **Unified dynamic-dispatch step**: receiver vtable pointer (read from the
+calling frame) `→ UnOp.vtableMethodLookup → abiCompatible →
+OpaqueCalleeTable.lookup → stepBranchPruned`. A receiver without a vtable pointer
+is UB, missing evidence fails closed (`MirStepNode.unsupported`), a CFI type-id
+mismatch is the defined CFI trap (`abort`), and every other semantic error is UB. -/
 def dynDispatchStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
-  match resolveDynTarget env site with
-  | .ok target => stepBranchPruned (redirectResolver tbl site.dynKey target) body s
-  | .err .cfiTypeIdMismatch => MirStepNode.retOutcome .abort
-  | .err _ => MirStepNode.fail .ub
-  | .unsupported _ => MirStepNode.unsupported
+  match site.vtablePtr? s with
+  | none => MirStepNode.fail .ub
+  | some vt =>
+    match resolveDynTarget env site vt with
+    | .ok target => stepBranchPruned (redirectResolver tbl site.dynKey target) body s
+    | .err .cfiTypeIdMismatch => MirStepNode.retOutcome .abort
+    | .err _ => MirStepNode.fail .ub
+    | .unsupported _ => MirStepNode.unsupported
 
 /-- `resolveDynTarget` is monotone under `EnvExtends` on supported answers. -/
 theorem resolveDynTarget_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
-    (site : DynCallSite) (hsup : ∀ m, resolveDynTarget env₁ site ≠ .unsupported m) :
-    resolveDynTarget env₂ site = resolveDynTarget env₁ site := by
+    (site : DynCallSite) (vt : ProvenancePtr)
+    (hsup : ∀ m, resolveDynTarget env₁ site vt ≠ .unsupported m) :
+    resolveDynTarget env₂ site vt = resolveDynTarget env₁ site vt := by
   unfold resolveDynTarget at hsup ⊢
   simp only [UnOpExt.query?] at hsup ⊢
-  generalize hq : CompilerQuery.vtableMethodLookup site.vtablePtr.allocId site.lookupOp.traitRef
+  generalize hq : CompilerQuery.vtableMethodLookup vt.allocId site.lookupOp.traitRef
     site.lookupOp.slotIdx = q at hsup ⊢
   cases hv : evalCompilerQuery env₁ q with
   | unsupported m => exact absurd (by simp [hv]) (hsup m)
@@ -3670,45 +3858,52 @@ theorem resolveDynTarget_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends
       | ok b => rw [query_mono_schema h _ (by simp [hb]), hb]
     | _ => rfl
 
-/-- The dynamic-dispatch step on a resolved target is a branch-pruned step. -/
+/-- The dynamic-dispatch step on a resolved receiver is a branch-pruned step. -/
 theorem dynDispatchStep_eq_of_resolved {env : CompilerQueryEnv} {tbl : OpaqueCalleeTable}
-    {site : DynCallSite} {body : CapturedMir} {s : MachineState} {target : DefPath × List RigidTy}
-    (h : resolveDynTarget env site = .ok target) :
+    {site : DynCallSite} {body : CapturedMir} {s : MachineState} {vt : ProvenancePtr}
+    {target : DefPath × List RigidTy} (hvt : site.vtablePtr? s = some vt)
+    (h : resolveDynTarget env site vt = .ok target) :
     dynDispatchStep env tbl site body s =
       stepBranchPruned (redirectResolver tbl site.dynKey target) body s := by
-  unfold dynDispatchStep
-  rw [h]
+  simp only [dynDispatchStep, hvt, h]
 
-/-- Preservation under `EnvExtends`. -/
+/-- Preservation under `EnvExtends` (supportedness is only required of the
+receiver vtable pointer actually present at `s`). -/
 theorem dynDispatchStep_envExtends {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     (tbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir) (s : MachineState)
-    (hsup : ∀ m, resolveDynTarget env₁ site ≠ .unsupported m) :
+    (hsup : ∀ vt, site.vtablePtr? s = some vt → ∀ m, resolveDynTarget env₁ site vt ≠ .unsupported m) :
     dynDispatchStep env₂ tbl site body s = dynDispatchStep env₁ tbl site body s := by
   unfold dynDispatchStep
-  rw [resolveDynTarget_mono h site hsup]
+  cases hvt : site.vtablePtr? s with
+  | none => rfl
+  | some vt => simp only [resolveDynTarget_mono h site vt (hsup vt hvt)]
 
 /-- Preservation under call-cone narrowing. -/
 theorem dynDispatchStep_cone_narrow (env : CompilerQueryEnv)
     (narrowTbl fullTbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir)
     (s : MachineState)
-    (hcone : ∀ target, resolveDynTarget env site = .ok target →
+    (hcone : ∀ vt target, site.vtablePtr? s = some vt → resolveDynTarget env site vt = .ok target →
       ∀ k, demandedKey? body s = some k →
         k.apply (redirectResolver narrowTbl site.dynKey target) =
           k.apply (redirectResolver fullTbl site.dynKey target)) :
     dynDispatchStep env narrowTbl site body s = dynDispatchStep env fullTbl site body s := by
   unfold dynDispatchStep
-  cases hr : resolveDynTarget env site with
-  | ok target => exact stepBranchPruned_congr body s (hcone target hr)
-  | err e => cases e <;> rfl
-  | unsupported m => rfl
+  cases hvt : site.vtablePtr? s with
+  | none => rfl
+  | some vt =>
+    dsimp only
+    cases hr : resolveDynTarget env site vt with
+    | ok target => exact stepBranchPruned_congr body s (hcone vt target hvt hr)
+    | err e => cases e <;> rfl
+    | unsupported m => rfl
 
 /-- **End-to-end integration theorem**: the dynamic-dispatch step is preserved
 simultaneously under a sound environment extension and call-cone narrowing. -/
 theorem dynDispatchStep_preserved {env₁ env₂ : CompilerQueryEnv}
     {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
     {s : MachineState} (h : EnvExtends env₁ env₂)
-    (hsup : ∀ m, resolveDynTarget env₁ site ≠ .unsupported m)
-    (hcone : ∀ target, resolveDynTarget env₁ site = .ok target →
+    (hsup : ∀ vt, site.vtablePtr? s = some vt → ∀ m, resolveDynTarget env₁ site vt ≠ .unsupported m)
+    (hcone : ∀ vt target, site.vtablePtr? s = some vt → resolveDynTarget env₁ site vt = .ok target →
       ∀ k, demandedKey? body s = some k →
         k.apply (redirectResolver narrowTbl site.dynKey target) =
           k.apply (redirectResolver fullTbl site.dynKey target)) :
@@ -3721,17 +3916,22 @@ theorem dynDispatchStep_preserved {env₁ env₂ : CompilerQueryEnv}
 /-- `Area` trait reference with `Self = dyn Area`. -/
 def dynTraitRef : TraitRef := ⟨"proto::Area", [.dynamic "proto::Area"]⟩
 
-/-- The `dyn Area` call site (vtable `7`, slot `0`, not CFI-instrumented). -/
+/-- `*const ()` (receiver vtable pointers; layout index `0`). -/
+def protoVtPtrTy : Ty := ⟨.rawPtr .not (.tuple []), 0⟩
+
+/-- The `dyn Area` call site (receiver vtable pointer in local `_1`, slot `0`, not
+CFI-instrumented). -/
 def dynSite : DynCallSite :=
-  { vtablePtr := ⟨7, 0⟩, lookupOp := ⟨dynTraitRef, 0⟩, callerAbi := protoRetU32Abi,
+  { vtableLocal := 1, lookupOp := ⟨dynTraitRef, 0⟩, callerAbi := protoRetU32Abi,
     cfiCallSite := none, dynKey := ("proto::Area::area", [.dynamic "proto::Area"]) }
 
-/-- `if true { <dyn Area>::area() } else { g_dead() }`. -/
+/-- `fn(vt: *const ()) -> u32 { if true { <dyn Area>::area() } else { g_dead() } }`. -/
 def dynRoot : CapturedMir :=
-  protoLitIfRoot true "proto::Area::area" [.dynamic "proto::Area"] "proto::g_dead"
+  { protoLitIfRoot true "proto::Area::area" [.dynamic "proto::Area"] "proto::g_dead" with
+    argCount := 1, localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩] }
 
-/-- Initial state of `dynRoot`. -/
-def dynInit : MachineState := initMachineState dynRoot []
+/-- Initial state of `dynRoot`, called with a `Circle` receiver (vtable `7`). -/
+def dynInit : MachineState := initMachineState dynRoot [.ptr ⟨7, 0⟩ 0]
 
 /-- State at the live `dyn` call (after the literal switch). -/
 def dynAtCall : MachineState :=
@@ -3744,36 +3944,44 @@ theorem dynAtCall_reached (r : CalleeResolver) :
     viewStepNode (stepBranchPruned r dynRoot dynInit) = .cont (some (.event 1)) (.running dynAtCall) :=
   rfl
 
+/-- The receiver's vtable pointer at the call is read from the frame: vtable `7`. -/
+theorem dyn_vtablePtr_atCall : dynSite.vtablePtr? dynAtCall = some ⟨7, 0⟩ := rfl
+
 /-- Schema-12 environment (no vtable evidence). -/
 def dynEnv12 : CompilerQueryEnv :=
   { schema := .v2026_08_01, layoutsV06 := protoLayouts,
     layoutsV08 := some (bridgeLayoutV06ToV08 protoLayouts),
-    fnAbis := [("proto::<impl Area for Circle>::area", protoRetU32Abi)], cfiTags := none,
-    syncRegions := none, vtables := none }
+    fnAbis := [("proto::<impl Area for Circle>::area", protoRetU32Abi),
+      ("proto::<impl Area for Square>::area", protoRetU32Abi)],
+    cfiTags := none, syncRegions := none, vtables := none }
 
-/-- Schema-13 extension with vtable evidence. -/
+/-- Schema-13 extension with vtable evidence (`7 ↦ Circle`, `9 ↦ Square`). -/
 def dynEnv13 : CompilerQueryEnv :=
   { dynEnv12 with
     schema := .schema13
-    vtables := some [⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])]⟩] }
+    vtables := some [⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])]⟩,
+      ⟨9, dynTraitRef, [("proto::<impl Area for Square>::area", [])]⟩] }
 
 /-- A further extension populating sync-storage regions. -/
 def dynEnv13Sync : CompilerQueryEnv := { dynEnv13 with syncRegions := some [⟨3, 4, 8⟩] }
 
+/-- `impl Area for Square { fn area() -> u32 { 44 } }`. -/
+def protoSquareArea : CapturedMir := protoLeaf "proto::<impl Area for Square>::area" 44 0 []
+
 /-- Full and narrowed tables for the `dyn` canary. -/
 def dynFullTbl : OpaqueCalleeTable :=
-  .ofList [protoFillerA, protoGDead, protoCircleArea, protoFillerB]
+  .ofList [protoFillerA, protoGDead, protoCircleArea, protoSquareArea, protoFillerB]
 
 /-- Narrowed `dyn` table. -/
 def dynNarrowTbl : OpaqueCalleeTable := .ofList [protoCircleArea]
 
 /-- Schema 12 fails closed on the `dyn` call. -/
 theorem dyn_schema12_unsupported :
-    resolveDynTarget dynEnv12 dynSite = .unsupported .missingVTableEvidence := by decide
+    resolveDynTarget dynEnv12 dynSite ⟨7, 0⟩ = .unsupported .missingVTableEvidence := by decide
 
-/-- Schema 13 dispatches to `<Circle as Area>::area`. -/
+/-- Schema 13 dispatches the `Circle` receiver to `<Circle as Area>::area`. -/
 theorem dyn_schema13_resolves :
-    resolveDynTarget dynEnv13 dynSite = .ok ("proto::<impl Area for Circle>::area", []) := by
+    resolveDynTarget dynEnv13 dynSite ⟨7, 0⟩ = .ok ("proto::<impl Area for Circle>::area", []) := by
   decide
 
 theorem dyn_envExtends_12_13 : EnvExtends dynEnv12 dynEnv13 :=
@@ -3798,7 +4006,14 @@ theorem dyn_step_enters_impl :
 /-- The Schema-12 dynamic-dispatch step is the fail-closed `unsupported` node. -/
 theorem dyn_step_schema12_fails_closed :
     dynDispatchStep dynEnv12 dynFullTbl dynSite dynRoot dynAtCall = MirStepNode.unsupported := by
-  rw [dynDispatchStep, dyn_schema12_unsupported]
+  simp only [dynDispatchStep, dyn_vtablePtr_atCall, dyn_schema12_unsupported]
+
+/-- A `dyn` call whose receiver local holds no pointer is UB (fail-closed: no
+vtable lookup, no call). -/
+theorem dyn_step_missing_receiver_ub :
+    dynDispatchStep dynEnv13 dynFullTbl { dynSite with vtableLocal := 0 } dynRoot dynAtCall =
+      MirStepNode.fail .ub :=
+  rfl
 
 /-- The live `dyn` call is the only demanded key at the call state. -/
 theorem dyn_demandedKey :
@@ -3808,14 +4023,19 @@ theorem dyn_demandedKey :
 
 /-- **End-to-end canary**: the Schema-13 dynamic-dispatch step is preserved when the
 environment is further extended (sync regions) *and* the callee table is narrowed
-to the dispatched method (dropping the dead-arm `g_dead` and fillers). -/
+to the dispatched method (dropping the dead-arm `g_dead`, `Square`, and fillers). -/
 theorem dyn_step_preserved :
     dynDispatchStep dynEnv13Sync dynNarrowTbl dynSite dynRoot dynAtCall =
       dynDispatchStep dynEnv13 dynFullTbl dynSite dynRoot dynAtCall := by
   apply dynDispatchStep_preserved dyn_envExtends_13_sync
-  · rw [dyn_schema13_resolves]
+  · intro vt hvt
+    rw [dyn_vtablePtr_atCall] at hvt
+    cases hvt
+    rw [dyn_schema13_resolves]
     exact fun _ h => nomatch h
-  · intro target ht k hk
+  · intro vt target hvt ht k hk
+    rw [dyn_vtablePtr_atCall] at hvt
+    cases hvt
     rw [dyn_schema13_resolves] at ht
     cases ht
     rw [dyn_demandedKey] at hk
@@ -3886,16 +4106,19 @@ theorem dyn_cfi_trap :
       MirStepNode.retOutcome .abort := by
   rfl
 
+/-! ### Demand-gated dynamic dispatch -/
+
 /-- Whether the next step at `s` demands the `dyn` call site `site.dynKey`. -/
 def demandsDynSite (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
   match demandedKey? body s with
   | some k => decide ((k.defPath, k.typeArgs) = site.dynKey)
   | none => false
 
-/-- **Demand-gated dynamic-dispatch step**: `resolveDynTarget` (`vtableMethodLookup`
-followed by `abiCompatible`) is issued *only* when the active step at `s` actually
-demands `site.dynKey`; all other steps (including literal switches and calls on
-the other branch) step directly via `stepBranchPruned tbl.lookup`. -/
+/-- **Demand-gated dynamic-dispatch step**: the receiver's vtable pointer is read
+and `resolveDynTarget` (`vtableMethodLookup` followed by `abiCompatible`) is issued
+*only* when the active step at `s` actually demands `site.dynKey`; all other steps
+(including literal switches and calls on the other branch) step directly via
+`stepBranchPruned tbl.lookup`. -/
 def dynDemandStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
   if demandsDynSite site body s then
@@ -3911,49 +4134,177 @@ theorem dynDemandStep_eq_dynDispatchStep_of_demanded (env : CompilerQueryEnv)
     dynDemandStep env tbl site body s = dynDispatchStep env tbl site body s := by
   simp [dynDemandStep, h]
 
+/-- A step that does not demand `site.dynKey` never consults the redirect. -/
+theorem stepBranchPruned_redirect_of_not_demanded (tbl : OpaqueCalleeTable) (site : DynCallSite)
+    (body : CapturedMir) (s : MachineState) (target : DefPath × List RigidTy)
+    (hnd : demandsDynSite site body s = false) :
+    stepBranchPruned (redirectResolver tbl site.dynKey target) body s =
+      stepBranchPruned tbl.lookup body s := by
+  apply stepBranchPruned_congr
+  intro k hk
+  have hne : ¬ (k.defPath, k.typeArgs) = site.dynKey := by
+    intro he
+    simp only [demandsDynSite, hk, he, decide_true, Bool.true_eq_false] at hnd
+  simp only [CalleeKey.apply, redirectResolver, ite_eq_right_of_eq_false _ _ (eq_false hne)]
+
+/-- **Demand gating is conservative**: wherever the eager dynamic-dispatch step
+resolves the receiver's method (`.ok target` for the vtable pointer at `s`), the
+demand-gated step is *identical* to it. The two differ only where the eager query
+fails (missing receiver, `.err`, or `.unsupported`) *and* the step does not demand
+the `dyn` key, i.e. demand gating only removes failures of calls that are not
+executed (`canary_dyn_deadBranch_schema12_succeeds`). -/
+theorem dynDemandStep_eq_dynDispatchStep_of_resolved {env : CompilerQueryEnv}
+    {tbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir} {s : MachineState}
+    {vt : ProvenancePtr} {target : DefPath × List RigidTy} (hvt : site.vtablePtr? s = some vt)
+    (hr : resolveDynTarget env site vt = .ok target) :
+    dynDemandStep env tbl site body s = dynDispatchStep env tbl site body s := by
+  unfold dynDemandStep
+  cases hd : demandsDynSite site body s with
+  | true => rfl
+  | false =>
+    simp only [Bool.false_eq_true, ite_false]
+    rw [dynDispatchStep_eq_of_resolved hvt hr,
+      stepBranchPruned_redirect_of_not_demanded tbl site body s target hd]
+
+/-- A step that does not demand the `dyn` key is exactly the trusted `stepMirFn`
+step (under the `memory.callees` frame condition): demand gating adds no new
+semantics off the `dyn` call. -/
+theorem dynDemandStep_eq_trusted_of_not_demanded (env : CompilerQueryEnv)
+    (tbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir) (s : MachineState)
+    (hnd : demandsDynSite site body s = false) (hframe : tbl.toList = s.memory.callees) :
+    dynDemandStep env tbl site body s = stepMirFn body s := by
+  simp only [dynDemandStep, hnd, Bool.false_eq_true, ite_false]
+  exact stepBranchPruned_eq_trusted tbl body s hframe
+
 /-- Fuel-bounded multi-step evaluation with demand-gated dynamic dispatch. -/
 def evalDynWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
     (site : DynCallSite) (body : CapturedMir) (fuel : Nat) (s : MachineState) : RunResult :=
   runSteps (dynDemandStep env tbl site body) fuel s []
 
-/-- Single-step preservation of `dynDemandStep` under `EnvExtends` (where the
-extension hypothesis `hsup` is only needed when `demandsDynSite site body s = true`)
-and call-cone narrowing. -/
+/-- Per-state side conditions under which one demand-gated step is preserved by
+`EnvExtends env₁ env₂` and narrowing `fullTbl` to `narrowTbl`. -/
+structure DynStepPreserved (env₁ : CompilerQueryEnv) (narrowTbl fullTbl : OpaqueCalleeTable)
+    (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Prop where
+  /-- A demanded `dyn` call's query is supported by `env₁`. -/
+  supported : demandsDynSite site body s = true → ∀ vt, site.vtablePtr? s = some vt →
+    ∀ m, resolveDynTarget env₁ site vt ≠ .unsupported m
+  /-- A demanded `dyn` call's redirected key agrees across the tables. -/
+  dynCone : demandsDynSite site body s = true → ∀ vt target, site.vtablePtr? s = some vt →
+    resolveDynTarget env₁ site vt = .ok target → ∀ k, demandedKey? body s = some k →
+      k.apply (redirectResolver narrowTbl site.dynKey target) =
+        k.apply (redirectResolver fullTbl site.dynKey target)
+  /-- Any other demanded key agrees across the tables. -/
+  cone : demandsDynSite site body s = false → ∀ k, demandedKey? body s = some k →
+    narrowTbl.lookupKey k = fullTbl.lookupKey k
+
+/-- Single-step preservation of `dynDemandStep` under `EnvExtends` (supportedness
+is only needed when `demandsDynSite site body s = true`) and call-cone narrowing. -/
 theorem dynDemandStep_preserved {env₁ env₂ : CompilerQueryEnv}
     {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
     {s : MachineState} (h : EnvExtends env₁ env₂)
-    (hsup : demandsDynSite site body s = true →
-      ∀ m, resolveDynTarget env₁ site ≠ .unsupported m)
-    (hcone :
-      (demandsDynSite site body s = true →
-        ∀ target, resolveDynTarget env₁ site = .ok target →
-          ∀ k, demandedKey? body s = some k →
-            k.apply (redirectResolver narrowTbl site.dynKey target) =
-              k.apply (redirectResolver fullTbl site.dynKey target)) ∧
-      (demandsDynSite site body s = false →
-        ∀ k, demandedKey? body s = some k →
-          narrowTbl.lookupKey k = fullTbl.lookupKey k)) :
+    (hp : DynStepPreserved env₁ narrowTbl fullTbl site body s) :
     dynDemandStep env₂ narrowTbl site body s = dynDemandStep env₁ fullTbl site body s := by
   unfold dynDemandStep
   cases hd : demandsDynSite site body s with
   | true =>
     simp only [ite_true]
-    exact dynDispatchStep_preserved h (hsup hd) (hcone.1 hd)
+    exact dynDispatchStep_preserved h (hp.supported hd) (hp.dynCone hd)
   | false =>
     simp only [Bool.false_eq_true, ite_false]
-    exact stepBranchPruned_congr body s (hcone.2 hd)
+    exact stepBranchPruned_congr body s (hp.cone hd)
+
+/-- **Multi-step end-to-end preservation**: if every state the `env₁`/`fullTbl`
+run visits satisfies `DynStepPreserved`, the entire demand-gated dynamic-dispatch
+run (receiver vtable pointer → `UnOp.vtableMethodLookup` → `abiCompatible` →
+`OpaqueCalleeTable.lookup` → `stepBranchPruned`, every step) is preserved under
+`EnvExtends env₁ env₂` and narrowing to `narrowTbl`. -/
+theorem evalDynWithOpaqueCallees_preserved {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hvisit : ∀ s' ∈ runVisited (dynDemandStep env₁ fullTbl site body) fuel s,
+      DynStepPreserved env₁ narrowTbl fullTbl site body s') :
+    evalDynWithOpaqueCallees env₂ narrowTbl site body fuel s =
+      evalDynWithOpaqueCallees env₁ fullTbl site body fuel s :=
+  runSteps_congr_visited fuel s [] (fun s' hs' => dynDemandStep_preserved h (hvisit s' hs'))
+
+/-- Decidable per-state certificate for `DynStepPreserved` (what a client checks by
+kernel evaluation along the run). -/
+def dynStepPreservedB (env₁ : CompilerQueryEnv) (narrowTbl fullTbl : OpaqueCalleeTable)
+    (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
+  match demandedKey? body s with
+  | none => true
+  | some k =>
+    if (k.defPath, k.typeArgs) = site.dynKey then
+      match site.vtablePtr? s with
+      | none => true
+      | some vt =>
+        match resolveDynTarget env₁ site vt with
+        | .ok target =>
+          decide (k.apply (redirectResolver narrowTbl site.dynKey target) =
+            k.apply (redirectResolver fullTbl site.dynKey target))
+        | .err _ => true
+        | .unsupported _ => false
+    else decide (narrowTbl.lookupKey k = fullTbl.lookupKey k)
+
+/-- The decidable certificate is sound. -/
+theorem dynStepPreserved_of_check {env₁ : CompilerQueryEnv} {narrowTbl fullTbl : OpaqueCalleeTable}
+    {site : DynCallSite} {body : CapturedMir} {s : MachineState}
+    (hc : dynStepPreservedB env₁ narrowTbl fullTbl site body s = true) :
+    DynStepPreserved env₁ narrowTbl fullTbl site body s := by
+  unfold dynStepPreservedB at hc
+  cases hk : demandedKey? body s with
+  | none =>
+    refine ⟨fun hd => ?_, fun hd => ?_, fun _ k hk' => ?_⟩
+    · simp [demandsDynSite, hk] at hd
+    · simp [demandsDynSite, hk] at hd
+    · rw [hk] at hk'
+      exact nomatch hk'
+  | some k =>
+    rw [hk] at hc
+    dsimp only at hc
+    by_cases he : (k.defPath, k.typeArgs) = site.dynKey
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true he)] at hc
+      refine ⟨fun _ vt hvt m hm => ?_, fun _ vt target hvt hr k' hk' => ?_, fun hd => ?_⟩
+      · simp only [hvt, hm, Bool.false_eq_true] at hc
+      · rw [hk] at hk'
+        cases hk'
+        simp only [hvt, hr, decide_eq_true_eq] at hc
+        exact hc
+      · simp [demandsDynSite, hk, he] at hd
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false he)] at hc
+      refine ⟨fun hd => ?_, fun hd => ?_, fun _ k' hk' => ?_⟩
+      · simp [demandsDynSite, hk, he] at hd
+      · simp [demandsDynSite, hk, he] at hd
+      · rw [hk] at hk'
+        cases hk'
+        exact of_decide_eq_true hc
+
+/-- Multi-step preservation from per-state certificates checked along the run. -/
+theorem evalDynWithOpaqueCallees_preserved_of_check {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hcheck : (runVisited (dynDemandStep env₁ fullTbl site body) fuel s).all
+      (dynStepPreservedB env₁ narrowTbl fullTbl site body) = true) :
+    evalDynWithOpaqueCallees env₂ narrowTbl site body fuel s =
+      evalDynWithOpaqueCallees env₁ fullTbl site body fuel s :=
+  evalDynWithOpaqueCallees_preserved h fuel s
+    (fun s' hs' => dynStepPreserved_of_check (List.all_eq_true.mp hcheck s' hs'))
 
 /-- **Full multi-step end-to-end dynamic-dispatch canary (Schema 13)**: starting
 from `dynInit` (`bb0: if true { <dyn Area>::area() } else { g_dead() }`),
-`evalDynWithOpaqueCallees` prunes the dead branch `g_dead`, resolves
-`UnOp.vtableMethodLookup` + `abiCompatible` on demand at `bb1`, enters
-`<Circle as Area>::area` in the narrowed opaque table, and halts returning `31`. -/
+`evalDynWithOpaqueCallees` prunes the dead branch `g_dead`, reads the receiver's
+vtable pointer, resolves `UnOp.vtableMethodLookup` + `abiCompatible` on demand at
+`bb1`, enters `<Circle as Area>::area` in the narrowed opaque table, and halts
+returning `31`; the narrowed/extended run equals the full run by the multi-step
+theorem (certificates kernel-checked along the run). -/
 theorem canary_dyn_e2e_full_run_schema13 :
     (evalDynWithOpaqueCallees dynEnv13 dynNarrowTbl dynSite dynRoot 12 dynInit).summary =
       ⟨.halted, [.event 1], some 31, none⟩ ∧
     evalDynWithOpaqueCallees dynEnv13Sync dynNarrowTbl dynSite dynRoot 12 dynInit =
-      evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInit := by
-  refine ⟨by decide +kernel, by decide +kernel⟩
+      evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInit :=
+  ⟨by decide +kernel,
+    evalDynWithOpaqueCallees_preserved_of_check dyn_envExtends_13_sync 12 dynInit
+      (by decide +kernel)⟩
 
 /-- `if false { <dyn Area>::area() } else { live_f() }`: the `dyn Area` call is on
 the dead literal-`false` branch, while the live branch calls `live_f`. -/
@@ -3984,6 +4335,62 @@ theorem canary_dyn_deadBranch_schema12_succeeds :
       evalDynWithOpaqueCallees dynEnv13 canaryFullTbl dynSite
         dynDeadBranchRoot 12 dynDeadBranchInit := by
   refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-! ### Receiver-driven dispatch: one call key, two receivers -/
+
+/-- `fn(vt_circle, vt_square: *const ()) -> u32`: the *same* `dyn Area` call key is
+reached twice with different receivers in one run
+(`bb0: StorageLive(vt); vt = copy vt_circle; _0 = <dyn Area>::area() -> bb1`,
+`bb1: vt = copy vt_square; _0 = <dyn Area>::area() -> bb2`, `bb2: return`). -/
+def dyn2Root : CapturedMir :=
+  { defPath := "proto::dyn_two_receivers", phase := .runtimePostCleanup, role := .subject,
+    argCount := 2,
+    localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt_circle"⟩,
+      ⟨.not, protoVtPtrTy, some "vt_square"⟩, ⟨.mut, protoVtPtrTy, some "vt"⟩],
+    basicBlocks := [
+      ⟨[⟨.storageLive 3, "dyn2:live"⟩, ⟨.assign ⟨3, []⟩ (.use (.copy ⟨1, []⟩)), "dyn2:vt0"⟩],
+        ⟨.call (protoFnItem "proto::Area::area" [.dynamic "proto::Area"]) [] protoRetPlace
+          (some 1) .continue_, "dyn2:call0"⟩, false⟩,
+      ⟨[⟨.assign ⟨3, []⟩ (.use (.copy ⟨2, []⟩)), "dyn2:vt1"⟩],
+        ⟨.call (protoFnItem "proto::Area::area" [.dynamic "proto::Area"]) [] protoRetPlace
+          (some 2) .continue_, "dyn2:call1"⟩, false⟩,
+      ⟨[], ⟨.return_, "dyn2:ret"⟩, false⟩ ],
+    fnAbi := protoRetU32Abi, layouts := protoLayouts, allocations := [] }
+
+/-- `dyn2Root` called with a `Circle` receiver (vtable `7`) and a `Square` receiver
+(vtable `9`). -/
+def dyn2Init : MachineState := initMachineState dyn2Root [.ptr ⟨7, 0⟩ 0, .ptr ⟨9, 0⟩ 0]
+
+/-- The two-receiver call site reads the receiver vtable pointer from local `vt` (`_3`). -/
+def dyn2Site : DynCallSite := { dynSite with vtableLocal := 3 }
+
+/-- Narrowed table holding exactly the two dispatched `impl` bodies. -/
+def dyn2NarrowTbl : OpaqueCalleeTable := .ofList [protoCircleArea, protoSquareArea]
+
+/-- **Receiver-driven dispatch canary**: in one Schema-13 run the same `dyn Area`
+call key is reached with a `Circle` receiver and then a `Square` receiver; the
+vtable pointer read from the frame at each call dispatches to the right `impl`, so
+the run returns `44` (`Square`'s area, from the last call). Reading a fixed
+receiver (`vtableLocal := 1`, as a receiver-independent site would) wrongly sends
+both calls to `Circle` (`31`), and Schema 12 fails closed at the first `dyn` call. -/
+theorem canary_dyn_two_receivers :
+    (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dyn2Site dyn2Root 16 dyn2Init).summary =
+      ⟨.halted, [], some 44, none⟩ ∧
+    (evalDynWithOpaqueCallees dynEnv13 dynFullTbl { dyn2Site with vtableLocal := 1 } dyn2Root 16
+        dyn2Init).summary = ⟨.halted, [], some 31, none⟩ ∧
+    evalDynWithOpaqueCallees dynEnv12 dynFullTbl dyn2Site dyn2Root 16 dyn2Init =
+      .faulted .unsupported [] := by
+  decide +kernel
+
+/-- **Multi-step preservation on the two-receiver run**: the whole run under the
+further-extended environment and the two-`impl` narrowed table equals the full
+run, by `evalDynWithOpaqueCallees_preserved_of_check` (per-state certificates
+kernel-checked at all 10 visited states, two of which demand the `dyn` key with
+different receivers). -/
+theorem canary_dyn_two_receivers_preserved :
+    evalDynWithOpaqueCallees dynEnv13Sync dyn2NarrowTbl dyn2Site dyn2Root 16 dyn2Init =
+      evalDynWithOpaqueCallees dynEnv13 dynFullTbl dyn2Site dyn2Root 16 dyn2Init :=
+  evalDynWithOpaqueCallees_preserved_of_check dyn_envExtends_13_sync 16 dyn2Init (by decide +kernel)
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -4227,6 +4634,54 @@ end ShadowingDemo
  Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_dyn_deadBranch_schema12_succeeds
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.decEqOfCtorIdxProto' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms decEqOfCtorIdxProto
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.instDecidableEqBinOpProto' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms instDecidableEqBinOpProto
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_hit_free_poly' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_hit_free_poly
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_free_poly_param_and_concrete' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_free_poly_param_and_concrete
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynDemandStep_eq_dynDispatchStep_of_resolved' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynDemandStep_eq_dynDispatchStep_of_resolved
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynDemandStep_eq_trusted_of_not_demanded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynDemandStep_eq_trusted_of_not_demanded
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalDynWithOpaqueCallees_preserved' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalDynWithOpaqueCallees_preserved
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynStepPreserved_of_check' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynStepPreserved_of_check
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalDynWithOpaqueCallees_preserved_of_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalDynWithOpaqueCallees_preserved_of_check
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_two_receivers' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_two_receivers
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_two_receivers_preserved' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_two_receivers_preserved
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dyn_step_missing_receiver_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dyn_step_missing_receiver_ub
 
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 

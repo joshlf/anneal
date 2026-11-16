@@ -134,6 +134,57 @@ def compile_prototype(tmp: Path) -> tuple[Path, float]:
     return olean_root, elapsed
 
 
+# Modules the compiled prototype must be importable alongside: the `Anneal` root
+# import closure (which contains `Anneal.Rustc.V2026_06_01.TraceCheck` and its
+# orphan `deriving instance DecidableEq` declarations for `Trusted` types).
+COIMPORT_MODULES = ("Anneal",)
+
+
+def coimport_check(tmp: Path, olean_root: Path) -> dict[str, Any]:
+    """Check that the prototype composes with the `Anneal` library, two ways:
+
+    1. `import_probe`: a file importing `COIMPORT_MODULES` *and* the compiled
+       prototype. Lean rejects importing two modules that declare the same
+       constant, which detects global-name collisions (e.g. the `T.ofNat`
+       auxiliaries that Lean's enumeration `deriving instance DecidableEq` handler
+       emits in the derived `Trusted` type's own namespace).
+    2. `reelaborate_probe`: the prototype source re-elaborated with
+       `COIMPORT_MODULES` prepended to its imports, so every proof, lazily
+       generated equation lemma, and the bottom-of-file axiom audit run inside the
+       library's import closure (whose extra simp lemmas and instances can change
+       how auxiliary lemmas are proven).
+
+    Raises if a co-import module has no built olean, so the check never passes
+    vacuously."""
+    lib = REPO_ROOT / ".lake" / "build" / "lib" / "lean"
+    for mod in COIMPORT_MODULES:
+        olean = lib.joinpath(*mod.split(".")).with_suffix(".olean")
+        if not olean.exists():
+            raise RuntimeError(f"co-import module {mod} has no built olean at {olean}")
+    header = "".join(f"import {m}\n" for m in COIMPORT_MODULES)
+    probes = {
+        "import_probe": (tmp / "CoImportPrototype.lean", header + f"import {BENCH_MODULE}\n"),
+        "reelaborate_probe": (tmp / "ReelaboratePrototype.lean",
+                              header + (REPO_ROOT / PROTOTYPE_REL).read_text(encoding="utf-8")),
+    }
+    result: dict[str, Any] = {"imports": list(COIMPORT_MODULES) + [BENCH_MODULE], "ok": True, "exit": 0,
+                              "errors": [], "wall_s": 0.0}
+    for key, (probe, text) in probes.items():
+        probe.write_text(text, encoding="utf-8")
+        t0 = time.monotonic()
+        proc = run_lean([str(probe)], extra_lean_path=[str(olean_root)])
+        elapsed = time.monotonic() - t0
+        output = (proc.stdout + proc.stderr).strip()
+        errors = [line for line in output.splitlines() if "error" in line]
+        ok = proc.returncode == 0 and not errors
+        result[key] = {"ok": ok, "exit": proc.returncode, "errors": errors, "wall_s": elapsed}
+        result["ok"] = result["ok"] and ok
+        result["exit"] = max(result["exit"], proc.returncode)
+        result["errors"] += [f"{key}: {e}" for e in errors]
+        result["wall_s"] += elapsed
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Probe generation
 # ---------------------------------------------------------------------------
@@ -320,6 +371,9 @@ def run_benchmark(sizes: list[int], reps: int = DEFAULT_REPS) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="anneal-opaque-callee-bench-", dir="/tmp") as tmp:
         tmp_path = Path(tmp)
         olean_root, compile_s = compile_prototype(tmp_path)
+        coimport = coimport_check(tmp_path, olean_root)
+        if not coimport["ok"]:
+            raise RuntimeError(f"prototype cannot be imported alongside {COIMPORT_MODULES}: {coimport}")
         per_size: dict[int, dict[str, dict[str, float]]] = {}
         raw: dict[str, Any] = {}
         for m in sizes:
@@ -364,6 +418,7 @@ def run_benchmark(sizes: list[int], reps: int = DEFAULT_REPS) -> dict[str, Any]:
         "sizes": sizes,
         "reps": reps,
         "prototype_compile_s": compile_s,
+        "coimport": coimport,
         "results": {str(m): per_size[m] for m in sizes},
         "raw": raw,
     }
@@ -849,6 +904,10 @@ def render_markdown(bench: dict[str, Any] | None, audit: dict[str, Any] | None) 
             sp = bench["speedups"][str(m)]
             out.append(f"| {m} | {sp['opaque_o1_heartbeat_speedup']:.1f}x | {sp['opaque_pruned_heartbeat_speedup']:.1f}x | "
                        f"{sp['opaque_o1_wall_speedup']:.1f}x | {sp['opaque_pruned_wall_speedup']:.1f}x |")
+        co = bench.get("coimport")
+        if co is not None:
+            out.append(f"\nCo-import check (`{' + '.join(co['imports'])}`): "
+                       f"{'ok' if co['ok'] else 'FAILED'} (exit {co['exit']}, {len(co['errors'])} errors)")
     if audit is not None:
         out.append("\n### `BEq + DecidableEq` repository audit\n")
         out.append("| root | .lean files | .rs files (codegen literals) | occurrences | codegen occurrences | files with occurrences |")

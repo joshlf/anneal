@@ -263,6 +263,55 @@ class RepoConsistencyTest(unittest.TestCase):
         self.assertIn("repo_audit", payload)
         self.assertNotIn("benchmark", payload)
 
+    def test_a1_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "decEqOfCtorIdxProto",
+            "instDecidableEqBinOpProto",
+            "instDecidableEqRetagKindProto",
+            "collectMatchingTraitImpls_of_no_impl",
+            "lookupCallee_hit_free_poly",
+            "canary_free_poly_param_and_concrete",
+            "dyn_vtablePtr_atCall",
+            "dyn_step_missing_receiver_ub",
+            "stepBranchPruned_redirect_of_not_demanded",
+            "dynDemandStep_eq_dynDispatchStep_of_resolved",
+            "dynDemandStep_eq_trusted_of_not_demanded",
+            "DynStepPreserved",
+            "evalDynWithOpaqueCallees_preserved",
+            "dynStepPreservedB",
+            "dynStepPreserved_of_check",
+            "evalDynWithOpaqueCallees_preserved_of_check",
+            "canary_dyn_two_receivers",
+            "canary_dyn_two_receivers_preserved",
+        ):
+            self.assertIn(name, ident_toks, f"missing A1 theorem: {name}")
+
+    def test_no_enum_deriving_for_trusted_types(self) -> None:
+        # Lean's enumeration `deriving instance DecidableEq` handler emits global
+        # `T.ofNat` / `T.ofNat_ctorIdx` constants in the *Trusted* type's namespace,
+        # which collide with `Anneal.Rustc.V2026_06_01.TraceCheck` (imported by the
+        # `Anneal` root). The nine enumeration types must use the prototype-local
+        # `decEqOfCtorIdxProto` instances instead.
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        enums = ("AbiPassMode", "UintTy", "IntTy", "FloatTy", "Mutability", "Safety", "UnOp",
+                 "BinOp", "RetagKind")
+        toks = bench.tokenize_lean(text)
+        derived: list[str] = []
+        for i, (kind, val, _) in enumerate(toks):
+            if kind == "ident" and val == "deriving" and i + 1 < len(toks) and toks[i + 1][1] == "instance":
+                j = i + 2
+                while j < len(toks) and toks[j][1] != "for":
+                    j += 1
+                if j + 1 < len(toks):
+                    derived.append(toks[j + 1][1])
+        self.assertGreater(len(derived), 50)
+        for target in derived:
+            self.assertNotIn(target.rsplit(".", 1)[-1], enums, target)
+        for e in enums:
+            self.assertIn(f"instDecidableEq{e}Proto", {v for k, v, _ in toks if k == "ident"}, e)
+
     def test_b1_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")
         ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
@@ -323,6 +372,19 @@ class RealLeanBenchmarkTest(unittest.TestCase):
 
     def test_worktree_untouched_by_benchmark(self) -> None:
         self.assertEqual(self.before, self.after)
+
+    def test_prototype_coimports_with_anneal_root(self) -> None:
+        # The compiled prototype must be importable alongside the `Anneal` root
+        # (whose `Anneal.Rustc.V2026_06_01.TraceCheck` derives `DecidableEq` for the
+        # same `Trusted` enumeration types): no duplicate global constants.
+        co = self.result["coimport"]
+        self.assertEqual(co["imports"][0], "Anneal")
+        self.assertTrue(co["ok"], co)
+        self.assertEqual(co["exit"], 0)
+        self.assertEqual(co["errors"], [])
+        for probe in ("import_probe", "reelaborate_probe"):
+            self.assertTrue(co[probe]["ok"], (probe, co[probe]))
+        self.assertIn("Co-import check", bench.render_markdown(self.result, None))
 
     def test_json_roundtrip(self) -> None:
         text = json.dumps(self.result)
