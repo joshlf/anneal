@@ -594,31 +594,90 @@ theorem split_at_mut_tree_borrows_end_to_end :
         (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
       ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterLR 79
         (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 := by
-  obtain ⟨entry, he, hL, hR, hDisj, hRoot, _, hDescL, _⟩ :=
+  have hw2 : writeTyped ByteLensCodec.u32LE
+      (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) (u 30) bytesW1 =
+        some bytesW2 := rfl
+  obtain ⟨entry, he, hL2, hR2, hRoot2⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow_write_both_reassemble 0 [] [] mutLens
+      (tagL := 78) (tagR := 79) (k := 2) (i := 1) (j := 0) (vL := u 20) (vR := u 30)
+      (by decide) (by decide) (by decide) (by decide) (by decide) rfl rfl write1 hw2
+  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
+  subst hEntry
+  exact ⟨hRoot2, hL2, hR2⟩
+
+/-- Full-subslice byte-range write frame (`ActiveTypedSliceMutBorrow.write_subrange_treeBorrows_frame`),
+`TightBorrowRange.of_invalidateConflictingBorrowsAtProj`,
+`isBorrowDescendantOrSelf_invalidateConflictingBorrowsAtProj`, foreign overlapping read freezing
+(`foreign_overlapping_read_freezes_unique_borrow`), and ground-MIR `.disabled` / `.frozen` slice
+deref UB refutations (`evalPlaceRead_slice_disabled_ub`, `writePlaceValue_slice_frozen_or_disabled_ub`). -/
+theorem subrange_write_freeze_and_slice_deref_ub_witness :
+    let borrowsSubrange :=
+      invalidateTreeBorrowsAtProj splitChildBorrows splitChildBorrows 0 (some 78) [] 0 8
+    let borrowsFrz :=
+      freezeTreeBorrowsOnReadAtProj slBorrows slBorrows 0 (some 99) [] 0 4 []
+    let borrowsDis :=
+      invalidateTreeBorrowsAtProj slBorrows slBorrows 0 (some 99) [] 0 4
+    let memDis : Memory := { mem0 with borrows := borrowsDis }
+    let wide77 : WidePtrVal := WidePtrVal.mk ⟨77, 0⟩ 4
+    let locals77 : List LocalSlot := (locals 8).set 1 (.init (WidePtrVal.toValue 8 wide77))
+    ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsSubrange 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW1 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsSubrange 79
+        (WidePtrVal.dropElems wide4 4 2) [u 3, u 4] bytesW1 ∧
+      TightBorrowRange
+        (invalidateConflictingBorrowsAtProj splitChildBorrows 0 (some 78) [] 0 8)
+        79 (WidePtrVal.dropElems wide4 4 2) 4 ∧
+      isBorrowDescendantOrSelf
+        (invalidateConflictingBorrowsAtProj splitChildBorrows 0 (some 78) [] 0 8) 79 77 = true ∧
+      ActiveTypedSliceBorrow ByteLensCodec.u32LE borrowsFrz 77 wide4 xs4 bytes16 ∧
+      ¬ ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsFrz 77 wide4 xs4 bytes16 ∧
+      evalPlaceRead locals77 { local_ := 1, projection := [.deref] }
+        memDis.borrows memDis.globals layouts64 memDis.callerLocals decls = .ub ∧
+      writePlaceValue locals77 borrowsFrz { local_ := 1, projection := [.deref] }
+        (.scalar ⟨1, 4⟩) decls layouts64 = .ub ∧
+      writePlaceValue locals77 borrowsDis { local_ := 1, projection := [.deref] }
+        (.scalar ⟨1, 4⟩) decls layouts64 = .ub := by
+  intro borrowsSubrange borrowsFrz borrowsDis memDis wide77 locals77
+  obtain ⟨entry, he, hL, hR, hDisj, _, _, _, hDescR0⟩ :=
     ActiveTypedSliceMutBorrow.splitAt_reborrow mutLens (tagL := 78) (tagR := 79) (k := 2)
       (by decide) (by decide) rfl rfl
   have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
   subst hEntry
-  obtain ⟨hL1, hR1⟩ :=
-    ActiveTypedSliceMutBorrow.write_elem_treeBorrows_frame 0 [] hL (i := 1) (by decide)
-      (by decide) (u 20) write1 hR
-      (fun e hlk => by cases Option.some.inj hlk; exact ⟨rfl, rfl, by decide⟩) hDisj
-  have hRoot1 := ActiveTypedSliceMutBorrow.descendant_write_preserves 0 []
-    (WidePtrVal.elemOffset (WidePtrVal.takeElems wide4 2) 4 1) 4 hRoot hDescL
-    split_left_write.2.2
-  have hw2 : writeTyped ByteLensCodec.u32LE
-      (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) (u 30) bytesW1 =
-        some bytesW2 := rfl
-  obtain ⟨hR2, hL2⟩ :=
-    ActiveTypedSliceMutBorrow.write_elem_treeBorrows_frame 0 [] hR1 (i := 0) (by decide)
-      (by decide) (u 30) hw2 hL1
-      (fun e hlk => by cases Option.some.inj hlk; exact ⟨rfl, rfl, by decide⟩)
-      (Or.inr (Or.inr (Or.inr (by decide))))
-  have hDescR : isBorrowDescendantOrSelf borrowsAfterL 79 77 = true := rfl
-  have hRoot2 := ActiveTypedSliceMutBorrow.descendant_write_preserves 0 []
-    (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) 4 hRoot1 hDescR
-    split_right_write.2.2
-  exact ⟨hRoot2, hL2, hR2⟩
+  have hTight79 : TightBorrowRange splitChildBorrows 79 (WidePtrVal.dropElems wide4 4 2) 4 := by
+    intro e hlk
+    cases Option.some.inj hlk
+    exact ⟨rfl, rfl, by decide⟩
+  obtain ⟨hL_sub, hR_sub⟩ :=
+    ActiveTypedSliceMutBorrow.write_subrange_treeBorrows_frame 0 [] 0 8 hL (i := 1)
+      (by decide) (u 20) write1 (by decide) (by decide) (by decide) hR hTight79 hDisj
+  have hTightConf : TightBorrowRange
+      (invalidateConflictingBorrowsAtProj splitChildBorrows 0 (some 78) [] 0 8)
+      79 (WidePtrVal.dropElems wide4 4 2) 4 :=
+    hTight79.of_invalidateConflictingBorrowsAtProj 0 (some 78) [] 0 8
+  have hDescConf : isBorrowDescendantOrSelf
+      (invalidateConflictingBorrowsAtProj splitChildBorrows 0 (some 78) [] 0 8) 79 77 = true := by
+    rw [isBorrowDescendantOrSelf_invalidateConflictingBorrowsAtProj]
+    exact hDescR0
+  obtain ⟨hFrzSh, hFrzNoMut⟩ :=
+    foreign_overlapping_read_freezes_unique_borrow ByteLensCodec.u32LE 0 [] 0 4 mutLens
+      (entry := rootSlEntry) (rTag := 99) rfl rfl rfl rfl rfl
+  have hReadDisUb : evalPlaceRead locals77 { local_ := 1, projection := [.deref] }
+      memDis.borrows memDis.globals layouts64 memDis.callerLocals decls = .ub :=
+    evalPlaceRead_slice_disabled_ub locals77 1 [] wide77 8
+      { rootSlEntry with perm := .disabled } memDis decls layouts64 (.uint .u32) 2
+      rfl rfl rfl rfl
+  have hWriteFrzUb : writePlaceValue locals77 borrowsFrz { local_ := 1, projection := [.deref] }
+      (.scalar ⟨1, 4⟩) decls layouts64 = .ub :=
+    writePlaceValue_slice_frozen_or_disabled_ub locals77 1 [] wide77 8
+      { rootSlEntry with perm := .frozen } borrowsFrz (.scalar ⟨1, 4⟩)
+      decls layouts64 rfl rfl (Or.inl rfl)
+  have hWriteDisUb : writePlaceValue locals77 borrowsDis { local_ := 1, projection := [.deref] }
+      (.scalar ⟨1, 4⟩) decls layouts64 = .ub :=
+    writePlaceValue_slice_frozen_or_disabled_ub locals77 1 [] wide77 8
+      { rootSlEntry with perm := .disabled } borrowsDis (.scalar ⟨1, 4⟩)
+      decls layouts64 rfl rfl (Or.inr rfl)
+  exact ⟨hL_sub, hR_sub, hTightConf, hDescConf, hFrzSh, hFrzNoMut, hReadDisUb,
+    hWriteFrzUb, hWriteDisUb⟩
 
 /-- Negative (why `splitAt_reborrow` demands fresh child tags): minting the left child on the
 parent's own live tag `77` shadows the root entry, and the root `&mut [u32]` lens on the whole
@@ -1093,6 +1152,64 @@ theorem intrinsicCaller_narrow_to_empty :
       (calleesAgreeOn_coneBodies coneUb fullCallees) rfl rfl rfl retIs42
       (retIs42_insensitive _)⟩
 
+/-- Polymorphic (`typeArgs = [.uint .u32]`) `lookupCallee_eq_of_findCallee_eq_of_no_traitImpl`,
+`checkCalleeSig_eq_of_findCallee_eq_of_no_traitImpl`, `hasTraitImplForDefPath_append`,
+`hasTraitImplForDefPath_flatMapTraitImpls_coneBodies`, and concrete `&[u32]` slice
+`core::intrinsics::size_of_val` caller narrowed from `fullCallees` to `[]`. -/
+def usizeRetLocal : LocalDecl :=
+  { mutability := .mut, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := some "ret" }
+
+def sliceArgLocal : LocalDecl :=
+  { mutability := .not, ty := { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 1 },
+    debugName := some "s" }
+
+def sliceSizeOfValCallerMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "cone::sliceSizeOfValCaller" 1 [usizeRetLocal, sliceArgLocal]
+    [{ statements := []
+       terminator :=
+         { kind := .call (fnItem "core::intrinsics::size_of_val")
+             [.copy { local_ := 1, projection := [] }]
+             { local_ := 0, projection := [] } (some 1) .continue_
+           span := "call_size_of_val" }
+       isCleanup := false },
+     retBlock []]
+
+def coneSizeOfVal : List DefPath := ["core::intrinsics::size_of_val"]
+
+theorem polymorphic_callee_and_slice_size_of_val_narrow_witness :
+    lookupCallee fullCallees emptyLayoutTable "cone::helper1" [.uint .u32] [] =
+      lookupCallee (coneBodies cone1 fullCallees) emptyLayoutTable "cone::helper1" [.uint .u32] [] ∧
+    checkCalleeSig fullCallees "cone::helper1" [] (.uint .u32) .rust [.uint .u32] [] =
+      checkCalleeSig (coneBodies cone1 fullCallees) "cone::helper1" [] (.uint .u32) .rust
+        [.uint .u32] [] ∧
+    hasTraitImplForDefPath ([] ++ flatMapTraitImpls (coneBodies cone1 fullCallees))
+      "cone::helper1" = false ∧
+    retVal? (runCfgWithCallees 8 sliceSizeOfValCallerMir [WidePtrVal.toValue 8 wide4]
+      emptyMemory fullCallees) = some (.scalar ⟨16, 8⟩) ∧
+    retVal? (runCfgWithCallees 8 sliceSizeOfValCallerMir [WidePtrVal.toValue 8 wide4]
+      emptyMemory (coneBodies coneSizeOfVal fullCallees)) = some (.scalar ⟨16, 8⟩) ∧
+    runCfgWithCallees 8 sliceSizeOfValCallerMir [WidePtrVal.toValue 8 wide4] emptyMemory
+        (coneBodies coneSizeOfVal fullCallees) =
+      (runCfgWithCallees 8 sliceSizeOfValCallerMir [WidePtrVal.toValue 8 wide4] emptyMemory
+        fullCallees).map
+        (MirOutcome.mapMem (Memory.withCallees (coneBodies coneSizeOfVal fullCallees))) := by
+  have hNoTrait1 : hasTraitImplForDefPath ([] ++ flatMapTraitImpls fullCallees)
+      "cone::helper1" = false := by
+    rw [hasTraitImplForDefPath_append]
+    rfl
+  have hNoTrait2 : hasTraitImplForDefPath ([] ++ flatMapTraitImpls (coneBodies cone1 fullCallees))
+      "cone::helper1" = false := by
+    rw [hasTraitImplForDefPath_append]
+    exact hasTraitImplForDefPath_flatMapTraitImpls_coneBodies cone1 fullCallees "cone::helper1" rfl
+  refine ⟨lookupCallee_eq_of_findCallee_eq_of_no_traitImpl emptyLayoutTable [.uint .u32] []
+      (cone_agree "cone::helper1" (List.Mem.head _)) hNoTrait1 hNoTrait2,
+    checkCalleeSig_eq_of_findCallee_eq_of_no_traitImpl [] (.uint .u32) .rust [.uint .u32] []
+      (cone_agree "cone::helper1" (List.Mem.head _)) hNoTrait1 hNoTrait2,
+    hNoTrait2, rfl, rfl,
+    runCfgWithCallees_cone_narrow_of_closed_wf coneSizeOfVal 8 sliceSizeOfValCallerMir
+      [WidePtrVal.toValue 8 wide4] emptyMemory (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
+      (calleesAgreeOn_coneBodies coneSizeOfVal fullCallees) rfl rfl rfl⟩
+
 /-! ## Kernel axiom audit -/
 
 /-! Audits every declaration added to `Anneal.SepLogicLenses` (section `SliceWidePtrLenses`,
@@ -1118,8 +1235,8 @@ run_cmd do
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
   for (modName, anchor, minCount) in
-      [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal, 60),
-       (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv, 140)] do
+      [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal, 75),
+       (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv, 145)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
     let some anchorRange ← findDeclarationRanges? anchor | throwError "no range for {anchor}"

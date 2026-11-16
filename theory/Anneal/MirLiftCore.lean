@@ -14862,6 +14862,93 @@ theorem checkCalleeSig_nil_eq_of_findCallee_eq {c₁ c₂ : CalleeEnv} {dp : Def
       dsimp only
       rw [h]
 
+/-- When no `TraitImplEntry` in `ti` targets `dp` (`hasTraitImplForDefPath ti dp = false`),
+`collectMatchingTraitImpls` leaves `acc` unchanged for every `typeArgs`. -/
+theorem collectMatchingTraitImpls_eq_of_no_traitImpl (callees : CalleeEnv) :
+    ∀ (ti : List TraitImplEntry) (dp : DefPath) (typeArgs : List RigidTy)
+      (acc : List (TraitImplEntry × Option (List RigidTy))),
+      hasTraitImplForDefPath ti dp = false →
+      collectMatchingTraitImpls callees ti dp typeArgs acc = acc
+  | [], _, _, acc, _ => rfl
+  | entry :: rest, dp, typeArgs, acc, h => by
+    unfold hasTraitImplForDefPath at h
+    cases hs : stringEq entry.traitRef.defPath dp with
+    | true => rw [hs] at h; cases h
+    | false =>
+      rw [hs] at h
+      unfold collectMatchingTraitImpls
+      rw [if_neg (by rw [hs]; decide)]
+      exact collectMatchingTraitImpls_eq_of_no_traitImpl callees rest dp typeArgs acc h
+
+/-- When no `TraitImplEntry` in `ti ++ flatMapTraitImpls c` targets `dp`,
+`resolveCalleeBodyAndArgs? c dp typeArgs ti` reduces to `findCallee? c dp` for *every*
+`typeArgs : List RigidTy` (both monomorphic `[]` and polymorphic `firstArg :: restArgs`). -/
+theorem resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (c : CalleeEnv) (dp : DefPath)
+    (typeArgs : List RigidTy) (ti : List TraitImplEntry)
+    (h_no : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c) dp = false) :
+    resolveCalleeBodyAndArgs? c dp typeArgs ti =
+      match findCallee? c dp with
+      | some b => some (b, typeArgs)
+      | none => none := by
+  cases typeArgs with
+  | nil => rfl
+  | cons firstArg restArgs =>
+    have h_col := collectMatchingTraitImpls_eq_of_no_traitImpl c (ti ++ flatMapTraitImpls c)
+      dp (firstArg :: restArgs) [] h_no
+    cases firstArg <;> (
+      unfold resolveCalleeBodyAndArgs?
+      dsimp only
+      try rw [h_col]
+      try dsimp only
+      cases findCallee? c dp with
+      | none => rfl
+      | some b =>
+        dsimp only
+        rw [h_no]
+        try rfl)
+
+/-- Polymorphic `lookupCallee` (`typeArgs` arbitrary) depends on `c₁` and `c₂` only through
+`findCallee?` whenever neither table's trait-impl list registers `dp`. -/
+theorem lookupCallee_eq_of_findCallee_eq_of_no_traitImpl {c₁ c₂ : CalleeEnv} {dp : DefPath}
+    (L : LayoutTable) (typeArgs : List RigidTy) (ti : List TraitImplEntry)
+    (h : findCallee? c₁ dp = findCallee? c₂ dp)
+    (h₁ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₁) dp = false)
+    (h₂ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₂) dp = false) :
+    lookupCallee c₁ L dp typeArgs ti = lookupCallee c₂ L dp typeArgs ti := by
+  unfold lookupCallee
+  rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c₁ dp typeArgs ti h₁,
+    resolveCalleeBodyAndArgs?_eq_of_no_traitImpl c₂ dp typeArgs ti h₂, h]
+
+/-- Polymorphic `checkCalleeSig` (`typeArgs` arbitrary) depends on `c₁` and `c₂` only through
+`findCallee?` (including when either table is `[]`) whenever neither table registers a
+`TraitImplEntry` for `dp`. -/
+theorem checkCalleeSig_eq_of_findCallee_eq_of_no_traitImpl {c₁ c₂ : CalleeEnv} {dp : DefPath}
+    (fnInputs : List RigidTy) (fnOutput : RigidTy) (fnAbi : CallConv)
+    (typeArgs : List RigidTy) (ti : List TraitImplEntry)
+    (h : findCallee? c₁ dp = findCallee? c₂ dp)
+    (h₁ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₁) dp = false)
+    (h₂ : hasTraitImplForDefPath (ti ++ flatMapTraitImpls c₂) dp = false) :
+    checkCalleeSig c₁ dp fnInputs fnOutput fnAbi typeArgs ti =
+      checkCalleeSig c₂ dp fnInputs fnOutput fnAbi typeArgs ti := by
+  cases c₁ with
+  | nil =>
+    cases c₂ with
+    | nil => rfl
+    | cons b₂ r₂ =>
+      have hfn : findCallee? (b₂ :: r₂) dp = none := h.symm
+      unfold checkCalleeSig
+      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₂ :: r₂) dp typeArgs ti h₂, hfn]
+  | cons b₁ r₁ =>
+    cases c₂ with
+    | nil =>
+      have hfn : findCallee? (b₁ :: r₁) dp = none := h
+      unfold checkCalleeSig
+      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₁ :: r₁) dp typeArgs ti h₁, hfn]
+    | cons b₂ r₂ =>
+      unfold checkCalleeSig
+      rw [resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₁ :: r₁) dp typeArgs ti h₁,
+        resolveCalleeBodyAndArgs?_eq_of_no_traitImpl (b₂ :: r₂) dp typeArgs ti h₂, h]
+
 /-- `internFnPtr` depends only on `Memory.fnPtrs` and `Memory.nextTag`, so it commutes with
 `Memory.withCalleeCtx`. -/
 theorem internFnPtr_withCalleeCtx
@@ -15733,6 +15820,42 @@ theorem findCallee?_coneBodies {cone : List DefPath} :
 theorem calleesAgreeOn_coneBodies (cone : List DefPath) (c₁ : CalleeEnv) :
     calleesAgreeOn cone c₁ (coneBodies cone c₁) :=
   fun _ hdp => (findCallee?_coneBodies c₁ hdp).symm
+
+/-- `hasTraitImplForDefPath` distributes over `++`. -/
+theorem hasTraitImplForDefPath_append (xs ys : List TraitImplEntry) (dp : DefPath) :
+    hasTraitImplForDefPath (xs ++ ys) dp =
+      (hasTraitImplForDefPath xs dp || hasTraitImplForDefPath ys dp) := by
+  induction xs with
+  | nil => rfl
+  | cons e rest ih =>
+    simp only [List.cons_append, hasTraitImplForDefPath]
+    cases stringEq e.traitRef.defPath dp with
+    | true => rfl
+    | false => exact ih
+
+/-- Filtering a callee table via `coneBodies` never introduces a `TraitImplEntry` for `dp`. -/
+theorem hasTraitImplForDefPath_flatMapTraitImpls_coneBodies (cone : List DefPath) :
+    ∀ (c₁ : CalleeEnv) (dp : DefPath),
+      hasTraitImplForDefPath (flatMapTraitImpls c₁) dp = false →
+      hasTraitImplForDefPath (flatMapTraitImpls (coneBodies cone c₁)) dp = false
+  | [], _, _ => rfl
+  | b :: rest, dp, h => by
+    unfold flatMapTraitImpls at h
+    rw [hasTraitImplForDefPath_append, Bool.or_eq_false_iff] at h
+    have ih := hasTraitImplForDefPath_flatMapTraitImpls_coneBodies cone rest dp h.2
+    by_cases hb : inCone cone b.defPath = true
+    · have hf : coneBodies cone (b :: rest) = b :: coneBodies cone rest := by
+        unfold coneBodies
+        simp only [List.filter_cons, hb, ↓reduceIte]
+      rw [hf]
+      unfold flatMapTraitImpls
+      rw [hasTraitImplForDefPath_append, h.1, ih]
+      rfl
+    · have hf : coneBodies cone (b :: rest) = coneBodies cone rest := by
+        unfold coneBodies
+        simp only [List.filter_cons, hb, ↓reduceIte, Bool.false_eq_true]
+      rw [hf]
+      exact ih
 
 /--
 A call operand accepted by `CallConeClosed`: a direct constant function item whose
