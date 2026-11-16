@@ -23,6 +23,8 @@
 //! closure-captured companion shapes the four lifecycle items do not cover
 //! (reversed and two-parameter pins, `<=` bounds, `u8` / `u64` widths,
 //! `|ref ret|`, and a modular caller of a `trusted` leaf) on real captured MIR.
+//! `end_to_end_rust_only_closure_deref_rejects_false_contracts` checks that the
+//! same shapes reject implementations that violate their `#[spec]`.
 
 use std::env;
 use std::fs;
@@ -614,6 +616,126 @@ pub fn total_pin_with_spec_callee(x: u32) -> u32 {
         "unexpected edge-shape summary:\n{summary}"
     );
     assert!(summary.contains("TrustedBoundary kernel replay: PASS"));
+
+    let _ = fs::remove_dir_all(&temp_crate);
+}
+
+/// Soundness canary for the closure-captured companion auto-discharge on real
+/// captured MIR: implementations that violate their `#[spec]` must be rejected
+/// by the generated default proofs even though their companions use the
+/// reversed, `<=`, and modular-`trusted` shapes that
+/// `end_to_end_rust_only_closure_deref_edge_shapes` accepts. `ok_pin` keeps a
+/// correct sibling in the crate so the failure is attributed per item.
+#[test]
+fn end_to_end_rust_only_closure_deref_rejects_false_contracts() {
+    let checkout_root = anneal_checkout_root();
+    let wrapper_bin = ensure_rustc_capture_binary(&checkout_root);
+
+    let temp_crate = unique_temp_dir("rust-only-closure-deref-negative");
+    let src_dir = temp_crate.join("src");
+    fs::create_dir_all(&src_dir).expect("create temporary crate src/");
+
+    let anneal_spec_dir = checkout_root.join("crates").join("anneal-spec");
+    let cargo_toml = format!(
+        r#"[package]
+name = "edge_neg_pkg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anneal-spec = {{ path = "{}" }}
+"#,
+        anneal_spec_dir.display()
+    );
+    fs::write(temp_crate.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+
+    // `rev_pin` returns 42, `le_bound` returns 101 at `x = 100`, and
+    // `call_trusted_rev` returns 50 under the trusted callee contract.
+    let lib_rs = r#"#![allow(dead_code)]
+
+use anneal_spec::*;
+
+#[anneal_spec::spec(
+    requires: 10 == port,
+    ensures: |ret: u32| ret == 43,
+)]
+pub fn rev_pin(port: u32) -> u32 {
+    port + 32
+}
+
+#[anneal_spec::spec(
+    requires: x <= 100,
+    ensures: |ret: u32| ret <= 100,
+)]
+pub fn le_bound(x: u32) -> u32 {
+    x + 1
+}
+
+#[anneal_spec::spec(
+    trusted,
+    requires: 10 == port,
+    ensures: |ret: u32| 42 == ret,
+)]
+pub unsafe fn ffi_trusted_rev(port: u32) -> u32 {
+    port.wrapping_add(999)
+}
+
+#[anneal_spec::spec(
+    requires: port == 10,
+    ensures: |ret: u32| ret == 51,
+)]
+pub fn call_trusted_rev(port: u32) -> u32 {
+    let v = unsafe { ffi_trusted_rev(port) };
+    v + 8
+}
+
+#[anneal_spec::spec(
+    requires: x == 7,
+    ensures: |ret: u32| ret == 8,
+)]
+pub fn ok_pin(x: u32) -> u32 {
+    x + 1
+}
+"#;
+    fs::write(src_dir.join("lib.rs"), lib_rs).expect("write src/lib.rs");
+
+    let mut driver_cfg = CaptureDriverConfig::new(&temp_crate);
+    driver_cfg.rustc_wrapper = Some(wrapper_bin);
+    let (manifest, records) =
+        run_cargo_capture(&driver_cfg).expect("negative run_cargo_capture must succeed");
+    assert!(manifest.compilation_succeeded);
+    let scaffold_cfg = ScaffoldConfig {
+        workspace_root: temp_crate.clone(),
+        units_dir: Some(driver_cfg.units_dir.clone()),
+        anneal_repo_root: Some(checkout_root.clone()),
+        init_spec_templates: false,
+        init_proof_templates: false,
+    };
+    scaffold_workspace_with_config(&scaffold_cfg, &records)
+        .expect("negative scaffold_workspace_with_config must succeed");
+    assert_eq!(count_lean_files(&temp_crate.join("anneal/proofs")), 0);
+
+    let err = verify_workspace_with_config(
+        &VerifyConfig::new(&temp_crate)
+            .with_anneal_repo_root(&checkout_root)
+            .with_allow_assumptions(true),
+    )
+    .expect_err("false closure-deref contracts must not verify");
+    for module_file in [
+        "Verify/EdgeNegPkg/rev_pin.lean",
+        "Verify/EdgeNegPkg/le_bound.lean",
+        "Verify/EdgeNegPkg/call_trusted_rev.lean",
+    ] {
+        assert!(
+            err.contains(module_file),
+            "expected a kernel rejection in {module_file}, got:\n{err}"
+        );
+    }
+    assert!(
+        !err.contains("Verify/EdgeNegPkg/ok_pin.lean"),
+        "the correct sibling ok_pin must still verify, got:\n{err}"
+    );
 
     let _ = fs::remove_dir_all(&temp_crate);
 }

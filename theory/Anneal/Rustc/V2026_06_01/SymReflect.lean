@@ -5210,7 +5210,9 @@ theorem checkSymReturnsFalseExt_sound :
       exact symIsReturnFalse_sound fuel body args st hCheck hHold
 
 /-- Match a dereference load statement `.assign ⟨dstLoc, .nil⟩ (.use (.copy ⟨ptrLoc, [.deref]⟩))`
-where `ptrLoc` borrows `.symArg idx` at unsigned integer type `uKind`. -/
+where `ptrLoc` borrows `.symArg idx` at unsigned integer type `uKind`. Loads at any other
+pointee type (signed integers, `bool`, wide pointers) do not match, so closure-captured
+companions over such parameters are outside the automatic pin/bound discharge. -/
 def symMatchDerefSymArgLoad
     (body : CapturedMir)
     (st : SymState)
@@ -7103,6 +7105,25 @@ theorem checkOptMirRequiresPinsScalarsExt_sound
     | nil => rfl
     | cons _ _ => nomatch hExp0
 
+/-- Closed-term check that `optReqBody` pins the parameters of `subjectBody` to
+`expectedScalars`, by one of three routes:
+1. `checkOptMirRequiresPinsScalarsDirect`: direct `.symArg idx == K` comparisons,
+   with no typing obligation;
+2. `checkOptMirRequiresPinsScalarsExt` (`checkSymPinsExtLoop`): `V2026_06_01`
+   `anodized` closure-captured thin-pointer dereferences stepped into
+   `.symArg idx` (including reversed `K == x`, intermediate moves, and
+   short-circuit `&&`); or
+3. `checkOptMirRequiresPinsScalars` (`symExtractDerefSlicePinEq`): an adjacent
+   dereference load compared against a constant.
+Routes 2 and 3 additionally require `checkSubjectParamsMatchWidths`, and
+`checkOptMirRequiresPinsScalars_sound` discharges them only under
+`ArgsTypedForSubject`: a closure dereference reads just a scalar slice of its
+target, which an untyped aggregate argument also satisfies (Pitfall A).
+
+Scope: the closure-captured routes recognize only unsigned-integer (`u8` ..
+`u128`, `usize`) dereference loads (`symMatchDerefSymArgLoad`). Pins on signed
+integers or `bool`, and `s.len()` slice-metadata predicates, are not discharged
+automatically and need an authored proof. -/
 def checkOptMirRequiresPinsScalarsForSubject
     (fuel : Nat)
     (subjectBody : CapturedMir)
