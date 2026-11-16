@@ -48,12 +48,19 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    Pending wrappers only post-process the final value
    (`evalFuel_blockCfgStep_wrap`, `wpConverges_blockCfgStep_wrap_iff`). On CFGs
    without symbolic forks the embedding is complete
-   (`wpConverges_blockCfgStep_iff_of_noFork`), and on CFGs that do not fork on
-   the states of a per-block invariant it is complete from those states
-   (`wpConverges_blockCfgStep_iff_of_blockInv`).
-2. **Partial correctness transfer** (`modular_block_cfg_sound`):
-   `wpConverges_blockCfgStep_postRet` strengthens any fuel-free convergence
-   proof of the embedded CFG with PureLift's `PostRet`, and
+   (`wpConverges_blockCfgStep_iff_of_noFork` /
+   `wpConverges_blockCfgStep_iff_of_noFork_loop`), and on CFGs that do not fork
+   on an inductive set of reachable states (`InvClosedNoFork` / `BlockInv`),
+   `evalFuel` equals `outcomeToFuel` of `runBlockCfgLoop` directly across all
+   three outcomes (`.halted ↔ .ret`, `.outOfFuel ↔ .diverged`,
+   `.faulted ↔ .fault ∨ wrap = none`) at every fuel and delay
+   (`evalFuel_blockCfgStep_eq_of_invClosedNoFork`,
+   `wpConverges_blockCfgStep_iff_of_blockInv_loop`).
+2. **Partial correctness transfer** (`modular_block_cfg_sound` /
+   `modular_block_cfg_loop_sound`): `wpConverges_blockCfgStep_postRet` and
+   `wpConverges_blockCfgStep_postRet_loop` strengthen any fuel-free convergence
+   proof of the embedded CFG (from any wrapper/delay state satisfying
+   `MachineInv`) with PureLift's `PostRet`, and
    `evalFuel_blockCfgStep_ne_faulted` rules out machine faults;
    `wpConverges_of_cfgCertificate` turns a `CfgCertificate` plus a function
    specification into fuel-free convergence of its CFG.
@@ -70,8 +77,10 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
 5. **Loops** (`runWhileFlowSteps_cutpoint_sound`, `forRangeUp`):
    `stepsTo_whileExit_of_runWhileFlowSteps` simulates every terminating
    structured `while` run by a fuel-free `StepsTo` segment of the 3-block loop
-   CFG of `cfg_certificate_while_sound`; `while_cutpoint_wpConverges` composes it
-   with `runWhileFlowSteps_cutpoint_sound`, and
+   CFG of `cfg_certificate_while_sound`; `while_cutpoint_wpConverges` and
+   `while_cutpoint_wpConverges_wrap` compose it with
+   `runWhileFlowSteps_cutpoint_sound` under strong well-founded descent
+   `rank s' < rank s` (and any pending wrapper), and
    `whileLoop_stepsTo_forRangeUp` / `whileLoop_stepsTo_exit_forRangeUp` drive
    the same CFG with MirLiftCore's structural `stepsTo_forRangeUp` rule.
 6. **Refinement into live MIR** (`runMirToBlock`, `LiftBlockToJoin`):
@@ -102,7 +111,10 @@ This module (kept out of the `Init`-only `PureLift` core, since it imports the
    change to the PureLift core.
 9. **Episode 2 compatibility** (no change to the PureLift core): the
    `V2026_06_01` bridge's `unpinFromSpatialInState` name for `main`'s
-   `reabsorbFromSpatialInState`, `evalPlan_whileLoop` for `main`'s `WfPlan`,
+   `reabsorbFromSpatialInState`, `evalPlan_whileLoop` / `evalPlan_branch` /
+   `evalPlan_branchExplicitJoin` and compositional `WfPlan` constructors
+   (`wfPlan_skip`, `wfPlan_act`, `wfPlan_earlyReturn`, `wfPlan_seq`,
+   `wfPlan_branch`, `wfPlan_branchExplicitJoin`, `wfPlan_whileLoop`),
    handle-freedom of every halt of an embedded `stepBasicBlock` CFG
    (`evalFuel_blockCfgStep_stepBasicBlock_handleFree`), and sub-identity
    partial wrappers (`SubIdWrap`, satisfied by the `handleFreeOutOpt` guard that
@@ -1377,6 +1389,297 @@ theorem wpConverges_blockCfgStep_iff_of_noFork_loop
     rw [evalFuel_blockCfgStep_loop, forkFree_eq_of_noFork stepBb hNoFork]
     exact (outcomeToFuel_eq_halted_iff s.wrap _ v').mpr ⟨v, hRun, hw⟩
 
+/-- `outcomeToFuel wrap` is `.outOfFuel` iff the CFG outcome is `.diverged`. -/
+theorem outcomeToFuel_eq_outOfFuel_iff (wrap : Ret → Option Ret)
+    (out : BlockCfgOutcome Ret) :
+    outcomeToFuel wrap out = .outOfFuel ↔ out = .diverged := by
+  cases out with
+  | ret v =>
+    dsimp only [outcomeToFuel]
+    cases wrap v <;>
+      exact Iff.intro (fun h => nomatch h) (fun h => nomatch h)
+  | diverged =>
+    exact Iff.intro (fun _ => rfl) (fun _ => rfl)
+  | fault =>
+    exact Iff.intro (fun h => nomatch h) (fun h => nomatch h)
+
+/-- `outcomeToFuel wrap` is `.faulted` iff the CFG outcome is `.fault` or the
+CFG returned a value `v` rejected by `wrap` (`wrap v = none`). -/
+theorem outcomeToFuel_eq_faulted_iff (wrap : Ret → Option Ret)
+    (out : BlockCfgOutcome Ret) :
+    outcomeToFuel wrap out = .faulted ↔
+      out = .fault ∨ Exists fun v => out = .ret v ∧ wrap v = none := by
+  cases out with
+  | ret v =>
+    dsimp only [outcomeToFuel]
+    constructor
+    · intro h
+      cases hw : wrap v with
+      | some _ =>
+        rw [hw] at h
+        exact nomatch h
+      | none =>
+        exact Or.inr ⟨v, rfl, hw⟩
+    · intro h
+      rcases h with hFault | ⟨v0, hRet, hw⟩
+      · exact nomatch hFault
+      · injection hRet with hEq
+        subst hEq
+        rw [hw]
+  | diverged =>
+    constructor
+    · intro h
+      exact nomatch h
+    · intro h
+      rcases h with hFault | ⟨_, hRet, _⟩
+      · exact nomatch hFault
+      · exact nomatch hRet
+  | fault =>
+    exact ⟨fun _ => Or.inl rfl, fun _ => rfl⟩
+
+/-- Any converged run of the embedded machine from an arbitrary state `s`
+(arbitrary pending wrapper `s.wrap` and delay `s.wait`) comes from an actual
+`runBlockCfgLoop` return of the original CFG accepted by `s.wrap`. -/
+theorem runBlockCfgLoop_of_wpConverges
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    {s : BlockMachineState State Ret} {P : Ret → Prop}
+    (h : PureMirExec.WpConverges (blockCfgStep stepBb) s P) :
+    Exists fun k => Exists fun v => Exists fun v' =>
+      runBlockCfgLoop stepBb k s.wait s.bb s.st = .ret v ∧
+      s.wrap v = some v' ∧ P v' := by
+  obtain ⟨k, v', hk, hp⟩ := h
+  rw [evalFuel_blockCfgStep_loop] at hk
+  obtain ⟨v, hRun, hw⟩ := (outcomeToFuel_eq_halted_iff s.wrap _ v').mp hk
+  exact ⟨k, v, v',
+    runBlockCfgLoop_of_forkFree_ret stepBb k s.wait s.bb s.st v hRun, hw, hp⟩
+
+/-- **Partial correctness transfer from any machine state**
+(`modular_block_cfg_loop_sound`): any fuel-free convergence proof from a state
+`s` satisfying `MachineInv BlockInv PostRet s` (with any pending wrapper and
+any `.convergedJump` delay) is strengthened with `PostRet` for free. -/
+theorem wpConverges_blockCfgStep_postRet_loop
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) (PostRet : Ret → Prop)
+    (hLocal : LocalBlockVC stepBb BlockInv PostRet)
+    {s : BlockMachineState State Ret}
+    (hs : MachineInv BlockInv PostRet s) {Q : Ret → Prop}
+    (h : PureMirExec.WpConverges (blockCfgStep stepBb) s Q) :
+    PureMirExec.WpConverges (blockCfgStep stepBb) s
+      (fun v => Q v ∧ PostRet v) := by
+  obtain ⟨k, v', hk, hq⟩ := h
+  refine ⟨k, v', hk, hq, ?_⟩
+  obtain ⟨k', v0, v1, hRun, hw, hEq⟩ :=
+    runBlockCfgLoop_of_wpConverges stepBb (P := (· = v')) ⟨k, v', hk, rfl⟩
+  subst hEq
+  have hSpec :=
+    modular_block_cfg_loop_sound stepBb BlockInv PostRet hLocal k' s.wait s.bb
+      s.st hs.1
+  rw [hRun] at hSpec
+  have hWrap := hs.2 v0 hSpec
+  rw [hw] at hWrap
+  exact hWrap
+
+/-- `BlockInv` is closed under `.jump`, `.jumpWrapped`, and `.convergedJump`
+transitions of `stepBb` and excludes symbolic `.branchJump` forks on `BlockInv`
+states (while still permitting `.ret`, `.fault`, or partial wrappers returning
+`none`). -/
+def InvClosedNoFork (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) : Prop :=
+  ∀ bb st, BlockInv bb st →
+    match stepBb bb st with
+    | .jump nextBb st' => BlockInv nextBb st'
+    | .jumpWrapped _ nextBb st' => BlockInv nextBb st'
+    | .convergedJump _ _ nextBb st' => BlockInv nextBb st'
+    | .branchJump _ _ _ _ => False
+    | .ret _ => True
+    | .fault => True
+
+/-- Every `LocalBlockVC` together with invariant-scoped `hNoFork` implies
+`InvClosedNoFork`. -/
+theorem invClosedNoFork_of_localBlockVC
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) (PostRet : Ret → Prop)
+    (hLocal : LocalBlockVC stepBb BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st') :
+    InvClosedNoFork stepBb BlockInv := by
+  intro bb st hInv
+  have hVC := hLocal bb st hInv
+  cases hst : stepBb bb st with
+  | jump nextBb st' =>
+    rw [hst] at hVC
+    exact hVC
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hVC
+    exact hVC.1
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hVC
+    exact hVC.1
+  | branchJump mergeRet thenBb elseBb st' =>
+    exact hNoFork bb st hInv mergeRet thenBb elseBb st' hst
+  | ret _ => trivial
+  | fault => trivial
+
+/-- **Exact invariant-scoped fork-free equality**: under `InvClosedNoFork`,
+`runBlockCfgLoop (forkFree stepBb)` equals `runBlockCfgLoop stepBb` across all
+outcomes (`.ret`, `.diverged`, and `.fault`) at every fuel and delay from any
+`BlockInv` state, even if reachable blocks fault or wrappers reject. -/
+theorem runBlockCfgLoop_forkFree_eq_of_invClosedNoFork
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop)
+    (hClosed : InvClosedNoFork stepBb BlockInv) :
+    ∀ (k wait : Nat) (bb : Nat) (st : State),
+      BlockInv bb st →
+      runBlockCfgLoop (forkFree stepBb) k wait bb st =
+        runBlockCfgLoop stepBb k wait bb st
+  | 0, _, _, _, _ => rfl
+  | k + 1, wait' + 1, bb, st, hInv => by
+    rw [runBlockCfgLoop_succ_wait, runBlockCfgLoop_succ_wait]
+    exact runBlockCfgLoop_forkFree_eq_of_invClosedNoFork stepBb BlockInv
+      hClosed k wait' bb st hInv
+  | k + 1, 0, bb, st, hInv => by
+    have hC := hClosed bb st hInv
+    change runBlockCfg (forkFree stepBb) bb st (k + 1) =
+      runBlockCfg stepBb bb st (k + 1)
+    rw [runBlockCfg_succ, runBlockCfg_succ]
+    dsimp only [forkFree]
+    cases hst : stepBb bb st with
+    | jump nextBb st' =>
+      rw [hst] at hC
+      exact runBlockCfgLoop_forkFree_eq_of_invClosedNoFork stepBb BlockInv
+        hClosed k 0 nextBb st' hC
+    | jumpWrapped wrapRet nextBb st' =>
+      rw [hst] at hC
+      dsimp only
+      have ih : runBlockCfg (forkFree stepBb) nextBb st' k =
+          runBlockCfg stepBb nextBb st' k :=
+        runBlockCfgLoop_forkFree_eq_of_invClosedNoFork stepBb BlockInv
+          hClosed k 0 nextBb st' hC
+      rw [ih]
+    | convergedJump armSteps wrapRet nextBb st' =>
+      rw [hst] at hC
+      dsimp only
+      rw [runBlockCfgLoop_forkFree_eq_of_invClosedNoFork stepBb BlockInv
+            hClosed k armSteps nextBb st' hC]
+    | branchJump _ _ _ _ =>
+      rw [hst] at hC
+      exact hC.elim
+    | ret _ => rfl
+    | fault => rfl
+
+/-- `runBlockCfg` form of `runBlockCfgLoop_forkFree_eq_of_invClosedNoFork`. -/
+theorem runBlockCfg_forkFree_eq_of_invClosedNoFork
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop)
+    (hClosed : InvClosedNoFork stepBb BlockInv)
+    (k bb : Nat) (st : State) (hInv : BlockInv bb st) :
+    runBlockCfg (forkFree stepBb) bb st k = runBlockCfg stepBb bb st k :=
+  runBlockCfgLoop_forkFree_eq_of_invClosedNoFork stepBb BlockInv hClosed k 0
+    bb st hInv
+
+/-- **Exact invariant-scoped `evalFuel` equation**: under `InvClosedNoFork`,
+`evalFuel` of the embedded machine from any `BlockInv` state equals
+`outcomeToFuel s.wrap` of the original CFG `runBlockCfgLoop stepBb` directly
+(with no `forkFree` on the RHS and no `∨ .faulted` disjunct). -/
+theorem evalFuel_blockCfgStep_eq_of_invClosedNoFork
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop)
+    (hClosed : InvClosedNoFork stepBb BlockInv)
+    (k : Nat) (s : BlockMachineState State Ret) (hInv : BlockInv s.bb s.st) :
+    PureMirExec.evalFuel (blockCfgStep stepBb) k s =
+      outcomeToFuel s.wrap (runBlockCfgLoop stepBb k s.wait s.bb s.st) := by
+  rw [evalFuel_blockCfgStep_loop,
+      runBlockCfgLoop_forkFree_eq_of_invClosedNoFork stepBb BlockInv hClosed
+        k s.wait s.bb s.st hInv]
+
+/-- `LocalBlockVC` form of `evalFuel_blockCfgStep_eq_of_invClosedNoFork`. -/
+theorem evalFuel_blockCfgStep_eq_of_blockInv
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) (PostRet : Ret → Prop)
+    (hLocal : LocalBlockVC stepBb BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st')
+    (k : Nat) (s : BlockMachineState State Ret) (hInv : BlockInv s.bb s.st) :
+    PureMirExec.evalFuel (blockCfgStep stepBb) k s =
+      outcomeToFuel s.wrap (runBlockCfgLoop stepBb k s.wait s.bb s.st) :=
+  evalFuel_blockCfgStep_eq_of_invClosedNoFork stepBb BlockInv
+    (invClosedNoFork_of_localBlockVC stepBb BlockInv PostRet hLocal hNoFork)
+    k s hInv
+
+/-- **Bidirectional `.outOfFuel` ↔ `.diverged` equivalence under
+`InvClosedNoFork`**. -/
+theorem evalFuel_blockCfgStep_outOfFuel_iff_of_invClosedNoFork
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop)
+    (hClosed : InvClosedNoFork stepBb BlockInv)
+    (k : Nat) (s : BlockMachineState State Ret) (hInv : BlockInv s.bb s.st) :
+    PureMirExec.evalFuel (blockCfgStep stepBb) k s = .outOfFuel ↔
+      runBlockCfgLoop stepBb k s.wait s.bb s.st = .diverged := by
+  rw [evalFuel_blockCfgStep_eq_of_invClosedNoFork stepBb BlockInv hClosed k s
+        hInv]
+  exact outcomeToFuel_eq_outOfFuel_iff s.wrap _
+
+/-- **Bidirectional `.faulted` characterization under `InvClosedNoFork`**: from
+an invariant state, the embedded machine faults at fuel `k` iff the original CFG
+faults at fuel `k` or returns a value rejected (`none`) by `s.wrap`. -/
+theorem evalFuel_blockCfgStep_faulted_iff_of_invClosedNoFork
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop)
+    (hClosed : InvClosedNoFork stepBb BlockInv)
+    (k : Nat) (s : BlockMachineState State Ret) (hInv : BlockInv s.bb s.st) :
+    PureMirExec.evalFuel (blockCfgStep stepBb) k s = .faulted ↔
+      runBlockCfgLoop stepBb k s.wait s.bb s.st = .fault ∨
+        Exists fun v =>
+          runBlockCfgLoop stepBb k s.wait s.bb s.st = .ret v ∧
+          s.wrap v = none := by
+  rw [evalFuel_blockCfgStep_eq_of_invClosedNoFork stepBb BlockInv hClosed k s
+        hInv]
+  exact outcomeToFuel_eq_faulted_iff s.wrap _
+
+/-- **General invariant-scoped completeness** (arbitrary pending wrapper and
+arbitrary `.convergedJump` delay) under `InvClosedNoFork`. -/
+theorem wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop)
+    (hClosed : InvClosedNoFork stepBb BlockInv)
+    (s : BlockMachineState State Ret) (hInv : BlockInv s.bb s.st)
+    (P : Ret → Prop) :
+    PureMirExec.WpConverges (blockCfgStep stepBb) s P ↔
+      Exists fun k => Exists fun v =>
+        runBlockCfgLoop stepBb k s.wait s.bb s.st = .ret v ∧
+        Exists fun v' => s.wrap v = some v' ∧ P v' := by
+  constructor
+  · intro h
+    obtain ⟨k, v, v', hRun, hw, hP⟩ := runBlockCfgLoop_of_wpConverges stepBb h
+    exact ⟨k, v, hRun, v', hw, hP⟩
+  · intro ⟨k, v, hRun, v', hw, hP⟩
+    refine ⟨k, v', ?_, hP⟩
+    rw [evalFuel_blockCfgStep_eq_of_invClosedNoFork stepBb BlockInv hClosed k s
+          hInv]
+    exact (outcomeToFuel_eq_halted_iff s.wrap _ v').mpr ⟨v, hRun, hw⟩
+
+/-- `LocalBlockVC` form of `wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop`:
+generalizes `wpConverges_blockCfgStep_iff_of_blockInv` to any pending wrapper
+`s.wrap` and any pending `.convergedJump` delay `s.wait`. -/
+theorem wpConverges_blockCfgStep_iff_of_blockInv_loop
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (BlockInv : Nat → State → Prop) (PostRet : Ret → Prop)
+    (hLocal : LocalBlockVC stepBb BlockInv PostRet)
+    (hNoFork : ∀ bb st, BlockInv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBb bb st ≠ .branchJump mergeRet thenBb elseBb st')
+    (s : BlockMachineState State Ret) (hInv : BlockInv s.bb s.st)
+    (P : Ret → Prop) :
+    PureMirExec.WpConverges (blockCfgStep stepBb) s P ↔
+      Exists fun k => Exists fun v =>
+        runBlockCfgLoop stepBb k s.wait s.bb s.st = .ret v ∧
+        Exists fun v' => s.wrap v = some v' ∧ P v' :=
+  wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop stepBb BlockInv
+    (invClosedNoFork_of_localBlockVC stepBb BlockInv PostRet hLocal hNoFork)
+    s hInv P
+
 end BlockMachine
 
 /-! ## Loops: `runWhileFlowSteps_cutpoint_sound` and `forRangeUp` -/
@@ -1545,6 +1848,50 @@ theorem stepsTo_whileExit_of_runWhileFlowSteps (alg : ValAlgebra Val)
                   (stepsTo_whileExit_of_runWhileFlowSteps alg cond body retExpr k
                     wrap st' stFinal hRec))
 
+/-- **Loop cutpoints compose with fuel-free lifting under any pending wrapper**
+(`runWhileFlowSteps_cutpoint_sound` + `StepsTo.bind_wp`): when the loop header
+is reached under a pending partial wrapper `wrap` (such as after a
+`.convergedJump` diamond or `.jumpWrapped` early-return guard), an inductive
+loop invariant `Inv` with strong descent `rank s' < rank s` and an exit
+obligation whose output is accepted by `wrap` make the embedded 3-block loop CFG
+converge (`PureMirExec.WpConverges`) to `Post`. -/
+theorem while_cutpoint_wpConverges_wrap (alg : ValAlgebra Val) (cond : RvalOp Val)
+    (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (wrap : FuncOut Val → Option (FuncOut Val))
+    (Post : FuncOut Val → Prop)
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => Exists fun out =>
+          evalRval alg retExpr s = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          wrap ⟨rv, collectRootMutVals s.loans⟩ = some out ∧
+          Post out)
+    (st : SymState Val) (hInv : Inv st) :
+    PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock alg (whileLoopBlocks cond body retExpr)))
+      ⟨wrap, 0, st, 0⟩ Post := by
+  obtain ⟨stFinal, hRun, hInvF, hCondF⟩ :=
+    runWhileFlowSteps_cutpoint_sound alg cond (evalPlan alg body) Inv rank hStep
+      (rank st) st hInv (Nat.le_refl (rank st))
+  refine (stepsTo_whileExit_of_runWhileFlowSteps alg cond body retExpr (rank st)
+    wrap st stFinal hRun).bind_wp ?_
+  intro s₁ hs₁
+  subst hs₁
+  obtain ⟨hClean, rv, out, hRv, hFree, hWrap, hPost⟩ := hExit stFinal hInvF hCondF
+  exact PureMirExec.WpConverges.of_done
+    (blockCfgStep_whileExit alg cond body retExpr wrap stFinal rv out hClean
+      hRv hFree hWrap)
+    hPost
+
 /-- **Loop cutpoints compose with fuel-free lifting**
 (`runWhileFlowSteps_cutpoint_sound` + `StepsTo.bind_wp`): an inductive loop
 invariant `Inv` with a strong well-founded ranking measure `rank` (`rank s' <
@@ -1571,19 +1918,12 @@ theorem while_cutpoint_wpConverges (alg : ValAlgebra Val) (cond : RvalOp Val)
     (st : SymState Val) (hInv : Inv st) :
     PureMirExec.WpConverges
       (blockCfgStep (stepBasicBlock alg (whileLoopBlocks cond body retExpr)))
-      ⟨some, 0, st, 0⟩ Post := by
-  obtain ⟨stFinal, hRun, hInvF, hCondF⟩ :=
-    runWhileFlowSteps_cutpoint_sound alg cond (evalPlan alg body) Inv rank hStep
-      (rank st) st hInv (Nat.le_refl (rank st))
-  refine (stepsTo_whileExit_of_runWhileFlowSteps alg cond body retExpr (rank st)
-    some st stFinal hRun).bind_wp ?_
-  intro s₁ hs₁
-  subst hs₁
-  obtain ⟨hClean, rv, hRv, hFree, hPost⟩ := hExit stFinal hInvF hCondF
-  exact PureMirExec.WpConverges.of_done
-    (blockCfgStep_whileExit alg cond body retExpr some stFinal rv
-      ⟨rv, collectRootMutVals stFinal.loans⟩ hClean hRv hFree rfl)
-    hPost
+      ⟨some, 0, st, 0⟩ Post :=
+  while_cutpoint_wpConverges_wrap alg cond body retExpr Inv rank hStep some Post
+    (fun s hs hCond => by
+      obtain ⟨hClean, rv, hRv, hFree, hPost⟩ := hExit s hs hCond
+      exact ⟨hClean, rv, ⟨rv, collectRootMutVals s.loans⟩, hRv, hFree, rfl, hPost⟩)
+    st hInv
 
 /-- **Counted loops via MirLiftCore's `forRangeUp` rule**: when each iteration
 `i ∈ [lo, hi)` of the embedded 3-block loop CFG takes the body (the header
@@ -2354,6 +2694,142 @@ theorem evalPlan_whileLoop {Val : Type} (alg : ValAlgebra Val)
      | _ => .fail) = _
   rw [hWfB true []]
   rfl
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.skip`. -/
+theorem wfPlan_skip {Val : Type} (alg : ValAlgebra Val) :
+    WfPlan alg .skip :=
+  fun _ _ => rfl
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.act`. -/
+theorem wfPlan_act {Val : Type} (alg : ValAlgebra Val) (a : PrimAction Val) :
+    WfPlan alg (.act a) :=
+  fun _ _ => rfl
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.earlyReturn`. -/
+theorem wfPlan_earlyReturn {Val : Type} (alg : ValAlgebra Val)
+    (cleanupLoans : List LoanId) (cleanupGroups : List RegionGroupId)
+    (retExpr : RvalOp Val) :
+    WfPlan alg (.earlyReturn cleanupLoans cleanupGroups retExpr) :=
+  fun _ _ => rfl
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.seq`. -/
+theorem wfPlan_seq {Val : Type} (alg : ValAlgebra Val)
+    {p1 p2 : FlowPlan Val} (hWf1 : WfPlan alg p1) (hWf2 : WfPlan alg p2) :
+    WfPlan alg (.seq p1 p2) := by
+  intro ok stk
+  change stepPlanOp alg .seqJoin (evalPlanOps alg (p1.ops ++ p2.ops) (ok, stk)) =
+    (ok, (fun s0 => evalPlan alg (.seq p1 p2) s0) :: stk)
+  rw [evalPlanOps_append, hWf2 ok stk, hWf1 ok _]
+  dsimp only [stepPlanOp]
+  refine congrArg (fun f => (ok, f :: stk)) (funext fun s0 => ?_)
+  exact (evalPlan_seq alg p1 p2 s0 hWf1 hWf2).symm
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.whileLoop`. -/
+theorem wfPlan_whileLoop {Val : Type} (alg : ValAlgebra Val)
+    (fuel : Nat) (cond : RvalOp Val) {body : FlowPlan Val}
+    (hWfB : WfPlan alg body) :
+    WfPlan alg (.whileLoop fuel cond body) := by
+  intro ok stk
+  change stepPlanOp alg (.whileLoopOp fuel cond)
+      (evalPlanOps alg body.ops (ok, stk)) =
+    (ok, (fun s0 => evalPlan alg (.whileLoop fuel cond body) s0) :: stk)
+  rw [hWfB ok stk]
+  dsimp only [stepPlanOp]
+  refine congrArg (fun f => (ok, f :: stk)) (funext fun s0 => ?_)
+  exact (evalPlan_whileLoop alg fuel cond body s0 hWfB).symm
+
+/-- Conditional branch plan equation for `main`'s `WfPlan`. -/
+theorem evalPlan_branch {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (onTrue onFalse : FlowPlan Val) (s0 : SymState Val)
+    (hWfT : WfPlan alg onTrue) (hWfF : WfPlan alg onFalse) :
+    evalPlan alg (.branch cond onTrue onFalse) s0 =
+      (match evalRval alg cond s0 with
+       | none => .fail
+       | some cVal =>
+         match alg.asBool cVal with
+         | some true => evalPlan alg onTrue s0
+         | some false => evalPlan alg onFalse s0
+         | none =>
+           match evalPlan alg onTrue s0, evalPlan alg onFalse s0 with
+           | .ok flowTrue, .ok flowFalse =>
+             match joinExecFlow alg cVal flowTrue flowFalse with
+             | some flowJoined => .ok flowJoined
+             | none => .fail
+           | _, _ => .fail) := by
+  change
+    (match stepPlanOp alg (.branchJoin cond)
+        (evalPlanOps alg (onTrue.ops ++ onFalse.ops) (true, [])) with
+     | (true, [evalFn]) => evalFn s0
+     | _ => .fail) = _
+  rw [evalPlanOps_append, hWfF true [], hWfT]
+  rfl
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.branch`. -/
+theorem wfPlan_branch {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) {onTrue onFalse : FlowPlan Val}
+    (hWfT : WfPlan alg onTrue) (hWfF : WfPlan alg onFalse) :
+    WfPlan alg (.branch cond onTrue onFalse) := by
+  intro ok stk
+  change stepPlanOp alg (.branchJoin cond)
+      (evalPlanOps alg (onTrue.ops ++ onFalse.ops) (ok, stk)) =
+    (ok, (fun s0 => evalPlan alg (.branch cond onTrue onFalse) s0) :: stk)
+  rw [evalPlanOps_append, hWfF ok stk, hWfT ok _]
+  dsimp only [stepPlanOp]
+  refine congrArg (fun f => (ok, f :: stk)) (funext fun s0 => ?_)
+  exact (evalPlan_branch alg cond onTrue onFalse s0 hWfT hWfF).symm
+
+/-- Explicit-join conditional branch plan equation for `main`'s `WfPlan`. -/
+theorem evalPlan_branchExplicitJoin {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (onTrue onFalse : FlowPlan Val)
+    (joinPairs : List (LoanId × LoanId)) (s0 : SymState Val)
+    (hWfT : WfPlan alg onTrue) (hWfF : WfPlan alg onFalse) :
+    evalPlan alg (.branchExplicitJoin cond onTrue onFalse joinPairs) s0 =
+      (if !validJoinPairs joinPairs [] [] then .fail
+       else
+         match evalRval alg cond s0 with
+         | none => .fail
+         | some cVal =>
+           match alg.asBool cVal with
+           | some true => evalPlan alg onTrue s0
+           | some false =>
+             match evalPlan alg onFalse s0 with
+             | .ok flowFalse =>
+               match applySelfJoinPairsFlow alg joinPairs flowFalse with
+               | some flow => .ok flow
+               | none => .fail
+             | .fail => .fail
+           | none =>
+             match evalPlan alg onTrue s0, evalPlan alg onFalse s0 with
+             | .ok flowTrue, .ok flowFalse =>
+               match joinExecFlowExplicit alg cVal joinPairs
+                       flowTrue flowFalse with
+               | some flowJoined => .ok flowJoined
+               | none => .fail
+             | _, _ => .fail) := by
+  change
+    (match stepPlanOp alg (.branchExplicitJoinOp cond joinPairs)
+        (evalPlanOps alg (onTrue.ops ++ onFalse.ops) (true, [])) with
+     | (true, [evalFn]) => evalFn s0
+     | _ => .fail) = _
+  rw [evalPlanOps_append, hWfF true [], hWfT]
+  rfl
+
+/-- Compositional `WfPlan` constructor for `FlowPlan.branchExplicitJoin`. -/
+theorem wfPlan_branchExplicitJoin {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) {onTrue onFalse : FlowPlan Val}
+    (joinPairs : List (LoanId × LoanId))
+    (hWfT : WfPlan alg onTrue) (hWfF : WfPlan alg onFalse) :
+    WfPlan alg (.branchExplicitJoin cond onTrue onFalse joinPairs) := by
+  intro ok stk
+  change stepPlanOp alg (.branchExplicitJoinOp cond joinPairs)
+      (evalPlanOps alg (onTrue.ops ++ onFalse.ops) (ok, stk)) =
+    (ok, (fun s0 =>
+      evalPlan alg (.branchExplicitJoin cond onTrue onFalse joinPairs) s0) :: stk)
+  rw [evalPlanOps_append, hWfF ok stk, hWfT ok _]
+  dsimp only [stepPlanOp]
+  refine congrArg (fun f => (ok, f :: stk)) (funext fun s0 => ?_)
+  exact (evalPlan_branchExplicitJoin alg cond onTrue onFalse joinPairs s0
+    hWfT hWfF).symm
 
 /-- `handleFreeOutOpt` only rejects values: it is a sub-identity wrapper. -/
 theorem subIdWrap_handleFreeOutOpt {Val : Type} (alg : ValAlgebra Val) :
@@ -4375,6 +4851,150 @@ theorem countdown_wrapper_frame_canaries (n : Nat) :
     obtain ⟨_, _, _, _, hNone, _⟩ :=
       (wpConverges_blockCfgStep_wrap_iff testCfgStep _ 0 n 0 P).mp h
     exact nomatch hNone
+
+/-- A CFG that emits `.branchJump` on unreachable block `99` (so global `hNoFork`
+is false) and uses `.convergedJump 1` with a partial wrapper (`v ≥ 10`) on
+reachable block `0` (so `LocalBlockVC` does not hold on states with `st < 10`,
+yet `InvClosedNoFork` holds on all `bb ∈ {0, 1}`). -/
+def invClosedPartialCfg (bb st : Nat) : BlockStepResult Nat Nat :=
+  match bb with
+  | 0 => .convergedJump 1 (fun v => if 10 ≤ v then some (v + 1) else none) 1 st
+  | 1 => .ret st
+  | 99 => .branchJump (fun a b => some (a + b)) 1 1 st
+  | _ => .fault
+
+def invClosedReachable (bb _st : Nat) : Prop :=
+  bb = 0 ∨ bb = 1
+
+theorem invClosedPartialCfg_invClosedNoFork :
+    InvClosedNoFork invClosedPartialCfg invClosedReachable := by
+  intro bb st hInv
+  rcases hInv with rfl | rfl
+  · exact Or.inr rfl
+  · trivial
+
+/-- **Non-vacuity of `InvClosedNoFork`,
+`evalFuel_blockCfgStep_faulted_iff_of_invClosedNoFork`,
+`evalFuel_blockCfgStep_outOfFuel_iff_of_invClosedNoFork`,
+`wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop`, and
+`wpConverges_blockCfgStep_postRet_loop`**:
+Even though `invClosedPartialCfg` has a `.branchJump` at unreachable block `99`
+and its partial wrapper rejects `st = 3` on reachable block `0`:
+1. `evalFuel_blockCfgStep_eq_of_invClosedNoFork` gives exact equality with
+   `runBlockCfgLoop invClosedPartialCfg` at every fuel and delay `wait`.
+2. At `st = 3`, the bidirectional fault theorem proves `evalFuel` at fuel `3`
+   is `.faulted` because `runBlockCfg` returns `.fault`, while at fuel `2` the
+   bidirectional out-of-fuel theorem proves `evalFuel = .outOfFuel`.
+3. From mid-delay state `⟨some, 1, 12, 1⟩` (`wait = 1`),
+   `wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop` proves convergence to
+   `12`.
+4. On `convergedJumpTestCfg true`, `wpConverges_blockCfgStep_postRet_loop`
+   strengthens convergence from mid-delay state `⟨composeWrap some (fun v =>
+   some (v + 10)), 1, n + 5, 2⟩` (`wait = 2`) with `PostRet`. -/
+theorem invClosedNoFork_and_loop_adequacy_canaries (n : Nat) :
+    ¬ (∀ bb st mergeRet thenBb elseBb st',
+        invClosedPartialCfg bb st ≠
+          .branchJump mergeRet thenBb elseBb st') ∧
+    (PureMirExec.evalFuel (blockCfgStep invClosedPartialCfg) 2
+      ⟨some, 0, 3, 0⟩ = .outOfFuel ↔
+      runBlockCfg invClosedPartialCfg 0 3 2 = .diverged) ∧
+    (PureMirExec.evalFuel (blockCfgStep invClosedPartialCfg) 3
+      ⟨some, 0, 3, 0⟩ = .faulted ↔
+      runBlockCfg invClosedPartialCfg 0 3 3 = .fault ∨
+        Exists fun v =>
+          runBlockCfg invClosedPartialCfg 0 3 3 = .ret v ∧
+          (some : Nat → Option Nat) v = none) ∧
+    PureMirExec.WpConverges (blockCfgStep invClosedPartialCfg)
+      ⟨some, 1, 12, 1⟩ (· = 12) ∧
+    PureMirExec.WpConverges (blockCfgStep (convergedJumpTestCfg true))
+      ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩
+      (fun v => v = (n + 5) * 2 + 10 ∧ (n + 5) * 2 ≤ v) := by
+  refine ⟨fun hAll => hAll 99 0 (fun a b => some (a + b)) 1 1 0 rfl,
+    evalFuel_blockCfgStep_outOfFuel_iff_of_invClosedNoFork invClosedPartialCfg
+      invClosedReachable invClosedPartialCfg_invClosedNoFork 2
+      ⟨some, 0, 3, 0⟩ (Or.inl rfl),
+    evalFuel_blockCfgStep_faulted_iff_of_invClosedNoFork invClosedPartialCfg
+      invClosedReachable invClosedPartialCfg_invClosedNoFork 3
+      ⟨some, 0, 3, 0⟩ (Or.inl rfl),
+    (wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop invClosedPartialCfg
+      invClosedReachable invClosedPartialCfg_invClosedNoFork
+      ⟨some, 1, 12, 1⟩ (Or.inr rfl) (· = 12)).mpr
+      ⟨2, 12, rfl, 12, rfl, rfl⟩,
+    wpConverges_blockCfgStep_postRet_loop (convergedJumpTestCfg true)
+      (convergedJumpTestInv n) (fun v => (n + 5) * 2 ≤ v)
+      (forkFree_eq_of_noFork (convergedJumpTestCfg true)
+        (convergedJumpTestCfg_noFork true) ▸ convergedJumpTest_localBlockVC n)
+      ⟨Or.inr ⟨rfl, rfl⟩, fun v hv => Nat.le_trans hv (Nat.le_add_right v 10)⟩
+      ⟨3, (n + 5) * 2 + 10, rfl, rfl⟩⟩
+
+/-- **Non-vacuity of `while_cutpoint_wpConverges_wrap`**: when the stride-3
+strong-descent loop is entered under the pending sub-identity guard
+`composeWrap some (handleFreeOutOpt stdValAlg)` (the exact wrapper installed by
+a preceding `.convergedJump` diamond in `stepBasicBlock`), it still converges
+fuel-free from every `n, i : Nat`. -/
+theorem stride3_while_cutpoint_wpConverges_wrap_canary (n i : Nat) :
+    PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg stride3Blocks))
+      ⟨composeWrap some (handleFreeOutOpt stdValAlg), 0, countUpState n i, 0⟩
+      (fun out => Exists fun j => n ≤ j ∧ out = ⟨.unit, [.nat j]⟩) :=
+  while_cutpoint_wpConverges_wrap stdValAlg countUpCond stride3Body
+    (.constVal .unit) (stride3Inv n) (countUpRank n) (stride3_cutpoint_step n)
+    (composeWrap some (handleFreeOutOpt stdValAlg))
+    (fun out => Exists fun j => n ≤ j ∧ out = ⟨.unit, [.nat j]⟩)
+    (fun s ⟨j, hEq⟩ ⟨cv, hcv, hb⟩ => by
+      subst hEq
+      rw [countUp_eval_cond] at hcv
+      injection hcv with hcv
+      subst hcv
+      change some (Nat.blt j n) = some false at hb
+      injection hb with hb
+      have hge : n ≤ j := Nat.ge_of_not_lt (fun hlt =>
+        Bool.noConfusion ((Nat.ble_eq_true_of_le hlt).symm.trans hb))
+      exact ⟨rfl, .unit, ⟨.unit, [.nat j]⟩, rfl, rfl, rfl, j, hge, rfl⟩)
+    (countUpState n i) ⟨i, rfl⟩
+
+/-- **Non-vacuity of compositional `WfPlan` constructors and `stdValAlg`
+`ValAlgebra` refinements (`branchSplit`, `sameCond`, `sameAggregateShape`,
+`handleRefs`, `remapValLoan`)**:
+1. Nested `.seq`, `.branch`, `.branchExplicitJoin`, and `.whileLoop` plans satisfy
+   `WfPlan` via `wfPlan_seq`, `wfPlan_branch`, `wfPlan_branchExplicitJoin`, and
+   `wfPlan_whileLoop`.
+2. `stdValAlg.branchSplit` recovers `(cond, vt, vf)` from a symbolic choice node
+   (`zipVal (.symBool true)`) and returns `none` on references and scalars.
+3. `stdValAlg.sameCond` identifies matching symbolic conditions and rejects
+   distinct ones, `stdValAlg.sameAggregateShape` distinguishes pairs from leaves
+   and is preserved by `setField`, and `handleRefs` / `remapValLoan` traverse
+   choice arms and fields sound-and-completely. -/
+theorem wfPlan_and_valAlgebra_refinements_canaries :
+    WfPlan stdValAlg
+      (.seq (.branch countUpCond countUpBody .skip)
+        (.whileLoop 2 countUpCond stride3Body)) ∧
+    WfPlan stdValAlg
+      (.branchExplicitJoin countUpCond (.earlyReturn [] [] (.constVal .unit))
+        .skip []) ∧
+    stdValAlg.branchSplit
+      (stdValAlg.zipVal (.symBool true) (.nat 10) (.nat 20)) =
+      some (.symBool true, .nat 10, .nat 20) ∧
+    stdValAlg.branchSplit (.refVal 0 []) = none ∧
+    stdValAlg.sameCond (.symBool true) (.symBool true) = true ∧
+    stdValAlg.sameCond (.symBool true) (.symBool false) = false ∧
+    stdValAlg.sameAggregateShape (.pair (.nat 1) (.nat 2))
+      (.pair (.nat 3) (.nat 4)) = true ∧
+    stdValAlg.sameAggregateShape (.pair (.nat 1) (.nat 2)) (.nat 1) = false ∧
+    handleRefs stdValAlg
+      (stdValAlg.zipVal (.symBool true) (.refVal 0 [1]) (.refVal 2 [])) =
+      some [(0, [1]), (2, [])] ∧
+    remapValLoan stdValAlg 0 5
+      (stdValAlg.zipVal (.symBool true) (.refVal 0 [1]) (.refVal 2 [])) =
+      some (stdValAlg.zipVal (.symBool true) (.refVal 5 [1]) (.refVal 2 [])) :=
+  ⟨wfPlan_seq stdValAlg
+     (wfPlan_branch stdValAlg countUpCond
+       (wfPlan_act stdValAlg _) (wfPlan_skip stdValAlg))
+     (wfPlan_whileLoop stdValAlg 2 countUpCond (wfPlan_act stdValAlg _)),
+   wfPlan_branchExplicitJoin stdValAlg countUpCond []
+     (wfPlan_earlyReturn stdValAlg [] [] (.constVal .unit))
+     (wfPlan_skip stdValAlg),
+   rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Canaries
 
