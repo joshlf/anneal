@@ -1572,6 +1572,163 @@ theorem evalRvalue_offsetOf_adt_eq_resolveAdtOffsetOf
   have hB2 : Nat.ble off l.size.bytes = true := Nat.ble_eq.mpr hIn
   simp only [hB1, hB2, Bool.and_self]
 
+/-- Exact two-sided agreement between a captured compiler layout `l` and `spec` on variant `v`:
+`layoutVariantFieldOffset? l v i` equals `resolveAdtOffsetOf spec v i` for every field index `i`
+(covering both valid in-bounds field offsets `some off` and out-of-bounds / unspecified rejections
+`none`). -/
+def TypeLayoutOffsetsAgreeEq (l : TypeLayout) (spec : AdtLayoutSpec) (v : Nat) : Prop :=
+  ∀ i, layoutVariantFieldOffset? l v i = resolveAdtOffsetOf spec v i
+
+/-- **Two-sided ADT `OffsetOf` characterization (`evalRvalue_offsetOf_adt_iff_resolveAdtOffsetOf`)**:
+when `TypeLayoutOffsetsAgreeEq l spec v` holds and `l.size.bytes ≤ isize::MAX`, Trusted's
+`evalRvalue` on `.nullaryOp (.offsetOf [(v, i)])` evaluates to `.ok (.scalar ⟨off, ptrBytes⟩)` when
+`resolveAdtOffsetOf spec v i = some off` (with `off ≤ l.size.bytes`), and fails closed with
+`.unsupported` whenever `resolveAdtOffsetOf spec v i = none` (out-of-bounds variant/field or
+unspecified layout). -/
+theorem evalRvalue_offsetOf_adt_iff_resolveAdtOffsetOf
+    {locals : List LocalSlot} {mem : Memory} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {defPath : DefPath} {args : List RigidTy} {lIdx : LayoutIdx}
+    {l : TypeLayout} {spec : AdtLayoutSpec} {v i : Nat}
+    (hLayout : findDeclLayoutForRigidTy localDecls layouts (.adt defPath args) = some l)
+    (hAgree : TypeLayoutOffsetsAgreeEq l spec v)
+    (hFits : l.size.bytes ≤ Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) :
+    (∀ off, resolveAdtOffsetOf spec v i = some off → off ≤ l.size.bytes →
+      evalRvalue locals (.nullaryOp (.offsetOf [(v, i)]) ⟨.adt defPath args, lIdx⟩) mem
+          localDecls layouts =
+        .ok (.scalar ⟨off, layoutPointerBytes layouts⟩) locals mem) ∧
+    (resolveAdtOffsetOf spec v i = none →
+      evalRvalue locals (.nullaryOp (.offsetOf [(v, i)]) ⟨.adt defPath args, lIdx⟩) mem
+          localDecls layouts =
+        .unsupported) := by
+  refine ⟨fun off hOff hIn =>
+    evalRvalue_offsetOf_adt_eq_resolveAdtOffsetOf hLayout
+      (fun j o h => (hAgree j).trans h) hOff hFits hIn,
+    fun hNone => ?_⟩
+  have hSz : intrinsicRigidTyByteSize localDecls layouts (.adt defPath args) =
+      some l.size.bytes := by
+    simp only [intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, hLayout]
+  have hStep : layoutVariantFieldOffset? l v i = none := (hAgree i).trans hNone
+  rw [← evalNullaryOp_eq_trusted_evalRvalue]
+  unfold evalNullaryOp
+  simp only [hSz, hLayout, resolveOffsetOfPath, hStep]
+
+@[reducible]
+def offsetOfChildKind (kindOpt : Option RigidTy) (variantIdx fieldIdx : Nat) : Option RigidTy :=
+  match kindOpt, Nat.beq variantIdx 0 with
+  | .some (.tuple ks), true => get? ks fieldIdx
+  | _, _ => .none
+
+@[reducible]
+def offsetOfChildLayout (layouts : LayoutTable) (layoutOf : RigidTy → Option TypeLayout)
+    (kindOpt : Option RigidTy) (l : TypeLayout) (variantIdx fieldIdx : Nat) : Option TypeLayout :=
+  match l.variants, get? l.fieldLayouts fieldIdx with
+  | .single _, .some flIdx => LayoutTable.lookup layouts flIdx
+  | _, _ =>
+    match offsetOfChildKind kindOpt variantIdx fieldIdx with
+    | .some ck => layoutOf ck
+    | .none => .none
+
+/-- Multi-hop layout agreement between a root `(kindOpt, lOpt)` in `layouts` and a chain of
+nested `OffsetOfStep` projections (`resolveAdtOffsetOfChain`): at each hop `step :: rest`, the
+container layout `l` agrees two-sidedly with `step.spec` at `(step.variantIdx, step.fieldIdx)`,
+and when that hop succeeds, the child layout resolved by `resolveOffsetOfPath`
+(`l.fieldLayouts[step.fieldIdx]` for `VariantsShape.single _`) satisfies `TypeLayoutChainAgrees`
+on `rest`. -/
+inductive TypeLayoutChainAgrees (layouts : LayoutTable)
+    (layoutOf : RigidTy → Option TypeLayout) :
+    Option RigidTy → Option TypeLayout → List OffsetOfStep → Prop where
+  | nil (kindOpt : Option RigidTy) (lOpt : Option TypeLayout) :
+      TypeLayoutChainAgrees layouts layoutOf kindOpt lOpt []
+  | cons (kindOpt : Option RigidTy) (l : TypeLayout) (step : OffsetOfStep)
+      (rest : List OffsetOfStep)
+      (hStepEq : layoutVariantFieldOffset? l step.variantIdx step.fieldIdx =
+        resolveAdtOffsetOf step.spec step.variantIdx step.fieldIdx)
+      (hTail : ∀ off,
+        resolveAdtOffsetOf step.spec step.variantIdx step.fieldIdx = some off →
+        TypeLayoutChainAgrees layouts layoutOf
+          (offsetOfChildKind kindOpt step.variantIdx step.fieldIdx)
+          (offsetOfChildLayout layouts layoutOf kindOpt l step.variantIdx step.fieldIdx) rest) :
+      TypeLayoutChainAgrees layouts layoutOf kindOpt (some l) (step :: rest)
+
+/-- **Multi-hop `resolveOffsetOfPath` equals `resolveAdtOffsetOfChain`
+(`resolveOffsetOfPath_adtChain_eq_resolveAdtOffsetOfChain`)**: for any multi-hop ADT projection
+chain `chain : List OffsetOfStep` satisfying `TypeLayoutChainAgrees`, `Trusted`'s
+`resolveOffsetOfPath` equals `resolveAdtOffsetOfChain chain` (both `some totalOff` and `none`). -/
+theorem resolveOffsetOfPath_adtChain_eq_resolveAdtOffsetOfChain
+    {layouts : LayoutTable} {fieldByteSize fieldAlign : RigidTy → Option Nat}
+    {layoutOf : RigidTy → Option TypeLayout}
+    {kindOpt : Option RigidTy} {lOpt : Option TypeLayout} {chain : List OffsetOfStep}
+    (hChain : TypeLayoutChainAgrees layouts layoutOf kindOpt lOpt chain) :
+    resolveOffsetOfPath layouts fieldByteSize fieldAlign layoutOf kindOpt lOpt
+        (chain.map (fun s => (s.variantIdx, s.fieldIdx))) =
+      resolveAdtOffsetOfChain chain := by
+  induction hChain with
+  | nil kindOpt lOpt => rfl
+  | cons kindOpt l step rest hStepEq _ ih =>
+    simp only [List.map_cons]
+    unfold resolveOffsetOfPath resolveAdtOffsetOfChain
+    dsimp only
+    rw [hStepEq]
+    cases hOff : resolveAdtOffsetOf step.spec step.variantIdx step.fieldIdx with
+    | none => rfl
+    | some off =>
+      have hCongr :=
+        congrArg
+          (fun x : Option Nat =>
+            match x with
+            | some tailOff => some (Nat.add off tailOff)
+            | none => none)
+          (ih off hOff)
+      exact hCongr.trans (by cases resolveAdtOffsetOfChain rest <;> rfl)
+
+/-- **Multi-hop ADT `OffsetOf` chain bridges to Trusted's `evalRvalue` with `=`
+(`evalRvalue_offsetOf_adtChain_eq_resolveAdtOffsetOfChain`)**: for any well-formed multi-hop chain
+`OffsetOfChainWF (root :: rest) leaf` starting at an ADT with layout `l` (`l.size.bytes = rootSize ≤ isize::MAX`),
+Trusted's `evalRvalue` on `.nullaryOp (.offsetOf ((root :: rest).map ...))` evaluates to
+`.ok (.scalar ⟨totalOff, ptrBytes⟩) locals mem` when `resolveAdtOffsetOfChain (root :: rest) = some totalOff`
+(discharging `totalOff ≤ l.size.bytes` automatically from `resolveAdtOffsetOfChain_bounds_and_align`),
+and to `.unsupported` when `resolveAdtOffsetOfChain (root :: rest) = none`. -/
+theorem evalRvalue_offsetOf_adtChain_eq_resolveAdtOffsetOfChain
+    {locals : List LocalSlot} {mem : Memory} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {defPath : DefPath} {args : List RigidTy} {lIdx : LayoutIdx}
+    {l : TypeLayout} {root : OffsetOfStep} {rest : List OffsetOfStep} {leaf : FieldLayout}
+    (hLayout : findDeclLayoutForRigidTy localDecls layouts (.adt defPath args) = some l)
+    (hChainAgree : TypeLayoutChainAgrees layouts (findDeclLayoutForRigidTy localDecls layouts)
+      (some (.adt defPath args)) (some l) (root :: rest))
+    (hFits : l.size.bytes ≤ Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) :
+    let fields := (root :: rest).map (fun s => (s.variantIdx, s.fieldIdx))
+    (∀ totalOff rootAlign,
+      OffsetOfChainWF (root :: rest) leaf →
+      adtLayout? root.spec = some (l.size.bytes, rootAlign) →
+      resolveAdtOffsetOfChain (root :: rest) = some totalOff →
+      evalRvalue locals (.nullaryOp (.offsetOf fields) ⟨.adt defPath args, lIdx⟩) mem
+          localDecls layouts =
+        .ok (.scalar ⟨totalOff, layoutPointerBytes layouts⟩) locals mem) ∧
+    (resolveAdtOffsetOfChain (root :: rest) = none →
+      evalRvalue locals (.nullaryOp (.offsetOf fields) ⟨.adt defPath args, lIdx⟩) mem
+          localDecls layouts =
+        .unsupported) := by
+  intro fields
+  have hSz : intrinsicRigidTyByteSize localDecls layouts (.adt defPath args) =
+      some l.size.bytes := by
+    simp only [intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, hLayout]
+  have hPathEq := resolveOffsetOfPath_adtChain_eq_resolveAdtOffsetOfChain
+    (fieldByteSize := intrinsicRigidTyByteSize localDecls layouts)
+    (fieldAlign := intrinsicRigidTyAlign localDecls layouts) hChainAgree
+  refine ⟨fun totalOff rootAlign hWF hRootLay hRes => ?_, fun hNone => ?_⟩
+  · obtain ⟨rSz, rAl, hRL, hBound, _⟩ := resolveAdtOffsetOfChain_bounds_and_align hWF hRes
+    rw [hRootLay] at hRL
+    injection hRL with hEq
+    rcases hEq with ⟨rfl, _⟩
+    have hIn : totalOff ≤ l.size.bytes := by omega
+    rw [← evalNullaryOp_eq_trusted_evalRvalue]
+    unfold evalNullaryOp
+    simp only [fields, hSz, hLayout, hPathEq, hRes,
+      Nat.ble_eq.mpr hFits, Nat.ble_eq.mpr hIn, Bool.and_self]
+  · rw [← evalNullaryOp_eq_trusted_evalRvalue]
+    unfold evalNullaryOp
+    simp only [fields, hSz, hLayout, hPathEq, hNone]
+
 /-! ## Section 1c: Typed ADT `Discriminant` -/
 
 /-- Discriminant-relevant facts of a typed ADT (`AdtDef` in `ir.rs`): whether it is an enum,
@@ -11866,6 +12023,217 @@ theorem evalWrapUnsafeBinder_wrap_eq_evalRvalue {slots : List LocalSlotState}
     rw [hOpTy]
     dsimp only
     cases scalarValidRangeOk l v <;> simp [hDistinct]
+
+/-- **`ShallowInitBox` rejects wrong-width pointers and non-raw-pointer operand types
+(`evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported`)**:
+1. If `v = .ptr p sz` has a pointer width `sz ≠ layoutPointerBytes layouts`, Trusted's
+   `evalRvalue (.shallowInitBox (.copy place) contentTy)` fails closed with `.unsupported`.
+2. If `operandTy localDecls layouts (.copy place) = some opTy` is not a raw pointer
+   (`∀ m pt, opTy.kind ≠ .rawPtr m pt`), both Anneal's `evalShallowInitBox` (`operandTy = none`)
+   and Trusted's `evalRvalue (.shallowInitBox (.copy place) contentTy)` reject the operand. -/
+theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported {τ : Type}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {place : Place}
+    {v : Value} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRead : readPlaceState slots place = .ok v) (contentTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
+      simp [placeTouchesUnion_nil_proj]) :
+    (∀ p sz, v = .ptr p sz → sz ≠ layoutPointerBytes layouts →
+      evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
+        .unsupported) ∧
+    (∀ (opTy : Ty) (ptrBits : Nat) (inner : τ) (a : APtr),
+      operandTy localDecls layouts (.copy place) = some opTy →
+      (∀ m pt, opTy.kind ≠ .rawPtr m pt) →
+      evalShallowInitBox ptrBits (none : Option (RawPtrTy τ)) inner a = none ∧
+      evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
+        .unsupported) := by
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  refine ⟨?_, ?_⟩
+  · intro p sz hV hNe
+    subst hV
+    have hBeq : Nat.beq sz (layoutPointerBytes layouts) = false := by
+      cases h : Nat.beq sz (layoutPointerBytes layouts) with
+      | false => rfl
+      | true => exact absurd (Nat.eq_of_beq_eq_true h) hNe
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
+        mem localDecls layouts = .unsupported
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
+    rw [hUse]
+    dsimp only
+    cases operandTy localDecls layouts (.copy place) with
+    | none => dsimp only; rw [hBeq]
+    | some ty =>
+      rcases ty with ⟨k, idx⟩
+      cases k <;> (dsimp only; try rw [hBeq])
+  · intro opTy ptrBits inner a hOpTy hNotRaw
+    refine ⟨rfl, ?_⟩
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
+        mem localDecls layouts = .unsupported
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
+    rw [hUse, hOpTy]
+    rcases opTy with ⟨k, idx⟩
+    cases k with
+    | rawPtr m pt => exact absurd rfl (hNotRaw m pt)
+    | _ => rfl
+
+/-- **`*(ShallowInitBox(p, T))` dereference round-trip (`evalShallowInitBox_deref_read_roundtrip`)**:
+when `evalRvalue locals (.shallowInitBox (.copy srcPlace) contentTy) mem localDecls layouts`
+evaluates to `.ok boxVal locals mem` (from a raw-pointer place `srcPlace` holding `.ptr p sz`) and
+`boxVal` is stored at `boxLoc`, dereferencing `boxLoc` (`⟨boxLoc, .deref :: restProj⟩`) extracts
+the exact pointer `p` via `extractDerefPtrVal?` and reads the exact same pointee value in
+`evalPlaceRead` as dereferencing `boxLoc` initialized directly with `.ptr p sz`. -/
+theorem evalShallowInitBox_deref_read_roundtrip
+    {slots : List LocalSlotState} {locals : List LocalSlot}
+    {srcPlace : Place} {boxLoc : LocalIdx} {p : ProvenancePtr} {sz : Nat}
+    {contentTy : Ty} {mem : Memory} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {boxVal : Value} (restProj : List ProjectionElem)
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hRead : readPlaceState slots srcPlace = .ok (.ptr p sz))
+    (hValid : validateLoadedValue layouts localDecls (.copy srcPlace) (.ptr p sz) = true)
+    (hEval : evalRvalue locals (.shallowInitBox (.copy srcPlace) contentTy) mem localDecls layouts =
+      .ok boxVal locals mem)
+    (hNoUnion : placeTouchesUnion localDecls layouts srcPlace = false := by
+      simp [placeTouchesUnion_nil_proj]) :
+    boxVal = .ptr p sz ∧
+    extractDerefPtrVal? boxVal = some p ∧
+    evalPlaceRead (locals.set boxLoc (.init boxVal)) ⟨boxLoc, .deref :: restProj⟩
+        mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      evalPlaceRead (locals.set boxLoc (.init (.ptr p sz))) ⟨boxLoc, .deref :: restProj⟩
+        mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack := by
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  change Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy srcPlace)
+      contentTy mem localDecls layouts = .ok boxVal locals mem at hEval
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox at hEval
+  rw [hUse] at hEval
+  dsimp only at hEval
+  have hBoxEq : boxVal = .ptr p sz := by
+    cases hTy : operandTy localDecls layouts (.copy srcPlace) with
+    | none =>
+      rw [hTy] at hEval
+      dsimp only at hEval
+      cases hB : Nat.beq sz (layoutPointerBytes layouts) <;> rw [hB] at hEval
+      · nomatch hEval
+      · injection hEval with hEq _ _; exact hEq.symm
+    | some ty =>
+      rcases ty with ⟨k, idx⟩
+      rw [hTy] at hEval
+      cases k with
+      | rawPtr m pt =>
+        dsimp only at hEval
+        cases hB : Nat.beq sz (layoutPointerBytes layouts) <;> rw [hB] at hEval
+        · nomatch hEval
+        · injection hEval with hEq _ _; exact hEq.symm
+      | _ => dsimp only at hEval; nomatch hEval
+  subst hBoxEq
+  exact ⟨rfl, rfl, rfl⟩
+
+/-- **`WrapUnsafeBinder` two-sided niche agreement (`evalWrapUnsafeBinder_niche_iff_evalRvalue`)**:
+bridging Anneal's `ScalarValidRange.contains` to Trusted's `scalarValidRangeOk`
+(`wrappingRangeContains`) via `ScalarValidRange.contains_eq_wrappingRangeContains`: for a scalar
+`sc` (`sc.bits < 2 ^ bitWidth`) and a single-field binder struct `targetTy` whose layout `l` has
+`l.backendRepr = .scalar (.initialized pk ⟨r.start, r.end_⟩)`:
+1. `scalarValidRangeOk l (.scalar sc) = r.contains sc.bits bitWidth`;
+2. When `r.contains sc.bits bitWidth = true`, Anneal's `evalWrapUnsafeBinder wf true (some (r, bitWidth)) (.scalar sc)`
+   returns `some (.aggregate 0 [.scalar sc])` and Trusted's `evalRvalue (.wrapUnsafeBinder (.copy place) targetTy)`
+   returns `.ok (.aggregate 0 [.scalar sc]) locals mem`;
+3. When `r.contains sc.bits bitWidth = false` (niche violation, e.g. `0` for `NonZero`), Anneal's
+   `evalWrapUnsafeBinder` returns `none` and Trusted's `evalRvalue` returns `.ub`. -/
+theorem evalWrapUnsafeBinder_niche_iff_evalRvalue {slots : List LocalSlotState}
+    {locals : List LocalSlot} {place : Place} {sc : ScalarInt} {wf : Value → Bool}
+    {r : ScalarValidRange} {bitWidth : Nat} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRead : readPlaceState slots place = .ok (.scalar sc))
+    (hWf : wf (.scalar sc) = true)
+    (hLt : sc.bits < 2 ^ bitWidth)
+    {targetTy opTy : Ty} {mem : Memory} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {l : TypeLayout} {pk : PrimitiveKind}
+    (hValid : validateLoadedValue layouts localDecls (.copy place) (.scalar sc) = true)
+    (hBinder : binderStructLayout? localDecls layouts targetTy = some l)
+    (hRepr : l.backendRepr = .scalar (.initialized pk ⟨r.start, r.end_⟩))
+    (hOpTy : operandTy localDecls layouts (.copy place) = some opTy)
+    (hDistinct : rigidTyEq opTy.kind targetTy.kind = false)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
+      simp [placeTouchesUnion_nil_proj]) :
+    scalarValidRangeOk l (.scalar sc) = r.contains sc.bits bitWidth ∧
+    (r.contains sc.bits bitWidth = true →
+      evalWrapUnsafeBinder wf true (some (r, bitWidth)) (.scalar sc) =
+        some (.aggregate 0 [.scalar sc]) ∧
+      evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
+        .ok (.aggregate 0 [.scalar sc]) locals mem) ∧
+    (r.contains sc.bits bitWidth = false →
+      evalWrapUnsafeBinder wf true (some (r, bitWidth)) (.scalar sc) = none ∧
+      evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts = .ub) := by
+  have hRangeEq : scalarValidRangeOk l (.scalar sc) = r.contains sc.bits bitWidth := by
+    rw [ScalarValidRange.contains_eq_wrappingRangeContains r sc.bits bitWidth,
+      decide_eq_true hLt, Bool.true_and]
+    unfold scalarValidRangeOk ScalarValidRange.toWrappingRange
+    rw [hRepr]
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  have hEvalT :
+      evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
+        match r.contains sc.bits bitWidth with
+        | true => .ok (.aggregate 0 [.scalar sc]) locals mem
+        | false => .ub := by
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place) targetTy
+        mem localDecls layouts = _
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
+    rw [hUse, hBinder]
+    dsimp only
+    rw [hOpTy]
+    dsimp only
+    rw [hRangeEq]
+    cases r.contains sc.bits bitWidth <;> simp [hDistinct]
+  refine ⟨hRangeEq, fun hIn => ?_, fun hOut => ?_⟩
+  · refine ⟨?_, by rw [hEvalT, hIn]⟩
+    unfold evalWrapUnsafeBinder
+    simp [hWf, hIn]
+  · exact ⟨evalWrapUnsafeBinder_rejects_niche hOut, by rw [hEvalT, hOut]⟩
+
+/-- **`WrapUnsafeBinder` same-ADT identity & `unwrapUnsafeBinder` round-trip inverse
+(`evalWrapUnsafeBinder_sameAdt_identity_and_unwrap_roundtrip`)**:
+1. When `targetTy` is a single-field binder struct (`binderStructLayout? = some l`) and the
+   operand already has that struct type (`rigidTyEq opTy.kind targetTy.kind = true`), Anneal's
+   identity `evalWrapUnsafeBinder wf false range? v = some v` agrees with Trusted's `evalRvalue`
+   returning `.ok v locals mem` (when `scalarValidRangeOk l v = true`) or `.ub` (when `false`).
+2. `ProjectionElem.unwrapUnsafeBinder` is the exact left-inverse of transparent `WrapUnsafeBinder`
+   in `readProjectedValue` and `writeProjectedValue`, while `.field 0` is the exact left-inverse of
+   struct-wrapping `WrapUnsafeBinder`. -/
+theorem evalWrapUnsafeBinder_sameAdt_identity_and_unwrap_roundtrip {slots : List LocalSlotState}
+    {locals : List LocalSlot} {place : Place} {v out newVal : Value} {wf : Value → Bool}
+    {range? : Option (ScalarValidRange × Nat)} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRead : readPlaceState slots place = .ok v)
+    (h : evalWrapUnsafeBinder wf false range? v = some out)
+    (targetTy innerTy : Ty) (rest : List ProjectionElem) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) {l : TypeLayout} {opTy : Ty}
+    (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
+    (hBinder : binderStructLayout? localDecls layouts targetTy = some l)
+    (hOpTy : operandTy localDecls layouts (.copy place) = some opTy)
+    (hSame : rigidTyEq opTy.kind targetTy.kind = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
+      simp [placeTouchesUnion_nil_proj]) :
+    out = v ∧
+    evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
+      (match scalarValidRangeOk l v with
+       | true => .ok out locals mem
+       | false => .ub) ∧
+    readProjectedValue locals out (.unwrapUnsafeBinder innerTy :: rest) =
+      readProjectedValue locals out rest ∧
+    writeProjectedValue locals out (.unwrapUnsafeBinder innerTy :: rest) newVal =
+      writeProjectedValue locals out rest newVal ∧
+    readProjectedValue locals (.aggregate 0 [out]) [.field 0 innerTy] = .ok out := by
+  obtain ⟨_, hCase⟩ := evalWrapUnsafeBinder_preserves h locals targetTy
+  rcases hCase with ⟨_, rfl⟩ | ⟨hW, _⟩
+  · refine ⟨rfl, ?_, rfl, rfl, rfl⟩
+    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place) targetTy
+        mem localDecls layouts = _
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
+    rw [hUse, hBinder]
+    dsimp only
+    rw [hOpTy]
+    dsimp only
+    cases scalarValidRangeOk l out <;> simp [hSame]
+  · nomatch hW
 
 /-! ## Section 3: Multi-block terminator CFG execution -/
 
@@ -23184,6 +23552,15 @@ theorem repeatByteBits_lt_pow (byte n : Nat) : repeatByteBits byte n < 2 ^ (8 * 
     rw [repeatByteBits, hPow]
     omega
 
+/-- Anneal's `repeatByteBits` is identically `Trusted`'s `writeBytesFillBits`
+(`Terminators.lean`). -/
+theorem repeatByteBits_eq_writeBytesFillBits (byte : Nat) :
+    ∀ n : Nat, repeatByteBits byte n = writeBytesFillBits byte n
+  | 0 => rfl
+  | n + 1 => by
+    simp only [repeatByteBits, writeBytesFillBits, repeatByteBits_eq_writeBytesFillBits byte n]
+    rfl
+
 /-- Precondition checks for `write_bytes(dst, val, count)` (`rvalue.rs` / `intrinsic.rs`):
 non-null aligned destination pointer within `ptrBits`, `val < 256`, byte count fitting in
 `isize::MAX`, and non-wrapping `[dst.addr, dst.addr + count * elemSize)`. -/
@@ -26508,6 +26885,177 @@ theorem evalTerminator_call_writeBytes_eq {s : MachineState} {cm : CapturedMir}
   simp only [evalTerminator, bodyLocalDeclsOf, hResTgt, hArgs, hNoCallee, isDirectExactDivTarget,
     hNotEx, evalDirectRustIntrinsic?, hKind]
 
+/-- **Corner-case characterization of `writeBytesAction` and `evalWriteBytesCall`
+(`writeBytesAction_and_call_corner_cases`)**:
+for a direct `write_bytes::<T>(dst, val, count)` call with a thin pointer `dst` of the target
+width (`ptrBytes`), `val < 256` (`sizeBytes = 1`), `count` (`sizeBytes = ptrBytes`), and resolved
+element layout `(elemSize, elemAlign)`:
+1. **`count * elemSize > isize::MAX` overflow**: returns `.fault .ub` / `MirStepNode.fail .ub`.
+2. **Read-only or disabled Tree Borrows tag (`.frozen` / `.disabled`)**: returns `.fault .ub` /
+   `MirStepNode.fail .ub`.
+3. **Misaligned destination pointer (`dstPtr.offsetBytes % elemAlign ≠ 0`, even when `count = 0` or
+   `elemSize = 0`)**: returns `.fault .ub` / `MirStepNode.fail .ub`.
+4. **Aligned zero-byte write (`count * elemSize = 0`, i.e. `count = 0` or ZST `elemSize = 0`)**:
+   returns `.noWrite` and writes `()` to `destination` at `targetBb` with memory unchanged, matching
+   `evalWriteBytesSubplace_zero_count`.
+5. **Single-element scalar store (`count = 1`, `elemSize > 0`, `dstPtr.offsetBytes = 0`,
+   `rigidTyEq dstPlaceTy.kind elemTy = true`, `isPrimitiveScalarKind elemTy = true`)**: returns
+   `.store dstPlace dstEntry.targetLocal dstPtr.tag (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩)`,
+   matching `evalWriteBytesSubplace`'s `repeatByteBits` payload. -/
+theorem writeBytesAction_and_call_corner_cases
+    (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (defPath : DefPath) (elemTy : RigidTy) (argOps : List Operand)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (dstPtr : ProvenancePtr) (valBits count elemSize elemAlign : Nat)
+    (hValLt : valBits < 256)
+    (hElemSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy = some elemSize)
+    (hElemAl : intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy = some elemAlign) :
+    let ptrBytes := layoutPointerBytes bodyLayouts
+    let maxObjSize := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
+    let target : ResolvedCallTarget :=
+      { defPath := defPath, typeArgs := [elemTy], isIndirect := false }
+    let argVals : List Value :=
+      [.ptr dstPtr ptrBytes, .scalar ⟨valBits, 1⟩, .scalar ⟨count, ptrBytes⟩]
+    -- (1) Overflow count * elemSize > isize::MAX -> .fault .ub
+    (Nat.ble (Nat.mul count elemSize) maxObjSize = false →
+      writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+          bodyLayouts argOps argVals = .fault .ub ∧
+      evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.fail .ub) ∧
+    -- (2) Frozen or disabled Tree Borrows tag -> .fault .ub
+    (∀ dstEntry,
+      Nat.ble (Nat.mul count elemSize) maxObjSize = true →
+      lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry →
+      (dstEntry.perm = .frozen ∨ dstEntry.perm = .disabled) →
+      writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+          bodyLayouts argOps argVals = .fault .ub ∧
+      evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.fail .ub) ∧
+    -- (3)-(5) Active writable borrow with aligned place
+    (∀ dstEntry dstPlaceTy placeAlign,
+      Nat.ble (Nat.mul count elemSize) maxObjSize = true →
+      lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry →
+      dstEntry.perm ≠ .frozen →
+      dstEntry.perm ≠ .disabled →
+      Nat.beq dstEntry.targetFrameDepth (length s.memory.callStack) = true →
+      placeTyResolved bodyLocalDecls bodyLayouts
+        ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ = some dstPlaceTy →
+      intrinsicRigidTyAlign bodyLocalDecls bodyLayouts dstPlaceTy.kind = some placeAlign →
+      Bool.not (Nat.beq elemAlign 0) = true →
+      Nat.beq (Nat.mod placeAlign elemAlign) 0 = true →
+      -- (3) Misaligned pointer -> .fault .ub (even when count * elemSize = 0)
+      (Nat.beq (Nat.mod dstPtr.offsetBytes elemAlign) 0 = false →
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals = .fault .ub ∧
+        evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+            destination targetBb = MirStepNode.fail .ub) ∧
+      -- (4) Aligned zero-byte write (count = 0 or ZST) -> .noWrite
+      (Nat.beq (Nat.mod dstPtr.offsetBytes elemAlign) 0 = true →
+        Nat.beq (Nat.mul count elemSize) 0 = true →
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals = .noWrite ∧
+        evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+            destination targetBb = writeIntrinsicReturn s locals' destination targetBb .unit) ∧
+      -- (5) Aligned single-element primitive scalar store -> .store with repeatByteBits
+      (count = 1 →
+        Nat.beq elemSize 0 = false →
+        dstPtr.offsetBytes = 0 →
+        dstEntry.targetProjection ≠ [] →
+        rigidTyEq dstPlaceTy.kind elemTy = true →
+        isPrimitiveScalarKind elemTy = true →
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals =
+          .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
+            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩))) := by
+  intro ptrBytes maxObjSize target argVals
+  have hValBlt : Nat.blt valBits 256 = true := Nat.blt_eq.mpr hValLt
+  have hPtrBeq : Nat.beq ptrBytes ptrBytes = true := Nat.beq_refl ptrBytes
+  refine ⟨?_, ?_, ?_⟩
+  · intro hOv
+    dsimp only [maxObjSize, ptrBytes] at hOv
+    have hAct :
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals = .fault .ub := by
+      unfold writeBytesAction
+      dsimp only [target, argVals, ptrBytes]
+      rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+      dsimp only
+      rw [hOv]
+      rfl
+    exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
+  · intro dstEntry hBle hLk hPerm
+    dsimp only [maxObjSize, ptrBytes] at hBle
+    have hAct :
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals = .fault .ub := by
+      unfold writeBytesAction
+      dsimp only [target, argVals, ptrBytes]
+      rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+      dsimp only
+      rw [hBle, hLk]
+      dsimp only
+      rcases hPerm with hP | hP <;> (rw [hP]; rfl)
+    exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
+  · intro dstEntry dstPlaceTy placeAlign hBle hLk hNotFrz hNotDis hDepth hPlaceTy hPlaceAl hAlNz hAlDiv
+    dsimp only [maxObjSize, ptrBytes] at hBle
+    refine ⟨?_, ?_, ?_⟩
+    · intro hMis
+      have hAct :
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals = .fault .ub := by
+        unfold writeBytesAction
+        dsimp only [target, argVals, ptrBytes]
+        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+        dsimp only
+        rw [hBle, hLk]
+        dsimp only
+        rw [hDepth, hPlaceTy]
+        dsimp only
+        rw [hPlaceAl]
+        dsimp only
+        rw [hAlNz, hAlDiv, hMis]
+        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+      exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
+    · intro hAligned hZero
+      have hAct :
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals = .noWrite := by
+        unfold writeBytesAction
+        dsimp only [target, argVals, ptrBytes]
+        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+        dsimp only
+        rw [hBle, hLk]
+        dsimp only
+        rw [hDepth, hPlaceTy]
+        dsimp only
+        rw [hPlaceAl]
+        dsimp only
+        rw [hAlNz, hAlDiv, hAligned, hZero]
+        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+      exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
+    · intro hCnt1 hSzNz hOff0 hProjNe hTyEq hPrim
+      subst hCnt1
+      have hMul1 : Nat.mul 1 elemSize = elemSize := Nat.one_mul elemSize
+      have hMod0 : Nat.beq (Nat.mod 0 elemAlign) 0 = true := by
+        show Nat.beq (0 % elemAlign) 0 = true
+        rw [Nat.zero_mod]; rfl
+      cases hProj : dstEntry.targetProjection with
+      | nil => exact absurd hProj hProjNe
+      | cons hd tl =>
+        rw [repeatByteBits_eq_writeBytesFillBits]
+        unfold writeBytesAction
+        dsimp only [target, argVals, ptrBytes]
+        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+        dsimp only
+        rw [hBle, hLk]
+        dsimp only
+        rw [hDepth, hPlaceTy]
+        dsimp only
+        rw [hPlaceAl]
+        dsimp only
+        rw [hAlNz, hAlDiv, hOff0, hMod0, hMul1, hSzNz, hProj, hTyEq, hPrim]
+        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+
 /-- **Smart constructor (`LTerminator.refinable_call_of_lowerIntrinsicKind`)**: a direct call of
 any `DefPath` that `lowerIntrinsicKind_V2026_06_01` lowers to an intrinsic, with
 non-`Deref` arguments and a non-`Deref` destination (`projectionHasDeref dest.projection = false`,
@@ -27561,6 +28109,83 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
         hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
 
+/-- **Target-presence boundary for call-form memory intrinsics
+(`evalLoweredTerminator_call_memIntrinsic_without_target_extCall`)**:
+a hand-built diverging (`target = none`) direct call to `core::intrinsics::copy_nonoverlapping` or
+`core::intrinsics::write_bytes` is rejected fail-closed (`= none`) by `evalLoweredTerminator` for
+**every** `env.memIntrinsic` callback, while `Trusted`'s `evalTerminator` dispatches memory
+intrinsics inline only on `target = some _` calls and falls through to `MirStepNode.extCall` with
+`resumeExternalDivergingCall`. -/
+theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
+    {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx} {op : LIntrinsicOp}
+    {args : List Operand} {avs : List Value} {dest : Place} {destTy : Ty} {u : UnwindAction}
+    (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+      args dest destTy none u)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hSupp : trustedSupportsIntrinsicDefPath defPath op)
+    (hMem : op = .copyNonOverlapping ∨ op = .writeBytes)
+    (hLayouts : cm.layouts = env.layouts)
+    (hSlots : SlotsRefine SlotBelow slots s.frame.locals)
+    (hGlobals : s.memory.globals = env.globals)
+    (hNoCallee :
+      lookupCallee s.memory.callees env.layouts defPath typeArgs s.memory.traitImpls = none)
+    (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
+    (hArgsEval : evalOperandsState env.layouts env.globals slots args = some (avs, slotsAfterArgs))
+    (span : String) :
+    evalLoweredTerminator env body bb slots unwinding = none ∧
+      ∃ locals2,
+        evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
+            s.memory.callerLocals = .ok avs locals2 ∧
+          evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
+            .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
+              (resumeExternalDivergingCall s locals2 u) := by
+  have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
+    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
+  have hNotDiv : op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind := by
+    rcases hMem with rfl | rfl <;> exact ⟨by decide, by decide, by decide⟩
+  obtain ⟨hNotUnr, hNotAb, hNotPan⟩ := valueIntrinsic_not_trustedDiverging hLower hNotDiv
+  refine ⟨?_, ?_⟩
+  · unfold evalLoweredTerminator
+    rw [hb]
+    simp only [hT]
+    split
+    · rfl
+    · unfold evalLoweredCall evalLoweredCallTargetDispatch
+      simp only [evalOperandState, evalConstValue]
+      split
+      · rfl
+      · rw [hArgsEval]
+        dsimp only
+        split
+        · rfl
+        · split
+          · rfl
+          · rw [hCallTgt]
+            simp only [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+              extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower]
+            rcases hMem with rfl | rfl <;>
+              (unfold evalLoweredIntrinsicCall; dsimp only; split <;> cases env.memIntrinsic <;> rfl)
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots
+      slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
+      s.memory.callerLocals hSlots hArgsND hArgsEval
+    have hTOpsCS :
+        evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
+            s.memory.callerLocals [] s.memory.callStack = .ok avs locals2 :=
+      (evalOperands_eq_nil_callStack_of_nonDeref _ _ _ _ _ _ _ s.memory.callStack hArgsND).trans
+        hTOps
+    have hResTgt :
+        ∀ (decls : List LocalDecl) (lays : LayoutTable),
+          resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+            (length args) decls lays =
+            .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+      fun _ _ => rfl
+    exact ⟨locals2, hTOps, by
+      simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+
 /-! #### 5g.2: `three_way_compare` `Ordering` ADT Encoding (`orderingVariant?`, `intrinsic.rs:108-136`) -/
 
 /-- Two's-complement sign-extension of an 8-bit discriminant bit pattern (`sign_extend_bits(bits, 8)`
@@ -27963,6 +28588,63 @@ theorem witness_cfg_call_writeBytes_and_copyNonOverlapping_subplace :
     unfold runLoweredCfgSteps
     rw [hB2]; dsimp only; rw [hStmts]; dsimp only; rw [hStep2]
   exact ⟨hStep0, hRun2, hRun3, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- **Positive Tracked-Tree-Borrows Execution of Call-Form `write_bytes` & `copy_nonoverlapping` in
+`Trusted.evalTerminator` (`witness_trusted_call_writeBytes_and_copyNonOverlapping_subplace_ok`)**:
+when the three sub-place pointers in `witnessCallMemBody` (`_3 -> _1.1`, `_4 -> _2.0`, `_5 -> _1.0`)
+carry active-frame Tree Borrows tags (`tag = 1, 2, 3`) at offset `0`:
+1. `Trusted.evalTerminator` on `bb0` (`core::intrinsics::write_bytes::<u32>(_3, 0xAB, 1)`) steps
+   to `bb1` with `_1 = .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨0xABABABAB, 4⟩])` and
+   `_0 = .init .unit` (while `_5`'s `.reservedIM` reservation on `_1.0` survives the foreign write);
+2. `Trusted.evalTerminator` on `bb1` (`core::intrinsics::copy_nonoverlapping::<u32>(_4, _5, 1)`)
+   steps to `bb2` with `_1 = .init (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .scalar ⟨0xABABABAB, 4⟩])`
+   and `_0 = .init .unit`, activating `_5`'s tag (`tag = 3`) to `.active`, matching Anneal's
+   `afterWbSlots` and `afterCopySlots` in
+   `witness_cfg_call_writeBytes_and_copyNonOverlapping_subplace` value-for-value! -/
+theorem witness_trusted_call_writeBytes_and_copyNonOverlapping_subplace_ok :
+    let borrows0 : List BorrowEntry :=
+      [ { tag := 1, targetLocal := 1, targetProjection := [.field 1 ep2TyU32], perm := .active }
+      , { tag := 2, targetLocal := 2, targetProjection := [.field 0 ep2TyU32], perm := .frozen }
+      , { tag := 3, targetLocal := 1, targetProjection := [.field 0 ep2TyU32], perm := .reservedIM } ]
+    let borrowsAfterCopy : List BorrowEntry :=
+      [ { tag := 1, targetLocal := 1, targetProjection := [.field 1 ep2TyU32], perm := .disabled }
+      , { tag := 2, targetLocal := 2, targetProjection := [.field 0 ep2TyU32], perm := .frozen }
+      , { tag := 3, targetLocal := 1, targetProjection := [.field 0 ep2TyU32], perm := .active } ]
+    let locals0 : List LocalSlot :=
+      [ .uninit
+      , .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩])
+      , .init (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .scalar ⟨0x55667788, 4⟩])
+      , .init (.ptr { allocId := 1, offsetBytes := 0 } 8)
+      , .init (.ptr { allocId := 2, offsetBytes := 0 } 8)
+      , .init (.ptr { allocId := 3, offsetBytes := 0 } 8) ]
+    let localsAfterWb : List LocalSlot :=
+      [ .init .unit
+      , .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨0xABABABAB, 4⟩])
+      , .init (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .scalar ⟨0x55667788, 4⟩])
+      , .init (.ptr { allocId := 1, offsetBytes := 0 } 8)
+      , .init (.ptr { allocId := 2, offsetBytes := 0 } 8)
+      , .init (.ptr { allocId := 3, offsetBytes := 0 } 8) ]
+    let localsAfterCopy : List LocalSlot :=
+      [ .init .unit
+      , .init (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .scalar ⟨0xABABABAB, 4⟩])
+      , .init (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .scalar ⟨0x55667788, 4⟩])
+      , .init (.ptr { allocId := 1, offsetBytes := 0 } 8)
+      , .init (.ptr { allocId := 2, offsetBytes := 0 } 8)
+      , .init (.ptr { allocId := 3, offsetBytes := 0 } 8) ]
+    let sTracked0 : MachineState :=
+      { frame := ⟨0, 0, locals0⟩
+        memory := { emptyMemory with borrows := borrows0 } }
+    let sTracked1 : MachineState :=
+      { frame := ⟨1, 0, localsAfterWb⟩
+        memory := { emptyMemory with borrows := borrows0 } }
+    let sTracked2 : MachineState :=
+      { frame := ⟨2, 0, localsAfterCopy⟩
+        memory := { emptyMemory with borrows := borrowsAfterCopy } }
+    evalTerminator sTracked0 ⟨(witnessCallMemBody.blocks[0]!.terminator).toTrusted, ""⟩
+        (some witnessCallMemCm) = MirStepNode.step sTracked1 ∧
+    evalTerminator sTracked1 ⟨(witnessCallMemBody.blocks[1]!.terminator).toTrusted, ""⟩
+        (some witnessCallMemCm) = MirStepNode.step sTracked2 := by
+  exact ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
 /-! #### 5g.4: Witness Suite 7 (`witness_projected_and_partialShell_call_destinations`) -/
 

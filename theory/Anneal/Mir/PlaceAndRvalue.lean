@@ -5370,6 +5370,115 @@ theorem evalRvalue_offsetOf_eq_resolveTupleOffsetOf
     (fun _ => rfl)]
   rfl
 
+/-- **Fail-closed `isize::MAX` overflow, invalid alignment, and out-of-bounds `NullaryOp`
+(`evalRvalue_nullaryOp_overflow_and_invalid_eq_unsupported`)**:
+`Trusted`'s `evalRvalue` on `Rvalue.nullaryOp` fails closed with `.unsupported` whenever:
+1. `intrinsicRigidTyByteSize` resolves to a byte size `sz > isize::MAX` (on `.sizeOf`, `.alignOf`,
+   or `.offsetOf fields`);
+2. `.alignOf` resolves to a non-power-of-two alignment or an alignment `≥ 2^(8 * ptrBytes)`;
+3. `.offsetOf fields` resolves to `none` or an offset `> sz`;
+4. `.ubChecks` is evaluated at a non-`bool` type, or `.contractChecks` is evaluated. -/
+theorem evalRvalue_nullaryOp_overflow_and_invalid_eq_unsupported
+    (locals : List LocalSlot)
+    (argTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (fields : List (VariantIdx × FieldIdx)) :
+    let maxObjSize := Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1
+    -- (1) size > isize::MAX on sizeOf / alignOf / offsetOf
+    (∀ sz, intrinsicRigidTyByteSize localDecls layouts argTy.kind = some sz →
+      Nat.ble sz maxObjSize = false →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+          locals (.nullaryOp .sizeOf argTy) mem localDecls layouts = .unsupported ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+          locals (.nullaryOp .alignOf argTy) mem localDecls layouts = .unsupported ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+          locals (.nullaryOp (.offsetOf fields) argTy) mem localDecls layouts = .unsupported) ∧
+    -- (2) non-power-of-two or overflowing alignOf
+    (∀ sz align,
+      intrinsicRigidTyByteSize localDecls layouts argTy.kind = some sz →
+      intrinsicRigidTyAlign localDecls layouts argTy.kind = some align →
+      (Align.isPowerOfTwoBytes ⟨align⟩ = false ∨
+        Nat.blt align (scalarModulus (layoutPointerBytes layouts)) = false) →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+          locals (.nullaryOp .alignOf argTy) mem localDecls layouts = .unsupported) ∧
+    -- (3) offset > sz on offsetOf
+    (∀ sz offset,
+      intrinsicRigidTyByteSize localDecls layouts argTy.kind = some sz →
+      resolveOffsetOfPath layouts (intrinsicRigidTyByteSize localDecls layouts)
+        (intrinsicRigidTyAlign localDecls layouts) (findDeclLayoutForRigidTy localDecls layouts)
+        (some argTy.kind) (findDeclLayoutForRigidTy localDecls layouts argTy.kind) fields =
+          some offset →
+      Nat.ble offset sz = false →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+          locals (.nullaryOp (.offsetOf fields) argTy) mem localDecls layouts = .unsupported) ∧
+    -- (4) contractChecks and non-bool ubChecks
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        locals (.nullaryOp .contractChecks argTy) mem localDecls layouts = .unsupported ∧
+    (argTy.kind ≠ .bool →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+          locals (.nullaryOp .ubChecks argTy) mem localDecls layouts = .unsupported) := by
+  intro maxObjSize
+  refine ⟨?_, ?_, ?_, rfl, ?_⟩
+  · intro sz hSz hBle
+    dsimp only [maxObjSize] at hBle
+    refine ⟨?_, ?_, ?_⟩
+    · show evalNullaryOp locals .sizeOf argTy mem localDecls layouts = .unsupported
+      unfold evalNullaryOp
+      dsimp only
+      rw [hSz]
+      dsimp only
+      rw [hBle]
+    · show evalNullaryOp locals .alignOf argTy mem localDecls layouts = .unsupported
+      unfold evalNullaryOp
+      dsimp only
+      rw [hSz]
+      cases intrinsicRigidTyAlign localDecls layouts argTy.kind with
+      | none => rfl
+      | some align =>
+        dsimp only
+        rw [hBle]
+        rfl
+    · show evalNullaryOp locals (.offsetOf fields) argTy mem localDecls layouts = .unsupported
+      unfold evalNullaryOp
+      dsimp only
+      rw [hSz]
+      dsimp only
+      cases resolveOffsetOfPath layouts (intrinsicRigidTyByteSize localDecls layouts)
+          (intrinsicRigidTyAlign localDecls layouts) (findDeclLayoutForRigidTy localDecls layouts)
+          (some argTy.kind) (findDeclLayoutForRigidTy localDecls layouts argTy.kind) fields with
+      | none => rfl
+      | some offset =>
+        dsimp only
+        rw [hBle]
+        rfl
+  · intro sz align hSz hAl hBad
+    show evalNullaryOp locals .alignOf argTy mem localDecls layouts = .unsupported
+    unfold evalNullaryOp
+    dsimp only
+    rw [hSz, hAl]
+    dsimp only
+    rcases hBad with hPow | hLt
+    · rw [hPow]; cases Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) <;> rfl
+    · rw [hLt]; cases Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) <;>
+        cases Align.isPowerOfTwoBytes ⟨align⟩ <;> rfl
+  · intro sz offset hSz hOff hBle
+    show evalNullaryOp locals (.offsetOf fields) argTy mem localDecls layouts = .unsupported
+    unfold evalNullaryOp
+    dsimp only
+    rw [hSz]
+    dsimp only
+    rw [hOff]
+    dsimp only
+    rw [hBle]
+    cases Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) <;> rfl
+  · intro hNe
+    show evalNullaryOp locals .ubChecks argTy mem localDecls layouts = .unsupported
+    unfold evalNullaryOp
+    dsimp only
+    cases hK : argTy.kind <;> first | rfl | exact absurd hK hNe
+
 /-- Regression (`rustc 1.98`: `offset_of!((u32, u16, u16), 2) = 6` and
 `offset_of!((u8, u32), 1) = 4`): without compiler layouts `Trusted`'s `evalRvalue` answers the
 canonical tuple query and fails closed on the padded tuple instead of returning the prefix sum

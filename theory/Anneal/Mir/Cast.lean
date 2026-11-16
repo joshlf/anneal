@@ -4512,6 +4512,30 @@ theorem trusted_tyByteSize_adt_primitive_zero_idx_none
   rw [hRes0]
   simp only [hLookup, hInvalid, findArrayElemStrideAndAlign?]
 
+/-- Even at a resolved non-zero layout index (`idx ≠ 0`), `Trusted` refuses to size an
+**uninhabited** (`l.isUninhabited = true`) non-zero-sized single-variant `.primitive` ADT layout
+(`layoutValidForResolvedAdt idx l = false`), failing closed when no array/slice declaration in
+`localDecls` supplies an element stride. -/
+theorem trusted_tyByteSize_adt_primitive_uninhabited_none
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (defPath : DefPath)
+    (args : List RigidTy) (idx : Nat) (l : TypeLayout) (variantIdx : Nat)
+    (h0 : idx ≠ 0) (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hUninhab : l.isUninhabited = true)
+    (hVar : l.variants = .single variantIdx) (hFields : l.fields = .primitive)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none) :
+    tyByteSize localDecls layouts { kind := .adt defPath args, layoutIdx := idx } = none := by
+  have hBeq0 : Nat.beq idx 0 = false := by
+    cases h : Nat.beq idx 0 with
+    | false => rfl
+    | true => exact absurd (Nat.eq_of_beq_eq_true h) h0
+  have hInvalid : layoutValidForResolvedAdt idx l = false := by
+    unfold layoutValidForResolvedAdt layoutValidForAdt
+    rw [hFields, hVar, hNz, hBeq0, hUninhab]
+  unfold tyByteSize tyByteSizeAndAlignAux
+  rw [trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts _ l h0 hLookup]
+  simp only [hLookup, hInvalid, hNoArr]
+
 /-- `Trusted.MirSemantics.evalByteCast` is `.unsupported` whenever the resolved target type has no
 `tyByteSize`. -/
 theorem trusted_evalByteCast_dst_size_none
@@ -12509,6 +12533,274 @@ theorem evalByteCast_adt_multiple_enum_to_scalar_ok
     memoryOrder varMemOrder m pointee dst hDstInt hVarLt hInRange hSrcLIdx hLookup hInhab hVar
     hFields hLSz hWidth hGetVar (by simp [resolveEnumDiscriminantForVariant, hNoDiscr])
     (by simp [resolveEnumVariantIdxByTag, hNoDiscr]) hOp hTy).1
+
+/--
+**Uninhabited single-variant `.primitive` wrapper ADTs fail closed (`evalByteCast_adt_primitive_uninhabited_unsupported`).**
+Contrasting with inhabited `.primitive` wrappers (`tryTransmute_adt_primitive_scalarLayout_eq` and
+`evalByteCast_adt_primitive_to_scalar_ok`), when a single-variant `.primitive` ADT layout at a
+resolved non-zero `dstLIdx ≠ 0` is uninhabited (`l.isUninhabited = true`, `Nat.beq l.size.bytes 0 = false`):
+1. `decodeValueFromBytes` at `dstTy` returns `none` for every byte sequence `bs`;
+2. `evalByteCast` into `dstTy` fails closed with `.unsupported` (when `findArrayElemStrideAndAlign? = none`).
+-/
+theorem evalByteCast_adt_primitive_uninhabited_unsupported
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (defPath : DefPath) (args : List RigidTy) (dstLIdx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (v : Value) (bs : List AbstractByte)
+    (hDstLIdx : dstLIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
+    (hUninhab : l.isUninhabited = true)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .primitive)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hNoArr : findArrayElemStrideAndAlign? layouts localDecls (.adt defPath args) = none)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok v locals') :
+    let dstTy : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
+    decodeValueFromBytes defaultCodecFuel layouts dstTy bs = none ∧
+    evalByteCast locals op dstTy mem localDecls layouts = .unsupported := by
+  intro dstTy
+  refine ⟨?_, ?_⟩
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [dstTy]
+    rw [hLookup]
+    dsimp only
+    rw [hUninhab]
+    rfl
+  · exact trusted_evalByteCast_dst_size_none locals locals' op mem localDecls layouts v dstTy hOp
+      (by rw [trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts dstTy l hDstLIdx hLookup]
+          exact trusted_tyByteSize_adt_primitive_uninhabited_none localDecls layouts defPath args
+            dstLIdx l variantIdx hDstLIdx hLookup hUninhab hVar hFields hNz hNoArr)
+
+/--
+**Container-projected single-variant `.primitive` wrapper ADT transmute (`evalByteCast_projected_adt_primitive_to_scalar_ok`).**
+When `op` projects a field of an inhabited single-variant `.primitive` wrapper ADT whose AST
+`operandTy` carries the unresolved `layoutIdx = 0` (`srcTy0 = { kind := .adt defPath args, layoutIdx := 0 }`)
+and `localDecls` lacks any synthetic root local of the wrapper ADT (`tyByteSize` on `resolveTyWithLocalDecls ... srcTy0`
+is `none`), `resolveByteCastSrcTyAndSize` falls back to `operandTyResolved` (which resolves the
+field's layout index `srcLIdx ≠ 0` from the parent container's `fieldLayouts`) and `evalByteCast` /
+`evalRvalue (.cast .transmute op dstTy)` succeeds!
+-/
+theorem evalByteCast_projected_adt_primitive_to_scalar_ok
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (defPath : DefPath) (args : List RigidTy) (srcLIdx dstLIdx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bits : Nat)
+    (m : Mutability) (pointee : RigidTy) (dst : ScalarTy)
+    (hDstInt : dst.isIntegral = true)
+    (hBits : bits < scalarModulus (dst.sizeBytes .bits64))
+    (hSrcLIdx : srcLIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts srcLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .primitive)
+    (hLSz : l.size.bytes = dst.sizeBytes .bits64)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      .ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals')
+    (hTy0 : operandTy localDecls layouts op =
+      some { kind := .adt defPath args, layoutIdx := 0 })
+    (hUnres0 : tyByteSize localDecls layouts
+      (resolveTyWithLocalDecls localDecls layouts { kind := .adt defPath args, layoutIdx := 0 }) = none)
+    (hTyRes : operandTyResolved localDecls layouts op =
+      some { kind := .adt defPath args, layoutIdx := srcLIdx }) :
+    let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
+    resolveByteCastSrcTyAndSize localDecls layouts op { kind := .adt defPath args, layoutIdx := 0 } =
+      some ({ kind := .adt defPath args, layoutIdx := srcLIdx }, dst.sizeBytes .bits64) ∧
+    evalByteCast locals op dstTy mem localDecls layouts =
+      ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem ∧
+    evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem := by
+  intro dstTy
+  let srcTy : Ty := { kind := .adt defPath args, layoutIdx := srcLIdx }
+  have hDstNp : dst.isPtr = false := ScalarTy.isPtr_eq_false_of_isIntegral dst hDstInt
+  have hNz : Nat.beq (dst.sizeBytes .bits64) 0 = false :=
+    ScalarTy.sizeBytes_bits64_beq_zero dst
+  have hRes := trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts srcTy l hSrcLIdx hLookup
+  have hSrcSz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts srcTy) =
+      some (dst.sizeBytes .bits64) := by
+    rw [hRes, trusted_tyByteSize_adt_primitive_of_lookup localDecls layouts defPath args srcLIdx l
+      variantIdx hSrcLIdx hLookup hInhab hVar hFields, hLSz]
+  have hResolvePair :
+      resolveByteCastSrcTyAndSize localDecls layouts op { kind := .adt defPath args, layoutIdx := 0 } =
+        some (srcTy, dst.sizeBytes .bits64) := by
+    unfold resolveByteCastSrcTyAndSize
+    dsimp only
+    rw [hUnres0]
+    dsimp only
+    rw [hTyRes]
+    dsimp only
+    rw [hSrcSz, hRes]
+  have hDstSz := trusted_tyByteSize_resolve_toTrustedRigidTy_of_not_isPtr localDecls layouts m
+    pointee dst dstLIdx hDstNp
+  have hEnc₀ :
+      encodeValueToBytes defaultCodecFuel layouts srcTy (.scalar ⟨bits, dst.sizeBytes .bits64⟩) =
+        some (encodeLittleEndianBytes bits (dst.sizeBytes .bits64) none) := by
+    unfold defaultCodecFuel encodeValueToBytes
+    dsimp only [srcTy]
+    rw [hLookup]
+    dsimp only
+    rw [hInhab, hVar, hFields, hLSz]
+    dsimp only
+    rw [Nat.beq_refl]
+    unfold encodeScalarBytes
+    dsimp only
+    rw [hNz]
+  have hEnc : encodeByteCastSourceBytes layouts srcTy (.scalar ⟨bits, dst.sizeBytes .bits64⟩) =
+      some (encodeLittleEndianBytes bits (dst.sizeBytes .bits64) none) :=
+    trusted_encodeByteCastSourceBytes_of_encodeValueToBytes layouts srcTy _ _ rfl
+      (trusted_isUnionLayout_adt_of_lookup layouts defPath args srcLIdx l hLookup
+        (fun c h => by rw [hFields] at h; nomatch h)) hEnc₀
+  have hValidDst : dst.isValidBits .bits64 bits = true :=
+    ScalarTy.isValidBits_of_isIntegral .bits64 dst bits hDstInt hBits
+  have hBc :
+      evalByteCast locals op dstTy mem localDecls layouts =
+        ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem := by
+    unfold evalByteCast
+    rw [hOp]
+    dsimp only
+    rw [hDstSz]
+    dsimp only
+    rw [hTy0]
+    dsimp only
+    rw [hResolvePair]
+    dsimp only
+    rw [Nat.beq_refl]
+    dsimp only
+    rw [hEnc]
+    dsimp only
+    rw [trusted_length_encodeLittleEndianBytes bits _ none, Nat.beq_refl]
+    dsimp only
+    rw [trusted_resolveTyWithLocalDecls_mk, show defaultCodecFuel = 15 + 1 from rfl,
+        trusted_decodeTypedValueFromBytes_toTrustedRigidTy_of_not_isPtr 15 layouts m pointee dst _ _
+          hDstNp,
+        trusted_abstractBytesHaveProv_encodeLittleEndianBytes_none]
+    dsimp only
+    rw [trusted_decodeValueFromBytes_scalar 15 layouts m pointee dst _ bits hDstNp hBits, hValidDst]
+  exact ⟨hResolvePair, hBc, hBc⟩
+
+/--
+**Signed negative `#[repr(i8)]` wrapping-range and 16-byte `#[repr(u128)]` explicit-discriminant `evalByteCast` agreement (`evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement`).**
+1. For a signed `#[repr(i8)]` fieldless enum (`l.variantDiscriminants = [255, 1]`, wrapping
+   `validRange = ⟨255, 1⟩`), `evalByteCast` maps two's-complement `-1_i8` (`255`) to
+   `.ok (.aggregate 0 [])`, maps `1_i8` (`1`) to `.ok (.aggregate 1 [])`, and rejects the undeclared
+   gap `0` (even though `wrappingRangeContains ⟨255, 1⟩ 0 = true`) with `.ub`.
+2. For a 16-byte `#[repr(u128)]` / `#[repr(i128)]` fieldless enum (`l.size.bytes = 16`,
+   `bitsWidth = 128`) with explicit discriminant `discrBits` (including `discrBits ≥ 2^64`,
+   such as `2^128 - 1`), `evalByteCast` and `evalRvalue (.cast .transmute ...)` round-trip
+   `discrBits` <-> `.aggregate varIdx []` in both directions.
+-/
+theorem evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pointee : RigidTy) (srcLIdx dstLIdx : LayoutIdx)
+    (defPath : DefPath) (args : List RigidTy)
+    (l8 l128 : TypeLayout) (memoryOrder vm0 vm1 : List Nat)
+    (hDstLIdx : dstLIdx ≠ 0)
+    (hLookup8 : LayoutTable.lookup layouts dstLIdx = some l8)
+    (hInhab8 : l8.isUninhabited = false)
+    (hVar8 : l8.variants =
+      .multiple (.initialized (.int 8 true) ⟨255, 1⟩) 0 [.arbitrary [] vm0, .arbitrary [] vm1])
+    (hFields8 : l8.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz8 : l8.size.bytes = 1)
+    (hDiscr8 : l8.variantDiscriminants = [255, 1])
+    (hTyI8 : operandTy localDecls layouts op =
+      some { kind := ScalarTy.i8.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
+    let enumTy8 : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
+    -- (1a) -1_i8 (255) -> .ok (.aggregate 0 [])
+    (evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨255, 1⟩) locals' →
+      evalByteCast locals op enumTy8 mem localDecls layouts = ok (.aggregate 0 []) locals' mem) ∧
+    -- (1b) 1_i8 (1) -> .ok (.aggregate 1 [])
+    (evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨1, 1⟩) locals' →
+      evalByteCast locals op enumTy8 mem localDecls layouts = ok (.aggregate 1 []) locals' mem) ∧
+    -- (1c) gap 0 (inside wrapping range ⟨255, 1⟩!) -> .ub
+    (evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨0, 1⟩) locals' →
+      wrappingRangeContains ⟨255, 1⟩ 0 = true ∧
+      evalByteCast locals op enumTy8 mem localDecls layouts = ub) ∧
+    -- (2) 16-byte u128 explicit discriminant (e.g. 2^128 - 1) -> .ok (.aggregate varIdx [])
+    (∀ (discr128 varIdx : Nat) (vr128 : WrappingRange) (vs128 : List FieldsShape) (vmo : List Nat),
+      discr128 < scalarModulus 16 →
+      wrappingRangeContains vr128 discr128 = true →
+      LayoutTable.lookup layouts dstLIdx = some l128 →
+      l128.isUninhabited = false →
+      l128.variants = .multiple (.initialized (.int 128 false) vr128) 0 vs128 →
+      l128.fields = .arbitrary [⟨0⟩] memoryOrder →
+      l128.size.bytes = 16 →
+      resolveEnumVariantIdxByTag l128.variantDiscriminants discr128 = some varIdx →
+      Trusted.Sequence.get? vs128 varIdx = some (.arbitrary [] vmo) →
+      (∀ tag < scalarModulus l128.size.bytes,
+        wrappingRangeContains vr128 tag = true →
+        ∀ vi, resolveEnumVariantIdxByTag l128.variantDiscriminants tag = some vi →
+        ∃ vm, Trusted.Sequence.get? vs128 vi = some (.arbitrary [] vm)) →
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨discr128, 16⟩) locals' →
+      operandTy localDecls layouts op =
+        some { kind := ScalarTy.u128.toTrustedRigidTy m pointee, layoutIdx := srcLIdx } →
+      evalByteCast locals op enumTy8 mem localDecls layouts =
+        ok (.aggregate varIdx []) locals' mem) := by
+  intro enumTy8
+  have hWidth8 : primitiveKindByteWidth (.int 8 true) = some l8.size.bytes :=
+    congrArg some hSz8.symm
+  have hFieldless8 :
+      ∀ tag < scalarModulus l8.size.bytes,
+        wrappingRangeContains ⟨255, 1⟩ tag = true →
+        ∀ varIdx, resolveEnumVariantIdxByTag l8.variantDiscriminants tag = some varIdx →
+        ∃ varMemOrder,
+          Trusted.Sequence.get? ([FieldsShape.arbitrary [] vm0, FieldsShape.arbitrary [] vm1] : List FieldsShape) varIdx =
+            some (FieldsShape.arbitrary [] varMemOrder) := by
+    intro tag _ _ varIdx hRes
+    rw [hDiscr8] at hRes
+    unfold resolveEnumVariantIdxByTag findDiscriminantVariantIdx? at hRes
+    dsimp only at hRes
+    cases h255 : Nat.beq 255 tag <;> rw [h255] at hRes
+    · dsimp only at hRes
+      unfold findDiscriminantVariantIdx? at hRes
+      cases h1 : Nat.beq 1 tag <;> rw [h1] at hRes
+      · dsimp only at hRes
+        unfold findDiscriminantVariantIdx? at hRes
+        nomatch hRes
+      · injection hRes with hEq; subst hEq; exact ⟨vm1, rfl⟩
+    · injection hRes with hEq; subst hEq; exact ⟨vm0, rfl⟩
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro hOp255
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' op mem localDecls layouts m pointee .i8 srcLIdx defPath args dstLIdx l8
+      8 255 true ⟨255, 1⟩ [FieldsShape.arbitrary [] vm0, FieldsShape.arbitrary [] vm1] memoryOrder rfl
+      ⟨by decide, trivial⟩ hDstLIdx hLookup8 hInhab8 hVar8 hFields8 hSz8 hWidth8 hFieldless8
+      hOp255 hTyI8).2.1
+    rw [hDiscr8] at hStep
+    exact hStep
+  · intro hOp1
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' op mem localDecls layouts m pointee .i8 srcLIdx defPath args dstLIdx l8
+      8 1 true ⟨255, 1⟩ [FieldsShape.arbitrary [] vm0, FieldsShape.arbitrary [] vm1] memoryOrder rfl
+      ⟨by decide, trivial⟩ hDstLIdx hLookup8 hInhab8 hVar8 hFields8 hSz8 hWidth8 hFieldless8
+      hOp1 hTyI8).2.1
+    rw [hDiscr8] at hStep
+    exact hStep
+  · intro hOp0
+    refine ⟨rfl, ?_⟩
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' op mem localDecls layouts m pointee .i8 srcLIdx defPath args dstLIdx l8
+      8 0 true ⟨255, 1⟩ [FieldsShape.arbitrary [] vm0, FieldsShape.arbitrary [] vm1] memoryOrder rfl
+      ⟨by decide, trivial⟩ hDstLIdx hLookup8 hInhab8 hVar8 hFields8 hSz8 hWidth8 hFieldless8
+      hOp0 hTyI8).2.1
+    rw [hDiscr8] at hStep
+    exact hStep
+  · intro discr128 varIdx vr128 vs128 vmo hLt128 hIn128 hLk128 hInh128 hVar128 hF128 hSz128
+      hRes128 _ hFl128 hOp128 hTy128
+    have hW128 : primitiveKindByteWidth (.int 128 false) = some l128.size.bytes :=
+      congrArg some hSz128.symm
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' op mem localDecls layouts m pointee .u128 srcLIdx defPath args dstLIdx l128
+      128 discr128 false vr128 vs128 memoryOrder rfl
+      ⟨hLt128, trivial⟩ hDstLIdx hLk128 hInh128 hVar128 hF128 hSz128 hW128 hFl128
+      hOp128 hTy128).2.1
+    rw [hIn128, hRes128] at hStep
+    exact hStep
 
 /--
 **Niche-aware decidable-certificate corollary (`evalByteCast_ok_of_checkIntoFromBytesNicheAware`).**

@@ -3913,6 +3913,55 @@ theorem adt_multiple_enum_explicit_discriminant_agreement
     rfl
 
 /--
+**Signed negative two's-complement & wrapping-range gap agreement (`#[repr(i8)] enum E { Neg = -1, Pos = 1 }`).**
+When `l.variantDiscriminants = [255, 1]` and `validRange = ⟨255, 1⟩` (a wrapping `ScalarLayout`
+range `start = 255 > end_ = 1` covering `{255, 0, 1}`):
+1. two's-complement `-1_i8` (`255`) decodes to variant `0` (`E::Neg`, `some (.aggregate 0 [])`)
+   and encoding `.aggregate 0 []` writes byte `255`;
+2. `1_i8` (`1`) decodes to variant `1` (`E::Pos`, `some (.aggregate 1 [])`)
+   and encoding `.aggregate 1 []` writes byte `1`;
+3. the undeclared gap `0` lies *inside* the wrapping `ScalarLayout.validRange`
+   (`wrappingRangeContains ⟨255, 1⟩ 0 = true`), yet `resolveEnumVariantIdxByTag [255, 1] 0 = none`
+   rejects it (`decodeValueFromBytes ... = none`);
+4. out-of-range `-128_i8` (`128`) is rejected (`decodeValueFromBytes ... = none`).
+-/
+theorem adt_multiple_enum_signed_negative_and_sparse_gap_agreement
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (memoryOrder vm0 vm1 : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants =
+      .multiple (.initialized (.int 8 true) ⟨255, 1⟩) 0 [.arbitrary [] vm0, .arbitrary [] vm1])
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz : l.size.bytes = 1)
+    (hDiscr : l.variantDiscriminants = [255, 1]) :
+    let enumTy : Ty := { kind := .adt defPath args, layoutIdx := idx }
+    wrappingRangeContains ⟨255, 1⟩ 0 = true ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 255 1 none) =
+      some (.aggregate 0 []) ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 1 1 none) =
+      some (.aggregate 1 []) ∧
+    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate 0 []) =
+      some (encodeLittleEndianBytes 255 1 none) ∧
+    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate 1 []) =
+      some (encodeLittleEndianBytes 1 1 none) ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 0 1 none) =
+      none ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 128 1 none) =
+      none := by
+  intro enumTy
+  rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts, lVarDiscrs⟩
+  dsimp only at hInhab hVar hFields hSz hDiscr
+  subst hInhab hVar hFields hSz hDiscr
+  refine ⟨rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  all_goals
+    rw [show defaultCodecFuel = 15 + 1 from rfl]
+    first | unfold decodeValueFromBytes | unfold encodeValueToBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+
+/--
 **Positive round-trip theorem for `0..n-1` multi-variant fieldless `#[repr(Int)]` / `#[repr(u8)]` enums.**
 When variant index `varIdx < scalarModulus l.size.bytes` lies in `validRange` and maps to a fieldless
 variant `.arbitrary [] varMemOrder` in `variantShapes` (with default `l.variantDiscriminants = []`):
