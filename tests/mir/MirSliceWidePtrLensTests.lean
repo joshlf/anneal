@@ -544,9 +544,9 @@ theorem mutLens_split_reborrow_and_treeBorrows_transitions :
       ¬ ActiveTypedSliceBorrow ByteLensCodec.u32LE
         (invalidateTreeBorrowsAtProj slBorrows slBorrows 0 (some 99) [] 0 4) 77 wide4 xs4 bytes16 := by
   intro borrowsAfterLeft borrowsAfterConf
-  obtain ⟨entry, he, hL, hR, hDisj⟩ :=
+  obtain ⟨entry, he, hL, hR, hDisj, _, _, _, _⟩ :=
     ActiveTypedSliceMutBorrow.splitAt_reborrow mutLens (tagL := 78) (tagR := 79) (k := 2)
-      (by decide) (by decide)
+      (by decide) (by decide) rfl rfl
   have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
   subst hEntry
   have hTight79 : ∀ e, lookupBorrow splitChildBorrows 79 = some e →
@@ -571,6 +571,64 @@ theorem mutLens_split_reborrow_and_treeBorrows_transitions :
       (tag := 77) (wTag := 99) (entry := rootSlEntry) 0 [] 0 4 wide4 xs4 bytes16
       rfl rfl rfl (by decide) rfl ⟨(fun h => nomatch h), (fun h => nomatch h)⟩
   exact ⟨hL_tb, hR_tb, hR_sh_tb, hL_cf, hR_cf, hDis.1⟩
+
+/-- The table after writing `20` through the left child `78` (element `1`, byte `4`). -/
+def borrowsAfterL : List BorrowEntry :=
+  invalidateTreeBorrowsAtProj splitChildBorrows splitChildBorrows 0 (some 78) [] 4 4
+
+/-- The table after then writing `30` through the right child `79` (its element `0`, byte `8`). -/
+def borrowsAfterLR : List BorrowEntry :=
+  invalidateTreeBorrowsAtProj borrowsAfterL borrowsAfterL 0 (some 79) [] 8 4
+
+/-- **End-to-end `split_at_mut` through the trusted Tree Borrows transitions.** Split the
+`&mut [u32]` lens on root tag `77` into fresh children `78` / `79` (`splitAt_reborrow`: the
+root lens survives and both children descend from it); write `20` through `78` (the sibling
+`79` is framed by `write_elem_treeBorrows_frame`, the root is a local ancestor by
+`descendant_write_preserves`); write `30` through `79` (now framing `78`). In the final table
+both children are still live with their updated halves *and* the root lens on `77` views the
+reassembled `[1, 20, 30, 4]`. -/
+theorem split_at_mut_tree_borrows_end_to_end :
+    ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterLR 77 wide4
+        [u 1, u 20, u 30, u 4] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterLR 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterLR 79
+        (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 := by
+  obtain ⟨entry, he, hL, hR, hDisj, hRoot, _, hDescL, _⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow mutLens (tagL := 78) (tagR := 79) (k := 2)
+      (by decide) (by decide) rfl rfl
+  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
+  subst hEntry
+  obtain ⟨hL1, hR1⟩ :=
+    ActiveTypedSliceMutBorrow.write_elem_treeBorrows_frame 0 [] hL (i := 1) (by decide)
+      (by decide) (u 20) write1 hR
+      (fun e hlk => by cases Option.some.inj hlk; exact ⟨rfl, rfl, by decide⟩) hDisj
+  have hRoot1 := ActiveTypedSliceMutBorrow.descendant_write_preserves 0 []
+    (WidePtrVal.elemOffset (WidePtrVal.takeElems wide4 2) 4 1) 4 hRoot hDescL
+    split_left_write.2.2
+  have hw2 : writeTyped ByteLensCodec.u32LE
+      (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) (u 30) bytesW1 =
+        some bytesW2 := rfl
+  obtain ⟨hR2, hL2⟩ :=
+    ActiveTypedSliceMutBorrow.write_elem_treeBorrows_frame 0 [] hR1 (i := 0) (by decide)
+      (by decide) (u 30) hw2 hL1
+      (fun e hlk => by cases Option.some.inj hlk; exact ⟨rfl, rfl, by decide⟩)
+      (Or.inr (Or.inr (Or.inr (by decide))))
+  have hDescR : isBorrowDescendantOrSelf borrowsAfterL 79 77 = true := rfl
+  have hRoot2 := ActiveTypedSliceMutBorrow.descendant_write_preserves 0 []
+    (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) 4 hRoot1 hDescR
+    split_right_write.2.2
+  exact ⟨hRoot2, hL2, hR2⟩
+
+/-- Negative (why `splitAt_reborrow` demands fresh child tags): minting the left child on the
+parent's own live tag `77` shadows the root entry, and the root `&mut [u32]` lens on the whole
+16-byte window is lost. -/
+theorem shadowing_child_destroys_root_lens :
+    ¬ ActiveTypedSliceMutBorrow ByteLensCodec.u32LE
+      (reborrowSubsliceEntry rootSlEntry 77 0 (2 * 4) :: slBorrows) 77 wide4 xs4 bytes16 := by
+  rintro ⟨_, entry, he, hc, _⟩
+  cases he
+  exact absurd hc.2 (by decide)
 
 /-! ## 7. Empty and zero-sized slices -/
 
@@ -953,7 +1011,7 @@ theorem callee_sig_and_fnptr_bridges (s : MachineState) (p : Place) :
    isNonSelectIntrinsicOpt_of_eq_none rfl,
    evalDirectRustIntrinsic?_eq_none_of_classify rfl⟩
 
-/-- Inline compiler intrinsic caller (`core::ub_checks::check_language_ub`,
+/-- Inline compiler intrinsic caller (`core::intrinsics::ub_checks`,
 `classifyRustIntrinsic? = some .ubChecks`) narrowed to an *empty* callee table `c₂ = []`
 (`coneBodies coneUb fullCallees = []`) via `runCfgWithCallees_cone_narrow_of_closed_wf`,
 `wpMirExecSym_cone_narrow_of_closed_wf`, and `mirWpConverges_cone_narrow_of_closed_wf`, plus
@@ -964,7 +1022,7 @@ def ubBoolLocal : LocalDecl :=
 def intrinsicCallerMir : CapturedMir :=
   Anneal.MirLoops.mkMirBody "cone::intrinsicCaller" 0 [retLocal, ubBoolLocal]
     [{ statements := [{ kind := .storageLive 1, span := "live" }],
-       terminator := callTerm (fnItem "core::ub_checks::check_language_ub") 1 1,
+       terminator := callTerm (fnItem "core::intrinsics::ub_checks") 1 1,
        isCleanup := false },
      retBlock [assignConst 0 42]]
 
@@ -972,7 +1030,33 @@ def constEvalSelectCallerMir : CapturedMir :=
   Anneal.MirLoops.mkMirBody "cone::selectCaller" 0 [retLocal]
     [callBlock (fnItem "core::intrinsics::const_eval_select") 0 1, retBlock []]
 
-def coneUb : List DefPath := ["core::ub_checks::check_language_ub"]
+def coneUb : List DefPath := ["core::intrinsics::ub_checks"]
+
+/-- The intrinsic really is dispatched inline: it is classified as `ubChecks`, and both the
+full and the *empty* callee table run the caller to `42u32` (an external call would make
+`runCfgWithCallees` return `none`), so the narrowing below is not vacuous. -/
+theorem intrinsicCaller_runs_concrete :
+    classifyRustIntrinsic? "core::intrinsics::ub_checks" = some .ubChecks ∧
+      retVal? (runCfgWithCallees 8 intrinsicCallerMir [] emptyMemory fullCallees) =
+        some (.scalar ⟨42, 4⟩) ∧
+      retVal? (runCfgWithCallees 8 intrinsicCallerMir [] emptyMemory
+        (coneBodies coneUb fullCallees)) = some (.scalar ⟨42, 4⟩) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Regression canary: `core::ub_checks::check_language_ub` is *not* a trusted intrinsic path
+(`classifyRustIntrinsic? = none`); with no body registered, the call is an unlinked external
+call, on which the bounded runner stops (`none`). -/
+def nonIntrinsicCallerMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "cone::nonIntrinsicCaller" 0 [retLocal, ubBoolLocal]
+    [{ statements := [{ kind := .storageLive 1, span := "live" }],
+       terminator := callTerm (fnItem "core::ub_checks::check_language_ub") 1 1,
+       isCleanup := false },
+     retBlock [assignConst 0 42]]
+
+theorem non_intrinsic_path_is_external_call :
+    classifyRustIntrinsic? "core::ub_checks::check_language_ub" = none ∧
+      runCfgWithCallees 8 nonIntrinsicCallerMir [] emptyMemory fullCallees = none :=
+  ⟨rfl, rfl⟩
 
 theorem callConeClosed_intrinsicCaller :
     CallConeClosed coneUb intrinsicCallerMir fullCallees = true ∧

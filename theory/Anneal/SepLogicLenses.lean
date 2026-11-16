@@ -23331,6 +23331,15 @@ def BorrowRangeCovers (entry : BorrowEntry) (base len : Nat) : Prop :=
 `bytes`, and borrow tag `tag` names a trusted `BorrowEntry` in `borrows` whose byte range
 covers the slice window `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)` with Tree
 Borrows read permission.
+
+Scope: this is a *logical* permission lens over byte-ranged entries, stated with the trusted
+lookup (`lookupBorrow`), permission transitions (`treeBorrowNodeAccess`,
+`invalidateTreeBorrowsAtProj`) and overlap test (`borrowEntryOverlapsWrite`). It is not a
+claim about the evaluator's own borrow bookkeeping: trusted global-backed slice pointers carry
+no borrow entry at all (`len_eq` / `evalPlaceRead_index` require
+`lookupBorrow mem.borrows wide.1.tag = none`), and trusted reborrows of stack slices create
+projection-governed entries (`rangeLen = 0`) or inherit the parent's byte range. `tag` is
+therefore a separate parameter, not `wide.1.tag`; `LiveSliceImage` ties `bytes` to `Memory`.
 -/
 def ActiveTypedSliceBorrow {α : Type} {n : Nat} (c : ByteLensCodec α n)
     (borrows : List BorrowEntry) (tag : Nat) (wide : WidePtrVal) (xs : List α)
@@ -24255,41 +24264,96 @@ theorem ActiveTypedSliceMutBorrow.write_elem_treeBorrows_shared_frame {α β : T
   · dsimp only [borrows']
     rw [lookupBorrow_invalidateTreeBorrowsAtProj, he', Option.map_some, hEqEntry']
 
-/-- Mint a child `BorrowEntry` for a subslice byte window `[off, off + len)` under `parent`. -/
+/-- The trusted initial permission of a fresh mutable reborrow of a `Freeze` pointee
+(`mutableBorrowPerm` / Miri's unprotected `NewPermission::new`), `.reservedFrz false`,
+grants unique-write permission: its first child write activates it to `.unique`. -/
+theorem TreeBorrowPerm.permitsUniqueWrite_reservedFrz_false :
+    TreeBorrowPerm.PermitsUniqueWrite (.reservedFrz false) := by
+  intro prot
+  cases prot <;> rfl
+
+/--
+Ghost child `BorrowEntry` for the subslice byte window `[off, off + len)` under `parent`: a
+Tree Borrows child of `parent` (`parentTag := some parent.tag`) on the same target local, in
+the trusted initial state of a fresh mutable reborrow of a `Freeze` pointee
+(`.reservedFrz false`, the trusted `mutableBorrowPerm` choice), *not* a copy of the parent's
+current permission.
+
+This is a logical extension of the borrow table for the byte-range lens only: the trusted
+evaluator's own reborrows of a stack slice create projection-governed entries (`rangeLen = 0`)
+or inherit the parent's byte range, so no trusted evaluation step produces this entry. It is
+consumed exclusively by the trusted Tree Borrows transitions (`invalidateTreeBorrowsAtProj`,
+`borrowEntryOverlapsWrite`, `isBorrowDescendantOrSelf`).
+-/
 @[reducible]
-def reborrowSubsliceEntry (parent : BorrowEntry) (childTag off len : Nat)
-    (perm : TreeBorrowPerm := parent.perm) : BorrowEntry :=
+def reborrowSubsliceEntry (parent : BorrowEntry) (childTag off len : Nat) : BorrowEntry :=
   { tag := childTag
     targetLocal := parent.targetLocal
     targetProjection := parent.targetProjection
-    perm := perm
+    perm := .reservedFrz false
     rangeOffset := off
     rangeLen := len
     parentTag := some parent.tag }
 
+/-- One step of the trusted ancestry walk: a child whose entry names `anc` as its parent is a
+descendant of `anc` at every positive fuel. -/
+theorem isBorrowDescendantOrSelfAux_of_parent {borrows : List BorrowEntry} {child anc : Nat}
+    {e : BorrowEntry} (fuel : Nat) (hne : child ≠ anc) (hlk : lookupBorrow borrows child = some e)
+    (hp : e.parentTag = some anc) :
+    isBorrowDescendantOrSelfAux (fuel + 1) borrows child anc = true := by
+  unfold isBorrowDescendantOrSelfAux
+  rw [nat_beq_eq_false_of_ne hne]
+  dsimp only
+  rw [hlk]
+  dsimp only
+  rw [hp]
+  exact isBorrowDescendantOrSelfAux_refl fuel borrows anc
+
 /--
-**`ActiveTypedSliceMutBorrow.splitAt_reborrow`**: splitting a mutable slice borrow at `k ≤ wide.2`
-by reborrowing two distinct child tags `tagL` and `tagR` (`tagL ≠ tagR`) with tight byte ranges
-`[wide.1.offsetBytes, wide.1.offsetBytes + k * n)` and
-`[wide.1.offsetBytes + k * n, wide.1.offsetBytes + k * n + (wide.2 - k) * n)`. Because each child
-entry has its own tight byte range, writing to the left half via `write_elem_treeBorrows_frame`
-transitions `borrows` and preserves the right half's `ActiveTypedSliceMutBorrow` (and vice versa).
+**`ActiveTypedSliceMutBorrow.splitAt_reborrow`** (`split_at_mut` with child tags): splitting a
+mutable slice borrow on `tag` at `k ≤ wide.2` by pushing two ghost child entries
+(`reborrowSubsliceEntry`) with *fresh* tags `tagL ≠ tagR` (neither present in `borrows`) and
+tight byte ranges `[off, off + k * n)` and `[off + k * n, off + k * n + (wide.2 - k) * n)`
+yields mutable lenses on both halves, adjacent and disjoint, while
+
+* the parent lens on `tag` survives unchanged (freshness rules out shadowing `tag` or any
+  other live tag: every other lookup is preserved), and
+* both children are trusted Tree Borrows descendants of `tag`, so writes through either half
+  are local accesses for the parent (`descendant_write_preserves`) and, being disjoint,
+  foreign but non-overlapping for the sibling (`write_elem_treeBorrows_frame`).
 -/
 theorem ActiveTypedSliceMutBorrow.splitAt_reborrow {α : Type} {n : Nat} {c : ByteLensCodec α n}
     {borrows : List BorrowEntry} {tag tagL tagR : Nat} {wide : WidePtrVal} {xs : List α}
     {bytes : ByteMem} (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
-    {k : Nat} (hk : k ≤ wide.2) (hNe : tagR ≠ tagL) :
+    {k : Nat} (hk : k ≤ wide.2) (hNe : tagR ≠ tagL)
+    (hFreshL : lookupBorrow borrows tagL = none) (hFreshR : lookupBorrow borrows tagR = none) :
     ∃ entry, lookupBorrow borrows tag = some entry ∧
       let eL := reborrowSubsliceEntry entry tagL wide.1.offsetBytes (k * n)
       let eR := reborrowSubsliceEntry entry tagR (wide.1.offsetBytes + k * n) ((wide.2 - k) * n)
       let borrows' := eR :: eL :: borrows
       ActiveTypedSliceMutBorrow c borrows' tagL (WidePtrVal.takeElems wide k) (xs.take k) bytes ∧
         ActiveTypedSliceMutBorrow c borrows' tagR (WidePtrVal.dropElems wide n k) (xs.drop k) bytes ∧
-        DisjointSlice wide.1.offsetBytes (k * n) (wide.1.offsetBytes + k * n) ((wide.2 - k) * n) := by
-  obtain ⟨hs, entry, he, _, hp⟩ := h
+        DisjointSlice wide.1.offsetBytes (k * n) (wide.1.offsetBytes + k * n) ((wide.2 - k) * n) ∧
+        ActiveTypedSliceMutBorrow c borrows' tag wide xs bytes ∧
+        (∀ t, t ≠ tagL → t ≠ tagR → lookupBorrow borrows' t = lookupBorrow borrows t) ∧
+        isBorrowDescendantOrSelf borrows' tagL tag = true ∧
+        isBorrowDescendantOrSelf borrows' tagR tag = true := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
   obtain ⟨hL, hR, hD⟩ := SliceTypedAt.splitAt hs hk
+  have htag : entry.tag = tag := lookupBorrow_tag he
+  have hneL : tagL ≠ tag := by
+    intro hEq
+    rw [hEq, he] at hFreshL
+    cases hFreshL
+  have hneR : tagR ≠ tag := by
+    intro hEq
+    rw [hEq, he] at hFreshR
+    cases hFreshR
   refine ⟨entry, he, ?_⟩
   intro eL eR borrows'
+  have hOther : ∀ t, t ≠ tagL → t ≠ tagR → lookupBorrow borrows' t = lookupBorrow borrows t :=
+    fun t htL htR =>
+      (lookupBorrow_cons_of_ne (Ne.symm htR)).trans (lookupBorrow_cons_of_ne (Ne.symm htL))
   have hLookR : lookupBorrow borrows' tagR = some eR := by
     unfold lookupBorrow
     dsimp only [borrows', eR, reborrowSubsliceEntry]
@@ -24301,8 +24365,59 @@ theorem ActiveTypedSliceMutBorrow.splitAt_reborrow {α : Type} {n : Nat} {c : By
     rw [hbeq]
     dsimp only [lookupBorrow, eL, reborrowSubsliceEntry]
     rw [Nat.beq_refl]
-  refine ⟨⟨hL, eL, hLookL, ⟨Nat.le_refl _, Nat.le_refl _⟩, hp⟩,
-    ⟨hR, eR, hLookR, ⟨Nat.le_refl _, Nat.le_refl _⟩, hp⟩, hD⟩
+  have hParentL : eL.parentTag = some tag := by
+    show some entry.tag = some tag
+    rw [htag]
+  have hParentR : eR.parentTag = some tag := by
+    show some entry.tag = some tag
+    rw [htag]
+  refine ⟨⟨hL, eL, hLookL, ⟨Nat.le_refl _, Nat.le_refl _⟩,
+      TreeBorrowPerm.permitsUniqueWrite_reservedFrz_false⟩,
+    ⟨hR, eR, hLookR, ⟨Nat.le_refl _, Nat.le_refl _⟩,
+      TreeBorrowPerm.permitsUniqueWrite_reservedFrz_false⟩, hD,
+    ⟨hs, entry, (hOther tag (Ne.symm hneL) (Ne.symm hneR)).trans he, hc, hp⟩, hOther, ?_, ?_⟩
+  · show isBorrowDescendantOrSelfAux (borrows.length + 1 + 1) borrows' tagL tag = true
+    exact isBorrowDescendantOrSelfAux_of_parent _ hneL hLookL hParentL
+  · show isBorrowDescendantOrSelfAux (borrows.length + 1 + 1) borrows' tagR tag = true
+    exact isBorrowDescendantOrSelfAux_of_parent _ hneR hLookR hParentR
+
+/--
+**`ActiveTypedSliceMutBorrow.descendant_write_preserves`**: a write through a Tree Borrows
+descendant `wTag` of `tag` (`isBorrowDescendantOrSelf borrows wTag tag = true`, e.g. through
+either `split_at_mut` half minted by `splitAt_reborrow`) is a *local* access for `tag`'s entry,
+so after the trusted `invalidateTreeBorrowsAtProj` transition `tag` keeps its byte range and
+unique-write permission (`.reservedFrz false` activates to `.unique`, `.unique` stays). Any
+new view `xs'` of the same window (e.g. the reassembled whole slice after writes through the
+halves) is again an `ActiveTypedSliceMutBorrow` on `tag` in the transitioned table.
+-/
+theorem ActiveTypedSliceMutBorrow.descendant_write_preserves {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag wTag : Nat} {wide : WidePtrVal}
+    {xs xs' : List α} {bytes bytes' : ByteMem} (targetLocal : Local)
+    (writeProj : List ProjectionElem) (writeOff writeLen : Nat)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hDesc : isBorrowDescendantOrSelf borrows wTag tag = true)
+    (hs' : SliceTypedAt c wide xs' bytes') :
+    ActiveTypedSliceMutBorrow c
+      (invalidateTreeBorrowsAtProj borrows borrows targetLocal (some wTag) writeProj writeOff
+        writeLen) tag wide xs' bytes' := by
+  obtain ⟨_, entry, he, hc, hp⟩ := h
+  have htag : entry.tag = tag := lookupBorrow_tag he
+  have hres : resolveTreeBorrowWriterTag borrows entry (some wTag) = some entry.tag := by
+    unfold resolveTreeBorrowWriterTag
+    dsimp only
+    rw [htag, hDesc]
+  obtain ⟨hc', hp'⟩ := updateBorrowPermAtProj_self_permitsUniqueWrite entry targetLocal writeProj
+    writeOff writeLen wide.1.offsetBytes (wide.2 * n) hc hp
+  refine ⟨hs', updateBorrowPermTreeAtProj borrows entry targetLocal (some wTag) writeProj writeOff
+    writeLen, ?_, ?_, ?_⟩
+  · rw [lookupBorrow_invalidateTreeBorrowsAtProj, he]
+    rfl
+  · unfold updateBorrowPermTreeAtProj
+    rw [hres]
+    exact hc'
+  · unfold updateBorrowPermTreeAtProj
+    rw [hres]
+    exact hp'
 
 /--
 **`foreign_overlapping_write_disables_borrow`**: if a non-ancestor tag `wTag`
