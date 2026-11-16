@@ -1330,7 +1330,75 @@ theorem evalFuel_blockCfgStep_halted_of_subIdWrap
     rw [hInner] at h
     exact nomatch h
 
-/-- `outcomeToFuel wrap` halts exactly on the returns that `wrap` accepts. -/
+/-- **Single-step inversion of halts** (for `ForwardSim` proofs, whose `.done`
+case must be matched by the target machine): the embedded machine halts with
+`v'` in one step exactly when no `.convergedJump` delay is pending, the current
+block returns some `v`, and the pending wrapper accepts `v` as `v'`. -/
+theorem blockCfgStep_eq_done_iff
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    (s : BlockMachineState State Ret) (v' : Ret) :
+    blockCfgStep stepBb s = .done v' ↔
+      s.wait = 0 ∧
+        Exists fun v => stepBb s.bb s.st = .ret v ∧ s.wrap v = some v' := by
+  rcases s with ⟨wrap, bb, st, wait⟩
+  cases wait with
+  | succ w =>
+    constructor
+    · intro h
+      exact nomatch h
+    · intro ⟨hw, _⟩
+      exact nomatch hw
+  | zero =>
+    constructor
+    · intro h
+      dsimp only [blockCfgStep] at h
+      cases hst : stepBb bb st with
+      | ret v =>
+        rw [hst] at h
+        dsimp only at h
+        cases hw : wrap v with
+        | some w =>
+          rw [hw] at h
+          injection h with hEq
+          subst hEq
+          exact ⟨rfl, v, rfl, hw⟩
+        | none =>
+          rw [hw] at h
+          exact nomatch h
+      | jump _ _ =>
+        rw [hst] at h
+        exact nomatch h
+      | jumpWrapped _ _ _ =>
+        rw [hst] at h
+        exact nomatch h
+      | convergedJump _ _ _ _ =>
+        rw [hst] at h
+        exact nomatch h
+      | branchJump _ _ _ _ =>
+        rw [hst] at h
+        exact nomatch h
+      | fault =>
+        rw [hst] at h
+        exact nomatch h
+    · intro ⟨_, v, hst, hw⟩
+      change stepBb bb st = .ret v at hst
+      change wrap v = some v' at hw
+      dsimp only [blockCfgStep]
+      rw [hst]
+      dsimp only
+      rw [hw]
+
+/-- Under a sub-identity pending wrapper, a one-step halt returns exactly the
+value of the current block's `.ret` (no delay is pending). -/
+theorem blockCfgStep_done_of_subIdWrap
+    (stepBb : Nat → State → BlockStepResult State Ret)
+    {s : BlockMachineState State Ret} {v' : Ret} (hWrap : SubIdWrap s.wrap)
+    (h : blockCfgStep stepBb s = .done v') :
+    s.wait = 0 ∧ stepBb s.bb s.st = .ret v' := by
+  obtain ⟨hWait, v, hst, hw⟩ := (blockCfgStep_eq_done_iff stepBb s v').mp h
+  have hEq := hWrap v v' hw
+  subst hEq
+  exact ⟨hWait, hst⟩
 theorem outcomeToFuel_eq_halted_iff (wrap : Ret → Option Ret)
     (out : BlockCfgOutcome Ret) (v' : Ret) :
     outcomeToFuel wrap out = .halted v' ↔
@@ -2949,9 +3017,38 @@ theorem mirWpConverges_of_blockCfg_forwardSim
       (fun o => Exists fun v => P v ∧ RetRel v o) :=
   PureMirExec.mirWpConverges_of_wpConverges (wpConverges_of_forwardSim hSim h ms hR)
 
+/-- **`CfgCertificate` adequacy under `InvClosedNoFork`**: a `CfgCertificate`,
+`HoldsFnSpec (evalFnValue ...)`, and an entry invariant that is closed under
+the CFG's jumps and never forks yield fuel-free `WpConverges` of
+`blockCfgStep`. Unlike `wpConverges_of_cfgCertificate`, neither a `PostRet` nor
+a `LocalBlockVC` is required, so the invariant may contain faulting or
+wrapper-rejecting states (the certificate alone supplies the return). -/
+theorem wpConverges_of_cfgCertificate_of_invClosedNoFork {Val : Type}
+    (alg : ValAlgebra Val) (cert : CfgCertificate alg)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (post : FuncOut Val → Prop)
+    (hInit : initFnState alg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue alg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState Val → Prop)
+    (hClosed : InvClosedNoFork (stepBasicBlock alg cert.blocks) BlockInv)
+    (hInv0 : BlockInv cert.entryBb st0) :
+    PureMirExec.WpConverges (blockCfgStep (stepBasicBlock alg cert.blocks))
+      ⟨some, cert.entryBb, st0, 0⟩ post := by
+  cases hEval : evalFnValue alg params cert.plan cert.retExpr with
+  | fail =>
+    rw [hEval] at hSpec
+    exact nomatch hSpec
+  | ok out =>
+    rw [hEval] at hSpec
+    exact (wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop
+      (stepBasicBlock alg cert.blocks) BlockInv hClosed
+      ⟨some, cert.entryBb, st0, 0⟩ hInv0 post).mpr
+      ⟨cert.fuel, out, cert.sound params st0 out hInit hEval, out, rfl, hSpec⟩
+
 /-- **`CfgCertificate` adequacy for the embedded CFG machine**: a `CfgCertificate`
 together with `HoldsFnSpec (evalFnValue ...)` and invariant-scoped fork-freedom
-yields fuel-free `WpConverges` of `blockCfgStep`. -/
+yields fuel-free `WpConverges` of `blockCfgStep` (the `LocalBlockVC` instance of
+`wpConverges_of_cfgCertificate_of_invClosedNoFork`). -/
 theorem wpConverges_of_cfgCertificate {Val : Type}
     (alg : ValAlgebra Val) (cert : CfgCertificate alg)
     (params : List (ParamInput Val)) (st0 : SymState Val)
@@ -2966,17 +3063,35 @@ theorem wpConverges_of_cfgCertificate {Val : Type}
           .branchJump mergeRet thenBb elseBb st')
     (hInv0 : BlockInv cert.entryBb st0) :
     PureMirExec.WpConverges (blockCfgStep (stepBasicBlock alg cert.blocks))
-      ⟨some, cert.entryBb, st0, 0⟩ post := by
-  cases hEval : evalFnValue alg params cert.plan cert.retExpr with
-  | fail =>
-    rw [hEval] at hSpec
-    exact nomatch hSpec
-  | ok out =>
-    rw [hEval] at hSpec
-    exact (wpConverges_blockCfgStep_iff_of_blockInv
-      (stepBasicBlock alg cert.blocks) BlockInv PostRet hLocal hNoFork
-      cert.entryBb st0 hInv0 post).mpr
-      ⟨cert.fuel, out, cert.sound params st0 out hInit hEval, hSpec⟩
+      ⟨some, cert.entryBb, st0, 0⟩ post :=
+  wpConverges_of_cfgCertificate_of_invClosedNoFork alg cert params st0 post hInit
+    hSpec BlockInv
+    (invClosedNoFork_of_localBlockVC (stepBasicBlock alg cert.blocks) BlockInv
+      PostRet hLocal hNoFork)
+    hInv0
+
+/-- `InvClosedNoFork` form of `mirWpConverges_of_cfgCertificate`. -/
+theorem mirWpConverges_of_cfgCertificate_of_invClosedNoFork {Val : Type}
+    (alg : ValAlgebra Val) (cert : CfgCertificate alg)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (post : FuncOut Val → Prop)
+    (hInit : initFnState alg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue alg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState Val → Prop)
+    (hClosed : InvClosedNoFork (stepBasicBlock alg cert.blocks) BlockInv)
+    (hInv0 : BlockInv cert.entryBb st0)
+    {body : CapturedMir}
+    {R : BlockMachineState (SymState Val) (FuncOut Val) → MachineState → Prop}
+    {RetRel : FuncOut Val → MirOutcome → Prop}
+    (hSim : ForwardSim (blockCfgStep (stepBasicBlock alg cert.blocks))
+      (PureMirExec.mirStep body) R RetRel)
+    {ms : MachineState} (hR : R ⟨some, cert.entryBb, st0, 0⟩ ms) :
+    Anneal.MirFuelFree.MirWpConverges body ms
+      (fun o => Exists fun v => post v ∧ RetRel v o) :=
+  mirWpConverges_of_blockCfg_forwardSim hSim
+    (wpConverges_of_cfgCertificate_of_invClosedNoFork alg cert params st0 post
+      hInit hSpec BlockInv hClosed hInv0)
+    hR
 
 /-- **`CfgCertificate` refines live MIR**: composes `wpConverges_of_cfgCertificate`
 with `mirWpConverges_of_blockCfg_forwardSim` to transport a `CfgCertificate` and
@@ -4228,6 +4343,47 @@ theorem ret100_mirWpConverges_of_cfgCertificate_canary :
     (fun out => out.ret = .nat 100) rfl rfl ret100Inv (fun _ => True)
     ret100_localBlockVC ret100_noFork ⟨rfl, rfl⟩ ret100_forwardSim ⟨rfl, rfl⟩
 
+/-- Entry invariant of `ret100Cert` that also admits the out-of-range block
+`99`, where `stepBasicBlock` faults on every state. -/
+def ret100FaultyInv (bb : Nat) (st : SymState StdVal) : Prop :=
+  (bb = 0 ∧ st = ⟨[], [], [], [], [], 0⟩) ∨ bb = 99
+
+theorem ret100FaultyInv_invClosedNoFork :
+    InvClosedNoFork (stepBasicBlock stdValAlg ret100Cert.blocks)
+      ret100FaultyInv := by
+  intro bb st hInv
+  rcases hInv with ⟨hBb, hSt⟩ | hBb
+  · subst hBb
+    subst hSt
+    exact trivial
+  · subst hBb
+    exact trivial
+
+/-- **`wpConverges_of_cfgCertificate_of_invClosedNoFork` is strictly more
+general than `wpConverges_of_cfgCertificate`**: `ret100FaultyInv` contains the
+faulting block `99`, so it satisfies no `LocalBlockVC` (for any `PostRet`) and
+`wpConverges_of_cfgCertificate` cannot use it; it is nevertheless closed and
+fork-free, so the certificate CFG still converges to `100` fuel-free and
+refines live `liveInteropMirBody`. -/
+theorem ret100_invClosedNoFork_cfgCertificate_canary :
+    (∀ PostRet, ¬ LocalBlockVC (stepBasicBlock stdValAlg ret100Cert.blocks)
+      ret100FaultyInv PostRet) ∧
+    PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg ret100Cert.blocks))
+      ⟨some, ret100Cert.entryBb, ⟨[], [], [], [], [], 0⟩, 0⟩
+      (fun out => out.ret = .nat 100) ∧
+    Anneal.MirFuelFree.MirWpConverges liveInteropMirBody (liveInteropMs 0)
+      (fun o => Exists fun (v : FuncOut StdVal) =>
+        v.ret = .nat 100 ∧ (v = ⟨.nat 100, []⟩ ∧ o = liveInteropMirOutcome)) :=
+  ⟨fun _ hLocal => hLocal 99 ⟨[], [], [], [], [], 0⟩ (Or.inr rfl),
+   wpConverges_of_cfgCertificate_of_invClosedNoFork stdValAlg ret100Cert []
+     ⟨[], [], [], [], [], 0⟩ (fun out => out.ret = .nat 100) rfl rfl
+     ret100FaultyInv ret100FaultyInv_invClosedNoFork (Or.inl ⟨rfl, rfl⟩),
+   mirWpConverges_of_cfgCertificate_of_invClosedNoFork stdValAlg ret100Cert []
+     ⟨[], [], [], [], [], 0⟩ (fun out => out.ret = .nat 100) rfl rfl
+     ret100FaultyInv ret100FaultyInv_invClosedNoFork (Or.inl ⟨rfl, rfl⟩)
+     ret100_forwardSim ⟨rfl, rfl⟩⟩
+
 /-- **Non-vacuity of `spatialCodecOfByteLensCodec_encode_length` and
 `spatialCodecOfByteLensCodec_decode_wrong_length`** for `u32` MIR scalars. -/
 theorem u32ValueSpatialCodec_width_canaries :
@@ -4738,8 +4894,9 @@ theorem parityNested_order_canaries :
      (k := 5) rfl P⟩
 
 /-- `.branchJump` with a partial merge function (`accept = false` rejects every
-pair of arm values), and (blocks `3`-`5`) a fork whose then-arm diverges while
-its else-arm faults. -/
+pair of arm values), (blocks `3`-`5`) a fork whose then-arm diverges while its
+else-arm faults, and (block `6`) a fork whose then-arm diverges while its
+else-arm returns. -/
 def mergeCfg (accept : Bool) (bb st : Nat) : BlockStepResult Nat Nat :=
   match bb with
   | 0 => .branchJump (fun vt vf => if accept then some (vt + vf) else none) 1 2 st
@@ -4747,6 +4904,7 @@ def mergeCfg (accept : Bool) (bb st : Nat) : BlockStepResult Nat Nat :=
   | 2 => .ret (st + 2)
   | 3 => .branchJump (fun vt vf => some (vt + vf)) 4 5 st
   | 4 => .jump 4 st
+  | 6 => .branchJump (fun vt vf => some (vt + vf)) 4 1 st
   | _ => .fault
 
 /-- Block `4` of `mergeCfg` jumps to itself, so it diverges at every fuel. -/
@@ -4768,6 +4926,17 @@ theorem mergeCfg_divergeFault (n k : Nat) :
   rw [mergeCfg_selfLoop_diverges n (k + 1)]
   rfl
 
+/-- The fork at block `6` of `mergeCfg` (diverging then-arm, returning
+else-arm) diverges at every fuel. -/
+theorem mergeCfg_divergeRet (n k : Nat) :
+    runBlockCfg (mergeCfg true) 6 n (k + 2) = .diverged := by
+  have hs6 : mergeCfg true 6 n =
+      .branchJump (fun vt vf => some (vt + vf)) 4 1 n := rfl
+  rw [runBlockCfg_succ, hs6]
+  dsimp only
+  rw [mergeCfg_selfLoop_diverges n (k + 1)]
+  rfl
+
 /-- **Partial `.branchJump` merges and fault adequacy**:
 1. When the merge rejects (`accept = false`), `runBlockCfg` faults even though
    both arms return, the embedded machine faults at the same fuel, and no
@@ -4777,7 +4946,11 @@ theorem mergeCfg_divergeFault (n k : Nat) :
    `evalFuel_blockCfgStep_eq_or_faulted` is genuinely needed.
 3. A fork whose then-arm diverges and whose else-arm faults faults at every
    fuel `≥ 2` (`runBlockCfg` lets a fault dominate a divergence), and the
-   embedding faults with it. -/
+   embedding faults with it.
+4. A fork whose then-arm diverges and whose else-arm returns diverges at every
+   fuel (`runBlockCfg` never returns there), while the embedding faults: the
+   `.outOfFuel` / `.faulted` distinction is lost exactly at symbolic forks,
+   which is why exact adequacy needs `InvClosedNoFork`. -/
 theorem mergeCfg_fault_adequacy_canaries (n : Nat) :
     runBlockCfg (mergeCfg false) 0 n 2 = .fault ∧
     PureMirExec.evalFuel (blockCfgStep (mergeCfg false)) 2 ⟨some, 0, n, 0⟩ =
@@ -4789,7 +4962,10 @@ theorem mergeCfg_fault_adequacy_canaries (n : Nat) :
       .faulted ∧
     (∀ k, runBlockCfg (mergeCfg true) 3 n (k + 2) = .fault) ∧
     (∀ P, ¬ PureMirExec.WpConverges (blockCfgStep (mergeCfg true))
-      ⟨some, 3, n, 0⟩ P) :=
+      ⟨some, 3, n, 0⟩ P) ∧
+    (∀ k, runBlockCfg (mergeCfg true) 6 n (k + 2) = .diverged) ∧
+    (∀ k, PureMirExec.evalFuel (blockCfgStep (mergeCfg true)) (k + 1)
+      ⟨some, 6, n, 0⟩ = .faulted) :=
   ⟨rfl,
    evalFuel_blockCfgStep_of_runBlockCfg_fault (mergeCfg false) 2 some 0 n rfl,
    fun P => not_wpConverges_blockCfgStep_of_runBlockCfg_fault (mergeCfg false)
@@ -4797,7 +4973,9 @@ theorem mergeCfg_fault_adequacy_canaries (n : Nat) :
    rfl, rfl,
    fun k => mergeCfg_divergeFault n k,
    fun P => not_wpConverges_blockCfgStep_of_runBlockCfg_fault (mergeCfg true)
-     (k := 2) rfl P⟩
+     (k := 2) rfl P,
+   fun k => mergeCfg_divergeRet n k,
+   fun _ => rfl⟩
 
 /-- **Completeness on a `.convergedJump` CFG**
 (`wpConverges_blockCfgStep_iff_of_noFork`): the fork-free
@@ -4879,12 +5057,14 @@ theorem invClosedPartialCfg_invClosedNoFork :
 `wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop`, and
 `wpConverges_blockCfgStep_postRet_loop`**:
 Even though `invClosedPartialCfg` has a `.branchJump` at unreachable block `99`
-and its partial wrapper rejects `st = 3` on reachable block `0`:
-1. `evalFuel_blockCfgStep_eq_of_invClosedNoFork` gives exact equality with
-   `runBlockCfgLoop invClosedPartialCfg` at every fuel and delay `wait`.
-2. At `st = 3`, the bidirectional fault theorem proves `evalFuel` at fuel `3`
-   is `.faulted` because `runBlockCfg` returns `.fault`, while at fuel `2` the
-   bidirectional out-of-fuel theorem proves `evalFuel = .outOfFuel`.
+(so the global no-fork hypothesis is false) and its partial wrapper rejects
+`st = 3` on reachable block `0` (so no `LocalBlockVC` over the reachable
+blocks holds, for any `PostRet`), `InvClosedNoFork` still holds, and:
+1. At `st = 3`, the bidirectional fault theorem derives a machine fault at
+   every fuel `k + 3` from the `runBlockCfg` fault (fuel stays symbolic).
+2. At fuel `2`, the bidirectional out-of-fuel theorem derives `.outOfFuel` from
+   `runBlockCfg`'s `.diverged`, and conversely recovers `.diverged` from the
+   machine's `.outOfFuel`.
 3. From mid-delay state `⟨some, 1, 12, 1⟩` (`wait = 1`),
    `wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop` proves convergence to
    `12`.
@@ -4895,27 +5075,28 @@ theorem invClosedNoFork_and_loop_adequacy_canaries (n : Nat) :
     ¬ (∀ bb st mergeRet thenBb elseBb st',
         invClosedPartialCfg bb st ≠
           .branchJump mergeRet thenBb elseBb st') ∧
-    (PureMirExec.evalFuel (blockCfgStep invClosedPartialCfg) 2
-      ⟨some, 0, 3, 0⟩ = .outOfFuel ↔
-      runBlockCfg invClosedPartialCfg 0 3 2 = .diverged) ∧
-    (PureMirExec.evalFuel (blockCfgStep invClosedPartialCfg) 3
-      ⟨some, 0, 3, 0⟩ = .faulted ↔
-      runBlockCfg invClosedPartialCfg 0 3 3 = .fault ∨
-        Exists fun v =>
-          runBlockCfg invClosedPartialCfg 0 3 3 = .ret v ∧
-          (some : Nat → Option Nat) v = none) ∧
+    (∀ PostRet, ¬ LocalBlockVC invClosedPartialCfg invClosedReachable PostRet) ∧
+    (∀ k, PureMirExec.evalFuel (blockCfgStep invClosedPartialCfg) (k + 3)
+      ⟨some, 0, 3, 0⟩ = .faulted) ∧
+    PureMirExec.evalFuel (blockCfgStep invClosedPartialCfg) 2
+      ⟨some, 0, 3, 0⟩ = .outOfFuel ∧
+    runBlockCfg invClosedPartialCfg 0 3 2 = .diverged ∧
     PureMirExec.WpConverges (blockCfgStep invClosedPartialCfg)
       ⟨some, 1, 12, 1⟩ (· = 12) ∧
     PureMirExec.WpConverges (blockCfgStep (convergedJumpTestCfg true))
       ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩
       (fun v => v = (n + 5) * 2 + 10 ∧ (n + 5) * 2 ≤ v) := by
   refine ⟨fun hAll => hAll 99 0 (fun a b => some (a + b)) 1 1 0 rfl,
-    evalFuel_blockCfgStep_outOfFuel_iff_of_invClosedNoFork invClosedPartialCfg
+    fun _ hLocal => (hLocal 0 3 (Or.inl rfl)).2 3 (hLocal 1 3 (Or.inr rfl)),
+    fun k => (evalFuel_blockCfgStep_faulted_iff_of_invClosedNoFork
+      invClosedPartialCfg invClosedReachable invClosedPartialCfg_invClosedNoFork
+      (k + 3) ⟨some, 0, 3, 0⟩ (Or.inl rfl)).mpr (Or.inl rfl),
+    (evalFuel_blockCfgStep_outOfFuel_iff_of_invClosedNoFork invClosedPartialCfg
       invClosedReachable invClosedPartialCfg_invClosedNoFork 2
-      ⟨some, 0, 3, 0⟩ (Or.inl rfl),
-    evalFuel_blockCfgStep_faulted_iff_of_invClosedNoFork invClosedPartialCfg
-      invClosedReachable invClosedPartialCfg_invClosedNoFork 3
-      ⟨some, 0, 3, 0⟩ (Or.inl rfl),
+      ⟨some, 0, 3, 0⟩ (Or.inl rfl)).mpr rfl,
+    (evalFuel_blockCfgStep_outOfFuel_iff_of_invClosedNoFork invClosedPartialCfg
+      invClosedReachable invClosedPartialCfg_invClosedNoFork 2
+      ⟨some, 0, 3, 0⟩ (Or.inl rfl)).mp rfl,
     (wpConverges_blockCfgStep_iff_of_invClosedNoFork_loop invClosedPartialCfg
       invClosedReachable invClosedPartialCfg_invClosedNoFork
       ⟨some, 1, 12, 1⟩ (Or.inr rfl) (· = 12)).mpr
@@ -4962,9 +5143,9 @@ theorem stride3_while_cutpoint_wpConverges_wrap_canary (n i : Nat) :
 2. `stdValAlg.branchSplit` recovers `(cond, vt, vf)` from a symbolic choice node
    (`zipVal (.symBool true)`) and returns `none` on references and scalars.
 3. `stdValAlg.sameCond` identifies matching symbolic conditions and rejects
-   distinct ones, `stdValAlg.sameAggregateShape` distinguishes pairs from leaves
-   and is preserved by `setField`, and `handleRefs` / `remapValLoan` traverse
-   choice arms and fields sound-and-completely. -/
+   distinct ones, `stdValAlg.sameAggregateShape` distinguishes pairs from
+   leaves, and `handleRefs` / `remapValLoan` visit (and remap) the references
+   in both arms of a choice node. -/
 theorem wfPlan_and_valAlgebra_refinements_canaries :
     WfPlan stdValAlg
       (.seq (.branch countUpCond countUpBody .skip)
