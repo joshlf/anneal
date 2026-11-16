@@ -842,9 +842,12 @@ theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
 **Theorem L3.21 (`mir_structural_completeness_brief_1_4_corresponds`)**:
 Universal characterization of the `BRIEF-1.4` structural completeness constructs:
 1. `StatementKind.backwardIncompatibleDropHint` steps as a no-op advancing `stmtIdx`;
-2. `ProjectionElem.unwrapUnsafeBinder` and `Rvalue.wrapUnsafeBinder` act as
-   transparent value identities in `readProjectedValue`, `writeProjectedValue`,
-   and `evalRvalue`;
+2. `ProjectionElem.unwrapUnsafeBinder` acts as a transparent value identity in
+   `readProjectedValue` and `writeProjectedValue`, and `Rvalue.wrapUnsafeBinder`
+   evaluates exactly like `Rvalue.use` when the binder type is neither a
+   single-field binder struct (`binderStructLayout? = none`) nor resolved to a
+   layout whose scalar validity range must be checked (`resolvedTyLayout? = none`;
+   see `evalWrapUnsafeBinder` for the other cases);
 3. `writeProjectedValue` on `ProjectionElem.subslice` splices in-bounds subslice
    aggregates and faults with `.ub` on length mismatch or out-of-bounds indices;
 4. `evalRvalue` evaluates `AggregateKind.closure` to `Value.aggregate 0 vals`;
@@ -858,12 +861,15 @@ theorem mir_structural_completeness_brief_1_4_corresponds
     (op : Operand) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
     (closureDefPath : DefPath) (ops : List Operand)
-    (sc : ScalarVal) (ptrVal : ProvenancePtr) (ptrSz : Nat) :
+    (sc : ScalarVal) (ptrVal : ProvenancePtr) (ptrSz : Nat)
+    (hBinder : binderStructLayout? localDecls layouts binderTy = none)
+    (hRange : resolvedTyLayout? localDecls layouts binderTy = none) :
     let p0 : Place := { local_ := 0, projection := .nil }
     -- 1. StatementKind.backwardIncompatibleDropHint steps as a no-op
     evalStmt s { kind := .backwardIncompatibleDropHint dropPlace, span := span } =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
-    -- 2. ProjectionElem.unwrapUnsafeBinder and Rvalue.wrapUnsafeBinder are transparent identities
+    -- 2. ProjectionElem.unwrapUnsafeBinder is a transparent identity; Rvalue.wrapUnsafeBinder
+    -- into a transparent binder type evaluates like Rvalue.use
     readProjectedValue locals v (.unwrapUnsafeBinder binderTy :: rest) =
       readProjectedValue locals v rest ∧
     writeProjectedValue locals v (.unwrapUnsafeBinder binderTy :: rest) newVal =
@@ -891,7 +897,14 @@ theorem mir_structural_completeness_brief_1_4_corresponds
       .ok (.scalar ⟨0, 8⟩) [.init (.scalar sc)] mem ∧
     evalRvalue [.init (.ptr ptrVal ptrSz)] (.discriminant p0) mem localDecls layouts =
       .ok (.scalar ⟨0, 8⟩) [.init (.ptr ptrVal ptrSz)] mem := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  have hWrap : evalRvalue locals (.wrapUnsafeBinder op binderTy) mem localDecls layouts =
+      evalRvalue locals (.use op) mem localDecls layouts := by
+    show evalWrapUnsafeBinder locals op binderTy mem localDecls layouts =
+      evalUseRvalue locals op mem localDecls layouts
+    unfold evalWrapUnsafeBinder
+    rw [hBinder, hRange]
+    cases evalUseRvalue locals op mem localDecls layouts <;> rfl
+  exact ⟨rfl, rfl, rfl, hWrap, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 **Theorem L3.22 (`mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds`)**:

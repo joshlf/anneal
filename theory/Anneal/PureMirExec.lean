@@ -946,6 +946,36 @@ private theorem evalRvalue_binaryOp_pure_eq_withMem
         | _ => rfl
       | _ => rfl
 
+/-- The operand load `evalUseRvalue` of a pure operand depends on memory only through the memory it
+returns. -/
+theorem evalUseRvalue_pure_eq_withMem
+    (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_pure : isPureOperand op = true) :
+    evalUseRvalue locals op mem localDecls layouts =
+      RvalueEvalResult.withMem mem
+        (evalUseRvalue locals op emptyMemory localDecls layouts) := by
+  dsimp only [evalUseRvalue]
+  rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
+  rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
+  cases evalOperand locals op [] [] layouts [] localDecls with
+  | ub => rfl
+  | unsupported => rfl
+  | ok v locals' =>
+    dsimp only
+    cases validateLoadedValue layouts localDecls op v with
+    | false => rfl
+    | true =>
+      cases op with
+      | constant _ => rfl
+      | copy p | move p =>
+        rcases p with ⟨loc, proj⟩
+        cases proj with
+        | nil => rfl
+        | cons hd tl =>
+          simp only [isPureOperand, isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
+          cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
+
 theorem evalRvalue_pure_eq_withMem_core
     (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -958,7 +988,7 @@ theorem evalRvalue_pure_eq_withMem_core
       RvalueEvalResult.withMem mem
         (evalRvalue locals rv emptyMemory localDecls layouts) := by
   cases rv with
-  | use op | wrapUnsafeBinder op _ =>
+  | use op =>
     dsimp only [isPureRvalue] at h_pure
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
@@ -980,6 +1010,22 @@ theorem evalRvalue_pure_eq_withMem_core
           | cons hd tl =>
             simp only [isPureOperand, isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
             cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
+  | wrapUnsafeBinder op targetTy =>
+    dsimp only [isPureRvalue] at h_pure
+    show evalWrapUnsafeBinder locals op targetTy mem localDecls layouts =
+      RvalueEvalResult.withMem mem
+        (evalWrapUnsafeBinder locals op targetTy emptyMemory localDecls layouts)
+    unfold evalWrapUnsafeBinder
+    rw [evalUseRvalue_pure_eq_withMem locals op mem localDecls layouts h_pure]
+    cases evalUseRvalue locals op emptyMemory localDecls layouts with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v l m =>
+      rw [show RvalueEvalResult.withMem mem (.ok v l m) = .ok v l mem from rfl]
+      dsimp only
+      repeat' (first
+        | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
+        | split)
   | «repeat» op count =>
     dsimp only [isPureRvalue] at h_pure
     dsimp only [evalRvalue]
@@ -1032,7 +1078,14 @@ theorem evalRvalue_pure_eq_withMem_core
     simp only [isPureRvalue, Bool.and_eq_true] at h_pure
     exact evalRvalue_binaryOp_pure_eq_withMem locals op lhs rhs mem localDecls layouts
       h_pure.1 h_pure.2.1 h_pure.2.2 h_bor_or_np
-  | nullaryOp _ _ => rfl
+  | nullaryOp op ty =>
+    show evalNullaryOp locals op ty mem localDecls layouts =
+      RvalueEvalResult.withMem mem (evalNullaryOp locals op ty emptyMemory localDecls layouts)
+    unfold evalNullaryOp
+    try dsimp only
+    repeat' (first
+      | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
+      | split)
   | unaryOp uop op =>
     dsimp only [isPureRvalue] at h_pure
     cases uop with
@@ -3886,6 +3939,16 @@ private theorem evalFloatCastRvalue_pushBaseStack
     dsimp only
     cases evalFloatCast ck (operandTy localDecls layouts op) targetTy layouts v <;> rfl
 
+/-- The operand load `evalUseRvalue` commutes with `Memory.pushBaseStack` (`[]` base stack). -/
+theorem evalUseRvalue_pushBaseStack
+    (calleeBody : CapturedMir) (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalUseRvalue locals op (Memory.pushBaseStack calleeBody [] mem) localDecls layouts =
+      RvalueEvalResult.pushBaseStack calleeBody []
+        (evalUseRvalue locals op mem localDecls layouts) := by
+  cases op
+  all_goals (dsimp only [evalUseRvalue, Memory.pushBaseStack]; repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split))
+
 /--
 `evalRvalue` is completely independent of `Memory.callStack` and
 `Memory.activeCallee`, commuting unconditionally with `Memory.pushBaseStack`.
@@ -4022,7 +4085,9 @@ theorem evalRvalue_pushBaseStack
               | split)
           | _ => rfl
         | _ => rfl
-  | nullaryOp _ _ => rfl
+  | nullaryOp op ty =>
+    dsimp only [evalRvalue, evalNullaryOp, Memory.pushBaseStack]
+    repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
   | unaryOp uop op =>
     cases uop with
     | not =>
@@ -4056,13 +4121,38 @@ theorem evalRvalue_pushBaseStack
     | _ =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
       repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
-  | shallowInitBox _ _ => rfl
+  | shallowInitBox op ty =>
+    show evalShallowInitBox locals op ty (Memory.pushBaseStack calleeBody [] mem) localDecls layouts =
+      RvalueEvalResult.pushBaseStack calleeBody []
+        (evalShallowInitBox locals op ty mem localDecls layouts)
+    unfold evalShallowInitBox
+    rw [evalUseRvalue_pushBaseStack]
+    cases evalUseRvalue locals op mem localDecls layouts with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v l m =>
+      rw [show RvalueEvalResult.pushBaseStack calleeBody [] (.ok v l m) =
+        .ok v l (Memory.pushBaseStack calleeBody [] m) from rfl]
+      dsimp only
+      repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
   | copyForDeref place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
     cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack <;> repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
-  | wrapUnsafeBinder op _ =>
-    cases op
-    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split))
+  | wrapUnsafeBinder op ty =>
+    show evalWrapUnsafeBinder locals op ty (Memory.pushBaseStack calleeBody [] mem) localDecls
+        layouts =
+      RvalueEvalResult.pushBaseStack calleeBody []
+        (evalWrapUnsafeBinder locals op ty mem localDecls layouts)
+    unfold evalWrapUnsafeBinder
+    rw [evalUseRvalue_pushBaseStack]
+    cases evalUseRvalue locals op mem localDecls layouts with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v l m =>
+      rw [show RvalueEvalResult.pushBaseStack calleeBody [] (.ok v l m) =
+        .ok v l (Memory.pushBaseStack calleeBody [] m) from rfl]
+      dsimp only
+      repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalCopySingleDirect_pushBaseStack
     (calleeBody : CapturedMir)
@@ -4509,6 +4599,16 @@ theorem copyWriteDstVal_isStmtNode
     | exact Or.inr (Or.inr rfl)
     | split)
 
+/-- `Trusted`'s destination write `commitCopyDstPlaceWrite` (shared by the statement and call
+forms of `copy_nonoverlapping` and by call-form `write_bytes`) is `copyWriteDstVal`. -/
+theorem commitCopyDstPlaceWrite_eq_copyWriteDstVal
+    (s : MachineState) (dstPlace : Place) (dstLoc : Local) (dstTag : Nat)
+    (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    commitCopyDstPlaceWrite s dstPlace dstLoc dstTag locals₃ newVal localDecls layouts =
+      copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts :=
+  rfl
+
 theorem copyViaBytesBody_pushBaseStack
     (calleeBody : CapturedMir)
     (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -4735,6 +4835,36 @@ theorem evalCopyNonOverlappingWithCount_isStmtNode
                  | true => exact evalCopyNonOverlappingPermOk_isStmtNode ..)
       | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
     | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
+
+/-- With no Tree Borrows entries, the statement-form `copy_nonoverlapping` core either copies
+nothing (`count = 0`: it only advances) or faults (no borrow entry for a pointer argument). -/
+theorem evalCopyNonOverlappingWithCount_borrows_nil
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot)
+    (h_nil : s.memory.borrows = []) :
+    (Nat.beq countBits 0 = true ∧
+      evalCopyNonOverlappingWithCount
+          s src dst localDecls layouts srcVal dstVal countBits locals₃ =
+        MirStepNode.step (advanceStmt s locals₃)) ∨
+    ∃ fk : FailureKind,
+      evalCopyNonOverlappingWithCount
+          s src dst localDecls layouts srcVal dstVal countBits locals₃ =
+        MirStepNode.fail fk := by
+  rw [evalCopyNonOverlappingWithCount_eq]
+  cases h_c : Nat.beq countBits 0 with
+  | true => exact Or.inl ⟨rfl, rfl⟩
+  | false =>
+    refine Or.inr ?_
+    cases srcVal with
+    | ptr srcPtr _ =>
+      cases dstVal with
+      | ptr dstPtr _ =>
+        dsimp only
+        rw [h_nil]
+        exact ⟨_, rfl⟩
+      | _ => exact ⟨_, rfl⟩
+    | _ => exact ⟨_, rfl⟩
 
 theorem evalCopyNonOverlapping_isStmtNode
     (s : MachineState) (src dst count : Operand)
@@ -6079,6 +6209,8 @@ theorem evalNonSelectIntrinsicCall_cases
   | alignOfVal =>
     exact evalAlignOfValIntrinsicCall_cases target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb
+  | copyNonOverlapping | writeBytes =>
+    exact Or.inr (Or.inr fun _ => rfl)
 
 private theorem writePlaceValue_deref_nil_borrows
     (locals : List LocalSlot) (loc : Local) (tl : List ProjectionElem)
@@ -6293,6 +6425,144 @@ theorem evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP
   · rw [h_fl ms] at h_st; exact False.elim h_st
   · rw [h_un ms] at h_st; exact False.elim h_st
 
+/-- `Trusted.finishMemIntrinsicCall` after a statement step `s'` writes `()` from the call's
+frame, with `s'`'s memory and frame locals. -/
+theorem finishMemIntrinsicCall_step (s s' : MachineState) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    finishMemIntrinsicCall s (MirStepNode.step s') destination targetBb =
+      writeIntrinsicReturn { s with memory := s'.memory } s'.frame.locals destination targetBb
+        .unit :=
+  rfl
+
+theorem commitCopyDstPlaceWrite_pushBaseStack
+    (calleeBody : CapturedMir) (s : MachineState) (dstPlace : Place) (dstLoc : Local)
+    (dstTag : Nat) (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    commitCopyDstPlaceWrite (MachineState.pushBaseStack calleeBody [] s) dstPlace dstLoc dstTag
+        locals₃ newVal localDecls layouts =
+      MirStepNode.pushBaseStack calleeBody []
+        (commitCopyDstPlaceWrite s dstPlace dstLoc dstTag locals₃ newVal localDecls layouts) :=
+  copyWriteDstVal_pushBaseStack calleeBody s locals₃ dstPlace dstLoc dstTag newVal localDecls
+    layouts
+
+theorem commitCopyDstPlaceWrite_isStmtNode
+    (s : MachineState) (dstPlace : Place) (dstLoc : Local) (dstTag : Nat)
+    (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    IsStmtNode
+      (commitCopyDstPlaceWrite s dstPlace dstLoc dstTag locals₃ newVal localDecls layouts) :=
+  copyWriteDstVal_isStmtNode s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts
+
+/-- With no Tree Borrows entries, a `write_bytes` call never writes: its destination pointer has
+no borrow entry, so `writeBytesAction` faults. -/
+theorem writeBytesAction_borrows_nil (frameDepth : Nat) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) :
+    ∃ fk : FailureKind,
+      writeBytesAction [] frameDepth target bodyLocalDecls bodyLayouts argOps argVals =
+        .fault fk := by
+  have hlb : ∀ t : Nat, lookupBorrow [] t = none := fun _ => rfl
+  unfold writeBytesAction
+  simp only [hlb]
+  repeat' (first | exact ⟨_, rfl⟩ | split)
+
+/-- Call-form `copy_nonoverlapping` commutes with `MachineState.pushBaseStack` on every
+successful (call-free) step. -/
+theorem evalCopyNonOverlappingCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (ms : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalCopyNonOverlappingCall ms bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalCopyNonOverlappingCall ms bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.step nextSt ∧
+      evalCopyNonOverlappingCall (MachineState.pushBaseStack calleeBody baseStack ms)
+          bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  unfold evalCopyNonOverlappingCall at h_st ⊢
+  rcases argOps with _ | ⟨srcOp, _ | ⟨dstOp, _ | ⟨cntOp, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    rcases argVals with
+      _ | ⟨srcVal, _ | ⟨dstVal, _ | ⟨_ | countSc | ⟨_, _⟩ | ⟨_, _⟩, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    try exact False.elim h_st
+  · -- exactly three operands and values, the last a `count` scalar
+    dsimp only at h_st ⊢
+    rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
+        srcVal dstVal countSc.bits locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+    · rcases h_bor with rfl | h_nil
+      · rw [hs'] at h_st
+        rw [evalCopyNonOverlappingWithCount_pushBaseStack, hs']
+        exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
+          { ms with memory := s'.memory } s'.frame.locals destination targetBb .unit h_st
+          (Or.inl rfl)
+      · rcases evalCopyNonOverlappingWithCount_borrows_nil ms srcOp dstOp bodyLocalDecls
+            bodyLayouts srcVal dstVal countSc.bits locals' h_nil with ⟨h_c, h_eq⟩ | ⟨fk, hf⟩
+        · rw [h_eq] at h_st ⊢
+          rw [evalCopyNonOverlappingWithCount_eq, h_c]
+          exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
+            destination targetBb .unit h_st (Or.inr h_nil)
+        · rw [hf] at h_st; exact False.elim h_st
+    · rw [hf] at h_st; exact False.elim h_st
+    · rw [hu] at h_st; exact False.elim h_st
+
+/-- Call-form `write_bytes` commutes with `MachineState.pushBaseStack` on every successful
+(call-free) step. -/
+theorem evalWriteBytesCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalWriteBytesCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalWriteBytesCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.step nextSt ∧
+      evalWriteBytesCall (MachineState.pushBaseStack calleeBody baseStack ms) target
+          bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  rcases h_bor with rfl | h_nil
+  · have h_act :
+        writeBytesAction (MachineState.pushBaseStack calleeBody [] ms).memory.borrows
+            (length (MachineState.pushBaseStack calleeBody [] ms).memory.callStack) target
+            bodyLocalDecls bodyLayouts argOps argVals =
+          writeBytesAction ms.memory.borrows (length ms.memory.callStack) target
+            bodyLocalDecls bodyLayouts argOps argVals := rfl
+    unfold evalWriteBytesCall at h_st ⊢
+    rw [h_act]
+    cases h_a : writeBytesAction ms.memory.borrows (length ms.memory.callStack) target
+        bodyLocalDecls bodyLayouts argOps argVals with
+    | fault fk => rw [h_a] at h_st; exact False.elim h_st
+    | noWrite =>
+      rw [h_a] at h_st
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody [] ms locals' destination
+        targetBb .unit h_st (Or.inl rfl)
+    | store dstPlace dstLoc dstTag newVal =>
+      rw [h_a] at h_st
+      dsimp only at h_st ⊢
+      rw [commitCopyDstPlaceWrite_pushBaseStack]
+      rcases commitCopyDstPlaceWrite_isStmtNode ms dstPlace dstLoc dstTag locals' newVal
+          bodyLocalDecls bodyLayouts with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+      · rw [hs'] at h_st ⊢
+        exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
+          { ms with memory := s'.memory } s'.frame.locals destination targetBb .unit h_st
+          (Or.inl rfl)
+      · rw [hf] at h_st; exact False.elim h_st
+      · rw [hu] at h_st; exact False.elim h_st
+  · obtain ⟨fk, h_fk⟩ := writeBytesAction_borrows_nil (length ms.memory.callStack) target
+      bodyLocalDecls bodyLayouts argOps argVals
+    unfold evalWriteBytesCall at h_st
+    rw [h_nil, h_fk] at h_st
+    exact False.elim h_st
+
 @[reducible]
 def selectTupleTyOpt : List RigidTy → Option RigidTy
   | firstTy :: _ => some firstTy
@@ -6402,14 +6672,49 @@ theorem evalDirectRustIntrinsic?_nonSelect
     (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
     {rk : RustIntrinsicKind}
     (h_cl : classifyRustIntrinsic? target.defPath = some rk)
-    (h_ne : rk ≠ .constEvalSelect) :
+    (h_ne : rk ≠ .constEvalSelect)
+    (h_nc : rk ≠ .copyNonOverlapping)
+    (h_nw : rk ≠ .writeBytes) :
     evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb unwind =
     some (evalNonSelectIntrinsicCall rk s target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb) := by
   unfold evalDirectRustIntrinsic?
   rw [h_cl]
-  cases rk <;> first | exact False.elim (h_ne rfl) | rfl
+  cases rk <;>
+    first
+    | exact False.elim (h_ne rfl)
+    | exact False.elim (h_nc rfl)
+    | exact False.elim (h_nw rfl)
+    | rfl
+
+theorem evalDirectRustIntrinsic?_copyNonOverlapping
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : classifyRustIntrinsic? target.defPath = some .copyNonOverlapping) :
+    evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb unwind =
+    some (evalCopyNonOverlappingCall s bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb) := by
+  unfold evalDirectRustIntrinsic?
+  rw [h_cl]
+
+theorem evalDirectRustIntrinsic?_writeBytes
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : classifyRustIntrinsic? target.defPath = some .writeBytes) :
+    evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb unwind =
+    some (evalWriteBytesCall s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb) := by
+  unfold evalDirectRustIntrinsic?
+  rw [h_cl]
 
 theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -6579,7 +6884,25 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
                           | faulted _ => rw [h_ap] at h_st; exact False.elim h_st
       · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
         injection h_di with h_sn; subst h_sn; exact False.elim h_st
-    · rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs] at h_di ⊢
+    · by_cases h_cn : rk = .copyNonOverlapping
+      · subst h_cn
+        rw [evalDirectRustIntrinsic?_copyNonOverlapping _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di ⊢
+        injection h_di with h_sn
+        subst h_sn
+        rcases evalCopyNonOverlappingCall_pushBaseStack_of_noCallWP calleeBody baseStack ms
+            curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb
+            h_st h_bor with ⟨nextSt, h1, h2⟩
+        exact ⟨nextSt, h1, congrArg some h2⟩
+      by_cases h_wb : rk = .writeBytes
+      · subst h_wb
+        rw [evalDirectRustIntrinsic?_writeBytes _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di ⊢
+        injection h_di with h_sn
+        subst h_sn
+        rcases evalWriteBytesCall_pushBaseStack_of_noCallWP calleeBody baseStack ms target
+            curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb
+            h_st h_bor with ⟨nextSt, h1, h2⟩
+        exact ⟨nextSt, h1, congrArg some h2⟩
+      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb] at h_di ⊢
       injection h_di with h_sn
       subst h_sn
       rcases evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP calleeBody
@@ -7075,7 +7398,9 @@ theorem evalRvalue_ok_borrows_ne_nil
       dsimp only [evalRvalue]
       repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
   | binaryOp op lhsOp rhsOp => exact evalRvalue_binaryOp_ne_nil h
-  | nullaryOp _ _ => exact rok_unsup
+  | nullaryOp op ty =>
+    dsimp only [evalRvalue, evalNullaryOp]
+    repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
   | unaryOp uop op =>
     cases uop with
     | not =>
@@ -7106,7 +7431,20 @@ theorem evalRvalue_ok_borrows_ne_nil
     | _ =>
       dsimp only [evalRvalue]
       repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
-  | shallowInitBox _ _ => exact rok_unsup
+  | shallowInitBox op ty =>
+    have hU : rvalOkBorrowsNeNil (evalUseRvalue locals op mem ld ly) :=
+      evalRvalue_use_ne_nil (locals := locals) (op := op) (ld := ld) (ly := ly) h
+    show rvalOkBorrowsNeNil (evalShallowInitBox locals op ty mem ld ly)
+    unfold evalShallowInitBox
+    revert hU
+    cases evalUseRvalue locals op mem ld ly with
+    | ub => intro _; exact rok_ub
+    | unsupported => intro _; exact rok_unsup
+    | ok v l m =>
+      intro hU
+      have hm : m.borrows ≠ [] := hU v l m rfl
+      dsimp only
+      repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok hm | split)
   | copyForDeref place =>
     dsimp only [evalRvalue]
     cases evalOperand locals (.copy place) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack <;>
@@ -7119,7 +7457,20 @@ theorem evalRvalue_ok_borrows_ne_nil
         | exact rok_ok (freezeDerefReadBorrowsAt_ne_nil nofun)
         | exact rok_ok (freezeTreeBorrowsOnReadAtProj_ne_nil nofun)
         | split)
-  | wrapUnsafeBinder op _ => exact evalRvalue_use_ne_nil h
+  | wrapUnsafeBinder op ty =>
+    have hU : rvalOkBorrowsNeNil (evalUseRvalue locals op mem ld ly) :=
+      evalRvalue_use_ne_nil (locals := locals) (op := op) (ld := ld) (ly := ly) h
+    show rvalOkBorrowsNeNil (evalWrapUnsafeBinder locals op ty mem ld ly)
+    unfold evalWrapUnsafeBinder
+    revert hU
+    cases evalUseRvalue locals op mem ld ly with
+    | ub => intro _; exact rok_ub
+    | unsupported => intro _; exact rok_unsup
+    | ok v l m =>
+      intro hU
+      have hm : m.borrows ≠ [] := hU v l m rfl
+      dsimp only
+      repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok hm | split)
 
 def stmtStepBorrowsNeNil (n : MirStepNode) : Prop :=
   ∀ ns : MachineState, n = MirStepNode.step ns → ns.memory.borrows ≠ []
@@ -7195,9 +7546,9 @@ private theorem borrowsAfterCopySingleDirect_ne_nil
     | cons _ _ => nofun
   · nofun
 
-private theorem evalCopyNonOverlapping_ne_nil
-    {s src dst count ld ly} (h : s.memory.borrows ≠ []) :
-    stmtStepBorrowsNeNil (evalCopyNonOverlapping s src dst count ld ly) := by
+private theorem evalCopyNonOverlappingWithCount_ne_nil
+    {s src dst ld ly sv dv cnt l3} (h : s.memory.borrows ≠ []) :
+    stmtStepBorrowsNeNil (evalCopyNonOverlappingWithCount s src dst ld ly sv dv cnt l3) := by
   have h_ff {sp dp se de cb l3} :
       stmtStepBorrowsNeNil (evalForeignFrameCopySingleDirect s src dst ld ly sp dp se de cb l3) := by
     unfold evalForeignFrameCopySingleDirect; try dsimp only
@@ -7238,8 +7589,18 @@ private theorem evalCopyNonOverlapping_ne_nil
       | exact copyViaBytesBody_ne_nil h
       | exact copyWriteDstVal_ne_nil h
       | split)
-  unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount; try dsimp only
+  unfold evalCopyNonOverlappingWithCount; try dsimp only
   repeat' (first | exact sn_fail | exact sn_unsup | exact sn_step h | exact h_ff | exact h_perm | split)
+
+private theorem evalCopyNonOverlapping_ne_nil
+    {s src dst count ld ly} (h : s.memory.borrows ≠ []) :
+    stmtStepBorrowsNeNil (evalCopyNonOverlapping s src dst count ld ly) := by
+  unfold evalCopyNonOverlapping; try dsimp only
+  repeat' (first
+    | exact sn_fail
+    | exact sn_unsup
+    | exact evalCopyNonOverlappingWithCount_ne_nil h
+    | split)
 
 private def fwOkBorrowsNeNil (r : FrameWriteResult) : Prop :=
   ∀ l m, r = .ok l m → m.borrows ≠ []
@@ -7965,7 +8326,9 @@ theorem evalRvalue_borrows_nil_pushBaseStack
     | binaryOp op lhsOp rhsOp =>
       exact evalRvalue_binaryOp_cons_nil_rnp calleeBody bHd bTl locals op lhsOp rhsOp nA gl nT cal tr cs ac ap nP cl fp ex localDecls layouts
 
-    | nullaryOp _ _ => exact rnp_unsup
+    | nullaryOp op ty =>
+      dsimp only [m0, evalRvalue, evalNullaryOp, Memory.pushBaseStack]
+      repeat' (first | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | split)
     | unaryOp uop op =>
       cases uop with
       | not =>
@@ -8005,14 +8368,67 @@ theorem evalRvalue_borrows_nil_pushBaseStack
         dsimp only [m0, evalRvalue, Memory.pushBaseStack]
         try simp only [evalOperands_nil_borrows_callStack]
         repeat' (first | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | split)
-    | shallowInitBox _ _ => exact rnp_unsup
+    | shallowInitBox op ty =>
+      have hU : rvalNilPushEq calleeBody (bHd :: bTl)
+          (evalUseRvalue locals op (Memory.pushBaseStack calleeBody (bHd :: bTl) m0) localDecls
+            layouts)
+          (evalUseRvalue locals op m0 localDecls layouts) :=
+        evalRvalue_use_cons_nil_rnp calleeBody bHd bTl locals op nA gl nT cal tr cs ac ap nP cl fp ex
+          localDecls layouts
+      show rvalNilPushEq calleeBody (bHd :: bTl)
+        (evalShallowInitBox locals op ty (Memory.pushBaseStack calleeBody (bHd :: bTl) m0) localDecls layouts)
+        (evalShallowInitBox locals op ty m0 localDecls layouts)
+      unfold evalShallowInitBox
+      revert hU
+      cases evalUseRvalue locals op m0 localDecls layouts with
+      | ub => intro _; exact rnp_ub
+      | unsupported => intro _; exact rnp_unsup
+      | ok v l m =>
+        intro hU hEx
+        obtain ⟨v', l', m', hEq, hNil⟩ := hEx
+        have hm : m' = m := by
+          dsimp only at hEq
+          revert hEq
+          repeat' (first | (intro hEq; cases hEq <;> rfl) | split)
+        subst hm
+        rw [hU ⟨v, l, m', rfl, hNil⟩,
+          show RvalueEvalResult.pushBaseStack calleeBody (bHd :: bTl) (.ok v l m') =
+            .ok v l (Memory.pushBaseStack calleeBody (bHd :: bTl) m') from rfl]
+        dsimp only
+        repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
     | copyForDeref place =>
       dsimp only [m0, evalRvalue, Memory.pushBaseStack, lookupBorrow,
         freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj]
       try simp only [evalOperand_nil_borrows_callStack]
       repeat' (first | contradiction | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | exact rnp_mint | split)
-    | wrapUnsafeBinder op _ =>
-      exact evalRvalue_use_cons_nil_rnp calleeBody bHd bTl locals op nA gl nT cal tr cs ac ap nP cl fp ex localDecls layouts
+    | wrapUnsafeBinder op ty =>
+      have hU : rvalNilPushEq calleeBody (bHd :: bTl)
+          (evalUseRvalue locals op (Memory.pushBaseStack calleeBody (bHd :: bTl) m0) localDecls
+            layouts)
+          (evalUseRvalue locals op m0 localDecls layouts) :=
+        evalRvalue_use_cons_nil_rnp calleeBody bHd bTl locals op nA gl nT cal tr cs ac ap nP cl fp ex
+          localDecls layouts
+      show rvalNilPushEq calleeBody (bHd :: bTl)
+        (evalWrapUnsafeBinder locals op ty (Memory.pushBaseStack calleeBody (bHd :: bTl) m0) localDecls layouts)
+        (evalWrapUnsafeBinder locals op ty m0 localDecls layouts)
+      unfold evalWrapUnsafeBinder
+      revert hU
+      cases evalUseRvalue locals op m0 localDecls layouts with
+      | ub => intro _; exact rnp_ub
+      | unsupported => intro _; exact rnp_unsup
+      | ok v l m =>
+        intro hU hEx
+        obtain ⟨v', l', m', hEq, hNil⟩ := hEx
+        have hm : m' = m := by
+          dsimp only at hEq
+          revert hEq
+          repeat' (first | (intro hEq; cases hEq <;> rfl) | split)
+        subst hm
+        rw [hU ⟨v, l, m', rfl, hNil⟩,
+          show RvalueEvalResult.pushBaseStack calleeBody (bHd :: bTl) (.ok v l m') =
+            .ok v l (Memory.pushBaseStack calleeBody (bHd :: bTl) m') from rfl]
+        dsimp only
+        repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 private theorem evalAssignDst_borrows_ne_nil
     {s : MachineState} {dst : Place} {val : Value}
@@ -8383,6 +8799,76 @@ private theorem evalNonSelectIntrinsicCall_borrows_ne_nil_of_noCallWP
   · rw [h_fl ms] at h_st; exact False.elim h_st
   · rw [h_un ms] at h_st; exact False.elim h_st
 
+private theorem evalCopyNonOverlappingCall_borrows_ne_nil_of_noCallWP
+    (ms : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalCopyNonOverlappingCall ms bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalCopyNonOverlappingCall ms bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] := by
+  unfold evalCopyNonOverlappingCall at h_st ⊢
+  rcases argOps with _ | ⟨srcOp, _ | ⟨dstOp, _ | ⟨cntOp, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    rcases argVals with
+      _ | ⟨srcVal, _ | ⟨dstVal, _ | ⟨_ | countSc | ⟨_, _⟩ | ⟨_, _⟩, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    try exact False.elim h_st
+  · -- exactly three operands and values, the last a `count` scalar
+    dsimp only at h_st ⊢
+    have h_sn := evalCopyNonOverlappingWithCount_ne_nil (src := srcOp) (dst := dstOp)
+      (ld := bodyLocalDecls) (ly := bodyLayouts) (sv := srcVal) (dv := dstVal)
+      (cnt := countSc.bits) (l3 := locals') h_ne
+    rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
+        srcVal dstVal countSc.bits locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+    · rw [hs'] at h_st ⊢
+      exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP { ms with memory := s'.memory }
+        s'.frame.locals destination targetBb .unit (h_sn s' hs') h_st
+    · rw [hf] at h_st; exact False.elim h_st
+    · rw [hu] at h_st; exact False.elim h_st
+
+private theorem evalWriteBytesCall_borrows_ne_nil_of_noCallWP
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalWriteBytesCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalWriteBytesCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] := by
+  unfold evalWriteBytesCall at h_st ⊢
+  cases h_a : writeBytesAction ms.memory.borrows (length ms.memory.callStack) target
+      bodyLocalDecls bodyLayouts argOps argVals with
+  | fault fk => rw [h_a] at h_st; exact False.elim h_st
+  | noWrite =>
+    rw [h_a] at h_st
+    exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP ms locals' destination targetBb .unit
+      h_ne h_st
+  | store dstPlace dstLoc dstTag newVal =>
+    rw [h_a] at h_st
+    dsimp only at h_st ⊢
+    have h_sn : stmtStepBorrowsNeNil
+        (commitCopyDstPlaceWrite ms dstPlace dstLoc dstTag locals' newVal bodyLocalDecls
+          bodyLayouts) :=
+      copyWriteDstVal_ne_nil (s := ms) (l3 := locals') (dp := dstPlace) (dl := dstLoc)
+        (dt := dstTag) (nv := newVal) (ld := bodyLocalDecls) (ly := bodyLayouts) h_ne
+    rcases commitCopyDstPlaceWrite_isStmtNode ms dstPlace dstLoc dstTag locals' newVal
+        bodyLocalDecls bodyLayouts with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+    · rw [hs'] at h_st ⊢
+      exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP { ms with memory := s'.memory }
+        s'.frame.locals destination targetBb .unit (h_sn s' hs') h_st
+    · rw [hf] at h_st; exact False.elim h_st
+    · rw [hu] at h_st; exact False.elim h_st
+
 private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
     (ms : MachineState) (curBody : CapturedMir)
     (target : ResolvedCallTarget) (argOps : List Operand)
@@ -8497,7 +8983,19 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
                           | faulted _ => intro h_st; exact False.elim h_st
       · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
         injection h_di with h_sn; subst h_sn; exact False.elim h_st
-    · rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs] at h_di
+    · by_cases h_cn : rk = .copyNonOverlapping
+      · subst h_cn
+        rw [evalDirectRustIntrinsic?_copyNonOverlapping _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+        injection h_di with h_sn; subst h_sn
+        exact evalCopyNonOverlappingCall_borrows_ne_nil_of_noCallWP ms curBody.localDecls
+          curBody.layouts argOps argVals locals' destination targetBb h_ne h_st
+      by_cases h_wb : rk = .writeBytes
+      · subst h_wb
+        rw [evalDirectRustIntrinsic?_writeBytes _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+        injection h_di with h_sn; subst h_sn
+        exact evalWriteBytesCall_borrows_ne_nil_of_noCallWP ms target curBody.localDecls
+          curBody.layouts argOps argVals locals' destination targetBb h_ne h_st
+      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb] at h_di
       injection h_di with h_sn; subst h_sn
       exact evalNonSelectIntrinsicCall_borrows_ne_nil_of_noCallWP
         rk ms target curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb h_ne h_st
@@ -9803,6 +10301,42 @@ theorem extCallAbortsProp_evalNonSelectIntrinsicCall
   · rw [h_fl s]; trivial
   · rw [h_un s]; trivial
 
+theorem extCallAbortsProp_finishMemIntrinsicCall (s : MachineState) (node : MirStepNode)
+    (destination : Place) (targetBb : BasicBlockIdx) (h_node : IsStmtNode node) :
+    extCallAbortsProp (finishMemIntrinsicCall s node destination targetBb) := by
+  rcases h_node with ⟨s', rfl⟩ | ⟨fk, rfl⟩ | rfl
+  · rw [finishMemIntrinsicCall_step]
+    exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+  · trivial
+  · trivial
+
+theorem extCallAbortsProp_evalCopyNonOverlappingCall
+    (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalCopyNonOverlappingCall s bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalCopyNonOverlappingCall
+  split
+  · exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
+      (evalCopyNonOverlappingWithCount_isStmtNode _ _ _ _ _ _ _ _ _)
+  · trivial
+
+theorem extCallAbortsProp_evalWriteBytesCall
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalWriteBytesCall
+  split
+  · trivial
+  · exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+  · exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
+      (commitCopyDstPlaceWrite_isStmtNode _ _ _ _ _ _ _ _)
+
 theorem extCallAbortsProp_evalDirectRustIntrinsic?
     (s : MachineState) (currentBody : Option CapturedMir)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
@@ -9899,7 +10433,21 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
                         | false => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
       · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
         injection h_di with h_sn; subst h_sn; trivial
-    · rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs] at h_di
+    · by_cases h_cn : rk = .copyNonOverlapping
+      · subst h_cn
+        rw [evalDirectRustIntrinsic?_copyNonOverlapping _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+        injection h_di with h_sn
+        subst h_sn
+        exact extCallAbortsProp_evalCopyNonOverlappingCall s bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb
+      by_cases h_wb : rk = .writeBytes
+      · subst h_wb
+        rw [evalDirectRustIntrinsic?_writeBytes _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+        injection h_di with h_sn
+        subst h_sn
+        exact extCallAbortsProp_evalWriteBytesCall s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb
+      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb] at h_di
       injection h_di with h_sn
       subst h_sn
       exact extCallAbortsProp_evalNonSelectIntrinsicCall rk s target
@@ -17716,7 +18264,8 @@ theorem evalDirectRustIntrinsic_bswap_u32
       { defPath := "core::intrinsics::bswap", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
       decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
     some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureBswapLoop 4 v 0, 4⟩)) := by
-  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .bswap) rfl (by rintro ⟨⟩)]
+  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .bswap) rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
+    (by rintro ⟨⟩)]
   change some (writeIntrinsicScalarResult s locals' dst targetBb (evalBswap ⟨v, 4⟩)) = _
   rw [evalBswap_u32_eq hv]
 
@@ -17730,7 +18279,8 @@ theorem evalDirectRustIntrinsic_ctpop_u32
       { defPath := "core::intrinsics::ctpop", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
       decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
     some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureCtpopLoop 32 v, 4⟩)) := by
-  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .ctpop) rfl (by rintro ⟨⟩)]
+  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .ctpop) rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
+    (by rintro ⟨⟩)]
   change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
   rw [evalCtpop_u32_eq hv]
 

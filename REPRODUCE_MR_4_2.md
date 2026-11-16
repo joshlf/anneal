@@ -101,7 +101,7 @@ checkpoints update it.
   (`evalCountOnes_intFromBits`, `evalCountOnes_signedness_indep`); plus Anneal's
   behavior on, and the fragment's rejection of, `Rvalue::NullaryOp(UbChecks)`,
   `CopyNonOverlapping` (`bdCopy2_noUB`), `BinOp::Offset` (`bdOffsetNeg1_noUB`),
-  `write_bytes` (`bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`),
+  `write_bytes` (`bdWriteBytes_untracked_unsupported`, `bdWriteBytes_untracked_not_noUB`),
   type-erased `MirCallReq`s (`bdExactDiv_same_request` versus
   `bdExactDiv_minirust_i32` / `bdExactDiv_minirust_u32`), diverging `abort`
   (`bdAbort_unsupported`), and `core::hint::unreachable_unchecked()`

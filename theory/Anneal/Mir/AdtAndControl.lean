@@ -1533,6 +1533,45 @@ theorem resolveAdtOffsetOf_taggedEnum_ge_tagSize {spec : AdtLayoutSpec} {tagSize
             PlaceAndRvalue.alignUp_ge tagSize (payloadAlign vs)
           omega
 
+/-- A captured compiler layout `l` *agrees with* the layout specification `spec` on variant `v`
+when every field offset that `resolveAdtOffsetOf` assigns in variant `v` is the offset `l`
+records (`layoutVariantFieldOffset?`, the per-hop offset `Trusted`'s `offset_of!` evaluation
+reads). -/
+def TypeLayoutOffsetsAgree (l : TypeLayout) (spec : AdtLayoutSpec) (v : Nat) : Prop :=
+  ∀ i off, resolveAdtOffsetOf spec v i = some off → layoutVariantFieldOffset? l v i = some off
+
+/-- **ADT `OffsetOf` bridges to Trusted's `evalRvalue` with `=`
+(`evalRvalue_offsetOf_adt_eq_resolveAdtOffsetOf`)**: for an ADT root type whose declaration layout
+`l` (the entry `intrinsicRigidTyByteSize` also reads) agrees with `spec` on variant `v`, a one-step
+`offset_of!` query that `resolveAdtOffsetOf` answers with `off` evaluates in Trusted's `evalRvalue`
+(`Rvalue.nullaryOp (.offsetOf [(v, i)])`) to exactly `off` as a `usize`, provided the type's size
+fits in `isize` and contains the offset (`resolveAdtOffsetOf_bounds_and_align` gives the latter for
+well-formed specifications). -/
+theorem evalRvalue_offsetOf_adt_eq_resolveAdtOffsetOf
+    {locals : List LocalSlot} {mem : Memory} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {defPath : DefPath} {args : List RigidTy} {lIdx : LayoutIdx}
+    {l : TypeLayout} {spec : AdtLayoutSpec} {v i off : Nat}
+    (hLayout : findDeclLayoutForRigidTy localDecls layouts (.adt defPath args) = some l)
+    (hAgree : TypeLayoutOffsetsAgree l spec v)
+    (hOff : resolveAdtOffsetOf spec v i = some off)
+    (hFits : l.size.bytes ≤ Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1)
+    (hIn : off ≤ l.size.bytes) :
+    evalRvalue locals (.nullaryOp (.offsetOf [(v, i)]) ⟨.adt defPath args, lIdx⟩) mem
+        localDecls layouts =
+      .ok (.scalar ⟨off, layoutPointerBytes layouts⟩) locals mem := by
+  have hSz : intrinsicRigidTyByteSize localDecls layouts (.adt defPath args) =
+      some l.size.bytes := by
+    simp only [intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, hLayout]
+  have hStep : layoutVariantFieldOffset? l v i = some off := hAgree i off hOff
+  rw [← evalNullaryOp_eq_trusted_evalRvalue]
+  unfold evalNullaryOp
+  simp only [hSz, hLayout, resolveOffsetOfPath, hStep, Nat.add_eq, Nat.add_zero]
+  have hB1 : Nat.ble l.size.bytes
+      (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) = true :=
+    Nat.ble_eq.mpr hFits
+  have hB2 : Nat.ble off l.size.bytes = true := Nat.ble_eq.mpr hIn
+  simp only [hB1, hB2, Bool.and_self]
+
 /-! ## Section 1c: Typed ADT `Discriminant` -/
 
 /-- Discriminant-relevant facts of a typed ADT (`AdtDef` in `ir.rs`): whether it is an enum,
@@ -11665,23 +11704,26 @@ theorem evalAdtDiscriminant_refines_evalRvalue {slots : List LocalSlotState}
     mem.callerLocals localDecls mem.callStack hNoUnion]
   exact hT
 
-/-- Trusted's `evalRvalue` on `WrapUnsafeBinder` of a copied non-union place (no `Deref`) returns
-the operand's value itself, with the frame unchanged, whenever Anneal can read the place on a
-below-related frame and the loaded value is valid for its type (`validateLoadedValue`). -/
-theorem evalRvalue_wrapUnsafeBinder_copy {slots : List LocalSlotState} {locals : List LocalSlot}
+/-- `Trusted`'s operand load `evalUseRvalue` (the `Rvalue.use` operand semantics shared by the
+`ShallowInitBox` and `WrapUnsafeBinder` arms of `evalRvalue`) on a copied non-union place (no
+`Deref`) returns the operand's value itself, with the frame and memory unchanged, whenever Anneal
+can read the place on a below-related frame and the loaded value is valid for its type
+(`validateLoadedValue`). -/
+theorem evalUseRvalue_copy {slots : List LocalSlotState} {locals : List LocalSlot}
     {place : Place} {v : Value} (hRel : SlotsRefine SlotBelow slots locals)
-    (hRead : readPlaceState slots place = .ok v) (ty : Ty) (mem : Memory)
+    (hRead : readPlaceState slots place = .ok v) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
       simp [placeTouchesUnion_nil_proj]) :
-    evalRvalue locals (.wrapUnsafeBinder (.copy place) ty) mem localDecls layouts =
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue locals (.copy place) mem localDecls
+        layouts =
       .ok v locals mem := by
   have hNoDeref := readPlaceState_ok_noDeref hRead
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead mem.borrows mem.globals layouts
     mem.callerLocals localDecls mem.callStack hNoUnion
   obtain ⟨loc, proj⟩ := place
-  unfold evalRvalue
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue
   simp only [hOp, hValid]
   cases proj with
   | nil => rfl
@@ -11690,47 +11732,140 @@ theorem evalRvalue_wrapUnsafeBinder_copy {slots : List LocalSlotState} {locals :
     | deref => simp [projectionHasDeref] at hNoDeref
     | _ => rfl
 
-/-- **`WrapUnsafeBinder` (identity) refines Trusted**: when the binder type is the operand type,
-Anneal's result is the operand value, exactly Trusted's `evalRvalue` result. -/
-theorem evalWrapUnsafeBinder_identity_refines_evalRvalue {slots : List LocalSlotState}
+/-- **`ShallowInitBox` agrees with Trusted (`evalShallowInitBox_agrees_evalRvalue`)**: for a copied
+non-union place holding a thin pointer `.ptr p sz` of the target width whose static type (when
+known) is a raw pointer, Trusted's `evalRvalue (.shallowInitBox (.copy place) T)` returns that same
+pointer (the `Box<T>` value) with the frame and memory unchanged, and Anneal's
+`evalShallowInitBox` likewise keeps the pointer's provenance and (in-width) address
+(`evalShallowInitBox_preserves`): both sides produce the operand pointer unchanged. -/
+theorem evalShallowInitBox_agrees_evalRvalue {τ : Type} {slots : List LocalSlotState}
+    {locals : List LocalSlot} {place : Place} {p : ProvenancePtr} {sz : Nat}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hRead : readPlaceState slots place = .ok (.ptr p sz)) (contentTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hValid : validateLoadedValue layouts localDecls (.copy place) (.ptr p sz) = true)
+    (hTy : operandTy localDecls layouts (.copy place) = none ∨
+      ∃ m pointee idx, operandTy localDecls layouts (.copy place) =
+        some ⟨.rawPtr m pointee, idx⟩)
+    (hWidth : sz = layoutPointerBytes layouts)
+    {ptrBits : Nat} {opTy : Option (RawPtrTy τ)} {inner : τ} {a q : APtr} {ty : RawPtrTy τ}
+    (hAnneal : evalShallowInitBox ptrBits opTy inner a = some (q, ty))
+    (hInWidth : a.addr < 2 ^ ptrBits)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
+      simp [placeTouchesUnion_nil_proj]) :
+    q = a ∧ ty = ⟨inner, true⟩ ∧
+      evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
+        .ok (.ptr p sz) locals mem := by
+  obtain ⟨_, hTyEq, _, _, hSame⟩ := evalShallowInitBox_preserves hAnneal
+  refine ⟨hSame hInWidth, hTyEq, ?_⟩
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
+      mem localDecls layouts = _
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
+  rw [hUse]
+  have hW : Nat.beq sz (layoutPointerBytes layouts) = true := by
+    rw [hWidth]; exact Nat.beq_refl _
+  rcases hTy with hTy | ⟨m, pointee, idx, hTy⟩ <;> simp only [hTy, hW]
+
+/-- **`ShallowInitBox` rejects non-pointer operands (`evalRvalue_shallowInitBox_nonPtr`)**: a copied
+operand that is not a thin pointer (an integer address, a wide pointer, `()`, or an aggregate) is
+unsupported, never silently reinterpreted as a box. -/
+theorem evalRvalue_shallowInitBox_nonPtr {slots : List LocalSlotState} {locals : List LocalSlot}
+    {place : Place} {v : Value} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRead : readPlaceState slots place = .ok v) (contentTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
+    (hNotPtr : ∀ p sz, v ≠ .ptr p sz)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
+      simp [placeTouchesUnion_nil_proj]) :
+    evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
+      .unsupported := by
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
+      mem localDecls layouts = _
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
+  rw [hUse]
+  dsimp only
+  split
+  · exact absurd rfl (hNotPtr _ _)
+  · rfl
+
+/-- **`WrapUnsafeBinder` into a transparent unsafe binder agrees two-sidedly with Trusted
+(`evalWrapUnsafeBinder_identity_eq_evalRvalue`)**: when the binder type is not a single-field
+binder struct (`binderStructLayout? = none`; every target `rustc`'s validator admits), Anneal's
+non-wrapping `evalWrapUnsafeBinder wf false` returns the operand `v` and Trusted's `evalRvalue`
+returns exactly `.ok v` when the target layout's scalar validity range admits `v`
+(`scalarValidRangeOk`), and `.ub` otherwise. -/
+theorem evalWrapUnsafeBinder_identity_eq_evalRvalue {slots : List LocalSlotState}
     {locals : List LocalSlot} {place : Place} {v out : Value} {wf : Value → Bool}
     {range? : Option (ScalarValidRange × Nat)} (hRel : SlotsRefine SlotBelow slots locals)
     (hRead : readPlaceState slots place = .ok v)
-    (h : evalWrapUnsafeBinder wf false range? v = some out) (ty : Ty) (mem : Memory)
+    (h : evalWrapUnsafeBinder wf false range? v = some out) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
+    (hNoBinder : binderStructLayout? localDecls layouts targetTy = none)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
       simp [placeTouchesUnion_nil_proj]) :
     out = v ∧
-      evalRvalue locals (.wrapUnsafeBinder (.copy place) ty) mem localDecls layouts =
-        .ok out locals mem := by
-  obtain ⟨_, hCase⟩ := evalWrapUnsafeBinder_preserves h locals ty
+      evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
+        (match (match resolvedTyLayout? localDecls layouts targetTy with
+                | some l => scalarValidRangeOk l v
+                | none => true) with
+         | true => .ok out locals mem
+         | false => .ub) := by
+  obtain ⟨_, hCase⟩ := evalWrapUnsafeBinder_preserves h locals targetTy
   rcases hCase with ⟨_, rfl⟩ | ⟨hW, _⟩
-  · exact ⟨rfl,
-      evalRvalue_wrapUnsafeBinder_copy hRel hRead ty mem localDecls layouts hValid hNoUnion⟩
+  · refine ⟨rfl, ?_⟩
+    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place)
+        targetTy mem localDecls layouts = _
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
+    rw [hUse, hNoBinder]
+    dsimp only
+    cases resolvedTyLayout? localDecls layouts targetTy with
+    | none => rfl
+    | some l =>
+      dsimp only
+      cases scalarValidRangeOk l out <;> rfl
   · nomatch hW
 
-/-- **Documented representation divergence of `WrapUnsafeBinder`**: wrapping into a distinct
-binder struct type, Anneal builds the one-field struct `.aggregate 0 [v]` (whose field `0` reads
-back `v`), whereas Trusted's `evalRvalue` represents the binder value by the operand value `v`
-itself. -/
-theorem evalWrapUnsafeBinder_wrap_vs_evalRvalue {slots : List LocalSlotState}
+/-- **`WrapUnsafeBinder` into a single-field binder struct agrees two-sidedly with Trusted
+(`evalWrapUnsafeBinder_wrap_eq_evalRvalue`)**: when the binder type is a single-field binder struct
+(`binderStructLayout? = some l`) distinct from the operand's static type, Anneal's wrapping
+`evalWrapUnsafeBinder wf true` builds `.aggregate 0 [v]` (whose field `0` reads back `v`), and
+Trusted's `evalRvalue` returns exactly `.ok (.aggregate 0 [v])` when the struct's scalar validity
+range admits `v` (`scalarValidRangeOk l v`), and `.ub` otherwise (replacing the former
+representation-divergence witness). -/
+theorem evalWrapUnsafeBinder_wrap_eq_evalRvalue {slots : List LocalSlotState}
     {locals : List LocalSlot} {place : Place} {v out : Value} {wf : Value → Bool}
     {range? : Option (ScalarValidRange × Nat)} (hRel : SlotsRefine SlotBelow slots locals)
     (hRead : readPlaceState slots place = .ok v)
-    (h : evalWrapUnsafeBinder wf true range? v = some out) (ty : Ty) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : evalWrapUnsafeBinder wf true range? v = some out) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) {l : TypeLayout} {opTy : Ty}
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
+    (hBinder : binderStructLayout? localDecls layouts targetTy = some l)
+    (hOpTy : operandTy localDecls layouts (.copy place) = some opTy)
+    (hDistinct : rigidTyEq opTy.kind targetTy.kind = false)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
       simp [placeTouchesUnion_nil_proj]) :
-    out = .aggregate 0 [v] ∧ evalValueProjRead locals out [.field 0 ty] = .ok v ∧
-      evalRvalue locals (.wrapUnsafeBinder (.copy place) ty) mem localDecls layouts =
-        .ok v locals mem := by
-  obtain ⟨_, hCase⟩ := evalWrapUnsafeBinder_preserves h locals ty
+    out = .aggregate 0 [v] ∧ evalValueProjRead locals out [.field 0 targetTy] = .ok v ∧
+      evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
+        (match scalarValidRangeOk l v with
+         | true => .ok out locals mem
+         | false => .ub) := by
+  obtain ⟨_, hCase⟩ := evalWrapUnsafeBinder_preserves h locals targetTy
   rcases hCase with ⟨hW, _⟩ | ⟨_, rfl, hField⟩
   · nomatch hW
-  · exact ⟨rfl, hField,
-      evalRvalue_wrapUnsafeBinder_copy hRel hRead ty mem localDecls layouts hValid hNoUnion⟩
+  · refine ⟨rfl, hField, ?_⟩
+    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place)
+        targetTy mem localDecls layouts = _
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
+    rw [hUse, hBinder]
+    dsimp only
+    rw [hOpTy]
+    dsimp only
+    cases scalarValidRangeOk l v <;> simp [hDistinct]
 
 /-! ## Section 3: Multi-block terminator CFG execution -/
 
@@ -11896,8 +12031,9 @@ inductive LCallTarget : Type where
   | inlineIntrinsic (op : LIntrinsicOp) (typeArgs : List RigidTy := []) : LCallTarget
   | callee (sym : String) (typeArgs : List RigidTy := []) : LCallTarget
 
-/-- Map a non-`constEvalSelect` `Trusted.Rustc.V2026_06_01.MirSemantics.RustIntrinsicKind` to
-its corresponding `LIntrinsicOp`. -/
+/-- Map a value-returning `Trusted.Rustc.V2026_06_01.MirSemantics.RustIntrinsicKind` (handled by
+`evalNonSelectIntrinsicCall`; every variant except `constEvalSelect` and the call-form memory
+intrinsics `copyNonOverlapping` / `writeBytes`) to its corresponding `LIntrinsicOp`. -/
 @[reducible]
 def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsicOp
   | .ubChecks => some .ubChecks
@@ -11925,6 +12061,8 @@ def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsi
   | .sizeOfVal => some .sizeOfVal
   | .alignOfVal => some .alignOfVal
   | .constEvalSelect => none
+  | .copyNonOverlapping => none
+  | .writeBytes => none
 
 /-- Map a value-returning `LIntrinsicOp` handled by `evalNonSelectIntrinsicCall` to its
 `RustIntrinsicKind` counterpart. -/
@@ -11956,37 +12094,45 @@ def LIntrinsicOp.toRustIntrinsicKind? : LIntrinsicOp → Option RustIntrinsicKin
   | .alignOfVal => some .alignOfVal
   | _ => none
 
-/-- The call forms of the memory intrinsics `core::intrinsics::copy_nonoverlapping` and
-`core::intrinsics::write_bytes` (the last two rows of `RUST_INTRINSIC_DEF_PATHS_V2026_06_01` in
-`crates/anneal-mir/src/rustc_v2026_06_01.rs`), which `Terminators.lean` leaves as external calls
-(`classifyRustIntrinsic?` does not name them) and Anneal executes inline with the statement's
-semantics.
+/-- Map every non-`constEvalSelect` `RustIntrinsicKind` to its `LIntrinsicOp`: the value-returning
+kinds through `fromRustIntrinsicKind?`, and the call forms of the memory intrinsics
+`core::intrinsics::copy_nonoverlapping` and `core::intrinsics::write_bytes` (the last two rows of
+`RUST_INTRINSIC_DEF_PATHS_V2026_06_01` in `crates/anneal-mir/src/rustc_v2026_06_01.rs`), which
+`Terminators.lean` dispatches inline with the statement's `copy_nonoverlapping` semantics
+(`evalCopyNonOverlappingCall`) and its `write_bytes` semantics (`evalWriteBytesCall`).
 
 `[adv ep2-B1]`: exactly like Episode 1's adapter, only the canonical `core::intrinsics::*`
-spellings are recognized. `rustc` prints a re-exported item (`std::intrinsics::*`) by its defining
-crate's path, and the `core::ptr::*` wrappers are ordinary (linked or external) functions with
-their own `ub_checks` preconditions (a violated precondition is a `panic_nounwind`, not undefined
-behavior), so lowering any alias to an inline intrinsic would diverge from
-`lower_intrinsic_kind_v2026_06_01` (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`). -/
+spellings are recognized (`classifyRustIntrinsic?`). `rustc` prints a re-exported item
+(`std::intrinsics::*`) by its defining crate's path, and the `core::ptr::*` wrappers are ordinary
+(linked or external) functions with their own `ub_checks` preconditions (a violated precondition is
+a `panic_nounwind`, not undefined behavior), so lowering any alias to an inline intrinsic would
+diverge from `lower_intrinsic_kind_v2026_06_01` (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`). -/
 @[reducible]
-def classifyMemIntrinsic_V2026_06_01? (defPath : DefPath) : Option LIntrinsicOp :=
-  if stringEq defPath "core::intrinsics::copy_nonoverlapping" then some .copyNonOverlapping
-  else if stringEq defPath "core::intrinsics::write_bytes" then some .writeBytes
-  else none
+def LIntrinsicOp.ofRustIntrinsicKind? (kind : RustIntrinsicKind) : Option LIntrinsicOp :=
+  match kind with
+  | .copyNonOverlapping => some .copyNonOverlapping
+  | .writeBytes => some .writeBytes
+  | _ => LIntrinsicOp.fromRustIntrinsicKind? kind
+
+private theorem LIntrinsicOp.ofRustIntrinsicKind?_of_fromRustIntrinsicKind?
+    {kind : RustIntrinsicKind} {op : LIntrinsicOp}
+    (h : LIntrinsicOp.fromRustIntrinsicKind? kind = some op) :
+    LIntrinsicOp.ofRustIntrinsicKind? kind = some op := by
+  cases kind <;> first | exact h | nomatch h
 
 /-- Thin `V2026_06_01` `DefPath` -> `LIntrinsicOp` lowering adapter
 (`lower_intrinsic_kind_v2026_06_01` in `crates/anneal-mir/src/rustc_v2026_06_01.rs`), structured
-like `Terminators.lean`'s dispatch (`isDirectExactDivTarget`, `classifyRustIntrinsic?`,
-`isUnreachableCallTarget`, `isAbortingPanicDefPath`, `isUnwindingPanicDefPath`) followed by the
-call forms of the memory intrinsics. It recognizes exactly the `DefPath`s of Episode 1's four
-tables (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`), and on every non-memory intrinsic it is
-exactly `Trusted`'s inline dispatch (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`). -/
+like `Terminators.lean`'s dispatch (`isDirectExactDivTarget`, `classifyRustIntrinsic?` including
+the call forms of the memory intrinsics, `isUnreachableCallTarget`, `isAbortingPanicDefPath`,
+`isUnwindingPanicDefPath`). It recognizes exactly the `DefPath`s of Episode 1's four tables
+(`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`), and on every intrinsic it is exactly `Trusted`'s
+inline dispatch (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`). -/
 @[reducible]
 def lowerIntrinsicKind_V2026_06_01 (defPath : DefPath) : Option LIntrinsicOp :=
   if stringEq defPath "core::intrinsics::exact_div" then
     some .exactDiv
   else match classifyRustIntrinsic? defPath with
-  | some kind => LIntrinsicOp.fromRustIntrinsicKind? kind
+  | some kind => LIntrinsicOp.ofRustIntrinsicKind? kind
   | none =>
     if isUnreachableCallTarget defPath then
       some .unreachableUnchecked
@@ -11995,7 +12141,7 @@ def lowerIntrinsicKind_V2026_06_01 (defPath : DefPath) : Option LIntrinsicOp :=
     else if isUnwindingPanicDefPath defPath then
       some .panicUnwind
     else
-      classifyMemIntrinsic_V2026_06_01? defPath
+      none
 
 /-- Thin `V2026_06_01` `DefPath` -> `LCallTarget` lowering adapter
 (`lower_call_target_v2026_06_01` / `classify_call_target_v2026_06_01` in
@@ -12599,7 +12745,11 @@ def LTerminator.toTrusted : LTerminator → TerminatorKind
   | .unwindTerminate => .unwindTerminate
 
 /-- Predicate characterizing canonical `V2026_06_01` `DefPath` strings whose direct call semantics
-in `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator` matches `LIntrinsicOp`. -/
+in `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator` matches `LIntrinsicOp`: exactly the
+conditions under which `Trusted` dispatches the call inline as `op` (`isDirectExactDivTarget`,
+`classifyRustIntrinsic?` (including the call-form memory intrinsics `copy_nonoverlapping` /
+`write_bytes`), `isUnreachableCallTarget`, `isAbortingPanicDefPath`, `isUnwindingPanicDefPath`), with
+no exempted intrinsic. -/
 def trustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Prop :=
   match op with
   | .exactDiv =>
@@ -12620,7 +12770,12 @@ def trustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Pr
       isUnreachableCallTarget defPath = false ∧
       isAbortingPanicDefPath defPath = false ∧
       isUnwindingPanicDefPath defPath = true
-  | .copyNonOverlapping | .writeBytes => False
+  | .copyNonOverlapping =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .copyNonOverlapping
+  | .writeBytes =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .writeBytes
   | _ =>
     ∃ kind, op.toRustIntrinsicKind? = some kind ∧
       stringEq defPath "core::intrinsics::exact_div" = false ∧
@@ -12725,6 +12880,11 @@ structure StateCorr (env : CfgEnv) (bb : Nat) (slots : List LocalSlotState) (s :
       lowerIntrinsicKind_V2026_06_01 defPath = some op →
       lookupCallee s.memory.callees env.layouts defPath typeArgs s.memory.traitImpls = none := by
     intros; rfl
+  /-- The single-body step refinement covers call-form memory intrinsics only in environments
+  without a sub-place memory-intrinsic callback, where Anneal rejects them (an Anneal error
+  refines every Trusted step); `Trusted`'s exact call-form semantics is characterized directly by
+  `evalTerminator_call_copyNonOverlapping_eq` and `evalTerminator_call_writeBytes_eq`. -/
+  memIntrinsicNone : env.memIntrinsic = none := by rfl
 
 /-- A Trusted transition that continues at `s'` (silently, or emitting a branch event). -/
 def TrustedStep (node : MirStepNode) (s' : MachineState) : Prop :=
@@ -12762,7 +12922,8 @@ theorem StateCorr.jump {env : CfgEnv} {bb : Nat} {slots slots' : List LocalSlotS
     {s : MachineState} (hCorr : StateCorr env bb slots s) (t : Nat) (locals' : List LocalSlot)
     (hRel : SlotsRefine SlotBelow slots' locals') :
     StateCorr env t slots' { s with frame := { blockIdx := t, stmtIdx := 0, locals := locals' } } :=
-  ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
+  ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee,
+    hCorr.memIntrinsicNone⟩
 
 private theorem StateCorr.jumpDirectDest {env : CfgEnv} {bb : Nat}
     {slots slots' : List LocalSlotState} {s : MachineState}
@@ -12779,10 +12940,12 @@ private theorem StateCorr.jumpDirectDest {env : CfgEnv} {bb : Nat}
   | cons _ _ =>
     cases dest.projection with
     | nil =>
-      exact ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
+      exact ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee,
+        hCorr.memIntrinsicNone⟩
     | cons hd _ =>
       cases hd <;>
-        exact ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
+        exact ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee,
+          hCorr.memIntrinsicNone⟩
 
 /-- Left-to-right operand list evaluation `evalOperandsState` refines Trusted's `evalOperands`
 under `SlotsRefine SlotBelow` when no operand begins with `.deref`. -/
@@ -13681,16 +13844,17 @@ private theorem evalDirectRustIntrinsic_of_nonSelect
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {args : List Operand} {argVals : List Value}
     {locals' : List LocalSlot} {destination : Place} {targetBb : BasicBlockIdx}
-    {unwind : UnwindAction} {kind : RustIntrinsicKind}
+    {unwind : UnwindAction} {kind : RustIntrinsicKind} {op : LIntrinsicOp}
     (hClass : classifyRustIntrinsic? target.defPath = some kind)
-    (hNotSel : kind ≠ .constEvalSelect) :
+    (hNotSel : kind ≠ .constEvalSelect)
+    (hKind : op.toRustIntrinsicKind? = some kind) :
     evalDirectRustIntrinsic? s body target localDecls layouts args argVals locals'
       destination targetBb unwind =
       some (evalNonSelectIntrinsicCall kind s target localDecls layouts args argVals
         locals' destination targetBb) := by
   unfold evalDirectRustIntrinsic?
   rw [hClass]
-  cases kind <;> first | contradiction | rfl
+  cases kind <;> first | contradiction | rfl | (cases op <;> cases hKind)
 
 /-- Internal strengthening of `evalLoweredTerminator_call_refines_evalTerminator` recording that
 every `.goto` transition preserves `s'.memory = s.memory` and `.returned` is impossible. -/
@@ -13803,7 +13967,7 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                           (localDecls := cm.localDecls) (layouts := env.layouts)
                           (args := args) (argVals := avs) (locals' := locals2)
                           (destination := dest) (targetBb := targetBb) (unwind := u)
-                          hClass hNotSel
+                          hClass hNotSel hKind
                       have hStepEval :
                           evalTerminator { s with frame := ⟨bb, sIdx, locals1⟩ }
                             ⟨(LTerminator.call
@@ -13822,9 +13986,9 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
           | unreachableUnchecked =>
             nomatch hBodyCall
           | copyNonOverlapping =>
-            simp [trustedSupportsIntrinsicDefPath] at hSupp
+            simp [evalLoweredIntrinsicCall, hCorr.memIntrinsicNone] at hBodyCall
           | writeBytes =>
-            simp [trustedSupportsIntrinsicDefPath] at hSupp
+            simp [evalLoweredIntrinsicCall, hCorr.memIntrinsicNone] at hBodyCall
           | abort =>
             simp only [evalLoweredIntrinsicCall] at hBodyCall
             split at hBodyCall
@@ -22322,7 +22486,9 @@ theorem lowerIntrinsicKind_V2026_06_01_of_classifyRustIntrinsic {defPath : DefPa
       trustedSupportsIntrinsicDefPath defPath op := by
   have hTo := LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind hFrom
   refine ⟨?_, ?_⟩
-  · simp [lowerIntrinsicKind_V2026_06_01, hNotCoreEx, hClass, hFrom]
+  · simp only [lowerIntrinsicKind_V2026_06_01, hNotCoreEx, hClass, Bool.false_eq_true,
+      ↓reduceIte]
+    exact LIntrinsicOp.ofRustIntrinsicKind?_of_fromRustIntrinsicKind? hFrom
   · cases op with
     | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
       cases hTo
@@ -22378,7 +22544,16 @@ def checkTrustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp)
       !isUnreachableCallTarget defPath &&
       !isAbortingPanicDefPath defPath &&
       isUnwindingPanicDefPath defPath
-  | .copyNonOverlapping | .writeBytes => false
+  | .copyNonOverlapping =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .copyNonOverlapping => true
+       | _ => false)
+  | .writeBytes =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .writeBytes => true
+       | _ => false)
   | _ =>
     match classifyRustIntrinsic? defPath with
     | some kind =>
@@ -22417,8 +22592,22 @@ theorem trustedSupportsIntrinsicDefPath_of_check {defPath : DefPath} {op : LIntr
     · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
         Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
       exact h
-    · nomatch h
-    · nomatch h
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
+        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
+      obtain ⟨hEx, hMem⟩ := h
+      refine ⟨hEx, ?_⟩
+      revert hMem
+      cases classifyRustIntrinsic? defPath with
+      | none => intro hMem; nomatch hMem
+      | some k => cases k <;> intro hMem <;> first | rfl | nomatch hMem
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
+        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
+      obtain ⟨hEx, hMem⟩ := h
+      refine ⟨hEx, ?_⟩
+      revert hMem
+      cases classifyRustIntrinsic? defPath with
+      | none => intro hMem; nomatch hMem
+      | some k => cases k <;> intro hMem <;> first | rfl | nomatch hMem
     · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
         Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
       exact ⟨h.1.1, h.1.2, h.2⟩
@@ -23494,6 +23683,8 @@ structure MultiBodyCorr (table : LCallTable) (rootCm : CapturedMir)
   localDecls : cm.localDecls = env.localDecls
   ubChecksTrue : env.ubChecks = true
   callTargetLinked : env.callTargetOf = extractLinkedLCallTarget_V2026_06_01? table
+  /-- See `StateCorr.memIntrinsicNone`. -/
+  memIntrinsicNone : env.memIntrinsic = none := by rfl
   block : ∀ (i : Nat) (b : LBlock), body.blocks[i]? = some b →
     b.terminator.MultiRefinable table ∧
       ∃ (tStmts : List Statement) (span : String),
@@ -24761,7 +24952,7 @@ theorem stepLoweredWithCallTable_refines_trusted
                                         (layouts := sharedLayouts)
                                         (args := args) (argVals := avs) (locals' := locals2)
                                         (destination := dest) (targetBb := targetBb)
-                                        (unwind := unwind) hClass hNotSel
+                                        (unwind := unwind) hClass hNotSel hKind
                                     let sNext : MachineState :=
                                       { s with frame := ⟨targetBb, 0, updatedLocals⟩ }
                                     have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
@@ -24789,8 +24980,10 @@ theorem stepLoweredWithCallTable_refines_trusted
                                       { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩
                         · cases op with
                           | unreachableUnchecked => nomatch hIntrEval
-                          | copyNonOverlapping => simp [trustedSupportsIntrinsicDefPath] at hSupp
-                          | writeBytes => simp [trustedSupportsIntrinsicDefPath] at hSupp
+                          | copyNonOverlapping =>
+                            simp [evalLoweredIntrinsicCall, hCorr.body.memIntrinsicNone] at hIntrEval
+                          | writeBytes =>
+                            simp [evalLoweredIntrinsicCall, hCorr.body.memIntrinsicNone] at hIntrEval
                           | abort =>
                             simp only [evalLoweredIntrinsicCall] at hIntrEval
                             split at hIntrEval
@@ -25155,7 +25348,8 @@ theorem witness_inline_intrinsics_cfg_refines_trusted :
     with_unfolding_all rfl
   have hCorr : StateCorr witnessInlineIntrinsicsEnv 0 initSlots s0 :=
     ⟨rfl, rfl, by simp [initSlots, s0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
   exact ⟨hRun, runLoweredCfgSteps_refines_trusted witnessInlineIntrinsics_bodyCorr
     (fun _ => rfl) 12 0 initSlots none s0 (.returned (.scalar ⟨84, 4⟩)) hCorr hRun⟩
 
@@ -25242,7 +25436,8 @@ theorem witness_ptr_intrinsics_cfg_refines_trusted :
     with_unfolding_all rfl
   have hCorr : StateCorr witnessPtrIntrinsicsEnv 0 initSlots s0 :=
     ⟨rfl, rfl, by simp [initSlots, s0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
   exact ⟨hArith, hSz, hRun,
     runLoweredCfgSteps_refines_trusted witnessPtrIntrinsics_bodyCorr (fun _ => rfl)
       6 0 initSlots none s0 (.returned (.scalar ⟨4, 8⟩)) hCorr hRun⟩
@@ -25481,7 +25676,8 @@ theorem witness_diverging_abort_vs_panicUnwind :
   have hCorrP : StateCorr witnessDivergingEnv 0 [.uninit] sPanic :=
     ⟨rfl, rfl, by simp [sPanic, initMachineState, initLocalsAux, witnessPanicCleanupCm,
       ep2MakeCaptured, witnessDivergingDecls, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
   exact ⟨hAbStep, hAbRun, hAbT, hPanStep, hPanRun,
     runLoweredCfgSteps_refines_trusted witnessPanicCleanup_bodyCorr (fun _ => rfl)
       4 0 [.uninit] none sPanic (.panicked 0) hCorrP hPanRun⟩
@@ -25815,7 +26011,7 @@ private theorem witnessLinkedTable_corr (rootCm : CapturedMir) (maxDepth : Nat) 
       have hCongr : ∀ c, stringEq dp c = stringEq s c :=
         fun c => (stringEq_congr_left hEq c).symm
       unfold lowerIntrinsicKind_V2026_06_01 classifyRustIntrinsic? isUnreachableCallTarget
-        isAbortingPanicDefPath isUnwindingPanicDefPath classifyMemIntrinsic_V2026_06_01?
+        isAbortingPanicDefPath isUnwindingPanicDefPath
       simp only [hCongr]
     have hNeLeaf : stringEq "witness::leaf" dp = false := by
       cases hEq : stringEq "witness::leaf" dp
@@ -26098,7 +26294,7 @@ private theorem lowerIntrinsicKind_V2026_06_01_off_literals {defPath : DefPath}
     List.nil_append, List.mem_cons, List.not_mem_nil, or_false, not_or] at hMem
   simp [lowerIntrinsicKind_V2026_06_01, ep1LowerIntrinsicKind_V2026_06_01, classifyRustIntrinsic?,
     isUnreachableCallTarget, isAbortingPanicDefPath, isUnwindingPanicDefPath,
-    classifyMemIntrinsic_V2026_06_01?, ep1RustIntrinsicDefPaths_V2026_06_01,
+    ep1RustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
     ep1UnwindingPanicDefPaths_V2026_06_01, stringEq_eq_decide, hMem]
 
@@ -26127,26 +26323,56 @@ theorem lowerIntrinsicKind_V2026_06_01_aliases_none :
       lowerIntrinsicKind_V2026_06_01 "core::intrinsics::const_eval_select" = none :=
   ⟨by decide, by decide, by decide, by decide, by decide, by decide, by decide⟩
 
-/-- **`trustedSupportsIntrinsicDefPath` is exactly the adapter's non-memory intrinsics
-(`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`)**: the intrinsic conjunct of
-`LTerminator.Refinable` / `LTerminator.MultiRefinable` hides no restriction beyond excluding the
-call forms of `copy_nonoverlapping` / `write_bytes`. A `DefPath` is dispatched inline by
-`Trusted.evalTerminator` as `op` (via `isDirectExactDivTarget`, `classifyRustIntrinsic?`,
-`isUnreachableCallTarget`, `isAbortingPanicDefPath`, or `isUnwindingPanicDefPath`) iff
-`lowerIntrinsicKind_V2026_06_01` lowers it to the non-memory intrinsic `op`. -/
+/-- `classifyRustIntrinsic?` names the call-form memory intrinsics exactly at their two canonical
+`core::intrinsics::*` paths. -/
+theorem classifyRustIntrinsic_eq_memIntrinsic_iff {defPath : DefPath} :
+    (classifyRustIntrinsic? defPath = some .copyNonOverlapping ↔
+      defPath = "core::intrinsics::copy_nonoverlapping") ∧
+    (classifyRustIntrinsic? defPath = some .writeBytes ↔
+      defPath = "core::intrinsics::write_bytes") := by
+  refine ⟨⟨fun h => ?_, fun h => by subst h; rfl⟩, ⟨fun h => ?_, fun h => by subst h; rfl⟩⟩
+  all_goals
+    unfold classifyRustIntrinsic? at h
+    repeat' split at h
+    all_goals
+      first
+      | (rename_i hEq; exact stringEq_eq_true_iff.mp hEq)
+      | nomatch h
+
+/-- `Trusted` dispatches the canonical call-form memory intrinsics inline: both canonical paths
+lower to their `LIntrinsicOp` and are named by `classifyRustIntrinsic?` (not by
+`isDirectExactDivTarget` or the diverging-call predicates). -/
+theorem lowerIntrinsicKind_V2026_06_01_memIntrinsics :
+    (lowerIntrinsicKind_V2026_06_01 "core::intrinsics::copy_nonoverlapping" =
+        some .copyNonOverlapping ∧
+      trustedSupportsIntrinsicDefPath "core::intrinsics::copy_nonoverlapping"
+        .copyNonOverlapping) ∧
+    (lowerIntrinsicKind_V2026_06_01 "core::intrinsics::write_bytes" = some .writeBytes ∧
+      trustedSupportsIntrinsicDefPath "core::intrinsics::write_bytes" .writeBytes) := by
+  refine ⟨⟨by decide, ?_⟩, ⟨by decide, ?_⟩⟩ <;>
+    exact trustedSupportsIntrinsicDefPath_of_check (by decide)
+
+/-- **`trustedSupportsIntrinsicDefPath` is exactly the adapter's intrinsics, with zero exemptions
+(`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`)**: a `DefPath` is dispatched inline by
+`Trusted.evalTerminator` as `op` (via `isDirectExactDivTarget`, `classifyRustIntrinsic?` including
+the call-form memory intrinsics, `isUnreachableCallTarget`, `isAbortingPanicDefPath`, or
+`isUnwindingPanicDefPath`) iff `lowerIntrinsicKind_V2026_06_01` lowers it to `op`, for every
+`LIntrinsicOp` including `copy_nonoverlapping` / `write_bytes`. -/
 theorem trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind {defPath : DefPath}
     {op : LIntrinsicOp} :
     trustedSupportsIntrinsicDefPath defPath op ↔
-      lowerIntrinsicKind_V2026_06_01 defPath = some op ∧ op ≠ .copyNonOverlapping ∧
-        op ≠ .writeBytes := by
+      lowerIntrinsicKind_V2026_06_01 defPath = some op := by
   constructor
   · intro h
-    have hC : op ≠ .copyNonOverlapping := by rintro rfl; exact h
-    have hW : op ≠ .writeBytes := by rintro rfl; exact h
-    refine ⟨?_, hC, hW⟩
     cases op with
-    | copyNonOverlapping => exact absurd rfl hC
-    | writeBytes => exact absurd rfl hW
+    | copyNonOverlapping =>
+      obtain ⟨hEx, hCl⟩ := h
+      simp only [lowerIntrinsicKind_V2026_06_01, hEx, hCl, Bool.false_eq_true, ↓reduceIte,
+        LIntrinsicOp.ofRustIntrinsicKind?]
+    | writeBytes =>
+      obtain ⟨hEx, hCl⟩ := h
+      simp only [lowerIntrinsicKind_V2026_06_01, hEx, hCl, Bool.false_eq_true, ↓reduceIte,
+        LIntrinsicOp.ofRustIntrinsicKind?]
     | exactDiv =>
       obtain ⟨hEx, _⟩ := h
       simp only [lowerIntrinsicKind_V2026_06_01, hEx, ↓reduceIte]
@@ -26164,8 +26390,9 @@ theorem trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind {defPath : DefPat
     | _ =>
       obtain ⟨kind, hTo, hEx, hCl⟩ := h
       simp only [lowerIntrinsicKind_V2026_06_01, hEx, hCl, Bool.false_eq_true, ↓reduceIte]
-      exact LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind hTo
-  · rintro ⟨h, hC, hW⟩
+      exact LIntrinsicOp.ofRustIntrinsicKind?_of_fromRustIntrinsicKind?
+        (LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind hTo)
+  · intro h
     unfold lowerIntrinsicKind_V2026_06_01 at h
     split at h
     · rename_i hEx
@@ -26178,11 +26405,23 @@ theorem trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind {defPath : DefPat
         simpa using hEx
       split at h
       · rename_i kind hCl
-        have hTo := LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind h
-        cases op with
-        | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
-          nomatch hTo
-        | _ => exact ⟨kind, hTo, hEx', hCl⟩
+        by_cases hMemK : kind = .copyNonOverlapping ∨ kind = .writeBytes
+        · rcases hMemK with rfl | rfl <;>
+            (simp only [LIntrinsicOp.ofRustIntrinsicKind?, Option.some.injEq] at h
+             subst h
+             exact ⟨hEx', hCl⟩)
+        · have hFrom : LIntrinsicOp.fromRustIntrinsicKind? kind = some op := by
+            cases kind <;>
+              first
+              | exact h
+              | exact (hMemK (Or.inl rfl)).elim
+              | exact (hMemK (Or.inr rfl)).elim
+          have hTo := LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind hFrom
+          cases op with
+          | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort
+          | panicUnwind =>
+            nomatch hTo
+          | _ => exact ⟨kind, hTo, hEx', hCl⟩
       · rename_i hCl
         split at h
         · rename_i hUn
@@ -26200,15 +26439,77 @@ theorem trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind {defPath : DefPat
             · rename_i hPa
               cases h
               exact ⟨hEx', hCl, hUn', hAb', hPa⟩
-            · unfold classifyMemIntrinsic_V2026_06_01? at h
-              split at h
-              · cases h; exact absurd rfl hC
-              · split at h
-                · cases h; exact absurd rfl hW
-                · nomatch h
+            · nomatch h
+
+/-- **Exact Trusted call-form `copy_nonoverlapping` semantics
+(`evalTerminator_call_copyNonOverlapping_eq`)**: a direct, non-diverging call
+(`target = some targetBb`) to the canonical `core::intrinsics::copy_nonoverlapping`
+(`classifyRustIntrinsic? defPath = some .copyNonOverlapping`) with no linked callee body evaluates
+in `Trusted.evalTerminator` to exactly `evalCopyNonOverlappingCall` on the evaluated arguments: the
+statement-form `copy_nonoverlapping` semantics (`evalCopyNonOverlappingWithCount`, shared with
+`StatementKind.intrinsic (.copyNonOverlapping ..)`) followed by writing `()` to the destination
+(`finishMemIntrinsicCall`). -/
+theorem evalTerminator_call_copyNonOverlapping_eq {s : MachineState} {cm : CapturedMir}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {dest : Place} {targetBb : Nat} {u : UnwindAction} {span : String}
+    {argVals : List Value} {locals' : List LocalSlot}
+    (hKind : classifyRustIntrinsic? defPath = some .copyNonOverlapping)
+    (hArgs : evalOperands s.frame.locals args s.memory.borrows s.memory.globals cm.layouts
+        s.memory.callerLocals [] s.memory.callStack = .ok argVals locals')
+    (hNoCallee :
+      lookupCallee s.memory.callees cm.layouts defPath typeArgs s.memory.traitImpls = none) :
+    evalTerminator s
+        ⟨.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
+          (some targetBb) u, span⟩
+        (some cm) =
+      evalCopyNonOverlappingCall s cm.localDecls cm.layouts args argVals locals' dest
+        targetBb := by
+  have hNotEx : stringEq defPath "core::intrinsics::exact_div" = false := by
+    rw [classifyRustIntrinsic_eq_memIntrinsic_iff.1.mp hKind]; decide
+  have hResTgt :
+      ∀ (decls : List LocalDecl) (lays : LayoutTable),
+        resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+          (length args) decls lays =
+          .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+    fun _ _ => rfl
+  simp only [evalTerminator, bodyLocalDeclsOf, hResTgt, hArgs, hNoCallee, isDirectExactDivTarget,
+    hNotEx, evalDirectRustIntrinsic?, hKind]
+
+/-- **Exact Trusted call-form `write_bytes` semantics (`evalTerminator_call_writeBytes_eq`)**: a
+direct, non-diverging call (`target = some targetBb`) to the canonical
+`core::intrinsics::write_bytes` (`classifyRustIntrinsic? defPath = some .writeBytes`) with no
+linked callee body evaluates in `Trusted.evalTerminator` to exactly `evalWriteBytesCall` on the
+evaluated arguments: the checks of `writeBytesAction` against the current Tree Borrows state and
+frame, then either no memory effect or the element store through `commitCopyDstPlaceWrite`,
+followed by writing `()` to the destination. -/
+theorem evalTerminator_call_writeBytes_eq {s : MachineState} {cm : CapturedMir}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {dest : Place} {targetBb : Nat} {u : UnwindAction} {span : String}
+    {argVals : List Value} {locals' : List LocalSlot}
+    (hKind : classifyRustIntrinsic? defPath = some .writeBytes)
+    (hArgs : evalOperands s.frame.locals args s.memory.borrows s.memory.globals cm.layouts
+        s.memory.callerLocals [] s.memory.callStack = .ok argVals locals')
+    (hNoCallee :
+      lookupCallee s.memory.callees cm.layouts defPath typeArgs s.memory.traitImpls = none) :
+    evalTerminator s
+        ⟨.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
+          (some targetBb) u, span⟩
+        (some cm) =
+      evalWriteBytesCall s { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+        cm.localDecls cm.layouts args argVals locals' dest targetBb := by
+  have hNotEx : stringEq defPath "core::intrinsics::exact_div" = false := by
+    rw [classifyRustIntrinsic_eq_memIntrinsic_iff.2.mp hKind]; decide
+  have hResTgt :
+      ∀ (decls : List LocalDecl) (lays : LayoutTable),
+        resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+          (length args) decls lays =
+          .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+    fun _ _ => rfl
+  simp only [evalTerminator, bodyLocalDeclsOf, hResTgt, hArgs, hNoCallee, isDirectExactDivTarget,
+    hNotEx, evalDirectRustIntrinsic?, hKind]
 
 /-- **Smart constructor (`LTerminator.refinable_call_of_lowerIntrinsicKind`)**: a direct call of
-any `DefPath` that `lowerIntrinsicKind_V2026_06_01` lowers to a non-memory intrinsic, with
+any `DefPath` that `lowerIntrinsicKind_V2026_06_01` lowers to an intrinsic, with
 non-`Deref` arguments and a non-`Deref` destination (`projectionHasDeref dest.projection = false`,
 including projected field / downcast / index places!), is covered by the single-body refinement
 theorems (`evalLoweredTerminator_refines_trusted`, `runLoweredCfgSteps_refines_trusted`, and their
@@ -26217,16 +26518,15 @@ theorem LTerminator.refinable_call_of_lowerIntrinsicKind {defPath : DefPath}
     {typeArgs : List RigidTy} {layoutIdx : LayoutIdx} {op : LIntrinsicOp} {args : List Operand}
     {dest : Place} {destTy : Ty} {t : Option Nat} {u : UnwindAction}
     (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
-    (hC : op ≠ .copyNonOverlapping) (hW : op ≠ .writeBytes)
     (hArgs : ∀ arg ∈ args, OperandNonDeref arg)
     (hDest : projectionHasDeref dest.projection = false) :
     (LTerminator.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
       destTy t u).Refinable :=
   ⟨⟨defPath, typeArgs, layoutIdx, op, rfl, hLower,
-    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mpr ⟨hLower, hC, hW⟩⟩, hArgs, hDest⟩
+    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mpr hLower⟩, hArgs, hDest⟩
 
 /-- **Smart constructor (`LTerminator.multiRefinable_call_of_lowerIntrinsicKind`)**: an unlinked
-direct call of a non-memory intrinsic with a non-`Deref` destination is covered by the multi-callee
+direct call of a lowered intrinsic with a non-`Deref` destination is covered by the multi-callee
 refinement (`runLoweredWithCallTable_refines_trusted`) with no Trusted-side premise left to
 discharge (`[adv ep2-A1]`). -/
 theorem LTerminator.multiRefinable_call_of_lowerIntrinsicKind {table : LCallTable}
@@ -26234,13 +26534,12 @@ theorem LTerminator.multiRefinable_call_of_lowerIntrinsicKind {table : LCallTabl
     {args : List Operand} {dest : Place} {destTy : Ty} {t : Option Nat} {u : UnwindAction}
     (hUnlinked : (table.lookup defPath typeArgs).isSome = false)
     (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
-    (hC : op ≠ .copyNonOverlapping) (hW : op ≠ .writeBytes)
     (hArgs : ∀ arg ∈ args, OperandNonDeref arg)
     (hDest : projectionHasDeref dest.projection = false) :
     (LTerminator.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
       destTy t u).MultiRefinable table :=
   ⟨hArgs, hDest, defPath, typeArgs, layoutIdx, rfl, Or.inr ⟨hUnlinked, op, hLower,
-    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mpr ⟨hLower, hC, hW⟩⟩⟩
+    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mpr hLower⟩⟩
 
 /-- **Value-intrinsic fault parity (`evalLIntrinsicValue_none_trusted_fault`)**: whenever Anneal's
 `evalLIntrinsicValue` rejects one of the 24 value-returning intrinsics Trusted dispatches through
@@ -26353,7 +26652,7 @@ theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
       (evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = .fail .ub ∨
         evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = .unsupported) := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
-    (trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp).1
+    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   refine ⟨?_, ?_⟩
   · unfold evalLoweredTerminator
     rw [hb]
@@ -26416,7 +26715,7 @@ theorem evalLoweredTerminator_call_value_intrinsic_fault_parity
           (localDecls := cm.localDecls) (layouts := env.layouts)
           (args := args) (argVals := avs) (locals' := locals2)
           (destination := dest) (targetBb := targetBb) (unwind := u)
-          hClass hNotSel
+          hClass hNotSel hKind
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
         hLayouts, hCorr.globals, hTOps, hNoCallee, isDirectExactDivTarget, hNotEx, hDir]
       exact evalLIntrinsicValue_none_trusted_fault
@@ -26516,7 +26815,7 @@ theorem witnessSignWidth_bodyCorr :
       refine ⟨rfl, ?_, "", rfl⟩
       first
       | trivial
-      | exact LTerminator.refinable_call_of_lowerIntrinsicKind rfl (by decide) (by decide)
+      | exact LTerminator.refinable_call_of_lowerIntrinsicKind rfl
           (fun arg hMem => ep2OpNonDeref_sound (List.all_eq_true.mp (by decide) arg hMem)) rfl
     | n + 13 =>
       simp [witnessSignWidthBody] at hb
@@ -26561,7 +26860,8 @@ theorem witness_intrinsic_signedness_width_cfg_refines_trusted :
     with_unfolding_all rfl
   have hCorr : StateCorr witnessSignWidthEnv 0 initSlots s0 :=
     ⟨rfl, rfl, by simp [initSlots, s0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
   obtain ⟨s', hRun', hCorr'⟩ := runLoweredCfgSteps_refines_trusted witnessSignWidth_bodyCorr
     (fun _ => rfl) 12 0 initSlots none s0 _ hCorr hRun12
   exact ⟨hRun12, hRun13,
@@ -26572,11 +26872,10 @@ theorem witness_intrinsic_signedness_width_cfg_refines_trusted :
 /-! #### Witness Suite 6 (`[adv ep2-B1]`): UB Fault Parity on Corresponding `LBody` / `CapturedMir` Pairs -/
 
 /-- The single direct-call body `bb0: _0 = f::<typeArgs>(args) -> bb1; bb1: return` corresponds
-(`BodyCorr`) to its own captured body whenever `f` lowers to a non-memory intrinsic. -/
+(`BodyCorr`) to its own captured body whenever `f` lowers to an intrinsic. -/
 private theorem ep2b1SingleCall_bodyCorr (defPath : DefPath) (typeArgs : List RigidTy)
     (args : List Operand) (destTy : Ty) (decls : List LocalDecl) {op : LIntrinsicOp}
     (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
-    (hC : op ≠ .copyNonOverlapping) (hW : op ≠ .writeBytes)
     (hArgs : ∀ arg ∈ args, OperandNonDeref arg) :
     BodyCorr (ep2MakeEnv decls) (ep2SingleCallBody defPath typeArgs args destTy (some 1))
       (ep2MakeCaptured "w" 0 decls (ep2SingleCallBody defPath typeArgs args destTy (some 1))) where
@@ -26587,7 +26886,7 @@ private theorem ep2b1SingleCall_bodyCorr (defPath : DefPath) (typeArgs : List Ri
     | 0 =>
       simp only [ep2SingleCallBody, List.getElem?_cons_zero, Option.some.injEq] at hb
       subst hb
-      exact ⟨rfl, LTerminator.refinable_call_of_lowerIntrinsicKind hLower hC hW hArgs rfl, "", rfl⟩
+      exact ⟨rfl, LTerminator.refinable_call_of_lowerIntrinsicKind hLower hArgs rfl, "", rfl⟩
     | 1 =>
       simp only [ep2SingleCallBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
@@ -26664,12 +26963,13 @@ theorem witness_signed_shift_overflow_ub_parity :
     simp only [ubCases, List.mem_cons, List.not_mem_nil, or_false] at hc
     rcases hc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
       dsimp only <;>
-      exact ⟨ep2b1SingleCall_bodyCorr _ _ _ _ _ rfl (by decide) (by decide)
+      exact ⟨ep2b1SingleCall_bodyCorr _ _ _ _ _ rfl
         (ep2b1_consts_nonDeref _ rfl), by with_unfolding_all rfl, by with_unfolding_all rfl⟩
   · intro body cm
     have hCorr : StateCorr (ep2MakeEnv [ep2Decl ep2TyI32]) 0 [.uninit] (initMachineState cm []) :=
       ⟨rfl, rfl, by simp [cm, initMachineState, initLocalsAux, ep2MakeCaptured, SlotsRefine,
-        SlotBelow], rfl, rfl, rfl, fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+        SlotBelow], rfl, rfl, rfl, fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
     exact evalLoweredTerminator_call_value_intrinsic_fault_parity
       (env := ep2MakeEnv [ep2Decl ep2TyI32]) (body := body) (cm := cm) (bb := 0) (targetBb := 1)
       (slots := [.uninit]) (unwinding := none) (s := initMachineState cm [])
@@ -27002,7 +27302,7 @@ theorem evalLoweredTerminator_call_resolved_value_intrinsic_ub_parity
     evalLoweredTerminator env body bb slots unwinding = none ∧
       evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = .fail .ub := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
-    (trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp).1
+    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   have hAnnealNone : evalLoweredTerminator env body bb slots unwinding = none :=
     (evalLoweredTerminator_call_value_intrinsic_fault_parity hb hT hCallTgt hUb hSupp hVal
       hLayouts hDecls hCorr hArgsND hArgsEval hNone span).1
@@ -27055,7 +27355,7 @@ theorem evalLoweredTerminator_call_resolved_value_intrinsic_ub_parity
         (localDecls := cm.localDecls) (layouts := env.layouts)
         (args := args) (argVals := avs) (locals' := locals2)
         (destination := dest) (targetBb := targetBb) (unwind := u)
-        hClass hNotSel
+        hClass hNotSel hKind
     simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
       hLayouts, hCorr.globals, hTOps, hNoCallee, isDirectExactDivTarget, hNotEx, hDir]
     exact evalLIntrinsicValue_resolved_none_eq_ub
@@ -27066,21 +27366,19 @@ set_option maxRecDepth 100000 in
 private theorem nonValueIntrinsic_literal_not_trustedReturning :
     adapterLiteralDefPaths_V2026_06_01.all (fun p =>
       match lowerIntrinsicKind_V2026_06_01 p with
-      | some .unreachableUnchecked | some .abort | some .panicUnwind
-      | some .copyNonOverlapping | some .writeBytes =>
+      | some .unreachableUnchecked | some .abort | some .panicUnwind =>
         !stringEq p "core::intrinsics::exact_div" && (classifyRustIntrinsic? p).isNone
       | _ => true) = true := by
   decide +kernel
 
 private theorem nonValueIntrinsic_not_trustedReturning {defPath : DefPath} {op : LIntrinsicOp}
     (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
-    (hNonVal : op = .unreachableUnchecked ∨ op = .abort ∨ op = .panicUnwind ∨
-      op = .copyNonOverlapping ∨ op = .writeBytes) :
+    (hNonVal : op = .unreachableUnchecked ∨ op = .abort ∨ op = .panicUnwind) :
     stringEq defPath "core::intrinsics::exact_div" = false ∧
       classifyRustIntrinsic? defPath = none := by
   by_cases hMem : defPath ∈ adapterLiteralDefPaths_V2026_06_01
   · have hAll := List.all_eq_true.mp nonValueIntrinsic_literal_not_trustedReturning defPath hMem
-    rcases hNonVal with rfl | rfl | rfl | rfl | rfl <;>
+    rcases hNonVal with rfl | rfl | rfl <;>
       simp [hLower, Bool.and_eq_true, Option.isNone_iff_eq_none] at hAll <;>
       exact hAll
   · have hNone := (lowerIntrinsicKind_V2026_06_01_off_literals hMem).1
@@ -27116,10 +27414,11 @@ private theorem valueIntrinsic_not_trustedDiverging {defPath : DefPath} {op : LI
 
 /-- **Target-presence boundary Part 1 (`evalLoweredTerminator_call_nonReturning_with_target_extCall`)**:
 a hand-built non-diverging (`target = some targetBb`) direct call to `unreachable_unchecked`,
-`abort`, or `panicUnwind` — or to `copy_nonoverlapping` / `write_bytes` when `env.memIntrinsic =
-none` — is rejected fail-closed by `evalLoweredTerminator` (`= none`), whereas `Trusted`'s
-`evalTerminator` dispatches none of those paths inline on a `target = some _` call and falls through
-to `MirStepNode.extCall`. -/
+`abort`, or `panicUnwind` is rejected fail-closed by `evalLoweredTerminator` (`= none`), whereas
+`Trusted`'s `evalTerminator` dispatches none of those paths inline on a `target = some _` call and
+falls through to `MirStepNode.extCall`. (Call-form `copy_nonoverlapping` / `write_bytes` are
+dispatched inline by `Trusted` since Episode 1 of `ws-repatriate-leaked-ground-semantics-to-tcb`;
+see `evalTerminator_call_copyNonOverlapping_eq` and `evalTerminator_call_writeBytes_eq`.) -/
 theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb targetBb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -27130,8 +27429,7 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
       args dest destTy (some targetBb) u)
     (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
     (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
-    (hKind : op = .unreachableUnchecked ∨ op = .abort ∨ op = .panicUnwind ∨
-      ((op = .copyNonOverlapping ∨ op = .writeBytes) ∧ env.memIntrinsic = none))
+    (hKind : op = .unreachableUnchecked ∨ op = .abort ∨ op = .panicUnwind)
     (hLayouts : cm.layouts = env.layouts)
     (hCorr : StateCorr env bb slots s)
     (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
@@ -27144,15 +27442,7 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
           evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
             .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
               (resumeExternalCall s locals2 dest targetBb u) := by
-  have hNonVal : op = .unreachableUnchecked ∨ op = .abort ∨ op = .panicUnwind ∨
-      op = .copyNonOverlapping ∨ op = .writeBytes := by
-    rcases hKind with h | h | h | ⟨h | h, _⟩
-    · exact Or.inl h
-    · exact Or.inr (Or.inl h)
-    · exact Or.inr (Or.inr (Or.inl h))
-    · exact Or.inr (Or.inr (Or.inr (Or.inl h)))
-    · exact Or.inr (Or.inr (Or.inr (Or.inr h)))
-  obtain ⟨hNotEx, hNotRust⟩ := nonValueIntrinsic_not_trustedReturning hLower hNonVal
+  obtain ⟨hNotEx, hNotRust⟩ := nonValueIntrinsic_not_trustedReturning hLower hKind
   refine ⟨?_, ?_⟩
   · unfold evalLoweredTerminator
     rw [hb]
@@ -27172,12 +27462,10 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
           · rw [hCallTgt]
             simp only [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
               extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower]
-            rcases hKind with rfl | rfl | rfl | ⟨rfl | rfl, hMemNone⟩
+            rcases hKind with rfl | rfl | rfl
             · rfl
             · simp only [evalLoweredIntrinsicCall]; split <;> rfl
             · rfl
-            · simp only [evalLoweredIntrinsicCall, hMemNone]; split <;> rfl
-            · simp only [evalLoweredIntrinsicCall, hMemNone]; split <;> rfl
   · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots
       slotsAfterArgs s.frame.locals avs s.memory.borrows env.globals env.layouts
       s.memory.callerLocals hCorr.slots hArgsND hArgsEval
@@ -27227,7 +27515,7 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
             .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
               (resumeExternalDivergingCall s locals2 u) := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
-    (trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp).1
+    trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   have hNotDiv : op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind := by
     rcases hVal with rfl | ⟨kind, hk⟩
     · exact ⟨by decide, by decide, by decide⟩
@@ -27582,10 +27870,11 @@ steps BOTH `core::intrinsics::write_bytes::<u32>` (`bb0`) and
 1. `bb0`'s `.call` writes `0xABABABAB_u32` into `_1.1` (leaving `_1.0 = 7` untouched);
 2. `bb1`'s `.call` copies `_2.0 = 0x11223344_u32` into `_1.0` (leaving `_1.1 = 0xABABABAB` and
    source `_2` untouched), and `bb2` returns `Value.unit`;
-3. `Trusted.evalTerminator` on both call-form memory intrinsics emits `MirStepNode.extCall`
-   (witnessing why call-form `write_bytes` / `copy_nonoverlapping` are outside
-   `trustedSupportsIntrinsicDefPath`, while statement-form `CopyNonOverlapping` refines
-   `evalCopySingleDirect`). -/
+3. `Trusted.evalTerminator` executes both call-form memory intrinsics inline (no
+   `MirStepNode.extCall`): from this state, whose pointers carry no Tree Borrows tags,
+   `write_bytes` is unsupported (the destination is untracked, so its alignment and validity
+   are unknown) and `copy_nonoverlapping` faults exactly like the statement form
+   (`evalCopyNonOverlappingWithCount`: no borrow entry for the source pointer). -/
 theorem witness_cfg_call_writeBytes_and_copyNonOverlapping_subplace :
     let initSlots : List LocalSlotState :=
       [ .uninit
@@ -27623,15 +27912,11 @@ theorem witness_cfg_call_writeBytes_and_copyNonOverlapping_subplace :
         some (.outOfFuel 2 afterCopySlots none) ∧
       runLoweredCfgSteps witnessCallMemEnv witnessCallMemBody 3 0 initSlots none =
         some (.returned .unit) ∧
-      (∃ ext k,
-        evalTerminator s0 ⟨(witnessCallMemBody.blocks[0]!.terminator).toTrusted, ""⟩
-          (some witnessCallMemCm) = .extCall ext k ∧
-        ext.defPath = "core::intrinsics::write_bytes") ∧
-      (∃ ext k,
-        evalTerminator { s0 with frame := ⟨1, 0, s0.frame.locals⟩ }
+      evalTerminator s0 ⟨(witnessCallMemBody.blocks[0]!.terminator).toTrusted, ""⟩
+          (some witnessCallMemCm) = MirStepNode.unsupported ∧
+      evalTerminator { s0 with frame := ⟨1, 0, s0.frame.locals⟩ }
           ⟨(witnessCallMemBody.blocks[1]!.terminator).toTrusted, ""⟩
-          (some witnessCallMemCm) = .extCall ext k ∧
-        ext.defPath = "core::intrinsics::copy_nonoverlapping") := by
+          (some witnessCallMemCm) = MirStepNode.fail .ub := by
   intro initSlots afterWbSlots afterCopySlots s0
   have hStep0 :
       evalLoweredTerminator witnessCallMemEnv witnessCallMemBody 0 initSlots none =
@@ -27677,9 +27962,7 @@ theorem witness_cfg_call_writeBytes_and_copyNonOverlapping_subplace :
     rw [hB1]; dsimp only; rw [hStmts]; dsimp only; rw [hStep1]; dsimp only
     unfold runLoweredCfgSteps
     rw [hB2]; dsimp only; rw [hStmts]; dsimp only; rw [hStep2]
-  exact ⟨hStep0, hRun2, hRun3,
-    ⟨_, _, by with_unfolding_all rfl, rfl⟩,
-    ⟨_, _, by with_unfolding_all rfl, rfl⟩⟩
+  exact ⟨hStep0, hRun2, hRun3, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
 /-! #### 5g.4: Witness Suite 7 (`witness_projected_and_partialShell_call_destinations`) -/
 
@@ -27755,7 +28038,7 @@ theorem witnessProjStmtCall_bodyCorr :
     | 0 =>
       simp only [witnessProjStmtCallBody, List.getElem?_cons_zero, Option.some.injEq] at hb
       subst hb
-      refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl (by decide) (by decide)
+      refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl
         (ep2b1_consts_nonDeref _ rfl) rfl,
         [⟨.deinit ⟨1, [.field 1 ep2TyU32]⟩, ""⟩], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
       simp only [witnessProjStmtCallEnv, evalSingleReadableProjDeinitStmts] at hEv
@@ -27775,7 +28058,7 @@ theorem witnessProjStmtCall_bodyCorr :
       simp only [witnessProjStmtCallBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl (by decide) (by decide)
+      refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl
         (ep2b1_consts_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hCorr.slots⟩
@@ -27786,7 +28069,7 @@ theorem witnessProjStmtCall_bodyCorr :
       simp only [witnessProjStmtCallBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl (by decide) (by decide)
+      refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl
         (ep2a1_ops_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hCorr.slots⟩
@@ -27849,7 +28132,7 @@ private theorem witnessProjCallerRoot_multiBodyCorr (maxDepth : Nat) :
       simp only [witnessProjCallerRootBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide) (by decide)
+      refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl
         (ep2a1_ops_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
@@ -27923,7 +28206,8 @@ theorem witness_projected_and_partialShell_call_destinations :
     with_unfolding_all rfl
   have hCorr0 : StateCorr witnessProjStmtCallEnv 0 initSlots s0 :=
     ⟨rfl, rfl, by simp [initSlots, s0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
   have hRunMulti :
       runLoweredWithCallTable (witnessLinkedTable 8) 8 stMulti =
         some (.returned (.scalar ⟨59, 4⟩)) := by
@@ -28011,7 +28295,7 @@ theorem witnessWidePtrAndChar_bodyCorr :
       simp only [witnessWidePtrAndCharBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
         Option.some.injEq] at hb
       subst hb
-      exact ⟨rfl, LTerminator.refinable_call_of_lowerIntrinsicKind rfl (by decide) (by decide)
+      exact ⟨rfl, LTerminator.refinable_call_of_lowerIntrinsicKind rfl
         (ep2b1_consts_nonDeref _ rfl) rfl, "", rfl⟩
     | 9 =>
       simp only [witnessWidePtrAndCharBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
@@ -28119,7 +28403,8 @@ theorem witness_wide_ptr_char_and_bodyCorr_ub_parity :
     with_unfolding_all rfl
   have hWideCorr : StateCorr witnessWidePtrAndCharEnv 0 initWideSlots sWide0 :=
     ⟨rfl, rfl, by simp [initWideSlots, sWide0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
   obtain ⟨s7, hRun7, hCorr7⟩ := runLoweredCfgSteps_refines_trusted witnessWidePtrAndChar_bodyCorr
     (fun _ => rfl) 7 0 initWideSlots none sWide0 _ hWideCorr hWide7
   refine ⟨hWide10,
@@ -28131,7 +28416,7 @@ theorem witness_wide_ptr_char_and_bodyCorr_ub_parity :
     simp only [scalarUbCases, List.mem_cons, List.not_mem_nil, or_false] at hc
     rcases hc with rfl | rfl | rfl | rfl | rfl <;>
       dsimp only <;>
-      exact ⟨ep2b1SingleCall_bodyCorr _ _ _ _ _ rfl (by decide) (by decide)
+      exact ⟨ep2b1SingleCall_bodyCorr _ _ _ _ _ rfl
         (ep2b1_consts_nonDeref _ rfl), by with_unfolding_all rfl, by with_unfolding_all rfl⟩
   · refine ⟨?_, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
     exact
@@ -28142,7 +28427,7 @@ theorem witness_wide_ptr_char_and_bodyCorr_ub_parity :
           | 0 =>
             simp only [bUnreach, ep2SingleCallBody, List.getElem?_cons_zero, Option.some.injEq] at hb
             subst hb
-            exact ⟨rfl, LTerminator.refinable_call_of_lowerIntrinsicKind rfl (by decide) (by decide)
+            exact ⟨rfl, LTerminator.refinable_call_of_lowerIntrinsicKind rfl
               (ep2b1_consts_nonDeref _ rfl) rfl, "", rfl⟩
           | 1 =>
             simp only [bUnreach, ep2SingleCallBody, List.getElem?_cons_succ,
@@ -28151,20 +28436,22 @@ theorem witness_wide_ptr_char_and_bodyCorr_ub_parity :
             exact ⟨rfl, trivial, "", rfl⟩
           | n + 2 => simp [bUnreach, ep2SingleCallBody] at hb }
   · exact ⟨ep2b1SingleCall_bodyCorr "core::intrinsics::size_of_val" [.slice (.uint .u32)]
-      [.copy ⟨1, []⟩] ep2TyUsize declsWide (op := .sizeOfVal) rfl (by decide) (by decide)
+      [.copy ⟨1, []⟩] ep2TyUsize declsWide (op := .sizeOfVal) rfl
       (ep2b1_consts_nonDeref _ rfl),
       ep2b1SingleCall_bodyCorr "core::intrinsics::align_of_val" [.slice (.uint .u32)]
-      [.copy ⟨1, []⟩] ep2TyUsize declsWide (op := .alignOfVal) rfl (by decide) (by decide)
+      [.copy ⟨1, []⟩] ep2TyUsize declsWide (op := .alignOfVal) rfl
       (ep2b1_consts_nonDeref _ rfl),
       by with_unfolding_all rfl, by with_unfolding_all rfl,
       by with_unfolding_all rfl, by with_unfolding_all rfl⟩
   · intro bShr cmShr
     have hCorrShr : StateCorr (ep2MakeEnv [ep2Decl ep2TyI32]) 0 [.uninit] (initMachineState cmShr []) :=
       ⟨rfl, rfl, by simp [cmShr, initMachineState, initLocalsAux, ep2MakeCaptured, SlotsRefine,
-        SlotBelow], rfl, rfl, rfl, fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+        SlotBelow], rfl, rfl, rfl, fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
     have hCorrHugeAl : StateCorr (ep2MakeEnv declsWide) 0 [.uninit, .init hugeWideU32] sHugeAl :=
       ⟨rfl, rfl, by simp [sHugeAl, SlotsRefine, SlotBelow], rfl, rfl, rfl,
-        fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+        fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl,
+        rfl⟩
     exact
       ⟨(evalLoweredTerminator_call_resolved_value_intrinsic_ub_parity
           (env := ep2MakeEnv [ep2Decl ep2TyI32]) (body := bShr) (cm := cmShr) (bb := 0)
@@ -28465,8 +28752,7 @@ private theorem witnessUnwindCallee_multiBodyCorrs (rootCm : CapturedMir) (maxDe
   · intro b hb
     simp only [witnessLeafBody, List.mem_cons, List.not_mem_nil, or_false] at hb
     rcases hb with rfl | rfl
-    · refine ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-        (by decide) ?_ rfl⟩
+    · refine ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl ?_ rfl⟩
       intro arg hm
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
       rcases hm with rfl | rfl <;> first | trivial | (intro _ hc; nomatch hc)
@@ -28474,8 +28760,7 @@ private theorem witnessUnwindCallee_multiBodyCorrs (rootCm : CapturedMir) (maxDe
   · intro b hb
     simp only [witnessPanicCalleeBody, List.mem_cons, List.not_mem_nil, or_false] at hb
     subst hb
-    exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-      (by decide) (fun _ hm => nomatch hm) rfl⟩
+    exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (fun _ hm => nomatch hm) rfl⟩
   · intro b hb
     simp only [witnessMidUnwindBody, List.mem_cons, List.not_mem_nil, or_false] at hb
     subst hb
@@ -28483,8 +28768,7 @@ private theorem witnessUnwindCallee_multiBodyCorrs (rootCm : CapturedMir) (maxDe
   · intro b hb
     simp only [witnessAbortCalleeBody, List.mem_cons, List.not_mem_nil, or_false] at hb
     subst hb
-    exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-      (by decide) (fun _ hm => nomatch hm) rfl⟩
+    exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (fun _ hm => nomatch hm) rfl⟩
   · intro b hb
     simp only [witnessMidAbortBody, List.mem_cons, List.not_mem_nil, or_false] at hb
     subst hb
@@ -29089,8 +29373,7 @@ private theorem witnessA2Table_corr (rootCm : CapturedMir) (isolatePtrs : Bool) 
       refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
       simp only [witnessLeafBody, List.mem_cons, List.not_mem_nil, or_false] at hb
       rcases hb with rfl | rfl
-      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (ep2a1_ops_nonDeref _ rfl) rfl⟩
       · exact ⟨rfl, trivial⟩
     have hMid : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
         (witnessA2Env witnessDecls2U32) witnessMidBody
@@ -29098,8 +29381,7 @@ private theorem witnessA2Table_corr (rootCm : CapturedMir) (isolatePtrs : Bool) 
       refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
       simp only [witnessMidBody, List.mem_cons, List.not_mem_nil, or_false] at hb
       rcases hb with rfl | rfl | rfl
-      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (ep2a1_ops_nonDeref _ rfl) rfl⟩
       · exact ⟨rfl, ep2a1_ops_nonDeref _ rfl, rfl, "witness::leaf", [], 0, rfl, Or.inl rfl⟩
       · exact ⟨rfl, trivial⟩
     have hPan : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
@@ -29109,16 +29391,14 @@ private theorem witnessA2Table_corr (rootCm : CapturedMir) (isolatePtrs : Bool) 
       refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
       simp only [witnessPanicTakeU32Body, List.mem_cons, List.not_mem_nil, or_false] at hb
       subst hb
-      exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-        (by decide) (fun _ hm => nomatch hm) rfl⟩
+      exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (fun _ hm => nomatch hm) rfl⟩
     have hCln : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
         (witnessA2Env witnessDecls2U32) witnessCleanupIncBody
         (ep2MakeCaptured "witness::cleanup_inc" 1 witnessDecls2U32 witnessCleanupIncBody) := by
       refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
       simp only [witnessCleanupIncBody, List.mem_cons, List.not_mem_nil, or_false] at hb
       rcases hb with rfl | rfl
-      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (ep2a1_ops_nonDeref _ rfl) rfl⟩
       · exact ⟨rfl, trivial⟩
     have hIdP : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
         (witnessA2Env witnessIdPtrDecls) witnessIdPtrBody
@@ -29126,8 +29406,7 @@ private theorem witnessA2Table_corr (rootCm : CapturedMir) (isolatePtrs : Bool) 
       refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
       simp only [witnessIdPtrBody, List.mem_cons, List.not_mem_nil, or_false] at hb
       rcases hb with rfl | rfl
-      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (ep2a1_ops_nonDeref _ rfl) rfl⟩
       · exact ⟨rfl, trivial⟩
     unfold witnessA2Table at hLk
     cases hE : tys.isEmpty with
@@ -29290,8 +29569,7 @@ private theorem witnessTupleArityProj2Deep_multiBodyCorr :
       simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
-        (by decide) (ep2a1_ops_nonDeref _ rfl) rfl,
+      refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (ep2a1_ops_nonDeref _ rfl) rfl,
         [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hRel⟩

@@ -67,17 +67,19 @@ soundness invariants, lens laws, and step correspondence/refinement against
      `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue` on
      `.cast .intToInt op targetTy` for unsigned 4-byte `char` operands.
 
-3. **Section 3 — `Rvalue.nullaryOp` Formalization, Canonical Tuple `OffsetOf`, & Refinement**:
-   - Alignment rounding (`alignUp`), Episode 1's canonical-byte-layout gate
-     (`rigidTyHasCanonicalByteLayout`, mirroring `Ty::has_canonical_byte_layout`),
-     canonical tuple field-offset resolution (`resolveTupleOffsetOf`), and
-     `evalNullaryOp` (`.sizeOf`, `.alignOf`, `.offsetOf`, `.ubChecks`).
+3. **Section 3 — `Rvalue.nullaryOp`, Canonical Tuple `OffsetOf`, & Exact Trusted Agreement**:
+   - Alignment rounding (`alignUp`) and canonical tuple field-offset resolution
+     (`resolveTupleOffsetOf`) over `Trusted`'s canonical-byte-layout gate
+     (`rigidTyHasCanonicalByteLayout`, mirroring `Ty::has_canonical_byte_layout`).
    - Arithmetic and layout invariants (non-zero tuple variant rejection,
      out-of-bounds field rejection, non-canonical layout rejection, prefix offset
      monotonicity, field offset + field size bounded by tuple size, field
      alignment dividing the field offset, `ubChecks` evaluating to `⟨1, 1⟩`).
-   - Unsupported-shrinking refinement against
-     `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue (.nullaryOp op ty)`, and
+   - The ground semantics `evalNullaryOp` lives in `Trusted` (`Places.lean`);
+     exact two-sided agreement with
+     `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue (.nullaryOp op ty)`
+     (`evalNullaryOp_eq_trusted_evalRvalue`), the layout-free reduction to
+     `resolveTupleOffsetOf` (`resolveOffsetOfPath_eq_resolveTupleOffsetOf`), and
      value-level agreement with the Trusted `size_of_val` / `align_of_val` /
      `ub_checks` intrinsics in `Terminators.lean`.
 
@@ -4219,7 +4221,7 @@ theorem evalCharToInt_trusted_evalRvalue_correspondence
       rw [hNone]
 
 
-/-! ## Section 3: `Rvalue.nullaryOp`, Canonical Tuple `OffsetOf`, & Unsupported-Shrinking Refinement -/
+/-! ## Section 3: `Rvalue.nullaryOp`, Canonical Tuple `OffsetOf`, & Exact Trusted Agreement -/
 
 /-- Round `offset` up to the nearest multiple of `align` (`roundUpToAlign`). -/
 @[reducible]
@@ -4261,166 +4263,19 @@ theorem alignUp_mod_eq_zero
       omega
     rw [hSplit, Nat.mul_mod_left]
 
-/-- Sum the byte sizes of the first `fieldIdx` fields of `tupleFields`, returning
-`.none` if `fieldIdx >= tupleFields.length` or if any preceding field has no known
-byte size. -/
-def sumPrefixFieldSizes
-    (fieldByteSize : RigidTy → Option Nat) :
-    List RigidTy → Nat → Option Nat
-  | .nil, _ => .none
-  | _ :: _, .zero => .some 0
-  | k :: rest, .succ idx =>
-    match fieldByteSize k, sumPrefixFieldSizes fieldByteSize rest idx with
-    | .some sz, .some restOff => .some (Nat.add sz restOff)
-    | _, _ => .none
+/-! ### Canonical tuple byte layouts
 
-/-! ### Canonical tuple byte layouts (`Ty::has_canonical_byte_layout` in `crates/anneal-mir/src/ir.rs`)
-
-Episode 1's `resolve_offset_of` only answers `OffsetOf` on containers with a
-*canonical byte layout*: `rustc`'s `repr(Rust)` layout is then the padding-free
-concatenation of the fields in declaration order, so the byte offset of field `i`
-is the unpadded prefix sum of the sizes of fields `0..i`. Without this gate the
-prefix sum is wrong whenever `rustc` inserts padding or reorders fields: e.g.
-`rustc 1.98` lays out `(u8, u32)` with the `u32` at byte `4`
-(`offset_of!((u8, u32), 1) = 4`), while the unpadded prefix sum is `1`. -/
-
-/-- Fuel-bounded trailing-zero count of `n` (`usize::trailing_zeros` for `n > 0`;
-`0` when `n = 0` or the fuel is exhausted). -/
-def natTrailingZerosAux : Nat → Nat → Nat
-  | .zero, _ => 0
-  | .succ fuel, n =>
-    match Nat.beq n 0, Nat.beq (Nat.mod n 2) 0 with
-    | false, true => Nat.succ (natTrailingZerosAux fuel (Nat.div n 2))
-    | _, _ => 0
-
-/-- `rustc`'s field-ordering alignment-group key `log2(max(align, size))`
-(`Ty::alignment_group_key`: `align.max(size).trailing_zeros()`). -/
-def alignmentGroupKey (size align : Nat) : Nat :=
-  let m :=
-    match Nat.ble align size with
-    | true => size
-    | false => align
-  natTrailingZerosAux m m
-
-mutual
-/-- Whether a type contains a niche-bearing scalar (`bool`, `char`, `&T`) whose
-in-tuple placement `rustc` may optimize (`Ty::contains_niche`). Kinds that
-`anneal-mir`'s `Ty` cannot express conservatively report a niche. -/
-def rigidTyContainsNiche : RigidTy → Bool
-  | .int _ => false
-  | .uint _ => false
-  | .rawPtr _ _ => false
-  | .never => false
-  | .array elem n =>
-    Bool.and (Bool.not (Nat.beq n 0)) (rigidTyContainsNiche elem)
-  | .tuple ks => rigidTyListContainsNiche ks
-  | _ => true
-
-/-- `rigidTyContainsNiche` over a list of tuple field kinds (`any`). -/
-def rigidTyListContainsNiche : List RigidTy → Bool
-  | .nil => false
-  | k :: ks => Bool.or (rigidTyContainsNiche k) (rigidTyListContainsNiche ks)
-end
-
-/-- Field-ordering keys `(align, alignmentGroupKey size align)` of the tuple fields
-`ks` in declaration order, or `.none` if any field size or alignment is unresolved
-or any alignment is `0`. -/
-def tupleFieldOrderKeys?
-    (fieldByteSize fieldAlign : RigidTy → Option Nat) :
-    List RigidTy → Option (List (Nat × Nat))
-  | .nil => .some .nil
-  | k :: ks =>
-    match fieldByteSize k, fieldAlign k, tupleFieldOrderKeys? fieldByteSize fieldAlign ks with
-    | .some sz, .some al, .some rest =>
-      match Nat.beq al 0 with
-      | true => .none
-      | false => .some ((al, alignmentGroupKey sz al) :: rest)
-    | _, _, _ => .none
-
-/-- Both the ABI alignments and the alignment-group keys are non-increasing in
-declaration order. -/
-def orderKeysNonIncreasing : List (Nat × Nat) → Bool
-  | a :: b :: rest =>
-    Bool.and (Nat.ble b.1 a.1)
-      (Bool.and (Nat.ble b.2 a.2) (orderKeysNonIncreasing (b :: rest)))
-  | _ => true
-
-/-- Lay out the fields `ks` in declaration order starting at byte `off` without
-inserting padding, requiring every field alignment to be positive (`al > 0`) and
-every field offset to be a multiple of the field's alignment; returns the unpadded
-end offset. -/
-def tupleDeclOrderAlignedEnd?
-    (fieldByteSize fieldAlign : RigidTy → Option Nat) :
-    Nat → List RigidTy → Option Nat
-  | off, .nil => .some off
-  | off, k :: ks =>
-    match fieldByteSize k, fieldAlign k with
-    | .some sz, .some al =>
-      match Bool.and (Bool.not (Nat.beq al 0)) (Nat.beq (Nat.mod off al) 0) with
-      | true => tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign (Nat.add off sz) ks
-      | false => .none
-    | _, _ => .none
-
-/-- All tuple field kinds are structurally equal (`rigidTyEq`) to their successor. -/
-def rigidTyListAllEq : List RigidTy → Bool
-  | a :: b :: rest => Bool.and (rigidTyEq a b) (rigidTyListAllEq (b :: rest))
-  | _ => true
-
-/-- Tuple-level conditions of `Ty::has_canonical_byte_layout`: the tuple has at
-most one field, or all fields have the same type, or no field contains a niche,
-both the field alignments and alignment-group keys are non-increasing in
-declaration order, every declaration-order field offset is aligned (with positive
-field alignments), and the unpadded size is a multiple of the positive tuple
-alignment (`tupleFieldsAlign`). -/
-def tupleDeclOrderIsCanonical
-    (fieldByteSize fieldAlign : RigidTy → Option Nat)
-    (ks : List RigidTy) : Bool :=
-  match Nat.ble (length ks) 1, rigidTyListAllEq ks with
-  | true, _ => true
-  | false, true => true
-  | false, false =>
-    match
-      rigidTyListContainsNiche ks,
-      tupleFieldOrderKeys? fieldByteSize fieldAlign ks,
-      tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign 0 ks,
-      tupleFieldsAlign fieldAlign ks
-    with
-    | false, .some keys, .some endOff, .some tupleAlign =>
-      Bool.and (orderKeysNonIncreasing keys)
-        (Bool.and (Bool.not (Nat.beq tupleAlign 0)) (Nat.beq (Nat.mod endOff tupleAlign) 0))
-    | _, _, _, _ => false
-
-mutual
-/-- `Ty::has_canonical_byte_layout`: scalars, thin/wide pointers, and `!` are
-canonical; arrays are canonical when their element is; tuples are canonical when
-every field is canonical and `tupleDeclOrderIsCanonical` holds. Every kind that
-`anneal-mir`'s `Ty` cannot express (ADTs, floats, slices, closures, ...) fails
-closed (`false`). -/
-def rigidTyHasCanonicalByteLayout
-    (fieldByteSize fieldAlign : RigidTy → Option Nat) : RigidTy → Bool
-  | .bool => true
-  | .char => true
-  | .int _ => true
-  | .uint _ => true
-  | .rawPtr _ _ => true
-  | .ref _ _ => true
-  | .never => true
-  | .array elem _ => rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign elem
-  | .tuple ks =>
-    Bool.and
-      (rigidTyListHasCanonicalByteLayout fieldByteSize fieldAlign ks)
-      (tupleDeclOrderIsCanonical fieldByteSize fieldAlign ks)
-  | _ => false
-
-/-- `rigidTyHasCanonicalByteLayout` over a list of tuple field kinds (`all`). -/
-def rigidTyListHasCanonicalByteLayout
-    (fieldByteSize fieldAlign : RigidTy → Option Nat) : List RigidTy → Bool
-  | .nil => true
-  | k :: ks =>
-    Bool.and
-      (rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign k)
-      (rigidTyListHasCanonicalByteLayout fieldByteSize fieldAlign ks)
-end
+`sumPrefixFieldSizes`, `rigidTyHasCanonicalByteLayout`, `tupleDeclOrderIsCanonical`, and their
+helpers (`Ty::has_canonical_byte_layout` in `crates/anneal-mir/src/ir.rs`) now live in
+`Trusted.Rustc.V2026_06_01.MirSemantics` (`Places.lean`), where `resolveOffsetOfPath` uses them as
+the layout-free fallback of `Rvalue.nullaryOp (.offsetOf _)`
+(`ws-repatriate-leaked-ground-semantics-to-tcb`, Episode 1). Episode 1's `resolve_offset_of`
+only answers `OffsetOf` on containers with a *canonical byte layout*: `rustc`'s `repr(Rust)`
+layout is then the padding-free concatenation of the fields in declaration order, so the byte
+offset of field `i` is the unpadded prefix sum of the sizes of fields `0..i`. Without this gate
+the prefix sum is wrong whenever `rustc` inserts padding or reorders fields: e.g. `rustc 1.98`
+lays out `(u8, u32)` with the `u32` at byte `4` (`offset_of!((u8, u32), 1) = 4`), while the
+unpadded prefix sum is `1`. -/
 
 /-- Resolve the byte offset of a `(variantIdx, fieldIdx)` projection chain inside
 a canonical tuple type (`resolve_offset_of` in `crates/anneal-mir/src/lower/rvalue.rs`).
@@ -5410,85 +5265,31 @@ theorem sumPrefixFieldSizes_monotone
               have hSub := ih i' j' rI rJ (by omega) hRestI hRestJ
               omega
 
-/-- Evaluate `Rvalue.nullaryOp` (`eval_nullary_op` in `crates/anneal-mir/src/lower/rvalue.rs`):
-- `.sizeOf`: resolves byte size via `intrinsicRigidTyByteSize`, checks `sz <= isize::MAX`,
-  and returns `.ok (.scalar ⟨sz, ptrBytes⟩) locals mem`.
-- `.alignOf`: resolves size and ABI alignment via `intrinsicRigidTyByteSize` and
-  `intrinsicRigidTyAlign`, checks `sz <= isize::MAX` and `align > 0`, and returns
-  `.ok (.scalar ⟨align, ptrBytes⟩) locals mem`.
-- `.offsetOf fields`: resolves canonical tuple field offset via `resolveTupleOffsetOf`,
-  checks `offset <= sz <= isize::MAX`, and returns `.ok (.scalar ⟨offset, ptrBytes⟩) locals mem`.
-- `.ubChecks`: on `RigidTy.bool`, returns `.ok (.scalar ⟨1, 1⟩) locals mem` (`boolToScalar true`).
-- Fails closed with `.unsupported` on unresolved layouts, overflow, or `.contractChecks`. -/
-def evalNullaryOp
+/-! ### `Rvalue.nullaryOp`: exact agreement with `Trusted`
+
+The ground semantics of `Rvalue.nullaryOp` (`eval_nullary_op` in
+`crates/anneal-mir/src/lower/rvalue.rs`) is `Trusted.Rustc.V2026_06_01.MirSemantics.evalNullaryOp`
+(`Places.lean`), which `Trusted`'s `evalRvalue` dispatches to directly; every theorem below is
+stated about that single definition. -/
+
+/-- **Exact Trusted Agreement (`evalNullaryOp_eq_trusted_evalRvalue`)**: `evalNullaryOp` *is*
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue` on `Rvalue.nullaryOp op argTy`, for every
+operator, type, frame, memory, local declaration list, and layout table (two-sided `=`; no
+`.unsupported` escape). -/
+theorem evalNullaryOp_eq_trusted_evalRvalue
     (locals : List LocalSlot)
     (op : NullOp)
     (argTy : Ty)
-    (mem : Memory := emptyMemory)
-    (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable) :
-    RvalueEvalResult :=
-  let ptrBytes := layoutPointerBytes layouts
-  let maxObjSize := Nat.sub (Nat.div (scalarModulus ptrBytes) 2) 1
-  match op with
-  | .sizeOf =>
-    match intrinsicRigidTyByteSize localDecls layouts argTy.kind with
-    | .some sz =>
-      match Nat.ble sz maxObjSize with
-      | true => .ok (.scalar ⟨sz, ptrBytes⟩) locals mem
-      | false => .unsupported
-    | .none => .unsupported
-  | .alignOf =>
-    match
-      intrinsicRigidTyByteSize localDecls layouts argTy.kind,
-      intrinsicRigidTyAlign localDecls layouts argTy.kind
-    with
-    | .some sz, .some align =>
-      match Bool.and (Nat.ble sz maxObjSize) (Bool.not (Nat.beq align 0)) with
-      | true => .ok (.scalar ⟨align, ptrBytes⟩) locals mem
-      | false => .unsupported
-    | _, _ => .unsupported
-  | .offsetOf fields =>
-    match intrinsicRigidTyByteSize localDecls layouts argTy.kind with
-    | .some sz =>
-      match
-        resolveTupleOffsetOf (intrinsicRigidTyByteSize localDecls layouts)
-          (intrinsicRigidTyAlign localDecls layouts) argTy.kind fields
-      with
-      | .some offset =>
-        match Bool.and (Nat.ble sz maxObjSize) (Nat.ble offset sz) with
-        | true => .ok (.scalar ⟨offset, ptrBytes⟩) locals mem
-        | false => .unsupported
-      | .none => .unsupported
-    | .none => .unsupported
-  | .ubChecks =>
-    match argTy.kind with
-    | .bool => .ok (.scalar (boolToScalar true)) locals mem
-    | _ => .unsupported
-  | .contractChecks => .unsupported
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    evalNullaryOp locals op argTy mem localDecls layouts =
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        locals (.nullaryOp op argTy) mem localDecls layouts := rfl
 
-/-- Unsupported-shrinking refinement relation on `RvalueEvalResult`:
-`annealRes` refines `trustedRes` when `trustedRes = .unsupported` (shrinking the
-unsupported fragment to a defined evaluation or keeping it unsupported) or when
-`annealRes = trustedRes` on all defined outcomes. -/
-def RvalueResultRefines (annealRes trustedRes : RvalueEvalResult) : Prop :=
-  trustedRes = .unsupported ∨ annealRes = trustedRes
-
-/-- `RvalueResultRefines` is reflexive and agrees identically whenever
-`trustedRes ≠ .unsupported`. -/
-theorem rvalueResultRefines_properties (a b : RvalueEvalResult) :
-    RvalueResultRefines a a ∧
-    (RvalueResultRefines a b → b ≠ .unsupported → a = b) := by
-  refine ⟨Or.inr rfl, ?_⟩
-  intro hRef hNe
-  rcases hRef with hUnsup | hEq
-  · exact False.elim (hNe hUnsup)
-  · exact hEq
-
-/-- In `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue`, `Rvalue.nullaryOp`
-currently hits the catch-all `.unsupported` branch (`Places.lean:8854`). -/
-@[simp]
-theorem trusted_evalRvalue_nullaryOp_eq_unsupported
+/-- **`NullaryOp` never faults (`evalNullaryOp_ne_ub`)**: `size_of`, `align_of`, `offset_of!`,
+and `ub_checks` are never undefined behavior; unresolved layouts are `.unsupported`. -/
+theorem evalNullaryOp_ne_ub
     (locals : List LocalSlot)
     (op : NullOp)
     (argTy : Ty)
@@ -5496,74 +5297,112 @@ theorem trusted_evalRvalue_nullaryOp_eq_unsupported
     (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
     Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
-      locals (.nullaryOp op argTy) mem localDecls layouts = .unsupported := rfl
+        locals (.nullaryOp op argTy) mem localDecls layouts ≠ .ub := by
+  rw [← evalNullaryOp_eq_trusted_evalRvalue]
+  unfold evalNullaryOp
+  cases op <;> dsimp only <;> repeat' split
+  all_goals (intro h; nomatch h)
 
-/-- **Refinement Theorem (`evalNullaryOp_refines_trusted_evalRvalue`)**:
-`evalNullaryOp` is a sound unsupported-shrinking refinement of
-`Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue (.nullaryOp op argTy)` and
-never introduces `.ub` on any input. Because Trusted's `evalRvalue` is
-`.unsupported` on every `Rvalue.nullaryOp`, the refinement half holds for every
-possible result and constrains nothing by itself; the value Anneal returns is
-pinned to Trusted's own layout semantics by
-`evalNullaryOp_sizeOf_matches_size_of_val_intrinsic`,
-`evalNullaryOp_alignOf_matches_align_of_val_intrinsic`, and
-`evalNullaryOp_ubChecks_matches_intrinsic`, and `.offsetOf` by the
-canonical-layout gate (`resolveTupleOffsetOf_noncanonical_eq_none`,
-`resolveTupleOffsetOf_single_step_aligned`). -/
-theorem evalNullaryOp_refines_trusted_evalRvalue
+/-- **No compiler layouts: `resolveOffsetOfPath` is `resolveTupleOffsetOf`
+(`resolveOffsetOfPath_eq_resolveTupleOffsetOf`)**: when no container has a compiler layout
+(`layoutOf` is always `.none`), `Trusted`'s `offset_of!` resolver from a known root kind is exactly
+the canonical-tuple resolver `resolveTupleOffsetOf`, so every `resolveTupleOffsetOf` theorem above
+(bounds, alignment, non-canonical rejection) applies to `Trusted`'s evaluation. -/
+theorem resolveOffsetOfPath_eq_resolveTupleOffsetOf
+    (layouts : LayoutTable)
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (layoutOf : RigidTy → Option TypeLayout)
+    (hNone : ∀ k, layoutOf k = .none) :
+    ∀ (path : List (VariantIdx × FieldIdx)) (kind : RigidTy),
+      resolveOffsetOfPath layouts fieldByteSize fieldAlign layoutOf (.some kind) .none path =
+        resolveTupleOffsetOf fieldByteSize fieldAlign kind path := by
+  intro path
+  induction path with
+  | nil => intro kind; cases kind <;> rfl
+  | cons step rest ih =>
+    intro kind
+    rcases step with ⟨variantIdx, fieldIdx⟩
+    cases kind with
+    | tuple tupleFields =>
+      simp only [resolveOffsetOfPath, resolveTupleOffsetOf, hNone, ih]
+      cases Nat.beq variantIdx 0 &&
+          rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) <;>
+        cases get? tupleFields fieldIdx <;>
+        cases sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx <;>
+        first
+        | rfl
+        | (rename_i childKind _
+           cases resolveTupleOffsetOf fieldByteSize fieldAlign childKind rest <;> rfl)
+    | _ => rfl
+
+/-- **Layout-free `OffsetOf` through `Trusted` (`evalRvalue_offsetOf_eq_resolveTupleOffsetOf`)**:
+with no local declarations (hence no compiler layouts), `Trusted`'s `evalRvalue` on
+`Rvalue.nullaryOp (.offsetOf fields) argTy` returns the canonical-tuple offset
+`resolveTupleOffsetOf` (checked against `size <= isize::MAX`), or `.unsupported`. -/
+theorem evalRvalue_offsetOf_eq_resolveTupleOffsetOf
     (locals : List LocalSlot)
-    (op : NullOp)
+    (fields : List (VariantIdx × FieldIdx))
     (argTy : Ty)
     (mem : Memory)
-    (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
-    RvalueResultRefines
-      (evalNullaryOp locals op argTy mem localDecls layouts)
-      (Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
-        locals (.nullaryOp op argTy) mem localDecls layouts) ∧
-    evalNullaryOp locals op argTy mem localDecls layouts ≠ .ub := by
-  refine ⟨Or.inl rfl, ?_⟩
-  rcases argTy with ⟨kind, lIdx⟩
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        locals (.nullaryOp (.offsetOf fields) argTy) mem .nil layouts =
+      (match intrinsicRigidTyByteSize .nil layouts argTy.kind with
+       | .some sz =>
+         match
+           resolveTupleOffsetOf (intrinsicRigidTyByteSize .nil layouts)
+             (intrinsicRigidTyAlign .nil layouts) argTy.kind fields
+         with
+         | .some offset =>
+           match
+             Bool.and
+               (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1))
+               (Nat.ble offset sz)
+           with
+           | true => .ok (.scalar ⟨offset, layoutPointerBytes layouts⟩) locals mem
+           | false => .unsupported
+         | .none => .unsupported
+       | .none => .unsupported) := by
+  rw [← evalNullaryOp_eq_trusted_evalRvalue]
   unfold evalNullaryOp
   dsimp only
-  cases op with
-  | sizeOf =>
-    cases intrinsicRigidTyByteSize localDecls layouts kind with
-    | none => intro h; nomatch h
-    | some sz =>
-      dsimp only
-      cases Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) <;>
-        (intro h; nomatch h)
-  | alignOf =>
-    cases intrinsicRigidTyByteSize localDecls layouts kind with
-    | none => intro h; nomatch h
-    | some sz =>
-      cases intrinsicRigidTyAlign localDecls layouts kind with
-      | none => intro h; nomatch h
-      | some align =>
-        dsimp only
-        cases Bool.and
-            (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1))
-            (Bool.not (Nat.beq align 0)) <;>
-          (intro h; nomatch h)
-  | offsetOf fields =>
-    cases intrinsicRigidTyByteSize localDecls layouts kind with
-    | none => intro h; nomatch h
-    | some sz =>
-      dsimp only
-      cases resolveTupleOffsetOf (intrinsicRigidTyByteSize localDecls layouts)
-          (intrinsicRigidTyAlign localDecls layouts) kind fields with
-      | none => intro h; nomatch h
-      | some offset =>
-        dsimp only
-        cases Bool.and
-            (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1))
-            (Nat.ble offset sz) <;>
-          (intro h; nomatch h)
-  | ubChecks =>
-    cases kind <;> (intro h; nomatch h)
-  | contractChecks =>
-    intro h; nomatch h
+  rw [resolveOffsetOfPath_eq_resolveTupleOffsetOf layouts _ _ (findDeclLayoutForRigidTy .nil layouts)
+    (fun _ => rfl)]
+  rfl
+
+/-- Regression (`rustc 1.98`: `offset_of!((u32, u16, u16), 2) = 6` and
+`offset_of!((u8, u32), 1) = 4`): without compiler layouts `Trusted`'s `evalRvalue` answers the
+canonical tuple query and fails closed on the padded tuple instead of returning the prefix sum
+`1`. -/
+example :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue []
+        (.nullaryOp (.offsetOf [(0, 2)]) ⟨.tuple [.uint .u32, .uint .u16, .uint .u16], 0⟩)
+        emptyMemory [] emptyLayoutTable =
+      .ok (.scalar ⟨6, 8⟩) [] emptyMemory ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue []
+        (.nullaryOp (.offsetOf [(0, 1)]) ⟨.tuple [.uint .u8, .uint .u32], 0⟩)
+        emptyMemory [] emptyLayoutTable =
+      .unsupported :=
+  ⟨rfl, rfl⟩
+
+/-- Regression (compiler layouts win): when a local declaration carries the captured layout of
+`(u8, u32)` (fields at bytes `4` and `0`, as `rustc` reorders them), `Trusted`'s `evalRvalue`
+returns the compiler's offsets `offset_of!((u8, u32), 0) = 4` and `offset_of!((u8, u32), 1) = 0`
+instead of failing closed. -/
+example :
+    let tupTy : Ty := ⟨.tuple [.uint .u8, .uint .u32], 0⟩
+    let l : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .arbitrary [⟨4⟩, ⟨0⟩] [1, 0], variants := .single 0, isUninhabited := false }
+    let layouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [l] }
+    let decls : List LocalDecl := [{ mutability := .not, ty := tupTy, debugName := .none }]
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue []
+        (.nullaryOp (.offsetOf [(0, 0)]) tupTy) emptyMemory decls layouts =
+      .ok (.scalar ⟨4, 8⟩) [] emptyMemory ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue []
+        (.nullaryOp (.offsetOf [(0, 1)]) tupTy) emptyMemory decls layouts =
+      .ok (.scalar ⟨0, 8⟩) [] emptyMemory :=
+  ⟨rfl, rfl⟩
 
 /-- **`UbChecks` Agreement With `Terminators.lean` (`evalNullaryOp_ubChecks_matches_intrinsic`)**:
 Evaluating `NullOp.ubChecks` on `RigidTy.bool` yields `.ok (.scalar ⟨1, 1⟩) locals mem`,
@@ -5590,10 +5429,8 @@ theorem evalNullaryOp_ubChecks_matches_intrinsic
   exact ⟨rfl, rfl⟩
 
 /-- **`SizeOf` Agreement With `size_of_val` (`evalNullaryOp_sizeOf_matches_size_of_val_intrinsic`)**:
-`Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue` leaves `Rvalue.nullaryOp`
-unsupported, so `RvalueResultRefines` alone cannot constrain the value Anneal
-returns. This theorem pins it to the value Trusted itself computes for the
-equivalent intrinsic call: whenever `NullOp.sizeOf` on `argTy` returns
+`Trusted`'s `evalRvalue` on `Rvalue.nullaryOp .sizeOf argTy` (= `evalNullaryOp`) agrees with
+the value Trusted computes for the equivalent intrinsic call: whenever `NullOp.sizeOf` on `argTy` returns
 `.ok (.scalar sc) ..` under a 64-bit layout table, the `size_of_val::<T>(ptr)`
 intrinsic (`evalNonSelectIntrinsicCall .sizeOfVal`, `Terminators.lean`) on a
 thin 8-byte pointer whose sized, non-extern pointee type is `argTy.kind` writes
@@ -5722,7 +5559,8 @@ theorem evalNullaryOp_alignOf_matches_align_of_val_intrinsic
         dsimp only at hEval
         cases hOk : Bool.and
             (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1))
-            (Bool.not (Nat.beq align 0)) with
+            (Bool.and (Align.isPowerOfTwoBytes ⟨align⟩)
+              (Nat.blt align (scalarModulus (layoutPointerBytes bodyLayouts)))) with
         | false => rw [hOk] at hEval; nomatch hEval
         | true =>
           rw [hOk] at hEval

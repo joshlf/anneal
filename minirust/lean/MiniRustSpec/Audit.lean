@@ -5646,9 +5646,8 @@ open MiniRustSpec.Correspondence in
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"
-  bdNullaryOp_unsupported
-  bdUbChecks_step
-  bdUbChecks_not_noUB
+  bdNullaryOp_ubChecks_contractChecks
+  bdUbChecks_anneal_ret
   bdNullaryOp_translateRvalue
   bdUbChecks_rejected
   bdCopy0_anneal_ret
@@ -5664,7 +5663,7 @@ open MiniRustSpec.Correspondence in
   bdOffset_rejected
   bdArithOffset_anneal_ret
   bdMirCallReq_fields
-  bdWriteBytes_extCall
+  bdWriteBytes_untracked_unsupported
   bdRawEq_extCall
   bdColdPath_extCall
   bdCtpop_anneal_ret
@@ -5683,7 +5682,7 @@ open MiniRustSpec.Correspondence in
   bdCtpop_inline
   bdExactDiv_inline
   exactDivHandler_iff_minirust
-  bdWriteBytes_unhandled_fault
+  bdWriteBytes_untracked_not_noUB
   bdUbChecksCall_anneal_ret
   bdUbChecksCall_handled
   bdUnreach_anneal_ub

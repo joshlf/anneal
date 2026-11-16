@@ -1413,13 +1413,14 @@ def ptr4Stage1ExtCall (path : DefPath) (argKind : RigidTy) (s : MachineState)
     { defPath := path, typeArgs := [argKind], args := argVals, memory := s.memory }
     (resumeExternalCall s s.frame.locals (local42 0) 1 .unreachable)
 
-/-- **`wit_lm4_2_write_bytes_boundary`** (Stage-1 boundary divergence): real
-execution of `_2 = &raw mut _1` (lockstep) followed by
+/-- **`wit_lm4_2_write_bytes_boundary`** (Stage-1 lockstep): real execution of
+`_2 = &raw mut _1` (lockstep) followed by
 `core::intrinsics::write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb1`. Stage-1
-`stepMirFn` has no `write_bytes` evaluator and hands the call to the environment
-(`MirStepNode.extCall`, `stepMirFn_stage1_unmodeled_intrinsic_extCall`), whereas
-`lean-miri` fills all 8 bytes of `_1` with `0xAB` inline, stepping to a state
-related to an Anneal state with `_1 = 0xABAB_ABAB_ABAB_ABAB`. -/
+`stepMirFn` executes the call inline
+(`Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`, since
+`ws-repatriate-leaked-ground-semantics-to-tcb`) and fills all 8 bytes of `_1` with
+`0xAB`, and `lean-miri` likewise steps to a state related to an Anneal state with
+`_1 = 0xABAB_ABAB_ABAB_ABAB`. -/
 theorem wit_lm4_2_write_bytes_boundary :
     ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let b := writeBytesMutBody 0xAB 1
@@ -1428,8 +1429,8 @@ theorem wit_lm4_2_write_bytes_boundary :
       stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
-      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
-        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] ∧
+      (∃ sW, stepMirFn b s₁ = .step sW ∧
+        get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩))) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       ∃ s₂, StateRelLM3_1 b s₂ m₂ [entry] ∧
         get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) := by
@@ -1499,13 +1500,13 @@ theorem wit_lm4_2_write_bytes_boundary :
           | head _ => exact Or.inl ⟨rfl, rfl⟩)
   rw [hs₂] at hsim₂
   obtain ⟨m₂, hm₂, hrel₂⟩ := hsim₂.miri_step_of_anneal_step
-  exact ⟨s₁, m₁, m₂, hs₁, hm₁, hrel₁, rfl, hm₂, s₂, hrel₂, rfl⟩
+  exact ⟨s₁, m₁, m₂, hs₁, hm₁, hrel₁, ⟨_, rfl, rfl⟩, hm₂, s₂, hrel₂, rfl⟩
 
 /-- **`wit_lm4_2_write_bytes_oob_boundary`** (Stage-1 boundary divergence): real
 execution where `write_bytes::<u64>(copy _2, 0xAB_u8, 2_usize)` attempts to write
-`16 > 8` bytes into the 8-byte stack allocation of `_1`: `lean-miri` reports
-undefined behavior, whereas Stage-1 `stepMirFn` hands the call to the environment
-(`MirStepNode.extCall`) without checking it. -/
+`16 > 8` bytes into the 8-byte stack allocation of `_1`: both `lean-miri` and
+Stage-1 `stepMirFn` (`evalWriteBytesCall`, which rejects a write past the end of a
+whole local) report undefined behavior. -/
 theorem wit_lm4_2_write_bytes_oob_boundary :
     ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState) (msg : String),
       let b := writeBytesMutBody 0xAB 2
@@ -1514,8 +1515,7 @@ theorem wit_lm4_2_write_bytes_oob_boundary :
       stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
-      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
-        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩] ∧
+      stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .error (.undefinedBehavior msg)) := by
   let b := writeBytesMutBody 0xAB 2
   have hrel₀ : StateRel b (ptr4AnnealPre b) (ptr4MiriPre b unitK) :=
@@ -1579,9 +1579,8 @@ theorem wit_lm4_2_write_bytes_oob_boundary :
 
 /-- **`wit_lm4_2_write_bytes_overflow_boundary`** (Stage-1 boundary divergence):
 real execution where `write_bytes::<u64>(copy _2, 0xAB_u8, (2^60)_usize)` overflows
-`isize::MAX` (`2^60 * 8 = 2^63 > 2^63 - 1`): `lean-miri` reports undefined
-behavior, whereas Stage-1 `stepMirFn` hands the call to the environment
-(`MirStepNode.extCall`). -/
+`isize::MAX` (`2^60 * 8 = 2^63 > 2^63 - 1`): both `lean-miri` and Stage-1
+`stepMirFn` (`evalWriteBytesCall`) report undefined behavior. -/
 theorem wit_lm4_2_write_bytes_overflow_boundary :
     ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState) (msg : String),
       let b := writeBytesMutBody 0xAB 1152921504606846976
@@ -1590,9 +1589,7 @@ theorem wit_lm4_2_write_bytes_overflow_boundary :
       stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
-      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
-        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩,
-          .scalar ⟨1152921504606846976, 8⟩] ∧
+      stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .error (.undefinedBehavior msg)) := by
   let b := writeBytesMutBody 0xAB 1152921504606846976
   have hrel₀ : StateRel b (ptr4AnnealPre b) (ptr4MiriPre b unitK) :=
@@ -1655,10 +1652,10 @@ def writeBytesFrozenBody : CapturedMir :=
 execution of `_2 = &raw const _1` (creating a `.frozen` borrow entry, lockstep)
 followed by `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize)`: `lean-miri`'s
 `annealWriteRepeatedBytes` (which checks allocation mutability without Tree
-Borrows transitions) steps with `.ok true`, whereas Stage-1 `stepMirFn` hands the
-call to the environment (`MirStepNode.extCall`) and never checks the `.frozen`
-permission (only the pre-Stage-1 reference model rejected the write,
-`call_intrinsic_write_bytes_perm_divergence`). -/
+Borrows transitions) steps with `.ok true`, whereas Stage-1 `stepMirFn`
+(`evalWriteBytesCall`) rejects the write through the `.frozen` tag as undefined
+behavior, like the pre-Stage-1 reference model
+(`call_intrinsic_write_bytes_perm_divergence`). -/
 theorem wit_lm4_2_write_bytes_frozen_boundary :
     ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let b := writeBytesFrozenBody
@@ -1667,8 +1664,7 @@ theorem wit_lm4_2_write_bytes_frozen_boundary :
       stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
-      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
-        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] ∧
+      stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) := by
   let b := writeBytesFrozenBody
   have hrel₀ : StateRel b (ptr4AnnealPre b) (ptr4MiriPre b unitK) :=
@@ -1724,8 +1720,9 @@ misaligned `offsetBytes = 1`, then
 `write_bytes::<u64>(copy _2, 0xAB_u8, 0_usize) -> bb1`: `lean-miri`'s
 `Intrinsics.writeBytes` checks no alignment (as rustc's `write_bytes_intrinsic`)
 and steps to a state related to an Anneal state with `_1 = 42_u64` unchanged,
-whereas Stage-1 `stepMirFn` hands the call to the environment
-(`MirStepNode.extCall`). -/
+whereas Stage-1 `stepMirFn` (`evalWriteBytesCall`) reports the misaligned
+destination as undefined behavior even though no byte is written, as the
+`core::ptr::write_bytes` safety contract requires. -/
 theorem wit_lm4_2_write_bytes_zero_misaligned_boundary :
     ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
       let b := writeBytesMisalignedZeroBody
@@ -1743,8 +1740,7 @@ theorem wit_lm4_2_write_bytes_zero_misaligned_boundary :
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_1 b s₄ m₄ [entry] ∧
-      stepMirFn b s₄ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₄
-        [.ptr { allocId := 1, offsetBytes := 1 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨0, 8⟩] ∧
+      stepMirFn b s₄ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
       ∃ s₅, StateRelLM3_1 b s₅ m₅ [entry] ∧
         get? s₅.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) := by
@@ -1896,7 +1892,8 @@ real 3-step lockstep execution advancing `_3 : *mut u8` to byte offset `2` insid
 `core::intrinsics::write_bytes::<u8>(copy _3, 0xAB_u8, 2_usize) -> bb1`: `lean-miri`
 splices bytes `[2, 4)` inline (`lm31AllocId1` reads `0x0000_0000_ABAB_002A`,
 related to an Anneal state with `_1 = 2880110634_u64`), whereas Stage-1 `stepMirFn`
-hands the call to the environment (`MirStepNode.extCall`). -/
+(`evalWriteBytesCall`, which models only single-element writes at offset `0`)
+fails closed with `MirStepNode.unsupported`. -/
 theorem wit_lm4_2_write_bytes_partial_boundary :
     ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
       let b := writeBytesPartialBody
@@ -1911,8 +1908,7 @@ theorem wit_lm4_2_write_bytes_partial_boundary :
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM3_1 b s₃ m₃ [entry] ∧
-      stepMirFn b s₃ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u8K s₃
-        [.ptr { allocId := 1, offsetBytes := 2 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩] ∧
+      stepMirFn b s₃ = MirStepNode.unsupported ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       (∃ s₄, StateRelLM3_1 b s₄ m₄ [entry] ∧
         get? s₄.frame.locals 1 = some (.init (.scalar ⟨0x00000000ABAB002A, 8⟩))) ∧

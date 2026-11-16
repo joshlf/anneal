@@ -172,9 +172,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("discriminant", "proved_corresponding"),
             ("aggregate", "proved_corresponding"),
             ("copyForDeref", "proved_corresponding"),
-            ("nullaryOp", "unsupported_fail_closed"),  # Lowered in Anneal.Mir.AdtAndControl
-            ("shallowInitBox", "unsupported_fail_closed"),  # Lowered in Anneal.Mir.AdtAndControl
-            ("wrapUnsafeBinder", "unsupported_fail_closed"),  # Lowered in Anneal.Mir.AdtAndControl
+            # Ground semantics in Trusted (`evalNullaryOp`, `evalShallowInitBox`,
+            # `evalWrapUnsafeBinder` in `MirSemantics/Places.lean`), with two-sided
+            # equalities in Anneal.Mir.PlaceAndRvalue / Anneal.Mir.AdtAndControl.
+            ("nullaryOp", "supported_untested"),
+            ("shallowInitBox", "supported_untested"),
+            ("wrapUnsafeBinder", "supported_untested"),
             ("threadLocalRef", "unsupported_fail_closed"),
         ],
     },

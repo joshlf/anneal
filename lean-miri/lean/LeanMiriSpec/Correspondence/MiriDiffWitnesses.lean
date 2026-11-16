@@ -115,14 +115,12 @@ agreeing whole-program facts.
    `w6_copy_nonoverlapping_overlap_ub` (Stage-1 `copy_nonoverlapping`), and the
    Stage-1 external-call boundary, where Stage-1 hands the intrinsic to the
    environment (`anneal_extCall_boundary`): `w6_rotate_left_extCall_boundary`
-   (from entry; `.unsupported` in `lean-miri`), and, from program entry,
-   `w6_write_bytes_extCall_boundary` (`lean-miri` writes the bytes inline, Anneal
-   returns `()` or reaches undefined behavior through the environment),
-   `w6_write_bytes_read_extCall_divergence` (`lean-miri` is
-   `System.Safe` and returns the written bytes, while Anneal returns the unchanged
-   value and is not `TreeSafe`) and `w6_write_bytes_oob_extCall_divergence`
-   (undefined behavior in `lean-miri`, a normal return of the unchanged value in
-   Anneal).
+   (from entry; `.unsupported` in `lean-miri`); and, from program entry, the
+   inline `write_bytes` agreements (Stage-1 executes `write_bytes` inline since
+   `ws-repatriate-leaked-ground-semantics-to-tcb`): `w6_write_bytes_inline_lockstep`
+   (both machines fill `_1` with the written bytes; Anneal returns `()`),
+   `w6_write_bytes_read_returns` (both return the written bytes) and
+   `w6_write_bytes_oob_ub` (undefined behavior in both).
 
 Every other witness runs from program entry (`initMachineState` /
 `initMachineStateWithCallees` and `miriEntryState`) except `w2_enum_downcast_switch_returns`,
@@ -150,8 +148,8 @@ through `coStep_of_extCall` for an explicit environment response
 an unwinding response may also carry a caller frame the program never pushed
 (`anneal_extCall_continue_unwind_ub`). The `write_bytes` runs of `lean-miri` are
 certified against the pre-Stage-1 reference model `stepMirFnLM4_2`
-(`retWriteBytesRead_ref_trace`, `w6_write_bytes_oob_extCall_divergence`), which
-executes the intrinsic inline like `lean-miri`. Witnesses without a corpus program
+(`retWriteBytesRead_ref_trace`, `w6_write_bytes_oob_ub`), which executes the
+intrinsic inline like `lean-miri`. Witnesses without a corpus program
 of that name (the out-of-bounds `write_bytes` and overlapping
 `copy_nonoverlapping` bodies) are marked as such.
 -/
@@ -4450,35 +4448,26 @@ def wbAddrOfState (b : CapturedMir) : MachineState :=
     [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
     [(rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1).toBorrowEntry] 2
 
-/-- **Stage-1 external-call boundary, from program entry** (`write_bytes::<u64>(ptr,
+/-- **Inline `write_bytes` in lockstep, from program entry** (`write_bytes::<u64>(ptr,
 0xAB, 1)`, `writeBytesEntryBody`): both machines run the entry block and
 `_2 = &raw mut _1` in lockstep from `initMachineState` / `miriEntryState`
-(`AgreeReaches`, `step_rawPtr_addrOf_simulation`). Then Stage-1 `stepMirFn` hands
-`write_bytes` to the environment (`MirStepNode.extCall`, as in
-`WitnessLM4_2.wit_lm4_2_write_bytes_boundary`): when the environment returns `()`
-without touching memory, Anneal's whole program returns `()`; when it unwinds, the
-call's `UnwindAction::Unreachable` is undefined behavior, so Anneal's whole program
-is not `TreeSafe`. `lean-miri` executes `write_bytes` inline (in lockstep with the
-pre-Stage-1 reference model `stepMirFnLM4_2`, `call_intrinsic_write_bytes_simulation`):
-`miriSystem` reaches a state `StateRelLM3_1`-related to an Anneal state with
-`_1 = 0xABABABABABABABAB`. (Before Stage-1, Anneal wrote the bytes inline in
-lockstep with `lean-miri`.) -/
-theorem w6_write_bytes_extCall_boundary :
-    ∃ m₁ m₂,
+(`AgreeReaches`, `step_rawPtr_addrOf_simulation`). Then both execute `write_bytes`
+inline: Stage-1 `stepMirFn` (`Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`,
+since `ws-repatriate-leaked-ground-semantics-to-tcb`) fills `_1` with `0xAB` bytes,
+and Anneal's whole program is `TreeSafe` and returns `()`; `lean-miri` (in lockstep
+with the pre-Stage-1 reference model `stepMirFnLM4_2`,
+`call_intrinsic_write_bytes_simulation`) reaches a state `StateRelLM3_1`-related to
+an Anneal state with the same `_1 = 0xABABABABABABABAB`. (Before that episode,
+Stage-1 handed the call to the environment, `MirStepNode.extCall`.) -/
+theorem w6_write_bytes_inline_lockstep :
+    ∃ m₁ m₂ sW,
       AgreeReaches writeBytesEntryBody (annealMiriHooks writeBytesEntryBody)
         (initMachineState writeBytesEntryBody []) (wbAddrOfState writeBytesEntryBody)
         (miriEntryState writeBytesEntryBody) m₁ ∧
-      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) =
-        MirStepNode.extCall
-          { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
-            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
-            memory := (wbAddrOfState writeBytesEntryBody).memory }
-          (resumeExternalCall (wbAddrOfState writeBytesEntryBody)
-            (wbAddrOfState writeBytesEntryBody).frame.locals (WitnessLM4_2.local42 0) 2
-            .unreachable) ∧
+      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) = .step sW ∧
+      get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) ∧
+      TreeSafe (mirCallTree writeBytesEntryBody []) ∧
       (∃ tr mem, ReachesRet (mirCallTree writeBytesEntryBody []) tr (.normal (.unit, mem))) ∧
-      MirReachesUB (mirCallTree writeBytesEntryBody []) ∧
-      ¬ TreeSafe (mirCallTree writeBytesEntryBody []) ∧
       (miriSystem (annealMiriHooks writeBytesEntryBody)).Reaches
         (miriEntryState writeBytesEntryBody) m₂ ∧
       ∃ s₂, StateRelLM3_1 writeBytesEntryBody s₂ m₂
@@ -4569,33 +4558,15 @@ theorem w6_write_bytes_extCall_boundary :
     (MiriPath.of_runLoopFuel hpm).trans
       (.step hm₁ (frames_ne_of_eq_singleton htf₁)
         (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _)))
-  -- Anneal: the external call, then the root return of `()`.
-  have hext : stepMirFn b (wbAddrOfState b) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
-          args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
-          memory := (wbAddrOfState b).memory }
-        (resumeExternalCall (wbAddrOfState b) (wbAddrOfState b).frame.locals
-          (WitnessLM4_2.local42 0) 2 .unreachable) := rfl
-  let sᵣ := WitnessLM4_2.mkPtrState b 2 0
-    [.init .unit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
-      .uninit]
-    [entry.toBorrowEntry] 2
-  have hres : resumeExternalCall (wbAddrOfState b) (wbAddrOfState b).frame.locals
-      (WitnessLM4_2.local42 0) 2 .unreachable (.returned .unit (wbAddrOfState b).memory) =
-      .running sᵣ := rfl
-  have hret : stepMirFn b sᵣ = .retNormal .unit
-      { sᵣ.memory with borrows := disableFrameBorrows sᵣ.memory.borrows 0 b.localDecls.length } := rfl
-  obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix
-    (sᵣ := sᵣ) (sₖ := sᵣ) (retVal := .unit) (v := .unit) (mem := (wbAddrOfState b).memory)
-    (memR := { sᵣ.memory with borrows := disableFrameBorrows sᵣ.memory.borrows 0 b.localDecls.length })
-    hpa (.step .silent hs₁ (.refl _)) hext hres (.refl _) hret (wbAddrOfState b).memory
+  -- Anneal: `write_bytes` inline, then the root return of `()`.
+  obtain ⟨hAsafe, ⟨tr, htr⟩, _⟩ := anneal_safe_of_runAnnealBounded_returned
+    (body := b) (N := 30) (s := initMachineState b []) (retVal := .unit) rfl
   have hagree : AgreeReaches b (annealMiriHooks b) (initMachineState b []) (wbAddrOfState b)
       (miriEntryState b) m₁ :=
     agreeReaches_of_prefix_paths hpa hpm (.step .silent hs₁ (.refl _))
       (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _))
   have hget : get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) := rfl
-  exact ⟨m₁, m₂, hagree, hext, ⟨tr, _, hrr⟩, hub, hns, hM₂.reaches, s₂, hrel₂, hget⟩
+  exact ⟨m₁, m₂, _, hagree, rfl, rfl, hAsafe, ⟨tr, _, htr⟩, hM₂.reaches, s₂, hrel₂, hget⟩
 
 /-- `I-11` (`pass_tb_unsafe_cell_shared_mutation`): through `&UnsafeCell<u32>`
 (a `Cell` tag), a foreign write through an unrelated raw pointer leaves the
@@ -5771,8 +5742,8 @@ def retWriteBytesTerm : TerminatorKind :=
 frame immediate across a `write_bytes` call. With it, `retWriteBytesRead_ref_trace`
 needs no `StorageLive(_0)`, and `lean-miri`'s program returns the bytes that
 `write_bytes` wrote, read back through the raw pointer, in lockstep with the
-pre-Stage-1 reference model; Stage-1 Anneal instead hands the call to the
-environment (`w6_write_bytes_read_extCall_divergence`). -/
+pre-Stage-1 reference model; Stage-1 Anneal returns the same bytes
+(`w6_write_bytes_read_returns`). -/
 
 /-- `act` leaves `lean-miri`'s stack unchanged whenever it succeeds. -/
 def retStackPreserving {α : Type} (act : Miri.Interpreter.RvalueM AnnealStepState α) : Prop :=
@@ -7902,9 +7873,9 @@ theorem w3_arith_offset_returns :
       (.refl _)))
     hmret rfl (by change (annealControlHooks.returnOperand () m₂).2 = _; rw [hop])
 
-/-- **Stage-1 external-call divergence, whole program from entry**
-(`retWriteBytesReadBody`): `StorageLive(_1.._3); _1 = const 42_u64; goto bb1;
-bb1: _2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 1) -> bb2;
+/-- **`write_bytes` then read back, whole program from entry, both machines return the
+written bytes** (`retWriteBytesReadBody`): `StorageLive(_1.._3); _1 = const 42_u64;
+goto bb1; bb1: _2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 1) -> bb2;
 bb2: _0 = copy (*_2); return`, run from `initMachineState` / `miriEntryState`.
 
 * `lean-miri` fills `_1` with `0xAB` bytes through the raw pointer, reads them back
@@ -7912,26 +7883,19 @@ bb2: _0 = copy (*_2); return`, run from `initMachineState` / `miriEntryState`.
   `0xABABABABABABABAB_u64` (`ImmediateRel`), and is partially correct only for that
   value (`retWriteBytesRead_prefix_miri`, then `retWriteBytesRead_ref_trace`, in
   lockstep with the pre-Stage-1 reference model).
-* Stage-1 `stepMirFn` hands `write_bytes` to the environment, and an environment
-  response cannot write Anneal's stack locals (`resumeExternalCall` keeps the
-  caller's locals): when the environment returns `()` without touching memory,
-  Anneal's whole program returns the unchanged `42_u64`; when it unwinds, the
-  call's `UnwindAction::Unreachable` is undefined behavior, so Anneal is not
-  `TreeSafe` although `lean-miri` is `System.Safe`. -/
-theorem w6_write_bytes_read_extCall_divergence :
+* Stage-1 `stepMirFn` executes `write_bytes` inline
+  (`Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`, since
+  `ws-repatriate-leaked-ground-semantics-to-tcb`) and Anneal's whole program is
+  `TreeSafe` and returns the same `0xABABABABABABABAB_u64` (`AgreeReturns`). (Before
+  that episode, Stage-1 handed the call to the environment and returned the
+  unchanged `42_u64`.) -/
+theorem w6_write_bytes_read_returns :
     ∃ (decl0 : LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).Safe
-        (miriEntryState retWriteBytesReadBody) ∧
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).ReachesOutcome
-        (miriEntryState retWriteBytesReadBody) (.returned (.immediate imm0)) ∧
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).PartialCorrect
-        (miriEntryState retWriteBytesReadBody) (· = .immediate imm0) ∧
+      AgreeReturns retWriteBytesReadBody (annealMiriHooks retWriteBytesReadBody)
+        (initMachineState retWriteBytesReadBody []) (miriEntryState retWriteBytesReadBody)
+        (.scalar ⟨0xABABABABABABABAB, 8⟩) (.immediate imm0) ∧
       get? retWriteBytesReadBody.localDecls 0 = some decl0 ∧
-      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 ∧
-      (∃ tr mem, ReachesRet (mirCallTree retWriteBytesReadBody []) tr
-        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-      MirReachesUB (mirCallTree retWriteBytesReadBody []) ∧
-      ¬ TreeSafe (mirCallTree retWriteBytesReadBody []) := by
+      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 := by
   obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, decl0, imm0, hs₁, hm₁, _, _, hext, hm₂, _, _, _, hm₃, _, _, _,
     hmret, hdecl0, hop, himm⟩ := retWriteBytesRead_ref_trace
   -- `lean-miri`: the entry block, then the traced run to the root pop.
@@ -7942,39 +7906,11 @@ theorem w6_write_bytes_read_extCall_divergence :
         (.step hm₃ (frames_ne_of_step_ok_true hmret) (.refl _))))
   obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_path_return hpath hmret rfl
     (by change (annealControlHooks.returnOperand () m₃).2 = _; rw [hop])
-  -- Anneal: the entry block, the `&raw mut` step, the external call, and the read
-  -- of the unchanged `_1`.
-  let entry := rawPtrAllocMapEntry retWriteBytesReadBody.localDecls retWriteBytesReadBody.layouts
-    .mut 1 1 Witness.lm31AllocId1
-  have hs₁' : stepMirFn retWriteBytesReadBody retWriteBytesReadPreAnneal =
-      .step (WitnessLM4_2.mkPtrState retWriteBytesReadBody 1 1
-        [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
-          .uninit]
-        [entry.toBorrowEntry] 2) := rfl
-  have hs_eq : s₁ = WitnessLM4_2.mkPtrState retWriteBytesReadBody 1 1
-      [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
-        .uninit]
-      [entry.toBorrowEntry] 2 := by
-    have h := hs₁.symm.trans hs₁'
-    unfold MirStepNode.step at h
-    injection h with h
-    injection h
-  subst hs_eq
-  let sᵣ := WitnessLM4_2.mkPtrState retWriteBytesReadBody 2 0
-    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
-      .init .unit]
-    [entry.toBorrowEntry] 2
-  let sₖ := WitnessLM4_2.mkPtrState retWriteBytesReadBody 2 1
-    [.init (.scalar ⟨42, 8⟩), .init (.scalar ⟨42, 8⟩),
-      .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init .unit]
-    [entry.toBorrowEntry] 2
-  have hk : stepMirFn retWriteBytesReadBody sᵣ = .step sₖ := rfl
-  obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix (sᵣ := sᵣ) (sₖ := sₖ)
-    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory)
-    (memR := { sₖ.memory with borrows := [{ entry.toBorrowEntry with perm := .disabled, allocDead := true }] })
-    retWriteBytesRead_prefix_anneal (.step .silent hs₁ (.refl _)) hext rfl
-    (.step .silent hk (.refl _)) rfl (initMachineState retWriteBytesReadBody []).memory
-  refine ⟨decl0, imm0, hsafe, hreach, fun v' hv' => ?_, hdecl0, himm, ⟨tr, _, hrr⟩, hub, hns⟩
+  -- Anneal: the whole program runs to the root return of the written bytes.
+  obtain ⟨hAsafe, tr, mem, htr⟩ := anneal_returns_of_bits (body := retWriteBytesReadBody)
+    (N := 30) (sz := 8) (b := 0xABABABABABABABAB) (s := initMachineState retWriteBytesReadBody [])
+    (by decide)
+  refine ⟨decl0, imm0, ⟨hAsafe, ⟨tr, mem, htr⟩, hsafe, hreach, fun v' hv' => ?_⟩, hdecl0, himm⟩
   have := huniq _ hv'
   injection this
 
@@ -8094,9 +8030,9 @@ theorem retWriteBytesOob_stateRel :
     | 0 | 1 | 2 | 3 => simp [retWriteBytesOobPreMiriFrame] at hmls; subst hmls; cases hv
     | _ + 4 => simp [retWriteBytesOobPreMiriFrame] at hmls
 
-/-- **Stage-1 external-call divergence, whole program from entry**
-(`retWriteBytesOobBody`): `StorageLive(_1.._3); _1 = const 42_u64; goto bb1;
-bb1: _2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 2) -> bb2;
+/-- **Out-of-bounds `write_bytes`, whole program from entry, undefined behavior in
+both machines** (`retWriteBytesOobBody`): `StorageLive(_1.._3); _1 = const 42_u64;
+goto bb1; bb1: _2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 2) -> bb2;
 bb2: _0 = copy (*_2); return`, run from `initMachineState` / `miriEntryState`.
 
 * `lean-miri` takes the entry block and `_2 = &raw mut _1` in lockstep with Anneal
@@ -8104,21 +8040,16 @@ bb2: _0 = copy (*_2); return`, run from `initMachineState` / `miriEntryState`.
   `8`-byte allocation of `_1` as undefined behavior (in lockstep with the
   pre-Stage-1 reference model `stepMirFnLM4_2`, `call_intrinsic_write_bytes_simulation`):
   `miriSystem` reaches `.undefinedBehavior` and is not `System.Safe`.
-* Stage-1 `stepMirFn` hands `write_bytes` to the environment without checking it:
-  when the environment returns `()` without touching memory, Anneal's whole
-  program returns the unchanged `42_u64`; when it unwinds, the call's
-  `UnwindAction::Unreachable` is undefined behavior (`MirReachesUB`, not
-  `TreeSafe`). (Before Stage-1, both machines reported undefined behavior at the
-  call.) -/
-theorem w6_write_bytes_oob_extCall_divergence :
-    (∃ e, (miriSystem (annealMiriHooks retWriteBytesOobBody)).ReachesOutcome
-        (miriEntryState retWriteBytesOobBody) (.undefinedBehavior e)) ∧
-    ¬ (miriSystem (annealMiriHooks retWriteBytesOobBody)).Safe
-        (miriEntryState retWriteBytesOobBody) ∧
-    (∃ tr mem, ReachesRet (mirCallTree retWriteBytesOobBody []) tr
-        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-    MirReachesUB (mirCallTree retWriteBytesOobBody []) ∧
-    ¬ TreeSafe (mirCallTree retWriteBytesOobBody []) := by
+* Stage-1 `stepMirFn` executes `write_bytes` inline
+  (`Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`, since
+  `ws-repatriate-leaked-ground-semantics-to-tcb`): the write extends past the end
+  of the whole local `_1`, a separate allocation, so Anneal's whole program
+  reaches undefined behavior and is not `TreeSafe` (`AgreeUB`). (Before that
+  episode, Stage-1 handed the call to the environment and returned the unchanged
+  `42_u64`.) -/
+theorem w6_write_bytes_oob_ub :
+    AgreeUB retWriteBytesOobBody (annealMiriHooks retWriteBytesOobBody)
+      (initMachineState retWriteBytesOobBody []) (miriEntryState retWriteBytesOobBody) := by
   let b := retWriteBytesOobBody
   obtain ⟨hrel₀, himm₀_all⟩ := retWriteBytesOob_stateRel
   have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
@@ -8194,29 +8125,9 @@ theorem w6_write_bytes_oob_extCall_divergence :
       (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _))
   have h := miri_outcome_of_path_error hM hm₂
   rw [classifyError_eq_ub_iff.2 ⟨rfl, rfl⟩] at h
-  -- Anneal: the entry block, the `&raw mut` step, the external call, and the read
-  -- of the unchanged `_1`.
-  have hext : stepMirFn b s₁ =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
-          args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩]
-          memory := s₁.memory }
-        (resumeExternalCall s₁ s₁.frame.locals (WitnessLM4_2.local42 3) 2 .unreachable) := rfl
-  let sᵣ := WitnessLM4_2.mkPtrState b 2 0
-    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
-      .init .unit]
-    [entry.toBorrowEntry] 2
-  let sₖ := WitnessLM4_2.mkPtrState b 2 1
-    [.init (.scalar ⟨42, 8⟩), .init (.scalar ⟨42, 8⟩),
-      .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init .unit]
-    [entry.toBorrowEntry] 2
-  have hk : stepMirFn b sᵣ = .step sₖ := rfl
-  obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix (sᵣ := sᵣ) (sₖ := sₖ)
-    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory)
-    (memR := { sₖ.memory with borrows := [{ entry.toBorrowEntry with perm := .disabled, allocDead := true }] })
-    retWriteBytesOob_prefix_anneal (.step .silent hs₁ (.refl _)) hext rfl
-    (.step .silent hk (.refl _)) rfl (initMachineState b []).memory
-  exact ⟨⟨_, h.1⟩, h.2, ⟨tr, _, hrr⟩, hub, hns⟩
+  -- Anneal: the whole program reaches undefined behavior at the out-of-bounds write.
+  have hA := anneal_ub_of_obs (body := b) (N := 30) (s := initMachineState b []) (by decide)
+  exact ⟨hA.1, hA.2, ⟨_, h.1⟩, h.2⟩
 
 /-- **Valid `CopyNonOverlapping` returns from entry** (`pass_copy_nonoverlapping_disjoint_locals`,
 `retCopyBody`): `StorageLive(_1.._4); _1 = 42_u64; _2 = 99_u64; goto bb1;

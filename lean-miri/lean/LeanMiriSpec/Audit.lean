@@ -111,9 +111,9 @@ weakened theorem keeps its name:
   upgrades (`w3_deref_oob_ub`, `w3_deref_misaligned_ub`,
   `w4_invalid_bool_ref_read_ub`) and the Stage-1 boundary and divergence
   witnesses (`w1_tail_call_class_divergence`, `anneal_extCall_boundary`,
-  `w6_rotate_left_extCall_boundary`, `w6_write_bytes_extCall_boundary`,
-  `w6_write_bytes_oob_extCall_divergence`,
-  `w6_write_bytes_read_extCall_divergence`).
+  `w6_rotate_left_extCall_boundary`) and the inline `write_bytes` agreements
+  (`w6_write_bytes_inline_lockstep`, `w6_write_bytes_oob_ub`,
+  `w6_write_bytes_read_returns`).
 -/
 
 namespace LeanMiriSpec.Audit
@@ -22897,8 +22897,8 @@ example :
       stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
-      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
-        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] ∧
+      (∃ sW, stepMirFn b s₁ = .step sW ∧
+        get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩))) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       ∃ s₂, StateRelLM3_1 b s₂ m₂ [entry] ∧
         get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
@@ -22958,8 +22958,7 @@ example :
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM3_1 b s₃ m₃ [entry] ∧
-      stepMirFn b s₃ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u8K s₃
-        [.ptr { allocId := 1, offsetBytes := 2 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩] ∧
+      stepMirFn b s₃ = MirStepNode.unsupported ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       (∃ s₄, StateRelLM3_1 b s₄ m₄ [entry] ∧
         get? s₄.frame.locals 1 = some (.init (.scalar ⟨0x00000000ABAB002A, 8⟩))) ∧
@@ -24797,7 +24796,7 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   protReady_rel
   w5_protector_release_returns
   w6_copy_nonoverlapping_disjoint_lockstep
-  w6_write_bytes_extCall_boundary
+  w6_write_bytes_inline_lockstep
   popOutcome
   PtrRetRel
   StepObsRelLM3_1.toLockstep
@@ -24818,11 +24817,11 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   w6_saturating_add_returns
   rotateLeftBody
   w6_rotate_left_extCall_boundary
-  w6_write_bytes_oob_extCall_divergence
+  w6_write_bytes_oob_ub
   retWriteBytesCall_preserves_imm
   retWriteBytesReadBody
   retWriteBytesRead_ref_trace
-  w6_write_bytes_read_extCall_divergence
+  w6_write_bytes_read_returns
   retCopy_copyStep_preserves_imm
   retCopyBody
   retCopy_trace
@@ -25107,59 +25106,39 @@ example :
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
-    ∃ m₁ m₂,
+    ∃ m₁ m₂ sW,
       AgreeReaches writeBytesEntryBody (annealMiriHooks writeBytesEntryBody)
         (initMachineState writeBytesEntryBody []) (wbAddrOfState writeBytesEntryBody)
         (miriEntryState writeBytesEntryBody) m₁ ∧
-      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) =
-        MirStepNode.extCall
-          { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
-            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
-            memory := (wbAddrOfState writeBytesEntryBody).memory }
-          (resumeExternalCall (wbAddrOfState writeBytesEntryBody)
-            (wbAddrOfState writeBytesEntryBody).frame.locals (WitnessLM4_2.local42 0) 2
-            .unreachable) ∧
+      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) = .step sW ∧
+      get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) ∧
+      TreeSafe (mirCallTree writeBytesEntryBody []) ∧
       (∃ tr mem, ReachesRet (mirCallTree writeBytesEntryBody []) tr (.normal (.unit, mem))) ∧
-      MirReachesUB (mirCallTree writeBytesEntryBody []) ∧
-      ¬ TreeSafe (mirCallTree writeBytesEntryBody []) ∧
       (miriSystem (annealMiriHooks writeBytesEntryBody)).Reaches
         (miriEntryState writeBytesEntryBody) m₂ ∧
       ∃ s₂, StateRelLM3_1 writeBytesEntryBody s₂ m₂
           [rawPtrAllocMapEntry writeBytesEntryBody.localDecls writeBytesEntryBody.layouts .mut 1 1
             Witness.lm31AllocId1] ∧
         get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
-  w6_write_bytes_extCall_boundary
+  w6_write_bytes_inline_lockstep
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
-    (∃ e, (miriSystem (annealMiriHooks retWriteBytesOobBody)).ReachesOutcome
-        (miriEntryState retWriteBytesOobBody) (.undefinedBehavior e)) ∧
-    ¬ (miriSystem (annealMiriHooks retWriteBytesOobBody)).Safe
-        (miriEntryState retWriteBytesOobBody) ∧
-    (∃ tr mem, ReachesRet (mirCallTree retWriteBytesOobBody []) tr
-        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-    MirReachesUB (mirCallTree retWriteBytesOobBody []) ∧
-    ¬ TreeSafe (mirCallTree retWriteBytesOobBody []) :=
-  w6_write_bytes_oob_extCall_divergence
+    AgreeUB retWriteBytesOobBody (annealMiriHooks retWriteBytesOobBody)
+      (initMachineState retWriteBytesOobBody []) (miriEntryState retWriteBytesOobBody) :=
+  w6_write_bytes_oob_ub
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
     ∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).Safe
-        (miriEntryState retWriteBytesReadBody) ∧
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).ReachesOutcome
-        (miriEntryState retWriteBytesReadBody) (.returned (.immediate imm0)) ∧
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).PartialCorrect
-        (miriEntryState retWriteBytesReadBody) (· = .immediate imm0) ∧
+      AgreeReturns retWriteBytesReadBody (annealMiriHooks retWriteBytesReadBody)
+        (initMachineState retWriteBytesReadBody []) (miriEntryState retWriteBytesReadBody)
+        (.scalar ⟨0xABABABABABABABAB, 8⟩) (.immediate imm0) ∧
       get? retWriteBytesReadBody.localDecls 0 = some decl0 ∧
-      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 ∧
-      (∃ tr mem, ReachesRet (mirCallTree retWriteBytesReadBody []) tr
-        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-      MirReachesUB (mirCallTree retWriteBytesReadBody []) ∧
-      ¬ TreeSafe (mirCallTree retWriteBytesReadBody []) :=
-  w6_write_bytes_read_extCall_divergence
+      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 :=
+  w6_write_bytes_read_returns
 
 /-! ### `LM-4.3` Stage-1 whole-program bridges: union returns, `LM-3.2` observations, unwinding -/
 

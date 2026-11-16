@@ -39,7 +39,10 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
      `bdExactDiv_inline`, `bdUbChecksCall_anneal_ret`), and diverging
      `core::intrinsics::abort` steps to `MirStepNode.retOutcome .abort`
      (`bdAbort_anneal_abort`).
-   * Unmodeled intrinsics (`write_bytes`, `raw_eq`, `cold_path`) emit external
+   * The call form of `write_bytes` is modeled in `evalDirectRustIntrinsic?`
+     (`evalWriteBytesCall`) and fails closed on an untracked destination
+     pointer (`bdWriteBytes_untracked_unsupported`).
+   * Unmodeled intrinsics (`raw_eq`, `cold_path`) emit external
      `MirCallReq` requests carrying `defPath`, `typeArgs`, `args`, and `memory`
      (`bdMirCallReq_fields`). When interpreted via `mirHandledTree`
      (`Trusted.VerificationResult`), `coldPathHandler` corresponds to
@@ -159,10 +162,12 @@ def bdCallReq? : MirStepNode → Option MirCallReq
 ```text
 bb0: _0 = UbChecks(); return
 ```
-Anneal: `evalRvalue` (`Places.lean:1951`) has no arm for `Rvalue.nullaryOp`,
-so its final catch-all arm (`Places.lean:2267`) returns `.unsupported`, and
-the assignment arm of `evalStmt` (`Statements.lean:909`, `1020`) turns that
-into `MirStepNode.unsupported`, a fault that no UB-free tree may reach.
+Anneal: `evalRvalue` evaluates `Rvalue.nullaryOp .ubChecks` at type `bool`
+through `evalNullaryOp` (`Places.lean`) to `true`, Anneal's UB-checking
+operational mode (the same flag that a call to `core::intrinsics::ub_checks`
+returns, `bdUbChecksCall_anneal_ret`), so the body returns `true`
+(`bdUbChecks_anneal_ret`); `NullOp.contractChecks` stays unsupported
+(`bdNullaryOp_ubChecks_contractChecks`).
 
 `minimize`: `translate_rvalue_smir` (`rvalue.rs:8-371`) has no arm for a
 nullary operation. In the stable MIR it consumes, the runtime-check flags are
@@ -176,20 +181,20 @@ def bdUbChecksBody : CapturedMir :=
     { statements := [mkStmt (.assign (local_ 0) (.nullaryOp .ubChecks boolTy))],
       terminator := mkTerm .return_, isCleanup := false }]
 
-/-- Every nullary operation is unsupported in Anneal, in every state. -/
-theorem bdNullaryOp_unsupported (locals : List LocalSlot) (op : NullOp) (ty : Ty) (mem : Memory)
-    (decls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.nullaryOp op ty) mem decls layouts = .unsupported := rfl
+/-- In every state, Anneal evaluates the runtime UB-check flag `NullOp.ubChecks` at `bool` to
+`true` (`1 : u8`) without touching the frame or memory, and rejects `NullOp.contractChecks` as
+unsupported. -/
+theorem bdNullaryOp_ubChecks_contractChecks (locals : List LocalSlot) (idx : LayoutIdx)
+    (ty : Ty) (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.nullaryOp .ubChecks ⟨.bool, idx⟩) mem decls layouts =
+        .ok (.scalar ⟨1, 1⟩) locals mem ∧
+      evalRvalue locals (.nullaryOp .contractChecks ty) mem decls layouts = .unsupported :=
+  ⟨rfl, rfl⟩
 
-theorem bdUbChecks_step :
-    stepMirFn bdUbChecksBody (initMachineState bdUbChecksBody []) = MirStepNode.unsupported :=
-  rfl
-
-/-- Anneal cannot certify any execution of `bdUbChecksBody`. -/
-theorem bdUbChecks_not_noUB : ¬ MirNoUBTree (mirCallTree bdUbChecksBody []) := by
-  obtain ⟨tr, u, hr, hf⟩ :=
-    faultsA_sound bdUbChecksBody 1 (initMachineState bdUbChecksBody []) rfl
-  exact fun hsafe => hsafe tr u hr hf
+/-- Anneal runs `bdUbChecksBody` to completion, returning `true`. -/
+theorem bdUbChecks_anneal_ret :
+    ∃ mem, ReachesRet (mirCallTree bdUbChecksBody []) [] (.normal (.scalar ⟨1, 1⟩, mem)) :=
+  ⟨_, runA_sound bdUbChecksBody 10 _ _ _ rfl⟩
 
 theorem bdNullaryOp_translateRvalue (layouts : Layout.LayoutTable) (decls : List LocalDecl)
     (targetTy : Option Ty) (op : NullOp) (ty : Ty) :
@@ -421,17 +426,19 @@ to `build::abort()` (`bb.rs:611-614`). -/
 def bdAbortCaller : CapturedMir :=
   bdCallBody "boundary::abort_caller" "core::intrinsics::abort" [] 0 [bdDecl bdNeverTy] none
 
+/-- Anneal evaluates the call form of `write_bytes` inline (`evalWriteBytesCall`): the
+destination pointer of `bdWriteBytesArgs` carries no Tree Borrows entry in the initial state, so
+its target place (and hence its alignment and validity) is unknown and the call fails closed with
+`MirStepNode.unsupported`, never reaching `minimize`'s `span_bug!`. -/
+theorem bdWriteBytes_untracked_unsupported :
+    stepMirFn bdWriteBytesCaller (initMachineState bdWriteBytesCaller bdWriteBytesArgs) =
+      MirStepNode.unsupported :=
+  rfl
+
 /-- Anneal: unmodeled intrinsics with a return target and no body in
-`Memory.callees` (`write_bytes`, `raw_eq`, `cold_path`) emit `MirStepNode.extCall`
-with `typeArgs` preserved, whereas `ctpop` and `exact_div` evaluate inline via
-`evalDirectRustIntrinsic?` and `abort` returns `MirOutcome.abort`. -/
-theorem bdWriteBytes_extCall :
-    ∃ k, stepMirFn bdWriteBytesCaller (initMachineState bdWriteBytesCaller bdWriteBytesArgs) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::write_bytes", typeArgs := [.uint .u32],
-          args := bdWriteBytesArgs,
-          memory := (initMachineState bdWriteBytesCaller bdWriteBytesArgs).memory } k :=
-  ⟨_, rfl⟩
+`Memory.callees` (`raw_eq`, `cold_path`) emit `MirStepNode.extCall` with `typeArgs` preserved,
+whereas `ctpop` and `exact_div` evaluate inline via `evalDirectRustIntrinsic?` and `abort` returns
+`MirOutcome.abort`. -/
 
 theorem bdRawEq_extCall :
     ∃ k, stepMirFn bdRawEqCaller (initMachineState bdRawEqCaller bdRawEqArgs) =
@@ -651,38 +658,6 @@ private theorem mirHandledTree_extCall_ret {body : CapturedMir} {args : List Val
     simp [ITree.interpStep, hobsS1, ITreeF.map]
   exact ⟨_, .tau hobs1 (.refl _), hobs2⟩
 
-private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Value}
-    {mem : Memory} {h : ExternalCallHandler} {req : MirCallReq}
-    {kStep : MirCallAns → MirExecState} {fk : FailureKind}
-    (hstep0 : stepMirFn body (initMachineStateWithMemory body args mem) = .extCall req kStep)
-    (hreq : h req = ITree.fail (E := MirClosedEffect) fk) :
-    FaultNow (mirHandledTree body args mem h) := by
-  have hobs0 : (mirStatefulTree body args mem).observe =
-      .vis (.inr (.inr (CallReq.call req : MirCallE.I)))
-        (fun ans => ITree.cofix (stepMirState body) (kStep ans)) := by
-    rw [mirStatefulTree, mirTree, ITree.observe_cofix]
-    simp [stepMirState, hstep0, MirStepNode.extCall, ITreeF.map]
-  have hfail : ∃ (kFail : PEmpty → ITree MirClosedEffect MirCallAns),
-      (ITree.fail (E := MirClosedEffect) (R := MirCallAns) fk).observe =
-      .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kFail := by
-    dsimp only [ITree.fail, Bind.bind, Monad.toBind, ITree.bind, ITree.triggerSub]
-    rw [ITree.observe_cofix]
-    dsimp only
-    rw [ITree.observe_vis]
-    exact ⟨_, rfl⟩
-  obtain ⟨kFail, hkFail⟩ := hfail
-  have hobsH : ∃ (kOut : PEmpty → ITree MirClosedEffect MirOutcome),
-      (mirHandledTree body args mem h).observe =
-      .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kOut := by
-    rw [mirHandledTree, mirHandledTreeWithCallees, ITree.interp, ITree.observe_cofix]
-    dsimp only [ITree.interpStep]
-    erw [hobs0]
-    dsimp only [handleMirExternalCalls]
-    erw [hreq, hkFail]
-    exact ⟨_, rfl⟩
-  obtain ⟨kOut, hkOut⟩ := hobsH
-  exact ⟨mirHandledTree body args mem h, .inl (.fail fk), kOut, .refl _, hkOut, trivial⟩
-
 /-- `ExternalCallHandler` for `core::intrinsics::cold_path`: returns `()` with
 unchanged memory, matching `minimize`'s no-op `Terminator::Goto(target)`
 (`bb.rs:595-599`). -/
@@ -839,18 +814,17 @@ theorem exactDivHandler_iff_minirust (it : Gen.IntType)
 
 /-! ### 4c. Completeness boundary for `write_bytes` and `ub_checks`
 
-* `core::intrinsics::write_bytes`: `stepMirFn` does **not** return
-  `MirStepNode.unsupported` directly; because `write_bytes` has a return target
-  and no body in `Memory.callees`, `stepMirFn` emits `MirStepNode.extCall`
-  (`bdWriteBytes_extCall`). Under any `ExternalCallHandler` that rejects
-  unmodeled calls with `ITree.fail FailureKind.unsupported`, `mirHandledTree`
-  faults immediately (`bdWriteBytes_unhandled_fault`), while `minimize`'s
+* `core::intrinsics::write_bytes`: `stepMirFn` evaluates the call inline
+  (`evalWriteBytesCall`); on the untracked destination pointer of
+  `bdWriteBytesArgs` it fails closed (`bdWriteBytes_untracked_unsupported`), so
+  Anneal certifies no execution of the caller
+  (`bdWriteBytes_untracked_not_noUB`), while `minimize`'s
   `translate_rs_intrinsic` (`bb.rs:429-694`) has no `sym::write_bytes` arm and
   hits `span_bug!` (`bb.rs:615`).
 * `core::intrinsics::ub_checks`: appears in two MIR forms. Inline
-  `Rvalue.nullaryOp .ubChecks` steps directly to `MirStepNode.unsupported` in
-  Anneal (`bdUbChecks_step`, `bdUbChecks_not_noUB`) and is rejected by
-  `translateRvalue` (`bdNullaryOp_translateRvalue`). An unlowered
+  `Rvalue.nullaryOp .ubChecks` evaluates to `true` in Anneal
+  (`bdNullaryOp_ubChecks_contractChecks`, `bdUbChecks_anneal_ret`) and is
+  rejected by `translateRvalue` (`bdNullaryOp_translateRvalue`). An unlowered
   `TerminatorKind.call` to `core::intrinsics::ub_checks` instead emits
   `MirStepNode.extCall` (`bdUbChecksCall_extCall`), and `ubChecksHandler flag`
   supplies the session-configured `bool` matching `minimize`'s
@@ -858,15 +832,14 @@ theorem exactDivHandler_iff_minirust (it : Gen.IntType)
   `bdUbChecksCall_handled`).
 -/
 
-/-- Without a handler for `core::intrinsics::write_bytes`, interpreting
-`bdWriteBytesCaller` under an `unsupported`-defaulting `ExternalCallHandler`
-faults immediately (`FaultNow`), and `progInFragment` rejects the caller
-(`bdExtCallers_rejected`). -/
-theorem bdWriteBytes_unhandled_fault :
-    FaultNow
-      (mirHandledTree bdWriteBytesCaller bdWriteBytesArgs emptyMemory
-        (fun _ => ITree.fail FailureKind.unsupported)) :=
-  mirHandledTree_extCall_ub rfl rfl
+/-- Anneal certifies no execution of `bdWriteBytesCaller` on `bdWriteBytesArgs`: its first step
+fails closed (`bdWriteBytes_untracked_unsupported`), independently of any external-call handler,
+and `progInFragment` rejects the caller (`bdExtCallers_rejected`). -/
+theorem bdWriteBytes_untracked_not_noUB :
+    ¬ MirNoUBTree (mirCallTree bdWriteBytesCaller bdWriteBytesArgs) := by
+  obtain ⟨tr, u, hr, hf⟩ :=
+    faultsA_sound bdWriteBytesCaller 1 (initMachineState bdWriteBytesCaller bdWriteBytesArgs) rfl
+  exact fun hsafe => hsafe tr u hr hf
 
 /-- `fn ub_checks_call_caller() -> bool`, calling `core::intrinsics::ub_checks`
 as an unlowered `TerminatorKind.call` (`bb.rs:607-610`). -/

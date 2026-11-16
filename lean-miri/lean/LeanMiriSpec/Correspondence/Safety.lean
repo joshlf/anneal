@@ -308,21 +308,19 @@ concrete real-step instances in the `Wit*` modules:
     offset aliases (`core::intrinsics::wrapping_offset`, `std::intrinsics::*`)
     routed by Stage-1 to `MirStepNode.extCall`
     (`stepMirFn_stage1_std_offset_alias_extCall`);
-  * the Stage-1 external-call boundary: Stage-1 hands `write_bytes`,
-    `rotate_left`, and `rotate_right` to the environment (`MirStepNode.extCall`,
+  * the Stage-1 external-call boundary: Stage-1 hands `rotate_left` and
+    `rotate_right` to the environment (`MirStepNode.extCall`,
     `stepMirFn_stage1_unmodeled_intrinsic_extCall`,
-    `call_intrinsic_rotate_stage1_boundary`), while `lean-miri` executes
-    `write_bytes` and fails closed on the rotations. Whole programs:
-    `MiriDiffWitnesses.w6_write_bytes_read_extCall_divergence` (from program entry:
-    `lean-miri` is `System.Safe` and returns `0xABABABABABABABAB`, while Anneal
-    returns the unchanged `42` when the environment returns `()`, and is not
-    `TreeSafe` because the environment may unwind into `UnwindAction::Unreachable`),
-    `MiriDiffWitnesses.w6_write_bytes_oob_extCall_divergence` (from program entry:
-    undefined behavior in `lean-miri`, a normal return of the unchanged `42` in
-    Anneal), `MiriDiffWitnesses.w6_write_bytes_extCall_boundary` (from program
-    entry: `lean-miri` writes the bytes inline while Anneal returns `()` or reaches
-    undefined behavior through the environment), and
-    `MiriDiffWitnesses.w6_rotate_left_extCall_boundary` (from entry);
+    `call_intrinsic_rotate_stage1_boundary`), while `lean-miri` fails closed on
+    them (`MiriDiffWitnesses.w6_rotate_left_extCall_boundary`, from entry);
+  * `write_bytes`, which Stage-1 executes inline
+    (`Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`, since
+    `ws-repatriate-leaked-ground-semantics-to-tcb`) like `lean-miri`. Whole
+    programs from entry: `MiriDiffWitnesses.w6_write_bytes_read_returns` (both
+    return `0xABABABABABABABAB`), `MiriDiffWitnesses.w6_write_bytes_oob_ub`
+    (undefined behavior in both), and
+    `MiriDiffWitnesses.w6_write_bytes_inline_lockstep` (both fill `_1` with the
+    written bytes; Anneal returns `()`);
   * the inline intrinsics outside `AnnealIntrinsic` that Stage-1 evaluates and
     `annealCallHooks` fails closed on
     (`step_call_nonAnnealIntrinsic_miri_unsupported`).

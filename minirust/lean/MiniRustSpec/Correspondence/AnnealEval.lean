@@ -3245,12 +3245,21 @@ theorem evalRvalue_use_deref_ok {locals : List LocalSlot} {op : Operand}
         dsimp only at hd hf
         simp [hd, hf]
 
-/-- `Rvalue.wrapUnsafeBinder op ty` evaluates identically to `Rvalue.use op`. -/
+/-- `Rvalue.wrapUnsafeBinder op ty` into a transparent binder type (neither a single-field binder
+struct, `binderStructLayout? = none`, nor a type resolved to a layout whose scalar validity range is
+checked, `resolvedTyLayout? = none`) evaluates identically to `Rvalue.use op`. -/
 theorem evalRvalue_wrapUnsafeBinder_eq_use (locals : List LocalSlot) (op : Operand)
     (ty : MirAst.Ty) (mem : MirSemantics.Memory) (decls : List LocalDecl)
-    (layouts : Layout.LayoutTable) :
+    (layouts : Layout.LayoutTable)
+    (hBinder : Trusted.Rustc.V2026_06_01.MirSemantics.binderStructLayout? decls layouts ty = none)
+    (hRange : Trusted.Rustc.V2026_06_01.MirSemantics.resolvedTyLayout? decls layouts ty = none) :
     evalRvalue locals (.wrapUnsafeBinder op ty) mem decls layouts =
-      evalRvalue locals (.use op) mem decls layouts := rfl
+      evalRvalue locals (.use op) mem decls layouts := by
+  show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals op ty mem decls layouts =
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue locals op mem decls layouts
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
+  rw [hBinder, hRange]
+  cases Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue locals op mem decls layouts <;> rfl
 
 /-! ### Dereference reads: Tree Borrows foreign-read freezing
 

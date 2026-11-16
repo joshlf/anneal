@@ -742,15 +742,16 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `bdArithOffset_anneal_ret`, `bdCtpop_anneal_ret`, `bdCtpop_inline`,
   `bdExactDivI32_anneal_ret`, `bdExactDiv_typeArgs_distinct`, `bdExactDiv_inline`,
   `bdUbChecksCall_anneal_ret`), and diverging `core::intrinsics::abort` returns
-  `MirOutcome.abort` (`bdAbort_anneal_abort`), while `cold_path`, `write_bytes`,
-  and `raw_eq` emit external `MirCallReq` requests (`bdColdPath_extCall`,
-  `bdColdPath_handled`, `bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`,
-  `bdRawEq_extCall`, alongside `ctpopHandler`, `ubChecksHandler` /
+  `MirOutcome.abort` (`bdAbort_anneal_abort`), `write_bytes` evaluates inline and
+  fails closed on an untracked destination pointer
+  (`bdWriteBytes_untracked_unsupported`, `bdWriteBytes_untracked_not_noUB`), while
+  `cold_path` and `raw_eq` emit external `MirCallReq` requests (`bdColdPath_extCall`,
+  `bdColdPath_handled`, `bdRawEq_extCall`, alongside `ctpopHandler`, `ubChecksHandler` /
   `bdUbChecksCall_handled`, `exactDivHandler_iff_minirust`, and the symbolic
   popcount proofs `evalCountOnes_intFromBits` and `evalCountOnes_signedness_indep`).
   For pointer/target intrinsics and polymorphism outside the fragment:
-  `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal (`bdUbChecks_step`)
-  but a session-fixed `bool` constant in `minimize`; `CopyNonOverlapping` aborts
+  `Rvalue::NullaryOp(UbChecks)` evaluates to `true` in Anneal
+  (`bdUbChecks_anneal_ret`) and is a session-fixed `bool` constant in `minimize`; `CopyNonOverlapping` aborts
   `minimize` (`span_bug!`) while Anneal executes it (`bdCopy2_noUB`); Anneal's
   `BinOp::Offset` scales the signed count by `size_of::<T>()` and enforces
   in-bounds byte arithmetic (`bdOffset1_anneal_ret`, `bdOffsetNeg1_anneal_ub`,
