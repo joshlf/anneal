@@ -203,6 +203,88 @@ theorem StdValRefines.zip_symBool {tagOf : LoanId → Nat} {b : Bool}
   | true => exact .choiceTrue h
   | false => exact .choiceFalse h
 
+/-- `stdValAlg.branchSplit v` returns `some (c, vt, vf)` iff `v` is the symbolic
+choice node `.choice c vt vf`. -/
+theorem stdBranchSplit_eq_some_iff (v c vt vf : StdVal) :
+    stdValAlg.branchSplit v = some (c, vt, vf) ↔ v = .choice c vt vf := by
+  constructor
+  · intro h
+    rcases v with ⟨_, tree⟩
+    cases tree with
+    | choice fc ft ff tc tvt tvf =>
+      injection h with hTuple
+      injection hTuple with hc hRest
+      injection hRest with hvt hvf
+      subst hc
+      subst hvt
+      subst hvf
+      rfl
+    | _ => exact nomatch h
+  · intro h
+    subst h
+    rfl
+
+/-- If `stdValAlg.branchSplit v` splits `v` at `.symBool b` into `(vt, vf)`,
+then any runtime value refining `if b then vt else vf` refines `v`. -/
+theorem StdValRefines.of_branchSplit {tagOf : LoanId → Nat} {v vt vf : StdVal}
+    {b : Bool} {mv : Value}
+    (hSplit : stdValAlg.branchSplit v = some (.symBool b, vt, vf))
+    (hArm : StdValRefines tagOf (if b then vt else vf) mv) :
+    StdValRefines tagOf v mv := by
+  rw [(stdBranchSplit_eq_some_iff v (.symBool b) vt vf).mp hSplit]
+  exact StdValRefines.zip_symBool hArm
+
+/-- Inversion of `StdValRefines` through `stdValAlg.branchSplit`: any refined
+value that splits via `branchSplit` has a `.symBool b` guard and refines the
+selected arm `if b then vt else vf`. -/
+theorem StdValRefines.branchSplit_inv {tagOf : LoanId → Nat}
+    {v c vt vf : StdVal} {mv : Value}
+    (hSplit : stdValAlg.branchSplit v = some (c, vt, vf))
+    (hRef : StdValRefines tagOf v mv) :
+    Exists fun b : Bool =>
+      c = .symBool b ∧ StdValRefines tagOf (if b then vt else vf) mv := by
+  cases hRef with
+  | choiceTrue hArm =>
+    injection hSplit with hTuple
+    injection hTuple with hc hRest
+    injection hRest with hvt hvf
+    subst hc
+    subst hvt
+    subst hvf
+    exact ⟨true, rfl, hArm⟩
+  | choiceFalse hArm =>
+    injection hSplit with hTuple
+    injection hTuple with hc hRest
+    injection hRest with hvt hvf
+    subst hc
+    subst hvt
+    subst hvf
+    exact ⟨false, rfl, hArm⟩
+  | unit => exact nomatch hSplit
+  | unitAgg => exact nomatch hSplit
+  | nat _ => exact nomatch hSplit
+  | bool _ => exact nomatch hSplit
+  | symBool _ => exact nomatch hSplit
+  | pair _ _ => exact nomatch hSplit
+  | ref _ _ _ => exact nomatch hSplit
+
+/-- Inversion for `StdValRefines` on a `.choice c vt vf` node: `c` is some
+symbolic boolean `.symBool b` and `mv` refines the arm `if b then vt else vf`. -/
+theorem StdValRefines.choice_inv {tagOf : LoanId → Nat} {c vt vf : StdVal}
+    {mv : Value} (h : StdValRefines tagOf (.choice c vt vf) mv) :
+    Exists fun b : Bool =>
+      c = .symBool b ∧ StdValRefines tagOf (if b then vt else vf) mv :=
+  h.branchSplit_inv rfl
+
+/-- `stdValAlg.sameCond` on symbolic booleans is exact boolean equality. -/
+theorem stdValAlg_sameCond_symBool_iff (b1 b2 : Bool) :
+    stdValAlg.sameCond (.symBool b1) (.symBool b2) = true ↔ b1 = b2 := by
+  cases b1 <;> cases b2 <;> decide
+
+/-- Binary pairs always share aggregate shape in `stdValAlg`. -/
+theorem stdValAlg_sameAggregateShape_pair (a1 b1 a2 b2 : StdVal) :
+    stdValAlg.sameAggregateShape (.pair a1 b1) (.pair a2 b2) = true := rfl
+
 /-- A natural is refined only by a scalar holding exactly that natural. -/
 theorem StdValRefines.nat_inv {tagOf : LoanId → Nat} {v : StdVal} {mv : Value}
     (h : StdValRefines tagOf v mv) {n : Nat} (hn : stdNatVal? v = some n) :
@@ -1925,20 +2007,35 @@ theorem mirStateRel_swap (tagOf : LoanId → Nat)
 
 /-- Block-level state relation between an embedded `PureLift` CFG machine state
 `s : BlockMachineState (SymState StdVal) (FuncOut StdVal)` and a live `V2026_06_01`
-`MachineState`: `s.wrap` is the identity wrapper, `ms` sits at the header of
-`mirBb s.bb` (`stmtIdx = 0`), `mirStateRel tagOf (bindingsAt s.bb) s.st ms`
-holds, and `extra s.bb s.st ms` holds. -/
+`MachineState`: `s.wrap` is a sub-identity wrapper (`SubIdWrap s.wrap`, satisfied
+by `some` and preserved across `.convergedJump` continuing-join guards
+`handleFreeOutOpt stdValAlg`), `ms` sits at the header of `mirBb s.bb`
+(`stmtIdx = 0`), `mirStateRel tagOf (bindingsAt s.bb) s.st ms` holds, and
+`extra s.bb s.st ms` holds (independently of `s.wait`, so `.convergedJump`
+`armSteps` delay ticks stutter automatically). -/
 def mirCfgStateRel (tagOf : LoanId → Nat)
     (bindingsAt : Nat → List (LoanId × Local × SubPath))
     (mirBb : Nat → BasicBlockIdx)
     (extra : Nat → SymState StdVal → MachineState → Prop := fun _ _ _ => True)
     (s : BlockMachineState (SymState StdVal) (FuncOut StdVal))
     (ms : MachineState) : Prop :=
-  (∀ o, s.wrap o = o) ∧
+  SubIdWrap s.wrap ∧
   ms.frame.blockIdx = mirBb s.bb ∧
   ms.frame.stmtIdx = 0 ∧
   mirStateRel tagOf (bindingsAt s.bb) s.st ms ∧
   extra s.bb s.st ms
+
+/-- `mirCfgStateRel` ignores `s.wait`, so any pending `.convergedJump` delay
+tick preserves it identically. -/
+theorem mirCfgStateRel_wait_step (tagOf : LoanId → Nat)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (wrap : FuncOut StdVal → Option (FuncOut StdVal))
+    (bb : Nat) (st : SymState StdVal) (w : Nat) (ms : MachineState)
+    (h : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, w + 1⟩ ms) :
+    mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, w⟩ ms :=
+  h
 
 /-- Outcome-level return relation matching `LiftedMirPost`: a normal return
 whose value refines `out.ret` and whose final memory realizes `out.mutFinals` at
@@ -1949,6 +2046,118 @@ def MirOutcomeRel (tagOf : LoanId → Nat)
   Exists fun mv => Exists fun mem =>
     o = .normal (mv, mem) ∧ StdValRefines tagOf out.ret mv ∧
     spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out (callerExitState mem)
+
+/-- **Wait-free and wrapper-unwrapped `ForwardSim` constructor for
+`mirCfgStateRel`**:
+1. All `.convergedJump` `armSteps` delay ticks (`s.wait = w + 1`) are discharged
+   automatically by stuttering (`mirCfgStateRel_wait_step`).
+2. On `.ret v`, `SubIdWrap wrap` from `mirCfgStateRel` automatically identifies
+   any accepted `wrap v = some v'` with `v`, so the caller only proves
+   `PureMirExec.WpConverges (PureMirExec.mirStep body) ms (MirOutcomeRel tagOf rootAddrs v)`. -/
+theorem mirCfg_forwardSim_of_waitFree (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hZero : ∀ wrap bb st ms,
+      mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st', 0⟩)
+      | .jumpWrapped wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', 0⟩)
+      | .convergedJump armSteps wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', armSteps⟩)
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs) := by
+  refine forwardSim_of_waitFree (stepBasicBlock stdValAlg blocks)
+    (PureMirExec.mirStep body)
+    (mirCfgStateRel tagOf bindingsAt mirBb extra)
+    (MirOutcomeRel tagOf rootAddrs)
+    (mirCfgStateRel_wait_step tagOf bindingsAt mirBb extra) ?_
+  intro wrap bb st ms hR
+  have hZ := hZero wrap bb st ms hR
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
+  | ret v =>
+    rw [hst] at hZ
+    dsimp only
+    cases hw : wrap v with
+    | none => trivial
+    | some v' =>
+      rw [hR.1 v v' hw]
+      exact hZ
+
+/-- **Wait-free `SegmentSim` constructor for `mirCfgStateRel`**: discharges all
+`.convergedJump` `armSteps` delay ticks by stuttering and imposes obligations
+only on `wait = 0` `.jump`, `.jumpWrapped`, and `.convergedJump` transitions. -/
+theorem mirCfg_segmentSim_of_waitFree (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (hZero : ∀ wrap bb st ms,
+      mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st', 0⟩)
+      | .jumpWrapped wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', 0⟩)
+      | .convergedJump armSteps wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', armSteps⟩)
+      | .ret _ => True
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    SegmentSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra) := by
+  refine segmentSim_of_waitFree (stepBasicBlock stdValAlg blocks)
+    (PureMirExec.mirStep body)
+    (mirCfgStateRel tagOf bindingsAt mirBb extra)
+    (mirCfgStateRel_wait_step tagOf bindingsAt mirBb extra) ?_
+  intro wrap bb st ms hR
+  have hZ := hZero wrap bb st ms hR
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
+  | ret _ => trivial
 
 /-- **Certificate-free block-level adequacy over live `V2026_06_01` MIR
 (`mir_blockCfg_sound`)**: a forward simulation from the embedded `PureLift`
@@ -1980,6 +2189,35 @@ theorem mir_blockCfg_sound (tagOf : LoanId → Nat) (body : CapturedMir)
         ⟨out, mv, mem, ho, hRef, hFin, hPost⟩)
       (wpConverges_of_forwardSim hSim hWp m0 hR0))
 
+/-- **`InvClosedNoFork` form of `mir_cfgCertificate_sound`**: requires only
+`InvClosedNoFork (stepBasicBlock stdValAlg cert.blocks) BlockInv` (no `PostRet`
+or fault-freedom on unreachable blocks). -/
+theorem mir_cfgCertificate_sound_of_invClosedNoFork (tagOf : LoanId → Nat)
+    (body : CapturedMir) (cert : CfgCertificate stdValAlg)
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue stdValAlg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState StdVal → Prop)
+    (hClosed : InvClosedNoFork (stepBasicBlock stdValAlg cert.blocks) BlockInv)
+    (hInv0 : BlockInv cert.entryBb st0)
+    (hSim : ForwardSim (blockCfgStep (stepBasicBlock stdValAlg cert.blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs))
+    {m0 : MachineState}
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨some, cert.entryBb, st0, 0⟩ m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_blockCfg_sound tagOf body cert.blocks post bindingsAt mirBb extra rootAddrs hSim
+    (wpConverges_of_cfgCertificate_of_invClosedNoFork stdValAlg cert params st0
+      post hInit hSpec BlockInv hClosed hInv0)
+    hR0
+
 /-- **Compositional `CfgCertificate` adequacy over live `V2026_06_01` MIR
 (`mir_cfgCertificate_sound`)**: connects `MirLiftCoreInterop.wpConverges_of_cfgCertificate`
 and `wpConverges_of_forwardSim` to `mirCfgStateRel` and `LiftedMirPost`. -/
@@ -2005,13 +2243,14 @@ theorem mir_cfgCertificate_sound (tagOf : LoanId → Nat) (body : CapturedMir)
       (mirCfgStateRel tagOf bindingsAt mirBb extra)
       (MirOutcomeRel tagOf rootAddrs))
     {m0 : MachineState}
-    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨fun o => o, cert.entryBb, st0⟩ m0) :
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨some, cert.entryBb, st0, 0⟩ m0) :
     Anneal.MirFuelFree.MirWpConverges body m0
       (fun o => LiftedMirPost tagOf post o rootAddrs) :=
-  mir_blockCfg_sound tagOf body cert.blocks post bindingsAt mirBb extra rootAddrs hSim
-    (wpConverges_of_cfgCertificate stdValAlg cert params st0 post hInit hSpec
-      BlockInv PostRet hLocal hNoFork hInv0)
-    hR0
+  mir_cfgCertificate_sound_of_invClosedNoFork tagOf body cert params st0 post
+    bindingsAt mirBb extra rootAddrs hInit hSpec BlockInv
+    (invClosedNoFork_of_localBlockVC (stepBasicBlock stdValAlg cert.blocks)
+      BlockInv PostRet hLocal hNoFork)
+    hInv0 hSim hR0
 
 /-- If `body` produces only `.continuing` flows, then `runWhileFlowSteps`
 produces only `.continuing` flows for any fuel bound `k`. -/
@@ -2140,6 +2379,251 @@ def CfgCertificate.whileLoop {Val : Type} (alg : ValAlgebra Val)
             subst hOut
             exact cfg_certificate_while_sound alg cond body retExpr loopFuel
               st0 sFinal retVal hRun hClean hRet hFree
+
+/-- **Strong-descent cutpoint soundness for `FlowPlan.whileLoop` function
+evaluation (`rank s' < rank s`)**: if `Inv` is a cutpoint invariant of `while
+cond { body }` whose taken iterations strictly decrease `rank` (`rank s' <
+rank s`, allowing multi-step drops `Δrank ≥ 2`) and whose exit state is clean,
+handle-free, and satisfies `post`, then `evalFnValue alg params (.whileLoop
+loopFuel cond body) retExpr` satisfies `HoldsFnSpec ... post` for every
+`loopFuel ≥ rank st0`. -/
+theorem holdsFnSpec_whileLoop_of_cutpoint {Val : Type} (alg : ValAlgebra Val)
+    (loopFuel : Nat) (cond : RvalOp Val) (body : FlowPlan Val)
+    (retExpr : RvalOp Val) (hWfB : WfPlan alg body)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (post : FuncOut Val → Prop)
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval alg retExpr s = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel) :
+    HoldsFnSpec (evalFnValue alg params (.whileLoop loopFuel cond body) retExpr)
+      post := by
+  obtain ⟨sFinal, hRun, hInvF, hCondF⟩ :=
+    runWhileFlowSteps_cutpoint_sound alg cond (evalPlan alg body) Inv rank hStep
+      loopFuel st0 hInv0 hRankLe
+  obtain ⟨hClean, rv, hRet, hFree, hPost⟩ := hExit sFinal hInvF hCondF
+  unfold evalFnValue
+  rw [hInit]
+  dsimp only
+  rw [evalPlan_whileLoop alg loopFuel cond body st0 hWfB, hRun]
+  dsimp only
+  rw [hClean]
+  dsimp
+  rw [hRet]
+  dsimp
+  rw [hFree]
+  exact hPost
+
+/-- Canonical 3-block invariant of `whileLoopBlocks cond body retExpr`
+induced by a header cutpoint invariant `Inv : SymState Val → Prop`. -/
+def whileCutpointBlockInv {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (Inv : SymState Val → Prop)
+    (bb : Nat) (st : SymState Val) : Prop :=
+  match bb with
+  | 0 => Inv st
+  | 1 =>
+    Inv st ∧
+    Exists fun cv => evalRval alg cond st = some cv ∧ alg.asBool cv = some true
+  | 2 =>
+    Inv st ∧
+    Exists fun cv => evalRval alg cond st = some cv ∧ alg.asBool cv = some false
+  | _ => False
+
+/-- **Any strong-descent cutpoint (`rank s' < rank s`) automatically satisfies
+`LocalBlockVC` on `whileLoopBlocks cond body retExpr`** under
+`whileCutpointBlockInv alg cond Inv`. -/
+theorem whileCutpoint_localBlockVC {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (post : FuncOut Val → Prop)
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval alg retExpr s = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩) :
+    LocalBlockVC (stepBasicBlock alg (whileLoopBlocks cond body retExpr))
+      (whileCutpointBlockInv alg cond Inv) post := by
+  intro bb st hInv
+  match bb with
+  | 0 =>
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    rw [hcv]
+    dsimp only
+    rcases hCase with hbF | ⟨hbT, _⟩
+    · rw [hbF]
+      exact ⟨hInv, cv, hcv, hbF⟩
+    · rw [hbT]
+      exact ⟨hInv, cv, hcv, hbT⟩
+  | 1 =>
+    obtain ⟨hInv0, cv0, hcv0, hb0⟩ := hInv
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv0
+    rw [hcv0] at hcv
+    injection hcv with hEq
+    subst hEq
+    rcases hCase with hbF | ⟨_, s', hBody, hInv', _⟩
+    · rw [hb0] at hbF
+      exact nomatch hbF
+    · dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, List.foldr]
+      rw [hBody]
+      exact hInv'
+  | 2 =>
+    obtain ⟨hInv0, hCondF⟩ := hInv
+    obtain ⟨hClean, rv, hRet, hFree, hPost⟩ := hExit st hInv0 hCondF
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    rw [hClean]
+    dsimp
+    rw [hRet]
+    dsimp
+    rw [hFree]
+    exact hPost
+  | _ + 3 => exact nomatch hInv
+
+/-- **Any strong-descent cutpoint (`rank s' < rank s`) is fork-free on
+`whileLoopBlocks cond body retExpr`** under `whileCutpointBlockInv alg cond Inv`. -/
+theorem whileCutpoint_noFork {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s))) :
+    ∀ bb st, whileCutpointBlockInv alg cond Inv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock alg (whileLoopBlocks cond body retExpr) bb st ≠
+          .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st hInv mergeRet thenBb elseBb st' hFork
+  match bb with
+  | 0 =>
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr] at hFork
+    rw [hcv] at hFork
+    dsimp only at hFork
+    rcases hCase with hbF | ⟨hbT, _⟩
+    · rw [hbF] at hFork
+      exact nomatch hFork
+    · rw [hbT] at hFork
+      exact nomatch hFork
+  | 1 =>
+    obtain ⟨hInv0, cv0, hcv0, hb0⟩ := hInv
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv0
+    rw [hcv0] at hcv
+    injection hcv with hEq
+    subst hEq
+    rcases hCase with hbF | ⟨_, s', hBody, _⟩
+    · rw [hb0] at hbF
+      exact nomatch hbF
+    · dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, List.foldr] at hFork
+      rw [hBody] at hFork
+      exact nomatch hFork
+  | 2 =>
+    revert hFork
+    dsimp [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    cases stateCleanAtReturn st with
+    | false =>
+      intro hFork
+      exact nomatch hFork
+    | true =>
+      cases evalRval alg retExpr st with
+      | none =>
+        intro hFork
+        exact nomatch hFork
+      | some rv =>
+        dsimp
+        cases handleFreeOut alg ⟨rv, collectRootMutVals st.loans⟩ with
+        | false =>
+          intro hFork
+          exact nomatch hFork
+        | true =>
+          intro hFork
+          exact nomatch hFork
+  | _ + 3 => exact nomatch hInv
+
+/-- **End-to-end live `V2026_06_01` MIR adequacy for a `CfgCertificate.whileLoop`
+verified by a strong-descent cutpoint (`rank s' < rank s`)**: packages
+`holdsFnSpec_whileLoop_of_cutpoint`, `whileCutpoint_localBlockVC`,
+`whileCutpoint_noFork`, and `mir_cfgCertificate_sound` so the caller supplies
+only the header cutpoint `(Inv, rank, hStep, hExit)` and the per-block live MIR
+simulation `hSim`. -/
+theorem mir_whileLoop_cfgCertificate_of_cutpoint (tagOf : LoanId → Nat)
+    (body : CapturedMir) (loopFuel : Nat) (cond : RvalOp StdVal)
+    (loopBody : FlowPlan StdVal) (retExpr : RvalOp StdVal)
+    (hWfB : WfPlan stdValAlg loopBody)
+    (hBodyCont : ∀ s f,
+      evalPlan stdValAlg loopBody s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (Inv : SymState StdVal → Prop) (rank : SymState StdVal → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        (stdValAlg.asBool cv = some false ∨
+         (stdValAlg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan stdValAlg loopBody s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        stdValAlg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval stdValAlg retExpr s = some rv ∧
+          handleFreeOut stdValAlg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel)
+    (hSim : ForwardSim
+      (blockCfgStep
+        (stepBasicBlock stdValAlg
+          (CfgCertificate.whileLoop stdValAlg loopFuel cond loopBody retExpr
+            hWfB hBodyCont).blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs))
+    {m0 : MachineState}
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨some, 0, st0, 0⟩ m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_cfgCertificate_sound tagOf body
+    (CfgCertificate.whileLoop stdValAlg loopFuel cond loopBody retExpr hWfB
+      hBodyCont)
+    params st0 post bindingsAt mirBb extra rootAddrs hInit
+    (holdsFnSpec_whileLoop_of_cutpoint stdValAlg loopFuel cond loopBody retExpr
+      hWfB Inv rank hStep post hExit params st0 hInit hInv0 hRankLe)
+    (whileCutpointBlockInv stdValAlg cond Inv) post
+    (whileCutpoint_localBlockVC stdValAlg cond loopBody retExpr Inv rank hStep
+      post hExit)
+    (whileCutpoint_noFork stdValAlg cond loopBody retExpr Inv rank hStep)
+    hInv0 hSim hR0
 
 /-- A successful `reabsorbFromSpatialInState` found its pinned block free of
 `.uninit` cells: `SpatialPin` never decodes a partially initialized block. -/
