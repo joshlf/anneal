@@ -801,8 +801,20 @@ pub fn render_obligations_module_with_options(
              And (req.defPath = \"{def_id}\") (defaultPre req.args)\n  \
            post req ans :=\n    \
              ∃ retVal,\n      \
-               And (ans = .returned retVal req.memory) (defaultPost req.args retVal)\n\n"
+               And (ans = .returned retVal req.memory)\n          \
+                   (And (defaultPost req.args retVal)\n                \
+                        (Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.{item}.body retVal))\n\n"
     ));
+
+    let default_spec_pre = if has_contract_companions {
+        format!(
+            "fun args =>\n    \
+               And (defaultPre args)\n        \
+                   (Trusted.VerificationResult.argsMatchCalleeParamTys Mir.{item}.body args)"
+        )
+    } else {
+        "defaultPre".to_string()
+    };
 
     out.push_str(&format!(
         "/-- Low-priority default `ItemSpec` instance for `{def_id}`.\n    \
@@ -812,7 +824,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "instance (priority := low) defaultSpec : ItemSpec \"{def_id}\" where\n  \
-           pre := defaultPre\n  \
+           pre := {default_spec_pre}\n  \
            post := defaultPost\n\n"
     ));
 
@@ -1132,20 +1144,36 @@ pub fn render_obligations_module_with_options(
     ));
 
     let sha = &bundle.subject.target.mir_module_sha256;
+    // Without an authored `Specs.<item>` module, `claimFor` is phrased over the
+    // instantiated `defaultPreFor` / `defaultPostFor` companions (like `sigPre` /
+    // `sigPost`), so its `ItemSpec` instance binder is only threaded through to
+    // keep the `polyClaim` signature uniform. Name it `_spec` in that case so the
+    // generated module stays free of `linter.unusedVariables` warnings.
+    let claim_for_spec_binder = if authored.has_specs { "spec" } else { "_spec" };
+    let claim_for_pre_head = if authored.has_specs {
+        "spec.pre args"
+    } else {
+        "defaultPreFor typeArgs args"
+    };
+    let claim_for_post_head = if authored.has_specs {
+        "spec.post args ret"
+    } else {
+        "defaultPostFor typeArgs args ret"
+    };
     out.push_str(&format!(
         "/-- Verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
          def claimFor\n    \
-             [spec : ItemSpec \"{def_id}\"]\n    \
+             [{claim_for_spec_binder} : ItemSpec \"{def_id}\"]\n    \
              (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              pre := fun args =>\n      \
-               And (spec.pre args)\n          \
+               And ({claim_for_pre_head})\n          \
                    (Trusted.VerificationResult.argsMatchSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs)\n            \
                      args\n            \
                      (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory)\n    \
              post := fun args ret =>\n      \
-               And (spec.post args ret)\n          \
+               And ({claim_for_post_head})\n          \
                    (Trusted.VerificationResult.retMatchesSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs)\n            \
                      ret\n            \
@@ -1607,6 +1635,17 @@ pub fn render_verify_module_with_options(
         ));
         out.push_str(&render_monomorphic_signature_guard(item));
     } else if !authored.has_specs && (bundle.has_rust_safe_total_attr() || authored.is_total) {
+        let req_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_requires.iter().any(|req| {
+                bundle
+                    .spec_companions_with_calls
+                    .contains(&derive_item_module_suffix(req))
+            });
+        let ens_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_ensures.len() == 1
+            && bundle
+                .spec_companions_with_calls
+                .contains(&derive_item_module_suffix(&bundle.inline_ensures[0]));
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             format!("(Option.some Mir.{req_suf}.body)")
@@ -1620,20 +1659,34 @@ pub fn render_verify_module_with_options(
             "Option.none".to_string()
         };
         let mut branches = String::new();
-        if bundle.inline_requires.len() <= 1 && bundle.inline_ensures.len() <= 1 {
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractAuto\n          \
-                         Obligations.{item}.totalClaim 64 64 {opt_req} {opt_ens}\n"
-            ));
+        if !req_uses_spec_callees && bundle.inline_requires.len() <= 1 && bundle.inline_ensures.len() <= 1 {
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractWithSpecCalleesAuto\n          \
+                             Obligations.{item}.totalClaim 64 128 Obligations.{item}.defaultSpecCallees {opt_req} {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractAuto\n          \
+                             Obligations.{item}.totalClaim 64 64 {opt_req} {opt_ens}\n"
+                ));
+            }
         }
-        if bundle.inline_requires.len() == 1 && bundle.inline_ensures.len() <= 1 {
+        if !req_uses_spec_callees && bundle.inline_requires.len() == 1 && bundle.inline_ensures.len() <= 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalSymRange1Auto\n          \
-                         Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
-                       | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
-                         Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n"
-            ));
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1WithSpecCalleesAuto\n          \
+                             Obligations.{item}.totalClaim 64 128 Obligations.{item}.defaultSpecCallees Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalSymRange1Auto\n          \
+                             Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
+                           | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
+                             Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            }
         }
         branches.push_str(&format!(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyTotalMirSym\n          \
@@ -1680,6 +1733,17 @@ pub fn render_verify_module_with_options(
              abbrev Certificate : Prop := VerificationResult Obligations.{item}.claim\n\n"
         ));
     } else {
+        let req_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_requires.iter().any(|req| {
+                bundle
+                    .spec_companions_with_calls
+                    .contains(&derive_item_module_suffix(req))
+            });
+        let ens_uses_spec_callees = !bundle.spec_callees.is_empty()
+            && bundle.inline_ensures.len() == 1
+            && bundle
+                .spec_companions_with_calls
+                .contains(&derive_item_module_suffix(&bundle.inline_ensures[0]));
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             format!("(Option.some Mir.{req_suf}.body)")
@@ -1694,25 +1758,41 @@ pub fn render_verify_module_with_options(
         };
         let mut branches = String::new();
         if !authored.has_specs
+            && !req_uses_spec_callees
             && bundle.inline_requires.len() <= 1
             && bundle.inline_ensures.len() <= 1
         {
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto\n          \
-                         Obligations.{item}.claim 64 64 {opt_req} {opt_ens}\n"
-            ));
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractWithSpecCalleesAuto\n          \
+                             Obligations.{item}.claim 64 128 Obligations.{item}.defaultSpecCallees {opt_req} {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto\n          \
+                             Obligations.{item}.claim 64 64 {opt_req} {opt_ens}\n"
+                ));
+            }
         }
         if !authored.has_specs
+            && !req_uses_spec_callees
             && bundle.inline_requires.len() == 1
             && bundle.inline_ensures.len() <= 1
         {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
-            branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustSymRange1Auto\n          \
-                         Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
-                       | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
-                         Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n"
-            ));
+            if ens_uses_spec_callees {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1WithSpecCalleesAuto\n          \
+                             Obligations.{item}.claim 64 128 Obligations.{item}.defaultSpecCallees Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            } else {
+                branches.push_str(&format!(
+                    "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustSymRange1Auto\n          \
+                             Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
+                           | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
+                             Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n"
+                ));
+            }
         }
         branches.push_str(&format!(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n          \
@@ -2199,6 +2279,10 @@ mod tests {
         assert!(empty_obligations.contains(
             "def defaultPost (args : List Value) (ret : Value) : Prop :=\n  True"
         ));
+        assert!(!empty_obligations.contains("argsMatchCalleeParamTys"));
+        assert!(empty_obligations.contains(
+            "Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.MyCrate.math.id.body retVal"
+        ));
 
         let multi_bundle = SubjectObligationBundle {
             subject,
@@ -2614,6 +2698,32 @@ mod tests {
 
         let obligations = render_obligations_module(bundle);
         assert!(obligations.contains(
+            "Trusted.VerificationResult.argsMatchCalleeParamTys Mir.MyCrate.math.inc.body args"
+        ));
+        assert!(obligations.contains(
+            "Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.MyCrate.math.inc.body retVal"
+        ));
+        assert!(obligations.contains("And (defaultPreFor typeArgs args)"));
+        assert!(obligations.contains("And (defaultPostFor typeArgs args ret)"));
+        let authored_obligations = render_obligations_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_specs: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(authored_obligations.contains("And (spec.pre args)"));
+        assert!(authored_obligations.contains("And (spec.post args ret)"));
+        // The authored rendering consumes its `ItemSpec` instance; the default
+        // rendering only threads it through (`_spec`), so neither emits an
+        // `unusedVariables` lint warning.
+        assert!(authored_obligations.contains(
+            "def claimFor\n    \
+                 [spec : ItemSpec \"my_crate::math::inc\"]\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst) : Claim :="
+        ));
+        assert!(!obligations.contains("[spec : ItemSpec \"my_crate::math::inc\"]\n    (typeArgs"));
+        assert!(obligations.contains(
             "def sigPre\n    \
                  (typeArgs : Trusted.MirAst.TypeSubst)\n    \
                  (args : List Value)\n    \
@@ -2634,7 +2744,7 @@ mod tests {
         ));
         assert!(obligations.contains(
             "def claimFor\n    \
-                 [spec : ItemSpec \"my_crate::math::inc\"]\n    \
+                 [_spec : ItemSpec \"my_crate::math::inc\"]\n    \
                  (typeArgs : Trusted.MirAst.TypeSubst) : Claim :="
         ));
         assert!(obligations.contains(
@@ -2989,6 +3099,32 @@ mod tests {
              defaultSpecCallees (List.append args (List.cons ret List.nil))"
         ));
 
+        let verify_with_spec_callees =
+            render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(verify_with_spec_callees.contains(
+            "dischargeRustPinnedContractWithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.claim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+        assert!(verify_with_spec_callees.contains(
+            "dischargeRustBoundedRange1WithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.claim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+        let total_verify_with_spec_callees = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                is_total: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(total_verify_with_spec_callees.contains(
+            "dischargeRustTotalPinnedContractWithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.totalClaim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+        assert!(total_verify_with_spec_callees.contains(
+            "dischargeRustTotalBoundedRange1WithSpecCalleesAuto\n          \
+             Obligations.MyCrate.math.inc.totalClaim 64 128 Obligations.MyCrate.math.inc.defaultSpecCallees"
+        ));
+
         // Without linked spec callees, every companion keeps the plain form.
         bundle.spec_callees.clear();
         let plain = render_obligations_module(bundle);
@@ -2997,6 +3133,10 @@ mod tests {
             "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
              (List.append args (List.cons ret List.nil))"
         ));
+        let plain_verify =
+            render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(plain_verify.contains("dischargeRustPinnedContractAuto"));
+        assert!(!plain_verify.contains("WithSpecCalleesAuto"));
     }
 
     #[test]

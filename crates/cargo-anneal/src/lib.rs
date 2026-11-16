@@ -2589,6 +2589,359 @@ pub fn run_lake_verify_targets(dot_anneal_dir: &Path, targets: &[String]) -> Res
     Ok(())
 }
 
+/// Parses `(MemTotal, MemAvailable)` in KiB from `/proc/meminfo` contents.
+///
+/// When `MemAvailable:` is absent (as on older kernels), falls back to
+/// `MemFree: + Cached:`.
+pub fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str| {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    let total = field("MemTotal:");
+    let avail = field("MemAvailable:").or_else(|| {
+        field("MemFree:").map(|free| free.saturating_add(field("Cached:").unwrap_or(0)))
+    });
+    (total, avail)
+}
+
+fn read_u64_file(path: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "max" {
+        return None;
+    }
+    trimmed.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn min_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+/// Parses non-reclaimable working-set usage (`anon + shmem`, in bytes) from
+/// cgroup v2 `memory.stat` contents. Returns `None` if neither `anon` nor
+/// `shmem` is present.
+pub fn parse_cgroup_memory_stat_used_bytes(stat_text: &str) -> Option<u64> {
+    let mut anon: Option<u64> = None;
+    let mut shmem: Option<u64> = None;
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(val_str) = parts.next() else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        match key {
+            "anon" => anon = val_str.parse::<u64>().ok(),
+            "shmem" => shmem = val_str.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    if anon.is_none() && shmem.is_none() {
+        None
+    } else {
+        Some(anon.unwrap_or(0).saturating_add(shmem.unwrap_or(0)))
+    }
+}
+
+/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 memory bound
+/// between this process's cgroup (`0::<rel>` in `proc_self_cgroup`) and
+/// `cgroup_root`, where headroom subtracts non-reclaimable `anon + shmem` from
+/// `memory.stat` (falling back to `memory.current` when `memory.stat` is absent).
+///
+/// Each level's bound is the smaller of `memory.max` (the OOM-kill limit) and
+/// `memory.high` (the throttling threshold above which the kernel stalls the
+/// cgroup in direct reclaim), with `"max"` meaning unbounded for either file,
+/// so a slice whose `memory.high` sits below its `memory.max` (as systemd
+/// `user.slice` commonly configures) caps concurrency before workers thrash.
+pub fn cgroup_memory_limits_kib(
+    cgroup_root: &Path,
+    proc_self_cgroup: &str,
+) -> (Option<u64>, Option<u64>) {
+    if !cgroup_root.is_dir() {
+        return (None, None);
+    }
+    let Some(raw_rel) = proc_self_cgroup
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("0::"))
+    else {
+        return (None, None);
+    };
+    let rel = raw_rel
+        .trim()
+        .strip_suffix(" (deleted)")
+        .unwrap_or(raw_rel.trim())
+        .trim()
+        .trim_start_matches('/');
+    if Path::new(rel).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return (None, None);
+    }
+
+    let mut dir = if rel.is_empty() {
+        cgroup_root.to_path_buf()
+    } else {
+        cgroup_root.join(rel)
+    };
+
+    let read_level_used = |d: &Path| -> Option<u64> {
+        fs::read_to_string(d.join("memory.stat"))
+            .ok()
+            .and_then(|s| parse_cgroup_memory_stat_used_bytes(&s))
+            .or_else(|| read_u64_file(&d.join("memory.current")))
+    };
+
+    let mut descendant_used_bytes: Option<u64> = None;
+    let mut limit_kib: Option<u64> = None;
+    let mut headroom_kib: Option<u64> = None;
+    while dir.starts_with(cgroup_root) {
+        if dir.is_dir() {
+            let lvl_used = read_level_used(&dir);
+            if let Some(u) = lvl_used {
+                descendant_used_bytes =
+                    Some(descendant_used_bytes.map_or(u, |prev| prev.max(u)));
+            }
+            let level_bound = min_opt_u64(
+                read_u64_file(&dir.join("memory.max")),
+                read_u64_file(&dir.join("memory.high")),
+            );
+            if let Some(bound) = level_bound {
+                let used = lvl_used.or(descendant_used_bytes).unwrap_or(0);
+                limit_kib = min_opt_u64(limit_kib, Some(bound / 1024));
+                headroom_kib =
+                    min_opt_u64(headroom_kib, Some(bound.saturating_sub(used) / 1024));
+            }
+        }
+        if dir == cgroup_root || !dir.pop() {
+            break;
+        }
+    }
+    (limit_kib, headroom_kib)
+}
+
+/// cgroup v1 reports an unlimited `memory.limit_in_bytes` as `PAGE_COUNTER_MAX`
+/// pages (`0x7FFF_FFFF_FFFF_F000` on 4 KiB-page kernels); treat anything at or
+/// above 2^62 bytes as unbounded.
+const CGROUP_V1_UNLIMITED_BYTES: u64 = 1 << 62;
+
+/// Parses non-reclaimable usage (in bytes) from cgroup v1 `memory.stat`:
+/// hierarchical `total_rss + total_shmem` when present, else the cgroup-local
+/// `rss + shmem`. Returns `None` if none of those keys are present.
+pub fn parse_cgroup_v1_memory_stat_used_bytes(stat_text: &str) -> Option<u64> {
+    let mut fields: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(key), Some(val), None) = (parts.next(), parts.next(), parts.next())
+            && let Ok(v) = val.parse::<u64>()
+        {
+            fields.insert(key, v);
+        }
+    }
+    let sum = |rss: &str, shmem: &str| -> Option<u64> {
+        match (fields.get(rss), fields.get(shmem)) {
+            (None, None) => None,
+            (r, s) => Some(r.copied().unwrap_or(0).saturating_add(s.copied().unwrap_or(0))),
+        }
+    };
+    sum("total_rss", "total_shmem").or_else(|| sum("rss", "shmem"))
+}
+
+/// Parses `hierarchical_memory_limit` (in bytes, when `< CGROUP_V1_UNLIMITED_BYTES`)
+/// from cgroup v1 `memory.stat`. In bind-mounted Kubernetes / Docker v1
+/// containers whose memory cap is set on an enclosing pod cgroup rather than
+/// the container leaf, `memory.limit_in_bytes` at the container mount root
+/// reads `unlimited`, while `hierarchical_memory_limit` in `memory.stat`
+/// exposes the effective ancestor limit.
+pub fn parse_cgroup_v1_memory_stat_limit_bytes(stat_text: &str) -> Option<u64> {
+    for line in stat_text.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some("hierarchical_memory_limit"), Some(val), None) =
+            (parts.next(), parts.next(), parts.next())
+            && let Ok(v) = val.parse::<u64>()
+            && v < CGROUP_V1_UNLIMITED_BYTES
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// cgroup v1 counterpart of [`cgroup_memory_limits_kib`], used when the
+/// unified hierarchy exposes no memory bound (legacy or hybrid hosts and
+/// containers): walks this process's `memory` controller path (the
+/// `<id>:<controllers>:<path>` line of `proc_self_cgroup` whose controller list
+/// contains `memory`) from the leaf up to `memory_root` (normally
+/// `/sys/fs/cgroup/memory`), reading `memory.limit_in_bytes` and subtracting
+/// `memory.stat` `total_rss + total_shmem` (falling back to
+/// `memory.usage_in_bytes`). As in a cgroup-namespaced v2 container, a path
+/// that does not exist under the mount (because the container sees its own
+/// cgroup as the root) walks up to `memory_root`, whose limit is then the
+/// container's.
+pub fn cgroup_v1_memory_limits_kib(
+    memory_root: &Path,
+    proc_self_cgroup: &str,
+) -> (Option<u64>, Option<u64>) {
+    if !memory_root.is_dir() {
+        return (None, None);
+    }
+    let Some(raw_rel) = proc_self_cgroup.lines().map(str::trim).find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let (_id, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
+        controllers
+            .split(',')
+            .any(|c| c == "memory")
+            .then_some(path)
+    }) else {
+        return (None, None);
+    };
+    let rel = raw_rel
+        .trim()
+        .strip_suffix(" (deleted)")
+        .unwrap_or(raw_rel.trim())
+        .trim()
+        .trim_start_matches('/');
+    if Path::new(rel).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return (None, None);
+    }
+    let mut dir = if rel.is_empty() {
+        memory_root.to_path_buf()
+    } else {
+        memory_root.join(rel)
+    };
+    let mut descendant_used_bytes: Option<u64> = None;
+    let mut limit_kib: Option<u64> = None;
+    let mut headroom_kib: Option<u64> = None;
+    while dir.starts_with(memory_root) {
+        if dir.is_dir() {
+            let stat_text = fs::read_to_string(dir.join("memory.stat")).ok();
+            let lvl_used = stat_text
+                .as_deref()
+                .and_then(parse_cgroup_v1_memory_stat_used_bytes)
+                .or_else(|| read_u64_file(&dir.join("memory.usage_in_bytes")));
+            if let Some(u) = lvl_used {
+                descendant_used_bytes = Some(descendant_used_bytes.map_or(u, |prev| prev.max(u)));
+            }
+            let direct_bound = read_u64_file(&dir.join("memory.limit_in_bytes"))
+                .filter(|&b| b < CGROUP_V1_UNLIMITED_BYTES);
+            let hier_bound = stat_text
+                .as_deref()
+                .and_then(parse_cgroup_v1_memory_stat_limit_bytes);
+            if let Some(bound) = min_opt_u64(direct_bound, hier_bound) {
+                let used = lvl_used.or(descendant_used_bytes).unwrap_or(0);
+                limit_kib = min_opt_u64(limit_kib, Some(bound / 1024));
+                headroom_kib =
+                    min_opt_u64(headroom_kib, Some(bound.saturating_sub(used) / 1024));
+            }
+        }
+        if dir == memory_root || !dir.pop() {
+            break;
+        }
+    }
+    (limit_kib, headroom_kib)
+}
+
+/// Computes the default Lake worker concurrency (`LEAN_NUM_THREADS`) from
+/// effective total / available memory (in KiB) and logical CPU count:
+/// `(effective_avail_mib / 1536).clamp(1, 6)` bounded by
+/// `(effective_total_mib / 2048).max(1)` and `cpu_cores`, defaulting to `2`
+/// when memory info is unavailable.
+pub fn resolve_default_lake_jobs(
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> usize {
+    let cpu_cap = cpu_cores.clamp(1, 6);
+    if total_kib.is_none() && avail_kib.is_none() {
+        return 2.min(cpu_cap);
+    }
+    let by_avail = avail_kib
+        .map(|k| ((k / 1024) / 1536).clamp(1, 6) as usize)
+        .unwrap_or(2);
+    let by_total = total_kib
+        .map(|k| ((k / 1024) / 2048).clamp(1, 6) as usize)
+        .unwrap_or(6);
+    by_avail.min(by_total).min(cpu_cap)
+}
+
+/// Resolves the `LEAN_NUM_THREADS` value that `build_lake_build_command` should
+/// set given `CARGO_ANNEAL_LAKE_JOBS`, whether `LEAN_NUM_THREADS` is already
+/// present in the caller's environment, and effective memory/CPU budgets.
+///
+/// - When `CARGO_ANNEAL_LAKE_JOBS` parses to an integer `>= 1`, returns
+///   `Some(parsed.min(16))`.
+/// - Otherwise, if `lean_num_threads_is_set` is `true`, returns `None` so the
+///   caller's explicit `LEAN_NUM_THREADS` is preserved.
+/// - Otherwise, returns `Some(resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores))`.
+pub fn resolve_lake_build_threads_env(
+    cargo_anneal_lake_jobs: Option<&str>,
+    lean_num_threads_is_set: bool,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> Option<usize> {
+    if let Some(raw) = cargo_anneal_lake_jobs
+        && let Ok(parsed) = raw.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return Some(parsed.min(16));
+    }
+    if lean_num_threads_is_set {
+        return None;
+    }
+    Some(resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores))
+}
+
+/// Probes host `/proc/meminfo` intersected with `/proc/self/cgroup` (the
+/// tighter of each level's `memory.max` / `memory.high`, minus `memory.stat`
+/// `anon + shmem`; or, when the unified hierarchy exposes no bound, the cgroup
+/// v1 `memory.limit_in_bytes` minus `total_rss + total_shmem`) in KiB.
+pub fn probe_effective_memory_kib() -> (Option<u64>, Option<u64>) {
+    let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
+        .map(|s| parse_meminfo_kib(&s))
+        .unwrap_or((None, None));
+    if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
+        let (v2_limit, v2_headroom) =
+            cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
+        // Intersect with cgroup v1 (`/sys/fs/cgroup/memory`, a single non-dir stat on
+        // pure v2 hosts) so both pure-v1 containers and hybrid v1+v2 hosts whose tightest
+        // memory cap lives on the v1 `memory` controller hierarchy are honored.
+        let (v1_limit, v1_headroom) =
+            cgroup_v1_memory_limits_kib(Path::new("/sys/fs/cgroup/memory"), &self_cgroup);
+        let cg_limit = min_opt_u64(v2_limit, v1_limit);
+        let cg_headroom = min_opt_u64(v2_headroom, v1_headroom);
+        total_kib = min_opt_u64(total_kib, cg_limit);
+        avail_kib = min_opt_u64(avail_kib, cg_headroom);
+    }
+    (total_kib, avail_kib)
+}
+
 /// Lake environment variables that `cargo anneal` sets for `lake build` unless
 /// the caller has already set them.
 ///
@@ -2606,17 +2959,65 @@ pub const LAKE_CACHE_ENV_DEFAULTS: &[(&str, &str)] = &[
     ("LAKE_RESTORE_ARTIFACTS", "true"),
 ];
 
-/// Build the `lake build` command for `dot_anneal_dir`, applying
-/// `LAKE_CACHE_ENV_DEFAULTS` for variables the environment leaves unset.
-pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Command {
+fn build_lake_build_command_with_inputs(
+    lake_bin: &Path,
+    dot_anneal_dir: &Path,
+    is_cache_env_set: impl Fn(&str) -> bool,
+    cargo_lake_jobs: Option<&str>,
+    lean_threads_set: bool,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> Command {
     let mut cmd = Command::new(lake_bin);
     cmd.arg("build").current_dir(dot_anneal_dir);
     for (key, value) in LAKE_CACHE_ENV_DEFAULTS {
-        if env::var_os(key).is_none() {
+        if !is_cache_env_set(key) {
             cmd.env(key, value);
         }
     }
+    if let Some(jobs) = resolve_lake_build_threads_env(
+        cargo_lake_jobs,
+        lean_threads_set,
+        total_kib,
+        avail_kib,
+        cpu_cores,
+    ) {
+        cmd.env("LEAN_NUM_THREADS", jobs.to_string());
+    }
     cmd
+}
+
+/// Build the `lake build` command for `dot_anneal_dir`, applying
+/// `LAKE_CACHE_ENV_DEFAULTS` for variables the environment leaves unset and
+/// bounding Lake worker concurrency via `LEAN_NUM_THREADS` (note: Lean v4.34.1
+/// `lake build` has no `-j` CLI flag).
+pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Command {
+    let cargo_lake_jobs = env::var("CARGO_ANNEAL_LAKE_JOBS").ok();
+    let lean_threads_set = env::var_os("LEAN_NUM_THREADS").is_some();
+    let has_explicit_threads = lean_threads_set
+        || cargo_lake_jobs
+            .as_deref()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .is_some_and(|n| n >= 1);
+    let (total_kib, avail_kib) = if has_explicit_threads {
+        (None, None)
+    } else {
+        probe_effective_memory_kib()
+    };
+    let cpu_cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    build_lake_build_command_with_inputs(
+        lake_bin,
+        dot_anneal_dir,
+        |key| env::var_os(key).is_some(),
+        cargo_lake_jobs.as_deref(),
+        lean_threads_set,
+        total_kib,
+        avail_kib,
+        cpu_cores,
+    )
 }
 
 pub(crate) fn run_trusted_boundary_verify_audit(
@@ -3193,7 +3594,518 @@ mod tests {
                 );
             }
         }
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["build".to_string()]);
+        assert!(
+            !args.iter().any(|a| a.starts_with("-j")),
+            "Lean v4.34.1 `lake build` has no `-j` CLI flag: {args:?}"
+        );
+        if env::var("CARGO_ANNEAL_LAKE_JOBS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .is_some_and(|n| n >= 1)
+        {
+            assert!(
+                envs.iter().any(|(k, v)| k == "LEAN_NUM_THREADS" && v.is_some()),
+                "CARGO_ANNEAL_LAKE_JOBS must set LEAN_NUM_THREADS on the command"
+            );
+        } else if env::var_os("LEAN_NUM_THREADS").is_some() {
+            assert!(
+                !envs.iter().any(|(k, _)| k == "LEAN_NUM_THREADS"),
+                "explicit caller LEAN_NUM_THREADS must be preserved when CARGO_ANNEAL_LAKE_JOBS is unset"
+            );
+        } else {
+            assert!(
+                envs.iter().any(|(k, v)| {
+                    k == "LEAN_NUM_THREADS"
+                        && v.as_deref()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .is_some_and(|n| (1..=6).contains(&n))
+                }),
+                "default LEAN_NUM_THREADS in 1..=6 must be set when unset in env: {envs:?}"
+            );
+        }
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/ws/.anneal")));
+    }
+
+    #[test]
+    fn default_lake_jobs_and_cgroup_memory_clamping_handle_stat_max_and_overrides() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const MIB_KIB: u64 = 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        // 1. `parse_meminfo_kib` reads MemTotal + MemAvailable and falls back to MemFree + Cached.
+        assert_eq!(
+            parse_meminfo_kib(
+                "MemTotal:       19996672 kB\nMemFree:         2000000 kB\nMemAvailable:   15631360 kB\n"
+            ),
+            (Some(19_996_672), Some(15_631_360))
+        );
+        assert_eq!(
+            parse_meminfo_kib("MemTotal: 8388608 kB\nMemFree: 1048576 kB\nCached: 2097152 kB\n"),
+            (Some(8_388_608), Some(3_145_728))
+        );
+        assert_eq!(parse_meminfo_kib("unparseable\n"), (None, None));
+
+        // 2. `resolve_default_lake_jobs` clamps by available memory (1536 MiB/job in 1..=6),
+        //    total memory (2048 MiB/job), and CPU cores, defaulting to 2 when memory is unknown.
+        assert_eq!(resolve_default_lake_jobs(None, None, 8), 2);
+        assert_eq!(resolve_default_lake_jobs(None, None, 1), 1);
+        assert_eq!(
+            resolve_default_lake_jobs(Some(16 * GIB_KIB), Some(1024 * MIB_KIB), 8),
+            1,
+            "< 1536 MiB available must clamp to 1 job"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(16 * GIB_KIB), Some(3072 * MIB_KIB), 8),
+            2,
+            "3072 MiB available -> 2 jobs"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(16 * GIB_KIB), Some(6144 * MIB_KIB), 8),
+            4,
+            "6144 MiB available -> 4 jobs"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(32 * GIB_KIB), Some(24 * GIB_KIB), 8),
+            6,
+            ">= 9 GiB available on >= 12 GiB host clamps at 6 jobs"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(4 * GIB_KIB), Some(16 * GIB_KIB), 8),
+            2,
+            "total memory cap (4096 / 2048 = 2) bounds jobs even when avail is larger"
+        );
+        assert_eq!(
+            resolve_default_lake_jobs(Some(32 * GIB_KIB), Some(24 * GIB_KIB), 3),
+            3,
+            "CPU core count bounds jobs"
+        );
+
+        // 3. `resolve_lake_build_threads_env`: CARGO_ANNEAL_LAKE_JOBS overrides (capped at 16),
+        //    invalid values fall through, and explicit caller LEAN_NUM_THREADS is preserved.
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("5"), true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            Some(5)
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("32"), false, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            Some(16),
+            "CARGO_ANNEAL_LAKE_JOBS must cap at 16"
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("0"), true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            None,
+            "CARGO_ANNEAL_LAKE_JOBS=0 is invalid and must preserve caller LEAN_NUM_THREADS"
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(Some("not-a-number"), true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            None
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(None, true, Some(16 * GIB_KIB), Some(8 * GIB_KIB), 8),
+            None,
+            "caller LEAN_NUM_THREADS must be preserved when CARGO_ANNEAL_LAKE_JOBS is unset"
+        );
+        assert_eq!(
+            resolve_lake_build_threads_env(None, false, Some(16 * GIB_KIB), Some(6144 * MIB_KIB), 8),
+            Some(4)
+        );
+
+        // 4. `cgroup_memory_limits_kib` walks from leaf up to cgroup_root, handles `"max"`,
+        //    subtracts `anon + shmem` from `memory.stat` (ignoring reclaimable `file` cache),
+        //    and falls back to `memory.current` when `memory.stat` is absent.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cg_root = env::temp_dir().join(format!(
+            "cargo-anneal-cgroup-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let slice_dir = cg_root.join("user.slice");
+        let app_dir = slice_dir.join("app.slice");
+        let scope_dir = app_dir.join("lean.scope");
+        fs::create_dir_all(&scope_dir).expect("create cgroup test hierarchy");
+
+        // Root and app.slice have `"max"` (unbounded).
+        fs::write(cg_root.join("memory.max"), "max\n").unwrap();
+        fs::write(app_dir.join("memory.max"), "max\n").unwrap();
+        // user.slice has 16 GiB max and no memory.stat, falling back to memory.current = 10 GiB -> 6 GiB headroom.
+        fs::write(slice_dir.join("memory.max"), format!("{}\n", 16 * GIB_KIB * 1024)).unwrap();
+        fs::write(
+            slice_dir.join("memory.current"),
+            format!("{}\n", 10 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        // lean.scope has 12 GiB max (tightest limit), memory.current = 11 GiB (due to 9 GiB file cache),
+        // but memory.stat has anon = 1 GiB + shmem = 1 GiB -> 2 GiB non-reclaimable -> 10 GiB headroom at leaf.
+        fs::write(scope_dir.join("memory.max"), format!("{}\n", 12 * GIB_KIB * 1024)).unwrap();
+        fs::write(
+            scope_dir.join("memory.current"),
+            format!("{}\n", 11 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            scope_dir.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\n",
+                GIB_KIB * 1024,
+                9 * GIB_KIB * 1024,
+                GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+
+        let (limit_kib, headroom_kib) = cgroup_memory_limits_kib(
+            &cg_root,
+            "1:name=systemd:/foo\n0::/user.slice/app.slice/lean.scope (deleted)\n",
+        );
+        assert_eq!(limit_kib, Some(12 * GIB_KIB));
+        assert_eq!(
+            headroom_kib,
+            Some(6 * GIB_KIB),
+            "leaf headroom is 10 GiB (via anon+shmem), parent user.slice headroom is 6 GiB (via memory.current fallback)"
+        );
+
+        // If user.slice also has `"max"`, leaf's `memory.stat` headroom (12 - 2 = 10 GiB) wins over `memory.current`.
+        fs::write(slice_dir.join("memory.max"), "max\n").unwrap();
+        let (limit2, headroom2) =
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/app.slice/lean.scope\n");
+        assert_eq!(limit2, Some(12 * GIB_KIB));
+        assert_eq!(headroom2, Some(10 * GIB_KIB));
+
+        // Missing leaf directory still walks upward through intermediate slice limits.
+        fs::write(slice_dir.join("memory.max"), format!("{}\n", 8 * GIB_KIB * 1024)).unwrap();
+        let (limit3, headroom3) = cgroup_memory_limits_kib(
+            &cg_root,
+            "0::/user.slice/app.slice/nonexistent-leaf.scope\n",
+        );
+        assert_eq!(limit3, Some(8 * GIB_KIB));
+        assert_eq!(headroom3, Some(0)); // user.slice had memory.current = 10 GiB > 8 GiB -> saturating 0
+
+        // When an ancestor has a bound without readable usage files, it subtracts the
+        // tightest (maximum) usage observed across all descendants on the path, not
+        // merely the leaf's usage.
+        let _ = fs::remove_file(slice_dir.join("memory.current"));
+        fs::write(
+            app_dir.join("memory.stat"),
+            format!("anon {}\nshmem {}\n", 5 * GIB_KIB * 1024, GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(slice_dir.join("memory.max"), format!("{}\n", 16 * GIB_KIB * 1024)).unwrap();
+        fs::write(scope_dir.join("memory.max"), "max\n").unwrap();
+        let (limit_anc, headroom_anc) =
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/app.slice/lean.scope\n");
+        assert_eq!(limit_anc, Some(16 * GIB_KIB));
+        assert_eq!(
+            headroom_anc,
+            Some(10 * GIB_KIB),
+            "ancestor without own usage must subtract max descendant usage (6 GiB at app.slice > 2 GiB at leaf)"
+        );
+        let _ = fs::remove_file(app_dir.join("memory.stat"));
+
+        // When all levels have `"max"`, both limit and headroom are None.
+        fs::write(slice_dir.join("memory.max"), "max\n").unwrap();
+        fs::write(scope_dir.join("memory.max"), "max\n").unwrap();
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/app.slice/lean.scope\n"),
+            (None, None)
+        );
+        // Path traversal is rejected.
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, "0::/user.slice/../../etc\n"),
+            (None, None)
+        );
+        // Unknown available memory with known total falls back conservatively to 2 (bounded by total).
+        assert_eq!(resolve_default_lake_jobs(Some(32 * GIB_KIB), None, 8), 2);
+        assert_eq!(resolve_default_lake_jobs(Some(1 * GIB_KIB), None, 8), 1);
+
+        // 5. `build_lake_build_command_with_inputs` deterministically configures `Command`
+        //    env vars (`LAKE_CACHE_ENV_DEFAULTS` + `LEAN_NUM_THREADS`) and never passes `-j`.
+        use std::collections::BTreeMap;
+        let cmd_default = build_lake_build_command_with_inputs(
+            Path::new("lake"),
+            Path::new("/tmp/ws/.anneal"),
+            |_| false,
+            None,
+            false,
+            Some(16 * GIB_KIB),
+            Some(4608 * MIB_KIB),
+            8,
+        );
+        let envs_default: BTreeMap<String, Option<String>> = cmd_default
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs_default.get("LEAN_NUM_THREADS"),
+            Some(&Some("3".to_string()))
+        );
+        assert_eq!(
+            envs_default.get("LAKE_ARTIFACT_CACHE"),
+            Some(&Some("true".to_string()))
+        );
+        assert_eq!(
+            envs_default.get("LAKE_RESTORE_ARTIFACTS"),
+            Some(&Some("true".to_string()))
+        );
+        assert!(
+            !cmd_default
+                .get_args()
+                .any(|a| a.to_string_lossy().starts_with("-j"))
+        );
+
+        let cmd_preserve_caller = build_lake_build_command_with_inputs(
+            Path::new("lake"),
+            Path::new("/tmp/ws/.anneal"),
+            |k| k == "LAKE_ARTIFACT_CACHE",
+            None,
+            true,
+            Some(16 * GIB_KIB),
+            Some(4608 * MIB_KIB),
+            8,
+        );
+        let envs_preserve: BTreeMap<String, Option<String>> = cmd_preserve_caller
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(!envs_preserve.contains_key("LEAN_NUM_THREADS"));
+        assert!(!envs_preserve.contains_key("LAKE_ARTIFACT_CACHE"));
+        assert_eq!(
+            envs_preserve.get("LAKE_RESTORE_ARTIFACTS"),
+            Some(&Some("true".to_string()))
+        );
+
+        let cmd_override = build_lake_build_command_with_inputs(
+            Path::new("lake"),
+            Path::new("/tmp/ws/.anneal"),
+            |_| false,
+            Some("99"),
+            true,
+            Some(16 * GIB_KIB),
+            Some(1024 * MIB_KIB),
+            2,
+        );
+        let envs_override: BTreeMap<String, Option<String>> = cmd_override
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs_override.get("LEAN_NUM_THREADS"),
+            Some(&Some("16".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&cg_root);
+    }
+
+    #[test]
+    fn cgroup_memory_limits_honor_memory_high_throttle_threshold_below_memory_max() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cg_root = env::temp_dir().join(format!(
+            "cargo-anneal-cgroup-high-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let slice = cg_root.join("user.slice");
+        let service = slice.join("rshelld.service");
+        let leaf = service.join("server");
+        fs::create_dir_all(&leaf).expect("create cgroup test hierarchy");
+
+        // Mirrors a systemd capsule: `user.slice` throttles at `memory.high`
+        // (19 GiB) below its `memory.max` (20 GiB); the service and leaf are
+        // unbounded (`"max"` for both files).
+        fs::write(slice.join("memory.max"), format!("{}\n", 20 * GIB)).unwrap();
+        fs::write(slice.join("memory.high"), format!("{}\n", 19 * GIB)).unwrap();
+        fs::write(
+            slice.join("memory.stat"),
+            format!("anon {}\nfile {}\nshmem {}\n", 3 * GIB, 6 * GIB, GIB),
+        )
+        .unwrap();
+        for dir in [&service, &leaf] {
+            fs::write(dir.join("memory.max"), "max\n").unwrap();
+            fs::write(dir.join("memory.high"), "max\n").unwrap();
+        }
+        let proc_self_cgroup = "0::/user.slice/rshelld.service/server\n";
+
+        // `memory.high` (19 GiB) is the binding bound; headroom = 19 - (3 + 1) = 15 GiB
+        // (reclaimable `file` cache is not subtracted).
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, proc_self_cgroup),
+            (Some(19 * GIB_KIB), Some(15 * GIB_KIB))
+        );
+
+        // A leaf `memory.high` below every `memory.max` binds even when the leaf's
+        // `memory.max` is `"max"`; the leaf has no `memory.stat`, so its own
+        // `memory.current` (2 GiB) is subtracted.
+        fs::write(leaf.join("memory.high"), format!("{}\n", 6 * GIB)).unwrap();
+        fs::write(leaf.join("memory.current"), format!("{}\n", 2 * GIB)).unwrap();
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, proc_self_cgroup),
+            (Some(6 * GIB_KIB), Some(4 * GIB_KIB))
+        );
+        // ...and therefore bounds the default Lake concurrency: 4096 MiB / 1536 -> 2
+        // jobs, and 6144 MiB / 2048 -> at most 3 jobs.
+        assert_eq!(
+            resolve_default_lake_jobs(Some(6 * GIB_KIB), Some(4 * GIB_KIB), 8),
+            2
+        );
+
+        // With every `memory.high` back at `"max"`, `memory.max` (20 GiB) binds again.
+        fs::write(leaf.join("memory.high"), "max\n").unwrap();
+        fs::write(slice.join("memory.high"), "max\n").unwrap();
+        assert_eq!(
+            cgroup_memory_limits_kib(&cg_root, proc_self_cgroup),
+            (Some(20 * GIB_KIB), Some(16 * GIB_KIB))
+        );
+
+        let _ = fs::remove_dir_all(&cg_root);
+    }
+
+    #[test]
+    fn cgroup_v1_memory_limits_cover_legacy_and_hybrid_containers() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+        const V1_UNLIMITED: &str = "9223372036854771712\n";
+
+        // `memory.stat` keys: hierarchical totals win over cgroup-local values,
+        // reclaimable `cache` / `total_cache` are ignored.
+        assert_eq!(
+            parse_cgroup_v1_memory_stat_used_bytes(
+                "cache 100\nrss 10\nshmem 1\ntotal_cache 900\ntotal_rss 40\ntotal_shmem 2\n"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_cgroup_v1_memory_stat_used_bytes("cache 100\nrss 10\nshmem 1\n"),
+            Some(11)
+        );
+        assert_eq!(parse_cgroup_v1_memory_stat_used_bytes("cache 100\n"), None);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let memory_root = env::temp_dir().join(format!(
+            "cargo-anneal-cgroup-v1-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let docker = memory_root.join("docker");
+        let container = docker.join("abc123");
+        fs::create_dir_all(&container).expect("create cgroup v1 test hierarchy");
+        fs::write(memory_root.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        fs::write(docker.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        // The container is limited to 8 GiB with 1.5 GiB non-reclaimable usage and
+        // 4 GiB of reclaimable page cache.
+        fs::write(container.join("memory.limit_in_bytes"), format!("{}\n", 8 * GIB)).unwrap();
+        fs::write(
+            container.join("memory.stat"),
+            format!(
+                "cache {}\nrss {}\nshmem {}\ntotal_cache {}\ntotal_rss {}\ntotal_shmem {}\n",
+                4 * GIB,
+                GIB,
+                GIB / 2,
+                4 * GIB,
+                GIB,
+                GIB / 2
+            ),
+        )
+        .unwrap();
+        fs::write(container.join("memory.usage_in_bytes"), format!("{}\n", 6 * GIB)).unwrap();
+
+        // Hybrid host: the unified `0::` line exposes no memory controller, the v1
+        // `memory` controller (possibly co-mounted, e.g. `memory,hugetlb`) does.
+        let proc_self_cgroup = "12:cpu,cpuacct:/docker/abc123\n\
+                                11:memory,hugetlb:/docker/abc123\n\
+                                0::/docker/abc123\n";
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (Some(8 * GIB_KIB), Some(6 * GIB_KIB + GIB_KIB / 2)),
+            "8 GiB - (1 GiB rss + 0.5 GiB shmem); page cache is reclaimable"
+        );
+        // Without `memory.stat`, `memory.usage_in_bytes` (6 GiB) is subtracted.
+        fs::remove_file(container.join("memory.stat")).unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (Some(8 * GIB_KIB), Some(2 * GIB_KIB))
+        );
+        // Inside the container the mount shows its own cgroup as the root, so the
+        // host-relative path does not exist: the walk climbs to the mount root,
+        // whose limit is the container's.
+        fs::write(memory_root.join("memory.limit_in_bytes"), format!("{}\n", 4 * GIB)).unwrap();
+        fs::write(memory_root.join("memory.usage_in_bytes"), format!("{}\n", GIB)).unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "4:memory:/kubepods/pod-xyz/ctr\n"),
+            (Some(4 * GIB_KIB), Some(3 * GIB_KIB))
+        );
+        // No `memory` controller line, unlimited everywhere, or path traversal -> None.
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "0::/docker/abc123\n"),
+            (None, None)
+        );
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "3:memory:/docker/../../etc\n"),
+            (None, None)
+        );
+        fs::write(memory_root.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        fs::write(container.join("memory.limit_in_bytes"), V1_UNLIMITED).unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (None, None)
+        );
+        // Bind-mounted pod container where `memory.limit_in_bytes` is unlimited at the
+        // container leaf, while `memory.stat`'s `hierarchical_memory_limit` exposes the
+        // enclosing pod's 3 GiB cap.
+        fs::write(
+            memory_root.join("memory.stat"),
+            format!(
+                "hierarchical_memory_limit {}\ntotal_rss {}\ntotal_shmem 0\n",
+                3 * GIB,
+                GIB
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            cgroup_v1_memory_limits_kib(&memory_root, "4:memory:/kubepods/pod-xyz/ctr\n"),
+            (Some(3 * GIB_KIB), Some(2 * GIB_KIB))
+        );
+        fs::remove_file(memory_root.join("memory.stat")).unwrap();
+        // The unified-hierarchy walk sees no `memory.max` in a v1 mount layout, which
+        // is what makes `probe_effective_memory_kib` fall back to v1.
+        assert_eq!(
+            cgroup_memory_limits_kib(&memory_root, proc_self_cgroup),
+            (None, None)
+        );
+
+        let _ = fs::remove_dir_all(&memory_root);
     }
 
     #[test]

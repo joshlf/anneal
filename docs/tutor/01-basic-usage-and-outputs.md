@@ -268,7 +268,9 @@ def defaultCallContract : MirCallContract where
     And (req.defPath = "frame_tutor::magic_version") (defaultPre req.args)
   post req ans :=
     ∃ retVal,
-      And (ans = .returned retVal req.memory) (defaultPost req.args retVal)
+      And (ans = .returned retVal req.memory)
+          (And (defaultPost req.args retVal)
+                (Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.FrameTutor.magic_version.body retVal))
 
 /-- Low-priority default `ItemSpec` instance for `frame_tutor::magic_version`.
     An authored normal-priority `ItemSpec` instance in `Specs.FrameTutor.magic_version`
@@ -470,17 +472,17 @@ def ubExceptionClaim [spec : UbExceptionItemSpec "frame_tutor::magic_version"] :
 
 /-- Verification claim for `frame_tutor::magic_version` instantiated at `typeArgs`. -/
 def claimFor
-    [spec : ItemSpec "frame_tutor::magic_version"]
+    [_spec : ItemSpec "frame_tutor::magic_version"]
     (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=
   { body := Mir.FrameTutor.magic_version.body.instantiate typeArgs
     pre := fun args =>
-      And (spec.pre args)
+      And (defaultPreFor typeArgs args)
           (Trusted.VerificationResult.argsMatchSignature
             (Mir.FrameTutor.magic_version.body.instantiate typeArgs)
             args
             (initMachineState (Mir.FrameTutor.magic_version.body.instantiate typeArgs) args).memory)
     post := fun args ret =>
-      And (spec.post args ret)
+      And (defaultPostFor typeArgs args ret)
           (Trusted.VerificationResult.retMatchesSignature
             (Mir.FrameTutor.magic_version.body.instantiate typeArgs)
             ret

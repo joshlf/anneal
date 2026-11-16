@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub use cargo_anneal::cgroup_memory_limits_kib;
 use cargo_anneal::{
     ANNEAL_CAPTURE_FILTER_ENV, AnnealOutcome, CaptureDriverConfig, ComparisonVerdict,
     DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
@@ -26,8 +27,8 @@ use cargo_anneal::{
     MiriToolchain, NotComparedReason, OracleItemSpec, ScaffoldConfig, SourcePos, SourceSpan,
     aggregate_unit_manifests, build_lake_build_command, compare_miri_and_anneal,
     derive_item_module_suffix, discover_zero_arg_pub_fns, normalize_path_against,
-    parse_anneal_probe_output, resolve_rustc_wrapper, run_miri_oracle,
-    scaffold_workspace_with_config, source_files_match,
+    parse_anneal_probe_output, probe_effective_memory_kib, resolve_default_lake_jobs,
+    resolve_rustc_wrapper, run_miri_oracle, scaffold_workspace_with_config, source_files_match,
 };
 
 use crate::mutators_miri::{
@@ -2309,29 +2310,92 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
     }
 }
 
+/// The `namespace <ident> ... end <ident>` section of `confirm_src` enclosing
+/// byte offset `theorem_pos` (the whole source when there is none), so a
+/// multi-group `MiriOracleConfirm.lean` yields only the definitions of the
+/// group whose kernel check accepted the theorem.
+fn enclosing_confirm_namespace_slice<'a>(confirm_src: &'a str, theorem_pos: usize) -> &'a str {
+    let prefix = &confirm_src[..theorem_pos];
+    let ns_pos = prefix
+        .rfind("\nnamespace ")
+        .map(|i| i + 1)
+        .or_else(|| prefix.starts_with("namespace ").then_some(0));
+    let Some(ns_start) = ns_pos else {
+        return confirm_src;
+    };
+    let after_kw = &confirm_src[ns_start + "namespace ".len()..];
+    let ns_ident = after_kw.lines().next().unwrap_or("").trim();
+    if ns_ident.is_empty() {
+        return confirm_src;
+    }
+    let end_marker = format!("\nend {ns_ident}");
+    if let Some(rel_end) = confirm_src[theorem_pos..].find(&end_marker) {
+        let end_idx = theorem_pos + rel_end + end_marker.len();
+        &confirm_src[ns_start..end_idx]
+    } else {
+        &confirm_src[ns_start..]
+    }
+}
+
 /// Extract the `confirm_tag_<fn_name>`, `confirm_probe_<fn_name>`, and (when
 /// present) `confirm_frame_<fn_name>` and `confirm_message_<fn_name>` theorems
 /// from `MiriOracleConfirm.lean` source, preceded by every confirm-module
 /// definition that they use: the synthetic constructor stub (when
 /// `linkedCallees` refers to it), `linkedCallees`, the run probe in
 /// [`PROBE_EXEC_LEAN`], and the panic-origin probe in
-/// [`PANIC_MESSAGE_PROBE_LEAN`] (when a frame or message theorem is present).
-/// The snippet therefore names no definition local to the confirm module that
-/// it does not also contain.
+/// [`PANIC_MESSAGE_PROBE_LEAN`] (when a frame or message theorem is present),
+/// all taken from the namespace section that holds `fn_name`'s theorems
+/// ([`enclosing_confirm_namespace_slice`]). The snippet therefore names no
+/// definition local to the confirm module that it does not also contain.
+fn find_line_starting_with(src: &str, header: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(rel) = src[offset..].find(header) {
+        let idx = offset + rel;
+        let at_line_start = idx == 0 || src.as_bytes()[idx - 1] == b'\n';
+        let after = idx + header.len();
+        let at_header_end = after == src.len()
+            || matches!(src.as_bytes()[after], b'\n' | b'\r' | b' ');
+        if at_line_start && at_header_end {
+            return Some(idx);
+        }
+        offset = idx + 1;
+    }
+    None
+}
+
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
-    // Each block runs from its header to the first blank line; the generated
-    // blocks contain no blank lines.
+    let theorem_headers = [
+        format!("theorem confirm_tag_{fn_name} :"),
+        format!("theorem confirm_probe_{fn_name} :"),
+        format!("theorem confirm_frame_{fn_name} :"),
+        format!("theorem confirm_message_{fn_name} :"),
+    ];
+    let Some(first_theorem_pos) = theorem_headers
+        .iter()
+        .filter_map(|h| find_line_starting_with(confirm_src, h))
+        .min()
+    else {
+        return String::new();
+    };
+    // Narrow to the enclosing `namespace ... end ...` group that confirmed
+    // `fn_name`, so multi-chunk / per-item-fallback `MiriOracleConfirm.lean`
+    // modules preserve each group's exact kernel-checked `linkedCallees`.
+    let scope_src = enclosing_confirm_namespace_slice(confirm_src, first_theorem_pos);
+
+    // Each block runs from its line-anchored header to the first blank line;
+    // anchoring at line start prevents `-- Anneal's panic message: ...` comments
+    // from spoofing another candidate's theorem header.
     let extract_block = |header: &str| -> Option<String> {
-        let start_idx = confirm_src.find(header)?;
-        let rest = &confirm_src[start_idx..];
+        let start_idx = find_line_starting_with(scope_src, header)?;
+        let rest = &scope_src[start_idx..];
         let end_rel = rest.find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
         Some(rest[..end_rel].trim().to_string())
     };
     let first_line = |block: &'static str| block.lines().next().unwrap_or(block);
-    let tag_block = extract_block(&format!("theorem confirm_tag_{fn_name} :"));
-    let probe_block = extract_block(&format!("theorem confirm_probe_{fn_name} :"));
-    let frame_block = extract_block(&format!("theorem confirm_frame_{fn_name} :"));
-    let message_block = extract_block(&format!("theorem confirm_message_{fn_name} :"));
+    let tag_block = extract_block(&theorem_headers[0]);
+    let probe_block = extract_block(&theorem_headers[1]);
+    let frame_block = extract_block(&theorem_headers[2]);
+    let message_block = extract_block(&theorem_headers[3]);
     if tag_block.is_none()
         && probe_block.is_none()
         && frame_block.is_none()
@@ -2624,12 +2688,334 @@ fn resolve_lake_bin() -> PathBuf {
     PathBuf::from("lake")
 }
 
-fn run_lake_build_with_bin(
+/// Maximum number of corpus candidate items per Stage 1 `Mir.*` build chunk and
+/// `MiriOracleProbe_{chunk_idx:03}.lean` evaluation module.
+pub const MIRI_PROBE_CHUNK_SIZE: usize = 64;
+
+/// Maximum number of candidate items per Stage 2 `MiriOracleConfirm_{chunk_idx:03}.lean`
+/// kernel confirmation chunk.
+pub const MIRI_CONFIRM_CHUNK_SIZE: usize = 16;
+
+/// Maximum consecutive failed per-candidate fallback runs (with zero fallback
+/// successes so far) before [`run_isolated_miri_stage`] trips its circuit
+/// breaker and stops per-candidate retries (retrying the rest of the chunk
+/// once as a group before declaring a systematic failure).
+pub const MIRI_FALLBACK_CIRCUIT_BREAKER: usize = 4;
+
+/// Maps effective total / available memory (in KiB) to a `lake env lean` chunk
+/// worker count for `miri-difftest`: 1 worker when available memory is below
+/// 24 GiB (or unknown) or total memory is at most 36 GiB, at most 2 workers up
+/// to 64 GiB total (or below 48 GiB available), and at most 4 workers above that.
+pub fn miri_lean_jobs_for_memory(total_kib: Option<u64>, avail_kib: Option<u64>) -> usize {
+    const GIB: u64 = 1024 * 1024;
+    if total_kib.is_none() && avail_kib.is_none() {
+        return 1;
+    }
+    let by_total = match total_kib {
+        None => 4,
+        Some(t) if t <= 36 * GIB => 1,
+        Some(t) if t <= 64 * GIB => 2,
+        Some(_) => 4,
+    };
+    let by_avail = match avail_kib {
+        None => 1,
+        Some(a) if a < 24 * GIB => 1,
+        Some(a) if a < 48 * GIB => 2,
+        Some(_) => 4,
+    };
+    by_total.min(by_avail)
+}
+
+/// Pure helper for [`resolve_miri_lean_jobs`] accepting explicit `ANNEAL_MIRI_LEAN_JOBS`
+/// and effective memory values for deterministic testing.
+pub fn resolve_miri_lean_jobs_with_env(
+    anneal_miri_lean_jobs: Option<&str>,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+) -> usize {
+    if let Some(val) = anneal_miri_lean_jobs
+        && let Ok(parsed) = val.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return parsed.min(8);
+    }
+    miri_lean_jobs_for_memory(total_kib, avail_kib)
+}
+
+/// Resolves the maximum number of concurrent `lake env lean` chunk workers (and
+/// sequential chunk `lake build` threads) for `miri-difftest` from
+/// `ANNEAL_MIRI_LEAN_JOBS` (capped at 8) or host `/proc/meminfo` intersected
+/// with enclosing cgroup v2 memory limits (`memory.max` & `memory.stat` `anon + shmem`).
+pub fn resolve_miri_lean_jobs() -> usize {
+    let override_env = env::var("ANNEAL_MIRI_LEAN_JOBS").ok();
+    let (total_kib, avail_kib) = probe_effective_memory_kib();
+    resolve_miri_lean_jobs_with_env(override_env.as_deref(), total_kib, avail_kib)
+}
+
+/// `LEAN_NUM_THREADS` budgets for `miri-difftest`'s sequential `lake build`
+/// invocations (Lean v4.34.1 `lake build` has no `-j` flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MiriLakeBuildThreads {
+    /// Stage 0 group 0: `SymbolicEval`, `Mir.Common`, and (when few) helpers.
+    base: usize,
+    /// Stage 0 helper overflow chunks and every Stage 1a corpus `Mir.*` chunk
+    /// (or per-candidate fallback) build.
+    mir_chunks: usize,
+}
+
+fn parse_positive_jobs(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Pure helper for [`resolve_miri_lake_build_threads`]:
+///
+/// - `ANNEAL_MIRI_LEAN_JOBS` (capped at 8) sets both budgets;
+/// - otherwise `CARGO_ANNEAL_LAKE_JOBS` (capped at 16) sets the base budget;
+/// - otherwise the base budget is [`resolve_default_lake_jobs`] for the
+///   effective memory and CPU budget, lowered (never raised) by a caller's
+///   `LEAN_NUM_THREADS`;
+/// - absent `ANNEAL_MIRI_LEAN_JOBS`, corpus `Mir.*` chunk builds use at most
+///   4 threads.
+fn resolve_miri_lake_build_threads_with_env(
+    anneal_miri_lean_jobs: Option<&str>,
+    cargo_anneal_lake_jobs: Option<&str>,
+    caller_lean_num_threads: Option<&str>,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    cpu_cores: usize,
+) -> MiriLakeBuildThreads {
+    if let Some(n) = parse_positive_jobs(anneal_miri_lean_jobs) {
+        let n = n.min(8);
+        return MiriLakeBuildThreads {
+            base: n,
+            mir_chunks: n,
+        };
+    }
+    let base = match parse_positive_jobs(cargo_anneal_lake_jobs) {
+        Some(n) => n.min(16),
+        None => {
+            let mem_jobs = resolve_default_lake_jobs(total_kib, avail_kib, cpu_cores);
+            match parse_positive_jobs(caller_lean_num_threads) {
+                Some(caller) => mem_jobs.min(caller),
+                None => mem_jobs,
+            }
+        }
+    };
+    MiriLakeBuildThreads {
+        base,
+        mir_chunks: base.min(4),
+    }
+}
+
+/// Resolves [`MiriLakeBuildThreads`] from `ANNEAL_MIRI_LEAN_JOBS`,
+/// `CARGO_ANNEAL_LAKE_JOBS`, `LEAN_NUM_THREADS`, and the host / cgroup memory
+/// and CPU budget.
+fn resolve_miri_lake_build_threads() -> MiriLakeBuildThreads {
+    let (total_kib, avail_kib) = probe_effective_memory_kib();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    resolve_miri_lake_build_threads_with_env(
+        env::var("ANNEAL_MIRI_LEAN_JOBS").ok().as_deref(),
+        env::var("CARGO_ANNEAL_LAKE_JOBS").ok().as_deref(),
+        env::var("LEAN_NUM_THREADS").ok().as_deref(),
+        total_kib,
+        avail_kib,
+        cpu_cores,
+    )
+}
+
+/// Lean module that every `MiriOracleProbe*` / `MiriOracleConfirm*` module imports.
+const MIRI_SYMBOLIC_EVAL_MODULE: &str = "Anneal.Rustc.V2026_06_01.SymbolicEval";
+
+/// Plans Stage 0's shared-base `lake build` invocations.
+///
+/// Group 0 builds [`MIRI_SYMBOLIC_EVAL_MODULE`], `Mir.Common` (when
+/// generated), and the deduplicated helper `Mir.<suffix>` modules when there
+/// are at most [`MIRI_PROBE_CHUNK_SIZE`] of them; otherwise the helpers follow
+/// in groups of at most `MIRI_PROBE_CHUNK_SIZE`. The umbrella `Mir` library
+/// target is never emitted: it would build every corpus candidate module in
+/// one Lake invocation (the Campaign #13 OOM).
+fn plan_miri_stage0_build_groups(
+    has_mir_common: bool,
+    helper_module_suffixes: &[String],
+) -> Vec<Vec<String>> {
+    let mut base: Vec<String> = vec![MIRI_SYMBOLIC_EVAL_MODULE.to_string()];
+    if has_mir_common {
+        base.push("Mir.Common".to_string());
+    }
+    let mut helpers: Vec<String> = Vec::new();
+    for suffix in helper_module_suffixes {
+        let suffix = suffix.trim();
+        if suffix.is_empty() {
+            continue;
+        }
+        let target = format!("Mir.{suffix}");
+        if !base.contains(&target) && !helpers.contains(&target) {
+            helpers.push(target);
+        }
+    }
+    if helpers.len() <= MIRI_PROBE_CHUNK_SIZE {
+        base.extend(helpers);
+        return vec![base];
+    }
+    let mut groups = vec![base];
+    groups.extend(helpers.chunks(MIRI_PROBE_CHUNK_SIZE).map(<[String]>::to_vec));
+    groups
+}
+
+/// Deduplicated corpus `Mir.<cand_suffix>` targets for one Stage 1a chunk
+/// (falling back to `Mir.<crate_camel>.<item>` for an empty suffix, exactly as
+/// [`render_linked_anneal_probe_module`] imports them).
+fn miri_candidate_build_targets(
+    crate_camel: &str,
+    chunk: &[(OracleItemSpec, String)],
+) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::with_capacity(chunk.len());
+    for (item, cand_suffix) in chunk {
+        let suffix = if cand_suffix.is_empty() {
+            format!("{crate_camel}.{}", item.name)
+        } else {
+            cand_suffix.clone()
+        };
+        let target = format!("Mir.{suffix}");
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn contains_bracketed_error_colon(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some(idx) = rest.find("error[") {
+        let after = &rest[idx + "error[".len()..];
+        if let Some(close_idx) = after.find("]:") {
+            let code = &after[..close_idx];
+            if !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return true;
+            }
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Whether `line` is a Lake / Lean / rustc diagnostic worth surfacing: a Lake
+/// `✖` failure marker, a Lake / Lean `error:` line, a bracketed compiler
+/// `error[<code>]:` line, or a fatal Lean / Rust runtime crash line (`out of memory`,
+/// `LEAN ASSERTION VIOLATION`, `PANIC at`, `panicked at`) that lacks `error:`.
+fn is_lean_diag_highlight_line(line: &str) -> bool {
+    if line.contains('✖') {
+        return true;
+    }
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error:")
+        || contains_bracketed_error_colon(&lower)
+        || lower.trim() == "out of memory"
+        || lower.contains("out of memory:")
+        || lower.contains(": out of memory")
+        || lower.contains("lean panic:")
+        || lower.contains("lean assertion violation")
+        || lower.contains("panic at ")
+        || lower.contains("panicked at ")
+}
+
+/// Extracts up to `max_lines` unique diagnostic lines (`✖` or `error:`) across
+/// `stdout` and `stderr`, preserving order.
+pub(crate) fn extract_lean_error_lines(
+    stdout: &str,
+    stderr: &str,
+    max_lines: usize,
+) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let mut matched: Vec<String> = Vec::new();
+    for raw in stdout.lines().chain(stderr.lines()) {
+        let trimmed = raw.trim_end_matches('\r');
+        if is_lean_diag_highlight_line(trimmed) && !matched.iter().any(|m| m == trimmed) {
+            matched.push(trimmed.to_string());
+        }
+    }
+    if matched.len() > max_lines {
+        matched.split_off(matched.len() - max_lines)
+    } else {
+        matched
+    }
+}
+
+/// Truncates a multi-line Lean log to its first 20 and last 20 lines while
+/// preserving any `✖` / `error:` lines that would otherwise be elided from the middle.
+fn truncate_lean_diag(msg: &str) -> String {
+    let lines: Vec<&str> = msg.lines().collect();
+    if lines.len() <= 40 {
+        return msg.to_string();
+    }
+    let middle = &lines[20..lines.len() - 20];
+    let middle_errors: Vec<&str> = middle
+        .iter()
+        .copied()
+        .filter(|l| is_lean_diag_highlight_line(l))
+        .take(20)
+        .collect();
+    if middle_errors.is_empty() {
+        format!(
+            "{}\n... ({} lines elided) ...\n{}",
+            lines[..20].join("\n"),
+            middle.len(),
+            lines[lines.len() - 20..].join("\n")
+        )
+    } else {
+        format!(
+            "{}\n... ({} lines elided; key error lines preserved below) ...\n{}\n... (end of preserved middle errors) ...\n{}",
+            lines[..20].join("\n"),
+            middle.len(),
+            middle_errors.join("\n"),
+            lines[lines.len() - 20..].join("\n")
+        )
+    }
+}
+
+/// Formats a `lake` / `lean` subprocess failure including highlighted `✖` / `error:`
+/// lines as well as both `stdout` and `stderr` (since Lake 5 logs build failures to `stdout`).
+pub(crate) fn format_lean_command_failure(header: &str, stdout: &str, stderr: &str) -> String {
+    let highlights = extract_lean_error_lines(stdout, stderr, 30);
+    let mut out = String::from(header);
+    if !highlights.is_empty() {
+        out.push_str("\nerror_lines:\n");
+        out.push_str(&highlights.join("\n"));
+    }
+    out.push_str("\nstdout:\n");
+    if stdout.trim().is_empty() {
+        out.push_str("(empty)");
+    } else {
+        out.push_str(&truncate_lean_diag(stdout.trim_end()));
+    }
+    out.push_str("\nstderr:\n");
+    if stderr.trim().is_empty() {
+        out.push_str("(empty)");
+    } else {
+        out.push_str(&truncate_lean_diag(stderr.trim_end()));
+    }
+    out
+}
+
+fn run_lake_build_with_bin_and_threads(
     lake_bin: &Path,
     dot_anneal_dir: &Path,
     targets: &[&str],
+    threads: Option<usize>,
 ) -> Result<(), String> {
     let mut cmd = build_lake_build_command(lake_bin, dot_anneal_dir);
+    if let Some(n) = threads {
+        cmd.env("LEAN_NUM_THREADS", n.max(1).to_string());
+    }
     for target in targets {
         cmd.arg(target);
     }
@@ -2644,10 +3030,14 @@ fn run_lake_build_with_bin(
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "lake build failed with status {} in {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status,
-            dot_anneal_dir.display()
+        return Err(format_lean_command_failure(
+            &format!(
+                "lake build failed with status {} in {}",
+                output.status,
+                dot_anneal_dir.display()
+            ),
+            &stdout,
+            &stderr,
         ));
     }
     Ok(())
@@ -2979,7 +3369,8 @@ fn render_linked_anneal_probe_module(
 /// for each panicking item, the panic frame (`probePanicFrameBounded`) and
 /// message (`probePanicMessageBounded`) that the probe recovered
 /// (`anneal_panic_frames` and `anneal_panic_messages`, keyed by item name).
-fn render_linked_anneal_confirm_module(
+fn render_anneal_confirm_namespace_section(
+    namespace_ident: &str,
     crate_camel: &str,
     items: &[(OracleItemSpec, String, AnnealOutcome)],
     helper_module_suffixes: &[String],
@@ -2987,29 +3378,9 @@ fn render_linked_anneal_confirm_module(
     anneal_panic_messages: &BTreeMap<String, Vec<u8>>,
 ) -> Result<String, String> {
     let mut out = String::new();
-    out.push_str("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
-    let mut imported_mir = BTreeSet::new();
-    for helper_suffix in helper_module_suffixes {
-        if imported_mir.insert(helper_suffix.clone()) {
-            out.push_str(&format!("import Mir.{helper_suffix}\n"));
-        }
-    }
-    for (item, cand_suffix, _) in items {
-        let suffix = if cand_suffix.is_empty() {
-            format!("{crate_camel}.{}", item.name)
-        } else {
-            cand_suffix.clone()
-        };
-        if imported_mir.insert(suffix.clone()) {
-            out.push_str(&format!("import Mir.{suffix}\n"));
-        }
-    }
-
     let callees_expr = render_linked_callees_expr(helper_module_suffixes);
     out.push_str(&format!(
-        "\nset_option maxRecDepth 100000\n\
-         set_option maxHeartbeats 2000000\n\n\
-         namespace MiriOracleConfirm\n\n\
+        "namespace {namespace_ident}\n\n\
          open Trusted.Sequence\n\
          open Trusted.Rustc.V2026_06_01.MirAst\n\
          open Trusted.Rustc.V2026_06_01.MirSemantics\n\
@@ -3084,7 +3455,107 @@ fn render_linked_anneal_confirm_module(
         }
     }
 
-    out.push_str("end MiriOracleConfirm\n");
+    out.push_str(&format!("end {namespace_ident}\n"));
+    Ok(out)
+}
+
+fn render_linked_anneal_confirm_module(
+    crate_camel: &str,
+    items: &[(OracleItemSpec, String, AnnealOutcome)],
+    helper_module_suffixes: &[String],
+    anneal_panic_frames: &BTreeMap<String, String>,
+    anneal_panic_messages: &BTreeMap<String, Vec<u8>>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    out.push_str("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
+    let mut imported_mir = BTreeSet::new();
+    for helper_suffix in helper_module_suffixes {
+        if imported_mir.insert(helper_suffix.clone()) {
+            out.push_str(&format!("import Mir.{helper_suffix}\n"));
+        }
+    }
+    for (item, cand_suffix, _) in items {
+        let suffix = if cand_suffix.is_empty() {
+            format!("{crate_camel}.{}", item.name)
+        } else {
+            cand_suffix.clone()
+        };
+        if imported_mir.insert(suffix.clone()) {
+            out.push_str(&format!("import Mir.{suffix}\n"));
+        }
+    }
+    out.push_str(
+        "\nset_option maxRecDepth 100000\n\
+         set_option maxHeartbeats 2000000\n\n",
+    );
+    out.push_str(&render_anneal_confirm_namespace_section(
+        "MiriOracleConfirm",
+        crate_camel,
+        items,
+        helper_module_suffixes,
+        anneal_panic_frames,
+        anneal_panic_messages,
+    )?);
+    Ok(out)
+}
+
+/// Renders `oracle/MiriOracleConfirm.lean` preserving the exact `linkedCallees`
+/// environment of each kernel-confirmed group (`Chunk` or single-item `Fallback`).
+/// When a single group was confirmed, emits `namespace MiriOracleConfirm`; when
+/// multiple groups were confirmed separately, emits isolated
+/// `namespace MiriOracleConfirm_{idx:03}` blocks so one group's helper/closure/`Drop`
+/// callees never contaminate another group's extracted theorem snippet.
+fn render_multi_group_anneal_confirm_module(
+    crate_camel: &str,
+    groups: &[(Vec<MiriConfirmEntry>, Vec<String>)],
+    anneal_panic_frames: &BTreeMap<String, String>,
+    anneal_panic_messages: &BTreeMap<String, Vec<u8>>,
+) -> Result<String, String> {
+    if let [(entries, helpers)] = groups {
+        return render_linked_anneal_confirm_module(
+            crate_camel,
+            entries,
+            helpers,
+            anneal_panic_frames,
+            anneal_panic_messages,
+        );
+    }
+    let mut out = String::new();
+    out.push_str("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
+    let mut imported_mir = BTreeSet::new();
+    for (entries, helpers) in groups {
+        for helper_suffix in helpers {
+            if imported_mir.insert(helper_suffix.clone()) {
+                out.push_str(&format!("import Mir.{helper_suffix}\n"));
+            }
+        }
+        for (item, cand_suffix, _) in entries {
+            let suffix = if cand_suffix.is_empty() {
+                format!("{crate_camel}.{}", item.name)
+            } else {
+                cand_suffix.clone()
+            };
+            if imported_mir.insert(suffix.clone()) {
+                out.push_str(&format!("import Mir.{suffix}\n"));
+            }
+        }
+    }
+    out.push_str(
+        "\nset_option maxRecDepth 100000\n\
+         set_option maxHeartbeats 2000000\n",
+    );
+    for (idx, (entries, helpers)) in groups.iter().enumerate() {
+        out.push('\n');
+        let ns = format!("MiriOracleConfirm_{idx:03}");
+        out.push_str(&render_anneal_confirm_namespace_section(
+            &ns,
+            crate_camel,
+            entries,
+            helpers,
+            anneal_panic_frames,
+            anneal_panic_messages,
+        )?);
+    }
     Ok(out)
 }
 
@@ -3120,31 +3591,929 @@ fn acquire_live_lean_oracle_lock() -> (
     (guard, lock_file)
 }
 
+/// Lean's per-process memory cap (`lean -M`, in MiB) for Stage 1 probe
+/// evaluation runs of `oracle/MiriOracleProbe_*.lean`.
+const PROBE_LEAN_MEMORY_MB: &str = "8192";
+
 /// Lean's per-process memory cap (`lean -M`, in MiB) for kernel confirmation
-/// runs of `oracle/MiriOracleConfirm.lean`.
+/// runs of `oracle/MiriOracleConfirm*.lean`.
 const CONFIRM_LEAN_MEMORY_MB: &str = "4096";
 
-/// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB oracle/MiriOracleConfirm.lean`
-/// in `dot_anneal`.
-fn run_lean_confirm_module(
+/// Hard resident-set budget (MiB) for one Stage 1b `lake env lean` probe
+/// process tree, enforced by [`run_lean_with_rss_budget`].
+///
+/// Lean's `-M` only bounds its small-object allocator: kernel `whnf` /
+/// `isDefEq` reduction memory is not counted. At 800-candidate scale a single
+/// `rfl` confirmation (`pass_int_widening_and_truncating_casts`, seed
+/// `0x42649b91`) grows past 7 GiB RSS under `-M 4096` (~280 MB/s), so without
+/// a harness-side bound one theorem OOM-kills the enclosing cgroup and with it
+/// the whole campaign. Measured healthy peaks: <= 0.65 GiB per 64-candidate
+/// probe chunk and <= 1.2 GiB per 16-entry confirm chunk.
+const PROBE_LEAN_RSS_BUDGET_MIB: u64 = 8192;
+
+/// Hard resident-set budget (MiB) for one Stage 2 `lake env lean` kernel
+/// confirmation process tree (see [`PROBE_LEAN_RSS_BUDGET_MIB`]); a run killed
+/// for exceeding it is classified as resource exhaustion
+/// ([`lean_confirm_failure_is_resource_exhaustion`]).
+const CONFIRM_LEAN_RSS_BUDGET_MIB: u64 = 4096;
+
+/// Overrides both per-stage RSS budget caps (MiB, `>= 1`).
+const MIRI_LEAN_RSS_BUDGET_ENV: &str = "ANNEAL_MIRI_LEAN_MAX_RSS_MIB";
+
+/// How often [`run_lean_with_rss_budget`] samples the process tree.
+const LEAN_RSS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Per-worker resident-set budget (KiB) for a Lean stage running `jobs`
+/// concurrent workers: the stage cap (`stage_cap_mib`, or
+/// `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` when set) bounded by 85% of this worker's share
+/// of the effective cgroup / host headroom, and never below 512 MiB.
+fn miri_lean_rss_budget_kib(
+    stage_cap_mib: u64,
+    override_mib: Option<&str>,
+    jobs: usize,
+    avail_kib: Option<u64>,
+) -> u64 {
+    let cap_kib = parse_positive_jobs(override_mib)
+        .map_or(stage_cap_mib, |n| n as u64)
+        .saturating_mul(1024);
+    let share_kib = avail_kib.map(|a| a / jobs.max(1) as u64 / 100 * 85);
+    share_kib
+        .map_or(cap_kib, |share| cap_kib.min(share))
+        .max(512 * 1024)
+}
+
+/// Resolves the per-worker RSS budget (KiB) for a Lean stage from
+/// `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` and the current effective memory headroom.
+fn resolve_miri_lean_rss_budget_kib(stage_cap_mib: u64, jobs: usize) -> u64 {
+    let (_, avail_kib) = probe_effective_memory_kib();
+    miri_lean_rss_budget_kib(
+        stage_cap_mib,
+        env::var(MIRI_LEAN_RSS_BUDGET_ENV).ok().as_deref(),
+        jobs,
+        avail_kib,
+    )
+}
+
+/// `(ppid, starttime)` from `/proc/<pid>/stat` contents (`pid (comm) state
+/// ppid ... starttime ...`, where `comm` may contain spaces or `)`): `ppid` is
+/// field 4 and `starttime` (clock ticks since boot) field 22 of `proc(5)`.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_ppid_starttime(stat: &str) -> Option<(u32, u64)> {
+    let after_comm = stat.rfind(')').map(|i| &stat[i + 1..])?;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let ppid = fields.get(1)?.parse::<u32>().ok()?;
+    let starttime = fields.get(19)?.parse::<u64>().ok()?;
+    Some((ppid, starttime))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_starttime(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| parse_proc_stat_ppid_starttime(&s))
+        .map(|(_, starttime)| starttime)
+}
+
+/// `root` and its live `ppid` descendants (`(pid, starttime)`) in breadth-first
+/// parent-before-child order from one `/proc/*/stat` snapshot; empty once
+/// `root` itself is gone.
+#[cfg(target_os = "linux")]
+fn process_tree_snapshot(root: u32) -> Vec<(u32, u64)> {
+    let mut children: BTreeMap<u32, Vec<(u32, u64)>> = BTreeMap::new();
+    let mut root_starttime = None;
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some((ppid, starttime)) = fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|s| parse_proc_stat_ppid_starttime(&s))
+            else {
+                continue;
+            };
+            if pid == root {
+                root_starttime = Some(starttime);
+            }
+            children.entry(ppid).or_default().push((pid, starttime));
+        }
+    }
+    let Some(root_starttime) = root_starttime else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::from([root]);
+    let mut bfs = vec![(root, root_starttime)];
+    let mut i = 0;
+    while i < bfs.len() {
+        let (pid, _) = bfs[i];
+        i += 1;
+        for &(kid, starttime) in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
+            if seen.insert(kid) {
+                bfs.push((kid, starttime));
+            }
+        }
+    }
+    bfs
+}
+
+/// Every process of one budgeted run seen so far, keyed by pid with its
+/// `starttime`.
+///
+/// The run is deliberately *not* moved into its own process group: `lake` /
+/// `lean` must keep receiving the harness's terminal and group signals (Ctrl-C,
+/// a scheduler's `kill -- -pgid`, `anneal-lean-run`'s session kill), otherwise
+/// interrupting the harness would leave an unsupervised runaway `lean` growing
+/// without bound. Instead, a descendant stays tracked after its intermediate
+/// parent exits and it is reparented, and the `starttime` check makes a
+/// recycled pid unrecognizable, so measuring and killing never touch an
+/// unrelated process.
+struct TrackedProcessTree {
+    root: u32,
+    /// `pid -> (starttime, discovery_seq)` so kills run newest-first by
+    /// `(starttime, discovery_seq)` rather than numerical PID (which wraps
+    /// past `pid_max`).
+    seen: BTreeMap<u32, (u64, u64)>,
+    next_seq: u64,
+}
+
+impl TrackedProcessTree {
+    fn new(root: u32) -> Self {
+        Self {
+            root,
+            seen: BTreeMap::new(),
+            next_seq: 0,
+        }
+    }
+
+    fn record_process(&mut self, pid: u32, starttime: u64) {
+        if let Some((prev_start, _)) = self.seen.get(&pid)
+            && *prev_start == starttime
+        {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.seen.insert(pid, (starttime, seq));
+    }
+
+    /// Drops tracked processes that exited (or whose pid now names another
+    /// process) and returns the live tracked pids. With `rescan`, first adds the
+    /// current `ppid` tree of `root` in BFS parent-before-child order; only
+    /// valid while `root` is un-reaped (after reaping, its pid may name an
+    /// unrelated process).
+    fn live_pids(&mut self, rescan: bool) -> Vec<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            if rescan {
+                for (pid, starttime) in process_tree_snapshot(self.root) {
+                    self.record_process(pid, starttime);
+                }
+            }
+            self.seen
+                .retain(|&pid, &mut (starttime, _)| proc_starttime(pid) == Some(starttime));
+            self.seen.keys().copied().collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = rescan;
+            Vec::new()
+        }
+    }
+
+    fn tracked_descendant_order_snapshot(&self) -> Vec<u32> {
+        let root = self.root;
+        let mut entries: Vec<(u64, u64, u32)> = self
+            .seen
+            .iter()
+            .filter_map(|(&pid, &(starttime, seq))| {
+                (pid != root).then_some((starttime, seq, pid))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.cmp(a));
+        entries.into_iter().map(|(_, _, pid)| pid).collect()
+    }
+
+    /// Live non-root tracked pids ordered newest-first by `(starttime, discovery_seq)`
+    /// so leaf descendants (`lean`) always die before intermediate parents (`lake`),
+    /// even when Linux wraps PIDs past `pid_max`.
+    fn descendant_kill_order(&mut self, rescan: bool) -> Vec<u32> {
+        let _ = self.live_pids(rescan);
+        self.tracked_descendant_order_snapshot()
+    }
+
+    /// Total resident set (KiB, `VmRSS`) of the live tracked processes, or
+    /// `None` where `/proc` is unavailable (the budget is then not enforced).
+    fn rss_kib(&mut self) -> Option<u64> {
+        let mut total: Option<u64> = None;
+        for pid in self.live_pids(true) {
+            let rss = fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("VmRSS:"))
+                        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+                });
+            if let Some(rss) = rss {
+                total = Some(total.unwrap_or(0).saturating_add(rss));
+            }
+        }
+        total
+    }
+
+    /// SIGKILLs every live tracked process other than `root` (newest processes
+    /// first by `(starttime, discovery_seq)`, so `lean` dies before `lake` can
+    /// react even across PID wraparound). Pass `rescan = false` once `root` has
+    /// been reaped.
+    fn kill_descendants(&mut self, rescan: bool) {
+        #[cfg(target_os = "linux")]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            const SIGKILL: i32 = 9;
+            for pid in self.descendant_kill_order(rescan) {
+                if let Ok(pid) = i32::try_from(pid)
+                    && pid > 0
+                {
+                    // SAFETY: `kill(2)` takes plain integers and has no
+                    // memory-safety preconditions; `descendant_kill_order` just
+                    // re-verified that `pid` still names the tracked process
+                    // (same `starttime`), and an already-exited pid fails with ESRCH.
+                    unsafe {
+                        kill(pid, SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    /// SIGKILLs the descendants and then `child` itself (the root, via
+    /// [`std::process::Child::kill`], which cannot hit a recycled pid because
+    /// `child` has not been reaped).
+    fn kill_all(&mut self, child: &mut std::process::Child) {
+        self.kill_descendants(true);
+        let _ = child.kill();
+    }
+}
+
+/// Result of [`run_lean_with_rss_budget`].
+struct BudgetedOutput {
+    output: std::process::Output,
+    /// Process-tree RSS (KiB) observed when the budget was exceeded and the
+    /// tree was killed (never set if the child had already exited cleanly).
+    budget_exceeded_kib: Option<u64>,
+}
+
+/// Runs `cmd` to completion capturing stdout / stderr like
+/// [`Command::output`], but SIGKILLs its whole process tree as soon as the
+/// tree's resident set exceeds `budget_kib` (sampled every
+/// [`LEAN_RSS_POLL_INTERVAL`]), so a runaway Lean kernel reduction is contained
+/// to its own run instead of OOM-killing the enclosing cgroup. The run stays in
+/// the harness's process group (see [`TrackedProcessTree`]).
+fn run_lean_with_rss_budget(
+    cmd: &mut Command,
+    budget_kib: Option<u64>,
+) -> std::io::Result<BudgetedOutput> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout_reader = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr_reader = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let mut tree = TrackedProcessTree::new(child.id());
+    let mut budget_exceeded_kib = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                tree.kill_all(&mut child);
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+        if let Some(budget) = budget_kib
+            && let Some(rss) = tree.rss_kib()
+            && rss > budget
+        {
+            // Re-check `try_wait` before killing so a process that exited while
+            // `/proc` was scanned keeps its genuine exit status (`exit 0` or a
+            // normal `exit 1` kernel rejection) rather than being misattributed
+            // to the RSS watchdog.
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(err) => {
+                    tree.kill_all(&mut child);
+                    let _ = child.wait();
+                    return Err(err);
+                }
+            }
+            tree.kill_all(&mut child);
+            let waited = child.wait()?;
+            if !waited.success() {
+                budget_exceeded_kib = Some(rss);
+            }
+            break waited;
+        }
+        std::thread::sleep(LEAN_RSS_POLL_INTERVAL);
+    };
+    if budget_kib.is_some() {
+        // `lake env lean` waits for `lean`, but never leave a tracked
+        // descendant running after the root exits: it would be unsupervised
+        // and would hold the pipes open, blocking the readers below. `child` is
+        // reaped now, so only already-tracked processes are considered.
+        tree.kill_descendants(false);
+    }
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(BudgetedOutput {
+        output: std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        budget_exceeded_kib,
+    })
+}
+
+/// Diagnostic appended to a run killed by [`run_lean_with_rss_budget`]. It is
+/// an `error:` line (so every diagnostics filter surfaces it) containing
+/// `out of memory`, so the run classifies as resource exhaustion even if `lake`
+/// reported an exit code before the kill reached it.
+fn rss_budget_kill_note(budget_kib: u64, observed_kib: u64) -> String {
+    format!(
+        "error: miri-difftest killed `lake env lean` (out of memory guard): process-tree \
+         resident set {} MiB exceeded the {} MiB budget (Lean's -M does not bound kernel \
+         reduction memory; override with {MIRI_LEAN_RSS_BUDGET_ENV})",
+        observed_kib / 1024,
+        budget_kib / 1024
+    )
+}
+
+/// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB <rel_oracle_path>` in `dot_anneal`
+/// with `LEAN_NUM_THREADS=1` (so concurrent confirm chunk workers never
+/// multiply threads) under a hard `rss_budget_kib` resident-set budget.
+fn run_lean_confirm_file(
     lake_bin: &Path,
     dot_anneal: &Path,
-) -> Result<std::process::Output, String> {
-    Command::new(lake_bin)
-        .current_dir(dot_anneal)
+    rel_oracle_path: &str,
+    rss_budget_kib: u64,
+) -> Result<LeanConfirmRun, String> {
+    let mut cmd = Command::new(lake_bin);
+    cmd.current_dir(dot_anneal)
+        .env("LEAN_NUM_THREADS", "1")
         .arg("env")
         .arg("lean")
         .arg("-M")
         .arg(CONFIRM_LEAN_MEMORY_MB)
-        .arg("oracle/MiriOracleConfirm.lean")
-        .output()
-        .map_err(|err| {
-            format!(
-                "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
-                 oracle/MiriOracleConfirm.lean': {err}",
-                lake_bin.display()
-            )
-        })
+        .arg(rel_oracle_path);
+    let run = run_lean_with_rss_budget(&mut cmd, Some(rss_budget_kib)).map_err(|err| {
+        format!(
+            "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
+             {rel_oracle_path}': {err}",
+            lake_bin.display()
+        )
+    })?;
+    Ok(LeanConfirmRun::from_budgeted_output(&run, rss_budget_kib))
+}
+
+fn sanitize_lean_file_stem(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("item");
+    }
+    if out != raw {
+        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+        for &b in raw.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        out.push_str(&format!("_{h:08x}"));
+    }
+    out
+}
+
+fn clean_oracle_files_with_prefixes(oracle_dir: &Path, prefixes: &[&str]) {
+    let Ok(entries) = fs::read_dir(oracle_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if prefixes.iter().any(|p| name.starts_with(p)) && path.is_file() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Outcome of [`run_isolated_miri_stage`].
+#[derive(Debug)]
+struct IsolatedMiriStage<X> {
+    /// Per-item results for every item whose chunk or per-candidate fallback succeeded.
+    results: BTreeMap<String, X>,
+    /// Per-item isolated diagnostic for every item that failed (or was skipped after
+    /// [`MIRI_FALLBACK_CIRCUIT_BREAKER`] consecutive fallback failures with 0 successes).
+    failed_reasons: BTreeMap<String, String>,
+    /// Diagnostics emitted across failed chunks and fallback attempts.
+    errors: Vec<String>,
+}
+
+/// Execution kind passed to `run_chunk` in [`run_isolated_miri_stage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiriStageRunKind {
+    /// Initial chunk run (`{stage_label}_{chunk_idx:03}`) inside a wave of
+    /// `wave_jobs` concurrent workers.
+    Chunk { wave_jobs: usize },
+    /// Single-candidate fallback run (`{stage_label}Fallback_<stem>`).
+    Fallback,
+    /// One-shot multi-candidate remainder retry after the circuit breaker trips
+    /// (`{stage_label}Remainder_{chunk_idx:03}`).
+    Remainder,
+}
+
+impl MiriStageRunKind {
+    /// Number of concurrent workers sharing cgroup headroom during this run.
+    fn active_workers(self) -> usize {
+        match self {
+            Self::Chunk { wave_jobs } => wave_jobs.max(1),
+            Self::Fallback | Self::Remainder => 1,
+        }
+    }
+}
+
+fn miri_probe_module_file_name(
+    chunk_idx: usize,
+    run_kind: MiriStageRunKind,
+    chunk: &[(OracleItemSpec, String)],
+) -> String {
+    match run_kind {
+        MiriStageRunKind::Chunk { .. } => format!("MiriOracleProbe_{chunk_idx:03}.lean"),
+        MiriStageRunKind::Remainder => format!("MiriOracleProbeRemainder_{chunk_idx:03}.lean"),
+        MiriStageRunKind::Fallback => {
+            let stem = chunk
+                .first()
+                .map(|(s, _)| sanitize_lean_file_stem(&s.name))
+                .unwrap_or_else(|| format!("chunk_{chunk_idx:03}"));
+            format!("MiriOracleProbeFallback_{stem}.lean")
+        }
+    }
+}
+
+/// Runs one chunked `miri-difftest` Lean stage (`Mir.*` build or `MiriOracleProbe`
+/// evaluation) with per-candidate fallback isolation and a circuit breaker.
+///
+/// `items` are split into chunks of at most `chunk_size`, run by
+/// `run_chunk(chunk_idx, run_kind, label, chunk)` in waves of at most `jobs`
+/// concurrent workers. A chunk only succeeds if it yields a result for every
+/// item; a failed, incomplete, or panicking chunk is re-run one item at a time.
+/// After [`MIRI_FALLBACK_CIRCUIT_BREAKER`] fallback failures with no fallback
+/// success, the rest of that chunk is retried once as a single group
+/// (`{stage_label}Remainder_{chunk_idx:03}`) so that a few broken candidates
+/// leading a chunk cannot write off its healthy remainder; if that retry also
+/// fails, the failure is treated as systematic and every remaining item fails
+/// without further Lean runs.
+fn run_isolated_miri_stage<C, X, K, F>(
+    stage_label: &str,
+    items: &[C],
+    chunk_size: usize,
+    jobs: usize,
+    item_key: K,
+    run_chunk: F,
+) -> IsolatedMiriStage<X>
+where
+    C: Clone + Sync,
+    X: Send,
+    K: Fn(&C) -> &str,
+    F: Fn(usize, MiriStageRunKind, &str, &[C]) -> Result<BTreeMap<String, X>, String> + Sync,
+{
+    let chunk_size = chunk_size.max(1);
+    let jobs = jobs.max(1);
+    let mut results: BTreeMap<String, X> = BTreeMap::new();
+    let mut failed_reasons: BTreeMap<String, String> = BTreeMap::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut failed_chunks: Vec<(usize, String, &[C])> = Vec::new();
+
+    let accept = |results: &mut BTreeMap<String, X>,
+                  slice: &[C],
+                  res: Result<BTreeMap<String, X>, String>,
+                  label: &str|
+     -> Result<(), String> {
+        let mut map = res.map_err(|e| format!("{label}: {}", truncate_lean_diag(&e)))?;
+        if let Some(missing) = slice.iter().find(|&c| !map.contains_key(item_key(c))) {
+            return Err(format!(
+                "{label}: Lean stage produced no result for `{}`",
+                item_key(missing)
+            ));
+        }
+        for c in slice {
+            if let Some(x) = map.remove(item_key(c)) {
+                results.insert(item_key(c).to_string(), x);
+            }
+        }
+        Ok(())
+    };
+
+    let chunks: Vec<&[C]> = items.chunks(chunk_size).collect();
+    for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
+        let wave_jobs = wave.len().max(1);
+        let wave_res: Vec<(usize, String, Result<BTreeMap<String, X>, String>)> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &chunk)| {
+                        let chunk_idx = wave_idx * jobs + i;
+                        let label = format!("{stage_label}_{chunk_idx:03}");
+                        let run_chunk = &run_chunk;
+                        let worker_label = label.clone();
+                        let handle = s.spawn(move || {
+                            run_chunk(
+                                chunk_idx,
+                                MiriStageRunKind::Chunk { wave_jobs },
+                                &worker_label,
+                                chunk,
+                            )
+                        });
+                        (chunk_idx, label, handle)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(chunk_idx, label, h)| {
+                        let res = h
+                            .join()
+                            .unwrap_or_else(|_| Err("Lean chunk worker panicked".to_string()));
+                        (chunk_idx, label, res)
+                    })
+                    .collect()
+            });
+        for (&chunk, (chunk_idx, label, res)) in wave.iter().zip(wave_res) {
+            if let Err(e) = accept(&mut results, chunk, res, &label) {
+                errors.push(e.clone());
+                failed_chunks.push((chunk_idx, e, chunk));
+            }
+        }
+    }
+
+    let mut fallback_successes = 0usize;
+    let mut fallback_failures = 0usize;
+    let mut skipped_fallbacks = 0usize;
+    let mut first_fallback_err: Option<String> = None;
+    // Set once a breaker remainder retry fails while no fallback has ever
+    // succeeded: the failure is then systematic, so later chunks skip straight
+    // to the breaker diagnosis instead of paying one more Lean run each.
+    let mut remainder_retry_failed = false;
+
+    for (chunk_idx, chunk_err, chunk) in failed_chunks {
+        if chunk.len() == 1 {
+            let key = item_key(&chunk[0]).to_string();
+            if fallback_successes == 0 {
+                fallback_failures += 1;
+                if first_fallback_err.is_none() {
+                    first_fallback_err = Some(chunk_err.clone());
+                }
+            }
+            failed_reasons.insert(key, chunk_err);
+            continue;
+        }
+        let mut deferred: Vec<C> = Vec::new();
+        for item in chunk {
+            let key = item_key(item).to_string();
+            if results.contains_key(&key) || failed_reasons.contains_key(&key) {
+                continue;
+            }
+            if fallback_successes == 0 && fallback_failures >= MIRI_FALLBACK_CIRCUIT_BREAKER {
+                deferred.push(item.clone());
+                continue;
+            }
+            let label = format!("{stage_label}Fallback_{}", sanitize_lean_file_stem(&key));
+            let single = std::slice::from_ref(item);
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_chunk(chunk_idx, MiriStageRunKind::Fallback, &label, single)
+            }))
+            .unwrap_or_else(|_| Err("Lean fallback worker panicked".to_string()));
+            match accept(&mut results, single, res, &label) {
+                Ok(()) => fallback_successes += 1,
+                Err(e) => {
+                    fallback_failures += 1;
+                    if first_fallback_err.is_none() {
+                        first_fallback_err = Some(e.clone());
+                    }
+                    errors.push(e.clone());
+                    failed_reasons.insert(key, e);
+                }
+            }
+        }
+        if deferred.is_empty() {
+            continue;
+        }
+        // The breaker tripped part-way through this chunk. Several genuinely
+        // broken candidates can lead a chunk, so retry the unresolved
+        // remainder once as a group before writing it off as a systematic
+        // failure (bounded to one extra Lean run per stage while no fallback
+        // has succeeded).
+        let mut remainder_note = String::new();
+        if !remainder_retry_failed {
+            let label = format!("{stage_label}Remainder_{chunk_idx:03}");
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_chunk(chunk_idx, MiriStageRunKind::Remainder, &label, &deferred)
+            }))
+            .unwrap_or_else(|_| Err("Lean remainder worker panicked".to_string()));
+            match accept(&mut results, &deferred, res, &label) {
+                Ok(()) => {
+                    fallback_successes += 1;
+                    continue;
+                }
+                Err(e) => {
+                    remainder_retry_failed = true;
+                    errors.push(e);
+                    remainder_note = format!("; remainder retry `{label}` also failed");
+                }
+            }
+        }
+        let root_cause = first_fallback_err.as_deref().unwrap_or(chunk_err.as_str());
+        let root_lines: Vec<&str> = root_cause.lines().collect();
+        let root_summary = if root_lines.len() > 12 {
+            let head_slice = &root_lines[..12];
+            let extra_highlights: Vec<&str> = root_lines[12..]
+                .iter()
+                .copied()
+                .filter(|l| is_lean_diag_highlight_line(l) && !head_slice.contains(l))
+                .take(6)
+                .collect();
+            if extra_highlights.is_empty() {
+                format!(
+                    "{}\n... (full diagnostic in the {stage_label} stage errors)",
+                    head_slice.join("\n")
+                )
+            } else {
+                format!(
+                    "{}\n{}\n... (full diagnostic in the {stage_label} stage errors)",
+                    head_slice.join("\n"),
+                    extra_highlights.join("\n")
+                )
+            }
+        } else {
+            root_cause.to_string()
+        };
+        skipped_fallbacks += deferred.len();
+        for item in &deferred {
+            failed_reasons.insert(
+                item_key(item).to_string(),
+                format!(
+                    "{stage_label}: per-candidate fallback skipped after \
+                     {MIRI_FALLBACK_CIRCUIT_BREAKER} consecutive fallback failures \
+                     (systematic Lean failure{remainder_note}); first failure: {root_summary}"
+                ),
+            );
+        }
+    }
+    if skipped_fallbacks > 0 {
+        errors.push(format!(
+            "{stage_label}: skipped {skipped_fallbacks} per-candidate fallback run(s) after \
+             {MIRI_FALLBACK_CIRCUIT_BREAKER} consecutive fallback failures (systematic Lean failure)"
+        ));
+    }
+
+    for item in items {
+        let key = item_key(item);
+        if !results.contains_key(key) && !failed_reasons.contains_key(key) {
+            failed_reasons.insert(
+                key.to_string(),
+                format!("{stage_label}: missing result for `{key}`"),
+            );
+        }
+    }
+
+    IsolatedMiriStage {
+        results,
+        failed_reasons,
+        errors,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MiriProbeItemStatus {
+    Present {
+        outcome: AnnealOutcome,
+        panic_frame: Option<String>,
+        panic_message: Option<Vec<u8>>,
+    },
+    MissingProbeLine,
+}
+
+fn parse_miri_probe_chunk_stdout(
+    chunk: &[(OracleItemSpec, String)],
+    stdout: &str,
+) -> Result<BTreeMap<String, MiriProbeItemStatus>, String> {
+    let mut parsed_outcomes = parse_anneal_probe_output(stdout)?;
+    let mut parsed_frames = parse_anneal_panic_frames(stdout)?;
+    let mut parsed_messages = parse_anneal_panic_messages(stdout)?;
+    let mut out = BTreeMap::new();
+    for (item, _) in chunk {
+        if let Some(outcome) = parsed_outcomes.remove(&item.name) {
+            out.insert(
+                item.name.clone(),
+                MiriProbeItemStatus::Present {
+                    outcome,
+                    panic_frame: parsed_frames.remove(&item.name),
+                    panic_message: parsed_messages.remove(&item.name),
+                },
+            );
+        } else {
+            out.insert(item.name.clone(), MiriProbeItemStatus::MissingProbeLine);
+        }
+    }
+    Ok(out)
+}
+
+fn aggregate_miri_probe_stage(
+    surviving_items: &[(OracleItemSpec, String)],
+    chunk_size: usize,
+    lean_jobs: usize,
+    eval_chunk: impl Fn(usize, MiriStageRunKind, &str, &[(OracleItemSpec, String)]) -> Result<String, String>
+    + Sync,
+    anneal_outcomes: &mut BTreeMap<String, AnnealOutcome>,
+    anneal_panic_frames: &mut BTreeMap<String, String>,
+    anneal_panic_messages: &mut BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let stage = run_isolated_miri_stage(
+        "MiriOracleProbe",
+        surviving_items,
+        chunk_size,
+        lean_jobs,
+        |(spec, _): &(OracleItemSpec, String)| spec.name.as_str(),
+        |chunk_idx, run_kind, label, chunk| {
+            let stdout = eval_chunk(chunk_idx, run_kind, label, chunk)?;
+            parse_miri_probe_chunk_stdout(chunk, &stdout)
+        },
+    );
+    for (item, _) in surviving_items {
+        if let Some(status) = stage.results.get(&item.name) {
+            match status {
+                MiriProbeItemStatus::Present {
+                    outcome,
+                    panic_frame,
+                    panic_message,
+                } => {
+                    anneal_outcomes.insert(item.name.clone(), outcome.clone());
+                    if let Some(frame) = panic_frame {
+                        anneal_panic_frames.insert(item.name.clone(), frame.clone());
+                    }
+                    if let Some(msg) = panic_message {
+                        anneal_panic_messages.insert(item.name.clone(), msg.clone());
+                    }
+                }
+                MiriProbeItemStatus::MissingProbeLine => {
+                    anneal_outcomes.insert(
+                        item.name.clone(),
+                        AnnealOutcome::CaptureOrLeanError(format!(
+                            "Lean probe output omitted ANNEAL_PROBE line for '{}'",
+                            item.name
+                        )),
+                    );
+                }
+            }
+        } else if let Some(err) = stage.failed_reasons.get(&item.name) {
+            anneal_outcomes.insert(item.name.clone(), AnnealOutcome::CaptureOrLeanError(err.clone()));
+        }
+    }
+    stage.errors
+}
+
+const LEAN_RESOURCE_MARKERS: [&str; 8] = [
+    "out of memory",
+    // Lean 4's `-M` flag reports `(kernel) excessive memory consumption detected`
+    // or `excessive memory consumption detected at '...'` rather than `out of memory`.
+    "excessive memory consumption",
+    "memory allocation failed",
+    "(deterministic) timeout",
+    "maximum number of heartbeats",
+    "maximum recursion depth",
+    "deep recursion",
+    "stack overflow",
+];
+
+const LEAN_KERNEL_REJECTION_MARKERS: [&str; 14] = [
+    // Lean v4.34.1 tactic `rfl` prints `Tactic `rfl` failed: The left-hand side ...
+    // is not definitionally equal to the right-hand side ...`; older Lean 4 printed
+    // `The rfl tactic failed`, and term-mode `rfl` prints `Not a definitional equality`.
+    "tactic `rfl` failed",
+    "the rfl tactic failed",
+    "not definitionally equal",
+    "not a definitional equality",
+    "type mismatch",
+    "application type mismatch",
+    "declaration type mismatch",
+    "(kernel) constant",
+    "unknown identifier",
+    "unknown constant",
+    "unknown module prefix",
+    "unknown namespace",
+    "failed to synthesize",
+    "unsolved goals",
+];
+
+fn is_lean_message_header(line: &str, kind: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.trim_start().starts_with(&format!("{kind}:")) || lower.contains(&format!(": {kind}:"))
+}
+
+fn is_lean_runtime_crash_boundary(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('✖') {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("lean panic:")
+        || lower.starts_with("lean assertion violation")
+        || lower.starts_with("panic at ")
+        || lower.starts_with("panicked at ")
+        || lower.starts_with("thread '")
+        || lower.starts_with("fatal runtime error:")
+}
+
+fn collect_stream_lean_error_blocks(stream: &str, blocks: &mut Vec<String>) {
+    let mut current: Option<String> = None;
+    for line in stream.lines() {
+        let starts_error = is_lean_message_header(line, "error");
+        if starts_error
+            || is_lean_message_header(line, "warning")
+            || is_lean_message_header(line, "info")
+            || is_lean_runtime_crash_boundary(line)
+        {
+            blocks.extend(current.take());
+            if starts_error {
+                current = Some(line.to_string());
+            }
+        } else if let Some(block) = current.as_mut() {
+            block.push('\n');
+            block.push_str(line);
+        }
+    }
+    blocks.extend(current);
+}
+
+/// The `error:` message blocks of a Lake / Lean run: each block starts at an
+/// `error:` header line (`<file>:<line>:<col>: error: ...` or a bare `error:`)
+/// and runs until the next `error:` / `warning:` / `info:` / runtime-crash
+/// header or the end of that stream (`stdout` and `stderr` are parsed
+/// separately so a headerless `stderr` runtime OOM line such as
+/// `LEAN PANIC: out of memory` never merges into a preceding `stdout` `error:`
+/// block).
+fn lean_error_blocks(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    collect_stream_lean_error_blocks(stdout, &mut blocks);
+    collect_stream_lean_error_blocks(stderr, &mut blocks);
+    blocks
+}
+
+/// Whether a failed run reported a kernel or elaboration rejection (`The rfl
+/// tactic failed`, `type mismatch`, `unknown identifier`, ...) in an error
+/// block that no resource marker explains (a typeclass search that ran out of
+/// heartbeats reports `failed to synthesize` together with `(deterministic)
+/// timeout` in one block, which is exhaustion, not rejection).
+///
+/// Such a rejection fails Stage 2 closed even when the run was later killed
+/// (by the RSS watchdog or a signal) or also exhausted a resource elsewhere:
+/// the kernel refused what the compiled probe claimed, which must never be
+/// downgraded to `kernel_confirmed = false`.
+fn lean_output_has_unexplained_kernel_rejection(stdout: &str, stderr: &str) -> bool {
+    lean_error_blocks(stdout, stderr).iter().any(|block| {
+        let lower = block.to_ascii_lowercase();
+        LEAN_KERNEL_REJECTION_MARKERS.iter().any(|m| lower.contains(m))
+            && !LEAN_RESOURCE_MARKERS.iter().any(|m| lower.contains(m))
+    })
 }
 
 /// Whether a failed Lean kernel confirmation run ran out of a resource
@@ -3157,16 +4526,229 @@ fn run_lean_confirm_module(
 /// compiled `#eval` probe and the kernel, or an elaboration or import error)
 /// is a harness inconsistency that must abort the run.
 fn lean_confirm_failure_is_resource_exhaustion(signal_terminated: bool, output: &str) -> bool {
-    const RESOURCE_MARKERS: [&str; 6] = [
-        "out of memory",
-        "(deterministic) timeout",
-        "maximum number of heartbeats",
-        "maximum recursion depth",
-        "deep recursion",
-        "stack overflow",
-    ];
     let lower = output.to_ascii_lowercase();
-    signal_terminated || RESOURCE_MARKERS.iter().any(|m| lower.contains(m))
+    signal_terminated || LEAN_RESOURCE_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// One `(spec, module suffix, Anneal outcome)` entry to kernel-confirm.
+type MiriConfirmEntry = (OracleItemSpec, String, AnnealOutcome);
+
+/// Captured result of one `lake env lean` kernel confirmation run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeanConfirmRun {
+    success: bool,
+    /// The process was terminated by a signal (such as the cgroup OOM killer).
+    signal_terminated: bool,
+    /// Rendered exit status (for diagnostics).
+    status: String,
+    stdout: String,
+    stderr: String,
+}
+
+impl LeanConfirmRun {
+    /// Converts a [`run_lean_with_rss_budget`] result. A clean exit stays a
+    /// success (the watchdog never records a kill for one). A run killed for
+    /// exceeding `budget_kib` is reported as signal-terminated with an
+    /// `out of memory` note; whether that may downgrade the entry is decided
+    /// by [`run_chunked_miri_confirm_stage`], where an unexplained kernel
+    /// rejection in the output still fails closed
+    /// ([`lean_output_has_unexplained_kernel_rejection`]).
+    fn from_budgeted_output(run: &BudgetedOutput, budget_kib: u64) -> Self {
+        let out = &run.output;
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let killed_by_budget = run.budget_exceeded_kib.filter(|_| !out.status.success());
+        if let Some(observed_kib) = killed_by_budget {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&rss_budget_kill_note(budget_kib, observed_kib));
+        }
+        Self {
+            success: out.status.success(),
+            signal_terminated: out.status.code().is_none() || killed_by_budget.is_some(),
+            status: out.status.to_string(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr,
+        }
+    }
+}
+
+/// Outcome of [`run_chunked_miri_confirm_stage`].
+#[derive(Debug)]
+struct ChunkedMiriConfirm {
+    /// Entries whose theorems the kernel accepted (in chunk order).
+    confirmed: Vec<MiriConfirmEntry>,
+    /// Exact slices (chunk or single-entry fallback) accepted by the Lean kernel,
+    /// so `MiriOracleConfirm.lean` preserves each slice's kernel-checked
+    /// `linkedCallees` environment without cross-chunk contamination.
+    confirmed_groups: Vec<Vec<MiriConfirmEntry>>,
+    /// Entries whose confirmation exhausted a resource
+    /// ([`lean_confirm_failure_is_resource_exhaustion`]), keyed by name, with
+    /// the diagnostic explaining the downgrade to `kernel_confirmed = false`.
+    unconfirmed: BTreeMap<String, String>,
+}
+
+/// One-line reason for a resource-exhausted confirmation: the run's exit
+/// status plus its last highlighted diagnostics (`error:` / budget-kill lines).
+fn resource_exhaustion_reason(module_name: &str, run: &LeanConfirmRun) -> String {
+    let highlights = extract_lean_error_lines(&run.stdout, &run.stderr, 3);
+    let detail = if highlights.is_empty() {
+        run.stderr
+            .lines()
+            .chain(run.stdout.lines())
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("(no diagnostics)")
+            .to_string()
+    } else {
+        highlights.join(" | ")
+    };
+    format!("oracle/{module_name} ({}): {detail}", run.status)
+}
+
+/// Stage 2: kernel-confirms `to_confirm` in `MiriOracleConfirm_{chunk_idx:03}.lean`
+/// modules of at most `chunk_size` entries, running at most `jobs` chunk
+/// modules concurrently (each `lake env lean` worker is bounded by
+/// `LEAN_NUM_THREADS=1` and `-M CONFIRM_LEAN_MEMORY_MB` in
+/// [`run_lean_confirm_file`]), so no single Lean process ever has to hold an
+/// unbounded batch of theorems.
+///
+/// A failing chunk is re-confirmed one entry at a time
+/// (`MiriOracleConfirmFallback_<item>.lean`). An entry whose confirmation
+/// exhausts a resource lands in [`ChunkedMiriConfirm::unconfirmed`]; any other
+/// failure (the kernel rejecting a theorem the compiled probe produced, or a
+/// module that does not elaborate) is a harness inconsistency and fails the
+/// stage closed with both `stdout` and `stderr` diagnostics. A rejection wins
+/// over exhaustion: an entry whose output contains an unexplained kernel
+/// rejection fails closed even if the run was then killed or ran out of
+/// heartbeats ([`lean_output_has_unexplained_kernel_rejection`]).
+///
+/// `write_module(file_name, entries)` renders a module and
+/// `run_module(file_name, active_workers)` checks it, where `active_workers`
+/// is the exact number of concurrent confirm workers sharing cgroup headroom
+/// (`wave.len()` for a chunk wave, `1` for a per-entry fallback).
+fn run_chunked_miri_confirm_stage<W, R>(
+    to_confirm: &[MiriConfirmEntry],
+    chunk_size: usize,
+    jobs: usize,
+    write_module: W,
+    run_module: R,
+) -> Result<ChunkedMiriConfirm, String>
+where
+    W: Fn(&str, &[MiriConfirmEntry]) -> Result<(), String>,
+    R: Fn(&str, usize) -> Result<LeanConfirmRun, String> + Sync,
+{
+    let chunk_size = chunk_size.max(1);
+    let jobs = jobs.max(1);
+    let chunks: Vec<&[MiriConfirmEntry]> = to_confirm.chunks(chunk_size).collect();
+    let mut confirmed: Vec<MiriConfirmEntry> = Vec::with_capacity(to_confirm.len());
+    let mut confirmed_groups: Vec<Vec<MiriConfirmEntry>> = Vec::with_capacity(chunks.len());
+    let mut unconfirmed: BTreeMap<String, String> = BTreeMap::new();
+
+    for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
+        let mut prepared: Vec<(String, &[MiriConfirmEntry])> = Vec::with_capacity(wave.len());
+        for (i, &chunk) in wave.iter().enumerate() {
+            let file_name = format!("MiriOracleConfirm_{:03}.lean", wave_idx * jobs + i);
+            write_module(&file_name, chunk)?;
+            prepared.push((file_name, chunk));
+        }
+        let wave_jobs = wave.len().max(1);
+        let outputs: Vec<Result<LeanConfirmRun, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = prepared
+                .iter()
+                .map(|(file_name, _)| {
+                    let run_module = &run_module;
+                    // Pass the actual wave concurrency (`wave_jobs`, e.g. `1` for a
+                    // trailing chunk or `3` for a 3-chunk wave on a 4-worker machine)
+                    // so the RSS budget is never over-divided by idle worker slots.
+                    s.spawn(move || run_module(file_name, wave_jobs))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("Lean confirm chunk worker panicked".to_string()))
+                })
+                .collect()
+        });
+
+        for ((file_name, chunk), out) in prepared.into_iter().zip(outputs) {
+            let out = out?;
+            if out.success {
+                confirmed.extend_from_slice(chunk);
+                confirmed_groups.push(chunk.to_vec());
+                continue;
+            }
+            let single_runs: Vec<(&MiriConfirmEntry, String, LeanConfirmRun)> =
+                if chunk.len() == 1 && wave_jobs == 1 {
+                    vec![(&chunk[0], file_name, out)]
+                } else {
+                    let mut runs = Vec::with_capacity(chunk.len());
+                    for entry in chunk {
+                        let fb_name = format!(
+                            "MiriOracleConfirmFallback_{}.lean",
+                            sanitize_lean_file_stem(&entry.0.name)
+                        );
+                        write_module(&fb_name, std::slice::from_ref(entry))?;
+                        let run = run_module(&fb_name, 1)?;
+                        runs.push((entry, fb_name, run));
+                    }
+                    runs
+                };
+            for (entry, module_name, run) in single_runs {
+                if run.success {
+                    confirmed.push(entry.clone());
+                    confirmed_groups.push(vec![entry.clone()]);
+                } else if !lean_output_has_unexplained_kernel_rejection(&run.stdout, &run.stderr)
+                    && lean_confirm_failure_is_resource_exhaustion(
+                        run.signal_terminated,
+                        &format!("{}\n{}", run.stdout, run.stderr),
+                    )
+                {
+                    unconfirmed.insert(
+                        entry.0.name.clone(),
+                        resource_exhaustion_reason(&module_name, &run),
+                    );
+                } else {
+                    return Err(format_lean_command_failure(
+                        &format!(
+                            "Lean kernel confirmation rejected `{}` in oracle/{module_name} ({})",
+                            entry.0.name, run.status
+                        ),
+                        &run.stdout,
+                        &run.stderr,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(ChunkedMiriConfirm {
+        confirmed,
+        confirmed_groups,
+        unconfirmed,
+    })
+}
+
+/// Cleans Stage 2 `MiriOracleConfirm_*` / `MiriOracleConfirmFallback_*` scratch
+/// modules on `Ok`, while preserving them on `Err` so the
+/// `(kernel confirmation modules in <oracle_dir>)` diagnostic never points at
+/// files that were deleted right before returning the error.
+fn finalize_stage2_confirm_scratch(
+    oracle_dir: &Path,
+    stage: Result<ChunkedMiriConfirm, String>,
+) -> Result<ChunkedMiriConfirm, String> {
+    let ok = stage.map_err(|e| {
+        format!(
+            "{e}\n(kernel confirmation modules in {})",
+            oracle_dir.display()
+        )
+    })?;
+    clean_oracle_files_with_prefixes(
+        oracle_dir,
+        &["MiriOracleConfirm_", "MiriOracleConfirmFallback_"],
+    );
+    Ok(ok)
 }
 
 fn run_linked_difftest_oracle_pipeline(
@@ -3314,63 +4896,167 @@ fn run_linked_difftest_oracle_pipeline(
     let mut anneal_panic_frames: BTreeMap<String, String> = BTreeMap::new();
     let mut anneal_panic_messages: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
+    clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe", "MiriOracleConfirm"]);
+
     if !present_items.is_empty() {
         let _lean_guard = acquire_live_lean_oracle_lock();
-        run_lake_build_with_bin(
-            &lake_bin,
-            &dot_anneal,
-            &["Mir", "Anneal.Rustc.V2026_06_01.SymbolicEval"],
-        )?;
+        let build_threads = resolve_miri_lake_build_threads();
+        let lean_jobs = resolve_miri_lean_jobs();
 
-        fs::create_dir_all(&oracle_dir)
-            .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
-        let probe_path = oracle_dir.join("MiriOracleProbe.lean");
-        let probe_src =
-            render_linked_anneal_probe_module(&crate_camel, &present_items, &helper_module_suffixes);
-        fs::write(&probe_path, &probe_src)
-            .map_err(|err| format!("failed to write {}: {}", probe_path.display(), err))?;
-
-        let probe_out = Command::new(&lake_bin)
-            .current_dir(&dot_anneal)
-            .arg("env")
-            .arg("lean")
-            .arg("oracle/MiriOracleProbe.lean")
-            .output()
-            .map_err(|err| {
-                format!(
-                    "failed to execute '{} env lean oracle/MiriOracleProbe.lean': {}",
-                    lake_bin.display(),
-                    err
-                )
-            })?;
-        if !probe_out.status.success() {
-            let stdout = String::from_utf8_lossy(&probe_out.stdout);
-            let stderr = String::from_utf8_lossy(&probe_out.stderr);
-            return Err(format!(
-                "Lean probe evaluation failed in {} ({}):\n{}\n{}",
-                dot_anneal.display(),
-                probe_out.status,
-                stdout,
-                stderr
-            ));
+        // Stage 0: Pre-build only shared base modules (`SymbolicEval`, optional
+        // `Mir.Common`, and helper `Mir.<suffix>` modules). Never pass the
+        // umbrella `"Mir"` target, which fans out across all 800+ corpus
+        // candidate modules simultaneously and triggers cgroup OOM kills.
+        // Every probe chunk imports every helper, so a Stage 0 failure is
+        // systematic and fails the run closed.
+        let stage0_groups = plan_miri_stage0_build_groups(
+            dot_anneal.join("generated/Mir/Common.lean").is_file(),
+            &helper_module_suffixes,
+        );
+        for (group_idx, group) in stage0_groups.iter().enumerate() {
+            let group_refs: Vec<&str> = group.iter().map(String::as_str).collect();
+            let threads = if group_idx == 0 {
+                build_threads.base
+            } else {
+                build_threads.mir_chunks
+            };
+            run_lake_build_with_bin_and_threads(&lake_bin, &dot_anneal, &group_refs, Some(threads))
+                .map_err(|e| {
+                    format!(
+                        "miri-difftest Stage 0 shared-base Lake build (group {group_idx} of {}, \
+                         LEAN_NUM_THREADS={threads}) failed: {e}",
+                        stage0_groups.len()
+                    )
+                })?;
         }
 
-        let stdout = String::from_utf8_lossy(&probe_out.stdout);
-        let mut parsed = parse_anneal_probe_output(&stdout)?;
-        anneal_panic_frames = parse_anneal_panic_frames(&stdout)?;
-        anneal_panic_messages = parse_anneal_panic_messages(&stdout)?;
-        for (item, _) in &present_items {
-            if let Some(outcome) = parsed.remove(&item.name) {
-                anneal_outcomes.insert(item.name.clone(), outcome);
-            } else {
+        // Stage 1a: Build corpus candidate `Mir.<cand_suffix>` targets in chunks
+        // of `MIRI_PROBE_CHUNK_SIZE` (sequentially across chunks so `.lake`
+        // metadata never contends, with `LEAN_NUM_THREADS` capped at `<= 4` by
+        // memory/cgroup headroom or set by `ANNEAL_MIRI_LEAN_JOBS`). A failing
+        // chunk isolates per-candidate with `MIRI_FALLBACK_CIRCUIT_BREAKER`.
+        let mir_build_stage = run_isolated_miri_stage(
+            "MiriMirBuild",
+            &present_items,
+            MIRI_PROBE_CHUNK_SIZE,
+            1,
+            |(spec, _): &(OracleItemSpec, String)| spec.name.as_str(),
+            |_chunk_idx, _is_fallback, _label, chunk| {
+                let targets = miri_candidate_build_targets(&crate_camel, chunk);
+                let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+                run_lake_build_with_bin_and_threads(
+                    &lake_bin,
+                    &dot_anneal,
+                    &target_refs,
+                    Some(build_threads.mir_chunks),
+                )?;
+                Ok(chunk
+                    .iter()
+                    .map(|(spec, _)| (spec.name.clone(), ()))
+                    .collect())
+            },
+        );
+        for err in &mir_build_stage.errors {
+            eprintln!("miri-difftest: Stage 1a Lean Mir module build failure: {err}");
+        }
+        let mut surviving_items: Vec<(OracleItemSpec, String)> =
+            Vec::with_capacity(present_items.len());
+        for (item, suffix) in &present_items {
+            if let Some(reason) = mir_build_stage.failed_reasons.get(&item.name) {
                 anneal_outcomes.insert(
                     item.name.clone(),
-                    AnnealOutcome::CaptureOrLeanError(format!(
-                        "Lean probe output omitted ANNEAL_PROBE line for '{}'",
-                        item.name
-                    )),
+                    AnnealOutcome::CaptureOrLeanError(reason.clone()),
                 );
+            } else {
+                surviving_items.push((item.clone(), suffix.clone()));
             }
+        }
+
+        // Stage 1b: Evaluate `oracle/MiriOracleProbe_{chunk_idx:03}.lean` per
+        // surviving chunk across up to `lean_jobs` concurrent workers, each
+        // bounded to `LEAN_NUM_THREADS=1`.
+        if !surviving_items.is_empty() {
+            fs::create_dir_all(&oracle_dir)
+                .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+            clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleProbe"]);
+
+            let probe_errors = aggregate_miri_probe_stage(
+                &surviving_items,
+                MIRI_PROBE_CHUNK_SIZE,
+                lean_jobs,
+                |chunk_idx, run_kind, _label, chunk| {
+                    let probe_rss_budget_kib = resolve_miri_lean_rss_budget_kib(
+                        PROBE_LEAN_RSS_BUDGET_MIB,
+                        run_kind.active_workers(),
+                    );
+                    let file_name = miri_probe_module_file_name(chunk_idx, run_kind, chunk);
+                    let probe_path = oracle_dir.join(&file_name);
+                    let rel_probe_path = format!("oracle/{file_name}");
+                    let probe_src = render_linked_anneal_probe_module(
+                        &crate_camel,
+                        chunk,
+                        &helper_module_suffixes,
+                    );
+                    fs::write(&probe_path, &probe_src).map_err(|err| {
+                        format!("failed to write {}: {}", probe_path.display(), err)
+                    })?;
+
+                    let mut probe_cmd = Command::new(&lake_bin);
+                    probe_cmd
+                        .current_dir(&dot_anneal)
+                        .env("LEAN_NUM_THREADS", "1")
+                        .arg("env")
+                        .arg("lean")
+                        .arg("-M")
+                        .arg(PROBE_LEAN_MEMORY_MB)
+                        .arg(&rel_probe_path);
+                    let probe_run = run_lean_with_rss_budget(&mut probe_cmd, Some(probe_rss_budget_kib))
+                        .map_err(|err| {
+                            format!(
+                                "failed to execute '{} env lean -M {PROBE_LEAN_MEMORY_MB} {rel_probe_path}': {err}",
+                                lake_bin.display()
+                            )
+                        })?;
+                    let probe_out = &probe_run.output;
+                    if let Some(observed_kib) = probe_run.budget_exceeded_kib {
+                        let stdout = String::from_utf8_lossy(&probe_out.stdout);
+                        let stderr = String::from_utf8_lossy(&probe_out.stderr);
+                        return Err(format_lean_command_failure(
+                            &format!(
+                                "Lean probe evaluation for {rel_probe_path} in {}: {}",
+                                dot_anneal.display(),
+                                rss_budget_kill_note(probe_rss_budget_kib, observed_kib)
+                            ),
+                            &stdout,
+                            &stderr,
+                        ));
+                    }
+                    if !probe_out.status.success() {
+                        let stdout = String::from_utf8_lossy(&probe_out.stdout);
+                        let stderr = String::from_utf8_lossy(&probe_out.stderr);
+                        return Err(format_lean_command_failure(
+                            &format!(
+                                "Lean probe evaluation failed in {} ({}) for {rel_probe_path}",
+                                dot_anneal.display(),
+                                probe_out.status
+                            ),
+                            &stdout,
+                            &stderr,
+                        ));
+                    }
+                    Ok(String::from_utf8_lossy(&probe_out.stdout).into_owned())
+                },
+                &mut anneal_outcomes,
+                &mut anneal_panic_frames,
+                &mut anneal_panic_messages,
+            );
+            for err in &probe_errors {
+                eprintln!("miri-difftest: Stage 1b Lean probe failure: {err}");
+            }
+            clean_oracle_files_with_prefixes(
+                &oracle_dir,
+                &["MiriOracleProbeFallback_", "MiriOracleProbeRemainder_"],
+            );
         }
     }
 
@@ -3442,89 +5128,101 @@ fn run_linked_difftest_oracle_pipeline(
     } else {
         fs::create_dir_all(&oracle_dir)
             .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+        clean_oracle_files_with_prefixes(&oracle_dir, &["MiriOracleConfirm"]);
         let confirm_path = oracle_dir.join("MiriOracleConfirm.lean");
-        let write_confirm_module = |entries: &[(OracleItemSpec, String, AnnealOutcome)]| {
-            let entry_specs: Vec<OracleItemSpec> =
-                entries.iter().map(|(spec, _, _)| spec.clone()).collect();
-            let entry_helper_suffixes = confirm_helper_module_suffixes(
-                &lib_rs,
-                &crate_camel,
-                &subject_pairs,
-                &helper_module_suffixes,
-                &entry_specs,
+        let write_confirm_module_at =
+            |dest: &Path, entries: &[(OracleItemSpec, String, AnnealOutcome)]| -> Result<(), String> {
+                let entry_specs: Vec<OracleItemSpec> =
+                    entries.iter().map(|(spec, _, _)| spec.clone()).collect();
+                let entry_helper_suffixes = confirm_helper_module_suffixes(
+                    &lib_rs,
+                    &crate_camel,
+                    &subject_pairs,
+                    &helper_module_suffixes,
+                    &entry_specs,
+                );
+                let src = render_linked_anneal_confirm_module(
+                    &crate_camel,
+                    entries,
+                    &entry_helper_suffixes,
+                    &anneal_panic_frames,
+                    &anneal_panic_messages,
+                )?;
+                fs::write(dest, &src)
+                    .map_err(|err| format!("failed to write {}: {}", dest.display(), err))
+            };
+
+        let _lean_guard = acquire_live_lean_oracle_lock();
+        let lean_jobs = resolve_miri_lean_jobs().max(1);
+        let stage = run_chunked_miri_confirm_stage(
+            &to_confirm,
+            MIRI_CONFIRM_CHUNK_SIZE,
+            lean_jobs,
+            |file_name, entries| write_confirm_module_at(&oracle_dir.join(file_name), entries),
+            |file_name, active_workers| {
+                let budget_kib = resolve_miri_lean_rss_budget_kib(
+                    CONFIRM_LEAN_RSS_BUDGET_MIB,
+                    active_workers,
+                );
+                run_lean_confirm_file(
+                    &lake_bin,
+                    &dot_anneal,
+                    &format!("oracle/{file_name}"),
+                    budget_kib,
+                )
+            },
+        );
+        // Preserve `MiriOracleConfirm_*` / `MiriOracleConfirmFallback_*` on `Err`
+        // so the `(kernel confirmation modules in <oracle_dir>)` note points at the
+        // actual rejecting `.lean` module on disk for post-mortem debugging; clean
+        // scratch modules only once `stage` has succeeded.
+        let ChunkedMiriConfirm {
+            confirmed: confirmed_items,
+            confirmed_groups,
+            unconfirmed: unconfirmed_names,
+        } = finalize_stage2_confirm_scratch(&oracle_dir, stage)?;
+        for (name, reason) in &unconfirmed_names {
+            eprintln!(
+                "miri-difftest: Stage 2 kernel confirmation of `{name}` exhausted a resource; \
+                 reporting kernel_confirmed = false: {reason}"
             );
-            let src = render_linked_anneal_confirm_module(
+        }
+        for rep in &mut reports {
+            if unconfirmed_names.contains_key(&rep.name) {
+                rep.kernel_confirmed = false;
+            }
+        }
+        if confirmed_items.is_empty() {
+            let _ = fs::remove_file(&confirm_path);
+            None
+        } else {
+            // Preserve each kernel-confirmed group's exact `linkedCallees` list
+            // in its own `namespace MiriOracleConfirm_{idx:03}` (or flat
+            // `namespace MiriOracleConfirm` when `confirmed_groups.len() == 1`)
+            // so `extract_confirm_theorems` never mixes callees across chunks.
+            let mut groups_with_helpers: Vec<(Vec<MiriConfirmEntry>, Vec<String>)> =
+                Vec::with_capacity(confirmed_groups.len());
+            for group in confirmed_groups {
+                let group_specs: Vec<OracleItemSpec> =
+                    group.iter().map(|(spec, _, _)| spec.clone()).collect();
+                let group_helpers = confirm_helper_module_suffixes(
+                    &lib_rs,
+                    &crate_camel,
+                    &subject_pairs,
+                    &helper_module_suffixes,
+                    &group_specs,
+                );
+                groups_with_helpers.push((group, group_helpers));
+            }
+            let multi_src = render_multi_group_anneal_confirm_module(
                 &crate_camel,
-                entries,
-                &entry_helper_suffixes,
+                &groups_with_helpers,
                 &anneal_panic_frames,
                 &anneal_panic_messages,
             )?;
-            fs::write(&confirm_path, &src)
-                .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))
-        };
-        write_confirm_module(&to_confirm)?;
-
-        let _lean_guard = acquire_live_lean_oracle_lock();
-        let batch_out = run_lean_confirm_module(&lake_bin, &dot_anneal)?;
-        if batch_out.status.success() {
+            fs::write(&confirm_path, &multi_src)
+                .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
             Some(confirm_path.clone())
-        } else {
-            // Re-confirm one item at a time. An item whose kernel confirmation
-            // exhausts a resource (`lean -M`, heartbeats, recursion depth, or a
-            // signal) is reported with `kernel_confirmed = false`; any other
-            // failure means the kernel rejected a theorem that the compiled
-            // probe produced (or the module did not elaborate), which is a
-            // harness inconsistency, so the run still fails closed.
-            let mut confirmed_items = Vec::new();
-            let mut unconfirmed_names = BTreeSet::new();
-            let single_runs: Vec<(&(OracleItemSpec, String, AnnealOutcome), std::process::Output)> =
-                if to_confirm.len() == 1 {
-                    vec![(&to_confirm[0], batch_out)]
-                } else {
-                    let mut runs = Vec::with_capacity(to_confirm.len());
-                    for entry in &to_confirm {
-                        write_confirm_module(std::slice::from_ref(entry))?;
-                        runs.push((entry, run_lean_confirm_module(&lake_bin, &dot_anneal)?));
-                    }
-                    runs
-                };
-            for (entry, out) in single_runs {
-                if out.status.success() {
-                    confirmed_items.push(entry.clone());
-                    continue;
-                }
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let signal_terminated = out.status.code().is_none();
-                if lean_confirm_failure_is_resource_exhaustion(
-                    signal_terminated,
-                    &format!("{stdout}\n{stderr}"),
-                ) {
-                    unconfirmed_names.insert(entry.0.name.clone());
-                } else {
-                    return Err(format!(
-                        "Lean kernel confirmation rejected `{}` in {} ({}):\n{}\n{}",
-                        entry.0.name,
-                        confirm_path.display(),
-                        out.status,
-                        stdout,
-                        stderr
-                    ));
-                }
-            }
-            for rep in &mut reports {
-                if unconfirmed_names.contains(&rep.name) {
-                    rep.kernel_confirmed = false;
-                }
-            }
-            if confirmed_items.is_empty() {
-                let _ = fs::remove_file(&confirm_path);
-                None
-            } else {
-                write_confirm_module(&confirmed_items)?;
-                Some(confirm_path.clone())
-            }
         }
     };
 
@@ -8597,6 +10295,1561 @@ pub fn cand_shadow() -> u32 {
                 "X.helper_unrelated",
             ],
             "helpers: {helpers:?}"
+        );
+    }
+
+    #[test]
+    fn miri_lean_jobs_and_cgroup_memory_limits_handle_thresholds_overrides_and_stat() {
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        // 32–36 GiB capsules clamp to 1 worker regardless of available memory.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(32 * GIB_KIB), Some(30 * GIB_KIB)),
+            1
+        );
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(36 * GIB_KIB), Some(35 * GIB_KIB)),
+            1
+        );
+        // Large host with < 24 GiB headroom -> 1 worker.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(128 * GIB_KIB), Some(20 * GIB_KIB)),
+            1
+        );
+        // Up to 64 GiB total or < 48 GiB headroom -> 2 workers.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(64 * GIB_KIB), Some(60 * GIB_KIB)),
+            2
+        );
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(128 * GIB_KIB), Some(40 * GIB_KIB)),
+            2
+        );
+        // > 64 GiB total and >= 48 GiB headroom -> 4 workers.
+        assert_eq!(
+            miri_lean_jobs_for_memory(Some(128 * GIB_KIB), Some(96 * GIB_KIB)),
+            4
+        );
+        // Missing memory info defaults conservatively to 1.
+        assert_eq!(miri_lean_jobs_for_memory(None, None), 1);
+        assert_eq!(miri_lean_jobs_for_memory(Some(128 * GIB_KIB), None), 1);
+
+        // `ANNEAL_MIRI_LEAN_JOBS` overrides memory heuristics and caps at 8.
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("6"), Some(32 * GIB_KIB), Some(16 * GIB_KIB)),
+            6
+        );
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("24"), Some(32 * GIB_KIB), Some(16 * GIB_KIB)),
+            8
+        );
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("0"), Some(64 * GIB_KIB), Some(50 * GIB_KIB)),
+            2
+        );
+        assert_eq!(
+            resolve_miri_lean_jobs_with_env(Some("bogus"), Some(64 * GIB_KIB), Some(50 * GIB_KIB)),
+            2
+        );
+
+        // `cgroup_memory_limits_kib` walks hierarchy, handles `"max"`, and uses `anon + shmem`.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!(
+            "anneal-miri-cgroup-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let scope = root.join("user.slice/app.slice/miri.scope");
+        fs::create_dir_all(&scope).unwrap();
+        fs::write(root.join("user.slice/memory.max"), "max\n").unwrap();
+        fs::write(
+            root.join("user.slice/app.slice/memory.max"),
+            format!("{}\n", 48 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("user.slice/app.slice/memory.current"),
+            format!("{}\n", 18 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            scope.join("memory.max"),
+            format!("{}\n", 40 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            scope.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\n",
+                4 * GIB_KIB * 1024,
+                28 * GIB_KIB * 1024,
+                2 * GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+        let (limit, headroom) =
+            cgroup_memory_limits_kib(&root, "0::/user.slice/app.slice/miri.scope\n");
+        assert_eq!(limit, Some(40 * GIB_KIB));
+        // Leaf headroom = 40 - (4 + 2) = 34 GiB; app.slice headroom (via memory.current) = 48 - 18 = 30 GiB.
+        assert_eq!(headroom, Some(30 * GIB_KIB));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunked_miri_probe_stage_partitions_over_64_items_and_aggregates_frames_messages_and_omissions()
+     {
+        let items: Vec<(OracleItemSpec, String)> = (0..150)
+            .map(|i| {
+                let name = format!("cand_{i:03}");
+                (
+                    OracleItemSpec::with_fuel(name.clone(), 400),
+                    format!("MiriDiffCorpus.{name}"),
+                )
+            })
+            .collect();
+
+        let observed_chunks: std::sync::Mutex<Vec<(usize, MiriStageRunKind, usize)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut outcomes = BTreeMap::new();
+        let mut frames = BTreeMap::new();
+        let mut messages = BTreeMap::new();
+
+        let errors = aggregate_miri_probe_stage(
+            &items,
+            MIRI_PROBE_CHUNK_SIZE,
+            2,
+            |chunk_idx, run_kind, _label, chunk| {
+                observed_chunks
+                    .lock()
+                    .unwrap()
+                    .push((chunk_idx, run_kind, chunk.len()));
+                let mut out = String::new();
+                for (spec, _) in chunk {
+                    if spec.name == "cand_130" {
+                        // Deliberately omit ANNEAL_PROBE line for cand_130 in chunk 2.
+                        continue;
+                    } else if spec.name == "cand_070" {
+                        out.push_str(&format!(
+                            "ANNEAL_PROBE\t{}\tpanic\tsrc/lib.rs:70:5:70:20\n\
+                             ANNEAL_PANIC_FRAME\t{}\tmiri_diff_corpus::cand_070\n\
+                             ANNEAL_PANIC_MESSAGE\t{}\t[98, 111, 111, 109]\n",
+                            spec.name, spec.name, spec.name
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "ANNEAL_PROBE\t{}\tpass:scalar:42:4\tnone\n",
+                            spec.name
+                        ));
+                    }
+                }
+                Ok(out)
+            },
+            &mut outcomes,
+            &mut frames,
+            &mut messages,
+        );
+
+        assert!(errors.is_empty(), "unexpected probe stage errors: {errors:?}");
+        let mut recorded = observed_chunks.into_inner().unwrap();
+        recorded.sort_by_key(|&(idx, _, _)| idx);
+        assert_eq!(
+            recorded,
+            vec![
+                (0, MiriStageRunKind::Chunk { wave_jobs: 2 }, 64),
+                (1, MiriStageRunKind::Chunk { wave_jobs: 2 }, 64),
+                (2, MiriStageRunKind::Chunk { wave_jobs: 1 }, 22),
+            ],
+            "150 items must split into 64 + 64 (2-worker wave) + 22 (1-worker trailing wave)"
+        );
+        assert_eq!(
+            MiriStageRunKind::Chunk { wave_jobs: 2 }.active_workers(),
+            2
+        );
+        assert_eq!(
+            MiriStageRunKind::Chunk { wave_jobs: 1 }.active_workers(),
+            1
+        );
+        assert_eq!(MiriStageRunKind::Fallback.active_workers(), 1);
+        assert_eq!(MiriStageRunKind::Remainder.active_workers(), 1);
+        assert_eq!(outcomes.len(), 150);
+        assert_eq!(
+            outcomes.get("cand_000"),
+            Some(&AnnealOutcome::PassScalar {
+                bits: 42,
+                size_bytes: 4
+            })
+        );
+        assert!(matches!(
+            outcomes.get("cand_070"),
+            Some(AnnealOutcome::Panic { .. })
+        ));
+        assert_eq!(
+            frames.get("cand_070").map(String::as_str),
+            Some("miri_diff_corpus::cand_070")
+        );
+        assert_eq!(messages.get("cand_070").map(Vec::as_slice), Some(&b"boom"[..]));
+        match outcomes.get("cand_130") {
+            Some(AnnealOutcome::CaptureOrLeanError(msg)) => {
+                assert!(
+                    msg.contains("Lean probe output omitted ANNEAL_PROBE line for 'cand_130'"),
+                    "unexpected missing-probe error: {msg}"
+                );
+            }
+            other => panic!("expected CaptureOrLeanError for omitted probe line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn isolated_miri_stage_isolates_single_bad_candidate_and_trips_circuit_breaker_on_systematic_failure()
+     {
+        // 1. Single bad candidate in chunk 0 (out of 70 items across 2 chunks) is isolated
+        //    to CaptureOrLeanError with stdout + stderr `✖` / `error:` diagnostics while all
+        //    other 69 candidates succeed.
+        let items: Vec<(OracleItemSpec, String)> = (0..70)
+            .map(|i| {
+                let name = format!("item_{i:03}");
+                (
+                    OracleItemSpec::with_fuel(name.clone(), 200),
+                    format!("MiriDiffCorpus.{name}"),
+                )
+            })
+            .collect();
+
+        let stage = run_isolated_miri_stage(
+            "MiriMirBuild",
+            &items,
+            MIRI_PROBE_CHUNK_SIZE,
+            1,
+            |(spec, _)| spec.name.as_str(),
+            |_chunk_idx, _is_fallback, _label, chunk| {
+                if chunk.iter().any(|(s, _)| s.name == "item_017") {
+                    let stdout = (0..25)
+                        .map(|k| format!("✔ [{k}/64] Built Mir.MiriDiffCorpus.ok_{k}"))
+                        .chain([
+                            "✖ [25/64] Building Mir.MiriDiffCorpus.item_017".to_string(),
+                            "error: .anneal/generated/Mir/MiriDiffCorpus/item_017.lean:12:4: type mismatch".to_string(),
+                        ])
+                        .chain((26..55).map(|k| format!("info: trailing build line {k}")))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let stderr = "error: Lake build failed with 1 target error";
+                    return Err(format_lean_command_failure(
+                        "lake build failed with status exit status: 1",
+                        &stdout,
+                        stderr,
+                    ));
+                }
+                Ok(chunk.iter().map(|(s, _)| (s.name.clone(), ())).collect())
+            },
+        );
+        assert_eq!(stage.results.len(), 69);
+        assert_eq!(stage.failed_reasons.len(), 1);
+        let bad_diag = stage
+            .failed_reasons
+            .get("item_017")
+            .expect("item_017 must fail");
+        assert!(
+            bad_diag.contains("✖ [25/64] Building Mir.MiriDiffCorpus.item_017"),
+            "stdout `✖` line in middle of log must be preserved: {bad_diag}"
+        );
+        assert!(
+            bad_diag.contains("item_017.lean:12:4: type mismatch"),
+            "stdout `error:` line in middle of log must be preserved: {bad_diag}"
+        );
+        assert!(
+            bad_diag.contains("Lake build failed with 1 target error"),
+            "stderr `error:` line must be preserved: {bad_diag}"
+        );
+
+        // 2. Systematic failure across 20 items (chunk_size = 8 -> 3 chunks) trips circuit
+        //    breaker after `MIRI_FALLBACK_CIRCUIT_BREAKER` (4) consecutive fallback failures
+        //    with 0 successes, then retries chunk 0's remainder once as a group; once that
+        //    also fails, chunks 1 and 2 skip straight to the breaker diagnosis:
+        //    total invocations = 3 chunks + 4 fallbacks + 1 remainder = 8 (not 3 + 20).
+        let sys_items: Vec<(OracleItemSpec, String)> = (0..20)
+            .map(|i| {
+                let name = format!("sys_{i:02}");
+                (OracleItemSpec::with_fuel(name.clone(), 200), name)
+            })
+            .collect();
+        let calls = AtomicUsize::new(0);
+        let sys_stage: IsolatedMiriStage<()> = run_isolated_miri_stage(
+            "MiriOracleProbe",
+            &sys_items,
+            8,
+            2,
+            |(spec, _)| spec.name.as_str(),
+            |_chunk_idx, _is_fallback, _label, _chunk| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(format_lean_command_failure(
+                    "lake env lean failed",
+                    "✖ broken toolchain",
+                    "error: unknown package `Trusted`",
+                ))
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3 + MIRI_FALLBACK_CIRCUIT_BREAKER + 1,
+            "expected 3 chunk runs + {MIRI_FALLBACK_CIRCUIT_BREAKER} fallback runs + 1 remainder \
+             retry before the circuit breaker settles on a systematic failure"
+        );
+        assert!(sys_stage.results.is_empty());
+        assert_eq!(sys_stage.failed_reasons.len(), 20);
+        assert!(
+            sys_stage
+                .failed_reasons
+                .get("sys_19")
+                .is_some_and(|r| r.contains("consecutive fallback failures")
+                    && r.contains("unknown package `Trusted`"))
+        );
+        assert!(
+            sys_stage
+                .failed_reasons
+                .get("sys_04")
+                .is_some_and(|r| r.contains("remainder retry `MiriOracleProbeRemainder_000` also failed")),
+            "chunk 0's skipped items must record the failed remainder retry: {:?}",
+            sys_stage.failed_reasons.get("sys_04")
+        );
+
+        // 3. Stale `MiriOracleProbe*` and `MiriOracleConfirm*` artifacts are cleaned without
+        //    touching unrelated files.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_oracle = env::temp_dir().join(format!(
+            "anneal-miri-oracle-clean-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp_oracle).unwrap();
+        fs::write(tmp_oracle.join("MiriOracleProbe.lean"), "-- old").unwrap();
+        fs::write(tmp_oracle.join("MiriOracleProbe_007.olean"), "old").unwrap();
+        fs::write(tmp_oracle.join("MiriOracleConfirm_001.lean"), "-- old").unwrap();
+        fs::write(tmp_oracle.join("KeepMe.txt"), "keep").unwrap();
+        clean_oracle_files_with_prefixes(&tmp_oracle, &["MiriOracleProbe", "MiriOracleConfirm"]);
+        assert!(!tmp_oracle.join("MiriOracleProbe.lean").exists());
+        assert!(!tmp_oracle.join("MiriOracleProbe_007.olean").exists());
+        assert!(!tmp_oracle.join("MiriOracleConfirm_001.lean").exists());
+        assert!(tmp_oracle.join("KeepMe.txt").is_file());
+        let _ = fs::remove_dir_all(&tmp_oracle);
+    }
+
+    #[test]
+    fn isolated_miri_stage_remainder_retry_keeps_healthy_candidates_behind_leading_broken_ones() {
+        let items: Vec<(OracleItemSpec, String)> = (0..20)
+            .map(|i| {
+                let name = format!("c_{i:02}");
+                (OracleItemSpec::with_fuel(name.clone(), 1), name)
+            })
+            .collect();
+        let run_with_broken = |broken: &'static [&'static str]| {
+            let calls: std::sync::Mutex<Vec<(usize, MiriStageRunKind, usize)>> =
+                std::sync::Mutex::new(Vec::new());
+            let stage: IsolatedMiriStage<()> = run_isolated_miri_stage(
+                "MiriMirBuild",
+                &items,
+                10,
+                1,
+                |(spec, _)| spec.name.as_str(),
+                |chunk_idx, run_kind, _label, chunk| {
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((chunk_idx, run_kind, chunk.len()));
+                    if let Some((bad, _)) =
+                        chunk.iter().find(|(s, _)| broken.contains(&s.name.as_str()))
+                    {
+                        return Err(format!("error: Mir/{}.lean: unknown identifier", bad.name));
+                    }
+                    Ok(chunk.iter().map(|(s, _)| (s.name.clone(), ())).collect())
+                },
+            );
+            (stage, calls.into_inner().unwrap())
+        };
+
+        // 1. A success before the broken candidates means the breaker never trips:
+        //    2 chunk runs + 10 per-candidate fallbacks for chunk 0, no remainder retry.
+        let (stage, calls) = run_with_broken(&["c_01", "c_02", "c_03", "c_04", "c_05", "c_06"]);
+        assert_eq!(calls.len(), 2 + 10, "calls: {calls:?}");
+        assert!(calls.iter().all(|&(_, kind, len)| {
+            matches!(kind, MiriStageRunKind::Chunk { wave_jobs: 1 })
+                || (kind == MiriStageRunKind::Fallback && len == 1)
+        }));
+        assert_eq!(stage.results.len(), 14);
+        assert_eq!(
+            stage.failed_reasons.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["c_01", "c_02", "c_03", "c_04", "c_05", "c_06"]
+        );
+        assert!(
+            stage
+                .failed_reasons
+                .values()
+                .all(|r| r.contains("unknown identifier") && !r.contains("fallback skipped"))
+        );
+
+        // 2. Four broken candidates leading chunk 0 trip the breaker, but the healthy
+        //    remainder (c_04..c_09) is recovered by one group retry instead of being
+        //    written off: 2 chunk runs + 4 fallbacks + 1 remainder run.
+        let (stage, calls) = run_with_broken(&["c_00", "c_01", "c_02", "c_03"]);
+        assert_eq!(
+            calls,
+            vec![
+                (0, MiriStageRunKind::Chunk { wave_jobs: 1 }, 10),
+                (1, MiriStageRunKind::Chunk { wave_jobs: 1 }, 10),
+                (0, MiriStageRunKind::Fallback, 1),
+                (0, MiriStageRunKind::Fallback, 1),
+                (0, MiriStageRunKind::Fallback, 1),
+                (0, MiriStageRunKind::Fallback, 1),
+                (0, MiriStageRunKind::Remainder, 6),
+            ]
+        );
+        assert_eq!(stage.results.len(), 16);
+        assert_eq!(
+            stage.failed_reasons.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["c_00", "c_01", "c_02", "c_03"]
+        );
+
+        // 3. A fifth broken candidate inside the remainder makes the retry fail too: the
+        //    remainder is then written off with the breaker diagnosis (root cause kept).
+        let (stage, calls) = run_with_broken(&["c_00", "c_01", "c_02", "c_03", "c_08"]);
+        assert_eq!(calls.len(), 2 + 4 + 1, "calls: {calls:?}");
+        assert_eq!(stage.results.len(), 10);
+        let skipped = stage.failed_reasons.get("c_05").expect("c_05 must be written off");
+        assert!(
+            skipped.contains("per-candidate fallback skipped after 4 consecutive fallback failures")
+                && skipped.contains("remainder retry `MiriMirBuildRemainder_000` also failed")
+                && skipped.contains("Mir/c_00.lean: unknown identifier"),
+            "unexpected breaker diagnosis: {skipped}"
+        );
+        assert!(
+            stage
+                .errors
+                .iter()
+                .any(|e| e.contains("skipped 6 per-candidate fallback run(s)")),
+            "errors: {:?}",
+            stage.errors
+        );
+    }
+
+    #[test]
+    fn miri_lake_build_threads_resolve_env_precedence_caps_and_caller_threads() {
+        const GIB_KIB: u64 = 1024 * 1024;
+        let threads = |base, mir_chunks| MiriLakeBuildThreads { base, mir_chunks };
+        let (cg_total, roomy, tight) = (Some(19 * GIB_KIB), Some(15 * GIB_KIB), Some(2 * GIB_KIB));
+
+        // Memory defaults: 15 GiB headroom in a 19 GiB cgroup on 8 cores -> 6 base
+        // threads (1536 MiB / job, clamped to 6) and 4 for corpus `Mir.*` chunks;
+        // 2 GiB headroom -> 1 thread everywhere.
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, None, None, cg_total, roomy, 8),
+            threads(6, 4)
+        );
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, None, None, cg_total, tight, 8),
+            threads(1, 1)
+        );
+        // A caller's LEAN_NUM_THREADS lowers (never raises) the memory default;
+        // invalid values are ignored.
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, None, Some("2"), cg_total, roomy, 8),
+            threads(2, 2)
+        );
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, None, Some("64"), cg_total, roomy, 8),
+            threads(6, 4)
+        );
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, None, Some("0"), cg_total, roomy, 8),
+            threads(6, 4)
+        );
+        // CARGO_ANNEAL_LAKE_JOBS overrides the base budget (capped at 16) and the
+        // caller's LEAN_NUM_THREADS; corpus chunk builds stay at most 4.
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, Some("32"), Some("1"), cg_total, tight, 8),
+            threads(16, 4)
+        );
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(None, Some(" 3 "), None, None, None, 8),
+            threads(3, 3)
+        );
+        // ANNEAL_MIRI_LEAN_JOBS sets both budgets (capped at 8) and beats everything.
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(Some("12"), Some("2"), Some("1"), cg_total, tight, 8),
+            threads(8, 8)
+        );
+        // Unknown memory with no overrides falls back to 2 threads.
+        assert_eq!(
+            resolve_miri_lake_build_threads_with_env(Some("bogus"), Some("0"), None, None, None, 8),
+            threads(2, 2)
+        );
+    }
+
+    #[test]
+    fn stage0_build_plan_never_emits_the_mir_umbrella_and_chunks_overflowing_helpers() {
+        let few: Vec<String> = vec![
+            "MiriDiffCorpus.helper_add_ten".to_string(),
+            "MiriDiffCorpus.helper_add_ten".to_string(),
+            String::new(),
+            "Common".to_string(),
+            "MiriDiffCorpus.Wrapper_as_core_ops_Drop_drop".to_string(),
+        ];
+        assert_eq!(
+            plan_miri_stage0_build_groups(true, &few),
+            vec![vec![
+                MIRI_SYMBOLIC_EVAL_MODULE.to_string(),
+                "Mir.Common".to_string(),
+                "Mir.MiriDiffCorpus.helper_add_ten".to_string(),
+                "Mir.MiriDiffCorpus.Wrapper_as_core_ops_Drop_drop".to_string(),
+            ]],
+            "helpers are deduplicated, `Mir.Common` is not repeated, and an empty \
+             suffix never yields a bare `Mir` / `Mir.` target"
+        );
+        assert_eq!(
+            plan_miri_stage0_build_groups(false, &[]),
+            vec![vec![MIRI_SYMBOLIC_EVAL_MODULE.to_string()]]
+        );
+
+        // Exactly MIRI_PROBE_CHUNK_SIZE helpers still share group 0 with the base targets.
+        let many: Vec<String> = (0..150)
+            .map(|i| format!("MiriDiffCorpus.cand_{i:03}__closure_0"))
+            .collect();
+        let exact = plan_miri_stage0_build_groups(false, &many[..MIRI_PROBE_CHUNK_SIZE]);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].len(), 1 + MIRI_PROBE_CHUNK_SIZE);
+
+        // 150 helpers -> base group + 64 + 64 + 22, every target a concrete module.
+        let plan = plan_miri_stage0_build_groups(true, &many);
+        assert_eq!(
+            plan.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 64, 64, 22]
+        );
+        assert!(
+            plan.iter()
+                .flatten()
+                .all(|t| t == MIRI_SYMBOLIC_EVAL_MODULE || (t.starts_with("Mir.") && t.len() > 4)),
+            "plan: {plan:?}"
+        );
+        assert_eq!(plan.iter().flatten().collect::<BTreeSet<_>>().len(), 152);
+    }
+
+    #[test]
+    fn miri_candidate_build_targets_match_probe_imports_and_dedup() {
+        let chunk = vec![
+            (
+                OracleItemSpec::with_fuel("cand_a".to_string(), 10),
+                "MiriDiffCorpus.cand_a".to_string(),
+            ),
+            (OracleItemSpec::with_fuel("cand_b".to_string(), 10), String::new()),
+            (
+                OracleItemSpec::with_fuel("cand_a".to_string(), 10),
+                "MiriDiffCorpus.cand_a".to_string(),
+            ),
+        ];
+        let targets = miri_candidate_build_targets("MiriDiffCorpus", &chunk);
+        assert_eq!(
+            targets,
+            vec![
+                "Mir.MiriDiffCorpus.cand_a".to_string(),
+                "Mir.MiriDiffCorpus.cand_b".to_string()
+            ]
+        );
+        // Every Stage 1a target is a module the chunk's probe imports (so the probe
+        // never needs an unbuilt `.olean`).
+        let probe = render_linked_anneal_probe_module("MiriDiffCorpus", &chunk, &[]);
+        for target in &targets {
+            assert!(
+                probe.contains(&format!("import {target}\n")),
+                "probe must import {target}:\n{probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_miri_probe_stage_fallback_recovers_frames_and_isolates_the_failing_candidate() {
+        let items: Vec<(OracleItemSpec, String)> = (0..70)
+            .map(|i| {
+                let name = format!("cand_{i:03}");
+                (
+                    OracleItemSpec::with_fuel(name.clone(), 400),
+                    format!("MiriDiffCorpus.{name}"),
+                )
+            })
+            .collect();
+        let probe_line = |name: &str| -> String {
+            if name == "cand_005" || name == "cand_066" {
+                format!(
+                    "ANNEAL_PROBE\t{name}\tpanic\tsrc/lib.rs:5:5:5:20\n\
+                     ANNEAL_PANIC_FRAME\t{name}\tmiri_diff_corpus::{name}\n\
+                     ANNEAL_PANIC_MESSAGE\t{name}\t[111, 104]\n"
+                )
+            } else {
+                format!("ANNEAL_PROBE\t{name}\tpass:scalar:7:4\tnone\n")
+            }
+        };
+        let calls: std::sync::Mutex<Vec<(usize, MiriStageRunKind, usize)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut outcomes = BTreeMap::new();
+        let mut frames = BTreeMap::new();
+        let mut messages = BTreeMap::new();
+
+        let errors = aggregate_miri_probe_stage(
+            &items,
+            MIRI_PROBE_CHUNK_SIZE,
+            2,
+            |chunk_idx, run_kind, _label, chunk| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((chunk_idx, run_kind, chunk.len()));
+                if chunk.iter().any(|(s, _)| s.name == "cand_010") {
+                    // Lean prints every other probe line, then exits non-zero on cand_010.
+                    let mut stdout: String = chunk
+                        .iter()
+                        .filter(|(s, _)| s.name != "cand_010")
+                        .map(|(s, _)| probe_line(&s.name))
+                        .collect();
+                    stdout.push_str(
+                        "oracle/MiriOracleProbe_000.lean:42:0: error: (interpreter) unknown \
+                         declaration 'Mir.MiriDiffCorpus.cand_010.body'\n",
+                    );
+                    return Err(format_lean_command_failure(
+                        "Lean probe evaluation failed (exit status: 1)",
+                        &stdout,
+                        "error: Lean exited with code 1",
+                    ));
+                }
+                Ok(chunk.iter().map(|(s, _)| probe_line(&s.name)).collect())
+            },
+            &mut outcomes,
+            &mut frames,
+            &mut messages,
+        );
+
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(calls.len(), 2 + MIRI_PROBE_CHUNK_SIZE, "calls: {calls:?}");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|&&(idx, kind, len)| {
+                    idx == 0 && kind == MiriStageRunKind::Fallback && len == 1
+                })
+                .count(),
+            MIRI_PROBE_CHUNK_SIZE,
+            "only the failed chunk 0 falls back, one candidate at a time"
+        );
+        assert_eq!(outcomes.len(), 70);
+        // Panic frames / messages survive both the fallback path (cand_005) and the
+        // healthy chunk path (cand_066).
+        for name in ["cand_005", "cand_066"] {
+            assert!(matches!(outcomes.get(name), Some(AnnealOutcome::Panic { .. })));
+            assert_eq!(
+                frames.get(name).map(String::as_str),
+                Some(format!("miri_diff_corpus::{name}").as_str())
+            );
+            assert_eq!(messages.get(name).map(Vec::as_slice), Some(&b"oh"[..]));
+        }
+        assert_eq!(frames.len(), 2);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            outcomes.get("cand_011"),
+            Some(&AnnealOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4
+            })
+        );
+        match outcomes.get("cand_010") {
+            Some(AnnealOutcome::CaptureOrLeanError(msg)) => {
+                for needle in [
+                    "MiriOracleProbeFallback_cand_010:",
+                    "unknown declaration 'Mir.MiriDiffCorpus.cand_010.body'",
+                    "error: Lean exited with code 1",
+                ] {
+                    assert!(msg.contains(needle), "missing `{needle}` in: {msg}");
+                }
+            }
+            other => panic!("expected CaptureOrLeanError for cand_010, got {other:?}"),
+        }
+        assert_eq!(errors.len(), 2, "chunk + fallback diagnostics: {errors:?}");
+        assert!(errors[0].starts_with("MiriOracleProbe_000:"));
+        assert!(errors[1].starts_with("MiriOracleProbeFallback_cand_010:"));
+    }
+
+    #[test]
+    fn chunked_miri_confirm_stage_bounds_modules_isolates_resource_exhaustion_and_fails_closed() {
+        let entry = |name: &str| -> MiriConfirmEntry {
+            (
+                OracleItemSpec::with_fuel(name.to_string(), 100),
+                format!("MiriDiffCorpus.{name}"),
+                AnnealOutcome::PassScalar {
+                    bits: 1,
+                    size_bytes: 4,
+                },
+            )
+        };
+        let ok = || LeanConfirmRun {
+            success: true,
+            signal_terminated: false,
+            status: "exit status: 0".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let to_confirm: Vec<MiriConfirmEntry> =
+            (0..40).map(|i| entry(&format!("div_{i:02}"))).collect();
+        let written: std::sync::Mutex<BTreeMap<String, Vec<String>>> =
+            std::sync::Mutex::new(BTreeMap::new());
+        let ran: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+        let stage = run_chunked_miri_confirm_stage(
+            &to_confirm,
+            MIRI_CONFIRM_CHUNK_SIZE,
+            2,
+            |file_name, entries| {
+                written.lock().unwrap().insert(
+                    file_name.to_string(),
+                    entries.iter().map(|e| e.0.name.clone()).collect(),
+                );
+                Ok(())
+            },
+            |file_name, active_workers| {
+                ran.lock().unwrap().push((file_name.to_string(), active_workers));
+                let names = written
+                    .lock()
+                    .unwrap()
+                    .get(file_name)
+                    .cloned()
+                    .unwrap_or_default();
+                if names.iter().any(|n| n == "div_20") {
+                    // The chunk (and div_20 alone) exhausts Lean's heartbeat budget.
+                    return Ok(LeanConfirmRun {
+                        success: false,
+                        signal_terminated: false,
+                        status: "exit status: 1".to_string(),
+                        stdout: "oracle/MiriOracleConfirm_001.lean:9:0: error: (deterministic) \
+                                 timeout at `whnf`, maximum number of heartbeats (2000000) has \
+                                 been reached"
+                            .to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                if names.len() > 1 && names.iter().any(|n| n == "div_33") {
+                    // The 8-entry chunk is OOM-killed; each entry alone fits.
+                    return Ok(LeanConfirmRun {
+                        success: false,
+                        signal_terminated: true,
+                        status: "signal: 9 (SIGKILL)".to_string(),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(ok())
+            },
+        )
+        .expect("resource exhaustion must downgrade, not fail, the stage");
+
+        let written = written.into_inner().unwrap();
+        let chunk_modules: Vec<(&String, usize)> = written
+            .iter()
+            .filter(|(f, _)| f.starts_with("MiriOracleConfirm_"))
+            .map(|(f, names)| (f, names.len()))
+            .collect();
+        assert_eq!(
+            chunk_modules,
+            vec![
+                (&"MiriOracleConfirm_000.lean".to_string(), 16),
+                (&"MiriOracleConfirm_001.lean".to_string(), 16),
+                (&"MiriOracleConfirm_002.lean".to_string(), 8),
+            ],
+            "no Lean confirm process may hold more than MIRI_CONFIRM_CHUNK_SIZE theorems"
+        );
+        let fallback_modules: Vec<&Vec<String>> = written
+            .iter()
+            .filter(|(f, _)| f.starts_with("MiriOracleConfirmFallback_"))
+            .map(|(_, names)| names)
+            .collect();
+        assert_eq!(fallback_modules.len(), 16 + 8);
+        assert!(fallback_modules.iter().all(|names| names.len() == 1));
+        let ran = ran.into_inner().unwrap();
+        assert_eq!(ran.len(), 3 + 16 + 8);
+        // Wave 0 runs 2 chunks concurrently (`active_workers == 2`); wave 1 has a
+        // single trailing chunk (`active_workers == 1`); every per-entry fallback runs
+        // serially (`active_workers == 1`) so it receives the full 1-worker RSS budget.
+        for (mod_name, active_workers) in &ran {
+            if mod_name == "MiriOracleConfirm_000.lean"
+                || mod_name == "MiriOracleConfirm_001.lean"
+            {
+                assert_eq!(*active_workers, 2, "{mod_name} ran in a 2-worker wave");
+            } else {
+                assert_eq!(*active_workers, 1, "{mod_name} ran alone and must get 1-worker RSS budget");
+            }
+        }
+        // A partial 3-chunk wave under `jobs = 4` passes `active_workers = 3` (never 4).
+        let partial_workers: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        run_chunked_miri_confirm_stage(
+            &to_confirm,
+            MIRI_CONFIRM_CHUNK_SIZE,
+            4,
+            |_f, _e| Ok(()),
+            |_f, active_workers| {
+                partial_workers.lock().unwrap().push(active_workers);
+                Ok(ok())
+            },
+        )
+        .expect("3-chunk wave on 4-job budget");
+        assert_eq!(partial_workers.into_inner().unwrap(), vec![3, 3, 3]);
+        assert_eq!(
+            stage.unconfirmed.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["div_20"]
+        );
+        // The downgrade carries its reason (module, status, and highlighted diagnostic).
+        let reason = &stage.unconfirmed["div_20"];
+        assert!(
+            reason.starts_with("oracle/MiriOracleConfirmFallback_div_20.lean (exit status: 1): ")
+                && reason.contains("maximum number of heartbeats"),
+            "{reason}"
+        );
+        let confirmed: Vec<&str> = stage.confirmed.iter().map(|e| e.0.name.as_str()).collect();
+        let expected: Vec<String> = (0..40)
+            .filter(|&i| i != 20)
+            .map(|i| format!("div_{i:02}"))
+            .collect();
+        assert_eq!(confirmed, expected.iter().map(String::as_str).collect::<Vec<_>>());
+
+        // A kernel rejection (no resource marker) fails the stage closed, naming the
+        // rejecting module and preserving the middle-of-log `error:` plus stderr.
+        let rejection = run_chunked_miri_confirm_stage(
+            &to_confirm[..3],
+            MIRI_CONFIRM_CHUNK_SIZE,
+            1,
+            |_file_name, _entries| Ok(()),
+            |file_name, _is_serial| {
+                if file_name.starts_with("MiriOracleConfirm_") || file_name.contains("div_01") {
+                    let mut stdout: String = (0..30)
+                        .map(|k| format!("info: elaborating theorem {k}\n"))
+                        .collect();
+                    stdout.push_str(
+                        "oracle/MiriOracleConfirm_000.lean:12:2: error: The rfl tactic failed \
+                         for div_01\n",
+                    );
+                    stdout.extend((30..60).map(|k| format!("info: trailing {k}\n")));
+                    return Ok(LeanConfirmRun {
+                        success: false,
+                        signal_terminated: false,
+                        status: "exit status: 1".to_string(),
+                        stdout,
+                        stderr: "error: Lean exited with code 1".to_string(),
+                    });
+                }
+                Ok(ok())
+            },
+        )
+        .expect_err("a kernel rejection must fail the stage closed");
+        for needle in [
+            "Lean kernel confirmation rejected `div_01` in oracle/MiriOracleConfirmFallback_div_01.lean",
+            "error: The rfl tactic failed for div_01",
+            "error: Lean exited with code 1",
+        ] {
+            assert!(rejection.contains(needle), "missing `{needle}` in: {rejection}");
+        }
+
+        // A spawn failure propagates.
+        let spawn_err = run_chunked_miri_confirm_stage(
+            &to_confirm[..2],
+            MIRI_CONFIRM_CHUNK_SIZE,
+            1,
+            |_file_name, _entries| Ok(()),
+            |_file_name, _is_serial| Err("failed to execute 'lake env lean'".to_string()),
+        )
+        .expect_err("spawn failures must propagate");
+        assert!(spawn_err.contains("failed to execute"));
+    }
+
+    #[test]
+    fn format_lean_command_failure_surfaces_stdout_stderr_middle_errors_and_rustc_codes() {
+        assert_eq!(
+            format_lean_command_failure("lake build failed with status exit status: 1", "", "  \n"),
+            "lake build failed with status exit status: 1\nstdout:\n(empty)\nstderr:\n(empty)"
+        );
+
+        let stdout: String = (0..30)
+            .map(|k| format!("✔ [{k}/90] Built Mir.Ok_{k}\n"))
+            .chain([
+                "✖ [31/90] Building Mir.MiriDiffCorpus.cand_031\n".to_string(),
+                "error: .anneal/generated/Mir/MiriDiffCorpus/cand_031.lean:3:2: unknown \
+                 identifier\n"
+                    .to_string(),
+            ])
+            .chain((32..90).map(|k| format!("✔ [{k}/90] Built Mir.Ok_{k}\n")))
+            .collect();
+        let stderr = "error[E0308]: mismatched types\n  --> src/lib.rs:4:5\nerror: Lake build failed";
+        let msg = format_lean_command_failure("lake build failed", &stdout, stderr);
+        let (head, rest) = msg.split_once("\nstdout:\n").expect("stdout section");
+        assert!(head.starts_with("lake build failed\nerror_lines:\n"), "{head}");
+        for needle in [
+            "✖ [31/90] Building Mir.MiriDiffCorpus.cand_031",
+            "cand_031.lean:3:2: unknown identifier",
+            "error[E0308]: mismatched types",
+            "error: Lake build failed",
+        ] {
+            assert!(head.contains(needle), "error_lines must contain `{needle}`: {head}");
+        }
+        let (stdout_part, stderr_part) = rest.split_once("\nstderr:\n").expect("stderr section");
+        assert!(stdout_part.contains("lines elided; key error lines preserved below"));
+        assert!(stdout_part.contains("✖ [31/90] Building Mir.MiriDiffCorpus.cand_031"));
+        assert!(stdout_part.contains("✔ [0/90] Built Mir.Ok_0"));
+        assert!(stdout_part.contains("✔ [89/90] Built Mir.Ok_89"));
+        assert!(!stdout_part.contains("Built Mir.Ok_50\n"));
+        assert_eq!(stderr_part, stderr);
+        assert_eq!(
+            extract_lean_error_lines("", stderr, 30),
+            vec![
+                "error[E0308]: mismatched types".to_string(),
+                "error: Lake build failed".to_string()
+            ]
+        );
+
+        // Ordinary Rust identifiers like `my_error[end]` must NOT false-match
+        // `error[...]:`, while non-E bracketed diagnostics and fatal OOM / panic
+        // crash lines without `error:` ARE highlighted.
+        let mixed = "let x = my_error[end];\n\
+                     error[internal]: compiler ICE\n\
+                     out of memory\n\
+                     PANIC at Lean.Kernel.whnf\n\
+                     thread 'main' panicked at src/main.rs:1:1: boom\n";
+        assert_eq!(
+            extract_lean_error_lines(mixed, "", 30),
+            vec![
+                "error[internal]: compiler ICE".to_string(),
+                "out of memory".to_string(),
+                "PANIC at Lean.Kernel.whnf".to_string(),
+                "thread 'main' panicked at src/main.rs:1:1: boom".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_group_confirm_module_and_probe_remainder_filenames_preserve_per_group_isolation() {
+        // 1. Probe module naming distinguishes Chunk, Fallback, and Remainder so a
+        //    multi-item Remainder slice never overwrites or blames the first item's
+        //    single-candidate Fallback file.
+        let sample_chunk = vec![
+            (
+                OracleItemSpec::with_fuel("cand_04".to_string(), 100),
+                "X.cand_04".to_string(),
+            ),
+            (
+                OracleItemSpec::with_fuel("cand_05".to_string(), 100),
+                "X.cand_05".to_string(),
+            ),
+        ];
+        assert_eq!(
+            miri_probe_module_file_name(0, MiriStageRunKind::Chunk { wave_jobs: 1 }, &sample_chunk),
+            "MiriOracleProbe_000.lean"
+        );
+        assert_eq!(
+            miri_probe_module_file_name(0, MiriStageRunKind::Remainder, &sample_chunk),
+            "MiriOracleProbeRemainder_000.lean"
+        );
+        assert_eq!(
+            miri_probe_module_file_name(0, MiriStageRunKind::Fallback, &sample_chunk[..1]),
+            "MiriOracleProbeFallback_cand_04.lean"
+        );
+
+        // 2. Multi-group `MiriOracleConfirm.lean` isolates each confirmed group's
+        //    `linkedCallees` in its own namespace so `extract_confirm_theorems`
+        //    returns the exact kernel-checked `linkedCallees` for each candidate
+        //    without leaking another chunk's closures or `Drop` impls.
+        let g0_entry: MiriConfirmEntry = (
+            OracleItemSpec::with_fuel("cand_top".to_string(), 200),
+            "X.cand_top".to_string(),
+            AnnealOutcome::PassScalar {
+                bits: 1,
+                size_bytes: 4,
+            },
+        );
+        let g1_entry: MiriConfirmEntry = (
+            OracleItemSpec::with_fuel("cand_shadow".to_string(), 200),
+            "X.cand_shadow".to_string(),
+            AnnealOutcome::Panic { span: None },
+        );
+        let mut frames = BTreeMap::new();
+        frames.insert("cand_shadow".to_string(), "x::cand_shadow".to_string());
+        let mut messages = BTreeMap::new();
+        messages.insert("cand_shadow".to_string(), b"msg".to_vec());
+
+        let groups = vec![
+            (
+                vec![g0_entry],
+                vec!["X.cand_top__closure_0".to_string(), "X.helper_leaf".to_string()],
+            ),
+            (
+                vec![g1_entry],
+                vec![
+                    "X.Guard_as_core_ops_Drop_drop".to_string(),
+                    "X.cand_shadow__closure_0".to_string(),
+                ],
+            ),
+        ];
+        let multi_src =
+            render_multi_group_anneal_confirm_module("X", &groups, &frames, &messages).unwrap();
+        assert!(multi_src.contains("namespace MiriOracleConfirm_000\n"));
+        assert!(multi_src.contains("namespace MiriOracleConfirm_001\n"));
+
+        let top_snippet = extract_confirm_theorems(&multi_src, "cand_top");
+        assert!(top_snippet.contains("Mir.X.cand_top__closure_0.body"));
+        assert!(top_snippet.contains("Mir.X.helper_leaf.body"));
+        assert!(
+            !top_snippet.contains("Guard_as_core_ops_Drop_drop"),
+            "group 1's Drop impl must not contaminate group 0's extracted theorem:\n{top_snippet}"
+        );
+        assert!(
+            !top_snippet.contains("cand_shadow__closure_0"),
+            "group 1's closure must not contaminate group 0's extracted theorem:\n{top_snippet}"
+        );
+        assert!(top_snippet.contains("theorem confirm_tag_cand_top :"));
+        assert!(!top_snippet.contains("theorem confirm_tag_cand_shadow :"));
+
+        let shadow_snippet = extract_confirm_theorems(&multi_src, "cand_shadow");
+        assert!(shadow_snippet.contains("Mir.X.Guard_as_core_ops_Drop_drop.body"));
+        assert!(shadow_snippet.contains("Mir.X.cand_shadow__closure_0.body"));
+        assert!(
+            !shadow_snippet.contains("cand_top__closure_0"),
+            "group 0's closure must not contaminate group 1's extracted theorem:\n{shadow_snippet}"
+        );
+        assert!(shadow_snippet.contains("theorem confirm_frame_cand_shadow :"));
+        assert!(shadow_snippet.contains("theorem confirm_message_cand_shadow :"));
+    }
+
+    #[test]
+    fn miri_lean_rss_budget_bounds_stage_cap_by_worker_headroom_share() {
+        const GIB_KIB: u64 = 1024 * 1024;
+        // The stage cap binds when headroom is ample.
+        assert_eq!(
+            miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, None, 1, Some(15 * GIB_KIB)),
+            4 * GIB_KIB
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, None, 1, None),
+            8 * GIB_KIB,
+            "unknown headroom keeps the stage cap"
+        );
+        // 85% of each worker's share of the headroom binds when tighter.
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, None, 2, Some(6 * GIB_KIB)),
+            6 * GIB_KIB / 2 / 100 * 85
+        );
+        // `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` replaces the cap but stays headroom-bounded;
+        // invalid values are ignored; the budget never drops below 512 MiB.
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, Some("12288"), 1, Some(64 * GIB_KIB)),
+            12 * GIB_KIB
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, Some("12288"), 1, Some(8 * GIB_KIB)),
+            8 * GIB_KIB / 100 * 85
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, Some("0"), 1, None),
+            4 * GIB_KIB
+        );
+        assert_eq!(
+            miri_lean_rss_budget_kib(4096, None, 4, Some(GIB_KIB)),
+            512 * 1024
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rss_budget_watchdog_captures_output_kills_process_trees_and_classifies_exhaustion() {
+        use std::io::{BufRead, BufReader};
+        use std::time::Duration;
+
+        let pgrp_of_stat = |stat: &str| -> Option<u32> {
+            stat.rfind(')')
+                .and_then(|i| stat[i + 1..].split_whitespace().nth(2)?.parse().ok())
+        };
+        let harness_pgrp = fs::read_to_string(format!("/proc/{}/stat", std::process::id()))
+            .ok()
+            .and_then(|s| pgrp_of_stat(&s))
+            .expect("harness pgrp");
+
+        // 0. The budgeted run stays in the harness's process group, so Ctrl-C, a
+        //    scheduler's `kill -- -pgid`, or `anneal-lean-run`'s session kill still
+        //    reach `lake` / `lean` if the harness itself is interrupted.
+        let mut pg_cmd = Command::new("sh");
+        pg_cmd.arg("-c").arg("cat /proc/$$/stat");
+        let pg = run_lean_with_rss_budget(&mut pg_cmd, Some(1 << 30)).expect("run sh");
+        assert_eq!(
+            pgrp_of_stat(&String::from_utf8_lossy(&pg.output.stdout)),
+            Some(harness_pgrp),
+            "budgeted runs must not leave the harness's process group"
+        );
+
+        // 1. Under budget: behaves like `Command::output`.
+        let mut ok_cmd = Command::new("sh");
+        ok_cmd
+            .arg("-c")
+            .arg("echo out-line; echo err-line >&2; exit 3");
+        let ok = run_lean_with_rss_budget(&mut ok_cmd, Some(1 << 30)).expect("run sh");
+        assert_eq!(ok.budget_exceeded_kib, None);
+        assert_eq!(ok.output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&ok.output.stdout), "out-line\n");
+        assert_eq!(String::from_utf8_lossy(&ok.output.stderr), "err-line\n");
+
+        // 2. Over budget: the tree is SIGKILLed promptly instead of running to completion.
+        let start = Instant::now();
+        let mut hog_cmd = Command::new("sleep");
+        hog_cmd.arg("60");
+        let killed = run_lean_with_rss_budget(&mut hog_cmd, Some(1)).expect("run sleep");
+        assert!(killed.budget_exceeded_kib.is_some_and(|kib| kib > 1));
+        assert!(killed.output.status.code().is_none(), "must be signal-terminated");
+        assert!(start.elapsed() < Duration::from_secs(20));
+        // ...and classifies as resource exhaustion, never as a kernel rejection.
+        let confirm = LeanConfirmRun::from_budgeted_output(&killed, 4 * 1024 * 1024);
+        assert!(!confirm.success && confirm.signal_terminated);
+        assert!(
+            confirm.stderr.contains("out of memory guard")
+                && confirm.stderr.contains("exceeded the 4096 MiB budget"),
+            "{}",
+            confirm.stderr
+        );
+        assert!(lean_confirm_failure_is_resource_exhaustion(
+            confirm.signal_terminated,
+            &confirm.stderr
+        ));
+
+        // 3. `lake env lean` runs `lean` as a grandchild: the tree walk sees it and the
+        //    kill reaches it (killing only the direct child would orphan the hog).
+        let proc_state = |pid: u32| -> Option<char> {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rfind(')').and_then(|i| s[i + 1..].trim_start().chars().next()))
+        };
+        let wait_dead = |pid: u32, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match proc_state(pid) {
+                    None | Some('Z') | Some('X') => break,
+                    Some(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(50))
+                    }
+                    Some(s) => panic!("{what} {pid} survived the tree kill (state {s})"),
+                }
+            }
+        };
+        let mut parent = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 & echo $!; wait")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut line = String::new();
+        BufReader::new(parent.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read grandchild pid");
+        let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+        let mut tree = TrackedProcessTree::new(parent.id());
+        assert!(tree.live_pids(true).contains(&grandchild));
+        assert!(tree.rss_kib().is_some_and(|kib| kib > 0));
+        tree.kill_all(&mut parent);
+        assert!(parent.wait().expect("wait sh").code().is_none());
+        wait_dead(grandchild, "grandchild");
+
+        // 4. Without a dedicated process group, a descendant reparented after its
+        //    intermediate parent exits stays tracked by pid + starttime: its RSS
+        //    still counts and the kill still reaches it.
+        let pid_file = env::temp_dir().join(format!(
+            "anneal-miri-orphan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut parent = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "(sleep 60 </dev/null >/dev/null 2>&1 & echo $! > '{}'; sleep 1); sleep 60",
+                pid_file.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn orphaning sh");
+        let mut tree = TrackedProcessTree::new(parent.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let orphan: u32 = loop {
+            tree.live_pids(true);
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
+                && tree.live_pids(true).contains(&pid)
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "orphan-to-be never observed");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Wait for the subshell to exit, reparenting `orphan` away from `parent`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_tree_snapshot(parent.id())
+            .iter()
+            .any(|&(pid, _)| pid == orphan)
+        {
+            assert!(Instant::now() < deadline, "subshell never exited");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            tree.live_pids(true).contains(&orphan),
+            "a reparented descendant must stay tracked"
+        );
+        tree.kill_all(&mut parent);
+        let _ = parent.wait();
+        wait_dead(orphan, "reparented descendant");
+        let _ = fs::remove_file(&pid_file);
+
+        // 4b. PID-wraparound kill order: when Linux wraps PIDs past `pid_max`, a
+        //     newer grandchild (`lean`, pid 1420) has a numerically smaller PID
+        //     than an older intermediate parent (`lake`, pid 4_194_300), even
+        //     within the same 10ms `starttime` tick. Ordering by `(starttime, seq)`
+        //     still kills the leaf child before its parent.
+        let mut wrapped = TrackedProcessTree::new(4_194_299);
+        wrapped.record_process(4_194_299, 50_000);
+        wrapped.record_process(4_194_300, 50_000); // intermediate parent
+        wrapped.record_process(1_420, 50_000); // wrapped leaf child in same tick
+        wrapped.record_process(900, 50_001); // even newer grandchild in next tick
+        assert_eq!(
+            wrapped.tracked_descendant_order_snapshot(),
+            vec![900, 1_420, 4_194_300],
+            "leaf descendants must die before older parents even across PID wraparound"
+        );
+
+        // 5. A clean exit observed after an over-budget sample stays a success.
+        use std::os::unix::process::ExitStatusExt;
+        let raced_ok = BudgetedOutput {
+            output: std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            budget_exceeded_kib: Some(5 * 1024 * 1024),
+        };
+        let confirm_ok = LeanConfirmRun::from_budgeted_output(&raced_ok, 4 * 1024 * 1024);
+        assert!(confirm_ok.success && !confirm_ok.signal_terminated);
+        assert!(!confirm_ok.stderr.contains("out of memory guard"));
+    }
+
+    #[test]
+    fn unexplained_kernel_rejections_fail_stage2_closed_even_when_killed_or_exhausted() {
+        let killed_note = rss_budget_kill_note(4 * 1024 * 1024, 4200 * 1024);
+        // Exact Lean v4.34.1 `:= by rfl` rejection (`Tactic \`rfl\` failed: ...`).
+        let lean_v434_tactic_rfl_rejection = "oracle/MiriOracleConfirm_000.lean:12:2: error: \
+             Tactic `rfl` failed: The left-hand side\n  1\nis not definitionally equal to the \
+             right-hand side\n  2\n\n⊢ 1 = 2\n";
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            lean_v434_tactic_rfl_rejection,
+            &killed_note
+        ));
+        // Exact Lean v4.34.1 term-mode `rfl` rejection (`Not a definitional equality`)
+        // and legacy Lean 4 `The rfl tactic failed` wording.
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            "oracle/MiriOracleConfirm_000.lean:12:0: error: Not a definitional equality: \
+             the left-hand side\n  1\nis not definitionally equal to the right-hand side\n  2\n",
+            &killed_note
+        ));
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            "oracle/MiriOracleConfirm_000.lean:12:2: error: The rfl tactic failed. Possible \
+             reasons:\n  the left-hand side and right-hand side are not definitionally equal\n",
+            &killed_note
+        ));
+        // Cross-stream isolation: a headerless C++ runtime OOM line on `stderr`
+        // (`LEAN PANIC: out of memory`) or a runtime crash line after an `error:`
+        // block must NEVER merge into the preceding `stdout` `rfl` error block and
+        // mask a kernel rejection.
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            lean_v434_tactic_rfl_rejection,
+            "LEAN PANIC: out of memory\n"
+        ));
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            &format!("{lean_v434_tactic_rfl_rejection}LEAN PANIC: out of memory\n"),
+            ""
+        ));
+        // Exact Lean v4.34.1 `-M` cap error (`(kernel) excessive memory consumption detected`
+        // and elaborator `excessive memory consumption detected at ...`) is classified as
+        // resource exhaustion (`exit 1`, `signal_terminated = false`), never as a rejection.
+        let lean_v434_minus_m_err =
+            "oracle/MiriOracleConfirmFallback_y.lean:1:4: error: (kernel) excessive memory \
+             consumption detected\n";
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            lean_v434_minus_m_err,
+            ""
+        ));
+        assert!(lean_confirm_failure_is_resource_exhaustion(
+            false,
+            lean_v434_minus_m_err
+        ));
+        // A typeclass search that ran out of heartbeats or `-M` memory reports
+        // `failed to synthesize` together with the resource diagnostic in one block:
+        // exhaustion, not rejection.
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            "x.lean:3:0: error: failed to synthesize\n  Decidable p\n(deterministic) timeout at \
+             `typeclass`, maximum number of heartbeats (20000) has been reached\n",
+            ""
+        ));
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            "x.lean:3:0: error: failed to synthesize\n  Decidable p\nexcessive memory \
+             consumption detected at `typeclass`\n",
+            ""
+        ));
+        // The watchdog's own note and pure resource errors are not rejections, nor is a
+        // marker that only appears in a warning.
+        assert!(!lean_output_has_unexplained_kernel_rejection("", &killed_note));
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            "x.lean:1:0: error: (kernel) deep recursion detected\n",
+            ""
+        ));
+        assert!(!lean_output_has_unexplained_kernel_rejection(
+            "x.lean:1:0: warning: unused variable `type mismatch`\n",
+            ""
+        ));
+        // One pure rejection block wins even when another block is exhaustion.
+        assert!(lean_output_has_unexplained_kernel_rejection(
+            "a.lean:1:0: error: (deterministic) timeout at `whnf`, maximum number of heartbeats \
+             (2000000) has been reached\na.lean:9:2: error: type mismatch\n  rfl\n",
+            ""
+        ));
+
+        // Stage level: a budget-killed (or OOM-killed) run that already printed a Lean v4.34.1
+        // `Tactic \`rfl\` failed` rejection fails closed; a killed run or a `-M` exit(1) run
+        // without an unexplained rejection is downgraded with its reason.
+        let entry = |name: &str| -> MiriConfirmEntry {
+            (
+                OracleItemSpec::with_fuel(name.to_string(), 100),
+                format!("MiriDiffCorpus.{name}"),
+                AnnealOutcome::PassScalar {
+                    bits: 1,
+                    size_bytes: 4,
+                },
+            )
+        };
+        let killed_run = |stdout: &str| LeanConfirmRun {
+            success: false,
+            signal_terminated: true,
+            status: "signal: 9 (SIGKILL)".to_string(),
+            stdout: stdout.to_string(),
+            stderr: killed_note.clone(),
+        };
+        let rejected = run_chunked_miri_confirm_stage(
+            &[entry("div_a")],
+            MIRI_CONFIRM_CHUNK_SIZE,
+            1,
+            |_file_name, _entries| Ok(()),
+            |_file_name, _active_workers| Ok(killed_run(lean_v434_tactic_rfl_rejection)),
+        )
+        .expect_err("a printed Lean v4.34.1 `Tactic rfl failed` rejection must fail closed despite the kill");
+        assert!(
+            rejected.contains("Lean kernel confirmation rejected `div_a`")
+                && rejected.contains("Tactic `rfl` failed"),
+            "{rejected}"
+        );
+        let downgraded = run_chunked_miri_confirm_stage(
+            &[entry("div_b"), entry("div_c")],
+            1,
+            1,
+            |_file_name, _entries| Ok(()),
+            |file_name, _active_workers| {
+                if file_name.contains("000") {
+                    Ok(killed_run(""))
+                } else {
+                    Ok(LeanConfirmRun {
+                        success: false,
+                        signal_terminated: false,
+                        status: "exit status: 1".to_string(),
+                        stdout: lean_v434_minus_m_err.to_string(),
+                        stderr: String::new(),
+                    })
+                }
+            },
+        )
+        .expect("RSS watchdog kill and `-M` excessive memory consumption without rejection both downgrade");
+        assert!(downgraded.confirmed.is_empty());
+        assert!(
+            downgraded
+                .unconfirmed
+                .get("div_b")
+                .is_some_and(|reason| reason.contains("out of memory guard")),
+            "{:?}",
+            downgraded.unconfirmed
+        );
+        assert!(
+            downgraded
+                .unconfirmed
+                .get("div_c")
+                .is_some_and(|reason| reason.contains("excessive memory consumption")),
+            "{:?}",
+            downgraded.unconfirmed
+        );
+    }
+
+    /// Classification against verbatim Lean v4.34.1 diagnostics captured from
+    /// this toolchain (`lean` on scratch files): a failing `:= by rfl`, a
+    /// heartbeat timeout (whose `Note:` / `Hint:` continuation is separated by
+    /// blank lines), and `-M` exhaustion while kernel-checking theorems over
+    /// imported definitions (the shape of every `MiriOracleConfirm*` module).
+    ///
+    /// Not covered on purpose: when `-M` is exhausted while checking a
+    /// definition in the *same* file, a dependent theorem then reports
+    /// `(kernel) declaration type mismatch`, which classifies as a rejection
+    /// (fail closed). Confirm modules only define small helpers ahead of their
+    /// theorems (whole modules peak at 0.6-1.1 GiB, far below `-M 4096`), so
+    /// that cascade cannot arise there.
+    #[test]
+    fn stage2_classification_matches_verbatim_lean_v4_34_1_diagnostics() {
+        const RFL_REJECTION: &str = "rfl_fail.lean:2:2: error: Tactic `rfl` failed: The \
+                                     left-hand side\n  1\nis not definitionally equal to the \
+                                     right-hand side\n  2\n\n⊢ 1 = 2\n";
+        const HEARTBEAT_TIMEOUT: &str = "hb.lean:6:19: error: (deterministic) timeout at \
+                                         `isDefEq`, maximum number of heartbeats (1) has been \
+                                         reached\n\nNote: Use `set_option maxHeartbeats <num>` \
+                                         to set the limit.\n\nHint: Additional diagnostic \
+                                         information may be available using the `set_option \
+                                         diagnostics true` command.\n";
+        const MINUS_M_EXHAUSTION: &str = "Use.lean:2:8: error: (kernel) excessive memory \
+                                          consumption detected\nUse.lean:4:8: error: (kernel) \
+                                          excessive memory consumption detected\nUse.lean:6:8: \
+                                          error: (kernel) excessive memory consumption \
+                                          detected\n";
+
+        assert!(lean_output_has_unexplained_kernel_rejection(RFL_REJECTION, ""));
+        for resource_only in [HEARTBEAT_TIMEOUT, MINUS_M_EXHAUSTION] {
+            assert!(!lean_output_has_unexplained_kernel_rejection(resource_only, ""));
+            assert!(lean_confirm_failure_is_resource_exhaustion(false, resource_only));
+        }
+        // One theorem timing out never hides another theorem's rejection.
+        let mixed = format!("{HEARTBEAT_TIMEOUT}{RFL_REJECTION}");
+        assert!(lean_output_has_unexplained_kernel_rejection(&mixed, ""));
+
+        let entry = |name: &str| -> MiriConfirmEntry {
+            (
+                OracleItemSpec::with_fuel(name.to_string(), 100),
+                format!("MiriDiffCorpus.{name}"),
+                AnnealOutcome::PassScalar {
+                    bits: 1,
+                    size_bytes: 4,
+                },
+            )
+        };
+        let exit1 = |stdout: &str| LeanConfirmRun {
+            success: false,
+            signal_terminated: false,
+            status: "exit status: 1".to_string(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        };
+        let stage_for = |stdout: String| {
+            run_chunked_miri_confirm_stage(
+                &[entry("div_v")],
+                MIRI_CONFIRM_CHUNK_SIZE,
+                1,
+                |_file_name, _entries| Ok(()),
+                move |_file_name, _active_workers| Ok(exit1(&stdout)),
+            )
+        };
+        for resource_only in [HEARTBEAT_TIMEOUT, MINUS_M_EXHAUSTION] {
+            let stage = stage_for(resource_only.to_string())
+                .expect("verbatim exhaustion output must downgrade, not abort");
+            assert!(stage.unconfirmed.contains_key("div_v"), "{resource_only}");
+        }
+        for rejecting in [RFL_REJECTION.to_string(), mixed] {
+            let err = stage_for(rejecting).expect_err("a verbatim rfl rejection must fail closed");
+            assert!(err.contains("Tactic `rfl` failed"), "{err}");
+        }
+    }
+
+    #[test]
+    fn stage2_scratch_preserved_on_rejection_and_extract_confirm_theorems_anchors_line_starts() {
+        // 1. On kernel rejection (`Err`), `finalize_stage2_confirm_scratch` leaves the
+        //    rejecting `MiriOracleConfirmFallback_*.lean` module on disk at the path cited
+        //    in `(kernel confirmation modules in <oracle_dir>)`, and cleans scratch files
+        //    only on `Ok`.
+        let tmp = env::temp_dir().join(format!(
+            "anneal-ep1-a4-stage2-scratch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&tmp).expect("create temp oracle dir");
+        let chunk_mod = tmp.join("MiriOracleConfirm_000.lean");
+        let fb_mod = tmp.join("MiriOracleConfirmFallback_bad_item.lean");
+        fs::write(&chunk_mod, "-- chunk\n").unwrap();
+        fs::write(&fb_mod, "-- fallback reproducer\n").unwrap();
+
+        let err = finalize_stage2_confirm_scratch(
+            &tmp,
+            Err("Lean kernel confirmation rejected `bad_item` in oracle/MiriOracleConfirmFallback_bad_item.lean".to_string()),
+        )
+        .expect_err("rejection must propagate");
+        assert!(err.contains(&tmp.display().to_string()), "{err}");
+        assert!(
+            chunk_mod.is_file() && fb_mod.is_file(),
+            "rejecting confirm scratch modules must stay on disk when Stage 2 fails closed"
+        );
+
+        let ok = finalize_stage2_confirm_scratch(
+            &tmp,
+            Ok(ChunkedMiriConfirm {
+                confirmed: Vec::new(),
+                confirmed_groups: Vec::new(),
+                unconfirmed: BTreeMap::new(),
+            }),
+        )
+        .expect("ok stage cleans scratch files");
+        assert!(ok.confirmed.is_empty());
+        assert!(!chunk_mod.exists() && !fb_mod.exists());
+        let _ = fs::remove_dir_all(&tmp);
+
+        // 2. `extract_confirm_theorems` anchors `theorem confirm_*_<fn> :` at line
+        //    starts so a panic-message comment in an earlier group can never spoof
+        //    another candidate's theorem or `linkedCallees` namespace.
+        let g0_entry: MiriConfirmEntry = (
+            OracleItemSpec::with_fuel("cand_decoy".to_string(), 100),
+            "X.cand_decoy".to_string(),
+            AnnealOutcome::Panic { span: None },
+        );
+        let g1_entry: MiriConfirmEntry = (
+            OracleItemSpec::with_fuel("cand_real".to_string(), 100),
+            "X.cand_real".to_string(),
+            AnnealOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4,
+            },
+        );
+        let frames = BTreeMap::new();
+        let mut messages = BTreeMap::new();
+        messages.insert(
+            "cand_decoy".to_string(),
+            b"spoof theorem confirm_tag_cand_real : fake".to_vec(),
+        );
+        let confirm_src = render_multi_group_anneal_confirm_module(
+            "X",
+            &[
+                (vec![g0_entry], vec!["X.helper_wrong".to_string()]),
+                (vec![g1_entry], vec!["X.helper_right".to_string()]),
+            ],
+            &frames,
+            &messages,
+        )
+        .expect("render multi-group confirm");
+        let extracted = extract_confirm_theorems(&confirm_src, "cand_real");
+        assert!(extracted.contains("Mir.X.helper_right.body"), "{extracted}");
+        assert!(
+            !extracted.contains("Mir.X.helper_wrong.body"),
+            "panic comment in group 0 must not hijack cand_real's namespace: {extracted}"
         );
     }
 }

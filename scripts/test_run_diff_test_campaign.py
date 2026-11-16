@@ -8918,5 +8918,240 @@ class PassEp2A4AdversarialRegressionTest(unittest.TestCase):
         self.assertIn("RecursionError", report["results"][0]["detail"])
 
 
+class RunHarnessStdoutAndErrorLinesDiagnosticsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+
+    def test_run_harness_captures_stdout_tail_stderr_tail_and_error_lines_across_all_paths(
+        self,
+    ) -> None:
+        import inspect
+        import io
+
+        sig = inspect.signature(campaign.run_harness)
+        self.assertEqual(
+            list(sig.parameters.keys()),
+            ["repo_root", "bin_name", "harness_args", "json_path"],
+            "4-positional-argument signature must remain intact for monkey-patching",
+        )
+
+        stdout_body = "\n".join(
+            [f"✔ [{i}/64] Built Mir.Ok_{i}" for i in range(1, 10)]
+            + [
+                "✖ [10/64] Building Mir.MiriDiffCorpus.cand_42",
+                "error: Mir/MiriDiffCorpus/cand_42.lean:8:2: unknown constant",
+            ]
+            + [f"✔ [{i}/64] Built Mir.After_{i}" for i in range(11, 35)]
+        )
+        stderr_body = "\n".join(
+            [f"note: progress {i}" for i in range(25)]
+            + ["error: lake build exited with code 1"]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            json_path = tmp_path / "out.json"
+
+            # 1. Non-zero exit captures stdout_tail, stderr_tail, and middle `✖`/`error:`
+            #    lines AND forwards non-empty stdout alongside stderr.
+            err_buf = io.StringIO()
+            failed_proc = subprocess.CompletedProcess(
+                args=[], returncode=137, stdout=stdout_body, stderr=stderr_body
+            )
+            with mock.patch.object(
+                campaign.subprocess, "run", return_value=failed_proc
+            ), mock.patch.object(campaign.sys, "stderr", err_buf):
+                self.assertIsNone(
+                    campaign.run_harness(tmp_path, "miri-difftest", ["--seed", "1"], json_path)
+                )
+            diag = campaign.LAST_HARNESS_DIAGNOSTICS["miri-difftest"]
+            self.assertEqual(diag["exit_code"], 137)
+            self.assertEqual(diag["oracle_error_reason"], "process_exit_137")
+            self.assertEqual(len(diag["stdout_tail"].splitlines()), 20)
+            self.assertEqual(len(diag["stderr_tail"].splitlines()), 20)
+            self.assertEqual(
+                diag["error_lines"],
+                [
+                    "✖ [10/64] Building Mir.MiriDiffCorpus.cand_42",
+                    "error: Mir/MiriDiffCorpus/cand_42.lean:8:2: unknown constant",
+                    "error: lake build exited with code 1",
+                ],
+            )
+            forwarded = err_buf.getvalue()
+            self.assertIn("✖ [10/64] Building Mir.MiriDiffCorpus.cand_42", forwarded)
+            self.assertIn("error: lake build exited with code 1", forwarded)
+
+            # 2. Unreadable JSON, non-object JSON, non-integer field, non-numeric elapsed_ms,
+            #    and success all populate `stdout_tail`, `stderr_tail`, and `error_lines`.
+            ok_proc = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="build line 1\n✖ lake warning-error line\n",
+                stderr="stderr note\nError: diagnostic line\n",
+            )
+            cases = [
+                ("unreadable", "{not valid json", "unreadable_json:"),
+                ("non_object", "[1, 2, 3]", "non_object_json"),
+                ("non_int", '{"total_candidates": "bad"}', "non_integer_total_candidates"),
+                ("non_num_elapsed", '{"elapsed_ms": "bad"}', "non_numeric_elapsed_ms"),
+                ("success", '{"harness": "miri-difftest", "elapsed_ms": 12.5}', None),
+            ]
+            for label, payload, expected_reason_prefix in cases:
+                with self.subTest(path=label):
+                    campaign.LAST_HARNESS_DIAGNOSTICS.clear()
+                    json_path.write_text(payload, encoding="utf-8")
+                    with mock.patch.object(
+                        campaign.subprocess, "run", return_value=ok_proc
+                    ), mock.patch.object(campaign.sys, "stderr", io.StringIO()):
+                        res = campaign.run_harness(
+                            tmp_path, "miri-difftest", [], json_path
+                        )
+                    d = campaign.LAST_HARNESS_DIAGNOSTICS["miri-difftest"]
+                    self.assertIn("stdout_tail", d)
+                    self.assertIn("stderr_tail", d)
+                    self.assertEqual(
+                        d["error_lines"],
+                        ["✖ lake warning-error line", "Error: diagnostic line"],
+                    )
+                    if expected_reason_prefix is None:
+                        self.assertIsNotNone(res)
+                        self.assertIsNone(d["oracle_error_reason"])
+                    else:
+                        self.assertIsNone(res)
+                        self.assertTrue(
+                            str(d["oracle_error_reason"]).startswith(expected_reason_prefix),
+                            d["oracle_error_reason"],
+                        )
+
+            # 3. `error_lines` caps at the last 30 lines when > 30 errors appear.
+            many_errs = "\n".join(f"error: line {i}" for i in range(45))
+            _, _, bounded_errs = campaign.extract_harness_output_diagnostics(many_errs, "")
+            self.assertEqual(len(bounded_errs), 30)
+            self.assertEqual(bounded_errs[0], "error: line 15")
+            self.assertEqual(bounded_errs[-1], "error: line 44")
+
+    def test_markdown_report_surfaces_stdout_tail_and_error_lines_for_failed_suite(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            write_initial_ledger(state_dir, active_fingerprints=[])
+
+            def fake_run_harness(repo_root, bin_name, harness_args, json_path):
+                if bin_name == "miri-difftest":
+                    campaign.LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+                        "exit_code": 0,
+                        "oracle_error_reason": None,
+                        "stdout_tail": "healthy miri stdout",
+                        "stderr_tail": "",
+                        "error_lines": [],
+                        "elapsed_s": 1.0,
+                    }
+                    return make_healthy_miri_report(state_dir)
+                campaign.LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+                    "exit_code": 1,
+                    "oracle_error_reason": "process_exit_1",
+                    "stdout_tail": "✔ [63/64] Built Mir.Foo\n```\nfence in stdout",
+                    "stderr_tail": "Some required builds logged failures",
+                    "error_lines": [
+                        "✖ [12/64] Building Mir.ItreeDiff.broken_cand",
+                        "error: broken_cand.lean:4:0: unexpected token",
+                    ],
+                    "elapsed_s": 5.2,
+                }
+                return None
+
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
+                rc = campaign.main(
+                    ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", ""]
+                )
+            self.assertEqual(rc, campaign.EXIT_HARNESS_FAILED)
+            report_md = (state_dir / "reports" / "LATEST_REPORT.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("## Harness Subprocess Diagnostics", report_md)
+            self.assertIn("✖ [12/64] Building Mir.ItreeDiff.broken_cand", report_md)
+            self.assertIn("✔ [63/64] Built Mir.Foo", report_md)
+            self.assertNotIn("healthy miri stdout", report_md)
+            # Each diagnostic block is labelled so readers can tell the streams apart,
+            # in error_lines -> stderr_tail -> stdout_tail order.
+            labels = [
+                "  - `error_lines` (`✖` / `error:` across stdout + stderr):",
+                "  - `stderr_tail`:",
+                "  - `stdout_tail`:",
+            ]
+            positions = [report_md.find(label) for label in labels]
+            self.assertTrue(all(p >= 0 for p in positions), positions)
+            self.assertEqual(positions, sorted(positions))
+            # The raw ``` inside stdout_tail cannot break out of its fence.
+            self.assertIn("````text\n✔ [63/64] Built Mir.Foo\n```\nfence in stdout\n````", report_md)
+
+    def test_error_lines_capture_rustc_error_codes_from_cargo_run_compile_failures(
+        self,
+    ) -> None:
+        # `run_harness` drives the harness through `cargo run`; a compile failure
+        # reports `error[E0308]: ...` (no `error:` substring) before the summary line.
+        stderr = "\n".join(
+            [
+                "   Compiling anneal-difftest v0.1.0",
+                "error[E0308]: mismatched types",
+                "  --> crates/anneal-difftest/src/miri_eval.rs:42:5",
+                "warning: unused variable `error`",
+                "error: could not compile `anneal-difftest` (lib) due to 1 previous error",
+            ]
+        )
+        stdout_tail, stderr_tail, error_lines = (
+            campaign.extract_harness_output_diagnostics("", stderr)
+        )
+        self.assertEqual(stdout_tail, "")
+        self.assertEqual(stderr_tail, stderr.strip())
+        self.assertEqual(
+            error_lines,
+            [
+                "error[E0308]: mismatched types",
+                "error: could not compile `anneal-difftest` (lib) due to 1 previous error",
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "out.json"
+            failed_proc = subprocess.CompletedProcess(
+                args=[], returncode=101, stdout="", stderr=stderr
+            )
+            with mock.patch.object(
+                campaign.subprocess, "run", return_value=failed_proc
+            ), mock.patch.object(campaign.sys, "stderr", io.StringIO()):
+                self.assertIsNone(
+                    campaign.run_harness(Path(tmp), "miri-difftest", [], json_path)
+                )
+        diag = campaign.LAST_HARNESS_DIAGNOSTICS["miri-difftest"]
+        self.assertEqual(diag["oracle_error_reason"], "process_exit_101")
+        self.assertIn("error[E0308]: mismatched types", diag["error_lines"])
+
+        # Non-E bracketed errors and fatal OOM/panic crash lines without `error:` are
+        # captured, while ordinary source lines like `my_error[end]` are ignored.
+        crash_stderr = "\n".join(
+            [
+                "let v = my_error[end];",
+                "error[internal]: unexpected compiler failure",
+                "out of memory",
+                "LEAN PANIC: stack overflow",
+                "PANIC at Lean.Kernel.whnf",
+                "thread 'main' panicked at src/main.rs:10:5: boom",
+            ]
+        )
+        _, _, crash_errs = campaign.extract_harness_output_diagnostics("", crash_stderr)
+        self.assertEqual(
+            crash_errs,
+            [
+                "error[internal]: unexpected compiler failure",
+                "out of memory",
+                "LEAN PANIC: stack overflow",
+                "PANIC at Lean.Kernel.whnf",
+                "thread 'main' panicked at src/main.rs:10:5: boom",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
