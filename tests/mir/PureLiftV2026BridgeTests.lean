@@ -2486,10 +2486,13 @@ theorem loopBorrow_unitCutpoint_sound :
 /-- **Non-vacuity of `StdValRefines.of_sameCond`,
 `StdValRefines.of_sameAggregateShape_ext`, and `StdValRefines.pair_inv`**:
 exercises the `StdValRefines` bridges for `stdValAlg.sameCond` and
-`stdValAlg.sameAggregateShape`. The `sameCond` transport goes from the oracle
-`symBool c` to `symBool (!!c)`, which is equal to it only propositionally
-(`Bool.not_not`, not by `rfl` for a variable `c`), so the law's equality does
-real work; `sameCond` still separates `symBool c` from `symBool (!c)`. -/
+`stdValAlg.sameAggregateShape`. Both transports cross terms that are equal only
+propositionally (not by `rfl` for a free `c : Bool`): `of_sameCond` transports
+from `symBool c` to `symBool (!!c)` (`Bool.not_not`), and
+`of_sameAggregateShape_ext` transports from `.pair (.nat 10) (.nat 4)` to
+`.pair (.nat (if c then 10 else 10)) (.nat 4)` via field-wise agreement
+(`cases c <;> rfl`), while `sameCond` and `sameAggregateShape` still separate
+distinct conditions and non-pair leaves. -/
 theorem stdValRefines_sameCond_and_sameAggregateShape_canaries (c : Bool) :
     StdValRefines tagOfLoan (.choice (.symBool c) (.nat 10) (.nat 3))
       (.scalar ⟨if c then 10 else 3, 4⟩) ∧
@@ -2498,6 +2501,10 @@ theorem stdValRefines_sameCond_and_sameAggregateShape_canaries (c : Bool) :
     stdValAlg.sameCond (.symBool c) (.symBool (!c)) = false ∧
     StdValRefines tagOfLoan (.pair (.nat 10) (.nat 4))
       (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩]) ∧
+    StdValRefines tagOfLoan
+      (.pair (.nat (if c then 10 else 10)) (.nat 4))
+      (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩]) ∧
+    stdValAlg.sameAggregateShape (.pair (.nat 10) (.nat 4)) (.nat 10) = false ∧
     Exists fun ma => Exists fun mb =>
       Value.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩] =
         .aggregate 0 [ma, mb] ∧
@@ -2518,9 +2525,12 @@ theorem stdValRefines_sameCond_and_sameAggregateShape_canaries (c : Bool) :
       ((stdValAlg_sameCond_symBool_iff c (!!c)).mpr (Bool.not_not c).symm)
       hChoice,
     by cases c <;> rfl,
+    hPair,
     StdValRefines.of_sameAggregateShape_ext
-      (stdValAlg_sameAggregateShape_pair (.nat 10) (.nat 4) (.nat 10) (.nat 4))
-      (fun _ => rfl) hPair,
+      (stdValAlg_sameAggregateShape_pair (.nat 10) (.nat 4)
+        (.nat (if c then 10 else 10)) (.nat 4))
+      (fun _ => by cases c <;> rfl) hPair,
+    rfl,
     hPair.pair_inv rfl⟩
 
 /-! ## Test 3: Hybrid `SpatialPin` Freeze → `zerocopy` Byte Write → Unpin -/
