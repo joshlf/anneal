@@ -1065,15 +1065,32 @@ def _strip_lean_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
+_LEAN_DECL_MODIFIERS = r"(?:(?:private|protected|noncomputable|nonrec|partial|unsafe|scoped)\s+)*"
+# Same-line command prefixes such as `set_option maxHeartbeats 400000 in theorem foo`.
+_LEAN_IN_PREFIXES = (
+    r"(?:(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[^\n]*?\s+in\s+)*"
+)
+
+
+def _truncate_at_lean_exit(stripped_src: str) -> str:
+    """Drop everything after a line-anchored `#exit` (Lean ignores the remainder)."""
+    m = re.search(r"(?m)^[ \t]*#exit\b", stripped_src)
+    return stripped_src[: m.start()] if m else stripped_src
+
+
 def _has_lean_decl(stripped_src: str, symbol: str, *, resolution: bool) -> bool:
+    """Line-anchored declaration scan on comment/string-stripped Lean source.
+
+    Accepts attributes (including nested brackets), declaration modifiers,
+    same-line `... in` command prefixes, and namespace-qualified names
+    (`theorem Ns.symbol`), and rejects primed / suffixed names (`symbol'`).
+    """
     kinds = r"(?:theorem|lemma)" if resolution else r"(?:theorem|lemma|def|abbrev)"
-    mods = (
-        r"(?:private\s+|protected\s+)*"
-        if resolution
-        else r"(?:private\s+|protected\s+|noncomputable\s+)*"
+    pat = (
+        rf"(?:^|\n)[ \t]*{_LEAN_IN_PREFIXES}(?:@\[[^\n]*?\]+\s*)*{_LEAN_DECL_MODIFIERS}"
+        rf"{kinds}\s+(?:[^\W\d][\w'!?]*\.)*{re.escape(symbol)}(?![\w'!?])"
     )
-    pat = rf"(?:^|\n)\s*(?:@\[[^\]]*\]\s*)*{mods}{kinds}\s+{re.escape(symbol)}\b"
-    return bool(re.search(pat, stripped_src))
+    return bool(re.search(pat, _truncate_at_lean_exit(stripped_src)))
 
 
 def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:

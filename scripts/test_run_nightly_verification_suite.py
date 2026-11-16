@@ -238,6 +238,49 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "**missing resolution** `step_binOp_offset_disabled_simulation`", md
             )
 
+        # Scanner robustness: namespace-qualified, same-line `... in`-prefixed, and
+        # `nonrec` / attributed witnesses are live (`open`), while a resolution that
+        # only appears after `#exit` or only under a primed name does not count.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={"DIV-LM-ENUM-SET-DISCR-UNINIT", "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC"},
+            )
+            prov = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with prov.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "theorem ProvenanceWitness.callerRefMutSilentWrongLocal_divergence : "
+                    "True := trivial\n"
+                    "set_option maxHeartbeats 400000 in theorem "
+                    "callerBorrowAcrossScalarCall_divergence : True := trivial\n"
+                )
+            ref = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean"
+            with ref.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "open Foo in\n@[reducible] nonrec def twoPhaseDirectWriteTreeBorrowsGap : "
+                    "Nat := 0\n"
+                    "theorem retagFnEntryLocalDealloc_simulation' : True := trivial\n"
+                )
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "#exit\ntheorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing"),
+                    ("DIV-MR-CALL-TARGET-LOCAL", "open"),
+                    ("DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL", "open"),
+                    ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
+                    ("DIV-MR-TB-TWOPHASE-DIRECT-WRITE", "open"),
+                ],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 3)
+
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / "state_out"

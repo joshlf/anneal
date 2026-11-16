@@ -31292,7 +31292,18 @@ combinations after `DIV-LM-D6-OFFSET-DISABLED-TAG` resolution:
 1. **Lockstep step**: `StepRelLM3_1` holds, `stepMirFn` steps, and `lean-miri` returns `.ok true`.
 2. **Lockstep UB**: `StepRelLM3_1` holds, `stepMirFn` fails with `.ub`, and `lean-miri` raises UB.
 3. **Unsound unsigned wrap-around divergence**: `rhsTy.kind = .uint .usize`, `2 ^ 63 ≤ sc.bits`,
-   `stepMirFn` steps backward, and `lean-miri` raises `"PointerArithOverflow"` UB. -/
+   `stepMirFn` steps backward, and `lean-miri` raises `"PointerArithOverflow"` UB.
+
+Side conditions: `hreach` excludes the zero-count corner of a pointer strictly past the end of a
+live target (`sc.bits = 0`, `off ≠ 0`, live non-`allocDead` target, `off > |t|`). `hnot_dead`
+excludes a `.disabled` entry with `allocDead = true` whose target local is live again. That state
+is admitted by `StateRelLM3_1` only because `AllocMapRel` has no field linking
+`AllocMapEntry.allocDead` to `lean-miri` allocation liveness, and in it Anneal's
+`ptrAllocByteBound?` (`allocDead ↦ some 0`) faults on positive offsets while `local_alloc_sync`
+makes `e.allocId` live in `lean-miri`. It is unreachable from the composed fragment
+(`WellTypedLM3_1StateStmt.storageLive` requires `∀ e ∈ allocMap, e.localIdx ≠ loc`; revived
+locals are handled by `StateRelLM3_1Revived`). Adding an `allocDead`/liveness field to
+`AllocMapRel` would discharge `hnot_dead` from `hstate`. -/
 theorem step_binOp_offset_d6_partition
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
