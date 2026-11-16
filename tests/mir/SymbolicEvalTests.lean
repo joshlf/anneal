@@ -3715,6 +3715,31 @@ theorem v26ReadAndOffsetModular_verified :
       v26FfiReadRegEnsMir
       []⟩
 
+/-- Soundness canary (Pitfall A, return side): the closure-deref `ensures` companion of
+`ffi_read_reg` is also satisfied by an untyped aggregate return value wrapping `42`
+(`extractValueScalarSlice0?` reads only its leading scalar slice), so the deref path of
+`checkCalleeEnsuresPinsRet` may pin a callee's return value to `.scalar ⟨42, 4⟩` only under
+the callee contract's `retMatchesCalleeReturnTy` typing (`OptRetIsScalarOfWidth`). -/
+theorem v26FfiReadRegEnsUntypedRet_accepted :
+    MirBoolPredicateHolds v26FfiReadRegEnsMir
+      ([.scalar ⟨10, 4⟩] ++ [.aggregate 0 [.scalar ⟨42, 4⟩]]) :=
+  mirBoolPredicateHolds_of_wp_fuelFree v26FfiReadRegEnsMir _
+
+/-- The closure-deref checkers are exact: a wrong pinned value, a pin or return width that
+disagrees with the `u32` parameter / return binder, and a loosened upper bound are all
+rejected. -/
+theorem v26ClosureDerefCheckers_reject_mismatches :
+    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir (.some v26FfiReadRegReqMir) [⟨11, 4⟩] = false ∧
+    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir (.some v26FfiReadRegReqMir) [⟨10, 8⟩] = false ∧
+    checkSubjectParamsMatchWidths v26FfiReadRegMir [⟨10, 4⟩] = true ∧
+    checkSubjectParamsMatchWidths v26FfiReadRegMir [⟨10, 8⟩] = false ∧
+    checkCalleeEnsuresPinsRet 64 v26FfiReadRegEnsMir [.scalar ⟨10, 4⟩] ⟨41, 4⟩ = false ∧
+    checkCalleeEnsuresPinsRet 64 v26FfiReadRegEnsMir [.scalar ⟨10, 4⟩] ⟨42, 8⟩ = false ∧
+    extractMirUpperBound1 64 v26ClampAddOneReqMir = .some ⟨15, 4⟩ ∧
+    checkMirUpperBound1ForSubject 64 v26ClampAddOneMir v26ClampAddOneReqMir ⟨15, 4⟩ = true ∧
+    checkMirUpperBound1ForSubject 64 v26ClampAddOneMir v26ClampAddOneReqMir ⟨16, 4⟩ = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
 /-!

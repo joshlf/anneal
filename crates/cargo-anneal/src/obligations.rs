@@ -1144,6 +1144,12 @@ pub fn render_obligations_module_with_options(
     ));
 
     let sha = &bundle.subject.target.mir_module_sha256;
+    // Without an authored `Specs.<item>` module, `claimFor` is phrased over the
+    // instantiated `defaultPreFor` / `defaultPostFor` companions (like `sigPre` /
+    // `sigPost`), so its `ItemSpec` instance binder is only threaded through to
+    // keep the `polyClaim` signature uniform. Name it `_spec` in that case so the
+    // generated module stays free of `linter.unusedVariables` warnings.
+    let claim_for_spec_binder = if authored.has_specs { "spec" } else { "_spec" };
     let claim_for_pre_head = if authored.has_specs {
         "spec.pre args"
     } else {
@@ -1157,7 +1163,7 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "/-- Verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
          def claimFor\n    \
-             [spec : ItemSpec \"{def_id}\"]\n    \
+             [{claim_for_spec_binder} : ItemSpec \"{def_id}\"]\n    \
              (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              pre := fun args =>\n      \
@@ -2656,6 +2662,15 @@ mod tests {
         );
         assert!(authored_obligations.contains("And (spec.pre args)"));
         assert!(authored_obligations.contains("And (spec.post args ret)"));
+        // The authored rendering consumes its `ItemSpec` instance; the default
+        // rendering only threads it through (`_spec`), so neither emits an
+        // `unusedVariables` lint warning.
+        assert!(authored_obligations.contains(
+            "def claimFor\n    \
+                 [spec : ItemSpec \"my_crate::math::inc\"]\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst) : Claim :="
+        ));
+        assert!(!obligations.contains("[spec : ItemSpec \"my_crate::math::inc\"]\n    (typeArgs"));
         assert!(obligations.contains(
             "def sigPre\n    \
                  (typeArgs : Trusted.MirAst.TypeSubst)\n    \
@@ -2677,7 +2692,7 @@ mod tests {
         ));
         assert!(obligations.contains(
             "def claimFor\n    \
-                 [spec : ItemSpec \"my_crate::math::inc\"]\n    \
+                 [_spec : ItemSpec \"my_crate::math::inc\"]\n    \
                  (typeArgs : Trusted.MirAst.TypeSubst) : Claim :="
         ));
         assert!(obligations.contains(

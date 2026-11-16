@@ -455,14 +455,18 @@ def defaultCallContract : MirCallContract where
     And (req.defPath = "frame_tutor::pin_magic") (defaultPre req.args)
   post req ans :=
     ∃ retVal,
-      And (ans = .returned retVal req.memory) (defaultPost req.args retVal)
+      And (ans = .returned retVal req.memory)
+          (And (defaultPost req.args retVal)
+                (Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.FrameTutor.pin_magic.body retVal))
 
 /-- Low-priority default `ItemSpec` instance for `frame_tutor::pin_magic`.
     An authored normal-priority `ItemSpec` instance in `Specs.FrameTutor.pin_magic`
     automatically overrides this instance via Lean typeclass
     synthesis. -/
 instance (priority := low) defaultSpec : ItemSpec "frame_tutor::pin_magic" where
-  pre := defaultPre
+  pre := fun args =>
+    And (defaultPre args)
+        (Trusted.VerificationResult.argsMatchCalleeParamTys Mir.FrameTutor.pin_magic.body args)
   post := defaultPost
 
 /-- Signature-typed stateful precondition for `frame_tutor::pin_magic` instantiated at
@@ -657,17 +661,17 @@ def ubExceptionClaim [spec : UbExceptionItemSpec "frame_tutor::pin_magic"] : UbE
 
 /-- Verification claim for `frame_tutor::pin_magic` instantiated at `typeArgs`. -/
 def claimFor
-    [spec : ItemSpec "frame_tutor::pin_magic"]
+    [_spec : ItemSpec "frame_tutor::pin_magic"]
     (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=
   { body := Mir.FrameTutor.pin_magic.body.instantiate typeArgs
     pre := fun args =>
-      And (spec.pre args)
+      And (defaultPreFor typeArgs args)
           (Trusted.VerificationResult.argsMatchSignature
             (Mir.FrameTutor.pin_magic.body.instantiate typeArgs)
             args
             (initMachineState (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) args).memory)
     post := fun args ret =>
-      And (spec.post args ret)
+      And (defaultPostFor typeArgs args ret)
           (Trusted.VerificationResult.retMatchesSignature
             (Mir.FrameTutor.pin_magic.body.instantiate typeArgs)
             ret

@@ -1385,15 +1385,53 @@ theorem limit2_positive_deref_shared_u32_prefix_of_larger_alloc_consistent :
         tr out :=
   checkRawByteTraceObsErasedBounded_sound 20 Mir.TracePkg.deref_shared_u32.body [] derefPrefixShadowTable derefPrefixRawTrace rfl
 
+-- Each fault-path evaluation is checked in its own declaration: `maxHeartbeats`
+-- budgets a whole declaration, and elaborating all six `rfl` evaluations inside a
+-- single declaration exceeds 400000 heartbeats on Lean v4.34.1, whereas each one
+-- alone stays far below that budget. The conjunction is then reassembled verbatim.
 set_option maxHeartbeats 400000 in
+theorem limit2_negative_unregistered_ptr_shared_check_faults :
+    checkRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] [] derefSharedRawTrace = false := by
+  exact rfl
+
+set_option maxHeartbeats 400000 in
+theorem limit2_negative_unregistered_ptr_shared_diag_faults :
+    (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] [] derefSharedRawTrace).tagName = "step_faulted" := by
+  exact rfl
+
+set_option maxHeartbeats 400000 in
+theorem limit2_negative_no_bytes_ptr_shared_check_faults :
+    checkRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] derefSharedNoBytesShadowTable derefSharedRawTrace = false := by
+  exact rfl
+
+set_option maxHeartbeats 400000 in
+theorem limit2_negative_no_bytes_ptr_shared_diag_faults :
+    (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] derefSharedNoBytesShadowTable derefSharedRawTrace).tagName = "step_faulted" := by
+  exact rfl
+
+set_option maxHeartbeats 400000 in
+theorem limit2_negative_unregistered_ptr_mut_check_faults :
+    checkRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_mut_u32.body [] [] derefMutRawTrace = false := by
+  exact rfl
+
+set_option maxHeartbeats 400000 in
+theorem limit2_negative_unregistered_ptr_mut_diag_faults :
+    (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_mut_u32.body [] [] derefMutRawTrace).tagName = "step_faulted" := by
+  exact rfl
+
 theorem limit2_negative_unregistered_ptr_deref_faults :
     checkRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] [] derefSharedRawTrace = false ∧
     (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] [] derefSharedRawTrace).tagName = "step_faulted" ∧
     checkRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] derefSharedNoBytesShadowTable derefSharedRawTrace = false ∧
     (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_shared_u32.body [] derefSharedNoBytesShadowTable derefSharedRawTrace).tagName = "step_faulted" ∧
     checkRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_mut_u32.body [] [] derefMutRawTrace = false ∧
-    (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_mut_u32.body [] [] derefMutRawTrace).tagName = "step_faulted" := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+    (diagnoseRawByteTraceObsErasedBounded 20 Mir.TracePkg.deref_mut_u32.body [] [] derefMutRawTrace).tagName = "step_faulted" :=
+  ⟨limit2_negative_unregistered_ptr_shared_check_faults,
+    limit2_negative_unregistered_ptr_shared_diag_faults,
+    limit2_negative_no_bytes_ptr_shared_check_faults,
+    limit2_negative_no_bytes_ptr_shared_diag_faults,
+    limit2_negative_unregistered_ptr_mut_check_faults,
+    limit2_negative_unregistered_ptr_mut_diag_faults⟩
 
 /-! ### Issue I-08 Limit 3: Reject/flag external calls taking `&mut` or raw-pointer args -/
 
