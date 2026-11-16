@@ -788,6 +788,74 @@ theorem split_at_mut_evalStmt_withLayouts_end_to_end :
   subst hEntry
   exact ⟨rfl, hRoot2, hL2, hR2, rfl⟩
 
+/-! ### The connected trusted run: lens bytes = trusted image of the written backing array -/
+
+/-- The backing array `_0` before the writes, after `(*_5)[1] = 20`, and after `(*_6)[0] = 30`. -/
+def backing0 : Value := .aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]
+
+def backingL : Value := .aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]
+
+def backingLR : Value :=
+  .aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨4, 4⟩]
+
+def splitStmtL : Statement :=
+  { kind := .assign derefDstL (.use (Anneal.MirLoops.constU32 20)), span := "write_left" }
+
+def splitStmtR : Statement :=
+  { kind := .assign derefDstR (.use (Anneal.MirLoops.constU32 30)), span := "write_right" }
+
+/-- A MIR body executing both `split_at_mut` writes and returning the backing array `_0`. -/
+def splitWriterMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "split::writer" 0 []
+    [{ statements := [splitStmtL, splitStmtR], terminator := { kind := .return_, span := "ret" },
+       isCleanup := false }]
+
+/-- The post-split machine state: live backing array, child fat pointers in `_5` / `_6`, and
+the split borrow table. -/
+def splitRunS0 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := liveChildLocals }
+    memory := { borrows := splitChildBorrows } }
+
+/-- **Connected trusted `split_at_mut` run.** The lens facts are about the *trusted run*, not a
+side buffer: the initial backing array encodes (trusted `encodeUntypedValueToBytes`) to the
+initial lens buffer `bytes16`; the trusted bounded evaluator runs both writes through
+`evalStmt` (data written into `_0`, borrows updated by `invalidateDerefWriteBorrowsWithLayouts`)
+and returns the final backing array with final borrow table `derefWithLayoutsBorrowsLR`; that
+array encodes to `bytesW2` and decodes back from it at `[u32; 4]`; and over exactly `bytesW2` in
+exactly that table, the root lens views the reassembled `[1, 20, 30, 4]` while both child lenses
+stay live. -/
+theorem split_at_mut_trusted_run_connected :
+    get? splitRunS0.frame.locals 0 = some (.init backing0) ∧
+      encodeUntypedValueToBytes defaultCodecFuel backing0 = some bytes16 ∧
+      evalStmt splitRunS0 splitStmtL =
+        MirStepNode.step
+          { frame := { blockIdx := 0, stmtIdx := 1, locals := liveChildLocals.set 0 (.init backingL) }
+            memory := { borrows := derefWithLayoutsBorrowsL } } ∧
+      encodeUntypedValueToBytes defaultCodecFuel backingL = some bytesW1 ∧
+      Anneal.MirFuelFree.runMirExecBounded 4 splitWriterMir (.running splitRunS0) =
+        some (.normal (backingLR, { borrows := derefWithLayoutsBorrowsLR })) ∧
+      encodeUntypedValueToBytes defaultCodecFuel backingLR = some bytesW2 ∧
+      decodeValueFromBytes defaultCodecFuel layouts64 { kind := .array (.uint .u32) 4, layoutIdx := 0 }
+        bytesW2 = some backingLR ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 77 wide4
+        [u 1, u 20, u 30, u 4] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 79
+        (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, split_at_mut_evalStmt_withLayouts_end_to_end.2.1,
+    split_at_mut_evalStmt_withLayouts_end_to_end.2.2.1,
+    split_at_mut_evalStmt_withLayouts_end_to_end.2.2.2.1⟩
+
+/-- Negative: replaying the right write on the *pre-split* table, where `79` has no entry,
+leaves the borrow table untouched (`invalidateDerefWriteBorrowsWithLayouts` is the identity
+without a writer entry), so the root never sees a child access through an unknown tag. -/
+theorem deref_write_unknown_tag_is_identity :
+    invalidateDerefWriteBorrowsWithLayouts [] emptyLayoutTable liveChildLocals
+      (rootSlEntry :: { rootSlEntry with tag := 90 } :: []) derefDstR [.constantIndex 0 0 false] =
+        rootSlEntry :: { rootSlEntry with tag := 90 } :: [] :=
+  rfl
+
 /-- The trusted deref write through `_5` really transitions the table (the left child's
 `.reservedFrz false` is activated to `.unique`), so the theorem above is not about an identity
 update. -/
@@ -1455,6 +1523,52 @@ theorem polymorphic_cone_narrowing_end_to_end :
     runCfgWithCallees_cone_narrow_of_closed_poly_wf coneSizeOfVal 8 polySizeOfValSliceCallerMir
       [WidePtrVal.toValue 8 wide4] emptyMemory (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
       (calleesAgreeOn_coneBodies coneSizeOfVal fullCallees) rfl hNoTraitSize rfl rfl⟩
+
+/-- **Decidable polymorphic narrowing** (`runCfgWithCallees_coneBodies_narrow_of_closed_poly`
+and its `wpMirExecSym` / `MirWpConverges` forms): the generic `polyId::<u32>` caller is narrowed
+to its call cone from the single `rfl`-checked `CallConeClosedPoly` fact, with no hand-proved
+trait-impl side condition. -/
+theorem polyId_coneBodies_narrow_decidable :
+    CallConeClosedPoly conePolyId polyIdCallerMir fullPolyCallees polyIdCallerMir.traitImpls = true ∧
+      runCfgWithCallees 8 polyIdCallerMir [] emptyMemory (coneBodies conePolyId fullPolyCallees) =
+        (runCfgWithCallees 8 polyIdCallerMir [] emptyMemory fullPolyCallees).map
+          (MirOutcome.mapMem (Memory.withCallees (coneBodies conePolyId fullPolyCallees))) ∧
+      (wpMirExecSym 8 polyIdCallerMir
+          (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            polyIdCallerMir [] emptyMemory (coneBodies conePolyId fullPolyCallees))) retIs42 ↔
+        wpMirExecSym 8 polyIdCallerMir
+          (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            polyIdCallerMir [] emptyMemory fullPolyCallees)) retIs42) ∧
+      (Anneal.MirFuelFree.MirWpConverges polyIdCallerMir
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            polyIdCallerMir [] emptyMemory (coneBodies conePolyId fullPolyCallees)) retIs42 ↔
+        Anneal.MirFuelFree.MirWpConverges polyIdCallerMir
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            polyIdCallerMir [] emptyMemory fullPolyCallees) retIs42) :=
+  ⟨rfl,
+    runCfgWithCallees_coneBodies_narrow_of_closed_poly conePolyId 8 polyIdCallerMir [] emptyMemory
+      (Or.inl (fun h => by cases h)) (Or.inl (fun h => by cases h)) rfl rfl rfl,
+    wpMirExecSym_coneBodies_narrow_of_closed_poly conePolyId 8 polyIdCallerMir [] emptyMemory
+      (Or.inl (fun h => by cases h)) (Or.inl (fun h => by cases h)) rfl rfl rfl retIs42
+      (retIs42_insensitive _),
+    mirWpConverges_coneBodies_narrow_of_closed_poly conePolyId polyIdCallerMir [] emptyMemory
+      (Or.inl (fun h => by cases h)) (Or.inl (fun h => by cases h)) rfl rfl rfl retIs42
+      (retIs42_insensitive _)⟩
+
+/-- A table whose `heavyCallee2` body registers a trait impl targeting `cone::polyId`. -/
+def traitDispatchCallees : CalleeEnv :=
+  [polyIdMir,
+   { heavy2Mir with
+     traitImpls := [{ traitRef := { defPath := "cone::polyId", args := [.uint .u32] },
+                      implPath := "cone::PolyImpl::poly_id" }] },
+   heavy3Mir]
+
+/-- Negative canary: once a trait impl can intercept `cone::polyId`, the polymorphic closure
+check fails closed (trait dispatch may resolve to a body outside the cone), even though the
+direct call and the cone body are unchanged. -/
+theorem trait_dispatch_fails_closed_poly :
+    CallConeClosedPoly conePolyId polyIdCallerMir traitDispatchCallees
+      polyIdCallerMir.traitImpls = false := rfl
 
 /-! ## Kernel axiom audit -/
 

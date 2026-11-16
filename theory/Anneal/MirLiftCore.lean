@@ -17545,6 +17545,73 @@ theorem mirWpConverges_cone_narrow_of_closed_poly_wf (cone : List DefPath) (body
           (closedInvPoly_init_of_wf cone body args mem h₁ h_ac h_cs))
         h_at).2 h⟩
 
+/-- `CallConeClosedPoly` also rules out trait-impl dispatch for every cone target in the
+narrowed table `coneBodies cone c₁` (filtering never adds a `TraitImplEntry`). -/
+theorem noTraitImpl_coneBodies_of_callConeClosedPoly {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti : List TraitImplEntry}
+    (h_closed : CallConeClosedPoly cone root c₁ ti = true) :
+    ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (ti ++ flatMapTraitImpls (coneBodies cone c₁)) dp = false := by
+  intro dp hdp
+  have h := noTraitImpl_of_callConeClosedPoly h_closed hdp
+  rw [hasTraitImplForDefPath_append, Bool.or_eq_false_iff] at h ⊢
+  exact ⟨h.1, hasTraitImplForDefPath_flatMapTraitImpls_coneBodies cone c₁ dp h.2⟩
+
+/--
+**Decidable polymorphic narrowing to the call cone (`runCfgWithCallees`).** The single
+`rfl`/`decide`-checkable condition `CallConeClosedPoly cone body c₁ body.traitImpls = true`
+discharges *both* side conditions of `runCfgWithCallees_cone_narrow_of_closed_poly_wf` (cone
+agreement and absence of trait-impl dispatch in the narrowed table) for `c₂ := coneBodies cone c₁`.
+-/
+theorem runCfgWithCallees_coneBodies_narrow_of_closed_poly (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {c₁ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem (coneBodies cone c₁))
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    runCfgWithCallees fuel body args mem (coneBodies cone c₁) =
+      (runCfgWithCallees fuel body args mem c₁).map
+        (MirOutcome.mapMem (Memory.withCallees (coneBodies cone c₁))) :=
+  runCfgWithCallees_cone_narrow_of_closed_poly_wf cone fuel body args mem h₁ h₂
+    (calleesAgreeOn_coneBodies cone c₁) h_closed
+    (noTraitImpl_coneBodies_of_callConeClosedPoly h_closed) h_ac h_cs
+
+/-- **Decidable polymorphic narrowing to the call cone (`wpMirExecSym`).** -/
+theorem wpMirExecSym_coneBodies_narrow_of_closed_poly (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {c₁ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem (coneBodies cone c₁))
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees (coneBodies cone c₁)) out) ↔
+      post out) :
+    wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          (coneBodies cone c₁))) post ↔
+      wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          c₁)) post :=
+  wpMirExecSym_cone_narrow_of_closed_poly_wf cone fuel body args mem h₁ h₂
+    (calleesAgreeOn_coneBodies cone c₁) h_closed
+    (noTraitImpl_coneBodies_of_callConeClosedPoly h_closed) h_ac h_cs post h_post
+
+/-- **Decidable polymorphic narrowing to the call cone (`MirWpConverges`).** -/
+theorem mirWpConverges_coneBodies_narrow_of_closed_poly (cone : List DefPath)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {c₁ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem (coneBodies cone c₁))
+    (h_closed : CallConeClosedPoly cone body c₁ body.traitImpls = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees (coneBodies cone c₁)) out) ↔
+      post out) :
+    MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          (coneBodies cone c₁)) post ↔
+      MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) post :=
+  mirWpConverges_cone_narrow_of_closed_poly_wf cone body args mem h₁ h₂
+    (calleesAgreeOn_coneBodies cone c₁) h_closed
+    (noTraitImpl_coneBodies_of_callConeClosedPoly h_closed) h_ac h_cs post h_post
+
 end CallConeNarrowing
 
 end Anneal.MirLiftCore
