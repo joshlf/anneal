@@ -2162,6 +2162,24 @@ theorem StepsTo.exists_subIdWrap_of_invClosedNoFork
       (invClosedNoFork_of_blockCfgStep_cont stepBb hClosed hInv hstep)
       (subIdWrap_of_blockCfgStep_cont stepBb hEmit hInv hWrap hstep)
 
+/-- **Header-targeted invariant preservation (`runBlockCfgToBlock = .reached s'`)
+under `InvClosedNoFork` alone**: requires only `InvClosedNoFork` (even when the
+CFG emits non-sub-identity wrappers, i.e. `¬ EmitsSubIdWraps`) to conclude
+`s'.bb = target ∧ s'.wait = 0 ∧ BlockInv s'.bb s'.st` at a reached join block. -/
+theorem runBlockCfgToBlock_inv_of_invClosedNoFork
+    {stepBb : Nat → State → BlockStepResult State Ret}
+    {BlockInv : Nat → State → Prop} (hClosed : InvClosedNoFork stepBb BlockInv)
+    {target bound : Nat} {s s' : BlockMachineState State Ret}
+    (hInv : BlockInv s.bb s.st)
+    (hRun : runBlockCfgToBlock stepBb target bound s = .reached s') :
+    s'.bb = target ∧ s'.wait = 0 ∧ BlockInv s'.bb s'.st := by
+  obtain ⟨hBb, hWait⟩ := runBlockCfgToBlock_reached_wait_zero hRun
+  obtain ⟨t, hEq, hInv'⟩ :=
+    StepsTo.exists_of_invClosedNoFork hClosed
+      (PureMirExec.stepsTo_of_runToTarget_reached hRun) hInv
+  subst hEq
+  exact ⟨hBb, hWait, hInv'⟩
+
 /-- **Header-targeted reachability (`runBlockCfgToBlock = .reached s'`) under
 `InvClosedNoFork` and `EmitsSubIdWraps`**: unlike `runBlockCfgToBlock_sound`
 (which requires a full `LocalBlockVC` across all reachable blocks), this rule
@@ -6220,34 +6238,48 @@ theorem natCountdownStep_stepInv :
 
 /-- **API coverage canary**: every remaining public interop theorem that no
 other canary uses is exercised once, non-vacuously, on a concrete machine:
-1. `wpConverges_of_stepInv_rank` (generic, rank `id`) on `natCountdownStep`;
+1. `wpConverges_of_stepInv_rank` (generic, rank `id`) and `StepsTo.exists_of_stepInv`
+   on `natCountdownStep`;
 2. `runBlockCfgLoop_forkFree_of_fault` on a genuine wrapper-rejection fault of
    `partialWrapCfg` (no fork involved);
 3. `evalFuel_blockCfgStep_ne_faulted_of_blockInv` on the countdown from every
    start value and fuel;
-4. `wpConverges_blockCfgStep_iff_of_noFork_loop` from the mid-delay state
-   (`wait = 2`, pending `(+ 10)`) of `convergedJumpTestCfg true`;
-5. `runBlockCfg_forkFree_eq_of_invClosedNoFork` and
-   `evalFuel_blockCfgStep_eq_of_blockInv` at every fuel;
-6. `wpConverges_blockCfgStep_iff_of_blockInv_loop` under the pending wrapper
-   `(+ 1)` from the countdown exit block;
+4. `wpConverges_blockCfgStep_iff_of_noFork_loop` (both `.mpr` and `.mp`) from
+   the mid-delay state (`wait = 2`, pending `(+ 10)`) of `convergedJumpTestCfg true`;
+5. `runBlockCfg_forkFree_eq_of_invClosedNoFork`,
+   `evalFuel_blockCfgStep_eq_of_blockInv`, and
+   `runBlockCfgToBlock_inv_of_invClosedNoFork` (on `convergedJumpTestCfg true`,
+   where `¬ EmitsSubIdWraps` holds and `armSteps = 2`);
+6. `wpConverges_blockCfgStep_iff_of_blockInv_loop` (both `.mpr` and `.mp`) under
+   the pending wrapper `(+ 1)` from the countdown exit block;
 7. `evalFuel_blockCfgStep_stepBasicBlock_handleFree`,
-   `wpConverges_blockCfgStep_stepBasicBlock_handleFree`, and `evalPlan_skip` on
-   the symbolic diamond of `sampleBranchBlockCfg`. -/
+   `wpConverges_blockCfgStep_stepBasicBlock_handleFree`, `evalPlan_skip`,
+   `unpinFromSpatialInState`, `cellsOfAbstractBytes_ne_init`, and
+   `allBytesInitialized_abstractBytesOfCells`. -/
 theorem interop_api_coverage_canaries (n : Nat) :
     PureMirExec.WpConverges natCountdownStep n (· = 100) ∧
+    (Exists fun s' => s' = n ∧ (fun _ : Nat => True) s') ∧
     runBlockCfgLoop (forkFree partialWrapCfg) 3 0 0 3 = .fault ∧
     (∀ k, PureMirExec.evalFuel (blockCfgStep testCfgStep) k ⟨some, 0, n, 0⟩ ≠
       .faulted) ∧
     PureMirExec.WpConverges (blockCfgStep (convergedJumpTestCfg true))
       ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩
       (· = (n + 5) * 2 + 10) ∧
+    (Exists fun k => Exists fun v =>
+      runBlockCfgLoop (convergedJumpTestCfg true) k 2 1 (n + 5) = .ret v ∧
+      Exists fun v' =>
+        composeWrap some (fun x => some (x + 10)) v = some v' ∧
+        v' = (n + 5) * 2 + 10) ∧
     (∀ k, runBlockCfg (forkFree invClosedPartialCfg) 0 3 k =
       runBlockCfg invClosedPartialCfg 0 3 k) ∧
     (∀ k, PureMirExec.evalFuel (blockCfgStep testCfgStep) k ⟨some, 0, n, 0⟩ =
       outcomeToFuel some (runBlockCfgLoop testCfgStep k 0 0 n)) ∧
+    convergedJumpTestInv 40 1 45 ∧
     PureMirExec.WpConverges (blockCfgStep testCfgStep)
       ⟨fun v => some (v + 1), 2, 0, 0⟩ (· = 101) ∧
+    (Exists fun k => Exists fun v =>
+      runBlockCfgLoop testCfgStep k 0 2 0 = .ret v ∧
+      Exists fun v' => (some (v + 1) : Option Nat) = some v' ∧ v' = 101) ∧
     handleFreeOut stdValAlg
       ⟨stdValAlg.zipVal (.symBool true) (.nat 10) (.nat 20), []⟩ = true ∧
     PureMirExec.WpConverges
@@ -6256,7 +6288,13 @@ theorem interop_api_coverage_canaries (n : Nat) :
       (fun out =>
         out = ⟨stdValAlg.zipVal (.symBool true) (.nat 10) (.nat 20), []⟩ ∧
         handleFreeOut stdValAlg out = true) ∧
-    evalPlan stdValAlg .skip sampleSymSt2 = .ok (.continuing sampleSymSt2) :=
+    evalPlan stdValAlg .skip sampleSymSt2 = .ok (.continuing sampleSymSt2) ∧
+    unpinFromSpatialInState stdValAlg 99 valueCellCodec sampleSymSt2 =
+      .fail ∧
+    (∀ (w : StdVal),
+      ([.rawByte 1] : List (CellVal StdVal)) ≠ [.init w]) ∧
+    Anneal.BitValidity.allBytesInitialized [.init 1 none] =
+      !hasUninitCell ([.rawByte 1] : List (CellVal StdVal)) :=
   ⟨wpConverges_of_stepInv_rank natCountdownStep_stepInv id
      (fun s s' _ h => by
        cases s with
@@ -6266,6 +6304,8 @@ theorem interop_api_coverage_canaries (n : Nat) :
          subst hEq
          exact Nat.lt_succ_self m)
      n trivial,
+   StepsTo.exists_of_stepInv natCountdownStep_stepInv
+     (PureMirExec.StepsTo.refl (rfl : n = n)) trivial,
    runBlockCfgLoop_forkFree_of_fault partialWrapCfg 3 0 0 3 rfl,
    fun k => evalFuel_blockCfgStep_ne_faulted_of_blockInv testCfgStep countdownInv
      (· = 100) countdown_localBlockVC 0 n 0 (Or.inl rfl) k,
@@ -6273,21 +6313,43 @@ theorem interop_api_coverage_canaries (n : Nat) :
      (convergedJumpTestCfg_noFork true)
      ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩ _).mpr
      ⟨3, (n + 5) * 2, rfl, _, rfl, rfl⟩,
+   (wpConverges_blockCfgStep_iff_of_noFork_loop (convergedJumpTestCfg true)
+     (convergedJumpTestCfg_noFork true)
+     ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩ _).mp
+     ⟨3, (n + 5) * 2 + 10, rfl, rfl⟩,
    fun k => runBlockCfg_forkFree_eq_of_invClosedNoFork invClosedPartialCfg
      invClosedReachable invClosedPartialCfg_invClosedNoFork k 0 3 (Or.inl rfl),
    fun k => evalFuel_blockCfgStep_eq_of_blockInv testCfgStep countdownInv (· = 100)
      countdown_localBlockVC_orig (fun bb st _ => testCfgStep_noFork bb st) k
      ⟨some, 0, n, 0⟩ (Or.inl rfl),
+   (runBlockCfgToBlock_inv_of_invClosedNoFork
+     (invClosedNoFork_of_localBlockVC (convergedJumpTestCfg true)
+       (convergedJumpTestInv 40) (fun v => (40 + 5) * 2 ≤ v)
+       (forkFree_eq_of_noFork (convergedJumpTestCfg true)
+         (convergedJumpTestCfg_noFork true) ▸ convergedJumpTest_localBlockVC 40)
+       (fun bb st _ => convergedJumpTestCfg_noFork true bb st))
+     (Or.inl ⟨rfl, rfl⟩)
+     (rfl : runBlockCfgToBlock (convergedJumpTestCfg true) 1 5 ⟨some, 0, 40, 0⟩ =
+       .reached ⟨composeWrap some (fun v => some (v + 10)), 1, 45, 0⟩)).2.2,
    (wpConverges_blockCfgStep_iff_of_blockInv_loop testCfgStep countdownInv
      (· = 100) countdown_localBlockVC_orig
      (fun bb st _ => testCfgStep_noFork bb st)
      ⟨fun v => some (v + 1), 2, 0, 0⟩ (Or.inr (Or.inr ⟨rfl, rfl⟩)) _).mpr
      ⟨1, 100, rfl, 101, rfl, rfl⟩,
+   (wpConverges_blockCfgStep_iff_of_blockInv_loop testCfgStep countdownInv
+     (· = 100) countdown_localBlockVC_orig
+     (fun bb st _ => testCfgStep_noFork bb st)
+     ⟨fun v => some (v + 1), 2, 0, 0⟩ (Or.inr (Or.inr ⟨rfl, rfl⟩)) _).mp
+     ⟨1, 101, rfl, rfl⟩,
    evalFuel_blockCfgStep_stepBasicBlock_handleFree stdValAlg sampleBranchBlockCfg
      (k := 3) (bb := 0) (st := sampleSymSt2) (wait := 0) rfl,
    wpConverges_blockCfgStep_stepBasicBlock_handleFree stdValAlg sampleBranchBlockCfg
      ⟨3, _, rfl, rfl⟩,
-   evalPlan_skip stdValAlg sampleSymSt2⟩
+   evalPlan_skip stdValAlg sampleSymSt2,
+   rfl,
+   fun w => cellsOfAbstractBytes_ne_init [.init 1 none] [.rawByte 1] w rfl,
+   allBytesInitialized_abstractBytesOfCells
+     ([.rawByte 1] : List (CellVal StdVal)) [.init 1 none] rfl⟩
 
 end Canaries
 
