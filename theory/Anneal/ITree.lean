@@ -2797,4 +2797,422 @@ theorem evalTauApprox_interpStateApprox_sound_reachesRet
   rw [(interpStateApprox_congr hh n).1, interpStateApprox_ofITree_le h t s hd] at hc
   exact evalTauApprox_sound_reachesRet hc
 
+/-! ### Kleene Depth Monotonicity \& Fuel-Free Reflection Bridges
+
+The statements below are phrased over the public approximant tower
+`ofITree n t : CofixA E R n`: the `Trusted.ITree` tower `Approx (ITreeP E R) n` is
+built from the private `ITreeHead`, so it cannot be named outside `trusted/lean/`.
+`CofixA.trunc` / `CofixA.truncBy` play the role of `Approx.trunc`
+(`trunc_ofITree`, `truncBy_ofITree`), and hypotheses follow the order of
+`wpCoalBounded_mono_fuel` (`h_le : n₁ ≤ n₂` first). -/
+
+/-- Iterated truncation of a depth-`(n + d)` approximant down to depth `n`. -/
+@[reducible]
+def CofixA.truncBy {E : Effect.{u}} {R : Type u} {n : Nat} :
+    (d : Nat) → CofixA E R (n + d) → CofixA E R n
+  | 0, a => a
+  | d + 1, a => CofixA.truncBy d (CofixA.trunc (n := n + d) a)
+
+/-- Projective coherence of `ofITree` under iterated truncation. -/
+@[simp]
+theorem truncBy_ofITree {E : Effect.{u}} {R : Type u}
+    (n d : Nat) (t : ITree E R) :
+    CofixA.truncBy d (ofITree (n + d) t) = ofITree n t := by
+  induction d with
+  | zero => rfl
+  | succ d ih =>
+    show CofixA.truncBy d (CofixA.trunc (ofITree (n + d + 1) t)) = ofITree n t
+    rw [trunc_ofITree]
+    exact ih
+
+/-- Kleene depth monotonicity of `ReachesRetApprox` along `ofITree`. -/
+theorem ReachesRetApprox.mono {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n₁ n₂ : Nat} {t : ITree E R} {tr : List (Event E)} {r : R}
+    (h_le : n₁ ≤ n₂) (h : ReachesRetApprox (ofITree n₁ t) tr r) :
+    ReachesRetApprox (ofITree n₂ t) tr r :=
+  h.ofITree_mono h_le
+
+/-- Truncation-coherent monotonicity of `ReachesRetApprox` for arbitrary `CofixA`
+approximants: a witness on `CofixA.truncBy d a` lifts to `a`. -/
+theorem ReachesRetApprox.of_truncBy {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n : Nat} {tr : List (Event E)} {r : R} :
+    (d : Nat) → {a : CofixA E R (n + d)} →
+      ReachesRetApprox (CofixA.truncBy d a) tr r → ReachesRetApprox a tr r
+  | 0, _, h => h
+  | d + 1, _, h => ReachesRetApprox.of_trunc (ReachesRetApprox.of_truncBy d h)
+
+/-- Kleene depth monotonicity of `checkTraceApprox` along `ofITree`. -/
+theorem checkTraceApprox_mono {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)]
+    {n₁ n₂ : Nat} {t : ITree E R} {tr : List (Event E)} {pred : R → Bool}
+    (h_le : n₁ ≤ n₂) (h : checkTraceApprox (ofITree n₁ t) tr pred = true) :
+    checkTraceApprox (ofITree n₂ t) tr pred = true :=
+  checkTraceApprox_ofITree_mono h h_le
+
+/-- Truncation-coherent monotonicity of `checkTraceApprox` for arbitrary `CofixA`
+approximants: acceptance of `CofixA.truncBy d a` implies acceptance of `a`. -/
+theorem checkTraceApprox_of_truncBy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)]
+    {n : Nat} {tr : List (Event E)} {pred : R → Bool} :
+    (d : Nat) → {a : CofixA E R (n + d)} →
+      checkTraceApprox (CofixA.truncBy d a) tr pred = true →
+        checkTraceApprox a tr pred = true
+  | 0, _, h => h
+  | d + 1, _, h => checkTraceApprox_of_trunc (checkTraceApprox_of_truncBy d h)
+
+/--
+Boolean finite-depth return reachability on `CofixA`: does the depth-`n`
+approximant `a` reach `.ret r` along `tr`? (`checkTraceApprox` with the return
+predicate `decide (· = r)`.)
+-/
+@[reducible]
+def approxReachesRet {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    (n : Nat) (a : CofixA E R n) (tr : List (Event E)) (r : R) : Bool :=
+  checkTraceApprox a tr (fun r' => decide (r' = r))
+
+/-- `approxReachesRet` decides `ReachesRetApprox`. -/
+theorem approxReachesRet_iff {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    {n : Nat} {a : CofixA E R n} {tr : List (Event E)} {r : R} :
+    approxReachesRet n a tr r = true ↔ ReachesRetApprox a tr r := by
+  refine ⟨fun h => ?_, fun h => checkTraceApprox_complete h (decide_eq_true rfl)⟩
+  rcases checkTraceApprox_sound_reachesRetApprox h with ⟨r', hr', hreach⟩
+  cases of_decide_eq_true hr'
+  exact hreach
+
+/-- Kleene depth monotonicity of `approxReachesRet` along `ofITree`. -/
+theorem approxReachesRet_mono {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    {n₁ n₂ : Nat} {t : ITree E R} {tr : List (Event E)} {r : R}
+    (h_le : n₁ ≤ n₂) (h : approxReachesRet n₁ (ofITree n₁ t) tr r = true) :
+    approxReachesRet n₂ (ofITree n₂ t) tr r = true :=
+  checkTraceApprox_mono h_le h
+
+/-- Truncation coherence of `approxReachesRet`: acceptance of `CofixA.trunc a` at
+depth `n` implies acceptance of `a` at depth `n + 1`. -/
+theorem approxReachesRet_of_trunc {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    {n : Nat} {a : CofixA E R (n + 1)} {tr : List (Event E)} {r : R}
+    (h : approxReachesRet n (CofixA.trunc a) tr r = true) :
+    approxReachesRet (n + 1) a tr r = true :=
+  checkTraceApprox_of_trunc h
+
+/-- Iterated truncation coherence of `approxReachesRet`. -/
+theorem approxReachesRet_of_truncBy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    {n : Nat} (d : Nat) {a : CofixA E R (n + d)} {tr : List (Event E)} {r : R}
+    (h : approxReachesRet n (CofixA.truncBy d a) tr r = true) :
+    approxReachesRet (n + d) a tr r = true :=
+  checkTraceApprox_of_truncBy d h
+
+/-- `approxReachesRet` is compatible with the projective structure of `ofITree`:
+checking the truncation of `ofITree (n + 1) t` is checking `ofITree n t`. -/
+@[simp]
+theorem approxReachesRet_trunc_ofITree {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    (n : Nat) (t : ITree E R) (tr : List (Event E)) (r : R) :
+    approxReachesRet n (CofixA.trunc (ofITree (n + 1) t)) tr r =
+      approxReachesRet n (ofITree n t) tr r := by
+  rw [trunc_ofITree]
+
+/-- Fuel-free reflection: a finite-depth `approxReachesRet` certificate at any depth
+lifts to the fuel-free coinductive `ReachesRet t tr r`, so external statements
+never expose the depth numeral. -/
+theorem reachesRet_of_approxReachesRet {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    {t : ITree E R} {tr : List (Event E)} {r : R}
+    (h : ∃ n, approxReachesRet n (ofITree n t) tr r = true) :
+    ReachesRet t tr r := by
+  rcases h with ⟨_, hn⟩
+  exact (approxReachesRet_iff.mp hn).toReachesRet
+
+/-- Exact fuel-free adequacy of `approxReachesRet`. -/
+theorem reachesRet_iff_exists_approxReachesRet {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    (t : ITree E R) (tr : List (Event E)) (r : R) :
+    ReachesRet t tr r ↔ ∃ n, approxReachesRet n (ofITree n t) tr r = true := by
+  refine ⟨fun h => ?_, reachesRet_of_approxReachesRet⟩
+  rcases ReachesRet.exists_ofITree h with ⟨n, hn⟩
+  exact ⟨n, approxReachesRet_iff.mpr hn⟩
+
+/-- Kleene form of the adequacy: `ReachesRet t tr r` holds iff `approxReachesRet`
+eventually always accepts along the `ofITree` tower. -/
+theorem reachesRet_iff_eventually_approxReachesRet {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    (t : ITree E R) (tr : List (Event E)) (r : R) :
+    ReachesRet t tr r ↔
+      ∃ n₀, ∀ n, n₀ ≤ n → approxReachesRet n (ofITree n t) tr r = true := by
+  rw [reachesRet_iff_exists_approxReachesRet]
+  exact ⟨fun ⟨n₀, h₀⟩ => ⟨n₀, fun _ hn => approxReachesRet_mono hn h₀⟩,
+    fun ⟨n₀, h₀⟩ => ⟨n₀, h₀ n₀ (Nat.le_refl n₀)⟩⟩
+
+/-- Fuel-free reflection of `approxReachesRet` on the suffix-free `approxCofix` walker. -/
+theorem reachesRet_cofix_iff_exists_approxReachesRet {E : Effect.{u}} {R S : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    (step : S → ITreeF E R S) (s : S) (tr : List (Event E)) (r : R) :
+    ReachesRet (ITree.cofix step s) tr r ↔
+      ∃ n, approxReachesRet n (approxCofix step n s) tr r = true := by
+  rw [reachesRet_iff_exists_approxReachesRet]
+  simp only [ofITree_cofix]
+
+/-- Fuel-free reflection of `approxReachesRet` on the suffix-free `iterApprox` walker. -/
+theorem reachesRet_iter_iff_exists_approxReachesRet {E : Effect.{u}} {I R : Type u}
+    [FaultEffect E] [DecidableEq E.I]
+    [∀ i : E.I, Decidable (FaultEffect.isFault (E := E) i)] [DecidableEq R]
+    (body : I → ITree E (I ⊕ R)) (init : I) (tr : List (Event E)) (r : R) :
+    ReachesRet (ITree.iter body init) tr r ↔
+      ∃ n, approxReachesRet n
+        (iterApprox (fun i m => ofITree m (body i)) n init) tr r = true := by
+  rw [reachesRet_iff_exists_approxReachesRet]
+  simp only [ofITree_iter]
+
+/-- Fuel-free reflection of `approxReachesRet` on the suffix-free `interpApprox` walker. -/
+theorem reachesRet_interp_iff_exists_approxReachesRet {E₁ E₂ : Effect.{u}} {R : Type u}
+    [FaultEffect E₂] [DecidableEq E₂.I]
+    [∀ i : E₂.I, Decidable (FaultEffect.isFault (E := E₂) i)] [DecidableEq R]
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i)) (t : ITree E₁ R)
+    (tr : List (Event E₂)) (r : R) :
+    ReachesRet (ITree.interp h t) tr r ↔
+      ∃ n, approxReachesRet n
+        (interpApprox (fun i m => ofITree m (h i)) n (ofITree n t)) tr r = true := by
+  rw [reachesRet_iff_exists_approxReachesRet]
+  simp only [ofITree_interp]
+
+/-- Fuel-free reflection of `approxReachesRet` on the suffix-free `interpStateApprox` walker. -/
+theorem reachesRet_interpState_iff_exists_approxReachesRet
+    {E₁ E₂ : Effect.{u}} {S R : Type u}
+    [FaultEffect E₂] [DecidableEq E₂.I]
+    [∀ i : E₂.I, Decidable (FaultEffect.isFault (E := E₂) i)] [DecidableEq (R × S)]
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S)) (t : ITree E₁ R) (s : S)
+    (tr : List (Event E₂)) (r : R × S) :
+    ReachesRet (ITree.interpState h t s) tr r ↔
+      ∃ n, approxReachesRet n
+        (interpStateApprox (fun i st m => ofITree m (h i st)) n (ofITree n t) s)
+          tr r = true := by
+  rw [reachesRet_iff_exists_approxReachesRet]
+  simp only [ofITree_interpState]
+
+/--
+Finite-depth labeled prefix reachability on `CofixA`: `ReachesApprox a tr b` holds
+when the depth-`n` approximant `a` reaches the depth-`m` sub-approximant `b` along
+`tr` (through `.tau` nodes and non-fault `.vis` nodes), mirroring `Reaches`.
+-/
+inductive ReachesApprox {E : Effect.{u}} {R : Type u} [FaultEffect E] :
+    {n m : Nat} → CofixA E R n → List (Event E) → CofixA E R m → Prop where
+  | refl {n : Nat} (a : CofixA E R n) : ReachesApprox a [] a
+  | tau {n m : Nat} {a : CofixA E R n} {tr : List (Event E)} {b : CofixA E R m} :
+      ReachesApprox a tr b → ReachesApprox (n := n + 1) (.tau a) tr b
+  | vis {n m : Nat} {i : E.I} {k : E.O i → CofixA E R n}
+      {tr : List (Event E)} {b : CofixA E R m} :
+      ¬ FaultEffect.isFault i →
+      (o : E.O i) →
+      ReachesApprox (k o) tr b →
+      ReachesApprox (n := n + 1) (.vis i k) (⟨i, o⟩ :: tr) b
+
+/-- Alias for `ReachesApprox`. -/
+abbrev approxReaches {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n m : Nat} (a : CofixA E R n) (tr : List (Event E)) (b : CofixA E R m) : Prop :=
+  ReachesApprox a tr b
+
+/-- Fuel-free reflection of finite approximant prefix reachability: if
+`ofITree n t` reaches the sub-approximant `b` along `tr`, then `t` reaches a
+residual `u` along `tr` in the fuel-free `Reaches` relation, and `b` is exactly
+the depth-`m` approximant of `u`. -/
+theorem reaches_of_approxReaches {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {n m : Nat} {t : ITree E R} {tr : List (Event E)} {b : CofixA E R m}
+    (h : approxReaches (ofITree n t) tr b) :
+    ∃ u, Reaches t tr u ∧ b = ofITree m u := by
+  generalize ha : ofITree n t = a at h
+  induction h generalizing t with
+  | refl a =>
+    subst ha
+    exact ⟨t, .refl t, rfl⟩
+  | @tau n' _ a' _ _ _ ih =>
+    revert ha
+    dsimp [ofITree]
+    cases ht : t.observe <;> intro ha
+    · nomatch ha
+    · injection ha with _ ha'
+      rcases ih ha' with ⟨u, hr, hb⟩
+      exact ⟨u, .tau ht hr, hb⟩
+    · nomatch ha
+  | @vis n' _ i k _ _ hnf o _ ih =>
+    revert ha
+    dsimp [ofITree]
+    cases ht : t.observe <;> intro ha
+    · nomatch ha
+    · nomatch ha
+    · rename_i i' k'
+      injection ha with _ hi hk
+      subst hi
+      have hk' := eq_of_heq hk
+      rcases ih (t := k' o) (congrFun hk' o) with ⟨u, hr, hb⟩
+      exact ⟨u, .vis ht hnf o hr, hb⟩
+
+/-- Completeness of `approxReaches`: every fuel-free `Reaches t tr u` is witnessed by
+a finite approximant prefix path to the depth-`m` approximant of `u`, for every `m`. -/
+theorem approxReaches_of_reaches {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {t u : ITree E R} {tr : List (Event E)}
+    (h : Reaches t tr u) (m : Nat) :
+    ∃ n, approxReaches (ofITree n t) tr (ofITree m u) := by
+  induction h with
+  | refl => exact ⟨m, .refl _⟩
+  | @tau t₀ t' _ _ ht _ ih =>
+    rcases ih with ⟨n, hn⟩
+    refine ⟨n + 1, ?_⟩
+    dsimp [approxReaches, ofITree]; rw [ht]
+    exact .tau hn
+  | @vis t₀ _ i k _ hv hnf o _ ih =>
+    rcases ih with ⟨n, hn⟩
+    refine ⟨n + 1, ?_⟩
+    dsimp [approxReaches, ofITree]; rw [hv]
+    exact .vis hnf o hn
+
+/-! ### Fuel-Free Equality \& `Eutt` Adequacy Bridges for the Walkers
+
+The equality bridges below are choice-free and carry all of the content: two
+walker runs that agree at every approximant depth denote equal interaction trees.
+`Eutt` itself is a `coinductive_fixpoint`, i.e. `Lean.Order.lfp_monotone` over a
+`Lean.Order.CompleteLattice` whose suprema are selected with `Classical.choice`, so
+`#print axioms Eutt` already reports `Classical.choice` and every statement that
+mentions `Eutt` inherits it; the `Eutt` corollaries add only `Eutt.refl`. -/
+
+/-- Fuel-free adequacy of `approxCofix`: `ITree.cofix step s = u` iff the walker
+agrees with `u` at every depth. -/
+theorem cofix_eq_iff_approxCofix {E : Effect.{u}} {R S : Type u}
+    (step : S → ITreeF E R S) (s : S) (u : ITree E R) :
+    ITree.cofix step s = u ↔ ∀ n, approxCofix step n s = ofITree n u := by
+  constructor
+  · rintro rfl n
+    exact (ofITree_cofix step s n).symm
+  · intro hu
+    exact ofITree_inj.mp fun n => (ofITree_cofix step s n).trans (hu n)
+
+/-- Fuel-free adequacy of `iterApprox`. -/
+theorem iter_eq_iff_iterApprox {E : Effect.{u}} {I R : Type u}
+    (body : I → ITree E (I ⊕ R)) (init : I) (u : ITree E R) :
+    ITree.iter body init = u ↔
+      ∀ n, iterApprox (fun i m => ofITree m (body i)) n init = ofITree n u := by
+  constructor
+  · rintro rfl n
+    exact (ofITree_iter body init n).symm
+  · intro hu
+    exact ofITree_inj.mp fun n => (ofITree_iter body init n).trans (hu n)
+
+/-- Fuel-free adequacy of `interpApprox`. -/
+theorem interp_eq_iff_interpApprox {E₁ E₂ : Effect.{u}} {R : Type u}
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i)) (t : ITree E₁ R) (u : ITree E₂ R) :
+    ITree.interp h t = u ↔
+      ∀ n, interpApprox (fun i m => ofITree m (h i)) n (ofITree n t) = ofITree n u := by
+  constructor
+  · rintro rfl n
+    exact (ofITree_interp h t n).symm
+  · intro hu
+    exact ofITree_inj.mp fun n => (ofITree_interp h t n).trans (hu n)
+
+/-- Fuel-free adequacy of `interpStateApprox`. -/
+theorem interpState_eq_iff_interpStateApprox {E₁ E₂ : Effect.{u}} {S R : Type u}
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S)) (t : ITree E₁ R) (s : S)
+    (u : ITree E₂ (R × S)) :
+    ITree.interpState h t s = u ↔
+      ∀ n, interpStateApprox (fun i st m => ofITree m (h i st)) n (ofITree n t) s =
+        ofITree n u := by
+  constructor
+  · rintro rfl n
+    exact (ofITree_interpState h t s n).symm
+  · intro hu
+    exact ofITree_inj.mp fun n => (ofITree_interpState h t s n).trans (hu n)
+
+/-- Congruence of `ITree.iter` under depth-wise agreement of the `iterApprox` walkers. -/
+theorem iter_eq_of_iterApprox_eq {E : Effect.{u}} {I R : Type u}
+    {body₁ body₂ : I → ITree E (I ⊕ R)} {init₁ init₂ : I}
+    (hA : ∀ n, iterApprox (fun i m => ofITree m (body₁ i)) n init₁ =
+      iterApprox (fun i m => ofITree m (body₂ i)) n init₂) :
+    ITree.iter body₁ init₁ = ITree.iter body₂ init₂ :=
+  (iter_eq_iff_iterApprox body₁ init₁ _).mpr fun n =>
+    (hA n).trans (ofITree_iter body₂ init₂ n).symm
+
+/-- Congruence of `ITree.interp` under depth-wise agreement of the `interpApprox` walkers. -/
+theorem interp_eq_of_interpApprox_eq {E₁ E₂ : Effect.{u}} {R : Type u}
+    {h₁ h₂ : (i : E₁.I) → ITree E₂ (E₁.O i)} {t₁ t₂ : ITree E₁ R}
+    (hA : ∀ n, interpApprox (fun i m => ofITree m (h₁ i)) n (ofITree n t₁) =
+      interpApprox (fun i m => ofITree m (h₂ i)) n (ofITree n t₂)) :
+    ITree.interp h₁ t₁ = ITree.interp h₂ t₂ :=
+  (interp_eq_iff_interpApprox h₁ t₁ _).mpr fun n =>
+    (hA n).trans (ofITree_interp h₂ t₂ n).symm
+
+/-- Congruence of `ITree.interpState` under depth-wise agreement of the
+`interpStateApprox` walkers. -/
+theorem interpState_eq_of_interpStateApprox_eq {E₁ E₂ : Effect.{u}} {S R : Type u}
+    {h₁ h₂ : (i : E₁.I) → S → ITree E₂ (E₁.O i × S)} {t₁ t₂ : ITree E₁ R} {s₁ s₂ : S}
+    (hA : ∀ n,
+      interpStateApprox (fun i st m => ofITree m (h₁ i st)) n (ofITree n t₁) s₁ =
+        interpStateApprox (fun i st m => ofITree m (h₂ i st)) n (ofITree n t₂) s₂) :
+    ITree.interpState h₁ t₁ s₁ = ITree.interpState h₂ t₂ s₂ :=
+  (interpState_eq_iff_interpStateApprox h₁ t₁ s₁ _).mpr fun n =>
+    (hA n).trans (ofITree_interpState h₂ t₂ s₂ n).symm
+
+/-- Equal interaction trees are `Eutt`. -/
+theorem eutt_of_eq {E : Effect.{u}} {R : Type u} {t u : ITree E R} (h : t = u) :
+    Eutt t u :=
+  h ▸ Eutt.refl t
+
+/-- Depth-wise agreement of all `CofixA` approximants implies `Eutt`. -/
+theorem eutt_of_ofITree_eq {E : Effect.{u}} {R : Type u} {t u : ITree E R}
+    (h : ∀ n, ofITree n t = ofITree n u) : Eutt t u :=
+  eutt_of_eq (ofITree_inj.mp h)
+
+/-- `Eutt` congruence of `ITree.iter` under depth-wise agreement of `iterApprox`. -/
+theorem iter_eutt_of_iterApprox_eq {E : Effect.{u}} {I R : Type u}
+    {body₁ body₂ : I → ITree E (I ⊕ R)} {init₁ init₂ : I}
+    (hA : ∀ n, iterApprox (fun i m => ofITree m (body₁ i)) n init₁ =
+      iterApprox (fun i m => ofITree m (body₂ i)) n init₂) :
+    Eutt (ITree.iter body₁ init₁) (ITree.iter body₂ init₂) :=
+  eutt_of_eq (iter_eq_of_iterApprox_eq hA)
+
+/-- `Eutt` congruence of `ITree.interp` under depth-wise agreement of `interpApprox`. -/
+theorem interp_eutt_of_interpApprox_eq {E₁ E₂ : Effect.{u}} {R : Type u}
+    {h₁ h₂ : (i : E₁.I) → ITree E₂ (E₁.O i)} {t₁ t₂ : ITree E₁ R}
+    (hA : ∀ n, interpApprox (fun i m => ofITree m (h₁ i)) n (ofITree n t₁) =
+      interpApprox (fun i m => ofITree m (h₂ i)) n (ofITree n t₂)) :
+    Eutt (ITree.interp h₁ t₁) (ITree.interp h₂ t₂) :=
+  eutt_of_eq (interp_eq_of_interpApprox_eq hA)
+
+/-- `Eutt` congruence of `ITree.interpState` under depth-wise agreement of
+`interpStateApprox`. -/
+theorem interpState_eutt_of_interpStateApprox_eq {E₁ E₂ : Effect.{u}} {S R : Type u}
+    {h₁ h₂ : (i : E₁.I) → S → ITree E₂ (E₁.O i × S)} {t₁ t₂ : ITree E₁ R} {s₁ s₂ : S}
+    (hA : ∀ n,
+      interpStateApprox (fun i st m => ofITree m (h₁ i st)) n (ofITree n t₁) s₁ =
+        interpStateApprox (fun i st m => ofITree m (h₂ i st)) n (ofITree n t₂) s₂) :
+    Eutt (ITree.interpState h₁ t₁ s₁) (ITree.interpState h₂ t₂ s₂) :=
+  eutt_of_eq (interpState_eq_of_interpStateApprox_eq hA)
+
+/-- `Eutt` adequacy of `interpApprox` against an arbitrary target tree `u`. -/
+theorem interp_eutt_of_interpApprox_eq_ofITree {E₁ E₂ : Effect.{u}} {R : Type u}
+    {h : (i : E₁.I) → ITree E₂ (E₁.O i)} {t : ITree E₁ R} {u : ITree E₂ R}
+    (hA : ∀ n, interpApprox (fun i m => ofITree m (h i)) n (ofITree n t) = ofITree n u) :
+    Eutt (ITree.interp h t) u :=
+  eutt_of_eq ((interp_eq_iff_interpApprox h t u).mpr hA)
+
+/-- `Eutt` adequacy of `iterApprox` against an arbitrary target tree `u`. -/
+theorem iter_eutt_of_iterApprox_eq_ofITree {E : Effect.{u}} {I R : Type u}
+    {body : I → ITree E (I ⊕ R)} {init : I} {u : ITree E R}
+    (hA : ∀ n, iterApprox (fun i m => ofITree m (body i)) n init = ofITree n u) :
+    Eutt (ITree.iter body init) u :=
+  eutt_of_eq ((iter_eq_iff_iterApprox body init u).mpr hA)
+
 end Anneal.ITree

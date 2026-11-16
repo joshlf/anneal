@@ -52,6 +52,16 @@ Kernel regression, non-vacuity canary, and heartbeat-scaling benchmark suite for
    insufficient fuel (exact boundaries for every checker), and the
    call-site-operand purity policy that a state-free `CofixA` walker can only
    enforce over the policy-guarded approximant `mirExecGuardedApprox`.
+6. Kleene depth monotonicity (`approxReachesRet_mono`, `checkTraceApprox_mono`,
+   `ReachesRetApprox.mono`, `CofixA.truncBy` coherence), fuel-free reflection into
+   `ReachesRet` / `Reaches` (`reachesRet_of_approxReachesRet`,
+   `reaches_of_approxReaches`), choice-free walker equality adequacy with its `Eutt`
+   corollaries, and the fuel-free `TraceCheck` entrypoints (observation-driven
+   `reconstructFullMirTraceAuto`, automatic `defaultIntraEventSteps` /
+   `defaultTraceSteps` bounds, `checkRawByteTrace{Full,ObsErased}` and their
+   `WithCallees` / `diagnose*` counterparts) with zero caller fuel numerals at
+   `k ∈ {4, 8, 16, 32}`, inlined callees, negative canaries, and an honest
+   incompleteness canary for the branch-erased budget on a call-free loop.
 
 All heartbeat figures are `maxHeartbeats` units (1000 internal heartbeats) for the
 whole declaration (elaboration plus kernel check), measured with
@@ -643,6 +653,247 @@ heartbeats for the full one) use small absolute floors.
 #guard_msgs (whitespace := lax) in
 #print axioms diagnoseRawByteTraceWithCalleesFullBounded_tag_ok_obsErased_sound
 
+/-! ### Kleene Depth Monotonicity, Fuel-Free Reflection \& Equality Adequacy (`Anneal.ITree`) -/
+
+/-- info: 'Anneal.ITree.ReachesRetApprox.mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesRetApprox.mono
+
+/-- info: 'Anneal.ITree.ReachesRetApprox.of_truncBy' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesRetApprox.of_truncBy
+
+/-- info: 'Anneal.ITree.truncBy_ofITree' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms truncBy_ofITree
+
+/-- info: 'Anneal.ITree.checkTraceApprox_mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_mono
+
+/-- info: 'Anneal.ITree.checkTraceApprox_of_truncBy' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_of_truncBy
+
+/-- info: 'Anneal.ITree.approxReachesRet_iff' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReachesRet_iff
+
+/-- info: 'Anneal.ITree.approxReachesRet_mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReachesRet_mono
+
+/-- info: 'Anneal.ITree.approxReachesRet_of_trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReachesRet_of_trunc
+
+/-- info: 'Anneal.ITree.approxReachesRet_of_truncBy' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReachesRet_of_truncBy
+
+/-- info: 'Anneal.ITree.reachesRet_of_approxReachesRet' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachesRet_of_approxReachesRet
+
+/-- info: 'Anneal.ITree.reachesRet_iff_exists_approxReachesRet' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachesRet_iff_exists_approxReachesRet
+
+/-- info: 'Anneal.ITree.reachesRet_iff_eventually_approxReachesRet' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachesRet_iff_eventually_approxReachesRet
+
+/-- info: 'Anneal.ITree.reachesRet_iter_iff_exists_approxReachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachesRet_iter_iff_exists_approxReachesRet
+
+/-- info: 'Anneal.ITree.reachesRet_interp_iff_exists_approxReachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachesRet_interp_iff_exists_approxReachesRet
+
+/-- info: 'Anneal.ITree.reachesRet_interpState_iff_exists_approxReachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reachesRet_interpState_iff_exists_approxReachesRet
+
+/-- info: 'Anneal.ITree.reaches_of_approxReaches' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms reaches_of_approxReaches
+
+/-- info: 'Anneal.ITree.approxReaches_of_reaches' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms approxReaches_of_reaches
+
+/-- info: 'Anneal.ITree.cofix_eq_iff_approxCofix' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms cofix_eq_iff_approxCofix
+
+/-- info: 'Anneal.ITree.iter_eq_iff_iterApprox' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms iter_eq_iff_iterApprox
+
+/-- info: 'Anneal.ITree.interp_eq_iff_interpApprox' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms interp_eq_iff_interpApprox
+
+/-- info: 'Anneal.ITree.interpState_eq_iff_interpStateApprox' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms interpState_eq_iff_interpStateApprox
+
+/-- info: 'Anneal.ITree.iter_eq_of_iterApprox_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms iter_eq_of_iterApprox_eq
+
+/-- info: 'Anneal.ITree.interp_eq_of_interpApprox_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms interp_eq_of_interpApprox_eq
+
+/-- info: 'Anneal.ITree.interpState_eq_of_interpStateApprox_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms interpState_eq_of_interpStateApprox_eq
+
+/-!
+`Eutt` is a `coinductive_fixpoint`, i.e. `Lean.Order.lfp_monotone` over a
+`Lean.Order.CompleteLattice` whose suprema are selected with `Classical.choice`, so
+the definition `Eutt` itself (not only proofs about it) depends on
+`Classical.choice`, and so does every statement that mentions it. The pinned guards
+below document that the `Eutt` corollaries inherit exactly the axioms of `Eutt` and
+nothing else; the walker equality bridges above carry the content choice-free.
+-/
+
+/-- info: 'Anneal.ITree.Eutt' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Eutt
+
+/-- info: 'Anneal.ITree.eutt_of_ofITree_eq' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms eutt_of_ofITree_eq
+
+/-- info: 'Anneal.ITree.iter_eutt_of_iterApprox_eq' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms iter_eutt_of_iterApprox_eq
+
+/-- info: 'Anneal.ITree.interp_eutt_of_interpApprox_eq' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms interp_eutt_of_interpApprox_eq
+
+/-- info: 'Anneal.ITree.interpState_eutt_of_interpStateApprox_eq' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms interpState_eutt_of_interpStateApprox_eq
+
+/-! ### Fuel-Free Observation-Driven Replay \& Entrypoints (`TraceCheck`) -/
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceWithin_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reconstructFullMirTraceWithin_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceAuto_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reconstructFullMirTraceAuto_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceWithin_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reconstructFullMirTraceWithin_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceAuto_checkFullMirTraceFast' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reconstructFullMirTraceAuto_checkFullMirTraceFast
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullObservedTrace_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullObservedTrace_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullObservedTrace_imp_bounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullObservedTrace_imp_bounded
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkObsErasedObservedTrace_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkObsErasedObservedTrace_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkObsErasedObservedTraceWithCallees_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkObsErasedObservedTraceWithCallees_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFull_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFull_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFull_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFull_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFull_imp_bounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFull_imp_bounded
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFull_imp_bounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFull_imp_bounded
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErased_eq_bounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErased_eq_bounded
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErased_eq_bounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErased_eq_bounded
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFull_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFull_obsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFull_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFull_obsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFull_tag_ok_of_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFull_tag_ok_of_check
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull_tag_ok_of_check' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFull_tag_ok_of_check
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErased_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErased_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErased_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesObsErased_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFull_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFull_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErased_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceObsErased_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFull_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErased_tag_ok_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesObsErased_tag_ok_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFull_tag_ok_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFull_tag_ok_obsErased_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull_tag_ok_obsErased_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFull_tag_ok_obsErased_sound
+
 /-! ## 2. Definitional-Closure Audit (`#audit_closure`)
 
 Kernel `rfl` / `decide` confirmation unfolds every definition reachable from a
@@ -783,6 +1034,52 @@ elab "#audit_closure " prof:ident root:ident : command => do
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceObsErasedBoundedFast
 /-- info: Trusted.VerificationResult.mirStatefulTree: reaches [Trusted.ITree.ITree.cofix] -/
 #guard_msgs in #audit_closure checker mirStatefulTree
+/-- info: Anneal.ITree.CofixA.truncBy: clean -/
+#guard_msgs in #audit_closure walker CofixA.truncBy
+/-- info: Anneal.ITree.approxReachesRet: reaches [Eq.ndrec, Eq.rec] -/
+#guard_msgs (whitespace := lax) in #audit_closure walker approxReachesRet
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultIntraEventSteps: clean -/
+#guard_msgs in #audit_closure checker defaultIntraEventSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultTraceSteps: clean -/
+#guard_msgs in #audit_closure checker defaultTraceSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultObsErasedTraceSteps: clean -/
+#guard_msgs in #audit_closure checker defaultObsErasedTraceSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultRawTraceSteps: clean -/
+#guard_msgs in #audit_closure checker defaultRawTraceSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultRawObsErasedTraceSteps: clean -/
+#guard_msgs in #audit_closure checker defaultRawObsErasedTraceSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.stepFullMirEventWithin: clean -/
+#guard_msgs in #audit_closure checker stepFullMirEventWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.finishFullMirTraceWithin: clean -/
+#guard_msgs in #audit_closure checker finishFullMirTraceWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceWithin: clean -/
+#guard_msgs in #audit_closure checker reconstructFullMirTraceWithin
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.reconstructFullMirTraceAuto: clean -/
+#guard_msgs in #audit_closure checker reconstructFullMirTraceAuto
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkFullObservedTrace: clean -/
+#guard_msgs in #audit_closure checker checkFullObservedTrace
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkObsErasedObservedTrace: clean -/
+#guard_msgs in #audit_closure checker checkObsErasedObservedTrace
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkObservedTraceConsistency: clean -/
+#guard_msgs in #audit_closure checker checkObservedTraceConsistency
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkObservedTraceWithCallees: clean -/
+#guard_msgs in #audit_closure checker checkObservedTraceWithCallees
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFull: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceFull
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErased: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceObsErased
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFull: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceWithCalleesFull
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErased: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceWithCalleesObsErased
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFull: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceFull
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErased: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceObsErased
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFull: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFull
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErased: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesObsErased
 
 /-! ## 3. Nested `interpState` over `interp` over `iter` (`CofixA` Walkers vs `.observe`) -/
 
@@ -2082,5 +2379,653 @@ theorem canary_callsite_raw_ptr_policy :
     (diagnoseMirExecBounded 4 true rawPeekBody rawPeekState
       rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩))).tagName = "impure_ext_call_ptr_arg" := by
   decide +kernel
+
+/-! ## 6. Kleene Depth Monotonicity, Fuel-Free Reflection \& Fuel-Free `TraceCheck` Entrypoints -/
+
+/-! ### Kleene Monotonicity \& Fuel-Free `ReachesRet` Reflection on the `iter` Layer -/
+
+/-- The visible `CounterE` trace of two `counterIterBody` iterations (oracle answers
+`1` and `7`), as in `counterIter_k2_trace_reachesRet`. -/
+@[reducible]
+def counterIterTrace2 : List (Event CounterE) :=
+  [⟨.tagStep 0, PUnit.unit⟩, ⟨.incBy 1, (1 : Nat)⟩,
+   ⟨.tagStep 1, PUnit.unit⟩, ⟨.incBy 2, (7 : Nat)⟩]
+
+/-- `approxReachesRet` on the `iterApprox` walker: rejected one depth short of the
+exact minimum `3 * 2 + 1 = 7`, accepted at `7`, and rejected for a wrong return
+value and for a wrong recorded answer. -/
+theorem counterIter_k2_approxReachesRet_boundary :
+    approxReachesRet 6 (iterApprox (counterIterBodyApprox 2) 6 (0, 0)) counterIterTrace2 7
+      = false ∧
+    approxReachesRet 7 (iterApprox (counterIterBodyApprox 2) 7 (0, 0)) counterIterTrace2 7
+      = true ∧
+    approxReachesRet 7 (iterApprox (counterIterBodyApprox 2) 7 (0, 0)) counterIterTrace2 8
+      = false ∧
+    approxReachesRet 7 (iterApprox (counterIterBodyApprox 2) 7 (0, 0))
+      [⟨.tagStep 0, PUnit.unit⟩, ⟨.incBy 1, (1 : Nat)⟩,
+       ⟨.tagStep 2, PUnit.unit⟩, ⟨.incBy 2, (7 : Nat)⟩] 7 = false := by
+  decide +kernel
+
+/-- The depth-`7` certificate restated on the `ofITree` tower of the coinductive
+`ITree.iter` (via `ofITree_iter` and the body bridge `ofITree_counterIterBody`). -/
+theorem counterIter_k2_approxReachesRet_ofITree :
+    approxReachesRet 7 (ofITree 7 (ITree.iter (counterIterBody 2) (0, 0)))
+      counterIterTrace2 7 = true := by
+  rw [ofITree_iter, iterApprox_congr (fun i m => ofITree_counterIterBody 2 i m)]
+  exact counterIter_k2_approxReachesRet_boundary.2.1
+
+/-- Kleene depth monotonicity carries the depth-`7` certificate to depth `40`, for
+`approxReachesRet`, `checkTraceApprox`, and `ReachesRetApprox`. -/
+theorem counterIter_k2_kleene_mono :
+    approxReachesRet 40 (ofITree 40 (ITree.iter (counterIterBody 2) (0, 0)))
+      counterIterTrace2 7 = true ∧
+    checkTraceApprox (ofITree 40 (ITree.iter (counterIterBody 2) (0, 0)))
+      counterIterTrace2 (fun r => decide (r = 7)) = true ∧
+    ReachesRetApprox (ofITree 40 (ITree.iter (counterIterBody 2) (0, 0)))
+      counterIterTrace2 7 := by
+  have h7 := counterIter_k2_approxReachesRet_ofITree
+  exact ⟨approxReachesRet_mono (n₁ := 7) (by decide) h7,
+    checkTraceApprox_mono (n₁ := 7) (by decide) h7,
+    ReachesRetApprox.mono (n₁ := 7) (by decide) ((approxReachesRet_iff (E := CounterE)).mp h7)⟩
+
+/-- Truncation coherence: the depth-`7` certificate on `CofixA.truncBy 3` of the
+depth-`10` walker output lifts to the depth-`10` output itself. -/
+theorem counterIter_k2_approxReachesRet_of_truncBy :
+    approxReachesRet (7 + 3) (iterApprox (counterIterBodyApprox 2) (7 + 3) (0, 0))
+      counterIterTrace2 7 = true :=
+  approxReachesRet_of_truncBy 3 (by decide +kernel)
+
+/-- Fuel-free reflection: the depth-`40` certificate lifts to fuel-free `ReachesRet`
+on the coinductive `ITree.iter`, whose statement mentions no depth numeral; the
+walker-level iff gives the same fact directly from the depth-`7` walker run, and the
+Kleene form shows acceptance at every depth from some `n₀` on. -/
+theorem counterIter_k2_reachesRet_fuelFree :
+    ReachesRet (ITree.iter (counterIterBody 2) (0, 0)) counterIterTrace2 7 :=
+  reachesRet_of_approxReachesRet ⟨40, counterIter_k2_kleene_mono.1⟩
+
+theorem counterIter_k2_reachesRet_fuelFree_walker :
+    ReachesRet (ITree.iter (counterIterBody 2) (0, 0)) counterIterTrace2 7 :=
+  (reachesRet_iter_iff_exists_approxReachesRet (counterIterBody 2) (0, 0)
+    counterIterTrace2 7).mpr
+    ⟨7, by
+      rw [iterApprox_congr (fun i m => ofITree_counterIterBody 2 i m)]
+      exact counterIter_k2_approxReachesRet_boundary.2.1⟩
+
+theorem counterIter_k2_eventually_accepted :
+    ∃ n₀, ∀ n, n₀ ≤ n →
+      approxReachesRet n (ofITree n (ITree.iter (counterIterBody 2) (0, 0)))
+        counterIterTrace2 7 = true :=
+  (reachesRet_iff_eventually_approxReachesRet (ITree.iter (counterIterBody 2) (0, 0))
+    counterIterTrace2 7).mp counterIter_k2_reachesRet_fuelFree
+
+/-- Finite approximant prefix reachability on the depth-`7` walker output: the
+recorded trace leads to the depth-`1` sub-approximant `.ret 7`. -/
+theorem counterIter_k2_approxReaches :
+    approxReaches (iterApprox (counterIterBodyApprox 2) 7 (0, 0)) counterIterTrace2
+      (CofixA.ret 7 : CofixA CounterE Nat 1) := by
+  refine ReachesApprox.vis (E := CounterE) (i := .tagStep 0) (fun h => h) PUnit.unit ?_
+  refine ReachesApprox.vis (E := CounterE) (i := .incBy 1) (fun h => h) (1 : Nat) ?_
+  refine ReachesApprox.tau ?_
+  refine ReachesApprox.vis (E := CounterE) (i := .tagStep 1) (fun h => h) PUnit.unit ?_
+  refine ReachesApprox.vis (E := CounterE) (i := .incBy 2) (fun h => h) (7 : Nat) ?_
+  exact ReachesApprox.tau (ReachesApprox.refl _)
+
+/-- `reaches_of_approxReaches` lifts the finite prefix path to the fuel-free
+`Reaches` relation on the coinductive `ITree.iter`, identifying the residual's
+depth-`1` approximant as `.ret 7`. -/
+theorem counterIter_k2_reaches_fuelFree :
+    ∃ u, Reaches (ITree.iter (counterIterBody 2) (0, 0)) counterIterTrace2 u ∧
+      (CofixA.ret 7 : CofixA CounterE Nat 1) = ofITree 1 u :=
+  reaches_of_approxReaches (n := 7) (by
+    rw [ofITree_iter, iterApprox_congr (fun i m => ofITree_counterIterBody 2 i m)]
+    exact counterIter_k2_approxReaches)
+
+/-- Completeness of `approxReaches`: the fuel-free `Reaches` witness above is
+witnessed again by a finite prefix path at every residual depth, here `5`. -/
+theorem counterIter_k2_approxReaches_complete :
+    ∃ u, Reaches (ITree.iter (counterIterBody 2) (0, 0)) counterIterTrace2 u ∧
+      ∃ n, approxReaches (ofITree n (ITree.iter (counterIterBody 2) (0, 0)))
+        counterIterTrace2 (ofITree 5 u) := by
+  rcases counterIter_k2_reaches_fuelFree with ⟨u, hu, _⟩
+  exact ⟨u, hu, approxReaches_of_reaches hu 5⟩
+
+/-! ### Fuel-Free Equality \& `Eutt` Congruence of the Walkers -/
+
+/-- `stateHandler` with its addition commuted. -/
+def stateHandlerComm : (i : StateE.I) → Nat → ITree EmptyE (StateE.O i × Nat)
+  | .addGet delta, s => .ret (delta + s, delta + s)
+
+/-- The two handlers agree at every approximant depth, so `interpState` over either
+yields the same interaction tree (choice-free `interpState_eq_of_interpStateApprox_eq`)
+and, as a corollary, `Eutt` trees (`interpState_eutt_of_interpStateApprox_eq`, whose
+only additional axiom is the `Classical.choice` built into `Eutt` itself). -/
+theorem stateHandlerComm_approx_eq (n : Nat) {d : Nat} (t : CofixA StateE Nat d) (s : Nat) :
+    interpStateApprox (fun i st m => ofITree m (stateHandlerComm i st)) n t s =
+      interpStateApprox (fun i st m => ofITree m (stateHandler i st)) n t s :=
+  (interpStateApprox_congr (fun i st m => by
+    cases i with
+    | addGet delta =>
+      show ofITree m (stateHandlerComm (.addGet delta) st) =
+        ofITree m (stateHandler (.addGet delta) st)
+      simp only [stateHandlerComm, stateHandler, Nat.add_comm delta st]) n).1 t s
+
+theorem nestedPipeline_stateHandlerComm_eq (limit initState : Nat) :
+    ITree.interpState stateHandlerComm
+        (ITree.interp counterToStateHandler (ITree.iter (counterIterBody limit) (0, 0)))
+        initState =
+      nestedPipelineITree limit initState := by
+  unfold nestedPipelineITree
+  exact interpState_eq_of_interpStateApprox_eq fun n => stateHandlerComm_approx_eq n _ initState
+
+theorem nestedPipeline_stateHandlerComm_eutt (limit initState : Nat) :
+    Eutt
+      (ITree.interpState stateHandlerComm
+        (ITree.interp counterToStateHandler (ITree.iter (counterIterBody limit) (0, 0)))
+        initState)
+      (nestedPipelineITree limit initState) := by
+  unfold nestedPipelineITree
+  exact interpState_eutt_of_interpStateApprox_eq fun n => stateHandlerComm_approx_eq n _ initState
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.nestedPipeline_stateHandlerComm_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nestedPipeline_stateHandlerComm_eq
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.counterIter_k2_reachesRet_fuelFree' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms counterIter_k2_reachesRet_fuelFree
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.counterIter_k2_reaches_fuelFree' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms counterIter_k2_reaches_fuelFree
+
+/-!
+### Fuel-Free `TraceCheck` Entrypoints with Automatic `CapturedMir` Step Bounds
+
+`mirLoopWithOracleCall` has `blockStepCount = 15` (`bb0`: `7`, `bb1`: `2`, `bb2`:
+`1`, `bb3`: `3`, `bb4`: `2`), so `defaultIntraEventSteps` is `16`; the longest replay
+segment (`bb0` and `bb1` up to the first `switchInt`) takes `9` transitions
+(`mirLoop_reconstructFullMirTraceWithin_boundary`). With the inlined
+`ffiStepOracleInlinedBody` (`4` block steps) the bound is `2 * (16 * 5) = 160`. The
+global budgets dominate the exact minimal fuels `6 * k + 11` at every
+`k ∈ {4, 8, 16, 32}`.
+
+Measured heartbeats of the fuel-free entrypoints in the exact shape a generated
+chunk would emit (`checkRawByteTrace{Full,ObsErased}_sound ... rfl`, no fuel
+numeral) and kernel-only, next to the `*Bounded` figures of section 4:
+
+| `k` | full fuel-free generated | full fuel-free kernel | obsErased fuel-free generated | obsErased fuel-free kernel | full `*Bounded` generated |
+|----:|-------------------------:|----------------------:|------------------------------:|---------------------------:|--------------------------:|
+|   4 |                     4711 |                  1631 |                          4696 |                       1625 |                      4695 |
+|   8 |                     5893 |                  2028 |                          5866 |                       2018 |                      5875 |
+|  16 |                     8275 |                  2831 |                          8218 |                       2812 |                      8248 |
+|  32 |                    13092 |                  4470 |                         12977 |                       4433 |                     13044 |
+
+The fuel-free entrypoints cost the same as the `*Bounded` ones (within 1%): the
+budgets are closed `Nat` terms evaluated once, and the observation-driven replay
+steps exactly the same `stepMirState` transitions as the global-fuel replay.
+-/
+
+/-- The automatic step bounds of the loop fixtures. -/
+theorem mirLoop_default_step_bounds :
+    blockStepCount mirLoopWithOracleCall = 15 ∧
+    defaultIntraEventSteps mirLoopWithOracleCall [] = 16 ∧
+    defaultIntraEventSteps mirLoopWithOracleCall [ffiStepOracleInlinedBody] = 160 ∧
+    defaultRawTraceSteps mirLoopWithOracleCall (mkLoopFullRawTrace 32) = 1056 ∧
+    defaultRawObsErasedTraceSteps mirLoopWithOracleCall (mkLoopObsErasedRawTrace 32) = 8976 ∧
+    (∀ k ∈ [4, 8, 16, 32],
+      6 * k + 11 ≤ defaultRawTraceSteps mirLoopWithOracleCall (mkLoopFullRawTrace k) ∧
+      6 * k + 11 ≤
+        defaultRawObsErasedTraceSteps mirLoopWithOracleCall (mkLoopObsErasedRawTrace k)) := by
+  decide +kernel
+
+/-- The decoded `ObservedTrace` of a loop `RawByteTrace`. -/
+@[reducible]
+def loopObs (rawTrace : RawByteTrace) : ObservedTrace :=
+  (decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable rawTrace).getD
+    { args := [], events := [], outcome := .panic }
+
+/-- The initial `MachineState` of a decoded loop trace. -/
+@[reducible]
+def loopInitState (obs : ObservedTrace) : MachineState :=
+  initMachineStateWithMemory mirLoopWithOracleCall obs.args
+    { obs.initMem with callees := obs.inlinedCallees }
+
+/-- Per-segment budget semantics of the observation-driven replay: every budget
+below the longest segment (`9` transitions) is rejected and `9` is accepted, at
+`k = 4` and `k = 32`; `defaultTraceSteps` on the decoded events is
+`(2 * 4 + 1 + 1) * 16 = 160` at `k = 4`. -/
+theorem mirLoop_reconstructFullMirTraceWithin_boundary :
+    (reconstructFullMirTraceWithin mirLoopWithOracleCall 8
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 4))))
+      (loopObs (mkLoopFullRawTrace 4)).events
+      (loopObs (mkLoopFullRawTrace 4)).outcome).isSome = false ∧
+    (reconstructFullMirTraceWithin mirLoopWithOracleCall 9
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 4))))
+      (loopObs (mkLoopFullRawTrace 4)).events
+      (loopObs (mkLoopFullRawTrace 4)).outcome).isSome = true ∧
+    (reconstructFullMirTraceWithin mirLoopWithOracleCall 8
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 32))))
+      (loopObs (mkLoopFullRawTrace 32)).events
+      (loopObs (mkLoopFullRawTrace 32)).outcome).isSome = false ∧
+    (reconstructFullMirTraceWithin mirLoopWithOracleCall 9
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 32))))
+      (loopObs (mkLoopFullRawTrace 32)).events
+      (loopObs (mkLoopFullRawTrace 32)).outcome).isSome = true ∧
+    defaultTraceSteps mirLoopWithOracleCall [] (loopObs (mkLoopFullRawTrace 4)).events = 160 := by
+  decide +kernel
+
+/-- Kleene budget monotonicity (`reconstructFullMirTraceWithin_mono`): the single
+minimal-budget acceptance at `9` covers every per-segment budget `intra ≥ 9`. -/
+theorem mirLoop_k32_within_budget_mono :
+    ∀ intra, 9 ≤ intra →
+      (reconstructFullMirTraceWithin mirLoopWithOracleCall intra
+        (.running (loopInitState (loopObs (mkLoopFullRawTrace 32))))
+        (loopObs (mkLoopFullRawTrace 32)).events
+        (loopObs (mkLoopFullRawTrace 32)).outcome).isSome = true := by
+  intro intra h_le
+  have h9 := mirLoop_reconstructFullMirTraceWithin_boundary.2.2.2.1
+  revert h9
+  cases h : reconstructFullMirTraceWithin mirLoopWithOracleCall 9
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 32))))
+      (loopObs (mkLoopFullRawTrace 32)).events
+      (loopObs (mkLoopFullRawTrace 32)).outcome with
+  | none => intro h9; nomatch h9
+  | some p =>
+    intro _
+    rw [reconstructFullMirTraceWithin_mono _ h_le _ _ _ p h]
+    rfl
+
+/-- Fuel-free `reconstructFullMirTraceAuto` / `checkFullObservedTrace` (full) and
+`checkObsErasedObservedTrace` (branch-erased) on the decoded loop traces at every
+`k ∈ {4, 8, 16, 32}`. -/
+theorem mirLoop_fuelFree_observedTrace_kernel :
+    (reconstructFullMirTraceAuto mirLoopWithOracleCall []
+      (.running (loopInitState (loopObs (mkLoopFullRawTrace 4))))
+      (loopObs (mkLoopFullRawTrace 4)).events
+      (loopObs (mkLoopFullRawTrace 4)).outcome).isSome = true ∧
+    checkFullObservedTrace mirLoopWithOracleCall
+      (loopInitState (loopObs (mkLoopFullRawTrace 8)))
+      (loopObs (mkLoopFullRawTrace 8)).events (loopObs (mkLoopFullRawTrace 8)).outcome = true ∧
+    checkFullObservedTrace mirLoopWithOracleCall
+      (loopInitState (loopObs (mkLoopFullRawTrace 16)))
+      (loopObs (mkLoopFullRawTrace 16)).events (loopObs (mkLoopFullRawTrace 16)).outcome = true ∧
+    checkFullObservedTrace mirLoopWithOracleCall
+      (loopInitState (loopObs (mkLoopFullRawTrace 32)))
+      (loopObs (mkLoopFullRawTrace 32)).events (loopObs (mkLoopFullRawTrace 32)).outcome = true ∧
+    checkObsErasedObservedTrace mirLoopWithOracleCall
+      (loopInitState (loopObs (mkLoopObsErasedRawTrace 4)))
+      (loopObs (mkLoopObsErasedRawTrace 4)).events
+      (loopObs (mkLoopObsErasedRawTrace 4)).outcome = true ∧
+    checkObsErasedObservedTrace mirLoopWithOracleCall
+      (loopInitState (loopObs (mkLoopObsErasedRawTrace 32)))
+      (loopObs (mkLoopObsErasedRawTrace 32)).events
+      (loopObs (mkLoopObsErasedRawTrace 32)).outcome = true := by
+  decide +kernel
+
+/-- Fuel-free soundness on the decoded `k = 32` traces: `mirTree` (full) and
+`mirObsErasedStatefulTree` (branch-erased) reach matching outcomes. -/
+theorem mirLoop_k32_observedTrace_reachesRet_fuelFree :
+    (∃ tr out,
+      MatchesObservedEvents (loopObs (mkLoopFullRawTrace 32)).events tr ∧
+      MatchesObservedOutcome (loopObs (mkLoopFullRawTrace 32)).outcome out ∧
+      ReachesRet
+        (mirTree mirLoopWithOracleCall (loopInitState (loopObs (mkLoopFullRawTrace 32))))
+        tr out) ∧
+    (∃ tr out,
+      MatchesObservedEvents (loopObs (mkLoopObsErasedRawTrace 32)).events tr ∧
+      MatchesObservedOutcome (loopObs (mkLoopObsErasedRawTrace 32)).outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTree mirLoopWithOracleCall
+          (loopObs (mkLoopObsErasedRawTrace 32)).args
+          { (loopObs (mkLoopObsErasedRawTrace 32)).initMem with
+            callees := (loopObs (mkLoopObsErasedRawTrace 32)).inlinedCallees })
+        tr out) :=
+  ⟨checkFullObservedTrace_sound _ _ _ _ mirLoop_fuelFree_observedTrace_kernel.2.2.2.1,
+   checkObsErasedObservedTrace_sound _ _ _ _ _ mirLoop_fuelFree_observedTrace_kernel.2.2.2.2.2⟩
+
+set_option maxHeartbeats 6130 in
+theorem mirLoop_k4_full_fuelFree_generated : LoopFullConsistent 4 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 4) rfl
+
+set_option maxHeartbeats 2120 in
+theorem mirLoop_k4_full_fuelFree_kernel : LoopFullConsistent 4 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 4) (by decide +kernel)
+
+set_option maxHeartbeats 6110 in
+theorem mirLoop_k4_obsErased_fuelFree_generated : LoopObsErasedConsistent 4 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) rfl
+
+set_option maxHeartbeats 2120 in
+theorem mirLoop_k4_obsErased_fuelFree_kernel : LoopObsErasedConsistent 4 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) (by decide +kernel)
+
+set_option maxHeartbeats 7670 in
+theorem mirLoop_k8_full_fuelFree_generated : LoopFullConsistent 8 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 8) rfl
+
+set_option maxHeartbeats 2640 in
+theorem mirLoop_k8_full_fuelFree_kernel : LoopFullConsistent 8 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 8) (by decide +kernel)
+
+set_option maxHeartbeats 7630 in
+theorem mirLoop_k8_obsErased_fuelFree_generated : LoopObsErasedConsistent 8 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) rfl
+
+set_option maxHeartbeats 2630 in
+theorem mirLoop_k8_obsErased_fuelFree_kernel : LoopObsErasedConsistent 8 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) (by decide +kernel)
+
+set_option maxRecDepth 2048 in
+set_option maxHeartbeats 10760 in
+theorem mirLoop_k16_full_fuelFree_generated : LoopFullConsistent 16 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 16) rfl
+
+set_option maxHeartbeats 3690 in
+theorem mirLoop_k16_full_fuelFree_kernel : LoopFullConsistent 16 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 16) (by decide +kernel)
+
+set_option maxRecDepth 2048 in
+set_option maxHeartbeats 10690 in
+theorem mirLoop_k16_obsErased_fuelFree_generated : LoopObsErasedConsistent 16 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) rfl
+
+set_option maxHeartbeats 3660 in
+theorem mirLoop_k16_obsErased_fuelFree_kernel : LoopObsErasedConsistent 16 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) (by decide +kernel)
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 17020 in
+theorem mirLoop_k32_full_fuelFree_generated : LoopFullConsistent 32 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) rfl
+
+set_option maxHeartbeats 5820 in
+theorem mirLoop_k32_full_fuelFree_kernel : LoopFullConsistent 32 :=
+  checkRawByteTraceFull_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) (by decide +kernel)
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 16880 in
+theorem mirLoop_k32_obsErased_fuelFree_generated : LoopObsErasedConsistent 32 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) rfl
+
+set_option maxHeartbeats 5770 in
+theorem mirLoop_k32_obsErased_fuelFree_kernel : LoopObsErasedConsistent 32 :=
+  checkRawByteTraceObsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) (by decide +kernel)
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_full_fuelFree_generated' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_k32_full_fuelFree_generated
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_obsErased_fuelFree_kernel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_k32_obsErased_fuelFree_kernel
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 17060 in
+/-- Fuel-free diagnosis at `k = 32` (`diagnoseRawByteTraceFull`, `13119` heartbeats
+measured), with no fuel numeral. -/
+theorem mirLoop_k32_fuelFree_diag_tag_rfl :
+    (diagnoseRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32)).tagName = "ok" := by
+  rfl
+
+set_option maxHeartbeats 290 in
+/-- The full and branch-erased consistency statements at `k = 32`, derived from the
+fuel-free `"ok"` tag (`diagnoseRawByteTraceFull_tag_ok_sound`,
+`diagnoseRawByteTraceFull_tag_ok_obsErased_sound` with `h_erase` by `rfl`) without
+re-running the MIR execution (`193` heartbeats measured, versus `13092` + `12977`
+for the two generated fuel-free theorems). -/
+theorem mirLoop_k32_fuelFree_from_diag_tag :
+    LoopFullConsistent 32 ∧ LoopObsErasedConsistent 32 :=
+  ⟨diagnoseRawByteTraceFull_tag_ok_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) mirLoop_k32_fuelFree_diag_tag_rfl,
+   diagnoseRawByteTraceFull_tag_ok_obsErased_sound mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) (mkLoopObsErasedRawTrace 32)
+    mirLoop_k32_fuelFree_diag_tag_rfl rfl⟩
+
+/-- Fuel-free check and diagnosis agree: the branch-erased diagnosis accepts exactly
+when the branch-erased check does (`diagnoseRawByteTraceObsErased_isOk`), and the
+full check implies the `"ok"` full diagnosis (`diagnoseRawByteTraceFull_tag_ok_of_check`)
+and the `*Bounded` check at `defaultRawTraceSteps`. -/
+theorem mirLoop_k4_fuelFree_check_diag_agreement :
+    (diagnoseRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4)).isOk = true ∧
+    (diagnoseRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4)).tagName = "ok" ∧
+    checkRawByteTraceFullBounded
+      (defaultRawTraceSteps mirLoopWithOracleCall (mkLoopFullRawTrace 4))
+      mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true :=
+  have h_full : checkRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true := by decide +kernel
+  have h_obs : checkRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true := by decide +kernel
+  ⟨(diagnoseRawByteTraceObsErased_isOk _ _ _ _).trans h_obs,
+   diagnoseRawByteTraceFull_tag_ok_of_check _ _ _ _ h_full,
+   checkRawByteTraceFull_imp_bounded _ _ _ _ h_full⟩
+
+/-- Fuel-free `WithCallees` entrypoints with the inlined callee
+`ffiStepOracleInlinedBody` at `k = 4` and `k = 32` (automatic budget `160` per
+segment), with fuel-free soundness and the branch-erased certificate derived from
+the full check. -/
+theorem mirLoop_inlinedCallees_fuelFree_kernel :
+    checkRawByteTraceWithCalleesFull mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesObsErased mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesFull mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 32) = true ∧
+    checkRawByteTraceWithCalleesObsErased mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 32) = true ∧
+    (diagnoseRawByteTraceWithCalleesObsErased mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4)).isOk = true := by
+  decide +kernel
+
+theorem mirLoop_k32_inlinedCallees_reachesRet_fuelFree :
+    (∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall []
+        emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 32) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTreeWithCallees
+          mirLoopWithOracleCall obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out) ∧
+    (∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall []
+        emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 32) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees
+          mirLoopWithOracleCall obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out) ∧
+    (∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall []
+        emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 32) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees
+          mirLoopWithOracleCall obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out) :=
+  ⟨checkRawByteTraceWithCalleesFull_sound _ _ _ _ mirLoop_inlinedCallees_fuelFree_kernel.2.2.1,
+   checkRawByteTraceWithCalleesObsErased_sound _ _ _ _
+     mirLoop_inlinedCallees_fuelFree_kernel.2.2.2.1,
+   checkRawByteTraceWithCalleesFull_obsErased_sound _ _ _ (mkLoopInlinedFullRawTrace 32) _
+     mirLoop_inlinedCallees_fuelFree_kernel.2.2.1 rfl⟩
+
+/-! ### Fuel-Free Negative Canaries -/
+
+/-- Canary 9: the fuel-free entrypoints reject a wrong outcome, a wrong branch tag, a
+wrong call argument, an impure `&mut` pointer call, and trailing events, with the
+same `TraceReplayDiag` as the `*Bounded` diagnoses (the automatic budget never masks
+a mismatch). -/
+theorem canary_fuelFree_mismatches_rejected :
+    let badOutcome : RawByteTrace :=
+      { mkLoopFullRawTrace 4 with outcome := .normal (encodeU32LeBytes 25) }
+    let badBranch : RawByteTrace :=
+      { mkLoopFullRawTrace 4 with
+        events := .branch 0 :: (mkLoopFullRawEventsAux 4 0).drop 1 }
+    let badArg : RawByteTrace :=
+      { mkLoopObsErasedRawTrace 4 with
+        events :=
+          .extCall "approx_test::ffi_step_oracle"
+            [encodeU32LeBytes 99]
+            (encodeU32LeBytes (oracleStepVal 0)) ::
+          (mkLoopObsErasedRawEventsAux 4 0).drop 1 }
+    let badImpure : RawByteTrace :=
+      { rawArgs := [encodeU32LeBytes 1]
+        events := [.extCall "approx_test::ffi_impure_mut" [[1, 0, 0, 0, 0, 0, 0, 0]] [0, 0, 0, 0]]
+        outcome := .normal (encodeU32LeBytes 0) }
+    let badTrailing : RawByteTrace :=
+      { mkLoopObsErasedRawTrace 4 with
+        events := mkLoopObsErasedRawEventsAux 4 0 ++ [.branch 0] }
+    checkRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badOutcome = false ∧
+    diagnoseRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badOutcome =
+      .outcomeMismatch
+        (.normal (Value.scalar ⟨24, 4⟩, emptyMemory))
+        (.normal (Value.scalar ⟨25, 4⟩)) ∧
+    checkRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badBranch = false ∧
+    diagnoseRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badBranch = .branchTagMismatch 1 0 1 ∧
+    checkRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badArg = false ∧
+    diagnoseRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badArg =
+      .callArgMismatch "approx_test::ffi_step_oracle" 2 ∧
+    checkRawByteTraceObsErased mirLoopWithOracleCall [ffiImpureMutSig]
+      emptyShadowProvenanceTable badImpure = false ∧
+    diagnoseRawByteTraceObsErased mirLoopWithOracleCall [ffiImpureMutSig]
+      emptyShadowProvenanceTable badImpure =
+      .impureExtCallPtrArg "approx_test::ffi_impure_mut" 0 0 ∧
+    checkRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badTrailing = false ∧
+    diagnoseRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable badTrailing = .unconsumedEventsRemaining 1 :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+`fn count_to(n: u32) -> u32 { let mut i = 0; while i < n { i += 1; } i }`: a
+call-free loop. `blockStepCount = 10` (`bb0`: `4`, `bb1`: `2`, `bb2`: `2`, `bb3`:
+`2`), `defaultIntraEventSteps = 11`, and a run takes `4 * n + 8` transitions. With
+`checkBranches = true` every iteration emits a `.branch` event, so each replay
+segment is at most `4` transitions; branch erasure leaves no event at all, so the
+branch-erased budget `defaultObsErasedTraceSteps = 1 * 11 * 12 = 132` covers
+`n ≤ 31` only.
+-/
+def mirCountTo : CapturedMir := {
+  defPath := "approx_test::count_to"
+  phase := .runtimeOptimized
+  role := .subject
+  argCount := 1
+  localDecls :=
+    [ approxMkDecl .mut approxU32Ty0
+    , approxMkDecl .not approxU32Ty0
+    , approxMkDecl .mut approxU32Ty0
+    , approxMkDecl .mut approxBoolTy1 ]
+  basicBlocks :=
+    [ { statements :=
+          [ approxMkStmt (.storageLive 2)
+          , approxMkStmt (.storageLive 3)
+          , approxMkStmt (.assign ⟨2, []⟩ (.use (approxU32ConstOperand 0))) ]
+        terminator := approxMkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ approxMkStmt (.assign ⟨3, []⟩
+              (.binaryOp .lt (.copy ⟨2, []⟩) (.copy ⟨1, []⟩))) ]
+        terminator :=
+          approxMkTerm (.switchInt (.move ⟨3, []⟩) { branches := [(0, 3)], otherwise := 2 })
+        isCleanup := false }
+    , { statements :=
+          [ approxMkStmt (.assign ⟨2, []⟩
+              (.binaryOp .add (.copy ⟨2, []⟩) (approxU32ConstOperand 1))) ]
+        terminator := approxMkTerm (.goto 1)
+        isCleanup := false }
+    , { statements :=
+          [ approxMkStmt (.assign ⟨0, []⟩ (.use (.copy ⟨2, []⟩))) ]
+        terminator := approxMkTerm .return_
+        isCleanup := false } ]
+  fnAbi := approxTestFnAbi
+  layouts := approxTestLayouts
+  allocations := []
+}
+
+@[reducible]
+def mkCountToFullRawEvents : Nat → List RawObservedEvent
+  | 0 => [.branch 0]
+  | rem + 1 => .branch 1 :: mkCountToFullRawEvents rem
+
+@[reducible]
+def mkCountToFullRawTrace (n : Nat) : RawByteTrace := {
+  rawArgs := [encodeU32LeBytes n]
+  events := mkCountToFullRawEvents n
+  outcome := .normal (encodeU32LeBytes n)
+}
+
+@[reducible]
+def mkCountToObsErasedRawTrace (n : Nat) : RawByteTrace := {
+  rawArgs := [encodeU32LeBytes n]
+  events := []
+  outcome := .normal (encodeU32LeBytes n)
+}
+
+/-- Canary 10 (honest incompleteness of the branch-erased budget): at `n = 32` the
+call-free loop needs `136` transitions, so the fuel-free branch-erased check
+rejects (diagnosed `out_of_fuel`) while the `*Bounded` check accepts at `136` and the
+fuel-free check accepts at `n = 31`; the full fuel-free check accepts at `n = 32`
+because every iteration's `.branch` event opens a fresh segment. -/
+theorem canary_fuelFree_obsErased_budget_boundary :
+    checkRawByteTraceObsErased mirCountTo [] emptyShadowProvenanceTable
+      (mkCountToObsErasedRawTrace 32) = false ∧
+    (diagnoseRawByteTraceObsErased mirCountTo [] emptyShadowProvenanceTable
+      (mkCountToObsErasedRawTrace 32)).tagName = "out_of_fuel" ∧
+    checkRawByteTraceObsErasedBounded 136 mirCountTo [] emptyShadowProvenanceTable
+      (mkCountToObsErasedRawTrace 32) = true ∧
+    checkRawByteTraceObsErased mirCountTo [] emptyShadowProvenanceTable
+      (mkCountToObsErasedRawTrace 31) = true ∧
+    checkRawByteTraceFull mirCountTo [] emptyShadowProvenanceTable
+      (mkCountToFullRawTrace 32) = true := by
+  decide +kernel
+
+/-- The branch-erased certificate at `n = 32` that the fuel-free branch-erased check
+cannot produce is still derived, budget-free, from the fuel-free full check
+(`checkRawByteTraceFull_obsErased_sound`, `h_erase` by `rfl`). -/
+theorem countTo_k32_obsErased_from_full_fuelFree :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace mirCountTo [] emptyShadowProvenanceTable
+        (mkCountToObsErasedRawTrace 32) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTree mirCountTo obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out :=
+  checkRawByteTraceFull_obsErased_sound mirCountTo [] emptyShadowProvenanceTable
+    (mkCountToFullRawTrace 32) (mkCountToObsErasedRawTrace 32)
+    canary_fuelFree_obsErased_budget_boundary.2.2.2.2 rfl
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.countTo_k32_obsErased_from_full_fuelFree' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms countTo_k32_obsErased_from_full_fuelFree
 
 end Anneal.Mir.ITreeApproxRunnerTests
