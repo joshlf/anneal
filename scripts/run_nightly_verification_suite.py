@@ -1164,6 +1164,8 @@ _LEAN_ALL_CMD_BOUNDARIES = (
     | {"example", "@["}
 )
 _LEAN_TRIVIAL_PIN_TYPES = {"_", "True", "Prop", "Bool", "Nat", "Unit", "PUnit"}
+# Tokens that make a pin's type depend on its own RHS (so the pin locks nothing).
+_LEAN_SELF_TYPED_PIN_TOKENS = {"type_of", "by", "_"}
 _LEAN_FORBIDDEN_PIN_ARGS = {
     "by",
     "fun",
@@ -1423,7 +1425,9 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
                             for rt in rem
                         ):
                             active_ns = [s for kind, sp in scope_stack if kind == "ns" for s in sp]
-                            pins.setdefault(qsegs[-1], []).append((active_ns, qsegs[:-1]))
+                            pins.setdefault(qsegs[-1], []).append(
+                                (active_ns, qsegs[:-1], tuple(type_toks))
+                            )
             i = end_ex
             continue
 
@@ -1490,7 +1494,16 @@ def _has_statement_pin(
         if (rel_pin_file or rel_res_file)
         else None
     )
-    for active_ns, inline_qual in entries:
+    sym_last = _clean_lean_seg(symbol.split(".")[-1])
+    for active_ns, inline_qual, type_toks in entries:
+        # A pin locks nothing if its type is computed from the theorem itself
+        # (`type_of% thm`, self-reference), by a tactic (`by ...`), or via holes
+        # (`_` / `?_`) that unify with the RHS type.
+        if any(
+            _clean_lean_seg(tt) == sym_last or tt in _LEAN_SELF_TYPED_PIN_TOKENS
+            for tt in type_toks
+        ):
+            continue
         if allowed_inline is not None and any(seg not in allowed_inline for seg in inline_qual):
             continue
         if allowed_audit_ns is not None and any(seg not in allowed_audit_ns for seg in active_ns):

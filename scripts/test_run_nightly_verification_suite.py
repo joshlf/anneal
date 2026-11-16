@@ -185,6 +185,16 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "example : 0 = 0 := callerRefMutSilentWrongLocal_simulation.1\n"
                     "example : 0 = 0 := Scratch.callerRefMutSilentWrongLocal_simulation\n"
                     "unsafe example : 0 = 0 := callerRefMutSilentWrongLocal_simulation\n"
+                    # Self-typed pins lock nothing: the type is computed from the RHS.
+                    "example : type_of% callerRefMutSilentWrongLocal_simulation :=\n"
+                    "  callerRefMutSilentWrongLocal_simulation\n"
+                    "example : (by exact type_of% @callerRefMutSilentWrongLocal_simulation) :=\n"
+                    "  callerRefMutSilentWrongLocal_simulation\n"
+                    "example : _ ∧ _ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : ?_ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : id (0 = 0) ∧ callerRefMutSilentWrongLocal_simulation = "
+                    "callerRefMutSilentWrongLocal_simulation :=\n"
+                    "  callerRefMutSilentWrongLocal_simulation\n"
                 )
             synth_divs = suite.discover_correspondence_divergences(tmp_root)
             self.assertEqual(
