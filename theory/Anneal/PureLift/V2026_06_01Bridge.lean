@@ -56,15 +56,21 @@ machine state:
    header) into the same conclusion, with no `CfgCertificate`;
    `mir_cfgCertificate_sound` is its certificate-driven corollary, and
    `CfgCertificate.whileLoop` packages `cfg_certificate_while_sound` as a
-   3-block loop certificate with a back-edge. `mirCfgStateRel` asks only for a
-   sub-identity pending wrapper (`SubIdWrap`) and ignores the pending
-   `.convergedJump` delay, so `stepBasicBlock`'s join-convergent symbolic
-   diamonds (a `.convergedJump armSteps` whose wrapper is the
-   `handleFreeOutOpt` guard) simulate through `mirCfg_forwardSim_of_waitFree` /
-   `mirCfg_segmentSim_of_waitFree` with obligations only at block transitions
-   (delay ticks stutter, and halts carry the raw block return);
-   `mir_cfgCertificate_sound_of_invClosedNoFork` needs only a closed, fork-free
-   invariant; and `mir_whileLoop_cfgCertificate_of_cutpoint` certifies
+   3-block loop certificate with a back-edge, while `CfgCertificate.diamond`
+   packages `cfg_certificate_diamond_sound` as a 4-block diamond certificate
+   supporting both concrete and symbolic (`.convergedJump 1`) branch conditions.
+   `mirCfgStateRel` asks only for a sub-identity pending wrapper (`SubIdWrap`)
+   and ignores the pending `.convergedJump` delay, so `stepBasicBlock`'s
+   join-convergent symbolic diamonds (a `.convergedJump armSteps` whose wrapper
+   is the `handleFreeOutOpt` guard) simulate through
+   `mirCfg_forwardSim_of_waitFree` / `mirCfg_segmentSim_of_waitFree` (and the
+   wrapper-agnostic `mirCfg_forwardSim_of_emitsSubIdWraps` /
+   `mirCfg_segmentSim_of_emitsSubIdWraps` over `mirCfgBlockRel`) with
+   obligations only at block transitions (delay ticks stutter, and halts carry
+   the raw block return); `mir_cfgCertificate_sound_of_invClosedNoFork` needs
+   only a closed, fork-free invariant; `mir_diamond_cfgCertificate_sound`
+   certifies symbolic `.convergedJump` diamonds through `CfgCertificate.diamond`;
+   and `mir_whileLoop_cfgCertificate_of_cutpoint` certifies
    `CfgCertificate.whileLoop` from a strong-descent loop cutpoint
    (`rank s' < rank s`, via `holdsFnSpec_whileLoop_of_cutpoint`,
    `whileCutpoint_localBlockVC`, and `whileCutpoint_noFork`).
@@ -2243,6 +2249,55 @@ theorem mirCfg_forwardSim_of_emitsSubIdWraps (tagOf : LoanId → Nat)
   | branchJump _ _ _ _ => trivial
   | fault => trivial
 
+/-- **Wrapper-agnostic wait-free `SegmentSim` for `mirCfgStateRel`**: when the
+CFG emits only sub-identity wrappers from the `extra`-related states
+(`EmitsSubIdWraps`), per-block segment simulation obligations mention neither
+the pending wrapper nor the `.convergedJump` delay (`mirCfgBlockRel`), and
+`.ret`, `.branchJump`, and `.fault` impose no obligation. -/
+theorem mirCfg_segmentSim_of_emitsSubIdWraps (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (hEmit : EmitsSubIdWraps (stepBasicBlock stdValAlg blocks)
+      (fun bb st => Exists fun ms => extra bb st ms))
+    (hZero : ∀ bb st ms, mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret _ => True
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    SegmentSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra) := by
+  refine mirCfg_segmentSim_of_waitFree tagOf body blocks bindingsAt mirBb
+    extra ?_
+  intro wrap bb st ms hR
+  have hW : SubIdWrap wrap := hR.1
+  have hE := hEmit bb st ⟨ms, hR.2.2.2.2⟩
+  have hZ := hZero bb st ms hR.2
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ.mono (fun _ h => ⟨hW, h⟩)
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | ret _ => trivial
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
+
 /-- **Certificate-free block-level adequacy over live `V2026_06_01` MIR
 (`mir_blockCfg_sound`)**: a forward simulation from the embedded `PureLift`
 block CFG (`blockCfgStep (stepBasicBlock stdValAlg blocks)`) into the live step
@@ -2385,6 +2440,15 @@ theorem runWhileFlowSteps_continuing {Val : Type} (alg : ValAlgebra Val)
             rw [hEv] at h
             exact runWhileFlowSteps_continuing alg cond body hBody k s' f h
 
+theorem evalPlan_skip {Val : Type} (alg : ValAlgebra Val) (s : SymState Val) :
+    evalPlan alg .skip s = .ok (.continuing s) := rfl
+
+theorem evalPlan_skip_continuing {Val : Type} (alg : ValAlgebra Val) :
+    ∀ s f, evalPlan alg .skip s = .ok f → Exists fun s' => f = .continuing s' := by
+  intro s f h
+  injection h with hf
+  exact ⟨s, hf.symm⟩
+
 theorem evalPlan_act {Val : Type} (alg : ValAlgebra Val) (a : PrimAction Val)
     (s : SymState Val) :
     evalPlan alg (.act a) s =
@@ -2414,6 +2478,101 @@ theorem evalPlan_seq_continuing {Val : Type} (alg : ValAlgebra Val) {p1 p2 : Flo
     subst hf1
     rw [hp1] at h
     exact h2 s1 f h
+
+theorem evalPlan_branch_continuing {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) {onTrue onFalse : FlowPlan Val}
+    (hWfT : WfPlan alg onTrue) (hWfF : WfPlan alg onFalse)
+    (hT : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hF : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s') :
+    ∀ s f, evalPlan alg (.branch cond onTrue onFalse) s = .ok f →
+      Exists fun s' => f = .continuing s' := by
+  intro s f h
+  rw [evalPlan_branch alg cond onTrue onFalse s hWfT hWfF] at h
+  cases hCond : evalRval alg cond s with
+  | none => rw [hCond] at h; exact nomatch h
+  | some cv =>
+    rw [hCond] at h
+    dsimp only at h
+    cases hBool : alg.asBool cv with
+    | some b =>
+      rw [hBool] at h
+      cases b with
+      | true => exact hT s f h
+      | false => exact hF s f h
+    | none =>
+      rw [hBool] at h
+      dsimp only at h
+      cases hEvT : evalPlan alg onTrue s with
+      | fail => rw [hEvT] at h; exact nomatch h
+      | ok fT =>
+        obtain ⟨sT, hfT⟩ := hT s fT hEvT
+        subst hfT
+        cases hEvF : evalPlan alg onFalse s with
+        | fail => rw [hEvT, hEvF] at h; exact nomatch h
+        | ok fF =>
+          obtain ⟨sF, hfF⟩ := hF s fF hEvF
+          subst hfF
+          rw [hEvT, hEvF] at h
+          dsimp only [joinExecFlow] at h
+          cases hJ : joinSymState alg cv sT sF with
+          | none => rw [hJ] at h; exact nomatch h
+          | some sJ =>
+            rw [hJ] at h
+            injection h with hf
+            exact ⟨sJ, hf.symm⟩
+
+theorem evalPlan_whileLoop_continuing {Val : Type} (alg : ValAlgebra Val)
+    (fuel : Nat) (cond : RvalOp Val) {body : FlowPlan Val}
+    (hWfB : WfPlan alg body)
+    (hBody : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s') :
+    ∀ s f, evalPlan alg (.whileLoop fuel cond body) s = .ok f →
+      Exists fun s' => f = .continuing s' := by
+  intro s f h
+  rw [evalPlan_whileLoop alg fuel cond body s hWfB] at h
+  exact runWhileFlowSteps_continuing alg cond body hBody fuel s f h
+
+/-- Any 3-block while-loop CFG whose body produces only `.continuing` flows
+never emits `.jumpWrapped` or `.convergedJump` transitions, so it satisfies
+`EmitsSubIdWraps` for every invariant `Inv`. -/
+theorem whileLoopBlocks_emitsSubIdWraps {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (hBody : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s')
+    (Inv : Nat → SymState Val → Prop) :
+    EmitsSubIdWraps (stepBasicBlock alg (whileLoopBlocks cond body retExpr)) Inv := by
+  intro bb st _
+  match bb with
+  | 0 =>
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    cases evalRval alg cond st with
+    | none => exact trivial
+    | some cv =>
+      dsimp only
+      cases alg.asBool cv with
+      | some b => cases b <;> exact trivial
+      | none => exact trivial
+  | 1 =>
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, List.foldr]
+    cases hB : evalPlan alg body st with
+    | fail => exact trivial
+    | ok f =>
+      obtain ⟨s', hf⟩ := hBody st f hB
+      subst hf
+      exact trivial
+  | 2 =>
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    cases stateCleanAtReturn st with
+    | false => exact trivial
+    | true =>
+      dsimp
+      cases evalRval alg retExpr st with
+      | none => exact trivial
+      | some rv =>
+        dsimp
+        cases handleFreeOut alg ⟨rv, collectRootMutVals st.loans⟩ <;>
+          exact trivial
+  | _ + 3 => exact trivial
 
 /-- **3-block while-loop `CfgCertificate` constructor (`CfgCertificate.whileLoop`)**:
 packages `[⟨.skip, .branch cond 1 2⟩, ⟨body, .goto 0⟩, ⟨.skip, .ret retExpr⟩]` at
@@ -2708,6 +2867,728 @@ theorem mir_whileLoop_cfgCertificate_of_cutpoint (tagOf : LoanId → Nat)
       post hExit)
     (whileCutpoint_noFork stdValAlg cond loopBody retExpr Inv rank hStep)
     hInv0 hSim hR0
+
+/-- 4-block diamond CFG: header block `0` runs `pre` and branches on `cond` to
+arm block `1` (`onTrue; goto 3`) or arm block `2` (`onFalse; goto 3`), which
+reconverge at join block `3` (`post; ret retExpr`). -/
+def diamondCfgBlocks {Val : Type} (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    List (BasicBlock Val) :=
+  [⟨pre, .branch cond 1 2⟩,
+   ⟨onTrue, .goto 3⟩,
+   ⟨onFalse, .goto 3⟩,
+   ⟨post, .ret retExpr⟩]
+
+theorem findConvergenceBlock_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    findConvergenceBlock
+      (diamondCfgBlocks pre cond onTrue onFalse post retExpr) 5 1 2 [0] =
+      some 3 := rfl
+
+theorem listGetOpt_zero_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 0 (diamondCfgBlocks pre cond onTrue onFalse post retExpr) =
+      some ⟨pre, .branch cond 1 2⟩ := rfl
+
+theorem listGetOpt_one_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 1 (diamondCfgBlocks pre cond onTrue onFalse post retExpr) =
+      some ⟨onTrue, .goto 3⟩ := rfl
+
+theorem listGetOpt_two_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 2 (diamondCfgBlocks pre cond onTrue onFalse post retExpr) =
+      some ⟨onFalse, .goto 3⟩ := rfl
+
+theorem length_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    (diamondCfgBlocks pre cond onTrue onFalse post retExpr).length = 4 := rfl
+
+/-- Evaluating a 1-block arm `cur` whose terminator is `.goto stopBb` at fuel
+`k + 2` (with `k` symbolic so `Nat.recCompiled` unfolds only 2 levels). -/
+theorem evalArmToJoin_goto_stop {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (k : Nat) (stopBb cur : BlockId)
+    (body : FlowPlan Val) (st : SymState Val)
+    (hNe : (cur == stopBb) = false)
+    (hBb : listGetOpt cur blocks = some ⟨body, .goto stopBb⟩)
+    (hRefl : (stopBb == stopBb) = true := by rfl) :
+    evalArmToJoin alg blocks (k + 2) stopBb cur st =
+      (match evalPlan alg body st with
+       | .fail => .fail
+       | .ok (.returned out valClean mutRet) =>
+         if !valClean || !handleFreeOut alg out then .fail
+         else .ok (1, .returned out true mutRet)
+       | .ok (.guardedContinuing wrapOut st' valClean wrapMut) =>
+         if !valClean then .fail
+         else .ok (1, .guardedContinuing wrapOut st' true wrapMut)
+       | .ok (.continuing st') => .ok (1, .continuing st')) := by
+  unfold evalArmToJoin
+  change
+    (if (cur == stopBb) = true then EvalOutcome.ok (0, ExecFlow.continuing st)
+     else
+       match listGetOpt cur blocks with
+       | none => EvalOutcome.fail
+       | some bb => _) = _
+  rw [hNe]
+  dsimp only
+  rw [hBb]
+  dsimp only
+  cases evalPlan alg body st with
+  | fail => rfl
+  | ok flow =>
+    cases flow with
+    | returned out valClean mutRet => rfl
+    | guardedContinuing wrapOut st' valClean wrapMut =>
+      cases valClean with
+      | false => rfl
+      | true =>
+        dsimp only [Nat.recCompiled]
+        rw [hRefl]
+        rfl
+    | continuing st' =>
+      dsimp only [Nat.recCompiled]
+      rw [hRefl]
+      rfl
+
+theorem evalArmToJoin_diamondCfgBlocks_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stT : SymState Val)
+    (hT : evalPlan alg onTrue st1 = .ok (.continuing stT)) :
+    evalArmToJoin alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      5 3 1 st1 = .ok (1, .continuing stT) := by
+  rw [evalArmToJoin_goto_stop alg _ 3 3 1 onTrue st1 rfl
+        (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+      hT]
+
+theorem evalArmToJoin_diamondCfgBlocks_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stF : SymState Val)
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF)) :
+    evalArmToJoin alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      5 3 2 st1 = .ok (1, .continuing stF) := by
+  rw [evalArmToJoin_goto_stop alg _ 3 3 2 onFalse st1 rfl
+        (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+      hF]
+
+theorem stepBasicBlock_diamondCfg_header_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some true) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      0 st0 = .jump 1 st1 := by
+  dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+  rw [hPre]
+  dsimp only
+  rw [hCond]
+  dsimp only
+  rw [hBool]
+
+theorem stepBasicBlock_diamondCfg_header_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some false) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      0 st0 = .jump 2 st1 := by
+  dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+  rw [hPre]
+  dsimp only
+  rw [hCond]
+  dsimp only
+  rw [hBool]
+
+theorem stepBasicBlock_diamondCfg_header_symbolic {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 stT stF stJ : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = none)
+    (hT : evalPlan alg onTrue st1 = .ok (.continuing stT))
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF))
+    (hJ : joinSymState alg cv stT stF = some stJ) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      0 st0 =
+      .convergedJump 1 (fun out => handleFreeOutOpt alg out) 3 stJ := by
+  have hArmT :=
+    evalArmToJoin_diamondCfgBlocks_true alg pre cond onTrue onFalse post
+      retExpr st1 stT hT
+  have hArmF :=
+    evalArmToJoin_diamondCfgBlocks_false alg pre cond onTrue onFalse post
+      retExpr st1 stF hF
+  have hConv :=
+    findConvergenceBlock_diamondCfgBlocks pre cond onTrue onFalse post retExpr
+  unfold stepBasicBlock
+  rw [listGetOpt_zero_diamondCfgBlocks, length_diamondCfgBlocks]
+  dsimp only
+  rw [hPre]
+  dsimp only
+  rw [hCond]
+  dsimp only
+  rw [hBool]
+  dsimp only
+  rw [hConv]
+  dsimp only
+  rw [hArmT, hArmF]
+  dsimp only [joinExecFlow]
+  rw [hJ]
+  rfl
+
+theorem stepBasicBlock_diamondCfg_arm_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stT : SymState Val)
+    (hT : evalPlan alg onTrue st1 = .ok (.continuing stT)) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      1 st1 = .jump 3 stT := by
+  dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+  rw [hT]
+
+theorem stepBasicBlock_diamondCfg_arm_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stF : SymState Val)
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF)) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      2 st1 = .jump 3 stF := by
+  dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+  rw [hF]
+
+theorem stepBasicBlock_diamondCfg_join {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (stJ stFinal : SymState Val) (rv : Val)
+    (hP : evalPlan alg post stJ = .ok (.continuing stFinal))
+    (hClean : stateCleanAtReturn stFinal = true)
+    (hRet : evalRval alg retExpr stFinal = some rv)
+    (hFree : handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      3 stJ = .ret ⟨rv, collectRootMutVals stFinal.loans⟩ := by
+  dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+  rw [hP]
+  dsimp only
+  rw [hClean]
+  dsimp
+  rw [hRet]
+  dsimp
+  rw [hFree]
+  rfl
+
+/-- Any 4-block diamond CFG whose component plans (`pre`, `onTrue`, `onFalse`,
+`post`) produce only `.continuing` flows emits only sub-identity wrappers
+(`handleFreeOutOpt alg` on symbolic `.convergedJump` transitions at block `0`,
+and no wrappers elsewhere), so it satisfies `EmitsSubIdWraps` for every
+invariant `Inv`. -/
+theorem diamondCfgBlocks_emitsSubIdWraps {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s')
+    (Inv : Nat → SymState Val → Prop) :
+    EmitsSubIdWraps
+      (stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+      Inv := by
+  intro bb st _
+  match bb with
+  | 0 =>
+    unfold stepBasicBlock
+    rw [listGetOpt_zero_diamondCfgBlocks, length_diamondCfgBlocks]
+    dsimp only
+    cases hEvP : evalPlan alg pre st with
+    | fail => exact trivial
+    | ok fP =>
+      obtain ⟨st1, hfP⟩ := hPre st fP hEvP
+      subst hfP
+      dsimp only
+      cases hCond : evalRval alg cond st1 with
+      | none => exact trivial
+      | some cv =>
+        dsimp only
+        cases hBool : alg.asBool cv with
+        | some b => cases b <;> exact trivial
+        | none =>
+          dsimp only
+          rw [findConvergenceBlock_diamondCfgBlocks]
+          dsimp only
+          cases hEvT : evalPlan alg onTrue st1 with
+          | fail =>
+            have hArmTFail :
+                evalArmToJoin alg
+                  (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+                  5 3 1 st1 = .fail := by
+              rw [evalArmToJoin_goto_stop alg _ 3 3 1 onTrue st1 rfl
+                    (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+                  hEvT]
+            rw [hArmTFail]
+            exact trivial
+          | ok fT =>
+            obtain ⟨stT, hfT⟩ := hTrue st1 fT hEvT
+            subst hfT
+            rw [evalArmToJoin_diamondCfgBlocks_true alg pre cond onTrue onFalse
+                  post retExpr st1 stT hEvT]
+            cases hEvF : evalPlan alg onFalse st1 with
+            | fail =>
+              have hArmFFail :
+                  evalArmToJoin alg
+                    (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+                    5 3 2 st1 = .fail := by
+                rw [evalArmToJoin_goto_stop alg _ 3 3 2 onFalse st1 rfl
+                      (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+                    hEvF]
+              rw [hArmFFail]
+              exact trivial
+            | ok fF =>
+              obtain ⟨stF, hfF⟩ := hFalse st1 fF hEvF
+              subst hfF
+              rw [evalArmToJoin_diamondCfgBlocks_false alg pre cond onTrue
+                    onFalse post retExpr st1 stF hEvF]
+              dsimp only [joinExecFlow]
+              cases joinSymState alg cv stT stF with
+              | none => exact trivial
+              | some stJ =>
+                exact subIdWrap_handleFreeOutOpt alg
+  | 1 =>
+    dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+    cases hEvT : evalPlan alg onTrue st with
+    | fail => exact trivial
+    | ok fT =>
+      obtain ⟨_, hfT⟩ := hTrue st fT hEvT
+      subst hfT
+      exact trivial
+  | 2 =>
+    dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+    cases hEvF : evalPlan alg onFalse st with
+    | fail => exact trivial
+    | ok fF =>
+      obtain ⟨_, hfF⟩ := hFalse st fF hEvF
+      subst hfF
+      exact trivial
+  | 3 =>
+    dsimp only [stepBasicBlock, diamondCfgBlocks, listGetOpt, List.foldr]
+    cases hEvP : evalPlan alg post st with
+    | fail => exact trivial
+    | ok fP =>
+      obtain ⟨stFinal, hfP⟩ := hPost st fP hEvP
+      subst hfP
+      dsimp only
+      cases stateCleanAtReturn stFinal with
+      | false => exact trivial
+      | true =>
+        dsimp
+        cases evalRval alg retExpr stFinal with
+        | none => exact trivial
+        | some rv =>
+          dsimp
+          cases handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ <;>
+            exact trivial
+  | _ + 4 => exact trivial
+
+/-- **4-block diamond CFG equivalence (`cfg_certificate_diamond_sound`)**:
+executing `diamondCfgBlocks pre cond onTrue onFalse post retExpr` for `3` steps
+via `runBlockCfg` produces `.ret out` whenever
+`evalFnValue alg params (.seq pre (.seq (.branch cond onTrue onFalse) post)) retExpr = .ok out`,
+both when `cond` is a concrete boolean (`alg.asBool cv = some b`, taking the
+3-block path `0 -> 1/2 -> 3`) and when `cond` is symbolic (`alg.asBool cv = none`,
+emitting `.convergedJump 1 (handleFreeOutOpt alg) 3 stJoined` at block `0`,
+consuming `1` delay tick for the arm step, and returning at block `3`). -/
+theorem cfg_certificate_diamond_sound {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) post))
+        retExpr = .ok out) :
+    runBlockCfg
+      (stepBasicBlock alg
+        (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+      0 st0 3 = .ret out := by
+  have hWfBr := wfPlan_branch alg cond hWfTrue hWfFalse
+  have hWfBrPost := wfPlan_seq alg hWfBr hWfPost
+  unfold evalFnValue at hEval
+  rw [hInit] at hEval
+  dsimp only at hEval
+  rw [evalPlan_seq alg pre (.seq (.branch cond onTrue onFalse) post) st0
+        hWfPre hWfBrPost] at hEval
+  cases hEvPre : evalPlan alg pre st0 with
+  | fail => rw [hEvPre] at hEval; exact nomatch hEval
+  | ok fPre =>
+    obtain ⟨st1, hfPre⟩ := hPre st0 fPre hEvPre
+    subst hfPre
+    rw [hEvPre] at hEval
+    dsimp only at hEval
+    rw [evalPlan_seq alg (.branch cond onTrue onFalse) post st1 hWfBr hWfPost,
+        evalPlan_branch alg cond onTrue onFalse st1 hWfTrue hWfFalse] at hEval
+    cases hCond : evalRval alg cond st1 with
+    | none => rw [hCond] at hEval; exact nomatch hEval
+    | some cv =>
+      rw [hCond] at hEval
+      dsimp only at hEval
+      cases hBool : alg.asBool cv with
+      | some b =>
+        rw [hBool] at hEval
+        cases b with
+        | true =>
+          dsimp only at hEval
+          cases hEvT : evalPlan alg onTrue st1 with
+          | fail => rw [hEvT] at hEval; exact nomatch hEval
+          | ok fT =>
+            obtain ⟨stT, hfT⟩ := hTrue st1 fT hEvT
+            subst hfT
+            rw [hEvT] at hEval
+            dsimp only at hEval
+            cases hEvP : evalPlan alg post stT with
+            | fail => rw [hEvP] at hEval; exact nomatch hEval
+            | ok fP =>
+              obtain ⟨stFinal, hfP⟩ := hPost stT fP hEvP
+              subst hfP
+              rw [hEvP] at hEval
+              dsimp only at hEval
+              cases hClean : stateCleanAtReturn stFinal with
+              | false => rw [hClean] at hEval; exact nomatch hEval
+              | true =>
+                rw [hClean] at hEval
+                cases hRet : evalRval alg retExpr stFinal with
+                | none => rw [hRet] at hEval; exact nomatch hEval
+                | some rv =>
+                  rw [hRet] at hEval
+                  dsimp only at hEval
+                  cases hFree :
+                      handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ with
+                  | false => rw [hFree] at hEval; exact nomatch hEval
+                  | true =>
+                    rw [hFree] at hEval
+                    injection hEval with hOut
+                    subst hOut
+                    rw [runBlockCfg_succ,
+                        stepBasicBlock_diamondCfg_header_true alg pre cond
+                          onTrue onFalse post retExpr st0 st1 cv hEvPre hCond
+                          hBool]
+                    dsimp only
+                    rw [runBlockCfg_succ,
+                        stepBasicBlock_diamondCfg_arm_true alg pre cond onTrue
+                          onFalse post retExpr st1 stT hEvT]
+                    dsimp only
+                    rw [runBlockCfg_succ,
+                        stepBasicBlock_diamondCfg_join alg pre cond onTrue
+                          onFalse post retExpr stT stFinal rv hEvP hClean hRet
+                          hFree]
+        | false =>
+          dsimp only at hEval
+          cases hEvF : evalPlan alg onFalse st1 with
+          | fail => rw [hEvF] at hEval; exact nomatch hEval
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse st1 fF hEvF
+            subst hfF
+            rw [hEvF] at hEval
+            dsimp only at hEval
+            cases hEvP : evalPlan alg post stF with
+            | fail => rw [hEvP] at hEval; exact nomatch hEval
+            | ok fP =>
+              obtain ⟨stFinal, hfP⟩ := hPost stF fP hEvP
+              subst hfP
+              rw [hEvP] at hEval
+              dsimp only at hEval
+              cases hClean : stateCleanAtReturn stFinal with
+              | false => rw [hClean] at hEval; exact nomatch hEval
+              | true =>
+                rw [hClean] at hEval
+                cases hRet : evalRval alg retExpr stFinal with
+                | none => rw [hRet] at hEval; exact nomatch hEval
+                | some rv =>
+                  rw [hRet] at hEval
+                  dsimp only at hEval
+                  cases hFree :
+                      handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ with
+                  | false => rw [hFree] at hEval; exact nomatch hEval
+                  | true =>
+                    rw [hFree] at hEval
+                    injection hEval with hOut
+                    subst hOut
+                    rw [runBlockCfg_succ,
+                        stepBasicBlock_diamondCfg_header_false alg pre cond
+                          onTrue onFalse post retExpr st0 st1 cv hEvPre hCond
+                          hBool]
+                    dsimp only
+                    rw [runBlockCfg_succ,
+                        stepBasicBlock_diamondCfg_arm_false alg pre cond onTrue
+                          onFalse post retExpr st1 stF hEvF]
+                    dsimp only
+                    rw [runBlockCfg_succ,
+                        stepBasicBlock_diamondCfg_join alg pre cond onTrue
+                          onFalse post retExpr stF stFinal rv hEvP hClean hRet
+                          hFree]
+      | none =>
+        rw [hBool] at hEval
+        dsimp only at hEval
+        cases hEvT : evalPlan alg onTrue st1 with
+        | fail => rw [hEvT] at hEval; exact nomatch hEval
+        | ok fT =>
+          obtain ⟨stT, hfT⟩ := hTrue st1 fT hEvT
+          subst hfT
+          cases hEvF : evalPlan alg onFalse st1 with
+          | fail => rw [hEvT, hEvF] at hEval; exact nomatch hEval
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse st1 fF hEvF
+            subst hfF
+            rw [hEvT, hEvF] at hEval
+            dsimp only [joinExecFlow] at hEval
+            cases hJ : joinSymState alg cv stT stF with
+            | none => rw [hJ] at hEval; exact nomatch hEval
+            | some stJ =>
+              rw [hJ] at hEval
+              dsimp only at hEval
+              cases hEvP : evalPlan alg post stJ with
+              | fail => rw [hEvP] at hEval; exact nomatch hEval
+              | ok fP =>
+                obtain ⟨stFinal, hfP⟩ := hPost stJ fP hEvP
+                subst hfP
+                rw [hEvP] at hEval
+                dsimp only at hEval
+                cases hClean : stateCleanAtReturn stFinal with
+                | false => rw [hClean] at hEval; exact nomatch hEval
+                | true =>
+                  rw [hClean] at hEval
+                  cases hRet : evalRval alg retExpr stFinal with
+                  | none => rw [hRet] at hEval; exact nomatch hEval
+                  | some rv =>
+                    rw [hRet] at hEval
+                    dsimp only at hEval
+                    cases hFree :
+                        handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ with
+                    | false => rw [hFree] at hEval; exact nomatch hEval
+                    | true =>
+                      rw [hFree] at hEval
+                      injection hEval with hOut
+                      subst hOut
+                      rw [runBlockCfg_succ,
+                          stepBasicBlock_diamondCfg_header_symbolic alg pre cond
+                            onTrue onFalse post retExpr st0 st1 stT stF stJ cv
+                            hEvPre hCond hBool hEvT hEvF hJ]
+                      dsimp only
+                      rw [runBlockCfgLoop_succ_wait]
+                      have hStepJoin :
+                          runBlockCfgLoop
+                            (stepBasicBlock alg
+                              (diamondCfgBlocks pre cond onTrue onFalse post
+                                retExpr))
+                            1 0 3 stJ =
+                          .ret ⟨rv, collectRootMutVals stFinal.loans⟩ := by
+                        change
+                          runBlockCfg
+                            (stepBasicBlock alg
+                              (diamondCfgBlocks pre cond onTrue onFalse post
+                                retExpr))
+                            3 stJ 1 =
+                          .ret ⟨rv, collectRootMutVals stFinal.loans⟩
+                        rw [runBlockCfg_succ,
+                            stepBasicBlock_diamondCfg_join alg pre cond onTrue
+                              onFalse post retExpr stJ stFinal rv hEvP hClean
+                              hRet hFree]
+                      rw [hStepJoin]
+                      dsimp only [handleFreeOutOpt]
+                      rw [hFree]
+                      rfl
+
+/-- **4-block diamond `CfgCertificate` constructor (`CfgCertificate.diamond`)**:
+packages `diamondCfgBlocks pre cond onTrue onFalse post retExpr` at fuel `3`
+with plan `.seq pre (.seq (.branch cond onTrue onFalse) post)` via
+`cfg_certificate_diamond_sound`, supporting both concrete branch conditions and
+symbolic `.convergedJump 1` branch conditions. -/
+def CfgCertificate.diamond {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s') :
+    CfgCertificate alg where
+  blocks := diamondCfgBlocks pre cond onTrue onFalse post retExpr
+  entryBb := 0
+  fuel := 3
+  plan := .seq pre (.seq (.branch cond onTrue onFalse) post)
+  retExpr := retExpr
+  sound :=
+    cfg_certificate_diamond_sound alg pre cond onTrue onFalse post retExpr
+      hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse hPost
+
+/-- Canonical 2-point invariant `(bb = 0 ∧ st = st0) ∨ (bb = 3 ∧ st = stJ)` for
+a symbolic `.convergedJump` run of `diamondCfgBlocks` from entry `(0, st0)` to
+join `(3, stJ)`. -/
+def diamondSymBlockInv {Val : Type} (st0 stJ : SymState Val)
+    (bb : Nat) (st : SymState Val) : Prop :=
+  (bb = 0 ∧ st = st0) ∨ (bb = 3 ∧ st = stJ)
+
+/-- Whenever block `0` of a `diamondCfgBlocks` CFG emits
+`.convergedJump 1 wrapRet 3 stJ` from `st0` and block `3` emits `.ret out` from
+`stJ`, `diamondSymBlockInv st0 stJ` satisfies `InvClosedNoFork` and
+`LocalBlockVC` (when `wrapRet` accepts `out`). -/
+theorem diamondSymBlockInv_invClosedNoFork {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (st0 stJ : SymState Val)
+    (armSteps : Nat) (wrapRet : FuncOut Val → Option (FuncOut Val))
+    (out : FuncOut Val)
+    (hStep0 : stepBasicBlock alg blocks 0 st0 =
+      .convergedJump armSteps wrapRet 3 stJ)
+    (hStep3 : stepBasicBlock alg blocks 3 stJ = .ret out) :
+    InvClosedNoFork (stepBasicBlock alg blocks) (diamondSymBlockInv st0 stJ) := by
+  intro bb st hInv
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · rw [hStep0]
+    exact Or.inr ⟨rfl, rfl⟩
+  · rw [hStep3]
+    exact trivial
+
+theorem diamondSymBlockInv_localBlockVC {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (st0 stJ : SymState Val)
+    (armSteps : Nat) (wrapRet : FuncOut Val → Option (FuncOut Val))
+    (out : FuncOut Val)
+    (hStep0 : stepBasicBlock alg blocks 0 st0 =
+      .convergedJump armSteps wrapRet 3 stJ)
+    (hStep3 : stepBasicBlock alg blocks 3 stJ = .ret out)
+    (hWrap : wrapRet out = some out) :
+    LocalBlockVC (stepBasicBlock alg blocks) (diamondSymBlockInv st0 stJ)
+      (· = out) := by
+  intro bb st hInv
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · rw [hStep0]
+    refine ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩
+    intro v hv
+    subst hv
+    rw [hWrap]
+  · rw [hStep3]
+
+theorem diamondSymBlockInv_noFork {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (st0 stJ : SymState Val)
+    (armSteps : Nat) (wrapRet : FuncOut Val → Option (FuncOut Val))
+    (out : FuncOut Val)
+    (hStep0 : stepBasicBlock alg blocks 0 st0 =
+      .convergedJump armSteps wrapRet 3 stJ)
+    (hStep3 : stepBasicBlock alg blocks 3 stJ = .ret out) :
+    ∀ bb st, diamondSymBlockInv st0 stJ bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock alg blocks bb st ≠
+          .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st hInv _ _ _ _ hFork
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · rw [hStep0] at hFork
+    exact nomatch hFork
+  · rw [hStep3] at hFork
+    exact nomatch hFork
+
+/-- **End-to-end live `V2026_06_01` MIR adequacy for a symbolic `.convergedJump`
+diamond certified by `CfgCertificate.diamond` (`mir_diamond_cfgCertificate_sound`)**:
+packages `CfgCertificate.diamond`, `diamondCfgBlocks_emitsSubIdWraps`,
+`mirCfg_forwardSim_of_emitsSubIdWraps`, `diamondSymBlockInv_localBlockVC`,
+`diamondSymBlockInv_noFork`, and `mir_cfgCertificate_sound` so the caller
+supplies only the wrapper-free `mirCfgBlockRel` step obligations at `bb0` and
+`bb3`. -/
+theorem mir_diamond_cfgCertificate_sound (tagOf : LoanId → Nat)
+    (body : CapturedMir) (pre : FlowPlan StdVal) (cond : RvalOp StdVal)
+    (onTrue onFalse postPlan : FlowPlan StdVal) (retExpr : RvalOp StdVal)
+    (hWfPre : WfPlan stdValAlg pre) (hWfTrue : WfPlan stdValAlg onTrue)
+    (hWfFalse : WfPlan stdValAlg onFalse) (hWfPost : WfPlan stdValAlg postPlan)
+    (hPre : ∀ s f, evalPlan stdValAlg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan stdValAlg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan stdValAlg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan stdValAlg postPlan s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 stJ : SymState StdVal)
+    (out : FuncOut StdVal) (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hEval :
+      evalFnValue stdValAlg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) postPlan))
+        retExpr = .ok out)
+    (hPostOut : post out)
+    (hStep0 :
+      stepBasicBlock stdValAlg
+        (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr) 0 st0 =
+        .convergedJump 1 (handleFreeOutOpt stdValAlg) 3 stJ)
+    (hStep3 :
+      stepBasicBlock stdValAlg
+        (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr) 3 stJ =
+        .ret out)
+    (hZero : ∀ bb st ms,
+      mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match
+        stepBasicBlock stdValAlg
+          (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr) bb st
+      with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True)
+    {m0 : MachineState}
+    (hR0 : mirCfgBlockRel tagOf bindingsAt mirBb extra 0 st0 m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) := by
+  have hFree : handleFreeOut stdValAlg out = true :=
+    stepBasicBlock_ret_handleFree stdValAlg
+      (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr) hStep3
+  have hWrap : handleFreeOutOpt stdValAlg out = some out :=
+    acceptsHandleFree_handleFreeOutOpt stdValAlg out hFree
+  have hSpec :
+      HoldsFnSpec
+        (evalFnValue stdValAlg params
+          (.seq pre (.seq (.branch cond onTrue onFalse) postPlan)) retExpr)
+        post := by
+    rw [hEval]
+    exact hPostOut
+  exact mir_cfgCertificate_sound tagOf body
+    (CfgCertificate.diamond stdValAlg pre cond onTrue onFalse postPlan retExpr
+      hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse hPost)
+    params st0 post bindingsAt mirBb extra rootAddrs hInit hSpec
+    (diamondSymBlockInv st0 stJ) (· = out)
+    (diamondSymBlockInv_localBlockVC stdValAlg
+      (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr)
+      st0 stJ 1 (handleFreeOutOpt stdValAlg) out hStep0 hStep3 hWrap)
+    (diamondSymBlockInv_noFork stdValAlg
+      (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr)
+      st0 stJ 1 (handleFreeOutOpt stdValAlg) out hStep0 hStep3)
+    (Or.inl ⟨rfl, rfl⟩)
+    (mirCfg_forwardSim_of_emitsSubIdWraps tagOf body
+      (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr)
+      bindingsAt mirBb extra rootAddrs
+      (diamondCfgBlocks_emitsSubIdWraps stdValAlg pre cond onTrue onFalse
+        postPlan retExpr hPre hTrue hFalse hPost _)
+      hZero)
+    ⟨subIdWrap_some, hR0⟩
 
 /-- A successful `reabsorbFromSpatialInState` found its pinned block free of
 `.uninit` cells: `SpatialPin` never decodes a partially initialized block. -/
