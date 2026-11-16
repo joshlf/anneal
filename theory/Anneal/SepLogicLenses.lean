@@ -22395,4 +22395,1010 @@ theorem decodeScalarLayoutBytesNoForge_u16_le (b2 b3 : Nat) (hb2 : b2 < 256) (hb
 
 end SignatureCombinators
 
+/-! ## 6. Wide-Pointer Slice Byte & Borrow Lenses (`WidePtrVal`, `SliceTypedAt`)
+
+Slice views of `wide_ptr_or_unsized_dst` functions over the trusted byte primitives and the
+trusted `Trusted.Rustc.V2026_06_01.MirSemantics` wide-pointer representation.
+
+* `WidePtrVal := ProvenancePtr × Nat` (data pointer, element length). Every combinator
+  (`toValue`, `elemOffset`, `elemPtr`, `takeElems`, `dropElems`) projects `.1` / `.2`
+  directly (never `let (p, l) := wide`), and `widePtr_proj_fst` / `widePtr_proj_snd`
+  are the `simp` normal forms, so partially symbolic pairs never stall `simp` / `whnf`.
+  `WidePtrVal.toValue ptrBytes wide` is exactly the trusted fat pointer
+  `.aggregate 0 [.ptr wide.1 ptrBytes, .scalar ⟨wide.2, ptrBytes⟩]`.
+* `SliceTypedAt c wide xs bytes`: `xs.length = wide.2`, the `wide.2 * n`-byte window at
+  `wide.1.offsetBytes` fits, and element `i` is `TypedAt c (wide.1.offsetBytes + i * n)`.
+  ZST codecs (`n = 0`) and empty slices (`wide.2 = 0`) need no division and no
+  special cases. Algebra: `unique`, `getElem_typedAt`, `splitAt` (with the slice-scaled
+  `DisjointSlice.adjacent` witness), `append` / `of_splitAt` (inverse), `write_elem`,
+  `frame_writeBytes` / `frame_write`, and the `split_at_mut` write-then-reassemble law
+  `write_left_reassemble`.
+* Live memory: `globalAllocByteMem` is the trusted `globalAllocSliceToAbstractBytes`
+  view of a captured allocation, and `SliceTypedAt.len_eq` /
+  `WidePtrVal.evalRvalue_ptrMetadata` discharge `Rvalue.len (*slice)` and
+  `UnOp.ptrMetadata` in the trusted `evalRvalue` to `.scalar ⟨wide.2, ptrBytes⟩`;
+  `TypedAt.unsize_array_to_slice` discharges the trusted `PointerCoercion("Unsize")` of a
+  `ByteLensCodec.array`-typed `[T; N]` to a `SliceTypedAt` slice with `wide.2 = N`.
+* Borrow-checked lenses: `ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow` pair a
+  `SliceTypedAt` view with a byte-ranged trusted `BorrowEntry` covering exactly
+  `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)` with read / write permission
+  (`TreeBorrowPerm`), with `write_elem_frame` and `splitAt` (`split_at_mut`).
+-/
+
+section SliceWidePtrLenses
+
+/-- A wide (fat) slice pointer: data pointer `.1` and element length `.2`. -/
+abbrev WidePtrVal : Type := ProvenancePtr × Nat
+
+/-- Build a wide pointer from its data pointer and element length. -/
+@[reducible]
+def WidePtrVal.mk (p : ProvenancePtr) (len : Nat) : WidePtrVal := (p, len)
+
+/-- Normal form of the data-pointer projection. -/
+@[simp]
+theorem widePtr_proj_fst (p : ProvenancePtr) (len : Nat) : (WidePtrVal.mk p len).1 = p := rfl
+
+/-- Normal form of the element-length projection. -/
+@[simp]
+theorem widePtr_proj_snd (p : ProvenancePtr) (len : Nat) : (WidePtrVal.mk p len).2 = len := rfl
+
+/-- The trusted runtime fat pointer `.aggregate 0 [.ptr wide.1 ptrBytes, .scalar ⟨wide.2, ptrBytes⟩]`. -/
+@[reducible]
+def WidePtrVal.toValue (ptrBytes : Nat) (wide : WidePtrVal) : Value :=
+  .aggregate 0 [.ptr wide.1 ptrBytes, .scalar ⟨wide.2, ptrBytes⟩]
+
+/-- Byte offset of element `i` of a slice of `n`-byte elements. -/
+@[reducible]
+def WidePtrVal.elemOffset (wide : WidePtrVal) (n i : Nat) : Nat :=
+  wide.1.offsetBytes + i * n
+
+/-- Thin pointer to element `i` (same allocation / provenance as `wide.1`). -/
+@[reducible]
+def WidePtrVal.elemPtr (wide : WidePtrVal) (n i : Nat) : ProvenancePtr :=
+  { allocId := wide.1.allocId, offsetBytes := WidePtrVal.elemOffset wide n i }
+
+/-- The prefix subslice `wide[.. k]`. -/
+@[reducible]
+def WidePtrVal.takeElems (wide : WidePtrVal) (k : Nat) : WidePtrVal :=
+  (wide.1, k)
+
+/-- The suffix subslice `wide[k ..]` (`wide.2 - k` elements starting at element `k`). -/
+@[reducible]
+def WidePtrVal.dropElems (wide : WidePtrVal) (n k : Nat) : WidePtrVal :=
+  (WidePtrVal.elemPtr wide n k, wide.2 - k)
+
+@[simp] theorem WidePtrVal.toValue_mk (ptrBytes : Nat) (p : ProvenancePtr) (len : Nat) :
+    WidePtrVal.toValue ptrBytes (WidePtrVal.mk p len) =
+      .aggregate 0 [.ptr p ptrBytes, .scalar ⟨len, ptrBytes⟩] := rfl
+
+@[simp] theorem WidePtrVal.takeElems_fst (wide : WidePtrVal) (k : Nat) :
+    (WidePtrVal.takeElems wide k).1 = wide.1 := rfl
+
+@[simp] theorem WidePtrVal.takeElems_snd (wide : WidePtrVal) (k : Nat) :
+    (WidePtrVal.takeElems wide k).2 = k := rfl
+
+@[simp] theorem WidePtrVal.dropElems_fst (wide : WidePtrVal) (n k : Nat) :
+    (WidePtrVal.dropElems wide n k).1 = WidePtrVal.elemPtr wide n k := rfl
+
+@[simp] theorem WidePtrVal.dropElems_snd (wide : WidePtrVal) (n k : Nat) :
+    (WidePtrVal.dropElems wide n k).2 = wide.2 - k := rfl
+
+/-- The trusted fat-pointer encoding is injective (for a fixed pointer width). -/
+theorem WidePtrVal.toValue_injective {ptrBytes : Nat} {w₁ w₂ : WidePtrVal}
+    (h : WidePtrVal.toValue ptrBytes w₁ = WidePtrVal.toValue ptrBytes w₂) : w₁ = w₂ := by
+  obtain ⟨p₁, l₁⟩ := w₁
+  obtain ⟨p₂, l₂⟩ := w₂
+  simp only [WidePtrVal.toValue, Value.aggregate.injEq, List.cons.injEq, Value.ptr.injEq,
+    Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h
+  obtain ⟨rfl, rfl⟩ := h
+  rfl
+
+/-- The byte offset of element `0` is the data pointer's offset. -/
+theorem WidePtrVal.elemOffset_zero (wide : WidePtrVal) (n : Nat) :
+    WidePtrVal.elemOffset wide n 0 = wide.1.offsetBytes := by
+  simp [WidePtrVal.elemOffset]
+
+/-- Element offsets of a suffix subslice shift by `k * n`. -/
+theorem WidePtrVal.elemOffset_dropElems (wide : WidePtrVal) (n k i : Nat) :
+    WidePtrVal.elemOffset (WidePtrVal.dropElems wide n k) n i =
+      WidePtrVal.elemOffset wide n (k + i) := by
+  simp only [WidePtrVal.elemOffset, Nat.add_mul, Nat.add_assoc]
+
+/-! ### `SliceTypedAt` -/
+
+/--
+**Relational slice view.** `SliceTypedAt c wide xs bytes`: `xs` has exactly `wide.2`
+elements, the `wide.2 * n`-byte window starting at `wide.1.offsetBytes` lies inside
+`bytes`, and element `i` is `TypedAt c (wide.1.offsetBytes + i * n) xs[i]`.
+-/
+def SliceTypedAt {α : Type} {n : Nat} (c : ByteLensCodec α n) (wide : WidePtrVal)
+    (xs : List α) (bytes : ByteMem) : Prop :=
+  xs.length = wide.2 ∧ wide.1.offsetBytes + wide.2 * n ≤ bytes.length ∧
+    ∀ (i : Nat) (hi : i < xs.length), TypedAt c (wide.1.offsetBytes + i * n) xs[i] bytes
+
+namespace SliceTypedAt
+
+variable {α : Type} {n : Nat} {c : ByteLensCodec α n}
+
+theorem length_eq {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) : xs.length = wide.2 := h.1
+
+theorem window_le {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) : wide.1.offsetBytes + wide.2 * n ≤ bytes.length := h.2.1
+
+/-- **`SliceTypedAt.unique`**: the slice view determines its element list. -/
+theorem unique {wide : WidePtrVal} {xs₁ xs₂ : List α} {bytes : ByteMem}
+    (h₁ : SliceTypedAt c wide xs₁ bytes) (h₂ : SliceTypedAt c wide xs₂ bytes) : xs₁ = xs₂ := by
+  apply List.ext_getElem (h₁.1.trans h₂.1.symm)
+  intro i hi₁ hi₂
+  exact TypedAt.unique (h₁.2.2 i hi₁) (h₂.2.2 i hi₂)
+
+/-- **`SliceTypedAt.getElem_typedAt`**: element `i < wide.2` is typed at its byte offset. -/
+theorem getElem_typedAt {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {i : Nat} (hi : i < wide.2) :
+    ∃ x, xs[i]? = some x ∧ TypedAt c (WidePtrVal.elemOffset wide n i) x bytes := by
+  have hi' : i < xs.length := by rw [h.1]; exact hi
+  exact ⟨xs[i], List.getElem?_eq_getElem hi', h.2.2 i hi'⟩
+
+/-- Indexed form of `getElem_typedAt`. -/
+theorem getElem_typedAt' {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {i : Nat} (hi : i < xs.length) :
+    TypedAt c (WidePtrVal.elemOffset wide n i) xs[i] bytes :=
+  h.2.2 i hi
+
+/-- Out-of-bounds indices have no element. -/
+theorem getElem?_eq_none_of_le {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {i : Nat} (hi : wide.2 ≤ i) : xs[i]? = none :=
+  List.getElem?_eq_none (by rw [h.1]; exact hi)
+
+/--
+**`SliceTypedAt.splitAt`**: at any `k ≤ wide.2`, the slice splits into its prefix
+`takeElems wide k` (`xs.take k`) and suffix `dropElems wide n k` (`xs.drop k`), whose byte
+windows are adjacent and disjoint (`DisjointSlice.adjacent`).
+-/
+theorem splitAt {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {k : Nat} (hk : k ≤ wide.2) :
+    SliceTypedAt c (WidePtrVal.takeElems wide k) (xs.take k) bytes ∧
+      SliceTypedAt c (WidePtrVal.dropElems wide n k) (xs.drop k) bytes ∧
+      DisjointSlice wide.1.offsetBytes (k * n) (wide.1.offsetBytes + k * n) ((wide.2 - k) * n) := by
+  obtain ⟨hlen, hb, hel⟩ := h
+  have hkn : k * n ≤ wide.2 * n := Nat.mul_le_mul_right n hk
+  refine ⟨⟨?_, ?_, ?_⟩, ⟨?_, ?_, ?_⟩, DisjointSlice.adjacent _ _ _⟩
+  · simp only [List.length_take, hlen]
+    omega
+  · show wide.1.offsetBytes + k * n ≤ bytes.length
+    omega
+  · intro i hi
+    have hi' : i < xs.length := by
+      simp only [List.length_take] at hi
+      omega
+    rw [List.getElem_take]
+    exact hel i hi'
+  · simp only [List.length_drop, hlen]
+  · show wide.1.offsetBytes + k * n + (wide.2 - k) * n ≤ bytes.length
+    rw [Nat.sub_mul]
+    omega
+  · intro i hi
+    have hi' : k + i < xs.length := by
+      simp only [List.length_drop] at hi
+      omega
+    rw [List.getElem_drop]
+    have h₁ := hel (k + i) hi'
+    show TypedAt c (wide.1.offsetBytes + k * n + i * n) xs[k + i] bytes
+    rw [Nat.add_assoc, ← Nat.add_mul]
+    exact h₁
+
+/--
+**`SliceTypedAt.append`**: a prefix of `k` elements at `p` and a suffix of `m` elements at
+`p + k * n` (same allocation) reassemble into one slice of `k + m` elements.
+-/
+theorem append {p : ProvenancePtr} {k m : Nat} {xsL xsR : List α} {bytes : ByteMem}
+    (hL : SliceTypedAt c (WidePtrVal.mk p k) xsL bytes)
+    (hR : SliceTypedAt c (WidePtrVal.mk (WidePtrVal.elemPtr (WidePtrVal.mk p k) n k) m) xsR bytes) :
+    SliceTypedAt c (WidePtrVal.mk p (k + m)) (xsL ++ xsR) bytes := by
+  obtain ⟨hlenL, hbL, helL⟩ := hL
+  obtain ⟨hlenR, hbR, helR⟩ := hR
+  dsimp only [WidePtrVal.mk] at hlenL hlenR hbL hbR helL helR
+  refine ⟨?_, ?_, ?_⟩
+  · simp only [List.length_append, hlenL, hlenR]
+  · show p.offsetBytes + (k + m) * n ≤ bytes.length
+    rw [Nat.add_mul]
+    simp only [WidePtrVal.elemOffset] at hbR
+    omega
+  · intro i hi
+    show TypedAt c (p.offsetBytes + i * n) (xsL ++ xsR)[i] bytes
+    by_cases hik : i < xsL.length
+    · rw [List.getElem_append_left hik]
+      exact helL i hik
+    · have hi' : i - xsL.length < xsR.length := by
+        simp only [List.length_append] at hi
+        omega
+      rw [List.getElem_append_right (by omega)]
+      have h₁ := helR (i - xsL.length) hi'
+      simp only [WidePtrVal.elemOffset] at h₁
+      have heq : p.offsetBytes + k * n + (i - xsL.length) * n = p.offsetBytes + i * n := by
+        rw [Nat.add_assoc, ← Nat.add_mul, hlenL, Nat.add_sub_cancel' (by omega)]
+      rw [heq] at h₁
+      exact h₁
+
+/--
+**`SliceTypedAt.of_splitAt`** (inverse of `splitAt`): typed prefix and suffix views at
+`k ≤ wide.2` reassemble into the whole slice.
+-/
+theorem of_splitAt {wide : WidePtrVal} {k : Nat} {xsL xsR : List α} {bytes : ByteMem}
+    (hk : k ≤ wide.2) (hL : SliceTypedAt c (WidePtrVal.takeElems wide k) xsL bytes)
+    (hR : SliceTypedAt c (WidePtrVal.dropElems wide n k) xsR bytes) :
+    SliceTypedAt c wide (xsL ++ xsR) bytes := by
+  have h := append (p := wide.1) (k := k) (m := wide.2 - k) hL hR
+  have hk' : k + (wide.2 - k) = wide.2 := by omega
+  rw [hk'] at h
+  exact h
+
+/-- `splitAt` followed by `of_splitAt` recovers exactly the original view. -/
+theorem splitAt_of_splitAt {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {k : Nat} (hk : k ≤ wide.2) :
+    SliceTypedAt c wide (xs.take k ++ xs.drop k) bytes ∧ xs.take k ++ xs.drop k = xs := by
+  obtain ⟨hL, hR, _⟩ := splitAt h hk
+  exact ⟨of_splitAt hk hL hR, List.take_append_drop k xs⟩
+
+/--
+**`SliceTypedAt.write_elem`**: a successful typed write of `v` at element `i < wide.2`
+updates the view to `xs.set i v`.
+-/
+theorem write_elem {wide : WidePtrVal} {xs : List α} {bytes bytes' : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {i : Nat} (hi : i < wide.2) (v : α)
+    (hw : writeTyped c (WidePtrVal.elemOffset wide n i) v bytes = some bytes') :
+    SliceTypedAt c wide (xs.set i v) bytes' := by
+  obtain ⟨hlen, hb, hel⟩ := h
+  have hlen' := writeTyped_length hw
+  have hin : wide.1.offsetBytes + i * n + n ≤ bytes.length := by
+    have h₁ : (i + 1) * n ≤ wide.2 * n := Nat.mul_le_mul_right n hi
+    rw [Nat.add_mul, Nat.one_mul] at h₁
+    omega
+  refine ⟨by rw [List.length_set]; exact hlen, by omega, ?_⟩
+  intro j hj
+  have hj' : j < xs.length := by rw [List.length_set] at hj; exact hj
+  rw [List.getElem_set]
+  by_cases hij : i = j
+  · subst hij
+    rw [ite_eq_left rfl]
+    obtain ⟨m', hm', ht, _⟩ := TypedAt.read_write_same c v hin
+    rw [hm'] at hw
+    cases hw
+    exact ht
+  · rw [ite_eq_right hij]
+    have hd : DisjointSlice (wide.1.offsetBytes + i * n) n (wide.1.offsetBytes + j * n) n := by
+      unfold DisjointSlice
+      rcases Nat.lt_or_gt_of_ne hij with hlt | hgt
+      · have h₁ : (i + 1) * n ≤ j * n := Nat.mul_le_mul_right n hlt
+        rw [Nat.add_mul, Nat.one_mul] at h₁
+        omega
+      · have h₁ : (j + 1) * n ≤ i * n := Nat.mul_le_mul_right n hgt
+        rw [Nat.add_mul, Nat.one_mul] at h₁
+        omega
+    exact TypedAt.frame_write hd hw (hel j hj')
+
+/-- **`SliceTypedAt.frame_writeBytes`**: a raw byte write disjoint from the slice window
+preserves the whole slice view. -/
+theorem frame_writeBytes {wide : WidePtrVal} {ys : List α} {bytes bytes' : ByteMem}
+    {off : Nat} {w : ByteMem} (h : SliceTypedAt c wide ys bytes)
+    (hd : DisjointSlice off w.length wide.1.offsetBytes (wide.2 * n))
+    (hw : writeAbstractBytesAt bytes off w = some bytes') :
+    SliceTypedAt c wide ys bytes' := by
+  obtain ⟨hlen, hb, hel⟩ := h
+  have hlen' : bytes'.length = bytes.length := by
+    rcases writeAbstractBytesAt_some_inv hw with ⟨_, rfl⟩ | ⟨hle, rfl⟩
+    · rfl
+    · exact length_splice hle
+  refine ⟨hlen, by omega, ?_⟩
+  intro j hj
+  have hjw : j < wide.2 := by omega
+  have hjn : (j + 1) * n ≤ wide.2 * n := Nat.mul_le_mul_right n hjw
+  rw [Nat.add_mul, Nat.one_mul] at hjn
+  refine TypedAt.frame_writeBytes ?_ hw (hel j hj)
+  unfold DisjointSlice at hd ⊢
+  rcases hd with h0 | h0 | h0 | h0
+  · exact Or.inl h0
+  · exact Or.inr (Or.inl (by omega))
+  · exact Or.inr (Or.inr (Or.inl (by omega)))
+  · exact Or.inr (Or.inr (Or.inr (by omega)))
+
+/-- **`SliceTypedAt.frame_write`**: a typed write disjoint from the slice window preserves
+the whole slice view. -/
+theorem frame_write {β : Type} {n₁ : Nat} {c₁ : ByteLensCodec β n₁} {base₁ : Nat} {v₁ : β}
+    {wide : WidePtrVal} {ys : List α} {bytes bytes' : ByteMem}
+    (h : SliceTypedAt c wide ys bytes)
+    (hd : DisjointSlice base₁ n₁ wide.1.offsetBytes (wide.2 * n))
+    (hw : writeTyped c₁ base₁ v₁ bytes = some bytes') :
+    SliceTypedAt c wide ys bytes' :=
+  frame_writeBytes h (by rw [c₁.encode_len]; exact hd) hw
+
+/--
+**`split_at_mut` write law**: writing element `i < k` of the left half updates the left
+view to `(xs.take k).set i v`, leaves the right view `xs.drop k` intact, and the halves
+reassemble into the direct update `xs.set i v`.
+-/
+theorem write_left_reassemble {wide : WidePtrVal} {xs : List α} {bytes bytes' : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {k i : Nat} (hk : k ≤ wide.2) (hi : i < k) (v : α)
+    (hw : writeTyped c (WidePtrVal.elemOffset wide n i) v bytes = some bytes') :
+    SliceTypedAt c (WidePtrVal.takeElems wide k) ((xs.take k).set i v) bytes' ∧
+      SliceTypedAt c (WidePtrVal.dropElems wide n k) (xs.drop k) bytes' ∧
+      SliceTypedAt c wide (xs.set i v) bytes' := by
+  obtain ⟨hL, hR, _⟩ := splitAt h hk
+  have hL' : SliceTypedAt c (WidePtrVal.takeElems wide k) ((xs.take k).set i v) bytes' :=
+    write_elem hL hi v hw
+  have hR' : SliceTypedAt c (WidePtrVal.dropElems wide n k) (xs.drop k) bytes' := by
+    refine frame_write hR ?_ hw
+    unfold DisjointSlice
+    have h₁ : (i + 1) * n ≤ k * n := Nat.mul_le_mul_right n hi
+    rw [Nat.add_mul, Nat.one_mul] at h₁
+    right; right; left
+    simp only [WidePtrVal.elemOffset]
+    omega
+  refine ⟨hL', hR', ?_⟩
+  have hfull := of_splitAt hk hL' hR'
+  have hset : (xs.take k).set i v ++ xs.drop k = xs.set i v := by
+    have hlt : i < (xs.take k).length := by
+      rw [List.length_take]
+      have := h.1
+      omega
+    rw [← List.set_append_left i v hlt, List.take_append_drop]
+  rw [hset] at hfull
+  exact hfull
+
+/-- **`split_at_mut` write law (right half)**: writing element `j` of the right half
+(absolute index `k + j`) leaves the left view intact. -/
+theorem write_right_reassemble {wide : WidePtrVal} {xs : List α} {bytes bytes' : ByteMem}
+    (h : SliceTypedAt c wide xs bytes) {k j : Nat} (hk : k ≤ wide.2) (hj : k + j < wide.2)
+    (v : α) (hw : writeTyped c (WidePtrVal.elemOffset wide n (k + j)) v bytes = some bytes') :
+    SliceTypedAt c (WidePtrVal.takeElems wide k) (xs.take k) bytes' ∧
+      SliceTypedAt c (WidePtrVal.dropElems wide n k) ((xs.drop k).set j v) bytes' ∧
+      SliceTypedAt c wide (xs.set (k + j) v) bytes' := by
+  obtain ⟨hL, hR, _⟩ := splitAt h hk
+  have hR' : SliceTypedAt c (WidePtrVal.dropElems wide n k) ((xs.drop k).set j v) bytes' := by
+    refine write_elem hR (by show j < wide.2 - k; omega) v ?_
+    rw [WidePtrVal.elemOffset_dropElems]
+    exact hw
+  have hL' : SliceTypedAt c (WidePtrVal.takeElems wide k) (xs.take k) bytes' := by
+    refine frame_write hL ?_ hw
+    unfold DisjointSlice
+    right; right; right
+    simp only [WidePtrVal.elemOffset]
+    have h₁ : k * n ≤ (k + j) * n := Nat.mul_le_mul_right n (Nat.le_add_right k j)
+    omega
+  refine ⟨hL', hR', ?_⟩
+  have hfull := of_splitAt hk hL' hR'
+  have hlen : (xs.take k).length = k := by
+    rw [List.length_take]; have := h.1; omega
+  have hset : xs.take k ++ (xs.drop k).set j v = xs.set (k + j) v := by
+    have hle : (xs.take k).length ≤ k + j := by omega
+    have h₁ := List.set_append_right (s := xs.take k) (t := xs.drop k) (k + j) v hle
+    rw [List.take_append_drop, hlen, Nat.add_sub_cancel_left] at h₁
+    exact h₁.symm
+  rw [hset] at hfull
+  exact hfull
+
+end SliceTypedAt
+
+/-! ### Zero-sized and empty slices -/
+
+/-- **Empty slices** are typed at every in-bounds data pointer with any codec. -/
+theorem sliceTypedAt_empty {α : Type} {n : Nat} (c : ByteLensCodec α n) (p : ProvenancePtr)
+    (bytes : ByteMem) (h : p.offsetBytes ≤ bytes.length) :
+    SliceTypedAt c (WidePtrVal.mk p 0) [] bytes :=
+  ⟨rfl, by rw [widePtr_proj_snd, Nat.zero_mul, Nat.add_zero]; exact h,
+    fun i hi => absurd hi (Nat.not_lt_zero i)⟩
+
+/-- **ZST slices** (`n = 0`): any length of `()` elements is typed at an in-bounds pointer;
+no byte is consumed and no division by the element size occurs. -/
+theorem sliceTypedAt_unit_replicate (p : ProvenancePtr) (len : Nat) (bytes : ByteMem)
+    (h : p.offsetBytes ≤ bytes.length) :
+    SliceTypedAt ByteLensCodec.unit (WidePtrVal.mk p len) (List.replicate len ()) bytes := by
+  refine ⟨?_, ?_, ?_⟩
+  · simp
+  · show p.offsetBytes + len * 0 ≤ bytes.length
+    rw [Nat.mul_zero, Nat.add_zero]
+    exact h
+  · intro i hi
+    show TypedAt ByteLensCodec.unit (p.offsetBytes + i * 0) (List.replicate len ())[i] bytes
+    rw [typedAt_zero_width_iff, Nat.mul_zero, Nat.add_zero]
+    refine ⟨h, ?_⟩
+    rw [List.getElem_replicate]
+    rfl
+
+
+/-! ### Live global allocations: the trusted byte view -/
+
+/-- The trusted per-byte conversion of `globalAllocBytesAux` at absolute offset `i`
+(`.uninit` for an uninitialized byte, `.init b prov` with relocation provenance). -/
+def globalAbsByteAt (bytes : List (Option UInt8)) (relocs : List (Nat × ProvenancePtr))
+    (i : Nat) : Option AbstractByte :=
+  match get? bytes i with
+  | none => none
+  | some optByte =>
+    some (match optByte with
+      | none => AbstractByte.uninit
+      | some b =>
+        AbstractByte.init b
+          (match lookupRelocAllocId relocs i with
+           | some targetPtr => some (targetPtr.allocId, targetPtr.tag)
+           | none => none))
+
+theorem globalAllocBytesAux_spec (bytes : List (Option UInt8))
+    (relocs : List (Nat × ProvenancePtr)) :
+    ∀ (rem off : Nat), off + rem ≤ bytes.length →
+      ∃ out, globalAllocBytesAux bytes relocs off rem = some out ∧ out.length = rem ∧
+        ∀ (j : Nat) (hj : j < out.length), some out[j] = globalAbsByteAt bytes relocs (off + j)
+  | 0, _, _ => ⟨[], rfl, rfl, fun j hj => absurd hj (Nat.not_lt_zero j)⟩
+  | rem + 1, off, h => by
+    obtain ⟨out, hout, hlen, hel⟩ := globalAllocBytesAux_spec bytes relocs rem (off + 1) (by omega)
+    have hlt : off < bytes.length := by omega
+    have hget : get? bytes off = some bytes[off] := by
+      unfold get?
+      exact List.getElem?_eq_getElem hlt
+    refine ⟨(match bytes[off] with
+        | none => AbstractByte.uninit
+        | some b =>
+          AbstractByte.init b
+            (match lookupRelocAllocId relocs off with
+             | some targetPtr => some (targetPtr.allocId, targetPtr.tag)
+             | none => none)) :: out, ?_, ?_, ?_⟩
+    · unfold globalAllocBytesAux
+      rw [hget]
+      dsimp only
+      rw [show Nat.add off 1 = off + 1 from rfl, hout]
+      rfl
+    · simp only [List.length_cons, hlen]
+    · intro j hj
+      cases j with
+      | zero =>
+        unfold globalAbsByteAt
+        rw [Nat.add_zero, hget]
+        rfl
+      | succ j =>
+        have hj' : j < out.length := by simp only [List.length_cons] at hj; omega
+        rw [List.getElem_cons_succ, hel j hj', Nat.add_assoc, Nat.add_comm 1 j]
+
+/-- **Trusted byte view of a captured global allocation**: the whole allocation read
+through the trusted `globalAllocSliceToAbstractBytes` (relocation provenance included). -/
+def globalAllocByteMem (alloc : CapturedAllocation) : ByteMem :=
+  (globalAllocSliceToAbstractBytes alloc 0 (length alloc.bytes)).getD []
+
+private theorem globalAllocByteMem_spec (alloc : CapturedAllocation) :
+    (globalAllocByteMem alloc).length = alloc.bytes.length ∧
+      ∀ (j : Nat) (hj : j < (globalAllocByteMem alloc).length),
+        some (globalAllocByteMem alloc)[j] = globalAbsByteAt alloc.bytes alloc.relocations j := by
+  obtain ⟨out, hout, hlen, hel⟩ :=
+    globalAllocBytesAux_spec alloc.bytes alloc.relocations alloc.bytes.length 0 (by omega)
+  have h : globalAllocSliceToAbstractBytes alloc 0 (length alloc.bytes) = some out := by
+    unfold globalAllocSliceToAbstractBytes
+    rw [show Nat.ble 0 (length alloc.bytes) = true from Nat.ble_eq_true_of_le (Nat.zero_le _)]
+    exact hout
+  have hm : globalAllocByteMem alloc = out := by
+    unfold globalAllocByteMem
+    rw [h]
+    rfl
+  rw [hm]
+  refine ⟨hlen, fun j hj => ?_⟩
+  rw [hel j hj, Nat.zero_add]
+
+theorem globalAllocByteMem_length (alloc : CapturedAllocation) :
+    (globalAllocByteMem alloc).length = alloc.bytes.length :=
+  (globalAllocByteMem_spec alloc).1
+
+/--
+**Deref-slice byte-read bridge**: every in-bounds trusted global byte read
+`globalAllocSliceToAbstractBytes alloc off len` returns exactly the window
+`[off, off + len)` of `globalAllocByteMem alloc`.
+-/
+theorem globalAllocSliceToAbstractBytes_eq_window (alloc : CapturedAllocation) (off len : Nat)
+    (h : off + len ≤ alloc.bytes.length) :
+    globalAllocSliceToAbstractBytes alloc off len =
+      some (((globalAllocByteMem alloc).drop off).take len) := by
+  obtain ⟨out, hout, hlen, hel⟩ :=
+    globalAllocBytesAux_spec alloc.bytes alloc.relocations len off h
+  obtain ⟨hfl, hfel⟩ := globalAllocByteMem_spec alloc
+  unfold globalAllocSliceToAbstractBytes
+  rw [show Nat.ble off (length alloc.bytes) = true from Nat.ble_eq_true_of_le (by
+    show off ≤ alloc.bytes.length; omega)]
+  dsimp only
+  rw [hout]
+  congr 1
+  apply List.ext_getElem
+  · simp only [List.length_take, List.length_drop, hfl, hlen]
+    omega
+  · intro j hj₁ hj₂
+    have h₁ := hel j hj₁
+    have hj₃ : off + j < (globalAllocByteMem alloc).length := by
+      simp only [List.length_take, List.length_drop] at hj₂
+      omega
+    have h₂ := hfel (off + j) hj₃
+    rw [List.getElem_take, List.getElem_drop]
+    rw [← h₂] at h₁
+    exact Option.some.inj h₁
+
+private theorem globalAllocBytesAux_bound (bytes : List (Option UInt8))
+    (relocs : List (Nat × ProvenancePtr)) :
+    ∀ (rem off : Nat) (out : List AbstractByte),
+      globalAllocBytesAux bytes relocs off rem = some out → off ≤ bytes.length →
+        off + rem ≤ bytes.length
+  | 0, off, _, _, h => by omega
+  | rem + 1, off, out, h, _ => by
+    unfold globalAllocBytesAux at h
+    cases hg : get? bytes off with
+    | none => rw [hg] at h; cases h
+    | some ob =>
+      rw [hg] at h
+      dsimp only at h
+      cases hr : globalAllocBytesAux bytes relocs (Nat.add off 1) rem with
+      | none => rw [hr] at h; cases h
+      | some rest =>
+        have hlt : off < bytes.length := by
+          unfold get? at hg
+          by_cases hc : off < bytes.length
+          · exact hc
+          · rw [List.getElem?_eq_none (by omega)] at hg
+            cases hg
+        have := globalAllocBytesAux_bound bytes relocs rem (off + 1) rest hr (by omega)
+        omega
+
+/-- **Typed deref read bridge**: `TypedAt` over the trusted global byte view is exactly a
+successful trusted global byte read followed by the codec's decoder. -/
+theorem typedAt_globalAllocByteMem_iff {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (alloc : CapturedAllocation) (off : Nat) (x : α) :
+    TypedAt c off x (globalAllocByteMem alloc) ↔
+      ∃ w, globalAllocSliceToAbstractBytes alloc off n = some w ∧ c.decode w = some x := by
+  rw [typedAt_iff, globalAllocByteMem_length]
+  constructor
+  · rintro ⟨hb, hd⟩
+    exact ⟨_, globalAllocSliceToAbstractBytes_eq_window alloc off n hb, hd⟩
+  · rintro ⟨w, hw, hd⟩
+    have hle : off ≤ alloc.bytes.length := by
+      unfold globalAllocSliceToAbstractBytes at hw
+      cases hle : Nat.ble off (length alloc.bytes) with
+      | false => rw [hle] at hw; cases hw
+      | true => exact Nat.le_of_ble_eq_true hle
+    have hb : off + n ≤ alloc.bytes.length := by
+      unfold globalAllocSliceToAbstractBytes at hw
+      rw [show Nat.ble off (length alloc.bytes) = true from Nat.ble_eq_true_of_le hle] at hw
+      exact globalAllocBytesAux_bound _ _ n off w hw hle
+    rw [globalAllocSliceToAbstractBytes_eq_window alloc off n hb] at hw
+    cases hw
+    exact ⟨hb, hd⟩
+
+/-! ### Trusted `Rvalue.len (*slice)` and `UnOp.ptrMetadata` -/
+
+/--
+**`WidePtrVal.evalRvalue_ptrMetadata`**: `PtrMetadata(op)` of an operand evaluating to the
+trusted fat pointer of `wide` is `.scalar ⟨wide.2, ptrBytes⟩`.
+-/
+theorem WidePtrVal.evalRvalue_ptrMetadata (locals locals' : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (wide : WidePtrVal)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem := by
+  show evalUnaryPtrMetadata locals op mem localDecls layouts = _
+  unfold evalUnaryPtrMetadata
+  simp only [hOp, WidePtrVal.toValue, Nat.beq_refl, Bool.and_self]
+
+/--
+**`WidePtrVal.evalRvalue_len`**: `Len(*p)` where `p` reads the trusted fat pointer of
+`wide` into a captured global allocation (no stack borrow under the tag) evaluates to
+`.scalar ⟨wide.2, ptrBytes⟩` whenever the `wide.2`-element window of `n`-byte elements fits
+the allocation.
+-/
+theorem WidePtrVal.evalRvalue_len (locals locals' : List LocalSlot) (place : Place)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (alloc : CapturedAllocation) (n : Nat) (wide : WidePtrVal)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hNoBorrow : lookupBorrow mem.borrows wide.1.tag = none)
+    (hAlloc : lookupGlobalAlloc mem.globals wide.1.allocId = some alloc)
+    (hSz : tyByteSize localDecls layouts
+      { kind := elem, layoutIdx := unresolvedLayoutIdx layouts } = some n)
+    (hFit : wide.1.offsetBytes + wide.2 * n ≤ alloc.bytes.length) :
+    evalRvalue locals (.len place) mem localDecls layouts =
+      .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem := by
+  have hb : Nat.ble (Nat.add wide.1.offsetBytes (Nat.mul wide.2 n)) (length alloc.bytes) = true :=
+    Nat.ble_eq_true_of_le hFit
+  show evalPlaceLen locals place mem localDecls layouts = _
+  unfold evalPlaceLen
+  simp only [hTy, hSplit, hRead, WidePtrVal.toValue, hNoBorrow, hAlloc, hSz, Nat.beq_refl,
+    Bool.true_and, Bool.and_true, Bool.and_self]
+  split
+  · rfl
+  · rename_i heq
+    rw [hb] at heq
+    contradiction
+
+/--
+**`SliceTypedAt.len_eq`**: for a slice view over the live global allocation `alloc` of
+`wide.1`, both `Len(*p)` and `PtrMetadata(p)` evaluate in the trusted semantics to
+`.scalar ⟨xs.length, ptrBytes⟩` (`= .scalar ⟨wide.2, ptrBytes⟩`), where `p`'s place read
+and operand both yield the fat pointer of `wide` and the slice element type has byte size
+`n` (the codec width).
+-/
+theorem SliceTypedAt.len_eq {α : Type} {n : Nat} {c : ByteLensCodec α n} {wide : WidePtrVal}
+    {xs : List α} {alloc : CapturedAllocation}
+    (h : SliceTypedAt c wide xs (globalAllocByteMem alloc))
+    (locals locals' : List LocalSlot) (place : Place) (ptrOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hNoBorrow : lookupBorrow mem.borrows wide.1.tag = none)
+    (hAlloc : lookupGlobalAlloc mem.globals wide.1.allocId = some alloc)
+    (hSz : tyByteSize localDecls layouts
+      { kind := elem, layoutIdx := unresolvedLayoutIdx layouts } = some n) :
+    evalRvalue locals (.len place) mem localDecls layouts =
+        .ok (.scalar ⟨xs.length, layoutPointerBytes layouts⟩) locals' mem ∧
+      evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls layouts =
+        .ok (.scalar ⟨xs.length, layoutPointerBytes layouts⟩) locals' mem := by
+  have hFit : wide.1.offsetBytes + wide.2 * n ≤ alloc.bytes.length := by
+    have := h.2.1
+    rw [globalAllocByteMem_length] at this
+    exact this
+  rw [h.1]
+  exact ⟨WidePtrVal.evalRvalue_len locals locals' place mem localDecls layouts initProj elem lIdx
+      alloc n wide hTy hSplit hRead hNoBorrow hAlloc hSz hFit,
+    WidePtrVal.evalRvalue_ptrMetadata locals locals' ptrOp mem localDecls layouts wide hOp⟩
+
+
+/-! ### Fixed-size array codec and `PointerCoercion("Unsize")` -/
+
+namespace ByteLensCodec
+
+/-- Decode exactly `N` consecutive `n`-byte elements (rejecting leftover bytes). -/
+def decodeElems {α : Type} {n : Nat} (c : ByteLensCodec α n) :
+    Nat → List AbstractByte → Option (List α)
+  | 0, bs =>
+    match bs with
+    | [] => some []
+    | _ :: _ => none
+  | N + 1, bs =>
+    match c.decode (bs.take n), decodeElems c N (bs.drop n) with
+    | some x, some xs => some (x :: xs)
+    | _, _ => none
+
+/-- Concatenated element encodings. -/
+def encodeElems {α : Type} {n : Nat} (c : ByteLensCodec α n) : List α → List AbstractByte
+  | [] => []
+  | x :: xs => c.encode x ++ encodeElems c xs
+
+theorem decodeElems_length {α : Type} {n : Nat} (c : ByteLensCodec α n) :
+    ∀ (N : Nat) (bs : List AbstractByte) (xs : List α), decodeElems c N bs = some xs →
+      xs.length = N
+  | 0, [], xs, h => by cases h; rfl
+  | 0, _ :: _, _, h => by cases h
+  | N + 1, bs, xs, h => by
+    unfold decodeElems at h
+    cases hx : c.decode (bs.take n) with
+    | none => rw [hx] at h; cases h
+    | some x =>
+      cases hxs : decodeElems c N (bs.drop n) with
+      | none => rw [hx, hxs] at h; cases h
+      | some xs' =>
+        rw [hx, hxs] at h
+        cases h
+        simp only [List.length_cons, decodeElems_length c N _ xs' hxs]
+
+theorem encodeElems_length {α : Type} {n : Nat} (c : ByteLensCodec α n) :
+    ∀ xs : List α, (encodeElems c xs).length = xs.length * n
+  | [] => by simp [encodeElems]
+  | x :: xs => by
+    simp only [encodeElems, List.length_append, c.encode_len, encodeElems_length c xs,
+      List.length_cons, Nat.succ_mul]
+    omega
+
+theorem decodeElems_encodeElems {α : Type} {n : Nat} (c : ByteLensCodec α n) :
+    ∀ xs : List α, decodeElems c xs.length (encodeElems c xs) = some xs
+  | [] => rfl
+  | x :: xs => by
+    show (match c.decode ((c.encode x ++ encodeElems c xs).take n),
+        decodeElems c xs.length ((c.encode x ++ encodeElems c xs).drop n) with
+      | some x, some xs => some (x :: xs)
+      | _, _ => none) = _
+    rw [List.take_left' (c.encode_len x), List.drop_left' (c.encode_len x), c.decode_encode,
+      decodeElems_encodeElems c xs]
+
+/-- **Fixed-size array codec `[T; N]`**: `N` consecutive `n`-byte elements. -/
+def array {α : Type} {n : Nat} (c : ByteLensCodec α n) (N : Nat) :
+    ByteLensCodec {xs : List α // xs.length = N} (N * n) where
+  encode xs := encodeElems c xs.val
+  decode bs := (decodeElems c N bs).bind fun xs =>
+    if h : xs.length = N then some ⟨xs, h⟩ else none
+  encode_len xs := by rw [encodeElems_length, xs.property]
+  decode_encode xs := by
+    show (decodeElems c N (encodeElems c xs.val)).bind _ = _
+    have h := decodeElems_encodeElems c xs.val
+    rw [xs.property] at h
+    rw [h]
+    show (if h : xs.val.length = N then some ⟨xs.val, h⟩ else none) = some xs
+    rw [dite_eq_left xs.property]
+
+end ByteLensCodec
+
+/-- Element-wise reading of a decoded array window. -/
+theorem sliceTypedAt_of_decodeElems {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (aid : AllocId) :
+    ∀ (N base : Nat) (xs : List α) (bytes : ByteMem), base + N * n ≤ bytes.length →
+      ByteLensCodec.decodeElems c N ((bytes.drop base).take (N * n)) = some xs →
+      SliceTypedAt c (WidePtrVal.mk ⟨aid, base⟩ N) xs bytes
+  | 0, base, xs, bytes, hb, h => by
+    rw [Nat.zero_mul, List.take_zero] at h
+    cases h
+    exact ⟨rfl, by show base + 0 * n ≤ bytes.length; omega,
+      fun i hi => absurd hi (Nat.not_lt_zero i)⟩
+  | N + 1, base, xs, bytes, hb, h => by
+    have hsplit : (N + 1) * n = n + N * n := by rw [Nat.succ_mul, Nat.add_comm]
+    have h1 : ((bytes.drop base).take ((N + 1) * n)).take n = (bytes.drop base).take n := by
+      rw [List.take_take, Nat.min_eq_left (by rw [hsplit]; exact Nat.le_add_right n (N * n))]
+    have h2 : ((bytes.drop base).take ((N + 1) * n)).drop n =
+        (bytes.drop (base + n)).take (N * n) := by
+      rw [hsplit, drop_take_add, List.drop_drop]
+    unfold ByteLensCodec.decodeElems at h
+    rw [h1, h2] at h
+    cases hx : c.decode ((bytes.drop base).take n) with
+    | none => rw [hx] at h; cases h
+    | some x =>
+      cases hxs : ByteLensCodec.decodeElems c N ((bytes.drop (base + n)).take (N * n)) with
+      | none => rw [hx, hxs] at h; cases h
+      | some xs' =>
+        rw [hx, hxs] at h
+        cases h
+        have hb' : base + n + N * n ≤ bytes.length := by rw [hsplit] at hb; omega
+        have ih := sliceTypedAt_of_decodeElems c aid N (base + n) xs' bytes hb' hxs
+        obtain ⟨hlen, _, hel⟩ := ih
+        refine ⟨?_, ?_, ?_⟩
+        · simp only [List.length_cons, hlen]
+        · show base + (N + 1) * n ≤ bytes.length
+          exact hb
+        · intro i hi
+          cases i with
+          | zero =>
+            show TypedAt c (base + 0 * n) x bytes
+            rw [Nat.zero_mul, Nat.add_zero, typedAt_iff]
+            exact ⟨by rw [hsplit] at hb; omega, hx⟩
+          | succ j =>
+            have hj : j < xs'.length := by simp only [List.length_cons] at hi; omega
+            have := hel j hj
+            show TypedAt c (base + (j + 1) * n) xs'[j] bytes
+            rw [show base + (j + 1) * n = base + n + j * n by rw [Nat.succ_mul]; omega]
+            exact this
+
+/-- A `ByteLensCodec.array`-typed window is a `SliceTypedAt` slice of the same elements. -/
+theorem SliceTypedAt.of_typedAt_array {α : Type} {n N : Nat} {c : ByteLensCodec α n}
+    {p : ProvenancePtr} {xs : {xs : List α // xs.length = N}} {bytes : ByteMem}
+    (h : TypedAt (c.array N) p.offsetBytes xs bytes) :
+    SliceTypedAt c (WidePtrVal.mk p N) xs.val bytes := by
+  rw [typedAt_iff] at h
+  obtain ⟨hb, hd⟩ := h
+  have hd' : ByteLensCodec.decodeElems c N ((bytes.drop p.offsetBytes).take (N * n)) = some xs.val := by
+    revert hd
+    show ((ByteLensCodec.decodeElems c N ((bytes.drop p.offsetBytes).take (N * n))).bind fun ys =>
+      if h : ys.length = N then some ⟨ys, h⟩ else none) = some xs → _
+    cases hdec : ByteLensCodec.decodeElems c N ((bytes.drop p.offsetBytes).take (N * n)) with
+    | none => intro h; cases h
+    | some ys =>
+      intro h
+      have hlen := ByteLensCodec.decodeElems_length c N _ ys hdec
+      rw [Option.bind_some, dite_eq_left hlen] at h
+      cases h
+      rfl
+  exact sliceTypedAt_of_decodeElems c p.allocId N p.offsetBytes xs.val bytes hb hd'
+
+/-- Slice pointer target kinds `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]`. -/
+@[reducible]
+def slicePtrKind (isRef : Bool) (m : Mutability) (elem : RigidTy) : RigidTy :=
+  match isRef with
+  | true => .ref m (.slice elem)
+  | false => .rawPtr m (.slice elem)
+
+/--
+**`TypedAt.unsize_array_to_slice`**: if the captured global allocation `alloc` holds a
+`[T; N]` array `xs` at `p` (`TypedAt (c.array N) p.offsetBytes xs`), then the trusted
+`PointerCoercion("Unsize")` of the thin array pointer `p` to a slice pointer evaluates to
+the fat pointer `WidePtrVal.toValue ptrBytes (p, N)`, and that fat pointer carries the
+slice view `SliceTypedAt c (p, N) xs` with `wide.2 = N`.
+-/
+theorem TypedAt.unsize_array_to_slice {α : Type} {n N : Nat} {c : ByteLensCodec α n}
+    {xs : {xs : List α // xs.length = N}} {alloc : CapturedAllocation}
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isRef : Bool) (m : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx) (srcTy : Ty)
+    (p : ProvenancePtr)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr p (layoutPointerBytes layouts)) locals')
+    (hNoBorrow : lookupBorrow mem.borrows p.tag = none)
+    (hTy : operandTy localDecls layouts op = some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrKind isRef m dstElem) = some N)
+    (hAlloc : lookupGlobalAlloc mem.globals p.allocId = some alloc)
+    (hMut : m = .mut → alloc.mutability = .mut)
+    (hSz : tyByteSize localDecls layouts
+      { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } = some n)
+    (hAlign : (byteOffsetToElemIdx? p.offsetBytes n).isSome = true)
+    (hArr : TypedAt (c.array N) p.offsetBytes xs (globalAllocByteMem alloc)) :
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op
+        { kind := slicePtrKind isRef m dstElem, layoutIdx := dstLIdx }) mem localDecls layouts =
+      .ok (WidePtrVal.toValue (layoutPointerBytes layouts) (WidePtrVal.mk p N)) locals' mem ∧
+    SliceTypedAt c (WidePtrVal.mk p N) xs.val (globalAllocByteMem alloc) := by
+  have hSl := SliceTypedAt.of_typedAt_array hArr
+  refine ⟨?_, hSl⟩
+  have hFit : p.offsetBytes + N * n ≤ alloc.bytes.length := by
+    have := hSl.2.1
+    rw [globalAllocByteMem_length] at this
+    exact this
+  have hb : Nat.ble (Nat.add p.offsetBytes (Nat.mul N n)) (length alloc.bytes) = true :=
+    Nat.ble_eq_true_of_le hFit
+  obtain ⟨k, hk⟩ := Option.isSome_iff_exists.mp hAlign
+  have hNoBorrow' : lookupBorrow mem.borrows p.allocId = none := hNoBorrow
+  show evalReifyFnPointer locals op _ mem localDecls layouts "Unsize" = _
+  unfold evalReifyFnPointer
+  rw [show isReifyFnPointerCoercion "Unsize" = false from rfl]
+  dsimp only
+  rw [show stringEq "Unsize" "Unsize" = true from rfl]
+  dsimp only
+  unfold evalUnsizeCoercion
+  cases isRef <;> cases m <;>
+    simp only [slicePtrKind, hOp, Nat.beq_refl, hNoBorrow', hTy, hSpec, hAlloc, hSz, hk, hb,
+      Bool.and_true, Bool.and_self, ProvenancePtr.tag, WidePtrVal.toValue] at hSpec ⊢ <;>
+    first
+    | rfl
+    | rw [hMut rfl]
+
+/-! ### Borrow-checked slice lenses (`&[T]` / `&mut [T]`) -/
+
+/-- Tree Borrows read permission of a tag: a child read through it is not UB (every state
+except `.disabled`), per the trusted `treeBorrowNodeAccess`. -/
+def TreeBorrowPerm.PermitsRead (p : TreeBorrowPerm) : Prop :=
+  treeBorrowTransitionIsUB (treeBorrowNodeAccess .read .localAccess p false) = false
+
+/-- Tree Borrows unique-write permission of a `&mut [T]` tag: a child write through it
+succeeds and leaves the tag `.unique`, protected or not (`unique`, `reservedFrz false`,
+`reservedIM`; never `cell`, `frozen`, `disabled`, or a conflicted reservation). -/
+def TreeBorrowPerm.PermitsUniqueWrite (p : TreeBorrowPerm) : Prop :=
+  ∀ prot : Bool, treeBorrowNodeAccess .write .localAccess p prot = .transition .unique
+
+theorem TreeBorrowPerm.permitsRead_of_permitsUniqueWrite {p : TreeBorrowPerm}
+    (h : TreeBorrowPerm.PermitsUniqueWrite p) : TreeBorrowPerm.PermitsRead p := by
+  have h₀ := h false
+  cases p <;> first | rfl | (simp [treeBorrowNodeAccess, treeBorrowPermTransition,
+    treeBorrowChildWrite] at h₀)
+
+/-- A child write keeps the unique-write permission (`.unique` is a fixed point). -/
+theorem TreeBorrowPerm.permitsUniqueWrite_unique : TreeBorrowPerm.PermitsUniqueWrite .unique := by
+  intro prot
+  rfl
+
+/-- The byte range `[entry.rangeOffset, entry.rangeOffset + entry.rangeLen)` of a byte-ranged
+trusted `BorrowEntry` contains the window `[base, base + len)`.
+
+This is deliberately conservative for projection-governed entries (`rangeLen = 0`, whose
+extent is fixed by `targetProjection` rather than by a byte range): such an entry covers only
+the empty window at `rangeOffset`, so coverage is never claimed beyond the recorded bytes. -/
+def BorrowRangeCovers (entry : BorrowEntry) (base len : Nat) : Prop :=
+  entry.rangeOffset ≤ base ∧ base + len ≤ entry.rangeOffset + entry.rangeLen
+
+/--
+**`&[T]` lens.** `xs` is the `SliceTypedAt` view of `wide` over the allocation image
+`bytes`, and borrow tag `tag` names a trusted `BorrowEntry` in `borrows` whose byte range
+covers the slice window `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)` with Tree
+Borrows read permission.
+-/
+def ActiveTypedSliceBorrow {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (borrows : List BorrowEntry) (tag : Nat) (wide : WidePtrVal) (xs : List α)
+    (bytes : ByteMem) : Prop :=
+  SliceTypedAt c wide xs bytes ∧
+    ∃ entry, lookupBorrow borrows tag = some entry ∧
+      BorrowRangeCovers entry wide.1.offsetBytes (wide.2 * n) ∧
+      TreeBorrowPerm.PermitsRead entry.perm
+
+/--
+**`&mut [T]` lens.** As `ActiveTypedSliceBorrow`, with Tree Borrows unique-write
+permission (`TreeBorrowPerm.PermitsUniqueWrite`).
+-/
+def ActiveTypedSliceMutBorrow {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (borrows : List BorrowEntry) (tag : Nat) (wide : WidePtrVal) (xs : List α)
+    (bytes : ByteMem) : Prop :=
+  SliceTypedAt c wide xs bytes ∧
+    ∃ entry, lookupBorrow borrows tag = some entry ∧
+      BorrowRangeCovers entry wide.1.offsetBytes (wide.2 * n) ∧
+      TreeBorrowPerm.PermitsUniqueWrite entry.perm
+
+/-- The live byte image of `wide`'s captured global allocation in `mem`. -/
+def LiveSliceImage (mem : Memory) (wide : WidePtrVal) (bytes : ByteMem) : Prop :=
+  ∃ alloc, lookupGlobalAlloc mem.globals wide.1.allocId = some alloc ∧
+    bytes = globalAllocByteMem alloc
+
+/-- A unique-write slice lens is in particular a shared (read) slice lens. -/
+theorem ActiveTypedSliceMutBorrow.toShared {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal} {xs : List α}
+    {bytes : ByteMem} (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes) :
+    ActiveTypedSliceBorrow c borrows tag wide xs bytes := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  exact ⟨hs, entry, he, hc, TreeBorrowPerm.permitsRead_of_permitsUniqueWrite hp⟩
+
+/--
+**`ActiveTypedSliceMutBorrow.write_elem_frame`**: writing `v` at element `i < wide.2`
+through the unique-write tag updates the lens to `xs.set i v` (same tag, same
+permission), and preserves every `SliceTypedAt` frame whose window is disjoint from the
+borrowed slice window (in particular the other half of a `split_at_mut`).
+-/
+theorem ActiveTypedSliceMutBorrow.write_elem_frame {α β : Type} {n m : Nat}
+    {c : ByteLensCodec α n} {c' : ByteLensCodec β m} {borrows : List BorrowEntry} {tag : Nat}
+    {wide wide' : WidePtrVal} {xs : List α} {ys : List β} {bytes bytes' : ByteMem}
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes) {i : Nat} (hi : i < wide.2)
+    (v : α) (hw : writeTyped c (WidePtrVal.elemOffset wide n i) v bytes = some bytes')
+    (hframe : SliceTypedAt c' wide' ys bytes)
+    (hdisj : DisjointSlice wide.1.offsetBytes (wide.2 * n) wide'.1.offsetBytes (wide'.2 * m)) :
+    ActiveTypedSliceMutBorrow c borrows tag wide (xs.set i v) bytes' ∧
+      SliceTypedAt c' wide' ys bytes' := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  refine ⟨⟨SliceTypedAt.write_elem hs hi v hw, entry, he, hc, hp⟩, ?_⟩
+  refine SliceTypedAt.frame_write hframe ?_ hw
+  have hin : (i + 1) * n ≤ wide.2 * n := Nat.mul_le_mul_right n hi
+  rw [Nat.add_mul, Nat.one_mul] at hin
+  unfold DisjointSlice at hdisj ⊢
+  simp only [WidePtrVal.elemOffset]
+  rcases hdisj with h0 | h0 | h0 | h0
+  · exact Or.inl (by omega)
+  · exact Or.inr (Or.inl h0)
+  · exact Or.inr (Or.inr (Or.inl (by omega)))
+  · exact Or.inr (Or.inr (Or.inr (by omega)))
+
+/--
+**`ActiveTypedSliceMutBorrow.splitAt`** (`split_at_mut`): at any `k ≤ wide.2` a mutable
+slice lens splits into two mutable lenses on the prefix and suffix subslices, whose byte
+windows are adjacent and disjoint, each covered by the parent borrow range.
+-/
+theorem ActiveTypedSliceMutBorrow.splitAt {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal} {xs : List α}
+    {bytes : ByteMem} (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes) {k : Nat}
+    (hk : k ≤ wide.2) :
+    ActiveTypedSliceMutBorrow c borrows tag (WidePtrVal.takeElems wide k) (xs.take k) bytes ∧
+      ActiveTypedSliceMutBorrow c borrows tag (WidePtrVal.dropElems wide n k) (xs.drop k) bytes ∧
+      DisjointSlice wide.1.offsetBytes (k * n) (wide.1.offsetBytes + k * n) ((wide.2 - k) * n) := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  obtain ⟨hL, hR, hD⟩ := SliceTypedAt.splitAt hs hk
+  have hkn : k * n ≤ wide.2 * n := Nat.mul_le_mul_right n hk
+  have hsum : k * n + (wide.2 - k) * n = wide.2 * n := by
+    rw [← Nat.add_mul, Nat.add_sub_of_le hk]
+  refine ⟨⟨hL, entry, he, ?_, hp⟩, ⟨hR, entry, he, ?_, hp⟩, hD⟩
+  · exact ⟨hc.1, Nat.le_trans (Nat.add_le_add_left hkn _) hc.2⟩
+  · refine ⟨Nat.le_trans hc.1 (Nat.le_add_right _ _), ?_⟩
+    show wide.1.offsetBytes + k * n + (wide.2 - k) * n ≤ entry.rangeOffset + entry.rangeLen
+    rw [Nat.add_assoc, hsum]
+    exact hc.2
+
+/--
+**Reassembly after `split_at_mut`**: two mutable lenses on adjacent halves (same tag)
+recombine into the parent lens on `xsL ++ xsR`, which is how `split_at_mut` borrows end.
+-/
+theorem ActiveTypedSliceMutBorrow.of_splitAt {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal} {xsL xsR : List α}
+    {bytes : ByteMem} {k : Nat} (hk : k ≤ wide.2)
+    (hL : ActiveTypedSliceMutBorrow c borrows tag (WidePtrVal.takeElems wide k) xsL bytes)
+    (hR : ActiveTypedSliceMutBorrow c borrows tag (WidePtrVal.dropElems wide n k) xsR bytes)
+    (hcov : ∃ entry, lookupBorrow borrows tag = some entry ∧
+      BorrowRangeCovers entry wide.1.offsetBytes (wide.2 * n)) :
+    ActiveTypedSliceMutBorrow c borrows tag wide (xsL ++ xsR) bytes := by
+  obtain ⟨hsL, entry, he, _, hp⟩ := hL
+  obtain ⟨hsR, _, _, _, _⟩ := hR
+  obtain ⟨entry', he', hc'⟩ := hcov
+  rw [he] at he'
+  cases he'
+  exact ⟨SliceTypedAt.of_splitAt hk hsL hsR, entry, he, hc', hp⟩
+
+end SliceWidePtrLenses
+
 end Anneal.SepLogicLenses
