@@ -727,6 +727,18 @@ heartbeats for the full one) use small absolute floors.
 #guard_msgs (whitespace := lax) in
 #print axioms ReachesApprox.trans
 
+/-- info: 'Anneal.ITree.ReachesApprox.le' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.le
+
+/-- info: 'Anneal.ITree.ReachesApprox.mono_succ' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesApprox.mono_succ
+
+/-- info: 'Anneal.ITree.TauStar.of_reaches_nil' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms TauStar.of_reaches_nil
+
 /-- info: 'Anneal.ITree.ReachesApprox.trunc' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms ReachesApprox.trunc
@@ -989,6 +1001,30 @@ nothing else; the walker equality bridges above carry the content choice-free.
 /-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceAuto_eq' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms checkFullMirTraceAuto_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.stepFullMirEventFastWithin_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stepFullMirEventFastWithin_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirFinishWithin_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirFinishWithin_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullObservedTrace_eq_reconstructAuto' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullObservedTrace_eq_reconstructAuto
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceAuto_checkFullMirTraceFast' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceAuto_checkFullMirTraceFast
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullMirTraceAuto_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseFullMirTraceAuto_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceFullFast_eq
 
 /-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceWithin_mono' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
@@ -2804,16 +2840,21 @@ Measured heartbeats of the fuel-free entrypoints in the exact shape a generated
 chunk would emit (`checkRawByteTrace{Full,ObsErased}_sound ... rfl`, no fuel
 numeral) and kernel-only, next to the `*Bounded` figures of section 4:
 
-| `k` | full fuel-free generated | full fuel-free kernel | obsErased fuel-free generated | obsErased fuel-free kernel | full `*Bounded` generated |
-|----:|-------------------------:|----------------------:|------------------------------:|---------------------------:|--------------------------:|
-|   4 |                     4711 |                  1631 |                          4696 |                       1625 |                      4695 |
-|   8 |                     5893 |                  2028 |                          5866 |                       2018 |                      5875 |
-|  16 |                     8275 |                  2831 |                          8218 |                       2812 |                      8248 |
-|  32 |                    13092 |                  4470 |                         12977 |                       4433 |                     13044 |
+| `k` | full fuel-free generated | full fuel-free kernel | obsErased fuel-free generated | obsErased fuel-free kernel | full `*Bounded` generated | full `*Bounded` kernel |
+|----:|-------------------------:|----------------------:|------------------------------:|---------------------------:|--------------------------:|-----------------------:|
+|   4 |                     4731 |                  1627 |                          4696 |                       1625 |                      4695 |                   1630 |
+|   8 |                     5928 |                  2022 |                          5866 |                       2018 |                      5875 |                   2026 |
+|  16 |                     8333 |                  2819 |                          8219 |                       2812 |                      8248 |                   2828 |
+|  32 |                    13182 |                  4448 |                         12977 |                       4433 |                     13043 |                   4464 |
 
-The fuel-free entrypoints cost the same as the `*Bounded` ones (within 1%): the
-budgets are closed `Nat` terms evaluated once, and the observation-driven replay
-steps exactly the same `stepMirState` transitions as the global-fuel replay.
+The fuel-free entrypoints cost what the `*Bounded` ones cost (generated form at most
+1.1% more, kernel-only slightly less): the budgets are closed `Nat` terms evaluated
+once, and the observation-driven replay steps exactly the same `stepMirState`
+transitions as the global-fuel replay. The full fuel-free column runs the
+tail-recursive boolean `checkFullMirTraceAuto`; the earlier
+`(reconstructFullMirTraceAuto ...).isSome` form measured `13092` (generated) and
+`4470` (kernel) at `k = 32`, so neither form allocates a measurable trace list
+under lazy kernel and elaborator reduction.
 -/
 
 /-- The automatic step bounds of the loop fixtures. -/
@@ -2912,6 +2953,30 @@ theorem mirLoop_fuelFree_observedTrace_kernel :
       (loopInitState (loopObs (mkLoopObsErasedRawTrace 32)))
       (loopObs (mkLoopObsErasedRawTrace 32)).events
       (loopObs (mkLoopObsErasedRawTrace 32)).outcome = true := by
+  decide +kernel
+
+/-- Every fuel-free entrypoint and diagnosis at every `k ∈ {4, 8, 16, 32}` (no fuel
+numeral anywhere): raw-level full and branch-erased diagnoses, observation-driven
+`reconstructFullMirTraceAuto`, and the `MachineState`-level `checkFullObservedTrace`
+/ `checkObsErasedObservedTrace`. -/
+theorem mirLoop_fuelFree_all_k_kernel :
+    ∀ k ∈ [4, 8, 16, 32],
+      (diagnoseRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
+        emptyShadowProvenanceTable (mkLoopFullRawTrace k)).isOk = true ∧
+      (diagnoseRawByteTraceObsErased mirLoopWithOracleCall [ffiStepOracleSig]
+        emptyShadowProvenanceTable (mkLoopObsErasedRawTrace k)).isOk = true ∧
+      (reconstructFullMirTraceAuto mirLoopWithOracleCall []
+        (.running (loopInitState (loopObs (mkLoopFullRawTrace k))))
+        (loopObs (mkLoopFullRawTrace k)).events
+        (loopObs (mkLoopFullRawTrace k)).outcome).isSome = true ∧
+      checkFullObservedTrace mirLoopWithOracleCall
+        (loopInitState (loopObs (mkLoopFullRawTrace k)))
+        (loopObs (mkLoopFullRawTrace k)).events
+        (loopObs (mkLoopFullRawTrace k)).outcome = true ∧
+      checkObsErasedObservedTrace mirLoopWithOracleCall
+        (loopInitState (loopObs (mkLoopObsErasedRawTrace k)))
+        (loopObs (mkLoopObsErasedRawTrace k)).events
+        (loopObs (mkLoopObsErasedRawTrace k)).outcome = true := by
   decide +kernel
 
 /-- Fuel-free soundness on the decoded `k = 32` traces: `mirTree` (full) and
@@ -3029,8 +3094,9 @@ theorem mirLoop_k32_obsErased_fuelFree_kernel : LoopObsErasedConsistent 32 :=
 
 set_option maxRecDepth 4096 in
 set_option maxHeartbeats 17060 in
-/-- Fuel-free diagnosis at `k = 32` (`diagnoseRawByteTraceFull`, `13119` heartbeats
-measured), with no fuel numeral. -/
+/-- Fuel-free per-segment diagnosis at `k = 32` (`diagnoseRawByteTraceFull`, `13065`
+heartbeats measured; the global-budget `diagnoseRawByteTraceFullGlobal` measured
+`13129`), with no fuel numeral. -/
 theorem mirLoop_k32_fuelFree_diag_tag_rfl :
     (diagnoseRawByteTraceFull mirLoopWithOracleCall [ffiStepOracleSig]
       emptyShadowProvenanceTable (mkLoopFullRawTrace 32)).tagName = "ok" := by
@@ -3040,7 +3106,7 @@ set_option maxHeartbeats 290 in
 /-- The full and branch-erased consistency statements at `k = 32`, derived from the
 fuel-free `"ok"` tag (`diagnoseRawByteTraceFull_tag_ok_sound`,
 `diagnoseRawByteTraceFull_tag_ok_obsErased_sound` with `h_erase` by `rfl`) without
-re-running the MIR execution (`193` heartbeats measured, versus `13092` + `12977`
+re-running the MIR execution (`193` heartbeats measured, versus `13182` + `12977`
 for the two generated fuel-free theorems). -/
 theorem mirLoop_k32_fuelFree_from_diag_tag :
     LoopFullConsistent 32 ∧ LoopObsErasedConsistent 32 :=

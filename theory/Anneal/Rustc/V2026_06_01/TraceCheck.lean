@@ -8011,6 +8011,19 @@ observed trace.
   program `defaultIntraEventSteps + 1` times); when the full trace is available,
   `checkRawByteTraceFull_obsErased_sound` derives the branch-erased certificate
   from the full fuel-free check with no budget at all.
+* The budgets are closed `Nat` literals, so their size costs nothing on accepted or
+  mismatching replays, but they grow with `∏ (blockStepCount c + 1)` over the
+  inlined callees (and quadratically in `defaultIntraEventSteps` for the
+  branch-erased budget). A replay whose model diverges silently, i.e. no visible
+  event or return ever follows, is stepped until the budget is spent; with a large
+  budget that exhausts `maxHeartbeats` (a deterministic timeout) instead of returning
+  `false` after a few steps as a small caller-chosen `*Bounded` fuel would.
+* The `WithCallees` entrypoints (`checkObservedTraceWithCallees`,
+  `checkRawByteTraceWithCallees*`, `diagnoseRawByteTraceWithCallees*`) derive the
+  budget from `trace.inlinedCallees`. When that list is empty,
+  `initMachineStateWithMemoryAndCallees` keeps `trace.initMem.callees` as the live
+  callee table, and the budget does not account for those bodies (completeness
+  only; soundness is unaffected).
 -/
 
 /-- `stepMirState` transitions needed to run every basic block of `bbs` once: one
