@@ -14833,20 +14833,77 @@ theorem lookupCallee_nil_eq_of_findCallee_eq {c₁ c₂ : CalleeEnv} {dp : DefPa
   unfold lookupCallee
   rw [hr]
 
+/-- Monomorphic `checkCalleeSig` (`typeArgs = []`) depends on the callee table only through
+`findCallee?`, including when either table is empty (`[]`). -/
+theorem checkCalleeSig_nil_eq_of_findCallee_eq {c₁ c₂ : CalleeEnv} {dp : DefPath}
+    (fnInputs : List RigidTy) (fnOutput : RigidTy) (fnAbi : CallConv)
+    (ti : List TraitImplEntry)
+    (h : findCallee? c₁ dp = findCallee? c₂ dp) :
+    checkCalleeSig c₁ dp fnInputs fnOutput fnAbi [] ti =
+      checkCalleeSig c₂ dp fnInputs fnOutput fnAbi [] ti := by
+  cases c₁ with
+  | nil =>
+    cases c₂ with
+    | nil => rfl
+    | cons b₂ r₂ =>
+      have h₂ : findCallee? (b₂ :: r₂) dp = none := h.symm
+      unfold checkCalleeSig resolveCalleeBodyAndArgs?
+      dsimp only
+      rw [h₂]
+  | cons b₁ r₁ =>
+    cases c₂ with
+    | nil =>
+      have h₁ : findCallee? (b₁ :: r₁) dp = none := h
+      unfold checkCalleeSig resolveCalleeBodyAndArgs?
+      dsimp only
+      rw [h₁]
+    | cons b₂ r₂ =>
+      unfold checkCalleeSig resolveCalleeBodyAndArgs?
+      dsimp only
+      rw [h]
+
+/-- `internFnPtr` depends only on `Memory.fnPtrs` and `Memory.nextTag`, so it commutes with
+`Memory.withCalleeCtx`. -/
+theorem internFnPtr_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame)
+    (mem : Memory) (defPath : DefPath) (typeArgs : List RigidTy) (fnSig : Option RigidTy) :
+    internFnPtr (Memory.withCalleeCtx c ac cs mem) defPath typeArgs fnSig =
+      let (allocId, mem') := internFnPtr mem defPath typeArgs fnSig
+      (allocId, Memory.withCalleeCtx c ac cs mem') := by
+  unfold internFnPtr
+  dsimp only [Memory.withCalleeCtx]
+  cases findFnPtrEntry? mem.fnPtrs defPath typeArgs fnSig <;> rfl
+
+/-- `Option RustIntrinsicKind` predicate excluding `.constEvalSelect` (the only compiler
+intrinsic whose dispatch in `evalDirectRustIntrinsic?` consults `Memory.callees` on a
+dynamically unpacked runtime callee argument). All 24 other `RustIntrinsicKind` variants execute
+inline via `evalNonSelectIntrinsicCall` without touching `Memory.callees`. -/
+def isNonSelectIntrinsicOpt : Option RustIntrinsicKind → Bool
+  | some .constEvalSelect => false
+  | _ => true
+
+theorem isNonSelectIntrinsicOpt_of_eq_none {o : Option RustIntrinsicKind} (h : o = none) :
+    isNonSelectIntrinsicOpt o = true := by
+  rw [h]; rfl
+
 /-! ### Semantic per-step cone safety -/
 
 /--
 Call-target cone condition: every target that `resolveCallTarget` resolves for `func`
 (direct constants, function items in locals, *and* indirect calls through reified
-function pointers) is a non-intrinsic definition path in `cone`, resolved
-monomorphically (`typeArgs = []`, so trait-impl tables are never consulted).
+function pointers) has its definition path in `cone`, is resolved monomorphically
+(`typeArgs = []`, so trait-impl tables are never consulted), and is not
+`core::intrinsics::const_eval_select` (`isNonSelectIntrinsicOpt` holds, permitting both
+regular callees and all 24 inline non-select compiler intrinsics such as `ub_checks`,
+`ctpop`, `bswap`, `size_of_val`, `align_of_val`, `arith_offset`, etc.).
 -/
 def CallTargetInCone (cone : List DefPath) (s : MachineState) (cur : CapturedMir)
     (func : Operand) (argCount : Nat) : Prop :=
   ∀ target localsAfterFunc,
     resolveCallTarget s func argCount (bodyLocalDeclsOf (some cur)) cur.layouts =
         .ok target localsAfterFunc →
-      target.defPath ∈ cone ∧ target.typeArgs = [] ∧ classifyRustIntrinsic? target.defPath = none
+      target.defPath ∈ cone ∧ target.typeArgs = [] ∧
+        isNonSelectIntrinsicOpt (classifyRustIntrinsic? target.defPath) = true
 
 /-- Terminator cone condition: only `call` / `tailCall` consult `Memory.callees`. -/
 def TermConeSafe (cone : List DefPath) (s : MachineState) (cur : CapturedMir)
@@ -14947,6 +15004,155 @@ theorem evalDirectRustIntrinsic?_eq_none_of_classify {s : MachineState}
   unfold evalDirectRustIntrinsic?
   rw [h]
 
+theorem writeIntrinsicReturn_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame)
+    (s : MachineState) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (retVal : Value) :
+    writeIntrinsicReturn (MachineState.mapMem (Memory.withCalleeCtx c ac cs) s)
+        locals' destination targetBb retVal =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs)
+        (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  unfold writeIntrinsicReturn
+  dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
+  cases writePlaceValue locals' s.memory.borrows destination retVal <;> rfl
+
+theorem writeIntrinsicScalarResult_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame)
+    (s : MachineState) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (resOpt : Option ScalarInt) :
+    writeIntrinsicScalarResult (MachineState.mapMem (Memory.withCalleeCtx c ac cs) s)
+        locals' destination targetBb resOpt =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs)
+        (writeIntrinsicScalarResult s locals' destination targetBb resOpt) := by
+  cases resOpt with
+  | none => rfl
+  | some sc =>
+    exact writeIntrinsicReturn_withCalleeCtx c ac cs s locals' destination targetBb (.scalar sc)
+
+theorem evalNonSelectIntrinsicCall_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (cs : List SavedCallerFrame)
+    (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalNonSelectIntrinsicCall kind (MachineState.mapMem (Memory.withCalleeCtx c ac cs) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs)
+        (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  have hMissing : intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs)
+        (intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps) := by
+    unfold intrinsicMissingPointeeStep
+    repeat' (first | exact nodeCC_fail | rfl | split)
+  have hUnres : ∀ pt, intrinsicUnresolvedLayoutStep pt =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs) (intrinsicUnresolvedLayoutStep pt) := by
+    intro pt
+    unfold intrinsicUnresolvedLayoutStep
+    repeat' (first | exact nodeCC_fail | rfl | split)
+  have hWide : ∀ pt, intrinsicWidePointeeStep pt =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac cs) (intrinsicWidePointeeStep pt) := by
+    intro pt
+    unfold intrinsicWidePointeeStep
+    repeat' (first | exact nodeCC_fail | rfl | split)
+  cases kind with
+  | sizeOfVal =>
+    rcases argVals with _ | ⟨ptrArgVal, _ | _⟩ <;> try rfl
+    unfold evalNonSelectIntrinsicCall
+    dsimp only
+    cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | none =>
+      dsimp only
+      repeat' (first | exact nodeCC_fail | exact hMissing | rfl | split)
+    | some pt =>
+      cases pt <;>
+        (dsimp only;
+         repeat' (first
+           | exact nodeCC_fail | exact hMissing | exact hUnres _ | exact hWide _ | rfl
+           | exact writeIntrinsicReturn_withCalleeCtx ..
+           | exact writeIntrinsicScalarResult_withCalleeCtx ..
+           | split))
+  | alignOfVal =>
+    rcases argVals with _ | ⟨ptrArgVal, _ | _⟩ <;> try rfl
+    unfold evalNonSelectIntrinsicCall
+    dsimp only
+    cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | none =>
+      dsimp only
+      repeat' (first | exact nodeCC_fail | exact hMissing | rfl | split)
+    | some pt =>
+      cases pt <;>
+        (dsimp only;
+         repeat' (first
+           | exact nodeCC_fail | exact hMissing | exact hUnres _ | exact hWide _ | rfl
+           | exact writeIntrinsicReturn_withCalleeCtx ..
+           | exact writeIntrinsicScalarResult_withCalleeCtx ..
+           | split))
+  | _ =>
+    dsimp only [evalNonSelectIntrinsicCall]
+    repeat' (first
+      | exact nodeCC_fail | exact hMissing | exact hUnres _ | exact hWide _ | rfl
+      | exact writeIntrinsicReturn_withCalleeCtx ..
+      | exact writeIntrinsicScalarResult_withCalleeCtx ..
+      | split)
+
+theorem evalNonSelectIntrinsicCall_calleeCtx_preserved
+    (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack)
+        (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  have h := evalNonSelectIntrinsicCall_withCalleeCtx
+    s.memory.callees s.memory.activeCallee s.memory.callStack
+    kind s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  rw [MachineState.withCalleeCtx_self] at h
+  exact h
+
+theorem evalNonSelectIntrinsicCall_withCallees
+    (c₂ : CalleeEnv) (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalNonSelectIntrinsicCall kind (MachineState.mapMem (Memory.withCallees c₂) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCallees c₂)
+        (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  rw [MachineState.withCallees_eq_withCalleeCtx,
+    evalNonSelectIntrinsicCall_withCalleeCtx _ _ _ kind s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb,
+    evalNonSelectIntrinsicCall_calleeCtx_preserved kind s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb,
+    MirStepNode.mapMem_comp, MirStepNode.mapMem_comp, Memory.withCallees_comp_withCalleeCtx]
+
+theorem evalDirectRustIntrinsic?_withCallees_of_nonSelect (c₂ : CalleeEnv)
+    (s : MachineState) (currentBody : Option CapturedMir) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h : isNonSelectIntrinsicOpt (classifyRustIntrinsic? target.defPath) = true) :
+    evalDirectRustIntrinsic? (MachineState.mapMem (Memory.withCallees c₂) s) currentBody
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb unwind =
+      (evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb unwind).map (MirStepNode.mapMem (Memory.withCallees c₂)) := by
+  unfold evalDirectRustIntrinsic?
+  cases h_cl : classifyRustIntrinsic? target.defPath with
+  | none => rfl
+  | some kind =>
+    rw [h_cl] at h
+    cases kind with
+    | constEvalSelect => cases h
+    | _ =>
+      dsimp only [Option.map]
+      exact congrArg some
+        (evalNonSelectIntrinsicCall_withCallees c₂ _ s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+
 /--
 **Terminator narrowing.** A terminator whose call targets lie in `cone`
 (`TermConeSafe`) steps identically under any callee table `c₂` that agrees with
@@ -15023,11 +15229,14 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
           dsimp only
           rw [h_ta, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
               (h_agree tgt.defPath h_dp).symm,
-            evalDirectRustIntrinsic?_eq_none_of_classify h_cl,
-            evalDirectRustIntrinsic?_eq_none_of_classify h_cl]
-          repeat' (first
-            | exact nodeCC_fail | rfl
-            | split)
+            evalDirectRustIntrinsic?_withCallees_of_nonSelect c₂ s (some cur) tgt
+              (bodyLocalDeclsOf (some cur)) cur.layouts argOps argVals locals' destination
+              targetBb unwind h_cl]
+          cases evalDirectRustIntrinsic? s (some cur) tgt (bodyLocalDeclsOf (some cur))
+              cur.layouts argOps argVals locals' destination targetBb unwind <;>
+            repeat' (first
+              | exact nodeCC_fail | rfl
+              | split)
     | none =>
       unfold evalTerminator
       dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory, Memory.withCallees_borrows,
@@ -15527,14 +15736,17 @@ theorem calleesAgreeOn_coneBodies (cone : List DefPath) (c₁ : CalleeEnv) :
 
 /--
 A call operand accepted by `CallConeClosed`: a direct constant function item whose
-monomorphic (`typeArgs = []`), non-intrinsic definition path lies in `cone`. Every other
-callee operand (function pointers, function items held in locals, generic or
-trait-dispatched calls, compiler intrinsics such as `const_eval_select`) fails closed.
+monomorphic (`typeArgs = []`), non-`constEvalSelect` definition path lies in `cone`
+(including inline non-select compiler intrinsics such as `ub_checks`, `ctpop`, `bswap`,
+`size_of_val`, `align_of_val`, `arith_offset`, etc.). Every other callee operand
+(function pointers, function items held in locals, generic or trait-dispatched calls, or
+`core::intrinsics::const_eval_select`) fails closed.
 -/
 def directCallInCone (cone : List DefPath) (func : Operand) : Bool :=
   match extractCalleeDefPath? func with
   | some dp =>
-    inCone cone dp && (extractCalleeTypeArgs func).isEmpty && (classifyRustIntrinsic? dp).isNone
+    inCone cone dp && (extractCalleeTypeArgs func).isEmpty &&
+      isNonSelectIntrinsicOpt (classifyRustIntrinsic? dp)
   | none => false
 
 /-- Terminator check: only `call` / `tailCall` are constrained. -/
@@ -15611,7 +15823,7 @@ theorem callTargetInCone_of_directCallInCone {cone : List DefPath} {s : MachineS
       rw [h_dp]
     rw [h_eq] at h_res
     cases h_res
-    exact ⟨inCone_iff.mp h_in, List.isEmpty_iff.mp h_ta, Option.isNone_iff_eq_none.mp h_cl⟩
+    exact ⟨inCone_iff.mp h_in, List.isEmpty_iff.mp h_ta, h_cl⟩
 
 theorem termConeSafe_of_termCallsInCone {cone : List DefPath} {s : MachineState}
     {cur : CapturedMir} {term : Terminator} (h : termCallsInCone cone term = true) :
@@ -15773,6 +15985,44 @@ private theorem closedInv_push {cone : List DefPath} {root : CapturedMir} {c₁ 
   | head => exact h_saved
   | tail _ hf => exact h_inv.2.2 f hf
 
+theorem nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect {cone : List DefPath}
+    {root : CapturedMir} {c₁ : CalleeEnv} {s : MachineState}
+    (h_inv : ClosedInv cone root c₁ s) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : isNonSelectIntrinsicOpt (classifyRustIntrinsic? target.defPath) = true)
+    (fallback : MirStepNode) (h_fb : NodeSuccs (ClosedInv cone root c₁) fallback) :
+    NodeSuccs (ClosedInv cone root c₁)
+      (match evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb unwind with
+       | some stepNode => stepNode
+       | none => fallback) := by
+  unfold evalDirectRustIntrinsic?
+  cases h_k : classifyRustIntrinsic? target.defPath with
+  | none => exact h_fb
+  | some kind =>
+    rw [h_k] at h_cl
+    have h_step : ∀ (k : RustIntrinsicKind),
+        NodeSuccs (ClosedInv cone root c₁)
+          (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
+            argOps argVals locals' destination targetBb) := by
+      intro k
+      refine nodeSuccs_of_fixed
+        (evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) ?_
+      intro s' hs'
+      have hm : s'.memory =
+          Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.callStack s'.memory :=
+        congrArg MachineState.memory hs'
+      refine ⟨?_, ?_, ?_⟩
+      · rw [hm]; exact h_inv.1
+      · rw [hm]; exact h_inv.2.1
+      · rw [hm]; exact h_inv.2.2
+    cases kind with
+    | constEvalSelect => cases h_cl
+    | _ => exact h_step _
+
 theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
     {s : MachineState} {term : Terminator} (h_inv : ClosedInv cone root c₁ s)
     (h_term : TermConeSafe cone s (s.memory.activeCallee.getD root) term) :
@@ -15826,7 +16076,7 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
         | unsupported => trivial
         | ok argVals locals' =>
           dsimp only
-          rw [h_ta, evalDirectRustIntrinsic?_eq_none_of_classify h_cl]
+          rw [h_ta]
           cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
               tgt.defPath [] s.memory.traitImpls with
           | some calleeBody =>
@@ -15838,7 +16088,10 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
               exact closedInv_push h_inv h_cur (inConeSet_of_lookup h_dp h_lk)
           | none =>
             dsimp only
-            repeat' (first | trivial | exact h_inv | split)
+            repeat' (first
+              | trivial | exact h_inv
+              | exact nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect h_inv _ _ _ _ _ _ _ _ _ _ h_cl _ trivial
+              | split)
     | none =>
       unfold evalTerminator
       dsimp only
@@ -15961,23 +16214,159 @@ theorem coneReach_of_closedInv {cone : List DefPath} {root : CapturedMir} {c₁ 
         | faulted _ => intro _; cases fuel <;> trivial
       · intro _; trivial
 
+/--
+Well-formedness of `(body, mem, c)` for `initMachineStateWithMemoryAndCallees`: either `c` is
+non-empty (`c ≠ []`), or `mem` is a clean entry memory (`mem.callees = [] ∧ mem.traitImpls =
+body.traitImpls`), allowing call-cone narrowing all the way down to an empty callee table
+`c₂ = []` (`coneBodies [] c₁ = []`).
+-/
+def CalleeInitWf (body : CapturedMir) (mem : Memory) (c : CalleeEnv) : Prop :=
+  c ≠ [] ∨ (mem.callees = [] ∧ mem.traitImpls = body.traitImpls)
+
+theorem initMachineStateWithMemoryAndCallees_withCallees_of_wf (body : CapturedMir)
+    (args : List Value) (mem : Memory) {c₁ c₂ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem c₂) :
+    Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₂ =
+      MachineState.mapMem (Memory.withCallees c₂)
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) := by
+  cases c₁ with
+  | nil =>
+    rcases h₁ with hne | ⟨hc₁, hti₁⟩
+    · exact absurd rfl hne
+    · cases c₂ with
+      | nil =>
+        unfold Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          Trusted.VerificationResult.initMachineStateWithMemory
+          MachineState.mapMem Memory.withCallees
+        dsimp only
+        cases mem
+        dsimp only at hc₁
+        subst hc₁
+        rfl
+      | cons b₂ r₂ =>
+        unfold Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          Trusted.VerificationResult.initMachineStateWithMemory
+          MachineState.mapMem Memory.withCallees
+        dsimp only
+        cases mem
+        dsimp only at hti₁
+        subst hti₁
+        rfl
+  | cons b₁ r₁ =>
+    cases c₂ with
+    | nil =>
+      rcases h₂ with hne | ⟨hc₂, hti₂⟩
+      · exact absurd rfl hne
+      · unfold Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          Trusted.VerificationResult.initMachineStateWithMemory
+          MachineState.mapMem Memory.withCallees
+        dsimp only
+        cases mem
+        dsimp only at hc₂ hti₂
+        subst hc₂ hti₂
+        rfl
+    | cons b₂ r₂ => rfl
+
+theorem initMachineStateWithMemoryAndCallees_callees_of_wf (body : CapturedMir)
+    (args : List Value) (mem : Memory) {c : CalleeEnv} (h : CalleeInitWf body mem c) :
+    (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c).memory.callees = c := by
+  cases c with
+  | nil =>
+    rcases h with hne | ⟨hc, _⟩
+    · exact absurd rfl hne
+    · exact hc
+  | cons b r => rfl
+
+theorem closedInv_init_of_wf (cone : List DefPath) (body : CapturedMir) (args : List Value)
+    (mem : Memory) {c₁ : CalleeEnv} (h₁ : CalleeInitWf body mem c₁)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    ClosedInv cone body c₁
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) := by
+  refine ⟨initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁, ?_, ?_⟩
+  · cases c₁ <;> (
+      show InConeSet cone body _ (mem.activeCallee.getD body)
+      rw [h_ac]
+      exact Or.inl rfl)
+  · intro f hf
+    cases c₁ <;> (
+      have hf' : f ∈ mem.callStack := hf
+      rw [h_cs] at hf'
+      cases hf')
+
+/--
+**Syntactic call-cone narrowing (`runCfgWithCallees`) allowing empty target cones (`c₂ = []`).**
+-/
+theorem runCfgWithCallees_cone_narrow_of_closed_wf (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {c₁ c₂ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem c₂)
+    (h_agree : calleesAgreeOn cone c₁ c₂)
+    (h_closed : CallConeClosed cone body c₁ = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    runCfgWithCallees fuel body args mem c₂ =
+      (runCfgWithCallees fuel body args mem c₁).map (MirOutcome.mapMem (Memory.withCallees c₂)) := by
+  unfold runCfgWithCallees
+  rw [initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine runMirExecBounded_cone_narrow cone body c₂ fuel _
+    (coneReach_of_closedInv h_closed fuel _ (closedInv_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  intro s hs
+  cases hs
+  rw [initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact h_agree
+
+/--
+**Syntactic call-cone narrowing (`wpMirExecSym`) allowing empty target cones (`c₂ = []`).**
+-/
+theorem wpMirExecSym_cone_narrow_of_closed_wf (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {c₁ c₂ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem c₂)
+    (h_agree : calleesAgreeOn cone c₁ c₂)
+    (h_closed : CallConeClosed cone body c₁ = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees c₂) out) ↔ post out) :
+    wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₂))
+        post ↔
+      wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁))
+        post := by
+  rw [initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine wpMirExecSym_cone_narrow cone body c₂ post h_post fuel _
+    (coneReach_of_closedInv h_closed fuel _ (closedInv_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  intro s hs
+  cases hs
+  rw [initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact h_agree
+
+/--
+**Syntactic call-cone narrowing (`MirWpConverges`) allowing empty target cones (`c₂ = []`).**
+-/
+theorem mirWpConverges_cone_narrow_of_closed_wf (cone : List DefPath) (body : CapturedMir)
+    (args : List Value) (mem : Memory) {c₁ c₂ : CalleeEnv}
+    (h₁ : CalleeInitWf body mem c₁) (h₂ : CalleeInitWf body mem c₂)
+    (h_agree : calleesAgreeOn cone c₁ c₂)
+    (h_closed : CallConeClosed cone body c₁ = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out, post (MirOutcome.mapMem (Memory.withCallees c₂) out) ↔ post out) :
+    MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₂) post ↔
+      MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) post := by
+  rw [initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine mirWpConverges_cone_narrow cone body c₂ post h_post _
+    (fun fuel =>
+      coneReach_of_closedInv h_closed fuel _ (closedInv_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  rw [initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact h_agree
+
 /-- The entry state with a non-empty callee table satisfies the closure invariant. -/
 theorem closedInv_init (cone : List DefPath) (body : CapturedMir) (args : List Value)
     (mem : Memory) {c₁ : CalleeEnv} (h₁ : c₁ ≠ [])
     (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
     ClosedInv cone body c₁
-      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) := by
-  cases c₁ with
-  | nil => exact absurd rfl h₁
-  | cons b r =>
-    refine ⟨rfl, ?_, ?_⟩
-    · show InConeSet cone body (b :: r) (mem.activeCallee.getD body)
-      rw [h_ac]
-      exact Or.inl rfl
-    · intro f hf
-      have hf' : f ∈ mem.callStack := hf
-      rw [h_cs] at hf'
-      cases hf'
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c₁) :=
+  closedInv_init_of_wf cone body args mem (Or.inl h₁) h_ac h_cs
 
 /--
 **Syntactic call-cone narrowing (`runCfgWithCallees`).** If `CallConeClosed cone body c₁`

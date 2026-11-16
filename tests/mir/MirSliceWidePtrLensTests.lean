@@ -141,6 +141,18 @@ theorem widePtr_elemOffset_witness :
       WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 1 = WidePtrVal.elemOffset wide4 4 3 :=
   ⟨WidePtrVal.elemOffset_zero _ _, WidePtrVal.elemOffset_dropElems _ _ _ _⟩
 
+theorem widePtr_ptr_len_elemPtr_witness :
+    wide4.ptr = p9 ∧ wide4.len = 4 ∧
+      (WidePtrVal.elemPtr wide4 4 2).allocId = 9 ∧
+      (WidePtrVal.elemPtr wide4 4 2).tag = 9 ∧
+      (WidePtrVal.elemPtr wide4 4 2).offsetBytes = 8 ∧
+      WidePtrVal.elemPtr wide4 4 0 = p9 ∧
+      WidePtrVal.elemPtr (WidePtrVal.dropElems wide4 4 2) 4 1 = WidePtrVal.elemPtr wide4 4 3 :=
+  ⟨widePtr_ptr_eq_fst _, widePtr_len_eq_snd _,
+    WidePtrVal.elemPtr_allocId _ _ _, WidePtrVal.elemPtr_tag _ _ _,
+    WidePtrVal.elemPtr_offsetBytes _ _ _, WidePtrVal.elemPtr_zero _ _,
+    WidePtrVal.elemPtr_dropElems _ _ _ _⟩
+
 /-- The 64-bit and 32-bit encodings of different wide pointers are distinct. -/
 theorem widePtr_toValue_injective_witness :
     WidePtrVal.toValue 8 wide4 ≠ WidePtrVal.toValue 8 (WidePtrVal.mk p9 3) := by
@@ -249,11 +261,52 @@ theorem elem_read_trusted_bytes :
   (typedAt_globalAllocByteMem_iff ByteLensCodec.u32LE arrAlloc 8 (u 3)).mp
     (arr_sliceTypedAt.getElem_typedAt' (i := 2) (by decide))
 
-/-- Trusted MIR side: the place `(*_1)[_2]` (`_2 = 2`) reads the scalar `3u32`. -/
+/-- Trusted MIR side: the place `(*_1)[_2]` (`_2 = 2`) reads the scalar `3u32`, proved via the
+general ground-MIR theorem `SliceTypedAt.evalPlaceRead_index` and `decodeValueFromBytes_uintLE_chunk`. -/
 theorem elem_read_mir_place :
     evalPlaceRead (locals 8) { local_ := 1, projection := [.deref, .index 2] } mem0.borrows
         mem0.globals layouts64 mem0.callerLocals decls = .ok (.scalar ⟨3, 4⟩) (locals 8) :=
-  rfl
+  SliceTypedAt.evalPlaceRead_index arr_sliceTypedAt (fun x => .scalar ⟨x.val, 4⟩)
+    (locals 8) 1 2 2 8 mem0 decls layouts64 (.uint .u32) 2 _
+    (by decide) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    (fun chunk x hlen hdec =>
+      decodeValueFromBytes_uintLE_chunk .u32 4 14 layouts64 rfl (by decide) chunk x hlen hdec)
+    rfl
+
+/-- Out-of-bounds ground-MIR place read `(*_1)[_2]` when `_2 = 4` faults with `.ub`
+(`SliceTypedAt.evalPlaceRead_index_oob_ub`). -/
+theorem elem_read_mir_place_oob_ub :
+    evalPlaceRead ((locals 8).set 2 (.init (.scalar ⟨4, 8⟩)))
+        { local_ := 1, projection := [.deref, .index 2] } mem0.borrows
+        mem0.globals layouts64 mem0.callerLocals decls = .ub :=
+  SliceTypedAt.evalPlaceRead_index_oob_ub arr_sliceTypedAt (fun x => .scalar ⟨x.val, 4⟩)
+    ((locals 8).set 2 (.init (.scalar ⟨4, 8⟩))) 1 2 4 8 mem0 decls layouts64 (.uint .u32) 2
+    _ (by decide) (by decide)
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    (fun chunk x hlen hdec =>
+      decodeValueFromBytes_uintLE_chunk .u32 4 14 layouts64 rfl (by decide) chunk x hlen hdec)
+
+/-- Subslice borrow `&(*_1)[1..3]` and element borrow `&(*_1)[2]` through
+`evalSliceFatPtrDerefBorrow` (`SliceTypedAt.evalSliceFatPtrDerefBorrow_subslice` and
+`SliceTypedAt.evalSliceFatPtrDerefBorrow_elem`). -/
+theorem slice_fatPtr_deref_borrow_subslice_and_elem :
+    (evalSliceFatPtrDerefBorrow (locals 8) mem0 wide4.1 8 ⟨wide4.2, 8⟩
+        [.subslice 1 3 false] .frozen false (some { kind := .slice (.uint .u32), layoutIdx := 0 })
+        layouts64 true decls none false =
+      .ok (WidePtrVal.toValue 8 (WidePtrVal.mk (WidePtrVal.elemPtr wide4 4 1) 2)) (locals 8) mem0 ∧
+     SliceTypedAt ByteLensCodec.u32LE (WidePtrVal.mk (WidePtrVal.elemPtr wide4 4 1) 2)
+        [u 2, u 3] bytes16) ∧
+    (evalSliceFatPtrDerefBorrow (locals 8) mem0 wide4.1 8 ⟨wide4.2, 8⟩
+        [.constantIndex 2 3 false] .frozen false (some { kind := .slice (.uint .u32), layoutIdx := 0 })
+        layouts64 true decls none false =
+      .ok (.ptr (WidePtrVal.elemPtr wide4 4 2) 8) (locals 8) mem0 ∧
+     TypedAt ByteLensCodec.u32LE (WidePtrVal.elemOffset wide4 4 2) (u 3) bytes16) :=
+  ⟨SliceTypedAt.evalSliceFatPtrDerefBorrow_subslice arr_sliceTypedAt (locals 8) mem0 .frozen false
+      (.uint .u32) 0 layouts64 true decls none false 1 3 (by decide) (by decide) rfl rfl
+      (fun _ => rfl) rfl,
+   SliceTypedAt.evalSliceFatPtrDerefBorrow_elem arr_sliceTypedAt (locals 8) mem0 .frozen false
+      (.uint .u32) 0 layouts64 true decls none false 2 3 (by decide) (by decide) rfl rfl
+      (fun _ => rfl) rfl⟩
 
 /-- The trusted window read equals the lens byte window (`globalAllocSliceToAbstractBytes_eq_window`). -/
 theorem elem_window_bridge :
@@ -460,6 +513,64 @@ theorem unknown_tag_no_lens :
 
 /-- Live-image binding of the lens bytes to `mem0`'s captured global. -/
 theorem liveImage : LiveSliceImage mem0 wide4 bytes16 := ⟨arrAlloc, rfl, rfl⟩
+
+/-- Child-tag `split_at_mut(2)` reborrow (`ActiveTypedSliceMutBorrow.splitAt_reborrow`) and
+Tree Borrows table-transition frame preservation (`write_elem_treeBorrows_frame`,
+`write_elem_conflictingBorrows_frame`, `write_elem_treeBorrows_shared_frame`), plus negative
+invalidated-borrow canary (`foreign_overlapping_write_disables_borrow`). -/
+def rootSlEntry : BorrowEntry :=
+  { tag := 77, targetLocal := 0, targetProjection := [], perm := .unique,
+    rangeOffset := 0, rangeLen := 16 }
+
+def splitChildBorrows : List BorrowEntry :=
+  reborrowSubsliceEntry rootSlEntry 79 8 ((4 - 2) * 4) ::
+    reborrowSubsliceEntry rootSlEntry 78 0 (2 * 4) :: slBorrows
+
+theorem mutLens_split_reborrow_and_treeBorrows_transitions :
+    let borrowsAfterLeft :=
+      invalidateTreeBorrowsAtProj splitChildBorrows splitChildBorrows 0 (some 78) [] 4 4
+    let borrowsAfterConf :=
+      invalidateConflictingBorrowsAtProj splitChildBorrows 0 (some 78) [] 4 4
+    ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterLeft 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW1 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterLeft 79
+        (WidePtrVal.dropElems wide4 4 2) [u 3, u 4] bytesW1 ∧
+      ActiveTypedSliceBorrow ByteLensCodec.u32LE borrowsAfterLeft 79
+        (WidePtrVal.dropElems wide4 4 2) [u 3, u 4] bytesW1 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterConf 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW1 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE borrowsAfterConf 79
+        (WidePtrVal.dropElems wide4 4 2) [u 3, u 4] bytesW1 ∧
+      ¬ ActiveTypedSliceBorrow ByteLensCodec.u32LE
+        (invalidateTreeBorrowsAtProj slBorrows slBorrows 0 (some 99) [] 0 4) 77 wide4 xs4 bytes16 := by
+  intro borrowsAfterLeft borrowsAfterConf
+  obtain ⟨entry, he, hL, hR, hDisj⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow mutLens (tagL := 78) (tagR := 79) (k := 2)
+      (by decide) (by decide)
+  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
+  subst hEntry
+  have hTight79 : ∀ e, lookupBorrow splitChildBorrows 79 = some e →
+      e.rangeOffset = (WidePtrVal.dropElems wide4 4 2).1.offsetBytes ∧
+        e.rangeLen = (WidePtrVal.dropElems wide4 4 2).2 * 4 ∧ 0 < e.rangeLen := by
+    intro e hlk
+    cases Option.some.inj hlk
+    exact ⟨rfl, rfl, by decide⟩
+  obtain ⟨hL_tb, hR_tb⟩ :=
+    ActiveTypedSliceMutBorrow.write_elem_treeBorrows_frame 0 [] hL (i := 1) (by decide) (by decide)
+      (u 20) write1 hR hTight79 hDisj
+  have hR_shared : ActiveTypedSliceBorrow ByteLensCodec.u32LE splitChildBorrows 79
+      (WidePtrVal.dropElems wide4 4 2) [u 3, u 4] bytes16 := hR.toShared
+  obtain ⟨_, hR_sh_tb⟩ :=
+    ActiveTypedSliceMutBorrow.write_elem_treeBorrows_shared_frame 0 [] hL (i := 1) (by decide)
+      (by decide) (u 20) write1 hR_shared hTight79 rfl (by decide) hDisj
+  obtain ⟨hL_cf, hR_cf⟩ :=
+    ActiveTypedSliceMutBorrow.write_elem_conflictingBorrows_frame 0 [] hL (i := 1) (by decide)
+      (by decide) (u 20) write1 hR hTight79 hDisj
+  have hDis :=
+    foreign_overlapping_write_disables_borrow ByteLensCodec.u32LE (borrows := slBorrows)
+      (tag := 77) (wTag := 99) (entry := rootSlEntry) 0 [] 0 4 wide4 xs4 bytes16
+      rfl rfl rfl (by decide) rfl ⟨(fun h => nomatch h), (fun h => nomatch h)⟩
+  exact ⟨hL_tb, hR_tb, hR_sh_tb, hL_cf, hR_cf, hDis.1⟩
 
 /-! ## 7. Empty and zero-sized slices -/
 
@@ -822,6 +933,81 @@ theorem agree_algebra :
   ⟨cone_agree.symm, calleesAgreeOn.refl _ _,
     calleesAgreeOn.mono cone_agree (fun _ h => by cases h),
     dup_shadow_agree.trans (by rw [coneBodies_fullCallees]; exact calleesAgreeOn.refl _ _)⟩
+
+/-- `checkCalleeSig_nil_eq_of_findCallee_eq`, `internFnPtr_withCalleeCtx`,
+`isNonSelectIntrinsicOpt_of_eq_none`, and `evalDirectRustIntrinsic?_eq_none_of_classify`
+witnesses. -/
+theorem callee_sig_and_fnptr_bridges (s : MachineState) (p : Place) :
+    checkCalleeSig fullCallees "cone::helper1" [] (.uint .u32) .rust [] [] =
+      checkCalleeSig (coneBodies cone1 fullCallees) "cone::helper1" [] (.uint .u32) .rust [] [] ∧
+    internFnPtr (Memory.withCalleeCtx [helper1Mir] none [] emptyMemory) "cone::helper1" [] none =
+      (let (aid, m') := internFnPtr emptyMemory "cone::helper1" [] none
+       (aid, Memory.withCalleeCtx [helper1Mir] none [] m')) ∧
+    isNonSelectIntrinsicOpt (classifyRustIntrinsic? "cone::helper1") = true ∧
+    evalDirectRustIntrinsic? s none
+        { defPath := "cone::helper1", typeArgs := [], fnSig := none, isIndirect := false }
+        [] emptyLayoutTable [] [] [] p 0 .continue_ = none :=
+  ⟨checkCalleeSig_nil_eq_of_findCallee_eq [] (.uint .u32) .rust []
+      (cone_agree "cone::helper1" (List.Mem.head _)),
+   internFnPtr_withCalleeCtx [helper1Mir] none [] emptyMemory "cone::helper1" [] none,
+   isNonSelectIntrinsicOpt_of_eq_none rfl,
+   evalDirectRustIntrinsic?_eq_none_of_classify rfl⟩
+
+/-- Inline compiler intrinsic caller (`core::ub_checks::check_language_ub`,
+`classifyRustIntrinsic? = some .ubChecks`) narrowed to an *empty* callee table `c₂ = []`
+(`coneBodies coneUb fullCallees = []`) via `runCfgWithCallees_cone_narrow_of_closed_wf`,
+`wpMirExecSym_cone_narrow_of_closed_wf`, and `mirWpConverges_cone_narrow_of_closed_wf`, plus
+negative canary for `core::intrinsics::const_eval_select`. -/
+def ubBoolLocal : LocalDecl :=
+  { mutability := .mut, ty := { kind := .bool, layoutIdx := 0 }, debugName := some "b" }
+
+def intrinsicCallerMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "cone::intrinsicCaller" 0 [retLocal, ubBoolLocal]
+    [{ statements := [{ kind := .storageLive 1, span := "live" }],
+       terminator := callTerm (fnItem "core::ub_checks::check_language_ub") 1 1,
+       isCleanup := false },
+     retBlock [assignConst 0 42]]
+
+def constEvalSelectCallerMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "cone::selectCaller" 0 [retLocal]
+    [callBlock (fnItem "core::intrinsics::const_eval_select") 0 1, retBlock []]
+
+def coneUb : List DefPath := ["core::ub_checks::check_language_ub"]
+
+theorem callConeClosed_intrinsicCaller :
+    CallConeClosed coneUb intrinsicCallerMir fullCallees = true ∧
+      CallConeClosed ["core::intrinsics::const_eval_select"] constEvalSelectCallerMir fullCallees =
+        false ∧
+      coneBodies coneUb fullCallees = [] :=
+  ⟨rfl, rfl, rfl⟩
+
+theorem intrinsicCaller_narrow_to_empty :
+    runCfgWithCallees 8 intrinsicCallerMir [] emptyMemory (coneBodies coneUb fullCallees) =
+      (runCfgWithCallees 8 intrinsicCallerMir [] emptyMemory fullCallees).map
+        (MirOutcome.mapMem (Memory.withCallees (coneBodies coneUb fullCallees))) ∧
+    (wpMirExecSym 8 intrinsicCallerMir
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          intrinsicCallerMir [] emptyMemory (coneBodies coneUb fullCallees))) retIs42 ↔
+      wpMirExecSym 8 intrinsicCallerMir
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          intrinsicCallerMir [] emptyMemory fullCallees)) retIs42) ∧
+    (Anneal.MirFuelFree.MirWpConverges intrinsicCallerMir
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          intrinsicCallerMir [] emptyMemory (coneBodies coneUb fullCallees)) retIs42 ↔
+      Anneal.MirFuelFree.MirWpConverges intrinsicCallerMir
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          intrinsicCallerMir [] emptyMemory fullCallees) retIs42) :=
+  ⟨runCfgWithCallees_cone_narrow_of_closed_wf coneUb 8 intrinsicCallerMir [] emptyMemory
+      (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
+      (calleesAgreeOn_coneBodies coneUb fullCallees) rfl rfl rfl,
+   wpMirExecSym_cone_narrow_of_closed_wf coneUb 8 intrinsicCallerMir [] emptyMemory
+      (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
+      (calleesAgreeOn_coneBodies coneUb fullCallees) rfl rfl rfl retIs42
+      (retIs42_insensitive _),
+   mirWpConverges_cone_narrow_of_closed_wf coneUb intrinsicCallerMir [] emptyMemory
+      (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
+      (calleesAgreeOn_coneBodies coneUb fullCallees) rfl rfl rfl retIs42
+      (retIs42_insensitive _)⟩
 
 /-! ## Kernel axiom audit -/
 
