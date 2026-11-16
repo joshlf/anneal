@@ -974,12 +974,14 @@ fn uninit_union_value_within(
 /// [`MirValue`] when every `FieldSlot::Uninit` sub-slot inside `shell` has a type for which
 /// uninitialized bytes are already a valid union value ([`uninit_union_value`], e.g.
 /// `struct Packet { header: u32, payload: MaybeUninit<u32> }` with `header` initialized and
-/// `payload` unwritten) or is an inhabited zero-sized type (which holds no bytes). Returns
-/// `Ok(None)` if any uninitialized sub-slot is neither or if an enum shell's tag has not been
-/// set.
+/// `payload` unwritten) or, when `allow_uninit_zst` is true (materializing into union storage,
+/// which has no per-field shells), is an inhabited zero-sized type (which holds no bytes).
+/// Returns `Ok(None)` if any uninitialized sub-slot is neither or if an enum shell's tag has not
+/// been set.
 fn materialize_partial_with_uninit_unions(
     shell: &PartialAggregate,
     ty: &Ty,
+    allow_uninit_zst: bool,
 ) -> Result<Option<MirValue>, RvalueEvalError> {
     if !shell_matches_declared_ty(shell, ty)
         || (shell.requires_tag_write() && !shell.discriminant_set)
@@ -1006,17 +1008,22 @@ fn materialize_partial_with_uninit_unions(
         match slot {
             FieldSlot::Init(val) => values.push(val.clone()),
             FieldSlot::Uninit => {
-                // An uninitialized inhabited zero-sized field holds no bytes either, so the
-                // bytes of the shell determine its unique value.
+                // An uninitialized inhabited zero-sized field holds no bytes either, so when
+                // materializing into union storage the bytes of the shell determine its unique
+                // value.
                 let val = match uninit_union_value(field_ty)? {
                     Some(val) => val,
-                    None if is_inhabited_zst(field_ty) => canonical_zst_value(field_ty)?,
+                    None if allow_uninit_zst && is_inhabited_zst(field_ty) => {
+                        canonical_zst_value(field_ty)?
+                    }
                     None => return Ok(None),
                 };
                 values.push(val);
             }
             FieldSlot::Partial(child) => {
-                let Some(val) = materialize_partial_with_uninit_unions(child, field_ty)? else {
+                let Some(val) =
+                    materialize_partial_with_uninit_unions(child, field_ty, allow_uninit_zst)?
+                else {
                     return Ok(None);
                 };
                 values.push(val);
@@ -8912,31 +8919,11 @@ impl StatementEvalState {
             Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(dst_local)),
             _ => {}
         }
-        if let FieldSlot::Partial(shell) = &new_slot
-            && (proj_traverses_union(&decl_ty, dst_proj)
-                || dst_proj.iter().any(|p| {
-                    matches!(
-                        p,
-                        ProjectionElem::Index(_)
-                            | ProjectionElem::ConstantIndex { .. }
-                            | ProjectionElem::Subslice { .. }
-                    )
-                }))
-            && let Some(materialized) = materialize_partial_with_uninit_unions(shell, expected_ty)?
-        {
-            return self.write_subplace_slot(
-                dst_local,
-                dst_proj,
-                expected_ty,
-                FieldSlot::Init(materialized),
-                src_local,
-                full_place,
-            );
-        }
+        let traverses_union = proj_traverses_union(&decl_ty, dst_proj);
         // Storing an uninitialized or partially initialized zero-sized value into an inhabited
         // zero-sized place reached through a union field stores no bytes of the union's storage,
         // so nothing changes (the union keeps its value, initialized or not).
-        if proj_traverses_union(&decl_ty, dst_proj) && is_inhabited_zst(expected_ty) {
+        if traverses_union && is_inhabited_zst(expected_ty) {
             let dst_place = Place {
                 local: dst_local,
                 projection: dst_proj.to_vec(),
@@ -8948,13 +8935,37 @@ impl StatementEvalState {
                 other => other,
             });
         }
+        if let FieldSlot::Partial(shell) = &new_slot
+            && (traverses_union
+                || dst_proj.iter().any(|p| {
+                    matches!(
+                        p,
+                        ProjectionElem::Index(_)
+                            | ProjectionElem::ConstantIndex { .. }
+                            | ProjectionElem::Subslice { .. }
+                    )
+                }))
+            && let Some(materialized) =
+                materialize_partial_with_uninit_unions(shell, expected_ty, traverses_union)?
+        {
+            return self.write_subplace_slot(
+                dst_local,
+                dst_proj,
+                expected_ty,
+                FieldSlot::Init(materialized),
+                src_local,
+                full_place,
+            );
+        }
         if matches!(new_slot, FieldSlot::Uninit) {
             // Uninitialized bytes copied over a whole union leave a union none of whose bytes
             // is initialized, which the value tree holds as the union with its inhabited
             // zero-sized field active (`MaybeUninit::uninit()`), also as an element of an array
             // of unions (`[MaybeUninit<T>; N]`), which has no per-element uninitialized slots.
             // Copied over uninitialized bytes, they change nothing.
-            if let Some(uninit) = uninit_union_value(expected_ty)? {
+            if !traverses_union
+                && let Some(uninit) = uninit_union_value(expected_ty)?
+            {
                 if matches!(
                     self.read_subplace_slot(dst_local, dst_proj, full_place),
                     Ok(FieldSlot::Uninit)
@@ -8970,7 +8981,7 @@ impl StatementEvalState {
                     full_place,
                 );
             }
-            // The same holds when they are copied into a field of a union (the innermost one
+            // The same holds when they are copied into a field of a union (every union
             // `dst_proj` traverses) covering every byte that any inhabited field of that union
             // can read, e.g. `copy_nonoverlapping::<u32>(uninit, mu.as_mut_ptr(), 1)` into a
             // `MaybeUninit<u32>`.
@@ -9292,6 +9303,21 @@ fn check_value_projection(
                         active_val,
                         expected_ty,
                         rest,
+                        read_index,
+                        full_place,
+                        None,
+                    )
+                } else if let Some((zst_ty, zst_tail)) = resolve_inactive_union_zst_subplace(
+                    expected_ty,
+                    rest,
+                    Some(read_index),
+                    full_place,
+                )? {
+                    let zst_val = canonical_zst_value(&zst_ty)?;
+                    check_value_projection(
+                        &zst_val,
+                        &zst_ty,
+                        zst_tail,
                         read_index,
                         full_place,
                         None,
@@ -9828,6 +9854,24 @@ fn write_to_partial_slot(
                     // it leaves the union with that field active; the write's steps are
                     // checked against that value.
                     if !is_inhabited_zst(expected_ty) {
+                        if let Some((zst_ty, zst_tail)) = resolve_inactive_union_zst_subplace(
+                            expected_ty,
+                            rest,
+                            Some(read_index),
+                            full_place,
+                        )? {
+                            let mut zst_val = canonical_zst_value(&zst_ty)?;
+                            return write_projected_mir_value(
+                                &mut zst_val,
+                                Some(&zst_ty),
+                                zst_tail,
+                                new_val,
+                                read_index,
+                                ptr_width,
+                                full_place,
+                                None,
+                            );
+                        }
                         // A nested write covering the whole field determines every initialized
                         // byte of the (uninitialized) union, e.g. `ptr::write(mu.as_mut_ptr(),
                         // v)`; any other nested write leaves the field partially initialized.
@@ -9889,6 +9933,7 @@ fn write_to_partial_slot(
                 } else {
                     FieldSlot::Partial(shell)
                 };
+                normalize_slot(slot);
                 return Ok(());
             }
             let FieldSlot::Partial(shell) = slot else {
@@ -10555,6 +10600,95 @@ fn root_slot_state(slot: FieldSlot) -> LocalSlotState {
     }
 }
 
+/// Returns true if the first inactive union `Field` step reached along `proj` on `val` is
+/// followed by a `Downcast` step (whose active variant an inactive union field does not
+/// determine). `Downcast` steps *before* that inactive union field have already been validated
+/// against live runtime values by [`project_mir_value`].
+fn inactive_union_tail_has_downcast(
+    val: &MirValue,
+    proj: &[ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+) -> bool {
+    fn window_has_downcast(
+        window: &[MirValue],
+        proj: &[ProjectionElem],
+        read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    ) -> bool {
+        let Some((first, rest)) = proj.split_first() else {
+            return false;
+        };
+        match first {
+            ProjectionElem::Index(idx_local) => read_index(*idx_local)
+                .ok()
+                .and_then(|bits| usize::try_from(bits).ok())
+                .and_then(|i| window.get(i))
+                .is_some_and(|elem| inactive_union_tail_has_downcast(elem, rest, read_index)),
+            ProjectionElem::ConstantIndex {
+                offset,
+                min_length,
+                from_end,
+            } => resolve_constant_index(window.len(), *offset, *min_length, *from_end)
+                .ok()
+                .and_then(|i| window.get(i))
+                .is_some_and(|elem| inactive_union_tail_has_downcast(elem, rest, read_index)),
+            ProjectionElem::Subslice {
+                from,
+                to,
+                from_end,
+            } => resolve_subslice_range(window.len(), *from, *to, *from_end)
+                .ok()
+                .is_some_and(|(s, e)| window_has_downcast(&window[s..e], rest, read_index)),
+            _ => false,
+        }
+    }
+    let Some((first, rest)) = proj.split_first() else {
+        return false;
+    };
+    match (first, val) {
+        (ProjectionElem::Downcast(_), _) => {
+            inactive_union_tail_has_downcast(val, rest, read_index)
+        }
+        (
+            ProjectionElem::Field(idx, _),
+            MirValue::Tuple(fields)
+            | MirValue::Adt {
+                active_field: None,
+                fields,
+                ..
+            },
+        ) => fields
+            .get(*idx)
+            .is_some_and(|child| inactive_union_tail_has_downcast(child, rest, read_index)),
+        (
+            ProjectionElem::Field(idx, _),
+            MirValue::Adt {
+                active_field: Some(active),
+                fields,
+                ..
+            },
+        ) => {
+            if *active != *idx {
+                return rest
+                    .iter()
+                    .any(|elem| matches!(elem, ProjectionElem::Downcast(_)));
+            }
+            let child = if fields.len() == 1 {
+                fields.first()
+            } else {
+                fields.get(*active)
+            };
+            child.is_some_and(|c| inactive_union_tail_has_downcast(c, rest, read_index))
+        }
+        (
+            ProjectionElem::Index(_)
+            | ProjectionElem::ConstantIndex { .. }
+            | ProjectionElem::Subslice { .. },
+            MirValue::Array { elements, .. },
+        ) => window_has_downcast(elements.as_slice(), proj, read_index),
+        _ => false,
+    }
+}
+
 /// Writes "uninitialized" over the sub-place `proj` of `slot` (of declared type `declared_ty`)
 /// for `Statement::Deinit` (see [`StatementEvalState::deinit_place`]). The caller normalizes
 /// `slot` afterwards; every error leaves the represented state unchanged.
@@ -10630,8 +10764,6 @@ fn deinit_in_slot(
                 ) || proj_traverses_union(declared_ty, proj)
                 {
                     let zst_leaf = is_inhabited_zst(&leaf_ty);
-                    let has_downcast =
-                        proj.iter().any(|elem| matches!(elem, ProjectionElem::Downcast(_)));
                     match project_mir_value(
                         val,
                         Some(declared_ty),
@@ -10642,7 +10774,8 @@ fn deinit_in_slot(
                     ) {
                         Ok(_) if zst_leaf => return Ok(()),
                         Err(RvalueEvalError::InactiveUnionField { .. })
-                            if zst_leaf && !has_downcast =>
+                            if zst_leaf
+                                && !inactive_union_tail_has_downcast(val, proj, read_index) =>
                         {
                             return Ok(());
                         }
@@ -10743,6 +10876,7 @@ fn deinit_in_slot(
             // Uninitialized bytes in a variant field may cover a niche-encoded tag; only a tag
             // stored apart from the fields (or no tag at all) is known to survive.
             if active_downcast.is_some()
+                && !matches!(child_slot, FieldSlot::Init(_))
                 && !shell
                     .adt_def
                     .as_ref()
@@ -12137,11 +12271,51 @@ fn select_subplace_candidate_in<F: FrameView + ?Sized>(
                     })
                     .unwrap_or(*first)
             } else {
-                return None;
+                let mut leaf_unions = consistent
+                    .iter()
+                    .copied()
+                    .filter(|&i| candidate_innermost_union_is_leaf(decl_ty, &candidates[i]));
+                let only = leaf_unions.next()?;
+                if leaf_unions.next().is_some() {
+                    return None;
+                }
+                only
             }
         }
     };
     Some(candidates.swap_remove(chosen))
+}
+
+/// Returns true if `proj` starting at `decl_ty` traverses at least one union `Field` step and
+/// its innermost union `Field` step is a leaf step (or followed only by element `0` of an
+/// array field).
+fn candidate_innermost_union_is_leaf(decl_ty: &Ty, proj: &[ProjectionElem]) -> bool {
+    let mut cur_ty = decl_ty;
+    let mut last_union_pos: Option<usize> = None;
+    for (pos, elem) in proj.iter().enumerate() {
+        match elem {
+            ProjectionElem::Downcast(_) => {}
+            ProjectionElem::Field(_, field_ty) => {
+                if matches!(cur_ty, Ty::Adt(def) if def.is_union()) {
+                    last_union_pos = Some(pos);
+                }
+                cur_ty = field_ty;
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                let Ty::Array(elem_ty, _) = cur_ty else {
+                    return false;
+                };
+                cur_ty = elem_ty;
+            }
+            ProjectionElem::Subslice { .. } => {}
+            ProjectionElem::Deref => return false,
+        }
+    }
+    let Some(pos) = last_union_pos else {
+        return false;
+    };
+    let rest = &proj[pos + 1..];
+    rest.is_empty() || before_array_start(rest).is_some_and(<[_]>::is_empty)
 }
 
 /// Validates the slice `Subslice` and element-selecting `Index` / `ConstantIndex` projections
@@ -13441,18 +13615,43 @@ fn before_array_start(rest: &[ProjectionElem]) -> Option<&[ProjectionElem]> {
 }
 
 /// Returns true if `rest` starting at an inactive or uninitialized union field of type `field_ty`
-/// designates an inhabited zero-sized sub-place ([`resolve_inactive_union_zst_subplace`]).
+/// designates an inhabited zero-sized sub-place ([`resolve_inactive_union_zst_subplace`]) whose
+/// remaining steps `zst_tail` are valid on its unique value ([`canonical_zst_value`]).
 fn union_field_path_is_inhabited_zst(field_ty: &Ty, rest: &[ProjectionElem]) -> bool {
     let dummy_place = Place::from_local(0);
-    resolve_inactive_union_zst_subplace::<fn(Local) -> Result<u128, RvalueEvalError>>(
+    let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
+        Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
+    };
+    let Some((zst_ty, zst_tail)) = resolve_inactive_union_zst_subplace(
         field_ty,
         rest,
-        None,
+        Some(&no_index),
         &dummy_place,
     )
     .ok()
-    .flatten()
-    .is_some()
+    .flatten() else {
+        return false;
+    };
+    if zst_tail.is_empty() {
+        return true;
+    }
+    let Ok(leaf_ty) = validate_projection_tail(
+        &zst_ty,
+        zst_tail,
+        None,
+        Some(&no_index),
+        &dummy_place,
+        None,
+    ) else {
+        return false;
+    };
+    if !is_inhabited_zst(&leaf_ty) {
+        return false;
+    }
+    let Ok(zst_val) = canonical_zst_value(&zst_ty) else {
+        return false;
+    };
+    project_mir_value(&zst_val, Some(&zst_ty), zst_tail, &no_index, &dummy_place, None).is_ok()
 }
 
 /// [`value_union_path_active`] on an uninitialized value of type `cur_ty`: steps through
@@ -13758,20 +13957,22 @@ fn proj_traverses_union<'a>(mut cur_ty: &'a Ty, proj: &'a [ProjectionElem]) -> b
 }
 
 /// For a destination place `proj` of type `dst_ty` inside a local of type `decl_ty` that
-/// traverses a union field, returns the length of the prefix of `proj` designating the
-/// innermost union traversed, with that union's type, when the destination covers every byte
-/// that an inhabited field of that union can read: it fills the whole traversed field `f`
-/// (`size_of(dst_ty) == size_of(f)`, so it starts at offset `0` of the union), and no
-/// inhabited field of the union is larger than `f` (trailing padding is read by no field).
-/// Storing uninitialized bytes there leaves that union without initialized bytes.
+/// traverses one or more union fields, returns the length of the prefix of `proj` designating
+/// the outermost union traversed, with that union's type, when the destination covers every
+/// byte that an inhabited field of every traversed union can read: it fills the whole
+/// traversed field `f` (`size_of(dst_ty) == size_of(f)`, so it starts at offset `0` of the
+/// union), and no inhabited field of the union is larger than `f` (trailing padding is read by
+/// no field). Storing uninitialized bytes there leaves the union without initialized bytes.
 fn innermost_union_covered_by(
     decl_ty: &Ty,
     proj: &[ProjectionElem],
     dst_ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Option<(usize, Ty)> {
+    let size_of = |ty: &Ty| ty.layout_for(ptr_width).ok().map(|layout| layout.size);
+    let dst_size = size_of(dst_ty)?;
     let mut cur_ty = decl_ty;
-    let mut innermost: Option<(usize, &Ty, usize)> = None;
+    let mut outermost: Option<(usize, Ty)> = None;
     for (pos, elem) in proj.iter().enumerate() {
         match elem {
             ProjectionElem::Downcast(_) => {}
@@ -13779,7 +13980,27 @@ fn innermost_union_covered_by(
                 if let Ty::Adt(def) = cur_ty
                     && def.is_union()
                 {
-                    innermost = Some((pos, cur_ty, *idx));
+                    let AdtKind::Union { fields } = &def.kind else {
+                        return None;
+                    };
+                    let declared_field_ty = fields.get(*idx)?;
+                    if !place_covers_whole_value(declared_field_ty, &proj[pos + 1..]) {
+                        return None;
+                    }
+                    let field_size = size_of(declared_field_ty)?;
+                    if dst_size != field_size {
+                        return None;
+                    }
+                    for other_field_ty in fields {
+                        if other_field_ty.is_inhabited_for(ptr_width)
+                            && size_of(other_field_ty)? > field_size
+                        {
+                            return None;
+                        }
+                    }
+                    if outermost.is_none() {
+                        outermost = Some((pos, cur_ty.clone()));
+                    }
                 }
                 cur_ty = field_ty;
             }
@@ -13792,28 +14013,7 @@ fn innermost_union_covered_by(
             ProjectionElem::Subslice { .. } | ProjectionElem::Deref => return None,
         }
     }
-    let (pos, union_ty, field_idx) = innermost?;
-    let Ty::Adt(def) = union_ty else {
-        return None;
-    };
-    let AdtKind::Union { fields } = &def.kind else {
-        return None;
-    };
-    let size_of = |ty: &Ty| ty.layout_for(ptr_width).ok().map(|layout| layout.size);
-    let field_ty = fields.get(field_idx)?;
-    if !place_covers_whole_value(field_ty, &proj[pos + 1..]) {
-        return None;
-    }
-    let field_size = size_of(field_ty)?;
-    if size_of(dst_ty)? != field_size {
-        return None;
-    }
-    for other_field_ty in fields {
-        if other_field_ty.is_inhabited_for(ptr_width) && size_of(other_field_ty)? > field_size {
-            return None;
-        }
-    }
-    Some((pos, union_ty.clone()))
+    outermost
 }
 
 /// Writes `FieldSlot::Partial(new_shell)` into `proj` inside `slot` (materializing parent
@@ -14338,8 +14538,18 @@ pub(crate) fn copy_nonoverlapping_values(
                 }
                 // Uninitialized elements of a union type with an inhabited zero-sized field are
                 // unions without initialized bytes (`uninit_union_value`), which an initialized
-                // array holds element by element: the window is overwritten with them.
-                if let Some(uninit) = uninit_union_value(elem_ty)? {
+                // array holds element by element: the window is overwritten with them when the
+                // array is not inside an inactive union field (whose coverage `write_subplace_slot`
+                // checks below).
+                if (!proj_traverses_union(&state.local_decls[dst_local.0], dst_arr_proj)
+                    || slot_union_path_active(
+                        &state.slots[dst_local.0],
+                        &state.local_decls[dst_local.0],
+                        dst_arr_proj,
+                        false,
+                    ))
+                    && let Some(uninit) = uninit_union_value(elem_ty)?
+                {
                     MirValue::Array {
                         elements: vec![uninit; count_usize],
                         elem_ty: elem_ty.clone(),

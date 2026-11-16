@@ -2560,3 +2560,275 @@ fn a1_partial_shells_with_uninitialized_zero_sized_fields_copy_into_union_fields
     );
     assert_eq!(state.get_init(Local(0)), Some(&mu.uninit()));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Adversarial round ep1-B2 regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn b2_enum_wrapped_union_zst_deinit_preserves_discriminant_and_allows_outer_downcasts() {
+    // 1. `Option<MaybeUninit<u32>> = Some(MaybeUninit::new(42))`: `Deinit((opt as Some).0.uninit)`
+    // and a 0-byte `copy_nonoverlapping` of uninitialized `()` into `(opt as Some).0.uninit`
+    // store 0 bytes and must keep `opt` initialized as `Some(MaybeUninit::new(42))` rather than
+    // clearing `discriminant_set` on the outer `Option`.
+    let mu = MaybeUninitTy::new(u32_ty());
+    let (opt_def, opt_ty) = adt(AdtDef::new_enum(
+        "OptionMu",
+        None,
+        vec![
+            VariantDef::new("None", vec![]),
+            VariantDef::new("Some", vec![mu.ty.clone()]),
+        ],
+    ));
+    let (tagged_opt_def, tagged_opt_ty) = adt(AdtDef::new_enum(
+        "TaggedOptionMu",
+        Some(anneal_mir::ir::ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("None", vec![]),
+            VariantDef::new("Some", vec![mu.ty.clone()]),
+        ],
+    ));
+    let decls = vec![
+        opt_ty.clone(),
+        unit(),
+        raw(unit(), Mutability::Not),
+        raw(unit(), Mutability::Mut),
+        tagged_opt_ty.clone(),
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    let some_val = MirValue::adt(&opt_def, 1, vec![mu.init(u32v(42))]);
+    let tagged_some_val = MirValue::adt(&tagged_opt_def, 1, vec![mu.init(u32v(42))]);
+    state.slots[0] = LocalSlotState::Init(some_val.clone());
+    state.slots[4] = LocalSlotState::Init(tagged_some_val.clone());
+
+    let some_uninit_place = proj(
+        0,
+        vec![
+            ProjectionElem::Downcast(1),
+            field(0, mu.ty.clone()),
+            mu.uninit_field(),
+        ],
+    );
+    run(Statement::Deinit(some_uninit_place), &mut state).unwrap();
+    assert_eq!(state.get_init(Local(0)), Some(&some_val));
+
+    let tagged_some_uninit_place = proj(
+        4,
+        vec![
+            ProjectionElem::Downcast(1),
+            field(0, mu.ty.clone()),
+            mu.uninit_field(),
+        ],
+    );
+    run(assign(local(2), raw_const(local(1))), &mut state).unwrap();
+    run(
+        assign(local(3), raw_mut(tagged_some_uninit_place)),
+        &mut state,
+    )
+    .unwrap();
+    run(copy_nonoverlapping(2, 3, 1), &mut state).unwrap();
+    assert_eq!(state.get_init(Local(4)), Some(&tagged_some_val));
+
+    // 2. `[Option<Shapes>; 1]`: `Deinit((arr[0] as Some).0.never_pair.0)` has a valid `Downcast`
+    // on the outer initialized `Option` *before* the inactive union field `never_pair` and no
+    // `Downcast` after it, so it succeeds as a 0-byte no-op.
+    let u = ShapesUnion::new();
+    let (opt_u_def, opt_u_ty) = adt(AdtDef::new_enum(
+        "OptionShapes",
+        None,
+        vec![
+            VariantDef::new("None", vec![]),
+            VariantDef::new("Some", vec![u.ty.clone()]),
+        ],
+    ));
+    let arr_opt_u = arr(opt_u_ty.clone(), 1);
+    let mut state = StatementEvalState::from_local_decls(vec![arr_opt_u], PW);
+    let arr_val = MirValue::Array {
+        elements: vec![MirValue::adt(&opt_u_def, 1, vec![u.with_val(7)])],
+        elem_ty: opt_u_ty,
+    };
+    state.slots[0] = LocalSlotState::Init(arr_val.clone());
+    let place = proj(
+        0,
+        vec![
+            cidx(0, 1),
+            ProjectionElem::Downcast(1),
+            field(0, u.ty.clone()),
+            u.f(NEVER_PAIR),
+            field(0, unit()),
+        ],
+    );
+    run(Statement::Deinit(place), &mut state).unwrap();
+    assert_eq!(state.get_init(Local(0)), Some(&arr_val));
+}
+
+#[test]
+fn b2_partial_zst_stores_into_uninit_unions_and_non_union_arrays_keep_invariants() {
+    // 1. Copying a partially initialized 0-byte ZST `((), ())` (with `.0` deinitialized) into a
+    // 0-byte ZST union field `z.zpair` of an *uninitialized* union `z: Z` copies 0 bytes, so `z`
+    // remains `LocalSlotState::Uninit` (matching an uninitialized `((), ())` copy).
+    let zpair = Ty::Tuple(vec![unit(), unit()]);
+    let (_z_def, z_ty) = adt(AdtDef::new_union(
+        "Z",
+        vec![u32_ty(), unit(), zpair.clone()],
+    ));
+    let decls = vec![
+        z_ty.clone(),
+        zpair.clone(),
+        raw(zpair.clone(), Mutability::Not),
+        raw(zpair.clone(), Mutability::Mut),
+        arr(zpair.clone(), 2),
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    state.slots[1] = LocalSlotState::Init(MirValue::Tuple(vec![MirValue::Unit, MirValue::Unit]));
+    run(
+        Statement::Deinit(proj(1, vec![field(0, unit())])),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(1)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    run(assign(local(2), raw_const(local(1))), &mut state).unwrap();
+    run(
+        assign(local(3), raw_mut(proj(0, vec![field(2, zpair.clone())]))),
+        &mut state,
+    )
+    .unwrap();
+    run(copy_nonoverlapping(2, 3, 1), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(0)), Some(&LocalSlotState::Uninit));
+
+    // 2. Copying a `PartialShell` with a deinitialized `()` field into a *non-union* array
+    // element `arr[0]` still fails closed with `UninitializedLocal(src_local)` (`c6d2ad74`).
+    let pair = MirValue::Tuple(vec![MirValue::Unit, MirValue::Unit]);
+    state.slots[4] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![pair.clone(), pair],
+        elem_ty: zpair.clone(),
+    });
+    run(
+        assign(local(3), raw_mut(proj(4, vec![cidx(0, 2)]))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        run(copy_nonoverlapping(2, 3, 1), &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+}
+
+#[test]
+fn b2_zst_subplace_writes_on_uninit_unions() {
+    // On an `Uninit` `MaybeUninit<(u32, ())>`, writing the 0-byte ZST sub-place
+    // `(*mu.as_mut_ptr()).1 = ()` succeeds and leaves `mu` `Uninit` until `(*mu.as_mut_ptr()).0`
+    // is written.
+    let pair_ty = Ty::Tuple(vec![u32_ty(), unit()]);
+    let mu = MaybeUninitTy::new(pair_ty.clone());
+    let mut state = StatementEvalState::from_local_decls(vec![mu.ty.clone()], PW);
+    let mut second = mu.inner();
+    second.push(field(1, unit()));
+    let mut first = mu.inner();
+    first.push(field(0, u32_ty()));
+    run(assign(proj(0, second), unit_rvalue()), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(0)), Some(&LocalSlotState::Uninit));
+    run(assign(proj(0, first), int(55, u32_ty())), &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&mu.init(MirValue::Tuple(vec![u32v(55), MirValue::Unit])))
+    );
+}
+
+#[test]
+fn b2_nested_uninit_union_copies_and_pointer_resolution_edge_cases() {
+    // 1. Borrowing `(u.absent_enum as Absent).0` on an initialized union where `absent_enum` is
+    // inactive is rejected with `InactiveVariantProjection`, just as when `absent_enum` is active.
+    let u = ShapesUnion::new();
+    let decls = vec![u.ty.clone(), raw(Ty::Never, Mutability::Not)];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    state.slots[0] = LocalSlotState::Init(u.with_val(7));
+    let absent_proj = proj(
+        0,
+        vec![
+            u.f(ABSENT_ENUM),
+            ProjectionElem::Downcast(1),
+            field(0, Ty::Never),
+        ],
+    );
+    assert_eq!(
+        run(assign(local(1), raw_const(absent_proj)), &mut state),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 0,
+        })
+    );
+
+    // 2. `union W2 { z: (), a: MaybeUninit<u8>, b: u32 }` with `b` (4 bytes) active: copying an
+    // uninitialized `MaybeUninit<u8>` (1 byte) into `w2.a` fails with `UNINIT_UNION_COPY` because
+    // 3 bytes of `b` remain initialized.
+    let mu_u8 = MaybeUninitTy::new(u8_ty());
+    let (w2_def, w2_ty) = adt(AdtDef::new_union(
+        "W2",
+        vec![unit(), mu_u8.ty.clone(), u32_ty()],
+    ));
+    let decls = vec![
+        w2_ty.clone(),
+        mu_u8.ty.clone(),
+        raw(mu_u8.ty.clone(), Mutability::Not),
+        raw(mu_u8.ty.clone(), Mutability::Mut),
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    let before = MirValue::union_value(&w2_def, 2, u32v(0x1122_3344));
+    state.slots[0] = LocalSlotState::Init(before.clone());
+    run(assign(local(2), raw_const(local(1))), &mut state).unwrap();
+    run(
+        assign(local(3), raw_mut(proj(0, vec![field(1, mu_u8.ty.clone())]))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        run(copy_nonoverlapping(2, 3, 1), &mut state),
+        Err(RvalueEvalError::UnsupportedMemoryAccess(UNINIT_UNION_COPY))
+    );
+    assert_eq!(state.get_init(Local(0)), Some(&before));
+
+    // 3. `union V { z: (), a: u32, b: (u32,) }`:
+    // - when `v` is `Uninit`, reading `*(&raw const v as *const u32)` resolves to `v.a` and
+    //   faults with `UninitializedLocal`;
+    // - when `V` is wrapped in `MaybeUninit<V>`, writing `*(mu_v.as_mut_ptr() as *mut u32) = 5`
+    //   prefers the innermost union's leaf field `a` over `b.0`.
+    let one = Ty::Tuple(vec![u32_ty()]);
+    let (v_def, v_ty) = adt(AdtDef::new_union("V", vec![unit(), u32_ty(), one]));
+    let mu_v = MaybeUninitTy::new(v_ty.clone());
+    let decls = vec![
+        v_ty.clone(),
+        raw(v_ty.clone(), Mutability::Not),
+        raw(u32_ty(), Mutability::Not),
+        mu_v.ty.clone(),
+        raw(mu_v.ty.clone(), Mutability::Mut),
+        raw(u32_ty(), Mutability::Mut),
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    run(assign(local(1), raw_const(local(0))), &mut state).unwrap();
+    run(
+        assign(local(2), ptr_cast(1, raw(u32_ty(), Mutability::Not))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.read_place(&deref(2)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+
+    state.slots[3] = LocalSlotState::Init(mu_v.uninit());
+    run(assign(local(4), raw_mut(local(3))), &mut state).unwrap();
+    run(
+        assign(local(5), ptr_cast(4, raw(u32_ty(), Mutability::Mut))),
+        &mut state,
+    )
+    .unwrap();
+    run(assign(deref(5), int(5, u32_ty())), &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(3)),
+        Some(&mu_v.init(MirValue::union_value(&v_def, 1, u32v(5))))
+    );
+}
