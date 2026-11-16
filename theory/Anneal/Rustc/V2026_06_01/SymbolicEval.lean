@@ -7671,5 +7671,5764 @@ theorem sig_subborrow_and_slice_offset_validated :
 
 end SignatureValidationTests
 
-end Anneal.Rustc.V2026_06_01.SymbolicEval
 
+set_option maxRecDepth 100000
+set_option maxHeartbeats 400000
+
+/-!
+## Section 1 — Append-Only `SymTable` GVN & Monotone Evaluation
+-/
+
+/-- Symbolic value identifier indexing into an append-only `SymTable`. -/
+abbrev SymId := Nat
+
+/-- Concrete environment mapping symbolic input variable indices to 64-bit scalar words. -/
+abbrev SymEnv := Nat → Nat
+
+/-- 64-bit word modulus $2^{64}$ used for bounded modular arithmetic operations. -/
+def word64Modulus : Nat := 18446744073709551616
+
+/-- Unary symbolic operations in `SymNode`. -/
+inductive SymOp1 where
+  | id
+  | boolNot
+  | wrappingNeg64
+  | maskLow32
+  | xorConst (mask : Nat)
+  | addConst (delta : Nat)
+  deriving DecidableEq
+
+/-- Binary symbolic operations in `SymNode`. -/
+inductive SymOp2 where
+  | add
+  | sub
+  | mul
+  | bitAnd
+  | bitOr
+  | bitXor
+  | shl
+  | shr
+  | eq
+  | lt
+  | le
+  deriving DecidableEq
+
+/-- Hash-consed symbolic DAG node. Child operands reference earlier `SymId` (`Nat`)
+    entries in the append-only `SymTable`. -/
+inductive SymNode where
+  | const (val : Nat)
+  | var (inputIdx : Nat)
+  | op1 (op : SymOp1) (arg : Nat)
+  | op2 (op : SymOp2) (lhs rhs : Nat)
+  | ite (cond thenBr elseBr : Nat)
+  deriving DecidableEq
+
+/-- Reduce a natural number to a 64-bit machine word (`v mod 2^64`). Every value produced by
+    `SymNode` / `ExprTree` / MIR evaluation is passed through `wrap64` (or is a `0`/`1` flag),
+    so all symbolic and concrete values are genuine `u64` words (`evalSymId_lt_word64`). -/
+def wrap64 (v : Nat) : Nat := v % word64Modulus
+
+theorem wrap64_lt (v : Nat) : wrap64 v < word64Modulus :=
+  Nat.mod_lt v (by decide)
+
+/-- Concrete evaluation of unary operations (`u64` wrapping semantics). -/
+def evalSymOp1 (op : SymOp1) (v : Nat) : Nat :=
+  match op with
+  | .id => v
+  | .boolNot => if v == 0 then 1 else 0
+  | .wrappingNeg64 => (word64Modulus - (v % word64Modulus)) % word64Modulus
+  | .maskLow32 => v % 4294967296
+  | .xorConst mask => wrap64 (Nat.xor v mask)
+  | .addConst delta => wrap64 (v + delta)
+
+/-- Concrete evaluation of binary operations with Rust `u64` `wrapping_*` semantics
+    (`add`/`sub`/`mul`/`shl` wrap modulo `2^64`; `sub` is `wrapping_sub`, **not** truncated
+    `Nat` subtraction; shift amounts are masked to `b % 64` like Rust's `wrapping_shl`). -/
+def evalSymOp2 (op : SymOp2) (a b : Nat) : Nat :=
+  match op with
+  | .add => wrap64 (a + b)
+  | .sub => wrap64 (a + (word64Modulus - b % word64Modulus))
+  | .mul => wrap64 (a * b)
+  | .bitAnd => wrap64 (Nat.land a b)
+  | .bitOr => wrap64 (Nat.lor a b)
+  | .bitXor => wrap64 (Nat.xor a b)
+  | .shl => wrap64 (Nat.shiftLeft a (b % 64))
+  | .shr => wrap64 (Nat.shiftRight a (b % 64))
+  | .eq => if a == b then 1 else 0
+  | .lt => if decide (a < b) then 1 else 0
+  | .le => if decide (a ≤ b) then 1 else 0
+
+/-- Non-vacuity witnesses for `u64` wrapping semantics (`u64::MAX + 1 = 0`,
+    `3.wrapping_sub(5) = 2^64 - 2`, `(2^63) << 1 = 0`). -/
+theorem evalSymOp2_wrapping_witness :
+    evalSymOp2 .add 18446744073709551615 1 = 0 ∧
+      evalSymOp2 .sub 3 5 = 18446744073709551614 ∧
+      evalSymOp2 .shl 9223372036854775808 1 = 0 :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Boolean check that all child `SymId`s in a `SymNode` are strictly below `bound`. -/
+def validNodeB (bound : Nat) : SymNode → Bool
+  | .const _ => true
+  | .var _ => true
+  | .op1 _ a => decide (a < bound)
+  | .op2 _ a b => decide (a < bound) && decide (b < bound)
+  | .ite c t e => decide (c < bound) && decide (t < bound) && decide (e < bound)
+
+/-- Propositional well-formedness of a `SymNode` at table bound `bound`: every
+    child `SymId` is strictly less than `bound`, enforcing a strict topological DAG. -/
+def ValidNode (bound : Nat) (node : SymNode) : Prop :=
+  match node with
+  | .const _ => True
+  | .var _ => True
+  | .op1 _ a => a < bound
+  | .op2 _ a b => a < bound ∧ b < bound
+  | .ite c t e => c < bound ∧ t < bound ∧ e < bound
+
+theorem validNode_iff_validNodeB (bound : Nat) (node : SymNode) :
+    ValidNode bound node ↔ validNodeB bound node = true := by
+  cases node with
+  | const _ => simp [ValidNode, validNodeB]
+  | var _ => simp [ValidNode, validNodeB]
+  | op1 _ a => simp [ValidNode, validNodeB]
+  | op2 _ a b => simp [ValidNode, validNodeB, Bool.and_eq_true]
+  | ite c t e => simp [ValidNode, validNodeB, Bool.and_eq_true, and_assoc]
+
+theorem ValidNode.mono {b₁ b₂ : Nat} {node : SymNode} (h : ValidNode b₁ node) (hle : b₁ ≤ b₂) :
+    ValidNode b₂ node := by
+  cases node with
+  | const _ => trivial
+  | var _ => trivial
+  | op1 _ a =>
+    exact Nat.lt_of_lt_of_le h hle
+  | op2 _ a b =>
+    exact ⟨Nat.lt_of_lt_of_le h.1 hle, Nat.lt_of_lt_of_le h.2 hle⟩
+  | ite c t e =>
+    exact ⟨Nat.lt_of_lt_of_le h.1 hle, Nat.lt_of_lt_of_le h.2.1 hle, Nat.lt_of_lt_of_le h.2.2 hle⟩
+
+/-- Append-only Global Value Numbering (`SymTable`) table storing `SymNode`s in
+    topological creation order. -/
+structure SymTable where
+  nodes : List SymNode := []
+  deriving DecidableEq
+
+/-- A `SymTable` is valid when every node at index `idx` only references strictly
+    earlier `SymId`s `< idx`. -/
+def ValidTable (tbl : SymTable) : Prop :=
+  ∀ (idx : Nat) (node : SymNode), tbl.nodes[idx]? = some node → ValidNode idx node
+
+theorem ValidTable.empty : ValidTable { nodes := [] } := by
+  intro idx node h
+  simp at h
+
+/-- Structural monotonicity (`Extends`): `tbl₂` extends `tbl₁` when every index
+    valid in `tbl₁` maps to the exact same `SymNode` in `tbl₂`. -/
+def SymTable.Extends (tbl₁ tbl₂ : SymTable) : Prop :=
+  ∀ (idx : Nat) (node : SymNode), tbl₁.nodes[idx]? = some node → tbl₂.nodes[idx]? = some node
+
+theorem SymTable.Extends.refl (tbl : SymTable) : tbl.Extends tbl := by
+  intro idx node h
+  exact h
+
+theorem SymTable.Extends.trans {tbl₁ tbl₂ tbl₃ : SymTable}
+    (h₁₂ : tbl₁.Extends tbl₂) (h₂₃ : tbl₂.Extends tbl₃) :
+    tbl₁.Extends tbl₃ := by
+  intro idx node h
+  exact h₂₃ idx node (h₁₂ idx node h)
+
+theorem getElem?_append_left_of_some {α : Type} {xs ys : List α} {idx : Nat} {v : α}
+    (h : xs[idx]? = some v) :
+    (xs ++ ys)[idx]? = some v := by
+  have hlt : idx < xs.length := by
+    cases hlt' : decide (idx < xs.length) with
+    | true => exact of_decide_eq_true hlt'
+    | false =>
+      have hge : xs.length ≤ idx := Nat.le_of_not_lt (of_decide_eq_false hlt')
+      rw [List.getElem?_eq_none hge] at h
+      cases h
+  rw [List.getElem?_append_left hlt]
+  exact h
+
+theorem SymTable.extends_append (tbl : SymTable) (extra : List SymNode) :
+    tbl.Extends { nodes := tbl.nodes ++ extra } := by
+  intro idx node h
+  exact getElem?_append_left_of_some h
+
+theorem SymTable.Extends.length_le {tbl₁ tbl₂ : SymTable}
+    (hExt : tbl₁.Extends tbl₂) : tbl₁.nodes.length ≤ tbl₂.nodes.length := by
+  cases h : tbl₁.nodes.length with
+  | zero => exact Nat.zero_le _
+  | succ k =>
+    have hlt : k < tbl₁.nodes.length := by omega
+    have hSome : tbl₁.nodes[k]? = some tbl₁.nodes[k] := List.getElem?_eq_getElem hlt
+    have hSome₂ := hExt k tbl₁.nodes[k] hSome
+    cases hlt₂ : decide (k < tbl₂.nodes.length) with
+    | true =>
+      have hk : k < tbl₂.nodes.length := of_decide_eq_true hlt₂
+      omega
+    | false =>
+      have hge : tbl₂.nodes.length ≤ k := Nat.le_of_not_lt (of_decide_eq_false hlt₂)
+      rw [List.getElem?_eq_none hge] at hSome₂
+      cases hSome₂
+
+/-- Evaluate a single `SymNode` given an evaluator `evalChild` for child `SymId`s. -/
+def evalSymNodeWith (evalChild : SymId → Nat) (env : SymEnv) : SymNode → Nat
+  | .const v => wrap64 v
+  | .var idx => wrap64 (env idx)
+  | .op1 op a => evalSymOp1 op (evalChild a)
+  | .op2 op a b => evalSymOp2 op (evalChild a) (evalChild b)
+  | .ite c t e => if evalChild c != 0 then evalChild t else evalChild e
+
+/-- Fuel-bounded structural evaluation of a `SymId` in `tbl`.
+    `evalSymId tbl env id` sets `fuel = id + 1`, which depends ONLY on `id`
+    and NOT on `tbl.nodes.length`. Because every valid node at `idx` only references
+    children `< idx`, `id + 1` steps of fuel always suffice and `evalSymId_mono` holds
+    directly across table extensions without fuel-shifting boilerplate. -/
+def evalSymIdAux (tbl : SymTable) (env : SymEnv) : Nat → SymId → Nat
+  | 0, _ => 0
+  | fuel + 1, id =>
+    match tbl.nodes[id]? with
+    | none => 0
+    | some node => evalSymNodeWith (evalSymIdAux tbl env fuel) env node
+
+/-- Evaluate `id : SymId` in `tbl` under concrete input environment `env`. -/
+def evalSymId (tbl : SymTable) (env : SymEnv) (id : SymId) : Nat :=
+  evalSymIdAux tbl env (id + 1) id
+
+/-- Monotonicity of `evalSymIdAux` across `SymTable.Extends`. -/
+theorem evalSymIdAux_mono {tbl₁ tbl₂ : SymTable} (hValid : ValidTable tbl₁)
+    (hExt : tbl₁.Extends tbl₂) (env : SymEnv) :
+    ∀ (fuel : Nat) (id : SymId),
+      id < tbl₁.nodes.length →
+      evalSymIdAux tbl₁ env fuel id = evalSymIdAux tbl₂ env fuel id
+  | 0, _, _ => rfl
+  | fuel + 1, id, hlt => by
+    have hSome₁ : tbl₁.nodes[id]? = some tbl₁.nodes[id] := List.getElem?_eq_getElem hlt
+    have hSome₂ : tbl₂.nodes[id]? = some tbl₁.nodes[id] := hExt id tbl₁.nodes[id] hSome₁
+    have hNodeValid : ValidNode id tbl₁.nodes[id] := hValid id tbl₁.nodes[id] hSome₁
+    dsimp [evalSymIdAux]
+    rw [hSome₁, hSome₂]
+    dsimp
+    cases hNode : tbl₁.nodes[id] with
+    | const v => rfl
+    | var idx => rfl
+    | op1 op a =>
+      rw [hNode] at hNodeValid
+      dsimp [ValidNode] at hNodeValid
+      dsimp [evalSymNodeWith]
+      rw [evalSymIdAux_mono hValid hExt env fuel a (Nat.lt_trans hNodeValid hlt)]
+    | op2 op a b =>
+      rw [hNode] at hNodeValid
+      dsimp [ValidNode] at hNodeValid
+      dsimp [evalSymNodeWith]
+      rw [evalSymIdAux_mono hValid hExt env fuel a (Nat.lt_trans hNodeValid.1 hlt)]
+      rw [evalSymIdAux_mono hValid hExt env fuel b (Nat.lt_trans hNodeValid.2 hlt)]
+    | ite c t e =>
+      rw [hNode] at hNodeValid
+      dsimp [ValidNode] at hNodeValid
+      dsimp [evalSymNodeWith]
+      rw [evalSymIdAux_mono hValid hExt env fuel c (Nat.lt_trans hNodeValid.1 hlt)]
+      rw [evalSymIdAux_mono hValid hExt env fuel t (Nat.lt_trans hNodeValid.2.1 hlt)]
+      rw [evalSymIdAux_mono hValid hExt env fuel e (Nat.lt_trans hNodeValid.2.2 hlt)]
+
+/-- **Core Monotonicity Theorem (`evalSymId_mono`)**:
+    Extending an append-only `SymTable` preserves the concrete evaluation of every
+    previously allocated `SymId`. -/
+theorem evalSymId_mono {tbl₁ tbl₂ : SymTable} (hValid : ValidTable tbl₁)
+    (hExt : tbl₁.Extends tbl₂) (env : SymEnv) {id : SymId}
+    (hlt : id < tbl₁.nodes.length) :
+    evalSymId tbl₁ env id = evalSymId tbl₂ env id :=
+  evalSymIdAux_mono hValid hExt env (id + 1) id hlt
+
+/-- Fuel-sufficiency theorem: in a `ValidTable`, any fuel `> id` evaluates `id`
+    to the exact same value. -/
+theorem evalSymIdAux_fuel_irrel {tbl : SymTable} (hValid : ValidTable tbl) (env : SymEnv) :
+    ∀ (bound id fuel₁ fuel₂ : Nat),
+      id < bound →
+      id < tbl.nodes.length →
+      id < fuel₁ →
+      id < fuel₂ →
+      evalSymIdAux tbl env fuel₁ id = evalSymIdAux tbl env fuel₂ id
+  | 0, _, _, _, hltB, _, _, _ => by omega
+  | bound + 1, id, fuel₁, fuel₂, hltB, hltLen, hltF₁, hltF₂ => by
+    cases fuel₁ with
+    | zero => omega
+    | succ f₁ =>
+      cases fuel₂ with
+      | zero => omega
+      | succ f₂ =>
+        have hSome : tbl.nodes[id]? = some tbl.nodes[id] := List.getElem?_eq_getElem hltLen
+        have hNodeValid : ValidNode id tbl.nodes[id] := hValid id tbl.nodes[id] hSome
+        dsimp [evalSymIdAux]
+        rw [hSome]
+        dsimp
+        cases hNode : tbl.nodes[id] with
+        | const v => rfl
+        | var idx => rfl
+        | op1 op a =>
+          rw [hNode] at hNodeValid
+          have ha : a < id := hNodeValid
+          dsimp [evalSymNodeWith]
+          rw [evalSymIdAux_fuel_irrel hValid env bound a f₁ f₂
+            (by omega) (by omega) (by omega) (by omega)]
+        | op2 op a b =>
+          rw [hNode] at hNodeValid
+          have ha : a < id := hNodeValid.1
+          have hb : b < id := hNodeValid.2
+          dsimp [evalSymNodeWith]
+          rw [evalSymIdAux_fuel_irrel hValid env bound a f₁ f₂
+            (by omega) (by omega) (by omega) (by omega)]
+          rw [evalSymIdAux_fuel_irrel hValid env bound b f₁ f₂
+            (by omega) (by omega) (by omega) (by omega)]
+        | ite c t e =>
+          rw [hNode] at hNodeValid
+          have hc : c < id := hNodeValid.1
+          have ht : t < id := hNodeValid.2.1
+          have he : e < id := hNodeValid.2.2
+          dsimp [evalSymNodeWith]
+          rw [evalSymIdAux_fuel_irrel hValid env bound c f₁ f₂
+            (by omega) (by omega) (by omega) (by omega)]
+          rw [evalSymIdAux_fuel_irrel hValid env bound t f₁ f₂
+            (by omega) (by omega) (by omega) (by omega)]
+          rw [evalSymIdAux_fuel_irrel hValid env bound e f₁ f₂
+            (by omega) (by omega) (by omega) (by omega)]
+
+theorem evalSymIdAux_eq_evalSymId {tbl : SymTable} (hValid : ValidTable tbl)
+    (env : SymEnv) {id fuel : Nat} (hltLen : id < tbl.nodes.length) (hltFuel : id < fuel) :
+    evalSymIdAux tbl env fuel id = evalSymId tbl env id :=
+  evalSymIdAux_fuel_irrel hValid env (id + 1) id fuel (id + 1)
+    (Nat.lt_succ_self id) hltLen hltFuel (Nat.lt_succ_self id)
+
+/-- Unfolding equation for `evalSymId` at any valid index `id` in `tbl`. -/
+theorem evalSymId_eq_evalSymNodeWith {tbl : SymTable} (hValid : ValidTable tbl)
+    (env : SymEnv) {id : Nat} {node : SymNode}
+    (hLookup : tbl.nodes[id]? = some node) :
+    evalSymId tbl env id = evalSymNodeWith (evalSymId tbl env) env node := by
+  have hltLen : id < tbl.nodes.length := by
+    cases h : decide (id < tbl.nodes.length) with
+    | true => exact of_decide_eq_true h
+    | false =>
+      rw [List.getElem?_eq_none (Nat.le_of_not_lt (of_decide_eq_false h))] at hLookup
+      cases hLookup
+  have hNodeValid : ValidNode id node := hValid id node hLookup
+  change evalSymIdAux tbl env (id + 1) id = evalSymNodeWith (evalSymId tbl env) env node
+  dsimp [evalSymIdAux]
+  rw [hLookup]
+  dsimp
+  cases node with
+  | const v => rfl
+  | var idx => rfl
+  | op1 op a =>
+    dsimp [ValidNode] at hNodeValid
+    dsimp [evalSymNodeWith]
+    rw [evalSymIdAux_eq_evalSymId hValid env (Nat.lt_trans hNodeValid hltLen) hNodeValid]
+  | op2 op a b =>
+    dsimp [ValidNode] at hNodeValid
+    dsimp [evalSymNodeWith]
+    rw [evalSymIdAux_eq_evalSymId hValid env (Nat.lt_trans hNodeValid.1 hltLen) hNodeValid.1]
+    rw [evalSymIdAux_eq_evalSymId hValid env (Nat.lt_trans hNodeValid.2 hltLen) hNodeValid.2]
+  | ite c t e =>
+    dsimp [ValidNode] at hNodeValid
+    dsimp [evalSymNodeWith]
+    rw [evalSymIdAux_eq_evalSymId hValid env (Nat.lt_trans hNodeValid.1 hltLen) hNodeValid.1]
+    rw [evalSymIdAux_eq_evalSymId hValid env (Nat.lt_trans hNodeValid.2.1 hltLen) hNodeValid.2.1]
+    rw [evalSymIdAux_eq_evalSymId hValid env (Nat.lt_trans hNodeValid.2.2 hltLen) hNodeValid.2.2]
+
+theorem evalSymOp1_lt_word64 (op : SymOp1) {v : Nat} (hv : v < word64Modulus) :
+    evalSymOp1 op v < word64Modulus := by
+  cases op with
+  | id => exact hv
+  | boolNot =>
+    dsimp only [evalSymOp1]
+    split <;> decide
+  | wrappingNeg64 => exact Nat.mod_lt _ (by decide)
+  | maskLow32 =>
+    dsimp only [evalSymOp1]
+    have h := Nat.mod_lt v (show 4294967296 > 0 by decide)
+    have h2 : (4294967296 : Nat) < word64Modulus := by decide
+    omega
+  | xorConst _ => exact wrap64_lt _
+  | addConst _ => exact wrap64_lt _
+
+theorem evalSymOp2_lt_word64 (op : SymOp2) (a b : Nat) : evalSymOp2 op a b < word64Modulus := by
+  cases op <;> first
+    | exact wrap64_lt _
+    | (dsimp only [evalSymOp2]; split <;> decide)
+
+/-- **`u64` Word Invariant (`evalSymId_lt_word64`)**: every `SymId` evaluates to a genuine
+    64-bit word (`< 2^64`) in every table, environment and fuel. -/
+theorem evalSymIdAux_lt_word64 (tbl : SymTable) (env : SymEnv) :
+    ∀ (fuel : Nat) (id : SymId), evalSymIdAux tbl env fuel id < word64Modulus
+  | 0, _ => by
+    dsimp only [evalSymIdAux]
+    decide
+  | fuel + 1, id => by
+    dsimp only [evalSymIdAux]
+    split
+    · decide
+    · rename_i node _
+      cases node with
+      | const v => exact wrap64_lt v
+      | var i => exact wrap64_lt (env i)
+      | op1 op a => exact evalSymOp1_lt_word64 op (evalSymIdAux_lt_word64 tbl env fuel a)
+      | op2 op a b => exact evalSymOp2_lt_word64 op _ _
+      | ite c t e =>
+        dsimp only [evalSymNodeWith]
+        split
+        · exact evalSymIdAux_lt_word64 tbl env fuel t
+        · exact evalSymIdAux_lt_word64 tbl env fuel e
+
+theorem evalSymId_lt_word64 (tbl : SymTable) (env : SymEnv) (id : SymId) :
+    evalSymId tbl env id < word64Modulus :=
+  evalSymIdAux_lt_word64 tbl env (id + 1) id
+
+/-- Search `nodes` for an existing occurrence of `target`, returning its index if present. -/
+def findNodeIdxAux (target : SymNode) (offset : Nat) : List SymNode → Option Nat
+  | [] => none
+  | n :: rest =>
+    if n == target then
+      some offset
+    else
+      findNodeIdxAux target (offset + 1) rest
+
+def findNodeIdx (nodes : List SymNode) (target : SymNode) : Option Nat :=
+  findNodeIdxAux target 0 nodes
+
+theorem findNodeIdxAux_spec (target : SymNode) :
+    ∀ (nodes : List SymNode) (offset idx : Nat),
+      findNodeIdxAux target offset nodes = some idx →
+      offset ≤ idx ∧ idx < offset + nodes.length ∧ nodes[idx - offset]? = some target
+  | [], _, _, h => by cases h
+  | n :: rest, offset, idx, h => by
+    dsimp [findNodeIdxAux] at h
+    split at h
+    · rename_i hEq
+      injection h with hIdx
+      subst hIdx
+      have hTarget : n = target := of_decide_eq_true hEq
+      subst hTarget
+      refine ⟨Nat.le_refl offset, by dsimp; omega, ?_⟩
+      rw [Nat.sub_self]
+      rfl
+    · have ih := findNodeIdxAux_spec target rest (offset + 1) idx h
+      refine ⟨by omega, by dsimp; omega, ?_⟩
+      have hSub : idx - offset = (idx - (offset + 1)) + 1 := by omega
+      rw [hSub]
+      exact ih.2.2
+
+theorem findNodeIdx_spec {nodes : List SymNode} {target : SymNode} {idx : Nat}
+    (h : findNodeIdx nodes target = some idx) :
+    idx < nodes.length ∧ nodes[idx]? = some target := by
+  have hSpec := findNodeIdxAux_spec target nodes 0 idx h
+  refine ⟨by omega, ?_⟩
+  have hSub : idx - 0 = idx := Nat.sub_zero idx
+  rw [← hSub]
+  exact hSpec.2.2
+
+theorem findNodeIdxAux_complete (target : SymNode) :
+    ∀ (nodes : List SymNode) (offset i : Nat),
+      nodes[i]? = some target →
+      ∃ idx, findNodeIdxAux target offset nodes = some idx
+  | [], _, _, h => by simp at h
+  | n :: rest, offset, i, h => by
+    dsimp [findNodeIdxAux]
+    split
+    · exact ⟨offset, rfl⟩
+    · rename_i hNe
+      cases i with
+      | zero =>
+        simp at h
+        subst h
+        exact False.elim (hNe (decide_eq_true rfl))
+      | succ i' =>
+        simp at h
+        exact findNodeIdxAux_complete target rest (offset + 1) i' h
+
+theorem findNodeIdx_complete {nodes : List SymNode} {target : SymNode} {i : Nat}
+    (h : nodes[i]? = some target) :
+    ∃ idx, findNodeIdx nodes target = some idx :=
+  findNodeIdxAux_complete target nodes 0 i h
+
+/-- Raw hash-consed interning without algebraic peephole rules: returns an existing
+    `SymId` if `node` is already in `tbl.nodes`, or appends `node` at `tbl.nodes.length`. -/
+def internRawNode (tbl : SymTable) (node : SymNode) : SymId × SymTable :=
+  match findNodeIdx tbl.nodes node with
+  | some idx => (idx, tbl)
+  | none => (tbl.nodes.length, { nodes := tbl.nodes ++ [node] })
+
+/-- Commutative binary operators: their operands are put in canonical `SymId` order before
+    hash-consing, so `x + y` and `y + x` share one `SymId`. -/
+def SymOp2.isComm : SymOp2 → Bool
+  | .add | .mul | .bitAnd | .bitOr | .bitXor | .eq => true
+  | _ => false
+
+theorem evalSymOp2_comm {op : SymOp2} (hComm : op.isComm = true) (x y : Nat) :
+    evalSymOp2 op x y = evalSymOp2 op y x := by
+  cases op with
+  | add => show wrap64 (x + y) = wrap64 (y + x); rw [Nat.add_comm]
+  | mul => show wrap64 (x * y) = wrap64 (y * x); rw [Nat.mul_comm]
+  | bitAnd =>
+    show wrap64 (Nat.land x y) = wrap64 (Nat.land y x)
+    rw [show Nat.land x y = Nat.land y x from Nat.and_comm x y]
+  | bitOr =>
+    show wrap64 (Nat.lor x y) = wrap64 (Nat.lor y x)
+    rw [show Nat.lor x y = Nat.lor y x from Nat.or_comm x y]
+  | bitXor =>
+    show wrap64 (Nat.xor x y) = wrap64 (Nat.xor y x)
+    rw [show Nat.xor x y = Nat.xor y x from Nat.xor_comm x y]
+  | eq =>
+    show (if decide (x = y) = true then 1 else 0) = (if decide (y = x) = true then 1 else 0)
+    by_cases h : x = y
+    · subst h
+      rfl
+    · rw [decide_eq_false h, decide_eq_false (Ne.symm h)]
+  | sub => cases hComm
+  | shl => cases hComm
+  | shr => cases hComm
+  | lt => cases hComm
+  | le => cases hComm
+
+/-- Table-independent algebraic peephole rewrite of a binary node (`peepholeOp2`):
+    duplicate-operand folds `x & x ↦ x`, `x | x ↦ x`, `x ^ x ↦ 0`, `x - x ↦ 0`, `x < x ↦ 0`,
+    `x == x ↦ 1`, `x ≤ x ↦ 1`, and canonical operand order for commutative operators.
+    `.inl x` reuses an existing `SymId`; `.inr node'` hash-conses `node'`. -/
+def peepholeOp2 (op : SymOp2) (a b : SymId) : SymId ⊕ SymNode :=
+  if a = b then
+    match op with
+    | .bitAnd | .bitOr => .inl a
+    | .bitXor | .sub | .lt => .inr (.const 0)
+    | .eq | .le => .inr (.const 1)
+    | _ => .inr (.op2 op a b)
+  else if op.isComm && decide (b < a) then .inr (.op2 op b a)
+  else .inr (.op2 op a b)
+
+/-- **Peephole Soundness (`peepholeOp2_sound`)**: every rewrite preserves the `u64` value of the
+    binary node for any child valuation `f` whose operand `a` is a 64-bit word. -/
+theorem peepholeOp2_sound (op : SymOp2) (a b : SymId) (f : SymId → Nat) (env : SymEnv)
+    (ha : f a < word64Modulus) :
+    match peepholeOp2 op a b with
+    | .inl x => f x = evalSymOp2 op (f a) (f b)
+    | .inr node' => evalSymNodeWith f env node' = evalSymOp2 op (f a) (f b) := by
+  unfold peepholeOp2
+  by_cases hab : a = b
+  · subst hab
+    rw [ite_eq_left (rfl : a = a)]
+    have hmod : f a % word64Modulus = f a := Nat.mod_eq_of_lt ha
+    cases op with
+    | add => rfl
+    | mul => rfl
+    | shl => rfl
+    | shr => rfl
+    | bitAnd =>
+      show f a = wrap64 (Nat.land (f a) (f a))
+      rw [show Nat.land (f a) (f a) = f a from Nat.and_self (f a)]
+      exact hmod.symm
+    | bitOr =>
+      show f a = wrap64 (Nat.lor (f a) (f a))
+      rw [show Nat.lor (f a) (f a) = f a from Nat.or_self (f a)]
+      exact hmod.symm
+    | bitXor =>
+      show wrap64 0 = wrap64 (Nat.xor (f a) (f a))
+      rw [show Nat.xor (f a) (f a) = 0 from Nat.xor_self (f a)]
+    | sub =>
+      show wrap64 0 = wrap64 (f a + (word64Modulus - f a % word64Modulus))
+      rw [hmod, Nat.add_sub_cancel' (Nat.le_of_lt ha)]
+      show 0 % word64Modulus = word64Modulus % word64Modulus
+      rw [Nat.mod_self]
+      rfl
+    | lt =>
+      show wrap64 0 = (if decide (f a < f a) = true then 1 else 0)
+      rw [decide_eq_false (Nat.lt_irrefl (f a))]
+      rfl
+    | eq =>
+      show wrap64 1 = (if decide (f a = f a) = true then 1 else 0)
+      rw [decide_eq_true rfl]
+      rfl
+    | le =>
+      show wrap64 1 = (if decide (f a ≤ f a) = true then 1 else 0)
+      rw [decide_eq_true (Nat.le_refl (f a))]
+      rfl
+  · rw [ite_eq_right hab]
+    by_cases hc : (op.isComm && decide (b < a)) = true
+    · rw [ite_eq_left hc]
+      have hComm : op.isComm = true := by
+        cases h : op.isComm
+        · rw [h] at hc
+          cases hc
+        · rfl
+      exact evalSymOp2_comm hComm (f b) (f a)
+    · rw [ite_eq_right hc]
+      rfl
+
+theorem peepholeOp2_valid {bound : Nat} {op : SymOp2} {a b : SymId}
+    (h : ValidNode bound (.op2 op a b)) :
+    match peepholeOp2 op a b with
+    | .inl x => x < bound
+    | .inr node' => ValidNode bound node' := by
+  have ha : a < bound := h.1
+  have hb : b < bound := h.2
+  unfold peepholeOp2
+  by_cases hab : a = b
+  · subst hab
+    rw [ite_eq_left (rfl : a = a)]
+    cases op <;> first | exact ha | exact (⟨ha, ha⟩ : a < bound ∧ a < bound) | trivial
+  · rw [ite_eq_right hab]
+    by_cases hc : (op.isComm && decide (b < a)) = true
+    · rw [ite_eq_left hc]
+      exact (⟨hb, ha⟩ : b < bound ∧ a < bound)
+    · rw [ite_eq_right hc]
+      exact (⟨ha, hb⟩ : a < bound ∧ b < bound)
+
+/-- Lookup-first binary interning: reuse an existing occurrence of the node verbatim, otherwise
+    apply `peepholeOp2` and hash-cons the result. -/
+def internOp2 (tbl : SymTable) (op : SymOp2) (a b : SymId) : SymId × SymTable :=
+  match findNodeIdx tbl.nodes (.op2 op a b) with
+  | some idx => (idx, tbl)
+  | none =>
+    match peepholeOp2 op a b with
+    | .inl x => (x, tbl)
+    | .inr node' => internRawNode tbl node'
+
+theorem findNodeIdxAux_append_none (target x : SymNode) (hx : x ≠ target) :
+    ∀ (nodes : List SymNode) (offset : Nat),
+      findNodeIdxAux target offset nodes = none →
+      findNodeIdxAux target offset (nodes ++ [x]) = none
+  | [], offset, _ => by
+    dsimp [findNodeIdxAux]
+    have hne : (x == target) = false := by
+      cases h : (x == target)
+      · rfl
+      · exact absurd (of_decide_eq_true h) hx
+    rw [hne]
+    rfl
+  | n :: rest, offset, h => by
+    dsimp [findNodeIdxAux] at h ⊢
+    split at h
+    · cases h
+    · rename_i hn
+      rw [ite_eq_right hn]
+      exact findNodeIdxAux_append_none target x hx rest (offset + 1) h
+
+theorem findNodeIdxAux_append_self (x : SymNode) :
+    ∀ (nodes : List SymNode) (offset : Nat),
+      findNodeIdxAux x offset nodes = none →
+      findNodeIdxAux x offset (nodes ++ [x]) = some (offset + nodes.length)
+  | [], offset, _ => by
+    dsimp [findNodeIdxAux]
+    rw [show (x == x) = true from decide_eq_true rfl]
+    rfl
+  | n :: rest, offset, h => by
+    dsimp [findNodeIdxAux] at h ⊢
+    split at h
+    · cases h
+    · rename_i hn
+      rw [ite_eq_right hn, findNodeIdxAux_append_self x rest (offset + 1) h]
+      congr 1
+      omega
+
+/-- Hash-consed GVN node interning with sound algebraic canonicalization:
+    - Folds idempotent conditional branches `ite c x x ↦ x`, identity unary ops
+      `op1 .id x ↦ x`, and zero-offset wrapping additions `op1 (.addConst 0) x ↦ x`
+      (whose soundness in `internNode_eval` relies on the `u64` word bound
+      `evalSymId_lt_word64 : evalSymId tbl env x < 2^64`) directly to existing `SymId` `x`
+      without allocating a new node.
+    - Interns binary nodes through `internOp2`: an existing occurrence is reused verbatim
+      (lookup first), otherwise the table-independent `peepholeOp2` rewrite applies
+      duplicate-operand folds (`x & x ↦ x`, `x | x ↦ x`, `x ^ x ↦ 0`, `x - x ↦ 0`,
+      `x < x ↦ 0`, `x == x ↦ 1`, `x ≤ x ↦ 1`) and canonical commutative operand order.
+    - Deduplicates any previously interned `SymNode` via `findNodeIdx`. -/
+def internNode (tbl : SymTable) (node : SymNode) : SymId × SymTable :=
+  match node with
+  | .ite _ t e =>
+    if t == e then
+      (t, tbl)
+    else
+      internRawNode tbl node
+  | .op1 .id a => (a, tbl)
+  | .op1 (.xorConst mask) a =>
+    if mask == 0 then
+      (a, tbl)
+    else
+      internRawNode tbl node
+  | .op1 (.addConst delta) a =>
+    if delta == 0 then
+      (a, tbl)
+    else
+      internRawNode tbl node
+  | .op2 op a b => internOp2 tbl op a b
+  | _ => internRawNode tbl node
+
+theorem internRawNode_extends (tbl : SymTable) (node : SymNode) :
+    tbl.Extends (internRawNode tbl node).2 := by
+  dsimp [internRawNode]
+  cases findNodeIdx tbl.nodes node with
+  | some _ => exact SymTable.Extends.refl tbl
+  | none => exact SymTable.extends_append tbl [node]
+
+theorem internOp2_extends (tbl : SymTable) (op : SymOp2) (a b : SymId) :
+    tbl.Extends (internOp2 tbl op a b).2 := by
+  unfold internOp2
+  split
+  · exact SymTable.Extends.refl tbl
+  · split
+    · exact SymTable.Extends.refl tbl
+    · exact internRawNode_extends tbl _
+
+/-- **Monotone Extension Theorem (`internNode_extends`)**:
+    `internNode` only appends to `tbl` (or leaves `tbl` unchanged on a GVN hit / fold). -/
+theorem internNode_extends (tbl : SymTable) (node : SymNode) :
+    tbl.Extends (internNode tbl node).2 := by
+  unfold internNode
+  cases node with
+  | ite c t e =>
+    dsimp
+    split
+    · exact SymTable.Extends.refl tbl
+    · exact internRawNode_extends tbl (.ite c t e)
+  | op1 op a =>
+    cases op <;> dsimp
+    · exact SymTable.Extends.refl tbl
+    · exact internRawNode_extends tbl (.op1 .boolNot a)
+    · exact internRawNode_extends tbl (.op1 .wrappingNeg64 a)
+    · exact internRawNode_extends tbl (.op1 .maskLow32 a)
+    · rename_i mask
+      split
+      · exact SymTable.Extends.refl tbl
+      · exact internRawNode_extends tbl (.op1 (.xorConst mask) a)
+    · rename_i delta
+      split
+      · exact SymTable.Extends.refl tbl
+      · exact internRawNode_extends tbl (.op1 (.addConst delta) a)
+  | const v => exact internRawNode_extends tbl (.const v)
+  | var idx => exact internRawNode_extends tbl (.var idx)
+  | op2 op a b => exact internOp2_extends tbl op a b
+
+theorem internRawNode_valid {tbl : SymTable} {node : SymNode}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length node) :
+    ValidTable (internRawNode tbl node).2 ∧
+      (internRawNode tbl node).1 < (internRawNode tbl node).2.nodes.length := by
+  dsimp [internRawNode]
+  cases hFind : findNodeIdx tbl.nodes node with
+  | some idx =>
+    have hSpec := findNodeIdx_spec hFind
+    exact ⟨hValid, hSpec.1⟩
+  | none =>
+    refine ⟨?_, ?_⟩
+    · intro idx n hGet
+      cases hlt : decide (idx < tbl.nodes.length) with
+      | true =>
+        have hlt' : idx < tbl.nodes.length := of_decide_eq_true hlt
+        rw [List.getElem?_append_left hlt'] at hGet
+        exact hValid idx n hGet
+      | false =>
+        have hge : tbl.nodes.length ≤ idx := Nat.le_of_not_lt (of_decide_eq_false hlt)
+        rw [List.getElem?_append_right hge] at hGet
+        cases hDiff : idx - tbl.nodes.length with
+        | zero =>
+          rw [hDiff] at hGet
+          simp at hGet
+          subst hGet
+          have hIdxEq : idx = tbl.nodes.length := by omega
+          rw [hIdxEq]
+          exact hNode
+        | succ k =>
+          rw [hDiff] at hGet
+          simp at hGet
+    · simp
+
+theorem internOp2_valid {tbl : SymTable} {op : SymOp2} {a b : SymId}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length (.op2 op a b)) :
+    ValidTable (internOp2 tbl op a b).2 ∧
+      (internOp2 tbl op a b).1 < (internOp2 tbl op a b).2.nodes.length := by
+  unfold internOp2
+  split
+  · rename_i idx hFind
+    exact ⟨hValid, (findNodeIdx_spec hFind).1⟩
+  · have hPV := peepholeOp2_valid hNode
+    split
+    · rename_i x hP
+      rw [hP] at hPV
+      exact ⟨hValid, hPV⟩
+    · rename_i node' hP
+      rw [hP] at hPV
+      exact internRawNode_valid hValid hPV
+
+/-- **Table Validity Preservation (`internNode_valid`)**:
+    Interning any node whose children are `< tbl.nodes.length` preserves `ValidTable`
+    and returns a valid `SymId < tbl'.nodes.length`. -/
+theorem internNode_valid {tbl : SymTable} {node : SymNode}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length node) :
+    ValidTable (internNode tbl node).2 ∧
+      (internNode tbl node).1 < (internNode tbl node).2.nodes.length := by
+  unfold internNode
+  cases node with
+  | ite c t e =>
+    dsimp [ValidNode] at hNode
+    dsimp
+    split
+    · exact ⟨hValid, hNode.2.1⟩
+    · exact internRawNode_valid hValid hNode
+  | op1 op a =>
+    dsimp [ValidNode] at hNode
+    cases op <;> dsimp
+    · exact ⟨hValid, hNode⟩
+    · exact internRawNode_valid hValid hNode
+    · exact internRawNode_valid hValid hNode
+    · exact internRawNode_valid hValid hNode
+    · split
+      · exact ⟨hValid, hNode⟩
+      · exact internRawNode_valid hValid hNode
+    · split
+      · exact ⟨hValid, hNode⟩
+      · exact internRawNode_valid hValid hNode
+  | const v => exact internRawNode_valid hValid hNode
+  | var idx => exact internRawNode_valid hValid hNode
+  | op2 op a b => exact internOp2_valid hValid hNode
+
+theorem internRawNode_eval {tbl : SymTable} {node : SymNode}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length node) (env : SymEnv) :
+    let res := internRawNode tbl node
+    evalSymId res.2 env res.1 = evalSymNodeWith (evalSymId tbl env) env node := by
+  dsimp [internRawNode]
+  cases hFind : findNodeIdx tbl.nodes node with
+  | some idx =>
+    have hSpec := findNodeIdx_spec hFind
+    exact evalSymId_eq_evalSymNodeWith hValid env hSpec.2
+  | none =>
+    have hValid' := (internRawNode_valid hValid hNode).1
+    dsimp [internRawNode] at hValid'
+    rw [hFind] at hValid'
+    dsimp at hValid'
+    have hExt : tbl.Extends { nodes := tbl.nodes ++ [node] } := SymTable.extends_append tbl [node]
+    have hLookupNew : (tbl.nodes ++ [node])[tbl.nodes.length]? = some node := by
+      rw [List.getElem?_append_right (Nat.le_refl _), Nat.sub_self]
+      rfl
+    rw [evalSymId_eq_evalSymNodeWith hValid' env hLookupNew]
+    cases node with
+    | const v => rfl
+    | var idx => rfl
+    | op1 op a =>
+      dsimp [ValidNode] at hNode
+      dsimp [evalSymNodeWith]
+      rw [← evalSymId_mono hValid hExt env hNode]
+    | op2 op a b =>
+      dsimp [ValidNode] at hNode
+      dsimp [evalSymNodeWith]
+      rw [← evalSymId_mono hValid hExt env hNode.1]
+      rw [← evalSymId_mono hValid hExt env hNode.2]
+    | ite c t e =>
+      dsimp [ValidNode] at hNode
+      dsimp [evalSymNodeWith]
+      rw [← evalSymId_mono hValid hExt env hNode.1]
+      rw [← evalSymId_mono hValid hExt env hNode.2.1]
+      rw [← evalSymId_mono hValid hExt env hNode.2.2]
+
+theorem internOp2_eval {tbl : SymTable} {op : SymOp2} {a b : SymId}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length (.op2 op a b)) (env : SymEnv) :
+    evalSymId (internOp2 tbl op a b).2 env (internOp2 tbl op a b).1 =
+      evalSymOp2 op (evalSymId tbl env a) (evalSymId tbl env b) := by
+  unfold internOp2
+  split
+  · rename_i idx hFind
+    exact evalSymId_eq_evalSymNodeWith hValid env (findNodeIdx_spec hFind).2
+  · have hPS := peepholeOp2_sound op a b (evalSymId tbl env) env (evalSymId_lt_word64 tbl env a)
+    have hPV := peepholeOp2_valid hNode
+    split
+    · rename_i x hP
+      rw [hP] at hPS
+      exact hPS
+    · rename_i node' hP
+      rw [hP] at hPS hPV
+      rw [internRawNode_eval hValid hPV env]
+      exact hPS
+
+/-- **Evaluation Soundness of `internNode` (`internNode_eval`)**:
+    Evaluating the `SymId` returned by `internNode tbl node` in the resulting table
+    equals evaluating `node` over `evalSymId tbl env` (including when `ite c x x ↦ x`
+    or `op1 .id x ↦ x` folds to an existing `SymId`). -/
+theorem internNode_eval {tbl : SymTable} {node : SymNode}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length node) (env : SymEnv) :
+    let res := internNode tbl node
+    evalSymId res.2 env res.1 = evalSymNodeWith (evalSymId tbl env) env node := by
+  unfold internNode
+  cases node with
+  | ite c t e =>
+    dsimp
+    split
+    · rename_i hCond
+      have hEqTE : t = e := of_decide_eq_true hCond
+      subst hEqTE
+      dsimp [evalSymNodeWith]
+      cases (evalSymId tbl env c != 0) <;> rfl
+    · exact internRawNode_eval hValid hNode env
+  | op1 op a =>
+    cases op <;> dsimp
+    · dsimp [evalSymNodeWith, evalSymOp1]
+    · exact internRawNode_eval hValid hNode env
+    · exact internRawNode_eval hValid hNode env
+    · exact internRawNode_eval hValid hNode env
+    · rename_i mask
+      split
+      · rename_i hZero
+        have hMask : mask = 0 := of_decide_eq_true hZero
+        subst hMask
+        dsimp [evalSymNodeWith, evalSymOp1, wrap64]
+        rw [Nat.xor_zero]
+        exact (Nat.mod_eq_of_lt (evalSymId_lt_word64 tbl env a)).symm
+      · exact internRawNode_eval hValid hNode env
+    · rename_i delta
+      split
+      · rename_i hZero
+        have hDelta : delta = 0 := of_decide_eq_true hZero
+        subst hDelta
+        dsimp [evalSymNodeWith, evalSymOp1, wrap64]
+        exact (Nat.mod_eq_of_lt (evalSymId_lt_word64 tbl env a)).symm
+      · exact internRawNode_eval hValid hNode env
+  | const v => exact internRawNode_eval hValid hNode env
+  | var idx => exact internRawNode_eval hValid hNode env
+  | op2 op a b => exact internOp2_eval hValid hNode env
+
+/-- Non-vacuity witness for `addConst 0` and `xorConst 0` peephole folding: interning
+    `.op1 (.addConst 0) 0` and `.op1 (.xorConst 0) 0` folds directly to `SymId 0` without
+    growing `tbl.nodes`, relying on `evalSymId_lt_word64` for `wrap64` soundness. -/
+theorem internNode_addConst0_peephole_witness :
+    internNode { nodes := [.var 0] } (.op1 (.addConst 0) 0) = (0, { nodes := [.var 0] }) ∧
+      internNode { nodes := [.var 0] } (.op1 (.xorConst 0) 0) = (0, { nodes := [.var 0] }) :=
+  ⟨rfl, rfl⟩
+
+/-- **GVN Deduplication Theorem (`internNode_dedup`)**:
+    Re-interning a `node` that was just interned returns the exact same `SymId`
+    and leaves `tbl` (and `tbl.nodes.length`) completely unchanged. -/
+theorem internRawNode_dedup (tbl : SymTable) (node : SymNode) :
+    let res₁ := internRawNode tbl node
+    internRawNode res₁.2 node = res₁ ∧
+      (internRawNode res₁.2 node).2.nodes.length = res₁.2.nodes.length := by
+  dsimp [internRawNode]
+  cases hFind : findNodeIdx tbl.nodes node with
+  | some idx =>
+    dsimp
+    rw [hFind]
+    exact ⟨rfl, rfl⟩
+  | none =>
+    dsimp
+    have hLookupApp : (tbl.nodes ++ [node])[tbl.nodes.length]? = some node := by
+      rw [List.getElem?_append_right (Nat.le_refl _), Nat.sub_self]
+      rfl
+    rcases findNodeIdx_complete hLookupApp with ⟨idx, hFindApp⟩
+    have hSpec := findNodeIdx_spec hFindApp
+    rw [hFindApp]
+    have hIdxEq : idx = tbl.nodes.length := by
+      cases hlt : decide (idx < tbl.nodes.length) with
+      | true =>
+        have hlt' : idx < tbl.nodes.length := of_decide_eq_true hlt
+        have hInOld : tbl.nodes[idx]? = some node := by
+          have hGet := hSpec.2
+          rw [List.getElem?_append_left hlt'] at hGet
+          exact hGet
+        rcases findNodeIdx_complete hInOld with ⟨idx₀, hFind₀⟩
+        rw [hFind] at hFind₀
+        cases hFind₀
+      | false =>
+        have hge : tbl.nodes.length ≤ idx := Nat.le_of_not_lt (of_decide_eq_false hlt)
+        have hLen : (tbl.nodes ++ [node]).length = tbl.nodes.length + 1 := by simp
+        have hlt' := hSpec.1
+        omega
+    subst hIdxEq
+    exact ⟨rfl, rfl⟩
+
+theorem internOp2_dedup (tbl : SymTable) (op : SymOp2) (a b : SymId) :
+    internOp2 (internOp2 tbl op a b).2 op a b = internOp2 tbl op a b := by
+  cases hFind : findNodeIdx tbl.nodes (.op2 op a b) with
+  | some idx =>
+    have h1 : internOp2 tbl op a b = (idx, tbl) := by
+      unfold internOp2
+      rw [hFind]
+    rw [h1]
+    exact h1
+  | none =>
+    cases hP : peepholeOp2 op a b with
+    | inl x =>
+      have h1 : internOp2 tbl op a b = (x, tbl) := by
+        unfold internOp2
+        rw [hFind, hP]
+      rw [h1]
+      exact h1
+    | inr node' =>
+      have h1 : internOp2 tbl op a b = internRawNode tbl node' := by
+        unfold internOp2
+        rw [hFind, hP]
+      rw [h1]
+      cases hRaw : findNodeIdx tbl.nodes node' with
+      | some j =>
+        have hR : internRawNode tbl node' = (j, tbl) := by
+          unfold internRawNode
+          rw [hRaw]
+        rw [hR]
+        show internOp2 tbl op a b = (j, tbl)
+        rw [h1, hR]
+      | none =>
+        have hR : internRawNode tbl node' =
+            (tbl.nodes.length, { nodes := tbl.nodes ++ [node'] }) := by
+          unfold internRawNode
+          rw [hRaw]
+        rw [hR]
+        by_cases hEq : node' = .op2 op a b
+        · subst hEq
+          have hSelf := findNodeIdxAux_append_self (.op2 op a b) tbl.nodes 0 hFind
+          unfold internOp2
+          dsimp only
+          rw [show findNodeIdx (tbl.nodes ++ [SymNode.op2 op a b]) (.op2 op a b) =
+            some tbl.nodes.length from by
+              unfold findNodeIdx
+              rw [hSelf, Nat.zero_add]]
+        · have hNone := findNodeIdxAux_append_none (.op2 op a b) node' hEq tbl.nodes 0 hFind
+          unfold internOp2
+          dsimp only
+          rw [show findNodeIdx (tbl.nodes ++ [node']) (.op2 op a b) = none from hNone, hP]
+          have hD := (internRawNode_dedup tbl node').1
+          rw [hR] at hD
+          exact hD
+
+theorem internNode_dedup (tbl : SymTable) (node : SymNode) :
+    let res₁ := internNode tbl node
+    internNode res₁.2 node = res₁ ∧
+      (internNode res₁.2 node).2.nodes.length = res₁.2.nodes.length := by
+  dsimp
+  cases node with
+  | ite c t e =>
+    cases hEq : (t == e) with
+    | true =>
+      have hStep : internNode tbl (.ite c t e) = (t, tbl) := by
+        dsimp [internNode]
+        rw [hEq]
+        rfl
+      rw [hStep]
+      dsimp
+      rw [hStep]
+      exact ⟨rfl, rfl⟩
+    | false =>
+      have hStep₁ : internNode tbl (.ite c t e) = internRawNode tbl (.ite c t e) := by
+        dsimp [internNode]
+        rw [hEq]
+        rfl
+      have hStep₂ : internNode (internRawNode tbl (.ite c t e)).2 (.ite c t e) =
+          internRawNode (internRawNode tbl (.ite c t e)).2 (.ite c t e) := by
+        dsimp [internNode]
+        rw [hEq]
+        rfl
+      rw [hStep₁, hStep₂]
+      exact internRawNode_dedup tbl (.ite c t e)
+  | op1 op a =>
+    cases op <;> dsimp [internNode]
+    · exact ⟨rfl, rfl⟩
+    · exact internRawNode_dedup tbl (.op1 .boolNot a)
+    · exact internRawNode_dedup tbl (.op1 .wrappingNeg64 a)
+    · exact internRawNode_dedup tbl (.op1 .maskLow32 a)
+    · rename_i mask
+      cases hZero : (mask == 0) with
+      | true => exact ⟨rfl, rfl⟩
+      | false => exact internRawNode_dedup tbl (.op1 (.xorConst mask) a)
+    · rename_i delta
+      cases hZero : (delta == 0) with
+      | true => exact ⟨rfl, rfl⟩
+      | false => exact internRawNode_dedup tbl (.op1 (.addConst delta) a)
+  | const v => exact internRawNode_dedup tbl (.const v)
+  | var idx => exact internRawNode_dedup tbl (.var idx)
+  | op2 op a b =>
+    exact ⟨internOp2_dedup tbl op a b,
+      congrArg (fun r => r.2.nodes.length) (internOp2_dedup tbl op a b)⟩
+
+theorem internRawNode_tbl_of_mem {tbl : SymTable} {node : SymNode} {i : Nat}
+    (hAt : tbl.nodes[i]? = some node) : (internRawNode tbl node).2 = tbl := by
+  rcases findNodeIdx_complete hAt with ⟨idx, hFind⟩
+  dsimp only [internRawNode]
+  rw [hFind]
+
+theorem internOp2_tbl_of_mem {tbl : SymTable} {op : SymOp2} {a b : SymId} {i : Nat}
+    (hAt : tbl.nodes[i]? = some (.op2 op a b)) : (internOp2 tbl op a b).2 = tbl := by
+  rcases findNodeIdx_complete hAt with ⟨idx, hFind⟩
+  unfold internOp2
+  rw [hFind]
+
+theorem internNode_tbl_of_mem {tbl : SymTable} {node : SymNode} {i : Nat}
+    (hAt : tbl.nodes[i]? = some node) : (internNode tbl node).2 = tbl := by
+  unfold internNode
+  cases node with
+  | ite c t e =>
+    dsimp only
+    split
+    · rfl
+    · exact internRawNode_tbl_of_mem hAt
+  | op1 op a =>
+    cases op <;> dsimp only <;>
+      first | rfl | exact internRawNode_tbl_of_mem hAt |
+        (split <;> first | rfl | exact internRawNode_tbl_of_mem hAt)
+  | const v => exact internRawNode_tbl_of_mem hAt
+  | var idx => exact internRawNode_tbl_of_mem hAt
+  | op2 op a b => exact internOp2_tbl_of_mem hAt
+
+/-- **Strong GVN Deduplication (`internNode_dedup_existing`)**: interning ANY node that already
+    occurs anywhere in a valid table (not just the most recently interned one) leaves the
+    table — hence `tbl.nodes.length` — unchanged and returns a `SymId` that denotes the same
+    value as the existing occurrence under every `env`. -/
+theorem internNode_dedup_existing {tbl : SymTable} {node : SymNode} {i : Nat}
+    (hValid : ValidTable tbl) (hAt : tbl.nodes[i]? = some node) :
+    (internNode tbl node).2 = tbl ∧
+      ∀ env, evalSymId tbl env (internNode tbl node).1 = evalSymId tbl env i := by
+  have hLt : i < tbl.nodes.length := by
+    cases h : decide (i < tbl.nodes.length) with
+    | true => exact of_decide_eq_true h
+    | false =>
+      rw [List.getElem?_eq_none (Nat.le_of_not_lt (of_decide_eq_false h))] at hAt
+      cases hAt
+  have hNode : ValidNode tbl.nodes.length node := (hValid i node hAt).mono (Nat.le_of_lt hLt)
+  have hTbl := internNode_tbl_of_mem hAt
+  refine ⟨hTbl, fun env => ?_⟩
+  have h1 := internNode_eval hValid hNode env
+  dsimp only at h1
+  rw [hTbl] at h1
+  rw [h1, evalSymId_eq_evalSymNodeWith hValid env hAt]
+
+/-- Six interning steps over `[x₀, x₁]` exercising every peephole class. -/
+def peepholeDemo : List SymId × SymTable :=
+  let t₀ : SymTable := { nodes := [.var 0, .var 1] }
+  let r₁ := internNode t₀ (.op2 .add 1 0)
+  let r₂ := internNode r₁.2 (.op2 .add 0 1)
+  let r₃ := internNode r₂.2 (.op2 .bitXor 0 0)
+  let r₄ := internNode r₃.2 (.op2 .sub 0 0)
+  let r₅ := internNode r₄.2 (.op2 .bitAnd 1 1)
+  let r₆ := internNode r₅.2 (.op2 .eq 0 0)
+  ([r₁.1, r₂.1, r₃.1, r₄.1, r₅.1, r₆.1], r₆.2)
+
+/-- **Peephole GVN Witness (`peepholeOp2_witness`)**: `x₁ + x₀` and `x₀ + x₁` share one
+    `SymId` (canonical commutative order); `x₀ ^ x₀` and `x₀ - x₀` fold to one shared constant
+    `0`; `x₁ & x₁` folds to `x₁` without allocating; `x₀ == x₀` folds to the constant `1`. -/
+theorem peepholeOp2_witness :
+    peepholeDemo = ([2, 2, 3, 3, 1, 4],
+      { nodes := [.var 0, .var 1, .op2 .add 0 1, .const 0, .const 1] }) := by
+  decide +kernel
+
+/-- Key structural freshness lemma: in any `ValidTable tbl`, every existing node at
+    `idx < tbl.nodes.length` satisfies `ValidNode (tbl.nodes.length - 1) node`.
+    Therefore, any node that references the newest `SymId` (`last = tbl.nodes.length - 1`)
+    cannot already appear anywhere in `tbl.nodes`! -/
+theorem findNodeIdx_eq_none_of_not_valid_last {tbl : SymTable} {node : SymNode}
+    (hValid : ValidTable tbl)
+    (hNotValid : ¬ ValidNode (tbl.nodes.length - 1) node) :
+    findNodeIdx tbl.nodes node = none := by
+  cases hFind : findNodeIdx tbl.nodes node with
+  | none => rfl
+  | some idx =>
+    have hSpec := findNodeIdx_spec hFind
+    have hNodeValid : ValidNode idx node := hValid idx node hSpec.2
+    have hLe : idx ≤ tbl.nodes.length - 1 := by omega
+    exact False.elim (hNotValid (hNodeValid.mono hLe))
+
+/-!
+### 1.1 $k$-Step Diamond Expression Scaling (`2 * k + 1` DAG Nodes vs. `4 * 2^k - 3` Tree Nodes)
+-/
+
+/-- Naive unshared symbolic expression AST produced by direct substitution without GVN. -/
+inductive ExprTree where
+  | const (val : Nat)
+  | var (inputIdx : Nat)
+  | op1 (op : SymOp1) (arg : ExprTree)
+  | op2 (op : SymOp2) (lhs rhs : ExprTree)
+  | ite (cond thenBr elseBr : ExprTree)
+  deriving DecidableEq
+
+/-- Concrete evaluation of a `ExprTree`. -/
+def ExprTree.eval (env : SymEnv) : ExprTree → Nat
+  | .const v => wrap64 v
+  | .var idx => wrap64 (env idx)
+  | .op1 op a => evalSymOp1 op (a.eval env)
+  | .op2 op a b => evalSymOp2 op (a.eval env) (b.eval env)
+  | .ite c t e => if c.eval env != 0 then t.eval env else e.eval env
+
+/-- Total AST node count of a `ExprTree`. -/
+def ExprTree.nodeCount : ExprTree → Nat
+  | .const _ => 1
+  | .var _ => 1
+  | .op1 _ a => 1 + a.nodeCount
+  | .op2 _ a b => 1 + a.nodeCount + b.nodeCount
+  | .ite c t e => 1 + c.nodeCount + t.nodeCount + e.nodeCount
+
+/-- Build the $k$-step diamond expression `x_{i+1} = add(xor(x_i, i+1), xor(x_i, i+1))`
+    by naive tree substitution (`ExprTree`), duplicating `x_i` across both arms at each step. -/
+def buildDiamondTree : Nat → ExprTree
+  | 0 => .var 0
+  | i + 1 =>
+    let prev := buildDiamondTree i
+    let br := ExprTree.op1 (.xorConst (i + 1)) prev
+    ExprTree.op2 .add br br
+
+/-- Build the exact same $k$-step diamond expression via `SymTable` GVN (`internNode`),
+    where both branches of diamond `i + 1` intern `.op1 (.xorConst (i + 1)) prevId` and
+    join via `.op2 .add leftId rightId`. -/
+def buildDiamondGvn : Nat → Nat × SymTable
+  | 0 => (0, { nodes := [.var 0] })
+  | i + 1 =>
+    let (prevId, tbl₀) := buildDiamondGvn i
+    let xorNode := SymNode.op1 (.xorConst (i + 1)) prevId
+    let (leftId, tbl₁) := internNode tbl₀ xorNode
+    let (rightId, tbl₂) := internNode tbl₁ xorNode
+    internNode tbl₂ (.op2 .add leftId rightId)
+
+/-- Exponential $O(2^k)$ node blowup of naive tree substitution:
+    `(buildDiamondTree k).nodeCount + 3 = 4 * 2^k`. -/
+theorem buildDiamondTree_nodeCount (k : Nat) :
+    (buildDiamondTree k).nodeCount + 3 = 4 * (2 ^ k) := by
+  induction k with
+  | zero => rfl
+  | succ i ih =>
+    dsimp [buildDiamondTree, ExprTree.nodeCount]
+    rw [Nat.pow_succ]
+    omega
+
+/-- **Universal $k$-Step Diamond GVN Theorem (`buildDiamondGvn_spec`)**:
+    For every `k : Nat`, `buildDiamondGvn k` produces a valid `SymTable` with:
+    1. Root `SymId = 2 * k`,
+    2. Exact linear table size `2 * k + 1` (vs. `4 * 2^k - 3` for `buildDiamondTree k`), and
+    3. Identical concrete evaluation `evalSymId tbl env rootId = (buildDiamondTree k).eval env`
+       for all input environments `env : SymEnv`. -/
+theorem buildDiamondGvn_spec (k : Nat) :
+    let (rootId, tbl) := buildDiamondGvn k
+    ValidTable tbl ∧
+      rootId = 2 * k ∧
+      tbl.nodes.length = 2 * k + 1 ∧
+      ∀ env : SymEnv, evalSymId tbl env rootId = (buildDiamondTree k).eval env := by
+  induction k with
+  | zero =>
+    refine ⟨?_, rfl, rfl, fun _ => rfl⟩
+    intro idx node hGet
+    cases idx with
+    | zero =>
+      dsimp [buildDiamondGvn] at hGet
+      injection hGet with hEq
+      subst hEq
+      trivial
+    | succ k' =>
+      dsimp [buildDiamondGvn] at hGet
+      cases hGet
+  | succ i ih =>
+    rcases hPrev : buildDiamondGvn i with ⟨prevId, tbl₀⟩
+    rw [hPrev] at ih
+    rcases ih with ⟨hValid₀, hPrevId, hLen₀, hEval₀⟩
+    dsimp [buildDiamondGvn]
+    rw [hPrev]
+    dsimp
+    let xorNode := SymNode.op1 (.xorConst (i + 1)) prevId
+    have hXorValid₀ : ValidNode tbl₀.nodes.length xorNode := by
+      dsimp [ValidNode, xorNode]
+      omega
+    have hXorNotValidLast : ¬ ValidNode (tbl₀.nodes.length - 1) xorNode := by
+      dsimp [ValidNode, xorNode]
+      intro hContra
+      omega
+    have hFindXor : findNodeIdx tbl₀.nodes xorNode = none :=
+      findNodeIdx_eq_none_of_not_valid_last hValid₀ hXorNotValidLast
+    have hStep₁ : internNode tbl₀ xorNode = (tbl₀.nodes.length, { nodes := tbl₀.nodes ++ [xorNode] }) := by
+      dsimp [internNode, xorNode, internRawNode]
+      rw [hFindXor]
+    have hDedup := (internNode_dedup tbl₀ xorNode).1
+    have hValid₁ : ValidTable (internNode tbl₀ xorNode).2 :=
+      (internNode_valid hValid₀ hXorValid₀).1
+    have hEval₁ : ∀ env, evalSymId (internNode tbl₀ xorNode).2 env (internNode tbl₀ xorNode).1 =
+        evalSymOp1 (.xorConst (i + 1)) (evalSymId tbl₀ env prevId) := by
+      intro env
+      exact internNode_eval hValid₀ hXorValid₀ env
+    rw [hDedup]
+    rw [hStep₁] at hValid₁ hEval₁ ⊢
+    dsimp at hValid₁ hEval₁ ⊢
+    let leftId := tbl₀.nodes.length
+    let tbl₁ : SymTable := { nodes := tbl₀.nodes ++ [xorNode] }
+    have hLen₁ : tbl₁.nodes.length = 2 * i + 2 := by
+      dsimp [tbl₁]
+      rw [List.length_append, hLen₀]
+      rfl
+    let addNode := SymNode.op2 .add leftId leftId
+    have hAddValid₁ : ValidNode tbl₁.nodes.length addNode := by
+      dsimp [ValidNode, addNode, leftId]
+      exact ⟨by omega, by omega⟩
+    have hAddNotValidLast : ¬ ValidNode (tbl₁.nodes.length - 1) addNode := by
+      dsimp [ValidNode, addNode, leftId]
+      intro hContra
+      have hContra₁ := hContra.1
+      omega
+    have hFindAdd : findNodeIdx tbl₁.nodes addNode = none :=
+      findNodeIdx_eq_none_of_not_valid_last hValid₁ hAddNotValidLast
+    have hStep₃ : internNode tbl₁ addNode = (tbl₁.nodes.length, { nodes := tbl₁.nodes ++ [addNode] }) := by
+      show internOp2 tbl₁ .add leftId leftId = _
+      unfold internOp2
+      rw [hFindAdd]
+      dsimp only [peepholeOp2]
+      rw [ite_eq_left (rfl : leftId = leftId)]
+      dsimp only
+      unfold internRawNode
+      rw [hFindAdd]
+    have hValid₃ : ValidTable (internNode tbl₁ addNode).2 :=
+      (internNode_valid hValid₁ hAddValid₁).1
+    have hEval₃ : ∀ env, evalSymId (internNode tbl₁ addNode).2 env (internNode tbl₁ addNode).1 =
+        evalSymOp2 .add (evalSymId tbl₁ env leftId) (evalSymId tbl₁ env leftId) := by
+      intro env
+      exact internNode_eval hValid₁ hAddValid₁ env
+    rw [hStep₃] at hValid₃ hEval₃ ⊢
+    dsimp at hValid₃ hEval₃ ⊢
+    refine ⟨hValid₃, by omega, ?_, ?_⟩
+    · rw [List.length_append, hLen₁]
+      dsimp
+      omega
+    · intro env
+      rw [hEval₃ env]
+      rw [hEval₁ env]
+      rw [hEval₀ env]
+      rfl
+
+/-- Concrete non-vacuity witness for `k = 6` diamond steps:
+    `SymTable` GVN uses `13` nodes (`2 * 6 + 1`) whereas `ExprTree` uses `253` nodes
+    (`4 * 2^6 - 3`), and both evaluate to the exact same value on input `x₀ = 42`. -/
+theorem diamond6_gvn_vs_tree_witness :
+    (buildDiamondGvn 6).2.nodes.length = 13 ∧
+      (buildDiamondTree 6).nodeCount = 253 ∧
+      evalSymId (buildDiamondGvn 6).2 (fun _ => 42) (buildDiamondGvn 6).1 =
+        (buildDiamondTree 6).eval (fun _ => 42) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- GVN-intern a naive `ExprTree` into `tbl` bottom-up (hash-consing every subtree). -/
+def internTree : SymTable → ExprTree → SymId × SymTable
+  | tbl, .const v => internNode tbl (.const v)
+  | tbl, .var i => internNode tbl (.var i)
+  | tbl, .op1 op a =>
+    match internTree tbl a with
+    | (ia, t₁) => internNode t₁ (.op1 op ia)
+  | tbl, .op2 op a b =>
+    match internTree tbl a with
+    | (ia, t₁) =>
+      match internTree t₁ b with
+      | (ib, t₂) => internNode t₂ (.op2 op ia ib)
+  | tbl, .ite c t e =>
+    match internTree tbl c with
+    | (ic, t₁) =>
+      match internTree t₁ t with
+      | (it, t₂) =>
+        match internTree t₂ e with
+        | (ie, t₃) => internNode t₃ (.ite ic it ie)
+
+theorem internNode_spec {tbl : SymTable} {node : SymNode} (hValid : ValidTable tbl)
+    (hNode : ValidNode tbl.nodes.length node) :
+    ValidTable (internNode tbl node).2 ∧ tbl.Extends (internNode tbl node).2 ∧
+      (internNode tbl node).1 < (internNode tbl node).2.nodes.length ∧
+      ∀ env, evalSymId (internNode tbl node).2 env (internNode tbl node).1 =
+        evalSymNodeWith (evalSymId tbl env) env node :=
+  ⟨(internNode_valid hValid hNode).1, internNode_extends tbl node,
+    (internNode_valid hValid hNode).2, fun env => internNode_eval hValid hNode env⟩
+
+/-- **Tree Interning Soundness (`internTree_spec`)**: GVN-interning ANY `ExprTree` preserves
+    `ValidTable`, only extends the table, and yields a `SymId` denoting exactly the tree. -/
+theorem internTree_spec : ∀ (t : ExprTree) (tbl : SymTable), ValidTable tbl →
+    ValidTable (internTree tbl t).2 ∧ tbl.Extends (internTree tbl t).2 ∧
+      (internTree tbl t).1 < (internTree tbl t).2.nodes.length ∧
+      ∀ env, evalSymId (internTree tbl t).2 env (internTree tbl t).1 = t.eval env
+  | .const v, tbl, hValid => by
+    rcases internNode_spec (node := .const v) hValid trivial with ⟨h1, h2, h3, h4⟩
+    exact ⟨h1, h2, h3, fun env => h4 env⟩
+  | .var i, tbl, hValid => by
+    rcases internNode_spec (node := .var i) hValid trivial with ⟨h1, h2, h3, h4⟩
+    exact ⟨h1, h2, h3, fun env => h4 env⟩
+  | .op1 op a, tbl, hValid => by
+    rcases internTree_spec a tbl hValid with ⟨hV₁, hE₁, hLt₁, hEv₁⟩
+    rcases hA : internTree tbl a with ⟨ia, t₁⟩
+    rw [hA] at hV₁ hE₁ hLt₁ hEv₁
+    rcases internNode_spec (node := .op1 op ia) hV₁ hLt₁ with ⟨h1, h2, h3, h4⟩
+    simp only [internTree, hA]
+    refine ⟨h1, hE₁.trans h2, h3, fun env => ?_⟩
+    rw [h4 env]
+    simp only [evalSymNodeWith, ExprTree.eval, hEv₁ env]
+  | .op2 op a b, tbl, hValid => by
+    rcases internTree_spec a tbl hValid with ⟨hV₁, hE₁, hLt₁, hEv₁⟩
+    rcases hA : internTree tbl a with ⟨ia, t₁⟩
+    rw [hA] at hV₁ hE₁ hLt₁ hEv₁
+    rcases internTree_spec b t₁ hV₁ with ⟨hV₂, hE₂, hLt₂, hEv₂⟩
+    rcases hB : internTree t₁ b with ⟨ib, t₂⟩
+    rw [hB] at hV₂ hE₂ hLt₂ hEv₂
+    have hIa : ia < t₂.nodes.length := Nat.lt_of_lt_of_le hLt₁ hE₂.length_le
+    rcases internNode_spec (node := .op2 op ia ib) hV₂ ⟨hIa, hLt₂⟩ with ⟨h1, h2, h3, h4⟩
+    simp only [internTree, hA, hB]
+    refine ⟨h1, (hE₁.trans hE₂).trans h2, h3, fun env => ?_⟩
+    rw [h4 env]
+    simp only [evalSymNodeWith, ExprTree.eval]
+    rw [← evalSymId_mono hV₁ hE₂ env hLt₁, hEv₁ env, hEv₂ env]
+  | .ite c t e, tbl, hValid => by
+    rcases internTree_spec c tbl hValid with ⟨hV₁, hE₁, hLt₁, hEv₁⟩
+    rcases hC : internTree tbl c with ⟨ic, t₁⟩
+    rw [hC] at hV₁ hE₁ hLt₁ hEv₁
+    rcases internTree_spec t t₁ hV₁ with ⟨hV₂, hE₂, hLt₂, hEv₂⟩
+    rcases hT : internTree t₁ t with ⟨it, t₂⟩
+    rw [hT] at hV₂ hE₂ hLt₂ hEv₂
+    rcases internTree_spec e t₂ hV₂ with ⟨hV₃, hE₃, hLt₃, hEv₃⟩
+    rcases hE : internTree t₂ e with ⟨ie, t₃⟩
+    rw [hE] at hV₃ hE₃ hLt₃ hEv₃
+    have hIc : ic < t₃.nodes.length :=
+      Nat.lt_of_lt_of_le hLt₁ (Nat.le_trans hE₂.length_le hE₃.length_le)
+    have hIt : it < t₃.nodes.length := Nat.lt_of_lt_of_le hLt₂ hE₃.length_le
+    rcases internNode_spec (node := .ite ic it ie) hV₃ ⟨hIc, hIt, hLt₃⟩ with ⟨h1, h2, h3, h4⟩
+    simp only [internTree, hC, hT, hE]
+    refine ⟨h1, ((hE₁.trans hE₂).trans hE₃).trans h2, h3, fun env => ?_⟩
+    rw [h4 env]
+    simp only [evalSymNodeWith, ExprTree.eval]
+    rw [← evalSymId_mono hV₁ (hE₂.trans hE₃) env hLt₁, ← evalSymId_mono hV₂ hE₃ env hLt₂,
+      hEv₁ env, hEv₂ env, hEv₃ env]
+
+/-!
+## Section 2 — Raw vs. Canonical MIR State (`CanonLocals` + Borrow-Dirtied Generations) & Spine Forcing
+-/
+
+/-- Local variable index in a MIR body. -/
+abbrev LocalId := Nat
+
+/-- Polymorphic MIR local slot parameterized by the payload type `Val` (`Nat` for
+    concrete values or `SymId` for symbolic GVN value references):
+    - `.dead gen`: storage is dead; `gen` is the next generation counter to assign.
+    - `.uninit gen`: storage is live (`StorageLive`), value not yet initialized.
+    - `.live val gen borrowed loanTarget`: holds initialized value `val` at generation
+      `gen`, where `borrowed == true` iff a reference (`Rvalue.ref` / `retagBorrow`) has
+      been taken to this incarnation, and `loanTarget` optionally tracks `(targetLocal,
+      expectedGen)` when this local itself holds a reference. -/
+inductive Slot (Val : Type) where
+  | dead (gen : Nat := 0)
+  | uninit (gen : Nat := 0)
+  | live (val : Val) (gen : Nat := 0) (borrowed : Bool := false)
+      (loanTarget : Option (LocalId × Nat) := none)
+  deriving DecidableEq
+
+/-- Extract the generation counter of a `Slot`. -/
+def Slot.gen {Val : Type} : Slot Val → Nat
+  | .dead g => g
+  | .uninit g => g
+  | .live _ g _ _ => g
+
+/-- Borrow-dirtied generation transition (`c19b8fce8`): ending or restarting a slot's
+    storage lifetime increments `gen` **if and only if** the current incarnation was
+    borrowed (`borrowed == true`). Unborrowed temporaries preserve `gen` unchanged! -/
+def Slot.nextGenOnEnd {Val : Type} : Slot Val → Nat
+  | .dead g => g
+  | .uninit g => g
+  | .live _ g false _ => g
+  | .live _ g true _ => g + 1
+
+/-- `StorageDead` transition on a single slot. -/
+def Slot.kill {Val : Type} (s : Slot Val) : Slot Val :=
+  .dead s.nextGenOnEnd
+
+/-- `StorageLive` transition on a single slot. -/
+def Slot.reborn {Val : Type} (s : Slot Val) : Slot Val :=
+  .uninit s.nextGenOnEnd
+
+/-- Assign a scalar/symbolic value `v` (with optional loan metadata) into a slot,
+    preserving its current `gen` and `borrowed` flag if already live. -/
+def Slot.writeVal {Val : Type} (s : Slot Val) (v : Val)
+    (loanTarget : Option (LocalId × Nat) := none) : Slot Val :=
+  match s with
+  | .live _ g b _ => .live v g b loanTarget
+  | .uninit g | .dead g => .live v g false loanTarget
+
+/-- Universal temporal safety lemma: killing or rebirthing a borrowed slot
+    (`.live v g true loan`) strictly advances its generation to `g + 1`. -/
+theorem Slot.kill_or_reborn_borrowed_bumps_gen {Val : Type} (v : Val) (g : Nat)
+    (loan : Option (LocalId × Nat)) :
+    (Slot.live v g true loan).kill.gen = g + 1 ∧
+      (Slot.live v g true loan).reborn.gen = g + 1 :=
+  ⟨rfl, rfl⟩
+
+/-- Universal unborrowed temporary round-trip identity: `StorageLive -> Assign ->
+    StorageDead` on any unborrowed `.dead g` slot returns to `.dead g` by `rfl`. -/
+theorem Slot.unborrowed_roundtrip_rfl {Val : Type} (v : Val) (g : Nat) :
+    (((Slot.dead g).reborn).writeVal v none).kill = Slot.dead g :=
+  rfl
+
+/-- `Slot.kill` is idempotent on all slots. -/
+theorem Slot.kill_idempotent {Val : Type} (s : Slot Val) :
+    s.kill.kill = s.kill := by
+  cases s with
+  | dead g => rfl
+  | uninit g => rfl
+  | live v g b loan =>
+    cases b <;> rfl
+
+/-- Normalize a slot against a join-point liveness bit `isLive`: live locals keep their
+    slot unchanged; dead locals (`isLive = false`) are killed via `Slot.kill` (which
+    preserves their borrow-dirtied generation counter while pruning dead values). -/
+def normalizeSlotForMask {Val : Type} (isLive : Bool) (s : Slot Val) : Slot Val :=
+  if isLive then s else s.kill
+
+theorem normalizeSlotForMask_idempotent {Val : Type} (isLive : Bool) (s : Slot Val) :
+    normalizeSlotForMask isLive (normalizeSlotForMask isLive s) =
+      normalizeSlotForMask isLive s := by
+  cases isLive with
+  | true => rfl
+  | false => exact Slot.kill_idempotent s
+
+/-- History-dependent `RawState`: models an uncanonicalized association-list write log
+    where out-of-order updates and branch-local `StorageLive`/`StorageDead` events
+    leave path-dependent history in `writeLog`. -/
+structure RawState (Val : Type) where
+  numLocals : Nat
+  writeLog : List (LocalId × Slot Val) := []
+  deriving DecidableEq
+
+/-- Look up the most recent slot for `loc` in a `RawState` write log. -/
+def RawState.getSlot {Val : Type} (st : RawState Val) (loc : LocalId) : Slot Val :=
+  match st.writeLog.find? (fun entry => entry.1 == loc) with
+  | some (_, s) => s
+  | none => .dead 0
+
+def RawState.putSlot {Val : Type} (st : RawState Val) (loc : LocalId) (s : Slot Val) : RawState Val :=
+  { st with writeLog := (loc, s) :: st.writeLog }
+
+def RawState.storageLive {Val : Type} (st : RawState Val) (loc : LocalId) : RawState Val :=
+  st.putSlot loc (st.getSlot loc).reborn
+
+def RawState.storageDead {Val : Type} (st : RawState Val) (loc : LocalId) : RawState Val :=
+  st.putSlot loc (st.getSlot loc).kill
+
+def RawState.assign {Val : Type} (st : RawState Val) (loc : LocalId) (v : Val) : RawState Val :=
+  st.putSlot loc ((st.getSlot loc).writeVal v none)
+
+/-- Write-log well-formedness: every logged write targets an in-bounds local `< numLocals`. -/
+def RawWriteLogWF {Val : Type} : Nat → List (LocalId × Slot Val) → Prop
+  | _, [] => True
+  | n, (loc, _) :: rest => loc < n ∧ RawWriteLogWF n rest
+
+/-- A `RawState` is well-formed (`RawState.WF`) when all entries in `writeLog` satisfy
+    `loc < st.numLocals`. -/
+def RawState.WF {Val : Type} (st : RawState Val) : Prop :=
+  RawWriteLogWF st.numLocals st.writeLog
+
+theorem RawState.putSlot_wf {Val : Type} {st : RawState Val} {loc : LocalId} {s : Slot Val}
+    (hWF : st.WF) (hLt : loc < st.numLocals) : (st.putSlot loc s).WF :=
+  ⟨hLt, hWF⟩
+
+theorem RawState.storageLive_wf {Val : Type} {st : RawState Val} {loc : LocalId}
+    (hWF : st.WF) (hLt : loc < st.numLocals) : (st.storageLive loc).WF :=
+  ⟨hLt, hWF⟩
+
+theorem RawState.storageDead_wf {Val : Type} {st : RawState Val} {loc : LocalId}
+    (hWF : st.WF) (hLt : loc < st.numLocals) : (st.storageDead loc).WF :=
+  ⟨hLt, hWF⟩
+
+theorem RawState.assign_wf {Val : Type} {st : RawState Val} {loc : LocalId} {v : Val}
+    (hWF : st.WF) (hLt : loc < st.numLocals) : (st.assign loc v).WF :=
+  ⟨hLt, hWF⟩
+
+theorem find?_eq_none_of_rawWriteLogWF {Val : Type} (n loc : Nat) (hGe : n ≤ loc) :
+    ∀ (log : List (LocalId × Slot Val)),
+      RawWriteLogWF n log →
+      log.find? (fun entry => entry.1 == loc) = none
+  | [], _ => rfl
+  | (l, _) :: rest, ⟨hLt, hRest⟩ => by
+    have hNe : (l == loc) = false :=
+      beq_eq_false_iff_ne.2 (Nat.ne_of_lt (Nat.lt_of_lt_of_le hLt hGe))
+    dsimp [List.find?]
+    rw [hNe]
+    exact find?_eq_none_of_rawWriteLogWF n loc hGe rest hRest
+
+/-- Any well-formed `RawState` returns `.dead 0` for every out-of-bounds local `loc ≥ numLocals`. -/
+theorem RawState.getSlot_of_ge_numLocals {Val : Type} {st : RawState Val} {loc : LocalId}
+    (hWF : st.WF) (hGe : st.numLocals ≤ loc) :
+    st.getSlot loc = .dead 0 := by
+  dsimp [RawState.getSlot]
+  rw [find?_eq_none_of_rawWriteLogWF st.numLocals loc hGe st.writeLog hWF]
+
+/-- Canonical MIR local state (`CanonState` / `CanonLocals`): a dense, strictly index-ordered
+    list of `Slot Val` entries (where index `i` is local `i`) with dead locals pruned to
+    `.dead gen`. -/
+structure CanonState (Val : Type) where
+  slots : List (Slot Val)
+  deriving DecidableEq
+
+/-- Canonical MIR local store alias (`CanonLocals`). -/
+abbrev CanonLocals (Val : Type) := CanonState Val
+
+/-- Spine-preserving list update at index `idx`. -/
+def setSlotAt {Val : Type} : List (Slot Val) → Nat → Slot Val → List (Slot Val)
+  | [], _, _ => []
+  | _ :: xs, 0, s => s :: xs
+  | x :: xs, i + 1, s => x :: setSlotAt xs i s
+
+/-- Total slot lookup in a canonical slot list. -/
+def getSlotAt {Val : Type} : List (Slot Val) → Nat → Slot Val
+  | [], _ => .dead 0
+  | x :: _, 0 => x
+  | _ :: xs, i + 1 => getSlotAt xs i
+
+def CanonState.getSlot {Val : Type} (st : CanonState Val) (loc : LocalId) : Slot Val :=
+  getSlotAt st.slots loc
+
+def CanonState.setSlot {Val : Type} (st : CanonState Val) (loc : LocalId) (s : Slot Val) :
+    CanonState Val :=
+  { slots := setSlotAt st.slots loc s }
+
+theorem getSlotAt_eq_getElem? {Val : Type} :
+    ∀ (slots : List (Slot Val)) (i : Nat),
+      i < slots.length →
+      slots[i]? = some (getSlotAt slots i)
+  | [], _, hlt => by simp at hlt
+  | x :: _, 0, _ => rfl
+  | _ :: xs, i + 1, hlt => by
+    dsimp [getSlotAt]
+    exact getSlotAt_eq_getElem? xs i (by dsimp at hlt; omega)
+
+/-- Build the canonical slot list for indices `offset .. offset + mask.length - 1`
+    from a slot lookup function `lookup`. -/
+def buildCanonSlotsAux {Val : Type} (lookup : LocalId → Slot Val) (offset : Nat) :
+    List Bool → List (Slot Val)
+  | [] => []
+  | isLive :: rest =>
+    normalizeSlotForMask isLive (lookup offset) ::
+      buildCanonSlotsAux lookup (offset + 1) rest
+
+/-- Canonicalize a `RawState` against a join-point `liveMask : List Bool`. -/
+def canonicalize {Val : Type} (liveMask : List Bool) (raw : RawState Val) : CanonState Val :=
+  { slots := buildCanonSlotsAux raw.getSlot 0 liveMask }
+
+/-- Re-canonicalize an already-canonical `CanonState` against `liveMask`. -/
+def canonicalizeCanon {Val : Type} (liveMask : List Bool) (st : CanonState Val) : CanonState Val :=
+  { slots := buildCanonSlotsAux st.getSlot 0 liveMask }
+
+/-- Live-restricted denotation of a `RawState` under `liveMask`. -/
+def denoteRaw {Val : Type} (liveMask : List Bool) (raw : RawState Val) (loc : LocalId) : Slot Val :=
+  match liveMask[loc]? with
+  | some isLive => normalizeSlotForMask isLive (raw.getSlot loc)
+  | none => .dead 0
+
+/-- Live-restricted denotation of a `CanonState` under `liveMask`. -/
+def denoteCanon {Val : Type} (liveMask : List Bool) (st : CanonState Val) (loc : LocalId) : Slot Val :=
+  match liveMask[loc]? with
+  | some isLive => normalizeSlotForMask isLive (st.getSlot loc)
+  | none => .dead 0
+
+/-- Two `RawState`s are live-equivalent at `liveMask` when every in-bounds local `i` has
+    (1) the **identical slot** (value, generation, borrow flag, loan) when `liveMask[i] = true`,
+    and (2) the **identical borrow-dirtied post-generation** `nextGenOnEnd` when
+    `liveMask[i] = false` — values, initialization status and write history of dead locals are
+    ignored. (Stated semantically, independently of `normalizeSlotForMask`/`canonicalize`.) -/
+def LiveEquiv {Val : Type} (liveMask : List Bool) (raw₁ raw₂ : RawState Val) : Prop :=
+  ∀ i isLive, liveMask[i]? = some isLive →
+    (isLive = true → raw₁.getSlot i = raw₂.getSlot i) ∧
+      (isLive = false → (raw₁.getSlot i).nextGenOnEnd = (raw₂.getSlot i).nextGenOnEnd)
+
+/-- Normalized slots agree iff they agree as live slots (live) or agree on their
+    borrow-dirtied post-generation (dead). -/
+theorem normalizeSlotForMask_eq_iff {Val : Type} (isLive : Bool) (s₁ s₂ : Slot Val) :
+    normalizeSlotForMask isLive s₁ = normalizeSlotForMask isLive s₂ ↔
+      ((isLive = true → s₁ = s₂) ∧
+        (isLive = false → s₁.nextGenOnEnd = s₂.nextGenOnEnd)) := by
+  cases isLive with
+  | true =>
+    constructor
+    · intro h
+      exact ⟨(fun _ => h), (fun h' => by cases h')⟩
+    · intro h
+      exact h.1 rfl
+  | false =>
+    constructor
+    · intro h
+      refine ⟨(fun h' => by cases h'), (fun _ => ?_)⟩
+      have h' : Slot.dead s₁.nextGenOnEnd = Slot.dead s₂.nextGenOnEnd := h
+      injection h'
+    · intro h
+      show Slot.dead s₁.nextGenOnEnd = Slot.dead s₂.nextGenOnEnd
+      rw [h.2 rfl]
+
+theorem buildCanonSlotsAux_length {Val : Type} (lookup : LocalId → Slot Val) :
+    ∀ (mask : List Bool) (offset : Nat),
+      (buildCanonSlotsAux lookup offset mask).length = mask.length
+  | [], _ => rfl
+  | _ :: rest, offset => by
+    dsimp [buildCanonSlotsAux]
+    rw [buildCanonSlotsAux_length lookup rest (offset + 1)]
+
+theorem getSlotAt_buildCanonSlotsAux {Val : Type} (lookup : LocalId → Slot Val) :
+    ∀ (mask : List Bool) (offset idx : Nat) (isLive : Bool),
+      mask[idx]? = some isLive →
+      getSlotAt (buildCanonSlotsAux lookup offset mask) idx =
+        normalizeSlotForMask isLive (lookup (offset + idx))
+  | [], _, _, _, h => by simp at h
+  | b :: rest, offset, 0, isLive, h => by
+    simp at h
+    subst h
+    rfl
+  | b :: rest, offset, idx + 1, isLive, h => by
+    simp at h
+    dsimp [buildCanonSlotsAux, getSlotAt]
+    rw [getSlotAt_buildCanonSlotsAux lookup rest (offset + 1) idx isLive h]
+    have hAdd : offset + 1 + idx = offset + (idx + 1) := by omega
+    rw [hAdd]
+
+theorem getSlot_canonicalize {Val : Type} (liveMask : List Bool) (raw : RawState Val)
+    {loc : LocalId} {isLive : Bool} (hMask : liveMask[loc]? = some isLive) :
+    (canonicalize liveMask raw).getSlot loc =
+      normalizeSlotForMask isLive (raw.getSlot loc) := by
+  dsimp [canonicalize, CanonState.getSlot]
+  rw [getSlotAt_buildCanonSlotsAux raw.getSlot liveMask 0 loc isLive hMask]
+  rw [Nat.zero_add]
+
+/-- **Canonical Denotation Soundness (`denoteCanon_canonicalize`)**:
+    Canonicalizing `raw` under `liveMask` preserves its exact live-restricted denotation
+    at every local variable `loc : LocalId`. -/
+theorem denoteCanon_canonicalize {Val : Type} (liveMask : List Bool) (raw : RawState Val)
+    (loc : LocalId) :
+    denoteCanon liveMask (canonicalize liveMask raw) loc =
+      denoteRaw liveMask raw loc := by
+  dsimp [denoteCanon, denoteRaw]
+  cases hMask : liveMask[loc]? with
+  | none => rfl
+  | some isLive =>
+    rw [getSlot_canonicalize liveMask raw hMask]
+    exact normalizeSlotForMask_idempotent isLive (raw.getSlot loc)
+
+theorem buildCanonSlotsAux_congr {Val : Type} (f₁ f₂ : LocalId → Slot Val) :
+    ∀ (mask : List Bool) (offset : Nat),
+      (∀ i isLive, mask[i]? = some isLive →
+        normalizeSlotForMask isLive (f₁ (offset + i)) =
+          normalizeSlotForMask isLive (f₂ (offset + i))) →
+      buildCanonSlotsAux f₁ offset mask = buildCanonSlotsAux f₂ offset mask
+  | [], _, _ => rfl
+  | isLive :: rest, offset, hEq => by
+    dsimp [buildCanonSlotsAux]
+    have hHead : normalizeSlotForMask isLive (f₁ offset) =
+        normalizeSlotForMask isLive (f₂ offset) := by
+      have h0 := hEq 0 isLive rfl
+      rw [Nat.add_zero] at h0
+      exact h0
+    rw [hHead]
+    congr 1
+    apply buildCanonSlotsAux_congr f₁ f₂ rest (offset + 1)
+    intro i b hRest
+    have hSucc := hEq (i + 1) b hRest
+    have hAdd : offset + 1 + i = offset + (i + 1) := by omega
+    rw [hAdd]
+    exact hSucc
+
+/-- **Canonicalization Idempotence (`canonicalize_idempotent`)**:
+    Re-canonicalizing an already-canonicalized state under `liveMask` is a no-op. -/
+theorem canonicalize_idempotent {Val : Type} (liveMask : List Bool) (raw : RawState Val) :
+    canonicalizeCanon liveMask (canonicalize liveMask raw) =
+      canonicalize liveMask raw := by
+  dsimp [canonicalizeCanon, canonicalize]
+  congr 1
+  apply buildCanonSlotsAux_congr _ raw.getSlot liveMask 0
+  intro i isLive hMask
+  rw [Nat.zero_add]
+  change normalizeSlotForMask isLive ((canonicalize liveMask raw).getSlot i) =
+    normalizeSlotForMask isLive (raw.getSlot i)
+  rw [getSlot_canonicalize liveMask raw hMask]
+  exact normalizeSlotForMask_idempotent isLive (raw.getSlot i)
+
+/-- **Canonical Completeness & Soundness (`canonicalize_eq_iff_live_equiv`)**:
+    Two `RawState`s canonicalize to the **exact same syntactic `CanonState`** if and only
+    if they are `LiveEquiv` under `liveMask`. -/
+theorem canonicalize_eq_of_live_equiv {Val : Type} {liveMask : List Bool}
+    {raw₁ raw₂ : RawState Val} (hEquiv : LiveEquiv liveMask raw₁ raw₂) :
+    canonicalize liveMask raw₁ = canonicalize liveMask raw₂ := by
+  dsimp [canonicalize]
+  congr 1
+  apply buildCanonSlotsAux_congr raw₁.getSlot raw₂.getSlot liveMask 0
+  intro i isLive hMask
+  rw [Nat.zero_add]
+  exact (normalizeSlotForMask_eq_iff isLive _ _).2 (hEquiv i isLive hMask)
+
+theorem live_equiv_of_canonicalize_eq {Val : Type} {liveMask : List Bool}
+    {raw₁ raw₂ : RawState Val}
+    (hEq : canonicalize liveMask raw₁ = canonicalize liveMask raw₂) :
+    LiveEquiv liveMask raw₁ raw₂ := by
+  intro i isLive hMask
+  refine (normalizeSlotForMask_eq_iff isLive _ _).1 ?_
+  have h1 := getSlot_canonicalize liveMask raw₁ hMask
+  have h2 := getSlot_canonicalize liveMask raw₂ hMask
+  rw [hEq] at h1
+  rw [← h1, ← h2]
+
+theorem canonicalize_eq_iff_live_equiv {Val : Type} (liveMask : List Bool)
+    (raw₁ raw₂ : RawState Val) :
+    canonicalize liveMask raw₁ = canonicalize liveMask raw₂ ↔
+      LiveEquiv liveMask raw₁ raw₂ :=
+  ⟨live_equiv_of_canonicalize_eq, canonicalize_eq_of_live_equiv⟩
+
+
+/-!
+### 2.1 Negative Theorem: Asymmetric Diamond Branches Defeat Raw State Syntactic Join
+-/
+
+/-- Initial raw state for a 3-local MIR body (`_0` return, `_1` live accum, `_2` branch-local temp):
+    `_0` and `_1` start `.live 10 0 false none`, `_2` starts `.dead 0`. -/
+def diamondRawInit : RawState Nat :=
+  ((({ numLocals := 3, writeLog := [] } : RawState Nat).assign 0 10).assign 1 20)
+
+/-- Left diamond branch: writes `_0 := 100`, then `_1 := 200`, and uses temporary `_2`
+    (`StorageLive(_2); _2 := 999; StorageDead(_2)`). -/
+def rawAfterLeft : RawState Nat :=
+  let st₁ := (diamondRawInit.assign 0 100).assign 1 200
+  (((st₁.storageLive 2).assign 2 999).storageDead 2)
+
+/-- Right diamond branch: writes `_1 := 200` first, then `_0 := 100`, without touching `_2`. -/
+def rawAfterRight : RawState Nat :=
+  (diamondRawInit.assign 1 200).assign 0 100
+
+/-- Join-point liveness mask at the diamond merge: `_0` and `_1` are live, `_2` is dead. -/
+def diamondLiveMask : List Bool := [true, true, false]
+
+/-- **Negative Theorem (`raw_asymmetric_diamond_Syntactic_ne_yet_canon_eq`)**:
+    Asymmetric `if/else` diamond branches (out-of-order writes to live locals `_0, _1`
+    plus a branch-local unborrowed temporary `_2` in the left branch) produce:
+    1. Syntactically **distinct** raw states (`rawAfterLeft ≠ rawAfterRight`), which
+       defeats any join cache or structural equality check on raw history-dependent states,
+    2. Yet **identical** live-restricted denotations (`denoteRaw diamondLiveMask rawAfterLeft =
+       denoteRaw diamondLiveMask rawAfterRight`), and
+    3. Syntactically **identical** canonical states (`canonicalize diamondLiveMask rawAfterLeft =
+       canonicalize diamondLiveMask rawAfterRight`)! -/
+theorem raw_asymmetric_diamond_syntactic_ne_yet_canon_eq :
+    rawAfterLeft ≠ rawAfterRight ∧
+      (∀ loc, denoteRaw diamondLiveMask rawAfterLeft loc =
+        denoteRaw diamondLiveMask rawAfterRight loc) ∧
+      canonicalize diamondLiveMask rawAfterLeft =
+        canonicalize diamondLiveMask rawAfterRight := by
+  refine ⟨by decide, ?_, rfl⟩
+  · intro loc
+    rw [← denoteCanon_canonicalize diamondLiveMask rawAfterLeft loc]
+    rw [← denoteCanon_canonicalize diamondLiveMask rawAfterRight loc]
+    rfl
+
+/-- Strengthened negative witness: the two raw states are **observationally identical on every
+    local** (including the dead temporary `_2` and all out-of-range locals) — the
+    `rawAfterLeft ≠ rawAfterRight` failure is purely syntactic write-history. -/
+theorem raw_asymmetric_diamond_pointwise_eq (loc : LocalId) :
+    rawAfterLeft.getSlot loc = rawAfterRight.getSlot loc := by
+  rcases loc with _ | _ | _ | n <;> rfl
+
+/-- All three diamond raw states (`diamondRawInit`, `rawAfterLeft`, `rawAfterRight`) satisfy
+    `RawState.WF` (`loc < numLocals = 3` for every entry in `writeLog`). -/
+theorem diamondRawStates_wf :
+    diamondRawInit.WF ∧ rawAfterLeft.WF ∧ rawAfterRight.WF := by
+  dsimp [diamondRawInit, rawAfterLeft, rawAfterRight, RawState.WF, RawWriteLogWF,
+    RawState.assign, RawState.storageLive, RawState.storageDead, RawState.putSlot]
+  repeat first | refine ⟨?_, ?_⟩ | decide | trivial
+
+
+/-!
+### 2.2 CPS Spine Forcing (`forceList`, `forceCanonState`)
+-/
+
+/-- Continuation-passing **spine** evaluator (`c19b8fce8` `forceList`): pattern-matches every
+    cons cell of the list before invoking continuation `k` on the reconstructed spine
+    (elements are passed through untouched; see `forceSlotsAux` for element forcing). -/
+def forceListAux {α β : Type} : List α → (List α → β) → β
+  | [], k => k []
+  | x :: xs, k =>
+    forceListAux xs (fun xs' => k (x :: xs'))
+
+def forceList {α : Type} (xs : List α) : List α :=
+  forceListAux xs (fun ys => ys)
+
+/-- CPS constructor forcing of a single slot: matches the slot's head constructor (and
+    re-binds its fields) before invoking `k`, so `k` never receives a pending slot thunk. -/
+def forceSlot {Val β : Type} (s : Slot Val) (k : Slot Val → β) : β :=
+  match s with
+  | .dead g => k (.dead g)
+  | .uninit g => k (.uninit g)
+  | .live v g b loan => k (.live v g b loan)
+
+/-- Spine **and element** CPS forcing of a slot list (`c19b8fce8` `forceLocals` analogue):
+    every cons cell and every slot's head constructor is matched before `k` runs on the
+    reconstructed list, so no `setSlotAt` / `buildCanonSlotsAux` redex survives into `k`. -/
+def forceSlotsAux {Val β : Type} : List (Slot Val) → (List (Slot Val) → β) → β
+  | [], k => k []
+  | s :: rest, k => forceSlot s (fun s' => forceSlotsAux rest (fun rest' => k (s' :: rest')))
+
+/-- Force the slot spine and every slot constructor of a `CanonState` before invoking `k`.
+    Applied by `symEvalCfgGvn` at every block boundary and by `mergeJoinStates` after every
+    join. (With closed `SymId` payloads the symbolic states never contain free variables, so
+    this is defence-in-depth against the `hasFVar` WHNF-cache bypass rather than a
+    load-bearing optimization in this prototype.) -/
+def forceCanonState {Val β : Type} (st : CanonState Val) (k : CanonState Val → β) : β :=
+  forceSlotsAux st.slots (fun slots' => k { slots := slots' })
+
+/-- **CPS Spine-Forcing Equivalence (`forceListAux_eq`)**:
+    `forceListAux xs k` is propositionally equal to `k xs` for every list `xs` and
+    continuation `k`. -/
+theorem forceListAux_eq {α β : Type} :
+    ∀ (xs : List α) (k : List α → β),
+      forceListAux xs k = k xs
+  | [], _ => rfl
+  | x :: xs, k => by
+    dsimp [forceListAux]
+    rw [forceListAux_eq xs (fun xs' => k (x :: xs'))]
+
+theorem forceList_eq {α : Type} (xs : List α) :
+    forceList xs = xs :=
+  forceListAux_eq xs (fun ys => ys)
+
+theorem forceSlot_eq {Val β : Type} (s : Slot Val) (k : Slot Val → β) :
+    forceSlot s k = k s := by
+  cases s <;> rfl
+
+theorem forceSlotsAux_eq {Val β : Type} :
+    ∀ (ss : List (Slot Val)) (k : List (Slot Val) → β), forceSlotsAux ss k = k ss
+  | [], _ => rfl
+  | s :: rest, k => by
+    dsimp only [forceSlotsAux]
+    rw [forceSlot_eq]
+    exact forceSlotsAux_eq rest (fun rest' => k (s :: rest'))
+
+theorem forceCanonState_eq {Val β : Type} (st : CanonState Val) (k : CanonState Val → β) :
+    forceCanonState st k = k st := by
+  dsimp [forceCanonState]
+  rw [forceSlotsAux_eq st.slots (fun slots' => k { slots := slots' })]
+
+
+/-!
+## Section 3 — Compositional Join-Point Cut (`mergeJoinStates`, `wpJoinBlock_sound`, `wpCfgSymGvn_sound`)
+-/
+
+/-- Evaluate a symbolic `Slot SymId` to a concrete `Slot Nat` under `tbl` and `env`. -/
+def evalSymSlot (tbl : SymTable) (env : SymEnv) : Slot SymId → Slot Nat
+  | .dead g => .dead g
+  | .uninit g => .uninit g
+  | .live symId g borrowed loan => .live (evalSymId tbl env symId) g borrowed loan
+
+/-- Evaluate a symbolic `CanonState SymId` to a concrete `CanonState Nat`. -/
+def evalSymCanonState (tbl : SymTable) (env : SymEnv) (st : CanonState SymId) : CanonState Nat :=
+  { slots := st.slots.map (evalSymSlot tbl env) }
+
+theorem getSlotAt_map_evalSymSlot (tbl : SymTable) (env : SymEnv) :
+    ∀ (slots : List (Slot SymId)) (loc : LocalId),
+      getSlotAt (slots.map (evalSymSlot tbl env)) loc =
+        evalSymSlot tbl env (getSlotAt slots loc)
+  | [], _ => rfl
+  | _ :: _, 0 => rfl
+  | _ :: xs, loc + 1 => getSlotAt_map_evalSymSlot tbl env xs loc
+
+theorem evalSymCanonState_getSlot (tbl : SymTable) (env : SymEnv)
+    (st : CanonState SymId) (loc : LocalId) :
+    (evalSymCanonState tbl env st).getSlot loc =
+      evalSymSlot tbl env (st.getSlot loc) :=
+  getSlotAt_map_evalSymSlot tbl env st.slots loc
+
+/-- Well-formedness of a symbolic `Slot SymId` at `SymTable` bound `bound`. -/
+def ValidSymSlot (bound : Nat) : Slot SymId → Prop
+  | .dead _ => True
+  | .uninit _ => True
+  | .live symId _ _ _ => symId < bound
+
+theorem ValidSymSlot.mono {b₁ b₂ : Nat} {s : Slot SymId}
+    (h : ValidSymSlot b₁ s) (hle : b₁ ≤ b₂) : ValidSymSlot b₂ s := by
+  cases s with
+  | dead _ => trivial
+  | uninit _ => trivial
+  | live symId _ _ _ => exact Nat.lt_of_lt_of_le h hle
+
+theorem evalSymSlot_mono {tbl₁ tbl₂ : SymTable} (hValid : ValidTable tbl₁)
+    (hExt : tbl₁.Extends tbl₂) (env : SymEnv) {s : Slot SymId}
+    (hSlot : ValidSymSlot tbl₁.nodes.length s) :
+    evalSymSlot tbl₁ env s = evalSymSlot tbl₂ env s := by
+  cases s with
+  | dead g => rfl
+  | uninit g => rfl
+  | live symId g b loan =>
+    dsimp [evalSymSlot]
+    rw [evalSymId_mono hValid hExt env hSlot]
+
+/-- Merge two canonical symbolic slots `(sT, sF)` under branch condition `condId` in `tbl`.
+    Returns `some (mergedSlot, tbl')` when the slot shapes/generations/loans agree at the
+    join point (the canonical live-pruned invariant), interning `.ite condId idT idF`
+    (which automatically folds `ite condId id id ↦ id` without allocating a node when
+    both branches hold the same `SymId`). -/
+def mergeJoinSlot (tbl : SymTable) (condId : Nat) (sT sF : Slot SymId) :
+    Option (Slot SymId × SymTable) :=
+  match sT, sF with
+  | .dead gT, .dead gF =>
+    if gT == gF then some (.dead gT, tbl) else none
+  | .uninit gT, .uninit gF =>
+    if gT == gF then some (.uninit gT, tbl) else none
+  | .live idT gT bT loanT, .live idF gF bF loanF =>
+    if gT == gF && bT == bF && decide (loanT = loanF) then
+      let (mergedId, tbl') := internNode tbl (.ite condId idT idF)
+      some (.live mergedId gT bT loanT, tbl')
+    else
+      none
+  | _, _ => none
+
+theorem mergeJoinSlot_spec {tbl : SymTable} {condId : Nat} {sT sF sM : Slot SymId}
+    {tbl' : SymTable}
+    (hValid : ValidTable tbl)
+    (hCond : condId < tbl.nodes.length)
+    (hValidT : ValidSymSlot tbl.nodes.length sT)
+    (hValidF : ValidSymSlot tbl.nodes.length sF)
+    (hMerge : mergeJoinSlot tbl condId sT sF = some (sM, tbl')) :
+    ValidTable tbl' ∧
+      tbl.Extends tbl' ∧
+      ValidSymSlot tbl'.nodes.length sM ∧
+      ∀ env : SymEnv,
+        evalSymSlot tbl' env sM =
+          (if evalSymId tbl env condId != 0 then
+            evalSymSlot tbl env sT
+          else
+            evalSymSlot tbl env sF) := by
+  cases sT with
+  | dead gT =>
+    cases sF with
+    | dead gF =>
+      dsimp [mergeJoinSlot] at hMerge
+      split at hMerge
+      · rename_i hEq
+        injection hMerge with hPair
+        injection hPair with hSM hTbl
+        subst hSM hTbl
+        have hg : gT = gF := of_decide_eq_true hEq
+        subst hg
+        refine ⟨hValid, SymTable.Extends.refl tbl, trivial, ?_⟩
+        intro env
+        cases (evalSymId tbl env condId != 0) <;> rfl
+      · cases hMerge
+    | uninit _ => cases hMerge
+    | live _ _ _ _ => cases hMerge
+  | uninit gT =>
+    cases sF with
+    | dead _ => cases hMerge
+    | uninit gF =>
+      dsimp [mergeJoinSlot] at hMerge
+      split at hMerge
+      · rename_i hEq
+        injection hMerge with hPair
+        injection hPair with hSM hTbl
+        subst hSM hTbl
+        have hg : gT = gF := of_decide_eq_true hEq
+        subst hg
+        refine ⟨hValid, SymTable.Extends.refl tbl, trivial, ?_⟩
+        intro env
+        cases (evalSymId tbl env condId != 0) <;> rfl
+      · cases hMerge
+    | live _ _ _ _ => cases hMerge
+  | live idT gT bT loanT =>
+    cases sF with
+    | dead _ => cases hMerge
+    | uninit _ => cases hMerge
+    | live idF gF bF loanF =>
+      dsimp [mergeJoinSlot] at hMerge
+      split at hMerge
+      · rename_i hEqAll
+        simp [Bool.and_eq_true] at hEqAll
+        rcases hEqAll with ⟨⟨hg, hb⟩, hloan⟩
+        subst hg hb hloan
+        injection hMerge with hPair
+        injection hPair with hSM hTbl
+        subst hSM hTbl
+        have hIteValid : ValidNode tbl.nodes.length (.ite condId idT idF) :=
+          ⟨hCond, hValidT, hValidF⟩
+        have hIntValid := internNode_valid hValid hIteValid
+        have hIntExt := internNode_extends tbl (.ite condId idT idF)
+        refine ⟨hIntValid.1, hIntExt, hIntValid.2, ?_⟩
+        intro env
+        dsimp [evalSymSlot]
+        have hIntEval := internNode_eval hValid hIteValid env
+        rw [hIntEval]
+        dsimp [evalSymNodeWith]
+        cases (evalSymId tbl env condId != 0) <;> rfl
+      · cases hMerge
+
+/-- Merge two lists of canonical symbolic slots pointwise in `tbl`. -/
+def mergeJoinSlots (tbl : SymTable) (condId : Nat) :
+    List (Slot SymId) → List (Slot SymId) → Option (List (Slot SymId) × SymTable)
+  | [], [] => some ([], tbl)
+  | sT :: restT, sF :: restF =>
+    match mergeJoinSlot tbl condId sT sF with
+    | none => none
+    | some (sM, tbl₁) =>
+      match mergeJoinSlots tbl₁ condId restT restF with
+      | none => none
+      | some (restM, tbl₂) => some (sM :: restM, tbl₂)
+  | _, _ => none
+
+/-- Merge two canonical symbolic states `(stT, stF)` under branch condition `condId`
+    and apply CPS spine forcing (`forceCanonState`) to the merged state. -/
+def mergeJoinStates (tbl : SymTable) (condId : Nat)
+    (stT stF : CanonState SymId) : Option (CanonState SymId × SymTable) :=
+  match mergeJoinSlots tbl condId stT.slots stF.slots with
+  | none => none
+  | some (slotsM, tbl') =>
+    forceCanonState { slots := slotsM } (fun forced => some (forced, tbl'))
+
+/-- Pointwise validity of a list of symbolic slots at `SymTable` bound `bound`. -/
+def ValidSymSlots (bound : Nat) : List (Slot SymId) → Prop
+  | [] => True
+  | s :: rest => ValidSymSlot bound s ∧ ValidSymSlots bound rest
+
+theorem ValidSymSlots.mono {b₁ b₂ : Nat} :
+    ∀ {slots : List (Slot SymId)}, ValidSymSlots b₁ slots → b₁ ≤ b₂ → ValidSymSlots b₂ slots
+  | [], _, _ => trivial
+  | _ :: _, ⟨hHead, hTail⟩, hle =>
+    ⟨hHead.mono hle, ValidSymSlots.mono hTail hle⟩
+
+theorem map_evalSymSlot_mono {tbl₁ tbl₂ : SymTable} (hValid : ValidTable tbl₁)
+    (hExt : tbl₁.Extends tbl₂) (env : SymEnv) :
+    ∀ {slots : List (Slot SymId)},
+      ValidSymSlots tbl₁.nodes.length slots →
+      slots.map (evalSymSlot tbl₁ env) = slots.map (evalSymSlot tbl₂ env)
+  | [], _ => rfl
+  | s :: rest, ⟨hHead, hTail⟩ => by
+    simp only [List.map_cons]
+    rw [evalSymSlot_mono hValid hExt env hHead]
+    rw [map_evalSymSlot_mono hValid hExt env hTail]
+
+/-- Well-formedness of a symbolic `CanonState SymId` at `SymTable` bound `bound`. -/
+def ValidSymCanonState (bound : Nat) (st : CanonState SymId) : Prop :=
+  ValidSymSlots bound st.slots
+
+theorem evalSymCanonState_mono {tbl₁ tbl₂ : SymTable} (hValid : ValidTable tbl₁)
+    (hExt : tbl₁.Extends tbl₂) (env : SymEnv) {st : CanonState SymId}
+    (hSt : ValidSymCanonState tbl₁.nodes.length st) :
+    evalSymCanonState tbl₁ env st = evalSymCanonState tbl₂ env st := by
+  dsimp [evalSymCanonState]
+  rw [map_evalSymSlot_mono hValid hExt env hSt]
+
+theorem mergeJoinSlots_spec {condId : Nat} :
+    ∀ (slotsT slotsF : List (Slot SymId)) (tbl : SymTable)
+      (slotsM : List (Slot SymId)) (tbl' : SymTable),
+      ValidTable tbl →
+      condId < tbl.nodes.length →
+      ValidSymSlots tbl.nodes.length slotsT →
+      ValidSymSlots tbl.nodes.length slotsF →
+      mergeJoinSlots tbl condId slotsT slotsF = some (slotsM, tbl') →
+      ValidTable tbl' ∧
+        tbl.Extends tbl' ∧
+        ValidSymSlots tbl'.nodes.length slotsM ∧
+        ∀ env : SymEnv,
+          slotsM.map (evalSymSlot tbl' env) =
+            (if evalSymId tbl env condId != 0 then
+              slotsT.map (evalSymSlot tbl env)
+            else
+              slotsF.map (evalSymSlot tbl env))
+  | [], [], tbl, slotsM, tbl', hValid, _, _, _, hMerge => by
+    injection hMerge with hPair
+    injection hPair with hS hT
+    subst hS hT
+    refine ⟨hValid, SymTable.Extends.refl tbl, trivial, ?_⟩
+    intro env
+    cases (evalSymId tbl env condId != 0) <;> rfl
+  | [], _ :: _, _, _, _, _, _, _, _, hMerge => by cases hMerge
+  | _ :: _, [], _, _, _, _, _, _, _, hMerge => by cases hMerge
+  | sT :: restT, sF :: restF, tbl, slotsM, tbl', hValid, hCond,
+    ⟨hHeadT, hTailT⟩, ⟨hHeadF, hTailF⟩, hMerge => by
+    dsimp [mergeJoinSlots] at hMerge
+    cases hStep₁ : mergeJoinSlot tbl condId sT sF with
+    | none =>
+      rw [hStep₁] at hMerge
+      cases hMerge
+    | some pair₁ =>
+      rcases pair₁ with ⟨sM, tbl₁⟩
+      rw [hStep₁] at hMerge
+      dsimp at hMerge
+      have hSpec₁ := mergeJoinSlot_spec hValid hCond hHeadT hHeadF hStep₁
+      rcases hSpec₁ with ⟨hValid₁, hExt₁, hValidSM, hEvalSM⟩
+      have hLenLe₁ : tbl.nodes.length ≤ tbl₁.nodes.length := hExt₁.length_le
+      have hCond₁ : condId < tbl₁.nodes.length := Nat.lt_of_lt_of_le hCond hLenLe₁
+      have hTailT₁ : ValidSymSlots tbl₁.nodes.length restT := hTailT.mono hLenLe₁
+      have hTailF₁ : ValidSymSlots tbl₁.nodes.length restF := hTailF.mono hLenLe₁
+      cases hStep₂ : mergeJoinSlots tbl₁ condId restT restF with
+      | none =>
+        rw [hStep₂] at hMerge
+        cases hMerge
+      | some pair₂ =>
+        rcases pair₂ with ⟨restM, tbl₂⟩
+        rw [hStep₂] at hMerge
+        dsimp at hMerge
+        injection hMerge with hPair
+        injection hPair with hSM hTbl
+        subst hSM hTbl
+        have hSpec₂ := mergeJoinSlots_spec restT restF tbl₁ restM tbl₂
+          hValid₁ hCond₁ hTailT₁ hTailF₁ hStep₂
+        rcases hSpec₂ with ⟨hValid₂, hExt₂, hValidRestM, hEvalRestM⟩
+        have hLenLe₂ : tbl₁.nodes.length ≤ tbl₂.nodes.length := hExt₂.length_le
+        refine ⟨hValid₂, hExt₁.trans hExt₂, ⟨hValidSM.mono hLenLe₂, hValidRestM⟩, ?_⟩
+        intro env
+        simp only [List.map_cons]
+        rw [← evalSymSlot_mono hValid₁ hExt₂ env hValidSM]
+        rw [hEvalSM env, hEvalRestM env]
+        rw [← evalSymId_mono hValid hExt₁ env hCond]
+        rw [← map_evalSymSlot_mono hValid hExt₁ env hTailT]
+        rw [← map_evalSymSlot_mono hValid hExt₁ env hTailF]
+        cases (evalSymId tbl env condId != 0) <;> rfl
+
+/-- **Compositional Join-Point Merge Theorem (`mergeJoinStates_eval`)**:
+    When two canonical symbolic post-states `(stT, stF)` merge under branch condition
+    `condId` in `tbl` via `mergeJoinStates tbl condId stT stF = some (stM, tbl')`,
+    `tbl'` is a valid monotone extension of `tbl` and evaluating the single merged
+    state `stM` in `tbl'` under any concrete `env` equals `evalSymCanonState tbl env stT`
+    when `evalSymId tbl env condId != 0` and `evalSymCanonState tbl env stF` otherwise! -/
+theorem mergeJoinStates_eval {tbl : SymTable} {condId : Nat}
+    {stT stF stM : CanonState SymId} {tbl' : SymTable}
+    (hValid : ValidTable tbl)
+    (hCond : condId < tbl.nodes.length)
+    (hValidT : ValidSymCanonState tbl.nodes.length stT)
+    (hValidF : ValidSymCanonState tbl.nodes.length stF)
+    (hMerge : mergeJoinStates tbl condId stT stF = some (stM, tbl')) :
+    ValidTable tbl' ∧
+      tbl.Extends tbl' ∧
+      ValidSymCanonState tbl'.nodes.length stM ∧
+      ∀ env : SymEnv,
+        evalSymCanonState tbl' env stM =
+          (if evalSymId tbl env condId != 0 then
+            evalSymCanonState tbl env stT
+          else
+            evalSymCanonState tbl env stF) := by
+  dsimp [mergeJoinStates] at hMerge
+  cases hSlots : mergeJoinSlots tbl condId stT.slots stF.slots with
+  | none =>
+    rw [hSlots] at hMerge
+    cases hMerge
+  | some pair =>
+    rcases pair with ⟨slotsM, tbl₁⟩
+    rw [hSlots] at hMerge
+    change forceCanonState { slots := slotsM } (fun forced => some (forced, tbl₁)) =
+      some (stM, tbl') at hMerge
+    rw [forceCanonState_eq] at hMerge
+    injection hMerge with hPair
+    injection hPair with hStM hTbl
+    subst hStM hTbl
+    have hSpec := mergeJoinSlots_spec stT.slots stF.slots tbl slotsM tbl₁
+      hValid hCond hValidT hValidF hSlots
+    rcases hSpec with ⟨hValid₁, hExt₁, hValidM, hEvalM⟩
+    refine ⟨hValid₁, hExt₁, hValidM, ?_⟩
+    intro env
+    dsimp [evalSymCanonState]
+    rw [hEvalM env]
+    cases (evalSymId tbl env condId != 0) <;> rfl
+
+/-- Identical slots merge to themselves without allocating any node (for any condition). -/
+theorem mergeJoinSlot_self (tbl : SymTable) (condId : Nat) (s : Slot SymId) :
+    mergeJoinSlot tbl condId s s = some (s, tbl) := by
+  have hNat : ∀ n : Nat, (n == n) = true := fun n => decide_eq_true rfl
+  cases s with
+  | dead g =>
+    dsimp only [mergeJoinSlot]
+    rw [hNat g]
+    rfl
+  | uninit g =>
+    dsimp only [mergeJoinSlot]
+    rw [hNat g]
+    rfl
+  | live id g b loan =>
+    dsimp only [mergeJoinSlot]
+    have hb : (b == b) = true := decide_eq_true rfl
+    have hl : decide (loan = loan) = true := decide_eq_true rfl
+    rw [hNat g, hb, hl]
+    dsimp only [internNode]
+    rw [hNat id]
+    rfl
+
+theorem mergeJoinSlots_self (tbl : SymTable) (condId : Nat) :
+    ∀ (ss : List (Slot SymId)), mergeJoinSlots tbl condId ss ss = some (ss, tbl)
+  | [] => rfl
+  | s :: rest => by
+    dsimp only [mergeJoinSlots]
+    rw [mergeJoinSlot_self]
+    dsimp only
+    rw [mergeJoinSlots_self tbl condId rest]
+
+/-- **Join Sharing (`mergeJoinSlots_shared`)**: every slot position on which the two branch
+    states agree is returned *unchanged* by the merge — the very same `SymId`, with no `ite`
+    node allocated for it. -/
+theorem mergeJoinSlots_shared {condId : Nat} :
+    ∀ (slotsT slotsF : List (Slot SymId)) (tbl : SymTable) (slotsM : List (Slot SymId))
+      (tbl' : SymTable),
+      mergeJoinSlots tbl condId slotsT slotsF = some (slotsM, tbl') →
+      ∀ i, getSlotAt slotsT i = getSlotAt slotsF i → getSlotAt slotsM i = getSlotAt slotsT i
+  | [], [], tbl, slotsM, tbl', hMerge, i, _ => by
+    injection hMerge with hPair
+    injection hPair with hS _
+    subst hS
+    rfl
+  | [], _ :: _, _, _, _, hMerge, _, _ => by cases hMerge
+  | _ :: _, [], _, _, _, hMerge, _, _ => by cases hMerge
+  | sT :: restT, sF :: restF, tbl, slotsM, tbl', hMerge, i, hEq => by
+    dsimp only [mergeJoinSlots] at hMerge
+    cases hStep₁ : mergeJoinSlot tbl condId sT sF with
+    | none => rw [hStep₁] at hMerge; cases hMerge
+    | some pair₁ =>
+      rcases pair₁ with ⟨sM, tbl₁⟩
+      rw [hStep₁] at hMerge
+      dsimp only at hMerge
+      cases hStep₂ : mergeJoinSlots tbl₁ condId restT restF with
+      | none => rw [hStep₂] at hMerge; cases hMerge
+      | some pair₂ =>
+        rcases pair₂ with ⟨restM, tbl₂⟩
+        rw [hStep₂] at hMerge
+        dsimp only at hMerge
+        injection hMerge with hPair
+        injection hPair with hS _
+        subst hS
+        cases i with
+        | zero =>
+          have hEq' : sT = sF := hEq
+          subst hEq'
+          rw [mergeJoinSlot_self] at hStep₁
+          injection hStep₁ with h
+          injection h with h1 _
+          subst h1
+          rfl
+        | succ j =>
+          exact mergeJoinSlots_shared restT restF tbl₁ restM tbl₂ hStep₂ j hEq
+
+/-- State-level join sharing: locals identical in both branch states stay shared verbatim. -/
+theorem mergeJoinStates_shared {tbl : SymTable} {condId : Nat} {stT stF stM : CanonState SymId}
+    {tbl' : SymTable} (hMerge : mergeJoinStates tbl condId stT stF = some (stM, tbl'))
+    (loc : LocalId) (hEq : stT.getSlot loc = stF.getSlot loc) :
+    stM.getSlot loc = stT.getSlot loc := by
+  dsimp only [mergeJoinStates] at hMerge
+  cases hSlots : mergeJoinSlots tbl condId stT.slots stF.slots with
+  | none => rw [hSlots] at hMerge; cases hMerge
+  | some pair =>
+    rcases pair with ⟨slotsM, tbl₁⟩
+    rw [hSlots] at hMerge
+    dsimp only at hMerge
+    rw [forceCanonState_eq] at hMerge
+    injection hMerge with hPair
+    injection hPair with hStM _
+    subst hStM
+    exact mergeJoinSlots_shared stT.slots stF.slots tbl slotsM tbl₁ hSlots loc hEq
+
+/-- Merging a state with itself is the identity and allocates nothing. -/
+theorem mergeJoinStates_self (tbl : SymTable) (condId : Nat) (st : CanonState SymId) :
+    mergeJoinStates tbl condId st st = some (st, tbl) := by
+  dsimp only [mergeJoinStates]
+  rw [mergeJoinSlots_self]
+  dsimp only
+  rw [forceCanonState_eq]
+
+/-!
+### 3.2 First-Order MIR CFG Syntax & Mask-Free Concrete Semantics (`execCfg`)
+
+**Trust boundary.** The concrete operational semantics `execCfg` below is the plain
+multi-block MIR semantics (`goto` / `switchInt` / `ret` / `unreachable`) over the *unpruned*
+dense local state: it never consults liveness masks or join points. Join-point liveness masks
+are *untrusted hints* (`JoinHints`) consumed only by the symbolic evaluator `symEvalCfgGvn`;
+every soundness theorem below quantifies over **all** hints, so a wrong (too-aggressive) mask
+can only make symbolic verification *fail*, never make it unsound.
+-/
+
+/-- Basic block identifier in a MIR CFG. -/
+abbrev BlockId := Nat
+
+/-- First-order MIR right-hand-side expression (`MirRvalue`). -/
+inductive MirRvalue where
+  | const (val : Nat)
+  | use (src : LocalId)
+  | op1 (op : SymOp1) (src : LocalId)
+  | op2 (op : SymOp2) (lhs rhs : LocalId)
+  | derefRef (ptr : LocalId)
+
+/-- First-order MIR statement (`MirStmt`) covering scalar assignment, storage lifecycle
+    (`storageLive` / `storageDead`), assertions (`assert`), borrow creation (`retagBorrow`,
+    which marks `target` as `borrowed = true` and records `(target, gen)` in `dst`'s
+    `loanTarget`), and indirect write-through-reference (`storeRef ptr rv`, i.e., `*ptr := rv`,
+    which checks temporal borrow-generation validity `curGen == expGen` and updates the
+    aliased referent `target` in place; the write bumps the referent's generation, which
+    invalidates every *other* outstanding loan, and re-validates the writer's own loan). -/
+inductive MirStmt where
+  | assign (dst : LocalId) (rv : MirRvalue)
+  | storageLive (loc : LocalId)
+  | storageDead (loc : LocalId)
+  | assert (cond : LocalId)
+  | retagBorrow (dst target : LocalId)
+  | storeRef (ptr : LocalId) (rv : MirRvalue)
+
+/-- First-order MIR block terminator (`MirTerm`). A *diamond* is an ordinary
+    `switchInt discr thenBb elseBb` whose two arm blocks both end in `goto joinBb`. -/
+inductive MirTerm where
+  | goto (target : BlockId)
+  | switchInt (discr : LocalId) (thenBb elseBb : BlockId)
+  | ret (retLoc : LocalId)
+  | unreachable
+
+/-- A basic block in the MIR CFG. -/
+structure MirBlock where
+  stmts : List MirStmt := []
+  term : MirTerm := .unreachable
+
+/-- A MIR Control-Flow Graph indexed by `BlockId`. -/
+structure MirCfg where
+  blocks : List MirBlock := []
+
+/-- Untrusted join-point liveness hints: `hints j = some mask` asks the symbolic evaluator to
+    merge diamonds joining at block `j` after pruning every local `i` with `mask[i] = false`
+    (`hints j = none` makes it path-split instead). The concrete semantics never reads hints. -/
+abbrev JoinHints := BlockId → Option (List Bool)
+
+/-- Concrete execution outcome of a MIR CFG:
+    - `.ret val`: normal return with concrete `u64` value `val`.
+    - `.fault`: UB / assertion failure / read of a dead-or-uninitialized local / write to a
+      dead (`StorageDead`) or undeclared local / dangling-borrow generation mismatch /
+      `unreachable` / missing block.
+    - `.outOfFuel`: step fuel exhausted. -/
+inductive ExecOutcome where
+  | ret (val : Nat)
+  | fault
+  | outOfFuel
+  deriving DecidableEq
+
+/-- Read a live concrete scalar from `st` at `loc`, returning `none` if the slot is dead,
+    uninitialized, **or holds a loan**: a reference is not a scalar, and in this untyped slot model
+    a pointer slot's value is only the snapshot of its referent taken at borrow time, so reading
+    it as a scalar (`use`, `op1`/`op2`, `assert`, `switchInt`, `ret`) would expose stale data.
+    References are consumed only through `derefRef` / `storeRef`. -/
+def readConcreteScalar (st : CanonState Nat) (loc : LocalId) : Option Nat :=
+  match st.getSlot loc with
+  | .live v _ _ none => some v
+  | _ => none
+
+/-- Concrete evaluation of a `MirRvalue` in `st : CanonState Nat` (constants are reduced to
+    `u64` words). `.derefRef ptr` checks that `ptr` holds an active `loanTarget = some (target,
+    expGen)` AND that `target` is currently a scalar slot `.live targetVal curGen true none` with
+    `curGen == expGen` (temporal borrow-generation check; dereferencing a reference-to-reference
+    is rejected so an inner reference slot's borrow-time snapshot is never read as a scalar). -/
+def evalConcreteRvalue (st : CanonState Nat) : MirRvalue → Option Nat
+  | .const v => some (wrap64 v)
+  | .use src => readConcreteScalar st src
+  | .op1 op src =>
+    match readConcreteScalar st src with
+    | some v => some (evalSymOp1 op v)
+    | none => none
+  | .op2 op lhs rhs =>
+    match readConcreteScalar st lhs, readConcreteScalar st rhs with
+    | some a, some b => some (evalSymOp2 op a b)
+    | _, _ => none
+  | .derefRef ptr =>
+    match st.getSlot ptr with
+    | .live _ _ _ (some (target, expGen)) =>
+      match st.getSlot target with
+      | .live targetVal curGen true none =>
+        if curGen == expGen then some targetVal else none
+      | _ => none
+    | _ => none
+
+/-- Faulting slot write: assigning into a **dead** slot (`StorageDead`, never `StorageLive`d,
+    or an undeclared / out-of-range local) is MIR UB and returns `none`; writing an `uninit`
+    slot initializes it (`borrowed := false`). Overwriting an *unborrowed* `live` slot keeps its
+    generation; overwriting a **borrowed** `live` slot through its owner invalidates every
+    outstanding loan (Stacked Borrows pops, and Tree Borrows disables, all references derived
+    from a parent that is written) by bumping the generation and clearing `borrowed`. -/
+def Slot.writeVal? {Val : Type} (s : Slot Val) (v : Val)
+    (loanTarget : Option (LocalId × Nat)) : Option (Slot Val) :=
+  match s with
+  | .dead _ => none
+  | .uninit g => some (.live v g false loanTarget)
+  | .live _ g false _ => some (.live v g false loanTarget)
+  | .live _ g true _ => some (.live v (g + 1) false loanTarget)
+
+/-- Owner-read transition on a slot: reading a local directly through its owner succeeds and
+    preserves its value and `loanTarget`, but if the slot was currently borrowed (`borrowed =
+    true`), the owner read invalidates outstanding loans to this slot by bumping its
+    generation to `g + 1` and clearing `borrowed := false`. On unborrowed slots this is the
+    identity.
+
+    Aliasing discipline: every loan is treated as a **unique** (`&mut`) loan, as in Stacked
+    Borrows, where a read through the parent pops all `Unique` items above it. This is stricter
+    than Tree Borrows, where a foreign read merely *freezes* an `Active` loan (later reads through
+    it stay legal) and leaves a `Reserved` one usable; the model is therefore sound but
+    incomplete for programs that keep reading through a loan after an owner read, and for shared
+    (`&`) borrows in general. Applied to every direct read of a local in `assign`, `storeRef`,
+    `assert`, and the `switchInt` discriminant (a `ret` read ends execution, so it needs none). -/
+def Slot.ownerRead {Val : Type} : Slot Val → Slot Val
+  | .live v g true loan => .live v (g + 1) false loan
+  | s => s
+
+/-- Apply `Slot.ownerRead` to `loc` in `st`. -/
+def CanonState.ownerReadLoc {Val : Type} (st : CanonState Val) (loc : LocalId) : CanonState Val :=
+  st.setSlot loc (st.getSlot loc).ownerRead
+
+/-- Apply `CanonState.ownerReadLoc` to all locals directly read by `rv`. -/
+def CanonState.ownerReadRvalue {Val : Type} (st : CanonState Val) : MirRvalue → CanonState Val
+  | .const _ => st
+  | .use src => st.ownerReadLoc src
+  | .op1 _ src => st.ownerReadLoc src
+  | .op2 _ lhs rhs => (st.ownerReadLoc lhs).ownerReadLoc rhs
+  | .derefRef ptr => st.ownerReadLoc ptr
+
+/-- Re-validate the loan held by a pointer slot at generation `g` (used after a write through
+    that pointer bumps its target's generation). Non-`live` slots are left unchanged. -/
+def Slot.retarget {Val : Type} (target g : Nat) : Slot Val → Slot Val
+  | .live pv pg pb _ => .live pv pg pb (some (target, g))
+  | s => s
+
+/-- Write-through-reference effect on the state: perform an owner read on `ptr` (invalidating
+    any loan to the pointer variable `ptr` itself), set the referent `target` to its new value at
+    the bumped generation `g`, then re-validate the writer `ptr`'s own loan at `g`. -/
+def CanonState.storeThrough {Val : Type} (st : CanonState Val) (ptr target : LocalId)
+    (v : Val) (g : Nat) (targetLoan : Option (LocalId × Nat)) : CanonState Val :=
+  let st₁ := (st.ownerReadLoc ptr).setSlot target (.live v g true targetLoan)
+  st₁.setSlot ptr ((st₁.getSlot ptr).retarget target g)
+
+/-- Concrete execution of a single `MirStmt`. Returns `none` on any fault, including writes
+    to dead locals, storage statements on undeclared locals, and uses of loans invalidated by
+    earlier owner reads, owner writes, re-borrows of the same target, writes through another
+    loan, or `StorageDead`. -/
+def execStmt (st : CanonState Nat) : MirStmt → Option (CanonState Nat)
+  | .assign dst rv =>
+    match evalConcreteRvalue st rv with
+    | none => none
+    | some v =>
+      let st₀ := st.ownerReadRvalue rv
+      match (st₀.getSlot dst).writeVal? v none with
+      | none => none
+      | some s' => some (st₀.setSlot dst s')
+  | .storageLive loc =>
+    if loc < st.slots.length then some (st.setSlot loc (st.getSlot loc).reborn) else none
+  | .storageDead loc =>
+    if loc < st.slots.length then some (st.setSlot loc (st.getSlot loc).kill) else none
+  | .assert cond =>
+    match readConcreteScalar st cond with
+    | some v => if v != 0 then some (st.ownerReadLoc cond) else none
+    | none => none
+  | .retagBorrow dst target =>
+    match st.getSlot target with
+    | .live targetVal g b targetLoan =>
+      -- Unique-loan (Stacked Borrows `&mut`) discipline: re-borrowing an already-borrowed
+      -- target invalidates every earlier loan to it (generation bump `g ↦ g + 1`); the new
+      -- loan is issued at the resulting generation.
+      let g' := if b then g + 1 else g
+      match ((st.setSlot target (.live targetVal g' true targetLoan)).getSlot dst).writeVal?
+          targetVal (some (target, g')) with
+      | none => none
+      | some s' => some ((st.setSlot target (.live targetVal g' true targetLoan)).setSlot dst s')
+    | _ => none
+  | .storeRef ptr rv =>
+    match evalConcreteRvalue st rv with
+    | none => none
+    | some v =>
+      let st₀ := st.ownerReadRvalue rv
+      match st₀.getSlot ptr with
+      | .live _ _ _ (some (target, expGen)) =>
+        match st₀.getSlot target with
+        | .live _ curGen true none =>
+          if curGen == expGen then
+            some (st₀.storeThrough ptr target v (curGen + 1) none)
+          else
+            none
+        | _ => none
+      | _ => none
+
+/-- Concrete execution of a statement list. -/
+def execStmts (st : CanonState Nat) : List MirStmt → Option (CanonState Nat)
+  | [] => some st
+  | stmt :: rest =>
+    match execStmt st stmt with
+    | some st' => execStmts st' rest
+    | none => none
+
+/-- Mask-free concrete operational semantics of a multi-block `MirCfg` with step fuel `fuel`
+    (one unit per executed basic block). -/
+def execCfg (cfg : MirCfg) : Nat → BlockId → CanonState Nat → ExecOutcome
+  | 0, _, _ => .outOfFuel
+  | fuel + 1, bb, st =>
+    match cfg.blocks[bb]? with
+    | none => .fault
+    | some blk =>
+      match execStmts st blk.stmts with
+      | none => .fault
+      | some st₁ =>
+        match blk.term with
+        | .goto target => execCfg cfg fuel target st₁
+        | .switchInt discr thenBb elseBb =>
+          match readConcreteScalar st₁ discr with
+          | none => .fault
+          | some v =>
+            -- Reading the discriminant is an owner read (invalidates loans to `discr`).
+            let st₂ := st₁.ownerReadLoc discr
+            if v != 0 then execCfg cfg fuel thenBb st₂ else execCfg cfg fuel elseBb st₂
+        | .ret retLoc =>
+          match readConcreteScalar st₁ retLoc with
+          | some v => .ret v
+          | none => .fault
+        | .unreachable => .fault
+
+/-- Commutativity of `setSlotAt` with `List.map`. -/
+theorem map_setSlotAt {Val₁ Val₂ : Type} (f : Slot Val₁ → Slot Val₂) :
+    ∀ (slots : List (Slot Val₁)) (loc : Nat) (s : Slot Val₁),
+      (setSlotAt slots loc s).map f = setSlotAt (slots.map f) loc (f s)
+  | [], _, _ => rfl
+  | _ :: _, 0, _ => rfl
+  | _ :: xs, i + 1, s => by
+    simp only [setSlotAt, List.map_cons]
+    rw [map_setSlotAt f xs i s]
+
+theorem evalSymCanonState_setSlot (tbl : SymTable) (env : SymEnv)
+    (st : CanonState SymId) (loc : LocalId) (s : Slot SymId) :
+    evalSymCanonState tbl env (st.setSlot loc s) =
+      (evalSymCanonState tbl env st).setSlot loc (evalSymSlot tbl env s) := by
+  dsimp [evalSymCanonState, CanonState.setSlot]
+  rw [map_setSlotAt]
+
+theorem evalSymSlot_reborn (tbl : SymTable) (env : SymEnv) (s : Slot SymId) :
+    evalSymSlot tbl env s.reborn = (evalSymSlot tbl env s).reborn := by
+  cases s with
+  | dead g => rfl
+  | uninit g => rfl
+  | live _ g b _ => cases b <;> rfl
+
+theorem evalSymSlot_kill (tbl : SymTable) (env : SymEnv) (s : Slot SymId) :
+    evalSymSlot tbl env s.kill = (evalSymSlot tbl env s).kill := by
+  cases s with
+  | dead g => rfl
+  | uninit g => rfl
+  | live _ g b _ => cases b <;> rfl
+
+theorem evalSymSlot_writeVal (tbl : SymTable) (env : SymEnv) (s : Slot SymId)
+    (symId : Nat) (loan : Option (LocalId × Nat)) :
+    evalSymSlot tbl env (s.writeVal symId loan) =
+      (evalSymSlot tbl env s).writeVal (evalSymId tbl env symId) loan := by
+  cases s <;> rfl
+
+theorem ValidSymSlots_getSlotAt {bound : Nat} :
+    ∀ {slots : List (Slot SymId)} (loc : LocalId),
+      ValidSymSlots bound slots →
+      ValidSymSlot bound (getSlotAt slots loc)
+  | [], _, _ => trivial
+  | _ :: _, 0, ⟨hHead, _⟩ => hHead
+  | _ :: _, loc + 1, ⟨_, hTail⟩ => ValidSymSlots_getSlotAt loc hTail
+
+theorem ValidSymCanonState.getSlot {bound : Nat} {st : CanonState SymId}
+    (hSt : ValidSymCanonState bound st) (loc : LocalId) :
+    ValidSymSlot bound (st.getSlot loc) :=
+  ValidSymSlots_getSlotAt loc hSt
+
+theorem ValidSymSlots_setSlotAt {bound : Nat} :
+    ∀ {slots : List (Slot SymId)} (loc : LocalId) {s : Slot SymId},
+      ValidSymSlots bound slots →
+      ValidSymSlot bound s →
+      ValidSymSlots bound (setSlotAt slots loc s)
+  | [], _, _, _, _ => trivial
+  | _ :: _, 0, _, ⟨_, hTail⟩, hS => ⟨hS, hTail⟩
+  | _ :: _, loc + 1, _, ⟨hHead, hTail⟩, hS =>
+    ⟨hHead, ValidSymSlots_setSlotAt loc hTail hS⟩
+
+theorem ValidSymCanonState.setSlot {bound : Nat} {st : CanonState SymId}
+    {loc : LocalId} {s : Slot SymId}
+    (hSt : ValidSymCanonState bound st) (hS : ValidSymSlot bound s) :
+    ValidSymCanonState bound (st.setSlot loc s) :=
+  ValidSymSlots_setSlotAt loc hSt hS
+
+theorem map_buildCanonSlotsAux (tbl : SymTable) (env : SymEnv)
+    (st : CanonState SymId) :
+    ∀ (mask : List Bool) (offset : Nat),
+      (buildCanonSlotsAux st.getSlot offset mask).map (evalSymSlot tbl env) =
+        buildCanonSlotsAux (evalSymCanonState tbl env st).getSlot offset mask
+  | [], _ => rfl
+  | isLive :: restMask, offset => by
+    simp only [buildCanonSlotsAux, List.map_cons]
+    rw [map_buildCanonSlotsAux tbl env st restMask (offset + 1)]
+    rw [evalSymCanonState_getSlot]
+    cases isLive with
+    | true => rfl
+    | false =>
+      dsimp [normalizeSlotForMask]
+      rw [evalSymSlot_kill]
+
+theorem evalSymCanonState_canonicalizeCanon (tbl : SymTable) (env : SymEnv)
+    (liveMask : List Bool) (st : CanonState SymId) :
+    evalSymCanonState tbl env (canonicalizeCanon liveMask st) =
+      canonicalizeCanon liveMask (evalSymCanonState tbl env st) := by
+  unfold canonicalizeCanon
+  dsimp [evalSymCanonState]
+  rw [map_buildCanonSlotsAux tbl env st liveMask 0]
+  rfl
+
+theorem ValidSymSlots_buildCanonSlotsAux {bound : Nat} {st : CanonState SymId}
+    (hSt : ValidSymCanonState bound st) :
+    ∀ (mask : List Bool) (offset : Nat),
+      ValidSymSlots bound (buildCanonSlotsAux st.getSlot offset mask)
+  | [], _ => trivial
+  | isLive :: restMask, offset => by
+    dsimp [buildCanonSlotsAux]
+    refine ⟨?_, ValidSymSlots_buildCanonSlotsAux hSt restMask (offset + 1)⟩
+    cases isLive with
+    | true => exact hSt.getSlot offset
+    | false => trivial
+
+theorem ValidSymCanonState.canonicalizeCanon {bound : Nat} {st : CanonState SymId}
+    (hSt : ValidSymCanonState bound st) (liveMask : List Bool) :
+    ValidSymCanonState bound (canonicalizeCanon liveMask st) :=
+  ValidSymSlots_buildCanonSlotsAux hSt liveMask 0
+
+/-- Read a live symbolic `SymId` from `st` at `loc` (a slot holding a loan is not a scalar; see
+    `readConcreteScalar`). -/
+def readSymScalar (st : CanonState SymId) (loc : LocalId) : Option Nat :=
+  match st.getSlot loc with
+  | .live symId _ _ none => some symId
+  | _ => none
+
+theorem readSymScalar_spec {tbl : SymTable} {st : CanonState SymId} {loc : LocalId}
+    (env : SymEnv) (hSt : ValidSymCanonState tbl.nodes.length st) :
+    match readSymScalar st loc with
+    | none => readConcreteScalar (evalSymCanonState tbl env st) loc = none
+    | some symId =>
+      symId < tbl.nodes.length ∧
+        readConcreteScalar (evalSymCanonState tbl env st) loc =
+          some (evalSymId tbl env symId) := by
+  have hSlot := hSt.getSlot loc
+  dsimp [readSymScalar, readConcreteScalar]
+  rw [evalSymCanonState_getSlot]
+  cases hGet : st.getSlot loc with
+  | dead g => rfl
+  | uninit g => rfl
+  | live symId g b loan =>
+    rw [hGet] at hSlot
+    cases loan with
+    | none => exact ⟨hSlot, rfl⟩
+    | some _ => rfl
+
+/-- Symbolic GVN evaluation of a `MirRvalue` in `(st, tbl)`.
+    Interns constants and unary/binary expressions into `tbl`, and verifies borrow
+    liveness and generation agreement `(curGen == expGen)` on `.derefRef ptr`. -/
+def evalSymRvalue (st : CanonState SymId) (tbl : SymTable) :
+    MirRvalue → Option (Nat × SymTable)
+  | .const v => some (internNode tbl (.const v))
+  | .use src =>
+    match readSymScalar st src with
+    | some symId => some (symId, tbl)
+    | none => none
+  | .op1 op src =>
+    match readSymScalar st src with
+    | some srcId => some (internNode tbl (.op1 op srcId))
+    | none => none
+  | .op2 op lhs rhs =>
+    match readSymScalar st lhs, readSymScalar st rhs with
+    | some lhsId, some rhsId => some (internNode tbl (.op2 op lhsId rhsId))
+    | _, _ => none
+  | .derefRef ptr =>
+    match st.getSlot ptr with
+    | .live _ _ _ (some (target, expGen)) =>
+      match st.getSlot target with
+      | .live targetSymId curGen true none =>
+        if curGen == expGen then some (targetSymId, tbl) else none
+      | _ => none
+    | _ => none
+
+theorem evalSymRvalue_sound {st : CanonState SymId} {tbl : SymTable}
+    {rv : MirRvalue} {resId : Nat} {tbl' : SymTable}
+    (hValid : ValidTable tbl)
+    (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hEval : evalSymRvalue st tbl rv = some (resId, tbl')) :
+    ValidTable tbl' ∧
+      tbl.Extends tbl' ∧
+      resId < tbl'.nodes.length ∧
+      ∀ env : SymEnv,
+        evalConcreteRvalue (evalSymCanonState tbl env st) rv =
+          some (evalSymId tbl' env resId) := by
+  cases rv with
+  | const v =>
+    dsimp [evalSymRvalue] at hEval
+    injection hEval with hPair
+    have hId : resId = (internNode tbl (.const v)).1 := by rw [hPair]
+    have hTbl : tbl' = (internNode tbl (.const v)).2 := by rw [hPair]
+    subst hId hTbl
+    have hNode : ValidNode tbl.nodes.length (.const v) := trivial
+    have hV := internNode_valid hValid hNode
+    have hE := internNode_extends tbl (.const v)
+    refine ⟨hV.1, hE, hV.2, ?_⟩
+    intro env
+    dsimp [evalConcreteRvalue]
+    have hEv := internNode_eval hValid hNode env
+    rw [hEv]
+    rfl
+  | use src =>
+    dsimp [evalSymRvalue] at hEval
+    cases hRead : readSymScalar st src with
+    | none =>
+      rw [hRead] at hEval
+      cases hEval
+    | some symId =>
+      rw [hRead] at hEval
+      injection hEval with hPair
+      injection hPair with hId hTbl
+      subst hId hTbl
+      refine ⟨hValid, SymTable.Extends.refl tbl, ?_, ?_⟩
+      · have hSpec := readSymScalar_spec (fun _ => 0) hSt (loc := src)
+        rw [hRead] at hSpec
+        exact hSpec.1
+      · intro env
+        have hSpec := readSymScalar_spec env hSt (loc := src)
+        rw [hRead] at hSpec
+        dsimp [evalConcreteRvalue]
+        exact hSpec.2
+  | op1 op src =>
+    dsimp [evalSymRvalue] at hEval
+    cases hRead : readSymScalar st src with
+    | none =>
+      rw [hRead] at hEval
+      cases hEval
+    | some srcId =>
+      rw [hRead] at hEval
+      injection hEval with hPair
+      have hId : resId = (internNode tbl (.op1 op srcId)).1 := by rw [hPair]
+      have hTbl : tbl' = (internNode tbl (.op1 op srcId)).2 := by rw [hPair]
+      subst hId hTbl
+      have hSrcLt : srcId < tbl.nodes.length := by
+        have hSpec := readSymScalar_spec (fun _ => 0) hSt (loc := src)
+        rw [hRead] at hSpec
+        exact hSpec.1
+      have hNode : ValidNode tbl.nodes.length (.op1 op srcId) := hSrcLt
+      have hV := internNode_valid hValid hNode
+      have hE := internNode_extends tbl (.op1 op srcId)
+      refine ⟨hV.1, hE, hV.2, ?_⟩
+      intro env
+      have hSpec := readSymScalar_spec env hSt (loc := src)
+      rw [hRead] at hSpec
+      dsimp [evalConcreteRvalue]
+      rw [hSpec.2]
+      have hEv := internNode_eval hValid hNode env
+      rw [hEv]
+      rfl
+  | op2 op lhs rhs =>
+    dsimp [evalSymRvalue] at hEval
+    cases hL : readSymScalar st lhs with
+    | none =>
+      rw [hL] at hEval
+      cases hEval
+    | some lhsId =>
+      rw [hL] at hEval
+      cases hR : readSymScalar st rhs with
+      | none =>
+        rw [hR] at hEval
+        cases hEval
+      | some rhsId =>
+        rw [hR] at hEval
+        injection hEval with hPair
+        have hId : resId = (internNode tbl (.op2 op lhsId rhsId)).1 := by rw [hPair]
+        have hTbl : tbl' = (internNode tbl (.op2 op lhsId rhsId)).2 := by rw [hPair]
+        subst hId hTbl
+        have hLhsLt : lhsId < tbl.nodes.length := by
+          have hSpec := readSymScalar_spec (fun _ => 0) hSt (loc := lhs)
+          rw [hL] at hSpec
+          exact hSpec.1
+        have hRhsLt : rhsId < tbl.nodes.length := by
+          have hSpec := readSymScalar_spec (fun _ => 0) hSt (loc := rhs)
+          rw [hR] at hSpec
+          exact hSpec.1
+        have hNode : ValidNode tbl.nodes.length (.op2 op lhsId rhsId) := ⟨hLhsLt, hRhsLt⟩
+        have hV := internNode_valid hValid hNode
+        have hE := internNode_extends tbl (.op2 op lhsId rhsId)
+        refine ⟨hV.1, hE, hV.2, ?_⟩
+        intro env
+        have hSpecL := readSymScalar_spec env hSt (loc := lhs)
+        have hSpecR := readSymScalar_spec env hSt (loc := rhs)
+        rw [hL] at hSpecL
+        rw [hR] at hSpecR
+        dsimp [evalConcreteRvalue]
+        rw [hSpecL.2, hSpecR.2]
+        have hEv := internNode_eval hValid hNode env
+        rw [hEv]
+        rfl
+  | derefRef ptr =>
+    dsimp [evalSymRvalue] at hEval
+    cases hPtr : st.getSlot ptr with
+    | dead _ => rw [hPtr] at hEval; cases hEval
+    | uninit _ => rw [hPtr] at hEval; cases hEval
+    | live ptrId ptrG ptrB ptrLoan =>
+      rw [hPtr] at hEval
+      cases ptrLoan with
+      | none => cases hEval
+      | some pair =>
+        rcases pair with ⟨target, expGen⟩
+        dsimp at hEval
+        cases hTgt : st.getSlot target with
+        | dead _ => rw [hTgt] at hEval; cases hEval
+        | uninit _ => rw [hTgt] at hEval; cases hEval
+        | live targetSymId curGen targetB targetLoan =>
+          rw [hTgt] at hEval
+          cases targetB with
+          | false => cases hEval
+          | true =>
+            cases targetLoan with
+            | some _ => cases hEval
+            | none =>
+              dsimp at hEval
+              split at hEval
+              · rename_i hGenEq
+                injection hEval with hPair
+                injection hPair with hId hTbl
+                subst hId hTbl
+                have hTgtSlot := hSt.getSlot target
+                rw [hTgt] at hTgtSlot
+                refine ⟨hValid, SymTable.Extends.refl tbl, hTgtSlot, ?_⟩
+                intro env
+                dsimp [evalConcreteRvalue]
+                rw [evalSymCanonState_getSlot, hPtr]
+                dsimp [evalSymSlot]
+                rw [evalSymCanonState_getSlot, hTgt]
+                dsimp [evalSymSlot]
+                rw [hGenEq]
+                rfl
+              · cases hEval
+
+/-- Active branch path condition `Option (SymId × Bool)`:
+    - `none`: no active branch assumption,
+    - `some (brId, true)`: inside a `then` arm where `(evalSymId tbl env brId != 0) = true`,
+    - `some (brId, false)`: inside an `else` arm where `(evalSymId tbl env brId != 0) = false`. -/
+abbrev PathCond := Option (SymId × Bool)
+
+/-- Well-formedness of a `PathCond` against a table size `bound`. -/
+def PathCondValid (bound : Nat) : PathCond → Prop
+  | none => True
+  | some (brId, _) => brId < bound
+
+theorem PathCondValid.mono {b₁ b₂ : Nat} {pc : PathCond} (h : PathCondValid b₁ pc)
+    (hLe : b₁ ≤ b₂) : PathCondValid b₂ pc := by
+  cases pc with
+  | none => trivial
+  | some p => exact Nat.lt_of_lt_of_le h hLe
+
+/-- Semantic meaning of `pc : PathCond` in `(tbl, env)`. -/
+def PathCondHolds (tbl : SymTable) (env : SymEnv) : PathCond → Prop
+  | none => True
+  | some (brId, polarity) => (evalSymId tbl env brId != 0) = polarity
+
+theorem PathCondHolds.mono {tbl tbl' : SymTable} {env : SymEnv} {pc : PathCond}
+    (hValid : ValidTable tbl) (hExt : tbl.Extends tbl')
+    (hPcValid : PathCondValid tbl.nodes.length pc)
+    (hPc : PathCondHolds tbl env pc) :
+    PathCondHolds tbl' env pc := by
+  cases pc with
+  | none => trivial
+  | some p =>
+    rcases p with ⟨brId, pol⟩
+    dsimp [PathCondHolds] at hPc ⊢
+    rw [← evalSymId_mono hValid hExt env hPcValid]
+    exact hPc
+
+/-- Sound GVN-backed non-zero condition recognizer for `MirStmt.assert`:
+    recognizes non-zero constants (`.const v` with `v != 0`), negated zero constants
+    (`.op1 .boolNot argId` where `argId` is `.const v` with `wrap64 v == 0`, e.g.,
+    `!(x < x)`, `!(x - x)`, `!(x ^ x)` after `peepholeOp2`), as well as reflexive
+    GVN equality/inequality nodes (`.op2 .eq a b` or `.op2 .le a b` where `a == b`). -/
+def isProvablyNonZero (tbl : SymTable) (condId : Nat) : Bool :=
+  match tbl.nodes[condId]? with
+  | some (.const v) => wrap64 v != 0
+  | some (.op1 .boolNot argId) =>
+    match tbl.nodes[argId]? with
+    | some (.const v) => wrap64 v == 0
+    | _ => false
+  | some (.op2 .eq a b) => a == b
+  | some (.op2 .le a b) => a == b
+  | _ => false
+
+/-- Branch-condition-aware non-zero recognizer (`isProvablyNonZeroUnder`):
+    extends `isProvablyNonZero` with path-sensitive discharge under an enclosing `switchInt`
+    branch condition `pc`:
+    - In the `then` arm (`pc = some (brId, true)`), `condId == brId` is provably non-zero.
+    - In the `else` arm (`pc = some (brId, false)`), any `condId` interned as
+      `.op1 .boolNot argId` with `argId == brId` is provably non-zero (`1`). -/
+def isProvablyNonZeroUnder (tbl : SymTable) (pc : PathCond) (condId : Nat) : Bool :=
+  if isProvablyNonZero tbl condId then
+    true
+  else
+    match pc with
+    | none => false
+    | some (brId, true) => condId == brId
+    | some (brId, false) =>
+      match tbl.nodes[condId]? with
+      | some (.op1 .boolNot argId) => argId == brId
+      | _ => false
+
+theorem isProvablyNonZero_sound {tbl : SymTable} {condId : Nat}
+    (hValid : ValidTable tbl) (hOk : isProvablyNonZero tbl condId = true)
+    (env : SymEnv) :
+    (evalSymId tbl env condId != 0) = true := by
+  dsimp [isProvablyNonZero] at hOk
+  cases hLookup : tbl.nodes[condId]? with
+  | none =>
+    rw [hLookup] at hOk
+    cases hOk
+  | some node =>
+    rw [hLookup] at hOk
+    have hEval := evalSymId_eq_evalSymNodeWith hValid env hLookup
+    cases node with
+    | const v =>
+      dsimp at hOk
+      rw [hEval]
+      dsimp [evalSymNodeWith]
+      exact hOk
+    | var _ =>
+      dsimp at hOk
+      cases hOk
+    | op1 op argId =>
+      cases op <;> dsimp at hOk <;> try cases hOk
+      cases hArg : tbl.nodes[argId]? with
+      | none => rw [hArg] at hOk; cases hOk
+      | some argNode =>
+        rw [hArg] at hOk
+        cases argNode with
+        | const v =>
+          dsimp at hOk
+          have hEvalArg := evalSymId_eq_evalSymNodeWith hValid env hArg
+          rw [hEval]
+          dsimp [evalSymNodeWith]
+          rw [hEvalArg]
+          dsimp [evalSymNodeWith, evalSymOp1]
+          rw [hOk]
+          rfl
+        | var _ => cases hOk
+        | op1 _ _ => cases hOk
+        | op2 _ _ _ => cases hOk
+        | ite _ _ _ => cases hOk
+    | ite _ _ _ =>
+      dsimp at hOk
+      cases hOk
+    | op2 op a b =>
+      cases op <;> dsimp at hOk <;> try cases hOk
+      · have hab : a = b := of_decide_eq_true hOk
+        subst hab
+        rw [hEval]
+        dsimp [evalSymNodeWith, evalSymOp2]
+        have hRefl : (evalSymId tbl env a == evalSymId tbl env a) = true :=
+          decide_eq_true rfl
+        rw [hRefl]
+        rfl
+      · have hab : a = b := of_decide_eq_true hOk
+        subst hab
+        rw [hEval]
+        dsimp [evalSymNodeWith, evalSymOp2]
+        have hRefl : decide (evalSymId tbl env a ≤ evalSymId tbl env a) = true :=
+          decide_eq_true (Nat.le_refl _)
+        rw [hRefl]
+        rfl
+
+/-- **Path-Sensitive Assertion Soundness (`isProvablyNonZeroUnder_sound`)**:
+    Whenever `PathCondHolds tbl env pc` holds, `isProvablyNonZeroUnder tbl pc condId = true`
+    guarantees `(evalSymId tbl env condId != 0) = true`. -/
+theorem isProvablyNonZeroUnder_sound {tbl : SymTable} {pc : PathCond} {condId : Nat}
+    {env : SymEnv} (hValid : ValidTable tbl) (hPc : PathCondHolds tbl env pc)
+    (hOk : isProvablyNonZeroUnder tbl pc condId = true) :
+    (evalSymId tbl env condId != 0) = true := by
+  dsimp [isProvablyNonZeroUnder] at hOk
+  cases hBase : isProvablyNonZero tbl condId with
+  | true => exact isProvablyNonZero_sound hValid hBase env
+  | false =>
+    rw [hBase] at hOk
+    dsimp at hOk
+    cases pc with
+    | none => cases hOk
+    | some p =>
+      rcases p with ⟨brId, pol⟩
+      cases pol with
+      | true =>
+        dsimp at hOk
+        have hEq : condId = brId := of_decide_eq_true hOk
+        subst hEq
+        exact hPc
+      | false =>
+        dsimp at hOk
+        cases hLookup : tbl.nodes[condId]? with
+        | none => rw [hLookup] at hOk; cases hOk
+        | some node =>
+          rw [hLookup] at hOk
+          have hEval := evalSymId_eq_evalSymNodeWith hValid env hLookup
+          cases node with
+          | const _ => cases hOk
+          | var _ => cases hOk
+          | op2 _ _ _ => cases hOk
+          | ite _ _ _ => cases hOk
+          | op1 op argId =>
+            cases op <;> dsimp at hOk <;> try cases hOk
+            have hArgEq : argId = brId := of_decide_eq_true hOk
+            subst hArgEq
+            rw [hEval]
+            dsimp [evalSymNodeWith, evalSymOp1]
+            dsimp [PathCondHolds] at hPc
+            have hZero : evalSymId tbl env argId = 0 := bne_eq_false_iff_eq.1 hPc
+            rw [hZero]
+            rfl
+
+theorem evalSymSlot_writeVal? (tbl : SymTable) (env : SymEnv) (s : Slot SymId)
+    (symId : Nat) (loan : Option (LocalId × Nat)) :
+    (s.writeVal? symId loan).map (evalSymSlot tbl env) =
+      (evalSymSlot tbl env s).writeVal? (evalSymId tbl env symId) loan := by
+  cases s with
+  | dead _ => rfl
+  | uninit _ => rfl
+  | live _ _ b _ => cases b <;> rfl
+
+theorem ValidSymSlot.writeVal? {bound : Nat} {s s' : Slot SymId} {symId : Nat}
+    {loan : Option (LocalId × Nat)} (hW : s.writeVal? symId loan = some s')
+    (hId : symId < bound) : ValidSymSlot bound s' := by
+  cases s with
+  | dead _ => cases hW
+  | uninit _ =>
+    injection hW with h
+    subst h
+    exact hId
+  | live _ _ b _ =>
+    cases b <;> (injection hW with h; subst h; exact hId)
+
+theorem evalSymCanonState_length (tbl : SymTable) (env : SymEnv) (st : CanonState SymId) :
+    (evalSymCanonState tbl env st).slots.length = st.slots.length := by
+  simp [evalSymCanonState]
+
+theorem evalSymSlot_ownerRead (tbl : SymTable) (env : SymEnv) (s : Slot SymId) :
+    evalSymSlot tbl env s.ownerRead = (evalSymSlot tbl env s).ownerRead := by
+  cases s with
+  | dead _ => rfl
+  | uninit _ => rfl
+  | live _ _ b _ => cases b <;> rfl
+
+theorem ValidSymSlot.ownerRead {bound : Nat} {s : Slot SymId} (h : ValidSymSlot bound s) :
+    ValidSymSlot bound s.ownerRead := by
+  cases s with
+  | dead _ => trivial
+  | uninit _ => trivial
+  | live _ _ b _ => cases b <;> exact h
+
+theorem evalSymCanonState_ownerReadLoc (tbl : SymTable) (env : SymEnv) (st : CanonState SymId)
+    (loc : LocalId) :
+    evalSymCanonState tbl env (st.ownerReadLoc loc) =
+      (evalSymCanonState tbl env st).ownerReadLoc loc := by
+  dsimp only [CanonState.ownerReadLoc]
+  rw [evalSymCanonState_setSlot, evalSymSlot_ownerRead, evalSymCanonState_getSlot]
+
+theorem ValidSymCanonState.ownerReadLoc {bound : Nat} {st : CanonState SymId}
+    (h : ValidSymCanonState bound st) (loc : LocalId) :
+    ValidSymCanonState bound (st.ownerReadLoc loc) :=
+  h.setSlot (h.getSlot loc).ownerRead
+
+theorem evalSymCanonState_ownerReadRvalue (tbl : SymTable) (env : SymEnv) (st : CanonState SymId)
+    (rv : MirRvalue) :
+    evalSymCanonState tbl env (st.ownerReadRvalue rv) =
+      (evalSymCanonState tbl env st).ownerReadRvalue rv := by
+  cases rv <;> dsimp only [CanonState.ownerReadRvalue] <;>
+    repeat rw [evalSymCanonState_ownerReadLoc]
+
+theorem ValidSymCanonState.ownerReadRvalue {bound : Nat} {st : CanonState SymId}
+    (h : ValidSymCanonState bound st) (rv : MirRvalue) :
+    ValidSymCanonState bound (st.ownerReadRvalue rv) := by
+  cases rv <;> dsimp only [CanonState.ownerReadRvalue]
+  · exact h
+  · exact h.ownerReadLoc _
+  · exact h.ownerReadLoc _
+  · exact (h.ownerReadLoc _).ownerReadLoc _
+  · exact h.ownerReadLoc _
+
+theorem evalSymSlot_retarget (tbl : SymTable) (env : SymEnv) (target g : Nat) (s : Slot SymId) :
+    evalSymSlot tbl env (s.retarget target g) = (evalSymSlot tbl env s).retarget target g := by
+  cases s <;> rfl
+
+theorem ValidSymSlot.retarget {bound : Nat} {s : Slot SymId} (h : ValidSymSlot bound s)
+    (target g : Nat) : ValidSymSlot bound (s.retarget target g) := by
+  cases s <;> exact h
+
+theorem evalSymCanonState_storeThrough (tbl : SymTable) (env : SymEnv) (st : CanonState SymId)
+    (ptr target : LocalId) (symId : SymId) (g : Nat) (loan : Option (LocalId × Nat)) :
+    evalSymCanonState tbl env (st.storeThrough ptr target symId g loan) =
+      (evalSymCanonState tbl env st).storeThrough ptr target (evalSymId tbl env symId) g loan := by
+  dsimp only [CanonState.storeThrough]
+  rw [evalSymCanonState_setSlot, evalSymSlot_retarget, ← evalSymCanonState_getSlot,
+    evalSymCanonState_setSlot, evalSymCanonState_ownerReadLoc]
+  rfl
+
+theorem ValidSymCanonState.storeThrough {bound : Nat} {st : CanonState SymId}
+    (h : ValidSymCanonState bound st) {ptr target : LocalId} {symId : SymId}
+    (hId : symId < bound) (g : Nat) (loan : Option (LocalId × Nat)) :
+    ValidSymCanonState bound (st.storeThrough ptr target symId g loan) := by
+  dsimp only [CanonState.storeThrough]
+  have h₁ : ValidSymCanonState bound
+      ((st.ownerReadLoc ptr).setSlot target (.live symId g true loan)) :=
+    (h.ownerReadLoc ptr).setSlot hId
+  exact h₁.setSlot ((h₁.getSlot ptr).retarget target g)
+
+/-- Symbolic execution of a single `MirStmt` in `(st, tbl)` under optional branch path
+    condition `pc` (mirrors `execStmt`'s faults, including `.storeRef` temporal borrow checks
+    and owner-read loan invalidation). -/
+def symExecStmt (st : CanonState SymId) (tbl : SymTable)
+    (stmt : MirStmt) (pc : PathCond := none) : Option (CanonState SymId × SymTable) :=
+  match stmt with
+  | .assign dst rv =>
+    match evalSymRvalue st tbl rv with
+    | none => none
+    | some (symId, tbl') =>
+      let st₀ := st.ownerReadRvalue rv
+      match (st₀.getSlot dst).writeVal? symId none with
+      | none => none
+      | some s' => some (st₀.setSlot dst s', tbl')
+  | .storageLive loc =>
+    if loc < st.slots.length then some (st.setSlot loc (st.getSlot loc).reborn, tbl) else none
+  | .storageDead loc =>
+    if loc < st.slots.length then some (st.setSlot loc (st.getSlot loc).kill, tbl) else none
+  | .assert cond =>
+    match readSymScalar st cond with
+    | some condId =>
+      if isProvablyNonZeroUnder tbl pc condId then some (st.ownerReadLoc cond, tbl) else none
+    | none => none
+  | .retagBorrow dst target =>
+    match st.getSlot target with
+    | .live targetSymId g b targetLoan =>
+      let g' := if b then g + 1 else g
+      match ((st.setSlot target (.live targetSymId g' true targetLoan)).getSlot dst).writeVal?
+          targetSymId (some (target, g')) with
+      | none => none
+      | some s' =>
+        some ((st.setSlot target (.live targetSymId g' true targetLoan)).setSlot dst s', tbl)
+    | _ => none
+  | .storeRef ptr rv =>
+    match evalSymRvalue st tbl rv with
+    | none => none
+    | some (symId, tbl') =>
+      let st₀ := st.ownerReadRvalue rv
+      match st₀.getSlot ptr with
+      | .live _ _ _ (some (target, expGen)) =>
+        match st₀.getSlot target with
+        | .live _ curGen true none =>
+          if curGen == expGen then
+            some (st₀.storeThrough ptr target symId (curGen + 1) none, tbl')
+          else
+            none
+        | _ => none
+      | _ => none
+
+/-- **Path-Sensitive Single-Statement Simulation (`symExecStmt_under_sound`)**: a successful
+    symbolic step under path condition `pc` is matched, under every `env` satisfying
+    `PathCondHolds tbl env pc`, by the identical concrete step on the evaluated state. -/
+theorem symExecStmt_under_sound {st st' : CanonState SymId} {tbl tbl' : SymTable}
+    {stmt : MirStmt} {pc : PathCond}
+    (hValid : ValidTable tbl)
+    (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hExec : symExecStmt st tbl stmt pc = some (st', tbl')) :
+    ValidTable tbl' ∧
+      tbl.Extends tbl' ∧
+      ValidSymCanonState tbl'.nodes.length st' ∧
+      ∀ env : SymEnv,
+        PathCondHolds tbl env pc →
+        execStmt (evalSymCanonState tbl env st) stmt =
+          some (evalSymCanonState tbl' env st') := by
+  cases stmt with
+  | assign dst rv =>
+    dsimp only [symExecStmt] at hExec
+    cases hRv : evalSymRvalue st tbl rv with
+    | none =>
+      rw [hRv] at hExec
+      cases hExec
+    | some pair =>
+      rcases pair with ⟨symId, tbl₁⟩
+      rw [hRv] at hExec
+      dsimp only at hExec
+      cases hW : ((st.ownerReadRvalue rv).getSlot dst).writeVal? symId none with
+      | none =>
+        rw [hW] at hExec
+        cases hExec
+      | some s' =>
+        rw [hW] at hExec
+        injection hExec with hPair
+        injection hPair with hSt' hTbl'
+        subst hSt' hTbl'
+        rcases evalSymRvalue_sound hValid hSt hRv with ⟨hValid₁, hExt₁, hSymIdLt, hEvalRv⟩
+        have hLenLe : tbl.nodes.length ≤ tbl₁.nodes.length := hExt₁.length_le
+        have hSt₁ : ValidSymCanonState tbl₁.nodes.length (st.ownerReadRvalue rv) :=
+          ValidSymSlots.mono (hSt.ownerReadRvalue rv) hLenLe
+        refine ⟨hValid₁, hExt₁, hSt₁.setSlot (ValidSymSlot.writeVal? hW hSymIdLt), ?_⟩
+        intro env _
+        dsimp only [execStmt]
+        rw [hEvalRv env]
+        dsimp only
+        rw [evalSymCanonState_mono hValid hExt₁ env hSt, ← evalSymCanonState_ownerReadRvalue,
+          evalSymCanonState_getSlot, ← evalSymSlot_writeVal?, hW]
+        dsimp only [Option.map]
+        rw [evalSymCanonState_setSlot]
+  | storageLive loc =>
+    dsimp only [symExecStmt] at hExec
+    split at hExec
+    · rename_i hLt
+      injection hExec with hPair
+      injection hPair with hSt' hTbl'
+      subst hSt' hTbl'
+      refine ⟨hValid, SymTable.Extends.refl tbl, hSt.setSlot trivial, ?_⟩
+      intro env _
+      dsimp only [execStmt]
+      rw [evalSymCanonState_length, ite_eq_left hLt, evalSymCanonState_setSlot,
+        evalSymCanonState_getSlot, evalSymSlot_reborn]
+    · cases hExec
+  | storageDead loc =>
+    dsimp only [symExecStmt] at hExec
+    split at hExec
+    · rename_i hLt
+      injection hExec with hPair
+      injection hPair with hSt' hTbl'
+      subst hSt' hTbl'
+      refine ⟨hValid, SymTable.Extends.refl tbl, hSt.setSlot trivial, ?_⟩
+      intro env _
+      dsimp only [execStmt]
+      rw [evalSymCanonState_length, ite_eq_left hLt, evalSymCanonState_setSlot,
+        evalSymCanonState_getSlot, evalSymSlot_kill]
+    · cases hExec
+  | assert cond =>
+    dsimp only [symExecStmt] at hExec
+    cases hRead : readSymScalar st cond with
+    | none =>
+      rw [hRead] at hExec
+      cases hExec
+    | some condId =>
+      rw [hRead] at hExec
+      dsimp only at hExec
+      split at hExec
+      · rename_i hNz
+        injection hExec with hPair
+        injection hPair with hSt' hTbl'
+        subst hSt' hTbl'
+        refine ⟨hValid, SymTable.Extends.refl tbl, hSt.ownerReadLoc cond, ?_⟩
+        intro env hPc
+        have hSpec := readSymScalar_spec env hSt (loc := cond)
+        rw [hRead] at hSpec
+        dsimp only [execStmt]
+        rw [hSpec.2]
+        dsimp only
+        rw [isProvablyNonZeroUnder_sound hValid hPc hNz, evalSymCanonState_ownerReadLoc]
+        rfl
+      · cases hExec
+  | retagBorrow dst target =>
+    dsimp only [symExecStmt] at hExec
+    cases hTgt : st.getSlot target with
+    | dead _ => rw [hTgt] at hExec; cases hExec
+    | uninit _ => rw [hTgt] at hExec; cases hExec
+    | live targetSymId g targetB targetLoan =>
+      rw [hTgt] at hExec
+      dsimp only at hExec
+      generalize hg' : (if targetB = true then g + 1 else g) = g' at hExec
+      cases hW : ((st.setSlot target (.live targetSymId g' true targetLoan)).getSlot dst).writeVal?
+          targetSymId (some (target, g')) with
+      | none =>
+        rw [hW] at hExec
+        cases hExec
+      | some s' =>
+        rw [hW] at hExec
+        injection hExec with hPair
+        injection hPair with hSt' hTbl'
+        subst hSt' hTbl'
+        have hTgtValid : targetSymId < tbl.nodes.length := by
+          have hSlot := hSt.getSlot target
+          rw [hTgt] at hSlot
+          exact hSlot
+        have hSt₁ := hSt.setSlot (loc := target) (s := .live targetSymId g' true targetLoan)
+          hTgtValid
+        refine ⟨hValid, SymTable.Extends.refl tbl,
+          hSt₁.setSlot (ValidSymSlot.writeVal? hW hTgtValid), ?_⟩
+        intro env _
+        have hSetEq : (evalSymCanonState tbl env st).setSlot target
+            (.live (evalSymId tbl env targetSymId) g' true targetLoan) =
+            evalSymCanonState tbl env (st.setSlot target (.live targetSymId g' true targetLoan)) :=
+          (evalSymCanonState_setSlot tbl env st target (.live targetSymId g' true targetLoan)).symm
+        dsimp only [execStmt]
+        rw [evalSymCanonState_getSlot, hTgt]
+        dsimp only [evalSymSlot]
+        rw [hg', hSetEq, evalSymCanonState_getSlot, ← evalSymSlot_writeVal?, hW]
+        dsimp only [Option.map]
+        exact congrArg some (evalSymCanonState_setSlot tbl env _ dst s').symm
+  | storeRef ptr rv =>
+    dsimp only [symExecStmt] at hExec
+    cases hRv : evalSymRvalue st tbl rv with
+    | none => rw [hRv] at hExec; cases hExec
+    | some pair =>
+      rcases pair with ⟨symId, tbl₁⟩
+      rw [hRv] at hExec
+      dsimp only at hExec
+      cases hPtr : (st.ownerReadRvalue rv).getSlot ptr with
+      | dead _ => rw [hPtr] at hExec; cases hExec
+      | uninit _ => rw [hPtr] at hExec; cases hExec
+      | live ptrId ptrG ptrB ptrLoan =>
+        rw [hPtr] at hExec
+        cases ptrLoan with
+        | none => cases hExec
+        | some lPair =>
+          rcases lPair with ⟨target, expGen⟩
+          dsimp only at hExec
+          cases hTgt : (st.ownerReadRvalue rv).getSlot target with
+          | dead _ => rw [hTgt] at hExec; cases hExec
+          | uninit _ => rw [hTgt] at hExec; cases hExec
+          | live targetSymId curGen targetB targetLoan =>
+            rw [hTgt] at hExec
+            cases targetB with
+            | false => cases hExec
+            | true =>
+              cases targetLoan with
+              | some _ => cases hExec
+              | none =>
+                dsimp only at hExec
+                split at hExec
+                · rename_i hGenEq
+                  injection hExec with hPair
+                  injection hPair with hSt' hTbl'
+                  subst hSt' hTbl'
+                  rcases evalSymRvalue_sound hValid hSt hRv with
+                    ⟨hValid₁, hExt₁, hSymIdLt, hEvalRv⟩
+                  have hSt₁ : ValidSymCanonState tbl₁.nodes.length (st.ownerReadRvalue rv) :=
+                    ValidSymSlots.mono (hSt.ownerReadRvalue rv) hExt₁.length_le
+                  refine ⟨hValid₁, hExt₁, hSt₁.storeThrough hSymIdLt (curGen + 1) none, ?_⟩
+                  intro env _
+                  dsimp only [execStmt]
+                  rw [hEvalRv env]
+                  dsimp only
+                  rw [← evalSymCanonState_ownerReadRvalue, evalSymCanonState_getSlot, hPtr]
+                  dsimp only [evalSymSlot]
+                  rw [evalSymCanonState_getSlot, hTgt]
+                  dsimp only [evalSymSlot]
+                  rw [ite_eq_left hGenEq, evalSymCanonState_storeThrough,
+                    evalSymCanonState_mono hValid hExt₁ env (hSt.ownerReadRvalue rv)]
+                · cases hExec
+
+/-- **Exact single-statement simulation (`symExecStmt_sound`)** for `pc = none`. -/
+theorem symExecStmt_sound {st st' : CanonState SymId} {tbl tbl' : SymTable}
+    {stmt : MirStmt}
+    (hValid : ValidTable tbl)
+    (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hExec : symExecStmt st tbl stmt = some (st', tbl')) :
+    ValidTable tbl' ∧
+      tbl.Extends tbl' ∧
+      ValidSymCanonState tbl'.nodes.length st' ∧
+      ∀ env : SymEnv,
+        execStmt (evalSymCanonState tbl env st) stmt =
+          some (evalSymCanonState tbl' env st') := by
+  rcases symExecStmt_under_sound hValid hSt hExec with ⟨hV, hE, hS, hEv⟩
+  exact ⟨hV, hE, hS, fun env => hEv env trivial⟩
+
+/-- Symbolic execution of a list of `MirStmt`s in `(st, tbl)` under optional branch path
+    condition `pc`. -/
+def symExecStmts (st : CanonState SymId) (tbl : SymTable) :
+    List MirStmt → (pc : PathCond := none) → Option (CanonState SymId × SymTable)
+  | [], _ => some (st, tbl)
+  | stmt :: rest, pc =>
+    match symExecStmt st tbl stmt pc with
+    | some (st₁, tbl₁) => symExecStmts st₁ tbl₁ rest pc
+    | none => none
+
+theorem symExecStmts_under_sound :
+    ∀ (stmts : List MirStmt) {st st' : CanonState SymId} {tbl tbl' : SymTable} {pc : PathCond},
+      ValidTable tbl →
+      ValidSymCanonState tbl.nodes.length st →
+      symExecStmts st tbl stmts pc = some (st', tbl') →
+      PathCondValid tbl.nodes.length pc →
+      ValidTable tbl' ∧
+        tbl.Extends tbl' ∧
+        ValidSymCanonState tbl'.nodes.length st' ∧
+        ∀ env : SymEnv,
+          PathCondHolds tbl env pc →
+          execStmts (evalSymCanonState tbl env st) stmts =
+            some (evalSymCanonState tbl' env st')
+  | [], _, _, tbl, _, _, hValid, hSt, hExec, _ => by
+    dsimp [symExecStmts] at hExec
+    injection hExec with hPair
+    injection hPair with hSt' hTbl'
+    subst hSt' hTbl'
+    exact ⟨hValid, SymTable.Extends.refl tbl, hSt, fun _ _ => rfl⟩
+  | stmt :: rest, st, st', tbl, tbl', pc, hValid, hSt, hExec, hPcValid => by
+    dsimp [symExecStmts] at hExec
+    cases hStep₁ : symExecStmt st tbl stmt pc with
+    | none =>
+      rw [hStep₁] at hExec
+      cases hExec
+    | some pair₁ =>
+      rcases pair₁ with ⟨st₁, tbl₁⟩
+      rw [hStep₁] at hExec
+      rcases symExecStmt_under_sound hValid hSt hStep₁ with ⟨hValid₁, hExt₁, hSt₁, hEval₁⟩
+      have hPcValid₁ : PathCondValid tbl₁.nodes.length pc := hPcValid.mono hExt₁.length_le
+      rcases symExecStmts_under_sound rest hValid₁ hSt₁ hExec hPcValid₁ with
+        ⟨hValid₂, hExt₂, hSt₂, hEval₂⟩
+      refine ⟨hValid₂, hExt₁.trans hExt₂, hSt₂, ?_⟩
+      intro env hPc
+      dsimp [execStmts]
+      rw [hEval₁ env hPc]
+      exact hEval₂ env (PathCondHolds.mono hValid hExt₁ hPcValid hPc)
+
+theorem symExecStmts_sound
+    (stmts : List MirStmt) {st st' : CanonState SymId} {tbl tbl' : SymTable}
+    (hValid : ValidTable tbl)
+    (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hExec : symExecStmts st tbl stmts = some (st', tbl')) :
+    ValidTable tbl' ∧
+      tbl.Extends tbl' ∧
+      ValidSymCanonState tbl'.nodes.length st' ∧
+      ∀ env : SymEnv,
+        execStmts (evalSymCanonState tbl env st) stmts =
+          some (evalSymCanonState tbl' env st') := by
+  rcases symExecStmts_under_sound stmts hValid hSt hExec trivial with ⟨hV, hE, hS, hEv⟩
+  exact ⟨hV, hE, hS, fun env => hEv env trivial⟩
+
+/-!
+### 3.3 Join-Point Pruning Refinement (`SlotRefines` / `StateRefines`)
+
+The symbolic evaluator prunes dead locals at joins (`joinCanon`), so the states it tracks are
+*more dead* than the concrete (unpruned) state: every abstract slot either equals the concrete
+slot or is the concrete slot's `kill` (dead, same borrow-dirtied generation). Every concrete
+operation is monotone w.r.t. this refinement (`execStmts_refines`), which is what lets the
+untrusted liveness mask stay outside the trusted concrete semantics.
+-/
+
+/-- Slot refinement: abstract slot `a` equals concrete slot `c`, or is its join-point prune `c.kill`. -/
+def SlotRefines (a c : Slot Nat) : Prop := a = c ∨ a = c.kill
+
+/-- Pointwise slot-list refinement (forces equal lengths). -/
+def SlotsRefine : List (Slot Nat) → List (Slot Nat) → Prop
+  | [], [] => True
+  | a :: as, c :: cs => SlotRefines a c ∧ SlotsRefine as cs
+  | _, _ => False
+
+/-- State refinement between an abstract (join-pruned) and a concrete `CanonState Nat`. -/
+def StateRefines (a c : CanonState Nat) : Prop := SlotsRefine a.slots c.slots
+
+theorem SlotsRefine.refl : ∀ (cs : List (Slot Nat)), SlotsRefine cs cs
+  | [] => trivial
+  | _ :: cs => ⟨Or.inl rfl, SlotsRefine.refl cs⟩
+
+theorem StateRefines.refl (c : CanonState Nat) : StateRefines c c :=
+  SlotsRefine.refl c.slots
+
+theorem SlotsRefine.length_eq : ∀ {as cs : List (Slot Nat)}, SlotsRefine as cs →
+    as.length = cs.length
+  | [], [], _ => rfl
+  | _ :: _, _ :: _, ⟨_, h⟩ => by simp [SlotsRefine.length_eq h]
+  | [], _ :: _, h => False.elim h
+  | _ :: _, [], h => False.elim h
+
+theorem StateRefines.length_eq {a c : CanonState Nat} (h : StateRefines a c) :
+    a.slots.length = c.slots.length :=
+  SlotsRefine.length_eq h
+
+theorem Slot.kill_reborn {Val : Type} (s : Slot Val) : s.kill.reborn = s.reborn := rfl
+
+/-- A non-dead abstract slot refines only itself. -/
+theorem SlotRefines.eq_of_not_dead {a c : Slot Nat} (h : SlotRefines a c)
+    (hNot : ∀ g, a ≠ .dead g) : c = a := by
+  rcases h with h | h
+  · exact h.symm
+  · exact absurd h (hNot c.nextGenOnEnd)
+
+theorem SlotsRefine.getSlotAt : ∀ {as cs : List (Slot Nat)} (loc : LocalId),
+    SlotsRefine as cs → SlotRefines (getSlotAt as loc) (getSlotAt cs loc)
+  | [], [], _, _ => Or.inl rfl
+  | _ :: _, _ :: _, 0, ⟨h, _⟩ => h
+  | _ :: _, _ :: _, loc + 1, ⟨_, h⟩ => SlotsRefine.getSlotAt loc h
+  | [], _ :: _, _, h => False.elim h
+  | _ :: _, [], _, h => False.elim h
+
+theorem StateRefines.getSlot {a c : CanonState Nat} (h : StateRefines a c) (loc : LocalId) :
+    SlotRefines (a.getSlot loc) (c.getSlot loc) :=
+  SlotsRefine.getSlotAt loc h
+
+theorem SlotsRefine.setSlotAt : ∀ {as cs : List (Slot Nat)} (loc : LocalId) {a c : Slot Nat},
+    SlotsRefine as cs → SlotRefines a c → SlotsRefine (setSlotAt as loc a) (setSlotAt cs loc c)
+  | [], [], _, _, _, _, _ => trivial
+  | _ :: _, _ :: _, 0, _, _, ⟨_, hT⟩, hS => ⟨hS, hT⟩
+  | _ :: _, _ :: _, loc + 1, _, _, ⟨hH, hT⟩, hS => ⟨hH, SlotsRefine.setSlotAt loc hT hS⟩
+  | [], _ :: _, _, _, _, h, _ => False.elim h
+  | _ :: _, [], _, _, _, h, _ => False.elim h
+
+theorem StateRefines.setSlot {a c : CanonState Nat} {loc : LocalId} {sa sc : Slot Nat}
+    (h : StateRefines a c) (hS : SlotRefines sa sc) :
+    StateRefines (a.setSlot loc sa) (c.setSlot loc sc) :=
+  SlotsRefine.setSlotAt loc h hS
+
+theorem readConcreteScalar_refines {a c : CanonState Nat} (h : StateRefines a c)
+    {loc : LocalId} {v : Nat} (hRead : readConcreteScalar a loc = some v) :
+    readConcreteScalar c loc = some v := by
+  unfold readConcreteScalar at hRead ⊢
+  have hS := h.getSlot loc
+  cases hA : a.getSlot loc with
+  | dead g => rw [hA] at hRead; cases hRead
+  | uninit g => rw [hA] at hRead; cases hRead
+  | live v' g b l =>
+    rw [hA] at hRead hS
+    rw [hS.eq_of_not_dead (by intro _ hh; cases hh)]
+    exact hRead
+
+theorem evalConcreteRvalue_refines {a c : CanonState Nat} (h : StateRefines a c)
+    {rv : MirRvalue} {v : Nat} (hEval : evalConcreteRvalue a rv = some v) :
+    evalConcreteRvalue c rv = some v := by
+  cases rv with
+  | const n => exact hEval
+  | use src => exact readConcreteScalar_refines h hEval
+  | op1 op src =>
+    dsimp only [evalConcreteRvalue] at hEval ⊢
+    cases hR : readConcreteScalar a src with
+    | none => rw [hR] at hEval; cases hEval
+    | some x =>
+      rw [hR] at hEval
+      rw [readConcreteScalar_refines h hR]
+      exact hEval
+  | op2 op lhs rhs =>
+    dsimp only [evalConcreteRvalue] at hEval ⊢
+    cases hL : readConcreteScalar a lhs with
+    | none => rw [hL] at hEval; cases hEval
+    | some x =>
+      cases hR : readConcreteScalar a rhs with
+      | none => rw [hL, hR] at hEval; cases hEval
+      | some y =>
+        rw [hL, hR] at hEval
+        rw [readConcreteScalar_refines h hL, readConcreteScalar_refines h hR]
+        exact hEval
+  | derefRef ptr =>
+    dsimp only [evalConcreteRvalue] at hEval ⊢
+    have hP := h.getSlot ptr
+    cases hPtr : a.getSlot ptr with
+    | dead _ => rw [hPtr] at hEval; cases hEval
+    | uninit _ => rw [hPtr] at hEval; cases hEval
+    | live pv pg pb pl =>
+      rw [hPtr] at hEval hP
+      rw [hP.eq_of_not_dead (by intro _ hh; cases hh)]
+      cases pl with
+      | none => cases hEval
+      | some pair =>
+        rcases pair with ⟨target, expGen⟩
+        dsimp only at hEval ⊢
+        have hT := h.getSlot target
+        cases hTgt : a.getSlot target with
+        | dead _ => rw [hTgt] at hEval; cases hEval
+        | uninit _ => rw [hTgt] at hEval; cases hEval
+        | live tv tg tb tl =>
+          rw [hTgt] at hEval hT
+          rw [hT.eq_of_not_dead (by intro _ hh; cases hh)]
+          exact hEval
+
+theorem writeVal?_refines {a c : Slot Nat} (h : SlotRefines a c) {v : Nat}
+    {l : Option (LocalId × Nat)} {a' : Slot Nat} (hW : a.writeVal? v l = some a') :
+    c.writeVal? v l = some a' := by
+  have hc : c = a := h.eq_of_not_dead (by
+    intro g hg
+    subst hg
+    cases hW)
+  rw [hc]
+  exact hW
+
+theorem Slot.ownerRead_kill {Val : Type} (s : Slot Val) : s.ownerRead.kill = s.kill := by
+  cases s with
+  | dead _ => rfl
+  | uninit _ => rfl
+  | live _ _ b _ => cases b <;> rfl
+
+theorem SlotRefines.ownerRead {a c : Slot Nat} (h : SlotRefines a c) :
+    SlotRefines a.ownerRead c.ownerRead := by
+  rcases h with h | h
+  · subst h
+    exact Or.inl rfl
+  · subst h
+    exact Or.inr (Slot.ownerRead_kill c).symm
+
+theorem StateRefines.ownerReadLoc {a c : CanonState Nat} (h : StateRefines a c) (loc : LocalId) :
+    StateRefines (a.ownerReadLoc loc) (c.ownerReadLoc loc) :=
+  h.setSlot (h.getSlot loc).ownerRead
+
+theorem StateRefines.ownerReadRvalue {a c : CanonState Nat} (h : StateRefines a c) (rv : MirRvalue) :
+    StateRefines (a.ownerReadRvalue rv) (c.ownerReadRvalue rv) := by
+  cases rv <;> dsimp only [CanonState.ownerReadRvalue]
+  · exact h
+  · exact h.ownerReadLoc _
+  · exact h.ownerReadLoc _
+  · exact (h.ownerReadLoc _).ownerReadLoc _
+  · exact h.ownerReadLoc _
+
+theorem SlotRefines.retarget {a c : Slot Nat} (h : SlotRefines a c) (target g : Nat) :
+    SlotRefines (a.retarget target g) (c.retarget target g) := by
+  rcases h with h | h
+  · subst h
+    exact Or.inl rfl
+  · subst h
+    cases c with
+    | dead _ => exact Or.inr rfl
+    | uninit _ => exact Or.inr rfl
+    | live pv pg pb pl => exact Or.inr (by cases pb <;> rfl)
+
+theorem StateRefines.storeThrough {a c : CanonState Nat} (h : StateRefines a c)
+    (ptr target : LocalId) (v g : Nat) (loan : Option (LocalId × Nat)) :
+    StateRefines (a.storeThrough ptr target v g loan) (c.storeThrough ptr target v g loan) := by
+  dsimp only [CanonState.storeThrough]
+  have h₁ : StateRefines ((a.ownerReadLoc ptr).setSlot target (.live v g true loan))
+      ((c.ownerReadLoc ptr).setSlot target (.live v g true loan)) :=
+    (h.ownerReadLoc ptr).setSlot (Or.inl rfl)
+  exact h₁.setSlot ((h₁.getSlot ptr).retarget target g)
+
+/-- **Refinement Monotonicity of a Concrete Step (`execStmt_refines`)**: if a statement succeeds
+    on the (more-dead) abstract state, it succeeds on every refined concrete state, and the
+    results remain related. -/
+theorem execStmt_refines {a c : CanonState Nat} (h : StateRefines a c) {stmt : MirStmt}
+    {a' : CanonState Nat} (hExec : execStmt a stmt = some a') :
+    ∃ c', execStmt c stmt = some c' ∧ StateRefines a' c' := by
+  cases stmt with
+  | assign dst rv =>
+    dsimp only [execStmt] at hExec ⊢
+    cases hRv : evalConcreteRvalue a rv with
+    | none => rw [hRv] at hExec; cases hExec
+    | some v =>
+      rw [hRv] at hExec
+      rw [evalConcreteRvalue_refines h hRv]
+      dsimp only at hExec ⊢
+      have h₀ : StateRefines (a.ownerReadRvalue rv) (c.ownerReadRvalue rv) :=
+        h.ownerReadRvalue rv
+      cases hW : ((a.ownerReadRvalue rv).getSlot dst).writeVal? v none with
+      | none => rw [hW] at hExec; cases hExec
+      | some s' =>
+        rw [hW] at hExec
+        rw [writeVal?_refines (h₀.getSlot dst) hW]
+        injection hExec with hA'
+        subst hA'
+        exact ⟨_, rfl, h₀.setSlot (Or.inl rfl)⟩
+  | storageLive loc =>
+    dsimp only [execStmt] at hExec ⊢
+    rw [← h.length_eq]
+    split at hExec
+    · rename_i hLt
+      injection hExec with hA'
+      subst hA'
+      refine ⟨_, ite_eq_left hLt, h.setSlot ?_⟩
+      rcases h.getSlot loc with hS | hS
+      · rw [hS]
+        exact Or.inl rfl
+      · rw [hS, Slot.kill_reborn]
+        exact Or.inl rfl
+    · cases hExec
+  | storageDead loc =>
+    dsimp only [execStmt] at hExec ⊢
+    rw [← h.length_eq]
+    split at hExec
+    · rename_i hLt
+      injection hExec with hA'
+      subst hA'
+      refine ⟨_, ite_eq_left hLt, h.setSlot ?_⟩
+      rcases h.getSlot loc with hS | hS
+      · rw [hS]
+        exact Or.inl rfl
+      · rw [hS, Slot.kill_idempotent]
+        exact Or.inl rfl
+    · cases hExec
+  | assert cond =>
+    dsimp only [execStmt] at hExec ⊢
+    cases hR : readConcreteScalar a cond with
+    | none => rw [hR] at hExec; cases hExec
+    | some v =>
+      rw [hR] at hExec
+      rw [readConcreteScalar_refines h hR]
+      dsimp only at hExec ⊢
+      split at hExec
+      · rename_i hNz
+        injection hExec with hA'
+        subst hA'
+        exact ⟨c.ownerReadLoc cond, ite_eq_left hNz, h.ownerReadLoc cond⟩
+      · cases hExec
+  | retagBorrow dst target =>
+    dsimp only [execStmt] at hExec ⊢
+    have hT := h.getSlot target
+    cases hTgt : a.getSlot target with
+    | dead _ => rw [hTgt] at hExec; cases hExec
+    | uninit _ => rw [hTgt] at hExec; cases hExec
+    | live tv g b tl =>
+      rw [hTgt] at hExec hT
+      rw [hT.eq_of_not_dead (by intro _ hh; cases hh)]
+      dsimp only at hExec ⊢
+      generalize (if b = true then g + 1 else g) = g' at hExec ⊢
+      have h₁ : StateRefines (a.setSlot target (.live tv g' true tl))
+          (c.setSlot target (.live tv g' true tl)) := h.setSlot (Or.inl rfl)
+      cases hW : ((a.setSlot target (.live tv g' true tl)).getSlot dst).writeVal? tv
+          (some (target, g')) with
+      | none => rw [hW] at hExec; cases hExec
+      | some s' =>
+        rw [hW] at hExec
+        rw [writeVal?_refines (h₁.getSlot dst) hW]
+        injection hExec with hA'
+        subst hA'
+        exact ⟨_, rfl, h₁.setSlot (Or.inl rfl)⟩
+  | storeRef ptr rv =>
+    dsimp only [execStmt] at hExec ⊢
+    cases hRv : evalConcreteRvalue a rv with
+    | none => rw [hRv] at hExec; cases hExec
+    | some v =>
+      rw [hRv] at hExec
+      rw [evalConcreteRvalue_refines h hRv]
+      dsimp only at hExec ⊢
+      have h₀ : StateRefines (a.ownerReadRvalue rv) (c.ownerReadRvalue rv) :=
+        h.ownerReadRvalue rv
+      have hP := h₀.getSlot ptr
+      cases hPtr : (a.ownerReadRvalue rv).getSlot ptr with
+      | dead _ => rw [hPtr] at hExec; cases hExec
+      | uninit _ => rw [hPtr] at hExec; cases hExec
+      | live pv pg pb pl =>
+        rw [hPtr] at hExec hP
+        rw [hP.eq_of_not_dead (by intro _ hh; cases hh)]
+        cases pl with
+        | none => cases hExec
+        | some lPair =>
+          rcases lPair with ⟨target, expGen⟩
+          dsimp only at hExec ⊢
+          have hT := h₀.getSlot target
+          cases hTgt : (a.ownerReadRvalue rv).getSlot target with
+          | dead _ => rw [hTgt] at hExec; cases hExec
+          | uninit _ => rw [hTgt] at hExec; cases hExec
+          | live tv curGen tb tl =>
+            rw [hTgt] at hExec hT
+            rw [hT.eq_of_not_dead (by intro _ hh; cases hh)]
+            cases tb with
+            | false => cases hExec
+            | true =>
+              cases tl with
+              | some _ => cases hExec
+              | none =>
+                dsimp only at hExec ⊢
+                split at hExec
+                · rename_i hGenEq
+                  injection hExec with hA'
+                  subst hA'
+                  exact ⟨_, ite_eq_left hGenEq, h₀.storeThrough ptr target v (curGen + 1) none⟩
+                · cases hExec
+
+theorem execStmts_refines : ∀ (stmts : List MirStmt) {a c a' : CanonState Nat},
+    StateRefines a c → execStmts a stmts = some a' →
+    ∃ c', execStmts c stmts = some c' ∧ StateRefines a' c'
+  | [], a, c, a', h, hExec => by
+    dsimp only [execStmts] at hExec
+    injection hExec with hA'
+    subst hA'
+    exact ⟨c, rfl, h⟩
+  | stmt :: rest, a, c, a', h, hExec => by
+    dsimp only [execStmts] at hExec ⊢
+    cases hS : execStmt a stmt with
+    | none => rw [hS] at hExec; cases hExec
+    | some a₁ =>
+      rw [hS] at hExec
+      dsimp only at hExec
+      rcases execStmt_refines h hS with ⟨c₁, hC₁, hR₁⟩
+      rw [hC₁]
+      exact execStmts_refines rest hR₁ hExec
+
+/-- Length-preserving join-point pruning of a dense slot list against a liveness mask: slot
+    `i` is kept when `mask[i] = true` (or when the mask is shorter than the slot list) and
+    replaced by `Slot.kill` (dead, keeping its borrow-dirtied generation) when
+    `mask[i] = false`. -/
+def pruneSlots {Val : Type} : List Bool → List (Slot Val) → List (Slot Val)
+  | [], ss => ss
+  | _ :: _, [] => []
+  | b :: bs, s :: ss => normalizeSlotForMask b s :: pruneSlots bs ss
+
+/-- Join-point canonicalization of a dense `CanonState` (`CanonLocals` pruning). -/
+def joinCanon {Val : Type} (mask : List Bool) (st : CanonState Val) : CanonState Val :=
+  { slots := pruneSlots mask st.slots }
+
+theorem pruneSlots_idempotent {Val : Type} : ∀ (mask : List Bool) (ss : List (Slot Val)),
+    pruneSlots mask (pruneSlots mask ss) = pruneSlots mask ss
+  | [], _ => rfl
+  | _ :: _, [] => rfl
+  | b :: bs, s :: ss => by
+    simp only [pruneSlots]
+    rw [normalizeSlotForMask_idempotent, pruneSlots_idempotent bs ss]
+
+/-- `joinCanon` is idempotent (re-pruning a pruned state is a no-op). -/
+theorem joinCanon_idempotent {Val : Type} (mask : List Bool) (st : CanonState Val) :
+    joinCanon mask (joinCanon mask st) = joinCanon mask st := by
+  dsimp only [joinCanon]
+  rw [pruneSlots_idempotent]
+
+theorem SlotRefines.normalize {a c : Slot Nat} (h : SlotRefines a c) (b : Bool) :
+    SlotRefines (normalizeSlotForMask b a) c := by
+  cases b with
+  | true => exact h
+  | false =>
+    rcases h with h | h
+    · subst h
+      exact Or.inr rfl
+    · subst h
+      exact Or.inr (Slot.kill_idempotent c)
+
+theorem pruneSlots_refines : ∀ (mask : List Bool) {as cs : List (Slot Nat)},
+    SlotsRefine as cs → SlotsRefine (pruneSlots mask as) cs
+  | [], _, _, h => h
+  | _ :: _, [], [], _ => trivial
+  | b :: bs, _ :: _, _ :: _, ⟨hH, hT⟩ => ⟨hH.normalize b, pruneSlots_refines bs hT⟩
+  | _ :: _, [], _ :: _, h => False.elim h
+  | _ :: _, _ :: _, [], h => False.elim h
+
+/-- Pruning dead locals keeps a refined state refined (the abstract side only gets deader). -/
+theorem StateRefines.joinCanon {a c : CanonState Nat} (h : StateRefines a c) (mask : List Bool) :
+    StateRefines (joinCanon mask a) c :=
+  pruneSlots_refines mask h
+
+theorem map_pruneSlots (tbl : SymTable) (env : SymEnv) :
+    ∀ (mask : List Bool) (ss : List (Slot SymId)),
+      (pruneSlots mask ss).map (evalSymSlot tbl env) =
+        pruneSlots mask (ss.map (evalSymSlot tbl env))
+  | [], _ => rfl
+  | _ :: _, [] => rfl
+  | b :: bs, s :: ss => by
+    simp only [pruneSlots, List.map_cons]
+    rw [map_pruneSlots tbl env bs ss]
+    cases b with
+    | true => rfl
+    | false =>
+      dsimp [normalizeSlotForMask]
+      rw [evalSymSlot_kill]
+
+theorem evalSymCanonState_joinCanon (tbl : SymTable) (env : SymEnv) (mask : List Bool)
+    (st : CanonState SymId) :
+    evalSymCanonState tbl env (joinCanon mask st) =
+      joinCanon mask (evalSymCanonState tbl env st) := by
+  dsimp only [evalSymCanonState, joinCanon]
+  rw [map_pruneSlots]
+
+theorem ValidSymSlots_pruneSlots {bound : Nat} : ∀ (mask : List Bool) {ss : List (Slot SymId)},
+    ValidSymSlots bound ss → ValidSymSlots bound (pruneSlots mask ss)
+  | [], _, h => h
+  | _ :: _, [], _ => trivial
+  | b :: bs, _ :: _, ⟨hH, hT⟩ => by
+    refine ⟨?_, ValidSymSlots_pruneSlots bs hT⟩
+    cases b with
+    | true => exact hH
+    | false => trivial
+
+theorem ValidSymCanonState.joinCanon {bound : Nat} {st : CanonState SymId}
+    (h : ValidSymCanonState bound st) (mask : List Bool) :
+    ValidSymCanonState bound (joinCanon mask st) :=
+  ValidSymSlots_pruneSlots mask h
+
+/-!
+### 3.4 Compositional Diamond Join (`symExecDiamondJoin`, `wpJoinBlock_sound`)
+-/
+
+/-- `goto` target of an arm block, if its terminator is a `goto`. -/
+def armGoto? (blk : MirBlock) : Option BlockId :=
+  match blk.term with
+  | .goto j => some j
+  | _ => none
+
+theorem armGoto?_spec {blk : MirBlock} {j : BlockId} (h : armGoto? blk = some j) :
+    blk.term = .goto j := by
+  unfold armGoto? at h
+  split at h
+  · rename_i j' hTerm
+    injection h with hj
+    subst hj
+    exact hTerm
+  · cases h
+
+/-- Recognize a `switchInt` diamond: both arm blocks exist and end in `goto` the same join
+    block. Returns `(thenStmts, elseStmts, joinBb)`. -/
+def matchDiamond (cfg : MirCfg) (thenBb elseBb : BlockId) :
+    Option (List MirStmt × List MirStmt × BlockId) :=
+  match cfg.blocks[thenBb]?, cfg.blocks[elseBb]? with
+  | some tBlk, some eBlk =>
+    match armGoto? tBlk, armGoto? eBlk with
+    | some jT, some jF => if jT = jF then some (tBlk.stmts, eBlk.stmts, jT) else none
+    | _, _ => none
+  | _, _ => none
+
+theorem matchDiamond_spec {cfg : MirCfg} {thenBb elseBb joinBb : BlockId}
+    {thenStmts elseStmts : List MirStmt}
+    (h : matchDiamond cfg thenBb elseBb = some (thenStmts, elseStmts, joinBb)) :
+    ∃ tBlk eBlk, cfg.blocks[thenBb]? = some tBlk ∧ cfg.blocks[elseBb]? = some eBlk ∧
+      tBlk.stmts = thenStmts ∧ eBlk.stmts = elseStmts ∧
+      tBlk.term = .goto joinBb ∧ eBlk.term = .goto joinBb := by
+  unfold matchDiamond at h
+  split at h
+  · rename_i tBlk eBlk hT hE
+    split at h
+    · rename_i jT jF hjT hjF
+      split at h
+      · rename_i hj
+        subst hj
+        injection h with h1
+        injection h1 with hS1 h2
+        injection h2 with hS2 hJ
+        subst hS1 hS2 hJ
+        exact ⟨tBlk, eBlk, hT, hE, rfl, rfl, armGoto?_spec hjT, armGoto?_spec hjF⟩
+      · cases h
+    · cases h
+  · cases h
+
+/-- Diamond merge plan: a recognized diamond whose join block carries a liveness hint. -/
+def diamondMergePlan (cfg : MirCfg) (hints : JoinHints) (thenBb elseBb : BlockId) :
+    Option (List MirStmt × List MirStmt × BlockId × List Bool) :=
+  match matchDiamond cfg thenBb elseBb with
+  | some (thenStmts, elseStmts, joinBb) =>
+    match hints joinBb with
+    | some mask => some (thenStmts, elseStmts, joinBb, mask)
+    | none => none
+  | none => none
+
+theorem diamondMergePlan_spec {cfg : MirCfg} {hints : JoinHints} {thenBb elseBb joinBb : BlockId}
+    {thenStmts elseStmts : List MirStmt} {mask : List Bool}
+    (h : diamondMergePlan cfg hints thenBb elseBb = some (thenStmts, elseStmts, joinBb, mask)) :
+    matchDiamond cfg thenBb elseBb = some (thenStmts, elseStmts, joinBb) := by
+  unfold diamondMergePlan at h
+  split at h
+  · rename_i tS eS j hM
+    split at h
+    · injection h with h1
+      injection h1 with hS1 h2
+      injection h2 with hS2 h3
+      injection h3 with hJ _
+      subst hS1 hS2 hJ
+      exact hM
+    · cases h
+  · cases h
+
+/-- Execute both diamond arms symbolically from `(st, tbl)` under their respective branch
+    path conditions (`some (condId, true)` for `thenStmts`, `some (condId, false)` for
+    `elseStmts`), prune both post-states with the (untrusted) join mask, and merge them into
+    ONE continuation state under `condId`. -/
+def symExecDiamondJoin (st : CanonState SymId) (tbl : SymTable) (condId : SymId)
+    (thenStmts elseStmts : List MirStmt) (mask : List Bool) :
+    Option (CanonState SymId × SymTable) :=
+  match symExecStmts st tbl thenStmts (some (condId, true)) with
+  | none => none
+  | some (stT, tbl₁) =>
+    match symExecStmts st tbl₁ elseStmts (some (condId, false)) with
+    | none => none
+    | some (stF, tbl₂) => mergeJoinStates tbl₂ condId (joinCanon mask stT) (joinCanon mask stF)
+
+/-- Alias for `symExecDiamondJoin` (`wpJoinDiamond`). -/
+abbrev wpJoinDiamond := @symExecDiamondJoin
+
+/-- **Compositional Join-Point Soundness (`wpJoinBlock_sound`)**: the single merged state
+    `stM` produced by `symExecDiamondJoin` soundly abstracts — via `StateRefines` — the
+    concrete post-state of whichever arm the concrete (mask-free) execution takes, from every
+    concrete state refined by the evaluated entry state. The join continuation can therefore
+    be analyzed **once**, from `stM`. -/
+theorem wpJoinBlock_sound {st stM : CanonState SymId} {tbl tblM : SymTable} {condId : SymId}
+    {thenStmts elseStmts : List MirStmt} {mask : List Bool}
+    (hValid : ValidTable tbl) (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hCond : condId < tbl.nodes.length)
+    (hJoin : symExecDiamondJoin st tbl condId thenStmts elseStmts mask = some (stM, tblM)) :
+    ValidTable tblM ∧ tbl.Extends tblM ∧ ValidSymCanonState tblM.nodes.length stM ∧
+      ∀ (env : SymEnv) (cst : CanonState Nat),
+        StateRefines (evalSymCanonState tbl env st) cst →
+        ∃ cst', execStmts cst (if evalSymId tbl env condId != 0 then thenStmts else elseStmts) =
+            some cst' ∧
+          StateRefines (evalSymCanonState tblM env stM) cst' := by
+  unfold symExecDiamondJoin at hJoin
+  cases hThen : symExecStmts st tbl thenStmts (some (condId, true)) with
+  | none => rw [hThen] at hJoin; cases hJoin
+  | some pT =>
+    rcases pT with ⟨stT, tbl₁⟩
+    rw [hThen] at hJoin
+    dsimp only at hJoin
+    rcases symExecStmts_under_sound thenStmts hValid hSt hThen hCond with
+      ⟨hValid₁, hExt₁, hStT, hEvalT⟩
+    have hSt₁ : ValidSymCanonState tbl₁.nodes.length st := ValidSymSlots.mono hSt hExt₁.length_le
+    have hCond₁ : condId < tbl₁.nodes.length := Nat.lt_of_lt_of_le hCond hExt₁.length_le
+    cases hElse : symExecStmts st tbl₁ elseStmts (some (condId, false)) with
+    | none => rw [hElse] at hJoin; cases hJoin
+    | some pF =>
+      rcases pF with ⟨stF, tbl₂⟩
+      rw [hElse] at hJoin
+      dsimp only at hJoin
+      rcases symExecStmts_under_sound elseStmts hValid₁ hSt₁ hElse hCond₁ with
+        ⟨hValid₂, hExt₂, hStF, hEvalF⟩
+      have hExt₀₂ : tbl.Extends tbl₂ := hExt₁.trans hExt₂
+      have hCond₂ : condId < tbl₂.nodes.length := Nat.lt_of_lt_of_le hCond hExt₀₂.length_le
+      have hStTc : ValidSymCanonState tbl₂.nodes.length (joinCanon mask stT) :=
+        ValidSymSlots.mono (hStT.joinCanon mask) hExt₂.length_le
+      have hStFc : ValidSymCanonState tbl₂.nodes.length (joinCanon mask stF) :=
+        hStF.joinCanon mask
+      rcases mergeJoinStates_eval hValid₂ hCond₂ hStTc hStFc hJoin with
+        ⟨hValidM, hExtM, hStM, hEvalM⟩
+      refine ⟨hValidM, hExt₀₂.trans hExtM, hStM, ?_⟩
+      intro env cst hR
+      rw [hEvalM env, ← evalSymId_mono hValid hExt₀₂ env hCond]
+      cases hB : (evalSymId tbl env condId != 0) with
+      | true =>
+        rcases execStmts_refines thenStmts hR (hEvalT env hB) with ⟨cT, hCT, hRT⟩
+        refine ⟨cT, by rw [ite_eq_left rfl]; exact hCT, ?_⟩
+        rw [ite_eq_left rfl, ← evalSymCanonState_mono hValid₁ hExt₂ env (hStT.joinCanon mask),
+          evalSymCanonState_joinCanon]
+        exact hRT.joinCanon mask
+      | false =>
+        have hR₁ : StateRefines (evalSymCanonState tbl₁ env st) cst := by
+          rw [← evalSymCanonState_mono hValid hExt₁ env hSt]
+          exact hR
+        have hB₁ : PathCondHolds tbl₁ env (some (condId, false)) := by
+          dsimp [PathCondHolds]
+          rw [← evalSymId_mono hValid hExt₁ env hCond]
+          exact hB
+        rcases execStmts_refines elseStmts hR₁ (hEvalF env hB₁) with ⟨cF, hCF, hRF⟩
+        refine ⟨cF, by rw [ite_eq_right Bool.false_ne_true]; exact hCF, ?_⟩
+        rw [ite_eq_right Bool.false_ne_true, evalSymCanonState_joinCanon]
+        exact hRF.joinCanon mask
+
+/-!
+### 3.5 Single-Continuation Symbolic CFG Evaluator (`symEvalCfgGvn`) & End-to-End Soundness
+-/
+
+/-- Constant-folded branch condition: `some b` iff `condId` is interned as a constant. -/
+def constCond? (tbl : SymTable) (condId : SymId) : Option Bool :=
+  match tbl.nodes[condId]? with
+  | some (.const v) => some (wrap64 v != 0)
+  | _ => none
+
+theorem constCond?_sound {tbl : SymTable} {condId : SymId} {b : Bool} (hValid : ValidTable tbl)
+    (h : constCond? tbl condId = some b) (env : SymEnv) :
+    (evalSymId tbl env condId != 0) = b := by
+  unfold constCond? at h
+  split at h
+  · rename_i v hNode
+    injection h with hb
+    subst hb
+    rw [evalSymId_eq_evalSymNodeWith hValid env hNode]
+    rfl
+  · cases h
+
+/-- Combine the explorations of both successors of a *path-split* (non-merged) `switchInt`,
+    threading the append-only table from the `then` exploration into the `else` one. -/
+def combineSplit (resT : Option (List SymId × SymTable))
+    (resF : SymTable → Option (List SymId × SymTable)) : Option (List SymId × SymTable) :=
+  match resT with
+  | none => none
+  | some (retsT, tblT) =>
+    match resF tblT with
+    | none => none
+    | some (retsF, tblF) => some (retsT ++ retsF, tblF)
+
+theorem combineSplit_eq_some {resT : Option (List SymId × SymTable)}
+    {resF : SymTable → Option (List SymId × SymTable)} {rets : List SymId} {tbl' : SymTable}
+    (h : combineSplit resT resF = some (rets, tbl')) :
+    ∃ retsT tblT retsF, resT = some (retsT, tblT) ∧ resF tblT = some (retsF, tbl') ∧
+      rets = retsT ++ retsF := by
+  unfold combineSplit at h
+  cases hT : resT with
+  | none => rw [hT] at h; cases h
+  | some pT =>
+    rcases pT with ⟨retsT, tblT⟩
+    rw [hT] at h
+    dsimp only at h
+    cases hF : resF tblT with
+    | none => rw [hF] at h; cases h
+    | some pF =>
+      rcases pF with ⟨retsF, tblF⟩
+      rw [hF] at h
+      dsimp only at h
+      injection h with h1
+      injection h1 with hR hTb
+      subst hR hTb
+      exact ⟨retsT, tblT, retsF, rfl, hF, rfl⟩
+
+/-- Single-continuation compositional symbolic GVN evaluator for multi-block `MirCfg`s.
+    Returns the list of returned `SymId`s (one per explored path) in the final append-only
+    table. At a symbolic `switchInt` whose arms form a diamond with a hinted join block, both
+    arms are executed, pruned with the join mask (`joinCanon`), merged (`mergeJoinStates`,
+    GVN + `ite c v v ↦ v`), and the join continuation is evaluated **once** (consuming one
+    extra unit of fuel for the arm block, exactly as the concrete execution does). Without a
+    hint it path-splits. CPS spine forcing (`forceCanonState`) is applied at every block. -/
+def symEvalCfgGvn (cfg : MirCfg) (hints : JoinHints) :
+    Nat → BlockId → CanonState SymId → SymTable → (pc : PathCond := none) →
+      Option (List SymId × SymTable)
+  | 0, _, _, _, _ => none
+  | fuel + 1, bb, st, tbl, pc =>
+    match cfg.blocks[bb]? with
+    | none => none
+    | some blk =>
+      match symExecStmts st tbl blk.stmts pc with
+      | none => none
+      | some (st₀, tbl₁) =>
+        forceCanonState st₀ fun st₁ =>
+        match blk.term with
+        | .goto target => symEvalCfgGvn cfg hints fuel target st₁ tbl₁ pc
+        | .switchInt discr thenBb elseBb =>
+          match readSymScalar st₁ discr with
+          | none => none
+          | some condId =>
+            let st₂ := st₁.ownerReadLoc discr
+            match constCond? tbl₁ condId with
+            | some b =>
+              if b then symEvalCfgGvn cfg hints fuel thenBb st₂ tbl₁ pc
+              else symEvalCfgGvn cfg hints fuel elseBb st₂ tbl₁ pc
+            | none =>
+              match diamondMergePlan cfg hints thenBb elseBb with
+              | some (thenStmts, elseStmts, joinBb, mask) =>
+                match fuel with
+                | 0 => none
+                | f + 1 =>
+                  match symExecDiamondJoin st₂ tbl₁ condId thenStmts elseStmts mask with
+                  | none => none
+                  | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
+              | none =>
+                combineSplit (symEvalCfgGvn cfg hints fuel thenBb st₂ tbl₁ (some (condId, true)))
+                  (fun tblT => symEvalCfgGvn cfg hints fuel elseBb st₂ tblT (some (condId, false)))
+        | .ret retLoc =>
+          match readSymScalar st₁ retLoc with
+          | some retSymId => some ([retSymId], tbl₁)
+          | none => none
+        | .unreachable => none
+
+/-- Path-sensitive soundness obligation for a symbolic CFG result `(rets, tbl')` under `pc`. -/
+def CfgResultSoundUnder (cfg : MirCfg) (fuel : Nat) (bb : BlockId) (st : CanonState SymId)
+    (tbl : SymTable) (pc : PathCond) (rets : List SymId) (tbl' : SymTable) : Prop :=
+  ValidTable tbl' ∧ tbl.Extends tbl' ∧ (∀ r ∈ rets, r < tbl'.nodes.length) ∧
+    ∀ (env : SymEnv) (cst : CanonState Nat),
+      PathCondHolds tbl env pc →
+      StateRefines (evalSymCanonState tbl env st) cst →
+      ∃ r ∈ rets, execCfg cfg fuel bb cst = .ret (evalSymId tbl' env r)
+
+/-- Soundness obligation for a symbolic CFG result `(rets, tbl')` from `(bb, st, tbl)`: the
+    final table is a valid extension, every returned `SymId` is allocated, and from **every**
+    concrete state refined by the evaluated entry state, the mask-free concrete execution with
+    the same fuel returns (no fault, no fuel exhaustion) the value of some returned `SymId`. -/
+def CfgResultSound (cfg : MirCfg) (fuel : Nat) (bb : BlockId) (st : CanonState SymId)
+    (tbl : SymTable) (rets : List SymId) (tbl' : SymTable) : Prop :=
+  ValidTable tbl' ∧ tbl.Extends tbl' ∧ (∀ r ∈ rets, r < tbl'.nodes.length) ∧
+    ∀ (env : SymEnv) (cst : CanonState Nat),
+      StateRefines (evalSymCanonState tbl env st) cst →
+      ∃ r ∈ rets, execCfg cfg fuel bb cst = .ret (evalSymId tbl' env r)
+
+/-- **Path-Sensitive Symbolic CFG Soundness (`symEvalCfgGvn_under_sound`)**, for every
+    (untrusted) `hints` and active branch path condition `pc`. -/
+theorem symEvalCfgGvn_under_sound (cfg : MirCfg) (hints : JoinHints) :
+    ∀ (fuel : Nat) (bb : BlockId) (st : CanonState SymId) (tbl : SymTable) (pc : PathCond)
+      (rets : List SymId) (tbl' : SymTable),
+      ValidTable tbl →
+      ValidSymCanonState tbl.nodes.length st →
+      PathCondValid tbl.nodes.length pc →
+      symEvalCfgGvn cfg hints fuel bb st tbl pc = some (rets, tbl') →
+      CfgResultSoundUnder cfg fuel bb st tbl pc rets tbl'
+  | 0, _, _, _, _, _, _, _, _, _, hEval => by cases hEval
+  | fuel + 1, bb, st, tbl, pc, rets, tbl', hValid, hSt, hPcValid, hEval => by
+    rw [symEvalCfgGvn] at hEval
+    cases hBlk : cfg.blocks[bb]? with
+    | none => rw [hBlk] at hEval; cases hEval
+    | some blk =>
+      rw [hBlk] at hEval
+      dsimp only at hEval
+      cases hStmts : symExecStmts st tbl blk.stmts pc with
+      | none => rw [hStmts] at hEval; cases hEval
+      | some pair₁ =>
+        rcases pair₁ with ⟨st₁, tbl₁⟩
+        rw [hStmts] at hEval
+        dsimp only at hEval
+        rw [forceCanonState_eq] at hEval
+        rcases symExecStmts_under_sound blk.stmts hValid hSt hStmts hPcValid with
+          ⟨hValid₁, hExt₁, hSt₁, hEvalStmts⟩
+        have hPcValid₁ : PathCondValid tbl₁.nodes.length pc := hPcValid.mono hExt₁.length_le
+        have hPrefix : ∀ env cst, PathCondHolds tbl env pc →
+            StateRefines (evalSymCanonState tbl env st) cst →
+            ∃ c₁, execStmts cst blk.stmts = some c₁ ∧
+              StateRefines (evalSymCanonState tbl₁ env st₁) c₁ ∧
+              PathCondHolds tbl₁ env pc :=
+          fun env _ hPc hR =>
+            let ⟨c₁, hC₁, hR₁⟩ := execStmts_refines blk.stmts hR (hEvalStmts env hPc)
+            ⟨c₁, hC₁, hR₁, PathCondHolds.mono hValid hExt₁ hPcValid hPc⟩
+        cases hTerm : blk.term with
+        | goto target =>
+          rw [hTerm] at hEval
+          rcases symEvalCfgGvn_under_sound cfg hints fuel target st₁ tbl₁ pc rets tbl'
+            hValid₁ hSt₁ hPcValid₁ hEval with ⟨hV', hE', hLt', hEv'⟩
+          refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
+          intro env cst hPc hR
+          rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+          rcases hEv' env c₁ hPc₁ hR₁ with ⟨r, hr, hExec⟩
+          refine ⟨r, hr, ?_⟩
+          dsimp only [execCfg]
+          rw [hBlk]
+          dsimp only
+          rw [hC₁]
+          dsimp only
+          rw [hTerm]
+          exact hExec
+        | switchInt discr thenBb elseBb =>
+          rw [hTerm] at hEval
+          dsimp only at hEval
+          cases hDiscr : readSymScalar st₁ discr with
+          | none => rw [hDiscr] at hEval; cases hEval
+          | some condId =>
+            rw [hDiscr] at hEval
+            dsimp only at hEval
+            have hCondLt : condId < tbl₁.nodes.length := by
+              have hSpec := readSymScalar_spec (fun _ => 0) hSt₁ (loc := discr)
+              rw [hDiscr] at hSpec
+              exact hSpec.1
+            -- Reading the discriminant is an owner read: both successors start from `st₂`.
+            have hSt₂ : ValidSymCanonState tbl₁.nodes.length (st₁.ownerReadLoc discr) :=
+              hSt₁.ownerReadLoc discr
+            have hR₂ : ∀ env c₁, StateRefines (evalSymCanonState tbl₁ env st₁) c₁ →
+                StateRefines (evalSymCanonState tbl₁ env (st₁.ownerReadLoc discr))
+                  (c₁.ownerReadLoc discr) := by
+              intro env c₁ hR₁
+              rw [evalSymCanonState_ownerReadLoc]
+              exact hR₁.ownerReadLoc discr
+            have hStepC : ∀ env cst c₁, execStmts cst blk.stmts = some c₁ →
+                StateRefines (evalSymCanonState tbl₁ env st₁) c₁ →
+                execCfg cfg (fuel + 1) bb cst =
+                  (if evalSymId tbl₁ env condId != 0 then
+                      execCfg cfg fuel thenBb (c₁.ownerReadLoc discr)
+                    else execCfg cfg fuel elseBb (c₁.ownerReadLoc discr)) := by
+              intro env cst c₁ hC₁ hR₁
+              have hSpec := readSymScalar_spec env hSt₁ (loc := discr)
+              rw [hDiscr] at hSpec
+              dsimp only [execCfg]
+              rw [hBlk]
+              dsimp only
+              rw [hC₁]
+              dsimp only
+              rw [hTerm]
+              dsimp only
+              rw [readConcreteScalar_refines hR₁ hSpec.2]
+            have hSplitCase : combineSplit
+                (symEvalCfgGvn cfg hints fuel thenBb (st₁.ownerReadLoc discr) tbl₁
+                  (some (condId, true)))
+                (fun tblT => symEvalCfgGvn cfg hints fuel elseBb (st₁.ownerReadLoc discr) tblT
+                  (some (condId, false))) =
+                  some (rets, tbl') →
+                CfgResultSoundUnder cfg (fuel + 1) bb st tbl pc rets tbl' := by
+              intro hComb
+              rcases combineSplit_eq_some hComb with ⟨retsT, tblT, retsF, hT, hF, hRets⟩
+              subst hRets
+              rcases symEvalCfgGvn_under_sound cfg hints fuel thenBb (st₁.ownerReadLoc discr) tbl₁
+                (some (condId, true)) retsT tblT hValid₁ hSt₂ hCondLt hT with
+                ⟨hVT, hET, hLtT, hEvT⟩
+              have hSt₂T : ValidSymCanonState tblT.nodes.length (st₁.ownerReadLoc discr) :=
+                ValidSymSlots.mono hSt₂ hET.length_le
+              have hCondLtT : PathCondValid tblT.nodes.length (some (condId, false)) :=
+                Nat.lt_of_lt_of_le hCondLt hET.length_le
+              rcases symEvalCfgGvn_under_sound cfg hints fuel elseBb (st₁.ownerReadLoc discr) tblT
+                (some (condId, false)) retsF tbl' hVT hSt₂T hCondLtT hF with
+                ⟨hVF, hEF, hLtF, hEvF⟩
+              refine ⟨hVF, (hExt₁.trans hET).trans hEF, ?_, ?_⟩
+              · intro r hr
+                rcases List.mem_append.1 hr with hr | hr
+                · exact Nat.lt_of_lt_of_le (hLtT r hr) hEF.length_le
+                · exact hLtF r hr
+              · intro env cst hPc hR
+                rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, _⟩
+                rw [hStepC env cst c₁ hC₁ hR₁]
+                cases hB : (evalSymId tbl₁ env condId != 0) with
+                | true =>
+                  rcases hEvT env (c₁.ownerReadLoc discr) hB (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
+                  refine ⟨r, List.mem_append_left _ hr, ?_⟩
+                  rw [ite_eq_left rfl, hExec, evalSymId_mono hVT hEF env (hLtT r hr)]
+                | false =>
+                  have hR₂T : StateRefines (evalSymCanonState tblT env (st₁.ownerReadLoc discr))
+                      (c₁.ownerReadLoc discr) := by
+                    rw [← evalSymCanonState_mono hValid₁ hET env hSt₂]
+                    exact hR₂ env c₁ hR₁
+                  have hPcF : PathCondHolds tblT env (some (condId, false)) := by
+                    dsimp [PathCondHolds]
+                    rw [← evalSymId_mono hValid₁ hET env hCondLt]
+                    exact hB
+                  rcases hEvF env (c₁.ownerReadLoc discr) hPcF hR₂T with ⟨r, hr, hExec⟩
+                  refine ⟨r, List.mem_append_right _ hr, ?_⟩
+                  rw [ite_eq_right Bool.false_ne_true, hExec]
+            cases hC : constCond? tbl₁ condId with
+            | some b =>
+              rw [hC] at hEval
+              dsimp only at hEval
+              have hB := constCond?_sound hValid₁ hC
+              cases b with
+              | true =>
+                rw [ite_eq_left rfl] at hEval
+                rcases symEvalCfgGvn_under_sound cfg hints fuel thenBb (st₁.ownerReadLoc discr) tbl₁
+                  pc rets tbl' hValid₁ hSt₂ hPcValid₁ hEval with ⟨hV', hE', hLt', hEv'⟩
+                refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
+                intro env cst hPc hR
+                rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+                rcases hEv' env (c₁.ownerReadLoc discr) hPc₁ (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
+                refine ⟨r, hr, ?_⟩
+                rw [hStepC env cst c₁ hC₁ hR₁, hB env, ite_eq_left rfl]
+                exact hExec
+              | false =>
+                rw [ite_eq_right Bool.false_ne_true] at hEval
+                rcases symEvalCfgGvn_under_sound cfg hints fuel elseBb (st₁.ownerReadLoc discr) tbl₁
+                  pc rets tbl' hValid₁ hSt₂ hPcValid₁ hEval with ⟨hV', hE', hLt', hEv'⟩
+                refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
+                intro env cst hPc hR
+                rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+                rcases hEv' env (c₁.ownerReadLoc discr) hPc₁ (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
+                refine ⟨r, hr, ?_⟩
+                rw [hStepC env cst c₁ hC₁ hR₁, hB env, ite_eq_right Bool.false_ne_true]
+                exact hExec
+            | none =>
+              rw [hC] at hEval
+              dsimp only at hEval
+              cases hPlan : diamondMergePlan cfg hints thenBb elseBb with
+              | none =>
+                rw [hPlan] at hEval
+                exact hSplitCase hEval
+              | some plan =>
+                rcases plan with ⟨thenStmts, elseStmts, joinBb, mask⟩
+                rw [hPlan] at hEval
+                cases fuel with
+                | zero => cases hEval
+                | succ f =>
+                  dsimp only at hEval
+                  cases hJoin : symExecDiamondJoin (st₁.ownerReadLoc discr) tbl₁ condId thenStmts
+                      elseStmts mask with
+                  | none => rw [hJoin] at hEval; cases hEval
+                  | some pM =>
+                    rcases pM with ⟨stM, tblM⟩
+                    rw [hJoin] at hEval
+                    dsimp only at hEval
+                    rcases wpJoinBlock_sound hValid₁ hSt₂ hCondLt hJoin with
+                      ⟨hVM, hEM, hStM, hJoinC⟩
+                    have hPcValidM : PathCondValid tblM.nodes.length pc :=
+                      hPcValid₁.mono hEM.length_le
+                    rcases symEvalCfgGvn_under_sound cfg hints f joinBb stM tblM pc rets tbl'
+                      hVM hStM hPcValidM hEval with ⟨hV', hE', hLt', hEv'⟩
+                    rcases matchDiamond_spec (diamondMergePlan_spec hPlan) with
+                      ⟨tBlk, eBlk, hTB, hEB, hTS, hES, hTT, hET⟩
+                    refine ⟨hV', (hExt₁.trans hEM).trans hE', hLt', ?_⟩
+                    intro env cst hPc hR
+                    rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+                    rcases hJoinC env (c₁.ownerReadLoc discr) (hR₂ env c₁ hR₁) with
+                      ⟨c₂, hC₂, hR₂'⟩
+                    have hPcM : PathCondHolds tblM env pc :=
+                      PathCondHolds.mono hValid₁ hEM hPcValid₁ hPc₁
+                    rcases hEv' env c₂ hPcM hR₂' with ⟨r, hr, hExec⟩
+                    refine ⟨r, hr, ?_⟩
+                    rw [hStepC env cst c₁ hC₁ hR₁]
+                    cases hB : (evalSymId tbl₁ env condId != 0) with
+                    | true =>
+                      rw [hB, ite_eq_left rfl] at hC₂
+                      rw [ite_eq_left rfl]
+                      dsimp only [execCfg]
+                      rw [hTB]
+                      dsimp only
+                      rw [hTS, hC₂]
+                      dsimp only
+                      rw [hTT]
+                      exact hExec
+                    | false =>
+                      rw [hB, ite_eq_right Bool.false_ne_true] at hC₂
+                      rw [ite_eq_right Bool.false_ne_true]
+                      dsimp only [execCfg]
+                      rw [hEB]
+                      dsimp only
+                      rw [hES, hC₂]
+                      dsimp only
+                      rw [hET]
+                      exact hExec
+        | ret retLoc =>
+          rw [hTerm] at hEval
+          dsimp only at hEval
+          cases hRet : readSymScalar st₁ retLoc with
+          | none => rw [hRet] at hEval; cases hEval
+          | some rId =>
+            rw [hRet] at hEval
+            dsimp only at hEval
+            injection hEval with hPair
+            injection hPair with hR hT
+            subst hR hT
+            have hSpec0 := readSymScalar_spec (fun _ => 0) hSt₁ (loc := retLoc)
+            rw [hRet] at hSpec0
+            refine ⟨hValid₁, hExt₁, ?_, ?_⟩
+            · intro r hr
+              rw [List.mem_singleton] at hr
+              subst hr
+              exact hSpec0.1
+            · intro env cst hPc hR
+              rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, _⟩
+              have hSpec := readSymScalar_spec env hSt₁ (loc := retLoc)
+              rw [hRet] at hSpec
+              refine ⟨rId, List.mem_singleton.2 rfl, ?_⟩
+              dsimp only [execCfg]
+              rw [hBlk]
+              dsimp only
+              rw [hC₁]
+              dsimp only
+              rw [hTerm]
+              dsimp only
+              rw [readConcreteScalar_refines hR₁ hSpec.2]
+        | unreachable =>
+          rw [hTerm] at hEval
+          cases hEval
+
+/-- **End-to-End Symbolic CFG Soundness (`symEvalCfgGvn_sound`)**, for every (untrusted)
+    `hints` (`pc = none`). -/
+theorem symEvalCfgGvn_sound (cfg : MirCfg) (hints : JoinHints)
+    (fuel : Nat) (bb : BlockId) (st : CanonState SymId) (tbl : SymTable)
+    (rets : List SymId) (tbl' : SymTable)
+    (hValid : ValidTable tbl)
+    (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hEval : symEvalCfgGvn cfg hints fuel bb st tbl = some (rets, tbl')) :
+    CfgResultSound cfg fuel bb st tbl rets tbl' := by
+  rcases symEvalCfgGvn_under_sound cfg hints fuel bb st tbl none rets tbl' hValid hSt trivial hEval
+    with ⟨hV, hE, hLt, hEv⟩
+  exact ⟨hV, hE, hLt, fun env cst hR => hEv env cst trivial hR⟩
+
+/-- Symbolic GVN + Canonical-Join Weakest Precondition (`wpCfgSymGvn`): evaluates `cfg`
+    symbolically once and requires `post` of every returned `SymId` for all `env`. -/
+def wpCfgSymGvn (cfg : MirCfg) (hints : JoinHints) (fuel : Nat) (bb : BlockId)
+    (st : CanonState SymId) (tbl : SymTable) (post : SymEnv → Nat → Prop) : Prop :=
+  match symEvalCfgGvn cfg hints fuel bb st tbl with
+  | none => False
+  | some (rets, tbl') => ∀ env : SymEnv, ∀ r ∈ rets, post env (evalSymId tbl' env r)
+
+/-- **End-to-End WP Soundness (`wpCfgSymGvn_sound`)**: for every (untrusted) join hint map, if
+    `wpCfgSymGvn` holds then, for every `env` and every concrete state refined by the evaluated
+    symbolic entry state, the **mask-free** concrete execution never faults (no assertion
+    failure, no read/write of a dead or uninitialized local, no stale-generation loan), never
+    runs out of fuel, and returns a value satisfying `post`. -/
+theorem wpCfgSymGvn_sound {cfg : MirCfg} {hints : JoinHints} {fuel : Nat} {bb : BlockId}
+    {st : CanonState SymId} {tbl : SymTable} {post : SymEnv → Nat → Prop}
+    (hValid : ValidTable tbl) (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hWp : wpCfgSymGvn cfg hints fuel bb st tbl post) :
+    ∀ (env : SymEnv) (cst : CanonState Nat), StateRefines (evalSymCanonState tbl env st) cst →
+      ∃ retVal : Nat, execCfg cfg fuel bb cst = .ret retVal ∧ post env retVal := by
+  unfold wpCfgSymGvn at hWp
+  cases hSym : symEvalCfgGvn cfg hints fuel bb st tbl with
+  | none =>
+    rw [hSym] at hWp
+    exact False.elim hWp
+  | some pair =>
+    rcases pair with ⟨rets, tbl'⟩
+    rw [hSym] at hWp
+    rcases symEvalCfgGvn_sound cfg hints fuel bb st tbl rets tbl' hValid hSt hSym with
+      ⟨_, _, _, hExec⟩
+    intro env cst hR
+    rcases hExec env cst hR with ⟨r, hr, hRet⟩
+    exact ⟨_, hRet, hWp env r hr⟩
+
+/-- `wpCfgSymGvn_sound` specialized to the exact evaluated symbolic entry state. -/
+theorem wpCfgSymGvn_sound_init {cfg : MirCfg} {hints : JoinHints} {fuel : Nat} {bb : BlockId}
+    {st : CanonState SymId} {tbl : SymTable} {post : SymEnv → Nat → Prop}
+    (hValid : ValidTable tbl) (hSt : ValidSymCanonState tbl.nodes.length st)
+    (hWp : wpCfgSymGvn cfg hints fuel bb st tbl post) (env : SymEnv) :
+    ∃ retVal : Nat, execCfg cfg fuel bb (evalSymCanonState tbl env st) = .ret retVal ∧
+      post env retVal :=
+  wpCfgSymGvn_sound hValid hSt hWp env _ (StateRefines.refl _)
+
+/-- Executable verification checker: run `symEvalCfgGvn`, GVN-intern the functional spec tree
+    into the final table, and accept iff every returned `SymId` is GVN-identical to the spec's
+    `SymId` (sound, incomplete syntactic equivalence check). -/
+def checkCfgAgainstTree (cfg : MirCfg) (hints : JoinHints) (fuel : Nat) (bb : BlockId)
+    (st : CanonState SymId) (tbl : SymTable) (spec : ExprTree) : Bool :=
+  match symEvalCfgGvn cfg hints fuel bb st tbl with
+  | none => false
+  | some (rets, tbl') => rets.all (fun r => r == (internTree tbl' spec).1)
+
+/-- **Checker Soundness (`checkCfgAgainstTree_sound`)**: an accepted check proves that the
+    mask-free concrete execution returns exactly `spec.eval env` for every `env` and every
+    refined concrete state. -/
+theorem checkCfgAgainstTree_sound {cfg : MirCfg} {hints : JoinHints} {fuel : Nat} {bb : BlockId}
+    {st : CanonState SymId} {tbl : SymTable} {spec : ExprTree}
+    (hCheck : checkCfgAgainstTree cfg hints fuel bb st tbl spec = true)
+    (hValid : ValidTable tbl) (hSt : ValidSymCanonState tbl.nodes.length st) :
+    ∀ (env : SymEnv) (cst : CanonState Nat), StateRefines (evalSymCanonState tbl env st) cst →
+      execCfg cfg fuel bb cst = .ret (spec.eval env) := by
+  unfold checkCfgAgainstTree at hCheck
+  cases hSym : symEvalCfgGvn cfg hints fuel bb st tbl with
+  | none => rw [hSym] at hCheck; cases hCheck
+  | some pair =>
+    rcases pair with ⟨rets, tbl'⟩
+    rw [hSym] at hCheck
+    dsimp only at hCheck
+    rcases symEvalCfgGvn_sound cfg hints fuel bb st tbl rets tbl' hValid hSt hSym with
+      ⟨hV', _, hLt', hExec⟩
+    rcases internTree_spec spec tbl' hV' with ⟨_, hExtS, _, hEvalS⟩
+    intro env cst hR
+    rcases hExec env cst hR with ⟨r, hr, hRet⟩
+    have hrEq : r = (internTree tbl' spec).1 := beq_iff_eq.1 (List.all_eq_true.1 hCheck r hr)
+    rw [hRet, evalSymId_mono hV' hExtS env (hLt' r hr), hrEq, hEvalS env]
+
+/-!
+### 3.6 Kernel-Checked `k`-Diamond Multi-Block CFG Benchmarks & Fault Witnesses (`by rfl`)
+-/
+
+/-- Diamond `i` of the benchmark CFG (blocks `3i`, `3i+1`, `3i+2`, joining at `3i+3`):
+    - head `3i`: `switchInt _1 → 3i+1 | 3i+2` (symbolic discriminant `_1`),
+    - then-arm `3i+1`: `StorageLive(_2); _2 := xor(_0, i+1); _0 := _2 + _2; goto 3i+3` — the
+      branch-local temporary `_2` is left **live**, so the two arm states differ at the join
+      (`_2` live vs. dead) and only join-point pruning (`_2 ∉` live mask) lets them merge,
+    - else-arm `3i+2`: `_0 := xor(_0, i+1); _0 := _0 + _0; goto 3i+3` (never touches `_2`). -/
+def mkDiamondBlocks (i : Nat) : List MirBlock :=
+  [ { stmts := [], term := .switchInt 1 (3 * i + 1) (3 * i + 2) },
+    { stmts := [ .storageLive 2, .assign 2 (.op1 (.xorConst (i + 1)) 0),
+        .assign 0 (.op2 .add 2 2) ]
+      term := .goto (3 * i + 3) },
+    { stmts := [ .assign 0 (.op1 (.xorConst (i + 1)) 0), .assign 0 (.op2 .add 0 0) ]
+      term := .goto (3 * i + 3) } ]
+
+/-- `count` diamonds starting at diamond index `i`, followed by a return block that checks a
+    GVN-recognizable reflexive assertion (`_2 := _0 == _0; assert _2`) and returns `_0`. -/
+def mkDiamondBlocksAux : Nat → Nat → List MirBlock
+  | _, 0 =>
+    [ { stmts := [ .storageLive 2, .assign 2 (.op2 .eq 0 0), .assert 2, .storageDead 2 ]
+        term := .ret 0 } ]
+  | i, count + 1 => mkDiamondBlocks i ++ mkDiamondBlocksAux (i + 1) count
+
+/-- The `k`-diamond MIR CFG (`3k + 1` blocks, `2^k` concrete paths). -/
+def mkDiamondCfg (k : Nat) : MirCfg :=
+  { blocks := mkDiamondBlocksAux 0 k }
+
+/-- Untrusted join hints for `mkDiamondCfg`: every join block `3(i+1)` gets live mask
+    `[true, true, false]` (`_0`, `_1` live; `_2` dead). -/
+def diamondJoinHints : JoinHints := fun bb =>
+  if bb % 3 == 0 && bb != 0 then some [true, true, false] else none
+
+/-- No hints at all: the evaluator path-splits every diamond (`2^k` paths, GVN still shared). -/
+def noJoinHints : JoinHints := fun _ => none
+
+/-- Hints that keep every local live (no pruning): merging fails on the `_2` shape mismatch. -/
+def noPruneJoinHints : JoinHints := fun bb =>
+  if bb % 3 == 0 && bb != 0 then some [true, true, true] else none
+
+/-- Initial symbolic state: `_0 ↦ SymId 0 (.var 0)`, `_1 ↦ SymId 1 (.var 1)`, `_2` dead. -/
+def diamondInitSymState : CanonState SymId :=
+  { slots := [.live 0 0 false none, .live 1 0 false none, .dead 0] }
+
+def diamondInitSymTable : SymTable :=
+  { nodes := [.var 0, .var 1] }
+
+theorem diamondInitSymTable_valid : ValidTable diamondInitSymTable := by
+  intro idx node hGet
+  cases idx with
+  | zero =>
+    dsimp [diamondInitSymTable] at hGet
+    injection hGet with hEq
+    subst hEq
+    trivial
+  | succ i =>
+    cases i with
+    | zero =>
+      dsimp [diamondInitSymTable] at hGet
+      injection hGet with hEq
+      subst hEq
+      trivial
+    | succ j =>
+      dsimp [diamondInitSymTable] at hGet
+      cases hGet
+
+theorem diamondInitSymState_valid :
+    ValidSymCanonState diamondInitSymTable.nodes.length diamondInitSymState :=
+  ⟨Nat.zero_lt_succ 1, Nat.lt_succ_self 1, trivial, trivial⟩
+
+/-- **5-Diamond Verification Benchmark (`diamond5_verified_rfl`)**: one symbolic pass
+    (`2 * 5 + 1 = 11` blocks of fuel) proves the 5-diamond CFG (`2^5 = 32` concrete paths)
+    returns exactly `(buildDiamondTree 5).eval env`. -/
+theorem diamond5_verified_rfl :
+    checkCfgAgainstTree (mkDiamondCfg 5) diamondJoinHints 11 0 diamondInitSymState
+      diamondInitSymTable (buildDiamondTree 5) = true := by
+  decide +kernel
+
+/-- **6-Diamond Verification Benchmark (`diamond6_verified_rfl`)**: one symbolic pass verifies
+    the 6-diamond CFG (`2^6 = 64` concrete paths) against `buildDiamondTree 6`. -/
+theorem diamond6_verified_rfl :
+    checkCfgAgainstTree (mkDiamondCfg 6) diamondJoinHints 13 0 diamondInitSymState
+      diamondInitSymTable (buildDiamondTree 6) = true := by
+  decide +kernel
+
+/-- Single-continuation vs. path-splitting shape witness at `k = 6`: with join hints the
+    evaluator returns **1** path and a `15`-node table; without hints it explores all **64**
+    paths (GVN keeps the table at `15` nodes); with non-pruning hints the merge is rejected
+    (`_2` is live in one arm and dead in the other), so join-point pruning is load-bearing. -/
+theorem diamond6_join_vs_split_witness :
+    (symEvalCfgGvn (mkDiamondCfg 6) diamondJoinHints 13 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (1, 15) ∧
+      (symEvalCfgGvn (mkDiamondCfg 6) noJoinHints 13 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (64, 15) ∧
+      symEvalCfgGvn (mkDiamondCfg 6) noPruneJoinHints 13 0 diamondInitSymState
+        diamondInitSymTable = none := by
+  decide +kernel
+
+/-- **End-to-End Concrete Corollary (`diamond6_cfg_concrete_sound`)**: for every `env`, the
+    mask-free concrete execution of the 6-diamond CFG returns `(buildDiamondTree 6).eval env`. -/
+theorem diamond6_cfg_concrete_sound (env : SymEnv) :
+    execCfg (mkDiamondCfg 6) 13 0 (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
+      .ret ((buildDiamondTree 6).eval env) :=
+  checkCfgAgainstTree_sound diamond6_verified_rfl diamondInitSymTable_valid
+    diamondInitSymState_valid env _ (StateRefines.refl _)
+
+/-- Diamond whose arms compute the same sum with swapped operands:
+    then-arm `_0 := _0 + _1`, else-arm `_0 := _1 + _0`. -/
+def commDiamondCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchInt 1 1 2 },
+        { stmts := [ .assign 0 (.op2 .add 0 1) ], term := .goto 3 },
+        { stmts := [ .assign 0 (.op2 .add 1 0) ], term := .goto 3 },
+        { stmts := [], term := .ret 0 } ] }
+
+/-- **Commutative GVN at a Join (`commDiamond_shared_join_witness`)**: thanks to canonical
+    operand order both arms intern the *same* `SymId` for `_0`, so the merge allocates no `ite`
+    node (table stays at `3` nodes) and the program verifies against `x₁ + x₀`. -/
+theorem commDiamond_shared_join_witness :
+    (symEvalCfgGvn commDiamondCfg (fun _ => some [true, true, false]) 3 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => (res.1, res.2.nodes.length)) = some ([2], 3) ∧
+      checkCfgAgainstTree commDiamondCfg (fun _ => some [true, true, false]) 3 0
+        diamondInitSymState diamondInitSymTable (.op2 .add (.var 1) (.var 0)) = true := by
+  decide +kernel
+
+/-- 4-local initial state for the fault / borrow witnesses: `_0`, `_1` live inputs, `_2`, `_3`
+    declared but uninitialized. -/
+def borrowInitSymState : CanonState SymId :=
+  { slots := [.live 0 0 false none, .live 1 0 false none, .uninit 0, .uninit 0] }
+
+theorem borrowInitSymState_valid :
+    ValidSymCanonState diamondInitSymTable.nodes.length borrowInitSymState :=
+  ⟨Nat.zero_lt_succ 1, Nat.lt_succ_self 1, trivial, trivial, trivial⟩
+
+/-- Writes `_1` after `StorageDead(_1)` (use-after-dead write). -/
+def deadWriteCfg : MirCfg :=
+  { blocks := [ { stmts := [.storageDead 1, .assign 1 (.const 7)], term := .ret 0 } ] }
+
+/-- Takes `_2 := &_1`, recycles `_1`'s storage (`StorageDead`/`StorageLive`), re-borrows the
+    new incarnation (`_3 := &_1`), then dereferences the **stale** loan `_2`. -/
+def staleLoanCfg : MirCfg :=
+  { blocks := [ { stmts := [ .retagBorrow 2 1, .storageDead 1, .storageLive 1,
+      .assign 1 (.const 5), .retagBorrow 3 1, .assign 0 (.derefRef 2) ], term := .ret 0 } ] }
+
+/-- Fresh-loan dereference: `_2 := &_1; _0 := *_2; return _0`. -/
+def freshLoanCfg : MirCfg :=
+  { blocks := [ { stmts := [ .retagBorrow 2 1, .assign 0 (.derefRef 2) ], term := .ret 0 } ] }
+
+/-- **Fault Non-Vacuity Witnesses**: the concrete semantics genuinely faults on a dead-local
+    write and on a stale-generation dereference (even after the target is re-borrowed, so the
+    borrow flag alone would not catch it), the symbolic evaluator rejects both programs, and
+    a fresh loan verifies (returns `_1`). -/
+theorem fault_and_loan_witnesses :
+    execCfg deadWriteCfg 1 0 (evalSymCanonState diamondInitSymTable (fun _ => 3)
+        borrowInitSymState) = .fault ∧
+      symEvalCfgGvn deadWriteCfg noJoinHints 1 0 borrowInitSymState diamondInitSymTable = none ∧
+      execCfg staleLoanCfg 1 0 (evalSymCanonState diamondInitSymTable (fun _ => 3)
+        borrowInitSymState) = .fault ∧
+      symEvalCfgGvn staleLoanCfg noJoinHints 1 0 borrowInitSymState diamondInitSymTable = none ∧
+      checkCfgAgainstTree freshLoanCfg noJoinHints 1 0 borrowInitSymState diamondInitSymTable
+        (.var 1) = true := by
+  decide +kernel
+
+/-- Diamond whose then-arm borrows the branch-local `_2` and kills it (bumping its
+    borrow-dirtied generation to `1`), while the else-arm leaves `_2` dead at generation `0`. -/
+def borrowGenDiamondCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchInt 1 1 2 },
+        { stmts := [ .storageLive 2, .assign 2 (.use 0), .retagBorrow 3 2, .storageDead 2 ]
+          term := .goto 3 },
+        { stmts := [], term := .goto 3 },
+        { stmts := [], term := .ret 0 } ] }
+
+/-- **Borrow-Generation Join Witness**: the generation mismatch on dead `_2` (`1` vs. `0`) makes
+    the canonical merge fail — the join never conflates distinct storage incarnations — while
+    path-splitting still verifies the program returns `_0`. -/
+theorem borrowGen_join_rejected_split_verified :
+    symEvalCfgGvn borrowGenDiamondCfg (fun _ => some [true, true, false, false]) 3 0
+        borrowInitSymState diamondInitSymTable = none ∧
+      checkCfgAgainstTree borrowGenDiamondCfg noJoinHints 3 0 borrowInitSymState
+        diamondInitSymTable (.var 0) = true := by
+  decide +kernel
+
+/-- Write **and** read through the same fresh loan: `_2 := &_1; *_2 := _0 + 10; _0 := *_2`. -/
+def freshStoreRefCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .retagBorrow 2 1,
+              .storeRef 2 (.op1 (.addConst 10) 0),
+              .assign 0 (.derefRef 2) ]
+          term := .ret 0 } ] }
+
+/-- Co-aliased loans, write through the older one, read through the newer one:
+    `_2 := &_1; _3 := &_1; *_2 := _0 + 10; _0 := *_3`. Under the model's unique-loan (Stacked
+    Borrows `&mut`) discipline the retag of `_3` already invalidates `_2`, so the write through
+    `_2` faults. (Tree Borrows would allow that write — `_2` is still `Reserved` — but it is a
+    foreign write that disables `_3`, so the final read is UB there too.) -/
+def freshStoreRefAliasCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .retagBorrow 2 1,
+              .retagBorrow 3 1,
+              .storeRef 2 (.op1 (.addConst 10) 0),
+              .assign 0 (.derefRef 3) ]
+          term := .ret 0 } ] }
+
+/-- An owner write invalidates outstanding loans: `_2 := &_1; _1 := 5; _0 := *_2`. -/
+def ownerWriteInvalidatesCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .assign 1 (.const 5), .assign 0 (.derefRef 2) ]
+          term := .ret 0 } ] }
+
+/-- Indirect write through a **stale** loan (`_2 := &_1`, recycle `_1` via `StorageDead`/
+    `StorageLive`, re-borrow `_3 := &_1`, then attempt `*_2 := _0`). -/
+def staleStoreRefCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .retagBorrow 2 1,
+              .storageDead 1,
+              .storageLive 1,
+              .assign 1 (.const 5),
+              .retagBorrow 3 1,
+              .storeRef 2 (.use 0) ]
+          term := .ret 1 } ] }
+
+/-- **Write-Through-Reference (`storeRef`) Aliasing Discipline Witness**:
+    1. writing `*_2 := _0 + 10` and reading back through the same loan verifies
+       (`= _0 + 10` for every input);
+    2. with co-aliased loans `_2`, `_3` to `_1`, the program faults concretely and is rejected
+       symbolically (the re-borrow `_3 := &_1` invalidates `_2`, so `*_2 := …` faults);
+    3. an owner write (`_1 := 5`) invalidates the outstanding loan `_2` likewise;
+    4. a write through a loan whose target storage was recycled faults and is rejected. -/
+theorem storeRef_mutation_and_stale_fault_witness :
+    checkCfgAgainstTree freshStoreRefCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable (.op1 (.addConst 10) (.var 0)) = true ∧
+      execCfg freshStoreRefAliasCfg 1 0 (evalSymCanonState diamondInitSymTable (fun _ => 3)
+        borrowInitSymState) = .fault ∧
+      symEvalCfgGvn freshStoreRefAliasCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      execCfg ownerWriteInvalidatesCfg 1 0 (evalSymCanonState diamondInitSymTable (fun _ => 3)
+        borrowInitSymState) = .fault ∧
+      symEvalCfgGvn ownerWriteInvalidatesCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      execCfg staleStoreRefCfg 1 0 (evalSymCanonState diamondInitSymTable (fun _ => 3)
+        borrowInitSymState) = .fault ∧
+      symEvalCfgGvn staleStoreRefCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none := by
+  decide +kernel
+
+/-- Legal owner read after loan use is finished: `_2 := &_1; *_2 := _0 + 10; _0 := _1`. -/
+def ownerReadAfterStoreRefValidCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .retagBorrow 2 1,
+              .storeRef 2 (.op1 (.addConst 10) 0),
+              .assign 0 (.use 1) ]
+          term := .ret 0 } ] }
+
+/-- Owner read of a borrowed local invalidates the loan (`_2 := &_1; _0 := _1; _0 := *_2`). -/
+def ownerReadInvalidatesLoanDerefCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .assign 0 (.use 1), .assign 0 (.derefRef 2) ]
+          term := .ret 0 } ] }
+
+/-- Owner read of a borrowed local invalidates a subsequent indirect write
+    (`_2 := &_1; _0 := _1; *_2 := 9`). -/
+def ownerReadInvalidatesLoanStoreCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .assign 0 (.use 1), .storeRef 2 (.const 9) ]
+          term := .ret 1 } ] }
+
+/-- **Owner-Read Loan Invalidation Witness (`owner_read_invalidation_witness`)**:
+    1. Writing through `_2 = &_1` and then reading `_1` through its owner (without using `_2`
+       afterward) is legal and verifies (`= _0 + 10` for all inputs);
+    2. Reading `_1` through its owner bumps `_1`'s borrow generation (`Slot.ownerRead`), so
+       either reading (`*_2`) or writing (`*_2 := 9`) through `_2` afterward faults in
+       `execCfg` and is rejected (`none`) by `symEvalCfgGvn`. -/
+theorem owner_read_invalidation_witness :
+    checkCfgAgainstTree ownerReadAfterStoreRefValidCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable (.op1 (.addConst 10) (.var 0)) = true ∧
+      execCfg ownerReadInvalidatesLoanDerefCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn ownerReadInvalidatesLoanDerefCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      execCfg ownerReadInvalidatesLoanStoreCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn ownerReadInvalidatesLoanStoreCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none := by
+  decide +kernel
+
+/-- Owner read through a `switchInt` discriminant while a loan is live:
+    `_2 := &_1; switchInt _1 → bb1 | bb2`, and both arms then read through `_2` (`_0 := *_2`). -/
+def switchOwnerReadDerefCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1 ], term := .switchInt 1 1 2 },
+        { stmts := [ .assign 0 (.derefRef 2) ], term := .ret 0 },
+        { stmts := [ .assign 0 (.derefRef 2) ], term := .ret 0 } ] }
+
+/-- The loan is finished before the `switchInt` reads its target (legal):
+    `_2 := &_1; *_2 := _0 + 10; switchInt _1 → bb1 | bb2`, both arms `return _1`. -/
+def switchOwnerReadValidCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .storeRef 2 (.op1 (.addConst 10) 0) ],
+          term := .switchInt 1 1 2 },
+        { stmts := [], term := .ret 1 },
+        { stmts := [], term := .ret 1 } ] }
+
+/-- Write through a loan, re-borrow the target, then write through the **old** loan:
+    `_2 := &_1; *_2 := 5; _3 := &_1; *_2 := 6`. UB under Stacked Borrows (the retag of `_3`
+    pops `_2`) and under Tree Borrows (the retag's read access freezes the `Active` `_2`). -/
+def reborrowInvalidatesOldLoanCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .storeRef 2 (.const 5), .retagBorrow 3 1,
+            .storeRef 2 (.const 6) ]
+          term := .ret 1 } ] }
+
+/-- The newest loan stays usable after a re-borrow:
+    `_2 := &_1; _3 := &_1; *_3 := _0 + 1; _0 := *_3`. -/
+def reborrowNewLoanValidCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .retagBorrow 3 1, .storeRef 3 (.op1 (.addConst 1) 0),
+            .assign 0 (.derefRef 3) ]
+          term := .ret 0 } ] }
+
+/-- **Discriminant-Read & Re-Borrow Loan Invalidation Witness
+    (`switch_and_reborrow_loan_invalidation_witness`)**:
+    1. a `switchInt` on a borrowed local is an owner read: using the loan in either arm faults
+       concretely (for a non-zero and a zero discriminant) and is rejected symbolically, while
+       finishing the loan before the `switchInt` verifies (`= _0 + 10` on both paths);
+    2. re-borrowing a target invalidates every earlier loan to it (`_2` after `_3 := &_1`
+       faults and is rejected), while the newest loan verifies (`= _0 + 1`). -/
+theorem switch_and_reborrow_loan_invalidation_witness :
+    checkCfgAgainstTree switchOwnerReadValidCfg noJoinHints 2 0 borrowInitSymState
+        diamondInitSymTable (.op1 (.addConst 10) (.var 0)) = true ∧
+      execCfg switchOwnerReadDerefCfg 2 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      execCfg switchOwnerReadDerefCfg 2 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 0) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn switchOwnerReadDerefCfg noJoinHints 2 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      execCfg reborrowInvalidatesOldLoanCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn reborrowInvalidatesOldLoanCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      checkCfgAgainstTree reborrowNewLoanValidCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable (.op1 (.addConst 1) (.var 0)) = true := by
+  decide +kernel
+
+/-- Borrowing the pointer local `_2` itself (`_3 := &_2`) and then writing through `*_2`
+    (`storeRef 2 (.const 9)`) performs an owner read on `_2`, invalidating `_3`'s loan to `_2`
+    so a subsequent `_0 := *_3` faults. -/
+def storeRefPtrOwnerReadInvalidatesLoanCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .retagBorrow 2 1,
+              .retagBorrow 3 2,
+              .storeRef 2 (.const 9),
+              .assign 0 (.derefRef 3) ]
+          term := .ret 0 } ] }
+
+/-- Borrowing `_2` (`_3 := &_2`), writing through `*_2 := _0 + 9`, and reading back through `_2`
+    itself (`_0 := *_2`, without touching the invalidated `_3`) succeeds and returns `_0 + 9`. -/
+def storeRefPtrOwnerReadValidSelfCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .retagBorrow 2 1,
+              .retagBorrow 3 2,
+              .storeRef 2 (.op1 (.addConst 9) 0),
+              .assign 0 (.derefRef 2) ]
+          term := .ret 0 } ] }
+
+/-- **Pointer-Local Owner-Read Invalidation in `storeRef`
+    (`storeRef_ptr_owner_read_invalidation_witness`)**:
+    1. When `_2 := &_1` and `_3 := &_2` (so `_3` borrows the pointer slot `_2`), executing
+       `*_2 := 9` (`storeRef 2 (.const 9)`) directly reads `_2` by its owner (`storeThrough`
+       applies `ownerReadLoc 2`), bumping `_2`'s generation and invalidating `_3` so a subsequent
+       `_0 := *_3` faults in `execCfg` and returns `none` in `symEvalCfgGvn`.
+    2. Meanwhile, `_2`'s own loan to `_1` is re-validated at `_1`'s bumped generation, so reading
+       back through `*_2` (`storeRefPtrOwnerReadValidSelfCfg`) verifies `= _0 + 9`. -/
+theorem storeRef_ptr_owner_read_invalidation_witness :
+    execCfg storeRefPtrOwnerReadInvalidatesLoanCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn storeRefPtrOwnerReadInvalidatesLoanCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      checkCfgAgainstTree storeRefPtrOwnerReadValidSelfCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable (.op1 (.addConst 9) (.var 0)) = true := by
+  decide +kernel
+
+/-- Reading a reference local as a scalar: `_2 := &_1; *_2 := 7; _0 := _2` (ill-typed MIR — a
+    `&mut u64` is not a `u64`). -/
+def pointerAsScalarCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .storeRef 2 (.const 7), .assign 0 (.use 2) ]
+          term := .ret 0 } ] }
+
+/-- Returning a reference local as the scalar result: `_2 := &_1; return _2`. -/
+def pointerReturnCfg : MirCfg :=
+  { blocks := [ { stmts := [ .retagBorrow 2 1 ], term := .ret 2 } ] }
+
+/-- Reading back through the reference instead: `_2 := &_1; *_2 := 7; _0 := *_2`. -/
+def pointerDerefCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .storeRef 2 (.const 7), .assign 0 (.derefRef 2) ]
+          term := .ret 0 } ] }
+
+/-- **Pointer Locals Are Not Scalars (`pointer_scalar_read_rejected_witness`)**: a slot holding a
+    loan cannot be read as a scalar, so the untyped model no longer exposes the stale snapshot of
+    the referent taken at borrow time. Before B4, `pointerAsScalarCfg` *verified* against the
+    **old** `_1` (`.var 1`) although `_1` had been overwritten with `7`. Both ill-typed programs
+    now fault concretely, the first is rejected symbolically, and the deref reads the current
+    referent (`= 7`). -/
+theorem pointer_scalar_read_rejected_witness :
+    execCfg pointerAsScalarCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn pointerAsScalarCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      execCfg pointerReturnCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      checkCfgAgainstTree pointerDerefCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable (.const 7) = true := by
+  decide +kernel
+
+/-- Two-level stale-snapshot read via `derefRef` on a reference-to-reference (`_2 := &_1;
+    _3 := &_2; _1 := 7; _0 := *_3; return _0`): in B4 (`9f2fc8f8`), `_1 := 7` invalidated `_2`'s
+    loan to `_1` without touching `_2`'s own generation, and `derefRef 3` matched `st.getSlot 2`
+    against `.live targetVal curGen true _` (ignoring `targetLoan = some (1, 0)`), so B4 verified
+    `_0 := *_3` against the stale borrow-time snapshot `.var 1` (`3`, even though `_1` had been
+    overwritten with `7`!). Requiring `targetLoan = none` in `derefRef` rejects this both
+    concretely and symbolically. -/
+def refToRefDerefCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .retagBorrow 3 2, .assign 1 (.const 7),
+            .assign 0 (.derefRef 3) ]
+          term := .ret 0 } ] }
+
+/-- Two-level scalar overwrite of a reference slot via `storeRef` (`_2 := &_1; _3 := &_2;
+    *_3 := 7; _0 := *_2`): in B4, `storeRef 3 (.const 7)` overwrote `_2`'s snapshot with `7`
+    while keeping `_2`'s `loanTarget = some (1, 0)`. Requiring `targetLoan = none` in `storeRef`
+    rejects scalar writes into reference slots. -/
+def refToRefStoreCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .retagBorrow 2 1, .retagBorrow 3 2, .storeRef 3 (.const 7),
+            .assign 0 (.derefRef 2) ]
+          term := .ret 0 } ] }
+
+/-- **Reference-to-Reference Scalar Deref/Store Rejection (`ref_to_ref_deref_and_store_rejected_witness`)**:
+    neither `derefRef` nor `storeRef` may treat a reference slot (`targetLoan = some _`) as a
+    scalar referent, closing B4's residual two-level stale-snapshot soundness hole (`PROTOTYPE_REPORT.md`
+    §2.7, §3.2). -/
+theorem ref_to_ref_deref_and_store_rejected_witness :
+    execCfg refToRefDerefCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn refToRefDerefCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none ∧
+      execCfg refToRefStoreCfg 1 0
+        (evalSymCanonState diamondInitSymTable (fun _ => 3) borrowInitSymState) = .fault ∧
+      symEvalCfgGvn refToRefStoreCfg noJoinHints 1 0 borrowInitSymState
+        diamondInitSymTable = none := by
+  decide +kernel
+
+/-- Diamond with branch-condition-dependent `MirStmt.assert`s in both arms:
+    - `then` arm (`bb 1`, where `_1 != 0`) asserts `_1` directly and computes `_0 := _0 + 7`,
+    - `else` arm (`bb 2`, where `_1 == 0`) computes `_2 := boolNot(_1)`, asserts `_2`, kills
+      `_2`, and computes `_0 := _0 + 7`. -/
+def branchCondAssertDiamondCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchInt 1 1 2 },
+        { stmts := [ .assert 1, .assign 0 (.op1 (.addConst 7) 0) ], term := .goto 3 },
+        { stmts :=
+            [ .storageLive 2,
+              .assign 2 (.op1 .boolNot 1),
+              .assert 2,
+              .storageDead 2,
+              .assign 0 (.op1 (.addConst 7) 0) ]
+          term := .goto 3 },
+        { stmts := [], term := .ret 0 } ] }
+
+/-- Non-diamond `switchInt` where both arms assert their branch condition and return directly
+    (`.ret 0`, so `diamondMergePlan = none` and `combineSplit` path-splits). -/
+def branchCondEarlyReturnCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchInt 1 1 2 },
+        { stmts := [ .assert 1, .assign 0 (.op1 (.addConst 7) 0) ], term := .ret 0 },
+        { stmts :=
+            [ .storageLive 2,
+              .assign 2 (.op1 .boolNot 1),
+              .assert 2,
+              .storageDead 2,
+              .assign 0 (.op1 (.addConst 7) 0) ]
+          term := .ret 0 } ] }
+
+/-- **Path-Sensitive Branch-Assertion Diamond & Split Witness (`branch_cond_assert_diamond_verified`)**:
+    `symEvalCfgGvn` discharges branch-dependent assertions (`assert _1` in the `then` arm and
+    `assert (boolNot _1)` in the `else` arm) both when merging at a join (`diamondJoinHints`,
+    `1` path) AND when path-splitting without join hints (`noJoinHints`, `2` paths) or on
+    early-return arms (`branchCondEarlyReturnCfg`). -/
+theorem branch_cond_assert_diamond_verified :
+    (symEvalCfgGvn branchCondAssertDiamondCfg diamondJoinHints 3 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => res.1.length) = some 1 ∧
+      checkCfgAgainstTree branchCondAssertDiamondCfg diamondJoinHints 3 0 diamondInitSymState
+        diamondInitSymTable (.op1 (.addConst 7) (.var 0)) = true ∧
+      (symEvalCfgGvn branchCondAssertDiamondCfg noJoinHints 3 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => res.1.length) = some 2 ∧
+      checkCfgAgainstTree branchCondAssertDiamondCfg noJoinHints 3 0 diamondInitSymState
+        diamondInitSymTable (.op1 (.addConst 7) (.var 0)) = true ∧
+      checkCfgAgainstTree branchCondEarlyReturnCfg noJoinHints 2 0 diamondInitSymState
+        diamondInitSymTable (.op1 (.addConst 7) (.var 0)) = true := by
+  decide +kernel
+
+/-- Asserts `!(x < x)` and `!(x - x)` (folded by `peepholeOp2` to `.const 0`, then negated by
+    `.op1 .boolNot` and discharged by `isProvablyNonZero`). -/
+def assertNotLtIrreflCfg : MirCfg :=
+  { blocks :=
+      [ { stmts :=
+            [ .storageLive 2,
+              .assign 2 (.op2 .lt 0 0),
+              .assign 2 (.op1 .boolNot 2),
+              .assert 2,
+              .assign 2 (.op2 .sub 0 0),
+              .assign 2 (.op1 .boolNot 2),
+              .assert 2,
+              .storageDead 2 ]
+          term := .ret 0 } ] }
+
+/-- **Negated Zero-Constant Assertion Witness (`assert_not_lt_irrefl_verified`)**:
+    `peepholeOp2` folds `_0 < _0` and `_0 - _0` to `.const 0`, and `isProvablyNonZero`
+    recognizes `boolNot (.const 0)` as provably non-zero. -/
+theorem assert_not_lt_irrefl_verified :
+    checkCfgAgainstTree assertNotLtIrreflCfg noJoinHints 1 0 diamondInitSymState
+      diamondInitSymTable (.var 0) = true := by
+  decide +kernel
+
+
+
+/-!
+## Trusted `MirSemantics` Operator Bridges & Production `DWLP mirDefaultWP` Diamond Join-Cut Combinators
+-/
+
+/-- Bridge adapter converting a concrete evaluated `SymId` into a trusted `MirSemantics.Value`
+    (`8`-byte `u64` scalar). -/
+def evalSymIdToMirValue (tbl : SymTable) (env : SymEnv) (id : SymId) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.Value :=
+  .scalar { bits := evalSymId tbl env id, sizeBytes := 8 }
+
+theorem bridge_coexistence_rfl :
+    evalSymIdToMirValue (buildDiamondGvn 4).2 (fun _ => 7) (buildDiamondGvn 4).1 =
+      .scalar { bits := (buildDiamondTree 4).eval (fun _ => 7), sizeBytes := 8 } :=
+  rfl
+
+/-- Does `evalSymOp2` on `u64` arithmetic/bitwise/shift operations agree with the trusted
+    `MirSemantics.evalScalarBinOp` on 8-byte scalars `a`, `b`? -/
+def protoOpAgrees (op : SymOp2) (mop : Trusted.Rustc.V2026_06_01.MirAst.BinOp) (a b : Nat) : Bool :=
+  match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp mop ⟨a, 8⟩ ⟨b, 8⟩ [] with
+  | .ok (.scalar s) _ _ => s.bits == evalSymOp2 op a b && s.sizeBytes == 8
+  | _ => false
+
+/-- Does `evalSymOp2` on `u64` comparison operations agree with the trusted
+    `MirSemantics.evalScalarBinOp` (which returns a 1-byte `bool` scalar via `boolToScalar`)
+    on 8-byte inputs `a`, `b`? -/
+def protoCmpAgrees (op : SymOp2) (mop : Trusted.Rustc.V2026_06_01.MirAst.BinOp) (a b : Nat) : Bool :=
+  match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp mop ⟨a, 8⟩ ⟨b, 8⟩ [] with
+  | .ok (.scalar s) _ _ => s.bits == evalSymOp2 op a b && s.sizeBytes == 1
+  | _ => false
+
+/-- Does every `SymOp1` unary operator (`id`, `boolNot`, `wrappingNeg64`, `maskLow32`, `xorConst`,
+    `addConst`) agree with its trusted `MirSemantics` binary-operator encoding on 8-byte scalar
+    `a` and constant `b`? -/
+def protoOp1Agrees (a b : Nat) : Bool :=
+  let m8 := Trusted.Rustc.V2026_06_01.MirSemantics.scalarModulus 8
+  let idOk := Trusted.Rustc.V2026_06_01.MirSemantics.wrapScalarBits a m8 == evalSymOp1 .id a
+  let boolNotOk :=
+    match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .eq ⟨a, 8⟩ ⟨0, 8⟩ [] with
+    | .ok (.scalar s) _ _ => s.bits == evalSymOp1 .boolNot a && s.sizeBytes == 1
+    | _ => false
+  let negOk :=
+    match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .sub ⟨0, 8⟩ ⟨a, 8⟩ [] with
+    | .ok (.scalar s) _ _ => s.bits == evalSymOp1 .wrappingNeg64 a && s.sizeBytes == 8
+    | _ => false
+  let maskOk :=
+    match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .bitAnd ⟨a, 8⟩ ⟨0xFFFFFFFF, 8⟩ [] with
+    | .ok (.scalar s) _ _ => s.bits == evalSymOp1 .maskLow32 a && s.sizeBytes == 8
+    | _ => false
+  let xorOk :=
+    match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .bitXor ⟨a, 8⟩ ⟨wrap64 b, 8⟩ [] with
+    | .ok (.scalar s) _ _ => s.bits == evalSymOp1 (.xorConst b) a && s.sizeBytes == 8
+    | _ => false
+  let addOk :=
+    match Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp .add ⟨a, 8⟩ ⟨wrap64 b, 8⟩ [] with
+    | .ok (.scalar s) _ _ => s.bits == evalSymOp1 (.addConst b) a && s.sizeBytes == 8
+    | _ => false
+  idOk && boolNotOk && negOk && maskOk && xorOk && addOk
+
+def bridgeSamples : List (Nat × Nat) :=
+  [(0, 0), (3, 5), (5, 3), (1, 65), (18446744073709551615, 1),
+   (18446744073709551615, 18446744073709551615), (9223372036854775808, 2), (123456789, 987654321)]
+
+/-- MIR `UnOp::Not` as evaluated by the trusted `evalUnaryNot` (operand type unknown) on a
+    `width`-byte scalar `a`. -/
+def mirNot (a width : Nat) : Option Nat :=
+  match Trusted.Rustc.V2026_06_01.MirSemantics.evalUnaryNot ⟨a, width⟩ none [] emptyMemory with
+  | .ok (.scalar s) _ _ => if s.sizeBytes == width then some s.bits else none
+  | _ => none
+
+/-- **Trusted `MirSemantics.evalUnaryNot` Bridge (`bridge_unary_not_mapping`)**:
+    `boolNot` agrees with MIR `UnOp::Not` on `bool` (`1`-byte `0`/`1`), `xorConst (2^64 - 1)`
+    agrees with MIR `UnOp::Not` on `u64` samples (bitwise complement), and `boolNot 5 ≠ mirNot 5 8`
+    (preventing unsound conflation of `bool` vs integer `!x`). -/
+theorem bridge_unary_not_mapping :
+    [0, 1].all (fun b => mirNot b 1 == some (evalSymOp1 .boolNot b)) = true ∧
+      bridgeSamples.all (fun p =>
+        mirNot p.1 8 == some (evalSymOp1 (.xorConst 18446744073709551615) p.1)) = true ∧
+      mirNot 5 8 ≠ some (evalSymOp1 .boolNot 5) := by
+  decide +kernel
+
+/-- **Trusted `MirSemantics.evalScalarBinOp` Bridge (`bridge_u64_semantics_agree`)**:
+    Kernel-checked agreement with the trusted MIR semantics on boundary, shift-wrap (`65 % 64`),
+    and generic `u64` samples across all 11 `SymOp2` binary operators and all 6 `SymOp1` unary
+    operators. -/
+theorem bridge_u64_semantics_agree :
+    bridgeSamples.all (fun p =>
+      protoOp1Agrees p.1 p.2 &&
+        protoOpAgrees .add .add p.1 p.2 && protoOpAgrees .sub .sub p.1 p.2 &&
+        protoOpAgrees .mul .mul p.1 p.2 && protoOpAgrees .bitXor .bitXor p.1 p.2 &&
+        protoOpAgrees .bitAnd .bitAnd p.1 p.2 && protoOpAgrees .bitOr .bitOr p.1 p.2 &&
+        protoOpAgrees .shl .shl p.1 p.2 && protoOpAgrees .shr .shr p.1 p.2 &&
+        protoCmpAgrees .eq .eq p.1 p.2 && protoCmpAgrees .lt .lt p.1 p.2 &&
+        protoCmpAgrees .le .le p.1 p.2) = true := by
+  decide +kernel
+
+/-- Universal `u64` addition bridge: `evalSymOp2 .add a b` matches `MirSemantics.evalScalarBinOp .add`
+    for **all** `a b : Nat`. -/
+theorem evalSymOp2_add_eq_evalScalarBinOp
+    (a b : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .add ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp2 .add a b, 8⟩) locals mem := by
+  dsimp [evalScalarBinOp, evalSymOp2, wrap64, word64Modulus]
+  rw [wrapScalarBits_eq_mod]
+
+/-- Universal `u64` multiplication bridge: `evalSymOp2 .mul a b` matches
+    `MirSemantics.evalScalarBinOp .mul` for **all** `a b : Nat`. -/
+theorem evalSymOp2_mul_eq_evalScalarBinOp
+    (a b : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .mul ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp2 .mul a b, 8⟩) locals mem := by
+  dsimp [evalScalarBinOp, evalSymOp2, wrap64, word64Modulus]
+  rw [wrapScalarBits_eq_mod]
+
+/-- Universal `u64` wrapping subtraction bridge: `evalSymOp2 .sub a b` matches
+    `MirSemantics.evalScalarBinOp .sub` for **all** `u64` words `a, b < word64Modulus`. -/
+theorem evalSymOp2_sub_eq_evalScalarBinOp
+    {a b : Nat} (ha : a < word64Modulus) (hb : b < word64Modulus)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .sub ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp2 .sub a b, 8⟩) locals mem := by
+  dsimp [evalScalarBinOp, evalSymOp2, wrap64, word64Modulus] at ha hb ⊢
+  have hModB : b % 18446744073709551616 = b := Nat.mod_eq_of_lt hb
+  rw [hModB]
+  cases hBle : Nat.ble b a with
+  | true =>
+    have hLe : b ≤ a := (nat_ble_eq_true_iff b a).1 hBle
+    rw [wrapScalarBits_eq_mod]
+    congr 2
+    have hSubLt : a - b < 18446744073709551616 := by omega
+    have hAddEq : a + (18446744073709551616 - b) = (a - b) + 18446744073709551616 := by omega
+    rw [hAddEq, Nat.add_mod_right, Nat.mod_eq_of_lt hSubLt]
+  | false =>
+    dsimp only
+    rw [wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb, wrapScalarBits_eq_mod]
+    have hEq : 18446744073709551616 + a - b = a + (18446744073709551616 - b) := by omega
+    rw [hEq]
+
+/-- Universal `u64` equality comparison bridge: `evalSymOp2 .eq a b` matches
+    `MirSemantics.evalScalarBinOp .eq` for **all** `a b : Nat`. -/
+theorem evalSymOp2_eq_eq_evalScalarBinOp
+    (a b : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .eq ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp2 .eq a b, 1⟩) locals mem := by
+  dsimp [evalScalarBinOp, evalSymOp2, boolToScalar]
+  by_cases h : a = b
+  · subst h
+    have hBeq : Nat.beq a a = true := (nat_beq_eq_true_iff a a).2 rfl
+    have hBne : (a == a) = true := decide_eq_true rfl
+    rw [hBeq, hBne]
+    rfl
+  · have hBeq : Nat.beq a b = false := (nat_beq_eq_false_iff a b).2 h
+    have hBne : (a == b) = false := decide_eq_false h
+    rw [hBeq, hBne]
+    rfl
+
+/-!
+### Compositional `DWLP mirDefaultWP` / `MirSemantics` Diamond Join-Cut Combinator (`evalJoinDiamondWP`, `wpMirJoinDiamond_sound`)
+-/
+
+/-- Check whether `st : MirExecState` is at the entry (`stmtIdx == 0`) of top-level basic block
+    `joinBb` (`activeCallee == none`). -/
+def isAtJoinBlockEntry (joinBb : BasicBlockIdx) : MirExecState → Option MachineState
+  | .running s =>
+    if s.memory.activeCallee.isNone && s.frame.blockIdx == joinBb && s.frame.stmtIdx == 0 then
+      some s
+    else
+      none
+  | _ => none
+
+theorem isAtJoinBlockEntry_eq_some
+    {joinBb : BasicBlockIdx} {st : MirExecState} {sJoin : MachineState}
+    (h : isAtJoinBlockEntry joinBb st = some sJoin) :
+    st = .running sJoin ∧
+      sJoin.memory.activeCallee = none ∧
+      sJoin.frame.blockIdx = joinBb ∧
+      sJoin.frame.stmtIdx = 0 := by
+  cases st with
+  | halted _ => cases h
+  | faulted _ => cases h
+  | running s =>
+    dsimp [isAtJoinBlockEntry] at h
+    split at h
+    · rename_i hCond
+      injection h with hEq
+      subst hEq
+      simp [Bool.and_eq_true, Option.isNone_iff_eq_none] at hCond
+      exact ⟨rfl, hCond.1.1, hCond.1.2, hCond.2⟩
+    · cases h
+
+/-- Single-pass fuel-bounded symbolic WP with a compositional join-block cut at basic block
+    `joinBb`: steps from `st` through prefix statements and branch terminators (`SwitchInt`
+    arms), and whenever a transition lands at the entry (`stmtIdx = 0`, `activeCallee = none`)
+    of `joinBb`, discharges `cut sJoin` instead of duplicating `joinBb`'s continuation across
+    every incoming path. -/
+def wpMirUntilJoinSym
+    (fuel : Nat) (body : CapturedMir) (joinBb : BasicBlockIdx) (st : MirExecState)
+    (cut : MachineState → Prop) (post : MirOutcome → Prop) : Prop :=
+  match fuel with
+  | 0 => False
+  | fuel' + 1 =>
+    evalSymNodeTree
+      (fun st' =>
+        match isAtJoinBlockEntry joinBb st' with
+        | some sJoin => cut sJoin
+        | none => wpMirUntilJoinSym fuel' body joinBb st' cut post)
+      post
+      (stepMirExecSymTree body st)
+
+/-- Fuel monotonicity of `wpMirExecSym`. -/
+theorem wpMirExecSym_mono_fuel
+    {f₁ f₂ : Nat} (hle : f₁ ≤ f₂)
+    {body : CapturedMir} {st : MirExecState} {post : MirOutcome → Prop}
+    (h : wpMirExecSym f₁ body st post) :
+    wpMirExecSym f₂ body st post := by
+  induction f₁ generalizing f₂ st with
+  | zero => exact False.elim h
+  | succ f₁' ih =>
+    cases f₂ with
+    | zero => omega
+    | succ f₂' =>
+      have hle' : f₁' ≤ f₂' := by omega
+      unfold wpMirExecSym at h ⊢
+      rw [evalSymNodeTree_eq, stepMirExecSymTree_eval, evalNodeWP_eq] at h ⊢
+      cases h_step : stepMirState body st with
+      | ret _ =>
+        rw [h_step] at h
+        exact h
+      | tau st' =>
+        rw [h_step] at h
+        exact ih hle' h
+      | vis i k =>
+        rw [h_step] at h
+        exact mirDefaultWP.mono (fun _ _ hw => ih hle' hw) h
+
+theorem wpMirSym_mono_fuel
+    {f₁ f₂ : Nat} (hle : f₁ ≤ f₂)
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : wpMirSym f₁ body s post) :
+    wpMirSym f₂ body s post :=
+  wpMirExecSym_mono_fuel hle h
+
+/-- Compositional cut-elimination theorem for `wpMirUntilJoinSym`: combining a prefix execution
+    `wpMirUntilJoinSym prefixFuel body joinBb st cut post` with a single suffix proof
+    `∀ sJoin, cut sJoin → wpMirSym suffixFuel body sJoin post` yields
+    `wpMirExecSym (prefixFuel + suffixFuel) body st post`. -/
+theorem wpMirUntilJoinSym_to_wpMirExecSym
+    {prefixFuel suffixFuel : Nat}
+    {body : CapturedMir}
+    {joinBb : BasicBlockIdx}
+    {st : MirExecState}
+    {cut : MachineState → Prop}
+    {post : MirOutcome → Prop}
+    (hPrefix : wpMirUntilJoinSym prefixFuel body joinBb st cut post)
+    (hJoin : ∀ sJoin : MachineState, cut sJoin → wpMirSym suffixFuel body sJoin post) :
+    wpMirExecSym (prefixFuel + suffixFuel) body st post := by
+  induction prefixFuel generalizing st with
+  | zero => exact False.elim hPrefix
+  | succ fuel' ih =>
+    have hAdd : fuel' + 1 + suffixFuel = (fuel' + suffixFuel) + 1 := by omega
+    rw [hAdd]
+    unfold wpMirUntilJoinSym at hPrefix
+    unfold wpMirExecSym
+    rw [evalSymNodeTree_eq, stepMirExecSymTree_eval, evalNodeWP_eq] at hPrefix ⊢
+    have hStepJoin :
+        ∀ st' : MirExecState,
+          (match isAtJoinBlockEntry joinBb st' with
+           | some sJoin => cut sJoin
+           | none => wpMirUntilJoinSym fuel' body joinBb st' cut post) →
+          wpMirExecSym (fuel' + suffixFuel) body st' post := by
+      intro st' hCont
+      cases hAt : isAtJoinBlockEntry joinBb st' with
+      | some sJoin =>
+        rw [hAt] at hCont
+        rcases isAtJoinBlockEntry_eq_some hAt with ⟨rfl, _, _, _⟩
+        exact wpMirExecSym_mono_fuel (Nat.le_add_left suffixFuel fuel') (hJoin sJoin hCont)
+      | none =>
+        rw [hAt] at hCont
+        exact ih hCont
+    cases h_step : stepMirState body st with
+    | ret _ =>
+      rw [h_step] at hPrefix
+      exact hPrefix
+    | tau st' =>
+      rw [h_step] at hPrefix
+      exact hStepJoin st' hPrefix
+    | vis i k =>
+      rw [h_step] at hPrefix
+      exact mirDefaultWP.mono (fun o _ hw => hStepJoin (k o) hw) hPrefix
+
+/-- Coinductive `DWLP mirDefaultWP` soundness of `wpMirUntilJoinSym`: if `wpMirUntilJoinSym`
+    holds up to `joinBb` with cut predicate `cut`, and every `sJoin` satisfying `cut` satisfies
+    `DWLP mirDefaultWP (mirTree body sJoin)`, then `DWLP mirDefaultWP` holds from `st`. -/
+theorem dwlp_of_wpMirUntilJoinSym
+    {fuel : Nat}
+    {body : CapturedMir}
+    {joinBb : BasicBlockIdx}
+    {st : MirExecState}
+    {cut : MachineState → Prop}
+    {post : MirOutcome → Prop}
+    (hPrefix : wpMirUntilJoinSym fuel body joinBb st cut post)
+    (hJoin :
+      ∀ sJoin : MachineState,
+        cut sJoin →
+        DWLP mirDefaultWP (mirTree body sJoin) (fun out _ => post out) PUnit.unit) :
+    DWLP mirDefaultWP (ITree.cofix (stepMirState body) st) (fun out _ => post out) PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => exact False.elim hPrefix
+  | succ fuel' ih =>
+    unfold wpMirUntilJoinSym at hPrefix
+    rw [evalSymNodeTree_eq, stepMirExecSymTree_eval, evalNodeWP_eq] at hPrefix
+    have hStepJoin :
+        ∀ st' : MirExecState,
+          (match isAtJoinBlockEntry joinBb st' with
+           | some sJoin => cut sJoin
+           | none => wpMirUntilJoinSym fuel' body joinBb st' cut post) →
+          DWLP mirDefaultWP (ITree.cofix (stepMirState body) st')
+            (fun out _ => post out) PUnit.unit := by
+      intro st' hCont
+      cases hAt : isAtJoinBlockEntry joinBb st' with
+      | some sJoin =>
+        rw [hAt] at hCont
+        rcases isAtJoinBlockEntry_eq_some hAt with ⟨rfl, _, _, _⟩
+        exact hJoin sJoin hCont
+      | none =>
+        rw [hAt] at hCont
+        exact ih hCont
+    rw [DWLP.unfold_eq, ITree.observe_cofix]
+    cases h_step : stepMirState body st with
+    | ret out =>
+      rw [h_step] at hPrefix
+      dsimp only [ITreeF.map]
+      exact hPrefix
+    | tau st' =>
+      rw [h_step] at hPrefix
+      dsimp only [ITreeF.map]
+      exact hStepJoin st' hPrefix
+    | vis i k =>
+      rw [h_step] at hPrefix
+      dsimp only [ITreeF.map]
+      exact mirDefaultWP.mono (fun o _ hw => hStepJoin (k o) hw) hPrefix
+
+/-- Merge two `MirSemantics.LocalSlot`s under boolean branch condition `cond`:
+    when both branches hold initialized scalars of the same byte width `sz`, pushes `if cond`
+    inside `ScalarInt.bits` so downstream `evalOperand` / `evalRvalue` steps in the join block
+    see a single `.init (.scalar ⟨..., sz⟩)` constructor without re-splitting on `cond`. -/
+def mergeMirScalarSlot (cond : Bool) (sT sF : LocalSlot) : LocalSlot :=
+  match sT, sF with
+  | .init (.scalar scT), .init (.scalar scF) =>
+    if Nat.beq scT.sizeBytes scF.sizeBytes then
+      .init (.scalar { bits := if cond then scT.bits else scF.bits, sizeBytes := scT.sizeBytes })
+    else
+      if cond then sT else sF
+  | .dead, .dead => .dead
+  | .uninit, .uninit => .uninit
+  | _, _ => if cond then sT else sF
+
+theorem mergeMirScalarSlot_true (sT sF : LocalSlot) :
+    mergeMirScalarSlot true sT sF = sT := by
+  cases sT with
+  | dead => cases sF <;> rfl
+  | uninit => cases sF <;> rfl
+  | init vT =>
+    cases vT with
+    | scalar scT =>
+      cases sF with
+      | dead => rfl
+      | uninit => rfl
+      | init vF =>
+        cases vF with
+        | scalar scF =>
+          dsimp [mergeMirScalarSlot]
+          split <;> rfl
+        | _ => rfl
+    | _ => cases sF <;> rfl
+
+theorem mergeMirScalarSlot_false (sT sF : LocalSlot) :
+    mergeMirScalarSlot false sT sF = sF := by
+  cases sT with
+  | dead => cases sF <;> rfl
+  | uninit => cases sF <;> rfl
+  | init vT =>
+    cases vT with
+    | scalar scT =>
+      cases sF with
+      | dead => rfl
+      | uninit => rfl
+      | init vF =>
+        cases vF with
+        | scalar scF =>
+          dsimp [mergeMirScalarSlot]
+          cases hSz : Nat.beq scT.sizeBytes scF.sizeBytes with
+          | false => rfl
+          | true =>
+            have hEq : scT.sizeBytes = scF.sizeBytes := (nat_beq_eq_true_iff _ _).1 hSz
+            rcases scF with ⟨bitsF, szF⟩
+            dsimp at hEq ⊢
+            subst hEq
+            rfl
+        | _ => rfl
+    | _ => cases sF <;> rfl
+
+theorem mergeMirScalarSlot_self (cond : Bool) (s : LocalSlot) :
+    mergeMirScalarSlot cond s s = s := by
+  cases cond
+  · exact mergeMirScalarSlot_false s s
+  · exact mergeMirScalarSlot_true s s
+
+/-- Pointwise merge of two `List LocalSlot` local stores under branch condition `cond`. -/
+def mergeMirLocalSlots (cond : Bool) : List LocalSlot → List LocalSlot → List LocalSlot
+  | [], lF => if cond then [] else lF
+  | lT, [] => if cond then lT else []
+  | sT :: restT, sF :: restF =>
+    mergeMirScalarSlot cond sT sF :: mergeMirLocalSlots cond restT restF
+
+theorem mergeMirLocalSlots_true :
+    ∀ (lT lF : List LocalSlot), mergeMirLocalSlots true lT lF = lT
+  | [], _ => rfl
+  | _ :: _, [] => rfl
+  | sT :: restT, sF :: restF => by
+    simp [mergeMirLocalSlots, mergeMirScalarSlot_true, mergeMirLocalSlots_true restT restF]
+
+theorem mergeMirLocalSlots_false :
+    ∀ (lT lF : List LocalSlot), mergeMirLocalSlots false lT lF = lF
+  | [], _ => rfl
+  | _ :: _, [] => rfl
+  | sT :: restT, sF :: restF => by
+    simp [mergeMirLocalSlots, mergeMirScalarSlot_false, mergeMirLocalSlots_false restT restF]
+
+theorem mergeMirLocalSlots_self (cond : Bool) (ls : List LocalSlot) :
+    mergeMirLocalSlots cond ls ls = ls := by
+  cases cond
+  · exact mergeMirLocalSlots_false ls ls
+  · exact mergeMirLocalSlots_true ls ls
+
+/-- Merge two `MachineState`s `(sT, sF)` arriving at the same join block under condition `cond`. -/
+def mergeMirJoinState (cond : Bool) (sT sF : MachineState) : MachineState :=
+  { frame :=
+      { blockIdx := if cond then sT.frame.blockIdx else sF.frame.blockIdx
+        stmtIdx := if cond then sT.frame.stmtIdx else sF.frame.stmtIdx
+        locals := mergeMirLocalSlots cond sT.frame.locals sF.frame.locals }
+    memory := if cond then sT.memory else sF.memory }
+
+theorem mergeMirJoinState_true (sT sF : MachineState) :
+    mergeMirJoinState true sT sF = sT := by
+  rcases sT with ⟨⟨bbT, stT, locT⟩, memT⟩
+  simp [mergeMirJoinState, mergeMirLocalSlots_true]
+
+theorem mergeMirJoinState_false (sT sF : MachineState) :
+    mergeMirJoinState false sT sF = sF := by
+  rcases sF with ⟨⟨bbF, stF, locF⟩, memF⟩
+  simp [mergeMirJoinState, mergeMirLocalSlots_false]
+
+theorem mergeMirJoinState_self (cond : Bool) (s : MachineState) :
+    mergeMirJoinState cond s s = s := by
+  cases cond
+  · exact mergeMirJoinState_false s s
+  · exact mergeMirJoinState_true s s
+
+/-- Production `MirSemantics` / `DWLP mirDefaultWP` diamond join-cut combinator
+    (`evalJoinDiamondWP`):
+    1. Steps `body` from `s` up to the join basic block entry `(joinBb, 0)` via
+       `wpMirUntilJoinSym prefixFuel body joinBb (.running s) (fun s' => s' = sJoin) post`,
+       verifying that both `SwitchInt` branches reach the single merged join state `sJoin`
+       (e.g., via canonicalized dead temporaries or `mergeMirJoinState`), and
+    2. Proves the continuation from `joinBb` **once** on `sJoin` via
+       `wpMirSym suffixFuel body sJoin post`. -/
+def evalJoinDiamondWP
+    (prefixFuel suffixFuel : Nat)
+    (body : CapturedMir)
+    (joinBb : BasicBlockIdx)
+    (s sJoin : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  wpMirUntilJoinSym prefixFuel body joinBb (.running s) (fun s' => s' = sJoin) post ∧
+    wpMirSym suffixFuel body sJoin post
+
+/-- `evalJoinDiamondWP` implies `wpMirSym (prefixFuel + suffixFuel) body s post`. -/
+theorem wpMirSym_of_evalJoinDiamondWP
+    {prefixFuel suffixFuel : Nat}
+    {body : CapturedMir}
+    {joinBb : BasicBlockIdx}
+    {s sJoin : MachineState}
+    {post : MirOutcome → Prop}
+    (h : evalJoinDiamondWP prefixFuel suffixFuel body joinBb s sJoin post) :
+    wpMirSym (prefixFuel + suffixFuel) body s post :=
+  wpMirUntilJoinSym_to_wpMirExecSym h.1 (fun _ hEq => hEq ▸ h.2)
+
+/-- Total-correctness (`DWP mirDefaultWP`) soundness of `evalJoinDiamondWP`. -/
+theorem dwpMirJoinDiamond_sound
+    {prefixFuel suffixFuel : Nat}
+    {body : CapturedMir}
+    {joinBb : BasicBlockIdx}
+    {s sJoin : MachineState}
+    {post : MirOutcome → Prop}
+    (h : evalJoinDiamondWP prefixFuel suffixFuel body joinBb s sJoin post) :
+    DWP mirDefaultWP (mirTree body s) (fun out _ => post out) PUnit.unit :=
+  dwp_of_wpMirSym (wpMirSym_of_evalJoinDiamondWP h)
+
+/-- **Compositional `DWLP mirDefaultWP` Diamond Join-Cut Soundness (`wpMirJoinDiamond_sound`)**:
+    When both `SwitchInt` arms step to the join block `joinBb` with states matching `sJoin`,
+    proving the suffix `wpMirSym suffixFuel body sJoin post` **once** on `sJoin` discharges
+    `DWLP mirDefaultWP (mirTree body s)` without duplicating `joinBb` across branches. -/
+theorem wpMirJoinDiamond_sound
+    {prefixFuel suffixFuel : Nat}
+    {body : CapturedMir}
+    {joinBb : BasicBlockIdx}
+    {s sJoin : MachineState}
+    {post : MirOutcome → Prop}
+    (h : evalJoinDiamondWP prefixFuel suffixFuel body joinBb s sJoin post) :
+    DWLP mirDefaultWP (mirTree body s) (fun out _ => post out) PUnit.unit :=
+  (dwpMirJoinDiamond_sound h).toDWLP
+
+/-- Coinductive `DWLP mirDefaultWP` variant of `wpMirJoinDiamond_sound` taking a direct
+    `DWLP mirDefaultWP (mirTree body sJoin)` continuation hypothesis at `joinBb`. -/
+theorem wpMirJoinDiamond_dwlp_sound
+    {prefixFuel : Nat}
+    {body : CapturedMir}
+    {joinBb : BasicBlockIdx}
+    {s sJoin : MachineState}
+    {post : MirOutcome → Prop}
+    (hPrefix : wpMirUntilJoinSym prefixFuel body joinBb (.running s) (fun s' => s' = sJoin) post)
+    (hJoin : DWLP mirDefaultWP (mirTree body sJoin) (fun out _ => post out) PUnit.unit) :
+    DWLP mirDefaultWP (mirTree body s) (fun out _ => post out) PUnit.unit :=
+  dwlp_of_wpMirUntilJoinSym hPrefix (fun _ hEq => hEq ▸ hJoin)
+
+section MirJoinDiamondWitness
+
+private def u64JoinMirTy : Ty := { kind := .uint .u64, layoutIdx := 0 }
+
+private def u64JoinConstOp (n : Nat) : Operand :=
+  .constant { ty := u64JoinMirTy, val := .scalar (.int { bits := n, sizeBytes := 8 }) }
+
+private def defaultU64JoinLayout : TypeLayout :=
+  { size := { bytes := 8 }
+    align := { bytes := 8 }
+    backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+private def defaultU64JoinFnAbi : FnAbi :=
+  { args := []
+    ret := { layout := defaultU64JoinLayout, mode := .direct }
+    conv := .rust
+    canUnwind := true }
+
+/-- Production `CapturedMir` diamond body (`mirJoinDiamondBody`):
+    - `_0`: `u64` return slot,
+    - `_1`: `u64` input `x`,
+    - `_2`: `u64` branch selector `flag`,
+    - `_3`: branch-local `u64` temporary used only in the `then` arm (`bb1`), killed via
+      `StorageDead(3)` before jumping to `bb3`.
+    - `bb0`: `SwitchInt(_2)` (`0 -> bb2`, `otherwise -> bb1`),
+    - `bb1` (`then` arm): `StorageLive(_3); _3 := _1 + 10; _0 := _3; StorageDead(_3); goto bb3`,
+    - `bb2` (`else` arm): `_0 := _1 + 20; goto bb3`,
+    - `bb3` (join block): `_0 := _0 + _1; return`. -/
+def mirJoinDiamondBody : CapturedMir :=
+  { defPath := "sym_eval::mir_join_diamond_witness"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 2
+    localDecls :=
+      [ { mutability := .mut, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .not, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .not, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .mut, ty := u64JoinMirTy, debugName := none } ]
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind := .switchInt (.copy { local_ := 2, projection := [] })
+                { branches := [(0, 2)], otherwise := 1 }
+              span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .storageLive 3, span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 3, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 10))
+                span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 0, projection := [] }
+                  (.use (.copy { local_ := 3, projection := [] }))
+                span := "SymbolicEval.lean" }
+            , { kind := .storageDead 3, span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 20))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (.copy { local_ := 1, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .return_, span := "SymbolicEval.lean" }
+          isCleanup := false } ]
+    fnAbi := defaultU64JoinFnAbi
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+/-- Merged join state at `bb3` (`stmtIdx = 0`) for `mirJoinDiamondBody` constructed via
+    `mergeMirLocalSlots` over condition `Nat.beq flag 0`:
+    - `_0` holds `.init (.scalar ⟨if Nat.beq flag 0 then wrap64 (x + 20) else wrap64 (x + 10), 8⟩)`,
+    - `_1` holds `.init (.scalar ⟨x, 8⟩)`,
+    - `_2` holds `.init (.scalar ⟨flag, 8⟩)`,
+    - `_3` is `.dead` in both arms (`StorageDead(3)` in `bb1` matches initial `.dead` in `bb2`). -/
+def mirJoinDiamondMergedState (x flag : Nat) : MachineState :=
+  let sInit := initMachineState mirJoinDiamondBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩]
+  let armVal :=
+    if Nat.beq flag 0 then
+      wrapScalarBits (Nat.add x 20) (scalarModulus 8)
+    else
+      wrapScalarBits (Nat.add x 10) (scalarModulus 8)
+  { sInit with
+    frame :=
+      { blockIdx := 3
+        stmtIdx := 0
+        locals :=
+          [ .init (.scalar ⟨armVal, 8⟩)
+          , .init (.scalar ⟨x, 8⟩)
+          , .init (.scalar ⟨flag, 8⟩)
+          , .dead ] } }
+
+/-- **Non-Vacuity Witness for `evalJoinDiamondWP` & `wpMirJoinDiamond_sound`
+    (`mirJoinDiamond_verified_witness`)**:
+    For all `x, flag : Nat`:
+    1. Both arms of `mirJoinDiamondBody` (`bb1` with `StorageLive/StorageDead` temporary `_3` and
+       `bb2` without `_3`) step via `wpMirUntilJoinSym` to the single merged join state
+       `mirJoinDiamondMergedState x flag` at `bb3`,
+    2. `bb3` is symbolically evaluated **once** on `mirJoinDiamondMergedState x flag` (without
+       re-splitting on `Nat.beq flag 0`), and
+    3. `wpMirJoinDiamond_sound` produces `DWLP mirDefaultWP` on `mirCallTree mirJoinDiamondBody`! -/
+theorem mirJoinDiamond_evalJoinDiamondWP (x flag : Nat) :
+    let armVal :=
+      if Nat.beq flag 0 then
+        wrapScalarBits (Nat.add x 20) (scalarModulus 8)
+      else
+        wrapScalarBits (Nat.add x 10) (scalarModulus 8)
+    let expectedRet := wrapScalarBits (Nat.add armVal x) (scalarModulus 8)
+    evalJoinDiamondWP 6 3 mirJoinDiamondBody 3
+      (initMachineState mirJoinDiamondBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩])
+      (mirJoinDiamondMergedState x flag)
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩)) := by
+  intro armVal expectedRet
+  refine ⟨?_, ?_⟩
+  · -- Prefix cut up to join block `bb3`:
+    (repeat' ((conv => whnf); split)); all_goals
+      (rename_i hCond; change Nat.beq flag 0 = _ at hCond;
+       dsimp [mirJoinDiamondMergedState, armVal]; rw [hCond]; rfl)
+  · -- Suffix from `bb3` evaluated ONCE on `mirJoinDiamondMergedState x flag`:
+    rfl
+
+theorem mirJoinDiamond_verified_witness (x flag : Nat) :
+    let armVal :=
+      if Nat.beq flag 0 then
+        wrapScalarBits (Nat.add x 20) (scalarModulus 8)
+      else
+        wrapScalarBits (Nat.add x 10) (scalarModulus 8)
+    let expectedRet := wrapScalarBits (Nat.add armVal x) (scalarModulus 8)
+    DWLP mirDefaultWP
+      (mirCallTree mirJoinDiamondBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩])
+      (fun out _ =>
+        mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩) out)
+      PUnit.unit :=
+  wpMirJoinDiamond_sound (mirJoinDiamond_evalJoinDiamondWP x flag)
+
+end MirJoinDiamondWitness
+
+end Anneal.Rustc.V2026_06_01.SymbolicEval
