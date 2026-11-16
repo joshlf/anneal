@@ -947,13 +947,20 @@ fn uninit_union_value_within(
         Ty::Closure { upvars, .. } => Ok(aggregate_fields(upvars, budget)?.map(MirValue::Tuple)),
         Ty::Array(elem, count) if *count > 0 => {
             charge_one(budget)?;
+            let before = *budget;
             let Some(elem_val) = uninit_union_value_within(elem, budget)? else {
                 return Ok(None);
             };
-            if *count > *budget {
+            // Every further element is a clone of `elem_val`: charge all of its nodes once per
+            // copy, so nested arrays (`[[[MaybeUninit<u8>; 1024]; 1024]; 1024]`) stay bounded.
+            let elem_nodes = before - *budget;
+            let Some(copies) = elem_nodes
+                .checked_mul(*count - 1)
+                .filter(|nodes| *nodes <= *budget)
+            else {
                 return Err(RvalueEvalError::EvaluationLimit { len: *count });
-            }
-            *budget -= *count;
+            };
+            *budget -= copies;
             Ok(Some(MirValue::Array {
                 elements: vec![elem_val; *count],
                 elem_ty: (**elem).clone(),
@@ -967,8 +974,9 @@ fn uninit_union_value_within(
 /// [`MirValue`] when every `FieldSlot::Uninit` sub-slot inside `shell` has a type for which
 /// uninitialized bytes are already a valid union value ([`uninit_union_value`], e.g.
 /// `struct Packet { header: u32, payload: MaybeUninit<u32> }` with `header` initialized and
-/// `payload` unwritten). Returns `Ok(None)` if any uninitialized sub-slot is not such a union
-/// type or if an enum shell's tag has not been set.
+/// `payload` unwritten) or is an inhabited zero-sized type (which holds no bytes). Returns
+/// `Ok(None)` if any uninitialized sub-slot is neither or if an enum shell's tag has not been
+/// set.
 fn materialize_partial_with_uninit_unions(
     shell: &PartialAggregate,
     ty: &Ty,
@@ -998,8 +1006,12 @@ fn materialize_partial_with_uninit_unions(
         match slot {
             FieldSlot::Init(val) => values.push(val.clone()),
             FieldSlot::Uninit => {
-                let Some(val) = uninit_union_value(field_ty)? else {
-                    return Ok(None);
+                // An uninitialized inhabited zero-sized field holds no bytes either, so the
+                // bytes of the shell determine its unique value.
+                let val = match uninit_union_value(field_ty)? {
+                    Some(val) => val,
+                    None if is_inhabited_zst(field_ty) => canonical_zst_value(field_ty)?,
+                    None => return Ok(None),
                 };
                 values.push(val);
             }
@@ -1154,9 +1166,15 @@ fn fill_covering_value(
     }
 }
 
-/// Returns true if the value `val` of type `ty` holds no initialized byte: `ty` is an inhabited
-/// zero-sized type, a union whose active field holds no initialized byte, or a struct, tuple,
-/// closure, or array whose elements/fields hold no initialized byte.
+/// Returns true if the value `val` of type `ty` holds no initialized byte that the value tree
+/// tracks: `ty` is an inhabited zero-sized type, a union whose active field holds none, or a
+/// struct, tuple, closure, or array whose elements/fields hold none.
+///
+/// A union value tracks the bytes of its active field only. Its other bytes may still be
+/// initialized in Miri (e.g. the upper bytes of a `u64` field after a smaller field was
+/// overwritten with `MaybeUninit::uninit()`), but every other non-zero-sized field then reads
+/// as `InactiveUnionField`, so discarding them (as a covering write does, see
+/// [`fill_covering_value`]) only ever fails closed and never yields a value they do not hold.
 fn value_holds_no_initialized_byte(val: &MirValue, ty: &Ty) -> bool {
     if is_inhabited_zst(ty) {
         return true;
@@ -1219,10 +1237,10 @@ fn value_holds_no_initialized_byte(val: &MirValue, ty: &Ty) -> bool {
     }
 }
 
-/// Returns true if the union `Ty::Adt` value `val` holds no initialized byte: its active field
-/// is an inhabited zero-sized field (`MaybeUninit::uninit()`) or recursively holds no
-/// initialized byte. Legacy tuple-modeled union values (which carry no union definition) are
-/// never reported.
+/// Returns true if the union `Ty::Adt` value `val` holds no tracked initialized byte
+/// ([`value_holds_no_initialized_byte`]): its active field is an inhabited zero-sized field
+/// (`MaybeUninit::uninit()`) or recursively holds none. Legacy tuple-modeled union values
+/// (which carry no union definition) are never reported.
 fn union_holds_no_initialized_byte(val: &MirValue) -> bool {
     let MirValue::Adt {
         active_field: Some(_),
@@ -10596,85 +10614,40 @@ fn deinit_in_slot(
                     active_downcast,
                 )?;
                 // Uninitialized bytes written over an inhabited zero-sized place inside a union's
-                // storage (`Deinit(u.zst)`, or a zero-sized place within any of its fields) store
-                // nothing, so the union keeps its value; every runtime step along the path is
-                // still validated.
-                if let (
-                    ProjectionElem::Field(idx, expected_ty),
+                // storage (`Deinit(u.zst)`, a zero-sized place within any of its fields, also in
+                // an array element) store nothing, so the union keeps its value. Every runtime
+                // step along the path is still validated as by a read of the place (an inactive
+                // enum variant fails as for any access). A read only rejects such a place when it
+                // lies in an inactive union field and cannot be located without traversing an
+                // uninhabited part (still a well-formed place storing nothing) or a downcast,
+                // whose variant an inactive field does not determine (unsupported).
+                if matches!(
+                    val,
                     MirValue::Adt {
-                        variant_idx,
-                        active_field: Some(active),
-                        fields,
-                        adt_def,
+                        active_field: Some(_),
                         ..
-                    },
-                ) = (first, val)
+                    }
+                ) || proj_traverses_union(declared_ty, proj)
                 {
-                    if active_downcast.is_some() || *variant_idx != 0 || fields.is_empty() {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "union ADT must have variant 0, at least one field, and cannot be downcast",
-                        ));
-                    }
-                    let active_val = if fields.len() == 1 {
-                        &fields[0]
-                    } else {
-                        fields.get(*active).ok_or(RvalueEvalError::TypeMismatch(
-                            "union ADT active_field index out of bounds of fields",
-                        ))?
-                    };
-                    if let Some(union_field_tys) = union_fields_of(declared_ty).or_else(|| {
-                        adt_def
-                            .as_ref()
-                            .filter(|def| def.is_union())
-                            .and_then(|def| def.variant_fields(0))
-                    }) {
-                        let Some(active_ty) = union_field_tys.get(*active) else {
-                            return Err(RvalueEvalError::TypeMismatch(
-                                "union ADT active_field index out of bounds of declared fields",
-                            ));
-                        };
-                        if !mir_value_matches_ty(active_val, active_ty) {
-                            return Err(RvalueEvalError::TypeMismatch(
-                                "union ADT active field runtime value does not match declared type",
-                            ));
-                        }
-                    }
-                    if *active == *idx {
-                        let _ = project_mir_value(
-                            active_val,
-                            Some(expected_ty),
-                            rest,
-                            read_index,
-                            full_place,
-                            None,
-                        )?;
-                        if is_inhabited_zst(&leaf_ty) {
-                            return Ok(());
-                        }
-                    } else if let Some((zst_ty, zst_tail)) = resolve_inactive_union_zst_subplace(
-                        expected_ty,
-                        rest,
-                        Some(read_index),
+                    let zst_leaf = is_inhabited_zst(&leaf_ty);
+                    let has_downcast =
+                        proj.iter().any(|elem| matches!(elem, ProjectionElem::Downcast(_)));
+                    match project_mir_value(
+                        val,
+                        Some(declared_ty),
+                        proj,
+                        read_index,
                         full_place,
-                    )? {
-                        let zst_val = canonical_zst_value(&zst_ty)?;
-                        let _ = project_mir_value(
-                            &zst_val,
-                            Some(&zst_ty),
-                            zst_tail,
-                            read_index,
-                            full_place,
-                            None,
-                        )?;
-                        if is_inhabited_zst(&leaf_ty) {
+                        active_downcast,
+                    ) {
+                        Ok(_) if zst_leaf => return Ok(()),
+                        Err(RvalueEvalError::InactiveUnionField { .. })
+                            if zst_leaf && !has_downcast =>
+                        {
                             return Ok(());
                         }
-                    } else if is_inhabited_zst(&leaf_ty)
-                        && !rest
-                            .iter()
-                            .any(|elem| matches!(elem, ProjectionElem::Downcast(_)))
-                    {
-                        return Ok(());
+                        Ok(_) | Err(RvalueEvalError::InactiveUnionField { .. }) => {}
+                        Err(err) => return Err(err),
                     }
                 }
                 return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
@@ -11338,6 +11311,36 @@ fn frame_slot_union_path_active(
         FrameSlot::Live(SlotRef::Partial(shell)) => shell_union_path_active(shell, proj, mode),
         FrameSlot::Live(SlotRef::Uninit) => uninit_ty_union_path_active(decl_ty, proj, mode),
         FrameSlot::Dead => true,
+    }
+}
+
+/// [`frame_slot_union_path_active`] for a read ([`UnionPathMode::ActiveOnly`]) that leaves the
+/// uninitialized parts of `slot` unconstrained: a read of such a part faults as uninitialized
+/// whichever field it names, while every union field selected inside an initialized value
+/// (also one held by a partially initialized shell) must still be active.
+fn frame_slot_union_path_readable(slot: FrameSlot<'_>, proj: &[ProjectionElem]) -> bool {
+    fn shell_readable(shell: &PartialAggregate, proj: &[ProjectionElem]) -> bool {
+        let Some((first, rest)) = proj.split_first() else {
+            return true;
+        };
+        match first {
+            ProjectionElem::Downcast(_) => shell_readable(shell, rest),
+            ProjectionElem::Field(idx, _) => match shell.fields.get(*idx) {
+                Some(FieldSlot::Init(val)) => {
+                    value_union_path_active(val, rest, UnionPathMode::ActiveOnly)
+                }
+                Some(FieldSlot::Partial(child)) => shell_readable(child, rest),
+                Some(FieldSlot::Uninit) | None => true,
+            },
+            _ => true,
+        }
+    }
+    match slot {
+        FrameSlot::Live(SlotRef::Init(val)) => {
+            value_union_path_active(val, proj, UnionPathMode::ActiveOnly)
+        }
+        FrameSlot::Live(SlotRef::Partial(shell)) => shell_readable(shell, proj),
+        FrameSlot::Live(SlotRef::Uninit) | FrameSlot::Dead => true,
     }
 }
 
@@ -12098,12 +12101,12 @@ fn select_subplace_candidate_in<F: FrameView + ?Sized>(
     let consistent = if !active_consistent.is_empty() {
         &active_consistent
     } else if !allow_union_overwrite {
+        // A read (or a write into a part of the pointee) names a place inside an uninitialized
+        // union as it names any other uninitialized place (the access then faults as
+        // uninitialized), but never an inactive field of an initialized union.
         fallback_consistent = (0..candidates.len())
             .filter(|&i| {
-                valid_projection(i) && match slot {
-                    FrameSlot::Live(SlotRef::Init(_)) => false,
-                    _ => true,
-                }
+                valid_projection(i) && frame_slot_union_path_readable(slot, &candidates[i])
             })
             .collect();
         &fallback_consistent
@@ -16127,5 +16130,43 @@ mod tests {
             }),
             Ok(MAX_EVAL_ARRAY_LEN - 1)
         );
+    }
+
+    /// `uninit_union_value` of arrays of unions: every element is `MaybeUninit::uninit()`, and
+    /// nested arrays charge every cloned node to the materialization budget (`ep1-A1`).
+    #[test]
+    fn test_ep1_uninit_union_arrays_and_their_materialization_budget() {
+        let md = Arc::new(
+            AdtDef::new_struct("core::mem::ManuallyDrop", vec![Ty::Uint(UintTy::U8)])
+                .with_repr(crate::ir::AdtRepr::transparent()),
+        );
+        let mu_def = Arc::new(
+            AdtDef::new_union("core::mem::MaybeUninit", vec![Ty::unit(), Ty::Adt(md)])
+                .with_repr(crate::ir::AdtRepr::transparent()),
+        );
+        let mu_ty = Ty::Adt(mu_def.clone());
+        let uninit = MirValue::union_value(&mu_def, 0, MirValue::Unit);
+        let arr = |elem: Ty, n: usize| Ty::Array(Box::new(elem), n);
+        let row = MirValue::Array {
+            elements: vec![uninit.clone(); 4],
+            elem_ty: mu_ty.clone(),
+        };
+        assert_eq!(
+            uninit_union_value(&arr(arr(mu_ty.clone(), 4), 3)),
+            Ok(Some(MirValue::Array {
+                elements: vec![row; 3],
+                elem_ty: arr(mu_ty.clone(), 4),
+            }))
+        );
+        // 2^30 union values (2^31 nodes) would be cloned from a 2^10-element row.
+        let cube = arr(arr(arr(mu_ty.clone(), 1 << 10), 1 << 10), 1 << 10);
+        assert!(matches!(
+            uninit_union_value(&cube),
+            Err(RvalueEvalError::EvaluationLimit { .. })
+        ));
+        assert!(matches!(
+            uninit_union_value(&arr(mu_ty, MAX_EVAL_ARRAY_LEN)),
+            Err(RvalueEvalError::EvaluationLimit { .. })
+        ));
     }
 }
