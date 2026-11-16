@@ -415,6 +415,18 @@ def tokenize_lean(text: str) -> list[tuple[str, str, int]]:
             j += 1
         return j
 
+    def skip_char_literal(j: int) -> int | None:
+        nonlocal line
+        # text[j] == "'" and (j == 0 or not _is_ident_char(text[j - 1]))
+        if text.startswith("'\\", j):
+            k = text.find("'", j + 3)
+            if k < 0 or "\n" in text[j:k]:
+                return None
+            return k + 1
+        if j + 2 < n and text[j + 2] == "'" and text[j + 1] != "\n":
+            return j + 3
+        return None
+
     def skip_code_until_brace(j: int) -> int:
         nonlocal line
         depth = 1
@@ -423,19 +435,33 @@ def tokenize_lean(text: str) -> list[tuple[str, str, int]]:
             if c == "\n":
                 line += 1
                 j += 1
+            elif text.startswith("--", j):
+                k = text.find("\n", j)
+                j = n if k < 0 else k
+            elif text.startswith("/-", j):
+                j = skip_block_comment(j)
+            elif c in "smf" and text.startswith('!"', j + 1) and (j == 0 or not _is_ident_char(text[j - 1])):
+                j = skip_string(j + 2, True)
+            elif c == "r" and (j == 0 or not _is_ident_char(text[j - 1])) and (
+                    text.startswith('r"', j) or text.startswith("r#", j)):
+                end = skip_raw_string(j)
+                j = j + 1 if end is None else end
+            elif c == '"':
+                j = skip_string(j, False)
+            elif c == "'" and (j == 0 or not _is_ident_char(text[j - 1])):
+                end = skip_char_literal(j)
+                j = j + 1 if end is None else end
+            elif c == "«":
+                k = text.find("»", j + 1)
+                k = n if k < 0 else k
+                line += text.count("\n", j, k)
+                j = k + 1
             elif c == "{":
                 depth += 1
                 j += 1
             elif c == "}":
                 depth -= 1
                 j += 1
-            elif c == '"':
-                j = skip_string(j, False)
-            elif text.startswith("--", j):
-                k = text.find("\n", j)
-                j = n if k < 0 else k
-            elif text.startswith("/-", j):
-                j = skip_block_comment(j)
             else:
                 j += 1
         return j
@@ -499,15 +525,13 @@ def tokenize_lean(text: str) -> list[tuple[str, str, int]]:
             else:
                 i = end
         elif c == "'" and (i == 0 or not _is_ident_char(text[i - 1])):
-            # char literal: 'x', '\n', '\x41', '\u{1F600}'
-            if text.startswith("'\\", i):
-                k = text.find("'", i + 2)
-                i = n if k < 0 else k + 1
-            elif i + 2 < n and text[i + 2] == "'":
-                i += 3
-            else:
+            # char literal: 'x', '\n', '\'', '\x41', '\u{1F600}'
+            end = skip_char_literal(i)
+            if end is None:
                 toks.append(("punct", "'", line))
                 i += 1
+            else:
+                i = end
         elif c == "«" or _is_ident_start(c):
             start_line = line
             parts: list[str] = []
@@ -564,10 +588,28 @@ def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> li
             if is_instance:
                 j += 1
             classes: list[str] = []
-            while j < n and toks[j][0] == "ident" and toks[j][1] not in ("for", "deriving"):
+            while j < n:
+                paren_depth = 0
+                while j < n and toks[j] == ("punct", "(", toks[j][2]):
+                    paren_depth += 1
+                    j += 1
+                if j >= n or toks[j][0] != "ident" or toks[j][1] in ("for", "deriving"):
+                    break
                 classes.append(toks[j][1])
                 j += 1
-                # skip class arguments in parentheses (rare: `deriving Foo (bar)`)
+                # skip class arguments in parentheses (e.g. `deriving Foo (bar), BEq`)
+                while j < n and toks[j] == ("punct", "(", toks[j][2]):
+                    arg_depth = 1
+                    j += 1
+                    while j < n and arg_depth > 0:
+                        if toks[j] == ("punct", "(", toks[j][2]):
+                            arg_depth += 1
+                        elif toks[j] == ("punct", ")", toks[j][2]):
+                            arg_depth -= 1
+                        j += 1
+                while paren_depth > 0 and j < n and toks[j] == ("punct", ")", toks[j][2]):
+                    paren_depth -= 1
+                    j += 1
                 if j < n and toks[j] == ("punct", ",", toks[j][2]):
                     j += 1
                     continue
@@ -575,9 +617,18 @@ def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> li
             targets: list[str] = []
             if is_instance and j < n and toks[j][1] == "for":
                 j += 1
-                while j < n and toks[j][0] == "ident":
+                while j < n:
+                    tp_depth = 0
+                    while j < n and toks[j] == ("punct", "(", toks[j][2]):
+                        tp_depth += 1
+                        j += 1
+                    if j >= n or toks[j][0] != "ident":
+                        break
                     targets.append(toks[j][1])
                     j += 1
+                    while tp_depth > 0 and j < n and toks[j] == ("punct", ")", toks[j][2]):
+                        tp_depth -= 1
+                        j += 1
                     if j < n and toks[j] == ("punct", ",", toks[j][2]):
                         j += 1
                         continue

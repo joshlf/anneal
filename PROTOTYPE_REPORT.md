@@ -22,19 +22,20 @@ and cone narrowing that preserves lookup *results* including `flatMapTraitImpls`
 contributions); none is a blocker, each has a concrete plan, and each is already
 pinned by a theorem or canary here.
 
-## 1. Lean verification inventory (A0)
+## 1. Lean verification inventory (updated through B1)
 
-| item | count |
+| item | count (A0 → B1) |
 |---|---|
-| `theorem` | 124 |
-| `def` | 145 |
+| `theorem` | 124 → **175** |
+| `def` | 145 → **171** |
 | `structure` / `inductive` | 10 / 12 |
-| `deriving instance DecidableEq` (real `Trusted` types) | 36 |
-| inline `deriving DecidableEq` (prototype types) | 19 |
+| `deriving instance DecidableEq` (real `Trusted` types) | 36 → **74** |
+| inline `deriving DecidableEq` (prototype types) | 19 → **21** |
+| manual axiom-free Boolean-reflection `DecidableEq` (`RigidTy`, `Value`) | 1 → **2** (`rigidTyStructEq_iff`, `valueStructEq_iff`) |
 | `deriving BEq` anywhere | **0** |
-| `#guard_msgs` (28 `#print axioms` pins + 4 behaviour pins) | 32 |
-| `decide +kernel` canaries (kernel evaluation of the real trusted machine) | 10 |
-| bottom-of-file `run_cmd` axiom audit | traverses every module-local constant (≥ 1000 in the prototype namespace plus `deriving` auxiliaries), allows only `[propext, Quot.sound]`, self-tests that it flags `Classical.choice` / `sorryAx` / `Lean.ofReduceBool` |
+| `#guard_msgs` (43 `#print axioms` pins + 4 behaviour pins) | 32 → **47** |
+| `decide +kernel` canaries (kernel evaluation of the real trusted machine) | 10 → **22** |
+| bottom-of-file `run_cmd` axiom audit | traverses every module-local constant (≥ 1200 in the prototype namespace plus `deriving` auxiliaries, ≥ 115 theorems), allows only `[propext, Quot.sound]`, self-tests that it flags `Classical.choice` / `sorryAx` / `Lean.ofReduceBool` |
 | `run_meta` opacity witness | `whnf` at default transparency leaves `OpaqueCalleeTable.lookupRaw` / `.lookup` stuck; only `.all` unfolds them |
 
 Every headline theorem's axiom set is pinned (`#guard_msgs (whitespace := lax)`):
@@ -55,7 +56,14 @@ every miss): `opaqueCalleeTable_lookup_eq_trusted`.
 `lookupCallee_hit` (resolution certificate + `instantiationLayouts?` certificate ⇒
 `some (c.instantiate (eff.zip argLayouts))`; the trusted accumulator loop
 `lookupCallee.resolveLayouts` is proven equal to `instantiationLayouts?`),
-`lookupCallee_trait_hit` (unique most-specific `TraitImplEntry` winner),
+`lookupCallee_hit_poly` (direct polymorphic or fallback default-method hit stated
+purely over `tbl.lookupRaw` and `(traitMatches ...).isEmpty = true`, eliminating raw
+`tbl.toList` reduction),
+`lookupCallee_trait_hit` (monomorphic `TraitImplEntry` override winner),
+`lookupCallee_trait_hit_poly` (polymorphic `TraitImplEntry` override winner with
+`c.typeParamCount > 0`),
+`lookupCallee_trait_default_hit` (default trait method inheritance when
+`winner.implPath = defPath`), and
 `lookupCallee_miss` / `_miss_direct` / `_miss_arity` / `_miss_uninstantiable`.
 Raw certificates are what a capture tool would emit and what the benchmark
 measures as `cert_gen`: `lookupRaw_ofList_append_cons_of_skips` splits the table as
@@ -77,7 +85,10 @@ arms), hence `stepBranchPruned_eq_trusted` (a pruned opaque step **is**
 `stepMirFn`), `evalWithOpaqueCallees_eq_evalWithListCallees` (exact multi-step
 equivalence for all programs, layouts, trait impls, states, fuel), and
 `evalWithOpaqueCallees_eq_trusted` (multi-step equality with iterated `stepMirFn`
-under the `memory.callees` frame condition).
+under the `memory.callees` frame condition, concretely instantiated in B1 by
+`canary_evalWithOpaqueCallees_eq_trusted` over `initMachineStateWithCallees`, while
+`canary_trusted_stepMirFn_requires_linked_callees` shows `initMachineState` with
+`callees = []` stalls at `.call` under trusted `stepMirFn`).
 
 **Call-cone narrowing.** `demandedKeys` collects the callee-table keys demanded along
 the pruned run (dead literal arms and unreachable blocks demand nothing).
@@ -89,7 +100,11 @@ evaluation of the real trusted machine:
 `canary_deadArm_halts` (the run genuinely halts with `[.event 1]`, returning `7`),
 `canary_liveArm_required` (dropping the live callee turns the run into an external
 call — the hypothesis is necessary), `canary_multi_cone_narrow` (polymorphic
-`poly::<u32>` instantiation + `<Circle as Area>::area` trait dispatch), and
+`poly::<u32>` instantiation + `<Circle as Area>::area` trait dispatch),
+`canary_trait_specificity_and_default_inheritance` (two competing `TraitImplEntry`
+records — blanket `impl<T> Area for Wrapper<T>` vs. specialized
+`impl Area for Wrapper<u32>` — resolved via `filterMostSpecificTraitImpls`, plus
+default trait method inheritance for `impl Area for Square`), and
 `canary_naiveNarrow_breaks_trait_dispatch` (see §8.1).
 
 ## 3. Part B — demand-time `CompilerQueryEnv`
@@ -98,8 +113,12 @@ call — the hypothesis is necessary), `canary_multi_cone_narrow` (polymorphic
 decidable total (hence partial) order `SchemaLe` (`refl`/`trans`/`antisymm`/`total`).
 Three-way `QueryResult` (`ok` / `err : QueryErr` / `unsupported : MissingEvidence`).
 `CompilerQueryEnv` carries the schema, V2026_06_01 layouts, optional V2026_08_01
-layouts (bridged by `bridgeLayoutV08ToV06` / `bridgeTypeLayoutV08ToV06`, lossless by
-`bridgeTypeLayout_roundtrip` / `bridgeLayout_roundtrip`), the declared `FnAbi`
+layouts (bridged in both directions by `bridgeLayoutV08ToV06` / `bridgeLayoutV06ToV08`,
+`bridgeTypeLayoutV08ToV06` / `bridgeTypeLayoutV06ToV08`, and
+`bridgeRigidTyV08ToV06` / `bridgeRigidTyV06ToV08`, lossless in both directions by
+`bridgeTypeLayout_roundtrip` / `bridgeTypeLayout_roundtrip_v08`,
+`bridgeLayout_roundtrip` / `bridgeLayout_roundtrip_v08`, and
+`bridgeRigidTy_roundtrip`), the declared `FnAbi`
 table, and optional Schema-13 CFI tags, sync-storage regions, and vtable entries;
 every Schema-13 (resp. V08) field is *schema-gated*.
 
@@ -107,17 +126,31 @@ every Schema-13 (resp. V08) field is *schema-gated*.
 captured `LayoutTable` entry; V08 `RigidTy.computeLayout` on the bridged type,
 bridged back), `abiCompatible` (CFI evidence → CFI type ids → `CallConv` → per-arg
 `AbiPassMode` + layout → return ABI → unwinding), `syncStorageGuard`
-(`syncStorageRegion_blocks_iff_overlap`: rejects exactly the accesses overlapping a
-region of the same allocation), and `vtableMethodLookup`.
+(`syncStorageRegion_blocks_iff_overlap`: rejects if and only if a non-empty access
+`0 < len` overlaps a non-empty region `0 < r.size` of the same allocation;
+`syncStorageRegion_blocks_zero_size`: 0-byte regions never block any access), and
+`vtableMethodLookup`.
 
-Proven: `query_schema12_unsupported_fallback` (stronger than required: *every*
-Schema-12 environment, whatever its optional fields hold, answers every
-Schema-13-only query with `.unsupported`), `query_schema12_never_ok`,
-`query_mono_schema` (every `.ok` / `.err` answer is preserved by every
-`EnvExtends`, itself a preorder), `layoutOf_agrees_with_eager` (demand-time V06
-`layoutOf` = the eager pre-enumerated catalog on every catalogued type),
-`memoLookup_memoize` (`QueryKey`-memoized answers = demand-time answers), plus
-decidable canaries for every query family and error.
+Proven:
+- **Universal cross-dialect `computeLayout` commutation (B1)**:
+  `computeLayout_bridge_commutes`, `computeLayoutList_bridge_commutes`,
+  `computeLayoutV08Bridged_bridgeLayoutV06ToV08`,
+  `computeLayoutV08Bridged_eq_computeLayoutV06_bridge`, and `evalLayoutOf_v08_eq_v06`
+  prove that V2026_08_01 `RigidTy.computeLayout` commutes with the dialect bridge
+  across all 21 `RigidTy` constructors (primitives, pointers, fat pointers, arrays,
+  tuples, closures, and ADTs with `fieldLayouts`, unions, and multi-variant enums).
+- **Bidirectional ABI compatibility characterizations (B1)**:
+  `argAbiMismatch?_eq_none_iff`, `fnAbiMismatch?_eq_none_iff`, and `abiCore_ok_iff`.
+- **Fail-closed Schema-12 fallback & schema-gated monotonicity**:
+  `query_schema12_unsupported_fallback` (*every* Schema-12 environment, whatever its
+  raw optional fields hold, answers every Schema-13-only query with `.unsupported`),
+  `query_schema12_never_ok`, and `query_mono_schema` (every `.ok` / `.err` answer is
+  preserved by every `EnvExtends` over schema-gated evidence accessors, with
+  `EnvExtends.of_raw` and `envExtends_schema12_ignored_fields_canary`).
+- **Eager catalog & memoization agreement**:
+  `layoutOf_agrees_with_eager` (demand-time V06 `layoutOf` = the eager pre-enumerated
+  catalog on every catalogued type) and `memoLookup_memoize` (`QueryKey`-memoized
+  answers = demand-time answers).
 
 ## 4. End-to-end integration
 
@@ -131,16 +164,37 @@ narrowing simultaneously; the canaries show Schema 12 failing closed
 (`dyn_step_enters_impl`), preservation under a further extension plus narrowing to
 the single dispatched body (`dyn_step_preserved`), and the CFI trap (`dyn_cfi_trap`).
 
+In B1, `demandsDynSite`, `dynDemandStep`, and `evalDynWithOpaqueCallees` add
+**demand-gated dynamic dispatch** (`resolveDynTarget` is queried *only* at states
+whose active step demands `site.dynKey`):
+- `dynDemandStep_preserved` proves single-step preservation where the query
+  supportedness hypothesis is required only when `demandsDynSite site body s = true`.
+- `canary_dyn_e2e_full_run_schema13` runs the full multi-step execution from `dynInit`
+  (`if true { <dyn Area>::area() } else { g_dead() }`) to `.halted 31` on the
+  narrowed opaque table.
+- `canary_dyn_deadBranch_schema12_succeeds` proves the **Part A + Part B synergy**:
+  when `<dyn Area>::area()` sits on the dead branch of `if false`,
+  `evalDynWithOpaqueCallees` under Schema 12 (`dynEnv12`, which lacks vtable
+  evidence) never demands `vtableMethodLookup` and halts cleanly returning `7` from
+  `live_f()`.
+
 ## 5. Part C — `DecidableEq` without `BEq`
 
-No prototype type derives or declares `BEq`; every real `Trusted` type the
-prototype compares gets `DecidableEq` only (36 `deriving instance`, plus a manual
-axiom-free `DecidableEq RigidTy` by Boolean reflection, `rigidTyStructEq_iff`), so
-`==` is `instBEqOfDecidableEq` and the core `instLawfulBEq` gives `beq_iff_eq`
-(`rigidTy_beq_iff_eq`, `layoutTable_beq_iff_eq`, …; `#synth LawfulBEq DemoKey`
-pinned to `instLawfulBEq`). The worked demonstration (`ShadowingDemo`) installs the
-structural `BEq` a redundant derivation would add and pins the resulting
-`failed to synthesize LawfulBEq DemoKey`.
+No prototype type derives or declares `BEq`; every real `Trusted` type in
+`Trusted.Rustc.V2026_06_01.{Layout,MirAst,MirSemantics}` and
+`Trusted.Rustc.V2026_08_01.{Layout,MirAst}` gets `DecidableEq` only (74
+`deriving instance` declarations covering all AST, layout, and machine-state types
+including `CapturedMir`, `MachineState`, `Memory`, `StackFrame`, `LocalSlot`,
+`BorrowEntry`, `TreeBorrowPerm`, `SavedCallerFrame`, `FnPtrEntry`, `MirCallReq`,
+`Outcome`, and `MirExecState`, plus 2 manual axiom-free Boolean-reflection
+`DecidableEq` instances for the nested inductives `RigidTy` and `Value` via
+`rigidTyStructEq_iff` and `valueStructEq_iff`, and 21 inline `deriving DecidableEq`
+prototype types including `StepView` and `RunResult`). Consequently, `==` is always
+`instBEqOfDecidableEq` and the core `instLawfulBEq` gives `beq_iff_eq`
+(`rigidTy_beq_iff_eq`, `layoutTable_beq_iff_eq`, `capturedMir_beq_iff_eq`,
+`machineState_beq_iff_eq`, …; `#synth LawfulBEq DemoKey` pinned to `instLawfulBEq`).
+The worked demonstration (`ShadowingDemo`) installs the structural `BEq` a redundant
+derivation would add and pins the resulting `failed to synthesize LawfulBEq DemoKey`.
 
 ## 6. Benchmark (`--sizes 4,16,64,128`)
 
@@ -239,6 +293,84 @@ Occurrences (each a `deriving` clause / `deriving instance` combining `BEq` with
    `stringEq` fact costs ≈ 0.13 MHb per skipped entry, so generating *both*
    certificates is cheaper than one baseline step and succeeds at `M = 128`.
 
+### Round B1
+
+1. **Part B Soundness Bug (`SyncStorageRegion.blocks` 0-byte region false positive).**
+   In A0, `SyncStorageRegion.blocks` omitted `decide (0 < r.size)` from the second
+   overlap disjunct `(decide (offset < r.offset) && decide (r.offset < offset + len))`,
+   causing a 0-byte region `⟨allocId, 6, 0⟩` (`[6, 6)`, empty) to falsely block any
+   spanning access such as `[0, 12)`. Fixed in `SyncStorageRegion.blocks`, proved
+   `syncStorageRegion_blocks_zero_size`, strengthened
+   `syncStorageRegion_blocks_iff_overlap` (dropping the redundant `0 < r.size`
+   precondition), and added the 0-byte spanning case to `syncStorageGuard_canary`.
+2. **Part B `EnvExtends` loophole on ignored raw fields.** A0 defined `EnvExtends` with
+   `OptionExtends` on raw ungated fields (`env₁.vtables`, `env₁.cfiTags`,
+   `env₁.syncRegions`, `env₁.layoutsV08`) rather than the schema-gated accessors
+   (`vtableEvidence?`, `cfiEvidence?`, `syncEvidence?`, `v08Layouts?`). A Schema-12
+   environment carrying ignored garbage in a raw Schema-13 field could not extend to a
+   valid Schema-13 environment under A0's `EnvExtends`. Fixed by stating `EnvExtends`
+   over the schema-gated evidence accessors, proving `EnvExtends.of_raw`, and adding
+   `envExtends_schema12_ignored_fields_canary`. Also proved bidirectional `FnAbi` /
+   `abiCore` characterizations (`argAbiMismatch?_eq_none_iff`,
+   `fnAbiMismatch?_eq_none_iff`, `abiCore_ok_iff`).
+3. **Part B universal cross-dialect `computeLayout` commutation (closing A0 Known Gap #1).**
+   A0 only proved the one-way `V06 → V08 → V06` roundtrip and an 8-type canary. B1
+   adds reverse bridges (`bridgeRigidTyV08ToV06`, `bridgeTypeLayout_roundtrip_v08`,
+   `bridgeLayout_roundtrip_v08`, `bridgeRigidTy_roundtrip`) and proves universal
+   cross-dialect commutation (`computeLayout_bridge_commutes`,
+   `computeLayoutList_bridge_commutes`, `computeLayoutV08Bridged_bridgeLayoutV06ToV08`,
+   `computeLayoutV08Bridged_eq_computeLayoutV06_bridge`, `evalLayoutOf_v08_eq_v06`)
+   across all 21 `RigidTy` constructors (primitives, pointers, fat pointers, arrays,
+   tuples, closures, and ADTs with `fieldLayouts`, unions, and multi-variant enums).
+4. **Part A polymorphic/trait `O(1)` certificates and specificity/default-method canaries.**
+   In A0, `lookupCallee_hit` left `resolveCalleeBodyAndArgs? tbl.toList` unreduced (so
+   `canary_multi_polyKey_agrees` fell back to raw-list `rfl`), `lookupCallee_trait_hit`
+   only handled monomorphic overrides (`c.typeParamCount = 0`), default trait method
+   inheritance (`winner.implPath = defPath`) had 0 lemmas or canaries,
+   `filterMostSpecificTraitImpls` was only tested on a 1-element list, and
+   `evalWithOpaqueCallees_eq_trusted` had 0 concrete callers because `canaryInit` used
+   `initMachineState` (`callees = []`). B1 proves `lookupCallee_hit_poly` (replacing
+   the raw-list `rfl` in `canary_multi_polyKey_agrees`), `lookupCallee_trait_hit_poly`,
+   and `lookupCallee_trait_default_hit`; adds
+   `canary_trait_specificity_and_default_inheritance` (competing blanket
+   `impl<T> Area for Wrapper<T>` vs. specialized `impl Area for Wrapper<u32>` plus
+   default trait method inheritance for `impl Area for Square`); and adds
+   `canary_evalWithOpaqueCallees_eq_trusted` and
+   `canary_trusted_stepMirFn_requires_linked_callees` over
+   `initMachineStateWithCallees`.
+5. **End-to-end demand-gated dynamic dispatch + dead-branch Schema-12 synergy.**
+   A0's `dynDispatchStep` evaluated `resolveDynTarget env site` eagerly before checking
+   whether the active state `s` actually demands `site.dynKey`, causing Schema 12 to
+   fail with `.unsupported` even when the `dyn` call sits on a pruned dead branch. B1
+   adds `demandsDynSite`, `dynDemandStep`, `evalDynWithOpaqueCallees`,
+   `dynDemandStep_preserved`, `canary_dyn_e2e_full_run_schema13` (full multi-step run
+   from `dynInit` to `.halted 31`), and `canary_dyn_deadBranch_schema12_succeeds`
+   (when `<dyn Area>::area()` is on a pruned dead branch `if false`, Schema 12 succeeds
+   and halts returning `7`).
+6. **Part C complete `DecidableEq` coverage (closing A0 Known Gap #3).**
+   B1 proves axiom-free Boolean-reflection `DecidableEq` (without `BEq`) for the
+   nested inductive `Value` (`valueStructEq`, `valueStructEq_iff`) and derives
+   `DecidableEq` (never `BEq`) for all remaining `Trusted.Rustc.V2026_06_01.{MirAst,MirSemantics}`
+   and prototype types (`CapturedMir`, `LocalSlot`, `StackFrame`, `TreeBorrowPerm`,
+   `BorrowEntry`, `SavedCallerFrame`, `FnPtrEntry`, `Memory`, `MachineState`,
+   `MirCallReq`, `Outcome`, `MirExecState`, `StepView`, `RunResult`), plus
+   `capturedMir_beq_iff_eq` and `machineState_beq_iff_eq`.
+7. **Part C scanner lexer/parser bugs in `scripts/bench_opaque_callee_and_query_proto.py`.**
+   Fixed three bugs in the lexer/parser:
+   - `tokenize_lean` failed on the escaped single-quote char literal `'\''` because
+     `text.find("'", i + 2)` matched the escaped `'` at `i + 2`, leaving the closing
+     `'` unconsumed to corrupt subsequent tokens.
+   - `skip_code_until_brace` inside `s!`/`m!`/`f!` string interpolations did not handle
+     char literals (`'{'`, `'}'`, `'\''`), raw strings (`r#"{"#`), guillemet
+     identifiers (`«{»`), or nested `s!"..."` interpolations, causing any brace inside
+     an interpolation hole to desynchronize brace depth and swallow the rest of the
+     file.
+   - `audit_redundant_beq_decidable_eq_text` had a comment `# skip class arguments in parentheses`
+     with no implementation, and did not unwrap parenthesized class/target names such
+     as `deriving (BEq), (DecidableEq)` or `deriving Foo (bar), BEq, DecidableEq`.
+   All three are fixed and pinned by new unit tests in
+   `scripts/test_bench_opaque_callee_and_query_proto.py`.
+
 ### Rounds A1–A4
 
 _(appended by later rounds)_
@@ -251,7 +383,8 @@ _(appended by later rounds)_
    (kernel-evaluated `stringEq` skips; or one `Nodup` witness per table plus
    membership certificates via `lookupRaw_ofList_of_mem_nodup`) beside `Mir/<Item>.lean`.
 2. **Stepping.** Rewrite callee resolution with `lookupCallee_hit_mono` /
-   `lookupCallee_hit` / `lookupCallee_trait_hit` instead of unfolding `findCallee?`;
+   `lookupCallee_hit_poly` / `lookupCallee_trait_hit` / `lookupCallee_trait_hit_poly` /
+   `lookupCallee_trait_default_hit` instead of unfolding `findCallee?`;
    use `stepTerminatorWith_litSwitch` (or an equivalent simp lemma stated directly on
    trusted `evalTerminator`, justified by `stepTerminatorWith_prune_exact`).
 3. **Frame lemma (condition).** Prove trusted `stepMirFn` preserves `memory.callees`
@@ -263,21 +396,26 @@ _(appended by later rounds)_
 5. **Query env (condition).** Wire `CompilerQueryEnv` to lean-miri Schema 12/13
    decoding; keep the CFI demand in the query key, gate V08 layouts and every
    Schema-13 field by schema, and treat `.unsupported` as fail-closed in the stepper.
-6. **Bridge commutation.** Upgrade the roundtrip lemmas + cross-dialect canary to a
-   general `computeLayout`-commutes-with-bridge theorem.
-7. **`BEq` cleanup.** Replace the audited `deriving …, BEq, DecidableEq …` clauses
-   (§7) with `DecidableEq` only, and add the scanner to CI.
+6. **Bridge commutation (completed in prototype in B1).** Universal cross-dialect
+   `computeLayout` commutation (`computeLayout_bridge_commutes`,
+   `computeLayoutV08Bridged_eq_computeLayoutV06_bridge`, `evalLayoutOf_v08_eq_v06`) is
+   now proven across all 21 `RigidTy` constructors; port into `Trusted` /
+   `Correspondence` alongside the query environment.
+7. **`BEq` cleanup (completed for `Trusted` + prototype in B1).** All 74 `Trusted`
+   AST/layout/machine types and 21 prototype types now have axiom-free `DecidableEq`
+   without `BEq`; replace the 10 audited `deriving …, BEq, DecidableEq …` clauses in
+   `theory/Correspondence/` (§7) with `DecidableEq` only, and add the scanner to CI.
 
-## 10. Receipts (A0, run fresh after the final edit)
+## 10. Receipts (A0 & B1, run fresh after the final edit)
 
 Receipt 1 (`export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"`) precedes every command.
 
 | # | command | exit | result |
 |---|---|---|---|
-| 2 | `anneal-lean-run --mode file --concurrency 1 -- lake env lean theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` | 0 | 0 error lines, 0 warning lines, 0 sorry lines, empty output (30 s) |
-| 3 | `python3 -B -m unittest -v scripts/test_bench_opaque_callee_and_query_proto.py` | 0 | Ran 36 tests in 63.788s: OK, 0 skips |
+| 2 | `anneal-lean-run --mode file --concurrency 1 -- lake env lean theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` | 0 | 0 error lines, 0 warning lines, 0 sorry lines, empty output |
+| 3 | `python3 -B -m unittest -v scripts/test_bench_opaque_callee_and_query_proto.py` | 0 | Ran 40 tests: OK, 0 failures, 0 skips |
 | 4 | `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` | 0 | 0 output lines (0 findings) |
-| 5 | `python3 -B scripts/bench_opaque_callee_and_query_proto.py --sizes 4,16,64,128 --json` | 0 | JSON with 4 sizes × 3 variants + certificates + repo audit (126 s) |
-| 6 | `git status --porcelain`; `git diff --name-status 86255c4698c28ce695b37e82f5a151896f7f736a..HEAD` | 0 | pre-commit: only the 4 deliverables untracked; post-`[adv A0]`-commit: empty status and exactly `A PROTOTYPE_REPORT.md`, `A scripts/bench_opaque_callee_and_query_proto.py`, `A scripts/test_bench_opaque_callee_and_query_proto.py`, `A theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` |
+| 5 | `python3 -B scripts/bench_opaque_callee_and_query_proto.py --sizes 4,16,64,128 --json` | 0 | JSON with 4 sizes × 3 variants + certificates + repo audit |
+| 6 | `git status --porcelain`; `git diff --name-status 86255c4698c28ce695b37e82f5a151896f7f736a..HEAD` | 0 | post-`[adv B1]`-commit: empty status and exactly `A PROTOTYPE_REPORT.md`, `A scripts/bench_opaque_callee_and_query_proto.py`, `A scripts/test_bench_opaque_callee_and_query_proto.py`, `A theory/Anneal/DemandCompilerQueryAndOpaqueCalleePrototype.lean` |
 
 `scripts/__pycache__` directories: 0.

@@ -130,6 +130,35 @@ class AuditScannerTest(unittest.TestCase):
         text = 'def s := s!"deriving {"BEq"}, DecidableEq {1 + 1}"\n'
         self.assertEqual(self.audit(text), [])
 
+    def test_interpolated_string_nested_braces_in_chars_raw_guillemets(self) -> None:
+        text = (
+            'def s1 := s!"prefix {\'{\'} {\'\\\'\'} {r#"{"#} {«{»} {s!"inner {\'}\'}"} deriving BEq, DecidableEq"\n'
+            'inductive RealAfterInterp where | a\n'
+            '  deriving BEq, DecidableEq\n'
+        )
+        f = self.audit(text)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["line"], 3)
+
+    def test_escaped_single_quote_char_literal(self) -> None:
+        text = "def q := '\\''\ninductive A where | a\n  deriving BEq, DecidableEq\n"
+        f = self.audit(text)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["line"], 3)
+
+    def test_parenthesized_deriving_classes_and_args(self) -> None:
+        text = (
+            "inductive A where | a\n"
+            "  deriving (BEq), (DecidableEq)\n"
+            "structure B where\n"
+            "  x : Nat\n"
+            "  deriving CustomHandler (opt1 opt2), BEq, DecidableEq\n"
+            "deriving instance (BEq), _root_.DecidableEq for (Foo), Bar\n"
+        )
+        f = self.audit(text)
+        self.assertEqual([x["line"] for x in f], [2, 5, 6])
+        self.assertEqual(f[2]["targets"], ["Foo", "Bar"])
+
     def test_guillemet_identifier(self) -> None:
         text = 'def «deriving BEq, DecidableEq» := 1\ndef «a -- b» := 2\ninductive A where | a\n  deriving DecidableEq\n'
         self.assertEqual(self.audit(text), [])
@@ -233,6 +262,31 @@ class RepoConsistencyTest(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertIn("repo_audit", payload)
         self.assertNotIn("benchmark", payload)
+
+    def test_b1_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "valueStructEq_iff",
+            "capturedMir_beq_iff_eq",
+            "machineState_beq_iff_eq",
+            "lookupCallee_hit_poly",
+            "lookupCallee_trait_hit_poly",
+            "lookupCallee_trait_default_hit",
+            "canary_trait_specificity_and_default_inheritance",
+            "canary_evalWithOpaqueCallees_eq_trusted",
+            "computeLayout_bridge_commutes",
+            "computeLayoutV08Bridged_eq_computeLayoutV06_bridge",
+            "evalLayoutOf_v08_eq_v06",
+            "fnAbiMismatch?_eq_none_iff",
+            "abiCore_ok_iff",
+            "syncStorageRegion_blocks_zero_size",
+            "envExtends_schema12_ignored_fields_canary",
+            "dynDemandStep_preserved",
+            "canary_dyn_e2e_full_run_schema13",
+            "canary_dyn_deadBranch_schema12_succeeds",
+        ):
+            self.assertIn(name, ident_toks, f"missing B1 theorem: {name}")
 
 
 class RealLeanBenchmarkTest(unittest.TestCase):

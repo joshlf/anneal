@@ -225,6 +225,110 @@ instance instDecidableEqRigidTyProto : DecidableEq RigidTy :=
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Ty
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.TraitRef
 deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.TraitImplEntry
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ConstScalar
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ConstValue
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ConstOperand
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.MirPhaseTag
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ContractRole
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.GenericParamDef
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Place
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Operand
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.BinOp
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.NullOp
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.BorrowKind
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.CastKind
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.AggregateKind
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Rvalue
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.RetagKind
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.StatementKind
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Statement
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.SwitchTargets
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.UnwindAction
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.Terminator
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.LocalDecl
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirAst.CapturedMir
+
+/-- Constructor tag of a `Value`. -/
+def valueTag : Value → Nat
+  | .unit => 0
+  | .scalar _ => 1
+  | .ptr .. => 2
+  | .aggregate .. => 3
+
+mutual
+/-- Structural Boolean equality on the nested inductive `Value`. -/
+def valueStructEq : Value → Value → Bool
+  | .unit, .unit => true
+  | .scalar a, .scalar b => decide (a = b)
+  | .ptr p₁ s₁, .ptr p₂ s₂ => decide (p₁ = p₂) && decide (s₁ = s₂)
+  | .aggregate v₁ fs₁, .aggregate v₂ fs₂ => decide (v₁ = v₂) && valueListStructEq fs₁ fs₂
+  | _, _ => false
+
+/-- Pointwise companion of `valueStructEq`. -/
+def valueListStructEq : List Value → List Value → Bool
+  | [], [] => true
+  | a :: as, b :: bs => valueStructEq a b && valueListStructEq as bs
+  | _, _ => false
+end
+
+theorem valueStructEq_of_tag_ne {a b : Value} (h : valueTag a ≠ valueTag b) :
+    valueStructEq a b = false := by
+  cases a <;> cases b <;> first | rfl | exact absurd rfl h
+
+mutual
+/-- `valueStructEq` decides `Value` equality. -/
+theorem valueStructEq_iff (a b : Value) : valueStructEq a b = true ↔ a = b :=
+  if hTag : valueTag a = valueTag b then
+    match a, b, hTag with
+    | .unit, .unit, _ => by simp [valueStructEq]
+    | .scalar x, .scalar y, _ => by simp [valueStructEq]
+    | .ptr p₁ s₁, .ptr p₂ s₂, _ => by simp [valueStructEq]
+    | .aggregate v₁ fs₁, .aggregate v₂ fs₂, _ => by
+      have ih := valueListStructEq_iff fs₁ fs₂
+      simp [valueStructEq, ih]
+  else by
+    rw [valueStructEq_of_tag_ne hTag]
+    exact ⟨(fun h => nomatch h), fun e => absurd (congrArg valueTag e) hTag⟩
+
+/-- Pointwise companion of `valueStructEq_iff`. -/
+theorem valueListStructEq_iff (as bs : List Value) :
+    valueListStructEq as bs = true ↔ as = bs :=
+  match as, bs with
+  | [], [] => by simp [valueListStructEq]
+  | [], _ :: _ => by simp [valueListStructEq]
+  | _ :: _, [] => by simp [valueListStructEq]
+  | a :: as, b :: bs => by
+    have ih₁ := valueStructEq_iff a b
+    have ih₂ := valueListStructEq_iff as bs
+    simp [valueListStructEq, ih₁, ih₂]
+end
+
+/-- Axiom-free manual `DecidableEq` for the nested inductive `Value`. -/
+instance instDecidableEqValueProto : DecidableEq Value :=
+  fun a b => decidable_of_iff _ (valueStructEq_iff a b)
+
+deriving instance DecidableEq for Trusted.Effect.Outcome
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.StackFrame
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.SavedCallerFrame
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.FnPtrEntry
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.Memory
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.MachineState
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.MirCallReq
+deriving instance DecidableEq for Trusted.Rustc.V2026_06_01.MirSemantics.MirExecState
+
+/-- `LawfulBEq CapturedMir` through `instBEqOfDecidableEq`. -/
+theorem capturedMir_beq_iff_eq {a b : CapturedMir} : (a == b) = true ↔ a = b := beq_iff_eq
+
+/-- `LawfulBEq MachineState` through `instBEqOfDecidableEq`. -/
+theorem machineState_beq_iff_eq {a b : MachineState} : (a == b) = true ↔ a = b := beq_iff_eq
 
 /-- `decide` evaluates `DecidableEq RigidTy` both on and off the constructor
 diagonal (including at top level). -/
@@ -619,6 +723,108 @@ theorem lookupCallee_trait_hit {tbl : OpaqueCalleeTable} {callerLayouts : Layout
   unfold lookupCallee
   simp only [hres, hmono]
   rfl
+
+/-- **`O(1)` certificate (polymorphic `TraitImplEntry` override hit)**: a generic
+trait `impl` override resolves to `c.instantiate (implArgs.zip argLayouts)`. -/
+theorem lookupCallee_trait_hit_poly {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra : List TraitImplEntry} {winner : TraitImplEntry} {implArgs : List RigidTy}
+    {c : CapturedMir} {argLayouts : List TypeLayout}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (hwin : filterMostSpecificTraitImpls (traitMatches tbl extra defPath (firstArg :: restArgs))
+      (traitMatches tbl extra defPath (firstArg :: restArgs)) = [(winner, some implArgs)])
+    (himpl : tbl.lookupRaw winner.implPath = some c)
+    (hoverride : winner.implPath ≠ defPath)
+    (hpoly : (c.typeParamCount == 0 && implArgs.isEmpty) = false)
+    (harity : implArgs.length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts implArgs = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate (implArgs.zip argLayouts)) :=
+  lookupCallee_hit (resolve_trait_override hfirst hwin himpl hoverride harity) hpoly harity hlay
+
+/-- Resolution certificate for explicit default trait method inheritance
+(`winner.implPath = defPath`, resolving the trait's default method body `c`
+with the full call-site `firstArg :: restArgs`). -/
+theorem resolve_trait_default {tbl : OpaqueCalleeTable} {defPath : DefPath}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {extra : List TraitImplEntry}
+    {winner : TraitImplEntry} {implArgs : List RigidTy} {c : CapturedMir}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (hwin : filterMostSpecificTraitImpls (traitMatches tbl extra defPath (firstArg :: restArgs))
+      (traitMatches tbl extra defPath (firstArg :: restArgs)) = [(winner, some implArgs)])
+    (hdefault : winner.implPath = defPath)
+    (hbody : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount) :
+    resolveCalleeBodyAndArgs? tbl.toList defPath (firstArg :: restArgs) extra =
+      some (c, firstArg :: restArgs) := by
+  rw [OpaqueCalleeTable.lookupRaw_eq, ← hdefault] at hbody
+  unfold traitMatches at hwin
+  have hdef : stringEq winner.implPath defPath = true :=
+    stringEq_eq_true_iff_proto.mpr hdefault
+  have hlen : ((firstArg :: restArgs).length == c.typeParamCount) = true := by
+    rw [harity]
+    exact decide_eq_true rfl
+  cases hm : collectMatchingTraitImpls tbl.toList (extra ++ flatMapTraitImpls tbl.toList)
+      defPath (firstArg :: restArgs) with
+  | nil => rw [hm] at hwin; simp [filterMostSpecificTraitImpls] at hwin
+  | cons m ms =>
+    rw [hm] at hwin
+    cases firstArg <;> first
+      | exact absurd rfl hfirst
+      | simp only [resolveCalleeBodyAndArgs?, hm, hwin, hbody, hdef, hlen, ite_true]
+
+/-- **`O(1)` certificate (default trait method inheritance hit)**: when the
+winning `TraitImplEntry` inherits the default trait method (`winner.implPath = defPath`),
+lookup instantiates the trait's default method body `c` with `firstArg :: restArgs`. -/
+theorem lookupCallee_trait_default_hit {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra : List TraitImplEntry} {winner : TraitImplEntry} {implArgs : List RigidTy}
+    {c : CapturedMir} {argLayouts : List TypeLayout}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (hwin : filterMostSpecificTraitImpls (traitMatches tbl extra defPath (firstArg :: restArgs))
+      (traitMatches tbl extra defPath (firstArg :: restArgs)) = [(winner, some implArgs)])
+    (hdefault : winner.implPath = defPath)
+    (hbody : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) :=
+  lookupCallee_hit (resolve_trait_default hfirst hwin hdefault hbody harity)
+    (by simp) harity hlay
+
+/-- Resolution certificate for a direct polymorphic function or fallback default
+trait method (`(traitMatches ...).isEmpty = true`, concrete `firstArg`). -/
+theorem resolve_free_poly_or_default {tbl : OpaqueCalleeTable} {defPath : DefPath}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {extra : List TraitImplEntry}
+    {c : CapturedMir}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (hnoTrait : (traitMatches tbl extra defPath (firstArg :: restArgs)).isEmpty = true)
+    (hraw : tbl.lookupRaw defPath = some c)
+    (hconcrete : allParamsInCallerLayouts 0 firstArg = true) :
+    resolveCalleeBodyAndArgs? tbl.toList defPath (firstArg :: restArgs) extra =
+      some (c, firstArg :: restArgs) := by
+  have hnil : traitMatches tbl extra defPath (firstArg :: restArgs) = [] :=
+    List.isEmpty_iff.mp hnoTrait
+  rw [OpaqueCalleeTable.lookupRaw_eq] at hraw
+  unfold traitMatches at hnil
+  cases firstArg <;> first
+    | exact absurd rfl hfirst
+    | simp only [resolveCalleeBodyAndArgs?, hnil, hraw, hconcrete, Bool.not_true, Bool.and_false]
+
+/-- **`O(1)` certificate (direct polymorphic / fallback default-method hit)**
+stated directly in terms of `tbl.lookupRaw` and `(traitMatches ...).isEmpty = true`. -/
+theorem lookupCallee_hit_poly {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra : List TraitImplEntry} {c : CapturedMir} {argLayouts : List TypeLayout}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (hnoTrait : (traitMatches tbl extra defPath (firstArg :: restArgs)).isEmpty = true)
+    (hraw : tbl.lookupRaw defPath = some c)
+    (hconcrete : allParamsInCallerLayouts 0 firstArg = true)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) :=
+  lookupCallee_hit (resolve_free_poly_or_default hfirst hnoTrait hraw hconcrete)
+    (by simp) harity hlay
 
 /-! ### Literal-discriminant branch pruning over the real trusted step -/
 
@@ -1043,6 +1249,7 @@ inductive StepView : Type where
   | fault (kind : FailureKind)
   /-- External / unlinked call awaiting the environment. -/
   | external (req : MirCallReq)
+  deriving DecidableEq
 
 /-- View a `MirStepNode` (`ITreeF MirEffect MirOutcome MirExecState`). -/
 def viewStepNode : MirStepNode → StepView
@@ -1058,6 +1265,7 @@ inductive RunResult : Type where
   | faulted (kind : FailureKind) (trace : List MirObs)
   | external (req : MirCallReq) (trace : List MirObs)
   | outOfFuel (state : MachineState) (trace : List MirObs)
+  deriving DecidableEq
 
 /-- Iterate a single-step function for at most `fuel` steps. -/
 def runSteps (step : MachineState → MirStepNode) : Nat → MachineState → List MirObs → RunResult
@@ -1482,6 +1690,31 @@ theorem canary_deadArm_halts :
       ⟨.halted, [.event 1], some 7, none⟩ := by
   decide +kernel
 
+/-- Initial state of `canaryRoot` with `canaryFullTbl.toList` linked in
+`memory.callees` (`initMachineStateWithCallees`). -/
+def canaryInitWithCallees : MachineState :=
+  initMachineStateWithCallees canaryRoot [] canaryFullTbl.toList
+
+/-- **Concrete instantiation of `evalWithOpaqueCallees_eq_trusted`**: when the
+initial state links `canaryFullTbl.toList` in `memory.callees`, every visited
+state along the run preserves `s'.memory.callees = canaryFullTbl.toList`, and
+`evalWithOpaqueCallees` is *identical* to the iterated trusted `stepMirFn`. -/
+theorem canary_evalWithOpaqueCallees_eq_trusted :
+    evalWithOpaqueCallees canaryFullTbl canaryRoot 8 canaryInitWithCallees =
+      runSteps (stepMirFn canaryRoot) 8 canaryInitWithCallees [] := by
+  apply evalWithOpaqueCallees_eq_trusted
+  decide +kernel
+
+/-- Contrast: on `canaryInit` (`initMachineState`, where `memory.callees = []`),
+the trusted `stepMirFn` halts at an external call to `proto::live_f`, whereas on
+`canaryInitWithCallees` it halts normally returning `7`. -/
+theorem canary_trusted_stepMirFn_requires_linked_callees :
+    (runSteps (stepMirFn canaryRoot) 8 canaryInit []).summary =
+      ⟨.external, [.event 1], none, some "proto::live_f"⟩ ∧
+    (runSteps (stepMirFn canaryRoot) 8 canaryInitWithCallees []).summary =
+      ⟨.halted, [.event 1], some 7, none⟩ := by
+  decide +kernel
+
 /-- Negative canary: dropping the *live* callee changes the outcome (the cone
 hypothesis is necessary). -/
 theorem canary_liveArm_required :
@@ -1585,11 +1818,21 @@ theorem canary_poly_resolve (tbl : List CapturedMir)
   exact lookupCallee_hit (by rw [OpaqueCalleeTable.toList_ofList]; exact h) rfl rfl
     canary_u32_instantiationLayouts
 
-/-- The polymorphic key agrees across the full and narrowed tables. -/
+/-- The polymorphic key agrees across the full and narrowed tables (`O(1)`
+`lookupCallee_hit_poly` certificates over `lookupRaw`, without unfolding
+`resolveCalleeBodyAndArgs?` over the raw list). -/
 theorem canary_multi_polyKey_agrees :
     multiNarrowTbl.lookupKey multiPolyKey = multiFullTbl.lookupKey multiPolyKey := by
-  unfold multiNarrowTbl multiFullTbl
-  rw [canary_poly_resolve _ (by rfl), canary_poly_resolve _ (by rfl)]
+  rw [OpaqueCalleeTable.lookupKey_eq, OpaqueCalleeTable.lookupKey_eq]
+  simp only [multiPolyKey]
+  rw [lookupCallee_hit_poly (c := protoPoly) (by decide) (by decide +kernel) ?_
+      (by decide) rfl canary_u32_instantiationLayouts,
+    lookupCallee_hit_poly (c := protoPoly) (by decide) (by decide +kernel) ?_
+      (by decide) rfl canary_u32_instantiationLayouts]
+  · unfold multiFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  · exact lookupRaw_ofList_cons_hit rfl
 
 /-- `impl Area for Circle` is the unique most-specific override in both tables. -/
 theorem canary_area_winner_narrow :
@@ -1645,6 +1888,77 @@ theorem canary_naiveNarrow_breaks_trait_dispatch :
     (evalWithOpaqueCallees multiNaiveTbl multiRoot 12 multiInit).summary =
       ⟨.external, [.event 0], none, some "proto::Area::area"⟩ := by
   decide +kernel
+
+/-- Generic `impl<T> Area for Wrapper<T>` entry (`traitRef.args = [Wrapper<T>]`). -/
+def protoWrapperGenericEntry : TraitImplEntry :=
+  ⟨⟨"proto::Area::area", [.adt "proto::Wrapper" [.param 0 "T"]]⟩,
+    "proto::<impl<T> Area for Wrapper<T>>::area"⟩
+
+/-- Specialized `impl Area for Wrapper<u32>` entry (`traitRef.args = [Wrapper<u32>]`). -/
+def protoWrapperU32Entry : TraitImplEntry :=
+  ⟨⟨"proto::Area::area", [.adt "proto::Wrapper" [.uint .u32]]⟩,
+    "proto::<impl Area for Wrapper<u32>>::area"⟩
+
+/-- Explicit default-method inheritance entry `impl Area for Square` (`implPath = defPath`). -/
+def protoSquareDefaultEntry : TraitImplEntry :=
+  ⟨⟨"proto::Area::area", [.adt "proto::Square" []]⟩, "proto::Area::area"⟩
+
+/-- Default trait method body `fn Area::area<Self>() -> u32 { 11 }` (`typeParamCount = 1`). -/
+def protoDefaultArea : CapturedMir := protoLeaf "proto::Area::area" 11 1 []
+
+/-- Generic override body `fn <impl<T> Area for Wrapper<T>>::area<T>() -> u32 { 22 }`. -/
+def protoWrapperGenericArea : CapturedMir :=
+  protoLeaf "proto::<impl<T> Area for Wrapper<T>>::area" 22 1 []
+
+/-- Specialized monomorphic override body `fn <impl Area for Wrapper<u32>>::area() -> u32 { 33 }`. -/
+def protoWrapperU32Area : CapturedMir :=
+  protoLeaf "proto::<impl Area for Wrapper<u32>>::area" 33 0 []
+
+/-- Opaque callee table with default trait method, generic override, and specialized override. -/
+def protoSpecTbl : OpaqueCalleeTable :=
+  .ofList [protoDefaultArea, protoWrapperGenericArea, protoWrapperU32Area]
+
+/-- Registered `TraitImplEntry` records exercising specificity and default inheritance. -/
+def protoSpecExtra : List TraitImplEntry :=
+  [protoWrapperGenericEntry, protoWrapperU32Entry, protoSquareDefaultEntry]
+
+/-- **Specificity, polymorphic override, and default-method inheritance canary**:
+1. On `Wrapper<u32>`, both `impl<T> Area for Wrapper<T>` and `impl Area for Wrapper<u32>`
+   match `traitMatches` (2 candidates), and `filterMostSpecificTraitImpls` selects the
+   strictly more specific `Wrapper<u32>` override (`lookupCallee_trait_hit`).
+2. On `Wrapper<bool>`, the generic `impl<T> Area for Wrapper<T>` wins and is instantiated
+   at `T = bool` (`lookupCallee_trait_hit_poly`).
+3. On `Square`, `protoSquareDefaultEntry` (`implPath = "proto::Area::area"`) inherits the
+   default trait method body `protoDefaultArea` and instantiates `Self = Square`
+   (`lookupCallee_trait_default_hit`). -/
+theorem canary_trait_specificity_and_default_inheritance :
+    (traitMatches protoSpecTbl protoSpecExtra "proto::Area::area"
+        [.adt "proto::Wrapper" [.uint .u32]]).length = 2 ∧
+    protoSpecTbl.lookup protoLayouts "proto::Area::area"
+        [.adt "proto::Wrapper" [.uint .u32]] protoSpecExtra =
+      some protoWrapperU32Area ∧
+    protoSpecTbl.lookup protoLayouts "proto::Area::area"
+        [.adt "proto::Wrapper" [.bool]] protoSpecExtra =
+      some (protoWrapperGenericArea.instantiate [(.bool, protoBoolLayout)]) ∧
+    protoSpecTbl.lookup protoLayouts "proto::Area::area"
+        [.adt "proto::Square" []] protoSpecExtra =
+      some (protoDefaultArea.instantiate [(.adt "proto::Square" [], protoUnitLayout)]) := by
+  refine ⟨by decide +kernel, ?_, ?_, ?_⟩
+  · apply lookupCallee_trait_hit (winner := protoWrapperU32Entry) (by decide) (by decide +kernel)
+      ?_ (by decide) rfl
+    unfold protoSpecTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  · apply lookupCallee_trait_hit_poly (winner := protoWrapperGenericEntry) (implArgs := [.bool])
+      (argLayouts := [protoBoolLayout]) (by decide) (by decide +kernel) ?_ (by decide) rfl rfl
+      (by decide)
+    unfold protoSpecTbl
+    rw [lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  · apply lookupCallee_trait_default_hit (winner := protoSquareDefaultEntry) (implArgs := [.adt "proto::Square" []])
+      (argLayouts := [protoUnitLayout]) (by decide) (by decide +kernel) rfl ?_ rfl (by decide)
+    unfold protoSpecTbl
+    exact lookupRaw_ofList_cons_hit rfl
 
 /-! ## Part B: multi-version demand-time `CompilerQueryEnv` -/
 
@@ -2040,6 +2354,591 @@ def bridgeRigidTyListV06ToV08 : List RigidTy → List Trusted.Rustc.V2026_08_01.
   | t :: ts => bridgeRigidTyV06ToV08 t :: bridgeRigidTyListV06ToV08 ts
 end
 
+/-- Reverse bridge of `CallConv` from V2026_08_01 to V2026_06_01. -/
+def bridgeCallConvV08ToV06 : Trusted.Rustc.V2026_08_01.Layout.CallConv → CallConv
+  | .rust => .rust
+  | .c => .c
+  | .rustIntrinsic => .rustIntrinsic
+  | .other name => .other name
+
+/-- Reverse bridge of `UintTy` from V2026_08_01 to V2026_06_01. -/
+def bridgeUintTyV08ToV06 : Trusted.Rustc.V2026_08_01.MirAst.UintTy → UintTy
+  | .u8 => .u8 | .u16 => .u16 | .u32 => .u32 | .u64 => .u64 | .u128 => .u128 | .usize => .usize
+
+/-- Reverse bridge of `IntTy` from V2026_08_01 to V2026_06_01. -/
+def bridgeIntTyV08ToV06 : Trusted.Rustc.V2026_08_01.MirAst.IntTy → IntTy
+  | .i8 => .i8 | .i16 => .i16 | .i32 => .i32 | .i64 => .i64 | .i128 => .i128 | .isize => .isize
+
+/-- Reverse bridge of `FloatTy` from V2026_08_01 to V2026_06_01. -/
+def bridgeFloatTyV08ToV06 : Trusted.Rustc.V2026_08_01.MirAst.FloatTy → FloatTy
+  | .f16 => .f16 | .f32 => .f32 | .f64 => .f64 | .f128 => .f128
+
+/-- Reverse bridge of `Mutability` from V2026_08_01 to V2026_06_01. -/
+def bridgeMutabilityV08ToV06 : Trusted.Rustc.V2026_08_01.MirAst.Mutability → Mutability
+  | .not => .not | .mut => .mut
+
+/-- Reverse bridge of `Safety` from V2026_08_01 to V2026_06_01. -/
+def bridgeSafetyV08ToV06 : Trusted.Rustc.V2026_08_01.MirAst.Safety → Safety
+  | .safe => .safe | .unsafe_ => .unsafe_
+
+mutual
+/-- Reverse bridge a V2026_08_01 `RigidTy` to V2026_06_01. -/
+def bridgeRigidTyV08ToV06 : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → RigidTy
+  | .param idx name => .param idx name
+  | .alias d args => .alias d (bridgeRigidTyListV08ToV06 args)
+  | .bool => .bool
+  | .char => .char
+  | .int w => .int (bridgeIntTyV08ToV06 w)
+  | .uint w => .uint (bridgeUintTyV08ToV06 w)
+  | .float w => .float (bridgeFloatTyV08ToV06 w)
+  | .never => .never
+  | .str => .str
+  | .tuple fields => .tuple (bridgeRigidTyListV08ToV06 fields)
+  | .array elem len => .array (bridgeRigidTyV08ToV06 elem) len
+  | .slice elem => .slice (bridgeRigidTyV08ToV06 elem)
+  | .ref m p => .ref (bridgeMutabilityV08ToV06 m) (bridgeRigidTyV08ToV06 p)
+  | .rawPtr m p => .rawPtr (bridgeMutabilityV08ToV06 m) (bridgeRigidTyV08ToV06 p)
+  | .adt d args => .adt d (bridgeRigidTyListV08ToV06 args)
+  | .fnDef d args => .fnDef d (bridgeRigidTyListV08ToV06 args)
+  | .fnPtr ins out sf abi =>
+    .fnPtr (bridgeRigidTyListV08ToV06 ins) (bridgeRigidTyV08ToV06 out) (bridgeSafetyV08ToV06 sf)
+      (bridgeCallConvV08ToV06 abi)
+  | .closure d upvars => .closure d (bridgeRigidTyListV08ToV06 upvars)
+  | .dynamic t => .dynamic t
+  | .foreign d => .foreign d
+  | .other r => .other r
+
+/-- Pointwise companion of `bridgeRigidTyV08ToV06`. -/
+def bridgeRigidTyListV08ToV06 : List Trusted.Rustc.V2026_08_01.MirAst.RigidTy → List RigidTy
+  | [] => []
+  | t :: ts => bridgeRigidTyV08ToV06 t :: bridgeRigidTyListV08ToV06 ts
+end
+
+theorem bridgeScalarLayout_roundtrip_v08
+    (x : Trusted.Rustc.V2026_08_01.Layout.ScalarLayout) :
+    bridgeScalarLayoutV06ToV08 (bridgeScalarLayoutV08ToV06 x) = x := by
+  cases x with
+  | initialized v r => cases v <;> rfl
+  | union v => cases v <;> rfl
+
+theorem bridgeFieldsShape_roundtrip_v08
+    (x : Trusted.Rustc.V2026_08_01.Layout.FieldsShape) :
+    bridgeFieldsShapeV06ToV08 (bridgeFieldsShapeV08ToV06 x) = x := by
+  cases x with
+  | arbitrary offsets memoryIndex =>
+    simp only [bridgeFieldsShapeV08ToV06, bridgeFieldsShapeV06ToV08, List.map_map]
+    congr
+    conv => rhs; rw [← List.map_id offsets]
+    rfl
+  | _ => rfl
+
+/-- **Lossless reverse bridge**: V2026_08_01 → V2026_06_01 → V2026_08_01 is the
+identity on `TypeLayout`. -/
+theorem bridgeTypeLayout_roundtrip_v08 (l : Trusted.Rustc.V2026_08_01.Layout.TypeLayout) :
+    bridgeTypeLayoutV06ToV08 (bridgeTypeLayoutV08ToV06 l) = l := by
+  obtain ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩ := l
+  simp only [bridgeTypeLayoutV08ToV06, bridgeTypeLayoutV06ToV08]
+  congr 1
+  · cases backendRepr <;> simp [bridgeBackendReprV08ToV06, bridgeBackendReprV06ToV08,
+      bridgeScalarLayout_roundtrip_v08]
+  · exact bridgeFieldsShape_roundtrip_v08 fields
+  · cases variants with
+    | multiple tag tagField vs =>
+      simp only [bridgeVariantsShapeV08ToV06, bridgeVariantsShapeV06ToV08, List.map_map,
+        bridgeScalarLayout_roundtrip_v08]
+      congr
+      conv => rhs; rw [← List.map_id vs]
+      apply List.map_congr_left
+      intro x _
+      exact bridgeFieldsShape_roundtrip_v08 x
+    | _ => rfl
+
+/-- **Lossless reverse table bridge** on V2026_08_01 `LayoutTable`. -/
+theorem bridgeLayout_roundtrip_v08 (t : Trusted.Rustc.V2026_08_01.Layout.LayoutTable) :
+    bridgeLayoutV06ToV08 (bridgeLayoutV08ToV06 t) = t := by
+  obtain ⟨pointerBits, isLittleEndian, entries⟩ := t
+  simp only [bridgeLayoutV08ToV06, bridgeLayoutV06ToV08, List.map_map]
+  congr
+  conv => rhs; rw [← List.map_id entries]
+  apply List.map_congr_left
+  intro x _
+  exact bridgeTypeLayout_roundtrip_v08 x
+
+mutual
+/-- **Lossless `RigidTy` bridge**: V2026_06_01 → V2026_08_01 → V2026_06_01. -/
+theorem bridgeRigidTy_roundtrip :
+    (k : RigidTy) → bridgeRigidTyV08ToV06 (bridgeRigidTyV06ToV08 k) = k
+  | .param _ _ => rfl
+  | .alias d args => congrArg (RigidTy.alias d) (bridgeRigidTyList_roundtrip args)
+  | .bool => rfl
+  | .char => rfl
+  | .int w => by cases w <;> rfl
+  | .uint w => by cases w <;> rfl
+  | .float w => by cases w <;> rfl
+  | .never => rfl
+  | .str => rfl
+  | .tuple fields => congrArg RigidTy.tuple (bridgeRigidTyList_roundtrip fields)
+  | .array elem len => congrArg (RigidTy.array · len) (bridgeRigidTy_roundtrip elem)
+  | .slice elem => congrArg RigidTy.slice (bridgeRigidTy_roundtrip elem)
+  | .ref m p => by cases m <;> exact congrArg (RigidTy.ref _) (bridgeRigidTy_roundtrip p)
+  | .rawPtr m p => by cases m <;> exact congrArg (RigidTy.rawPtr _) (bridgeRigidTy_roundtrip p)
+  | .adt d args => congrArg (RigidTy.adt d) (bridgeRigidTyList_roundtrip args)
+  | .fnDef d args => congrArg (RigidTy.fnDef d) (bridgeRigidTyList_roundtrip args)
+  | .fnPtr ins out sf abi => by
+    cases sf <;> cases abi <;>
+      exact congrArg2 (RigidTy.fnPtr · · _ _)
+        (bridgeRigidTyList_roundtrip ins) (bridgeRigidTy_roundtrip out)
+  | .closure d upvars => congrArg (RigidTy.closure d) (bridgeRigidTyList_roundtrip upvars)
+  | .dynamic _ => rfl
+  | .foreign _ => rfl
+  | .other _ => rfl
+
+theorem bridgeRigidTyList_roundtrip :
+    (ks : List RigidTy) → bridgeRigidTyListV08ToV06 (bridgeRigidTyListV06ToV08 ks) = ks
+  | [] => rfl
+  | k :: ks =>
+    congrArg2 List.cons (bridgeRigidTy_roundtrip k) (bridgeRigidTyList_roundtrip ks)
+end
+
+/-- Bridge a V2026_06_01 `TypeSubst` to V2026_08_01. -/
+def bridgeTypeSubstV06ToV08 (args : TypeSubst) : Trusted.Rustc.V2026_08_01.MirAst.TypeSubst :=
+  args.map fun (k, l) => (bridgeRigidTyV06ToV08 k, bridgeTypeLayoutV06ToV08 l)
+
+theorem typeSubstLookup_bridge :
+    ∀ (args : TypeSubst) (idx : Nat),
+      Trusted.Rustc.V2026_08_01.MirAst.TypeSubst.lookup (bridgeTypeSubstV06ToV08 args) idx =
+        (TypeSubst.lookup args idx).map fun (k, l) =>
+          (bridgeRigidTyV06ToV08 k, bridgeTypeLayoutV06ToV08 l)
+  | [], _ => rfl
+  | _ :: _, 0 => rfl
+  | _ :: rest, n + 1 => typeSubstLookup_bridge rest n
+
+mutual
+/-- `RigidTy.instantiate` commutes with the V2026_06_01 → V2026_08_01 bridge. -/
+theorem rigidTyInstantiate_bridge (args : TypeSubst) :
+    (k : RigidTy) →
+      Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate (bridgeTypeSubstV06ToV08 args)
+          (bridgeRigidTyV06ToV08 k) =
+        bridgeRigidTyV06ToV08 (RigidTy.instantiate args k)
+  | .param idx name => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      RigidTy.instantiate, typeSubstLookup_bridge]
+    cases TypeSubst.lookup args idx <;> rfl
+  | .alias d a => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiateList_bridge args a]
+  | .bool => rfl
+  | .char => rfl
+  | .int _ => rfl
+  | .uint _ => rfl
+  | .float _ => rfl
+  | .never => rfl
+  | .str => rfl
+  | .tuple fs => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiateList_bridge args fs]
+  | .array elem len => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiate_bridge args elem]
+  | .slice elem => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiate_bridge args elem]
+  | .ref m p => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiate_bridge args p]
+  | .rawPtr m p => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiate_bridge args p]
+  | .adt d a => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiateList_bridge args a]
+  | .fnDef d a => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiateList_bridge args a]
+  | .fnPtr ins out sf abi => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiateList_bridge args ins,
+      rigidTyInstantiate_bridge args out]
+  | .closure d upvars => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiate,
+      rigidTyInstantiateList_bridge args upvars]
+  | .dynamic _ => rfl
+  | .foreign _ => rfl
+  | .other _ => rfl
+
+theorem rigidTyInstantiateList_bridge (args : TypeSubst) :
+    (ks : List RigidTy) →
+      Trusted.Rustc.V2026_08_01.MirAst.RigidTy.instantiateList (bridgeTypeSubstV06ToV08 args)
+          (bridgeRigidTyListV06ToV08 ks) =
+        bridgeRigidTyListV06ToV08 (RigidTy.instantiateList args ks)
+  | [] => rfl
+  | k :: ks =>
+    congrArg2 List.cons (rigidTyInstantiate_bridge args k) (rigidTyInstantiateList_bridge args ks)
+end
+
+theorem get?_map_proto {α β : Type} (f : α → β) :
+    ∀ (xs : List α) (idx : Nat), get? (xs.map f) idx = (get? xs idx).map f
+  | [], _ => rfl
+  | _ :: _, 0 => rfl
+  | _ :: xs, n + 1 => get?_map_proto f xs n
+
+theorem lookupFieldLayouts_bridge (entries : List TypeLayout) :
+    ∀ (idxs : List Nat),
+      Trusted.Rustc.V2026_08_01.Layout.lookupFieldLayouts
+          (entries.map bridgeTypeLayoutV06ToV08) idxs =
+        (lookupFieldLayouts entries idxs).map (List.map bridgeTypeLayoutV06ToV08)
+  | [] => rfl
+  | idx :: rest => by
+    simp only [Trusted.Rustc.V2026_08_01.Layout.lookupFieldLayouts, lookupFieldLayouts,
+      get?_map_proto, lookupFieldLayouts_bridge entries rest]
+    cases get? entries idx <;> cases lookupFieldLayouts entries rest <;> rfl
+
+theorem computeArbitraryFieldsAux_bridge :
+    ∀ (curOff curAlign idx : Nat) (fls : List TypeLayout),
+      Trusted.Rustc.V2026_08_01.Layout.computeArbitraryFieldsAux curOff curAlign idx
+          (fls.map bridgeTypeLayoutV06ToV08) =
+        let (offs, memIdx, sz, al, uninh) := computeArbitraryFieldsAux curOff curAlign idx fls
+        (offs.map bridgeSizeV06ToV08, memIdx, sz, al, uninh)
+  | _, _, _, [] => rfl
+  | curOff, curAlign, idx, fl :: rest => by
+    simp only [List.map_cons, Trusted.Rustc.V2026_08_01.Layout.computeArbitraryFieldsAux,
+      bridgeTypeLayoutV06ToV08, bridgeSizeV06ToV08, bridgeAlignV06ToV08]
+    rw [computeArbitraryFieldsAux_bridge _ _ _ rest]
+    rcases computeArbitraryFieldsAux
+      (alignUp curOff (maxNat 1 fl.align.bytes) + fl.size.bytes)
+      (maxNat curAlign (maxNat 1 fl.align.bytes)) (idx + 1) rest with
+      ⟨offs, memIdx, sz, al, uninh⟩
+    rfl
+
+theorem computeUnionSizeAndAlign_bridge :
+    ∀ (maxSz maxAl : Nat) (fls : List TypeLayout),
+      Trusted.Rustc.V2026_08_01.Layout.computeUnionSizeAndAlign maxSz maxAl
+          (fls.map bridgeTypeLayoutV06ToV08) =
+        computeUnionSizeAndAlign maxSz maxAl fls
+  | _, _, [] => rfl
+  | _, _, _ :: rest => computeUnionSizeAndAlign_bridge _ _ rest
+
+theorem computeAggregateBackendRepr_bridge (totalSize : Nat) :
+    ∀ (fls : List TypeLayout),
+      Trusted.Rustc.V2026_08_01.Layout.computeAggregateBackendRepr totalSize
+          (fls.map bridgeTypeLayoutV06ToV08) =
+        bridgeBackendReprV06ToV08 (computeAggregateBackendRepr totalSize fls)
+  | [] => rfl
+  | [fl0] => by
+    simp only [List.map, Trusted.Rustc.V2026_08_01.Layout.computeAggregateBackendRepr,
+      computeAggregateBackendRepr, bridgeTypeLayoutV06ToV08]
+    cases Nat.beq totalSize 0 <;> rfl
+  | [fl0, fl1] => by
+    simp only [List.map, Trusted.Rustc.V2026_08_01.Layout.computeAggregateBackendRepr,
+      computeAggregateBackendRepr, bridgeTypeLayoutV06ToV08]
+    cases Nat.beq totalSize 0 <;> cases fl0.backendRepr <;> cases fl1.backendRepr <;> rfl
+  | _ :: _ :: _ :: _ => rfl
+
+theorem tagScalarByteWidth_bridge (tag : ScalarLayout) :
+    Trusted.Rustc.V2026_08_01.Layout.tagScalarByteWidth (bridgeScalarLayoutV06ToV08 tag) =
+      tagScalarByteWidth tag := by
+  cases tag with
+  | initialized v _ => cases v <;> rfl
+  | union v => cases v <;> rfl
+
+@[simp] theorem bridgeTypeLayoutV06ToV08_size_bytes (fl : TypeLayout) :
+    (bridgeTypeLayoutV06ToV08 fl).size.bytes = fl.size.bytes := rfl
+
+@[simp] theorem bridgeTypeLayoutV06ToV08_align_bytes (fl : TypeLayout) :
+    (bridgeTypeLayoutV06ToV08 fl).align.bytes = fl.align.bytes := rfl
+
+theorem recomputeVariantShapesAux_bridge (tagBytes : Nat) :
+    ∀ (vs : List FieldsShape) (fls : List TypeLayout),
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux tagBytes
+          (vs.map bridgeFieldsShapeV06ToV08) (fls.map bridgeTypeLayoutV06ToV08) =
+        let (shapes', maxSz, maxAl) := recomputeVariantShapesAux tagBytes vs fls
+        (shapes'.map bridgeFieldsShapeV06ToV08, maxSz, maxAl)
+  | [], _ => rfl
+  | .primitive :: vRest, fls => by
+    simp only [List.map_cons, bridgeFieldsShapeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [recomputeVariantShapesAux_bridge tagBytes vRest fls]
+  | .union c :: vRest, fls => by
+    simp only [List.map_cons, bridgeFieldsShapeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [recomputeVariantShapesAux_bridge tagBytes vRest fls]
+  | .array s c :: vRest, fls => by
+    simp only [List.map_cons, bridgeFieldsShapeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [recomputeVariantShapesAux_bridge tagBytes vRest fls]
+  | .arbitrary [] memIdx :: vRest, fls => by
+    simp only [List.map_cons, List.map_nil, bridgeFieldsShapeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [recomputeVariantShapesAux_bridge tagBytes vRest fls]
+  | .arbitrary (_ :: _) memIdx :: vRest, [] => by
+    have ih := recomputeVariantShapesAux_bridge tagBytes vRest []
+    simp only [List.map_nil] at ih
+    simp only [List.map_cons, List.map_nil, bridgeFieldsShapeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [ih]
+  | .arbitrary (_ :: _) memIdx :: vRest, [fl] => by
+    have ih := recomputeVariantShapesAux_bridge tagBytes vRest [fl]
+    simp only [List.map_cons, List.map_nil] at ih
+    simp only [List.map_cons, List.map_nil, bridgeFieldsShapeV06ToV08,
+      bridgeTypeLayoutV06ToV08_size_bytes, bridgeTypeLayoutV06ToV08_align_bytes,
+      bridgeSizeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [ih]
+    rfl
+  | .arbitrary (_ :: _) memIdx :: vRest, fl :: fl₂ :: pRest => by
+    have ih := recomputeVariantShapesAux_bridge tagBytes vRest (fl₂ :: pRest)
+    simp only [List.map_cons] at ih
+    simp only [List.map_cons, bridgeFieldsShapeV06ToV08,
+      bridgeTypeLayoutV06ToV08_size_bytes, bridgeTypeLayoutV06ToV08_align_bytes,
+      bridgeSizeV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.recomputeVariantShapesAux]
+    rw [ih]
+    rfl
+
+theorem recomputeFromFieldLayouts_bridge (extEntries : List TypeLayout) (l : TypeLayout) :
+    Trusted.Rustc.V2026_08_01.Layout.TypeLayout.recomputeFromFieldLayouts
+        (extEntries.map bridgeTypeLayoutV06ToV08) (bridgeTypeLayoutV06ToV08 l) =
+      bridgeTypeLayoutV06ToV08 (TypeLayout.recomputeFromFieldLayouts extEntries l) := by
+  obtain ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩ := l
+  cases fieldLayouts with
+  | nil => rfl
+  | cons fIdx fRest =>
+    dsimp only [bridgeTypeLayoutV06ToV08,
+      Trusted.Rustc.V2026_08_01.Layout.TypeLayout.recomputeFromFieldLayouts,
+      TypeLayout.recomputeFromFieldLayouts]
+    rw [lookupFieldLayouts_bridge]
+    cases lookupFieldLayouts extEntries (fIdx :: fRest) with
+    | none => rfl
+    | some fls =>
+      dsimp only [Option.map]
+      cases variants with
+      | empty => rfl
+      | single vIdx =>
+        dsimp only [bridgeVariantsShapeV06ToV08]
+        cases fields with
+        | primitive =>
+          cases fls with
+          | nil => rfl
+          | cons fl0 flRest => cases flRest <;> rfl
+        | union count =>
+          dsimp only [bridgeFieldsShapeV06ToV08]
+          rw [computeUnionSizeAndAlign_bridge]
+          rcases computeUnionSizeAndAlign 0 1 fls with ⟨totalSz, maxAl⟩
+          rfl
+        | array stride count =>
+          cases fls <;> rfl
+        | arbitrary offsets memIdx =>
+          dsimp only [bridgeFieldsShapeV06ToV08]
+          rw [computeArbitraryFieldsAux_bridge]
+          rcases computeArbitraryFieldsAux 0 1 0 fls with ⟨offsets', memIdx', totalSz, maxAl, uninh⟩
+          simp [bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+            computeAggregateBackendRepr_bridge]
+      | multiple tag tagField vs =>
+        dsimp only [bridgeVariantsShapeV06ToV08]
+        rw [tagScalarByteWidth_bridge, recomputeVariantShapesAux_bridge]
+        rcases recomputeVariantShapesAux (tagScalarByteWidth tag) vs fls with
+          ⟨shapes', maxSz, maxAl⟩
+        cases fields with
+        | arbitrary offsets memIdx =>
+          cases offsets <;> rfl
+        | primitive => rfl
+        | union _ => rfl
+        | array _ _ => rfl
+
+theorem bridgeUintTy_byteWidth (ptrBits : Nat) (w : UintTy) :
+    Trusted.Rustc.V2026_08_01.MirAst.UintTy.byteWidth ptrBits (bridgeUintTyV06ToV08 w) =
+      UintTy.byteWidth ptrBits w := by
+  cases w <;> rfl
+
+theorem bridgeIntTy_byteWidth (ptrBits : Nat) (w : IntTy) :
+    Trusted.Rustc.V2026_08_01.MirAst.IntTy.byteWidth ptrBits (bridgeIntTyV06ToV08 w) =
+      IntTy.byteWidth ptrBits w := by
+  cases w <;> rfl
+
+theorem bridgeFloatTy_byteWidth (w : FloatTy) :
+    Trusted.Rustc.V2026_08_01.MirAst.FloatTy.byteWidth (bridgeFloatTyV06ToV08 w) =
+      FloatTy.byteWidth w := by
+  cases w <;> rfl
+
+@[simp] theorem pow2Nat_bridge :
+    ∀ n : Nat, Trusted.Rustc.V2026_08_01.MirAst.pow2Nat n = pow2Nat n
+  | 0 => rfl
+  | k + 1 => by simp [Trusted.Rustc.V2026_08_01.MirAst.pow2Nat, pow2Nat, pow2Nat_bridge k]
+
+mutual
+/-- **Universal cross-dialect `computeLayout` commutation**: V2026_08_01
+`RigidTy.computeLayout` on bridged inputs equals bridging V2026_06_01
+`RigidTy.computeLayout` across all 21 `RigidTy` constructors (primitives,
+pointers, fat pointers, arrays, tuples, closures, and ADTs with `fieldLayouts`,
+unions, and multi-variant enums). -/
+theorem computeLayout_bridge_commutes (ptrBits : Nat) (extEntries : List TypeLayout)
+    (args : TypeSubst) :
+    ∀ (origLayout : Option TypeLayout) (k : RigidTy),
+      Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout ptrBits
+          (extEntries.map bridgeTypeLayoutV06ToV08) (bridgeTypeSubstV06ToV08 args)
+          (origLayout.map bridgeTypeLayoutV06ToV08) (bridgeRigidTyV06ToV08 k) =
+        (RigidTy.computeLayout ptrBits extEntries args origLayout k).map
+          bridgeTypeLayoutV06ToV08
+  | origLayout, .param idx name => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, typeSubstLookup_bridge]
+    cases TypeSubst.lookup args idx <;> rfl
+  | _, .bool => rfl
+  | _, .char => rfl
+  | _, .uint w => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, bridgeUintTy_byteWidth, pow2Nat_bridge]
+    rfl
+  | _, .int w => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, bridgeIntTy_byteWidth, pow2Nat_bridge]
+    rfl
+  | _, .float w => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, bridgeFloatTy_byteWidth, pow2Nat_bridge]
+    rfl
+  | _, .never => rfl
+  | _, .fnDef _ _ => rfl
+  | _, .fnPtr _ _ _ _ => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, pow2Nat_bridge]
+    rfl
+  | _, .ref m pointee => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, rigidTyInstantiate_bridge, pow2Nat_bridge]
+    cases RigidTy.instantiate args pointee <;> rfl
+  | _, .rawPtr m pointee => by
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, rigidTyInstantiate_bridge, pow2Nat_bridge]
+    cases RigidTy.instantiate args pointee <;> rfl
+  | origLayout, .array elem len => by
+    have ih := computeLayout_bridge_commutes ptrBits extEntries args none elem
+    simp only [Option.map_none] at ih
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, ih]
+    cases RigidTy.computeLayout ptrBits extEntries args none elem <;> rfl
+  | origLayout, .tuple fields => by
+    have ih := computeLayoutList_bridge_commutes ptrBits extEntries args fields
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, ih]
+    cases RigidTy.computeLayoutList ptrBits extEntries args fields with
+    | none => rfl
+    | some fls =>
+      dsimp only [Option.map]
+      rw [computeArbitraryFieldsAux_bridge]
+      rcases computeArbitraryFieldsAux 0 1 0 fls with ⟨offsets, memIdx, totalSz, maxAl, uninh⟩
+      simp [bridgeTypeLayoutV06ToV08, bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+        bridgeFieldsShapeV06ToV08, bridgeVariantsShapeV06ToV08,
+        computeAggregateBackendRepr_bridge]
+  | origLayout, .adt d adtArgs => by
+    have ih := computeLayoutList_bridge_commutes ptrBits extEntries args adtArgs
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, ih]
+    cases origLayout with
+    | none =>
+      cases RigidTy.computeLayoutList ptrBits extEntries args adtArgs with
+      | none => rfl
+      | some fls =>
+        dsimp only [Option.map]
+        rw [computeArbitraryFieldsAux_bridge]
+        rcases computeArbitraryFieldsAux 0 1 0 fls with ⟨offsets, memIdx, totalSz, maxAl, uninh⟩
+        simp [bridgeTypeLayoutV06ToV08, bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+          bridgeFieldsShapeV06ToV08, bridgeVariantsShapeV06ToV08,
+          computeAggregateBackendRepr_bridge]
+    | some origL =>
+      obtain ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩ := origL
+      cases fieldLayouts with
+      | cons fIdx fRest =>
+        dsimp only [Option.map]
+        exact congrArg Option.some (recomputeFromFieldLayouts_bridge extEntries _)
+      | nil =>
+        dsimp only [Option.map, bridgeTypeLayoutV06ToV08]
+        cases RigidTy.computeLayoutList ptrBits extEntries args adtArgs with
+        | none => rfl
+        | some fls =>
+          dsimp only []
+          cases variants with
+          | empty => rfl
+          | single vIdx =>
+            dsimp only [bridgeVariantsShapeV06ToV08]
+            cases fields with
+            | union count =>
+              dsimp only [bridgeFieldsShapeV06ToV08]
+              rw [computeUnionSizeAndAlign_bridge]
+              rcases computeUnionSizeAndAlign 0 1 fls with ⟨totalSz, maxAl⟩
+              rfl
+            | primitive =>
+              dsimp only [bridgeFieldsShapeV06ToV08]
+              rw [computeArbitraryFieldsAux_bridge]
+              rcases computeArbitraryFieldsAux 0 1 0 fls with
+                ⟨offsets, memIdx, totalSz, maxAl, uninh⟩
+              simp [bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+                computeAggregateBackendRepr_bridge]
+            | array s c =>
+              dsimp only [bridgeFieldsShapeV06ToV08]
+              rw [computeArbitraryFieldsAux_bridge]
+              rcases computeArbitraryFieldsAux 0 1 0 fls with
+                ⟨offsets, memIdx, totalSz, maxAl, uninh⟩
+              simp [bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+                computeAggregateBackendRepr_bridge]
+            | arbitrary offs mIdx =>
+              dsimp only [bridgeFieldsShapeV06ToV08]
+              rw [computeArbitraryFieldsAux_bridge]
+              rcases computeArbitraryFieldsAux 0 1 0 fls with
+                ⟨offsets, memIdx, totalSz, maxAl, uninh⟩
+              simp [bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+                computeAggregateBackendRepr_bridge]
+          | multiple tag tagField vs =>
+            dsimp only [bridgeVariantsShapeV06ToV08]
+            rw [tagScalarByteWidth_bridge, recomputeVariantShapesAux_bridge]
+            rcases recomputeVariantShapesAux (tagScalarByteWidth tag) vs fls with
+              ⟨shapes', maxSz, maxAl⟩
+            cases fields with
+            | arbitrary offs mIdx =>
+              cases offs <;> rfl
+            | primitive => rfl
+            | union _ => rfl
+            | array _ _ => rfl
+  | origLayout, .closure d upvars => by
+    have ih := computeLayoutList_bridge_commutes ptrBits extEntries args upvars
+    simp only [bridgeRigidTyV06ToV08, Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout,
+      RigidTy.computeLayout, ih]
+    cases RigidTy.computeLayoutList ptrBits extEntries args upvars with
+    | none => rfl
+    | some fls =>
+      dsimp only [Option.map]
+      rw [computeArbitraryFieldsAux_bridge]
+      rcases computeArbitraryFieldsAux 0 1 0 fls with ⟨offsets, memIdx, totalSz, maxAl, uninh⟩
+      simp [bridgeTypeLayoutV06ToV08, bridgeSizeV06ToV08, bridgeAlignV06ToV08,
+        bridgeFieldsShapeV06ToV08, bridgeVariantsShapeV06ToV08,
+        computeAggregateBackendRepr_bridge]
+  | _, .slice _ => rfl
+  | _, .str => rfl
+  | _, .dynamic _ => rfl
+  | _, .alias _ _ => rfl
+  | _, .foreign _ => rfl
+  | _, .other _ => rfl
+
+theorem computeLayoutList_bridge_commutes (ptrBits : Nat) (extEntries : List TypeLayout)
+    (args : TypeSubst) :
+    ∀ (ks : List RigidTy),
+      Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayoutList ptrBits
+          (extEntries.map bridgeTypeLayoutV06ToV08) (bridgeTypeSubstV06ToV08 args)
+          (bridgeRigidTyListV06ToV08 ks) =
+        (RigidTy.computeLayoutList ptrBits extEntries args ks).map
+          (List.map bridgeTypeLayoutV06ToV08)
+  | [] => rfl
+  | k :: ks => by
+    have ih₁ := computeLayout_bridge_commutes ptrBits extEntries args none k
+    have ih₂ := computeLayoutList_bridge_commutes ptrBits extEntries args ks
+    simp only [Option.map_none] at ih₁
+    simp only [bridgeRigidTyListV06ToV08,
+      Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayoutList,
+      RigidTy.computeLayoutList, ih₁, ih₂]
+    cases RigidTy.computeLayout ptrBits extEntries args none k <;>
+      cases RigidTy.computeLayoutList ptrBits extEntries args ks <;> rfl
+end
+
 /-! ### The finite-material environment and its evaluator -/
 
 /-- `o₂` extends `o₁`: present evidence is preserved, absent evidence may appear. -/
@@ -2107,6 +3006,35 @@ def computeLayoutV08Bridged (tbl : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
   (Trusted.Rustc.V2026_08_01.MirAst.RigidTy.computeLayout tbl.pointerBits tbl.entries []
       (tbl.lookup ty.layoutIdx) (bridgeRigidTyV06ToV08 ty.kind)).map bridgeTypeLayoutV08ToV06
 
+/-- **Universal cross-dialect layout agreement (`V06 → V08`)**: for every
+`tbl : LayoutTable` and every `ty : Ty`, `computeLayoutV08Bridged` on the bridged
+table equals `computeLayoutV06`. -/
+theorem computeLayoutV08Bridged_bridgeLayoutV06ToV08 (tbl : LayoutTable) (ty : Ty) :
+    computeLayoutV08Bridged (bridgeLayoutV06ToV08 tbl) ty = computeLayoutV06 tbl ty := by
+  unfold computeLayoutV08Bridged computeLayoutV06 bridgeLayoutV06ToV08
+  have hLook :
+      Trusted.Rustc.V2026_08_01.Layout.LayoutTable.lookup
+        { pointerBits := tbl.pointerBits, isLittleEndian := tbl.isLittleEndian,
+          entries := tbl.entries.map bridgeTypeLayoutV06ToV08 } ty.layoutIdx =
+        (tbl.lookup ty.layoutIdx).map bridgeTypeLayoutV06ToV08 :=
+    get?_map_proto bridgeTypeLayoutV06ToV08 tbl.entries ty.layoutIdx
+  have hComm := computeLayout_bridge_commutes tbl.pointerBits tbl.entries []
+    (tbl.lookup ty.layoutIdx) ty.kind
+  simp only [bridgeTypeSubstV06ToV08, List.map_nil] at hComm
+  rw [hLook, hComm, Option.map_map]
+  cases RigidTy.computeLayout tbl.pointerBits tbl.entries [] (tbl.lookup ty.layoutIdx) ty.kind with
+  | none => rfl
+  | some l => simp [Function.comp, bridgeTypeLayout_roundtrip]
+
+/-- **Universal cross-dialect layout agreement (`V08 → V06`)**: for every
+V2026_08_01 `tbl : LayoutTable` and every `ty : Ty`, `computeLayoutV08Bridged tbl ty`
+equals `computeLayoutV06 (bridgeLayoutV08ToV06 tbl) ty`. -/
+theorem computeLayoutV08Bridged_eq_computeLayoutV06_bridge
+    (tbl : Trusted.Rustc.V2026_08_01.Layout.LayoutTable) (ty : Ty) :
+    computeLayoutV08Bridged tbl ty = computeLayoutV06 (bridgeLayoutV08ToV06 tbl) ty := by
+  rw [← computeLayoutV08Bridged_bridgeLayoutV06ToV08 (bridgeLayoutV08ToV06 tbl) ty,
+    bridgeLayout_roundtrip_v08]
+
 /-- Demand-time `layoutOf`. -/
 def evalLayoutOf (env : CompilerQueryEnv) (dialect : LayoutDialect) (ty : Ty) :
     QueryResult QueryAnswer :=
@@ -2123,6 +3051,17 @@ def evalLayoutOf (env : CompilerQueryEnv) (dialect : LayoutDialect) (ty : Ty) :
       | some l => .ok (.layout l)
       | none => .err .layoutUncomputable
 
+/-- **Universal cross-dialect `evalLayoutOf` agreement**: whenever `env.v08Layouts?`
+holds a V2026_08_01 table whose bridge equals `env.layoutsV06`, `evalLayoutOf`
+in the `.v2026_08_01` dialect equals `evalLayoutOf` in the `.v2026_06_01` dialect
+for *every* `ty : Ty`. -/
+theorem evalLayoutOf_v08_eq_v06 (env : CompilerQueryEnv)
+    (tblV08 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (hv08 : env.v08Layouts? = some tblV08)
+    (hbridge : bridgeLayoutV08ToV06 tblV08 = env.layoutsV06) (ty : Ty) :
+    evalLayoutOf env .v2026_08_01 ty = evalLayoutOf env .v2026_06_01 ty := by
+  simp only [evalLayoutOf, hv08, computeLayoutV08Bridged_eq_computeLayoutV06_bridge, hbridge]
+
 /-- First per-argument ABI mismatch (pass mode, then layout). -/
 def argAbiMismatch? : Nat → List ArgAbi → List ArgAbi → Option QueryErr
   | _, [], [] => none
@@ -2131,6 +3070,23 @@ def argAbiMismatch? : Nat → List ArgAbi → List ArgAbi → Option QueryErr
       if a.layout = b.layout then argAbiMismatch? (i + 1) as bs else some (.argLayoutMismatch i)
     else some (.argModeMismatch i)
   | _, _, _ => some .argCountMismatch
+
+/-- Exact characterization of `argAbiMismatch? i as bs = none`. -/
+theorem argAbiMismatch?_eq_none_iff :
+    ∀ (i : Nat) (as bs : List ArgAbi), argAbiMismatch? i as bs = none ↔ as = bs
+  | _, [], [] => by simp [argAbiMismatch?]
+  | _, [], _ :: _ => by simp [argAbiMismatch?]
+  | _, _ :: _, [] => by simp [argAbiMismatch?]
+  | i, ⟨la, ma⟩ :: as, ⟨lb, mb⟩ :: bs => by
+    simp only [argAbiMismatch?, List.cons.injEq, ArgAbi.mk.injEq]
+    by_cases hm : ma = mb
+    · subst hm
+      simp only [ite_true]
+      by_cases hl : la = lb
+      · subst hl
+        simp [argAbiMismatch?_eq_none_iff (i + 1) as bs]
+      · simp [hl]
+    · simp [hm]
 
 /-- First `FnAbi` mismatch: calling convention, arguments, return, unwinding. -/
 def fnAbiMismatch? (caller callee : FnAbi) : Option QueryErr :=
@@ -2143,6 +3099,28 @@ def fnAbiMismatch? (caller callee : FnAbi) : Option QueryErr :=
       else some .retAbiMismatch
   else some .callConvMismatch
 
+/-- Exact characterization of `fnAbiMismatch? caller callee = none`. -/
+theorem fnAbiMismatch?_eq_none_iff (caller callee : FnAbi) :
+    fnAbiMismatch? caller callee = none ↔
+      caller.conv = callee.conv ∧ caller.args = callee.args ∧ caller.ret = callee.ret ∧
+        (callee.canUnwind = true → caller.canUnwind = true) := by
+  unfold fnAbiMismatch?
+  by_cases hc : caller.conv = callee.conv
+  · simp only [hc, ite_true, true_and]
+    cases ha : argAbiMismatch? 0 caller.args callee.args with
+    | some e =>
+      have hne : caller.args ≠ callee.args :=
+        fun h => by rw [(argAbiMismatch?_eq_none_iff 0 _ _).mpr h] at ha; nomatch ha
+      simp [hne]
+    | none =>
+      have heq : caller.args = callee.args := (argAbiMismatch?_eq_none_iff 0 _ _).mp ha
+      simp only [heq, true_and]
+      by_cases hr : caller.ret = callee.ret
+      · simp only [hr, ite_true, true_and]
+        cases callee.canUnwind <;> cases caller.canUnwind <;> simp
+      · simp [hr]
+  · simp [hc]
+
 /-- CFI-independent ABI check against the declared `FnAbi` table. -/
 def abiCore (env : CompilerQueryEnv) (callerAbi : FnAbi) (callee : DefPath) :
     QueryResult QueryAnswer :=
@@ -2152,6 +3130,24 @@ def abiCore (env : CompilerQueryEnv) (callerAbi : FnAbi) (callee : DefPath) :
     match fnAbiMismatch? callerAbi calleeAbi with
     | some e => .err e
     | none => .ok .abiOk
+
+/-- Exact characterization of `abiCore env callerAbi callee = .ok .abiOk`. -/
+theorem abiCore_ok_iff (env : CompilerQueryEnv) (callerAbi : FnAbi) (callee : DefPath) :
+    abiCore env callerAbi callee = .ok .abiOk ↔
+      ∃ calleeAbi, lookupDefPathAssoc env.fnAbis callee = some calleeAbi ∧
+        callerAbi.conv = calleeAbi.conv ∧ callerAbi.args = calleeAbi.args ∧
+        callerAbi.ret = calleeAbi.ret ∧
+        (calleeAbi.canUnwind = true → callerAbi.canUnwind = true) := by
+  unfold abiCore
+  cases h : lookupDefPathAssoc env.fnAbis callee with
+  | none => simp
+  | some calleeAbi =>
+    simp only [Option.some.injEq, exists_eq_left']
+    cases hm : fnAbiMismatch? callerAbi calleeAbi with
+    | some e =>
+      simp [← fnAbiMismatch?_eq_none_iff, hm]
+    | none =>
+      simp [← fnAbiMismatch?_eq_none_iff, hm]
 
 /-- Demand-time `abiCompatible`. A CFI-instrumented call (`cfiCallSite = some _`)
 first requires Schema-13 CFI evidence (failing closed with
@@ -2172,11 +3168,17 @@ def evalAbiCompatible (env : CompilerQueryEnv) (callerAbi : FnAbi) (callee : Def
         if calleeId = siteId then abiCore env callerAbi callee else .err .cfiTypeIdMismatch
 
 /-- A byte access `[offset, offset + len)` of `allocId` begins inside, or crosses
-into, sync region `r`. -/
+into, a non-empty sync region `r` (`0 < r.size`). Zero-byte regions (`r.size = 0`)
+denote empty intervals `[r.offset, r.offset)` and never block any access. -/
 def SyncStorageRegion.blocks (r : SyncStorageRegion) (allocId offset len : Nat) : Bool :=
-  decide (r.allocId = allocId) &&
+  decide (r.allocId = allocId) && decide (0 < r.size) &&
     ((decide (r.offset ≤ offset) && decide (offset < r.offset + r.size)) ||
       (decide (offset < r.offset) && decide (r.offset < offset + len)))
+
+/-- A zero-byte `SyncStorageRegion` (`r.size = 0`) never blocks any byte access. -/
+theorem syncStorageRegion_blocks_zero_size (r : SyncStorageRegion) (allocId offset len : Nat)
+    (hz : r.size = 0) : r.blocks allocId offset len = false := by
+  simp [SyncStorageRegion.blocks, hz]
 
 /-- Demand-time sync-object storage guard (`lean-miri#65`). -/
 def evalSyncStorageGuard (env : CompilerQueryEnv) (allocId offset len : Nat) :
@@ -2251,15 +3253,15 @@ theorem query_schema12_never_ok (env : CompilerQueryEnv) (q : CompilerQuery)
   exact fun h => nomatch h
 
 /-- Sound environment extension: finite material preserved, schema upgraded,
-optional evidence only populated. -/
+and effective schema-gated optional evidence monotonically populated. -/
 structure EnvExtends (env₁ env₂ : CompilerQueryEnv) : Prop where
   schema_le : SchemaLe env₁.schema env₂.schema
   layoutsV06_eq : env₂.layoutsV06 = env₁.layoutsV06
-  layoutsV08_ext : OptionExtends env₁.layoutsV08 env₂.layoutsV08
+  layoutsV08_ext : OptionExtends env₁.v08Layouts? env₂.v08Layouts?
   fnAbis_eq : env₂.fnAbis = env₁.fnAbis
-  cfi_ext : OptionExtends env₁.cfiTags env₂.cfiTags
-  sync_ext : OptionExtends env₁.syncRegions env₂.syncRegions
-  vtables_ext : OptionExtends env₁.vtables env₂.vtables
+  cfi_ext : OptionExtends env₁.cfiEvidence? env₂.cfiEvidence?
+  sync_ext : OptionExtends env₁.syncEvidence? env₂.syncEvidence?
+  vtables_ext : OptionExtends env₁.vtableEvidence? env₂.vtableEvidence?
 
 theorem EnvExtends.refl (env : CompilerQueryEnv) : EnvExtends env env :=
   ⟨SchemaLe.refl _, rfl, OptionExtends.refl _, rfl, OptionExtends.refl _,
@@ -2272,7 +3274,7 @@ theorem EnvExtends.trans {env₁ env₂ env₃ : CompilerQueryEnv} (h₁ : EnvEx
     h₁.cfi_ext.trans h₂.cfi_ext, h₁.sync_ext.trans h₂.sync_ext,
     h₁.vtables_ext.trans h₂.vtables_ext⟩
 
-/-- Schema-gated evidence is monotone under extension. -/
+/-- Schema-gated evidence is monotone under raw field extension. -/
 theorem gated_evidence_mono {α : Type} {f : CompilerSchemaVersion → Bool}
     (hf : ∀ a b, SchemaLe a b → f a = true → f b = true) {s₁ s₂ : CompilerSchemaVersion}
     {o₁ o₂ : Option α} (hs : SchemaLe s₁ s₂) (ho : OptionExtends o₁ o₂) {x : α}
@@ -2283,24 +3285,41 @@ theorem gated_evidence_mono {α : Type} {f : CompilerSchemaVersion → Bool}
     simp only [hf₁, ite_true] at h
     simp [hf _ _ hs hf₁, ho x h]
 
+/-- Raw-field extension implies `EnvExtends` on schema-gated evidence. -/
+theorem EnvExtends.of_raw {env₁ env₂ : CompilerQueryEnv}
+    (hs : SchemaLe env₁.schema env₂.schema)
+    (hl06 : env₂.layoutsV06 = env₁.layoutsV06)
+    (hl08 : OptionExtends env₁.layoutsV08 env₂.layoutsV08)
+    (hfn : env₂.fnAbis = env₁.fnAbis)
+    (hcfi : OptionExtends env₁.cfiTags env₂.cfiTags)
+    (hsync : OptionExtends env₁.syncRegions env₂.syncRegions)
+    (hvt : OptionExtends env₁.vtables env₂.vtables) :
+    EnvExtends env₁ env₂ :=
+  ⟨hs, hl06,
+    fun _ => gated_evidence_mono (fun _ _ => hasV08Layouts_mono) hs hl08,
+    hfn,
+    fun _ => gated_evidence_mono (fun _ _ => hasSchema13_mono) hs hcfi,
+    fun _ => gated_evidence_mono (fun _ _ => hasSchema13_mono) hs hsync,
+    fun _ => gated_evidence_mono (fun _ _ => hasSchema13_mono) hs hvt⟩
+
 theorem v08Layouts_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     {t : Trusted.Rustc.V2026_08_01.Layout.LayoutTable} (ht : env₁.v08Layouts? = some t) :
     env₂.v08Layouts? = some t :=
-  gated_evidence_mono (fun _ _ => hasV08Layouts_mono) h.schema_le h.layoutsV08_ext ht
+  h.layoutsV08_ext t ht
 
 theorem cfiEvidence_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     {x : CfiTagSpec} (hx : env₁.cfiEvidence? = some x) : env₂.cfiEvidence? = some x :=
-  gated_evidence_mono (fun _ _ => hasSchema13_mono) h.schema_le h.cfi_ext hx
+  h.cfi_ext x hx
 
 theorem syncEvidence_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     {x : List SyncStorageRegion} (hx : env₁.syncEvidence? = some x) :
     env₂.syncEvidence? = some x :=
-  gated_evidence_mono (fun _ _ => hasSchema13_mono) h.schema_le h.sync_ext hx
+  h.sync_ext x hx
 
 theorem vtableEvidence_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     {x : List VTableMethodEntry} (hx : env₁.vtableEvidence? = some x) :
     env₂.vtableEvidence? = some x :=
-  gated_evidence_mono (fun _ _ => hasSchema13_mono) h.schema_le h.vtables_ext hx
+  h.vtables_ext x hx
 
 theorem abiCore_extends {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     (callerAbi : FnAbi) (callee : DefPath) :
@@ -2343,19 +3362,20 @@ theorem query_mono_schema {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env
         (hsup .missingVTableEvidence)
     | some vts => simp only [evalCompilerQuery, evalVTableMethodLookup, hv, vtableEvidence_mono h hv]
 
-/-- **Sync guard specification**: for non-empty accesses and regions, the guard
-rejects exactly the accesses overlapping a region of the same allocation. -/
+/-- **Sync guard specification**: for any non-empty access (`0 < len`), the guard
+rejects `r` if and only if `r` is a non-empty region (`0 < r.size`) of the same
+allocation overlapping `[offset, offset + len)`. -/
 theorem syncStorageRegion_blocks_iff_overlap (r : SyncStorageRegion) (allocId offset len : Nat)
-    (hlen : 0 < len) (hsize : 0 < r.size) :
+    (hlen : 0 < len) :
     r.blocks allocId offset len = true ↔
-      r.allocId = allocId ∧ offset < r.offset + r.size ∧ r.offset < offset + len := by
+      r.allocId = allocId ∧ 0 < r.size ∧ offset < r.offset + r.size ∧ r.offset < offset + len := by
   simp only [SyncStorageRegion.blocks, Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq]
   constructor
-  · rintro ⟨ha, (⟨h₁, h₂⟩ | ⟨h₁, h₂⟩)⟩
-    · exact ⟨ha, h₂, by omega⟩
-    · exact ⟨ha, by omega, h₂⟩
-  · rintro ⟨ha, h₁, h₂⟩
-    refine ⟨ha, ?_⟩
+  · rintro ⟨⟨ha, hs⟩, (⟨h₁, h₂⟩ | ⟨h₁, h₂⟩)⟩
+    · exact ⟨ha, hs, h₂, by omega⟩
+    · exact ⟨ha, hs, by omega, h₂⟩
+  · rintro ⟨ha, hs, h₁, h₂⟩
+    refine ⟨⟨ha, hs⟩, ?_⟩
     by_cases hle : r.offset ≤ offset
     · exact Or.inl ⟨hle, h₁⟩
     · exact Or.inr ⟨by omega, h₂⟩
@@ -2826,7 +3846,8 @@ theorem query_mono_canary :
     evalCompilerQuery dynEnv13 (.vtableMethodLookup 8 dynTraitRef 0) = .err (.vtableNotFound 8) := by
   decide
 
-/-- Sync-storage guard canaries over region `[4, 12)` of allocation `3`. -/
+/-- Sync-storage guard canaries over region `[4, 12)` of allocation `3` (plus a
+zero-byte region `[6, 6)` at offset `6`, which never blocks a spanning access). -/
 theorem syncStorageGuard_canary :
     evalCompilerQuery dynEnv13Sync (.syncStorageGuard 3 6 1) =
       .err (.syncStorageOverlap ⟨3, 4, 8⟩) ∧
@@ -2835,8 +3856,26 @@ theorem syncStorageGuard_canary :
     evalCompilerQuery dynEnv13Sync (.syncStorageGuard 3 0 4) = .ok .syncPermit ∧
     evalCompilerQuery dynEnv13Sync (.syncStorageGuard 3 12 4) = .ok .syncPermit ∧
     evalCompilerQuery dynEnv13Sync (.syncStorageGuard 4 6 1) = .ok .syncPermit ∧
+    evalCompilerQuery { dynEnv13 with syncRegions := some [⟨3, 6, 0⟩] }
+        (.syncStorageGuard 3 0 12) = .ok .syncPermit ∧
     evalCompilerQuery dynEnv13 (.syncStorageGuard 3 6 1) = .unsupported .missingSyncStorage := by
   decide
+
+/-- Schema-gated `EnvExtends` canary: a Schema-12 environment whose raw `vtables`
+field holds ignored garbage still extends cleanly to `dynEnv13` (`EnvExtends`),
+and `query_mono_schema` preserves its supported answers. -/
+theorem envExtends_schema12_ignored_fields_canary :
+    let noisy12 : CompilerQueryEnv :=
+      { dynEnv12 with vtables := some [⟨999, ⟨"proto::Noise", []⟩, []⟩] }
+    EnvExtends noisy12 dynEnv13 ∧
+      evalCompilerQuery noisy12 (.vtableMethodLookup 7 dynTraitRef 0) =
+        .unsupported .missingVTableEvidence ∧
+      evalCompilerQuery dynEnv13
+          (.abiCompatible protoRetU32Abi "proto::<impl Area for Circle>::area" none) =
+        evalCompilerQuery noisy12
+          (.abiCompatible protoRetU32Abi "proto::<impl Area for Circle>::area" none) := by
+  refine ⟨⟨by decide, rfl, OptionExtends.refl _, rfl, OptionExtends.refl _, OptionExtends.refl _,
+    (fun _ h => nomatch h)⟩, by decide, by decide⟩
 
 /-- A CFI-instrumented `dyn` call whose call-site type id mismatches is the
 defined CFI trap (`abort`), not UB and not a call. -/
@@ -2846,6 +3885,105 @@ theorem dyn_cfi_trap :
       { dynSite with cfiCallSite := some (.fnPtr [] (.uint .u32) .safe .rust) } dynRoot dynAtCall =
       MirStepNode.retOutcome .abort := by
   rfl
+
+/-- Whether the next step at `s` demands the `dyn` call site `site.dynKey`. -/
+def demandsDynSite (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
+  match demandedKey? body s with
+  | some k => decide ((k.defPath, k.typeArgs) = site.dynKey)
+  | none => false
+
+/-- **Demand-gated dynamic-dispatch step**: `resolveDynTarget` (`vtableMethodLookup`
+followed by `abiCompatible`) is issued *only* when the active step at `s` actually
+demands `site.dynKey`; all other steps (including literal switches and calls on
+the other branch) step directly via `stepBranchPruned tbl.lookup`. -/
+def dynDemandStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
+    (body : CapturedMir) (s : MachineState) : MirStepNode :=
+  if demandsDynSite site body s then
+    dynDispatchStep env tbl site body s
+  else
+    stepBranchPruned tbl.lookup body s
+
+/-- At any state that demands `site.dynKey` (such as `dynAtCall`), `dynDemandStep`
+is definitionally `dynDispatchStep`. -/
+theorem dynDemandStep_eq_dynDispatchStep_of_demanded (env : CompilerQueryEnv)
+    (tbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir) (s : MachineState)
+    (h : demandsDynSite site body s = true) :
+    dynDemandStep env tbl site body s = dynDispatchStep env tbl site body s := by
+  simp [dynDemandStep, h]
+
+/-- Fuel-bounded multi-step evaluation with demand-gated dynamic dispatch. -/
+def evalDynWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (site : DynCallSite) (body : CapturedMir) (fuel : Nat) (s : MachineState) : RunResult :=
+  runSteps (dynDemandStep env tbl site body) fuel s []
+
+/-- Single-step preservation of `dynDemandStep` under `EnvExtends` (where the
+extension hypothesis `hsup` is only needed when `demandsDynSite site body s = true`)
+and call-cone narrowing. -/
+theorem dynDemandStep_preserved {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
+    {s : MachineState} (h : EnvExtends env₁ env₂)
+    (hsup : demandsDynSite site body s = true →
+      ∀ m, resolveDynTarget env₁ site ≠ .unsupported m)
+    (hcone :
+      (demandsDynSite site body s = true →
+        ∀ target, resolveDynTarget env₁ site = .ok target →
+          ∀ k, demandedKey? body s = some k →
+            k.apply (redirectResolver narrowTbl site.dynKey target) =
+              k.apply (redirectResolver fullTbl site.dynKey target)) ∧
+      (demandsDynSite site body s = false →
+        ∀ k, demandedKey? body s = some k →
+          narrowTbl.lookupKey k = fullTbl.lookupKey k)) :
+    dynDemandStep env₂ narrowTbl site body s = dynDemandStep env₁ fullTbl site body s := by
+  unfold dynDemandStep
+  cases hd : demandsDynSite site body s with
+  | true =>
+    simp only [ite_true]
+    exact dynDispatchStep_preserved h (hsup hd) (hcone.1 hd)
+  | false =>
+    simp only [Bool.false_eq_true, ite_false]
+    exact stepBranchPruned_congr body s (hcone.2 hd)
+
+/-- **Full multi-step end-to-end dynamic-dispatch canary (Schema 13)**: starting
+from `dynInit` (`bb0: if true { <dyn Area>::area() } else { g_dead() }`),
+`evalDynWithOpaqueCallees` prunes the dead branch `g_dead`, resolves
+`UnOp.vtableMethodLookup` + `abiCompatible` on demand at `bb1`, enters
+`<Circle as Area>::area` in the narrowed opaque table, and halts returning `31`. -/
+theorem canary_dyn_e2e_full_run_schema13 :
+    (evalDynWithOpaqueCallees dynEnv13 dynNarrowTbl dynSite dynRoot 12 dynInit).summary =
+      ⟨.halted, [.event 1], some 31, none⟩ ∧
+    evalDynWithOpaqueCallees dynEnv13Sync dynNarrowTbl dynSite dynRoot 12 dynInit =
+      evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInit := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-- `if false { <dyn Area>::area() } else { live_f() }`: the `dyn Area` call is on
+the dead literal-`false` branch, while the live branch calls `live_f`. -/
+def dynDeadBranchRoot : CapturedMir :=
+  { defPath := "proto::dyn_dead_root", phase := .runtimePostCleanup, role := .subject, argCount := 0,
+    localDecls := [⟨.mut, protoU32Ty, some "_0"⟩],
+    basicBlocks := [
+      ⟨[], ⟨.switchInt (protoBoolConst false) ⟨[(0, 2)], 1⟩, "root:if"⟩, false⟩,
+      protoCallBlock "proto::Area::area" [.dynamic "proto::Area"] 3,
+      protoCallBlock "proto::live_f" [] 3,
+      ⟨[], ⟨.return_, "root:ret"⟩, false⟩ ],
+    fnAbi := protoRetU32Abi, layouts := protoLayouts, allocations := [] }
+
+/-- Initial state of `dynDeadBranchRoot`. -/
+def dynDeadBranchInit : MachineState := initMachineState dynDeadBranchRoot []
+
+/-- **Synergy canary (Dead-Branch Pruning + Demand-Time Schema-12 Queries)**:
+when `<dyn Area>::area()` lies in the dead arm of `if false`, `evalDynWithOpaqueCallees`
+under Schema 12 (`dynEnv12`, which lacks Schema-13 vtable evidence!) never
+demands `vtableMethodLookup` and executes the live branch `live_f()` to `.halted 7`
+on the narrowed `[protoLiveF]` table. -/
+theorem canary_dyn_deadBranch_schema12_succeeds :
+    (evalDynWithOpaqueCallees dynEnv12 canaryNarrowTbl dynSite
+        dynDeadBranchRoot 12 dynDeadBranchInit).summary =
+      ⟨.halted, [.event 0], some 7, none⟩ ∧
+    evalDynWithOpaqueCallees dynEnv12 canaryNarrowTbl dynSite
+        dynDeadBranchRoot 12 dynDeadBranchInit =
+      evalDynWithOpaqueCallees dynEnv13 canaryFullTbl dynSite
+        dynDeadBranchRoot 12 dynDeadBranchInit := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -3022,6 +4160,74 @@ end ShadowingDemo
 #guard_msgs (whitespace := lax) in
 #print axioms stringEq_eq_true_iff_proto
 
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.valueStructEq_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms valueStructEq_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_hit_poly' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_hit_poly
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_trait_hit_poly' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_trait_hit_poly
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_trait_default_hit' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_trait_default_hit
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_trait_specificity_and_default_inheritance' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_trait_specificity_and_default_inheritance
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_evalWithOpaqueCallees_eq_trusted' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_evalWithOpaqueCallees_eq_trusted
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.computeLayout_bridge_commutes' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms computeLayout_bridge_commutes
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.computeLayoutV08Bridged_eq_computeLayoutV06_bridge' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms computeLayoutV08Bridged_eq_computeLayoutV06_bridge
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalLayoutOf_v08_eq_v06' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalLayoutOf_v08_eq_v06
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.fnAbiMismatch?_eq_none_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms fnAbiMismatch?_eq_none_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.abiCore_ok_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms abiCore_ok_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.syncStorageRegion_blocks_zero_size' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms syncStorageRegion_blocks_zero_size
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynDemandStep_preserved' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynDemandStep_preserved
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_e2e_full_run_schema13' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_e2e_full_run_schema13
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_deadBranch_schema12_succeeds' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_deadBranch_schema12_succeeds
+
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 
 /-! ## Bottom-of-file axiom audit
@@ -3059,5 +4265,5 @@ run_cmd do
     unless f.isEmpty do bad := bad.push (n, f)
   unless bad.isEmpty do
     throwError "axiom audit: forbidden axioms {bad}"
-  unless inNamespace ≥ 1000 && theorems ≥ 90 do
+  unless inNamespace ≥ 1200 && theorems ≥ 115 do
     throwError "axiom audit coverage too low: {constants} constants ({inNamespace} in namespace), {theorems} theorems"
