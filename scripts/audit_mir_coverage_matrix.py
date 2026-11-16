@@ -220,6 +220,31 @@ DEFAULT_UNSIZED_DST_BLOCKER = "unsized_dst_or_ptr_metadata"
 LIFTERS_LAYER = "anneal_proof_lifters"
 
 
+
+_VERIFIED_KINDS = (
+    "StatefulVerificationResult",
+    "ModularVerificationResult",
+    "UbExceptionVerificationResult",
+    "VerificationResult",
+)
+
+
+def _dogfood_crate_item(rel: str) -> tuple[str, str]:
+    """`(Crate, item)` of `examples/<crate>/anneal/proofs/Proof/<Crate>/<item>.lean`."""
+    parts = Path(rel).parts
+    return parts[-2], Path(parts[-1]).stem
+
+
+def _verified_signature_ok(header: str, crate: str, item: str) -> bool:
+    """Whether the whitespace-normalized `theorem verified : ...` header (up to `:=`) is exactly
+    `theorem verified : <Kind> Obligations.<crate>.<item>.<claim>`."""
+    m = re.fullmatch(
+        r"theorem verified : (" + "|".join(_VERIFIED_KINDS) + r") Obligations\."
+        + re.escape(crate) + r"\." + re.escape(item) + r"\.[A-Za-z_][A-Za-z0-9_]*",
+        header,
+    )
+    return m is not None
+
 @dataclass(frozen=True)
 class BlockerProbe:
     """A one-function Rust sample and whether it must block `anneal_proof_lifters`."""
@@ -1204,19 +1229,41 @@ class _Audit:
                         res.errors.append(f"{rel}:{_line_of(d_code, m.start())}: forbidden `{label}` in code")
                 d_lines = d_code.split("\n")
                 d_decls = scan_lean_declarations(d_code)
-                has_verified = any(d.kind == "theorem" and d.written_name == "verified" for d in d_decls)
-                if not has_verified:
+                crate, item = _dogfood_crate_item(rel)
+                verified_decls = [d for d in d_decls if d.kind == "theorem" and d.written_name == "verified"]
+                if not verified_decls:
                     res.errors.append(f"{rel}: missing `theorem verified`")
+                for d in verified_decls:
+                    # The `verified` statement must stay exactly the generated obligation claim type
+                    # (statement-origin isolation: no `Anneal.*` symbol may appear in it).
+                    header = " ".join("\n".join(d_lines[d.start_line : d.end_line]).split(":=", 1)[0].split())
+                    if not _verified_signature_ok(header, crate, item):
+                        res.errors.append(
+                            f"{rel}: `theorem verified` must state `<VerificationResult kind> "
+                            f"Obligations.{crate}.{item}.<claim>` with no other symbol (found `{header}`)"
+                        )
                 companions: list[str] = []
+                connected: list[str] = []
+                connect_re = re.compile(
+                    r"\bMir\." + re.escape(crate) + r"\." + re.escape(item) + r"\b|\bverified\b"
+                    r"|\bSpecs\." + re.escape(crate) + r"\." + re.escape(item) + r"\b"
+                )
                 for d in d_decls:
                     if d.kind != "theorem" or d.written_name == "verified":
                         continue
                     body = "\n".join(d_lines[d.start_line : d.end_line])
                     if lens_re.search(body) and wide_re.search(body):
                         companions.append(d.written_name)
+                        if connect_re.search(body):
+                            connected.append(d.written_name)
                 if not companions:
                     res.errors.append(
                         f"{rel}: no companion theorem referencing `WidePtrVal` and one of {list(REQUIRED_LENS_DEFINITIONS)}"
+                    )
+                elif not connected:
+                    res.errors.append(
+                        f"{rel}: no slice-lens companion theorem is connected to the verified function "
+                        f"(it must mention `Mir.{crate}.{item}`, `Specs.{crate}.{item}`, or `verified`)"
                     )
                 dogfood_report[rel] = companions
         res.details = {"definitions": found_defs, "lemmas": found_lemmas, "dogfood_companions": dogfood_report}

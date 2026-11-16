@@ -623,6 +623,46 @@ class LensAndBlockerTests(AuditFixtureTestCase):
         self.assert_only_failures(report, {"d_slice_lens_declarations"})
         self.assert_error(report, "d_slice_lens_declarations", f"{fidl_rel}: no companion theorem")
 
+    def _install_dogfood(self) -> None:
+        for rel in audit.REQUIRED_DOGFOOD_PROOFS:
+            target = self.root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / rel, target)
+
+    def test_dogfood_companion_must_be_connected_to_the_function(self) -> None:
+        self._install_dogfood()
+        rel = "examples/fxfs-storage-boundary/anneal/proofs/Proof/FxfsStorageBoundary/vmo_subslice_bounds_valid.lean"
+        # A generic lens fact that never mentions the item's MIR body, its spec, or `verified`.
+        (self.root / rel).write_text(
+            "theorem verified : StatefulVerificationResult "
+            "Obligations.FxfsStorageBoundary.vmo_subslice_bounds_valid.statefulClaim := by\n  exact x\n\n"
+            "theorem lens_only {w : WidePtrVal} : SliceTypedAt c w [] b := by\n  exact h\n",
+            encoding="utf-8",
+        )
+        report = self.run_checks()
+        self.assert_only_failures(report, {"d_slice_lens_declarations"})
+        self.assert_error(report, "d_slice_lens_declarations", f"{rel}: no slice-lens companion theorem is connected")
+
+    def test_dogfood_verified_signature_is_pinned(self) -> None:
+        self._install_dogfood()
+        rel = "examples/fuchsia-usercopy/anneal/proofs/Proof/FuchsiaUsercopy/assume_initialized_until_split_len.lean"
+        self.edit(
+            rel,
+            "theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.assume_initialized_until_split_len.statefulClaim",
+            "theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.assume_initialized_until_split_len.statefulClaim ∧ Anneal.SepLogicLenses.WidePtrVal = WidePtrVal",
+        )
+        report = self.run_checks()
+        self.assert_only_failures(report, {"d_slice_lens_declarations"})
+        self.assert_error(report, "d_slice_lens_declarations", f"{rel}: `theorem verified` must state")
+        # A different obligation's claim is rejected too.
+        self.assertFalse(
+            audit._verified_signature_ok(
+                "theorem verified : VerificationResult Obligations.FuchsiaUsercopy.other_item.claim",
+                "FuchsiaUsercopy",
+                "assume_initialized_until_split_len",
+            )
+        )
+
     def _assert_blocker_mutant_rejected(self, old: str, new: str, fragment: str) -> None:
         self.edit(SUITE, old, new)
         report = self.run_checks()

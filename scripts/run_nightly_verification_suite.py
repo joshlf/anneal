@@ -689,7 +689,10 @@ def _strip_rust_comments_and_strings(rs_text: str) -> str:
             out.append(re.sub(r"[^\n]", " ", rs_text[i:k]))
             i = k
         elif rs_text[i] == "'":
-            cm = char_re.match(rs_text, i) if i == 0 or not (rs_text[i - 1].isalnum() or rs_text[i - 1] == "_") else None
+            prev = rs_text[i - 1] if i > 0 else ""
+            # A byte char literal `b'"'` is preceded by `b` (itself not part of an identifier).
+            byte_prefix = prev == "b" and (i < 2 or not (rs_text[i - 2].isalnum() or rs_text[i - 2] == "_"))
+            cm = char_re.match(rs_text, i) if (not (prev.isalnum() or prev == "_") or byte_prefix) else None
             if cm:
                 out.append("'" + " " * (cm.end() - i - 2) + "'")
                 i = cm.end()

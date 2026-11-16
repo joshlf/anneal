@@ -316,6 +316,23 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertEqual([u[0] for u in c_units], ["real_fn"])
         self.assertNotIn("?Sized", c_units[0][2])
         self.assertFalse(any("size_of_val" in stmt for stmt in c_units[0][1]))
+        # A byte char literal `b'"'` (and `b'{'`) must not open a string literal or a block,
+        # while lifetimes (`'a`) and identifiers ending in `b` stay untouched.
+        byte_chars = """
+        pub fn scan<'a>(s: &'a [u8], ab: u8) -> usize {
+            let q = s.iter().filter(|&&c| c == b'"' || c == b'{' || c == ab).count();
+            let n = unsafe { core::slice::from_raw_parts(s.as_ptr(), q) };
+            n.len()
+        }
+        pub fn after<T: ?Sized>(t: &T) -> usize { core::mem::size_of_val(t) }
+        """
+        stripped = suite._strip_rust_comments_and_strings(byte_chars)
+        self.assertIn("size_of_val", stripped)
+        self.assertIn("&'a [u8]", stripped)
+        b_units = suite._extract_rust_fn_units(byte_chars)
+        self.assertEqual([u[0] for u in b_units], ["scan", "after"])
+        self.assertTrue(any("size_of_val" in stmt for stmt in b_units[1][1]))
+        self.assertIn("?Sized", b_units[1][2])
 
     def test_correspondence_divergence_switch_to_pass_detection(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)
