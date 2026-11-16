@@ -385,6 +385,75 @@ def validateBackTarget {Val : Type} (alg : ValAlgebra Val)
     | [fRoot] => fRoot vNew
     | _ => false
 
+/-- Rebuild `v1` with each field present in both `v1` and `v2` replaced by
+`ih f1 f2`, visiting every index below `maxFields` (gaps included). Fails if
+some index is a field of only one of the two values. Callers pass a bound
+above every field index of both values (`getField_lt_sizeBound`), so no field
+is skipped. -/
+def zipAggregateFields {Val : Type} (alg : ValAlgebra Val)
+    (ih : Val → Val → Val) (maxFields : Nat) (v1 v2 : Val) : Option Val :=
+  @Nat.recCompiled (fun _ => Nat → Val → Option Val)
+    (fun _ acc => some acc)
+    (fun _ ihField idx acc =>
+      match alg.getField idx v1, alg.getField idx v2 with
+      | none, none => ihField (idx + 1) acc
+      | some f1, some f2 =>
+        match alg.setField idx acc (ih f1 f2) with
+        | some acc' => ihField (idx + 1) acc'
+        | none => none
+      | _, _ => none)
+    maxFields 0 v1
+
+/-- True iff `v` has a field at some index (below `alg.sizeBound v`, which
+bounds every field index). -/
+def hasAnyField {Val : Type} (alg : ValAlgebra Val) (v : Val) : Bool :=
+  natFold false
+    (fun idx acc =>
+      acc ||
+        match alg.getField idx v with
+        | some _ => true
+        | none => false)
+    (alg.sizeBound v)
+
+/-- Merge two values under symbolic branch condition `cond`, preserving an
+encoded reference handle unchanged when both branches hold a reference to the
+exact same `(lid, path)` that `alg.sameRefVal` vouches are equal as full `Val`
+values (`sameRefVal_eq`), and recursively merging aggregate fields when both
+branches hold aggregates that `sameAggregateShape` relates and whose fields
+occupy the same indices, so field projections (`alg.getField`) remain
+available after a symbolic branch join. Because `getField_lt_sizeBound`
+guarantees `sizeBound c < sizeBound v` for every child field `c`, the outer
+budget `max (alg.sizeBound v1) (alg.sizeBound v2) + 1` strictly bounds every
+nested aggregate field chain. -/
+def zipOrKeepSameRef {Val : Type} (alg : ValAlgebra Val)
+    (cond v1 v2 : Val) : Val :=
+  @Nat.recCompiled (fun _ => Val → Val → Val)
+    (fun a b =>
+      match alg.decodeRef a, alg.decodeRef b with
+      | some (l1, p1), some (l2, p2) =>
+        if l1 == l2 && subPathEq p1 p2 && alg.sameRefVal a b then a
+        else alg.zipVal cond a b
+      | _, _ => alg.zipVal cond a b)
+    (fun _ ih a b =>
+      match alg.decodeRef a, alg.decodeRef b with
+      | some (l1, p1), some (l2, p2) =>
+        if l1 == l2 && subPathEq p1 p2 && alg.sameRefVal a b then a
+        else alg.zipVal cond a b
+      | _, _ =>
+        -- Rebuilding from `a` is exact only when `a` and `b` differ at most
+        -- in their fields (`sameAggregateShape_ext`).
+        let fieldBound :=
+          if decide (alg.sizeBound a ≤ alg.sizeBound b) then alg.sizeBound b
+          else alg.sizeBound a
+        if hasAnyField alg a && hasAnyField alg b &&
+           alg.sameAggregateShape a b then
+          match zipAggregateFields alg ih fieldBound a b with
+          | some agg => agg
+          | none => alg.zipVal cond a b
+        else alg.zipVal cond a b)
+    ((if decide (alg.sizeBound v1 ≤ alg.sizeBound v2) then alg.sizeBound v2
+      else alg.sizeBound v1) + 1) v1 v2
+
 /-- Evaluate the updated sub-value for `(owner, path)` when ending a loan with
 `target`, new loan value `vNew`, and prior owner sub-value `vOld`. Supports
 `.direct`, `.lensCall`, and arbitrarily nested `.choice` trees with
@@ -416,20 +485,14 @@ def evalBackVal {Val : Type} (alg : ValAlgebra Val)
                 | some false => fFalse vCur vOldCur
                 | none =>
                   -- Both values are projected onto each branch before the
-                  -- branch results are recombined with `zipVal`. `ValAlgebra`
-                  -- pins `projectBranchVal` down only on concrete conditions
-                  -- and on `zipVal` results, so for other values this is a
-                  -- precision choice rather than a trusted step. It decides
-                  -- only which value the symbolic state records for each
-                  -- branch; nothing here treats that record as a fact about a
-                  -- machine. Relating the symbolic state to a machine needs a
-                  -- separate proof, which a projection that disagrees with
-                  -- the machine makes impossible rather than unsound.
+                  -- branch results are recombined with `zipOrKeepSameRef`
+                  -- (preserving aggregate field structure and identical
+                  -- reference handles across choice writeback joins).
                   match fTrue (alg.projectBranchVal cond true vCur)
                               (alg.projectBranchVal cond true vOldCur),
                         fFalse (alg.projectBranchVal cond false vCur)
                                (alg.projectBranchVal cond false vOldCur) with
-                  | some v1, some v2 => some (alg.zipVal cond v1 v2)
+                  | some v1, some v2 => some (zipOrKeepSameRef alg cond v1 v2)
                   | _, _ => none
             fBranch :: rest
           | _ => [fun _ _ => none]
@@ -1411,74 +1474,6 @@ def ownerHasBorrowLock {Val : Type} (alg : ValAlgebra Val) (lid : LoanId)
               !hasMutLoanAtPath lid path perm
         okPhase && okPerm
       | none => false
-
-/-- Rebuild `v1` with each field present in both `v1` and `v2` replaced by
-`ih f1 f2`, visiting every index below `maxFields` (gaps included). Fails if
-some index is a field of only one of the two values. Callers pass a bound
-above every field index of both values (`getField_lt_sizeBound`), so no field
-is skipped. -/
-def zipAggregateFields {Val : Type} (alg : ValAlgebra Val)
-    (ih : Val → Val → Val) (maxFields : Nat) (v1 v2 : Val) : Option Val :=
-  @Nat.recCompiled (fun _ => Nat → Val → Option Val)
-    (fun _ acc => some acc)
-    (fun _ ihField idx acc =>
-      match alg.getField idx v1, alg.getField idx v2 with
-      | none, none => ihField (idx + 1) acc
-      | some f1, some f2 =>
-        match alg.setField idx acc (ih f1 f2) with
-        | some acc' => ihField (idx + 1) acc'
-        | none => none
-      | _, _ => none)
-    maxFields 0 v1
-
-/-- True iff `v` has a field at some index (below `alg.sizeBound v`, which
-bounds every field index). -/
-def hasAnyField {Val : Type} (alg : ValAlgebra Val) (v : Val) : Bool :=
-  natFold false
-    (fun idx acc =>
-      acc ||
-        match alg.getField idx v with
-        | some _ => true
-        | none => false)
-    (alg.sizeBound v)
-
-/-- Merge two values under symbolic branch condition `cond`, preserving an
-encoded reference handle unchanged when both branches hold a reference to the
-exact same `(lid, path)` and recursively merging aggregate fields when both
-branches hold aggregates that `sameAggregateShape` relates and whose fields
-occupy the same indices, so field projections (`alg.getField`) remain
-available after a symbolic branch join. Because `getField_lt_sizeBound`
-guarantees `sizeBound c < sizeBound v` for every child field `c`, the outer
-budget `max (alg.sizeBound v1) (alg.sizeBound v2) + 1` strictly bounds every
-nested aggregate field chain. -/
-def zipOrKeepSameRef {Val : Type} (alg : ValAlgebra Val)
-    (cond v1 v2 : Val) : Val :=
-  @Nat.recCompiled (fun _ => Val → Val → Val)
-    (fun a b =>
-      match alg.decodeRef a, alg.decodeRef b with
-      | some (l1, p1), some (l2, p2) =>
-        if l1 == l2 && subPathEq p1 p2 then a
-        else alg.zipVal cond a b
-      | _, _ => alg.zipVal cond a b)
-    (fun _ ih a b =>
-      match alg.decodeRef a, alg.decodeRef b with
-      | some (l1, p1), some (l2, p2) =>
-        if l1 == l2 && subPathEq p1 p2 then a
-        else alg.zipVal cond a b
-      | _, _ =>
-        -- Rebuilding from `a` is exact only when `a` and `b` differ at most
-        -- in their fields (`sameAggregateShape_ext`).
-        let fieldBound :=
-          if decide (alg.sizeBound a ≤ alg.sizeBound b) then alg.sizeBound b
-          else alg.sizeBound a
-        if hasAnyField alg a && hasAnyField alg b &&
-           alg.sameAggregateShape a b then
-          match zipAggregateFields alg ih fieldBound a b with
-          | some agg => agg
-          | none => alg.zipVal cond a b
-        else alg.zipVal cond a b)
-    ((if decide (alg.sizeBound v1 ≤ alg.sizeBound v2) then alg.sizeBound v2
-      else alg.sizeBound v1) + 1) v1 v2
 
 /-- If `owner` exists in `st`, holds a borrow lock for `lid` at `path` of the
 flavor required by `reqMut` (`ownerHasBorrowLock`), and resolves at `path`,
@@ -3667,10 +3662,9 @@ theorem handle_accounting_tests :
 3. `liveLoanTargetsOverlap` reports a live loan that overlaps in the writer's
    branch, but not one that overlaps only in the other branch or that is
    exempt, and
-4. two loans whose targets a branch join swapped can each end while the other
-   is live, but nested targets must end innermost first (loan `2`, inside
-   loan `1`'s target in the other branch): after loan `1` ends, `x0[0]` holds
-   a choice value that `getPath` cannot see through. -/
+4. two loans whose targets a branch join swapped can end in either order
+   because `evalBackVal` preserves `x0[0]`'s aggregate fields via
+   `zipOrKeepSameRef` and `projectBranchOrFields`. -/
 theorem correlated_overlap_tests :
     let c : LensTestVal := .node (.atom 0) (.atom 0)
     let d : LensTestVal := .node (.atom 0) (.atom 1)
@@ -3725,7 +3719,7 @@ theorem correlated_overlap_tests :
       (live (.choice c (x0 [0, 1]) x2)) [] = false ∧
     -- 4. Swapped diamond loans:
     endBoth 2 1 = true ∧
-    endBoth 1 2 = false :=
+    endBoth 1 2 = true :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Region deposits and shared children:
