@@ -555,6 +555,12 @@ def lookup (tbl : OpaqueCalleeTable) : CalleeResolver :=
 def lookupKey (tbl : OpaqueCalleeTable) (k : CalleeKey) : Option CapturedMir :=
   k.apply tbl.lookup
 
+/-- Captured `TraitImplEntry` records across the table (`flatMapTraitImpls tbl.toList`),
+sealed `@[irreducible]` below so free-generic and trait-method certificates rewrite
+`tbl.traitImpls` once per table instead of unfolding `tbl.toList` at every call site. -/
+def traitImpls (tbl : OpaqueCalleeTable) : List TraitImplEntry :=
+  flatMapTraitImpls tbl.toList
+
 theorem toList_ofList (callees : List CapturedMir) : (ofList callees).toList = callees := rfl
 
 theorem ofList_toList (tbl : OpaqueCalleeTable) : ofList tbl.toList = tbl := rfl
@@ -570,10 +576,19 @@ theorem lookup_eq (tbl : OpaqueCalleeTable) (callerLayouts : LayoutTable) (defPa
 theorem lookupKey_eq (tbl : OpaqueCalleeTable) (k : CalleeKey) :
     tbl.lookupKey k = tbl.lookup k.callerLayouts k.defPath k.typeArgs k.extraTraitImpls := rfl
 
+theorem traitImpls_eq (tbl : OpaqueCalleeTable) :
+    tbl.traitImpls = flatMapTraitImpls tbl.toList := rfl
+
 end OpaqueCalleeTable
 
 attribute [irreducible] OpaqueCalleeTable OpaqueCalleeTable.ofList OpaqueCalleeTable.toList
-  OpaqueCalleeTable.lookupRaw OpaqueCalleeTable.lookup
+  OpaqueCalleeTable.lookupRaw OpaqueCalleeTable.lookup OpaqueCalleeTable.traitImpls
+
+/-- One-time per-table `traitImpls` certificate: `(ofList callees).traitImpls` is
+`flatMapTraitImpls callees`. -/
+theorem traitImpls_ofList (callees : List CapturedMir) :
+    (OpaqueCalleeTable.ofList callees).traitImpls = flatMapTraitImpls callees := by
+  rw [OpaqueCalleeTable.traitImpls_eq, OpaqueCalleeTable.toList_ofList]
 
 /-- **Equivalence**: opaque-table lookup is the trusted `lookupCallee`. -/
 theorem opaqueCalleeTable_lookup_eq_trusted (callees : List CapturedMir)
@@ -974,6 +989,176 @@ theorem lookupCallee_hit_free_poly {tbl : OpaqueCalleeTable} {callerLayouts : La
     tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
       some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) :=
   lookupCallee_hit (resolve_free_poly hnoImpl hraw) (by simp) harity hlay
+
+/-- **`O(1)` certificate (free generic function, `tbl.toList`-free)**: uses the
+sealed `tbl.traitImpls` projection (rewritten once per table by `htraits`) instead
+of unfolding `flatMapTraitImpls tbl.toList` across all `M` callees. -/
+theorem lookupCallee_hit_free_poly_opaque {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra impls : List TraitImplEntry} {c : CapturedMir} {argLayouts : List TypeLayout}
+    (htraits : tbl.traitImpls = impls)
+    (hnoImpl : hasTraitImplForDefPath (extra ++ impls) defPath = false)
+    (hraw : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra =
+      some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) := by
+  rw [← htraits, OpaqueCalleeTable.traitImpls_eq] at hnoImpl
+  exact lookupCallee_hit_free_poly hnoImpl hraw harity hlay
+
+/-- Resolver-parametric companion of `collectMatchingTraitImpls`: replaces the
+linear `findCallee? callees entry.implPath` scan with an opaque raw lookup
+`lookupRaw : DefPath → Option CapturedMir` (`tbl.lookupRaw`), which is only
+invoked on entries whose `(traitRef.defPath, traitRef.args)` header actually
+matches `(defPath, typeArgs)`. -/
+def collectMatchingTraitImplsWith (lookupRaw : DefPath → Option CapturedMir)
+    (traitImpls : List TraitImplEntry) (defPath : DefPath) (typeArgs : List RigidTy)
+    (acc : List (TraitImplEntry × Option (List RigidTy)) := []) :
+    List (TraitImplEntry × Option (List RigidTy)) :=
+  match traitImpls with
+  | [] => acc
+  | entry :: rest =>
+    if stringEq entry.traitRef.defPath defPath then
+      match entry.traitRef.args with
+      | [] => collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs acc
+      | _ :: _ =>
+        match matchRigidTyPrefix entry.traitRef.args typeArgs [] with
+        | none => collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs acc
+        | some (subst, methodTypeArgs) =>
+          let rawImplTypeArgsOpt :=
+            match extractImplTypeArgs subst subst.length with
+            | some implHeaderArgs => some (implHeaderArgs ++ methodTypeArgs)
+            | none => none
+          let implTypeArgsOpt :=
+            match rawImplTypeArgsOpt, lookupRaw entry.implPath with
+            | some rawArgs, some c =>
+              let effectiveTypeArgs :=
+                match stringEq entry.implPath defPath with
+                | true => typeArgs
+                | false => rawArgs
+              if effectiveTypeArgs.length == c.typeParamCount then
+                some effectiveTypeArgs
+              else
+                none
+            | _, _ => none
+          collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs
+            (upsertMatchingTraitImpl entry implTypeArgsOpt acc)
+    else
+      collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs acc
+
+/-- `collectMatchingTraitImpls tbl.toList` equals `collectMatchingTraitImplsWith tbl.lookupRaw`. -/
+theorem collectMatchingTraitImpls_eq_with (tbl : OpaqueCalleeTable)
+    (defPath : DefPath) (typeArgs : List RigidTy) :
+    ∀ (impls : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      collectMatchingTraitImpls tbl.toList impls defPath typeArgs acc =
+        collectMatchingTraitImplsWith tbl.lookupRaw impls defPath typeArgs acc
+  | [], _ => rfl
+  | entry :: rest, acc => by
+    unfold collectMatchingTraitImpls collectMatchingTraitImplsWith
+    rw [OpaqueCalleeTable.lookupRaw_eq]
+    by_cases hd : stringEq entry.traitRef.defPath defPath = true
+    · simp only [hd, ite_true]
+      cases entry.traitRef.args with
+      | nil => exact collectMatchingTraitImpls_eq_with tbl defPath typeArgs rest acc
+      | cons a as =>
+        dsimp only
+        cases matchRigidTyPrefix (a :: as) typeArgs [] with
+        | none => exact collectMatchingTraitImpls_eq_with tbl defPath typeArgs rest acc
+        | some p =>
+          exact collectMatchingTraitImpls_eq_with tbl defPath typeArgs rest _
+    · simp only [hd, Bool.false_eq_true, ite_false]
+      exact collectMatchingTraitImpls_eq_with tbl defPath typeArgs rest acc
+
+/-- Opaque-table trait match collector: uses `tbl.traitImpls` and `tbl.lookupRaw`,
+never mentioning `tbl.toList`. -/
+def traitMatchesOpaque (tbl : OpaqueCalleeTable) (extra : List TraitImplEntry)
+    (defPath : DefPath) (typeArgs : List RigidTy) :
+    List (TraitImplEntry × Option (List RigidTy)) :=
+  collectMatchingTraitImplsWith tbl.lookupRaw (extra ++ tbl.traitImpls) defPath typeArgs []
+
+theorem traitMatches_eq_opaque (tbl : OpaqueCalleeTable) (extra : List TraitImplEntry)
+    (defPath : DefPath) (typeArgs : List RigidTy) :
+    traitMatches tbl extra defPath typeArgs = traitMatchesOpaque tbl extra defPath typeArgs := by
+  unfold traitMatches traitMatchesOpaque
+  rw [← OpaqueCalleeTable.traitImpls_eq, collectMatchingTraitImpls_eq_with]
+
+/-- A `TraitImplEntry` for a different trait method is skipped without calling `lookupRaw`. -/
+theorem collectMatchingTraitImplsWith_cons_ne_path
+    {lookupRaw : DefPath → Option CapturedMir} {entry : TraitImplEntry}
+    {rest : List TraitImplEntry} {defPath : DefPath} {typeArgs : List RigidTy}
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    (hne : stringEq entry.traitRef.defPath defPath = false) :
+    collectMatchingTraitImplsWith lookupRaw (entry :: rest) defPath typeArgs acc =
+      collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs acc := by
+  rw [collectMatchingTraitImplsWith]
+  simp only [hne, Bool.false_eq_true, ite_false]
+
+/-- A `TraitImplEntry` whose `traitRef.args` does not match `typeArgs` is skipped
+without calling `lookupRaw`. -/
+theorem collectMatchingTraitImplsWith_cons_ne_args
+    {lookupRaw : DefPath → Option CapturedMir} {entry : TraitImplEntry}
+    {rest : List TraitImplEntry} {defPath : DefPath} {typeArgs : List RigidTy}
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    (hpath : stringEq entry.traitRef.defPath defPath = true)
+    (hargs : match entry.traitRef.args with
+      | [] => true
+      | _ :: _ => (matchRigidTyPrefix entry.traitRef.args typeArgs []).isNone) :
+    collectMatchingTraitImplsWith lookupRaw (entry :: rest) defPath typeArgs acc =
+      collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs acc := by
+  rw [collectMatchingTraitImplsWith]
+  simp only [hpath, ite_true]
+  cases htr : entry.traitRef.args with
+  | nil => rfl
+  | cons a as =>
+    rw [htr] at hargs
+    cases hm : matchRigidTyPrefix (a :: as) typeArgs [] with
+    | none => rfl
+    | some _ => rw [hm] at hargs; nomatch hargs
+
+/-- A matching monomorphic `TraitImplEntry` override rewrites its body lookup in `O(1)`
+via its `lookupRaw` certificate (`himpl : lookupRaw entry.implPath = some c`). -/
+theorem collectMatchingTraitImplsWith_cons_hit_mono
+    {lookupRaw : DefPath → Option CapturedMir} {entry : TraitImplEntry}
+    {rest : List TraitImplEntry} {defPath : DefPath} {typeArgs : List RigidTy}
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    {a : RigidTy} {as : List RigidTy} {c : CapturedMir}
+    (hpath : stringEq entry.traitRef.defPath defPath = true)
+    (htr : entry.traitRef.args = a :: as)
+    (hmatch : matchRigidTyPrefix (a :: as) typeArgs [] = some ([], []))
+    (himpl : lookupRaw entry.implPath = some c)
+    (hov : stringEq entry.implPath defPath = false)
+    (hmono : c.typeParamCount = 0) :
+    collectMatchingTraitImplsWith lookupRaw (entry :: rest) defPath typeArgs acc =
+      collectMatchingTraitImplsWith lookupRaw rest defPath typeArgs
+        (upsertMatchingTraitImpl entry (some []) acc) := by
+  have hex : extractImplTypeArgs [] 0 = some [] := rfl
+  rw [collectMatchingTraitImplsWith]
+  simp only [hpath, ite_true, htr, hmatch, himpl, hov, List.length_nil, List.append_nil]
+  rw [hex]
+  simp only [List.length_nil, hmono]
+  rfl
+
+/-- **`O(1)` certificate (monomorphic `TraitImplEntry` override hit, `tbl.toList`-free)**:
+given a per-table `tbl.traitImpls = impls` certificate and `winner`'s `lookupRaw`
+certificate, resolves a trait method call without ever unfolding `tbl.toList`. -/
+theorem lookupCallee_trait_hit_cert {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {firstArg : RigidTy} {restArgs : List RigidTy}
+    {extra impls : List TraitImplEntry} {winner : TraitImplEntry}
+    {matches_ : List (TraitImplEntry × Option (List RigidTy))} {c : CapturedMir}
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (htraits : tbl.traitImpls = impls)
+    (hcollect : collectMatchingTraitImplsWith tbl.lookupRaw (extra ++ impls)
+      defPath (firstArg :: restArgs) [] = matches_)
+    (hwin : filterMostSpecificTraitImpls matches_ matches_ = [(winner, some [])])
+    (himpl : tbl.lookupRaw winner.implPath = some c)
+    (hoverride : winner.implPath ≠ defPath)
+    (hmono : c.typeParamCount = 0) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra = some c := by
+  apply lookupCallee_trait_hit hfirst ?_ himpl hoverride hmono
+  rw [traitMatches_eq_opaque]
+  unfold traitMatchesOpaque
+  rw [htraits, hcollect]
+  exact hwin
 
 /-! ### Literal-discriminant branch pruning over the real trusted step -/
 
@@ -2131,6 +2316,60 @@ theorem canary_free_poly_param_and_concrete :
   exact ⟨lookupCallee_hit_free_poly hno hraw rfl canary_u32_instantiationLayouts,
     lookupCallee_hit_free_poly hno hraw rfl hlayP⟩
 
+/-- One-time per-table `traitImpls` certificate for `multiFullTbl`: emitted once
+for the table and reused across all free-generic and trait-method call sites without
+ever unfolding `multiFullTbl.toList` again. -/
+theorem multiFullTbl_traitImpls : multiFullTbl.traitImpls = [protoAreaEntry] := by
+  unfold multiFullTbl
+  rw [traitImpls_ofList]
+  rfl
+
+/-- **`tbl.toList`-free free-generic certificate canary**: reuses the per-table
+`multiFullTbl_traitImpls` certificate (`multiFullTbl.traitImpls = [protoAreaEntry]`)
+so `hno` checks only the 1-entry `TraitImplEntry` list `[protoAreaEntry]`
+without ever unfolding `multiFullTbl.toList`. -/
+theorem canary_free_poly_opaque_cert :
+    multiFullTbl.lookup protoLayouts "proto::poly" [.uint .u32] [] =
+      some (protoPoly.instantiate [(.uint .u32, protoU32Layout)]) ∧
+    multiFullTbl.lookup protoLayouts "proto::poly" [.param 0 "T"] [] =
+      some (protoPoly.instantiate [(.param 0 "T", protoUnitLayout)]) := by
+  have hno : hasTraitImplForDefPath ([] ++ [protoAreaEntry]) "proto::poly" = false := by
+    decide
+  have hraw : multiFullTbl.lookupRaw "proto::poly" = some protoPoly := by
+    unfold multiFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hlayP : instantiationLayouts? protoLayouts [.param 0 "T"] = some [protoUnitLayout] := by
+    decide
+  exact ⟨lookupCallee_hit_free_poly_opaque multiFullTbl_traitImpls hno hraw rfl
+      canary_u32_instantiationLayouts,
+    lookupCallee_hit_free_poly_opaque multiFullTbl_traitImpls hno hraw rfl hlayP⟩
+
+/-- **`tbl.toList`-free trait-dispatch certificate canary**: resolves
+`<Circle as Area>::area` on `multiFullTbl` using *only* the one-time table
+certificate `multiFullTbl_traitImpls`, `collectMatchingTraitImplsWith_cons_hit_mono`,
+and the `O(1)` `lookupRaw` certificate for `protoCircleArea` — zero `tbl.toList`
+unfolding and zero `decide +kernel` over the callee list. -/
+theorem canary_trait_cert_no_toList :
+    multiFullTbl.lookup protoLayouts "proto::Area::area" [protoCircleTy] [] =
+      some protoCircleArea := by
+  have himpl : multiFullTbl.lookupRaw "proto::<impl Area for Circle>::area" =
+      some protoCircleArea := by
+    unfold multiFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hcollect :
+      collectMatchingTraitImplsWith multiFullTbl.lookupRaw ([] ++ [protoAreaEntry])
+        "proto::Area::area" [protoCircleTy] [] = [(protoAreaEntry, some [])] := by
+    rw [List.nil_append,
+      collectMatchingTraitImplsWith_cons_hit_mono (c := protoCircleArea)
+        (by decide) rfl (by decide) himpl (by decide) rfl]
+    rfl
+  exact lookupCallee_trait_hit_cert (winner := protoAreaEntry) (by decide)
+    multiFullTbl_traitImpls hcollect (by decide) himpl (by decide) rfl
+
 /-! ## Part B: multi-version demand-time `CompilerQueryEnv` -/
 
 /-- Compiler schema version of the captured evidence (`proofs-rs/lean-miri#64`,
@@ -2231,8 +2470,9 @@ inductive QueryErr : Type where
   | vtableNotFound (vtableId : Nat)
   | vtableTraitMismatch
   | vtableSlotOutOfBounds (slotIdx : Nat)
+  | vtableSupertraitNotFound (vtableId : Nat) (superTrait : TraitRef)
   | answerKindMismatch
-  deriving DecidableEq, Repr
+  deriving DecidableEq
 
 /-- Three-way demand-time query result. -/
 inductive QueryResult (α : Type) : Type where
@@ -2255,11 +2495,13 @@ structure CfiTagSpec : Type where
   deriving DecidableEq
 
 /-- Schema-13 vtable evidence (`charon#1611`): the method slots of vtable
-`vtableId` for `traitRef`. -/
+`vtableId` for `traitRef`, plus direct supertrait vtable pointer slots
+`(superTraitRef, superVTableId)` for supertrait upcasting / chained method lookup. -/
 structure VTableMethodEntry : Type where
   vtableId : Nat
   traitRef : TraitRef
   methods : List (DefPath × List RigidTy)
+  supertraits : List (TraitRef × Nat) := []
   deriving DecidableEq
 
 /-- Demand-time compiler queries. -/
@@ -2273,6 +2515,10 @@ inductive CompilerQuery : Type where
   | syncStorageGuard (allocId : AllocId) (offset len : Nat)
   /-- `UnOp.vtableMethodLookup` (`charon#1611`). -/
   | vtableMethodLookup (vtableId : Nat) (traitRef : TraitRef) (slotIdx : Nat)
+  /-- Supertrait vtable pointer lookup (`charon#1611` supertrait upcast / chained
+  method lookup): resolves the vtable allocation id for `superTrait` inside
+  `vtableId` (`traitRef`). -/
+  | vtableSupertraitLookup (vtableId : Nat) (traitRef superTrait : TraitRef)
   deriving DecidableEq
 
 /-- Answers of demand-time queries. -/
@@ -2281,6 +2527,7 @@ inductive QueryAnswer : Type where
   | abiOk
   | syncPermit
   | method (defPath : DefPath) (typeArgs : List RigidTy)
+  | supertraitVTable (vtableId : Nat)
   deriving DecidableEq
 
 /-- Memoization key of a demand-time query (`QueryKey`). -/
@@ -3233,6 +3480,47 @@ theorem evalLayoutOf_v08_eq_v06 (env : CompilerQueryEnv)
     evalLayoutOf env .v2026_08_01 ty = evalLayoutOf env .v2026_06_01 ty := by
   simp only [evalLayoutOf, hv08, computeLayoutV08Bridged_eq_computeLayoutV06_bridge, hbridge]
 
+/-- Bidirectional layout-table bridge equivalence: `bridgeLayoutV08ToV06 tblV08 = tblV06`
+holds if and only if `tblV08 = bridgeLayoutV06ToV08 tblV06`. -/
+theorem bridgeLayout_iff_eq (tblV08 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (tblV06 : LayoutTable) :
+    bridgeLayoutV08ToV06 tblV08 = tblV06 ↔ tblV08 = bridgeLayoutV06ToV08 tblV06 := by
+  constructor
+  · rintro rfl
+    exact (bridgeLayout_roundtrip_v08 tblV08).symm
+  · rintro rfl
+    exact bridgeLayout_roundtrip tblV06
+
+/-- **Cross-dialect layout-table coherence invariant**: whenever V2026_08_01 layout
+material is active under the environment's schema (`env.v08Layouts? = some tblV08`),
+its bridge to V2026_06_01 equals `env.layoutsV06` (equivalently, by
+`bridgeLayout_iff_eq`, `tblV08 = bridgeLayoutV06ToV08 env.layoutsV06`). -/
+def CompilerQueryEnv.isLayoutCoherent (env : CompilerQueryEnv) : Bool :=
+  match env.v08Layouts? with
+  | none => true
+  | some tblV08 => decide (bridgeLayoutV08ToV06 tblV08 = env.layoutsV06)
+
+/-- Any `.v2026_06_01` environment is vacuously layout-coherent (`v08Layouts? = none`). -/
+theorem isLayoutCoherent_of_schema_v06 (env : CompilerQueryEnv)
+    (hs : env.schema = .v2026_06_01) : env.isLayoutCoherent = true := by
+  simp [CompilerQueryEnv.isLayoutCoherent, CompilerQueryEnv.v08Layouts?, hs,
+    CompilerSchemaVersion.hasV08Layouts]
+
+/-- Canonical smart upgrader that populates `layoutsV08` by bridging `env.layoutsV06`. -/
+def CompilerQueryEnv.withBridgedV08Layouts (env : CompilerQueryEnv)
+    (newSchema : CompilerSchemaVersion := env.schema) : CompilerQueryEnv :=
+  { env with
+    schema := newSchema
+    layoutsV08 := some (bridgeLayoutV06ToV08 env.layoutsV06) }
+
+/-- `withBridgedV08Layouts` always satisfies `isLayoutCoherent`. -/
+theorem withBridgedV08Layouts_isLayoutCoherent (env : CompilerQueryEnv)
+    (newSchema : CompilerSchemaVersion) :
+    (env.withBridgedV08Layouts newSchema).isLayoutCoherent = true := by
+  unfold CompilerQueryEnv.isLayoutCoherent CompilerQueryEnv.v08Layouts?
+    CompilerQueryEnv.withBridgedV08Layouts
+  cases newSchema.hasV08Layouts <;> simp [bridgeLayout_roundtrip]
+
 /-- First per-argument ABI mismatch (pass mode, then layout). -/
 def argAbiMismatch? : Nat → List ArgAbi → List ArgAbi → Option QueryErr
   | _, [], [] => none
@@ -3376,18 +3664,38 @@ def evalVTableMethodLookup (env : CompilerQueryEnv) (vtableId : Nat) (traitRef :
         | none => .err (.vtableSlotOutOfBounds slotIdx)
       else .err .vtableTraitMismatch
 
-/-- **Pure demand-time evaluator** of all four query families. -/
+/-- Demand-time supertrait vtable pointer lookup (`charon#1611` supertrait upcast /
+chained vtable resolution): resolves the direct supertrait `superTrait`'s vtable
+allocation id inside `vtableId` (`traitRef`). -/
+def evalVTableSupertraitLookup (env : CompilerQueryEnv) (vtableId : Nat)
+    (traitRef superTrait : TraitRef) : QueryResult QueryAnswer :=
+  match env.vtableEvidence? with
+  | none => .unsupported .missingVTableEvidence
+  | some vtables =>
+    match vtables.find? (fun e => decide (e.vtableId = vtableId)) with
+    | none => .err (.vtableNotFound vtableId)
+    | some e =>
+      if e.traitRef = traitRef then
+        match e.supertraits.find? (fun s => decide (s.1 = superTrait)) with
+        | some (_, superVtId) => .ok (.supertraitVTable superVtId)
+        | none => .err (.vtableSupertraitNotFound vtableId superTrait)
+      else .err .vtableTraitMismatch
+
+/-- **Pure demand-time evaluator** of all query families. -/
 def evalCompilerQuery (env : CompilerQueryEnv) : CompilerQuery → QueryResult QueryAnswer
   | .layoutOf dialect ty => evalLayoutOf env dialect ty
   | .abiCompatible callerAbi callee cfiCallSite => evalAbiCompatible env callerAbi callee cfiCallSite
   | .syncStorageGuard allocId offset len => evalSyncStorageGuard env allocId offset len
   | .vtableMethodLookup vtableId traitRef slotIdx => evalVTableMethodLookup env vtableId traitRef slotIdx
+  | .vtableSupertraitLookup vtableId traitRef superTrait =>
+    evalVTableSupertraitLookup env vtableId traitRef superTrait
 
 /-- Queries answerable only from Schema-13 evidence. -/
 def CompilerQuery.isSchema13Only : CompilerQuery → Bool
   | .abiCompatible _ _ (some _) => true
   | .syncStorageGuard .. => true
   | .vtableMethodLookup .. => true
+  | .vtableSupertraitLookup .. => true
   | _ => false
 
 /-- **Schema-12 fail-closed fallback**: under any Schema-12 environment (whatever
@@ -3412,6 +3720,9 @@ theorem query_schema12_unsupported_fallback (env : CompilerQueryEnv) (q : Compil
   | vtableMethodLookup vtableId traitRef slotIdx =>
     exact ⟨.missingVTableEvidence, by
       simp [evalCompilerQuery, evalVTableMethodLookup, CompilerQueryEnv.vtableEvidence?, h13]⟩
+  | vtableSupertraitLookup vtableId traitRef superTrait =>
+    exact ⟨.missingVTableEvidence, by
+      simp [evalCompilerQuery, evalVTableSupertraitLookup, CompilerQueryEnv.vtableEvidence?, h13]⟩
 
 /-- Corollary: a Schema-12 environment never fabricates `.ok` for a Schema-13-only
 query, whether its optional Schema-13 fields are `none` or (ignored by the schema
@@ -3532,6 +3843,81 @@ theorem query_mono_schema {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env
       exact absurd (by simp [evalCompilerQuery, evalVTableMethodLookup, hv])
         (hsup .missingVTableEvidence)
     | some vts => simp only [evalCompilerQuery, evalVTableMethodLookup, hv, vtableEvidence_mono h hv]
+  | vtableSupertraitLookup vtableId traitRef superTrait =>
+    cases hv : env₁.vtableEvidence? with
+    | none =>
+      exact absurd (by simp [evalCompilerQuery, evalVTableSupertraitLookup, hv])
+        (hsup .missingVTableEvidence)
+    | some vts =>
+      simp only [evalCompilerQuery, evalVTableSupertraitLookup, hv, vtableEvidence_mono h hv]
+
+/-- **Coherent cross-dialect `layoutOf` agreement**: under any layout-coherent
+environment (`env.isLayoutCoherent = true`) where `.v2026_08_01` is supported,
+`evalCompilerQuery env (.layoutOf .v2026_08_01 ty)` equals
+`evalCompilerQuery env (.layoutOf .v2026_06_01 ty)` for *every* `ty : Ty`. -/
+theorem evalLayoutOf_v08_eq_v06_of_coherent (env : CompilerQueryEnv)
+    (hcoh : env.isLayoutCoherent = true) (ty : Ty)
+    (hsup : ∀ m, evalCompilerQuery env (.layoutOf .v2026_08_01 ty) ≠ .unsupported m) :
+    evalCompilerQuery env (.layoutOf .v2026_08_01 ty) =
+      evalCompilerQuery env (.layoutOf .v2026_06_01 ty) := by
+  unfold CompilerQueryEnv.isLayoutCoherent at hcoh
+  cases hv08 : env.v08Layouts? with
+  | none =>
+    exact absurd (by simp [evalCompilerQuery, evalLayoutOf, hv08]) (hsup .missingV08LayoutDialect)
+  | some tblV08 =>
+    rw [hv08, decide_eq_true_eq] at hcoh
+    exact evalLayoutOf_v08_eq_v06 env tblV08 hv08 hcoh ty
+
+/-- If `env₁` is layout-coherent with active V08 layouts (`env₁.v08Layouts? = some _`),
+every `EnvExtends env₁ env₂` preserves `isLayoutCoherent`. -/
+theorem isLayoutCoherent_preserved_of_v08_present {env₁ env₂ : CompilerQueryEnv}
+    (h : EnvExtends env₁ env₂) (hcoh : env₁.isLayoutCoherent = true)
+    {tblV08 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable}
+    (hv08 : env₁.v08Layouts? = some tblV08) :
+    env₂.isLayoutCoherent = true := by
+  unfold CompilerQueryEnv.isLayoutCoherent at hcoh ⊢
+  rw [hv08] at hcoh
+  rw [v08Layouts_mono h hv08, h.layoutsV06_eq]
+  exact hcoh
+
+/-- Upgrading any layout-coherent environment via `withBridgedV08Layouts` to a
+schema `newSchema` (`SchemaLe env.schema newSchema`) is a sound `EnvExtends`. -/
+theorem withBridgedV08Layouts_extends (env : CompilerQueryEnv)
+    (newSchema : CompilerSchemaVersion) (hs : SchemaLe env.schema newSchema)
+    (hcoh : env.isLayoutCoherent = true) :
+    EnvExtends env (env.withBridgedV08Layouts newSchema) := by
+  refine ⟨hs, rfl, ?_, rfl,
+    fun _ => gated_evidence_mono (fun _ _ => hasSchema13_mono) hs (OptionExtends.refl _),
+    fun _ => gated_evidence_mono (fun _ _ => hasSchema13_mono) hs (OptionExtends.refl _),
+    fun _ => gated_evidence_mono (fun _ _ => hasSchema13_mono) hs (OptionExtends.refl _)⟩
+  intro tblV08 ht
+  unfold CompilerQueryEnv.isLayoutCoherent at hcoh
+  rw [ht, decide_eq_true_eq, bridgeLayout_iff_eq] at hcoh
+  unfold CompilerQueryEnv.v08Layouts? at ht ⊢
+  cases hf₁ : env.schema.hasV08Layouts with
+  | false => simp [hf₁] at ht
+  | true =>
+    have hf₂ : newSchema.hasV08Layouts = true := hasV08Layouts_mono hs hf₁
+    simp [CompilerQueryEnv.withBridgedV08Layouts, hf₂, hcoh]
+
+/-- **Negative coherence canary**: if a decoder populates an incoherent V2026_08_01
+`LayoutTable` (`pointerBits = 32` while `layoutsV06.pointerBits = 64`),
+`isLayoutCoherent` is `false` and `.v2026_08_01` `layoutOf` disagrees with
+`.v2026_06_01` `layoutOf` on `&u32` (`4` bytes vs. `8` bytes). -/
+theorem incoherence_breaks_dialect_agreement_canary :
+    let badEnv : CompilerQueryEnv :=
+      { schema := .v2026_08_01
+        layoutsV06 := protoLayouts
+        layoutsV08 := some { bridgeLayoutV06ToV08 protoLayouts with pointerBits := 32 }
+        fnAbis := [], cfiTags := none, syncRegions := none, vtables := none }
+    let refU32 : Ty := ⟨.ref .not (.uint .u32), 0⟩
+    badEnv.isLayoutCoherent = false ∧
+      evalCompilerQuery badEnv (.layoutOf .v2026_06_01 refU32) ≠
+        evalCompilerQuery badEnv (.layoutOf .v2026_08_01 refU32) ∧
+      (badEnv.withBridgedV08Layouts .v2026_08_01).isLayoutCoherent = true ∧
+      evalCompilerQuery (badEnv.withBridgedV08Layouts .v2026_08_01) (.layoutOf .v2026_06_01 refU32) =
+        evalCompilerQuery (badEnv.withBridgedV08Layouts .v2026_08_01) (.layoutOf .v2026_08_01 refU32) := by
+  decide
 
 /-- **Sync guard specification**: for any non-empty access (`0 < len`), the guard
 rejects `r` if and only if `r` is a non-empty region (`0 < r.size`) of the same
@@ -3747,10 +4133,15 @@ theorem cfi_canary :
 
 /-! ## End-to-end: `UnOp.vtableMethodLookup → abiCompatible → OpaqueCalleeTable.lookup → stepBranchPruned` -/
 
-/-- `charon#1611` `UnOp.vtableMethodLookup traitRef slotIdx`. -/
+/-- `charon#1611` `UnOp.vtableMethodLookup traitRef slotIdx` with optional
+supertrait vtable chain (`supertraitChain`). When `supertraitChain = []`, looks
+up method `slotIdx` directly in `traitRef`'s vtable; when
+`supertraitChain = [subTrait, ...]`, first walks supertrait vtable pointers
+along `supertraitChain → traitRef` before looking up `slotIdx`. -/
 structure VTableMethodLookupOp : Type where
   traitRef : TraitRef
   slotIdx : Nat
+  supertraitChain : List TraitRef := []
   deriving DecidableEq
 
 /-- Prototype unary operators: the trusted `UnOp` plus `charon#1611`'s demand-time
@@ -3760,12 +4151,66 @@ inductive UnOpExt : Type where
   | vtableMethodLookup (op : VTableMethodLookupOp)
   deriving DecidableEq
 
-/-- The demand-time compiler query a unary operator issues on a vtable pointer
-(`none` for trusted base operators, which never consult the query environment). -/
+/-- The initial demand-time compiler query a unary operator issues on a vtable
+pointer (`none` for trusted base operators, which never consult the query
+environment; `.vtableMethodLookup` when `supertraitChain = []`, and the first
+`.vtableSupertraitLookup` hop when `supertraitChain` is non-empty). -/
 def UnOpExt.query? : UnOpExt → ProvenancePtr → Option CompilerQuery
   | .base _, _ => none
   | .vtableMethodLookup op, vtablePtr =>
-    some (.vtableMethodLookup vtablePtr.allocId op.traitRef op.slotIdx)
+    match op.supertraitChain with
+    | [] => some (.vtableMethodLookup vtablePtr.allocId op.traitRef op.slotIdx)
+    | curTrait :: rest =>
+      some (.vtableSupertraitLookup vtablePtr.allocId curTrait (rest.headD op.traitRef))
+
+/-- Walk a chain of `UnOp.vtableMethodLookup` supertrait vtable hops starting
+at `vtId` before looking up method slot `slotIdx` on the final `traitRef`. -/
+def resolveVTableChain (env : CompilerQueryEnv) (traitRef : TraitRef) (slotIdx : Nat) :
+    List TraitRef → Nat → QueryResult (DefPath × List RigidTy)
+  | [], vtId =>
+    match evalCompilerQuery env (.vtableMethodLookup vtId traitRef slotIdx) with
+    | .ok (.method p tys) => .ok (p, tys)
+    | .ok _ => .err .answerKindMismatch
+    | .err e => .err e
+    | .unsupported m => .unsupported m
+  | curTrait :: restChain, vtId =>
+    match evalCompilerQuery env
+        (.vtableSupertraitLookup vtId curTrait (restChain.headD traitRef)) with
+    | .ok (.supertraitVTable nextVtId) =>
+      resolveVTableChain env traitRef slotIdx restChain nextVtId
+    | .ok _ => .err .answerKindMismatch
+    | .err e => .err e
+    | .unsupported m => .unsupported m
+
+/-- `resolveVTableChain` is monotone under `EnvExtends` for any supertrait chain. -/
+theorem resolveVTableChain_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
+    (traitRef : TraitRef) (slotIdx : Nat) :
+    ∀ (chain : List TraitRef) (vtId : Nat),
+      (∀ m, resolveVTableChain env₁ traitRef slotIdx chain vtId ≠ .unsupported m) →
+        resolveVTableChain env₂ traitRef slotIdx chain vtId =
+          resolveVTableChain env₁ traitRef slotIdx chain vtId
+  | [], vtId, hsup => by
+    unfold resolveVTableChain at hsup ⊢
+    generalize hq : CompilerQuery.vtableMethodLookup vtId traitRef slotIdx = q at hsup ⊢
+    cases hv : evalCompilerQuery env₁ q with
+    | unsupported m => exact absurd (by simp [hv]) (hsup m)
+    | err e => rw [query_mono_schema h q (by simp [hv]), hv]
+    | ok a =>
+      rw [query_mono_schema h q (by simp [hv]), hv]
+  | curTrait :: restChain, vtId, hsup => by
+    unfold resolveVTableChain at hsup ⊢
+    generalize hq :
+      CompilerQuery.vtableSupertraitLookup vtId curTrait (restChain.headD traitRef) = q at hsup ⊢
+    cases hv : evalCompilerQuery env₁ q with
+    | unsupported m => exact absurd (by simp [hv]) (hsup m)
+    | err e => rw [query_mono_schema h q (by simp [hv]), hv]
+    | ok a =>
+      rw [query_mono_schema h q (by simp [hv]), hv]
+      rw [hv] at hsup
+      cases a with
+      | supertraitVTable nextVtId =>
+        exact resolveVTableChain_mono h traitRef slotIdx restChain nextVtId hsup
+      | _ => rfl
 
 /-- A `dyn Trait` method call site, lowered as in `charon#1611`: the receiver's
 vtable pointer (`PtrMetadata(recv)`) is held in local `vtableLocal` of the calling
@@ -3793,21 +4238,19 @@ def DynCallSite.vtablePtr? (site : DynCallSite) (s : MachineState) : Option Prov
   | _ => none
 
 /-- Resolve a `dyn` call through the runtime vtable pointer `vtablePtr`:
-`UnOp.vtableMethodLookup`, then `abiCompatible`. -/
+`resolveVTableChain` (direct or supertrait-chained `UnOp.vtableMethodLookup`),
+then `abiCompatible`. -/
 def resolveDynTarget (env : CompilerQueryEnv) (site : DynCallSite) (vtablePtr : ProvenancePtr) :
     QueryResult (DefPath × List RigidTy) :=
-  match (UnOpExt.vtableMethodLookup site.lookupOp).query? vtablePtr with
-  | none => .err .answerKindMismatch
-  | some q =>
-    match evalCompilerQuery env q with
-    | .ok (.method p tys) =>
-      match evalCompilerQuery env (.abiCompatible site.callerAbi p site.cfiCallSite) with
-      | .ok _ => .ok (p, tys)
-      | .err e => .err e
-      | .unsupported m => .unsupported m
-    | .ok _ => .err .answerKindMismatch
+  match resolveVTableChain env site.lookupOp.traitRef site.lookupOp.slotIdx
+      site.lookupOp.supertraitChain vtablePtr.allocId with
+  | .ok (p, tys) =>
+    match evalCompilerQuery env (.abiCompatible site.callerAbi p site.cfiCallSite) with
+    | .ok _ => .ok (p, tys)
     | .err e => .err e
     | .unsupported m => .unsupported m
+  | .err e => .err e
+  | .unsupported m => .unsupported m
 
 /-- Resolver redirecting the `dyn` call key to the dispatched method in the opaque
 table (every other key resolves through the table unchanged). -/
@@ -3833,30 +4276,27 @@ def dynDispatchStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : D
     | .err _ => MirStepNode.fail .ub
     | .unsupported _ => MirStepNode.unsupported
 
-/-- `resolveDynTarget` is monotone under `EnvExtends` on supported answers. -/
+/-- `resolveDynTarget` is monotone under `EnvExtends` on supported answers (for
+both direct and supertrait-chained vtable lookups). -/
 theorem resolveDynTarget_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
     (site : DynCallSite) (vt : ProvenancePtr)
     (hsup : ∀ m, resolveDynTarget env₁ site vt ≠ .unsupported m) :
     resolveDynTarget env₂ site vt = resolveDynTarget env₁ site vt := by
   unfold resolveDynTarget at hsup ⊢
-  simp only [UnOpExt.query?] at hsup ⊢
-  generalize hq : CompilerQuery.vtableMethodLookup vt.allocId site.lookupOp.traitRef
-    site.lookupOp.slotIdx = q at hsup ⊢
-  cases hv : evalCompilerQuery env₁ q with
+  cases hv : resolveVTableChain env₁ site.lookupOp.traitRef site.lookupOp.slotIdx
+      site.lookupOp.supertraitChain vt.allocId with
   | unsupported m => exact absurd (by simp [hv]) (hsup m)
   | err e =>
-    rw [query_mono_schema h q (by simp [hv]), hv]
-  | ok a =>
-    rw [query_mono_schema h q (by simp [hv]), hv]
+    rw [resolveVTableChain_mono h _ _ _ _ (by simp [hv]), hv]
+  | ok pt =>
+    rcases pt with ⟨p, tys⟩
+    rw [resolveVTableChain_mono h _ _ _ _ (by simp [hv]), hv]
     rw [hv] at hsup
-    cases a with
-    | method p tys =>
-      simp only at hsup ⊢
-      cases hb : evalCompilerQuery env₁ (.abiCompatible site.callerAbi p site.cfiCallSite) with
-      | unsupported m => exact absurd (by simp [hb]) (hsup m)
-      | err e => rw [query_mono_schema h _ (by simp [hb]), hb]
-      | ok b => rw [query_mono_schema h _ (by simp [hb]), hb]
-    | _ => rfl
+    dsimp only at hsup ⊢
+    cases hb : evalCompilerQuery env₁ (.abiCompatible site.callerAbi p site.cfiCallSite) with
+    | unsupported m => exact absurd (by simp [hb]) (hsup m)
+    | err e => rw [query_mono_schema h _ (by simp [hb]), hb]
+    | ok b => rw [query_mono_schema h _ (by simp [hb]), hb]
 
 /-- The dynamic-dispatch step on a resolved receiver is a branch-pruned step. -/
 theorem dynDispatchStep_eq_of_resolved {env : CompilerQueryEnv} {tbl : OpaqueCalleeTable}
@@ -3922,7 +4362,7 @@ def protoVtPtrTy : Ty := ⟨.rawPtr .not (.tuple []), 0⟩
 /-- The `dyn Area` call site (receiver vtable pointer in local `_1`, slot `0`, not
 CFI-instrumented). -/
 def dynSite : DynCallSite :=
-  { vtableLocal := 1, lookupOp := ⟨dynTraitRef, 0⟩, callerAbi := protoRetU32Abi,
+  { vtableLocal := 1, lookupOp := ⟨dynTraitRef, 0, []⟩, callerAbi := protoRetU32Abi,
     cfiCallSite := none, dynKey := ("proto::Area::area", [.dynamic "proto::Area"]) }
 
 /-- `fn(vt: *const ()) -> u32 { if true { <dyn Area>::area() } else { g_dead() } }`. -/
@@ -3959,8 +4399,8 @@ def dynEnv12 : CompilerQueryEnv :=
 def dynEnv13 : CompilerQueryEnv :=
   { dynEnv12 with
     schema := .schema13
-    vtables := some [⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])]⟩,
-      ⟨9, dynTraitRef, [("proto::<impl Area for Square>::area", [])]⟩] }
+    vtables := some [⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])], []⟩,
+      ⟨9, dynTraitRef, [("proto::<impl Area for Square>::area", [])], []⟩] }
 
 /-- A further extension populating sync-storage regions. -/
 def dynEnv13Sync : CompilerQueryEnv := { dynEnv13 with syncRegions := some [⟨3, 4, 8⟩] }
@@ -4086,7 +4526,7 @@ field holds ignored garbage still extends cleanly to `dynEnv13` (`EnvExtends`),
 and `query_mono_schema` preserves its supported answers. -/
 theorem envExtends_schema12_ignored_fields_canary :
     let noisy12 : CompilerQueryEnv :=
-      { dynEnv12 with vtables := some [⟨999, ⟨"proto::Noise", []⟩, []⟩] }
+      { dynEnv12 with vtables := some [⟨999, ⟨"proto::Noise", []⟩, [], []⟩] }
     EnvExtends noisy12 dynEnv13 ∧
       evalCompilerQuery noisy12 (.vtableMethodLookup 7 dynTraitRef 0) =
         .unsupported .missingVTableEvidence ∧
@@ -4290,20 +4730,46 @@ theorem evalDynWithOpaqueCallees_preserved_of_check {env₁ env₂ : CompilerQue
   evalDynWithOpaqueCallees_preserved h fuel s
     (fun s' hs' => dynStepPreserved_of_check (List.all_eq_true.mp hcheck s' hs'))
 
+/-- **Narrow-run multi-step end-to-end preservation**: states are collected along
+the *narrowed* run `runVisited (dynDemandStep env₂ narrowTbl site body) fuel s`
+(so `fullTbl` is never stepped to compute the visited-state list!). -/
+theorem evalDynWithOpaqueCallees_preserved_of_narrow {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hvisit : ∀ s' ∈ runVisited (dynDemandStep env₂ narrowTbl site body) fuel s,
+      DynStepPreserved env₁ narrowTbl fullTbl site body s') :
+    evalDynWithOpaqueCallees env₂ narrowTbl site body fuel s =
+      evalDynWithOpaqueCallees env₁ fullTbl site body fuel s := by
+  symm
+  exact runSteps_congr_visited fuel s []
+    (fun s' hs' => (dynDemandStep_preserved h (hvisit s' hs')).symm)
+
+/-- Narrow-run multi-step preservation from per-state certificates checked along
+the *narrowed* run (`runVisited` never steps `fullTbl`). -/
+theorem evalDynWithOpaqueCallees_preserved_of_narrow_check {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hcheck : (runVisited (dynDemandStep env₂ narrowTbl site body) fuel s).all
+      (dynStepPreservedB env₁ narrowTbl fullTbl site body) = true) :
+    evalDynWithOpaqueCallees env₂ narrowTbl site body fuel s =
+      evalDynWithOpaqueCallees env₁ fullTbl site body fuel s :=
+  evalDynWithOpaqueCallees_preserved_of_narrow h fuel s
+    (fun s' hs' => dynStepPreserved_of_check (List.all_eq_true.mp hcheck s' hs'))
+
 /-- **Full multi-step end-to-end dynamic-dispatch canary (Schema 13)**: starting
 from `dynInit` (`bb0: if true { <dyn Area>::area() } else { g_dead() }`),
 `evalDynWithOpaqueCallees` prunes the dead branch `g_dead`, reads the receiver's
 vtable pointer, resolves `UnOp.vtableMethodLookup` + `abiCompatible` on demand at
 `bb1`, enters `<Circle as Area>::area` in the narrowed opaque table, and halts
-returning `31`; the narrowed/extended run equals the full run by the multi-step
-theorem (certificates kernel-checked along the run). -/
+returning `31`; the narrowed/extended run equals the full run by the narrow-run
+multi-step theorem (`runVisited` steps only `dynNarrowTbl`). -/
 theorem canary_dyn_e2e_full_run_schema13 :
     (evalDynWithOpaqueCallees dynEnv13 dynNarrowTbl dynSite dynRoot 12 dynInit).summary =
       ⟨.halted, [.event 1], some 31, none⟩ ∧
     evalDynWithOpaqueCallees dynEnv13Sync dynNarrowTbl dynSite dynRoot 12 dynInit =
       evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInit :=
   ⟨by decide +kernel,
-    evalDynWithOpaqueCallees_preserved_of_check dyn_envExtends_13_sync 12 dynInit
+    evalDynWithOpaqueCallees_preserved_of_narrow_check dyn_envExtends_13_sync 12 dynInit
       (by decide +kernel)⟩
 
 /-- `if false { <dyn Area>::area() } else { live_f() }`: the `dyn Area` call is on
@@ -4325,7 +4791,9 @@ def dynDeadBranchInit : MachineState := initMachineState dynDeadBranchRoot []
 when `<dyn Area>::area()` lies in the dead arm of `if false`, `evalDynWithOpaqueCallees`
 under Schema 12 (`dynEnv12`, which lacks Schema-13 vtable evidence!) never
 demands `vtableMethodLookup` and executes the live branch `live_f()` to `.halted 7`
-on the narrowed `[protoLiveF]` table. -/
+on the narrowed `[protoLiveF]` table; preservation across `dynEnv12 → dynEnv13` and
+`canaryNarrowTbl ↔ canaryFullTbl` is proved through
+`evalDynWithOpaqueCallees_preserved_of_narrow_check`. -/
 theorem canary_dyn_deadBranch_schema12_succeeds :
     (evalDynWithOpaqueCallees dynEnv12 canaryNarrowTbl dynSite
         dynDeadBranchRoot 12 dynDeadBranchInit).summary =
@@ -4334,7 +4802,22 @@ theorem canary_dyn_deadBranch_schema12_succeeds :
         dynDeadBranchRoot 12 dynDeadBranchInit =
       evalDynWithOpaqueCallees dynEnv13 canaryFullTbl dynSite
         dynDeadBranchRoot 12 dynDeadBranchInit := by
-  refine ⟨by decide +kernel, by decide +kernel⟩
+  refine ⟨by decide +kernel, ?_⟩
+  have h1 :
+      evalDynWithOpaqueCallees dynEnv13 canaryNarrowTbl dynSite
+          dynDeadBranchRoot 12 dynDeadBranchInit =
+        evalDynWithOpaqueCallees dynEnv12 canaryNarrowTbl dynSite
+          dynDeadBranchRoot 12 dynDeadBranchInit :=
+    evalDynWithOpaqueCallees_preserved_of_narrow_check
+      dyn_envExtends_12_13 12 dynDeadBranchInit (by decide +kernel)
+  have h2 :
+      evalDynWithOpaqueCallees dynEnv13 canaryNarrowTbl dynSite
+          dynDeadBranchRoot 12 dynDeadBranchInit =
+        evalDynWithOpaqueCallees dynEnv13 canaryFullTbl dynSite
+          dynDeadBranchRoot 12 dynDeadBranchInit :=
+    evalDynWithOpaqueCallees_preserved_of_narrow_check
+      (EnvExtends.refl dynEnv13) 12 dynDeadBranchInit (by decide +kernel)
+  exact h1.symm.trans h2
 
 /-! ### Receiver-driven dispatch: one call key, two receivers -/
 
@@ -4384,13 +4867,68 @@ theorem canary_dyn_two_receivers :
 
 /-- **Multi-step preservation on the two-receiver run**: the whole run under the
 further-extended environment and the two-`impl` narrowed table equals the full
-run, by `evalDynWithOpaqueCallees_preserved_of_check` (per-state certificates
-kernel-checked at all 10 visited states, two of which demand the `dyn` key with
-different receivers). -/
+run, by `evalDynWithOpaqueCallees_preserved_of_narrow_check` (`runVisited` steps
+only `dyn2NarrowTbl`). -/
 theorem canary_dyn_two_receivers_preserved :
     evalDynWithOpaqueCallees dynEnv13Sync dyn2NarrowTbl dyn2Site dyn2Root 16 dyn2Init =
       evalDynWithOpaqueCallees dynEnv13 dynFullTbl dyn2Site dyn2Root 16 dyn2Init :=
-  evalDynWithOpaqueCallees_preserved_of_check dyn_envExtends_13_sync 16 dyn2Init (by decide +kernel)
+  evalDynWithOpaqueCallees_preserved_of_narrow_check dyn_envExtends_13_sync 16 dyn2Init
+    (by decide +kernel)
+
+/-! ### Chained supertrait vtable lookup (`charon#1611`) -/
+
+/-- Subtrait `SubArea : Area` with `Self = dyn SubArea`. -/
+def dynSubTraitRef : TraitRef := ⟨"proto::SubArea", [.dynamic "proto::SubArea"]⟩
+
+/-- Schema-13 environment where vtable `11` (`dyn SubArea` for `Circle`) links its
+supertrait `Area` to vtable `7` (`dyn Area` for `Circle`). -/
+def dynSubEnv13 : CompilerQueryEnv :=
+  { dynEnv13 with
+    vtables := some [
+      ⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])], []⟩,
+      ⟨9, dynTraitRef, [("proto::<impl Area for Square>::area", [])], []⟩,
+      ⟨11, dynSubTraitRef, [], [(dynTraitRef, 7)]⟩ ] }
+
+/-- Call site on a `dyn SubArea` receiver that chains `SubArea → Area` before
+looking up `Area::area` at slot `0`. -/
+def dynSubSite : DynCallSite :=
+  { dynSite with lookupOp := ⟨dynTraitRef, 0, [dynSubTraitRef]⟩ }
+
+/-- Initial state of `dynRoot` called with a `dyn SubArea` receiver (vtable `11`). -/
+def dynSubInit : MachineState := initMachineState dynRoot [.ptr ⟨11, 0⟩ 0]
+
+/-- **Chained supertrait vtable canary (`charon#1611`)**:
+1. `UnOpExt.query?` on `dynSubSite` issues `.vtableSupertraitLookup 11 dynSubTraitRef dynTraitRef`
+   as its initial query, resolving to `.ok (.supertraitVTable 7)`.
+2. `resolveDynTarget` chains `11 (SubArea) → 7 (Area) → <Circle as Area>::area`.
+3. `evalDynWithOpaqueCallees` on `dynSubInit` halts returning `31` on the narrowed
+   table `dynNarrowTbl` (and equals the full-table run by
+   `evalDynWithOpaqueCallees_preserved_of_narrow_check`).
+4. Missing the supertrait link (`dynEnv13`, where vtable `7` has `supertraits = []`)
+   returns `.err (.vtableSupertraitNotFound 7 dynTraitRef)` when starting from a
+   vtable without the supertrait entry, and Schema 12 (`dynEnv12`) fails closed
+   with `.unsupported .missingVTableEvidence`. -/
+theorem canary_dyn_supertrait_chain :
+    (UnOpExt.vtableMethodLookup dynSubSite.lookupOp).query? ⟨11, 0⟩ =
+      some (.vtableSupertraitLookup 11 dynSubTraitRef dynTraitRef) ∧
+    evalCompilerQuery dynSubEnv13 (.vtableSupertraitLookup 11 dynSubTraitRef dynTraitRef) =
+      .ok (.supertraitVTable 7) ∧
+    resolveDynTarget dynSubEnv13 dynSubSite ⟨11, 0⟩ =
+      .ok ("proto::<impl Area for Circle>::area", []) ∧
+    resolveDynTarget dynEnv12 dynSubSite ⟨11, 0⟩ =
+      .unsupported .missingVTableEvidence ∧
+    evalCompilerQuery dynSubEnv13 (.vtableSupertraitLookup 7 dynTraitRef dynSubTraitRef) =
+      .err (.vtableSupertraitNotFound 7 dynSubTraitRef) ∧
+    (evalDynWithOpaqueCallees dynSubEnv13 dynNarrowTbl dynSubSite dynRoot 12 dynSubInit).summary =
+      ⟨.halted, [.event 1], some 31, none⟩ ∧
+    evalDynWithOpaqueCallees { dynSubEnv13 with syncRegions := some [⟨3, 4, 8⟩] }
+        dynNarrowTbl dynSubSite dynRoot 12 dynSubInit =
+      evalDynWithOpaqueCallees dynSubEnv13 dynFullTbl dynSubSite dynRoot 12 dynSubInit := by
+  have hExt : EnvExtends dynSubEnv13 { dynSubEnv13 with syncRegions := some [⟨3, 4, 8⟩] } :=
+    ⟨by decide, rfl, OptionExtends.refl _, rfl, OptionExtends.refl _, (fun _ h => nomatch h),
+      OptionExtends.refl _⟩
+  refine ⟨rfl, by decide, by decide, by decide, by decide, by decide +kernel,
+    evalDynWithOpaqueCallees_preserved_of_narrow_check hExt 12 dynSubInit (by decide +kernel)⟩
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -4443,6 +4981,46 @@ Hint: Additional diagnostic information may be available using the `set_option d
 #synth LawfulBEq DemoKey
 
 end Shadowed
+
+/-- Real `Trusted` type audit connection (`theory/Correspondence/V2026_06_01/L4_TreeBorrows.lean:80`):
+with `DecidableEq TreeBorrowPerm` alone, `LawfulBEq TreeBorrowPerm` is synthesized
+via `instLawfulBEq` and `beq_iff_eq` holds. -/
+theorem treeBorrowPerm_beq_iff_eq (a b : TreeBorrowPerm) : (a == b) = true ↔ a = b := by simp
+
+/-- info: instLawfulBEq -/
+#guard_msgs in
+#synth LawfulBEq TreeBorrowPerm
+
+/-- The redundant structural `BEq TreeBorrowPerm` derived at
+`theory/Correspondence/V2026_06_01/L4_TreeBorrows.lean:80`. -/
+@[instance_reducible]
+def structuralBEqTreeBorrowPerm : BEq TreeBorrowPerm :=
+  ⟨fun a b =>
+    match a, b with
+    | .cell, .cell => true
+    | .reservedFrz true, .reservedFrz true => true
+    | .reservedFrz false, .reservedFrz false => true
+    | .reservedIM, .reservedIM => true
+    | .unique, .unique => true
+    | .frozen, .frozen => true
+    | .disabled, .disabled => true
+    | _, _ => false⟩
+
+section ShadowedTreeBorrowPerm
+attribute [local instance] structuralBEqTreeBorrowPerm
+
+-- Installing the redundant `BEq TreeBorrowPerm` shadows `instBEqOfDecidableEq`
+-- and breaks `LawfulBEq TreeBorrowPerm` synthesis.
+/--
+error: failed to synthesize
+  LawfulBEq TreeBorrowPerm
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+-/
+#guard_msgs (whitespace := lax) in
+#synth LawfulBEq TreeBorrowPerm
+
+end ShadowedTreeBorrowPerm
 
 end ShadowingDemo
 
@@ -4683,16 +5261,63 @@ end ShadowingDemo
 #guard_msgs (whitespace := lax) in
 #print axioms dyn_step_missing_receiver_ub
 
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_hit_free_poly_opaque' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_hit_free_poly_opaque
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.lookupCallee_trait_hit_cert' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms lookupCallee_trait_hit_cert
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_trait_cert_no_toList' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_trait_cert_no_toList
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalLayoutOf_v08_eq_v06_of_coherent' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalLayoutOf_v08_eq_v06_of_coherent
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.withBridgedV08Layouts_extends' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms withBridgedV08Layouts_extends
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.incoherence_breaks_dialect_agreement_canary' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms incoherence_breaks_dialect_agreement_canary
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.resolveVTableChain_mono' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms resolveVTableChain_mono
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalDynWithOpaqueCallees_preserved_of_narrow_check' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalDynWithOpaqueCallees_preserved_of_narrow_check
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_supertrait_chain' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_supertrait_chain
+
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 
 /-! ## Bottom-of-file axiom audit
 
 Traverses every constant this module adds (`Environment.constants.map₂`: the
 `Anneal.DemandCompilerQueryAndOpaqueCalleePrototype` namespace plus
-`deriving`-generated auxiliaries) and fails elaboration if any uses an axiom
-outside `[propext, Quot.sound]`. Non-vacuity:
-the auditor must flag `Classical.choice` (via `Classical.em`), `sorryAx`, and
-`Lean.ofReduceBool`, and must have covered a minimum number of constants and
+`deriving`-generated auxiliaries) and fails elaboration if:
+1. any declaration uses an axiom outside `[propext, Quot.sound]`, or
+2. any declaration is emitted outside the `Anneal.DemandCompilerQueryAndOpaqueCalleePrototype`
+   namespace (`leaked` check, catching orphan enumeration `T.ofNat` / `T.ofNat_ctorIdx`
+   collisions with `Trusted.*` at elaboration time).
+Non-vacuity: the auditor must flag `Classical.choice` (via `Classical.em`), `sorryAx`,
+and `Lean.ofReduceBool`, and must have covered a minimum number of constants and
 theorems. -/
 
 open Lean in
@@ -4709,16 +5334,26 @@ run_cmd do
   let mut constants : Nat := 0
   let mut inNamespace : Nat := 0
   let mut theorems : Nat := 0
+  let mut leaked : Array Name := #[]
   let mut bad : Array (Name × Array Name) := #[]
-  -- Every constant this module adds (including `deriving`-generated auxiliaries in
-  -- the derived types' namespaces) is audited.
   for (n, ci) in env.constants.map₂.toList do
     constants := constants + 1
-    if pfx.isPrefixOf ((Lean.privateToUserName? n).getD n) then inNamespace := inNamespace + 1
+    let un := (Lean.privateToUserName? n).getD n
+    if pfx.isPrefixOf un then
+      inNamespace := inNamespace + 1
+    else
+      let last := un.eraseMacroScopes.getString!
+      let isRealizedEq :=
+        last == "eq_def" || last == "splitter" || last == "else_eq" ||
+          last.startsWith "eq_" || last.startsWith "_sparseCasesOn_"
+      unless un.hasMacroScopes || isRealizedEq do
+        leaked := leaked.push un
     if ci matches .thmInfo _ then theorems := theorems + 1
     let f ← forbiddenOf n
     unless f.isEmpty do bad := bad.push (n, f)
   unless bad.isEmpty do
     throwError "axiom audit: forbidden axioms {bad}"
-  unless inNamespace ≥ 1200 && theorems ≥ 115 do
+  unless leaked.isEmpty do
+    throwError "namespace hygiene audit: constants declared outside {pfx}: {leaked}"
+  unless inNamespace ≥ 1400 && theorems ≥ 140 do
     throwError "axiom audit coverage too low: {constants} constants ({inNamespace} in namespace), {theorems} theorems"

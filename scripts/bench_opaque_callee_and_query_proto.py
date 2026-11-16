@@ -175,7 +175,10 @@ def coimport_check(tmp: Path, olean_root: Path) -> dict[str, Any]:
         proc = run_lean([str(probe)], extra_lean_path=[str(olean_root)])
         elapsed = time.monotonic() - t0
         output = (proc.stdout + proc.stderr).strip()
-        errors = [line for line in output.splitlines() if "error" in line]
+        errors = [
+            line for line in output.splitlines()
+            if any(k in line.lower() for k in ("error", "warning:", "panic", "sorry"))
+        ]
         ok = proc.returncode == 0 and not errors
         result[key] = {"ok": ok, "exit": proc.returncode, "errors": errors, "wall_s": elapsed}
         result["ok"] = result["ok"] and ok
@@ -736,10 +739,10 @@ def rust_string_literals(text: str) -> list[tuple[int, str]]:
                     if text[i] == "\n":
                         line += 1
                     i += 1
-        elif c in "rb" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
-            j = i + 1 if c == "r" else (i + 2 if text.startswith("br", i) else i + 1)
-            if c == "b" and not text.startswith("br", i):
-                # byte string b"..."
+        elif c in "rbc" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            j = i + 1 if c == "r" else (i + 2 if (text.startswith("br", i) or text.startswith("cr", i)) else i + 1)
+            if c in "bc" and not (text.startswith("br", i) or text.startswith("cr", i)):
+                # byte string b"..." or C-string c"..."
                 if j < n and text[j] == '"':
                     i = j
                     continue
@@ -767,14 +770,19 @@ def rust_string_literals(text: str) -> list[tuple[int, str]]:
                     nxt = text[j + 1]
                     if nxt == "\n":
                         line += 1
+                        buf.append("\n")
                         j += 2
                         while j < n and text[j] in " \t\r\n":
                             if text[j] == "\n":
                                 line += 1
+                                buf.append("\n")
                             j += 1
                         continue
                     if nxt == "u" and text.startswith("{", j + 2):
                         k = text.find("}", j + 3)
+                        if k < 0:
+                            j = n
+                            break
                         try:
                             buf.append(chr(int(text[j + 3:k], 16)))
                         except ValueError:

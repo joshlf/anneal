@@ -189,6 +189,21 @@ class AuditScannerTest(unittest.TestCase):
         f = bench.audit_rust_codegen_text(rust, "y.rs")
         self.assertEqual([x["line"] for x in f], [2])
 
+    def test_rust_c_strings_line_continuation_and_unclosed_unicode(self) -> None:
+        rust = (
+            'const A: &CStr = c"deriving BEq, DecidableEq";\n'
+            'const B: &CStr = cr#"deriving instance DecidableEq, BEq for T"#;\n'
+            'const C: &str = "inductive X where | a \\\n'
+            '    deriving BEq, DecidableEq";\n'
+            'const D: &str = "\\u{unclosed";\n'
+        )
+        f = bench.audit_rust_codegen_text(rust, "z.rs")
+        self.assertEqual([(x["line"], x["kind"]) for x in f], [
+            (1, "deriving_codegen"),
+            (2, "deriving_instance_codegen"),
+            (4, "deriving_codegen"),
+        ])
+
     def test_multiple_occurrences(self) -> None:
         text = ("inductive A where | a\n  deriving BEq, DecidableEq\n"
                 "structure B where\n  x : Nat\n  deriving DecidableEq, BEq\n"
@@ -292,11 +307,15 @@ class RepoConsistencyTest(unittest.TestCase):
         # Lean's enumeration `deriving instance DecidableEq` handler emits global
         # `T.ofNat` / `T.ofNat_ctorIdx` constants in the *Trusted* type's namespace,
         # which collide with `Anneal.Rustc.V2026_06_01.TraceCheck` (imported by the
-        # `Anneal` root). The nine enumeration types must use the prototype-local
-        # `decEqOfCtorIdxProto` instances instead.
+        # `Anneal` root) or any other module deriving `DecidableEq` for a `Trusted`
+        # enumeration type. All enumeration types must use prototype-local instances.
         text = PROTOTYPE.read_text(encoding="utf-8")
-        enums = ("AbiPassMode", "UintTy", "IntTy", "FloatTy", "Mutability", "Safety", "UnOp",
-                 "BinOp", "RetagKind")
+        proto_enums = ("AbiPassMode", "UintTy", "IntTy", "FloatTy", "Mutability", "Safety", "UnOp",
+                       "BinOp", "RetagKind")
+        all_trusted_enums = proto_enums + (
+            "AbstractByte", "TreeBorrowAccessKind", "TreeBorrowRelatedness",
+            "IeeeFormat", "FloatPtrWidth", "UnionSrcSliceResult", "RustIntrinsicKind",
+        )
         toks = bench.tokenize_lean(text)
         derived: list[str] = []
         for i, (kind, val, _) in enumerate(toks):
@@ -304,13 +323,56 @@ class RepoConsistencyTest(unittest.TestCase):
                 j = i + 2
                 while j < len(toks) and toks[j][1] != "for":
                     j += 1
-                if j + 1 < len(toks):
-                    derived.append(toks[j + 1][1])
+                if j < len(toks) and toks[j][1] == "for":
+                    j += 1
+                    while j < len(toks):
+                        while j < len(toks) and toks[j] == ("punct", "(", toks[j][2]):
+                            j += 1
+                        if j >= len(toks) or toks[j][0] != "ident":
+                            break
+                        derived.append(toks[j][1])
+                        j += 1
+                        while j < len(toks) and toks[j] == ("punct", ")", toks[j][2]):
+                            j += 1
+                        if j < len(toks) and toks[j] == ("punct", ",", toks[j][2]):
+                            j += 1
+                            continue
+                        break
         self.assertGreater(len(derived), 50)
         for target in derived:
-            self.assertNotIn(target.rsplit(".", 1)[-1], enums, target)
-        for e in enums:
-            self.assertIn(f"instDecidableEq{e}Proto", {v for k, v, _ in toks if k == "ident"}, e)
+            self.assertNotIn(target.rsplit(".", 1)[-1], all_trusted_enums, target)
+        ident_set = {v for k, v, _ in toks if k == "ident"}
+        for e in proto_enums:
+            self.assertIn(f"instDecidableEq{e}Proto", ident_set, e)
+
+    def test_b2_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "traitImpls_ofList",
+            "lookupCallee_hit_free_poly_opaque",
+            "collectMatchingTraitImplsWith",
+            "collectMatchingTraitImpls_eq_with",
+            "lookupCallee_trait_hit_cert",
+            "multiFullTbl_traitImpls",
+            "canary_free_poly_opaque_cert",
+            "canary_trait_cert_no_toList",
+            "bridgeLayout_iff_eq",
+            "isLayoutCoherent_of_schema_v06",
+            "withBridgedV08Layouts_isLayoutCoherent",
+            "evalLayoutOf_v08_eq_v06_of_coherent",
+            "isLayoutCoherent_preserved_of_v08_present",
+            "withBridgedV08Layouts_extends",
+            "incoherence_breaks_dialect_agreement_canary",
+            "evalVTableSupertraitLookup",
+            "resolveVTableChain",
+            "resolveVTableChain_mono",
+            "evalDynWithOpaqueCallees_preserved_of_narrow",
+            "evalDynWithOpaqueCallees_preserved_of_narrow_check",
+            "canary_dyn_supertrait_chain",
+            "treeBorrowPerm_beq_iff_eq",
+        ):
+            self.assertIn(name, ident_toks, f"missing B2 theorem: {name}")
 
     def test_b1_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")
