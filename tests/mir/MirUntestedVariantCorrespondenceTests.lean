@@ -76,8 +76,8 @@ Coverage manifest (checked by `scripts/audit_mir_coverage_matrix.py --check` and
 final `run_cmd`):
 -/
 -- @mir-variant-coverage StatementKind.constEvalCounter trusted=constEvalCounter_trusted_step_universal,constEvalCounter_stepMirFn_universal,constEvalCounter_nop_statement_equiv minirust=constEvalCounter_minirust_ops_corresponds,constEvalCounter_minirustSpec_fail_closed leanmiri=constEvalCounter_leanMiri_lockstep,constEvalCounter_leanMiri_nop_equiv positive=constEvalCounter_witness_runs,constEvalCounter_leanMiri_witness negative=constEvalCounter_witness_ub_not_masked,constEvalCounter_witness_minirustSpec_rejects
--- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi
--- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal,opaqueCast_trusted_placeTy_and_helpers_universal,opaqueCast_trusted_write_and_borrow_universal,opaqueCast_trusted_place_rw_with_decls minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move,opaqueCast_witness_place_rw_with_decls negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject,opaqueCast_witness_type_switch
+-- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_calling_conv_ub_corresponds positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi
+-- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal,opaqueCast_trusted_placeTy_and_helpers_universal,opaqueCast_trusted_write_and_borrow_universal,opaqueCast_trusted_place_rw_with_decls,opaqueCast_trusted_stmt_placeMention_and_deinit_universal minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move,opaqueCast_witness_place_rw_with_decls negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject,opaqueCast_witness_type_switch
 
 /-
 Source anchors (each is re-read verbatim from the pinned vendored file):
@@ -89,6 +89,8 @@ Source anchors (each is re-read verbatim from the pinned vendored file):
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Step.lean#let next := { currentLoc with statementIndex := currentLoc.statementIndex + 1 }
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/ExecutionMachine.lean#incrementConstEvalCounter := fun _ state => (state,.ok ())
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/ExecutionMachine.lean#tailCall := fun c terminator => MachineHooks.run (Call.evalTailCallTerminator calls c limits.callDispatch terminator)
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#unless h.sameConvention callerFnAbi calleeFnAbi do
+-- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#throw (.undefinedBehavior "caller/callee calling convention mismatch")
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#let args := evaluated.args.map fun arg => FnArg.Copy arg.copyFnArg
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#let frame ← h.popRaw choice
 -- @source-anchor lean-miri/vendor/Miri/Interpreter/Call.lean#let (ret, unwind) ← match frame.returnContinuation with
@@ -269,7 +271,8 @@ frame's return place and continuation, and require `cleanup` to return `.normal`
 (`Call.lean:445-446`). -/
 def initFnTailCall {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
     (state : StepState B P U M) (retAbiCompat : Bool := true)
-    (cleanupNormal : Bool := true) (argAbiCompat : Nat → Bool := fun _ => true) :
+    (cleanupNormal : Bool := true) (argAbiCompat : Nat → Bool := fun _ => true)
+    (sameConvention : Bool := true) :
     Except StepError (StepState B P U M) :=
   match state.frames.getLast? with
   | none => .error .emptyStack
@@ -277,6 +280,9 @@ def initFnTailCall {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
     match frame.returnContinuation with
     | .stop _ => .error (.invalidProgram "cannot tailcall as root of stack")
     | .goto ret unwind =>
+      if !sameConvention then
+        .error (.undefinedBehavior "caller/callee calling convention mismatch")
+      else
       match passArgsError argAbiCompat argCount 0 calleeArgCount with
       | some e => .error e
       | none =>
@@ -296,11 +302,12 @@ def initFnTailCall {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
 leave the frame index unchanged. -/
 def evalTailCallTerminator {B P U M : Type} (callee : B) (calleeArgCount argCount : Nat)
     (state : StepState B P U M) (retAbiCompat : Bool := true)
-    (cleanupNormal : Bool := true) (argAbiCompat : Nat → Bool := fun _ => true) :
+    (cleanupNormal : Bool := true) (argAbiCompat : Nat → Bool := fun _ => true)
+    (sameConvention : Bool := true) :
     Except StepError (StepState B P U M) :=
   let oldIndex := state.frames.length - 1
   match initFnTailCall callee calleeArgCount argCount state retAbiCompat cleanupNormal
-      argAbiCompat with
+      argAbiCompat sameConvention with
   | .error e => .error e
   | .ok state' =>
     if state'.frames.length - 1 == oldIndex then .ok state'
@@ -1370,7 +1377,36 @@ theorem tailCall_leanMiri_arg_abi_universal {B P U M : Type}
   have hfirst := passArgsError_first_mismatch compat n j hj hbad n 0 (Nat.zero_le j) (by omega)
     (fun x _ hx => hpre x hx)
   refine ⟨?_, rfl, passArgsError_all_ok _ n n 0 (by omega) (fun _ _ _ => rfl)⟩
-  simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hlast, hgoto, hfirst]
+  simp [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hlast, hgoto, hfirst]
+
+/-- **LeanMiri calling-convention mismatch UB correspondence (universal).** In Miri
+(`initStackFrame`, `Call.lean:254-255`), `unless h.sameConvention callerFnAbi calleeFnAbi`
+raises UB `"caller/callee calling convention mismatch"` before the per-argument loop; in
+Trusted (`resolveCallTarget` / `checkCalleeTargetCompatible`), an indirect tail call whose
+reified `FnPtrEntry` or linked `calleeBody` has a mismatched calling convention also faults
+with `MirStepNode.fail .ub`. -/
+theorem tailCall_leanMiri_calling_conv_ub_corresponds {B P U M : Type}
+    (m : LeanMiri.StepState B P U M) (callee : B) (k n : Nat)
+    (retAbiCompat cleanupNormal : Bool) (argAbiCompat : Nat → Bool)
+    (f : LeanMiri.Frame B P U) (ret : Option Nat) (u : U)
+    (hlast : m.frames.getLast? = some f) (hgoto : f.returnContinuation = .goto ret u)
+    (s : MachineState) (func : Operand) (argOps : List Operand) (span : String)
+    (callerBody : CapturedMir) (hnodirect : extractCalleeDefPath? func = none)
+    (p : ProvenancePtr) (l : List LocalSlot) (fnEntry : FnPtrEntry)
+    (h : evalOperand s.frame.locals func s.memory.borrows s.memory.globals callerBody.layouts
+        s.memory.callerLocals = .ok (.ptr p 8) l)
+    (hoff : p.offsetBytes = 0) (hbor : lookupBorrow s.memory.borrows p.tag = none)
+    (hfn : lookupFnPtr s.memory.fnPtrs p.allocId = some fnEntry)
+    (hcompat : fnEntryCompatibleWithCallSite fnEntry (length argOps)
+        (operandTy callerBody.localDecls callerBody.layouts func) = false) :
+    LeanMiri.evalTailCallTerminator callee k n m retAbiCompat cleanupNormal argAbiCompat false =
+        .error (.undefinedBehavior "caller/callee calling convention mismatch") ∧
+      (LeanMiri.StepError.undefinedBehavior "caller/callee calling convention mismatch").isUB =
+        true ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (some callerBody) = MirStepNode.fail .ub := by
+  refine ⟨?_, rfl, (tailCall_trusted_fail_closed_universal s func argOps span callerBody
+    hnodirect).2.2.2.2.1 p l fnEntry h hoff hbor hfn hcompat⟩
+  simp [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hlast, hgoto]
 
 
 
@@ -2000,7 +2036,8 @@ theorem opaqueCast_trusted_write_and_borrow_universal
     exact ⟨heq, by rw [heq, stripTransparentProjections]⟩
 
 /-- **Trusted place read/write with declarations (universal).** For any declaration table
-(the one `stepMirFn` passes), a read or write through `(_l as T).e.r` (`e` not a
+(the one `stepMirFn` passes) and any active-protector list, a read or write
+(`evalPlaceRead`, `writePlaceValue`, `evalPlaceWrite`) through `(_l as T).e.r` (`e` not a
 dereference) agrees with the cast-free place `_l.e.r` whenever neither place touches a union
 and the cast does not change the validation types (`placeTy` / `placeTyResolved` agree, e.g.
 when `T` is the declared type or the next projection fixes the type) — the type switch is
@@ -2008,6 +2045,7 @@ the *only* way an opaque cast is observable at a place (`opaqueCast_witness_type
 theorem opaqueCast_trusted_place_rw_with_decls
     (locals : List LocalSlot) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    (activeProtectors : List Nat)
     (l : Nat) (t : Ty) (e : ProjectionElem) (r : List ProjectionElem) (val : Value)
     (hnd : ∀ r', e :: r ≠ .deref :: r')
     (hu : placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: e :: r⟩ = false)
@@ -2018,19 +2056,132 @@ theorem opaqueCast_trusted_place_rw_with_decls
     evalPlaceRead locals ⟨l, .opaqueCast t :: e :: r⟩ borrows globals layouts callerLocals decls =
         evalPlaceRead locals ⟨l, e :: r⟩ borrows globals layouts callerLocals decls ∧
       writePlaceValue locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val decls layouts =
-        writePlaceValue locals borrows ⟨l, e :: r⟩ val decls layouts := by
+        writePlaceValue locals borrows ⟨l, e :: r⟩ val decls layouts ∧
+      evalPlaceWrite locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val activeProtectors decls
+          layouts =
+        evalPlaceWrite locals borrows ⟨l, e :: r⟩ val activeProtectors decls layouts := by
   have hread : ∀ v, readProjectedValue locals v (.opaqueCast t :: e :: r) =
       readProjectedValue locals v (e :: r) := fun v =>
     (opaqueCast_trusted_traversal_universal locals v v t (e :: r)).1
   have hwrite : ∀ v, writeProjectedValue locals v (.opaqueCast t :: e :: r) val =
       writeProjectedValue locals v (e :: r) val := fun v =>
     (opaqueCast_trusted_traversal_universal locals v val t (e :: r)).2.1
-  cases e with
-  | deref => exact absurd rfl (hnd r)
-  | _ =>
-    constructor <;>
-      simp only [evalPlaceRead, writePlaceValue, readProjectedForLocal, writeProjectedForLocal,
-        hu, hu', hty, htyR, hread, hwrite]
+  have hprot : ∀ (ps : List Nat) (q : List ProjectionElem),
+      hasProtectedWriteConflict borrows ps l none (.opaqueCast t :: q) =
+        hasProtectedWriteConflict borrows ps l none q := by
+    intro ps q
+    induction borrows with
+    | nil => rfl
+    | cons b bs ih =>
+      simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap,
+        stripTransparentProjections, ih]
+  have hres_er :
+      (match resolveBorrowProjectionElems locals (.opaqueCast t :: e :: r) with
+       | some rp => rp
+       | none => .opaqueCast t :: e :: r) =
+      .opaqueCast t ::
+        (match resolveBorrowProjectionElems locals (e :: r) with
+         | some rp => rp
+         | none => e :: r) := by
+    simp only [resolveBorrowProjectionElems]
+    cases resolveBorrowProjectionElems locals (e :: r) <;> rfl
+  have hwv :
+      writePlaceValue locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val decls layouts =
+        writePlaceValue locals borrows ⟨l, e :: r⟩ val decls layouts := by
+    cases e with
+    | deref => exact absurd rfl (hnd r)
+    | _ =>
+      cases decls <;>
+        simp only [writePlaceValue, writeProjectedForLocal, hu, hu', hty, hwrite]
+  refine ⟨?_, hwv, ?_⟩
+  · cases e with
+    | deref => exact absurd rfl (hnd r)
+    | _ =>
+      simp only [evalPlaceRead, readProjectedForLocal, hu, hu', htyR, hread]
+  · cases activeProtectors with
+    | nil => exact hwv
+    | cons ph pt =>
+      cases e with
+      | deref => exact absurd rfl (hnd r)
+      | _ =>
+        change
+          (match hasProtectedWriteConflict borrows (ph :: pt) l none
+              (match resolveBorrowProjectionElems locals (.opaqueCast t :: _ :: r) with
+               | some rp => rp
+               | none => .opaqueCast t :: _ :: r) with
+           | true => PlaceWriteResult.ub
+           | false =>
+             writePlaceValue locals borrows ⟨l, .opaqueCast t :: _ :: r⟩ val decls layouts) =
+          (match hasProtectedWriteConflict borrows (ph :: pt) l none
+              (match resolveBorrowProjectionElems locals (_ :: r) with
+               | some rp => rp
+               | none => _ :: r) with
+           | true => PlaceWriteResult.ub
+           | false => writePlaceValue locals borrows ⟨l, _ :: r⟩ val decls layouts)
+        rw [hres_er, hprot, hwv]
+
+private theorem projectionHasDeref_erase : ∀ p : List ProjectionElem,
+    projectionHasDeref (eraseOpaqueCasts p) = projectionHasDeref p
+  | [] => rfl
+  | e :: rest => by
+    have ih := projectionHasDeref_erase rest
+    cases e <;> simp only [eraseOpaqueCasts, projectionHasDeref, ih]
+
+private theorem placeIndexLocalsInit_erase (locals : List LocalSlot) :
+    ∀ p : List ProjectionElem,
+      placeIndexLocalsInit locals (eraseOpaqueCasts p) = placeIndexLocalsInit locals p
+  | [] => rfl
+  | e :: rest => by
+    have ih := placeIndexLocalsInit_erase locals rest
+    cases e <;> simp only [eraseOpaqueCasts, placeIndexLocalsInit, ih]
+
+/-- **Trusted `placeMention` and `deinit` statement semantics on `.opaqueCast` (universal).**
+`StatementKind.placeMention` is completely invariant under erasing `.opaqueCast` at any
+depth (even with `.deref` or `.index` projections). By contrast, `StatementKind.deinit`
+distinguishes root `[]` from a projected path `.opaqueCast t :: rest`: on an initialized
+root `get? s.frame.locals l = some (.init rootVal)`, `.deinit ⟨l, .opaqueCast t :: rest⟩`
+evaluates `readProjectedValue s.frame.locals rootVal (eraseOpaqueCasts rest)` (advancing the
+PC without de-initializing `l` on `.ok`), whereas on an `.uninit` root it faults with
+`MirStepNode.fail .ub` (unlike root `.deinit ⟨l, []⟩`, which steps). -/
+theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
+    (s : MachineState) (decls : List LocalDecl) (layouts : LayoutTable)
+    (l : Nat) (t : Ty) (span : String) (rootSlot : LocalSlot) :
+    (∀ p : List ProjectionElem,
+      placeMentionOperandsInit s.frame.locals rootSlot (eraseOpaqueCasts p) =
+        placeMentionOperandsInit s.frame.locals rootSlot p ∧
+      evalStmt s ⟨.placeMention ⟨l, p⟩, span⟩ decls layouts =
+        evalStmt s ⟨.placeMention ⟨l, eraseOpaqueCasts p⟩, span⟩ decls layouts) ∧
+    (∀ (rootVal : Value) (rest : List ProjectionElem),
+      get? s.frame.locals l = some (.init rootVal) →
+      evalStmt s ⟨.deinit ⟨l, .opaqueCast t :: rest⟩, span⟩ decls layouts =
+        match readProjectedValue s.frame.locals rootVal (eraseOpaqueCasts rest) with
+        | .ok _ => MirStepNode.step (advanceStmt s s.frame.locals)
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported) ∧
+    (∀ rest : List ProjectionElem,
+      get? s.frame.locals l = some .uninit →
+      evalStmt s ⟨.deinit ⟨l, .opaqueCast t :: rest⟩, span⟩ decls layouts =
+        MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro p
+    have hm : ∀ slot, placeMentionOperandsInit s.frame.locals slot (eraseOpaqueCasts p) =
+        placeMentionOperandsInit s.frame.locals slot p := by
+      intro slot
+      simp only [placeMentionOperandsInit, projectionHasDeref_erase, placeIndexLocalsInit_erase]
+    refine ⟨hm rootSlot, ?_⟩
+    simp only [evalStmt]
+    cases get? s.frame.locals l with
+    | none => rfl
+    | some slot =>
+      cases slot <;> simp only [hm]
+  · intro rootVal rest hv
+    have hr := (opaqueCast_trusted_traversal_universal s.frame.locals rootVal rootVal t rest).2.2.1
+      (.opaqueCast t :: rest)
+    simp only [eraseOpaqueCasts] at hr
+    simp only [evalStmt, hv, hr]
+    rfl
+  · intro rest huninit
+    simp only [evalStmt, huninit]
 
 private theorem borrowProjSteps_erase : ∀ p : List ProjectionElem,
     MiniRustSpec.Correspondence.borrowProjSteps (eraseOpaqueCasts p) =
@@ -2153,25 +2304,49 @@ theorem opaqueCast_witness_place_rw_with_decls :
           wLayouts ∧
       writePlaceValue ocLocals [] (ocField 1) (.scalar ⟨5, 4⟩) [u32Decl "_0", pairDecl] wLayouts =
         .ok [.uninit, .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩])] :=
-  (opaqueCast_trusted_place_rw_with_decls ocLocals [] [] wLayouts [] [u32Decl "_0", pairDecl] 1
+  (opaqueCast_trusted_place_rw_with_decls ocLocals [] [] wLayouts [] [u32Decl "_0", pairDecl] [] 1
       tyPair (.field 1 tyU32) [] (.scalar ⟨5, 4⟩) (fun _ h => by cases h) rfl rfl rfl rfl).elim
-    fun hr hw => ⟨rfl, hr, hw, rfl⟩
+    fun hr hrest => ⟨rfl, hr, hrest.1, rfl⟩
 
-/-- **Documented type switch.** The opaque cast is observable exactly through typing: casting
-the `(u32, u32)` local to `u8` switches the static place type (`placeTy`, which drives write
-validation, and `placeTyResolved`, which drives read validation) from the declared pair type
-to `u8`, while the value read is unchanged — so the agreement hypotheses of
-`opaqueCast_trusted_place_rw_with_decls` are genuinely needed. -/
+def tyBool : Ty := { kind := .bool, layoutIdx := 0 }
+
+def tyU8Arr2 : Ty := { kind := .array (.uint .u8) 2, layoutIdx := 0 }
+
+def tyBoolArr2 : Ty := { kind := .array .bool 2, layoutIdx := 0 }
+
+def u8Arr2Decl : LocalDecl := { mutability := .mut, ty := tyU8Arr2, debugName := some "arr" }
+
+def u8Arr2Locals : List LocalSlot := [.uninit, .init (.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨0, 1⟩])]
+
+/-- **Documented type switch (including `.ok` vs `.ub` runtime validity flip).** The opaque
+cast switches `placeTy` (write validation) and `placeTyResolved` (read validation). When an
+array `[u8; 2]` local holding `[2_u8, 0_u8]` is indexed at `0` (`e = .constantIndex 0 1 false`,
+which inherits its element type from the base type), the cast-free read and write of `2_u8`
+succeed at `tyU8`, whereas pre-casting the base via `.opaqueCast tyBoolArr2` switches the
+element type to `bool` (`tyBool`) so `validateValueForTy?` rejects `2` and both
+`evalPlaceRead` and `writePlaceValue` fault with `.ub` — proving the `hty`/`htyR` agreement
+hypotheses of `opaqueCast_trusted_place_rw_with_decls` are necessary even for non-empty
+`e :: r` tails. -/
 theorem opaqueCast_witness_type_switch :
     placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ = some tyU8 ∧
       placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ = some tyPair ∧
       placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ ≠
         placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ ∧
-      evalPlaceRead ocLocals ⟨1, [.opaqueCast tyU8]⟩ [] [] wLayouts [] [u32Decl "_0", pairDecl] =
-        evalPlaceRead ocLocals ⟨1, [.opaqueCast tyPair]⟩ [] [] wLayouts [] [u32Decl "_0", pairDecl] := by
+      evalPlaceRead u8Arr2Locals ⟨1, [.constantIndex 0 1 false]⟩ [] [] wLayouts []
+          [u32Decl "_0", u8Arr2Decl] =
+        .ok (.scalar ⟨2, 1⟩) u8Arr2Locals ∧
+      evalPlaceRead u8Arr2Locals ⟨1, [.opaqueCast tyBoolArr2, .constantIndex 0 1 false]⟩ [] []
+          wLayouts [] [u32Decl "_0", u8Arr2Decl] =
+        .ub ∧
+      writePlaceValue u8Arr2Locals [] ⟨1, [.constantIndex 0 1 false]⟩ (.scalar ⟨2, 1⟩)
+          [u32Decl "_0", u8Arr2Decl] wLayouts =
+        .ok u8Arr2Locals ∧
+      writePlaceValue u8Arr2Locals [] ⟨1, [.opaqueCast tyBoolArr2, .constantIndex 0 1 false]⟩
+          (.scalar ⟨2, 1⟩) [u32Decl "_0", u8Arr2Decl] wLayouts =
+        .ub := by
   have h1 : placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ = some tyU8 := rfl
   have h2 : placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ = some tyPair := rfl
-  refine ⟨h1, h2, ?_, rfl⟩
+  refine ⟨h1, h2, ?_, rfl, rfl, rfl, rfl⟩
   rw [h1, h2]
   intro h
   simp [tyU8, tyPair] at h
@@ -2283,7 +2458,8 @@ run_cmd do
        ("minirust", [`tailCall_minirust_corresponds]),
        ("leanmiri", [`tailCall_leanMiri_shape_lockstep, `tailCall_leanMiri_root_stop_diverges,
           `tailCall_leanMiri_arity_ub, `tailCall_leanMiri_ret_abi_and_cleanup_universal,
-          `tailCall_leanMiri_arg_abi_universal]),
+          `tailCall_leanMiri_arg_abi_universal,
+          `tailCall_leanMiri_calling_conv_ub_corresponds]),
        ("positive", [`tailCall_leanMiri_witness, `tailCall_witness_nested_runs, `tailCall_witness_root_runs,
           `tailCall_witness_external, `tailCall_witness_indirect_and_zst]),
        ("negative", [`tailCall_witness_ub_cases, `tailCall_witness_direct_arity_divergence,
@@ -2294,7 +2470,8 @@ run_cmd do
       [("trusted", [`opaqueCast_trusted_traversal_universal, `opaqueCast_trusted_retype_universal,
           `opaqueCast_trusted_overlap_universal, `opaqueCast_trusted_place_read_universal,
           `opaqueCast_trusted_placeTy_and_helpers_universal,
-          `opaqueCast_trusted_write_and_borrow_universal, `opaqueCast_trusted_place_rw_with_decls]),
+          `opaqueCast_trusted_write_and_borrow_universal, `opaqueCast_trusted_place_rw_with_decls,
+          `opaqueCast_trusted_stmt_placeMention_and_deinit_universal]),
        ("minirust", [`opaqueCast_minirust_corresponds]),
        ("leanmiri", [`opaqueCast_leanMiri_phase_boundary]),
        ("positive", [`opaqueCast_witness_read_write, `opaqueCast_witness_projected_move,

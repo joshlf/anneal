@@ -666,7 +666,7 @@ def _strip_rust_comments_and_strings(rs_text: str) -> str:
     out: list[str] = []
     i = 0
     n = len(rs_text)
-    raw_str_re = re.compile(r'(?<![\w\'"])b?r(#*)"')
+    raw_str_re = re.compile(r'(?<![\w\'"])[bc]?r(#*)"')
     char_re = re.compile(r"'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]{1,6}\}|.)|[^\\'\n])'")
     while i < n:
         if rs_text.startswith("//", i):
@@ -747,6 +747,7 @@ def _extract_rust_fn_units(rs_text: str) -> list[tuple[str, list[str], str]]:
         idx = m.end() - 1
         paren_depth = 0
         angle_depth = 0
+        bracket_depth = 0
         body_start = -1
         while idx < n:
             ch = cleaned[idx]
@@ -754,14 +755,18 @@ def _extract_rust_fn_units(rs_text: str) -> list[tuple[str, list[str], str]]:
                 paren_depth += 1
             elif ch == ")":
                 paren_depth = max(0, paren_depth - 1)
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                bracket_depth = max(0, bracket_depth - 1)
             elif ch == "<":
                 angle_depth += 1
             elif ch == ">" and (idx == 0 or cleaned[idx - 1] != "-"):
                 angle_depth = max(0, angle_depth - 1)
-            elif ch == ";" and paren_depth == 0 and angle_depth == 0:
+            elif ch == ";" and paren_depth == 0 and angle_depth == 0 and bracket_depth == 0:
                 pos = idx + 1
                 break
-            elif ch == "{" and paren_depth == 0:
+            elif ch == "{" and paren_depth == 0 and bracket_depth == 0:
                 body_start = idx
                 break
             idx += 1

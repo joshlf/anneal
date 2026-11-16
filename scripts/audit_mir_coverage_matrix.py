@@ -362,11 +362,22 @@ pub fn probe(p: *const [u8]) -> (*const (), usize) {
 /* impl<T: ?Sized> Ghost<T> { fn ghost() { core::mem::size_of_val(&0); } } */
 pub fn probe(p: *const u8, n: usize) -> usize {
     let _msg = "http://example.com size_of_val T: ?Sized ptr::from_raw_parts";
+    let _cstr = cr#"raw c string with " quote and size_of_val"#;
     let s = unsafe { core::slice::from_raw_parts(p, n) };
     s.len()
 }
 """,
         False,
+    ),
+    BlockerProbe(
+        "unsized_qsized_returning_array",
+        """
+pub fn probe<T: ?Sized>(_t: &T, p: *const u8, n: usize) -> [usize; 2] {
+    let _w = core::ptr::slice_from_raw_parts(p, n);
+    [n, 0]
+}
+""",
+        True,
     ),
 )
 
@@ -1233,7 +1244,15 @@ class _Audit:
                 verified_decls = [d for d in d_decls if d.kind == "theorem" and d.written_name == "verified"]
                 if not verified_decls:
                     res.errors.append(f"{rel}: missing `theorem verified`")
+                elif len(verified_decls) > 1:
+                    res.errors.append(f"{rel}: multiple `theorem verified` declarations ({len(verified_decls)})")
+                expected_verified_qname = f"Proof.{crate}.{item}.verified"
                 for d in verified_decls:
+                    if d.qualified_name != expected_verified_qname:
+                        res.errors.append(
+                            f"{rel}: `theorem verified` must be declared in `namespace Proof.{crate}.{item}` "
+                            f"(found `{d.qualified_name}`)"
+                        )
                     # The `verified` statement must stay exactly the generated obligation claim type
                     # (statement-origin isolation: no `Anneal.*` symbol may appear in it).
                     header = " ".join("\n".join(d_lines[d.start_line : d.end_line]).split(":=", 1)[0].split())
@@ -1244,18 +1263,31 @@ class _Audit:
                         )
                 companions: list[str] = []
                 connected: list[str] = []
+                nontrivial_ops: list[str] = []
                 connect_re = re.compile(
                     r"\bMir\." + re.escape(crate) + r"\." + re.escape(item) + r"\b|\bverified\b"
                     r"|\bSpecs\." + re.escape(crate) + r"\." + re.escape(item) + r"\b"
                 )
+                lens_op_re = re.compile(
+                    r"\b(?:splitAt|of_splitAt|DisjointSlice|takeElems|dropElems|elemOffset|elemPtr"
+                    r"|evalSliceFatPtrDerefBorrow)\b"
+                )
                 for d in d_decls:
                     if d.kind != "theorem" or d.written_name == "verified":
                         continue
-                    body = "\n".join(d_lines[d.start_line : d.end_line])
+                    span_lines = list(d_lines[d.start_line : d.end_line])
+                    if span_lines:
+                        m_decl = _DECL_RE.match(span_lines[0])
+                        if m_decl and m_decl.group("name"):
+                            s_i, e_i = m_decl.span("name")
+                            span_lines[0] = span_lines[0][:s_i] + (" " * (e_i - s_i)) + span_lines[0][e_i:]
+                    body = "\n".join(span_lines)
                     if lens_re.search(body) and wide_re.search(body):
                         companions.append(d.written_name)
                         if connect_re.search(body):
                             connected.append(d.written_name)
+                            if lens_op_re.search(body):
+                                nontrivial_ops.append(d.written_name)
                 if not companions:
                     res.errors.append(
                         f"{rel}: no companion theorem referencing `WidePtrVal` and one of {list(REQUIRED_LENS_DEFINITIONS)}"
@@ -1264,6 +1296,12 @@ class _Audit:
                     res.errors.append(
                         f"{rel}: no slice-lens companion theorem is connected to the verified function "
                         f"(it must mention `Mir.{crate}.{item}`, `Specs.{crate}.{item}`, or `verified`)"
+                    )
+                elif not nontrivial_ops:
+                    res.errors.append(
+                        f"{rel}: connected slice-lens companion theorem does not use any slice window/split/disjointness "
+                        "operation (`splitAt`, `of_splitAt`, `DisjointSlice`, `takeElems`, `dropElems`, `elemOffset`, "
+                        "`elemPtr`, or `evalSliceFatPtrDerefBorrow`)"
                     )
                 dogfood_report[rel] = companions
         res.details = {"definitions": found_defs, "lemmas": found_lemmas, "dogfood_companions": dogfood_report}

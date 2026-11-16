@@ -333,6 +333,23 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertEqual([u[0] for u in b_units], ["scan", "after"])
         self.assertTrue(any("size_of_val" in stmt for stmt in b_units[1][1]))
         self.assertIn("?Sized", b_units[1][2])
+        # Array `[T; N]` return/where types must not be mistaken for `;`-terminated trait method
+        # declarations, and raw C-string literals `cr#"..."#` must not open unbalanced strings.
+        arr_and_cr = """
+        pub fn ret_array<T: ?Sized>(_t: &T, p: *const u8, n: usize) -> [usize; 2] {
+            let _cs = cr#"raw C string with " quote and size_of_val"#;
+            let _w = core::ptr::slice_from_raw_parts(p, n);
+            [n, 0]
+        }
+        pub fn after_arr(p: *const u8, n: usize) -> [u8; 4] {
+            let _s = unsafe { core::slice::from_raw_parts(p, n) };
+            [0; 4]
+        }
+        """
+        a_units = suite._extract_rust_fn_units(arr_and_cr)
+        self.assertEqual([u[0] for u in a_units], ["ret_array", "after_arr"])
+        self.assertIn("?Sized", a_units[0][2])
+        self.assertFalse(any("size_of_val" in stmt for stmt in a_units[0][1]))
 
     def test_correspondence_divergence_switch_to_pass_detection(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)

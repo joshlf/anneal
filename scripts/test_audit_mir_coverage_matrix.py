@@ -634,14 +634,36 @@ class LensAndBlockerTests(AuditFixtureTestCase):
         rel = "examples/fxfs-storage-boundary/anneal/proofs/Proof/FxfsStorageBoundary/vmo_subslice_bounds_valid.lean"
         # A generic lens fact that never mentions the item's MIR body, its spec, or `verified`.
         (self.root / rel).write_text(
+            "namespace Proof.FxfsStorageBoundary.vmo_subslice_bounds_valid\n"
             "theorem verified : StatefulVerificationResult "
             "Obligations.FxfsStorageBoundary.vmo_subslice_bounds_valid.statefulClaim := by\n  exact x\n\n"
-            "theorem lens_only {w : WidePtrVal} : SliceTypedAt c w [] b := by\n  exact h\n",
+            "theorem lens_only {w : WidePtrVal} : SliceTypedAt c w [] b := by\n  exact h\n"
+            "end Proof.FxfsStorageBoundary.vmo_subslice_bounds_valid\n",
             encoding="utf-8",
         )
         report = self.run_checks()
         self.assert_only_failures(report, {"d_slice_lens_declarations"})
         self.assert_error(report, "d_slice_lens_declarations", f"{rel}: no slice-lens companion theorem is connected")
+
+        # Even if connected to `Specs.<Crate>.<item>`, a pass-through companion that never uses
+        # any slice split/subslice/disjointness operation must be rejected.
+        (self.root / rel).write_text(
+            "namespace Proof.FxfsStorageBoundary.vmo_subslice_bounds_valid\n"
+            "theorem verified : StatefulVerificationResult "
+            "Obligations.FxfsStorageBoundary.vmo_subslice_bounds_valid.statefulClaim := by\n  exact x\n\n"
+            "theorem pass_through {w : WidePtrVal} (h : SliceTypedAt c w [] b) :\n"
+            "    SliceTypedAt c w [] b ∧ Specs.FxfsStorageBoundary.vmo_subslice_bounds_valid.pre [] = "
+            "Specs.FxfsStorageBoundary.vmo_subslice_bounds_valid.pre [] := ⟨h, rfl⟩\n"
+            "end Proof.FxfsStorageBoundary.vmo_subslice_bounds_valid\n",
+            encoding="utf-8",
+        )
+        report = self.run_checks()
+        self.assert_only_failures(report, {"d_slice_lens_declarations"})
+        self.assert_error(
+            report,
+            "d_slice_lens_declarations",
+            f"{rel}: connected slice-lens companion theorem does not use any slice window/split/disjointness operation",
+        )
 
     def test_dogfood_verified_signature_is_pinned(self) -> None:
         self._install_dogfood()
@@ -654,6 +676,18 @@ class LensAndBlockerTests(AuditFixtureTestCase):
         report = self.run_checks()
         self.assert_only_failures(report, {"d_slice_lens_declarations"})
         self.assert_error(report, "d_slice_lens_declarations", f"{rel}: `theorem verified` must state")
+        # Declaring `verified` in the wrong namespace is rejected too.
+        self.edit(
+            rel,
+            "namespace Proof.FuchsiaUsercopy.assume_initialized_until_split_len",
+            "namespace Proof.FuchsiaUsercopy.wrong_item",
+        )
+        report = self.run_checks()
+        self.assert_error(
+            report,
+            "d_slice_lens_declarations",
+            f"{rel}: `theorem verified` must be declared in `namespace Proof.FuchsiaUsercopy.assume_initialized_until_split_len`",
+        )
         # A different obligation's claim is rejected too.
         self.assertFalse(
             audit._verified_signature_ok(
