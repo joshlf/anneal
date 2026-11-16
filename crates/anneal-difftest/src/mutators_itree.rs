@@ -19,13 +19,22 @@
 //! `SwitchInt` + `TerminatorKind::Call` without unmodeled `core::num` or
 //! `core::hint::black_box` intrinsic calls.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use arbitrary::Unstructured;
 use proc_macro2::{Ident, TokenStream, TokenTree};
 use quote::{format_ident, quote};
+use syn::visit::{self, Visit};
 use syn::visit_mut::{self, VisitMut};
-use syn::{Attribute, Block, Expr, File, FnArg, Item, Pat, ReturnType, Stmt, Type};
+use syn::{Attribute, BinOp, Block, Expr, File, FnArg, Item, Lit, Pat, ReturnType, Stmt, Type};
 
+pub use crate::input_gen::{
+    ArgPinConstraint, ArgPinFallbackReason, ConcolicBranchGuard, ConcolicTrialPhase,
+    ConcolicTrialPlan, RelaxPinResult, arg_pin_term, flip_branch_guard, neg_arg_pin_term,
+    negate_arg_pin, pin_term, relax_pin_constraint,
+};
+use crate::input_gen::{EnvScheduleGenerator, MirInputDictionary, ScalarLayout};
+use crate::instrument::EnvSchedule;
 use crate::mutators_miri::DetRng;
 
 /// Output candidate produced by [`generate_itree_batch`].
@@ -87,7 +96,8 @@ fn returns_u32(output: &ReturnType) -> bool {
     }
 }
 
-fn first_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
+fn collect_u32_param_idents(func: &syn::ItemFn) -> Vec<Ident> {
+    let mut idents = Vec::new();
     for input in &func.sig.inputs {
         if let FnArg::Typed(pat_ty) = input
             && matches!(
@@ -96,11 +106,35 @@ fn first_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
             )
             && let Pat::Ident(pat_id) = pat_ty.pat.as_ref()
         {
-            let id = &pat_id.ident;
-            return syn::parse_quote!(#id);
+            idents.push(pat_id.ident.clone());
         }
     }
+    idents
+}
+
+fn first_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
+    let idents = collect_u32_param_idents(func);
+    if let Some(id) = idents.first() {
+        return syn::parse_quote!(#id);
+    }
     syn::parse_quote!(#fallback)
+}
+
+fn second_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
+    let idents = collect_u32_param_idents(func);
+    if let Some(id) = idents.get(1).or_else(|| idents.first()) {
+        return syn::parse_quote!(#id);
+    }
+    syn::parse_quote!(#fallback)
+}
+
+fn combined_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
+    let idents = collect_u32_param_idents(func);
+    match idents.as_slice() {
+        [p0, p1, ..] => syn::parse_quote!(#p0 ^ #p1),
+        [p0] => syn::parse_quote!(#p0),
+        [] => syn::parse_quote!(#fallback),
+    }
 }
 
 fn target_fn_index(file: &File) -> Option<usize> {
@@ -233,12 +267,13 @@ impl ItreeAstMutator for CallBoundaryOutliner {
             if let Some(idx) = target_idx
                 && let Item::Fn(func) = &mut file.items[idx]
             {
-                let arg_expr = first_u32_param_expr(func, k_const);
+                let arg0_expr = first_u32_param_expr(func, k_const);
+                let arg1_expr = second_u32_param_expr(func, k_const);
                 let stage1_local = format_ident!("__itree_call_s1_{}", tag);
                 let local_ident = format_ident!("__itree_call_res_{}", tag);
                 let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #stage1_local: u32 = #helper_ident(#arg_expr, #k_const);
-                    let #local_ident: u32 = #stage2_ident(#stage1_local, #k_const);
+                    let #stage1_local: u32 = #helper_ident(#arg0_expr, #arg1_expr);
+                    let #local_ident: u32 = #stage2_ident(#stage1_local, #arg1_expr ^ #k_const);
                 };
                 weave_into_fn_body(func, injected, &local_ident);
             }
@@ -258,10 +293,11 @@ impl ItreeAstMutator for CallBoundaryOutliner {
             if let Some(idx) = target_idx
                 && let Item::Fn(func) = &mut file.items[idx]
             {
-                let arg_expr = first_u32_param_expr(func, k_const);
+                let arg0_expr = first_u32_param_expr(func, k_const);
+                let arg1_expr = second_u32_param_expr(func, k_const);
                 let local_ident = format_ident!("__itree_call_res_{}", tag);
                 let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #local_ident: u32 = #helper_ident(#arg_expr, #k_const);
+                    let #local_ident: u32 = #helper_ident(#arg0_expr, #arg1_expr);
                 };
                 weave_into_fn_body(func, injected, &local_ident);
             }
@@ -412,7 +448,7 @@ impl ItreeAstMutator for ExtOracleInjector {
         if let Some(idx) = target_idx
             && let Item::Fn(func) = &mut file.items[idx]
         {
-            let arg_expr = first_u32_param_expr(func, mask);
+            let arg_expr = combined_u32_param_expr(func, mask);
             let ans_ident = format_ident!("__itree_oracle_ans_{}", tag);
             let injected: Vec<Stmt> = syn::parse_quote! {
                 let #ans_ident: u32 = #oracle_ident(#arg_expr);
@@ -804,6 +840,649 @@ pub fn generate_itree_batch(
     out
 }
 
+/// Static call-site descriptor extracted from an ITree candidate's root function
+/// by [`extract_itree_call_site_pins`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItreeCallSiteDescriptor {
+    /// Zero-based call slot index in AST traversal order.
+    pub slot_id: usize,
+    /// Unprefixed external callee name (`ext_oracle`, `__anneal_ext_oracle_*`, `__anneal_itree_outlined_*`).
+    pub callee: String,
+    /// Number of arguments passed at the call site (`0` for 0-arg calls).
+    pub arity: usize,
+    /// Root parameter dependencies for each argument position (choose the last/secondary
+    /// parameter when an argument combines `magic ^ payload_len`, so an unpinned
+    /// secondary parameter remains steerable when `magic` is locked by a prefix guard).
+    pub arg_param_sources: Vec<Option<String>>,
+    /// All root parameter names mentioned in each argument expression.
+    pub arg_all_params: Vec<Vec<String>>,
+    /// Enclosing `switchInt` / `if` / `match` prefix branch guards gating this call site.
+    pub prefix_guards: Vec<ConcolicBranchGuard>,
+}
+
+struct ExprIdentCollector<'a> {
+    root_params: &'a BTreeSet<String>,
+    local_deps: &'a BTreeMap<String, Vec<String>>,
+    found: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for ExprIdentCollector<'_> {
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if node.leading_colon.is_none() && node.segments.len() == 1 {
+            let name = node.segments[0].ident.to_string();
+            if self.root_params.contains(&name) {
+                if !self.found.contains(&name) {
+                    self.found.push(name);
+                }
+            } else if let Some(deps) = self.local_deps.get(&name) {
+                for dep in deps {
+                    if !self.found.contains(dep) {
+                        self.found.push(dep.clone());
+                    }
+                }
+            }
+        }
+        visit::visit_path(self, node);
+    }
+}
+
+fn collect_expr_param_deps(
+    expr: &Expr,
+    root_params: &BTreeSet<String>,
+    local_deps: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut collector = ExprIdentCollector {
+        root_params,
+        local_deps,
+        found: Vec::new(),
+    };
+    collector.visit_expr(expr);
+    collector.found
+}
+
+fn parse_lit_u128(expr: &Expr) -> Option<u128> {
+    match expr {
+        Expr::Lit(syn::ExprLit {
+            lit: Lit::Int(lit_int),
+            ..
+        }) => lit_int.base10_parse::<u128>().ok(),
+        Expr::Paren(p) => parse_lit_u128(&p.expr),
+        _ => None,
+    }
+}
+
+fn extract_cond_branch_guard(
+    cond: &Expr,
+    branch_id: usize,
+    taken: bool,
+    root_params: &BTreeSet<String>,
+    local_deps: &BTreeMap<String, Vec<String>>,
+) -> Option<ConcolicBranchGuard> {
+    let Expr::Binary(bin) = cond else {
+        return None;
+    };
+    let lhs_params = collect_expr_param_deps(&bin.left, root_params, local_deps);
+    let rhs_params = collect_expr_param_deps(&bin.right, root_params, local_deps);
+    let (field_name, lit_val) = if let Some(val) = parse_lit_u128(&bin.right) {
+        (lhs_params.first().cloned(), val)
+    } else if let Some(val) = parse_lit_u128(&bin.left) {
+        (rhs_params.first().cloned(), val)
+    } else {
+        return None;
+    };
+    let fname = field_name?;
+    let target_bits = match bin.op {
+        BinOp::Eq(_) => lit_val,
+        BinOp::Gt(_) => lit_val.saturating_add(1),
+        BinOp::Ge(_) => lit_val,
+        BinOp::Lt(_) => lit_val.saturating_sub(1),
+        BinOp::Le(_) => lit_val,
+        _ => lit_val,
+    };
+    let concrete_bits = if taken {
+        target_bits
+    } else {
+        target_bits.wrapping_add(1)
+    };
+    Some(ConcolicBranchGuard {
+        branch_id,
+        taken,
+        taken_tag: u32::from(taken),
+        field_name: Some(fname),
+        concrete_bits,
+        target_bits,
+        bit_width: 32,
+    })
+}
+
+struct CallSiteExtractor<'a> {
+    ext_callees: &'a BTreeSet<String>,
+    root_params: BTreeSet<String>,
+    local_deps: BTreeMap<String, Vec<String>>,
+    active_guards: Vec<ConcolicBranchGuard>,
+    next_branch_id: usize,
+    sites: Vec<ItreeCallSiteDescriptor>,
+}
+
+impl CallSiteExtractor<'_> {
+    fn select_primary_source(&self, params: &[String]) -> Option<String> {
+        let locked_by_prefix: BTreeSet<&str> = self
+            .active_guards
+            .iter()
+            .filter_map(|g| g.field_name.as_deref())
+            .collect();
+        // Prefer an unlocked root parameter when an argument expression combines multiple
+        // parameters (e.g. `magic ^ payload_len` under a `magic == ...` branch guard).
+        params
+            .iter()
+            .find(|p| !locked_by_prefix.contains(p.as_str()))
+            .or_else(|| params.last())
+            .cloned()
+    }
+
+    fn scan_block(&mut self, block: &Block) {
+        for stmt in &block.stmts {
+            self.scan_stmt(stmt);
+        }
+    }
+
+    fn scan_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Local(loc) => {
+                if let Some(init) = &loc.init {
+                    self.scan_expr(&init.expr);
+                    let deps =
+                        collect_expr_param_deps(&init.expr, &self.root_params, &self.local_deps);
+                    let pat_ident = match &loc.pat {
+                        Pat::Ident(pi) => Some(pi.ident.to_string()),
+                        Pat::Type(pt) => match &*pt.pat {
+                            Pat::Ident(pi) => Some(pi.ident.to_string()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(name) = pat_ident
+                        && !deps.is_empty()
+                    {
+                        self.local_deps.insert(name, deps);
+                    }
+                }
+            }
+            Stmt::Expr(expr, _) => self.scan_expr(expr),
+            Stmt::Item(_) | Stmt::Macro(_) => {}
+        }
+    }
+
+    fn scan_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Call(call) => {
+                for arg in &call.args {
+                    self.scan_expr(arg);
+                }
+                if let Expr::Path(p) = &*call.func
+                    && p.path.leading_colon.is_none()
+                    && p.path.segments.len() == 1
+                {
+                    let callee = p.path.segments[0].ident.to_string();
+                    if self.ext_callees.contains(&callee) {
+                        let mut arg_param_sources = Vec::with_capacity(call.args.len());
+                        let mut arg_all_params = Vec::with_capacity(call.args.len());
+                        for arg in &call.args {
+                            let deps = collect_expr_param_deps(
+                                arg,
+                                &self.root_params,
+                                &self.local_deps,
+                            );
+                            arg_param_sources.push(self.select_primary_source(&deps));
+                            arg_all_params.push(deps);
+                        }
+                        let slot_id = self.sites.len();
+                        self.sites.push(ItreeCallSiteDescriptor {
+                            slot_id,
+                            callee,
+                            arity: call.args.len(),
+                            arg_param_sources,
+                            arg_all_params,
+                            prefix_guards: self.active_guards.clone(),
+                        });
+                    }
+                }
+            }
+            Expr::If(expr_if) => {
+                self.scan_expr(&expr_if.cond);
+                // Ignore synthetic `__itree_pad_fold == 0` / `__itree_call_res == 0` short-circuit
+                // guards introduced by `weave_into_fn_body`, which always take the `else` branch
+                // on live non-zero helper returns.
+                let is_synthetic_weave_guard = if let Expr::Binary(bin) = &*expr_if.cond
+                    && matches!(bin.op, BinOp::Eq(_))
+                    && parse_lit_u128(&bin.right) == Some(0)
+                    && let Expr::Path(p) = &*bin.left
+                    && let Some(seg) = p.path.segments.last()
+                {
+                    seg.ident.to_string().starts_with("__itree_")
+                } else {
+                    false
+                };
+
+                if is_synthetic_weave_guard {
+                    self.scan_block(&expr_if.then_branch);
+                    if let Some((_, else_expr)) = &expr_if.else_branch {
+                        self.scan_expr(else_expr);
+                    }
+                    return;
+                }
+
+                let bid = self.next_branch_id;
+                self.next_branch_id += 1;
+                let pushed_then = if let Some(g) = extract_cond_branch_guard(
+                    &expr_if.cond,
+                    bid,
+                    true,
+                    &self.root_params,
+                    &self.local_deps,
+                ) {
+                    self.active_guards.push(g);
+                    true
+                } else {
+                    false
+                };
+                self.scan_block(&expr_if.then_branch);
+                if pushed_then {
+                    self.active_guards.pop();
+                }
+
+                if let Some((_, else_expr)) = &expr_if.else_branch {
+                    let pushed_else = if let Some(g) = extract_cond_branch_guard(
+                        &expr_if.cond,
+                        bid,
+                        false,
+                        &self.root_params,
+                        &self.local_deps,
+                    ) {
+                        self.active_guards.push(g);
+                        true
+                    } else {
+                        false
+                    };
+                    self.scan_expr(else_expr);
+                    if pushed_else {
+                        self.active_guards.pop();
+                    }
+                }
+            }
+            Expr::Match(expr_match) => {
+                self.scan_expr(&expr_match.expr);
+                let scrutinee_params =
+                    collect_expr_param_deps(&expr_match.expr, &self.root_params, &self.local_deps);
+                let field_name = scrutinee_params.first().cloned();
+                for (arm_idx, arm) in expr_match.arms.iter().enumerate() {
+                    let bid = self.next_branch_id;
+                    self.next_branch_id += 1;
+                    let arm_lit = match &arm.pat {
+                        Pat::Lit(pl) => match &pl.lit {
+                            Lit::Int(li) => li.base10_parse::<u128>().ok(),
+                            _ => None,
+                        },
+                        _ => Some(arm_idx as u128),
+                    };
+                    let pushed = if let (Some(fname), Some(target)) = (field_name.clone(), arm_lit)
+                    {
+                        self.active_guards.push(ConcolicBranchGuard {
+                            branch_id: bid,
+                            taken: true,
+                            taken_tag: arm_idx as u32,
+                            field_name: Some(fname),
+                            concrete_bits: target,
+                            target_bits: target,
+                            bit_width: 32,
+                        });
+                        true
+                    } else {
+                        false
+                    };
+                    self.scan_expr(&arm.body);
+                    if pushed {
+                        self.active_guards.pop();
+                    }
+                }
+            }
+            Expr::Block(b) => self.scan_block(&b.block),
+            Expr::While(w) => {
+                self.scan_expr(&w.cond);
+                self.scan_block(&w.body);
+            }
+            Expr::Binary(b) => {
+                self.scan_expr(&b.left);
+                self.scan_expr(&b.right);
+            }
+            Expr::Unary(u) => self.scan_expr(&u.expr),
+            Expr::Assign(a) => {
+                self.scan_expr(&a.left);
+                self.scan_expr(&a.right);
+            }
+            Expr::Paren(p) => self.scan_expr(&p.expr),
+            Expr::Cast(c) => self.scan_expr(&c.expr),
+            Expr::Return(r) => {
+                if let Some(e) = &r.expr {
+                    self.scan_expr(e);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extracts static [`ItreeCallSiteDescriptor`]s (callee, arity, parameter dependencies,
+/// and enclosing `switchInt` / `if` / `match` [`ConcolicBranchGuard`]s) for every external
+/// call site inside `root_fn_name`.
+pub fn extract_itree_call_site_pins(
+    source: &str,
+    root_fn_name: &str,
+) -> Result<Vec<ItreeCallSiteDescriptor>, String> {
+    let file = syn::parse_str::<File>(source).map_err(|e| e.to_string())?;
+    let mut ext_callees = BTreeSet::new();
+    let mut root_fn: Option<&syn::ItemFn> = None;
+
+    for item in &file.items {
+        if let Item::Fn(func) = item {
+            let name = func.sig.ident.to_string();
+            if name == root_fn_name {
+                root_fn = Some(func);
+            } else {
+                ext_callees.insert(name);
+            }
+        }
+    }
+    let Some(func) = root_fn else {
+        return Err(format!("root function `{root_fn_name}` not found"));
+    };
+    let root_params: BTreeSet<String> = collect_u32_param_idents(func)
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect();
+
+    let mut extractor = CallSiteExtractor {
+        ext_callees: &ext_callees,
+        root_params,
+        local_deps: BTreeMap::new(),
+        active_guards: Vec::new(),
+        next_branch_id: 0,
+        sites: Vec::new(),
+    };
+    extractor.scan_block(&func.block);
+    Ok(extractor.sites)
+}
+
+/// Builds an initial [`ArgPinConstraint`] from a static [`ItreeCallSiteDescriptor`] and
+/// concrete root parameter values `(magic, payload_len)`.
+pub fn build_arg_pin_for_call_site(
+    site: &ItreeCallSiteDescriptor,
+    staged_callee: &str,
+    magic: u32,
+    payload_len: u32,
+    ret_val: u32,
+) -> ArgPinConstraint {
+    let mut arg_tuple = Vec::with_capacity(site.arity);
+    let mut arg_layouts = Vec::with_capacity(site.arity);
+    for arg_idx in 0..site.arity {
+        let deps = site
+            .arg_all_params
+            .get(arg_idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let val = if deps.len() >= 2 {
+            magic ^ payload_len
+        } else if deps.first().map(String::as_str) == Some("payload_len")
+            || deps.first().map(String::as_str) == Some("b")
+        {
+            payload_len
+        } else {
+            magic
+        };
+        arg_tuple.push(val.to_le_bytes().to_vec());
+        arg_layouts.push(ScalarLayout::u32());
+    }
+    ArgPinConstraint::new(
+        site.slot_id,
+        staged_callee.to_string(),
+        site.prefix_guards.len(),
+        arg_tuple,
+        ret_val.to_le_bytes().to_vec(),
+    )
+    .with_arg_layouts(arg_layouts)
+    .with_arg_field_sources(site.arg_param_sources.clone())
+}
+
+/// Synthesizes `trials` deterministic `(magic, payload_len, EnvSchedule)` inputs for an
+/// ITree candidate using concolic [`ArgPinConstraint`] relaxation (`neg_arg_pin_term`):
+///
+/// 1. Extracts every external call site and its enclosing `switchInt` branch guards via
+///    [`extract_itree_call_site_pins`].
+/// 2. Under each prefix branch guard configuration (e.g. `magic == 0x414E_4E4C`,
+///    `magic % 4 == 1/2/3`, `payload_len == 0x80`), applies [`relax_pin_constraint`]
+///    to negate external-call argument pins (`arg != prev_arg`) while keeping prefix
+///    branch guards intact BEFORE cycling pure oracle return-value perturbations.
+pub fn synthesize_itree_concolic_trials(
+    source: &str,
+    root_fn_name: &str,
+    staged_prefix: &str,
+    staged_ext_callees: &[String],
+    dict: &MirInputDictionary,
+    trials: usize,
+    seed_u64: u64,
+) -> Vec<(u32, u32, EnvSchedule)> {
+    let count = trials.max(1);
+    let sites = extract_itree_call_site_pins(source, root_fn_name).unwrap_or_default();
+    let sched_gen = EnvScheduleGenerator::new(dict)
+        .with_horizon_steps(4)
+        .with_panic_injection_pct(20);
+    let callee_refs: Vec<&str> = staged_ext_callees.iter().map(String::as_str).collect();
+
+    let mut out: Vec<(u32, u32, EnvSchedule)> = Vec::with_capacity(count);
+    let mut seen_inputs: BTreeSet<(u32, u32, Option<usize>, Vec<(String, Vec<Vec<u8>>)>)> =
+        BTreeSet::new();
+
+    fn push_unique_trial(
+        out: &mut Vec<(u32, u32, EnvSchedule)>,
+        seen_inputs: &mut BTreeSet<(u32, u32, Option<usize>, Vec<(String, Vec<Vec<u8>>)>)>,
+        count: usize,
+        m: u32,
+        p: u32,
+        s: EnvSchedule,
+    ) -> bool {
+        if out.len() >= count {
+            return false;
+        }
+        let q_key: Vec<(String, Vec<Vec<u8>>)> = s
+            .callee_queues
+            .iter()
+            .map(|(k, q)| (k.clone(), q.iter().cloned().collect()))
+            .collect();
+        if seen_inputs.insert((m, p, s.global_panic_on_call, q_key)) {
+            out.push((m, p, s));
+            true
+        } else {
+            false
+        }
+    }
+
+    // Base prefix configurations covering the seed branch guards.
+    let prefix_seeds: &[(u32, u32)] = &[
+        (0x414E_4E4C, 2048),
+        (0x414E_4E4C, 64),
+        (0x0000_0010, 0x80),
+        (0x0000_0000, 0),
+        (0x0000_0001, 1),
+        (0x0000_0002, 2),
+        (0x0000_0003, 3),
+        (0xDEAD_BEEF, 0),
+    ];
+
+    for &(m, p) in prefix_seeds {
+        if out.len() + 2 <= count || out.is_empty() {
+            push_unique_trial(&mut out, &mut seen_inputs, count, m, p, EnvSchedule::new());
+        }
+    }
+    if out.len() < count && count >= 9 {
+        push_unique_trial(
+            &mut out,
+            &mut seen_inputs,
+            count,
+            0x414E_4E4C,
+            2048,
+            EnvSchedule::new().with_panic_on_call(0),
+        );
+    }
+
+    // Concolic `argPinTerm` negation phase: for each extracted external call site,
+    // keep its prefix branch guards fixed (`magic == 0x414E_4E4C`, `magic % 4 == ...`, etc.)
+    // and relax its `ArgPinConstraint` (`neg_arg_pin_term`) to steer the call's concrete
+    // argument tuple to distinct values (`arg != prev_arg`) before perturbing return schedules.
+    if !sites.is_empty() && out.len() < count {
+        let mut site_pins: Vec<(Vec<ConcolicBranchGuard>, ArgPinConstraint, u32, u32)> = sites
+            .iter()
+            .map(|site| {
+                let mut m = 0x414E_4E4Cu32;
+                let mut p = 2048u32;
+                for g in &site.prefix_guards {
+                    match g.field_name.as_deref() {
+                        Some("magic") | Some("a") => m = g.concrete_bits as u32,
+                        Some("payload_len") | Some("b") => p = g.concrete_bits as u32,
+                        _ => {}
+                    }
+                }
+                let staged_callee = format!("{staged_prefix}{}", site.callee);
+                let mut pin = build_arg_pin_for_call_site(site, &staged_callee, m, p, 0x100);
+                // Record already-scheduled prefix seeds that share the same prefix guards
+                // so `neg_arg_pin_term` steers to genuinely new argument tuples!
+                for &(prev_m, prev_p, _) in &out {
+                    let matches_prefix = site.prefix_guards.iter().all(|g| {
+                        let bits = match g.field_name.as_deref() {
+                            Some("magic") | Some("a") => u128::from(prev_m),
+                            Some("payload_len") | Some("b") => u128::from(prev_p),
+                            _ => g.concrete_bits,
+                        };
+                        g.effective_term(bits)
+                    });
+                    if matches_prefix {
+                        let prev_pin =
+                            build_arg_pin_for_call_site(site, &staged_callee, prev_m, prev_p, 0x100);
+                        pin.record_excluded_arg_tuple(prev_pin.arg_tuple);
+                    }
+                }
+                (site.prefix_guards.clone(), pin, m, p)
+            })
+            .collect();
+
+        let mut round = 0usize;
+        while out.len() < count && round < count.saturating_mul(2).max(8) {
+            let mut any_relaxed = false;
+            for (guards, pin, base_m, base_p) in &mut site_pins {
+                if out.len() >= count {
+                    break;
+                }
+                if pin.is_arg_domain_exhausted() {
+                    continue;
+                }
+                let mut effective_guards = guards.clone();
+                if effective_guards.is_empty() {
+                    // When an outlined helper or injected oracle sits at top level before
+                    // `kernel_step`'s `if magic == 0x414E_4E4C`, anchor `magic` on its
+                    // primary branch literal so `argPinTerm` negation steers `payload_len`
+                    // under the active prefix branch guard.
+                    effective_guards.push(ConcolicBranchGuard::new_equality(
+                        0,
+                        Some("magic".to_string()),
+                        u128::from(*base_m),
+                        u128::from(*base_m),
+                        32,
+                    ));
+                    pin.before_guard_idx = effective_guards.len();
+                }
+                if let Some(RelaxPinResult::RelaxedArgPin {
+                    new_arg_tuple,
+                    input_field_overrides,
+                    ..
+                }) = relax_pin_constraint(
+                    &effective_guards,
+                    std::slice::from_ref(pin),
+                    0,
+                    dict,
+                    round + (seed_u64 as usize % 7),
+                ) {
+                    pin.record_excluded_arg_tuple(new_arg_tuple.clone());
+                    let next_m = input_field_overrides
+                        .get("magic")
+                        .or_else(|| input_field_overrides.get("a"))
+                        .map(|&v| v as u32)
+                        .unwrap_or(*base_m);
+                    let next_p = input_field_overrides
+                        .get("payload_len")
+                        .or_else(|| input_field_overrides.get("b"))
+                        .map(|&v| v as u32)
+                        .unwrap_or_else(|| {
+                            new_arg_tuple
+                                .last()
+                                .map(|b| {
+                                    let mut le = [0u8; 4];
+                                    let n = b.len().min(4);
+                                    le[..n].copy_from_slice(&b[..n]);
+                                    u32::from_le_bytes(le)
+                                })
+                                .unwrap_or(*base_p)
+                        });
+                    if push_unique_trial(
+                        &mut out,
+                        &mut seen_inputs,
+                        count,
+                        next_m,
+                        next_p,
+                        EnvSchedule::new(),
+                    ) {
+                        any_relaxed = true;
+                    }
+                }
+            }
+            if !any_relaxed {
+                break;
+            }
+            round += 1;
+        }
+    }
+
+    // Remaining trials: pair argument-diverse inputs with reactive `EnvScheduleGenerator`
+    // oracle return schedules once distinct call arguments have been scheduled.
+    let mut rng = DetRng::new(seed_u64);
+    let mut fill_step = 0usize;
+    while out.len() < count && fill_step < count.saturating_mul(4).max(16) {
+        let mut entropy = [0u8; 64];
+        for chunk in entropy.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+        }
+        let mut u = Unstructured::new(&entropy);
+        let (base_m, base_p, _) = out[fill_step % out.len().max(1)];
+        let schedule = if !callee_refs.is_empty() {
+            sched_gen.generate_schedule(&callee_refs, &mut u)
+        } else {
+            EnvSchedule::new()
+        };
+        let alt_p = base_p.wrapping_add(((fill_step as u32) + 1).wrapping_mul(17));
+        if !push_unique_trial(
+            &mut out,
+            &mut seen_inputs,
+            count,
+            base_m,
+            base_p,
+            schedule.clone(),
+        ) {
+            let _ = push_unique_trial(&mut out, &mut seen_inputs, count, base_m, alt_p, schedule);
+        }
+        fill_step += 1;
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,6 +1636,189 @@ mod tests {
                     _ => {}
                 }
             }
+        }
+    }
+
+    #[test]
+    fn arg_pin_negation_preserves_prefix_branch_pins_and_increases_distinct_call_arg_tuples() {
+        let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
+        let batch = generate_itree_batch(seeds, 12, 0x3333_4444);
+
+        let mut checked_outliner = 0usize;
+        let mut checked_injector = 0usize;
+
+        for cand in &batch {
+            let has_outliner = cand
+                .applied_mutators
+                .iter()
+                .any(|m| m == "CallBoundaryOutliner");
+            let has_injector = cand
+                .applied_mutators
+                .iter()
+                .any(|m| m == "ExtOracleInjector");
+            if !has_outliner && !has_injector {
+                continue;
+            }
+            let sites =
+                extract_itree_call_site_pins(&cand.source, "kernel_step").expect("extract pins");
+            assert!(
+                !sites.is_empty(),
+                "expected external call sites in candidate {} ({:?})",
+                cand.id,
+                cand.applied_mutators
+            );
+            let staged = stage_itree_candidate_items(&cand.source, "b0_c0__", "kernel_step")
+                .expect("stage candidate");
+            let dict = MirInputDictionary::from_rust_source(&cand.source).expect("dict");
+            let trials = synthesize_itree_concolic_trials(
+                &cand.source,
+                "kernel_step",
+                &staged.cand_prefix,
+                &staged.ext_callee_names,
+                &dict,
+                16,
+                cand.seed_u64,
+            );
+            assert_eq!(trials.len(), 16);
+
+            // Compare distinct `(callee, arg_tuple)` pairs observed under the prefix branch
+            // guard `magic == 0x414E_4E4C` when using `synthesize_itree_concolic_trials`
+            // (`argPinTerm` negation) vs. return-only perturbation on fixed `(0x414E_4E4C, 2048)`.
+            let mut concolic_distinct_call_args: BTreeSet<(String, Vec<Vec<u8>>)> = BTreeSet::new();
+            let mut return_only_distinct_call_args: BTreeSet<(String, Vec<Vec<u8>>)> =
+                BTreeSet::new();
+
+            for &(m, p, _) in &trials {
+                if m == 0x414E_4E4C {
+                    for site in &sites {
+                        let pin = build_arg_pin_for_call_site(site, &site.callee, m, p, 0);
+                        concolic_distinct_call_args.insert((site.callee.clone(), pin.arg_tuple));
+                    }
+                }
+            }
+            for _ret_trial in 0..8 {
+                for site in &sites {
+                    let pin =
+                        build_arg_pin_for_call_site(site, &site.callee, 0x414E_4E4C, 2048, 0);
+                    return_only_distinct_call_args.insert((site.callee.clone(), pin.arg_tuple));
+                }
+            }
+
+            assert!(
+                concolic_distinct_call_args.len() > return_only_distinct_call_args.len(),
+                "candidate {} ({:?}): argPinTerm negation must strictly increase distinct \
+                 (callee, arg_tuple) coverage under prefix guard `magic == 0x414E_4E4C` \
+                 (got {} vs return-only {})",
+                cand.id,
+                cand.applied_mutators,
+                concolic_distinct_call_args.len(),
+                return_only_distinct_call_args.len()
+            );
+
+            if has_outliner {
+                checked_outliner += 1;
+            }
+            if has_injector {
+                checked_injector += 1;
+            }
+        }
+
+        assert!(checked_outliner >= 2, "expected >= 2 CallBoundaryOutliner candidates");
+        assert!(checked_injector >= 2, "expected >= 2 ExtOracleInjector candidates");
+    }
+
+    #[test]
+    fn extract_itree_call_site_pins_handles_zero_arg_and_multi_call_chains() {
+        let src = r#"
+            pub fn ext_zero() -> u32 {
+                7
+            }
+            pub fn ext_one(x: u32) -> u32 {
+                x + 1
+            }
+            pub fn ext_two(x: u32, y: u32) -> u32 {
+                x ^ y
+            }
+            pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {
+                if magic == 0x414E_4E4C {
+                    let z = ext_zero();
+                    let a = ext_one(magic);
+                    let b = ext_two(a, payload_len);
+                    z + b
+                } else {
+                    0
+                }
+            }
+        "#;
+        let sites = extract_itree_call_site_pins(src, "kernel_step").expect("extract call sites");
+        assert_eq!(sites.len(), 3);
+        assert_eq!((sites[0].callee.as_str(), sites[0].arity), ("ext_zero", 0));
+        assert_eq!((sites[1].callee.as_str(), sites[1].arity), ("ext_one", 1));
+        assert_eq!((sites[2].callee.as_str(), sites[2].arity), ("ext_two", 2));
+        for s in &sites {
+            assert_eq!(s.prefix_guards.len(), 1);
+            assert_eq!(
+                s.prefix_guards[0].field_name.as_deref(),
+                Some("magic")
+            );
+            assert_eq!(s.prefix_guards[0].concrete_bits, 0x414E_4E4C);
+        }
+
+        let dict = MirInputDictionary::from_rust_source(src).expect("dict");
+        let pin0 = build_arg_pin_for_call_site(&sites[0], "ext_zero", 0x414E_4E4C, 2048, 7);
+        let pin1 = build_arg_pin_for_call_site(&sites[1], "ext_one", 0x414E_4E4C, 2048, 100);
+        let pin2 = build_arg_pin_for_call_site(&sites[2], "ext_two", 0x414E_4E4C, 2048, 200);
+        assert!(pin0.is_zero_arg());
+        assert!(pin0.arg_pin_term(&[]));
+        assert!(!pin0.neg_arg_pin_term(&[]));
+
+        // Relaxing pin0 (0-arg call) returns ZeroArgCall fallback.
+        let r0 = relax_pin_constraint(&sites[0].prefix_guards, &[pin0.clone(), pin1.clone(), pin2.clone()], 0, &dict, 0).unwrap();
+        assert!(matches!(
+            r0,
+            RelaxPinResult::FallbackReturnPerturbation {
+                reason: ArgPinFallbackReason::ZeroArgCall,
+                ..
+            }
+        ));
+
+        // Relaxing pin2 (call index 2 in chain) preserves prefix guard `magic == 0x414E_4E4C`
+        // AND earlier pins `pin0` (`ext_zero`) and `pin1` (`ext_one(magic)`), while negating
+        // `pin2`'s argument tuple via `payload_len != 2048`!
+        let r2 = relax_pin_constraint(
+            &sites[2].prefix_guards,
+            &[pin0.clone(), pin1.clone(), pin2.clone()],
+            2,
+            &dict,
+            0,
+        )
+        .unwrap();
+        match r2 {
+            RelaxPinResult::RelaxedArgPin {
+                pin_idx,
+                prefix_guards,
+                prefix_pins,
+                new_arg_tuple,
+                input_field_overrides,
+                schedule,
+                ..
+            } => {
+                assert_eq!(pin_idx, 2);
+                assert_eq!(prefix_guards.len(), 1);
+                assert_eq!(prefix_pins, vec![pin0, pin1]);
+                assert!(pin2.neg_arg_pin_term(&new_arg_tuple));
+                assert_eq!(input_field_overrides.get("magic"), Some(&0x414E_4E4C));
+                assert_ne!(input_field_overrides.get("payload_len"), Some(&2048));
+                assert_eq!(
+                    schedule.callee_queues.get("ext_zero").unwrap()[0],
+                    7u32.to_le_bytes().to_vec()
+                );
+                assert_eq!(
+                    schedule.callee_queues.get("ext_one").unwrap()[0],
+                    100u32.to_le_bytes().to_vec()
+                );
+            }
+            other => panic!("expected RelaxedArgPin for pin2, got {other:?}"),
         }
     }
 }

@@ -16,11 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arbitrary::Unstructured;
 use cargo_anneal::{
@@ -41,6 +41,7 @@ use crate::mutators_itree::{
     GeneratedItreeCandidate, ItreeMutationStep, StagedItreeCandidate,
     annotate_itree_external_callees, contains_unsafe_token, itree_candidate_replay_is_faithful,
     reconstruct_itree_mutation_steps, replay_itree_mutation_steps, stage_itree_candidate_items,
+    synthesize_itree_concolic_trials,
 };
 use crate::mutators_miri::DetRng;
 use crate::shrink::{MemoizedOracle, MutatorChainShrinkStatus, shrink_mutation_chain_detailed};
@@ -209,8 +210,34 @@ pub const DEFAULT_ITREE_TRIALS_PER_CANDIDATE: usize = 12;
 /// `checkRawByteTraceObsErasedBounded_sound`.
 pub const ITREE_TRACE_CHECK_FUEL: usize = 240;
 
+/// Default per-invocation wall-clock timeout for a single `lake env lean` chunk
+/// or fallback module (override via `ANNEAL_ITREE_LEAN_TIMEOUT_SECS` or
+/// `ANNEAL_ITREE_LEAN_TIMEOUT_MS`).
+pub const DEFAULT_ITREE_LEAN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Default per-worker process-tree physical RSS limit in KiB (`8 GiB`).
+pub const DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB: u64 = 8 * 1024 * 1024;
+
+/// Minimum auto-computed per-worker process-tree physical RSS limit in KiB
+/// (`512 MiB`). Explicit `ANNEAL_ITREE_MAX_RSS_KIB` overrides may set smaller
+/// values in unit tests.
+pub const MIN_ITREE_LEAN_RSS_LIMIT_KIB: u64 = 512 * 1024;
+
+/// Grace period between `SIGTERM` and `SIGKILL` when the watchdog terminates a
+/// `lake env lean` process tree.
+const ITREE_WATCHDOG_KILL_GRACE: Duration = Duration::from_millis(100);
+
+/// Poll interval for the `lake env lean` RSS + wall-clock watchdog loop.
+const ITREE_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Cgroup v1/v2 byte values at or above `1 EiB` (`1 << 60`) represent an
+/// unconstrained / unlimited controller (e.g., `PAGE_COUNTER_MAX * PAGE_SIZE`
+/// on 64-bit kernels).
+const CGROUP_UNLIMITED_BYTES_FLOOR: u64 = 1u64 << 60;
+
 /// Parses `(MemTotal, MemAvailable)` in KiB from `/proc/meminfo` contents.
-fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
+/// Falls back to `MemFree + Buffers + Cached` when `MemAvailable:` is absent.
+pub fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
     let field = |name: &str| {
         meminfo.lines().find_map(|line| {
             line.strip_prefix(name)?
@@ -220,14 +247,34 @@ fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
                 .ok()
         })
     };
-    (field("MemTotal:"), field("MemAvailable:"))
+    let total = field("MemTotal:");
+    let avail = field("MemAvailable:").or_else(|| {
+        let free = field("MemFree:")?;
+        let buffers = field("Buffers:").unwrap_or(0);
+        let cached = field("Cached:").unwrap_or(0);
+        Some(free.saturating_add(buffers).saturating_add(cached))
+    });
+    (total, avail)
 }
 
 fn read_u64_file(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
 }
 
-fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+fn read_cgroup_limit_bytes(path: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "max" {
+        return None;
+    }
+    let bytes = trimmed.parse::<u64>().ok()?;
+    if bytes == 0 || bytes >= CGROUP_UNLIMITED_BYTES_FLOOR {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn min_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.min(y)),
         (x, None) => x,
@@ -235,38 +282,253 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 `memory.max`
-/// between this process's cgroup (`0::<path>` in `proc_self_cgroup`) and
-/// `cgroup_root`, where headroom is `memory.max - memory.current`.
+/// Reads non-reclaimable working-set usage in bytes for a cgroup v2 directory:
+/// prefers `anon + shmem` from `memory.stat` when present (so reclaimable page
+/// cache from earlier builds does not artificially shrink available headroom),
+/// falling back to `memory.current`.
+fn cgroup_v2_working_set_bytes(dir: &Path) -> u64 {
+    if let Ok(stat) = fs::read_to_string(dir.join("memory.stat")) {
+        let mut anon: Option<u64> = None;
+        let mut shmem: Option<u64> = None;
+        for line in stat.lines() {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("anon"), Some(v)) => anon = v.parse::<u64>().ok(),
+                (Some("shmem"), Some(v)) => shmem = v.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        if anon.is_some() || shmem.is_some() {
+            return anon.unwrap_or(0).saturating_add(shmem.unwrap_or(0));
+        }
+    }
+    read_u64_file(&dir.join("memory.current")).unwrap_or(0)
+}
+
+/// Reads effective limit and non-reclaimable working-set usage in bytes for a
+/// cgroup v1 directory (`memory.limit_in_bytes` intersected with
+/// `hierarchical_memory_limit` in `memory.stat`, and `total_rss + total_shmem`
+/// falling back to `memory.usage_in_bytes`).
+fn cgroup_v1_dir_limit_and_usage_bytes(dir: &Path) -> Option<(u64, u64)> {
+    let direct_limit = read_cgroup_limit_bytes(&dir.join("memory.limit_in_bytes"));
+    let stat_text = fs::read_to_string(dir.join("memory.stat")).ok();
+    let mut hier_limit: Option<u64> = None;
+    let mut total_rss: Option<u64> = None;
+    let mut total_shmem: Option<u64> = None;
+    let mut rss: Option<u64> = None;
+    let mut shmem: Option<u64> = None;
+    if let Some(stat) = &stat_text {
+        for line in stat.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(key), Some(val_str)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Ok(val) = val_str.parse::<u64>() else {
+                continue;
+            };
+            match key {
+                "hierarchical_memory_limit"
+                    if val > 0 && val < CGROUP_UNLIMITED_BYTES_FLOOR =>
+                {
+                    hier_limit = Some(val);
+                }
+                "total_rss" => total_rss = Some(val),
+                "total_shmem" => total_shmem = Some(val),
+                "rss" => rss = Some(val),
+                "shmem" => shmem = Some(val),
+                _ => {}
+            }
+        }
+    }
+    let limit = min_opt(direct_limit, hier_limit)?;
+    let usage = if total_rss.is_some() || total_shmem.is_some() {
+        total_rss
+            .unwrap_or(0)
+            .saturating_add(total_shmem.unwrap_or(0))
+    } else if rss.is_some() || shmem.is_some() {
+        rss.unwrap_or(0).saturating_add(shmem.unwrap_or(0))
+    } else {
+        read_u64_file(&dir.join("memory.usage_in_bytes")).unwrap_or(0)
+    };
+    Some((limit, usage))
+}
+
+/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 (`memory.max`
+/// / `memory.high`) or cgroup v1 (`memory.limit_in_bytes` /
+/// `hierarchical_memory_limit`) ancestor between this process's cgroup in
+/// `proc_self_cgroup` and `cgroup_root`, where headroom is
+/// `effective_limit - working_set`.
 ///
 /// `anneal-lean-run` confines commands to a transient `systemd-run --scope`
-/// whose `MemoryMax` is far below host `MemAvailable` (and parent slices may be
-/// capped too), so `/proc/meminfo` alone overestimates how many concurrent
-/// `lake env lean` workers fit before the cgroup OOM killer fires.
-fn cgroup_memory_limits_kib(
+/// whose `MemoryMax` / `MemoryHigh` is far below host `MemAvailable` (and parent
+/// slices may be capped too), so `/proc/meminfo` alone overestimates how many
+/// concurrent `lake env lean` workers and how much per-worker RSS fit before
+/// throttling or the cgroup OOM killer fires.
+pub fn cgroup_memory_limits_kib(
     cgroup_root: &Path,
     proc_self_cgroup: &str,
 ) -> (Option<u64>, Option<u64>) {
-    let Some(rel) = proc_self_cgroup
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-    else {
-        return (None, None);
-    };
-    let mut dir = cgroup_root.join(rel.trim().trim_start_matches('/'));
     let mut limit_kib: Option<u64> = None;
     let mut headroom_kib: Option<u64> = None;
-    while dir.starts_with(cgroup_root) {
-        if let Some(max) = read_u64_file(&dir.join("memory.max")) {
-            let current = read_u64_file(&dir.join("memory.current")).unwrap_or(0);
-            limit_kib = min_opt(limit_kib, Some(max / 1024));
-            headroom_kib = min_opt(headroom_kib, Some(max.saturating_sub(current) / 1024));
-        }
-        if dir == cgroup_root || !dir.pop() {
-            break;
+
+    // 1. Cgroup v2 unified hierarchy (`0::<path>`).
+    if let Some(rel) = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+    {
+        let mut dir = cgroup_root.join(rel.trim().trim_start_matches('/'));
+        while dir.starts_with(cgroup_root) {
+            let max_bytes = read_cgroup_limit_bytes(&dir.join("memory.max"));
+            let high_bytes = read_cgroup_limit_bytes(&dir.join("memory.high"));
+            if let Some(eff_limit) = min_opt(max_bytes, high_bytes) {
+                let current = cgroup_v2_working_set_bytes(&dir);
+                limit_kib = min_opt(limit_kib, Some(eff_limit / 1024));
+                headroom_kib = min_opt(
+                    headroom_kib,
+                    Some(eff_limit.saturating_sub(current) / 1024),
+                );
+            }
+            if dir == cgroup_root || !dir.pop() {
+                break;
+            }
         }
     }
+
+    // 2. Cgroup v1 `memory` controller hierarchy (`<id>:memory:<path>`).
+    let v1_rel = proc_self_cgroup.lines().find_map(|line| {
+        let mut parts = line.trim().splitn(3, ':');
+        let _id = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        controllers
+            .split(',')
+            .any(|c| c == "memory")
+            .then_some(path.trim().trim_start_matches('/'))
+    });
+    if let Some(rel) = v1_rel {
+        for base in [cgroup_root.join("memory"), cgroup_root.to_path_buf()] {
+            let mut dir = if rel.is_empty() {
+                base.clone()
+            } else {
+                base.join(rel)
+            };
+            if !dir.is_dir() {
+                continue;
+            }
+            while dir.starts_with(&base) {
+                if let Some((lim, usage)) = cgroup_v1_dir_limit_and_usage_bytes(&dir) {
+                    limit_kib = min_opt(limit_kib, Some(lim / 1024));
+                    headroom_kib = min_opt(headroom_kib, Some(lim.saturating_sub(usage) / 1024));
+                }
+                if dir == base || !dir.pop() {
+                    break;
+                }
+            }
+        }
+    }
+
     (limit_kib, headroom_kib)
+}
+
+/// Parses a cgroup v2 `cpu.max` string (`"<quota> <period>"` or `"max <period>"`)
+/// into an integer core ceiling `ceil(quota / period)`. Returns `None` when
+/// unconstrained (`"max"`) or malformed.
+pub fn parse_cpu_max_quota_cores(cpu_max: &str) -> Option<usize> {
+    let mut parts = cpu_max.split_whitespace();
+    let quota_str = parts.next()?;
+    if quota_str == "max" {
+        return None;
+    }
+    let period_str = parts.next().unwrap_or("100000");
+    let quota = quota_str.parse::<u64>().ok()?;
+    let period = period_str.parse::<u64>().ok()?;
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    Some(quota.div_ceil(period).max(1) as usize)
+}
+
+/// Returns the tightest CPU core ceiling across the enclosing cgroup v2
+/// (`cpu.max`) and cgroup v1 (`cpu.cfs_quota_us` / `cpu.cfs_period_us`)
+/// hierarchy between `proc_self_cgroup` and `cgroup_root`.
+pub fn cgroup_cpu_quota_cores(cgroup_root: &Path, proc_self_cgroup: &str) -> Option<usize> {
+    let mut tightest: Option<usize> = None;
+
+    // 1. Cgroup v2 (`0::<path>`).
+    if let Some(rel) = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+    {
+        let mut dir = cgroup_root.join(rel.trim().trim_start_matches('/'));
+        while dir.starts_with(cgroup_root) {
+            if let Ok(raw) = fs::read_to_string(dir.join("cpu.max"))
+                && let Some(cores) = parse_cpu_max_quota_cores(&raw)
+            {
+                tightest = min_opt(tightest, Some(cores));
+            }
+            if dir == cgroup_root || !dir.pop() {
+                break;
+            }
+        }
+    }
+
+    // 2. Cgroup v1 (`<id>:cpu,cpuacct:<path>` or `<id>:cpu:<path>`).
+    let v1_rel = proc_self_cgroup.lines().find_map(|line| {
+        let mut parts = line.trim().splitn(3, ':');
+        let _id = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        controllers
+            .split(',')
+            .any(|c| c == "cpu")
+            .then_some(path.trim().trim_start_matches('/'))
+    });
+    if let Some(rel) = v1_rel {
+        for base in [
+            cgroup_root.join("cpu,cpuacct"),
+            cgroup_root.join("cpu"),
+            cgroup_root.to_path_buf(),
+        ] {
+            let mut dir = if rel.is_empty() {
+                base.clone()
+            } else {
+                base.join(rel)
+            };
+            if !dir.is_dir() {
+                continue;
+            }
+            while dir.starts_with(&base) {
+                if let Ok(q_raw) = fs::read_to_string(dir.join("cpu.cfs_quota_us"))
+                    && let Ok(quota_i64) = q_raw.trim().parse::<i64>()
+                    && quota_i64 > 0
+                {
+                    let period = read_u64_file(&dir.join("cpu.cfs_period_us")).unwrap_or(100_000);
+                    if period > 0 {
+                        let cores = (quota_i64 as u64).div_ceil(period).max(1) as usize;
+                        tightest = min_opt(tightest, Some(cores));
+                    }
+                }
+                if dir == base || !dir.pop() {
+                    break;
+                }
+            }
+        }
+    }
+
+    tightest
+}
+
+fn effective_memory_limits_kib() -> (Option<u64>, Option<u64>) {
+    let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
+        .map(|s| parse_meminfo_kib(&s))
+        .unwrap_or((None, None));
+    if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
+        let (cg_limit, cg_headroom) =
+            cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
+        total_kib = min_opt(total_kib, cg_limit);
+        avail_kib = min_opt(avail_kib, cg_headroom);
+    }
+    (total_kib, avail_kib)
 }
 
 /// Maps effective total / available memory (KiB) to a `lake env lean` worker
@@ -295,7 +557,7 @@ pub fn itree_lean_jobs_for_memory(total_kib: Option<u64>, avail_kib: Option<u64>
 
 /// Resolve the maximum number of concurrent `lake env lean` chunk workers for
 /// `itree-difftest` from `ANNEAL_ITREE_LEAN_JOBS` (capped at 8) or, by default,
-/// from host `/proc/meminfo` intersected with the enclosing cgroup v2 memory
+/// from host `/proc/meminfo` intersected with the enclosing cgroup v1/v2 memory
 /// limits (see [`itree_lean_jobs_for_memory`]).
 pub fn resolve_itree_lean_jobs() -> usize {
     if let Ok(val) = env::var("ANNEAL_ITREE_LEAN_JOBS")
@@ -304,16 +566,639 @@ pub fn resolve_itree_lean_jobs() -> usize {
     {
         return parsed.min(8);
     }
-    let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
-        .map(|s| parse_meminfo_kib(&s))
-        .unwrap_or((None, None));
-    if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
-        let (cg_limit, cg_headroom) =
-            cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
-        total_kib = min_opt(total_kib, cg_limit);
-        avail_kib = min_opt(avail_kib, cg_headroom);
-    }
+    let (total_kib, avail_kib) = effective_memory_limits_kib();
     itree_lean_jobs_for_memory(total_kib, avail_kib)
+}
+
+/// Computes `LEAN_NUM_THREADS` for one `lake env lean` worker given the host's
+/// logical core count, optional cgroup CPU quota ceiling, effective available
+/// memory in KiB, and number of concurrent `lake env lean` workers (`active_workers`).
+pub fn itree_lean_threads_for_resources(
+    host_cores: usize,
+    cgroup_cores: Option<usize>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> usize {
+    const GIB: u64 = 1024 * 1024;
+    let workers = active_workers.max(1);
+    let effective_cores = min_opt(Some(host_cores.max(1)), cgroup_cores).unwrap_or(1);
+    let by_cpu = (effective_cores / workers).clamp(1, 8);
+    let by_mem = match avail_kib.map(|a| a / (workers as u64)) {
+        Some(per_worker_kib) if per_worker_kib < 4 * GIB => 1,
+        Some(per_worker_kib) if per_worker_kib < 8 * GIB => 2,
+        Some(per_worker_kib) if per_worker_kib < 16 * GIB => 4,
+        _ => 8,
+    };
+    by_cpu.min(by_mem).max(1)
+}
+
+/// Resolves `LEAN_NUM_THREADS` for `lake env lean` / `lake build` invocations,
+/// honoring an explicit `ANNEAL_ITREE_LEAN_THREADS` or `LEAN_NUM_THREADS`
+/// environment variable when set, and otherwise partitioning host + cgroup CPU
+/// quota and memory headroom across `active_workers`.
+pub fn resolve_itree_lean_threads(active_workers: usize) -> usize {
+    for var in ["ANNEAL_ITREE_LEAN_THREADS", "LEAN_NUM_THREADS"] {
+        if let Ok(val) = env::var(var)
+            && let Ok(parsed) = val.trim().parse::<usize>()
+            && parsed >= 1
+        {
+            return parsed.min(16);
+        }
+    }
+    let host_cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let cgroup_cores = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cg| cgroup_cpu_quota_cores(Path::new("/sys/fs/cgroup"), &cg));
+    let (_total_kib, avail_kib) = effective_memory_limits_kib();
+    itree_lean_threads_for_resources(host_cores, cgroup_cores, avail_kib, active_workers)
+}
+
+/// Computes `(lean_max_mb, rss_limit_kib)` for one `lake env lean` worker from
+/// effective `(total_kib, avail_kib)` and `active_workers`.
+///
+/// Reserves `min(20% of available, 2 GiB)` for the rest of the system / test
+/// runner, divides the remaining budget across `active_workers`, and clamps to
+/// `[MIN_ITREE_LEAN_RSS_LIMIT_KIB, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB]`.
+pub fn itree_lean_rss_budget_kib(
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> (u64, u64) {
+    const TWO_GIB_KIB: u64 = 2 * 1024 * 1024;
+    let workers = (active_workers.max(1)) as u64;
+    let mut rss_kib = DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB;
+
+    if let Some(avail) = avail_kib {
+        let reserve = (avail / 5).min(TWO_GIB_KIB);
+        let usable = avail.saturating_sub(reserve) / workers;
+        rss_kib = rss_kib.min(usable);
+    }
+    if let Some(total) = total_kib {
+        let usable_total = (total.saturating_mul(3) / 4) / workers;
+        rss_kib = rss_kib.min(usable_total);
+    }
+    let rss_limit_kib = rss_kib.clamp(
+        MIN_ITREE_LEAN_RSS_LIMIT_KIB,
+        DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+    );
+    let lean_max_mb = (rss_limit_kib / 1024).clamp(256, 8192);
+    (lean_max_mb, rss_limit_kib)
+}
+
+/// Resolves `(lean_max_mb, rss_limit_kib)` for one `lake env lean` worker,
+/// honoring `ANNEAL_ITREE_MAX_RSS_KIB` or `ANNEAL_ITREE_LEAN_MAX_MB` when set.
+pub fn resolve_itree_lean_rss_budget_kib(active_workers: usize) -> (u64, u64) {
+    let (total_kib, avail_kib) = effective_memory_limits_kib();
+    let (mut lean_max_mb, mut rss_limit_kib) =
+        itree_lean_rss_budget_kib(total_kib, avail_kib, active_workers);
+    if let Ok(val) = env::var("ANNEAL_ITREE_LEAN_MAX_MB")
+        && let Ok(parsed) = val.trim().parse::<u64>()
+        && parsed >= 64
+    {
+        lean_max_mb = parsed.min(16_384);
+        rss_limit_kib = lean_max_mb.saturating_mul(1024);
+    }
+    if let Ok(val) = env::var("ANNEAL_ITREE_MAX_RSS_KIB")
+        && let Ok(parsed) = val.trim().parse::<u64>()
+        && parsed >= 1024
+    {
+        rss_limit_kib = parsed;
+        lean_max_mb = (rss_limit_kib / 1024).clamp(64, 16_384);
+    }
+    (lean_max_mb, rss_limit_kib)
+}
+
+/// Resolves the per-invocation wall-clock timeout for `lake env lean`.
+pub fn resolve_itree_lean_timeout() -> Duration {
+    if let Ok(ms_str) = env::var("ANNEAL_ITREE_LEAN_TIMEOUT_MS")
+        && let Ok(ms) = ms_str.trim().parse::<u64>()
+        && ms >= 10
+    {
+        return Duration::from_millis(ms);
+    }
+    if let Ok(secs_str) = env::var("ANNEAL_ITREE_LEAN_TIMEOUT_SECS")
+        && let Ok(secs) = secs_str.trim().parse::<u64>()
+        && secs >= 1
+    {
+        return Duration::from_secs(secs);
+    }
+    DEFAULT_ITREE_LEAN_TIMEOUT
+}
+
+/// Parses `(state, ppid, starttime_ticks)` from `/proc/<pid>/stat` contents.
+///
+/// The `comm` field (field 2) is enclosed in `(` and `)` and may contain spaces,
+/// parentheses, or newlines, so we locate the last `)` before splitting the
+/// remaining fields by whitespace.
+/// After `)`:
+/// - token 0 is field 3 (`state`, e.g. `'R'`, `'S'`, `'Z'`),
+/// - token 1 is field 4 (`ppid`),
+/// - token 19 is field 22 (`starttime` in clock ticks since boot).
+pub fn parse_proc_stat_state_ppid_starttime(stat: &str) -> Option<(char, u32, u64)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let after_comm = stat.get(close + 1..)?.trim_start();
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    let starttime = fields.nth(17)?.parse::<u64>().ok()?;
+    Some((state, ppid, starttime))
+}
+
+fn proc_state_ppid_starttime_in(proc_root: &Path, pid: u32) -> Option<(char, u32, u64)> {
+    let stat_path = proc_root.join(pid.to_string()).join("stat");
+    let stat = fs::read_to_string(stat_path).ok()?;
+    parse_proc_stat_state_ppid_starttime(&stat)
+}
+
+fn proc_starttime_in(proc_root: &Path, pid: u32) -> Option<u64> {
+    proc_state_ppid_starttime_in(proc_root, pid).map(|(_, _, st)| st)
+}
+
+fn host_page_size_kib() -> u64 {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn sysconf(name: i32) -> std::ffi::c_long;
+        }
+        #[cfg(target_os = "linux")]
+        const SC_PAGESIZE: i32 = 30;
+        #[cfg(target_os = "macos")]
+        const SC_PAGESIZE: i32 = 29;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const SC_PAGESIZE: i32 = 30;
+        let bytes = unsafe { sysconf(SC_PAGESIZE) };
+        if bytes > 0 {
+            return (bytes as u64 / 1024).max(1);
+        }
+    }
+    4
+}
+
+/// Reads physical resident set size (RSS) in KiB for `pid` under `proc_root`,
+/// preferring `<proc_root>/<pid>/statm` (field 2 = resident pages) and falling
+/// back to `VmRSS:` in `<proc_root>/<pid>/status`.
+pub fn proc_rss_kib_in(proc_root: &Path, pid: u32, page_size_kib: u64) -> Option<u64> {
+    let pid_dir = proc_root.join(pid.to_string());
+    if let Ok(statm) = fs::read_to_string(pid_dir.join("statm"))
+        && let Some(res_pages_str) = statm.split_whitespace().nth(1)
+        && let Ok(res_pages) = res_pages_str.parse::<u64>()
+    {
+        return Some(res_pages.saturating_mul(page_size_kib.max(1)));
+    }
+    let status = fs::read_to_string(pid_dir.join("status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kib_str = rest.split_whitespace().next()?;
+            return kib_str.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// Tracks a root `lake env lean` process and all of its descendants across
+/// polling ticks by `(pid, starttime)` so that:
+/// 1. grandchildren whose intermediate parent exits and are reparented to PID 1
+///    or a subreaper remain tracked in the tree,
+/// 2. PID reuse after a child exits cannot cause the watchdog to misattribute
+///    RSS or signal an unrelated process whose `starttime` differs, and
+/// 3. descendants can be signaled in reverse-creation order (`(starttime, seq)`
+///    descending) even when Linux PID numbers wrap around `pid_max`.
+#[derive(Debug, Clone)]
+pub struct TrackedProcessTree {
+    root_pid: u32,
+    root_starttime: Option<u64>,
+    /// Map from `pid` to `(starttime_ticks, discovery_seq)` for every live
+    /// process known to belong to this process tree.
+    tracked: BTreeMap<u32, (u64, u64)>,
+    next_seq: u64,
+    proc_root: PathBuf,
+    page_size_kib: u64,
+}
+
+impl TrackedProcessTree {
+    /// Creates a new process-tree tracker rooted at `root_pid` using `/proc`.
+    pub fn new(root_pid: u32) -> Self {
+        Self::with_proc_root(root_pid, Path::new("/proc"), host_page_size_kib())
+    }
+
+    /// Creates a new process-tree tracker rooted at `root_pid` reading from a
+    /// custom `proc_root` and `page_size_kib` (used by deterministic unit tests).
+    pub fn with_proc_root(root_pid: u32, proc_root: &Path, page_size_kib: u64) -> Self {
+        let root_starttime = proc_starttime_in(proc_root, root_pid);
+        let mut tracked = BTreeMap::new();
+        let mut next_seq = 0u64;
+        if let Some(st) = root_starttime {
+            tracked.insert(root_pid, (st, next_seq));
+            next_seq += 1;
+        }
+        Self {
+            root_pid,
+            root_starttime,
+            tracked,
+            next_seq,
+            proc_root: proc_root.to_path_buf(),
+            page_size_kib: page_size_kib.max(1),
+        }
+    }
+
+    /// Refreshes the tracked process tree from `self.proc_root` and returns the
+    /// summed physical RSS (in KiB) of all live non-zombie processes in the tree.
+    pub fn sample_rss_kib(&mut self) -> u64 {
+        let Some(root_st) = self.root_starttime.or_else(|| {
+            let st = proc_starttime_in(&self.proc_root, self.root_pid)?;
+            self.root_starttime = Some(st);
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.tracked.insert(self.root_pid, (st, seq));
+            Some(st)
+        }) else {
+            return 0;
+        };
+
+        let Ok(entries) = fs::read_dir(&self.proc_root) else {
+            return proc_rss_kib_in(&self.proc_root, self.root_pid, self.page_size_kib)
+                .unwrap_or(0);
+        };
+
+        let mut children_by_ppid: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut live_meta: BTreeMap<u32, (char, u64)> = BTreeMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if let Some((state, ppid, st)) = proc_state_ppid_starttime_in(&self.proc_root, pid) {
+                children_by_ppid.entry(ppid).or_default().push(pid);
+                live_meta.insert(pid, (state, st));
+            }
+        }
+
+        // If `root_pid` exited or was recycled for an unrelated process, do not
+        // attribute its RSS.
+        match live_meta.get(&self.root_pid) {
+            Some(&(_, st)) if st == root_st => {}
+            _ => {
+                self.tracked.remove(&self.root_pid);
+                return 0;
+            }
+        }
+
+        // Prune any tracked PID that exited, turned into a zombie, or was reused
+        // with a different `starttime`.
+        self.tracked.retain(|&pid, &mut (expected_st, _seq)| {
+            matches!(
+                live_meta.get(&pid),
+                Some(&(state, actual_st)) if actual_st == expected_st && state != 'Z' && state != 'X'
+            )
+        });
+
+        // Expand from all verified tracked members to discover any new children
+        // or grandchildren (including descendants reparented before their parent
+        // exited).
+        let mut stack: Vec<u32> = self.tracked.keys().copied().collect();
+        while let Some(pid) = stack.pop() {
+            if let Some(children) = children_by_ppid.get(&pid) {
+                for &child_pid in children {
+                    if self.tracked.contains_key(&child_pid) {
+                        continue;
+                    }
+                    if let Some(&(state, child_st)) = live_meta.get(&child_pid)
+                        && state != 'Z'
+                        && state != 'X'
+                    {
+                        let seq = self.next_seq;
+                        self.next_seq += 1;
+                        self.tracked.insert(child_pid, (child_st, seq));
+                        stack.push(child_pid);
+                    }
+                }
+            }
+        }
+
+        let mut total_rss_kib = 0u64;
+        for (&pid, &(expected_st, _seq)) in &self.tracked {
+            if let Some(&(state, actual_st)) = live_meta.get(&pid)
+                && actual_st == expected_st
+                && state != 'Z'
+                && state != 'X'
+            {
+                total_rss_kib = total_rss_kib.saturating_add(
+                    proc_rss_kib_in(&self.proc_root, pid, self.page_size_kib).unwrap_or(0),
+                );
+            }
+        }
+        total_rss_kib
+    }
+
+    /// Returns tracked descendants (excluding `root_pid`) ordered newest-first
+    /// (`(starttime, discovery_seq)` descending) so children are signaled before
+    /// parents even when PID numbers wrap around `pid_max`.
+    pub fn descendant_kill_order(&self) -> Vec<(u32, u64)> {
+        let mut order: Vec<(u32, u64, u64)> = self
+            .tracked
+            .iter()
+            .filter(|&(&pid, _)| pid != self.root_pid)
+            .map(|(&pid, &(st, seq))| (pid, st, seq))
+            .collect();
+        order.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
+        order.into_iter().map(|(pid, st, _)| (pid, st)).collect()
+    }
+
+    /// Returns true if any tracked descendant (excluding `root_pid`) is still
+    /// alive (and not a zombie) with its recorded `starttime`.
+    pub fn has_live_descendants(&self) -> bool {
+        self.tracked.iter().any(|(&pid, &(expected_st, _))| {
+            pid != self.root_pid
+                && matches!(
+                    proc_state_ppid_starttime_in(&self.proc_root, pid),
+                    Some((state, _, actual_st))
+                        if actual_st == expected_st && state != 'Z' && state != 'X'
+                )
+        })
+    }
+
+    /// Signals all tracked descendants whose current `starttime` still matches
+    /// (`SIGTERM` followed by `SIGKILL` after `grace_period` if any remain).
+    pub fn kill_descendants(&mut self, grace_period: Duration) {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            const SIGTERM: i32 = 15;
+            const SIGKILL: i32 = 9;
+
+            let order = self.descendant_kill_order();
+            if order.is_empty() {
+                return;
+            }
+            for &(pid, expected_st) in &order {
+                if let Ok(ip) = i32::try_from(pid)
+                    && ip > 1
+                    && matches!(
+                        proc_state_ppid_starttime_in(&self.proc_root, pid),
+                        Some((state, _, actual_st))
+                            if actual_st == expected_st && state != 'Z' && state != 'X'
+                    )
+                {
+                    unsafe {
+                        let _ = kill(ip, SIGTERM);
+                    }
+                }
+            }
+            if !grace_period.is_zero() {
+                let deadline = Instant::now() + grace_period;
+                while Instant::now() < deadline {
+                    if !self.has_live_descendants() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            for &(pid, expected_st) in &order {
+                if let Ok(ip) = i32::try_from(pid)
+                    && ip > 1
+                    && matches!(
+                        proc_state_ppid_starttime_in(&self.proc_root, pid),
+                        Some((state, _, actual_st))
+                            if actual_st == expected_st && state != 'Z' && state != 'X'
+                    )
+                {
+                    unsafe {
+                        let _ = kill(ip, SIGKILL);
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grace_period;
+        }
+    }
+}
+
+/// Terminates `child` (spawned with `.process_group(0)` so `pgid == root_pid`)
+/// and all tracked descendants cleanly:
+/// 1. Refreshes `tree` while `child` is still un-reaped (`root_pid` cannot be
+///    reused before `wait()`).
+/// 2. Sends `SIGTERM` to `-pgid` and to all `(pid, starttime)`-verified
+///    descendants (in case a grandchild called `setsid` / `setpgid`).
+/// 3. Polls up to `grace_period` for `child` and all non-zombie descendants to
+///    exit.
+/// 4. Escalates to `SIGKILL` on `-pgid` and any surviving verified descendants,
+///    and reaps `child` via `child.wait()` so no zombie is left behind.
+fn terminate_process_tree(child: &mut Child, tree: &mut TrackedProcessTree, grace_period: Duration) {
+    let _ = tree.sample_rss_kib();
+    let mut root_reaped = child.try_wait().ok().flatten().is_some();
+
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        const SIGKILL: i32 = 9;
+
+        let pgid = i32::try_from(tree.root_pid).ok().filter(|&p| p > 1);
+        if !root_reaped && let Some(pg) = pgid {
+            unsafe {
+                let _ = kill(-pg, SIGTERM);
+            }
+        }
+        for (pid, expected_st) in tree.descendant_kill_order() {
+            if let Ok(ip) = i32::try_from(pid)
+                && ip > 1
+                && proc_starttime_in(&tree.proc_root, pid) == Some(expected_st)
+            {
+                unsafe {
+                    let _ = kill(ip, SIGTERM);
+                }
+            }
+        }
+
+        let deadline = Instant::now() + grace_period;
+        while Instant::now() < deadline {
+            if !root_reaped && child.try_wait().ok().flatten().is_some() {
+                root_reaped = true;
+            }
+            if root_reaped && !tree.has_live_descendants() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        if !root_reaped && let Some(pg) = pgid {
+            unsafe {
+                let _ = kill(-pg, SIGKILL);
+            }
+        }
+        for (pid, expected_st) in tree.descendant_kill_order() {
+            if let Ok(ip) = i32::try_from(pid)
+                && ip > 1
+                && proc_starttime_in(&tree.proc_root, pid) == Some(expected_st)
+            {
+                unsafe {
+                    let _ = kill(ip, SIGKILL);
+                }
+            }
+        }
+    }
+
+    if !root_reaped {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Classification of a `lake env lean` failure so `run_isolated_lean_stage` and
+/// callers can distinguish RSS/timeout watchdog terminations from genuine Lean
+/// elaboration errors or missing-toolchain failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItreeLeanFailureKind {
+    /// Killed by the process-tree RSS watchdog (`rss_kib > rss_limit_kib`).
+    RssWatchdogExceeded,
+    /// Killed by the wall-clock timeout watchdog (`elapsed >= timeout`).
+    WallClockTimeout,
+    /// Missing binary / systematic host setup failure (`command not found`).
+    MissingToolchain,
+    /// Lean elaboration / kernel / missing-output failure.
+    ElaborationOrOutputFailure,
+}
+
+/// Classifies an error string returned by `run_itree_lean_module` or a chunk
+/// runner closure.
+pub fn classify_itree_lean_failure(err: &str) -> ItreeLeanFailureKind {
+    if err.contains("[WATCHDOG:RSS_EXCEEDED]") || err.contains("exceeded RSS limit") {
+        ItreeLeanFailureKind::RssWatchdogExceeded
+    } else if err.contains("[WATCHDOG:TIMEOUT]") || err.contains("exceeded wall-clock timeout") {
+        ItreeLeanFailureKind::WallClockTimeout
+    } else if err.contains("command not found") || err.contains("No such file or directory") {
+        ItreeLeanFailureKind::MissingToolchain
+    } else {
+        ItreeLeanFailureKind::ElaborationOrOutputFailure
+    }
+}
+
+/// Result of running a `Command` under [`run_command_with_watchdog`].
+#[derive(Debug, Clone)]
+pub struct WatchdogCommandOutput {
+    /// Exit status of the root process (`None` if killed by the watchdog).
+    pub exit_success: bool,
+    /// Captured standard output.
+    pub stdout: Vec<u8>,
+    /// Captured standard error.
+    pub stderr: Vec<u8>,
+    /// Peak process-tree physical RSS observed (in KiB).
+    pub peak_rss_kib: u64,
+    /// Watchdog termination reason if the process tree was killed by the
+    /// watchdog (`Some(ItreeLeanFailureKind::RssWatchdogExceeded | WallClockTimeout)`).
+    pub watchdog_killed: Option<ItreeLeanFailureKind>,
+}
+
+/// Spawns `cmd` in its own Unix process group (`.process_group(0)`), drains
+/// stdout/stderr concurrently on background threads so pipe buffers never
+/// deadlock, and polls the process tree's `(pid, starttime)` `/proc` RSS and
+/// wall-clock elapsed time.
+pub fn run_command_with_watchdog(
+    mut cmd: Command,
+    rss_limit_kib: u64,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<WatchdogCommandOutput, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    let root_pid = child.id();
+    let mut tree = TrackedProcessTree::new(root_pid);
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let poll = poll_interval.max(Duration::from_millis(5));
+
+    std::thread::scope(|s| {
+        let out_handle = s.spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let err_handle = s.spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let start = Instant::now();
+        let mut peak_rss_kib = tree.sample_rss_kib();
+        let mut watchdog_killed: Option<ItreeLeanFailureKind> = None;
+        let mut exit_success = false;
+
+        if peak_rss_kib > rss_limit_kib {
+            watchdog_killed = Some(ItreeLeanFailureKind::RssWatchdogExceeded);
+            terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
+        } else {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        exit_success = status.success();
+                        // Clean up any stray background descendants using
+                        // `(pid, starttime)` checks only (never `-pgid` after
+                        // `root_pid` has been reaped).
+                        tree.kill_descendants(Duration::ZERO);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
+                        let _ = out_handle.join();
+                        let _ = err_handle.join();
+                        return Err(format!("failed polling child process {root_pid}: {e}"));
+                    }
+                }
+
+                let rss_kib = tree.sample_rss_kib();
+                peak_rss_kib = peak_rss_kib.max(rss_kib);
+                if rss_kib > rss_limit_kib {
+                    watchdog_killed = Some(ItreeLeanFailureKind::RssWatchdogExceeded);
+                    terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
+                    break;
+                }
+                if start.elapsed() >= timeout {
+                    watchdog_killed = Some(ItreeLeanFailureKind::WallClockTimeout);
+                    terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
+                    break;
+                }
+                std::thread::sleep(poll);
+            }
+        }
+
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
+        Ok(WatchdogCommandOutput {
+            exit_success,
+            stdout,
+            stderr,
+            peak_rss_kib,
+            watchdog_killed,
+        })
+    })
 }
 
 fn fnv1a_64_update(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -374,25 +1259,37 @@ fn truncate_lean_diag(msg: &str) -> String {
 /// Outcome of [`run_isolated_lean_stage`].
 #[derive(Debug)]
 struct IsolatedLeanStage<X> {
-    /// Per-case results for every case whose chunk or per-candidate fallback
-    /// module succeeded.
+    /// Per-case results for every case whose chunk, per-candidate fallback, or
+    /// bisected sub-chunk succeeded.
     results: BTreeMap<String, X>,
     /// Candidates (root fn names) owning at least one case without a result.
     failed_fns: BTreeSet<String>,
-    /// Truncated diagnostics for each failed chunk or fallback run.
+    /// Truncated diagnostics for each failed chunk, fallback, or irreducible
+    /// single-case bisection run.
     errors: Vec<String>,
 }
 
-/// Runs one chunked Lean stage with failure isolation.
+/// Runs one chunked Lean stage with failure isolation and multi-case bisection.
 ///
 /// `cases` are split into chunks of at most `chunk_size`, evaluated by
 /// `run_chunk(label, chunk)` in waves of at most `jobs` concurrent workers.
 /// A chunk only counts as successful if `run_chunk` returns a result for every
 /// case in it; a failed, incomplete, or panicking chunk is re-run one candidate
-/// at a time (`{stage_label}Fallback_<fn>`), so only the offending candidate(s)
-/// end up in `failed_fns`. After [`ITREE_FALLBACK_CIRCUIT_BREAKER`] consecutive
-/// fallback failures without any fallback success, remaining fallbacks are
-/// skipped (their candidates fail) to bound the cost of systematic failures.
+/// at a time (`{stage_label}Fallback_<fn>`).
+///
+/// When a multi-case candidate fallback (`fn_cases.len() > 1`) fails due to an
+/// RSS/timeout watchdog kill or elaboration error (excluding missing-toolchain
+/// errors), `fn_cases` is recursively bisected (`{stage_label}Bisect_<fn>_...`)
+/// down to individual cases so that:
+/// 1. candidates whose combined trace module exceeded the RSS/timeout limit
+///    recover completely when smaller sub-slices succeed, and
+/// 2. if an irreducible single case (`slice.len() == 1`) exceeds limits or
+///    fails elaboration, healthy sibling cases are still recovered into
+///    `results` and `errors` records an explicit single-case diagnostic.
+///
+/// After [`ITREE_FALLBACK_CIRCUIT_BREAKER`] consecutive candidate fallback
+/// failures without any recovery, remaining fallbacks are skipped to bound the
+/// cost of systematic failures.
 fn run_isolated_lean_stage<C, X, K, F>(
     stage_label: &str,
     cases: &[C],
@@ -490,8 +1387,73 @@ where
             match accept(&mut results, &fn_cases, res, &label) {
                 Ok(()) => fallback_successes += 1,
                 Err(e) => {
-                    fallback_failures += 1;
+                    let failure_kind = classify_itree_lean_failure(&e);
                     errors.push(e);
+                    if fn_cases.len() > 1
+                        && failure_kind != ItreeLeanFailureKind::MissingToolchain
+                    {
+                        let recovered_before = results.len();
+                        let mut bisect_stack: Vec<(usize, usize)> = vec![(0, fn_cases.len())];
+                        let mut first_split = true;
+                        while let Some((lo, hi)) = bisect_stack.pop() {
+                            let slice = &fn_cases[lo..hi];
+                            if first_split && slice.len() > 1 {
+                                first_split = false;
+                                let mid = lo + slice.len() / 2;
+                                bisect_stack.push((mid, hi));
+                                bisect_stack.push((lo, mid));
+                                continue;
+                            }
+                            let sub_label = if slice.len() == 1 {
+                                format!(
+                                    "{stage_label}Bisect_{fn_name}_{}",
+                                    case_key(&slice[0])
+                                )
+                            } else {
+                                format!("{stage_label}Bisect_{fn_name}_{lo}_{hi}")
+                            };
+                            let sub_res =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_chunk(&sub_label, slice)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err("Lean bisect worker panicked".to_string())
+                                });
+                            if let Err(sub_err) =
+                                accept(&mut results, slice, sub_res, &sub_label)
+                            {
+                                if slice.len() == 1 {
+                                    let single_key = case_key(&slice[0]);
+                                    errors.push(format!(
+                                        "{sub_label} (irreducible single case `{single_key}` of `{fn_name}`): {}",
+                                        truncate_lean_diag(&sub_err)
+                                    ));
+                                } else {
+                                    errors.push(sub_err);
+                                    if classify_itree_lean_failure(
+                                        errors.last().map(String::as_str).unwrap_or(""),
+                                    ) != ItreeLeanFailureKind::MissingToolchain
+                                    {
+                                        let mid = lo + slice.len() / 2;
+                                        bisect_stack.push((mid, hi));
+                                        bisect_stack.push((lo, mid));
+                                    }
+                                }
+                            }
+                        }
+                        if results.len() == recovered_before + fn_cases.len() {
+                            // All cases of `fn_name` succeeded once split into
+                            // smaller modules (e.g. batch RSS/timeout exceeded).
+                            fallback_successes += 1;
+                        } else {
+                            if results.len() > recovered_before {
+                                fallback_successes += 1;
+                            }
+                            fallback_failures += 1;
+                        }
+                    } else {
+                        fallback_failures += 1;
+                    }
                 }
             }
         }
@@ -515,32 +1477,90 @@ where
     }
 }
 
-/// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M 8192`
-/// on it from `anneal_dir`, returning stdout on success.
+/// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M <mb>`
+/// on it from `anneal_dir` under [`run_command_with_watchdog`], bounding
+/// `LEAN_NUM_THREADS`, Lean's internal allocator (`-M`), the process tree's
+/// physical RSS, and wall-clock runtime.
+fn run_itree_lean_module_with_workers(
+    verify_dir: &Path,
+    anneal_dir: &Path,
+    label: &str,
+    src: &str,
+    active_workers: usize,
+) -> Result<String, String> {
+    let file = verify_dir.join(format!("{label}.lean"));
+    fs::write(&file, src).map_err(|e| format!("failed to write {}: {e}", file.display()))?;
+    let (lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_kib(active_workers);
+    let lean_threads = resolve_itree_lean_threads(active_workers);
+    let timeout = resolve_itree_lean_timeout();
+
+    let mut cmd = Command::new("lake");
+    cmd.args(["env", "lean", "-M", &lean_max_mb.to_string()])
+        .arg(&file)
+        .current_dir(anneal_dir)
+        .env("LEAN_NUM_THREADS", lean_threads.to_string());
+
+    let out = run_command_with_watchdog(
+        cmd,
+        rss_limit_kib,
+        timeout,
+        ITREE_WATCHDOG_POLL_INTERVAL,
+    )
+    .map_err(|e| format!("failed to run `lake env lean` on {}: {e}", file.display()))?;
+
+    match out.watchdog_killed {
+        Some(ItreeLeanFailureKind::RssWatchdogExceeded) => {
+            return Err(format!(
+                "[WATCHDOG:RSS_EXCEEDED] `{}` exceeded RSS limit ({} KiB > {} KiB, -M {} MiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                file.display(),
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_max_mb,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Some(ItreeLeanFailureKind::WallClockTimeout) => {
+            return Err(format!(
+                "[WATCHDOG:TIMEOUT] `{}` exceeded wall-clock timeout ({:?}, peak RSS {} KiB / {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                file.display(),
+                timeout,
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        _ => {}
+    }
+
+    if !out.exit_success {
+        return Err(format!(
+            "`{}` failed (peak RSS {} KiB / {} KiB, -M {} MiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+            file.display(),
+            out.peak_rss_kib,
+            rss_limit_kib,
+            lean_max_mb,
+            lean_threads,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean` under the
+/// RSS + wall-clock watchdog with default concurrency (`1`).
+#[allow(dead_code)]
 fn run_itree_lean_module(
     verify_dir: &Path,
     anneal_dir: &Path,
     label: &str,
     src: &str,
 ) -> Result<String, String> {
-    let file = verify_dir.join(format!("{label}.lean"));
-    fs::write(&file, src).map_err(|e| format!("failed to write {}: {e}", file.display()))?;
-    let out = Command::new("lake")
-        .args(["env", "lean", "-M", "8192"])
-        .arg(&file)
-        .current_dir(anneal_dir)
-        .output()
-        .map_err(|e| format!("failed to run `lake env lean` on {}: {e}", file.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "`{}` failed ({}):\nstdout:\n{}\nstderr:\n{}",
-            file.display(),
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    run_itree_lean_module_with_workers(verify_dir, anneal_dir, label, src, 1)
 }
 
 fn batch_case_ident(case: &BatchTraceEvalCase) -> &str {
@@ -1292,11 +2312,43 @@ fn build_candidate_trial_inputs(
         (0x414E_4E4C, 2048, true),
     ];
 
-    let mut out = Vec::with_capacity(count);
+    // Synthesize concolic `ArgPinConstraint` argument-pin-negated and
+    // prefix-guard-preserving trials from `cand.source` and `dict`.
+    let staged_prefix = staged
+        .root_fn_name
+        .strip_suffix("kernel_step")
+        .unwrap_or("b0_c0__");
+    let concolic_trials = synthesize_itree_concolic_trials(
+        &cand.source,
+        "kernel_step",
+        staged_prefix,
+        &staged.ext_callee_names,
+        &dict,
+        count.max(12),
+        cand.seed_u64 ^ batch_seed,
+    );
+    let mut concolic_arg_trials: Vec<(u32, u32)> = Vec::new();
+    for &(m, p, _) in &concolic_trials {
+        if !concolic_arg_trials.contains(&(m, p)) {
+            concolic_arg_trials.push((m, p));
+        }
+    }
+    let mut concolic_cursor = 0usize;
+
+    // For mutated candidates, keep the first 3 core seed probes and dedicate
+    // the remaining trial budget to concolic `argPinTerm`-negated trials before
+    // cycling pure oracle return-value perturbations.
+    let fixed_probe_cap = if cand.applied_mutators.is_empty() {
+        fixed_probes.len()
+    } else {
+        3.min(fixed_probes.len())
+    };
+
+    let mut out: Vec<CandidateTrialInput> = Vec::with_capacity(count);
     let mut rng = DetRng::new(cand.seed_u64 ^ batch_seed);
     let mut dynamic_idx = 0usize;
     for idx in 0..count {
-        if idx < fixed_probes.len() && idx + 2 <= count {
+        if idx < fixed_probe_cap && idx + 2 <= count {
             let (magic, payload_len, inject_panic) = fixed_probes[idx];
             let schedule = if inject_panic {
                 EnvSchedule::new().with_panic_on_call(0)
@@ -1315,10 +2367,34 @@ fn build_candidate_trial_inputs(
             chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
         }
         let mut u = Unstructured::new(&entropy);
-        let raw = builder.build_bytes(&pair_layout, &mut u);
-        let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        let payload_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        let schedule = if dynamic_idx % 2 == 1 && !callee_refs.is_empty() {
+
+        // Steer call arguments via `argPinTerm` negation while unseen concolic
+        // argument pairs remain, before falling back to byte-builder + oracle
+        // return-value schedules.
+        let mut chosen_pair: Option<(u32, u32)> = None;
+        while concolic_cursor < concolic_arg_trials.len() {
+            let pair = concolic_arg_trials[concolic_cursor];
+            concolic_cursor += 1;
+            if !out
+                .iter()
+                .any(|t| t.magic == pair.0 && t.payload_len == pair.1)
+            {
+                chosen_pair = Some(pair);
+                break;
+            }
+        }
+        let (magic, payload_len, is_arg_pin_trial) = match chosen_pair {
+            Some((m, p)) => (m, p, true),
+            None => {
+                let raw = builder.build_bytes(&pair_layout, &mut u);
+                (
+                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+                    false,
+                )
+            }
+        };
+        let schedule = if !is_arg_pin_trial && dynamic_idx % 2 == 1 && !callee_refs.is_empty() {
             sched_gen.generate_schedule(&callee_refs, &mut u)
         } else {
             EnvSchedule::new()
@@ -2259,7 +3335,13 @@ fn evaluate_itree_entries(
             &case_to_fn,
             |label: &str, chunk: &[BatchTraceEvalCase]| {
                 let src = render_batch_trace_probe_lean_module(&format!("Proof.{label}"), chunk);
-                let stdout = run_itree_lean_module(&verify_dir, &anneal_dir, label, &src)?;
+                let stdout = run_itree_lean_module_with_workers(
+                    &verify_dir,
+                    &anneal_dir,
+                    label,
+                    &src,
+                    lean_jobs,
+                )?;
                 let parsed = parse_batch_trace_probe_output(&stdout);
                 for c in chunk {
                     if !parsed.contains_key(&c.case_ident) {
@@ -2347,7 +3429,13 @@ fn evaluate_itree_entries(
             |label: &str, chunk: &[BatchTraceEvalCase]| {
                 let src =
                     render_batch_trace_eval_lean_module(&format!("Proof.{label}"), chunk, false);
-                run_itree_lean_module(&verify_dir, &anneal_dir, label, &src)?;
+                run_itree_lean_module_with_workers(
+                    &verify_dir,
+                    &anneal_dir,
+                    label,
+                    &src,
+                    lean_jobs,
+                )?;
                 Ok(chunk
                     .iter()
                     .map(|c| {
@@ -3294,23 +4382,14 @@ pub fn reproduce_itree_finding(
             "Proof.ItreeDiffReproProbe",
             std::slice::from_ref(&case),
         );
-        let probe_file = verify_dir.join("ItreeDiffReproProbe.lean");
-        fs::write(&probe_file, &probe_src)
-            .map_err(|e| format!("failed to write {}: {e}", probe_file.display()))?;
-        let probe_out = Command::new("lake")
-            .args(["env", "lean", "-M", "4096"])
-            .arg(&probe_file)
-            .current_dir(&anneal_dir)
-            .output()
-            .map_err(|e| format!("failed to run probe in repro: {e}"))?;
-        if !probe_out.status.success() {
-            return Err(format!(
-                "repro probe failed:\n{}",
-                String::from_utf8_lossy(&probe_out.stderr)
-            ));
-        }
-        let probe_map =
-            parse_batch_trace_probe_output(&String::from_utf8_lossy(&probe_out.stdout));
+        let probe_stdout = run_itree_lean_module(
+            &verify_dir,
+            &anneal_dir,
+            "ItreeDiffReproProbe",
+            &probe_src,
+        )
+        .map_err(|e| format!("repro probe failed:\n{e}"))?;
+        let probe_map = parse_batch_trace_probe_output(&probe_stdout);
         let (diag_tag, diag_repr) = probe_map
             .get("repro_case")
             .cloned()
@@ -3322,16 +4401,13 @@ pub fn reproduce_itree_finding(
             std::slice::from_ref(&case),
             false,
         );
-        let confirm_file = verify_dir.join("ItreeDiffRepro.lean");
-        fs::write(&confirm_file, &confirm_src)
-            .map_err(|e| format!("failed to write {}: {e}", confirm_file.display()))?;
-        let confirm_out = Command::new("lake")
-            .args(["env", "lean", "-M", "4096"])
-            .arg(&confirm_file)
-            .current_dir(&anneal_dir)
-            .output()
-            .map_err(|e| format!("failed to run confirm in repro: {e}"))?;
-        let kernel_confirmed = confirm_out.status.success();
+        let kernel_confirmed = run_itree_lean_module(
+            &verify_dir,
+            &anneal_dir,
+            "ItreeDiffRepro",
+            &confirm_src,
+        )
+        .is_ok();
         let verdict = if diag_tag == "ok" {
             "agree".to_string()
         } else {
@@ -4727,6 +5803,327 @@ mod tests {
             covered.len(),
             MARKERS.len(),
             "expected ITree ddmin coverage of both Episode 1 variants, covered {covered:?}"
+        );
+    }
+
+    #[test]
+    fn cgroup_v1_v2_memory_and_cpu_quotas_and_lean_budgets_respect_tightest_limits() {
+        let root = std::env::temp_dir().join(format!(
+            "anneal-itree-cg-v1v2-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let v2_leaf = root.join("v2/user.slice/run.scope");
+        fs::create_dir_all(&v2_leaf).expect("create v2 cgroup tree");
+        // user.slice: memory.max = 24 GiB, memory.high = 16 GiB (tighter than max),
+        // memory.stat anon=3 GiB, shmem=1 GiB, file=8 GiB (reclaimable page cache
+        // ignored in working-set calculation) -> 16 - 4 = 12 GiB headroom.
+        fs::write(
+            root.join("v2/user.slice/memory.max"),
+            format!("{}\n", 24 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("v2/user.slice/memory.high"),
+            format!("{}\n", 16 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("v2/user.slice/memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\n",
+                3 * GIB_KIB * 1024,
+                8 * GIB_KIB * 1024,
+                GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("v2/user.slice/cpu.max"), "600000 100000\n").unwrap();
+        // run.scope: memory.max = max, memory.high = 10 GiB, memory.stat anon=2 GiB -> 8 GiB headroom,
+        // cpu.max = 250000 100000 -> ceil(2.5) = 3 cores.
+        fs::write(v2_leaf.join("memory.max"), "max\n").unwrap();
+        fs::write(
+            v2_leaf.join("memory.high"),
+            format!("{}\n", 10 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            v2_leaf.join("memory.stat"),
+            format!("anon {}\nshmem 0\n", 2 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(v2_leaf.join("cpu.max"), "250000 100000\n").unwrap();
+
+        let (v2_limit, v2_headroom) =
+            cgroup_memory_limits_kib(&root.join("v2"), "0::/user.slice/run.scope\n");
+        assert_eq!(v2_limit, Some(10 * GIB_KIB));
+        assert_eq!(v2_headroom, Some(8 * GIB_KIB));
+        assert_eq!(
+            cgroup_cpu_quota_cores(&root.join("v2"), "0::/user.slice/run.scope\n"),
+            Some(3)
+        );
+
+        // Cgroup v1 hierarchy with hierarchical_memory_limit and cfs_quota_us.
+        let v1_mem = root.join("v1/memory/kubepods/pod1");
+        let v1_cpu = root.join("v1/cpu,cpuacct/kubepods/pod1");
+        fs::create_dir_all(&v1_mem).unwrap();
+        fs::create_dir_all(&v1_cpu).unwrap();
+        fs::write(
+            v1_mem.join("memory.limit_in_bytes"),
+            format!("{}\n", 12 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            v1_mem.join("memory.stat"),
+            format!(
+                "hierarchical_memory_limit {}\ntotal_rss {}\ntotal_shmem {}\n",
+                8 * GIB_KIB * 1024,
+                2 * GIB_KIB * 1024,
+                GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+        fs::write(v1_cpu.join("cpu.cfs_quota_us"), "400000\n").unwrap();
+        fs::write(v1_cpu.join("cpu.cfs_period_us"), "100000\n").unwrap();
+
+        let v1_cg_text = "6:cpu,cpuacct:/kubepods/pod1\n12:memory:/kubepods/pod1\n";
+        let (v1_limit, v1_headroom) = cgroup_memory_limits_kib(&root.join("v1"), v1_cg_text);
+        assert_eq!(v1_limit, Some(8 * GIB_KIB));
+        assert_eq!(v1_headroom, Some(5 * GIB_KIB));
+        assert_eq!(
+            cgroup_cpu_quota_cores(&root.join("v1"), v1_cg_text),
+            Some(4)
+        );
+
+        // Thread & RSS budget calculations.
+        assert_eq!(
+            itree_lean_threads_for_resources(16, Some(4), Some(12 * GIB_KIB), 2),
+            2
+        );
+        assert_eq!(
+            itree_lean_threads_for_resources(16, None, Some(3 * GIB_KIB), 1),
+            1
+        );
+        let (lean_mb, rss_kib) =
+            itree_lean_rss_budget_kib(Some(10 * GIB_KIB), Some(5 * GIB_KIB), 2);
+        // 5 GiB avail -> reserve 1 GiB -> 4 GiB usable / 2 workers = 2 GiB per worker.
+        assert_eq!(rss_kib, 2 * GIB_KIB);
+        assert_eq!(lean_mb, 2048);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tracked_process_tree_measures_rss_handles_pid_wraparound_and_rejects_pid_reuse() {
+        let proc_dir = std::env::temp_dir().join(format!(
+            "anneal-itree-proc-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&proc_dir).unwrap();
+
+        let write_proc = |pid: u32, comm: &str, state: char, ppid: u32, st: u64, pages: u64| {
+            let d = proc_dir.join(pid.to_string());
+            fs::create_dir_all(&d).unwrap();
+            // 19 fields after `)`: state(0), ppid(1), pgrp..itrealvalue(17 fields), starttime(19).
+            let zeros = vec!["0"; 17].join(" ");
+            let stat = format!("{pid} ({comm}) {state} {ppid} {zeros} {st} 0 0\n");
+            fs::write(d.join("stat"), stat).unwrap();
+            fs::write(d.join("statm"), format!("1000 {pages} 0 0 0 0 0\n")).unwrap();
+        };
+
+        // Root PID 30000 (100 pages = 400 KiB), child PID 32700 (starttime 200, 250 pages = 1000 KiB),
+        // grandchild PID 105 (wrapped around pid_max, starttime 300, 500 pages = 2000 KiB).
+        write_proc(30000, "lake (env)", 'S', 1, 100, 100);
+        write_proc(32700, "lean worker)", 'R', 30000, 200, 250);
+        write_proc(105, "lean (child)", 'R', 32700, 300, 500);
+
+        let mut tree = TrackedProcessTree::with_proc_root(30000, &proc_dir, 4);
+        assert_eq!(tree.sample_rss_kib(), 400 + 1000 + 2000);
+
+        // Descendant kill order must put newest grandchild (PID 105, starttime 300)
+        // before its parent (PID 32700, starttime 200) despite 105 < 32700.
+        assert_eq!(tree.descendant_kill_order(), vec![(105, 300), (32700, 200)]);
+
+        // Now simulate intermediate parent PID 32700 exiting and its PID being
+        // immediately reused by an unrelated process (starttime 999, 5000 pages),
+        // while grandchild PID 105 is reparented to PID 1.
+        write_proc(32700, "unrelated", 'R', 1, 999, 5000);
+        write_proc(105, "lean (child)", 'R', 1, 300, 600);
+
+        // `sample_rss_kib` must prune the reused PID 32700 (starttime 999 != 200)
+        // while retaining reparented grandchild PID 105 (400 + 2400 = 2800 KiB).
+        assert_eq!(tree.sample_rss_kib(), 400 + 2400);
+        assert_eq!(tree.descendant_kill_order(), vec![(105, 300)]);
+
+        let _ = fs::remove_dir_all(&proc_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kills_runaway_process_tree_on_timeout_and_rss_and_cleans_up_children() {
+        // 1. Wall-clock timeout test with a child that spawns a background grandchild.
+        let pid_file = std::env::temp_dir().join(format!(
+            "anneal-itree-watchdog-grandchild-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "sleep 60 & echo $! > {}; wait",
+                pid_file.display()
+            ));
+        let out = run_command_with_watchdog(
+            cmd,
+            DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+            Duration::from_millis(150),
+            Duration::from_millis(15),
+        )
+        .expect("run command under timeout watchdog");
+        assert_eq!(
+            out.watchdog_killed,
+            Some(ItreeLeanFailureKind::WallClockTimeout)
+        );
+        if let Ok(gc_pid_str) = fs::read_to_string(&pid_file)
+            && let Ok(gc_pid) = gc_pid_str.trim().parse::<u32>()
+        {
+            // Grandchild must be dead (or not running `sleep`).
+            let state = proc_state_ppid_starttime_in(Path::new("/proc"), gc_pid);
+            assert!(
+                state.is_none() || matches!(state, Some(('Z' | 'X', _, _))),
+                "grandchild PID {gc_pid} should have been terminated by watchdog, got {state:?}"
+            );
+        }
+        let _ = fs::remove_file(&pid_file);
+
+        // 2. RSS watchdog test: set an artificially tight 1 KiB RSS ceiling so any
+        //    live child exceeds it immediately and is killed with `RssWatchdogExceeded`.
+        let mut rss_cmd = Command::new("sh");
+        rss_cmd.arg("-c").arg("sleep 30");
+        let rss_out = run_command_with_watchdog(
+            rss_cmd,
+            1, // 1 KiB ceiling -> guaranteed immediate RSS watchdog trigger
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .expect("run command under RSS watchdog");
+        assert_eq!(
+            rss_out.watchdog_killed,
+            Some(ItreeLeanFailureKind::RssWatchdogExceeded)
+        );
+        assert!(rss_out.peak_rss_kib > 1);
+    }
+
+    #[test]
+    fn isolated_lean_stage_bisects_watchdog_failures_and_isolates_irreducible_single_case() {
+        let (cases, case_to_fn) = stage_fixture(&[
+            ("cand_batch_heavy", 4),
+            ("cand_one_poison", 4),
+            ("cand_healthy", 2),
+        ]);
+        // Scenario:
+        // - `cand_batch_heavy` fails with `[WATCHDOG:RSS_EXCEEDED]` whenever > 2 of
+        //   its cases are evaluated in one module, but succeeds when bisected into
+        //   2-case sub-modules! So `cand_batch_heavy` must be 100% recovered.
+        // - `cand_one_poison` has one irreducible poison case `case_cand_one_poison_t2`
+        //   that always hits `[WATCHDOG:TIMEOUT]`, while `t0`, `t1`, and `t3` succeed
+        //   once isolated by bisection.
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            6,
+            2,
+            ident,
+            &case_to_fn,
+            |_label: &str, chunk: &[String]| {
+                let heavy_count = chunk
+                    .iter()
+                    .filter(|c| case_to_fn[*c] == "cand_batch_heavy")
+                    .count();
+                if heavy_count > 2 {
+                    return Err(
+                        "[WATCHDOG:RSS_EXCEEDED] module exceeded RSS limit (9000000 KiB > 8388608 KiB)"
+                            .to_string(),
+                    );
+                }
+                if chunk.iter().any(|c| c == "case_cand_one_poison_t2") {
+                    return Err(
+                        "[WATCHDOG:TIMEOUT] module exceeded wall-clock timeout (180s)"
+                            .to_string(),
+                    );
+                }
+                ok_all(chunk)
+            },
+        );
+
+        // `cand_batch_heavy` (all 4 cases) and `cand_healthy` (all 2 cases) must
+        // be completely recovered, plus the 3 healthy cases of `cand_one_poison`.
+        assert_eq!(
+            stage.failed_fns,
+            BTreeSet::from(["cand_one_poison".to_string()]),
+            "only cand_one_poison has an unrecovered case; cand_batch_heavy recovered via bisection"
+        );
+        for t in 0..4 {
+            assert!(
+                stage
+                    .results
+                    .contains_key(&format!("case_cand_batch_heavy_t{t}")),
+                "cand_batch_heavy case t{t} should be recovered by bisection"
+            );
+        }
+        for t in [0, 1, 3] {
+            assert!(
+                stage
+                    .results
+                    .contains_key(&format!("case_cand_one_poison_t{t}")),
+                "cand_one_poison healthy sibling case t{t} should be recovered by bisection"
+            );
+        }
+        assert!(
+            !stage.results.contains_key("case_cand_one_poison_t2"),
+            "irreducible poison case must not be in results"
+        );
+        assert!(
+            stage.errors.iter().any(|e| {
+                e.contains("irreducible single case `case_cand_one_poison_t2` of `cand_one_poison`")
+                    && e.contains("[WATCHDOG:TIMEOUT]")
+            }),
+            "expected explicit irreducible single-case diagnostic in {:?}",
+            stage.errors
+        );
+    }
+
+    #[test]
+    fn build_candidate_trial_inputs_incorporates_concolic_arg_pin_negated_trials() {
+        let cand = generate_itree_batch(ITREE_SAFE_SEEDS, 8, 0xABCD_1234)
+            .into_iter()
+            .find(|c| {
+                c.applied_mutators
+                    .iter()
+                    .any(|m| m == "CallBoundaryOutliner" || m == "ExtOracleInjector")
+            })
+            .expect("candidate with CallBoundaryOutliner or ExtOracleInjector");
+        let staged =
+            stage_itree_candidate_items(&cand.source, "b0_c0__", "kernel_step").expect("stage");
+        let trials = build_candidate_trial_inputs(&cand, &staged, None, 12, 0xABCD_1234);
+        assert_eq!(trials.len(), 12);
+
+        let distinct_arg_pairs: BTreeSet<(u32, u32)> =
+            trials.iter().map(|t| (t.magic, t.payload_len)).collect();
+        assert!(
+            distinct_arg_pairs.len() >= 8,
+            "expected concolic argPinTerm negation to produce >= 8 distinct (magic, payload_len) pairs across 12 trials, got {}",
+            distinct_arg_pairs.len()
         );
     }
 }

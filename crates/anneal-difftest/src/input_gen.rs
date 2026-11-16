@@ -1630,6 +1630,974 @@ impl<'a> EnvScheduleGenerator<'a> {
 
         schedule
     }
+
+    /// Synthesizes up to `max_trials` deduplicated concolic trial plans from an
+    /// initial concrete execution (`base_fields`, `guards`, `pins`), prioritizing
+    /// external-call argument-pin negation (`neg_arg_pin_term`) under preserved
+    /// prefix branch guards (`0..pin.before_guard_idx`) and earlier full call pins
+    /// (`0..pin_idx`) before exploring pure oracle return-value perturbations or
+    /// branch-guard flips.
+    pub fn synthesize_concolic_trials(
+        &self,
+        base_fields: &BTreeMap<String, u128>,
+        guards: &[ConcolicBranchGuard],
+        pins: &[ArgPinConstraint],
+        max_trials: usize,
+        u: &mut Unstructured<'_>,
+    ) -> Vec<ConcolicTrialPlan> {
+        if max_trials == 0 {
+            return Vec::new();
+        }
+        let mut working_pins: Vec<ArgPinConstraint> = pins.to_vec();
+        let mut out: Vec<ConcolicTrialPlan> = Vec::with_capacity(max_trials);
+        let mut seen_keys: BTreeSet<(Vec<(String, u128)>, Vec<(String, Vec<Vec<u8>>)>, Option<usize>)> =
+            BTreeSet::new();
+
+        let record_plan = |out: &mut Vec<ConcolicTrialPlan>,
+                           seen: &mut BTreeSet<(
+                               Vec<(String, u128)>,
+                               Vec<(String, Vec<Vec<u8>>)>,
+                               Option<usize>,
+                           )>,
+                           plan: ConcolicTrialPlan|
+         -> bool {
+            let field_key: Vec<(String, u128)> = plan
+                .input_fields
+                .iter()
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+            let sched_key: Vec<(String, Vec<Vec<u8>>)> = plan
+                .schedule
+                .callee_queues
+                .iter()
+                .map(|(k, q)| (k.clone(), q.iter().cloned().collect()))
+                .collect();
+            let panic_key = plan.schedule.global_panic_on_call;
+            if seen.insert((field_key, sched_key, panic_key)) {
+                out.push(plan);
+                true
+            } else {
+                false
+            }
+        };
+
+        // Seed the seen set with the initial concrete run so every synthesized trial is new.
+        {
+            let mut init_sched = EnvSchedule::new();
+            for p in &working_pins {
+                init_sched.push_callee_response(&p.callee, p.ret_bytes.clone());
+            }
+            let init_fields: Vec<(String, u128)> =
+                base_fields.iter().map(|(k, &v)| (k.clone(), v)).collect();
+            let init_sched_key: Vec<(String, Vec<Vec<u8>>)> = init_sched
+                .callee_queues
+                .iter()
+                .map(|(k, q)| (k.clone(), q.iter().cloned().collect()))
+                .collect();
+            seen_keys.insert((init_fields, init_sched_key, None));
+        }
+
+        // Phase 1: Relax external-call argument pins (`neg_arg_pin_term`) across all call
+        // sites in round-robin rounds while keeping prefix branch guards and earlier call
+        // pins fixed.
+        let mut exhausted_pins = vec![false; working_pins.len()];
+        let mut round = 0usize;
+        while out.len() < max_trials
+            && !working_pins.is_empty()
+            && exhausted_pins.iter().any(|&ex| !ex)
+            && round < max_trials.saturating_mul(2).max(8)
+        {
+            let mut made_progress = false;
+            for pin_idx in 0..working_pins.len() {
+                if out.len() >= max_trials {
+                    break;
+                }
+                if exhausted_pins[pin_idx] {
+                    continue;
+                }
+                match relax_pin_constraint_with_generator(
+                    self,
+                    base_fields,
+                    guards,
+                    &working_pins,
+                    pin_idx,
+                    round,
+                ) {
+                    Some(RelaxPinResult::RelaxedArgPin {
+                        callee,
+                        prefix_guards,
+                        prefix_pins,
+                        new_arg_tuple,
+                        input_field_overrides,
+                        schedule,
+                        ..
+                    }) => {
+                        working_pins[pin_idx].record_excluded_arg_tuple(new_arg_tuple.clone());
+                        let mut merged_fields = base_fields.clone();
+                        for (k, v) in input_field_overrides {
+                            merged_fields.insert(k, v);
+                        }
+                        let plan = ConcolicTrialPlan {
+                            phase: ConcolicTrialPhase::NegateCallArg {
+                                pin_idx,
+                                callee,
+                                new_arg_tuple,
+                            },
+                            prefix_guards,
+                            prefix_pins,
+                            input_fields: merged_fields,
+                            schedule,
+                        };
+                        if record_plan(&mut out, &mut seen_keys, plan) {
+                            made_progress = true;
+                        }
+                        if working_pins[pin_idx].is_arg_domain_exhausted() {
+                            exhausted_pins[pin_idx] = true;
+                        }
+                    }
+                    Some(RelaxPinResult::FallbackReturnPerturbation { .. }) | None => {
+                        exhausted_pins[pin_idx] = true;
+                    }
+                }
+            }
+            if !made_progress {
+                break;
+            }
+            round += 1;
+        }
+
+        // Phase 2: Once distinct external-call arguments under the current prefix have been
+        // explored (or for 0-arg / domain-exhausted call sites), explore oracle return-value
+        // perturbations while preserving prefix branch guards and earlier call pins.
+        let mut ret_round = 0usize;
+        while out.len() < max_trials
+            && !working_pins.is_empty()
+            && ret_round < 4
+        {
+            let mut any_added = false;
+            for pin_idx in 0..working_pins.len() {
+                if out.len() >= max_trials {
+                    break;
+                }
+                let fallback = build_return_perturbation_fallback(
+                    self,
+                    base_fields,
+                    guards,
+                    &working_pins,
+                    pin_idx,
+                    ret_round,
+                );
+                if let Some(RelaxPinResult::FallbackReturnPerturbation {
+                    callee,
+                    reason,
+                    prefix_guards,
+                    prefix_pins,
+                    input_field_overrides,
+                    schedule,
+                    ..
+                }) = fallback
+                {
+                    let mut merged_fields = base_fields.clone();
+                    for (k, v) in input_field_overrides {
+                        merged_fields.insert(k, v);
+                    }
+                    let plan = ConcolicTrialPlan {
+                        phase: ConcolicTrialPhase::PerturbOracleReturn {
+                            pin_idx,
+                            callee,
+                            reason,
+                        },
+                        prefix_guards,
+                        prefix_pins,
+                        input_fields: merged_fields,
+                        schedule,
+                    };
+                    if record_plan(&mut out, &mut seen_keys, plan) {
+                        any_added = true;
+                    }
+                }
+            }
+            if !any_added {
+                break;
+            }
+            ret_round += 1;
+        }
+
+        // Phase 3: Flip branch guards (`flip_branch_guard`) to steer execution into
+        // sibling control-flow arms while preserving earlier guards and earlier pins.
+        for guard_idx in (0..guards.len()).rev() {
+            if out.len() >= max_trials {
+                break;
+            }
+            for attempt in 0..4 {
+                if out.len() >= max_trials {
+                    break;
+                }
+                if let Some(flipped) =
+                    flip_branch_guard(base_fields, guards, &working_pins, guard_idx, self.dict, attempt)
+                {
+                    let plan = ConcolicTrialPlan {
+                        phase: ConcolicTrialPhase::FlipBranchGuard {
+                            guard_idx,
+                            flipped_bits: flipped.flipped_bits,
+                        },
+                        prefix_guards: flipped.prefix_guards,
+                        prefix_pins: flipped.prefix_pins,
+                        input_fields: flipped.input_fields,
+                        schedule: flipped.schedule,
+                    };
+                    let _ = record_plan(&mut out, &mut seen_keys, plan);
+                }
+            }
+        }
+
+        let _ = u;
+        out
+    }
+}
+
+/// Symbolic/concolic branch decision recorded at a `switchInt` / `if` / `match`
+/// node along a concrete execution trace (modeled on `Nightowl.MultiInterp.BranchGuard`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcolicBranchGuard {
+    /// Static or trace-order identifier of the branch guard.
+    pub branch_id: usize,
+    /// Concrete branch direction taken (`true` for the matched/then arm, `false` for else).
+    pub taken: bool,
+    /// Concrete `switchInt` arm tag recorded along the trace (`1` for true, `0` for false, or arm index).
+    pub taken_tag: u32,
+    /// Optional root input field or parameter name constrained by this branch guard (e.g. `"magic"`).
+    pub field_name: Option<String>,
+    /// Concrete scalar value of the guarded field along the trace.
+    pub concrete_bits: u128,
+    /// Target constant literal compared at this branch guard.
+    pub target_bits: u128,
+    /// Bit width of the guarded scalar (`1`, `8`, `16`, `32`, `64`, or `128`).
+    pub bit_width: u32,
+}
+
+impl ConcolicBranchGuard {
+    /// Constructs a branch guard for an equality comparison `field == target_bits`.
+    pub fn new_equality(
+        branch_id: usize,
+        field_name: Option<String>,
+        concrete_bits: u128,
+        target_bits: u128,
+        bit_width: u32,
+    ) -> Self {
+        let mask = width_mask(bit_width);
+        let c = concrete_bits & mask;
+        let t = target_bits & mask;
+        let taken = c == t;
+        Self {
+            branch_id,
+            taken,
+            taken_tag: u32::from(taken),
+            field_name,
+            concrete_bits: c,
+            target_bits: t,
+            bit_width,
+        }
+    }
+
+    /// Polarity-adjusted path predicate (`condTerm` when `taken == true`, `¬ condTerm` when `false`).
+    pub fn effective_term(&self, candidate_bits: u128) -> bool {
+        let masked = candidate_bits & width_mask(self.bit_width);
+        let cond = masked == self.target_bits;
+        if self.taken { cond } else { !cond }
+    }
+
+    /// Negated path predicate (`¬ condTerm` when `taken == true`, `condTerm` when `false`)
+    /// asserted by [`flip_branch_guard`].
+    pub fn flipped_term(&self, candidate_bits: u128) -> bool {
+        !self.effective_term(candidate_bits)
+    }
+}
+
+/// Symbolic/concolic equality pin recorded for an external call along a concrete trace,
+/// separating argument-only pinning (`arg_pin_term` / `neg_arg_pin_term`) from full
+/// `(arg, ret)` call pinning (`pin_term`), following `Nightowl.MultiInterp.PinConstraint`
+/// (`cl/1022312290`).
+///
+/// - `arg_pin_term` (`argSym == argConc`): evaluates to `true` for 0-argument external
+///   calls (`arg_tuple.is_empty()`), so `neg_arg_pin_term` (`¬ arg_pin_term`) is `false`
+///   (unsatisfiable) on 0-argument calls.
+/// - `pin_term` (`argSym == argConc && retSym == retConc`): asserted on earlier prefix calls
+///   `0..pin_idx` during [`relax_pin_constraint`] so concrete replay reaches call `pin_idx`
+///   along the exact same prefix with different arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgPinConstraint {
+    /// Zero-based slot identifier of the external call along the trace.
+    pub slot_id: usize,
+    /// External callee name (`fn`).
+    pub callee: String,
+    /// Number of [`ConcolicBranchGuard`]s recorded prior to this call along the trace (`beforeGuardIdx`).
+    pub before_guard_idx: usize,
+    /// Concrete argument tuple byte vectors passed to the external call (empty for 0-arg calls).
+    pub arg_tuple: Vec<Vec<u8>>,
+    /// Concrete return value bytes returned by the oracle on this call.
+    pub ret_bytes: Vec<u8>,
+    /// Per-argument scalar layouts defining the valid bit-pattern domain of each argument.
+    pub arg_layouts: Vec<ScalarLayout>,
+    /// Optional mapping from each argument index to the root input field name flowing into it.
+    pub arg_field_sources: Vec<Option<String>>,
+    /// Additional previously exercised argument tuples at this call site under the same prefix
+    /// that [`ArgPinConstraint::neg_arg_pin_term`] excludes so successive relaxations discover
+    /// distinct argument tuples.
+    pub excluded_arg_tuples: Vec<Vec<Vec<u8>>>,
+}
+
+impl ArgPinConstraint {
+    /// Creates an [`ArgPinConstraint`] for `callee` at `slot_id` preceded by `before_guard_idx`
+    /// branch guards, inferring default unsigned scalar layouts from each argument's byte width.
+    pub fn new(
+        slot_id: usize,
+        callee: impl Into<String>,
+        before_guard_idx: usize,
+        arg_tuple: Vec<Vec<u8>>,
+        ret_bytes: Vec<u8>,
+    ) -> Self {
+        let arg_layouts = arg_tuple
+            .iter()
+            .map(|bytes| ScalarLayout::unsigned(bytes.len().max(1)))
+            .collect();
+        let arg_field_sources = vec![None; arg_tuple.len()];
+        Self {
+            slot_id,
+            callee: callee.into(),
+            before_guard_idx,
+            arg_tuple,
+            ret_bytes,
+            arg_layouts,
+            arg_field_sources,
+            excluded_arg_tuples: Vec::new(),
+        }
+    }
+
+    /// Sets explicit per-argument [`ScalarLayout`] domains (e.g. `bool_layout`, `u8`, or ranged integers).
+    pub fn with_arg_layouts(mut self, layouts: Vec<ScalarLayout>) -> Self {
+        self.arg_layouts = layouts;
+        self
+    }
+
+    /// Associates root input field names with each argument position.
+    pub fn with_arg_field_sources(mut self, sources: Vec<Option<String>>) -> Self {
+        self.arg_field_sources = sources;
+        self
+    }
+
+    /// Records an already-exercised argument tuple so future `neg_arg_pin_term` evaluations
+    /// require a tuple distinct from both `self.arg_tuple` and all `excluded_arg_tuples`.
+    pub fn record_excluded_arg_tuple(&mut self, tuple: Vec<Vec<u8>>) {
+        if tuple != self.arg_tuple && !self.excluded_arg_tuples.contains(&tuple) {
+            self.excluded_arg_tuples.push(tuple);
+        }
+    }
+
+    /// Returns `true` when the external call takes 0 arguments (`arg_tuple.is_empty()`).
+    #[inline]
+    pub fn is_zero_arg(&self) -> bool {
+        self.arg_tuple.is_empty()
+    }
+
+    /// Shifts `before_guard_idx` by `delta` when lifting pins out of a branch arm or
+    /// continuation (`PinConstraint.shiftGuardIdx`), preserving `arg_pin_term`,
+    /// `neg_arg_pin_term`, and `pin_term`.
+    pub fn shift_guard_idx(&self, delta: usize) -> Self {
+        let mut shifted = self.clone();
+        shifted.before_guard_idx = self.before_guard_idx.saturating_add(delta);
+        shifted
+    }
+
+    /// Argument-only equality conjunction `argSym₁ == argConc₁ ∧ ... ∧ true`
+    /// (`mkExternArgPinTerm` in `Concolic.lean`).
+    ///
+    /// For a 0-argument call (`self.arg_tuple.is_empty()`), this is constantly `true`
+    /// on the empty argument tuple `&[]`.
+    pub fn arg_pin_term(&self, candidate_args: &[Vec<u8>]) -> bool {
+        if self.arg_tuple.is_empty() {
+            return candidate_args.is_empty();
+        }
+        candidate_args == self.arg_tuple.as_slice()
+    }
+
+    /// Negated argument pin constraint `¬ arg_pin_term` (plus exclusion of previously
+    /// exercised argument tuples in `self.excluded_arg_tuples`), asserted by
+    /// [`relax_pin_constraint`].
+    ///
+    /// For a 0-argument call, `arg_pin_term(&[])` is `true`, so `neg_arg_pin_term(&[])`
+    /// is `false` (unsatisfiable).
+    pub fn neg_arg_pin_term(&self, candidate_args: &[Vec<u8>]) -> bool {
+        if self.arg_tuple.is_empty() || candidate_args.len() != self.arg_tuple.len() {
+            return false;
+        }
+        !self.arg_pin_term(candidate_args)
+            && !self
+                .excluded_arg_tuples
+                .iter()
+                .any(|prev| prev.as_slice() == candidate_args)
+    }
+
+    /// Full call pin conjunction `argSym == argConc ∧ retSym == retConc`
+    /// (`mkExternPinTerm` in `Concolic.lean`).
+    pub fn pin_term(&self, candidate_args: &[Vec<u8>], candidate_ret: &[u8]) -> bool {
+        self.arg_pin_term(candidate_args) && candidate_ret == self.ret_bytes.as_slice()
+    }
+
+    /// Exact cardinality of the valid argument-tuple domain when finite and representable
+    /// in `u128` (`Some(1)` for 0-argument calls, `Some(2)` for a single `bool` argument,
+    /// `Some(256)` for a single `u8` argument, etc.).
+    pub fn domain_cardinality(&self) -> Option<u128> {
+        if self.arg_tuple.is_empty() {
+            return Some(1);
+        }
+        if self.arg_layouts.len() != self.arg_tuple.len() {
+            return None;
+        }
+        let mut total: u128 = 1;
+        for layout in &self.arg_layouts {
+            let card: u128 = if layout.is_bool {
+                2
+            } else if layout.is_char {
+                // Valid Unicode scalar values: 0..=0xD7FF and 0xE000..=0x10FFFF.
+                0x10_FFFF - 0x800 + 1
+            } else {
+                let mask = width_mask(layout.bit_width());
+                let start = layout.valid_start & mask;
+                let end = (layout.valid_end & mask).max(start);
+                end.checked_sub(start)?.checked_add(1)?
+            };
+            total = total.checked_mul(card)?;
+        }
+        Some(total)
+    }
+
+    /// Count of distinct valid argument tuples already pinned (`{self.arg_tuple} ∪ excluded_arg_tuples`).
+    pub fn distinct_pinned_arg_tuples_count(&self) -> usize {
+        if self.arg_tuple.is_empty() {
+            return 1;
+        }
+        let mut seen: BTreeSet<&[Vec<u8>]> = BTreeSet::new();
+        seen.insert(self.arg_tuple.as_slice());
+        for t in &self.excluded_arg_tuples {
+            if t.len() == self.arg_tuple.len() {
+                seen.insert(t.as_slice());
+            }
+        }
+        seen.len()
+    }
+
+    /// Returns `true` if `self` is a 0-argument call or if all valid argument tuples
+    /// in `self.arg_layouts` have already been exercised.
+    pub fn is_arg_domain_exhausted(&self) -> bool {
+        if self.is_zero_arg() {
+            return true;
+        }
+        if let Some(cap) = self.domain_cardinality() {
+            (self.distinct_pinned_arg_tuples_count() as u128) >= cap
+        } else {
+            false
+        }
+    }
+
+    /// Synthesizes a concrete argument tuple satisfying [`Self::neg_arg_pin_term`] and
+    /// all `self.arg_layouts` bit-validity invariants while keeping any argument position
+    /// whose source field is locked in `locked_fields` fixed (unless `self` has multiple
+    /// arguments and another argument position is unlocked).
+    ///
+    /// Returns `None` without looping if the call takes 0 arguments, if all argument
+    /// positions are locked by prefix constraints, or if the valid argument domain is
+    /// exhausted.
+    pub fn negate_arg_pin(
+        &self,
+        dict: &MirInputDictionary,
+        locked_fields: &BTreeMap<String, u128>,
+        attempt: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        if self.is_zero_arg() || self.is_arg_domain_exhausted() {
+            return None;
+        }
+        let arity = self.arg_tuple.len();
+        let mut per_arg_candidates: Vec<Vec<Vec<u8>>> = Vec::with_capacity(arity);
+
+        for i in 0..arity {
+            let cur_bytes = &self.arg_tuple[i];
+            let layout = self
+                .arg_layouts
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| ScalarLayout::unsigned(cur_bytes.len().max(1)));
+            let field_source = self.arg_field_sources.get(i).and_then(Option::as_deref);
+
+            // If this argument position directly reads a field locked by a prefix branch
+            // guard or an earlier call pin, keep it fixed to its locked bytes.
+            if let Some(fname) = field_source
+                && let Some(&locked_bits) = locked_fields.get(fname)
+            {
+                let valid = layout.clamp_to_valid_bits(locked_bits);
+                per_arg_candidates.push(vec![encode_scalar_le_bytes(valid, layout.size_bytes)]);
+                continue;
+            }
+
+            let cands = candidate_arg_bytes_for_layout(&layout, field_source, cur_bytes, dict);
+            if cands.is_empty() {
+                return None;
+            }
+            per_arg_candidates.push(cands);
+        }
+
+        // Enumerate candidate tuples in deterministic order starting at `attempt`,
+        // returning the first tuple that satisfies `neg_arg_pin_term`.
+        let total_combinations: usize = per_arg_candidates
+            .iter()
+            .fold(1usize, |acc, v| acc.saturating_mul(v.len()).min(4096));
+        if total_combinations == 0 {
+            return None;
+        }
+
+        for step in 0..total_combinations {
+            let combo_idx = step.wrapping_add(attempt);
+            let mut rem = combo_idx;
+            let mut tuple = Vec::with_capacity(arity);
+            for cands in &per_arg_candidates {
+                let len = cands.len().max(1);
+                tuple.push(cands[rem % len].clone());
+                rem /= len;
+            }
+            if self.neg_arg_pin_term(&tuple) {
+                return Some(tuple);
+            }
+        }
+        None
+    }
+}
+
+fn decode_scalar_le_bytes(bytes: &[u8]) -> u128 {
+    let n = bytes.len().min(16);
+    let mut le = [0u8; 16];
+    le[..n].copy_from_slice(&bytes[..n]);
+    u128::from_le_bytes(le) & width_mask((n * 8) as u32)
+}
+
+fn encode_scalar_le_bytes(bits: u128, size_bytes: usize) -> Vec<u8> {
+    let n = size_bytes.clamp(1, 16);
+    let masked = bits & width_mask((n * 8) as u32);
+    let le = masked.to_le_bytes();
+    le[..n].to_vec()
+}
+
+fn candidate_arg_bytes_for_layout(
+    layout: &ScalarLayout,
+    field_source: Option<&str>,
+    cur_bytes: &[u8],
+    dict: &MirInputDictionary,
+) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut push_unique = |bits: u128| {
+        let valid = layout.clamp_to_valid_bits(bits);
+        let bytes = encode_scalar_le_bytes(valid, layout.size_bytes);
+        if LayoutSpec::Scalar(layout.clone()).validate_bytes(&bytes).is_ok()
+            && !out.contains(&bytes)
+        {
+            out.push(bytes);
+        }
+    };
+
+    let cur_bits = decode_scalar_le_bytes(cur_bytes);
+    if layout.is_bool {
+        push_unique(cur_bits ^ 1);
+        push_unique(0);
+        push_unique(1);
+        return out;
+    }
+
+    if let Some(fname) = field_source
+        && let Some(hints) = dict.field_hints.get(fname)
+    {
+        for &h in hints {
+            push_unique(h);
+            push_unique(h.saturating_sub(1));
+            push_unique(h.saturating_add(1));
+        }
+    }
+
+    let bits = layout.bit_width();
+    for cand in dict.candidates_for_width(bits) {
+        push_unique(cand);
+    }
+
+    for delta in [
+        cur_bits ^ 1,
+        cur_bits.wrapping_add(1),
+        cur_bits.wrapping_sub(1),
+        cur_bits.wrapping_add(2),
+        cur_bits.wrapping_add(16),
+        cur_bits.wrapping_add(0x80),
+        cur_bits.wrapping_add(0x401),
+        cur_bits ^ 0x55AA,
+        cur_bits ^ 0x414E_4E4C,
+    ] {
+        push_unique(delta);
+    }
+
+    let span = layout.valid_end.saturating_sub(layout.valid_start);
+    if span <= 256 {
+        for v in layout.valid_start..=layout.valid_end {
+            push_unique(v);
+        }
+    }
+    out
+}
+
+/// Evaluates [`ArgPinConstraint::arg_pin_term`] on `candidate_args`.
+#[inline]
+pub fn arg_pin_term(pin: &ArgPinConstraint, candidate_args: &[Vec<u8>]) -> bool {
+    pin.arg_pin_term(candidate_args)
+}
+
+/// Evaluates [`ArgPinConstraint::neg_arg_pin_term`] on `candidate_args`.
+#[inline]
+pub fn neg_arg_pin_term(pin: &ArgPinConstraint, candidate_args: &[Vec<u8>]) -> bool {
+    pin.neg_arg_pin_term(candidate_args)
+}
+
+/// Evaluates [`ArgPinConstraint::pin_term`] on `(candidate_args, candidate_ret)`.
+#[inline]
+pub fn pin_term(
+    pin: &ArgPinConstraint,
+    candidate_args: &[Vec<u8>],
+    candidate_ret: &[u8],
+) -> bool {
+    pin.pin_term(candidate_args, candidate_ret)
+}
+
+/// Synthesizes a new concrete argument tuple satisfying [`ArgPinConstraint::neg_arg_pin_term`].
+#[inline]
+pub fn negate_arg_pin(
+    pin: &ArgPinConstraint,
+    dict: &MirInputDictionary,
+    locked_fields: &BTreeMap<String, u128>,
+    attempt: usize,
+) -> Option<Vec<Vec<u8>>> {
+    pin.negate_arg_pin(dict, locked_fields, attempt)
+}
+
+/// Reason why [`relax_pin_constraint`] fell back from argument-pin negation to
+/// oracle return-value perturbation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgPinFallbackReason {
+    /// The external call has 0 arguments (`arg_pin_term == true`, so `neg_arg_pin_term == false`).
+    ZeroArgCall,
+    /// Every valid argument tuple in the call's [`ScalarLayout`] domain has already been exercised.
+    DomainExhausted,
+    /// All input fields feeding this call's arguments are locked by prefix branch guards or earlier call pins.
+    PrefixLocked,
+}
+
+/// Outcome of [`relax_pin_constraint`] (modeled on `Nightowl.MultiInterp.relaxPinConstraint`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelaxPinResult {
+    /// Successfully negated `target_pin.arg_pin_term` (`new_arg_tuple != target_pin.arg_tuple`)
+    /// while holding all prefix branch guards `0..target_pin.before_guard_idx` and earlier
+    /// full call pins `0..pin_idx` fixed.
+    RelaxedArgPin {
+        pin_idx: usize,
+        callee: String,
+        prefix_guards: Vec<ConcolicBranchGuard>,
+        prefix_pins: Vec<ArgPinConstraint>,
+        new_arg_tuple: Vec<Vec<u8>>,
+        input_field_overrides: BTreeMap<String, u128>,
+        schedule: EnvSchedule,
+    },
+    /// `neg_arg_pin_term` is unsatisfiable (0-arg call, exhausted argument domain, or
+    /// prefix-locked fields): preserves prefix branch guards and earlier call pins while
+    /// perturbing the oracle return value for call `pin_idx`.
+    FallbackReturnPerturbation {
+        pin_idx: usize,
+        callee: String,
+        reason: ArgPinFallbackReason,
+        prefix_guards: Vec<ConcolicBranchGuard>,
+        prefix_pins: Vec<ArgPinConstraint>,
+        input_field_overrides: BTreeMap<String, u128>,
+        schedule: EnvSchedule,
+    },
+}
+
+/// Trial synthesized by [`flip_branch_guard`] (modeled on `Nightowl.MultiInterp.flipBranchGuard`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlippedBranchTrial {
+    pub guard_idx: usize,
+    pub flipped_bits: u128,
+    pub prefix_guards: Vec<ConcolicBranchGuard>,
+    pub prefix_pins: Vec<ArgPinConstraint>,
+    pub input_fields: BTreeMap<String, u128>,
+    pub schedule: EnvSchedule,
+}
+
+/// Exploration phase that produced a [`ConcolicTrialPlan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcolicTrialPhase {
+    /// Negated external-call argument pin `pin_idx` (`arg != prev_arg`) under fixed prefix guards/pins.
+    NegateCallArg {
+        pin_idx: usize,
+        callee: String,
+        new_arg_tuple: Vec<Vec<u8>>,
+    },
+    /// Perturbed external-call oracle return value at `pin_idx` after argument pins were covered or exhausted.
+    PerturbOracleReturn {
+        pin_idx: usize,
+        callee: String,
+        reason: ArgPinFallbackReason,
+    },
+    /// Flipped `switchInt` branch guard `guard_idx` while keeping earlier guards and pins fixed.
+    FlipBranchGuard {
+        guard_idx: usize,
+        flipped_bits: u128,
+    },
+}
+
+/// Complete concolic trial plan produced by [`EnvScheduleGenerator::synthesize_concolic_trials`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcolicTrialPlan {
+    pub phase: ConcolicTrialPhase,
+    pub prefix_guards: Vec<ConcolicBranchGuard>,
+    pub prefix_pins: Vec<ArgPinConstraint>,
+    pub input_fields: BTreeMap<String, u128>,
+    pub schedule: EnvSchedule,
+}
+
+fn collect_prefix_locked_fields(
+    base_fields: &BTreeMap<String, u128>,
+    prefix_guards: &[ConcolicBranchGuard],
+    prefix_pins: &[ArgPinConstraint],
+) -> BTreeMap<String, u128> {
+    let mut locked = BTreeMap::new();
+    for g in prefix_guards {
+        if let Some(ref fname) = g.field_name {
+            locked.insert(fname.clone(), g.concrete_bits);
+        }
+    }
+    for p in prefix_pins {
+        for (arg_idx, src) in p.arg_field_sources.iter().enumerate() {
+            if let Some(fname) = src
+                && !locked.contains_key(fname)
+            {
+                if let Some(&val) = base_fields.get(fname) {
+                    locked.insert(fname.clone(), val);
+                } else if let Some(arg_bytes) = p.arg_tuple.get(arg_idx) {
+                    locked.insert(fname.clone(), decode_scalar_le_bytes(arg_bytes));
+                }
+            }
+        }
+    }
+    locked
+}
+
+fn build_return_perturbation_fallback(
+    sched_gen: &EnvScheduleGenerator<'_>,
+    base_fields: &BTreeMap<String, u128>,
+    guards: &[ConcolicBranchGuard],
+    pins: &[ArgPinConstraint],
+    pin_idx: usize,
+    attempt: usize,
+) -> Option<RelaxPinResult> {
+    let target_pin = pins.get(pin_idx)?;
+    let guard_bound = target_pin.before_guard_idx.min(guards.len());
+    let prefix_guards = guards[..guard_bound].to_vec();
+    let prefix_pins = pins[..pin_idx].to_vec();
+    let locked_fields = collect_prefix_locked_fields(base_fields, &prefix_guards, &prefix_pins);
+
+    let reason = if target_pin.is_zero_arg() {
+        ArgPinFallbackReason::ZeroArgCall
+    } else if target_pin.is_arg_domain_exhausted() {
+        ArgPinFallbackReason::DomainExhausted
+    } else {
+        ArgPinFallbackReason::PrefixLocked
+    };
+
+    let mut schedule = EnvSchedule::new();
+    for p in &prefix_pins {
+        let layout = sched_gen.expected_callee_layout(&p.callee);
+        schedule.register_callee_return_size(&p.callee, layout.total_size());
+        schedule.push_callee_response(&p.callee, p.ret_bytes.clone());
+    }
+    let ret_layout = sched_gen.expected_callee_layout(&target_pin.callee);
+    let ret_size = ret_layout.total_size();
+    schedule.register_callee_return_size(&target_pin.callee, ret_size);
+
+    let scalar_ret = match &ret_layout {
+        LayoutSpec::Scalar(s) => s.clone(),
+        _ => ScalarLayout::unsigned(ret_size.max(1)),
+    };
+    let ret_candidates = candidate_arg_bytes_for_layout(
+        &scalar_ret,
+        None,
+        &target_pin.ret_bytes,
+        sched_gen.dict,
+    );
+    let perturbed_ret = ret_candidates
+        .iter()
+        .cycle()
+        .skip(attempt)
+        .take(ret_candidates.len().max(1))
+        .find(|cand| cand.as_slice() != target_pin.ret_bytes.as_slice())
+        .cloned()
+        .unwrap_or_else(|| {
+            let cur = decode_scalar_le_bytes(&target_pin.ret_bytes);
+            let next = scalar_ret.clamp_to_valid_bits(cur ^ 1);
+            encode_scalar_le_bytes(next, ret_size)
+        });
+    schedule.push_callee_response(&target_pin.callee, perturbed_ret);
+
+    Some(RelaxPinResult::FallbackReturnPerturbation {
+        pin_idx,
+        callee: target_pin.callee.clone(),
+        reason,
+        prefix_guards,
+        prefix_pins,
+        input_field_overrides: locked_fields,
+        schedule,
+    })
+}
+
+fn relax_pin_constraint_with_generator(
+    sched_gen: &EnvScheduleGenerator<'_>,
+    base_fields: &BTreeMap<String, u128>,
+    guards: &[ConcolicBranchGuard],
+    pins: &[ArgPinConstraint],
+    pin_idx: usize,
+    attempt: usize,
+) -> Option<RelaxPinResult> {
+    let target_pin = pins.get(pin_idx)?;
+    let guard_bound = target_pin.before_guard_idx.min(guards.len());
+    let prefix_guards = guards[..guard_bound].to_vec();
+    let prefix_pins = pins[..pin_idx].to_vec();
+    let locked_fields = collect_prefix_locked_fields(base_fields, &prefix_guards, &prefix_pins);
+
+    if let Some(new_arg_tuple) = target_pin.negate_arg_pin(sched_gen.dict, &locked_fields, attempt) {
+        let mut overrides = locked_fields;
+        for (arg_idx, bytes) in new_arg_tuple.iter().enumerate() {
+            if let Some(Some(fname)) = target_pin.arg_field_sources.get(arg_idx)
+                && !overrides.contains_key(fname)
+            {
+                overrides.insert(fname.clone(), decode_scalar_le_bytes(bytes));
+            }
+        }
+        let mut schedule = EnvSchedule::new();
+        for p in &prefix_pins {
+            let layout = sched_gen.expected_callee_layout(&p.callee);
+            schedule.register_callee_return_size(&p.callee, layout.total_size());
+            schedule.push_callee_response(&p.callee, p.ret_bytes.clone());
+        }
+        let target_layout = sched_gen.expected_callee_layout(&target_pin.callee);
+        schedule.register_callee_return_size(&target_pin.callee, target_layout.total_size());
+        if !target_pin.ret_bytes.is_empty() {
+            schedule.push_callee_response(&target_pin.callee, target_pin.ret_bytes.clone());
+        }
+        return Some(RelaxPinResult::RelaxedArgPin {
+            pin_idx,
+            callee: target_pin.callee.clone(),
+            prefix_guards,
+            prefix_pins,
+            new_arg_tuple,
+            input_field_overrides: overrides,
+            schedule,
+        });
+    }
+
+    build_return_perturbation_fallback(sched_gen, base_fields, guards, pins, pin_idx, attempt)
+}
+
+/// Relaxes the `pin_idx`-th external call pin in `pins` by asserting
+/// `target_pin.neg_arg_pin_term` while holding all prior branch guards
+/// (`guards[..target_pin.before_guard_idx]`) and earlier full call pins
+/// (`pins[..pin_idx]`) fixed (modeled on `Nightowl.MultiInterp.relaxPinConstraint`).
+pub fn relax_pin_constraint(
+    guards: &[ConcolicBranchGuard],
+    pins: &[ArgPinConstraint],
+    pin_idx: usize,
+    dict: &MirInputDictionary,
+    attempt: usize,
+) -> Option<RelaxPinResult> {
+    let sched_gen = EnvScheduleGenerator::new(dict).with_panic_injection_pct(0);
+    let base_fields = BTreeMap::new();
+    relax_pin_constraint_with_generator(&sched_gen, &base_fields, guards, pins, pin_idx, attempt)
+}
+
+/// Flips the `guard_idx`-th branch guard in `guards` by asserting
+/// `target_guard.flipped_term` while preserving all earlier branch guards
+/// (`guards[..guard_idx]`) and all external call pins recorded up to `guard_idx`
+/// (`pins.iter().filter(|p| p.before_guard_idx <= guard_idx)`), modeled on
+/// `Nightowl.MultiInterp.flipBranchGuard`.
+pub fn flip_branch_guard(
+    base_fields: &BTreeMap<String, u128>,
+    guards: &[ConcolicBranchGuard],
+    pins: &[ArgPinConstraint],
+    guard_idx: usize,
+    dict: &MirInputDictionary,
+    attempt: usize,
+) -> Option<FlippedBranchTrial> {
+    let target_guard = guards.get(guard_idx)?;
+    let prefix_guards = guards[..guard_idx].to_vec();
+    let prefix_pins: Vec<ArgPinConstraint> = pins
+        .iter()
+        .filter(|p| p.before_guard_idx <= guard_idx)
+        .cloned()
+        .collect();
+    let mut input_fields = base_fields.clone();
+    for (k, v) in collect_prefix_locked_fields(base_fields, &prefix_guards, &prefix_pins) {
+        input_fields.insert(k, v);
+    }
+
+    let layout = ScalarLayout::unsigned((target_guard.bit_width / 8).max(1) as usize);
+    let cur_bytes = encode_scalar_le_bytes(target_guard.concrete_bits, layout.size_bytes);
+    let cands = candidate_arg_bytes_for_layout(
+        &layout,
+        target_guard.field_name.as_deref(),
+        &cur_bytes,
+        dict,
+    );
+    let flipped_bits = if !target_guard.taken {
+        // Flipping an untaken `x == target_bits` guard sets `x = target_bits`.
+        target_guard.target_bits
+    } else {
+        cands
+            .iter()
+            .cycle()
+            .skip(attempt)
+            .take(cands.len().max(1))
+            .map(|b| decode_scalar_le_bytes(b))
+            .find(|&bits| target_guard.flipped_term(bits))?
+    };
+
+    if !target_guard.flipped_term(flipped_bits) {
+        return None;
+    }
+    if let Some(ref fname) = target_guard.field_name {
+        // If an earlier prefix guard already locked this exact field to a conflicting value,
+        // flipping this guard is unsatisfiable under the prefix.
+        if prefix_guards
+            .iter()
+            .any(|g| g.field_name.as_ref() == Some(fname) && !g.effective_term(flipped_bits))
+        {
+            return None;
+        }
+        input_fields.insert(fname.clone(), flipped_bits);
+    }
+
+    let mut schedule = EnvSchedule::new();
+    for p in &prefix_pins {
+        schedule.push_callee_response(&p.callee, p.ret_bytes.clone());
+    }
+
+    Some(FlippedBranchTrial {
+        guard_idx,
+        flipped_bits,
+        prefix_guards,
+        prefix_pins,
+        input_fields,
+        schedule,
+    })
 }
 
 /// Canonical equivalence class key for an observed execution path in [`MirObsPathSet`].
@@ -1931,5 +2899,280 @@ mod tests {
         assert!(!set.record_execution(key.clone(), vec![1, 2]));
         assert_eq!(set.len(), 1);
         assert_eq!(set.minimal_seed_for(&key), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn arg_pin_constraint_separates_arg_pin_from_ret_pin_and_handles_zero_arg_calls() {
+        let dict = MirInputDictionary::new();
+        let locked = BTreeMap::new();
+
+        // 1. 0-arg external call: `arg_pin_term` is `true` on `&[]`, so `neg_arg_pin_term`
+        //    is `false` (unsatisfiable), while `pin_term` still compares `ret_bytes`.
+        let zero_arg = ArgPinConstraint::new(0, "ext_tick", 1, Vec::new(), vec![7, 0, 0, 0]);
+        assert!(zero_arg.is_zero_arg());
+        assert!(arg_pin_term(&zero_arg, &[]));
+        assert!(!neg_arg_pin_term(&zero_arg, &[]));
+        assert!(pin_term(&zero_arg, &[], &[7, 0, 0, 0]));
+        assert!(!pin_term(&zero_arg, &[], &[8, 0, 0, 0]));
+        assert_eq!(zero_arg.domain_cardinality(), Some(1));
+        assert!(zero_arg.is_arg_domain_exhausted());
+        assert_eq!(negate_arg_pin(&zero_arg, &dict, &locked, 0), None);
+
+        let guard = ConcolicBranchGuard::new_equality(
+            0,
+            Some("magic".to_string()),
+            0x414E_4E4C,
+            0x414E_4E4C,
+            32,
+        );
+        match relax_pin_constraint(&[guard.clone()], &[zero_arg.clone()], 0, &dict, 0) {
+            Some(RelaxPinResult::FallbackReturnPerturbation {
+                pin_idx,
+                reason,
+                prefix_guards,
+                schedule,
+                ..
+            }) => {
+                assert_eq!(pin_idx, 0);
+                assert_eq!(reason, ArgPinFallbackReason::ZeroArgCall);
+                assert_eq!(prefix_guards, vec![guard]);
+                let q = schedule.callee_queues.get("ext_tick").expect("ext_tick queue");
+                assert_ne!(q[0].as_slice(), &[7, 0, 0, 0]);
+            }
+            other => panic!("expected FallbackReturnPerturbation for 0-arg call, got {other:?}"),
+        }
+
+        // 2. Shifting `before_guard_idx` preserves `arg_pin_term`, `neg_arg_pin_term`, and `pin_term`.
+        let one_arg = ArgPinConstraint::new(
+            1,
+            "ext_oracle",
+            2,
+            vec![1025u32.to_le_bytes().to_vec()],
+            42u32.to_le_bytes().to_vec(),
+        );
+        let shifted = one_arg.shift_guard_idx(3);
+        assert_eq!(shifted.before_guard_idx, 5);
+        for cand_arg in [1025u32, 2048u32] {
+            let args = vec![cand_arg.to_le_bytes().to_vec()];
+            assert_eq!(shifted.arg_pin_term(&args), one_arg.arg_pin_term(&args));
+            assert_eq!(
+                shifted.neg_arg_pin_term(&args),
+                one_arg.neg_arg_pin_term(&args)
+            );
+            for cand_ret in [42u32, 99u32] {
+                let ret = cand_ret.to_le_bytes();
+                assert_eq!(shifted.pin_term(&args, &ret), one_arg.pin_term(&args, &ret));
+            }
+        }
+        // Mutating only the oracle return value satisfies `¬ pin_term` but NOT `neg_arg_pin_term`.
+        let same_arg = vec![1025u32.to_le_bytes().to_vec()];
+        let diff_ret = 99u32.to_le_bytes();
+        assert!(!one_arg.pin_term(&same_arg, &diff_ret));
+        assert!(!one_arg.neg_arg_pin_term(&same_arg));
+    }
+
+    #[test]
+    fn relax_pin_constraint_preserves_prefix_guards_and_earlier_call_pins_across_multi_call_chains() {
+        let mut dict = MirInputDictionary::new();
+        dict.add_field_hint("payload_len", 2048);
+        dict.add_field_hint("payload_len", 4096);
+        dict.add_field_hint("step_arg", 77);
+
+        let g0 = ConcolicBranchGuard::new_equality(
+            0,
+            Some("magic".to_string()),
+            0x414E_4E4C,
+            0x414E_4E4C,
+            32,
+        );
+        let g1 = ConcolicBranchGuard::new_equality(
+            1,
+            Some("mode".to_string()),
+            2,
+            2,
+            32,
+        );
+        let g2 = ConcolicBranchGuard::new_equality(
+            2,
+            Some("post_flag".to_string()),
+            1,
+            1,
+            32,
+        );
+
+        let pin0 = ArgPinConstraint::new(
+            0,
+            "ext_stage1",
+            1,
+            vec![100u32.to_le_bytes().to_vec()],
+            500u32.to_le_bytes().to_vec(),
+        )
+        .with_arg_field_sources(vec![Some("payload_len".to_string())]);
+
+        let pin1 = ArgPinConstraint::new(
+            1,
+            "ext_stage2",
+            2,
+            vec![
+                100u32.to_le_bytes().to_vec(),
+                10u32.to_le_bytes().to_vec(),
+            ],
+            900u32.to_le_bytes().to_vec(),
+        )
+        .with_arg_field_sources(vec![
+            Some("payload_len".to_string()),
+            Some("step_arg".to_string()),
+        ]);
+
+        // Relaxing `pin_idx = 1` (the second call) must:
+        // - preserve `guards[..pin1.before_guard_idx]` = `[g0, g1]` (NOT `g2`),
+        // - preserve `pins[..1]` = `[pin0]` (keeping `payload_len == 100` and pushing
+        //   `pin0.ret_bytes = 500` into `ext_stage1`'s schedule),
+        // - negate `pin1`'s argument tuple by varying `"step_arg"` (`!= 10`) while
+        //   keeping `pin1`'s first argument (`"payload_len" == 100`) locked!
+        let relaxed = relax_pin_constraint(
+            &[g0.clone(), g1.clone(), g2],
+            &[pin0.clone(), pin1.clone()],
+            1,
+            &dict,
+            0,
+        )
+        .expect("relax pin 1");
+
+        match relaxed {
+            RelaxPinResult::RelaxedArgPin {
+                pin_idx,
+                callee,
+                prefix_guards,
+                prefix_pins,
+                new_arg_tuple,
+                input_field_overrides,
+                schedule,
+            } => {
+                assert_eq!(pin_idx, 1);
+                assert_eq!(callee, "ext_stage2");
+                assert_eq!(prefix_guards, vec![g0, g1]);
+                assert_eq!(prefix_pins, vec![pin0.clone()]);
+                assert!(pin1.neg_arg_pin_term(&new_arg_tuple));
+                // First argument of pin1 (`payload_len`) stays locked to pin0's concrete argument `100`.
+                assert_eq!(new_arg_tuple[0], 100u32.to_le_bytes().to_vec());
+                assert_ne!(new_arg_tuple[1], 10u32.to_le_bytes().to_vec());
+                assert_eq!(input_field_overrides.get("magic"), Some(&0x414E_4E4C));
+                assert_eq!(input_field_overrides.get("mode"), Some(&2));
+                assert_eq!(input_field_overrides.get("payload_len"), Some(&100));
+                assert!(!input_field_overrides.contains_key("post_flag"));
+                // Prefix call `ext_stage1` has its exact return value `500` pinned in `schedule`.
+                assert_eq!(
+                    schedule.callee_queues.get("ext_stage1").unwrap()[0],
+                    500u32.to_le_bytes().to_vec()
+                );
+                assert_eq!(
+                    schedule.callee_queues.get("ext_stage2").unwrap()[0],
+                    900u32.to_le_bytes().to_vec()
+                );
+            }
+            other => panic!("expected RelaxedArgPin for pin 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_concolic_trials_exhausts_bool_and_bounded_u8_domains_without_loops_or_duplicates() {
+        let dict = MirInputDictionary::new();
+        let sched_gen = EnvScheduleGenerator::new(&dict)
+            .with_horizon_steps(4)
+            .with_panic_injection_pct(0)
+            .with_callee_return_layout("ext_bool", LayoutSpec::Scalar(ScalarLayout::u8()));
+
+        let g0 = ConcolicBranchGuard::new_equality(
+            0,
+            Some("magic".to_string()),
+            0x414E_4E4C,
+            0x414E_4E4C,
+            32,
+        );
+        // `flag` has `bool` layout (cardinality 2: `{0, 1}`), starting at `0`.
+        let bool_pin = ArgPinConstraint::new(
+            0,
+            "ext_bool",
+            1,
+            vec![vec![0u8]],
+            vec![10u8],
+        )
+        .with_arg_layouts(vec![ScalarLayout::bool_layout()])
+        .with_arg_field_sources(vec![Some("flag".to_string())]);
+
+        assert_eq!(bool_pin.domain_cardinality(), Some(2));
+        assert!(!bool_pin.is_arg_domain_exhausted());
+
+        let base_fields = BTreeMap::from([
+            ("magic".to_string(), 0x414E_4E4C),
+            ("flag".to_string(), 0),
+        ]);
+        let mut u = Unstructured::new(&[0x55; 32]);
+        let plans = sched_gen.synthesize_concolic_trials(
+            &base_fields,
+            std::slice::from_ref(&g0),
+            std::slice::from_ref(&bool_pin),
+            8,
+            &mut u,
+        );
+
+        // Exactly 1 `NegateCallArg` trial is possible for `bool` (`flag = 1`), after which
+        // the generator must gracefully fall back to `PerturbOracleReturn` and `FlipBranchGuard`
+        // without emitting duplicate `(input_fields, schedule)` plans.
+        let arg_neg_plans: Vec<_> = plans
+            .iter()
+            .filter(|p| matches!(p.phase, ConcolicTrialPhase::NegateCallArg { .. }))
+            .collect();
+        assert_eq!(
+            arg_neg_plans.len(),
+            1,
+            "bool domain {{0, 1}} has exactly 1 distinct alternative argument: {arg_neg_plans:?}"
+        );
+        assert_eq!(arg_neg_plans[0].input_fields.get("magic"), Some(&0x414E_4E4C));
+        assert_eq!(arg_neg_plans[0].input_fields.get("flag"), Some(&1));
+
+        assert!(
+            plans.iter().any(|p| matches!(
+                p.phase,
+                ConcolicTrialPhase::PerturbOracleReturn {
+                    reason: ArgPinFallbackReason::DomainExhausted,
+                    ..
+                }
+            )),
+            "must fall back to PerturbOracleReturn(DomainExhausted) once bool domain is exhausted: {plans:?}"
+        );
+        assert!(
+            plans
+                .iter()
+                .any(|p| matches!(p.phase, ConcolicTrialPhase::FlipBranchGuard { .. })),
+            "must also explore FlipBranchGuard after argument & return phases: {plans:?}"
+        );
+
+        // Bounded `u8` sub-range `10..=12` (cardinality 3: `{10, 11, 12}`):
+        let mut u8_pin = ArgPinConstraint::new(
+            0,
+            "ext_u8_range",
+            1,
+            vec![vec![10u8]],
+            vec![1u8],
+        )
+        .with_arg_layouts(vec![ScalarLayout::with_valid_range(1, false, 10, 12)])
+        .with_arg_field_sources(vec![Some("code".to_string())]);
+        assert_eq!(u8_pin.domain_cardinality(), Some(3));
+        let mut seen_u8 = BTreeSet::from([10u8]);
+        for step in 0..5 {
+            if let Some(next_tuple) = u8_pin.negate_arg_pin(&dict, &BTreeMap::new(), step) {
+                let b = next_tuple[0][0];
+                assert!((10..=12).contains(&b), "out-of-range u8 arg {b}");
+                assert!(seen_u8.insert(b), "duplicate u8 arg {b}");
+                u8_pin.record_excluded_arg_tuple(next_tuple);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(seen_u8, BTreeSet::from([10u8, 11, 12]));
+        assert!(u8_pin.is_arg_domain_exhausted());
+        assert_eq!(u8_pin.negate_arg_pin(&dict, &BTreeMap::new(), 0), None);
     }
 }
