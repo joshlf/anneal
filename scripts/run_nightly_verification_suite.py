@@ -1049,6 +1049,9 @@ def compute_stage_b_empirical_corpora(
 # Pillar 3: Live Correspondence Divergence & Known-Bug Discovery
 # ---------------------------------------------------------------------------
 
+# Episode 2 correspondence file closing `constEvalCounter` / `tailCall` / `opaqueCast`.
+UNTESTED_VARIANT_TEST_FILE = "tests/mir/MirUntestedVariantCorrespondenceTests.lean"
+
 TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
     {
         "id": "DIV-MR-CALL-TARGET-LOCAL",
@@ -1148,6 +1151,52 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Scalars",
         "switch_to_pass_criterion": "Intentional two-address-model characterization (64 KiB local page stride vs. 4 GiB allocId stride).",
         "summary": "Anneal assigns local i base address (1048576 + i) * 65536 vs. lean-miri allocId.value * 2^32; exact relation proved in step_rawPtr_cmp_ptr_ptr_exact.",
+    },
+    # Episode 2 (`tests/mir/MirUntestedVariantCorrespondenceTests.lean`): divergences found while
+    # closing `tailCall` / `opaqueCast`, each witnessed by a kernel-audited manifest theorem.
+    {
+        "id": "DIV-LM-TAILCALL-NOUNWIND-UNWIND",
+        "authority": "LeanMiriSpec",
+        "category": "actionable_anneal_bug",
+        "severity": "P2_soundness",
+        "witness_symbol": "tailCall_leanMiri_nounwind_callee",
+        "file": UNTESTED_VARIANT_TEST_FILE,
+        "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "switch_to_pass_criterion": "When the call-site or callee ABI cannot unwind, rewrite the inherited saved caller's returnUnwind to .unreachable in enterTailCalleeFrame (Miri initStackFrame, Call.lean:261-264), so tailCall_leanMiri_nounwind_callee's `↔ u = ur` collapses to unconditional shape agreement.",
+        "summary": "A tail call into a non-unwinding (e.g. extern \"C\") callee keeps the tail-caller's inherited unwind action in Anneal, whereas Miri forces it to Unreachable: an unwind out of the callee is UB in Miri but follows the original cleanup/continue action in Anneal.",
+    },
+    {
+        "id": "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
+        "authority": "LeanMiriSpec",
+        "category": "actionable_anneal_bug",
+        "severity": "P3_latent_phase_boundary",
+        "witness_symbol": "opaqueCast_trusted_root_dispatch_divergence",
+        "file": UNTESTED_VARIANT_TEST_FILE,
+        "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
+        "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, and evalStmt (.deinit), so (_l as T) behaves exactly like its post-borrowck erasure _l.",
+        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path: move keeps _l initialized, a write to an uninitialized _l is UB, and Deinit only read-checks. Latent: MirPhase::Runtime (every captured body) forbids OpaqueCast.",
+    },
+    {
+        "id": "MODEL-LM-TAILCALL-MODULAR-ROOT",
+        "authority": "LeanMiriSpec",
+        "category": "intentional_modeling_choice",
+        "severity": "info",
+        "witness_symbol": "tailCall_leanMiri_root_stop_diverges",
+        "file": UNTESTED_VARIANT_TEST_FILE,
+        "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep.",
+        "summary": "At a whole-program root (ReturnContinuation.stop) Miri raises invalidProgram (rustc bug!(\"can't tailcall as root\")), whereas Anneal's root tail call steps into the callee.",
+    },
+    {
+        "id": "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP",
+        "authority": "LeanMiriSpec",
+        "category": "intentional_modeling_choice",
+        "severity": "info",
+        "witness_symbol": "tailCall_witness_direct_arity_divergence",
+        "file": UNTESTED_VARIANT_TEST_FILE,
+        "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "switch_to_pass_criterion": "Intentional: rustc's MIR type checker rules out ill-arity FnDef calls; both semantics report UB.",
+        "summary": "An ill-arity direct tail call is UB at the call in Miri, while Anneal enters the callee and faults one step later when it reads the dead parameter (both UB, different steps).",
     },
 ]
 

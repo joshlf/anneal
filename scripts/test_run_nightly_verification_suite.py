@@ -359,6 +359,36 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertIn("DIV-LM-RAW-OVERWRITE-CHAR-COPY", ids)
         self.assertEqual(divs["known_miri_diff_manifest_bugs"], [])
 
+    def test_episode2_divergences_tracked_with_live_witnesses(self) -> None:
+        divs = suite.discover_correspondence_divergences(REPO_ROOT)
+        actionable = {d["id"]: d for d in divs["actionable_anneal_bugs"]}
+        modeling = {d["id"]: d for d in divs["intentional_modeling_choices"]}
+        for div_id in ("DIV-LM-TAILCALL-NOUNWIND-UNWIND", "DIV-TR-OPAQUECAST-ROOT-DISPATCH"):
+            self.assertIn(div_id, actionable)
+            self.assertEqual(actionable[div_id]["file"], suite.UNTESTED_VARIANT_TEST_FILE)
+        for div_id in ("MODEL-LM-TAILCALL-MODULAR-ROOT", "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"):
+            self.assertIn(div_id, modeling)
+            self.assertTrue(modeling[div_id]["live_in_source"])
+        # Switch-to-pass: once a witness theorem is gone (Trusted fixed), its entry resolves.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / suite.UNTESTED_VARIANT_TEST_FILE
+            target.parent.mkdir(parents=True)
+            text = (REPO_ROOT / suite.UNTESTED_VARIANT_TEST_FILE).read_text(encoding="utf-8")
+            target.write_text(
+                text.replace(
+                    "theorem opaqueCast_trusted_root_dispatch_divergence",
+                    "theorem opaqueCast_trusted_root_dispatch_erasure_commutes",
+                ),
+                encoding="utf-8",
+            )
+            fixed = suite.discover_correspondence_divergences(root)
+            self.assertIn("DIV-LM-TAILCALL-NOUNWIND-UNWIND", {d["id"] for d in fixed["actionable_anneal_bugs"]})
+            self.assertIn(
+                "DIV-TR-OPAQUECAST-ROOT-DISPATCH",
+                {d["id"] for d in fixed["resolved_correspondence_divergences"]},
+            )
+
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / "state_out"

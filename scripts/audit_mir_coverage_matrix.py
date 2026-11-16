@@ -1167,10 +1167,33 @@ class _Audit:
                         unlisted.append(literal)
         for literal in unlisted:
             res.errors.append(f"{rel}: the run_cmd audit names theorem `{literal}`, which no @mir-variant-coverage line lists")
+        # Divergences documented here must surface in the nightly suite's Pillar 3 registry, and every
+        # registry witness pointing at this file must be a kernel-audited manifest theorem — so a
+        # divergence can neither be buried in this file nor tracked against an unaudited name.
+        tracked_here: dict[str, str] = {}
+        tracked = getattr(self.suite, "TRACKED_CORRESPONDENCE_DIVERGENCES", None) if self.suite is not None else None
+        if not isinstance(tracked, list):
+            res.errors.append(f"{SUITE_RELPATH}: TRACKED_CORRESPONDENCE_DIVERGENCES is missing")
+        else:
+            for item in tracked:
+                if isinstance(item, dict) and item.get("file") == rel:
+                    tracked_here[str(item.get("witness_symbol", ""))] = str(item.get("id", "?"))
+            for sym, div_id in sorted(tracked_here.items()):
+                if sym not in manifest_names:
+                    res.errors.append(
+                        f"{SUITE_RELPATH}: divergence {div_id} witness `{sym}` is not a manifest theorem of {rel}"
+                    )
+            for nm in sorted(manifest_names):
+                if "diverge" in nm.lower() and nm not in tracked_here:
+                    res.errors.append(
+                        f"{rel}: divergence theorem `{nm}` is not tracked in {SUITE_RELPATH} "
+                        "TRACKED_CORRESPONDENCE_DIVERGENCES"
+                    )
         res.details = {
             "entries": theorem_report,
             "declarations_scanned": len(decls),
             "trailing_audit_line": None if audit_start is None else audit_start + 1,
+            "tracked_divergences": dict(sorted((v, k) for k, v in tracked_here.items())),
         }
         return res
 

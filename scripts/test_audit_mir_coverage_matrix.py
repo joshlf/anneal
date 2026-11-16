@@ -176,6 +176,22 @@ def lintrinsic_stub() -> str:
     return "namespace Anneal.Mir\n\n" + "\n".join(lines[start : end + 1]) + "\n\nend Anneal.Mir\n"
 
 
+def retarget_fixture_divergences(dest: Path) -> None:
+    """The synthetic correspondence file replaces the real one, so point the suite copy's
+    Pillar 3 divergences witnessed by that file at the stand-in's manifest theorems."""
+    real = audit.load_suite_module(REPO_ROOT).TRACKED_CORRESPONDENCE_DIVERGENCES
+    stand_ins = ("tail_leanmiri_root", "opaque_trusted_read", "tail_negative_root", "tail_negative_arity")
+    path = dest / SUITE
+    text = path.read_text(encoding="utf-8")
+    witnessed_here = [d for d in real if d["file"] == CORR]
+    assert witnessed_here, "no tracked divergence is witnessed by the correspondence test"
+    for i, item in enumerate(witnessed_here):
+        anchor = f'"witness_symbol": "{item["witness_symbol"]}"'
+        assert text.count(anchor) == 1, anchor
+        text = text.replace(anchor, f'"witness_symbol": "{stand_ins[i % len(stand_ins)]}"')
+    path.write_text(text, encoding="utf-8")
+
+
 def build_fixture(dest: Path) -> None:
     for rel in COPIED_FILES:
         target = dest / rel
@@ -185,6 +201,7 @@ def build_fixture(dest: Path) -> None:
     (dest / audit.LINTRINSIC_FILE).write_text(lintrinsic_stub(), encoding="utf-8")
     (dest / audit.SEP_LOGIC_LENSES).write_text(SEP_LOGIC_LENSES_STUB, encoding="utf-8")
     (dest / CORR).write_text(correspondence_source(), encoding="utf-8")
+    retarget_fixture_divergences(dest)
 
 
 class AuditFixtureTestCase(unittest.TestCase):
@@ -474,6 +491,22 @@ class ManifestTests(AuditFixtureTestCase):
         self.assert_only_failures(report, {"c_variant_manifest"})
         self.assert_error(report, "c_variant_manifest", "`opaque_minirust` is not named in code by the trailing run_cmd audit")
         self.assert_error(report, "c_variant_manifest", "names theorem `cec_extra`, which no @mir-variant-coverage line lists")
+
+    def test_divergences_must_be_tracked_against_manifest_theorems(self) -> None:
+        # A Pillar 3 registry entry whose witness is not a (kernel-audited) manifest theorem ...
+        self.edit(SUITE, '"witness_symbol": "tail_negative_root"', '"witness_symbol": "tail_ghost_witness"')
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(report, "c_variant_manifest", "witness `tail_ghost_witness` is not a manifest theorem")
+        # ... and a manifest divergence theorem nobody tracks are both rejected.
+        self.edit(SUITE, '"witness_symbol": "tail_ghost_witness"', '"witness_symbol": "tail_negative_root"')
+        self.edit(CORR, "tail_negative_arity", "tail_arity_divergence", count=-1)
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(report, "c_variant_manifest", "divergence theorem `tail_arity_divergence` is not tracked")
+        self.assert_error(report, "c_variant_manifest", "witness `tail_negative_arity` is not a manifest theorem")
+        tracked = audit.run_audit(self.base)["checks"]["c_variant_manifest"]["details"]["tracked_divergences"]
+        self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", tracked)
 
 
 class HygieneTests(AuditFixtureTestCase):
