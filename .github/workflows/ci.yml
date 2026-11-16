@@ -387,6 +387,7 @@ jobs:
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/boundary-audit.log") 2>&1
           cargo run --locked -p anneal-audit -- \
             --lean "$ANNEAL_TEST_INSTALL_ROOT/lean/bin/lean" \
+            --require-correspondence \
             --miri-cache-dir "$ANNEAL_MIRI_CACHE_DIR"
 
       - name: Test Rust workspace

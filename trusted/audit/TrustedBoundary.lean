@@ -37,18 +37,25 @@ invokes this file in two phases over JSON IPC (`run` and `main`):
   and `loadExts := false` (so no `[init]` initializers or persistent environment
   extensions from audited modules are deserialized or executed). It verifies
   module-level trust-tier separation, `Trusted` namespace hygiene, the
-  foundation axiom allowlist, and a full kernel replay of every non-foundation
-  constant against the foundation environment (`base.toKernelEnv.replay`).
-- **`"correspondence-audit"` (`lean-miri` closure and Pass 2 correspondence
+  foundation axiom allowlist, core weakest-precondition and canary theorem
+  presence when `Anneal.MirWp` is present, and a full kernel replay of every
+  non-foundation constant against the foundation environment
+  (`base.toKernelEnv.replay`).
+- **`"correspondence-audit"` (Pass 2 MIR correspondence and `lean-miri` cone
   audit):**
-  Loads the 160-module `Miri.Interpreter.ExecutionMachine` closure (plus any
-  Pass 2 correspondence modules when present) at `trustLevel := 0` with
-  `plugins := #[]` and `loadExts := false`. It classifies every loaded module
-  into a closed 5-role partition (`CorrModuleRole`), verifies `Trusted` and
-  `Anneal` namespace non-impersonation and axiom absence across all
-  `.vendorMiri` modules, and checks that every constant in the
-  `Miri.Interpreter.ExecutionMachine` dependency cone is free of `unsafe`,
-  `partial`, `.vendorMiri` `opaque` declarations, and unapproved axioms.
+  Loads `Trusted.Correspondence`, `Anneal.MirCorrespondenceProof`, and the
+  160-module `Miri.Interpreter.ExecutionMachine` closure at `trustLevel := 0`
+  with `plugins := #[]` and `loadExts := false`. It classifies every loaded
+  module into a closed 5-role partition (`CorrModuleRole`), verifies `Trusted`
+  namespace hygiene and trust-tier separation (including that `.vendorMiri`
+  and `.sysrootFoundation` modules declare no constants in the reserved
+  `Trusted` or `Anneal` root namespaces and that `.vendorMiri` declares no
+  axioms), checks that every constant in the transitive dependency cone is free
+  of `unsafe`, `partial`, and `.vendorMiri` `opaque` declarations, verifies
+  that `correspondence_claim_holds`, `fault_equivalence_claim_holds`,
+  `miri_move_deinit_wiring_claim_holds`, and all correspondence canary theorems
+  prove the exact `Trusted.Correspondence` claims without custom axioms, and
+  replays the correspondence modules through `toKernelEnv.replay`.
 
 ## Module roles and trust tiers
 
@@ -378,9 +385,11 @@ def extractSourceRole (moduleName : Name) (text : String) : IO SourceRole := do
   match isTrustedModule, directives with
   | false, [] => pure .theory
   | false, _ :: _ =>
-    fail s!"trust tier directive is only allowed in Trusted modules ({moduleName})"
+    fail (s!"trust tier directive is only allowed in Trusted modules " ++
+      s!"({moduleName})")
   | true, [] =>
-    fail s!"missing `-- anneal-trust-tier: vetted` or `-- anneal-trust-tier: candidate:<feature>` in {moduleName}"
+    fail ("missing `-- anneal-trust-tier: vetted` or " ++
+      s!"`-- anneal-trust-tier: candidate:<feature>` in {moduleName}")
   | true, [rawTier] =>
     match TrustTier.parse? rawTier with
     | some tier => pure (.trusted tier)
@@ -431,7 +440,8 @@ def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax) : IO Unit := do
     unless args.size == 3 do fail "unsupported command-wrapper shape"
     unless [``Parser.Command.open, ``Parser.Command.variable].contains
         args[0]!.getKind do
-      fail "only `open` and `variable` commands are permitted on the LHS of `in`"
+      fail ("only `open` and `variable` commands are permitted on the " ++
+        "LHS of `in`")
     unless isAllowedNestedCommand args[2]!.getKind do
       fail s!"unsupported command inside `in`: {args[2]!.getKind}"
   else if k == ``Parser.Attr.simple then
@@ -655,7 +665,8 @@ def validateLocalConstant (m : Name) (role : ModuleRole)
     (ci : ConstantInfo) : IO Unit := do
   let isTrusted := role matches .trusted _
   if !isTrusted && (privateToUserName ci.name).getRoot == `Trusted then
-    fail s!"non-Trusted module {m} cannot declare constant {ci.name} in Trusted namespace"
+    fail (s!"non-Trusted module {m} cannot declare constant {ci.name} " ++
+      "in Trusted namespace")
   if !isTrusted && (ci matches .opaqueInfo _) then
     fail s!"opaque declaration {ci.name} in {m} is not allowed outside Trusted"
   if ci.isUnsafe || ci.isPartial then
@@ -748,9 +759,11 @@ def checkTierReferences (env : Environment)
         | .foundation => pure ()
         | .trusted depTier =>
           if tier == .vetted && depTier != .vetted then
-            fail s!"vetted constant {cName} references {depTier.render} constant {dep}"
+            fail (s!"vetted constant {cName} references " ++
+              s!"{depTier.render} constant {dep}")
         | .theory =>
-          fail s!"Trusted constant {cName} references {dep} from non-Trusted module {depOrigin}"
+          fail (s!"Trusted constant {cName} references {dep} from " ++
+            s!"non-Trusted module {depOrigin}")
 
 /-- Verify that `claimName` is a `.defnInfo` definition in `expectedClaimMod`
 with type `Prop` (`claimCi.type == .sort .zero`) referencing every constant in
@@ -923,9 +936,9 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
     ("reachableDeclarations", toJson allVisited.size),
     ("axioms", toJson allAxioms), ("replay", toJson true)]
 
-/-! ## Phase 3: `lean-miri` closure and Pass 2 correspondence audit -/
+/-! ## Phase 3: Pass 2 MIR correspondence and `lean-miri` cone audit -/
 
-/-- Closed 5-role partition of every module loaded in the
+/-- Closed 5-role partition of every module loaded in the Pass 2
 `"correspondence-audit"` environment. -/
 inductive CorrModuleRole where
   | foundation
@@ -959,7 +972,7 @@ The `Lean.*` root must be admitted as a whole: several modules in the
 `Miri.Memory.InitMask` and `Miri.TreeBorrows.TreeState`) `import Lean`, which
 loads the entire `Lean` package from the pinned toolchain. Admission only
 classifies these modules; `closureCorr` still rejects any `unsafe` or
-`partial` constant that the interpreter or correspondence cone reaches, and
+`partial` constant that the correspondence cone reaches, and
 `verifyAndCollectCorrLocals` rejects any of their constants in the reserved
 `Trusted` or `Anneal` namespaces. -/
 def classifyCorrModules (j : Json) (env : Environment)
@@ -1013,13 +1026,18 @@ def corrConstProvenance (env : Environment)
     | fail s!"foreign module {orig} for {n}"
   return (orig, role)
 
-/-- Validate all `.trusted`, `.theory`, `.vendorMiri`, and `.sysrootFoundation`
-declarations in the environment and return `(repoLocals, corrLocals)`.
+/-- Validate all `.trusted` and `.theory` declarations in the correspondence
+environment and return `(repoLocals, corrLocals)`, where `repoLocals` contains
+all constants from `trusted` and `theory` and `corrLocals` contains the subset
+defined in `corrModules` (`trusted/correspondence/` and `correspondence/`).
 
 `.vendorMiri` and `.sysrootFoundation` modules are outside the repository's
-source-role checks, so this rejects any constant they declare in the reserved
-`Trusted` or `Anneal` root namespaces (after stripping private prefixes) and
-any axiom (`sorryAx` or custom `axiom`) declared in `.vendorMiri`. -/
+source-role checks, so this also rejects any constant they declare in the
+reserved `Trusted` or `Anneal` root namespaces (after stripping private
+prefixes) and any axiom declared in `.vendorMiri`. Without that check, a
+vendored file could define a constant named like a trusted specification or a
+theory lemma, and module provenance alone would not reveal the substitution to
+a reader of a theorem statement. -/
 def verifyAndCollectCorrLocals (env : Environment)
     (roles : Std.HashMap Name CorrModuleRole) (corrModules : NameSet) :
     IO (Std.HashMap Name ConstantInfo × Std.HashMap Name ConstantInfo) := do
@@ -1073,7 +1091,8 @@ def verifyAndCollectCorrLocals (env : Environment)
           corrLocals := corrLocals.insert ci.name ci
   return (repoLocals, corrLocals)
 
-/-- Enforce trust-tier separation across all `.trusted` constants:
+/-- Enforce trust-tier separation across all `.trusted` constants in the Pass 2
+correspondence environment:
 - A `.trusted .vetted` constant may only reference `.foundation` or
   `.trusted .vetted` constants (never `.sysrootFoundation`, `.vendorMiri`, or
   `.trusted (.candidate _)`).
@@ -1102,8 +1121,8 @@ def checkCorrTierReferences (env : Environment)
           fail (s!"Trusted constant {cName} references {dep} from " ++
             s!"non-Trusted module {depOrigin}")
 
-/-- Traverse the transitive constant-level dependency cone starting from
-`pending`, verifying that:
+/-- Traverse the transitive constant-level dependency cone `C_cone` starting
+from `pending`, verifying that:
 - No reachable constant is `unsafe` or `isPartial`.
 - No reachable `.vendorMiri` constant is `.opaqueInfo` (guaranteeing that none
   of the 24 `partial def` JSON parser helpers in `Miri.Input.*` is reachable).
@@ -1138,36 +1157,183 @@ partial def closureCorr (env : Environment)
       let deps ← declarationEdges ci
       closureCorr env roles axioms (deps.toList ++ rest) visited reachedAxioms
 
-/-- Verify that the `Miri.Interpreter.ExecutionMachine` interpreter cone is
-free of `unsafe`, `partial`, `.vendorMiri` `opaque` declarations, and
-unapproved axioms. -/
-def verifyMiriExecutionMachineCone (env : Environment)
-    (roles : Std.HashMap Name CorrModuleRole)
-    (axiomPolicy : Array (String × String)) : IO (Array Name × NameSet) :=
-  closureCorr env roles axiomPolicy [
-    `Miri.Interpreter.ExecutionMachine.step,
-    `Miri.Interpreter.ExecutionMachine.withValidation,
-    `Miri.Interpreter.ExecutionMachine.operandHooks,
-    `Miri.Interpreter.IntegerOps.binary,
-    `Miri.Interpreter.IntegerOps.binaryBool,
-    `Miri.Interpreter.IntegerOps.unary,
-    `Miri.Memory.ScalarInt.truncateFromUInt,
-    `Miri.Memory.ScalarInt.tryFromUInt,
-    `Miri.Memory.ScalarInt.tryToBool,
-    `Miri.Interpreter.evalOperand,
-    `Miri.Interpreter.evalPlaceToOp,
-    `Miri.Interpreter.localToOp,
-    `Miri.Interpreter.placeWriteLocalImmediate,
-    `Miri.Interpreter.evalRvalueIntoPlace,
-    `Miri.Interpreter.runRvalue,
-    `Miri.Interpreter.Step.evalStatement,
-    `Miri.Interpreter.Frame.storageLive,
-    `Miri.Interpreter.Frame.storageDead,
-    `Miri.Interpreter.ControlFlow.goToBlock,
-    `Miri.Interpreter.ControlFlow.evalTerminator,
-    `Miri.Interpreter.ControlFlow.returnFromCurrentFrame]
+/-- Verify that `claimName` is a `Prop` definition in `Trusted.Correspondence`
+referencing every constant in `reqConsts`, and that `proofName` is a `.thmInfo`
+theorem in `Anneal.MirCorrespondenceProof` whose type is exactly
+`Expr.const claimName []`. -/
+def requireClaimAndProof (env : Environment)
+    (corrLocals : Std.HashMap Name ConstantInfo)
+    (claimName proofName : Name) (reqConsts : List Name := []) : IO Unit :=
+  requireExactClaimProof env corrLocals `Trusted.Correspondence
+    `Anneal.MirCorrespondenceProof claimName proofName reqConsts
 
-/-- Execute Phase 3 (`"correspondence-audit"`) on the `lean-miri` closure
+/-- Verify that all Pass 2 correspondence claims, core round-trip, constructor
+preservation, uniqueness, and simulation theorems, and canaries `D6`–`D10` are
+present in `Trusted.Correspondence` and proved with exact claim-type equality
+in `Anneal.MirCorrespondenceProof`. -/
+def verifyCorrespondenceClaims (env : Environment)
+    (corrLocals : Std.HashMap Name ConstantInfo) : IO Unit := do
+  -- The correspondence claim must relate terminal behavior and divergence in
+  -- both directions, not only transfer `M_anneal` behaviors forward.
+  requireClaimAndProof env corrLocals
+    `Trusted.Correspondence.CorrespondenceClaim
+    `Anneal.MirCorrespondenceProof.correspondence_claim_holds
+    [ `Trusted.MirSemantics.WellFormed,
+      `Trusted.Correspondence.RefWellFormed,
+      `Trusted.MirSemantics.Behavior,
+      `Trusted.Correspondence.RefBehavior,
+      `Trusted.MirSemantics.Diverges,
+      `Trusted.Correspondence.RefDiverges,
+      `Trusted.Correspondence.encodeProg ]
+  requireClaimAndProof env corrLocals
+    `Trusted.Correspondence.FaultEquivalenceClaim
+    `Anneal.MirCorrespondenceProof.fault_equivalence_claim_holds
+    [ `Trusted.MirSemantics.ReachesResult,
+      `Trusted.Correspondence.RefReachesOutcome,
+      `Trusted.Correspondence.faultToRefOutcome,
+      `Trusted.Correspondence.encodeProg ]
+  requireClaimAndProof env corrLocals
+    `Trusted.Correspondence.MiriMoveDeinitWiringClaim
+    `Anneal.MirCorrespondenceProof.miri_move_deinit_wiring_claim_holds
+    [ `Miri.Interpreter.ExecutionMachine.step,
+      `Miri.Interpreter.ExecutionMachine.stepHooks,
+      `Miri.Interpreter.Step.step,
+      `Miri.Interpreter.ExecutionMachine.withValidation,
+      `Miri.Interpreter.ExecutionMachine.operandHooks,
+      `Miri.Interpreter.evalOperand,
+      `Miri.Interpreter.MachineHooks.takeLastPendingMoveDeinit,
+      `Miri.Interpreter.MachineHooks.recordPendingMoveDeinit,
+      `Miri.Interpreter.FnArg.copyFnArg,
+      `Miri.Interpreter.Call.deinitInPlaceArg ]
+  for (claimName, proofName) in [
+      (`Trusted.Correspondence.DecodeProgEncodeProgClaim,
+        `Anneal.MirCorrespondenceProof.decodeProg_encodeProg),
+      (`Trusted.Correspondence.EncodeProgTypesCanonicalClaim,
+        `Anneal.MirCorrespondenceProof.encodeProg_types_canonical),
+      (`Trusted.Correspondence.EncodeStmtNoDormantNoopsClaim,
+        `Anneal.MirCorrespondenceProof.encodeStmt_no_dormant_noops),
+      (`Trusted.Correspondence.EncodeRvalueBinaryOpIffClaim,
+        `Anneal.MirCorrespondenceProof.encodeRvalue_binaryOp_iff),
+      (`Trusted.Correspondence.EncodeRvalueUnaryOpIffClaim,
+        `Anneal.MirCorrespondenceProof.encodeRvalue_unaryOp_iff),
+      (`Trusted.Correspondence.EncodeStmtAssignIffClaim,
+        `Anneal.MirCorrespondenceProof.encodeStmt_assign_iff),
+      (`Trusted.Correspondence.StateUniqueOfSimulationInvClaim,
+        `Anneal.MirCorrespondenceProof.state_unique_of_simulationInv),
+      (`Trusted.Correspondence.RefStateUniqueOfSimulationInvClaim,
+        `Anneal.MirCorrespondenceProof.refState_unique_of_simulationInv),
+      (`Trusted.Correspondence.InitRefStateSimClaim,
+        `Anneal.MirCorrespondenceProof.initRefState_sim),
+      (`Trusted.Correspondence.EvalRefStepEqClaim,
+        `Anneal.MirCorrespondenceProof.evalRefStep_eq),
+      (`Trusted.Correspondence.SimOfRefStepClaim,
+        `Anneal.MirCorrespondenceProof.sim_of_refStep),
+      (`Trusted.Correspondence.SimOfRefReachesClaim,
+        `Anneal.MirCorrespondenceProof.sim_of_refReaches),
+      (`Trusted.Correspondence.RefWellFormedOfWellFormedClaim,
+        `Anneal.MirCorrespondenceProof.refWellFormed_of_wellFormed),
+      (`Trusted.Correspondence.RefBehaviorOfBehaviorClaim,
+        `Anneal.MirCorrespondenceProof.refBehavior_of_behavior),
+      (`Trusted.Correspondence.BehaviorOfRefBehaviorClaim,
+        `Anneal.MirCorrespondenceProof.behavior_of_refBehavior),
+      (`Trusted.Correspondence.BehaviorIffRefBehaviorClaim,
+        `Anneal.MirCorrespondenceProof.behavior_iff_refBehavior),
+      (`Trusted.Correspondence.DivergesIffRefDivergesClaim,
+        `Anneal.MirCorrespondenceProof.diverges_iff_refDiverges),
+      (`Trusted.Correspondence.CorrespondenceClaim,
+        `Anneal.MirCorrespondenceProof.anneal_corresponds_to_miri),
+      (`Trusted.Correspondence.FaultEquivalenceClaim,
+        `Anneal.MirCorrespondenceProof.reachesResult_fault_iff_refReachesOutcome),
+      (`Trusted.Correspondence.CanaryD6UseAfterMoveUbClaim,
+        `Anneal.MirCorrespondenceProof.canary_D6_use_after_move_ub),
+      (`Trusted.Correspondence.CanaryD7aBinopCopyThenMoveOkClaim,
+        `Anneal.MirCorrespondenceProof.canary_D7a_binop_copy_then_move_ok),
+      (`Trusted.Correspondence.CanaryD7bBinopMoveThenCopyUbClaim,
+        `Anneal.MirCorrespondenceProof.canary_D7b_binop_move_then_copy_ub),
+      (`Trusted.Correspondence.CanaryD7cBinopMoveThenMoveUbClaim,
+        `Anneal.MirCorrespondenceProof.canary_D7c_binop_move_then_move_ub),
+      (`Trusted.Correspondence.CanaryD8SelfMoveOkClaim,
+        `Anneal.MirCorrespondenceProof.canary_D8_self_move_ok),
+      (`Trusted.Correspondence.CanaryD9MoveUnitZstOkClaim,
+        `Anneal.MirCorrespondenceProof.canary_D9_move_unit_zst_ok),
+      (`Trusted.Correspondence.CanaryD10AddUncheckedOverflowUbClaim,
+        `Anneal.MirCorrespondenceProof.canary_D10_add_unchecked_overflow_ub)] do
+    requireClaimAndProof env corrLocals claimName proofName
+
+/-- Verify that the reference machine `M_ref`
+(`Trusted.Correspondence.evalRefStep` and
+`Trusted.Correspondence.initRefState`) delegates to `vendor/lean-miri` and
+never references `M_anneal`'s evaluator functions. -/
+def verifyRefEvaluatorIndependence (env : Environment)
+    (roles : Std.HashMap Name CorrModuleRole)
+    (axiomPolicy : Array (String × String)) : IO Unit := do
+  let (_, refCone) ← closureCorr env roles axiomPolicy
+    [`Trusted.Correspondence.evalRefStep, `Trusted.Correspondence.initRefState]
+  for reqMiri in [
+      `Miri.Interpreter.Step.step,
+      `Miri.Interpreter.IntegerOps.binary,
+      `Miri.Interpreter.IntegerOps.binaryBool,
+      `Miri.Interpreter.IntegerOps.unary,
+      `Miri.Memory.ScalarInt.truncateFromUInt,
+      `Miri.Memory.ScalarInt.tryFromUInt,
+      `Miri.Memory.ScalarInt.tryToBool,
+      `Miri.Interpreter.evalOperand,
+      `Miri.Interpreter.evalPlaceToOp,
+      `Miri.Interpreter.localToOp,
+      `Miri.Interpreter.placeWriteLocalImmediate,
+      `Miri.Interpreter.evalRvalueIntoPlace,
+      `Miri.Interpreter.runRvalue,
+      `Miri.Interpreter.Step.evalStatement,
+      `Miri.Interpreter.Frame.storageLive,
+      `Miri.Interpreter.Frame.storageDead,
+      `Miri.Interpreter.ControlFlow.goToBlock,
+      `Miri.Interpreter.ControlFlow.evalTerminator,
+      `Miri.Interpreter.ControlFlow.returnFromCurrentFrame] do
+    unless refCone.contains reqMiri do
+      fail (s!"reference evaluator cone is missing required Miri " ++
+        s!"primitive {reqMiri}")
+  for forbiddenAnneal in [
+      `Trusted.MirSemantics.evalConstLit,
+      `Trusted.MirSemantics.evalBinOp,
+      `Trusted.MirSemantics.evalUnOp,
+      `Trusted.MirSemantics.checkVal,
+      `Trusted.MirSemantics.checkArgsMatch,
+      `Trusted.MirSemantics.evalSwitchBranches,
+      `Trusted.MirSemantics.evalBoolSwitchBranches,
+      `Trusted.MirSemantics.evalOperandToSlot,
+      `Trusted.MirSemantics.evalPrimitiveOperand,
+      `Trusted.MirSemantics.evalRvalue,
+      `Trusted.MirSemantics.writePlace,
+      `Trusted.MirSemantics.evalStatement,
+      `Trusted.MirSemantics.evalTerminator,
+      `Trusted.MirSemantics.evalStep,
+      `Trusted.MirSemantics.initState] do
+    if refCone.contains forbiddenAnneal then
+      fail (s!"reference evaluator cone illegally references M_anneal " ++
+        s!"evaluator {forbiddenAnneal}")
+
+/-- Inspect the full Pass 2 environment in its own scope so `env` can be
+released before importing the `base` environment for kernel replay. -/
+def inspectCorrEnv (j : Json)
+    (foundation allTrusted allTheory vendorMiri : Array Name)
+    (corrModSet : NameSet) (axiomPolicy : Array (String × String)) :
+    IO (Std.HashMap Name ConstantInfo × Array Name × Nat) := do
+  let env ← importCorrEnv (foundation ++ allTrusted ++ allTheory ++ vendorMiri)
+  let roles ← classifyCorrModules j env foundation allTrusted
+    allTheory vendorMiri
+  let (repoLocals, corrLocals) ← verifyAndCollectCorrLocals env roles corrModSet
+  checkCorrTierReferences env roles repoLocals
+  if (env.checked.get.find? `Miri.Interpreter.ExecutionMachine.step).isSome then
+    discard <| closureCorr env roles axiomPolicy
+      [`Miri.Interpreter.ExecutionMachine.step]
+  verifyCorrespondenceClaims env corrLocals
+  verifyRefEvaluatorIndependence env roles axiomPolicy
+  let corrRoots := corrLocals.fold (init := []) fun acc n _ => n :: acc
+  let (corrAxioms, corrVisited) ←
+    closureCorr env roles axiomPolicy corrRoots
+  return (corrLocals, corrAxioms, corrVisited.size)
+
+/-- Execute Phase 3 (`"correspondence-audit"`) on the Pass 2 correspondence
 environment. -/
 def auditCorrespondence (j : Json) (foundation : Array Name) : IO Json := do
   let baseTrusted ← names j "trusted"
@@ -1179,16 +1345,19 @@ def auditCorrespondence (j : Json) (foundation : Array Name) : IO Json := do
   let allTrusted := baseTrusted ++ corrTrusted
   let allTheory := baseTheory ++ corrTheory
   let corrModSet : NameSet := .ofList (corrTrusted.toList ++ corrTheory.toList)
-  let env ← importCorrEnv (foundation ++ allTrusted ++ allTheory ++ vendorMiri)
-  let roles ← classifyCorrModules j env foundation allTrusted
-    allTheory vendorMiri
-  let (repoLocals, _) ← verifyAndCollectCorrLocals env roles corrModSet
-  checkCorrTierReferences env roles repoLocals
-  let (miriAxioms, miriVisited) ←
-    verifyMiriExecutionMachineCone env roles axiomPolicy
+  let (corrLocals, corrAxioms, corrVisitedSize) ←
+    inspectCorrEnv j foundation allTrusted allTheory vendorMiri
+      corrModSet axiomPolicy
+  -- Replay `Trusted.Correspondence` and `Anneal.MirCorrespondenceProof` from
+  -- scratch through the Lean kernel against the base environment.
+  let base ←
+    importCorrEnv (foundation ++ baseTrusted ++ baseTheory ++ vendorMiri)
+  discard <| base.toKernelEnv.replay corrLocals
   return Json.mkObj [
-    ("miriClosureReachableDeclarations", toJson miriVisited.size),
-    ("miriClosureAxioms", toJson miriAxioms)]
+    ("correspondenceDeclarations", toJson corrLocals.size),
+    ("correspondenceReachableDeclarations", toJson corrVisitedSize),
+    ("correspondenceAxioms", toJson corrAxioms),
+    ("correspondenceReplay", toJson true)]
 
 /-- Dispatch `"preflight"`, `"audit"`, or `"correspondence-audit"` from the
 JSON request `j`. -/

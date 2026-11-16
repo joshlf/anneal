@@ -39,6 +39,11 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Require Pass 2 (`vendor/lean-miri/`, `trusted/correspondence/`, and
+    /// `correspondence/`) correspondence verification to be present and pass.
+    #[arg(long)]
+    require_correspondence: bool,
+
     /// Optional directory for caching verified `Miri.*` `.olean` artifacts
     /// across runs (overrides `ANNEAL_MIRI_CACHE_DIR`).
     #[arg(long)]
@@ -89,6 +94,9 @@ fn run(raw_args: Vec<OsString>) -> Result<u8, (u8, String)> {
             format!("Trusted check could not initialize staging directory: {e}"),
         )
     })?;
+    if cli.require_correspondence {
+        checker.set_require_correspondence(true);
+    }
     if let Some(cache_dir) = cli.miri_cache_dir {
         checker.set_miri_cache_dir(Some(cache_dir));
     }

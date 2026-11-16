@@ -125,7 +125,6 @@ pub const LOCKED_PATCHED_MIRI_FILES: &[&str] = &[
     "Miri/Interpreter/Place.lean",
     "Miri/Interpreter/PlaceMachine.lean",
 ];
-
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
@@ -326,10 +325,11 @@ pub enum InspectorRequest {
         theory: Vec<String>,
         module_tiers: BTreeMap<String, TrustTier>,
     },
-    /// Phase 3 (`"correspondence-audit"`): load `lean-miri` closure (and any
-    /// Pass 2 correspondence) `.olean`s with `loadExts := false`, verify 5-role
-    /// module provenance and constant-cone purity, and replay correspondence
-    /// modules when present.
+    /// Phase 3 (`"correspondence-audit"`): load Pass 2 correspondence and
+    /// `lean-miri` closure `.olean`s with `loadExts := false`, verify 5-role
+    /// module provenance, constant-cone purity, and core correspondence claims
+    /// and canaries, and replay the correspondence modules through the Lean
+    /// kernel.
     CorrespondenceAudit {
         search_path: Vec<PathBuf>,
         trusted: Vec<String>,
@@ -1167,6 +1167,16 @@ pub fn scan_lean_tree(
     root: &Path,
     umbrella_prefix: &str,
 ) -> Result<BTreeMap<String, PathBuf>, Failure> {
+    scan_lean_tree_opts(root, umbrella_prefix, true)
+}
+
+/// Scan a Lean directory tree (`root`) under `umbrella_prefix`, optionally
+/// requiring a root `<umbrella_prefix>.lean` umbrella file.
+fn scan_lean_tree_opts(
+    root: &Path,
+    umbrella_prefix: &str,
+    require_umbrella: bool,
+) -> Result<BTreeMap<String, PathBuf>, Failure> {
     let meta = fs::symlink_metadata(root).map_err(|_| {
         Failure::new(
             1,
@@ -1242,7 +1252,8 @@ pub fn scan_lean_tree(
                     format!("duplicate module: {module}"),
                 ));
             }
-        } else if !(umbrella_prefix == "Trusted"
+        } else if !(require_umbrella
+            && umbrella_prefix == "Trusted"
             && (relative == "lean-toolchain" || relative == "foundation-lock.json"))
         {
             return Err(Failure::new(
@@ -1253,7 +1264,8 @@ pub fn scan_lean_tree(
         }
     }
 
-    if (umbrella_prefix == "Trusted" || !modules.is_empty())
+    if require_umbrella
+        && (umbrella_prefix == "Trusted" || !modules.is_empty())
         && !modules.contains_key(umbrella_prefix)
     {
         return Err(Failure::new(
@@ -1510,6 +1522,7 @@ pub struct Checker {
     pub environment: BTreeMap<String, String>,
     counter: usize,
     pub admitted: Option<AdmittedToolchain>,
+    pub require_correspondence: bool,
     pub miri_cache_dir: Option<PathBuf>,
     pub require_mir_wp: bool,
 }
@@ -1627,9 +1640,17 @@ impl Checker {
             environment,
             counter: 0,
             admitted: None,
+            require_correspondence: false,
             miri_cache_dir: None,
             require_mir_wp: false,
         })
+    }
+
+    /// Configure whether Pass 2 (`vendor/lean-miri/`,
+    /// `trusted/correspondence/`, and `correspondence/`) is mandatory even if
+    /// those directories are absent.
+    pub fn set_require_correspondence(&mut self, require: bool) {
+        self.require_correspondence = require;
     }
 
     /// Configure an optional cache directory for verified `Miri.*` `.olean`
@@ -1910,7 +1931,19 @@ impl Checker {
         umbrella_prefix: &str,
         stage_subdir: &str,
     ) -> Result<BTreeMap<String, PathBuf>, Failure> {
-        scan_lean_tree(root, umbrella_prefix)?
+        self.scan_and_stage_tree_opts(root, umbrella_prefix, stage_subdir, true)
+    }
+
+    /// Scan `root` via [`scan_lean_tree_opts`] and copy every discovered
+    /// `.lean` file into `self.stage.join(stage_subdir)`.
+    fn scan_and_stage_tree_opts(
+        &self,
+        root: &Path,
+        umbrella_prefix: &str,
+        stage_subdir: &str,
+        require_umbrella: bool,
+    ) -> Result<BTreeMap<String, PathBuf>, Failure> {
+        scan_lean_tree_opts(root, umbrella_prefix, require_umbrella)?
             .into_iter()
             .map(|(mod_name, raw_path)| {
                 let staged_path = self
@@ -2325,7 +2358,7 @@ impl Checker {
             );
         }
 
-        if let Some(corr_report) = self.run_miri_closure(&preflight.module_tiers)?
+        if let Some(corr_report) = self.run_correspondence(&preflight.module_tiers)?
             && let (Some(rep_obj), Some(corr_obj)) =
                 (report.as_object_mut(), corr_report.as_object())
         {
@@ -2337,20 +2370,151 @@ impl Checker {
         Ok(report)
     }
 
-    /// Stage, compile (or restore from verified cache), and audit the 160-module
-    /// `Miri.Interpreter.ExecutionMachine` closure whenever `vendor/lean-miri`
-    /// is present in `self.checkout`.
-    fn run_miri_closure(
+    /// Execute Pass 2 (`"correspondence-audit"`) when
+    /// `self.require_correspondence` is set or any of `vendor/lean-miri`,
+    /// `trusted/correspondence`, or `correspondence` exists in `self.checkout`.
+    fn run_correspondence(
         &mut self,
         base_tiers: &BTreeMap<String, TrustTier>,
     ) -> Result<Option<Json>, Failure> {
         let vendor_dir = self.checkout.join("vendor/lean-miri");
-        if fs::symlink_metadata(&vendor_dir).is_err() {
+        let corr_trusted_dir = self.checkout.join("trusted/correspondence");
+        let corr_theory_dir = self.checkout.join("correspondence");
+
+        let vendor_exists = fs::symlink_metadata(&vendor_dir).is_ok();
+        let corr_trusted_exists = fs::symlink_metadata(&corr_trusted_dir).is_ok();
+        let corr_theory_exists = fs::symlink_metadata(&corr_theory_dir).is_ok();
+
+        if !self.require_correspondence
+            && !vendor_exists
+            && !corr_trusted_exists
+            && !corr_theory_exists
+        {
             return Ok(None);
+        }
+        if !vendor_exists || !corr_trusted_exists || !corr_theory_exists {
+            return Err(Failure::policy(
+                "correspondence",
+                "missing required correspondence directories (vendor/lean-miri, trusted/correspondence, correspondence)",
+            ));
         }
 
         let pin = verify_upstream_pin(&vendor_dir)?;
 
+        let corr_trusted_modules =
+            self.scan_and_stage_tree_opts(&corr_trusted_dir, "Trusted", "src/corr-trusted", false)?;
+        if !corr_trusted_modules.contains_key("Trusted.Correspondence") {
+            return Err(Failure::policy(
+                "snapshot",
+                "missing Trusted/Correspondence.lean umbrella in trusted/correspondence",
+            ));
+        }
+
+        let corr_theory_modules =
+            self.scan_and_stage_tree_opts(&corr_theory_dir, "Anneal", "src/corr-theory", false)?;
+        if !corr_theory_modules.contains_key("Anneal.MirCorrespondenceProof") {
+            return Err(Failure::policy(
+                "snapshot",
+                "missing Anneal/MirCorrespondenceProof.lean in correspondence",
+            ));
+        }
+
+        // Run Phase 1 (`"preflight"`) over `trusted/correspondence/` and
+        // `correspondence/` before compiling any Pass 2 module.
+        let corr_sources: Vec<(String, PathBuf)> = corr_trusted_modules
+            .iter()
+            .chain(corr_theory_modules.iter())
+            .map(|(n, p)| (n.clone(), p.clone()))
+            .collect();
+        let pf_res: PreflightResult =
+            serde_json::from_value(self.inspect(InspectorRequest::Preflight {
+                sources: corr_sources,
+            })?)
+            .map_err(|_| {
+                Failure::operational("preflight", "incomplete correspondence header inventory")
+            })?;
+
+        let miri_closure_set: BTreeSet<&str> = pin
+            .execution_machine_closure
+            .iter()
+            .map(|e| e.module.as_str())
+            .collect();
+        let mut corr_imports: BTreeMap<String, Vec<ImportEdge>> = BTreeMap::new();
+        let mut module_tiers = base_tiers.clone();
+        {
+            let adm = self.admitted()?;
+            for h in pf_res.headers {
+                let mod_name = h.module;
+                let is_corr_trusted = corr_trusted_modules.contains_key(&mod_name);
+                if is_corr_trusted {
+                    let raw_tier = h.trust_tier.ok_or_else(|| {
+                        Failure::policy(
+                            "preflight",
+                            format!("missing trust tier for Trusted module {mod_name}"),
+                        )
+                    })?;
+                    let tier = TrustTier::parse(&raw_tier).ok_or_else(|| {
+                        Failure::policy(
+                            "preflight",
+                            format!("invalid trust tier {raw_tier} for Trusted module {mod_name}"),
+                        )
+                    })?;
+                    module_tiers.insert(mod_name.clone(), tier);
+                }
+                for edge in &h.imports {
+                    let imp_mod = edge.module.as_str();
+                    let allowed = if is_corr_trusted {
+                        adm.artifacts.contains_key(imp_mod)
+                            || adm.modules.contains_key(imp_mod)
+                            || corr_trusted_modules.contains_key(imp_mod)
+                            || miri_closure_set.contains(imp_mod)
+                    } else {
+                        adm.artifacts.contains_key(imp_mod)
+                            || adm.modules.contains_key(imp_mod)
+                            || corr_trusted_modules.contains_key(imp_mod)
+                            || adm.theory_modules.contains_key(imp_mod)
+                            || corr_theory_modules.contains_key(imp_mod)
+                            || miri_closure_set.contains(imp_mod)
+                    };
+                    if !allowed {
+                        return Err(Failure::policy(
+                            "preflight",
+                            format!("foreign/missing import {imp_mod} in {mod_name}"),
+                        ));
+                    }
+                }
+                corr_imports.insert(mod_name, h.imports);
+            }
+        }
+
+        let expected_corr_count = corr_trusted_modules.len() + corr_theory_modules.len();
+        if corr_imports.len() != expected_corr_count
+            || !corr_trusted_modules
+                .keys()
+                .all(|m| corr_imports.contains_key(m))
+            || !corr_theory_modules
+                .keys()
+                .all(|m| corr_imports.contains_key(m))
+        {
+            return Err(Failure::operational(
+                "preflight",
+                "incomplete correspondence header inventory",
+            ));
+        }
+
+        let corr_trusted_order = topo_sort_modules(
+            corr_trusted_modules.keys().cloned().collect(),
+            &corr_imports,
+            "Trusted correspondence import cycle",
+        )?;
+        let corr_theory_order = topo_sort_modules(
+            corr_theory_modules.keys().cloned().collect(),
+            &corr_imports,
+            "Correspondence proof import cycle",
+        )?;
+
+        // Stage and verify (or compile from verified source) all 160 `Miri.*`
+        // closure `.olean` artifacts in topological order.
         let miri_src_root = self.stage.join("src/vendor-miri");
         let miri_lib = self.stage.join("miri-lib");
         fs::create_dir_all(&miri_lib)
@@ -2487,25 +2651,81 @@ impl Checker {
             }
         }
 
-        let search_dirs = vec![
-            self.stage.join("lib"),
-            self.stage.join("theory-lib"),
-            miri_lib,
-        ];
+        // Compile `Trusted.Correspondence.*` into `lib/` and
+        // `Anneal.MirCorrespondenceProof.*` into `theory-lib/` (after Pass 1
+        // `"audit"` has already completed) so Lean's package-root search path
+        // resolves `Trusted.*`, `Anneal.*`, and `Miri.*` deterministically.
+        let corr_trusted_lib = self.stage.join("lib");
+        let corr_theory_lib = self.stage.join("theory-lib");
+        let search_dirs = vec![corr_trusted_lib.clone(), corr_theory_lib.clone(), miri_lib];
+        let corr_lean_path = env::join_paths(&search_dirs)
+            .map_err(|e| Failure::operational("compile", e.to_string()))?;
+
+        let corr_trusted_src_root = self.stage.join("src/corr-trusted");
+        for module in &corr_trusted_order {
+            let staged_src = &corr_trusted_modules[module];
+            let out_olean = corr_trusted_lib.join(format!("{}.olean", module.replace('.', "/")));
+            if let Some(parent) = out_olean.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| Failure::operational("compile", e.to_string()))?;
+            }
+            self.execution_began = true;
+            let args = vec![
+                "-j1".to_string(),
+                "-M2048".to_string(),
+                "-t0".to_string(),
+                "-DElab.async=false".to_string(),
+                "-Ddebug.skipKernelTC=false".to_string(),
+                "-R".to_string(),
+                corr_trusted_src_root.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                out_olean.to_string_lossy().into_owned(),
+                staged_src.to_string_lossy().into_owned(),
+            ];
+            self.process_with_path(&format!("compile-{module}"), &args, Some(&corr_lean_path))?;
+            regular(&out_olean, "compile")?;
+        }
+
+        let corr_theory_src_root = self.stage.join("src/corr-theory");
+        for module in &corr_theory_order {
+            let staged_src = &corr_theory_modules[module];
+            let out_olean = corr_theory_lib.join(format!("{}.olean", module.replace('.', "/")));
+            if let Some(parent) = out_olean.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| Failure::operational("compile", e.to_string()))?;
+            }
+            self.execution_began = true;
+            let args = vec![
+                "-j1".to_string(),
+                "-M2048".to_string(),
+                "-t0".to_string(),
+                "-DElab.async=false".to_string(),
+                "-Ddebug.skipKernelTC=false".to_string(),
+                "-DwarningAsError=true".to_string(),
+                "-R".to_string(),
+                corr_theory_src_root.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                out_olean.to_string_lossy().into_owned(),
+                staged_src.to_string_lossy().into_owned(),
+            ];
+            self.process_with_path(&format!("compile-{module}"), &args, Some(&corr_lean_path))?;
+            regular(&out_olean, "compile")?;
+        }
+
         let corr_req = {
             let adm = self.admitted()?;
             InspectorRequest::CorrespondenceAudit {
                 search_path: search_dirs,
                 trusted: adm.modules.keys().cloned().collect(),
-                corr_trusted: Vec::new(),
+                corr_trusted: corr_trusted_modules.keys().cloned().collect(),
                 theory: adm.theory_modules.keys().cloned().collect(),
-                corr_theory: Vec::new(),
+                corr_theory: corr_theory_modules.keys().cloned().collect(),
                 vendor_miri: pin
                     .execution_machine_closure
                     .iter()
                     .map(|e| e.module.clone())
                     .collect(),
-                module_tiers: base_tiers.clone(),
+                module_tiers,
             }
         };
         let mut corr_report = self.inspect(corr_req)?;
@@ -2683,7 +2903,7 @@ pub fn verify_upstream_pin(vendor_root: &Path) -> Result<UpstreamPin, Failure> {
         ));
     }
 
-    // Verify `patched_files` against the closed allowlist.
+    // Verify `patched_files` against the closed 10-file allowlist.
     let mut patched_map: BTreeMap<&str, &PatchedMiriFile> = BTreeMap::new();
     for pf in &pin.patched_files {
         if !LOCKED_PATCHED_MIRI_FILES.contains(&pf.path.as_str()) {
@@ -2715,7 +2935,7 @@ pub fn verify_upstream_pin(vendor_root: &Path) -> Result<UpstreamPin, Failure> {
     if patched_map.len() != LOCKED_PATCHED_MIRI_FILES.len() {
         return Err(Failure::policy(
             phase,
-            "patched_files list in UPSTREAM_PIN.json does not match locked allowlist",
+            "patched_files list in UPSTREAM_PIN.json does not match locked 10-file set",
         ));
     }
 
@@ -2902,15 +3122,12 @@ pub fn verify_upstream_pin(vendor_root: &Path) -> Result<UpstreamPin, Failure> {
         ));
     }
 
-    // Verify `execution_machine_closure` (when present) and ensure
-    // `Miri.Input.NativeMathHost` (which contains `@[extern]` host math
-    // bindings) is excluded from the correspondence slice.
+    // Verify `execution_machine_closure`.
     let mut seen_closure_mods = BTreeSet::new();
     for entry in &pin.execution_machine_closure {
         let expected_rel = format!("{}.lean", entry.module.replace('.', "/"));
         if !entry.module.starts_with("Miri.")
             || entry.module == "Miri.Input.NativeMathHost"
-            || entry.module == "Miri"
             || entry.path != expected_rel
             || !expected_lean_files.contains_key(&entry.path)
             || !is_sha256_hex(&entry.olean_sha256)

@@ -1286,16 +1286,17 @@ fn verifies_upstream_pin_and_rejects_tampering() {
     );
 }
 
-/// Verifies that `"correspondence-audit"` rejects a `.vendorMiri` module that
-/// declares a constant in the reserved `Trusted` or `Anneal` root namespace
-/// (including a `private` declaration) or declares an `axiom`, while a benign
-/// vendor constant passes those checks and fails only later when the
-/// `Miri.Interpreter.ExecutionMachine` cone is missing.
+/// Verifies that Pass 2 (`"correspondence-audit"`) rejects a `.vendorMiri`
+/// module that declares a constant in the reserved `Trusted` or `Anneal` root
+/// namespace (including a `private` declaration) or declares an `axiom`, while
+/// a vendor constant outside those roots passes those checks and fails only
+/// later, when the required correspondence claims are missing.
 #[test]
 fn rejects_vendor_constants_in_reserved_namespaces() {
     let fix = TempFixture::new(None);
     let mut checker = Checker::new(&fix.root, None).unwrap();
     checker.set_require_mir_wp(false);
+    // Pass 1 compiles the fixture's `Trusted` umbrella into `<stage>/lib`.
     checker.run().unwrap();
     let trusted_lib = checker.stage.join("lib");
     let vendor_src = checker.stage.join("src/fake-miri");
@@ -1403,9 +1404,7 @@ fn rejects_vendor_constants_in_reserved_namespaces() {
                     "benign vendor module {module} was rejected: {err}"
                 );
                 assert!(
-                    err.message.contains(
-                        "unknown declaration origin: Miri.Interpreter.ExecutionMachine.step"
-                    ),
+                    err.message.contains("missing required claim"),
                     "unexpected error for {module}: {err}"
                 );
             }
@@ -1415,9 +1414,10 @@ fn rejects_vendor_constants_in_reserved_namespaces() {
 
 /// Verifies non-backsliding enforcement on `Trusted.MirAst`,
 /// `Trusted.MirSemantics`, and `Anneal.MirWp` core theorems and canaries in
-/// Pass 1 (`"audit"`).
+/// Pass 1 (`"audit"`) and required correspondence directories and claims in
+/// Pass 2 (`--require-correspondence`).
 #[test]
-fn enforces_mir_wp_non_backsliding() {
+fn enforces_mir_wp_and_correspondence_non_backsliding() {
     // 1. With default `Checker::new` (`require_mir_wp == true`), deleting both
     // `Trusted/MirSemantics.lean` and `Anneal/MirWp.lean` (even when
     // `Trusted/MirAst.lean` is present) is rejected fail-closed.
@@ -1501,5 +1501,388 @@ fn enforces_mir_wp_non_backsliding() {
             "theorem Anneal.MirWp.wellFormed_and_spec_of_wp must prove Trusted.MirSemantics.WpSoundnessClaim Anneal.MirWp.wpProg directly"
         ),
         "unexpected error: {err_wp}"
+    );
+
+    // 4. When `require_correspondence` is enabled and correspondence
+    // directories are absent, `Checker::run` rejects in `"correspondence"`.
+    let fix_missing_corr = TempFixture::new(None);
+    let mut checker = Checker::new(&fix_missing_corr.root, None).unwrap();
+    checker.set_require_mir_wp(false);
+    checker.set_require_correspondence(true);
+    let err_corr = checker.run().unwrap_err();
+    assert_eq!(err_corr.code, 1);
+    assert_eq!(err_corr.phase, "correspondence");
+    assert!(
+        err_corr
+            .message
+            .contains("missing required correspondence directories"),
+        "unexpected error: {err_corr}"
+    );
+
+    // 5. Pass 2 (`InspectorRequest::CorrespondenceAudit`) enforces
+    // `verifyCorrespondenceClaims` (required constant references on
+    // `CorrespondenceClaim` and exact claim-type proof checking on
+    // `correspondence_claim_holds`) and `verifyRefEvaluatorIndependence`
+    // (required Miri primitives and forbidden `Trusted.MirSemantics.*`
+    // evaluator references in `evalRefStep` / `initRefState`).
+    let compile_stage_mod = |checker: &mut Checker,
+                             root_dir: &Path,
+                             out_dir: &Path,
+                             imports: &[&str],
+                             module: &str,
+                             body: &str| {
+        let rel = module.replace('.', "/");
+        let src = root_dir.join(format!("{rel}.lean"));
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, body).unwrap();
+        let out = out_dir.join(format!("{rel}.olean"));
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let mut edges = vec![anneal_audit::ImportEdge {
+            module: "Init.Core".to_string(),
+            import_all: false,
+            is_exported: true,
+            is_meta: false,
+        }];
+        for imp in imports {
+            edges.push(anneal_audit::ImportEdge {
+                module: (*imp).to_string(),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            });
+        }
+        let setup_path = checker.write_setup_json(module, &edges).unwrap();
+        checker
+            .process(
+                &format!("compile-{module}"),
+                &[
+                    "-j1".to_string(),
+                    "-M2048".to_string(),
+                    "-t0".to_string(),
+                    "--setup".to_string(),
+                    setup_path.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    out.to_string_lossy().into_owned(),
+                    src.to_string_lossy().into_owned(),
+                ],
+            )
+            .unwrap();
+        let available = BTreeMap::from([("olean", out.to_string_lossy().into_owned())]);
+        let arts =
+            anneal_audit::ModuleArtifacts::from_available(&available, "test", String::new).unwrap();
+        checker
+            .admitted
+            .as_mut()
+            .unwrap()
+            .artifacts
+            .insert(module.to_string(), arts);
+    };
+
+    let fix_pass2 = TempFixture::new(None);
+    let mut checker_pass2 = Checker::new(&fix_pass2.root, None).unwrap();
+    checker_pass2.set_require_mir_wp(false);
+    checker_pass2.run().unwrap();
+    let trusted_lib = checker_pass2.stage.join("lib");
+    let corr_src = checker_pass2.stage.join("src/fake-corr");
+    let corr_lib = checker_pass2.stage.join("fake-corr-lib");
+    let vendor_src = checker_pass2.stage.join("src/fake-vendor");
+    let vendor_lib = checker_pass2.stage.join("fake-vendor-lib");
+    let search_paths = vec![trusted_lib.clone(), vendor_lib.clone(), corr_lib.clone()];
+
+    compile_stage_mod(
+        &mut checker_pass2,
+        &vendor_src,
+        &vendor_lib,
+        &[],
+        "Miri.FakeStubs",
+        "prelude\nimport Init.Core\n\
+         namespace Miri.Interpreter.ExecutionMachine\n\
+         def step : Nat := 0\n\
+         def stepHooks : Nat := 0\n\
+         def withValidation : Nat := 0\n\
+         def operandHooks : Nat := 0\n\
+         end Miri.Interpreter.ExecutionMachine\n\
+         namespace Miri.Interpreter.Step\n\
+         def step : Nat := 0\n\
+         def evalStatement : Nat := 0\n\
+         end Miri.Interpreter.Step\n\
+         namespace Miri.Interpreter.MachineHooks\n\
+         def takeLastPendingMoveDeinit : Nat := 0\n\
+         def recordPendingMoveDeinit : Nat := 0\n\
+         end Miri.Interpreter.MachineHooks\n\
+         namespace Miri.Interpreter.FnArg\n\
+         def copyFnArg : Nat := 0\n\
+         end Miri.Interpreter.FnArg\n\
+         namespace Miri.Interpreter.Call\n\
+         def deinitInPlaceArg : Nat := 0\n\
+         end Miri.Interpreter.Call\n\
+         namespace Miri.Interpreter.IntegerOps\n\
+         def binary : Nat := 0\n\
+         def binaryBool : Nat := 0\n\
+         def unary : Nat := 0\n\
+         end Miri.Interpreter.IntegerOps\n\
+         namespace Miri.Memory.ScalarInt\n\
+         def truncateFromUInt : Nat := 0\n\
+         def tryFromUInt : Nat := 0\n\
+         def tryToBool : Nat := 0\n\
+         end Miri.Memory.ScalarInt\n\
+         namespace Miri.Interpreter\n\
+         def evalOperand : Nat := 0\n\
+         def evalPlaceToOp : Nat := 0\n\
+         def localToOp : Nat := 0\n\
+         def placeWriteLocalImmediate : Nat := 0\n\
+         def evalRvalueIntoPlace : Nat := 0\n\
+         def runRvalue : Nat := 0\n\
+         end Miri.Interpreter\n\
+         namespace Miri.Interpreter.Frame\n\
+         def storageLive : Nat := 0\n\
+         def storageDead : Nat := 0\n\
+         end Miri.Interpreter.Frame\n\
+         namespace Miri.Interpreter.ControlFlow\n\
+         def goToBlock : Nat := 0\n\
+         def evalTerminator : Nat := 0\n\
+         def returnFromCurrentFrame : Nat := 0\n\
+         end Miri.Interpreter.ControlFlow\n",
+    );
+
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &trusted_lib,
+        &[],
+        "Trusted.MirSemantics",
+        "prelude\nimport Init.Core\n\
+         namespace Trusted.MirSemantics\n\
+         def WellFormed : Prop := True\n\
+         def Behavior : Prop := True\n\
+         def Diverges : Prop := True\n\
+         def ReachesResult : Prop := True\n\
+         def evalStep : Nat := 0\n\
+         end Trusted.MirSemantics\n",
+    );
+
+    // 4a. Weakened `CorrespondenceClaim` (missing
+    // `Trusted.MirSemantics.WellFormed` reference) is rejected by
+    // `verifyCorrespondenceClaims`.
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &trusted_lib,
+        &[],
+        "Trusted.Correspondence",
+        "prelude\nimport Init.Core\n\
+         namespace Trusted.Correspondence\n\
+         def CorrespondenceClaim : Prop := True\n\
+         end Trusted.Correspondence\n",
+    );
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &corr_lib,
+        &["Trusted.Correspondence"],
+        "Anneal.MirCorrespondenceProof",
+        "prelude\nimport Trusted.Correspondence\n\
+         namespace Anneal.MirCorrespondenceProof\n\
+         theorem correspondence_claim_holds : Trusted.Correspondence.CorrespondenceClaim := True.intro\n\
+         end Anneal.MirCorrespondenceProof\n",
+    );
+    let run_corr_audit = |checker: &mut Checker| {
+        checker.inspect(InspectorRequest::CorrespondenceAudit {
+            search_path: search_paths.clone(),
+            trusted: vec!["Trusted".to_string(), "Trusted.MirSemantics".to_string()],
+            corr_trusted: vec!["Trusted.Correspondence".to_string()],
+            theory: Vec::new(),
+            corr_theory: vec!["Anneal.MirCorrespondenceProof".to_string()],
+            vendor_miri: vec!["Miri.FakeStubs".to_string()],
+            module_tiers: BTreeMap::from([
+                ("Trusted".to_string(), TrustTier::Vetted),
+                (
+                    "Trusted.MirSemantics".to_string(),
+                    TrustTier::parse("candidate:mir_semantics").unwrap(),
+                ),
+                (
+                    "Trusted.Correspondence".to_string(),
+                    TrustTier::parse("candidate:mir_semantics").unwrap(),
+                ),
+            ]),
+        })
+    };
+    let err_weak_claim = run_corr_audit(&mut checker_pass2).unwrap_err();
+    assert_eq!(err_weak_claim.code, 1);
+    assert_eq!(err_weak_claim.phase, "correspondence-audit");
+    assert!(
+        err_weak_claim.message.contains(
+            "claim Trusted.Correspondence.CorrespondenceClaim body must reference Trusted.MirSemantics.WellFormed"
+        ),
+        "unexpected error: {err_weak_claim}"
+    );
+
+    // 4b. When all required claims and proofs are present,
+    // `verifyCorrespondenceClaims` succeeds and
+    // `verifyRefEvaluatorIndependence` rejects an `evalRefStep` that omits
+    // required Miri primitives or illegally references
+    // `Trusted.MirSemantics.evalStep`.
+    let all_claims_src = |eval_ref_step_body: &str| {
+        format!(
+            "prelude\nimport Init.Core\nimport Miri.FakeStubs\nimport Trusted.MirSemantics\n\
+             namespace Trusted.Correspondence\n\
+             def RefWellFormed : Prop := True\n\
+             def RefBehavior : Prop := True\n\
+             def RefDiverges : Prop := True\n\
+             def encodeProg : Nat := 0\n\
+             def RefReachesOutcome : Prop := True\n\
+             def faultToRefOutcome : Nat := 0\n\
+             def CorrespondenceClaim : Prop :=\n\
+               Trusted.MirSemantics.WellFormed ∧ RefWellFormed ∧\n\
+               Trusted.MirSemantics.Behavior ∧ RefBehavior ∧\n\
+               Trusted.MirSemantics.Diverges ∧ RefDiverges ∧ encodeProg = encodeProg\n\
+             def FaultEquivalenceClaim : Prop :=\n\
+               Trusted.MirSemantics.ReachesResult ∧ RefReachesOutcome ∧\n\
+               faultToRefOutcome = encodeProg\n\
+             def MiriMoveDeinitWiringClaim : Prop :=\n\
+               Miri.Interpreter.ExecutionMachine.step = Miri.Interpreter.ExecutionMachine.stepHooks ∧\n\
+               Miri.Interpreter.Step.step = Miri.Interpreter.ExecutionMachine.withValidation ∧\n\
+               Miri.Interpreter.ExecutionMachine.operandHooks = Miri.Interpreter.evalOperand ∧\n\
+               Miri.Interpreter.MachineHooks.takeLastPendingMoveDeinit = Miri.Interpreter.MachineHooks.recordPendingMoveDeinit ∧\n\
+               Miri.Interpreter.FnArg.copyFnArg = Miri.Interpreter.Call.deinitInPlaceArg\n\
+             def DecodeProgEncodeProgClaim : Prop := True\n\
+             def EncodeProgTypesCanonicalClaim : Prop := True\n\
+             def EncodeStmtNoDormantNoopsClaim : Prop := True\n\
+             def EncodeRvalueBinaryOpIffClaim : Prop := True\n\
+             def EncodeRvalueUnaryOpIffClaim : Prop := True\n\
+             def EncodeStmtAssignIffClaim : Prop := True\n\
+             def StateUniqueOfSimulationInvClaim : Prop := True\n\
+             def RefStateUniqueOfSimulationInvClaim : Prop := True\n\
+             def InitRefStateSimClaim : Prop := True\n\
+             def EvalRefStepEqClaim : Prop := True\n\
+             def SimOfRefStepClaim : Prop := True\n\
+             def SimOfRefReachesClaim : Prop := True\n\
+             def RefWellFormedOfWellFormedClaim : Prop := True\n\
+             def RefBehaviorOfBehaviorClaim : Prop := True\n\
+             def BehaviorOfRefBehaviorClaim : Prop := True\n\
+             def BehaviorIffRefBehaviorClaim : Prop := True\n\
+             def DivergesIffRefDivergesClaim : Prop := True\n\
+             def CanaryD6UseAfterMoveUbClaim : Prop := True\n\
+             def CanaryD7aBinopCopyThenMoveOkClaim : Prop := True\n\
+             def CanaryD7bBinopMoveThenCopyUbClaim : Prop := True\n\
+             def CanaryD7cBinopMoveThenMoveUbClaim : Prop := True\n\
+             def CanaryD8SelfMoveOkClaim : Prop := True\n\
+             def CanaryD9MoveUnitZstOkClaim : Prop := True\n\
+             def CanaryD10AddUncheckedOverflowUbClaim : Prop := True\n\
+             def initRefState : Nat := 0\n\
+             def evalRefStep : Nat := {eval_ref_step_body}\n\
+             end Trusted.Correspondence\n"
+        )
+    };
+    let all_proofs_src = "prelude\nimport Trusted.Correspondence\n\
+        namespace Anneal.MirCorrespondenceProof\n\
+        open Trusted.Correspondence\n\
+        theorem correspondence_claim_holds : CorrespondenceClaim :=\n\
+          ⟨True.intro, True.intro, True.intro, True.intro, True.intro, True.intro, Eq.refl _⟩\n\
+        theorem fault_equivalence_claim_holds : FaultEquivalenceClaim :=\n\
+          ⟨True.intro, True.intro, Eq.refl _⟩\n\
+        theorem miri_move_deinit_wiring_claim_holds : MiriMoveDeinitWiringClaim :=\n\
+          ⟨Eq.refl _, Eq.refl _, Eq.refl _, Eq.refl _, Eq.refl _⟩\n\
+        theorem decodeProg_encodeProg : DecodeProgEncodeProgClaim := True.intro\n\
+        theorem encodeProg_types_canonical : EncodeProgTypesCanonicalClaim := True.intro\n\
+        theorem encodeStmt_no_dormant_noops : EncodeStmtNoDormantNoopsClaim := True.intro\n\
+        theorem encodeRvalue_binaryOp_iff : EncodeRvalueBinaryOpIffClaim := True.intro\n\
+        theorem encodeRvalue_unaryOp_iff : EncodeRvalueUnaryOpIffClaim := True.intro\n\
+        theorem encodeStmt_assign_iff : EncodeStmtAssignIffClaim := True.intro\n\
+        theorem state_unique_of_simulationInv : StateUniqueOfSimulationInvClaim := True.intro\n\
+        theorem refState_unique_of_simulationInv : RefStateUniqueOfSimulationInvClaim := True.intro\n\
+        theorem initRefState_sim : InitRefStateSimClaim := True.intro\n\
+        theorem evalRefStep_eq : EvalRefStepEqClaim := True.intro\n\
+        theorem sim_of_refStep : SimOfRefStepClaim := True.intro\n\
+        theorem sim_of_refReaches : SimOfRefReachesClaim := True.intro\n\
+        theorem refWellFormed_of_wellFormed : RefWellFormedOfWellFormedClaim := True.intro\n\
+        theorem refBehavior_of_behavior : RefBehaviorOfBehaviorClaim := True.intro\n\
+        theorem behavior_of_refBehavior : BehaviorOfRefBehaviorClaim := True.intro\n\
+        theorem behavior_iff_refBehavior : BehaviorIffRefBehaviorClaim := True.intro\n\
+        theorem diverges_iff_refDiverges : DivergesIffRefDivergesClaim := True.intro\n\
+        theorem anneal_corresponds_to_miri : CorrespondenceClaim := correspondence_claim_holds\n\
+        theorem reachesResult_fault_iff_refReachesOutcome : FaultEquivalenceClaim := fault_equivalence_claim_holds\n\
+        theorem canary_D6_use_after_move_ub : CanaryD6UseAfterMoveUbClaim := True.intro\n\
+        theorem canary_D7a_binop_copy_then_move_ok : CanaryD7aBinopCopyThenMoveOkClaim := True.intro\n\
+        theorem canary_D7b_binop_move_then_copy_ub : CanaryD7bBinopMoveThenCopyUbClaim := True.intro\n\
+        theorem canary_D7c_binop_move_then_move_ub : CanaryD7cBinopMoveThenMoveUbClaim := True.intro\n\
+        theorem canary_D8_self_move_ok : CanaryD8SelfMoveOkClaim := True.intro\n\
+        theorem canary_D9_move_unit_zst_ok : CanaryD9MoveUnitZstOkClaim := True.intro\n\
+        theorem canary_D10_add_unchecked_overflow_ub : CanaryD10AddUncheckedOverflowUbClaim := True.intro\n\
+        end Anneal.MirCorrespondenceProof\n";
+
+    let corr_deps = ["Miri.FakeStubs", "Trusted.MirSemantics"];
+    let proof_deps = ["Trusted.Correspondence"];
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &trusted_lib,
+        &corr_deps,
+        "Trusted.Correspondence",
+        &all_claims_src("0"),
+    );
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &corr_lib,
+        &proof_deps,
+        "Anneal.MirCorrespondenceProof",
+        all_proofs_src,
+    );
+    let err_missing_miri = run_corr_audit(&mut checker_pass2).unwrap_err();
+    assert_eq!(err_missing_miri.code, 1);
+    assert_eq!(err_missing_miri.phase, "correspondence-audit");
+    assert!(
+        err_missing_miri.message.contains(
+            "reference evaluator cone is missing required Miri primitive Miri.Interpreter.Step.step"
+        ),
+        "unexpected error: {err_missing_miri}"
+    );
+
+    let all_miri_plus_anneal_step = "let _ := (\
+        Miri.Interpreter.Step.step, \
+        Miri.Interpreter.IntegerOps.binary, \
+        Miri.Interpreter.IntegerOps.binaryBool, \
+        Miri.Interpreter.IntegerOps.unary, \
+        Miri.Memory.ScalarInt.truncateFromUInt, \
+        Miri.Memory.ScalarInt.tryFromUInt, \
+        Miri.Memory.ScalarInt.tryToBool, \
+        Miri.Interpreter.evalOperand, \
+        Miri.Interpreter.evalPlaceToOp, \
+        Miri.Interpreter.localToOp, \
+        Miri.Interpreter.placeWriteLocalImmediate, \
+        Miri.Interpreter.evalRvalueIntoPlace, \
+        Miri.Interpreter.runRvalue, \
+        Miri.Interpreter.Step.evalStatement, \
+        Miri.Interpreter.Frame.storageLive, \
+        Miri.Interpreter.Frame.storageDead, \
+        Miri.Interpreter.ControlFlow.goToBlock, \
+        Miri.Interpreter.ControlFlow.evalTerminator, \
+        Miri.Interpreter.ControlFlow.returnFromCurrentFrame); \
+        Trusted.MirSemantics.evalStep";
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &trusted_lib,
+        &corr_deps,
+        "Trusted.Correspondence",
+        &all_claims_src(all_miri_plus_anneal_step),
+    );
+    compile_stage_mod(
+        &mut checker_pass2,
+        &corr_src,
+        &corr_lib,
+        &proof_deps,
+        "Anneal.MirCorrespondenceProof",
+        all_proofs_src,
+    );
+    let err_forbidden_anneal = run_corr_audit(&mut checker_pass2).unwrap_err();
+    assert_eq!(err_forbidden_anneal.code, 1);
+    assert_eq!(err_forbidden_anneal.phase, "correspondence-audit");
+    assert!(
+        err_forbidden_anneal.message.contains(
+            "reference evaluator cone illegally references M_anneal evaluator Trusted.MirSemantics.evalStep"
+        ),
+        "unexpected error: {err_forbidden_anneal}"
     );
 }
