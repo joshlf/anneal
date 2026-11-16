@@ -9,3 +9,5 @@
 prelude
 import Anneal.PureLift.Lens
 import Anneal.PureLift.PermTree
+import Anneal.PureLift.LoanGraph
+import Anneal.PureLift.SpatialPin
