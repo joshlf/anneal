@@ -6042,21 +6042,24 @@ theorem convergedJumpTestCfg_emitsSubIdWraps_false :
   exact nomatch hEq
 
 /-- **Non-vacuity of `segmentSim_of_waitFree`,
-`liftBlockToJoin_of_runBlockCfgToBlock_of_invClosedNoFork`,
 `runBlockCfgToBlock_reached_of_invClosedNoFork`,
 `blockCfgStep_stepBasicBlock_eq_done_iff`, and
-`while_cutpoint_wpConverges_of_acceptsHandleFree`**:
+`while_cutpoint_wpConverges_of_acceptsHandleFree`** (for
+`liftBlockToJoin_of_runBlockCfgToBlock_of_invClosedNoFork` see
+`liveInterop_liftBlockToJoin_of_invClosedNoFork_canary`):
 1. `segmentSim_of_waitFree` discharges `armSteps = 2` delay ticks without `.ret`
    obligations and feeds `liftBlockToJoin_of_blockCfg_segment` to yield
    `MirLiftCore.LiftBlockToJoin` on `liveInteropMirBody`.
 2. On `sampleBranchBlockCfg` (where block `0` emits a `.convergedJump` with
    `armSteps = 1` and `handleFreeOutOpt stdValAlg` on `sampleSymSt2`),
-   `runBlockCfgToBlock` reaches join block `3` at `wait = 0` in 2 steps, and
-   `runBlockCfgToBlock_reached_of_invClosedNoFork` preserves both the prefix
-   invariant and `SubIdWrap` without needing a `LocalBlockVC` on block `3`.
-3. `blockCfgStep_stepBasicBlock_eq_done_iff` establishes the exact biconditional
-   for `.done` at block `3` of `sampleBranchBlockCfg` under the post-diamond
-   wrapper `composeWrap some (handleFreeOutOpt stdValAlg)`.
+   `runBlockCfgToBlock` reaches join block `3` at `wait = 0` within bound `5`,
+   and `runBlockCfgToBlock_reached_of_invClosedNoFork` preserves both the
+   prefix invariant and `SubIdWrap` without needing a `LocalBlockVC` on block
+   `3`.
+3. `blockCfgStep_stepBasicBlock_eq_done_iff` derives the one-step halt at block
+   `3` of `sampleBranchBlockCfg` under the post-diamond wrapper
+   `composeWrap some (handleFreeOutOpt stdValAlg)` from the block's `.ret`
+   (`.mpr`), and recovers that `.ret` from the halt (`.mp`).
 4. `while_cutpoint_wpConverges_of_acceptsHandleFree` proves convergence of the
    stride-3 strong-descent loop under `composeWrap some (handleFreeOutOpt stdValAlg)`
    reusing `stride3_cutpoint_exit` directly. -/
@@ -6070,7 +6073,7 @@ theorem segmentSim_waitFree_and_acceptsHandleFree_canaries (n i : Nat) :
      (blockCfgStep (stepBasicBlock stdValAlg sampleBranchBlockCfg)
         ⟨composeWrap some (handleFreeOutOpt stdValAlg), 3,
           ⟨[⟨.bool true, .unborrowed⟩, ⟨.nat 10, .unborrowed⟩],
-           [], [], [], [], 0⟩, 0⟩ = .done ⟨.nat 10, []⟩ ↔
+           [], [], [], [], 0⟩, 0⟩ = .done ⟨.nat 10, []⟩ ∧
       stepBasicBlock stdValAlg sampleBranchBlockCfg 3
         ⟨[⟨.bool true, .unborrowed⟩, ⟨.nat 10, .unborrowed⟩],
          [], [], [], [], 0⟩ = .ret ⟨.nat 10, []⟩)) ∧
@@ -6134,7 +6137,7 @@ theorem segmentSim_waitFree_and_acceptsHandleFree_canaries (n i : Nat) :
           (acceptsHandleFree_some stdValAlg)
           (acceptsHandleFree_handleFreeOutOpt stdValAlg))
     exact ⟨⟨sJ, hRun, hReached.1, hReached.2.1, hReached.2.2.2⟩,
-      ⟨fun h => (hIff.mp h).2, fun h => hIff.mpr ⟨rfl, h⟩⟩⟩
+      hIff.mpr ⟨rfl, rfl⟩, (hIff.mp rfl).2⟩
   · exact while_cutpoint_wpConverges_of_acceptsHandleFree stdValAlg countUpCond
       stride3Body (.constVal .unit) (stride3Inv n) (countUpRank n)
       (stride3_cutpoint_step n)
@@ -6143,6 +6146,148 @@ theorem segmentSim_waitFree_and_acceptsHandleFree_canaries (n i : Nat) :
         (acceptsHandleFree_handleFreeOutOpt stdValAlg))
       (fun out => Exists fun j => n ≤ j ∧ out = ⟨.unit, [.nat j]⟩)
       (stride3_cutpoint_exit n) (countUpState n i) ⟨i, rfl⟩
+
+/-- Countdown invariant extended with the out-of-range block `99`, where
+`testCfgStep` faults on every state. -/
+def countdownInv99 (bb st : Nat) : Prop :=
+  countdownInv bb st ∨ bb = 99
+
+theorem countdownInv99_invClosedNoFork :
+    InvClosedNoFork testCfgStep countdownInv99 := by
+  intro bb st hInv
+  rcases hInv with (h0 | h1 | ⟨h2, hst⟩) | h99
+  · subst h0
+    cases st with
+    | zero => exact Or.inl (Or.inr (Or.inr ⟨rfl, rfl⟩))
+    | succ _ => exact Or.inl (Or.inr (Or.inl rfl))
+  · subst h1
+    exact Or.inl (Or.inl rfl)
+  · subst h2
+    subst hst
+    exact trivial
+  · subst h99
+    exact trivial
+
+/-- `testCfgStep` emits no wrappers at all on `countdownInv99` states. -/
+theorem countdownInv99_emitsSubIdWraps :
+    EmitsSubIdWraps testCfgStep countdownInv99 := by
+  intro bb st hInv
+  rcases hInv with (h0 | h1 | ⟨h2, hst⟩) | h99
+  · subst h0
+    cases st with
+    | zero => exact trivial
+    | succ _ => exact trivial
+  · subst h1
+    exact trivial
+  · subst h2
+    subst hst
+    exact trivial
+  · subst h99
+    exact trivial
+
+/-- **Non-vacuity of `liftBlockToJoin_of_runBlockCfgToBlock_of_invClosedNoFork`**
+(strictly more general than `liftBlockToJoin_of_runBlockCfgToBlock`):
+`countdownInv99` admits the faulting block `99`, so it satisfies no
+`LocalBlockVC` for any `PostRet` and `liftBlockToJoin_of_runBlockCfgToBlock`
+cannot use it; it is nevertheless closed, fork-free, and wrapper-free, so the
+header-targeted countdown run from block `0` to join block `2` still lifts to
+`LiftBlockToJoin` on the live `liveInteropMirBody`. -/
+theorem liveInterop_liftBlockToJoin_of_invClosedNoFork_canary :
+    (∀ PostRet, ¬ LocalBlockVC testCfgStep countdownInv99 PostRet) ∧
+    MirLiftCore.LiftBlockToJoin liveInteropMirBody 0 liveInteropEnv 1
+      (· = liveInteropEnv) :=
+  ⟨fun _ hLocal => hLocal 99 0 (Or.inr rfl),
+   liftBlockToJoin_of_runBlockCfgToBlock_of_invClosedNoFork
+     countdownInv99_invClosedNoFork countdownInv99_emitsSubIdWraps
+     liveInterop_forwardSim.segmentSim (s := ⟨some, 0, 0, 0⟩)
+     (Or.inl (Or.inl rfl)) subIdWrap_some
+     (rfl : runBlockCfgToBlock testCfgStep 2 5 ⟨some, 0, 0, 0⟩ =
+       .reached ⟨some, 2, 0, 0⟩)
+     ⟨rfl, rfl, rfl, Or.inl ⟨rfl, rfl⟩⟩
+     (fun ms' _ _ _ _ hR' => by
+       rcases hR'.2.2.2 with ⟨hBad, _⟩ | ⟨_, hMs⟩
+       · exact nomatch hBad
+       · subst hMs
+         exact ⟨rfl, rfl⟩)⟩
+
+/-- `natCountdownStep` never faults and halts with `100` from every state. -/
+theorem natCountdownStep_stepInv :
+    StepInv natCountdownStep (fun _ => True) (· = 100) := by
+  intro s _
+  cases s with
+  | zero => rfl
+  | succ _ => trivial
+
+/-- **API coverage canary**: every remaining public interop theorem that no
+other canary uses is exercised once, non-vacuously, on a concrete machine:
+1. `wpConverges_of_stepInv_rank` (generic, rank `id`) on `natCountdownStep`;
+2. `runBlockCfgLoop_forkFree_of_fault` on a genuine wrapper-rejection fault of
+   `partialWrapCfg` (no fork involved);
+3. `evalFuel_blockCfgStep_ne_faulted_of_blockInv` on the countdown from every
+   start value and fuel;
+4. `wpConverges_blockCfgStep_iff_of_noFork_loop` from the mid-delay state
+   (`wait = 2`, pending `(+ 10)`) of `convergedJumpTestCfg true`;
+5. `runBlockCfg_forkFree_eq_of_invClosedNoFork` and
+   `evalFuel_blockCfgStep_eq_of_blockInv` at every fuel;
+6. `wpConverges_blockCfgStep_iff_of_blockInv_loop` under the pending wrapper
+   `(+ 1)` from the countdown exit block;
+7. `evalFuel_blockCfgStep_stepBasicBlock_handleFree`,
+   `wpConverges_blockCfgStep_stepBasicBlock_handleFree`, and `evalPlan_skip` on
+   the symbolic diamond of `sampleBranchBlockCfg`. -/
+theorem interop_api_coverage_canaries (n : Nat) :
+    PureMirExec.WpConverges natCountdownStep n (· = 100) ∧
+    runBlockCfgLoop (forkFree partialWrapCfg) 3 0 0 3 = .fault ∧
+    (∀ k, PureMirExec.evalFuel (blockCfgStep testCfgStep) k ⟨some, 0, n, 0⟩ ≠
+      .faulted) ∧
+    PureMirExec.WpConverges (blockCfgStep (convergedJumpTestCfg true))
+      ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩
+      (· = (n + 5) * 2 + 10) ∧
+    (∀ k, runBlockCfg (forkFree invClosedPartialCfg) 0 3 k =
+      runBlockCfg invClosedPartialCfg 0 3 k) ∧
+    (∀ k, PureMirExec.evalFuel (blockCfgStep testCfgStep) k ⟨some, 0, n, 0⟩ =
+      outcomeToFuel some (runBlockCfgLoop testCfgStep k 0 0 n)) ∧
+    PureMirExec.WpConverges (blockCfgStep testCfgStep)
+      ⟨fun v => some (v + 1), 2, 0, 0⟩ (· = 101) ∧
+    handleFreeOut stdValAlg
+      ⟨stdValAlg.zipVal (.symBool true) (.nat 10) (.nat 20), []⟩ = true ∧
+    PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg sampleBranchBlockCfg))
+      ⟨some, 0, sampleSymSt2, 0⟩
+      (fun out =>
+        out = ⟨stdValAlg.zipVal (.symBool true) (.nat 10) (.nat 20), []⟩ ∧
+        handleFreeOut stdValAlg out = true) ∧
+    evalPlan stdValAlg .skip sampleSymSt2 = .ok (.continuing sampleSymSt2) :=
+  ⟨wpConverges_of_stepInv_rank natCountdownStep_stepInv id
+     (fun s s' _ h => by
+       cases s with
+       | zero => exact nomatch h
+       | succ m =>
+         injection h with hEq
+         subst hEq
+         exact Nat.lt_succ_self m)
+     n trivial,
+   runBlockCfgLoop_forkFree_of_fault partialWrapCfg 3 0 0 3 rfl,
+   fun k => evalFuel_blockCfgStep_ne_faulted_of_blockInv testCfgStep countdownInv
+     (· = 100) countdown_localBlockVC 0 n 0 (Or.inl rfl) k,
+   (wpConverges_blockCfgStep_iff_of_noFork_loop (convergedJumpTestCfg true)
+     (convergedJumpTestCfg_noFork true)
+     ⟨composeWrap some (fun v => some (v + 10)), 1, n + 5, 2⟩ _).mpr
+     ⟨3, (n + 5) * 2, rfl, _, rfl, rfl⟩,
+   fun k => runBlockCfg_forkFree_eq_of_invClosedNoFork invClosedPartialCfg
+     invClosedReachable invClosedPartialCfg_invClosedNoFork k 0 3 (Or.inl rfl),
+   fun k => evalFuel_blockCfgStep_eq_of_blockInv testCfgStep countdownInv (· = 100)
+     countdown_localBlockVC_orig (fun bb st _ => testCfgStep_noFork bb st) k
+     ⟨some, 0, n, 0⟩ (Or.inl rfl),
+   (wpConverges_blockCfgStep_iff_of_blockInv_loop testCfgStep countdownInv
+     (· = 100) countdown_localBlockVC_orig
+     (fun bb st _ => testCfgStep_noFork bb st)
+     ⟨fun v => some (v + 1), 2, 0, 0⟩ (Or.inr (Or.inr ⟨rfl, rfl⟩)) _).mpr
+     ⟨1, 100, rfl, 101, rfl, rfl⟩,
+   evalFuel_blockCfgStep_stepBasicBlock_handleFree stdValAlg sampleBranchBlockCfg
+     (k := 3) (bb := 0) (st := sampleSymSt2) (wait := 0) rfl,
+   wpConverges_blockCfgStep_stepBasicBlock_handleFree stdValAlg sampleBranchBlockCfg
+     ⟨3, _, rfl, rfl⟩,
+   evalPlan_skip stdValAlg sampleSymSt2⟩
 
 end Canaries
 
