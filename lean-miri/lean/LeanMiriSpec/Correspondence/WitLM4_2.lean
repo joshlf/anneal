@@ -27,17 +27,18 @@ simulation theorems, and in explicitly labeled contrast conjuncts.
 
 * Lockstep witnesses (both machines step to related states, or both report
   undefined behavior): `assume`, the bit / saturating / `exact_div` /
-  `arith_offset` calls, and the `copy_nonoverlapping` zero-count, overlap,
-  out-of-bounds same-local, overflow, distinct-local single-element, and
-  distinct-local full-byte multi-element (`count * size_of::<u8>() = 8` via
-  `copyViaBytes`) witnesses.
+  `arith_offset` calls, single-element / OOB / overflow `write_bytes`, and the
+  `copy_nonoverlapping` zero-count, overlap, out-of-bounds same-local, overflow,
+  distinct-local single-element, and distinct-local full-byte multi-element
+  (`count * size_of::<u8>() = 8` via `copyViaBytes`) witnesses.
 * Stage-1 boundary witnesses (`*_boundary`): Stage-1 hands `rotate_left`,
-  `rotate_right`, `write_bytes`, and the `wrapping_offset` /
-  `std::intrinsics::*` aliases to the environment (`MirStepNode.extCall`), while
-  `lean-miri` executes them inline or fails closed; conversely, on
-  `Stage1ExtraIntrinsic` calls (`wrapping_add`) and pointer-valued
-  `copy_nonoverlapping::<*mut u64>` (`TyId 80`), Stage-1 steps while `annealStepHooks`
-  fails closed.
+  `rotate_right`, and the `wrapping_offset` / `std::intrinsics::*` aliases to the
+  environment (`MirStepNode.extCall`), while `lean-miri` executes them inline or
+  fails closed; for `write_bytes`, Stage-1 rejects `.frozen` and misaligned
+  zero-count writes as UB and fails closed on partial non-zero-offset sub-range
+  writes; conversely, on `Stage1ExtraIntrinsic` calls (`wrapping_add`) and
+  pointer-valued `copy_nonoverlapping::<*mut u64>` (`TyId 80`), Stage-1 steps
+  while `annealStepHooks` fails closed.
 * Stage-1 divergence witnesses (`*_divergence`, `*_stage1_steps`, `*_clobbers*`):
   concrete programs on which Stage-1 `Trusted` and canonical `lean-miri` disagree —
   Stage-1 accepts zero-count misaligned and out-of-bounds copies that Miri
@@ -1500,7 +1501,7 @@ theorem wit_lm4_2_write_bytes_boundary :
           | head _ => exact Or.inl ⟨rfl, rfl⟩)
   rw [hs₂] at hsim₂
   obtain ⟨m₂, hm₂, hrel₂⟩ := hsim₂.miri_step_of_anneal_step
-  exact ⟨s₁, m₁, m₂, hs₁, hm₁, hrel₁, ⟨_, rfl, rfl⟩, hm₂, s₂, hrel₂, rfl⟩
+  exact ⟨s₁, m₁, m₂, hs₁, hm₁, hrel₁, ⟨_, by dsimp only [b, s₁, entry]; rfl, rfl⟩, hm₂, s₂, hrel₂, rfl⟩
 
 /-- **`wit_lm4_2_write_bytes_oob_boundary`** (Stage-1 boundary divergence): real
 execution where `write_bytes::<u64>(copy _2, 0xAB_u8, 2_usize)` attempts to write
@@ -1575,7 +1576,7 @@ theorem wit_lm4_2_write_bytes_oob_boundary :
           exact absurd hinb (by decide))
   rw [hs₂] at hsim₂
   obtain ⟨m₂, msg, hm₂⟩ := hsim₂.miri_ub_of_anneal_ub
-  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, rfl, hm₂⟩
+  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, by dsimp only [b, s₁, entry]; rfl, hm₂⟩
 
 /-- **`wit_lm4_2_write_bytes_overflow_boundary`** (Stage-1 boundary divergence):
 real execution where `write_bytes::<u64>(copy _2, 0xAB_u8, (2^60)_usize)` overflows
@@ -1640,7 +1641,7 @@ theorem wit_lm4_2_write_bytes_overflow_boundary :
       exact absurd hle (by decide))
   rw [hs₂] at hsim₂
   obtain ⟨m₂, msg, hm₂⟩ := hsim₂.miri_ub_of_anneal_ub
-  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, rfl, hm₂⟩
+  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, by dsimp only [b, s₁, entry]; rfl, hm₂⟩
 
 /-- Body for `write_bytes` on `&raw const _1` (`.frozen` borrow permission). -/
 def writeBytesFrozenBody : CapturedMir :=
@@ -1702,7 +1703,7 @@ theorem wit_lm4_2_write_bytes_frozen_boundary :
     (by simp [s₁, mkPtrState, entry, rawPtrAllocMapEntry, get?])
     (by decide) (by decide) rfl rfl (Or.inl rfl)
   obtain ⟨_, m₂, hm₂⟩ := hdiv
-  exact ⟨s₁, m₁, m₂, hs₁, hm₁, hrel₁, rfl, hm₂⟩
+  exact ⟨s₁, m₁, m₂, hs₁, hm₁, hrel₁, by dsimp only [b, s₁, entry]; rfl, hm₂⟩
 
 /-- Body for `write_bytes` at misaligned `offsetBytes = 1` on `*mut u64` with `count = 0`. -/
 def writeBytesMisalignedZeroBody : CapturedMir :=
@@ -2059,7 +2060,8 @@ theorem wit_lm4_2_write_bytes_partial_boundary :
     obtain ⟨_, _, _, msc, hrel_sc, hread⟩ := hsc_spec ⟨0x00000000ABAB002A, 8⟩ rfl
     exact ⟨la₁, msc, hfind₁, hrel_sc, hread⟩
   exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
-    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, rfl, hm₄, ⟨s₄, hrel₄, rfl⟩, hmem₁⟩
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃,
+    by dsimp only [b, s₃, ptr0, ptr2, entry]; rfl, hm₄, ⟨s₄, hrel₄, rfl⟩, hmem₁⟩
 
 /-! ## 6. `NonDivergingIntrinsic.CopyNonOverlapping` real-step witnesses -/
 
@@ -2313,7 +2315,7 @@ theorem wit_lm4_2_copy_nonoverlapping_oob_ub :
   have hs₂ : stepMirFnLM4_2 b s₁ = .fail .ub := rfl
   rw [hs₂] at hsim₂
   obtain ⟨m₂, msg, hm₂⟩ := hsim₂.miri_ub_of_anneal_ub
-  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, rfl, hm₂⟩
+  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, by dsimp only [b, s₁, entry]; rfl, hm₂⟩
 
 /-- **`wit_lm4_2_copy_nonoverlapping_overflow_ub`**: real 2-step execution where
 `copy_nonoverlapping(copy _2, copy _2, (2^60)_usize)` overflows `isize::MAX`
@@ -2376,7 +2378,7 @@ theorem wit_lm4_2_copy_nonoverlapping_overflow_ub :
   have hs₂ : stepMirFnLM4_2 b s₁ = .fail .ub := rfl
   rw [hs₂] at hsim₂
   obtain ⟨m₂, msg, hm₂⟩ := hsim₂.miri_ub_of_anneal_ub
-  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, rfl, hm₂⟩
+  exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, by dsimp only [b, s₁, entry]; rfl, hm₂⟩
 
 /-- Body for `copy_nonoverlapping` at misaligned `offsetBytes = 1` on `*mut u64` with `count = 0`. -/
 def copyMisalignedZeroBody : CapturedMir :=

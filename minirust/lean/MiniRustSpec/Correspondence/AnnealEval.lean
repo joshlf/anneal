@@ -6291,6 +6291,12 @@ theorem operandTy_copyOp (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     operandTy decls layouts (copyOp op) = operandTy decls layouts op := by
   cases op <;> rfl
 
+private theorem resolveByteCastSrcTyAndSize_copyOp
+    (decls : List LocalDecl) (layouts : Layout.LayoutTable) (op : Operand) (srcTy : Ty) :
+    MirSemantics.resolveByteCastSrcTyAndSize decls layouts (copyOp op) srcTy =
+      MirSemantics.resolveByteCastSrcTyAndSize decls layouts op srcTy := by
+  cases op <;> rfl
+
 theorem operandIsSigned_copyOp (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     (op : Operand) :
     operandIsSigned decls (copyOp op) layouts = operandIsSigned decls op layouts := by
@@ -7568,6 +7574,7 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, evalByteCast, copyRv, rvPost, opsPost, rvOperands, List.foldl]
     rw [evalOperand_move locals op hs _ _ _ _ decls, operandTy_copyOp]
+    simp only [resolveByteCastSrcTyAndSize_copyOp]
     cases evalOperand locals (copyOp op) mem.borrows mem.globals layouts mem.callerLocals decls
         mem.callStack with
     | ok v L1 =>

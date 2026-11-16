@@ -4560,7 +4560,8 @@ theorem w6_write_bytes_inline_lockstep :
         (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _)))
   -- Anneal: `write_bytes` inline, then the root return of `()`.
   obtain ⟨hAsafe, ⟨tr, htr⟩, _⟩ := anneal_safe_of_runAnnealBounded_returned
-    (body := b) (N := 30) (s := initMachineState b []) (retVal := .unit) rfl
+    (body := b) (N := 30) (s := initMachineState b []) (retVal := .unit)
+    (by dsimp only [b]; rfl)
   have hagree : AgreeReaches b (annealMiriHooks b) (initMachineState b []) (wbAddrOfState b)
       (miriEntryState b) m₁ :=
     agreeReaches_of_prefix_paths hpa hpm (.step .silent hs₁ (.refl _))
@@ -6121,11 +6122,11 @@ with the pre-Stage-1 reference model `stepMirFnLM4_2` at the `write_bytes` call
 and with Stage-1 `stepMirFn` elsewhere, from `retWriteBytesReadPreAnneal`:
 
 1. `_2 = &raw mut _1` (`stepMirFn`);
-2. `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb2`, which `lean-miri` and
-   the reference model execute inline, filling all 8 bytes of `_1` with `0xAB`
-   (`0xABAB_ABAB_ABAB_ABAB = 12370169555311111083`); Stage-1 `stepMirFn` instead
-   hands the call to the environment (`MirStepNode.extCall`, the conjunct after
-   the reference step);
+2. `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb2`, which `lean-miri`,
+   the reference model, and Stage-1 `stepMirFn` (`evalWriteBytesCall`, since
+   `ws-repatriate-leaked-ground-semantics-to-tcb`) all execute inline, filling
+   all 8 bytes of `_1` with `0xAB`
+   (`0xABAB_ABAB_ABAB_ABAB = 12370169555311111083`);
 3. `_0 = copy (*_2)`, which reads the written bytes back through the raw
    pointer;
 4. the root-frame `return`, at which the reference state returns the scalar
@@ -6144,12 +6145,8 @@ theorem retWriteBytesRead_ref_trace :
       Miri.Interpreter.Step.step hooks () retWriteBytesReadPreMiri = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
       stepMirFnLM4_2 b s₁ = .step s₂ ∧
-      stepMirFn b s₁ =
-        MirStepNode.extCall
-          { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
-            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
-            memory := s₁.memory }
-          (resumeExternalCall s₁ s₁.frame.locals (WitnessLM4_2.local42 3) 2 .unreachable) ∧
+      (∃ sW, stepMirFn b s₁ = .step sW ∧
+        get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩))) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       StateRelLM3_1 b s₂ m₂ [entry] ∧
       get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) ∧
@@ -6290,7 +6287,8 @@ theorem retWriteBytesRead_ref_trace :
   have hobs₄ := hsim₄.toStepObsRelLM3_1
   rw [hs₄] at hsim₄
   obtain ⟨decl0, imm0, hdecl0, hop, himm, hmret⟩ := retStepRelLM3_1_retNormal_rel hsim₄
-  exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, decl0, imm0, hs₁, hm₁, hrel₁, hs₂, rfl, hm₂, hrel₂, rfl,
+  exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, decl0, imm0, hs₁, hm₁, hrel₁, hs₂,
+    ⟨_, by dsimp only [b, s₁, entry]; rfl, rfl⟩, hm₂, hrel₂, rfl,
     hs₃, hm₃, hrel₃, hobs₄, hs₄, hmret, hdecl0, hop, himm⟩
 
 /-!

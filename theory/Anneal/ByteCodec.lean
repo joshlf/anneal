@@ -3489,7 +3489,8 @@ def fieldlessEnum {ε : Type}
         t < 2 ^ (8 * sz) →
         wrappingRangeContains validRange t = true →
         Trusted.Sequence.get? variantShapes t = some varShape →
-        ∃ e : ε, toTag e = t) :
+        ∃ e : ε, toTag e = t)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx } ε sz where
   codec := FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds
   toValue := fun e => .aggregate (toTag e) []
@@ -3526,7 +3527,7 @@ def fieldlessEnum {ε : Type}
     rw [hFields, hScalarWidth, hGetVar]
     dsimp only
     have hGet0 : Trusted.Sequence.get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
-    rw [hGet0, hSize]
+    rw [hGet0, hNoDiscr, hSize]
     dsimp only
     unfold encodeScalarBytes
     have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
@@ -3575,7 +3576,7 @@ def fieldlessEnum {ε : Type}
     rw [show defaultCodecFuel = 15 + 1 from rfl,
         decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
           (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-          hLookup hInhab hVar hFields hScalarWidth]
+          hLookup hInhab hVar hFields hScalarWidth bs hNoDiscr]
     have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
     rw [hLenDef, hSize]
     let enumC := FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds
@@ -11502,14 +11503,15 @@ def mirValueCodec (spec : CompactEnumSpec)
         t < 2 ^ (8 * spec.tagByteWidth) →
         wrappingRangeContains validRange t = true →
         Trusted.Sequence.get? variantShapes t = some varShape →
-        ∃ v : CompactEnumVal spec, v.toTag = t) :
+        ∃ v : CompactEnumVal spec, v.toTag = t)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx }
       (CompactEnumVal spec) spec.tagByteWidth :=
   MirValueCodec.fieldlessEnum
     layouts defPath args idx l spec.tagByteWidth bitsWidth signed validRange
     variantShapes memoryOrder toTag (ofTagNat spec)
     (ofTagNat_toTag spec) (toTag_lt spec) spec.tagByteWidth_pos
-    hLookup hInhab hSize hVar hFields hWidth hAllFieldless hTagValid hTagComplete
+    hLookup hInhab hSize hVar hFields hWidth hAllFieldless hTagValid hTagComplete hNoDiscr
 
 end CompactEnumVal
 

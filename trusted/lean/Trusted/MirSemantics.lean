@@ -61,7 +61,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   encodeUntypedValueToBytes encodeFieldsAtOffsetsWith encodeSeqFieldsWith
   encodeUnionFieldsWith
   decodeFieldsAtOffsetsWith decodeFieldsBySpan decodeSeqFieldsWith
-  defaultCodecFuel encodeValueToBytes decodeValueFromBytes lookupBorrow
+  defaultCodecFuel findDiscriminantVariantIdx? resolveEnumVariantIdxByTag
+  resolveEnumDiscriminantForVariant encodeValueToBytes decodeValueFromBytes lookupBorrow
   updateBorrowPerm invalidateConflictingBorrows
   isBorrowDescendantOrSelfAux isBorrowDescendantOrSelf
   resolveTreeBorrowWriterTag updateBorrowPermTreeAtProj
@@ -79,7 +80,9 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
   evalOperand evalOperands
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
-  writePlaceValue derefWriteTreeUB evalByteCast
+  writePlaceValue derefWriteTreeUB layoutValidForAdt layoutValidForResolvedAdt
+  resolveByteCastSrcTyAndSize evalByteCast
+  evalNullaryOp evalUseRvalue evalShallowInitBox evalWrapUnsafeBinder
   unsizeArrayToSliceSpec? evalUnsizeCoercion deriveStackElemThinPtr
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze placeIsFreeze
   rigidTyIsZeroSized tyIsZeroSized placeIsZeroSized
@@ -128,7 +131,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   writeIntrinsicReturn writeIntrinsicScalarResult
   evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
   withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
-  constEvalSelectTupleArgOps evalDirectRustIntrinsic?
+  constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
+  WriteBytesAction writeBytesAction evalWriteBytesCall evalDirectRustIntrinsic?
   isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees

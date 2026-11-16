@@ -1860,6 +1860,9981 @@ attribute [irreducible] LiftBlock LiftResidualBlock LiftStmtsTerminator LiftFram
 
 end Anneal.MirLiftCore
 
+/-!
+## Modular Pure Execution (`PureMirModularConverges`) in the `Anneal.PureMirExec` Namespace
+
+Sections 9C–10C keep their `Anneal.PureMirExec` names and signatures (preserving
+the public API for all callers) and are elaborated here alongside Section 12 so
+both `PureMirExec.lean` and `MirLiftCore.lean` stay comfortably within the
+`-M2048` and 180-second per-module budgets of `trusted/audit/check_trusted.py`.
+-/
+section ModularPureExecContinuation
+set_option maxRecDepth 2048
+namespace Anneal.PureMirExec
+
+open Trusted.Effect
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.VerificationResult
+open Anneal.MirFuelFree
+open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.Rustc.V2026_06_01.Lower
+
+/-!
+### 9C. `#[external_spec]` & Modular Call Execution on `PureState`
+(`PureMirModularConverges`)
+-/
+
+/--
+Root-frame memory invariant for modular pure callers (`FF-2.2` Section 2 & 4):
+preserves `callees`, `traitImpls`, `callStack = []`, root/self `activeCallee`,
+and `activeProtectors = []`, while allowing arbitrary `borrows`, `globals`, and
+`fnPtrs` across `#[external_spec]` and `polyExternalSpecCallContract` calls.
+-/
+def ModularRootMemory
+    (body : CapturedMir) (callees : List CapturedMir)
+    (traitImpls : List TraitImplEntry) (m : Memory) : Prop :=
+  m.callees = callees ∧
+  m.traitImpls = traitImpls ∧
+  m.callStack = [] ∧
+  (m.activeCallee = none ∨ m.activeCallee = some body) ∧
+  m.activeProtectors = []
+
+theorem ModularRootMemory.activeCallee_getD
+    {body : CapturedMir} {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry} {m : Memory}
+    (h : ModularRootMemory body callees traitImpls m) :
+    m.activeCallee.getD body = body := by
+  rcases h.2.2.2.1 with h_none | h_some
+  · simp [h_none]
+  · simp [h_some]
+
+theorem ModularRootMemory.withBorrows
+    {body : CapturedMir} {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry} {m : Memory}
+    (h : ModularRootMemory body callees traitImpls m)
+    (bs : List BorrowEntry) :
+    ModularRootMemory body callees traitImpls { m with borrows := bs } :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2⟩
+
+theorem ModularRootMemory.withDirectDestBorrows
+    {body : CapturedMir} {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry} {m : Memory}
+    (h : ModularRootMemory body callees traitImpls m)
+    (locals : List LocalSlot) (dst : Place) :
+    ModularRootMemory body callees traitImpls
+      (invalidateDirectDestWriteBorrows m locals dst) := by
+  unfold invalidateDirectDestWriteBorrows
+  cases m.borrows with
+  | nil => exact h
+  | cons _ _ =>
+    rcases dst with ⟨_, _ | ⟨hd, _⟩⟩
+    · exact h.withBorrows _
+    · cases hd <;> first | exact h | exact h.withBorrows _
+
+theorem ModularRootMemory.withSomeActiveCallee
+    {body : CapturedMir} {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry} {m : Memory}
+    (h : ModularRootMemory body callees traitImpls m) :
+    ModularRootMemory body callees traitImpls { m with activeCallee := some body } :=
+  ⟨h.1, h.2.1, h.2.2.1, Or.inr rfl, h.2.2.2.2⟩
+
+theorem ModularRootMemory.of_callFrameAndTraitsPreserved
+    {body : CapturedMir} {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry} {m memAfter : Memory}
+    (h : ModularRootMemory body callees traitImpls m)
+    (h_pres : callFrameAndTraitsPreserved m memAfter) :
+    ModularRootMemory body callees traitImpls memAfter := by
+  rcases h with ⟨hc, ht, hcs, hac, hap⟩
+  rcases h_pres with ⟨⟨hc', hcs', hac', hap', _⟩, ht'⟩
+  exact ⟨by rw [hc', hc], by rw [ht', ht], by rw [hcs', hcs],
+    by rw [hac']; exact hac, by rw [hap', hap]⟩
+
+theorem ModularRootMemory.of_callFramePreserved_nil_traits
+    {body : CapturedMir} {callees : List CapturedMir}
+    {m memAfter : Memory}
+    (h : ModularRootMemory body callees memAfter.traitImpls m)
+    (h_pres : callFramePreserved m memAfter) :
+    ModularRootMemory body callees memAfter.traitImpls memAfter := by
+  rcases h with ⟨hc, _, hcs, hac, hap⟩
+  rcases h_pres with ⟨hc', hcs', hac', hap', _⟩
+  exact ⟨by rw [hc', hc], rfl, by rw [hcs', hcs],
+    by rw [hac']; exact hac, by rw [hap', hap]⟩
+
+/--
+Fuel-free modular pure convergence (`FF-2.2` Section 2 & 4):
+from any `m : Memory` satisfying `ModularRootMemory body callees traitImpls m`,
+the coinductive `ITree` `mirTree body (ps.toMachineState m)` converges (`DWP`)
+under `mirModularWP contract.toCallContract` to
+`mirSafePost (fun retVal _ => post retVal)`.
+-/
+def PureMirModularConverges
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (ps : PureState)
+    (post : Value → Prop)
+    (traitImpls : List TraitImplEntry := body.traitImpls) : Prop :=
+  ∀ m : Memory,
+    ModularRootMemory body callees traitImpls m →
+    Anneal.ITreeWP.DWP (mirModularWP contract.toCallContract)
+      (mirTree body (ps.toMachineState m))
+      (fun out _ => mirSafePost (fun retVal _ => post retVal) out)
+      PUnit.unit
+
+/-- Postcondition monotonicity for `PureMirModularConverges`. -/
+theorem PureMirModularConverges.mono
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {P Q : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_imp : ∀ v, P v → Q v)
+    (h : PureMirModularConverges contract body callees ps P traitImpls) :
+    PureMirModularConverges contract body callees ps Q traitImpls := by
+  intro m hm
+  refine Anneal.ITreeWP.DWP.mono ?_ (h m hm)
+  intro out _ h_out
+  cases out with
+  | normal rv => exact h_imp rv.1 h_out
+  | panic => trivial
+  | abort => trivial
+
+/--
+Contract refinement / subsumption monotonicity for `PureMirModularConverges`:
+lifts any modular convergence proof under `cSub` to a larger combined rely
+contract `cSuper` whenever `cSub.Subsumes cSuper`.
+-/
+theorem PureMirModularConverges.mono_contract
+    {cSub cSuper : MirCallContract}
+    {body : CapturedMir} {callees : List CapturedMir}
+    {ps : PureState} {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes cSub cSuper)
+    (h : PureMirModularConverges cSub body callees ps post traitImpls) :
+    PureMirModularConverges cSuper body callees ps post traitImpls := by
+  intro m hm
+  refine Anneal.ITreeWP.DWP.induct
+    (fun x s₀ =>
+      Anneal.ITreeWP.DWP (mirModularWP cSuper.toCallContract) x
+        (fun out _ => mirSafePost (fun retVal _ => post retVal) out) s₀)
+    ?_ (h m hm)
+  intro x s₀ hx
+  rw [Anneal.ITreeWP.DWP.unfold_eq]
+  cases hx_obs : x.observe with
+  | ret _ => rw [hx_obs] at hx; exact hx
+  | tau _ => rw [hx_obs] at hx; exact hx
+  | vis i k =>
+    rw [hx_obs] at hx
+    rcases i with _ | (ev | callOp)
+    · exact False.elim hx
+    · cases ev; exact hx
+    · cases callOp with
+      | call req =>
+        rcases hx with ⟨h_pre, h_cont⟩
+        rcases h_sub req h_pre with ⟨h_sup_pre, h_sup_post⟩
+        exact ⟨h_sup_pre, fun ans h_ans => h_cont ans (h_sup_post ans h_ans)⟩
+
+/--
+Lift bounded frame-and-traits symbolic modular evaluation
+(`wpMirFrameAndTraitsModularSym`) into `PureMirModularConverges`.
+-/
+theorem PureMirModularConverges.of_wpFrameAndTraitsModular
+    {contract : MirCallContract}
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.frameAndTraitsPreserved req.memory)
+    {body : CapturedMir} {callees : List CapturedMir}
+    {ps : PureState} {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_wp :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        ∃ fuel : Nat,
+          wpMirFrameAndTraitsModularSym contract fuel body
+            (ps.toMachineState m)
+            (mirSafePost (fun retVal _ => post retVal))) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  rcases h_wp m hm with ⟨fuel, hf⟩
+  have h_mod : MirModularWpConverges contract body (ps.toMachineState m)
+      (mirSafePost (fun retVal _ => post retVal)) :=
+    ⟨fuel, wpMirExecModularSym_of_wpMirExecFrameAndTraitsModularSym
+      contract h_frame fuel body _ _ hf⟩
+  exact dwp_of_mirModularWpConverges h_mod
+
+theorem dwp_modular_of_noCallWp
+    {contract : MirCallContract} {body : CapturedMir}
+    {s : MachineState} {Q : MirOutcome → Prop}
+    (h_nc : MirNoCallWpConverges body s Q) :
+    Anneal.ITreeWP.DWP (mirModularWP contract.toCallContract)
+      (mirTree body s) (fun out _ => Q out) PUnit.unit := by
+  rcases h_nc with ⟨f, hf⟩
+  suffices ∀ st : MirExecState,
+      wpMirExecNoCallSym f body st Q →
+      Anneal.ITreeWP.DWP (mirModularWP contract.toCallContract)
+        (Trusted.ITree.ITree.cofix (stepMirState body) st)
+        (fun out _ => Q out) PUnit.unit from
+    this (.running s) hf
+  clear hf
+  induction f with
+  | zero => intro _ h_st; exact False.elim h_st
+  | succ f' ih =>
+    intro st h_st
+    unfold wpMirExecNoCallSym at h_st
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval] at h_st
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    cases h_sf : stepMirState body st with
+    | ret out => rw [h_sf] at h_st; exact h_st
+    | tau st' => rw [h_sf] at h_st; exact ih st' h_st
+    | vis i k =>
+      rw [h_sf] at h_st
+      rcases i with fk | (e | c)
+      · exact False.elim h_st
+      · cases e; exact ih (k PUnit.unit) h_st
+      · exact False.elim h_st
+
+theorem dwp_modular_bind_steps
+    {contract : MirCallContract} {body : CapturedMir}
+    {s : MachineState} {mid : MachineState → Prop}
+    {Q : MirOutcome → Prop}
+    (h_steps : MirStepsConverges body s mid Q)
+    (h_cont :
+      ∀ s', mid s' →
+        Anneal.ITreeWP.DWP (mirModularWP contract.toCallContract)
+          (mirTree body s') (fun out _ => Q out) PUnit.unit) :
+    Anneal.ITreeWP.DWP (mirModularWP contract.toCallContract)
+      (mirTree body s) (fun out _ => Q out) PUnit.unit := by
+  rcases h_steps with ⟨f, hf⟩
+  suffices ∀ st : MirExecState,
+      wpMirExecStepsSym f body st
+        (fun
+          | .running s' => mid s'
+          | .halted out => Q out
+          | .faulted _ => False)
+        Q →
+      Anneal.ITreeWP.DWP (mirModularWP contract.toCallContract)
+        (Trusted.ITree.ITree.cofix (stepMirState body) st)
+        (fun out _ => Q out) PUnit.unit from
+    this (.running s) hf
+  clear hf
+  induction f with
+  | zero =>
+    intro st h_st
+    cases st with
+    | running s' => exact h_cont s' h_st
+    | halted out =>
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      exact h_st
+    | faulted _ => exact False.elim h_st
+  | succ f' ih =>
+    intro st h_st
+    unfold wpMirExecStepsSym at h_st
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval] at h_st
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    cases h_sf : stepMirState body st with
+    | ret out =>
+      rw [h_sf] at h_st
+      exact h_st
+    | tau st' =>
+      rw [h_sf] at h_st
+      exact ih st' h_st
+    | vis i k =>
+      rw [h_sf] at h_st
+      rcases i with fk | (e | c)
+      · exact False.elim h_st
+      · cases e
+        exact ih (k PUnit.unit) h_st
+      · exact False.elim h_st
+
+/--
+1-step `return_` rule for `PureMirModularConverges`.
+-/
+theorem PureMirModularConverges.return_
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {retVal : Value}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .return_)
+    (h_ret : get? ps.env 0 = some (.init retVal))
+    (h_post : post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator]
+    rw [h_ret]
+    dsimp only
+    rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, hm.2.2.1]
+    dsimp only [MirStepNode.retNormal,
+      Trusted.ITree.ITreeF.map]
+    exact h_post
+
+/--
+1-step pure statement rule for `PureMirModularConverges` (valid even when
+`m.borrows` is non-empty after an external modular call).
+-/
+theorem PureMirModularConverges.step_stmt
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {stmt : Statement} {s_emp : MachineState}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_stmt : get? bb.statements ps.stmtIdx = some stmt)
+    (h_pure : isBorrowFreePureStatement body.localDecls body.layouts stmt.kind = true)
+    (h_eval :
+      evalStmt (ps.toMachineState emptyMemory) stmt body.localDecls body.layouts =
+        MirStepNode.step s_emp)
+    (h_next :
+      PureMirModularConverges contract body callees
+        (PureState.ofMachineState s_emp) post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_pure_s := isPureStatement_of_isBorrowFreePureStatement h_pure
+  have h_ap : m.activeProtectors = [] := hm.2.2.2.2
+  have h_step_m :
+      ∃ bs : List BorrowEntry,
+        evalStmt (ps.toMachineState m) stmt body.localDecls body.layouts =
+          MirStepNode.step
+            ((PureState.ofMachineState s_emp).toMachineState
+              { m with borrows := bs }) := by
+    rcases stmt with ⟨skind, sspan⟩
+    cases skind with
+    | nop =>
+      injection h_eval with h_se; injection h_se with h_eq
+      subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+    | coverage =>
+      injection h_eval with h_se; injection h_se with h_eq
+      subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+    | constEvalCounter =>
+      injection h_eval with h_se; injection h_se with h_eq
+      subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+    | placeMention p =>
+      unfold evalStmt at h_eval ⊢
+      dsimp only [PureState.toMachineState] at h_eval ⊢
+      cases h_g : get? ps.env p.local_ with
+      | none => rw [h_g] at h_eval; nomatch h_eval
+      | some sl =>
+        rw [h_g] at h_eval
+        cases sl with
+        | dead => nomatch h_eval
+        | uninit =>
+          dsimp only at h_eval ⊢
+          cases h_ok : placeMentionOperandsInit ps.env .uninit p.projection with
+          | false => rw [h_ok] at h_eval; nomatch h_eval
+          | true =>
+            rw [h_ok] at h_eval
+            injection h_eval with h_se; injection h_se with h_eq
+            subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+        | init v =>
+          dsimp only at h_eval ⊢
+          cases h_ok : placeMentionOperandsInit ps.env (.init v) p.projection with
+          | false => rw [h_ok] at h_eval; nomatch h_eval
+          | true =>
+            rw [h_ok] at h_eval
+            injection h_eval with h_se; injection h_se with h_eq
+            subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+    | storageLive loc =>
+      unfold evalStmt at h_eval ⊢
+      dsimp only [PureState.toMachineState] at h_eval ⊢
+      cases h_g : get? ps.env loc with
+      | none => rw [h_g] at h_eval; nomatch h_eval
+      | some _ =>
+        rw [h_g] at h_eval
+        cases h_s : set? ps.env loc .uninit with
+        | none => rw [h_s] at h_eval; nomatch h_eval
+        | some l' =>
+          rw [h_s] at h_eval
+          dsimp only [emptyMemory] at h_eval
+          rw [h_ap]
+          injection h_eval with h_se; injection h_se with h_eq
+          subst h_eq
+          exact ⟨disableLocalBorrows m.borrows loc (length m.callStack), rfl⟩
+    | storageDead loc =>
+      unfold evalStmt at h_eval ⊢
+      dsimp only [PureState.toMachineState] at h_eval ⊢
+      cases h_g : get? ps.env loc with
+      | none => rw [h_g] at h_eval; nomatch h_eval
+      | some _ =>
+        rw [h_g] at h_eval
+        cases h_s : set? ps.env loc .dead with
+        | none => rw [h_s] at h_eval; nomatch h_eval
+        | some l' =>
+          rw [h_s] at h_eval
+          dsimp only [emptyMemory] at h_eval
+          rw [h_ap]
+          injection h_eval with h_se; injection h_se with h_eq
+          subst h_eq
+          exact ⟨disableLocalBorrows m.borrows loc (length m.callStack), rfl⟩
+    | deinit p =>
+      unfold evalStmt at h_eval ⊢
+      dsimp only [PureState.toMachineState] at h_eval ⊢
+      rcases p with ⟨loc, proj⟩
+      cases proj with
+      | nil =>
+        dsimp only at h_eval ⊢
+        cases h_g : get? ps.env loc with
+        | none => rw [h_g] at h_eval; nomatch h_eval
+        | some sl =>
+          rw [h_g] at h_eval
+          cases sl with
+          | dead => nomatch h_eval
+          | uninit =>
+            cases h_s : set? ps.env loc .uninit with
+            | none => rw [h_s] at h_eval; nomatch h_eval
+            | some _ =>
+              rw [h_s] at h_eval
+              injection h_eval with h_se; injection h_se with h_eq
+              subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+          | init _ =>
+            cases h_s : set? ps.env loc .uninit with
+            | none => rw [h_s] at h_eval; nomatch h_eval
+            | some _ =>
+              rw [h_s] at h_eval
+              injection h_eval with h_se; injection h_se with h_eq
+              subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+      | cons hd tl =>
+        dsimp only at h_eval ⊢
+        cases h_g : get? ps.env loc with
+        | none => rw [h_g] at h_eval; nomatch h_eval
+        | some sl =>
+          rw [h_g] at h_eval
+          cases sl with
+          | uninit => nomatch h_eval
+          | dead => nomatch h_eval
+          | init rv =>
+            dsimp only at h_eval ⊢
+            cases h_rd : readProjectedValue ps.env rv (hd :: tl) with
+            | ub => rw [h_rd] at h_eval; nomatch h_eval
+            | unsupported => rw [h_rd] at h_eval; nomatch h_eval
+            | ok _ =>
+              rw [h_rd] at h_eval
+              injection h_eval with h_se; injection h_se with h_eq
+              subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+    | intrinsic intr =>
+      cases intr with
+      | copyNonOverlapping _ _ _ => cases h_pure_s
+      | assume op =>
+        dsimp only [isPureStatement] at h_pure_s
+        unfold evalStmt at h_eval ⊢
+        dsimp only [PureState.toMachineState] at h_eval ⊢
+        rw [evalOperand_pure_eq ps.env op m.borrows m.globals body.layouts m.callerLocals h_pure_s]
+        rw [evalOperand_pure_eq ps.env op emptyMemory.borrows emptyMemory.globals body.layouts emptyMemory.callerLocals h_pure_s] at h_eval
+        cases h_ev : evalOperand ps.env op [] [] body.layouts [] body.localDecls with
+        | ub => rw [h_ev] at h_eval; nomatch h_eval
+        | unsupported => rw [h_ev] at h_eval; nomatch h_eval
+        | ok val l' =>
+          rw [h_ev] at h_eval
+          cases val with
+          | scalar sc =>
+            dsimp only at h_eval ⊢
+            cases h_ok : Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
+            | false => rw [h_ok] at h_eval; nomatch h_eval
+            | true =>
+              rw [h_ok] at h_eval
+              injection h_eval with h_se; injection h_se with h_eq
+              subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+          | _ => nomatch h_eval
+    | retag _ _ => cases h_pure_s
+    | backwardIncompatibleDropHint _ => cases h_pure_s
+    | setDiscriminant p varIdx =>
+      dsimp only [isPureStatement] at h_pure_s
+      have h_op : isPureOperand (.copy p) = true := h_pure_s
+      rcases p with ⟨loc, proj⟩
+      cases proj with
+      | nil =>
+        unfold evalStmt at h_eval ⊢
+        dsimp only [PureState.toMachineState, evalSetDiscriminantLocal, emptyMemory] at h_eval ⊢
+        cases h_g : get? ps.env loc with
+        | none => rw [h_g] at h_eval; nomatch h_eval
+        | some sl =>
+          rw [h_g] at h_eval
+          cases sl with
+          | dead => nomatch h_eval
+          | uninit =>
+            dsimp only at h_eval ⊢
+            cases h_decl : setDiscriminantUninitDeclOk body.localDecls loc with
+            | false => rw [h_decl] at h_eval; nomatch h_eval
+            | true =>
+              rw [h_decl] at h_eval
+              dsimp only at h_eval ⊢
+              cases h_s : set? ps.env loc (.init (.aggregate varIdx [])) with
+              | none => rw [h_s] at h_eval; nomatch h_eval
+              | some _ =>
+                rw [h_s] at h_eval
+                rw [h_ap]
+                injection h_eval with h_se; injection h_se with h_eq
+                subst h_eq
+                exact ⟨invalidateConflictingBorrows m.borrows loc .none (length m.callStack), rfl⟩
+          | init v =>
+            cases v with
+            | aggregate _ flds =>
+              dsimp only at h_eval ⊢
+              cases h_s : set? ps.env loc (.init (.aggregate varIdx flds)) with
+              | none => rw [h_s] at h_eval; nomatch h_eval
+              | some _ =>
+                rw [h_s] at h_eval
+                rw [h_ap]
+                injection h_eval with h_se; injection h_se with h_eq
+                subst h_eq
+                exact ⟨invalidateConflictingBorrows m.borrows loc .none (length m.callStack), rfl⟩
+            | _ => nomatch h_eval
+      | cons hd tl =>
+        have h_hd : isPureProjElem hd = true := by
+          simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure_s
+          exact h_pure_s.1
+        have h_nd := ne_deref_of_isPureProjElem h_hd
+        rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd] at h_eval ⊢
+        dsimp only [PureState.toMachineState, emptyMemory] at h_eval ⊢
+        rw [evalOperand_pure_eq ps.env (.copy { local_ := loc, projection := hd :: tl })
+          m.borrows m.globals body.layouts m.callerLocals h_op]
+        rw [evalOperand_pure_eq ps.env (.copy { local_ := loc, projection := hd :: tl })
+          [] [] body.layouts [] h_op] at h_eval
+        cases h_ev : evalOperand ps.env (.copy { local_ := loc, projection := hd :: tl }) [] [] body.layouts [] body.localDecls with
+        | ub => rw [h_ev] at h_eval; nomatch h_eval
+        | unsupported => rw [h_ev] at h_eval; nomatch h_eval
+        | ok v l1 =>
+          rw [h_ev] at h_eval
+          cases v with
+          | aggregate _ flds =>
+            dsimp only [hasProtectedWriteConflict] at h_eval ⊢
+            rw [h_ap, hasProtectedWriteConflict_activeProtectors_nil]
+            dsimp only at h_eval ⊢
+            rw [writePlaceValue_pure_eq l1 m.borrows { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) h_pure_s]
+            rw [writePlaceValue_pure_eq l1 [] { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) h_pure_s] at h_eval
+            cases h_w : writePlaceValue l1 [] { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) body.localDecls body.layouts with
+            | ub => rw [h_w] at h_eval; nomatch h_eval
+            | unsupported => rw [h_w] at h_eval; nomatch h_eval
+            | ok _ =>
+              rw [h_w] at h_eval
+              injection h_eval with h_se; injection h_se with h_eq
+              subst h_eq
+              exact ⟨invalidateConflictingBorrowsAtProj m.borrows loc .none _ 0 0 (length m.callStack), rfl⟩
+          | _ => nomatch h_eval
+    | assign dst rv =>
+      simp only [isBorrowFreePureStatement, Bool.and_eq_true] at h_pure
+      rcases h_pure with ⟨h_dst, h_rv⟩
+      rw [evalStmt_assign_eq] at h_eval
+      rw [evalStmt_assign_eq]
+      dsimp only [PureState.toMachineState] at h_eval ⊢
+      rw [evalRvalue_borrowFree_pure_eq_withMem ps.env rv m body.localDecls body.layouts h_rv]
+      have h_emp := evalRvalue_borrowFree_pure_eq_withMem ps.env rv emptyMemory body.localDecls body.layouts h_rv
+      cases h_res : evalRvalue ps.env rv emptyMemory body.localDecls body.layouts with
+      | ub => rw [h_res] at h_eval; nomatch h_eval
+      | unsupported => rw [h_res] at h_eval; nomatch h_eval
+      | ok val l1 mem1 =>
+        have h_mem1 : mem1 = emptyMemory := by
+          rw [h_res] at h_emp; injection h_emp
+        subst h_mem1
+        rw [h_res] at h_eval
+        dsimp only [RvalueEvalResult.withMem] at h_eval ⊢
+        rcases dst with ⟨dstLoc, dstProj⟩
+        cases dstProj with
+        | nil =>
+          unfold evalAssignDst at h_eval ⊢
+          dsimp only at h_eval ⊢
+          cases h_g : get? l1 dstLoc with
+          | none => rw [h_g] at h_eval; nomatch h_eval
+          | some sl =>
+            rw [h_g] at h_eval
+            cases sl with
+            | dead => nomatch h_eval
+            | uninit =>
+              cases h_s : set? l1 dstLoc (.init val) with
+              | none => rw [h_s] at h_eval; nomatch h_eval
+              | some l2 =>
+                rw [h_s] at h_eval
+                dsimp only [emptyMemory] at h_eval
+                rw [h_ap]
+                injection h_eval with h_se; injection h_se with h_eq
+                subst h_eq
+                exact ⟨invalidateConflictingBorrows m.borrows dstLoc .none (length m.callStack), rfl⟩
+            | init _ =>
+              cases h_s : set? l1 dstLoc (.init val) with
+              | none => rw [h_s] at h_eval; nomatch h_eval
+              | some l2 =>
+                rw [h_s] at h_eval
+                dsimp only [emptyMemory] at h_eval
+                rw [h_ap]
+                injection h_eval with h_se; injection h_se with h_eq
+                subst h_eq
+                exact ⟨invalidateConflictingBorrows m.borrows dstLoc .none (length m.callStack), rfl⟩
+        | cons hd tl =>
+          simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
+          have h_nd := ne_deref_of_isPureProjElem h_dst.1
+          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd] at h_eval
+          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd]
+          unfold evalAssignNonDeref at h_eval ⊢
+          dsimp only at h_eval ⊢
+          cases h_g : get? l1 dstLoc with
+          | none => rw [h_g] at h_eval; nomatch h_eval
+          | some sl =>
+            rw [h_g] at h_eval
+            cases sl with
+            | uninit =>
+              dsimp only at h_eval ⊢
+              cases h_sh : uninitFieldWriteShell? body.localDecls body.layouts dstLoc hd tl with
+              | none => rw [h_sh] at h_eval; nomatch h_eval
+              | some rootVal =>
+                rw [h_sh] at h_eval
+                dsimp only at h_eval ⊢
+                generalize writeProjectedForLocal l1 body.localDecls body.layouts dstLoc rootVal _ val = wpvRes at h_eval ⊢
+                cases wpvRes with
+                | ub => nomatch h_eval
+                | unsupported => nomatch h_eval
+                | ok rootVal' =>
+                  dsimp only at h_eval ⊢
+                  cases h_s : set? l1 dstLoc (.init rootVal') with
+                  | none => rw [h_s] at h_eval; nomatch h_eval
+                  | some l2 =>
+                    rw [h_s] at h_eval
+                    dsimp only [emptyMemory] at h_eval
+                    rw [h_ap]
+                    injection h_eval with h_se; injection h_se with h_eq
+                    subst h_eq
+                    exact ⟨invalidateConflictingBorrowsAtProj m.borrows dstLoc .none _ 0 0 (length m.callStack), rfl⟩
+            | dead => nomatch h_eval
+            | init rootVal =>
+              dsimp only at h_eval ⊢
+              generalize
+                writeProjectedForLocal l1 body.localDecls body.layouts dstLoc (ensureNestedFieldShells rootVal (hd :: tl)) _ val =
+                  wpvRes at h_eval ⊢
+              cases wpvRes with
+              | ub => nomatch h_eval
+              | unsupported => nomatch h_eval
+              | ok rootVal' =>
+                dsimp only at h_eval ⊢
+                cases h_s : set? l1 dstLoc (.init rootVal') with
+                | none => rw [h_s] at h_eval; nomatch h_eval
+                | some l2 =>
+                  rw [h_s] at h_eval
+                  dsimp only [emptyMemory] at h_eval
+                  rw [h_ap]
+                  injection h_eval with h_se; injection h_se with h_eq
+                  subst h_eq
+                  exact ⟨invalidateConflictingBorrowsAtProj m.borrows dstLoc .none _ 0 0 (length m.callStack), rfl⟩
+  rcases h_step_m with ⟨bs, h_eval_m⟩
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState] at h_eval_m ⊢
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt]
+    dsimp only
+    rw [h_eval_m]
+    exact h_next { m with borrows := bs } (ModularRootMemory.withBorrows hm bs)
+
+/-- 1-step `goto` terminator rule for `PureMirModularConverges`. -/
+theorem PureMirModularConverges.step_goto
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {targetBb : BasicBlockIdx}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .goto targetBb)
+    (h_next :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := ps.env } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    exact h_next m hm
+
+theorem resolveCalleeBodyAndArgs?_nil
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (traitImpls : List TraitImplEntry) :
+    resolveCalleeBodyAndArgs? [] defPath typeArgs traitImpls = none := by
+  have h_nonparam (fa : RigidTy) (ra : List RigidTy) :
+      (let allTraitImpls := traitImpls ++ flatMapTraitImpls []
+       let matchedImpls := collectMatchingTraitImpls [] allTraitImpls defPath (fa :: ra)
+       match matchedImpls with
+       | [] =>
+         match findCallee? [] defPath with
+         | none => none
+         | some c =>
+           match Bool.and (hasTraitImplForDefPath allTraitImpls defPath)
+               (Bool.not (allParamsInCallerLayouts 0 fa)) with
+           | true => none
+           | false => some (c, fa :: ra)
+       | _ :: _ =>
+         match filterMostSpecificTraitImpls matchedImpls matchedImpls with
+         | (winnerEntry, some implTypeArgs) :: [] =>
+           match findCallee? [] winnerEntry.implPath with
+           | some c =>
+             let effectiveTypeArgs :=
+               match stringEq winnerEntry.implPath defPath with
+               | true => fa :: ra
+               | false => implTypeArgs
+             if effectiveTypeArgs.length == c.typeParamCount then
+               some (c, effectiveTypeArgs)
+             else none
+           | none => none
+         | _ => none) = (none : Option (CapturedMir × List RigidTy)) := by
+    dsimp only
+    cases h_m : collectMatchingTraitImpls []
+        (traitImpls ++ flatMapTraitImpls []) defPath (fa :: ra) with
+    | nil => rfl
+    | cons hd tl =>
+      dsimp only
+      cases filterMostSpecificTraitImpls (hd :: tl) (hd :: tl) with
+      | nil => rfl
+      | cons w wtl =>
+        rcases w with ⟨_, wargs⟩
+        cases wargs <;> cases wtl <;> rfl
+  unfold resolveCalleeBodyAndArgs?
+  cases typeArgs with
+  | nil => rfl
+  | cons firstArg restArgs =>
+    cases firstArg with
+    | param _ _ => rfl
+    | bool => exact h_nonparam _ _
+    | char => exact h_nonparam _ _
+    | int _ => exact h_nonparam _ _
+    | uint _ => exact h_nonparam _ _
+    | float _ => exact h_nonparam _ _
+    | never => exact h_nonparam _ _
+    | str => exact h_nonparam _ _
+    | tuple _ => exact h_nonparam _ _
+    | array _ _ => exact h_nonparam _ _
+    | slice _ => exact h_nonparam _ _
+    | ref _ _ => exact h_nonparam _ _
+    | rawPtr _ _ => exact h_nonparam _ _
+    | adt _ _ => exact h_nonparam _ _
+    | fnDef _ _ => exact h_nonparam _ _
+    | fnPtr _ _ _ _ => exact h_nonparam _ _
+    | closure _ _ => exact h_nonparam _ _
+    | dynamic _ => exact h_nonparam _ _
+    | foreign _ => exact h_nonparam _ _
+    | alias _ _ => exact h_nonparam _ _
+    | other _ => exact h_nonparam _ _
+
+/--
+Looking up any callee in an empty `callees` list returns `none` for any
+`traitImpls`.
+-/
+@[simp]
+theorem lookupCallee_nil
+    (layouts : LayoutTable)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (traitImpls : List TraitImplEntry) :
+    lookupCallee [] layouts defPath typeArgs traitImpls = none := by
+  unfold lookupCallee
+  rw [resolveCalleeBodyAndArgs?_nil]
+
+/--
+Compositional 1-step modular call rule (`PureMirModularConverges.call_modular`,
+`FF-2.2` Section 2 & 4):
+when block `bb` ends with `TerminatorKind.call func argOps destination (.some
+targetBb) unwind`
+targeting an un-inlined callee `(defPath, typeArgs)` covered by `contract`
+(such as `#[external_spec]`, `polyExternalSpecCallContract`, or
+`pureRustIntrinsicContract`), the caller steps directly in **1 compositional
+step** to `{ bb := targetBb, stmtIdx := 0, env := updatedEnv }` in `PureState`
+for every normal return value `retVal` satisfying `calleePost retVal`.
+-/
+theorem PureMirModularConverges.call_modular
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        contract.pre
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m })
+    (h_contract_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        contract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.returned retVal retMem) →
+        ModularRootMemory body callees traitImpls retMem ∧ calleePost retVal)
+    (h_contract_panic :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ contract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem))
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        contract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = [])
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (resumeExternalCall (ps.toMachineState m) envAfterArgs
+            destination targetBb unwind) := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only [evalDirectRustIntrinsic?]
+      rw [h_not_intrinsic]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  refine ⟨h_contract_pre m hm, fun ans h_cpost => ?_⟩
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | panicked panicMem =>
+    rcases h_contract_panic with rfl | rfl | h_no_panic
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      rw [h_panic_stack m panicMem hm h_cpost]
+      dsimp only [unwindFromCallStack]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · exact False.elim (h_no_panic m panicMem hm h_cpost)
+  | returned retVal retMem =>
+    rcases h_contract_ret m retMem retVal hm h_cpost with ⟨h_mod_ret, h_cp⟩
+    rcases h_after retVal h_cp with ⟨updEnv, h_wr, h_next⟩
+    rw [resumeExternalCall_pure_returned_eq _ envAfterArgs destination targetBb unwind
+      retVal retMem h_dst_pure h_mod_ret.2.2.2.2]
+    unfold writePurePlaceValue at h_wr
+    rw [h_wr]
+    exact h_next _ (h_mod_ret.withDirectDestBorrows envAfterArgs destination)
+
+/--
+1-step specialization of `PureMirModularConverges.call_modular` for polymorphic
+`#[external_spec]` call contracts (`polyExternalSpecCallContract`).
+-/
+theorem PureMirModularConverges.call_poly_external_spec
+    {targetDefPath : DefPath}
+    {expectedTypeArgs : List RigidTy}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some targetDefPath)
+    (h_targs : extractCalleeTypeArgs func = expectedTypeArgs)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath expectedTypeArgs traitImpls = none)
+    (h_not_exact : stringEq targetDefPath "core::intrinsics::exact_div" = false := by decide)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_unwind :
+      unwind = .continue_ ∨ unwind = .terminate ∨
+      sidecarTargetCanUnwind sidecarBody = false)
+    (h_after :
+      ∀ (retVal : Value),
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges
+            (polyExternalSpecCallContract targetDefPath expectedTypeArgs
+              sidecarBody extraPre extraPost)
+            body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    PureMirModularConverges
+      (polyExternalSpecCallContract targetDefPath expectedTypeArgs
+        sidecarBody extraPre extraPost)
+      body callees ps post traitImpls := by
+  refine PureMirModularConverges.call_modular
+    h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args
+    (by rw [h_targs]; exact h_lookup)
+    h_not_exact
+    (fun _ _ => ⟨rfl, h_targs, h_arity, h_param_tys, h_extra_pre⟩)
+    (fun m retMem retVal hm hp =>
+      ⟨ModularRootMemory.of_callFrameAndTraitsPreserved hm hp.1, hp.2⟩)
+    ?_
+    (fun m panicMem hm hp => by
+      dsimp only [polyExternalSpecCallContract] at hp
+      cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · rw [hp.1.2.1, hm.2.2.1])
+    h_after
+    h_not_intrinsic
+  rcases h_unwind with hu | hu | h_nu
+  · exact Or.inl hu
+  · exact Or.inr (Or.inl hu)
+  · refine Or.inr (Or.inr (fun _ _ _ hp => ?_))
+    dsimp only [polyExternalSpecCallContract] at hp
+    rw [h_nu] at hp
+    exact hp
+
+/--
+1-step specialization of `PureMirModularConverges.call_modular` for monomorphic
+`#[external_spec]` call contracts (`externalSpecCallContract`, when
+`traitImpls = []` and `body.traitImpls = []`, or via `combineMirCallContracts`).
+-/
+theorem PureMirModularConverges.call_external_spec
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some targetDefPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq targetDefPath "core::intrinsics::exact_div" = false := by decide)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_unwind :
+      unwind = .continue_ ∨ unwind = .terminate ∨
+      sidecarTargetCanUnwind sidecarBody = false)
+    (h_after :
+      ∀ (retVal : Value) (tr' : List TraitImplEntry),
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges
+            (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+            body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr')
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    PureMirModularConverges
+      (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+      body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := targetDefPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (resumeExternalCall (ps.toMachineState m) envAfterArgs
+            destination targetBb unwind) := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only [evalDirectRustIntrinsic?]
+      rw [h_not_intrinsic]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  refine ⟨⟨rfl, h_arity, h_param_tys, h_extra_pre⟩, fun ans hp => ?_⟩
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | panicked panicMem =>
+    dsimp only [externalSpecCallContract] at hp
+    rcases h_unwind with rfl | rfl | h_nu
+    · cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · dsimp only [resumeExternalCall, applyUnwindAction]
+        rw [hp.2.1, hm.2.2.1]
+        dsimp only [unwindFromCallStack]
+        rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+        trivial
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · rw [h_nu] at hp
+      exact False.elim hp
+  | returned retVal retMem =>
+    rcases hp with ⟨h_fp, h_ret_ty, h_ep⟩
+    rcases h_after retVal retMem.traitImpls ⟨h_ret_ty, h_ep⟩ with ⟨updEnv, h_wr, h_next⟩
+    have hm_ret : ModularRootMemory body callees retMem.traitImpls retMem := by
+      rcases h_fp with ⟨hc', hcs', hac', hap', _⟩
+      exact ⟨by rw [hc', hm.1], rfl, by rw [hcs', hm.2.2.1],
+        by rw [hac']; exact hm.2.2.2.1, by rw [hap', hm.2.2.2.2]⟩
+    rw [resumeExternalCall_pure_returned_eq _ envAfterArgs destination targetBb unwind
+      retVal retMem h_dst_pure hm_ret.2.2.2.2]
+    unfold writePurePlaceValue at h_wr
+    rw [h_wr]
+    exact h_next _ (hm_ret.withDirectDestBorrows envAfterArgs destination)
+
+/--
+1-step specialization of `PureMirModularConverges.call_modular` for pure
+`CallConv.rustIntrinsic` calls under `pureRustIntrinsicContract`.
+-/
+theorem PureMirModularConverges.call_intrinsic
+    {pointerBytes : Nat}
+    {ubChecksEnabled : Bool}
+    {rtEval : DefPath → List RigidTy → List Value → Option Value}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {kind : PureRustIntrinsicKind}
+    {envAfterArgs updatedEnv : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_kind : classifyPureRustIntrinsic? defPath = some kind)
+    (h_eval :
+      evalPureRustIntrinsicWithRuntime rtEval kind
+        (extractCalleeTypeArgs func) argVals pointerBytes ubChecksEnabled =
+        some retVal)
+    (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
+    (h_after :
+      PureMirModularConverges
+        (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+        body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    PureMirModularConverges
+      (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+      body callees ps post traitImpls := by
+  refine PureMirModularConverges.call_modular
+    (calleePost := (· = retVal))
+    h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args h_lookup
+    h_not_exact
+    (fun _ _ => ⟨kind, retVal, h_kind, h_eval⟩)
+    (fun m retMem rv hm hp => by
+      rcases hp with ⟨rfl, k', hk', hev'⟩
+      rw [h_kind] at hk'
+      injection hk' with hk_eq
+      subst hk_eq
+      rw [h_eval] at hev'
+      injection hev' with hrv_eq
+      exact ⟨hm, hrv_eq.symm⟩)
+    (Or.inr (Or.inr (fun _ _ _ hp => hp)))
+    (fun _ _ _ hp => False.elim hp)
+    (fun rv h_eq => by
+      subst h_eq
+      exact ⟨updatedEnv, h_wr, h_after⟩)
+    h_not_intrinsic
+
+/--
+1-step modular call rule parameterized by a subsumed sub-contract `subContract`
+(`h_sub : subContract.Subsumes contract`), enabling a single modular caller to
+mix `call_intrinsic_sub`, `call_poly_external_spec_sub`, and
+`call_external_spec_sub` steps while keeping the continuation in `contract`.
+-/
+theorem PureMirModularConverges.call_modular_sub
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m })
+    (h_contract_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.returned retVal retMem) →
+        ModularRootMemory body callees traitImpls retMem ∧ calleePost retVal)
+    (h_contract_panic :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem))
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = [])
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  refine PureMirModularConverges.call_modular
+    h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args h_lookup
+    h_not_exact
+    (fun m hm => (h_sub _ (h_contract_pre m hm)).1)
+    (fun m retMem retVal hm hp =>
+      h_contract_ret m retMem retVal hm
+        ((h_sub _ (h_contract_pre m hm)).2 _ hp))
+    ?_
+    (fun m panicMem hm hp =>
+      h_panic_stack m panicMem hm ((h_sub _ (h_contract_pre m hm)).2 _ hp))
+    h_after
+    h_not_intrinsic
+  rcases h_contract_panic with hu | hu | h_np
+  · exact Or.inl hu
+  · exact Or.inr (Or.inl hu)
+  · exact Or.inr (Or.inr (fun m panicMem hm hp =>
+      h_np m panicMem hm ((h_sub _ (h_contract_pre m hm)).2 _ hp)))
+
+/--
+Subsumption-aware 1-step polymorphic `#[external_spec]` call rule inside modular
+callers (`PureMirModularConverges.call_poly_external_spec_sub`), usable directly
+under `combineMirCallContracts` via `MirCallContract.Subsumes`.
+-/
+theorem PureMirModularConverges.call_poly_external_spec_sub
+    {contract : MirCallContract}
+    {targetDefPath : DefPath}
+    {expectedTypeArgs : List RigidTy}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (polyExternalSpecCallContract targetDefPath expectedTypeArgs
+          sidecarBody extraPre extraPost)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some targetDefPath)
+    (h_targs : extractCalleeTypeArgs func = expectedTypeArgs)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath expectedTypeArgs traitImpls = none)
+    (h_not_exact : stringEq targetDefPath "core::intrinsics::exact_div" = false := by decide)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_unwind :
+      unwind = .continue_ ∨ unwind = .terminate ∨
+      sidecarTargetCanUnwind sidecarBody = false)
+    (h_after :
+      ∀ (retVal : Value),
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  refine PureMirModularConverges.call_modular_sub h_sub
+    h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args
+    (by rw [h_targs]; exact h_lookup)
+    h_not_exact
+    (fun _ _ => ⟨rfl, h_targs, h_arity, h_param_tys, h_extra_pre⟩)
+    (fun m _ _ hm hp =>
+      ⟨ModularRootMemory.of_callFrameAndTraitsPreserved hm hp.1, hp.2⟩)
+    ?_
+    (fun m _ hm hp => by
+      dsimp only [polyExternalSpecCallContract] at hp
+      cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · rw [hp.1.2.1, hm.2.2.1])
+    h_after
+    h_not_intrinsic
+  rcases h_unwind with hu | hu | h_nu
+  · exact Or.inl hu
+  · exact Or.inr (Or.inl hu)
+  · refine Or.inr (Or.inr (fun _ _ _ hp => ?_))
+    dsimp only [polyExternalSpecCallContract] at hp
+    rw [h_nu] at hp
+    exact hp
+
+/--
+Subsumption-aware 1-step monomorphic `#[external_spec]` call rule inside modular
+callers (`PureMirModularConverges.call_external_spec_sub`), usable directly
+under `combineMirCallContracts` via `MirCallContract.Subsumes`.
+-/
+theorem PureMirModularConverges.call_external_spec_sub
+    {contract : MirCallContract}
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some targetDefPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq targetDefPath "core::intrinsics::exact_div" = false := by decide)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_unwind :
+      unwind = .continue_ ∨ unwind = .terminate ∨
+      sidecarTargetCanUnwind sidecarBody = false)
+    (h_after :
+      ∀ (retVal : Value) (tr' : List TraitImplEntry),
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr')
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := targetDefPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (resumeExternalCall (ps.toMachineState m) envAfterArgs
+            destination targetBb unwind) := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only [evalDirectRustIntrinsic?]
+      rw [h_not_intrinsic]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  have h_sub_pre :
+      (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost).pre
+        { defPath := targetDefPath
+          typeArgs := extractCalleeTypeArgs func
+          args := argVals
+          memory := m } := ⟨rfl, h_arity, h_param_tys, h_extra_pre⟩
+  rcases h_sub _ h_sub_pre with ⟨h_cpre, h_cpost_imp⟩
+  refine ⟨h_cpre, fun ans hp_sup => ?_⟩
+  have hp := h_cpost_imp ans hp_sup
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | panicked panicMem =>
+    dsimp only [externalSpecCallContract] at hp
+    rcases h_unwind with rfl | rfl | h_nu
+    · cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · dsimp only [resumeExternalCall, applyUnwindAction]
+        rw [hp.2.1, hm.2.2.1]
+        dsimp only [unwindFromCallStack]
+        rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+        trivial
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · rw [h_nu] at hp
+      exact False.elim hp
+  | returned retVal retMem =>
+    rcases hp with ⟨h_fp, h_ret_ty, h_ep⟩
+    rcases h_after retVal retMem.traitImpls ⟨h_ret_ty, h_ep⟩ with ⟨updEnv, h_wr, h_next⟩
+    have hm_ret : ModularRootMemory body callees retMem.traitImpls retMem := by
+      rcases h_fp with ⟨hc', hcs', hac', hap', _⟩
+      exact ⟨by rw [hc', hm.1], rfl, by rw [hcs', hm.2.2.1],
+        by rw [hac']; exact hm.2.2.2.1, by rw [hap', hm.2.2.2.2]⟩
+    dsimp only
+    rw [resumeExternalCall_pure_returned_eq _ envAfterArgs destination targetBb unwind
+      retVal retMem h_dst_pure hm_ret.2.2.2.2]
+    unfold writePurePlaceValue at h_wr
+    rw [h_wr]
+    exact h_next _ (hm_ret.withDirectDestBorrows envAfterArgs destination)
+
+/--
+Subsumption-aware 1-step pure `CallConv.rustIntrinsic` call rule inside modular
+callers (`PureMirModularConverges.call_intrinsic_sub`), usable directly under
+`combineMirCallContracts` via `MirCallContract.Subsumes` for external intrinsic
+aliases (`classifyRustIntrinsic? defPath = none`, e.g. `std::intrinsics::*`).
+-/
+theorem PureMirModularConverges.call_intrinsic_sub
+    {contract : MirCallContract}
+    {pointerBytes : Nat}
+    {ubChecksEnabled : Bool}
+    {rtEval : DefPath → List RigidTy → List Value → Option Value}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {kind : PureRustIntrinsicKind}
+    {envAfterArgs updatedEnv : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_kind : classifyPureRustIntrinsic? defPath = some kind)
+    (h_eval :
+      evalPureRustIntrinsicWithRuntime rtEval kind
+        (extractCalleeTypeArgs func) argVals pointerBytes ubChecksEnabled =
+        some retVal)
+    (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
+    (h_after :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  refine PureMirModularConverges.call_modular_sub
+    (calleePost := (· = retVal))
+    h_sub h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args h_lookup
+    h_not_exact
+    (fun _ _ => ⟨kind, retVal, h_kind, h_eval⟩)
+    (fun m _ _ hm hp => by
+      rcases hp with ⟨rfl, _, hk', hev'⟩
+      rw [h_kind] at hk'
+      injection hk' with hk_eq
+      subst hk_eq
+      rw [h_eval] at hev'
+      injection hev' with hrv_eq
+      exact ⟨hm, hrv_eq.symm⟩)
+    (Or.inr (Or.inr (fun _ _ _ hp => hp)))
+    (fun _ _ _ hp => False.elim hp)
+    (fun rv h_eq => by
+      subst h_eq
+      exact ⟨updatedEnv, h_wr, h_after⟩)
+    h_not_intrinsic
+
+theorem bswapLoop_eq_pureBswapLoop (n b a : Nat) :
+    bswapLoop n b a = pureBswapLoop n b a := by
+  induction n generalizing b a with
+  | zero => rfl
+  | succ n ih =>
+    dsimp only [bswapLoop, pureBswapLoop]
+    exact ih _ _
+
+theorem ctpopLoop_eq_pureCtpopLoop (n b : Nat) :
+    ctpopLoop n b = pureCtpopLoop n b := by
+  induction n generalizing b with
+  | zero => rfl
+  | succ n ih =>
+    dsimp only [ctpopLoop, pureCtpopLoop]
+    rw [ih]
+
+theorem wrapScalarBits_u32_of_lt {v : Nat} (hv : v < 4294967296) :
+    wrapScalarBits v (scalarModulus 4) = v := by
+  have hm : scalarModulus 4 = 4294967296 := rfl
+  rw [hm]
+  unfold wrapScalarBits
+  cases h : Nat.ble 4294967296 v with
+  | false => rfl
+  | true =>
+    have hle := Nat.le_of_ble_eq_true h
+    omega
+
+theorem evalBswap_u32_eq {v : Nat} (hv : v < 4294967296) :
+    evalBswap ⟨v, 4⟩ = some ⟨pureBswapLoop 4 v 0, 4⟩ := by
+  unfold evalBswap
+  dsimp only
+  rw [wrapScalarBits_u32_of_lt hv, bswapLoop_eq_pureBswapLoop]
+
+theorem evalCtpop_u32_eq {v : Nat} (hv : v < 4294967296) :
+    evalCtpop ⟨v, 4⟩ = some ⟨pureCtpopLoop 32 v, 4⟩ := by
+  unfold evalCtpop
+  dsimp only
+  rw [wrapScalarBits_u32_of_lt hv, ctpopLoop_eq_pureCtpopLoop]
+  rfl
+
+theorem evalDirectRustIntrinsic_bswap_u32
+    (s : MachineState) (curBody : Option CapturedMir)
+    (typeArgs : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List SlotState)
+    (dst : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {v : Nat} (hv : v < 4294967296) :
+    evalDirectRustIntrinsic? s curBody
+      { defPath := "core::intrinsics::bswap", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+      decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
+    some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureBswapLoop 4 v 0, 4⟩)) := by
+  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .bswap) rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
+    (by rintro ⟨⟩)]
+  change some (writeIntrinsicScalarResult s locals' dst targetBb (evalBswap ⟨v, 4⟩)) = _
+  rw [evalBswap_u32_eq hv]
+
+theorem evalDirectRustIntrinsic_ctpop_u32
+    (s : MachineState) (curBody : Option CapturedMir)
+    (typeArgs : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List SlotState)
+    (dst : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {v : Nat} (hv : v < 4294967296) :
+    evalDirectRustIntrinsic? s curBody
+      { defPath := "core::intrinsics::ctpop", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+      decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
+    some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureCtpopLoop 32 v, 4⟩)) := by
+  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .ctpop) rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
+    (by rintro ⟨⟩)]
+  change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
+  rw [evalCtpop_u32_eq hv]
+
+theorem evalDirectRustIntrinsic_constEvalSelect_ctpop_u32
+    (s : MachineState) (curBody : Option CapturedMir)
+    (decls : List LocalDecl) (layouts : LayoutTable)
+    (op0 op1 rtOp : Operand) (locals' : List SlotState)
+    (dst : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {sc : ScalarInt}
+    (h_rt_def : extractCalleeDefPath? rtOp = some "core::intrinsics::ctpop")
+    (h_rt_targs : extractCalleeTypeArgs rtOp = [.uint .u32])
+    (h_rt_lk :
+      lookupCallee s.memory.callees layouts "core::intrinsics::ctpop"
+        [.uint .u32] s.memory.traitImpls = none)
+    (h_sz : sc.sizeBytes = 4)
+    (h_lt : sc.bits < 4294967296) :
+    evalDirectRustIntrinsic? s curBody
+      { defPath := "core::intrinsics::const_eval_select"
+        typeArgs := [
+          .tuple [.uint .u32],
+          .fnDef "core::intrinsics::ctpop" [.uint .u32],
+          .fnDef "core::intrinsics::ctpop" [.uint .u32],
+          .uint .u32
+        ]
+        fnSig := .none
+        isIndirect := false }
+      decls layouts [op0, op1, rtOp] [.aggregate 0 [.scalar sc], .unit, .unit]
+      locals' dst targetBb unwind =
+    some (writeIntrinsicReturn s locals' dst targetBb
+      (.scalar ⟨pureCtpopLoop 32 sc.bits, 4⟩)) := by
+  rcases sc with ⟨v, sz⟩
+  dsimp only at h_sz h_lt ⊢
+  subst h_sz
+  have hc_sel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = some .constEvalSelect := rfl
+  have hc_pop : classifyRustIntrinsic? "core::intrinsics::ctpop" = some .ctpop := rfl
+  have h_unp :
+      unpackConstEvalSelectArgs? (.aggregate 0 [.scalar ⟨v, 4⟩]) (some (.tuple [.uint .u32])) =
+        some [.scalar ⟨v, 4⟩] := rfl
+  have h_res :
+      resolveConstEvalSelectTarget? s
+        { defPath := "core::intrinsics::const_eval_select"
+          typeArgs := [
+            .tuple [.uint .u32],
+            .fnDef "core::intrinsics::ctpop" [.uint .u32],
+            .fnDef "core::intrinsics::ctpop" [.uint .u32],
+            .uint .u32
+          ]
+          fnSig := .none
+          isIndirect := false }
+        decls layouts (some rtOp) .unit 1 =
+      some { defPath := "core::intrinsics::ctpop"
+             typeArgs := [.uint .u32]
+             fnSig := .none
+             isIndirect := false } := by
+    unfold resolveConstEvalSelectTarget?
+    dsimp only
+    rw [h_rt_def, h_rt_targs]
+  rw [evalDirectRustIntrinsic?_constEvalSelect_three _ _ _ _ _ _ _ _ _ _ _ _ _ hc_sel]
+  unfold evalConstEvalSelectThree
+  dsimp only [selectTupleTyOpt, selectRtFnOpOpt]
+  rw [h_unp]
+  dsimp only [length]
+  rw [h_res]
+  dsimp only
+  rw [h_rt_lk]
+  dsimp only [isDirectExactDivTarget]
+  have h_ne : stringEq "core::intrinsics::ctpop" "core::intrinsics::exact_div" = false := by decide
+  rw [h_ne]
+  dsimp only
+  rw [hc_pop]
+  change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
+  rw [evalCtpop_u32_eq h_lt]
+
+/--
+1-step inline `CallConv.rustIntrinsic` `.call` rule for `PureMirModularConverges`
+when `evalDirectRustIntrinsic?` evaluates inline to `writeIntrinsicReturn`
+(covering all 22 inline scalar/layout intrinsics as well as `const_eval_select`
+dispatching to an unlinked inline intrinsic, for any modular `contract`).
+-/
+theorem PureMirModularConverges.call_inline_intrinsic
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs updatedEnv : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_eval :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        evalDirectRustIntrinsic? (ps.toMachineState m) (some body)
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            fnSig := .none
+            isIndirect := false }
+          body.localDecls body.layouts argOps argVals envAfterArgs
+          destination targetBb unwind =
+          some (writeIntrinsicReturn (ps.toMachineState m) envAfterArgs
+            destination targetBb retVal))
+    (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
+    (h_after :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.step
+          (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState
+            (invalidateDirectDestWriteBorrows m envAfterArgs destination)) := by
+    have h_ev := h_eval m hm
+    dsimp only [PureState.toMachineState] at h_ev
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only
+      rw [h_ev]
+      rw [writeIntrinsicReturn_pure_eq _ envAfterArgs destination targetBb retVal h_dst_pure]
+      unfold writePurePlaceValue at h_wr
+      rw [h_wr]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  exact h_after _ (hm.withDirectDestBorrows envAfterArgs destination)
+
+def SameCallFrameAndTraits (m₁ m₂ : Memory) : Prop :=
+  m₂.callees = m₁.callees ∧
+  m₂.traitImpls = m₁.traitImpls ∧
+  m₂.callStack = m₁.callStack ∧
+  m₂.activeCallee = m₁.activeCallee ∧
+  m₂.activeProtectors = m₁.activeProtectors
+
+def ModularCalleeOutMemory
+    (callees : List CapturedMir) (traitImpls : List TraitImplEntry)
+    (m : Memory) : Prop :=
+  m.callees = callees ∧
+  m.traitImpls = traitImpls ∧
+  m.callStack = [] ∧
+  m.activeProtectors = []
+
+
+
+def StackedCallFrameAndTraits
+    (_outerBody body : CapturedMir) (baseStack : List SavedCallerFrame)
+    (m₁ m₂ : Memory) : Prop :=
+  m₂.callStack = m₁.callStack ++ baseStack ∧
+  m₂.callees = m₁.callees ∧
+  m₂.traitImpls = m₁.traitImpls ∧
+  m₂.activeCallee = some (m₁.activeCallee.getD body) ∧
+  m₂.activeProtectors = m₁.activeProtectors
+
+theorem StackedCallFrameAndTraits.withDirectDestBorrowsRhs
+    {outerBody body : CapturedMir} {baseStack : List SavedCallerFrame}
+    {m₁ m₂ : Memory}
+    (h : StackedCallFrameAndTraits outerBody body baseStack m₁ m₂)
+    (locals : List LocalSlot) (dst : Place) :
+    StackedCallFrameAndTraits outerBody body baseStack m₁
+      (invalidateDirectDestWriteBorrows m₂ locals dst) := by
+  unfold invalidateDirectDestWriteBorrows
+  cases m₂.borrows with
+  | nil => exact h
+  | cons _ _ =>
+    rcases dst with ⟨_, _ | ⟨hd, _⟩⟩
+    · exact ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2⟩
+    · cases hd <;> exact ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2⟩
+
+theorem SameCallFrameAndTraits.withDirectDestBorrowsRhs
+    {m₁ m₂ : Memory}
+    (h : SameCallFrameAndTraits m₁ m₂)
+    (locals : List LocalSlot) (dst : Place) :
+    SameCallFrameAndTraits m₁
+      (invalidateDirectDestWriteBorrows m₂ locals dst) := by
+  unfold invalidateDirectDestWriteBorrows
+  cases m₂.borrows with
+  | nil => exact h
+  | cons _ _ =>
+    rcases dst with ⟨_, _ | ⟨hd, _⟩⟩
+    · exact ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2⟩
+    · cases hd <;> exact ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2⟩
+
+def wpMirExecStepsUpToSym
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (mid : MirExecState → Prop) (post : MirOutcome → Prop) : Prop :=
+  match fuel with
+  | 0 => mid st
+  | fuel' + 1 =>
+    mid st ∨
+    evalNodeNoCallWP
+      (fun st' => wpMirExecStepsUpToSym fuel' body st' mid post)
+      post
+      (stepMirState body st)
+
+theorem wpMirExecStepsUpToSym_of_mid
+    {fuel : Nat} {body : CapturedMir} {st : MirExecState}
+    {mid : MirExecState → Prop} {post : MirOutcome → Prop}
+    (h : mid st) :
+    wpMirExecStepsUpToSym fuel body st mid post := by
+  cases fuel with
+  | zero => exact h
+  | succ _ => exact Or.inl h
+
+theorem mirStepsConverges_of_wpMirExecStepsUpToSym
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h :
+      wpMirExecStepsUpToSym fuel body (.running s)
+        (fun
+          | .running ms' => mid ms'
+          | .halted out => post out
+          | .faulted _ => False)
+        post) :
+    MirStepsConverges body s mid post := by
+  suffices ∀ st : MirExecState,
+      wpMirExecStepsUpToSym fuel body st
+        (fun
+          | .running ms' => mid ms'
+          | .halted out => post out
+          | .faulted _ => False)
+        post →
+      ∃ f : Nat,
+        wpMirExecStepsSym f body st
+          (fun
+            | .running ms' => mid ms'
+            | .halted out => post out
+            | .faulted _ => False)
+          post from
+    this (.running s) h
+  clear h s
+  induction fuel with
+  | zero =>
+    intro st h
+    exact ⟨0, h⟩
+  | succ fuel' ih =>
+    intro st h
+    rcases h with h_now | h_step
+    · exact ⟨0, h_now⟩
+    · cases h_node : stepMirState body st with
+      | ret out =>
+        rw [h_node] at h_step
+        refine ⟨1, ?_⟩
+        unfold wpMirExecStepsSym
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq, h_node]
+        exact h_step
+      | tau st' =>
+        rw [h_node] at h_step
+        dsimp only [evalNodeNoCallWP] at h_step
+        rcases ih st' h_step with ⟨f_sub, hf_sub⟩
+        refine ⟨f_sub + 1, ?_⟩
+        unfold wpMirExecStepsSym
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq, h_node]
+        exact hf_sub
+      | vis i k =>
+        rw [h_node] at h_step
+        rcases i with fk | (obs | req)
+        · exact False.elim h_step
+        · dsimp only [evalNodeNoCallWP] at h_step
+          rcases ih (k PUnit.unit) h_step with ⟨f_sub, hf_sub⟩
+          refine ⟨f_sub + 1, ?_⟩
+          unfold wpMirExecStepsSym
+          rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq, h_node]
+          exact hf_sub
+        · exact False.elim h_step
+
+theorem StackedCallFrameAndTraits_eq {outerBody body : CapturedMir} {baseStack : List SavedCallerFrame}
+    {m₁ m₂ m₁' m₂' : Memory}
+    (h_eq : StackedCallFrameAndTraits outerBody body baseStack m₁ m₂)
+    (h_cs₁ : m₁'.callStack = m₁.callStack)
+    (h_cal₁ : m₁'.callees = m₁.callees)
+    (h_tr₁ : m₁'.traitImpls = m₁.traitImpls)
+    (h_ac₁ : m₁'.activeCallee = m₁.activeCallee)
+    (h_ap₁ : m₁'.activeProtectors = m₁.activeProtectors)
+    (h_cs₂ : m₂'.callStack = m₂.callStack)
+    (h_cal₂ : m₂'.callees = m₂.callees)
+    (h_tr₂ : m₂'.traitImpls = m₂.traitImpls)
+    (h_ac₂ : m₂'.activeCallee = m₂.activeCallee)
+    (h_ap₂ : m₂'.activeProtectors = m₂.activeProtectors) :
+    StackedCallFrameAndTraits outerBody body baseStack m₁' m₂' := by
+  rcases h_eq with ⟨hcs, hcal, htr, hac, hap⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [h_cs₂, hcs, h_cs₁]
+  · rw [h_cal₂, hcal, h_cal₁]
+  · rw [h_tr₂, htr, h_tr₁]
+  · rw [h_ac₂, hac, h_ac₁]
+  · rw [h_ap₂, hap, h_ap₁]
+
+private theorem SameCallFrameAndTraits_refl (m : Memory) :
+    SameCallFrameAndTraits m m :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+private theorem SameCallFrameAndTraits_step_rel
+    {m₁ m₂ m₁' m₂' : Memory}
+    (h : SameCallFrameAndTraits m₁ m₂)
+    (h₁ : SameCallFrameAndTraits m₁ m₁')
+    (h₂ : SameCallFrameAndTraits m₂ m₂') :
+    SameCallFrameAndTraits m₁' m₂' :=
+  ⟨h₂.1.trans (h.1.trans h₁.1.symm),
+   h₂.2.1.trans (h.2.1.trans h₁.2.1.symm),
+   h₂.2.2.1.trans (h.2.2.1.trans h₁.2.2.1.symm),
+   h₂.2.2.2.1.trans (h.2.2.2.1.trans h₁.2.2.2.1.symm),
+   h₂.2.2.2.2.trans (h.2.2.2.2.trans h₁.2.2.2.2.symm)⟩
+
+private theorem StackedCallFrameAndTraits_step_rel
+    {outerBody body : CapturedMir} {baseStack : List SavedCallerFrame}
+    {m₁ m₂ m₁' m₂' : Memory}
+    (h : StackedCallFrameAndTraits outerBody body baseStack m₁ m₂)
+    (h₁ : SameCallFrameAndTraits m₁ m₁')
+    (h₂ : SameCallFrameAndTraits m₂ m₂') :
+    StackedCallFrameAndTraits outerBody body baseStack m₁' m₂' :=
+  StackedCallFrameAndTraits_eq h
+    h₁.2.2.1 h₁.1 h₁.2.1 h₁.2.2.2.1 h₁.2.2.2.2
+    h₂.2.2.1 h₂.1 h₂.2.1 h₂.2.2.2.1 h₂.2.2.2.2
+
+private theorem evalAssignDst_pure_sim
+    {s₁ s₂ : MachineState} {dst : Place} {val : Value}
+    {l1 : List LocalSlot} {ld : List LocalDecl} {ly : LayoutTable}
+    {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_dst : isPurePlace dst = true)
+    (h_ap₁ : s₁.memory.activeProtectors = [])
+    (h_ap₂ : s₂.memory.activeProtectors = [])
+    (h_wp : evalNodeNoCallWP Q R (evalAssignDst s₁ dst val l1 s₁.memory ld ly)) :
+    ∃ (l2 : List LocalSlot) (bs₁ bs₂ : List BorrowEntry),
+      evalAssignDst s₁ dst val l1 s₁.memory ld ly =
+        .step (advanceStmt s₁ l2 { s₁.memory with borrows := bs₁ }) ∧
+      evalAssignDst s₂ dst val l1 s₂.memory ld ly =
+        .step (advanceStmt s₂ l2 { s₂.memory with borrows := bs₂ }) := by
+  rcases dst with ⟨dstLoc, dstProj⟩
+  cases dstProj with
+  | nil =>
+    unfold evalAssignDst at h_wp ⊢
+    dsimp only at h_wp ⊢
+    cases h_g : get? l1 dstLoc with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some sl =>
+      rw [h_g] at h_wp
+      cases sl with
+      | dead => exact False.elim h_wp
+      | uninit =>
+        cases h_set : set? l1 dstLoc (.init val) with
+        | none => rw [h_set] at h_wp; exact False.elim h_wp
+        | some l2 =>
+          rw [h_ap₁, h_ap₂]
+          exact ⟨l2, _, _, rfl, rfl⟩
+      | init _ =>
+        cases h_set : set? l1 dstLoc (.init val) with
+        | none => rw [h_set] at h_wp; exact False.elim h_wp
+        | some l2 =>
+          rw [h_ap₁, h_ap₂]
+          exact ⟨l2, _, _, rfl, rfl⟩
+  | cons hd tl =>
+    simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
+    have h_nd := ne_deref_of_isPureProjElem h_dst.1
+    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd] at h_wp
+    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd,
+      evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd]
+    unfold evalAssignNonDeref at h_wp ⊢
+    dsimp only at h_wp ⊢
+    cases h_g : get? l1 dstLoc with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some sl =>
+      rw [h_g] at h_wp
+      cases sl with
+      | dead => exact False.elim h_wp
+      | uninit =>
+        dsimp only at h_wp ⊢
+        cases h_sh : uninitFieldWriteShell? ld ly dstLoc hd tl with
+        | none => rw [h_sh] at h_wp; exact False.elim h_wp
+        | some rootVal =>
+          rw [h_sh] at h_wp
+          dsimp only at h_wp ⊢
+          cases h_wpv : writeProjectedForLocal l1 ld ly dstLoc rootVal (hd :: tl) val with
+          | ub => rw [h_wpv] at h_wp; exact False.elim h_wp
+          | unsupported => rw [h_wpv] at h_wp; exact False.elim h_wp
+          | ok rootVal' =>
+            rw [h_wpv] at h_wp
+            dsimp only at h_wp ⊢
+            cases h_set : set? l1 dstLoc (.init rootVal') with
+            | none => rw [h_set] at h_wp; exact False.elim h_wp
+            | some l2 =>
+              rw [h_ap₁, h_ap₂]
+              exact ⟨l2, _, _, rfl, rfl⟩
+      | init rootVal =>
+        dsimp only at h_wp ⊢
+        cases h_wpv :
+            writeProjectedForLocal l1 ld ly dstLoc
+              (ensureNestedFieldShells rootVal (hd :: tl)) (hd :: tl) val with
+        | ub => rw [h_wpv] at h_wp; exact False.elim h_wp
+        | unsupported => rw [h_wpv] at h_wp; exact False.elim h_wp
+        | ok rootVal' =>
+          rw [h_wpv] at h_wp
+          dsimp only at h_wp ⊢
+          cases h_set : set? l1 dstLoc (.init rootVal') with
+          | none => rw [h_set] at h_wp; exact False.elim h_wp
+          | some l2 =>
+            rw [h_ap₁, h_ap₂]
+            exact ⟨l2, _, _, rfl, rfl⟩
+
+private theorem evalStmt_borrowFree_pure_sim
+    {s₁ s₂ : MachineState} {stmt : Statement}
+    {ld : List LocalDecl} {ly : LayoutTable}
+    {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_fr : s₂.frame = s₁.frame)
+    (h_ap₁ : s₁.memory.activeProtectors = [])
+    (h_ap₂ : s₂.memory.activeProtectors = [])
+    (h_bf : isBorrowFreePureStatement ld ly stmt.kind = true)
+    (h_wp : evalNodeNoCallWP Q R (evalStmt s₁ stmt ld ly)) :
+    ∃ ns₁ ns₂ : MachineState,
+      evalStmt s₁ stmt ld ly = .step ns₁ ∧
+      evalStmt s₂ stmt ld ly = .step ns₂ ∧
+      ns₂.frame = ns₁.frame ∧
+      SameCallFrameAndTraits s₁.memory ns₁.memory ∧
+      SameCallFrameAndTraits s₂.memory ns₂.memory := by
+  have h_s := isPureStatement_of_isBorrowFreePureStatement h_bf
+  have h_adv (locs : List LocalSlot) :
+      (advanceStmt s₂ locs).frame = (advanceStmt s₁ locs).frame := by
+    dsimp only [advanceStmt]; rw [h_fr]
+  have h_adv_m (locs : List LocalSlot) (m₁ m₂ : Memory) :
+      (advanceStmt s₂ locs m₂).frame = (advanceStmt s₁ locs m₁).frame := by
+    dsimp only [advanceStmt]; rw [h_fr]
+  rcases stmt with ⟨skind, sspan⟩
+  cases skind with
+  | nop =>
+    dsimp only [evalStmt]
+    rw [h_fr]
+    exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+  | coverage =>
+    dsimp only [evalStmt]
+    rw [h_fr]
+    exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+  | constEvalCounter =>
+    dsimp only [evalStmt]
+    rw [h_fr]
+    exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+  | placeMention p =>
+    dsimp only [evalStmt] at h_wp ⊢
+    rw [h_fr]
+    cases h_g : get? s₁.frame.locals p.local_ with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some sl =>
+      rw [h_g] at h_wp
+      cases sl with
+      | dead => exact False.elim h_wp
+      | uninit =>
+        dsimp only at h_wp ⊢
+        cases h_ok : placeMentionOperandsInit s₁.frame.locals .uninit p.projection with
+        | false => rw [h_ok] at h_wp; exact False.elim h_wp
+        | true =>
+          exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+      | init v =>
+        dsimp only at h_wp ⊢
+        cases h_ok : placeMentionOperandsInit s₁.frame.locals (.init v) p.projection with
+        | false => rw [h_ok] at h_wp; exact False.elim h_wp
+        | true =>
+          exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+  | storageLive loc =>
+    dsimp only [evalStmt] at h_wp ⊢
+    rw [h_fr]
+    cases h_g : get? s₁.frame.locals loc with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some _ =>
+      rw [h_g] at h_wp
+      cases h_set : set? s₁.frame.locals loc .uninit with
+      | none => rw [h_set] at h_wp; exact False.elim h_wp
+      | some _ =>
+        rw [h_ap₁, h_ap₂]
+        exact ⟨_, _, rfl, rfl, h_adv_m _ _ _,
+          ⟨rfl, rfl, rfl, rfl, h_ap₁.symm⟩, ⟨rfl, rfl, rfl, rfl, h_ap₂.symm⟩⟩
+  | storageDead loc =>
+    dsimp only [evalStmt] at h_wp ⊢
+    rw [h_fr]
+    cases h_g : get? s₁.frame.locals loc with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some _ =>
+      rw [h_g] at h_wp
+      cases h_set : set? s₁.frame.locals loc .dead with
+      | none => rw [h_set] at h_wp; exact False.elim h_wp
+      | some _ =>
+        rw [h_ap₁, h_ap₂]
+        exact ⟨_, _, rfl, rfl, h_adv_m _ _ _,
+          ⟨rfl, rfl, rfl, rfl, h_ap₁.symm⟩, ⟨rfl, rfl, rfl, rfl, h_ap₂.symm⟩⟩
+  | deinit p =>
+    dsimp only [evalStmt] at h_wp ⊢
+    rw [h_fr]
+    rcases p with ⟨loc, proj⟩
+    cases proj with
+    | nil =>
+      dsimp only at h_wp ⊢
+      cases h_g : get? s₁.frame.locals loc with
+      | none => rw [h_g] at h_wp; exact False.elim h_wp
+      | some sl =>
+        rw [h_g] at h_wp
+        cases sl with
+        | dead => exact False.elim h_wp
+        | uninit =>
+          cases h_set : set? s₁.frame.locals loc .uninit with
+          | none => rw [h_set] at h_wp; exact False.elim h_wp
+          | some _ =>
+            exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+        | init _ =>
+          cases h_set : set? s₁.frame.locals loc .uninit with
+          | none => rw [h_set] at h_wp; exact False.elim h_wp
+          | some _ =>
+            exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+    | cons hd tl =>
+      dsimp only at h_wp ⊢
+      cases h_g : get? s₁.frame.locals loc with
+      | none => rw [h_g] at h_wp; exact False.elim h_wp
+      | some sl =>
+        rw [h_g] at h_wp
+        cases sl with
+        | uninit => exact False.elim h_wp
+        | dead => exact False.elim h_wp
+        | init rv =>
+          dsimp only at h_wp ⊢
+          cases h_rd : readProjectedValue s₁.frame.locals rv (hd :: tl) with
+          | ub => rw [h_rd] at h_wp; exact False.elim h_wp
+          | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
+          | ok _ =>
+            exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+  | intrinsic intr =>
+    cases intr with
+    | copyNonOverlapping _ _ _ => cases h_s
+    | assume op =>
+      dsimp only [isPureStatement] at h_s
+      dsimp only [evalStmt] at h_wp ⊢
+      rw [h_fr]
+      rw [evalOperand_pure_eq s₁.frame.locals op s₂.memory.borrows
+        s₂.memory.globals ly s₂.memory.callerLocals h_s]
+      rw [evalOperand_pure_eq s₁.frame.locals op s₁.memory.borrows
+        s₁.memory.globals ly s₁.memory.callerLocals h_s] at h_wp ⊢
+      cases h_op : evalOperand s₁.frame.locals op [] [] ly [] ld with
+      | ub => rw [h_op] at h_wp; exact False.elim h_wp
+      | unsupported => rw [h_op] at h_wp; exact False.elim h_wp
+      | ok v l' =>
+        rw [h_op] at h_wp
+        cases v with
+        | scalar sc =>
+          dsimp only at h_wp ⊢
+          cases h_ok : Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
+          | false => rw [h_ok] at h_wp; exact False.elim h_wp
+          | true =>
+            exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+        | _ => exact False.elim h_wp
+  | retag _ _ => cases h_s
+  | backwardIncompatibleDropHint _ => cases h_s
+  | setDiscriminant p varIdx =>
+    dsimp only [isPureStatement] at h_s
+    have h_op_p : isPureOperand (.copy p) = true := h_s
+    rcases p with ⟨loc, proj⟩
+    cases proj with
+    | nil =>
+      dsimp only [evalStmt, evalSetDiscriminantLocal] at h_wp ⊢
+      rw [h_fr]
+      cases h_g : get? s₁.frame.locals loc with
+      | none => rw [h_g] at h_wp; exact False.elim h_wp
+      | some sl =>
+        rw [h_g] at h_wp
+        cases sl with
+        | dead => exact False.elim h_wp
+        | uninit =>
+          dsimp only at h_wp ⊢
+          cases h_decl : setDiscriminantUninitDeclOk ld loc with
+          | false => rw [h_decl] at h_wp; exact False.elim h_wp
+          | true =>
+            rw [h_decl] at h_wp
+            dsimp only at h_wp ⊢
+            cases h_set : set? s₁.frame.locals loc (.init (.aggregate varIdx [])) with
+            | none => rw [h_set] at h_wp; exact False.elim h_wp
+            | some _ =>
+              rw [h_ap₁, h_ap₂]
+              exact ⟨_, _, rfl, rfl, h_adv_m _ _ _,
+                ⟨rfl, rfl, rfl, rfl, h_ap₁.symm⟩, ⟨rfl, rfl, rfl, rfl, h_ap₂.symm⟩⟩
+        | init v =>
+          cases v with
+          | aggregate _ flds =>
+            dsimp only at h_wp ⊢
+            cases h_set : set? s₁.frame.locals loc (.init (.aggregate varIdx flds)) with
+            | none => rw [h_set] at h_wp; exact False.elim h_wp
+            | some _ =>
+              rw [h_ap₁, h_ap₂]
+              exact ⟨_, _, rfl, rfl, h_adv_m _ _ _,
+                ⟨rfl, rfl, rfl, rfl, h_ap₁.symm⟩, ⟨rfl, rfl, rfl, rfl, h_ap₂.symm⟩⟩
+          | _ => exact False.elim h_wp
+    | cons hd tl =>
+      have h_hd : isPureProjElem hd = true := by
+        simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_s
+        exact h_s.1
+      have h_nd := ne_deref_of_isPureProjElem h_hd
+      rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd] at h_wp
+      rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd,
+        evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd]
+      rw [h_fr]
+      rw [evalOperand_pure_eq s₁.frame.locals
+        (.copy { local_ := loc, projection := hd :: tl })
+        s₂.memory.borrows s₂.memory.globals ly s₂.memory.callerLocals h_op_p]
+      rw [evalOperand_pure_eq s₁.frame.locals
+        (.copy { local_ := loc, projection := hd :: tl })
+        s₁.memory.borrows s₁.memory.globals ly s₁.memory.callerLocals h_op_p] at h_wp ⊢
+      cases h_ev : evalOperand s₁.frame.locals
+          (.copy { local_ := loc, projection := hd :: tl }) [] [] ly [] ld with
+      | ub => rw [h_ev] at h_wp; exact False.elim h_wp
+      | unsupported => rw [h_ev] at h_wp; exact False.elim h_wp
+      | ok v l1 =>
+        rw [h_ev] at h_wp
+        cases v with
+        | aggregate _ flds =>
+          dsimp only at h_wp ⊢
+          rw [h_ap₁, hasProtectedWriteConflict_activeProtectors_nil] at h_wp ⊢
+          rw [h_ap₂, hasProtectedWriteConflict_activeProtectors_nil]
+          dsimp only at h_wp ⊢
+          rw [writePlaceValue_pure_eq l1 s₂.memory.borrows
+            { local_ := loc, projection := hd :: tl }
+            (.aggregate varIdx flds) h_s]
+          rw [writePlaceValue_pure_eq l1 s₁.memory.borrows
+            { local_ := loc, projection := hd :: tl }
+            (.aggregate varIdx flds) h_s] at h_wp ⊢
+          cases h_w : writePlaceValue l1 []
+              { local_ := loc, projection := hd :: tl }
+              (.aggregate varIdx flds) ld ly with
+          | ub => rw [h_w] at h_wp; exact False.elim h_wp
+          | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
+          | ok _ =>
+            exact ⟨_, _, rfl, rfl, h_adv_m _ _ _,
+              ⟨rfl, rfl, rfl, rfl, h_ap₁.symm⟩, ⟨rfl, rfl, rfl, rfl, h_ap₂.symm⟩⟩
+        | _ => exact False.elim h_wp
+  | assign dst rv =>
+    simp only [isBorrowFreePureStatement, Bool.and_eq_true] at h_bf
+    rcases h_bf with ⟨h_dst, h_rv⟩
+    rw [evalStmt_assign_eq] at h_wp
+    rw [evalStmt_assign_eq, evalStmt_assign_eq]
+    rw [h_fr]
+    rw [evalRvalue_borrowFree_pure_eq_withMem s₁.frame.locals rv s₂.memory ld ly h_rv]
+    rw [evalRvalue_borrowFree_pure_eq_withMem s₁.frame.locals rv s₁.memory ld ly h_rv] at h_wp ⊢
+    cases h_ev : evalRvalue s₁.frame.locals rv emptyMemory ld ly with
+    | ub => rw [h_ev] at h_wp; exact False.elim h_wp
+    | unsupported => rw [h_ev] at h_wp; exact False.elim h_wp
+    | ok val l1 _ =>
+      rw [h_ev] at h_wp
+      dsimp only [RvalueEvalResult.withMem] at h_wp ⊢
+      rcases evalAssignDst_pure_sim (s₂ := s₂) h_dst h_ap₁ h_ap₂ h_wp with
+        ⟨l2, bs₁, bs₂, h_d1, h_d2⟩
+      rw [h_d1, h_d2]
+      exact ⟨_, _, rfl, rfl, h_adv_m _ _ _,
+        ⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
+
+private theorem evalDrop_pure_sim
+    {s₁ s₂ : MachineState} {p : Place} {target : BasicBlockIdx} {unwind : UnwindAction}
+    {tspan : String} {bodyOpt : Option CapturedMir} {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_fr : s₂.frame = s₁.frame)
+    (h_wp : evalNodeNoCallWP Q R (evalTerminator s₁ ⟨.drop p target unwind, tspan⟩ bodyOpt)) :
+    ∃ f' : StackFrame,
+      evalTerminator s₁ ⟨.drop p target unwind, tspan⟩ bodyOpt = .step { s₁ with frame := f' } ∧
+      evalTerminator s₂ ⟨.drop p target unwind, tspan⟩ bodyOpt = .step { s₂ with frame := f' } := by
+  rcases p with ⟨pLoc, pProj⟩
+  dsimp only [evalTerminator] at h_wp ⊢
+  rw [h_fr]
+  cases h_g : get? s₁.frame.locals pLoc with
+  | none => rw [h_g] at h_wp; exact False.elim h_wp
+  | some sl =>
+    rw [h_g] at h_wp
+    cases sl with
+    | dead => exact False.elim h_wp
+    | uninit =>
+      dsimp only at h_wp ⊢
+      cases pProj with
+      | nil =>
+        dsimp only at h_wp ⊢
+        cases h_s : set? s₁.frame.locals pLoc .uninit with
+        | none => rw [h_s] at h_wp; exact False.elim h_wp
+        | some _ => exact ⟨_, rfl, rfl⟩
+      | cons _ _ => exact False.elim h_wp
+    | init rv =>
+      dsimp only at h_wp ⊢
+      cases pProj with
+      | nil =>
+        dsimp only at h_wp ⊢
+        cases h_s : set? s₁.frame.locals pLoc .uninit with
+        | none => rw [h_s] at h_wp; exact False.elim h_wp
+        | some _ => exact ⟨_, rfl, rfl⟩
+      | cons hd tl =>
+        dsimp only at h_wp ⊢
+        cases h_rd : readProjectedValue s₁.frame.locals rv (hd :: tl) with
+        | ub => rw [h_rd] at h_wp; exact False.elim h_wp
+        | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
+        | ok _ => exact ⟨_, rfl, rfl⟩
+
+private theorem evalSwitchInt_pure_sim
+    {s₁ s₂ : MachineState} {discr : Operand} {targets : SwitchTargets} {tspan : String}
+    {curBody : CapturedMir} {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_fr : s₂.frame = s₁.frame)
+    (h_pt : isPureOperand discr = true)
+    (h_wp : evalNodeNoCallWP Q R (evalTerminator s₁ ⟨.switchInt discr targets, tspan⟩ (some curBody))) :
+    ∃ (tag : Nat) (f' : StackFrame),
+      evalTerminator s₁ ⟨.switchInt discr targets, tspan⟩ (some curBody) = .emitStep (.event tag) { s₁ with frame := f' } ∧
+      evalTerminator s₂ ⟨.switchInt discr targets, tspan⟩ (some curBody) = .emitStep (.event tag) { s₂ with frame := f' } := by
+  dsimp only [evalTerminator] at h_wp ⊢
+  rw [h_fr]
+  rw [evalOperand_pure_eq s₁.frame.locals discr s₂.memory.borrows
+    s₂.memory.globals curBody.layouts s₂.memory.callerLocals h_pt]
+  rw [evalOperand_pure_eq s₁.frame.locals discr s₁.memory.borrows
+    s₁.memory.globals curBody.layouts s₁.memory.callerLocals h_pt] at h_wp ⊢
+  cases h_ev : evalOperand s₁.frame.locals discr [] [] curBody.layouts [] with
+  | ub => rw [h_ev] at h_wp; exact False.elim h_wp
+  | unsupported => rw [h_ev] at h_wp; exact False.elim h_wp
+  | ok val l' =>
+    rw [h_ev] at h_wp
+    cases val with
+    | scalar _ => exact ⟨_, _, rfl, rfl⟩
+    | _ => exact False.elim h_wp
+
+private theorem evalTailCall_pure_sim
+    {s₁ s₂ : MachineState} {func : Operand} {argOps : List Operand} {tspan : String}
+    {curBody : CapturedMir} {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {checkCallee : CapturedMir → Bool}
+    {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_fr : s₂.frame = s₁.frame)
+    (h_ap₁ : s₁.memory.activeProtectors = [])
+    (h_ap₂ : s₂.memory.activeProtectors = [])
+    (h_cal₁ : s₁.memory.callees = callees)
+    (h_cal₂ : s₂.memory.callees = callees)
+    (h_tr₁ : s₁.memory.traitImpls = traitImpls)
+    (h_tr₂ : s₂.memory.traitImpls = traitImpls)
+    (h_term :
+      (argOps.all isPureOperand &&
+        match extractPureCalleeTarget? curBody.localDecls curBody.layouts func with
+        | none => false
+        | some (defPath, typeArgs) =>
+          match lookupCallee callees curBody.layouts defPath typeArgs traitImpls with
+          | some calleeBody => checkCallee calleeBody
+          | none => false) = true)
+    (h_wp : evalNodeNoCallWP Q R (evalTerminator s₁ ⟨.tailCall func argOps, tspan⟩ (some curBody))) :
+    ∃ (calleeBody : CapturedMir) (argVals : List Value) (bs₁ bs₂ : List BorrowEntry),
+      evalTerminator s₁ ⟨.tailCall func argOps, tspan⟩ (some curBody) =
+        .step (enterTailCalleeFrame { s₁.memory with borrows := bs₁ } calleeBody argVals) ∧
+      evalTerminator s₂ ⟨.tailCall func argOps, tspan⟩ (some curBody) =
+        .step (enterTailCalleeFrame { s₂.memory with borrows := bs₂ } calleeBody argVals) := by
+  simp only [Bool.and_eq_true] at h_term
+  rcases h_term with ⟨h_args, h_ext⟩
+  cases h_def : extractPureCalleeTarget? curBody.localDecls curBody.layouts func with
+  | none => rw [h_def] at h_ext; exact False.elim (Bool.false_ne_true h_ext)
+  | some dt =>
+    rcases dt with ⟨defPath, typeArgs⟩
+    rw [h_def] at h_ext
+    dsimp only at h_ext
+    dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf] at h_wp ⊢
+    have h_res₂ :=
+      resolveCallTarget_eq_of_extractPureCalleeTarget s₂ func (length argOps)
+        curBody.localDecls curBody.layouts h_def
+    have h_res₁ :=
+      resolveCallTarget_eq_of_extractPureCalleeTarget s₁ func (length argOps)
+        curBody.localDecls curBody.layouts h_def
+    rw [h_fr] at h_res₂
+    rw [h_res₂]
+    rw [h_res₁] at h_wp ⊢
+    cases h_rp : resolvePureCalleeTarget s₁.frame.locals func defPath typeArgs curBody.layouts with
+    | ub => rw [h_rp] at h_wp; exact False.elim h_wp
+    | unsupported => rw [h_rp] at h_wp; exact False.elim h_wp
+    | ok rTarget localsAfterFunc =>
+      rw [h_rp] at h_wp
+      have h_rt := resolvePureCalleeTarget_ok_target h_rp
+      subst h_rt
+      dsimp only at h_wp ⊢
+      rw [evalOperands_pure_eq localsAfterFunc argOps s₂.memory.borrows
+        s₂.memory.globals curBody.layouts s₂.memory.callerLocals h_args]
+      rw [evalOperands_pure_eq localsAfterFunc argOps s₁.memory.borrows
+        s₁.memory.globals curBody.layouts s₁.memory.callerLocals h_args] at h_wp ⊢
+      cases h_ev : evalOperands localsAfterFunc argOps [] [] curBody.layouts [] with
+      | ub => rw [h_ev] at h_wp; exact False.elim h_wp
+      | unsupported => rw [h_ev] at h_wp; exact False.elim h_wp
+      | ok argVals _ =>
+        rw [h_ev] at h_wp
+        dsimp only at h_wp ⊢
+        rw [hasFrameDeallocProtectorConflict_of_eq_nil h_ap₁] at h_wp ⊢
+        rw [hasFrameDeallocProtectorConflict_of_eq_nil h_ap₂]
+        dsimp only at h_wp ⊢
+        cases h_lk : lookupCallee callees curBody.layouts defPath typeArgs traitImpls with
+        | none => rw [h_lk] at h_ext; exact False.elim (Bool.false_ne_true h_ext)
+        | some calleeBody =>
+          have h_lk₁ :
+              lookupCallee s₁.memory.callees curBody.layouts defPath typeArgs s₁.memory.traitImpls =
+                some calleeBody := by rw [h_cal₁, h_tr₁, h_lk]
+          have h_lk₂ :
+              lookupCallee s₂.memory.callees curBody.layouts defPath typeArgs s₂.memory.traitImpls =
+                some calleeBody := by rw [h_cal₂, h_tr₂, h_lk]
+          rw [h_lk₁] at h_wp ⊢
+          rw [h_lk₂]
+          dsimp only at h_wp ⊢
+          cases h_cmp :
+              checkCalleeTargetCompatible
+                { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+                calleeBody (length argVals) with
+          | false => rw [h_cmp] at h_wp; exact False.elim h_wp
+          | true =>
+            exact ⟨calleeBody, argVals, _, _, rfl, rfl⟩
+
+private theorem unwindFromCallStack_stacked_eq
+    {outerBody body : CapturedMir} {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    (cs : List SavedCallerFrame) (m₁ m₂ : Memory)
+    (hm_eq : StackedCallFrameAndTraits outerBody body (caller :: restStack) m₁ m₂)
+    (hd_cs : ∀ f ∈ cs, isPurePlace f.destination = true)
+    (hp_cs : ∀ f ∈ cs, f.callerProtector = none ∧ f.calleeProtectors = []) :
+    match unwindFromCallStack cs m₁, unwindFromCallStack (cs ++ (caller :: restStack)) m₂ with
+    | .running ns₁, .running ns₂ =>
+      ns₂.frame = ns₁.frame ∧
+      StackedCallFrameAndTraits outerBody body (caller :: restStack) ns₁.memory ns₂.memory ∧
+      ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true
+    | .halted .panic, _ => True
+    | .halted o₁, .halted o₂ =>
+      o₂ = o₁ ∧ (o₁ = .panic ∨ o₁ = .abort)
+    | .faulted f₁, .faulted f₂ => f₂ = f₁
+    | _, _ => False := by
+  induction cs generalizing m₁ m₂ with
+  | nil => exact True.intro
+  | cons c rest ih_cs =>
+    have hd_tl : ∀ f ∈ rest, isPurePlace f.destination = true :=
+      fun f hf => hd_cs f (List.Mem.tail c hf)
+    have hp_tl : ∀ f ∈ rest, f.callerProtector = none ∧ f.calleeProtectors = [] :=
+      fun f hf => hp_cs f (List.Mem.tail c hf)
+    dsimp only [unwindFromCallStack, List.append_eq]
+    rw [List.cons_append]
+    dsimp only [unwindFromCallStack]
+    cases c.returnUnwind with
+    | unreachable => rfl
+    | terminate => exact ⟨rfl, Or.inr rfl⟩
+    | cleanup _ =>
+      rcases hm_eq with ⟨_, hcal, htr, _, _⟩
+      exact ⟨rfl, ⟨rfl, hcal, htr, rfl, rfl⟩, hd_tl⟩
+    | continue_ =>
+      rcases hm_eq with ⟨_, hcal, htr, _, _⟩
+      exact ih_cs _ _ ⟨rfl, hcal, htr, rfl, rfl⟩ hd_tl hp_tl
+
+private theorem unwindFromCallStack_sameFrame_eq
+    (cs : List SavedCallerFrame) (m₁ m₂ : Memory)
+    (hm_eq : SameCallFrameAndTraits m₁ m₂)
+    (hd_cs : ∀ f ∈ cs, isPurePlace f.destination = true) :
+    match unwindFromCallStack cs m₁, unwindFromCallStack cs m₂ with
+    | .running ns₁, .running ns₂ =>
+      ns₂.frame = ns₁.frame ∧
+      SameCallFrameAndTraits ns₁.memory ns₂.memory ∧
+      ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true
+    | .halted o₁, .halted o₂ =>
+      o₂ = o₁ ∧ (o₁ = .panic ∨ o₁ = .abort)
+    | .faulted f₁, .faulted f₂ => f₂ = f₁
+    | _, _ => False := by
+  induction cs generalizing m₁ m₂ with
+  | nil => exact ⟨rfl, Or.inl rfl⟩
+  | cons c rest ih_cs =>
+    have hd_tl : ∀ f ∈ rest, isPurePlace f.destination = true :=
+      fun f hf => hd_cs f (List.Mem.tail c hf)
+    dsimp only [unwindFromCallStack]
+    cases c.returnUnwind with
+    | unreachable => rfl
+    | terminate => exact ⟨rfl, Or.inr rfl⟩
+    | cleanup _ =>
+      exact ⟨rfl, ⟨hm_eq.1, hm_eq.2.1, rfl, rfl, rfl⟩, hd_tl⟩
+    | continue_ =>
+      exact ih_cs _ _ ⟨hm_eq.1, hm_eq.2.1, rfl, rfl, rfl⟩ hd_tl
+
+private theorem applyUnwindAction_stacked_sim
+    {fuel' : Nat} {outerBody body : CapturedMir}
+    {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {s₁ s₂ : MachineState} {l' : List LocalSlot} {unwind : UnwindAction}
+    {P : Value → Prop} {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (ih_run :
+      ∀ {ns₁ ns₂ : MachineState},
+        wpMirExecNoCallSym fuel' body (.running ns₁)
+          (mirNormalPost fun retVal mem' =>
+            ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal) →
+        (PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true) →
+        (ns₂.frame = ns₁.frame ∧
+          StackedCallFrameAndTraits outerBody body (caller :: restStack) ns₁.memory ns₂.memory) →
+        wpMirExecStepsUpToSym fuel' outerBody (.running ns₂)
+          (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post)
+    (h_meq : StackedCallFrameAndTraits outerBody body (caller :: restStack) s₁.memory s₂.memory)
+    (h_dst_stk : ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (hp_stk : ∀ f ∈ s₁.memory.callStack, f.callerProtector = none ∧ f.calleeProtectors = [])
+    (h_wp_u :
+      evalNodeNoCallWP
+        (fun st' =>
+          wpMirExecNoCallSym fuel' body st'
+            (mirNormalPost fun retVal mem' =>
+              ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))
+        (mirNormalPost fun retVal mem' =>
+          ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)
+        (match applyUnwindAction s₁ l' s₁.memory unwind with
+         | .running ns => MirStepNode.step ns
+         | .halted out => MirStepNode.retOutcome out
+         | .faulted fk => MirStepNode.fail fk))
+    (h_inv_u :
+      pureNodeStepInv callees traitImpls body
+        (match applyUnwindAction s₁ l' s₁.memory unwind with
+         | .running ns => MirStepNode.step ns
+         | .halted out => MirStepNode.retOutcome out
+         | .faulted fk => MirStepNode.fail fk)) :
+    evalNodeNoCallWP
+      (fun st' =>
+        wpMirExecStepsUpToSym fuel' outerBody st'
+          (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post)
+      post
+      (match applyUnwindAction s₂ l' s₂.memory unwind with
+       | .running ns => MirStepNode.step ns
+       | .halted out => MirStepNode.retOutcome out
+       | .faulted fk => MirStepNode.fail fk) := by
+  dsimp only [applyUnwindAction] at h_wp_u h_inv_u ⊢
+  cases unwind with
+  | unreachable => exact False.elim h_wp_u
+  | terminate => exact False.elim h_wp_u
+  | cleanup _ =>
+    dsimp only at h_wp_u h_inv_u ⊢
+    exact ih_run h_wp_u ⟨h_inv_u, h_dst_stk⟩ ⟨rfl, h_meq⟩
+  | continue_ =>
+    rw [h_meq.1]
+    have hu := unwindFromCallStack_stacked_eq s₁.memory.callStack s₁.memory s₂.memory h_meq h_dst_stk hp_stk
+    cases h_u1 : unwindFromCallStack s₁.memory.callStack s₁.memory
+    · cases h_u2 : unwindFromCallStack (s₁.memory.callStack ++ (caller :: restStack)) s₂.memory
+      · rw [h_u1, h_u2] at hu
+        rw [h_u1] at h_wp_u h_inv_u
+        rcases hu with ⟨hfr', hmeq', hdst'⟩
+        exact ih_run h_wp_u ⟨h_inv_u, hdst'⟩ ⟨hfr', hmeq'⟩
+      · rw [h_u1, h_u2] at hu; exact False.elim hu
+      · rw [h_u1, h_u2] at hu; exact False.elim hu
+    · rename_i o₁
+      rw [h_u1] at h_wp_u
+      dsimp only [evalNodeNoCallWP, MirStepNode.retOutcome, mirNormalPost] at h_wp_u ⊢
+      cases o₁
+      · cases h_u2 : unwindFromCallStack (s₁.memory.callStack ++ (caller :: restStack)) s₂.memory
+        · rw [h_u1, h_u2] at hu; exact False.elim hu
+        · rw [h_u1, h_u2] at hu
+          rcases hu with ⟨_, h_eq | h_eq⟩ <;> contradiction
+        · rw [h_u1, h_u2] at hu; exact False.elim hu
+      · exact False.elim h_wp_u
+      · exact False.elim h_wp_u
+    · rw [h_u1] at h_wp_u
+      exact False.elim h_wp_u
+
+private theorem applyUnwindAction_sameFrame_sim
+    {fuel' : Nat} {body : CapturedMir}
+    {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {s₁ s₂ : MachineState} {l' : List LocalSlot} {unwind : UnwindAction}
+    {P : Value → Prop}
+    (ih_run :
+      ∀ {ns₁ ns₂ : MachineState},
+        wpMirExecNoCallSym fuel' body (.running ns₁)
+          (mirNormalPost fun retVal mem' =>
+            ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal) →
+        (PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true) →
+        (ns₂.frame = ns₁.frame ∧ SameCallFrameAndTraits ns₁.memory ns₂.memory) →
+        wpMirExecNoCallSym fuel' body (.running ns₂)
+          (mirNormalPost fun retVal mem' =>
+            ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal))
+    (h_meq : SameCallFrameAndTraits s₁.memory s₂.memory)
+    (h_dst_stk : ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (h_wp_u :
+      evalNodeNoCallWP
+        (fun st' =>
+          wpMirExecNoCallSym fuel' body st'
+            (mirNormalPost fun retVal mem' =>
+              ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))
+        (mirNormalPost fun retVal mem' =>
+          ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)
+        (match applyUnwindAction s₁ l' s₁.memory unwind with
+         | .running ns => MirStepNode.step ns
+         | .halted out => MirStepNode.retOutcome out
+         | .faulted fk => MirStepNode.fail fk))
+    (h_inv_u :
+      pureNodeStepInv callees traitImpls body
+        (match applyUnwindAction s₁ l' s₁.memory unwind with
+         | .running ns => MirStepNode.step ns
+         | .halted out => MirStepNode.retOutcome out
+         | .faulted fk => MirStepNode.fail fk)) :
+    evalNodeNoCallWP
+      (fun st' =>
+        wpMirExecNoCallSym fuel' body st'
+          (mirNormalPost fun retVal mem' =>
+            ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal))
+      (mirNormalPost fun retVal mem' =>
+        ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal)
+      (match applyUnwindAction s₂ l' s₂.memory unwind with
+       | .running ns => MirStepNode.step ns
+       | .halted out => MirStepNode.retOutcome out
+       | .faulted fk => MirStepNode.fail fk) := by
+  dsimp only [applyUnwindAction] at h_wp_u h_inv_u ⊢
+  cases unwind with
+  | unreachable => exact False.elim h_wp_u
+  | terminate => exact False.elim h_wp_u
+  | cleanup _ =>
+    exact ih_run h_wp_u ⟨h_inv_u, h_dst_stk⟩ ⟨rfl, h_meq⟩
+  | continue_ =>
+    rw [h_meq.2.2.1]
+    have hu := unwindFromCallStack_sameFrame_eq s₁.memory.callStack s₁.memory s₂.memory h_meq h_dst_stk
+    cases h_u1 : unwindFromCallStack s₁.memory.callStack s₁.memory <;>
+      cases h_u2 : unwindFromCallStack s₁.memory.callStack s₂.memory <;>
+      rw [h_u1, h_u2] at hu <;>
+      try exact False.elim hu
+    · rw [h_u1] at h_wp_u h_inv_u
+      rcases hu with ⟨hfr', hmeq', hdst'⟩
+      exact ih_run h_wp_u ⟨h_inv_u, hdst'⟩ ⟨hfr', hmeq'⟩
+    · rw [h_u1] at h_wp_u
+      rcases hu with ⟨_, rfl | rfl⟩ <;> exact False.elim h_wp_u
+    · rw [h_u1] at h_wp_u
+      exact False.elim h_wp_u
+
+private theorem evalExactDiv_pure_sim
+    {s₁ : MachineState} {defPath : DefPath} {typeArgs : List RigidTy}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {targetBb : BasicBlockIdx} {curBody : CapturedMir}
+    {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_dst : isPurePlace destination = true)
+    (h_wp :
+      evalNodeNoCallWP Q R
+        (match argVals with
+         | [.scalar lhsSc, .scalar rhsSc] =>
+           match
+             resolveIntrinsicIsSigned
+               { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+               curBody.localDecls curBody.layouts argOps
+           with
+           | .none => MirStepNode.unsupported
+           | .some isSigned =>
+             match evalExactDiv lhsSc rhsSc isSigned with
+             | .some retSc =>
+               writeIntrinsicReturn s₁ locals' destination targetBb (.scalar retSc)
+             | .none => MirStepNode.fail .ub
+         | _ => MirStepNode.fail .ub)) :
+    ∃ (lhsSc rhsSc retSc : ScalarInt) (isSigned : Bool) (updL : List LocalSlot),
+      argVals = [.scalar lhsSc, .scalar rhsSc] ∧
+      resolveIntrinsicIsSigned
+        { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+        curBody.localDecls curBody.layouts argOps = some isSigned ∧
+      evalExactDiv lhsSc rhsSc isSigned = some retSc ∧
+      writePlaceValue locals' [] destination (.scalar retSc) = .ok updL := by
+  cases argVals with
+  | nil => exact False.elim h_wp
+  | cons v1 vs1 =>
+    cases v1 with
+    | scalar lhsSc =>
+      cases vs1 with
+      | nil => exact False.elim h_wp
+      | cons v2 vs2 =>
+        cases v2 with
+        | scalar rhsSc =>
+          cases vs2 with
+          | cons _ _ => exact False.elim h_wp
+          | nil =>
+            dsimp only at h_wp
+            cases h_sgn :
+                resolveIntrinsicIsSigned
+                  { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+                  curBody.localDecls curBody.layouts argOps with
+            | none => rw [h_sgn] at h_wp; exact False.elim h_wp
+            | some isSigned =>
+              rw [h_sgn] at h_wp
+              dsimp only at h_wp
+              cases h_d : evalExactDiv lhsSc rhsSc isSigned with
+              | none => rw [h_d] at h_wp; exact False.elim h_wp
+              | some retSc =>
+                rw [h_d] at h_wp
+                dsimp only at h_wp
+                rw [writeIntrinsicReturn_pure_eq s₁ locals' destination targetBb (.scalar retSc) h_dst] at h_wp
+                cases h_w : writePlaceValue locals' [] destination (.scalar retSc) with
+                | ub => simp only [h_w] at h_wp; exact False.elim h_wp
+                | unsupported => simp only [h_w] at h_wp; exact False.elim h_wp
+                | ok updL => exact ⟨lhsSc, rhsSc, retSc, isSigned, updL, rfl, rfl, h_d, h_w⟩
+        | _ => exact False.elim h_wp
+    | _ => exact False.elim h_wp
+
+private theorem pureCallee_pushCalleeFrame_step_callTerm
+    {fuel' : Nat} {outerBody body : CapturedMir}
+    {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {checkCallee : CapturedMir → Bool}
+    {s₁ s₂ : MachineState} {tkind : TerminatorKind} {tspan : String}
+    {P : Value → Prop} {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (ih_run :
+      ∀ {ns₁ ns₂ : MachineState},
+        wpMirExecNoCallSym fuel' body (.running ns₁)
+          (mirNormalPost fun retVal mem' =>
+            ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal) →
+        (PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true) →
+        (ns₂.frame = ns₁.frame ∧
+          StackedCallFrameAndTraits outerBody body (caller :: restStack) ns₁.memory ns₂.memory) →
+        wpMirExecStepsUpToSym fuel' outerBody (.running ns₂)
+          (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post)
+    (h_inv :
+      PureCalleeMachineInv callees traitImpls body s₁ ∧
+      ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (h_rel :
+      s₂.frame = s₁.frame ∧
+      StackedCallFrameAndTraits outerBody body (caller :: restStack) s₁.memory s₂.memory)
+    (h_pt : isPureTerminator tkind = false)
+    (h_term :
+      checkPureTerminatorWith callees (s₁.memory.activeCallee.getD body).layouts traitImpls
+        checkCallee tkind (s₁.memory.activeCallee.getD body).localDecls = true)
+    (h_step_inv :
+      pureNodeStepInv callees traitImpls body
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))))
+    (h_wp :
+      evalNodeNoCallWP
+        (fun st' =>
+          wpMirExecNoCallSym fuel' body st'
+            (mirNormalPost fun retVal mem' =>
+              ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))
+        (mirNormalPost fun retVal mem' =>
+          ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body)))) :
+    evalNodeNoCallWP
+      (fun st' =>
+        wpMirExecStepsUpToSym fuel' outerBody st'
+          (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post)
+      post
+      (evalTerminator s₂ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))) := by
+  rcases h_inv with ⟨⟨h_bor₁, _, _, h_ap, h_cal, h_tr, _, h_stack⟩, h_dst_stk⟩
+  rcases h_rel with ⟨h_fr, h_meq⟩
+  rcases h_meq with ⟨mf_cs, mf_cal, mf_tr, mf_ac, mf_ap⟩
+  have h_meq_full : StackedCallFrameAndTraits outerBody body (caller :: restStack) s₁.memory s₂.memory :=
+    ⟨mf_cs, mf_cal, mf_tr, mf_ac, mf_ap⟩
+  unfold checkPureTerminatorWith at h_term
+  simp only [h_pt, Bool.false_eq_true, ↓reduceIte] at h_term
+  cases tkind with
+  | call func argOps destination targetOpt unwind =>
+    simp only [Bool.and_eq_true] at h_term
+    rcases h_term with ⟨⟨h_dst, h_args⟩, h_ext⟩
+    cases h_def : extractPureCalleeTarget?
+        (s₁.memory.activeCallee.getD body).localDecls
+        (s₁.memory.activeCallee.getD body).layouts func with
+    | none => rw [h_def] at h_ext; exact False.elim (Bool.false_ne_true h_ext)
+    | some dt =>
+      rcases dt with ⟨defPath, typeArgs⟩
+      rw [h_def] at h_ext
+      dsimp only at h_ext
+      simp only [evalTerminator_call_eq_unified] at h_wp h_step_inv ⊢
+      dsimp only [evalCallTerminatorUnified, bodyLocalDeclsOf] at h_wp h_step_inv ⊢
+      have h_res₂ :=
+        resolveCallTarget_eq_of_extractPureCalleeTarget s₂ func (length argOps)
+          (s₁.memory.activeCallee.getD body).localDecls
+          (s₁.memory.activeCallee.getD body).layouts h_def
+      have h_res₁ :=
+        resolveCallTarget_eq_of_extractPureCalleeTarget s₁ func (length argOps)
+          (s₁.memory.activeCallee.getD body).localDecls
+          (s₁.memory.activeCallee.getD body).layouts h_def
+      rw [h_fr] at h_res₂
+      rw [h_res₂]
+      rw [h_res₁] at h_wp h_step_inv
+      cases h_rp : resolvePureCalleeTarget s₁.frame.locals func defPath typeArgs
+          (s₁.memory.activeCallee.getD body).layouts with
+      | ub => rw [h_rp] at h_wp; exact False.elim h_wp
+      | unsupported => rw [h_rp] at h_wp; exact False.elim h_wp
+      | ok rTarget localsAfterFunc =>
+        rw [h_rp] at h_wp h_step_inv
+        have h_rt := resolvePureCalleeTarget_ok_target h_rp
+        subst h_rt
+        dsimp only at h_wp h_step_inv ⊢
+        rw [evalOperands_pure_eq localsAfterFunc argOps s₂.memory.borrows
+          s₂.memory.globals (s₁.memory.activeCallee.getD body).layouts
+          s₂.memory.callerLocals h_args]
+        rw [evalOperands_pure_eq localsAfterFunc argOps s₁.memory.borrows
+          s₁.memory.globals (s₁.memory.activeCallee.getD body).layouts
+          s₁.memory.callerLocals h_args] at h_wp h_step_inv
+        cases h_ev : evalOperands localsAfterFunc argOps [] []
+            (s₁.memory.activeCallee.getD body).layouts [] with
+        | ub => rw [h_ev] at h_wp; cases targetOpt <;> exact False.elim h_wp
+        | unsupported => rw [h_ev] at h_wp; cases targetOpt <;> exact False.elim h_wp
+        | ok argVals locals' =>
+          rw [h_ev] at h_wp h_step_inv
+          cases targetOpt with
+          | none =>
+            dsimp only at h_wp h_step_inv ⊢
+            rw [h_cal, h_tr] at h_wp h_step_inv
+            rw [mf_cal, mf_tr, h_cal, h_tr]
+            cases h_lk : lookupCallee callees
+                (s₁.memory.activeCallee.getD body).layouts defPath typeArgs traitImpls with
+            | some calleeBody =>
+              rw [h_lk] at h_wp h_step_inv
+              dsimp only [checkCalleeTargetCompatible, pushDivergingCalleeFrame] at h_wp h_step_inv ⊢
+              refine ih_run h_wp ⟨h_step_inv, ?_⟩ ⟨rfl, ?_⟩
+              · intro f hf
+                cases hf with
+                | head => exact h_dst
+                | tail _ hm => exact h_dst_stk f hm
+              · exact ⟨by dsimp only; rw [h_fr, mf_cs, mf_ap, List.cons_append], mf_cal, mf_tr, rfl, mf_ap⟩
+            | none =>
+              rw [h_lk] at h_ext h_wp h_step_inv
+              dsimp only at h_ext h_wp h_step_inv ⊢
+              cases h_unr : isUnreachableCallTarget defPath with
+              | true => rw [h_unr] at h_wp; exact False.elim h_wp
+              | false =>
+                rw [h_unr] at h_ext h_wp h_step_inv
+                dsimp only at h_wp h_step_inv ⊢
+                cases h_ab : isAbortingPanicDefPath defPath with
+                | true => rw [h_ab] at h_wp; exact False.elim h_wp
+                | false =>
+                  rw [h_ab] at h_ext h_wp h_step_inv
+                  simp only [Bool.false_or] at h_ext
+                  dsimp only at h_wp h_step_inv ⊢
+                  rw [h_ext] at h_wp h_step_inv ⊢
+                  exact applyUnwindAction_stacked_sim ih_run h_meq_full h_dst_stk
+                    (fun f hf => ⟨(h_stack f hf).1, (h_stack f hf).2.1⟩) h_wp h_step_inv
+          | some targetBb =>
+            dsimp only at h_wp h_step_inv ⊢
+            rw [h_cal, h_tr] at h_wp h_step_inv
+            rw [mf_cal, mf_tr, h_cal, h_tr]
+            cases h_lk : lookupCallee callees
+                (s₁.memory.activeCallee.getD body).layouts defPath typeArgs traitImpls with
+            | some calleeBody =>
+              rw [h_lk] at h_wp h_step_inv
+              dsimp only [checkCalleeTargetCompatible, pushCalleeFrame] at h_wp h_step_inv ⊢
+              refine ih_run h_wp ⟨h_step_inv, ?_⟩ ⟨rfl, ?_⟩
+              · intro f hf
+                cases hf with
+                | head => exact h_dst
+                | tail _ hm => exact h_dst_stk f hm
+              · exact ⟨by dsimp only; rw [h_fr, mf_cs, mf_ap, List.cons_append], mf_cal, mf_tr, rfl, mf_ap⟩
+            | none =>
+              rw [h_lk] at h_ext h_wp h_step_inv
+              dsimp only at h_ext
+              dsimp only [isDirectExactDivTarget] at h_wp h_step_inv ⊢
+              rw [h_ext] at h_wp h_step_inv ⊢
+              dsimp only at h_wp h_step_inv ⊢
+              rcases evalExactDiv_pure_sim h_dst h_wp with
+                ⟨lhsSc, rhsSc, retSc, isSigned, updL, rfl, h_sgn, h_d, h_w⟩
+              dsimp only at h_wp h_step_inv ⊢
+              rw [h_sgn] at h_wp h_step_inv ⊢
+              dsimp only at h_wp h_step_inv ⊢
+              rw [h_d] at h_wp h_step_inv ⊢
+              dsimp only at h_wp h_step_inv ⊢
+              rw [writeIntrinsicReturn_pure_eq _ locals' destination targetBb (.scalar retSc) h_dst] at h_wp h_step_inv
+              rw [writeIntrinsicReturn_pure_eq _ locals' destination targetBb (.scalar retSc) h_dst]
+              rw [h_w] at h_wp h_step_inv ⊢
+              have h_id₁ : invalidateDirectDestWriteBorrows s₁.memory locals' destination = s₁.memory := by
+                unfold invalidateDirectDestWriteBorrows; rw [h_bor₁]
+              rw [h_id₁] at h_wp h_step_inv
+              exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩
+                ⟨rfl, h_meq_full.withDirectDestBorrowsRhs locals' destination⟩
+  | tailCall func argOps =>
+    have h_ap2 : s₂.memory.activeProtectors = [] := by rw [mf_ap, h_ap]
+    rcases evalTailCall_pure_sim h_fr h_ap h_ap2 h_cal (mf_cal.trans h_cal) h_tr (mf_tr.trans h_tr) h_term h_wp with
+      ⟨calleeBody, argVals, bs₁, bs₂, h_t1, h_t2⟩
+    rw [h_t1] at h_wp h_step_inv
+    rw [h_t2]
+    dsimp only [enterTailCalleeFrame, MirStepNode.step, evalNodeNoCallWP, pureNodeStepInv] at h_wp h_step_inv ⊢
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, ⟨mf_cs, mf_cal, mf_tr, rfl, mf_ap⟩⟩
+  | _ => exact False.elim (Bool.false_ne_true h_term)
+
+private theorem pureCallee_pushCalleeFrame_step_pureTerm
+    {fuel' : Nat} {outerBody body : CapturedMir}
+    {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {s₁ s₂ : MachineState} {tkind : TerminatorKind} {tspan : String}
+    {P : Value → Prop} {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h_div_caller : caller.isDiverging = false)
+    (h_prot_caller : restoreCallerProtectors caller = [])
+    (ih_run :
+      ∀ {ns₁ ns₂ : MachineState},
+        wpMirExecNoCallSym fuel' body (.running ns₁)
+          (mirNormalPost fun retVal mem' =>
+            ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal) →
+        (PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true) →
+        (ns₂.frame = ns₁.frame ∧
+          StackedCallFrameAndTraits outerBody body (caller :: restStack) ns₁.memory ns₂.memory) →
+        wpMirExecStepsUpToSym fuel' outerBody (.running ns₂)
+          (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post)
+    (h_cont :
+      ∀ retVal memOut memOut₂ (nLocals : Nat),
+        ActiveRootMemory body (pureCalleeMemory callees traitImpls) memOut →
+        P retVal →
+        StackedCallFrameAndTraits outerBody body (caller :: restStack) memOut memOut₂ →
+        memOut₂.activeProtectors = [] →
+        ∃ (updLocals : List LocalSlot) (memResumed : Memory),
+          writeReturnDestination caller.frame.locals
+            { memOut₂ with
+              borrows := disableFrameBorrows memOut₂.borrows (length (caller :: restStack)) nLocals
+              callStack := restStack
+              activeCallee := some caller.callerBody
+              activeProtectors := [] }
+            caller.destination retVal
+            caller.callerBody.localDecls caller.callerBody.layouts = .ok updLocals memResumed ∧
+          mid {
+            frame := { caller.frame with blockIdx := caller.returnTarget, stmtIdx := 0, locals := updLocals }
+            memory := memResumed
+          })
+    (h_inv :
+      PureCalleeMachineInv callees traitImpls body s₁ ∧
+      ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (h_rel :
+      s₂.frame = s₁.frame ∧
+      StackedCallFrameAndTraits outerBody body (caller :: restStack) s₁.memory s₂.memory)
+    (h_pt : isPureTerminator tkind = true)
+    (h_step_inv :
+      pureNodeStepInv callees traitImpls body
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))))
+    (h_wp :
+      evalNodeNoCallWP
+        (fun st' =>
+          wpMirExecNoCallSym fuel' body st'
+            (mirNormalPost fun retVal mem' =>
+              ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))
+        (mirNormalPost fun retVal mem' =>
+          ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body)))) :
+    evalNodeNoCallWP
+      (fun st' =>
+        wpMirExecStepsUpToSym fuel' outerBody st'
+          (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post)
+      post
+      (evalTerminator s₂ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))) := by
+  rcases h_inv with ⟨⟨_, _, _, h_ap, _, _, _, h_stack⟩, h_dst_stk⟩
+  rcases h_rel with ⟨h_fr, h_meq⟩
+  rcases h_meq with ⟨mf_cs, mf_cal, mf_tr, mf_ac, mf_ap⟩
+  have h_meq_full : StackedCallFrameAndTraits outerBody body (caller :: restStack) s₁.memory s₂.memory :=
+    ⟨mf_cs, mf_cal, mf_tr, mf_ac, mf_ap⟩
+  cases tkind with
+  | goto target =>
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [h_fr]
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+  | unreachable => exact False.elim h_wp
+  | unwindTerminate => exact False.elim h_wp
+  | inlineAsm => cases h_pt
+  | call _ _ _ _ _ => cases h_pt
+  | tailCall _ _ => cases h_pt
+  | drop p target unwind =>
+    rcases evalDrop_pure_sim (s₂ := s₂) h_fr h_wp with ⟨f', h_d1, h_d2⟩
+    rw [h_d1] at h_wp h_step_inv
+    rw [h_d2]
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+  | unwindResume =>
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [mf_cs]
+    have hu := unwindFromCallStack_stacked_eq s₁.memory.callStack s₁.memory s₂.memory h_meq_full h_dst_stk
+      (fun f hf => ⟨(h_stack f hf).1, (h_stack f hf).2.1⟩)
+    cases h_u1 : unwindFromCallStack s₁.memory.callStack s₁.memory
+    · cases h_u2 : unwindFromCallStack (s₁.memory.callStack ++ (caller :: restStack)) s₂.memory
+      · rw [h_u1, h_u2] at hu
+        rw [h_u1] at h_wp h_step_inv
+        rcases hu with ⟨hfr', hmeq', hdst'⟩
+        exact ih_run h_wp ⟨h_step_inv, hdst'⟩ ⟨hfr', hmeq'⟩
+      · rw [h_u1, h_u2] at hu; exact False.elim hu
+      · rw [h_u1, h_u2] at hu; exact False.elim hu
+    · rename_i o₁
+      rw [h_u1] at h_wp
+      dsimp only [evalNodeNoCallWP, MirStepNode.retOutcome, mirNormalPost, evalTerminator] at h_wp ⊢
+      cases o₁
+      · cases h_u2 : unwindFromCallStack (s₁.memory.callStack ++ (caller :: restStack)) s₂.memory
+        · rw [h_u1, h_u2] at hu; exact False.elim hu
+        · rw [h_u1, h_u2] at hu
+          rcases hu with ⟨_, h_eq | h_eq⟩ <;> contradiction
+        · rw [h_u1, h_u2] at hu; exact False.elim hu
+      · exact False.elim h_wp
+      · exact False.elim h_wp
+    · rw [h_u1] at h_wp
+      exact False.elim h_wp
+  | return_ =>
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [h_fr, mf_cs]
+    cases h_g : get? s₁.frame.locals 0 with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some sl =>
+      rw [h_g] at h_wp h_step_inv
+      cases sl with
+      | uninit => exact False.elim h_wp
+      | dead => exact False.elim h_wp
+      | init retVal =>
+        have h_ap2 : s₂.memory.activeProtectors = [] := by rw [mf_ap, h_ap]
+        dsimp only at h_wp h_step_inv ⊢
+        rw [hasFrameDeallocProtectorConflict_of_eq_nil h_ap] at h_wp h_step_inv
+        rw [hasFrameDeallocProtectorConflict_of_eq_nil h_ap2]
+        dsimp only at h_wp h_step_inv ⊢
+        cases h_cs : s₁.memory.callStack with
+        | nil =>
+          rw [h_cs] at h_wp
+          dsimp only [MirStepNode.retNormal, evalNodeNoCallWP, mirNormalPost] at h_wp
+          rcases h_wp with ⟨h_act₁, hp₁⟩
+          let memOut₁ := { s₁.memory with callStack := [], borrows := disableFrameBorrows s₁.memory.borrows (length ([] : List SavedCallerFrame)) (length s₁.frame.locals) }
+          let memOut₂ := s₂.memory
+          have h_meq' : StackedCallFrameAndTraits outerBody body (caller :: restStack) memOut₁ memOut₂ :=
+            StackedCallFrameAndTraits_eq h_meq_full (by rw [h_cs]) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+          rcases h_cont retVal memOut₁ memOut₂ (length s₁.frame.locals) h_act₁ hp₁ h_meq' h_ap2 with ⟨updLocals, memResumed, h_wr, h_mid⟩
+          dsimp only [List.nil_append]
+          rw [h_div_caller, h_prot_caller]
+          dsimp only
+          rw [h_wr]
+          dsimp only [MirStepNode.step, evalNodeNoCallWP]
+          exact wpMirExecStepsUpToSym_of_mid h_mid
+        | cons c_frame rest =>
+          rw [h_cs] at h_wp h_step_inv h_dst_stk
+          dsimp only at h_wp h_step_inv ⊢
+          cases h_div : c_frame.isDiverging with
+          | true => rw [h_div] at h_wp; exact False.elim h_wp
+          | false =>
+            rw [h_div] at h_wp h_step_inv
+            dsimp only at h_wp h_step_inv ⊢
+            have h_cdst : isPurePlace c_frame.destination = true :=
+              h_dst_stk c_frame (List.Mem.head rest)
+            have h_hd := h_stack c_frame (by rw [h_cs]; exact List.Mem.head rest)
+            have h_prot_nil : restoreCallerProtectors c_frame = [] := by
+              rcases h_hd with ⟨hp1, hp2, _⟩
+              simp [restoreCallerProtectors, hp1, hp2]
+            rw [h_prot_nil] at h_wp h_step_inv
+            let memPop₁ : Memory :=
+              { s₁.memory with
+                borrows := disableFrameBorrows s₁.memory.borrows (length (c_frame :: rest)) (length s₁.frame.locals)
+                callStack := rest
+                activeCallee := .some c_frame.callerBody
+                activeProtectors := [] }
+            let memPop₂ : Memory :=
+              { s₂.memory with
+                borrows := disableFrameBorrows s₂.memory.borrows (length (c_frame :: (rest ++ caller :: restStack))) (length s₁.frame.locals)
+                callStack := rest ++ (caller :: restStack)
+                activeCallee := .some c_frame.callerBody
+                activeProtectors := [] }
+            rcases writeReturnDestination_pure_eq_withMem
+              c_frame.frame.locals memPop₂ c_frame.destination retVal
+              c_frame.callerBody.localDecls c_frame.callerBody.layouts
+              h_cdst rfl with ⟨bs₂, h_w2⟩
+            rcases writeReturnDestination_pure_eq_withMem
+              c_frame.frame.locals memPop₁ c_frame.destination retVal
+              c_frame.callerBody.localDecls c_frame.callerBody.layouts
+              h_cdst rfl with ⟨bs₁, h_w1⟩
+            dsimp only [List.cons_append]
+            rw [h_div, h_prot_nil]
+            dsimp only
+            rw [h_w2]
+            rw [h_w1] at h_wp h_step_inv
+            cases h_w : writeReturnDestination c_frame.frame.locals emptyMemory
+                c_frame.destination retVal c_frame.callerBody.localDecls
+                c_frame.callerBody.layouts with
+            | ub => rw [h_w] at h_wp; exact False.elim h_wp
+            | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
+            | ok updL _ =>
+              rw [h_w] at h_wp h_step_inv
+              dsimp only [FrameWriteResult.withMem] at h_wp h_step_inv ⊢
+              exact ih_run h_wp ⟨h_step_inv, fun f hf => h_dst_stk f (List.Mem.tail c_frame hf)⟩
+                ⟨rfl, ⟨rfl, mf_cal, mf_tr, rfl, rfl⟩⟩
+  | switchInt discr targets =>
+    dsimp only [isPureTerminator] at h_pt
+    rcases evalSwitchInt_pure_sim (s₂ := s₂) h_fr h_pt h_wp with ⟨obs, f', h_s1, h_s2⟩
+    rw [h_s1] at h_wp h_step_inv
+    rw [h_s2]
+    dsimp only [MirStepNode.emitStep, evalNodeNoCallWP, pureNodeStepInv] at h_wp h_step_inv ⊢
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+  | assert cond expected target unwind =>
+    dsimp only [isPureTerminator] at h_pt
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [h_fr]
+    rw [evalOperand_pure_eq s₁.frame.locals cond s₂.memory.borrows
+      s₂.memory.globals (s₁.memory.activeCallee.getD body).layouts
+      s₂.memory.callerLocals h_pt]
+    rw [evalOperand_pure_eq s₁.frame.locals cond s₁.memory.borrows
+      s₁.memory.globals (s₁.memory.activeCallee.getD body).layouts
+      s₁.memory.callerLocals h_pt] at h_wp h_step_inv
+    cases h_ev : evalOperand s₁.frame.locals cond [] []
+        (s₁.memory.activeCallee.getD body).layouts [] with
+    | ub => rw [h_ev] at h_wp; exact False.elim h_wp
+    | unsupported => rw [h_ev] at h_wp; exact False.elim h_wp
+    | ok val l' =>
+      rw [h_ev] at h_wp h_step_inv
+      cases val with
+      | scalar sc =>
+        have hp_stk : ∀ f ∈ s₁.memory.callStack, f.callerProtector = none ∧ f.calleeProtectors = [] :=
+          fun f hf => ⟨(h_stack f hf).1, (h_stack f hf).2.1⟩
+        cases expected <;> dsimp only [BEq.beq] at h_wp h_step_inv ⊢
+        · revert h_wp h_step_inv
+          cases Nat.beq sc.bits 0 with
+          | true =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+          | false =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact applyUnwindAction_stacked_sim ih_run h_meq_full h_dst_stk hp_stk h_wp h_step_inv
+        · revert h_wp h_step_inv
+          cases Nat.beq sc.bits 1 with
+          | true =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+          | false =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact applyUnwindAction_stacked_sim ih_run h_meq_full h_dst_stk hp_stk h_wp h_step_inv
+      | _ => exact False.elim h_wp
+
+theorem pureCallee_pushCalleeFrame_steps
+    {fuel : Nat} {outerBody body : CapturedMir}
+    {caller : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry}
+    {s₁ s₂ : MachineState}
+    {P : Value → Prop} {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h_div_caller : caller.isDiverging = false)
+    (h_prot_caller : restoreCallerProtectors caller = [])
+    (h_inv :
+        PureCalleeMachineInv callees traitImpls body s₁ ∧
+        ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (h_rel :
+        s₂.frame = s₁.frame ∧
+        StackedCallFrameAndTraits outerBody body (caller :: restStack) s₁.memory s₂.memory)
+    (h_wp :
+      wpMirExecNoCallSym fuel body (.running s₁)
+        (mirNormalPost
+          (fun retVal mem' =>
+            ActiveRootMemory body
+              (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)))
+    (h_cont :
+      ∀ retVal memOut memOut₂ (nLocals : Nat),
+        ActiveRootMemory body (pureCalleeMemory callees traitImpls) memOut →
+        P retVal →
+        StackedCallFrameAndTraits outerBody body (caller :: restStack) memOut memOut₂ →
+        memOut₂.activeProtectors = [] →
+        ∃ (updLocals : List LocalSlot) (memResumed : Memory),
+          writeReturnDestination caller.frame.locals
+            { memOut₂ with
+              borrows := disableFrameBorrows memOut₂.borrows (length (caller :: restStack)) nLocals
+              callStack := restStack
+              activeCallee := some caller.callerBody
+              activeProtectors := [] }
+            caller.destination
+            retVal
+            caller.callerBody.localDecls caller.callerBody.layouts = .ok updLocals memResumed ∧
+          mid {
+            frame := {
+              caller.frame with
+              blockIdx := caller.returnTarget
+              stmtIdx := 0
+              locals := updLocals
+            }
+            memory := memResumed
+          }) :
+    wpMirExecStepsUpToSym fuel outerBody (.running s₂) (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post := by
+  revert s₁ s₂ h_inv h_rel h_wp
+  induction fuel with
+  | zero =>
+    intros _ _ _ _ h_wp
+    exact False.elim h_wp
+  | succ fuel' ih_run_f =>
+    intro s₁ s₂ h_inv h_rel h_wp
+    have ih_run {ns₁ ns₂ : MachineState}
+        (hw :
+          wpMirExecNoCallSym fuel' body (.running ns₁)
+            (mirNormalPost
+              (fun retVal mem' =>
+                ActiveRootMemory body
+                  (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)))
+        (hi :
+          PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true)
+        (hr : ns₂.frame = ns₁.frame ∧ StackedCallFrameAndTraits outerBody body (caller :: restStack) ns₁.memory ns₂.memory) :
+        wpMirExecStepsUpToSym fuel' outerBody (.running ns₂) (fun | .running ms' => mid ms' | .halted out => post out | .faulted _ => False) post :=
+      ih_run_f hi hr hw
+    unfold wpMirExecNoCallSym at h_wp
+    unfold wpMirExecStepsUpToSym
+    apply Or.inr
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval] at h_wp
+    have h_inv_full := h_inv.1
+    have h_dst_stk := h_inv.2
+    have h_fr := h_rel.1
+    have h_meq := h_rel.2
+    have h_ap := h_inv_full.2.2.2.1
+    have h_act := h_inv_full.2.2.2.2.2.2.1
+    dsimp only [stepMirState] at h_wp ⊢
+    rw [stepMirFn_eq_ite] at h_wp
+    rw [stepMirFn_eq_ite]
+    dsimp only at h_wp ⊢
+    have h_m2_ac : s₂.memory.activeCallee.getD outerBody = s₁.memory.activeCallee.getD body := by
+      rw [h_meq.2.2.2.1]; rfl
+    rw [h_m2_ac, h_fr]
+    cases h_ph : isOtherPhase (s₁.memory.activeCallee.getD body).phase with
+    | true =>
+      simp only [h_ph, ite_true] at h_wp
+      exact False.elim h_wp
+    | false =>
+      simp only [h_ph, Bool.false_eq_true, ite_false] at h_wp ⊢
+      cases h_bb : get? (s₁.memory.activeCallee.getD body).basicBlocks s₁.frame.blockIdx with
+      | none =>
+        rw [h_bb] at h_wp
+        exact False.elim h_wp
+      | some bb =>
+        rw [h_bb] at h_wp
+        dsimp only at h_wp ⊢
+        have ⟨h_stmts, h_term⟩ := IsPureWithCalleesAtSomeDepth.block h_act h_bb
+        cases h_stmt : get? bb.statements s₁.frame.stmtIdx with
+        | some stmt =>
+          rw [h_stmt] at h_wp
+          dsimp only at h_wp ⊢
+          have h_s_bf := list_all_of_get? h_stmts h_stmt
+          have h_s := isPureStatement_of_isBorrowFreePureStatement h_s_bf
+          have h_inv_next :=
+            evalStmt_preserves_pureCalleeMachineInv
+              (localDecls := (s₁.memory.activeCallee.getD body).localDecls)
+              (layouts := (s₁.memory.activeCallee.getD body).layouts)
+              h_s h_inv_full
+          have h_ap2 : s₂.memory.activeProtectors = [] := by rw [h_meq.2.2.2.2, h_ap]
+          rcases evalStmt_borrowFree_pure_sim (s₂ := s₂) h_fr h_ap h_ap2 h_s_bf h_wp with
+            ⟨ns₁, ns₂, h_st₁, h_st₂, h_nfr, h_m₁, h_m₂⟩
+          rw [h_st₁] at h_wp h_inv_next
+          rw [h_st₂]
+          have h_dst_stk' : ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true := by
+            rw [h_m₁.2.2.1]; exact h_dst_stk
+          exact ih_run h_wp ⟨h_inv_next, h_dst_stk'⟩ ⟨h_nfr, StackedCallFrameAndTraits_step_rel h_meq h_m₁ h_m₂⟩
+        | none =>
+          rw [h_stmt] at h_wp
+          dsimp only at h_wp ⊢
+          by_cases h_len : (s₁.frame.stmtIdx == length bb.statements) = true
+          · simp only [h_len, ite_true] at h_wp ⊢
+            rcases bb with ⟨stmts, ⟨tkind, tspan⟩, isCl⟩
+            dsimp only at h_term
+            have ⟨h_step_inv, _⟩ :=
+              stepMirFn_pureCallee_step_and_replaceRoot
+                (mem₀ := pureCalleeMemory callees traitImpls)
+                h_inv_full rfl rfl rfl
+            rw [stepMirFn_eq_ite] at h_step_inv
+            dsimp only at h_step_inv
+            simp only [h_ph, Bool.false_eq_true, ite_false] at h_step_inv
+            rw [h_bb] at h_step_inv
+            dsimp only at h_step_inv
+            rw [h_stmt] at h_step_inv
+            dsimp only at h_step_inv
+            simp only [h_len, ite_true] at h_step_inv
+            cases h_pt : isPureTerminator tkind with
+            | true =>
+              exact pureCallee_pushCalleeFrame_step_pureTerm h_div_caller h_prot_caller ih_run h_cont
+                h_inv h_rel h_pt h_step_inv h_wp
+            | false =>
+              exact pureCallee_pushCalleeFrame_step_callTerm ih_run h_inv h_rel h_pt h_term h_step_inv h_wp
+          · simp only [h_len] at h_wp
+            exact False.elim h_wp
+
+theorem writeReturnDestination_of_writePureReturnDestination_pure
+    {callerLocals updatedEnv : List LocalSlot} {mem : Memory} {dst : Place}
+    {retVal : Value} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (h_pure : isPurePlace dst = true) (h_ap : mem.activeProtectors = [])
+    (h_pure_wr : writePureReturnDestination callerLocals dst retVal localDecls layouts = .ok updatedEnv) :
+    ∃ bs : List BorrowEntry,
+      writeReturnDestination callerLocals mem dst retVal localDecls layouts =
+        .ok updatedEnv { mem with borrows := bs } := by
+  rcases writeReturnDestination_pure_eq_withMem callerLocals mem dst retVal localDecls layouts h_pure h_ap with ⟨bs, h_eq⟩
+  refine ⟨bs, ?_⟩
+  rw [h_eq]
+  unfold writePureReturnDestination at h_pure_wr
+  cases h_w : writeReturnDestination callerLocals emptyMemory dst retVal localDecls layouts with
+  | ok env' _ =>
+    rw [h_w] at h_pure_wr
+    injection h_pure_wr with h_e
+    subst h_e
+    rfl
+  | ub => rw [h_w] at h_pure_wr; nomatch h_pure_wr
+  | unsupported => rw [h_w] at h_pure_wr; nomatch h_pure_wr
+
+theorem mirStepsConverges_pushCalleeFrame_pure
+    {contract : MirCallContract}
+    {body calleeBody : CapturedMir}
+    {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry}
+    {ps : PureState}
+    {m : Memory}
+    {envAfterArgs : List SlotState}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {argVals : List Value}
+    {unwind : UnwindAction}
+    {calleePost post : Value → Prop}
+    {maxCallDepth : Nat}
+    {Q : MirOutcome → Prop}
+    (hm : ModularRootMemory body callees traitImpls m)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_callee_pure : checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody argVals) calleePost traitImpls)
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePureReturnDestination envAfterArgs destination retVal body.localDecls body.layouts = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    MirStepsConverges body
+      (pushCalleeFrame (ps.toMachineState m) body envAfterArgs destination targetBb calleeBody argVals unwind)
+      (fun s' =>
+        ∃ (updatedEnv : List SlotState) (m' : Memory),
+          s' = PureState.toMachineState { bb := targetBb, stmtIdx := 0, env := updatedEnv } m' ∧
+          ModularRootMemory body callees traitImpls m' ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+      Q := by
+  rcases h_callee_summary with ⟨fuel_c, h_wp_c⟩
+  let s0 := ps.toMachineState m
+  let savedCaller : SavedCallerFrame := {
+    callerBody := body
+    frame := { s0.frame with locals := envAfterArgs }
+    destination := destination
+    returnTarget := targetBb
+    calleeProtectors := s0.memory.activeProtectors
+    returnUnwind := unwind
+    isDiverging := false
+  }
+  have h_prot_caller : restoreCallerProtectors savedCaller = [] := by
+    dsimp only [savedCaller, s0, PureState.toMachineState, restoreCallerProtectors]
+    rw [hm.2.2.2.2]
+  apply mirStepsConverges_of_wpMirExecStepsUpToSym
+  refine pureCallee_pushCalleeFrame_steps
+    (outerBody := body) (body := calleeBody)
+    (caller := savedCaller) (restStack := s0.memory.callStack)
+    (s₁ := (initPureState calleeBody argVals).toMachineState (pureCalleeMemory callees traitImpls))
+    rfl h_prot_caller
+    ⟨PureCalleeMachineInv.init (initPureState calleeBody argVals) ⟨maxCallDepth, h_callee_pure⟩,
+     fun _ hf => nomatch hf⟩
+    ⟨rfl, rfl, hm.1, hm.2.1, rfl, hm.2.2.2.2⟩
+    h_wp_c ?_
+  intro retVal memOut memOut₂ nLocals h_act_out h_cp h_meq' _
+  rcases h_after retVal h_cp with ⟨updEnv, h_wr_pure, h_next_mod⟩
+  let memPop : Memory := {
+    memOut₂ with
+    borrows := disableFrameBorrows memOut₂.borrows (length (savedCaller :: s0.memory.callStack)) nLocals
+    callStack := s0.memory.callStack
+    activeCallee := some body
+    activeProtectors := []
+  }
+  rcases writeReturnDestination_of_writePureReturnDestination_pure
+    (mem := memPop) h_dst_pure rfl h_wr_pure with ⟨bs', h_wr_m⟩
+  refine ⟨updEnv, { memPop with borrows := bs' }, h_wr_m, updEnv, { memPop with borrows := bs' }, rfl, ?_, h_next_mod⟩
+  have h_cal_out : memOut.callees = callees := by
+    rcases h_act_out with rfl | ⟨_, rfl⟩ <;> rfl
+  have h_tr_out : memOut.traitImpls = traitImpls := by
+    rcases h_act_out with rfl | ⟨_, rfl⟩ <;> rfl
+  exact ⟨h_meq'.2.1.trans h_cal_out, h_meq'.2.2.1.trans h_tr_out, hm.2.2.1, Or.inr rfl, rfl⟩
+
+private theorem sameExceptBorrows_step_callTerm
+    {fuel' : Nat} {body : CapturedMir}
+    {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {checkCallee : CapturedMir → Bool}
+    {s₁ s₂ : MachineState} {tkind : TerminatorKind} {tspan : String}
+    {P : Value → Prop}
+    (ih_run :
+      ∀ {ns₁ ns₂ : MachineState},
+        wpMirExecNoCallSym fuel' body (.running ns₁)
+          (mirNormalPost fun retVal mem' =>
+            ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal) →
+        (PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true) →
+        (ns₂.frame = ns₁.frame ∧ SameCallFrameAndTraits ns₁.memory ns₂.memory) →
+        wpMirExecNoCallSym fuel' body (.running ns₂)
+          (mirNormalPost fun retVal mem' =>
+            ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal))
+    (h_inv :
+      PureCalleeMachineInv callees traitImpls body s₁ ∧
+      ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (h_rel : s₂.frame = s₁.frame ∧ SameCallFrameAndTraits s₁.memory s₂.memory)
+    (h_pt : isPureTerminator tkind = false)
+    (h_term :
+      checkPureTerminatorWith callees (s₁.memory.activeCallee.getD body).layouts traitImpls
+        checkCallee tkind (s₁.memory.activeCallee.getD body).localDecls = true)
+    (h_step_inv :
+      pureNodeStepInv callees traitImpls body
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))))
+    (h_wp :
+      evalNodeNoCallWP
+        (fun st' =>
+          wpMirExecNoCallSym fuel' body st'
+            (mirNormalPost fun retVal mem' =>
+              ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))
+        (mirNormalPost fun retVal mem' =>
+          ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body)))) :
+    evalNodeNoCallWP
+      (fun st' =>
+        wpMirExecNoCallSym fuel' body st'
+          (mirNormalPost fun retVal mem' =>
+            ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal))
+      (mirNormalPost fun retVal mem' =>
+        ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal)
+      (evalTerminator s₂ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))) := by
+  rcases h_inv with ⟨⟨h_bor₁, _, _, h_ap, h_cal, h_tr, _, _⟩, h_dst_stk⟩
+  rcases h_rel with ⟨h_fr, h_meq⟩
+  rcases h_meq with ⟨mf_cal, mf_tr, mf_cs, mf_ac, mf_ap⟩
+  have h_meq_full : SameCallFrameAndTraits s₁.memory s₂.memory := ⟨mf_cal, mf_tr, mf_cs, mf_ac, mf_ap⟩
+  unfold checkPureTerminatorWith at h_term
+  simp only [h_pt, Bool.false_eq_true, ↓reduceIte] at h_term
+  cases tkind with
+  | call func argOps destination targetOpt unwind =>
+    simp only [Bool.and_eq_true] at h_term
+    rcases h_term with ⟨⟨h_dst, h_args⟩, h_ext⟩
+    cases h_def : extractPureCalleeTarget?
+        (s₁.memory.activeCallee.getD body).localDecls
+        (s₁.memory.activeCallee.getD body).layouts func with
+    | none => rw [h_def] at h_ext; exact False.elim (Bool.false_ne_true h_ext)
+    | some dt =>
+      rcases dt with ⟨defPath, typeArgs⟩
+      rw [h_def] at h_ext
+      dsimp only at h_ext
+      simp only [evalTerminator_call_eq_unified] at h_wp h_step_inv ⊢
+      dsimp only [evalCallTerminatorUnified, bodyLocalDeclsOf] at h_wp h_step_inv ⊢
+      have h_res₂ :=
+        resolveCallTarget_eq_of_extractPureCalleeTarget s₂ func (length argOps)
+          (s₁.memory.activeCallee.getD body).localDecls
+          (s₁.memory.activeCallee.getD body).layouts h_def
+      have h_res₁ :=
+        resolveCallTarget_eq_of_extractPureCalleeTarget s₁ func (length argOps)
+          (s₁.memory.activeCallee.getD body).localDecls
+          (s₁.memory.activeCallee.getD body).layouts h_def
+      rw [h_fr] at h_res₂
+      rw [h_res₂]
+      rw [h_res₁] at h_wp h_step_inv
+      cases h_rp : resolvePureCalleeTarget s₁.frame.locals func defPath typeArgs
+          (s₁.memory.activeCallee.getD body).layouts with
+      | ub => rw [h_rp] at h_wp; exact False.elim h_wp
+      | unsupported => rw [h_rp] at h_wp; exact False.elim h_wp
+      | ok rTarget localsAfterFunc =>
+        rw [h_rp] at h_wp h_step_inv
+        have h_rt := resolvePureCalleeTarget_ok_target h_rp
+        subst h_rt
+        dsimp only at h_wp h_step_inv ⊢
+        rw [evalOperands_pure_eq localsAfterFunc argOps s₂.memory.borrows
+          s₂.memory.globals (s₁.memory.activeCallee.getD body).layouts
+          s₂.memory.callerLocals h_args]
+        rw [evalOperands_pure_eq localsAfterFunc argOps s₁.memory.borrows
+          s₁.memory.globals (s₁.memory.activeCallee.getD body).layouts
+          s₁.memory.callerLocals h_args] at h_wp h_step_inv
+        cases h_ev : evalOperands localsAfterFunc argOps [] []
+            (s₁.memory.activeCallee.getD body).layouts [] with
+        | ub => rw [h_ev] at h_wp; cases targetOpt <;> exact False.elim h_wp
+        | unsupported => rw [h_ev] at h_wp; cases targetOpt <;> exact False.elim h_wp
+        | ok argVals locals' =>
+          rw [h_ev] at h_wp h_step_inv
+          cases targetOpt with
+          | none =>
+            dsimp only at h_wp h_step_inv ⊢
+            rw [h_cal, h_tr] at h_wp h_step_inv
+            rw [mf_cal, mf_tr, h_cal, h_tr]
+            cases h_lk : lookupCallee callees
+                (s₁.memory.activeCallee.getD body).layouts defPath typeArgs traitImpls with
+            | some calleeBody =>
+              rw [h_lk] at h_wp h_step_inv
+              dsimp only [checkCalleeTargetCompatible, pushDivergingCalleeFrame] at h_wp h_step_inv ⊢
+              refine ih_run h_wp ⟨h_step_inv, ?_⟩ ⟨rfl, ?_⟩
+              · intro f hf
+                cases hf with
+                | head => exact h_dst
+                | tail _ hm => exact h_dst_stk f hm
+              · exact ⟨mf_cal, mf_tr, by dsimp only; rw [h_fr, mf_ap, mf_cs], rfl, mf_ap⟩
+            | none =>
+              rw [h_lk] at h_ext h_wp h_step_inv
+              dsimp only at h_ext h_wp h_step_inv ⊢
+              cases h_unr : isUnreachableCallTarget defPath with
+              | true => rw [h_unr] at h_wp; exact False.elim h_wp
+              | false =>
+                rw [h_unr] at h_ext h_wp h_step_inv
+                dsimp only at h_wp h_step_inv ⊢
+                cases h_ab : isAbortingPanicDefPath defPath with
+                | true => rw [h_ab] at h_wp; exact False.elim h_wp
+                | false =>
+                  rw [h_ab] at h_ext h_wp h_step_inv
+                  simp only [Bool.false_or] at h_ext
+                  dsimp only at h_wp h_step_inv ⊢
+                  rw [h_ext] at h_wp h_step_inv ⊢
+                  exact applyUnwindAction_sameFrame_sim ih_run h_meq_full h_dst_stk h_wp h_step_inv
+          | some targetBb =>
+            dsimp only at h_wp h_step_inv ⊢
+            rw [h_cal, h_tr] at h_wp h_step_inv
+            rw [mf_cal, mf_tr, h_cal, h_tr]
+            cases h_lk : lookupCallee callees
+                (s₁.memory.activeCallee.getD body).layouts defPath typeArgs traitImpls with
+            | some calleeBody =>
+              rw [h_lk] at h_wp h_step_inv
+              dsimp only [checkCalleeTargetCompatible, pushCalleeFrame] at h_wp h_step_inv ⊢
+              refine ih_run h_wp ⟨h_step_inv, ?_⟩ ⟨rfl, ?_⟩
+              · intro f hf
+                cases hf with
+                | head => exact h_dst
+                | tail _ hm => exact h_dst_stk f hm
+              · exact ⟨mf_cal, mf_tr, by dsimp only; rw [h_fr, mf_ap, mf_cs], rfl, mf_ap⟩
+            | none =>
+              rw [h_lk] at h_ext h_wp h_step_inv
+              dsimp only at h_ext
+              dsimp only [isDirectExactDivTarget] at h_wp h_step_inv ⊢
+              rw [h_ext] at h_wp h_step_inv ⊢
+              dsimp only at h_wp h_step_inv ⊢
+              rcases evalExactDiv_pure_sim h_dst h_wp with
+                ⟨lhsSc, rhsSc, retSc, isSigned, updL, rfl, h_sgn, h_d, h_w⟩
+              dsimp only at h_wp h_step_inv ⊢
+              rw [h_sgn] at h_wp h_step_inv ⊢
+              dsimp only at h_wp h_step_inv ⊢
+              rw [h_d] at h_wp h_step_inv ⊢
+              dsimp only at h_wp h_step_inv ⊢
+              rw [writeIntrinsicReturn_pure_eq _ locals' destination targetBb (.scalar retSc) h_dst] at h_wp h_step_inv
+              rw [writeIntrinsicReturn_pure_eq _ locals' destination targetBb (.scalar retSc) h_dst]
+              rw [h_w] at h_wp h_step_inv ⊢
+              have h_id₁ : invalidateDirectDestWriteBorrows s₁.memory locals' destination = s₁.memory := by
+                unfold invalidateDirectDestWriteBorrows; rw [h_bor₁]
+              rw [h_id₁] at h_wp h_step_inv
+              exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩
+                ⟨rfl, h_meq_full.withDirectDestBorrowsRhs locals' destination⟩
+  | tailCall func argOps =>
+    have h_ap2 : s₂.memory.activeProtectors = [] := by rw [mf_ap, h_ap]
+    rcases evalTailCall_pure_sim h_fr h_ap h_ap2 h_cal (mf_cal.trans h_cal) h_tr (mf_tr.trans h_tr) h_term h_wp with
+      ⟨calleeBody, argVals, bs₁, bs₂, h_t1, h_t2⟩
+    rw [h_t1] at h_wp h_step_inv
+    rw [h_t2]
+    dsimp only [enterTailCalleeFrame, MirStepNode.step, evalNodeNoCallWP, pureNodeStepInv] at h_wp h_step_inv ⊢
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, mf_cal, mf_tr, mf_cs, rfl, mf_ap⟩
+  | _ => exact False.elim (Bool.false_ne_true h_term)
+
+private theorem sameExceptBorrows_step_pureTerm
+    {fuel' : Nat} {body : CapturedMir}
+    {callees : List CapturedMir} {traitImpls : List TraitImplEntry}
+    {s₁ s₂ : MachineState} {tkind : TerminatorKind} {tspan : String}
+    {P : Value → Prop}
+    (ih_run :
+      ∀ {ns₁ ns₂ : MachineState},
+        wpMirExecNoCallSym fuel' body (.running ns₁)
+          (mirNormalPost fun retVal mem' =>
+            ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal) →
+        (PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true) →
+        (ns₂.frame = ns₁.frame ∧ SameCallFrameAndTraits ns₁.memory ns₂.memory) →
+        wpMirExecNoCallSym fuel' body (.running ns₂)
+          (mirNormalPost fun retVal mem' =>
+            ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal))
+    (h_inv :
+      PureCalleeMachineInv callees traitImpls body s₁ ∧
+      ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true)
+    (h_rel : s₂.frame = s₁.frame ∧ SameCallFrameAndTraits s₁.memory s₂.memory)
+    (h_pt : isPureTerminator tkind = true)
+    (h_step_inv :
+      pureNodeStepInv callees traitImpls body
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))))
+    (h_wp :
+      evalNodeNoCallWP
+        (fun st' =>
+          wpMirExecNoCallSym fuel' body st'
+            (mirNormalPost fun retVal mem' =>
+              ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))
+        (mirNormalPost fun retVal mem' =>
+          ActiveRootMemory body (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)
+        (evalTerminator s₁ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body)))) :
+    evalNodeNoCallWP
+      (fun st' =>
+        wpMirExecNoCallSym fuel' body st'
+          (mirNormalPost fun retVal mem' =>
+            ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal))
+      (mirNormalPost fun retVal mem' =>
+        ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal)
+      (evalTerminator s₂ ⟨tkind, tspan⟩ (some (s₁.memory.activeCallee.getD body))) := by
+  rcases h_inv with ⟨⟨_, _, _, h_ap, _, _, _, h_stack⟩, h_dst_stk⟩
+  rcases h_rel with ⟨h_fr, h_meq⟩
+  rcases h_meq with ⟨mf_cal, mf_tr, mf_cs, mf_ac, mf_ap⟩
+  have h_meq_full : SameCallFrameAndTraits s₁.memory s₂.memory := ⟨mf_cal, mf_tr, mf_cs, mf_ac, mf_ap⟩
+  cases tkind with
+  | goto target =>
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [h_fr]
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+  | unreachable => exact False.elim h_wp
+  | unwindTerminate => exact False.elim h_wp
+  | inlineAsm => cases h_pt
+  | call _ _ _ _ _ => cases h_pt
+  | tailCall _ _ => cases h_pt
+  | drop p target unwind =>
+    rcases evalDrop_pure_sim (s₂ := s₂) h_fr h_wp with ⟨f', h_d1, h_d2⟩
+    rw [h_d1] at h_wp h_step_inv
+    rw [h_d2]
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+  | unwindResume =>
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [mf_cs]
+    have hu := unwindFromCallStack_sameFrame_eq s₁.memory.callStack s₁.memory s₂.memory h_meq_full h_dst_stk
+    cases h_u1 : unwindFromCallStack s₁.memory.callStack s₁.memory <;>
+      cases h_u2 : unwindFromCallStack s₁.memory.callStack s₂.memory <;>
+      rw [h_u1, h_u2] at hu <;>
+      try exact False.elim hu
+    · rw [h_u1] at h_wp h_step_inv
+      rcases hu with ⟨hfr', hmeq', hdst'⟩
+      exact ih_run h_wp ⟨h_step_inv, hdst'⟩ ⟨hfr', hmeq'⟩
+    · rw [h_u1] at h_wp
+      rcases hu with ⟨_, rfl | rfl⟩ <;> exact False.elim h_wp
+    · rw [h_u1] at h_wp
+      exact False.elim h_wp
+  | return_ =>
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [h_fr, mf_cs]
+    cases h_g : get? s₁.frame.locals 0 with
+    | none => rw [h_g] at h_wp; exact False.elim h_wp
+    | some sl =>
+      rw [h_g] at h_wp h_step_inv
+      cases sl with
+      | uninit => exact False.elim h_wp
+      | dead => exact False.elim h_wp
+      | init retVal =>
+        have h_ap2 : s₂.memory.activeProtectors = [] := by rw [mf_ap, h_ap]
+        dsimp only at h_wp h_step_inv ⊢
+        rw [hasFrameDeallocProtectorConflict_of_eq_nil h_ap] at h_wp h_step_inv
+        rw [hasFrameDeallocProtectorConflict_of_eq_nil h_ap2]
+        dsimp only at h_wp h_step_inv ⊢
+        cases h_cs : s₁.memory.callStack with
+        | nil =>
+          rw [h_cs] at h_wp
+          dsimp only [MirStepNode.retNormal, evalNodeNoCallWP, mirNormalPost] at h_wp ⊢
+          rcases h_wp with ⟨h_act₁, hp₁⟩
+          refine ⟨?_, hp₁⟩
+          dsimp only [ModularCalleeOutMemory]
+          rw [mf_cal, mf_tr, mf_ap]
+          rcases h_act₁ with h_eq1 | ⟨_, h_eq1⟩ <;>
+            (have hc := congrArg Memory.callees h_eq1;
+             have ht := congrArg Memory.traitImpls h_eq1;
+             have hap := congrArg Memory.activeProtectors h_eq1;
+             rw [hc, ht, hap];
+             exact ⟨rfl, rfl, rfl, rfl⟩)
+        | cons caller rest =>
+          rw [h_cs] at h_wp h_step_inv h_dst_stk
+          dsimp only at h_wp h_step_inv ⊢
+          cases h_div : caller.isDiverging with
+          | true => rw [h_div] at h_wp; exact False.elim h_wp
+          | false =>
+            rw [h_div] at h_wp h_step_inv
+            dsimp only at h_wp h_step_inv ⊢
+            have h_cdst : isPurePlace caller.destination = true :=
+              h_dst_stk caller (List.Mem.head rest)
+            have h_hd := h_stack caller (by rw [h_cs]; exact List.Mem.head rest)
+            have h_prot_nil : restoreCallerProtectors caller = [] := by
+              rcases h_hd with ⟨hp1, hp2, _⟩
+              simp [restoreCallerProtectors, hp1, hp2]
+            rw [h_prot_nil] at h_wp h_step_inv ⊢
+            let memPop₁ : Memory :=
+              { s₁.memory with
+                borrows := disableFrameBorrows s₁.memory.borrows (length (caller :: rest)) (length s₁.frame.locals)
+                callStack := rest
+                activeCallee := .some caller.callerBody
+                activeProtectors := [] }
+            let memPop₂ : Memory :=
+              { s₂.memory with
+                borrows := disableFrameBorrows s₂.memory.borrows (length (caller :: rest)) (length s₁.frame.locals)
+                callStack := rest
+                activeCallee := .some caller.callerBody
+                activeProtectors := [] }
+            rcases writeReturnDestination_pure_eq_withMem
+              caller.frame.locals memPop₂ caller.destination retVal
+              caller.callerBody.localDecls caller.callerBody.layouts
+              h_cdst rfl with ⟨bs₂, h_w2⟩
+            rcases writeReturnDestination_pure_eq_withMem
+              caller.frame.locals memPop₁ caller.destination retVal
+              caller.callerBody.localDecls caller.callerBody.layouts
+              h_cdst rfl with ⟨bs₁, h_w1⟩
+            rw [h_w2]
+            rw [h_w1] at h_wp h_step_inv
+            cases h_w : writeReturnDestination caller.frame.locals emptyMemory
+                caller.destination retVal caller.callerBody.localDecls
+                caller.callerBody.layouts with
+            | ub => rw [h_w] at h_wp; exact False.elim h_wp
+            | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
+            | ok updL _ =>
+              rw [h_w] at h_wp h_step_inv
+              dsimp only [FrameWriteResult.withMem] at h_wp h_step_inv ⊢
+              exact ih_run h_wp ⟨h_step_inv, fun f hf => h_dst_stk f (List.Mem.tail caller hf)⟩
+                ⟨rfl, mf_cal, mf_tr, rfl, rfl, rfl⟩
+  | switchInt discr targets =>
+    dsimp only [isPureTerminator] at h_pt
+    rcases evalSwitchInt_pure_sim (s₂ := s₂) h_fr h_pt h_wp with ⟨obs, f', h_s1, h_s2⟩
+    rw [h_s1] at h_wp h_step_inv
+    rw [h_s2]
+    dsimp only [MirStepNode.emitStep, evalNodeNoCallWP, pureNodeStepInv] at h_wp h_step_inv ⊢
+    exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+  | assert cond expected target unwind =>
+    dsimp only [isPureTerminator] at h_pt
+    dsimp only [evalTerminator] at h_wp h_step_inv ⊢
+    rw [h_fr]
+    rw [evalOperand_pure_eq s₁.frame.locals cond s₂.memory.borrows
+      s₂.memory.globals (s₁.memory.activeCallee.getD body).layouts
+      s₂.memory.callerLocals h_pt]
+    rw [evalOperand_pure_eq s₁.frame.locals cond s₁.memory.borrows
+      s₁.memory.globals (s₁.memory.activeCallee.getD body).layouts
+      s₁.memory.callerLocals h_pt] at h_wp h_step_inv
+    cases h_ev : evalOperand s₁.frame.locals cond [] []
+        (s₁.memory.activeCallee.getD body).layouts [] with
+    | ub => rw [h_ev] at h_wp; exact False.elim h_wp
+    | unsupported => rw [h_ev] at h_wp; exact False.elim h_wp
+    | ok val l' =>
+      rw [h_ev] at h_wp h_step_inv
+      cases val with
+      | scalar sc =>
+        cases expected <;> dsimp only [BEq.beq] at h_wp h_step_inv ⊢
+        · revert h_wp h_step_inv
+          cases Nat.beq sc.bits 0 with
+          | true =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+          | false =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact applyUnwindAction_sameFrame_sim ih_run h_meq_full h_dst_stk h_wp h_step_inv
+        · revert h_wp h_step_inv
+          cases Nat.beq sc.bits 1 with
+          | true =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact ih_run h_wp ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq_full⟩
+          | false =>
+            intro h_step_inv h_wp
+            dsimp only at h_wp h_step_inv ⊢
+            exact applyUnwindAction_sameFrame_sim ih_run h_meq_full h_dst_stk h_wp h_step_inv
+      | _ => exact False.elim h_wp
+
+theorem sameExceptBorrows_step_noCall
+    {fuel : Nat} {body : CapturedMir} {callees : List CapturedMir}
+    {traitImpls : List TraitImplEntry}
+    {st₁ st₂ : MirExecState} {P : Value → Prop}
+    (h_inv :
+      match st₁ with
+      | .running s₁ =>
+        PureCalleeMachineInv callees traitImpls body s₁ ∧
+        ∀ f ∈ s₁.memory.callStack, isPurePlace f.destination = true
+      | _ => True)
+    (h_rel :
+      match st₁, st₂ with
+      | .running s₁, .running s₂ =>
+        s₂.frame = s₁.frame ∧
+        SameCallFrameAndTraits s₁.memory s₂.memory
+      | .halted (.normal (v₁, m₁)), .halted (.normal (v₂, m₂)) =>
+        v₂ = v₁ ∧ SameCallFrameAndTraits m₁ m₂
+      | .halted .panic, .halted .panic => True
+      | .halted .abort, .halted .abort => True
+      | .faulted fk₁, .faulted fk₂ => fk₂ = fk₁
+      | _, _ => False)
+    (h_wp :
+      wpMirExecNoCallSym fuel body st₁
+        (mirNormalPost
+          (fun retVal mem' =>
+            ActiveRootMemory body
+              (pureCalleeMemory callees traitImpls) mem' ∧ P retVal))) :
+    wpMirExecNoCallSym fuel body st₂
+      (mirNormalPost
+        (fun retVal mem' =>
+          ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal)) := by
+  induction fuel generalizing st₁ st₂ with
+  | zero => exact False.elim h_wp
+  | succ fuel' ih =>
+    have ih_run {ns₁ ns₂ : MachineState}
+        (hw :
+          wpMirExecNoCallSym fuel' body (.running ns₁)
+            (mirNormalPost
+              (fun retVal mem' =>
+                ActiveRootMemory body
+                  (pureCalleeMemory callees traitImpls) mem' ∧ P retVal)))
+        (hi :
+          PureCalleeMachineInv callees traitImpls body ns₁ ∧
+          ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true)
+        (hr : ns₂.frame = ns₁.frame ∧ SameCallFrameAndTraits ns₁.memory ns₂.memory) :
+        wpMirExecNoCallSym fuel' body (.running ns₂)
+          (mirNormalPost
+            (fun retVal mem' =>
+              ModularCalleeOutMemory callees traitImpls mem' ∧ P retVal)) :=
+      ih (st₁ := .running ns₁) (st₂ := .running ns₂) hi hr hw
+    unfold wpMirExecNoCallSym at h_wp ⊢
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval] at h_wp ⊢
+    cases st₁ with
+    | faulted _ => exact False.elim h_wp
+    | halted out₁ =>
+      cases out₁ with
+      | panic => exact False.elim h_wp
+      | abort => exact False.elim h_wp
+      | normal rv₁ =>
+        rcases rv₁ with ⟨v₁, m₁⟩
+        cases st₂ with
+        | running _ => exact False.elim h_rel
+        | faulted _ => exact False.elim h_rel
+        | halted out₂ =>
+          cases out₂ with
+          | panic => exact False.elim h_rel
+          | abort => exact False.elim h_rel
+          | normal rv₂ =>
+            rcases rv₂ with ⟨v₂, m₂⟩
+            rcases h_rel with ⟨rfl, hc, ht, hcs, _, hap⟩
+            rcases h_wp with ⟨h_act₁, hp₁⟩
+            refine ⟨?_, hp₁⟩
+            dsimp only [ModularCalleeOutMemory]
+            rw [hc, ht, hcs, hap]
+            rcases h_act₁ with rfl | ⟨_, rfl⟩ <;>
+              exact ⟨rfl, rfl, rfl, rfl⟩
+    | running s₁ =>
+      cases st₂ with
+      | halted _ => exact False.elim h_rel
+      | faulted _ => exact False.elim h_rel
+      | running s₂ =>
+        have h_fr := h_rel.1
+        have h_meq := h_rel.2
+        have h_inv_full := h_inv.1
+        have h_dst_stk := h_inv.2
+        have h_ap := h_inv_full.2.2.2.1
+        have h_act := h_inv_full.2.2.2.2.2.2.1
+        dsimp only [stepMirState] at h_wp ⊢
+        rw [stepMirFn_eq_ite] at h_wp
+        rw [stepMirFn_eq_ite]
+        dsimp only at h_wp ⊢
+        rw [h_meq.2.2.2.1, h_fr]
+        cases h_ph : isOtherPhase (s₁.memory.activeCallee.getD body).phase with
+        | true =>
+          simp only [h_ph, ite_true] at h_wp
+          exact False.elim h_wp
+        | false =>
+          simp only [h_ph, Bool.false_eq_true, ite_false] at h_wp ⊢
+          cases h_bb : get? (s₁.memory.activeCallee.getD body).basicBlocks s₁.frame.blockIdx with
+          | none =>
+            rw [h_bb] at h_wp
+            exact False.elim h_wp
+          | some bb =>
+            rw [h_bb] at h_wp
+            dsimp only at h_wp ⊢
+            have ⟨h_stmts, h_term⟩ := IsPureWithCalleesAtSomeDepth.block h_act h_bb
+            cases h_stmt : get? bb.statements s₁.frame.stmtIdx with
+            | some stmt =>
+              rw [h_stmt] at h_wp
+              dsimp only at h_wp ⊢
+              have h_s_bf := list_all_of_get? h_stmts h_stmt
+              have h_s := isPureStatement_of_isBorrowFreePureStatement h_s_bf
+              have h_inv_next :=
+                evalStmt_preserves_pureCalleeMachineInv
+                  (localDecls := (s₁.memory.activeCallee.getD body).localDecls)
+                  (layouts := (s₁.memory.activeCallee.getD body).layouts)
+                  h_s h_inv_full
+              have h_ap2 : s₂.memory.activeProtectors = [] := by rw [h_meq.2.2.2.2, h_ap]
+              rcases evalStmt_borrowFree_pure_sim (s₂ := s₂) h_fr h_ap h_ap2 h_s_bf h_wp with
+                ⟨ns₁, ns₂, h_st₁, h_st₂, h_nfr, h_m₁, h_m₂⟩
+              rw [h_st₁] at h_wp h_inv_next
+              rw [h_st₂]
+              have h_dst_stk' : ∀ f ∈ ns₁.memory.callStack, isPurePlace f.destination = true := by
+                rw [h_m₁.2.2.1]; exact h_dst_stk
+              exact ih_run h_wp ⟨h_inv_next, h_dst_stk'⟩ ⟨h_nfr, SameCallFrameAndTraits_step_rel h_meq h_m₁ h_m₂⟩
+            | none =>
+              rw [h_stmt] at h_wp
+              dsimp only at h_wp ⊢
+              by_cases h_len : (s₁.frame.stmtIdx == length bb.statements) = true
+              · simp only [h_len, ite_true] at h_wp ⊢
+                rcases bb with ⟨stmts, ⟨tkind, tspan⟩, isCl⟩
+                dsimp only at h_term
+                have ⟨h_step_inv, _⟩ :=
+                  stepMirFn_pureCallee_step_and_replaceRoot
+                    (mem₀ := pureCalleeMemory callees traitImpls)
+                    h_inv_full rfl rfl rfl
+                rw [stepMirFn_eq_ite] at h_step_inv
+                dsimp only at h_step_inv
+                simp only [h_ph, Bool.false_eq_true, ite_false] at h_step_inv
+                rw [h_bb] at h_step_inv
+                dsimp only at h_step_inv
+                rw [h_stmt] at h_step_inv
+                dsimp only at h_step_inv
+                simp only [h_len, ite_true] at h_step_inv
+                cases h_pt : isPureTerminator tkind with
+                | true =>
+                  exact sameExceptBorrows_step_pureTerm ih_run h_inv h_rel h_pt h_step_inv h_wp
+                | false =>
+                  exact sameExceptBorrows_step_callTerm ih_run h_inv h_rel h_pt h_term h_step_inv h_wp
+              · simp only [h_len] at h_wp
+                exact False.elim h_wp
+
+/--
+Compositional 1-step inlined-callee summary rule inside modular callers
+(`PureMirModularConverges.call_summary`, `FF-2.2` Section 2 & 4):
+resolves direct or polymorphic `(defPath, typeArgs)` callees in `callees`
+using an established `PureMirConvergesWithCallees` summary (with
+`checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true`)
+and advances the modular caller directly to `{ bb := targetBb, stmtIdx := 0, env
+:= updatedEnv }`
+in **1 compositional step**, even when `m.borrows` is non-empty after a prior
+`#[external_spec]` call.
+-/
+theorem PureMirModularConverges.call_summary
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleeBody : CapturedMir}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    {maxCallDepth : Nat}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_depth : 0 < maxCallDepth := by
+      first | decide | exact Nat.zero_lt_succ 31)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls =
+        some calleeBody)
+    (h_callee_pure :
+      checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody argVals) calleePost traitImpls)
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePureReturnDestination envAfterArgs destination retVal body.localDecls body.layouts = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  let _ := h_depth
+  intro m hm
+  let s0 := ps.toMachineState m
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body s0 =
+        MirStepNode.step
+          (pushCalleeFrame s0 body envAfterArgs destination targetBb
+            calleeBody argVals unwind) := by
+    unfold stepMirFn
+    dsimp only [s0, PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf,
+        resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      rfl
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.step, Trusted.ITree.ITreeF.map]
+  refine dwp_modular_bind_steps
+    (mirStepsConverges_pushCalleeFrame_pure hm h_dst_pure h_callee_pure h_callee_summary h_after)
+    ?_
+  rintro s' ⟨updEnv, m', rfl, hm', h_next_mod⟩
+  exact h_next_mod m' hm'
+
+/--
+Compositional 1-step inlined-callee `tailCall` summary rule inside modular
+callers (`PureMirModularConverges.tailCall_summary`):
+resolves direct or polymorphic `(defPath, typeArgs)` callees in `callees`
+using an established `PureMirConvergesWithCallees` summary and converges in
+**1 compositional step**, even when `m.borrows` is non-empty after a prior
+`#[external_spec]` call.
+-/
+theorem PureMirModularConverges.tailCall_summary
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleeBody : CapturedMir}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    {maxCallDepth : Nat}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_depth : 0 < maxCallDepth := by
+      first | decide | exact Nat.zero_lt_succ 31)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls =
+        some calleeBody)
+    (h_callee_pure :
+      checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody argVals) calleePost traitImpls)
+    (h_imp : ∀ retVal : Value, calleePost retVal → post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  let _ := h_depth
+  intro m hm
+  let s0 := ps.toMachineState m
+  let mTd : Memory :=
+    { m with borrows := disableFrameBorrows m.borrows (length m.callStack) (length ps.env) }
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body s0 =
+        MirStepNode.step (enterTailCalleeFrame mTd calleeBody argVals) := by
+    unfold stepMirFn
+    dsimp only [s0, PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf,
+        resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      have h_lk_m :
+          lookupCallee m.callees body.layouts defPath (extractCalleeTypeArgs func) m.traitImpls =
+            some calleeBody := by
+        rw [hm.1, hm.2.1, h_lookup]
+      rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
+      rfl
+  rcases h_callee_summary with ⟨fuel_c, h_wp_c⟩
+  have h_callee_m :
+      wpMirExecNoCallSym fuel_c calleeBody
+        (.running (initMachineStateWithMemory calleeBody argVals
+          { mTd with callStack := [], activeCallee := none }))
+        (mirNormalPost
+          (fun retVal memOut =>
+            ModularCalleeOutMemory callees traitImpls memOut ∧
+            calleePost retVal)) :=
+    sameExceptBorrows_step_noCall
+      (st₁ := .running ((initPureState calleeBody argVals).toMachineState
+        (pureCalleeMemory callees traitImpls)))
+      ⟨PureCalleeMachineInv.init (initPureState calleeBody argVals)
+        ⟨maxCallDepth, h_callee_pure⟩, fun _ hf => nomatch hf⟩
+      ⟨rfl, hm.1, hm.2.1, rfl, rfl, hm.2.2.2.2⟩
+      h_wp_c
+  have h_pushed :=
+    wpMirExecNoCallSym_pushBaseStack_nil_outer (outerBody := body) h_callee_m
+  have h_state_eq :
+      MirExecState.pushBaseStack calleeBody []
+        (.running (initMachineStateWithMemory calleeBody argVals
+          { mTd with callStack := [], activeCallee := none })) =
+      .running (enterTailCalleeFrame mTd calleeBody argVals) := by
+    have h_cs := hm.2.2.1
+    cases m
+    dsimp only [mTd] at h_cs ⊢
+    subst h_cs
+    rfl
+  rw [h_state_eq] at h_pushed
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.step, Trusted.ITree.ITreeF.map]
+  refine dwp_modular_of_noCallWp ⟨fuel_c, wpMirExecNoCallSym_mono_post ?_ h_pushed⟩
+  intro out h_out
+  cases out with
+  | panic => exact False.elim h_out
+  | abort => exact False.elim h_out
+  | normal rv =>
+    rcases rv with ⟨retVal, _⟩
+    rcases h_out with ⟨_, _, _, h_cp⟩
+    exact h_imp retVal h_cp
+
+/-- 1-step `switchInt` terminator rule for `PureMirModularConverges`. -/
+theorem PureMirModularConverges.step_switchInt
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {discr : Operand} {targets : SwitchTargets}
+    {sc : ScalarInt} {env' : List SlotState}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .switchInt discr targets)
+    (h_pure : isPureOperand discr = true)
+    (h_eval : evalPureOperand ps.env discr body.layouts = .ok (.scalar sc) env')
+    (h_next :
+      PureMirModularConverges contract body callees
+        { bb := lookupSwitchTarget sc.bits targets.branches targets.otherwise
+          stmtIdx := 0
+          env := env' }
+        post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator]
+    rw [evalOperand_pure_eq ps.env discr m.borrows m.globals body.layouts
+      m.callerLocals h_pure]
+    unfold evalPureOperand at h_eval
+    rw [h_eval]
+    exact h_next m hm
+
+/--
+1-step `assert` terminator rule for `PureMirModularConverges`: handles both
+passing assertions (`sc.bits == expectedBit`, stepping to `targetBb`) and
+runtime-panicking/aborting/cleanup assertions (`sc.bits != expectedBit` under
+`mirSafePost`).
+-/
+theorem PureMirModularConverges.step_assert
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {cond : Operand} {expected : Bool}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {sc : ScalarInt} {env' : List SlotState}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .assert cond expected targetBb unwind)
+    (h_pure : isPureOperand cond = true)
+    (h_eval : evalPureOperand ps.env cond body.layouts = .ok (.scalar sc) env')
+    (h_pass :
+      Nat.beq sc.bits (if expected then 1 else 0) = true →
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := env' } post traitImpls)
+    (h_fail :
+      Nat.beq sc.bits (if expected then 1 else 0) = false →
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      ∃ cleanupBb : BasicBlockIdx,
+        unwind = .cleanup cleanupBb ∧
+        PureMirModularConverges contract body callees
+          { bb := cleanupBb, stmtIdx := 0, env := env' } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator]
+    rw [evalOperand_pure_eq ps.env cond m.borrows m.globals body.layouts
+      m.callerLocals h_pure]
+    unfold evalPureOperand at h_eval
+    rw [h_eval]
+    cases expected <;> dsimp only at h_pass h_fail ⊢
+    all_goals
+      cases h_cond : Nat.beq sc.bits _ with
+      | true =>
+        exact h_pass h_cond m hm
+      | false =>
+        rcases h_fail h_cond with rfl | rfl | ⟨cleanupBb, rfl, h_clean⟩
+        · dsimp only [applyUnwindAction]
+          rw [hm.2.2.1]
+          dsimp only [unwindFromCallStack, MirStepNode.retOutcome,
+            Trusted.ITree.ITreeF.map]
+          trivial
+        · dsimp only [applyUnwindAction, MirStepNode.retOutcome,
+            Trusted.ITree.ITreeF.map]
+          trivial
+        · dsimp only [applyUnwindAction]
+          exact h_clean m hm
+
+/--
+1-step `drop` terminator rule for `PureMirModularConverges` (valid even when
+`m.borrows` is non-empty after a prior `#[external_spec]` call).
+-/
+theorem PureMirModularConverges.step_drop
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {place : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {s_emp : MachineState} {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .drop place targetBb unwind)
+    (h_eval :
+      evalTerminator (ps.toMachineState emptyMemory) bb.terminator (some body) =
+        MirStepNode.step s_emp)
+    (h_next :
+      PureMirModularConverges contract body callees
+        (PureState.ofMachineState s_emp) post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_drop_m :
+      evalTerminator (ps.toMachineState m) bb.terminator (some body) =
+        MirStepNode.step ((PureState.ofMachineState s_emp).toMachineState m) := by
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    rcases place with ⟨loc, proj⟩
+    dsimp only at h_term
+    subst h_term
+    unfold evalTerminator at h_eval ⊢
+    dsimp only [PureState.toMachineState] at h_eval ⊢
+    cases h_g : get? ps.env loc with
+    | none => rw [h_g] at h_eval; nomatch h_eval
+    | some sl =>
+      rw [h_g] at h_eval
+      cases sl with
+      | dead => nomatch h_eval
+      | uninit =>
+        cases proj with
+        | nil =>
+          dsimp only at h_eval ⊢
+          cases h_s : set? ps.env loc .uninit with
+          | none => rw [h_s] at h_eval; nomatch h_eval
+          | some _ =>
+            rw [h_s] at h_eval
+            dsimp only at h_eval ⊢
+            injection h_eval with h_se
+            injection h_se with h_eq
+            subst h_eq
+            rfl
+        | cons _ _ => nomatch h_eval
+      | init rv =>
+        cases proj with
+        | nil =>
+          dsimp only at h_eval ⊢
+          cases h_s : set? ps.env loc .uninit with
+          | none => rw [h_s] at h_eval; nomatch h_eval
+          | some _ =>
+            rw [h_s] at h_eval
+            dsimp only at h_eval ⊢
+            injection h_eval with h_se
+            injection h_se with h_eq
+            subst h_eq
+            rfl
+        | cons hd tl =>
+          dsimp only at h_eval ⊢
+          cases h_rd : readProjectedValue ps.env rv (hd :: tl) with
+          | ub => rw [h_rd] at h_eval; nomatch h_eval
+          | unsupported => rw [h_rd] at h_eval; nomatch h_eval
+          | ok _ =>
+            rw [h_rd] at h_eval
+            dsimp only at h_eval ⊢
+            injection h_eval with h_se
+            injection h_se with h_eq
+            subst h_eq
+            rfl
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState] at h_drop_m ⊢
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rw [h_drop_m]
+    exact h_next m hm
+
+/--
+1-step inline `core::intrinsics::exact_div` call rule for
+`PureMirModularConverges` (when `"core::intrinsics::exact_div"` is un-shadowed
+in `callees`).
+-/
+theorem PureMirModularConverges.call_exact_div
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {func : Operand}
+    {argOps : List Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {defPath : DefPath} {lhs rhs retScalar : ScalarInt}
+    {isSigned : Bool}
+    {envAfterArgs updatedEnv : List SlotState}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_exact_path : stringEq defPath "core::intrinsics::exact_div" = true := by decide)
+    (h_args :
+      evalPureOperands ps.env argOps body.layouts =
+        .ok [.scalar lhs, .scalar rhs] envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_signed :
+      resolveIntrinsicIsSigned
+        { defPath := defPath
+          typeArgs := extractCalleeTypeArgs func
+          fnSig := .none
+          isIndirect := false }
+        body.localDecls body.layouts argOps = some isSigned := by rfl)
+    (h_div : evalExactDiv lhs rhs isSigned = some retScalar)
+    (h_wr :
+      writePurePlaceValue envAfterArgs destination (.scalar retScalar) =
+        .ok updatedEnv)
+    (h_next :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.step
+          (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState
+            (invalidateDirectDestWriteBorrows m envAfterArgs destination)) := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_exact_path]
+      dsimp only
+      rw [h_signed]
+      dsimp only
+      rw [h_div]
+      dsimp only
+      rw [writeIntrinsicReturn_pure_eq _ envAfterArgs destination targetBb
+        (.scalar retScalar) h_dst_pure]
+      unfold writePurePlaceValue at h_wr
+      rw [h_wr]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  exact h_next _ (hm.withDirectDestBorrows envAfterArgs destination)
+
+/--
+Generalized 1-step inlined-callee summary rule inside modular callers
+(`PureMirModularConverges.call_summary_resolved`): supports any call target
+resolved via `resolveCallTarget` (including capture-free closures, local ZST
+function items, and `checkCalleeTargetCompatible` validation) without requiring
+`extractCalleeDefPath? func = some _`.
+-/
+theorem PureMirModularConverges.call_summary_resolved
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleeBody : CapturedMir}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    {maxCallDepth : Nat}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_depth : 0 < maxCallDepth := by
+      first | decide | exact Nat.zero_lt_succ 31)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_resolve :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        resolveCallTarget (ps.toMachineState m) func (length argOps)
+          body.localDecls body.layouts = .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts resolvedTarget.defPath
+        resolvedTarget.typeArgs traitImpls = some calleeBody)
+    (h_compat :
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true := by rfl)
+    (h_callee_pure :
+      checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody argVals) calleePost traitImpls)
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePureReturnDestination envAfterArgs destination retVal body.localDecls body.layouts = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  let _ := h_depth
+  intro m hm
+  let s0 := ps.toMachineState m
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body s0 =
+        MirStepNode.step
+          (pushCalleeFrame s0 body envAfterArgs destination targetBb
+            calleeBody argVals unwind) := by
+    have h_res_m := h_resolve m hm
+    dsimp only [PureState.toMachineState] at h_res_m
+    unfold stepMirFn
+    dsimp only [s0, PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
+      rw [h_res_m]
+      dsimp only
+      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only
+      rw [h_compat]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.step, Trusted.ITree.ITreeF.map]
+  refine dwp_modular_bind_steps
+    (mirStepsConverges_pushCalleeFrame_pure hm h_dst_pure h_callee_pure h_callee_summary h_after)
+    ?_
+  rintro s' ⟨updEnv, m', rfl, hm', h_next_mod⟩
+  exact h_next_mod m' hm'
+
+/--
+1-step inlined-callee summary rule for `core::intrinsics::const_eval_select`
+inside modular callers (`PureMirModularConverges.call_const_eval_select_summary`):
+when `const_eval_select` is un-shadowed in `callees` (`lookupCallee = none`) and
+its runtime target `rtTarget` resolves in `callees` (`lookupCallee = some calleeBody`),
+`evalDirectRustIntrinsic?` steps via `pushCalleeFrame` and composes with
+`calleeBody`'s `PureMirConvergesWithCallees` summary in 1 step.
+-/
+theorem PureMirModularConverges.call_const_eval_select_summary
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {tupleArgVal ctFnVal rtFnVal : Value}
+    {unpackedArgs : List Value}
+    {rtTarget : ResolvedCallTarget}
+    {calleeBody : CapturedMir}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    {maxCallDepth : Nat}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_depth : 0 < maxCallDepth := by
+      first | decide | exact Nat.zero_lt_succ 31)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_select_path : classifyRustIntrinsic? defPath = some .constEvalSelect := by rfl)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_args :
+      evalPureOperands ps.env argOps body.layouts =
+        .ok [tupleArgVal, ctFnVal, rtFnVal] envAfterArgs)
+    (h_lookup_select :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_unpack :
+      unpackConstEvalSelectArgs? tupleArgVal
+        (selectTupleTyOpt (extractCalleeTypeArgs func)) = .some unpackedArgs)
+    (h_resolve_rt :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        resolveConstEvalSelectTarget? (ps.toMachineState m)
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            fnSig := .none
+            isIndirect := false }
+          body.localDecls body.layouts
+          (selectRtFnOpOpt argOps)
+          rtFnVal (length unpackedArgs) = .some rtTarget)
+    (h_lookup_rt :
+      lookupCallee callees body.layouts rtTarget.defPath rtTarget.typeArgs traitImpls =
+        some calleeBody)
+    (h_compat_rt :
+      Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+        (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+          (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) = true := by rfl)
+    (h_callee_pure :
+      checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody unpackedArgs) calleePost traitImpls)
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePureReturnDestination envAfterArgs destination retVal body.localDecls body.layouts = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  let _ := h_depth
+  intro m hm
+  let s0 := ps.toMachineState m
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body s0 =
+        MirStepNode.step
+          (pushCalleeFrame s0 body envAfterArgs destination targetBb
+            calleeBody unpackedArgs unwind) := by
+    have h_res_rt_m := h_resolve_rt m hm
+    dsimp only [PureState.toMachineState] at h_res_rt_m
+    unfold stepMirFn
+    dsimp only [s0, PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup_select]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only
+      rw [evalDirectRustIntrinsic?_constEvalSelect_three _ _ _ _ _ _ _ _ _ _ _ _ _ h_select_path]
+      unfold evalConstEvalSelectThree
+      dsimp only
+      rw [h_unpack]
+      dsimp only
+      rw [h_res_rt_m]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup_rt]
+      dsimp only
+      rw [h_compat_rt]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.step, Trusted.ITree.ITreeF.map]
+  refine dwp_modular_bind_steps
+    (mirStepsConverges_pushCalleeFrame_pure hm h_dst_pure h_callee_pure h_callee_summary h_after)
+    ?_
+  rintro s' ⟨updEnv, m', rfl, hm', h_next_mod⟩
+  exact h_next_mod m' hm'
+
+/--
+Discharge a `ModularVerificationResult` with non-empty linked `callees` against
+`contract.holdsOn` from `PureMirModularConverges` (`FF-2.2` Section 2 & 4).
+-/
+theorem verifyModularMirWithCallees_of_pureModularExec
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_nonempty : callees ≠ [] := by decide)
+    (h_frame :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        mem.callStack = [] ∧
+        (mem.activeCallee = none ∨ mem.activeCallee = some body) ∧
+        mem.activeProtectors = [])
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        PureMirModularConverges contract body callees
+          (initPureState body args)
+          (fun retVal => ∀ mem', post args mem retVal mem')
+          body.traitImpls) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post
+        callees := callees } := by
+  refine Anneal.Rustc.V2026_06_01.Lower.verifyModularContractWithCalleesByDWLP
+    contract body callees pre post (fun args mem h_pre => ?_)
+  rcases h_frame args mem h_pre with ⟨h_cs, h_ac, h_ap⟩
+  let initSt :=
+    Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  have h_st_eq :
+      initSt = (initPureState body args).toMachineState initSt.memory := by
+    dsimp only [initSt,
+      Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
+      initMachineStateWithMemory, PureState.toMachineState, initPureState]
+  have h_mod : ModularRootMemory body callees body.traitImpls initSt.memory := by
+    dsimp only [initSt,
+      Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
+      initMachineStateWithMemory]
+    cases hc : callees with
+    | nil => exact False.elim (h_nonempty hc)
+    | cons _ _ => exact ⟨rfl, rfl, h_cs, h_ac, h_ap⟩
+  have hdwp := h_wp args mem h_pre initSt.memory h_mod
+  change Anneal.ITreeWP.DWLP _ (mirTree body initSt) _ _
+  rw [h_st_eq]
+  refine Anneal.ITreeWP.DWLP.mono ?_ hdwp.toDWLP
+  intro out _ h_out retVal mem' h_eq
+  subst h_eq
+  exact h_out mem'
+
+/--
+Discharge a `ModularVerificationResult` (with `callees = []`, e.g. pure
+`#[external_spec]` or `CallConv.rustIntrinsic` callers) against
+`contract.holdsOn` from `PureMirModularConverges`.
+-/
+theorem verifyModularMir_of_pureModularExec
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_frame :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        mem.callees = [] ∧
+        mem.callStack = [] ∧
+        (mem.activeCallee = none ∨ mem.activeCallee = some body) ∧
+        mem.activeProtectors = [])
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        PureMirModularConverges contract body []
+          (initPureState body args)
+          (fun retVal => ∀ mem', post args mem retVal mem')
+          mem.traitImpls) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } := by
+  refine Anneal.Rustc.V2026_06_01.Lower.verifyModularContractByDWLP
+    contract body pre post (fun args mem h_pre => ?_)
+  rcases h_frame args mem h_pre with ⟨h_cal, h_cs, h_ac, h_ap⟩
+  have h_mod : ModularRootMemory body [] mem.traitImpls mem :=
+    ⟨h_cal, rfl, h_cs, h_ac, h_ap⟩
+  have hdwp := h_wp args mem h_pre mem h_mod
+  change Anneal.ITreeWP.DWLP _
+    (mirTree body ((initPureState body args).toMachineState mem)) _ _
+  refine Anneal.ITreeWP.DWLP.mono ?_ hdwp.toDWLP
+  intro out _ h_out retVal mem' h_eq
+  subst h_eq
+  exact h_out mem'
+
+/--
+Generalized 1-step inlined-callee `tailCall` summary rule inside modular callers
+(`PureMirModularConverges.tailCall_summary_resolved`): supports any call target
+resolved via `resolveCallTarget` (including capture-free closures, local ZST
+function items, and `checkCalleeTargetCompatible` validation) without requiring
+`extractCalleeDefPath? func = some _`.
+-/
+theorem PureMirModularConverges.tailCall_summary_resolved
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleeBody : CapturedMir}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    {maxCallDepth : Nat}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_depth : 0 < maxCallDepth := by
+      first | decide | exact Nat.zero_lt_succ 31)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_resolve :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        resolveCallTarget (ps.toMachineState m) func (length argOps)
+          body.localDecls body.layouts = .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts resolvedTarget.defPath
+        resolvedTarget.typeArgs traitImpls = some calleeBody)
+    (h_compat :
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true := by rfl)
+    (h_callee_pure :
+      checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody argVals) calleePost traitImpls)
+    (h_imp : ∀ retVal : Value, calleePost retVal → post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  let _ := h_depth
+  intro m hm
+  let s0 := ps.toMachineState m
+  let mTd : Memory :=
+    { m with borrows := disableFrameBorrows m.borrows (length m.callStack) (length ps.env) }
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body s0 =
+        MirStepNode.step (enterTailCalleeFrame mTd calleeBody argVals) := by
+    have h_res_m := h_resolve m hm
+    dsimp only [PureState.toMachineState] at h_res_m
+    unfold stepMirFn
+    dsimp only [s0, PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
+      rw [h_res_m]
+      dsimp only
+      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      have h_lk_m :
+          lookupCallee m.callees body.layouts resolvedTarget.defPath
+            resolvedTarget.typeArgs m.traitImpls = some calleeBody := by
+        rw [hm.1, hm.2.1, h_lookup]
+      rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
+      dsimp only
+      rw [h_compat]
+  rcases h_callee_summary with ⟨fuel_c, h_wp_c⟩
+  have h_callee_m :
+      wpMirExecNoCallSym fuel_c calleeBody
+        (.running (initMachineStateWithMemory calleeBody argVals
+          { mTd with callStack := [], activeCallee := none }))
+        (mirNormalPost
+          (fun retVal memOut =>
+            ModularCalleeOutMemory callees traitImpls memOut ∧
+            calleePost retVal)) :=
+    sameExceptBorrows_step_noCall
+      (st₁ := .running ((initPureState calleeBody argVals).toMachineState
+        (pureCalleeMemory callees traitImpls)))
+      ⟨PureCalleeMachineInv.init (initPureState calleeBody argVals)
+        ⟨maxCallDepth, h_callee_pure⟩, fun _ hf => nomatch hf⟩
+      ⟨rfl, hm.1, hm.2.1, rfl, rfl, hm.2.2.2.2⟩
+      h_wp_c
+  have h_pushed :=
+    wpMirExecNoCallSym_pushBaseStack_nil_outer (outerBody := body) h_callee_m
+  have h_state_eq :
+      MirExecState.pushBaseStack calleeBody []
+        (.running (initMachineStateWithMemory calleeBody argVals
+          { mTd with callStack := [], activeCallee := none })) =
+      .running (enterTailCalleeFrame mTd calleeBody argVals) := by
+    have h_cs := hm.2.2.1
+    cases m
+    dsimp only [mTd] at h_cs ⊢
+    subst h_cs
+    rfl
+  rw [h_state_eq] at h_pushed
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.step, Trusted.ITree.ITreeF.map]
+  refine dwp_modular_of_noCallWp ⟨fuel_c, wpMirExecNoCallSym_mono_post ?_ h_pushed⟩
+  intro out h_out
+  cases out with
+  | panic => exact False.elim h_out
+  | abort => exact False.elim h_out
+  | normal rv =>
+    rcases rv with ⟨retVal, _⟩
+    rcases h_out with ⟨_, _, _, h_cp⟩
+    exact h_imp retVal h_cp
+
+/--
+Compositional 1-step external `tailCall` rule (`PureMirModularConverges.tailCall_modular`):
+when block `bb` ends with `TerminatorKind.tailCall func argOps` targeting an
+un-inlined callee `(defPath, typeArgs)` covered by `contract` (`lookupCallee =
+none`), any returned value satisfying `contract.post` with `retMem.callStack =
+[]` halts normally with `post retVal` (and unwinding with `panicMem.callStack =
+[]` or aborting satisfies `mirSafePost`).
+-/
+theorem PureMirModularConverges.tailCall_modular
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        contract.pre
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m })
+    (h_contract_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        contract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.returned retVal retMem) →
+        retMem.callStack = [] ∧ post retVal)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        contract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = []) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  let mTd : Memory :=
+    { m with borrows := disableFrameBorrows m.borrows (length m.callStack) (length ps.env) }
+  have hmTd : ModularRootMemory body callees traitImpls mTd :=
+    ModularRootMemory.withBorrows hm _
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := mTd }
+          resumeExternalTailCall := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf,
+        resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      have h_lk_m :
+          lookupCallee m.callees body.layouts defPath (extractCalleeTypeArgs func) m.traitImpls =
+            none := by
+        rw [hm.1, hm.2.1, h_lookup]
+      rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  refine ⟨h_contract_pre mTd hmTd, fun ans h_cpost => ?_⟩
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalTailCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | panicked panicMem =>
+    dsimp only [resumeExternalTailCall]
+    rw [h_panic_stack mTd panicMem hmTd h_cpost]
+    dsimp only [unwindFromCallStack]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | returned retVal retMem =>
+    rcases h_contract_ret mTd retMem retVal hmTd h_cpost with ⟨h_cs, h_post_ret⟩
+    dsimp only [resumeExternalTailCall]
+    rw [h_cs]
+    dsimp only
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    exact h_post_ret
+
+/--
+Subsumption-aware 1-step external `tailCall` rule
+(`PureMirModularConverges.tailCall_modular_sub`).
+-/
+theorem PureMirModularConverges.tailCall_modular_sub
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m })
+    (h_contract_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.returned retVal retMem) →
+        retMem.callStack = [] ∧ post retVal)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = []) :
+    PureMirModularConverges contract body callees ps post traitImpls :=
+  PureMirModularConverges.tailCall_modular
+    h_phase h_bb h_end h_term h_args_pure h_def h_args h_lookup
+    (fun m hm => (h_sub _ (h_contract_pre m hm)).1)
+    (fun m retMem retVal hm hp =>
+      h_contract_ret m retMem retVal hm
+        ((h_sub _ (h_contract_pre m hm)).2 _ hp))
+    (fun m panicMem hm hp =>
+      h_panic_stack m panicMem hm
+        ((h_sub _ (h_contract_pre m hm)).2 _ hp))
+
+/--
+Subsumption-aware 1-step polymorphic `#[external_spec]` `tailCall` rule
+(`PureMirModularConverges.tailCall_poly_external_spec_sub`).
+-/
+theorem PureMirModularConverges.tailCall_poly_external_spec_sub
+    {contract : MirCallContract}
+    {targetDefPath : DefPath}
+    {expectedTypeArgs : List RigidTy}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (polyExternalSpecCallContract targetDefPath expectedTypeArgs
+          sidecarBody extraPre extraPost)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some targetDefPath)
+    (h_targs : extractCalleeTypeArgs func = expectedTypeArgs)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath expectedTypeArgs traitImpls = none)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_imp :
+      ∀ retVal : Value,
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls :=
+  PureMirModularConverges.tailCall_modular_sub h_sub
+    h_phase h_bb h_end h_term h_args_pure h_def h_args
+    (by rw [h_targs]; exact h_lookup)
+    (fun _ _ => ⟨rfl, h_targs, h_arity, h_param_tys, h_extra_pre⟩)
+    (fun m _ retVal hm hp =>
+      ⟨(ModularRootMemory.of_callFrameAndTraitsPreserved hm hp.1).2.2.1,
+        h_imp retVal hp.2⟩)
+    (fun m _ hm hp => by
+      dsimp only [polyExternalSpecCallContract] at hp
+      cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · rw [hp.1.2.1, hm.2.2.1])
+
+/--
+Subsumption-aware 1-step monomorphic `#[external_spec]` `tailCall` rule
+(`PureMirModularConverges.tailCall_external_spec_sub`).
+-/
+theorem PureMirModularConverges.tailCall_external_spec_sub
+    {contract : MirCallContract}
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some targetDefPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_imp :
+      ∀ retVal : Value,
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls :=
+  PureMirModularConverges.tailCall_modular_sub h_sub
+    h_phase h_bb h_end h_term h_args_pure h_def h_args h_lookup
+    (fun _ _ => ⟨rfl, h_arity, h_param_tys, h_extra_pre⟩)
+    (fun m _ retVal hm hp =>
+      ⟨by rw [hp.1.2.1, hm.2.2.1], h_imp retVal hp.2⟩)
+    (fun m _ hm hp => by
+      dsimp only [externalSpecCallContract] at hp
+      cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · rw [hp.2.1, hm.2.2.1])
+
+/--
+Subsumption-aware 1-step pure `CallConv.rustIntrinsic` `tailCall` rule
+(`PureMirModularConverges.tailCall_intrinsic_sub`).
+-/
+theorem PureMirModularConverges.tailCall_intrinsic_sub
+    {contract : MirCallContract}
+    {pointerBytes : Nat}
+    {ubChecksEnabled : Bool}
+    {rtEval : DefPath → List RigidTy → List Value → Option Value}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {defPath : DefPath}
+    {kind : PureRustIntrinsicKind}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_kind : classifyPureRustIntrinsic? defPath = some kind)
+    (h_eval :
+      evalPureRustIntrinsicWithRuntime rtEval kind
+        (extractCalleeTypeArgs func) argVals pointerBytes ubChecksEnabled =
+        some retVal)
+    (h_post : post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls :=
+  PureMirModularConverges.tailCall_modular_sub h_sub
+    h_phase h_bb h_end h_term h_args_pure h_def h_args h_lookup
+    (fun _ _ => ⟨kind, retVal, h_kind, h_eval⟩)
+    (fun m _ rv hm hp => by
+      rcases hp with ⟨rfl, _, hk', hev'⟩
+      rw [h_kind] at hk'
+      injection hk' with hk_eq
+      subst hk_eq
+      rw [h_eval] at hev'
+      injection hev' with hrv_eq
+      subst hrv_eq
+      exact ⟨hm.2.2.1, h_post⟩)
+    (fun _ _ _ hp => False.elim hp)
+
+/--
+1-step specialization of `PureMirModularConverges.tailCall_intrinsic_sub` to
+`pureRustIntrinsicContract` directly.
+-/
+theorem PureMirModularConverges.tailCall_intrinsic
+    {pointerBytes : Nat}
+    {ubChecksEnabled : Bool}
+    {rtEval : DefPath → List RigidTy → List Value → Option Value}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {defPath : DefPath}
+    {kind : PureRustIntrinsicKind}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_kind : classifyPureRustIntrinsic? defPath = some kind)
+    (h_eval :
+      evalPureRustIntrinsicWithRuntime rtEval kind
+        (extractCalleeTypeArgs func) argVals pointerBytes ubChecksEnabled =
+        some retVal)
+    (h_post : post retVal) :
+    PureMirModularConverges
+      (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+      body callees ps post traitImpls :=
+  PureMirModularConverges.tailCall_intrinsic_sub
+    (MirCallContract.Subsumes.refl _)
+    h_phase h_bb h_end h_term h_args_pure h_def h_args h_lookup h_kind h_eval
+    h_post
+
+/--
+1-step diverging standard panic/abort call rule (`target = .none`) for
+`PureMirModularConverges`: discharges un-shadowed `isAbortingPanicDefPath`
+entrypoints directly and `isUnwindingPanicDefPath` entrypoints under
+`.continue_`, `.terminate`, or `.cleanup cleanupBb`.
+-/
+theorem PureMirModularConverges.call_diverging_panic
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination .none unwind)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_unreach : isUnreachableCallTarget defPath = false := by decide)
+    (h_panic :
+      isAbortingPanicDefPath defPath = true ∨
+      (isUnwindingPanicDefPath defPath = true ∧
+        (unwind = .continue_ ∨
+         unwind = .terminate ∨
+         ∃ cleanupBb : BasicBlockIdx,
+           unwind = .cleanup cleanupBb ∧
+           PureMirModularConverges contract body callees
+             { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+             post traitImpls))) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator, bodyLocalDeclsOf,
+      resolveCallTarget]
+    rw [h_def]
+    dsimp only
+    rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+      m.callerLocals h_args_pure]
+    unfold evalPureOperands at h_args
+    rw [h_args]
+    dsimp only
+    rw [hm.1, hm.2.1, h_lookup]
+    dsimp only
+    rw [h_not_unreach]
+    dsimp only
+    cases h_ab : isAbortingPanicDefPath defPath with
+    | true =>
+      dsimp only [MirStepNode.retOutcome, Trusted.ITree.ITreeF.map]
+      trivial
+    | false =>
+      dsimp only
+      rcases h_panic with h_ab_true | ⟨h_unw_path, h_unw_act⟩
+      · rw [h_ab] at h_ab_true; nomatch h_ab_true
+      · rw [h_unw_path]
+        dsimp only
+        rcases h_unw_act with rfl | rfl | ⟨cleanupBb, rfl, h_clean⟩
+        · dsimp only [applyUnwindAction]
+          rw [hm.2.2.1]
+          dsimp only [unwindFromCallStack, MirStepNode.retOutcome,
+            Trusted.ITree.ITreeF.map]
+          trivial
+        · dsimp only [applyUnwindAction, MirStepNode.retOutcome,
+            Trusted.ITree.ITreeF.map]
+          trivial
+        · dsimp only [applyUnwindAction]
+          exact h_clean m hm
+
+/--
+Subsumption-aware 1-step external diverging call rule (`target = .none`) for
+`PureMirModularConverges` (for `-> !` callees whose `subContract.post` forbids
+normal `.returned` answers).
+-/
+theorem PureMirModularConverges.call_diverging_modular_sub
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination .none unwind)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_unreach : isUnreachableCallTarget defPath = false := by decide)
+    (h_not_abort : isAbortingPanicDefPath defPath = false := by decide)
+    (h_not_unwind : isUnwindingPanicDefPath defPath = false := by decide)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m })
+    (h_no_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.returned retVal retMem))
+    (h_contract_panic :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      (∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem)) ∨
+      ∃ cleanupBb : BasicBlockIdx,
+        unwind = .cleanup cleanupBb ∧
+        (∀ (m panicMem : Memory),
+          ModularRootMemory body callees traitImpls m →
+          subContract.post
+            { defPath := defPath
+              typeArgs := extractCalleeTypeArgs func
+              args := argVals
+              memory := m }
+            (.panicked panicMem) →
+          ModularRootMemory body callees traitImpls panicMem) ∧
+        PureMirModularConverges contract body callees
+          { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+          post traitImpls)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = []) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            args := argVals
+            memory := m }
+          (resumeExternalDivergingCall (ps.toMachineState m) envAfterArgs unwind) := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf,
+        resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only
+      rw [h_not_unreach, h_not_abort, h_not_unwind]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  rcases h_sub _ (h_contract_pre m hm) with ⟨h_cpre, h_cpost_imp⟩
+  refine ⟨h_cpre, fun ans hp_sup => ?_⟩
+  have hp := h_cpost_imp ans hp_sup
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalDivergingCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | returned retVal retMem =>
+    exact False.elim (h_no_ret m retMem retVal hm hp)
+  | panicked panicMem =>
+    rcases h_contract_panic with rfl | rfl | h_no_panic | ⟨cleanupBb, rfl, h_mod_p, h_clean⟩
+    · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+      rw [h_panic_stack m panicMem hm hp]
+      dsimp only [unwindFromCallStack]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · exact False.elim (h_no_panic m panicMem hm hp)
+    · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+      exact h_clean panicMem (h_mod_p m panicMem hm hp)
+
+/--
+Unified `ModularVerificationResult` gate (`verifyModularMir_of_pureModularExec_any`)
+for `PureMirModularConverges` that seamlessly handles both non-empty
+`c.callees ≠ []` (using `c.body.traitImpls`) and empty `c.callees = []` (when
+`c.pre` pins `mem.callees = []`, allowing arbitrary `mem.traitImpls`).
+-/
+theorem verifyModularMir_of_pureModularExec_any
+    (contract : MirCallContract)
+    (c : ModularClaim)
+    (h_env : c.envAssumed = contract.holdsOn := by rfl)
+    (h_callees :
+      c.callees ≠ [] ∨
+      ∀ args mem, c.pre args mem → mem.callees = [])
+    (h_frame :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        mem.callStack = [] ∧
+        (mem.activeCallee = none ∨ mem.activeCallee = some c.body) ∧
+        mem.activeProtectors = [])
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        PureMirModularConverges contract c.body c.callees
+          (initPureState c.body args)
+          (fun retVal => ∀ mem', c.post args mem retVal mem')
+          (if c.callees.isEmpty then mem.traitImpls else c.body.traitImpls)) :
+    ModularVerificationResult c := by
+  rcases c with ⟨body, envAssumed, pre, post, callees⟩
+  dsimp only at h_env h_callees h_frame h_wp
+  subst h_env
+  refine Anneal.Rustc.V2026_06_01.Lower.verifyModularContractWithCalleesByDWLP
+    contract body callees pre post (fun args mem h_pre => ?_)
+  rcases h_frame args mem h_pre with ⟨h_cs, h_ac, h_ap⟩
+  let initSt :=
+    Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  have h_st_eq :
+      initSt = (initPureState body args).toMachineState initSt.memory := by
+    dsimp only [initSt,
+      Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
+      initMachineStateWithMemory, PureState.toMachineState, initPureState]
+  have h_mod :
+      ModularRootMemory body callees
+        (if callees.isEmpty then mem.traitImpls else body.traitImpls)
+        initSt.memory := by
+    dsimp only [initSt,
+      Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
+      initMachineStateWithMemory]
+    cases hc : callees with
+    | cons _ _ => exact ⟨rfl, rfl, h_cs, h_ac, h_ap⟩
+    | nil =>
+      rcases h_callees with h_ne | h_emp
+      · exact False.elim (h_ne hc)
+      · exact ⟨h_emp args mem h_pre, rfl, h_cs, h_ac, h_ap⟩
+  have hdwp := h_wp args mem h_pre initSt.memory h_mod
+  change Anneal.ITreeWP.DWLP _ (mirTree body initSt) _ _
+  rw [h_st_eq]
+  refine Anneal.ITreeWP.DWLP.mono ?_ hdwp.toDWLP
+  intro out _ h_out retVal mem' h_eq
+  subst h_eq
+  exact h_out mem'
+
+/--
+1-step `unwindResume` terminator rule for `PureMirModularConverges`: in any root
+modular caller (`m.callStack = []`), completing a cleanup landing pad (`isCleanup
+= true`) via `TerminatorKind.unwindResume` halts cleanly with `.halted .panic`,
+satisfying `mirSafePost`.
+-/
+theorem PureMirModularConverges.step_unwindResume
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .unwindResume) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator]
+    rw [hm.2.2.1]
+    dsimp only [unwindFromCallStack, MirStepNode.retOutcome,
+      Trusted.ITree.ITreeF.map]
+    trivial
+
+/--
+1-step `unwindTerminate` terminator rule for `PureMirModularConverges`:
+halting via `TerminatorKind.unwindTerminate` produces `.halted .abort`,
+satisfying `mirSafePost`.
+-/
+theorem PureMirModularConverges.step_unwindTerminate
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .unwindTerminate) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator, MirStepNode.retOutcome, Trusted.ITree.ITreeF.map]
+    trivial
+
+/--
+Generalized subsumption-aware 1-step external modular call rule
+(`PureMirModularConverges.call_modular_resolved`):
+supports arbitrary call-target resolution via `resolveCallTarget` (including
+local/projected zero-sized `RigidTy.fnDef` slots with `Operand.move` slot
+invalidation and indirect `FnPtrEntry` targets) AND full `.cleanup cleanupBb`
+unwind landing-pad recovery alongside `.continue_`, `.terminate`, and
+non-unwinding contracts.
+-/
+theorem PureMirModularConverges.call_modular_resolved
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_resolve :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        resolveCallTarget (ps.toMachineState m) func (length argOps)
+          body.localDecls body.layouts = .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts resolvedTarget.defPath
+        resolvedTarget.typeArgs traitImpls = none)
+    (h_not_exact : isDirectExactDivTarget resolvedTarget = false := by decide)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m })
+    (h_contract_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (.returned retVal retMem) →
+        ModularRootMemory body callees traitImpls retMem ∧ calleePost retVal)
+    (h_contract_panic :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      (∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem)) ∨
+      ∃ cleanupBb : BasicBlockIdx,
+        unwind = .cleanup cleanupBb ∧
+        (∀ (m panicMem : Memory),
+          ModularRootMemory body callees traitImpls m →
+          subContract.post
+            { defPath := resolvedTarget.defPath
+              typeArgs := resolvedTarget.typeArgs
+              args := argVals
+              memory := m }
+            (.panicked panicMem) →
+          ModularRootMemory body callees traitImpls panicMem) ∧
+        PureMirModularConverges contract body callees
+          { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+          post traitImpls)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = [])
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic :
+      resolvedTarget.isIndirect = true ∨
+      classifyRustIntrinsic? resolvedTarget.defPath = none := by
+      first | exact Or.inr (by decide) | exact Or.inl (by decide)) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (resumeExternalCall (ps.toMachineState m) envAfterArgs
+            destination targetBb unwind) := by
+    have h_res_m := h_resolve m hm
+    dsimp only [PureState.toMachineState] at h_res_m
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
+      rw [h_res_m]
+      dsimp only
+      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only
+      rw [h_not_exact]
+      dsimp only
+      cases h_ind : resolvedTarget.isIndirect with
+      | true => rfl
+      | false =>
+        rcases h_not_intrinsic with h_ind_t | h_ni
+        · rw [h_ind] at h_ind_t
+          exact False.elim (Bool.false_ne_true h_ind_t)
+        · dsimp only [evalDirectRustIntrinsic?]
+          rw [h_ni]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  rcases h_sub _ (h_contract_pre m hm) with ⟨h_cpre, h_cpost_imp⟩
+  refine ⟨h_cpre, fun ans hp_sup => ?_⟩
+  have hp := h_cpost_imp ans hp_sup
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | panicked panicMem =>
+    rcases h_contract_panic with
+      rfl | rfl | h_no_panic | ⟨cleanupBb, rfl, h_mod_p, h_clean⟩
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      rw [h_panic_stack m panicMem hm hp]
+      dsimp only [unwindFromCallStack]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · exact False.elim (h_no_panic m panicMem hm hp)
+    · dsimp only [resumeExternalCall, applyUnwindAction]
+      exact h_clean panicMem (h_mod_p m panicMem hm hp)
+  | returned retVal retMem =>
+    rcases h_contract_ret m retMem retVal hm hp with ⟨h_mod_ret, h_cp⟩
+    rcases h_after retVal h_cp with ⟨updEnv, h_wr, h_next⟩
+    dsimp only
+    rw [resumeExternalCall_pure_returned_eq _ envAfterArgs destination targetBb unwind
+      retVal retMem h_dst_pure h_mod_ret.2.2.2.2]
+    unfold writePurePlaceValue at h_wr
+    rw [h_wr]
+    exact h_next _ (h_mod_ret.withDirectDestBorrows envAfterArgs destination)
+
+/--
+Subsumption-aware 1-step polymorphic `#[external_spec]` call rule supporting
+both constant and local/projected zero-sized `RigidTy.fnDef` operands
+(`extractPureCalleeTarget?` + `resolvePureCalleeTarget`) AND `.cleanup
+cleanupBb` unwind landing-pad recovery.
+-/
+theorem PureMirModularConverges.call_poly_external_spec_pureTarget
+    {contract : MirCallContract}
+    {targetDefPath : DefPath}
+    {expectedTypeArgs : List RigidTy}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (polyExternalSpecCallContract targetDefPath expectedTypeArgs
+          sidecarBody extraPre extraPost)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (targetDefPath, expectedTypeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func targetDefPath expectedTypeArgs
+        body.layouts = .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath expectedTypeArgs traitImpls = none)
+    (h_not_exact : stringEq targetDefPath "core::intrinsics::exact_div" = false := by decide)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_unwind :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      sidecarTargetCanUnwind sidecarBody = false ∨
+      ∃ cleanupBb : BasicBlockIdx,
+        unwind = .cleanup cleanupBb ∧
+        PureMirModularConverges contract body callees
+          { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+          post traitImpls)
+    (h_after :
+      ∀ (retVal : Value),
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  refine PureMirModularConverges.call_modular_resolved
+    (resolvedTarget := { defPath := targetDefPath, typeArgs := expectedTypeArgs, fnSig := .none, isIndirect := false })
+    h_sub h_phase h_bb h_end h_term h_dst_pure h_args_pure
+    (fun m _ => by
+      rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+        (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+        h_ext]
+      exact h_res_pure)
+    h_args h_lookup h_not_exact
+    (fun _ _ => ⟨rfl, rfl, h_arity, h_param_tys, h_extra_pre⟩)
+    (fun m _ _ hm hp =>
+      ⟨ModularRootMemory.of_callFrameAndTraitsPreserved hm hp.1, hp.2⟩)
+    ?_
+    (fun m _ hm hp => by
+      dsimp only [polyExternalSpecCallContract] at hp
+      cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · rw [hp.1.2.1, hm.2.2.1])
+    h_after
+    (Or.inr h_not_intrinsic)
+  rcases h_unwind with hu | hu | h_nu | ⟨cleanupBb, h_cl, h_clean_wp⟩
+  · exact Or.inl hu
+  · exact Or.inr (Or.inl hu)
+  · refine Or.inr (Or.inr (Or.inl (fun _ _ _ hp => ?_)))
+    dsimp only [polyExternalSpecCallContract] at hp
+    rw [h_nu] at hp
+    exact hp
+  · refine Or.inr (Or.inr (Or.inr ⟨cleanupBb, h_cl, ?_, h_clean_wp⟩))
+    intro m panicMem hm hp
+    dsimp only [polyExternalSpecCallContract] at hp
+    cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+    · exact False.elim hp
+    · exact ModularRootMemory.of_callFrameAndTraitsPreserved hm hp
+
+/--
+Subsumption-aware 1-step pure `CallConv.rustIntrinsic` call rule supporting
+both constant and local/projected zero-sized `RigidTy.fnDef` operands
+(`extractPureCalleeTarget?` + `resolvePureCalleeTarget`).
+-/
+theorem PureMirModularConverges.call_intrinsic_pureTarget
+    {contract : MirCallContract}
+    {pointerBytes : Nat}
+    {ubChecksEnabled : Bool}
+    {rtEval : DefPath → List RigidTy → List Value → Option Value}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {typeArgs : List RigidTy}
+    {resolvedTarget : ResolvedCallTarget}
+    {kind : PureRustIntrinsicKind}
+    {envAfterFunc envAfterArgs updatedEnv : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (defPath, typeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func defPath typeArgs body.layouts =
+        .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup : lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_kind : classifyPureRustIntrinsic? defPath = some kind)
+    (h_eval :
+      evalPureRustIntrinsicWithRuntime rtEval kind typeArgs argVals pointerBytes
+        ubChecksEnabled = some retVal)
+    (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
+    (h_after :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  refine PureMirModularConverges.call_modular_resolved
+    (resolvedTarget := { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false })
+    (calleePost := (· = retVal))
+    h_sub h_phase h_bb h_end h_term h_dst_pure h_args_pure
+    (fun m _ => by
+      rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+        (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+        h_ext]
+      exact h_res_pure)
+    h_args h_lookup h_not_exact
+    (fun _ _ => ⟨kind, retVal, h_kind, h_eval⟩)
+    (fun m _ rv hm hp => by
+      rcases hp with ⟨rfl, _, hk', hev'⟩
+      rw [h_kind] at hk'
+      injection hk' with hk_eq
+      subst hk_eq
+      rw [h_eval] at hev'
+      injection hev' with hrv_eq
+      exact ⟨hm, hrv_eq.symm⟩)
+    (Or.inr (Or.inr (Or.inl (fun _ _ _ hp => hp))))
+    (fun _ _ _ hp => False.elim hp)
+    (fun rv h_eq => by
+      subst h_eq
+      exact ⟨updatedEnv, h_wr, h_after⟩)
+    (Or.inr h_not_intrinsic)
+
+/--
+1-step inline `core::intrinsics::exact_div` call rule supporting both constant
+and local/projected zero-sized `RigidTy.fnDef` operands
+(`extractPureCalleeTarget?` + `resolvePureCalleeTarget`).
+-/
+theorem PureMirModularConverges.call_exact_div_pureTarget
+    {contract : MirCallContract} {body : CapturedMir}
+    {callees : List CapturedMir} {ps : PureState}
+    {bb : BasicBlockData} {func : Operand}
+    {argOps : List Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {defPath : DefPath} {typeArgs : List RigidTy}
+    {resolvedTarget : ResolvedCallTarget}
+    {lhs rhs retScalar : ScalarInt} {isSigned : Bool}
+    {envAfterFunc envAfterArgs updatedEnv : List SlotState}
+    {post : Value → Prop} {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (defPath, typeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func defPath typeArgs body.layouts =
+        .ok resolvedTarget envAfterFunc)
+    (h_exact_path : stringEq defPath "core::intrinsics::exact_div" = true := by decide)
+    (h_args :
+      evalPureOperands envAfterFunc argOps body.layouts =
+        .ok [.scalar lhs, .scalar rhs] envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
+    (h_signed :
+      resolveIntrinsicIsSigned
+        { defPath := defPath
+          typeArgs := typeArgs
+          fnSig := .none
+          isIndirect := false }
+        body.localDecls body.layouts argOps = some isSigned := by rfl)
+    (h_div : evalExactDiv lhs rhs isSigned = some retScalar)
+    (h_wr :
+      writePurePlaceValue envAfterArgs destination (.scalar retScalar) =
+        .ok updatedEnv)
+    (h_next :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.step
+          (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState
+            (invalidateDirectDestWriteBorrows m envAfterArgs destination)) := by
+    have h_res_m :
+        resolveCallTarget (ps.toMachineState m) func (length argOps)
+          body.localDecls body.layouts =
+          .ok { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+            envAfterFunc := by
+      rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+        (ps.toMachineState m) func (length argOps)
+        body.localDecls body.layouts h_ext]
+      exact h_res_pure
+    dsimp only [PureState.toMachineState] at h_res_m
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
+      rw [h_res_m]
+      dsimp only
+      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_exact_path]
+      dsimp only
+      rw [h_signed]
+      dsimp only
+      rw [h_div]
+      dsimp only
+      rw [writeIntrinsicReturn_pure_eq _ envAfterArgs destination targetBb
+        (.scalar retScalar) h_dst_pure]
+      unfold writePurePlaceValue at h_wr
+      rw [h_wr]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  exact h_next _ (hm.withDirectDestBorrows envAfterArgs destination)
+
+/--
+Generalized subsumption-aware 1-step external `tailCall` rule
+(`PureMirModularConverges.tailCall_modular_resolved`):
+supports arbitrary call-target resolution via `resolveCallTarget` (including
+local/projected zero-sized `RigidTy.fnDef` slots and indirect `FnPtrEntry`
+targets).
+-/
+theorem PureMirModularConverges.tailCall_modular_resolved
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_resolve :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        resolveCallTarget (ps.toMachineState m) func (length argOps)
+          body.localDecls body.layouts = .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts resolvedTarget.defPath
+        resolvedTarget.typeArgs traitImpls = none)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m })
+    (h_contract_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (.returned retVal retMem) →
+        retMem.callStack = [] ∧ post retVal)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = []) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  let mTd : Memory :=
+    { m with borrows := disableFrameBorrows m.borrows (length m.callStack) (length ps.env) }
+  have hmTd : ModularRootMemory body callees traitImpls mTd :=
+    ModularRootMemory.withBorrows hm _
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.extCall
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := mTd }
+          resumeExternalTailCall := by
+    have h_res_m := h_resolve m hm
+    dsimp only [PureState.toMachineState] at h_res_m
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
+      rw [h_res_m]
+      dsimp only
+      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      have h_lk_m :
+          lookupCallee m.callees body.layouts resolvedTarget.defPath
+            resolvedTarget.typeArgs m.traitImpls = none := by
+        rw [hm.1, hm.2.1, h_lookup]
+      rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, h_lk_m]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
+    MirCallContract.toCallContract]
+  rcases h_sub _ (h_contract_pre mTd hmTd) with ⟨h_cpre, h_cpost_imp⟩
+  refine ⟨h_cpre, fun ans hp_sup => ?_⟩
+  have hp := h_cpost_imp ans hp_sup
+  cases ans with
+  | aborted =>
+    dsimp only [resumeExternalTailCall]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | panicked panicMem =>
+    dsimp only [resumeExternalTailCall]
+    rw [h_panic_stack mTd panicMem hmTd hp]
+    dsimp only [unwindFromCallStack]
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    trivial
+  | returned retVal retMem =>
+    rcases h_contract_ret mTd retMem retVal hmTd hp with ⟨h_cs, h_post_ret⟩
+    dsimp only [resumeExternalTailCall]
+    rw [h_cs]
+    dsimp only
+    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+    exact h_post_ret
+
+/--
+Subsumption-aware 1-step polymorphic `#[external_spec]` `tailCall` rule
+supporting both constant and local/projected zero-sized `RigidTy.fnDef`
+operands (`extractPureCalleeTarget?` + `resolvePureCalleeTarget`).
+-/
+theorem PureMirModularConverges.tailCall_poly_external_spec_pureTarget
+    {contract : MirCallContract}
+    {targetDefPath : DefPath}
+    {expectedTypeArgs : List RigidTy}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (polyExternalSpecCallContract targetDefPath expectedTypeArgs
+          sidecarBody extraPre extraPost)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (targetDefPath, expectedTypeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func targetDefPath expectedTypeArgs
+        body.layouts = .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts targetDefPath expectedTypeArgs traitImpls = none)
+    (h_arity : length argVals = sidecarBody.argCount)
+    (h_param_tys : argsMatchCalleeParamTys sidecarBody argVals)
+    (h_extra_pre : extraPre argVals)
+    (h_imp :
+      ∀ retVal : Value,
+        retMatchesCalleeReturnTy sidecarBody retVal ∧ extraPost argVals retVal →
+        post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  exact PureMirModularConverges.tailCall_modular_resolved
+    (subContract := polyExternalSpecCallContract targetDefPath expectedTypeArgs
+      sidecarBody extraPre extraPost)
+    (resolvedTarget := { defPath := targetDefPath, typeArgs := expectedTypeArgs, fnSig := .none, isIndirect := false })
+    h_sub
+    h_phase h_bb h_end h_term h_args_pure
+    (fun m _ => by
+      rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+        (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+        h_ext]
+      exact h_res_pure)
+    h_args h_lookup
+    (fun _ _ => ⟨rfl, rfl, h_arity, h_param_tys, h_extra_pre⟩)
+    (fun m _ retVal hm hp =>
+      ⟨(ModularRootMemory.of_callFrameAndTraitsPreserved hm hp.1).2.2.1,
+        h_imp retVal hp.2⟩)
+    (fun m _ hm hp => by
+      dsimp only [polyExternalSpecCallContract] at hp
+      cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at hp
+      · exact False.elim hp
+      · rw [hp.1.2.1, hm.2.2.1])
+
+/--
+Subsumption-aware 1-step pure `CallConv.rustIntrinsic` `tailCall` rule
+supporting both constant and local/projected zero-sized `RigidTy.fnDef`
+operands (`extractPureCalleeTarget?` + `resolvePureCalleeTarget`).
+-/
+theorem PureMirModularConverges.tailCall_intrinsic_pureTarget
+    {contract : MirCallContract}
+    {pointerBytes : Nat}
+    {ubChecksEnabled : Bool}
+    {rtEval : DefPath → List RigidTy → List Value → Option Value}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {defPath : DefPath}
+    {typeArgs : List RigidTy}
+    {resolvedTarget : ResolvedCallTarget}
+    {kind : PureRustIntrinsicKind}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub :
+      MirCallContract.Subsumes
+        (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+        contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .tailCall func argOps)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (defPath, typeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func defPath typeArgs body.layouts =
+        .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup : lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
+    (h_kind : classifyPureRustIntrinsic? defPath = some kind)
+    (h_eval :
+      evalPureRustIntrinsicWithRuntime rtEval kind typeArgs argVals pointerBytes
+        ubChecksEnabled = some retVal)
+    (h_post : post retVal) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  exact PureMirModularConverges.tailCall_modular_resolved
+    (subContract := pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+    (resolvedTarget := { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false })
+    h_sub
+    h_phase h_bb h_end h_term h_args_pure
+    (fun m _ => by
+      rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+        (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+        h_ext]
+      exact h_res_pure)
+    h_args h_lookup
+    (fun _ _ => ⟨kind, retVal, h_kind, h_eval⟩)
+    (fun m _ rv hm hp => by
+      rcases hp with ⟨rfl, _, hk', hev'⟩
+      rw [h_kind] at hk'
+      injection hk' with hk_eq
+      subst hk_eq
+      rw [h_eval] at hev'
+      injection hev' with hrv_eq
+      subst hrv_eq
+      exact ⟨hm.2.2.1, h_post⟩)
+    (fun _ _ _ hp => False.elim hp)
+
+/--
+1-step diverging standard panic/abort call rule (`target = .none`) supporting
+both constant and local/projected zero-sized `RigidTy.fnDef` operands
+(`extractPureCalleeTarget?` + `resolvePureCalleeTarget`).
+-/
+theorem PureMirModularConverges.call_diverging_panic_pureTarget
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {typeArgs : List RigidTy}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination .none unwind)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (defPath, typeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func defPath typeArgs body.layouts =
+        .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup : lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
+    (h_not_unreach : isUnreachableCallTarget defPath = false := by decide)
+    (h_panic :
+      isAbortingPanicDefPath defPath = true ∨
+      (isUnwindingPanicDefPath defPath = true ∧
+        (unwind = .continue_ ∨
+         unwind = .terminate ∨
+         ∃ cleanupBb : BasicBlockIdx,
+           unwind = .cleanup cleanupBb ∧
+           PureMirModularConverges contract body callees
+             { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+             post traitImpls))) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_res_m :
+      resolveCallTarget (ps.toMachineState m) func (length argOps)
+        body.localDecls body.layouts =
+        .ok { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+          envAfterFunc := by
+    rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+      (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+      h_ext]
+    exact h_res_pure
+  dsimp only [PureState.toMachineState] at h_res_m
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator, bodyLocalDeclsOf]
+    rw [h_res_m]
+    dsimp only
+    rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
+      m.callerLocals h_args_pure]
+    unfold evalPureOperands at h_args
+    rw [h_args]
+    dsimp only
+    rw [hm.1, hm.2.1, h_lookup]
+    dsimp only
+    rw [h_not_unreach]
+    dsimp only
+    cases h_ab : isAbortingPanicDefPath defPath with
+    | true =>
+      dsimp only [MirStepNode.retOutcome, Trusted.ITree.ITreeF.map]
+      trivial
+    | false =>
+      dsimp only
+      rcases h_panic with h_ab_true | ⟨h_unw_path, h_unw_act⟩
+      · rw [h_ab] at h_ab_true; nomatch h_ab_true
+      · rw [h_unw_path]
+        dsimp only
+        rcases h_unw_act with rfl | rfl | ⟨cleanupBb, rfl, h_clean⟩
+        · dsimp only [applyUnwindAction]
+          rw [hm.2.2.1]
+          dsimp only [unwindFromCallStack, MirStepNode.retOutcome,
+            Trusted.ITree.ITreeF.map]
+          trivial
+        · dsimp only [applyUnwindAction, MirStepNode.retOutcome,
+            Trusted.ITree.ITreeF.map]
+          trivial
+        · dsimp only [applyUnwindAction]
+          exact h_clean m hm
+
+theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {typeArgs : List RigidTy}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination .none unwind)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (defPath, typeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func defPath typeArgs body.layouts =
+        .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup : lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
+    (h_not_unreach : isUnreachableCallTarget defPath = false := by decide)
+    (h_not_abort : isAbortingPanicDefPath defPath = false := by decide)
+    (h_not_unwind : isUnwindingPanicDefPath defPath = false := by decide)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m })
+    (h_no_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m }
+          (.returned retVal retMem))
+    (h_contract_panic :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      (∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem)) ∨
+      ∃ cleanupBb : BasicBlockIdx,
+        unwind = .cleanup cleanupBb ∧
+        (∀ (m panicMem : Memory),
+          ModularRootMemory body callees traitImpls m →
+          subContract.post
+            { defPath := defPath
+              typeArgs := typeArgs
+              args := argVals
+              memory := m }
+            (.panicked panicMem) →
+          ModularRootMemory body callees traitImpls panicMem) ∧
+        PureMirModularConverges contract body callees
+          { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+          post traitImpls)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = []) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_res_m :
+      resolveCallTarget (ps.toMachineState m) func (length argOps)
+        body.localDecls body.layouts =
+        .ok { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+          envAfterFunc := by
+    rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+      (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+      h_ext]
+    exact h_res_pure
+  dsimp only [PureState.toMachineState] at h_res_m
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator, bodyLocalDeclsOf]
+    rw [h_res_m]
+    dsimp only
+    rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
+      m.callerLocals h_args_pure]
+    unfold evalPureOperands at h_args
+    cases h_ev : evalOperands envAfterFunc argOps [] [] body.layouts [] with
+    | ub => rw [h_ev] at h_args; nomatch h_args
+    | unsupported => rw [h_ev] at h_args; nomatch h_args
+    | ok vals env' =>
+      rw [h_ev] at h_args; injection h_args with h_v h_e
+      subst h_v h_e
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only
+      have h_unr : isUnreachableCallTarget defPath = false := h_not_unreach
+      rw [h_unr]
+      dsimp only
+      have h_ab : isAbortingPanicDefPath defPath = false := h_not_abort
+      rw [h_ab]
+      dsimp only
+      have h_not_unw : isUnwindingPanicDefPath defPath = false := h_not_unwind
+      rw [h_not_unw]
+      dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP, MirCallContract.toCallContract]
+      rcases h_sub _ (h_contract_pre m hm) with ⟨h_cpre, h_cpost_imp⟩
+      refine ⟨h_cpre, fun ans hp_sup => ?_⟩
+      have hp := h_cpost_imp ans hp_sup
+      cases ans with
+      | aborted =>
+        dsimp only [resumeExternalDivergingCall]
+        rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+        trivial
+      | returned retVal retMem =>
+        exact False.elim (h_no_ret m retMem retVal hm hp)
+      | panicked panicMem =>
+        rcases h_contract_panic with rfl | rfl | h_no_panic | ⟨cleanupBb, rfl, h_mod_p, h_clean⟩
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+          rw [h_panic_stack m panicMem hm hp]
+          dsimp only [unwindFromCallStack]
+          rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+          trivial
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+          rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+          trivial
+        · exact False.elim (h_no_panic m panicMem hm hp)
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+          exact h_clean panicMem (h_mod_p m panicMem hm hp)
+
+/-!
+## 10. Concrete Multi-Callee, Polymorphic, Intrinsic, & `#[external_spec]`
+Witnesses
+-/
+
+/-- Generic parameter `T` (`idx := 0`, dedicated layout slot `0`). -/
+def polyParamTTy : Ty :=
+  { kind := .param 0 "T", layoutIdx := 0 }
+
+/-- Generic tuple `(T, T)` (dedicated compound layout slot `1`). -/
+def polyPairTTy : Ty :=
+  { kind := .tuple [.param 0 "T", .param 0 "T"], layoutIdx := 1 }
+
+/-- `u64` type (`8` bytes). -/
+def pureU64Ty : Ty :=
+  { kind := .uint .u64, layoutIdx := 0 }
+
+/-- Concrete `64`-bit layout for `(u32, u32)`. -/
+def pairU32Layout : TypeLayout :=
+  Option.getD
+    (RigidTy.computeLayout 64 [u32Layout] [] none (.tuple [.uint .u32, .uint .u32]))
+    u32Layout
+
+/-- Concrete `64`-bit layout for `u64`. -/
+def u64Layout : TypeLayout :=
+  Option.getD (RigidTy.computeLayout 64 [] [] none (.uint .u64)) u32Layout
+
+/-- Concrete `64`-bit layout for `(u64, u64)`. -/
+def pairU64Layout : TypeLayout :=
+  Option.getD
+    (RigidTy.computeLayout 64 [u64Layout] [] none (.tuple [.uint .u64, .uint .u64]))
+    u64Layout
+
+/-- Zero-sized function-item constant `Operand` for `(defPath, typeArgs)`. -/
+def fnItemOperand (defPath : DefPath) (typeArgs : List RigidTy := []) : Operand :=
+  .constant
+    { ty := { kind := .fnDef defPath typeArgs, layoutIdx := 0 }
+      val := .zeroSized }
+
+/-- Compile-time `u32` scalar constant `Operand`. -/
+def u32ConstOperand (n : Nat) : Operand :=
+  .constant
+    { ty := pureU32Ty
+      val := .scalar (.int { bits := n, sizeBytes := 4 }) }
+
+/--
+Polymorphic helper `demo::poly_swap_pair<T>` (`typeParamCount := 1`,
+`genericParams := [{ idx := 0, name := "T" }]`, `argCount := 1`):
+takes `_1 : (T, T)` and returns `(_1.1, _1.0) : (T, T)`.
+Slot `0` holds the placeholder for `T` and slot `1` holds `(T, T)` so
+`CapturedMir.instantiate` substitutes `T`'s layout and recomputes `(T, T)`'s
+compound layout cleanly at any concrete scalar type `T`.
+-/
+def polySwapPairBody : CapturedMir where
+  defPath := "demo::poly_swap_pair"
+  phase := .runtimePostCleanup
+  role := .subject
+  typeParamCount := 1
+  genericParams := [{ idx := 0, name := "T" }]
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := polyPairTTy, debugName := some "_0" },
+    { mutability := .not, ty := polyPairTTy, debugName := some "pair" }
+  ]
+  basicBlocks := [
+    { statements := [
+        { kind := .assign
+            { local_ := 0, projection := [] }
+            (.aggregate .tuple [
+              .copy { local_ := 1, projection := [.field 1 polyParamTTy] },
+              .copy { local_ := 1, projection := [.field 0 polyParamTTy] }
+            ])
+          span := pureAdtSpan }
+      ]
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := pairU32Layout, mode := .direct }]
+    ret := { layout := pairU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := {
+    pointerBits := 64
+    isLittleEndian := true
+    entries := [u32Layout, pairU32Layout]
+  }
+  allocations := []
+
+/--
+Caller layout table shared by `u32`-pair callers (`[u32Layout, pairU32Layout]`).
+-/
+def demoCallerLayouts : LayoutTable where
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [u32Layout, pairU32Layout]
+
+/--
+Monomorphized `demo::poly_swap_pair::<u32>` body produced by
+`CapturedMir.instantiate`.
+-/
+def polySwapPairU32Body : CapturedMir :=
+  polySwapPairBody.instantiate [(.uint .u32, u32Layout)]
+
+/--
+Monomorphized `demo::poly_swap_pair::<u64>` body produced by
+`CapturedMir.instantiate`.
+-/
+def polySwapPairU64Body : CapturedMir :=
+  polySwapPairBody.instantiate [(.uint .u64, u64Layout)]
+
+/--
+Polymorphic `(defPath, typeArgs)` resolution at `T = u32` via `lookupCallee`
+instantiates `polySwapPairBody` to `polySwapPairU32Body`.
+-/
+theorem lookupCallee_polySwapPair_u32 :
+    lookupCallee [polySwapPairBody] demoCallerLayouts
+      "demo::poly_swap_pair" [.uint .u32] [] =
+      some polySwapPairU32Body := rfl
+
+/--
+Polymorphic `(defPath, typeArgs)` resolution at `T = u64` via `lookupCallee`
+instantiates `polySwapPairBody` to `polySwapPairU64Body` with recomputed
+`u64` / `(u64, u64)` layouts.
+-/
+theorem lookupCallee_polySwapPair_u64 :
+    lookupCallee [polySwapPairBody] demoCallerLayouts
+      "demo::poly_swap_pair" [.uint .u64] [] =
+      some polySwapPairU64Body := rfl
+
+/-- `checkPureMir` holds on monomorphized `polySwapPairU32Body`. -/
+theorem checkPureMir_polySwapPairU32Body :
+    checkPureMir polySwapPairU32Body = true := by
+  decide
+
+/-- `checkPureMir` holds on monomorphized `polySwapPairU64Body`. -/
+theorem checkPureMir_polySwapPairU64Body :
+    checkPureMir polySwapPairU64Body = true := by
+  decide
+
+/--
+Call-free `PureMirConverges` summary for `polySwapPairU32Body` (`T = u32`),
+swapping `(a, b)` to `(b, a)`.
+-/
+theorem polySwapPairU32_pureConverges (a b : Value) :
+    PureMirConverges polySwapPairU32Body
+      (initPureState polySwapPairU32Body [.aggregate 0 [a, b]])
+      (· = .aggregate 0 [b, a]) :=
+  ⟨4, rfl⟩
+
+/--
+Call-free `PureMirConverges` summary for `polySwapPairU64Body` (`T = u64`),
+swapping `(a, b)` to `(b, a)`.
+-/
+theorem polySwapPairU64_pureConverges (a b : Value) :
+    PureMirConverges polySwapPairU64Body
+      (initPureState polySwapPairU64Body [.aggregate 0 [a, b]])
+      (· = .aggregate 0 [b, a]) :=
+  ⟨4, rfl⟩
+
+/--
+Intermediate helper `demo::scale_swap_and_div` (`argCount := 1`):
+- Input `_1 : (u32, u32) = (x, y)` (with `x < 2^31`).
+- `bb0`: calls polymorphic `demo::poly_swap_pair::<u32>(_1)` -> `_2 = (y, x)`,
+  jumping to `bb1`.
+- `bb1`: computes `_3 = _2.1 * 2` (`BinOp.mul`), then calls inline intrinsic
+  `core::intrinsics::exact_div::<u32>(_3, 2)` -> `_4 = x`, jumping to `bb2`.
+- `bb2`: computes `_5 = _2.0 + 1` (`BinOp.add`), writes `_0 = (_5, _4)`, and
+  returns `((y + 1) % 2^32, x)`.
+-/
+def scaleSwapAndDivBody : CapturedMir where
+  defPath := "demo::scale_swap_and_div"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "_0" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "swapped" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "doubled_x" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "halved_x" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "inc_y" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_2); _2 = demo::poly_swap_pair::<u32>(_1) -> bb1
+    { statements := [
+        { kind := .storageLive 2, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::poly_swap_pair" [.uint .u32])
+          [.copy { local_ := 1, projection := [] }]
+          { local_ := 2, projection := [] }
+          (.some 1)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: StorageLive(_3, _4); _3 = _2.1 * 2; _4 = exact_div::<u32>(_3, 2) ->
+    -- bb2
+    { statements := [
+        { kind := .storageLive 3, span := pureAdtSpan },
+        { kind := .storageLive 4, span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 3, projection := [] }
+            (.binaryOp .mul
+              (.copy { local_ := 2, projection := [.field 1 pureU32Ty] })
+              (u32ConstOperand 2))
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::exact_div" [.uint .u32])
+          [.copy { local_ := 3, projection := [] }, u32ConstOperand 2]
+          { local_ := 4, projection := [] }
+          (.some 2)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: StorageLive(_5); _5 = _2.0 + 1; _0 = (_5, _4); return
+    { statements := [
+        { kind := .storageLive 5, span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 5, projection := [] }
+            (.binaryOp .add
+              (.copy { local_ := 2, projection := [.field 0 pureU32Ty] })
+              (u32ConstOperand 1))
+          span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 0, projection := [] }
+            (.aggregate .tuple [
+              .copy { local_ := 5, projection := [] },
+              .copy { local_ := 4, projection := [] }
+            ])
+          span := pureAdtSpan }
+      ]
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := pairU32Layout, mode := .direct }]
+    ret := { layout := pairU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/--
+Outer caller `demo::caller_two_nested` (`argCount := 1`) invoking 2 nested
+helper functions in `demoCallees := [polySwapPairBody, scaleSwapAndDivBody]`:
+- `bb0`: `StorageLive(_2)`; calls `demo::scale_swap_and_div(_1)` (which
+  internally invokes polymorphic `demo::poly_swap_pair::<u32>` and inline
+  `core::intrinsics::exact_div::<u32>`), writing `_2 = ((y + 1) % 2^32, x)`.
+- `bb1`: calls polymorphic `demo::poly_swap_pair::<u32>(_2)`, writing
+  `_0 = (x, (y + 1) % 2^32)`.
+- `bb2`: `return`.
+-/
+def nestedMultiCalleeCallerBody : CapturedMir where
+  defPath := "demo::caller_two_nested"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "_0" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "mid" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_2); _2 = demo::scale_swap_and_div(_1) -> bb1
+    { statements := [
+        { kind := .storageLive 2, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::scale_swap_and_div" [])
+          [.copy { local_ := 1, projection := [] }]
+          { local_ := 2, projection := [] }
+          (.some 1)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: _0 = demo::poly_swap_pair::<u32>(_2) -> bb2
+    { statements := []
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::poly_swap_pair" [.uint .u32])
+          [.copy { local_ := 2, projection := [] }]
+          { local_ := 0, projection := [] }
+          (.some 2)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: return
+    { statements := []
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := pairU32Layout, mode := .direct }]
+    ret := { layout := pairU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/-- Linked callee table with 2 nested pure helper functions. -/
+def demoCallees : List CapturedMir :=
+  [polySwapPairBody, scaleSwapAndDivBody]
+
+/--
+Expected pair output `(x, (y + 1) % 2^32)` of `nestedMultiCalleeCallerBody`.
+-/
+def nestedCallerExpected (x y : Nat) : Value :=
+  .aggregate 0 [
+    .scalar { bits := x, sizeBytes := 4 },
+    .scalar { bits := wrapScalarBits (Nat.add y 1) (scalarModulus 4), sizeBytes := 4 }
+  ]
+
+private theorem wrapScalarBits_lt {val modulus : Nat} (h : val < modulus) :
+    wrapScalarBits val modulus = val := by
+  unfold wrapScalarBits
+  have h_ble : Nat.ble modulus val = false := by
+    cases hb : Nat.ble modulus val with
+    | false => rfl
+    | true =>
+      have h_le : modulus ≤ val := Nat.le_of_ble_eq_true hb
+      omega
+  rw [h_ble]
+
+private theorem evalExactDiv_double_u32 {x : Nat} (hx : x < 2147483648) :
+    evalExactDiv ⟨wrapScalarBits (Nat.mul x 2) (scalarModulus 4), 4⟩ ⟨2, 4⟩ false =
+      some ⟨x, 4⟩ := by
+  have hm : scalarModulus 4 = 4294967296 := rfl
+  have h_mul : Nat.mul x 2 = x * 2 := rfl
+  have h_w1 : wrapScalarBits (Nat.mul x 2) (scalarModulus 4) = x * 2 := by
+    rw [hm, h_mul]
+    exact wrapScalarBits_lt (by omega)
+  have h_w2 : wrapScalarBits (x * 2) (scalarModulus 4) = x * 2 := by
+    rw [hm]
+    exact wrapScalarBits_lt (by omega)
+  have h_b2 : wrapScalarBits 2 (scalarModulus 4) = 2 := rfl
+  have h_mod : Nat.beq (Nat.mod (x * 2) 2) 0 = true := by
+    rw [Nat.beq_eq]
+    change (x * 2) % 2 = 0
+    omega
+  have h_div : Nat.div (x * 2) 2 = x := by
+    change (x * 2) / 2 = x
+    omega
+  dsimp only [evalExactDiv]
+  rw [h_w1, h_w2, h_b2]
+  dsimp only
+  rw [h_mod]
+  dsimp only
+  rw [h_div]
+  rfl
+
+/-!
+### 10A. Proof Path A — Compositional 1-Step Callee Summaries
+(`PureMirConverges.call_summary`)
+-/
+
+/--
+Compositional summary for `scaleSwapAndDivBody`: resolves polymorphic
+`demo::poly_swap_pair::<u32>` in 1 compositional step via
+`PureMirConverges.call_leaf_summary` and inline `core::intrinsics::exact_div`
+in 1 step via `PureMirConvergesWithCallees.call_exact_div`.
+-/
+theorem scaleSwapAndDiv_compositional
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirConvergesWithCallees scaleSwapAndDivBody demoCallees
+      (initPureState scaleSwapAndDivBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ])
+      (· = .aggregate 0 [
+        .scalar { bits := wrapScalarBits (Nat.add y 1) (scalarModulus 4), sizeBytes := 4 },
+        .scalar { bits := x, sizeBytes := 4 }
+      ])
+      [] := by
+  -- bb0 stmt 0 (StorageLive(_2)), then 1-step compositional call to
+  -- poly_swap_pair::<u32>
+  have h_init :
+      initPureState scaleSwapAndDivBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] = {
+        bb := 0
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .dead, .dead, .dead, .dead
+        ]
+      } := rfl
+  rw [h_init]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConverges.call_leaf_summary
+    (maxCallDepth := 64)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_polySwapPairU32Body
+    (polySwapPairU32_pureConverges
+      (.scalar { bits := x, sizeBytes := 4 })
+      (.scalar { bits := y, sizeBytes := 4 }))
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- bb1 stmts (StorageLive(_3), StorageLive(_4), _3 = _2.1 * 2)
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  -- bb1 terminator: 1-step inline core::intrinsics::exact_div(_3, 2)
+  refine PureMirConvergesWithCallees.call_exact_div
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
+    (evalExactDiv_double_u32 hx) rfl ?_
+  -- bb2 stmts (StorageLive(_5), _5 = _2.0 + 1, _0 = (_5, _4)) and return_
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  exact PureMirConvergesWithCallees.step ⟨Or.inl rfl, rfl⟩
+
+/--
+Headline compositional 2-nested-callee proof (`FF-2.2` Section 4):
+proves `nestedMultiCalleeCallerBody` using **2 compositional `call_summary`
+steps**
+(1 step for `demo::scale_swap_and_div`, reusing `scaleSwapAndDiv_compositional`
+without re-stepping any of its basic blocks or guessing fuel, and 1 step for
+polymorphic `demo::poly_swap_pair::<u32>`) plus `StorageLive(_2)` and `return_`.
+-/
+theorem nestedMultiCalleeCaller_compositional
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirConvergesWithCallees nestedMultiCalleeCallerBody demoCallees
+      (initPureState nestedMultiCalleeCallerBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ])
+      (· = nestedCallerExpected x y)
+      [] := by
+  -- bb0: StorageLive(_2), then 1 compositional step for
+  -- demo::scale_swap_and_div
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConverges.call_summary
+    (maxCallDepth := 64)
+    (calleeBody := scaleSwapAndDivBody)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    (scaleSwapAndDiv_compositional x y hx)
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- bb1: 1 compositional step for polymorphic demo::poly_swap_pair::<u32>
+  refine PureMirConverges.call_leaf_summary
+    (maxCallDepth := 64)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_polySwapPairU32Body
+    (polySwapPairU32_pureConverges
+      (.scalar { bits := wrapScalarBits (Nat.add y 1) (scalarModulus 4), sizeBytes := 4 })
+      (.scalar { bits := x, sizeBytes := 4 }))
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- bb2: return_
+  exact PureMirConvergesWithCallees.step ⟨Or.inl rfl, rfl⟩
+
+/--
+`checkPureMirWithCallees` succeeds on `nestedMultiCalleeCallerBody` at exact
+call depth `maxCallDepth = 2` (`caller -> scale_swap_and_div ->
+poly_swap_pair`).
+-/
+theorem checkPureMirWithCallees_nestedCaller_depth2 :
+    checkPureMirWithCallees demoCallees nestedMultiCalleeCallerBody 2 [] = true := by
+  decide
+
+/--
+Tightness of `maxCallDepth` in `checkPureMirWithCallees`: depth `1` rejects
+`nestedMultiCalleeCallerBody` because `scale_swap_and_div` makes a nested call
+at depth `2`.
+-/
+theorem checkPureMirWithCallees_nestedCaller_depth1_false :
+    checkPureMirWithCallees demoCallees nestedMultiCalleeCallerBody 1 [] = false := by
+  decide
+
+/--
+Transport the compositional 1-step-per-call
+`nestedMultiCalleeCaller_compositional`
+proof directly to `MirWpConverges` on `initMachineStateWithCallees`.
+-/
+theorem nestedMultiCalleeCaller_wpConverges_compositional
+    (x y : Nat) (hx : x < 2147483648) :
+    MirWpConverges nestedMultiCalleeCallerBody
+      (initMachineStateWithCallees nestedMultiCalleeCallerBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] demoCallees)
+      (mirNormalPost
+        (fun retVal mem' =>
+          ActiveRootMemory nestedMultiCalleeCallerBody
+            (initMachineStateWithCallees nestedMultiCalleeCallerBody [
+              .aggregate 0 [
+                .scalar { bits := x, sizeBytes := 4 },
+                .scalar { bits := y, sizeBytes := 4 }
+              ]
+            ] demoCallees).memory mem' ∧
+          retVal = nestedCallerExpected x y)) :=
+  mirWpConverges_of_pureExecWithCallees_init
+    checkPureMirWithCallees_nestedCaller_depth2
+    (nestedMultiCalleeCaller_compositional x y hx)
+
+/-!
+### 10B. Proof Path B — Inline `checkPureMirWithCallees` Execution & Trusted
+Certificates
+-/
+
+private def runPureTauSteps : Nat → CapturedMir → MachineState → Option MachineState
+  | 0, _, s => some s
+  | n + 1, body, s =>
+    match stepMirFn body s with
+    | .tau (.running s') => runPureTauSteps n body s'
+    | _ => none
+
+private theorem wpMirExecNoCallSym_of_runPureTauSteps
+    {n fuel : Nat} {body : CapturedMir} {s s' : MachineState}
+    {post : _ → Prop}
+    (h_run : runPureTauSteps n body s = some s')
+    (h_rest : wpMirExecNoCallSym fuel body (.running s') post) :
+    wpMirExecNoCallSym (n + fuel) body (.running s) post := by
+  induction n generalizing s with
+  | zero =>
+    injection h_run with h_eq
+    subst h_eq
+    simpa only [Nat.zero_add] using h_rest
+  | succ k ih =>
+    dsimp only [runPureTauSteps] at h_run
+    cases h_sf : stepMirFn body s with
+    | ret _ => rw [h_sf] at h_run; nomatch h_run
+    | vis _ _ => rw [h_sf] at h_run; nomatch h_run
+    | tau st =>
+      rw [h_sf] at h_run
+      cases st with
+      | halted _ => nomatch h_run
+      | faulted _ => nomatch h_run
+      | running nxt =>
+        have h_sub := ih h_run
+        rw [Nat.succ_add]
+        unfold wpMirExecNoCallSym
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval]
+        dsimp only [stepMirState]
+        rw [h_sf]
+        exact h_sub
+
+private theorem wpMirExecNoCallSym_of_step_eq
+    {fuel : Nat} {body : CapturedMir} {s s' : MachineState}
+    {post : _ → Prop}
+    (h_step : stepMirFn body s = .tau (.running s'))
+    (h_rest : wpMirExecNoCallSym fuel body (.running s') post) :
+    wpMirExecNoCallSym (fuel + 1) body (.running s) post := by
+  unfold wpMirExecNoCallSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h_step]
+  exact h_rest
+
+private theorem wpMirExecNoCallSym_of_retNormal
+    {body : CapturedMir} {s : MachineState} {retVal : Value} {memOut : Memory}
+    {post : _ → Prop}
+    (h_step : stepMirFn body s = .ret (.normal (retVal, memOut)))
+    (h_post : post (.normal (retVal, memOut))) :
+    wpMirExecNoCallSym 1 body (.running s) post := by
+  unfold wpMirExecNoCallSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h_step]
+  exact h_post
+
+/--
+Inline multi-frame `PureMirConvergesWithCallees` proof for
+`nestedMultiCalleeCallerBody` (`FF-2.2` Section 4), executing directly across
+`pushCalleeFrame`, 2-deep `callStack`, polymorphic `poly_swap_pair::<u32>`,
+inline `exact_div`, and `activeCallee` restoration in
+`wpPureMirExecWithCallees`.
+-/
+theorem nestedMultiCalleeCaller_inline
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirConvergesWithCallees nestedMultiCalleeCallerBody demoCallees
+      (initPureState nestedMultiCalleeCallerBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ])
+      (· = nestedCallerExpected x y)
+      [] := by
+  let pairXY : Value :=
+    .aggregate 0 [
+      .scalar { bits := x, sizeBytes := 4 },
+      .scalar { bits := y, sizeBytes := 4 }
+    ]
+  let pairYX : Value :=
+    .aggregate 0 [
+      .scalar { bits := y, sizeBytes := 4 },
+      .scalar { bits := x, sizeBytes := 4 }
+    ]
+  let baseMem := pureCalleeMemory demoCallees []
+  let s0 := (initPureState nestedMultiCalleeCallerBody [pairXY]).toMachineState baseMem
+  let callerSaved : SavedCallerFrame := {
+    callerBody := nestedMultiCalleeCallerBody
+    frame := {
+      blockIdx := 0
+      stmtIdx := 1
+      locals := [.uninit, .init pairXY, .uninit]
+    }
+    destination := { local_ := 2, projection := [] }
+    returnTarget := 1
+    calleeProtectors := []
+    returnUnwind := .continue_
+    isDiverging := false
+  }
+  let s9 : MachineState := {
+    frame := {
+      blockIdx := 1
+      stmtIdx := 3
+      locals := [
+        .uninit,
+        .init pairXY,
+        .init pairYX,
+        .init (.scalar { bits := wrapScalarBits (Nat.mul x 2) (scalarModulus 4), sizeBytes := 4 }),
+        .uninit,
+        .dead
+      ]
+    }
+    memory := {
+      baseMem with
+      callStack := [callerSaved]
+      activeCallee := some scaleSwapAndDivBody
+    }
+  }
+  let s10 : MachineState := {
+    frame := {
+      blockIdx := 2
+      stmtIdx := 0
+      locals := [
+        .uninit,
+        .init pairXY,
+        .init pairYX,
+        .init (.scalar { bits := wrapScalarBits (Nat.mul x 2) (scalarModulus 4), sizeBytes := 4 }),
+        .init (.scalar { bits := x, sizeBytes := 4 }),
+        .dead
+      ]
+    }
+    memory := s9.memory
+  }
+  let midPair : Value :=
+    .aggregate 0 [
+      .scalar { bits := wrapScalarBits (Nat.add y 1) (scalarModulus 4), sizeBytes := 4 },
+      .scalar { bits := x, sizeBytes := 4 }
+    ]
+  let s17 : MachineState := {
+    frame := {
+      blockIdx := 2
+      stmtIdx := 0
+      locals := [.init (nestedCallerExpected x y), .init pairXY, .init midPair]
+    }
+    memory := {
+      baseMem with
+      activeCallee := some nestedMultiCalleeCallerBody
+    }
+  }
+  have h_step10 : stepMirFn nestedMultiCalleeCallerBody s9 = .tau (.running s10) := by
+    change
+      (match evalExactDiv ⟨wrapScalarBits (Nat.mul x 2) (scalarModulus 4), 4⟩ ⟨2, 4⟩ false with
+       | some retScalar =>
+         match writePlaceValue s9.frame.locals s9.memory.borrows
+             { local_ := 4, projection := [] } (.scalar retScalar) with
+         | .ok updatedLocals =>
+           MirStepNode.step {
+             frame := { s9.frame with blockIdx := 2, stmtIdx := 0, locals := updatedLocals }
+             memory := s9.memory
+           }
+         | .ub => MirStepNode.fail .ub
+         | .unsupported => MirStepNode.unsupported
+       | none => MirStepNode.fail .ub) = .tau (.running s10)
+    rw [evalExactDiv_double_u32 hx]
+    rfl
+  have h_run9 : runPureTauSteps 9 nestedMultiCalleeCallerBody s0 = some s9 := rfl
+  have h_run7 : runPureTauSteps 7 nestedMultiCalleeCallerBody s10 = some s17 := rfl
+  have h_ret17 :
+      stepMirFn nestedMultiCalleeCallerBody s17 =
+        .ret (.normal (nestedCallerExpected x y, s17.memory)) := rfl
+  refine ⟨18, ?_⟩
+  unfold wpPureMirExecWithCallees
+  exact wpMirExecNoCallSym_of_runPureTauSteps (n := 9) (fuel := 9) h_run9
+    (wpMirExecNoCallSym_of_step_eq (fuel := 8) h_step10
+      (wpMirExecNoCallSym_of_runPureTauSteps (n := 7) (fuel := 1) h_run7
+        (wpMirExecNoCallSym_of_retNormal h_ret17 ⟨Or.inr ⟨_, rfl⟩, rfl⟩)))
+
+/-- Stateless `Claim` for `nestedMultiCalleeCallerBody` with `demoCallees`. -/
+def nestedMultiCalleeStatelessClaim : Claim where
+  body := nestedMultiCalleeCallerBody
+  callees := demoCallees
+  pre args :=
+    ∃ (x y : Nat),
+      x < 2147483648 ∧
+      args = [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ]
+  post args retVal :=
+    ∀ (x y : Nat),
+      args = [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] →
+      retVal = nestedCallerExpected x y
+
+/-- Non-vacuity witness for `nestedMultiCalleeStatelessClaim.pre`. -/
+theorem nestedMultiCalleeStatelessClaim_nonVacuous :
+    NonVacuousPre nestedMultiCalleeStatelessClaim.pre :=
+  ⟨[.aggregate 0 [.scalar { bits := 21, sizeBytes := 4 }, .scalar { bits := 99, sizeBytes := 4 }]],
+   21, 99, by decide, rfl⟩
+
+private theorem pairU32Args_inj
+    {x y x' y' : Nat}
+    (h :
+      ([Value.aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]] : List Value) =
+      [Value.aggregate 0 [
+          .scalar { bits := x', sizeBytes := 4 },
+          .scalar { bits := y', sizeBytes := 4 }
+        ]]) :
+    x = x' ∧ y = y' := by
+  injection h with h_hd _
+  injection h_hd with _ h_flds
+  injection h_flds with h_x h_tl
+  injection h_tl with h_y _
+  injection h_x with h_sx
+  injection h_y with h_sy
+  injection h_sx with hx_eq _
+  injection h_sy with hy_eq _
+  exact ⟨hx_eq, hy_eq⟩
+
+/--
+Stateless `VerificationResult` for `nestedMultiCalleeStatelessClaim`, discharged
+via `verifyMirNoPanic_of_pureExecWithCallees` and
+`nestedMultiCalleeCaller_inline`.
+-/
+theorem verify_nestedMultiCalleeStatelessClaim :
+    VerificationResult nestedMultiCalleeStatelessClaim := by
+  refine verifyMirNoPanic_of_pureExecWithCallees
+    nestedMultiCalleeStatelessClaim
+    checkPureMirWithCallees_nestedCaller_depth2
+    (fun args h_pre => ?_)
+  rcases h_pre with ⟨x, y, hx, rfl⟩
+  refine PureMirConvergesWithCallees.mono ?_ (nestedMultiCalleeCaller_inline x y hx)
+  intro retVal h_ret x' y' h_eq
+  rcases pairU32Args_inj h_eq with ⟨rfl, rfl⟩
+  exact h_ret
+
+/--
+Stateful `StatefulClaim` for `nestedMultiCalleeCallerBody` requiring full
+`ActiveRootMemory` preservation (`allocs`, `borrows`, `provenanceMap`,
+`globals`,
+`fnPtrs`, `callees`, `traitImpls`, `callStack = []`) across arbitrary heap
+state.
+-/
+def nestedMultiCalleeStatefulClaim : StatefulClaim where
+  body := nestedMultiCalleeCallerBody
+  callees := demoCallees
+  pre args mem₀ :=
+    (∃ (x y : Nat),
+      x < 2147483648 ∧
+      args = [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ]) ∧
+    RootActiveMemory mem₀
+  post args mem₀ retVal mem' :=
+    ActiveRootMemory nestedMultiCalleeCallerBody
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        nestedMultiCalleeCallerBody args mem₀ demoCallees).memory mem' ∧
+    ∀ (x y : Nat),
+      args = [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] →
+      retVal = nestedCallerExpected x y
+
+/-- Non-vacuity witness for `nestedMultiCalleeStatefulClaim.pre`. -/
+theorem nestedMultiCalleeStatefulClaim_nonVacuous :
+    NonVacuousStatefulPre nestedMultiCalleeStatefulClaim.pre :=
+  ⟨[.aggregate 0 [.scalar { bits := 21, sizeBytes := 4 }, .scalar { bits := 99, sizeBytes := 4 }]],
+   emptyMemory,
+   ⟨21, 99, by decide, rfl⟩,
+   rootActiveMemory_emptyMemory⟩
+
+/--
+Stateful `StatefulVerificationResult` for `nestedMultiCalleeStatefulClaim`,
+discharged via `verifyStatefulMirNoPanic_of_pureExecWithCallees`.
+-/
+theorem verify_nestedMultiCalleeStatefulClaim :
+    StatefulVerificationResult nestedMultiCalleeStatefulClaim := by
+  refine verifyStatefulMirNoPanic_of_pureExecWithCallees
+    nestedMultiCalleeStatefulClaim
+    checkPureMirWithCallees_nestedCaller_depth2
+    (by decide)
+    (fun _ _ h_pre => h_pre.2)
+    (fun args _ h_pre => ?_)
+  rcases h_pre.1 with ⟨x, y, hx, rfl⟩
+  refine PureMirConvergesWithCallees.mono ?_ (nestedMultiCalleeCaller_compositional x y hx)
+  intro retVal h_ret mem' h_act
+  refine ⟨h_act, fun x' y' h_eq => ?_⟩
+  rcases pairU32Args_inj h_eq with ⟨rfl, rfl⟩
+  exact h_ret
+
+/--
+Total-correctness `TotalClaim` for `nestedMultiCalleeCallerBody`
+(`demoCallees`).
+-/
+def nestedMultiCalleeTotalClaim : TotalClaim where
+  body := nestedMultiCalleeCallerBody
+  callees := demoCallees
+  pre := nestedMultiCalleeStatefulClaim.pre
+  post := nestedMultiCalleeStatefulClaim.post
+
+/-- Non-vacuity witness for `nestedMultiCalleeTotalClaim.pre`. -/
+theorem nestedMultiCalleeTotalClaim_nonVacuous :
+    NonVacuousStatefulPre nestedMultiCalleeTotalClaim.pre :=
+  nestedMultiCalleeStatefulClaim_nonVacuous
+
+/--
+Total-correctness `TotalVerificationResult` (`TreeSafe`, `Productive`,
+`¬ MayDiverge`, no panic/abort) for `nestedMultiCalleeTotalClaim`.
+-/
+theorem verify_nestedMultiCalleeTotalClaim :
+    TotalVerificationResult nestedMultiCalleeTotalClaim := by
+  refine verifyTotalMir_of_pureExecWithCallees
+    nestedMultiCalleeTotalClaim
+    checkPureMirWithCallees_nestedCaller_depth2
+    (by decide)
+    (fun _ _ h_pre => h_pre.2)
+    (fun args _ h_pre => ?_)
+  rcases h_pre.1 with ⟨x, y, hx, rfl⟩
+  refine PureMirConvergesWithCallees.mono ?_ (nestedMultiCalleeCaller_compositional x y hx)
+  intro retVal h_ret mem' h_act
+  refine ⟨h_act, fun x' y' h_eq => ?_⟩
+  rcases pairU32Args_inj h_eq with ⟨rfl, rfl⟩
+  exact h_ret
+
+/-! ### 10C. Pure `CallConv.rustIntrinsic` & UB-Rejection Witnesses -/
+
+/--
+`ctlz::<u8>(0) = 8`, whereas `ctlz_nonzero::<u8>(0) = none` (UB rejected).
+-/
+theorem evalPureScalarIntrinsic_ctlz_and_nonzero_ub :
+    evalPureScalarIntrinsic .ctlz [.uint .u8] [.scalar ⟨0, 1⟩] =
+      some (.scalar ⟨8, 4⟩) ∧
+    evalPureScalarIntrinsic .ctlzNonzero [.uint .u8] [.scalar ⟨0x10, 1⟩] =
+      some (.scalar ⟨3, 4⟩) ∧
+    evalPureScalarIntrinsic .ctlzNonzero [.uint .u8] [.scalar ⟨0, 1⟩] = none :=
+  ⟨rfl, rfl, rfl⟩
+
+/--
+`cttz::<u8>(0) = 8`, whereas `cttz_nonzero::<u8>(0) = none` (UB rejected).
+-/
+theorem evalPureScalarIntrinsic_cttz_and_nonzero_ub :
+    evalPureScalarIntrinsic .cttz [.uint .u8] [.scalar ⟨0, 1⟩] =
+      some (.scalar ⟨8, 4⟩) ∧
+    evalPureScalarIntrinsic .cttzNonzero [.uint .u8] [.scalar ⟨0x18, 1⟩] =
+      some (.scalar ⟨3, 4⟩) ∧
+    evalPureScalarIntrinsic .cttzNonzero [.uint .u8] [.scalar ⟨0, 1⟩] = none :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- `ctpop`, `bswap`, and `bitreverse` pure evaluation witnesses. -/
+theorem evalPureScalarIntrinsic_bitops :
+    evalPureScalarIntrinsic .ctpop [.uint .u32] [.scalar ⟨0x10101, 4⟩] =
+      some (.scalar ⟨3, 4⟩) ∧
+    evalPureScalarIntrinsic .bswap [.uint .u32] [.scalar ⟨0x12345678, 4⟩] =
+      some (.scalar ⟨0x78563412, 4⟩) ∧
+    evalPureScalarIntrinsic .bitreverse [.uint .u8] [.scalar ⟨0x81, 1⟩] =
+      some (.scalar ⟨0x81, 1⟩) :=
+  ⟨rfl, rfl, rfl⟩
+
+/--
+`wrapping_add/sub/mul` and unsigned/signed `saturating_add/sub` witnesses.
+-/
+theorem evalPureScalarIntrinsic_wrapping_and_saturating :
+    evalPureScalarIntrinsic .wrappingAdd [.uint .u8]
+      [.scalar ⟨250, 1⟩, .scalar ⟨10, 1⟩] = some (.scalar ⟨4, 1⟩) ∧
+    evalPureScalarIntrinsic .wrappingSub [.uint .u8]
+      [.scalar ⟨3, 1⟩, .scalar ⟨5, 1⟩] = some (.scalar ⟨254, 1⟩) ∧
+    evalPureScalarIntrinsic .wrappingMul [.uint .u8]
+      [.scalar ⟨16, 1⟩, .scalar ⟨16, 1⟩] = some (.scalar ⟨0, 1⟩) ∧
+    evalPureScalarIntrinsic .saturatingAdd [.uint .u8]
+      [.scalar ⟨250, 1⟩, .scalar ⟨10, 1⟩] = some (.scalar ⟨255, 1⟩) ∧
+    evalPureScalarIntrinsic .saturatingAdd [.int .i8]
+      [.scalar ⟨120, 1⟩, .scalar ⟨20, 1⟩] = some (.scalar ⟨127, 1⟩) ∧
+    evalPureScalarIntrinsic .saturatingSub [.int .i8]
+      [.scalar ⟨136, 1⟩, .scalar ⟨20, 1⟩] = some (.scalar ⟨128, 1⟩) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+UB-guarded `unchecked_add`, `unchecked_shl`, and `exact_div` witnesses:
+valid inputs evaluate to `some`, while overflow (`250 + 10` on `u8`),
+out-of-range
+shift (`1 << 8` on `u8`), non-exact division (`7 / 2`), and signed `i8::MIN ÷
+-1`
+(`128 ÷ 255` on `i8`) evaluate to `none`.
+-/
+theorem evalPureScalarIntrinsic_ub_guards :
+    evalPureScalarIntrinsic .uncheckedAdd [.uint .u8]
+      [.scalar ⟨200, 1⟩, .scalar ⟨50, 1⟩] = some (.scalar ⟨250, 1⟩) ∧
+    evalPureScalarIntrinsic .uncheckedAdd [.uint .u8]
+      [.scalar ⟨250, 1⟩, .scalar ⟨10, 1⟩] = none ∧
+    evalPureScalarIntrinsic .uncheckedShl [.uint .u8, .uint .u32]
+      [.scalar ⟨3, 1⟩, .scalar ⟨2, 4⟩] = some (.scalar ⟨12, 1⟩) ∧
+    evalPureScalarIntrinsic .uncheckedShl [.uint .u8, .uint .u32]
+      [.scalar ⟨3, 1⟩, .scalar ⟨8, 4⟩] = none ∧
+    evalPureScalarIntrinsic .exactDiv [.uint .u8]
+      [.scalar ⟨7, 1⟩, .scalar ⟨2, 1⟩] = none ∧
+    evalPureScalarIntrinsic .exactDiv [.int .i8]
+      [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `three_way_compare`, `ub_checks`, and `const_eval_select` witnesses. -/
+theorem evalPureRustIntrinsic_misc_and_constEvalSelect :
+    evalPureScalarIntrinsic .threeWayCompare [.int .i8]
+      [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩] = some (.scalar ⟨255, 1⟩) ∧
+    evalPureScalarIntrinsic .ubChecks [] [] 8 false = some (.scalar ⟨0, 1⟩) ∧
+    evalPureRustIntrinsicWithRuntime
+      (fun dp targs unpacked =>
+        if dp == "demo::rt_add" then
+          match targs, unpacked with
+          | [.uint .u32], [.scalar a, .scalar b] =>
+            some (.scalar ⟨a.bits + b.bits, 4⟩)
+          | _, _ => none
+        else none)
+      .constEvalSelect
+      [.tuple [.uint .u32, .uint .u32],
+       .fnDef "demo::ct_add" [.uint .u32],
+       .fnDef "demo::rt_add" [.uint .u32],
+       .uint .u32]
+      [.aggregate 0 [.scalar ⟨19, 4⟩, .scalar ⟨23, 4⟩], .unit, .unit] =
+      some (.scalar ⟨42, 4⟩) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-!
+### 10D. Modular `CallConv.rustIntrinsic` & `#[external_spec]` Caller
+Witnesses
+-/
+
+/--
+Caller `demo::intrinsic_bswap_pop` invoking two `CallConv.rustIntrinsic`
+operations (`core::intrinsics::bswap::<u32>` followed by
+`core::intrinsics::ctpop::<u32>`) on `_1 : u32`.
+-/
+def pureIntrinsicCallerBody : CapturedMir where
+  defPath := "demo::intrinsic_bswap_pop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "x" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "swapped" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_2); _2 = core::intrinsics::bswap::<u32>(_1) -> bb1
+    { statements := [
+        { kind := .storageLive 2, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::bswap" [.uint .u32])
+          [.copy { local_ := 1, projection := [] }]
+          { local_ := 2, projection := [] }
+          (.some 1)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: _0 = core::intrinsics::ctpop::<u32>(_2) -> bb2
+    { statements := []
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::ctpop" [.uint .u32])
+          [.copy { local_ := 2, projection := [] }]
+          { local_ := 0, projection := [] }
+          (.some 2)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: return
+    { statements := []
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := u32Layout, mode := .direct }]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/--
+Default 64-bit runtime `pureRustIntrinsicContract` instance (`pointerBytes =
+8`).
+-/
+abbrev defaultPureRustIntrinsicContract : MirCallContract :=
+  pureRustIntrinsicContract 8 true (fun _ _ _ => none)
+
+/--
+Expected return value `ctpop::<u32>(bswap::<u32>(x))` of
+`pureIntrinsicCallerBody`.
+-/
+@[irreducible]
+def expectedBswapPopU32 (x : Nat) : Value :=
+  .scalar ⟨pureCtpopLoop 32 (pureBswapLoop 4 x 0), 4⟩
+
+private theorem expectedBswapPopU32_def (x : Nat) :
+    (Value.scalar ⟨pureCtpopLoop 32 (pureBswapLoop 4 x 0), 4⟩) =
+      expectedBswapPopU32 x := by
+  unfold expectedBswapPopU32
+  rfl
+
+private theorem isCanonicalScalarOfSize_four {v : Nat} (hv : v < 4294967296) :
+    isCanonicalScalarOfSize { bits := v, sizeBytes := 4 } 4 = true := by
+  change decide (v < 4294967296) = true
+  exact decide_eq_true hv
+
+/--
+Compositional modular convergence for `pureIntrinsicCallerBody` under
+`defaultPureRustIntrinsicContract` on any canonical `x < 2^32` and arbitrary
+`traitImpls`.
+-/
+theorem pureIntrinsicCaller_modularConverges
+    (x : Nat) (hx : x < 4294967296)
+    (traitImpls : List TraitImplEntry := []) :
+    PureMirModularConverges
+      defaultPureRustIntrinsicContract
+      pureIntrinsicCallerBody []
+      (initPureState pureIntrinsicCallerBody [.scalar { bits := x, sizeBytes := 4 }])
+      (· = expectedBswapPopU32 x)
+      traitImpls := by
+  have h_canon_x :
+      isCanonicalScalarOfSize { bits := x, sizeBytes := 4 } 4 = true :=
+    isCanonicalScalarOfSize_four hx
+  have h_step (v a bound : Nat) (ha : a < bound) :
+      a * 256 + Nat.mod v 256 < bound * 256 := by
+    have hm : Nat.mod v 256 < 256 := Nat.mod_lt v (by decide)
+    omega
+  have h_bswap_lt : pureBswapLoop 4 x 0 < 4294967296 := by
+    dsimp only [pureBswapLoop]
+    have h1 := h_step x 0 1 (by decide)
+    have h2 := h_step (Nat.div x 256) _ 256 h1
+    have h3 := h_step (Nat.div (Nat.div x 256) 256) _ 65536 h2
+    exact h_step (Nat.div (Nat.div (Nat.div x 256) 256) 256) _ 16777216 h3
+  have h_canon_bs :
+      isCanonicalScalarOfSize
+        { bits := pureBswapLoop 4 x 0, sizeBytes := 4 } 4 = true :=
+    isCanonicalScalarOfSize_four h_bswap_lt
+  -- bb0: StorageLive(_2), then 1-step inline intrinsic bswap::<u32>(_1)
+  refine PureMirModularConverges.step_stmt
+    (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  refine PureMirModularConverges.call_inline_intrinsic
+    (retVal := .scalar ⟨pureBswapLoop 4 x 0, 4⟩)
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
+    (lookupCallee_nil _ _ _ _) (by decide)
+    (fun _ _ => evalDirectRustIntrinsic_bswap_u32 _ _ _ _ _ _ _ _ _ _ hx)
+    rfl ?_
+  -- bb1: 1-step inline intrinsic ctpop::<u32>(_2)
+  refine PureMirModularConverges.call_inline_intrinsic
+    (retVal := expectedBswapPopU32 x)
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
+    (lookupCallee_nil _ _ _ _) (by decide)
+    (fun _ _ => by
+      rw [← expectedBswapPopU32_def x]
+      exact evalDirectRustIntrinsic_ctpop_u32 _ _ _ _ _ _ _ _ _ _ h_bswap_lt)
+    rfl ?_
+  exact PureMirModularConverges.return_ (fun _ h => nomatch h) rfl rfl rfl rfl rfl
+
+/-- Modular precondition for `pureIntrinsicCallerBody`. -/
+def pureIntrinsicCallerPre (args : List Value) (mem : Memory) : Prop :=
+  (∃ x : Nat, x < 4294967296 ∧ args = [.scalar { bits := x, sizeBytes := 4 }]) ∧
+  mem.callees = [] ∧
+  mem.callStack = [] ∧
+  (mem.activeCallee = none ∨ mem.activeCallee = some pureIntrinsicCallerBody) ∧
+  mem.activeProtectors = []
+
+/-- Modular postcondition for `pureIntrinsicCallerBody`. -/
+def pureIntrinsicCallerPost
+    (args : List Value) (_ : Memory) (retVal : Value) (_ : Memory) : Prop :=
+  ∀ x : Nat,
+    args = [.scalar { bits := x, sizeBytes := 4 }] →
+    retVal = expectedBswapPopU32 x
+
+/-- Non-vacuity witness for `pureIntrinsicCallerBody`'s modular precondition. -/
+theorem pureIntrinsicCaller_modularPre_nonVacuous :
+    NonVacuousStatefulPre pureIntrinsicCallerPre :=
+  ⟨[.scalar { bits := 0x12345678, sizeBytes := 4 }],
+   emptyMemory,
+   ⟨0x12345678, by decide, rfl⟩,
+   rfl, rfl, Or.inl rfl, rfl⟩
+
+/--
+Audited `ModularVerificationResult` for `pureIntrinsicCallerBody` against
+`defaultPureRustIntrinsicContract.holdsOn`.
+-/
+theorem verify_pureIntrinsicCallerModular :
+    ModularVerificationResult
+      { body := pureIntrinsicCallerBody
+        envAssumed := defaultPureRustIntrinsicContract.holdsOn
+        pre := pureIntrinsicCallerPre
+        post := pureIntrinsicCallerPost } := by
+  refine verifyModularMir_of_pureModularExec
+    defaultPureRustIntrinsicContract
+    pureIntrinsicCallerBody
+    pureIntrinsicCallerPre
+    pureIntrinsicCallerPost
+    (fun _ _ h_pre => h_pre.2)
+    (fun args mem h_pre => ?_)
+  rcases h_pre.1 with ⟨x, hx, rfl⟩
+  refine PureMirModularConverges.mono ?_
+    (pureIntrinsicCaller_modularConverges x hx mem.traitImpls)
+  intro retVal h_ret _ x' h_eq
+  injection h_eq with h_hd _
+  injection h_hd with h_sc
+  injection h_sc with hx_eq _
+  subst hx_eq
+  exact h_ret
+
+/--
+Sidecar stub body for a polymorphic `#[external_spec]` target
+`ext::checked_inc<T>(x: u32) -> u32` (monomorphized at `T = u32`).
+-/
+def extCheckedIncSidecarBody : CapturedMir where
+  defPath := "ext::checked_inc_spec"
+  phase := .runtimePostCleanup
+  role := .externalSpec "ext::checked_inc"
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "x" }
+  ]
+  basicBlocks := [
+    { statements := []
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [{ layout := u32Layout, mode := .direct }]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/--
+Polymorphic `#[external_spec]` contract for `ext::checked_inc::<u32>`:
+requires `x < 2^32 - 1` and returns `x + 1`.
+-/
+def extCheckedIncContract : MirCallContract :=
+  polyExternalSpecCallContract
+    "ext::checked_inc"
+    [.uint .u32]
+    extCheckedIncSidecarBody
+    (fun args => ∃ x : Nat, x < 4294967295 ∧ args = [.scalar { bits := x, sizeBytes := 4 }])
+    (fun args retVal =>
+      ∀ x : Nat,
+        args = [.scalar { bits := x, sizeBytes := 4 }] →
+        retVal = .scalar { bits := x + 1, sizeBytes := 4 })
+
+/--
+Hybrid caller `demo::external_spec_and_poly_callee` (`argCount := 1`,
+input `_1 : (u32, u32) = (x, y)` with `x < 2^32 - 1`):
+- `bb0`: `StorageLive(_2, _3)`; calls `#[external_spec]` target
+  `ext::checked_inc::<u32>(_1.0)` -> `_2 = x + 1`.
+- `bb1`: constructs `_3 = (_2, _1.1) = (x + 1, y)`, then calls linked
+  polymorphic
+  callee `demo::poly_swap_pair::<u32>(_3)` in `demoCallees` -> `_0 = (y, x +
+  1)`.
+- `bb2`: `return`.
+-/
+def externalSpecAndPolyCalleeCallerBody : CapturedMir where
+  defPath := "demo::external_spec_and_poly_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "_0" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "inc_x" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "tmp_pair" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_2, _3); _2 = ext::checked_inc::<u32>(_1.0) -> bb1
+    { statements := [
+        { kind := .storageLive 2, span := pureAdtSpan },
+        { kind := .storageLive 3, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "ext::checked_inc" [.uint .u32])
+          [.copy { local_ := 1, projection := [.field 0 pureU32Ty] }]
+          { local_ := 2, projection := [] }
+          (.some 1)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: _3 = (_2, _1.1); _0 = demo::poly_swap_pair::<u32>(_3) -> bb2
+    { statements := [
+        { kind := .assign
+            { local_ := 3, projection := [] }
+            (.aggregate .tuple [
+              .copy { local_ := 2, projection := [] },
+              .copy { local_ := 1, projection := [.field 1 pureU32Ty] }
+            ])
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::poly_swap_pair" [.uint .u32])
+          [.copy { local_ := 3, projection := [] }]
+          { local_ := 0, projection := [] }
+          (.some 2)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: return
+    { statements := []
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := pairU32Layout, mode := .direct }]
+    ret := { layout := pairU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/--
+Compositional modular proof combining a 1-step `#[external_spec]` call
+(`PureMirModularConverges.call_poly_external_spec`) with a 1-step linked
+polymorphic callee summary (`PureMirModularConverges.call_summary`), even after
+the external call may have mutated `m.borrows` or `m.globals`.
+-/
+theorem externalSpecAndPolyCallee_modularConverges
+    (x y : Nat) (hx : x < 4294967295) :
+    PureMirModularConverges
+      extCheckedIncContract
+      externalSpecAndPolyCalleeCallerBody
+      [polySwapPairBody]
+      (initPureState externalSpecAndPolyCalleeCallerBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ])
+      (· = .aggregate 0 [
+        .scalar { bits := y, sizeBytes := 4 },
+        .scalar { bits := x + 1, sizeBytes := 4 }
+      ])
+      [] := by
+  -- bb0: StorageLive(_2), StorageLive(_3), then 1-step #[external_spec] call
+  refine PureMirModularConverges.step_stmt
+    (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  refine PureMirModularConverges.step_stmt
+    (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  refine PureMirModularConverges.call_poly_external_spec
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl
+    ⟨⟨x, by dsimp [scalarModulus]; omega, rfl⟩, trivial⟩
+    ⟨x, hx, rfl⟩
+    (Or.inl rfl)
+    ?_
+  rintro retVal ⟨_, h_ext_post⟩
+  have h_rv : retVal = .scalar { bits := x + 1, sizeBytes := 4 } :=
+    h_ext_post x rfl
+  subst h_rv
+  refine ⟨_, rfl, ?_⟩
+  -- bb1 stmt 0: _3 = (_2, _1.1)
+  refine PureMirModularConverges.step_stmt
+    (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  -- bb1 terminator: 1-step linked polymorphic callee summary
+  -- demo::poly_swap_pair::<u32>
+  refine PureMirModularConverges.call_summary
+    (maxCallDepth := 1)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl rfl
+    (by decide)
+    (PureMirConvergesWithCallees.of_pureMirConverges
+      checkPureMir_polySwapPairU32Body
+      (polySwapPairU32_pureConverges
+        (.scalar { bits := x + 1, sizeBytes := 4 })
+        (.scalar { bits := y, sizeBytes := 4 })))
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- bb2: return_
+  exact PureMirModularConverges.return_ (fun _ h => nomatch h) rfl rfl rfl rfl rfl
+
+/--
+Non-vacuity witness for `externalSpecAndPolyCalleeCallerBody`'s precondition.
+-/
+theorem externalSpecAndPolyCallee_modularPre_nonVacuous :
+    NonVacuousStatefulPre
+      (fun args mem =>
+        (∃ (x y : Nat),
+          x < 4294967295 ∧
+          args = [
+            .aggregate 0 [
+              .scalar { bits := x, sizeBytes := 4 },
+              .scalar { bits := y, sizeBytes := 4 }
+            ]
+          ]) ∧
+        mem.callStack = [] ∧
+        (mem.activeCallee = none ∨
+         mem.activeCallee = some externalSpecAndPolyCalleeCallerBody) ∧
+        mem.activeProtectors = []) :=
+  ⟨[.aggregate 0 [.scalar { bits := 41, sizeBytes := 4 }, .scalar { bits := 7, sizeBytes := 4 }]],
+   emptyMemory,
+   ⟨41, 7, by decide, rfl⟩,
+   rfl, Or.inl rfl, rfl⟩
+
+/--
+Audited `ModularVerificationResult` for `externalSpecAndPolyCalleeCallerBody`
+with linked `[polySwapPairBody]` and external `extCheckedIncContract.holdsOn`.
+-/
+theorem verify_externalSpecAndPolyCalleeModular :
+    ModularVerificationResult
+      { body := externalSpecAndPolyCalleeCallerBody
+        callees := [polySwapPairBody]
+        envAssumed := extCheckedIncContract.holdsOn
+        pre := fun args mem =>
+          (∃ (x y : Nat),
+            x < 4294967295 ∧
+            args = [
+              .aggregate 0 [
+                .scalar { bits := x, sizeBytes := 4 },
+                .scalar { bits := y, sizeBytes := 4 }
+              ]
+            ]) ∧
+          mem.callStack = [] ∧
+          (mem.activeCallee = none ∨
+           mem.activeCallee = some externalSpecAndPolyCalleeCallerBody) ∧
+          mem.activeProtectors = []
+        post := fun args _ retVal _ =>
+          ∀ (x y : Nat),
+            args = [
+              .aggregate 0 [
+                .scalar { bits := x, sizeBytes := 4 },
+                .scalar { bits := y, sizeBytes := 4 }
+              ]
+            ] →
+            retVal = .aggregate 0 [
+              .scalar { bits := y, sizeBytes := 4 },
+              .scalar { bits := x + 1, sizeBytes := 4 }
+            ] } := by
+  refine verifyModularMirWithCallees_of_pureModularExec
+    extCheckedIncContract
+    externalSpecAndPolyCalleeCallerBody
+    [polySwapPairBody]
+    _ _
+    (by decide)
+    (fun _ _ h_pre => h_pre.2)
+    (fun args _ h_pre => ?_)
+  rcases h_pre.1 with ⟨x, y, hx, rfl⟩
+  refine PureMirModularConverges.mono ?_
+    (externalSpecAndPolyCallee_modularConverges x y hx)
+  intro retVal h_ret _ x' y' h_eq
+  rcases pairU32Args_inj h_eq with ⟨rfl, rfl⟩
+  exact h_ret
+
+/-!
+### 10E. Combined Modular Pipeline Witness — `combineMirCallContracts`
+(`#[external_spec]` + `bswap` + `const_eval_select(ctpop)` + `assert` +
+`exact_div` + Linked Polymorphic `tailCall`)
+-/
+
+/--
+Combined rely contract pairing `defaultPureRustIntrinsicContract` and
+`extCheckedIncContract` via `combineMirCallContracts`.
+-/
+def combinedIntrinsicAndExtContract : MirCallContract :=
+  combineMirCallContracts defaultPureRustIntrinsicContract extCheckedIncContract
+
+/--
+Combined modular caller `demo::combined_modular_pipeline` (`argCount := 1`,
+input `_1 : (u32, u32) = (x, y)` with `x < 2^31`):
+- `bb0`: `StorageLive(_2.._9)`; calls `#[external_spec]` target
+  `ext::checked_inc::<u32>(_1.0)` -> `_2 = x + 1`.
+- `bb1`: calls `core::intrinsics::bswap::<u32>(_2)` -> `_3`.
+- `bb2`: packs `_5 = (_3,)` and calls `core::intrinsics::const_eval_select`
+  selecting `core::intrinsics::ctpop::<u32>` at runtime -> `_4 =
+  ctpop::<u32>(bswap::<u32>(x + 1))`.
+- `bb3`: computes `_6 = (_2 == _2)` and executes `TerminatorKind.assert` ->
+  `bb4`.
+- `bb4`: computes `_7 = _1.0 * 2` and calls inline
+  `core::intrinsics::exact_div::<u32>(_7, 2)` -> `_8 = x`.
+- `bb5`: constructs `_9 = (_4, _8)` and executes `TerminatorKind.tailCall` to
+  linked polymorphic `demo::poly_swap_pair::<u32>(_9)` -> `(x,
+  ctpop::<u32>(bswap::<u32>(x + 1)))`.
+-/
+def combinedModularPipelineBody : CapturedMir where
+  defPath := "demo::combined_modular_pipeline"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "_0" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "inc_x" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "bswap_inc" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "pop_val" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32], layoutIdx := 0 }, debugName := some "arg_tup" },
+    { mutability := .mut, ty := { kind := .bool, layoutIdx := 0 }, debugName := some "cond" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "doubled_x" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "halved_x" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "final_pair" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_2.._9); _2 = ext::checked_inc::<u32>(_1.0) -> bb1
+    { statements := [
+        { kind := .storageLive 2, span := pureAdtSpan },
+        { kind := .storageLive 3, span := pureAdtSpan },
+        { kind := .storageLive 4, span := pureAdtSpan },
+        { kind := .storageLive 5, span := pureAdtSpan },
+        { kind := .storageLive 6, span := pureAdtSpan },
+        { kind := .storageLive 7, span := pureAdtSpan },
+        { kind := .storageLive 8, span := pureAdtSpan },
+        { kind := .storageLive 9, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "ext::checked_inc" [.uint .u32])
+          [.copy { local_ := 1, projection := [.field 0 pureU32Ty] }]
+          { local_ := 2, projection := [] }
+          (.some 1)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: _3 = core::intrinsics::bswap::<u32>(_2) -> bb2
+    { statements := []
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::bswap" [.uint .u32])
+          [.copy { local_ := 2, projection := [] }]
+          { local_ := 3, projection := [] }
+          (.some 2)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: _5 = (_3,); _4 = const_eval_select((_3,), ctpop::<u32>,
+    -- ctpop::<u32>) -> bb3
+    { statements := [
+        { kind := .assign
+            { local_ := 5, projection := [] }
+            (.aggregate .tuple [.copy { local_ := 3, projection := [] }])
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::const_eval_select" [
+            .tuple [.uint .u32],
+            .fnDef "core::intrinsics::ctpop" [.uint .u32],
+            .fnDef "core::intrinsics::ctpop" [.uint .u32],
+            .uint .u32
+          ])
+          [ .copy { local_ := 5, projection := [] },
+            fnItemOperand "core::intrinsics::ctpop" [.uint .u32],
+            fnItemOperand "core::intrinsics::ctpop" [.uint .u32] ]
+          { local_ := 4, projection := [] }
+          (.some 3)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb3: _6 = (_2 == _2); assert(_6 == true) -> bb4
+    { statements := [
+        { kind := .assign
+            { local_ := 6, projection := [] }
+            (.binaryOp .eq
+              (.copy { local_ := 2, projection := [] })
+              (.copy { local_ := 2, projection := [] }))
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .assert
+          (.copy { local_ := 6, projection := [] })
+          true
+          4
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb4: _7 = _1.0 * 2; _8 = core::intrinsics::exact_div::<u32>(_7, 2) -> bb5
+    { statements := [
+        { kind := .assign
+            { local_ := 7, projection := [] }
+            (.binaryOp .mul
+              (.copy { local_ := 1, projection := [.field 0 pureU32Ty] })
+              (u32ConstOperand 2))
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::exact_div" [.uint .u32])
+          [.copy { local_ := 7, projection := [] }, u32ConstOperand 2]
+          { local_ := 8, projection := [] }
+          (.some 5)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb5: _9 = (_4, _8); tailCall demo::poly_swap_pair::<u32>(_9)
+    { statements := [
+        { kind := .assign
+            { local_ := 9, projection := [] }
+            (.aggregate .tuple [
+              .copy { local_ := 4, projection := [] },
+              .copy { local_ := 8, projection := [] }
+            ])
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .tailCall
+          (fnItemOperand "demo::poly_swap_pair" [.uint .u32])
+          [.copy { local_ := 9, projection := [] }]
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := pairU32Layout, mode := .direct }]
+    ret := { layout := pairU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+@[irreducible]
+private def bswapScalarU32 (v : Nat) : ScalarInt :=
+  ⟨pureBswapLoop 4 v 0, 4⟩
+
+private theorem bswapScalarU32_def (v : Nat) :
+    ({ bits := pureBswapLoop 4 v 0, sizeBytes := 4 } : ScalarInt) =
+      bswapScalarU32 v := by
+  unfold bswapScalarU32
+  rfl
+
+private theorem evalConstEvalSelect_ctpop_u32 (v : ScalarInt)
+    (hv : isCanonicalScalarOfSize v 4 = true) :
+    evalPureRustIntrinsicWithRuntime (fun _ _ _ => none) .constEvalSelect
+      [.tuple [.uint .u32],
+       .fnDef "core::intrinsics::ctpop" [.uint .u32],
+       .fnDef "core::intrinsics::ctpop" [.uint .u32],
+       .uint .u32]
+      [.aggregate 0 [.scalar v], .unit, .unit] 8 true =
+      some (.scalar ⟨pureCtpopLoop 32 v.bits, 4⟩) := by
+  have h_unp :
+      unpackConstEvalSelectWithElemTys?
+        [.tuple [.uint .u32],
+         .fnDef "core::intrinsics::ctpop" [.uint .u32],
+         .fnDef "core::intrinsics::ctpop" [.uint .u32],
+         .uint .u32]
+        [.aggregate 0 [.scalar v], .unit, .unit] =
+      some ([.uint .u32], "core::intrinsics::ctpop", [.uint .u32], [.scalar v]) := rfl
+  have h_cls : classifyPureRustIntrinsic? "core::intrinsics::ctpop" = some .ctpop := rfl
+  dsimp only [evalPureRustIntrinsicWithRuntime]
+  rw [h_unp]
+  dsimp only
+  rw [h_cls]
+  change (if isCanonicalScalarOfSize v 4 then some (Value.scalar ⟨pureCtpopLoop 32 v.bits, 4⟩) else none) = _
+  rw [hv]
+  rfl
+
+private theorem pureBswapLoop_four_lt (v : Nat) :
+    pureBswapLoop 4 v 0 < 4294967296 := by
+  have h_step (u a bound : Nat) (ha : a < bound) :
+      a * 256 + Nat.mod u 256 < bound * 256 := by
+    have hm : Nat.mod u 256 < 256 := Nat.mod_lt u (by decide)
+    omega
+  dsimp only [pureBswapLoop]
+  have h1 := h_step v 0 1 (by decide)
+  have h2 := h_step (Nat.div v 256) _ 256 h1
+  have h3 := h_step (Nat.div (Nat.div v 256) 256) _ 65536 h2
+  exact h_step (Nat.div (Nat.div (Nat.div v 256) 256) 256) _ 16777216 h3
+
+private theorem checkPureMirWithCallees_polySwapPairU32 :
+    checkPureMirWithCallees [polySwapPairBody] polySwapPairU32Body 1 [] = true := by
+  decide
+
+private theorem combinedModularPipeline_from_bb3
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirModularConverges
+      combinedIntrinsicAndExtContract
+      combinedModularPipelineBody
+      [polySwapPairBody]
+      { bb := 3
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .init (.scalar { bits := x + 1, sizeBytes := 4 }),
+          .init (.scalar (bswapScalarU32 (x + 1))),
+          .init (expectedBswapPopU32 (x + 1)),
+          .init (.aggregate 0 [.scalar (bswapScalarU32 (x + 1))]),
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit
+        ] }
+      (· = .aggregate 0 [
+        .scalar { bits := x, sizeBytes := 4 },
+        expectedBswapPopU32 (x + 1)
+      ])
+      [] := by
+  -- bb3 stmt 0: _6 = (_2 == _2) (evaluates to bool true = 1)
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  -- bb3 terminator: assert(_6 == true) -> bb4
+  refine PureMirModularConverges.step_assert
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl
+    (fun _ => ?_)
+    (fun _ => Or.inl rfl)
+  -- bb4 stmt 0: _7 = _1.0 * 2
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  -- bb4 terminator: inline core::intrinsics::exact_div::<u32>(_7, 2) -> bb5
+  refine PureMirModularConverges.call_exact_div
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+    (evalExactDiv_double_u32 hx) rfl ?_
+  -- bb5 stmt 0: _9 = (_4, _8)
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  -- bb5 terminator: linked polymorphic tailCall demo::poly_swap_pair::<u32>(_9)
+  refine PureMirModularConverges.tailCall_summary
+    (maxCallDepth := 1)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMirWithCallees_polySwapPairU32
+    (PureMirConvergesWithCallees.of_pureMirConverges
+      checkPureMir_polySwapPairU32Body
+      (polySwapPairU32_pureConverges
+        (expectedBswapPopU32 (x + 1))
+        (.scalar { bits := x, sizeBytes := 4 })))
+    (fun _ h => h)
+
+private theorem combinedModularPipeline_from_bb2
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirModularConverges
+      combinedIntrinsicAndExtContract
+      combinedModularPipelineBody
+      [polySwapPairBody]
+      { bb := 2
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .init (.scalar { bits := x + 1, sizeBytes := 4 }),
+          .init (.scalar (bswapScalarU32 (x + 1))),
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit
+        ] }
+      (· = .aggregate 0 [
+        .scalar { bits := x, sizeBytes := 4 },
+        expectedBswapPopU32 (x + 1)
+      ])
+      [] := by
+  -- bb2 stmt 0: _5 = (_3,)
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  -- bb2 terminator: const_eval_select((_3,), ctpop::<u32>, ctpop::<u32>)
+  refine PureMirModularConverges.call_inline_intrinsic
+    (retVal := expectedBswapPopU32 (x + 1))
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl (by decide)
+    (fun m hm => by
+      have h_sz_bs : (bswapScalarU32 (x + 1)).sizeBytes = 4 := by
+        rw [← bswapScalarU32_def]
+      have h_bits_bs : (bswapScalarU32 (x + 1)).bits = pureBswapLoop 4 (x + 1) 0 := by
+        rw [← bswapScalarU32_def]
+      have h_lt_bs : (bswapScalarU32 (x + 1)).bits < 4294967296 := by
+        rw [h_bits_bs]
+        exact pureBswapLoop_four_lt (x + 1)
+      rw [← expectedBswapPopU32_def (x + 1), ← h_bits_bs]
+      exact evalDirectRustIntrinsic_constEvalSelect_ctpop_u32
+        _ _ _ _ _ _ _ _ _ _ _ rfl rfl
+        (by dsimp only [PureState.toMachineState]; rw [hm.1, hm.2.1]; rfl)
+        h_sz_bs h_lt_bs)
+    rfl
+    (combinedModularPipeline_from_bb3 x y hx)
+
+/--
+Compositional modular proof for `combinedModularPipelineBody`, combining
+`call_poly_external_spec_sub`, `call_inline_intrinsic` (`bswap` +
+`const_eval_select(ctpop)`), `step_assert`, `call_exact_div`, and
+`tailCall_summary` in a single caller under `combinedIntrinsicAndExtContract`.
+-/
+theorem combinedModularPipeline_modularConverges
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirModularConverges
+      combinedIntrinsicAndExtContract
+      combinedModularPipelineBody
+      [polySwapPairBody]
+      (initPureState combinedModularPipelineBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ])
+      (· = .aggregate 0 [
+        .scalar { bits := x, sizeBytes := 4 },
+        expectedBswapPopU32 (x + 1)
+      ])
+      [] := by
+  have hx1_lt : x + 1 < 4294967296 :=
+    Nat.lt_trans (Nat.succ_lt_succ hx) (by decide)
+  -- bb0: StorageLive(_2.._9)
+  have h_init :
+      initPureState combinedModularPipelineBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] = {
+        bb := 0
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .dead, .dead, .dead, .dead, .dead, .dead, .dead, .dead
+        ]
+      } := rfl
+  rw [h_init]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  -- bb0 terminator: ext::checked_inc::<u32>(_1.0) via call_poly_external_spec_sub
+  refine PureMirModularConverges.call_poly_external_spec_sub
+    (targetDefPath := "ext::checked_inc")
+    (expectedTypeArgs := [.uint .u32])
+    (sidecarBody := extCheckedIncSidecarBody)
+    (extraPre := fun args =>
+      ∃ x : Nat, x < 4294967295 ∧ args = [.scalar { bits := x, sizeBytes := 4 }])
+    (extraPost := fun args retVal =>
+      ∀ x : Nat,
+        args = [.scalar { bits := x, sizeBytes := 4 }] →
+        retVal = .scalar { bits := x + 1, sizeBytes := 4 })
+    (MirCallContract.Subsumes.combine_right
+      defaultPureRustIntrinsicContract extCheckedIncContract)
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    ⟨⟨x, Nat.lt_trans hx (by decide), rfl⟩, trivial⟩
+    ⟨x, Nat.lt_trans hx (by decide), rfl⟩
+    (Or.inl rfl)
+    ?_
+    rfl
+  rintro retVal ⟨_, h_ext_post⟩
+  have h_rv : retVal = .scalar { bits := x + 1, sizeBytes := 4 } :=
+    h_ext_post x rfl
+  subst h_rv
+  refine ⟨_, rfl, ?_⟩
+  -- bb1: core::intrinsics::bswap::<u32>(_2) via call_inline_intrinsic
+  refine PureMirModularConverges.call_inline_intrinsic
+    (retVal := .scalar (bswapScalarU32 (x + 1)))
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    ?_
+    rfl
+    (combinedModularPipeline_from_bb2 x y hx)
+  intro _ _
+  rw [← bswapScalarU32_def]
+  exact evalDirectRustIntrinsic_bswap_u32 _ _ _ _ _ _ _ _ _ _ hx1_lt
+
+/-- Non-vacuity witness for `combinedModularPipelineBody`'s precondition. -/
+theorem combinedModularPipeline_modularPre_nonVacuous :
+    NonVacuousStatefulPre
+      (fun args mem =>
+        (∃ (x y : Nat),
+          x < 2147483648 ∧
+          args = [
+            .aggregate 0 [
+              .scalar { bits := x, sizeBytes := 4 },
+              .scalar { bits := y, sizeBytes := 4 }
+            ]
+          ]) ∧
+        mem.callStack = [] ∧
+        (mem.activeCallee = none ∨
+         mem.activeCallee = some combinedModularPipelineBody) ∧
+        mem.activeProtectors = []) :=
+  ⟨[.aggregate 0 [.scalar { bits := 19, sizeBytes := 4 }, .scalar { bits := 3, sizeBytes := 4 }]],
+   emptyMemory,
+   ⟨19, 3, by decide, rfl⟩,
+   rfl, Or.inl rfl, rfl⟩
+
+/--
+Audited `ModularVerificationResult` for `combinedModularPipelineBody` against
+`combinedIntrinsicAndExtContract.holdsOn`.
+-/
+theorem verify_combinedModularPipeline :
+    ModularVerificationResult
+      { body := combinedModularPipelineBody
+        callees := [polySwapPairBody]
+        envAssumed := combinedIntrinsicAndExtContract.holdsOn
+        pre := fun args mem =>
+          (∃ (x y : Nat),
+            x < 2147483648 ∧
+            args = [
+              .aggregate 0 [
+                .scalar { bits := x, sizeBytes := 4 },
+                .scalar { bits := y, sizeBytes := 4 }
+              ]
+            ]) ∧
+          mem.callStack = [] ∧
+          (mem.activeCallee = none ∨
+           mem.activeCallee = some combinedModularPipelineBody) ∧
+          mem.activeProtectors = []
+        post := fun args _ retVal _ =>
+          ∀ (x y : Nat),
+            args = [
+              .aggregate 0 [
+                .scalar { bits := x, sizeBytes := 4 },
+                .scalar { bits := y, sizeBytes := 4 }
+              ]
+            ] →
+            retVal = .aggregate 0 [
+              .scalar { bits := x, sizeBytes := 4 },
+              expectedBswapPopU32 (x + 1)
+            ] } := by
+  refine verifyModularMirWithCallees_of_pureModularExec
+    combinedIntrinsicAndExtContract
+    combinedModularPipelineBody
+    [polySwapPairBody]
+    _ _
+    (by decide)
+    (fun _ _ h_pre => h_pre.2)
+    (fun args _ h_pre => ?_)
+  rcases h_pre.1 with ⟨x, y, hx, rfl⟩
+  refine PureMirModularConverges.mono ?_
+    (combinedModularPipeline_modularConverges x y hx)
+  intro retVal h_ret _ x' y' h_eq
+  rcases pairU32Args_inj h_eq with ⟨rfl, rfl⟩
+  exact h_ret
+
+/-!
+### 10F. `TraitImplEntry` Dispatch, Multi-Monomorphization (`u32` + `u64`),
+Linked `tailCall`, & Computable `evalPureMirWithCallees` Witness
+-/
+
+/--
+Concrete `u32` trait-method implementation body `demo::u32_step_impl`
+(`<u32 as demo::StepTrait>::step`), returning `_1 + 1` (wrapping modulo `2^32`).
+-/
+def u32StepImplBody : CapturedMir where
+  defPath := "demo::u32_step_impl"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "x" }
+  ]
+  basicBlocks := [
+    { statements := [
+        { kind := .assign
+            { local_ := 0, projection := [] }
+            (.binaryOp .add
+              (.copy { local_ := 1, projection := [] })
+              (u32ConstOperand 1))
+          span := pureAdtSpan }
+      ]
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := u32Layout, mode := .direct }]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/--
+Registered `TraitImplEntry` associating `<u32 as demo::StepTrait>::step` with
+`demo::u32_step_impl`.
+-/
+def demoStepTraitImpl : TraitImplEntry where
+  traitRef := { defPath := "demo::StepTrait::step", args := [.uint .u32] }
+  implPath := "demo::u32_step_impl"
+
+theorem checkPureMir_u32StepImplBody : checkPureMir u32StepImplBody = true := by
+  decide
+
+theorem u32StepImpl_pureConverges (x : Nat) :
+    PureMirConverges u32StepImplBody
+      (initPureState u32StepImplBody [.scalar { bits := x, sizeBytes := 4 }])
+      (· = .scalar { bits := wrapScalarBits (Nat.add x 1) (scalarModulus 4), sizeBytes := 4 }) :=
+  ⟨4, rfl⟩
+
+/--
+Layout table supporting both `(u32, u32)` and `(u64, u64)` pairs in a single
+caller (`[u32Layout, pairU32Layout, u64Layout, pairU64Layout]`).
+-/
+def multiMonoCallerLayouts : LayoutTable where
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [u32Layout, pairU32Layout, u64Layout, pairU64Layout]
+
+/--
+Caller `demo::trait_and_tail_multi_mono_caller` (`argCount := 2`,
+`_1 : (u32, u32) = (x, y)`, `_2 : (u64, u64) = (z, w)`, with
+`traitImpls := [demoStepTraitImpl]`):
+- `bb0`: calls `demo::poly_swap_pair::<u32>(_1)` -> `_3 = (y, x)`.
+- `bb1`: calls `demo::poly_swap_pair::<u64>(_2)` -> `_4 = (w, z)` (second
+  monomorphization of `polySwapPairBody` in the same caller!).
+- `bb2`: dispatches trait method `demo::StepTrait::step::<u32>(_3.1)` via
+  `TraitImplEntry` (`demoStepTraitImpl` -> `demo::u32_step_impl`) -> `_5 =
+  (x + 1) % 2^32`.
+- `bb3`: executes `TerminatorKind.tailCall` to trait method
+  `demo::StepTrait::step::<u32>(_5)` -> `((x + 1) % 2^32 + 1) % 2^32`.
+-/
+def traitAndTailMultiMonoCallerBody : CapturedMir where
+  defPath := "demo::trait_and_tail_multi_mono_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair32" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 3 }, debugName := some "pair64" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "sw32" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 3 }, debugName := some "sw64" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "step1" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_3, _4, _5); _3 = demo::poly_swap_pair::<u32>(_1) -> bb1
+    { statements := [
+        { kind := .storageLive 3, span := pureAdtSpan },
+        { kind := .storageLive 4, span := pureAdtSpan },
+        { kind := .storageLive 5, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::poly_swap_pair" [.uint .u32])
+          [.copy { local_ := 1, projection := [] }]
+          { local_ := 3, projection := [] }
+          (.some 1)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: _4 = demo::poly_swap_pair::<u64>(_2) -> bb2
+    { statements := []
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::poly_swap_pair" [.uint .u64])
+          [.copy { local_ := 2, projection := [] }]
+          { local_ := 4, projection := [] }
+          (.some 2)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: _5 = <u32 as demo::StepTrait>::step(_3.1) -> bb3
+    { statements := []
+      terminator := {
+        kind := .call
+          (fnItemOperand "demo::StepTrait::step" [.uint .u32])
+          [.copy { local_ := 3, projection := [.field 1 pureU32Ty] }]
+          { local_ := 5, projection := [] }
+          (.some 3)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb3: tailCall <u32 as demo::StepTrait>::step(_5)
+    { statements := []
+      terminator := {
+        kind := .tailCall
+          (fnItemOperand "demo::StepTrait::step" [.uint .u32])
+          [.copy { local_ := 5, projection := [] }]
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [
+      { layout := pairU32Layout, mode := .direct },
+      { layout := pairU64Layout, mode := .direct }
+    ]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := multiMonoCallerLayouts
+  allocations := []
+  traitImpls := [demoStepTraitImpl]
+
+def traitMultiMonoCallees : List CapturedMir :=
+  [polySwapPairBody, u32StepImplBody]
+
+theorem checkPureMirWithCallees_traitAndTailMultiMono :
+    checkPureMirWithCallees traitMultiMonoCallees
+      traitAndTailMultiMonoCallerBody 2 [demoStepTraitImpl] = true := by
+  decide
+
+/--
+Compositional 4-step proof of `traitAndTailMultiMonoCallerBody` exercising
+`u32` + `u64` multi-monomorphization of `polySwapPairBody`, `TraitImplEntry`
+dispatch (`<u32 as demo::StepTrait>::step -> demo::u32_step_impl`), and
+`PureMirConverges.tailCall_leaf_summary`.
+-/
+theorem traitAndTailMultiMonoCaller_compositional (x y z w : Nat) :
+    PureMirConvergesWithCallees traitAndTailMultiMonoCallerBody
+      traitMultiMonoCallees
+      (initPureState traitAndTailMultiMonoCallerBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ],
+        .aggregate 0 [
+          .scalar { bits := z, sizeBytes := 8 },
+          .scalar { bits := w, sizeBytes := 8 }
+        ]
+      ])
+      (· = .scalar {
+        bits := wrapScalarBits
+          (Nat.add (wrapScalarBits (Nat.add x 1) (scalarModulus 4)) 1)
+          (scalarModulus 4)
+        sizeBytes := 4
+      })
+      [demoStepTraitImpl] := by
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  -- 1. demo::poly_swap_pair::<u32>(_1)
+  refine PureMirConverges.call_leaf_summary
+    (maxCallDepth := 2)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_polySwapPairU32Body
+    (polySwapPairU32_pureConverges
+      (.scalar { bits := x, sizeBytes := 4 })
+      (.scalar { bits := y, sizeBytes := 4 }))
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- 2. demo::poly_swap_pair::<u64>(_2)
+  refine PureMirConverges.call_leaf_summary
+    (maxCallDepth := 2)
+    (calleeBody := polySwapPairU64Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_polySwapPairU64Body
+    (polySwapPairU64_pureConverges
+      (.scalar { bits := z, sizeBytes := 8 })
+      (.scalar { bits := w, sizeBytes := 8 }))
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- 3. TraitImplEntry dispatch <u32 as demo::StepTrait>::step(_3.1)
+  refine PureMirConverges.call_leaf_summary
+    (maxCallDepth := 2)
+    (calleeBody := u32StepImplBody)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_u32StepImplBody
+    (u32StepImpl_pureConverges x)
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- 4. TraitImplEntry tailCall <u32 as demo::StepTrait>::step(_5)
+  exact PureMirConverges.tailCall_leaf_summary
+    (maxCallDepth := 2)
+    (calleeBody := u32StepImplBody)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_u32StepImplBody
+    (u32StepImpl_pureConverges (wrapScalarBits (Nat.add x 1) (scalarModulus 4)))
+    (fun _ h => h)
+
+/--
+Zero-step computable evaluation witness for `traitAndTailMultiMonoCallerBody`
+via `pureMirConvergesWithCallees_of_evalPureMirWithCallees` (`x = 40` -> `42`).
+-/
+theorem traitAndTailMultiMonoCaller_evalConcrete :
+    PureMirConvergesWithCallees traitAndTailMultiMonoCallerBody
+      traitMultiMonoCallees
+      (initPureState traitAndTailMultiMonoCallerBody [
+        .aggregate 0 [
+          .scalar { bits := 40, sizeBytes := 4 },
+          .scalar { bits := 7, sizeBytes := 4 }
+        ],
+        .aggregate 0 [
+          .scalar { bits := 100, sizeBytes := 8 },
+          .scalar { bits := 200, sizeBytes := 8 }
+        ]
+      ])
+      (· = .scalar { bits := 42, sizeBytes := 4 })
+      [demoStepTraitImpl] :=
+  pureMirConvergesWithCallees_of_evalPureMirWithCallees
+    checkPureMirWithCallees_traitAndTailMultiMono
+    (fuel := 32)
+    rfl
+
+/-!
+### 10G. Higher-Order Local Zero-Sized Function-Item & Callee-Backed
+`const_eval_select` + Diverging Panic + External Intrinsic `tailCall` Witnesses
+-/
+
+/-- Zero-sized layout (`0` bytes) for function-item types (`RigidTy.fnDef`). -/
+def zstFnItemLayout : TypeLayout :=
+  Option.getD
+    (RigidTy.computeLayout 64 [] [] none (.fnDef "demo::poly_swap_pair" [.uint .u32]))
+    u32Layout
+
+/-- Function-item `Ty` for `demo::poly_swap_pair::<u32>` at layout slot `2`. -/
+def polySwapU32FnItemTy : Ty :=
+  { kind := .fnDef "demo::poly_swap_pair" [.uint .u32], layoutIdx := 2 }
+
+/--
+Caller layout table `[u32Layout, pairU32Layout, zstFnItemLayout]` supporting
+`u32`, `(u32, u32)`, and zero-sized `fnDef` local variables.
+-/
+def higherOrderCallerLayouts : LayoutTable where
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [u32Layout, pairU32Layout, zstFnItemLayout]
+
+/--
+Higher-order caller `demo::higher_order_fn_item_caller` (`argCount := 2`):
+- `_1` has zero-sized function-item type `RigidTy.fnDef "demo::poly_swap_pair"
+  [.uint .u32]` (`Value.unit`),
+- `_2` has type `(u32, u32)`,
+- `bb0` copies `_1` into local `_3` and invokes `TerminatorKind.call` via
+  `Operand.move _3` (`extractCalleeDefPath? = none`!), writing `_4 = (y, x)`,
+- `bb1` invokes `TerminatorKind.tailCall` via `Operand.copy _1`
+  (`extractCalleeDefPath? = none`!), returning `(x, y)`.
+-/
+def higherOrderFnItemCallerBody : CapturedMir where
+  defPath := "demo::higher_order_fn_item_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "_0" },
+    { mutability := .not, ty := polySwapU32FnItemTy, debugName := some "f" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair" },
+    { mutability := .mut, ty := polySwapU32FnItemTy, debugName := some "f_local" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "swapped" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_3); StorageLive(_4); _3 = Copy(_1);
+    --      _4 = (Move(_3))(_2) -> bb1
+    { statements := [
+        { kind := .storageLive 3, span := pureAdtSpan },
+        { kind := .storageLive 4, span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 3, projection := [] }
+            (.use (.copy { local_ := 1, projection := [] }))
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (.move { local_ := 3, projection := [] })
+          [.copy { local_ := 2, projection := [] }]
+          { local_ := 4, projection := [] }
+          (.some 1)
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: tailcall (Copy(_1))(_4)
+    { statements := []
+      terminator := {
+        kind := .tailCall
+          (.copy { local_ := 1, projection := [] })
+          [.copy { local_ := 4, projection := [] }]
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [
+      { layout := zstFnItemLayout, mode := .ignore },
+      { layout := pairU32Layout, mode := .direct }
+    ]
+    ret := { layout := pairU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := higherOrderCallerLayouts
+  allocations := []
+
+/--
+`checkPureMirWithCallees` accepts `higherOrderFnItemCallerBody` at `maxCallDepth =
+2` even though both `call` and `tailCall` invoke local `Operand.move` /
+`Operand.copy` function-item slots (`extractCalleeDefPath? = none`).
+-/
+theorem checkPureMirWithCallees_higherOrderFnItemCaller :
+    checkPureMirWithCallees [polySwapPairBody] higherOrderFnItemCallerBody 2 [] =
+      true := by
+  decide
+
+/--
+Symbolic compositional proof for `higherOrderFnItemCallerBody` across all
+`x y : Nat`, discharging the `Operand.move _3` call via
+`PureMirConverges.call_leaf_summary` and the `Operand.copy _1` tail call via
+`PureMirConverges.tailCall_leaf_summary`.
+-/
+theorem higherOrderFnItemCaller_compositional (x y : Nat) :
+    PureMirConvergesWithCallees higherOrderFnItemCallerBody [polySwapPairBody]
+      (initPureState higherOrderFnItemCallerBody [
+        .unit,
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ])
+      (· = .aggregate 0 [
+        .scalar { bits := x, sizeBytes := 4 },
+        .scalar { bits := y, sizeBytes := 4 }
+      ])
+      [] := by
+  -- bb0: StorageLive(_3), StorageLive(_4), _3 = Copy(_1)
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  -- bb0 terminator: (Move(_3))(_2) -> polySwapPairU32Body
+  refine PureMirConverges.call_leaf_summary
+    (maxCallDepth := 2)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_polySwapPairU32Body
+    (polySwapPairU32_pureConverges
+      (.scalar { bits := x, sizeBytes := 4 })
+      (.scalar { bits := y, sizeBytes := 4 }))
+    ?_
+  rintro _ rfl
+  refine ⟨_, rfl, ?_⟩
+  -- bb1 terminator: tailCall (Copy(_1))(_4) -> polySwapPairU32Body
+  exact PureMirConverges.tailCall_leaf_summary
+    (maxCallDepth := 2)
+    (calleeBody := polySwapPairU32Body)
+    (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl
+    checkPureMir_polySwapPairU32Body
+    (polySwapPairU32_pureConverges
+      (.scalar { bits := y, sizeBytes := 4 })
+      (.scalar { bits := x, sizeBytes := 4 }))
+    (fun _ h => h)
+
+/--
+Operational `MirWpConverges` witness on `initMachineStateWithCallees` for
+`higherOrderFnItemCallerBody`.
+-/
+theorem higherOrderFnItemCaller_mirWpConverges (x y : Nat) :
+    MirWpConverges higherOrderFnItemCallerBody
+      (initMachineStateWithCallees higherOrderFnItemCallerBody [
+        .unit,
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] [polySwapPairBody])
+      (mirNormalPost
+        (fun retVal mem' =>
+          ActiveRootMemory higherOrderFnItemCallerBody
+            (initMachineStateWithCallees higherOrderFnItemCallerBody [
+              .unit,
+              .aggregate 0 [
+                .scalar { bits := x, sizeBytes := 4 },
+                .scalar { bits := y, sizeBytes := 4 }
+              ]
+            ] [polySwapPairBody]).memory mem' ∧
+          retVal = .aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ])) :=
+  mirWpConverges_of_pureExecWithCallees_init
+    checkPureMirWithCallees_higherOrderFnItemCaller
+    (higherOrderFnItemCaller_compositional x y)
+
+/--
+Zero-step concrete evaluation witness for `higherOrderFnItemCallerBody` via
+`pureMirConvergesWithCallees_of_evalPureMirWithCallees`.
+-/
+theorem higherOrderFnItemCaller_evalConcrete :
+    PureMirConvergesWithCallees higherOrderFnItemCallerBody [polySwapPairBody]
+      (initPureState higherOrderFnItemCallerBody [
+        .unit,
+        .aggregate 0 [
+          .scalar { bits := 17, sizeBytes := 4 },
+          .scalar { bits := 99, sizeBytes := 4 }
+        ]
+      ])
+      (· = .aggregate 0 [
+        .scalar { bits := 17, sizeBytes := 4 },
+        .scalar { bits := 99, sizeBytes := 4 }
+      ])
+      [] :=
+  pureMirConvergesWithCallees_of_evalPureMirWithCallees
+    checkPureMirWithCallees_higherOrderFnItemCaller
+    (fuel := 16)
+    rfl
+
+/--
+Modular caller `demo::callee_const_eval_and_intrinsic_tail` (`argCount := 1`):
+- Input `_1 : (u32, u32) = (x, y)`.
+- `bb0`: invokes `core::intrinsics::const_eval_select` selecting polymorphic
+  Rust helper `demo::poly_swap_pair::<u32>` on `(_1,)` (unpacked via `((u32,
+  u32),)` 1-tuple), evaluated through `calleeRuntimeEval` -> `_3 = (y, x)`.
+- `bb1`: `switchInt(_3.0)` (testing whether `y == 0`):
+  - `y == 0` (`bb2`): invokes diverging `core::panicking::panic` (`target =
+    .none`, `unwind = .continue_`), discharged via `call_diverging_panic`.
+  - `y != 0` (`bb3`): invokes external `TerminatorKind.tailCall` to
+    `core::intrinsics::ctpop::<u32>(_3.0)`, discharged via
+    `tailCall_intrinsic_sub`.
+-/
+def calleeBackedConstEvalAndIntrinsicTailBody : CapturedMir where
+  defPath := "demo::callee_const_eval_and_intrinsic_tail"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "pair" },
+    { mutability := .mut, ty := { kind := .tuple [.tuple [.uint .u32, .uint .u32]], layoutIdx := 1 }, debugName := some "arg_tup" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }, debugName := some "swapped" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "first" },
+    { mutability := .mut, ty := { kind := .never, layoutIdx := 2 }, debugName := some "never_dst" }
+  ]
+  basicBlocks := [
+    -- bb0: _2 = (_1,); _3 = const_eval_select(_2, poly_swap_pair::<u32>,
+    --      poly_swap_pair::<u32>) -> bb1
+    { statements := [
+        { kind := .storageLive 2, span := pureAdtSpan },
+        { kind := .storageLive 3, span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 2, projection := [] }
+            (.aggregate .tuple [.copy { local_ := 1, projection := [] }])
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::intrinsics::const_eval_select" [
+            .tuple [.tuple [.uint .u32, .uint .u32]],
+            .fnDef "demo::poly_swap_pair" [.uint .u32],
+            .fnDef "demo::poly_swap_pair" [.uint .u32],
+            .tuple [.uint .u32, .uint .u32]
+          ])
+          [
+            .copy { local_ := 2, projection := [] },
+            fnItemOperand "demo::poly_swap_pair" [.uint .u32],
+            fnItemOperand "demo::poly_swap_pair" [.uint .u32]
+          ]
+          { local_ := 3, projection := [] }
+          (.some 1)
+          .unreachable
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: _4 = Copy(_3.0); switchInt(_4) [0 -> bb2, otherwise -> bb3]
+    { statements := [
+        { kind := .storageLive 4, span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 4, projection := [] }
+            (.use (.copy { local_ := 3, projection := [.field 0 pureU32Ty] }))
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .switchInt
+          (.copy { local_ := 4, projection := [] })
+          { branches := [(0, 2)], otherwise := 3 }
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2: diverging panic guard core::panicking::panic() -> !
+    { statements := [
+        { kind := .storageLive 5, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (fnItemOperand "core::panicking::panic" [])
+          []
+          { local_ := 5, projection := [] }
+          .none
+          .continue_
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb3: external intrinsic tailCall core::intrinsics::ctpop::<u32>(_4)
+    { statements := []
+      terminator := {
+        kind := .tailCall
+          (fnItemOperand "core::intrinsics::ctpop" [.uint .u32])
+          [.copy { local_ := 4, projection := [] }]
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [{ layout := pairU32Layout, mode := .direct }]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := higherOrderCallerLayouts
+  allocations := []
+
+/--
+Combined modular contract pairing `calleeRuntimeEval` over `[polySwapPairBody]`
+inside `pureRustIntrinsicContract` with `extCheckedIncContract`.
+-/
+def calleeBackedModularContract : MirCallContract :=
+  combineMirCallContracts
+    (pureRustIntrinsicContract 8 true
+      (calleeRuntimeEval 16 [polySwapPairBody] higherOrderCallerLayouts [] 2))
+    extCheckedIncContract
+
+/--
+Precondition for `calleeBackedConstEvalAndIntrinsicTailBody` on concrete pair
+`(7, 0x0F0F0005)` (where swapped first element `y = 0x0F0F0005` has popcount
+`10`), plus arbitrary `(x, 0)` exercising the diverging `panic` branch.
+-/
+def calleeBackedModularPre (args : List Value) (mem : Memory) : Prop :=
+  mem.callStack = [] ∧
+  (mem.activeCallee = none ∨
+    mem.activeCallee = some calleeBackedConstEvalAndIntrinsicTailBody) ∧
+  mem.activeProtectors = [] ∧
+  ((args = [.aggregate 0 [
+      .scalar { bits := 7, sizeBytes := 4 },
+      .scalar { bits := 0x0F0F0005, sizeBytes := 4 }
+    ]]) ∨
+   (args = [.aggregate 0 [
+      .scalar { bits := 7, sizeBytes := 4 },
+      .scalar { bits := 0, sizeBytes := 4 }
+    ]]))
+
+/-- Non-vacuity witness for `calleeBackedModularPre`. -/
+theorem calleeBackedConstEval_modularPre_nonVacuous :
+    NonVacuousStatefulPre calleeBackedModularPre :=
+  ⟨[.aggregate 0 [
+      .scalar { bits := 7, sizeBytes := 4 },
+      .scalar { bits := 0x0F0F0005, sizeBytes := 4 }
+    ]],
+   emptyMemory,
+   ⟨rfl, Or.inl rfl, rfl, Or.inl rfl⟩⟩
+
+/--
+End-to-end audited `ModularVerificationResult` certificate via
+`verifyModularMir_of_pureModularExec_any` exercising:
+1. `calleeRuntimeEval` inside `const_eval_select` resolving polymorphic
+   `demo::poly_swap_pair::<u32>`,
+2. `PureMirModularConverges.step_switchInt`,
+3. `PureMirModularConverges.call_diverging_panic` on the `y = 0` guard branch,
+4. `PureMirModularConverges.tailCall_intrinsic_sub` (`ctpop::<u32>`) on the
+   `y = 0x0F0F0005` branch (returning popcount `10`).
+-/
+theorem verify_calleeBackedConstEvalAndIntrinsicTail :
+    ModularVerificationResult
+      { body := calleeBackedConstEvalAndIntrinsicTailBody
+        envAssumed := calleeBackedModularContract.holdsOn
+        pre := calleeBackedModularPre
+        post := fun args _ retVal _ =>
+          args = [.aggregate 0 [
+            .scalar { bits := 7, sizeBytes := 4 },
+            .scalar { bits := 0x0F0F0005, sizeBytes := 4 }
+          ]] →
+          retVal = .scalar { bits := 10, sizeBytes := 4 }
+        callees := [polySwapPairBody] } := by
+  refine verifyModularMir_of_pureModularExec_any
+    calleeBackedModularContract _ rfl (Or.inl (by decide))
+    (fun _ _ hp => ⟨hp.1, hp.2.1, hp.2.2.1⟩)
+    (fun args _ hp => ?_)
+  simp only [List.isEmpty, Bool.false_eq_true, ↓reduceIte]
+  rcases hp.2.2.2 with rfl | rfl
+  · -- Case 1: y = 0x0F0F0005 -> const_eval_select -> switchInt -> tailCall ctpop = 10
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.call_const_eval_select_summary
+      (maxCallDepth := 1)
+      (calleeBody := polySwapPairU32Body)
+      (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl (by decide)
+      rfl rfl rfl (fun _ _ => rfl) rfl rfl (by decide)
+      (PureMirConvergesWithCallees.of_pureMirConverges
+        checkPureMir_polySwapPairU32Body
+        (polySwapPairU32_pureConverges
+          (.scalar { bits := 7, sizeBytes := 4 })
+          (.scalar { bits := 0x0F0F0005, sizeBytes := 4 })))
+      ?_
+    rintro _ rfl
+    refine ⟨_, rfl, ?_⟩
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_switchInt
+      (fun _ h => nomatch h) rfl rfl rfl rfl rfl ?_
+    exact PureMirModularConverges.tailCall_intrinsic_sub
+      (MirCallContract.Subsumes.combine_left _ _)
+      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (fun _ _ => rfl)
+  · -- Case 2: y = 0 -> const_eval_select -> switchInt -> diverging panic guard
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.call_const_eval_select_summary
+      (maxCallDepth := 1)
+      (calleeBody := polySwapPairU32Body)
+      (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl (by decide)
+      rfl rfl rfl (fun _ _ => rfl) rfl rfl (by decide)
+      (PureMirConvergesWithCallees.of_pureMirConverges
+        checkPureMir_polySwapPairU32Body
+        (polySwapPairU32_pureConverges
+          (.scalar { bits := 7, sizeBytes := 4 })
+          (.scalar { bits := 0, sizeBytes := 4 })))
+      ?_
+    rintro _ rfl
+    refine ⟨_, rfl, ?_⟩
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.step_switchInt
+      (fun _ h => nomatch h) rfl rfl rfl rfl rfl ?_
+    refine PureMirModularConverges.step_stmt
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    exact PureMirModularConverges.call_diverging_panic
+      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
+      (Or.inr ⟨rfl, Or.inl rfl⟩)
+
+/-!
+### 10H. Capture-Free Closure & Arity-Validated `const_eval_select` +
+Higher-Order Modular `fnDef` & `.cleanup` Unwind Landing-Pad Witnesses
+-/
+
+/--
+Capture-free closure body `demo::closure_first` (`|x: u32, _y: u32| -> u32 { x }`,
+`argCount := 3`):
+- `_1` is the zero-sized closure environment `RigidTy.closure "demo::closure_first" []`
+  (`Value.unit`),
+- `_2` is parameter `x : u32`,
+- `_3` is parameter `y : u32`,
+- `bb0` returns `Copy(_2)` (`x`), distinguishing exact `(.unit :: unpackedArgs)`
+  closure frame layout from off-by-one `unpackedArgs` misalignment.
+-/
+def captureFreeFirstClosureBody : CapturedMir where
+  defPath := "demo::closure_first"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 3
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not,
+      ty := { kind := .closure "demo::closure_first" [], layoutIdx := 2 },
+      debugName := some "_env" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "x" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "y" }
+  ]
+  basicBlocks := [
+    { statements := [
+        { kind := .assign
+            { local_ := 0, projection := [] }
+            (.use (.copy { local_ := 2, projection := [] }))
+          span := pureAdtSpan }
+      ]
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [
+      { layout := zstFnItemLayout, mode := .ignore },
+      { layout := u32Layout, mode := .direct },
+      { layout := u32Layout, mode := .direct }
+    ]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := higherOrderCallerLayouts
+  allocations := []
+
+/--
+Kernel-checked regression witnesses for `const_eval_select` + `calleeRuntimeEval`:
+1. Invoking capture-free closure `captureFreeFirstClosureBody` on `(10, 99)`
+   prepends `Value.unit` for `_1` and returns `10` (`_2`), not `99` (`_3`).
+2. Capturing closures (`upvars ≠ []`) are rejected (`none`) by
+   `extractZeroSizedCallableTy?` ( both as `rtFnTy` and as `constFnTy`).
+3. Arity-mismatched `const_eval_select` calls (e.g., passing a 2-element tuple
+   to 1-parameter `u32StepImplBody`) fail closed (`none`) instead of corrupting
+   temporary locals.
+-/
+theorem constEvalSelect_closure_and_arity_witnesses :
+    evalPureRustIntrinsicWithRuntime
+      (calleeRuntimeEval 8 [captureFreeFirstClosureBody] higherOrderCallerLayouts [] 1)
+      .constEvalSelect
+      [.tuple [.uint .u32, .uint .u32],
+       .fnDef "demo::ct_first" [],
+       .closure "demo::closure_first" [],
+       .uint .u32]
+      [.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩], .unit, .unit] =
+      some (.scalar ⟨10, 4⟩) ∧
+    evalPureRustIntrinsicWithRuntime
+      (calleeRuntimeEval 8 [captureFreeFirstClosureBody] higherOrderCallerLayouts [] 1)
+      .constEvalSelect
+      [.tuple [.uint .u32, .uint .u32],
+       .fnDef "demo::ct_first" [],
+       .closure "demo::closure_first" [.uint .u32],
+       .uint .u32]
+      [.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩], .unit, .unit] = none ∧
+    evalPureRustIntrinsicWithRuntime
+      (calleeRuntimeEval 8 [captureFreeFirstClosureBody] higherOrderCallerLayouts [] 1)
+      .constEvalSelect
+      [.tuple [.uint .u32, .uint .u32],
+       .tuple [],
+       .closure "demo::closure_first" [],
+       .uint .u32]
+      [.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩], .unit, .unit] = none ∧
+    calleeRuntimeEval 8 [u32StepImplBody] demoCallerLayouts [] 1
+      "demo::u32_step_impl" [] [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩] = none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/--
+Operational `MirWpConverges` soundness certificate for `calleeRuntimeEval` on
+capture-free closure `captureFreeFirstClosureBody` via `calleeRuntimeEval_sound`.
+-/
+theorem captureFreeFirstClosure_calleeRuntimeEval_sound :
+    ∃ (calleeBody : CapturedMir) (callArgs : List Value),
+      lookupCallee [captureFreeFirstClosureBody] higherOrderCallerLayouts
+        "demo::closure_first" [] [] = some calleeBody ∧
+      effectiveConstEvalCalleeArgs? calleeBody
+        [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩] = some callArgs ∧
+      MirWpConverges calleeBody
+        (initMachineStateWithMemory calleeBody callArgs
+          (pureCalleeMemory [captureFreeFirstClosureBody] []))
+        (mirNormalPost
+          (fun rv mem' =>
+            ActiveRootMemory calleeBody
+              (pureCalleeMemory [captureFreeFirstClosureBody] []) mem' ∧
+            rv = .scalar ⟨10, 4⟩)) :=
+  calleeRuntimeEval_sound (fuel := 8) (maxCallDepth := 1)
+    (mem₀ := pureCalleeMemory [captureFreeFirstClosureBody] []) rfl
+
+/--
+Unwinding `#[external_spec]` sidecar stub `ext::unwinding_inc<T>(x: u32) -> u32`
+with `fnAbi.canUnwind := true` (`sidecarTargetCanUnwind = true`), so callers
+passing `unwind = .cleanup cleanupBb` must genuinely prove cleanup landing-pad
+convergence.
+-/
+def extUnwindingIncSidecarBody : CapturedMir where
+  defPath := "ext::unwinding_inc_spec"
+  phase := .runtimePostCleanup
+  role := .externalSpec "ext::unwinding_inc"
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "x" }
+  ]
+  basicBlocks := [
+    { statements := []
+      terminator := { kind := .return_, span := pureAdtSpan }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [{ layout := u32Layout, mode := .direct }]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := demoCallerLayouts
+  allocations := []
+
+/--
+Polymorphic unwinding `#[external_spec]` contract for `ext::unwinding_inc::<u32>`:
+requires `x < 2^32 - 1` and returns `x + 1` on normal return, while permitting
+frame-preserving panics (`sidecarTargetCanUnwind = true`).
+-/
+def extUnwindingIncContract : MirCallContract :=
+  polyExternalSpecCallContract
+    "ext::unwinding_inc"
+    [.uint .u32]
+    extUnwindingIncSidecarBody
+    (fun args => ∃ x : Nat, x < 4294967295 ∧ args = [.scalar { bits := x, sizeBytes := 4 }])
+    (fun args retVal =>
+      ∀ x : Nat,
+        args = [.scalar { bits := x, sizeBytes := 4 }] →
+        retVal = .scalar { bits := x + 1, sizeBytes := 4 })
+
+/-- Zero-sized function-item `Ty` for `ext::unwinding_inc::<u32>`. -/
+def extUnwindingIncU32FnTy : Ty :=
+  { kind := .fnDef "ext::unwinding_inc" [.uint .u32], layoutIdx := 2 }
+
+/-- Zero-sized function-item `Ty` for `core::intrinsics::ctpop::<u32>`. -/
+def ctpopU32FnTy : Ty :=
+  { kind := .fnDef "core::intrinsics::ctpop" [.uint .u32], layoutIdx := 2 }
+
+/--
+Combined modular contract pairing `defaultPureRustIntrinsicContract` with
+unwinding `extUnwindingIncContract`.
+-/
+def localFnItemAndCleanupContract : MirCallContract :=
+  combineMirCallContracts
+    defaultPureRustIntrinsicContract
+    extUnwindingIncContract
+
+/--
+Higher-order modular caller `demo::local_fn_item_and_cleanup_modular`
+(`argCount := 3`, `_1 : u32`, `_2 : fnDef("ext::unwinding_inc", [u32])`,
+`_3 : fnDef("core::intrinsics::ctpop", [u32])`):
+- `bb0`: copies `_1` into `_4` and calls `(Move(_2))(_4)` (`Operand.move` local
+  `fnDef` slot!) with `unwind := .cleanup 2`.
+- `bb1`: on normal return `_5 = x + 1`, tail-calls `(Copy(_3))(_5)`
+  (`Operand.copy` local intrinsic `fnDef` slot!), returning `ctpop::<u32>(x + 1)`.
+- `bb2` (`isCleanup := true`): on unwind from `ext::unwinding_inc`, runs
+  `StorageDead(_5)` and `drop(_4) -> bb3`.
+- `bb3` (`isCleanup := true`): runs `StorageDead(_4)` and `unwindResume`.
+-/
+def localFnItemAndCleanupModularBody : CapturedMir where
+  defPath := "demo::local_fn_item_and_cleanup_modular"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 3
+  localDecls := [
+    { mutability := .mut, ty := pureU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := pureU32Ty, debugName := some "x" },
+    { mutability := .mut, ty := extUnwindingIncU32FnTy, debugName := some "ext_f" },
+    { mutability := .not, ty := ctpopU32FnTy, debugName := some "intr_f" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "guard_tmp" },
+    { mutability := .mut, ty := pureU32Ty, debugName := some "inc_out" }
+  ]
+  basicBlocks := [
+    -- bb0: StorageLive(_4, _5); _4 = Copy(_1);
+    --      _5 = (Move(_2))(_4) -> [return: bb1, unwind: cleanup(bb2)]
+    { statements := [
+        { kind := .storageLive 4, span := pureAdtSpan },
+        { kind := .storageLive 5, span := pureAdtSpan },
+        { kind := .assign
+            { local_ := 4, projection := [] }
+            (.use (.copy { local_ := 1, projection := [] }))
+          span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .call
+          (.move { local_ := 2, projection := [] })
+          [.copy { local_ := 4, projection := [] }]
+          { local_ := 5, projection := [] }
+          (.some 1)
+          (.cleanup 2)
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb1: tailcall (Copy(_3))(_5)
+    { statements := []
+      terminator := {
+        kind := .tailCall
+          (.copy { local_ := 3, projection := [] })
+          [.copy { local_ := 5, projection := [] }]
+        span := pureAdtSpan
+      }
+      isCleanup := false
+    },
+    -- bb2 (cleanup): StorageDead(_5); drop(_4) -> [return: bb3, unwind: terminate]
+    { statements := [
+        { kind := .storageDead 5, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .drop
+          { local_ := 4, projection := [] }
+          3
+          .terminate
+        span := pureAdtSpan
+      }
+      isCleanup := true
+    },
+    -- bb3 (cleanup): StorageDead(_4); unwindResume
+    { statements := [
+        { kind := .storageDead 4, span := pureAdtSpan }
+      ]
+      terminator := {
+        kind := .unwindResume
+        span := pureAdtSpan
+      }
+      isCleanup := true
+    }
+  ]
+  fnAbi := {
+    args := [
+      { layout := u32Layout, mode := .direct },
+      { layout := zstFnItemLayout, mode := .ignore },
+      { layout := zstFnItemLayout, mode := .ignore }
+    ]
+    ret := { layout := u32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := higherOrderCallerLayouts
+  allocations := []
+
+/--
+Precondition for `localFnItemAndCleanupModularBody` over all `x < 2^32 - 1` and
+unconstrained `mem.traitImpls` (with `mem.callees = []`).
+-/
+def localFnItemAndCleanupPre (args : List Value) (mem : Memory) : Prop :=
+  (∃ x : Nat,
+    x < 4294967295 ∧
+    args = [.scalar { bits := x, sizeBytes := 4 }, .unit, .unit]) ∧
+  mem.callees = [] ∧
+  mem.callStack = [] ∧
+  (mem.activeCallee = none ∨
+    mem.activeCallee = some localFnItemAndCleanupModularBody) ∧
+  mem.activeProtectors = []
+
+/-- Non-vacuity witness for `localFnItemAndCleanupPre`. -/
+theorem localFnItemAndCleanup_modularPre_nonVacuous :
+    NonVacuousStatefulPre localFnItemAndCleanupPre :=
+  ⟨[.scalar { bits := 41, sizeBytes := 4 }, .unit, .unit],
+   emptyMemory,
+   ⟨41, by decide, rfl⟩,
+   rfl, rfl, Or.inl rfl, rfl⟩
+
+@[irreducible]
+def expectedCtpopU32 (v : Nat) : Value := .scalar ⟨pureCtpopLoop 32 v, 4⟩
+
+private theorem expectedCtpopU32_def (v : Nat) :
+    (Value.scalar ⟨pureCtpopLoop 32 v, 4⟩) = expectedCtpopU32 v := by
+  unfold expectedCtpopU32
+  rfl
+
+/--
+Symbolic modular convergence across all `x < 2^32 - 1` and arbitrary
+`traitImpls` for `localFnItemAndCleanupModularBody`, exercising:
+1. `PureMirModularConverges.call_poly_external_spec_pureTarget` on `Operand.move
+   _2` (`_2` becomes `.uninit`) with `unwind = .cleanup 2`,
+2. Cleanup landing-pad recovery in `bb2 -> bb3` via `step_stmt` + `step_drop` +
+   `step_unwindResume`,
+3. `PureMirModularConverges.tailCall_intrinsic_pureTarget` on `Operand.copy _3`
+   (`ctpop::<u32>(x + 1)`).
+-/
+theorem localFnItemAndCleanup_modularConverges
+    (x : Nat) (hx : x < 4294967295)
+    (traitImpls : List TraitImplEntry := []) :
+    PureMirModularConverges
+      localFnItemAndCleanupContract
+      localFnItemAndCleanupModularBody
+      []
+      (initPureState localFnItemAndCleanupModularBody
+        [.scalar { bits := x, sizeBytes := 4 }, .unit, .unit])
+      (· = expectedCtpopU32 (x + 1))
+      traitImpls := by
+  have hx1_lt : x + 1 < 4294967296 := Nat.succ_lt_succ hx
+  have h_canon_x1 :
+      isCanonicalScalarOfSize { bits := x + 1, sizeBytes := 4 } 4 = true :=
+    isCanonicalScalarOfSize_four hx1_lt
+  -- bb0: StorageLive(_4), StorageLive(_5), _4 = Copy(_1)
+  have h_init :
+      initPureState localFnItemAndCleanupModularBody
+        [.scalar { bits := x, sizeBytes := 4 }, .unit, .unit] =
+        { bb := 0
+          stmtIdx := 0
+          env := [.uninit, .init (.scalar { bits := x, sizeBytes := 4 }),
+            .init .unit, .init .unit, .dead, .dead] } := rfl
+  rw [h_init]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  -- bb0 terminator: (Move(_2))(_4) -> [return: bb1, unwind: cleanup(bb2)]
+  refine PureMirModularConverges.call_poly_external_spec_pureTarget
+    (targetDefPath := "ext::unwinding_inc")
+    (expectedTypeArgs := [.uint .u32])
+    (sidecarBody := extUnwindingIncSidecarBody)
+    (extraPre := fun args =>
+      ∃ x : Nat, x < 4294967295 ∧ args = [.scalar { bits := x, sizeBytes := 4 }])
+    (extraPost := fun args retVal =>
+      ∀ x : Nat,
+        args = [.scalar { bits := x, sizeBytes := 4 }] →
+        retVal = .scalar { bits := x + 1, sizeBytes := 4 })
+    (MirCallContract.Subsumes.combine_right
+      defaultPureRustIntrinsicContract extUnwindingIncContract)
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
+    (lookupCallee_nil _ _ _ _)
+    rfl rfl
+    ⟨⟨x, Nat.lt_trans hx (by decide), rfl⟩, trivial⟩
+    ⟨x, hx, rfl⟩
+    (Or.inr (Or.inr (Or.inr ⟨2, rfl, ?_⟩)))
+    ?_
+    rfl
+  · -- Cleanup landing pad bb2 -> bb3: StorageDead(_5), drop(_4), StorageDead(_4), unwindResume
+    refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set]
+    refine PureMirModularConverges.step_drop (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set]
+    exact PureMirModularConverges.step_unwindResume
+      (fun _ h => nomatch h) rfl rfl rfl
+  · -- Normal return path bb1: tailCall (Copy(_3))(_5) -> ctpop::<u32>(x + 1)
+    rintro retVal ⟨_, h_ext_post⟩
+    have h_rv : retVal = .scalar { bits := x + 1, sizeBytes := 4 } :=
+      h_ext_post x rfl
+    subst h_rv
+    refine ⟨_, rfl, ?_⟩
+    refine PureMirModularConverges.tailCall_intrinsic_pureTarget
+      (pointerBytes := 8)
+      (ubChecksEnabled := true)
+      (rtEval := fun _ _ _ => none)
+      (kind := .ctpop)
+      (retVal := expectedCtpopU32 (x + 1))
+      (MirCallContract.Subsumes.combine_left
+        defaultPureRustIntrinsicContract extUnwindingIncContract)
+      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
+      (lookupCallee_nil _ _ _ _)
+      rfl
+      ?_
+      rfl
+    dsimp only [evalPureRustIntrinsicWithRuntime, evalPureScalarIntrinsic,
+      intrinsicScalarTyInfo?]
+    rw [h_canon_x1]
+    exact congrArg some (expectedCtpopU32_def (x + 1))
+
+/--
+Audited `ModularVerificationResult` for `localFnItemAndCleanupModularBody` via
+`verifyModularMir_of_pureModularExec_any` with `callees = []` and unconstrained
+`mem.traitImpls`.
+-/
+theorem verify_localFnItemAndCleanupModular :
+    ModularVerificationResult
+      { body := localFnItemAndCleanupModularBody
+        envAssumed := localFnItemAndCleanupContract.holdsOn
+        pre := localFnItemAndCleanupPre
+        post := fun args _ retVal _ =>
+          ∀ x : Nat,
+            args = [.scalar { bits := x, sizeBytes := 4 }, .unit, .unit] →
+            retVal = expectedCtpopU32 (x + 1)
+        callees := [] } := by
+  refine verifyModularMir_of_pureModularExec_any
+    localFnItemAndCleanupContract _ rfl
+    (Or.inr (fun _ _ hp => hp.2.1))
+    (fun _ _ hp => hp.2.2)
+    (fun args mem hp => ?_)
+  rcases hp.1 with ⟨x, hx, rfl⟩
+  refine PureMirModularConverges.mono ?_
+    (localFnItemAndCleanup_modularConverges x hx mem.traitImpls)
+  intro retVal h_ret _ x' h_eq
+  injection h_eq with h_hd _
+  injection h_hd with h_sc
+  injection h_sc with hx_eq _
+  subst hx_eq
+  exact h_ret
+
+
+end Anneal.PureMirExec
+end ModularPureExecContinuation
+
 set_option linter.all false
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
@@ -2409,10 +12384,9 @@ def evalByteCastAfterOperand
   | .some dstSize =>
     match operandTy body.localDecls body.layouts op with
     | .some srcTy =>
-      let rSrcTy := resolveTyWithLocalDecls body.localDecls body.layouts srcTy
-      match tyByteSize body.localDecls body.layouts rSrcTy with
+      match resolveByteCastSrcTyAndSize body.localDecls body.layouts op srcTy with
       | .none => .unsupported
-      | .some srcSize =>
+      | .some (rSrcTy, srcSize) =>
         match Nat.beq srcSize dstSize with
         | false => .unsupported
         | true =>

@@ -37,11 +37,12 @@ transmutation:
   (`ScalarLayout.initialized pk validRange`, `wrappingRangeContains`, and
   `decodeScalarLayoutBytes`) to `IsFromBytes`, `IsFromZeros`, and exact
   `IsTryFromBytes` decodability for `.primitive` ADTs such as fieldless enum
-  tags and `NonZero*` niches. It also proves explicit witnesses for the cases
-  where `Trusted`'s codec departs from Rust's validity invariants: generic
-  `NonZero<T>` decoded at its type argument, niches recorded only on a wrapper's
-  backend representation, explicit enum discriminants, and layout certificates
-  that ignore backend scalar niches.
+  tags and `NonZero*` niches, as well as explicit-discriminant multi-variant
+  `#[repr(Int)]` enums via `TypeLayout.variantDiscriminants`. It also proves
+  explicit witnesses for the cases where `Trusted`'s layout-free codec departs
+  from Rust's validity invariants: generic `NonZero<T>` decoded at its type
+  argument, niches recorded only on a wrapper's backend representation, and
+  layout certificates that ignore backend scalar niches.
 - Section 7 restates the trait models for the Stage-1 decoder that `Trusted`
   executes (`decodeTypedValueFromBytes`, `decodeScalarLayoutBytesNoForge`): it
   characterizes provenance-free scalar decoding (including `char` surrogate
@@ -2909,11 +2910,13 @@ on those field layouts (`adt_fieldLayout_path_inner_primitive_scalarLayout_decod
 and ignores a niche recorded only on the wrapper
 (`adt_fieldLayout_path_outer_niche_unenforced`).
 
-The `.multiple` decoder uses the tag value itself as the variant index
-(`get? variantShapes tag`), and the encoder writes the variant index as the tag.
-This matches `rustc` only for direct tags whose discriminants are the variant
-indices `0..n-1`; explicit discriminants diverge
-(`adt_multiple_enum_explicit_discriminant_divergence`).
+The `.multiple` codec resolves tag bit patterns through
+`resolveEnumVariantIdxByTag l.variantDiscriminants` and encodes variants through
+`resolveEnumDiscriminantForVariant`: when `l.variantDiscriminants` is populated,
+it maps between variant indices `0..n-1` and explicit `#[repr(Int)]` machine
+discriminants (`adt_multiple_enum_explicit_discriminant_roundtrip`,
+`adt_multiple_enum_explicit_discriminant_agreement`), and when empty (`.nil`), it
+falls back to direct `0..n-1` variant indices.
 -/
 
 @[simp]
@@ -3350,15 +3353,12 @@ theorem adt_newtype_nonZero_not_isFromZeros
     (wrappingRangeContains_nonZeroRange_zero hPos)
 
 /--
-Unfolding lemma for `decodeValueFromBytes` on an inhabited multi-variant enum
+General unfolding lemma for `decodeValueFromBytes` on an inhabited multi-variant enum
 `.adt defPath args` (`l.variants = .multiple tagLayout 0 variantShapes`,
 `l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`),
-the layout shape of a fieldless multi-variant `#[repr(u8)]` / `#[repr(Int)]` enum
-whose tag fills the whole value. The decoded tag value is used directly as the
-variant index, which matches `rustc` only when the discriminants are the variant
-indices (`adt_multiple_enum_explicit_discriminant_divergence`).
+resolving the decoded tag bits via `resolveEnumVariantIdxByTag l.variantDiscriminants`.
 -/
-theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
+theorem decodeValueFromBytes_adt_multiple_enum_explicit_scalarLayout
     (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
     (l : TypeLayout) (tagLayout : ScalarLayout) (variantShapes : List FieldsShape)
     (memoryOrder : List Nat)
@@ -3374,12 +3374,15 @@ theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
       | true =>
         match decodeScalarLayoutBytes tagLayout bs with
         | some (.scalar tagSc) =>
-          match get? variantShapes tagSc.bits with
-          | some (.arbitrary varOffsets _) =>
-            match decodeFieldsBySpan bs l.size.bytes varOffsets with
-            | some vals => some (.aggregate tagSc.bits vals)
-            | none => none
-          | _ => none
+          match resolveEnumVariantIdxByTag l.variantDiscriminants tagSc.bits with
+          | some varIdx =>
+            match get? variantShapes varIdx with
+            | some (.arbitrary varOffsets _) =>
+              match decodeFieldsBySpan bs l.size.bytes varOffsets with
+              | some vals => some (.aggregate varIdx vals)
+              | none => none
+            | _ => none
+          | none => none
         | _ => none := by
   unfold decodeValueFromBytes
   dsimp only
@@ -3401,10 +3404,42 @@ theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
     rfl
 
 /--
+Unfolding lemma for `decodeValueFromBytes` on an inhabited multi-variant enum
+`.adt defPath args` (`l.variants = .multiple tagLayout 0 variantShapes`,
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`)
+with default `0..n-1` discriminants (`l.variantDiscriminants = []`).
+-/
+theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
+    (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (tagLayout : ScalarLayout) (variantShapes : List FieldsShape)
+    (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple tagLayout 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hWidth : scalarLayoutByteWidth tagLayout = some l.size.bytes)
+    (bs : List AbstractByte)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
+    decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx } bs =
+      match Nat.beq (length bs) l.size.bytes with
+      | false => none
+      | true =>
+        match decodeScalarLayoutBytes tagLayout bs with
+        | some (.scalar tagSc) =>
+          match get? variantShapes tagSc.bits with
+          | some (.arbitrary varOffsets _) =>
+            match decodeFieldsBySpan bs l.size.bytes varOffsets with
+            | some vals => some (.aggregate tagSc.bits vals)
+            | none => none
+          | _ => none
+        | _ => none := by
+  rw [decodeValueFromBytes_adt_multiple_enum_explicit_scalarLayout fuel layouts defPath args idx l
+    tagLayout variantShapes memoryOrder hLookup hInhab hVar hFields hWidth bs, hNoDiscr]
+
+/--
 Exact evaluation of `decodeValueFromBytes` on `encodeLittleEndianBytes bits l.size.bytes prov`
-for a fieldless multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum
-(`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`,
-`l.fields = .arbitrary [⟨0⟩] memoryOrder`) where every valid tag in `validRange` maps to a
+for a fieldless multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum with default `0..n-1`
+discriminants (`l.variantDiscriminants = []`) where every valid tag in `validRange` maps to a
 fieldless variant `.arbitrary [] _` in `variantShapes`.
 -/
 theorem adt_multiple_enum_scalarLayout_decode_encode_eq
@@ -3422,7 +3457,8 @@ theorem adt_multiple_enum_scalarLayout_decode_encode_eq
         wrappingRangeContains validRange tag = true →
         ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder))
     (bits : Nat) (prov : Option (Nat × Nat))
-    (hBits : bits < scalarModulus l.size.bytes) :
+    (hBits : bits < scalarModulus l.size.bytes)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     decodeValueFromBytes defaultCodecFuel layouts
         { kind := .adt defPath args, layoutIdx := idx }
         (encodeLittleEndianBytes bits l.size.bytes prov) =
@@ -3440,7 +3476,7 @@ theorem adt_multiple_enum_scalarLayout_decode_encode_eq
   rw [show defaultCodecFuel = 15 + 1 from rfl,
       decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
         (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-        hLookup hInhab hVar hFields hWidth,
+        hLookup hInhab hVar hFields hWidth _ hNoDiscr,
       hBeqLen]
   dsimp only
   rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes _ hWidth,
@@ -3456,7 +3492,8 @@ theorem adt_multiple_enum_scalarLayout_decode_encode_eq
 
 /--
 A fieldless multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum satisfies `IsFromZeros`
-whenever `0` lies in `validRange` and variant `0` is fieldless (`.arbitrary [] _`).
+whenever `0` lies in `validRange` and resolves via `l.variantDiscriminants` (or `0` when empty)
+to a fieldless variant `.arbitrary [] _`.
 -/
 theorem adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -3469,7 +3506,8 @@ theorem adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange
     (hNz : Nat.beq l.size.bytes 0 = false)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
     (hZeroValid : wrappingRangeContains validRange 0 = true)
-    (hVar0 : get? variantShapes 0 = some (.arbitrary [] varMemOrder0)) :
+    (hVar0 : get? variantShapes 0 = some (.arbitrary [] varMemOrder0))
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } := by
   refine ⟨l.size.bytes, .aggregate 0 [], by simp [rigidTyByteSize, hLookup], ?_⟩
   have hBeqLen : Nat.beq (length (zeroInitBytes l.size.bytes)) l.size.bytes = true := by
@@ -3477,7 +3515,7 @@ theorem adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange
   rw [show defaultCodecFuel = 15 + 1 from rfl,
       decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
         (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-        hLookup hInhab hVar hFields hWidth,
+        hLookup hInhab hVar hFields hWidth _ hNoDiscr,
       hBeqLen]
   dsimp only
   rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes
@@ -3491,8 +3529,9 @@ theorem adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange
   rw [hVar0]
 
 /--
-A multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum does NOT satisfy `IsFromZeros`
-whenever `wrappingRangeContains validRange 0 = false` (e.g., when discriminant `0` is uninhabited).
+A multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum (with arbitrary `l.variantDiscriminants`)
+does NOT satisfy `IsFromZeros` whenever `wrappingRangeContains validRange 0 = false`
+(e.g., when discriminant `0` is uninhabited).
 -/
 theorem adt_multiple_enum_scalarLayout_not_isFromZeros
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -3512,7 +3551,7 @@ theorem adt_multiple_enum_scalarLayout_not_isFromZeros
   have hBeqLen : Nat.beq (length (zeroInitBytes l.size.bytes)) l.size.bytes = true := by
     rw [length_zeroInitBytes]; exact Nat.beq_refl _
   rw [show defaultCodecFuel = 15 + 1 from rfl,
-      decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+      decodeValueFromBytes_adt_multiple_enum_explicit_scalarLayout 15 layouts defPath args idx l
         (.initialized pk validRange) variantShapes memoryOrder
         hLookup hInhab hVar hFields hWidth,
       hBeqLen] at hDec
@@ -3531,10 +3570,9 @@ theorem adt_multiple_enum_scalarLayout_not_isFromZeros
 /--
 `IsTryFromBytes` characterization for multi-variant `#[repr(Int)]` / `#[repr(u8)]` enums
 (`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`,
-`l.fields = .arbitrary [⟨0⟩] memoryOrder`): every decoded value has the form
-`.aggregate tag vals` where `tag < scalarModulus l.size.bytes` and
-`wrappingRangeContains validRange tag = true` (and `vals = []` when all variants in `variantShapes`
-are fieldless).
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`) with default `0..n-1` discriminants:
+every decoded value has the form `.aggregate tag vals` where `tag < scalarModulus l.size.bytes`
+and `wrappingRangeContains validRange tag = true`.
 -/
 theorem adt_multiple_enum_scalarLayout_isTryFromBytes
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -3544,7 +3582,8 @@ theorem adt_multiple_enum_scalarLayout_isTryFromBytes
     (hInhab : l.isUninhabited = false)
     (hVar : l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
-    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     IsTryFromBytes layouts { kind := .adt defPath args, layoutIdx := idx }
       (fun v =>
         ∃ (tag : Nat) (vals : List Value) (varOffsets : List Size) (varMemOrder : List Nat),
@@ -3557,7 +3596,7 @@ theorem adt_multiple_enum_scalarLayout_isTryFromBytes
   rw [show defaultCodecFuel = 15 + 1 from rfl,
       decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
         (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-        hLookup hInhab hVar hFields hWidth] at hDec
+        hLookup hInhab hVar hFields hWidth bs hNoDiscr] at hDec
   cases hLen : Nat.beq (length bs) l.size.bytes <;> rw [hLen] at hDec
   · nomatch hDec
   · dsimp only at hDec
@@ -3592,8 +3631,9 @@ theorem adt_multiple_enum_scalarLayout_isTryFromBytes
 A multi-variant fieldless enum (`VariantsShape.multiple tagLayout 0 variantShapes`,
 `l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`,
 where every variant in `variantShapes` has empty field offsets `.arbitrary [] _`)
-satisfies `IsIntoBytes`: every valid variant encoding writes its `l.size.bytes`-byte
-discriminant tag at offset `0` with no uninitialized padding bytes.
+satisfies `IsIntoBytes` for **both** default (`0..n-1`) and explicit
+(`l.variantDiscriminants = d :: _`) discriminants: every valid variant encoding writes its
+`l.size.bytes`-byte discriminant tag at offset `0` with no uninitialized padding bytes.
 -/
 theorem adt_multiple_enum_fieldless_isIntoBytes
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -3632,33 +3672,39 @@ theorem adt_multiple_enum_fieldless_isIntoBytes
         have hGet0 : get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
         rw [hGet0] at hEnc
         dsimp only at hEnc
-        cases hTagEnc : encodeScalarBytes ⟨varIdx, l.size.bytes⟩ none <;> rw [hTagEnc] at hEnc
+        cases hDiscr :
+          resolveEnumDiscriminantForVariant tagLayout l.size.bytes l.variantDiscriminants varIdx <;>
+          rw [hDiscr] at hEnc
         · nomatch hEnc
-        case some tagBytes =>
+        case some tagBits =>
           dsimp only at hEnc
-          have ⟨hTagLen, hTagInit⟩ :=
-            encodeScalarBytes_length_and_init ⟨varIdx, l.size.bytes⟩ none tagBytes hTagEnc
-          dsimp only at hTagLen
-          have hWrite :
-              writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 tagBytes =
-                some tagBytes := by
-            rw [replicateUninitBytes_eq_replicate]
-            have hRep :
-                List.replicate l.size.bytes AbstractByte.uninit =
-                  ([] : List AbstractByte) ++ List.replicate (tagBytes.length + 0) .uninit := by
-              change List.replicate l.size.bytes AbstractByte.uninit =
-                List.replicate (length tagBytes) AbstractByte.uninit
-              rw [hTagLen]
-            rw [hRep]
-            simpa using writeAbstractBytesAt_append_replicate [] tagBytes 0
-          rw [hWrite] at hEnc
-          dsimp only at hEnc
-          cases fieldVals with
-          | nil =>
-            injection hEnc with hBs
-            subst hBs
-            exact ⟨hTagLen, hTagInit⟩
-          | cons _ _ => nomatch hEnc
+          cases hTagEnc : encodeScalarBytes ⟨tagBits, l.size.bytes⟩ none <;> rw [hTagEnc] at hEnc
+          · nomatch hEnc
+          case some tagBytes =>
+            dsimp only at hEnc
+            have ⟨hTagLen, hTagInit⟩ :=
+              encodeScalarBytes_length_and_init ⟨tagBits, l.size.bytes⟩ none tagBytes hTagEnc
+            dsimp only at hTagLen
+            have hWrite :
+                writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 tagBytes =
+                  some tagBytes := by
+              rw [replicateUninitBytes_eq_replicate]
+              have hRep :
+                  List.replicate l.size.bytes AbstractByte.uninit =
+                    ([] : List AbstractByte) ++ List.replicate (tagBytes.length + 0) .uninit := by
+                change List.replicate l.size.bytes AbstractByte.uninit =
+                  List.replicate (length tagBytes) AbstractByte.uninit
+                rw [hTagLen]
+              rw [hRep]
+              simpa using writeAbstractBytesAt_append_replicate [] tagBytes 0
+            rw [hWrite] at hEnc
+            dsimp only at hEnc
+            cases fieldVals with
+            | nil =>
+              injection hEnc with hBs
+              subst hBs
+              exact ⟨hTagLen, hTagInit⟩
+            | cons _ _ => nomatch hEnc
       | _ => nomatch hEnc
   | _ => nomatch hEnc
 
@@ -3707,73 +3753,19 @@ theorem adt_generic_nonZero_typeArg_path_niche_unenforced
   exact ⟨rfl, hDec, ⟨4, _, hSize, hDec⟩⟩
 
 /--
-**Divergence (explicit enum discriminants).** The `.multiple` codec identifies
-the tag value with the variant index: `decodeValueFromBytes` looks up
-`get? variantShapes tag`, and `encodeValueToBytes` writes the variant index as
-the tag. For a fieldless `#[repr(u8)] enum E { A = 1, B = 2 }`-shaped layout
-(`validRange = ⟨1, 2⟩`, two fieldless variants):
-1. the valid discriminant `2` is inside `validRange` but is rejected;
-2. the discriminant `1` (which is `E::A` in Rust) decodes to variant index `1`
-   (`E::B`);
-3. encoding `E::A` (`.aggregate 0 []`) writes the byte `0`, which lies outside
-   `validRange`, and the same layout rejects it when decoding.
-Theorems over `.multiple` enum layouts are therefore faithful to `rustc` only
-when the discriminants are the variant indices `0..n-1`.
--/
-theorem adt_multiple_enum_explicit_discriminant_divergence
-    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
-    (l : TypeLayout) (memoryOrder vm0 vm1 : List Nat)
-    (hLookup : LayoutTable.lookup layouts idx = some l)
-    (hInhab : l.isUninhabited = false)
-    (hVar : l.variants =
-      .multiple (.initialized (.int 8 false) ⟨1, 2⟩) 0 [.arbitrary [] vm0, .arbitrary [] vm1])
-    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
-    (hSz : l.size.bytes = 1) :
-    let enumTy : Ty := { kind := .adt defPath args, layoutIdx := idx }
-    wrappingRangeContains ⟨1, 2⟩ 2 = true ∧
-    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 2 1 none) = none ∧
-    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 1 1 none) =
-      some (.aggregate 1 []) ∧
-    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate 0 []) =
-      some (encodeLittleEndianBytes 0 1 none) ∧
-    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 0 1 none) =
-      none := by
-  intro enumTy
-  rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
-  dsimp only at hInhab hVar hFields hSz
-  subst hInhab hVar hFields hSz
-  refine ⟨rfl, ?_, ?_, ?_, ?_⟩
-  · rw [show defaultCodecFuel = 15 + 1 from rfl]
-    unfold decodeValueFromBytes
-    dsimp only [enumTy]
-    rw [hLookup]
-    rfl
-  · rw [show defaultCodecFuel = 15 + 1 from rfl]
-    unfold decodeValueFromBytes
-    dsimp only [enumTy]
-    rw [hLookup]
-    rfl
-  · rw [show defaultCodecFuel = 15 + 1 from rfl]
-    unfold encodeValueToBytes
-    dsimp only [enumTy]
-    rw [hLookup]
-    rfl
-  · rw [show defaultCodecFuel = 15 + 1 from rfl]
-    unfold decodeValueFromBytes
-    dsimp only [enumTy]
-    rw [hLookup]
-    rfl
-
-/--
-**Positive round-trip theorem for `0..n-1` multi-variant fieldless `#[repr(Int)]` / `#[repr(u8)]` enums.**
-When variant index `varIdx < scalarModulus l.size.bytes` lies in `validRange` and maps to a fieldless
-variant `.arbitrary [] varMemOrder` in `variantShapes`:
-1. `encodeValueToBytes` on `.aggregate varIdx []` produces `some (encodeLittleEndianBytes varIdx l.size.bytes none)`.
+**General explicit-discriminant round-trip theorem for multi-variant fieldless `#[repr(Int)]` enums.**
+For any `#[repr(u8/u16/u32/u64/u128/i8/i16/i32/i64/i128)]` fieldless enum layout `l` (including
+explicit non-zero, sparse, `u128`, or two's-complement negative discriminants recorded in
+`l.variantDiscriminants`), whenever variant `varIdx` has canonical machine discriminant `discrBits`
+(`resolveEnumDiscriminantForVariant ... varIdx = some discrBits` and
+`resolveEnumVariantIdxByTag l.variantDiscriminants discrBits = some varIdx`), `discrBits` fits in
+`l.size.bytes` and lies in `validRange`, and `variantShapes[varIdx]` is fieldless:
+1. `encodeValueToBytes` on `.aggregate varIdx []` produces `some (encodeLittleEndianBytes discrBits l.size.bytes none)`.
 2. `decodeValueFromBytes` on those encoded bytes recovers `some (.aggregate varIdx [])`.
 -/
-theorem adt_multiple_enum_encode_decode_roundtrip
+theorem adt_multiple_enum_explicit_discriminant_roundtrip
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
-    (l : TypeLayout) (bitsWidth varIdx : Nat) (signed : Bool) (validRange : WrappingRange)
+    (l : TypeLayout) (bitsWidth varIdx discrBits : Nat) (signed : Bool) (validRange : WrappingRange)
     (variantShapes : List FieldsShape) (memoryOrder varMemOrder : List Nat)
     (hLookup : LayoutTable.lookup layouts idx = some l)
     (hInhab : l.isUninhabited = false)
@@ -3782,11 +3774,15 @@ theorem adt_multiple_enum_encode_decode_roundtrip
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
     (hNz : Nat.beq l.size.bytes 0 = false)
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
-    (hVarLt : varIdx < scalarModulus l.size.bytes)
-    (hInRange : wrappingRangeContains validRange varIdx = true)
-    (hGetVar : get? variantShapes varIdx = some (.arbitrary [] varMemOrder)) :
+    (hDiscrLt : discrBits < scalarModulus l.size.bytes)
+    (hInRange : wrappingRangeContains validRange discrBits = true)
+    (hGetVar : get? variantShapes varIdx = some (.arbitrary [] varMemOrder))
+    (hEncDiscr :
+      resolveEnumDiscriminantForVariant (.initialized (.int bitsWidth signed) validRange)
+        l.size.bytes l.variantDiscriminants varIdx = some discrBits)
+    (hDecDiscr : resolveEnumVariantIdxByTag l.variantDiscriminants discrBits = some varIdx) :
     let enumTy : Ty := { kind := .adt defPath args, layoutIdx := idx }
-    let tagBytes := encodeLittleEndianBytes varIdx l.size.bytes none
+    let tagBytes := encodeLittleEndianBytes discrBits l.size.bytes none
     encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate varIdx []) = some tagBytes ∧
     decodeValueFromBytes defaultCodecFuel layouts enumTy tagBytes =
       some (.aggregate varIdx []) := by
@@ -3809,6 +3805,8 @@ theorem adt_multiple_enum_encode_decode_roundtrip
     have hGet0 : get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
     rw [hGet0]
     dsimp only
+    rw [hEncDiscr]
+    dsimp only
     unfold encodeScalarBytes
     dsimp only
     rw [hNz]
@@ -3817,7 +3815,7 @@ theorem adt_multiple_enum_encode_decode_roundtrip
         writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 tagBytes = some tagBytes := by
       rw [replicateUninitBytes_eq_replicate]
       have hTagLen : length tagBytes = l.size.bytes :=
-        length_encodeLittleEndianBytes none l.size.bytes varIdx
+        length_encodeLittleEndianBytes none l.size.bytes discrBits
       have hRep :
           List.replicate l.size.bytes AbstractByte.uninit =
             ([] : List AbstractByte) ++ List.replicate (tagBytes.length + 0) .uninit := by
@@ -3835,7 +3833,7 @@ theorem adt_multiple_enum_encode_decode_roundtrip
       rw [length_encodeLittleEndianBytes]
       exact Nat.beq_refl _
     rw [show defaultCodecFuel = 15 + 1 from rfl,
-        decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+        decodeValueFromBytes_adt_multiple_enum_explicit_scalarLayout 15 layouts defPath args idx l
           (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
           hLookup hInhab hVar hFields hWidth,
         hBeqLen]
@@ -3844,12 +3842,108 @@ theorem adt_multiple_enum_encode_decode_roundtrip
         hBeqLen]
     dsimp only
     unfold tagBytes
-    rw [decodeScalarBytes_encodeLittleEndianBytes_of_lt l.size.bytes varIdx none false hPos hVarLt]
+    rw [decodeScalarBytes_encodeLittleEndianBytes_of_lt l.size.bytes discrBits none false hPos hDiscrLt]
     dsimp only
     rw [hInRange]
     dsimp only
+    rw [hDecDiscr]
+    dsimp only
     rw [hGetVar]
   exact ⟨hEnc, hDec⟩
+
+/--
+**Positive agreement for explicit enum discriminants (`#[repr(u8)] enum E { A = 1, B = 2 }`).**
+When `l.variantDiscriminants = [1, 2]` (`validRange = ⟨1, 2⟩`, two fieldless variants):
+1. discriminant `1` decodes to variant `0` (`E::A`, `some (.aggregate 0 [])`);
+2. discriminant `2` decodes to variant `1` (`E::B`, `some (.aggregate 1 [])`);
+3. encoding `E::A` (`.aggregate 0 []`) writes byte `1`, and encoding `E::B` (`.aggregate 1 []`)
+   writes byte `2`;
+4. byte `0` (outside `validRange`) is rejected (`= none`).
+-/
+theorem adt_multiple_enum_explicit_discriminant_agreement
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (memoryOrder vm0 vm1 : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants =
+      .multiple (.initialized (.int 8 false) ⟨1, 2⟩) 0 [.arbitrary [] vm0, .arbitrary [] vm1])
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz : l.size.bytes = 1)
+    (hDiscr : l.variantDiscriminants = [1, 2]) :
+    let enumTy : Ty := { kind := .adt defPath args, layoutIdx := idx }
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 1 1 none) =
+      some (.aggregate 0 []) ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 2 1 none) =
+      some (.aggregate 1 []) ∧
+    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate 0 []) =
+      some (encodeLittleEndianBytes 1 1 none) ∧
+    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate 1 []) =
+      some (encodeLittleEndianBytes 2 1 none) ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 0 1 none) =
+      none := by
+  intro enumTy
+  rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts, lVarDiscrs⟩
+  dsimp only at hInhab hVar hFields hSz hDiscr
+  subst hInhab hVar hFields hSz hDiscr
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold encodeValueToBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold encodeValueToBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+
+/--
+**Positive round-trip theorem for `0..n-1` multi-variant fieldless `#[repr(Int)]` / `#[repr(u8)]` enums.**
+When variant index `varIdx < scalarModulus l.size.bytes` lies in `validRange` and maps to a fieldless
+variant `.arbitrary [] varMemOrder` in `variantShapes` (with default `l.variantDiscriminants = []`):
+1. `encodeValueToBytes` on `.aggregate varIdx []` produces `some (encodeLittleEndianBytes varIdx l.size.bytes none)`.
+2. `decodeValueFromBytes` on those encoded bytes recovers `some (.aggregate varIdx [])`.
+-/
+theorem adt_multiple_enum_encode_decode_roundtrip
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth varIdx : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder varMemOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants =
+      .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hVarLt : varIdx < scalarModulus l.size.bytes)
+    (hInRange : wrappingRangeContains validRange varIdx = true)
+    (hGetVar : get? variantShapes varIdx = some (.arbitrary [] varMemOrder))
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
+    let enumTy : Ty := { kind := .adt defPath args, layoutIdx := idx }
+    let tagBytes := encodeLittleEndianBytes varIdx l.size.bytes none
+    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate varIdx []) = some tagBytes ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy tagBytes =
+      some (.aggregate varIdx []) :=
+  adt_multiple_enum_explicit_discriminant_roundtrip layouts defPath args idx l bitsWidth varIdx
+    varIdx signed validRange variantShapes memoryOrder varMemOrder hLookup hInhab hVar hFields hNz
+    hWidth hVarLt hInRange hGetVar
+    (by simp [resolveEnumDiscriminantForVariant, hNoDiscr])
+    (by simp [resolveEnumVariantIdxByTag, hNoDiscr])
 
 /--
 **Positive `l.fieldLayouts` niche-enforcement theorem.**
@@ -5530,7 +5624,8 @@ theorem adt_multiple_enum_stage1_accepts_tag_provenance
     (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
     (hVarLt : varIdx < scalarModulus l.size.bytes)
     (hInRange : wrappingRangeContains validRange varIdx = true)
-    (hGetVar : get? variantShapes varIdx = some (.arbitrary [] varMemOrder)) :
+    (hGetVar : get? variantShapes varIdx = some (.arbitrary [] varMemOrder))
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     abstractBytesHaveProv (encodeLittleEndianBytes varIdx l.size.bytes (some pv)) = true ∧
     decodeTypedValueFromBytes defaultCodecFuel layouts
         { kind := .adt defPath args, layoutIdx := idx }
@@ -5552,7 +5647,7 @@ theorem adt_multiple_enum_stage1_accepts_tag_provenance
         variantShapes _ hLookup hInhab hVar hLen,
       decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
         (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-        hLookup hInhab hVar hFields hWidth,
+        hLookup hInhab hVar hFields hWidth _ hNoDiscr,
       hBeqLen]
     dsimp only
     rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes _
@@ -5592,7 +5687,8 @@ theorem adt_multiple_fieldless_enum_stage1
     (hFieldless :
       ∀ tag < scalarModulus l.size.bytes,
         wrappingRangeContains validRange tag = true →
-        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder)) :
+        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder))
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     (∀ bits < scalarModulus l.size.bytes,
       decodeTypedValueFromBytes defaultCodecFuel layouts
           { kind := .adt defPath args, layoutIdx := idx }
@@ -5619,7 +5715,7 @@ theorem adt_multiple_fieldless_enum_stage1
         get? variantShapes tag = some (.arbitrary varOffsets varMemOrder))
     hLookup hInhab hVar
   refine ⟨?_, hIff.1.mpr (adt_multiple_enum_scalarLayout_isTryFromBytes layouts defPath args idx l
-      bitsWidth signed validRange variantShapes memoryOrder hLookup hInhab hVar hFields hWidth),
+      bitsWidth signed validRange variantShapes memoryOrder hLookup hInhab hVar hFields hWidth hNoDiscr),
     ?_⟩
   · intro bits hBits
     have hLen := length_encodeLittleEndianBytes none l.size.bytes bits
@@ -5628,7 +5724,7 @@ theorem adt_multiple_fieldless_enum_stage1
         variantShapes _ hLookup hInhab hVar hLen]
     exact adt_multiple_enum_scalarLayout_decode_encode_eq layouts defPath args idx l bitsWidth
       signed validRange variantShapes memoryOrder hLookup hInhab hVar hFields hNz hWidth hFieldless
-      bits none hBits
+      bits none hBits hNoDiscr
   · rw [hIff.2]
     have hZeroLt : 0 < scalarModulus l.size.bytes := by
       rw [Anneal.Scalars.scalarModulus_eq_two_pow]
@@ -5644,7 +5740,7 @@ theorem adt_multiple_fieldless_enum_stage1
       obtain ⟨varMemOrder0, hVar0⟩ := hFieldless 0 hZeroLt hZ
       exact adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange layouts defPath args idx l
         bitsWidth signed validRange variantShapes memoryOrder varMemOrder0 hLookup hInhab hVar
-        hFields hNz hWidth hZ hVar0
+        hFields hNz hWidth hZ hVar0 hNoDiscr
 
 /--
 A full-range multi-variant fieldless enum (`validRange.start = 0`,
@@ -5667,7 +5763,8 @@ theorem adt_multiple_fieldless_enum_fullRange_isFromBytesTyped
     (hEnd : scalarModulus l.size.bytes - 1 ≤ validRange.end_)
     (hFieldless :
       ∀ tag < scalarModulus l.size.bytes,
-        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder)) :
+        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder))
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     IsFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx } := by
   refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], fun bs hLen hInit _hProv => ?_⟩
   have hBeqLen : Nat.beq (length bs) l.size.bytes = true := by
@@ -5688,7 +5785,7 @@ theorem adt_multiple_fieldless_enum_fullRange_isFromBytesTyped
       variantShapes bs hLookup hInhab hVar hLen,
     decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
       (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-      hLookup hInhab hVar hFields hWidth,
+      hLookup hInhab hVar hFields hWidth bs hNoDiscr,
     hBeqLen]
   dsimp only
   rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes bs

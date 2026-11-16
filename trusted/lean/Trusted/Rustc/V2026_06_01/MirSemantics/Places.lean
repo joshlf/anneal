@@ -3431,6 +3431,35 @@ def layoutValidForAdt (l : TypeLayout) : Bool :=
   | _, _ => true
 
 /--
+`true` when `l` at `layoutIdx` in `layouts` is valid to size and align an `.adt`
+or `.closure`: accepts every `layoutValidForAdt l` entry, and when `layoutIdx`
+is a resolved non-zero index (`Nat.beq layoutIdx 0 = false`, ruling out the
+synthesized `0` index that could collide with `layouts.entries[0]`), also
+accepts inhabited single-variant `FieldsShape.primitive` wrapper layouts
+(such as `#[repr(transparent)]` primitive-wrapper ADTs flattened to their inner
+scalar or pointer layout).
+
+Reference (The Rust Reference, "The transparent representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-transparent-representation>
+
+> "The transparent representation can only be used on a struct or an enum with a
+> single variant that has:
+> - any number of fields with size 0 and alignment 1 (e.g. PhantomData<T>), and
+> - at most one other field.
+>
+> Structs and enums with this representation have the same layout and ABI as the
+> only non-size 0 non-alignment 1 field, if present, or unit otherwise."
+-/
+@[reducible]
+def layoutValidForResolvedAdt (layoutIdx : Nat) (l : TypeLayout) : Bool :=
+  match layoutValidForAdt l with
+  | true => true
+  | false =>
+    match Nat.beq layoutIdx 0, l.isUninhabited, l.fields, l.variants with
+    | false, false, .primitive, .single _ => true
+    | _, _, _, _ => false
+
+/--
 `true` when `idx` is either `0` (the default index assigned to `Ty`s synthesized
 by `pointeeTyOf` / `elemTyOf`) or an out-of-range index in `layouts` (such as
 `unresolvedLayoutIdx layouts`).
@@ -3821,7 +3850,7 @@ def tyByteSizeAndAlignAux
     | .adt _ _ | .closure _ _ =>
       match LayoutTable.lookup layouts rTy.layoutIdx with
       | .some l =>
-        match layoutValidForAdt l with
+        match layoutValidForResolvedAdt rTy.layoutIdx l with
         | false => findArrayElemStrideAndAlign? layouts localDecls rTy.kind
         | true =>
           let a :=
@@ -6058,7 +6087,7 @@ def tyByteAlignAux
       | .some l =>
         let ok : Bool :=
           match rTy.kind with
-          | .adt _ _ | .closure _ _ => layoutValidForAdt l
+          | .adt _ _ | .closure _ _ => layoutValidForResolvedAdt rTy.layoutIdx l
           | .tuple ks => layoutMatchesAggregateVariant l 0 (length ks)
           | .array _ n =>
             match l.fields with
@@ -6154,7 +6183,7 @@ def tyExactByteAlignAux
       | .some l =>
         let ok : Bool :=
           match rTy.kind with
-          | .adt _ _ | .closure _ _ => layoutValidForAdt l
+          | .adt _ _ | .closure _ _ => layoutValidForResolvedAdt rTy.layoutIdx l
           | .tuple ks => layoutMatchesAggregateVariant l 0 (length ks)
           | .array _ n =>
             match l.fields with
@@ -12263,6 +12292,39 @@ def encodeByteCastSourceBytes
     | false => encodeUntypedValueToBytes defaultCodecFuel v
 
 /--
+Resolve the effective `(resolvedSrcTy, srcSizeBytes)` of byte-cast operand `op`
+from its `operandTy` `srcTy`: uses `resolveTyWithLocalDecls` and `tyByteSize`
+directly when `srcTy` is already layout-sized (including primitive wrappers at
+non-zero `layoutIdx`), and falls back to `operandTyResolved` when `op` projects
+through a container or reference whose `fieldLayouts` in `layouts` carry the
+inner type's `LayoutIdx` without a synthetic root local in `localDecls`.
+
+Reference (The Rust Reference, "The transparent representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-transparent-representation>
+
+> "Structs and enums with this representation have the same layout and ABI as the
+> only non-size 0 non-alignment 1 field, if present, or unit otherwise."
+-/
+@[reducible]
+def resolveByteCastSrcTyAndSize
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand)
+    (srcTy : Ty) :
+    Option (Ty × Nat) :=
+  let rSrcTy0 := resolveTyWithLocalDecls localDecls layouts srcTy
+  match tyByteSize localDecls layouts rSrcTy0 with
+  | .some sz => .some (rSrcTy0, sz)
+  | .none =>
+    match operandTyResolved localDecls layouts op with
+    | .some resTy =>
+      let rRes := resolveTyWithLocalDecls localDecls layouts resTy
+      match tyByteSize localDecls layouts rRes with
+      | .some sz => .some (rRes, sz)
+      | .none => .none
+    | .none => .none
+
+/--
 Evaluate a byte-level representation cast (`CastKind.transmute` or
 `CastKind.subtype`) from operand `op` to `targetTy` by encoding the source
 `Value` into `List AbstractByte` and decoding at `targetTy`.
@@ -12314,10 +12376,9 @@ def evalByteCast
     | .some dstSize =>
       match operandTy localDecls layouts op with
       | .some srcTy =>
-        let rSrcTy := resolveTyWithLocalDecls localDecls layouts srcTy
-        match tyByteSize localDecls layouts rSrcTy with
+        match resolveByteCastSrcTyAndSize localDecls layouts op srcTy with
         | .none => .unsupported
-        | .some srcSize =>
+        | .some (rSrcTy, srcSize) =>
           match Nat.beq srcSize dstSize with
           | false => .unsupported
           | true =>

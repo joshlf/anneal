@@ -22561,6 +22561,18 @@ def checkTrustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp)
         decide (LIntrinsicOp.fromRustIntrinsicKind? kind = some op)
     | none => false
 
+private theorem eq_some_of_match_copyNonOverlapping :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .copyNonOverlapping => true | _ => false) = true →
+      x = some .copyNonOverlapping
+  | some .copyNonOverlapping, _ => rfl
+
+private theorem eq_some_of_match_writeBytes :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .writeBytes => true | _ => false) = true →
+      x = some .writeBytes
+  | some .writeBytes, _ => rfl
+
 theorem trustedSupportsIntrinsicDefPath_of_check {defPath : DefPath} {op : LIntrinsicOp}
     (h : checkTrustedSupportsIntrinsicDefPath defPath op = true) :
     trustedSupportsIntrinsicDefPath defPath op := by
@@ -22592,22 +22604,10 @@ theorem trustedSupportsIntrinsicDefPath_of_check {defPath : DefPath} {op : LIntr
     · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
         Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
       exact h
-    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
-        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
-      obtain ⟨hEx, hMem⟩ := h
-      refine ⟨hEx, ?_⟩
-      revert hMem
-      cases classifyRustIntrinsic? defPath with
-      | none => intro hMem; nomatch hMem
-      | some k => cases k <;> intro hMem <;> first | rfl | nomatch hMem
-    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
-        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
-      obtain ⟨hEx, hMem⟩ := h
-      refine ⟨hEx, ?_⟩
-      revert hMem
-      cases classifyRustIntrinsic? defPath with
-      | none => intro hMem; nomatch hMem
-      | some k => cases k <;> intro hMem <;> first | rfl | nomatch hMem
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_copyNonOverlapping _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_writeBytes _ h.2⟩
     · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
         Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
       exact ⟨h.1.1, h.1.2, h.2⟩
