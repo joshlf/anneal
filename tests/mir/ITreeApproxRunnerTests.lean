@@ -6,6 +6,7 @@
 -- This file may not be copied, modified, or distributed except according to
 -- those terms.
 
+import Lean
 import Anneal.ITree
 import Anneal.Rustc.V2026_06_01.TraceCheck
 
@@ -21,26 +22,39 @@ open Anneal.ITree
 open Anneal.Rustc.V2026_06_01.TraceCheck
 
 /-!
-# Suffix-Free `CofixA` Approximant Walkers & Fast `TraceCheck` Suite (`[adv ep1-A0]`)
+# Suffix-Free `CofixA` Approximant Walkers & `TraceCheck` Suite
 
 Kernel regression, non-vacuity canary, and heartbeat-scaling benchmark suite for
 `Anneal.ITree` Section 7 (`CofixA` walkers) and `Anneal.Rustc.V2026_06_01.TraceCheck`:
-1. `#guard_msgs (whitespace := lax) in #print axioms` guards on all principal
-   `Anneal.ITree` and `Anneal.Rustc.V2026_06_01.TraceCheck` bridge and soundness
-   theorems, verifying zero `sorryAx`, zero `Classical.choice`, and zero `Lean.ofReduceBool`.
-2. Positive `by rfl` kernel confirmation and `ReachesRet` / `TauStar` adequacy proofs
-   across loop depths $k \in \{4, 8, 16, 32\}$ for `approxCofix`, `bindApprox`,
-   `iterApprox`, `interpApprox`, and `interpStateApprox` (including nested
-   `interpState` over `interp` over `iter`) under tight `maxHeartbeats` bounds.
-3. Multi-iteration MIR loop `CapturedMir` fixtures with `SwitchInt` branches and
-   external `MirCallE` oracle calls tested at $k \in \{4, 8, 16, 32\}$ across
-   `checkRawByteTraceFullBounded*`, `checkRawByteTraceObsErasedBounded*`,
-   `checkRawByteTraceFullApprox`, `checkRawByteTraceObsErasedApprox`, and
-   `diagnoseRawByteTrace*Bounded`.
-4. Negative non-vacuity canary theorems proving that wrong outcomes, wrong branch
-   tags, wrong external call arguments, unexpected trailing events, impure pointer
-   external calls, and insufficient fuel are soundly rejected (`= false` and
-   exact `TraceReplayDiag` mismatch `by rfl`).
+1. `#guard_msgs (whitespace := lax) in #print axioms` guards on the principal
+   bridge, adequacy, and soundness theorems (zero `sorryAx`, zero `Classical.choice`,
+   zero `Lean.ofReduceBool`).
+2. `#audit_closure` guards walking the definitional closure of every walker and
+   trace checker: no `ITree.observe` / `CoInd.unfold` anywhere, and no `Eq.rec`
+   / `Eq.ndrec` / `Eq.mpr` / `cast` / `Nat.noConfusion` index transports in the
+   `CofixA` walkers (with `ofITree` as a positive control that does reach them).
+3. Measured heartbeat benchmarks for nested `interpStateApprox ∘ interpApprox ∘
+   iterApprox` at loop depths `k ∈ {4, 8, 16, 32}` (elaborator `rfl` and
+   kernel-only `decide +kernel`), side by side with the `ITree.observe`-based
+   evaluator on the corresponding coinductive `ITree` (`k ∈ {1, 2, 4, 8}`) and a
+   `(kernel) deterministic timeout` canary for `.observe` at `k = 8` under the
+   budget that the walker meets at `k = 32`.
+4. A multi-iteration MIR loop (`SwitchInt` branches + external `MirCallE` oracle
+   calls) checked at `k ∈ {4, 8, 16, 32}` by `checkRawByteTrace*Bounded`,
+   `checkRawByteTrace*Approx` (`CofixA` route), and `diagnoseRawByteTrace*Bounded`
+   at the exact minimal fuel, plus kernel-only (`decide +kernel`) end-to-end
+   soundness at `k = 32` and `k = 64` (where elaborator `rfl` exceeds the default
+   `maxRecDepth`).
+5. Negative non-vacuity canaries: wrong outcome, wrong branch tag, wrong call
+   argument, wrong call target, trailing events, impure pointer calls,
+   insufficient fuel (exact boundaries for every checker), and the
+   call-site-operand purity policy that a state-free `CofixA` walker can only
+   enforce over the policy-guarded approximant `mirExecGuardedApprox`.
+
+All heartbeat figures are `maxHeartbeats` units (1000 internal heartbeats) for the
+whole declaration (elaboration plus kernel check), measured with
+`IO.getNumHeartbeats` around synchronous elaboration (`Elab.async false`); every
+guard below is set at most about 1.5x the measured figure.
 -/
 
 /-! ## 1. Axiom-Hygiene Guards (`#print axioms`) -/
@@ -241,7 +255,241 @@ Kernel regression, non-vacuity canary, and heartbeat-scaling benchmark suite for
 #guard_msgs (whitespace := lax) in
 #print axioms checkRawByteTraceObsErasedApprox_sound
 
-/-! ## 2. Nested `interpState` over `interp` over `iter` (`CofixA` Walkers vs `.observe`) -/
+/-- info: 'Anneal.ITree.ReachesRetApprox.ofITree_mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms ReachesRetApprox.ofITree_mono
+
+/-- info: 'Anneal.ITree.evalTauApprox_ofITree_mono' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_ofITree_mono
+
+/-- info: 'Anneal.ITree.checkTraceApprox_complete' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_complete
+
+/-- info: 'Anneal.ITree.checkTraceApprox_ofITree_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_ofITree_iff
+
+/-- info: 'Anneal.ITree.checkTraceApprox_ofITree_mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_ofITree_mono
+
+/-- info: 'Anneal.ITree.checkTraceApprox_approxCofix_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_approxCofix_sound
+
+/-- info: 'Anneal.ITree.checkTraceApprox_iterApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_iterApprox_sound
+
+/-- info: 'Anneal.ITree.checkTraceApprox_interpApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_interpApprox_sound
+
+/-- info: 'Anneal.ITree.checkTraceApprox_interpStateApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTraceApprox_interpStateApprox_sound
+
+/-- info: 'Anneal.ITree.evalTauApprox_approxCofix_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_approxCofix_sound
+
+/-- info: 'Anneal.ITree.evalTauApprox_iterApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_iterApprox_sound
+
+/-- info: 'Anneal.ITree.evalTauApprox_interpApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_interpApprox_sound
+
+/-- info: 'Anneal.ITree.evalTauApprox_interpStateApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalTauApprox_interpStateApprox_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullObservedTraceBounded_eq_fast' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullObservedTraceBounded_eq_fast
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkObsErasedObservedTraceBounded_eq_fast' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkObsErasedObservedTraceBounded_eq_fast
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox_guarded_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirTraceApprox_guarded_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirObsErasedTraceApprox_guarded_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirObsErasedTraceApprox_guarded_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox_interpSilence_guarded_imp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirTraceApprox_interpSilence_guarded_imp
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullBoundedFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFullBoundedFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedBoundedFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedBoundedFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullBoundedFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullBoundedFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedBoundedFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedBoundedFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullBounded_fast_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullBounded_fast_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedBounded_fast_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedBounded_fast_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullApprox_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFullApprox_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullApprox_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullApprox_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedApprox_imp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedApprox_imp
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedApprox_imp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedApprox_imp
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesFullApprox_sound
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedApprox_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedApprox_sound
+
+/-! ## 2. Definitional-Closure Audit (`#audit_closure`)
+
+Kernel `rfl` / `decide` confirmation unfolds every definition reachable from a
+walker. The audit below walks that closure (definition bodies, compiled matchers,
+and structural-recursion auxiliaries; theorem proofs and opaque constants are not
+entered) and reports every forbidden constant it reaches:
+- `walker` profile: `ITree.observe`, `CoInd.unfold` (the `childApprox` /
+  `head_eq ▸` tower rebuilt at every `.observe`), and index-transport
+  eliminators `Eq.rec`, `Eq.ndrec`, `Eq.mpr`, `Eq.mp`, `cast`, `HEq.rec`,
+  `HEq.ndrec`, `Nat.noConfusion`;
+- `checker` profile: `ITree.observe`, `CoInd.unfold`, `ITree.cofix`, `CoInd.fold`
+  (no coinductive `ITree` is ever built or observed by the replay checkers).
+`ofITree` (which observes by design) and the generic `checkTraceApprox` (which
+transports answers along a decided request equality) are positive controls that
+prove the audit is not vacuous. The MIR trace walkers `checkMirTraceApprox` /
+`checkMirObsErasedTraceApprox` are audited under the `checker` profile: their
+nested request patterns still compile to index-unifying matchers (a constant
+per-node `Eq.ndrec` cost, measured at about 4% over `checkRawByteTraceFullBounded`
+kernel-only at `k = 32`, dominated by `stepMirState`).
+-/
+
+open Lean Elab Command in
+/--
+`#audit_closure (walker|checker) root` reports which constants of the chosen
+forbidden profile occur in the transitive definitional closure of `root`.
+-/
+elab "#audit_closure " prof:ident root:ident : command => do
+  let env ← getEnv
+  let rootName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo root
+  let forbidden : Array Name :=
+    if prof.getId == `walker then
+      #[``Trusted.ITree.ITree.observe, ``Trusted.CoInd.CoInd.unfold, ``Eq.rec, ``Eq.ndrec,
+        ``Eq.mpr, ``Eq.mp, ``cast, ``HEq.rec, ``HEq.ndrec, ``Nat.noConfusion]
+    else
+      #[``Trusted.ITree.ITree.observe, ``Trusted.CoInd.CoInd.unfold,
+        ``Trusted.ITree.ITree.cofix, ``Trusted.CoInd.CoInd.fold]
+  let mut visited : NameSet := NameSet.empty.insert rootName
+  let mut stack : Array Name := #[rootName]
+  let mut hits : NameSet := {}
+  for _ in [0:1000000] do
+    match stack.back? with
+    | none => break
+    | some n =>
+      stack := stack.pop
+      match env.find? n with
+      | some (.defnInfo v) =>
+        for c in v.value.getUsedConstants do
+          if forbidden.contains c then
+            hits := hits.insert c
+          if !visited.contains c then
+            visited := visited.insert c
+            stack := stack.push c
+      | _ => pure ()
+  let hitList := (hits.toList.map toString).toArray.qsort (· < ·)
+  if hitList.isEmpty then
+    logInfo m!"{rootName}: clean"
+  else
+    logInfo m!"{rootName}: reaches {hitList.toList}"
+
+/-- info: Anneal.ITree.approxCofix: clean -/
+#guard_msgs in #audit_closure walker approxCofix
+/-- info: Anneal.ITree.CofixA.map: clean -/
+#guard_msgs in #audit_closure walker CofixA.map
+/-- info: Anneal.ITree.approxStep: clean -/
+#guard_msgs in #audit_closure walker approxStep
+/-- info: Anneal.ITree.bindApprox: clean -/
+#guard_msgs in #audit_closure walker bindApprox
+/-- info: Anneal.ITree.iterApprox: clean -/
+#guard_msgs in #audit_closure walker iterApprox
+/-- info: Anneal.ITree.interpApprox: clean -/
+#guard_msgs in #audit_closure walker interpApprox
+/-- info: Anneal.ITree.interpHandlerApprox: clean -/
+#guard_msgs in #audit_closure walker interpHandlerApprox
+/-- info: Anneal.ITree.interpStateApprox: clean -/
+#guard_msgs in #audit_closure walker interpStateApprox
+/-- info: Anneal.ITree.interpStateHandlerApprox: clean -/
+#guard_msgs in #audit_closure walker interpStateHandlerApprox
+/-- info: Anneal.ITree.evalTauApprox: clean -/
+#guard_msgs in #audit_closure walker evalTauApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.silenceMirObsApprox: clean -/
+#guard_msgs in #audit_closure walker silenceMirObsApprox
+
+/-- info: Anneal.ITree.ofITree: reaches [Eq.rec, Trusted.CoInd.CoInd.unfold, Trusted.ITree.ITree.observe] -/
+#guard_msgs (whitespace := lax) in #audit_closure walker ofITree
+/-- info: Anneal.ITree.checkTraceApprox: reaches [Eq.ndrec, Eq.rec] -/
+#guard_msgs (whitespace := lax) in #audit_closure walker checkTraceApprox
+
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox: clean -/
+#guard_msgs in #audit_closure checker checkMirTraceApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkMirObsErasedTraceApprox: clean -/
+#guard_msgs in #audit_closure checker checkMirObsErasedTraceApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullBounded: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceFullBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedBounded: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceObsErasedBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullBounded: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceWithCalleesFullBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedBounded: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceWithCalleesObsErasedBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullApprox: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceFullApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedApprox: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceObsErasedApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesFullApprox: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceWithCalleesFullApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedApprox: clean -/
+#guard_msgs in #audit_closure checker checkRawByteTraceWithCalleesObsErasedApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullBounded: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceFullBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceObsErasedBounded: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceObsErasedBounded
+/-- info: Trusted.VerificationResult.mirStatefulTree: reaches [Trusted.ITree.ITree.cofix] -/
+#guard_msgs in #audit_closure checker mirStatefulTree
+
+/-! ## 3. Nested `interpState` over `interp` over `iter` (`CofixA` Walkers vs `.observe`) -/
 
 /-- Effect with an observation tag request (`tagStep`) and an accumulator request (`incBy`). -/
 inductive CounterReq : Type where
@@ -417,13 +665,11 @@ theorem nestedPipelineApprox_sound
   rw [← ofITree_nestedPipeline] at h
   exact ⟨evalTauApprox_sound_reachesRet h, evalTauApprox_sound_tauStar h⟩
 
-/--
-Reference `.observe`-based fuel evaluator on `ITree EmptyE R` for side-by-side
-heartbeat comparison against `evalTauApprox ∘ nestedPipelineApprox`.
-Notice that each step invokes `t.observe`, which unfolds `CoInd.unfold` across all
-3 nested layers (`interpState`, `interp`, `iter`) and re-wraps continuation trees
-with `ITreeF.map`.
--/
+/-- Reference `.observe`-based fuel evaluator on `ITree EmptyE R` for side-by-side
+heartbeat comparison against `evalTauApprox ∘ nestedPipelineApprox`. Every step
+calls `t.observe` (`CoInd.unfold`), which on `nestedPipelineITree` re-evaluates
+the `childApprox` / `head_eq ▸` towers of all three nested coalgebras
+(`interpState`, `interp`, `iter`) and re-wraps continuations with `ITreeF.map`. -/
 def evalTauObserve {R : Type} : Nat → ITree EmptyE R → Option R
   | 0, _ => none
   | fuel + 1, t =>
@@ -433,76 +679,169 @@ def evalTauObserve {R : Type} : Nat → ITree EmptyE R → Option R
     | .vis i _ => nomatch i
 
 /-!
-### Kernel `by rfl` Confirmation & Scaling Across Loop Depths $k \in \{4, 8, 16, 32\}$
+### Measured Kernel Scaling: `CofixA` Walkers versus `ITree.observe`
 
-Each iteration of `counterIterBody` performs two `CounterE` requests (`tagStep`
-and `incBy`) plus one `iter` back-edge `.tau`, consuming exactly `5` output `.tau`
-steps per iteration under `interpState ∘ interp ∘ iter` plus `1` terminal `.ret`
-(`5 * k + 1` steps total).
+Each loop iteration of `counterIterBody` contributes exactly `4` output `.tau`s
+under `interpState ∘ interp ∘ iter`: `tagStep` (handler `.ret` → `.tau`), `incBy`
+(`interp` emits `.vis (.addGet _)`, which `interpState` answers with a `.tau`,
+followed by `interp`'s handler-return `.tau`), and the `iter` back-edge `.tau`;
+the run ends with one `.ret`. The minimal fuel is therefore `4 * k + 1`
+(`nestedPipeline_exact_fuel_boundary`).
 
-Measured kernel reduction scaling (`evalTauApprox (nestedPipelineApprox k 100 (5 * k + 2))`):
-- `k = 4` (`fuel = 22`): succeeds well within `maxHeartbeats 15000` (`(110, 110)`).
-- `k = 8` (`fuel = 42`): succeeds well within `maxHeartbeats 15000` (`(136, 136)`).
-- `k = 16` (`fuel = 82`): succeeds well within `maxHeartbeats 15000` (`(236, 236)`).
-- `k = 32` (`fuel = 162`): succeeds well within `maxHeartbeats 20000` (`(628, 628)`).
-By contrast, `evalTauObserve` on `nestedPipelineITree` cannot even reduce a single
-step by `rfl` in the kernel without rewriting via `ITree.observe_cofix` axioms
-because `CoInd.unfold` is a non-computable quotient lift (`Quot.liftOn`)!
+Measured heartbeats (whole declaration):
+
+| `k` | fuel | walker `rfl` | walker `decide +kernel` | `.observe` `decide +kernel` |
+|----:|-----:|-------------:|------------------------:|----------------------------:|
+|   1 |    5 |            – |                      54 |                         122 |
+|   2 |    9 |            – |                      67 |                         404 |
+|   4 |   17 |          370 |                      98 |                        2364 |
+|   8 |   33 |          671 |                     149 |                       17252 |
+|  16 |   65 |         1273 |                     252 |                           – |
+|  32 |  129 |         2478 |                     458 |                           – |
+
+For reference, the same walkers written with index-unifying `match`es on
+`CofixA` (whose compiled matchers transport indices with `Eq.ndrec`) measured
+`1543 / 2950 / 5768 / 11399` (`rfl`) and `164 / 270 / 481 / 904` (kernel) at
+`k = 4 / 8 / 16 / 32`.
+
+The walker is linear in `k` (about `13` kernel heartbeats per iteration), while
+the `.observe` evaluator grows roughly cubically (`7.3x` from `k = 4` to `k = 8`,
+the `O(k^3)` nested-`childApprox` blowup): at `k = 4` it already costs about 5x
+what the walker needs at `k = 32`, and at `k = 8` it times out under the walker's
+`k = 32` budget (`nestedPipelineObserve_k8_exceeds_walker_k32_budget`).
+Elaborator `rfl` costs a further constant factor over the kernel because
+`Meta.isDefEq` re-evaluates the term before the kernel re-checks it.
 -/
 
-set_option maxHeartbeats 15000 in
+set_option maxHeartbeats 500 in
 theorem nestedPipeline_k4_rfl :
-    evalTauApprox (nestedPipelineApprox 4 100 22) = some (110, 110) :=
+    evalTauApprox (nestedPipelineApprox 4 100 17) = some (110, 110) :=
   rfl
 
-set_option maxHeartbeats 15000 in
+set_option maxHeartbeats 900 in
 theorem nestedPipeline_k8_rfl :
-    evalTauApprox (nestedPipelineApprox 8 100 42) = some (136, 136) :=
+    evalTauApprox (nestedPipelineApprox 8 100 33) = some (136, 136) :=
   rfl
 
-set_option maxHeartbeats 15000 in
+set_option maxHeartbeats 1700 in
 theorem nestedPipeline_k16_rfl :
-    evalTauApprox (nestedPipelineApprox 16 100 82) = some (236, 236) :=
+    evalTauApprox (nestedPipelineApprox 16 100 65) = some (236, 236) :=
   rfl
 
-set_option maxHeartbeats 20000 in
+set_option maxHeartbeats 3300 in
 theorem nestedPipeline_k32_rfl :
-    evalTauApprox (nestedPipelineApprox 32 100 162) = some (628, 628) :=
+    evalTauApprox (nestedPipelineApprox 32 100 129) = some (628, 628) :=
   rfl
 
-/-- Exact boundary fuel check: `4 * k + 1` is the minimum depth for `k` iterations
-(`17` succeeds for `k = 4`, while `16` returns `none`). -/
-theorem nestedPipeline_k4_exact_fuel_boundary :
+set_option maxHeartbeats 150 in
+theorem nestedPipeline_k4_kernel :
+    evalTauApprox (nestedPipelineApprox 4 100 17) = some (110, 110) := by
+  decide +kernel
+
+set_option maxHeartbeats 200 in
+theorem nestedPipeline_k8_kernel :
+    evalTauApprox (nestedPipelineApprox 8 100 33) = some (136, 136) := by
+  decide +kernel
+
+set_option maxHeartbeats 350 in
+theorem nestedPipeline_k16_kernel :
+    evalTauApprox (nestedPipelineApprox 16 100 65) = some (236, 236) := by
+  decide +kernel
+
+set_option maxHeartbeats 600 in
+theorem nestedPipeline_k32_kernel :
+    evalTauApprox (nestedPipelineApprox 32 100 129) = some (628, 628) := by
+  decide +kernel
+
+set_option maxHeartbeats 170 in
+theorem nestedPipelineObserve_k1_kernel :
+    evalTauObserve 5 (nestedPipelineITree 1 100) = some (101, 101) := by
+  decide +kernel
+
+set_option maxHeartbeats 550 in
+theorem nestedPipelineObserve_k2_kernel :
+    evalTauObserve 9 (nestedPipelineITree 2 100) = some (103, 103) := by
+  decide +kernel
+
+set_option maxHeartbeats 3100 in
+theorem nestedPipelineObserve_k4_kernel :
+    evalTauObserve 17 (nestedPipelineITree 4 100) = some (110, 110) := by
+  decide +kernel
+
+set_option maxHeartbeats 22500 in
+theorem nestedPipelineObserve_k8_kernel :
+    evalTauObserve 33 (nestedPipelineITree 8 100) = some (136, 136) := by
+  decide +kernel
+
+/-- error: (kernel) deterministic timeout -/
+#guard_msgs in
+set_option maxHeartbeats 600 in
+theorem nestedPipelineObserve_k8_exceeds_walker_k32_budget :
+    evalTauObserve 33 (nestedPipelineITree 8 100) = some (136, 136) := by
+  decide +kernel
+
+/-- Exact minimal fuel `4 * k + 1` at `k = 4` and `k = 32`. -/
+theorem nestedPipeline_exact_fuel_boundary :
     evalTauApprox (nestedPipelineApprox 4 100 17) = some (110, 110) ∧
-    evalTauApprox (nestedPipelineApprox 4 100 16) = none :=
-  ⟨rfl, rfl⟩
+    evalTauApprox (nestedPipelineApprox 4 100 16) = none ∧
+    evalTauApprox (nestedPipelineApprox 32 100 129) = some (628, 628) ∧
+    evalTauApprox (nestedPipelineApprox 32 100 128) = none := by
+  decide +kernel
 
 /-- End-to-end `ReachesRet` and `TauStar` adequacy theorems at $k = 4, 8, 16, 32$. -/
 theorem nestedPipeline_k4_reachesRet :
     ReachesRet (nestedPipelineITree 4 100) [] (110, 110) ∧
     ∃ u, TauStar (nestedPipelineITree 4 100) u ∧ u.observe = .ret (110, 110) :=
-  nestedPipelineApprox_sound nestedPipeline_k4_rfl
+  nestedPipelineApprox_sound nestedPipeline_k4_kernel
 
 theorem nestedPipeline_k8_reachesRet :
     ReachesRet (nestedPipelineITree 8 100) [] (136, 136) ∧
     ∃ u, TauStar (nestedPipelineITree 8 100) u ∧ u.observe = .ret (136, 136) :=
-  nestedPipelineApprox_sound nestedPipeline_k8_rfl
+  nestedPipelineApprox_sound nestedPipeline_k8_kernel
 
 theorem nestedPipeline_k16_reachesRet :
     ReachesRet (nestedPipelineITree 16 100) [] (236, 236) ∧
     ∃ u, TauStar (nestedPipelineITree 16 100) u ∧ u.observe = .ret (236, 236) :=
-  nestedPipelineApprox_sound nestedPipeline_k16_rfl
+  nestedPipelineApprox_sound nestedPipeline_k16_kernel
 
 theorem nestedPipeline_k32_reachesRet :
     ReachesRet (nestedPipelineITree 32 100) [] (628, 628) ∧
     ∃ u, TauStar (nestedPipelineITree 32 100) u ∧ u.observe = .ret (628, 628) :=
-  nestedPipelineApprox_sound nestedPipeline_k32_rfl
+  nestedPipelineApprox_sound nestedPipeline_k32_kernel
 
 /-- info: 'Anneal.Mir.ITreeApproxRunnerTests.nestedPipeline_k32_reachesRet' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms nestedPipeline_k32_reachesRet
 
-/-! ## 3. Multi-Iteration MIR Loop `CapturedMir` Fixture with Branches & External `MirCallE` Calls -/
+/-! ### Walker-Level `checkTraceApprox` Soundness on the `iter` Layer -/
+
+instance (i : CounterE.I) : Decidable (FaultEffect.isFault (E := CounterE) i) :=
+  instDecidableFalse
+
+/-- The visible `CounterE` trace of two `counterIterBody` iterations (oracle answers
+`1` and `7`), checked by `checkTraceApprox` on the `iterApprox` walker at its exact
+depth `3 * 2 + 1 = 7`, lifted to `ReachesRet` on the coinductive `ITree.iter` by
+`checkTraceApprox_iterApprox_sound`. -/
+theorem counterIter_k2_trace_reachesRet :
+    ∃ r, (r == 7) = true ∧
+      ReachesRet (ITree.iter (counterIterBody 2) (0, 0))
+        [⟨.tagStep 0, PUnit.unit⟩, ⟨.incBy 1, (1 : Nat)⟩,
+         ⟨.tagStep 1, PUnit.unit⟩, ⟨.incBy 2, (7 : Nat)⟩] r :=
+  checkTraceApprox_iterApprox_sound (counterIterBody 2) (counterIterBodyApprox 2)
+    (fun i m => (ofITree_counterIterBody 2 i m).symm) (0, 0) (n := 7)
+    (p := fun r => r == 7) (by decide +kernel)
+
+/-- The same trace is rejected one depth short of `7`, and with a wrong final answer. -/
+theorem counterIter_k2_trace_boundary :
+    checkTraceApprox (iterApprox (counterIterBodyApprox 2) 6 (0, 0))
+        [⟨.tagStep 0, PUnit.unit⟩, ⟨.incBy 1, (1 : Nat)⟩,
+         ⟨.tagStep 1, PUnit.unit⟩, ⟨.incBy 2, (7 : Nat)⟩] (fun r => r == 7) = false ∧
+    checkTraceApprox (iterApprox (counterIterBodyApprox 2) 7 (0, 0))
+        [⟨.tagStep 0, PUnit.unit⟩, ⟨.incBy 1, (1 : Nat)⟩,
+         ⟨.tagStep 1, PUnit.unit⟩, ⟨.incBy 2, (7 : Nat)⟩] (fun r => r == 8) = false := by
+  decide +kernel
+
+/-! ## 4. Multi-Iteration MIR Loop `CapturedMir` Fixture with Branches & External `MirCallE` Calls -/
 
 def approxU32Ty0 : Ty := { kind := .uint .u32, layoutIdx := 0 }
 def approxBoolTy1 : Ty := { kind := .bool, layoutIdx := 1 }
@@ -737,76 +1076,204 @@ def mkLoopObsErasedRawTrace (k : Nat) : RawByteTrace := {
 }
 
 /-!
-### Kernel `by rfl` Confirmation & Soundness Across Loop Depths $k \in \{4, 8, 16, 32\}$
+### Exact Minimal Fuel & Measured Heartbeats Across Loop Depths $k \in \{4, 8, 16, 32\}$
 
-Each iteration of `mirLoopWithOracleCall` executes:
-- `bb1`: 1 statement + 1 `switchInt` branch (`.vis (.emit (.event 1))` + `.tau` continuation) = 3 steps
-- `bb2`: 1 `call` terminator (`.vis (.call ...)` + `.tau` continuation) = 2 steps
-- `bb3`: 2 statements + 1 `goto` = 3 steps
-Total per iteration = `8` steps, plus `bb0` (`3` steps), final `bb1` exit (`3` steps), and
-`bb4` return (`2` steps) = `8 * k + 8` steps (`8 * k + 9` for `CofixA` `mirObsErasedStatefulApprox`
-where each silenced `MirObsE` adds 1 `.tau` step, so `9 * k + 10` fuel suffices).
+`bb0` executes `6` statements and a `goto` (`7` steps). Each loop iteration then
+executes `bb1` (`1` statement + `switchInt`, `2` steps), `bb2` (the `call`
+terminator: `1` step, a `.vis (.call ...)` node whose continuation resumes at
+`bb3`), and `bb3` (`2` statements + `goto`, `3` steps), i.e. `6` steps, and the
+exit executes `bb1` (`2` steps) and `bb4` (`1` statement + `return`, `2` steps).
+The minimal fuel of `checkRawByteTrace{Full,ObsErased}Bounded`,
+`checkRawByteTraceFullApprox`, and `diagnoseRawByteTrace*Bounded` is therefore
+`6 * k + 11`. The `interpApprox silenceMirObsApprox` route
+(`checkRawByteTraceObsErasedApprox`) needs one extra output depth per external
+call (the handler-return `.tau` of `silenceMirObs`'s `ITree.trigger`): `7 * k + 11`.
+Every minimum is pinned by `= false` boundary canaries one unit below.
+
+Measured heartbeats (whole declaration; the `*Bounded` checkers through elaborator
+`rfl`, exactly as `cargo-anneal` emits `checkRawByteTrace*Bounded_sound ... rfl`,
+and the `*Approx` checkers kernel-only through `decide +kernel`):
+
+| `k` | fuel (`6k+11`) | `FullBounded` `rfl` | `ObsErasedBounded` `rfl` | `FullApprox` kernel | `ObsErasedApprox` kernel |
+|----:|---------------:|--------------------:|-------------------------:|--------------------:|-------------------------:|
+|   4 |             35 |                8379 |                     8337 |                1674 |                     1700 |
+|   8 |             59 |               10399 |                    10324 |                2101 |                     2147 |
+|  16 |            107 |               14465 |                    14316 |                2964 |                     3048 |
+|  32 |            203 |               22666 |                    22364 |                4722 |                     4885 |
+
+Kernel-only confirmation of the same `checkRawByteTraceFullBounded` obligation at
+`k = 32` costs `4535` heartbeats (`mirLoop_k32_full_kernel_reachesRet`),
+about 5x less than elaborator `rfl`, adds no axioms (no `Lean.ofReduceBool`), and
+is not bounded by `maxRecDepth`: at `k = 64` elaborator `rfl` exceeds the default
+`maxRecDepth` (`mirLoop_k64_full_rfl_exceeds_maxRecDepth`) while `decide +kernel`
+succeeds (`mirLoop_k64_full_kernel_reachesRet`). Replacing the trailing `rfl` of
+the generated `checkRawByteTrace*Bounded_sound` applications with
+`(by decide +kernel)` is the available end-to-end accelerator; the checker
+definitions themselves are not the bottleneck (`decodeRawByteTrace` is about 13%
+and `stepMirState` most of the rest).
 -/
 
 @[reducible]
 def emptyShadowProvenanceTable : ShadowProvenanceTable := []
 
-set_option maxHeartbeats 25000 in
-theorem mirLoop_k4_full_and_obsErased_rfl :
+set_option maxHeartbeats 11000 in
+theorem mirLoop_k4_full_rfl :
     checkRawByteTraceFullBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true ∧
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true :=
+  rfl
+
+set_option maxHeartbeats 13500 in
+theorem mirLoop_k8_full_rfl :
+    checkRawByteTraceFullBounded 59 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 8) = true :=
+  rfl
+
+set_option maxRecDepth 2048 in
+set_option maxHeartbeats 19000 in
+theorem mirLoop_k16_full_rfl :
+    checkRawByteTraceFullBounded 107 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 16) = true :=
+  rfl
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 29500 in
+theorem mirLoop_k32_full_rfl :
+    checkRawByteTraceFullBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true :=
+  rfl
+
+set_option maxHeartbeats 11000 in
+theorem mirLoop_k4_obsErased_rfl :
     checkRawByteTraceObsErasedBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true ∧
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true :=
+  rfl
+
+set_option maxHeartbeats 13500 in
+theorem mirLoop_k8_obsErased_rfl :
+    checkRawByteTraceObsErasedBounded 59 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) = true :=
+  rfl
+
+set_option maxRecDepth 2048 in
+set_option maxHeartbeats 18700 in
+theorem mirLoop_k16_obsErased_rfl :
+    checkRawByteTraceObsErasedBounded 107 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) = true :=
+  rfl
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 29000 in
+theorem mirLoop_k32_obsErased_rfl :
+    checkRawByteTraceObsErasedBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = true :=
+  rfl
+
+set_option maxHeartbeats 2200 in
+theorem mirLoop_k4_fullApprox_kernel :
     checkRawByteTraceFullApprox 35 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true ∧
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 2750 in
+theorem mirLoop_k8_fullApprox_kernel :
+    checkRawByteTraceFullApprox 59 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 8) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 3900 in
+theorem mirLoop_k16_fullApprox_kernel :
+    checkRawByteTraceFullApprox 107 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 16) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 6200 in
+theorem mirLoop_k32_fullApprox_kernel :
+    checkRawByteTraceFullApprox 203 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 2250 in
+theorem mirLoop_k4_obsErasedApprox_kernel :
     checkRawByteTraceObsErasedApprox 39 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true ∧
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 2800 in
+theorem mirLoop_k8_obsErasedApprox_kernel :
+    checkRawByteTraceObsErasedApprox 67 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 4000 in
+theorem mirLoop_k16_obsErasedApprox_kernel :
+    checkRawByteTraceObsErasedApprox 123 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 6400 in
+theorem mirLoop_k32_obsErasedApprox_kernel :
+    checkRawByteTraceObsErasedApprox 235 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = true := by
+  decide +kernel
+
+set_option maxHeartbeats 7700 in
+theorem mirLoop_k4_diag_rfl :
     (diagnoseRawByteTraceFullBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
       emptyShadowProvenanceTable (mkLoopFullRawTrace 4)).isOk = true ∧
     (diagnoseRawByteTraceObsErasedBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
       emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4)).isOk = true :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
-
-set_option maxHeartbeats 25000 in
-theorem mirLoop_k8_full_and_obsErased_rfl :
-    checkRawByteTraceFullBounded 59 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 8) = true ∧
-    checkRawByteTraceObsErasedBounded 59 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) = true ∧
-    checkRawByteTraceFullApprox 59 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 8) = true ∧
-    checkRawByteTraceObsErasedApprox 67 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 8) = true :=
-  ⟨rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl⟩
 
 set_option maxRecDepth 4096 in
-set_option maxHeartbeats 50000 in
-theorem mirLoop_k16_full_and_obsErased_rfl :
-    checkRawByteTraceFullBounded 107 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 16) = true ∧
-    checkRawByteTraceObsErasedBounded 107 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) = true ∧
-    checkRawByteTraceFullApprox 107 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 16) = true ∧
-    checkRawByteTraceObsErasedApprox 123 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 16) = true :=
-  ⟨rfl, rfl, rfl, rfl⟩
+set_option maxHeartbeats 17000 in
+theorem mirLoop_k32_diag_tag_rfl :
+    (diagnoseRawByteTraceFullBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32)).tagName = "ok" := by
+  rfl
 
-set_option maxRecDepth 4096 in
-set_option maxHeartbeats 120000 in
-theorem mirLoop_k32_full_and_obsErased_rfl :
-    checkRawByteTraceFullBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true ∧
-    checkRawByteTraceObsErasedBounded 203 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = true ∧
-    checkRawByteTraceFullApprox 203 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = true ∧
-    checkRawByteTraceObsErasedApprox 235 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = true :=
-  ⟨rfl, rfl, rfl, rfl⟩
+set_option maxHeartbeats 4100 in
+/-- `WithCallees` and tail-recursive `*Fast` entry points at `k = 4` (no inlined
+callees, so the same minimal fuel applies). -/
+theorem mirLoop_k4_withCallees_and_fast_kernel :
+    checkRawByteTraceWithCalleesFullBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesObsErasedBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesFullApprox 35 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesObsErasedApprox 39 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true ∧
+    checkRawByteTraceFullBoundedFast 35 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = true ∧
+    checkRawByteTraceObsErasedBoundedFast 35 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true := by
+  decide +kernel
 
-/-- End-to-end `ReachesRet` soundness at $k = 32$ for both `checkRawByteTraceFullBounded`
-and `checkRawByteTraceObsErasedBounded` (and `checkRawByteTraceObsErasedApprox`). -/
+set_option maxHeartbeats 12000 in
+/-- Exact minimal-fuel boundaries (`6 * k + 10` and `7 * k + 10` rejected) for every
+checker at `k = 4` and `k = 32`. -/
+theorem mirLoop_exact_fuel_boundaries :
+    checkRawByteTraceFullBounded 34 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = false ∧
+    checkRawByteTraceObsErasedBounded 34 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = false ∧
+    checkRawByteTraceFullApprox 34 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = false ∧
+    checkRawByteTraceObsErasedApprox 38 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = false ∧
+    checkRawByteTraceFullBounded 202 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = false ∧
+    checkRawByteTraceObsErasedBounded 202 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = false ∧
+    checkRawByteTraceFullApprox 202 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = false ∧
+    checkRawByteTraceObsErasedApprox 234 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) = false := by
+  decide +kernel
+
+/-- End-to-end `ReachesRet` soundness at $k = 32$ for `checkRawByteTraceFullBounded`
+and `checkRawByteTraceObsErasedBounded` (from the elaborator-`rfl` confirmations)
+and for the `CofixA` route `checkRawByteTraceObsErasedApprox`. -/
 theorem mirLoop_k32_full_reachesRet :
     ∃ obsTrace tr out,
       decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
@@ -818,8 +1285,7 @@ theorem mirLoop_k32_full_reachesRet :
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
         tr out :=
   checkRawByteTraceFullBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopFullRawTrace 32)
-    mirLoop_k32_full_and_obsErased_rfl.1
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) mirLoop_k32_full_rfl
 
 theorem mirLoop_k32_obsErased_reachesRet :
     ∃ obsTrace tr out,
@@ -832,8 +1298,7 @@ theorem mirLoop_k32_obsErased_reachesRet :
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
         tr out :=
   checkRawByteTraceObsErasedBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32)
-    mirLoop_k32_full_and_obsErased_rfl.2.1
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) mirLoop_k32_obsErased_rfl
 
 theorem mirLoop_k32_obsErasedApprox_reachesRet :
     ∃ obsTrace tr out,
@@ -846,14 +1311,63 @@ theorem mirLoop_k32_obsErasedApprox_reachesRet :
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
         tr out :=
   checkRawByteTraceObsErasedApprox_sound 235 mirLoopWithOracleCall [ffiStepOracleSig]
-    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32)
-    mirLoop_k32_full_and_obsErased_rfl.2.2.2
+    emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 32) mirLoop_k32_obsErasedApprox_kernel
 
 /-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_obsErasedApprox_reachesRet' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms mirLoop_k32_obsErasedApprox_reachesRet
 
-/-! ## 4. Negative Non-Vacuity Canaries (`= false` & Exact `TraceReplayDiag` `by rfl`) -/
+set_option maxHeartbeats 5900 in
+/-- Kernel-only end-to-end soundness at `k = 32`: the `checkRawByteTraceFullBounded`
+hypothesis is discharged by `decide +kernel` instead of elaborator `rfl`. -/
+theorem mirLoop_k32_full_kernel_reachesRet :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
+        emptyShadowProvenanceTable (mkLoopFullRawTrace 32) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTree mirLoopWithOracleCall obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out :=
+  checkRawByteTraceFullBounded_sound 203 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 32) (by decide +kernel)
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_full_kernel_reachesRet' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_k32_full_kernel_reachesRet
+
+/--
+error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+---
+error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+-/
+#guard_msgs in
+set_option maxHeartbeats 15000 in
+theorem mirLoop_k64_full_rfl_exceeds_maxRecDepth :
+    checkRawByteTraceFullBounded 395 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 64) = true :=
+  rfl
+
+set_option maxHeartbeats 10400 in
+theorem mirLoop_k64_full_kernel_reachesRet :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall [ffiStepOracleSig]
+        emptyShadowProvenanceTable (mkLoopFullRawTrace 64) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTree mirLoopWithOracleCall obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out :=
+  checkRawByteTraceFullBounded_sound 395 mirLoopWithOracleCall [ffiStepOracleSig]
+    emptyShadowProvenanceTable (mkLoopFullRawTrace 64) (by decide +kernel)
+
+/-! ## 5. Negative Non-Vacuity Canaries (`= false` & Exact `TraceReplayDiag` `by rfl`) -/
 
 /-- Canary 1: Wrong terminal outcome (`25` instead of `expectedLoopAccum 4 = 24`) is
 rejected (`= false`) and diagnosed as `.outcomeMismatch`. -/
@@ -917,10 +1431,12 @@ theorem canary_wrong_extCall_target_rejected :
           (mkLoopObsErasedRawEventsAux 4 0).drop 1 }
     checkRawByteTraceObsErasedBounded 40 mirLoopWithOracleCall [ffiStepOracleSig, otherSig]
       emptyShadowProvenanceTable badTrace = false ∧
+    checkRawByteTraceObsErasedApprox 46 mirLoopWithOracleCall [ffiStepOracleSig, otherSig]
+      emptyShadowProvenanceTable badTrace = false ∧
     diagnoseRawByteTraceObsErasedBounded 40 mirLoopWithOracleCall [ffiStepOracleSig, otherSig]
       emptyShadowProvenanceTable badTrace =
       .unexpectedExtCall "approx_test::ffi_step_oracle" 2 :=
-  ⟨rfl, rfl⟩
+  ⟨rfl, rfl, rfl⟩
 
 /-- Canary 5: Unexpected trailing event after loop completion is rejected (`= false`)
 and diagnosed as `.unconsumedEventsRemaining 1`. -/
@@ -937,8 +1453,10 @@ theorem canary_unexpected_trailing_events_rejected :
   ⟨rfl, rfl, rfl⟩
 
 /-- Canary 6: External call with an impure `&mut u32` pointer parameter is rejected
-(`= false`) at raw decode and diagnosed as `.impureExtCallPtrArg` (and runtime
-`MirCallReq` with `Value.ptr` is rejected by both `checkFullMirTraceFast` and `checkMirTraceApprox`). -/
+(`= false`) at raw decode and diagnosed as `.impureExtCallPtrArg`; a hand-built
+approximant whose `MirCallReq` passes an untracked (borrow-less) `Value.ptr` is
+rejected by both state-free walkers `checkMirTraceApprox` and
+`checkMirObsErasedTraceApprox`. -/
 theorem canary_impure_ptr_extCall_rejected :
     let badRawTrace : RawByteTrace :=
       { rawArgs := [encodeU32LeBytes 1]
@@ -960,11 +1478,18 @@ theorem canary_impure_ptr_extCall_rejected :
       [.extCall "approx_test::ffi_impure_mut"
         [Value.ptr { allocId := 1, offsetBytes := 0 } 8]
         (Value.scalar ⟨0, 4⟩)]
+      (.normal (Value.scalar ⟨0, 4⟩)) = false ∧
+    checkMirObsErasedTraceApprox impureApprox
+      [.extCall "approx_test::ffi_impure_mut"
+        [Value.ptr { allocId := 1, offsetBytes := 0 } 8]
+        (Value.scalar ⟨0, 4⟩)]
       (.normal (Value.scalar ⟨0, 4⟩)) = false :=
-  ⟨rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl⟩
 
-/-- Canary 7: Insufficient fuel (`fuel = 34` when `k = 4` requires `35` steps) is
-soundly rejected (`= false`) and diagnosed as `.outOfFuel`, while `fuel = 35` succeeds (`= true`). -/
+/-- Canary 7: Insufficient fuel (`fuel = 34` when `k = 4` requires `6 * 4 + 11 = 35`
+steps, and `38` for the `interpApprox` route that requires `7 * 4 + 11 = 39`) is
+soundly rejected (`= false`) and diagnosed as `.outOfFuel`, while the exact
+minimum succeeds (`= true`). -/
 theorem canary_insufficient_fuel_rejected :
     checkRawByteTraceFullBounded 34 mirLoopWithOracleCall [ffiStepOracleSig]
       emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = false ∧
@@ -975,7 +1500,108 @@ theorem canary_insufficient_fuel_rejected :
     checkRawByteTraceObsErasedBounded 35 mirLoopWithOracleCall [ffiStepOracleSig]
       emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true ∧
     (diagnoseRawByteTraceFullBounded 34 mirLoopWithOracleCall [ffiStepOracleSig]
-      emptyShadowProvenanceTable (mkLoopFullRawTrace 4)).tagName = "out_of_fuel" :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4)).tagName = "out_of_fuel" ∧
+    checkRawByteTraceFullApprox 34 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopFullRawTrace 4) = false ∧
+    checkRawByteTraceObsErasedApprox 38 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = false ∧
+    checkRawByteTraceObsErasedApprox 39 mirLoopWithOracleCall [ffiStepOracleSig]
+      emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Canary 8: Call-Site Operand Purity Policy Under State-Free `CofixA` Walkers
+
+`fn peek_raw(p: *const u32) -> u32 { ffi_peek(p) }` passes a raw pointer whose
+runtime tag is registered `.frozen`, so the runtime argument check
+`findCallReqImpurePtrArgIdx?` accepts it, while the call-site operand-type check
+`findBlockCallImpurePtrArgIdx?` (part of `findActiveCallImpurePtrArgIdx?`) rejects
+it. A `CofixA` node forgets the `MirExecState`, so `checkMirTraceApprox` over the
+plain approximant `mirExecApprox` accepts this trace (soundly with respect to
+`ReachesRet`, but violating the memory-pure external-callee policy enforced by
+`checkFullMirTraceFast` and `diagnoseMirExecBounded`); over the policy-guarded
+approximant `mirExecGuardedApprox` it is rejected exactly like the coalgebra-direct
+checkers (`checkMirTraceApprox_guarded_eq`).
+-/
+
+def policyU32Ty0 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+def policyRawConstU32Ty1 : Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 1 }
+
+def policyRawPtrLayoutEntry : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr := .scalar (.initialized (.pointer 0) { start := 0, end_ := 18446744073709551615 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+def policyLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [approxU32LayoutEntry, policyRawPtrLayoutEntry, approxFnDefZstLayoutEntry]
+}
+
+/-- `fn peek_raw(p: *const u32) -> u32 { ffi_peek(p) }`. -/
+def rawPeekBody : CapturedMir := {
+  defPath := "policy_test::peek_raw"
+  phase := .runtimeOptimized
+  role := .subject
+  argCount := 1
+  localDecls := [approxMkDecl .mut policyU32Ty0, approxMkDecl .not policyRawConstU32Ty1]
+  basicBlocks :=
+    [ { statements := []
+        terminator :=
+          approxMkTerm (.call
+            (.constant
+              { ty := { kind := .fnDef "policy_test::ffi_peek" [], layoutIdx := 2 }
+                val := .zeroSized })
+            [.copy ⟨1, []⟩]
+            ⟨0, []⟩
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := approxMkTerm .return_
+        isCleanup := false } ]
+  fnAbi := {
+    args := [{ layout := policyRawPtrLayoutEntry, mode := .direct }]
+    ret := { layout := approxU32LayoutEntry, mode := .direct }
+    conv := .rust
+    canUnwind := true }
+  layouts := policyLayouts
+  allocations := []
+}
+
+def frozenRawPtr : Value := Value.ptr { allocId := 7, offsetBytes := 0 } 8
+
+def frozenRawPtrMem : Memory :=
+  { borrows := [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .frozen }] }
+
+def rawPeekState : MirExecState :=
+  .running (initMachineStateWithMemory rawPeekBody [frozenRawPtr] frozenRawPtrMem)
+
+def rawPeekEvents : List ObservedEvent :=
+  [.extCall "policy_test::ffi_peek" [frozenRawPtr] (Value.scalar ⟨42, 4⟩)]
+
+theorem canary_callsite_raw_ptr_policy :
+    findCallReqImpurePtrArgIdx?
+        { defPath := "policy_test::ffi_peek", args := [frozenRawPtr], memory := frozenRawPtrMem } =
+      none ∧
+    checkMirTraceApprox (mirExecApprox rawPeekBody 4 rawPeekState)
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩)) = true ∧
+    checkMirTraceApprox (mirExecGuardedApprox rawPeekBody 4 rawPeekState)
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩)) = false ∧
+    checkMirObsErasedTraceApprox (mirExecGuardedApprox rawPeekBody 4 rawPeekState)
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩)) = false ∧
+    checkMirTraceApprox
+        (interpApprox silenceMirObsApprox 4 (mirExecGuardedApprox rawPeekBody 4 rawPeekState))
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩)) = false ∧
+    checkFullMirTraceFast 4 rawPeekBody rawPeekState
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩)) = false ∧
+    checkObsErasedMirTraceFast 4 rawPeekBody rawPeekState
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩)) = false ∧
+    (diagnoseMirExecBounded 4 true rawPeekBody rawPeekState
+      rawPeekEvents (.normal (Value.scalar ⟨42, 4⟩))).tagName = "impure_ext_call_ptr_arg" := by
+  decide +kernel
 
 end Anneal.Mir.ITreeApproxRunnerTests

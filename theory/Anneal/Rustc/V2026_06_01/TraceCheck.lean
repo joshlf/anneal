@@ -1612,7 +1612,11 @@ def reconstructFullMirTraceFast
 
 /--
 Allocation-free tail-recursive boolean checker for full (`MirObsE` + `MirCallE`)
-trace consistency (`checkBranches = true`).
+trace consistency (`checkBranches = true`), equal to
+`(reconstructFullMirTrace ...).isSome` (`checkFullMirTraceFast_eq`). Because
+kernel and elaborator reduction are lazy, this tail-recursive form has the same
+measured kernel cost as `reconstructFullMirTrace`; it is provided as a
+structurally simpler alternative implementation, not as an accelerator.
 -/
 @[reducible]
 def checkFullMirTraceFast
@@ -1849,13 +1853,30 @@ theorem checkFullMirTraceFast_eq
 
 /--
 Computable boolean checker for full (`MirObsE` + `MirCallE`) trace consistency
-(`checkBranches = true`), backed directly by allocation-free `checkFullMirTraceFast`.
+(`checkBranches = true`).
+
+The definition is intentionally kept as `(reconstructFullMirTrace ...).isSome`
+(equal to the tail-recursive `checkFullMirTraceFast` by `checkFullMirTraceFast_eq`):
+Lean's kernel and elaborator reduce lazily to weak-head normal form, so the
+discarded `Event MirEffect` list is never materialized, and measured `rfl`
+confirmation of `mirLoopWithOracleCall` at `k = 32` (`tests/mir/ITreeApproxRunnerTests.lean`)
+costs `22655` heartbeat units via `reconstructFullMirTrace` versus `23522` via
+`checkFullMirTraceFast` (kernel-only `decide +kernel`: `4461` versus `4449`).
 -/
 @[reducible]
 def checkFullObservedTraceBounded
     (fuel : Nat) (body : CapturedMir) (s : MachineState)
     (events : List ObservedEvent) (outcome : ObservedOutcome) : Bool :=
-  checkFullMirTraceFast fuel body (.running s) events outcome
+  (reconstructFullMirTrace fuel body (.running s) events outcome).isSome
+
+/-- `checkFullObservedTraceBounded` agrees with the tail-recursive
+`checkFullMirTraceFast`. -/
+theorem checkFullObservedTraceBounded_eq_fast
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    checkFullObservedTraceBounded fuel body s events outcome =
+      checkFullMirTraceFast fuel body (.running s) events outcome :=
+  (checkFullMirTraceFast_eq fuel body (.running s) events outcome).symm
 
 /--
 Soundness of `reconstructFullMirTrace`: when `reconstructFullMirTrace` succeeds
@@ -2033,8 +2054,14 @@ theorem checkFullObservedTraceBounded_sound
     ∃ tr out,
       MatchesObservedEvents events tr ∧
       MatchesObservedOutcome outcome out ∧
-      ReachesRet (mirTree body s) tr out :=
-  checkFullMirTraceFast_sound fuel body (.running s) events outcome h_ok
+      ReachesRet (mirTree body s) tr out := by
+  unfold checkFullObservedTraceBounded at h_ok
+  cases h_rec : reconstructFullMirTrace fuel body (.running s) events outcome with
+  | none => rw [h_rec] at h_ok; nomatch h_ok
+  | some pair =>
+    exact ⟨pair.1, pair.2,
+      reconstructFullMirTrace_sound fuel body (.running s) events outcome
+        pair.1 pair.2 h_rec⟩
 
 /-! ## 4. Branch-Erased Trace Replay (`checkBranches = false`) and Soundness -/
 
@@ -2127,7 +2154,10 @@ def reconstructObsErasedMirTraceFast
 
 /--
 Allocation-free tail-recursive boolean checker for branch-erased (`MirCallE`-only)
-trace consistency (`checkBranches = false`).
+trace consistency (`checkBranches = false`), equal to
+`(reconstructObsErasedMirTrace ...).isSome` (`checkObsErasedMirTraceFast_eq`),
+with the same measured kernel cost (lazy reduction never materializes the
+discarded trace list).
 -/
 @[reducible]
 def checkObsErasedMirTraceFast
@@ -2305,13 +2335,28 @@ theorem checkObsErasedMirTraceFast_eq
 
 /--
 Computable boolean checker for branch-erased (`MirCallE`-only) trace consistency
-(`checkBranches = false`), backed directly by allocation-free `checkObsErasedMirTraceFast`.
+(`checkBranches = false`).
+
+Kept as `(reconstructObsErasedMirTrace ...).isSome` (equal to the tail-recursive
+`checkObsErasedMirTraceFast` by `checkObsErasedMirTraceFast_eq`); lazy weak-head
+reduction never materializes the discarded trace list, and measured `rfl`
+confirmation at `k = 32` costs `22356` heartbeat units versus `23137` via
+`checkObsErasedMirTraceFast` (kernel-only: `4420` versus `4413`).
 -/
 @[reducible]
 def checkObsErasedObservedTraceBounded
     (fuel : Nat) (body : CapturedMir) (s : MachineState)
     (events : List ObservedEvent) (outcome : ObservedOutcome) : Bool :=
-  checkObsErasedMirTraceFast fuel body (.running s) events outcome
+  (reconstructObsErasedMirTrace fuel body (.running s) events outcome).isSome
+
+/-- `checkObsErasedObservedTraceBounded` agrees with the tail-recursive
+`checkObsErasedMirTraceFast`. -/
+theorem checkObsErasedObservedTraceBounded_eq_fast
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome) :
+    checkObsErasedObservedTraceBounded fuel body s events outcome =
+      checkObsErasedMirTraceFast fuel body (.running s) events outcome :=
+  (checkObsErasedMirTraceFast_eq fuel body (.running s) events outcome).symm
 
 private theorem reachesRet_interp_silenceMirObs_ret
     {t : ITree MirEffect MirOutcome} {out : MirOutcome}
@@ -2536,9 +2581,17 @@ theorem checkObsErasedObservedTraceBounded_sound
     ∃ tr out,
       MatchesObservedEvents events tr ∧
       MatchesObservedOutcome outcome out ∧
-      ReachesRet (mirObsErasedStatefulTree body args mem) tr out :=
-  checkObsErasedMirTraceFast_sound fuel body
-    (.running (initMachineStateWithMemory body args mem)) events outcome h_ok
+      ReachesRet (mirObsErasedStatefulTree body args mem) tr out := by
+  unfold checkObsErasedObservedTraceBounded at h_ok
+  cases h_rec :
+      reconstructObsErasedMirTrace fuel body
+        (.running (initMachineStateWithMemory body args mem)) events outcome with
+  | none => rw [h_rec] at h_ok; nomatch h_ok
+  | some pair =>
+    exact ⟨pair.1, pair.2,
+      reconstructObsErasedMirTrace_sound fuel body
+        (.running (initMachineStateWithMemory body args mem)) events outcome
+        pair.1 pair.2 h_rec⟩
 
 /--
 Soundness of `checkObsErasedObservedTraceBounded` with `callees`: if
@@ -2559,10 +2612,18 @@ theorem checkObsErasedObservedTraceWithCalleesBounded_sound
       MatchesObservedEvents events tr ∧
       MatchesObservedOutcome outcome out ∧
       ReachesRet
-        (mirObsErasedStatefulTreeWithCallees body args mem callees) tr out :=
-  checkObsErasedMirTraceFast_sound fuel body
-    (.running (initMachineStateWithMemoryAndCallees body args mem callees))
-    events outcome h_ok
+        (mirObsErasedStatefulTreeWithCallees body args mem callees) tr out := by
+  unfold checkObsErasedObservedTraceBounded at h_ok
+  cases h_rec :
+      reconstructObsErasedMirTrace fuel body
+        (.running (initMachineStateWithMemoryAndCallees body args mem callees))
+        events outcome with
+  | none => rw [h_rec] at h_ok; nomatch h_ok
+  | some pair =>
+    exact ⟨pair.1, pair.2,
+      reconstructObsErasedMirTrace_sound fuel body
+        (.running (initMachineStateWithMemoryAndCallees body args mem callees))
+        events outcome pair.1 pair.2 h_rec⟩
 
 /--
 Unified trace-consistency dispatcher supporting both `checkBranches = true`
@@ -2738,6 +2799,13 @@ Direct suffix-free `CofixA` boolean trace checker over `CofixA MirEffect MirOutc
 replaying `ObservedEvent`s and `ObservedOutcome` by structural recursion on the
 finite `CofixA` approximant without `ITree.observe` or `Event MirEffect` list
 allocation.
+
+An approximant node carries no `MirExecState`, so this walker can only reject
+impure external calls by runtime argument value (`findCallReqImpurePtrArgIdx?`).
+Over the plain approximants `mirExecApprox` / `mirStatefulApprox` it is therefore
+more permissive than `checkFullMirTraceFast` (which also rejects impure call-site
+operand types); run it over `mirExecGuardedApprox` for the exact policy
+(`checkMirTraceApprox_guarded_eq`).
 -/
 @[reducible]
 def checkMirTraceApprox :
@@ -2877,6 +2945,273 @@ theorem checkMirObsErasedStatefulApprox_sound
       ReachesRet (mirObsErasedStatefulTree body args mem) tr out := by
   rw [← ofITree_mirObsErasedStatefulTree] at h_ok
   exact checkMirTraceApprox_sound h_ok
+
+/-! ### Policy-Exact `CofixA` Trace Checkers (`stepMirStateGuarded`)
+
+A `CofixA` approximant forgets the `MirExecState` (active body and program
+counter) at every node, so `checkMirTraceApprox` walking the plain approximant
+`approxCofix (stepMirState body)` can only re-check runtime argument values
+(`findCallReqImpurePtrArgIdx?`); it cannot re-check call-site operand types
+(`findBlockCallImpurePtrArgIdx?`, e.g. a `*const T` / `*mut T` operand whose
+runtime tag happens to be `.frozen`). It is therefore strictly more permissive
+than `checkFullMirTraceFast` / `checkObsErasedMirTraceFast`.
+
+`stepMirStateGuarded` folds the complete `findActiveCallImpurePtrArgIdx?` policy
+into the step function itself (rejected calls become fail-closed
+`.unsupported` fault nodes), so walkers over
+`mirExecGuardedApprox = approxCofix (stepMirStateGuarded body)` reject exactly
+the traces the coalgebra-direct checkers reject
+(`checkMirTraceApprox_guarded_eq`, `checkMirObsErasedTraceApprox_guarded_eq`). -/
+
+/-- Fold the external-call purity policy of `checkFullMirTraceFast` into one MIR
+step node: an external call rejected by `findActiveCallImpurePtrArgIdx?` becomes a
+fail-closed `.unsupported` fault node; all other nodes are unchanged. -/
+@[reducible]
+def guardMirCallNode (body : CapturedMir) (st : MirExecState) :
+    MirStepNode → MirStepNode
+  | .vis (.inr (.inr (.call req))) k =>
+    match findActiveCallImpurePtrArgIdx? (execStateActiveBody body st) (execStateCursor st).1 req with
+    | some _ => MirStepNode.fail .unsupported
+    | none => .vis (.inr (.inr (.call req))) k
+  | node => node
+
+/-- Policy-guarded MIR step (`stepMirState` with `guardMirCallNode`). -/
+@[reducible]
+def stepMirStateGuarded (body : CapturedMir) (st : MirExecState) : MirStepNode :=
+  guardMirCallNode body st (stepMirState body st)
+
+/-- Policy-guarded `CofixA` approximant of `ITree.cofix (stepMirState body) st`. -/
+@[reducible]
+def mirExecGuardedApprox (body : CapturedMir) (n : Nat) (st : MirExecState) :
+    CofixA MirEffect MirOutcome n :=
+  approxCofix (stepMirStateGuarded body) n st
+
+theorem findCallReqImpurePtrArgIdx?_eq_none_of_active
+    {activeBody : CapturedMir} {blockIdx : Nat} {req : MirCallReq}
+    (h : findActiveCallImpurePtrArgIdx? activeBody blockIdx req = none) :
+    findCallReqImpurePtrArgIdx? req = none := by
+  unfold findActiveCallImpurePtrArgIdx? at h
+  split at h
+  · nomatch h
+  · exact h
+
+/--
+Exact agreement of the policy-guarded approximant walker with the
+coalgebra-direct full checker at every fuel: `checkMirTraceApprox` over
+`mirExecGuardedApprox body n st` equals `checkFullMirTraceFast n body st`.
+-/
+theorem checkMirTraceApprox_guarded_eq (body : CapturedMir) (n : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      checkMirTraceApprox (mirExecGuardedApprox body n st) events outcome =
+        checkFullMirTraceFast n body st events outcome := by
+  induction n with
+  | zero => intro _ _ _; rfl
+  | succ m ih =>
+    intro st events outcome
+    unfold mirExecGuardedApprox at ih ⊢
+    unfold approxCofix stepMirStateGuarded checkFullMirTraceFast
+    cases hs : stepMirState body st with
+    | ret out => rfl
+    | tau st' => exact ih st' events outcome
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · rfl
+      · cases obsReq with
+        | emit obs =>
+          cases obs with
+          | silent => rfl
+          | event tag =>
+            cases events with
+            | nil => rfl
+            | cons ev rest =>
+              cases ev with
+              | branch expectedTag =>
+                dsimp only [guardMirCallNode]
+                unfold checkMirTraceApprox
+                dsimp only
+                cases Nat.beq tag expectedTag with
+                | false => rfl
+                | true => exact ih (k PUnit.unit) rest outcome
+              | extCall _ _ _ => rfl
+              | extCallPanic _ _ => rfl
+              | extCallAbort _ _ => rfl
+      · cases callReq with
+        | call req =>
+          dsimp only [guardMirCallNode]
+          cases hpol :
+              findActiveCallImpurePtrArgIdx? (execStateActiveBody body st)
+                (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            have hreq := findCallReqImpurePtrArgIdx?_eq_none_of_active hpol
+            dsimp only
+            unfold checkMirTraceApprox
+            simp only [hreq]
+            cases events with
+            | nil => rfl
+            | cons obsEv rest =>
+              dsimp only
+              cases matchCallObservedEvent req obsEv with
+              | none => rfl
+              | some ans => exact ih (k ans) rest outcome
+
+/--
+Suffix-free branch-erased `CofixA` trace walker: silences `MirObsE` nodes inline
+(continuing at `k PUnit.unit` without consuming events) and replays external
+calls against `events`, mirroring `checkObsErasedMirTraceFast` on approximants.
+-/
+@[reducible]
+def checkMirObsErasedTraceApprox :
+    {n : Nat} → CofixA MirEffect MirOutcome n →
+    List ObservedEvent → ObservedOutcome → Bool
+  | _, .zero, _, _ => false
+  | _, .ret out, events, outcome =>
+    match events with
+    | [] => checkOutcomeMatches outcome out
+    | _ :: _ => false
+  | _, .tau t', events, outcome =>
+    checkMirObsErasedTraceApprox t' events outcome
+  | _, .vis (.inl _) _, _, _ => false
+  | _, .vis (.inr (.inl _)) k, events, outcome =>
+    checkMirObsErasedTraceApprox (k PUnit.unit) events outcome
+  | _, .vis (.inr (.inr (.call req))) k, events, outcome =>
+    match findCallReqImpurePtrArgIdx? req with
+    | some _ => false
+    | none =>
+      match events with
+      | obsEv :: rest =>
+        match matchCallObservedEvent req obsEv with
+        | some ans =>
+          checkMirObsErasedTraceApprox (k ans) rest outcome
+        | none => false
+      | [] => false
+
+/--
+Exact agreement of the branch-erased approximant walker over the policy-guarded
+approximant with `checkObsErasedMirTraceFast` at every fuel.
+-/
+theorem checkMirObsErasedTraceApprox_guarded_eq (body : CapturedMir) (n : Nat) :
+    ∀ (st : MirExecState) (events : List ObservedEvent) (outcome : ObservedOutcome),
+      checkMirObsErasedTraceApprox (mirExecGuardedApprox body n st) events outcome =
+        checkObsErasedMirTraceFast n body st events outcome := by
+  induction n with
+  | zero => intro _ _ _; rfl
+  | succ m ih =>
+    intro st events outcome
+    unfold mirExecGuardedApprox at ih ⊢
+    unfold approxCofix stepMirStateGuarded checkObsErasedMirTraceFast
+    cases hs : stepMirState body st with
+    | ret out => rfl
+    | tau st' => exact ih st' events outcome
+    | vis i k =>
+      rcases i with f | (obsReq | callReq)
+      · rfl
+      · exact ih (k PUnit.unit) events outcome
+      · cases callReq with
+        | call req =>
+          dsimp only [guardMirCallNode]
+          cases hpol :
+              findActiveCallImpurePtrArgIdx? (execStateActiveBody body st)
+                (execStateCursor st).1 req with
+          | some _ => rfl
+          | none =>
+            have hreq := findCallReqImpurePtrArgIdx?_eq_none_of_active hpol
+            dsimp only
+            unfold checkMirObsErasedTraceApprox
+            simp only [hreq]
+            cases events with
+            | nil => rfl
+            | cons obsEv rest =>
+              dsimp only
+              cases matchCallObservedEvent req obsEv with
+              | none => rfl
+              | some ans => exact ih (k ans) rest outcome
+
+/-- Simulation from the `interpApprox silenceMirObsApprox` route to the inline
+branch-erasing walker, simultaneously in source and handler mode. -/
+private theorem checkMirTraceApprox_interpSilence_aux :
+    ∀ n : Nat,
+      (∀ {d : Nat} (a : CofixA MirEffect MirOutcome d)
+          (events : List ObservedEvent) (outcome : ObservedOutcome),
+        checkMirTraceApprox (interpApprox silenceMirObsApprox n a) events outcome = true →
+        checkMirObsErasedTraceApprox a events outcome = true) ∧
+      (∀ {d : Nat} (req : MirCallReq)
+          (k : MirEffect.O (.inr (.inr (.call req))) → CofixA MirEffect MirOutcome d)
+          (ans : MirCallAns) (events : List ObservedEvent) (outcome : ObservedOutcome),
+        checkMirTraceApprox
+            (interpHandlerApprox silenceMirObsApprox n (i := .inr (.inr (.call req)))
+              (CofixA.retApprox (E := MirEffect) ans n) k) events outcome = true →
+        checkMirObsErasedTraceApprox (k ans) events outcome = true) := by
+  intro n
+  induction n with
+  | zero =>
+    refine ⟨fun _ _ _ h => ?_, fun _ _ _ _ _ h => ?_⟩
+    · nomatch h
+    · nomatch h
+  | succ m ih =>
+    obtain ⟨ihS, ihH⟩ := ih
+    refine ⟨?_, ?_⟩
+    · intro d a events outcome h
+      cases a with
+      | zero => exact ihS .zero events outcome h
+      | ret out => exact h
+      | tau t' => exact ihS t' events outcome h
+      | vis i k =>
+        rcases i with f | (obsReq | callReq)
+        · cases f with
+          | fail fk => nomatch h
+        · cases obsReq with
+          | emit obs => exact ihS (k PUnit.unit) events outcome h
+        · cases callReq with
+          | call req =>
+            have hred : checkMirTraceApprox
+                (interpApprox silenceMirObsApprox (m + 1)
+                  (CofixA.vis (E := MirEffect) (.inr (.inr (.call req))) k))
+                events outcome =
+                checkMirTraceApprox
+                  (CofixA.vis (E := MirEffect) (.inr (.inr (.call req)))
+                    (fun ans => interpHandlerApprox silenceMirObsApprox m
+                      (i := .inr (.inr (.call req))) (CofixA.retApprox (E := MirEffect) ans m) k))
+                  events outcome := rfl
+            rw [hred] at h
+            unfold checkMirTraceApprox at h
+            unfold checkMirObsErasedTraceApprox
+            cases hreq : findCallReqImpurePtrArgIdx? req with
+            | some _ => simp only [hreq, Bool.false_eq_true] at h
+            | none =>
+              simp only [hreq] at h ⊢
+              cases events with
+              | nil => nomatch h
+              | cons obsEv rest =>
+                dsimp only at h ⊢
+                cases hm : matchCallObservedEvent req obsEv with
+                | none => simp only [hm, Bool.false_eq_true] at h
+                | some ans =>
+                  simp only [hm] at h ⊢
+                  exact ihH req k ans rest outcome h
+    · intro d req k ans events outcome h
+      cases m with
+      | zero => nomatch h
+      | succ m' =>
+        exact ihS (k ans) events outcome h
+
+/--
+The `interpApprox silenceMirObsApprox` route (the `CofixA` image of
+`ITree.interp silenceMirObs`, see `ofITree_interp_silenceMirObs`) over the
+policy-guarded approximant accepts only traces that `checkObsErasedMirTraceFast`
+accepts at the same fuel (each external call costs one extra output depth in the
+interpreted approximant, so the converse needs `fuel + #calls`).
+-/
+theorem checkMirTraceApprox_interpSilence_guarded_imp
+    (body : CapturedMir) (n : Nat) (st : MirExecState)
+    (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_ok :
+      checkMirTraceApprox
+        (interpApprox silenceMirObsApprox n (mirExecGuardedApprox body n st))
+        events outcome = true) :
+    checkObsErasedMirTraceFast n body st events outcome = true := by
+  rw [← checkMirObsErasedTraceApprox_guarded_eq]
+  exact (checkMirTraceApprox_interpSilence_aux n).1 _ events outcome h_ok
 
 /-! ## 5. Connection to Verification Certificates & Postcondition Refutation -/
 
@@ -4901,45 +5236,117 @@ theorem checkRawByteTraceWithCalleesObsErasedBounded_sound
       ⟨tr, out, h_evs, h_out, h_reach⟩
     exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
 
-/--
-Fast end-to-end full trace consistency checker (`checkBranches = true`) over
-`RawByteTrace`.
+/-! ### Tail-Recursive (`*Fast`) and Policy-Exact `CofixA` (`*Approx`) `RawByteTrace` Checkers
+
+Measured kernel-cost profile (`mirLoopWithOracleCall`, see
+`tests/mir/ITreeApproxRunnerTests.lean`): `decodeRawByteTrace` accounts for roughly
+13% of a `checkRawByteTrace*Bounded` confirmation and `stepMirState` for most of
+the remainder; the checker wrapper itself is negligible, so the tail-recursive
+`*Fast` forms below have the same kernel cost as `checkRawByteTrace*Bounded`.
+The elaborator's `rfl` pass (`Meta.isDefEq`), by contrast, costs about 5x the
+kernel re-check (`k = 32`: `23522` versus `4449` heartbeat units) and exceeds the
+default `maxRecDepth` at `k >= 64`; a hypothesis proved `by decide +kernel` is
+checked by the kernel alone, with no additional axioms (no `Lean.ofReduceBool`).
 -/
+
+/-- End-to-end full trace checker over `RawByteTrace` running the tail-recursive
+`checkFullMirTraceFast` (equal to `checkRawByteTraceFullBounded`,
+`checkRawByteTraceFullBoundedFast_eq`). -/
 @[reducible]
 def checkRawByteTraceFullBoundedFast
     (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
-  checkRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkFullMirTraceFast fuel rootBody
+      (.running (initMachineStateWithMemory rootBody obsTrace.args
+        { obsTrace.initMem with callees := obsTrace.inlinedCallees }))
+      obsTrace.events obsTrace.outcome
+  | none => false
 
-/--
-Fast end-to-end branch-erased trace consistency checker (`checkBranches = false`)
-over `RawByteTrace`.
--/
+/-- End-to-end branch-erased trace checker over `RawByteTrace` running the
+tail-recursive `checkObsErasedMirTraceFast` (equal to
+`checkRawByteTraceObsErasedBounded`, `checkRawByteTraceObsErasedBoundedFast_eq`). -/
 @[reducible]
 def checkRawByteTraceObsErasedBoundedFast
     (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
-  checkRawByteTraceObsErasedBounded fuel rootBody calleeSigs table rawTrace
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkObsErasedMirTraceFast fuel rootBody
+      (.running (initMachineStateWithMemory rootBody obsTrace.args
+        { obsTrace.initMem with callees := obsTrace.inlinedCallees }))
+      obsTrace.events obsTrace.outcome
+  | none => false
 
-/--
-Fast end-to-end full trace consistency checker (`checkBranches = true`) with
-inlined `callees` and `traitImpls`.
--/
+/-- `checkRawByteTraceWithCalleesFullBounded` with the tail-recursive
+`checkFullMirTraceFast` (`checkRawByteTraceWithCalleesFullBoundedFast_eq`). -/
 @[reducible]
 def checkRawByteTraceWithCalleesFullBoundedFast
     (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
-  checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkFullMirTraceFast fuel rootBody
+      (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
+        obsTrace.initMem obsTrace.inlinedCallees))
+      obsTrace.events obsTrace.outcome
+  | none => false
 
-/--
-Fast end-to-end branch-erased trace consistency checker (`checkBranches = false`)
-with inlined `callees` and `traitImpls`.
--/
+/-- `checkRawByteTraceWithCalleesObsErasedBounded` with the tail-recursive
+`checkObsErasedMirTraceFast` (`checkRawByteTraceWithCalleesObsErasedBoundedFast_eq`). -/
 @[reducible]
 def checkRawByteTraceWithCalleesObsErasedBoundedFast
     (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
-  checkRawByteTraceWithCalleesObsErasedBounded fuel rootBody calleeSigs table rawTrace
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkObsErasedMirTraceFast fuel rootBody
+      (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
+        obsTrace.initMem obsTrace.inlinedCallees))
+      obsTrace.events obsTrace.outcome
+  | none => false
+
+theorem checkRawByteTraceFullBoundedFast_eq
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    checkRawByteTraceFullBoundedFast fuel rootBody calleeSigs table rawTrace =
+      checkRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold checkRawByteTraceFullBoundedFast checkRawByteTraceFullBounded
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact (checkFullObservedTraceBounded_eq_fast _ _ _ _ _).symm
+
+theorem checkRawByteTraceObsErasedBoundedFast_eq
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    checkRawByteTraceObsErasedBoundedFast fuel rootBody calleeSigs table rawTrace =
+      checkRawByteTraceObsErasedBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold checkRawByteTraceObsErasedBoundedFast checkRawByteTraceObsErasedBounded
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact (checkObsErasedObservedTraceBounded_eq_fast _ _ _ _ _).symm
+
+theorem checkRawByteTraceWithCalleesFullBoundedFast_eq
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    checkRawByteTraceWithCalleesFullBoundedFast fuel rootBody calleeSigs table rawTrace =
+      checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold checkRawByteTraceWithCalleesFullBoundedFast checkRawByteTraceWithCalleesFullBounded
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact (checkFullObservedTraceBounded_eq_fast _ _ _ _ _).symm
+
+theorem checkRawByteTraceWithCalleesObsErasedBoundedFast_eq
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    checkRawByteTraceWithCalleesObsErasedBoundedFast fuel rootBody calleeSigs table rawTrace =
+      checkRawByteTraceWithCalleesObsErasedBounded fuel rootBody calleeSigs table rawTrace := by
+  unfold checkRawByteTraceWithCalleesObsErasedBoundedFast
+    checkRawByteTraceWithCalleesObsErasedBounded
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact (checkObsErasedObservedTraceBounded_eq_fast _ _ _ _ _).symm
 
 /-- Soundness of `checkRawByteTraceFullBoundedFast`. -/
 theorem checkRawByteTraceFullBounded_fast_sound
@@ -4954,8 +5361,9 @@ theorem checkRawByteTraceFullBounded_fast_sound
       ReachesRet
         (mirStatefulTree rootBody obsTrace.args
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
-  checkRawByteTraceFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+        tr out := by
+  rw [checkRawByteTraceFullBoundedFast_eq] at h_ok
+  exact checkRawByteTraceFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
 
 /-- Soundness of `checkRawByteTraceObsErasedBoundedFast`. -/
 theorem checkRawByteTraceObsErasedBounded_fast_sound
@@ -4970,8 +5378,9 @@ theorem checkRawByteTraceObsErasedBounded_fast_sound
       ReachesRet
         (mirObsErasedStatefulTree rootBody obsTrace.args
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
-        tr out :=
-  checkRawByteTraceObsErasedBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+        tr out := by
+  rw [checkRawByteTraceObsErasedBoundedFast_eq] at h_ok
+  exact checkRawByteTraceObsErasedBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
 
 /-- Soundness of `checkRawByteTraceWithCalleesFullBoundedFast`. -/
 theorem checkRawByteTraceWithCalleesFullBounded_fast_sound
@@ -4987,8 +5396,9 @@ theorem checkRawByteTraceWithCalleesFullBounded_fast_sound
       ReachesRet
         (mirStatefulTreeWithCallees
           rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
-        tr out :=
-  checkRawByteTraceWithCalleesFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+        tr out := by
+  rw [checkRawByteTraceWithCalleesFullBoundedFast_eq] at h_ok
+  exact checkRawByteTraceWithCalleesFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
 
 /-- Soundness of `checkRawByteTraceWithCalleesObsErasedBoundedFast`. -/
 theorem checkRawByteTraceWithCalleesObsErasedBounded_fast_sound
@@ -5004,11 +5414,17 @@ theorem checkRawByteTraceWithCalleesObsErasedBounded_fast_sound
       ReachesRet
         (mirObsErasedStatefulTreeWithCallees
           rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
-        tr out :=
-  checkRawByteTraceWithCalleesObsErasedBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+        tr out := by
+  rw [checkRawByteTraceWithCalleesObsErasedBoundedFast_eq] at h_ok
+  exact checkRawByteTraceWithCalleesObsErasedBounded_sound
+    fuel rootBody calleeSigs table rawTrace h_ok
 
 /--
-End-to-end `CofixA`-approximant full trace checker (`mirStatefulApprox`).
+End-to-end `CofixA`-approximant full trace checker: `checkMirTraceApprox` over
+the policy-guarded approximant `mirExecGuardedApprox`. Equal to
+`checkRawByteTraceFullBounded` at every fuel (`checkRawByteTraceFullApprox_eq`),
+including its rejection of impure (`&mut` / raw-pointer) external calls by call-site
+operand type.
 -/
 @[reducible]
 def checkRawByteTraceFullApprox
@@ -5017,14 +5433,19 @@ def checkRawByteTraceFullApprox
   match decodeRawByteTrace rootBody calleeSigs table rawTrace with
   | some obsTrace =>
     checkMirTraceApprox
-      (mirStatefulApprox rootBody obsTrace.args
-        { obsTrace.initMem with callees := obsTrace.inlinedCallees } fuel)
+      (mirExecGuardedApprox rootBody fuel
+        (.running (initMachineStateWithMemory rootBody obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })))
       obsTrace.events obsTrace.outcome
   | none => false
 
 /--
-End-to-end `CofixA`-approximant branch-erased trace checker
-(`mirObsErasedStatefulApprox` via `interpApprox silenceMirObsApprox`).
+End-to-end `CofixA`-approximant branch-erased trace checker:
+`checkMirTraceApprox` over `interpApprox silenceMirObsApprox` (the `CofixA` image
+of `ITree.interp silenceMirObs`) applied to the policy-guarded approximant.
+Accepts only traces accepted by `checkRawByteTraceObsErasedBounded` at the same
+fuel (`checkRawByteTraceObsErasedApprox_imp`); each external call costs one extra
+output depth (`.vis` then the handler-return `.tau`).
 -/
 @[reducible]
 def checkRawByteTraceObsErasedApprox
@@ -5033,10 +5454,104 @@ def checkRawByteTraceObsErasedApprox
   match decodeRawByteTrace rootBody calleeSigs table rawTrace with
   | some obsTrace =>
     checkMirTraceApprox
-      (mirObsErasedStatefulApprox rootBody obsTrace.args
-        { obsTrace.initMem with callees := obsTrace.inlinedCallees } fuel)
+      (interpApprox silenceMirObsApprox fuel
+        (mirExecGuardedApprox rootBody fuel
+          (.running (initMachineStateWithMemory rootBody obsTrace.args
+            { obsTrace.initMem with callees := obsTrace.inlinedCallees }))))
       obsTrace.events obsTrace.outcome
   | none => false
+
+/-- `checkRawByteTraceFullApprox` with `initMachineStateWithMemoryAndCallees`
+(equal to `checkRawByteTraceWithCalleesFullBounded`). -/
+@[reducible]
+def checkRawByteTraceWithCalleesFullApprox
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkMirTraceApprox
+      (mirExecGuardedApprox rootBody fuel
+        (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
+          obsTrace.initMem obsTrace.inlinedCallees)))
+      obsTrace.events obsTrace.outcome
+  | none => false
+
+/-- `checkRawByteTraceObsErasedApprox` with `initMachineStateWithMemoryAndCallees`
+(implies `checkRawByteTraceWithCalleesObsErasedBounded`). -/
+@[reducible]
+def checkRawByteTraceWithCalleesObsErasedApprox
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkMirTraceApprox
+      (interpApprox silenceMirObsApprox fuel
+        (mirExecGuardedApprox rootBody fuel
+          (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
+            obsTrace.initMem obsTrace.inlinedCallees))))
+      obsTrace.events obsTrace.outcome
+  | none => false
+
+/-- `checkRawByteTraceFullApprox` equals `checkRawByteTraceFullBounded` at every fuel. -/
+theorem checkRawByteTraceFullApprox_eq
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    checkRawByteTraceFullApprox fuel rootBody calleeSigs table rawTrace =
+      checkRawByteTraceFullBounded fuel rootBody calleeSigs table rawTrace := by
+  rw [← checkRawByteTraceFullBoundedFast_eq]
+  unfold checkRawByteTraceFullApprox checkRawByteTraceFullBoundedFast
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact checkMirTraceApprox_guarded_eq _ _ _ _ _
+
+/-- `checkRawByteTraceWithCalleesFullApprox` equals
+`checkRawByteTraceWithCalleesFullBounded` at every fuel. -/
+theorem checkRawByteTraceWithCalleesFullApprox_eq
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    checkRawByteTraceWithCalleesFullApprox fuel rootBody calleeSigs table rawTrace =
+      checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace := by
+  rw [← checkRawByteTraceWithCalleesFullBoundedFast_eq]
+  unfold checkRawByteTraceWithCalleesFullApprox checkRawByteTraceWithCalleesFullBoundedFast
+  cases decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rfl
+  | some obsTrace => exact checkMirTraceApprox_guarded_eq _ _ _ _ _
+
+/-- Every trace accepted by `checkRawByteTraceObsErasedApprox` is accepted by
+`checkRawByteTraceObsErasedBounded` at the same fuel. -/
+theorem checkRawByteTraceObsErasedApprox_imp
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceObsErasedApprox fuel rootBody calleeSigs table rawTrace = true) :
+    checkRawByteTraceObsErasedBounded fuel rootBody calleeSigs table rawTrace = true := by
+  rw [← checkRawByteTraceObsErasedBoundedFast_eq]
+  unfold checkRawByteTraceObsErasedApprox at h_ok
+  unfold checkRawByteTraceObsErasedBoundedFast
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    exact checkMirTraceApprox_interpSilence_guarded_imp _ _ _ _ _ h_ok
+
+/-- Every trace accepted by `checkRawByteTraceWithCalleesObsErasedApprox` is
+accepted by `checkRawByteTraceWithCalleesObsErasedBounded` at the same fuel. -/
+theorem checkRawByteTraceWithCalleesObsErasedApprox_imp
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceWithCalleesObsErasedApprox
+        fuel rootBody calleeSigs table rawTrace = true) :
+    checkRawByteTraceWithCalleesObsErasedBounded
+      fuel rootBody calleeSigs table rawTrace = true := by
+  rw [← checkRawByteTraceWithCalleesObsErasedBoundedFast_eq]
+  unfold checkRawByteTraceWithCalleesObsErasedApprox at h_ok
+  unfold checkRawByteTraceWithCalleesObsErasedBoundedFast
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    exact checkMirTraceApprox_interpSilence_guarded_imp _ _ _ _ _ h_ok
 
 /-- Soundness of `checkRawByteTraceFullApprox`. -/
 theorem checkRawByteTraceFullApprox_sound
@@ -5052,16 +5567,8 @@ theorem checkRawByteTraceFullApprox_sound
         (mirStatefulTree rootBody obsTrace.args
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
         tr out := by
-  unfold checkRawByteTraceFullApprox at h_ok
-  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
-  | none => rw [h_dec] at h_ok; nomatch h_ok
-  | some obsTrace =>
-    rw [h_dec] at h_ok
-    rcases checkMirStatefulApprox_sound fuel rootBody obsTrace.args
-        { obsTrace.initMem with callees := obsTrace.inlinedCallees }
-        obsTrace.events obsTrace.outcome h_ok with
-      ⟨tr, out, h_evs, h_out, h_reach⟩
-    exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
+  rw [checkRawByteTraceFullApprox_eq] at h_ok
+  exact checkRawByteTraceFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
 
 /-- Soundness of `checkRawByteTraceObsErasedApprox`. -/
 theorem checkRawByteTraceObsErasedApprox_sound
@@ -5076,17 +5583,45 @@ theorem checkRawByteTraceObsErasedApprox_sound
       ReachesRet
         (mirObsErasedStatefulTree rootBody obsTrace.args
           { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out :=
+  checkRawByteTraceObsErasedBounded_sound fuel rootBody calleeSigs table rawTrace
+    (checkRawByteTraceObsErasedApprox_imp fuel rootBody calleeSigs table rawTrace h_ok)
+
+/-- Soundness of `checkRawByteTraceWithCalleesFullApprox`. -/
+theorem checkRawByteTraceWithCalleesFullApprox_sound
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceWithCalleesFullApprox fuel rootBody calleeSigs table rawTrace = true) :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTreeWithCallees
+          rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
         tr out := by
-  unfold checkRawByteTraceObsErasedApprox at h_ok
-  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
-  | none => rw [h_dec] at h_ok; nomatch h_ok
-  | some obsTrace =>
-    rw [h_dec] at h_ok
-    rcases checkMirObsErasedStatefulApprox_sound fuel rootBody obsTrace.args
-        { obsTrace.initMem with callees := obsTrace.inlinedCallees }
-        obsTrace.events obsTrace.outcome h_ok with
-      ⟨tr, out, h_evs, h_out, h_reach⟩
-    exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
+  rw [checkRawByteTraceWithCalleesFullApprox_eq] at h_ok
+  exact checkRawByteTraceWithCalleesFullBounded_sound fuel rootBody calleeSigs table rawTrace h_ok
+
+/-- Soundness of `checkRawByteTraceWithCalleesObsErasedApprox`. -/
+theorem checkRawByteTraceWithCalleesObsErasedApprox_sound
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceWithCalleesObsErasedApprox
+        fuel rootBody calleeSigs table rawTrace = true) :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees
+          rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out :=
+  checkRawByteTraceWithCalleesObsErasedBounded_sound fuel rootBody calleeSigs table rawTrace
+    (checkRawByteTraceWithCalleesObsErasedApprox_imp
+      fuel rootBody calleeSigs table rawTrace h_ok)
 
 /-! ## 7. Differential-Testing Triage Diagnostic Replay (`TraceReplayDiag`) -/
 
