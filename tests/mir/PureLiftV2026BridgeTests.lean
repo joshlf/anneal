@@ -26,7 +26,15 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    into `bb1`/`bb2` and `bb3` under `mirCfgStateRel` (the joined loan realized
    on the live machine at `bb3`), and `mir_blockCfg_sound` concludes. Test 2c
    runs a 3-block `while` loop with a back-edge through
-   `CfgCertificate.whileLoop` and `mir_cfgCertificate_sound`.
+   `CfgCertificate.whileLoop` and `mir_cfgCertificate_sound`. Test 2b-sym
+   replays the diamond from one symbolic entry state, where `stepBasicBlock`
+   joins both arms into a single `.convergedJump 1` (one delay tick, pending
+   `handleFreeOutOpt` guard) that `mirCfg_forwardSim_of_waitFree` matches with
+   one header-targeted live run, and checks that a rejecting wrapper or a
+   leaked handle faults. Test 2d certifies loops from strong-descent cutpoints
+   (`rank s' < rank s`) with `mir_whileLoop_cfgCertificate_of_cutpoint`,
+   including the stride-3 `while i < 5` loop whose live header computes
+   `Lt(i, 5)` and whose rank drops `5 → 2 → 0`.
 3. **Hybrid `SpatialPin` freeze → `zerocopy` byte write → unpin**: the frozen
    block is the place's trusted byte window (`TypedAt`), the spatial mutation
    writes exactly the bytes produced by the live raw-pointer `*mut u8` store,
@@ -1078,6 +1086,46 @@ theorem dbSym_sound (c : Bool) :
     (dbSym_forwardSim c) (dbSym_cfg_wpConverges c).2
     ⟨subIdWrap_some, rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
 
+/-- `diamondBlocks` emits only sub-identity wrappers from the `dbSymExtra`
+states: block `0` emits the `handleFreeOutOpt`-guarded `.convergedJump`, and
+block `3` returns. -/
+theorem dbSym_emitsSubIdWraps (c : Bool) :
+    EmitsSubIdWraps (stepBasicBlock stdValAlg diamondBlocks)
+      (fun bb st => Exists fun ms => dbSymExtra c bb st ms) := by
+  intro bb st ⟨_, hEx⟩
+  rcases hEx with ⟨hBb, hSt, _⟩ | ⟨hBb, hSt, _⟩
+  · subst hBb
+    subst hSt
+    rw [diamondBlocks_convergedJump]
+    exact subIdWrap_handleFreeOutOpt stdValAlg
+  · subst hBb
+    subst hSt
+    cases c <;> exact trivial
+
+/-- **Non-vacuity of `mirCfg_forwardSim_of_emitsSubIdWraps`**: the symbolic
+`.convergedJump` diamond simulates `diamondBody` with per-block obligations that
+mention neither the pending wrapper nor the delay (`mirCfgBlockRel`), and
+`mir_blockCfg_sound` again yields live `MirWpConverges` for every oracle. -/
+theorem dbSym_sound_of_emitsSubIdWraps (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) :=
+  mir_blockCfg_sound tagOfLoan diamondBody diamondBlocks (· = diamondSymOut c)
+    (dbBindingsAt c) id (dbSymExtra c) []
+    (mirCfg_forwardSim_of_emitsSubIdWraps tagOfLoan diamondBody diamondBlocks
+      (dbBindingsAt c) id (dbSymExtra c) [] (dbSym_emitsSubIdWraps c)
+      (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+        rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;>
+            exact stepsTo_of_runMirToBlock_reached (diamond_runMirToBlock _)
+              ⟨rfl, rfl, diamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c
+          · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines false, rfl⟩
+          · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines true, rfl⟩))
+    (dbSym_cfg_wpConverges c).2
+    ⟨subIdWrap_some, rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
 /-- Variant of the symbolic diamond whose join block `bb3` attempts to return the
 leaked borrow handle `_4 = .refVal 0 []` while `.convergedJump 1
 (handleFreeOutOpt stdValAlg)` is active. -/
@@ -1154,9 +1202,11 @@ theorem dbSym_convergedJump_rejection_and_valAlgebra_canaries
 
 /-! ### Test 2d: Multi-Step Strong-Descent (`rank s' < rank s`, `Δrank ≥ 2`) Loop Cutpoints over Live `V2026_06_01` MIR -/
 
-/-- Strong-descent ranking function on `loopBorrowBody` (`Test 2c`) that drops
-by `3` in a single iteration (`3 → 0`), refuting unit-decrement `rank s =
-rank s' + 1`. -/
+/-- Strong-descent ranking function on `loopBorrowBody` (`Test 2c`): an
+indicator of the loop flag (`3` while `_1 = true`, else `0`), so its single
+iteration drops it by `3`. The loop runs once, so this only checks that the
+cutpoint rule accepts a non-unit drop; the variable-stride, multi-iteration
+canary with a natural rank is `strideLoop_strongDescent_cutpoint_sound`. -/
 def lbStrongRank (s : SymState StdVal) : Nat :=
   match s.locals with
   | ⟨⟨_, .bool true⟩, _⟩ :: _ => 3
@@ -1250,17 +1300,28 @@ theorem loopBorrow_strongDescent_cutpoint_sound :
 
 /-- 2-iteration stride-3 live `V2026_06_01` `CapturedMir` loop:
 `fn stride_loop(mut i: u32, mut x: u32) -> u32 { while i < 5 { x += 10; i += 3; } x }`
-starting at `i = 0, x = 7` (`i = 0 → 3 → 6`, `x = 7 → 17 → 27`). -/
+starting at `i = 0, x = 7` (`i = 0 → 3 → 6`, `x = 7 → 17 → 27`). The header is
+the rustc shape of `while i < 5`: it evaluates the comparison into the `bool`
+temporary `_3` (`StorageLive(_3); _3 = Lt(copy _1, const 5_u32)`) and switches
+on it (`switchInt(copy _3) -> [0: bb2, otherwise: bb1]`), and both successors
+start with `StorageDead(_3)`, so the live header genuinely computes `i < 5` for
+every `i` rather than enumerating the reachable values
+(`strideLoop_header_computes_lt`). -/
 def strideLoopBody : CapturedMir :=
   mkBody 2
-    [decl .mut u32Ty, decl .mut u32Ty, decl .mut u32Ty]
-    [mkBb [] (.switchInt (.copy (pl 1)) ⟨[(0, 1), (3, 1)], 2⟩),
+    [decl .mut u32Ty, decl .mut u32Ty, decl .mut u32Ty, decl .mut boolTy]
+    [mkBb
+       [mkSt (.storageLive 3),
+        mkSt (.assign (pl 3) (.binaryOp .lt (.copy (pl 1)) (u32C 5)))]
+       (.switchInt (.copy (pl 3)) ⟨[(0, 2)], 1⟩),
      mkBb
-       [mkSt (.assign (pl 2) (.binaryOp .add (.copy (pl 2)) (u32C 10))),
+       [mkSt (.storageDead 3),
+        mkSt (.assign (pl 2) (.binaryOp .add (.copy (pl 2)) (u32C 10))),
         mkSt (.assign (pl 1) (.binaryOp .add (.copy (pl 1)) (u32C 3)))]
        (.goto 0),
      mkBb
-       [mkSt (.assign (pl 0) (.use (.copy (pl 2))))]
+       [mkSt (.storageDead 3),
+        mkSt (.assign (pl 0) (.use (.copy (pl 2))))]
        .return_]
 
 def strideAdd10 (v : StdVal) : Option StdVal :=
@@ -1355,26 +1416,42 @@ theorem strideCutpoint_exit : ∀ s, strideCutInv s →
 def strideMs0 : MachineState :=
   initMachineState strideLoopBody [.scalar ⟨0, 4⟩, .scalar ⟨7, 4⟩]
 
-def strideMsBody0 : MachineState :=
-  { strideMs0 with frame := { strideMs0.frame with blockIdx := 1, stmtIdx := 0 } }
-
-def strideMs1 : MachineState :=
+/-- Live `strideLoopBody` state at the header of block `bb` with `i`, `x`, and
+the comparison temporary `_3` in slot `t`. -/
+def strideMsAt (bb i x : Nat) (t : LocalSlot) : MachineState :=
   { strideMs0 with
     frame :=
-      { blockIdx := 0, stmtIdx := 0,
-        locals := [.uninit, .init (.scalar ⟨3, 4⟩), .init (.scalar ⟨17, 4⟩)] } }
+      { blockIdx := bb, stmtIdx := 0,
+        locals := [.uninit, .init (.scalar ⟨i, 4⟩), .init (.scalar ⟨x, 4⟩), t] } }
 
-def strideMsBody1 : MachineState :=
-  { strideMs1 with frame := { strideMs1.frame with blockIdx := 1, stmtIdx := 0 } }
+/-- `_3 = Lt(copy _1, const 5_u32)` as a live `bool` scalar. -/
+def strideLtSlot (b : Bool) : LocalSlot :=
+  .init (.scalar ⟨if b then 1 else 0, 1⟩)
 
-def strideMs2 : MachineState :=
-  { strideMs0 with
-    frame :=
-      { blockIdx := 0, stmtIdx := 0,
-        locals := [.uninit, .init (.scalar ⟨6, 4⟩), .init (.scalar ⟨27, 4⟩)] } }
+def strideMsBody0 : MachineState := strideMsAt 1 0 7 (strideLtSlot true)
 
-def strideMsExit : MachineState :=
-  { strideMs2 with frame := { strideMs2.frame with blockIdx := 2, stmtIdx := 0 } }
+def strideMs1 : MachineState := strideMsAt 0 3 17 .dead
+
+def strideMsBody1 : MachineState := strideMsAt 1 3 17 (strideLtSlot true)
+
+def strideMs2 : MachineState := strideMsAt 0 6 27 .dead
+
+def strideMsExit : MachineState := strideMsAt 2 6 27 (strideLtSlot false)
+
+/-- **The live header computes `i < 5`, not a table of reachable values**: from
+the header with any of `i = 2, 4` (never reached from `i = 0` by stride 3) the
+live MIR still enters the body, and from `i = 5` (the boundary) it exits, with
+`_3` holding `Lt(i, 5)`; the initial state has `_3` dead. -/
+theorem strideLoop_header_computes_lt :
+    strideMs0.frame.locals =
+      [.uninit, .init (.scalar ⟨0, 4⟩), .init (.scalar ⟨7, 4⟩), .dead] ∧
+    Anneal.PureMirExec.runMirToBlock strideLoopBody 1 (strideMsAt 0 2 0 .dead) =
+      .reached (strideMsAt 1 2 0 (strideLtSlot true)) ∧
+    Anneal.PureMirExec.runMirToBlock strideLoopBody 1 (strideMsAt 0 4 0 .dead) =
+      .reached (strideMsAt 1 4 0 (strideLtSlot true)) ∧
+    Anneal.PureMirExec.runMirToBlock strideLoopBody 2 (strideMsAt 0 5 0 .dead) =
+      .reached (strideMsAt 2 5 0 (strideLtSlot false)) :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 def strideExtra (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
   (bb = 0 ∧ st = strideSt0 ∧ ms = strideMs0) ∨

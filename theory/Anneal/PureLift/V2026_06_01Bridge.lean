@@ -26,7 +26,10 @@ machine state:
    tagOf v mv` relates a symbolic value to the trusted runtime value of the
    run selected by its oracles (a `choice (symBool b) vt vf` is refined by the
    taken arm), with naturals refined by fixed-width scalars and borrow handles
-   by pointers whose provenance tag is `tagOf lid`.
+   by pointers whose provenance tag is `tagOf lid`. `stdValAlg.branchSplit`
+   splits exactly the `.choice` nodes (`stdBranchSplit_eq_some_iff`), and
+   refinement passes through it in both directions
+   (`StdValRefines.of_branchSplit`, `StdValRefines.branchSplit_inv`).
 2. **Lawful field lenses over trusted aggregates (`valuePathLens`).**
    `valueFieldLens f` reads field `f` of a `Value.aggregate` and writes it with
    `MirLiftCore.setSpineChecked?` (equal to the trusted `Sequence.set?`);
@@ -53,7 +56,18 @@ machine state:
    header) into the same conclusion, with no `CfgCertificate`;
    `mir_cfgCertificate_sound` is its certificate-driven corollary, and
    `CfgCertificate.whileLoop` packages `cfg_certificate_while_sound` as a
-   3-block loop certificate with a back-edge.
+   3-block loop certificate with a back-edge. `mirCfgStateRel` asks only for a
+   sub-identity pending wrapper (`SubIdWrap`) and ignores the pending
+   `.convergedJump` delay, so `stepBasicBlock`'s join-convergent symbolic
+   diamonds (a `.convergedJump armSteps` whose wrapper is the
+   `handleFreeOutOpt` guard) simulate through `mirCfg_forwardSim_of_waitFree` /
+   `mirCfg_segmentSim_of_waitFree` with obligations only at block transitions
+   (delay ticks stutter, and halts carry the raw block return);
+   `mir_cfgCertificate_sound_of_invClosedNoFork` needs only a closed, fork-free
+   invariant; and `mir_whileLoop_cfgCertificate_of_cutpoint` certifies
+   `CfgCertificate.whileLoop` from a strong-descent loop cutpoint
+   (`rank s' < rank s`, via `holdsFnSpec_whileLoop_of_cutpoint`,
+   `whileCutpoint_localBlockVC`, and `whileCutpoint_noFork`).
 5. **Byte-window `SpatialCodec`s (`MirTypedByteCodec`).** A fixed-width
    `SepLogicLenses.ByteLensCodec α n` that agrees with the trusted operational
    byte codec `encodeValueToBytes` / `decodeValueFromBytes` at MIR type `ty`
@@ -2158,6 +2172,76 @@ theorem mirCfg_segmentSim_of_waitFree (tagOf : LoanId → Nat)
   | branchJump _ _ _ _ => trivial
   | fault => trivial
   | ret _ => trivial
+
+/-- `mirCfgStateRel` without its wrapper component: the live machine sits at
+statement `0` of `mirBb bb`, realizes `st` (`mirStateRel`), and satisfies
+`extra`. -/
+def mirCfgBlockRel (tagOf : LoanId → Nat)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  ms.frame.blockIdx = mirBb bb ∧
+  ms.frame.stmtIdx = 0 ∧
+  mirStateRel tagOf (bindingsAt bb) st ms ∧
+  extra bb st ms
+
+/-- **Wrapper-agnostic wait-free `ForwardSim` for `mirCfgStateRel`**: when the
+CFG emits only sub-identity wrappers from the `extra`-related states
+(`EmitsSubIdWraps`, as for `stepBasicBlock`'s `.continuing` joins guarded by
+`handleFreeOutOpt`), the per-block obligations mention neither the pending
+wrapper nor the `.convergedJump` delay: `SubIdWrap` of every composed wrapper is
+discharged by `subIdWrap_composeWrap`, delay ticks stutter, and halts are
+obligations on the raw block return. -/
+theorem mirCfg_forwardSim_of_emitsSubIdWraps (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hEmit : EmitsSubIdWraps (stepBasicBlock stdValAlg blocks)
+      (fun bb st => Exists fun ms => extra bb st ms))
+    (hZero : ∀ bb st ms, mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs) := by
+  refine mirCfg_forwardSim_of_waitFree tagOf body blocks bindingsAt mirBb extra
+    rootAddrs ?_
+  intro wrap bb st ms hR
+  have hW : SubIdWrap wrap := hR.1
+  have hE := hEmit bb st ⟨ms, hR.2.2.2.2⟩
+  have hZ := hZero bb st ms hR.2
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ.mono (fun _ h => ⟨hW, h⟩)
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | ret v =>
+    rw [hst] at hZ
+    exact hZ
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
 
 /-- **Certificate-free block-level adequacy over live `V2026_06_01` MIR
 (`mir_blockCfg_sound`)**: a forward simulation from the embedded `PureLift`
