@@ -5263,9 +5263,10 @@ def populateShadowPointerMemory
   | [] => baseMem
   | _ :: _ =>
     let minCallerIdx := maxLocalCountInBodies (rootBody :: auxBodies)
-    populateShadowPointerMemoryAux
-      rootBody auxBodies table minCallerIdx 1
-      (rootBody.localDecls.drop 1) rawArgs args baseMem
+    { populateShadowPointerMemoryAux
+        rootBody auxBodies table minCallerIdx 1
+        (rootBody.localDecls.drop 1) rawArgs args baseMem with
+      callees := baseMem.callees }
 
 /--
 Raw byte-level interaction event recorded at runtime before `LayoutTable`
@@ -8019,11 +8020,11 @@ observed trace.
   budget that exhausts `maxHeartbeats` (a deterministic timeout) instead of returning
   `false` after a few steps as a small caller-chosen `*Bounded` fuel would.
 * The `WithCallees` entrypoints (`checkObservedTraceWithCallees`,
-  `checkRawByteTraceWithCallees*`, `diagnoseRawByteTraceWithCallees*`) derive the
-  budget from `trace.inlinedCallees`. When that list is empty,
-  `initMachineStateWithMemoryAndCallees` keeps `trace.initMem.callees` as the live
-  callee table, and the budget does not account for those bodies (completeness
-  only; soundness is unaffected).
+  `checkRawByteTraceWithCallees*`, `diagnoseRawByteTraceWithCallees*`) derive their
+  step budget from `effectiveInlinedCallees trace.initMem trace.inlinedCallees`
+  (`= (initMachineStateWithMemoryAndCallees ...).memory.callees`), accounting for
+  `trace.initMem.callees` when `trace.inlinedCallees = []` as well as
+  `trace.inlinedCallees` when non-empty.
 -/
 
 /-- `stepMirState` transitions needed to run every basic block of `bbs` once: one
@@ -8081,6 +8082,23 @@ def defaultObsErasedTraceSteps (body : CapturedMir) (inlinedCallees : List Captu
     (events : List ObservedEvent) : Nat :=
   defaultObsErasedTraceStepsOfLength body inlinedCallees events.length
 
+/-- Active transparent callee table for `initMachineStateWithMemoryAndCallees`:
+uses `inlinedCallees` when non-empty and falls back to `initMem.callees` when
+`inlinedCallees = []`. -/
+@[reducible]
+def effectiveInlinedCallees (initMem : Memory) (inlinedCallees : List CapturedMir) :
+    List CapturedMir :=
+  match inlinedCallees with
+  | [] => initMem.callees
+  | _ :: _ => inlinedCallees
+
+theorem initMachineStateWithMemoryAndCallees_callees
+    (body : CapturedMir) (args : List Value) (initMem : Memory)
+    (inlinedCallees : List CapturedMir) :
+    (initMachineStateWithMemoryAndCallees body args initMem inlinedCallees).memory.callees =
+      effectiveInlinedCallees initMem inlinedCallees := by
+  cases inlinedCallees <;> rfl
+
 /-- `defaultTraceSteps` for an undecoded `RawByteTrace` (decoding preserves the event
 count and the inlined callees). -/
 @[reducible]
@@ -8091,6 +8109,23 @@ def defaultRawTraceSteps (rootBody : CapturedMir) (rawTrace : RawByteTrace) : Na
 @[reducible]
 def defaultRawObsErasedTraceSteps (rootBody : CapturedMir) (rawTrace : RawByteTrace) : Nat :=
   defaultObsErasedTraceStepsOfLength rootBody rawTrace.inlinedCallees rawTrace.events.length
+
+/-- `defaultTraceSteps` for an undecoded `RawByteTrace` under `WithCallees`
+initialization (`effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees`). -/
+@[reducible]
+def defaultRawWithCalleesTraceSteps (rootBody : CapturedMir) (rawTrace : RawByteTrace) : Nat :=
+  defaultTraceStepsOfLength rootBody
+    (effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees)
+    rawTrace.events.length
+
+/-- `defaultObsErasedTraceSteps` for an undecoded `RawByteTrace` under `WithCallees`
+initialization (`effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees`). -/
+@[reducible]
+def defaultRawWithCalleesObsErasedTraceSteps
+    (rootBody : CapturedMir) (rawTrace : RawByteTrace) : Nat :=
+  defaultObsErasedTraceStepsOfLength rootBody
+    (effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees)
+    rawTrace.events.length
 
 /--
 One observation-driven replay segment (`checkBranches = true`): runs silent `.tau`
@@ -9021,20 +9056,34 @@ def checkObservedTraceConsistency (checkBranches : Bool) (body : CapturedMir)
 
 /-- Fuel-free trace-consistency dispatcher initializing `MachineState` via
 `initMachineStateWithMemoryAndCallees`, the fuel-free counterpart of
-`checkObservedTraceWithCalleesBounded`. -/
+`checkObservedTraceWithCalleesBounded`. Derives the step budget from
+`effectiveInlinedCallees trace.initMem trace.inlinedCallees` (`= s.memory.callees`). -/
 @[reducible]
 def checkObservedTraceWithCallees (checkBranches : Bool) (body : CapturedMir)
     (trace : ObservedTrace) : Bool :=
   let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem
     trace.inlinedCallees
+  let callees := effectiveInlinedCallees trace.initMem trace.inlinedCallees
   match checkBranches with
   | true =>
-    checkFullMirTraceAuto body trace.inlinedCallees (.running s)
+    checkFullMirTraceAuto body callees (.running s)
       trace.events trace.outcome
   | false =>
     checkObsErasedObservedTraceBounded
-      (defaultObsErasedTraceSteps body trace.inlinedCallees trace.events)
+      (defaultObsErasedTraceSteps body callees trace.events)
       body s trace.events trace.outcome
+
+theorem checkObservedTraceWithCallees_eq_observedTrace
+    (checkBranches : Bool) (body : CapturedMir) (trace : ObservedTrace) :
+    checkObservedTraceWithCallees checkBranches body trace =
+      let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem
+        trace.inlinedCallees
+      match checkBranches with
+      | true => checkFullObservedTrace body s trace.events trace.outcome
+      | false => checkObsErasedObservedTrace body s trace.events trace.outcome := by
+  unfold checkObservedTraceWithCallees checkFullObservedTrace checkObsErasedObservedTrace
+  dsimp only
+  cases checkBranches <;> rw [initMachineStateWithMemoryAndCallees_callees]
 
 /-- Fuel-free end-to-end full check of a `RawByteTrace` against `mirStatefulTree`
 (`checkBranches = true`). -/
@@ -9143,7 +9192,8 @@ theorem checkRawByteTraceWithCalleesFull_sound
   | none => rw [h_dec] at h_ok; nomatch h_ok
   | some obsTrace =>
     rw [h_dec] at h_ok
-    rcases checkFullMirTraceAuto_sound rootBody obsTrace.inlinedCallees
+    rcases checkFullMirTraceAuto_sound rootBody
+        (effectiveInlinedCallees obsTrace.initMem obsTrace.inlinedCallees)
         (.running (initMachineStateWithMemoryAndCallees rootBody obsTrace.args
           obsTrace.initMem obsTrace.inlinedCallees))
         obsTrace.events obsTrace.outcome h_ok with
@@ -9174,6 +9224,14 @@ theorem checkRawByteTraceWithCalleesObsErased_sound
       ⟨tr, out, h_evs, h_out, h_reach⟩
     exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
 
+theorem populateShadowPointerMemory_callees
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawArgs : List (List UInt8))
+    (args : List Value) (baseMem : Memory) :
+    (populateShadowPointerMemory rootBody auxBodies table rawArgs args baseMem).callees =
+      baseMem.callees := by
+  cases table <;> rfl
+
 /-- Decoding a `RawByteTrace` preserves its transparent inlined callees. -/
 theorem decodeRawByteTrace_inlinedCallees
     {rootBody : CapturedMir} {calleeSigs : List CapturedMir}
@@ -9197,6 +9255,43 @@ theorem decodeRawByteTrace_inlinedCallees
         injection h with h'
         subst h'
         rfl
+
+/-- Decoding a `RawByteTrace` preserves `initMem.callees`. -/
+theorem decodeRawByteTrace_initMem_callees
+    {rootBody : CapturedMir} {calleeSigs : List CapturedMir}
+    {table : ShadowProvenanceTable} {rawTrace : RawByteTrace}
+    {obsTrace : ObservedTrace}
+    (h : decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace) :
+    obsTrace.initMem.callees = rawTrace.initMem.callees := by
+  unfold decodeRawByteTrace at h
+  cases h₁ : decodeFnArgsFromRawBytes rootBody table rawTrace.rawArgs with
+  | none => rw [h₁] at h; nomatch h
+  | some args =>
+    rw [h₁] at h
+    cases h₂ : decodeRawObservedEvents calleeSigs table rawTrace.events with
+    | none => rw [h₂] at h; nomatch h
+    | some events =>
+      rw [h₂] at h
+      cases h₃ : decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rw [h₃] at h; nomatch h
+      | some outcome =>
+        rw [h₃] at h
+        injection h with h'
+        subst h'
+        exact populateShadowPointerMemory_callees
+          rootBody (calleeSigs ++ rawTrace.inlinedCallees)
+          table rawTrace.rawArgs args rawTrace.initMem
+
+/-- Decoding a `RawByteTrace` preserves `effectiveInlinedCallees`. -/
+theorem decodeRawByteTrace_effectiveInlinedCallees
+    {rootBody : CapturedMir} {calleeSigs : List CapturedMir}
+    {table : ShadowProvenanceTable} {rawTrace : RawByteTrace}
+    {obsTrace : ObservedTrace}
+    (h : decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace) :
+    effectiveInlinedCallees obsTrace.initMem obsTrace.inlinedCallees =
+      effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees := by
+  unfold effectiveInlinedCallees
+  rw [decodeRawByteTrace_inlinedCallees h, decodeRawByteTrace_initMem_callees h]
 
 /-- The fuel-free full check implies the `*Bounded` full check at the automatic global
 budget `defaultRawTraceSteps`. -/
@@ -9243,12 +9338,12 @@ theorem checkRawByteTraceFullBounded_imp_fuelFree_of_le
     exact checkFullMirTraceFast_imp_within_of_le rootBody h_le' _ _ _ h_ok
 
 /-- The fuel-free `WithCallees` full check implies the `*Bounded` check at the
-automatic global budget `defaultRawTraceSteps`. -/
+automatic global budget `defaultRawWithCalleesTraceSteps`. -/
 theorem checkRawByteTraceWithCalleesFull_imp_bounded
     (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
     (h_ok : checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace = true) :
-    checkRawByteTraceWithCalleesFullBounded (defaultRawTraceSteps rootBody rawTrace)
+    checkRawByteTraceWithCalleesFullBounded (defaultRawWithCalleesTraceSteps rootBody rawTrace)
       rootBody calleeSigs table rawTrace = true := by
   rw [← checkRawByteTraceWithCalleesFullBoundedFast_eq]
   unfold checkRawByteTraceWithCalleesFull at h_ok
@@ -9258,20 +9353,22 @@ theorem checkRawByteTraceWithCalleesFull_imp_bounded
   | some obsTrace =>
     rw [h_dec] at h_ok
     have h_len := decodeRawByteTrace_events_length h_dec
-    have h_cal := decodeRawByteTrace_inlinedCallees h_dec
+    have h_cal := decodeRawByteTrace_effectiveInlinedCallees h_dec
     have h_auto := checkFullMirTraceAuto_checkFullMirTraceFast rootBody _ _
       obsTrace.events obsTrace.outcome h_ok
-    unfold defaultRawTraceSteps
+    unfold defaultRawWithCalleesTraceSteps
     rw [← h_len, ← h_cal]
     exact h_auto
 
 /-- Converse: `checkRawByteTraceWithCalleesFullBounded` acceptance at
-`fuel ≤ defaultIntraEventSteps` implies fuel-free `checkRawByteTraceWithCalleesFull`
-acceptance. -/
+`fuel ≤ defaultIntraEventSteps rootBody (effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees)`
+implies fuel-free `checkRawByteTraceWithCalleesFull` acceptance. -/
 theorem checkRawByteTraceWithCalleesFullBounded_imp_fuelFree_of_le
     {fuel : Nat} (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
-    (h_le : fuel ≤ defaultIntraEventSteps rootBody rawTrace.inlinedCallees)
+    (h_le : fuel ≤
+      defaultIntraEventSteps rootBody
+        (effectiveInlinedCallees rawTrace.initMem rawTrace.inlinedCallees))
     (h_ok :
       checkRawByteTraceWithCalleesFullBounded fuel rootBody calleeSigs table rawTrace = true) :
     checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace = true := by
@@ -9282,8 +9379,10 @@ theorem checkRawByteTraceWithCalleesFullBounded_imp_fuelFree_of_le
   | none => rw [h_dec] at h_ok; nomatch h_ok
   | some obsTrace =>
     rw [h_dec] at h_ok
-    have h_cal := decodeRawByteTrace_inlinedCallees h_dec
-    have h_le' : fuel ≤ defaultIntraEventSteps rootBody obsTrace.inlinedCallees := by
+    have h_cal := decodeRawByteTrace_effectiveInlinedCallees h_dec
+    have h_le' : fuel ≤
+        defaultIntraEventSteps rootBody
+          (effectiveInlinedCallees obsTrace.initMem obsTrace.inlinedCallees) := by
       rw [h_cal]
       exact h_le
     exact checkFullMirTraceFast_imp_within_of_le rootBody h_le' _ _ _ h_ok
@@ -9306,21 +9405,21 @@ theorem checkRawByteTraceObsErased_eq_bounded
     rw [← h_len, ← h_cal]
 
 /-- The fuel-free `WithCallees` branch-erased check is exactly the `*Bounded` check at
-the automatic global budget `defaultRawObsErasedTraceSteps`. -/
+the automatic global budget `defaultRawWithCalleesObsErasedTraceSteps`. -/
 theorem checkRawByteTraceWithCalleesObsErased_eq_bounded
     (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
     checkRawByteTraceWithCalleesObsErased rootBody calleeSigs table rawTrace =
       checkRawByteTraceWithCalleesObsErasedBounded
-        (defaultRawObsErasedTraceSteps rootBody rawTrace)
+        (defaultRawWithCalleesObsErasedTraceSteps rootBody rawTrace)
         rootBody calleeSigs table rawTrace := by
   unfold checkRawByteTraceWithCalleesObsErased checkRawByteTraceWithCalleesObsErasedBounded
   cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
   | none => rfl
   | some obsTrace =>
     have h_len := decodeRawByteTrace_events_length h_dec
-    have h_cal := decodeRawByteTrace_inlinedCallees h_dec
-    unfold defaultRawObsErasedTraceSteps
+    have h_cal := decodeRawByteTrace_effectiveInlinedCallees h_dec
+    unfold defaultRawWithCalleesObsErasedTraceSteps
     rw [← h_len, ← h_cal]
 
 /-- Fuel-free branch-erased certificate from the fuel-free full check: when the full
@@ -9795,7 +9894,9 @@ with `callees` (`checkBranches = true`). -/
 def diagnoseFullObservedTraceWithCallees (body : CapturedMir) (trace : ObservedTrace) :
     TraceReplayDiag :=
   let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
-  diagnoseFullMirTraceAuto body trace.inlinedCallees (.running s) trace.events trace.outcome
+  diagnoseFullMirTraceAuto body
+    (effectiveInlinedCallees trace.initMem trace.inlinedCallees)
+    (.running s) trace.events trace.outcome
 
 /-- Tail-recursive allocation-free fuel-free diagnostic replay of a decoded
 `ObservedTrace` (`checkBranches = true`). -/
@@ -9812,7 +9913,9 @@ def diagnoseFullObservedTraceFast (body : CapturedMir) (trace : ObservedTrace) :
 def diagnoseFullObservedTraceWithCalleesFast (body : CapturedMir) (trace : ObservedTrace) :
     TraceReplayDiag :=
   let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
-  diagnoseFullMirTraceFastAuto body trace.inlinedCallees (.running s) trace.events trace.outcome
+  diagnoseFullMirTraceFastAuto body
+    (effectiveInlinedCallees trace.initMem trace.inlinedCallees)
+    (.running s) trace.events trace.outcome
 
 /-- Fuel-free diagnostic replay for `checkRawByteTraceFull`, recursing structurally
 on `events` with the automatic per-segment budget `defaultIntraEventSteps` so that
@@ -9979,7 +10082,8 @@ def diagnoseRawByteTraceWithCalleesFullFast (rootBody : CapturedMir)
 def diagnoseRawByteTraceWithCalleesFullGlobal (rootBody : CapturedMir)
     (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
     (rawTrace : RawByteTrace) : TraceReplayDiag :=
-  diagnoseRawByteTraceWithCalleesFullBounded (defaultRawTraceSteps rootBody rawTrace)
+  diagnoseRawByteTraceWithCalleesFullBounded
+    (defaultRawWithCalleesTraceSteps rootBody rawTrace)
     rootBody calleeSigs table rawTrace
 
 /-- Fuel-free diagnostic replay for `checkRawByteTraceWithCalleesObsErased`. -/
@@ -9988,7 +10092,8 @@ def diagnoseRawByteTraceWithCalleesObsErased (rootBody : CapturedMir)
     (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
     (rawTrace : RawByteTrace) : TraceReplayDiag :=
   diagnoseRawByteTraceWithCalleesObsErasedBounded
-    (defaultRawObsErasedTraceSteps rootBody rawTrace) rootBody calleeSigs table rawTrace
+    (defaultRawWithCalleesObsErasedTraceSteps rootBody rawTrace)
+    rootBody calleeSigs table rawTrace
 
 /-- Tail-recursive allocation-free fuel-free diagnostic replay for
 `checkRawByteTraceWithCalleesObsErased`. -/
@@ -9997,7 +10102,8 @@ def diagnoseRawByteTraceWithCalleesObsErasedFast (rootBody : CapturedMir)
     (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
     (rawTrace : RawByteTrace) : TraceReplayDiag :=
   diagnoseRawByteTraceWithCalleesObsErasedBoundedFast
-    (defaultRawObsErasedTraceSteps rootBody rawTrace) rootBody calleeSigs table rawTrace
+    (defaultRawWithCalleesObsErasedTraceSteps rootBody rawTrace)
+    rootBody calleeSigs table rawTrace
 
 /-- The fuel-free full diagnosis agrees identically with the fuel-free full check. -/
 theorem diagnoseRawByteTraceFull_isOk
@@ -10036,7 +10142,7 @@ theorem diagnoseRawByteTraceWithCalleesFull_isOk
       cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
       | none => rfl
       | some outcome =>
-        exact diagnoseFullMirTraceAuto_isOk rootBody rawTrace.inlinedCallees _ events outcome
+        exact diagnoseFullMirTraceAuto_isOk rootBody _ _ events outcome
 
 theorem diagnoseRawByteTraceFullFast_eq
     (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
@@ -10071,6 +10177,40 @@ theorem diagnoseRawByteTraceFullFast_tagName
     (diagnoseRawByteTraceFullFast rootBody calleeSigs table rawTrace).tagName =
       (diagnoseRawByteTraceFull rootBody calleeSigs table rawTrace).tagName := by
   rw [diagnoseRawByteTraceFullFast_eq, TraceReplayDiag.tagName_eraseTrace]
+
+theorem diagnoseRawByteTraceWithCalleesFullFast_eq
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    diagnoseRawByteTraceWithCalleesFullFast rootBody calleeSigs table rawTrace =
+      (diagnoseRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace).eraseTrace := by
+  unfold diagnoseRawByteTraceWithCalleesFullFast diagnoseRawByteTraceWithCalleesFull
+  cases diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | error _ => rfl
+  | ok args =>
+    cases hevs : diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | error d =>
+      exact (TraceReplayDiag.eraseTrace_eq_self_of_not_isOk
+        (diagnoseDecodeRawEventsAux_error_not_ok hevs)).symm
+    | ok events =>
+      cases decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => rfl
+      | some outcome =>
+        exact diagnoseFullMirTraceFastWithin_eq rootBody _ _ events outcome
+
+theorem diagnoseRawByteTraceWithCalleesFullFast_isOk
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesFullFast rootBody calleeSigs table rawTrace).isOk =
+      checkRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace := by
+  rw [diagnoseRawByteTraceWithCalleesFullFast_eq, TraceReplayDiag.isOk_eraseTrace,
+      diagnoseRawByteTraceWithCalleesFull_isOk]
+
+theorem diagnoseRawByteTraceWithCalleesFullFast_tagName
+    (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) :
+    (diagnoseRawByteTraceWithCalleesFullFast rootBody calleeSigs table rawTrace).tagName =
+      (diagnoseRawByteTraceWithCalleesFull rootBody calleeSigs table rawTrace).tagName := by
+  rw [diagnoseRawByteTraceWithCalleesFullFast_eq, TraceReplayDiag.tagName_eraseTrace]
 
 /-- Exact equivalence between an `"ok"` tag of `diagnoseRawByteTraceFull` and
 `checkRawByteTraceFull = true`. -/

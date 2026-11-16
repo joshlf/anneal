@@ -1098,6 +1098,38 @@ nothing else; the walker equality bridges above carry the content choice-free.
 #guard_msgs (whitespace := lax) in
 #print axioms diagnoseRawByteTraceWithCalleesObsErased_tag_ok_iff_check
 
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.initMachineStateWithMemoryAndCallees_callees' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms initMachineStateWithMemoryAndCallees_callees
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkObservedTraceWithCallees_eq_observedTrace' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkObservedTraceWithCallees_eq_observedTrace
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.populateShadowPointerMemory_callees' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms populateShadowPointerMemory_callees
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.decodeRawByteTrace_initMem_callees' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeRawByteTrace_initMem_callees
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.decodeRawByteTrace_effectiveInlinedCallees' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeRawByteTrace_effectiveInlinedCallees
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullFast_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFullFast_eq
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullFast_isOk' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFullFast_isOk
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullFast_tagName' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms diagnoseRawByteTraceWithCalleesFullFast_tagName
+
 /-! ## 2. Definitional-Closure Audit (`#audit_closure`)
 
 Kernel `rfl` / `decide` confirmation unfolds every definition reachable from a
@@ -1314,6 +1346,32 @@ elab "#audit_closure " prof:ident root:ident : command => do
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFullFast
 /-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErasedFast: clean -/
 #guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesObsErasedFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.effectiveInlinedCallees: clean -/
+#guard_msgs in #audit_closure checker effectiveInlinedCallees
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultRawWithCalleesTraceSteps: clean -/
+#guard_msgs in #audit_closure checker defaultRawWithCalleesTraceSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.defaultRawWithCalleesObsErasedTraceSteps: clean -/
+#guard_msgs in #audit_closure checker defaultRawWithCalleesObsErasedTraceSteps
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullObservedTrace: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullObservedTrace
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullObservedTraceWithCallees: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullObservedTraceWithCallees
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullObservedTraceFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullObservedTraceFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseFullObservedTraceWithCalleesFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseFullObservedTraceWithCalleesFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceFullGlobal: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceFullGlobal
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullGlobal: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFullGlobal
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullBounded: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFullBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErasedBounded: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesObsErasedBounded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesFullBoundedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesFullBoundedFast
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.diagnoseRawByteTraceWithCalleesObsErasedBoundedFast: clean -/
+#guard_msgs in #audit_closure checker diagnoseRawByteTraceWithCalleesObsErasedBoundedFast
 
 /-! ## 3. Nested `interpState` over `interp` over `iter` (`CofixA` Walkers vs `.observe`) -/
 
@@ -3380,5 +3438,142 @@ theorem canary_per_segment_diag_agreement_and_converse :
   exact checkRawByteTraceFullBounded_imp_fuelFree_of_le (fuel := 8)
     mirCountTo [] emptyShadowProvenanceTable (mkCountToFullRawTrace 0)
     (by decide) (by decide +kernel)
+
+/-- Inlined oracle callee with `blockStepCount = 11` (`10` statements + `return`), so
+each loop iteration segment between two consecutive `.branch` events takes
+`1 + 11 + 3 + 2 = 17` transitions (`> 16 = defaultIntraEventSteps mirLoopWithOracleCall []`). -/
+def ffiStepOracleLongInlinedBody : CapturedMir := {
+  defPath := "approx_test::ffi_step_oracle"
+  phase := .runtimeOptimized
+  role := .subject
+  argCount := 1
+  localDecls :=
+    [ approxMkDecl .mut approxU32Ty0
+    , approxMkDecl .not approxU32Ty0
+    , approxMkDecl .mut approxU32Ty0 ]
+  basicBlocks :=
+    [ { statements :=
+          [ approxMkStmt (.storageLive 2)
+          , approxMkStmt .nop
+          , approxMkStmt .nop
+          , approxMkStmt .nop
+          , approxMkStmt .nop
+          , approxMkStmt .nop
+          , approxMkStmt .nop
+          , approxMkStmt .nop
+          , approxMkStmt (.assign ⟨2, []⟩
+              (.binaryOp .mul (.copy ⟨1, []⟩) (approxU32ConstOperand 2)))
+          , approxMkStmt (.assign ⟨0, []⟩
+              (.binaryOp .add (.copy ⟨2, []⟩) (approxU32ConstOperand 3))) ]
+        terminator := approxMkTerm .return_
+        isCleanup := false } ]
+  fnAbi := approxTestFnAbi
+  layouts := approxTestLayouts
+  allocations := []
+}
+
+@[reducible]
+def mkLoopInitMemCalleesFullRawTrace (k : Nat) : RawByteTrace := {
+  rawArgs := [encodeU32LeBytes k]
+  initMem := { emptyMemory with callees := [ffiStepOracleLongInlinedBody] }
+  inlinedCallees := []
+  events := mkLoopInlinedFullRawEvents k
+  outcome := .normal (encodeU32LeBytes (expectedLoopAccum k))
+}
+
+@[reducible]
+def mkLoopInitMemCalleesObsErasedRawTrace (k : Nat) : RawByteTrace := {
+  rawArgs := [encodeU32LeBytes k]
+  initMem := { emptyMemory with callees := [ffiStepOracleLongInlinedBody] }
+  inlinedCallees := []
+  events := []
+  outcome := .normal (encodeU32LeBytes (expectedLoopAccum k))
+}
+
+/-- Canary 12 (`WithCallees` completeness when `inlinedCallees = []` and
+`initMem.callees` is non-empty):
+When `inlinedCallees = []` and `initMem.callees = [ffiStepOracleLongInlinedBody]`,
+`initMachineStateWithMemoryAndCallees` keeps `initMem.callees` as the live callee
+table. Each loop segment takes `17 > 16 = defaultIntraEventSteps mirLoopWithOracleCall []`
+transitions, so a budget derived from `inlinedCallees = []` (`16`) rejects the
+trace (`checkFullMirTraceWithin mirLoopWithOracleCall 16 ... = false`), whereas
+`effectiveInlinedCallees` (`= [ffiStepOracleLongInlinedBody]`, per-segment budget
+`384`) accepts across all fuel-free `WithCallees` checkers and diagnoses. -/
+theorem canary_withCallees_initMem_callees_accepted :
+    defaultIntraEventSteps mirLoopWithOracleCall [] = 16 ∧
+    defaultIntraEventSteps mirLoopWithOracleCall
+      (effectiveInlinedCallees
+        (mkLoopInitMemCalleesFullRawTrace 4).initMem
+        (mkLoopInitMemCalleesFullRawTrace 4).inlinedCallees) = 384 ∧
+    checkFullMirTraceWithin mirLoopWithOracleCall 16
+      (.running (initMachineStateWithMemoryAndCallees mirLoopWithOracleCall
+        [Value.scalar ⟨4, 4⟩]
+        (mkLoopInitMemCalleesFullRawTrace 4).initMem
+        (mkLoopInitMemCalleesFullRawTrace 4).inlinedCallees))
+      (loopObs (mkLoopInitMemCalleesFullRawTrace 4)).events
+      (loopObs (mkLoopInitMemCalleesFullRawTrace 4)).outcome = false ∧
+    checkRawByteTraceWithCalleesFull mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInitMemCalleesFullRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesObsErased mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInitMemCalleesObsErasedRawTrace 4) = true ∧
+    (diagnoseRawByteTraceWithCalleesFull mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInitMemCalleesFullRawTrace 4)).tagName = "ok" ∧
+    (diagnoseRawByteTraceWithCalleesFullFast mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInitMemCalleesFullRawTrace 4)).tagName = "ok" ∧
+    (diagnoseRawByteTraceWithCalleesObsErased mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInitMemCalleesObsErasedRawTrace 4)).tagName = "ok" := by
+  decide +kernel
+
+theorem mirLoop_initMemCallees_reachesRet_fuelFree :
+    (∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall []
+        emptyShadowProvenanceTable (mkLoopInitMemCalleesFullRawTrace 4) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTreeWithCallees
+          mirLoopWithOracleCall obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out) ∧
+    (∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall []
+        emptyShadowProvenanceTable (mkLoopInitMemCalleesObsErasedRawTrace 4) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees
+          mirLoopWithOracleCall obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out) :=
+  ⟨checkRawByteTraceWithCalleesFull_sound _ _ _ _
+    canary_withCallees_initMem_callees_accepted.2.2.2.1,
+   checkRawByteTraceWithCalleesObsErased_sound _ _ _ _
+    canary_withCallees_initMem_callees_accepted.2.2.2.2.1⟩
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.counterIter_k2_approxReaches_kleene_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms counterIter_k2_approxReaches_kleene_mono
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.nestedPipeline_k4_eutt_ret_and_strict_ineq' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nestedPipeline_k4_eutt_ret_and_strict_ineq
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_fuelFree_all_k_kernel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_fuelFree_all_k_kernel
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_k32_inlinedCallees_reachesRet_fuelFree' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_k32_inlinedCallees_reachesRet_fuelFree
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.canary_per_segment_diag_agreement_and_converse' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_per_segment_diag_agreement_and_converse
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.canary_withCallees_initMem_callees_accepted' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_withCallees_initMem_callees_accepted
+
+/-- info: 'Anneal.Mir.ITreeApproxRunnerTests.mirLoop_initMemCallees_reachesRet_fuelFree' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirLoop_initMemCallees_reachesRet_fuelFree
 
 end Anneal.Mir.ITreeApproxRunnerTests
