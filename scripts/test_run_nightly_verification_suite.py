@@ -127,6 +127,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(d["status"], "resolved")
             self.assertFalse(d["live_in_source"])
             self.assertTrue(d["resolution_live_in_source"], d["id"])
+            self.assertTrue(d["resolution_statement_pinned"], d["id"])
 
         actionable_items = [
             item
@@ -139,9 +140,20 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertTrue(item["resolution_symbol"].endswith("_simulation"), item["id"])
 
         def write_synthetic_checkout(
-            root: Path, *, live_ids: set[str] = frozenset(), missing_ids: set[str] = frozenset()
+            root: Path,
+            *,
+            live_ids: set[str] = frozenset(),
+            missing_ids: set[str] = frozenset(),
+            unpinned_ids: set[str] = frozenset(),
         ) -> None:
             for item in actionable_items:
+                # Statement pins live in the authority audit module (written even for
+                # `missing_ids`, whose resolution theorem itself is absent).
+                if item["id"] not in unpinned_ids:
+                    audit = root / suite.AUTHORITY_AUDIT_FILES[item["authority"]]
+                    audit.parent.mkdir(parents=True, exist_ok=True)
+                    with audit.open("a", encoding="utf-8") as fh:
+                        fh.write(f"example : True :=\n  {item['resolution_symbol']}\n")
                 if item["id"] in missing_ids:
                     continue
                 path = root / item.get("resolution_file", item["file"])
@@ -150,6 +162,48 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     fh.write(f"theorem {item['resolution_symbol']} : True := trivial\n")
                     if item["id"] in live_ids:
                         fh.write(f"theorem {item['witness_symbol']} : True := trivial\n")
+
+        # Fail-closed statement-pin linkage: a resolution theorem whose statement is not
+        # locked by an audit `example ... := <theorem>` pin (only listed, commented out,
+        # or applied mid-term) stays actionable as `resolution_unpinned`.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, unpinned_ids={"DIV-MR-CALL-TARGET-LOCAL"})
+            mr_audit = tmp_root / suite.AUTHORITY_AUDIT_FILES["MiniRustSpec"]
+            with mr_audit.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "#assert_standard_axioms\n  callerRefMutSilentWrongLocal_simulation\n"
+                    "-- example : True := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : True := id callerRefMutSilentWrongLocal_simulation\n"
+                )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-MR-CALL-TARGET-LOCAL", "resolution_unpinned")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 7)
+            with mr_audit.open("a", encoding="utf-8") as fh:
+                fh.write("example : True :=\n  @callerRefMutSilentWrongLocal_simulation\n")
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 0)
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 8)
+
+        # A `private` (or `unsafe` / `partial`) modifier on its own line(s) before the
+        # resolution theorem still makes it module-private, so it must not count.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(tmp_root, missing_ids={"DIV-LM-ENUM-SET-DISCR-UNINIT"})
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "@[simp]\nprivate\n\ntheorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing")],
+            )
 
         # Regression check: reintroducing a live `*_divergence` witness symbol in a
         # synthetic checkout must immediately flip `actionable_anneal_bugs_count` back > 0.

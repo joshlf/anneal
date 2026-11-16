@@ -1077,11 +1077,25 @@ _LEAN_RESOLUTION_MODIFIERS = (
     r"(?:(?:protected|noncomputable|nonrec|scoped)\s+|"
     r"@\[[^\]]*?(?:\[[^\]]*?\][^\]]*?)*\]\s*)*"
 )
-# Command prefixes such as `set_option maxHeartbeats 400000 in` or `local attribute [simp] f in`.
-_LEAN_IN_PREFIXES = (
-    r"(?:(?:(?:local|scoped)\s+)?"
-    r"(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[\s\S]*?\s+in\s+)*"
+# A line consisting only of declaration modifiers / attributes (e.g. `private` on its own
+# line before `theorem foo`), which Lean attaches to the next declaration.
+_LEAN_DANGLING_MODIFIER_LINE = re.compile(
+    r"^[ \t]*(?:(?:private|protected|noncomputable|nonrec|partial|unsafe|scoped|local)\b[ \t]*"
+    r"|@\[[^\n]*?\]+[ \t]*)+$"
 )
+
+
+def _has_dangling_forbidden_modifier(prefix_src: str) -> bool:
+    """True iff the modifier-only lines directly preceding a declaration (skipping blank
+    lines) contain `private`, `unsafe`, or `partial`."""
+    for line in reversed(prefix_src.split("\n")):
+        if not line.strip():
+            continue
+        if not _LEAN_DANGLING_MODIFIER_LINE.match(line):
+            return False
+        if re.search(r"\b(?:private|unsafe|partial)\b", line):
+            return True
+    return False
 
 
 def _truncate_at_lean_exit(stripped_src: str) -> str:
@@ -1174,6 +1188,8 @@ def _has_lean_decl(
     )
     mod_parts = _lean_module_parts(rel_file) if rel_file else []
     for m in re.finditer(pat_res, truncated):
+        if _has_dangling_forbidden_modifier(truncated[: m.start()]):
+            continue
         qual_raw = m.group("qual")
         inline_segs = [s.strip("«»") for s in qual_raw.split(".") if s]
         active_ns = _active_lean_namespace_at(truncated, m.start())
@@ -1185,6 +1201,24 @@ def _has_lean_decl(
             continue
         return True
     return False
+
+
+# Authority audit modules whose `example : <statement> := <theorem>` pins lock the
+# exact statement of each resolution theorem (a pin fails the Lean build if the
+# theorem is ever weakened, e.g. restated as `True`).
+AUTHORITY_AUDIT_FILES: dict[str, str] = {
+    "MiniRustSpec": "minirust/lean/MiniRustSpec/Audit.lean",
+    "LeanMiriSpec": "lean-miri/lean/LeanMiriSpec/Audit.lean",
+}
+
+
+def _has_statement_pin(stripped_audit_src: str, symbol: str) -> bool:
+    """True iff some term body in the (comment/string-stripped) audit module starts
+    with `symbol` right after `:=` (an `example : T := symbol ...` statement pin)."""
+    esc = re.escape(symbol)
+    qual_seg = r"(?:«[^»\n]+»|[^\W\d][\w'!?]*)"
+    pat = rf":=\s*@?(?:{qual_seg}\.)*(?:«{esc}»|{esc})(?![\w'!?»])"
+    return bool(re.search(pat, _truncate_at_lean_exit(stripped_audit_src)))
 
 
 def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
@@ -1226,9 +1260,20 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
                 else False
             )
 
+        resolution_pinned: bool | None = None
+        if resolution_symbol and resolution_present:
+            rel_pin = item.get("resolution_pin_file", AUTHORITY_AUDIT_FILES.get(item["authority"]))
+            stripped_pin = read_stripped(repo_root / rel_pin) if rel_pin else None
+            resolution_pinned = (
+                _has_statement_pin(stripped_pin, resolution_symbol)
+                if stripped_pin is not None
+                else False
+            )
+
         record = dict(item)
         record["live_in_source"] = present
         record["resolution_live_in_source"] = resolution_present
+        record["resolution_statement_pinned"] = resolution_pinned
         if item["category"] == "intentional_modeling_choice":
             record["status"] = "modeling_choice"
             modeling_choices.append(record)
@@ -1240,6 +1285,11 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
             # replacement theorem (deleted/moved file or bare rename), so the
             # divergence is NOT proven resolved.
             record["status"] = "resolution_missing"
+            actionable_open.append(record)
+        elif resolution_symbol and not resolution_pinned:
+            # Fail closed: the replacement theorem exists but no audit `example`
+            # pin locks its statement, so it could be weakened without notice.
+            record["status"] = "resolution_unpinned"
             actionable_open.append(record)
         else:
             record["status"] = "resolved"
@@ -2153,6 +2203,15 @@ def render_markdown_report(dashboard: dict[str, Any]) -> str:
             witness_cell = (
                 f"`{div['witness_symbol']}` (`{div['file']}`) — "
                 f"**missing resolution** `{res_sym}` (`{res_file}`)"
+            )
+        elif div.get("status") == "resolution_unpinned":
+            res_sym = div.get("resolution_symbol", "<missing>")
+            pin_file = div.get(
+                "resolution_pin_file", AUTHORITY_AUDIT_FILES.get(div["authority"], "<audit>")
+            )
+            witness_cell = (
+                f"`{div['witness_symbol']}` (`{div['file']}`) — "
+                f"**unpinned resolution** `{res_sym}` (no `example ... := {res_sym}` in `{pin_file}`)"
             )
         else:
             witness_cell = f"`{div['witness_symbol']}` (`{div['file']}`)"
