@@ -26071,6 +26071,74 @@ theorem ActiveTypedSliceMutBorrow.writePlaceValue_constantIndex_encodeElems_conn
     encodeUntypedValueToBytes_aggregate_map c toVal fuel 0 h_enc (backingXs.set (elemOff + i) v),
     hw, hW, hS, hAnc⟩
 
+/-! ### Single-borrow deref writes (one live `&mut [T]`) -/
+
+/-- A trusted flat (conflicting-borrows) write update performed *through the writer's own tag*
+keeps the writer's lens live: same byte range, unique-write permission (`.reservedFrz false`
+activates to `.unique`), with any new view `xs'` of its window. -/
+theorem ActiveTypedSliceMutBorrow.conflictingAtProj_self {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal}
+    {xs xs' : List α} {bytes bytes' : ByteMem} (targetLocal : Local)
+    (writeProj : List ProjectionElem) (writeOff writeLen : Nat)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hs' : SliceTypedAt c wide xs' bytes') :
+    ActiveTypedSliceMutBorrow c
+      (invalidateConflictingBorrowsAtProj borrows targetLocal (some tag) writeProj writeOff
+        writeLen) tag wide xs' bytes' := by
+  obtain ⟨_, entry, he, hc, hp⟩ := h
+  have htag : entry.tag = tag := lookupBorrow_tag he
+  obtain ⟨hc', hp'⟩ := updateBorrowPermAtProj_self_permitsUniqueWrite entry targetLocal writeProj
+    writeOff writeLen wide.1.offsetBytes (wide.2 * n) hc hp
+  refine ⟨hs', updateBorrowPermAtProj entry targetLocal (some tag) writeProj writeOff writeLen,
+    ?_, ?_, ?_⟩
+  · rw [lookupBorrow_invalidateConflictingBorrowsAtProj, he]
+    rfl
+  · rw [← htag]
+    exact hc'
+  · rw [← htag]
+    exact hp'
+
+/--
+**`ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single`**: the single-borrow case (one live
+`&mut [T]`), which every `2 ≤ borrows.length` deref-write bridge excludes. On a one-entry table,
+the trusted deref-write borrow update `invalidateDerefWriteBorrowsWithLayouts` through the
+(thin or 64-bit fat) pointer of the writer tag, whose entry has the tight range of its window,
+is the flat `invalidateConflictingBorrowsAtProj` over that range, and the writer lens stays live
+with the updated view `xs.set i v`.
+-/
+theorem ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {e₀ : BorrowEntry} {tag : Nat} {wide : WidePtrVal} {xs : List α}
+    {bytes bytes' : ByteMem} (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (locals : List LocalSlot) (dst : Place) (restProj : List ProjectionElem) (fat : Value)
+    (ptrVal : ProvenancePtr)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal) (hTag : ptrVal.tag = tag)
+    (h : ActiveTypedSliceMutBorrow c [e₀] tag wide xs bytes)
+    (hTight : TightBorrowRange [e₀] tag wide n)
+    {i : Nat} (hi : i < wide.2) (v : α)
+    (hw : writeTyped c (WidePtrVal.elemOffset wide n i) v bytes = some bytes') :
+    ActiveTypedSliceMutBorrow c
+      (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals [e₀] dst restProj)
+      tag wide (xs.set i v) bytes' := by
+  obtain ⟨entry, he, _, _⟩ := h.2
+  obtain ⟨_, _, hPos⟩ := hTight entry he
+  have hs' : SliceTypedAt c wide (xs.set i v) bytes' := SliceTypedAt.write_elem h.1 hi v hw
+  have hNz : Nat.beq entry.rangeLen 0 = false := nat_beq_eq_false_of_ne (by omega)
+  have he' : lookupBorrow [e₀] ptrVal.tag = some entry := by rw [hTag]; exact he
+  unfold invalidateDerefWriteBorrowsWithLayouts
+  dsimp only
+  rw [hSlot]
+  dsimp only
+  rw [hExt]
+  dsimp only
+  rw [he']
+  dsimp only
+  rw [hTag]
+  split
+  · rw [hNz]
+    exact ActiveTypedSliceMutBorrow.conflictingAtProj_self _ _ _ _ h hs'
+  · exact ActiveTypedSliceMutBorrow.conflictingAtProj_self _ _ _ _ h hs'
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses

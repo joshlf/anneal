@@ -974,6 +974,69 @@ theorem split_at_mut_symbolic_encodeElems_and_borrow_bridges :
     writeTyped_encodeElems_set ByteLensCodec.u32LE xs4 (idx := 1) (by decide) (u 20),
     hConn.2.1, hLenL.1, hLenL.2, hReadL, hReadR⟩
 
+/-! ### One live `&mut [u32]`: trusted write, single-entry borrow update, and lens -/
+
+/-- One live `&mut [u32]` (tag `77`, the only borrow entry, over the whole backing array `_0`),
+held in `_5` as a 64-bit fat pointer. -/
+def singleFat : Value := WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)
+
+def singleLocals : List LocalSlot := liveChildLocals.set 5 (.init singleFat)
+
+def singleDst : Place := { local_ := 5, projection := [.deref, .constantIndex 2 0 false] }
+
+def singleState : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := singleLocals }
+    memory := { borrows := slBorrows } }
+
+def singleStmt : Statement :=
+  { kind := .assign singleDst (.use (Anneal.MirLoops.constU32 30)), span := "single_write" }
+
+def backingS : Value :=
+  .aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨4, 4⟩]
+
+def singleBorrowsAfter : List BorrowEntry :=
+  invalidateDerefWriteBorrowsWithLayouts [] emptyLayoutTable singleLocals slBorrows singleDst
+    [.constantIndex 2 0 false]
+
+/-- **Single-borrow trusted write, connected** (the one-entry case every `2 ≤ borrows.length`
+deref-write bridge excludes). The trusted `evalStmt` of `(*_5)[2] = 30u32` through the only live
+`&mut [u32]` writes `30` into the backing array and updates the one-entry borrow table by
+`invalidateDerefWriteBorrowsWithLayouts`; the new backing array encodes to
+`encodeElems (xs4.set 2 30)`, and in the updated table the lens on tag `77` views exactly
+`[1, 2, 30, 4]` over those bytes (`derefWriteWithLayouts_single`), still with unique-write
+permission. -/
+theorem single_borrow_trusted_write_connected :
+    evalStmt singleState singleStmt =
+        MirStepNode.step
+          { frame := { blockIdx := 0, stmtIdx := 1, locals := singleLocals.set 0 (.init backingS) }
+            memory := { borrows := singleBorrowsAfter } } ∧
+      encodeUntypedValueToBytes defaultCodecFuel backingS =
+        some (ByteLensCodec.encodeElems ByteLensCodec.u32LE (xs4.set 2 (u 30))) ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE singleBorrowsAfter 77 wide4 (xs4.set 2 (u 30))
+        (ByteLensCodec.encodeElems ByteLensCodec.u32LE (xs4.set 2 (u 30))) ∧
+      (lookupBorrow singleBorrowsAfter 77).map BorrowEntry.perm = some .unique := by
+  refine ⟨rfl, rfl, ?_, rfl⟩
+  have hTight : TightBorrowRange slBorrows 77 wide4 4 := by
+    intro e hlk
+    cases Option.some.inj hlk
+    exact ⟨rfl, rfl, by decide⟩
+  exact ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single [] emptyLayoutTable singleLocals
+    singleDst [.constantIndex 2 0 false] singleFat ⟨77, 0⟩ rfl rfl rfl mutLens hTight (i := 2)
+    (by decide) (u 30) rfl
+
+/-- 32-bit edge case (trusted-semantics observation, no trusted edit): the trusted
+`writePlaceValue` accepts only 8-byte fat pointers, so on a 32-bit target the element write
+`(*_5)[1] = 20u32` through a live child `&mut [u32]` (4-byte words) is `.ub`, while the same
+write through the 64-bit fat pointer succeeds. -/
+theorem writePlaceValue_32bit_fat_ptr_ub :
+    writePlaceValue
+        (liveChildLocals.set 5 (.init (WidePtrVal.toValue 4 (WidePtrVal.mk ⟨78, 0⟩ 2))))
+        splitChildBorrows derefDstL (.scalar ⟨20, 4⟩) [] layouts32 = .ub ∧
+      writePlaceValue liveChildLocals splitChildBorrows derefDstL (.scalar ⟨20, 4⟩) []
+          emptyLayoutTable =
+        .ok (liveChildLocals.set 0 (.init backingL)) :=
+  ⟨rfl, rfl⟩
+
 /-- Negative: replaying the right write on the *pre-split* table, where `79` has no entry,
 leaves the borrow table untouched (`invalidateDerefWriteBorrowsWithLayouts` is the identity
 without a writer entry), so the root never sees a child access through an unknown tag. -/
