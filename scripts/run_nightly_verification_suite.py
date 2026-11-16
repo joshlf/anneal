@@ -1163,7 +1163,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
         "switch_to_pass_criterion": "When the call-site or callee ABI cannot unwind, rewrite the inherited saved caller's returnUnwind to .unreachable in enterTailCalleeFrame (Miri initStackFrame, Call.lean:261-264), so tailCall_leanMiri_nounwind_callee's `↔ u = ur` collapses to unconditional shape agreement.",
-        "summary": "A tail call into a non-unwinding (e.g. extern \"C\") callee keeps the tail-caller's inherited unwind action in Anneal, whereas Miri forces it to Unreachable: an unwind out of the callee is UB in Miri but follows the original cleanup/continue action in Anneal.",
+        "summary": "A tail call into a non-unwinding (e.g. extern \"C\") callee keeps the tail-caller's inherited unwind action in Anneal, whereas Miri forces it to Unreachable: an UnwindResume out of the callee is UB in Miri for every inherited action but resumes the caller's cleanup block, aborts, or keeps unwinding in Anneal (two-sided verdict table: tailCall_leanMiri_unwind_verdicts).",
     },
     {
         "id": "DIV-TR-OPAQUECAST-ROOT-DISPATCH",

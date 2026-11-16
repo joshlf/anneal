@@ -516,6 +516,17 @@ class ManifestTests(AuditFixtureTestCase):
         tracked = audit.run_audit(self.base)["checks"]["c_variant_manifest"]["details"]["tracked_divergences"]
         self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", tracked)
 
+    def test_divergence_theorem_outside_the_manifest_is_rejected(self) -> None:
+        # Neither in the manifest (so not non-vacuity-audited) nor trackable in Pillar 3.
+        self.edit(CORR, "def tailCallTerm", "theorem tail_hidden_divergence : 1 = 1 := rfl\n\ndef tailCallTerm")
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(
+            report,
+            "c_variant_manifest",
+            "divergence theorem `tail_hidden_divergence` is declared but is not a manifest theorem",
+        )
+
 
 class HygieneTests(AuditFixtureTestCase):
     def test_sorry_in_code_is_rejected_but_not_in_comments_or_strings(self) -> None:

@@ -431,6 +431,21 @@ REQUIRED_SOURCE_ANCHORS: tuple[tuple[str, str], ...] = (
         'throw (.undefinedBehavior "calling a function with more arguments than it expected")',
     ),
     ("lean-miri/vendor/Miri/Interpreter/Call.lean", 'throw (.undefinedBehavior "AbiMismatchReturn")'),
+    # `initStackFrame` checks / nounwind continuation rewrite and the `UnwindResume` path that the
+    # tail-call transcription (`LeanMiri.CallChecks`, `LeanMiri.unwindResume`) relies on.
+    (
+        "lean-miri/vendor/Miri/Interpreter/Call.lean",
+        'throw (.undefinedBehavior "caller/callee #[track_caller] mismatch")',
+    ),
+    ("lean-miri/vendor/Miri/Interpreter/Call.lean", "| .goto ret _ => .goto ret .Unreachable"),
+    (
+        "lean-miri/vendor/Miri/Interpreter/ControlFlow.lean",
+        "if unwinding then return unwindToBlock hooks choice unwind state",
+    ),
+    (
+        "lean-miri/vendor/Miri/Interpreter/ControlFlow.lean",
+        'return (state, .error (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))',
+    ),
     (
         "lean-miri/vendor/Miri/Interpreter/Projection.lean",
         '| .OpaqueCast _ => throw (.invariant "OpaqueCast after borrowck")',
@@ -1167,6 +1182,13 @@ class _Audit:
                         unlisted.append(literal)
         for literal in unlisted:
             res.errors.append(f"{rel}: the run_cmd audit names theorem `{literal}`, which no @mir-variant-coverage line lists")
+        # A divergence theorem outside the manifest would escape both the run_cmd non-vacuity audit
+        # and the Pillar 3 registry cross-check below.
+        for d in decls:
+            if d.kind == "theorem" and "diverge" in d.written_name.lower() and d.written_name not in manifest_names:
+                res.errors.append(
+                    f"{rel}: divergence theorem `{d.written_name}` is declared but is not a manifest theorem"
+                )
         # Divergences documented here must surface in the nightly suite's Pillar 3 registry, and every
         # registry witness pointing at this file must be a kernel-audited manifest theorem — so a
         # divergence can neither be buried in this file nor tracked against an unaudited name.
