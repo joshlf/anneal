@@ -1171,13 +1171,25 @@ class _Audit:
         # registry witness pointing at this file must be a kernel-audited manifest theorem — so a
         # divergence can neither be buried in this file nor tracked against an unaudited name.
         tracked_here: dict[str, str] = {}
+        seen_ids: set[str] = set()
         tracked = getattr(self.suite, "TRACKED_CORRESPONDENCE_DIVERGENCES", None) if self.suite is not None else None
         if not isinstance(tracked, list):
             res.errors.append(f"{SUITE_RELPATH}: TRACKED_CORRESPONDENCE_DIVERGENCES is missing")
         else:
             for item in tracked:
-                if isinstance(item, dict) and item.get("file") == rel:
-                    tracked_here[str(item.get("witness_symbol", ""))] = str(item.get("id", "?"))
+                if not isinstance(item, dict):
+                    continue
+                div_id = str(item.get("id", "?"))
+                if div_id in seen_ids:
+                    res.errors.append(f"{SUITE_RELPATH}: duplicate divergence id `{div_id}` in TRACKED_CORRESPONDENCE_DIVERGENCES")
+                seen_ids.add(div_id)
+                if item.get("file") == rel:
+                    sym = str(item.get("witness_symbol", ""))
+                    if sym in tracked_here:
+                        res.errors.append(
+                            f"{SUITE_RELPATH}: duplicate divergence witness `{sym}` ({tracked_here[sym]} and {div_id})"
+                        )
+                    tracked_here[sym] = div_id
             for sym, div_id in sorted(tracked_here.items()):
                 if sym not in manifest_names:
                     res.errors.append(

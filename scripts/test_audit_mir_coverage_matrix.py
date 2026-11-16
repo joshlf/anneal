@@ -505,6 +505,14 @@ class ManifestTests(AuditFixtureTestCase):
         self.assert_only_failures(report, {"c_variant_manifest"})
         self.assert_error(report, "c_variant_manifest", "divergence theorem `tail_arity_divergence` is not tracked")
         self.assert_error(report, "c_variant_manifest", "witness `tail_negative_arity` is not a manifest theorem")
+        # Duplicate divergence id or witness_symbol in TRACKED_CORRESPONDENCE_DIVERGENCES must also fail closed.
+        self.edit(CORR, "tail_arity_divergence", "tail_negative_arity", count=-1)
+        self.edit(SUITE, '"id": "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"', '"id": "MODEL-LM-TAILCALL-MODULAR-ROOT"')
+        self.edit(SUITE, '"witness_symbol": "tail_negative_arity"', '"witness_symbol": "tail_negative_root"')
+        report = self.run_checks()
+        self.assert_only_failures(report, {"c_variant_manifest"})
+        self.assert_error(report, "c_variant_manifest", "duplicate divergence id `MODEL-LM-TAILCALL-MODULAR-ROOT`")
+        self.assert_error(report, "c_variant_manifest", "duplicate divergence witness `tail_negative_root`")
         tracked = audit.run_audit(self.base)["checks"]["c_variant_manifest"]["details"]["tracked_divergences"]
         self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", tracked)
 

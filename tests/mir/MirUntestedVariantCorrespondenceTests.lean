@@ -1498,8 +1498,11 @@ call-site or the callee ABI cannot unwind, Miri forces the inherited continuatio
 action to `Unreachable` (`ur`), whereas Trusted's tail call keeps the saved caller's
 `returnUnwind`. The stack shapes stay related *exactly* when the inherited action already
 was `ur` (e.g. rustc emitted `UnwindAction::Unreachable` at the original call); otherwise
-an unwind out of the non-unwinding callee is UB in Miri but follows the original action in
-Trusted. -/
+an unwind (`UnwindResume`) out of the non-unwinding callee under a nested caller
+`s.memory.callStack = caller :: rest` faults with `MirStepNode.fail .ub` in Trusted when
+`u = .unreachable`, but steps to `cleanupBb` (`≠ MirStepNode.fail .ub`) when
+`u = .cleanup cleanupBb` and halts with `.abort` (`≠ MirStepNode.fail .ub`) when
+`u = .terminate`. -/
 theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value)
     (rootCont : LeanMiri.ReturnContinuation UnwindAction)
@@ -1509,7 +1512,21 @@ theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
     ∃ m', LeanMiri.evalTailCallTerminator callee n n m { nounwindAs := some ur } = .ok m' ∧
       (∃ f, m'.frames.getLast? = some f ∧ f.returnContinuation = .goto ret ur) ∧
       (StackShapeRel rootCont (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack
-          m' ↔ u = ur) := by
+          m' ↔ u = ur) ∧
+      (∀ (caller : SavedCallerFrame) (rest : List SavedCallerFrame) (f : StackFrame)
+          (span : String) (cb : Option CapturedMir),
+        s.memory.callStack = caller :: rest →
+        (u = .unreachable →
+          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+            ⟨.unwindResume, span⟩ cb = MirStepNode.fail .ub) ∧
+        (∀ cleanupBb : BasicBlockIdx, u = .cleanup cleanupBb →
+          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+            ⟨.unwindResume, span⟩ cb ≠ MirStepNode.fail .ub) ∧
+        (u = .terminate →
+          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+            ⟨.unwindResume, span⟩ cb = MirStepNode.retOutcome .abort ∧
+          evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+            ⟨.unwindResume, span⟩ cb ≠ MirStepNode.fail .ub)) := by
   obtain ⟨init, last, hfr, hlast, hmap⟩ := shape_last hrel
   rw [hact] at hlast hmap
   let newF : LeanMiri.Frame B P UnwindAction :=
@@ -1517,7 +1534,7 @@ theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
       location := .mir ⟨0, 0⟩ }
   have hpass : LeanMiri.passArgsError (fun _ => true) n 0 n = none :=
     passArgsError_all_ok _ n n 0 (by omega) (fun _ _ _ => rfl)
-  refine ⟨{ m with frames := init ++ [newF] }, ?_, ⟨newF, by simp, rfl⟩, ?_⟩
+  refine ⟨{ m with frames := init ++ [newF] }, ?_, ⟨newF, by simp, rfl⟩, ?_, ?_⟩
   · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr,
       List.getLast?_concat, hlast, hpass, Nat.lt_irrefl, ite_false, List.dropLast_concat]
     simp [newF]
@@ -1533,6 +1550,22 @@ theorem tailCall_leanMiri_nounwind_callee {B P M : Type}
     · intro h
       subst h
       rfl
+  · intro caller rest f span cb hcs
+    have hu : caller.returnUnwind = u := by
+      rw [hcs, activeCont, contOfCaller] at hact
+      injection hact
+    refine ⟨?_, ?_, ?_⟩
+    · intro hur
+      simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hur]
+    · intro cleanupBb hcl hbad
+      simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hcl,
+        MirStepNode.step, MirStepNode.fail] at hbad
+    · intro hterm
+      refine ⟨?_, ?_⟩
+      · simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hterm]
+      · intro hbad
+        simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, hterm,
+          MirStepNode.retOutcome, MirStepNode.fail] at hbad
 
 /-- **ABI mismatch correspondence (universal).** For an indirect tail call through a
 registered function pointer whose reified calling convention `sigAbi` differs from the
@@ -2213,15 +2246,17 @@ theorem opaqueCast_trusted_write_and_borrow_universal
       exact hres
     exact ⟨heq, by rw [heq, stripTransparentProjections]⟩
 
-/-- **Trusted place read/write with declarations (universal).** For any declaration table
-(the one `stepMirFn` passes) and any active-protector list, a read or write
-(`evalPlaceRead`, `writePlaceValue`, `evalPlaceWrite`) through `(_l as T).e.r` (`e` not a
-dereference) agrees with the cast-free place `_l.e.r` whenever neither place touches a union
-and the cast does not change the validation types (`placeTy` / `placeTyResolved` agree, e.g.
-when `T` is the declared type or the next projection fixes the type) — with a non-deref tail
-`e :: r`, the type switch is the only way an opaque cast is observable at a place
-(`opaqueCast_witness_type_switch`); a *bare* `(_l as T)` place is additionally observable
-through Trusted's root-vs-projected dispatch (`opaqueCast_trusted_root_dispatch_divergence`). -/
+/-- **Trusted place read/write and initialized `.assign` with declarations (universal).** For
+any declaration table (the one `stepMirFn` passes) and any active-protector list, a read or
+write (`evalPlaceRead`, `writePlaceValue`, `evalPlaceWrite`, and `evalStmt` on
+`StatementKind.assign` into an initialized local `get? locals₁ l = some (.init rootVal)`)
+through `(_l as T).e.r` (`e` not a dereference) agrees with the cast-free place `_l.e.r`
+whenever neither place touches a union and the cast does not change the validation types
+(`placeTy` / `placeTyResolved` agree, e.g. when `T` is the declared type or the next
+projection fixes the type). On an *uninitialized* local (`get? locals₁ l = some .uninit`),
+or at a *bare* `(_l as T)` place, Trusted's root-vs-projected dispatch and
+`uninitFieldWriteShell?` introduce additional divergences documented in
+`opaqueCast_trusted_root_dispatch_divergence`. -/
 theorem opaqueCast_trusted_place_rw_with_decls
     (locals : List LocalSlot) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot) (decls : List LocalDecl)
@@ -2239,32 +2274,54 @@ theorem opaqueCast_trusted_place_rw_with_decls
         writePlaceValue locals borrows ⟨l, e :: r⟩ val decls layouts ∧
       evalPlaceWrite locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val activeProtectors decls
           layouts =
-        evalPlaceWrite locals borrows ⟨l, e :: r⟩ val activeProtectors decls layouts := by
+        evalPlaceWrite locals borrows ⟨l, e :: r⟩ val activeProtectors decls layouts ∧
+      (∀ (s : MachineState) (rv : Rvalue) (span : String) (locals₁ : List LocalSlot)
+          (mem₁ : Memory) (rootVal : Value),
+        evalRvalue s.frame.locals rv s.memory decls layouts = .ok val locals₁ mem₁ →
+        get? locals₁ l = some (.init rootVal) →
+        evalStmt s ⟨.assign ⟨l, .opaqueCast t :: e :: r⟩ rv, span⟩ decls layouts =
+          evalStmt s ⟨.assign ⟨l, e :: r⟩ rv, span⟩ decls layouts) := by
   have hread : ∀ v, readProjectedValue locals v (.opaqueCast t :: e :: r) =
       readProjectedValue locals v (e :: r) := fun v =>
     (opaqueCast_trusted_traversal_universal locals v v t (e :: r)).1
-  have hwrite : ∀ v, writeProjectedValue locals v (.opaqueCast t :: e :: r) val =
-      writeProjectedValue locals v (e :: r) val := fun v =>
-    (opaqueCast_trusted_traversal_universal locals v val t (e :: r)).2.1
-  have hprot : ∀ (ps : List Nat) (q : List ProjectionElem),
-      hasProtectedWriteConflict borrows ps l none (.opaqueCast t :: q) =
-        hasProtectedWriteConflict borrows ps l none q := by
-    intro ps q
-    induction borrows with
+  have hwrite : ∀ (ls : List LocalSlot) (v : Value),
+      writeProjectedValue ls v (.opaqueCast t :: e :: r) val =
+        writeProjectedValue ls v (e :: r) val := fun ls v =>
+    (opaqueCast_trusted_traversal_universal ls v val t (e :: r)).2.1
+  have hprot : ∀ (bs : List BorrowEntry) (ps : List Nat) (q : List ProjectionElem),
+      hasProtectedWriteConflict bs ps l none (.opaqueCast t :: q) =
+        hasProtectedWriteConflict bs ps l none q := by
+    intro bs ps q
+    induction bs with
     | nil => rfl
     | cons b bs ih =>
       simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap,
         stripTransparentProjections, ih]
-  have hres_er :
-      (match resolveBorrowProjectionElems locals (.opaqueCast t :: e :: r) with
+  have hinv : ∀ (bs : List BorrowEntry) (q : List ProjectionElem),
+      invalidateConflictingBorrowsAtProj bs l none (.opaqueCast t :: q) =
+        invalidateConflictingBorrowsAtProj bs l none q := by
+    intro bs q
+    induction bs with
+    | nil => rfl
+    | cons b bs ih =>
+      simp only [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj,
+        borrowEntryOverlapsWrite, projectionsOverlap, stripTransparentProjections, ih]
+  have hres_er : ∀ (ls : List LocalSlot),
+      (match resolveBorrowProjectionElems ls (.opaqueCast t :: e :: r) with
        | some rp => rp
        | none => .opaqueCast t :: e :: r) =
       .opaqueCast t ::
-        (match resolveBorrowProjectionElems locals (e :: r) with
+        (match resolveBorrowProjectionElems ls (e :: r) with
          | some rp => rp
          | none => e :: r) := by
+    intro ls
     simp only [resolveBorrowProjectionElems]
-    cases resolveBorrowProjectionElems locals (e :: r) <;> rfl
+    cases resolveBorrowProjectionElems ls (e :: r) <;> rfl
+  have hwfl : ∀ (ls : List LocalSlot) (v : Value),
+      writeProjectedForLocal ls decls layouts l v (.opaqueCast t :: e :: r) val =
+        writeProjectedForLocal ls decls layouts l v (e :: r) val := by
+    intro ls v
+    simp only [writeProjectedForLocal, hu, hu', hwrite]
   have hwv :
       writePlaceValue locals borrows ⟨l, .opaqueCast t :: e :: r⟩ val decls layouts =
         writePlaceValue locals borrows ⟨l, e :: r⟩ val decls layouts := by
@@ -2273,7 +2330,7 @@ theorem opaqueCast_trusted_place_rw_with_decls
     | _ =>
       cases decls <;>
         simp only [writePlaceValue, writeProjectedForLocal, hu, hu', hty, hwrite]
-  refine ⟨?_, hwv, ?_⟩
+  refine ⟨?_, hwv, ?_, ?_⟩
   · cases e with
     | deref => exact absurd rfl (hnd r)
     | _ =>
@@ -2299,6 +2356,20 @@ theorem opaqueCast_trusted_place_rw_with_decls
            | true => PlaceWriteResult.ub
            | false => writePlaceValue locals borrows ⟨l, _ :: r⟩ val decls layouts)
         rw [hres_er, hprot, hwv]
+  · intro s rv span locals₁ mem₁ rootVal hrv hinit
+    have hens : ensureNestedFieldShells rootVal (.opaqueCast t :: e :: r) =
+        ensureNestedFieldShells rootVal (e :: r) := by
+      cases rootVal <;> rfl
+    have hrlp : resolveBorrowWriteLocalProj decls layouts locals₁ l (.opaqueCast t :: e :: r) =
+        .opaqueCast t :: resolveBorrowWriteLocalProj decls layouts locals₁ l (e :: r) := by
+      rw [resolveBorrowWriteLocalProj_of_not_union decls layouts locals₁ l
+            (.opaqueCast t :: e :: r) hu,
+          resolveBorrowWriteLocalProj_of_not_union decls layouts locals₁ l (e :: r) hu']
+      exact hres_er locals₁
+    cases e with
+    | deref => exact absurd rfl (hnd r)
+    | _ =>
+      simp only [evalStmt, hrv, hinit, hens, hwfl, hrlp, hinv, hprot]
 
 private theorem projectionHasDeref_erase : ∀ p : List ProjectionElem,
     projectionHasDeref (eraseOpaqueCasts p) = projectionHasDeref p
@@ -2373,20 +2444,24 @@ private theorem set?_get?_self {α : Type} {xs : List α} {i : Nat} {x : α} (y 
       cases h
   exact ⟨by simp [set?, hlt], by simp [get?, hlt]⟩
 
-/-- **Trusted root-dispatch divergence (universal; documented, latent).** Trusted dispatches
-on the *raw* projection list (`[]` vs `proj :: rest`) before any opaque cast is looked at,
-so a place whose projection is exactly `[.opaqueCast t]` takes the *projected* path while
-its post-borrowck erasure `_l` takes the *root* path. With no declarations at all (so no
-validation type exists and this is **not** the type switch of
-`opaqueCast_witness_type_switch`), the two differ observably:
+/-- **Trusted root-dispatch and `.uninit` shell divergence (universal; documented, latent).**
+Trusted dispatches on the *raw* projection list (`[]` vs `proj :: rest`) before any opaque
+cast is looked at, and `uninitFieldWriteShell?` matches only on `proj = .field fieldIdx fieldTy`
+without stripping a leading `.opaqueCast`. With no type switch involved, opaque-cast places
+differ observably from their post-borrowck erasure:
 * `move (_l as T)` yields `v` and keeps `_l` initialized; `move _l` de-initializes `_l`;
-* `(_l as T) = val` on an uninitialized `_l` is UB; `_l = val` initializes `_l`;
-* `Deinit((_l as T))` only read-checks `_l` (still `.init v`); `Deinit(_l)` de-initializes it.
-Hence Trusted does **not** commute with opaque-cast erasure at a bare-cast place; the
-universal agreement (`opaqueCast_trusted_place_rw_with_decls`, `placeMention` above) needs a
-non-deref tail `e :: r`. Unreachable for captured bodies (`MirPhase::Runtime` forbids
-`OpaqueCast`, `opaqueCast_leanMiri_phase_boundary`); tracked as `DIV-TR-OPAQUECAST-ROOT-DISPATCH`
-in `scripts/run_nightly_verification_suite.py`. -/
+* `writePlaceValue` and `evalStmt` on `StatementKind.assign ⟨l, .opaqueCast t :: rest⟩ rv`
+  into an uninitialized `_l` fault with `.ub` / `MirStepNode.fail .ub` for *every* tail `rest`
+  (because `uninitFieldWriteShell?` returns `none` on `.opaqueCast`), whereas `_l = rv`
+  (`rest = []`) initializes `_l` (`≠ MirStepNode.fail .ub`) and `_l.f = rv`
+  (`rest = [.field i ft]` on a tuple/ADT local) materializes the aggregate shell and writes
+  field `i`;
+* `Deinit((_l as T))` only read-checks `_l` (still `.init v`); `Deinit(_l)` de-initializes it
+  (whereas `SetDiscriminant((_l as T), vIdx)` on an initialized aggregate with `decls = []`
+  agrees with `SetDiscriminant(_l, vIdx)`).
+Unreachable for captured bodies (`MirPhase::Runtime` forbids `OpaqueCast`,
+`opaqueCast_leanMiri_phase_boundary`); tracked as `DIV-TR-OPAQUECAST-ROOT-DISPATCH` in
+`scripts/run_nightly_verification_suite.py`. -/
 theorem opaqueCast_trusted_root_dispatch_divergence
     (locals : List LocalSlot) (borrows : List BorrowEntry) (layouts : LayoutTable)
     (l : Nat) (t : Ty) (v val : Value) :
@@ -2400,6 +2475,20 @@ theorem opaqueCast_trusted_root_dispatch_divergence
       ∃ locals', set? locals l (.init val) = some locals' ∧ get? locals' l = some (.init val) ∧
         writePlaceValue locals borrows ⟨l, [.opaqueCast t]⟩ val = .ub ∧
         writePlaceValue locals borrows ⟨l, []⟩ val = .ok locals') ∧
+    (∀ (s : MachineState) (decls : List LocalDecl) (rv : Rvalue) (span : String)
+        (locals₁ : List LocalSlot) (mem₁ : Memory),
+      evalRvalue s.frame.locals rv s.memory decls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ l = some .uninit →
+      (∀ rest : List ProjectionElem,
+        evalStmt s ⟨.assign ⟨l, .opaqueCast t :: rest⟩ rv, span⟩ decls layouts =
+          MirStepNode.fail .ub) ∧
+      (mem₁.activeProtectors = [] →
+        ∃ locals₂, set? locals₁ l (.init val) = some locals₂ ∧
+          evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts =
+            MirStepNode.step (advanceStmt s locals₂
+              { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows l none }) ∧
+          evalStmt s ⟨.assign ⟨l, [.opaqueCast t]⟩ rv, span⟩ decls layouts ≠
+            evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts)) ∧
     (∀ (s : MachineState) (decls : List LocalDecl) (span : String),
       get? s.frame.locals l = some (.init v) →
       ∃ locals', set? s.frame.locals l .uninit = some locals' ∧ get? locals' l = some .uninit ∧
@@ -2408,11 +2497,15 @@ theorem opaqueCast_trusted_root_dispatch_divergence
         evalStmt s ⟨.deinit ⟨l, []⟩, span⟩ decls layouts =
           MirStepNode.step (advanceStmt s locals') ∧
         evalStmt s ⟨.deinit ⟨l, [.opaqueCast t]⟩, span⟩ decls layouts ≠
-          evalStmt s ⟨.deinit ⟨l, []⟩, span⟩ decls layouts) := by
+          evalStmt s ⟨.deinit ⟨l, []⟩, span⟩ decls layouts) ∧
+    (∀ (s : MachineState) (oldVi vIdx : VariantIdx) (fields : List Value) (span : String),
+      get? s.frame.locals l = some (.init (.aggregate oldVi fields)) →
+      evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ [] layouts =
+        evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ [] layouts) := by
   have hrd : ∀ (ls : List LocalSlot) (w : Value),
       readProjectedValue ls w [.opaqueCast t] = .ok w := fun ls w =>
     (opaqueCast_trusted_traversal_universal ls w w t []).1.trans (by cases w <;> rfl)
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hv
     obtain ⟨hset, hget⟩ := set?_get?_self LocalSlot.uninit hv
     have hmo : evalOperand locals (.move ⟨l, [.opaqueCast t]⟩) borrows [] layouts =
@@ -2432,6 +2525,22 @@ theorem opaqueCast_trusted_root_dispatch_divergence
     refine ⟨_, hset, hget, ?_, ?_⟩
     · simp only [writePlaceValue, hu]
     · simp only [writePlaceValue, hu, hset]
+  · intro s decls rv span locals₁ mem₁ hrv hu
+    have hub : ∀ rest : List ProjectionElem,
+        evalStmt s ⟨.assign ⟨l, .opaqueCast t :: rest⟩ rv, span⟩ decls layouts =
+          MirStepNode.fail .ub := by
+      intro rest
+      simp only [evalStmt, hrv, hu, uninitFieldWriteShell?]
+    refine ⟨hub, fun hprot => ?_⟩
+    obtain ⟨hset, _⟩ := set?_get?_self (LocalSlot.init val) hu
+    have hstep : evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts =
+        MirStepNode.step (advanceStmt s (locals₁.set l (.init val))
+          { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows l none }) := by
+      simp only [evalStmt, hrv, hu, hset, hprot]
+    refine ⟨_, hset, hstep, ?_⟩
+    rw [hub [], hstep]
+    intro h
+    simp [MirStepNode.fail, MirStepNode.step] at h
   · intro s decls span hv
     obtain ⟨hset, hget⟩ := set?_get?_self LocalSlot.uninit hv
     have hdo : evalStmt s ⟨.deinit ⟨l, [.opaqueCast t]⟩, span⟩ decls layouts =
@@ -2449,6 +2558,14 @@ theorem opaqueCast_trusted_root_dispatch_divergence
     simp only [MirStepNode.step, advanceStmt, Option.some.injEq] at hl
     rw [← hl, hv] at hget
     cases hget
+  · intro s oldVi vIdx fields span hv
+    obtain ⟨hset, _⟩ := set?_get?_self (LocalSlot.init (.aggregate vIdx fields)) hv
+    have hw : writeProjectedValue s.frame.locals (.aggregate oldVi fields) [.opaqueCast t]
+        (.aggregate vIdx fields) = .ok (.aggregate vIdx fields) :=
+      (opaqueCast_trusted_traversal_universal s.frame.locals (.aggregate oldVi fields)
+        (.aggregate vIdx fields) t []).2.1
+    simp only [evalStmt, evalOperand, hv, hrd, writePlaceValue, writeProjectedForLocal,
+      hw, hset]
 private theorem borrowProjSteps_erase : ∀ p : List ProjectionElem,
     MiniRustSpec.Correspondence.borrowProjSteps (eraseOpaqueCasts p) =
       MiniRustSpec.Correspondence.borrowProjSteps p
@@ -2631,19 +2748,32 @@ def dBody : CapturedMir := mkBody "w::d" 1 [u32Decl "_0", pairDecl] [blk [] .ret
 
 def dInit : MachineState := initMachineStateWithCallees dBody [pairVal] []
 
-/-- **Negative witness (root dispatch).** `(_0 as (u32, u32)) = p` on the uninitialized
-return place is UB while its erasure `_0 = p` initializes `_0`; `Deinit((_1 as (u32, u32)))`
+/-- **Negative witness (root dispatch and `.uninit` field shell).** `(_0 as (u32, u32)) = p`
+and `evalStmt` on `(_0 as u32) = 42` at the uninitialized return place `_0` fault with UB
+while their erasures initialize `_0`; partial field initialization `(_1 as (u32, u32)).0 = 42`
+on an uninitialized tuple `_1` faults with UB (`uninitFieldWriteShell? = none`) while
+`_1.0 = 42` materializes the tuple shell and writes field `0`; and `Deinit((_1 as (u32, u32)))`
 keeps `p` initialized while `Deinit(_1)` de-initializes it — the opaque cast is observable
 with no type switch involved (`opaqueCast_trusted_root_dispatch_divergence`). -/
 theorem opaqueCast_witness_root_dispatch :
     writePlaceValue ocLocals [] ⟨0, [.opaqueCast tyPair]⟩ pairVal = .ub ∧
       writePlaceValue ocLocals [] ⟨0, []⟩ pairVal = .ok [.init pairVal, .init pairVal] ∧
       dInit.frame.locals = ocLocals ∧
+      evalStmt dInit ⟨.assign ⟨0, [.opaqueCast tyU32]⟩ (.use (cU32 42)), "w"⟩ dBody.localDecls
+          wLayouts = MirStepNode.fail .ub ∧
+      evalStmt dInit ⟨.assign ⟨0, []⟩ (.use (cU32 42)), "w"⟩ dBody.localDecls wLayouts =
+        MirStepNode.step (advanceStmt dInit [.init (.scalar ⟨42, 4⟩), .init pairVal]) ∧
+      evalStmt { dInit with frame := { dInit.frame with locals := [.uninit, .uninit] } }
+          ⟨.assign (ocField 0) (.use (cU32 42)), "w"⟩ dBody.localDecls wLayouts =
+        MirStepNode.fail .ub ∧
+      evalStmt { dInit with frame := { dInit.frame with locals := [.uninit, .uninit] } }
+          ⟨.assign (plainField 0) (.use (cU32 42)), "w"⟩ dBody.localDecls wLayouts =
+        MirStepNode.step (advanceStmt dInit [.uninit, .init (.aggregate 0 [.scalar ⟨42, 4⟩])]) ∧
       evalStmt dInit ⟨.deinit ⟨1, [.opaqueCast tyPair]⟩, "w"⟩ dBody.localDecls wLayouts =
         MirStepNode.step (advanceStmt dInit ocLocals) ∧
       evalStmt dInit ⟨.deinit ⟨1, []⟩, "w"⟩ dBody.localDecls wLayouts =
         MirStepNode.step (advanceStmt dInit [.uninit, .uninit]) :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Negative witnesses.** An opaque cast never masks UB: projecting a missing field
 through it, or reading through it from an uninitialized or dead local, is UB exactly as

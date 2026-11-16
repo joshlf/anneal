@@ -838,6 +838,28 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             )
             self.assertIsNone(suite._lean_header_imports(Path(tmp) / "missing.lean"))
 
+    def test_discover_correspondence_divergences_ignores_commented_out_witness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / UNTESTED_VARIANT_TEST
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "-- theorem tailCall_leanMiri_nounwind_callee : True := trivial\n"
+                "/- theorem opaqueCast_trusted_root_dispatch_divergence : True := trivial -/\n"
+                "theorem tailCall_leanMiri_root_stop_diverges : True := trivial\n",
+                encoding="utf-8",
+            )
+            divs = suite.discover_correspondence_divergences(root)
+            resolved_ids = {d["id"] for d in divs["resolved_correspondence_divergences"]}
+            open_ids = {d["id"] for d in divs["actionable_anneal_bugs"]}
+            self.assertIn("DIV-LM-TAILCALL-NOUNWIND-UNWIND", resolved_ids)
+            self.assertIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", resolved_ids)
+            self.assertNotIn("DIV-LM-TAILCALL-NOUNWIND-UNWIND", open_ids)
+            self.assertNotIn("DIV-TR-OPAQUECAST-ROOT-DISPATCH", open_ids)
+            by_id = {d["id"]: d for d in divs["intentional_modeling_choices"]}
+            self.assertTrue(by_id["MODEL-LM-TAILCALL-MODULAR-ROOT"]["live_in_source"])
+            self.assertFalse(by_id["MODEL-LM-TAILCALL-DIRECT-ARITY-STEP"]["live_in_source"])
+
     def test_terminate_step_grants_grace_window_to_same_group_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "cleaned"

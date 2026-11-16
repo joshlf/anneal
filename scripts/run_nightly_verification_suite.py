@@ -1173,8 +1173,8 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "witness_symbol": "opaqueCast_trusted_root_dispatch_divergence",
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
-        "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, and evalStmt (.deinit), so (_l as T) behaves exactly like its post-borrowck erasure _l.",
-        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path: move keeps _l initialized, a write to an uninitialized _l is UB, and Deinit only read-checks. Latent: MirPhase::Runtime (every captured body) forbids OpaqueCast.",
+        "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, evalStmt (.assign / .deinit), and uninitFieldWriteShell?, so (_l as T) and (_l as T).f behave like their post-borrowck erasures _l and _l.f.",
+        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returns none on a leading .opaqueCast: move keeps _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) fault with UB, and Deinit only read-checks. Latent: MirPhase::Runtime forbids OpaqueCast.",
     },
     {
         "id": "MODEL-LM-TAILCALL-MODULAR-ROOT",
@@ -1212,7 +1212,7 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
         symbol = item["witness_symbol"]
         present = False
         if fpath.is_file():
-            text = fpath.read_text(encoding="utf-8", errors="replace")
+            text = _strip_lean_comments(fpath.read_text(encoding="utf-8", errors="replace"))
             present = bool(re.search(rf"\b(?:theorem|def)\s+{re.escape(symbol)}\b", text))
 
         record = dict(item)
