@@ -25117,6 +25117,378 @@ theorem TightBorrowRange.of_invalidateDerefWriteBorrows {borrows : List BorrowEn
       · exact h
     · exact h
 
+/--
+**`ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWrite_both_reassemble`**: general symbolic
+two-write `split_at_mut` reassembly theorem over `invalidateDerefWriteBorrows`. Splitting root
+`tag` at `k` (`0 < k`, `k < wide.2`, `0 < n`) into fresh child tags `tagL ≠ tagR`, executing a
+trusted deref write through `tagL` (`dstL`) and then through `tagR` (`dstR`), preserves both
+child lenses and reassembles `((xs.take k).set i vL) ++ ((xs.drop k).set j vR)` on root `tag`.
+-/
+theorem ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWrite_both_reassemble {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag tagL tagR : Nat}
+    {wide : WidePtrVal} {xs : List α} {bytes bytes₁ bytes₂ : ByteMem}
+    (locals₁ locals₂ : List LocalSlot) (dstL dstR : Place)
+    (restProjL restProjR : List ProjectionElem) (callerLocals₁ callerLocals₂ : List LocalSlot)
+    (fatL fatR : Value) (ptrL ptrR : ProvenancePtr)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    {k i j : Nat} {vL vR : α}
+    (hk0 : 0 < k) (hk : k < wide.2) (hn : 0 < n)
+    (hi : i < k) (hj : j < wide.2 - k)
+    (hNe : tagR ≠ tagL)
+    (hFreshL : lookupBorrow borrows tagL = none)
+    (hFreshR : lookupBorrow borrows tagR = none)
+    (hSlotL : get? locals₁ dstL.local_ = some (.init fatL))
+    (hExtL : extractDerefPtrVal? fatL = some ptrL) (hTagL : ptrL.tag = tagL)
+    (hSlotR : get? locals₂ dstR.local_ = some (.init fatR))
+    (hExtR : extractDerefPtrVal? fatR = some ptrR) (hTagR : ptrR.tag = tagR)
+    (hw₁ : writeTyped c (WidePtrVal.elemOffset (WidePtrVal.takeElems wide k) n i) vL bytes =
+      some bytes₁)
+    (hw₂ : writeTyped c (WidePtrVal.elemOffset (WidePtrVal.dropElems wide n k) n j) vR bytes₁ =
+      some bytes₂) :
+    ∃ entry, lookupBorrow borrows tag = some entry ∧
+      let eL := reborrowSubsliceEntry entry tagL wide.1.offsetBytes (k * n)
+      let eR := reborrowSubsliceEntry entry tagR (wide.1.offsetBytes + k * n) ((wide.2 - k) * n)
+      let borrows₀ := eR :: eL :: borrows
+      let borrows₁ := invalidateDerefWriteBorrows locals₁ borrows₀ dstL restProjL callerLocals₁
+      let borrows₂ := invalidateDerefWriteBorrows locals₂ borrows₁ dstR restProjR callerLocals₂
+      ActiveTypedSliceMutBorrow c borrows₂ tagL (WidePtrVal.takeElems wide k)
+          ((xs.take k).set i vL) bytes₂ ∧
+        ActiveTypedSliceMutBorrow c borrows₂ tagR (WidePtrVal.dropElems wide n k)
+          ((xs.drop k).set j vR) bytes₂ ∧
+        ActiveTypedSliceMutBorrow c borrows₂ tag wide
+          (((xs.take k).set i vL) ++ ((xs.drop k).set j vR)) bytes₂ := by
+  obtain ⟨entry, he, hRest⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow h (Nat.le_of_lt hk) hNe hFreshL hFreshR
+  refine ⟨entry, he, ?_⟩
+  intro eL eR borrows₀ borrows₁ borrows₂
+  obtain ⟨hL₀, hR₀, hDisj, hRoot₀, _, hDescL₀, hDescR₀⟩ := hRest
+  have hLen₀ : 2 ≤ borrows₀.length := by simp [borrows₀]
+  have hTightL₀ : TightBorrowRange borrows₀ tagL (WidePtrVal.takeElems wide k) n := by
+    intro e hlk
+    unfold lookupBorrow at hlk
+    dsimp only [borrows₀, eR, reborrowSubsliceEntry] at hlk
+    rw [nat_beq_eq_false_of_ne hNe] at hlk
+    dsimp only [lookupBorrow, eL, reborrowSubsliceEntry] at hlk
+    rw [Nat.beq_refl] at hlk
+    cases hlk
+    refine ⟨rfl, rfl, Nat.mul_pos hk0 hn⟩
+  have hTightR₀ : TightBorrowRange borrows₀ tagR (WidePtrVal.dropElems wide n k) n := by
+    intro e hlk
+    unfold lookupBorrow at hlk
+    dsimp only [borrows₀, eR, reborrowSubsliceEntry] at hlk
+    rw [Nat.beq_refl] at hlk
+    cases hlk
+    refine ⟨rfl, rfl, Nat.mul_pos (by omega) hn⟩
+  obtain ⟨hL₁, hR₁⟩ :=
+    ActiveTypedSliceMutBorrow.derefWrite_frame locals₁ dstL restProjL callerLocals₁ fatL ptrL
+      hLen₀ hSlotL hExtL hTagL hL₀ hTightL₀ (show i < (WidePtrVal.takeElems wide k).2 from hi)
+      vL hw₁ hR₀ hTightR₀ hDisj
+  have hWhole₁ : SliceTypedAt c wide (((xs.take k).set i vL) ++ xs.drop k) bytes₁ :=
+    SliceTypedAt.of_splitAt (Nat.le_of_lt hk) hL₁.1 hR₁.1
+  have hRoot₁ : ActiveTypedSliceMutBorrow c borrows₁ tag wide
+      (((xs.take k).set i vL) ++ xs.drop k) bytes₁ :=
+    ActiveTypedSliceMutBorrow.derefWrite_ancestor locals₁ dstL restProjL callerLocals₁ fatL ptrL
+      hLen₀ hSlotL hExtL hTagL hRoot₀ hDescL₀ hWhole₁
+  have hLen₁ : 2 ≤ borrows₁.length := by
+    dsimp only [borrows₁]
+    rw [invalidateDerefWriteBorrows_length _ _ _ _ _ hLen₀]
+    exact hLen₀
+  have hTightL₁ : TightBorrowRange borrows₁ tagL (WidePtrVal.takeElems wide k) n :=
+    hTightL₀.of_invalidateDerefWriteBorrows locals₁ dstL restProjL callerLocals₁ hLen₀
+  have hTightR₁ : TightBorrowRange borrows₁ tagR (WidePtrVal.dropElems wide n k) n :=
+    hTightR₀.of_invalidateDerefWriteBorrows locals₁ dstL restProjL callerLocals₁ hLen₀
+  have hDescR₁ : isBorrowDescendantOrSelf borrows₁ tagR tag = true := by
+    dsimp only [borrows₁]
+    rw [isBorrowDescendantOrSelf_invalidateDerefWriteBorrows _ _ _ _ _ hLen₀]
+    exact hDescR₀
+  obtain ⟨hR₂, hL₂⟩ :=
+    ActiveTypedSliceMutBorrow.derefWrite_frame locals₂ dstR restProjR callerLocals₂ fatR ptrR
+      hLen₁ hSlotR hExtR hTagR hR₁ hTightR₁ (show j < (WidePtrVal.dropElems wide n k).2 from hj)
+      vR hw₂ hL₁ hTightL₁ hDisj.symm
+  have hWhole₂ : SliceTypedAt c wide
+      (((xs.take k).set i vL) ++ ((xs.drop k).set j vR)) bytes₂ :=
+    SliceTypedAt.of_splitAt (Nat.le_of_lt hk) hL₂.1 hR₂.1
+  have hRoot₂ : ActiveTypedSliceMutBorrow c borrows₂ tag wide
+      (((xs.take k).set i vL) ++ ((xs.drop k).set j vR)) bytes₂ :=
+    ActiveTypedSliceMutBorrow.derefWrite_ancestor locals₂ dstR restProjR callerLocals₂ fatR ptrR
+      hLen₁ hSlotR hExtR hTagR hRoot₁ hDescR₁ hWhole₂
+  exact ⟨hL₂, hR₂, hRoot₂⟩
+
+/-! ### Ground-MIR `evalStmt` deref writes: `invalidateDerefWriteBorrowsWithLayouts` -/
+
+/--
+**`invalidateDerefWriteBorrowsWithLayouts_eq_tree`**: in `evalStmt`'s primary deref-assignment
+branch (`evalPlaceWrite = .ok locals₂`), the borrow update is
+`invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals₁ borrows dst restProj` (not
+`invalidateDerefWriteBorrows`, which is only used in the `callerLocals` fallback). On a table
+with at least two entries, it equals `invalidateTreeBorrowsAtProj` over the writer entry's own
+byte range `[entry.rangeOffset, entry.rangeOffset + entry.rangeLen)` at the union-truncated
+projection `resolveDerefBorrowWriteFullProj`.
+-/
+theorem invalidateDerefWriteBorrowsWithLayouts_eq_tree (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (dst : Place) (restProj : List ProjectionElem)
+    (fat : Value) (ptrVal : ProvenancePtr) (entry : BorrowEntry)
+    (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal)
+    (he : lookupBorrow borrows ptrVal.tag = some entry) :
+    invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj =
+      invalidateTreeBorrowsAtProj borrows borrows entry.targetLocal (some ptrVal.tag)
+        (resolveDerefBorrowWriteFullProj localDecls layouts entry.targetLocal
+          (resolveDerefWriteFullProj locals locals fat entry restProj))
+        entry.rangeOffset entry.rangeLen := by
+  match borrows, hLen, he with
+  | b₁ :: b₂ :: rest, _, he =>
+    unfold invalidateDerefWriteBorrowsWithLayouts
+    dsimp only
+    rw [hSlot]
+    dsimp only
+    rw [hExt]
+    dsimp only
+    rw [he]
+
+theorem invalidateDerefWriteBorrowsWithLayouts_eq_self_of_lookup_none
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (dst : Place) (restProj : List ProjectionElem)
+    (fat : Value) (ptrVal : ProvenancePtr)
+    (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal)
+    (hNone : lookupBorrow borrows ptrVal.tag = none) :
+    invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj =
+      borrows := by
+  match borrows, hLen, hNone with
+  | b₁ :: b₂ :: rest, _, hNone =>
+    unfold invalidateDerefWriteBorrowsWithLayouts
+    dsimp only
+    rw [hSlot]
+    dsimp only
+    rw [hExt]
+    dsimp only
+    rw [hNone]
+
+theorem invalidateDerefWriteBorrowsWithLayouts_length (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (dst : Place) (restProj : List ProjectionElem) (hLen : 2 ≤ borrows.length) :
+    (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj).length =
+      borrows.length := by
+  match borrows, hLen with
+  | b₁ :: b₂ :: rest, _ =>
+    unfold invalidateDerefWriteBorrowsWithLayouts
+    dsimp only
+    split
+    · split
+      · split
+        · exact invalidateTreeBorrowsAtProj_length _ _ _ _ _ _ _
+        · rfl
+      · rfl
+    · rfl
+
+theorem isBorrowDescendantOrSelf_invalidateDerefWriteBorrowsWithLayouts
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (dst : Place) (restProj : List ProjectionElem)
+    (hLen : 2 ≤ borrows.length) (cTag aTag : Nat) :
+    isBorrowDescendantOrSelf
+        (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj)
+        cTag aTag =
+      isBorrowDescendantOrSelf borrows cTag aTag := by
+  match borrows, hLen with
+  | b₁ :: b₂ :: rest, _ =>
+    unfold invalidateDerefWriteBorrowsWithLayouts
+    dsimp only
+    split
+    · split
+      · split
+        · exact isBorrowDescendantOrSelf_invalidateTreeBorrowsAtProj _ _ _ _ _ _ _ _ _
+        · rfl
+      · rfl
+    · rfl
+
+theorem TightBorrowRange.of_invalidateDerefWriteBorrowsWithLayouts
+    {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal} {n : Nat}
+    (h : TightBorrowRange borrows tag wide n)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (locals : List LocalSlot)
+    (dst : Place) (restProj : List ProjectionElem) (hLen : 2 ≤ borrows.length) :
+    TightBorrowRange
+      (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj)
+      tag wide n := by
+  match borrows, hLen, h with
+  | b₁ :: b₂ :: rest, _, h =>
+    unfold invalidateDerefWriteBorrowsWithLayouts
+    dsimp only
+    split
+    · split
+      · split
+        · exact h.of_invalidateTreeBorrowsAtProj _ _ _ _ _ _
+        · exact h
+      · exact h
+    · exact h
+
+/--
+**`ActiveTypedSliceMutBorrow.derefWriteWithLayouts_frame`**: writer lens update (`xs.set i v`) and
+disjoint tight sibling frame across `invalidateDerefWriteBorrowsWithLayouts` (the borrow update
+executed by `evalStmt` on dereferenced assignments).
+-/
+theorem ActiveTypedSliceMutBorrow.derefWriteWithLayouts_frame {α β : Type} {n m : Nat}
+    {c : ByteLensCodec α n} {c' : ByteLensCodec β m} {borrows : List BorrowEntry}
+    {tag tag' : Nat} {wide wide' : WidePtrVal} {xs : List α} {ys : List β}
+    {bytes bytes' : ByteMem} (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (locals : List LocalSlot) (dst : Place) (restProj : List ProjectionElem)
+    (fat : Value) (ptrVal : ProvenancePtr) (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal) (hTag : ptrVal.tag = tag)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hTight : TightBorrowRange borrows tag wide n)
+    {i : Nat} (hi : i < wide.2) (v : α)
+    (hw : writeTyped c (WidePtrVal.elemOffset wide n i) v bytes = some bytes')
+    (hSib : ActiveTypedSliceMutBorrow c' borrows tag' wide' ys bytes)
+    (hSibTight : TightBorrowRange borrows tag' wide' m)
+    (hdisj : DisjointSlice wide.1.offsetBytes (wide.2 * n) wide'.1.offsetBytes (wide'.2 * m)) :
+    ActiveTypedSliceMutBorrow c
+        (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj)
+        tag wide (xs.set i v) bytes' ∧
+      ActiveTypedSliceMutBorrow c'
+        (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj)
+        tag' wide' ys bytes' := by
+  obtain ⟨entry, he, _, _⟩ := h.2
+  obtain ⟨hOff, hLenE, hPos⟩ := hTight entry he
+  have he' : lookupBorrow borrows ptrVal.tag = some entry := by rw [hTag]; exact he
+  rw [invalidateDerefWriteBorrowsWithLayouts_eq_tree localDecls layouts locals borrows dst
+    restProj fat ptrVal entry hLen hSlot hExt he', hTag]
+  exact ActiveTypedSliceMutBorrow.write_subrange_treeBorrows_frame entry.targetLocal _
+    entry.rangeOffset entry.rangeLen h hi v hw hPos (Nat.le_of_eq hOff.symm)
+    (Nat.le_of_eq (by rw [hOff, hLenE])) hSib hSibTight hdisj
+
+/--
+**`ActiveTypedSliceMutBorrow.derefWriteWithLayouts_ancestor`**: ancestor preservation across
+`invalidateDerefWriteBorrowsWithLayouts` when a descendant `wTag` of `tag` is written.
+-/
+theorem ActiveTypedSliceMutBorrow.derefWriteWithLayouts_ancestor {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag wTag : Nat} {wide : WidePtrVal}
+    {xs xs' : List α} {bytes bytes' : ByteMem} (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (locals : List LocalSlot) (dst : Place)
+    (restProj : List ProjectionElem) (fat : Value) (ptrVal : ProvenancePtr)
+    (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal) (hTag : ptrVal.tag = wTag)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hDesc : isBorrowDescendantOrSelf borrows wTag tag = true)
+    (hs' : SliceTypedAt c wide xs' bytes') :
+    ActiveTypedSliceMutBorrow c
+      (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals borrows dst restProj)
+      tag wide xs' bytes' := by
+  cases hlk : lookupBorrow borrows ptrVal.tag with
+  | none =>
+    rw [invalidateDerefWriteBorrowsWithLayouts_eq_self_of_lookup_none localDecls layouts locals
+      borrows dst restProj fat ptrVal hLen hSlot hExt hlk]
+    obtain ⟨_, entry, he, hc, hp⟩ := h
+    exact ⟨hs', entry, he, hc, hp⟩
+  | some wEntry =>
+    rw [invalidateDerefWriteBorrowsWithLayouts_eq_tree localDecls layouts locals borrows dst
+      restProj fat ptrVal wEntry hLen hSlot hExt hlk, hTag]
+    exact ActiveTypedSliceMutBorrow.descendant_write_preserves wEntry.targetLocal _ _ _ h hDesc hs'
+
+/--
+**`ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWriteWithLayouts_both_reassemble`**: general
+symbolic two-write `split_at_mut` reassembly theorem over `invalidateDerefWriteBorrowsWithLayouts`
+(the exact borrow update performed by `evalStmt` on deref assignments).
+-/
+theorem ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWriteWithLayouts_both_reassemble
+    {α : Type} {n : Nat} {c : ByteLensCodec α n} {borrows : List BorrowEntry}
+    {tag tagL tagR : Nat} {wide : WidePtrVal} {xs : List α} {bytes bytes₁ bytes₂ : ByteMem}
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (locals₁ locals₂ : List LocalSlot) (dstL dstR : Place)
+    (restProjL restProjR : List ProjectionElem)
+    (fatL fatR : Value) (ptrL ptrR : ProvenancePtr)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    {k i j : Nat} {vL vR : α}
+    (hk0 : 0 < k) (hk : k < wide.2) (hn : 0 < n)
+    (hi : i < k) (hj : j < wide.2 - k)
+    (hNe : tagR ≠ tagL)
+    (hFreshL : lookupBorrow borrows tagL = none)
+    (hFreshR : lookupBorrow borrows tagR = none)
+    (hSlotL : get? locals₁ dstL.local_ = some (.init fatL))
+    (hExtL : extractDerefPtrVal? fatL = some ptrL) (hTagL : ptrL.tag = tagL)
+    (hSlotR : get? locals₂ dstR.local_ = some (.init fatR))
+    (hExtR : extractDerefPtrVal? fatR = some ptrR) (hTagR : ptrR.tag = tagR)
+    (hw₁ : writeTyped c (WidePtrVal.elemOffset (WidePtrVal.takeElems wide k) n i) vL bytes =
+      some bytes₁)
+    (hw₂ : writeTyped c (WidePtrVal.elemOffset (WidePtrVal.dropElems wide n k) n j) vR bytes₁ =
+      some bytes₂) :
+    ∃ entry, lookupBorrow borrows tag = some entry ∧
+      let eL := reborrowSubsliceEntry entry tagL wide.1.offsetBytes (k * n)
+      let eR := reborrowSubsliceEntry entry tagR (wide.1.offsetBytes + k * n) ((wide.2 - k) * n)
+      let borrows₀ := eR :: eL :: borrows
+      let borrows₁ :=
+        invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals₁ borrows₀ dstL restProjL
+      let borrows₂ :=
+        invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals₂ borrows₁ dstR restProjR
+      ActiveTypedSliceMutBorrow c borrows₂ tagL (WidePtrVal.takeElems wide k)
+          ((xs.take k).set i vL) bytes₂ ∧
+        ActiveTypedSliceMutBorrow c borrows₂ tagR (WidePtrVal.dropElems wide n k)
+          ((xs.drop k).set j vR) bytes₂ ∧
+        ActiveTypedSliceMutBorrow c borrows₂ tag wide
+          (((xs.take k).set i vL) ++ ((xs.drop k).set j vR)) bytes₂ := by
+  obtain ⟨entry, he, hRest⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow h (Nat.le_of_lt hk) hNe hFreshL hFreshR
+  refine ⟨entry, he, ?_⟩
+  intro eL eR borrows₀ borrows₁ borrows₂
+  obtain ⟨hL₀, hR₀, hDisj, hRoot₀, _, hDescL₀, hDescR₀⟩ := hRest
+  have hLen₀ : 2 ≤ borrows₀.length := by simp [borrows₀]
+  have hTightL₀ : TightBorrowRange borrows₀ tagL (WidePtrVal.takeElems wide k) n := by
+    intro e hlk
+    unfold lookupBorrow at hlk
+    dsimp only [borrows₀, eR, reborrowSubsliceEntry] at hlk
+    rw [nat_beq_eq_false_of_ne hNe] at hlk
+    dsimp only [lookupBorrow, eL, reborrowSubsliceEntry] at hlk
+    rw [Nat.beq_refl] at hlk
+    cases hlk
+    refine ⟨rfl, rfl, Nat.mul_pos hk0 hn⟩
+  have hTightR₀ : TightBorrowRange borrows₀ tagR (WidePtrVal.dropElems wide n k) n := by
+    intro e hlk
+    unfold lookupBorrow at hlk
+    dsimp only [borrows₀, eR, reborrowSubsliceEntry] at hlk
+    rw [Nat.beq_refl] at hlk
+    cases hlk
+    refine ⟨rfl, rfl, Nat.mul_pos (by omega) hn⟩
+  obtain ⟨hL₁, hR₁⟩ :=
+    ActiveTypedSliceMutBorrow.derefWriteWithLayouts_frame localDecls layouts locals₁ dstL
+      restProjL fatL ptrL hLen₀ hSlotL hExtL hTagL hL₀ hTightL₀
+      (show i < (WidePtrVal.takeElems wide k).2 from hi) vL hw₁ hR₀ hTightR₀ hDisj
+  have hWhole₁ : SliceTypedAt c wide (((xs.take k).set i vL) ++ xs.drop k) bytes₁ :=
+    SliceTypedAt.of_splitAt (Nat.le_of_lt hk) hL₁.1 hR₁.1
+  have hRoot₁ : ActiveTypedSliceMutBorrow c borrows₁ tag wide
+      (((xs.take k).set i vL) ++ xs.drop k) bytes₁ :=
+    ActiveTypedSliceMutBorrow.derefWriteWithLayouts_ancestor localDecls layouts locals₁ dstL
+      restProjL fatL ptrL hLen₀ hSlotL hExtL hTagL hRoot₀ hDescL₀ hWhole₁
+  have hLen₁ : 2 ≤ borrows₁.length := by
+    dsimp only [borrows₁]
+    rw [invalidateDerefWriteBorrowsWithLayouts_length _ _ _ _ _ _ hLen₀]
+    exact hLen₀
+  have hTightL₁ : TightBorrowRange borrows₁ tagL (WidePtrVal.takeElems wide k) n :=
+    hTightL₀.of_invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals₁ dstL restProjL
+      hLen₀
+  have hTightR₁ : TightBorrowRange borrows₁ tagR (WidePtrVal.dropElems wide n k) n :=
+    hTightR₀.of_invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals₁ dstL restProjL
+      hLen₀
+  have hDescR₁ : isBorrowDescendantOrSelf borrows₁ tagR tag = true := by
+    dsimp only [borrows₁]
+    rw [isBorrowDescendantOrSelf_invalidateDerefWriteBorrowsWithLayouts _ _ _ _ _ _ hLen₀]
+    exact hDescR₀
+  obtain ⟨hR₂, hL₂⟩ :=
+    ActiveTypedSliceMutBorrow.derefWriteWithLayouts_frame localDecls layouts locals₂ dstR
+      restProjR fatR ptrR hLen₁ hSlotR hExtR hTagR hR₁ hTightR₁
+      (show j < (WidePtrVal.dropElems wide n k).2 from hj) vR hw₂ hL₁ hTightL₁ hDisj.symm
+  have hWhole₂ : SliceTypedAt c wide
+      (((xs.take k).set i vL) ++ ((xs.drop k).set j vR)) bytes₂ :=
+    SliceTypedAt.of_splitAt (Nat.le_of_lt hk) hL₂.1 hR₂.1
+  have hRoot₂ : ActiveTypedSliceMutBorrow c borrows₂ tag wide
+      (((xs.take k).set i vL) ++ ((xs.drop k).set j vR)) bytes₂ :=
+    ActiveTypedSliceMutBorrow.derefWriteWithLayouts_ancestor localDecls layouts locals₂ dstR
+      restProjR fatR ptrR hLen₁ hSlotR hExtR hTagR hRoot₁ hDescR₁ hWhole₂
+  exact ⟨hL₂, hR₂, hRoot₂⟩
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses

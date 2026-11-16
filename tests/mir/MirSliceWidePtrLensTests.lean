@@ -723,50 +723,70 @@ theorem split_at_mut_trusted_deref_writes :
         (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
       ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefBorrowsLR 79
         (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 := by
-  obtain ⟨entry, he, hL, hR, hDisj, hRoot, _, hDescL, hDescR⟩ :=
-    ActiveTypedSliceMutBorrow.splitAt_reborrow mutLens (tagL := 78) (tagR := 79) (k := 2)
-      (by decide) (by decide) rfl rfl
-  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
-  subst hEntry
-  have hTightL : TightBorrowRange splitChildBorrows 78 (WidePtrVal.takeElems wide4 2) 4 := by
-    intro e hlk
-    cases Option.some.inj hlk
-    exact ⟨rfl, rfl, by decide⟩
-  have hTightR : TightBorrowRange splitChildBorrows 79 (WidePtrVal.dropElems wide4 4 2) 4 := by
-    intro e hlk
-    cases Option.some.inj hlk
-    exact ⟨rfl, rfl, by decide⟩
-  have hLen0 : 2 ≤ splitChildBorrows.length := by decide
-  obtain ⟨hL1, hR1⟩ :=
-    ActiveTypedSliceMutBorrow.derefWrite_frame childLocals derefDstL [.constantIndex 1 0 false] []
-      childFatL ⟨78, 0⟩ hLen0 rfl rfl rfl hL hTightL (i := 1) (by decide) (u 20) write1 hR hTightR
-      hDisj
-  have hRoot1 :=
-    ActiveTypedSliceMutBorrow.derefWrite_ancestor childLocals derefDstL [.constantIndex 1 0 false] []
-      childFatL ⟨78, 0⟩ hLen0 rfl rfl rfl hRoot hDescL split_left_write.2.2
-  have hLen1 : 2 ≤ derefBorrowsL.length := by
-    rw [derefBorrowsL, invalidateDerefWriteBorrows_length _ _ _ _ _ hLen0]
-    exact hLen0
-  have hTightL1 : TightBorrowRange derefBorrowsL 78 (WidePtrVal.takeElems wide4 2) 4 :=
-    hTightL.of_invalidateDerefWriteBorrows childLocals derefDstL [.constantIndex 1 0 false] []
-      hLen0
-  have hTightR1 : TightBorrowRange derefBorrowsL 79 (WidePtrVal.dropElems wide4 4 2) 4 :=
-    hTightR.of_invalidateDerefWriteBorrows childLocals derefDstL [.constantIndex 1 0 false] []
-      hLen0
-  have hDescR1 : isBorrowDescendantOrSelf derefBorrowsL 79 77 = true := by
-    rw [derefBorrowsL, isBorrowDescendantOrSelf_invalidateDerefWriteBorrows _ _ _ _ _ hLen0]
-    exact hDescR
   have hw2 : writeTyped ByteLensCodec.u32LE
       (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) (u 30) bytesW1 =
         some bytesW2 := rfl
-  obtain ⟨hR2, hL2⟩ :=
-    ActiveTypedSliceMutBorrow.derefWrite_frame childLocals derefDstR [.constantIndex 0 0 false] []
-      childFatR ⟨79, 8⟩ hLen1 rfl rfl rfl hR1 hTightR1 (i := 0) (by decide) (u 30) hw2 hL1
-      hTightL1 (Or.inr (Or.inr (Or.inr (by decide))))
-  have hRoot2 :=
-    ActiveTypedSliceMutBorrow.derefWrite_ancestor childLocals derefDstR [.constantIndex 0 0 false] []
-      childFatR ⟨79, 8⟩ hLen1 rfl rfl rfl hRoot1 hDescR1 split_right_write.2.2
+  obtain ⟨entry, he, hL2, hR2, hRoot2⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWrite_both_reassemble childLocals childLocals
+      derefDstL derefDstR [.constantIndex 1 0 false] [.constantIndex 0 0 false] [] []
+      childFatL childFatR ⟨78, 0⟩ ⟨79, 8⟩ mutLens
+      (tagL := 78) (tagR := 79) (k := 2) (i := 1) (j := 0) (vL := u 20) (vR := u 30)
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+      rfl rfl rfl rfl rfl rfl rfl rfl write1 hw2
+  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
+  subst hEntry
   exact ⟨hRoot2, hL2, hR2⟩
+
+/-- Live backing `[u32; 4]` local `_0` so `writePlaceValue` and `evalStmt` succeed on `(*_5)[1]`
+and `(*_6)[0]` (whereas `childLocals` had `_0 = .uninit`, on which `writePlaceValue` faults with
+`.ub`), paired with `invalidateDerefWriteBorrowsWithLayouts` (the borrow update `evalStmt`
+actually executes on deref assignments). -/
+def liveChildLocals : List LocalSlot :=
+  (childLocals.set 0 (.init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩])))
+
+def derefWithLayoutsBorrowsL : List BorrowEntry :=
+  invalidateDerefWriteBorrowsWithLayouts [] emptyLayoutTable liveChildLocals splitChildBorrows
+    derefDstL [.constantIndex 1 0 false]
+
+def derefWithLayoutsBorrowsLR : List BorrowEntry :=
+  invalidateDerefWriteBorrowsWithLayouts [] emptyLayoutTable liveChildLocals
+    derefWithLayoutsBorrowsL derefDstR [.constantIndex 0 0 false]
+
+theorem split_at_mut_evalStmt_withLayouts_end_to_end :
+    writePlaceValue childLocals splitChildBorrows derefDstL (.scalar ⟨20, 4⟩) = .ub ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 77 wide4
+        [u 1, u 20, u 30, u 4] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefWithLayoutsBorrowsLR 79
+        (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 ∧
+      (let s₀ : MachineState :=
+         { frame := { blockIdx := 0, stmtIdx := 0, locals := liveChildLocals }
+           memory := { borrows := splitChildBorrows } }
+       let stmtL : Statement :=
+         { kind := .assign derefDstL (.use (Anneal.MirLoops.constU32 20))
+           span := "write_left" }
+       evalStmt s₀ stmtL =
+         MirStepNode.step
+           { frame :=
+               { blockIdx := 0, stmtIdx := 1
+                 locals := liveChildLocals.set 0
+                   (.init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩])) }
+             memory := { borrows := derefWithLayoutsBorrowsL } }) := by
+  have hw2 : writeTyped ByteLensCodec.u32LE
+      (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) (u 30) bytesW1 =
+        some bytesW2 := rfl
+  obtain ⟨entry, he, hL2, hR2, hRoot2⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow_derefWriteWithLayouts_both_reassemble []
+      emptyLayoutTable liveChildLocals liveChildLocals derefDstL derefDstR
+      [.constantIndex 1 0 false] [.constantIndex 0 0 false]
+      childFatL childFatR ⟨78, 0⟩ ⟨79, 8⟩ mutLens
+      (tagL := 78) (tagR := 79) (k := 2) (i := 1) (j := 0) (vL := u 20) (vR := u 30)
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+      rfl rfl rfl rfl rfl rfl rfl rfl write1 hw2
+  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
+  subst hEntry
+  exact ⟨rfl, hRoot2, hL2, hR2, rfl⟩
 
 /-- The trusted deref write through `_5` really transitions the table (the left child's
 `.reservedFrz false` is activated to `.unique`), so the theorem above is not about an identity
@@ -1156,16 +1176,16 @@ witnesses. -/
 theorem callee_sig_and_fnptr_bridges (s : MachineState) (p : Place) :
     checkCalleeSig fullCallees "cone::helper1" [] (.uint .u32) .rust [] [] =
       checkCalleeSig (coneBodies cone1 fullCallees) "cone::helper1" [] (.uint .u32) .rust [] [] ∧
-    internFnPtr (Memory.withCalleeCtx [helper1Mir] none [] emptyMemory) "cone::helper1" [] none =
+    internFnPtr (Memory.withCalleeCtx [helper1Mir] none [] [] emptyMemory) "cone::helper1" [] none =
       (let (aid, m') := internFnPtr emptyMemory "cone::helper1" [] none
-       (aid, Memory.withCalleeCtx [helper1Mir] none [] m')) ∧
+       (aid, Memory.withCalleeCtx [helper1Mir] none [] [] m')) ∧
     isNonSelectIntrinsicOpt (classifyRustIntrinsic? "cone::helper1") = true ∧
     evalDirectRustIntrinsic? s none
         { defPath := "cone::helper1", typeArgs := [], fnSig := none, isIndirect := false }
         [] emptyLayoutTable [] [] [] p 0 .continue_ = none :=
   ⟨checkCalleeSig_nil_eq_of_findCallee_eq [] (.uint .u32) .rust []
       (cone_agree "cone::helper1" (List.Mem.head _)),
-   internFnPtr_withCalleeCtx [helper1Mir] none [] emptyMemory "cone::helper1" [] none,
+   internFnPtr_withCalleeCtx [helper1Mir] none [] [] emptyMemory "cone::helper1" [] none,
    isNonSelectIntrinsicOpt_of_eq_none rfl,
    evalDirectRustIntrinsic?_eq_none_of_classify rfl⟩
 
@@ -1320,12 +1340,121 @@ def genericCallerMir : CapturedMir :=
        isCleanup := false },
      retBlock [assignMove 0 1]]
 
-/-- Negative canary: the narrowing theorems are monomorphic. A generic call fails closed in
-`CallConeClosed` even though its definition path is in the cone; the polymorphic
-`lookupCallee` / `checkCalleeSig` agreement lemmas are standalone bridges and are not consumed
-by any narrowing theorem. -/
+/-- Negative canary for monomorphic `CallConeClosed` vs. positive polymorphic narrowing via
+`CallConeClosedPoly` (`runCfgWithCallees_cone_narrow_of_closed_poly_wf`,
+`wpMirExecSym_cone_narrow_of_closed_poly_wf`, `mirWpConverges_cone_narrow_of_closed_poly_wf`),
+plus a true generic callee `polyIdMir` (`typeParamCount = 1`) monomorphized at runtime by
+`lookupCallee` via `CapturedMir.instantiate` and a polymorphic `size_of_val::<[u32]>` intrinsic
+caller. -/
 theorem generic_call_fails_closed :
-    CallConeClosed cone1 genericCallerMir fullCallees = false := rfl
+    CallConeClosed cone1 genericCallerMir fullCallees = false ∧
+      CallConeClosedPoly cone1 genericCallerMir fullCallees = true := ⟨rfl, rfl⟩
+
+def param0Ty : Ty := { kind := .param 0 "T", layoutIdx := 0 }
+
+def polyIdMir : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "cone::polyId" 1
+      [{ mutability := .mut, ty := param0Ty, debugName := some "_0" },
+       { mutability := .not, ty := param0Ty, debugName := some "x" }]
+      [retBlock [assignMove 0 1]]) with
+    typeParamCount := 1
+    genericParams := [{ idx := 0, name := "T" }] }
+
+def polyIdCallerMir : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "cone::polyIdCaller" 0
+      [retLocal]
+      [{ statements := []
+         terminator :=
+           { kind := .call
+               (.constant { ty := { kind := .fnDef "cone::polyId" [.uint .u32], layoutIdx := 0 }
+                            val := .zeroSized })
+               [Anneal.MirLoops.constU32 42]
+               { local_ := 0, projection := [] } (some 1) .continue_
+             span := "call_poly_id" }
+         isCleanup := false },
+       retBlock []]) with
+    layouts := layouts64 }
+
+def fullPolyCallees : CalleeEnv := [polyIdMir, heavy2Mir, heavy3Mir]
+
+def conePolyId : List DefPath := ["cone::polyId"]
+
+def polySizeOfValSliceCallerMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "cone::polySizeOfValSliceCaller" 1 [usizeRetLocal, sliceArgLocal]
+    [{ statements := []
+       terminator :=
+         { kind := .call
+             (.constant { ty := { kind := .fnDef "core::intrinsics::size_of_val" [.slice (.uint .u32)]
+                                  layoutIdx := 0 }
+                          val := .zeroSized })
+             [.copy { local_ := 1, projection := [] }]
+             { local_ := 0, projection := [] } (some 1) .continue_
+           span := "call_poly_size_of_val" }
+       isCleanup := false },
+     retBlock []]
+
+theorem polymorphic_cone_narrowing_end_to_end :
+    retVal? (runCfgWithCallees 8 polyIdCallerMir [] emptyMemory fullPolyCallees) =
+      some (.scalar ⟨42, 4⟩) ∧
+    retVal? (runCfgWithCallees 8 polyIdCallerMir [] emptyMemory
+      (coneBodies conePolyId fullPolyCallees)) = some (.scalar ⟨42, 4⟩) ∧
+    runCfgWithCallees 8 polyIdCallerMir [] emptyMemory
+        (coneBodies conePolyId fullPolyCallees) =
+      (runCfgWithCallees 8 polyIdCallerMir [] emptyMemory fullPolyCallees).map
+        (MirOutcome.mapMem (Memory.withCallees (coneBodies conePolyId fullPolyCallees))) ∧
+    (wpMirExecSym 8 polyIdCallerMir
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          polyIdCallerMir [] emptyMemory (coneBodies conePolyId fullPolyCallees))) retIs42 ↔
+      wpMirExecSym 8 polyIdCallerMir
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          polyIdCallerMir [] emptyMemory fullPolyCallees)) retIs42) ∧
+    (Anneal.MirFuelFree.MirWpConverges polyIdCallerMir
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          polyIdCallerMir [] emptyMemory (coneBodies conePolyId fullPolyCallees)) retIs42 ↔
+      Anneal.MirFuelFree.MirWpConverges polyIdCallerMir
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          polyIdCallerMir [] emptyMemory fullPolyCallees) retIs42) ∧
+    retVal? (runCfgWithCallees 8 polySizeOfValSliceCallerMir [WidePtrVal.toValue 8 wide4]
+      emptyMemory fullCallees) = some (.scalar ⟨16, 8⟩) ∧
+    retVal? (runCfgWithCallees 8 polySizeOfValSliceCallerMir [WidePtrVal.toValue 8 wide4]
+      emptyMemory (coneBodies coneSizeOfVal fullCallees)) = some (.scalar ⟨16, 8⟩) ∧
+    runCfgWithCallees 8 polySizeOfValSliceCallerMir [WidePtrVal.toValue 8 wide4] emptyMemory
+        (coneBodies coneSizeOfVal fullCallees) =
+      (runCfgWithCallees 8 polySizeOfValSliceCallerMir [WidePtrVal.toValue 8 wide4] emptyMemory
+        fullCallees).map
+        (MirOutcome.mapMem (Memory.withCallees (coneBodies coneSizeOfVal fullCallees))) := by
+  have hNoTraitPoly : ∀ dp, dp ∈ conePolyId →
+      hasTraitImplForDefPath
+        (polyIdCallerMir.traitImpls ++ flatMapTraitImpls (coneBodies conePolyId fullPolyCallees))
+        dp = false := by
+    intro dp hdp
+    cases hdp with
+    | head => rfl
+    | tail _ h => cases h
+  have hNoTraitSize : ∀ dp, dp ∈ coneSizeOfVal →
+      hasTraitImplForDefPath
+        (polySizeOfValSliceCallerMir.traitImpls ++
+          flatMapTraitImpls (coneBodies coneSizeOfVal fullCallees)) dp = false := by
+    intro dp hdp
+    cases hdp with
+    | head => rfl
+    | tail _ h => cases h
+  refine ⟨rfl, rfl,
+    runCfgWithCallees_cone_narrow_of_closed_poly_wf conePolyId 8 polyIdCallerMir [] emptyMemory
+      (Or.inl (fun h => by cases h)) (Or.inl (fun h => by cases h))
+      (calleesAgreeOn_coneBodies conePolyId fullPolyCallees) rfl hNoTraitPoly rfl rfl,
+    wpMirExecSym_cone_narrow_of_closed_poly_wf conePolyId 8 polyIdCallerMir [] emptyMemory
+      (Or.inl (fun h => by cases h)) (Or.inl (fun h => by cases h))
+      (calleesAgreeOn_coneBodies conePolyId fullPolyCallees) rfl hNoTraitPoly rfl rfl
+      retIs42 (retIs42_insensitive _),
+    mirWpConverges_cone_narrow_of_closed_poly_wf conePolyId polyIdCallerMir [] emptyMemory
+      (Or.inl (fun h => by cases h)) (Or.inl (fun h => by cases h))
+      (calleesAgreeOn_coneBodies conePolyId fullPolyCallees) rfl hNoTraitPoly rfl rfl
+      retIs42 (retIs42_insensitive _),
+    rfl, rfl,
+    runCfgWithCallees_cone_narrow_of_closed_poly_wf coneSizeOfVal 8 polySizeOfValSliceCallerMir
+      [WidePtrVal.toValue 8 wide4] emptyMemory (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
+      (calleesAgreeOn_coneBodies coneSizeOfVal fullCallees) rfl hNoTraitSize rfl rfl⟩
 
 /-! ## Kernel axiom audit -/
 
@@ -1352,8 +1481,8 @@ run_cmd do
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
   for (modName, anchor, minCount) in
-      [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal, 75),
-       (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv, 145)] do
+      [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal, 85),
+       (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv, 175)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
     let some anchorRange ← findDeclarationRanges? anchor | throwError "no range for {anchor}"
