@@ -467,8 +467,8 @@ def lm23FnAbi : FnAbi :=
   Goto(bb6) -> copy ((_1 as 2).1) -> Return`;
 - `bb7`, `bb9`..`bb11`: `.uninit` `discriminant`, `.dead` `Aggregate`, `.dead`
   `Downcast` + `Field`, and `.dead` `SetDiscriminant` lockstep UB blocks;
-- `bb8`: `SetDiscriminant` on `.uninit` `_1`, where Anneal reports UB but
-  lean-miri writes the tag. -/
+- `bb8`: `SetDiscriminant` on `.uninit` `_1`, where both Anneal and
+  `lean-miri` write the tag and step in lockstep (`DIV-LM-ENUM-SET-DISCR-UNINIT`). -/
 def lm23Body : CapturedMir where
   defPath := "lm_2_3_witness::enums"
   phase := .runtimePostCleanup
@@ -525,7 +525,7 @@ def lm23Body : CapturedMir where
       { statements := [lm23DiscrStmt 2 1]
         terminator := lm23Term .return_
         isCleanup := false }
-    , -- bb8: SetDiscriminant(_1, 0) on uninit _1: Anneal UB, lean-miri steps
+    , -- bb8: SetDiscriminant(_1, 0) on uninit _1: both Anneal and lean-miri step in lockstep
       { statements := [lm23SetDiscrStmt 1 0]
         terminator := lm23Term .return_
         isCleanup := false }
@@ -2747,5 +2747,169 @@ theorem wit_lm2_3_return_enum_and_ub :
         hst_u0 lm23Ret_phase rfl rfl rfl rfl rfl
         (decl0 := lm23Decl lm23EnumTy) rfl rfl rfl hnot_imm0
     exact ⟨m_u0, mp_u0, hst_u0, hnot_imm0, ha_ub, hop_u0, humpr_u0, hm_u0⟩
+
+/-! ## 21. Witness 20: Unified `SetDiscriminant` on `.uninit` Round-Trip + Uninit Payload UB -/
+
+/-- Three-statement MIR body exercising `DIV-LM-ENUM-SET-DISCR-UNINIT` round-trip
+through `step_setDiscriminant_any_simulation`:
+1. `SetDiscriminant(_1, 1)` on `.uninit` `_1` (`Lm23Enum::V1(u32)` tag write, leaving payload `[4, 8)` uninitialized);
+2. `_2 = discriminant(_1)` reads `1_isize` in lockstep;
+3. `_3 = copy ((_1 as 1).0 : u32)` attempts to read the uninitialized `V1.0` payload field and faults with `.ub` in lockstep. -/
+def lm23SetDiscrUninitRoundTripBody : CapturedMir where
+  defPath := "lm_2_3_witness::set_discr_uninit_roundtrip"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := lm23Body.localDecls
+  basicBlocks :=
+    [ { statements :=
+          [ lm23SetDiscrStmt 1 1
+          , lm23DiscrStmt 2 1
+          , lm23DowncastReadStmt false 3 1 (some "V1") 1 0 lm23U32Ty ]
+        terminator := lm23Term .return_
+        isCleanup := false } ]
+  fnAbi := lm23FnAbi
+  layouts := lm23Layouts
+  allocations := []
+
+theorem lm23SetDiscrRT_phase : ∀ p, lm23SetDiscrUninitRoundTripBody.phase ≠ .other p := by
+  intro p h; cases h
+
+abbrev lm23SetDiscrRTHooks :=
+  annealStepHooksLM2_3 lm23SetDiscrUninitRoundTripBody.localDecls
+    lm23SetDiscrUninitRoundTripBody.layouts
+
+def lm23SetDiscrRTInitMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { lm23InitMiriFrame 0 with body := translateBody lm23SetDiscrUninitRoundTripBody }
+
+def lm23SetDiscrRTInitMiri : AnnealStepState :=
+  { stack := ⟨#[lm23SetDiscrRTInitMiriFrame]⟩, machine := AnnealMachine.empty }
+
+def lm23SetDiscrRTS1 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 1,
+               locals := [.uninit, .init (.aggregate 1 .nil), .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+def lm23SetDiscrRTS2 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 2,
+               locals := [.uninit, .init (.aggregate 1 .nil),
+                          .init (.scalar ⟨1, 8⟩), .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+theorem lm23SetDiscrRT_init_stateRel :
+    StateRelLM2_3 lm23SetDiscrUninitRoundTripBody lm23Env 1
+      (lm23InitAnneal 0) lm23SetDiscrRTInitMiri := by
+  have hsr : StateRel lm23SetDiscrUninitRoundTripBody
+      (lm23InitAnneal 0) lm23SetDiscrRTInitMiri := by
+    refine StateRel.mk lm23SetDiscrRTInitMiriFrame rfl rfl
+      ⟨translateTy lm23U64Ty lm23Layouts, rfl⟩ ?_ rfl rfl rfl rfl rfl
+      (by
+        intro i _ _ _ _ _ _ hi _
+        revert hi
+        match i with
+        | 0 | 1 | 2 | 3 | 4 => rintro ⟨⟩
+        | _ + 5 => rintro ⟨⟩)
+    refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    match i with
+    | 0 | 1 | 2 | 3 =>
+      have hs : slot = .uninit := by simpa [lm23InitAnneal, get?] using hslot.symm
+      have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [lm23SetDiscrRTInitMiriFrame, lm23InitMiriFrame] using hmls.symm
+      subst hs hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    | 4 =>
+      have hs : slot = .dead := by simpa [lm23InitAnneal, get?] using hslot.symm
+      have hm : mls = { value := .dead, layout := none } := by
+        simpa [lm23SetDiscrRTInitMiriFrame, lm23InitMiriFrame] using hmls.symm
+      subst hs hm
+      exact .dead none (fun _ h => nomatch h)
+    | _ + 5 =>
+      simp [lm23SetDiscrUninitRoundTripBody, lm23Body, get?] at hdecl
+  refine hsr.toLM2_3 lm23_env_valid ?_
+    (Or.inr (AllocIdWatermark.empty 1 (by decide)))
+  intro idx decl slot mls hdecl _ hslot tf hframes hmls
+  have htf : lm23SetDiscrRTInitMiriFrame = tf := by
+    simpa [lm23SetDiscrRTInitMiri] using hframes
+  subst htf
+  match idx with
+  | 0 | 1 | 2 | 3 =>
+    right
+    refine ⟨by simpa [lm23InitAnneal, get?] using hslot.symm, ?_⟩
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm23SetDiscrRTInitMiriFrame, lm23InitMiriFrame] using hmls.symm
+    subst hm; rfl
+  | 4 =>
+    left
+    simpa [lm23InitAnneal, get?] using hslot.symm
+  | _ + 5 =>
+    simp [lm23SetDiscrUninitRoundTripBody, lm23Body, get?] at hdecl
+
+theorem lm23SetDiscrRT_init_imm (j : Nat) :
+    IsImmediateStepLocal lm23SetDiscrRTInitMiri j := by
+  intro tf hframes mls hmls mp hv
+  have htf : lm23SetDiscrRTInitMiriFrame = tf := by
+    simpa [lm23SetDiscrRTInitMiri] using hframes
+  subst htf
+  match j with
+  | 0 | 1 | 2 | 3 | 4 =>
+    simp [lm23SetDiscrRTInitMiriFrame, lm23InitMiriFrame] at hmls
+    subst hmls; cases hv
+  | _ + 5 =>
+    simp [lm23SetDiscrRTInitMiriFrame, lm23InitMiriFrame] at hmls
+
+/-- **Witness 20 (`wit_lm2_3_setDiscriminant_uninit_roundtrip_and_payload_ub`)**:
+Chaining `step_setDiscriminant_any_simulation` (without `.uninit` exclusion) ->
+`evalRvalue_discriminant_simulation` -> `evalProjection_downcast_field_simulation`
+on `.uninit` `_1 : Lm23Enum`:
+1. `SetDiscriminant(_1, 1)` steps in lockstep to `.init (.aggregate 1 .nil)` (`lm23SetDiscrRTS1`);
+2. `_2 = discriminant(_1)` reads `1_isize` (`⟨1, 8⟩`) in lockstep (`lm23SetDiscrRTS2`);
+3. `_3 = copy ((_1 as 1).0 : u32)` traps with `.ub` in BOTH Anneal and `lean-miri`
+   because payload field `0` at `[4, 8)` remains uninitialized. -/
+theorem wit_lm2_3_setDiscriminant_uninit_roundtrip_and_payload_ub :
+    ∃ (m₁ m₂ : AnnealStepState) (msg : String),
+      stepMirFn lm23SetDiscrUninitRoundTripBody (lm23InitAnneal 0) = .step lm23SetDiscrRTS1 ∧
+      Miri.Interpreter.Step.step lm23SetDiscrRTHooks () lm23SetDiscrRTInitMiri = (m₁, .ok true) ∧
+      StateRelLM2_3 lm23SetDiscrUninitRoundTripBody lm23Env 0 lm23SetDiscrRTS1 m₁ ∧
+      stepMirFn lm23SetDiscrUninitRoundTripBody lm23SetDiscrRTS1 = .step lm23SetDiscrRTS2 ∧
+      Miri.Interpreter.Step.step lm23SetDiscrRTHooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_3 lm23SetDiscrUninitRoundTripBody lm23Env 0 lm23SetDiscrRTS2 m₂ ∧
+      stepMirFn lm23SetDiscrUninitRoundTripBody lm23SetDiscrRTS2 = .fail .ub ∧
+      (Miri.Interpreter.Step.step lm23SetDiscrRTHooks () m₂).2 =
+        .error (.undefinedBehavior msg) := by
+  have ha₁ :
+      stepMirFn lm23SetDiscrUninitRoundTripBody (lm23InitAnneal 0) =
+        .step lm23SetDiscrRTS1 := rfl
+  obtain ⟨hrel₁, himm₁_fn⟩ := step_setDiscriminant_any_simulation
+    lm23SetDiscrRT_init_stateRel lm23SetDiscrRT_phase lm23_env_valid
+    rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide)
+    (fun _ _ _ hsl _ _ => by simp [lm23InitAnneal, get?] at hsl)
+  rw [ha₁] at hrel₁
+  obtain ⟨m₁, hm₁, hst₁⟩ := stepRelLM2_3_inv_step hrel₁
+  have himm₁ : ∀ j, j ≠ 1 → IsImmediateStepLocal m₁ j := fun j hj => by
+    simpa [hm₁] using himm₁_fn j hj (lm23SetDiscrRT_init_imm j)
+  have ha₂ :
+      stepMirFn lm23SetDiscrUninitRoundTripBody lm23SetDiscrRTS1 =
+        .step lm23SetDiscrRTS2 := rfl
+  obtain ⟨hrel₂, _, himm₂_fn⟩ := evalRvalue_discriminant_simulation
+    hst₁ lm23SetDiscrRT_phase lm23_env_valid rfl rfl rfl
+    (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23IsizeTy)
+    rfl rfl rfl lm23_isDiscrDest_isize (himm₁ 2 (by decide))
+  rw [ha₂] at hrel₂
+  obtain ⟨m₂, hm₂, hst₂⟩ := stepRelLM2_3_inv_step hrel₂
+  have himm₂_3 : IsImmediateStepLocal m₂ 3 := by
+    simpa [hm₂] using himm₂_fn 3 (himm₁ 3 (by decide))
+  have ha₃ :
+      stepMirFn lm23SetDiscrUninitRoundTripBody lm23SetDiscrRTS2 = .fail .ub := rfl
+  obtain ⟨hrel₃, _, _⟩ := evalProjection_downcast_field_simulation
+    hst₂ lm23SetDiscrRT_phase lm23_env_valid rfl rfl (isMove := false) rfl
+    (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23U32Ty)
+    rfl rfl rfl (by decide) (by decide) rfl rfl himm₂_3
+    (fun v_act _ hsl hne => by
+      injection hsl with hs; injection hs with hv; injection hv with hv_eq _
+      exact absurd hv_eq hne)
+  obtain ⟨msg, hm₃_ub⟩ := hrel₃.ub_iff.mp ha₃
+  exact ⟨m₁, m₂, msg, ha₁, hm₁, hst₁, ha₂, hm₂, hst₂, ha₃, hm₃_ub⟩
 
 end LeanMiriSpec.Correspondence.Witness

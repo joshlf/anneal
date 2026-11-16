@@ -9162,6 +9162,91 @@ theorem wit_lm3_1_raw_overwritten_bool_and_char_real_steps :
       (by rw [hl0]; rintro ⟨⟩) rfl (by decide) (by decide)
     exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄, hs₁, hm₁, hs₂, hm₂, hs₃, hm₃, hs₄, hm₄⟩
 
+/-- `Runtime(PostCleanup)` MIR body exercising direct `Copy` / `Move` of `_1 : char`
+from a wrong-byte-size (`1`-byte) scalar state (`DIV-LM-RAW-OVERWRITE-CHAR-COPY`). -/
+def lm31WrongSizeCharBody (useMove : Bool) : CapturedMir where
+  defPath := if useMove then "lm_3_1_witness::raw_overwrite_wrong_size_char_move"
+             else "lm_3_1_witness::raw_overwrite_wrong_size_char_copy"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [charDeclLM31, charDeclLM31]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0)
+          (.use (if useMove then .move (local_ 1) else .copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_raw_overwritten_wrong_size_char_ub` (`LM-3.1` D5 Wrong-Byte-Size `char` Direct Load UB)**:
+Constructs an inhabited `RawOverwrittenScalarState` on `_1 : char` backed by a `1`-byte scalar
+`⟨2, 1⟩` (note `isValidCharCode 2 = true`, so ONLY the wrong byte size `sizeBytes = 1 ≠ 4`
+invalidates the load!) and proves via
+`step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation` that BOTH `copy _1`
+(`useMove = false`) AND `move _1` (`useMove = true`) fault with `.ub` in Anneal and
+`.error (.undefinedBehavior msg)` in `lean-miri` (`StepRelLM3_1.ub`). -/
+theorem wit_lm3_1_raw_overwritten_wrong_size_char_ub (useMove : Bool) :
+    let b := lm31WrongSizeCharBody useMove
+    let hooks := annealStepHooks b.localDecls b.layouts
+    isValidCharCode 2 = true ∧
+    ∃ (s : MachineState) (m m' : AnnealStepState) (msc_raw : Miri.Memory.ScalarInt) (msg : String),
+      RawOverwrittenScalarState b s m [] 1 lm31AllocId1 ⟨2, 1⟩ msc_raw ∧
+      StepRelLM3_1 b m [] (stepMirFn b s) (Miri.Interpreter.Step.step hooks () m) ∧
+      stepMirFn b s = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m = (m', .error (.undefinedBehavior msg)) := by
+  intro b hooks
+  refine ⟨by decide, ?_⟩
+  obtain ⟨_, _, _, _, _, m_src, msc_raw, _, _, _, _, _, _, _, _, _, _, _, hraw_src⟩ :=
+    rawOverwriteBool_reach_state false
+  rcases hraw_src with
+    ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, hid_lt, hbase, hrel_raw, hlive_alloc, _⟩
+  let s : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨2, 1⟩)] }
+      memory := (initMachineState b []).memory }
+  let tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+    { body := translateBody b
+      bodyIdentity := .ofCanonicalIndex 0
+      functionInstance := { kind := .Item 0, args := #[] }
+      extra := ()
+      returnContinuation := .stop false
+      returnPlace := .frameLocal 0 0 none (translateTy charTyLM31 emptyLayoutTable) (.ofAllocationToken 0)
+      localsIdentity := .ofAllocationToken 0
+      locals := #[
+        { value := .live (.immediate .uninit), layout := none },
+        { value := .live (.indirect (stackAllocPlace lm31AllocId1)), layout := none }]
+      vaList := #[]
+      trackCallerArg := none
+      location := .mir ⟨0, 0⟩ }
+  let m : AnnealStepState := { stack := ⟨#[tf]⟩, machine := m_src.machine }
+  have hraw : RawOverwrittenScalarState b s m [] 1 lm31AllocId1 ⟨2, 1⟩ msc_raw := by
+    refine ⟨tf, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, List.nodup_nil, ?_,
+      rfl, ⟨none, rfl, fun _ _ _ h => nomatch h⟩, hid_lt, hbase, hrel_raw, hlive_alloc, rfl⟩
+    intro i decl_i slot_i mls_i hne hdecl hsl hmls
+    match i with
+    | 0 =>
+      have hs : slot_i = .uninit := by simpa [s, get?] using hsl.symm
+      have hm : mls_i = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [tf] using hmls.symm
+      subst hs hm
+      exact .base (.immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩))
+    | 1 => exact absurd rfl hne
+    | _ + 2 => simp [b, lm31WrongSizeCharBody, get?] at hdecl
+  cases useMove
+  · obtain ⟨hsim, ha_ub, m', msg, hm_ub⟩ :=
+      step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation hraw
+        (fun _ h => nomatch h) (Or.inl rfl) rfl rfl
+        (dstDecl := charDeclLM31) (locDecl := charDeclLM31)
+        rfl rfl rfl rfl (by decide) (by rintro ⟨⟩) (by decide) (Or.inl (by decide))
+    exact ⟨s, m, m', msc_raw, msg, hraw, hsim, ha_ub, hm_ub⟩
+  · obtain ⟨hsim, ha_ub, m', msg, hm_ub⟩ :=
+      step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation hraw
+        (fun _ h => nomatch h) (Or.inr rfl) rfl rfl
+        (dstDecl := charDeclLM31) (locDecl := charDeclLM31)
+        rfl rfl rfl rfl (by decide) (by rintro ⟨⟩) (by decide) (Or.inl (by decide))
+    exact ⟨s, m, m', msc_raw, msg, hraw, hsim, ha_ub, hm_ub⟩
+
 /-- `Runtime(PostCleanup)` MIR body exercising narrower / offset invalid `char` deref read
 (`*const char` at byte offset `4` of `_1 : u64` holding `0x0000D800_00000041 = 237494511599681`,
 with `Operand.move`). -/

@@ -1884,7 +1884,6 @@ theorem evalRvalue_binOp_offset_eq
     (hsc_sz : offsetSc.sizeBytes = 8)
     (hoff_lt : ptrVal.offsetBytes < 2 ^ 32)
     (hbits_lt : offsetSc.bits < 2 ^ 32)
-    (_hnot_dis : ∀ e, lookupBorrow mem.borrows ptrVal.tag = some e → e.perm ≠ .disabled)
     (hbound : ∀ b, ptrAllocByteBound? locals mem [] emptyLayoutTable ptrVal = some b →
       b < 2 ^ 63 ∧ ptrVal.offsetBytes + offsetSc.bits ≤ b) :
     evalRvalue locals
@@ -2060,7 +2059,7 @@ theorem evalBinOp_offset_inbounds_simulation
       · rw [← hsc_bits]
         exact evalRvalue_binOp_offset_eq s.frame.locals s.memory
           ptrLoc offLoc ptrVal offsetSc hptr_slot hoff_slot hsc_sz hoff
-          (by rw [hsc_bits]; exact hdelta) hnot_dis
+          (by rw [hsc_bits]; exact hdelta)
           (fun b hb => by
             obtain ⟨hle_b, hlt_b⟩ := hbound b hb
             rw [hsc_bits]
@@ -27187,6 +27186,167 @@ theorem step_raw_overwritten_direct_copy_invalid_char_simulation
         unfold evalOperand; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
       rw [hm_a]; dsimp only []; rw [hv_false]
   exact ⟨by rw [ha_ub, hm_ub]; exact .ub _ _, ha_ub, _, hm_ub⟩
+
+/-- **`step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation`
+(`LM-3.1` D5 Complete Wrong-Size + Invalid-Bit-Pattern `char` Direct Load UB)**:
+strengthens `step_raw_overwritten_direct_copy_invalid_char_simulation` (`DIV-LM-RAW-OVERWRITE-CHAR-COPY`)
+by removing the `rawSc.bits < 2 ^ 32` hypothesis (automatically derived from `ScalarRel.canonical`)
+and covering **wrong-byte-size** scalar payloads (`rawSc.sizeBytes ≤ 4`, i.e., `1` or `2` bytes in
+`RawOverwrittenScalarState`, alongside `4`-byte non-scalar codepoints `isValidCharCode rawSc.bits = false`):
+- when `rawSc.sizeBytes = 4` and `isValidCharCode rawSc.bits = false`, both Anneal (`validateLoadedValue`)
+  and `lean-miri` (`annealValidateScalarForTyId 2`) fault with `.ub`;
+- when `rawSc.sizeBytes < 4` (`1` or `2` bytes), Anneal's `validateLoadedValue` rejects
+  `Nat.beq rawSc.sizeBytes 4 = false` with `.ub`, and `lean-miri`'s `annealReadMemoryPlace` rejects the
+  `4`-byte `char` read from the narrower `rawSc.sizeBytes`-byte allocation via `annealReadMemoryPlace_oob_ub`
+  with `.error (.undefinedBehavior msg)`, establishing `StepRelLM3_1.ub` across both `Copy` and `Move`. -/
+theorem step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    {loc : Local} {allocId : Miri.Memory.AllocId}
+    {rawSc : MirAst.ScalarInt} {msc_raw : Miri.Memory.ScalarInt}
+    (hraw : RawOverwrittenScalarState body s m allocMap loc allocId rawSc msc_raw)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨loc, .nil⟩)), span⟩)
+    {dstDecl locDecl : LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_loc : get? body.localDecls loc = some locDecl)
+    (hloc_char : locDecl.ty.kind = .char)
+    (hdst_char : dstDecl.ty.kind = .char)
+    (hne_dst : dstIdx ≠ loc)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead := by rintro ⟨⟩)
+    (hsz_le4 : rawSc.sizeBytes ≤ 4)
+    (hinvalid : rawSc.sizeBytes ≠ 4 ∨ isValidCharCode rawSc.bits = false) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m' msg,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior msg)) := by
+  by_cases hsz4 : rawSc.sizeBytes = 4
+  · have hinv : isValidCharCode rawSc.bits = false := by
+      rcases hinvalid with hne | hinv
+      · exact absurd hsz4 hne
+      · exact hinv
+    have hb_hi : rawSc.bits < 2 ^ 32 := by
+      rcases hraw with ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hrel_raw, _, _⟩
+      have hcan := hrel_raw.canonical
+      rw [hsz4] at hcan
+      have hm4 : scalarModulus 4 = 2 ^ 32 := rfl
+      rw [hm4] at hcan
+      exact hcan
+    obtain ⟨hsim, ha_ub, m', hm_ub⟩ :=
+      step_raw_overwritten_direct_copy_invalid_char_simulation hraw hphase hopKind hbb hstmt
+        hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz4 hb_hi hinv
+    exact ⟨hsim, ha_ub, m', "reading invalid value", hm_ub⟩
+  · rcases hraw with
+      ⟨tf, hframes, hbody_eq, hloc_eq, haf_len, hmf_size, hcal, _, _, _, _,
+        hother_rel, hloc_slot, ⟨lay_loc, hlay_loc, hcache_loc⟩, hid_lt, hbase, hrel_raw,
+        ⟨localAlloc, hfind_la, hshape_la, _⟩, hstack⟩
+    have hsz12 : rawSc.sizeBytes = 1 ∨ rawSc.sizeBytes = 2 := by
+      rcases hrel_raw.validBytes with h1 | h2 | h4 | h8 | h16
+      · exact Or.inl h1
+      · exact Or.inr h2
+      · exact absurd h4 hsz4
+      · omega
+      · omega
+    have hlt_decl_d : dstIdx < body.localDecls.length := by
+      cases hd : body.localDecls[dstIdx]? with
+      | none => rw [get?_eq_getElem?, hd] at hdecl_dst; cases hdecl_dst
+      | some _ => exact (List.getElem?_eq_some_iff.mp hd).1
+    have hlt_d : dstIdx < tf.locals.size := by rw [hmf_size]; exact hlt_decl_d
+    have hslot_d : get? s.frame.locals dstIdx =
+        some (s.frame.locals[dstIdx]'(by rw [haf_len]; exact hlt_decl_d)) := by
+      rw [get?_eq_getElem?, List.getElem?_eq_getElem]
+    have hmls_d : tf.locals[dstIdx]? = some (tf.locals[dstIdx]'hlt_d) :=
+      Array.getElem?_eq_getElem hlt_d
+    have hloc_d := hother_rel dstIdx dstDecl _ _ hne_dst hdecl_dst hslot_d hmls_d
+    have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hloc_d.cachedLayout_eq
+    let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+    have hlt_decl_l : loc < body.localDecls.length := by
+      cases hd : body.localDecls[loc]? with
+      | none => rw [get?_eq_getElem?, hd] at hdecl_loc; cases hdecl_loc
+      | some _ => exact (List.getElem?_eq_some_iff.mp hd).1
+    have hlt_af_l : loc < s.frame.locals.length := by rw [haf_len]; exact hlt_decl_l
+    have hlt_l : loc < tf.locals.size := by rw [hmf_size]; exact hlt_decl_l
+    have hlt_la : loc < tfa.locals.size := by rw [cacheFrameLocalLayout_size]; exact hlt_l
+    have hmls_la : tfa.locals[loc]'hlt_la = ⟨.live (.indirect (stackAllocPlace allocId)), lay_loc⟩ := by
+      have hget : tfa.locals[loc]? = tf.locals[loc]? := by
+        dsimp only [tfa, cacheFrameLocalLayout]; rw [Array.getElem?_set_ne _ hne_dst]
+      rw [Array.getElem?_eq_getElem hlt_la, hlay_loc] at hget
+      exact Option.some.inj hget
+    have hloc_prim : IsPrimScalarTy locDecl.ty := Or.inr (Or.inl hloc_char)
+    obtain ⟨tf_op, hop_m⟩ : ∃ tf_op,
+        annealEvalOperand body.localDecls body.layouts (translateOperand (opKind ⟨loc, .nil⟩))
+          (some (translateTy dstDecl.ty body.layouts)) { m with stack := ⟨#[tfa]⟩ } =
+        .ok ⟨.indirect (stackAllocPlace allocId), translateTy locDecl.ty body.layouts⟩
+          { m with stack := ⟨#[tf_op]⟩ } := by
+      rcases hopKind with rfl | rfl
+      · exact ⟨_, annealEvalOperand_copy_live (m := { m with stack := ⟨#[tfa]⟩ }) rfl hlt_la
+          hdecl_loc hmls_la (hcache_loc locDecl · hdecl_loc)⟩
+      · exact ⟨_, annealEvalOperand_move_live (m := { m with stack := ⟨#[tfa]⟩ }) rfl hlt_la
+          hdecl_loc hmls_la (hcache_loc locDecl · hdecl_loc)⟩
+    have hoob : localAlloc.allocation.byteSize.bytes.toNat <
+        0 + (translateTy locDecl.ty body.layouts).layout.size.bytes.toNat := by
+      have htr4 : (translateTy locDecl.ty body.layouts).layout.size = Miri.ABI.Size.ofBytes 4 := by
+        unfold translateTy; rw [hloc_char]; rfl
+      rw [hshape_la.byteSize_eq, htr4]
+      rcases hsz12 with h1 | h2
+      · rw [h1]; decide
+      · rw [h2]; decide
+    obtain ⟨msg, hread_oob⟩ := annealReadMemoryPlace_oob_ub hloc_prim hid_lt
+      (offsetBytes := 0) (by decide) hbase hfind_la hoob
+      (borTag := Miri.Memory.BorTag.one) (st := { m with stack := ⟨#[tf_op]⟩ }) none
+    have haddr0 : annealStackBaseAddr allocId + UInt64.ofNat 0 = annealStackBaseAddr allocId :=
+      UInt64.add_zero _
+    rw [haddr0] at hread_oob
+    have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
+      ⟨dstIdx, .nil⟩ (opKind ⟨loc, .nil⟩) span m
+    have hm_err : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨loc, .nil⟩)), span⟩) m =
+        ({ m with stack := ⟨#[tf_op]⟩ }, .error (.undefinedBehavior msg)) := by
+      have htr_dst : translatePlace ⟨dstIdx, .nil⟩ = ⟨dstIdx, #[]⟩ := rfl
+      have hsp_eq : stackAllocPlace allocId =
+          ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr allocId),
+            some (.concrete allocId Miri.Memory.BorTag.one)⟩, .none, none⟩ := rfl
+      rw [hm_stmt, htr_dst]; unfold Miri.Interpreter.runRvalue
+      rw [EStateM.bind_eq_ok hdst_eval]; dsimp only []
+      rw [EStateM.bind_eq_ok hop_m,
+        annealReadImmediate_indirect_prim_eq hloc_prim, hsp_eq,
+        EStateM.bind_eq_error hread_oob]
+    have hm_ub := miri_step_at_statement_error _ hframes hbody_eq hloc_eq hbb hstmt hm_err
+    have hbeq4_false : Nat.beq rawSc.sizeBytes 4 = false := by
+      rcases hsz12 with h1 | h2
+      · rw [h1]; rfl
+      · rw [h2]; rfl
+    have hv_false : validateLoadedValue body.layouts body.localDecls
+        (opKind ⟨loc, .nil⟩) (.scalar rawSc) = false := by
+      rcases locDecl with ⟨_, ⟨lk, lli⟩, _⟩
+      dsimp only at hloc_char; subst hloc_char
+      rcases hopKind with rfl | rfl <;>
+      · unfold validateLoadedValue operandTy placeTy; dsimp only []
+        rw [hdecl_loc]; dsimp only [resolveProjectedTy]
+        simp [hbeq4_false]
+    have ha_ub : stepMirFn body s = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s hcal hphase]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; rw [hstack]; dsimp only []
+      rcases hopKind with rfl | rfl
+      · have hc : evalOperand s.frame.locals (.copy ⟨loc, .nil⟩) s.memory.borrows s.memory.globals
+            body.layouts s.memory.callerLocals body.localDecls = .ok (.scalar rawSc) s.frame.locals := by
+          simp [evalOperand, readProjectedValue, hloc_slot]
+        rw [hc]; dsimp only []; rw [hv_false]
+      · have hm_a : evalOperand s.frame.locals (.move ⟨loc, .nil⟩) s.memory.borrows s.memory.globals
+            body.layouts s.memory.callerLocals body.localDecls =
+            .ok (.scalar rawSc) (s.frame.locals.set loc .uninit) := by
+          unfold evalOperand; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
+        rw [hm_a]; dsimp only []; rw [hv_false]
+    exact ⟨by rw [ha_ub, hm_ub]; exact .ub _ _, ha_ub, _, msg, hm_ub⟩
 
 /-- **`step_raw_overwritten_direct_copy_valid_char_simulation` (`LM-3.1` D5 Valid-`char`
 Preservation on Direct Load after Raw Overwrite)**:

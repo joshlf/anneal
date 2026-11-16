@@ -187,6 +187,57 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 {"resolution_missing"},
             )
 
+        # Comment, nested block-comment, string-literal, and non-theorem (`def`) spoofing
+        # must fail closed (`resolution_missing`), while `abbrev` witness aliases and
+        # character literals (`'"'`) must be handled accurately.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={"DIV-LM-D6-OFFSET-DISABLED-TAG", "DIV-LM-ENUM-SET-DISCR-UNINIT"},
+            )
+            d6_file = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+            with d6_file.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "-- theorem step_binOp_offset_disabled_simulation : True := trivial\n"
+                    "/- outer /- theorem step_binOp_offset_disabled_simulation : True := trivial -/ -/\n"
+                    'def docStr : String := "theorem step_binOp_offset_disabled_simulation"\n'
+                    "def step_binOp_offset_disabled_simulation : Unit := ()\n"
+                )
+            lm23_file = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23_file.parent.mkdir(parents=True, exist_ok=True)
+            lm23_file.write_text(
+                "def quoteChar : Char := '\"'\n"
+                "-- Replaces theorem step_setDiscriminant_uninit_divergence\n"
+                "@[simp] theorem step_setDiscriminant_uninit_simulation : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                [(d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]],
+                [("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing")],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 7)
+
+            # Reintroducing a witness via `abbrev` must also be caught as `open`.
+            with lm23_file.open("a", encoding="utf-8") as fh:
+                fh.write("abbrev step_setDiscriminant_uninit_divergence := True\n")
+            synth_divs2 = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs2["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing"),
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "open"),
+                ],
+            )
+            state_dir = tmp_root / "state_render"
+            _, _, md = suite.run_suite_and_generate_dashboard(
+                repo_root=tmp_root, profile="census-only", state_dir=state_dir
+            )
+            self.assertIn(
+                "**missing resolution** `step_binOp_offset_disabled_simulation`", md
+            )
+
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / "state_out"

@@ -4124,12 +4124,15 @@ private theorem finish_setDiscriminant_uninit_from_indirect
     (hpmap₀ : la_down.allocation.provenanceMap = Miri.Memory.ProvenanceMap.new)
     (hmask₀ : InitMaskWordRel la_down.allocation.initializationMask
       la_down.allocation.byteSize
-      (initWordsFalse (translateTy dstDecl.ty body.layouts).layout.size)) :
+      (initWordsFalse (translateTy dstDecl.ty body.layouts).layout.size))
+    (himm_down : ∀ j, j ≠ dstIdx → IsImmediateFrameLocal topFrame j →
+      IsImmediateFrameLocal tf_down j) :
     ∃ m',
       Miri.Interpreter.Step.step
         (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) ∧
       StateRelLM2_3 body env allocBudget
-        (advanceStmt s (s.frame.locals.set dstIdx (.init (.aggregate variantIdx .nil)))) m' := by
+        (advanceStmt s (s.frame.locals.set dstIdx (.init (.aggregate variantIdx .nil)))) m' ∧
+      (∀ j, j ≠ dstIdx → IsImmediateStepLocal m j → IsImmediateStepLocal m' j) := by
   obtain ⟨u, hu_lt, alloc_final, words_final, mscTag, hu_eq, hw_disc, hlive_final,
       hrelTag, hbs_f, hlen_f, hmut_f, hpmap_f, hmask_f, hbits_f, _,
       htag_init_f, htag_read_f⟩ :=
@@ -4203,12 +4206,15 @@ private theorem finish_setDiscriminant_uninit_from_indirect
     hfr_final_ex.finish_dst hdst_decl hset_af hmf_dst_down hloc_dst_final
   have hsup_final : AllocIdSupplyValid allocBudget mach_final.memory :=
     hsup_down.of_updateAlloc hu_lt hu_eq
-  refine ⟨_, hstep_ok, ?_⟩
-  exact StateRelLM2_3.mk
-    { tf_down with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ }
-    rfl hrc_down ⟨retLay, hrp_down⟩
-    hfr_done.step_pc hsup_final
-    hcal hstack hbor hprot hcaller hdisj_down
+  refine ⟨_, hstep_ok, ?_, ?_⟩
+  · exact StateRelLM2_3.mk
+      { tf_down with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ }
+      rfl hrc_down ⟨retLay, hrp_down⟩
+      hfr_done.step_pc hsup_final
+      hcal hstack hbor hprot hcaller hdisj_down
+  · intro j hj himm_j tf' htf'
+    injection htf' with ha; injection ha with htf_eq; subst htf_eq
+    exact himm_down j hj (himm_j topFrame hframes)
 
 /-- **`step_setDiscriminant_uninit_simulation`** (`DIV-LM-ENUM-SET-DISCR-UNINIT`
 upgrade): `SetDiscriminant(_dst, variantIdx)` on an `.uninit` enum local steps
@@ -4220,7 +4226,7 @@ uninitialized, while checking `setDiscriminantUninitDeclOk`), and vendored
 `Discriminant.writeDiscriminant` forces `_dst` into memory if needed and writes
 the tag scalar `⟨variantIdx, tagBytes⟩` at `[0, tagBytes)` while leaving all
 payload bytes `[tagBytes, size)` uninitialized. -/
-theorem step_setDiscriminant_uninit_simulation
+private theorem step_setDiscriminant_uninit_simulation_core
     {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
     {s : MachineState} {m : AnnealStepState}
     (hstate : StateRelLM2_3 body env (allocBudget + 1) s m)
@@ -4245,7 +4251,8 @@ theorem step_setDiscriminant_uninit_simulation
     ∃ m',
       Miri.Interpreter.Step.step
         (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) ∧
-      StateRelLM2_3 body env allocBudget s' m' := by
+      StateRelLM2_3 body env allocBudget s' m' ∧
+      (∀ j, j ≠ dstIdx → IsImmediateStepLocal m j → IsImmediateStepLocal m' j) := by
   intro s'
   rcases hstate with
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe, halloc,
@@ -4304,7 +4311,8 @@ theorem step_setDiscriminant_uninit_simulation
       ∃ m',
         Miri.Interpreter.Step.step
           (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) ∧
-        StateRelLM2_3 body env allocBudget s' m' := by
+        StateRelLM2_3 body env allocBudget s' m' ∧
+        (∀ j, j ≠ dstIdx → IsImmediateStepLocal m j → IsImmediateStepLocal m' j) := by
     cases hloc_d with
     | base _ _ hnone _ =>
       rw [henv_dst] at hnone; cases hnone
@@ -4360,6 +4368,10 @@ theorem step_setDiscriminant_uninit_simulation
         rfl (hovf_all _ hvalid_enum.size_lt_4gib)
         (annealStackBaseAddr_isAligned newId _ hvalid_enum.align_pow2_le)
         hmut0 hbs0 (by dsimp [a0]; rw [hlen0, hbs0]) hpmap0 hmask_a0
+        (fun j hj hj_imm mls hmls => by
+          dsimp only [tf_down] at hmls
+          rw [Array.getElem?_set_ne _ (Ne.symm hj)] at hmls
+          exact (hj_imm.cache_layout _ _) mls hmls)
     | enumUninitInd tb' vs' mp _ henv' _ hmem_u =>
       rw [henv_dst] at henv'; injection henv' with heq_p; rcases heq_p with ⟨rfl, rfl⟩
       rcases hmem_u with ⟨allocId, borTag, baseAddr, localAlloc, _, hprov, hmis, hmeta,
@@ -4385,10 +4397,103 @@ theorem step_setDiscriminant_uninit_simulation
         hdisj₀ (Or.inr (halloc.of_succ.mono (Nat.le_succ allocBudget)))
         hprov hmis hmeta hlive hbase hptr hovf halign
         hmut hbs hlen hpmap hmask₀
-  obtain ⟨m', hm'_step, hst'⟩ := hm_ex
-  refine ⟨ha_step, ?_, m', hm'_step, hst'⟩
+        (fun j _ hj_imm => hj_imm.cache_layout _ _)
+  obtain ⟨m', hm'_step, hst', himm'⟩ := hm_ex
+  refine ⟨ha_step, ?_, m', hm'_step, hst', himm'⟩
   rw [ha_step, hm'_step]
   exact .step _ _ hst'
+
+/-- **`step_setDiscriminant_uninit_simulation`** (`DIV-LM-ENUM-SET-DISCR-UNINIT`
+upgrade): `SetDiscriminant(_dst, variantIdx)` on an `.uninit` enum local steps
+both Anneal and `lean-miri` in lockstep (`StepRelLM2_3` and `StateRelLM2_3`). -/
+theorem step_setDiscriminant_uninit_simulation
+    {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_3 body env (allocBudget + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    (henv_valid : ∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs)
+    {bb : BasicBlockData} {stmt : Statement}
+    {dstIdx : Local} {dstDecl : LocalDecl} {variantIdx : Nat}
+    {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hkind : stmt.kind = .setDiscriminant ⟨dstIdx, .nil⟩ variantIdx)
+    (hdst_decl : get? body.localDecls dstIdx = some dstDecl)
+    (henv_dst : env dstDecl.ty = some (tagBytes, variants))
+    (hv_lt : variantIdx < variants.length)
+    (huninit : get? s.frame.locals dstIdx = some .uninit) :
+    let s' := advanceStmt s (s.frame.locals.set dstIdx (.init (.aggregate variantIdx .nil)))
+    stepMirFn body s = .step s' ∧
+    StepRelLM2_3 body env allocBudget m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM2_3 body.localDecls body.layouts) () m) ∧
+    ∃ m',
+      Miri.Interpreter.Step.step
+        (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) ∧
+      StateRelLM2_3 body env allocBudget s' m' := by
+  intro s'
+  obtain ⟨ha_step, hrel, m', hm'_step, hst', _⟩ :=
+    step_setDiscriminant_uninit_simulation_core hstate hphase henv_valid hbb hstmt hkind
+      hdst_decl henv_dst hv_lt huninit
+  exact ⟨ha_step, hrel, m', hm'_step, hst'⟩
+
+/-- **`step_setDiscriminant_any_simulation`** (unified `SetDiscriminant` lockstep
+without `.uninit` exclusion, `DIV-LM-ENUM-SET-DISCR-UNINIT`): across **all**
+destination slot states (`.dead` UB, `.uninit` tag initialization + optional
+stack promotion, and `.init` in-place tag mutation), `StatementKind.SetDiscriminant`
+steps Anneal and `lean-miri` in lockstep (`StepRelLM2_3`) while preserving
+`IsImmediateStepLocal` on all other locals `j ≠ dstIdx`. -/
+theorem step_setDiscriminant_any_simulation
+    {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_3 body env (allocBudget + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    (henv_valid : ∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs)
+    {bb : BasicBlockData} {stmt : Statement}
+    {dstIdx : Local} {dstDecl : LocalDecl} {variantIdx : Nat}
+    {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hkind : stmt.kind = .setDiscriminant ⟨dstIdx, .nil⟩ variantIdx)
+    (hdst_decl : get? body.localDecls dstIdx = some dstDecl)
+    (henv_dst : env dstDecl.ty = some (tagBytes, variants))
+    (hv_lt : variantIdx < variants.length)
+    (hpayload_compat :
+      ∀ v_act (hv_act : v_act < variants.length) fieldVals,
+        get? s.frame.locals dstIdx = some (.init (.aggregate v_act fieldVals)) →
+        ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
+          (∃ (hi_act : i < (variants[v_act]'hv_act).length),
+            (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
+          (get? fieldVals i = none ∧
+            ∃ b,
+              ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
+              b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
+                ((variants[variantIdx]'hv_lt)[i]'hi).fieldLayout.size.bytes.toNat ∧
+              EnumLocalByteUninit m dstIdx b)) :
+    StepRelLM2_3 body env allocBudget m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_3 body.localDecls body.layouts) () m) ∧
+    (∀ j, j ≠ dstIdx →
+      IsImmediateStepLocal m j →
+      IsImmediateStepLocal
+        (Miri.Interpreter.Step.step (annealStepHooksLM2_3 body.localDecls body.layouts) () m).1
+        j) := by
+  by_cases hun : get? s.frame.locals dstIdx = some .uninit
+  · obtain ⟨_, hrel, m', hm', _, himm'⟩ :=
+      step_setDiscriminant_uninit_simulation_core hstate hphase henv_valid hbb hstmt hkind
+        hdst_decl henv_dst hv_lt hun
+    refine ⟨hrel, fun j hj himm_j => ?_⟩
+    rw [hm']
+    exact himm' j hj himm_j
+  · have hstate_sub : StateRelLM2_3 body env allocBudget s m := by
+      rcases hstate with ⟨tf, hf, hrc, hrp, hfr, halloc, hcal, hst, hb, hp, hcl, hd⟩
+      exact ⟨tf, hf, hrc, hrp, hfr, Or.inr (halloc.of_succ.mono (Nat.le_succ allocBudget)),
+        hcal, hst, hb, hp, hcl, hd⟩
+    obtain ⟨hrel, _, himm⟩ :=
+      step_setDiscriminant_simulation hstate_sub hphase henv_valid hbb hstmt hkind
+        hdst_decl henv_dst hv_lt hun hpayload_compat
+    exact ⟨hrel, fun j _ hj => himm j hj⟩
 
 /-! ## 6. Multi-Variant Enum Construction (`LM-2.3` Deliverable 1) -/
 

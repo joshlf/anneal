@@ -997,32 +997,122 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
 ]
 
 
+def _strip_lean_comments_and_strings(src: str) -> str:
+    """Strip Lean `--` line comments, nested `/- ... -/` block comments, and literals.
+
+    Replaces stripped spans with spaces while preserving `\\n` so line-anchored
+    declaration matching cannot be spoofed by commented-out theorems, docstrings,
+    or string literals (and handles `'\"'` character literals cleanly).
+    """
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    block_depth = 0
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if block_depth > 0:
+            if ch == "/" and nxt == "-":
+                block_depth += 1
+                out.append("  ")
+                i += 2
+            elif ch == "-" and nxt == "/":
+                block_depth -= 1
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "-":
+            block_depth = 1
+            out.append("  ")
+            i += 2
+            continue
+        if ch == "-" and nxt == "-":
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == '"':
+            out.append(" ")
+            i += 1
+            while i < n:
+                c = src[i]
+                if c == "\\":
+                    out.append("  " if i + 1 < n and src[i + 1] != "\n" else " ")
+                    i += 2
+                    continue
+                if c == '"':
+                    out.append(" ")
+                    i += 1
+                    break
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+        # Handle Lean character literals like `'"'` or `'\''` so `'"'` does not open a string.
+        if ch == "'":
+            if i + 2 < n and src[i + 1] != "\\" and src[i + 2] == "'":
+                out.append("   ")
+                i += 3
+                continue
+            if i + 3 < n and src[i + 1] == "\\" and src[i + 3] == "'":
+                out.append("    ")
+                i += 4
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _has_lean_decl(stripped_src: str, symbol: str, *, resolution: bool) -> bool:
+    kinds = r"(?:theorem|lemma)" if resolution else r"(?:theorem|lemma|def|abbrev)"
+    mods = (
+        r"(?:private\s+|protected\s+)*"
+        if resolution
+        else r"(?:private\s+|protected\s+|noncomputable\s+)*"
+    )
+    pat = rf"(?:^|\n)\s*(?:@\[[^\]]*\]\s*)*{mods}{kinds}\s+{re.escape(symbol)}\b"
+    return bool(re.search(pat, stripped_src))
+
+
 def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
     """Check status of tracked correspondence divergences and `correspondence_gaps.toml`."""
     actionable_open: list[dict[str, Any]] = []
     actionable_resolved: list[dict[str, Any]] = []
     modeling_choices: list[dict[str, Any]] = []
+    stripped_cache: dict[Path, str] = {}
+
+    def read_stripped(path: Path) -> str | None:
+        if path in stripped_cache:
+            return stripped_cache[path]
+        if not path.is_file():
+            return None
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        stripped = _strip_lean_comments_and_strings(raw)
+        stripped_cache[path] = stripped
+        return stripped
 
     for item in TRACKED_CORRESPONDENCE_DIVERGENCES:
         fpath = repo_root / item["file"]
         symbol = item["witness_symbol"]
-        present = False
-        if fpath.is_file():
-            text = fpath.read_text(encoding="utf-8", errors="replace")
-            present = bool(re.search(rf"\b(?:theorem|def)\s+{re.escape(symbol)}\b", text))
+        stripped_f = read_stripped(fpath)
+        present = (
+            _has_lean_decl(stripped_f, symbol, resolution=False)
+            if stripped_f is not None
+            else False
+        )
 
         resolution_symbol = item.get("resolution_symbol")
         resolution_present: bool | None = None
         if resolution_symbol:
             rpath = repo_root / item.get("resolution_file", item["file"])
-            resolution_present = False
-            if rpath.is_file():
-                rtext = rpath.read_text(encoding="utf-8", errors="replace")
-                resolution_present = bool(
-                    re.search(
-                        rf"\b(?:theorem|lemma)\s+{re.escape(resolution_symbol)}\b", rtext
-                    )
-                )
+            stripped_r = read_stripped(rpath)
+            resolution_present = (
+                _has_lean_decl(stripped_r, resolution_symbol, resolution=True)
+                if stripped_r is not None
+                else False
+            )
 
         record = dict(item)
         record["live_in_source"] = present
@@ -1945,9 +2035,18 @@ def render_markdown_report(dashboard: dict[str, Any]) -> str:
         ]
     )
     for div in p3["correspondence_divergences"]["actionable_anneal_bugs"]:
+        if div.get("status") == "resolution_missing":
+            res_sym = div.get("resolution_symbol", "<missing>")
+            res_file = div.get("resolution_file", div["file"])
+            witness_cell = (
+                f"`{div['witness_symbol']}` (`{div['file']}`) — "
+                f"**missing resolution** `{res_sym}` (`{res_file}`)"
+            )
+        else:
+            witness_cell = f"`{div['witness_symbol']}` (`{div['file']}`)"
         lines.append(
             f"| `{div['id']}` | `{div['authority']}` | `{div['severity']}` | "
-            f"`{div['witness_symbol']}` (`{div['file']}`) | `{div['anneal_component']}` | "
+            f"{witness_cell} | `{div['anneal_component']}` | "
             f"{div['switch_to_pass_criterion']} |"
         )
 

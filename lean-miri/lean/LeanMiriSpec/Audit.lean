@@ -639,6 +639,7 @@ open LeanMiriSpec.Correspondence in
   step_raw_overwritten_deref_invalid_bool_or_char_simulation
   step_raw_overwritten_direct_copy_invalid_bool_simulation
   step_raw_overwritten_direct_copy_invalid_char_simulation
+  step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation
   step_raw_overwritten_direct_copy_valid_char_simulation
   offsetAfterLhsLocals
   step_binOp_offset_neg_oob_ub_simulation
@@ -676,6 +677,8 @@ open LeanMiriSpec.Correspondence in
   Witness.lm31RawOverwriteBoolBody
   Witness.lm31RawOverwriteCharBody
   Witness.wit_lm3_1_raw_overwritten_bool_and_char_real_steps
+  Witness.lm31WrongSizeCharBody
+  Witness.wit_lm3_1_raw_overwritten_wrong_size_char_ub
   Witness.lm31NarrowerInvalidCharReadBody
   Witness.wit_lm3_1_deref_read_narrower_invalid_char_real_steps
   Witness.lm31OffsetNegStrideBody
@@ -1331,6 +1334,7 @@ open LeanMiriSpec.Correspondence in
   writeDiscriminant_uninit_imm_local_ok
   step_setDiscriminant_simulation
   step_setDiscriminant_uninit_simulation
+  step_setDiscriminant_any_simulation
   evalRvalue_discriminant_simulation
   evalProjection_downcast_field_simulation
   evalProjection_downcast_field_initialized_divergence
@@ -1388,6 +1392,8 @@ open LeanMiriSpec.Correspondence in
   Witness.lm23Ret_dead_stateRelLM2_3
   Witness.lm23Ret_materialize_uninitInd0
   Witness.wit_lm2_3_return_enum_and_ub
+  Witness.lm23SetDiscrUninitRoundTripBody
+  Witness.wit_lm2_3_setDiscriminant_uninit_roundtrip_and_payload_ub
 
 
 /-- Exhaustively verify that every declaration across every imported
@@ -7388,6 +7394,38 @@ example
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) :=
   step_raw_overwritten_direct_copy_invalid_char_simulation hraw hphase hopKind hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz4 hb_hi hinvalid
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    {loc : Local} {allocId : Miri.Memory.AllocId}
+    {rawSc : MirAst.ScalarInt} {msc_raw : Miri.Memory.ScalarInt}
+    (hraw : RawOverwrittenScalarState body s m allocMap loc allocId rawSc msc_raw)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨loc, .nil⟩)), span⟩)
+    {dstDecl locDecl : MirAst.LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_loc : get? body.localDecls loc = some locDecl)
+    (hloc_char : locDecl.ty.kind = .char)
+    (hdst_char : dstDecl.ty.kind = .char)
+    (hne_dst : dstIdx ≠ loc)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hsz_le4 : rawSc.sizeBytes ≤ 4)
+    (hinvalid : rawSc.sizeBytes ≠ 4 ∨ isValidCharCode rawSc.bits = false) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m' msg,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior msg)) :=
+  step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation hraw hphase hopKind hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz_le4 hinvalid
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -15948,6 +15986,42 @@ example :
             (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) ∧
           StateRelLM2_3 body env allocBudget s' m' :=
   @step_setDiscriminant_uninit_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env (allocBudget + 1) s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {dstIdx : Local} {dstDecl : MirAst.LocalDecl} {variantIdx : Nat}
+        {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .setDiscriminant ⟨dstIdx, .nil⟩ variantIdx →
+        get? body.localDecls dstIdx = some dstDecl →
+        env dstDecl.ty = some (tagBytes, variants) →
+        (hv_lt : variantIdx < variants.length) →
+        (∀ v_act (hv_act : v_act < variants.length) fieldVals,
+          get? s.frame.locals dstIdx = some (.init (.aggregate v_act fieldVals)) →
+          ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
+            (∃ (hi_act : i < (variants[v_act]'hv_act).length),
+              (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
+            (get? fieldVals i = none ∧
+              ∃ b,
+                ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
+                b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
+                  ((variants[variantIdx]'hv_lt)[i]'hi).fieldLayout.size.bytes.toNat ∧
+                EnumLocalByteUninit m dstIdx b)) →
+        StepRelLM2_3 body env allocBudget m
+          (stepMirFn body s)
+          (Miri.Interpreter.Step.step (annealStepHooksLM2_3 body.localDecls body.layouts) () m) ∧
+        (∀ j, j ≠ dstIdx →
+          IsImmediateStepLocal m j →
+          IsImmediateStepLocal
+            (Miri.Interpreter.Step.step (annealStepHooksLM2_3 body.localDecls body.layouts) () m).1
+            j) :=
+  @step_setDiscriminant_any_simulation
 
 example :
     ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
@@ -25406,6 +25480,36 @@ example {body : CapturedMir} {s sₙ : MachineState}
     (hstack : memP.callStack = caller :: rest) (hcaller : caller.returnUnwind = .unreachable) :
     MirReachesUB (mirTree body s) ∧ ¬ TreeSafe (mirTree body s) :=
   anneal_extCall_continue_unwind_ub hA hs hstack hcaller
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (useMove : Bool) :
+    let b := Witness.lm31WrongSizeCharBody useMove
+    let hooks := annealStepHooks b.localDecls b.layouts
+    isValidCharCode 2 = true ∧
+    ∃ (s : MachineState) (m m' : AnnealStepState) (msc_raw : Miri.Memory.ScalarInt) (msg : String),
+      RawOverwrittenScalarState b s m [] 1 Witness.lm31AllocId1 ⟨2, 1⟩ msc_raw ∧
+      StepRelLM3_1 b m [] (stepMirFn b s) (Miri.Interpreter.Step.step hooks () m) ∧
+      stepMirFn b s = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m = (m', .error (.undefinedBehavior msg)) :=
+  Witness.wit_lm3_1_raw_overwritten_wrong_size_char_ub useMove
+
+example :
+    ∃ (m₁ m₂ : AnnealStepState) (msg : String),
+      stepMirFn Witness.lm23SetDiscrUninitRoundTripBody (Witness.lm23InitAnneal 0) =
+        .step Witness.lm23SetDiscrRTS1 ∧
+      Miri.Interpreter.Step.step Witness.lm23SetDiscrRTHooks () Witness.lm23SetDiscrRTInitMiri =
+        (m₁, .ok true) ∧
+      StateRelLM2_3 Witness.lm23SetDiscrUninitRoundTripBody Witness.lm23Env 0
+        Witness.lm23SetDiscrRTS1 m₁ ∧
+      stepMirFn Witness.lm23SetDiscrUninitRoundTripBody Witness.lm23SetDiscrRTS1 =
+        .step Witness.lm23SetDiscrRTS2 ∧
+      Miri.Interpreter.Step.step Witness.lm23SetDiscrRTHooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_3 Witness.lm23SetDiscrUninitRoundTripBody Witness.lm23Env 0
+        Witness.lm23SetDiscrRTS2 m₂ ∧
+      stepMirFn Witness.lm23SetDiscrUninitRoundTripBody Witness.lm23SetDiscrRTS2 = .fail .ub ∧
+      (Miri.Interpreter.Step.step Witness.lm23SetDiscrRTHooks () m₂).2 =
+        .error (.undefinedBehavior msg) :=
+  Witness.wit_lm2_3_setDiscriminant_uninit_roundtrip_and_payload_ub
 
 end StatementPins
 
