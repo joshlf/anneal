@@ -153,19 +153,21 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     audit = root / suite.AUTHORITY_AUDIT_FILES[item["authority"]]
                     audit.parent.mkdir(parents=True, exist_ok=True)
                     with audit.open("a", encoding="utf-8") as fh:
-                        fh.write(f"example : True :=\n  {item['resolution_symbol']}\n")
+                        fh.write(f"example : 0 = 0 :=\n  {item['resolution_symbol']}\n")
                 if item["id"] in missing_ids:
                     continue
                 path = root / item.get("resolution_file", item["file"])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as fh:
-                    fh.write(f"theorem {item['resolution_symbol']} : True := trivial\n")
+                    fh.write(f"theorem {item['resolution_symbol']} : 0 = 0 := rfl\n")
                     if item["id"] in live_ids:
-                        fh.write(f"theorem {item['witness_symbol']} : True := trivial\n")
+                        fh.write(f"theorem {item['witness_symbol']} : 0 = 0 := rfl\n")
 
         # Fail-closed statement-pin linkage: a resolution theorem whose statement is not
-        # locked by an audit `example ... := <theorem>` pin (only listed, commented out,
-        # or applied mid-term) stays actionable as `resolution_unpinned`.
+        # locked by a non-trivial typed audit `example : <Prop> := <theorem>` pin (e.g.
+        # only listed, commented out, applied mid-term, untyped `let _ :=` / `example :=`,
+        # vacuous `: True` / wildcard `: _`, field-projected `.1`, or decoy-qualified
+        # `Scratch.<thm>`) stays actionable as `resolution_unpinned`.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
             write_synthetic_checkout(tmp_root, unpinned_ids={"DIV-MR-CALL-TARGET-LOCAL"})
@@ -173,8 +175,16 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             with mr_audit.open("a", encoding="utf-8") as fh:
                 fh.write(
                     "#assert_standard_axioms\n  callerRefMutSilentWrongLocal_simulation\n"
-                    "-- example : True := callerRefMutSilentWrongLocal_simulation\n"
-                    "example : True := id callerRefMutSilentWrongLocal_simulation\n"
+                    "-- example : 0 = 0 := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : 0 = 0 := id callerRefMutSilentWrongLocal_simulation\n"
+                    "let _ := @callerRefMutSilentWrongLocal_simulation\n"
+                    "example := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : _ := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : True := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : (True) := callerRefMutSilentWrongLocal_simulation\n"
+                    "example : 0 = 0 := callerRefMutSilentWrongLocal_simulation.1\n"
+                    "example : 0 = 0 := Scratch.callerRefMutSilentWrongLocal_simulation\n"
+                    "unsafe example : 0 = 0 := callerRefMutSilentWrongLocal_simulation\n"
                 )
             synth_divs = suite.discover_correspondence_divergences(tmp_root)
             self.assertEqual(
@@ -183,7 +193,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             )
             self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 7)
             with mr_audit.open("a", encoding="utf-8") as fh:
-                fh.write("example : True :=\n  @callerRefMutSilentWrongLocal_simulation\n")
+                fh.write("example : 0 = 0 :=\n  @callerRefMutSilentWrongLocal_simulation\n")
             synth_divs = suite.discover_correspondence_divergences(tmp_root)
             self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 0)
             self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 8)
@@ -387,6 +397,73 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     ("DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL", "open"),
                     ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
                     ("DIV-MR-TB-TWOPHASE-DIRECT-WRITE", "open"),
+                ],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 2)
+
+        # Token-level Lean 4 grammar edge cases: `open Foo in private\ntheorem`,
+        # `private @[simp,\n  reducible]\ntheorem`, `section private theorem ... end`,
+        # and `section #exit\ntheorem` must NOT satisfy `resolution_symbol`, whereas
+        # same-line `namespace Foo theorem <witness> ... end Foo`, `mutual def <witness> ... end`,
+        # `#exit'` non-truncation, and `r#"\"#` raw strings must still detect witnesses as `open`.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            write_synthetic_checkout(
+                tmp_root,
+                missing_ids={
+                    "DIV-LM-ENUM-SET-DISCR-UNINIT",
+                    "DIV-LM-D6-OFFSET-DISABLED-TAG",
+                    "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC",
+                    "DIV-MR-TB-UNSAFECELL-PROTECTED-IM",
+                },
+            )
+            lm23 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+            lm23.parent.mkdir(parents=True, exist_ok=True)
+            lm23.write_text(
+                "open Foo in private\n"
+                "theorem step_setDiscriminant_uninit_simulation : 0 = 0 := rfl\n"
+                "private @[simp,\n  reducible]\n"
+                "theorem step_setDiscriminant_uninit_simulation : 0 = 0 := rfl\n",
+                encoding="utf-8",
+            )
+            lm31 = tmp_root / "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+            with lm31.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "section private theorem step_binOp_offset_disabled_simulation : "
+                    "0 = 0 := rfl end\n"
+                    "#exit'\n"
+                    "theorem step_raw_overwritten_direct_copy_invalid_char_divergence : "
+                    "0 = 0 := rfl\n"
+                )
+            ref = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/RefWitness.lean"
+            with ref.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "section #exit\n"
+                    "theorem retagFnEntryLocalDealloc_simulation : 0 = 0 := rfl\n"
+                )
+            tb = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/TbWitness.lean"
+            tb.parent.mkdir(parents=True, exist_ok=True)
+            tb.write_text(
+                "mutual def unsafeCellProtectedInteriorMut : Nat := 0 end\n",
+                encoding="utf-8",
+            )
+            prov = tmp_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with prov.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    'def rawBackslash := r#"\\"#\n'
+                    "namespace Foo theorem callerRefMutSilentWrongLocal_divergence : "
+                    "0 = 0 := rfl end Foo\n"
+                )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(
+                sorted((d["id"], d["status"]) for d in synth_divs["actionable_anneal_bugs"]),
+                [
+                    ("DIV-LM-D6-OFFSET-DISABLED-TAG", "resolution_missing"),
+                    ("DIV-LM-ENUM-SET-DISCR-UNINIT", "resolution_missing"),
+                    ("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "open"),
+                    ("DIV-MR-CALL-TARGET-LOCAL", "open"),
+                    ("DIV-MR-TB-FNENTRY-LOCAL-DEALLOC", "resolution_missing"),
+                    ("DIV-MR-TB-UNSAFECELL-PROTECTED-IM", "open"),
                 ],
             )
             self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 2)

@@ -1038,6 +1038,24 @@ def _strip_lean_comments_and_strings(src: str) -> str:
                 out.append(" ")
                 i += 1
             continue
+        # Lean 4 raw string literals (`r"..."`, `r#"..."#`, `r##"..."##`) do not escape `\"`.
+        if ch == "r" and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_'!?»")):
+            j = i + 1
+            while j < n and src[j] == "#":
+                j += 1
+            if j < n and src[j] == '"':
+                hashes = j - (i + 1)
+                closing = '"' + ("#" * hashes)
+                out.append(" " * (j - i + 1))
+                i = j + 1
+                while i < n:
+                    if src.startswith(closing, i):
+                        out.append(" " * len(closing))
+                        i += len(closing)
+                        break
+                    out.append("\n" if src[i] == "\n" else " ")
+                    i += 1
+                continue
         if ch == '"':
             out.append(" ")
             i += 1
@@ -1069,39 +1087,95 @@ def _strip_lean_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
-_LEAN_WITNESS_MODIFIERS = (
-    r"(?:(?:private|protected|noncomputable|nonrec|partial|unsafe|scoped|local)\s+|"
-    r"@\[[^\]]*?(?:\[[^\]]*?\][^\]]*?)*\]\s*)*"
-)
-_LEAN_RESOLUTION_MODIFIERS = (
-    r"(?:(?:protected|noncomputable|nonrec|scoped)\s+|"
-    r"@\[[^\]]*?(?:\[[^\]]*?\][^\]]*?)*\]\s*)*"
-)
-# A line consisting only of declaration modifiers / attributes (e.g. `private` on its own
-# line before `theorem foo`), which Lean attaches to the next declaration.
-_LEAN_DANGLING_MODIFIER_LINE = re.compile(
-    r"^[ \t]*(?:(?:private|protected|noncomputable|nonrec|partial|unsafe|scoped|local)\b[ \t]*"
-    r"|@\[[^\n]*?\]+[ \t]*)+$"
+_LEAN_TOKEN_RE = re.compile(
+    r"""
+    @\[
+    | :=
+    | [(\[{⟨)\]}⟩:@.;,]
+    | «[^»\n]+»
+    | \#?[A-Za-z_0-9][A-Za-z_0-9'!?]*
+    """,
+    re.VERBOSE,
 )
 
-
-def _has_dangling_forbidden_modifier(prefix_src: str) -> bool:
-    """True iff the modifier-only lines directly preceding a declaration (skipping blank
-    lines) contain `private`, `unsafe`, or `partial`."""
-    for line in reversed(prefix_src.split("\n")):
-        if not line.strip():
-            continue
-        if not _LEAN_DANGLING_MODIFIER_LINE.match(line):
-            return False
-        if re.search(r"\b(?:private|unsafe|partial)\b", line):
-            return True
-    return False
-
-
-def _truncate_at_lean_exit(stripped_src: str) -> str:
-    """Drop everything after a line-anchored `#exit` (Lean ignores the remainder)."""
-    m = re.search(r"(?m)^[ \t]*#exit\b", stripped_src)
-    return stripped_src[: m.start()] if m else stripped_src
+_LEAN_OPEN_BRACKETS = {"@[", "(", "[", "{", "⟨"}
+_LEAN_CLOSE_BRACKETS = {")", "]", "}", "⟩"}
+_LEAN_DECL_MODIFIERS = {
+    "private",
+    "protected",
+    "noncomputable",
+    "nonrec",
+    "partial",
+    "unsafe",
+    "scoped",
+    "local",
+}
+_LEAN_FORBIDDEN_RES_MODS = {"private", "unsafe", "partial"}
+_LEAN_WITNESS_DECL_KINDS = {
+    "theorem",
+    "lemma",
+    "def",
+    "abbrev",
+    "axiom",
+    "opaque",
+    "structure",
+    "inductive",
+    "class",
+}
+_LEAN_RES_DECL_KINDS = {"theorem", "lemma"}
+_LEAN_IN_PREFIX_CMDS = {
+    "open",
+    "set_option",
+    "include",
+    "omit",
+    "variable",
+    "unseal",
+    "seal",
+    "attribute",
+}
+_LEAN_SCOPE_KEYWORDS = {"namespace", "section", "mutual", "end"}
+_LEAN_OTHER_TOP_CMDS = {
+    "import",
+    "prelude",
+    "universe",
+    "universes",
+    "export",
+    "elab",
+    "macro",
+    "macro_rules",
+    "syntax",
+    "notation",
+    "infix",
+    "infixl",
+    "infixr",
+    "prefix",
+    "postfix",
+    "instance",
+    "deriving",
+    "initialize",
+    "builtin_initialize",
+}
+_LEAN_ALL_CMD_BOUNDARIES = (
+    _LEAN_DECL_MODIFIERS
+    | _LEAN_WITNESS_DECL_KINDS
+    | _LEAN_IN_PREFIX_CMDS
+    | _LEAN_SCOPE_KEYWORDS
+    | _LEAN_OTHER_TOP_CMDS
+    | {"example", "@["}
+)
+_LEAN_TRIVIAL_PIN_TYPES = {"_", "True", "Prop", "Bool", "Nat", "Unit", "PUnit"}
+_LEAN_FORBIDDEN_PIN_ARGS = {
+    "by",
+    "fun",
+    "let",
+    "have",
+    "do",
+    "match",
+    "where",
+    "with",
+    "show",
+    "suffices",
+}
 
 
 def _lean_module_parts(rel_file: str) -> list[str]:
@@ -1113,33 +1187,255 @@ def _lean_module_parts(rel_file: str) -> list[str]:
     return parts
 
 
-def _active_lean_namespace_at(truncated_src: str, pos: int) -> list[str]:
-    """Compute the active `namespace` stack at character offset `pos` in comment/string-stripped Lean source."""
-    stack: list[tuple[str, list[str]]] = []
-    for line in truncated_src[:pos].splitlines():
-        st = line.strip()
-        m_ns = re.match(r"^namespace\s+([^\s]+)$", st)
-        if m_ns:
-            stack.append(("ns", [seg.strip("«»") for seg in m_ns.group(1).split(".") if seg]))
+def _clean_lean_seg(tok: str) -> str:
+    return tok[1:-1] if tok.startswith("«") and tok.endswith("»") else tok
+
+
+def _is_lean_ident_tok(tok: str) -> bool:
+    if tok.startswith("«") and tok.endswith("»"):
+        return True
+    if not tok or tok[0] in "@:()[]{}⟨⟩.,;#0123456789":
+        return False
+    return True
+
+
+def _is_lean_top_cmd_tok(tok: str, prev_tok: str) -> bool:
+    if prev_tok == ".":
+        return False
+    return tok in _LEAN_ALL_CMD_BOUNDARIES or (tok.startswith("#") and len(tok) > 1)
+
+
+def _read_lean_qname(tokens: list[str], idx: int) -> tuple[list[str], int]:
+    """Read `seg (. seg)*` starting at `idx` (including `.1` field projections so `thm.1` does not match `thm`)."""
+    n = len(tokens)
+    if idx >= n or not (_is_lean_ident_tok(tokens[idx]) or tokens[idx].isdigit()):
+        return [], idx
+    segs = [_clean_lean_seg(tokens[idx])]
+    idx += 1
+    while (
+        idx + 1 < n
+        and tokens[idx] == "."
+        and (_is_lean_ident_tok(tokens[idx + 1]) or tokens[idx + 1].isdigit())
+    ):
+        segs.append(_clean_lean_seg(tokens[idx + 1]))
+        idx += 2
+    return segs, idx
+
+
+def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
+    """Tokenize comment/string-stripped Lean 4 source at bracket depth 0.
+
+    Handles multi-line and same-line commands (`namespace Foo theorem bar ... end Foo`,
+    `section private theorem ...`, `open Foo in private\\ntheorem ...`, `private @[simp,\\n ...]`,
+    `mutual ... end`, `section #exit`, `#exit'` non-truncation) and extracts:
+      - `witness_symbols`: every declared witness-eligible constant name;
+      - `resolutions`: `symbol -> list[(effective_namespace_parts, has_forbidden_modifier)]`;
+      - `pins`: `symbol -> list[(audit_active_namespace_parts, inline_qualifier_parts)]` for
+        valid typed `example ... : <NonTrivialProp> := @?symbol <ident_args>*` statement pins.
+    """
+    tokens = _LEAN_TOKEN_RE.findall(stripped_src)
+    n = len(tokens)
+    depth = 0
+    scope_stack: list[tuple[str, list[str]]] = []
+    pending_mods: set[str] = set()
+    witness_symbols: set[str] = set()
+    resolutions: dict[str, list[tuple[list[str], bool]]] = {}
+    pins: dict[str, list[tuple[list[str], list[str]]]] = {}
+
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        prev = tokens[i - 1] if i > 0 else ""
+        if tok in _LEAN_OPEN_BRACKETS:
+            depth += 1
+            i += 1
             continue
-        m_sec = re.match(r"^(?:noncomputable\s+)?section(?:\s+([^\s]+))?$", st)
-        if m_sec:
-            sec_name = [m_sec.group(1).strip("«»")] if m_sec.group(1) else []
-            stack.append(("sec", sec_name))
+        if tok in _LEAN_CLOSE_BRACKETS:
+            if depth > 0:
+                depth -= 1
+            i += 1
             continue
-        m_end = re.match(r"^end(?:\s+([^\s]+))?$", st)
-        if m_end and stack:
-            if not m_end.group(1):
-                stack.pop()
+        if depth > 0 or prev == ".":
+            i += 1
+            continue
+
+        if tok == "#exit":
+            break
+
+        if tok in _LEAN_DECL_MODIFIERS:
+            nxt = tokens[i + 1] if i + 1 < n else ""
+            if tok in ("local", "scoped") and nxt in (_LEAN_IN_PREFIX_CMDS | _LEAN_OTHER_TOP_CMDS):
+                i += 1
+                continue
+            pending_mods.add(tok)
+            i += 1
+            continue
+
+        if tok in _LEAN_IN_PREFIX_CMDS:
+            j = i + 1
+            d2 = 0
+            while j < n:
+                t2 = tokens[j]
+                p2 = tokens[j - 1] if j > 0 else ""
+                if t2 in _LEAN_OPEN_BRACKETS:
+                    d2 += 1
+                elif t2 in _LEAN_CLOSE_BRACKETS:
+                    if d2 > 0:
+                        d2 -= 1
+                elif d2 == 0 and p2 != ".":
+                    if t2 == "in":
+                        i = j + 1
+                        break
+                    if (
+                        t2 == "#exit"
+                        or t2 in (_LEAN_WITNESS_DECL_KINDS | _LEAN_SCOPE_KEYWORDS | {"example"})
+                        or t2 in _LEAN_DECL_MODIFIERS
+                        or t2 == "@["
+                    ):
+                        pending_mods.clear()
+                        i = j
+                        break
+                j += 1
             else:
-                end_parts = [seg.strip("«»") for seg in m_end.group(1).split(".") if seg]
-                while stack and end_parts:
-                    _, sp = stack.pop()
+                break
+            continue
+
+        if tok == "namespace":
+            pending_mods.clear()
+            segs, i = _read_lean_qname(tokens, i + 1)
+            if segs:
+                scope_stack.append(("ns", segs))
+            continue
+
+        if tok == "section":
+            pending_mods.clear()
+            nxt = tokens[i + 1] if i + 1 < n else ""
+            if _is_lean_ident_tok(nxt) and not _is_lean_top_cmd_tok(nxt, ""):
+                scope_stack.append(("sec", [_clean_lean_seg(nxt)]))
+                i += 2
+            else:
+                scope_stack.append(("sec", []))
+                i += 1
+            continue
+
+        if tok == "mutual":
+            pending_mods.clear()
+            scope_stack.append(("mutual", []))
+            i += 1
+            continue
+
+        if tok == "end":
+            pending_mods.clear()
+            nxt = tokens[i + 1] if i + 1 < n else ""
+            if _is_lean_ident_tok(nxt) and not _is_lean_top_cmd_tok(nxt, ""):
+                end_parts, i = _read_lean_qname(tokens, i + 1)
+                while scope_stack and end_parts:
+                    _, sp = scope_stack.pop()
                     if sp and len(sp) <= len(end_parts) and end_parts[-len(sp) :] == sp:
                         end_parts = end_parts[: -len(sp)]
                     else:
                         break
-    return [seg for kind, sp in stack if kind == "ns" for seg in sp]
+            else:
+                if scope_stack:
+                    scope_stack.pop()
+                i += 1
+            continue
+
+        if tok in _LEAN_WITNESS_DECL_KINDS:
+            mods = set(pending_mods)
+            pending_mods.clear()
+            segs, next_i = _read_lean_qname(tokens, i + 1)
+            if segs and not segs[-1].isdigit():
+                sym = segs[-1]
+                witness_symbols.add(sym)
+                if tok in _LEAN_RES_DECL_KINDS:
+                    active_ns = [s for kind, sp in scope_stack if kind == "ns" for s in sp]
+                    inline_ns = segs[:-1]
+                    eff_ns = inline_ns[1:] if (inline_ns and inline_ns[0] == "_root_") else (active_ns + inline_ns)
+                    resolutions.setdefault(sym, []).append((eff_ns, bool(mods & _LEAN_FORBIDDEN_RES_MODS)))
+            i = max(next_i, i + 1)
+            continue
+
+        if tok == "example":
+            mods = set(pending_mods)
+            pending_mods.clear()
+            j = i + 1
+            d2 = 0
+            colon_idx: int | None = None
+            assign_idx: int | None = None
+            let_pending = 0
+            while j < n:
+                t2 = tokens[j]
+                p2 = tokens[j - 1] if j > 0 else ""
+                if t2 in _LEAN_OPEN_BRACKETS:
+                    d2 += 1
+                elif t2 in _LEAN_CLOSE_BRACKETS:
+                    if d2 > 0:
+                        d2 -= 1
+                elif d2 == 0:
+                    if assign_idx is not None and _is_lean_top_cmd_tok(t2, p2):
+                        break
+                    if t2 == ":" and colon_idx is None and assign_idx is None:
+                        colon_idx = j
+                    elif colon_idx is not None and assign_idx is None and p2 != "." and t2 in ("let", "have"):
+                        let_pending += 1
+                    elif t2 == ":=" and assign_idx is None:
+                        if let_pending > 0:
+                            let_pending -= 1
+                        else:
+                            assign_idx = j
+                j += 1
+            end_ex = j
+            if (
+                not (mods & _LEAN_FORBIDDEN_RES_MODS)
+                and colon_idx is not None
+                and assign_idx is not None
+                and colon_idx < assign_idx
+            ):
+                type_toks = tokens[colon_idx + 1 : assign_idx]
+                while len(type_toks) >= 2 and type_toks[0] == "(" and type_toks[-1] == ")":
+                    bal = 0
+                    ok_strip = True
+                    for tt in type_toks[:-1]:
+                        if tt == "(":
+                            bal += 1
+                        elif tt == ")":
+                            bal -= 1
+                            if bal == 0:
+                                ok_strip = False
+                                break
+                    if ok_strip and bal == 1:
+                        type_toks = type_toks[1:-1]
+                    else:
+                        break
+                valid_type = len(type_toks) > 0 and not (
+                    len(type_toks) == 1
+                    and (type_toks[0] in _LEAN_TRIVIAL_PIN_TYPES or type_toks[0].startswith("?"))
+                )
+                rhs_toks = tokens[assign_idx + 1 : end_ex]
+                if valid_type and rhs_toks:
+                    r_idx = 1 if rhs_toks[0] == "@" else 0
+                    qsegs, r_next = _read_lean_qname(rhs_toks, r_idx)
+                    if qsegs and not qsegs[-1].isdigit():
+                        rem = rhs_toks[r_next:]
+                        if all(
+                            (_is_lean_ident_tok(rt) or rt == "_") and rt not in _LEAN_FORBIDDEN_PIN_ARGS
+                            for rt in rem
+                        ):
+                            active_ns = [s for kind, sp in scope_stack if kind == "ns" for s in sp]
+                            pins.setdefault(qsegs[-1], []).append((active_ns, qsegs[:-1]))
+            i = end_ex
+            continue
+
+        if pending_mods:
+            pending_mods.clear()
+        i += 1
+
+    return {
+        "witness_symbols": witness_symbols,
+        "resolutions": resolutions,
+        "pins": pins,
+    }
 
 
 def _has_lean_decl(
@@ -1148,55 +1444,16 @@ def _has_lean_decl(
     *,
     resolution: bool,
     rel_file: str = "",
+    scan: dict[str, Any] | None = None,
 ) -> bool:
-    """Declaration scan on comment/string-stripped Lean source.
-
-    - For `resolution=False` (reintroduced divergence witness check): detects
-      `theorem|lemma|def|abbrev|axiom|opaque|structure|inductive` across multi-line
-      modifiers/attributes, `local`/`scoped` `... in` prefixes, namespace-qualified
-      names, and guillemet-quoted identifiers `«symbol»`.
-    - For `resolution=True` (replacement simulation theorem check): accepts ONLY
-      non-`private`, non-`unsafe`, non-`partial` `theorem`/`lemma` declarations whose
-      effective namespace (`active_namespace + inline_prefix`) is a prefix of the
-      target module's Lean namespace path.
-    """
-    truncated = _truncate_at_lean_exit(stripped_src)
-    esc = re.escape(symbol)
-    sym_pat = rf"(?:«{esc}»|{esc})(?![\w'!?»])"
-    qual_seg = r"(?:«[^»\n]+»|[^\W\d][\w'!?]*)"
+    """Check whether `symbol` is declared in `stripped_src` under witness or resolution rules."""
+    parsed = scan if scan is not None else _scan_lean_declarations_and_pins(stripped_src)
     if not resolution:
-        kinds = r"(?:theorem|lemma|def|abbrev|axiom|opaque|structure|inductive)"
-        # Avoid spanning across earlier declarations by anchoring each candidate at line start
-        # and matching same/multi-line `in`-prefixes + modifiers right before `kinds`.
-        in_line = (
-            r"(?:(?:(?:local|scoped)\s+)?"
-            r"(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[^\n]*?\s+in\s+)*"
-        )
-        pat = (
-            rf"(?:^|\n)[ \t]*{in_line}{_LEAN_WITNESS_MODIFIERS}"
-            rf"{kinds}\s+(?:{qual_seg}\.)*{sym_pat}"
-        )
-        return bool(re.search(pat, truncated))
-
-    in_line_res = (
-        r"(?:(?:(?:local|scoped)\s+)?"
-        r"(?:open|set_option|include|omit|variable|unseal|seal|attribute)\b[^\n]*?\s+in\s+)*"
-    )
-    pat_res = (
-        rf"(?:^|\n)[ \t]*{in_line_res}(?P<mods>{_LEAN_RESOLUTION_MODIFIERS})"
-        rf"(?:theorem|lemma)\s+(?P<qual>(?:{qual_seg}\.)*){sym_pat}"
-    )
+        return symbol in parsed["witness_symbols"]
     mod_parts = _lean_module_parts(rel_file) if rel_file else []
-    for m in re.finditer(pat_res, truncated):
-        if _has_dangling_forbidden_modifier(truncated[: m.start()]):
+    for eff_ns, has_forbidden in parsed["resolutions"].get(symbol, []):
+        if has_forbidden:
             continue
-        qual_raw = m.group("qual")
-        inline_segs = [s.strip("«»") for s in qual_raw.split(".") if s]
-        active_ns = _active_lean_namespace_at(truncated, m.start())
-        if inline_segs and inline_segs[0] == "_root_":
-            eff_ns = inline_segs[1:]
-        else:
-            eff_ns = active_ns + inline_segs
         if mod_parts and (len(eff_ns) > len(mod_parts) or eff_ns != mod_parts[: len(eff_ns)]):
             continue
         return True
@@ -1212,13 +1469,34 @@ AUTHORITY_AUDIT_FILES: dict[str, str] = {
 }
 
 
-def _has_statement_pin(stripped_audit_src: str, symbol: str) -> bool:
-    """True iff some term body in the (comment/string-stripped) audit module starts
-    with `symbol` right after `:=` (an `example : T := symbol ...` statement pin)."""
-    esc = re.escape(symbol)
-    qual_seg = r"(?:«[^»\n]+»|[^\W\d][\w'!?]*)"
-    pat = rf":=\s*@?(?:{qual_seg}\.)*(?:«{esc}»|{esc})(?![\w'!?»])"
-    return bool(re.search(pat, _truncate_at_lean_exit(stripped_audit_src)))
+def _has_statement_pin(
+    stripped_audit_src: str,
+    symbol: str,
+    *,
+    rel_res_file: str = "",
+    rel_pin_file: str = "",
+    scan: dict[str, Any] | None = None,
+) -> bool:
+    """True iff `stripped_audit_src` contains a non-trivial typed `example` statement pin
+    whose RHS directly applies `symbol` (without field projections like `.1`, vacuous `: True`
+    or wildcard `: _` types, or decoy inline/enclosing namespaces)."""
+    parsed = scan if scan is not None else _scan_lean_declarations_and_pins(stripped_audit_src)
+    entries = parsed["pins"].get(symbol, [])
+    if not entries:
+        return False
+    allowed_inline = {"_root_", *_lean_module_parts(rel_res_file)} if rel_res_file else None
+    allowed_audit_ns = (
+        {"StatementPins", *_lean_module_parts(rel_pin_file), *_lean_module_parts(rel_res_file)}
+        if (rel_pin_file or rel_res_file)
+        else None
+    )
+    for active_ns, inline_qual in entries:
+        if allowed_inline is not None and any(seg not in allowed_inline for seg in inline_qual):
+            continue
+        if allowed_audit_ns is not None and any(seg not in allowed_audit_ns for seg in active_ns):
+            continue
+        return True
+    return False
 
 
 def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
@@ -1226,47 +1504,59 @@ def discover_correspondence_divergences(repo_root: Path) -> dict[str, Any]:
     actionable_open: list[dict[str, Any]] = []
     actionable_resolved: list[dict[str, Any]] = []
     modeling_choices: list[dict[str, Any]] = []
-    stripped_cache: dict[Path, str] = {}
+    scan_cache: dict[Path, tuple[str, dict[str, Any]]] = {}
 
-    def read_stripped(path: Path) -> str | None:
-        if path in stripped_cache:
-            return stripped_cache[path]
+    def read_scanned(path: Path) -> tuple[str, dict[str, Any]] | None:
+        if path in scan_cache:
+            return scan_cache[path]
         if not path.is_file():
             return None
         raw = path.read_text(encoding="utf-8", errors="replace")
         stripped = _strip_lean_comments_and_strings(raw)
-        stripped_cache[path] = stripped
-        return stripped
+        scanned = _scan_lean_declarations_and_pins(stripped)
+        scan_cache[path] = (stripped, scanned)
+        return stripped, scanned
 
     for item in TRACKED_CORRESPONDENCE_DIVERGENCES:
         fpath = repo_root / item["file"]
         symbol = item["witness_symbol"]
-        stripped_f = read_stripped(fpath)
+        scanned_f = read_scanned(fpath)
         present = (
-            _has_lean_decl(stripped_f, symbol, resolution=False)
-            if stripped_f is not None
+            _has_lean_decl(scanned_f[0], symbol, resolution=False, scan=scanned_f[1])
+            if scanned_f is not None
             else False
         )
 
         resolution_symbol = item.get("resolution_symbol")
         resolution_present: bool | None = None
+        rel_r = item.get("resolution_file", item["file"])
         if resolution_symbol:
-            rel_r = item.get("resolution_file", item["file"])
-            rpath = repo_root / rel_r
-            stripped_r = read_stripped(rpath)
+            scanned_r = read_scanned(repo_root / rel_r)
             resolution_present = (
-                _has_lean_decl(stripped_r, resolution_symbol, resolution=True, rel_file=rel_r)
-                if stripped_r is not None
+                _has_lean_decl(
+                    scanned_r[0],
+                    resolution_symbol,
+                    resolution=True,
+                    rel_file=rel_r,
+                    scan=scanned_r[1],
+                )
+                if scanned_r is not None
                 else False
             )
 
         resolution_pinned: bool | None = None
         if resolution_symbol and resolution_present:
             rel_pin = item.get("resolution_pin_file", AUTHORITY_AUDIT_FILES.get(item["authority"]))
-            stripped_pin = read_stripped(repo_root / rel_pin) if rel_pin else None
+            scanned_pin = read_scanned(repo_root / rel_pin) if rel_pin else None
             resolution_pinned = (
-                _has_statement_pin(stripped_pin, resolution_symbol)
-                if stripped_pin is not None
+                _has_statement_pin(
+                    scanned_pin[0],
+                    resolution_symbol,
+                    rel_res_file=rel_r,
+                    rel_pin_file=rel_pin or "",
+                    scan=scanned_pin[1],
+                )
+                if scanned_pin is not None
                 else False
             )
 
