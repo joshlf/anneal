@@ -15953,10 +15953,6 @@ theorem sliceAbstractBytes_eq (bytes : ByteMem) (off len : Nat) :
     have hle : off + len ≤ bytes.length := Nat.le_of_ble_eq_true h
     rw [ite_eq_left hle]
 
-private theorem writeAbstractBytesAt_nil (buf : ByteMem) (off : Nat) :
-    writeAbstractBytesAt buf off [] = some buf := by
-  cases buf <;> cases off <;> rfl
-
 private theorem writeAbstractBytesAt_cons :
     ∀ (buf : ByteMem) (off : Nat) (x : AbstractByte) (ws : ByteMem),
       writeAbstractBytesAt buf off (x :: ws) =
@@ -15968,7 +15964,8 @@ private theorem writeAbstractBytesAt_cons :
     have : 0 + ([] : ByteMem).length + 1 ≤ (b :: rest).length := by simp
     show (match writeAbstractBytesAt rest 0 [] with
       | some tail' => some (x :: tail') | none => none) = _
-    rw [writeAbstractBytesAt_nil, ite_eq_left (by simp)]
+    have hnil : writeAbstractBytesAt rest 0 [] = some rest := by cases rest <;> rfl
+    rw [hnil, ite_eq_left (by simp)]
     rfl
   | b :: rest, 0, x, y :: ws => by
     show (match writeAbstractBytesAt rest 0 (y :: ws) with
@@ -15993,7 +15990,8 @@ theorem writeAbstractBytesAt_eq_splice {buf w : ByteMem} {off : Nat}
     writeAbstractBytesAt buf off w = some (splice buf off w) := by
   cases w with
   | nil =>
-    rw [writeAbstractBytesAt_nil]
+    have hnil : writeAbstractBytesAt buf off [] = some buf := by cases buf <;> cases off <;> rfl
+    rw [hnil]
     simp [splice, List.take_append_drop]
   | cons x ws =>
     rw [writeAbstractBytesAt_cons, ite_eq_left (by simpa using h)]
@@ -16010,7 +16008,8 @@ theorem writeAbstractBytesAt_some_inv {buf w mem' : ByteMem} {off : Nat}
     (w.length = 0 ∧ mem' = buf) ∨ (off + w.length ≤ buf.length ∧ mem' = splice buf off w) := by
   cases w with
   | nil =>
-    rw [writeAbstractBytesAt_nil] at hw
+    have hnil : writeAbstractBytesAt buf off [] = some buf := by cases buf <;> cases off <;> rfl
+    rw [hnil] at hw
     exact Or.inl ⟨rfl, (Option.some.inj hw).symm⟩
   | cons x ws =>
     rw [writeAbstractBytesAt_cons] at hw
@@ -16168,7 +16167,7 @@ theorem writeTyped_zero_width {α : Type} (c : ByteLensCodec α 0) (base : Nat) 
   unfold writeTyped
   have hl := c.encode_len v
   cases he : c.encode v with
-  | nil => exact writeAbstractBytesAt_nil mem base
+  | nil => cases mem <;> cases base <;> rfl
   | cons x ws => rw [he] at hl; simp at hl
 
 /-- **Zero-width boundary (reads)**: a zero-width `TypedAt` additionally

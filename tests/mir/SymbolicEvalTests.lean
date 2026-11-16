@@ -3292,6 +3292,429 @@ theorem divergingExtCall_modular_safe_panic_rejected :
       false :=
   ⟨rfl, rfl⟩
 
+/-! ## 14. `V2026_06_01` Closure-Captured Dereference Auto-Discharge & Soundness Canaries -/
+
+private def v26SubjectLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries :=
+    [ { size := { bytes := 4 }, align := { bytes := 4 },
+        backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 1 }, align := { bytes := 1 },
+        backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 8 }, align := { bytes := 4 },
+        backendRepr := .scalarPair
+          (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+          (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+        fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [0, 1] }
+    , { size := { bytes := 0 }, align := { bytes := 1 },
+        backendRepr := .memory, fields := .arbitrary [] [],
+        variants := .single 0, isUninhabited := false } ] }
+
+private def v26ReqLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries :=
+    [ { size := { bytes := 1 }, align := { bytes := 1 },
+        backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 4 }, align := { bytes := 4 },
+        backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .arbitrary [{ bytes := 0 }] [0],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [2] }
+    , { size := { bytes := 0 }, align := { bytes := 1 },
+        backendRepr := .memory, fields := .arbitrary [] [],
+        variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [3] } ] }
+
+private def v26EnsLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries :=
+    [ { size := { bytes := 1 }, align := { bytes := 1 },
+        backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 4 }, align := { bytes := 4 },
+        backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .arbitrary [{ bytes := 0 }] [0],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [2] }
+    , { size := { bytes := 8 }, align := { bytes := 4 },
+        backendRepr := .scalarPair
+          (.initialized (.int 8 false) { start := 0, end_ := 1 })
+          (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+        fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [0, 1] }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [0] }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .arbitrary [{ bytes := 0 }] [0],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [5] }
+    , { size := { bytes := 0 }, align := { bytes := 1 },
+        backendRepr := .memory, fields := .arbitrary [] [],
+        variants := .single 0, isUninhabited := false }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [6] }
+    , { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [3] } ] }
+
+private def mkV26ClosureReqU32
+    (defPath subjPath : String) (op : BinOp) (k : Nat) : CapturedMir :=
+  let closureKind : RigidTy :=
+    .closure (defPath ++ "::{closure#0}")
+      [ .int .i8
+      , .fnPtr [.tuple []] .bool .safe (.other "rust-call")
+      , .tuple [.ref .not (.uint .u32)] ]
+  let refU32Ty : Ty := { kind := .ref .not (.uint .u32), layoutIdx := 2 }
+  { defPath := defPath
+    phase := .runtimeOptimized
+    role := .requires subjPath
+    argCount := 1
+    localDecls :=
+      [ mkDecl .mut { kind := .bool, layoutIdx := 0 }
+      , mkDecl .not { kind := .uint .u32, layoutIdx := 1 }
+      , mkDecl .mut { kind := .bool, layoutIdx := 0 }
+      , mkDecl .mut { kind := .bool, layoutIdx := 0 }
+      , mkDecl .mut { kind := closureKind, layoutIdx := 3 }
+      , mkDecl .mut refU32Ty
+      , mkDecl .not { kind := closureKind, layoutIdx := 3 }
+      , mkDecl .mut { kind := .bool, layoutIdx := 0 }
+      , mkDecl .mut { kind := .ref .not closureKind, layoutIdx := 5 }
+      , mkDecl .mut { kind := .uint .u32, layoutIdx := 1 }
+      , mkDecl .mut refU32Ty ]
+    basicBlocks :=
+      [ { statements :=
+            [ mkStmt (.storageLive 2), mkStmt (.storageLive 3), mkStmt (.storageLive 4)
+            , mkStmt (.storageLive 5), mkStmt (.storageLive 6), mkStmt (.storageLive 7)
+            , mkStmt (.storageLive 8), mkStmt (.storageLive 9), mkStmt (.storageLive 10)
+            , mkStmt (.assign ⟨2, []⟩ (.use (boolConstOperand true)))
+            , mkStmt (.assign ⟨5, []⟩ (.ref .shared ⟨1, []⟩))
+            , mkStmt (.assign ⟨4, []⟩ (.aggregate .tuple [.move ⟨5, []⟩]))
+            , mkStmt (.assign ⟨6, []⟩ (.use (.move ⟨4, []⟩)))
+            , mkStmt (.assign ⟨8, []⟩ (.ref .shared ⟨6, []⟩))
+            , mkStmt (.assign ⟨10, []⟩ (.use (.copy ⟨8, [.deref, .field 0 refU32Ty]⟩)))
+            , mkStmt (.assign ⟨9, []⟩ (.use (.copy ⟨10, [.deref]⟩)))
+            , mkStmt (.assign ⟨7, []⟩ (.binaryOp op (.move ⟨9, []⟩)
+                (.constant { ty := { kind := .uint .u32, layoutIdx := 1 }
+                             val := .scalar (.int { bits := k, sizeBytes := 4 }) })))
+            , mkStmt (.assign ⟨3, []⟩ (.use (.move ⟨7, []⟩)))
+            , mkStmt (.assign ⟨0, []⟩ (.binaryOp .bitAnd (.move ⟨2, []⟩) (.move ⟨3, []⟩))) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ]
+    fnAbi := defaultTestFnAbi
+    layouts := v26ReqLayouts
+    allocations := [] }
+
+private def mkV26ClosureEnsU32
+    (defPath subjPath : String) (op : BinOp) (k : Nat) : CapturedMir :=
+  let clos0 : RigidTy :=
+    .closure (defPath ++ "::{closure#0}")
+      [ .int .i32
+      , .fnPtr [.tuple []] (.uint .u32) .safe (.other "rust-call")
+      , .tuple [.ref .not (.uint .u32)] ]
+  let clos1 : RigidTy :=
+    .closure (defPath ++ "::{closure#1}")
+      [ .int .i8
+      , .fnPtr [.tuple [.uint .u32]] (.tuple [.bool, .uint .u32]) .safe (.other "rust-call")
+      , .tuple [.ref .not .bool] ]
+  let clos10 : RigidTy :=
+    .closure (defPath ++ "::{closure#1}::{closure#0}")
+      [ .int .i8
+      , .fnPtr [.tuple []] .bool .safe (.other "rust-call")
+      , .tuple [.ref .not (.uint .u32)] ]
+  let boolTy0 : Ty := { kind := .bool, layoutIdx := 0 }
+  let u32Ty1 : Ty := { kind := .uint .u32, layoutIdx := 1 }
+  let refU32Ty2 : Ty := { kind := .ref .not (.uint .u32), layoutIdx := 2 }
+  let refBoolTy5 : Ty := { kind := .ref .not .bool, layoutIdx := 5 }
+  let pairTy4 : Ty := { kind := .tuple [.bool, .uint .u32], layoutIdx := 4 }
+  { defPath := defPath
+    phase := .runtimeOptimized
+    role := .ensures subjPath
+    argCount := 2
+    localDecls :=
+      [ mkDecl .mut boolTy0, mkDecl .not u32Ty1, mkDecl .not u32Ty1, mkDecl .not u32Ty1
+      , mkDecl .mut { kind := clos0, layoutIdx := 3 }, mkDecl .mut refU32Ty2
+      , mkDecl .not boolTy0, mkDecl .not u32Ty1, mkDecl .mut pairTy4
+      , mkDecl .mut { kind := clos1, layoutIdx := 6 }, mkDecl .mut refBoolTy5
+      , mkDecl .mut u32Ty1, mkDecl .mut { kind := clos0, layoutIdx := 3 }, mkDecl .mut refU32Ty2
+      , mkDecl .not { kind := clos1, layoutIdx := 6 }, mkDecl .mut pairTy4
+      , mkDecl .mut { kind := .ref .not clos1, layoutIdx := 8 }, mkDecl .not u32Ty1
+      , mkDecl .mut boolTy0, mkDecl .mut boolTy0, mkDecl .mut boolTy0
+      , mkDecl .mut { kind := clos10, layoutIdx := 3 }, mkDecl .mut refU32Ty2
+      , mkDecl .mut refBoolTy5, mkDecl .not { kind := clos10, layoutIdx := 3 }
+      , mkDecl .mut boolTy0, mkDecl .mut { kind := .ref .not clos10, layoutIdx := 9 }
+      , mkDecl .mut u32Ty1, mkDecl .mut refU32Ty2 ]
+    basicBlocks :=
+      [ { statements :=
+            (List.range 26 |>.map (fun i => mkStmt (.storageLive (i + 3)))) ++
+            [ mkStmt (.assign ⟨5, []⟩ (.ref .shared ⟨2, []⟩))
+            , mkStmt (.assign ⟨4, []⟩ (.aggregate .tuple [.move ⟨5, []⟩]))
+            , mkStmt (.assign ⟨12, []⟩ (.use (.move ⟨4, []⟩)))
+            , mkStmt (.assign ⟨13, []⟩ (.use (.copy ⟨12, [.field 0 refU32Ty2]⟩)))
+            , mkStmt (.assign ⟨11, []⟩ (.use (.copy ⟨13, [.deref]⟩)))
+            , mkStmt (.assign ⟨3, []⟩ (.use (.move ⟨11, []⟩)))
+            , mkStmt (.assign ⟨6, []⟩ (.use (boolConstOperand true)))
+            , mkStmt (.assign ⟨10, []⟩ (.ref .shared ⟨6, []⟩))
+            , mkStmt (.assign ⟨9, []⟩ (.aggregate .tuple [.move ⟨10, []⟩]))
+            , mkStmt (.assign ⟨14, []⟩ (.use (.move ⟨9, []⟩)))
+            , mkStmt (.assign ⟨16, []⟩ (.ref .shared ⟨14, []⟩))
+            , mkStmt (.assign ⟨17, []⟩ (.use (.copy ⟨3, []⟩)))
+            , mkStmt (.assign ⟨23, []⟩ (.use (.copy ⟨16, [.deref, .field 0 refBoolTy5]⟩)))
+            , mkStmt (.assign ⟨19, []⟩ (.use (.copy ⟨23, [.deref]⟩)))
+            , mkStmt (.assign ⟨22, []⟩ (.ref .shared ⟨17, []⟩))
+            , mkStmt (.assign ⟨21, []⟩ (.aggregate .tuple [.move ⟨22, []⟩]))
+            , mkStmt (.assign ⟨24, []⟩ (.use (.move ⟨21, []⟩)))
+            , mkStmt (.assign ⟨26, []⟩ (.ref .shared ⟨24, []⟩))
+            , mkStmt (.assign ⟨28, []⟩ (.use (.copy ⟨26, [.deref, .field 0 refU32Ty2]⟩)))
+            , mkStmt (.assign ⟨27, []⟩ (.use (.copy ⟨28, [.deref]⟩)))
+            , mkStmt (.assign ⟨25, []⟩ (.binaryOp op (.move ⟨27, []⟩)
+                (.constant { ty := u32Ty1, val := .scalar (.int { bits := k, sizeBytes := 4 }) })))
+            , mkStmt (.assign ⟨20, []⟩ (.use (.move ⟨25, []⟩)))
+            , mkStmt (.assign ⟨18, []⟩ (.binaryOp .bitAnd (.move ⟨19, []⟩) (.move ⟨20, []⟩)))
+            , mkStmt (.assign ⟨15, []⟩ (.aggregate .tuple [.move ⟨18, []⟩, .copy ⟨17, []⟩]))
+            , mkStmt (.assign ⟨8, []⟩ (.use (.move ⟨15, []⟩)))
+            , mkStmt (.assign ⟨0, []⟩ (.use (.copy ⟨8, [.field 0 boolTy0]⟩)))
+            , mkStmt (.assign ⟨7, []⟩ (.use (.copy ⟨8, [.field 1 u32Ty1]⟩))) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ]
+    fnAbi := defaultTestFnAbi
+    layouts := v26EnsLayouts
+    allocations := [] }
+
+private def mkV26AddConstU32Mir (defPath : String) (delta : Nat) : CapturedMir :=
+  let u32Ty0 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+  let boolTy1 : Ty := { kind := .bool, layoutIdx := 1 }
+  let checkedTy2 : Ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := 2 }
+  { defPath := defPath
+    phase := .runtimeOptimized
+    role := .subject
+    argCount := 1
+    localDecls := [ mkDecl .mut u32Ty0, mkDecl .not u32Ty0, mkDecl .mut checkedTy2 ]
+    basicBlocks :=
+      [ { statements :=
+            [ mkStmt (.storageLive 2)
+            , mkStmt (.assign ⟨2, []⟩ (.binaryOp .addWithOverflow (.copy ⟨1, []⟩)
+                (.constant { ty := u32Ty0, val := .scalar (.int { bits := delta, sizeBytes := 4 }) }))) ]
+          terminator := mkTerm (.assert (.move ⟨2, [.field 1 boolTy1]⟩) false 1 .continue_)
+          isCleanup := false }
+      , { statements := [ mkStmt (.assign ⟨0, []⟩ (.use (.move ⟨2, [.field 0 u32Ty0]⟩))) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ]
+    fnAbi := defaultTestFnAbi
+    layouts := v26SubjectLayouts
+    allocations := [] }
+
+def v26FfiReadRegMir : CapturedMir := mkV26AddConstU32Mir "sym_test::ffi_read_reg" 32
+def v26FfiReadRegReqMir : CapturedMir :=
+  mkV26ClosureReqU32 "sym_test::__anodized_fn_requires_ffi_read_reg" "sym_test::ffi_read_reg" .eq 10
+def v26FfiReadRegEnsMir : CapturedMir :=
+  mkV26ClosureEnsU32 "sym_test::__anodized_fn_ensures_ffi_read_reg" "sym_test::ffi_read_reg" .eq 42
+
+def v26FfiReadRegClaim : Claim where
+  body := v26FfiReadRegMir
+  pre args :=
+    And
+      (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds v26FfiReadRegReqMir args))
+      (argsMatchCalleeParamTys v26FfiReadRegMir args)
+  post args ret := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
+
+theorem v26FfiReadRegPinnedAuto_verified : VerificationResult v26FfiReadRegClaim :=
+  dischargeRustPinnedContractAuto
+    v26FfiReadRegClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
+
+theorem v26FfiReadRegEqU32_verified : VerificationResult v26FfiReadRegClaim :=
+  dischargeRustEqU32FuelFree
+    v26FfiReadRegClaim v26FfiReadRegReqMir v26FfiReadRegEnsMir 10
+
+def v26FfiReadRegTotalClaim : TotalClaim where
+  body := v26FfiReadRegMir
+  pre args mem :=
+    And
+      (And
+        (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds v26FfiReadRegReqMir args))
+        (mem = (initMachineState v26FfiReadRegMir args).memory))
+      (argsMatchSignature (v26FfiReadRegMir.instantiate .nil) args mem)
+  post args _ ret _ := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
+
+theorem v26FfiReadRegTotalPinnedAuto_verified : TotalVerificationResult v26FfiReadRegTotalClaim :=
+  dischargeRustTotalPinnedContractAuto
+    v26FfiReadRegTotalClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
+
+/-- Soundness canary (Pitfall A): without `argsMatchCalleeParamTys` / `argsMatchSignature`,
+an untyped aggregate `[.aggregate 0 [.scalar ⟨10, 4⟩]]` satisfies the closure-deref `requires`
+companion via `extractValueScalarSlice0?` yet faults with `.ub` on `CheckedAdd`! -/
+def v26FfiReadRegUntypedClaim : Claim where
+  body := v26FfiReadRegMir
+  pre args :=
+    And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds v26FfiReadRegReqMir args)
+  post args ret := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
+
+theorem v26FfiReadRegUntypedClaim_refuted :
+    checkOptMirRequiresPinsScalarsDirect 64 (.some v26FfiReadRegReqMir) [⟨10, 4⟩] = false ∧
+    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir (.some v26FfiReadRegReqMir) [⟨10, 4⟩] = true ∧
+    ¬ v26FfiReadRegUntypedClaim.holds :=
+  ⟨rfl, rfl,
+    refuteClaimByBoundedUB
+      v26FfiReadRegUntypedClaim
+      16
+      [.aggregate 0 [.scalar { bits := 10, sizeBytes := 4 }]]
+      ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree v26FfiReadRegReqMir _⟩⟩
+
+def v26ClampAddOneMir : CapturedMir := mkV26AddConstU32Mir "sym_test::clamp_add_one" 1
+def v26ClampAddOneReqMir : CapturedMir :=
+  mkV26ClosureReqU32 "sym_test::__anodized_fn_requires_clamp_add_one" "sym_test::clamp_add_one" .lt 16
+def v26ClampAddOneEnsMir : CapturedMir :=
+  mkV26ClosureEnsU32 "sym_test::__anodized_fn_ensures_clamp_add_one" "sym_test::clamp_add_one" .le 16
+
+def v26ClampAddOneClaim : Claim where
+  body := v26ClampAddOneMir
+  pre args :=
+    And
+      (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds v26ClampAddOneReqMir args))
+      (argsMatchCalleeParamTys v26ClampAddOneMir args)
+  post args ret := MirBoolPredicateHolds v26ClampAddOneEnsMir (args ++ [ret])
+
+theorem v26ClampAddOneSymRange_verified : VerificationResult v26ClampAddOneClaim :=
+  dischargeRustSymRange1Auto
+    v26ClampAddOneClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+
+theorem v26ClampAddOneBoundedRange_verified : VerificationResult v26ClampAddOneClaim :=
+  dischargeRustBoundedRange1Auto
+    v26ClampAddOneClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+
+def v26ClampAddOneTotalClaim : TotalClaim where
+  body := v26ClampAddOneMir
+  pre args mem :=
+    And
+      (And
+        (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds v26ClampAddOneReqMir args))
+        (mem = (initMachineState v26ClampAddOneMir args).memory))
+      (argsMatchSignature (v26ClampAddOneMir.instantiate .nil) args mem)
+  post args _ ret _ := MirBoolPredicateHolds v26ClampAddOneEnsMir (args ++ [ret])
+
+theorem v26ClampAddOneTotalBoundedRange_verified :
+    TotalVerificationResult v26ClampAddOneTotalClaim :=
+  dischargeRustTotalBoundedRange1Auto
+    v26ClampAddOneTotalClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+
+def v26ZeroArgConstMir : CapturedMir :=
+  mkMirBody "sym_test::zero_arg_const" 0
+    [mkDecl .mut u32MirTy]
+    [ { statements := [mkStmt (.assign ⟨0, []⟩ (.use (u32ConstOperand 7)))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def v26ZeroArgEnsMir : CapturedMir :=
+  mkMirBody "sym_test::__anodized_fn_ensures_zero_arg_const" 1
+    [ mkDecl .mut boolMirTy, mkDecl .not u32MirTy ]
+    [ { statements :=
+          [ mkStmt (.assign ⟨0, []⟩
+              (.binaryOp .eq (.copy ⟨1, []⟩) (u32ConstOperand 7))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def v26ZeroArgEnsOnlyClaim : Claim where
+  body := v26ZeroArgConstMir
+  pre args :=
+    And (Trusted.Sequence.length args = 0)
+        (argsMatchCalleeParamTys v26ZeroArgConstMir args)
+  post args ret := MirBoolPredicateHolds v26ZeroArgEnsMir (args ++ [ret])
+
+theorem v26ZeroArgEnsOnlyPinnedAuto_verified :
+    VerificationResult v26ZeroArgEnsOnlyClaim :=
+  dischargeRustPinnedContractAuto
+    v26ZeroArgEnsOnlyClaim 16 16 .none (.some v26ZeroArgEnsMir)
+
+def v26ReadAndOffsetMir : CapturedMir :=
+  let u32Ty0 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+  let boolTy1 : Ty := { kind := .bool, layoutIdx := 1 }
+  let checkedTy2 : Ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := 2 }
+  { defPath := "sym_test::read_and_offset"
+    phase := .runtimeOptimized
+    role := .subject
+    argCount := 1
+    localDecls := [ mkDecl .mut u32Ty0, mkDecl .not u32Ty0, mkDecl .not u32Ty0, mkDecl .mut checkedTy2 ]
+    basicBlocks :=
+      [ { statements := [ mkStmt (.storageLive 2), mkStmt (.storageLive 3) ]
+          terminator :=
+            mkTerm (.call
+              (.constant { ty := { kind := .fnDef "sym_test::ffi_read_reg" [], layoutIdx := 3 }, val := .zeroSized })
+              [.copy ⟨1, []⟩]
+              ⟨2, []⟩
+              (.some 1)
+              .continue_)
+          isCleanup := false }
+      , { statements :=
+            [ mkStmt (.assign ⟨3, []⟩ (.binaryOp .addWithOverflow (.copy ⟨2, []⟩)
+                (.constant { ty := u32Ty0, val := .scalar (.int { bits := 8, sizeBytes := 4 }) }))) ]
+          terminator := mkTerm (.assert (.move ⟨3, [.field 1 boolTy1]⟩) false 2 .continue_)
+          isCleanup := false }
+      , { statements := [ mkStmt (.assign ⟨0, []⟩ (.use (.move ⟨3, [.field 0 u32Ty0]⟩))) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ]
+    fnAbi := defaultTestFnAbi
+    layouts := v26SubjectLayouts
+    allocations := [] }
+
+def v26ReadAndOffsetReqMir : CapturedMir :=
+  mkV26ClosureReqU32 "sym_test::__anodized_fn_requires_read_and_offset" "sym_test::read_and_offset" .eq 10
+def v26ReadAndOffsetEnsMir : CapturedMir :=
+  mkV26ClosureEnsU32 "sym_test::__anodized_fn_ensures_read_and_offset" "sym_test::read_and_offset" .eq 50
+
+def v26FfiReadRegCallContract : MirCallContract where
+  pre req :=
+    And (req.defPath = "sym_test::ffi_read_reg")
+      (And (Trusted.Sequence.length req.args = 1)
+        (MirBoolPredicateHolds v26FfiReadRegReqMir req.args))
+  post req ans :=
+    ∃ retVal,
+      And (ans = .returned retVal req.memory)
+        (And (MirBoolPredicateHolds v26FfiReadRegEnsMir (req.args ++ [retVal]))
+          (retMatchesCalleeReturnTy v26FfiReadRegMir retVal))
+
+theorem v26ReadAndOffsetModular_verified :
+    checkCalleeEnsuresPinsRetDirect 64 v26FfiReadRegEnsMir [.scalar ⟨10, 4⟩] ⟨42, 4⟩ = false ∧
+    checkCalleeEnsuresPinsRet 64 v26FfiReadRegEnsMir [.scalar ⟨10, 4⟩] ⟨42, 4⟩ = true ∧
+    ModularVerificationResult
+      { body := v26ReadAndOffsetMir
+        envAssumed := v26FfiReadRegCallContract.holdsOn
+        pre := fun args mem =>
+          And
+            (And
+              (And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds v26ReadAndOffsetReqMir args))
+              (mem = (initMachineState v26ReadAndOffsetMir args).memory))
+            (argsMatchSignature (v26ReadAndOffsetMir.instantiate .nil) args mem)
+        post := fun args _ ret _ => MirBoolPredicateHolds v26ReadAndOffsetEnsMir (args ++ [ret])
+        callees := [] } :=
+  ⟨rfl, rfl,
+    dischargeRustModularContractAuto
+      v26FfiReadRegCallContract
+      v26ReadAndOffsetMir
+      _
+      _
+      64 64
+      (.some v26ReadAndOffsetReqMir)
+      (.some v26ReadAndOffsetEnsMir)
+      "sym_test::ffi_read_reg"
+      1
+      (.some v26FfiReadRegReqMir)
+      v26FfiReadRegEnsMir
+      []⟩
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
 /-!

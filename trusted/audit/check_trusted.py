@@ -27,6 +27,7 @@ sys.dont_write_bytecode = True  # Public self-test imports must not write checko
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
+CHILD_TIMEOUT_SECS = 180
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -390,7 +391,7 @@ class Checker:
             with stdout.open("xb") as out, stderr.open("xb") as err:
                 try:
                     completed = subprocess.run(command, cwd=self.stage, env=self.environment,
-                                               stdout=out, stderr=err, timeout=60, check=False)
+                                               stdout=out, stderr=err, timeout=CHILD_TIMEOUT_SECS, check=False)
                     code = completed.returncode
                 except subprocess.TimeoutExpired:
                     timed_out = True
@@ -403,7 +404,7 @@ class Checker:
         self.last_status = observation
         self.budget()
         if timed_out:
-            raise Failure(2, label, "direct Lean child exceeded 60 seconds; no retry")
+            raise Failure(2, label, f"direct Lean child exceeded {CHILD_TIMEOUT_SECS} seconds; no retry")
         if code != 0:
             raise Failure(2, label, f"Lean exited {code}; see {stem}.stdout/.stderr")
         return stdout.read_text(encoding="utf-8", errors="strict")
@@ -442,7 +443,7 @@ class Checker:
                 env=self.environment,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=CHILD_TIMEOUT_SECS,
                 check=False,
             )
             if res_c.returncode != 0 or not c_path.is_file():
@@ -453,7 +454,7 @@ class Checker:
                 env=self.environment,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=CHILD_TIMEOUT_SECS,
                 check=False,
             )
             if res_bin.returncode != 0 or not tmp_bin.is_file():

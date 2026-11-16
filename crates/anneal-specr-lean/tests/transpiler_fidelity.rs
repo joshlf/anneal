@@ -46,6 +46,44 @@ fn make_ephemeral_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
+fn bounded_lean_threads() -> String {
+    std::env::var("LEAN_NUM_THREADS")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 4).to_string())
+                .unwrap_or_else(|_| "2".to_string())
+        })
+}
+
+fn ensure_examples_minirust_built(examples_dir: &Path, augmented_path: &str) {
+    static MINIRUST_BUILD: std::sync::OnceLock<std::sync::Mutex<bool>> = std::sync::OnceLock::new();
+    let lock = MINIRUST_BUILD.get_or_init(|| std::sync::Mutex::new(false));
+    let mut built = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if *built {
+        return;
+    }
+    let threads = bounded_lean_threads();
+    let status_build = std::process::Command::new("lake")
+        .args(["build", "MiniRust"])
+        .current_dir(examples_dir)
+        .env("PATH", augmented_path)
+        .env("LAKE_ARTIFACT_CACHE", "true")
+        .env("LAKE_RESTORE_ARTIFACTS", "true")
+        .env("LEAN_NUM_THREADS", &threads)
+        .output()
+        .expect("spawn `lake build MiniRust`");
+    assert!(
+        status_build.status.success(),
+        "`lake build MiniRust` failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status_build.stdout),
+        String::from_utf8_lossy(&status_build.stderr)
+    );
+    *built = true;
+}
+
 #[test]
 fn gate1_upstream_lock_sha256_integrity_both_real_snapshots() {
     let root = repo_root();
@@ -1441,18 +1479,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
     let augmented_path =
         format!("{home}/.cargo/bin:{home}/.elan/bin:{home}/.local/bin:{current_path}");
 
-    let status_build = std::process::Command::new("lake")
-        .args(["build", "MiniRust"])
-        .current_dir(&examples_dir)
-        .env("PATH", &augmented_path)
-        .output()
-        .expect("spawn `lake build MiniRust`");
-    assert!(
-        status_build.status.success(),
-        "`lake build MiniRust` failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&status_build.stdout),
-        String::from_utf8_lossy(&status_build.stderr)
-    );
+    ensure_examples_minirust_built(&examples_dir, &augmented_path);
 
     let output = std::process::Command::new("lake")
         .arg("env")
@@ -1460,6 +1487,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
         .arg(&lean_harness_path)
         .current_dir(&examples_dir)
         .env("PATH", &augmented_path)
+        .env("LEAN_NUM_THREADS", bounded_lean_threads())
         .output()
         .expect("spawn `lake env lean` on 520+ vector harness");
 
@@ -1666,11 +1694,14 @@ pub fn advance_vault(state: VaultState, caller: Int, write_req: bool, bonus: Int
     let current_path = std::env::var("PATH").unwrap_or_default();
     let augmented_path =
         format!("{home}/.cargo/bin:{home}/.elan/bin:{home}/.local/bin:{current_path}");
+    let examples_dir = root.join("examples");
+    ensure_examples_minirust_built(&examples_dir, &augmented_path);
     let out = std::process::Command::new("lake")
         .args(["env", "lean"])
         .arg(&harness_path)
-        .current_dir(root.join("examples"))
+        .current_dir(&examples_dir)
         .env("PATH", &augmented_path)
+        .env("LEAN_NUM_THREADS", bounded_lean_threads())
         .output()
         .expect("run lake env lean on UnseenHoldoutCheck.lean");
     let _ = fs::remove_dir_all(&tmp);

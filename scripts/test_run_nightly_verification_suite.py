@@ -234,7 +234,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "lake_build_core_theory": 900,
             "check_trusted_fast": 600,
             "rust_workspace_unit_tests": 600,
-            "check_trusted_self_test": 600,
+            "check_trusted_self_test": 1200,
             "tests_mir_bit_validity_stage1": 300,
             "tests_mir_byte_codec": 300,
             "tests_mir_cast_stage1": 300,

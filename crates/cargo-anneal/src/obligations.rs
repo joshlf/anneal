@@ -801,8 +801,20 @@ pub fn render_obligations_module_with_options(
              And (req.defPath = \"{def_id}\") (defaultPre req.args)\n  \
            post req ans :=\n    \
              ∃ retVal,\n      \
-               And (ans = .returned retVal req.memory) (defaultPost req.args retVal)\n\n"
+               And (ans = .returned retVal req.memory)\n          \
+                   (And (defaultPost req.args retVal)\n                \
+                        (Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.{item}.body retVal))\n\n"
     ));
+
+    let default_spec_pre = if has_contract_companions {
+        format!(
+            "fun args =>\n    \
+               And (defaultPre args)\n        \
+                   (Trusted.VerificationResult.argsMatchCalleeParamTys Mir.{item}.body args)"
+        )
+    } else {
+        "defaultPre".to_string()
+    };
 
     out.push_str(&format!(
         "/-- Low-priority default `ItemSpec` instance for `{def_id}`.\n    \
@@ -812,7 +824,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "instance (priority := low) defaultSpec : ItemSpec \"{def_id}\" where\n  \
-           pre := defaultPre\n  \
+           pre := {default_spec_pre}\n  \
            post := defaultPost\n\n"
     ));
 
@@ -1132,6 +1144,16 @@ pub fn render_obligations_module_with_options(
     ));
 
     let sha = &bundle.subject.target.mir_module_sha256;
+    let claim_for_pre_head = if authored.has_specs {
+        "spec.pre args"
+    } else {
+        "defaultPreFor typeArgs args"
+    };
+    let claim_for_post_head = if authored.has_specs {
+        "spec.post args ret"
+    } else {
+        "defaultPostFor typeArgs args ret"
+    };
     out.push_str(&format!(
         "/-- Verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
          def claimFor\n    \
@@ -1139,13 +1161,13 @@ pub fn render_obligations_module_with_options(
              (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              pre := fun args =>\n      \
-               And (spec.pre args)\n          \
+               And ({claim_for_pre_head})\n          \
                    (Trusted.VerificationResult.argsMatchSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs)\n            \
                      args\n            \
                      (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory)\n    \
              post := fun args ret =>\n      \
-               And (spec.post args ret)\n          \
+               And ({claim_for_post_head})\n          \
                    (Trusted.VerificationResult.retMatchesSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs)\n            \
                      ret\n            \
@@ -2199,6 +2221,10 @@ mod tests {
         assert!(empty_obligations.contains(
             "def defaultPost (args : List Value) (ret : Value) : Prop :=\n  True"
         ));
+        assert!(!empty_obligations.contains("argsMatchCalleeParamTys"));
+        assert!(empty_obligations.contains(
+            "Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.MyCrate.math.id.body retVal"
+        ));
 
         let multi_bundle = SubjectObligationBundle {
             subject,
@@ -2613,6 +2639,23 @@ mod tests {
         let bundle = &bundles[0];
 
         let obligations = render_obligations_module(bundle);
+        assert!(obligations.contains(
+            "Trusted.VerificationResult.argsMatchCalleeParamTys Mir.MyCrate.math.inc.body args"
+        ));
+        assert!(obligations.contains(
+            "Trusted.VerificationResult.retMatchesCalleeReturnTy Mir.MyCrate.math.inc.body retVal"
+        ));
+        assert!(obligations.contains("And (defaultPreFor typeArgs args)"));
+        assert!(obligations.contains("And (defaultPostFor typeArgs args ret)"));
+        let authored_obligations = render_obligations_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_specs: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(authored_obligations.contains("And (spec.pre args)"));
+        assert!(authored_obligations.contains("And (spec.post args ret)"));
         assert!(obligations.contains(
             "def sigPre\n    \
                  (typeArgs : Trusted.MirAst.TypeSubst)\n    \
