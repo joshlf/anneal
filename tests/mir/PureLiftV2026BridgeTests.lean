@@ -35,11 +35,14 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    from the plan's `HoldsFnSpec` alone (`mir_diamond_cfgCertificate_sound`), for
    the symbolic oracle (`.convergedJump`) and the concrete one (path
    `0 → 1/2 → 3`), and through the `LocalBlockVC` route of
-   `mir_cfgCertificate_sound` with the exact 2-point invariant. Test 2b-asym
+   `mir_cfgCertificate_sound` with the exact 2-point invariant; its fuel `3` is
+   exact on both modes. Test 2b-asym
    replays an asymmetric 5-block diamond (`bb1 -> bb2` vs. `bb3`, `armSteps =
    Nat.max 2 1 = 2` with `.outOfFuel` at fuel `3` and convergence at fuel `4`),
    through `mir_blockCfg_sound`, through `CfgCertificate.asymDiamond` /
-   `mir_asymDiamond_cfgCertificate_sound`, and as a segment
+   `mir_asymDiamond_cfgCertificate_sound` for the symbolic oracle and for both
+   concrete oracles (the 4-step `true` arm `0 → 1 → 2 → 4` simulated block for
+   block at the certificate's exact fuel `4`), and as a segment
    (`mirCfg_segmentSim_of_emitsSubIdWraps`) landing exactly on the live join
    state, while the rejection canaries check that a rejecting wrapper, a
    block-level leaked handle (`diamondLeakRetBlocks`), or a guarded
@@ -1330,6 +1333,26 @@ theorem db_cfgCertificate_sound (c : Bool) :
          fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
      Or.inl ⟨rfl, rfl, rfl⟩⟩
 
+/-- **`CfgCertificate.diamond`'s fuel `3` is exact**: the concrete path
+(`0 → 1/2 → 3`) and the symbolic run (`.convergedJump 1`: one step and one delay
+tick, then `bb3`) both diverge at fuel `2` and return at the certificate's fuel
+`3`, the latter from the certificate's own `sound` field applied to the plan's
+evaluation (concrete `dbParams c` and symbolic `diamondParams c`). -/
+theorem diamondCert_fuel_exact (c : Bool) :
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (dbSt0 c) 2 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (dbSt0 c)
+      diamondCert.fuel = .ret (dbOut c) ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (diamondSt0 c) 2 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (diamondSt0 c)
+      diamondCert.fuel = .ret (diamondSymOut c) :=
+  ⟨by cases c <;> rfl,
+   diamondCert.sound (dbParams c) (dbSt0 c) (dbOut c) rfl (by cases c <;> rfl),
+   by cases c <;> rfl,
+   diamondCert.sound (diamondParams c) (diamondSt0 c) (diamondSymOut c)
+     (diamond_init c) (by cases c <;> rfl)⟩
+
 /-- Wrapper-level unit test for `handleFreeOutOpt stdValAlg` inside
 `runBlockCfg`: block `0` emits `.convergedJump 1 (handleFreeOutOpt stdValAlg) 3
 (diamondStJoin c)` and block `3` returns `⟨.refVal 0 [], []⟩`. -/
@@ -1836,6 +1859,185 @@ theorem asymDiamond_cfgCertificate_sound (c : Bool) :
      ⟨⟨trivial, trivial⟩,
       mirLocalsRel_of_localsRefine
         ⟨fun _ => ⟨_, rfl, .symBool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-! #### Test 2b-asym-cert (concrete condition): the 4-step arm at the certificate's exact fuel -/
+
+/-- Concrete result of `asym_diamond` for oracle `c`: `(20, 4)` when `c` (the
+`true` arm sets `x = 20`, then writes it through `&mut p.0`), else `(3, 3)`. -/
+def asymConcOut (c : Bool) : FuncOut StdVal :=
+  ⟨if c then .pair (.nat 20) (.nat 4) else .pair (.nat 3) (.nat 3), []⟩
+
+/-- **`CfgCertificate.asymDiamond`'s fuel `4` is exact on both of its longest
+paths**: the concrete `true` path (`0 → 1 → 2 → 4`, four block steps) and the
+symbolic run (`.convergedJump 2`: one step and two delay ticks, then `bb4`) both
+diverge at fuel `3` and return at the certificate's fuel `4`, while the concrete
+`false` path (`0 → 3 → 4`) already returns at fuel `3`. The fuel-`4` returns
+come from the certificate's own `sound` field applied to the plan's evaluation
+(concrete `dbParams c` and symbolic `diamondParams c`). -/
+theorem asymDiamondCert_fuel_exact (c : Bool) :
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 true) 3 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 c)
+      asymDiamondCert.fuel = .ret (asymConcOut c) ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 false) 3 =
+      .ret (asymConcOut false) ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (diamondSt0 c) 3 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (diamondSt0 c)
+      asymDiamondCert.fuel = .ret (asymDiamondSymOut c) :=
+  ⟨rfl,
+   asymDiamondCert.sound (dbParams c) (dbSt0 c) (asymConcOut c) rfl
+     (by cases c <;> rfl),
+   rfl,
+   by cases c <;> rfl,
+   asymDiamondCert.sound (diamondParams c) (diamondSt0 c) (asymDiamondSymOut c)
+     (diamond_init c) (by cases c <;> rfl)⟩
+
+/-- Live state at the header of the taken arm of `asymDiamondBody` (`bb1` if
+`c`, else `bb3`), after `bb0` built `_4 = (_2, _3)`. -/
+def asymConcMsArm (c : Bool) : MachineState :=
+  { frame :=
+      { blockIdx := if c then 1 else 3, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨if c then 1 else 0, 1⟩), .init (.scalar ⟨3, 4⟩),
+           .init (.scalar ⟨4, 4⟩), .init (.aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]),
+           .uninit] }
+    memory := (asymDiamondMs0 c).memory }
+
+/-- Live state at the header of `bb2` on the `true` arm: `_5 = &mut _4.0`
+through the `reserved` tag `1`, `x` still `3`. -/
+def asymConcMsMid : MachineState :=
+  { frame :=
+      { blockIdx := 2, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨3, 4⟩), .init (.scalar ⟨4, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]), .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { (asymDiamondMs0 true).memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 4, targetProjection := [.field 0 u32Ty],
+             perm := .reservedFrz false }]
+        nextTag := 2 } }
+
+/-- `PureLift` state at the join `bb4` on the concrete `true` path: the loan of
+`p.0` from `bb1` is still active and `x = 20` (set in `bb2`). -/
+def asymConcStJoinT : SymState StdVal :=
+  ⟨[⟨.bool true, .unborrowed⟩, ⟨.nat 20, .unborrowed⟩, ⟨.nat 4, .unborrowed⟩,
+    ⟨.pair (.nat 3) (.nat 4), .split [([0], .mutLocked 0)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat 3, .unborrowed⟩, .direct (.localReg 3) [0]⟩],
+   [], [], [], 0⟩
+
+/-- `PureLift` state at the join `bb4` for the concrete oracle `c`. -/
+def asymConcStJoin (c : Bool) : SymState StdVal :=
+  if c then asymConcStJoinT else dbSt3 false
+
+theorem asymConc_rel_arm (c : Bool) :
+    mirStateRel tagOfLoan [] (dbSt1 c) (asymConcMsArm c) := by
+  cases c <;>
+  exact ⟨⟨trivial, trivial⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .pair (.nat (by decide)) (.nat (by decide))⟩, trivial⟩⟩
+
+theorem asymConc_rel_mid :
+    mirStateRel tagOfLoan [(0, 4, [0])] (dbSt3 true) asymConcMsMid :=
+  ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+theorem asymConc_rel_join (c : Bool) :
+    mirStateRel tagOfLoan [(0, 4, if c then [0] else [1])] (asymConcStJoin c)
+      (asymDiamondMsJoin c) := by
+  cases c <;>
+  exact ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+def asymConcBindingsAt (c : Bool) (bb : Nat) : List (LoanId × Local × SubPath) :=
+  if bb = 2 ∨ bb = 4 then [(0, 4, if c then [0] else [1])] else []
+
+/-- Block-entry relation of the concrete asymmetric diamond: one live header
+state per visited block (`bb0`, the taken arm's first block, `bb2` on the
+2-block `true` arm only, and the join `bb4`). -/
+def asymConcExtra (c : Bool) (bb : Nat) (st : SymState StdVal) (ms : MachineState) :
+    Prop :=
+  (bb = 0 ∧ st = dbSt0 c ∧ ms = asymDiamondMs0 c) ∨
+  (bb = (if c then 1 else 3) ∧ st = dbSt1 c ∧ ms = asymConcMsArm c) ∨
+  (c = true ∧ bb = 2 ∧ st = dbSt3 true ∧ ms = asymConcMsMid) ∨
+  (bb = 4 ∧ st = asymConcStJoin c ∧ ms = asymDiamondMsJoin c)
+
+/-- **Test 2b-asym-cert (concrete condition)**: `CfgCertificate.asymDiamond`
+certifies the concrete asymmetric diamond (`_0 = .bool c`) through
+`mir_asymDiamond_cfgCertificate_sound`, simulating the 2-block `true` arm block
+for block (`bb0 → bb1 → bb2 → bb4`, four steps at the certificate's exact fuel)
+and the 1-block `false` arm (`bb0 → bb3 → bb4`) on the live machine, so the
+concrete paths of `cfg_certificate_asymDiamond_sound` and
+`asymDiamondCfgInv_invClosedNoFork` are exercised end to end. -/
+theorem asymDiamond_cfgCertificate_sound_concrete (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges asymDiamondBody (asymDiamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = asymConcOut c) o []) :=
+  mir_asymDiamond_cfgCertificate_sound tagOfLoan asymDiamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan asymDiamondArmTrue2Plan diamondArmFalsePlan
+    asymDiamondPostPlan (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl)
+    asymDiamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    asymDiamondPostPlan_continuing
+    (dbParams c) (dbSt0 c) (· = asymConcOut c)
+    (asymConcBindingsAt c) id (asymConcExtra c) []
+    rfl (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hC, hBb, hSt, hMs⟩ |
+          ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 3 (asymDiamondMs0 false) =
+              .reached (asymConcMsArm false))
+            ⟨rfl, rfl, asymConc_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 1 (asymDiamondMs0 true) =
+              .reached (asymConcMsArm true))
+            ⟨rfl, rfl, asymConc_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      · subst hSt; subst hMs
+        cases c
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 4 (asymConcMsArm false) =
+              .reached (asymDiamondMsJoin false))
+            ⟨rfl, rfl, asymConc_rel_join false, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 2 (asymConcMsArm true) =
+              .reached asymConcMsMid)
+            ⟨rfl, rfl, asymConc_rel_mid, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl, rfl⟩))⟩
+      · subst hC; subst hBb; subst hSt; subst hMs
+        exact stepsTo_of_runMirToBlock_reached (rfl :
+          Anneal.PureMirExec.runMirToBlock asymDiamondBody 4 asymConcMsMid =
+            .reached (asymDiamondMsJoin true))
+          ⟨rfl, rfl, asymConc_rel_join true, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩)
+    ⟨rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .bool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
          fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
      Or.inl ⟨rfl, rfl, rfl⟩⟩
 
