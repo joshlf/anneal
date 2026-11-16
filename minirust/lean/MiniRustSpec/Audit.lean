@@ -3473,10 +3473,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_notInFragment
   twoPhaseForeignWriteDiscrepancy_anneal_ub
   twoPhaseForeignWriteDiscrepancy_minirust_direct
-  twoPhaseDirectWriteTreeBorrowsGap_translate
-  twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
-  twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
+  twoPhaseDirectWriteTreeBorrows_translate
+  twoPhaseDirectWriteTreeBorrows_notInFragment
+  twoPhaseDirectWriteTreeBorrows_anneal_ub
+  twoPhaseDirectWriteTreeBorrows_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
   frozenRefMutReborrow_minirust_direct
@@ -3689,7 +3689,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   misalignedRef_tb_direct
   danglingRef_tb_direct
   twoPhaseForeignWriteDiscrepancy_tb_direct
-  twoPhaseDirectWriteTreeBorrowsGap_tb_direct
+  twoPhaseDirectWriteTreeBorrows_tb_direct
+  twoPhaseDirectWriteTreeBorrows_simulation
   frozenRefMutReborrow_tb_direct
   frozenRefMutReborrowWrite_translate
   frozenRefMutReborrowWrite_notInFragment
@@ -3705,11 +3706,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagTrulyDisabledRefUb_anneal_ub
   retagTrulyDisabledRefUb_minirust_direct
   retagTrulyDisabledRefUb_tb_direct
-  retagFnEntryLocalDeallocUb_translate
-  retagFnEntryLocalDeallocUb_notInFragment
-  retagFnEntryLocalDeallocUb_anneal_ret
-  retagFnEntryLocalDeallocUb_minirust_direct
-  retagFnEntryLocalDeallocUb_tb_direct
+  retagFnEntryLocalDealloc_translate
+  retagFnEntryLocalDealloc_notInFragment
+  retagFnEntryLocalDealloc_anneal_ub
+  retagFnEntryLocalDealloc_minirust_direct
+  retagFnEntryLocalDealloc_tb_direct
+  retagFnEntryLocalDealloc_simulation
   retagScalarDiscrepancy_tb_direct
   transmuteSharedRefToMutWriteDiscrepancy_tb_direct
   transmuteDanglingIntToRefDiscrepancy_tb_direct
@@ -3970,10 +3972,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_notInFragment
   twoPhaseForeignWriteDiscrepancy_anneal_ub
   twoPhaseForeignWriteDiscrepancy_minirust_direct
-  twoPhaseDirectWriteTreeBorrowsGap_translate
-  twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
-  twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
+  twoPhaseDirectWriteTreeBorrows_translate
+  twoPhaseDirectWriteTreeBorrows_notInFragment
+  twoPhaseDirectWriteTreeBorrows_anneal_ub
+  twoPhaseDirectWriteTreeBorrows_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
   frozenRefMutReborrow_minirust_direct
@@ -4186,7 +4188,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   misalignedRef_tb_direct
   danglingRef_tb_direct
   twoPhaseForeignWriteDiscrepancy_tb_direct
-  twoPhaseDirectWriteTreeBorrowsGap_tb_direct
+  twoPhaseDirectWriteTreeBorrows_tb_direct
+  twoPhaseDirectWriteTreeBorrows_simulation
   frozenRefMutReborrow_tb_direct
   frozenRefMutReborrowWrite_translate
   frozenRefMutReborrowWrite_notInFragment
@@ -4202,11 +4205,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagTrulyDisabledRefUb_anneal_ub
   retagTrulyDisabledRefUb_minirust_direct
   retagTrulyDisabledRefUb_tb_direct
-  retagFnEntryLocalDeallocUb_translate
-  retagFnEntryLocalDeallocUb_notInFragment
-  retagFnEntryLocalDeallocUb_anneal_ret
-  retagFnEntryLocalDeallocUb_minirust_direct
-  retagFnEntryLocalDeallocUb_tb_direct
+  retagFnEntryLocalDealloc_translate
+  retagFnEntryLocalDealloc_notInFragment
+  retagFnEntryLocalDealloc_anneal_ub
+  retagFnEntryLocalDealloc_minirust_direct
+  retagFnEntryLocalDealloc_tb_direct
+  retagFnEntryLocalDealloc_simulation
   retagScalarDiscrepancy_tb_direct
   transmuteSharedRefToMutWriteDiscrepancy_tb_direct
   transmuteDanglingIntToRefDiscrepancy_tb_direct
@@ -4353,6 +4357,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellProtectedInteriorMut_anneal_ret
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
+  unsafeCellProtectedInteriorMut_simulation
+  unsafeCellProtectedStorageDead_simulation
   exposeSingleRefMutRoundTrip_translateIntr
   exposeSingleRefMutRoundTrip_anneal_ret
   exposeSingleRefMutRoundTrip_minirust_direct
@@ -4548,6 +4554,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellProtectedInteriorMut_anneal_ret
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
+  unsafeCellProtectedInteriorMut_simulation
+  unsafeCellProtectedStorageDead_simulation
   exposeSingleRefMutRoundTrip_translateIntr
   exposeSingleRefMutRoundTrip_anneal_ret
   exposeSingleRefMutRoundTrip_minirust_direct
@@ -5015,10 +5023,10 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSharedRefWriteUb_B3_divergence
   callerRawPtrRetagFnEntry_anneal_ub
   callerRawPtrRetagFnEntry_B3_divergence
-  callerRefMutSilentWrongLocal_anneal_137
-  callerRefMutSilentWrongLocal_divergence
-  callerBorrowAcrossScalarCall_anneal_ub
-  callerBorrowAcrossScalarCall_divergence
+  callerRefMutSilentWrongLocal_anneal_ret
+  callerRefMutSilentWrongLocal_simulation
+  callerBorrowAcrossScalarCall_anneal_ret
+  callerBorrowAcrossScalarCall_simulation
   callerBorrowExposeAndScalarCall_anneal_92
   callerBorrowExposeAndScalarCall_three_way
   progSingleExposeSiteOk_nil
@@ -5441,10 +5449,10 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSharedRefWriteUb_B3_divergence
   callerRawPtrRetagFnEntry_anneal_ub
   callerRawPtrRetagFnEntry_B3_divergence
-  callerRefMutSilentWrongLocal_anneal_137
-  callerRefMutSilentWrongLocal_divergence
-  callerBorrowAcrossScalarCall_anneal_ub
-  callerBorrowAcrossScalarCall_divergence
+  callerRefMutSilentWrongLocal_anneal_ret
+  callerRefMutSilentWrongLocal_simulation
+  callerBorrowAcrossScalarCall_anneal_ret
+  callerBorrowAcrossScalarCall_simulation
   callerBorrowExposeAndScalarCall_anneal_92
   callerBorrowExposeAndScalarCall_three_way
   progSingleExposeSiteOk_nil

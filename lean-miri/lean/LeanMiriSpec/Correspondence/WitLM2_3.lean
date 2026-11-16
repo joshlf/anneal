@@ -60,8 +60,8 @@ exercising all five `LM-2.3` simulation theorems plus control-flow helpers and
    `discriminant(_1)` on `.uninit`, `Lm23Enum::V0` aggregate assignment to
    `.dead` `_4`, `Downcast` + `Field` projection from `.dead` `_4`, and
    `SetDiscriminant(_4, 1)` on `.dead` `_4`.
-6. `wit_lm2_3_setDiscriminant_uninit_divergence`: `SetDiscriminant(_1, 0)` on
-   `.uninit` `_1` is UB in Anneal, but lean-miri writes the tag and steps.
+6. `wit_lm2_3_setDiscriminant_uninit_simulation`: `SetDiscriminant(_1, 0)` on
+   `.uninit` `_1` writes the tag and steps to `.init (.aggregate 0 .nil)` in lockstep.
 7. `wit_lm2_3_inactive_variant_initialized_divergence`: after
    `_1 = Lm23Enum::V1(42_u32)`, projecting inactive variant `V2`'s first field
    `((_1 as 2).0 : u32)` at `[4, 8)` (which overlaps active `V1.0` at `[4, 8)`)
@@ -1282,16 +1282,23 @@ theorem wit_lm2_3_uninit_and_dead_ub :
       (fun _ _ _ hsl _ _ => by simp [lm23InitAnneal, get?] at hsl)
     exact ⟨ha, hrel.ub_iff.mp ha⟩
 
-/-! ## 7. Witness 6: `SetDiscriminant` on `.uninit` Diverges (`bb8`) -/
+/-! ## 7. Witness 6: `SetDiscriminant` on `.uninit` Simulation (`bb8`) -/
 
-/-- **Witness 6 (`wit_lm2_3_setDiscriminant_uninit_divergence`)**:
-`SetDiscriminant(_1, 0)` on the fresh `.uninit` local `_1` is UB in Anneal,
-but lean-miri forces `_1` into memory, writes tag `0`, and completes the step
-(`step_setDiscriminant_uninit_divergence`). -/
-theorem wit_lm2_3_setDiscriminant_uninit_divergence :
-    stepMirFn lm23Body (lm23InitAnneal 8) = .fail .ub ∧
-    ∃ m', Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 8) = (m', .ok true) :=
-  step_setDiscriminant_uninit_divergence
+/-- **Witness 6 (`wit_lm2_3_setDiscriminant_uninit_simulation`)**:
+`SetDiscriminant(_1, 0)` on the fresh `.uninit` local `_1` writes tag `0` and
+steps to `.init (.aggregate 0 .nil)` in lockstep in both Anneal and `lean-miri`
+(`step_setDiscriminant_uninit_simulation`). -/
+theorem wit_lm2_3_setDiscriminant_uninit_simulation :
+    let s' := advanceStmt (lm23InitAnneal 8)
+      ((lm23InitAnneal 8).frame.locals.set 1 (.init (.aggregate 0 .nil)))
+    stepMirFn lm23Body (lm23InitAnneal 8) = .step s' ∧
+    StepRelLM2_3 lm23Body lm23Env 0 (lm23InitMiri 8)
+      (stepMirFn lm23Body (lm23InitAnneal 8))
+      (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 8)) ∧
+    ∃ m',
+      Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 8) = (m', .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 s' m' :=
+  step_setDiscriminant_uninit_simulation
     (lm23_init_stateRelLM2_3 8 1 (by decide)) lm23_phase lm23_env_valid
     rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide) rfl
 

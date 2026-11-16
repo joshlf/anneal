@@ -1734,12 +1734,38 @@ private theorem wbInvalidateConflictingBorrows_eq_map_updateAllocMapOnWrite
     simp only [List.map_cons, invalidateConflictingBorrows_cons, updateAllocMapOnWrite,
       AllocMapEntry.toBorrowEntry_updateOnWrite, ih]
 
-private theorem wbUpdateOnWrite_eq_self_of_active
+private theorem wbUpdateOnWrite_toBorrowEntry_eq_of_active
     {x : AllocMapEntry} {targetLocal : Local} {wTag : Nat}
     (hx : x.localIdx = targetLocal →
       (x.tag = wTag ∧ x.perm = .active) ∨ (x.tag ≠ wTag ∧ x.perm = .disabled)) :
+    (x.updateOnWrite targetLocal (some wTag)).toBorrowEntry = x.toBorrowEntry := by
+  rw [AllocMapEntry.toBorrowEntry_updateOnWrite]
+  rcases x with ⟨tag, localIdx, allocId, perm, allocDead⟩
+  unfold AllocMapEntry.toBorrowEntry updateBorrowPerm
+    treeBorrowWriterRelatedness treeBorrowNodeAccess applyTreeBorrowTransition
+  dsimp only
+  cases hloc : Nat.beq localIdx targetLocal with
+  | false => rfl
+  | true =>
+    rcases hx (Nat.eq_of_beq_eq_true hloc) with ⟨htag, hact⟩ | ⟨htag_ne, hdis⟩
+    · dsimp only at htag hact
+      subst htag hact
+      simp [Nat.beq_refl]
+    · dsimp only at htag_ne hdis
+      subst hdis
+      have hbeq : Nat.beq tag wTag = false := by
+        cases h : Nat.beq tag wTag
+        · rfl
+        · exact absurd (Nat.eq_of_beq_eq_true h) htag_ne
+      simp [hbeq]
+
+private theorem wbUpdateOnWrite_eq_self_of_active
+    {x : AllocMapEntry} {targetLocal : Local} {wTag : Nat}
+    (hx : x.localIdx = targetLocal →
+      (x.tag = wTag ∧ x.perm = .active) ∨ (x.tag ≠ wTag ∧ x.perm = .disabled))
+    (had0 : x.perm = .active → x.allocDead = false) :
     x.updateOnWrite targetLocal (some wTag) = x := by
-  rcases x with ⟨tag, localIdx, allocId, perm⟩
+  rcases x with ⟨tag, localIdx, allocId, perm, allocDead⟩
   unfold AllocMapEntry.updateOnWrite AllocMapEntry.toBorrowEntry updateBorrowPerm
     treeBorrowWriterRelatedness treeBorrowNodeAccess applyTreeBorrowTransition
   dsimp only
@@ -1749,29 +1775,116 @@ private theorem wbUpdateOnWrite_eq_self_of_active
     rcases hx (Nat.eq_of_beq_eq_true hloc) with ⟨htag, hact⟩ | ⟨htag_ne, hdis⟩
     · dsimp only at htag hact
       subst htag hact
-      rw [Nat.beq_refl]; rfl
+      have had_f := had0 rfl
+      dsimp only at had_f
+      subst had_f
+      simp [Nat.beq_refl]
     · dsimp only at htag_ne hdis
       subst hdis
       have hbeq : Nat.beq tag wTag = false := by
         cases h : Nat.beq tag wTag
         · rfl
         · exact absurd (Nat.eq_of_beq_eq_true h) htag_ne
-      rw [hbeq]
+      simp [hbeq]
 
-/-- When `e.perm = .active` and every foreign borrow of `e.localIdx` in
-`allocMap` is already `.disabled` (in particular, whenever `e` is the unique
-borrow of `e.localIdx`), writing through `e.tag` leaves `allocMap` unchanged. -/
+/-- When `e.perm = .active` (`allocDead = false`) and every foreign borrow of `e.localIdx` in
+`allocMap` is already `.disabled`, writing through `e.tag` leaves `allocMap` unchanged. -/
 theorem updateAllocMapOnWrite_eq_self_of_active
     {allocMap : List AllocMapEntry} {targetLocal : Local} {wTag : Nat}
     (hperm : ∀ x ∈ allocMap, x.localIdx = targetLocal →
-      (x.tag = wTag ∧ x.perm = .active) ∨ (x.tag ≠ wTag ∧ x.perm = .disabled)) :
+      (x.tag = wTag ∧ x.perm = .active) ∨ (x.tag ≠ wTag ∧ x.perm = .disabled))
+    (had0 : ∀ x ∈ allocMap, x.perm = .active → x.allocDead = false) :
     updateAllocMapOnWrite allocMap targetLocal (some wTag) = allocMap := by
   induction allocMap with
   | nil => rfl
   | cons x xs ih =>
     simp only [updateAllocMapOnWrite, List.map_cons] at ih ⊢
-    rw [wbUpdateOnWrite_eq_self_of_active (hperm x (List.mem_cons_self ..)),
-      ih (fun y hy => hperm y (List.mem_cons_of_mem _ hy))]
+    rw [wbUpdateOnWrite_eq_self_of_active (hperm x (List.mem_cons_self ..))
+          (had0 x (List.mem_cons_self ..)),
+      ih (fun y hy => hperm y (List.mem_cons_of_mem _ hy))
+         (fun y hy => had0 y (List.mem_cons_of_mem _ hy))]
+
+private theorem wbPtrRel_of_map {allocMap : List AllocMapEntry}
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ x, (f x).tag = x.tag) (halloc : ∀ x, (f x).allocId = x.allocId)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    (h : PtrRel (allocMap.map f) p mptr) : PtrRel allocMap p mptr := by
+  cases h with
+  | mk allocId borTag hprov hid hoff haddr htarget =>
+    obtain ⟨y, hy, het, hea⟩ := htarget
+    obtain ⟨x, hx, rfl⟩ := List.mem_map.mp hy
+    exact .mk allocId borTag hprov hid hoff haddr
+      ⟨x, hx, by rw [← htag]; exact het, by rw [← halloc]; exact hea⟩
+
+private theorem wbLocalRelLM3_1_of_map {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ x, (f x).tag = x.tag) (halloc : ∀ x, (f x).allocId = x.allocId)
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach (allocMap.map f) decl layouts slot mls) :
+    LocalRelLM3_1 mach allocMap decl layouts slot mls := by
+  cases h with
+  | base hb => exact .base hb
+  | rawPtr p mptr cl mutability pointeeKind hc hty hptr =>
+    exact .rawPtr p mptr cl mutability pointeeKind hc hty (wbPtrRel_of_map f htag halloc hptr)
+
+theorem stateRelLM3_1_of_updateAllocMapOnWrite_active
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} {targetLocal : Local} {wTag : Nat}
+    (hstate : StateRelLM3_1 body s m (updateAllocMapOnWrite allocMap targetLocal (some wTag)))
+    (hperm : ∀ x ∈ allocMap, x.localIdx = targetLocal →
+      (x.tag = wTag ∧ x.perm = .active) ∨ (x.tag ≠ wTag ∧ x.perm = .disabled)) :
+    StateRelLM3_1 body s m allocMap := by
+  let f : AllocMapEntry → AllocMapEntry := fun x => x.updateOnWrite targetLocal (some wTag)
+  have hf_eq : updateAllocMapOnWrite allocMap targetLocal (some wTag) = allocMap.map f := rfl
+  rw [hf_eq] at hstate
+  rcases hstate with
+    ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, hbor, halloc, hdisj⟩
+  have hfr' : FrameRelLM3_1 body m.machine allocMap s.frame tf :=
+    { body_eq := hfr.body_eq
+      location_eq := hfr.location_eq
+      af_locals_len := hfr.af_locals_len
+      mf_locals_size := hfr.mf_locals_size
+      locals_rel := fun i decl slot mls hd hs hm =>
+        wbLocalRelLM3_1_of_map f (fun _ => rfl) (fun _ => rfl)
+          (hfr.locals_rel i decl slot mls hd hs hm) }
+  have hmap_be : (allocMap.map f).map AllocMapEntry.toBorrowEntry =
+      allocMap.map AllocMapEntry.toBorrowEntry := by
+    rw [List.map_map]
+    exact List.map_congr_left (fun x hx => wbUpdateOnWrite_toBorrowEntry_eq_of_active (hperm x hx))
+  refine .mk tf hframes hretCont hretPlace hfr' hcal hstack hprot hcaller
+    (hbor.trans hmap_be) ?_ hdisj
+  refine
+    { tags_nodup := by
+        have htags := halloc.tags_nodup
+        rw [List.map_map] at htags
+        exact htags
+      local_to_alloc_unique := fun e₁ h₁ e₂ h₂ hloc =>
+        halloc.local_to_alloc_unique (f e₁) (List.mem_map_of_mem h₁) (f e₂) (List.mem_map_of_mem h₂) hloc
+      alloc_to_local_injective := fun e₁ h₁ e₂ h₂ hid =>
+        halloc.alloc_to_local_injective (f e₁) (List.mem_map_of_mem h₁) (f e₂) (List.mem_map_of_mem h₂) hid
+      target_decl := fun x hx => halloc.target_decl (f x) (List.mem_map_of_mem hx)
+      base_addr_valid := fun x hx => halloc.base_addr_valid (f x) (List.mem_map_of_mem hx)
+      borrow_sync := fun x hx => by
+        have hbs := halloc.borrow_sync (f x) (List.mem_map_of_mem hx)
+        rw [wbUpdateOnWrite_toBorrowEntry_eq_of_active (hperm x hx)] at hbs
+        exact hbs
+      live_key_unique := fun x hx => halloc.live_key_unique (f x) (List.mem_map_of_mem hx)
+      local_alloc_sync := fun topFrame htop x hx =>
+        halloc.local_alloc_sync topFrame htop (f x) (List.mem_map_of_mem hx) }
+
+theorem stepRelLM3_1_of_updateAllocMapOnWrite_active
+    {body : CapturedMir} {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    {targetLocal : Local} {wTag : Nat}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRelLM3_1 body m (updateAllocMapOnWrite allocMap targetLocal (some wTag)) aRes mRes)
+    (hperm : ∀ x ∈ allocMap, x.localIdx = targetLocal →
+      (x.tag = wTag ∧ x.perm = .active) ∨ (x.tag ≠ wTag ∧ x.perm = .disabled)) :
+    StepRelLM3_1 body m allocMap aRes mRes := by
+  cases h with
+  | step s' m' hst => exact .step s' m' (stateRelLM3_1_of_updateAllocMapOnWrite_active hst hperm)
+  | retRoot decl0 retVal imm0 mem' m' hd hr hi hm => exact .retRoot decl0 retVal imm0 mem' m' hd hr hi hm
+  | ub m' msg => exact .ub m' msg
 
 /-! ## 6. Full-step `write_bytes` simulation and characterized divergences -/
 
@@ -2098,8 +2211,7 @@ private theorem wbEvalWriteBytesCall_perm_ub
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hpos : 0 < countSc.bits * elemBytes)
     (hle : countSc.bits * elemBytes ≤ isizeMaxBytes)
-    (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
-      some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
+    (hbor : lookupBorrow s.memory.borrows dstPtr.tag = some e.toBorrowEntry)
     (hperm : e.perm = .frozen ∨ e.perm = .disabled) :
     evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
         localDecls layouts =
@@ -2108,6 +2220,7 @@ private theorem wbEvalWriteBytesCall_perm_ub
   rw [hop]; dsimp only
   rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
     Nat.ble_eq.mpr hle, wbBeq_zero_eq_false_of_pos hpos, hbor]
+  dsimp only [AllocMapEntry.toBorrowEntry]
   rcases hperm with hp | hp <;> simp [hp]
 
 private theorem wbEvalWriteBytesCall_dead_ub
@@ -2118,8 +2231,7 @@ private theorem wbEvalWriteBytesCall_dead_ub
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hpos : 0 < countSc.bits * elemBytes)
     (hle : countSc.bits * elemBytes ≤ isizeMaxBytes)
-    (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
-      some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
+    (hbor : lookupBorrow s.memory.borrows dstPtr.tag = some e.toBorrowEntry)
     (hdecl : get? localDecls e.localIdx = some tgtDecl)
     (_htgt : IsIntegralTy tgtDecl.ty tgtKind)
     (hdead : get? s.frame.locals e.localIdx = some .dead) :
@@ -2130,7 +2242,7 @@ private theorem wbEvalWriteBytesCall_dead_ub
   rw [hop]; dsimp only
   rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
     Nat.ble_eq.mpr hle, wbBeq_zero_eq_false_of_pos hpos, hbor]
-  dsimp only
+  dsimp only [AllocMapEntry.toBorrowEntry]
   cases e.perm with
   | frozen => rfl
   | disabled => rfl
@@ -2146,8 +2258,7 @@ private theorem wbEvalWriteBytesCall_oob_ub
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hpos : 0 < countSc.bits * elemBytes)
     (hle : countSc.bits * elemBytes ≤ isizeMaxBytes)
-    (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
-      some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
+    (hbor : lookupBorrow s.memory.borrows dstPtr.tag = some e.toBorrowEntry)
     (hdecl : get? localDecls e.localIdx = some tgtDecl)
     (htgt : IsIntegralTy tgtDecl.ty tgtKind)
     (hoob : ¬ dstPtr.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind) :
@@ -2158,7 +2269,7 @@ private theorem wbEvalWriteBytesCall_oob_ub
   rw [hop]; dsimp only
   rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
     Nat.ble_eq.mpr hle, wbBeq_zero_eq_false_of_pos hpos, hbor]
-  dsimp only
+  dsimp only [AllocMapEntry.toBorrowEntry]
   cases e.perm with
   | frozen => rfl
   | disabled => rfl
@@ -2186,8 +2297,7 @@ private theorem wbEvalWriteBytesCall_full_ok
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hpos : 0 < countSc.bits * elemBytes)
     (hle : countSc.bits * elemBytes ≤ isizeMaxBytes)
-    (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
-      some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
+    (hbor : lookupBorrow s.memory.borrows dstPtr.tag = some e.toBorrowEntry)
     (hperm : e.perm = .active ∨ e.perm = .reserved)
     (hdecl : get? localDecls e.localIdx = some tgtDecl)
     (htgt : IsIntegralTy tgtDecl.ty tgtKind)
@@ -2216,7 +2326,7 @@ private theorem wbEvalWriteBytesCall_full_ok
   rw [hop]; dsimp only
   rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
     Nat.ble_eq.mpr hle, wbBeq_zero_eq_false_of_pos hpos, hbor]
-  dsimp only
+  dsimp only [AllocMapEntry.toBorrowEntry]
   rcases hperm with hp | hp <;> rw [hp] <;>
   · dsimp only
     rw [hslot, hdecl]
@@ -2247,8 +2357,7 @@ private theorem wbEvalWriteBytesCall_partial_ok
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hpos : 0 < countSc.bits * elemBytes)
     (hle : countSc.bits * elemBytes ≤ isizeMaxBytes)
-    (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
-      some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
+    (hbor : lookupBorrow s.memory.borrows dstPtr.tag = some e.toBorrowEntry)
     (hperm : e.perm = .active ∨ e.perm = .reserved)
     (hdecl : get? localDecls e.localIdx = some tgtDecl)
     (htgt : IsIntegralTy tgtDecl.ty tgtKind)
@@ -2280,7 +2389,7 @@ private theorem wbEvalWriteBytesCall_partial_ok
   rw [hop]; dsimp only
   rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
     hble_max, wbBeq_zero_eq_false_of_pos hpos, hbor]
-  dsimp only
+  dsimp only [AllocMapEntry.toBorrowEntry]
   rcases hperm with hp | hp <;> rw [hp] <;>
   · dsimp only
     rw [hslot, hdecl]; dsimp only
@@ -2656,9 +2765,7 @@ private theorem wbCall_writeBytes_core
             obtain ⟨tgtDecl, hdecl_tgt, _⟩ := halloc.target_decl e he
             obtain ⟨tgtKind, htgtInt⟩ := htgt_int ptrVal e tgtDecl hptr_ok he htag hdecl_tgt
             obtain ⟨_, _, hbase⟩ := halloc.base_addr_valid e he
-            have hbor_look : lookupBorrow s.memory.borrows ptrVal.tag =
-                some { tag := e.tag, targetLocal := e.localIdx,
-                       targetProjection := [], perm := e.perm } := by
+            have hbor_look : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
               rw [← htag]; exact (halloc.borrow_sync e he).2
             have hmptr_opt : mptr.withOptionalProvenance =
                 ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId +
@@ -3043,7 +3150,7 @@ theorem call_intrinsic_write_bytes_simulation
   · rw [ha, hm]; exact .step _ _ hst
   · obtain ⟨hall, _⟩ :=
       hlive_inbounds ptrVal countSc e tgtDecl tgtKind hp hc_pre hpos hle he htag hd ht hnd hinb
-    rw [updateAllocMapOnWrite_eq_self_of_active hall] at hst
+    have hst := stateRelLM3_1_of_updateAllocMapOnWrite_active hst hall
     rw [ha, hm]
     exact .step _ _ hst
 
@@ -3127,9 +3234,7 @@ theorem call_intrinsic_write_bytes_perm_divergence
       .ok [.ptr ptrVal 8, .scalar valSc, .scalar countSc] s.frame.locals := by
     simp only [evalOperands, ha₁, ha₂, ha₃]
   have hop_pt := operandPointeeBytes?_copy_rawPtr (layouts := body.layouts) hptrDecl hptrTy hpt.anneal_size
-  have hbor_look : lookupBorrow s.memory.borrows ptrVal.tag =
-      some { tag := e.tag, targetLocal := e.localIdx,
-             targetProjection := [], perm := e.perm } := by
+  have hbor_look : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
     rw [← htag]; exact (halloc.borrow_sync e he).2
   refine ⟨?_, ?_⟩
   · rw [hanneal_step, hanneal_term, hevals]; dsimp only

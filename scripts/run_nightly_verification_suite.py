@@ -230,9 +230,9 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("pointerWithExposedProvenance", "proved_corresponding"),
             ("pointerCoercion", "supported_and_tested"),
             ("subtype", "supported_and_tested"),
-            ("floatToInt", "unsupported_fail_closed"),
-            ("intToFloat", "unsupported_fail_closed"),
-            ("floatToFloat", "unsupported_fail_closed"),
+            ("floatToInt", "proved_corresponding"),
+            ("intToFloat", "proved_corresponding"),
+            ("floatToFloat", "proved_corresponding"),
             ("fnPtrToPtr", "unsupported_fail_closed"),
         ],
     },
@@ -864,6 +864,16 @@ def compute_stage_b_empirical_corpora(
 # ---------------------------------------------------------------------------
 # Pillar 3: Live Correspondence Divergence & Known-Bug Discovery
 # ---------------------------------------------------------------------------
+# Note: All 8 entries below remain permanently registered in
+# `TRACKED_CORRESPONDENCE_DIVERGENCES` as switch-to-pass regression guards; once
+# their `witness_symbol` divergence theorems are replaced by positive
+# `*_simulation` theorems, `discover_correspondence_divergences` classifies them
+# under `resolved_correspondence_divergences`.
+# Known Tree Borrows follow-up (not an open tracked bug here):
+# `DIV-MR-TB-DIRECT-LOCAL-ACCESS` — general Tree Borrows ancestor/child Read vs.
+# Write state transitions on direct local reads/writes beyond unprotected Freeze
+# Reserved root writes (`DIV-MR-TB-TWOPHASE-DIRECT-WRITE`) remain a future TB
+# correspondence milestone rather than a claim of full Tree Borrows completeness.
 
 TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
     {

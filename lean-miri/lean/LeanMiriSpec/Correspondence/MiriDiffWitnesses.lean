@@ -2019,7 +2019,8 @@ theorem w3_ptr_offset_stride_read_returns :
     exact himm_s₄ tf₃ tf htf₃ htf 0 (himm₃ tf₃ htf₃ 0 (by decide))
   have hsim₅ := step_terminator_goto_return_lm3_1_simulation hrel₄ hphase rfl rfl rfl rfl
     (Or.inr (Or.inl ⟨rfl, Witness.u32DeclLM31, rfl, (by rintro _ _ ⟨⟩), (by decide), himm₄_0⟩))
-  have ha₅ : stepMirFn b s₄ = .retNormal (.scalar ⟨300, 4⟩) s₄.memory := rfl
+  have ha₅ : stepMirFn b s₄ = .retNormal (.scalar ⟨300, 4⟩)
+      { s₄.memory with borrows := disableFrameBorrows s₄.memory.borrows 0 b.localDecls.length } := rfl
   rw [ha₅] at hsim₅
   generalize hm_res : Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m₄ = mRes at hsim₅
   cases hsim₅ with
@@ -2270,7 +2271,8 @@ theorem w3_rawPtr_return :
     (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty hm₁
   have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → IsImmediateFrameLocal tf₁ 0 :=
     fun tf₁ htf₁ => himm₁_step _ tf₁ rfl htf₁ 0 (by decide) (himm₀_all _ rfl 0)
-  have hret : stepMirFn b s₁ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₁.memory :=
+  have hret : stepMirFn b s₁ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8)
+      { s₁.memory with borrows := disableFrameBorrows s₁.memory.borrows 0 b.localDecls.length } :=
     rfl
   have hsim₂ := step_terminator_return_rawPtr_lm3_1_simulation hrel₁ (fun _ h => nomatch h)
     rfl rfl rfl rfl rfl rfl rfl himm₁
@@ -2887,7 +2889,8 @@ theorem w4_safe_ref_return :
   have himm₁ : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
     fun tf htf => isImmediateFrameLocal_of_nextAllocId_two hrel₁ hsup₁ hnext₁
       (List.Mem.head _) rfl htf 0 (by decide)
-  have hret : stepMirFn b s₁ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₁.memory :=
+  have hret : stepMirFn b s₁ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8)
+      { s₁.memory with borrows := disableFrameBorrows s₁.memory.borrows 0 b.localDecls.length } :=
     rfl
   have hsim₂ := step_terminator_goto_return_lm3_2_simulation hrel₁ hphase rfl rfl rfl rfl
     (Or.inr (Or.inl ⟨rfl, Witness.refU64Decl, rfl, by decide, himm₁⟩))
@@ -3110,7 +3113,7 @@ theorem w4_reborrow_dangling_safeRef_ub :
     .return_ rfl
   have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
   let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 Witness.lm31AllocId1
-  let entryDis : AllocMapEntry := { entry with perm := .disabled }
+  let entryDis : AllocMapEntry := { entry with perm := .disabled, allocDead := true }
   let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
   let s₁ := WitnessLM4_2.mkPtrState b 1 1
     [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr1, .uninit] [entry.toBorrowEntry] 2
@@ -3358,7 +3361,8 @@ theorem w4_disabled_read_divergence :
     intro tf htf mls hmls mp hmp
     rw [htf₃] at htf; injection htf with h1; injection h1 with h2; subst h2
     rw [hmls] at hv₃; simp [hmp] at hv₃
-  have hret_act : stepMirFn b s₃_act = .retNormal (.scalar ⟨77, 8⟩) s₃_act.memory := rfl
+  have hret_act : stepMirFn b s₃_act = .retNormal (.scalar ⟨77, 8⟩)
+      { s₃_act.memory with borrows := disableFrameBorrows s₃_act.memory.borrows 0 b.localDecls.length } := rfl
   have hsim₄ := step_terminator_goto_return_lm3_2_simulation hrel₃ hphase rfl rfl rfl rfl
     (Or.inr (Or.inl ⟨rfl, Witness.u64Decl, rfl, by decide, himm₃_0⟩))
   rw [hret_act] at hsim₄
@@ -4580,10 +4584,11 @@ theorem w6_write_bytes_extCall_boundary :
   have hres : resumeExternalCall (wbAddrOfState b) (wbAddrOfState b).frame.locals
       (WitnessLM4_2.local42 0) 2 .unreachable (.returned .unit (wbAddrOfState b).memory) =
       .running sᵣ := rfl
-  have hret : stepMirFn b sᵣ = .retNormal .unit sᵣ.memory := rfl
+  have hret : stepMirFn b sᵣ = .retNormal .unit
+      { sᵣ.memory with borrows := disableFrameBorrows sᵣ.memory.borrows 0 b.localDecls.length } := rfl
   obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix
     (sᵣ := sᵣ) (sₖ := sᵣ) (retVal := .unit) (v := .unit) (mem := (wbAddrOfState b).memory)
-    (memR := sᵣ.memory)
+    (memR := { sᵣ.memory with borrows := disableFrameBorrows sᵣ.memory.borrows 0 b.localDecls.length })
     hpa (.step .silent hs₁ (.refl _)) hext hres (.refl _) hret (wbAddrOfState b).memory
   have hagree : AgreeReaches b (annealMiriHooks b) (initMachineState b []) (wbAddrOfState b)
       (miriEntryState b) m₁ :=
@@ -4699,7 +4704,8 @@ theorem w4_protected_reservedFrz_conflict_ub :
 * on a protected `Cell` (`perm = .cell`), Stage-1 Anneal faults (`MirReachesUB`)
   while `deallocateBorrowRange` succeeds (`sim_lm3_3_storage_dead_protected_cell_divergence`). -/
 theorem w4_storage_dead_protected_ub (perm : TreeBorrowPerm) :
-    (MirReachesUB (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true)) ∧
+    (preventsDeallocation perm = true →
+      MirReachesUB (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true)) ∧
       ¬ TreeSafe (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true))) ∧
     (perm ≠ .cell →
       ((hooksTwoNodeTree perm).deallocateBorrowRange
@@ -4708,21 +4714,25 @@ theorem w4_storage_dead_protected_ub (perm : TreeBorrowPerm) :
         (hooksForChildProtected true).protectedTags).status ≠ Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) ∧
     (∃ s_dead : MachineState,
       stepMirFn SimLM3_3.storageDeadBody (SimLM3_3.childState perm false) = .step s_dead ∧
-      s_dead.memory.borrows = [SimLM3_3.entry 1 .disabled] ∧
+      s_dead.memory.borrows = [{ (SimLM3_3.entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
       ((hooksTwoNodeTree perm).deallocateBorrowRange
         (.concrete (hooksAccessTag .foreignAccess))
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
         (hooksForChildProtected false).protectedTags).status = Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) ∧
-    (((hooksTwoNodeTree .cell).deallocateBorrowRange
+    ((∃ s_cell : MachineState,
+      stepMirFn SimLM3_3.storageDeadBody (SimLM3_3.childState .cell true) = .step s_cell) ∧
+     ((hooksTwoNodeTree .cell).deallocateBorrowRange
         (.concrete (hooksAccessTag .foreignAccess))
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
         (hooksForChildProtected true).protectedTags).status = Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) := by
-  obtain ⟨hub, _, hne_cell, ⟨s_dead, _, hs_dead, _, hb_dead, hrel_dead, _, _, _, _⟩, hdealloc_ok⟩ :=
+  obtain ⟨hub_fn, hne_cell, ⟨s_dead, _, hs_dead, _, hb_dead, hrel_dead, _, _, _, _⟩, hdealloc_ok⟩ :=
     SimLM3_3.sim_lm3_3_storage_dead_and_live_protector_step perm
-  exact ⟨anneal_ub_of_coReach (.refl _) hub, hne_cell,
+  obtain ⟨⟨s_cell, _, hs_cell, _, _, _⟩, hcell_dealloc⟩ :=
+    SimLM3_3.sim_lm3_3_storage_dead_protected_cell_simulation
+  exact ⟨fun hp => anneal_ub_of_coReach (.refl _) (hub_fn hp).1, hne_cell,
     ⟨s_dead, hs_dead, hb_dead, hrel_dead, hdealloc_ok⟩,
-    SimLM3_3.sim_lm3_3_storage_dead_protected_cell_divergence.2.2⟩
+    ⟨⟨s_cell, hs_cell⟩, hcell_dealloc⟩⟩
 
 /-! ## 5. Multi-frame calls -/
 
@@ -4913,6 +4923,7 @@ theorem protReady_rel : MultiFrameStateRel protCallerBody protReadyAnneal protRe
     (by intro cid hcid; rcases List.mem_singleton.mp hcid with rfl; decide)
     (by intro e he cid hp; rcases List.mem_singleton.mp he with rfl; injection hp with h; subst h; decide)
     hbt
+    { root_depth := (by decide), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
 
 /-- **Protector release on return, whole program** (`Terminator.Return` with
 `GlobalState.endCall`, `LM-4.1`): from the state where the callee of
@@ -5046,7 +5057,8 @@ theorem w5_protector_release_returns :
       (bb := { statements := [], terminator := WitnessLM4_1.mkTerm .return_, isCleanup := false })
       (decl0 := WitnessLM4_1.u8Decl)
       rfl rfl rfl rfl rfl rfl (fun h => nomatch h) hret_wf
-    have hs₂ : stepMirFn protCallerBody s₁ = .retNormal (.scalar WitnessLM4_1.sc1) s₁.memory := rfl
+    have hs₂ : stepMirFn protCallerBody s₁ = .retNormal (.scalar WitnessLM4_1.sc1)
+        { s₁.memory with borrows := disableFrameBorrows s₁.memory.borrows 0 protCallerBody.localDecls.length } := rfl
     rw [hs₂, ← hcore₂] at hsim₂
     generalize hm₂_eq : protWholeHooks.coreStep () m₁ = mRes₂ at hsim₂
     cases hsim₂ with
@@ -5631,7 +5643,8 @@ theorem retArithOffset_trace :
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       StateRelLM3_1 b s₂ m₂ [entry] ∧
       StepObsRelLM3_1 b m₂ [entry] (stepMirFn b s₂) (Miri.Interpreter.Step.step hooks () m₂) ∧
-      stepMirFn b s₂ = .retNormal (.ptr { allocId := 1, offsetBytes := 40 } 8) s₂.memory ∧
+      stepMirFn b s₂ = .retNormal (.ptr { allocId := 1, offsetBytes := 40 } 8)
+        { s₂.memory with borrows := disableFrameBorrows s₂.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₂ = ({ m₂ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₂ = (m₂, .ok (.immediate imm0)) ∧
@@ -5704,7 +5717,8 @@ theorem retArithOffset_trace :
       tf₁ tf₂ htf₁ htf₂ 0 (himm₁ tf₁ htf₁ 0 (by decide))
   -- Step 3: root-frame `return` of the raw pointer in `_0`.
   have hs₃ : stepMirFn b s₂ =
-      .retNormal (.ptr { allocId := 1, offsetBytes := 40 } 8) s₂.memory := rfl
+      .retNormal (.ptr { allocId := 1, offsetBytes := 40 } 8)
+        { s₂.memory with borrows := disableFrameBorrows s₂.memory.borrows 0 b.localDecls.length } := rfl
   have hobs₃ := step_terminator_return_rawPtr_lm3_1_simulation hrel₂ hphase rfl rfl rfl rfl rfl
     rfl rfl himm₂
   have hsim₃ := hobs₃
@@ -6167,7 +6181,8 @@ theorem retWriteBytesRead_ref_trace :
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM3_1 b s₃ m₃ [entry] ∧
       StepObsRelLM3_1 b m₃ [entry] (stepMirFn b s₃) (Miri.Interpreter.Step.step hooks () m₃) ∧
-      stepMirFn b s₃ = .retNormal (.scalar ⟨0xABABABABABABABAB, 8⟩) s₃.memory ∧
+      stepMirFn b s₃ = .retNormal (.scalar ⟨0xABABABABABABABAB, 8⟩)
+        { s₃.memory with borrows := disableFrameBorrows s₃.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₃ = ({ m₃ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₃ = (m₃, .ok (.immediate imm0)) ∧
@@ -6291,7 +6306,8 @@ theorem retWriteBytesRead_ref_trace :
     obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
     exact himm₃_step tf₂ tf₃ htf₂ htf₃ 0 (himm₂ tf₂ htf₂ 0 (by decide))
   -- Step 4: root-frame `return` of the scalar in `_0`.
-  have hs₄ : stepMirFn b s₃ = .retNormal (.scalar ⟨0xABABABABABABABAB, 8⟩) s₃.memory := rfl
+  have hs₄ : stepMirFn b s₃ = .retNormal (.scalar ⟨0xABABABABABABABAB, 8⟩)
+      { s₃.memory with borrows := disableFrameBorrows s₃.memory.borrows 0 b.localDecls.length } := rfl
   have hsim₄ := step_terminator_goto_return_lm3_1_simulation hrel₃ hphase rfl rfl rfl rfl
     (Or.inr (Or.inl ⟨rfl, WitnessLM4_2.declOf WitnessLM4_2.u64K, rfl,
       (fun _ _ h => nomatch h), (by decide), himm₃⟩))
@@ -6803,7 +6819,8 @@ theorem retCopy_trace :
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
-      stepMirFn b s₄ = .retNormal (.scalar ⟨42, 8⟩) s₄.memory ∧
+      stepMirFn b s₄ = .retNormal (.scalar ⟨42, 8⟩)
+        { s₄.memory with borrows := disableFrameBorrows s₄.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₄ = ({ m₄ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₄ = (m₄, .ok (.immediate imm0)) ∧
@@ -7014,7 +7031,8 @@ theorem retCopy_trace :
   have hsim₅ := step_terminator_goto_return_lm3_1_simulation hrel₄ hphase rfl rfl rfl rfl
     (Or.inr (Or.inl ⟨rfl, WitnessLM4_2.declOf WitnessLM4_2.u64K, rfl, (by rintro _ _ ⟨⟩),
       (by decide), himm₄_0⟩))
-  have hret : stepMirFn b s₄ = .retNormal (.scalar ⟨42, 8⟩) s₄.memory := rfl
+  have hret : stepMirFn b s₄ = .retNormal (.scalar ⟨42, 8⟩)
+      { s₄.memory with borrows := disableFrameBorrows s₄.memory.borrows 0 b.localDecls.length } := rfl
   rw [hret] at hsim₅
   generalize hm_res : Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m₄ =
     mRes at hsim₅
@@ -7280,7 +7298,7 @@ theorem assert_pairFlag_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, h_a']
+      rw [hbor, hcaller, hstack, h_a']
       dsimp only
       split
       · rfl
@@ -7304,7 +7322,7 @@ theorem assert_pairFlag_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, h_a']
+      rw [hbor, hcaller, hstack, h_a']
       dsimp only
       split
       · next h_contra =>
@@ -7461,7 +7479,7 @@ theorem step_assign_pairField0_simulation_ext
         exact h0
       unfold evalRvalue
       dsimp only
-      rw [hbor, hcaller, h_ld]
+      rw [hbor, hcaller, hstack, h_ld]
       dsimp only
       rw [hvalid]
     rw [huse]
@@ -7803,8 +7821,8 @@ theorem checkedAdd_stepClosedSim (rhs : Nat) (hrhs : rhs < 65536) :
       refine checkedAdd_lockstep_of_stepRel hsim fun s' m' hs' _ => ?_
       rw [stepMirFn_at_terminator hcal hphase hbb1 hstmt_none hstmt_len] at hs'
       unfold evalTerminator at hs'
-      rw [show checkedAddBb1.terminator.kind = .return_ from rfl, hstack] at hs'
-      dsimp only at hs'
+      rw [show checkedAddBb1.terminator.kind = .return_ from rfl, hstack, hbor, hprot] at hs'
+      dsimp only [hasFrameDeallocProtectorConflict, disableFrameBorrows] at hs'
       revert hs'
       cases get? s.frame.locals 0 with
       | none => exact fun h => absurd h MirStepNode_fail_ne_step
@@ -7947,7 +7965,8 @@ theorem w6_write_bytes_read_extCall_divergence :
     [entry.toBorrowEntry] 2
   have hk : stepMirFn retWriteBytesReadBody sᵣ = .step sₖ := rfl
   obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix (sᵣ := sᵣ) (sₖ := sₖ)
-    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory) (memR := sₖ.memory)
+    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory)
+    (memR := { sₖ.memory with borrows := [{ entry.toBorrowEntry with perm := .disabled, allocDead := true }] })
     retWriteBytesRead_prefix_anneal (.step .silent hs₁ (.refl _)) hext rfl
     (.step .silent hk (.refl _)) rfl (initMachineState retWriteBytesReadBody []).memory
   refine ⟨decl0, imm0, hsafe, hreach, fun v' hv' => ?_, hdecl0, himm, ⟨tr, _, hrr⟩, hub, hns⟩
@@ -8188,7 +8207,8 @@ theorem w6_write_bytes_oob_extCall_divergence :
     [entry.toBorrowEntry] 2
   have hk : stepMirFn b sᵣ = .step sₖ := rfl
   obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix (sᵣ := sᵣ) (sₖ := sₖ)
-    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory) (memR := sₖ.memory)
+    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory)
+    (memR := { sₖ.memory with borrows := [{ entry.toBorrowEntry with perm := .disabled, allocDead := true }] })
     retWriteBytesOob_prefix_anneal (.step .silent hs₁ (.refl _)) hext rfl
     (.step .silent hk (.refl _)) rfl (initMachineState b []).memory
   exact ⟨⟨_, h.1⟩, h.2, ⟨tr, _, hrr⟩, hub, hns⟩
@@ -8505,7 +8525,8 @@ theorem w6_copy_nonoverlapping_full_bytes_returns :
   have himm₆_0 : ∀ tf₆, m₆.stack.frames = #[tf₆] → IsImmediateFrameLocal tf₆ 0 := by
     intro tf₆ htf₆; obtain ⟨tf₅, htf₅, _⟩ := id hrel₅
     exact himm₆_step tf₅ tf₆ htf₅ htf₆ 0 (himm₅ tf₅ htf₅ 0 (by decide) (by decide))
-  have hs₇ : stepMirFn b s₆ = .retNormal (.scalar ⟨0x0102030405060708, 8⟩) s₆.memory := rfl
+  have hs₇ : stepMirFn b s₆ = .retNormal (.scalar ⟨0x0102030405060708, 8⟩)
+      { s₆.memory with borrows := disableFrameBorrows s₆.memory.borrows 0 b.localDecls.length } := rfl
   have hsim₇ := step_terminator_goto_return_lm3_1_simulation hrel₆ hphase rfl rfl rfl rfl
     (Or.inr (Or.inl ⟨rfl, WitnessLM4_2.declOf WitnessLM4_2.u64K, rfl,
       (by rintro _ _ ⟨⟩), (by decide), himm₆_0⟩))

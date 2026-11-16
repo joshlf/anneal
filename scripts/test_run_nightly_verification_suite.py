@@ -105,11 +105,42 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
 
     def test_correspondence_divergence_switch_to_pass_detection(self) -> None:
         divs = suite.discover_correspondence_divergences(REPO_ROOT)
-        self.assertGreaterEqual(divs["actionable_anneal_bugs_count"], 5)
-        ids = {d["id"] for d in divs["actionable_anneal_bugs"]}
-        self.assertIn("DIV-MR-CALL-TARGET-LOCAL", ids)
-        self.assertIn("DIV-LM-RAW-OVERWRITE-CHAR-COPY", ids)
+        self.assertEqual(divs["actionable_anneal_bugs_count"], 0)
+        self.assertEqual(divs["actionable_anneal_bugs"], [])
+        self.assertEqual(len(divs["resolved_correspondence_divergences"]), 8)
+        resolved_ids = {d["id"] for d in divs["resolved_correspondence_divergences"]}
+        self.assertEqual(
+            resolved_ids,
+            {
+                "DIV-MR-CALL-TARGET-LOCAL",
+                "DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL",
+                "DIV-MR-TB-TWOPHASE-DIRECT-WRITE",
+                "DIV-MR-TB-FNENTRY-LOCAL-DEALLOC",
+                "DIV-MR-TB-UNSAFECELL-PROTECTED-IM",
+                "DIV-LM-RAW-OVERWRITE-CHAR-COPY",
+                "DIV-LM-D6-OFFSET-DISABLED-TAG",
+                "DIV-LM-ENUM-SET-DISCR-UNINIT",
+            },
+        )
         self.assertEqual(divs["known_miri_diff_manifest_bugs"], [])
+
+        # Regression check: reintroducing a live `*_divergence` witness symbol in a
+        # synthetic checkout must immediately flip `actionable_anneal_bugs_count` back > 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            rel_file = Path("lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean")
+            (tmp_root / rel_file.parent).mkdir(parents=True, exist_ok=True)
+            (tmp_root / rel_file).write_text(
+                "theorem step_raw_overwritten_direct_copy_invalid_char_divergence : True := trivial\n",
+                encoding="utf-8",
+            )
+            synth_divs = suite.discover_correspondence_divergences(tmp_root)
+            self.assertEqual(synth_divs["actionable_anneal_bugs_count"], 1)
+            self.assertEqual(
+                [d["id"] for d in synth_divs["actionable_anneal_bugs"]],
+                ["DIV-LM-RAW-OVERWRITE-CHAR-COPY"],
+            )
+            self.assertEqual(len(synth_divs["resolved_correspondence_divergences"]), 7)
 
     def test_census_only_end_to_end_dashboard_and_ratchet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1531,7 +1531,8 @@ theorem validateValueForTy?_primScalar (layouts : LayoutTable) {fty : Ty} {tyOpt
 theorem validateLoadedValue_unionField_true {localDecls : List LocalDecl} {layouts : LayoutTable}
     {u : Local} {uDecl : LocalDecl} (hdecl_u : get? localDecls u = some uDecl)
     (isMove : Bool) (j : Nat) (fty : Ty) {bits w : Nat}
-    (hbool : fty.kind = .bool → bits = 0 ∨ bits = 1) :
+    (hbool : fty.kind = .bool → bits = 0 ∨ bits = 1)
+    (hchar : fty.kind = .char → w = 4 ∧ isValidCharCode bits = true) :
     validateLoadedValue layouts localDecls (unionFieldReadOperand isMove u j fty)
       (.scalar ⟨bits, w⟩) = true := by
   have hpt : placeTy localDecls layouts ⟨u, [.field j fty]⟩ = some fty := by
@@ -1542,7 +1543,10 @@ theorem validateLoadedValue_unionField_true {localDecls : List LocalDecl} {layou
      dsimp only;
      by_cases hk : fty.kind = .bool
      · rw [hk]; rcases hbool hk with rfl | rfl <;> rfl
-     · cases h : fty.kind <;> first | exact absurd h hk | rfl)
+     · by_cases hkc : fty.kind = .char
+       · obtain ⟨rfl, hv⟩ := hchar hkc
+         simp [hkc, hv]
+       · cases h : fty.kind <;> first | exact absurd h hk | exact absurd h hkc | rfl)
 
 theorem validateLoadedValue_unionWhole_true {localDecls : List LocalDecl} {layouts : LayoutTable}
     {u : Local} {uDecl : LocalDecl} {S : Nat}
@@ -1956,15 +1960,15 @@ theorem step_union_field_read_simulation
       translateSizeBytes_inj hw hkv (hsz.symm.trans hf0sz)
     obtain ⟨msc, _, himm, hread⟩ := hsame hwk
     cases himm0 with
-    | scalar _ _ _ _ hbool0 _ =>
+    | scalar _ _ _ _ hbool0 hchar0 =>
     have hval_ld : validateLoadedValue body.layouts body.localDecls
         (unionFieldReadOperand isMove u f f0Ty) (.scalar sc) = true := by
       cases sc with | mk bits szB =>
-      exact validateLoadedValue_unionField_true hdecl_u isMove f f0Ty (fun hb => (hbool0 hb).2)
+      exact validateLoadedValue_unionField_true hdecl_u isMove f f0Ty (fun hb => (hbool0 hb).2) hchar0
     have hrv_ok : evalRvalue s.frame.locals (.use (unionFieldReadOperand isMove u f f0Ty)) s.memory
         body.localDecls body.layouts = .ok (.scalar sc) s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only
-      rw [hbor, hcaller, hop_ok]; dsimp only; rw [hval_ld]
+      rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hop_ok]; dsimp only; rw [hval_ld]
       cases isMove <;> rfl
     have ha_ok : evalStmt s
         ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u f f0Ty)), span⟩
@@ -2012,7 +2016,7 @@ theorem step_union_field_read_simulation
     have ha_ub : evalStmt s
         ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u j fty)), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hop_ub]
     have hm_err : Miri.Interpreter.Step.evalStatement
         (annealStepHooksLM2_4 body.localDecls body.layouts) ()
         (translateStmt ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u j fty)), span⟩) m =
@@ -2779,7 +2783,7 @@ theorem evalRvalue_unionAggregate_activeField_eq
       ImmediateRel fTy body.layouts (.scalar sc) (.scalar (.fromScalarInt msc)) →
       evalRvalue locals (.aggregate (.adt d 0 (some f)) [op]) mem body.localDecls body.layouts =
         .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) locals mem) := by
-  have hop_ld := hop.evalOperand_localDecls_eq locals mem.globals
+  have hop_ld := hop.evalOperand_localDecls_eq locals mem.globals mem.callStack
   refine ⟨fun hub => ?_, fun sc msc hok himm => ?_⟩
   · unfold evalRvalue
     dsimp only
@@ -6129,7 +6133,7 @@ theorem step_union_field_write_simulation
   rcases hstate with ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
     hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals
+  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot
     generalize s.memory = mem
@@ -6277,7 +6281,7 @@ theorem step_union_field_write_simulation
     have hstep_m := miri_step_at_statement_ok (annealStepHooksLM2_4 body.localDecls body.layouts)
       hframes hframe.body_eq hframe.location_eq hbb hstmt hm_stmt rfl hloc₁
     -- Anneal: field `f` of the union value becomes `sc'`.
-    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool'
+    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool' hchar'
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc') s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
@@ -6481,7 +6485,7 @@ theorem step_union_field_write_uninit_simulation
     hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   obtain ⟨mem', id, hres⟩ := hcanRes
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals
+  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot
     generalize s.memory = mem
@@ -6766,7 +6770,7 @@ theorem step_union_field_write_uninit_simulation
     have hstep_m := miri_step_at_statement_ok (annealStepHooksLM2_4 body.localDecls body.layouts)
       hframes hframe.body_eq hframe.location_eq hbb hstmt hm_stmt rfl hloc₃
     -- Anneal: `uninitFieldWriteShell?` + `writeProjectedForLocal` initializes `_u`.
-    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool_sc
+    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool_sc hchar_sc
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc) s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
@@ -7336,11 +7340,13 @@ theorem step_union_type_punning_read_simulation
   have hvld : validateLoadedValue body.layouts body.localDecls
       (unionFieldReadOperand isMove u j fty) (.scalar ⟨sc.bits % scalarModulus w, w⟩) = true :=
     validateLoadedValue_unionField_true hdecl_u isMove j fty hbool
+      (fun hk => ⟨translateSizeBytes_inj hw (Or.inr (Or.inr (Or.inl rfl)))
+        (by rw [← hsz]; simp [translateTy, hk]; rfl), hchar hk⟩)
   have hrv_ok : evalRvalue s.frame.locals (.use (unionFieldReadOperand isMove u j fty)) s.memory
       body.localDecls body.layouts =
       .ok (.scalar ⟨sc.bits % scalarModulus w, w⟩) s.frame.locals s.memory := by
     unfold evalRvalue; dsimp only
-    rw [hbor, hcaller, hop_ok]; dsimp only; rw [hvld]
+    rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hop_ok]; dsimp only; rw [hvld]
     cases isMove <;> rfl
   have ha_ok : evalStmt s
       ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u j fty)), span⟩
@@ -7584,7 +7590,7 @@ theorem step_union_nonzero_field_write_simulation
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
       hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals
+  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot; generalize s.memory = mem; intro hbor hprot
     cases mem; dsimp only at hbor hprot; subst hbor hprot; rfl
@@ -7720,7 +7726,7 @@ theorem step_union_nonzero_field_write_simulation
       rw [htf₁_loc]; exact hframe.location_eq
     have hstep_m := miri_step_at_statement_ok (annealStepHooksLM2_4 body.localDecls body.layouts)
       hframes hframe.body_eq hframe.location_eq hbb hstmt hm_stmt rfl hloc₁
-    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool'
+    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool' hchar'
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc') s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
@@ -8089,7 +8095,7 @@ theorem step_union_narrower_field_write_simulation
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
       hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals
+  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot; generalize s.memory = mem; intro hbor hprot
     cases mem; dsimp only at hbor hprot; subst hbor hprot; rfl
@@ -8244,7 +8250,7 @@ theorem step_union_narrower_field_write_simulation
       rw [htf₁_loc]; exact hframe.location_eq
     have hstep_m := miri_step_at_statement_ok (annealStepHooksLM2_4 body.localDecls body.layouts)
       hframes hframe.body_eq hframe.location_eq hbb hstmt hm_stmt rfl hloc₁
-    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool'
+    have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool' hchar'
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc') s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
@@ -8604,11 +8610,13 @@ theorem step_union_overlay_field_read_simulation
   have hvld : validateLoadedValue body.layouts body.localDecls
       (unionFieldReadOperand isMove u j fty) (.scalar ⟨sc.bits % scalarModulus w, w⟩) = true :=
     validateLoadedValue_unionField_true hdecl_u isMove j fty hbool
+      (fun hk => ⟨translateSizeBytes_inj hw (Or.inr (Or.inr (Or.inl rfl)))
+        (by rw [← hsz]; simp [translateTy, hk]; rfl), hchar hk⟩)
   have hrv_ok : evalRvalue s.frame.locals (.use (unionFieldReadOperand isMove u j fty)) s.memory
       body.localDecls body.layouts =
       .ok (.scalar ⟨sc.bits % scalarModulus w, w⟩) s.frame.locals s.memory := by
     unfold evalRvalue; dsimp only
-    rw [hbor, hcaller, hop_ok]; dsimp only; rw [hvld]
+    rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hop_ok]; dsimp only; rw [hvld]
     cases isMove <;> rfl
   have ha_ok : evalStmt s
       ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u j fty)), span⟩
@@ -9673,7 +9681,7 @@ theorem step_subslice_assign_simulation
           .ok (.aggregate 0 sub) s.frame.locals s.memory := by
         unfold evalRvalue
         dsimp only
-        rw [hbor, hcaller, ha_op_ok]
+        rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, ha_op_ok]
         dsimp only
         change (match validateLoadedValue body.layouts body.localDecls op (.aggregate 0 sub) with
           | false => _ | true => _) = _
@@ -11714,7 +11722,7 @@ theorem step_subslice_assign_overwrite_simulation
       simp [op, subsliceReadOperand, validateLoadedValue, operandTy, hpt, hwf_arr.arr_kind]
   have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
       .ok (.aggregate 0 sub) s.frame.locals s.memory := by
-    unfold evalRvalue; dsimp only; rw [hbor, hcaller, ha_op_ok]
+    unfold evalRvalue; dsimp only; rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, ha_op_ok]
     dsimp only
     change (match validateLoadedValue body.layouts body.localDecls op (.aggregate 0 sub) with
       | false => _ | true => _) = _
@@ -13198,7 +13206,7 @@ theorem step_repeat_union_field_simulation
     have ha_ub : evalStmt s
         ⟨.assign ⟨arrIdx, .nil⟩ (.repeat (unionFieldReadOperand isMove u j fty) count), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hev_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hev_ub]
     have hread_err := hbig hk_lt hw_le
     have hop_agg_err : (annealAggregateHooksLM2_4 body.localDecls body.layouts).evalOperandAt ()
         (Miri.Interpreter.OperandPath.rvalue "operand")
@@ -13226,7 +13234,7 @@ theorem step_repeat_union_field_simulation
     have ha_ub : evalStmt s
         ⟨.assign ⟨arrIdx, .nil⟩ (.repeat (unionFieldReadOperand isMove u f fty) count), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hev_ok]; dsimp only
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hev_ok]; dsimp only
       rw [replicateValue_eq_replicate, hdead]
     have hop_agg_ok : (annealAggregateHooksLM2_4 body.localDecls body.layouts).evalOperandAt ()
         (Miri.Interpreter.OperandPath.rvalue "operand")
@@ -13280,7 +13288,7 @@ theorem step_repeat_union_field_simulation
         ⟨.assign ⟨arrIdx, .nil⟩ (.repeat (unionFieldReadOperand isMove u f fty) count), span⟩
         body.localDecls body.layouts =
         MirStepNode.step (advanceStmt s locals₂ s.memory) := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hev_ok]; dsimp only
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq, hev_ok]; dsimp only
       rw [replicateValue_eq_replicate, hprot, hbor]
       dsimp only [invalidateConflictingBorrows]
       rw [hmem_same, huninit]

@@ -485,6 +485,7 @@ theorem witCalleeReadyToReturn_rel :
         rcases List.mem_singleton.mp he with rfl
         injection hprot with h; subst h; decide)
     witCalleeReadyToReturn_borrowTrackerRel
+    { root_depth := (by decide), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
 
 /-- **Witness (a.1)**: Executing `TerminatorKind.return_` in `witCalleeBody` at
 depth 2 copies `_0 = 1u8` into caller local `_1`, pops the callee frame,
@@ -649,6 +650,7 @@ theorem wit_lm4_1_root_return_simulation :
       ⟨by decide, by decide, rfl, rfl, rfl⟩
       (ActiveProtectorsValid.nil _)
       (BorrowTrackerStackRel.of_none _ _ _)
+      (BorrowsFrameStackValid.of_empty rfl rfl)
   have hstate : MultiFrameStateRel witCallerBody witCallerAtRootReturnAnneal witCallerAtRootReturnMiri :=
     htb_state.toMultiFrameStateRel (by decide) (fun _ h => nomatch h) (fun _ h => nomatch h)
   have hsim :=
@@ -736,6 +738,7 @@ theorem wit_lm4_1_return_callee_uninit_ub :
           rcases List.mem_singleton.mp he with rfl
           injection hprot with h; subst h; decide)
       (BorrowTrackerStackRel.of_none _ _ _)
+      { root_depth := (by decide), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
   have hsim :=
     step_terminator_return_callee_simulation hstate rfl
       (by intro tf htf; injection htf with h; subst h; rfl)
@@ -1118,6 +1121,7 @@ theorem wit_lm4_1_zst_unit_return_simulation :
       (ActiveProtectorsValid.nil _) (by decide)
       (fun _ h => nomatch h) (fun _ h => nomatch h)
       (BorrowTrackerStackRel.of_none _ _ _)
+      { root_depth := (fun _ h => by cases h), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
   have hsim_callee :=
     step_terminator_return_callee_simulation hstate_callee rfl
       (by intro tf htf; injection htf with h; subst h; rfl)
@@ -1153,6 +1157,7 @@ theorem wit_lm4_1_zst_unit_return_simulation :
       ⟨by decide, by decide, rfl, rfl, rfl⟩
       (ActiveProtectorsValid.nil _)
       (BorrowTrackerStackRel.of_none _ _ _)
+      (BorrowsFrameStackValid.of_empty rfl rfl)
   have hstate_root :=
     htb_root.toMultiFrameStateRel (by decide) (fun _ h => nomatch h) (fun _ h => nomatch h)
   have hsim_root :=
@@ -1337,6 +1342,7 @@ theorem wit_lm4_1_indirect_dest_call_and_return_simulation :
           rcases List.mem_singleton.mp he with rfl
           injection hprot with h; subst h; decide)
       (BorrowTrackerStackRel.of_none _ _ _)
+      { root_depth := (by decide), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
   have hsim_ret :=
     step_terminator_return_callee_simulation hstate_ret rfl
       (by intro tf htf; injection htf with h; subst h; rfl)
@@ -1656,6 +1662,7 @@ theorem wit_lm4_1_return_from_diverging_callee_ub :
       (ActiveProtectorsValid.nil _) (by decide)
       (fun _ h => nomatch h) (fun _ h => nomatch h)
       (BorrowTrackerStackRel.of_none _ _ _)
+      { root_depth := (fun _ h => by cases h), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
   have hsim :=
     step_terminator_return_callee_simulation hstate rfl
       (by intro tf htf; injection htf with h; subst h; rfl)
@@ -1878,11 +1885,16 @@ def witCexCalleeReturnAnneal : MachineState :=
     memory :=
       { witCalleeReadyToReturnAnneal.memory with
         borrows := cexForeignUniqueBorrows
+        callStack := [{ (witSavedCallerFrame .uninit .uninit []) with destination := ⟨0, .nil⟩ }]
         activeProtectors := [7]
         nextProtector := 8 } }
 
 def witCexCalleeReturnMiri : AnnealStepState :=
-  { witCalleeReadyToReturnMiri with machine := AnnealMachine.empty }
+  { stack :=
+      ⟨#[mkWitCallerMiriFrame 0 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩,
+         mkWitCalleeMiriFrame ⟨.live (.immediate (.scalar (.fromScalarInt msc1))), none⟩
+           (.frameLocal 0 0 none (translateTy u8Ty emptyLayoutTable) (.ofAllocationToken 0))]⟩
+    machine := AnnealMachine.empty }
 
 /-- **Witness (l, `C2`)**: Step-level certification of the end-of-call
 foreign-`Unique` protector-release divergence on `witCexCalleeReturnAnneal` /
@@ -1929,6 +1941,7 @@ theorem wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence :
       ⟨.live (.immediate (.scalar (.fromScalarInt msc1))), none⟩
       (.immediate (.init (.scalar sc1)) (.scalar (.fromScalarInt msc1)) none
         (fun _ h => nomatch h) (Or.inr ⟨.scalar sc1, rfl, val1_immRel⟩))
+      (.frameLocal 0 0 none (translateTy u8Ty emptyLayoutTable) (.ofAllocationToken 0))
   have hlinks_root :
       CallerStackLinksRel witCallerBody AnnealMachine.empty witCallerBody
         { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
@@ -1936,10 +1949,12 @@ theorem wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence :
         [mkWitCallerMiriFrame 0 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩] :=
     .root _ _ [] rfl ⟨translateTy u8Ty emptyLayoutTable, rfl⟩ hfr_caller
   have hdest :
-      CallerDestinationRel AnnealMachine.empty 0 (witSavedCallerFrame .uninit .uninit [])
+      CallerDestinationRel AnnealMachine.empty 0
+        { (witSavedCallerFrame .uninit .uninit []) with destination := ⟨0, .nil⟩ }
         (mkWitCallerMiriFrame 0 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩)
-        (mkWitCalleeMiriFrame ⟨.live (.immediate (.scalar (.fromScalarInt msc1))), none⟩).returnPlace :=
-    .immediate 1 u8Decl .uninit .uninit none rfl rfl rfl (fun h => nomatch h) rfl
+        (mkWitCalleeMiriFrame ⟨.live (.immediate (.scalar (.fromScalarInt msc1))), none⟩
+          (.frameLocal 0 0 none (translateTy u8Ty emptyLayoutTable) (.ofAllocationToken 0))).returnPlace :=
+    .immediate 0 u8Decl .uninit .uninit none rfl rfl rfl (fun h => nomatch h) rfl
   have hlinks :
       CallerStackLinksRel witCallerBody AnnealMachine.empty
         (activeMirBody witCallerBody witCexCalleeReturnAnneal)
@@ -1949,12 +1964,23 @@ theorem wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence :
         witCexCalleeReturnMiri.stack.frames.toList.reverse :=
     .cons witCalleeBody
       witCexCalleeReturnAnneal.frame
-      (witSavedCallerFrame .uninit .uninit []) [] [7] []
+      { (witSavedCallerFrame .uninit .uninit []) with destination := ⟨0, .nil⟩ } [] [7] []
       _ _ []
       rfl hdest hfr_callee (fun _ _ _ _ _ h _ _ _ => nomatch h) rfl (by intro _ _; rfl) hlinks_root
-  have hdisj : MultiFrameAllocDisjoint witCexCalleeReturnMiri.stack.frames :=
-    wit_multiFrameAllocDisjoint_two _ _ _
-      (fun _ h => nomatch h) (fun _ h => nomatch h) (fun _ h => nomatch h)
+  have hdisj : MultiFrameAllocDisjoint witCexCalleeReturnMiri.stack.frames := by
+    refine ⟨?_, ?_⟩
+    · intro mf hmf i _ _ _ _ _ _ hi _
+      rcases List.mem_cons.mp hmf with rfl | h1
+      · rcases i with _ | ⟨_ | i⟩ <;> cases hi
+      · rcases List.mem_singleton.mp h1 with rfl
+        rcases i with _ | i <;> cases hi
+    · intro f₁ _ i _ mf₁ _ _ _ _ _ _ hf₁ _ hi _
+      rcases f₁ with _ | ⟨_ | f₁⟩
+      · injection hf₁ with hmf₁; subst hmf₁
+        rcases i with _ | ⟨_ | i⟩ <;> cases hi
+      · injection hf₁ with hmf₁; subst hmf₁
+        rcases i with _ | i <;> cases hi
+      · cases hf₁
   have hcex := cex_end_of_call_foreign_unique_frozen_divergence
   have hstate :
       MultiFrameStateRel witCallerBody witCexCalleeReturnAnneal witCexCalleeReturnMiri :=
@@ -1968,6 +1994,7 @@ theorem wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence :
           · rcases List.mem_singleton.mp he1 with rfl
             cases hprot)
       (BorrowTrackerStackRel.of_none _ _ _)
+      { root_depth := (by decide), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
   have hsim :=
     step_terminator_return_callee_simulation hstate rfl
       (by intro tf htf; injection htf with h; subst h; rfl)
@@ -2383,6 +2410,9 @@ theorem wit_lm4_1_unwindResume_cleanup_and_unreachable_ub_simulation :
           rcases List.mem_singleton.mp he with rfl
           injection hprot with h; subst h; decide)
       (BorrowTrackerStackRel.of_none _ _ _)
+      { root_depth := by dsimp [mkWitUnwindAnneal]; decide
+        root_protectors_nil := fun h => by cases h
+        last_restores_nil := fun _ h => by cases h; rfl }
   have hsim_clean :=
     step_terminator_unwindResume_callee_simulation (mk_unwind_state (.cleanup 1)) rfl
       (by intro tf htf; injection htf with h; subst h; rfl)
@@ -2459,6 +2489,7 @@ theorem wit_lm4_1_unwindResume_root_panic_vs_ub_divergence :
       (ActiveProtectorsValid.nil _) (by decide)
       (fun _ h => nomatch h) (fun _ h => nomatch h)
       (BorrowTrackerStackRel.of_none _ _ _)
+      (BorrowsFrameStackValid.of_empty rfl rfl)
   exact step_terminator_unwindResume_root_panic_vs_ub_divergence hstate rfl
     (fun _ h => nomatch h)
     (bb := { statements := [], terminator := mkTerm .unwindResume, isCleanup := true })
@@ -2619,6 +2650,7 @@ theorem witAssertTermPanic_rel
     (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
     (fun _ h => nomatch h) (fun _ h => nomatch h)
     (BorrowTrackerStackRel.of_none _ _ _)
+    (BorrowsFrameStackValid.of_empty rfl rfl)
 
 /-- **Witness (o)**:
 1. `step_terminator_unwindResume_multiFrame_simulation` at depth 3 (`k = 2`):
@@ -2765,6 +2797,7 @@ theorem wit_lm4_1_multiFrame_continue_unwind_and_assert_terminate :
             · rcases List.mem_singleton.mp h1 with rfl; decide)
         (fun _ h => nomatch h)
         (BorrowTrackerStackRel.of_none _ _ _)
+        { root_depth := (fun _ h => by cases h), root_protectors_nil := (fun h => by cases h), last_restores_nil := (fun _ h => by cases h; rfl) }
     have hwf3 : UnwindChainWf witCallerBody witUnwind3Anneal witUnwind3Miri := by
       refine ⟨?_, ?_, ?_, ?_, ?_⟩
       · intro mf hmf
@@ -3002,6 +3035,7 @@ theorem witIndirectCaller_rel
     (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
     (fun _ h => nomatch h) (fun _ h => nomatch h)
     (BorrowTrackerStackRel.of_none _ _ _)
+    (BorrowsFrameStackValid.of_empty rfl rfl)
 
 theorem witIndirectFnPtr_pre (fnPtrs : List FnPtrEntry) :
     IndirectFnPtrMovePre witIndirectCallerBody
@@ -3421,6 +3455,7 @@ theorem witUsizeIndirectCaller_rel
     (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
     (fun _ h => nomatch h) (fun _ h => nomatch h)
     (BorrowTrackerStackRel.of_none _ _ _)
+    (BorrowsFrameStackValid.of_empty rfl rfl)
 
 theorem witUsizeIndirectFnPtr_pre :
     IndirectFnPtrMovePre witUsizeIndirectCallerBody
@@ -3568,6 +3603,7 @@ theorem witReifyCaller0_rel :
     (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
     (fun _ h => nomatch h) (fun _ h => nomatch h)
     (BorrowTrackerStackRel.of_none _ _ _)
+    (BorrowsFrameStackValid.of_empty rfl rfl)
 
 /-- Linked `"core::panicking::panic"` body whose entry block is a cleanup block
 that immediately executes `UnwindResume`. -/
@@ -3629,6 +3665,7 @@ theorem witLinkedPanicCall_rel :
     (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
     (fun _ h => nomatch h) (fun _ h => nomatch h)
     (BorrowTrackerStackRel.of_none _ _ _)
+    (BorrowsFrameStackValid.of_empty rfl rfl)
 
 /-- **Witness (r)**:
 1. **2-step `MultiFrameStateRel` → `ReifyFnPointer` → `IndirectFnPtrMovePre` →

@@ -9151,10 +9151,13 @@ def uninitProjCallDestMInit : Mach :=
     uninitProjCallDestFn uninitProjCallDestS0.frame.locals uninitProjCallDestFn.start
 
 theorem uninitProjCallDest_anneal_ub :
-    ∃ tr u, Reaches
-      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) tr u ∧
-      FaultNow u :=
-  faultsA_sound uninitProjCallDestCaller 15 _ (by decide)
+    (∃ mem, ReachesRet
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) []
+      (.normal (.scalar ⟨251, 1⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) :=
+  ⟨⟨_, runA_sound uninitProjCallDestCaller 15 _ _ _ rfl⟩,
+    runA_noUB uninitProjCallDestCaller 15 _ _ _ rfl⟩
 
 theorem uninitProjCallDest_minirust_ret :
     (Interp.steps 9 uninitProjCallDestMInit).toOption.map
@@ -9413,16 +9416,20 @@ theorem callProjMoveReuse_noUB_transfer_fails :
       no_returnRel_before (mInit := callProjMoveReuseMInit) (n := 7) (by decide +kernel)
         hk hsteps hret⟩
 
-/-- `uninitProjCallDestCaller` refutes the conclusion of
-`mirCallWithCallees_ub`: Anneal faults when `Return` writes `_2.0` into the
-uninitialized tuple `_2`, while MiniRust returns `-5i8` at step `9` and then
-stops with a `specPanic` in the external caller frame, never raising UB. -/
+/-- `uninitProjCallDestCaller` (`progInFragment = false` because `_2` is not
+fully initialized before `_2.0 = negI8Callee(copy _1)`): with `writeReturnDestination`
+(`uninitFieldWriteShell?`), Anneal initializes `_2`'s field `0` shell and returns
+`-5i8` (`251`) without UB, agreeing with MiniRust, which returns `-5i8` at step `9`
+and then stops with a `specPanic` in the external caller frame, never raising UB. -/
 theorem uninitProjCallDest_ub_transfer_fails :
-    (∃ tr u, Reaches
-      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) tr u ∧
-      FaultNow u) ∧
+    (∃ mem, ReachesRet
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) []
+      (.normal (.scalar ⟨251, 1⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) ∧
     ¬ ∃ (n : Nat) (msg : String), Interp.steps n uninitProjCallDestMInit = .error (.ub msg) :=
-  ⟨uninitProjCallDest_anneal_ub,
+  ⟨uninitProjCallDest_anneal_ub.1,
+    uninitProjCallDest_anneal_ub.2,
     never_ub_of_nonUb_stop (N := 10) (by decide +kernel) (by decide +kernel)⟩
 
 /-- Diverging callee `fn spin_u32_callee(x: u32) -> u32 { loop {} }`. -/
@@ -13465,7 +13472,7 @@ theorem evalStmt_retag_scalar_ub (s : MachineState) (decls : List LocalDecl)
     (layouts : LayoutTable) (k : RetagKind) (place : Place) (span : String)
     (sc : ScalarInt) (L : List LocalSlot)
     (h : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals decls = .ok (.scalar sc) L)
+      s.memory.callerLocals decls s.memory.callStack = .ok (.scalar sc) L)
     (hUntyped : placeTy decls layouts place = none) :
     evalStmt s ⟨.retag k place, span⟩ decls layouts = MirStepNode.fail .ub := by
   simp [evalStmt, h, hUntyped]
@@ -13482,7 +13489,7 @@ theorem evalStmt_retag_scalar_noop (s : MachineState) (decls : List LocalDecl)
     (layouts : LayoutTable) (k : RetagKind) (place : Place) (span : String)
     (sc : ScalarInt) (L : List LocalSlot) {ty : Ty}
     (h : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals decls = .ok (.scalar sc) L)
+      s.memory.callerLocals decls s.memory.callStack = .ok (.scalar sc) L)
     (hTy : placeTy decls layouts place = some ty)
     (hNotPtr : ∀ m inner, ty.kind ≠ .ref m inner ∧ ty.kind ≠ .rawPtr m inner) :
     evalStmt s ⟨.retag k place, span⟩ decls layouts = MirStepNode.step (advanceStmt s L) := by

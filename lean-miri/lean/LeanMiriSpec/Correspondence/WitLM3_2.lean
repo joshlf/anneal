@@ -1444,7 +1444,7 @@ theorem wit_lm3_2_ref_deref_read_storageDead_real_steps :
       StateRelLM3_2 lm32RefBody s₃ m₃ [entry] ∧
       stepMirFn lm32RefBody s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 lm32RefBody s₄ m₄ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 lm32RefBody s₄ m₄ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₄.machine.memory.live.find? (fun x => x.1 == lm31AllocId1) = none := by
   have hphase : ∀ p, lm32RefBody.phase ≠ .other p := fun _ h => nomatch h
   let hooks := annealStepHooks lm32RefBody.localDecls lm32RefBody.layouts
@@ -1518,7 +1518,7 @@ theorem wit_lm3_2_ref_deref_read_storageDead_real_steps :
   have hsim₃ := step_storageDead_lm3_2_simulation hrel₂ hphase rfl rfl rfl (by decide)
   obtain ⟨m₃, hm₃, hrel₃⟩ := stepRelLM3_2_of_anneal_step hsim₃ hs₃
   -- Step 4: `StorageDead(_1)`
-  let entryDis : AllocMapEntry := { entry with perm := .disabled }
+  let entryDis : AllocMapEntry := { entry with perm := .disabled, allocDead := true }
   let s₄ := mkWitStateLM32 lm32RefBody 7
     [.init (.scalar ⟨42, 8⟩), .dead, .dead] [entryDis.toBorrowEntry] 2
   have hs₄ : stepMirFn lm32RefBody s₃ = .step s₄ := rfl
@@ -2075,7 +2075,7 @@ theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
       StateRelLM3_2 lm32DanglingReborrowBody s₁ m₁ [entry] ∧
       stepMirFn lm32DanglingReborrowBody s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [{ entry with perm := .disabled, allocDead := true }] ∧
       stepMirFn lm32DanglingReborrowBody s₂ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₂ =
         (m₃, .error (.undefinedBehavior "dereferencing a dangling reference"))) ∧
@@ -2091,7 +2091,7 @@ theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
   · have hphase : ∀ p, lm32DanglingReborrowBody.phase ≠ .other p := fun _ h => nomatch h
     let entry := refAllocMapEntry lm32DanglingReborrowBody.localDecls
       lm32DanglingReborrowBody.layouts .shared 1 1 lm31AllocId1
-    let entryDis : AllocMapEntry := { entry with perm := .disabled }
+    let entryDis : AllocMapEntry := { entry with perm := .disabled, allocDead := true }
     let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
     let borSh := [entry.toBorrowEntry]
     have himm₀_all : ∀ tf, lm32DanglingReborrowMiriPre.stack.frames = #[tf] →
@@ -2428,7 +2428,7 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
             layout := some (translateTy u64Ty) }) = (m₁, .ok true) ∧
       stepMirFn b s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2 b s₂ m₂ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 b s₂ m₂ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₂.stack.frames = #[tf₂] ∧
       get? s₂.frame.locals 1 = some .dead ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
@@ -2499,7 +2499,7 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
       (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
         (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
     let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1
-    let entryDis : AllocMapEntry := { entry with perm := .disabled }
+    let entryDis : AllocMapEntry := { entry with perm := .disabled, allocDead := true }
     let s₁ := mkWitStateLM32 b 1
       [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
       [entry.toBorrowEntry] 2
@@ -3773,7 +3773,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      StateRelLM3_2 b s₃ m₃ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 b s₃ m₃ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₃.stack.frames = #[tf₃] ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
         refU64Ty 4 ⟨.local 0 3 none tf₃.localsIdentity, translateTy refU64Ty b.layouts⟩
@@ -3782,7 +3782,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
           "validation: encountered a dangling reference (use-after-free)") m₃ ∧
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 b s₄ m₄ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 b s₄ m₄ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₄.stack.frames = #[tf₄] ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
         refU64Ty 4 ⟨.local 0 0 none tf₄.localsIdentity, translateTy refU64Ty b.layouts⟩
@@ -3849,7 +3849,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
       (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
         (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
     let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1
-    let entryDis : AllocMapEntry := { entry with perm := .disabled }
+    let entryDis : AllocMapEntry := { entry with perm := .disabled, allocDead := true }
     let p0 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
     let s₁ := mkWitStateLM32 b 1 [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p0 8), .uninit]
       [entry.toBorrowEntry] 2
@@ -4067,14 +4067,76 @@ private theorem stepObsRelLM3_2_of_anneal_step
     rw [ha] at ha_eq
     cases ha_eq
 
-private theorem allocMap_eq_singleton_of_nextAllocId_two
+private def normAllocDead (e : AllocMapEntry) : AllocMapEntry :=
+  { e with allocDead := match e.perm with | .disabled => e.allocDead | _ => false }
+
+private theorem normAllocDead_toBorrowEntry (e : AllocMapEntry) :
+    (normAllocDead e).toBorrowEntry = e.toBorrowEntry := by
+  cases e with
+  | mk tag localIdx allocId perm allocDead =>
+    cases perm <;> rfl
+
+private theorem stateRel_map_normAllocDead
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap) :
+    StateRelLM3_2 body s m (allocMap.map normAllocDead) := by
+  rcases hstate with
+    ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, hbor, halloc, hdisj⟩
+  have hfr' : FrameRelLM3_2 body m.machine (allocMap.map normAllocDead) s.frame tf :=
+    { body_eq := hfr.body_eq
+      location_eq := hfr.location_eq
+      af_locals_len := hfr.af_locals_len
+      mf_locals_size := hfr.mf_locals_size
+      locals_rel := fun i decl slot mls hd hs hm =>
+        (hfr.locals_rel i decl slot mls hd hs hm).map_preserve normAllocDead
+          (fun _ => rfl) (fun _ => rfl) }
+  have hbor' : s.memory.borrows = (allocMap.map normAllocDead).map AllocMapEntry.toBorrowEntry := by
+    rw [List.map_map]
+    have hfun : (AllocMapEntry.toBorrowEntry ∘ normAllocDead) = AllocMapEntry.toBorrowEntry :=
+      funext normAllocDead_toBorrowEntry
+    rw [hfun]
+    exact hbor
+  refine .mk tf hframes hretCont hretPlace hfr' hcal hstack hprot hcaller hbor' ?_ hdisj
+  refine
+    { tags_nodup := by
+        rw [List.map_map]
+        exact halloc.tags_nodup
+      local_to_alloc_unique := fun e₁ h₁ e₂ h₂ hloc => by
+        obtain ⟨x₁, hx₁, rfl⟩ := List.mem_map.mp h₁
+        obtain ⟨x₂, hx₂, rfl⟩ := List.mem_map.mp h₂
+        exact halloc.local_to_alloc_unique x₁ hx₁ x₂ hx₂ hloc
+      alloc_to_local_injective := fun e₁ h₁ e₂ h₂ hid => by
+        obtain ⟨x₁, hx₁, rfl⟩ := List.mem_map.mp h₁
+        obtain ⟨x₂, hx₂, rfl⟩ := List.mem_map.mp h₂
+        exact halloc.alloc_to_local_injective x₁ hx₁ x₂ hx₂ hid
+      target_decl := fun e' he' => by
+        obtain ⟨x, hx, rfl⟩ := List.mem_map.mp he'
+        exact halloc.target_decl x hx
+      base_addr_valid := fun e' he' => by
+        obtain ⟨x, hx, rfl⟩ := List.mem_map.mp he'
+        exact halloc.base_addr_valid x hx
+      borrow_sync := fun e' he' => by
+        obtain ⟨x, hx, rfl⟩ := List.mem_map.mp he'
+        rw [normAllocDead_toBorrowEntry]
+        exact halloc.borrow_sync x hx
+      live_key_unique := fun e' he' => by
+        obtain ⟨x, hx, rfl⟩ := List.mem_map.mp he'
+        exact halloc.live_key_unique x hx
+      local_alloc_sync := fun topFrame htop e' he' => by
+        obtain ⟨x, hx, rfl⟩ := List.mem_map.mp he'
+        exact halloc.local_alloc_sync topFrame htop x hx }
+
+private theorem stateRel_singleton_of_nextAllocId_two
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry} {e : AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
     (hbor : s.memory.borrows = [e.toBorrowEntry])
     (ha1 : e.allocId = lm31AllocId1)
-    (hnext2 : m.machine.memory.nextAllocId = 2) :
-    allocMap = [e] := by
+    (hnext2 : m.machine.memory.nextAllocId = 2)
+    (had0 : e.allocDead = false := by rfl) :
+    StateRelLM3_2 body s m [e] := by
+  have hnorm := stateRel_map_normAllocDead hstate
   obtain ⟨_, _, _, _, _, _, _, _, _, hbor_eq, halloc, _⟩ := id hstate
   rw [hbor] at hbor_eq
   cases allocMap with
@@ -4094,11 +4156,23 @@ private theorem allocMap_eq_singleton_of_nextAllocId_two
       have ht : e'.tag = e.tag := congrArg BorrowEntry.tag hbe.symm
       have hl : e'.localIdx = e.localIdx := congrArg BorrowEntry.targetLocal hbe.symm
       have hp : e'.perm = e.perm := congrArg BorrowEntry.perm hbe.symm
-      rcases e' with ⟨t', l', a', p'⟩
-      rcases e with ⟨t, l, a, p⟩
-      dsimp only at ht hl hp hid_eq ha1
-      subst ht hl hp hid_eq ha1
-      rfl
+      have had : (normAllocDead e').allocDead = e.allocDead := by
+        have h1 := congrArg BorrowEntry.allocDead hbe.symm
+        have h2 : e.toBorrowEntry.allocDead = e.allocDead := by
+          rcases e with ⟨t, l, a, p, ad⟩
+          dsimp only at had0
+          subst had0
+          cases p <;> rfl
+        exact h1.trans h2
+      have heq : normAllocDead e' = e := by
+        rcases e' with ⟨t', l', a', p', ad'⟩
+        rcases e with ⟨t, l, a, p, ad⟩
+        dsimp only [normAllocDead] at ht hl hp had hid_eq ha1 ⊢
+        subst ht hl hp hid_eq ha1
+        exact congrArg (AllocMapEntry.mk _ _ lm31AllocId1 _) had
+      dsimp only [List.map] at hnorm
+      rw [heq] at hnorm
+      exact hnorm
 
 /-- **`wit_lm3_2_placeMention_and_unified_return_ref_real_steps`**:
 1. **End-to-end 6-step unified `step_mir_lm3_2_state_simulation` trace returning
@@ -4137,7 +4211,8 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
       StateRelLM3_2 b s₅ m₅ [{ entry with perm := .active }] ∧
       (∃ am, StepObsRelLM3_2 b m₅ am (stepMirFn b s₅) (Miri.Interpreter.Step.step hooks () m₅)) ∧
-      stepMirFn b s₅ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₅.memory ∧
+      stepMirFn b s₅ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8)
+        { s₅.memory with borrows := disableFrameBorrows s₅.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₅ = ({ m₅ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₅ = (m₅, .ok (.immediate imm0)) ∧
@@ -4198,8 +4273,8 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       (dstDecl := refMutU64Decl) (targetDecl := u64Decl) rfl rfl
       (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
-    have ham₁ := allocMap_eq_singleton_of_nextAllocId_two hrel₁ rfl rfl hnext₁
-    subst ham₁
+    have hrel₁ : StateRelLM3_2 b s₁ m₁ [entry] :=
+      stateRel_singleton_of_nextAllocId_two hrel₁ rfl rfl hnext₁
     -- Step 2 (`stmtIdx = 1`): `PlaceMention(_2)`
     let s₂ := mkWitStateLM32 b 2 [.uninit, .uninit, .init (.ptr p0 8), .uninit] borMut 2
     have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
@@ -4212,8 +4287,8 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
     have hmach₂ := step_placeMention_local_machine_eq hrel₁ rfl rfl (decl := refMutU64Decl) rfl hm₂
     have hsup₂ : AllocIdSupplyReady m₂.machine.memory := hmach₂ ▸ hsup₁
     have hnext₂ : m₂.machine.memory.nextAllocId = 2 := by rw [hmach₂]; exact hnext₁
-    have ham₂ := allocMap_eq_singleton_of_nextAllocId_two hrel₂ rfl rfl hnext₂
-    subst ham₂
+    have hrel₂ : StateRelLM3_2 b s₂ m₂ [entry] :=
+      stateRel_singleton_of_nextAllocId_two hrel₂ rfl rfl hnext₂
     -- Step 3 (`stmtIdx = 2`): `PlaceMention(*_2)` (while `*_2` is `.uninit`!)
     let s₃ := mkWitStateLM32 b 3 [.uninit, .uninit, .init (.ptr p0 8), .uninit] borMut 2
     have hs₃ : stepMirFn b s₂ = .step s₃ := rfl
@@ -4236,8 +4311,8 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       (fun d hd => by injection hd with hd'; subst hd'; rfl) hm₃
     have hsup₃ : AllocIdSupplyReady m₃.machine.memory := hmach₃ ▸ hsup₂
     have hnext₃ : m₃.machine.memory.nextAllocId = 2 := by rw [hmach₃]; exact hnext₂
-    have ham₃ := allocMap_eq_singleton_of_nextAllocId_two hrel₃ rfl rfl hnext₃
-    subst ham₃
+    have hrel₃ : StateRelLM3_2 b s₃ m₃ [entry] :=
+      stateRel_singleton_of_nextAllocId_two hrel₃ rfl rfl hnext₃
     -- Step 4 (`stmtIdx = 3`): `*_2 = const 55_u64`
     let s₄ := mkWitStateLM32 b 4 [.uninit, .init (.scalar ⟨55, 8⟩), .init (.ptr p0 8), .uninit] borMutW 2
     have hs₄ : stepMirFn b s₃ = .step s₄ := rfl
@@ -4267,8 +4342,8 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       (fun tf _ => constU64_wellTypedLM32 b tf 55 (by decide)) himm₃_2
       rfl (List.Mem.head _) rfl rfl (fun h => nomatch h)
       (fun d hd => by injection hd with hd'; subst hd'; rfl) hsup₃ hnext₃ rfl hm₄
-    have ham₄ := allocMap_eq_singleton_of_nextAllocId_two hrel₄ rfl rfl hnext₄
-    subst ham₄
+    have hrel₄ : StateRelLM3_2 b s₄ m₄ [entryAct] :=
+      stateRel_singleton_of_nextAllocId_two hrel₄ rfl rfl hnext₄
     -- Step 5 (`stmtIdx = 4`): `_0 = move _2` (`&mut u64 -> &u64`)
     let s₅ := mkWitStateLM32 b 5 [.init (.ptr p0 8), .init (.scalar ⟨55, 8⟩), .uninit, .uninit] borMutW 2
     have hs₅ : stepMirFn b s₄ = .step s₅ := rfl
@@ -4290,10 +4365,11 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       rfl (fun h => nomatch h) hm₅
     have hsup₅ : AllocIdSupplyReady m₅.machine.memory := hmach₅ ▸ hsup₄
     have hnext₅ : m₅.machine.memory.nextAllocId = 2 := by rw [hmach₅]; exact hnext₄
-    have ham₅ := allocMap_eq_singleton_of_nextAllocId_two hrel₅ rfl rfl hnext₅
-    subst ham₅
+    have hrel₅ : StateRelLM3_2 b s₅ m₅ [entryAct] :=
+      stateRel_singleton_of_nextAllocId_two hrel₅ rfl rfl hnext₅
     -- Step 6 (`stmtIdx = 5`): root-frame `return` terminator returning `_0 : &u64`
-    have hs₆ : stepMirFn b s₅ = .retNormal (.ptr p0 8) s₅.memory := rfl
+    have hs₆ : stepMirFn b s₅ = .retNormal (.ptr p0 8)
+        { s₅.memory with borrows := disableFrameBorrows s₅.memory.borrows 0 b.localDecls.length } := rfl
     have himm₅_0 : ∀ tf, m₅.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
       fun tf htf => immediate_of_nextAllocId_two hrel₅ hsup₅ hnext₅
         (List.Mem.head _) rfl htf 0 (Or.inr (by decide))
@@ -4335,7 +4411,7 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
         (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
     let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1
-    let entryDis : AllocMapEntry := { entry with perm := .disabled }
+    let entryDis : AllocMapEntry := { entry with perm := .disabled, allocDead := true }
     let p0 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
     let s₁ := mkWitStateLM32 b 1
       [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p0 8), .uninit]
@@ -4753,7 +4829,8 @@ theorem wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps :
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_2Tree b s₄ m₄ [lm32TreeChild .frozen, lm32TreeRoot .active] ∧
       get? s₄.frame.locals 0 = some (.init (.scalar ⟨99, 8⟩)) ∧
-      stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩) s₄.memory ∧
+      stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩)
+        { s₄.memory with borrows := disableFrameBorrows s₄.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₄ = ({ m₄ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₄ = (m₄, .ok (.immediate imm0)) ∧
@@ -4936,7 +5013,8 @@ theorem wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps :
   have himm₄_0 : ∀ tf, m₄.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
     fun tf htf => himm₄_step tf₃ tf htf₃ htf 0 (himm₃ tf₃ htf₃ 0 (by decide))
   -- Step 5 (`stmtIdx = 4`): root-frame `return` of `_0 = 99_u64`
-  have hs₅ : stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩) s₄.memory := rfl
+  have hs₅ : stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩)
+      { s₄.memory with borrows := disableFrameBorrows s₄.memory.borrows 0 b.localDecls.length } := rfl
   have hsim₅ := step_terminator_goto_return_tree_simulation htree₄' hphase rfl rfl rfl
     (.return_ u64Decl rfl rfl rfl (by decide) himm₄_0) (Or.inr (Or.inl rfl))
   obtain ⟨decl0, imm0, hdecl0, hret0, himmRel0, hm₅⟩ := stepRelLM3_2Tree_retNormal hsim₅ hs₅
@@ -5279,13 +5357,17 @@ private theorem stepObsRelLM3_2Tree_of_anneal_emitEvent
   | retRoot _ _ _ _ _ _ _ _ _ => rw [ha] at ha_eq; cases ha_eq
   | ub _ _ => rw [ha] at ha_eq; cases ha_eq
 
-private theorem treeMap_eq_of_toBorrowEntry_eq
+private def normReborrowDead (e : ReborrowMapEntry) : ReborrowMapEntry :=
+  { e with allocDead := match e.perm with | .disabled => e.allocDead | _ => false }
+
+private theorem normTreeMap_eq_of_toBorrowEntry_eq
     {treeMap expected : List ReborrowMapEntry}
     (hta1 : ∀ e' ∈ treeMap, e'.allocId = lm31AllocId1)
     (ha1 : ∀ e ∈ expected, e.allocId = lm31AllocId1)
+    (had0 : ∀ e ∈ expected, e.allocDead = false)
     (hmap : treeMap.map ReborrowMapEntry.toBorrowEntry =
       expected.map ReborrowMapEntry.toBorrowEntry) :
-    treeMap = expected := by
+    treeMap.map normReborrowDead = expected := by
   induction treeMap generalizing expected with
   | nil =>
     cases expected with
@@ -5298,32 +5380,73 @@ private theorem treeMap_eq_of_toBorrowEntry_eq
       injection hmap with hbe hrest
       have he'_a1 := hta1 e' (List.Mem.head _)
       have he_a1 := ha1 e (List.Mem.head _)
+      have he_ad0 := had0 e (List.Mem.head _)
       have htl := ih (fun x hx => hta1 x (List.Mem.tail _ hx))
-        (fun x hx => ha1 x (List.Mem.tail _ hx)) hrest
-      subst htl
+        (fun x hx => ha1 x (List.Mem.tail _ hx))
+        (fun x hx => had0 x (List.Mem.tail _ hx)) hrest
       have ht : e'.tag = e.tag := congrArg BorrowEntry.tag hbe
       have hl : e'.localIdx = e.localIdx := congrArg BorrowEntry.targetLocal hbe
       have hp : e'.perm = e.perm := congrArg BorrowEntry.perm hbe
       have hpar : e'.parentTag = e.parentTag := congrArg BorrowEntry.parentTag hbe
-      rcases e' with ⟨t', l', a', p', par'⟩
-      rcases e with ⟨t, l, a, p, par⟩
-      dsimp only at ht hl hp hpar he'_a1 he_a1
-      subst ht hl hp hpar he'_a1 he_a1
-      rfl
+      have had : (normReborrowDead e').allocDead = e.allocDead := by
+        have h1 := congrArg BorrowEntry.allocDead hbe
+        have h2 : e.toBorrowEntry.allocDead = e.allocDead := by
+          rcases e with ⟨t, l, a, p, par, ad⟩
+          dsimp only at he_ad0
+          subst he_ad0
+          cases p <;> rfl
+        exact h1.trans h2
+      have heq : normReborrowDead e' = e := by
+        rcases e' with ⟨t', l', a', p', par', ad'⟩
+        rcases e with ⟨t, l, a, p, par, ad⟩
+        dsimp only [normReborrowDead] at ht hl hp hpar had he'_a1 he_a1 ⊢
+        subst ht hl hp hpar he'_a1 he_a1
+        exact congrArg (ReborrowMapEntry.mk _ _ lm31AllocId1 _ _) had
+      dsimp only [List.map]
+      rw [heq, htl]
 
-private theorem treeMap_eq_of_borrows_and_nextAllocId_two
+private theorem stateRelTree_of_borrows_and_nextAllocId_two
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap expected : List ReborrowMapEntry}
     (htree : StateRelLM3_2Tree body s m treeMap)
     (hbor : s.memory.borrows = expected.map ReborrowMapEntry.toBorrowEntry)
     (ha1 : ∀ e ∈ expected, e.allocId = lm31AllocId1)
-    (hnext2 : m.machine.memory.nextAllocId = 2) :
-    treeMap = expected := by
+    (hnext2 : m.machine.memory.nextAllocId = 2)
+    (had0 : ∀ e ∈ expected, e.allocDead = false := by
+      intro e he
+      try dsimp +zetaDelta at he
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at he
+      first
+      | (subst he; rfl)
+      | (rcases he with rfl | rfl <;> rfl)
+      | (rcases he with rfl | rfl | rfl <;> rfl)) :
+    StateRelLM3_2Tree body s m expected := by
   obtain ⟨_, _, _, _, _, _, _, _, _, _, halloc, _⟩ := id htree.erased_rel
-  refine treeMap_eq_of_toBorrowEntry_eq (fun e' he' => ?_) ha1 (htree.borrows_eq.symm.trans hbor)
-  have hlt := (halloc.base_addr_valid e'.toAllocMapEntry (List.mem_map_of_mem he')).2.1
-  rw [hnext2] at hlt
-  exact allocId_eq_one_of_lt_two hlt
+  have hnorm_eq : treeMap.map normReborrowDead = expected :=
+    normTreeMap_eq_of_toBorrowEntry_eq
+      (fun e' he' => by
+        have hlt := (halloc.base_addr_valid e'.toAllocMapEntry (List.mem_map_of_mem he')).2.1
+        rw [hnext2] at hlt
+        exact allocId_eq_one_of_lt_two hlt)
+      ha1 had0 (htree.borrows_eq.symm.trans hbor)
+  have herase_eq :
+      eraseBorrowParents s (treeMap.map normReborrowDead) = eraseBorrowParents s treeMap := by
+    unfold eraseBorrowParents
+    simp only [List.map_map]
+    have hfun : (AllocMapEntry.toBorrowEntry ∘ ReborrowMapEntry.toAllocMapEntry ∘ normReborrowDead) =
+        (AllocMapEntry.toBorrowEntry ∘ ReborrowMapEntry.toAllocMapEntry) := by
+      funext x
+      exact normAllocDead_toBorrowEntry x.toAllocMapEntry
+    rw [hfun]
+  have hmap_am : (treeMap.map normReborrowDead).map ReborrowMapEntry.toAllocMapEntry =
+      (treeMap.map ReborrowMapEntry.toAllocMapEntry).map normAllocDead := by
+    rw [List.map_map, List.map_map]
+    rfl
+  have herased' : StateRelLM3_2 body (eraseBorrowParents s expected) m
+      (expected.map ReborrowMapEntry.toAllocMapEntry) := by
+    rw [← hnorm_eq, herase_eq, hmap_am]
+    exact stateRel_map_normAllocDead htree.erased_rel
+  exact ⟨herased', hbor⟩
 
 /-- Constant `true : bool` operand for `Assert` terminator witnesses. -/
 def constBoolTrueLM32 : ConstOperand :=
@@ -5562,7 +5685,8 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
       Miri.Interpreter.Step.step hooks () m₇ = (m₈, .ok true) ∧
       StateRelLM3_2Tree b s₈ m₈ finalTree ∧
       (∃ tm, StepObsRelLM3_2Tree b m₈ tm (stepMirFn b s₈) (Miri.Interpreter.Step.step hooks () m₈)) ∧
-      stepMirFn b s₈ = .retNormal (.ptr { allocId := 3, offsetBytes := 0 } 8) s₈.memory ∧
+      stepMirFn b s₈ = .retNormal (.ptr { allocId := 3, offsetBytes := 0 } 8)
+        { s₈.memory with borrows := disableFrameBorrows s₈.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₈ = ({ m₈ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₈ = (m₈, .ok (.immediate imm0)) ∧
@@ -5597,10 +5721,9 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
   obtain ⟨hsup₁, hnext₁⟩ := step_ref_supply_two hrel₀ rfl rfl
     (dstDecl := refMutU64Decl) (targetDecl := u64Decl) rfl rfl hu64 (by decide)
     (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
-  have htm₁ : tm₁ = [lm32TreeRoot .reserved] :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₁ rfl
+  have htree₁ : StateRelLM3_2Tree b s₁ m₁ [lm32TreeRoot .reserved] :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₁ rfl
       (by intro _ he; cases he with | head _ => rfl | tail _ h => cases h) hnext₁
-  subst htm₁
   -- Step 2 (`bb0[1]`): `_3 = &mut *_2` (child tag `2`, `parentTag = some 1`)
   let s₂ := mkWitLocStateLM32 b 0 2
     [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8), .uninit, .uninit]
@@ -5644,13 +5767,12 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
   have hmach₂ : m₂.machine = m₁.machine := (by have h := hm₂'.symm.trans hm₂; injection h : m₂' = m₂) ▸ hmach₂'
   have hsup₂ : AllocIdSupplyReady m₂.machine.memory := hmach₂ ▸ hsup₁
   have hnext₂ : m₂.machine.memory.nextAllocId = 2 := by rw [hmach₂]; exact hnext₁
-  have htm₂ : tm₂ = [lm32TreeChild .reserved, lm32TreeRoot .reserved] :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₂ rfl
+  have htree₂ : StateRelLM3_2Tree b s₂ m₂ [lm32TreeChild .reserved, lm32TreeRoot .reserved] :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₂ rfl
       (by
         intro e he
         simp only [List.mem_cons, List.not_mem_nil, or_false] at he
         rcases he with rfl | rfl <;> rfl) hnext₂
-  subst htm₂
   -- Step 3 (`bb0[2]`): `*_3 = const 99_u64` (child write activates child & root)
   let s₃ := mkWitLocStateLM32 b 0 3
     [.uninit, .init (.scalar ⟨99, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8), .uninit, .uninit]
@@ -5683,13 +5805,12 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
     (ptrVal := p2) (e := (lm32TreeChild .reserved).toAllocMapEntry)
     rfl (List.Mem.head _) rfl rfl (fun h => nomatch h)
     (fun d hd => by injection hd with hd'; subst hd'; rfl) hsup₂ hnext₂ rfl hm₃
-  have htm₃ : tm₃ = [lm32TreeChild .active, lm32TreeRoot .active] :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₃ rfl
+  have htree₃ : StateRelLM3_2Tree b s₃ m₃ [lm32TreeChild .active, lm32TreeRoot .active] :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₃ rfl
       (by
         intro e he
         simp only [List.mem_cons, List.not_mem_nil, or_false] at he
         rcases he with rfl | rfl <;> rfl) hnext₃
-  subst htm₃
   -- Step 4 (`bb0[3]`): `_4 = &*_3` (grandchild tag `3`, `parentTag = some 2`)
   let tree₄ := [lm32TreeGrandchild .frozen, lm32TreeChild .active, lm32TreeRoot .active]
   let s₄ := mkWitLocStateLM32 b 0 4
@@ -5743,9 +5864,8 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
     intro e he
     simp only [tree₄, List.mem_cons, List.not_mem_nil, or_false] at he
     rcases he with rfl | rfl | rfl <;> rfl
-  have htm₄ : tm₄ = tree₄ :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₄ rfl htree₄_a1 hnext₄
-  subst htm₄
+  have htree₄ : StateRelLM3_2Tree b s₄ m₄ tree₄ :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₄ rfl htree₄_a1 hnext₄
   -- Step 5 (`bb0[4]`): `_5 = copy *_2` (root read yields `99_u64` & freezes child `tag 2`)
   let finalTree := [lm32TreeGrandchild .frozen, lm32TreeChild .frozen, lm32TreeRoot .active]
   have hfinal_a1 : ∀ e ∈ finalTree, e.allocId = lm31AllocId1 := by
@@ -5797,9 +5917,8 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
         exact hlive₅ ptrVal hget e he htag' hdead) hm₅).1
   have hsup₅ : AllocIdSupplyReady m₅.machine.memory := hmach₅ ▸ hsup₄
   have hnext₅ : m₅.machine.memory.nextAllocId = 2 := by rw [hmach₅]; exact hnext₄
-  have htm₅ : tm₅ = finalTree :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₅ rfl hfinal_a1 hnext₅
-  subst htm₅
+  have htree₅ : StateRelLM3_2Tree b s₅ m₅ finalTree :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₅ rfl hfinal_a1 hnext₅
   -- Step 6 (`bb0` terminator): `SwitchInt(copy _5)` -> `bb1` emitting `MirObs.event 99`
   let s₆ := mkWitLocStateLM32 b 1 0 s₅.frame.locals s₅.memory.borrows 4
   have hs₆ : stepMirFn b s₅ = .emitStep (.event 99) s₆ := rfl
@@ -5830,9 +5949,8 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
       (fun tf htf => .copyLocal 5 u64Decl rfl (by decide) (himm₅_5 tf htf)) hcases hm₆
   have hsup₆ : AllocIdSupplyReady m₆.machine.memory := hmach₆ ▸ hsup₅
   have hnext₆ : m₆.machine.memory.nextAllocId = 2 := by rw [hmach₆]; exact hnext₅
-  have htm₆ : tm₆ = finalTree :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₆ rfl hfinal_a1 hnext₆
-  subst htm₆
+  have htree₆ : StateRelLM3_2Tree b s₆ m₆ finalTree :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₆ rfl hfinal_a1 hnext₆
   -- Step 7 (`bb1` terminator): `Assert(const true == true)` -> `bb2`
   let s₇ := mkWitLocStateLM32 b 2 0 s₅.frame.locals s₅.memory.borrows 4
   have hs₇ : stepMirFn b s₆ = .step s₇ := rfl
@@ -5849,9 +5967,8 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
     step_terminator_assert_constTrue_machine_eq htree₆.erased_rel rfl rfl rfl rfl hm₇
   have hsup₇ : AllocIdSupplyReady m₇.machine.memory := hmach₇ ▸ hsup₆
   have hnext₇ : m₇.machine.memory.nextAllocId = 2 := by rw [hmach₇]; exact hnext₆
-  have htm₇ : tm₇ = finalTree :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₇ rfl hfinal_a1 hnext₇
-  subst htm₇
+  have htree₇ : StateRelLM3_2Tree b s₇ m₇ finalTree :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₇ rfl hfinal_a1 hnext₇
   -- Step 8 (`bb2[0]`): `_0 = move _4`
   let s₈ := mkWitLocStateLM32 b 2 1
     [.init (.ptr p3 8), .init (.scalar ⟨99, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8),
@@ -5878,11 +5995,11 @@ theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
       rfl (fun h => nomatch h) hm₈
   have hsup₈ : AllocIdSupplyReady m₈.machine.memory := hmach₈ ▸ hsup₇
   have hnext₈ : m₈.machine.memory.nextAllocId = 2 := by rw [hmach₈]; exact hnext₇
-  have htm₈ : tm₈ = finalTree :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₈ rfl hfinal_a1 hnext₈
-  subst htm₈
+  have htree₈ : StateRelLM3_2Tree b s₈ m₈ finalTree :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₈ rfl hfinal_a1 hnext₈
   -- Step 9 (`bb2` terminator): root-frame `return` of `_0 : &u64` (`p3`, tag `3`)
-  have hs₉ : stepMirFn b s₈ = .retNormal (.ptr p3 8) s₈.memory := rfl
+  have hs₉ : stepMirFn b s₈ = .retNormal (.ptr p3 8)
+      { s₈.memory with borrows := disableFrameBorrows s₈.memory.borrows 0 b.localDecls.length } := rfl
   have himm₈_0 : ∀ tf, m₈.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
     fun tf htf => immediate_of_nextAllocId_two htree₈.erased_rel hsup₈ hnext₈
       (List.Mem.head _) rfl htf 0 (Or.inr (by decide))
@@ -5968,10 +6085,9 @@ theorem wit_lm3_2_placeMention_safeRef_deref_uninit_tree_state_simulation_real_s
   obtain ⟨hsup₁, hnext₁⟩ := step_ref_supply_two hrel₀ rfl rfl
     (dstDecl := refMutU64Decl) (targetDecl := u64Decl) rfl rfl hu64 (by decide)
     (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
-  have htm₁ : tm₁ = [lm32TreeRoot .reserved] :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₁ rfl
+  have htree₁ : StateRelLM3_2Tree b s₁ m₁ [lm32TreeRoot .reserved] :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₁ rfl
       (by intro _ he; cases he with | head _ => rfl | tail _ h => cases h) hnext₁
-  subst htm₁
   let s₂ := mkWitLocStateLM32 b 0 2
     [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8), .uninit, .uninit]
     [(lm32TreeChild .reserved).toBorrowEntry, (lm32TreeRoot .reserved).toBorrowEntry] 3
@@ -6014,13 +6130,12 @@ theorem wit_lm3_2_placeMention_safeRef_deref_uninit_tree_state_simulation_real_s
   have hmach₂ : m₂.machine = m₁.machine := (by have h := hm₂'.symm.trans hm₂; injection h : m₂' = m₂) ▸ hmach₂'
   have hsup₂ : AllocIdSupplyReady m₂.machine.memory := hmach₂ ▸ hsup₁
   have hnext₂ : m₂.machine.memory.nextAllocId = 2 := by rw [hmach₂]; exact hnext₁
-  have htm₂ : tm₂ = [lm32TreeChild .reserved, lm32TreeRoot .reserved] :=
-    treeMap_eq_of_borrows_and_nextAllocId_two htree₂ rfl
+  have htree₂ : StateRelLM3_2Tree b s₂ m₂ [lm32TreeChild .reserved, lm32TreeRoot .reserved] :=
+    stateRelTree_of_borrows_and_nextAllocId_two htree₂ rfl
       (by
         intro e he
         simp only [List.mem_cons, List.not_mem_nil, or_false] at he
         rcases he with rfl | rfl <;> rfl) hnext₂
-  subst htm₂
   have himm₂_4 : ∀ tf, m₂.stack.frames = #[tf] → IsImmediateFrameLocal tf 4 :=
     fun tf htf => immediate_of_nextAllocId_two htree₂.erased_rel hsup₂ hnext₂
       (List.Mem.head _) rfl htf 4 (Or.inr (by decide))

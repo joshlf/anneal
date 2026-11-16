@@ -997,6 +997,7 @@ private theorem stepMirFn_binOp_offset_const_eq
       (.init (.ptr { ptrVal with offsetBytes := ptrVal.offsetBytes + sc.bits * stride } 8)) =
       some s'.frame.locals := by rfl)
     (hprot : s.memory.activeProtectors = .nil := by rfl)
+    (hstack : s.memory.callStack = .nil := by rfl)
     (hs' : advanceStmt s s'.frame.locals
       { s.memory with
         borrows := invalidateConflictingBorrows s.memory.borrows dstIdx none
@@ -1016,7 +1017,7 @@ private theorem stepMirFn_binOp_offset_const_eq
   simp only [hbb, hstmt]
   unfold evalStmt evalRvalue
   dsimp only []
-  rw [hop_lhs]
+  rw [hstack, hop_lhs]
   dsimp only []
   have hop_rhs : evalOperand locals_mid (.constant c) s.memory.borrows s.memory.globals
       body.layouts s.memory.callerLocals body.localDecls = .ok (.scalar sc) locals_mid := by
@@ -1029,8 +1030,12 @@ private theorem stepMirFn_binOp_offset_const_eq
   rw [hslot_d]
   cases slot_d with
   | dead => exact absurd rfl hd_ne
-  | uninit => simp only [hset_d, hprot, hs']
-  | init _ => simp only [hset_d, hprot, hs']
+  | uninit =>
+    have hlen_cs : length s.memory.callStack = 0 := by rw [hstack]; rfl
+    rw [hlen_cs]; simp only [hset_d, hprot, hs']
+  | init _ =>
+    have hlen_cs : length s.memory.callStack = 0 := by rw [hstack]; rfl
+    rw [hlen_cs]; simp only [hset_d, hprot, hs']
 
 /-- Body for negative `arith_offset`: `_2 = &raw mut _1`, `_3 = copy _2 as *mut u8`,
 `_3 = Offset(copy _3, 8_usize)`, `_2 = copy _3 as *mut u64`, then

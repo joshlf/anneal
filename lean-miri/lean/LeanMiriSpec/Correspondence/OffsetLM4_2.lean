@@ -1095,7 +1095,7 @@ theorem evalTerminator_stage1_arithOffset_call
     (helem : rigidTyKindByteSize pointeeKind = some elemBytes) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals [ptrOp, countOp] s.memory.borrows s.memory.globals
-          body.layouts s.memory.callerLocals with
+          body.layouts s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         match vs with
         | .ptr ptrVal ptrSz :: .scalar countSc :: .nil =>
@@ -1104,7 +1104,7 @@ theorem evalTerminator_stage1_arithOffset_call
           | true =>
             match evalArithOffset ptrVal ptrSz countSc elemBytes with
             | .some retPtrVal =>
-              intrinsicWriteReturn s locals' ⟨dstIdx, []⟩ targetBb (.ptr retPtrVal 8)
+              writeIntrinsicReturn s locals' ⟨dstIdx, []⟩ targetBb (.ptr retPtrVal 8)
             | .none => MirStepNode.fail .ub
         | _ => MirStepNode.fail .ub
       | .ub => MirStepNode.fail .ub
@@ -1113,7 +1113,7 @@ theorem evalTerminator_stage1_arithOffset_call
   rw [hterm]
   simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
   cases evalOperands s.frame.locals [ptrOp, countOp] s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
+      s.memory.callerLocals [] s.memory.callStack with
   | ok vs locals' =>
     simp only [hcallee]
     dsimp only [isDirectExactDivTarget, stringEq, listByteEq, evalDirectRustIntrinsic?,
@@ -1172,11 +1172,11 @@ theorem call_intrinsic_arithOffset_stage1_simulation
       (layoutOfEncodedTyId (encodeTyId { kind := pointeeKind, layoutIdx := 0 })
         body.layouts).layout.size.bytes.toNat = elemBytes :=
     layoutOfEncodedTyId_size_of_scalarLayoutOfRigidTy body.layouts helem_miri
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, _, _⟩ := id hstate
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-  rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal,
+  rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal, hstack,
     miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
     translateTerminator_intrinsic_call (k := .arithOffset) hterm hc]
   simp only [List.map_cons, List.map_nil]
@@ -1305,10 +1305,12 @@ theorem call_intrinsic_arithOffset_stage1_simulation
         have hanneal_ev :
             (match evalArithOffset p 8 countSc elemBytes with
             | .some retPtrVal =>
-              intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.ptr retPtrVal 8)
+              writeIntrinsicReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.ptr retPtrVal 8)
             | .none => MirStepNode.fail .ub) =
             intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb (.ptr p' 8) := by
           rw [stage1_evalArithOffset_eq p countSc elemBytes hcount8 hcan8]
+          exact hstate.writeIntrinsicReturn_eq_intrinsicWriteReturn hframes hdst
+            (hdstImm tf hframes) targetBb (.ptr p' 8)
         have hev : Miri.Interpreter.Intrinsics.eval
             (annealIntrinsicHooks body.localDecls body.layouts) ()
             AnnealIntrinsic.arithOffset.name #[argTyId]
@@ -1428,7 +1430,7 @@ theorem call_intrinsic_arithOffset_stage1_scalar_ptr_divergence
                 (.init (.scalar ⟨(addr.bits + countSc.bits * elemBytes) % scalarModulus 8, 8⟩)) }
           memory := s.memory }
         m' allocMap := by
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, hstack, _, _, _, _, _⟩ := id hstate
   have ha₁ : evalOperand s.frame.locals (.copy ⟨ptrIdx, []⟩) s.memory.borrows s.memory.globals
       body.layouts s.memory.callerLocals = .ok (.scalar addr) s.frame.locals := by
     unfold evalOperand; dsimp only; rw [hptr_scalar]; rfl
@@ -1445,7 +1447,7 @@ theorem call_intrinsic_arithOffset_stage1_scalar_ptr_divergence
   have hstage1_ub : stepMirFn body s = MirStepNode.fail .ub := by
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
     simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-    rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal, hevals]
+    rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal, hstack, hevals]
   refine ⟨hstage1_ub, ?_⟩
   rcases annealEvalOperand_rawPtr_copy_lm3_1 hstate hframes hptrDecl hptrTy (hptrImm tf hframes) with
     ⟨_, _, ha₁', _⟩ | ⟨_, ha₁', _⟩ |

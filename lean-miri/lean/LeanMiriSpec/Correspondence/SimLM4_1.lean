@@ -110,6 +110,24 @@ open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 
+private theorem evalOperand_copy_nil_any
+    (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals
+        localDecls callStack =
+      evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
+
+private theorem evalOperand_move_nil_any
+    (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals
+        localDecls callStack =
+      evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
+
 /-! ## 1. Multi-Frame `stepMirFn`, `Step.step`, and Stack Array Helpers -/
 
 /-- Unfold `stepMirFn rootBody s` at arbitrary stack depth in terms of
@@ -349,7 +367,7 @@ theorem step_terminator_unreachable_ub_simulation
       (Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
           fnPtrs) () m) := by
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -400,7 +418,7 @@ theorem step_terminator_drop_noop_simulation
           fnPtrs) () m) := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -524,7 +542,7 @@ theorem step_terminator_drop_noop_simulation
         refine .mk topFrame' (by simp) hcal_root hcal_nonroot
           (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody] using hlinks'.toForall2)
           (by simpa [activeMirBody] using hlinks')
-          hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt
+          hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
 
 /-- **Divergence Lemma (`H3`, `canonical_drop_no_glue_preserves_local_divergence`)**:
 When dropping an unprojected live immediate local `localId` with value
@@ -644,7 +662,7 @@ theorem step_terminator_drop_projected_simulation
           fnPtrs) () m) := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -730,7 +748,7 @@ theorem step_terminator_drop_projected_simulation
             exact .mk topFrame' (array_back?_append_singleton restMfs.reverse topFrame') hcal_root hcal_nonroot
               (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody] using hlinks'.toForall2)
               (by simpa [activeMirBody] using hlinks')
-              hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt
+              hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
 
 /-- **Divergence (`step_terminator_drop_projected_uninit_divergence`)**: on a
 projected `TerminatorKind.drop ⟨localId, .field fieldIdx :: .nil⟩ target unwind`
@@ -769,7 +787,7 @@ theorem step_terminator_drop_projected_uninit_divergence
       m'.stack.frames.back? = some tf' ∧
       tf'.location = .mir ⟨target, 0⟩ ∧
       ∃ lay, tf'.locals[localId]? = some ⟨.live (.immediate .uninit), lay⟩ := by
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -899,7 +917,7 @@ theorem step_terminator_drop_canonical_no_glue_step_divergence
       gf.locals[localId]? = some ⟨.live (.immediate (.scalar (.fromScalarInt msc))), lay⟩) := by
   have hsim :=
     step_terminator_drop_noop_simulation hstate hphase hbb hstmt_none hstmt_len hterm hdecl himm
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -1280,7 +1298,14 @@ theorem step_terminator_return_root_simulation
       (Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
           fnPtrs) () m) := by
-  rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _, hbfv⟩
+  have hprot_nil : s.memory.activeProtectors = [] := hbfv.root_protectors_nil hstack
+  have hconf0 :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length ([] : List SavedCallerFrame)) (length s.frame.locals) = false := by
+    rw [hprot_nil]
+    unfold hasFrameDeallocProtectorConflict
+    rfl
   have hact_body : activeMirBody rootBody s = rootBody := by
     unfold activeMirBody
     rcases hcal_root hstack with hnone | hsome
@@ -1392,9 +1417,11 @@ theorem step_terminator_return_root_simulation
           unfold Miri.Interpreter.runRvalue
           rw [EStateM.bind_eq_ok hread_ok]
           rfl
+        rw [hconf0]
+        dsimp only []
         rw [returnFromCurrentFrame_lm4_1_root_ok hframes hframe.body_eq hframe.location_eq
           hbb hcleanup hretCont hop0 hcopy_ok]
-        exact StepRelMultiFrame.retRoot decl0 (.scalar sc0) (.indirect mp0) s.memory _
+        exact StepRelMultiFrame.retRoot decl0 (.scalar sc0) (.indirect mp0) _ _
           hdecl0 hop0 (Or.inr ⟨mp0, rfl, hmemRel0_save⟩) rfl
     | immediate _ imm cachedLayout _ hval =>
       rcases hval with ⟨rfl, rfl⟩ | ⟨retVal, rfl, himmRel⟩
@@ -1406,7 +1433,9 @@ theorem step_terminator_return_root_simulation
           (annealControlHooks_returnOperand_uninit_back hback hframe.body_eq hframe.location_eq
             hbb hcleanup hget0 hdecl0 hsz0)]
         exact StepRelMultiFrame.ub _ _
-      · have hcopy_imm :
+      · rw [hconf0]
+        dsimp only []
+        have hcopy_imm :
             ∀ imm0,
               (annealControlHooksLM4_1 rootBody.localDecls rootBody.layouts).copyReturn ()
                 (.immediate imm0) rootMf.returnPlace { m with stack := ⟨#[]⟩ } =
@@ -1423,7 +1452,7 @@ theorem step_terminator_return_root_simulation
             annealControlHooks_returnOperand_zst_unit_back hback hget0 hdecl0 hzero
           rw [returnFromCurrentFrame_lm4_1_root_ok hframes hframe.body_eq hframe.location_eq
             hbb hcleanup hretCont hop0 (hcopy_imm .uninit)]
-          exact StepRelMultiFrame.retRoot decl0 .unit (.immediate .uninit) s.memory _
+          exact StepRelMultiFrame.retRoot decl0 .unit (.immediate .uninit) _ _
             hdecl0 hop0 (Or.inl ⟨.uninit, rfl, .unit hzero⟩) rfl
         | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
           have hop0 :
@@ -1432,7 +1461,7 @@ theorem step_terminator_return_root_simulation
             annealControlHooks_returnOperand_scalar_back hback hget0
           rw [returnFromCurrentFrame_lm4_1_root_ok hframes hframe.body_eq hframe.location_eq
             hbb hcleanup hretCont hop0 (hcopy_imm _)]
-          exact StepRelMultiFrame.retRoot decl0 _ _ s.memory _ hdecl0 hop0
+          exact StepRelMultiFrame.retRoot decl0 _ _ _ _ hdecl0 hop0
             (Or.inl ⟨_, rfl, .scalar sc msc hsc hsz_sc hbool_sc hchar_sc⟩) rfl
         | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
           have hop0 :
@@ -1441,7 +1470,7 @@ theorem step_terminator_return_root_simulation
             annealControlHooks_returnOperand_scalarPair_back hback hget0
           rw [returnFromCurrentFrame_lm4_1_root_ok hframes hframe.body_eq hframe.location_eq
             hbb hcleanup hretCont hop0 (hcopy_imm _)]
-          exact StepRelMultiFrame.retRoot decl0 _ _ s.memory _ hdecl0 hop0
+          exact StepRelMultiFrame.retRoot decl0 _ _ _ _ hdecl0 hop0
             (Or.inl ⟨_, rfl, .scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair⟩) rfl
 
 /-! ## 4. Non-Root Callee `Terminator.Return` Simulation (`step_terminator_return_callee_simulation`) -/
@@ -2347,11 +2376,11 @@ theorem step_terminator_return_callee_simulation
           fnPtrs) () m) := by
   rcases hstate with
     ⟨_, _, _, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   generalize hmfs : m.stack.frames.toList.reverse = mfs at hlinks
-  generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt
+  generalize hprots : s.memory.activeProtectors = prots at hlinks htb hvalid hcid_act hbt hbfv
   generalize hcur : activeMirBody rootBody s = curBody at hlinks
-  rw [hstack] at hlinks hbt
+  rw [hstack] at hlinks hbt hbfv
   cases hlinks with
   | cons _ _ _ _ curFrameProts callerProts calleeMf callerMf restMfs
       hretCont hdest hfr_callee hretWf hcp _ hlinks_caller =>
@@ -2373,15 +2402,17 @@ theorem step_terminator_return_callee_simulation
     let bt' := popFrameBorrowTracker poppedFrame m.machine.borrowTracker
     let m₀ : AnnealStepState :=
       { stack := m.stack, machine := { m.machine with borrowTracker := bt' } }
+    have hbt_pop :
+        BorrowTrackerStackRel s.memory.borrows (callerRestoredProtectors [cf]) restStack bt' := by
+      dsimp only [bt']
+      rw [hpopped_eq]
+      exact hbt.of_popFrame
     have hbt_post :
         BorrowTrackerStackRel s.memory.borrows
           (match cf.callerProtector with
            | some protId => protId :: cf.calleeProtectors
            | none => cf.calleeProtectors)
-          restStack bt' := by
-      dsimp only [bt']
-      rw [hpopped_eq]
-      exact hbt.of_popFrame
+          restStack bt' := hbt_pop
     have hdest := hdest.of_borrowTracker (bt' := bt')
     have hfr_callee := hfr_callee.of_borrowTracker (bt' := bt')
     have hretWf := hretWf.of_borrowTracker (bt' := bt')
@@ -2396,6 +2427,15 @@ theorem step_terminator_return_callee_simulation
       annealTerminatorHooksLM4_1
     rw [hterm, hstack, hslot0]
     dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+    have hconf_cal :
+        hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+          (length (cf :: restStack)) (length s.frame.locals) = false :=
+      hasFrameDeallocProtectorConflict_succ_eq_false hbfv.root_depth
+        s.memory.activeProtectors (length restStack) (length s.frame.locals)
+    have hdis_cal :
+        disableFrameBorrows s.memory.borrows (length (cf :: restStack)) (length s.frame.locals) =
+          s.memory.borrows :=
+      disableFrameBorrows_succ_eq hbfv.root_depth (length restStack) (length s.frame.locals)
     have hpop :
         (annealControlHooksLM4_1 (activeMirBody rootBody s).localDecls (activeMirBody rootBody s).layouts poppedFrame).popFrame () m =
           ({ m₀ with stack := ⟨⟨restMfs.reverse ++ [callerMf]⟩⟩ }, .ok calleeMf) :=
@@ -2565,6 +2605,7 @@ theorem step_terminator_return_callee_simulation
         dsimp only [Except.map]
         exact StepRelMultiFrame.ub _ _
       | init retVal =>
+        rw [hconf_cal]; dsimp only []; rw [hdis_cal]
         obtain ⟨sc0, rfl⟩ := hinit_sc0 retVal hslot0
         obtain ⟨hsz0_eq, hbool0, hchar0, msc0, hrel0, hread0⟩ := hscalar_cons0 sc0 rfl
         have himmRel0 :
@@ -2610,10 +2651,15 @@ theorem step_terminator_return_callee_simulation
           subst hmls_eq2
           have hcache_d : ∀ l ∈ cachedLayout_d, l = translateTy destDecl.ty cf.callerBody.layouts :=
             hloc_d.cachedLayout_eq
-          have hwrite_af :
-              writePlaceValue cf.frame.locals s.memory.borrows cf.destination (.scalar sc0) =
-                .ok (cf.frame.locals.set destIdx (.init (.scalar sc0))) := by
-            rw [hcf]; exact writePlaceValue_not_dead_ok hslot_d hne_dead
+          obtain ⟨hw_dest, htb_fin, hvalid_fin, hcid_bor_fin, hbt_fin, hbfv_fin⟩ :=
+            writeReturnDestination_callee_ok_and_invariants hbfv htb hvalid_post' hcid_bor
+              hbt_pop hcf hlt_af_d hslot_d hne_dead
+              { s.memory with
+                borrows := s.memory.borrows
+                callStack := restStack
+                activeCallee := .some cf.callerBody
+                activeProtectors := restoreCallerProtectors cf }
+              rfl rfl rfl (.scalar sc0)
           let imm0 : Miri.Interpreter.Immediate AnnealProv := .scalar (.fromScalarInt msc0)
           let callerMf₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
             { callerMf with
@@ -2678,7 +2724,8 @@ theorem step_terminator_return_callee_simulation
             exact StepRelMultiFrame.ub _ _
           have hdiv_false : cf.isDiverging = false := Bool.eq_false_iff.mpr hdiv_true
           simp only [hdiv_false, Bool.false_eq_true, ↓reduceIte] at hretCont ⊢
-          simp only [hwrite_af, restoreCallerProtectors]
+          rw [hw_dest]
+          dsimp only []
           rw [returnFromCurrentFrame_lm4_1_callee_ok hback hfr_callee.body_eq hfr_callee.location_eq
             hbb hcleanup hretCont hop0 hpop hcopy hclean]
           dsimp only [Except.map]
@@ -2770,8 +2817,9 @@ theorem step_terminator_return_callee_simulation
           refine .mk callerMf'
             (array_back?_append_singleton restMfs.reverse callerMf')
             hcal_root_post (fun _ => rfl)
-            (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, hcp] using hlinks_post.toForall2)
+            (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, restoreCallerProtectors, hcp] using hlinks_post.toForall2)
             (by
+              dsimp only [restoreCallerProtectors]
               have hcp_rev : callerProts = (match cf.callerProtector with | some protId => protId :: cf.calleeProtectors | none => cf.calleeProtectors) := hcp.symm
               cases hcp_rev
               unfold activeMirBody
@@ -2781,8 +2829,8 @@ theorem step_terminator_return_callee_simulation
                 array_toList_reverse_append_singleton restMfs callerMf'
               rw [hrev_post]
               exact hlinks_post)
-            hdisj_post htb_post
-            hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post
+            hdisj_post htb_fin
+            hvalid_fin hcid_pos hcid_act_post' hcid_bor_fin hbt_fin hbfv_fin
         | indirect destIdx destDecl slot_d mp_d c_d rp_callee allocId tag baseAddr relOffset
             localAlloc words hcf hdecl_d hprim_d hslot_d hne_dead hmls_d hrp_or hprov hmis
             hmeta hlive hnodup hbase h_no_overflow h_offset hmut hlen hprovMap hmask_rel
@@ -2802,10 +2850,15 @@ theorem step_terminator_return_callee_simulation
           subst hmls_eq2
           have hcache_d : ∀ l ∈ c_d, l = translateTy destDecl.ty cf.callerBody.layouts :=
             hloc_d.cachedLayout_eq
-          have hwrite_af :
-              writePlaceValue cf.frame.locals s.memory.borrows cf.destination (.scalar sc0) =
-                .ok (cf.frame.locals.set destIdx (.init (.scalar sc0))) := by
-            rw [hcf]; exact writePlaceValue_not_dead_ok hslot_d hne_dead
+          obtain ⟨hw_dest, htb_fin, hvalid_fin, hcid_bor_fin, hbt_fin, hbfv_fin⟩ :=
+            writeReturnDestination_callee_ok_and_invariants hbfv htb hvalid_post' hcid_bor
+              hbt_pop hcf hlt_af_d hslot_d hne_dead
+              { s.memory with
+                borrows := s.memory.borrows
+                callStack := restStack
+                activeCallee := .some cf.callerBody
+                activeProtectors := restoreCallerProtectors cf }
+              rfl rfl rfl (.scalar sc0)
           obtain ⟨u, hu_lt, hfidx, hget, _⟩ := array_findIdx?_of_nodup_fst hnodup hlive
           have himmRel_dest :=
             hty_compat destIdx destDecl hcf hdecl_d (.scalar sc0) (.scalar (.fromScalarInt msc0)) himmRel0
@@ -2913,7 +2966,8 @@ theorem step_terminator_return_callee_simulation
             exact StepRelMultiFrame.ub _ _
           have hdiv_false : cf.isDiverging = false := Bool.eq_false_iff.mpr hdiv_true
           simp only [hdiv_false, Bool.false_eq_true, ↓reduceIte] at hretCont ⊢
-          simp only [hwrite_af, restoreCallerProtectors]
+          rw [hw_dest]
+          dsimp only []
           rw [returnFromCurrentFrame_lm4_1_callee_ok hback hfr_callee.body_eq hfr_callee.location_eq
             hbb hcleanup hretCont hop0 hpop hcopy hclean]
           dsimp only [Except.map]
@@ -3079,8 +3133,9 @@ theorem step_terminator_return_callee_simulation
           refine .mk callerMf'
             (array_back?_append_singleton restMfs.reverse callerMf')
             hcal_root_post (fun _ => rfl)
-            (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, hcp] using hlinks_post.toForall2)
+            (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, restoreCallerProtectors, hcp] using hlinks_post.toForall2)
             (by
+              dsimp only [restoreCallerProtectors]
               have hcp_rev : callerProts = (match cf.callerProtector with | some protId => protId :: cf.calleeProtectors | none => cf.calleeProtectors) := hcp.symm
               cases hcp_rev
               unfold activeMirBody
@@ -3090,8 +3145,8 @@ theorem step_terminator_return_callee_simulation
                 array_toList_reverse_append_singleton restMfs callerMf'
               rw [hrev_post]
               exact hlinks_post)
-            hdisj_post htb_post
-            hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post
+            hdisj_post htb_fin
+            hvalid_fin hcid_pos hcid_act_post' hcid_bor_fin hbt_fin hbfv_fin
     | immediate _ imm0 cachedLayout _ hval0 =>
       rcases hval0 with ⟨rfl, rfl⟩ | ⟨retVal, rfl, himmRel0⟩
       · have hsz0 :
@@ -3104,7 +3159,8 @@ theorem step_terminator_return_callee_simulation
           (annealControlHooks_returnOperand_uninit_back hback hfr_callee.body_eq hfr_callee.location_eq
             hbb hcleanup hget0 hdecl0 hsz0)]
         exact StepRelMultiFrame.ub _ _
-      · have hop0 :
+      · rw [hconf_cal]; dsimp only []; rw [hdis_cal]
+        have hop0 :
             (annealControlHooksLM4_1 (activeMirBody rootBody s).localDecls (activeMirBody rootBody s).layouts poppedFrame).returnOperand () m =
               (m, .ok (.immediate imm0)) := by
           cases himmRel0 with
@@ -3129,13 +3185,18 @@ theorem step_terminator_return_callee_simulation
           subst hmls_eq2
           have hcache_d : ∀ l ∈ c_d, l = translateTy destDecl.ty cf.callerBody.layouts :=
             hloc_d.cachedLayout_eq
-          have hwrite_af :
-              writePlaceValue cf.frame.locals s.memory.borrows cf.destination retVal =
-                .ok (cf.frame.locals.set destIdx (.init retVal)) := by
-            rw [hcf]; exact writePlaceValue_not_dead_ok hslot_d hne_dead
           have himmRel_dest := hty_compat destIdx destDecl hcf hdecl_d retVal imm0 himmRel0
           obtain ⟨sc, msc, rfl, rfl, hdata, hsz_dest, hbool_dest, hchar_dest⟩ :=
             ImmediateRel.of_primitive_scalar himmRel_dest hprim_d
+          obtain ⟨hw_dest, htb_fin, hvalid_fin, hcid_bor_fin, hbt_fin, hbfv_fin⟩ :=
+            writeReturnDestination_callee_ok_and_invariants hbfv htb hvalid_post' hcid_bor
+              hbt_pop hcf hlt_af_d hslot_d hne_dead
+              { s.memory with
+                borrows := s.memory.borrows
+                callStack := restStack
+                activeCallee := .some cf.callerBody
+                activeProtectors := restoreCallerProtectors cf }
+              rfl rfl rfl (.scalar sc)
           obtain ⟨u, hu_lt, hfidx, hget, _⟩ := array_findIdx?_of_nodup_fst hnodup hlive
           have hbnd :
               relOffset.bytes.toNat + (translateSizeBytes sc.sizeBytes).bytes.toNat ≤
@@ -3211,7 +3272,8 @@ theorem step_terminator_return_callee_simulation
             exact StepRelMultiFrame.ub _ _
           have hdiv_false : cf.isDiverging = false := Bool.eq_false_iff.mpr hdiv_true
           simp only [hdiv_false, Bool.false_eq_true, ↓reduceIte] at hretCont ⊢
-          simp only [hwrite_af, restoreCallerProtectors]
+          rw [hw_dest]
+          dsimp only []
           rw [returnFromCurrentFrame_lm4_1_callee_ok hback hfr_callee.body_eq hfr_callee.location_eq
             hbb hcleanup hretCont hop0 hpop hcopy hclean]
           dsimp only [Except.map]
@@ -3377,8 +3439,9 @@ theorem step_terminator_return_callee_simulation
           refine .mk callerMf'
             (array_back?_append_singleton restMfs.reverse callerMf')
             hcal_root_post (fun _ => rfl)
-            (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, hcp] using hlinks_post.toForall2)
+            (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, restoreCallerProtectors, hcp] using hlinks_post.toForall2)
             (by
+              dsimp only [restoreCallerProtectors]
               have hcp_rev : callerProts = (match cf.callerProtector with | some protId => protId :: cf.calleeProtectors | none => cf.calleeProtectors) := hcp.symm
               cases hcp_rev
               unfold activeMirBody
@@ -3388,8 +3451,8 @@ theorem step_terminator_return_callee_simulation
                 array_toList_reverse_append_singleton restMfs callerMf'
               rw [hrev_post]
               exact hlinks_post)
-            hdisj_post htb_post
-            hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post
+            hdisj_post htb_fin
+            hvalid_fin hcid_pos hcid_act_post' hcid_bor_fin hbt_fin hbfv_fin
         | immediate destIdx destDecl slot_d imm_d cachedLayout_d hcf hdecl_d hslot_d hne_dead hmls_d =>
             have hforall_caller := hlinks_caller.toForall2
             have hfr_caller := list_forall2_head hforall_caller
@@ -3400,21 +3463,15 @@ theorem step_terminator_return_callee_simulation
             subst hmls_eq2
             have hcache_d : ∀ l ∈ cachedLayout_d, l = translateTy destDecl.ty cf.callerBody.layouts :=
               hloc_d.cachedLayout_eq
-            have hwrite_af :
-                writePlaceValue cf.frame.locals s.memory.borrows cf.destination retVal =
-                  .ok (cf.frame.locals.set destIdx (.init retVal)) := by
-              unfold writePlaceValue
-              rw [hcf]
-              dsimp only
-              rw [hslot_d]
-              cases slot_d with
-              | dead => exact False.elim (hne_dead rfl)
-              | uninit =>
-                dsimp only
-                rw [set?_eq_some_set hlt_af_d (.init retVal)]
-              | init _ =>
-                dsimp only
-                rw [set?_eq_some_set hlt_af_d (.init retVal)]
+            obtain ⟨hw_dest, htb_fin, hvalid_fin, hcid_bor_fin, hbt_fin, hbfv_fin⟩ :=
+              writeReturnDestination_callee_ok_and_invariants hbfv htb hvalid_post' hcid_bor
+                hbt_pop hcf hlt_af_d hslot_d hne_dead
+                { s.memory with
+                  borrows := s.memory.borrows
+                  callStack := restStack
+                  activeCallee := .some cf.callerBody
+                  activeProtectors := restoreCallerProtectors cf }
+                rfl rfl rfl retVal
             let callerMf₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
               { callerMf with
                 locals := callerMf.locals.set destIdx
@@ -3473,8 +3530,8 @@ theorem step_terminator_return_callee_simulation
               exact StepRelMultiFrame.ub _ _
             have hdiv_false : cf.isDiverging = false := Bool.eq_false_iff.mpr hdiv_true
             simp only [hdiv_false, Bool.false_eq_true, ↓reduceIte] at hretCont ⊢
-            rw [hwrite_af]
-            dsimp only [restoreCallerProtectors]
+            rw [hw_dest]
+            dsimp only []
             rw [returnFromCurrentFrame_lm4_1_callee_ok hback hfr_callee.body_eq hfr_callee.location_eq
               hbb hcleanup hretCont hop0 hpop hcopy hclean]
             dsimp only [Except.map]
@@ -3566,8 +3623,9 @@ theorem step_terminator_return_callee_simulation
             refine .mk callerMf'
               (array_back?_append_singleton restMfs.reverse callerMf')
               hcal_root_post (fun _ => rfl)
-              (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, hcp] using hlinks_post.toForall2)
+              (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody, restoreCallerProtectors, hcp] using hlinks_post.toForall2)
               (by
+                dsimp only [restoreCallerProtectors]
                 have hcp_rev : callerProts = (match cf.callerProtector with | some protId => protId :: cf.calleeProtectors | none => cf.calleeProtectors) := hcp.symm
                 cases hcp_rev
                 unfold activeMirBody
@@ -3577,8 +3635,8 @@ theorem step_terminator_return_callee_simulation
                   array_toList_reverse_append_singleton restMfs callerMf'
                 rw [hrev_post]
                 exact hlinks_post)
-              hdisj_post htb_post
-              hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post
+              hdisj_post htb_fin
+              hvalid_fin hcid_pos hcid_act_post' hcid_bor_fin hbt_fin hbfv_fin
 
 abbrev step_terminator_return_callee_immediate_simulation :=
   @step_terminator_return_callee_simulation
@@ -3637,11 +3695,11 @@ theorem step_terminator_unwindResume_callee_simulation
           fnPtrs) () m) := by
   rcases hstate with
     ⟨_, _, _, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   generalize hmfs : m.stack.frames.toList.reverse = mfs at hlinks
-  generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt
+  generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt hbfv
   generalize hcur : activeMirBody rootBody s = curBody at hlinks
-  rw [hstack] at hlinks hbt
+  rw [hstack] at hlinks hbt hbfv
   cases hlinks with
   | cons _ _ _ _ curFrameProts callerProts calleeMf callerMf restMfs
       hretCont _ hfr_callee _ hcp _ hlinks_caller =>
@@ -3732,6 +3790,7 @@ theorem step_terminator_unwindResume_callee_simulation
       dsimp only [Except.map]
       exact StepRelMultiFrame.ub _ _
     · rw [hclean_bb] at hretCont ⊢
+      rw [disableFramesAbove_eq_of_root_depth hbfv.root_depth]
       dsimp only [translateUnwindAction] at hretCont
       rw [returnFromCurrentFrame_lm4_1_unwind_cleanup_ok harr hfr_callee.body_eq
         hfr_callee.location_eq hbb hcleanup hretCont hop0 hpop hclean]
@@ -3834,7 +3893,7 @@ theorem step_terminator_unwindResume_callee_simulation
           rw [hrev_post]
           exact hlinks_post)
         hdisj_post htb_post
-        hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post
+        hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post hbfv.of_popFrame_same
 
 
 /-- On a single-frame `lean-miri` stack (`m.stack.frames = #[rootMf]`) whose top
@@ -3896,7 +3955,7 @@ theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
         fnPtrs)
       () m).2 =
       .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
-  rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hact_body : activeMirBody rootBody s = rootBody := by
     unfold activeMirBody
     rcases hcal_root hstack with hnone | hsome
@@ -3987,7 +4046,7 @@ theorem step_terminator_call_unreachable_unchecked_ub_simulation
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
           fnPtrs) () m) := by
   subst hargs
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -4343,6 +4402,36 @@ theorem WellTypedCallArgs.mono_immediate
   | nil tempDecls => exact .nil tempDecls
   | cons op restOps argDecl restDecls hop _ ih =>
     exact .cons op restOps argDecl restDecls (hop.mono_immediate hmono) ih
+
+theorem WellTypedCallArgs.evalOperands_any
+    {callerBody calleeBody : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {ops : List MirAst.Operand} {decls : List LocalDecl}
+    (h : WellTypedCallArgs callerBody calleeBody tf ops decls)
+    (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperands locals ops borrows globals layouts callerLocals localDecls callStack =
+      evalOperands locals ops borrows globals layouts callerLocals := by
+  induction h generalizing locals with
+  | nil _ => rfl
+  | cons op restOps argDecl restDecls hop _ ih =>
+    have hop_eq :
+        evalOperand locals op borrows globals layouts callerLocals localDecls callStack =
+          evalOperand locals op borrows globals layouts callerLocals := by
+      cases hop with
+      | scalarOp _ _ _ hsc _ _ =>
+        cases hsc <;> rfl
+      | moveLocal _ _ _ _ _ _ _ _ => rfl
+    unfold evalOperands
+    rw [hop_eq]
+    cases evalOperand locals op borrows globals layouts callerLocals with
+    | ok v locals' =>
+      dsimp only []
+      rw [ih locals']
+    | ub => rfl
+    | unsupported => rfl
 
 /-- Pointwise relation between evaluated Anneal argument values `argVals`,
 `lean-miri` argument immediates `argImms`, and the callee's post-`_0`
@@ -5397,7 +5486,7 @@ theorem step_terminator_call_args_simulation
       (Miri.Interpreter.runRvalue
         (annealEvalCallArgsLM4_1 (activeMirBody rootBody s).localDecls
           (activeMirBody rootBody s).layouts (argOps.map translateOperand)) m) := by
-  rcases hstate with ⟨_, _, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨_, _, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rw [hmfs] at hforall
   cases hforall with
@@ -5482,7 +5571,7 @@ theorem step_terminator_call_simulation
   have hstate_copy := hstate
   rcases hstate with
     ⟨topFrame, hback, _, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨callerMf, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -5545,7 +5634,7 @@ theorem step_terminator_call_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [ha_ops, hcall]
+        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops, hcall]
         exact StepRelMultiFrame.ub _ _
       | ok argVals locals' callerMf' calleeMf argImms
           hid_eq hrc_eq hrp_eq hloc_sub hd_fn hfr_caller'
@@ -5605,7 +5694,7 @@ theorem step_terminator_call_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [ha_ops]
+        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops]
         dsimp only []
         rw [htypeArgs,
           lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam,
@@ -5715,7 +5804,7 @@ theorem step_terminator_call_simulation
             rw [hrev_post]
             exact hlinks_post)
           hdisj_post htb hvalid hcid_pos hcid_act hcid_bor
-          (hbt.of_pushFrame rfl)
+          (hbt.of_pushFrame rfl) (hbfv.of_pushFrame rfl rfl)
 
 /-- **Theorem 5b (`step_terminator_call_diverging_simulation`)**: Stage-1
 `Trusted` executes a *diverging* `TerminatorKind.call func argOps ⟨destIdx, .nil⟩
@@ -5776,7 +5865,7 @@ theorem step_terminator_call_diverging_simulation
   have hstate_copy := hstate
   rcases hstate with
     ⟨topFrame, hback, _, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨callerMf, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -5839,7 +5928,7 @@ theorem step_terminator_call_diverging_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [ha_ops, hcall]
+        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops, hcall]
         exact StepRelMultiFrame.ub _ _
       | ok argVals locals' callerMf' calleeMf argImms
           hid_eq hrc_eq hrp_eq hloc_sub hd_fn hfr_caller'
@@ -5899,7 +5988,7 @@ theorem step_terminator_call_diverging_simulation
         dsimp only [Id.run]
         rw [hfunc]
         dsimp only []
-        rw [ha_ops]
+        rw [(hwt_args callerMf hback).evalOperands_any, ha_ops]
         dsimp only []
         rw [htypeArgs,
           lookupCallee_nil_eq_of_findCallee_some _ _ _ _ hcallee htparam,
@@ -6009,7 +6098,7 @@ theorem step_terminator_call_diverging_simulation
             rw [hrev_post]
             exact hlinks_post)
           hdisj_post htb hvalid hcid_pos hcid_act hcid_bor
-          (hbt.of_pushFrame rfl)
+          (hbt.of_pushFrame rfl) (hbfv.of_pushFrame rfl rfl)
 
 /-! ## 6. Arbitrary-Depth Multi-Frame `.continue_` & `.terminate` Unwinding Simulation -/
 
@@ -6384,7 +6473,7 @@ theorem step_unwinding_state_single_frame
   rcases hunw with ⟨m_mir, topFrame₀, span, hback_mir, hm_eq, hstate_mir⟩
   rcases hstate_mir with
     ⟨topFrame₁, hback₁, hcal_root, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have htf_eq0 : topFrame₁ = topFrame₀ := Option.some.inj (hback₁.symm.trans hback_mir)
   subst htf_eq0
   refine ⟨?_, ?_⟩
@@ -6419,9 +6508,9 @@ theorem step_unwinding_state_single_frame
     obtain ⟨decl0, hdecl0⟩ := hwf.cur_decl0 hne_cs
     have hlive0 := hwf.cur_live0 hne_cs
     generalize hmfs : m_mir.stack.frames.toList.reverse = mfs at hlinks
-    generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt
+    generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt hbfv
     generalize hcur : activeMirBody rootBody s = curBody at hlinks
-    rw [hstack] at hlinks hbt
+    rw [hstack] at hlinks hbt hbfv
     cases hlinks with
     | cons _ _ _ _ curFrameProts callerProts calleeMf callerMf restMfs
         hretCont _ hfr_callee _ hcp _ hlinks_caller =>
@@ -6605,7 +6694,7 @@ theorem step_unwinding_state_single_frame
               dsimp only [callerAf']
               rw [hcp_eq, array_toList_reverse_append_singleton restMfs callerMf']
               exact hlinks_post)
-            hdisj_post htb_post hvalid_post hcid_pos hcid_act_post hcid_bor hbt_post
+            hdisj_post htb_post hvalid_post hcid_pos hcid_act_post hcid_bor hbt_post hbfv.of_popFrame_same
       · intro hunreach
         have hretCont' : calleeUnw.returnContinuation =
             .goto (if cf.isDiverging then none else some cf.returnTarget) .Unreachable := by
@@ -6669,7 +6758,7 @@ theorem step_unwinding_state_single_frame
                 dsimp only [m₁_mir]
                 rw [hcp_eq, array_toList_reverse_append_singleton restMfs callerMf]
                 exact hlinks_post)
-              hdisj_pop htb_post hvalid_post hcid_pos hcid_act_post hcid_bor hbt_post
+              hdisj_pop htb_post hvalid_post hcid_pos hcid_act_post hcid_bor hbt_post hbfv.of_popFrame_same
         · refine ⟨?_, ?_, ?_, ?_, ?_⟩
           · intro mf hmf
             dsimp only [m₁] at hmf
@@ -6748,8 +6837,11 @@ theorem unwindFromCallStack_miri_multiStep_simulation
     have hframe_step := (step_unwinding_state_single_frame hunw hwf).2 cf restStack hcs
     cases hru : cf.returnUnwind with
     | cleanup cleanupBb =>
+      have hroot_bor : ∀ e ∈ s.memory.borrows, e.targetFrameDepth = 0 := by
+        rcases hunw with ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hbfv_u⟩
+        exact hbfv_u.root_depth
       obtain ⟨m', hm_step, hrel'⟩ := hframe_step.1 cleanupBb hru
-      simp only [unwindFromCallStack, hru]
+      simp only [unwindFromCallStack, hru, disableFramesAbove_eq_of_root_depth hroot_bor]
       refine ⟨?_, ?_, ?_, ?_⟩
       · intro s' hs'
         injection hs' with hs_eq
@@ -6857,7 +6949,7 @@ theorem step_terminator_unwindResume_multiFrame_simulation
   have hstate_copy := hstate
   rcases hstate with
     ⟨topFrame, hback, hcal_root, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   cases hstack : s.memory.callStack with
   | nil =>
     have hact_body : activeMirBody rootBody s = rootBody := by
@@ -6903,9 +6995,9 @@ theorem step_terminator_unwindResume_multiFrame_simulation
     obtain ⟨decl0, hdecl0⟩ := hwf.cur_decl0 hne
     have hlive0 := hwf.cur_live0 hne
     generalize hmfs : m.stack.frames.toList.reverse = mfs at hlinks
-    generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt
+    generalize hprots : s.memory.activeProtectors = prots at hlinks hvalid hcid_act hbt hbfv
     generalize hcur : activeMirBody rootBody s = curBody at hlinks
-    rw [hstack] at hlinks hbt
+    rw [hstack] at hlinks hbt hbfv
     cases hlinks with
     | cons _ _ _ _ curFrameProts callerProts calleeMf callerMf restMfs
         hretCont _ hfr_callee _ hcp _ hlinks_caller =>
@@ -7145,7 +7237,7 @@ theorem step_terminator_unwindResume_multiFrame_simulation
                 dsimp only [m₁_mir, s₁, Option.getD]
                 rw [hcp_eq, array_toList_reverse_append_singleton restMfs callerMf]
                 exact hlinks_post)
-              hdisj_pop (htb.change_protectors _) hvalid_post hcid_pos hcid_act_post hcid_bor hbt_post
+              hdisj_pop (htb.change_protectors _) hvalid_post hcid_pos hcid_act_post hcid_bor hbt_post hbfv.of_popFrame_same
         have hwf₁ : UnwindChainWf rootBody s₁ m₁ := by
           refine ⟨?_, ?_, ?_, ?_, ?_⟩
           · intro mf hmf
@@ -7247,7 +7339,7 @@ theorem step_terminator_unwindTerminate_abort_vs_unsupported
     stepMirFn rootBody s = MirStepNode.retOutcome .abort ∧
     Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m =
       (m, .error (.unsupported "unwindTerminate")) := by
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, _⟩
   · rw [hmfs] at hforall; cases hforall
@@ -7323,7 +7415,7 @@ theorem step_terminator_assert_local_simulation
         .error (.unsupported "assert panic without linked panic lang item")) := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -7386,7 +7478,7 @@ theorem step_terminator_assert_local_simulation
           unfold evalTerminator Miri.Interpreter.ControlFlow.evalTerminator
           rw [hterm, htk_assert]
           dsimp only [Id.run]
-          rw [heval_a]
+          rw [evalOperand_copy_nil_any, heval_a]
           simp only [hread_err, miriFinishStep, Except.map]
           exact StepRelMultiFrame.ub _ _
         | immediate _ imm _ _ hval =>
@@ -7411,7 +7503,7 @@ theorem step_terminator_assert_local_simulation
             unfold evalTerminator Miri.Interpreter.ControlFlow.evalTerminator
             rw [hterm, htk_assert]
             dsimp only [Id.run]
-            rw [heval_a]
+            rw [evalOperand_copy_nil_any, heval_a]
             simp only [hread_err, miriFinishStep, Except.map]
             exact StepRelMultiFrame.ub _ _
           · subst hv
@@ -7469,7 +7561,7 @@ theorem step_terminator_assert_local_simulation
               unfold evalTerminator
               rw [hterm]
               dsimp only []
-              rw [heval_a]
+              rw [evalOperand_copy_nil_any, heval_a]
               cases b <;> rfl
             rw [ha_step_eq, ha_ok, hm_step_eq]
             unfold Miri.Interpreter.ControlFlow.evalTerminator
@@ -7539,7 +7631,7 @@ theorem step_terminator_assert_local_simulation
                 unfold activeMirBody
                 rw [array_toList_reverse_append_singleton restMfs tfTarget]
                 exact hlinks_post)
-              hdisj_post htb hvalid hcid_pos hcid_act hcid_bor hbt
+              hdisj_post htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
       · intro sc hsc hne_exp
         have hslot_eq : slot = .init (.scalar sc) := Option.some.inj (hslot.symm.trans hsc)
         subst hslot_eq
@@ -7580,7 +7672,7 @@ theorem step_terminator_assert_local_simulation
                   .ok (.scalar (boolToScalar b)) s.frame.locals := by
                 unfold evalOperand; dsimp only []; rw [hsc]; rfl
               dsimp only []
-              rw [heval_a]
+              rw [evalOperand_copy_nil_any, heval_a]
               cases expected <;> cases b <;> (try exact False.elim (hne_exp rfl)) <;> rfl
             · rw [hm_step_eq]
               unfold Miri.Interpreter.ControlFlow.evalTerminator
@@ -7629,7 +7721,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
         | .faulted fk => .fail fk) ∧
     (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m).2 =
       .error (.unsupported "diverging call to unlinked non-unreachable callee") := by
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, _⟩
   · rw [hmfs] at hforall; cases hforall
@@ -7746,7 +7838,7 @@ theorem step_terminator_call_fnDef_local_simulation
       (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) := by
   rcases hstate with
     ⟨topFrame, hback, _, _, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨callerMf, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -7801,7 +7893,7 @@ theorem step_terminator_call_fnDef_local_simulation
         rw [hterm, htk]
         unfold resolveCallTarget
         dsimp only [Id.run, extractCalleeDefPath?]
-        rw [heval_f, hcall_m]
+        rw [evalOperand_copy_nil_any, heval_f, hcall_m]
         exact StepRelMultiFrame.ub _ _
       | immediate _ imm_f _ _ hval_f =>
         have hslot_init : slot_f = .init .unit := by
@@ -7937,7 +8029,7 @@ theorem step_terminator_call_fnDef_local_simulation
                 (activeMirBody rootBody s).layouts s.memory.callerLocals =
               .ok .unit s.frame.locals := by
             unfold evalOperand; dsimp only []; rw [hslot_f]; rfl
-          rw [heval_f, hop_ty]
+          rw [evalOperand_copy_nil_any, heval_f, hop_ty]
           have hextr : extractFnItemTarget? (some fnDecl.ty) = some (defPath, []) := by
             cases hty_mk : fnDecl.ty with
             | mk k lidx =>
@@ -8030,7 +8122,7 @@ theorem step_terminator_call_fnDef_local_simulation
               rw [hrev_post]; exact hlinks_post.toForall2)
             (by unfold activeMirBody; rw [hrev_post]; exact hlinks_post)
             hdisj_post htb hvalid hcid_pos hcid_act hcid_bor
-            (hbt.of_pushFrame rfl)
+            (hbt.of_pushFrame rfl) (hbfv.of_pushFrame rfl rfl)
 
 /-- **Theorem 8b (`step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation`)**:
 At arbitrary stack depth under `MultiFrameStateRel rootBody s m` (where immediate
@@ -8059,7 +8151,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) := by
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨callerMf, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -8119,7 +8211,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
         rw [hterm, htk]
         unfold resolveCallTarget
         dsimp only [Id.run, extractCalleeDefPath?]
-        rw [heval_f, hcall_m]
+        rw [evalOperand_copy_nil_any, heval_f, hcall_m]
         exact StepRelMultiFrame.ub _ _
       | immediate _ imm_f _ _ hval_f =>
         rcases hval_f with ⟨rfl, rfl⟩ | ⟨v, rfl, himmRel⟩
@@ -8153,7 +8245,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
           rw [hterm, htk]
           unfold resolveCallTarget
           dsimp only [Id.run, extractCalleeDefPath?]
-          rw [heval_f, hcall_m]
+          rw [evalOperand_copy_nil_any, heval_f, hcall_m]
           exact StepRelMultiFrame.ub _ _
         · have hsz8 :
               (translateTy fnDecl.ty (activeMirBody rootBody s).layouts).layout.size =
@@ -8212,7 +8304,7 @@ theorem step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
                   (activeMirBody rootBody s).layouts s.memory.callerLocals =
                 .ok (.scalar sc) s.frame.locals := by
               unfold evalOperand; dsimp only []; rw [hslot_f]; rfl
-            rw [heval_a, hcall_m]
+            rw [evalOperand_copy_nil_any, heval_a, hcall_m]
             exact StepRelMultiFrame.ub _ _
 
 /-- Pre-state relation (`IndirectFnPtrMovePre`) for a provenance-bearing indirect
@@ -8363,7 +8455,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     { m with stack := ⟨⟨restMfs.reverse ++ [tfDeinit]⟩⟩ }
   rcases hdeinit_state with
     ⟨tf_d, hback_d, _, _, _, hlinks_d, hdisj_d, htb_d, hvalid_d,
-      hcid_pos_d, hcid_act_d, hcid_bor_d, hbt_d⟩
+      hcid_pos_d, hcid_act_d, hcid_bor_d, hbt_d, hbfv_d⟩
   have htf_d_eq : tf_d = tfDeinit :=
     Option.some.inj (hback_d.symm.trans (array_back?_append_singleton restMfs.reverse tfDeinit))
   subst htf_d_eq
@@ -8481,7 +8573,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hterm, htk]
     unfold resolveCallTarget
     dsimp only [Id.run, extractCalleeDefPath?]
-    rw [hmove_a]
+    rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []
     rw [hbeq_off, hcall_m]
     exact StepRelMultiFrame.ub _ _
@@ -8527,7 +8619,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hterm, htk]
     unfold resolveCallTarget
     dsimp only [Id.run, extractCalleeDefPath?]
-    rw [hmove_a]
+    rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -8577,7 +8669,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hterm, htk]
     unfold resolveCallTarget
     dsimp only [Id.run, extractCalleeDefPath?, bodyLocalDeclsOf, length, List.length]
-    rw [hmove_a]
+    rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -8689,7 +8781,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
       rw [hterm, htk]
       unfold resolveCallTarget
       dsimp only [Id.run, extractCalleeDefPath?, bodyLocalDeclsOf, length, List.length]
-      rw [hmove_a]
+      rw [evalOperand_move_nil_any, hmove_a]
       dsimp only []
       rw [hoff0, hpre.not_borrow]
       dsimp only [Nat.beq, Bool.and]
@@ -8786,7 +8878,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
           rw [hrev_post]; exact hlinks_post.toForall2)
         (by unfold activeMirBody; rw [hrev_post]; exact hlinks_post)
         hdisj_post htb_d hvalid_d hcid_pos_d hcid_act_d hcid_bor_d
-        (hbt_d.of_pushFrame rfl)
+        (hbt_d.of_pushFrame rfl) (hbfv_d.of_pushFrame rfl rfl)
 
 /-- **Divergence (`step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`)**:
 When an `unsafe fn() -> T` (`fnEntry.fnSig = some (.fnPtr [] callerOut .unsafe_ callerAbi)`)
@@ -8853,7 +8945,7 @@ theorem step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
   let mDeinit : AnnealStepState :=
     { m with stack := ⟨⟨restMfs.reverse ++ [tfDeinit]⟩⟩ }
   rcases hdeinit_state with
-    ⟨tf_d, hback_d, _, _, _, hlinks_d, _, _, _, _, _, _, _⟩
+    ⟨tf_d, hback_d, _, _, _, hlinks_d, _, _, _, _, _, _, _, _⟩
   have htf_d_eq : tf_d = tfDeinit :=
     Option.some.inj (hback_d.symm.trans (array_back?_append_singleton restMfs.reverse tfDeinit))
   subst htf_d_eq
@@ -8893,7 +8985,7 @@ theorem step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
         .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
       unfold evalOperand; dsimp only []; rw [hpre.fn_slot]; dsimp only []
       rw [set?_eq_some_set hpre.fn_lt_af .uninit]
-    rw [hmove_a]
+    rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -9092,7 +9184,7 @@ theorem step_terminator_call_indirect_layoutCompat_fnPtr_divergence
   let mDeinit : AnnealStepState :=
     { m with stack := ⟨⟨restMfs.reverse ++ [tfDeinit]⟩⟩ }
   rcases hdeinit_state with
-    ⟨tf_d, hback_d, _, _, _, hlinks_d, _, _, _, _, _, _, _⟩
+    ⟨tf_d, hback_d, _, _, _, hlinks_d, _, _, _, _, _, _, _, _⟩
   have htf_d_eq : tf_d = tfDeinit :=
     Option.some.inj (hback_d.symm.trans (array_back?_append_singleton restMfs.reverse tfDeinit))
   subst htf_d_eq
@@ -9125,7 +9217,7 @@ theorem step_terminator_call_indirect_layoutCompat_fnPtr_divergence
         .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
       unfold evalOperand; dsimp only []; rw [hpre.fn_slot]; dsimp only []
       rw [set?_eq_some_set hpre.fn_lt_af .uninit]
-    rw [hmove_a]
+    rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []
     rw [hoff0, hpre.not_borrow]
     dsimp only [Nat.beq, Bool.and]
@@ -9330,7 +9422,7 @@ theorem step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
         mAllocId Miri.Memory.BorTag.one baseAddr := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -9738,7 +9830,7 @@ theorem step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
             simp only [m₁, List.reverse_append, List.reverse_singleton,
               List.reverse_reverse, List.singleton_append]
             exact hlinks_deinit)
-          hdisj_deinit htb hvalid hcid_pos hcid_act hcid_bor hbt
+          hdisj_deinit htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
 
 /-- **Theorem 9a (`step_terminator_call_linked_panic_unwind_simulation`)**:
 When `"core::panicking::panic"` IS linked in `s.memory.callees` as `panicBody`
@@ -9802,7 +9894,7 @@ theorem step_terminator_call_linked_panic_unwind_simulation
       hfunc hcallee htypeArgs htparam hdest_decl hpanic_decls hpanic_bb0
       hdest_wf hdest_live (fun _ _ => .nil []) (Or.inl hpanic_unwind) s.memory.fnPtrs
   rcases hstate with
-    ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+    ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨callerMf, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -9977,7 +10069,7 @@ theorem step_terminator_unwindTerminate_termination_abort_simulation
       .abnormalTermination ∧
     (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").isUbReport =
       false := by
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, _⟩
   · rw [hmfs] at hforall; cases hforall
@@ -10068,7 +10160,7 @@ theorem step_terminator_assert_failed_directUnwind_simulation
         UnwindingStateRel rootBody s m₁) := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
-      hcid_pos, hcid_act, hcid_bor, hbt⟩
+      hcid_pos, hcid_act, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -10157,7 +10249,7 @@ theorem step_terminator_assert_failed_directUnwind_simulation
                 .ok (.scalar (boolToScalar b)) s.frame.locals := by
               unfold evalOperand; dsimp only []; rw [hsc]; rfl
             dsimp only []
-            rw [heval_a]
+            rw [evalOperand_copy_nil_any, heval_a]
             cases expected <;> cases b <;> (try exact False.elim (hne_exp rfl)) <;> rfl
           have hfr_cached := hframe.cache_local_layout hdecl hlt_mf
           have hdisj_orig : MultiFrameAllocDisjoint ⟨restMfs.reverse ++ [topFrame]⟩ := by
@@ -10245,7 +10337,7 @@ theorem step_terminator_assert_failed_directUnwind_simulation
                 unfold activeMirBody
                 rw [array_toList_reverse_append_singleton restMfs tfTarget]
                 exact hlinks_post)
-              hdisj_post htb hvalid hcid_pos hcid_act hcid_bor hbt
+              hdisj_post htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
           · intro hunw
             subst hunw
             rw [ha_base, hm_step_eq]
@@ -10340,7 +10432,7 @@ theorem step_terminator_assert_failed_directUnwind_simulation
                     dsimp only [m₁_mir]
                     rw [array_toList_reverse_append_singleton restMfs tfCached]
                     exact hlinks_cached)
-                  hdisj_cached htb hvalid hcid_pos hcid_act hcid_bor hbt
+                  hdisj_cached htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
 
 end LeanMiriSpec.Correspondence
 

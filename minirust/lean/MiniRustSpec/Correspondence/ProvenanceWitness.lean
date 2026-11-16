@@ -1510,16 +1510,19 @@ def callRefMutProtectedTBInit : MachTB :=
 
 /-- `progInFragment` (used by `multi_step_correspondence`) rejects
 `callerRefMutProtectedMir` / `calleeAdd37RefMutMir` because `_1 : &mut u32` is
-non-scalar; in Anneal's `MirSemantics`, `Terminators.evalTerminator` saves the
-caller's locals on `s.memory.callStack` without rebinding `BorrowEntry.targetLocal`
-across frames, so dereferencing `*_1` inside `calleeAdd37RefMutMir` reads the
-callee's own `_1` (`Value.ptr`) and faults on `Value.ptr + 37`. -/
+non-scalar; in Anneal's `MirSemantics`, `Terminators.evalTerminator` records
+`targetFrameDepth` on `BorrowEntry` and resolves cross-frame dereferences via
+`readPlaceThroughCallerChain` / `writePlaceThroughCallerChain`, so dereferencing
+`*_1` inside `calleeAdd37RefMutMir` reads and updates the caller's `_1` from `5`
+to `42`, and `callerRefMutProtectedMir` returns `42 + 42 = 84` with `MirNoUBTree`. -/
 theorem callRefMutProtected_anneal_ret :
     progInFragment callerRefMutProtectedMir [calleeAdd37RefMutMir] = false ∧
-    (∃ tr u, Reaches
+    (∃ tr mem, ReachesRet
       (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir])
-      tr u ∧ FaultNow u) :=
-  ⟨by decide +kernel, faultsA_sound callerRefMutProtectedMir 25 _ (by decide)⟩
+      tr (.normal (.scalar ⟨84, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir]) :=
+  ⟨by decide +kernel, runsToScalar_sound (fuel := 25) (by decide)⟩
 
 /-- Multi-frame `Call` passing `&mut u32` with function-entry `Validate` (`fn_entry = true`)
 succeeds on both `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`),
@@ -1542,9 +1545,11 @@ theorem callRefMutProtectedRoundTrip_three_way :
     progInFragmentWithIntrinsics callerRefMutProtectedMir [calleeAdd37RefMutMir] = false ∧
     translateProgWithIntrinsics callerRefMutProtectedMir [calleeAdd37RefMutMir] =
       some callRefMutProtectedProg ∧
-    (∃ tr u, Reaches
+    (∃ tr mem, ReachesRet
       (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir])
-      tr u ∧ FaultNow u) ∧
+      tr (.normal (.scalar ⟨84, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir]) ∧
     (Interp.steps 17 callRefMutProtectedMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 84 }, [1]) ∧
@@ -1557,7 +1562,8 @@ theorem callRefMutProtectedRoundTrip_three_way :
    callRefMutProtected_inFragmentWithIntrinsics.1,
    callRefMutProtected_inFragmentWithIntrinsics.2,
    callRefMutProtected_translateProgWithIntrinsics,
-   callRefMutProtected_anneal_ret.2,
+   callRefMutProtected_anneal_ret.2.1,
+   callRefMutProtected_anneal_ret.2.2,
    callRefMutProtectedRoundTrip_mach_and_tb.1,
    callRefMutProtectedRoundTrip_mach_and_tb.2⟩
 
@@ -2083,7 +2089,7 @@ theorem childReborrowWriteDisablesParent_B3_divergence :
       (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩,
         { (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with perm := .frozen, parentTag := some 1 },
+          borrows := retBorrows [{ rawPtrEntry 2 .mut (local_ 1) with perm := .frozen, parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 3 })) ∧
     retAfter childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩] 8 =
@@ -2254,24 +2260,24 @@ def callerRefMutSilentWrongLocalMInit : Mach :=
 def callerRefMutSilentWrongLocalTBInit : MachTB :=
   liftMachToTB callerRefMutSilentWrongLocalMInit
 
-theorem callerRefMutSilentWrongLocal_anneal_137 :
+theorem callerRefMutSilentWrongLocal_anneal_ret :
     (∃ tr mem, ReachesRet
       (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
         [calleeReadRefWithLocalMir])
-      tr (.normal (.scalar ⟨137, 4⟩, mem))) ∧
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
     MirNoUBTree
       (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
         [calleeReadRefWithLocalMir]) :=
   runsToScalar_sound (fuel := 25) (by decide)
 
-theorem callerRefMutSilentWrongLocal_divergence :
+theorem callerRefMutSilentWrongLocal_simulation :
     progInFragmentWithIntrinsicsB3 callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = true ∧
     progCrossFrameTranslatable callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = true ∧
     progInFragmentWithIntrinsics callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = false ∧
     (∃ tr mem, ReachesRet
       (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
         [calleeReadRefWithLocalMir])
-      tr (.normal (.scalar ⟨137, 4⟩, mem))) ∧
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
     MirNoUBTree
       (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
         [calleeReadRefWithLocalMir]) ∧
@@ -2284,14 +2290,14 @@ theorem callerRefMutSilentWrongLocal_divergence :
              stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
       tbRetU32 42 :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel,
-   callerRefMutSilentWrongLocal_anneal_137.1,
-   callerRefMutSilentWrongLocal_anneal_137.2,
+   callerRefMutSilentWrongLocal_anneal_ret.1,
+   callerRefMutSilentWrongLocal_anneal_ret.2,
    by decide +kernel, by decide +kernel⟩
 
 /-- Scalar-only callee `fn scalar_assign_local1(mut y: u32) -> u32`: assigns its
-own scalar parameter `_1 = _1 + 36` and returns `_1`. In Anneal, `_1 = ...` runs
-`invalidateConflictingBorrows mem₁.borrows 1 .none` on the shared `borrows`
-table, disabling any active caller borrow with `targetLocal = 1`! -/
+own scalar parameter `_1 = _1 + 36` and returns `_1`. With frame-scoped
+`BorrowEntry.targetFrameDepth`, assigning callee local `_1` only invalidates
+borrows at the callee's frame depth and preserves caller borrows on caller `_1`. -/
 def calleeScalarAssignLocal1Mir : CapturedMir where
   defPath := "witness::scalar_assign_local1"
   phase := .runtimePostCleanup
@@ -2311,7 +2317,7 @@ def calleeScalarAssignLocal1Mir : CapturedMir where
 `_2 = &raw mut _1` before a purely scalar call `scalar_assign_local1(1) -> _3`,
 then writes `*_2 = _3 + 5` after `Return`. Both bodies individually satisfy
 `ptrAliasingOk = true`, yet `ptrAliasingProgOk callerBorrowAcrossScalarCallMir = false`
-because `ptrTermStep` disables `_2` across the returning `Call`. -/
+because `ptrTermStep` conservatively disables `_2` across the returning `Call`. -/
 def callerBorrowAcrossScalarCallMir : CapturedMir where
   defPath := "witness::caller_borrow_across_scalar_call"
   phase := .runtimePostCleanup
@@ -2350,23 +2356,29 @@ def callerBorrowAcrossScalarCallMInit : Mach :=
 def callerBorrowAcrossScalarCallTBInit : MachTB :=
   liftMachToTB callerBorrowAcrossScalarCallMInit
 
-theorem callerBorrowAcrossScalarCall_anneal_ub :
-    ∃ tr u, Reaches
+theorem callerBorrowAcrossScalarCall_anneal_ret :
+    (∃ tr mem, ReachesRet
       (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
         [calleeScalarAssignLocal1Mir])
-      tr u ∧ FaultNow u :=
-  faultsA_sound callerBorrowAcrossScalarCallMir 25 _ (by decide)
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir]) :=
+  runsToScalar_sound (fuel := 25) (by decide)
 
-theorem callerBorrowAcrossScalarCall_divergence :
+theorem callerBorrowAcrossScalarCall_simulation :
     ptrAliasingOk callerBorrowAcrossScalarCallMir = true ∧
     ptrAliasingOk calleeScalarAssignLocal1Mir = true ∧
     ptrAliasingProgOk callerBorrowAcrossScalarCallMir = false ∧
     progInFragmentWithIntrinsicsB3 callerBorrowAcrossScalarCallMir [calleeScalarAssignLocal1Mir] = true ∧
     progInFragmentWithIntrinsics callerBorrowAcrossScalarCallMir [calleeScalarAssignLocal1Mir] = false ∧
-    (∃ tr u, Reaches
+    (∃ tr mem, ReachesRet
       (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
         [calleeScalarAssignLocal1Mir])
-      tr u ∧ FaultNow u) ∧
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir]) ∧
     (Interp.steps 14 callerBorrowAcrossScalarCallMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
@@ -2377,7 +2389,8 @@ theorem callerBorrowAcrossScalarCall_divergence :
       tbRetU32 42 :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel,
    by decide +kernel, by decide +kernel,
-   callerBorrowAcrossScalarCall_anneal_ub,
+   callerBorrowAcrossScalarCall_anneal_ret.1,
+   callerBorrowAcrossScalarCall_anneal_ret.2,
    by decide +kernel, by decide +kernel⟩
 
 /-- Positive sound unified multi-function callee `fn borrow_assume_add(mut y: u32) -> u32`:

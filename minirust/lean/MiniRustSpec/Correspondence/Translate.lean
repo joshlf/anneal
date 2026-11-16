@@ -2983,20 +2983,19 @@ translated direct call). Non-call terminators delegate directly to
 def translateIntrinsicOrNone (decls : List MirAst.LocalDecl) (defPath : String)
     (argOps : List MirAst.Operand) (destination : MirAst.Place)
     (target : Option MirAst.BasicBlockIdx) : Option TerminatorResult :=
-  match defPath.toList with
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','r','a','w','_','e','q'] =>
-      translateRsIntrinsic decls .raw_eq argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','t','p','o','p'] =>
-      translateRsIntrinsic decls .ctpop argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','e','x','a','c','t','_','d','i','v'] =>
-      translateRsIntrinsic decls .exact_div argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','o','l','d','_','p','a','t','h'] =>
-      translateRsIntrinsic decls .cold_path argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','a','b','o','r','t'] =>
-      translateRsIntrinsic decls .abort argOps destination target
-  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','u','b','_','c','h','e','c','k','s'] =>
-      translateRsIntrinsic decls .ub_checks argOps destination target
-  | _ => none
+  if defPath = "core::intrinsics::raw_eq" then
+    translateRsIntrinsic decls .raw_eq argOps destination target
+  else if defPath = "core::intrinsics::ctpop" then
+    translateRsIntrinsic decls .ctpop argOps destination target
+  else if defPath = "core::intrinsics::exact_div" then
+    translateRsIntrinsic decls .exact_div argOps destination target
+  else if defPath = "core::intrinsics::cold_path" then
+    translateRsIntrinsic decls .cold_path argOps destination target
+  else if defPath = "core::intrinsics::abort" then
+    translateRsIntrinsic decls .abort argOps destination target
+  else if defPath = "core::intrinsics::ub_checks" then
+    translateRsIntrinsic decls .ub_checks argOps destination target
+  else none
 
 def translateTerminatorInProg (fnMap : FnMap) (layouts : Layout.LayoutTable)
     (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :

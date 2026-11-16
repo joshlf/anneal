@@ -3469,7 +3469,8 @@ theorem borrowEntryReadUB_eq_nodeAccess
     (readProj : List ProjectionElem)
     (readRangeOff readRangeLen : Nat)
     (hloc : entry.targetLocal = targetLocal)
-    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true) :
+    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true)
+    (hdepth : entry.targetFrameDepth = 0 := by rfl) :
     borrowEntryReadUB allBorrows activeProtectors entry targetLocal readerTag
         readProj readRangeOff readRangeLen =
       treeBorrowTransitionIsUB
@@ -3478,7 +3479,9 @@ theorem borrowEntryReadUB_eq_nodeAccess
           entry.perm
           (isBorrowProtected activeProtectors entry)) := by
   unfold borrowEntryReadUB treeBorrowAccessRelatedness
-  have hbeq : Nat.beq entry.targetLocal targetLocal = true := by simp [hloc]
+  have hbeq :
+      Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal) = true := by
+    simp [hdepth, hloc]
   rw [hbeq, hov]; dsimp only []
   cases readerTag with
   | none => rfl
@@ -3502,7 +3505,8 @@ theorem updateBorrowPermOnReadAtProj_eq_nodeAccess
     (readRangeOff readRangeLen : Nat)
     (activeProtectors : List Nat)
     (hloc : entry.targetLocal = targetLocal)
-    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true) :
+    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true)
+    (hdepth : entry.targetFrameDepth = 0 := by rfl) :
     updateBorrowPermOnReadAtProj allBorrows entry targetLocal readerTag
         readProj readRangeOff readRangeLen activeProtectors =
       applyTreeBorrowTransition entry
@@ -3511,7 +3515,9 @@ theorem updateBorrowPermOnReadAtProj_eq_nodeAccess
           entry.perm
           (isBorrowProtected activeProtectors entry)) := by
   unfold updateBorrowPermOnReadAtProj treeBorrowAccessRelatedness
-  have hbeq : Nat.beq entry.targetLocal targetLocal = true := by simp [hloc]
+  have hbeq :
+      Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal) = true := by
+    simp [hdepth, hloc]
   rw [hbeq, hov]; dsimp only []
   cases readerTag with
   | none => rfl
@@ -3521,10 +3527,10 @@ theorem updateBorrowPermOnReadAtProj_eq_nodeAccess
     cases d with
     | false => rfl
     | true =>
-      rcases entry with ⟨tag, tloc, tproj, perm, roff, rlen, prot, ptag⟩
+      rcases entry with ⟨tag, tloc, tproj, perm, roff, rlen, prot, ptag, tdepth, adead⟩
       rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;>
         cases isBorrowProtected activeProtectors
-          ⟨tag, tloc, tproj, _, roff, rlen, prot, ptag⟩ <;> rfl
+          ⟨tag, tloc, tproj, _, roff, rlen, prot, ptag, tdepth, adead⟩ <;> rfl
 
 /-- **`hasTreeReadUB_iff_exists`**: `hasTreeReadUB` reports undefined behavior on
 `borrows` iff some `entry ∈ borrows` satisfies `borrowEntryReadUB = true`. -/
@@ -3596,7 +3602,8 @@ theorem updateBorrowPermTreeAtProj_eq_nodeAccess
     (hno_prot_ub :
       Bool.and (isBorrowProtected activeProtectors entry)
         (borrowEntryWriteConflicts entry
-          (resolveTreeBorrowWriterTag allBorrows entry writerTag)) = false) :
+          (resolveTreeBorrowWriterTag allBorrows entry writerTag)) = false)
+    (hdepth : entry.targetFrameDepth = 0 := by rfl) :
     updateBorrowPermTreeAtProj allBorrows entry targetLocal writerTag
         writeProj writeRangeOff writeRangeLen =
       applyTreeBorrowTransition entry
@@ -3606,11 +3613,13 @@ theorem updateBorrowPermTreeAtProj_eq_nodeAccess
           (isBorrowProtected activeProtectors entry)) := by
   rw [borrowEntryWriteConflicts_resolve_eq_nodeAccess] at hno_prot_ub
   unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
-  have hbeq : Nat.beq entry.targetLocal targetLocal = true := by simp [hloc]
+  have hbeq :
+      Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal) = true := by
+    simp [hdepth, hloc]
   rw [hbeq, treeBorrowWriterRelatedness_resolveTreeBorrowWriterTag, hov]
   generalize treeBorrowAccessRelatedness allBorrows entry writerTag = rel at hno_prot_ub ⊢
   generalize isBorrowProtected activeProtectors entry = isProt at hno_prot_ub ⊢
-  rcases entry with ⟨tag, tloc, tproj, perm, roff, rlen, prot, ptag⟩
+  rcases entry with ⟨tag, tloc, tproj, perm, roff, rlen, prot, ptag, tdepth, adead⟩
   cases rel <;> cases isProt <;> rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;>
     first
     | rfl
@@ -3630,7 +3639,7 @@ theorem hasProtectedTreeWriteConflict_iff_exists
     hasProtectedTreeWriteConflict allBorrows borrows activeProtectors targetLocal
         writerTag writeProj writeRangeOff writeRangeLen = true ↔
       ∃ entry ∈ borrows,
-        Bool.and (Nat.beq entry.targetLocal targetLocal)
+        Bool.and (Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal))
           (Bool.and (borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen)
             (Bool.and (isBorrowProtected activeProtectors entry)
               (treeBorrowTransitionIsUB
@@ -3644,7 +3653,7 @@ theorem hasProtectedTreeWriteConflict_iff_exists
     unfold hasProtectedTreeWriteConflict; dsimp only []
     rw [borrowEntryWriteConflicts_resolve_eq_nodeAccess]
     generalize hthis :
-      Bool.and (Nat.beq hd.targetLocal targetLocal)
+      Bool.and (Bool.and (Nat.beq hd.targetFrameDepth 0) (Nat.beq hd.targetLocal targetLocal))
         (Bool.and (borrowEntryOverlapsWrite hd writeProj writeRangeOff writeRangeLen)
           (Bool.and (isBorrowProtected activeProtectors hd)
             (treeBorrowTransitionIsUB
@@ -3752,7 +3761,7 @@ private theorem updateBorrowPermOnReadAtProj_preserves_tag_parent_prot
     e'.tag = e.tag ∧ e'.parentTag = e.parentTag ∧ e'.protector = e.protector := by
   dsimp only []
   unfold updateBorrowPermOnReadAtProj
-  cases Nat.beq e.targetLocal targetLocal with
+  cases Bool.and (Nat.beq e.targetFrameDepth 0) (Nat.beq e.targetLocal targetLocal) with
   | false => exact ⟨rfl, rfl, rfl⟩
   | true =>
     cases borrowEntryOverlapsWrite e readProj readRangeOff readRangeLen with
@@ -3779,7 +3788,7 @@ private theorem updateBorrowPermTreeAtProj_preserves_tag_parent_prot
     e'.tag = e.tag ∧ e'.parentTag = e.parentTag ∧ e'.protector = e.protector := by
   dsimp only []
   unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
-  cases Nat.beq e.targetLocal targetLocal with
+  cases Bool.and (Nat.beq e.targetFrameDepth 0) (Nat.beq e.targetLocal targetLocal) with
   | false => exact ⟨rfl, rfl, rfl⟩
   | true =>
     cases treeBorrowWriterRelatedness e (resolveTreeBorrowWriterTag allBorrows e writerTag) with
@@ -3916,7 +3925,8 @@ theorem freezeTreeBorrowsOnReadAtProj_locationState_simulation
     (hskip : treeBorrowAccessRelatedness allBorrows borrows[i] readerTag = .foreignAccess →
       borrows[i].perm ≠ .disabled)
     (hno_ub : hasTreeReadUB allBorrows borrows activeProtectors targetLocal readerTag
-      readProj readRangeOff readRangeLen = false) :
+      readProj readRangeOff readRangeLen = false)
+    (hdepth : borrows[i].targetFrameDepth = 0 := by rfl) :
     let borrows' := freezeTreeBorrowsOnReadAtProj allBorrows borrows targetLocal
       readerTag readProj readRangeOff readRangeLen activeProtectors
     let hi' : i < borrows'.length := by
@@ -3957,7 +3967,7 @@ theorem freezeTreeBorrowsOnReadAtProj_locationState_simulation
           borrows[i].perm
           (isBorrowProtected activeProtectors borrows[i])) = false := by
     rw [← borrowEntryReadUB_eq_nodeAccess allBorrows activeProtectors borrows[i]
-      targetLocal readerTag readProj readRangeOff readRangeLen hloc hov]
+      targetLocal readerTag readProj readRangeOff readRangeLen hloc hov hdepth]
     exact he_ub
   have htr := treeBorrowNodeAccess_of_isUB_false .read
     (treeBorrowAccessRelatedness allBorrows borrows[i] readerTag)
@@ -3977,7 +3987,7 @@ theorem freezeTreeBorrowsOnReadAtProj_locationState_simulation
           (isBorrowProtected activeProtectors borrows[i])) := by
     simp only [freezeTreeBorrowsOnReadAtProj_eq_map, List.getElem_map]
     exact updateBorrowPermOnReadAtProj_eq_nodeAccess allBorrows borrows[i] targetLocal
-      readerTag readProj readRangeOff readRangeLen activeProtectors hloc hov
+      readerTag readProj readRangeOff readRangeLen activeProtectors hloc hov hdepth
   refine ⟨he_ub,
     basedNormalTree_stateAt_lt borrows activeProtectors i hi,
     basedNormalTree_stateAt_lt _ activeProtectors i _,
@@ -4012,7 +4022,8 @@ theorem invalidateTreeBorrowsAtProj_locationState_simulation
         (treeBorrowNodeAccess .write
           (treeBorrowAccessRelatedness allBorrows borrows[i] writerTag)
           borrows[i].perm
-          (isBorrowProtected activeProtectors borrows[i])) = false) :
+          (isBorrowProtected activeProtectors borrows[i])) = false)
+    (hdepth : borrows[i].targetFrameDepth = 0 := by rfl) :
     let borrows' := invalidateTreeBorrowsAtProj allBorrows borrows targetLocal
       writerTag writeProj writeRangeOff writeRangeLen
     let hi' : i < borrows'.length := by
@@ -4042,7 +4053,10 @@ theorem invalidateTreeBorrowsAtProj_locationState_simulation
     | false => rfl
     | true =>
       rw [borrowEntryWriteConflicts_resolve_eq_nodeAccess] at hb
-      have hbeq : Nat.beq borrows[i].targetLocal targetLocal = true := by simp [hloc]
+      have hbeq :
+          Bool.and (Nat.beq borrows[i].targetFrameDepth 0)
+            (Nat.beq borrows[i].targetLocal targetLocal) = true := by
+        simp [hdepth, hloc]
       have hex : hasProtectedTreeWriteConflict allBorrows borrows activeProtectors targetLocal
           writerTag writeProj writeRangeOff writeRangeLen = true :=
         (hasProtectedTreeWriteConflict_iff_exists allBorrows borrows activeProtectors targetLocal
@@ -4068,7 +4082,7 @@ theorem invalidateTreeBorrowsAtProj_locationState_simulation
           (isBorrowProtected activeProtectors borrows[i])) := by
     simp only [invalidateTreeBorrowsAtProj_eq_map, List.getElem_map]
     exact updateBorrowPermTreeAtProj_eq_nodeAccess allBorrows activeProtectors borrows[i]
-      targetLocal writerTag writeProj writeRangeOff writeRangeLen hloc hov hno_prot_i
+      targetLocal writerTag writeProj writeRangeOff writeRangeLen hloc hov hno_prot_i hdepth
   refine ⟨basedNormalTree_stateAt_lt borrows activeProtectors i hi,
     basedNormalTree_stateAt_lt _ activeProtectors i _,
     ?_⟩
@@ -4144,8 +4158,8 @@ theorem borrowEntryReadUB_of_disjoint
       readProj readRangeOff readRangeLen = false := by
   unfold borrowEntryReadUB
   rcases hdisj with hloc | hov
-  · rw [nat_beq_eq_false_of_ne hloc]
-  · cases Nat.beq entry.targetLocal targetLocal
+  · rw [nat_beq_eq_false_of_ne hloc, Bool.and_false]
+  · cases Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal)
     · rfl
     · rw [hov]
 
@@ -4162,8 +4176,8 @@ theorem updateBorrowPermOnReadAtProj_of_disjoint
       readProj readRangeOff readRangeLen activeProtectors = entry := by
   unfold updateBorrowPermOnReadAtProj
   rcases hdisj with hloc | hov
-  · rw [nat_beq_eq_false_of_ne hloc]
-  · cases Nat.beq entry.targetLocal targetLocal
+  · rw [nat_beq_eq_false_of_ne hloc, Bool.and_false]
+  · cases Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal)
     · rfl
     · rw [hov]
 
@@ -4181,8 +4195,8 @@ theorem updateBorrowPermTreeAtProj_of_foreign_disjoint
       writeProj writeRangeOff writeRangeLen = entry := by
   unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
   rcases hdisj with hloc | ⟨hrel, hov⟩
-  · rw [nat_beq_eq_false_of_ne hloc]
-  · cases Nat.beq entry.targetLocal targetLocal
+  · rw [nat_beq_eq_false_of_ne hloc, Bool.and_false]
+  · cases Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal)
     · rfl
     · rw [treeBorrowWriterRelatedness_resolveTreeBorrowWriterTag, hrel, hov]
 
@@ -4281,14 +4295,14 @@ theorem hasProtectedTreeWriteConflict_of_all_disjoint
     unfold hasProtectedTreeWriteConflict
     dsimp only []
     have hthis :
-        Bool.and (Nat.beq hd.targetLocal targetLocal)
+        Bool.and (Bool.and (Nat.beq hd.targetFrameDepth 0) (Nat.beq hd.targetLocal targetLocal))
           (Bool.and (borrowEntryOverlapsWrite hd writeProj writeRangeOff writeRangeLen)
             (Bool.and (isBorrowProtected activeProtectors hd)
               (borrowEntryWriteConflicts hd
                 (resolveTreeBorrowWriterTag allBorrows hd writerTag)))) = false := by
       rcases hdisj hd (List.Mem.head _) with hloc | hov
-      · rw [nat_beq_eq_false_of_ne hloc]; rfl
-      · rw [hov]; cases Nat.beq hd.targetLocal targetLocal <;> rfl
+      · rw [nat_beq_eq_false_of_ne hloc, Bool.and_false]; rfl
+      · rw [hov]; cases Bool.and (Nat.beq hd.targetFrameDepth 0) (Nat.beq hd.targetLocal targetLocal) <;> rfl
     rw [hthis]
     exact ih (fun e he => hdisj e (List.Mem.tail _ he))
 
@@ -4622,7 +4636,8 @@ attribute [local simp] annealTableAccessUB annealTableAfterAccess basedAccessTag
 private theorem singleton_ub_after_eq (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
     (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
     (hloc : b₀.targetLocal = targetLocal)
-    (hproj : b₀.targetProjection = .nil) :
+    (hproj : b₀.targetProjection = .nil)
+    (hdepth : b₀.targetFrameDepth = 0 := by rfl) :
     let p₀ := isBorrowProtected activeProtectors b₀
     annealTableAccessUB kind [b₀] activeProtectors targetLocal start.val =
       annealTableAccessUB kind (canon1 b₀.perm p₀) (canonProts1 p₀) 0 start.val ∧
@@ -4648,7 +4663,9 @@ private theorem parent_child_ub_after_eq (kind : TreeBorrowAccessKind)
     (hcloc : child.targetLocal = targetLocal)
     (hploc : parent.targetLocal = targetLocal)
     (hcproj : child.targetProjection = .nil)
-    (hpproj : parent.targetProjection = .nil) :
+    (hpproj : parent.targetProjection = .nil)
+    (hcdepth : child.targetFrameDepth = 0 := by rfl)
+    (hpdepth : parent.targetFrameDepth = 0 := by rfl) :
     let p₀ := isBorrowProtected activeProtectors child
     let p₁ := isBorrowProtected activeProtectors parent
     annealTableAccessUB kind [child, parent] activeProtectors targetLocal start.val =
@@ -4681,7 +4698,9 @@ private theorem siblings_ub_after_eq (kind : TreeBorrowAccessKind)
     (hloc₀ : b₀.targetLocal = targetLocal)
     (hloc₁ : b₁.targetLocal = targetLocal)
     (hproj₀ : b₀.targetProjection = .nil)
-    (hproj₁ : b₁.targetProjection = .nil) :
+    (hproj₁ : b₁.targetProjection = .nil)
+    (hdepth₀ : b₀.targetFrameDepth = 0 := by rfl)
+    (hdepth₁ : b₁.targetFrameDepth = 0 := by rfl) :
     let p₀ := isBorrowProtected activeProtectors b₀
     let p₁ := isBorrowProtected activeProtectors b₁
     annealTableAccessUB kind [b₀, b₁] activeProtectors targetLocal start.val =
@@ -4721,7 +4740,10 @@ private theorem chain3_ub_after_eq (kind : TreeBorrowAccessKind)
     (hrproj : r.targetProjection = .nil)
     (hgprot : isBorrowProtected activeProtectors g = false)
     (hcprot : isBorrowProtected activeProtectors c = false)
-    (hrprot : isBorrowProtected activeProtectors r = false) :
+    (hrprot : isBorrowProtected activeProtectors r = false)
+    (hgdepth : g.targetFrameDepth = 0 := by rfl)
+    (hcdepth : c.targetFrameDepth = 0 := by rfl)
+    (hrdepth : r.targetFrameDepth = 0 := by rfl) :
     annealTableAccessUB kind [g, c, r] activeProtectors targetLocal start.val =
       annealTableAccessUB kind (canonChain3 g.perm c.perm r.perm) [] 0 start.val ∧
     (annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val).map
@@ -4762,7 +4784,10 @@ private theorem branch3_ub_after_eq (kind : TreeBorrowAccessKind)
     (hprojp : p.targetProjection = .nil)
     (hc₀prot : isBorrowProtected activeProtectors c₀ = false)
     (hc₁prot : isBorrowProtected activeProtectors c₁ = false)
-    (hpprot : isBorrowProtected activeProtectors p = false) :
+    (hpprot : isBorrowProtected activeProtectors p = false)
+    (hdepth₀ : c₀.targetFrameDepth = 0 := by rfl)
+    (hdepth₁ : c₁.targetFrameDepth = 0 := by rfl)
+    (hdepthp : p.targetFrameDepth = 0 := by rfl) :
     annealTableAccessUB kind [c₀, c₁, p] activeProtectors targetLocal start.val =
       annealTableAccessUB kind (canonBranch3 c₀.perm c₁.perm p.perm) [] 0 start.val ∧
     (annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val).map
@@ -5181,7 +5206,8 @@ theorem basedNormalTree_performAccess_singleton_simulation
     (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
     (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
     (hp₀ : b₀.parentTag = none) (hloc : b₀.targetLocal = targetLocal)
-    (hproj : b₀.targetProjection = .nil) :
+    (hproj : b₀.targetProjection = .nil)
+    (hdepth : b₀.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [b₀] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [b₀] activeProtectors targetLocal start.val
@@ -5191,7 +5217,7 @@ theorem basedNormalTree_performAccess_singleton_simulation
   dsimp only []
   have hnt := basedNormalTree_singleton_eq b₀ activeProtectors hp₀
   obtain ⟨hub_eq, hafter_eq⟩ :=
-    singleton_ub_after_eq kind b₀ activeProtectors targetLocal start hloc hproj
+    singleton_ub_after_eq kind b₀ activeProtectors targetLocal start hloc hproj hdepth
   obtain ⟨hlen, htags, htopo, hprot⟩ :=
     annealTableAfterAccess_preserves_shape kind [b₀] activeProtectors targetLocal start.val
   obtain ⟨hcore_st, hcore_rel⟩ :=
@@ -5227,7 +5253,9 @@ theorem basedNormalTree_performAccess_parent_child_simulation
     (hcloc : child.targetLocal = targetLocal)
     (hploc : parent.targetLocal = targetLocal)
     (hcproj : child.targetProjection = .nil)
-    (hpproj : parent.targetProjection = .nil) :
+    (hpproj : parent.targetProjection = .nil)
+    (hcdepth : child.targetFrameDepth = 0 := by rfl)
+    (hpdepth : parent.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [child, parent] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [child, parent] activeProtectors targetLocal
@@ -5238,7 +5266,7 @@ theorem basedNormalTree_performAccess_parent_child_simulation
   dsimp only []
   have hnt := basedNormalTree_parent_child_eq child parent activeProtectors hneq hcpar hppar
   obtain ⟨hub_eq, hafter_eq⟩ := parent_child_ub_after_eq kind child parent activeProtectors
-    targetLocal start hneq hcpar hppar hcloc hploc hcproj hpproj
+    targetLocal start hneq hcpar hppar hcloc hploc hcproj hpproj hcdepth hpdepth
   obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
     [child, parent] activeProtectors targetLocal start.val
   have hcore : pcCoreGoal kind child.perm parent.perm
@@ -5283,7 +5311,9 @@ theorem basedNormalTree_performAccess_siblings_simulation
     (hloc₀ : b₀.targetLocal = targetLocal)
     (hloc₁ : b₁.targetLocal = targetLocal)
     (hproj₀ : b₀.targetProjection = .nil)
-    (hproj₁ : b₁.targetProjection = .nil) :
+    (hproj₁ : b₁.targetProjection = .nil)
+    (hdepth₀ : b₀.targetFrameDepth = 0 := by rfl)
+    (hdepth₁ : b₁.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [b₀, b₁] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [b₀, b₁] activeProtectors targetLocal start.val
@@ -5293,7 +5323,7 @@ theorem basedNormalTree_performAccess_siblings_simulation
   dsimp only []
   have hnt := basedNormalTree_siblings_eq b₀ b₁ activeProtectors hp₀ hp₁
   obtain ⟨hub_eq, hafter_eq⟩ := siblings_ub_after_eq kind b₀ b₁ activeProtectors
-    targetLocal start hneq hp₀ hp₁ hloc₀ hloc₁ hproj₀ hproj₁
+    targetLocal start hneq hp₀ hp₁ hloc₀ hloc₁ hproj₀ hproj₁ hdepth₀ hdepth₁
   obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
     [b₀, b₁] activeProtectors targetLocal start.val
   have hcore : sibCoreGoal kind b₀.perm b₁.perm
@@ -5350,7 +5380,10 @@ theorem basedNormalTree_performAccess_three_level_chain_simulation
     (hgprot : isBorrowProtected activeProtectors g = false)
     (hcprot : isBorrowProtected activeProtectors c = false)
     (hrprot : isBorrowProtected activeProtectors r = false)
-    (hinv : treeBorrowsChain3Inv g.perm c.perm r.perm = true) :
+    (hinv : treeBorrowsChain3Inv g.perm c.perm r.perm = true)
+    (hgdepth : g.targetFrameDepth = 0 := by rfl)
+    (hcdepth : c.targetFrameDepth = 0 := by rfl)
+    (hrdepth : r.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [g, c, r] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val
@@ -5362,7 +5395,7 @@ theorem basedNormalTree_performAccess_three_level_chain_simulation
     hgpar hcpar hrpar hgprot hcprot hrprot
   obtain ⟨hub_eq, hafter_eq⟩ := chain3_ub_after_eq kind g c r activeProtectors targetLocal start
     hneq_gc hneq_gr hneq_cr hgpar hcpar hrpar hgloc hcloc hrloc hgproj hcproj hrproj
-    hgprot hcprot hrprot
+    hgprot hcprot hrprot hgdepth hcdepth hrdepth
   obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
     [g, c, r] activeProtectors targetLocal start.val
   obtain ⟨hcore_st, hcore_rel⟩ := chain3_canon_core kind g.perm c.perm r.perm start hinv
@@ -5406,7 +5439,10 @@ theorem basedNormalTree_performAccess_branching_children_simulation
     (hc₀prot : isBorrowProtected activeProtectors c₀ = false)
     (hc₁prot : isBorrowProtected activeProtectors c₁ = false)
     (hpprot : isBorrowProtected activeProtectors p = false)
-    (hinv : treeBorrowsBranch3Inv c₀.perm c₁.perm p.perm = true) :
+    (hinv : treeBorrowsBranch3Inv c₀.perm c₁.perm p.perm = true)
+    (hdepth₀ : c₀.targetFrameDepth = 0 := by rfl)
+    (hdepth₁ : c₁.targetFrameDepth = 0 := by rfl)
+    (hdepthp : p.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [c₀, c₁, p] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val
@@ -5418,7 +5454,7 @@ theorem basedNormalTree_performAccess_branching_children_simulation
     hc₀par hc₁par hppar hc₀prot hc₁prot hpprot
   obtain ⟨hub_eq, hafter_eq⟩ := branch3_ub_after_eq kind c₀ c₁ p activeProtectors targetLocal start
     hneq₀₁ hneq₀p hneq₁p hc₀par hc₁par hppar hloc₀ hloc₁ hlocp hproj₀ hproj₁ hprojp
-    hc₀prot hc₁prot hpprot
+    hc₀prot hc₁prot hpprot hdepth₀ hdepth₁ hdepthp
   obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
     [c₀, c₁, p] activeProtectors targetLocal start.val
   obtain ⟨hcore_st, hcore_rel⟩ := branch3_canon_core kind c₀.perm c₁.perm p.perm start hinv
@@ -5712,7 +5748,10 @@ private theorem chain3Prot_ub_after_eq (kind : TreeBorrowAccessKind)
     (hrloc : r.targetLocal = targetLocal)
     (hgproj : g.targetProjection = .nil)
     (hcproj : c.targetProjection = .nil)
-    (hrproj : r.targetProjection = .nil) :
+    (hrproj : r.targetProjection = .nil)
+    (hgdepth : g.targetFrameDepth = 0 := by rfl)
+    (hcdepth : c.targetFrameDepth = 0 := by rfl)
+    (hrdepth : r.targetFrameDepth = 0 := by rfl) :
     let p₀ := isBorrowProtected activeProtectors g
     let p₁ := isBorrowProtected activeProtectors c
     let p₂ := isBorrowProtected activeProtectors r
@@ -5758,7 +5797,10 @@ private theorem branch3Prot_ub_after_eq (kind : TreeBorrowAccessKind)
     (hlocp : p.targetLocal = targetLocal)
     (hproj₀ : c₀.targetProjection = .nil)
     (hproj₁ : c₁.targetProjection = .nil)
-    (hprojp : p.targetProjection = .nil) :
+    (hprojp : p.targetProjection = .nil)
+    (hdepth₀ : c₀.targetFrameDepth = 0 := by rfl)
+    (hdepth₁ : c₁.targetFrameDepth = 0 := by rfl)
+    (hdepthp : p.targetFrameDepth = 0 := by rfl) :
     let p₀ := isBorrowProtected activeProtectors c₀
     let p₁ := isBorrowProtected activeProtectors c₁
     let p₂ := isBorrowProtected activeProtectors p
@@ -6138,7 +6180,10 @@ theorem basedNormalTree_performAccess_three_level_chain_prot_simulation
     (hgproj : g.targetProjection = .nil)
     (hcproj : c.targetProjection = .nil)
     (hrproj : r.targetProjection = .nil)
-    (hinv : borrowListChain3ProtInv [g, c, r] activeProtectors = true) :
+    (hinv : borrowListChain3ProtInv [g, c, r] activeProtectors = true)
+    (hgdepth : g.targetFrameDepth = 0 := by rfl)
+    (hcdepth : c.targetFrameDepth = 0 := by rfl)
+    (hrdepth : r.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [g, c, r] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val
@@ -6153,7 +6198,7 @@ theorem basedNormalTree_performAccess_three_level_chain_prot_simulation
     hneq_gc hneq_gr hneq_cr hgpar hcpar hrpar
   obtain ⟨hub_eq, hafter_eq⟩ := chain3Prot_ub_after_eq kind g c r activeProtectors
     targetLocal start hneq_gc hneq_gr hneq_cr hgpar hcpar hrpar hgloc hcloc hrloc
-    hgproj hcproj hrproj
+    hgproj hcproj hrproj hgdepth hcdepth hrdepth
   obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
     [g, c, r] activeProtectors targetLocal start.val
   obtain ⟨hcore_st, hcore_rel⟩ := chain3Prot_canon_core kind g.perm c.perm r.perm
@@ -6222,7 +6267,10 @@ theorem basedNormalTree_performAccess_branching_children_prot_simulation
     (hproj₀ : c₀.targetProjection = .nil)
     (hproj₁ : c₁.targetProjection = .nil)
     (hprojp : p.targetProjection = .nil)
-    (hinv : borrowListBranch3ProtInv [c₀, c₁, p] activeProtectors = true) :
+    (hinv : borrowListBranch3ProtInv [c₀, c₁, p] activeProtectors = true)
+    (hdepth₀ : c₀.targetFrameDepth = 0 := by rfl)
+    (hdepth₁ : c₁.targetFrameDepth = 0 := by rfl)
+    (hdepthp : p.targetFrameDepth = 0 := by rfl) :
     let nres := (basedNormalTree [c₀, c₁, p] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val
@@ -6237,7 +6285,7 @@ theorem basedNormalTree_performAccess_branching_children_prot_simulation
     hneq₀p hneq₁p hc₀par hc₁par hppar
   obtain ⟨hub_eq, hafter_eq⟩ := branch3Prot_ub_after_eq kind c₀ c₁ p activeProtectors
     targetLocal start hneq₀₁ hneq₀p hneq₁p hc₀par hc₁par hppar hloc₀ hloc₁ hlocp
-    hproj₀ hproj₁ hprojp
+    hproj₀ hproj₁ hprojp hdepth₀ hdepth₁ hdepthp
   obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
     [c₀, c₁, p] activeProtectors targetLocal start.val
   obtain ⟨hcore_st, hcore_rel⟩ := branch3Prot_canon_core kind c₀.perm c₁.perm p.perm

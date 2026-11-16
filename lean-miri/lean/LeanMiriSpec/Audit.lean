@@ -492,7 +492,7 @@ open LeanMiriSpec.Correspondence in
   step_deref_misaligned_miri_ub
   step_cast_ptrToPtr_simulation
   step_binOp_offset_simulation
-  step_binOp_offset_disabled_divergence
+  step_binOp_offset_disabled_simulation
   step_binOp_offset_oob_dangling_miri_ub
   WellTypedLM3_1StateStmt
   step_stmt_lm3_1_state_simulation
@@ -513,7 +513,7 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_1_use_after_storageDead_real_steps
   Witness.wit_lm3_1_ptrToPtr_and_offset_real_steps
   Witness.lm31OffsetDisabledBody
-  Witness.wit_lm3_1_binOp_offset_disabled_divergence
+  Witness.wit_lm3_1_binOp_offset_disabled_simulation
   Witness.wit_lm3_1_deref_oob_and_misaligned_real_steps
   isThinRawPtrPointee
   annealValidateScalarForTyId
@@ -638,12 +638,13 @@ open LeanMiriSpec.Correspondence in
   step_deref_raw_subrange_write_into_bool_or_char_correspondence
   step_raw_overwritten_deref_invalid_bool_or_char_simulation
   step_raw_overwritten_direct_copy_invalid_bool_simulation
-  step_raw_overwritten_direct_copy_invalid_char_divergence
+  step_raw_overwritten_direct_copy_invalid_char_simulation
+  step_raw_overwritten_direct_copy_valid_char_simulation
   offsetAfterLhsLocals
   step_binOp_offset_neg_oob_ub_simulation
   step_binOp_offset_usize_wrap_divergence
-  step_binOp_offset_disabled_stride_divergence
-  step_binOp_offset_disabled_neg_isize_divergence
+  step_binOp_offset_disabled_stride_simulation
+  step_binOp_offset_disabled_neg_isize_simulation
   step_binOp_offset_usize_wrap_disabled_ub_simulation
   step_binOp_offset_d6_partition
   step_binOp_offset_d6_lockstep_of_not_disabled
@@ -1327,7 +1328,7 @@ open LeanMiriSpec.Correspondence in
   writeDiscriminant_dead_local_err
   writeDiscriminant_uninit_imm_local_ok
   step_setDiscriminant_simulation
-  step_setDiscriminant_uninit_divergence
+  step_setDiscriminant_uninit_simulation
   evalRvalue_discriminant_simulation
   evalProjection_downcast_field_simulation
   evalProjection_downcast_field_initialized_divergence
@@ -1366,7 +1367,7 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm2_3_setDiscriminant_then_inactive_ub
   Witness.wit_lm2_3_switch_otherwise_and_goto_trace
   Witness.wit_lm2_3_uninit_and_dead_ub
-  Witness.wit_lm2_3_setDiscriminant_uninit_divergence
+  Witness.wit_lm2_3_setDiscriminant_uninit_simulation
   Witness.wit_lm2_3_inactive_variant_initialized_divergence
   Witness.wit_lm2_3_prefix_setDiscriminant_read
   Witness.wit_lm2_3_upcast_setDiscriminant_read_and_trailing_ub
@@ -1702,7 +1703,7 @@ example
     {op : MirAst.Operand}
     {srcTy dstTy : Ty}
     (dest : Miri.Interpreter.RuntimePlace AnnealProv)
-    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       .ok (.scalar sc) locals')
     (hopTy : operandTy localDecls layouts op = some srcTy)
     (hsrc : srcTy.kind = .bool ∨ (∃ k, srcTy.kind = .int k) ∨ (∃ k, srcTy.kind = .uint k))
@@ -4153,16 +4154,22 @@ example
     (htgt_decl : get? body.localDecls e.localIdx = some tgtDecl)
     (hinb :
       (sc.bits = 0 ∧ ptrVal.offsetBytes = 0) ∨
-      (get? s.frame.locals e.localIdx ≠ some .dead ∧
+      (get? s.frame.locals e.localIdx ≠ some .dead ∧ e.allocDead = false ∧
         ptrVal.offsetBytes + sc.bits ≤
           (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat))
     (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
     (hptr8 : layoutPointerBytes body.layouts = 8) :
-    stepMirFn body s = MirStepNode.fail .ub ∧
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    (∃ s',
+      stepMirFn body s = .step s' ∧
+      get? s'.frame.locals dstIdx =
+        some (.init (.ptr { ptrVal with offsetBytes := ptrVal.offsetBytes + sc.bits } 8))) ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .ok true) :=
-  step_binOp_offset_disabled_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty
+  step_binOp_offset_disabled_simulation hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty
     hdst_ty hpt hrhs_ty hop_rhs himm hno_int hslot_p hrhs_ok he htag hdis htgt_decl hinb
     hdst_live hptr8
 
@@ -4299,7 +4306,7 @@ example :
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
 example :
-    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
       let hooks := annealStepHooks lm31OffsetDisabledBody.localDecls lm31OffsetDisabledBody.layouts
       let entry := rawPtrAllocMapEntry lm31OffsetDisabledBody.localDecls
         lm31OffsetDisabledBody.layouts .mut 1 1 lm31AllocId1
@@ -4312,10 +4319,14 @@ example :
       StateRelLM3_1 lm31OffsetDisabledBody s₂ m₂ [entry] ∧
       stepMirFn lm31OffsetDisabledBody s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      StateRelLM3_1 lm31OffsetDisabledBody s₃ m₃ [{ entry with perm := .disabled }] ∧
-      stepMirFn lm31OffsetDisabledBody s₃ = .fail .ub ∧
-      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) :=
-  Witness.wit_lm3_1_binOp_offset_disabled_divergence
+      StateRelLM3_1 lm31OffsetDisabledBody s₃ m₃
+        [{ entry with perm := .disabled, allocDead := true }] ∧
+      stepMirFn lm31OffsetDisabledBody s₃ = .step s₄ ∧
+      get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 lm31OffsetDisabledBody s₄ m₄
+        [{ entry with perm := .disabled, allocDead := true }] :=
+  Witness.wit_lm3_1_binOp_offset_disabled_simulation
 
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
@@ -4424,7 +4435,8 @@ example :
       stepMirFn b s₆ = .step s₇ ∧
       Miri.Interpreter.Step.step hooks () m₆ = (m₇, .ok true) ∧
       StateRelLM3_1 b s₇ m₇ (derefReadNextAllocMap s₆.frame.locals [entry] 3) ∧
-      stepMirFn b s₇ = .retNormal (.scalar ⟨5, 4⟩) s₇.memory ∧
+      stepMirFn b s₇ = .retNormal (.scalar ⟨5, 4⟩)
+        { s₇.memory with borrows := disableFrameBorrows s₇.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₇ = ({ m₇ with stack := ⟨#[]⟩ }, .ok true) ∧
       annealControlHooks.returnOperand () m₇ =
         (m₇, .ok (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 5))))) :=
@@ -6329,7 +6341,8 @@ example :
       s₅.frame.blockIdx = 2 ∧
       StateRelLM3_1 b s₅ m₅ allocMap₂ ∧
       stepMirFn b s₅ =
-        .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₅.memory ∧
+        .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8)
+          { s₅.memory with borrows := disableFrameBorrows s₅.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₅ = ({ m₅ with stack := ⟨#[]⟩ }, .ok true) ∧
       annealControlHooks.returnOperand () m₅ =
         (m₅, .ok (.immediate (.scalar
@@ -7085,11 +7098,36 @@ example
         ptrVal.offsetBytes +
             count *
               (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat ≤
-          (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)) :
-    stepMirFn body s = MirStepNode.fail .ub ∧
-    ∃ m', Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
-      (m', .ok true) :=
-  step_binOp_offset_disabled_stride_divergence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag hdis hdecl_tgt hinbounds
+          (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat))
+    (hnot_dead : get? s.frame.locals e.localIdx ≠ some .dead → e.allocDead = false)
+    (hreach0 : count = 0 →
+      ptrVal.offsetBytes = 0 ∨
+      get? s.frame.locals e.localIdx = some .dead ∨
+      e.allocDead = true ∨
+      ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
+    let stride :=
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s =
+      MirStepNode.step
+        (advanceStmt s
+          (locals_rhs.set dstIdx
+            (.init (.ptr { ptrVal with offsetBytes := ptrVal.offsetBytes + count * stride } 8)))
+          s.memory) ∧
+    ∃ m' tf' borTag,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes
+              (annealStackBaseAddr e.allocId + UInt64.ofNat (ptrVal.offsetBytes + count * stride)),
+              .concrete e.allocId borTag⟩)))) :=
+  step_binOp_offset_disabled_stride_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag hdis hdecl_tgt hinbounds hnot_dead hreach0 hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -7132,11 +7170,33 @@ example
           (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat ≤
         ptrVal.offsetBytes)
     (hhi_off : ptrVal.offsetBytes ≤
-      (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat) :
-    stepMirFn body s = MirStepNode.fail .ub ∧
-    ∃ m', Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
-      (m', .ok true) :=
-  step_binOp_offset_disabled_neg_isize_divergence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hcount_pos hdst_live he_mem he_tag hdis hdecl_tgt htgt_live hlo_off hhi_off
+      (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (halive : e.allocDead = false)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
+    let stride :=
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s =
+      MirStepNode.step
+        (advanceStmt s
+          (locals_rhs.set dstIdx
+            (.init (.ptr
+              { ptrVal with offsetBytes := ptrVal.offsetBytes - countMag * stride } 8)))
+          s.memory) ∧
+    ∃ m' tf' borTag,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes
+              (annealStackBaseAddr e.allocId +
+                UInt64.ofNat (ptrVal.offsetBytes - countMag * stride)),
+              .concrete e.allocId borTag⟩)))) :=
+  step_binOp_offset_disabled_neg_isize_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hcount_pos hdst_live he_mem he_tag hdis hdecl_tgt htgt_live hlo_off hhi_off halive hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -7171,7 +7231,10 @@ example
     (hbits : 2 ^ 63 ≤ sc.bits)
     (he_mem : e ∈ allocMap)
     (he_tag : e.tag = ptrVal.tag)
-    (hdis : e.perm = .disabled) :
+    (hdis : e.perm = .disabled)
+    (hoob_or_dead : e.allocDead = true ∨ get? s.frame.locals e.localIdx = some .dead ∨
+      ptrVal.offsetBytes = 0)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -7179,7 +7242,7 @@ example
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "PointerArithOverflow")) :=
-  step_binOp_offset_usize_wrap_disabled_ub_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hbits he_mem he_tag hdis
+  step_binOp_offset_usize_wrap_disabled_ub_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hbits he_mem he_tag hdis hoob_or_dead hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -7315,16 +7378,52 @@ example
     (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
     (hsz4 : rawSc.sizeBytes = 4) (hb_hi : rawSc.bits < 2 ^ 32)
     (hinvalid : isValidCharCode rawSc.bits = false) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "reading invalid value")) :=
+  step_raw_overwritten_direct_copy_invalid_char_simulation hraw hphase hopKind hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz4 hb_hi hinvalid
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    {loc : Local} {allocId : Miri.Memory.AllocId}
+    {rawSc : MirAst.ScalarInt} {msc_raw : Miri.Memory.ScalarInt}
+    (hraw : RawOverwrittenScalarState body s m allocMap loc allocId rawSc msc_raw)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨loc, .nil⟩)), span⟩)
+    {dstDecl locDecl : MirAst.LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_loc : get? body.localDecls loc = some locDecl)
+    (hloc_char : locDecl.ty.kind = .char)
+    (hdst_char : dstDecl.ty.kind = .char)
+    (hne_dst : dstIdx ≠ loc)
+    (himm_dst : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hsz4 : rawSc.sizeBytes = 4) (hb_hi : rawSc.bits < 2 ^ 32)
+    (hvalid : isValidCharCode rawSc.bits = true) :
     stepMirFn body s =
       MirStepNode.step
         (advanceStmt s
           ((offsetAfterLhsLocals opKind s.frame.locals loc).set dstIdx (.init (.scalar rawSc)))
           { s.memory with
             borrows := invalidateConflictingBorrows s.memory.borrows dstIdx none }) ∧
-    ∃ m',
+    ∃ m' tf',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
-        (m', .error (.undefinedBehavior "reading invalid value")) :=
-  step_raw_overwritten_direct_copy_invalid_char_divergence hraw hphase hopKind hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz4 hb_hi hinvalid
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt msc_raw)))) :=
+  step_raw_overwritten_direct_copy_valid_char_simulation hraw hphase hopKind hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst himm_dst hdst_live hsz4 hb_hi hvalid
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -7444,7 +7543,8 @@ example :
       stepMirFn b s₅ = .step s₆ ∧
       Miri.Interpreter.Step.step hooks () m₅ = (m₆, .ok true) ∧
       StateRelLM3_1 b s₆ m₆ allocMap₆ ∧
-      stepMirFn b s₆ = .retNormal (.scalar ⟨38654705669, 8⟩) s₆.memory ∧
+      stepMirFn b s₆ = .retNormal (.scalar ⟨38654705669, 8⟩)
+        { s₆.memory with borrows := disableFrameBorrows s₆.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₆ = ({ m₆ with stack := ⟨#[]⟩ }, .ok true) ∧
       annealControlHooks.returnOperand () m₆ =
         (m₆, .ok (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 38654705669))))) :=
@@ -7547,25 +7647,23 @@ example :
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior msg))) ∧
     (let b := lm31RawOverwriteCharBody false false
      let hooks := annealStepHooks b.localDecls b.layouts
-     ∃ s₁ s₂ s₃ s₄ m₁ m₂ m₃ m₄,
+     ∃ s₁ s₂ s₃ m₁ m₂ m₃ m₄,
        stepMirFn b (mkSixLocalScalarAnnealPre b ⟨0x41, 4⟩) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks ()
          (mkSixLocalScalarMiriPre b charTyLM31 charTyLM31 (Miri.Memory.ScalarInt.ofUInt32 0x41)) = (m₁, .ok true) ∧
        stepMirFn b s₁ = .step s₂ ∧ Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
        stepMirFn b s₂ = .step s₃ ∧ Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-       stepMirFn b s₃ = .step s₄ ∧
+       stepMirFn b s₃ = .fail .ub ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior "reading invalid value"))) ∧
     (let b := lm31RawOverwriteCharBody false true
      let hooks := annealStepHooks b.localDecls b.layouts
-     ∃ s₁ s₂ s₃ s₄ m₁ m₂ m₃ m₄,
+     ∃ s₁ s₂ s₃ m₁ m₂ m₃ m₄,
        stepMirFn b (mkSixLocalScalarAnnealPre b ⟨0x41, 4⟩) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks ()
          (mkSixLocalScalarMiriPre b charTyLM31 charTyLM31 (Miri.Memory.ScalarInt.ofUInt32 0x41)) = (m₁, .ok true) ∧
        stepMirFn b s₁ = .step s₂ ∧ Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
        stepMirFn b s₂ = .step s₃ ∧ Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-       stepMirFn b s₃ = .step s₄ ∧
-       get? s₄.frame.locals 1 = some .uninit ∧
-       get? s₄.frame.locals 0 = some (.init (.scalar ⟨0xD800, 4⟩)) ∧
+       stepMirFn b s₃ = .fail .ub ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior "reading invalid value"))) :=
   Witness.wit_lm3_1_raw_overwritten_bool_and_char_real_steps
 
@@ -7786,7 +7884,7 @@ example :
     (let b := lm31OffsetDisabledLiveBody
      let hooks := annealStepHooks b.localDecls b.layouts
      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1
-     ∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
        stepMirFn b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks ()
          (mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
@@ -7795,12 +7893,14 @@ example :
        StateRelLM3_1 b s₂ m₂ (updateAllocMapOnWrite [entry] 1 none) ∧
        (entry.updateOnWrite 1 none).perm = .disabled ∧
        get? s₂.frame.locals 1 = some (.init (.scalar ⟨7, 8⟩)) ∧
-       stepMirFn b s₂ = .fail .ub ∧
-       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true)) ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       get? s₃.frame.locals 3 = some (.init (.ptr { allocId := 1, offsetBytes := 8 } 8)) ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ (updateAllocMapOnWrite [entry] 1 none)) ∧
     (let b := lm31OffsetDisabledNegBody
      let hooks := annealStepHooks b.localDecls b.layouts
      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1
-     ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
        stepMirFn b (mkSixLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks ()
          (mkSixLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
@@ -7810,8 +7910,10 @@ example :
        Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
        StateRelLM3_1 b s₃ m₃ (updateAllocMapOnWrite [entry] 1 none) ∧
        get? s₃.frame.locals 3 = some (.init (.ptr { allocId := 1, offsetBytes := 8 } 8)) ∧
-       stepMirFn b s₃ = .fail .ub ∧
-       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true)) ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ (updateAllocMapOnWrite [entry] 1 none)) ∧
     (let b := lm31OffsetDisabledUsizeMaxBody
      let hooks := annealStepHooks b.localDecls b.layouts
      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1
@@ -7830,7 +7932,7 @@ example :
     (let b := lm31OffsetDisabledDeadZeroBody
      let hooks := annealStepHooks b.localDecls b.layouts
      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1
-     ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
        stepMirFn b (mkSixLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks ()
          (mkSixLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
@@ -7841,8 +7943,10 @@ example :
        StateRelLM3_1 b s₃ m₃ (disableAllocMapLocal [entry] 1) ∧
        get? s₃.frame.locals 1 = some .dead ∧
        get? s₃.frame.locals 3 = some (.init (.ptr { allocId := 1, offsetBytes := 8 } 8)) ∧
-       stepMirFn b s₃ = .fail .ub ∧
-       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true)) :=
+       stepMirFn b s₃ = .step s₄ ∧
+       get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 8 } 8)) ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ (disableAllocMapLocal [entry] 1)) :=
   Witness.wit_lm3_1_binOp_offset_disabled_live_real_steps
 
 open Trusted.Rustc.V2026_06_01.Layout in
@@ -8030,7 +8134,7 @@ example :
        Miri.Interpreter.Step.step hooks () m₅ = (m₆, .error (.undefinedBehavior msg))) ∧
     (let b := lm31RawSubbyteMoveOverwriteCharBody false
      let hooks := annealStepHooks b.localDecls b.layouts
-     ∃ s₁ s₂ s₃ s₄ s₅ s₆ m₁ m₂ m₃ m₄ m₅ m₆,
+     ∃ s₁ s₂ s₃ s₄ s₅ m₁ m₂ m₃ m₄ m₅ m₆,
        stepMirFn b (mkSixLocalScalarAnnealPre b ⟨0x41, 4⟩) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks ()
          (mkSixLocalScalarMiriPre b charTyLM31 charTyLM31 (Miri.Memory.ScalarInt.ofUInt32 0x41)) =
@@ -8039,9 +8143,7 @@ example :
        stepMirFn b s₂ = .step s₃ ∧ Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
        stepMirFn b s₃ = .step s₄ ∧ Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
        stepMirFn b s₄ = .step s₅ ∧ Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
-       stepMirFn b s₅ = .step s₆ ∧
-       get? s₆.frame.locals 1 = some .uninit ∧
-       get? s₆.frame.locals 0 = some (.init (.scalar ⟨0xD841, 4⟩)) ∧
+       stepMirFn b s₅ = .fail .ub ∧
        Miri.Interpreter.Step.step hooks () m₅ =
          (m₆, .error (.undefinedBehavior "reading invalid value"))) ∧
     (let b := lm31ComposedPartialOobWriteBody
@@ -8105,10 +8207,13 @@ example
     (he_mem : e ∈ allocMap)
     (he_tag : e.tag = ptrVal.tag)
     (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
-    (hreach : e.perm ≠ .disabled → sc.bits = 0 →
+    (hreach : sc.bits = 0 →
       ptrVal.offsetBytes = 0 ∨
-      (get? s.frame.locals e.localIdx ≠ some .dead ∧
-        ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat))
+      get? s.frame.locals e.localIdx = some .dead ∨
+      (e.perm = .disabled ∧ e.allocDead = true) ∨
+      ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hnot_dead : e.perm = .disabled → get? s.frame.locals e.localIdx ≠ some .dead →
+      e.allocDead = false)
     (hptr8 : layoutPointerBytes body.layouts = 8) :
     let hooks := annealStepHooks body.localDecls body.layouts
     (StepRelLM3_1 body m allocMap (stepMirFn body s) (Miri.Interpreter.Step.step hooks () m) ∧
@@ -8117,11 +8222,7 @@ example
     (StepRelLM3_1 body m allocMap (stepMirFn body s) (Miri.Interpreter.Step.step hooks () m) ∧
       stepMirFn body s = MirStepNode.fail .ub ∧
       ∃ m' msg, Miri.Interpreter.Step.step hooks () m = (m', .error (.undefinedBehavior msg))) ∨
-    (e.perm = .disabled ∧
-      stepMirFn body s = MirStepNode.fail .ub ∧
-      ∃ m', Miri.Interpreter.Step.step hooks () m = (m', .ok true)) ∨
-    (e.perm ≠ .disabled ∧
-      rhsTy.kind = .uint .usize ∧
+    (rhsTy.kind = .uint .usize ∧
       2 ^ 63 ≤ sc.bits ∧
       (∃ s', stepMirFn body s = MirStepNode.step s') ∧
       ∃ m',
@@ -8129,7 +8230,7 @@ example
           (m', .error (.undefinedBehavior "PointerArithOverflow"))) :=
   step_binOp_offset_d6_partition hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty
     hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag
-    hdecl_tgt hreach hptr8
+    hdecl_tgt hreach hnot_dead hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -8668,6 +8769,7 @@ example (s : MachineState) (localDecls : List MirAst.LocalDecl) (layouts : Layou
     let perm : TreeBorrowPerm := refBorrowPerm localDecls layouts bk targetIdx
     let entry : BorrowEntry :=
       { tag := s.memory.nextTag
+        targetFrameDepth := length s.memory.callStack
         targetLocal := targetIdx
         targetProjection := .nil
         perm := perm }
@@ -9981,7 +10083,7 @@ example :
       StateRelLM3_2 lm32RefBody s₃ m₃ [entry] ∧
       stepMirFn lm32RefBody s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 lm32RefBody s₄ m₄ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 lm32RefBody s₄ m₄ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₄.machine.memory.live.find? (fun x => x.1 == lm31AllocId1) = none :=
   Witness.wit_lm3_2_ref_deref_read_storageDead_real_steps
 
@@ -10053,7 +10155,7 @@ example :
       StateRelLM3_2 lm32DanglingReborrowBody s₁ m₁ [entry] ∧
       stepMirFn lm32DanglingReborrowBody s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [{ entry with perm := .disabled, allocDead := true }] ∧
       stepMirFn lm32DanglingReborrowBody s₂ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₂ =
         (m₃, .error (.undefinedBehavior "dereferencing a dangling reference"))) ∧
@@ -11128,7 +11230,7 @@ example :
             layout := some (translateTy u64Ty) }) = (m₁, .ok true) ∧
       stepMirFn b s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2 b s₂ m₂ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 b s₂ m₂ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₂.stack.frames = #[tf₂] ∧
       get? s₂.frame.locals 1 = some .dead ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
@@ -11202,7 +11304,7 @@ example :
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      StateRelLM3_2 b s₃ m₃ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 b s₃ m₃ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₃.stack.frames = #[tf₃] ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
         refU64Ty 4 ⟨.local 0 3 none tf₃.localsIdentity, translateTy refU64Ty b.layouts⟩
@@ -11211,7 +11313,7 @@ example :
           "validation: encountered a dangling reference (use-after-free)") m₃ ∧
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 b s₄ m₄ [{ entry with perm := .disabled }] ∧
+      StateRelLM3_2 b s₄ m₄ [{ entry with perm := .disabled, allocDead := true }] ∧
       m₄.stack.frames = #[tf₄] ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
         refU64Ty 4 ⟨.local 0 0 none tf₄.localsIdentity, translateTy refU64Ty b.layouts⟩
@@ -11279,7 +11381,8 @@ example :
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
       StateRelLM3_2 b s₅ m₅ [{ entry with perm := .active }] ∧
       (∃ am, StepObsRelLM3_2 b m₅ am (stepMirFn b s₅) (Miri.Interpreter.Step.step hooks () m₅)) ∧
-      stepMirFn b s₅ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₅.memory ∧
+      stepMirFn b s₅ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8)
+        { s₅.memory with borrows := disableFrameBorrows s₅.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₅ = ({ m₅ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₅ = (m₅, .ok (.immediate imm0)) ∧
@@ -11669,7 +11772,8 @@ example :
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       StateRelLM3_2Tree b s₄ m₄ [lm32TreeChild .frozen, lm32TreeRoot .active] ∧
       get? s₄.frame.locals 0 = some (.init (.scalar ⟨99, 8⟩)) ∧
-      stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩) s₄.memory ∧
+      stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩)
+        { s₄.memory with borrows := disableFrameBorrows s₄.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₄ = ({ m₄ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₄ = (m₄, .ok (.immediate imm0)) ∧
@@ -15779,10 +15883,17 @@ example :
         env dstDecl.ty = some (tagBytes, variants) →
         variantIdx < variants.length →
         get? s.frame.locals dstIdx = some .uninit →
-        stepMirFn body s = .fail .ub ∧
-        ∃ m', Miri.Interpreter.Step.step
-          (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) :=
-  @step_setDiscriminant_uninit_divergence
+        let s' := advanceStmt s (s.frame.locals.set dstIdx (.init (.aggregate variantIdx .nil)))
+        stepMirFn body s = .step s' ∧
+        StepRelLM2_3 body env allocBudget m
+          (stepMirFn body s)
+          (Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m) ∧
+        ∃ m',
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) ∧
+          StateRelLM2_3 body env allocBudget s' m' :=
+  @step_setDiscriminant_uninit_simulation
 
 example :
     ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
@@ -16035,10 +16146,16 @@ example :
   Witness.wit_lm2_3_uninit_and_dead_ub
 
 example :
-    stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 8) = .fail .ub ∧
-    ∃ m', Miri.Interpreter.Step.step Witness.lm23Hooks ()
-      (Witness.lm23InitMiri 8) = (m', .ok true) :=
-  Witness.wit_lm2_3_setDiscriminant_uninit_divergence
+    let s' := advanceStmt (Witness.lm23InitAnneal 8)
+      ((Witness.lm23InitAnneal 8).frame.locals.set 1 (.init (.aggregate 0 .nil)))
+    stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 8) = .step s' ∧
+    StepRelLM2_3 Witness.lm23Body Witness.lm23Env 0 (Witness.lm23InitMiri 8)
+      (stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 8))
+      (Miri.Interpreter.Step.step Witness.lm23Hooks () (Witness.lm23InitMiri 8)) ∧
+    ∃ m',
+      Miri.Interpreter.Step.step Witness.lm23Hooks () (Witness.lm23InitMiri 8) = (m', .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 s' m' :=
+  Witness.wit_lm2_3_setDiscriminant_uninit_simulation
 
 example :
     ∃ (m₁ m₂ : AnnealStepState),
@@ -17038,7 +17155,8 @@ example (allBorrows : List BorrowEntry)
     (readProj : List ProjectionElem)
     (readRangeOff readRangeLen : Nat)
     (hloc : entry.targetLocal = targetLocal)
-    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true) :
+    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true)
+    (hd : entry.targetFrameDepth = 0) :
     borrowEntryReadUB allBorrows activeProtectors entry targetLocal readerTag
         readProj readRangeOff readRangeLen =
       treeBorrowTransitionIsUB
@@ -17047,7 +17165,7 @@ example (allBorrows : List BorrowEntry)
           entry.perm
           (isBorrowProtected activeProtectors entry)) :=
   @borrowEntryReadUB_eq_nodeAccess allBorrows activeProtectors entry targetLocal
-    readerTag readProj readRangeOff readRangeLen hloc hov
+    readerTag readProj readRangeOff readRangeLen hloc hov hd
 
 example (allBorrows : List BorrowEntry)
     (entry : BorrowEntry)
@@ -17057,7 +17175,8 @@ example (allBorrows : List BorrowEntry)
     (readRangeOff readRangeLen : Nat)
     (activeProtectors : List Nat)
     (hloc : entry.targetLocal = targetLocal)
-    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true) :
+    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true)
+    (hd : entry.targetFrameDepth = 0) :
     updateBorrowPermOnReadAtProj allBorrows entry targetLocal readerTag
         readProj readRangeOff readRangeLen activeProtectors =
       applyTreeBorrowTransition entry
@@ -17066,7 +17185,7 @@ example (allBorrows : List BorrowEntry)
           entry.perm
           (isBorrowProtected activeProtectors entry)) :=
   @updateBorrowPermOnReadAtProj_eq_nodeAccess allBorrows entry targetLocal readerTag
-    readProj readRangeOff readRangeLen activeProtectors hloc hov
+    readProj readRangeOff readRangeLen activeProtectors hloc hov hd
 
 example (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
@@ -17106,7 +17225,8 @@ example (allBorrows : List BorrowEntry)
     (hno_prot_ub :
       Bool.and (isBorrowProtected activeProtectors entry)
         (borrowEntryWriteConflicts entry
-          (resolveTreeBorrowWriterTag allBorrows entry writerTag)) = false) :
+          (resolveTreeBorrowWriterTag allBorrows entry writerTag)) = false)
+    (hd : entry.targetFrameDepth = 0) :
     updateBorrowPermTreeAtProj allBorrows entry targetLocal writerTag
         writeProj writeRangeOff writeRangeLen =
       applyTreeBorrowTransition entry
@@ -17115,7 +17235,7 @@ example (allBorrows : List BorrowEntry)
           entry.perm
           (isBorrowProtected activeProtectors entry)) :=
   @updateBorrowPermTreeAtProj_eq_nodeAccess allBorrows activeProtectors entry targetLocal
-    writerTag writeProj writeRangeOff writeRangeLen hloc hov hno_prot_ub
+    writerTag writeProj writeRangeOff writeRangeLen hloc hov hno_prot_ub hd
 
 example (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
@@ -17126,7 +17246,7 @@ example (allBorrows borrows : List BorrowEntry)
     hasProtectedTreeWriteConflict allBorrows borrows activeProtectors targetLocal
         writerTag writeProj writeRangeOff writeRangeLen = true ↔
       ∃ entry ∈ borrows,
-        Bool.and (Nat.beq entry.targetLocal targetLocal)
+        Bool.and (Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.beq entry.targetLocal targetLocal))
           (Bool.and (borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen)
             (Bool.and (isBorrowProtected activeProtectors entry)
               (treeBorrowTransitionIsUB
@@ -17649,7 +17769,8 @@ example (allBorrows borrows : List BorrowEntry)
     (hskip : treeBorrowAccessRelatedness allBorrows borrows[i] readerTag = .foreignAccess →
       borrows[i].perm ≠ .disabled)
     (hno_ub : hasTreeReadUB allBorrows borrows activeProtectors targetLocal readerTag
-      readProj readRangeOff readRangeLen = false) :
+      readProj readRangeOff readRangeLen = false)
+    (hd : borrows[i].targetFrameDepth = 0) :
     let borrows' := freezeTreeBorrowsOnReadAtProj allBorrows borrows targetLocal
       readerTag readProj readRangeOff readRangeLen activeProtectors
     let hi' : i < borrows'.length := by
@@ -17670,7 +17791,7 @@ example (allBorrows borrows : List BorrowEntry)
         .Read (annealRelatednessToMiri rel) isProt =
       .Success ⟨annealPermToMiri (borrows'[i]'hi').perm, true, .None⟩ transition) :=
   @freezeTreeBorrowsOnReadAtProj_locationState_simulation allBorrows borrows activeProtectors
-    targetLocal readerTag readProj readRangeOff readRangeLen i hi hloc hov hskip hno_ub
+    targetLocal readerTag readProj readRangeOff readRangeLen i hi hloc hov hskip hno_ub hd
 
 example (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
@@ -17690,7 +17811,8 @@ example (allBorrows borrows : List BorrowEntry)
         (treeBorrowNodeAccess .write
           (treeBorrowAccessRelatedness allBorrows borrows[i] writerTag)
           borrows[i].perm
-          (isBorrowProtected activeProtectors borrows[i])) = false) :
+          (isBorrowProtected activeProtectors borrows[i])) = false)
+    (hd : borrows[i].targetFrameDepth = 0) :
     let borrows' := invalidateTreeBorrowsAtProj allBorrows borrows targetLocal
       writerTag writeProj writeRangeOff writeRangeLen
     let hi' : i < borrows'.length := by
@@ -17709,7 +17831,7 @@ example (allBorrows borrows : List BorrowEntry)
         .Write (annealRelatednessToMiri rel) isProt =
       .Success ⟨annealPermToMiri (borrows'[i]'hi').perm, true, .None⟩ transition) :=
   @invalidateTreeBorrowsAtProj_locationState_simulation allBorrows borrows activeProtectors
-    targetLocal writerTag writeProj writeRangeOff writeRangeLen i hi hloc hov hskip hno_prot hnode_ub
+    targetLocal writerTag writeProj writeRangeOff writeRangeLen i hi hloc hov hskip hno_prot hnode_ub hd
 
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 private theorem pin_sim_lm3_3_retag_raw_scalar_step (rk : RetagKind) (mutability : Mutability) :
@@ -17725,31 +17847,33 @@ private theorem pin_sim_lm3_3_retag_raw_scalar_step (rk : RetagKind) (mutability
 
 open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
 example :
-    ∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ s₇ s₈ : MachineState,
       stepMirFn callerG initG = .step s₁ ∧
       s₁.memory.borrows = [entry 1 .reserved] ∧
       stepMirFn callerG s₁ = .step s₂ ∧
-      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
-      s₂.memory.activeProtectors = [1] ∧
+      s₂.memory.borrows = [entry 2 .frozen, entry 1 .reserved] ∧
       stepMirFn callerG s₂ = .step s₃ ∧
-      s₃.memory.borrows =
-        [entry 3 .frozen, entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
       stepMirFn callerG s₃ = .step s₄ ∧
-      s₄.memory.borrows =
-        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
-      s₄.memory.activeProtectors = [1] ∧
       stepMirFn callerG s₄ = .step s₅ ∧
-      s₅.memory.activeProtectors = [] ∧
       s₅.memory.borrows =
-        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
+        [entry 3 (.reservedFrz false) (some 1) (some 1), entry 2 .frozen, entry 1 .reserved] ∧
+      s₅.memory.activeProtectors = [1] ∧
       stepMirFn callerG s₅ = .step s₆ ∧
       s₆.memory.borrows =
-        [entry 3 .disabled, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
-      get? s₆.frame.locals 1 = some (.init (.scalar ⟨9, 8⟩)) ∧
-      ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Write
+        [entry 3 (.reservedFrz true) (some 1) (some 1), entry 2 .frozen, entry 1 .reserved] ∧
+      s₆.memory.activeProtectors = [1] ∧
+      stepMirFn callerG s₆ = .step s₇ ∧
+      s₇.memory.activeProtectors = [] ∧
+      s₇.memory.borrows =
+        [entry 3 (.reservedFrz true) (some 1) (some 1), entry 2 .frozen, entry 1 .reserved] ∧
+      stepMirFn callerG s₇ = .step s₈ ∧
+      s₈.memory.borrows =
+        [entry 3 .unique (some 1) (some 1), entry 2 .disabled, entry 1 .unique] ∧
+      get? s₈.frame.locals 1 = some (.init (.scalar ⟨9, 8⟩)) ∧
+      ((basedNormalTree s₇.memory.borrows []).performAccess 0 .Write
           .VisitChildrenOfAccessed).status = .Completed ∧
-      TreeBorrowsRel s₆.memory.borrows []
-        ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Write
+      TreeBorrowsRel s₈.memory.borrows []
+        ((basedNormalTree s₇.memory.borrows []).performAccess 0 .Write
           .VisitChildrenOfAccessed).tree :=
   @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_protector_release_on_return_real_steps
 
@@ -17829,7 +17953,8 @@ example (allBorrows : List BorrowEntry) (entry : BorrowEntry)
 example (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
     (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
     (hp₀ : b₀.parentTag = none) (hloc : b₀.targetLocal = targetLocal)
-    (hproj : b₀.targetProjection = .nil) :
+    (hproj : b₀.targetProjection = .nil)
+    (hd₀ : b₀.targetFrameDepth = 0) :
     let nres := (basedNormalTree [b₀] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [b₀] activeProtectors targetLocal start.val
@@ -17837,7 +17962,7 @@ example (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
       annealTableAccessUB kind [b₀] activeProtectors targetLocal start.val = false) ∧
     (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
   @basedNormalTree_performAccess_singleton_simulation kind b₀ activeProtectors
-    targetLocal start hp₀ hloc hproj
+    targetLocal start hp₀ hloc hproj hd₀
 
 example (kind : TreeBorrowAccessKind) (child parent : BorrowEntry)
     (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
@@ -17847,7 +17972,9 @@ example (kind : TreeBorrowAccessKind) (child parent : BorrowEntry)
     (hcloc : child.targetLocal = targetLocal)
     (hploc : parent.targetLocal = targetLocal)
     (hcproj : child.targetProjection = .nil)
-    (hpproj : parent.targetProjection = .nil) :
+    (hpproj : parent.targetProjection = .nil)
+    (hcd : child.targetFrameDepth = 0)
+    (hpd : parent.targetFrameDepth = 0) :
     let nres := (basedNormalTree [child, parent] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [child, parent] activeProtectors targetLocal
@@ -17856,7 +17983,7 @@ example (kind : TreeBorrowAccessKind) (child parent : BorrowEntry)
       annealTableAccessUB kind [child, parent] activeProtectors targetLocal start.val = false) ∧
     (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
   @basedNormalTree_performAccess_parent_child_simulation kind child parent activeProtectors
-    targetLocal start hneq hcpar hppar hcloc hploc hcproj hpproj
+    targetLocal start hneq hcpar hppar hcloc hploc hcproj hpproj hcd hpd
 
 example (kind : TreeBorrowAccessKind) (b₀ b₁ : BorrowEntry)
     (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 3)
@@ -17866,7 +17993,9 @@ example (kind : TreeBorrowAccessKind) (b₀ b₁ : BorrowEntry)
     (hloc₀ : b₀.targetLocal = targetLocal)
     (hloc₁ : b₁.targetLocal = targetLocal)
     (hproj₀ : b₀.targetProjection = .nil)
-    (hproj₁ : b₁.targetProjection = .nil) :
+    (hproj₁ : b₁.targetProjection = .nil)
+    (hd₀ : b₀.targetFrameDepth = 0)
+    (hd₁ : b₁.targetFrameDepth = 0) :
     let nres := (basedNormalTree [b₀, b₁] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [b₀, b₁] activeProtectors targetLocal start.val
@@ -17874,7 +18003,7 @@ example (kind : TreeBorrowAccessKind) (b₀ b₁ : BorrowEntry)
       annealTableAccessUB kind [b₀, b₁] activeProtectors targetLocal start.val = false) ∧
     (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
   @basedNormalTree_performAccess_siblings_simulation kind b₀ b₁ activeProtectors
-    targetLocal start hneq hp₀ hp₁ hloc₀ hloc₁ hproj₀ hproj₁
+    targetLocal start hneq hp₀ hp₁ hloc₀ hloc₁ hproj₀ hproj₁ hd₀ hd₁
 
 example (allBorrows rest : List BorrowEntry) (activeProtectors : List Nat)
     (targetLocal : Local) (readerTag : Option Nat)
@@ -17969,7 +18098,10 @@ example (kind : TreeBorrowAccessKind) (g c r : BorrowEntry)
     (hgprot : isBorrowProtected activeProtectors g = false)
     (hcprot : isBorrowProtected activeProtectors c = false)
     (hrprot : isBorrowProtected activeProtectors r = false)
-    (hinv : treeBorrowsChain3Inv g.perm c.perm r.perm = true) :
+    (hinv : treeBorrowsChain3Inv g.perm c.perm r.perm = true)
+    (hgd : g.targetFrameDepth = 0)
+    (hcd : c.targetFrameDepth = 0)
+    (hrd : r.targetFrameDepth = 0) :
     let nres := (basedNormalTree [g, c, r] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val
@@ -17978,7 +18110,7 @@ example (kind : TreeBorrowAccessKind) (g c r : BorrowEntry)
     (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
   @basedNormalTree_performAccess_three_level_chain_simulation kind g c r activeProtectors
     targetLocal start hneq_gc hneq_gr hneq_cr hgpar hcpar hrpar hgloc hcloc hrloc
-    hgproj hcproj hrproj hgprot hcprot hrprot hinv
+    hgproj hcproj hrproj hgprot hcprot hrprot hinv hgd hcd hrd
 
 example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
     (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 4)
@@ -17995,7 +18127,10 @@ example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
     (hc₀prot : isBorrowProtected activeProtectors c₀ = false)
     (hc₁prot : isBorrowProtected activeProtectors c₁ = false)
     (hpprot : isBorrowProtected activeProtectors p = false)
-    (hinv : treeBorrowsBranch3Inv c₀.perm c₁.perm p.perm = true) :
+    (hinv : treeBorrowsBranch3Inv c₀.perm c₁.perm p.perm = true)
+    (hd₀ : c₀.targetFrameDepth = 0)
+    (hd₁ : c₁.targetFrameDepth = 0)
+    (hdp : p.targetFrameDepth = 0) :
     let nres := (basedNormalTree [c₀, c₁, p] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val
@@ -18004,7 +18139,7 @@ example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
     (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
   @basedNormalTree_performAccess_branching_children_simulation kind c₀ c₁ p activeProtectors
     targetLocal start hneq₀₁ hneq₀p hneq₁p hc₀par hc₁par hppar hloc₀ hloc₁ hlocp
-    hproj₀ hproj₁ hprojp hc₀prot hc₁prot hpprot hinv
+    hproj₀ hproj₁ hprojp hc₀prot hc₁prot hpprot hinv hd₀ hd₁ hdp
 
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 example (rk : RetagKind) (mutability : Mutability) :
@@ -18391,7 +18526,10 @@ example (kind : TreeBorrowAccessKind) (g c r : BorrowEntry)
     (hgproj : g.targetProjection = .nil)
     (hcproj : c.targetProjection = .nil)
     (hrproj : r.targetProjection = .nil)
-    (hinv : borrowListChain3ProtInv [g, c, r] activeProtectors = true) :
+    (hinv : borrowListChain3ProtInv [g, c, r] activeProtectors = true)
+    (hgd : g.targetFrameDepth = 0)
+    (hcd : c.targetFrameDepth = 0)
+    (hrd : r.targetFrameDepth = 0) :
     let nres := (basedNormalTree [g, c, r] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val
@@ -18402,7 +18540,7 @@ example (kind : TreeBorrowAccessKind) (g c r : BorrowEntry)
       borrowListChain3ProtInv borrows' activeProtectors = true) :=
   @basedNormalTree_performAccess_three_level_chain_prot_simulation
     kind g c r activeProtectors targetLocal start hneq_gc hneq_gr hneq_cr
-    hgpar hcpar hrpar hgloc hcloc hrloc hgproj hcproj hrproj hinv
+    hgpar hcpar hrpar hgloc hcloc hrloc hgproj hcproj hrproj hinv hgd hcd hrd
 
 open LeanMiriSpec.Correspondence in
 example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
@@ -18417,7 +18555,10 @@ example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
     (hproj₀ : c₀.targetProjection = .nil)
     (hproj₁ : c₁.targetProjection = .nil)
     (hprojp : p.targetProjection = .nil)
-    (hinv : borrowListBranch3ProtInv [c₀, c₁, p] activeProtectors = true) :
+    (hinv : borrowListBranch3ProtInv [c₀, c₁, p] activeProtectors = true)
+    (hd₀ : c₀.targetFrameDepth = 0)
+    (hd₁ : c₁.targetFrameDepth = 0)
+    (hdp : p.targetFrameDepth = 0) :
     let nres := (basedNormalTree [c₀, c₁, p] activeProtectors).performAccess start.val
       (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
     let borrows' := annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val
@@ -18428,7 +18569,7 @@ example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
       borrowListBranch3ProtInv borrows' activeProtectors = true) :=
   @basedNormalTree_performAccess_branching_children_prot_simulation
     kind c₀ c₁ p activeProtectors targetLocal start hneq₀₁ hneq₀p hneq₁p
-    hc₀par hc₁par hppar hloc₀ hloc₁ hlocp hproj₀ hproj₁ hprojp hinv
+    hc₀par hc₁par hppar hloc₀ hloc₁ hlocp hproj₀ hproj₁ hprojp hinv hd₀ hd₁ hdp
 
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 example (rk : RetagKind) (mutability : Mutability) (pointee : RigidTy)
@@ -19452,7 +19593,8 @@ example :
       Miri.Interpreter.Step.step hooks () m₇ = (m₈, .ok true) ∧
       StateRelLM3_2Tree b s₈ m₈ finalTree ∧
       (∃ tm, StepObsRelLM3_2Tree b m₈ tm (stepMirFn b s₈) (Miri.Interpreter.Step.step hooks () m₈)) ∧
-      stepMirFn b s₈ = .retNormal (.ptr { allocId := 3, offsetBytes := 0 } 8) s₈.memory ∧
+      stepMirFn b s₈ = .retNormal (.ptr { allocId := 3, offsetBytes := 0 } 8)
+        { s₈.memory with borrows := disableFrameBorrows s₈.memory.borrows 0 b.localDecls.length } ∧
       Miri.Interpreter.Step.step hooks () m₈ = ({ m₈ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₈ = (m₈, .ok (.immediate imm0)) ∧
@@ -20862,7 +21004,7 @@ open LeanMiriSpec.Correspondence in
   SimLM3_3.storageDeadBody
   SimLM3_3.storageLiveBody
   SimLM3_3.sim_lm3_3_storage_dead_and_live_protector_step
-  SimLM3_3.sim_lm3_3_storage_dead_protected_cell_divergence
+  SimLM3_3.sim_lm3_3_storage_dead_protected_cell_simulation
   WitnessLM3_3.bodyOProtectedStorageDead
   WitnessLM3_3.bodyOUnprotectedStorageDead
   WitnessLM3_3.initO
@@ -21332,8 +21474,9 @@ example
 
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 example (perm : TreeBorrowPerm) :
-    stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
-    stepMirFn storageLiveBody (childState perm true) = .fail .ub ∧
+    (preventsDeallocation perm = true →
+      stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
+      stepMirFn storageLiveBody (childState perm true) = .fail .ub) ∧
     (perm ≠ .cell →
       ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
@@ -21341,11 +21484,11 @@ example (perm : TreeBorrowPerm) :
     (∃ s_dead s_live : MachineState,
       stepMirFn storageDeadBody (childState perm false) = .step s_dead ∧
       get? s_dead.frame.locals 1 = some .dead ∧
-      s_dead.memory.borrows = [entry 1 .disabled] ∧
+      s_dead.memory.borrows = [{ (entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
       stepMirFn storageLiveBody (childState perm false) = .step s_live ∧
       get? s_live.frame.locals 1 = some .uninit ∧
-      s_live.memory.borrows = [entry 1 .disabled] ∧
+      s_live.memory.borrows = [{ (entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s_live.memory.borrows [] (basedNormalTree s_live.memory.borrows [])) ∧
     ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
       Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
@@ -21354,12 +21497,15 @@ example (perm : TreeBorrowPerm) :
 
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 example :
-    stepMirFn storageDeadBody (childState .cell true) = .fail .ub ∧
-    stepMirFn storageLiveBody (childState .cell true) = .fail .ub ∧
+    (∃ s_dead s_live : MachineState,
+      stepMirFn storageDeadBody (childState .cell true) = .step s_dead ∧
+      get? s_dead.frame.locals 1 = some .dead ∧
+      stepMirFn storageLiveBody (childState .cell true) = .step s_live ∧
+      get? s_live.frame.locals 1 = some .uninit) ∧
     ((hooksTwoNodeTree .cell).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
       Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
       (hooksForChildProtected true).protectedTags).status = .Deallocated :=
-  sim_lm3_3_storage_dead_protected_cell_divergence
+  sim_lm3_3_storage_dead_protected_cell_simulation
 
 open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
 example :
@@ -21381,7 +21527,7 @@ example :
       s₂.memory.borrows = [entry 1 .unique] ∧
       stepMirFn bodyOUnprotectedStorageDead s₂ = .step s₃ ∧
       get? s₃.frame.locals 1 = some .dead ∧
-      s₃.memory.borrows = [entry 1 .disabled] ∧
+      s₃.memory.borrows = [{ (entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s₃.memory.borrows [] (basedNormalTree s₃.memory.borrows []) ∧
       stepMirFn bodyOUnprotectedStorageDead s₃ = .fail .ub ∧
       ((basedNormalTree s₃.memory.borrows []).performAccess 0 .Read
@@ -22958,7 +23104,7 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
       s.memory.traitImpls = none) :
     evalTerminator s term (some body) =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         MirStepNode.extCall
           { defPath := defPath, typeArgs := typeArgs, args := vs, memory := s.memory }
@@ -22984,7 +23130,7 @@ example {body : CapturedMir} {s : MachineState}
       s.memory.traitImpls = none) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         MirStepNode.extCall
           { defPath := k.defPath, typeArgs := [argKind], args := vs, memory := s.memory }
@@ -23012,7 +23158,7 @@ example {body : CapturedMir} {s : MachineState}
       s.memory.traitImpls = none) :
     stepMirFn body s =
       match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals with
+          s.memory.callerLocals [] s.memory.callStack with
       | .ok vs locals' =>
         MirStepNode.extCall
           { defPath := defPath, typeArgs := [argKind], args := vs, memory := s.memory }
@@ -24963,7 +25109,8 @@ example {rootBody : CapturedMir} {H : AnnealMiriHooks} {k : Nat}
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example (perm : TreeBorrowPerm) :
-    (MirReachesUB (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true)) ∧
+    (preventsDeallocation perm = true →
+      MirReachesUB (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true)) ∧
       ¬ TreeSafe (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true))) ∧
     (perm ≠ .cell →
       ((hooksTwoNodeTree perm).deallocateBorrowRange
@@ -24973,14 +25120,16 @@ example (perm : TreeBorrowPerm) :
           Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) ∧
     (∃ s_dead : MachineState,
       stepMirFn SimLM3_3.storageDeadBody (SimLM3_3.childState perm false) = .step s_dead ∧
-      s_dead.memory.borrows = [SimLM3_3.entry 1 .disabled] ∧
+      s_dead.memory.borrows = [{ (SimLM3_3.entry 1 .disabled) with allocDead := true }] ∧
       TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
       ((hooksTwoNodeTree perm).deallocateBorrowRange
         (.concrete (hooksAccessTag .foreignAccess))
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
         (hooksForChildProtected false).protectedTags).status =
           Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) ∧
-    (((hooksTwoNodeTree .cell).deallocateBorrowRange
+    ((∃ s_cell : MachineState,
+      stepMirFn SimLM3_3.storageDeadBody (SimLM3_3.childState .cell true) = .step s_cell) ∧
+     ((hooksTwoNodeTree .cell).deallocateBorrowRange
         (.concrete (hooksAccessTag .foreignAccess))
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
         (hooksForChildProtected true).protectedTags).status =

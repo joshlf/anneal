@@ -1787,7 +1787,7 @@ theorem validityVisitor_ref_dereferenceable_simulation
       rw [hslot_r]
       dsimp only []
       rw [hlook]
-      dsimp only [AllocMapEntry.toBorrowEntry]
+      dsimp only [AllocMapEntry.toBorrowEntry, activeFrameSlot?]
       cases e.perm <;> (dsimp only []; try rw [hdead])
 
 /-- Reading a dead local through `annealValidityPlaceOperand` raises undefined
@@ -4488,6 +4488,8 @@ structure ReborrowMapEntry where
   perm : TreeBorrowPerm
   /-- Optional parent tag in the reborrow tree (`BorrowEntry.parentTag`). -/
   parentTag : Option Nat := none
+  /-- Whether the backing stack allocation has been deallocated (`BorrowEntry.allocDead`). -/
+  allocDead : Bool := false
 
 namespace ReborrowMapEntry
 
@@ -4497,7 +4499,8 @@ def toAllocMapEntry (e : ReborrowMapEntry) : AllocMapEntry :=
   { tag := e.tag
     localIdx := e.localIdx
     allocId := e.allocId
-    perm := e.perm }
+    perm := e.perm
+    allocDead := e.allocDead }
 
 /-- Embed a root `AllocMapEntry` into `ReborrowMapEntry` (`parentTag := none`). -/
 def ofRoot (e : AllocMapEntry) : ReborrowMapEntry :=
@@ -4505,7 +4508,8 @@ def ofRoot (e : AllocMapEntry) : ReborrowMapEntry :=
     localIdx := e.localIdx
     allocId := e.allocId
     perm := e.perm
-    parentTag := none }
+    parentTag := none
+    allocDead := e.allocDead }
 
 /-- Project a `ReborrowMapEntry` to the exact `MirSemantics.BorrowEntry` stored
 in `s.memory.borrows` (retaining `parentTag`). -/
@@ -4514,7 +4518,8 @@ def toBorrowEntry (e : ReborrowMapEntry) : BorrowEntry :=
     targetLocal := e.localIdx
     targetProjection := .nil
     perm := e.perm
-    parentTag := e.parentTag }
+    parentTag := e.parentTag
+    allocDead := match e.perm with | .disabled => e.allocDead | _ => false }
 
 @[simp]
 theorem toAllocMapEntry_ofRoot (e : AllocMapEntry) :
@@ -4547,8 +4552,11 @@ theorem map_toBorrowEntry_of_noParents :
     have he0 : e.parentTag = none := hnop e (List.mem_cons_self ..)
     have hes : ∀ x ∈ es, x.parentTag = none :=
       fun x hx => hnop x (List.mem_cons_of_mem _ hx)
+    rcases e with ⟨tag, localIdx, allocId, perm, parentTag, allocDead⟩
+    dsimp only at he0; subst he0
     simp only [List.map_cons, toAllocMapEntry, AllocMapEntry.toBorrowEntry,
-      toBorrowEntry, he0, map_toBorrowEntry_of_noParents hes]
+      toBorrowEntry, map_toBorrowEntry_of_noParents hes]
+    cases perm <;> rfl
 
 end ReborrowMapEntry
 
@@ -4748,7 +4756,7 @@ theorem ReborrowMapEntry.updateOnRead_toBorrowEntry (allBorrows : List BorrowEnt
     (x.updateOnRead allBorrows targetLocal rTag).toBorrowEntry =
       updateBorrowPermOnReadAtProj allBorrows x.toBorrowEntry targetLocal
         (some rTag) .nil 0 0 := by
-  rcases x with ⟨tag, loc, aid, perm, ptag⟩
+  rcases x with ⟨tag, loc, aid, perm, ptag, allocDead⟩
   unfold ReborrowMapEntry.updateOnRead updateBorrowPermOnReadAtProj
     borrowEntryOverlapsWrite projectionsOverlap stripTransparentProjections
     projectionsOverlapAux
@@ -4844,7 +4852,8 @@ def ReborrowMapEntry.updateOnWrite (allBorrows : List BorrowEntry)
       match x.perm with
       | .cell => x
       | .reservedIM => x
-      | _ => { x with perm := .disabled }
+      | .disabled => x
+      | _ => { x with perm := .disabled, allocDead := false }
 
 @[simp]
 theorem ReborrowMapEntry.updateOnWrite_tag (allBorrows : List BorrowEntry)
@@ -4883,7 +4892,7 @@ theorem ReborrowMapEntry.updateOnWrite_toBorrowEntry_tree
     (x.updateOnWrite allBorrows targetLocal wTag).toBorrowEntry =
       updateBorrowPermTreeAtProj allBorrows x.toBorrowEntry targetLocal
         (some wTag) .nil 0 0 := by
-  rcases x with ⟨tag, loc, aid, perm, ptag⟩
+  rcases x with ⟨tag, loc, aid, perm, ptag, allocDead⟩
   unfold ReborrowMapEntry.updateOnWrite updateBorrowPermTreeAtProj
     resolveTreeBorrowWriterTag updateBorrowPermAtProj
     borrowEntryOverlapsWrite projectionsOverlap stripTransparentProjections
@@ -4900,16 +4909,16 @@ theorem ReborrowMapEntry.updateOnWrite_toBorrowEntry_tree
           subst heq
           rw [isBorrowDescendantOrSelf_self] at hdesc
           cases hdesc
-      have hrel : treeBorrowWriterRelatedness
+      have hrel : ∀ ad, treeBorrowWriterRelatedness
           { tag := tag, targetLocal := loc, targetProjection := .nil, perm := perm,
-            parentTag := ptag } (some wTag) = .foreignAccess := by
-        simp only [treeBorrowWriterRelatedness, hne]
+            parentTag := ptag, allocDead := ad } (some wTag) = .foreignAccess := by
+        intro ad; simp only [treeBorrowWriterRelatedness, hne]
       rw [hrel]
       rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;> rfl
-    · have hrel : treeBorrowWriterRelatedness
+    · have hrel : ∀ ad, treeBorrowWriterRelatedness
           { tag := tag, targetLocal := loc, targetProjection := .nil, perm := perm,
-            parentTag := ptag } (some tag) = .localAccess := by
-        simp only [treeBorrowWriterRelatedness, Nat.beq_refl]
+            parentTag := ptag, allocDead := ad } (some tag) = .localAccess := by
+        intro ad; simp only [treeBorrowWriterRelatedness, Nat.beq_refl]
       rw [hrel]
       rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;> rfl
 
@@ -4970,15 +4979,15 @@ theorem invalidateDerefWriteBorrows_map_toBorrowEntry_tree
     cases rest with
     | nil =>
       rcases List.mem_singleton.mp he with rfl
-      rcases e with ⟨tag, loc, aid, perm, ptag⟩
+      rcases e with ⟨tag, loc, aid, perm, ptag, allocDead⟩
       dsimp only at htag
       subst htag
       simp only [invalidateDerefWriteBorrows, hget, List.map_cons, List.map_nil] at hlook_bor ⊢
       rw [hlook_bor]
-      have hrel : treeBorrowWriterRelatedness
+      have hrel : ∀ ad, treeBorrowWriterRelatedness
           { tag := ptrVal.tag, targetLocal := loc, targetProjection := .nil, perm := perm,
-            parentTag := ptag } (some ptrVal.tag) = .localAccess := by
-        simp only [treeBorrowWriterRelatedness, Nat.beq_refl]
+            parentTag := ptag, allocDead := ad } (some ptrVal.tag) = .localAccess := by
+        intro ad; simp only [treeBorrowWriterRelatedness, Nat.beq_refl]
       dsimp only [ReborrowMapEntry.toBorrowEntry, appendProjections,
         invalidateConflictingBorrows, updateBorrowPerm, ReborrowMapEntry.updateOnWrite]
       simp only [Nat.beq_refl, isBorrowDescendantOrSelf_self, hrel]

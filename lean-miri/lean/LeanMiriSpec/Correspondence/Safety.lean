@@ -263,8 +263,7 @@ concrete real-step instances in the `Wit*` modules:
 * `LM-2.2` (`step_assign_self_copy_memory_struct_divergence`): a memory-backed
   struct self-copy `_1 = copy _1` steps in Anneal and is an overlapping-copy
   undefined behavior in `lean-miri`.
-* `LM-2.3`: `SetDiscriminant` on an uninitialized enum
-  (`step_setDiscriminant_uninit_divergence`), `Downcast` field reads and
+* `LM-2.3`: `Downcast` field reads and
   writes of an inactive or uninitialized variant
   (`evalProjection_downcast_field_initialized_divergence`,
   `step_downcast_field_write_inactive_divergence`,
@@ -281,13 +280,12 @@ concrete real-step instances in the `Wit*` modules:
   `step_union_copy_indirect_uninit_divergence`,
   `step_union_aggregate_smaller_overwrite_divergence`).
 * `LM-3.1`: exposed-provenance casts, cross-local relational ordering, `≥ 64` KiB
-  page-wrapping offsets, `≥ 2 ^ 32` scalar-pointer thresholds, and `Offset` on
-  disabled live tags (`step_cast_with_exposed_provenance_divergence`,
+  page-wrapping offsets, and `≥ 2 ^ 32` scalar-pointer thresholds
+  (`step_cast_with_exposed_provenance_divergence`,
   `step_rawPtr_cmp_ptr_divergence`,
   `wit_lm3_1_d12_cross_local_order_divergence_real_steps`,
   `wit_lm3_1_d12_page_wrap_eq_divergence_real_steps`,
-  `wit_lm3_1_d12_scalar_threshold_divergence_real_steps`,
-  `step_binOp_offset_disabled_stride_divergence`).
+  `wit_lm3_1_d12_scalar_threshold_divergence_real_steps`).
 * `LM-3.2` / `LM-3.3`: reborrows of integer-valued raw pointers
   (`evalRvalue_reborrow_rawPtr_int_divergence`), dangling-reference copies
   validated eagerly by `lean-miri`
@@ -3074,7 +3072,7 @@ theorem switchInt_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, ha_op]
+      rw [hbor, hcaller, hstack, ha_op]
     have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
         (translateOperand discr) m = (m', .error (.undefinedBehavior msg)) := by
       rw [hdisc_eq]; unfold Miri.Interpreter.runRvalue; rw [hm_op]
@@ -3121,7 +3119,7 @@ theorem switchInt_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, ha_op]
+      rw [hbor, hcaller, hstack, ha_op]
     have hM := miri_step_terminator_eq hframes hframe.body_eq hframe.location_eq hbb hstmt_none
       (m' := { m with stack := ⟨#[{ topFrame' with
         location := .mir ⟨lookupSwitchTarget sc.bits targets.branches targets.otherwise, 0⟩ }]⟩ })
@@ -3328,7 +3326,7 @@ theorem assert_unreachable_step_cases
         unfold evalTerminator
         rw [hterm]
         dsimp only
-        rw [hbor, hcaller, h_a]
+        rw [hbor, hcaller, hstack, h_a]
         dsimp only
         split
         · rfl
@@ -3353,7 +3351,7 @@ theorem assert_unreachable_step_cases
         unfold evalTerminator
         rw [hterm]
         dsimp only
-        rw [hbor, hcaller, h_a]
+        rw [hbor, hcaller, hstack, h_a]
         dsimp only
         split
         · next h_contra =>
@@ -3372,7 +3370,7 @@ theorem assert_unreachable_step_cases
       unfold evalTerminator
       rw [hterm]
       dsimp only
-      rw [hbor, hcaller, h_a]
+      rw [hbor, hcaller, hstack, h_a]
     exact Or.inl ⟨m', msg, hA.trans hA', hM'⟩
 
 /-- **(b)** `Assert cond expected target unreachable` step simulation on a
@@ -3648,7 +3646,7 @@ theorem step_assign_lm1_2_simulation_ext
       have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
         unfold evalStmt; rw [hkind]; dsimp only
         unfold evalRvalue; dsimp only
-        cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, ha_lhs])
+        cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, hstack, ha_lhs])
       have hm_err : Miri.Interpreter.Step.evalStatement
           (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
           (m', .error (.undefinedBehavior msg)) := by
@@ -3671,7 +3669,7 @@ theorem step_assign_lm1_2_simulation_ext
         have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; rw [hkind]; dsimp only
           unfold evalRvalue; dsimp only
-          cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, ha_lhs]; dsimp only; rw [ha_rhs])
+          cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hbor, hcaller, hstack, ha_lhs]; dsimp only; rw [ha_rhs])
         have hm_err : Miri.Interpreter.Step.evalStatement
             (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
             (m'', .error (.undefinedBehavior msg)) := by
@@ -3712,7 +3710,7 @@ theorem step_assign_lm1_2_simulation_ext
             unfold evalRvalue; dsimp only
             cases bop <;> first | exact absurd rfl hbop_ne | (
               dsimp only
-              rw [hbor, hcaller, ha_lhs]
+              rw [hbor, hcaller, hstack, ha_lhs]
               dsimp only
               rw [ha_rhs]
               dsimp only
@@ -3743,7 +3741,7 @@ theorem step_assign_lm1_2_simulation_ext
               unfold evalRvalue; dsimp only
               cases bop <;> first | exact absurd rfl hbop_ne | (
                 dsimp only
-                rw [hbor, hcaller, ha_lhs]
+                rw [hbor, hcaller, hstack, ha_lhs]
                 dsimp only
                 rw [ha_rhs]
                 dsimp only
@@ -3832,7 +3830,7 @@ theorem step_assign_lm1_2_simulation_ext
     have ha_ub : aOp = .ub → evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
       intro hub
       unfold evalStmt; rw [hkind]
-      simp [evalRvalue, hbor, hcaller, ha_op, hub]
+      simp [evalRvalue, hbor, hcaller, hstack, ha_op, hub]
     cases hop_sim with
     | ub m' msg =>
       have hm_err : Miri.Interpreter.Step.evalStatement
@@ -3862,8 +3860,8 @@ theorem step_assign_lm1_2_simulation_ext
       obtain ⟨sc, msc, rfl, rfl, hrel, hsz, hbool, _⟩ := himmRel.of_primitive_scalar hprim
       obtain ⟨_, hsz_src⟩ := sizeBytes_eq_of_translateTy hsrc hrel.validBytes hsz
       have hop_a : evalOperand s.frame.locals op s.memory.borrows s.memory.globals body.layouts
-          s.memory.callerLocals body.localDecls = .ok (.scalar sc) locals₁ := by
-        rw [hbor, hcaller]; exact ha_op
+          s.memory.callerLocals body.localDecls s.memory.callStack = .ok (.scalar sc) locals₁ := by
+        rw [hbor, hcaller, hstack]; exact ha_op
       obtain ⟨msc', hrv_ok, _, hcast, hrel'⟩ :=
         evalCast_intToInt_simulation hrel destPlace hop_a hopTy hsrc hdst hsz_src
           (fun h => (hbool h).2) rfl
@@ -4090,12 +4088,16 @@ theorem step_assign_move_preserves_immediate
           by_cases hk : srcDecl.ty.kind = .bool
           · obtain ⟨sc, _, rfl, _, _, _, hbool, _⟩ := himmRel.of_primitive_scalar (Or.inl hk)
             rcases (hbool hk).2 with hb | hb <;> simp [hk, hb]
-          · cases h : srcDecl.ty.kind <;> simp_all
+          · by_cases hkc : srcDecl.ty.kind = .char
+            · obtain ⟨sc, _, rfl, _, _, _, _, hchar⟩ := himmRel.of_primitive_scalar (Or.inr (Or.inl hkc))
+              obtain ⟨hsz, hv⟩ := hchar hkc
+              simp [hkc, hsz, hv]
+            · cases h : srcDecl.ty.kind <;> simp_all
         have huse : evalRvalue s.frame.locals (.use (.move ⟨srcIdx, .nil⟩)) s.memory
             body.localDecls body.layouts = .ok v (s.frame.locals.set srcIdx .uninit) s.memory := by
           unfold evalRvalue
           dsimp only
-          rw [hbor, hcaller]
+          rw [hbor, hcaller, hstack]
           have hop_ok : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
               s.memory.globals body.layouts .nil body.localDecls =
               .ok v (s.frame.locals.set srcIdx .uninit) := by
@@ -4397,7 +4399,7 @@ theorem ValidFrameLocation.preservedExt
     (hstep : stepMirFn body s = .emitStep obs s') :
     ValidFrameLocation body s'.frame := by
   have hstate' := hstate
-  rcases hstate' with ⟨_, _, _, _, _, hcal, hstack, _, _, _, _⟩
+  rcases hstate' with ⟨_, _, _, _, _, hcal, hstack, hbor, hprot, _, _⟩
   obtain ⟨bb, hbb, hle⟩ := hloc
   have hbb_mem : bb ∈ body.basicBlocks := by
     rw [get?_eq_getElem?] at hbb
@@ -4432,8 +4434,8 @@ theorem ValidFrameLocation.preservedExt
       exact ⟨targetBb, htbb, Nat.zero_le _⟩
     | return_ _ hret _ _ _ =>
       unfold evalTerminator at hstep
-      rw [hret, hstack] at hstep
-      dsimp only at hstep
+      rw [hret, hstack, hbor, hprot] at hstep
+      dsimp only [hasFrameDeallocProtectorConflict, disableFrameBorrows] at hstep
       revert hstep
       cases get? s.frame.locals 0 with
       | none => exact fun hstep => absurd hstep fail_ne_emitStep
@@ -4513,7 +4515,7 @@ theorem NonAddrTakenImmediate.preservedExt
         hlen_eq hbb_wt.not_cleanup
         (Or.inr (Or.inl ⟨hret, decl0, hdecl0, hsz0,
           fun tf hframes => himm tf hframes 0 decl0 hdecl0 hna0⟩))
-      rcases hstate with ⟨_, _, _, _, _, hcal, hstack, _, _, _⟩
+      rcases hstate with ⟨_, _, _, _, _, hcal, hstack, hbor, hprot, _⟩
       generalize ha_eq : stepMirFn body s = aRes at hsim
       generalize Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         mRes at hsim htf' hm_ok
@@ -4529,8 +4531,8 @@ theorem NonAddrTakenImmediate.preservedExt
           simp [hlen_eq]
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte] at ha_eq
         unfold evalTerminator at ha_eq
-        rw [hret, hstack] at ha_eq
-        dsimp only at ha_eq
+        rw [hret, hstack, hbor, hprot] at ha_eq
+        dsimp only [hasFrameDeallocProtectorConflict, disableFrameBorrows] at ha_eq
         revert ha_eq
         cases get? s.frame.locals 0 with
         | none => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
@@ -5173,6 +5175,14 @@ theorem step_terminator_return_lm2_4_simulation
   unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
   rw [hret, hstack, hctrl_eq, hslot0]
   dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  have hconf0 :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length ([] : List SavedCallerFrame)) (length s.frame.locals) = false := by
+    rw [hbor, hprot]; rfl
+  have hdis0 :
+      disableFrameBorrows s.memory.borrows (length ([] : List SavedCallerFrame))
+        (length s.frame.locals) = s.memory.borrows := by
+    rw [hbor]; rfl
   cases hloc0 with
   | dead _ _ =>
     rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
@@ -5185,7 +5195,8 @@ theorem step_terminator_return_lm2_4_simulation
     · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
         hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
       exact StepRel.ub _ _
-    · cases himmRel with
+    · rw [hconf0]; dsimp only []; rw [hdis0]
+      cases himmRel with
       | unit hzero => exact False.elim (hsz0 hzero)
       | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
         have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
@@ -5310,6 +5321,14 @@ theorem step_terminator_return_union_lm2_4_simulation
   unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
   rw [hret, hstack, hctrl_eq, hslot0]
   dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  have hconf0 :
+      hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length ([] : List SavedCallerFrame)) (length s.frame.locals) = false := by
+    rw [hbor, hprot]; rfl
+  have hdis0 :
+      disableFrameBorrows s.memory.borrows (length ([] : List SavedCallerFrame))
+        (length s.frame.locals) = s.memory.borrows := by
+    rw [hbor]; rfl
   cases huloc0 with
   | base _ _ hloc0 =>
     cases hloc0 with
@@ -5322,7 +5341,8 @@ theorem step_terminator_return_union_lm2_4_simulation
       · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
         exact .ub _ _
-      · cases himmRel with
+      · rw [hconf0]; dsimp only []; rw [hdis0]
+        cases himmRel with
         | unit hzero => exact False.elim (hsz0 hzero)
         | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
           have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
@@ -5348,6 +5368,7 @@ theorem step_terminator_return_union_lm2_4_simulation
       | uninit =>
         exact False.elim (hnot_uninit_ind ⟨hslot0, topFrame, mp0, c0, hframes, hmls0⟩)
       | init retVal =>
+        rw [hconf0]; dsimp only []; rw [hdis0]
         have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
         rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup hretCont hop0
@@ -5358,6 +5379,7 @@ theorem step_terminator_return_union_lm2_4_simulation
           (.base _ _ (.indirect (.init retVal) mp0 none (fun _ h => nomatch h)
             (fun h => nomatch h) hmem)) rfl
   | union S n f f0Ty sc mp0 _ _ hwt hfields hf hmem =>
+    rw [hconf0]; dsimp only []; rw [hdis0]
     have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
     rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
       hframe.location_eq hbb hcleanup hretCont hop0
@@ -5367,6 +5389,7 @@ theorem step_terminator_return_union_lm2_4_simulation
     exact .retRootUnion decl0 _ mp0 s.memory _ hdecl0 hop0
       (.union S n f f0Ty sc mp0 none (fun _ h => nomatch h) hwt hfields hf hmem) rfl
   | unionOverlay S n j f0Ty sc sc_low mergedBytes mp0 _ _ hwt hfields hspec hmem =>
+    rw [hconf0]; dsimp only []; rw [hdis0]
     have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
     rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
       hframe.location_eq hbb hcleanup hretCont hop0
