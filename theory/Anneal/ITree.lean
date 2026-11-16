@@ -1476,15 +1476,6 @@ def retApprox {E : Effect.{u}} {R : Type u} (r : R) : (n : Nat) → CofixA E R n
   | 0 => .zero
   | _ + 1 => .ret r
 
-/-- Project a depth-`(n + 1)` approximant down to depth `n`. -/
-@[reducible]
-def trunc {E : Effect.{u}} {R : Type u} :
-    {n : Nat} → CofixA E R (n + 1) → CofixA E R n
-  | 0, _ => .zero
-  | _ + 1, .ret r => .ret r
-  | _ + 1, .tau t => .tau (trunc t)
-  | _ + 1, .vis i k => .vis i (fun o => trunc (k o))
-
 /-- Fold one `ITreeF` layer of depth-`n` children into `CofixA E R (n + 1)`. -/
 @[reducible]
 def ofStep {E : Effect.{u}} {R : Type u} {n : Nat} :
@@ -1522,6 +1513,23 @@ def approxStep {E : Effect.{u}} {R : Type u} {n : Nat}
     (fun r => .ret r)
     (fun t' => .tau t')
     (fun i k => .vis i k)
+
+namespace CofixA
+
+/-- Project a depth-`(n + 1)` approximant down to depth `n` (defined via
+`approxStep` and `ITreeF.casesOn` so no `Eq.ndrec` or `Nat.noConfusion` index
+unification is generated). -/
+@[reducible]
+def trunc {E : Effect.{u}} {R : Type u} :
+    {n : Nat} → CofixA E R (n + 1) → CofixA E R n
+  | 0, _ => .zero
+  | _ + 1, t =>
+    match approxStep t with
+    | .ret r => .ret r
+    | .tau t' => .tau (trunc t')
+    | .vis i k => .vis i (fun o => trunc (k o))
+
+end CofixA
 
 @[simp]
 theorem approxStep_ofStep {E : Effect.{u}} {R : Type u} {n : Nat}
@@ -2493,6 +2501,43 @@ theorem evalTauApprox_ofITree_mono {E : Effect.{u}} {R : Type u}
   induction hnm with
   | refl => exact h
   | step _ ih => exact evalTauApprox_ofITree_succ ih
+
+/-- Completeness of `checkTauRetApprox` with respect to `evalTauApprox`. -/
+theorem checkTauRetApprox_complete {E : Effect.{u}} {R : Type u}
+    {n : Nat} {a : CofixA E R n} {r : R} {p : R → Bool}
+    (h : evalTauApprox a = some r) (hp : p r = true) :
+    checkTauRetApprox a p = true := by
+  unfold checkTauRetApprox
+  rw [h]
+  exact hp
+
+/-- Exact finite-horizon adequacy of `checkTauRetApprox`: `t` silently reaches `.ret r`
+with `p r = true` iff some finite depth `n` is accepted by `checkTauRetApprox`. -/
+theorem checkTauRetApprox_ofITree_iff {E : Effect.{u}} {R : Type u}
+    (t : ITree E R) (p : R → Bool) :
+    (∃ n, checkTauRetApprox (ofITree n t) p = true) ↔
+      ∃ r, p r = true ∧ ∃ u, TauStar t u ∧ u.observe = .ret r := by
+  refine ⟨fun ⟨n, h⟩ => ?_, fun ⟨r, hp, u, hs, hu⟩ => ?_⟩
+  · unfold checkTauRetApprox at h
+    cases hev : evalTauApprox (ofITree n t) with
+    | none => rw [hev] at h; nomatch h
+    | some r =>
+      rw [hev] at h
+      exact ⟨r, h, evalTauApprox_sound_tauStar hev⟩
+  · rcases tauStar_ret_exists_evalTauApprox hs hu with ⟨n, hn⟩
+    exact ⟨n, checkTauRetApprox_complete hn hp⟩
+
+/-- Fuel monotonicity of `checkTauRetApprox` along `ofITree`. -/
+theorem checkTauRetApprox_ofITree_mono {E : Effect.{u}} {R : Type u}
+    {n m : Nat} {t : ITree E R} {p : R → Bool}
+    (h : checkTauRetApprox (ofITree n t) p = true) (hnm : n ≤ m) :
+    checkTauRetApprox (ofITree m t) p = true := by
+  unfold checkTauRetApprox at h
+  cases hev : evalTauApprox (ofITree n t) with
+  | none => rw [hev] at h; nomatch h
+  | some r =>
+    rw [hev] at h
+    exact checkTauRetApprox_complete (evalTauApprox_ofITree_mono hev hnm) h
 
 /-- Completeness of the boolean checker `checkTraceApprox` with respect to
 `ReachesRetApprox`: every finite-depth witness whose return value satisfies `p`

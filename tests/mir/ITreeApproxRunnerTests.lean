@@ -59,7 +59,7 @@ guard below is set at most about 1.5x the measured figure.
 
 /-! ## 1. Axiom-Hygiene Guards (`#print axioms`) -/
 
-/-- info: 'Anneal.ITree.trunc_ofITree' depends on axioms: [propext, Quot.sound] -/
+/-- info: 'Anneal.ITree.trunc_ofITree' depends on axioms: [Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms trunc_ofITree
 
@@ -375,25 +375,93 @@ guard below is set at most about 1.5x the measured figure.
 #guard_msgs (whitespace := lax) in
 #print axioms checkRawByteTraceWithCalleesObsErasedApprox_sound
 
+/-- info: 'Anneal.ITree.checkTauRetApprox_complete' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTauRetApprox_complete
+
+/-- info: 'Anneal.ITree.checkTauRetApprox_ofITree_iff' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTauRetApprox_ofITree_iff
+
+/-- info: 'Anneal.ITree.checkTauRetApprox_ofITree_mono' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkTauRetApprox_ofITree_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkFullMirTraceFast_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkFullMirTraceFast_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkObsErasedMirTraceFast_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkObsErasedMirTraceFast_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkObsErasedMirTraceFast_imp_interpSilence_guarded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkObsErasedMirTraceFast_imp_interpSilence_guarded
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox_trunc' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirTraceApprox_trunc
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox_ofITree_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirTraceApprox_ofITree_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox_interpSilence_guarded_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkMirTraceApprox_interpSilence_guarded_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullBounded_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFullBounded_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedBounded_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedBounded_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceFullApprox_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceFullApprox_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedApprox_mono' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedApprox_mono
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceObsErasedBounded_imp_approx' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceObsErasedBounded_imp_approx
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.checkRawByteTraceWithCalleesObsErasedBounded_imp_approx' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms checkRawByteTraceWithCalleesObsErasedBounded_imp_approx
+
+/-- info: 'Anneal.Rustc.V2026_06_01.TraceCheck.exists_checkRawByteTraceObsErasedApprox_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms exists_checkRawByteTraceObsErasedApprox_iff
+
 /-! ## 2. Definitional-Closure Audit (`#audit_closure`)
 
 Kernel `rfl` / `decide` confirmation unfolds every definition reachable from a
-walker. The audit below walks that closure (definition bodies, compiled matchers,
-and structural-recursion auxiliaries; theorem proofs and opaque constants are not
-entered) and reports every forbidden constant it reaches:
+walker. The audit below walks that closure (including the root symbol itself,
+definition bodies, compiled matchers, and structural-recursion auxiliaries;
+theorem proofs and opaque constants are not entered) and reports every forbidden
+constant it reaches:
 - `walker` profile: `ITree.observe`, `CoInd.unfold` (the `childApprox` /
-  `head_eq ▸` tower rebuilt at every `.observe`), and index-transport
-  eliminators `Eq.rec`, `Eq.ndrec`, `Eq.mpr`, `Eq.mp`, `cast`, `HEq.rec`,
-  `HEq.ndrec`, `Nat.noConfusion`;
-- `checker` profile: `ITree.observe`, `CoInd.unfold`, `ITree.cofix`, `CoInd.fold`
+  `head_eq ▸` tower rebuilt at every `.observe`), quotient/choice/cheat
+  constants (`Quot.lift`, `Classical.choice`, `sorryAx`, `Lean.ofReduceBool`), and
+  index-transport / `noConfusion` eliminators `Eq.rec`, `Eq.ndrec`, `Eq.mpr`,
+  `Eq.mp`, `cast`, `HEq.rec`, `HEq.ndrec`, `Nat.noConfusion`,
+  `Nat.noConfusionType`, `CofixA.noConfusion`, `ITreeF.noConfusion`;
+- `checker` profile: `ITree.observe`, `CoInd.unfold`, `ITree.cofix`, `CoInd.fold`,
+  `Quot.lift`, `Classical.choice`, `sorryAx`, `Lean.ofReduceBool`
   (no coinductive `ITree` is ever built or observed by the replay checkers).
 `ofITree` (which observes by design) and the generic `checkTraceApprox` (which
 transports answers along a decided request equality) are positive controls that
-prove the audit is not vacuous. The MIR trace walkers `checkMirTraceApprox` /
-`checkMirObsErasedTraceApprox` are audited under the `checker` profile: their
-nested request patterns still compile to index-unifying matchers (a constant
-per-node `Eq.ndrec` cost, measured at about 4% over `checkRawByteTraceFullBounded`
-kernel-only at `k = 32`, dominated by `stepMirState`).
+prove the audit is not vacuous. `elimMirVis` eliminates `MirEffect.I` using
+`Sum.casesOn` / `FailReq.casesOn` / `ObsReq.casesOn` / `MirObs.casesOn` /
+`CallReq.casesOn` before introducing the continuation `k` and passes the strict
+`walker` profile (`checkMirTraceApprox` / `checkMirObsErasedTraceApprox` reach
+`Eq.ndrec` only through `Char` / `UInt32` equality inside `stringEq`).
 -/
 
 open Lean Elab Command in
@@ -406,14 +474,19 @@ elab "#audit_closure " prof:ident root:ident : command => do
   let rootName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo root
   let forbidden : Array Name :=
     if prof.getId == `walker then
-      #[``Trusted.ITree.ITree.observe, ``Trusted.CoInd.CoInd.unfold, ``Eq.rec, ``Eq.ndrec,
-        ``Eq.mpr, ``Eq.mp, ``cast, ``HEq.rec, ``HEq.ndrec, ``Nat.noConfusion]
+      #[``Trusted.ITree.ITree.observe, ``Trusted.CoInd.CoInd.unfold,
+        ``Quot.lift, ``Classical.choice, ``sorryAx, ``Lean.ofReduceBool,
+        ``Eq.rec, ``Eq.ndrec, ``Eq.mpr, ``Eq.mp, ``cast, ``HEq.rec, ``HEq.ndrec,
+        ``Nat.noConfusion, ``Nat.noConfusionType,
+        ``Anneal.ITree.CofixA.noConfusion, ``Trusted.ITree.ITreeF.noConfusion]
     else
       #[``Trusted.ITree.ITree.observe, ``Trusted.CoInd.CoInd.unfold,
-        ``Trusted.ITree.ITree.cofix, ``Trusted.CoInd.CoInd.fold]
+        ``Trusted.ITree.ITree.cofix, ``Trusted.CoInd.CoInd.fold,
+        ``Quot.lift, ``Classical.choice, ``sorryAx, ``Lean.ofReduceBool]
   let mut visited : NameSet := NameSet.empty.insert rootName
   let mut stack : Array Name := #[rootName]
-  let mut hits : NameSet := {}
+  let mut hits : NameSet :=
+    if forbidden.contains rootName then NameSet.empty.insert rootName else {}
   for _ in [0:1000000] do
     match stack.back? with
     | none => break
@@ -438,6 +511,8 @@ elab "#audit_closure " prof:ident root:ident : command => do
 #guard_msgs in #audit_closure walker approxCofix
 /-- info: Anneal.ITree.CofixA.map: clean -/
 #guard_msgs in #audit_closure walker CofixA.map
+/-- info: Anneal.ITree.CofixA.trunc: clean -/
+#guard_msgs in #audit_closure walker CofixA.trunc
 /-- info: Anneal.ITree.approxStep: clean -/
 #guard_msgs in #audit_closure walker approxStep
 /-- info: Anneal.ITree.bindApprox: clean -/
@@ -454,14 +529,24 @@ elab "#audit_closure " prof:ident root:ident : command => do
 #guard_msgs in #audit_closure walker interpStateHandlerApprox
 /-- info: Anneal.ITree.evalTauApprox: clean -/
 #guard_msgs in #audit_closure walker evalTauApprox
+/-- info: Anneal.ITree.checkTauRetApprox: clean -/
+#guard_msgs in #audit_closure walker checkTauRetApprox
 /-- info: Anneal.Rustc.V2026_06_01.TraceCheck.silenceMirObsApprox: clean -/
 #guard_msgs in #audit_closure walker silenceMirObsApprox
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.elimMirVis: clean -/
+#guard_msgs in #audit_closure walker elimMirVis
 
 /-- info: Anneal.ITree.ofITree: reaches [Eq.rec, Trusted.CoInd.CoInd.unfold, Trusted.ITree.ITree.observe] -/
 #guard_msgs (whitespace := lax) in #audit_closure walker ofITree
 /-- info: Anneal.ITree.checkTraceApprox: reaches [Eq.ndrec, Eq.rec] -/
 #guard_msgs (whitespace := lax) in #audit_closure walker checkTraceApprox
 
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.guardMirCallNode: clean -/
+#guard_msgs in #audit_closure checker guardMirCallNode
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.stepMirStateGuarded: clean -/
+#guard_msgs in #audit_closure checker stepMirStateGuarded
+/-- info: Anneal.Rustc.V2026_06_01.TraceCheck.mirExecGuardedApprox: clean -/
+#guard_msgs in #audit_closure checker mirExecGuardedApprox
 /-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkMirTraceApprox: clean -/
 #guard_msgs in #audit_closure checker checkMirTraceApprox
 /-- info: Anneal.Rustc.V2026_06_01.TraceCheck.checkMirObsErasedTraceApprox: clean -/
@@ -1248,6 +1333,93 @@ theorem mirLoop_k4_withCallees_and_fast_kernel :
     checkRawByteTraceObsErasedBoundedFast 35 mirLoopWithOracleCall [ffiStepOracleSig]
       emptyShadowProvenanceTable (mkLoopObsErasedRawTrace 4) = true := by
   decide +kernel
+
+/-- Concrete body for `fn ffi_step_oracle(iter: u32) -> u32 { 2 * iter + 3 }`:
+when placed in `RawByteTrace.inlinedCallees`, each loop call steps transparently
+through `Memory.callStack` via `.tau` transitions (`4` extra steps per iteration:
+`storageLive 2`, `_2 = Mul(copy _1, 2)`, `_0 = Add(copy _2, 3)`, `return`), so
+the minimal fuel for `k` iterations becomes `10 * k + 11` (`51` at `k = 4`) and
+no external `MirCallE` events are emitted. -/
+def ffiStepOracleInlinedBody : CapturedMir := {
+  defPath := "approx_test::ffi_step_oracle"
+  phase := .runtimeOptimized
+  role := .subject
+  argCount := 1
+  localDecls :=
+    [ approxMkDecl .mut approxU32Ty0
+    , approxMkDecl .not approxU32Ty0
+    , approxMkDecl .mut approxU32Ty0 ]
+  basicBlocks :=
+    [ { statements :=
+          [ approxMkStmt (.storageLive 2)
+          , approxMkStmt (.assign ⟨2, []⟩
+              (.binaryOp .mul (.copy ⟨1, []⟩) (approxU32ConstOperand 2)))
+          , approxMkStmt (.assign ⟨0, []⟩
+              (.binaryOp .add (.copy ⟨2, []⟩) (approxU32ConstOperand 3))) ]
+        terminator := approxMkTerm .return_
+        isCleanup := false } ]
+  fnAbi := approxTestFnAbi
+  layouts := approxTestLayouts
+  allocations := []
+}
+
+@[reducible]
+def mkLoopInlinedFullRawEvents : Nat → List RawObservedEvent
+  | 0 => [.branch 0]
+  | rem + 1 => .branch 1 :: mkLoopInlinedFullRawEvents rem
+
+@[reducible]
+def mkLoopInlinedFullRawTrace (k : Nat) : RawByteTrace := {
+  rawArgs := [encodeU32LeBytes k]
+  inlinedCallees := [ffiStepOracleInlinedBody]
+  events := mkLoopInlinedFullRawEvents k
+  outcome := .normal (encodeU32LeBytes (expectedLoopAccum k))
+}
+
+@[reducible]
+def mkLoopInlinedObsErasedRawTrace (k : Nat) : RawByteTrace := {
+  rawArgs := [encodeU32LeBytes k]
+  inlinedCallees := [ffiStepOracleInlinedBody]
+  events := []
+  outcome := .normal (encodeU32LeBytes (expectedLoopAccum k))
+}
+
+set_option maxHeartbeats 5500 in
+/-- Multi-frame inlined-callee verification at `k = 4`: with `ffiStepOracleInlinedBody`
+in `inlinedCallees`, all `WithCallees` checkers (`*Bounded`, `*BoundedFast`, and
+`*Approx`) accept at exact minimal fuel `10 * 4 + 11 = 51` and reject at `50`. -/
+theorem mirLoop_k4_inlinedCallees_kernel :
+    checkRawByteTraceWithCalleesFullBounded 51 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesFullBounded 50 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 4) = false ∧
+    checkRawByteTraceWithCalleesObsErasedBounded 51 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesObsErasedBounded 50 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4) = false ∧
+    checkRawByteTraceWithCalleesFullApprox 51 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesFullApprox 50 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedFullRawTrace 4) = false ∧
+    checkRawByteTraceWithCalleesObsErasedApprox 51 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4) = true ∧
+    checkRawByteTraceWithCalleesObsErasedApprox 50 mirLoopWithOracleCall []
+      emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4) = false := by
+  decide +kernel
+
+theorem mirLoop_k4_inlinedCallees_obsErasedApprox_reachesRet :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace mirLoopWithOracleCall []
+        emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4) = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees
+          mirLoopWithOracleCall obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out :=
+  checkRawByteTraceWithCalleesObsErasedApprox_sound 51 mirLoopWithOracleCall []
+    emptyShadowProvenanceTable (mkLoopInlinedObsErasedRawTrace 4)
+    mirLoop_k4_inlinedCallees_kernel.2.2.2.2.2.2.1
 
 set_option maxHeartbeats 12000 in
 /-- Exact minimal-fuel boundaries (`6 * k + 10` and `7 * k + 10` rejected) for every
