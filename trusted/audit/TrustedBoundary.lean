@@ -836,7 +836,7 @@ def requireParamClaimProof (env : Environment)
 /-- Verify that `Trusted.MirAst`, `Trusted.MirSemantics`, and `Anneal.MirWp`
 are present (whenever `requireMirWp` is `true` or any of the three modules is
 loaded) and that the core weakest-precondition adequacy and
-fault-characterization theorems and all 15 non-vacuity and parameter-boundary
+fault-characterization theorems and all 19 non-vacuity and parameter-boundary
 canaries in `Anneal.MirWp` prove the exact `*Claim` propositions defined in
 `Trusted.MirSemantics`. -/
 def verifyMirWpCoreTheorems (env : Environment)
@@ -894,7 +894,15 @@ def verifyMirWpCoreTheorems (env : Environment)
         (`Trusted.MirSemantics.CanaryNegativeUbUnreachableAnnealClaim,
           `Anneal.MirWp.canary_negative_ub_unreachable_anneal),
         (`Trusted.MirSemantics.CanaryNegativeUnsupportedUnsignedNegAnnealClaim,
-          `Anneal.MirWp.canary_negative_unsupported_unsigned_neg_anneal)] do
+          `Anneal.MirWp.canary_negative_unsupported_unsigned_neg_anneal),
+        (`Trusted.MirSemantics.CanaryPositiveEnumExplicitReprAnnealClaim,
+          `Anneal.MirWp.canary_positive_enum_explicit_repr_anneal),
+        (`Trusted.MirSemantics.CanaryPositiveZstSingleEnumAnnealClaim,
+          `Anneal.MirWp.canary_positive_zst_single_enum_anneal),
+        (`Trusted.MirSemantics.CanaryNegativeUbEnumInvalidTagAndUninitAnnealClaim,
+          `Anneal.MirWp.canary_negative_ub_enum_invalid_tag_and_uninit_anneal),
+        (`Trusted.MirSemantics.CanaryCrateAndBodyVerifiedAnnealClaim,
+          `Anneal.MirWp.canary_crate_and_body_verified_anneal)] do
       requireExactClaimProof env locals semMod wpMod claimName proofName
 
 /-- Execute Phase 2 (`"audit"`) on the compiled `.olean` environment `env`. -/
@@ -1168,7 +1176,7 @@ def requireClaimAndProof (env : Environment)
     `Anneal.MirCorrespondenceProof claimName proofName reqConsts
 
 /-- Verify that all Pass 2 correspondence claims, core round-trip, constructor
-preservation, uniqueness, and simulation theorems, and canaries `D6`–`D10` are
+preservation, uniqueness, and simulation theorems, and canaries `D6`–`D13` are
 present in `Trusted.Correspondence` and proved with exact claim-type equality
 in `Anneal.MirCorrespondenceProof`. -/
 def verifyCorrespondenceClaims (env : Environment)
@@ -1257,7 +1265,13 @@ def verifyCorrespondenceClaims (env : Environment)
       (`Trusted.Correspondence.CanaryD9MoveUnitZstOkClaim,
         `Anneal.MirCorrespondenceProof.canary_D9_move_unit_zst_ok),
       (`Trusted.Correspondence.CanaryD10AddUncheckedOverflowUbClaim,
-        `Anneal.MirCorrespondenceProof.canary_D10_add_unchecked_overflow_ub)] do
+        `Anneal.MirCorrespondenceProof.canary_D10_add_unchecked_overflow_ub),
+      (`Trusted.Correspondence.CanaryD11EnumDiscriminantAndConstOkClaim,
+        `Anneal.MirCorrespondenceProof.canary_D11_enum_discriminant_and_const_ok),
+      (`Trusted.Correspondence.CanaryD12ZstEnumMoveAndDiscrOkClaim,
+        `Anneal.MirCorrespondenceProof.canary_D12_zst_enum_move_and_discr_ok),
+      (`Trusted.Correspondence.CanaryD13EnumInvalidTagAndUninitUbClaim,
+        `Anneal.MirCorrespondenceProof.canary_D13_enum_invalid_tag_and_uninit_ub)] do
     requireClaimAndProof env corrLocals claimName proofName
 
 /-- Verify that the reference machine `M_ref`
@@ -1283,6 +1297,8 @@ def verifyRefEvaluatorIndependence (env : Environment)
       `Miri.Interpreter.placeWriteLocalImmediate,
       `Miri.Interpreter.evalRvalueIntoPlace,
       `Miri.Interpreter.runRvalue,
+      `Miri.Interpreter.Discriminant.readDiscriminant,
+      `Miri.Interpreter.Discriminant.discriminantForVariant,
       `Miri.Interpreter.Step.evalStatement,
       `Miri.Interpreter.Frame.storageLive,
       `Miri.Interpreter.Frame.storageDead,
@@ -1293,6 +1309,13 @@ def verifyRefEvaluatorIndependence (env : Environment)
       fail (s!"reference evaluator cone is missing required Miri " ++
         s!"primitive {reqMiri}")
   for forbiddenAnneal in [
+      `Trusted.MirSemantics.enumAdmitted,
+      `Trusted.MirSemantics.tagBitsToDiscrBits,
+      `Trusted.MirSemantics.isZstEnumTy,
+      `Trusted.MirSemantics.findDiscrVariant?,
+      `Trusted.MirSemantics.isSupportedScalarOrUnitTy,
+      `Trusted.MirSemantics.liveUninitSlot,
+      `Trusted.MirSemantics.isPrimitiveReadableTy,
       `Trusted.MirSemantics.evalConstLit,
       `Trusted.MirSemantics.evalBinOp,
       `Trusted.MirSemantics.evalUnOp,

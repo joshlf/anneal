@@ -1634,6 +1634,10 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
          def evalRvalueIntoPlace : Nat := 0\n\
          def runRvalue : Nat := 0\n\
          end Miri.Interpreter\n\
+         namespace Miri.Interpreter.Discriminant\n\
+         def readDiscriminant : Nat := 0\n\
+         def discriminantForVariant : Nat := 0\n\
+         end Miri.Interpreter.Discriminant\n\
          namespace Miri.Interpreter.Frame\n\
          def storageLive : Nat := 0\n\
          def storageDead : Nat := 0\n\
@@ -1657,6 +1661,7 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
          def Behavior : Prop := True\n\
          def Diverges : Prop := True\n\
          def ReachesResult : Prop := True\n\
+         def enumAdmitted : Nat := 0\n\
          def evalStep : Nat := 0\n\
          end Trusted.MirSemantics\n",
     );
@@ -1769,6 +1774,9 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
              def CanaryD8SelfMoveOkClaim : Prop := True\n\
              def CanaryD9MoveUnitZstOkClaim : Prop := True\n\
              def CanaryD10AddUncheckedOverflowUbClaim : Prop := True\n\
+             def CanaryD11EnumDiscriminantAndConstOkClaim : Prop := True\n\
+             def CanaryD12ZstEnumMoveAndDiscrOkClaim : Prop := True\n\
+             def CanaryD13EnumInvalidTagAndUninitUbClaim : Prop := True\n\
              def initRefState : Nat := 0\n\
              def evalRefStep : Nat := {eval_ref_step_body}\n\
              end Trusted.Correspondence\n"
@@ -1809,6 +1817,9 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
         theorem canary_D8_self_move_ok : CanaryD8SelfMoveOkClaim := True.intro\n\
         theorem canary_D9_move_unit_zst_ok : CanaryD9MoveUnitZstOkClaim := True.intro\n\
         theorem canary_D10_add_unchecked_overflow_ub : CanaryD10AddUncheckedOverflowUbClaim := True.intro\n\
+        theorem canary_D11_enum_discriminant_and_const_ok : CanaryD11EnumDiscriminantAndConstOkClaim := True.intro\n\
+        theorem canary_D12_zst_enum_move_and_discr_ok : CanaryD12ZstEnumMoveAndDiscrOkClaim := True.intro\n\
+        theorem canary_D13_enum_invalid_tag_and_uninit_ub : CanaryD13EnumInvalidTagAndUninitUbClaim := True.intro\n\
         end Anneal.MirCorrespondenceProof\n";
 
     let corr_deps = ["Miri.FakeStubs", "Trusted.MirSemantics"];
@@ -1853,6 +1864,8 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
         Miri.Interpreter.placeWriteLocalImmediate, \
         Miri.Interpreter.evalRvalueIntoPlace, \
         Miri.Interpreter.runRvalue, \
+        Miri.Interpreter.Discriminant.readDiscriminant, \
+        Miri.Interpreter.Discriminant.discriminantForVariant, \
         Miri.Interpreter.Step.evalStatement, \
         Miri.Interpreter.Frame.storageLive, \
         Miri.Interpreter.Frame.storageDead, \

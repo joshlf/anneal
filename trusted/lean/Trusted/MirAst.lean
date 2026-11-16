@@ -160,6 +160,72 @@ inductive Mutability where
   | shared
   | mut
 
+/-- In-memory tag representation of a fieldless Rust enum, corresponding to
+`rustc_abi::Variants` (`compiler/rustc_abi/src/lib.rs`, `rust-lang/rust`
+`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+
+> "pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
+>     Empty,
+>     Single { index: VariantIdx },
+>     Multiple {
+>         tag: Scalar,
+>         tag_encoding: TagEncoding<VariantIdx>,
+>         tag_field: FieldIdx,
+>         variants: IndexVec<VariantIdx, LayoutData<FieldIdx, VariantIdx>>,
+>     },
+> }"
+
+Constructor correspondence:
+- `.zeroSized` corresponds to `Variants::Single { index: 0 }` on an inhabited
+  1-variant fieldless enum (`Size::ZERO` 0-byte ZST, where no tag bytes are
+  stored in memory and `ConstValue::ZeroSized` represents the unique variant).
+- `.scalar width signed` corresponds to `Variants::Multiple { tag,
+  tag_encoding: TagEncoding::Direct, tag_field: 0, .. }` where `tag` has
+  primitive integer representation `(width, signed)` (`tag.primitive()` in
+  `compiler/rustc_abi/src/lib.rs`). (Uninhabited 0-variant enums
+  `Variants::Empty` have no admitted `EnumTagRepr` and are rejected by
+  `Trusted.MirSemantics.enumAdmitted`.) -/
+inductive EnumTagRepr where
+  | zeroSized
+  | scalar (width : IntWidth) (signed : Bool)
+
+/-- Structural descriptor for a fieldless Rust enum (`TyKind::Adt(def, _)` with
+`def.is_enum()` and zero fields on every variant), carrying its nominal
+type-identity key `id`, its `Ty::discriminant_ty` integer representation
+`(discrWidth, discrSigned)`, its in-memory tag representation `tagRepr`, and
+its declaration-indexed discriminant bit-pattern table `discriminants`.
+
+Corresponds to `rustc_middle::ty::util::Discr` and `Ty::discriminant_ty`
+(`compiler/rustc_middle/src/ty/util.rs`, `rust-lang/rust`
+`8144389c895da997dbdecaa635e41d6a50be6ffd`) and the Rust Reference
+(`src/items/enumerations.md`, `rust-lang/reference`
+`38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e`):
+
+> "pub struct Discr<'tcx> {
+>     /// Bit representation of the discriminant (e.g., `-1i8` is `0xFF_u128`).
+>     pub val: u128,
+>     pub ty: Ty<'tcx>,
+> }"
+> (`compiler/rustc_middle/src/ty/util.rs`, `rust-lang/rust`
+> `8144389c895da997dbdecaa635e41d6a50be6ffd`)
+>
+> "Under the default representation, the specified discriminant is interpreted
+> as an `isize` value."
+> "With a primitive representation, the specified discriminant is interpreted
+> as that primitive integer type."
+> (`src/items/enumerations.md`, `rust-lang/reference`
+> `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e`)
+
+Each entry `d ∈ discriminants` stores the unsigned bit pattern `Discr.val`
+truncated to `discrWidth` (`d < discrWidth.modulus`; e.g., `-1i8` is `255` and
+`-1isize` on 64-bit targets is `2^64 - 1`). -/
+structure EnumTy where
+  id : Nat
+  discrWidth : IntWidth := .isize
+  discrSigned : Bool := true
+  tagRepr : EnumTagRepr := .scalar .isize true
+  discriminants : List Nat
+
 /-- Structural MIR type descriptors carried directly by value in
 `Trusted.MirAst`.
 
@@ -182,19 +248,27 @@ Constructor correspondence:
 - `.int width false` corresponds to `TyKind::Uint(width)` (`u8`, `u16`, `u32`,
   `u64`, `u128`, `usize`).
 - `.unit` corresponds to the 0-element unit tuple `TyKind::Tuple([])` (`()`).
+- `.never` corresponds to the uninhabited never type `TyKind::Never` (`!`).
+- `.enum ty` corresponds to a fieldless `TyKind::Adt(def, _)` enum
+  (`def.is_enum()` where every variant has zero fields), carrying `ty : EnumTy`
+  with its nominal `id`, `Ty::discriminant_ty` `(discrWidth, discrSigned)`,
+  in-memory `tagRepr` (`Variants::Single` ZST vs. direct `Variants::Multiple`
+  scalar tag), and variant `discriminants` bit patterns.
 - `.tuple fields` corresponds to non-empty `TyKind::Tuple(fields)`.
 - `.ref mutability pointee` corresponds to `TyKind::Ref(_, pointee, mutability)`
   (regions are erased at runtime).
 - `.rawPtr mutability pointee` corresponds to
   `TyKind::RawPtr(pointee, mutability)`.
-- `.unsupported` represents all other `TyKind` variants (`Char`, `Float`, `Adt`,
-  `Foreign`, `Str`, `Array`, `Pat`, `Slice`, `FnDef`, `FnPtr`, `Dynamic`,
-  `Closure`, `CoroutineClosure`, `Coroutine`, `Never`, etc.), causing
+- `.unsupported` represents all other `TyKind` variants (`Char`, `Float`,
+  non-fieldless-enum `Adt`, `Foreign`, `Str`, `Array`, `Pat`, `Slice`, `FnDef`,
+  `FnPtr`, `Dynamic`, `Closure`, `CoroutineClosure`, `Coroutine`, etc.), causing
   $M_{\text{anneal}}$ to fail closed with `FaultKind.unsupported`. -/
 inductive MirTy where
   | bool
   | int (width : IntWidth) (signed : Bool)
   | unit
+  | never
+  | enum (ty : EnumTy)
   | tuple (fields : List MirTy)
   | ref (mutability : Mutability) (pointee : MirTy)
   | rawPtr (mutability : Mutability) (pointee : MirTy)
@@ -217,6 +291,26 @@ noncomputable def Mutability.beq : Mutability → Mutability → Bool
   | .mut, .mut => true
   | _, _ => false
 
+/-- Elementwise structural equality on `List Nat`. -/
+noncomputable def natListBeq : List Nat → List Nat → Bool
+  | [], [] => true
+  | x :: xs, y :: ys => Nat.beq x y && natListBeq xs ys
+  | _, _ => false
+
+/-- Explicit structural equality on `EnumTagRepr`. -/
+noncomputable def EnumTagRepr.beq : EnumTagRepr → EnumTagRepr → Bool
+  | .zeroSized, .zeroSized => true
+  | .scalar w₁ s₁, .scalar w₂ s₂ => IntWidth.beq w₁ w₂ && (s₁ == s₂)
+  | _, _ => false
+
+/-- Explicit structural equality on `EnumTy`. -/
+noncomputable def EnumTy.beq (a b : EnumTy) : Bool :=
+  Nat.beq a.id b.id &&
+    IntWidth.beq a.discrWidth b.discrWidth &&
+    (a.discrSigned == b.discrSigned) &&
+    EnumTagRepr.beq a.tagRepr b.tagRepr &&
+    natListBeq a.discriminants b.discriminants
+
 mutual
   /-- Explicit structural equality on `MirTy`. -/
   noncomputable def MirTy.beq : MirTy → MirTy → Bool
@@ -226,6 +320,11 @@ mutual
       | .int w₂ s₂ => IntWidth.beq w₁ w₂ && (s₁ == s₂)
       | _ => false
     | .unit => fun b => match b with | .unit => true | _ => false
+    | .never => fun b => match b with | .never => true | _ => false
+    | .enum ety₁ => fun b =>
+      match b with
+      | .enum ety₂ => EnumTy.beq ety₁ ety₂
+      | _ => false
     | .tuple fs₁ => fun b =>
       match b with
       | .tuple fs₂ => MirTy.beqList fs₁ fs₂
@@ -441,19 +540,28 @@ Constructor correspondence:
   `.unsupported` until stacked/tree-borrows retagging is modeled).
 - `.binaryOp op lhs rhs` corresponds to `Rvalue::BinaryOp(op, (lhs, rhs))`.
 - `.unaryOp op opnd` corresponds to `Rvalue::UnaryOp(op, opnd)`.
+- `.discriminant place` corresponds to `Rvalue::Discriminant(place)`
+  (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
+  `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+
+  > "Computes the discriminant of the place, returning it as an integer of type
+  > [`discriminant_ty`]. Returns zero for types without discriminant."
+  > "Note too that the value of the discriminant is not the same thing as the
+  > variant index; use [`discriminant_for_variant`] to convert."
 - `.ref mutability place` corresponds to `Rvalue::Ref(_, borrowKind, place)`.
 - `.addressOf mutability place` corresponds to `Rvalue::RawPtr(kind, place)`
   (`Rvalue::AddressOf` in `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
 - `.aggregateTuple fields` corresponds to
   `Rvalue::Aggregate(AggregateKind::Tuple, fields)`.
 - `.unsupported` represents all other `Rvalue` variants (`Repeat`,
-  `ThreadLocalRef`, `Cast`, `Discriminant`, non-tuple `Aggregate`,
-  `CopyForDeref`, `WrapUnsafeBinder`, `Reborrow`, and `Use(_, WithRetag::Yes)`).
+  `ThreadLocalRef`, `Cast`, non-tuple `Aggregate`, `CopyForDeref`,
+  `WrapUnsafeBinder`, `Reborrow`, and `Use(_, WithRetag::Yes)`).
 -/
 inductive Rvalue where
   | use (op : Operand)
   | binaryOp (op : BinOp) (lhs rhs : Operand)
   | unaryOp (op : UnOp) (opnd : Operand)
+  | discriminant (place : Place)
   | ref (mutability : Mutability) (place : Place)
   | addressOf (mutability : Mutability) (place : Place)
   | aggregateTuple (fields : List Operand)
@@ -652,15 +760,50 @@ Local slot layout (`compiler/rustc_middle/src/mir/mod.rs`):
 - Local `0` (`_0`) is the return place (`locals[0]`).
 - Locals `1 .. argumentCount` are the function parameters
   (`locals[1..=argumentCount]`).
-- Locals `> argumentCount` are temporaries and user-declared locals. -/
+- Locals `> argumentCount` are temporaries and user-declared locals.
+- `isUnsafe` records whether the function signature has
+  `rustc_hir::Safety::Unsafe` (`compiler/rustc_hir/src/hir.rs`, `rust-lang/rust`
+  `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+
+  > "pub enum Safety { #[default] Unsafe, Safe }"
+
+  Only bodies with `isUnsafe = true` may assume a caller-supplied safety
+  precondition in `Trusted.MirSemantics.BodyVerified`.
+- `identity` records the canonical definition path string
+  (`tcx.def_path_str(def_id)`) used to index
+  `Trusted.MirSemantics.Specs.safety`. Single-body unit test fixtures that do
+  not use `BodyVerified` / `ProgramVerified` may leave the default
+  `identity := ""`; `BodyStaticAdmitted` rejects empty `identity` strings and
+  `ProgramVerified` requires pairwise-distinct identities across all bodies in
+  `Program.bodies` so two functions can never silently alias in `Specs.safety`.
+-/
 structure Body where
   argumentCount : Nat
   locals : List MirTy
   basicBlocks : List BasicBlock
+  isUnsafe : Bool := false
+  identity : String := ""
+
+/-- Capture scope of a `Program`, distinguishing whole-crate verification
+(`.crate`, covering every executable body in the compiled crate via
+`Trusted.MirSemantics.CrateTheorem`) from selected proof-unit verification
+(`.unit`, covering a designated root item and its captured dependencies via
+`Trusted.MirSemantics.UnitTheorem`). -/
+inductive VerificationScope where
+  | unit
+  | crate
+
+/-- Explicit structural equality on `VerificationScope`. -/
+noncomputable def VerificationScope.beq :
+    VerificationScope → VerificationScope → Bool
+  | .unit, .unit => true
+  | .crate, .crate => true
+  | _, _ => false
 
 /-- A complete MIR program unit: function bodies indexed by `DefId`, an entry
 function `entryDefId`, the captured target's pointer width `pointerWidthBits`,
-and the MIR semantic profile version `mirProfileVersion`.
+the MIR semantic profile version `mirProfileVersion`, and the capture scope
+`scope`.
 
 1. **Target pointer width (`pointerWidthBits`):**
    `pointerWidthBits` records the target layout that `rustc` used when it
@@ -693,5 +836,6 @@ structure Program where
   entryDefId : DefId := 0
   pointerWidthBits : Nat := 64
   mirProfileVersion : Nat := 1
+  scope : VerificationScope := .unit
 
 end Trusted.MirAst

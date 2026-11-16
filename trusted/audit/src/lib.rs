@@ -2670,9 +2670,12 @@ impl Checker {
                     .map_err(|e| Failure::operational("compile", e.to_string()))?;
             }
             self.execution_began = true;
+            // Importing the 160-module `Miri.Interpreter.ExecutionMachine`
+            // closure consumes ~1.7 GiB of Lean's `-M` allocator at startup,
+            // so Pass 2 uses `-M4096` rather than Pass 1's `-M2048`.
             let args = vec![
                 "-j1".to_string(),
-                "-M2048".to_string(),
+                "-M4096".to_string(),
                 "-t0".to_string(),
                 "-DElab.async=false".to_string(),
                 "-Ddebug.skipKernelTC=false".to_string(),
@@ -2697,7 +2700,7 @@ impl Checker {
             self.execution_began = true;
             let args = vec![
                 "-j1".to_string(),
-                "-M2048".to_string(),
+                "-M4096".to_string(),
                 "-t0".to_string(),
                 "-DElab.async=false".to_string(),
                 "-Ddebug.skipKernelTC=false".to_string(),

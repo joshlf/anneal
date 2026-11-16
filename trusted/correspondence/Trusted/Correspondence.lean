@@ -18,6 +18,7 @@ import Miri.Interpreter.ExecutionMachine
 import Miri.Interpreter.LocalAccess
 import Miri.Interpreter.Place
 import Miri.Interpreter.Rvalue
+import Miri.Interpreter.Discriminant
 import Miri.Interpreter.Step
 import Miri.Interpreter.ControlFlow
 import Trusted.MirAst
@@ -145,6 +146,7 @@ inductive RefRvalue where
   | use (op : RefOperand)
   | binaryOp (op : BinOp) (lhs rhs : RefOperand)
   | unaryOp (op : UnOp) (opnd : RefOperand)
+  | discriminant (place : RefPlace)
   | ref (mutability : Mutability) (place : RefPlace)
   | addressOf (mutability : Mutability) (place : RefPlace)
   | aggregateTuple (fields : List RefOperand)
@@ -183,6 +185,8 @@ structure RefBody where
   argumentCount : Nat
   locals : List TyId
   basicBlocks : List RefBasicBlock
+  isUnsafe : Bool := false
+  identity : String := ""
 
 /-- Reference program with a single-source deduplicated `types : List MirTy`
 table indexed by `TyId`.
@@ -193,16 +197,18 @@ and `initRefState` pre-caches `cachedLayout := some (types[tyId])` on each
 `RefLocalState` so `Miri.Interpreter.localToOp` never mutates `frame.locals`
 during read-only accesses.
 
-`pointerWidthBits` and `mirProfileVersion` carry `Program.pointerWidthBits` and
-`Program.mirProfileVersion` across the codec so that `initRefState`
-independently rejects non-64-bit targets and unsupported MIR profile versions,
-matching `Trusted.MirSemantics.initState`. -/
+`pointerWidthBits`, `mirProfileVersion`, and `scope` carry
+`Program.pointerWidthBits`, `Program.mirProfileVersion`, and `Program.scope`
+across the codec so that `initRefState` independently rejects non-64-bit
+targets and unsupported MIR profile versions, matching
+`Trusted.MirSemantics.initState`. -/
 structure RefProg where
   bodies : List RefBody
   entryDefId : DefId := 0
   types : List MirTy
   pointerWidthBits : Nat := 64
   mirProfileVersion : Nat := 1
+  scope : VerificationScope := .unit
 
 /-! ## Canonical Type Interning and Codec (`encodeProg` / `decodeProg`) -/
 
@@ -241,6 +247,8 @@ mutual
     | .bool => insertTy .bool acc
     | .int w s => insertTy (.int w s) acc
     | .unit => insertTy .unit acc
+    | .never => insertTy .never acc
+    | .enum ety => insertTy (.enum ety) acc
     | .unsupported => insertTy .unsupported acc
     | .ref m p => insertTy (.ref m p) (collectTy acc p)
     | .rawPtr m p => insertTy (.rawPtr m p) (collectTy acc p)
@@ -284,7 +292,7 @@ noncomputable def collectRvalue (acc : List MirTy) : Rvalue → List MirTy
   | .use op => collectOperand acc op
   | .binaryOp _ l r => collectOperand (collectOperand acc l) r
   | .unaryOp _ op => collectOperand acc op
-  | .ref _ p | .addressOf _ p => collectPlace acc p
+  | .discriminant p | .ref _ p | .addressOf _ p => collectPlace acc p
   | .aggregateTuple ops => collectOperandList acc ops
   | .unsupported => acc
 
@@ -372,6 +380,7 @@ noncomputable def encodeRvalue (ts : List MirTy) : Rvalue → RefRvalue
   | .use op => .use (encodeOperand ts op)
   | .binaryOp op l r => .binaryOp op (encodeOperand ts l) (encodeOperand ts r)
   | .unaryOp op opnd => .unaryOp op (encodeOperand ts opnd)
+  | .discriminant p => .discriminant (encodePlace ts p)
   | .ref m p => .ref m (encodePlace ts p)
   | .addressOf m p => .addressOf m (encodePlace ts p)
   | .aggregateTuple ops => .aggregateTuple (encodeOperandList ts ops)
@@ -410,13 +419,15 @@ noncomputable def encodeBasicBlock (ts : List MirTy)
 noncomputable def encodeBody (ts : List MirTy) (b : Body) : RefBody :=
   ⟨b.argumentCount,
    b.locals.map (lookupTyId ts),
-   b.basicBlocks.map (encodeBasicBlock ts)⟩
+   b.basicBlocks.map (encodeBasicBlock ts),
+   b.isUnsafe,
+   b.identity⟩
 
 /-- Total encoder from `Program` to `RefProg`. -/
 noncomputable def encodeProg (p : Program) : RefProg :=
   let ts := collectProgTypes p
   ⟨p.bodies.map (encodeBody ts), p.entryDefId, ts, p.pointerWidthBits,
-   p.mirProfileVersion⟩
+   p.mirProfileVersion, p.scope⟩
 
 /-- Decode a `RefProjectionElem` against type table `ts`. -/
 noncomputable def decodeProjElem (ts : List MirTy) :
@@ -480,6 +491,10 @@ noncomputable def decodeRvalue (ts : List MirTy) : RefRvalue → Option Rvalue
   | .unaryOp op opnd =>
     match decodeOperand ts opnd with
     | some opnd' => some (.unaryOp op opnd')
+    | none => none
+  | .discriminant p =>
+    match decodePlace ts p with
+    | some p' => some (.discriminant p')
     | none => none
   | .ref m p =>
     match decodePlace ts p with
@@ -565,7 +580,8 @@ noncomputable def decodeLocalTys (ts : List MirTy) :
 /-- Decode a `RefBody` against type table `ts`. -/
 noncomputable def decodeBody (ts : List MirTy) (b : RefBody) : Option Body :=
   match decodeLocalTys ts b.locals, decodeBasicBlockList ts b.basicBlocks with
-  | some locals, some bbs => some ⟨b.argumentCount, locals, bbs⟩
+  | some locals, some bbs =>
+    some ⟨b.argumentCount, locals, bbs, b.isUnsafe, b.identity⟩
   | _, _ => none
 
 /-- Decode a list of `RefBody` definitions against type table `ts`. -/
@@ -582,7 +598,8 @@ some p`). -/
 noncomputable def decodeProg (rp : RefProg) : Option Program :=
   match decodeBodyList rp.types rp.bodies with
   | some bodies =>
-    some ⟨bodies, rp.entryDefId, rp.pointerWidthBits, rp.mirProfileVersion⟩
+    some ⟨bodies, rp.entryDefId, rp.pointerWidthBits, rp.mirProfileVersion,
+          rp.scope⟩
   | none => none
 
 /-! ## Reference Machine State and Step Engine ($M_{\text{ref}}$) -/
@@ -608,30 +625,6 @@ structure RefFrameState where
   stmtIdx : Nat
   locals : List RefLocalState
   returnContinuation : Bool := false
-
-/-- Caller sentinel frame beneath the entry function's frame.
-
-$M_{\text{ref}}$ represents the caller of the entry function as an explicit
-frame that owns the entry function's return place. In `lean-miri`,
-`MainThread.callMain` (`vendor/lean-miri/Miri/Interpreter/MainThread.lean`)
-allocates the return place `retPlace` before it calls the entry function, so
-that place outlives the entry frame. The sentinel models this caller-owned
-place as a single live destination slot (`_0`) of the entry function's return
-type `retTy`.
-
-The sentinel never executes a statement and is marked as a suspended caller
-(`returnContinuation := true`). `initRefState` places it beneath the entry
-frame, and `evalRefStep` requires it and preserves it on every running step,
-so the reference stack has one fixed shape. Returning from the entry frame
-ends the execution with `.returned` (`evalRefTerminator`) instead of resuming
-the sentinel. Its `defId`, `blockIdx`, and `stmtIdx` are unused. -/
-noncomputable def callerSentinelFrame (retTy : MirTy) : RefFrameState := {
-  defId := 0
-  blockIdx := 0
-  stmtIdx := 0
-  locals := [⟨liveUninitSlot retTy, some retTy⟩]
-  returnContinuation := true
-}
 
 /-- Reference machine state (`Miri.Interpreter.ExecutionMachine.ExecutionState`
 paired with `Limits.maxSteps`): tracks `stepsExecuted : Nat` and `maxSteps :
@@ -751,6 +744,251 @@ noncomputable def miriIntValue (sv : ScalarVal) :
     Miri.Interpreter.IntegerValue :=
   ⟨miriScalar sv.width sv.bits, toMiriIntType sv.width sv.signed⟩
 
+/-- Map an Anneal `IntWidth` to its `Miri.ABI.Integer` on 64-bit targets. -/
+noncomputable def toMiriInteger : IntWidth → Miri.ABI.Integer
+  | .i8 => .I8
+  | .i16 => .I16
+  | .i32 => .I32
+  | .i64 => .I64
+  | .i128 => .I128
+  | .isize => .I64
+
+/-- Independent `List Nat` non-membership check in $M_{\text{ref}}$. -/
+noncomputable def refNatNotElem (x : Nat) : List Nat → Bool
+  | [] => true
+  | y :: ys => !Nat.beq x y && refNatNotElem x ys
+
+/-- Independent pairwise-distinctness check on `List Nat` in
+$M_{\text{ref}}$. -/
+noncomputable def refNatListPairwiseNe : List Nat → Bool
+  | [] => true
+  | x :: xs => refNatNotElem x xs && refNatListPairwiseNe xs
+
+/-- Independent $M_{\text{ref}}$ tag-to-discriminant extension using
+`Miri.ABI.Size.signExtend`, `BitVec.ofInt 128`, and `Miri.ABI.Size.truncate`
+(`vendor/lean-miri/Miri/Interpreter/Discriminant.lean`). -/
+noncomputable def refMiriTagToDiscrBits (tagW : IntWidth) (tagS : Bool)
+    (discrW : IntWidth) (tagBits : BitVec 128) : Option (BitVec 128) :=
+  let tagSz := toMiriSize tagW
+  let discrSz := toMiriSize discrW
+  let extOpt : Option (BitVec 128) :=
+    if tagS then
+      match tagSz.signExtend tagBits with
+      | .ok integer => some (BitVec.ofInt 128 integer)
+      | .error _ => none
+    else
+      match tagSz.truncate tagBits with
+      | .ok trunc => some trunc
+      | .error _ => none
+  match extOpt with
+  | some extended =>
+    match discrSz.truncate extended with
+    | .ok discrBits => some discrBits
+    | .error _ => none
+  | none => none
+
+/-- Independent $M_{\text{ref}}$ fieldless-enum admission check using
+`Miri.Memory.ScalarInt.tryFromUInt` and `Miri.ABI.Size` operations (never
+sharing `Trusted.MirSemantics.enumAdmitted`). -/
+noncomputable def refEnumAdmitted (ety : EnumTy) : Bool :=
+  !ety.discriminants.isEmpty &&
+    Nat.blt ety.discriminants.length (Nat.pow 2 32) &&
+    ety.discriminants.all (fun d =>
+      Nat.blt d (Nat.pow 2 128) &&
+        match Miri.Memory.ScalarInt.tryFromUInt (BitVec.ofNat 128 d)
+            (toMiriSize ety.discrWidth) with
+        | .ok (some _) => true
+        | _ => false) &&
+    refNatListPairwiseNe ety.discriminants &&
+    match ety.tagRepr with
+    | .zeroSized => Nat.beq ety.discriminants.length 1
+    | .scalar tagW tagS =>
+      ety.discriminants.all (fun d =>
+        let dBits := BitVec.ofNat 128 d
+        match (toMiriSize tagW).truncate dBits with
+        | .ok truncTag =>
+          match refMiriTagToDiscrBits tagW tagS ety.discrWidth truncTag with
+          | some recovered => recovered == dBits
+          | none => false
+        | .error _ => false)
+
+/-- Independent $M_{\text{ref}}$ 0-byte ZST enum check (`Variants.Single 0`). -/
+noncomputable def refIsZstEnumTy (ety : EnumTy) : Bool :=
+  match ety.tagRepr with
+  | .zeroSized => refEnumAdmitted ety
+  | .scalar _ _ => false
+
+/-- Linear search from `idx` in $M_{\text{ref}}$ for the variant whose declared
+discriminant equals `discrBits`. -/
+noncomputable def refFindDiscrVariantAux (idx : Nat) (discrBits : BitVec 128) :
+    List Nat → Option Nat
+  | [] => none
+  | d :: ds =>
+    if BitVec.ofNat 128 d == discrBits then
+      some idx
+    else
+      refFindDiscrVariantAux (idx + 1) discrBits ds
+
+/-- Resolve `discrBits` to its variant index in `ds` for
+`Miri.Interpreter.DiscriminantHooks.variantForDiscriminant`. -/
+noncomputable def refFindDiscrVariant? (discrBits : BitVec 128)
+    (ds : List Nat) : Option Nat :=
+  refFindDiscrVariantAux 0 discrBits ds
+
+/-- Independent $M_{\text{ref}}$ supported local-type check. -/
+noncomputable def refIsSupportedLocalTy : MirTy → Bool
+  | .bool | .int _ _ | .unit | .never => true
+  | .enum ety => refEnumAdmitted ety
+  | _ => false
+
+/-- Independent $M_{\text{ref}}$ primitive-readable type check. -/
+noncomputable def refIsPrimitiveReadableTy : MirTy → Bool
+  | .bool | .int _ _ => true
+  | _ => false
+
+/-- Independent $M_{\text{ref}}$ initial live slot for `ty` (inhabited for
+0-byte ZSTs `.unit` and admitted `.zeroSized` 1-variant enums). -/
+noncomputable def refLiveUninitSlot : MirTy → LocalSlot
+  | .unit => .live (some .unit)
+  | .enum ety =>
+    if refIsZstEnumTy ety then .live (some (.enumVal ety 0)) else .live none
+  | _ => .live none
+
+/-- Construct a scalar `Miri.ABI.LayoutData` for `(w, signed)`. -/
+noncomputable def refScalarLayoutData (w : IntWidth) (s : Bool) :
+    Miri.ABI.LayoutData :=
+  let sc : Miri.ABI.Scalar := .Union (value := .Int (toMiriInteger w) s)
+  {
+    fields := .Primitive
+    variants := .Single 0
+    backendRepr := .Scalar sc
+    largestNiche := none
+    uninhabited := false
+    align := Miri.ABI.AbiAlign.new Miri.ABI.Align.ONE
+    size := toMiriSize w
+    maxReprAlign := none
+    unadjustedAbiAlign := Miri.ABI.Align.ONE
+    reprC := false
+    randomizationSeed := 0
+  }
+
+/-- Construct a `Miri.ABI.LayoutData` from a `Miri.ABI.Scalar` tag descriptor
+for `Miri.Interpreter.DiscriminantHooks.tagLayout`. -/
+noncomputable def refTagScalarLayout? (tag : Miri.ABI.Scalar) :
+    Option Miri.ABI.LayoutData :=
+  match tag.primitive with
+  | .Int integer _ =>
+    some {
+      fields := .Primitive
+      variants := .Single 0
+      backendRepr := .Scalar tag
+      largestNiche := none
+      uninhabited := false
+      align := Miri.ABI.AbiAlign.new Miri.ABI.Align.ONE
+      size := integer.size
+      maxReprAlign := none
+      unadjustedAbiAlign := Miri.ABI.Align.ONE
+      reprC := false
+      randomizationSeed := 0
+    }
+  | _ => none
+
+/-- Inhabited 0-field `Miri.ABI.VariantLayout` entry for fieldless enum variants
+in `Variants.Multiple`. -/
+noncomputable def refInhabitedVariantLayout : Miri.ABI.VariantLayout := {
+  size := Miri.ABI.Size.ZERO
+  backendRepr := .Memory (sized := true)
+  fieldOffsets := Array.empty
+  fieldsInMemoryOrder := Array.empty
+  largestNiche := none
+  uninhabited := false
+}
+
+/-- `Miri.ABI.LayoutData` for a fieldless enum `ety : EnumTy`:
+`Variants.Single 0` (`Size.ZERO`, `isZst = true`) for `.zeroSized`, and
+`Variants.Multiple tag .Direct 0 variants` for `.scalar tagW tagS`. -/
+noncomputable def refEnumLayoutData (ety : EnumTy) : Miri.ABI.LayoutData :=
+  match ety.tagRepr with
+  | .zeroSized => {
+      fields := .Primitive
+      variants := .Single 0
+      backendRepr := .Memory (sized := true)
+      largestNiche := none
+      uninhabited := false
+      align := Miri.ABI.AbiAlign.new Miri.ABI.Align.ONE
+      size := Miri.ABI.Size.ZERO
+      maxReprAlign := none
+      unadjustedAbiAlign := Miri.ABI.Align.ONE
+      reprC := false
+      randomizationSeed := 0
+    }
+  | .scalar tagW tagS =>
+    let tag : Miri.ABI.Scalar := .Union (value := .Int (toMiriInteger tagW) tagS)
+    let variants :=
+      Array.mk (ety.discriminants.map (fun _ => refInhabitedVariantLayout))
+    {
+      refScalarLayoutData tagW tagS with
+      variants := .Multiple tag .Direct 0 variants
+    }
+
+/-- Construct `Miri.Interpreter.DiscriminantHooks` for a fixed `ety : EnumTy`
+(at `enumTyId` and `discrTyId := enumTyId + 1`) over state type `S` so both
+`evalRefConstLit` and `evalRefRvalue` delegate directly to
+`Miri.Interpreter.Discriminant.readDiscriminant` and
+`Miri.Interpreter.Discriminant.discriminantForVariant`. -/
+noncomputable def refDiscriminantHooksForEnum (S : Type) (enumTyId : Nat)
+    (ety : EnumTy) :
+    Miri.Interpreter.DiscriminantHooks Miri.Memory.Provenance S Unit Unit := {
+  runtimeTarget := Miri.ABI.RuntimeTargetDataLayout.default
+  discriminantLayout := fun _ ty s =>
+    if Nat.beq ty enumTyId then
+      .ok ⟨enumTyId + 1, refScalarLayoutData ety.discrWidth ety.discrSigned⟩ s
+    else
+      .error (.invalidProgram "unexpected enum TyId in discriminantLayout") s
+  tagLayout := fun _ tag s =>
+    match refTagScalarLayout? tag with
+    | some l => .ok ⟨0, l⟩ s
+    | none => .error (.invalidProgram "non-integer enum tag") s
+  discriminantValue := fun _ ty variant s =>
+    if Nat.beq ty enumTyId then
+      match MirSemantics.getElem? ety.discriminants variant with
+      | some disc => .ok (some (enumTyId + 1, BitVec.ofNat 128 disc)) s
+      | none => .error (.invalidProgram "enum variant out of bounds") s
+    else
+      .error (.invalidProgram "unexpected enum TyId in discriminantValue") s
+  variantForDiscriminant := fun _ ty discrBits s =>
+    if Nat.beq ty enumTyId then
+      .ok (refFindDiscrVariant? discrBits ety.discriminants) s
+    else
+      .error (.invalidProgram "unexpected enum TyId in variantForDiscriminant") s
+  adtVariantCount := fun _ _ s => .ok ety.discriminants.length s
+  projectRead := fun _ op field s =>
+    if Nat.beq field 0 then
+      match op.layout.layout.variants with
+      | .Multiple tag _ _ _ =>
+        match refTagScalarLayout? tag with
+        | some tl => .ok ⟨op.op, ⟨0, tl⟩⟩ s
+        | none => .error (.invalidProgram "non-integer enum tag") s
+      | _ => .error (.invalidProgram "projectRead on non-Multiple enum") s
+    else
+      .error (.invalidProgram "non-zero tag field on fieldless enum") s
+  readImmediate := fun _ op s =>
+    match op.op with
+    | .immediate .uninit =>
+      .error (.undefinedBehavior "InvalidUninitBytes(None)") s
+    | .immediate imm => .ok ⟨imm, op.layout⟩ s
+    | .indirect _ => .error (.unsupported "memory enum place unsupported") s
+  destLayout := fun _ =>
+    ⟨enumTyId + 1, refScalarLayoutData ety.discrWidth ety.discrSigned⟩
+  projectWrite := fun _ _ _ s =>
+    .error (.unsupported "SetDiscriminant unsupported") s
+  writeScalar := fun _ _ _ s =>
+    .error (.unsupported "SetDiscriminant unsupported") s
+  toOp := fun _ _ s =>
+    .error (.unsupported "SetDiscriminant unsupported") s
+  scalarMayBeNull := fun _ _ s => .ok true s
+}
+
 /-- Map `Trusted.MirAst.UnOp` to `Miri.MIR.UnOp`. -/
 noncomputable def toMiriUnOp : UnOp → Miri.MIR.UnOp
   | .not => .Not
@@ -820,6 +1058,26 @@ noncomputable def evalRefConstLit : MirTy → ConstLit → Except FaultKind Val
       | .error _ => .error .unsupported
     | _ => .error .unsupported
   | .unit, .zeroSized => .ok .unit
+  | .enum ety, .zeroSized =>
+    if refIsZstEnumTy ety then .ok (.enumVal ety 0) else .error .unsupported
+  | .enum ety, .scalar bits =>
+    match ety.tagRepr with
+    | .zeroSized => .error .unsupported
+    | .scalar tagW _ =>
+      if !refEnumAdmitted ety then
+        .error .unsupported
+      else
+        match Miri.Memory.ScalarInt.tryFromUInt bits (toMiriSize tagW) with
+        | .ok (some sc) =>
+          let op : Miri.Interpreter.OpTy Miri.Memory.Provenance :=
+            ⟨.immediate (.scalar (.fromScalarInt sc)),
+              ⟨0, refEnumLayoutData ety⟩⟩
+          match Miri.Interpreter.Discriminant.readDiscriminant
+              (refDiscriminantHooksForEnum Unit 0 ety) () op () with
+          | .ok v _ => .ok (.enumVal ety v)
+          | .error (.undefinedBehavior _) _ => .error .undefined
+          | .error _ _ => .error .unsupported
+        | _ => .error .unsupported
   | _, _ => .error .unsupported
 
 /-- Reference unary operator evaluator calling
@@ -882,7 +1140,7 @@ noncomputable def evalRefBinOp (op : BinOp) (lhs rhs : Val) :
       | .error _ => .error .unsupported
   | _, _ => .error .unsupported
 
-/-- Reference scalar/boolean/unit value validity and type check calling
+/-- Reference scalar/boolean/unit/enum value validity and type check calling
 `Miri.Memory.ScalarInt.tryFromUInt` and `Miri.Memory.ScalarInt.ofBool`. -/
 noncomputable def checkRefVal (v : Val) (ty : MirTy) : Bool :=
   match v, ty with
@@ -895,6 +1153,9 @@ noncomputable def checkRefVal (v : Val) (ty : MirTy) : Bool :=
     | .ok _ => true
     | .error _ => false
   | .unit, .unit => true
+  | .enumVal ety v, .enum ety' =>
+    (refEnumAdmitted ety && Nat.blt v ety.discriminants.length) &&
+      EnumTy.beq ety ety'
   | _, _ => false
 
 /-- Check that argument list `vs` matches parameter types `tys` under
@@ -974,6 +1235,30 @@ noncomputable def evalRefBoolSwitchBranches (discr : Bool)
     | .ok _ =>
       .error .unsupported
 
+/-- Caller sentinel frame beneath the entry function's frame.
+
+$M_{\text{ref}}$ represents the caller of the entry function as an explicit
+frame that owns the entry function's return place. In `lean-miri`,
+`MainThread.callMain` (`vendor/lean-miri/Miri/Interpreter/MainThread.lean`)
+allocates the return place `retPlace` before it calls the entry function, so
+that place outlives the entry frame. The sentinel models this caller-owned
+place as a single live destination slot (`_0`) of the entry function's return
+type `retTy`.
+
+The sentinel never executes a statement and is marked as a suspended caller
+(`returnContinuation := true`). `initRefState` places it beneath the entry
+frame, and `evalRefStep` requires it and preserves it on every running step,
+so the reference stack has one fixed shape. Returning from the entry frame
+ends the execution with `.returned` (`evalRefTerminator`) instead of resuming
+the sentinel. Its `defId`, `blockIdx`, and `stmtIdx` are unused. -/
+noncomputable def callerSentinelFrame (retTy : MirTy) : RefFrameState := {
+  defId := 0
+  blockIdx := 0
+  stmtIdx := 0
+  locals := [⟨refLiveUninitSlot retTy, some retTy⟩]
+  returnContinuation := true
+}
+
 /-- Initialize `RefLocalState` slots at function entry, pre-populating
 `cachedLayout := some ty` on every slot, matching `initFrameLocals` in
 `Miri.Interpreter.CallMachine` and
@@ -995,7 +1280,7 @@ noncomputable def initRefLocalsLoop (rbody : RefBody) (args : List Val) :
   | idx, ty :: rest =>
       let slot : LocalSlot :=
         if Nat.beq idx 0 then
-          liveUninitSlot ty
+          refLiveUninitSlot ty
         else if Nat.ble idx rbody.argumentCount then
           match MirSemantics.getElem? args (idx - 1) with
           | some v => .live (some v)
@@ -1003,7 +1288,7 @@ noncomputable def initRefLocalsLoop (rbody : RefBody) (args : List Val) :
         else if refHasStorageAnnotation rbody idx then
           .dead
         else
-          liveUninitSlot ty
+          refLiveUninitSlot ty
       ⟨slot, some ty⟩ :: initRefLocalsLoop rbody args (idx + 1) rest
 
 /-- Entry initialization of $M_{\text{ref}}$ (`initRefState rp q maxSteps`):
@@ -1035,7 +1320,7 @@ noncomputable def initRefState (rp : RefProg) (q : Query)
           .error .unsupported
         else if !refStorageAnnotationsInBounds rbody then
           .error .unsupported
-        else if !localTys.all isSupportedScalarOrUnitTy then
+        else if !localTys.all refIsSupportedLocalTy then
           .error .unsupported
         else
           let paramTys := (localTys.drop 1).take rbody.argumentCount
@@ -1095,11 +1380,14 @@ noncomputable def refLocalLayoutZst : Miri.Interpreter.LocalLayout := {
   }
 }
 
-/-- `Miri.Interpreter.LocalLayout` for a Day 1 scalar or unit local slot:
-0-byte ZST (`refLocalLayoutZst`, `isZst = true`) for `MirTy.unit`, and 8-byte
-sized layout (`refSizedLocalLayout`, `isZst = false`) for non-unit types. -/
+/-- `Miri.Interpreter.LocalLayout` for a supported local slot:
+0-byte ZST (`refLocalLayoutZst`, `isZst = true`) for `MirTy.unit` and admitted
+1-variant ZST fieldless enums (`refIsZstEnumTy`), and 8-byte sized layout
+(`refSizedLocalLayout`, `isZst = false`) for non-ZST types. -/
 noncomputable def refLocalLayoutForTy : MirTy → Miri.Interpreter.LocalLayout
   | .unit => refLocalLayoutZst
+  | .enum ety =>
+    if refIsZstEnumTy ety then refLocalLayoutZst else refSizedLocalLayout
   | _ => refSizedLocalLayout
 
 /-- Embed `optVal : Option Val` into `Miri.Interpreter.Immediate (Option Val)`
@@ -1217,7 +1505,7 @@ noncomputable def evalMiriMoveOperand (slot : LocalSlot) (ty : MirTy) :
       some (miriImmediateToOptVal imm, .live none)
     | .ok ⟨.live (.immediate _), _⟩ =>
       if outLayout.layout.isZst then
-        some (miriImmediateToOptVal imm, .live (some .unit))
+        some (miriImmediateToOptVal imm, refLiveUninitSlot ty)
       else
         none
     | _ => none
@@ -1289,12 +1577,20 @@ noncomputable def evalRefPrimitiveOperand (types : List MirTy)
   match evalRefOperandToSlot types rlocals opnd with
   | .error k => .error k
   | .ok (ty, optVal, rlocals') =>
-    if !isPrimitiveReadableTy ty then
+    if !refIsPrimitiveReadableTy ty then
       .error .unsupported
     else
       match optVal with
       | some v => .ok (v, rlocals')
       | none => .error .undefined
+
+/-- Map `RefPlace` to `Miri.MIR.Place` for `Rvalue.Discriminant` dispatch
+(preserving `localId` and marking any non-empty projection so `evalPlaceToOp`
+rejects projected discriminant reads fail-closed). -/
+noncomputable def toMiriPlaceForDiscriminant (rp : RefPlace) :
+    Miri.MIR.Place :=
+  ⟨rp.localId,
+    if rp.projection.isEmpty then Array.empty else Array.mk [.Deref]⟩
 
 /-- Map `RefRvalue` to its corresponding `Miri.MIR.Rvalue` constructor for
 `Miri.Interpreter.evalRvalueIntoPlace`. -/
@@ -1303,98 +1599,235 @@ noncomputable def toMiriRvalueForDispatch : RefRvalue → Miri.MIR.Rvalue
   | .binaryOp op _ _ =>
     .BinaryOp (toMiriBinOp op) (.Copy ⟨0, Array.empty⟩) (.Copy ⟨1, Array.empty⟩)
   | .unaryOp op _ => .UnaryOp (toMiriUnOp op) (.Copy ⟨0, Array.empty⟩)
+  | .discriminant rp => .Discriminant (toMiriPlaceForDiscriminant rp)
   | _ => .CopyForDeref ⟨0, Array.empty⟩
 
-/-- `Miri.Interpreter.RvalueHooks` used to dispatch and execute
-`Miri.MIR.Rvalue` through `Miri.Interpreter.evalRvalueIntoPlace` and
-`Miri.Interpreter.runRvalue`
-(`vendor/lean-miri/Miri/Interpreter/Rvalue.lean`). -/
-noncomputable def refRvalueHooksFor (types : List MirTy)
-    (rlocals : List RefLocalState) (dstTy : MirTy) (rrv : RefRvalue) :
-    Miri.Interpreter.RvalueHooks (Option Val)
-      (Option (Except FaultKind (Val × List RefLocalState))) Unit Unit := {
-  placeLayout := fun _ => refSizedLocalLayout
-  evalPlace := fun _ _ _ s => .ok () s
-  evalOperand := fun _ _ _ s =>
-    .ok ⟨.immediate .uninit, refSizedLocalLayout⟩ s
-  evalPlaceToOp := fun _ _ _ s =>
-    .ok ⟨.immediate .uninit, refSizedLocalLayout⟩ s
-  readImmediate := fun _ _ s =>
-    .ok ⟨.uninit, refSizedLocalLayout⟩ s
-  writeImmediate := fun _ _ _ s => .ok () s
-  writePointer := fun _ _ _ s =>
-    .error (.unsupported "ThreadLocalRef unsupported") s
-  threadLocalPointer := fun _ _ s =>
-    .error (.unsupported "ThreadLocalRef unsupported") s
-  withRetagMode := fun _ _ act => act
-  copyOp := fun _ _ _ _ =>
-    let res :=
-      match rrv with
-      | .use opnd =>
-        match evalRefOperandToSlot types rlocals opnd with
-        | .error k => .error k
-        | .ok (srcTy, optVal, rlocals₁) =>
-          if !(MirTy.beq srcTy dstTy) then
-            .error .unsupported
-          else
-            match optVal with
-            | some v => .ok (v, rlocals₁)
-            | none => .error .undefined
-      | _ => .error .unsupported
-    .ok () (some res)
-  copyOpAllowTransmute := fun _ _ _ s => .ok () s
-  binaryOp := fun _ _ _ _ _ =>
-    let res :=
-      match rrv with
-      | .binaryOp op lhs rhs =>
-        match evalRefPrimitiveOperand types rlocals lhs with
-        | .error k => .error k
-        | .ok (lVal, rlocals₁) =>
-          match evalRefPrimitiveOperand types rlocals₁ rhs with
-          | .error k => .error k
-          | .ok (rVal, rlocals₂) =>
-            match evalRefBinOp op lVal rVal with
-            | .error k => .error k
-            | .ok v => .ok (v, rlocals₂)
-      | _ => .error .unsupported
-    .ok ⟨.uninit, refSizedLocalLayout⟩ (some res)
-  unaryOp := fun _ _ _ _ =>
-    let res :=
-      match rrv with
-      | .unaryOp op opnd =>
-        match evalRefPrimitiveOperand types rlocals opnd with
-        | .error k => .error k
-        | .ok (v, rlocals₁) =>
-          match evalRefUnOp op v with
-          | .error k => .error k
-          | .ok u => .ok (u, rlocals₁)
-      | _ => .error .unsupported
-    .ok ⟨.uninit, refSizedLocalLayout⟩ (some res)
-  writeAggregate := fun _ _ _ _ s =>
-    .error (.unsupported "Aggregate unsupported on Day 1") s
-  writeRepeat := fun _ _ _ s =>
-    .error (.unsupported "Repeat unsupported") s
-  forceAllocation := fun _ _ s =>
-    .error (.unsupported "Ref/RawPtr unsupported on Day 1") s
-  toRef := fun _ _ s =>
-    .error (.unsupported "Ref/RawPtr unsupported on Day 1") s
-  enforceValidity := fun _ _ s => .ok false s
-  retagPtrValue := fun _ _ _ s => .ok none s
-  placeBaseRaw := fun _ _ s => .ok false s
-  normalize := fun _ ty s => .ok ty s
-  cast := fun _ _ _ _ _ s =>
-    .error (.unsupported "Cast unsupported") s
-  readDiscriminant := fun _ _ s =>
-    .error (.unsupported "Discriminant unsupported") s
-  discriminantForVariant := fun _ _ _ s =>
-    .error (.unsupported "Discriminant unsupported") s
+/-- `Miri.Interpreter.DiscriminantHooks` indexed by `localId` (`ty := localId`)
+in `rlocals`, delegating every enum query to `refDiscriminantHooksForEnum`. -/
+noncomputable def refDiscriminantHooksForLocals (S : Type)
+    (rlocals : List RefLocalState) :
+    Miri.Interpreter.DiscriminantHooks Miri.Memory.Provenance S Unit Unit := {
+  runtimeTarget := Miri.ABI.RuntimeTargetDataLayout.default
+  discriminantLayout := fun c ty s =>
+    match MirSemantics.getElem? rlocals ty with
+    | some ⟨_, some (.enum ety)⟩ =>
+      (refDiscriminantHooksForEnum S ty ety).discriminantLayout c ty s
+    | _ => .error (.invalidProgram "non-enum local in discriminantLayout") s
+  tagLayout := fun _ tag s =>
+    match refTagScalarLayout? tag with
+    | some l => .ok ⟨0, l⟩ s
+    | none => .error (.invalidProgram "non-integer enum tag") s
+  discriminantValue := fun c ty variant s =>
+    match MirSemantics.getElem? rlocals ty with
+    | some ⟨_, some (.enum ety)⟩ =>
+      (refDiscriminantHooksForEnum S ty ety).discriminantValue c ty variant s
+    | _ => .error (.invalidProgram "non-enum local in discriminantValue") s
+  variantForDiscriminant := fun c ty discrBits s =>
+    match MirSemantics.getElem? rlocals ty with
+    | some ⟨_, some (.enum ety)⟩ =>
+      (refDiscriminantHooksForEnum S ty ety).variantForDiscriminant c ty
+        discrBits s
+    | _ => .error (.invalidProgram "non-enum local in variantForDiscriminant") s
+  adtVariantCount := fun c ty s =>
+    match MirSemantics.getElem? rlocals ty with
+    | some ⟨_, some (.enum ety)⟩ =>
+      (refDiscriminantHooksForEnum S ty ety).adtVariantCount c ty s
+    | _ => .error (.invalidProgram "non-enum local in adtVariantCount") s
+  projectRead := fun _ op field s =>
+    if Nat.beq field 0 then
+      match op.layout.layout.variants with
+      | .Multiple tag _ _ _ =>
+        match refTagScalarLayout? tag with
+        | some tl => .ok ⟨op.op, ⟨0, tl⟩⟩ s
+        | none => .error (.invalidProgram "non-integer enum tag") s
+      | _ => .error (.invalidProgram "projectRead on non-Multiple enum") s
+    else
+      .error (.invalidProgram "non-zero tag field on fieldless enum") s
+  readImmediate := fun _ op s =>
+    match op.op with
+    | .immediate .uninit =>
+      .error (.undefinedBehavior "InvalidUninitBytes(None)") s
+    | .immediate imm => .ok ⟨imm, op.layout⟩ s
+    | .indirect _ => .error (.unsupported "memory enum place unsupported") s
+  destLayout := fun _ => refSizedLocalLayout
+  projectWrite := fun _ _ _ s =>
+    .error (.unsupported "SetDiscriminant unsupported") s
+  writeScalar := fun _ _ _ s =>
+    .error (.unsupported "SetDiscriminant unsupported") s
+  toOp := fun _ _ s =>
+    .error (.unsupported "SetDiscriminant unsupported") s
+  scalarMayBeNull := fun _ _ s => .ok true s
 }
 
+/-- Evaluate an unprojected enum local `src` to `Miri.Interpreter.OpTy` via
+`Miri.Interpreter.evalPlaceToOp` (`Miri.Interpreter.localToOp`) and
+`Miri.Memory.ScalarInt.truncateFromUInt` for `RvalueHooks.evalPlaceToOp`
+(`.Discriminant src`). -/
+noncomputable def evalRefEnumPlaceToOp (rlocals : List RefLocalState)
+    (src : Miri.MIR.Place)
+    (s : Option (Except FaultKind (Val × List RefLocalState))) :
+    EStateM.Result Miri.Interpreter.StepError
+      (Option (Except FaultKind (Val × List RefLocalState)))
+      (Miri.Interpreter.OpTy Miri.Memory.Provenance) :=
+  if !src.projection.isEmpty then
+    .error (.unsupported "projected Discriminant unsupported") s
+  else
+    match MirSemantics.getElem? rlocals src.localId with
+    | some ⟨slot, some (.enum ety)⟩ =>
+      if !refEnumAdmitted ety then
+        .error (.unsupported "unadmitted enum in Discriminant") s
+      else
+        let layout : Miri.Interpreter.LocalLayout :=
+          ⟨src.localId, refEnumLayoutData ety⟩
+        let frame₀ :=
+          mkSingleLocalMiriFrameWithLayout (slotToMiriLocalValue slot) layout
+            false
+        match (Miri.Interpreter.evalPlaceToOp (refLocalAccessHooks false)
+            frame₀ () ⟨0, Array.empty⟩ (some layout)).outcome with
+        | .error (.stack stackErr) => .error (.stack stackErr) s
+        | .error _ => .error (.unsupported "evalPlaceToOp failed") s
+        | .ok ⟨.indirect _, _⟩ =>
+          .error (.unsupported "indirect enum local unsupported") s
+        | .ok ⟨.immediate imm, _⟩ =>
+          match ety.tagRepr, miriImmediateToOptVal imm with
+          | .zeroSized, none =>
+            .ok ⟨.immediate .uninit, layout⟩ s
+          | .zeroSized, some (.enumVal ety' v) =>
+            if EnumTy.beq ety ety' && Nat.beq v 0 then
+              .ok ⟨.immediate .uninit, layout⟩ s
+            else
+              .error (.unsupported "mismatched ZST enum variant in slot") s
+          | .zeroSized, some _ =>
+            .error (.unsupported "non-enum value in ZST enum slot") s
+          | .scalar _ _, none =>
+            .ok ⟨.immediate .uninit, layout⟩ s
+          | .scalar tagW _, some (.enumVal ety' v) =>
+            if EnumTy.beq ety ety' && Nat.blt v ety.discriminants.length then
+              match MirSemantics.getElem? ety.discriminants v with
+              | some disc =>
+                match Miri.Memory.ScalarInt.truncateFromUInt
+                    (BitVec.ofNat 128 disc) (toMiriSize tagW) with
+                | .ok (tagSc, _) =>
+                  .ok ⟨.immediate (.scalar (.fromScalarInt tagSc)), layout⟩ s
+                | .error _ =>
+                  .error (.invalidProgram "enum tag truncate failure") s
+              | none =>
+                .error (.invalidProgram "missing enum discriminant") s
+            else
+              .error (.unsupported "mismatched scalar enum variant in slot") s
+          | .scalar _ _, some _ =>
+            .error (.unsupported "non-enum value in scalar enum slot") s
+    | _ => .error (.unsupported "Discriminant on non-enum local") s
+
+/-- `Miri.Interpreter.RvalueHooks` used to dispatch and execute
+`Miri.MIR.Rvalue` through `Miri.Interpreter.evalRvalueIntoPlace`,
+`Miri.Interpreter.Discriminant.readDiscriminant`,
+`Miri.Interpreter.Discriminant.discriminantForVariant`, and
+`Miri.Interpreter.runRvalue` (`vendor/lean-miri/Miri/Interpreter/Rvalue.lean`
+and `Discriminant.lean`). -/
+noncomputable def refRvalueHooksFor (types : List MirTy)
+    (rlocals : List RefLocalState) (dstTy : MirTy) (rrv : RefRvalue) :
+    Miri.Interpreter.RvalueHooks Miri.Memory.Provenance
+      (Option (Except FaultKind (Val × List RefLocalState))) Unit Unit :=
+  let S := Option (Except FaultKind (Val × List RefLocalState))
+  let discrHooks := refDiscriminantHooksForLocals S rlocals
+  {
+    placeLayout := fun _ => refSizedLocalLayout
+    evalPlace := fun _ _ _ s => .ok () s
+    evalOperand := fun _ _ _ s =>
+      .ok ⟨.immediate .uninit, refSizedLocalLayout⟩ s
+    evalPlaceToOp := fun _ src _ s =>
+      evalRefEnumPlaceToOp rlocals src s
+    readImmediate := fun _ _ s =>
+      .ok ⟨.uninit, refSizedLocalLayout⟩ s
+    writeImmediate := fun _ _ _ s => .ok () s
+    writePointer := fun _ _ _ s =>
+      .error (.unsupported "ThreadLocalRef unsupported") s
+    threadLocalPointer := fun _ _ s =>
+      .error (.unsupported "ThreadLocalRef unsupported") s
+    withRetagMode := fun _ _ act => act
+    copyOp := fun _ _ _ _ =>
+      let res :=
+        match rrv with
+        | .use opnd =>
+          match evalRefOperandToSlot types rlocals opnd with
+          | .error k => .error k
+          | .ok (srcTy, optVal, rlocals₁) =>
+            if !(MirTy.beq srcTy dstTy) then
+              .error .unsupported
+            else
+              match optVal with
+              | some v => .ok (v, rlocals₁)
+              | none => .error .undefined
+        | _ => .error .unsupported
+      .ok () (some res)
+    copyOpAllowTransmute := fun _ _ _ s => .ok () s
+    binaryOp := fun _ _ _ _ _ =>
+      let res :=
+        match rrv with
+        | .binaryOp op lhs rhs =>
+          match evalRefPrimitiveOperand types rlocals lhs with
+          | .error k => .error k
+          | .ok (lVal, rlocals₁) =>
+            match evalRefPrimitiveOperand types rlocals₁ rhs with
+            | .error k => .error k
+            | .ok (rVal, rlocals₂) =>
+              match evalRefBinOp op lVal rVal with
+              | .error k => .error k
+              | .ok v => .ok (v, rlocals₂)
+        | _ => .error .unsupported
+      .ok ⟨.uninit, refSizedLocalLayout⟩ (some res)
+    unaryOp := fun _ _ _ _ =>
+      let res :=
+        match rrv with
+        | .unaryOp op opnd =>
+          match evalRefPrimitiveOperand types rlocals opnd with
+          | .error k => .error k
+          | .ok (v, rlocals₁) =>
+            match evalRefUnOp op v with
+            | .error k => .error k
+            | .ok u => .ok (u, rlocals₁)
+        | _ => .error .unsupported
+      .ok ⟨.uninit, refSizedLocalLayout⟩ (some res)
+    writeAggregate := fun _ _ _ _ s =>
+      .error (.unsupported "Aggregate unsupported on Day 1") s
+    writeRepeat := fun _ _ _ s =>
+      .error (.unsupported "Repeat unsupported") s
+    forceAllocation := fun _ _ s =>
+      .error (.unsupported "Ref/RawPtr unsupported on Day 1") s
+    toRef := fun _ _ s =>
+      .error (.unsupported "Ref/RawPtr unsupported on Day 1") s
+    enforceValidity := fun _ _ s => .ok false s
+    retagPtrValue := fun _ _ _ s => .ok none s
+    placeBaseRaw := fun _ _ s => .ok false s
+    normalize := fun _ ty s => .ok ty s
+    cast := fun _ _ _ _ _ s =>
+      .error (.unsupported "Cast unsupported") s
+    readDiscriminant :=
+      Miri.Interpreter.Discriminant.readDiscriminant discrHooks
+    discriminantForVariant := fun c ty variant s =>
+      match Miri.Interpreter.Discriminant.discriminantForVariant
+          discrHooks c ty variant s with
+      | .error err s' => .error err s'
+      | .ok discr s' =>
+        match MirSemantics.getElem? rlocals ty, discr.imm with
+        | some ⟨_, some (.enum ety)⟩, .scalar msc =>
+          match msc.tryToScalarInt with
+          | .ok (.integer sc) =>
+            .ok discr
+              (some (.ok (.scalar ⟨ety.discrWidth, ety.discrSigned, sc.data⟩,
+                rlocals)))
+          | _ => .error (.invalidProgram "non-integer discriminant scalar") s'
+        | _, _ => .error (.invalidProgram "invalid discriminant state") s'
+  }
+
 /-- Reference rvalue evaluator delegating outer dispatch and execution to
-`Miri.Interpreter.evalRvalueIntoPlace` and `Miri.Interpreter.runRvalue`
-(`vendor/lean-miri/Miri/Interpreter/Rvalue.lean`), matching
-`eval_rvalue_into_place` in `compiler/rustc_const_eval/src/interpret/step.rs`
-(`rust-lang/rust` `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`Miri.Interpreter.evalRvalueIntoPlace`,
+`Miri.Interpreter.Discriminant.{readDiscriminant, discriminantForVariant}`, and
+`Miri.Interpreter.runRvalue` (`vendor/lean-miri/Miri/Interpreter/Rvalue.lean`
+and `Discriminant.lean`), matching `eval_rvalue_into_place` in
+`compiler/rustc_const_eval/src/interpret/step.rs` (`rust-lang/rust`
+`8144389c895da997dbdecaa635e41d6a50be6ffd`):
 
 > "pub fn eval_rvalue_into_place(&mut self, rvalue: &mir::Rvalue<'tcx>,
 > place: mir::Place<'tcx>) -> InterpResult<'tcx>"
@@ -1408,6 +1841,8 @@ noncomputable def evalRefRvalue (types : List MirTy)
         (refRvalueHooksFor types rlocals dstTy rrv) ()
         (toMiriRvalueForDispatch rrv) ⟨0, Array.empty⟩) none with
   | (some res, .ok ()) => res
+  | (_, .error (.undefinedBehavior _))
+  | (_, .error (.stack (.localExpectedLive _))) => .error .undefined
   | _ => .error .unsupported
 
 /-- Write `val` into destination local `dstLocalId` in `rlocals` via
@@ -1690,7 +2125,7 @@ noncomputable def refStepHooksFor (types : List MirTy) (rframe : RefFrameState)
         match MirSemantics.getElem? rframe.locals localId with
         | some ⟨_, some localTy⟩ =>
           match MirSemantics.setElem? rframe.locals localId
-              ⟨liveUninitSlot localTy, some localTy⟩ with
+              ⟨refLiveUninitSlot localTy, some localTy⟩ with
           | some rlocals' =>
             .step {
               frames := [{
@@ -2421,5 +2856,62 @@ noncomputable def CanaryD10AddUncheckedOverflowUbClaim : Prop :=
   Behavior progAddU32 queryU32MaxPlusOne (.returned ⟨u32Val 0, ⟨[]⟩⟩) ∧
   RefBehavior (encodeProg progAddU32) queryU32MaxPlusOne
     (.returned ⟨u32Val 0, ⟨[]⟩⟩)
+
+/-- Trusted claim for
+`Anneal.MirCorrespondenceProof.canary_D11_enum_discriminant_and_const_ok`:
+exercises explicit-repr `#[repr(u8)]` non-index enum constant tag decoding +
+`u8` `Rvalue.discriminant` and signed `i8` -> `isize` tag sign-extension in
+both $M_{\text{anneal}}$ and $M_{\text{ref}}$ (`Miri.Interpreter.Discriminant`).
+-/
+noncomputable def CanaryD11EnumDiscriminantAndConstOkClaim : Prop :=
+  WellFormed progEnumExplicitReprU8 queryEmpty ∧
+  Behavior progEnumExplicitReprU8 queryEmpty
+    (.returned ⟨u8Val 20, ⟨[]⟩⟩) ∧
+  RefWellFormed (encodeProg progEnumExplicitReprU8) queryEmpty ∧
+  RefBehavior (encodeProg progEnumExplicitReprU8) queryEmpty
+    (.returned ⟨u8Val 20, ⟨[]⟩⟩) ∧
+  WellFormed progEnumSignedTagIsize queryEmpty ∧
+  Behavior progEnumSignedTagIsize queryEmpty
+    (.returned ⟨scalarNatVal .isize true (Nat.pow 2 64 - 1), ⟨[]⟩⟩) ∧
+  RefWellFormed (encodeProg progEnumSignedTagIsize) queryEmpty ∧
+  RefBehavior (encodeProg progEnumSignedTagIsize) queryEmpty
+    (.returned ⟨scalarNatVal .isize true (Nat.pow 2 64 - 1), ⟨[]⟩⟩)
+
+/-- Trusted claim for
+`Anneal.MirCorrespondenceProof.canary_D12_zst_enum_move_and_discr_ok`:
+exercises 1-variant inhabited ZST enum implicit return, non-deinitializing
+`Operand.move`, `ConstLit.zeroSized`, and `Variants.Single 0`
+`Rvalue.discriminant` in both $M_{\text{anneal}}$ and $M_{\text{ref}}$. -/
+noncomputable def CanaryD12ZstEnumMoveAndDiscrOkClaim : Prop :=
+  WellFormed progZstSingleEnumImplicitRet queryEmpty ∧
+  Behavior progZstSingleEnumImplicitRet queryEmpty
+    (.returned ⟨.enumVal canarySingleZstEnumTy 0, ⟨[]⟩⟩) ∧
+  RefWellFormed (encodeProg progZstSingleEnumImplicitRet) queryEmpty ∧
+  RefBehavior (encodeProg progZstSingleEnumImplicitRet) queryEmpty
+    (.returned ⟨.enumVal canarySingleZstEnumTy 0, ⟨[]⟩⟩) ∧
+  WellFormed progZstSingleEnumMoveAndDiscr queryEmpty ∧
+  Behavior progZstSingleEnumMoveAndDiscr queryEmpty
+    (.returned ⟨scalarNatVal .isize true 42, ⟨[]⟩⟩) ∧
+  RefWellFormed (encodeProg progZstSingleEnumMoveAndDiscr) queryEmpty ∧
+  RefBehavior (encodeProg progZstSingleEnumMoveAndDiscr) queryEmpty
+    (.returned ⟨scalarNatVal .isize true 42, ⟨[]⟩⟩)
+
+/-- Trusted claim for
+`Anneal.MirCorrespondenceProof.canary_D13_enum_invalid_tag_and_uninit_ub`:
+exercises invalid constant scalar tag `1` on `ReprU8 { A = 10, B = 20 }` and
+reading `Rvalue.discriminant` from an uninitialized scalar-tagged enum local,
+both faulting with `.undefined` / `.ub` in $M_{\text{anneal}}$ and
+$M_{\text{ref}}$. -/
+noncomputable def CanaryD13EnumInvalidTagAndUninitUbClaim : Prop :=
+  ReachesResult progEnumInvalidTagConstUb queryEmpty (.fault .undefined) ∧
+  ¬ ReachesResult progEnumInvalidTagConstUb queryEmpty (.fault .unsupported) ∧
+  ¬ WellFormed progEnumInvalidTagConstUb queryEmpty ∧
+  (∃ maxSteps, RefReachesOutcome (encodeProg progEnumInvalidTagConstUb)
+    queryEmpty maxSteps .ub) ∧
+  ReachesResult progEnumUninitDiscrUb queryEmpty (.fault .undefined) ∧
+  ¬ ReachesResult progEnumUninitDiscrUb queryEmpty (.fault .unsupported) ∧
+  ¬ WellFormed progEnumUninitDiscrUb queryEmpty ∧
+  (∃ maxSteps, RefReachesOutcome (encodeProg progEnumUninitDiscrUb)
+    queryEmpty maxSteps .ub)
 
 end Trusted.Correspondence

@@ -94,9 +94,10 @@ trusted/correspondence/Trusted/ Correspondence TCB specification (Pass 2)
                                 (-- anneal-trust-tier: candidate:mir_semantics)
 
 correspondence/Anneal/          Untrusted correspondence proof (Pass 2)
-  MirCorrespondenceProof.lean   Bijective SimulationInv, step proofs, codec
-                                constructor-preservation theorems, and M_ref
-                                correspondence canaries (D6-D10)
+  MirCorrespondenceBase.lean    Codec round-trip, canonicality, SimulationInv,
+                                and Miri scalar/discriminant bridge lemmas
+  MirCorrespondenceProof.lean   Per-step simulation, correspondence theorems,
+                                and M_ref correspondence canaries (D6-D13)
 
 trusted/audit/                  Two-pass source + binary .olean auditor
   src/lib.rs                    Pass 1 (51-module core lock) + Pass 2
@@ -146,7 +147,7 @@ Placing `Trusted.Correspondence` and `Anneal.MirCorrespondenceProof` in
    enabled), `TrustedBoundary.lean` (`verifyMirWpCoreTheorems`) requires
    `Trusted.MirAst` and `Trusted.MirSemantics` in `trusted/` and `Anneal.MirWp`
    in `theory/`, and verifies that `wellFormed_and_spec_of_wp`,
-   `reaches_fault_and_exclusive_of_wpFault`, and all 15 Pass 1 canary theorems
+   `reaches_fault_and_exclusive_of_wpFault`, and all 19 Pass 1 canary theorems
    in `Anneal.MirWp` prove the exact trusted `*Claim` propositions (referencing
    the trusted `prog*` fixtures) defined in `Trusted.MirSemantics`. Only
    `trusted/lean/` and `theory/` ship in `omnibus-archive`, keeping downstream
@@ -298,7 +299,7 @@ together with every later change to those definitions:
   (`RefReachesOutcome`, `RefWellFormed`, `RefBehavior`, `RefDiverges`, and
   `faultToRefOutcome`); and the claims and canary propositions themselves
   (`CorrespondenceClaim`, `FaultEquivalenceClaim`, `MiriMoveDeinitWiringClaim`,
-  and `CanaryD6*Claim`–`CanaryD10*Claim`).
+  and `CanaryD6*Claim`–`CanaryD13*Claim`).
 - **`vendor/lean-miri/`:** `Trusted.Correspondence` drives `evalRefStep`
   through `lean-miri`'s interpreter modules (`Miri.Interpreter.evalOperand`,
   `Miri.Interpreter.evalRvalueIntoPlace`, `Miri.Interpreter.Step.evalStatement`,
@@ -1424,6 +1425,18 @@ The Pass 1 canaries in `Anneal.MirWp` check $M_{\text{anneal}}$ directly:
   `StatementKind.storageDead 0` on return place `_0` (matching
   `StackError.storageDeadReturnPlace`) reach `.fault .unsupported` (not
   `.undefined`) and are not `WellFormed`.
+- **`canary_positive_enum_explicit_repr_anneal`,
+  `canary_positive_zst_single_enum_anneal`, and
+  `canary_negative_ub_enum_invalid_tag_and_uninit_anneal`:**
+  Exercise fieldless enum encoded-tag constant decoding (`#[repr(u8)]` and
+  signed `i8` -> `isize`), explicit-width `Rvalue.discriminant`, inhabited
+  1-variant zero-sized enums (`EnumTagRepr.zeroSized`, `ConstLit.zeroSized`),
+  invalid scalar enum tag UB, and uninitialized enum discriminant read UB.
+- **`canary_crate_and_body_verified_anneal`:**
+  Exercises `CrateTheorem`, `UnitTheorem`, `BodyVerified` (including
+  `p.bodies[defId]` lookup binding, `isUnsafe` contract gating, and
+  uninhabited `MirTy.never` parameter `BodyStaticAdmitted` non-vacuity), and
+  empty-`bodies` / out-of-bounds `entryDefId` / duplicate-`identity` rejection.
 
 The Pass 2 canaries in `Anneal.MirCorrespondenceProof` check both models:
 
@@ -1443,6 +1456,13 @@ The Pass 2 canaries in `Anneal.MirCorrespondenceProof` check both models:
   `_0 = AddUnchecked(_1, _2)` reaches `.fault .undefined` in $M_{\text{anneal}}$
   and `.ub` in $M_{\text{ref}}$, while wrapping `_0 = Add(_1, _2)` returns `0`
   in both.
+- **`canary_D11_enum_discriminant_and_const_ok`,
+  `canary_D12_zst_enum_move_and_discr_ok`, and
+  `canary_D13_enum_invalid_tag_and_uninit_ub`:**
+  Verify agreement between $M_{\text{anneal}}$ and $M_{\text{ref}}$
+  (`Miri.Interpreter.Discriminant`) across explicit-repr and signed-tag
+  fieldless enums, 1-variant zero-sized enums, invalid scalar enum tags, and
+  uninitialized enum discriminant reads.
 
 ---
 
