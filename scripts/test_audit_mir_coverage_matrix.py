@@ -518,14 +518,23 @@ class ManifestTests(AuditFixtureTestCase):
 
     def test_divergence_theorem_outside_the_manifest_is_rejected(self) -> None:
         # Neither in the manifest (so not non-vacuity-audited) nor trackable in Pillar 3.
-        self.edit(CORR, "def tailCallTerm", "theorem tail_hidden_divergence : 1 = 1 := rfl\n\ndef tailCallTerm")
+        self.edit(
+            CORR,
+            "def tailCallTerm",
+            "theorem tail_hidden_divergence : 1 = 1 := rfl\n"
+            "lemma tail_lemma_diverges : 1 = 1 := rfl\n"
+            "def tail_def_divergence : Prop := 1 = 1\n\ndef tailCallTerm",
+        )
+        self.edit(SUITE, '"category": "intentional_modeling_choice"', '"category": "unknown_category"')
         report = self.run_checks()
         self.assert_only_failures(report, {"c_variant_manifest"})
-        self.assert_error(
-            report,
-            "c_variant_manifest",
-            "divergence theorem `tail_hidden_divergence` is declared but is not a manifest theorem",
-        )
+        for sym in ("tail_hidden_divergence", "tail_lemma_diverges", "tail_def_divergence"):
+            self.assert_error(
+                report,
+                "c_variant_manifest",
+                f"divergence theorem `{sym}` is declared but is not a manifest theorem",
+            )
+        self.assert_error(report, "c_variant_manifest", "invalid category 'unknown_category'")
 
 
 class HygieneTests(AuditFixtureTestCase):

@@ -90,7 +90,7 @@ Coverage manifest (checked by `scripts/audit_mir_coverage_matrix.py --check` and
 final `run_cmd`):
 -/
 -- @mir-variant-coverage StatementKind.constEvalCounter trusted=constEvalCounter_trusted_step_universal,constEvalCounter_stepMirFn_universal,constEvalCounter_nop_statement_equiv minirust=constEvalCounter_minirust_ops_corresponds,constEvalCounter_minirustSpec_fail_closed leanmiri=constEvalCounter_leanMiri_lockstep,constEvalCounter_leanMiri_nop_equiv positive=constEvalCounter_witness_runs,constEvalCounter_leanMiri_witness negative=constEvalCounter_witness_ub_not_masked,constEvalCounter_witness_minirustSpec_rejects
--- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_checks_classification,tailCall_leanMiri_nounwind_callee,tailCall_leanMiri_unwind_verdicts,tailCall_abi_mismatch_corresponds,tailCall_leanMiri_calling_conv_ub_corresponds positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi,tailCall_leanMiri_witness_checks,tailCall_leanMiri_witness_unwind
+-- @mir-variant-coverage TerminatorKind.tailCall trusted=tailCall_trusted_direct_enters_without_push,tailCall_trusted_vs_call_depth,tailCall_trusted_return_through,tailCall_trusted_external,tailCall_trusted_external_resume_is_return,tailCall_trusted_fail_closed_universal,tailCall_trusted_non_function_value_ub,tailCall_trusted_unwind_through,tailCall_trusted_direct_and_unsupported_fail_closed,tailCall_trusted_return_through_fail_closed minirust=tailCall_minirust_corresponds leanmiri=tailCall_leanMiri_shape_lockstep,tailCall_leanMiri_root_stop_diverges,tailCall_leanMiri_arity_ub,tailCall_leanMiri_ret_abi_and_cleanup_universal,tailCall_leanMiri_arg_abi_universal,tailCall_leanMiri_checks_classification,tailCall_leanMiri_nounwind_callee,tailCall_leanMiri_unwind_verdicts,tailCall_abi_mismatch_corresponds,tailCall_leanMiri_calling_conv_ub_corresponds,tailCall_leanMiri_call_pushes positive=tailCall_leanMiri_witness,tailCall_witness_nested_runs,tailCall_witness_root_runs,tailCall_witness_external,tailCall_witness_indirect_and_zst negative=tailCall_witness_ub_cases,tailCall_witness_direct_arity_divergence,tailCall_leanMiri_witness_arg_abi,tailCall_leanMiri_witness_checks,tailCall_leanMiri_witness_unwind
 -- @mir-variant-coverage ProjectionElem.opaqueCast trusted=opaqueCast_trusted_traversal_universal,opaqueCast_trusted_retype_universal,opaqueCast_trusted_overlap_universal,opaqueCast_trusted_place_read_universal,opaqueCast_trusted_placeTy_and_helpers_universal,opaqueCast_trusted_write_and_borrow_universal,opaqueCast_trusted_place_rw_with_decls,opaqueCast_trusted_stmt_placeMention_and_deinit_universal,opaqueCast_trusted_root_dispatch_divergence minirust=opaqueCast_minirust_corresponds leanmiri=opaqueCast_leanMiri_phase_boundary positive=opaqueCast_witness_read_write,opaqueCast_witness_projected_move,opaqueCast_witness_place_rw_with_decls negative=opaqueCast_witness_ub_not_masked,opaqueCast_witness_references_reject,opaqueCast_witness_type_switch,opaqueCast_witness_root_dispatch
 
 /-
@@ -520,7 +520,7 @@ private theorem mapM_none_of_mem {α β : Type} (f : α → Option β) :
 
 /-- A body that contains a statement rejected by `MiniRustSpec`'s fragment check is not in
 the `MiniRustSpec` fragment (so `step_correspondence` is never claimed for it). -/
-theorem inFragment_false_of_stmt {body : CapturedMir} {bb : BasicBlockData}
+private theorem inFragment_false_of_stmt {body : CapturedMir} {bb : BasicBlockData}
     (hbb : bb ∈ body.basicBlocks) {s : Statement} (hs : s ∈ bb.statements)
     (hbad : MiniRustSpec.Correspondence.statementOk body.localDecls s body.layouts = false) :
     MiniRustSpec.Correspondence.inFragment body = false := by
@@ -1211,7 +1211,7 @@ theorem tailCall_trusted_return_through_fail_closed
 
 /-- A body whose block ends in a terminator rejected by `MiniRustSpec`'s fragment check is
 not in the `MiniRustSpec` fragment. -/
-theorem inFragment_false_of_term {body : CapturedMir} {bb : BasicBlockData}
+private theorem inFragment_false_of_term {body : CapturedMir} {bb : BasicBlockData}
     (hbb : bb ∈ body.basicBlocks)
     (hbad : MiniRustSpec.Correspondence.terminatorOk body.layouts body.localDecls
       body.basicBlocks.length bb.terminator = false) :
@@ -1630,19 +1630,22 @@ def unwindCallerMem (mem : Memory) (caller : SavedCallerFrame) (rest : List Save
   { mem with callStack := rest, activeCallee := some caller.callerBody,
              activeProtectors := restoreCallerProtectors caller }
 
-/-- **Unwinding out of a tail-callee (universal; lockstep and nounwind divergence).** For a
-nested tail call (`s.memory.callStack = caller :: rest`, inherited action
-`caller.returnUnwind`), Miri's `UnwindResume` out of the tail-callee (`returnFromCurrentFrame
-… true` → `unwindToBlock`, transcribed as `LeanMiri.unwindResume`) resolves the callee frame's
-continuation, while Trusted (`unwindFromCallStack`) resolves the saved caller's
-`returnUnwind`:
-* unwinding callee: both resolve the *same* action — `unreachable` is UB in both, `terminate`
-  aborts, `cleanup bb` resumes the caller at `bb`, and `continue_` keeps unwinding (Trusted
-  pops on into `rest` within the same step);
-* non-unwinding callee (`nounwindAs := some .unreachable`): Miri is UB for **every**
-  inherited action, Trusted only for `unreachable`; for `cleanup` / `terminate` / `continue_`
-  Trusted resumes, aborts, or keeps unwinding where Miri reports UB
-  (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`). -/
+/-- **Unwinding out of a tail-callee (universal; lockstep, nounwind divergence, and
+modular-root topmost-frame divergence).**
+* Under a nested caller (`s.memory.callStack = caller :: rest`, inherited action
+  `caller.returnUnwind`), Miri's `UnwindResume` out of the tail-callee (`returnFromCurrentFrame
+  … true` → `unwindToBlock`, transcribed as `LeanMiri.unwindResume`) resolves the callee frame's
+  continuation, while Trusted (`unwindFromCallStack` — for both in-table `UnwindResume` and
+  external `resumeExternalTailCall (.panicked …)`) resolves the saved caller's `returnUnwind`:
+  - unwinding callee: both resolve the *same* action (`unreachable` is UB, `terminate` aborts,
+    `cleanup bb` resumes the caller at `bb`, `continue_` keeps unwinding);
+  - non-unwinding callee (`nounwindAs := some .unreachable`): Miri is UB for **every**
+    inherited action, Trusted only for `unreachable` (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
+* At a modular root (`s0.memory.callStack = []`, `StackShapeRel (.goto ret u) [] m0`, where
+  `m0.frames.length = 1`): after the tail call (`m'.frames.length = 1`), Miri's
+  `returnFromCurrentFrame` faults with UB `"unwinding past the topmost stack frame"`, whereas
+  Trusted's modular-root model (`MODEL-LM-TAILCALL-MODULAR-ROOT`) halts cleanly with
+  `MirStepNode.retOutcome .panic` / `.halted .panic`. -/
 theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
     (s : MachineState) (calleeBody : CapturedMir) (argVals : List Value)
     (rootCont : LeanMiri.ReturnContinuation UnwindAction)
@@ -1666,7 +1669,27 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
          MirStepNode.step { frame := { caller.frame with blockIdx := bb, stmtIdx := 0 },
                             memory := unwindCallerMem s.memory caller rest }
        | .continue_ =>
-         execNode (unwindFromCallStack rest (unwindCallerMem s.memory caller rest))) := by
+         execNode (unwindFromCallStack rest (unwindCallerMem s.memory caller rest))) ∧
+    execNode (resumeExternalTailCall
+        (.panicked (enterTailCalleeFrame s.memory calleeBody argVals).memory)) =
+      evalTerminator ⟨f, (enterTailCalleeFrame s.memory calleeBody argVals).memory⟩
+        ⟨.unwindResume, span⟩ cb ∧
+    (∀ (s0 : MachineState) (m0 : LeanMiri.StepState B P UnwindAction M)
+        (ret : Option Nat) (u : UnwindAction),
+      s0.memory.callStack = [] →
+      StackShapeRel (.goto ret u) s0.memory.callStack m0 →
+      (∃ m', LeanMiri.evalTailCallTerminator callee n n m0 = .ok m' ∧
+        LeanMiri.unwindResume m' =
+          .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+      (∃ m', LeanMiri.evalTailCallTerminator callee n n m0 { nounwindAs := some .unreachable } =
+          .ok m' ∧
+        LeanMiri.unwindResume m' =
+          .error (.undefinedBehavior "unwinding past the topmost stack frame")) ∧
+      evalTerminator ⟨f, (enterTailCalleeFrame s0.memory calleeBody argVals).memory⟩
+          ⟨.unwindResume, span⟩ cb = MirStepNode.retOutcome .panic ∧
+      resumeExternalTailCall
+          (.panicked (enterTailCalleeFrame s0.memory calleeBody argVals).memory) =
+        .halted .panic) := by
   obtain ⟨init, last, hfr, hlast, hmap⟩ := shape_last hrel
   have hact : activeCont rootCont s.memory.callStack =
       .goto (if caller.isDiverging then none else some caller.returnTarget)
@@ -1692,7 +1715,7 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
         LeanMiri.unwindToBlock ur := by
     intro ur
     simp [LeanMiri.unwindResume, hlen]
-  refine ⟨⟨_, ?_, hres caller.returnUnwind⟩, ⟨_, ?_, hres .unreachable⟩, ?_⟩
+  refine ⟨⟨_, ?_, hres caller.returnUnwind⟩, ⟨_, ?_, hres .unreachable⟩, ?_, ?_, ?_⟩
   · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr,
       List.getLast?_concat, hlast, hpass, Nat.lt_irrefl, ite_false, List.dropLast_concat]
     simp
@@ -1703,6 +1726,38 @@ theorem tailCall_leanMiri_unwind_verdicts {B P M : Type}
       simp [evalTerminator, enterTailCalleeFrame, hcs, unwindFromCallStack, hu, execNode,
         unwindCallerMem] <;>
       rfl
+  · simp [resumeExternalTailCall, evalTerminator, enterTailCalleeFrame, hcs]
+    cases unwindFromCallStack rest (unwindCallerMem s.memory caller rest) <;>
+      cases caller.returnUnwind <;> rfl
+  · intro s0 m0 ret u hnil0 hrel0
+    obtain ⟨init0, last0, hfr0, hlast0, hmap0⟩ := shape_last hrel0
+    have hact0 : activeCont (.goto ret u) s0.memory.callStack = .goto ret u := by
+      rw [hnil0]; rfl
+    rw [hact0] at hlast0
+    have hinit0 : init0 = [] := by
+      unfold StackShapeRel at hrel0
+      have hl0 := congrArg List.length hrel0
+      simp [hfr0, hnil0] at hl0
+      exact hl0
+    subst hinit0
+    have hres0 : ∀ (ur : UnwindAction),
+        LeanMiri.unwindResume
+            ({ m0 with frames :=
+                [{ body := callee, returnContinuation := .goto ret ur,
+                   returnPlace := last0.returnPlace, location := .mir ⟨0, 0⟩ }] } :
+              LeanMiri.StepState B P UnwindAction M) =
+          .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
+      intro ur
+      simp [LeanMiri.unwindResume]
+    refine ⟨⟨_, ?_, hres0 u⟩, ⟨_, ?_, hres0 .unreachable⟩,
+      by simp [evalTerminator, enterTailCalleeFrame, hnil0, unwindFromCallStack],
+      by simp [resumeExternalTailCall, enterTailCalleeFrame, hnil0, unwindFromCallStack]⟩
+    · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
+        List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
+      simp
+    · simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr0,
+        List.nil_append, List.getLast?_singleton, hlast0, hpass, Nat.lt_irrefl, ite_false]
+      simp
 
 /-- **ABI mismatch correspondence (universal).** For an indirect tail call through a
 registered function pointer whose reified calling convention `sigAbi` differs from the
@@ -1742,25 +1797,46 @@ theorem tailCall_abi_mismatch_corresponds {B P M : Type}
 
 /-- **LeanMiri call contrast (universal).** A returning Trusted `call` (`pushCalleeFrame`)
 and the transcribed call push both grow the stack by one frame and stay shape-related —
-the pushed continuation is the saved caller's `goto targetBb` — whereas a tail call keeps
-the depth (`tailCall_leanMiri_shape_lockstep`). -/
+the pushed continuation is the saved caller's `goto targetBb` — whereas a tail call
+(`enterTailCalleeFrame` / `LeanMiri.evalTailCallTerminator`) preserves the depth, so the
+returning call is strictly one frame deeper than the tail call on both sides. -/
 theorem tailCall_leanMiri_call_pushes {B P M : Type}
     (s : MachineState) (callerBody calleeBody : CapturedMir) (locals' : List LocalSlot)
     (destination : Place) (targetBb : BasicBlockIdx) (argVals : List Value)
     (unwind : UnwindAction) (rootCont : LeanMiri.ReturnContinuation UnwindAction)
-    (m : LeanMiri.StepState B P UnwindAction M) (callee : B) (dest : P)
+    (m : LeanMiri.StepState B P UnwindAction M) (callee : B) (dest : P) (n : Nat)
     (hrel : StackShapeRel rootCont s.memory.callStack m) :
     StackShapeRel rootCont
         (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind
           ).memory.callStack
         (LeanMiri.evalCallPush callee dest (some targetBb) unwind m) ∧
       (LeanMiri.evalCallPush callee dest (some targetBb) unwind m).frames.length =
-        m.frames.length + 1 := by
-  refine ⟨?_, by simp [LeanMiri.evalCallPush]⟩
-  unfold StackShapeRel at hrel ⊢
-  simp only [LeanMiri.evalCallPush, pushCalleeFrame, List.map_append, hrel, List.map_cons,
-    List.reverse_cons, contOfCaller, List.map_nil]
-  rfl
+        m.frames.length + 1 ∧
+      (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind
+          ).memory.callStack.length =
+        (enterTailCalleeFrame s.memory calleeBody argVals).memory.callStack.length + 1 ∧
+      (∀ (m' : LeanMiri.StepState B P UnwindAction M),
+        LeanMiri.evalTailCallTerminator callee n n m = .ok m' →
+        (LeanMiri.evalCallPush callee dest (some targetBb) unwind m).frames.length =
+          m'.frames.length + 1) := by
+  refine ⟨?_, by simp [LeanMiri.evalCallPush], by simp [pushCalleeFrame, enterTailCalleeFrame], ?_⟩
+  · unfold StackShapeRel at hrel ⊢
+    simp only [LeanMiri.evalCallPush, pushCalleeFrame, List.map_append, hrel, List.map_cons,
+      List.reverse_cons, contOfCaller, List.map_nil]
+    rfl
+  · intro m' htc
+    obtain ⟨init, last, hfr, _, _⟩ := shape_last hrel
+    cases hcont : last.returnContinuation with
+    | stop c =>
+      simp [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr, hcont] at htc
+    | goto ret u =>
+      have hpass : LeanMiri.passArgsError (fun _ => true) n 0 n = none :=
+        passArgsError_all_ok _ n n 0 (by omega) (fun _ _ _ => rfl)
+      simp only [LeanMiri.evalTailCallTerminator, LeanMiri.initFnTailCall, hfr,
+        List.getLast?_concat, hcont, hpass, Nat.lt_irrefl, ite_false, List.dropLast_concat] at htc
+      simp at htc
+      subst htc
+      simp [LeanMiri.evalCallPush, hfr]
 
 /-! ### Concrete witnesses -/
 
@@ -2043,12 +2119,20 @@ theorem tailCall_leanMiri_witness_checks :
       .ok ⟨[lmFrame "w::g" (.goto (some 3) .unreachable)], ()⟩ :=
   ⟨rfl, rfl, rfl⟩
 
+/-- `fn gunw() -> u32 { resume }` and `fn funw() -> u32 { become gunw() }`. -/
+def gUnwindBody : CapturedMir := mkBody "w::gunw" 0 [u32Decl "_0"] [blk [] .unwindResume]
+
+def fUnwindBody : CapturedMir :=
+  mkBody "w::funw" 0 [u32Decl "_0"] [blk [] (.tailCall (fnItem "w::gunw") [])]
+
 /-- **LeanMiri witnesses (unwinding out of a tail-callee).** `main` (root) below `f`, which
 returns into `bb1` and keeps unwinding (`continue_`). After `f` tail-calls a non-unwinding
 `g`, an unwind out of `g` is UB ("unwinding past a frame that does not allow unwinding");
 had `g` kept the inherited `continue_` it would keep unwinding into `main`, and a
 `cleanup bb4` action resumes the caller at `bb4`; `UnwindResume` outside a cleanup block is
-an invalid program. -/
+an invalid program; and at a 1-frame modular root (`[lmFrame "w::funw" (.goto (some 3) .continue_)]`),
+Miri faults with UB "unwinding past the topmost stack frame" whereas Trusted's root tail call
+`funw → gunw` halts cleanly with `.halted .panic` (as does `resumeExternalTailCall (.panicked …)`). -/
 theorem tailCall_leanMiri_witness_unwind :
     LeanMiri.evalTailCallTerminator "w::g" 1 1
         (⟨[lmFrame "w::main" (.stop false), lmFrame "w::f" (.goto (some 1) .continue_)], ()⟩ :
@@ -2067,8 +2151,17 @@ theorem tailCall_leanMiri_witness_unwind :
     LeanMiri.unwindResume
         (⟨[lmFrame "w::main" (.stop false), lmFrame "w::g" (.goto (some 1) .continue_)], ()⟩ :
           LeanMiri.StepState String Nat UnwindAction Unit) (isCleanup := false) =
-      .error (.invalidProgram "return/unwind cleanup assertion failed") :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+      .error (.invalidProgram "return/unwind cleanup assertion failed") ∧
+    LeanMiri.unwindResume
+        (⟨[lmFrame "w::gunw" (.goto (some 3) .continue_)], ()⟩ :
+          LeanMiri.StepState String Nat UnwindAction Unit) =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") ∧
+    execN fUnwindBody 2
+        (.running (initMachineStateWithCallees fUnwindBody [] [gUnwindBody])) =
+      some (.halted .panic) ∧
+    resumeExternalTailCall (.panicked (initMachineState fExtBody [.scalar ⟨7, 4⟩]).memory) =
+      .halted .panic :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end TailCall
 
@@ -3041,7 +3134,7 @@ run_cmd do
           `tailCall_leanMiri_arg_abi_universal, `tailCall_leanMiri_checks_classification,
           `tailCall_leanMiri_nounwind_callee, `tailCall_leanMiri_unwind_verdicts,
           `tailCall_abi_mismatch_corresponds,
-          `tailCall_leanMiri_calling_conv_ub_corresponds]),
+          `tailCall_leanMiri_calling_conv_ub_corresponds, `tailCall_leanMiri_call_pushes]),
        ("positive", [`tailCall_leanMiri_witness, `tailCall_witness_nested_runs, `tailCall_witness_root_runs,
           `tailCall_witness_external, `tailCall_witness_indirect_and_zst]),
        ("negative", [`tailCall_witness_ub_cases, `tailCall_witness_direct_arity_divergence,

@@ -1184,8 +1184,8 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "witness_symbol": "tailCall_leanMiri_root_stop_diverges",
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
-        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep.",
-        "summary": "At a whole-program root (ReturnContinuation.stop) Miri raises invalidProgram (rustc bug!(\"can't tailcall as root\")), whereas Anneal's root tail call steps into the callee.",
+        "switch_to_pass_criterion": "Intentional modular-root model (Anneal's root frame is the modularly verified function with an external caller); nested and modular-root lockstep is proved in tailCall_leanMiri_shape_lockstep, and 1-frame modular-root UnwindResume (.panic vs Miri's topmost-frame UB) is characterized in tailCall_leanMiri_unwind_verdicts.",
+        "summary": "At a whole-program root (ReturnContinuation.stop) Miri raises invalidProgram (rustc bug!(\"can't tailcall as root\")) and at a 1-frame stack UnwindResume is UB (\"unwinding past the topmost stack frame\"), whereas Anneal's modular root tail call steps into the callee and unwinds to .panic.",
     },
     {
         "id": "MODEL-LM-TAILCALL-DIRECT-ARITY-STEP",

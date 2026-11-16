@@ -1182,10 +1182,14 @@ class _Audit:
                         unlisted.append(literal)
         for literal in unlisted:
             res.errors.append(f"{rel}: the run_cmd audit names theorem `{literal}`, which no @mir-variant-coverage line lists")
-        # A divergence theorem outside the manifest would escape both the run_cmd non-vacuity audit
-        # and the Pillar 3 registry cross-check below.
+        # A divergence theorem/lemma/def outside the manifest would escape both the run_cmd
+        # non-vacuity audit and the Pillar 3 registry cross-check below.
         for d in decls:
-            if d.kind == "theorem" and "diverge" in d.written_name.lower() and d.written_name not in manifest_names:
+            if (
+                d.kind in ("theorem", "lemma", "def", "abbrev")
+                and "diverge" in d.written_name.lower()
+                and not any(_decl_matches(d, nm) for nm in manifest_names)
+            ):
                 res.errors.append(
                     f"{rel}: divergence theorem `{d.written_name}` is declared but is not a manifest theorem"
                 )
@@ -1205,6 +1209,11 @@ class _Audit:
                 if div_id in seen_ids:
                     res.errors.append(f"{SUITE_RELPATH}: duplicate divergence id `{div_id}` in TRACKED_CORRESPONDENCE_DIVERGENCES")
                 seen_ids.add(div_id)
+                cat = item.get("category")
+                if cat not in ("actionable_anneal_bug", "intentional_modeling_choice"):
+                    res.errors.append(
+                        f"{SUITE_RELPATH}: divergence {div_id} has invalid category {cat!r}"
+                    )
                 if item.get("file") == rel:
                     sym = str(item.get("witness_symbol", ""))
                     if sym in tracked_here:
