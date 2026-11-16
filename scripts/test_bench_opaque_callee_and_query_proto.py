@@ -168,6 +168,18 @@ class AuditScannerTest(unittest.TestCase):
         self.assertEqual(len(f), 1)
         self.assertEqual(f[0]["targets"], ["Option", "Prod", "List"])
 
+    def test_unparenthesized_class_args_in_deriving(self) -> None:
+        text = (
+            "structure S where\n"
+            "  x : Nat\n"
+            "  deriving CustomHandler opt1 opt2, BEq, DecidableEq\n"
+            "deriving instance CustomHandler opt1, DecidableEq, BEq for Foo\n"
+        )
+        f = self.audit(text)
+        self.assertEqual([x["line"] for x in f], [3, 4])
+        self.assertEqual(f[0]["classes"], ["CustomHandler", "BEq", "DecidableEq"])
+        self.assertEqual(f[1]["targets"], ["Foo"])
+
     def test_guillemet_identifier(self) -> None:
         text = 'def «deriving BEq, DecidableEq» := 1\ndef «a -- b» := 2\ninductive A where | a\n  deriving DecidableEq\n'
         self.assertEqual(self.audit(text), [])
@@ -341,6 +353,29 @@ class RepoConsistencyTest(unittest.TestCase):
         ident_set = {v for k, v, _ in toks if k == "ident"}
         for e in proto_enums:
             self.assertIn(f"instDecidableEq{e}Proto", ident_set, e)
+
+    def test_b4_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "evalAbiCompatible_ok_iff",
+            "evalSyncStorageGuard_ok_iff",
+            "evalVTableMethodLookup_ok_iff",
+            "evalVTableSupertraitLookup_ok_iff",
+            "methodMatchesTrait",
+            "dynDispatchStep_of_method_mismatch",
+            "dynWrongTraitPrefixRoot",
+            "dynWrongTraitPrefixSite",
+            "canary_dyn_wrong_trait_prefix_fails_closed",
+            "dynConvU32TraitRef",
+            "protoCircleConvU32",
+            "dynGenSuperEnv13",
+            "dynGenSuperRoot",
+            "dynGenSuperSite",
+            "dynGenSuperBadSite",
+            "canary_dyn_generic_supertrait_chain",
+        ):
+            self.assertIn(name, ident_toks, f"missing B4 theorem: {name}")
 
     def test_a3_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")

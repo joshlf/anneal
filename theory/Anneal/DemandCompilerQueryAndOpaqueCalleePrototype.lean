@@ -3837,6 +3837,134 @@ def evalVTableSupertraitLookup (env : CompilerQueryEnv) (vtableId : Nat)
         | none => .err (.vtableSupertraitNotFound vtableId superTrait)
       else .err .vtableTraitMismatch
 
+/-- Exact bidirectional characterization of `evalAbiCompatible ... = .ok .abiOk`
+(combining `abiCore` with optional Schema-13 CFI type-id agreement). -/
+theorem evalAbiCompatible_ok_iff (env : CompilerQueryEnv) (callerAbi : FnAbi)
+    (callee : DefPath) (cfiCallSite : Option RigidTy) :
+    evalAbiCompatible env callerAbi callee cfiCallSite = .ok .abiOk ↔
+      abiCore env callerAbi callee = .ok .abiOk ∧
+        match cfiCallSite with
+        | none => True
+        | some siteTy =>
+          ∃ spec tag, env.cfiEvidence? = some spec ∧
+            lookupDefPathAssoc spec.calleeTypeIds callee = some tag ∧
+            lookupTyAssoc spec.callSiteTypeIds siteTy = some tag := by
+  unfold evalAbiCompatible
+  cases cfiCallSite with
+  | none => simp
+  | some siteTy =>
+    dsimp only
+    constructor
+    · intro h
+      cases hc : env.cfiEvidence? with
+      | none => rw [hc] at h; nomatch h
+      | some spec =>
+        rw [hc] at h
+        dsimp only at h
+        cases hcallee : lookupDefPathAssoc spec.calleeTypeIds callee with
+        | none => rw [hcallee] at h; nomatch h
+        | some calleeId =>
+          cases hsite : lookupTyAssoc spec.callSiteTypeIds siteTy with
+          | none => rw [hcallee, hsite] at h; nomatch h
+          | some siteId =>
+            rw [hcallee, hsite] at h
+            dsimp only at h
+            by_cases heq : calleeId = siteId
+            · subst heq
+              simp only [ite_true] at h
+              exact ⟨h, spec, calleeId, rfl, hcallee, hsite⟩
+            · simp only [heq, ite_false] at h
+              nomatch h
+    · rintro ⟨habi, spec, tag, hc, hcallee, hsite⟩
+      simp only [hc, hcallee, hsite, ite_true, habi]
+
+/-- Exact bidirectional characterization of `evalSyncStorageGuard ... = .ok .syncPermit`. -/
+theorem evalSyncStorageGuard_ok_iff (env : CompilerQueryEnv) (allocId offset len : Nat) :
+    evalSyncStorageGuard env allocId offset len = .ok .syncPermit ↔
+      ∃ regions, env.syncEvidence? = some regions ∧
+        ∀ r ∈ regions, ¬ r.blocks allocId offset len = true := by
+  unfold evalSyncStorageGuard
+  cases hs : env.syncEvidence? with
+  | none => simp
+  | some regions =>
+    simp only [Option.some.injEq, exists_eq_left', ← List.find?_eq_none]
+    cases regions.find? (fun r => r.blocks allocId offset len) <;> simp
+
+/-- Exact bidirectional characterization of `evalVTableMethodLookup ... = .ok (.method p tys)`. -/
+theorem evalVTableMethodLookup_ok_iff (env : CompilerQueryEnv) (vtableId : Nat)
+    (traitRef : TraitRef) (slotIdx : Nat) (p : DefPath) (tys : List RigidTy) :
+    evalVTableMethodLookup env vtableId traitRef slotIdx = .ok (.method p tys) ↔
+      ∃ vtables e, env.vtableEvidence? = some vtables ∧
+        vtables.find? (fun x => decide (x.vtableId = vtableId)) = some e ∧
+        e.traitRef = traitRef ∧ e.methods[slotIdx]? = some (p, tys) := by
+  unfold evalVTableMethodLookup
+  constructor
+  · intro h
+    cases hv : env.vtableEvidence? with
+    | none => rw [hv] at h; nomatch h
+    | some vtables =>
+      rw [hv] at h
+      dsimp only at h
+      cases hf : vtables.find? (fun x => decide (x.vtableId = vtableId)) with
+      | none => rw [hf] at h; nomatch h
+      | some e =>
+        rw [hf] at h
+        dsimp only at h
+        by_cases ht : e.traitRef = traitRef
+        · simp only [ht, ite_true] at h
+          cases hm : e.methods[slotIdx]? with
+          | none => rw [hm] at h; nomatch h
+          | some pt =>
+            rcases pt with ⟨p', tys'⟩
+            rw [hm] at h
+            injection h with ha
+            injection ha with hp htys
+            subst hp; subst htys
+            exact ⟨vtables, e, rfl, hf, ht, hm⟩
+        · simp only [ht, ite_false] at h
+          nomatch h
+  · rintro ⟨vtables, e, hv, hf, ht, hm⟩
+    simp only [hv, hf, ht, ite_true, hm]
+
+/-- Exact bidirectional characterization of
+`evalVTableSupertraitLookup ... = .ok (.supertraitVTable superVtId)`. -/
+theorem evalVTableSupertraitLookup_ok_iff (env : CompilerQueryEnv) (vtableId : Nat)
+    (traitRef superTrait : TraitRef) (superVtId : Nat) :
+    evalVTableSupertraitLookup env vtableId traitRef superTrait =
+        .ok (.supertraitVTable superVtId) ↔
+      ∃ vtables e st, env.vtableEvidence? = some vtables ∧
+        vtables.find? (fun x => decide (x.vtableId = vtableId)) = some e ∧
+        e.traitRef = traitRef ∧
+        e.supertraits.find? (fun s => decide (s.1 = superTrait)) = some (st, superVtId) := by
+  unfold evalVTableSupertraitLookup
+  constructor
+  · intro h
+    cases hv : env.vtableEvidence? with
+    | none => rw [hv] at h; nomatch h
+    | some vtables =>
+      rw [hv] at h
+      dsimp only at h
+      cases hf : vtables.find? (fun x => decide (x.vtableId = vtableId)) with
+      | none => rw [hf] at h; nomatch h
+      | some e =>
+        rw [hf] at h
+        dsimp only at h
+        by_cases ht : e.traitRef = traitRef
+        · simp only [ht, ite_true] at h
+          cases hs : e.supertraits.find? (fun s => decide (s.1 = superTrait)) with
+          | none => rw [hs] at h; nomatch h
+          | some sv =>
+            rcases sv with ⟨st', vt'⟩
+            rw [hs] at h
+            injection h with ha
+            injection ha with hvt
+            subst hvt
+            exact ⟨vtables, e, st', rfl, hf, ht, hs⟩
+        · simp only [ht, ite_false] at h
+          nomatch h
+  · rintro ⟨vtables, e, st, hv, hf, ht, hs⟩
+    simp only [hv, hf, ht, ite_true, hs]
+
 /-- **Pure demand-time evaluator** of all query families. -/
 def evalCompilerQuery (env : CompilerQueryEnv) : CompilerQuery → QueryResult QueryAnswer
   | .layoutOf dialect ty => evalLayoutOf env dialect ty
@@ -4485,23 +4613,6 @@ def dynSelfTrait? (key : DefPath × List RigidTy) : Option DefPath :=
   | .dynamic d :: _ => some d
   | _ => none
 
-/-- A `dyn` call site is well formed when:
-1. its call key is a virtual call whose receiver type `dyn D` names the trait of
-   the *first* vtable the lookup reads (`firstTrait.defPath`),
-2. the call key's full generic argument list `site.dynKey.2` (`Self = dyn D` plus
-   any generic trait parameters) equals `firstTrait.args` (preventing a generic
-   trait call `Conv<u32>::into` from reading a `Conv<u64>` vtable;
-   `canary_dyn_trait_arg_mismatch_fails_closed`), and
-3. the terminal trait reference `site.lookupOp.traitRef.args` is non-empty. -/
-def DynCallSite.wellFormed (site : DynCallSite) : Bool :=
-  let firstTrait := site.lookupOp.supertraitChain.headD site.lookupOp.traitRef
-  match dynSelfTrait? site.dynKey with
-  | some d =>
-    decide (d = firstTrait.defPath) &&
-      decide (site.dynKey.2 = firstTrait.args) &&
-      !site.lookupOp.traitRef.args.isEmpty
-  | none => false
-
 /-- `lastPathSegmentAux prevColon seg bytes`: the last `::`-separated segment of the
 UTF-8 bytes of a `DefPath` (`seg` is the current segment, reversed; `prevColon`
 records a pending single `:`, byte `58`). Structural on `bytes`, so kernel- and
@@ -4525,6 +4636,42 @@ the called method's is never the right slot: the site's `slotIdx` does not belon
 to the method in its call key. -/
 def implementsCalledMethod (calledMethod target : DefPath) : Bool :=
   decide (lastPathSegment calledMethod = lastPathSegment target)
+
+/-- Whether `calledMethod` is a method item of `traitDefPath` (`calledMethod =
+traitDefPath ++ "::" ++ lastPathSegment calledMethod` with a non-empty method
+segment). Without this check, a site for `<dyn Area as OtherTrait>::area` paired
+with an `Area` vtable lookup passes both A3's `DynCallSite.wellFormed` and
+`implementsCalledMethod` (because both end in `::area`!) and executes `Area::area`
+for an `OtherTrait::area` call (`canary_dyn_wrong_trait_prefix_fails_closed`). -/
+def methodMatchesTrait (calledMethod traitDefPath : DefPath) : Bool :=
+  let seg := lastPathSegment calledMethod
+  !seg.isEmpty &&
+    decide (calledMethod.toByteArray.data.toList =
+      traitDefPath.toByteArray.data.toList ++ [(58 : UInt8), (58 : UInt8)] ++ seg)
+
+/-- A `dyn` call site is well formed when:
+1. its call key is a virtual call whose receiver type `dyn D` names the trait of
+   the *first* vtable the lookup reads (`d = firstTrait.defPath` and
+   `firstTrait.args.head? = some (.dynamic d)`),
+2. the call key's full generic argument list `site.dynKey.2` equals
+   `.dynamic d :: site.lookupOp.traitRef.args.tail` (`Self = dyn D` followed by
+   the terminal trait's generic parameters, supporting generic supertraits
+   `<dyn Sub as Conv<u32>>::conv` while rejecting mismatched generic parameters;
+   `canary_dyn_trait_arg_mismatch_fails_closed`, `canary_dyn_generic_supertrait_chain`),
+3. the terminal trait reference `site.lookupOp.traitRef.args` is non-empty, and
+4. `site.dynKey.1` is a method of the terminal trait `site.lookupOp.traitRef.defPath`
+   (`methodMatchesTrait site.dynKey.1 site.lookupOp.traitRef.defPath`;
+   `canary_dyn_wrong_trait_prefix_fails_closed`). -/
+def DynCallSite.wellFormed (site : DynCallSite) : Bool :=
+  let firstTrait := site.lookupOp.supertraitChain.headD site.lookupOp.traitRef
+  match dynSelfTrait? site.dynKey with
+  | some d =>
+    decide (d = firstTrait.defPath) &&
+      decide (firstTrait.args.head? = some (.dynamic d)) &&
+      decide (site.dynKey.2 = .dynamic d :: site.lookupOp.traitRef.args.tail) &&
+      !site.lookupOp.traitRef.args.isEmpty &&
+      methodMatchesTrait site.dynKey.1 site.lookupOp.traitRef.defPath
+  | none => false
 
 /-- Resolve a `dyn` call through the runtime vtable pointer `vtablePtr`:
 `resolveVTableChain` (direct or supertrait-chained `UnOp.vtableMethodLookup`),
@@ -4614,6 +4761,17 @@ theorem dynDispatchStep_of_not_wellFormed (env : CompilerQueryEnv) (tbl : Opaque
     (hwf : site.wellFormed = false) :
     dynDispatchStep env tbl site body s = MirStepNode.unsupported := by
   simp only [dynDispatchStep, hwf, Bool.false_eq_true, ite_false]
+
+/-- A resolved vtable slot whose target item name does not match the called method
+fails closed (`MirStepNode.unsupported`), whatever the callee table holds. -/
+theorem dynDispatchStep_of_method_mismatch (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    {site : DynCallSite} (body : CapturedMir) (s : MachineState) {vt : ProvenancePtr}
+    {target : DefPath × List RigidTy} (hwf : site.wellFormed = true)
+    (hvt : site.vtablePtr? s = some vt)
+    (hr : resolveDynTarget env site vt = .ok target)
+    (hname : implementsCalledMethod site.dynKey.1 target.1 = false) :
+    dynDispatchStep env tbl site body s = MirStepNode.unsupported := by
+  simp only [dynDispatchStep, hwf, ite_true, hvt, hr, hname, Bool.false_eq_true, ite_false]
 
 /-- Preservation under `EnvExtends` (supportedness is only required of the
 receiver vtable pointer actually present at `s`). -/
@@ -5676,6 +5834,118 @@ theorem canary_dyn_registry_ambiguity_fails_closed :
       ⟨.halted, [.event 1], some 31, none⟩ := by
   decide +kernel
 
+/-- Root calling `<dyn Area as OtherTrait>::area`: same method suffix `::area` as
+`Area::area`, but on a *different* trait `proto::OtherTrait`. -/
+def dynWrongTraitPrefixRoot : CapturedMir :=
+  { protoLitIfRoot true "proto::OtherTrait::area" [.dynamic "proto::Area"] "proto::g_dead" with
+    argCount := 1, localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩] }
+
+/-- Site for `<dyn Area as OtherTrait>::area` reading `Area`'s vtable slot `0`
+(`"proto::<impl Area for Circle>::area"`). It passes A3's `implementsCalledMethod`
+(both paths end in `::area`!) and A3's `d = firstTrait.defPath` / `dynKey.2 = firstTrait.args`
+checks, so A3 would dispatch `OtherTrait::area` to `<impl Area for Circle>::area`! -/
+def dynWrongTraitPrefixSite : DynCallSite :=
+  { dynSite with dynKey := ("proto::OtherTrait::area", [.dynamic "proto::Area"]) }
+
+/-- **Cross-trait method-suffix collision canary**: `dynWrongTraitPrefixSite` calls
+`"proto::OtherTrait::area"` while reading `Area`'s vtable slot `0`. Both paths end
+in `::area`, so `implementsCalledMethod` is `true` and `resolveDynTarget` succeeds,
+but `methodMatchesTrait "proto::OtherTrait::area" "proto::Area"` is `false`, so B4's
+`DynCallSite.wellFormed` rejects the site (`false`) and execution fails closed. -/
+theorem canary_dyn_wrong_trait_prefix_fails_closed :
+    implementsCalledMethod dynWrongTraitPrefixSite.dynKey.1
+      "proto::<impl Area for Circle>::area" = true ∧
+    methodMatchesTrait dynWrongTraitPrefixSite.dynKey.1
+      dynWrongTraitPrefixSite.lookupOp.traitRef.defPath = false ∧
+    dynWrongTraitPrefixSite.wellFormed = false ∧
+    resolveDynTarget dynEnv13 dynWrongTraitPrefixSite ⟨7, 0⟩ =
+      .ok ("proto::<impl Area for Circle>::area", []) ∧
+    (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynWrongTraitPrefixSite
+        dynWrongTraitPrefixRoot 12
+        (initMachineState dynWrongTraitPrefixRoot [.ptr ⟨7, 0⟩ 0])).summary =
+      ⟨.faulted, [.event 1], none, none⟩ := by
+  decide +kernel
+
+/-- Generic supertrait `Conv<u32>` with `Self = dyn Conv` (`args = [dyn Conv, u32]`). -/
+def dynConvU32TraitRef : TraitRef :=
+  ⟨"proto::Conv", [.dynamic "proto::Conv", .uint .u32]⟩
+
+/-- `<impl Conv<u32> for Circle>::conv() -> u32 { 55 }`. -/
+def protoCircleConvU32 : CapturedMir :=
+  protoLeaf "proto::<impl Conv<u32> for Circle>::conv" 55 0
+    [⟨⟨"proto::Conv::conv", [protoCircleTy, .uint .u32]⟩,
+      "proto::<impl Conv<u32> for Circle>::conv"⟩]
+
+/-- Schema-13 environment where vtable `11` (`dyn SubArea` for `Circle`) links
+generic supertrait `Conv<u32>` to vtable `13`. -/
+def dynGenSuperEnv13 : CompilerQueryEnv :=
+  { dynSubEnv13 with
+    fnAbis := [
+      ("proto::<impl Area for Circle>::area", protoRetU32Abi),
+      ("proto::<impl Area for Square>::area", protoRetU32Abi),
+      ("proto::<impl Conv<u32> for Circle>::conv", protoRetU32Abi) ],
+    vtables := some [
+      ⟨7, dynTraitRef, [("proto::<impl Area for Circle>::area", [])], []⟩,
+      ⟨11, dynSubTraitRef, [], [(dynTraitRef, 7), (dynConvU32TraitRef, 13)]⟩,
+      ⟨13, dynConvU32TraitRef, [("proto::<impl Conv<u32> for Circle>::conv", [])], []⟩ ] }
+
+/-- Root calling the generic supertrait method `<dyn SubArea as Conv<u32>>::conv`
+(call key `("proto::Conv::conv", [dyn SubArea, u32])`). -/
+def dynGenSuperRoot : CapturedMir :=
+  { protoLitIfRoot true "proto::Conv::conv" [.dynamic "proto::SubArea", .uint .u32] "proto::g_dead" with
+    argCount := 1, localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩] }
+
+/-- Call site for `<dyn SubArea as Conv<u32>>::conv` chaining `SubArea → Conv<u32>`. -/
+def dynGenSuperSite : DynCallSite :=
+  { vtableLocal := 1
+    lookupOp := ⟨dynConvU32TraitRef, 0, [dynSubTraitRef]⟩
+    callerAbi := protoRetU32Abi
+    cfiCallSite := none
+    dynKey := ("proto::Conv::conv", [.dynamic "proto::SubArea", .uint .u32]) }
+
+/-- Mismatched generic supertrait site `<dyn SubArea as Conv<u64>>::conv` paired with
+the `Conv<u32>` vtable chain. -/
+def dynGenSuperBadSite : DynCallSite :=
+  { dynGenSuperSite with
+    dynKey := ("proto::Conv::conv", [.dynamic "proto::SubArea", .uint .u64]) }
+
+/-- Narrowed and full tables for `dynGenSuperRoot`. -/
+def dynGenSuperNarrowTbl : OpaqueCalleeTable := .ofList [protoCircleConvU32]
+def dynGenSuperFullTbl : OpaqueCalleeTable :=
+  .ofList [protoLiveF, protoGDead, protoCircleArea, protoCircleConvU32]
+
+/-- **Generic supertrait vtable chain canary (closing A3 Item 4)**:
+1. `dynGenSuperSite` (`<dyn SubArea as Conv<u32>>::conv`, where `firstTrait = SubArea`
+   has args `[dyn SubArea]` while the supertrait `Conv<u32>` has args `[dyn Conv, u32]`)
+   was rejected by B3/A3's `dynKey.2 = firstTrait.args`, but is accepted (`wellFormed = true`)
+   by B4's `dynKey.2 = .dynamic d :: traitRef.args.tail`.
+2. `evalDynWithOpaqueCallees` chains `11 (SubArea) → 13 (Conv<u32>) → <impl Conv<u32> for Circle>::conv`
+   and halts returning `55` on `dynGenSuperNarrowTbl` (and equals the full-table run via
+   `evalDynWithOpaqueCallees_preserved_of_narrow_check`).
+3. Mismatched supertrait type arguments (`dynGenSuperBadSite`: `Conv<u64>` vs. `Conv<u32>`)
+   have `wellFormed = false`. -/
+theorem canary_dyn_generic_supertrait_chain :
+    decide (dynGenSuperSite.dynKey.2 =
+      (dynGenSuperSite.lookupOp.supertraitChain.headD
+        dynGenSuperSite.lookupOp.traitRef).args) = false ∧
+    dynGenSuperSite.wellFormed = true ∧
+    dynGenSuperBadSite.wellFormed = false ∧
+    (evalDynWithOpaqueCallees dynGenSuperEnv13 dynGenSuperNarrowTbl dynGenSuperSite
+        dynGenSuperRoot 12 (initMachineState dynGenSuperRoot [.ptr ⟨11, 0⟩ 0])).summary =
+      ⟨.halted, [.event 1], some 55, none⟩ ∧
+    evalDynWithOpaqueCallees { dynGenSuperEnv13 with syncRegions := some [⟨3, 4, 8⟩] }
+        dynGenSuperNarrowTbl dynGenSuperSite dynGenSuperRoot 12
+        (initMachineState dynGenSuperRoot [.ptr ⟨11, 0⟩ 0]) =
+      evalDynWithOpaqueCallees dynGenSuperEnv13 dynGenSuperFullTbl dynGenSuperSite
+        dynGenSuperRoot 12 (initMachineState dynGenSuperRoot [.ptr ⟨11, 0⟩ 0]) := by
+  have hExt : EnvExtends dynGenSuperEnv13
+      { dynGenSuperEnv13 with syncRegions := some [⟨3, 4, 8⟩] } :=
+    ⟨by decide, rfl, OptionExtends.refl _, rfl, OptionExtends.refl _, (fun _ h => nomatch h),
+      OptionExtends.refl _⟩
+  refine ⟨by decide, by decide, by decide, by decide +kernel,
+    evalDynWithOpaqueCallees_preserved_of_narrow_check hExt 12
+      (initMachineState dynGenSuperRoot [.ptr ⟨11, 0⟩ 0]) (by decide +kernel)⟩
+
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
 namespace ShadowingDemo
@@ -6122,6 +6392,42 @@ end ShadowingDemo
 /-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_registry_ambiguity_fails_closed' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_dyn_registry_ambiguity_fails_closed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalAbiCompatible_ok_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalAbiCompatible_ok_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalSyncStorageGuard_ok_iff' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalSyncStorageGuard_ok_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalVTableMethodLookup_ok_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalVTableMethodLookup_ok_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.evalVTableSupertraitLookup_ok_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalVTableSupertraitLookup_ok_iff
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.methodMatchesTrait' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms methodMatchesTrait
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynDispatchStep_of_method_mismatch' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynDispatchStep_of_method_mismatch
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_wrong_trait_prefix_fails_closed' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_wrong_trait_prefix_fails_closed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_generic_supertrait_chain' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_generic_supertrait_chain
 
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 

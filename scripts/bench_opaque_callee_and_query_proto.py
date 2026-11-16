@@ -743,16 +743,21 @@ def audit_redundant_beq_decidable_eq_text(text: str, path: str = "<text>") -> li
                     break
                 classes.append(toks[j][1])
                 j += 1
-                # skip class arguments in parentheses (e.g. `deriving Foo (bar), BEq`)
-                while j < n and toks[j] == ("punct", "(", toks[j][2]):
-                    arg_depth = 1
-                    j += 1
-                    while j < n and arg_depth > 0:
-                        if toks[j] == ("punct", "(", toks[j][2]):
-                            arg_depth += 1
-                        elif toks[j] == ("punct", ")", toks[j][2]):
-                            arg_depth -= 1
+                # skip class arguments (parenthesized `(bar)` or bare identifiers `bar`)
+                while j < n:
+                    if toks[j] == ("punct", "(", toks[j][2]):
+                        arg_depth = 1
                         j += 1
+                        while j < n and arg_depth > 0:
+                            if toks[j] == ("punct", "(", toks[j][2]):
+                                arg_depth += 1
+                            elif toks[j] == ("punct", ")", toks[j][2]):
+                                arg_depth -= 1
+                            j += 1
+                    elif toks[j][0] == "ident" and toks[j][1] not in _COMMAND_STOP_WORDS and toks[j][1] != "for":
+                        j += 1
+                    else:
+                        break
                 while paren_depth > 0 and j < n and toks[j] == ("punct", ")", toks[j][2]):
                     paren_depth -= 1
                     j += 1
