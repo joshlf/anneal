@@ -345,6 +345,36 @@ class RepoConsistencyTest(unittest.TestCase):
         for e in proto_enums:
             self.assertIn(f"instDecidableEq{e}Proto", ident_set, e)
 
+    def test_a2_headline_theorems_present(self) -> None:
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}
+        for name in (
+            "DynCallSite.wellFormed",
+            "dynDispatchStep_of_not_wellFormed",
+            "dynSite_wellFormed",
+            "demandsUnregisteredDyn",
+            "dynDemandStep_of_unregistered",
+            "dynSubRoot",
+            "dynSubSite_wellFormed",
+            "dynMismatchSite",
+            "canary_dyn_site_mismatch_fails_closed",
+            "dynOtherSite",
+            "canary_unregistered_dyn_fails_closed",
+        ):
+            self.assertIn(name, ident_toks, f"missing A2 theorem: {name}")
+
+    def test_vtable_chain_routes_through_unop(self) -> None:
+        # Every hop of the end-to-end vtable resolution must be issued by the
+        # `UnOp.vtableMethodLookup` operator (`UnOpExt.query?`), not by evaluating
+        # `CompilerQuery` constructors directly.
+        text = PROTOTYPE.read_text(encoding="utf-8")
+        start = text.index("def resolveVTableChain")
+        end = text.index("theorem resolveVTableChain_mono", start)
+        block = text[start:end]
+        self.assertEqual(block.count("UnOpExt.vtableMethodLookup"), 2, block)
+        self.assertEqual(block.count(".query?"), 2, block)
+        self.assertNotIn("evalCompilerQuery env (.vtable", block)
+
     def test_b2_headline_theorems_present(self) -> None:
         text = PROTOTYPE.read_text(encoding="utf-8")
         ident_toks = {v for k, v, _ in bench.tokenize_lean(text) if k == "ident"}

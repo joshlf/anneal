@@ -4164,23 +4164,34 @@ def UnOpExt.query? : UnOpExt → ProvenancePtr → Option CompilerQuery
       some (.vtableSupertraitLookup vtablePtr.allocId curTrait (rest.headD op.traitRef))
 
 /-- Walk a chain of `UnOp.vtableMethodLookup` supertrait vtable hops starting
-at `vtId` before looking up method slot `slotIdx` on the final `traitRef`. -/
+at `vtId` before looking up method slot `slotIdx` on the final `traitRef`. Every
+hop is one application of the `UnOp.vtableMethodLookup` operator to the current
+vtable pointer: the query evaluated at each hop is exactly the one
+`UnOpExt.query?` issues for the remaining chain (as in `charon#1611`, where each
+supertrait hop and the final method read are separate `UnOp::VTableMethodLookup`
+operations on the vtable pointer the previous one returned). -/
 def resolveVTableChain (env : CompilerQueryEnv) (traitRef : TraitRef) (slotIdx : Nat) :
     List TraitRef → Nat → QueryResult (DefPath × List RigidTy)
   | [], vtId =>
-    match evalCompilerQuery env (.vtableMethodLookup vtId traitRef slotIdx) with
-    | .ok (.method p tys) => .ok (p, tys)
-    | .ok _ => .err .answerKindMismatch
-    | .err e => .err e
-    | .unsupported m => .unsupported m
+    match (UnOpExt.vtableMethodLookup ⟨traitRef, slotIdx, []⟩).query? ⟨vtId, 0⟩ with
+    | none => .err .answerKindMismatch
+    | some q =>
+      match evalCompilerQuery env q with
+      | .ok (.method p tys) => .ok (p, tys)
+      | .ok _ => .err .answerKindMismatch
+      | .err e => .err e
+      | .unsupported m => .unsupported m
   | curTrait :: restChain, vtId =>
-    match evalCompilerQuery env
-        (.vtableSupertraitLookup vtId curTrait (restChain.headD traitRef)) with
-    | .ok (.supertraitVTable nextVtId) =>
-      resolveVTableChain env traitRef slotIdx restChain nextVtId
-    | .ok _ => .err .answerKindMismatch
-    | .err e => .err e
-    | .unsupported m => .unsupported m
+    match (UnOpExt.vtableMethodLookup ⟨traitRef, slotIdx, curTrait :: restChain⟩).query?
+        ⟨vtId, 0⟩ with
+    | none => .err .answerKindMismatch
+    | some q =>
+      match evalCompilerQuery env q with
+      | .ok (.supertraitVTable nextVtId) =>
+        resolveVTableChain env traitRef slotIdx restChain nextVtId
+      | .ok _ => .err .answerKindMismatch
+      | .err e => .err e
+      | .unsupported m => .unsupported m
 
 /-- `resolveVTableChain` is monotone under `EnvExtends` for any supertrait chain. -/
 theorem resolveVTableChain_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends env₁ env₂)
@@ -4191,6 +4202,7 @@ theorem resolveVTableChain_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExten
           resolveVTableChain env₁ traitRef slotIdx chain vtId
   | [], vtId, hsup => by
     unfold resolveVTableChain at hsup ⊢
+    simp only [UnOpExt.query?] at hsup ⊢
     generalize hq : CompilerQuery.vtableMethodLookup vtId traitRef slotIdx = q at hsup ⊢
     cases hv : evalCompilerQuery env₁ q with
     | unsupported m => exact absurd (by simp [hv]) (hsup m)
@@ -4199,6 +4211,7 @@ theorem resolveVTableChain_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExten
       rw [query_mono_schema h q (by simp [hv]), hv]
   | curTrait :: restChain, vtId, hsup => by
     unfold resolveVTableChain at hsup ⊢
+    simp only [UnOpExt.query?] at hsup ⊢
     generalize hq :
       CompilerQuery.vtableSupertraitLookup vtId curTrait (restChain.headD traitRef) = q at hsup ⊢
     cases hv : evalCompilerQuery env₁ q with
@@ -4237,6 +4250,23 @@ def DynCallSite.vtablePtr? (site : DynCallSite) (s : MachineState) : Option Prov
   | some (.init (.ptr p _)) => some p
   | _ => none
 
+/-- The `dyn` trait of a call key: a virtual call `<dyn D as Trait>::method`
+carries `dyn D` as its first generic argument (`none` for non-virtual keys). -/
+def dynSelfTrait? (key : DefPath × List RigidTy) : Option DefPath :=
+  match key.2 with
+  | .dynamic d :: _ => some d
+  | _ => none
+
+/-- A `dyn` call site is well formed when its call key is a virtual call whose
+receiver type `dyn D` names the trait of the *first* vtable the lookup reads (the
+receiver's own vtable): the head of `supertraitChain`, or `traitRef` when no
+supertrait hop is needed. Without this link a site could dispatch a `dyn A` call
+through a `dyn B` vtable chain (`canary_dyn_site_mismatch_fails_closed`). -/
+def DynCallSite.wellFormed (site : DynCallSite) : Bool :=
+  match dynSelfTrait? site.dynKey with
+  | some d => decide (d = (site.lookupOp.supertraitChain.headD site.lookupOp.traitRef).defPath)
+  | none => false
+
 /-- Resolve a `dyn` call through the runtime vtable pointer `vtablePtr`:
 `resolveVTableChain` (direct or supertrait-chained `UnOp.vtableMethodLookup`),
 then `abiCompatible`. -/
@@ -4262,19 +4292,23 @@ def redirectResolver (tbl : OpaqueCalleeTable) (dynKey target : DefPath × List 
 
 /-- **Unified dynamic-dispatch step**: receiver vtable pointer (read from the
 calling frame) `→ UnOp.vtableMethodLookup → abiCompatible →
-OpaqueCalleeTable.lookup → stepBranchPruned`. A receiver without a vtable pointer
-is UB, missing evidence fails closed (`MirStepNode.unsupported`), a CFI type-id
-mismatch is the defined CFI trap (`abort`), and every other semantic error is UB. -/
+OpaqueCalleeTable.lookup → stepBranchPruned`. An ill-formed site (call key not a
+virtual call on the first vtable's trait) fails closed (`MirStepNode.unsupported`:
+a configuration error, never attributed to the program), a receiver without a
+vtable pointer is UB, missing evidence fails closed, a CFI type-id mismatch is the
+defined CFI trap (`abort`), and every other semantic error is UB. -/
 def dynDispatchStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
-  match site.vtablePtr? s with
-  | none => MirStepNode.fail .ub
-  | some vt =>
-    match resolveDynTarget env site vt with
-    | .ok target => stepBranchPruned (redirectResolver tbl site.dynKey target) body s
-    | .err .cfiTypeIdMismatch => MirStepNode.retOutcome .abort
-    | .err _ => MirStepNode.fail .ub
-    | .unsupported _ => MirStepNode.unsupported
+  if site.wellFormed then
+    match site.vtablePtr? s with
+    | none => MirStepNode.fail .ub
+    | some vt =>
+      match resolveDynTarget env site vt with
+      | .ok target => stepBranchPruned (redirectResolver tbl site.dynKey target) body s
+      | .err .cfiTypeIdMismatch => MirStepNode.retOutcome .abort
+      | .err _ => MirStepNode.fail .ub
+      | .unsupported _ => MirStepNode.unsupported
+  else MirStepNode.unsupported
 
 /-- `resolveDynTarget` is monotone under `EnvExtends` on supported answers (for
 both direct and supertrait-chained vtable lookups). -/
@@ -4301,11 +4335,20 @@ theorem resolveDynTarget_mono {env₁ env₂ : CompilerQueryEnv} (h : EnvExtends
 /-- The dynamic-dispatch step on a resolved receiver is a branch-pruned step. -/
 theorem dynDispatchStep_eq_of_resolved {env : CompilerQueryEnv} {tbl : OpaqueCalleeTable}
     {site : DynCallSite} {body : CapturedMir} {s : MachineState} {vt : ProvenancePtr}
-    {target : DefPath × List RigidTy} (hvt : site.vtablePtr? s = some vt)
+    {target : DefPath × List RigidTy} (hwf : site.wellFormed = true)
+    (hvt : site.vtablePtr? s = some vt)
     (h : resolveDynTarget env site vt = .ok target) :
     dynDispatchStep env tbl site body s =
       stepBranchPruned (redirectResolver tbl site.dynKey target) body s := by
-  simp only [dynDispatchStep, hvt, h]
+  simp only [dynDispatchStep, hwf, ite_true, hvt, h]
+
+/-- An ill-formed site fails closed at every state, whatever the environment,
+table, or receiver. -/
+theorem dynDispatchStep_of_not_wellFormed (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    {site : DynCallSite} (body : CapturedMir) (s : MachineState)
+    (hwf : site.wellFormed = false) :
+    dynDispatchStep env tbl site body s = MirStepNode.unsupported := by
+  simp only [dynDispatchStep, hwf, Bool.false_eq_true, ite_false]
 
 /-- Preservation under `EnvExtends` (supportedness is only required of the
 receiver vtable pointer actually present at `s`). -/
@@ -4314,9 +4357,13 @@ theorem dynDispatchStep_envExtends {env₁ env₂ : CompilerQueryEnv} (h : EnvEx
     (hsup : ∀ vt, site.vtablePtr? s = some vt → ∀ m, resolveDynTarget env₁ site vt ≠ .unsupported m) :
     dynDispatchStep env₂ tbl site body s = dynDispatchStep env₁ tbl site body s := by
   unfold dynDispatchStep
-  cases hvt : site.vtablePtr? s with
-  | none => rfl
-  | some vt => simp only [resolveDynTarget_mono h site vt (hsup vt hvt)]
+  cases hwf : site.wellFormed with
+  | false => rfl
+  | true =>
+    simp only [ite_true]
+    cases hvt : site.vtablePtr? s with
+    | none => rfl
+    | some vt => simp only [resolveDynTarget_mono h site vt (hsup vt hvt)]
 
 /-- Preservation under call-cone narrowing. -/
 theorem dynDispatchStep_cone_narrow (env : CompilerQueryEnv)
@@ -4328,14 +4375,18 @@ theorem dynDispatchStep_cone_narrow (env : CompilerQueryEnv)
           k.apply (redirectResolver fullTbl site.dynKey target)) :
     dynDispatchStep env narrowTbl site body s = dynDispatchStep env fullTbl site body s := by
   unfold dynDispatchStep
-  cases hvt : site.vtablePtr? s with
-  | none => rfl
-  | some vt =>
-    dsimp only
-    cases hr : resolveDynTarget env site vt with
-    | ok target => exact stepBranchPruned_congr body s (hcone vt target hvt hr)
-    | err e => cases e <;> rfl
-    | unsupported m => rfl
+  cases hwf : site.wellFormed with
+  | false => rfl
+  | true =>
+    simp only [ite_true]
+    cases hvt : site.vtablePtr? s with
+    | none => rfl
+    | some vt =>
+      dsimp only
+      cases hr : resolveDynTarget env site vt with
+      | ok target => exact stepBranchPruned_congr body s (hcone vt target hvt hr)
+      | err e => cases e <;> rfl
+      | unsupported m => rfl
 
 /-- **End-to-end integration theorem**: the dynamic-dispatch step is preserved
 simultaneously under a sound environment extension and call-cone narrowing. -/
@@ -4386,6 +4437,10 @@ theorem dynAtCall_reached (r : CalleeResolver) :
 
 /-- The receiver's vtable pointer at the call is read from the frame: vtable `7`. -/
 theorem dyn_vtablePtr_atCall : dynSite.vtablePtr? dynAtCall = some ⟨7, 0⟩ := rfl
+
+/-- `dynSite` is well formed: its call key `<dyn Area as Area>::area` is a virtual
+call on `Area`, the trait of the receiver's vtable. -/
+theorem dynSite_wellFormed : dynSite.wellFormed = true := by decide
 
 /-- Schema-12 environment (no vtable evidence). -/
 def dynEnv12 : CompilerQueryEnv :=
@@ -4446,7 +4501,8 @@ theorem dyn_step_enters_impl :
 /-- The Schema-12 dynamic-dispatch step is the fail-closed `unsupported` node. -/
 theorem dyn_step_schema12_fails_closed :
     dynDispatchStep dynEnv12 dynFullTbl dynSite dynRoot dynAtCall = MirStepNode.unsupported := by
-  simp only [dynDispatchStep, dyn_vtablePtr_atCall, dyn_schema12_unsupported]
+  simp only [dynDispatchStep, dynSite_wellFormed, ite_true, dyn_vtablePtr_atCall,
+    dyn_schema12_unsupported]
 
 /-- A `dyn` call whose receiver local holds no pointer is UB (fail-closed: no
 vtable lookup, no call). -/
@@ -4554,15 +4610,29 @@ def demandsDynSite (site : DynCallSite) (body : CapturedMir) (s : MachineState) 
   | some k => decide ((k.defPath, k.typeArgs) = site.dynKey)
   | none => false
 
+/-- Whether the next step at `s` demands a *virtual* call key (first generic argument
+`dyn D`) other than `site.dynKey`: a `dyn` call no registered site resolves. -/
+def demandsUnregisteredDyn (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
+  match demandedKey? body s with
+  | some k =>
+    (dynSelfTrait? (k.defPath, k.typeArgs)).isSome && !decide ((k.defPath, k.typeArgs) = site.dynKey)
+  | none => false
+
 /-- **Demand-gated dynamic-dispatch step**: the receiver's vtable pointer is read
 and `resolveDynTarget` (`vtableMethodLookup` followed by `abiCompatible`) is issued
-*only* when the active step at `s` actually demands `site.dynKey`; all other steps
-(including literal switches and calls on the other branch) step directly via
+*only* when the active step at `s` actually demands `site.dynKey`. Any *other*
+virtual call fails closed (`MirStepNode.unsupported`) instead of falling through to
+the trusted static resolver, which has no vtable and would turn the `dyn` call into
+an unlinked external call to the trait method's `DefPath`
+(`canary_unregistered_dyn_fails_closed`). All remaining steps (literal switches,
+non-virtual calls, calls on the other branch) step directly via
 `stepBranchPruned tbl.lookup`. -/
 def dynDemandStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
   if demandsDynSite site body s then
     dynDispatchStep env tbl site body s
+  else if demandsUnregisteredDyn site body s then
+    MirStepNode.unsupported
   else
     stepBranchPruned tbl.lookup body s
 
@@ -4588,22 +4658,25 @@ theorem stepBranchPruned_redirect_of_not_demanded (tbl : OpaqueCalleeTable) (sit
   simp only [CalleeKey.apply, redirectResolver, ite_eq_right_of_eq_false _ _ (eq_false hne)]
 
 /-- **Demand gating is conservative**: wherever the eager dynamic-dispatch step
-resolves the receiver's method (`.ok target` for the vtable pointer at `s`), the
+resolves the receiver's method (well-formed site, `.ok target` for the vtable
+pointer at `s`) and the step demands no *unregistered* virtual call, the
 demand-gated step is *identical* to it. The two differ only where the eager query
-fails (missing receiver, `.err`, or `.unsupported`) *and* the step does not demand
-the `dyn` key, i.e. demand gating only removes failures of calls that are not
-executed (`canary_dyn_deadBranch_schema12_succeeds`). -/
+fails (missing receiver, `.err`, or `.unsupported`) and the step does not demand
+the `dyn` key — demand gating only removes failures of calls that are not executed
+(`canary_dyn_deadBranch_schema12_succeeds`) — or where an unregistered virtual call
+is demanded, which demand gating fails closed. -/
 theorem dynDemandStep_eq_dynDispatchStep_of_resolved {env : CompilerQueryEnv}
     {tbl : OpaqueCalleeTable} {site : DynCallSite} {body : CapturedMir} {s : MachineState}
-    {vt : ProvenancePtr} {target : DefPath × List RigidTy} (hvt : site.vtablePtr? s = some vt)
-    (hr : resolveDynTarget env site vt = .ok target) :
+    {vt : ProvenancePtr} {target : DefPath × List RigidTy} (hwf : site.wellFormed = true)
+    (hvt : site.vtablePtr? s = some vt) (hr : resolveDynTarget env site vt = .ok target)
+    (hu : demandsUnregisteredDyn site body s = false) :
     dynDemandStep env tbl site body s = dynDispatchStep env tbl site body s := by
   unfold dynDemandStep
   cases hd : demandsDynSite site body s with
   | true => rfl
   | false =>
-    simp only [Bool.false_eq_true, ite_false]
-    rw [dynDispatchStep_eq_of_resolved hvt hr,
+    simp only [Bool.false_eq_true, ite_false, hu]
+    rw [dynDispatchStep_eq_of_resolved hwf hvt hr,
       stepBranchPruned_redirect_of_not_demanded tbl site body s target hd]
 
 /-- A step that does not demand the `dyn` key is exactly the trusted `stepMirFn`
@@ -4611,10 +4684,27 @@ step (under the `memory.callees` frame condition): demand gating adds no new
 semantics off the `dyn` call. -/
 theorem dynDemandStep_eq_trusted_of_not_demanded (env : CompilerQueryEnv)
     (tbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir) (s : MachineState)
-    (hnd : demandsDynSite site body s = false) (hframe : tbl.toList = s.memory.callees) :
+    (hnd : demandsDynSite site body s = false) (hu : demandsUnregisteredDyn site body s = false)
+    (hframe : tbl.toList = s.memory.callees) :
     dynDemandStep env tbl site body s = stepMirFn body s := by
-  simp only [dynDemandStep, hnd, Bool.false_eq_true, ite_false]
+  simp only [dynDemandStep, hnd, hu, Bool.false_eq_true, ite_false]
   exact stepBranchPruned_eq_trusted tbl body s hframe
+
+/-- An unregistered virtual call fails closed under every environment and table. -/
+theorem dynDemandStep_of_unregistered (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (site : DynCallSite) (body : CapturedMir) (s : MachineState)
+    (hu : demandsUnregisteredDyn site body s = true) :
+    dynDemandStep env tbl site body s = MirStepNode.unsupported := by
+  have hnd : demandsDynSite site body s = false := by
+    unfold demandsUnregisteredDyn at hu
+    unfold demandsDynSite
+    cases hk : demandedKey? body s with
+    | none => rfl
+    | some k =>
+      rw [hk] at hu
+      simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_false_iff_not] at hu
+      exact decide_eq_false hu.2
+  simp only [dynDemandStep, hnd, hu, Bool.false_eq_true, ite_false, ite_true]
 
 /-- Fuel-bounded multi-step evaluation with demand-gated dynamic dispatch. -/
 def evalDynWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
@@ -4651,7 +4741,11 @@ theorem dynDemandStep_preserved {env₁ env₂ : CompilerQueryEnv}
     exact dynDispatchStep_preserved h (hp.supported hd) (hp.dynCone hd)
   | false =>
     simp only [Bool.false_eq_true, ite_false]
-    exact stepBranchPruned_congr body s (hp.cone hd)
+    cases hu : demandsUnregisteredDyn site body s with
+    | true => rfl
+    | false =>
+      simp only [Bool.false_eq_true, ite_false]
+      exact stepBranchPruned_congr body s (hp.cone hd)
 
 /-- **Multi-step end-to-end preservation**: if every state the `env₁`/`fullTbl`
 run visits satisfies `DynStepPreserved`, the entire demand-gated dynamic-dispatch
@@ -4889,25 +4983,38 @@ def dynSubEnv13 : CompilerQueryEnv :=
       ⟨9, dynTraitRef, [("proto::<impl Area for Square>::area", [])], []⟩,
       ⟨11, dynSubTraitRef, [], [(dynTraitRef, 7)]⟩ ] }
 
-/-- Call site on a `dyn SubArea` receiver that chains `SubArea → Area` before
-looking up `Area::area` at slot `0`. -/
-def dynSubSite : DynCallSite :=
-  { dynSite with lookupOp := ⟨dynTraitRef, 0, [dynSubTraitRef]⟩ }
+/-- `fn(vt: *const ()) -> u32 { if true { <dyn SubArea as Area>::area() } else { g_dead() } }`:
+the supertrait method `Area::area` called on a `dyn SubArea` receiver (call key
+`(Area::area, [dyn SubArea])`, as rustc emits it). -/
+def dynSubRoot : CapturedMir :=
+  { protoLitIfRoot true "proto::Area::area" [.dynamic "proto::SubArea"] "proto::g_dead" with
+    argCount := 1, localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoVtPtrTy, some "vt"⟩] }
 
-/-- Initial state of `dynRoot` called with a `dyn SubArea` receiver (vtable `11`). -/
-def dynSubInit : MachineState := initMachineState dynRoot [.ptr ⟨11, 0⟩ 0]
+/-- Call site of `dynSubRoot`'s virtual call: the receiver's `dyn SubArea` vtable is
+read first, chaining `SubArea → Area` before looking up `Area::area` at slot `0`. -/
+def dynSubSite : DynCallSite :=
+  { dynSite with
+    lookupOp := ⟨dynTraitRef, 0, [dynSubTraitRef]⟩
+    dynKey := ("proto::Area::area", [.dynamic "proto::SubArea"]) }
+
+/-- `dynSubSite` is well formed: the call's receiver type `dyn SubArea` names the
+trait of the first vtable the chain reads. -/
+theorem dynSubSite_wellFormed : dynSubSite.wellFormed = true := by decide
+
+/-- Initial state of `dynSubRoot` called with a `dyn SubArea` receiver (vtable `11`). -/
+def dynSubInit : MachineState := initMachineState dynSubRoot [.ptr ⟨11, 0⟩ 0]
 
 /-- **Chained supertrait vtable canary (`charon#1611`)**:
 1. `UnOpExt.query?` on `dynSubSite` issues `.vtableSupertraitLookup 11 dynSubTraitRef dynTraitRef`
-   as its initial query, resolving to `.ok (.supertraitVTable 7)`.
+   as its initial query (the first hop of `resolveVTableChain`), resolving to
+   `.ok (.supertraitVTable 7)`.
 2. `resolveDynTarget` chains `11 (SubArea) → 7 (Area) → <Circle as Area>::area`.
-3. `evalDynWithOpaqueCallees` on `dynSubInit` halts returning `31` on the narrowed
-   table `dynNarrowTbl` (and equals the full-table run by
-   `evalDynWithOpaqueCallees_preserved_of_narrow_check`).
-4. Missing the supertrait link (`dynEnv13`, where vtable `7` has `supertraits = []`)
-   returns `.err (.vtableSupertraitNotFound 7 dynTraitRef)` when starting from a
-   vtable without the supertrait entry, and Schema 12 (`dynEnv12`) fails closed
-   with `.unsupported .missingVTableEvidence`. -/
+3. Schema 12 (`dynEnv12`) fails closed with `.unsupported .missingVTableEvidence`.
+4. A hop from a vtable without the requested supertrait link (vtable `7` of `Area`
+   has `supertraits = []`) is `.err (.vtableSupertraitNotFound 7 dynSubTraitRef)`.
+5. `evalDynWithOpaqueCallees` on `dynSubInit` halts returning `31` on the narrowed
+   table `dynNarrowTbl`, and equals the full-table run by
+   `evalDynWithOpaqueCallees_preserved_of_narrow_check`. -/
 theorem canary_dyn_supertrait_chain :
     (UnOpExt.vtableMethodLookup dynSubSite.lookupOp).query? ⟨11, 0⟩ =
       some (.vtableSupertraitLookup 11 dynSubTraitRef dynTraitRef) ∧
@@ -4919,16 +5026,51 @@ theorem canary_dyn_supertrait_chain :
       .unsupported .missingVTableEvidence ∧
     evalCompilerQuery dynSubEnv13 (.vtableSupertraitLookup 7 dynTraitRef dynSubTraitRef) =
       .err (.vtableSupertraitNotFound 7 dynSubTraitRef) ∧
-    (evalDynWithOpaqueCallees dynSubEnv13 dynNarrowTbl dynSubSite dynRoot 12 dynSubInit).summary =
+    (evalDynWithOpaqueCallees dynSubEnv13 dynNarrowTbl dynSubSite dynSubRoot 12 dynSubInit).summary =
       ⟨.halted, [.event 1], some 31, none⟩ ∧
     evalDynWithOpaqueCallees { dynSubEnv13 with syncRegions := some [⟨3, 4, 8⟩] }
-        dynNarrowTbl dynSubSite dynRoot 12 dynSubInit =
-      evalDynWithOpaqueCallees dynSubEnv13 dynFullTbl dynSubSite dynRoot 12 dynSubInit := by
+        dynNarrowTbl dynSubSite dynSubRoot 12 dynSubInit =
+      evalDynWithOpaqueCallees dynSubEnv13 dynFullTbl dynSubSite dynSubRoot 12 dynSubInit := by
   have hExt : EnvExtends dynSubEnv13 { dynSubEnv13 with syncRegions := some [⟨3, 4, 8⟩] } :=
     ⟨by decide, rfl, OptionExtends.refl _, rfl, OptionExtends.refl _, (fun _ h => nomatch h),
       OptionExtends.refl _⟩
   refine ⟨rfl, by decide, by decide, by decide, by decide, by decide +kernel,
     evalDynWithOpaqueCallees_preserved_of_narrow_check hExt 12 dynSubInit (by decide +kernel)⟩
+
+/-- The site B2's supertrait canary used: a `<dyn Area as Area>::area` call key
+paired with a lookup that starts at the receiver's `dyn SubArea` vtable. -/
+def dynMismatchSite : DynCallSite := { dynSite with lookupOp := ⟨dynTraitRef, 0, [dynSubTraitRef]⟩ }
+
+/-- **Ill-formed site canary**: the vtable chain alone would happily resolve
+`dynMismatchSite` (a `dyn Area` call dispatched through a `dyn SubArea` vtable
+chain), but the site's call key does not name the trait of the receiver's vtable,
+so it is ill formed and the run fails closed at the virtual call. -/
+theorem canary_dyn_site_mismatch_fails_closed :
+    dynMismatchSite.wellFormed = false ∧
+    resolveDynTarget dynSubEnv13 dynMismatchSite ⟨11, 0⟩ =
+      .ok ("proto::<impl Area for Circle>::area", []) ∧
+    (evalDynWithOpaqueCallees dynSubEnv13 dynFullTbl dynMismatchSite dynRoot 12
+        (initMachineState dynRoot [.ptr ⟨11, 0⟩ 0])).summary =
+      ⟨.faulted, [.event 1], none, none⟩ := by
+  decide +kernel
+
+/-- A site for an unrelated virtual call (`<dyn Shape as Shape>::perimeter`). -/
+def dynOtherSite : DynCallSite :=
+  { dynSite with
+    lookupOp := ⟨⟨"proto::Shape", [.dynamic "proto::Shape"]⟩, 0, []⟩
+    dynKey := ("proto::Shape::perimeter", [.dynamic "proto::Shape"]) }
+
+/-- **Unregistered virtual calls fail closed**: without vtable dispatch, the trusted
+static resolver turns `<dyn Area as Area>::area` into an unlinked external call to
+the trait method's `DefPath` (`dyn Area` has no layout, so no body instantiates).
+`evalDynWithOpaqueCallees` with a site for a *different* virtual call refuses it
+(`.unsupported`) instead. -/
+theorem canary_unregistered_dyn_fails_closed :
+    (evalWithOpaqueCallees dynFullTbl dynRoot 12 dynInit).summary =
+      ⟨.external, [.event 1], none, some "proto::Area::area"⟩ ∧
+    (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynOtherSite dynRoot 12 dynInit).summary =
+      ⟨.faulted, [.event 1], none, none⟩ := by
+  decide +kernel
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -5304,6 +5446,22 @@ end ShadowingDemo
  Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms canary_dyn_supertrait_chain
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynDispatchStep_of_not_wellFormed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynDispatchStep_of_not_wellFormed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.dynDemandStep_of_unregistered' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms dynDemandStep_of_unregistered
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_dyn_site_mismatch_fails_closed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_dyn_site_mismatch_fails_closed
+
+/-- info: 'Anneal.DemandCompilerQueryAndOpaqueCalleePrototype.canary_unregistered_dyn_fails_closed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms canary_unregistered_dyn_fails_closed
 
 end Anneal.DemandCompilerQueryAndOpaqueCalleePrototype
 
