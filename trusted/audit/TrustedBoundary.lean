@@ -80,7 +80,7 @@ namespace TrustedBoundary
 /-- Closed set of subsystem feature identifiers allowed in
 `-- anneal-trust-tier: candidate:<feature>`. -/
 def validCandidateFeatures : List Name :=
-  [`refinement, `step_result, `memory, `mir_ast, `mir_semantics, `rustc_capture]
+  [`refinement, `step_result, `memory, `mir_ast, `mir_semantics, `rustc_capture, `mvp]
 
 /-- Module-level trust tier declared by a `Trusted` module via its
 `-- anneal-trust-tier:` directive. -/
