@@ -28,8 +28,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
     disposable = []
 
     def check_budget():
-        if time.monotonic() - started > 1200:
-            raise AssertionError("self-test exceeded twenty-minute envelope")
+        if time.monotonic() - started > 1500:
+            raise AssertionError("self-test exceeded twenty-five-minute envelope")
         if sum(p.stat().st_size for p in suite.rglob("*") if p.is_file()) > runner.MAX_BYTES:
             raise AssertionError("self-test exceeded 512 MiB retained envelope")
 

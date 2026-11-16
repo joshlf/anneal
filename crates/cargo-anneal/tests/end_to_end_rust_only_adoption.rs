@@ -80,32 +80,67 @@ fn anneal_checkout_root() -> PathBuf {
 }
 
 fn ensure_rustc_capture_binary(checkout_root: &Path) -> PathBuf {
-    let exe_name = format!("anneal-rustc-capture{}", env::consts::EXE_SUFFIX);
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| checkout_root.join("target"));
-    let default_bin = target_dir.join("debug").join(&exe_name);
+    static PREREQS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PREREQS
+        .get_or_init(|| {
+            let exe_name = format!("anneal-rustc-capture{}", env::consts::EXE_SUFFIX);
+            let target_dir = env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| checkout_root.join("target"));
+            let default_bin = target_dir.join("debug").join(&exe_name);
 
-    let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(cargo_bin)
-        .current_dir(checkout_root)
-        .arg("build")
-        .arg("-p")
-        .arg("anneal-rustc-capture")
-        .arg("--bin")
-        .arg("anneal-rustc-capture")
-        .status()
-        .expect("build anneal-rustc-capture binary");
-    assert!(
-        status.success(),
-        "cargo build -p anneal-rustc-capture must succeed"
-    );
-    assert!(
-        default_bin.is_file(),
-        "expected compiled wrapper binary at {}",
-        default_bin.display()
-    );
-    default_bin
+            let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let status = Command::new(cargo_bin)
+                .current_dir(checkout_root)
+                .arg("build")
+                .arg("-p")
+                .arg("anneal-rustc-capture")
+                .arg("--bin")
+                .arg("anneal-rustc-capture")
+                .status()
+                .expect("build anneal-rustc-capture binary");
+            assert!(
+                status.success(),
+                "cargo build -p anneal-rustc-capture must succeed"
+            );
+            assert!(
+                default_bin.is_file(),
+                "expected compiled wrapper binary at {}",
+                default_bin.display()
+            );
+
+            // Pre-warm `Trusted` and `Anneal` once into Lake's content-addressed
+            // artifact cache (`LAKE_ARTIFACT_CACHE=true`) before the parallel
+            // e2e tests spawn concurrent `lake build` processes in independent
+            // `.anneal/` workspaces, avoiding 3x redundant cold rebuilds of
+            // `SymReflect` and cgroup memory spikes.
+            let lake_dir = checkout_root.join(".lake");
+            fs::create_dir_all(&lake_dir).expect("create `.lake` dir for cache-warm lock");
+            let lock_file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(lake_dir.join(".anneal-e2e-cache-warm.lock"))
+                .expect("open `.anneal-e2e-cache-warm.lock`");
+            lock_file
+                .lock()
+                .expect("acquire exclusive lock for `lake build Anneal` cache warm");
+            let lake_bin = env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".elan/bin/lake"))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| PathBuf::from("lake"));
+            let mut lake_cmd = cargo_anneal::build_lake_build_command(&lake_bin, checkout_root);
+            lake_cmd.arg("Anneal");
+            let lake_status = lake_cmd.status().expect("spawn `lake build Anneal`");
+            let _ = lock_file.unlock();
+            assert!(
+                lake_status.success(),
+                "`lake build Anneal` pre-warm in checkout root must succeed"
+            );
+
+            default_bin
+        })
+        .clone()
 }
 
 #[test]
@@ -697,6 +732,23 @@ pub fn call_trusted_rev(port: u32) -> u32 {
 pub fn ok_pin(x: u32) -> u32 {
     x + 1
 }
+
+#[anneal_spec::spec(
+    requires: x < 8,
+    ensures: |ret: u32| ret == ok_pin(x),
+)]
+pub fn bad_spec_callee_bound(x: u32) -> u32 {
+    x + 2
+}
+
+#[anneal_spec::spec(
+    safe_total,
+    requires: 42 == x,
+    ensures: |ret: u32| x.wrapping_add(5) == ret,
+)]
+pub fn bad_total_spec_callee(x: u32) -> u32 {
+    x + 6
+}
 "#;
     fs::write(src_dir.join("lib.rs"), lib_rs).expect("write src/lib.rs");
 
@@ -726,6 +778,8 @@ pub fn ok_pin(x: u32) -> u32 {
         "Verify/EdgeNegPkg/rev_pin.lean",
         "Verify/EdgeNegPkg/le_bound.lean",
         "Verify/EdgeNegPkg/call_trusted_rev.lean",
+        "Verify/EdgeNegPkg/bad_spec_callee_bound.lean",
+        "Verify/EdgeNegPkg/bad_total_spec_callee.lean",
     ] {
         assert!(
             err.contains(module_file),
