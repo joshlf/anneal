@@ -689,6 +689,105 @@ theorem shadowing_child_destroys_root_lens :
   cases he
   exact absurd hc.2 (by decide)
 
+/-! ### `split_at_mut` through the trusted deref-write borrow update -/
+
+/-- Fat pointers of the two `split_at_mut` children (64-bit): `_5 : &mut [u32]` for the left
+half (tag `78`, byte `0`) and `_6` for the right half (tag `79`, byte `8`). -/
+def childFatL : Value := WidePtrVal.toValue 8 (WidePtrVal.mk ⟨78, 0⟩ 2)
+
+def childFatR : Value := WidePtrVal.toValue 8 (WidePtrVal.mk ⟨79, 8⟩ 2)
+
+def childLocals : List LocalSlot := locals 8 ++ [.init childFatL, .init childFatR]
+
+def derefDstL : Place := { local_ := 5, projection := [.deref, .constantIndex 1 0 false] }
+
+def derefDstR : Place := { local_ := 6, projection := [.deref, .constantIndex 0 0 false] }
+
+/-- The borrow table after the trusted deref write `(*_5)[1] = 20`. -/
+def derefBorrowsL : List BorrowEntry :=
+  invalidateDerefWriteBorrows childLocals splitChildBorrows derefDstL [.constantIndex 1 0 false] []
+
+/-- The borrow table after the trusted deref write `(*_6)[0] = 30`. -/
+def derefBorrowsLR : List BorrowEntry :=
+  invalidateDerefWriteBorrows childLocals derefBorrowsL derefDstR [.constantIndex 0 0 false] []
+
+/-- **`split_at_mut` through the trusted deref-write borrow update.** The same two writes as
+`split_at_mut_tree_borrows_end_to_end`, but each borrow transition is the one the trusted
+assignment path performs, `invalidateDerefWriteBorrows` on the child's fat pointer (which
+invalidates over the writer entry's whole range): both children stay live with their updated
+halves, and the root lens on `77` views the reassembled `[1, 20, 30, 4]`. -/
+theorem split_at_mut_trusted_deref_writes :
+    ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefBorrowsLR 77 wide4
+        [u 1, u 20, u 30, u 4] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefBorrowsLR 78
+        (WidePtrVal.takeElems wide4 2) [u 1, u 20] bytesW2 ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE derefBorrowsLR 79
+        (WidePtrVal.dropElems wide4 4 2) [u 30, u 4] bytesW2 := by
+  obtain ⟨entry, he, hL, hR, hDisj, hRoot, _, hDescL, hDescR⟩ :=
+    ActiveTypedSliceMutBorrow.splitAt_reborrow mutLens (tagL := 78) (tagR := 79) (k := 2)
+      (by decide) (by decide) rfl rfl
+  have hEntry : entry = rootSlEntry := (Option.some.inj he).symm
+  subst hEntry
+  have hTightL : TightBorrowRange splitChildBorrows 78 (WidePtrVal.takeElems wide4 2) 4 := by
+    intro e hlk
+    cases Option.some.inj hlk
+    exact ⟨rfl, rfl, by decide⟩
+  have hTightR : TightBorrowRange splitChildBorrows 79 (WidePtrVal.dropElems wide4 4 2) 4 := by
+    intro e hlk
+    cases Option.some.inj hlk
+    exact ⟨rfl, rfl, by decide⟩
+  have hLen0 : 2 ≤ splitChildBorrows.length := by decide
+  obtain ⟨hL1, hR1⟩ :=
+    ActiveTypedSliceMutBorrow.derefWrite_frame childLocals derefDstL [.constantIndex 1 0 false] []
+      childFatL ⟨78, 0⟩ hLen0 rfl rfl rfl hL hTightL (i := 1) (by decide) (u 20) write1 hR hTightR
+      hDisj
+  have hRoot1 :=
+    ActiveTypedSliceMutBorrow.derefWrite_ancestor childLocals derefDstL [.constantIndex 1 0 false] []
+      childFatL ⟨78, 0⟩ hLen0 rfl rfl rfl hRoot hDescL split_left_write.2.2
+  have hLen1 : 2 ≤ derefBorrowsL.length := by
+    rw [derefBorrowsL, invalidateDerefWriteBorrows_length _ _ _ _ _ hLen0]
+    exact hLen0
+  have hTightL1 : TightBorrowRange derefBorrowsL 78 (WidePtrVal.takeElems wide4 2) 4 :=
+    hTightL.of_invalidateDerefWriteBorrows childLocals derefDstL [.constantIndex 1 0 false] []
+      hLen0
+  have hTightR1 : TightBorrowRange derefBorrowsL 79 (WidePtrVal.dropElems wide4 4 2) 4 :=
+    hTightR.of_invalidateDerefWriteBorrows childLocals derefDstL [.constantIndex 1 0 false] []
+      hLen0
+  have hDescR1 : isBorrowDescendantOrSelf derefBorrowsL 79 77 = true := by
+    rw [derefBorrowsL, isBorrowDescendantOrSelf_invalidateDerefWriteBorrows _ _ _ _ _ hLen0]
+    exact hDescR
+  have hw2 : writeTyped ByteLensCodec.u32LE
+      (WidePtrVal.elemOffset (WidePtrVal.dropElems wide4 4 2) 4 0) (u 30) bytesW1 =
+        some bytesW2 := rfl
+  obtain ⟨hR2, hL2⟩ :=
+    ActiveTypedSliceMutBorrow.derefWrite_frame childLocals derefDstR [.constantIndex 0 0 false] []
+      childFatR ⟨79, 8⟩ hLen1 rfl rfl rfl hR1 hTightR1 (i := 0) (by decide) (u 30) hw2 hL1
+      hTightL1 (Or.inr (Or.inr (Or.inr (by decide))))
+  have hRoot2 :=
+    ActiveTypedSliceMutBorrow.derefWrite_ancestor childLocals derefDstR [.constantIndex 0 0 false] []
+      childFatR ⟨79, 8⟩ hLen1 rfl rfl rfl hRoot1 hDescR1 split_right_write.2.2
+  exact ⟨hRoot2, hL2, hR2⟩
+
+/-- The trusted deref write through `_5` really transitions the table (the left child's
+`.reservedFrz false` is activated to `.unique`), so the theorem above is not about an identity
+update. -/
+theorem deref_write_activates_child :
+    (lookupBorrow derefBorrowsL 78).map BorrowEntry.perm = some .unique ∧
+      (lookupBorrow splitChildBorrows 78).map BorrowEntry.perm = some (.reservedFrz false) :=
+  ⟨rfl, rfl⟩
+
+/-- 32-bit edge case (trusted-semantics observation, no trusted edit): `extractDerefPtrVal?`
+recognizes only 8-byte fat pointers, so on a 32-bit target a deref write through a
+`&mut [u32]` fat pointer leaves the borrow table unchanged; no Tree Borrows transition is
+applied to the writer, its siblings, or its ancestors. -/
+theorem derefWrite_32bit_fat_ptr_skips_invalidation :
+    extractDerefPtrVal? (WidePtrVal.toValue 4 (WidePtrVal.mk ⟨78, 0⟩ 2)) = none ∧
+      invalidateDerefWriteBorrows
+          (locals 4 ++ [.init (WidePtrVal.toValue 4 (WidePtrVal.mk ⟨78, 0⟩ 2))])
+          splitChildBorrows { local_ := 5, projection := [.deref, .constantIndex 1 0 false] }
+          [.constantIndex 1 0 false] [] = splitChildBorrows :=
+  ⟨rfl, rfl⟩
+
 /-! ## 7. Empty and zero-sized slices -/
 
 /-- An empty slice one-past-the-end of the allocation. -/
@@ -1209,6 +1308,24 @@ theorem polymorphic_callee_and_slice_size_of_val_narrow_witness :
     runCfgWithCallees_cone_narrow_of_closed_wf coneSizeOfVal 8 sliceSizeOfValCallerMir
       [WidePtrVal.toValue 8 wide4] emptyMemory (Or.inl fullCallees_ne_nil) (Or.inr ⟨rfl, rfl⟩)
       (calleesAgreeOn_coneBodies coneSizeOfVal fullCallees) rfl rfl rfl⟩
+
+/-- A generic call `cone::helper1::<u32>()` (type arguments on the function item). -/
+def genericCallerMir : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "cone::genericCaller" 0
+    [retLocal, { mutability := .mut, ty := coneU32, debugName := some "t" }]
+    [{ statements := [{ kind := .storageLive 1, span := "live" }],
+       terminator := callTerm
+         (.constant { ty := { kind := .fnDef "cone::helper1" [.uint .u32], layoutIdx := 0 },
+                      val := .zeroSized }) 1 1,
+       isCleanup := false },
+     retBlock [assignMove 0 1]]
+
+/-- Negative canary: the narrowing theorems are monomorphic. A generic call fails closed in
+`CallConeClosed` even though its definition path is in the cone; the polymorphic
+`lookupCallee` / `checkCalleeSig` agreement lemmas are standalone bridges and are not consumed
+by any narrowing theorem. -/
+theorem generic_call_fails_closed :
+    CallConeClosed cone1 genericCallerMir fullCallees = false := rfl
 
 /-! ## Kernel axiom audit -/
 

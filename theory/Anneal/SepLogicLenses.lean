@@ -24944,6 +24944,179 @@ theorem writePlaceValue_slice_frozen_or_disabled_ub (locals : List LocalSlot) (s
     split <;> rfl
   }
 
+/-! ### Ground-MIR deref writes: `invalidateDerefWriteBorrows` -/
+
+/--
+**`invalidateDerefWriteBorrows_eq_tree`**: on a borrow table with at least two entries, the
+trusted borrow update of a deref write through the (thin or 64-bit fat) pointer held in
+`dst.local_` is exactly the Tree Borrows write transition of the pointer's tag `ptrVal.tag`
+over the *writer entry's own* byte range `[entry.rangeOffset, entry.rangeOffset +
+entry.rangeLen)` on `entry.targetLocal` (the range `invalidateDerefWriteBorrows` really uses,
+not the written element's range).
+-/
+theorem invalidateDerefWriteBorrows_eq_tree (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (dst : Place) (restProj : List ProjectionElem) (callerLocals : List LocalSlot)
+    (fat : Value) (ptrVal : ProvenancePtr) (entry : BorrowEntry)
+    (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal)
+    (he : lookupBorrow borrows ptrVal.tag = some entry) :
+    invalidateDerefWriteBorrows locals borrows dst restProj callerLocals =
+      invalidateTreeBorrowsAtProj borrows borrows entry.targetLocal (some ptrVal.tag)
+        (resolveDerefWriteFullProj locals locals fat entry restProj callerLocals)
+        entry.rangeOffset entry.rangeLen := by
+  match borrows, hLen, he with
+  | b₁ :: b₂ :: rest, _, he =>
+    unfold invalidateDerefWriteBorrows
+    dsimp only
+    rw [hSlot]
+    dsimp only
+    rw [hExt]
+    dsimp only
+    rw [he]
+
+/-- If the written pointer's tag has no entry, the trusted deref-write borrow update leaves a
+table with at least two entries unchanged. -/
+theorem invalidateDerefWriteBorrows_eq_self_of_lookup_none (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (dst : Place) (restProj : List ProjectionElem)
+    (callerLocals : List LocalSlot) (fat : Value) (ptrVal : ProvenancePtr)
+    (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal)
+    (hNone : lookupBorrow borrows ptrVal.tag = none) :
+    invalidateDerefWriteBorrows locals borrows dst restProj callerLocals = borrows := by
+  match borrows, hLen, hNone with
+  | b₁ :: b₂ :: rest, _, hNone =>
+    unfold invalidateDerefWriteBorrows
+    dsimp only
+    rw [hSlot]
+    dsimp only
+    rw [hExt]
+    dsimp only
+    rw [hNone]
+
+/--
+**`ActiveTypedSliceMutBorrow.derefWrite_frame`**: a trusted deref write through the pointer
+of the writer tag `tag` (held in `dst.local_`, `ptrVal.tag = tag`) whose entry has the *tight*
+range of its window updates the borrow table exactly as `invalidateDerefWriteBorrows` does,
+and in that table the writer lens is updated to `xs.set i v` while every disjoint sibling lens
+with a tight range (e.g. the other `split_at_mut` half) survives.
+-/
+theorem ActiveTypedSliceMutBorrow.derefWrite_frame {α β : Type} {n m : Nat}
+    {c : ByteLensCodec α n} {c' : ByteLensCodec β m} {borrows : List BorrowEntry}
+    {tag tag' : Nat} {wide wide' : WidePtrVal} {xs : List α} {ys : List β}
+    {bytes bytes' : ByteMem} (locals : List LocalSlot) (dst : Place)
+    (restProj : List ProjectionElem) (callerLocals : List LocalSlot) (fat : Value)
+    (ptrVal : ProvenancePtr) (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal) (hTag : ptrVal.tag = tag)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hTight : TightBorrowRange borrows tag wide n)
+    {i : Nat} (hi : i < wide.2) (v : α)
+    (hw : writeTyped c (WidePtrVal.elemOffset wide n i) v bytes = some bytes')
+    (hSib : ActiveTypedSliceMutBorrow c' borrows tag' wide' ys bytes)
+    (hSibTight : TightBorrowRange borrows tag' wide' m)
+    (hdisj : DisjointSlice wide.1.offsetBytes (wide.2 * n) wide'.1.offsetBytes (wide'.2 * m)) :
+    ActiveTypedSliceMutBorrow c (invalidateDerefWriteBorrows locals borrows dst restProj callerLocals)
+        tag wide (xs.set i v) bytes' ∧
+      ActiveTypedSliceMutBorrow c' (invalidateDerefWriteBorrows locals borrows dst restProj
+        callerLocals) tag' wide' ys bytes' := by
+  obtain ⟨entry, he, _, _⟩ := h.2
+  obtain ⟨hOff, hLenE, hPos⟩ := hTight entry he
+  have he' : lookupBorrow borrows ptrVal.tag = some entry := by rw [hTag]; exact he
+  rw [invalidateDerefWriteBorrows_eq_tree locals borrows dst restProj callerLocals fat ptrVal entry
+    hLen hSlot hExt he', hTag]
+  exact ActiveTypedSliceMutBorrow.write_subrange_treeBorrows_frame entry.targetLocal _
+    entry.rangeOffset entry.rangeLen h hi v hw hPos (Nat.le_of_eq hOff.symm)
+    (Nat.le_of_eq (by rw [hOff, hLenE])) hSib hSibTight hdisj
+
+/--
+**`ActiveTypedSliceMutBorrow.derefWrite_ancestor`**: a trusted deref write through any
+descendant `wTag` of `tag` (`isBorrowDescendantOrSelf borrows wTag tag = true`) keeps `tag`'s
+lens alive in the `invalidateDerefWriteBorrows` table, with any new view `xs'` of its window
+(e.g. the reassembled parent slice after writing through a `split_at_mut` half). This holds
+whether or not `wTag` has an entry (without one, the trusted update is the identity).
+-/
+theorem ActiveTypedSliceMutBorrow.derefWrite_ancestor {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag wTag : Nat} {wide : WidePtrVal}
+    {xs xs' : List α} {bytes bytes' : ByteMem} (locals : List LocalSlot) (dst : Place)
+    (restProj : List ProjectionElem) (callerLocals : List LocalSlot) (fat : Value)
+    (ptrVal : ProvenancePtr) (hLen : 2 ≤ borrows.length)
+    (hSlot : get? locals dst.local_ = some (.init fat))
+    (hExt : extractDerefPtrVal? fat = some ptrVal) (hTag : ptrVal.tag = wTag)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hDesc : isBorrowDescendantOrSelf borrows wTag tag = true)
+    (hs' : SliceTypedAt c wide xs' bytes') :
+    ActiveTypedSliceMutBorrow c (invalidateDerefWriteBorrows locals borrows dst restProj callerLocals)
+      tag wide xs' bytes' := by
+  cases hlk : lookupBorrow borrows ptrVal.tag with
+  | none =>
+    rw [invalidateDerefWriteBorrows_eq_self_of_lookup_none locals borrows dst restProj callerLocals
+      fat ptrVal hLen hSlot hExt hlk]
+    obtain ⟨_, entry, he, hc, hp⟩ := h
+    exact ⟨hs', entry, he, hc, hp⟩
+  | some wEntry =>
+    rw [invalidateDerefWriteBorrows_eq_tree locals borrows dst restProj callerLocals fat ptrVal
+      wEntry hLen hSlot hExt hlk, hTag]
+    exact ActiveTypedSliceMutBorrow.descendant_write_preserves wEntry.targetLocal _ _ _ h hDesc hs'
+
+/-- The trusted deref-write borrow update preserves the table length (two or more entries). -/
+theorem invalidateDerefWriteBorrows_length (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (dst : Place) (restProj : List ProjectionElem) (callerLocals : List LocalSlot)
+    (hLen : 2 ≤ borrows.length) :
+    (invalidateDerefWriteBorrows locals borrows dst restProj callerLocals).length =
+      borrows.length := by
+  match borrows, hLen with
+  | b₁ :: b₂ :: rest, _ =>
+    unfold invalidateDerefWriteBorrows
+    dsimp only
+    split
+    · split
+      · split
+        · exact invalidateTreeBorrowsAtProj_length _ _ _ _ _ _ _
+        · rfl
+      · rfl
+    · rfl
+
+/-- The trusted deref-write borrow update preserves Tree Borrows ancestry (two or more
+entries): only permissions change, never `parentTag`. -/
+theorem isBorrowDescendantOrSelf_invalidateDerefWriteBorrows (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (dst : Place) (restProj : List ProjectionElem)
+    (callerLocals : List LocalSlot) (hLen : 2 ≤ borrows.length) (cTag aTag : Nat) :
+    isBorrowDescendantOrSelf (invalidateDerefWriteBorrows locals borrows dst restProj callerLocals)
+        cTag aTag =
+      isBorrowDescendantOrSelf borrows cTag aTag := by
+  match borrows, hLen with
+  | b₁ :: b₂ :: rest, _ =>
+    unfold invalidateDerefWriteBorrows
+    dsimp only
+    split
+    · split
+      · split
+        · exact isBorrowDescendantOrSelf_invalidateTreeBorrowsAtProj _ _ _ _ _ _ _ _ _
+        · rfl
+      · rfl
+    · rfl
+
+/-- The trusted deref-write borrow update preserves tight byte ranges (two or more entries). -/
+theorem TightBorrowRange.of_invalidateDerefWriteBorrows {borrows : List BorrowEntry} {tag : Nat}
+    {wide : WidePtrVal} {n : Nat} (h : TightBorrowRange borrows tag wide n)
+    (locals : List LocalSlot) (dst : Place) (restProj : List ProjectionElem)
+    (callerLocals : List LocalSlot) (hLen : 2 ≤ borrows.length) :
+    TightBorrowRange (invalidateDerefWriteBorrows locals borrows dst restProj callerLocals) tag
+      wide n := by
+  match borrows, hLen, h with
+  | b₁ :: b₂ :: rest, _, h =>
+    unfold invalidateDerefWriteBorrows
+    dsimp only
+    split
+    · split
+      · split
+        · exact h.of_invalidateTreeBorrowsAtProj _ _ _ _ _ _
+        · exact h
+      · exact h
+    · exact h
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses
