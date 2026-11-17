@@ -1024,7 +1024,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {rest : List ProjectionElem} {rootVal projVal : Value} :
       get? env place.local_ = some (.init rootVal) →
       place.projection = proj :: rest →
-      readProjectedValue env rootVal (proj :: rest) = .ok projVal →
+      checkProjectedDropValue env rootVal (proj :: rest) = .ok projVal →
       post (.frame target 0 env mem) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .drop place target unwind, span := span }
@@ -2322,17 +2322,31 @@ theorem PureMirModularConverges.step_stmt
         | some sl =>
           rw [h_g] at h_eval
           cases sl with
-          | uninit => nomatch h_eval
           | dead => nomatch h_eval
-          | init rv =>
+          | uninit =>
             dsimp only at h_eval ⊢
-            cases h_rd : readProjectedValue ps.env rv (hd :: tl) with
-            | ub => rw [h_rd] at h_eval; nomatch h_eval
-            | unsupported => rw [h_rd] at h_eval; nomatch h_eval
-            | ok _ =>
-              rw [h_rd] at h_eval
+            cases h_ok : deinitTailOk ps.env (hd :: tl) with
+            | false =>
+              rw [h_ok] at h_eval
+              cases h_d : projectionHasDeref (hd :: tl) <;> (rw [h_d] at h_eval; nomatch h_eval)
+            | true =>
+              rw [h_ok] at h_eval
               injection h_eval with h_se; injection h_se with h_eq
               subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
+          | init rv =>
+            dsimp only at h_eval ⊢
+            cases h_rd : deinitProjectedForLocal ps.env body.localDecls body.layouts loc rv (hd :: tl) with
+            | ub => rw [h_rd] at h_eval; nomatch h_eval
+            | unsupported => rw [h_rd] at h_eval; nomatch h_eval
+            | ok rv' =>
+              rw [h_rd] at h_eval
+              dsimp only at h_eval ⊢
+              cases h_s : set? ps.env loc (.init rv') with
+              | none => rw [h_s] at h_eval; nomatch h_eval
+              | some _ =>
+                rw [h_s] at h_eval
+                injection h_eval with h_se; injection h_se with h_eq
+                subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
     | intrinsic intr =>
       cases intr with
       | copyNonOverlapping _ _ _ => cases h_pure_s
@@ -4137,15 +4151,27 @@ private theorem evalStmt_borrowFree_pure_sim
       | some sl =>
         rw [h_g] at h_wp
         cases sl with
-        | uninit => exact False.elim h_wp
         | dead => exact False.elim h_wp
+        | uninit =>
+          dsimp only at h_wp ⊢
+          cases h_ok : deinitTailOk s₁.frame.locals (hd :: tl) with
+          | false =>
+            rw [h_ok] at h_wp
+            cases h_d : projectionHasDeref (hd :: tl) <;> (rw [h_d] at h_wp; exact False.elim h_wp)
+          | true =>
+            exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
         | init rv =>
           dsimp only at h_wp ⊢
-          cases h_rd : readProjectedValue s₁.frame.locals rv (hd :: tl) with
+          cases h_rd : deinitProjectedForLocal s₁.frame.locals ld ly loc rv (hd :: tl) with
           | ub => rw [h_rd] at h_wp; exact False.elim h_wp
           | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
-          | ok _ =>
-            exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
+          | ok rv' =>
+            rw [h_rd] at h_wp
+            dsimp only at h_wp ⊢
+            cases h_set : set? s₁.frame.locals loc (.init rv') with
+            | none => rw [h_set] at h_wp; exact False.elim h_wp
+            | some _ =>
+              exact ⟨_, _, rfl, rfl, h_adv _, SameCallFrameAndTraits_refl _, SameCallFrameAndTraits_refl _⟩
   | intrinsic intr =>
     cases intr with
     | copyNonOverlapping _ _ _ => cases h_s
@@ -4297,7 +4323,12 @@ private theorem evalDrop_pure_sim
         cases h_s : set? s₁.frame.locals pLoc .uninit with
         | none => rw [h_s] at h_wp; exact False.elim h_wp
         | some _ => exact ⟨_, rfl, rfl⟩
-      | cons _ _ => exact False.elim h_wp
+      | cons hd tl =>
+        dsimp only at h_wp ⊢
+        cases h_rd : checkProjectedDropValue s₁.frame.locals .uninit (hd :: tl) with
+        | ub => rw [h_rd] at h_wp; exact False.elim h_wp
+        | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
+        | ok _ => exact ⟨_, rfl, rfl⟩
     | init rv =>
       dsimp only at h_wp ⊢
       cases pProj with
@@ -4308,7 +4339,7 @@ private theorem evalDrop_pure_sim
         | some _ => exact ⟨_, rfl, rfl⟩
       | cons hd tl =>
         dsimp only at h_wp ⊢
-        cases h_rd : readProjectedValue s₁.frame.locals rv (hd :: tl) with
+        cases h_rd : checkProjectedDropValue s₁.frame.locals rv (hd :: tl) with
         | ub => rw [h_rd] at h_wp; exact False.elim h_wp
         | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
         | ok _ => exact ⟨_, rfl, rfl⟩
@@ -6294,7 +6325,18 @@ theorem PureMirModularConverges.step_drop
             injection h_se with h_eq
             subst h_eq
             rfl
-        | cons _ _ => nomatch h_eval
+        | cons hd tl =>
+          dsimp only at h_eval ⊢
+          cases h_rd : checkProjectedDropValue ps.env .uninit (hd :: tl) with
+          | ub => rw [h_rd] at h_eval; nomatch h_eval
+          | unsupported => rw [h_rd] at h_eval; nomatch h_eval
+          | ok _ =>
+            rw [h_rd] at h_eval
+            dsimp only at h_eval ⊢
+            injection h_eval with h_se
+            injection h_se with h_eq
+            subst h_eq
+            rfl
       | init rv =>
         cases proj with
         | nil =>
@@ -6310,7 +6352,7 @@ theorem PureMirModularConverges.step_drop
             rfl
         | cons hd tl =>
           dsimp only at h_eval ⊢
-          cases h_rd : readProjectedValue ps.env rv (hd :: tl) with
+          cases h_rd : checkProjectedDropValue ps.env rv (hd :: tl) with
           | ub => rw [h_rd] at h_eval; nomatch h_eval
           | unsupported => rw [h_rd] at h_eval; nomatch h_eval
           | ok _ =>
@@ -8916,21 +8958,29 @@ theorem checkPureMir_polySwapPairU64Body :
 Call-free `PureMirConverges` summary for `polySwapPairU32Body` (`T = u32`),
 swapping `(a, b)` to `(b, a)`.
 -/
-theorem polySwapPairU32_pureConverges (a b : Value) :
+theorem polySwapPairU32_pureConverges (a b : Value)
+    (ha : ∃ sc, a = .scalar sc := by exact ⟨_, rfl⟩)
+    (hb : ∃ sc, b = .scalar sc := by exact ⟨_, rfl⟩) :
     PureMirConverges polySwapPairU32Body
       (initPureState polySwapPairU32Body [.aggregate 0 [a, b]])
-      (· = .aggregate 0 [b, a]) :=
-  ⟨4, rfl⟩
+      (· = .aggregate 0 [b, a]) := by
+  rcases ha with ⟨_, rfl⟩
+  rcases hb with ⟨_, rfl⟩
+  exact ⟨4, rfl⟩
 
 /--
 Call-free `PureMirConverges` summary for `polySwapPairU64Body` (`T = u64`),
 swapping `(a, b)` to `(b, a)`.
 -/
-theorem polySwapPairU64_pureConverges (a b : Value) :
+theorem polySwapPairU64_pureConverges (a b : Value)
+    (ha : ∃ sc, a = .scalar sc := by exact ⟨_, rfl⟩)
+    (hb : ∃ sc, b = .scalar sc := by exact ⟨_, rfl⟩) :
     PureMirConverges polySwapPairU64Body
       (initPureState polySwapPairU64Body [.aggregate 0 [a, b]])
-      (· = .aggregate 0 [b, a]) :=
-  ⟨4, rfl⟩
+      (· = .aggregate 0 [b, a]) := by
+  rcases ha with ⟨_, rfl⟩
+  rcases hb with ⟨_, rfl⟩
+  exact ⟨4, rfl⟩
 
 /--
 Intermediate helper `demo::scale_swap_and_div` (`argCount := 1`):
@@ -9831,13 +9881,16 @@ Expected return value `ctpop::<u32>(bswap::<u32>(x))` of
 `pureIntrinsicCallerBody`.
 -/
 @[irreducible]
+def expectedBswapPopU32Bits (x : Nat) : Nat :=
+  pureCtpopLoop 32 (pureBswapLoop 4 x 0)
+
 def expectedBswapPopU32 (x : Nat) : Value :=
-  .scalar ⟨pureCtpopLoop 32 (pureBswapLoop 4 x 0), 4⟩
+  .scalar ⟨expectedBswapPopU32Bits x, 4⟩
 
 private theorem expectedBswapPopU32_def (x : Nat) :
     (Value.scalar ⟨pureCtpopLoop 32 (pureBswapLoop 4 x 0), 4⟩) =
       expectedBswapPopU32 x := by
-  unfold expectedBswapPopU32
+  unfold expectedBswapPopU32 expectedBswapPopU32Bits
   rfl
 
 private theorem isCanonicalScalarOfSize_four {v : Nat} (hv : v < 4294967296) :
@@ -12215,12 +12268,13 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
     | .nil =>
       match get? locals p.local_ with
       | .some (.init v) =>
-        match valueContainsUninit v with
-        | true => .ub
-        | false =>
+        match readProjectedValue locals v .nil with
+        | .ok validVal =>
           match set? locals p.local_ .uninit with
-          | .some locals' => .ok v locals'
+          | .some locals' => .ok validVal locals'
           | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub

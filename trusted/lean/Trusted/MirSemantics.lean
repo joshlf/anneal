@@ -70,7 +70,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   freezeTreeBorrowsOnReadAtProj freezeDerefReadBorrowsAt
   hasProtectedTreeWriteConflict lookupGlobalAlloc
   readLittleEndianBytes readGlobalScalar tyScalarBytes evalConstValue
-  dropValues takeValues extractSubslice readProjectedValue
+  dropValues takeValues extractSubslice readProjectedValue readContainerProjectedValue
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
   projListHasDeref deinitTailOk deinitProjectedValue deinitProjectedForLocal checkProjectedDropValue

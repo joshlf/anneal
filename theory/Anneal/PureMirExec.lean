@@ -9029,8 +9029,17 @@ theorem evalStmt_borrows_nil_pushBaseStack
         | none => rfl
         | some sl =>
           cases sl with
-          | uninit | dead => rfl
-          | init rv => dsimp only; cases readProjectedValue sFr.locals rv (phd :: ptl) <;> rfl
+          | dead => rfl
+          | uninit =>
+            dsimp only
+            cases deinitTailOk sFr.locals (phd :: ptl) with
+            | true => rfl
+            | false => dsimp only; cases projectionHasDeref (phd :: ptl) <;> rfl
+          | init rv =>
+            dsimp only
+            cases deinitProjectedForLocal sFr.locals localDecls layouts loc rv (phd :: ptl) with
+            | ub | unsupported => rfl
+            | ok rv' => dsimp only; cases set? sFr.locals loc (.init rv') <;> rfl
     | retag rk p =>
       exact evalStmt_retag_cons_nil_pushBaseStack calleeBody bHd bTl sFr nA gl nT cal tr cs ac ap nP cl fp ex rk p span localDecls layouts
     | storageLive loc =>
@@ -9650,7 +9659,14 @@ theorem wpMirExecNoCallSym_borrows_nil
                     | some l' =>
                       rw [h_s] at h_wp; dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_wp
                       exact absurd (ih_run h_wp) h_ne
-                  | cons _ _ => rw [h_pr] at h_wp; exact h_wp
+                  | cons pH pT =>
+                    rw [h_pr] at h_wp; dsimp only at h_wp
+                    cases h_rp : checkProjectedDropValue ms.frame.locals .uninit (pH :: pT) with
+                    | ok _ =>
+                      rw [h_rp] at h_wp; dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_wp
+                      exact absurd (ih_run h_wp) h_ne
+                    | ub => rw [h_rp] at h_wp; exact h_wp
+                    | unsupported => rw [h_rp] at h_wp; exact h_wp
                 | init rootVal =>
                   cases h_pr : place.projection with
                   | nil =>
@@ -9662,7 +9678,7 @@ theorem wpMirExecNoCallSym_borrows_nil
                       exact absurd (ih_run h_wp) h_ne
                   | cons pH pT =>
                     rw [h_pr] at h_wp; dsimp only at h_wp
-                    cases h_rp : readProjectedValue ms.frame.locals rootVal (pH :: pT) with
+                    cases h_rp : checkProjectedDropValue ms.frame.locals rootVal (pH :: pT) with
                     | ok _ =>
                       rw [h_rp] at h_wp; dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_wp
                       exact absurd (ih_run h_wp) h_ne
@@ -10223,9 +10239,19 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                           (st_un := .running {
                             ms with frame := { blockIdx := target, stmtIdx := 0, locals := l' } })
                           h_step_body h_st (fun _ _ h => by cases h)
-                    | cons _ _ =>
-                      rw [h_pr] at h_st
-                      exact False.elim h_st
+                    | cons pHead pTail =>
+                      rw [h_pr] at h_st h_step_body
+                      dsimp only at h_st h_step_body
+                      cases h_rp : checkProjectedDropValue ms.frame.locals .uninit (pHead :: pTail) with
+                      | ok _ =>
+                        rw [h_rp] at h_st h_step_body
+                        dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
+                        exact liftTau
+                          (st_un := .running {
+                            ms with frame := { ms.frame with blockIdx := target, stmtIdx := 0 } })
+                          h_step_body h_st (fun _ _ h => by cases h)
+                      | ub => rw [h_rp] at h_st; exact False.elim h_st
+                      | unsupported => rw [h_rp] at h_st; exact False.elim h_st
                   | init rootVal =>
                     cases h_pr : place.projection with
                     | nil =>
@@ -10243,7 +10269,7 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                     | cons pHead pTail =>
                       rw [h_pr] at h_st h_step_body
                       dsimp only at h_st h_step_body
-                      cases h_rp : readProjectedValue ms.frame.locals rootVal (pHead :: pTail) with
+                      cases h_rp : checkProjectedDropValue ms.frame.locals rootVal (pHead :: pTail) with
                       | ok _ =>
                         rw [h_rp] at h_st h_step_body
                         dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
@@ -11170,7 +11196,9 @@ theorem stepMirFn_extCall_aborts_prop
                 | nil =>
                   dsimp only
                   cases set? s.frame.locals place.local_ .uninit <;> trivial
-                | cons _ _ => trivial
+                | cons _ _ =>
+                  dsimp only
+                  cases checkProjectedDropValue s.frame.locals .uninit _ <;> trivial
               | init rootVal =>
                 cases place.projection with
                 | nil =>
@@ -11178,7 +11206,7 @@ theorem stepMirFn_extCall_aborts_prop
                   cases set? s.frame.locals place.local_ .uninit <;> trivial
                 | cons _ _ =>
                   dsimp only
-                  cases readProjectedValue s.frame.locals rootVal _ <;> trivial
+                  cases checkProjectedDropValue s.frame.locals rootVal _ <;> trivial
           | tailCall func argOps =>
             dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
             cases resolveCallTarget s func (length argOps) _ _ with
@@ -11675,7 +11703,16 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                   | dead => exact False.elim h_st
                   | uninit =>
                     cases h_pr : pl.projection with
-                    | cons _ _ => rw [h_pr] at h_st; exact False.elim h_st
+                    | cons hd tl =>
+                      rw [h_pr] at h_st h_step_body
+                      dsimp only at h_st h_step_body
+                      cases h_rd : checkProjectedDropValue ms.frame.locals .uninit (hd :: tl) with
+                      | ub => rw [h_rd] at h_st; exact False.elim h_st
+                      | unsupported => rw [h_rd] at h_st; exact False.elim h_st
+                      | ok _ =>
+                        rw [h_rd] at h_st h_step_body
+                        rw [h_step_body]
+                        exact ih h_st
                     | nil =>
                       rw [h_pr] at h_st h_step_body
                       dsimp only at h_st h_step_body
@@ -11699,7 +11736,7 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                     | cons hd tl =>
                       rw [h_pr] at h_st h_step_body
                       dsimp only at h_st h_step_body
-                      cases h_rd : readProjectedValue ms.frame.locals rv (hd :: tl) with
+                      cases h_rd : checkProjectedDropValue ms.frame.locals rv (hd :: tl) with
                       | ub => rw [h_rd] at h_st; exact False.elim h_st
                       | unsupported => rw [h_rd] at h_st; exact False.elim h_st
                       | ok _ =>
@@ -13888,7 +13925,18 @@ theorem PureMirConvergesWithCallees.step_drop
             injection h_se with h_eq
             subst h_eq
             rfl
-        | cons _ _ => nomatch h_eval
+        | cons hd tl =>
+          dsimp only at h_eval ⊢
+          cases h_rd : checkProjectedDropValue ps.env .uninit (hd :: tl) with
+          | ub => rw [h_rd] at h_eval; nomatch h_eval
+          | unsupported => rw [h_rd] at h_eval; nomatch h_eval
+          | ok _ =>
+            rw [h_rd] at h_eval
+            dsimp only at h_eval ⊢
+            injection h_eval with h_se
+            injection h_se with h_eq
+            subst h_eq
+            rfl
       | init rv =>
         cases proj with
         | nil =>
@@ -13904,7 +13952,7 @@ theorem PureMirConvergesWithCallees.step_drop
             rfl
         | cons hd tl =>
           dsimp only at h_eval ⊢
-          cases h_rd : readProjectedValue ps.env rv (hd :: tl) with
+          cases h_rd : checkProjectedDropValue ps.env rv (hd :: tl) with
           | ub => rw [h_rd] at h_eval; nomatch h_eval
           | unsupported => rw [h_rd] at h_eval; nomatch h_eval
           | ok _ =>
@@ -14952,7 +15000,12 @@ theorem stepMirFn_pureCallee_step_and_replaceRoot
                     cases set? s.frame.locals loc .uninit with
                     | none => exact ⟨trivial, rfl⟩
                     | some _ => exact ⟨h_inv_full, rfl⟩
-                  | cons _ _ => exact ⟨trivial, rfl⟩
+                  | cons hd tl =>
+                    dsimp only
+                    cases checkProjectedDropValue s.frame.locals .uninit (hd :: tl) with
+                    | ub => exact ⟨trivial, rfl⟩
+                    | unsupported => exact ⟨trivial, rfl⟩
+                    | ok _ => exact ⟨h_inv_full, rfl⟩
                 | init rv =>
                   dsimp only
                   cases proj with
@@ -14963,7 +15016,7 @@ theorem stepMirFn_pureCallee_step_and_replaceRoot
                     | some _ => exact ⟨h_inv_full, rfl⟩
                   | cons hd tl =>
                     dsimp only
-                    cases readProjectedValue s.frame.locals rv (hd :: tl) with
+                    cases checkProjectedDropValue s.frame.locals rv (hd :: tl) with
                     | ub => exact ⟨trivial, rfl⟩
                     | unsupported => exact ⟨trivial, rfl⟩
                     | ok _ => exact ⟨h_inv_full, rfl⟩

@@ -2363,12 +2363,10 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 def readProjectedValue
     (locals : List LocalSlot) :
     Value → List ProjectionElem → ProjReadResult
-  | .uninit, _ => .ub
-  | .aggregate variantIdx fields, .nil =>
-    match valueListContainsUninit fields with
-    | false => .ok (.aggregate variantIdx fields)
+  | val, .nil =>
+    match valueContainsUninit val with
+    | false => .ok val
     | true => .ub
-  | val, .nil => .ok val
   | .aggregate _ fields, .field idx _ :: rest =>
     match get? fields idx with
     | .some fieldVal => readProjectedValue locals fieldVal rest
@@ -5363,6 +5361,74 @@ def resolveLeafTyInTargetDecls
   | .none => resolveTyWithLocalDecls localDecls layouts ty
 
 /--
+Traverse `proj` from `rootVal` to locate an enclosing container `Value` for
+pointer byte-offset resolution, without requiring unaccessed sibling fields of
+the enclosing aggregate to be initialized.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Evaluating a dereference expression (`*expr`) on a raw pointer that is
+>   dangling or unaligned, even in place expression context (e.g.
+>   `addr_of!(*expr)`)."
+-/
+@[reducible]
+def readContainerProjectedValue
+    (locals : List LocalSlot) :
+    Value → List ProjectionElem → ProjReadResult
+  | .uninit, _ => .ub
+  | val, .nil => .ok val
+  | .aggregate _ fields, .field idx _ :: rest =>
+    match get? fields idx with
+    | .some fieldVal => readContainerProjectedValue locals fieldVal rest
+    | .none => .ub
+  | .scalar sc, .field .zero _ :: rest =>
+    readContainerProjectedValue locals (.scalar sc) rest
+  | .ptr p sz, .field .zero _ :: rest =>
+    readContainerProjectedValue locals (.ptr p sz) rest
+  | .unit, .field .zero _ :: rest =>
+    readContainerProjectedValue locals .unit rest
+  | _, .field _ _ :: _ => .ub
+  | .aggregate actualVariant fields, .downcast _ variantIdx :: rest =>
+    match Nat.beq actualVariant variantIdx with
+    | true =>
+      readContainerProjectedValue locals (.aggregate actualVariant fields) rest
+    | false => .ub
+  | _, .downcast _ _ :: _ => .ub
+  | .aggregate 0 fields, .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match get? fields sc.bits with
+      | .some elemVal => readContainerProjectedValue locals elemVal rest
+      | .none => .ub
+    | _ => .ub
+  | _, .index _ :: _ => .ub
+  | .aggregate 0 fields, .constantIndex offset minLen fromEnd :: rest =>
+    let len := length fields
+    match Nat.ble minLen len with
+    | true =>
+      let idx :=
+        match fromEnd with
+        | true => Nat.sub len offset
+        | false => offset
+      match get? fields idx with
+      | .some elemVal => readContainerProjectedValue locals elemVal rest
+      | .none => .ub
+    | false => .ub
+  | _, .constantIndex _ _ _ :: _ => .ub
+  | .aggregate 0 fields, .subslice fromIdx toIdx fromEnd :: rest =>
+    match extractSubslice fields fromIdx toIdx fromEnd with
+    | .some subElems =>
+      readContainerProjectedValue locals (.aggregate 0 subElems) rest
+    | .none => .ub
+  | _, .subslice _ _ _ :: _ => .ub
+  | val, .opaqueCast _ :: rest =>
+    readContainerProjectedValue locals val rest
+  | val, .unwrapUnsafeBinder _ :: rest =>
+    readContainerProjectedValue locals val rest
+  | _, _ :: _ => .unsupported
+
+/--
 Resolve a non-zero intra-allocation byte offset `offsetBytes` from a field-based
 `BorrowEntry` projection `normTargetProj` ending in `.field _ leafFieldTy` onto
 the sibling or nested field at `startByteOff + offsetBytes` (plus any
@@ -5402,7 +5468,7 @@ def resolveStackThinPtrFieldOffsetProj?
     Option (List ProjectionElem × Nat) :=
   let (encProj, rawRelProj) := splitAfterLastSeqProj windowTargetProj
   let relProj := normalizeSubsliceProjections rawRelProj
-  match readProjectedValue indexLocals targetRootVal encProj with
+  match readContainerProjectedValue indexLocals targetRootVal encProj with
   | .ok (.aggregate encVar encFields) =>
     let encVal := Value.aggregate encVar encFields
     let encTyOpt : Option Ty :=
@@ -5420,7 +5486,7 @@ def resolveStackThinPtrFieldOffsetProj?
     | .none => .none
     | .some startByteOff =>
       let leafValOpt : Option Value :=
-        match readProjectedValue indexLocals targetRootVal windowTargetProj with
+        match readContainerProjectedValue indexLocals targetRootVal windowTargetProj with
         | .ok lv => .some lv
         | _ => .none
       let expectedElemBytesOpt : Option Nat :=
@@ -5613,7 +5679,7 @@ def resolveStackThinPtrTargetProjWithResidual?
               | _ =>
                 match restProj, tyScalarBytes pointeeTy with
                 | .nil, .some _ =>
-                  match readProjectedValue indexLocals targetRootVal normTargetProj with
+                  match readContainerProjectedValue indexLocals targetRootVal normTargetProj with
                   | .ok (.aggregate _ _) => true
                   | _ => false
                 | _, _ => false
@@ -5633,7 +5699,7 @@ def resolveStackThinPtrTargetProjWithResidual?
       let candidateOpt : Option (List ProjectionElem) :=
         match startsWithArrayOrSliceProj cleanRest, pointeeTyOpt with
         | true, .some { kind := .array ptEk ptArrLen, .. } =>
-          match readProjectedValue indexLocals targetRootVal normTargetProj with
+          match readContainerProjectedValue indexLocals targetRootVal normTargetProj with
           | .ok (.aggregate 0 backingElems) =>
             let containerElemIsPtEk : Bool :=
               match
@@ -5689,7 +5755,7 @@ def resolveStackThinPtrTargetProjWithResidual?
   | _, _ =>
     match splitLastConstantIndex? windowTargetProj with
     | .some (initProj, baseIdx, minLen) =>
-      match readProjectedValue indexLocals targetRootVal initProj with
+      match readContainerProjectedValue indexLocals targetRootVal initProj with
       | .ok (.aggregate 0 elems) =>
         let elemSz :=
           resolveSeqContainerElemByteStride
@@ -5878,7 +5944,7 @@ def resolveStackThinPtrTargetProjWithResidual?
       | _ => .none
     | .none =>
       let resolveSeqAtNormTarget : Option (List ProjectionElem × Nat) :=
-        match readProjectedValue indexLocals targetRootVal normTargetProj with
+        match readContainerProjectedValue indexLocals targetRootVal normTargetProj with
         | .ok (.aggregate 0 elems) =>
           let isSeqCandidate : Bool :=
             match endsWithSubslice normTargetProj with
@@ -9716,15 +9782,18 @@ def decodeAtBorrowTargetOffset?
   | .nil =>
     match accessedTyOpt with
     | .some accTy =>
-      match
-        readProjectedForLocal
-          locals
-          localDecls
-          layouts
-          entry.targetLocal
-          targetRootVal
-          entry.targetProjection
-      with
+      let baseRes : ProjReadResult :=
+        match entry.targetProjection with
+        | .nil => .ok targetRootVal
+        | _ :: _ =>
+          readProjectedForLocal
+            locals
+            localDecls
+            layouts
+            entry.targetLocal
+            targetRootVal
+            entry.targetProjection
+      match baseRes with
       | .ok baseVal =>
         decodeSubValueAtByteOffset? layouts targetTyOpt baseVal ptrVal.offsetBytes accTy localDecls
           accLayouts accDecls
@@ -9733,15 +9802,18 @@ def decodeAtBorrowTargetOffset?
   | pHead :: pTail =>
     match pointeeTyOpt with
     | .some pt =>
-      match
-        readProjectedForLocal
-          locals
-          localDecls
-          layouts
-          entry.targetLocal
-          targetRootVal
-          entry.targetProjection
-      with
+      let baseRes : ProjReadResult :=
+        match entry.targetProjection with
+        | .nil => .ok targetRootVal
+        | _ :: _ =>
+          readProjectedForLocal
+            locals
+            localDecls
+            layouts
+            entry.targetLocal
+            targetRootVal
+            entry.targetProjection
+      match baseRes with
       | .ok baseVal =>
         match
           decodeSubValueAtByteOffset? layouts targetTyOpt baseVal ptrVal.offsetBytes pt localDecls
@@ -9944,15 +10016,18 @@ def evalStackThinPtrTypedDerefRead
         | .nil, .some accTy =>
           match tyScalarBytes accTy with
           | .some reqBytes =>
-            match
-              readProjectedForLocal
-                locals
-                effTargetDecls
-                targetLayouts
-                entry.targetLocal
-                targetRootVal
-                rawFullProj
-            with
+            let fastBaseRes : ProjReadResult :=
+              match rawFullProj with
+              | .nil => .ok targetRootVal
+              | _ :: _ =>
+                readProjectedForLocal
+                  locals
+                  effTargetDecls
+                  targetLayouts
+                  entry.targetLocal
+                  targetRootVal
+                  rawFullProj
+            match fastBaseRes with
             | .ok (.scalar sc) =>
               match extractScalarSlice? sc ptrVal.offsetBytes reqBytes with
               | .some slicedSc =>
@@ -21614,11 +21689,19 @@ def evalRvalue
   | .unaryOp .ptrMetadata op =>
     evalUnaryPtrMetadata locals op mem localDecls layouts
   | .discriminant place =>
-    match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
-    | .ok val locals' =>
-      evalPlaceDiscriminant val locals' mem place localDecls layouts
-    | .ub => .ub
-    | .unsupported => .unsupported
+    match place.projection with
+    | .nil =>
+      match get? locals place.local_ with
+      | .some (.init .uninit) => .ub
+      | .some (.init val) =>
+        evalPlaceDiscriminant val locals mem place localDecls layouts
+      | _ => .ub
+    | _ :: _ =>
+      match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | .ok val locals' =>
+        evalPlaceDiscriminant val locals' mem place localDecls layouts
+      | .ub => .ub
+      | .unsupported => .unsupported
   | .aggregate (.array _) ops =>
     match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
