@@ -1133,75 +1133,91 @@ def elemsMatchByteStride (elems : List Value) (elemSz : Nat) : Bool :=
   | false => elemsHaveUniformByteStride elems elemSz
 
 /--
-Remaining byte capacity of `rootVal` starting at a normalized projection path:
-- At `.nil`, the total byte size of `rootVal`.
-- At `.field idx _ :: rest` on `.aggregate _ fields`, the remaining bytes from
-  `rest` inside `fields[idx]` plus the byte size of the trailing fields
-  `dropValues (idx + 1) fields`.
-- At `.constantIndex offset minLen fromEnd :: rest` on `.aggregate 0 elems`, the
-  remaining bytes from `rest` inside `elems[baseIdx]` plus the byte size of the
-  trailing elements `dropValues (baseIdx + 1) elems`.
+Byte size of the allocation (the root local) that `entry` targets, resolving the
+owning frame exactly like `Trusted.borrowPlaceByteOffset?`
+(`Places.lean:15009-15061`): the declared type of the target local in the owning
+frame's `localDecls` via the layout-aware `Trusted.tyByteSize`
+(`Places.lean:3862`; struct padding, `repr(Rust)` layouts, array strides), else
+(an undeclared target such as a caller-owned referent) the untyped default size
+`Trusted.valueDefaultByteSize` (`Places.lean:15310`) of the live root value.
 -/
-def remainingRootBytesFromProjAux : Value → List ProjectionElem → Option Nat
-  | val, .nil =>
-    match encodeUntypedValueToBytes defaultCodecFuel val with
-    | .some bs => .some (length bs)
-    | .none => .none
-  | .aggregate _ fields, .field idx _ :: rest =>
-    match get? fields idx with
-    | .none => .none
-    | .some fVal =>
-      match
-        remainingRootBytesFromProjAux fVal rest,
-        encodeUntypedValueToBytes defaultCodecFuel (.aggregate 0 (dropValues (Nat.succ idx) fields))
-      with
-      | .some subRem, .some tailBs => .some (Nat.add subRem (length tailBs))
-      | _, _ => .none
-  | .aggregate 0 elems, .constantIndex offset minLen fromEnd :: rest =>
-    let len := length elems
-    let baseIdxOpt : Option Nat :=
-      match fromEnd with
-      | false =>
-        match Bool.and (Nat.ble minLen len) (Nat.ble offset len) with
-        | true => .some offset
-        | false => .none
-      | true =>
-        match Bool.and (Nat.ble minLen len) (Bool.and (Nat.ble 1 offset) (Nat.ble offset len)) with
-        | true => .some (Nat.sub len offset)
-        | false => .none
-    match baseIdxOpt with
-    | .none => .none
-    | .some baseIdx =>
-      match get? elems baseIdx with
-      | .none => .none
-      | .some eVal =>
-        match
-          remainingRootBytesFromProjAux eVal rest,
-          encodeUntypedValueToBytes defaultCodecFuel (.aggregate 0 (dropValues (Nat.succ baseIdx) elems))
-        with
-        | .some subRem, .some tailBs => .some (Nat.add subRem (length tailBs))
-        | _, _ => .none
+def borrowRootAllocBytes?
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (entry : BorrowEntry)
+    (rootVal : Value) :
+    Option Nat :=
+  let declsAndLayouts : List LocalDecl × LayoutTable :=
+    match activeFrameSlot? locals s.memory.callStack entry.targetFrameDepth entry.targetLocal with
+    | .some _ => (localDecls, layouts)
+    | .none =>
+      foreignFrameDeclsAndLayouts
+        s.memory.callStack layouts entry.targetFrameDepth entry.targetLocal
+  match get? declsAndLayouts.1 entry.targetLocal with
+  | .some decl => tyByteSize declsAndLayouts.1 declsAndLayouts.2 decl.ty
+  | .none => valueDefaultByteSize rootVal
+
+/--
+Remaining bytes of `entry`'s allocation from the first byte of its target place:
+`borrowRootAllocBytes? - Trusted.borrowPlaceByteOffset?` (`.none` when either is
+unknown). Both quantities come from the TCB's own layout-aware size / offset
+functions, so the result is exact rather than a sum of runtime value encodings
+(which omits padding and assumes declaration order). Under Tree Borrows a raw
+pointer to a sub-place keeps the provenance of the whole allocation, so this —
+not the extent of the sub-place or of its enclosing array — bounds the bytes
+`copy_nonoverlapping` may access through it.
+-/
+def borrowTargetRemainingBytes?
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (entry : BorrowEntry)
+    (rootVal : Value) :
+    Option Nat :=
+  match
+    borrowRootAllocBytes? s locals localDecls layouts entry rootVal,
+    borrowPlaceByteOffset? locals s.memory.callerLocals localDecls layouts entry s.memory.callStack
+  with
+  | .some allocSz, .some off =>
+    match Nat.ble off allocSz with
+    | true => .some (Nat.sub allocSz off)
+    | false => .none
   | _, _ => .none
 
 /--
-Remaining byte capacity in `rootVal` starting at a strict sub-place `proj`
-(returning `.none` when `proj` is the root `[]` after stripping transparent
-projections).
+Whether a `copy_nonoverlapping` access of `accessBytes` bytes starting `ptrOff`
+bytes past `entry`'s target place stays inside the allocation: `.some true`
+(fits), `.some false` (certainly out of bounds, undefined behavior), or `.none`
+(allocation extent unknown, so callers fail closed with `.unsupported`).
 -/
 @[reducible]
-def remainingSubPlaceBytesInRoot?
+def copyAccessFitsAlloc?
+    (s : MachineState)
     (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (entry : BorrowEntry)
     (rootVal : Value)
-    (proj : List ProjectionElem) :
-    Option Nat :=
-  let resolvedProj :=
-    match resolveBorrowProjectionElems locals proj with
-    | .some rp => rp
-    | .none => proj
-  let normProj := normalizeSubsliceProjections (stripTransparentProjections resolvedProj)
-  match normProj with
-  | .nil => .none
-  | _ :: _ => remainingRootBytesFromProjAux rootVal normProj
+    (ptrOff accessBytes : Nat) :
+    Option Bool :=
+  match borrowTargetRemainingBytes? s locals localDecls layouts entry rootVal with
+  | .some rem => .some (Nat.ble (Nat.add ptrOff accessBytes) rem)
+  | .none => .none
+
+/-- `true` exactly when an access is certainly out of bounds (`.some false`). -/
+@[reducible]
+def accessCertainlyOob : Option Bool → Bool
+  | .some false => true
+  | _ => false
+
+/-- `true` iff a (normalized) container projection is the root local itself. -/
+@[reducible]
+def isNilProj : List ProjectionElem → Bool
+  | .nil => true
+  | _ :: _ => false
 
 /-- Static element kind of an array / slice container type (`.none` when unknown). -/
 @[reducible]
@@ -1267,13 +1283,27 @@ Repaired `evalCopyNonOverlappingPermOk` (`Statements.lean:1414-1687`):
 4. Checks bounds (`srcStart + n ≤ length srcElems`, `dstStart + n ≤ length dstElems`)
    and non-overlap (`sameContainer → srcStart + n ≤ dstStart ∨ dstStart + n ≤ srcStart`),
    allowing disjoint slices of one array while faulting with `.ub` on
-   overlapping slices or out-of-bounds counts.
+   overlapping slices. An element-count overrun is undefined behavior only when
+   it is certain to leave the *allocation*: the access
+   `ptr.offsetBytes + n * elemSz` exceeds the exact remaining bytes of the
+   endpoint's allocation (`copyAccessFitsAlloc?`, from the TCB's layout-aware
+   `tyByteSize` / `borrowPlaceByteOffset?`), or — when that extent is unknown —
+   the overrun container is the root local itself with an exact element stride.
+   An overrun that stays inside the allocation (a nested `s.arr[i]` copy running
+   into the sibling fields of `s`, legal under Tree Borrows) or whose extent is
+   unknown fails closed with `.unsupported`.
 5. Splices element-wise only when both containers hold elements of the copied
    element size (`copySliceStrideOk`; `.unsupported` otherwise), running the
    Tree Borrows read-then-write transition of `Trusted`'s single-element path on
    the accessed `.subslice` windows (`borrowsAfterCopySliceProto`).
 6. Requires `length bs == n * elemBytes` in the byte-level fallback, so `n > 1`
-   on a scalar allocation faults with `.ub` instead of copying one element.
+   on a scalar allocation faults with `.ub` instead of copying one element; a
+   byte span that differs from the place it is read from or written to is `.ub`
+   only when it certainly leaves the allocation (`copyAccessFitsAlloc?`), and
+   fails closed with `.unsupported` otherwise (cross-field or partial writes).
+7. A copy of zero total bytes (a zero-sized pointee, or untyped `.unit`
+   elements) is a no-op exactly like `count = 0`: zero-sized accesses are always
+   in bounds, never overlap, and perform no Tree Borrows access.
 -/
 def evalCopyNonOverlappingPermOkProto
     (s : MachineState)
@@ -1398,7 +1428,17 @@ def evalCopyNonOverlappingPermOkProto
                   | .some t => .some t
                   | .none => effDstPtOpt
                 match srcSliceVal with
-                | .none => MirStepNode.fail .ub
+                | .none =>
+                  match expectedMultiCopyBytes? localDecls layouts src dst srcSubVal n with
+                  | .some expBytes =>
+                    match
+                      accessCertainlyOob
+                        (copyAccessFitsAlloc? s locals₃ localDecls layouts
+                          srcEntry srcRootVal srcPtr.offsetBytes expBytes)
+                    with
+                    | true => MirStepNode.fail .ub
+                    | false => MirStepNode.unsupported
+                  | .none => MirStepNode.unsupported
                 | .some sVal =>
                   match encodeUntypedValueToBytes defaultCodecFuel sVal with
                   | .none => MirStepNode.unsupported
@@ -1409,13 +1449,13 @@ def evalCopyNonOverlappingPermOkProto
                         match Nat.beq (length bs) expBytes with
                         | true => .some true
                         | false =>
-                          let isSubPlaceWithinRoot : Bool :=
-                            match remainingSubPlaceBytesInRoot? locals₃ srcRootVal srcEntry.targetProjection with
-                            | .some remBytes => Nat.ble expBytes remBytes
-                            | .none => false
-                          match isSubPlaceWithinRoot with
-                          | true => .none
-                          | false => .some false
+                          match
+                            accessCertainlyOob
+                              (copyAccessFitsAlloc? s locals₃ localDecls layouts
+                                srcEntry srcRootVal srcPtr.offsetBytes expBytes)
+                          with
+                          | true => .some false
+                          | false => .none
                       | .none => .some true
                     match byteCountStatus with
                     | .none => MirStepNode.unsupported
@@ -1450,10 +1490,10 @@ def evalCopyNonOverlappingPermOkProto
                         match effDstLocalPlaceTy, dstSubVal with
                         | .none, .aggregate 0 _ => true
                         | _, _ => false
-                      let dstSubPlaceWithinRoot : Bool :=
-                        match remainingSubPlaceBytesInRoot? locals₃ dstRootVal effDstPlace.projection with
-                        | .some remBytes => Nat.ble (length bs) remBytes
-                        | .none => false
+                      let dstCertainlyOob : Bool :=
+                        accessCertainlyOob
+                          (copyAccessFitsAlloc? s locals₃ localDecls layouts
+                            dstEntry dstRootVal dstPtr.offsetBytes (length bs))
                       match preferSplicedArray, spliceBytesToDstArray with
                       | true, .some splicedVal => writeDstVal splicedVal
                       | _, _ =>
@@ -1473,9 +1513,9 @@ def evalCopyNonOverlappingPermOkProto
                               match spliceBytesToDstArray with
                               | .some splicedVal => writeDstVal splicedVal
                               | .none =>
-                                match dstSubPlaceWithinRoot with
-                                | true => MirStepNode.unsupported
-                                | false => MirStepNode.fail .ub
+                                match dstCertainlyOob with
+                                | true => MirStepNode.fail .ub
+                                | false => MirStepNode.unsupported
                           | .none =>
                             match spliceBytesToDstArray with
                             | .some splicedVal => writeDstVal splicedVal
@@ -1484,11 +1524,16 @@ def evalCopyNonOverlappingPermOkProto
                           match spliceBytesToDstArray with
                           | .some splicedVal => writeDstVal splicedVal
                           | .none =>
-                            match dstSubPlaceWithinRoot with
-                            | true => MirStepNode.unsupported
-                            | false => MirStepNode.fail .ub
-            match srcSliceEndOpt, dstSliceEndOpt with
-            | .some (srcParentProj, srcStart, srcElems),
+                            match dstCertainlyOob with
+                            | true => MirStepNode.fail .ub
+                            | false => MirStepNode.unsupported
+            let zeroByteCopy : Bool :=
+              match copyElemSzOpt with
+              | .some elemSz => Nat.beq elemSz 0
+              | .none => false
+            match zeroByteCopy, srcSliceEndOpt, dstSliceEndOpt with
+            | true, _, _ => MirStepNode.step (advanceStmt s locals₃)
+            | false, .some (srcParentProj, srcStart, srcElems),
               .some (dstParentProj, dstStart, dstElems) =>
               let dstParentPlace : Place := {
                 local_ := dstEntry.targetLocal
@@ -1508,8 +1553,13 @@ def evalCopyNonOverlappingPermOkProto
                   (Bool.and
                     (Nat.ble (Nat.add srcStart n) (length srcElems))
                     (Nat.ble (Nat.add dstStart n) (length dstElems)))
-              match inBounds with
-              | false =>
+              let zeroByteSlice : Bool :=
+                match copyElemSzOpt with
+                | .some _ => false
+                | .none => allUnitValues srcElems
+              match zeroByteSlice, inBounds with
+              | true, _ => MirStepNode.step (advanceStmt s locals₃)
+              | false, false =>
                 match
                   Bool.and
                     (Nat.beq dstStart 0)
@@ -1525,8 +1575,19 @@ def evalCopyNonOverlappingPermOkProto
                     dstParentTy
                     dstParentIsAdt
                 | false =>
+                  let srcOverrun : Bool :=
+                    Bool.not (Nat.ble (Nat.add srcStart n) (length srcElems))
+                  let dstOverrun : Bool :=
+                    Bool.not (Nat.ble (Nat.add dstStart n) (length dstElems))
                   match copyElemSzOpt with
-                  | .none => MirStepNode.fail .ub
+                  | .none =>
+                    match
+                      Bool.or
+                        (Bool.and (isNilProj srcParentProj) srcOverrun)
+                        (Bool.and (isNilProj dstParentProj) dstOverrun)
+                    with
+                    | true => MirStepNode.fail .ub
+                    | false => MirStepNode.unsupported
                   | .some elemSz =>
                     let srcContainerTy : Option Ty :=
                       match get? locals₃ srcEntry.targetLocal with
@@ -1534,38 +1595,34 @@ def evalCopyNonOverlappingPermOkProto
                         placeTy localDecls layouts
                           { local_ := srcEntry.targetLocal, projection := srcParentProj }
                       | .none => .none
-                    match
+                    let strideOk : Bool :=
                       copySliceStrideOk
                         effSrcPtOpt copyElemSzOpt srcContainerTy dstParentTy srcElems dstElems
+                    let accessBytes := Nat.mul n elemSz
+                    let sideCertainlyOob
+                        (fitOpt : Option Bool)
+                        (parentProj : List ProjectionElem)
+                        (overrun : Bool) :
+                        Bool :=
+                      match fitOpt with
+                      | .some fits => Bool.not fits
+                      | .none => Bool.and strideOk (Bool.and (isNilProj parentProj) overrun)
+                    match
+                      Bool.or
+                        (sideCertainlyOob
+                          (copyAccessFitsAlloc? s locals₃ localDecls layouts
+                            srcEntry srcRootVal srcPtr.offsetBytes accessBytes)
+                          srcParentProj
+                          srcOverrun)
+                        (sideCertainlyOob
+                          (copyAccessFitsAlloc? s locals₃ localDecls layouts
+                            dstEntry dstRootVal dstPtr.offsetBytes accessBytes)
+                          dstParentProj
+                          dstOverrun)
                     with
                     | true => MirStepNode.fail .ub
-                    | false =>
-                      let totalCopyBytes := Nat.mul n elemSz
-                      let srcRemOpt : Option Nat :=
-                        match remainingSubPlaceBytesInRoot? locals₃ srcRootVal srcEntry.targetProjection with
-                        | .some r => .some r
-                        | .none =>
-                          match encodeUntypedValueToBytes defaultCodecFuel srcRootVal with
-                          | .some bs => .some (length bs)
-                          | .none => .none
-                      let dstRemOpt : Option Nat :=
-                        match remainingSubPlaceBytesInRoot? locals₃ dstRootVal dstEntry.targetProjection with
-                        | .some r => .some r
-                        | .none =>
-                          match encodeUntypedValueToBytes defaultCodecFuel dstRootVal with
-                          | .some bs => .some (length bs)
-                          | .none => .none
-                      match srcRemOpt, dstRemOpt with
-                      | .some srcRem, .some dstRem =>
-                        match
-                          Bool.and
-                            (Nat.ble (Nat.add (Nat.mul srcElemOff elemSz) totalCopyBytes) srcRem)
-                            (Nat.ble (Nat.add (Nat.mul dstElemOff elemSz) totalCopyBytes) dstRem)
-                        with
-                        | true => MirStepNode.unsupported
-                        | false => MirStepNode.fail .ub
-                      | _, _ => MirStepNode.unsupported
-              | true =>
+                    | false => MirStepNode.unsupported
+              | false, true =>
                 let sameContainer :=
                   Bool.and
                     (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
@@ -1617,7 +1674,7 @@ def evalCopyNonOverlappingPermOkProto
                         borrows'
                         localDecls
                         layouts
-            | .some (_, srcStart, srcElems), .none =>
+            | false, .some (_, srcStart, srcElems), .none =>
               match readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
               | .ok dstSubVal =>
                 copyViaBytes
@@ -1641,7 +1698,7 @@ def evalCopyNonOverlappingPermOkProto
                     dstIsAdt
                 | false => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
-            | .none, .some (dstParentProj, dstStart, dstElems) =>
+            | false, .none, .some (dstParentProj, dstStart, dstElems) =>
               let dstParentPlace : Place := {
                 local_ := dstEntry.targetLocal
                 projection := dstParentProj
@@ -1665,7 +1722,7 @@ def evalCopyNonOverlappingPermOkProto
                   dstParentTy
                   dstParentIsAdt
               | _ => MirStepNode.fail .ub
-            | .none, .none =>
+            | false, .none, .none =>
               match
                 readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
                 readProjectedValue locals₃ dstRootVal dstEntry.targetProjection
@@ -2703,50 +2760,107 @@ def writeReturnDestinationProto
         callerLocals mem { local_ := dst.local_, projection := p0 :: ps } retVal writeDecls layouts
 
 /--
-Whether a calling convention permits unwinding (`rustc_abi::ExternAbi::can_unwind`:
-`extern "C"` and `extern "rust-intrinsic"` never unwind; `"C-unwind"` / `"Rust"` do).
+Unwind capability of a function-pointer call ABI, modeling the ABI match of
+rustc's `fn_can_unwind` (`compiler/rustc_middle/src/ty/layout.rs:1236-1297` at
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, the `fn_def_id = None` case of a
+function-pointer call) over `ExternAbi::as_str` names
+(`compiler/rustc_abi/src/extern_abi.rs:177-215`):
+- `.some true` for the Rust-like ABIs (`Rust`, `rust-call`, `rust-cold`,
+  `rust-preserve-none`; the prototype assumes `-C panic=unwind`, under which
+  only these and the `*-unwind` ABIs unwind) and every `"<abi>-unwind"` ABI;
+- `.some false` for ABIs that never unwind (`system`, `cdecl`, `stdcall`,
+  `fastcall`, `vectorcall`, `thiscall`, `aapcs`, `win64`, `sysv64`, `efiapi`,
+  `Swift`, the interrupt / kernel / CMSE ABIs, `custom`, `unadjusted`,
+  `rust-invalid`);
+- `.none` when the captured `CallConv` does not determine it. In particular the
+  capture lowers *both* `extern "C"` (never unwinds) and `extern "C-unwind"`
+  (unwinds) to `CallConv.c` (`trusted/rustc-capture/src/rustc_2026_06_01/layout_lower.rs:853-855`:
+  `ExternAbi::C { .. } => IrCallConv::C`), so `.c` is ambiguous; `.rustIntrinsic`
+  and unrecognized `.other` names are not classified either.
 -/
-@[reducible]
-def callConvCanUnwind : CallConv → Bool
-  | .c => false
-  | .rustIntrinsic => false
-  | .other "system" => false
-  | .other "stdcall" => false
-  | .other "fastcall" => false
-  | .other "vectorcall" => false
-  | .other "thiscall" => false
-  | .other "aapcs" => false
-  | .other "win64" => false
-  | .other "sysv64" => false
-  | _ => true
+def callConvCanUnwind? : CallConv → Option Bool
+  | .rust => .some true
+  | .c => .none
+  | .rustIntrinsic => .none
+  | .other "rust-call" => .some true
+  | .other "rust-cold" => .some true
+  | .other "rust-preserve-none" => .some true
+  | .other "aapcs-unwind" => .some true
+  | .other "cdecl-unwind" => .some true
+  | .other "fastcall-unwind" => .some true
+  | .other "stdcall-unwind" => .some true
+  | .other "system-unwind" => .some true
+  | .other "sysv64-unwind" => .some true
+  | .other "thiscall-unwind" => .some true
+  | .other "vectorcall-unwind" => .some true
+  | .other "win64-unwind" => .some true
+  | .other "aapcs" => .some false
+  | .other "cdecl" => .some false
+  | .other "fastcall" => .some false
+  | .other "stdcall" => .some false
+  | .other "system" => .some false
+  | .other "sysv64" => .some false
+  | .other "thiscall" => .some false
+  | .other "vectorcall" => .some false
+  | .other "win64" => .some false
+  | .other "efiapi" => .some false
+  | .other "Swift" => .some false
+  | .other "avr-interrupt" => .some false
+  | .other "avr-non-blocking-interrupt" => .some false
+  | .other "cmse-nonsecure-call" => .some false
+  | .other "cmse-nonsecure-entry" => .some false
+  | .other "custom" => .some false
+  | .other "gpu-kernel" => .some false
+  | .other "msp430-interrupt" => .some false
+  | .other "ptx-kernel" => .some false
+  | .other "riscv-interrupt-m" => .some false
+  | .other "riscv-interrupt-s" => .some false
+  | .other "rust-invalid" => .some false
+  | .other "unadjusted" => .some false
+  | .other "x86-interrupt" => .some false
+  | .other _ => .none
 
 /--
-Infer whether an unlinked external call target can unwind from its resolved
-function-pointer signature (`target.fnSig`) or call-site operand type (`func`).
+Unwind capability of an unlinked external tail-call target, from its resolved
+function-pointer signature (`target.fnSig`) or call-site operand type (`func`):
+`callConvCanUnwind?` of a function-pointer ABI. A target that is not called
+through a function pointer (a `FnDef` item, whose ABI the TCB type does not
+carry) keeps `Trusted`'s behavior (`.some true`: no narrowing); `rustc` checks
+that the tail callee's ABI equals the tail caller's (`check_tail_calls.rs:134`).
 -/
 @[reducible]
-def externalTargetCanUnwind
+def externalTargetCanUnwind?
     (target : ResolvedCallTarget)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (func : Operand) :
-    Bool :=
+    Option Bool :=
   match target.fnSig with
-  | .some (.fnPtr _ _ _ sigAbi) => callConvCanUnwind sigAbi
+  | .some (.fnPtr _ _ _ sigAbi) => callConvCanUnwind? sigAbi
   | _ =>
     match operandTy localDecls layouts func with
-    | .some { kind := .fnPtr _ _ _ sigAbi, .. } => callConvCanUnwind sigAbi
-    | _ => true
+    | .some { kind := .fnPtr _ _ _ sigAbi, .. } => callConvCanUnwind? sigAbi
+    | _ => .some true
 
 /--
 Repaired `resumeExternalTailCall` (`Terminators.lean:1117-1156`):
 - On `.returned retVal memAfter`, uses `writeReturnDestinationProto` when
   `caller.destination` has a leading `.opaqueCast` (otherwise delegating directly
   to `Trusted.resumeExternalTailCall`).
-- On `.panicked memAfter`, enforces the root unwind ceiling `extCeiling` when
-  `memAfter.callStack = []`.
+- On `.panicked memAfter`, unwinds with `Trusted.unwindFromCallStack` (through the
+  `callStack` narrowed before the call when `extUnwind = .some false`); a panic
+  that escapes the modular root is undefined behavior when the root unwind
+  ceiling `rootCeiling` is narrowed or the external callee itself cannot unwind.
+  When the callee's unwind capability is unknown (`extUnwind = .none`, e.g. a
+  `CallConv.c` pointer that may be `extern "C"` or `extern "C-unwind"`), only an
+  outcome that is undefined behavior under both readings is kept (`.faulted .ub`);
+  every other outcome fails closed with `.faulted .unsupported`.
 -/
-def resumeExternalTailCallProto (extCeiling : Bool) (ans : MirCallAns) : MirExecState :=
+def resumeExternalTailCallProto
+    (rootCeiling : Bool)
+    (extUnwind : Option Bool)
+    (ans : MirCallAns) :
+    MirExecState :=
   match ans with
   | .returned retVal memAfter =>
     match memAfter.callStack with
@@ -2787,12 +2901,21 @@ def resumeExternalTailCallProto (extCeiling : Bool) (ans : MirCallAns) : MirExec
           | .ub => .faulted .ub
           | .unsupported => .faulted .unsupported
   | .panicked memAfter =>
-    match unwindFromCallStack memAfter.callStack memAfter with
-    | .halted .panic =>
-      match extCeiling with
-      | true => .halted .panic
-      | false => .faulted .ub
-    | st => st
+    let escapeOk : Bool :=
+      match extUnwind with
+      | .some false => false
+      | _ => rootCeiling
+    let unwound : MirExecState :=
+      match unwindFromCallStack memAfter.callStack memAfter with
+      | .halted .panic =>
+        match escapeOk with
+        | true => .halted .panic
+        | false => .faulted .ub
+      | st => st
+    match extUnwind, unwound with
+    | .none, .faulted .ub => .faulted .ub
+    | .none, _ => .faulted .unsupported
+    | .some _, st => st
   | .aborted => .halted .abort
 
 /--
@@ -2803,9 +2926,13 @@ Repaired `evalTailCallTerminator` (`Terminators.lean:3307-3378`), equal to
 - at a modular root (`callStack = []`) the torn-down memory is relocated by
   `relocateRootCallerReferents` (Bug 3) before entering the callee,
 - an in-table callee is entered with `enterTailCalleeFrameProto` (Bug 2), and an
-  external (out-of-table) callee narrows `callStack` / `extCeiling` from its
-  call-site function-pointer ABI (`externalTargetCanUnwind`) and resumes via
-  `resumeExternalTailCallProto`.
+  external (out-of-table) callee narrows the inherited `callStack` continuation
+  when its call-site function-pointer ABI cannot unwind
+  (`externalTargetCanUnwind? = .some false`) and resumes via
+  `resumeExternalTailCallProto`, which applies the root unwind ceiling only at a
+  modular root (`callStack = []`; deeper, the root ceiling is enforced by
+  `guardRootUnwindCeiling` on the step) and fails closed when the callee's unwind
+  capability is unknown.
 -/
 def evalTailCallTerminatorProto
     (s : MachineState)
@@ -2885,17 +3012,24 @@ def evalTailCallTerminatorProto
                 | _ :: _ => memAfterTeardown
               MirStepNode.step (enterTailCalleeFrameProto memEntered ceiling calleeBody argVals)
           | .none =>
-            let extCanUnwind := externalTargetCanUnwind target decls' bodyLayouts func'
+            let extUnwind := externalTargetCanUnwind? target decls' bodyLayouts func'
+            let narrowExt : Bool :=
+              match extUnwind with
+              | .some false => false
+              | _ => true
             let memExt : Memory :=
               { memAfterTeardown with
-                callStack := narrowCallStackForTailCallee memAfterTeardown.callStack extCanUnwind }
-            let extCeiling := Bool.and ceiling extCanUnwind
+                callStack := narrowCallStackForTailCallee memAfterTeardown.callStack narrowExt }
+            let rootCeiling : Bool :=
+              match s.memory.callStack with
+              | .nil => ceiling
+              | _ :: _ => true
             MirStepNode.extCall
               { defPath := target.defPath
                 typeArgs := target.typeArgs
                 args := argVals
                 memory := memExt }
-              (resumeExternalTailCallProto extCeiling)
+              (resumeExternalTailCallProto rootCeiling extUnwind)
 
 /--
 Repaired `evalTerminator` (`Terminators.lean:3379-3704`), equal to
@@ -3426,6 +3560,7 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
       .some (.nil, dstIdx, dstElems))
     (hSrcBounds : Nat.ble (Nat.add srcIdx n) (length srcElems) = true)
     (hDstBounds : Nat.ble (Nat.add dstIdx n) (length dstElems) = true)
+    (hNotZst : allUnitValues srcElems = false)
     (hStride : copySliceStrideOk .none .none .none .none srcElems dstElems = true) :
     let srcPtr : ProvenancePtr := { allocId := srcTag, offsetBytes := 0 }
     let dstPtr : ProvenancePtr := { allocId := dstTag, offsetBytes := 0 }
@@ -3495,7 +3630,7 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
   simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
     hSrcRoot, hDstRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
     srcEntry, dstEntry, hDstSlot,
-    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
+    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds, hNotZst,
     Nat.beq_refl, hDistinctLoc, hTagEq, hDstTagEq, hDistinctTag, hStride,
     copiedSlice, dstElems', Bool.and_false, Bool.false_and]
 
@@ -3524,6 +3659,7 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_src_oob_ub
       resolveArraySliceEndpoint?
         locals₃ (.aggregate 0 dstElems) [.constantIndex dstIdx minD false] 0 n .none emptyLayoutTable =
       .some (.nil, dstIdx, dstElems))
+    (hNotZst : allUnitValues srcElems = false)
     (hSrcOob : Nat.ble (Nat.add srcIdx n) (length srcElems) = false) :
     let srcPtr : ProvenancePtr := { allocId := srcTag, offsetBytes := 0 }
     let dstPtr : ProvenancePtr := { allocId := dstTag, offsetBytes := 0 }
@@ -3569,7 +3705,8 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_src_oob_ub
   simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
     hSrcRoot, hDstRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
     srcEntry, dstEntry, hDstSlot,
-    hPlaceTyNil, Bool.not_false, hSrcOob, Bool.and_false]
+    hPlaceTyNil, Bool.not_false, hSrcOob, hNotZst, Bool.and_false, isNilProj,
+    Bool.true_and, Bool.true_or]
 
 /--
 Overlapping multi-element subplace copy within the same array container
@@ -3599,6 +3736,7 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_overlap_ub
       .some (.nil, dstIdx, arrElems))
     (hSrcBounds : Nat.ble (Nat.add srcIdx n) (length arrElems) = true)
     (hDstBounds : Nat.ble (Nat.add dstIdx n) (length arrElems) = true)
+    (hNotZst : allUnitValues arrElems = false)
     (hOverlap1 : Nat.ble (Nat.add srcIdx n) dstIdx = false)
     (hOverlap2 : Nat.ble (Nat.add dstIdx n) srcIdx = false) :
     let srcPtr : ProvenancePtr := { allocId := srcTag, offsetBytes := 0 }
@@ -3642,7 +3780,7 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_overlap_ub
   simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
     hRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
     srcEntry, dstEntry, hArrSlot,
-    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
+    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds, hNotZst,
     Nat.beq_refl, hOverlapNil, hOverlap1, hOverlap2, Bool.or_false]
 
 /--
@@ -3675,6 +3813,7 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
     (hSrcBounds : Nat.ble (Nat.add srcIdx n) (length arrElems) = true)
     (hDstBounds : Nat.ble (Nat.add dstIdx n) (length arrElems) = true)
     (hDisjoint : Nat.ble (Nat.add srcIdx n) dstIdx = true)
+    (hNotZst : allUnitValues arrElems = false)
     (hStride : copySliceStrideOk .none .none .none .none arrElems arrElems = true) :
     let srcPtr : ProvenancePtr := { allocId := srcTag, offsetBytes := 0 }
     let dstPtr : ProvenancePtr := { allocId := dstTag, offsetBytes := 0 }
@@ -3739,7 +3878,7 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
   simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
     hRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
     srcEntry, dstEntry, hArrSlot,
-    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
+    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds, hNotZst,
     Nat.beq_refl, hOverlapNil, hDisjoint, Bool.true_or, hStride,
     copiedSlice, arrElems']
 

@@ -905,8 +905,8 @@ theorem canary_bug1_second_field_oob_faults_ub :
 /--
 Canary 4H (Zero-sized element `[(); 4]` multi-element subplace copy succeeds):
 B2's `copySliceStrideOk` delegated to `elemsHaveUniformByteStride`, which returns
-`false` whenever `elemSz == 0` and `elems` is non-empty; A2's `elemsMatchByteStride`
-accepts `.unit` elements when `elemSz == 0`.
+`false` whenever `elemSz == 0` and `elems` is non-empty. Since B3 a copy of zero
+total bytes (here untyped `.unit` elements) is the `count = 0` no-op.
 -/
 theorem canary_bug1_zst_unit_array_subplace_copy :
     let unitArr : Value := .aggregate 0 [.unit, .unit, .unit, .unit]
@@ -929,40 +929,60 @@ theorem canary_bug1_zst_unit_array_subplace_copy :
     } := by
   rfl
 
+/-- Root state calling an external callee through a reified `fn()` pointer of ABI `abi`. -/
+private def extTailState (abi : CallConv) : MachineState := {
+  frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.ptr { allocId := 500, offsetBytes := 0 } 8)] }
+  memory := { emptyMemory with
+    fnPtrs := [{ allocId := 500, defPath := "ext::callee", typeArgs := [],
+                 fnSig := .some (.fnPtr [] (.tuple []) .safe abi) }] }
+}
+
+/-- `become (move (_0 as fn()))` through the pointer of `extTailState abi`. -/
+private def extTailTerm (abi : CallConv) : Terminator :=
+  ⟨.tailCall (.move ⟨0, [.opaqueCast { kind := .fnPtr [] (.tuple []) .safe abi, layoutIdx := 0 }]⟩) [], "t"⟩
+
+/-- Resume an external call node with a `.panicked` answer carrying the request's memory. -/
+private def panicResume : MirStepNode → Option MirExecState
+  | .vis (.inr (.inr (.call req))) k => some (k (.panicked req.memory))
+  | _ => none
+
 /--
-Canary 4I (External `extern "C"` tail-call unwind narrowing and `StatementKind.intrinsic (.assume)`
+Canary 4I (External tail-call unwind capability and `StatementKind.intrinsic (.assume)`
 pure-`.opaqueCast` `move` de-initialization):
-1. An external tail call through a reified `extern "C" fn()` pointer (`CallConv.c`)
-   narrows the root unwind ceiling so a `.panicked` external answer faults with
-   `.faulted .ub` under `evalTerminatorProto` (whereas unpatched `evalTerminator`
-   halts with `.halted .panic`).
-2. `StatementKind.intrinsic (.assume (move (_0 as bool)))` de-initializes `_0`
+1. A panic out of an external tail callee called through an `extern "system"`
+   pointer (never unwinds) faults with `.faulted .ub` under `evalTerminatorProto`,
+   whereas unpatched `evalTerminator` halts with `.halted .panic`.
+2. Through a `CallConv.c` pointer the answer fails closed with
+   `.faulted .unsupported`: the capture lowers both `extern "C"` (UB) and
+   `extern "C-unwind"` (the panic propagates) to `CallConv.c`
+   (`layout_lower.rs:853-855`), so A2's `.faulted .ub` was a false positive for
+   `C-unwind`.
+3. Through `extern "system-unwind"` and Rust-ABI pointers the panic propagates
+   exactly as in `Trusted` (`.halted .panic`).
+4. `StatementKind.intrinsic (.assume (move (_0 as bool)))` de-initializes `_0`
    under `evalStmtProto` (whereas unpatched `evalStmt` leaves `_0` initialized).
 -/
 theorem canary_bug2_bug4_external_c_abi_tailcall_and_assume_opaqueCast :
-    let cFnSig : RigidTy := .fnPtr [] (.tuple []) .safe .c
-    let fnPtrTy : Ty := { kind := cFnSig, layoutIdx := 0 }
     let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
-    let fnEntry : FnPtrEntry :=
-      { allocId := 500, defPath := "ext::c_callee", typeArgs := [], fnSig := .some cFnSig }
-    let sTail : MachineState := {
-      frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.ptr { allocId := 500, offsetBytes := 0 } 8)] }
-      memory := { emptyMemory with fnPtrs := [fnEntry] }
-    }
-    let tailTerm : Terminator :=
-      ⟨.tailCall (.move ⟨0, [.opaqueCast fnPtrTy]⟩) [], "t"⟩
     let sAssume : MachineState := {
       frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar { bits := 1, sizeBytes := 1 })] }
       memory := emptyMemory
     }
     let assumeStmt : Statement :=
       ⟨.intrinsic (.assume (.move ⟨0, [.opaqueCast boolTy]⟩)), "a"⟩
-    (match evalTerminator sTail tailTerm .none with
-     | .vis (.inr (.inr (.call _))) k => some (k (.panicked emptyMemory))
-     | _ => none) = some (.halted .panic) ∧
-    (match evalTerminatorProto sTail tailTerm .none with
-     | .vis (.inr (.inr (.call _))) k => some (k (.panicked emptyMemory))
-     | _ => none) = some (.faulted .ub) ∧
+    panicResume (evalTerminator (extTailState (.other "system")) (extTailTerm (.other "system")) .none) =
+      some (.halted .panic) ∧
+    panicResume (evalTerminatorProto (extTailState (.other "system")) (extTailTerm (.other "system")) .none) =
+      some (.faulted .ub) ∧
+    panicResume (evalTerminator (extTailState .c) (extTailTerm .c) .none) =
+      some (.halted .panic) ∧
+    panicResume (evalTerminatorProto (extTailState .c) (extTailTerm .c) .none) =
+      some (.faulted .unsupported) ∧
+    panicResume
+        (evalTerminatorProto (extTailState (.other "system-unwind")) (extTailTerm (.other "system-unwind")) .none) =
+      some (.halted .panic) ∧
+    panicResume (evalTerminatorProto (extTailState .rust) (extTailTerm .rust) .none) =
+      some (.halted .panic) ∧
     evalStmt sAssume assumeStmt [] emptyLayoutTable =
       MirStepNode.step {
         sAssume with
@@ -973,7 +993,211 @@ theorem canary_bug2_bug4_external_c_abi_tailcall_and_assume_opaqueCast :
         sAssume with
         frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit] }
       } := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+open TailCallCallerReferentWitnesses in
+/--
+Canary 4J (The root unwind ceiling is not the tail caller's own ABI): a callee
+frame whose body has `fnAbi.canUnwind = false` (e.g. a `#[rustc_nounwind]`
+function reached through a Rust-ABI pointer, so its caller's continuation is
+`.continue_`) tail-calls an external Rust-ABI callee that panics. Miri's tail
+call only narrows the inherited continuation by the *callee's* ABI, so the panic
+unwinds through the un-narrowed caller frame and escapes the (un-narrowed) root:
+`.halted .panic`, as in `Trusted`. A2 folded the tail caller's own
+`fnAbi.canUnwind` into the external root ceiling and faulted with `.ub`.
+-/
+theorem canary_bug2_external_tailcall_ceiling_ignores_tail_caller_abi :
+    let callerFrame : SavedCallerFrame := {
+      callerBody := rootActivationBody (mkBody "w::outer" 0 [u32Decl "_0"] [blk [] .return_])
+      frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
+      destination := ⟨0, []⟩
+      returnUnwind := .continue_ }
+    let fnPtrDecl : LocalDecl :=
+      { mutability := .mut, ty := { kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }, debugName := none }
+    let curBody : CapturedMir := mkBody "w::nounwind_mid" 0 [fnPtrDecl] [blk [] .return_]
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.ptr { allocId := 500, offsetBytes := 0 } 8)] }
+      memory := { emptyMemory with
+        callStack := [callerFrame]
+        fnPtrs := [{ allocId := 500, defPath := "ext::callee", typeArgs := [],
+                     fnSig := .some (.fnPtr [] (.tuple []) .safe .rust) }] } }
+    let term : Terminator := ⟨.tailCall (.copy ⟨0, []⟩) [], "t"⟩
+    curBody.fnAbi.canUnwind = false ∧
+    panicResume (evalTerminator s term (some curBody)) = some (.halted .panic) ∧
+    panicResume (evalTerminatorProto s term (some curBody)) = some (.halted .panic) := by
+  exact ⟨rfl, rfl, rfl⟩
+
+/-! ## 4b. B3 Canaries: Allocation-Exact Out-of-Bounds Criterion and Zero-Byte Copies -/
+
+private def mkU8 (n : Nat) : Value := .scalar { bits := n, sizeBytes := 1 }
+
+/-- Unresolved layout index for non-ADT types (keeps `b3Layouts` entries for the ADTs). -/
+private def noLayout : Nat := 99
+
+/--
+`#[repr(C)] struct T { x: u32, y: u8 }` (entry `0`: size `8`, field offsets
+`[0, 4]`, three trailing padding bytes) and
+`#[repr(C)] struct S { a: [u32; 2], b: [u32; 2] }` (entry `1`: size `16`,
+field offsets `[0, 8]`).
+-/
+private def b3Layouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory
+      fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1]
+      variants := .single 0, isUninhabited := false },
+    { size := { bytes := 16 }, align := { bytes := 4 }, backendRepr := .memory
+      fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+      variants := .single 0, isUninhabited := false }
+  ]
+}
+
+/-- Typed copy between `_0` and `_1` through raw-pointer locals `_2 : *const p` / `_3 : *mut p`. -/
+private def b3Copy
+    (ty0 ty1 : Ty)
+    (pointee : RigidTy)
+    (v0 v1 : Value)
+    (srcLocal : Nat) (srcProj : List ProjectionElem) (srcOff : Nat)
+    (dstLocal : Nat) (dstProj : List ProjectionElem) (dstOff : Nat)
+    (n : Nat) :
+    MirStepNode :=
+  let decls : List LocalDecl := [
+    { mutability := .mut, ty := ty0, debugName := none },
+    { mutability := .mut, ty := ty1, debugName := none },
+    { mutability := .mut, ty := { kind := .rawPtr .not pointee, layoutIdx := noLayout }, debugName := none },
+    { mutability := .mut, ty := { kind := .rawPtr .mut pointee, layoutIdx := noLayout }, debugName := none }]
+  let locals : List LocalSlot := [
+    .init v0, .init v1,
+    .init (.ptr { allocId := 90, offsetBytes := srcOff } 8),
+    .init (.ptr { allocId := 91, offsetBytes := dstOff } 8)]
+  let srcEntry : BorrowEntry :=
+    { tag := 90, targetLocal := srcLocal, targetProjection := srcProj, perm := .cell }
+  let dstEntry : BorrowEntry :=
+    { tag := 91, targetLocal := dstLocal, targetProjection := dstProj, perm := .unique }
+  let s : MachineState := {
+    frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+    memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 92 }
+  }
+  evalCopyNonOverlappingPermOkProto
+    s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls b3Layouts
+    { allocId := 90, offsetBytes := srcOff } { allocId := 91, offsetBytes := dstOff }
+    srcEntry dstEntry n locals
+
+/--
+Canary 4K (Out-of-bounds is decided against the layout, not value encodings):
+`t : T` with `#[repr(C)] struct T { x: u32, y: u8 }` occupies `8` bytes and `y`
+sits at offset `4`, so `copy_nonoverlapping::<u8>(&raw const t.y, &raw mut d[0], 3)`
+reads bytes `4..7` of `t` (the field and two padding bytes): a valid copy in Rust,
+which the prototype fails closed on (`.unsupported`). A2 summed value encodings
+(`y` is the last field: `1` remaining byte) and faulted with a false `.ub`.
+Reading `5` bytes (`4 + 5 > 8`) leaves the allocation: `.ub`.
+-/
+theorem canary_bug1_padding_aware_field_span :
+    let tTy : Ty := { kind := .adt "T" [], layoutIdx := 0 }
+    let dTy : Ty := { kind := .array (.uint .u8) 3, layoutIdx := noLayout }
+    let tVal : Value := .aggregate 0 [mkU32 7, mkU8 9]
+    let dVal : Value := .aggregate 0 [mkU8 0, mkU8 0, mkU8 0]
+    let yProj : List ProjectionElem := [.field 1 { kind := .uint .u8, layoutIdx := noLayout }]
+    b3Copy tTy dTy (.uint .u8) tVal dVal 0 yProj 0 1 [.constantIndex 0 3 false] 0 3 =
+      MirStepNode.unsupported ∧
+    b3Copy tTy dTy (.uint .u8) tVal dVal 0 yProj 0 1 [.constantIndex 0 3 false] 0 5 =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 4L (A nested-array overrun inside the allocation is not UB): with
+`#[repr(C)] struct S { a: [u32; 2], b: [u32; 2] }`,
+`copy_nonoverlapping::<u32>(&raw const s.a[0], &raw mut d[0], 4)` runs past
+`s.a` into `s.b` but stays inside the `16`-byte allocation `s`, which a raw
+pointer to `s.a[0]` may access under Tree Borrows: the prototype fails closed
+(`.unsupported`; A2 faulted with `.ub` on any stride-exact element overrun).
+`count = 5` (`20 > 16` bytes) leaves the allocation: `.ub`.
+-/
+theorem canary_bug1_nested_array_overrun_within_allocation :
+    let arr2 : Ty := { kind := .array (.uint .u32) 2, layoutIdx := noLayout }
+    let sTy : Ty := { kind := .adt "S" [], layoutIdx := 1 }
+    let dTy : Ty := { kind := .array (.uint .u32) 5, layoutIdx := noLayout }
+    let sVal : Value := .aggregate 0 [.aggregate 0 [mkU32 1, mkU32 2], .aggregate 0 [mkU32 3, mkU32 4]]
+    let dVal : Value := .aggregate 0 [mkU32 0, mkU32 0, mkU32 0, mkU32 0, mkU32 0]
+    let aProj : List ProjectionElem := [.field 0 arr2, .constantIndex 0 2 false]
+    b3Copy sTy dTy (.uint .u32) sVal dVal 0 aProj 0 1 [.constantIndex 0 5 false] 0 4 =
+      MirStepNode.unsupported ∧
+    b3Copy sTy dTy (.uint .u32) sVal dVal 0 aProj 0 1 [.constantIndex 0 5 false] 0 5 =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 4M (Sub-place spans past a scalar field and partial writes): with
+`t : T` (`#[repr(C)] { x: u32, y: u8 }`, entry `0`),
+`copy_nonoverlapping::<u32>((&raw const t.x).add(1), &raw mut d[0], 1)` reads
+bytes `4..8` of `t` (`y` and its padding: in bounds) and fails closed
+(`.unsupported`), while `.add(2)`
+(bytes `8..12`) faults with `.ub`; A2 faulted with `.ub` on any non-zero element
+offset into a scalar sub-place. Likewise `copy_nonoverlapping::<u8>(&raw const a[0],
+&raw mut x as *mut u8, 4)` into `x : u64` is a valid partial overwrite
+(`.unsupported`; A2: `.ub`), whereas `9` bytes overrun `a` (`.ub`).
+-/
+theorem canary_bug1_scalar_offset_and_partial_write_fail_closed :
+    let tTy : Ty := { kind := .adt "T" [], layoutIdx := 0 }
+    let dTy : Ty := { kind := .array (.uint .u32) 2, layoutIdx := noLayout }
+    let tVal : Value := .aggregate 0 [mkU32 7, mkU8 9]
+    let dVal : Value := .aggregate 0 [mkU32 0, mkU32 0]
+    let xProj : List ProjectionElem := [.field 0 { kind := .uint .u32, layoutIdx := noLayout }]
+    let aTy : Ty := { kind := .array (.uint .u8) 4, layoutIdx := noLayout }
+    let u64Ty : Ty := { kind := .uint .u64, layoutIdx := noLayout }
+    let aVal : Value := .aggregate 0 [mkU8 1, mkU8 2, mkU8 3, mkU8 4]
+    let xVal : Value := .scalar { bits := 0, sizeBytes := 8 }
+    b3Copy tTy dTy (.uint .u32) tVal dVal 0 xProj 4 1 [.constantIndex 0 2 false] 0 1 =
+      MirStepNode.unsupported ∧
+    b3Copy tTy dTy (.uint .u32) tVal dVal 0 xProj 8 1 [.constantIndex 0 2 false] 0 1 =
+      MirStepNode.fail .ub ∧
+    b3Copy aTy u64Ty (.uint .u8) aVal xVal 0 [.constantIndex 0 4 false] 0 1 [] 0 4 =
+      MirStepNode.unsupported ∧
+    b3Copy aTy u64Ty (.uint .u8) aVal xVal 0 [.constantIndex 0 4 false] 0 1 [] 0 9 =
+      MirStepNode.fail .ub := by
   exact ⟨rfl, rfl, rfl, rfl⟩
+
+/--
+Canary 4N (Zero-byte copies are no-ops): for `a : [(); 4]` read and written
+through `*const ()` / `*mut ()`, `copy_nonoverlapping(&raw const a[0], &raw mut a[1], 2)`
+(element windows overlap, but zero-sized regions never do) and
+`copy_nonoverlapping(&raw const a[0], &raw mut a[0], 7)` (count past the end of
+`a`, but a zero-sized access is always in bounds) both advance like `count = 0`;
+A2 faulted with `.ub` on both.
+-/
+theorem canary_bug1_zero_byte_copies_are_noops :
+    let unitArrTy : Ty := { kind := .array (.tuple []) 4, layoutIdx := noLayout }
+    let unitArr : Value := .aggregate 0 [.unit, .unit, .unit, .unit]
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := unitArrTy, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .not (.tuple []), layoutIdx := noLayout }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .mut (.tuple []), layoutIdx := noLayout }, debugName := none }]
+    let locals : List LocalSlot := [
+      .init unitArr,
+      .init (.ptr { allocId := 90, offsetBytes := 0 } 8),
+      .init (.ptr { allocId := 91, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry :=
+      { tag := 90, targetLocal := 0, targetProjection := [.constantIndex 0 4 false], perm := .cell }
+    let dstEntry1 : BorrowEntry :=
+      { tag := 91, targetLocal := 0, targetProjection := [.constantIndex 1 4 false], perm := .unique }
+    let dstEntry0 : BorrowEntry :=
+      { tag := 91, targetLocal := 0, targetProjection := [.constantIndex 0 4 false], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry1], nextTag := 92 }
+    }
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨1, []⟩) (.copy ⟨2, []⟩) decls emptyLayoutTable
+      { allocId := 90, offsetBytes := 0 } { allocId := 91, offsetBytes := 0 }
+      srcEntry dstEntry1 2 locals =
+      MirStepNode.step { s with frame := { blockIdx := 0, stmtIdx := 1, locals := locals } } ∧
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨1, []⟩) (.copy ⟨2, []⟩) decls emptyLayoutTable
+      { allocId := 90, offsetBytes := 0 } { allocId := 91, offsetBytes := 0 }
+      srcEntry dstEntry0 7 locals =
+      MirStepNode.step { s with frame := { blockIdx := 0, stmtIdx := 1, locals := locals } } := by
+  exact ⟨rfl, rfl⟩
 
 /-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
 
@@ -1044,6 +1268,11 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms canary_bug1_second_field_oob_faults_ub
 #print axioms canary_bug1_zst_unit_array_subplace_copy
 #print axioms canary_bug2_bug4_external_c_abi_tailcall_and_assume_opaqueCast
+#print axioms canary_bug2_external_tailcall_ceiling_ignores_tail_caller_abi
+#print axioms canary_bug1_padding_aware_field_span
+#print axioms canary_bug1_nested_array_overrun_within_allocation
+#print axioms canary_bug1_scalar_offset_and_partial_write_fail_closed
+#print axioms canary_bug1_zero_byte_copies_are_noops
 #print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
 #print axioms canary_bug4_call_destination_and_binop_move_opaqueCast
 #print axioms canary_conservativity_use_keeps_tree_borrows_read
