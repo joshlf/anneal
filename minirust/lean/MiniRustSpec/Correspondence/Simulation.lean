@@ -18938,4 +18938,877 @@ theorem mirCall_abort_or_panic_withAssert {body : CapturedMir} {f : Gen.Function
     run_abort_or_panic_withAssert hfragA hf ctx (initMachineState body args) m0 hrel0 hret ho
   exact ⟨initLen body + n, by rw [steps_add, hm0, ok_bind, hsteps]⟩
 
+/-! ## Union-Extended Local & Machine State Relation and Multi-Step Run Composition (`R-d`)
+
+`Relation.lean` (outside Episode 2's edit scope) restricts `LocalsOk` /
+`StateRelN` to `LocalTy` locals (`scalar`, `intBoolTuple`, `[Int; N]`,
+`TupleSpec`, `thinRawPtr`, `&T`). The definitions below extend `LocalStorage`,
+`LocalsOkA`, and `StateRelN` additively in `Simulation.lean` to cover frames
+containing `Type.Union` locals (`mrUnionTy fields S al` with
+`MiniRustUnionBytesRel`, including `.Uninit` padding bytes) and 0-byte ZST
+locals (`mrUnitTy`, `mrZstArrayTy N`, `mrUninhabitedZstTy`) alongside standard
+`LocalStorage` locals:
+* `LocalsOkA.toWithUnions` and `StateRelN.toStateRelWithUnions` embed existing
+  `LocalsOkA` / `StateRelN` states;
+* `step_union_whole_copy_stateRelWithUnions` lifts
+  `step_union_whole_copy_minirust_simulation` onto `StateRelWithUnions`;
+* `evalReturn_withUnions` and `step_return_withUnions` prove `Return` teardown
+  across mixed scalar + ZST + `Type.Union` frames, establishing `ReturnRel`;
+* `reaches_rel_withUnions`, `run_ret_withUnions`, and `run_ub_withUnions`
+  compose per-step union simulations into whole-execution normal return
+  (`ReturnRel`) and UB (`Stop.ub`) theorems. -/
+
+/-- `StackFrame::storage_dead` on any live local whose MiniRust type `T` has
+sized layout `.Sized ⟨sz⟩ ⟨al⟩` (generalizing `storageDead_some` from `LocalTy`
+to include `mrUnionTy`, `mrZstArrayTy`, `mrUnitTy`, and `mrUninhabitedZstTy`). -/
+theorem storageDead_sized {fr : Frame} {cm : Gen.ConcurrentMemory BM} {key : Gen.LocalName}
+    {T : Gen.«Type»} {sz al : Nat}
+    (hlay : Interp.Type.layout T = .ok (.Sized ⟨sz⟩ ⟨al⟩))
+    (hty : mapGet fr.func.locals key = some T)
+    {p : Ptr} (hp : mapGet fr.locals key = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) {a : Gen.Allocation}
+    (hA : cm.memory.allocations[k]? = some a) (hlive : a.live = true) (haddr : a.addr = p.addr)
+    (hkind : a.kind = .Stack) (hlen : a.data.length = sz) (halign : a.align = ⟨al⟩) :
+    storageDead fr cm key =
+      .ok ({ fr with locals := ⟨fr.locals.entries.filter (fun e => !decide (e.1 = key))⟩ },
+           { cm with memory := { cm.memory with allocations := cm.memory.allocations.set k (kill a) } }) := by
+  obtain ⟨hk, hAk⟩ := List.getElem?_eq_some_iff.mp hA
+  simp [storageDead, mapIndex, hty, hlay, LayoutStrategy.expect_size,
+    LayoutStrategy.expect_align, mapRemove, hp, CM.deallocate, BM.deallocate, hpk, listIndex, hk,
+    hAk, hlive, haddr, hkind, Allocation.size, hlen, halign, listSet, kill]
+
+/-- Frame teardown loop of `Return` (`deallocAll`) generalized from `LocalTy`
+(`deallocAll_gen`) to arbitrary sized MiniRust types (including `Type.Union` and
+0-byte ZST locals). -/
+theorem deallocAll_sized (fuel : Nat) (fr : Frame) (cm : Gen.ConcurrentMemory BM)
+    (es : List (Gen.LocalName × Ptr)) (hfuel : es.length ≤ fuel) (hloc : fr.locals = ⟨es⟩)
+    (hnodup : (es.map Prod.fst).Nodup) (hidnd : (es.map (fun e => provId e.2)).Nodup)
+    (hok : ∀ e ∈ es, ∃ T sz al a, mapGet fr.func.locals e.1 = some T ∧
+      Interp.Type.layout T = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+      e.2.provenance = some (⟨(provId e.2 : Int)⟩, ()) ∧
+      cm.memory.allocations[provId e.2]? = some a ∧ a.live = true ∧ a.addr = e.2.addr ∧
+      a.kind = .Stack ∧ a.data.length = sz ∧ a.align = ⟨al⟩) :
+    ∃ cm', deallocAll fuel fr cm = .ok ({ fr with locals := ⟨[]⟩ }, cm') ∧
+      cm'.memory.allocations = killAt cm.memory.allocations (es.map (fun e => provId e.2)) := by
+  induction es generalizing fuel fr cm with
+  | nil =>
+    refine ⟨cm, ?_, by simp [killAt_nil]⟩
+    have hfr : fr = { fr with locals := ⟨[]⟩ } := by
+      cases fr; simp at hloc; simp [hloc]
+    cases fuel <;> (simp only [deallocAll, hloc]; rw [← hfr]; rfl)
+  | cons e es ih =>
+    obtain ⟨key, p⟩ := e
+    obtain ⟨fuel', rfl⟩ : ∃ k, fuel = k + 1 := ⟨fuel - 1, by simp at hfuel; omega⟩
+    rw [List.map_cons, List.nodup_cons] at hnodup hidnd
+    obtain ⟨hni, hnd⟩ := hnodup
+    obtain ⟨hnid, hndid⟩ := hidnd
+    obtain ⟨T, sz, al, a, hty, hlay, hpk, ha, hlive, haddr, hkind, hlen, halign⟩ :=
+      hok (key, p) (by simp)
+    have hrest : ∀ e ∈ es, e.1 ≠ key := fun e he hek => hni (List.mem_map.mpr ⟨e, he, hek⟩)
+    have hp : mapGet fr.locals key = some p := by rw [hloc, mapGet_cons]; simp
+    have hsd := storageDead_sized hlay hty hp hpk ha hlive haddr hkind hlen halign
+    have hfil : fr.locals.entries.filter (fun e => !decide (e.1 = key)) = es := by
+      rw [hloc]; exact filter_key_cons_self key p es hrest
+    rw [hfil] at hsd
+    obtain ⟨cm', hcm', hcm'mem⟩ := ih fuel' { fr with locals := ⟨es⟩ }
+      { cm with memory := { cm.memory with
+          allocations := cm.memory.allocations.set (provId p) (kill a) } }
+      (by simp at hfuel; omega) rfl hnd hndid
+      (by
+        intro e he
+        obtain ⟨T', sz', al', a', hty', hlay', hpk', ha', h1, h2, h3, h4, h5⟩ := hok e (by simp [he])
+        have hij : provId p ≠ provId e.2 := fun hij => hnid (List.mem_map.mpr ⟨e, he, hij.symm⟩)
+        exact ⟨T', sz', al', a', hty', hlay', hpk',
+          by simp only; rw [List.getElem?_set_ne hij]; exact ha', h1, h2, h3, h4, h5⟩)
+    refine ⟨cm', ?_, ?_⟩
+    · rw [deallocAll]; simp only [hloc]; rw [hsd]; simpa using hcm'
+    · rw [hcm'mem, List.map_cons, killAt_cons _ _ _ a ha hnid]
+
+/-- Additive per-local storage relation extending `LocalStorage` with 0-byte ZST
+locals (`()`, `[(); N]`, uninhabited 0-byte enums) and `Type.Union` locals
+(`mrUnionTy fields S al` related by `MiniRustUnionBytesRel`). -/
+inductive LocalStorageWithUnions (f : Gen.Function) (ctx : Ctx) (allocs : List Gen.Allocation)
+    (layouts : Layout.LayoutTable) (i : Nat) (d : LocalDecl) (slot : LocalSlot) (p : Ptr) : Prop
+  | base :
+      mapGet f.locals (localName i) = some (tyOf d layouts) →
+      localDeclOk layouts d = true →
+      DeclSlotOk d slot layouts →
+      LocalStorage ctx allocs d slot p layouts →
+      LocalStorageWithUnions f ctx allocs layouts i d slot p
+  | zstUnit (id : Nat) :
+      d.ty.kind = .tuple [] →
+      mapGet f.locals (localName i) = some mrUnitTy →
+      p.provenance = some (⟨(id : Int)⟩, ()) →
+      ctx.base.length ≤ id →
+      0 ≤ p.addr →
+      p.addr < 2 ^ 64 →
+      (slot = .uninit ∨ slot = .init .unit) →
+      allocs[id]? = some (stackAlloc p.addr ⟨.Unsigned, ⟨1⟩⟩ []) →
+      LocalStorageWithUnions f ctx allocs layouts i d slot p
+  | zstArray (N id : Nat) :
+      d.ty.kind = .array (.tuple []) N →
+      mapGet f.locals (localName i) = some (mrZstArrayTy N) →
+      p.provenance = some (⟨(id : Int)⟩, ()) →
+      ctx.base.length ≤ id →
+      0 ≤ p.addr →
+      p.addr < 2 ^ 64 →
+      (slot = .uninit ∨ slot = .init (.aggregate 0 (List.replicate N .unit)) ∨
+        slot = .init (.aggregate 0 (List.replicate N (.aggregate 0 [])))) →
+      allocs[id]? = some (stackAlloc p.addr ⟨.Unsigned, ⟨1⟩⟩ []) →
+      LocalStorageWithUnions f ctx allocs layouts i d slot p
+  | zstUninhabited (id : Nat) :
+      (scalarTypeOf d.ty).isSome = false →
+      mapGet f.locals (localName i) = some mrUninhabitedZstTy →
+      p.provenance = some (⟨(id : Int)⟩, ()) →
+      ctx.base.length ≤ id →
+      0 ≤ p.addr →
+      p.addr < 2 ^ 64 →
+      slot = .uninit →
+      allocs[id]? = some (stackAlloc p.addr ⟨.Unsigned, ⟨1⟩⟩ []) →
+      LocalStorageWithUnions f ctx allocs layouts i d slot p
+  | union (fields : List (Gen.Offset × Gen.«Type»)) (S al id : Nat) (mrBytes : List Byte) :
+      (scalarTypeOf d.ty).isSome = false →
+      0 < S →
+      mapGet f.locals (localName i) = some (mrUnionTy fields S al) →
+      p.provenance = some (⟨(id : Int)⟩, ()) →
+      ctx.base.length ≤ id →
+      Align.is_aligned ⟨al⟩ p.addr = true →
+      0 ≤ p.addr →
+      p.addr + (S : Int) < 2 ^ 64 →
+      mrBytes.length = S →
+      allocs[id]? = some (stackAlloc p.addr ⟨.Unsigned, ⟨al⟩⟩ mrBytes) →
+      (match slot with
+       | .uninit => mrBytes = List.replicate S .Uninit
+       | .init val => MiniRustUnionBytesRel layouts d.ty S val mrBytes
+       | .dead => False) →
+      LocalStorageWithUnions f ctx allocs layouts i d slot p
+
+/-- Any `MiniRustUnionLocalStorage` at `localPtr ctx u` in `ctx.base ++ L`
+(for a non-scalar union declaration `d`) satisfies `LocalStorageWithUnions.union`. -/
+theorem LocalStorageWithUnions.ofMiniRustUnionLocalStorage
+    {f : Gen.Function} {ctx : Ctx} {L : List Gen.Allocation} {lm : Map Gen.LocalName Ptr}
+    {layouts : Layout.LayoutTable} {u : Nat} {d : LocalDecl}
+    {fields : List (Gen.Offset × Gen.«Type»)} {S al : Nat}
+    {slot : LocalSlot} {mrBytes : List Byte}
+    (hnonSc : (scalarTypeOf d.ty).isSome = false)
+    (hu : MiniRustUnionLocalStorage ctx L f lm layouts u d.ty fields S al slot mrBytes) :
+    LocalStorageWithUnions f ctx (ctx.base ++ L) layouts u d slot (localPtr ctx u) := by
+  refine .union fields S al (ctx.base.length + u) mrBytes hnonSc hu.pos_size hu.fn_local rfl
+    (Nat.le_add_right _ _) hu.align_ok hu.addr_nonneg hu.addr_lt hu.bytes_len ?_ hu.slot_rel
+  rw [List.getElem?_append_right (Nat.le_add_right _ _), Nat.add_sub_cancel_left]
+  exact hu.alloc_eq
+
+theorem LocalStorageWithUnions.teardown_entry
+    {f : Gen.Function} {ctx : Ctx} {allocs : List Gen.Allocation}
+    {layouts : Layout.LayoutTable} {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr}
+    (h : LocalStorageWithUnions f ctx allocs layouts i d slot p) :
+    ∃ (id : Nat) (T : Gen.«Type») (sz al : Nat) (data : List Byte),
+      p.provenance = some (⟨(id : Int)⟩, ()) ∧
+      ctx.base.length ≤ id ∧
+      mapGet f.locals (localName i) = some T ∧
+      Interp.Type.layout T = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+      data.length = sz ∧
+      allocs[id]? = some (stackAlloc p.addr ⟨.Unsigned, ⟨al⟩⟩ data) := by
+  cases h with
+  | base hfn hdok hsl hls =>
+    obtain ⟨id, hpid, hb, _, _, _, hA⟩ := hls
+    have hlt := localTy_of_declOk hdok
+    cases hp_ty : isPtrTy d.ty with
+    | false =>
+      simp only [hp_ty, Bool.false_eq_true, ↓reduceIte] at hA
+      refine ⟨id, tyOf d layouts, tyBytes (tyOf d layouts), (itOf d layouts).size.bytes,
+        declSlotData d slot layouts, hpid, hb, hfn, hlt.layout,
+        declSlotData_length_of_declOk hdok hsl, ?_⟩
+      simpa [stackAlloc] using hA
+    | true =>
+      simp only [hp_ty, ↓reduceIte] at hA
+      obtain ⟨hTd, _⟩ := tyOf_isPtrTy (layouts := layouts) hp_ty
+      match slot, hsl, hA with
+      | .dead, hsl, hA =>
+        refine ⟨id, tyOf d layouts, tyBytes (tyOf d layouts), (itOf d layouts).size.bytes,
+          _, hpid, hb, hfn, hlt.layout, declSlotData_length_of_declOk hdok hsl, ?_⟩
+        simpa [stackAlloc] using hA
+      | .uninit, hsl, hA =>
+        refine ⟨id, tyOf d layouts, tyBytes (tyOf d layouts), (itOf d layouts).size.bytes,
+          _, hpid, hb, hfn, hlt.layout, declSlotData_length_of_declOk hdok hsl, ?_⟩
+        simpa [stackAlloc] using hA
+      | .init v, hsl, hA =>
+        obtain ⟨pv, rfl⟩ := (DeclSlotOk_of_isPtrTy hp_ty (.init v)).mp hsl
+        obtain ⟨tAddr, tProv, _, _, hA'⟩ := hA
+        refine ⟨id, tyOf d layouts, tyBytes (tyOf d layouts), (itOf d layouts).size.bytes,
+          ptrBytes tAddr tProv, hpid, hb, hfn, hlt.layout,
+          by rw [ptrBytes_length, hTd, tyBytes_declPtrTy], ?_⟩
+        simpa [stackAlloc] using hA'
+  | zstUnit id _ hfn hpid hb _ _ _ hA =>
+    exact ⟨id, mrUnitTy, 0, 1, [], hpid, hb, hfn, Type_layout_mrUnitTy, rfl, hA⟩
+  | zstArray N id _ hfn hpid hb _ _ _ hA =>
+    exact ⟨id, mrZstArrayTy N, 0, 1, [], hpid, hb, hfn, Type_layout_mrZstArrayTy N, rfl, hA⟩
+  | zstUninhabited id _ hfn hpid hb _ _ _ hA =>
+    exact ⟨id, mrUninhabitedZstTy, 0, 1, [], hpid, hb, hfn, rfl, rfl, hA⟩
+  | union fields S al id mrBytes _ _ hfn hpid hb _ _ _ hlen hA _ =>
+    exact ⟨id, mrUnionTy fields S al, S, al, mrBytes, hpid, hb, hfn,
+      Type_layout_mrUnionTy fields S al, hlen, hA⟩
+
+/-- Frame-wide local agreement extending `LocalsOkA` to support `Type.Union`
+(`mrUnionTy` + `MiniRustUnionBytesRel`) and 0-byte ZST locals alongside standard
+`LocalStorage` locals (`R-d`). -/
+structure LocalsOkWithUnions (body : CapturedMir) (f : Gen.Function) (ctx : Ctx)
+    (al : List Nat) (locals : List LocalSlot) (lm : Map Gen.LocalName Ptr)
+    (allocs : List Gen.Allocation) : Prop where
+  nlocals : locals.length = body.localDecls.length
+  base : ∃ R, allocs = ctx.base ++ R
+  keysNodup : (lm.entries.map Prod.fst).Nodup
+  keysLocal : ∀ e ∈ lm.entries, ∃ i, i < body.localDecls.length ∧ e.1 = localName i
+  live : ∀ (i : Nat) slot, locals[i]? = some slot →
+    ((mapGet lm (localName i)).isSome = true ↔ (slot ≠ .dead ∨ i ∈ al))
+  storage : ∀ (i : Nat) d slot p, body.localDecls[i]? = some d → locals[i]? = some slot →
+    mapGet lm (localName i) = some p → LocalStorageWithUnions f ctx allocs body.layouts i d slot p
+  inj : ∀ (i j : Nat) p q, mapGet lm (localName i) = some p → mapGet lm (localName j) = some q →
+    p.provenance = q.provenance → i = j
+  owned : ∀ (id : Nat) a, allocs[id]? = some a → a.live = true → ctx.base.length ≤ id →
+    ∃ (i : Nat) (p : Ptr), mapGet lm (localName i) = some p ∧ p.provenance = some (⟨(id : Int)⟩, ())
+
+/-- Every `LocalsOkA` state embeds into `LocalsOkWithUnions`. -/
+theorem LocalsOkA.toWithUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr}
+    {allocs : List Gen.Allocation}
+    (hf : FnLocalsSpec body f)
+    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
+    (h : LocalsOkA body ctx al locals lm allocs) :
+    LocalsOkWithUnions body f ctx al locals lm allocs where
+  nlocals := h.nlocals
+  base := h.base
+  keysNodup := h.keysNodup
+  keysLocal := h.keysLocal
+  live := h.live
+  storage i d slot p hd hs hp :=
+    .base (hf.2 i d hd).2 (hdeclsOk d (List.mem_of_getElem? hd))
+      (h.slots i d slot hd hs) (h.storage i d slot p hd hs hp)
+  inj := h.inj
+  owned := h.owned
+
+theorem LocalsOkWithUnions.teardown {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr}
+    {A : List Gen.Allocation}
+    (hlo : LocalsOkWithUnions body f ctx al locals lm A) :
+    (lm.entries.map (fun e => provId e.2)).Nodup ∧
+    (∀ e ∈ lm.entries, ∃ T sz aln a, mapGet f.locals e.1 = some T ∧
+      Interp.Type.layout T = .ok (.Sized ⟨sz⟩ ⟨aln⟩) ∧
+      e.2.provenance = some (⟨(provId e.2 : Int)⟩, ()) ∧ A[provId e.2]? = some a ∧
+      a.live = true ∧ a.addr = e.2.addr ∧ a.kind = .Stack ∧ a.data.length = sz ∧
+      a.align = ⟨aln⟩) ∧
+    (∀ id ∈ lm.entries.map (fun e => provId e.2), ctx.base.length ≤ id) ∧
+    (∀ (id : Nat) a, A[id]? = some a → a.live = true → ctx.base.length ≤ id →
+      id ∈ lm.entries.map (fun e => provId e.2)) := by
+  have hentry : ∀ e ∈ lm.entries, ∃ i d slot, body.localDecls[i]? = some d ∧
+      locals[i]? = some slot ∧ e.1 = localName i ∧ mapGet lm (localName i) = some e.2 := by
+    intro e he
+    obtain ⟨i, hi, hei⟩ := hlo.keysLocal e he
+    have hil : i < locals.length := by rw [hlo.nlocals]; exact hi
+    refine ⟨i, _, _, List.getElem?_eq_getElem hi, List.getElem?_eq_getElem hil, hei, ?_⟩
+    rw [← hei]
+    exact mapGet_of_mem_nodup (by simpa using he) hlo.keysNodup
+  have hstore : ∀ e ∈ lm.entries, ∃ i T sz aln data,
+      e.1 = localName i ∧ mapGet lm (localName i) = some e.2 ∧
+      e.2.provenance = some (⟨(provId e.2 : Int)⟩, ()) ∧ ctx.base.length ≤ provId e.2 ∧
+      mapGet f.locals (localName i) = some T ∧
+      Interp.Type.layout T = .ok (.Sized ⟨sz⟩ ⟨aln⟩) ∧
+      data.length = sz ∧
+      A[provId e.2]? = some (stackAlloc e.2.addr ⟨.Unsigned, ⟨aln⟩⟩ data) := by
+    intro e he
+    obtain ⟨i, d, slot, hd, hs, hei, hmg⟩ := hentry e he
+    obtain ⟨id, T, sz, aln, data, hpid, hb, hfn, hlay, hlen, hA⟩ :=
+      (hlo.storage i d slot e.2 hd hs hmg).teardown_entry
+    rw [provId_of hpid]
+    exact ⟨i, T, sz, aln, data, hei, hmg, hpid, hb, hfn, hlay, hlen, hA⟩
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · apply nodup_map_of_inj_on _ _ (nodup_of_map Prod.fst hlo.keysNodup)
+    intro x hx y hy hxy
+    obtain ⟨i, _, _, _, _, hxi, hmx, hpx, _, _, _, _, _⟩ := hstore x hx
+    obtain ⟨j, _, _, _, _, hyj, hmy, hpy, _, _, _, _, _⟩ := hstore y hy
+    have hij : i = j := hlo.inj i j x.2 y.2 hmx hmy (by rw [hpx, hpy, hxy])
+    subst hij
+    have hv : x.2 = y.2 := by rw [hmx] at hmy; exact Option.some.inj hmy
+    obtain ⟨x1, x2⟩ := x; obtain ⟨y1, y2⟩ := y
+    simp only at hxi hyj hv
+    rw [hxi, hyj, hv]
+  · intro e he
+    obtain ⟨i, T, sz, aln, data, hei, _, hpid, _, hfn, hlay, hlen, hA⟩ := hstore e he
+    exact ⟨T, sz, aln, _, by rw [hei]; exact hfn, hlay, hpid, hA, rfl, rfl, rfl, hlen, rfl⟩
+  · intro id hid
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp hid
+    obtain ⟨_, _, _, _, _, _, _, _, hb, _, _, _, _⟩ := hstore e he
+    exact hb
+  · intro id a hA hlive hb
+    obtain ⟨i, q, hq, hqid⟩ := hlo.owned id a hA hlive hb
+    exact List.mem_map.mpr ⟨(localName i, q), mapGet_mem hq, provId_of hqid⟩
+
+/-- Machine-level state relation extending `StateRelN` with
+`LocalsOkWithUnions` (`R-d`), allowing `Type.Union` locals (`mrUnionTy` +
+`MiniRustUnionBytesRel`) and 0-byte ZST locals (`()`, `[(); N]`, `VoidZst`) to
+coexist with scalar/fragment locals across multi-step runs and `Return`.
+Here `mStmt` is MiniRust's statement index inside `bbName s.frame.blockIdx`,
+allowing `StorageLive` prologues or `Deinit + Assign` union aggregate lowerings
+to advance `mStmt` independently of `s.frame.stmtIdx`. -/
+structure StateRelWithUnionsAt (body : CapturedMir) (f : Gen.Function) (ctx : Ctx)
+    (al : List Nat) (s : MachineState) (view : List LocalSlot)
+    (lm : Map Gen.LocalName Ptr) (mStmt : Nat) (m : Mach) : Prop where
+  shape : Shape m ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx mStmt]
+    m.mem.memory.allocations
+  retName : f.ret = localName 0
+  locs : LocalsOkWithUnions body f ctx al view lm m.mem.memory.allocations
+  blk : s.frame.blockIdx < body.basicBlocks.length
+  stmt : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb → s.frame.stmtIdx ≤ bb.statements.length
+  stale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx
+  retLive : view[0]? ≠ some .dead
+  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d body.layouts) (itOf d body.layouts)
+  baseLow : BaseLow ctx
+  borrows : s.memory.borrows = []
+  callStack : s.memory.callStack = []
+  activeCallee : s.memory.activeCallee = none
+  protectors : s.memory.activeProtectors = []
+  callerLocals : s.memory.callerLocals = []
+
+/-- Existentially packaged `StateRelWithUnionsAt`. -/
+def StateRelWithUnions (body : CapturedMir) (f : Gen.Function) (ctx : Ctx)
+    (s : MachineState) (m : Mach) : Prop :=
+  ∃ al view lm mStmt, StateRelWithUnionsAt body f ctx al s view lm mStmt m
+
+/-- Every borrow-free `StateRelN` (with `ctx.ptrTargets = fun _ => none`, the
+default on `Ctx`) embeds into `StateRelWithUnions`. -/
+theorem StateRelN.toStateRelWithUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {m : Mach}
+    (hf : FnLocalsSpec body f)
+    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
+    (hbor : s.memory.borrows = [])
+    (hpt : ctx.ptrTargets = fun _ => none)
+    (h : StateRelN body f ctx s m) :
+    StateRelWithUnions body f ctx s m := by
+  obtain ⟨view, lm, hrel, hthr, hlo, _, _⟩ := h
+  rw [hbor, ctxWithBorrows_nil] at hlo
+  have hctx : { ctx with ptrTargets := fun _ => none } = ctx := by
+    cases ctx; dsimp only at hpt; subst hpt; rfl
+  rw [hctx] at hlo
+  exact ⟨alwaysStorageLiveLocals body, view, lm, s.frame.stmtIdx, {
+    shape := ⟨hthr, hrel.active, rfl⟩
+    retName := hf.1
+    locs := hlo.toWithUnions hf hdeclsOk
+    blk := hrel.blk
+    stmt := hrel.stmt
+    stale := hrel.stale
+    retLive := hrel.retLive
+    ret := hrel.ret
+    baseLow := hrel.baseLow
+    borrows := hbor
+    callStack := hrel.callStack
+    activeCallee := hrel.activeCallee
+    protectors := hrel.protectors
+    callerLocals := hrel.callerLocals }⟩
+
+/-- **`Terminator::Return` on `StateRelWithUnionsAt` (`R-d`)**:
+When `_0` is a scalar return local (`(scalarTypeOf d0.ty).isSome = true`),
+`evalReturn` loads `_0`, deallocates every live local in `lm` (including all
+`mrUnionTy` union allocations and 0-byte ZST allocations) via `deallocAll_sized`,
+writes the return value to `ctx.retPtr`, and establishes `ReturnRel`! -/
+theorem evalReturn_withUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {s : MachineState} {view : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {mStmt : Nat} {m : Mach}
+    (h : StateRelWithUnionsAt body f ctx al s view lm mStmt m)
+    {d0 : LocalDecl} (hd0 : body.localDecls[0]? = some d0)
+    (h0scalar : (scalarTypeOf d0.ty).isSome = true) :
+    (∀ v, view[0]? = some (.init v) →
+      ∃ m', evalReturn m = .ok m' ∧ m'.active_thread = 0 ∧ ReturnRel body ctx s v m') ∧
+    (view[0]? = some .uninit → ∃ msg, evalReturn m = .error (.ub msg)) := by
+  have hdScalar : scalarTypeOf d0.ty = some (tyOf d0 body.layouts) := by
+    obtain ⟨T0, hT0⟩ := Option.isSome_iff_exists.mp h0scalar
+    exact (tyOf_of_scalarTypeOf hT0) ▸ hT0
+  have hnp0 : isPtrTy d0.ty = false := isPtrTy_false_of_scalarTypeOf hdScalar
+  obtain ⟨r0, a0, hp, hr0, hlive, haddrr, hlenr, halr⟩ := h.ret d0 hd0
+  have hact : activeThread m = .ok (thread1 ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx mStmt]) := by
+    simp [activeThread, listIndex, h.shape.threads, h.shape.active]
+  have hs3 : Shape { m with threads := [thread1 ctx [ctx.caller]] } ctx [ctx.caller]
+      m.mem.memory.allocations := ⟨rfl, h.shape.active, rfl⟩
+  have hstore0 : ∀ slot0, view[0]? = some slot0 → slot0 ≠ .dead →
+      ∃ (p0 : Ptr) (id0 : Nat),
+        mapGet f.locals (localName 0) = some (tyOf d0 body.layouts) ∧
+        LocalTy (tyOf d0 body.layouts) (itOf d0 body.layouts) ∧
+        DeclSlotOk d0 slot0 body.layouts ∧
+        mapGet lm (localName 0) = some p0 ∧
+        p0.provenance = some (⟨(id0 : Int)⟩, ()) ∧
+        Align.is_aligned ⟨(itOf d0 body.layouts).size.bytes⟩ p0.addr = true ∧
+        m.mem.memory.allocations[id0]? =
+          some (stackAlloc p0.addr (itOf d0 body.layouts) (declSlotData d0 slot0 body.layouts)) := by
+    intro slot0 hs0 hne
+    have hsome : (mapGet lm (localName 0)).isSome = true := (h.locs.live 0 slot0 hs0).mpr (.inl hne)
+    obtain ⟨p0, hp0⟩ := Option.isSome_iff_exists.mp hsome
+    have hls0 := h.locs.storage 0 d0 slot0 p0 hd0 hs0 hp0
+    cases hls0 with
+    | base hfn0 hdok0 hsl0 hst0 =>
+      obtain ⟨id0, hpid0, _, haddr0, _, _, hif0⟩ := hst0
+      simp only [hnp0, Bool.false_eq_true, ↓reduceIte] at hif0
+      exact ⟨p0, id0, hfn0, localTy_of_declOk hdok0, hsl0, hp0, hpid0,
+        by simp only [Align.is_aligned, haddr0.1]; rfl, hif0⟩
+    | zstUnit _ hk0 =>
+      obtain ⟨_, ⟨k0, _⟩, _⟩ := d0; dsimp only at hk0; subst hk0; cases h0scalar
+    | zstArray _ _ hk0 =>
+      obtain ⟨_, ⟨k0, _⟩, _⟩ := d0; dsimp only at hk0; subst hk0; cases h0scalar
+    | zstUninhabited _ hns => rw [h0scalar] at hns; cases hns
+    | union _ _ _ _ _ hns => rw [h0scalar] at hns; cases hns
+  have hprefix : ∀ (p0 : Ptr) (hfn0 : mapGet f.locals (localName 0) = some (tyOf d0 body.layouts))
+      (hlt0 : LocalTy (tyOf d0 body.layouts) (itOf d0 body.layouts)),
+      mapGet lm (localName 0) = some p0 → evalReturn m = (do
+        let (retVal, m4) ← typedLoad { m with threads := [thread1 ctx [ctx.caller]] } p0
+          (tyOf d0 body.layouts) ⟨(itOf d0 body.layouts).size.bytes⟩ .None
+        let (frame, cm) ← deallocAll lm.entries.length
+          (calleeFrameL f ctx lm s.frame.blockIdx mStmt) m4.mem
+        let m5 := { m4 with mem := cm }
+        match frame.stack_pop_action with
+        | .BottomOfStack => terminateActiveThread m5
+        | .BackToCaller nextBlock _ callerRetPtr => do
+          let t ← activeThread m5
+          if t.stack.length = 0 then specPanic "assertion failed: self.active_thread().stack.len() > 0"
+          else do
+            let m6 ← typedStore m5 callerRetPtr retVal (tyOf d0 body.layouts)
+              ⟨(itOf d0 body.layouts).size.bytes⟩ .None
+            match nextBlock with
+            | some nb => jumpToBlock m6 nb
+            | none => ub "return from a function where caller did not specify next block") := by
+    intro p0 hfn0 hlt0 hp0
+    simp only [evalReturn, hact, ok_bind, thread1, List.getLast?_cons_cons, List.getLast?_singleton,
+      listSet, h.shape.active, h.shape.threads]
+    simp [calleeFrameL, h.retName, mapIndex, hfn0, hlt0.layout, expect_align_sized, hp0]
+    rfl
+  constructor
+  · intro v hv
+    obtain ⟨p0, id0, hfn0, hlt0, hsl0, hp0, hpid0, hal0, hA0⟩ := hstore0 _ hv (by simp)
+    have hslot0 : SlotOk (tyOf d0 body.layouts) (.init v) :=
+      (DeclSlotOk_of_scalarTypeOf hdScalar (.init v)).mp hsl0
+    obtain ⟨m4, hm4, hs4⟩ := typedLoad_ptr_localTy hs3 p0 id0 hpid0 d0 hdScalar v hslot0 hA0 _ hal0
+    obtain ⟨hidnd, hok, hlow, hown⟩ := h.locs.teardown
+    obtain ⟨cm5, hcm5, hcm5mem⟩ := deallocAll_sized lm.entries.length
+      (calleeFrameL f ctx lm s.frame.blockIdx mStmt) m4.mem lm.entries (Nat.le_refl _) rfl
+      h.locs.keysNodup hidnd
+      (by
+        intro e he
+        obtain ⟨T, sz, aln, a', h1, h2, h3, h4, h5⟩ := hok e he
+        exact ⟨T, sz, aln, a', h1, h2, h3, by rw [hs4.allocs]; exact h4, h5⟩)
+    obtain ⟨R0, hR0⟩ := h.locs.base
+    have hall : ∀ (j : Nat) b, R0[j]? = some b → b.live = true →
+        ctx.base.length + j ∈ lm.entries.map (fun e => provId e.2) := by
+      intro j b hb hlb
+      refine hown (ctx.base.length + j) b ?_ hlb (by omega)
+      rw [hR0, List.getElem?_append_right (by omega)]
+      simpa using hb
+    obtain ⟨R, hRk, hRdead⟩ := killAt_append_dead ctx.base R0 _ hlow hall
+    rw [hs4.allocs, hR0, hRk] at hcm5mem
+    have hs5 : Shape { m4 with mem := cm5 } ctx [ctx.caller] (ctx.base ++ R) :=
+      ⟨hs4.threads, hs4.active, hcm5mem⟩
+    have hact5 : activeThread { m4 with mem := cm5 } = .ok (thread1 ctx [ctx.caller]) := by
+      simp [activeThread, listIndex, hs4.threads, hs4.active]
+    obtain ⟨acc, hst⟩ := typedStore_base_localTy hs5 ctx.retPtr r0 a0 hp hr0 hlive haddrr d0 hdScalar
+      hlenr v hslot0 ⟨(itOf d0 body.layouts).size.bytes⟩ (by simp only [Align.is_aligned, halr]; rfl)
+    have hs6 := withMem_shape
+      (allocs' := ctx.base.set r0 { a0 with data := declSlotData d0 (.init v) body.layouts } ++ R) hs5 acc
+    obtain ⟨m7, hm7, hs7⟩ := mutateCurFrame_single hs6
+      (fun fr => { fr with next_block := ctx.nextBlock, next_stmt := 0 })
+    refine ⟨m7, ?_, hs7.active, ⟨r0, a0, d0, R, hd0, hslot0, hp, hr0, hs7.threads, hs7.allocs, hRdead⟩⟩
+    rw [hprefix p0 hfn0 hlt0 hp0, hm4]
+    simp only [ok_bind]
+    rw [hcm5]
+    simp only [ok_bind, calleeFrameL, hact5, thread1, hst]
+    simp [jumpToBlock, hm7]
+  · intro hu
+    obtain ⟨p0, id0, hfn0, hlt0, _, hp0, hpid0, hal0, hA0⟩ := hstore0 _ hu (by simp)
+    obtain ⟨msg, hmsg⟩ := typedLoad_ptr_localTy_uninit hs3 p0 id0 hpid0 d0 hdScalar hA0 _ hal0
+    exact ⟨msg, by rw [hprefix p0 hfn0 hlt0 hp0, hmsg]; rfl⟩
+
+/-- **`step_return_withUnions` (`R-d`)**:
+On a `StateRelWithUnionsAt` state at the end of `bb` (`s.frame.stmtIdx = bb.statements.length`,
+`mStmt = tb.statements.length`) with `bb.terminator.kind = .return_` and `tb.terminator = .Return`:
+1. When `s.frame.locals[0]? = view[0]? = some (.init v)`, `stepMirFn body s` returns
+   `.ret (.normal (v, ...))` and `Interp.step m` succeeds with `ReturnRel body ctx s v m'`;
+2. When `s.frame.locals[0]? = view[0]? = some .uninit`, `stepMirFn body s = MirStepNode.fail .ub`
+   and `Interp.step m = .error (.ub msg)`. -/
+theorem step_return_withUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {s : MachineState} {view : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {mStmt : Nat} {m : Mach}
+    {bb : BasicBlockData} {tb : Gen.BasicBlock} {d0 : LocalDecl}
+    (h : StateRelWithUnionsAt body f ctx al s view lm mStmt m)
+    (hphase : body.phase = .runtimePostCleanup)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hstmt_end : s.frame.stmtIdx = bb.statements.length)
+    (hk : bb.terminator.kind = .return_)
+    (hgetb : mapGet f.blocks (bbName s.frame.blockIdx) = some tb)
+    (hmstmt_end : mStmt = tb.statements.length)
+    (htt : tb.terminator = .Return)
+    (hd0 : body.localDecls[0]? = some d0)
+    (h0scalar : (scalarTypeOf d0.ty).isSome = true)
+    (h0eq : s.frame.locals[0]? = view[0]?) :
+    (∀ v, view[0]? = some (.init v) →
+      stepMirFn body s =
+        MirStepNode.retNormal v
+          { s.memory with
+            borrows := MirSemantics.disableFrameBorrows s.memory.borrows 0 s.frame.locals.length } ∧
+      ∃ m', Interp.step m = .ok m' ∧ ReturnRel body ctx s v m') ∧
+    (view[0]? = some .uninit →
+      stepMirFn body s = MirStepNode.fail .ub ∧
+      ∃ msg, Interp.step m = .error (.ub msg)) := by
+  have hframe0 : StateRelWithUnionsAt body f ctx al s view lm mStmt (resetPick m) :=
+    { h with shape := resetPick_shape h.shape }
+  obtain ⟨hretOk, hretUb⟩ := evalReturn_withUnions hframe0 hd0 h0scalar
+  have hstepA := stepMirFn_term body s bb h.activeCallee hphase hbb hstmt_end
+  have hstepM := step_callee h.shape tb hgetb
+  have hif : ((mStmt : Nat) : Int) = (tb.statements.length : Int) := by rw [hmstmt_end]
+  refine ⟨fun v hv => ?_, fun hu => ?_⟩
+  · have hsA : s.frame.locals[0]? = some (.init v) := h0eq.trans hv
+    have hA : stepMirFn body s =
+        MirStepNode.retNormal v
+          { s.memory with
+            borrows := MirSemantics.disableFrameBorrows s.memory.borrows 0 s.frame.locals.length } := by
+      rw [hstepA]
+      simp [MirSemantics.evalTerminator, hk, get?, hsA, h.callStack, h.protectors,
+        MirSemantics.hasFrameDeallocProtectorConflict]
+      rfl
+    obtain ⟨m', hm', hact', hR⟩ := hretOk v hv
+    have hchk : CM.check_data_races m'.mem m'.active_thread
+        (setInsert m.synchronized_threads 0, m.mem.accesses) = .ok () := by
+      rw [hact']; exact check_ok _ _ _
+    exact ⟨hA, m', by simp [hstepM, hif, htt, Interp.evalTerminator, hm', ok_bind, hchk], hR⟩
+  · have hsA : s.frame.locals[0]? = some .uninit := h0eq.trans hu
+    have hA : stepMirFn body s = MirStepNode.fail .ub := by
+      rw [hstepA]
+      simp [MirSemantics.evalTerminator, hk, get?, hsA]
+    obtain ⟨msg, hmsg⟩ := hretUb hu
+    exact ⟨hA, msg, by simp [hstepM, hif, htt, Interp.evalTerminator, hmsg, bind, Except.bind]⟩
+
+theorem LocalStorage.set_other {ctx : Ctx} {allocs : List Gen.Allocation}
+    {d : LocalDecl} {slot : LocalSlot} {p : Ptr} {layouts : Layout.LayoutTable}
+    {k : Nat} {a : Gen.Allocation}
+    (hls : LocalStorage ctx allocs d slot p layouts)
+    (hne : ∀ (id : Nat), p.provenance = some (⟨(id : Int)⟩, ()) → k ≠ id) :
+    LocalStorage ctx (allocs.set k a) d slot p layouts := by
+  obtain ⟨id, hpid, hb, haddr, hlt64, hcls, hif⟩ := hls
+  have hkid : k ≠ id := hne id hpid
+  refine ⟨id, hpid, hb, haddr, hlt64, hcls, ?_⟩
+  by_cases hptr : isPtrTy d.ty = true
+  · simp only [hptr, ↓reduceIte] at hif ⊢
+    split at hif
+    · obtain ⟨tAddr, tProv, h1, h2, hA⟩ := hif
+      exact ⟨tAddr, tProv, h1, h2, by rw [List.getElem?_set_ne hkid]; exact hA⟩
+    · rw [List.getElem?_set_ne hkid]; exact hif
+  · simp only [hptr, Bool.false_eq_true, ↓reduceIte] at hif ⊢
+    rw [List.getElem?_set_ne hkid]; exact hif
+
+theorem LocalStorageWithUnions.set_other
+    {f : Gen.Function} {ctx : Ctx} {allocs : List Gen.Allocation}
+    {layouts : Layout.LayoutTable} {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr}
+    {k : Nat} {a : Gen.Allocation}
+    (h : LocalStorageWithUnions f ctx allocs layouts i d slot p)
+    (hne : ∀ (id : Nat), p.provenance = some (⟨(id : Int)⟩, ()) → k ≠ id) :
+    LocalStorageWithUnions f ctx (allocs.set k a) layouts i d slot p := by
+  cases h with
+  | base hfn hlt hsl hls =>
+    exact .base hfn hlt hsl (hls.set_other hne)
+  | zstUnit id hk hfn hpid hb h0 h64 hsl hA =>
+    exact .zstUnit id hk hfn hpid hb h0 h64 hsl (by rw [List.getElem?_set_ne (hne id hpid)]; exact hA)
+  | zstArray N id hk hfn hpid hb h0 h64 hsl hA =>
+    exact .zstArray N id hk hfn hpid hb h0 h64 hsl (by rw [List.getElem?_set_ne (hne id hpid)]; exact hA)
+  | zstUninhabited id hns hfn hpid hb h0 h64 hsl hA =>
+    exact .zstUninhabited id hns hfn hpid hb h0 h64 hsl (by rw [List.getElem?_set_ne (hne id hpid)]; exact hA)
+  | union fields S al id mrBytes hns hpos hfn hpid hb hal h0 h64 hlen hA hrel =>
+    exact .union fields S al id mrBytes hns hpos hfn hpid hb hal h0 h64 hlen
+      (by rw [List.getElem?_set_ne (hne id hpid)]; exact hA) hrel
+
+/-- **Lifting `step_union_whole_copy_minirust_simulation` onto `StateRelWithUnionsAt` (`R-d`)**:
+On a `StateRelWithUnionsAt` state (`s.frame.locals = view`, `m.mem.memory.allocations = ctx.base ++ L`)
+where union local `u` holds `.init val` with bytes `mrBytes` (including any `.Uninit`
+padding bytes) and union local `w ≠ 0` is live, `_w = copy _u` steps in lockstep in
+Anneal (`stepMirFn body s`) and MiniRust (`Interp.step m`) and preserves
+`StateRelWithUnionsAt` (and hence `StateRelWithUnions`)! -/
+theorem step_union_whole_copy_stateRelWithUnions
+    {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    {L : List Gen.Allocation} {mStmt : Nat} {m : Mach}
+    {bb : BasicBlockData} {tb : Gen.BasicBlock}
+    {u w : Nat} {uDecl wDecl : LocalDecl}
+    {fields : List (Gen.Offset × Gen.«Type»)}
+    {S align : Nat} {val : MirSemantics.Value} {wSlot : LocalSlot}
+    {mrBytes oldBytes : List Byte} {span : String}
+    (hphase : body.phase = .runtimePostCleanup)
+    (hrel : StateRelWithUnionsAt body f ctx al s s.frame.locals lm mStmt m)
+    (hallocs : m.mem.memory.allocations = ctx.base ++ L)
+    (hu : MiniRustUnionLocalStorage ctx L f lm body.layouts u uDecl.ty fields S align (.init val) mrBytes)
+    (hw : MiniRustUnionLocalStorage ctx L f lm body.layouts w wDecl.ty fields S align wSlot oldBytes)
+    (_hdu : body.localDecls[u]? = some uDecl)
+    (hdw : body.localDecls[w]? = some wDecl)
+    (hty_eq : wDecl.ty = uDecl.ty)
+    (hw_nonSc : (scalarTypeOf wDecl.ty).isSome = false)
+    (hw0 : w ≠ 0)
+    (hu_slot : s.frame.locals[u]? = some (.init val))
+    (hw_live : s.frame.locals[w]? = some wSlot)
+    (hw_not_dead : wSlot ≠ .dead)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some ⟨.assign ⟨w, []⟩ (.use (.copy ⟨u, []⟩)), span⟩)
+    (htb : mapGet f.blocks (bbName s.frame.blockIdx) = some tb)
+    (hlt_tb : mStmt < tb.statements.length)
+    (htst : tb.statements[mStmt]? =
+      some (.Assign (.Local (localName w)) (.Load (.Local (localName u)))))
+    (hval : MirSemantics.validateLoadedValue body.layouts body.localDecls (.copy ⟨u, []⟩) val = true) :
+    let s' := advanceStmt s (s.frame.locals.set w (.init val)) s.memory
+    stepMirFn body s = .tau (.running s') ∧
+    ∃ m',
+      Interp.step m = .ok m' ∧
+      StateRelWithUnionsAt body f ctx al s' s'.frame.locals lm (mStmt + 1) m' ∧
+      StateRelWithUnions body f ctx s' m' := by
+  have hlt_bb : s.frame.stmtIdx < bb.statements.length := (List.getElem?_eq_some_iff.mp hst).1
+  have hstepA_eq := stepMirFn_stmt body s bb _ hrel.activeCallee hphase hbb hst
+  -- Reuse `step_union_whole_copy_minirust_simulation` at `mStmt` by re-indexing `s`'s `stmtIdx` for the MiniRust shape!
+  let sM : MachineState := { s with frame := { s.frame with stmtIdx := mStmt } }
+  have hshM : Shape m ctx [ctx.caller, calleeFrameL f ctx lm sM.frame.blockIdx sM.frame.stmtIdx]
+      (ctx.base ++ L) := by
+    refine ⟨hrel.shape.threads, hrel.shape.active, hallocs⟩
+  have hu' : MiniRustUnionLocalStorage ctx L f lm body.layouts u wDecl.ty fields S align (.init val) mrBytes :=
+    hty_eq ▸ hu
+  obtain ⟨_, m', hstepM, hsh', hw'⟩ :=
+    step_union_whole_copy_minirust_simulation (body := body) (s := sM) (span := span)
+      hshM hu' hw hu_slot hw_live hw_not_dead hrel.borrows hrel.protectors hrel.callerLocals
+      htb hlt_tb htst hval
+  -- And on `s` itself, `evalStmt` is identical apart from advancing `s.frame.stmtIdx`:
+  have hw_lt_af : w < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hw_live).1
+  have hA : evalStmt s ⟨.assign ⟨w, []⟩ (.use (.copy ⟨u, []⟩)), span⟩
+      body.localDecls body.layouts =
+      MirStepNode.step (advanceStmt s (s.frame.locals.set w (.init val)) s.memory) := by
+    have hop : evalOperand s.frame.locals (.copy ⟨u, []⟩) s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
+        .ok val s.frame.locals := by
+      simp [evalOperand, get?, hu_slot, readProjectedValue]
+    have hrv := evalRvalue_use_ok hop hval rfl
+    have hinv : MirSemantics.invalidateConflictingBorrows s.memory.borrows w .none
+        s.memory.callStack.length = s.memory.borrows := by
+      rw [hrel.borrows]; rfl
+    simp only [evalStmt, hrv, get?, hw_live, set?, Trusted.Sequence.length, hw_lt_af, ↓reduceIte,
+      hrel.protectors, hinv]
+    cases wSlot with
+    | dead => exact absurd rfl hw_not_dead
+    | uninit | init _ => rw [memory_mk_nil_prot s.memory hrel.protectors]
+  let L' := L.set w (localAlloc ctx w ⟨.Unsigned, ⟨align⟩⟩ mrBytes)
+  let s' := advanceStmt s (s.frame.locals.set w (.init val)) s.memory
+  have hw_lt_L : w < L.length := (List.getElem?_eq_some_iff.mp hw.alloc_eq).1
+  have hallocs_set : ctx.base ++ L' =
+      (ctx.base ++ L).set (ctx.base.length + w) (localAlloc ctx w ⟨.Unsigned, ⟨align⟩⟩ mrBytes) := by
+    rw [List.set_append_right _ _ (Nat.le_add_right _ _), Nat.add_sub_cancel_left]
+  have hlocs' : LocalsOkWithUnions body f ctx al s'.frame.locals lm m'.mem.memory.allocations := by
+    rw [hsh'.allocs]
+    refine {
+      nlocals := by simp [s', advanceStmt, hrel.locs.nlocals]
+      base := ⟨L', rfl⟩
+      keysNodup := hrel.locs.keysNodup
+      keysLocal := hrel.locs.keysLocal
+      live := fun i sl hsl => by
+        simp only [s', advanceStmt, List.getElem?_set] at hsl
+        by_cases hwi : w = i
+        · subst hwi
+          simp only [↓reduceIte, hw_lt_af, Option.some.injEq] at hsl
+          subst hsl
+          have h1 := (hrel.locs.live w wSlot hw_live).mpr (.inl hw_not_dead)
+          exact ⟨fun _ => .inl (by simp), fun _ => h1⟩
+        · simp only [hwi, ↓reduceIte] at hsl
+          exact hrel.locs.live i sl hsl
+      storage := fun i di sli pi hdi hsli hpi => by
+        simp only [s', advanceStmt, List.getElem?_set] at hsli
+        by_cases hwi : w = i
+        · subst hwi
+          simp only [↓reduceIte, hw_lt_af, Option.some.injEq] at hsli
+          subst hsli
+          rw [hdw] at hdi; cases hdi
+          rw [hw.lm_ptr] at hpi; cases hpi
+          exact LocalStorageWithUnions.ofMiniRustUnionLocalStorage hw_nonSc hw'
+        · simp only [hwi, ↓reduceIte] at hsli
+          have h0 := hrel.locs.storage i di sli pi hdi hsli hpi
+          rw [hallocs] at h0
+          rw [hallocs_set]
+          refine h0.set_other (fun id hpid hkid => hwi ?_)
+          subst hkid
+          exact hrel.locs.inj w i (localPtr ctx w) pi hw.lm_ptr hpi (by rw [hpid]; rfl)
+      inj := hrel.locs.inj
+      owned := fun id a hA hlive_a hb => by
+        rw [hallocs_set, List.getElem?_set] at hA
+        by_cases hk : ctx.base.length + w = id
+        · subst hk
+          exact ⟨w, localPtr ctx w, hw.lm_ptr, rfl⟩
+        · simp only [hk, ↓reduceIte] at hA
+          have hA0 : m.mem.memory.allocations[id]? = some a := by rw [hallocs]; exact hA
+          exact hrel.locs.owned id a hA0 hlive_a hb }
+  have hrel' : StateRelWithUnionsAt body f ctx al s' s'.frame.locals lm (mStmt + 1) m' := {
+    shape := ⟨hsh'.threads, hsh'.active, rfl⟩
+    retName := hrel.retName
+    locs := hlocs'
+    blk := hrel.blk
+    stmt := fun bb' hbb' => by
+      dsimp only [s', advanceStmt] at hbb' ⊢
+      rw [hbb] at hbb'; cases hbb'; exact Nat.succ_le_of_lt hlt_bb
+    stale := ⟨rfl, fun _ hj => absurd rfl hj⟩
+    retLive := by
+      simp only [s', advanceStmt, List.getElem?_set_ne hw0]
+      exact hrel.retLive
+    ret := hrel.ret
+    baseLow := hrel.baseLow
+    borrows := hrel.borrows
+    callStack := hrel.callStack
+    activeCallee := hrel.activeCallee
+    protectors := hrel.protectors
+    callerLocals := hrel.callerLocals }
+  exact ⟨by rw [hstepA_eq, hA]; rfl, m', hstepM, hrel', ⟨al, s'.frame.locals, lm, mStmt + 1, hrel'⟩⟩
+
+/-- Step relation parameterized by a union-aware state invariant `Inv` (`Inv s m → StateRelWithUnions body f ctx s m`),
+supporting 1-or-more MiniRust steps per Anneal step (`1 ≤ k`, covering 1-step
+statement lockstep such as `_w = copy _u` as well as `StorageLive` prologues,
+`Deinit + Assign` union aggregate lowerings, and `StorageDead` epilogues before `Return`). -/
+def StepRelWithUnionsInv (Inv : MachineState → Mach → Prop)
+    (body : CapturedMir) (ctx : Ctx) (s : MachineState) (a : MirStepNode) (m : Mach) : Prop :=
+  match a with
+  | .tau (.running s') => ∃ k m', 1 ≤ k ∧ Interp.steps k m = .ok m' ∧ Inv s' m'
+  | .vis (.inr (.inl (.emit _))) kCont =>
+    ∃ s' k m', 1 ≤ k ∧ kCont PUnit.unit = .running s' ∧ Interp.steps k m = .ok m' ∧ Inv s' m'
+  | .ret (.normal (v, _)) => ∃ k m', 1 ≤ k ∧ Interp.steps k m = .ok m' ∧ ReturnRel body ctx s v m'
+  | .vis (.inl (.fail .ub)) _ => ∃ k msg, 1 ≤ k ∧ Interp.steps k m = .error (.ub msg)
+  | _ => False
+
+/-- **Multi-step execution prefix lift for `StateRelWithUnions` (`R-d`)**:
+Given any invariant `Inv` refining `StateRelWithUnions body f ctx` that is
+closed under `StepRelWithUnionsInv Inv body ctx`, every Anneal execution prefix
+`Reaches (mirTree body s) tr u` is matched by finitely many MiniRust steps to a
+`StateRelWithUnions`-related state! -/
+theorem reaches_rel_withUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    (Inv : MachineState → Mach → Prop)
+    (hinv : ∀ s m, Inv s m → StateRelWithUnions body f ctx s m)
+    (hstep : ∀ s m, Inv s m → StepRelWithUnionsInv Inv body ctx s (stepMirFn body s) m)
+    {t u : Trusted.ITree.ITree MirEffect MirOutcome}
+    {tr : List (Trusted.Effect.Event MirEffect)} (h : Trusted.ITree.Reaches t tr u) :
+    ∀ (s : MachineState) (m : Mach), t = mirTree body s → Inv s m →
+      ∃ (n : Nat) (s' : MachineState) (m' : Mach), Interp.steps n m = .ok m' ∧
+        Inv s' m' ∧ StateRelWithUnions body f ctx s' m' ∧ u = mirTree body s' := by
+  induction h with
+  | refl t =>
+    intro s m ht hi
+    exact ⟨0, s, m, rfl, hi, hinv s m hi, ht⟩
+  | tau hobs _ ih =>
+    intro s m ht hi
+    subst ht
+    have hsr := hstep s m hi
+    rw [mirTree_observe_local] at hobs
+    generalize stepMirFn body s = node at hsr hobs
+    cases node with
+    | ret r => simp [Trusted.ITree.ITreeF.map] at hobs
+    | vis i k => simp [Trusted.ITree.ITreeF.map] at hobs
+    | tau x =>
+      simp only [Trusted.ITree.ITreeF.map, Trusted.ITree.ITreeF.tau.injEq] at hobs
+      cases x with
+      | running s1 =>
+        obtain ⟨k1, m1, _, hm1, hi1⟩ := hsr
+        obtain ⟨n, s', m', hsteps, hi', hrel', hu⟩ := ih s1 m1 hobs.symm hi1
+        exact ⟨k1 + n, s', m', by rw [steps_add, hm1, ok_bind, hsteps], hi', hrel', hu⟩
+      | halted _ => exact False.elim hsr
+      | faulted _ => exact False.elim hsr
+  | vis hobs hnf o _ ih =>
+    intro s m ht hi
+    subst ht
+    have hsr := hstep s m hi
+    rw [mirTree_observe_local] at hobs
+    generalize stepMirFn body s = node at hsr hobs
+    cases node with
+    | ret r => simp [Trusted.ITree.ITreeF.map] at hobs
+    | tau x => simp [Trusted.ITree.ITreeF.map] at hobs
+    | vis i0 k0 =>
+      simp only [Trusted.ITree.ITreeF.map] at hobs
+      injection hobs with hi0 hk
+      subst hi0
+      have hk' := eq_of_heq hk
+      subst hk'
+      cases i0 with
+      | inl a => exact False.elim (hnf trivial)
+      | inr b =>
+        cases b with
+        | inr c => exact False.elim hsr
+        | inl ob =>
+          obtain ⟨s1, k1, m1, _, hk1, hm1, hi1⟩ := hsr
+          cases o
+          have ht' : Trusted.ITree.ITree.cofix (stepMirState body) (k0 PUnit.unit) =
+              mirTree body s1 := by
+            rw [hk1]; rfl
+          obtain ⟨n, s', m', hsteps, hi', hrel', hu⟩ := ih s1 m1 ht' hi1
+          exact ⟨k1 + n, s', m', by rw [steps_add, hm1, ok_bind, hsteps], hi', hrel', hu⟩
+
+/-- **Whole-execution normal return for `StateRelWithUnions` (`R-d`)**:
+If Anneal's semantics of `body` from `s` returns `.normal (v, mem)`, MiniRust
+from an `Inv`-related `StateRelWithUnions` state reaches `ReturnRel` after
+finitely many steps. -/
+theorem run_ret_withUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    (Inv : MachineState → Mach → Prop)
+    (hinv : ∀ s m, Inv s m → StateRelWithUnions body f ctx s m)
+    (hstep : ∀ s m, Inv s m → StepRelWithUnionsInv Inv body ctx s (stepMirFn body s) m)
+    (s : MachineState) (m : Mach) (hi : Inv s m)
+    {tr : List (Trusted.Effect.Event MirEffect)} {v : Value} {mem : MirSemantics.Memory}
+    (hret : Trusted.ITree.ReachesRet (mirTree body s) tr (.normal (v, mem))) :
+    ∃ (n : Nat) (s' : MachineState) (mPre m' : Mach),
+      Interp.steps n m = .ok m' ∧
+      StateRelWithUnions body f ctx s' mPre ∧
+      ReturnRel body ctx s' v m' := by
+  obtain ⟨u, hreach, hu⟩ := hret
+  obtain ⟨n1, s', m1, hsteps1, hi', hrel', rfl⟩ :=
+    reaches_rel_withUnions Inv hinv hstep hreach s m rfl hi
+  have hsr := hstep s' m1 hi'
+  rw [mirTree_observe_local] at hu
+  generalize stepMirFn body s' = node at hsr hu
+  cases node with
+  | tau x => simp [Trusted.ITree.ITreeF.map] at hu
+  | vis i k => simp [Trusted.ITree.ITreeF.map] at hu
+  | ret r =>
+    simp only [Trusted.ITree.ITreeF.map, Trusted.ITree.ITreeF.ret.injEq] at hu
+    subst hu
+    obtain ⟨k2, m', _, hm', hret'⟩ := hsr
+    exact ⟨n1 + k2, s', m1, m', by rw [steps_add, hsteps1, ok_bind, hm'], hrel', hret'⟩
+
+/-- **Whole-execution UB for `StateRelWithUnions` (`R-d`)**:
+If Anneal's semantics of `body` from `s` reaches `FaultNow`, MiniRust from an
+`Inv`-related `StateRelWithUnions` state stops with `.error (.ub msg)` after
+finitely many steps. -/
+theorem run_ub_withUnions {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    (Inv : MachineState → Mach → Prop)
+    (hinv : ∀ s m, Inv s m → StateRelWithUnions body f ctx s m)
+    (hstep : ∀ s m, Inv s m → StepRelWithUnionsInv Inv body ctx s (stepMirFn body s) m)
+    (s : MachineState) (m : Mach) (hi : Inv s m)
+    {tr : List (Trusted.Effect.Event MirEffect)} {u : Trusted.ITree.ITree MirEffect MirOutcome}
+    (hreach : Trusted.ITree.Reaches (mirTree body s) tr u)
+    (hfault : Trusted.ITree.FaultNow u) :
+    ∃ (n : Nat) (msg : String), Interp.steps n m = .error (.ub msg) := by
+  obtain ⟨t', i, k, htau, hobs, hfi⟩ := hfault
+  obtain ⟨n1, s1, m1, h1, hi1, _, rfl⟩ :=
+    reaches_rel_withUnions Inv hinv hstep hreach s m rfl hi
+  obtain ⟨n2, s2, m2, h2, hi2, _, rfl⟩ :=
+    reaches_rel_withUnions Inv hinv hstep (tauStar_reaches_local htau) s1 m1 rfl hi1
+  have hsr := hstep s2 m2 hi2
+  rw [mirTree_observe_local] at hobs
+  generalize stepMirFn body s2 = node at hsr hobs
+  cases node with
+  | ret r => simp [Trusted.ITree.ITreeF.map] at hobs
+  | tau x => simp [Trusted.ITree.ITreeF.map] at hobs
+  | vis i0 k0 =>
+    simp only [Trusted.ITree.ITreeF.map] at hobs
+    injection hobs with hi0 _
+    subst hi0
+    cases i0 with
+    | inr b =>
+      cases b with
+      | inl _ => exact False.elim hfi
+      | inr _ => exact False.elim hfi
+    | inl f0 =>
+      cases f0 with
+      | fail reason =>
+        cases reason with
+        | ub =>
+          obtain ⟨kStep, msg, _, hkStep⟩ := hsr
+          exact ⟨(n1 + n2) + kStep, msg, by rw [steps_add, steps_add, h1, ok_bind, h2, ok_bind, hkStep]⟩
+        | unsupported | outOfFuel => exact False.elim hsr
+
 end MiniRustSpec.Correspondence

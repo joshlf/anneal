@@ -4005,8 +4005,29 @@ inductive ZstZeroMemRel
 /-- Extended local relation covering `UnionLocalRel` plus padded unions whose
 active arm is a 0-byte `[(); N]` ZST array (`zstUninit` on all-uninit storage,
 `zstOverlay` when `[(); N]` overwrote a scalar-initialized union), pre-allocated
-uninitialized unions (`uninitIndirect`), and 0-byte `[(); N]` ZST array locals
-(`zstArrayIndirect`). -/
+uninitialized unions (`uninitIndirect`), and initialized 0-byte `[(); N]` ZST
+array locals (`zstArrayIndirect`).
+
+Model boundary notes (`R-b`, `R-c`):
+* **`zstArrayIndirect` (`R-c`)**: relates only an initialized Anneal slot
+  `.init (zstArrayVal N)` to a live 0-byte `ZstZeroMemRel` allocation
+  `⟨.live (.indirect mp), cachedLayout⟩`, so reading that `[(); N]` local
+  succeeds in both Anneal and `lean-miri` (whereas an `.uninit` `[(); N]` local
+  is represented via `ofUnionLocalRel (.base (.immediate .uninit .uninit ..))`
+  and faults in both).
+* **Never-written (`.uninit`) union 0-byte field reads (`R-b`)**: in rustc's
+  interpreter / Miri (and MiniRust's `evalValue_load_union_zstArray_field`),
+  `StorageLive` allocates `S` uninitialized bytes in memory and reading an
+  inhabited 0-byte ZST arm succeeds even before any write to the union. By
+  contrast, Anneal's `MirSemantics.evalOperand` requires `LocalSlot.init` before
+  `readProjectedValueUnionAware`, and `lean-miri`'s `annealEvalUnionField` /
+  `annealEvalOperandLM2_4PaddedZst` likewise faults on `.immediate .uninit`
+  (as produced by `StorageLive`). Under `uninitIndirect` (a pre-allocated
+  write/copy destination where Anneal holds `.uninit` and `lean-miri` already
+  holds `.indirect mp`), `lean-miri` matches real Miri by accepting a 0-byte
+  inhabited field read while Anneal faults on `LocalSlot.uninit`; once a ZST arm
+  initializes the union (`zstUninit`), all `S` backing bytes remain `.uninit`
+  and both Anneal and `lean-miri` accept inhabited 0-byte reads. -/
 inductive PaddedZstUnionLocalRel
     (mach : AnnealMachine)
     (decl : LocalDecl)
@@ -4028,16 +4049,15 @@ inductive PaddedZstUnionLocalRel
       PaddedZstUnionLocalRel mach decl layouts
         .uninit
         ⟨.live (.indirect mp), cachedLayout⟩
-  | zstArrayIndirect (N : Nat) (slot : LocalSlot)
+  | zstArrayIndirect (N : Nat)
       (mp : Miri.Interpreter.MemPlace AnnealProv)
       (cachedLayout : Option Miri.Interpreter.LocalLayout) :
       (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
       decl.ty.kind = .array (.tuple []) N →
       (translateTy decl.ty layouts).layout.size = Miri.ABI.Size.ZERO →
-      (slot = .uninit ∨ slot = .init (zstArrayVal N)) →
       ZstZeroMemRel mach mp →
       PaddedZstUnionLocalRel mach decl layouts
-        slot
+        (.init (zstArrayVal N))
         ⟨.live (.indirect mp), cachedLayout⟩
   | zstUninit (S n N f_z zstFlIdx : Nat)
       (mp : Miri.Interpreter.MemPlace AnnealProv)

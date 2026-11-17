@@ -15885,6 +15885,596 @@ theorem wUnionMid2_two_sided_step_simulations :
     evalValue_load_union_zstArray_field wUnionMid2_shape wUnionMid2_storage4 (j := 0) (N := 4) rfl
   exact ⟨m', hm'⟩
 
+/-! ### Multi-Step Union Run Composition via `StateRelWithUnions`, `run_ret_withUnions`, and `run_ub_withUnions` (`R-d`)
+
+Here `wUnionAutoFn` is computed directly by `translateFnWithUnions wUnionWitnessMir true`
+(`wUnionAutoFn_eq`). We compose `step_union_whole_copy_stateRelWithUnions`
+(which wraps `step_union_whole_copy_minirust_simulation`), the `[(); 4]` ZST
+field write/read steps, the `u8` field read and `u32` cast, and
+`step_return_withUnions` (`evalReturn_withUnions`, which tears down the live
+`mrPU` union allocations and `[(); 4]` ZST allocation via `deallocAll_sized`)
+into full multi-step runs via `run_ret_withUnions` (`bb2` -> `ReturnRel`) and
+`run_ub_withUnions` (`bb3` -> `.error (.ub _)`). -/
+
+/-- `translateFnWithUnions` succeeds on `wUnionWitnessMir`. -/
+def wUnionAutoFn : Gen.Function :=
+  (translateFnWithUnions wUnionWitnessMir true).get (by decide)
+
+theorem wUnionAutoFn_eq :
+    translateFnWithUnions wUnionWitnessMir true = some wUnionAutoFn := rfl
+
+private def wUnionPUValU8 : Value :=
+  .aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit]
+
+private def wUnionPUValOverlay : Value :=
+  .aggregate 0
+    ([.unit, .unit, .unit, .unit] ++
+      [.aggregate 0
+        (MirSemantics.encodeRawAbstractByteVals
+          [.init 0x55 none, .uninit, .uninit, .uninit])])
+
+private def wUnionPUBytes55 : List Byte :=
+  [.Init 0x55 none, .Uninit, .Uninit, .Uninit]
+
+private def wUnionRunState (b k : Nat) (locs : List LocalSlot) : MachineState :=
+  { frame := { blockIdx := b, stmtIdx := k, locals := locs }
+    memory := (wUnionS0 b).memory }
+
+private def wUnionRunMach (b mStmt : Nat) (L : List Gen.Allocation) : Mach :=
+  { prog := emptyProg
+    mem := { memory := { allocations := wUnionCtx2.base ++ L, _phantom := {} },
+             accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [thread1 wUnionCtx2
+      [wUnionCtx2.caller, calleeFrameL wUnionAutoFn wUnionCtx2 (localsMap wUnionCtx2 8) b mStmt]]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+/-- General constructor establishing `StateRelWithUnionsAt` on `wUnionWitnessMir` /
+`wUnionAutoFn` for any live 8-local allocation list `L = [a0..a7]` matching `locs`. -/
+private theorem wUnionAuto_stateRelAt
+    {b k mStmt : Nat} {s : MachineState} {m : Mach} {L : List Gen.Allocation}
+    (hs_blk : s.frame.blockIdx = b)
+    (hs_stmt : s.frame.stmtIdx = k)
+    (hb : b < wUnionWitnessMir.basicBlocks.length)
+    (hk : ∀ bb, wUnionWitnessMir.basicBlocks[b]? = some bb → k ≤ bb.statements.length)
+    (hmem : s.memory = (wUnionS0 b).memory)
+    (hsh : Shape m wUnionCtx2
+      [wUnionCtx2.caller, calleeFrameL wUnionAutoFn wUnionCtx2 (localsMap wUnionCtx2 8) b mStmt]
+      (wUnionCtx2.base ++ L))
+    (hnloc : s.frame.locals.length = 8)
+    (hL_len : L.length = 8)
+    (hlive_slots : ∀ (j : Nat) (sl : LocalSlot), s.frame.locals[j]? = some sl → sl ≠ LocalSlot.dead)
+    (hst0 : ∀ d slot, wUnionWitnessMir.localDecls[0]? = some d → s.frame.locals[0]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 0 d slot (localPtr wUnionCtx2 0))
+    (hst1 : ∀ d slot, wUnionWitnessMir.localDecls[1]? = some d → s.frame.locals[1]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 1 d slot (localPtr wUnionCtx2 1))
+    (hst2 : ∀ d slot, wUnionWitnessMir.localDecls[2]? = some d → s.frame.locals[2]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 2 d slot (localPtr wUnionCtx2 2))
+    (hst3 : ∀ d slot, wUnionWitnessMir.localDecls[3]? = some d → s.frame.locals[3]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 3 d slot (localPtr wUnionCtx2 3))
+    (hst4 : ∀ d slot, wUnionWitnessMir.localDecls[4]? = some d → s.frame.locals[4]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 4 d slot (localPtr wUnionCtx2 4))
+    (hst5 : ∀ d slot, wUnionWitnessMir.localDecls[5]? = some d → s.frame.locals[5]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 5 d slot (localPtr wUnionCtx2 5))
+    (hst6 : ∀ d slot, wUnionWitnessMir.localDecls[6]? = some d → s.frame.locals[6]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 6 d slot (localPtr wUnionCtx2 6))
+    (hst7 : ∀ d slot, wUnionWitnessMir.localDecls[7]? = some d → s.frame.locals[7]? = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 7 d slot (localPtr wUnionCtx2 7)) :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] s s.frame.locals
+      (localsMap wUnionCtx2 8) mStmt m where
+  shape := ⟨by rw [hs_blk]; exact hsh.threads, hsh.active, rfl⟩
+  retName := rfl
+  locs := {
+    nlocals := hnloc
+    base := ⟨L, hsh.allocs⟩
+    keysNodup := by decide
+    keysLocal := fun e he => by
+      obtain ⟨i, hi, rfl⟩ := List.mem_map.mp he
+      exact ⟨i, by simp [wUnionWitnessMir]; exact List.mem_range.mp hi, rfl⟩
+    live := fun i slot hs => by
+      have hi : i < 8 := by have := (List.getElem?_eq_some_iff.mp hs).1; omega
+      have hne := hlive_slots i slot hs
+      have hmg : (mapGet (localsMap wUnionCtx2 8) (localName i)).isSome = true := by
+        rw [mapGet_localsMap wUnionCtx2 8 i hi]; rfl
+      exact ⟨fun _ => .inl hne, fun _ => hmg⟩
+    storage := fun i d slot p hd hs hp => by
+      rw [hsh.allocs]
+      match i with
+      | 0 => have hp' : p = localPtr wUnionCtx2 0 := Option.some.inj hp.symm; subst hp'; exact hst0 d slot hd hs
+      | 1 => have hp' : p = localPtr wUnionCtx2 1 := Option.some.inj hp.symm; subst hp'; exact hst1 d slot hd hs
+      | 2 => have hp' : p = localPtr wUnionCtx2 2 := Option.some.inj hp.symm; subst hp'; exact hst2 d slot hd hs
+      | 3 => have hp' : p = localPtr wUnionCtx2 3 := Option.some.inj hp.symm; subst hp'; exact hst3 d slot hd hs
+      | 4 => have hp' : p = localPtr wUnionCtx2 4 := Option.some.inj hp.symm; subst hp'; exact hst4 d slot hd hs
+      | 5 => have hp' : p = localPtr wUnionCtx2 5 := Option.some.inj hp.symm; subst hp'; exact hst5 d slot hd hs
+      | 6 => have hp' : p = localPtr wUnionCtx2 6 := Option.some.inj hp.symm; subst hp'; exact hst6 d slot hd hs
+      | 7 => have hp' : p = localPtr wUnionCtx2 7 := Option.some.inj hp.symm; subst hp'; exact hst7 d slot hd hs
+      | n + 8 => simp [wUnionWitnessMir] at hd
+    inj := fun i j p q hp hq hpq => by
+      simp only [localsMap, mapGet_range_map] at hp hq
+      split at hp
+      · split at hq
+        · injection hp with hp; injection hq with hq; subst hp hq
+          simp only [localPtr, wUnionCtx2, List.length_singleton, Option.some.injEq, Prod.mk.injEq] at hpq
+          have h0 : ((1 + i : Nat) : Int) = ((1 + j : Nat) : Int) := congrArg (fun x => x._0) hpq.1
+          omega
+        · nomatch hq
+      · nomatch hp
+    owned := fun id a hA _ hb => by
+      rw [hsh.allocs] at hA
+      have hlen : (wUnionCtx2.base ++ L).length = 9 := by simp [wUnionCtx2, hL_len]
+      have hid_lt : id < 9 := hlen ▸ (List.getElem?_eq_some_iff.mp hA).1
+      have hid_ge : 1 ≤ id := by simpa [wUnionCtx2] using hb
+      refine ⟨id - 1, localPtr wUnionCtx2 (id - 1),
+        mapGet_localsMap wUnionCtx2 8 (id - 1) (by omega), ?_⟩
+      simp only [localPtr, wUnionCtx2, List.length_singleton, Option.some.injEq, Prod.mk.injEq]
+      exact ⟨by congr 1; omega, trivial⟩ }
+  blk := by rw [hs_blk]; exact hb
+  stmt := fun bb hbb => by rw [hs_blk] at hbb; rw [hs_stmt]; exact hk bb hbb
+  stale := ⟨rfl, fun _ hj => absurd rfl hj⟩
+  retLive := fun h0 => hlive_slots 0 .dead h0 rfl
+  ret := fun d hd => by
+    simp [wUnionWitnessMir] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+  baseLow := by unfold BaseLow; decide
+  borrows := by rw [hmem]; rfl
+  callStack := by rw [hmem]; rfl
+  activeCallee := by rw [hmem]; rfl
+  protectors := by rw [hmem]; rfl
+  callerLocals := by rw [hmem]; rfl
+
+private theorem wUnionAuto_storage_fixed (L : List Gen.Allocation)
+    (h1 : L[1]? = some (localAlloc wUnionCtx2 1 ⟨.Unsigned, ⟨4⟩⟩ (List.replicate 4 .Uninit)))
+    (h2 : L[2]? = some (localAlloc wUnionCtx2 2 ⟨.Unsigned, ⟨4⟩⟩ (List.replicate 4 .Uninit)))
+    (h3 : L[3]? = some (localAlloc wUnionCtx2 3 ⟨.Unsigned, ⟨1⟩⟩ []))
+    (h4 : L[4]? = some (localAlloc wUnionCtx2 4 ⟨.Unsigned, ⟨4⟩⟩ wUnionPUBytes55))
+    (h7 : L[7]? = some (localAlloc wUnionCtx2 7 ⟨.Unsigned, ⟨1⟩⟩ [])) :
+    (∀ d slot, wUnionWitnessMir.localDecls[1]? = some d →
+      (some LocalSlot.uninit) = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 1 d slot (localPtr wUnionCtx2 1)) ∧
+    (∀ d slot, wUnionWitnessMir.localDecls[2]? = some d →
+      (some LocalSlot.uninit) = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 2 d slot (localPtr wUnionCtx2 2)) ∧
+    (∀ (slot3 : LocalSlot),
+      (slot3 = .uninit ∨ slot3 = .init (.aggregate 0 (List.replicate 4 .unit)) ∨
+        slot3 = .init (.aggregate 0 (List.replicate 4 (.aggregate 0 [])))) →
+      ∀ d slot, wUnionWitnessMir.localDecls[3]? = some d →
+        some slot3 = some slot →
+        LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+          wUnionWitnessMir.layouts 3 d slot (localPtr wUnionCtx2 3)) ∧
+    (∀ d slot, wUnionWitnessMir.localDecls[4]? = some d →
+      some (LocalSlot.init wUnionPUValU8) = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 4 d slot (localPtr wUnionCtx2 4)) ∧
+    (∀ d slot, wUnionWitnessMir.localDecls[7]? = some d →
+      (some LocalSlot.uninit) = some slot →
+      LocalStorageWithUnions wUnionAutoFn wUnionCtx2 (wUnionCtx2.base ++ L)
+        wUnionWitnessMir.layouts 7 d slot (localPtr wUnionCtx2 7)) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro d slot hd hs
+    injection hd with hd; subst hd; injection hs with hs; subst hs
+    exact .union [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u32)] 4 4 2 (List.replicate 4 .Uninit)
+      rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide) rfl
+      (by simpa [wUnionCtx2, localAlloc, localPtr] using h1) rfl
+  · intro d slot hd hs
+    injection hd with hd; subst hd; injection hs with hs; subst hs
+    exact .union [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u32)] 4 4 3 (List.replicate 4 .Uninit)
+      rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide) rfl
+      (by simpa [wUnionCtx2, localAlloc, localPtr] using h2) rfl
+  · intro slot3 hsl3 d slot hd hs
+    injection hd with hd; subst hd; injection hs with hs; subst hs
+    exact .zstArray 4 4 rfl rfl rfl (by decide) (by decide) (by decide) hsl3
+      (by simpa [wUnionCtx2, localAlloc, localPtr] using h3)
+  · intro d slot hd hs
+    injection hd with hd; subst hd; injection hs with hs; subst hs
+    exact .union
+      [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+      4 4 5 wUnionPUBytes55 rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide)
+      rfl (by simpa [wUnionCtx2, localAlloc, localPtr] using h4) ⟨rfl, _, rfl, rfl, rfl⟩
+  · intro d slot hd hs
+    injection hd with hd; subst hd; injection hs with hs; subst hs
+    exact .zstUninhabited 8 rfl rfl rfl (by decide) (by decide) (by decide) rfl
+      (by simpa [wUnionCtx2, localAlloc, localPtr] using h7)
+
+private def wUnionRunAllocsCopied : List Gen.Allocation :=
+  wUnionAllocs2.set 5 (localAlloc wUnionCtx2 5 ⟨.Unsigned, ⟨4⟩⟩ wUnionPUBytes55)
+
+private def wUnionRunAllocsU8 : List Gen.Allocation :=
+  wUnionRunAllocsCopied.set 6 (localAlloc wUnionCtx2 6 u8 (scalarBytes u8 0x55))
+
+private def wUnionRunAllocsU32 : List Gen.Allocation :=
+  wUnionRunAllocsU8.set 0 (localAlloc wUnionCtx2 0 u32 (scalarBytes u32 0x55))
+
+private def wZstArr4UnitVal : Value := .aggregate 0 (List.replicate 4 .unit)
+
+private def wUnionBb2S : Nat → MachineState
+  | 0 => wUnionRunState 2 2 [.uninit, .uninit, .uninit, .init wZstArr4Val,
+      .init wUnionPUValU8, .uninit, .uninit, .uninit]
+  | 1 => wUnionRunState 2 3 [.uninit, .uninit, .uninit, .init wZstArr4Val,
+      .init wUnionPUValU8, .init wUnionPUValU8, .uninit, .uninit]
+  | 2 => wUnionRunState 2 4 [.uninit, .uninit, .uninit, .init wZstArr4Val,
+      .init wUnionPUValU8, .init wUnionPUValOverlay, .uninit, .uninit]
+  | 3 => wUnionRunState 2 5 [.uninit, .uninit, .uninit, .init wZstArr4UnitVal,
+      .init wUnionPUValU8, .init wUnionPUValOverlay, .uninit, .uninit]
+  | 4 => wUnionRunState 2 6 [.uninit, .uninit, .uninit, .init wZstArr4UnitVal,
+      .init wUnionPUValU8, .init wUnionPUValOverlay, .init (.scalar ⟨0x55, 1⟩), .uninit]
+  | _ => wUnionRunState 2 7 [.init (.scalar ⟨0x55, 4⟩), .uninit, .uninit, .init wZstArr4UnitVal,
+      .init wUnionPUValU8, .init wUnionPUValOverlay, .init (.scalar ⟨0x55, 1⟩), .uninit]
+
+private def wUnionBb2M0 : Mach := wUnionRunMach 2 6 wUnionAllocs2
+
+private theorem wUnionBb2_storage4 :
+    MiniRustUnionLocalStorage wUnionCtx2 wUnionAllocs2 wUnionAutoFn
+      (localsMap wUnionCtx2 8) wUnionLayouts 4 wPUTy
+      [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+      4 4 (.init wUnionPUValU8) wUnionPUBytes55 where
+  pos_size := by decide
+  align_ok := by decide
+  addr_nonneg := by decide
+  addr_lt := by decide
+  fn_local := rfl
+  lm_ptr := rfl
+  bytes_len := rfl
+  alloc_eq := rfl
+  slot_rel := ⟨rfl, _, rfl, rfl, rfl⟩
+
+private theorem wUnionBb2_storage5 :
+    MiniRustUnionLocalStorage wUnionCtx2 wUnionAllocs2 wUnionAutoFn
+      (localsMap wUnionCtx2 8) wUnionLayouts 5 wPUTy
+      [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+      4 4 .uninit (List.replicate 4 .Uninit) where
+  pos_size := by decide
+  align_ok := by decide
+  addr_nonneg := by decide
+  addr_lt := by decide
+  fn_local := rfl
+  lm_ptr := rfl
+  bytes_len := rfl
+  alloc_eq := rfl
+  slot_rel := rfl
+
+private theorem wUnionBb2_rel0 :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb2S 0)
+      (wUnionBb2S 0).frame.locals (localsMap wUnionCtx2 8) 6 wUnionBb2M0 := by
+  have hf := wUnionAuto_storage_fixed wUnionAllocs2 rfl rfl rfl rfl rfl
+  refine wUnionAuto_stateRelAt (b := 2) (k := 2) (L := wUnionAllocs2) rfl rfl (by decide)
+    (fun bb hbb => by simp [wUnionWitnessMir] at hbb; subst hbb; decide) rfl
+    ⟨rfl, rfl, rfl⟩ rfl rfl
+    (fun j sl hj => by
+      match j with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => simp [wUnionBb2S, wUnionRunState] at hj; subst hj; nofun
+      | n + 8 => simp [wUnionBb2S, wUnionRunState] at hj)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨1, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.1 hf.2.1 (hf.2.2.1 _ (.inr (.inr rfl))) hf.2.2.2.1
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact LocalStorageWithUnions.ofMiniRustUnionLocalStorage rfl wUnionBb2_storage5)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨7, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.2.2.2.2
+
+private def wUnionBb2M1 : Mach := (Interp.step wUnionBb2M0).toOption.get (by decide)
+private def wUnionBb2M2 : Mach := (Interp.step wUnionBb2M1).toOption.get (by decide)
+private def wUnionBb2M3 : Mach := (Interp.step wUnionBb2M2).toOption.get (by decide)
+private def wUnionBb2M4 : Mach := (Interp.step wUnionBb2M3).toOption.get (by decide)
+private def wUnionBb2M5 : Mach := (Interp.step wUnionBb2M4).toOption.get (by decide)
+
+private theorem wUnionBb2_step0_whole_copy :
+    stepMirFn wUnionWitnessMir (wUnionBb2S 0) = .tau (.running (wUnionBb2S 1)) ∧
+    Interp.step wUnionBb2M0 = .ok wUnionBb2M1 ∧
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb2S 1)
+      (wUnionBb2S 1).frame.locals (localsMap wUnionCtx2 8) 7 wUnionBb2M1 ∧
+    StateRelWithUnions wUnionWitnessMir wUnionAutoFn wUnionCtx2 (wUnionBb2S 1) wUnionBb2M1 := by
+  obtain ⟨hA, m1, hM, hrel1, hrelU1⟩ :=
+    step_union_whole_copy_stateRelWithUnions (body := wUnionWitnessMir) (f := wUnionAutoFn)
+      (u := 4) (w := 5) (uDecl := wPUDecl) (wDecl := wPUDecl)
+      rfl wUnionBb2_rel0 rfl wUnionBb2_storage4 wUnionBb2_storage5
+      rfl rfl rfl rfl (by decide) rfl rfl nofun rfl rfl rfl (by decide) rfl (by decide)
+  have hm1_eq : m1 = wUnionBb2M1 := by
+    have h0 : Interp.step wUnionBb2M0 = .ok wUnionBb2M1 := rfl
+    rw [h0] at hM; exact (Except.ok.inj hM).symm
+  subst hm1_eq
+  exact ⟨hA, rfl, hrel1, hrelU1⟩
+
+private theorem wUnionBb2_rel2 :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb2S 2)
+      (wUnionBb2S 2).frame.locals (localsMap wUnionCtx2 8) 8 wUnionBb2M2 := by
+  have hf := wUnionAuto_storage_fixed wUnionRunAllocsCopied rfl rfl rfl rfl rfl
+  refine wUnionAuto_stateRelAt (b := 2) (k := 4) (L := wUnionRunAllocsCopied) rfl rfl (by decide)
+    (fun bb hbb => by simp [wUnionWitnessMir] at hbb; subst hbb; decide) rfl
+    ⟨rfl, rfl, rfl⟩ rfl rfl
+    (fun j sl hj => by
+      match j with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => simp [wUnionBb2S, wUnionRunState] at hj; subst hj; nofun
+      | n + 8 => simp [wUnionBb2S, wUnionRunState] at hj)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨1, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.1 hf.2.1 (hf.2.2.1 _ (.inr (.inr rfl))) hf.2.2.2.1
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .union
+        [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+        4 4 6 wUnionPUBytes55 rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide)
+        rfl rfl ⟨rfl, _, rfl, rfl, rfl⟩)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨7, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.2.2.2.2
+
+private theorem wUnionBb2_rel3 :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb2S 3)
+      (wUnionBb2S 3).frame.locals (localsMap wUnionCtx2 8) 9 wUnionBb2M3 := by
+  have hf := wUnionAuto_storage_fixed wUnionRunAllocsCopied rfl rfl rfl rfl rfl
+  refine wUnionAuto_stateRelAt (b := 2) (k := 5) (L := wUnionRunAllocsCopied) rfl rfl (by decide)
+    (fun bb hbb => by simp [wUnionWitnessMir] at hbb; subst hbb; decide) rfl
+    ⟨rfl, rfl, rfl⟩ rfl rfl
+    (fun j sl hj => by
+      match j with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => simp [wUnionBb2S, wUnionRunState] at hj; subst hj; nofun
+      | n + 8 => simp [wUnionBb2S, wUnionRunState] at hj)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨1, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.1 hf.2.1 (hf.2.2.1 _ (.inr (.inl rfl))) hf.2.2.2.1
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .union
+        [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+        4 4 6 wUnionPUBytes55 rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide)
+        rfl rfl ⟨rfl, _, rfl, rfl, rfl⟩)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨7, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.2.2.2.2
+
+private theorem wUnionBb2_rel4 :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb2S 4)
+      (wUnionBb2S 4).frame.locals (localsMap wUnionCtx2 8) 10 wUnionBb2M4 := by
+  have hf := wUnionAuto_storage_fixed wUnionRunAllocsU8 rfl rfl rfl rfl rfl
+  refine wUnionAuto_stateRelAt (b := 2) (k := 6) (L := wUnionRunAllocsU8) rfl rfl (by decide)
+    (fun bb hbb => by simp [wUnionWitnessMir] at hbb; subst hbb; decide) rfl
+    ⟨rfl, rfl, rfl⟩ rfl rfl
+    (fun j sl hj => by
+      match j with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => simp [wUnionBb2S, wUnionRunState] at hj; subst hj; nofun
+      | n + 8 => simp [wUnionBb2S, wUnionRunState] at hj)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨1, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.1 hf.2.1 (hf.2.2.1 _ (.inr (.inl rfl))) hf.2.2.2.1
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .union
+        [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+        4 4 6 wUnionPUBytes55 rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide)
+        rfl rfl ⟨rfl, _, rfl, rfl, rfl⟩)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl ((DeclSlotOk_of_scalarTypeOf rfl _).mpr ⟨rfl, by decide⟩)
+        ⟨7, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.2.2.2.2
+
+private theorem wUnionBb2_rel5 :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb2S 5)
+      (wUnionBb2S 5).frame.locals (localsMap wUnionCtx2 8) 11 wUnionBb2M5 := by
+  have hf := wUnionAuto_storage_fixed wUnionRunAllocsU32 rfl rfl rfl rfl rfl
+  refine wUnionAuto_stateRelAt (b := 2) (k := 7) (L := wUnionRunAllocsU32) rfl rfl (by decide)
+    (fun bb hbb => by simp [wUnionWitnessMir] at hbb; subst hbb; decide) rfl
+    ⟨rfl, rfl, rfl⟩ rfl rfl
+    (fun j sl hj => by
+      match j with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => simp [wUnionBb2S, wUnionRunState] at hj; subst hj; nofun
+      | n + 8 => simp [wUnionBb2S, wUnionRunState] at hj)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl ((DeclSlotOk_of_scalarTypeOf rfl _).mpr ⟨rfl, by decide⟩)
+        ⟨1, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.1 hf.2.1 (hf.2.2.1 _ (.inr (.inl rfl))) hf.2.2.2.1
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .union
+        [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+        4 4 6 wUnionPUBytes55 rfl (by decide) rfl rfl (by decide) (by decide) (by decide) (by decide)
+        rfl rfl ⟨rfl, _, rfl, rfl, rfl⟩)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl ((DeclSlotOk_of_scalarTypeOf rfl _).mpr ⟨rfl, by decide⟩)
+        ⟨7, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.2.2.2.2
+
+private def wUnionBb2Inv (s : MachineState) (m : Mach) : Prop :=
+  (s = wUnionBb2S 0 ∧ m = wUnionBb2M0) ∨
+  (s = wUnionBb2S 1 ∧ m = wUnionBb2M1) ∨
+  (s = wUnionBb2S 2 ∧ m = wUnionBb2M2) ∨
+  (s = wUnionBb2S 3 ∧ m = wUnionBb2M3) ∨
+  (s = wUnionBb2S 4 ∧ m = wUnionBb2M4) ∨
+  (s = wUnionBb2S 5 ∧ m = wUnionBb2M5)
+
+private theorem wUnionBb2Inv_toStateRelWithUnions :
+    ∀ s m, wUnionBb2Inv s m → StateRelWithUnions wUnionWitnessMir wUnionAutoFn wUnionCtx2 s m := by
+  intro s m hi
+  rcases hi with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · exact ⟨[], _, _, 6, wUnionBb2_rel0⟩
+  · exact wUnionBb2_step0_whole_copy.2.2.2
+  · exact ⟨[], _, _, 8, wUnionBb2_rel2⟩
+  · exact ⟨[], _, _, 9, wUnionBb2_rel3⟩
+  · exact ⟨[], _, _, 10, wUnionBb2_rel4⟩
+  · exact ⟨[], _, _, 11, wUnionBb2_rel5⟩
+
+private theorem wUnionBb2Inv_step :
+    ∀ s m, wUnionBb2Inv s m →
+      StepRelWithUnionsInv wUnionBb2Inv wUnionWitnessMir wUnionCtx2 s
+        (stepMirFn wUnionWitnessMir s) m := by
+  intro s m hi
+  rcases hi with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · -- Step 0 (`_5 = copy _4`): discharged via `step_union_whole_copy_stateRelWithUnions`!
+    rw [wUnionBb2_step0_whole_copy.1]
+    exact ⟨1, wUnionBb2M1, Nat.le_refl 1, steps_one wUnionBb2_step0_whole_copy.2.1,
+      .inr (.inl ⟨rfl, rfl⟩)⟩
+  · -- Step 1 (`_5.0 = copy _3`)
+    change StepRelWithUnionsInv wUnionBb2Inv wUnionWitnessMir wUnionCtx2 (wUnionBb2S 1)
+      (.tau (.running (wUnionBb2S 2))) wUnionBb2M1
+    exact ⟨1, wUnionBb2M2, Nat.le_refl 1, rfl, .inr (.inr (.inl ⟨rfl, rfl⟩))⟩
+  · -- Step 2 (`_3 = copy (_5.0)`)
+    change StepRelWithUnionsInv wUnionBb2Inv wUnionWitnessMir wUnionCtx2 (wUnionBb2S 2)
+      (.tau (.running (wUnionBb2S 3))) wUnionBb2M2
+    exact ⟨1, wUnionBb2M3, Nat.le_refl 1, rfl, .inr (.inr (.inr (.inl ⟨rfl, rfl⟩)))⟩
+  · -- Step 3 (`_6 = copy (_5.1)`)
+    change StepRelWithUnionsInv wUnionBb2Inv wUnionWitnessMir wUnionCtx2 (wUnionBb2S 3)
+      (.tau (.running (wUnionBb2S 4))) wUnionBb2M3
+    exact ⟨1, wUnionBb2M4, Nat.le_refl 1, rfl, .inr (.inr (.inr (.inr (.inl ⟨rfl, rfl⟩))))⟩
+  · -- Step 4 (`_0 = _6 as u32`)
+    change StepRelWithUnionsInv wUnionBb2Inv wUnionWitnessMir wUnionCtx2 (wUnionBb2S 4)
+      (.tau (.running (wUnionBb2S 5))) wUnionBb2M4
+    exact ⟨1, wUnionBb2M5, Nat.le_refl 1, rfl, .inr (.inr (.inr (.inr (.inr ⟨rfl, rfl⟩))))⟩
+  · -- Step 5 (`return_`): discharged via `step_return_withUnions` (`deallocAll_sized`)!
+    obtain ⟨hretOk, _⟩ :=
+      step_return_withUnions wUnionBb2_rel5 rfl (bb := wUnionWitnessMir.basicBlocks[2]) rfl rfl rfl
+        rfl rfl rfl (d0 := wU32Decl) rfl rfl rfl
+    obtain ⟨hA, m', hm', hR⟩ := hretOk (.scalar ⟨0x55, 4⟩) rfl
+    rw [hA]
+    exact ⟨1, m', Nat.le_refl 1, steps_one hm', hR⟩
+
+/-- **Multi-step `StateRelWithUnions` normal-return run composition (`R-d`)**:
+Composes `step_union_whole_copy_stateRelWithUnions` (`step_union_whole_copy_minirust_simulation`),
+0-byte `[(); 4]` ZST union arm write/read, `u8` payload read, `u32` cast, and
+`step_return_withUnions` (`evalReturn_withUnions` tearing down the live `mrPU`
+union allocations) via `run_ret_withUnions` on `wUnionAutoFn`
+(`translateFnWithUnions wUnionWitnessMir true = some wUnionAutoFn`), proving
+end-to-end `ReturnRel wUnionWitnessMir wUnionCtx2 s' (.scalar ⟨0x55, 4⟩) m'`. -/
+theorem wUnionAuto_bb2_multi_step_returnRel_run :
+    translateFnWithUnions wUnionWitnessMir true = some wUnionAutoFn ∧
+    ∃ n s' mPre m',
+      Interp.steps n wUnionBb2M0 = .ok m' ∧
+      StateRelWithUnions wUnionWitnessMir wUnionAutoFn wUnionCtx2 s' mPre ∧
+      ReturnRel wUnionWitnessMir wUnionCtx2 s' (.scalar ⟨0x55, 4⟩) m' := by
+  have hret : ReachesRet (mirTree wUnionWitnessMir (wUnionBb2S 0)) []
+      (.normal (.scalar ⟨0x55, 4⟩, (wUnionBb2S 0).memory)) :=
+    runA_sound wUnionWitnessMir 10 _ _ _ rfl
+  exact ⟨wUnionAutoFn_eq,
+    run_ret_withUnions wUnionBb2Inv wUnionBb2Inv_toStateRelWithUnions wUnionBb2Inv_step
+      (wUnionBb2S 0) wUnionBb2M0 (.inl ⟨rfl, rfl⟩) hret⟩
+
+private def wUnionBb3S : Nat → MachineState
+  | 0 => wUnionRunState 3 1 [.uninit, .uninit, .uninit, .uninit,
+      .init wUnionPUValU8, .uninit, .uninit, .uninit]
+  | _ => wUnionRunState 3 2 [.uninit, .uninit, .uninit, .uninit,
+      .init wUnionPUValU8, .init wUnionPUValU8, .uninit, .uninit]
+
+private def wUnionBb3M0 : Mach := wUnionRunMach 3 4 wUnionAllocs2
+private def wUnionBb3M1 : Mach := (Interp.step wUnionBb3M0).toOption.get (by decide)
+
+private theorem wUnionBb3_rel0 :
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb3S 0)
+      (wUnionBb3S 0).frame.locals (localsMap wUnionCtx2 8) 4 wUnionBb3M0 := by
+  have hf := wUnionAuto_storage_fixed wUnionAllocs2 rfl rfl rfl rfl rfl
+  refine wUnionAuto_stateRelAt (b := 3) (k := 1) (L := wUnionAllocs2) rfl rfl (by decide)
+    (fun bb hbb => by simp [wUnionWitnessMir] at hbb; subst hbb; decide) rfl
+    ⟨rfl, rfl, rfl⟩ rfl rfl
+    (fun j sl hj => by
+      match j with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => simp [wUnionBb3S, wUnionRunState] at hj; subst hj; nofun
+      | n + 8 => simp [wUnionBb3S, wUnionRunState] at hj)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨1, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.1 hf.2.1 (hf.2.2.1 _ (.inl rfl)) hf.2.2.2.1
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact LocalStorageWithUnions.ofMiniRustUnionLocalStorage rfl wUnionBb2_storage5)
+    (fun d slot hd hs => by
+      injection hd with hd; subst hd; injection hs with hs; subst hs
+      exact .base rfl rfl (declSlotOk_uninit _ _) ⟨7, rfl, by decide, ⟨by decide, by decide⟩, by decide, .inl (by decide), rfl⟩)
+    hf.2.2.2.2
+
+private theorem wUnionBb3_step0_whole_copy :
+    stepMirFn wUnionWitnessMir (wUnionBb3S 0) = .tau (.running (wUnionBb3S 1)) ∧
+    Interp.step wUnionBb3M0 = .ok wUnionBb3M1 ∧
+    StateRelWithUnionsAt wUnionWitnessMir wUnionAutoFn wUnionCtx2 [] (wUnionBb3S 1)
+      (wUnionBb3S 1).frame.locals (localsMap wUnionCtx2 8) 5 wUnionBb3M1 ∧
+    StateRelWithUnions wUnionWitnessMir wUnionAutoFn wUnionCtx2 (wUnionBb3S 1) wUnionBb3M1 := by
+  obtain ⟨hA, m1, hM, hrel1, hrelU1⟩ :=
+    step_union_whole_copy_stateRelWithUnions (body := wUnionWitnessMir) (f := wUnionAutoFn)
+      (u := 4) (w := 5) (uDecl := wPUDecl) (wDecl := wPUDecl)
+      rfl wUnionBb3_rel0 rfl wUnionBb2_storage4 wUnionBb2_storage5
+      rfl rfl rfl rfl (by decide) rfl rfl nofun rfl rfl rfl (by decide) rfl (by decide)
+  have hm1_eq : m1 = wUnionBb3M1 := by
+    have h0 : Interp.step wUnionBb3M0 = .ok wUnionBb3M1 := rfl
+    rw [h0] at hM; exact (Except.ok.inj hM).symm
+  subst hm1_eq
+  exact ⟨hA, rfl, hrel1, hrelU1⟩
+
+private def wUnionBb3Inv (s : MachineState) (m : Mach) : Prop :=
+  (s = wUnionBb3S 0 ∧ m = wUnionBb3M0) ∨
+  (s = wUnionBb3S 1 ∧ m = wUnionBb3M1)
+
+private theorem wUnionBb3Inv_toStateRelWithUnions :
+    ∀ s m, wUnionBb3Inv s m → StateRelWithUnions wUnionWitnessMir wUnionAutoFn wUnionCtx2 s m := by
+  intro s m hi
+  rcases hi with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · exact ⟨[], _, _, 4, wUnionBb3_rel0⟩
+  · exact wUnionBb3_step0_whole_copy.2.2.2
+
+private theorem wUnionBb3Inv_step :
+    ∀ s m, wUnionBb3Inv s m →
+      StepRelWithUnionsInv wUnionBb3Inv wUnionWitnessMir wUnionCtx2 s
+        (stepMirFn wUnionWitnessMir s) m := by
+  intro s m hi
+  rcases hi with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · rw [wUnionBb3_step0_whole_copy.1]
+    exact ⟨1, wUnionBb3M1, Nat.le_refl 1, steps_one wUnionBb3_step0_whole_copy.2.1,
+      .inr ⟨rfl, rfl⟩⟩
+  · change StepRelWithUnionsInv wUnionBb3Inv wUnionWitnessMir wUnionCtx2 (wUnionBb3S 1)
+      (MirStepNode.fail .ub) wUnionBb3M1
+    exact ⟨1, "load at type but the data in memory violates the language invariant",
+      Nat.le_refl 1, rfl⟩
+
+/-- **Multi-step `StateRelWithUnions` UB run composition (`R-d`)**:
+Composes `step_union_whole_copy_stateRelWithUnions` (`_5 = copy _4`, preserving
+the 3 `.Uninit` padding bytes) followed by `_0 = copy (_5.2: u32)` (`FaultNow`)
+via `run_ub_withUnions` on `wUnionAutoFn`. -/
+theorem wUnionAuto_bb3_multi_step_ub_run :
+    ∃ u,
+      Trusted.ITree.Reaches (mirTree wUnionWitnessMir (wUnionBb3S 0)) [] u ∧
+      Trusted.ITree.FaultNow u ∧
+      ∃ n msg, Interp.steps n wUnionBb3M0 = .error (.ub msg) := by
+  have hobs0 : (mirTree wUnionWitnessMir (wUnionBb3S 0)).observe =
+      .tau (mirTree wUnionWitnessMir (wUnionBb3S 1)) := by
+    simp [mirTree, Trusted.ITree.ITree.observe_cofix, stepMirState, wUnionBb3_step0_whole_copy.1,
+      Trusted.ITree.ITreeF.map]
+  have hreach : Trusted.ITree.Reaches (mirTree wUnionWitnessMir (wUnionBb3S 0)) []
+      (mirTree wUnionWitnessMir (wUnionBb3S 1)) :=
+    .tau hobs0 (.refl _)
+  have hobs1 : (mirTree wUnionWitnessMir (wUnionBb3S 1)).observe =
+      (MirStepNode.fail .ub).map (Trusted.ITree.ITree.cofix (stepMirState wUnionWitnessMir)) := by
+    simp [mirTree, Trusted.ITree.ITree.observe_cofix, stepMirState]
+    rfl
+  have hfault : Trusted.ITree.FaultNow (mirTree wUnionWitnessMir (wUnionBb3S 1)) :=
+    ⟨mirTree wUnionWitnessMir (wUnionBb3S 1), .inl (.fail .ub), _, .refl _, hobs1, trivial⟩
+  exact ⟨mirTree wUnionWitnessMir (wUnionBb3S 1), hreach, hfault,
+    run_ub_withUnions wUnionBb3Inv wUnionBb3Inv_toStateRelWithUnions wUnionBb3Inv_step
+      (wUnionBb3S 0) wUnionBb3M0 (.inl ⟨rfl, rfl⟩) hreach hfault⟩
+
 /-! ## `TerminatorKind.assert` (`assert cond expected target unwind`) Witnesses
 
 `translateFnWithAssert` computes `assertWitnessFn` from `assertWitnessMir`
