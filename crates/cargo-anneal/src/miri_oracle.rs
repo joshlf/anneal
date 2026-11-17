@@ -1796,6 +1796,25 @@ fn build_miri_item_command(
     miri_cmd
 }
 
+fn build_anneal_oracle_capture_command(
+    cargo_bin: &str,
+    corpus_root: &Path,
+    wrapper: &Path,
+    units_dir: &Path,
+    rustflags: &str,
+) -> Command {
+    let mut cmd = Command::new(cargo_bin);
+    cmd.current_dir(corpus_root)
+        .arg("check")
+        .arg("--lib")
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env_remove("RUSTC_WRAPPER")
+        .env(ANNEAL_CAPTURE_DIR_ENV, units_dir)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV);
+    cmd
+}
+
 fn expand_flag_tokens(flags: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for raw in flags {
@@ -2126,19 +2145,19 @@ pub fn run_anneal_oracle(
     };
 
     let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut cmd = Command::new(cargo_bin);
-    cmd.current_dir(&corpus_root);
-    cmd.arg("check").arg("--lib");
     let wrapper = resolve_rustc_wrapper(&driver_cfg);
     let rustflags = if config.capture_rustflags.is_empty() {
         DEFAULT_CAPTURE_RUSTFLAGS.join(" ")
     } else {
         config.capture_rustflags.join(" ")
     };
-    cmd.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
-    cmd.env(ANNEAL_CAPTURE_DIR_ENV, &units_dir);
-    cmd.env("RUSTFLAGS", rustflags);
-    cmd.env_remove(ANNEAL_CAPTURE_FILTER_ENV);
+    let mut cmd = build_anneal_oracle_capture_command(
+        &cargo_bin,
+        &corpus_root,
+        &wrapper,
+        &units_dir,
+        &rustflags,
+    );
 
     let capture_out = cmd
         .output()
@@ -3607,6 +3626,33 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
                 envs.get(OsStr::new(key)),
                 Some(&Some(OsStr::new(value))),
                 "setup_cmd must set {key}"
+            );
+        }
+
+        let capture_cmd = build_anneal_oracle_capture_command(
+            "/usr/bin/cargo",
+            Path::new("/tmp/corpus"),
+            Path::new("/opt/bin/anneal-rustc-capture"),
+            Path::new("/tmp/corpus/.anneal/capture/units"),
+            "-Zmir-opt-level=0",
+        );
+        let capture_envs: BTreeMap<&OsStr, Option<&OsStr>> = capture_cmd.get_envs().collect();
+        for removed in ["RUSTC_WRAPPER", ANNEAL_CAPTURE_FILTER_ENV] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(removed)),
+                Some(&None),
+                "capture_cmd must explicitly remove {removed}"
+            );
+        }
+        for (key, value) in [
+            ("RUSTC_WORKSPACE_WRAPPER", "/opt/bin/anneal-rustc-capture"),
+            (ANNEAL_CAPTURE_DIR_ENV, "/tmp/corpus/.anneal/capture/units"),
+            ("RUSTFLAGS", "-Zmir-opt-level=0"),
+        ] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(key)),
+                Some(&Some(OsStr::new(value))),
+                "capture_cmd must set {key}"
             );
         }
     }

@@ -3099,6 +3099,36 @@ fn resolve_cargo_bin() -> PathBuf {
     PathBuf::from("cargo")
 }
 
+fn build_ensure_rustc_wrapper_command(cargo_bin: &Path, root: &Path) -> Command {
+    let mut cmd = Command::new(cargo_bin);
+    cmd.args(["build", "-p", "anneal-rustc-capture", "--locked"])
+        .current_dir(root)
+        .env_remove("ANNEAL_CAPTURE_DIR")
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cmd
+}
+
+fn build_batch_capture_command(
+    cargo_bin: &Path,
+    corpus_root: &Path,
+    wrapper: &Path,
+    units_dir: &Path,
+    rustflags: &str,
+) -> Command {
+    let mut cmd = Command::new(cargo_bin);
+    cmd.current_dir(corpus_root)
+        .arg("check")
+        .arg("--lib")
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env_remove("RUSTC_WRAPPER")
+        .env("ANNEAL_CAPTURE_DIR", units_dir)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV);
+    cmd
+}
+
 fn ensure_rustc_wrapper(
     driver_cfg: &CaptureDriverConfig,
     anneal_repo_root: Option<&Path>,
@@ -3124,12 +3154,7 @@ fn ensure_rustc_wrapper(
             return Ok(built);
         }
         let cargo_bin = resolve_cargo_bin();
-        let output = Command::new(&cargo_bin)
-            .args(["build", "-p", "anneal-rustc-capture", "--locked"])
-            .current_dir(root)
-            .env_remove("ANNEAL_CAPTURE_DIR")
-            .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        let output = build_ensure_rustc_wrapper_command(&cargo_bin, root)
             .output()
             .map_err(|e| format!("failed to invoke cargo build for anneal-rustc-capture: {e}"))?;
         if output.status.success() && built.is_file() {
@@ -4804,16 +4829,10 @@ fn run_linked_difftest_oracle_pipeline(
         config.capture_rustflags.join(" ")
     };
     let cargo_bin = resolve_cargo_bin();
-    let capture_out = Command::new(&cargo_bin)
-        .current_dir(&corpus_root)
-        .arg("check")
-        .arg("--lib")
-        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
-        .env("ANNEAL_CAPTURE_DIR", &units_dir)
-        .env("RUSTFLAGS", rustflags)
-        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
-        .output()
-        .map_err(|err| format!("failed to execute cargo check on corpus: {err}"))?;
+    let capture_out =
+        build_batch_capture_command(&cargo_bin, &corpus_root, &wrapper, &units_dir, &rustflags)
+            .output()
+            .map_err(|err| format!("failed to execute cargo check on corpus: {err}"))?;
     if !capture_out.status.success() {
         let stderr = String::from_utf8_lossy(&capture_out.stderr);
         return Err(format!(
@@ -11876,6 +11895,49 @@ pub fn cand_shadow() -> u32 {
                 envs.get(OsStr::new(removed)),
                 Some(&None),
                 "build_snippet_rustc_command must remove {removed}"
+            );
+        }
+
+        let wrapper_cmd =
+            build_ensure_rustc_wrapper_command(Path::new("cargo"), Path::new("/tmp/anneal"));
+        let wrapper_envs: BTreeMap<&OsStr, Option<&OsStr>> = wrapper_cmd.get_envs().collect();
+        for removed in [
+            "ANNEAL_CAPTURE_DIR",
+            ANNEAL_CAPTURE_FILTER_ENV,
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(
+                wrapper_envs.get(OsStr::new(removed)),
+                Some(&None),
+                "build_ensure_rustc_wrapper_command must remove {removed}"
+            );
+        }
+
+        let capture_cmd = build_batch_capture_command(
+            Path::new("cargo"),
+            Path::new("/tmp/corpus"),
+            Path::new("/opt/bin/anneal-rustc-capture"),
+            Path::new("/tmp/corpus/units"),
+            "-Zmir-opt-level=0",
+        );
+        let capture_envs: BTreeMap<&OsStr, Option<&OsStr>> = capture_cmd.get_envs().collect();
+        for removed in ["RUSTC_WRAPPER", ANNEAL_CAPTURE_FILTER_ENV] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(removed)),
+                Some(&None),
+                "build_batch_capture_command must remove {removed}"
+            );
+        }
+        for (key, value) in [
+            ("RUSTC_WORKSPACE_WRAPPER", "/opt/bin/anneal-rustc-capture"),
+            ("ANNEAL_CAPTURE_DIR", "/tmp/corpus/units"),
+            ("RUSTFLAGS", "-Zmir-opt-level=0"),
+        ] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(key)),
+                Some(&Some(OsStr::new(value))),
+                "build_batch_capture_command must set {key}"
             );
         }
 
