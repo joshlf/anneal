@@ -66,7 +66,7 @@ open Anneal.OpaqueCalleeTable
 /-! ## `DecidableEq` without `BEq` on the `Trusted` V2026_08_01 types
 
 As for V2026_06_01 (`Anneal.OpaqueCalleeTable`), every instance is `DecidableEq` only; the
-six enumeration-shaped types use `OpaqueCalleeTable.decEqOfCtorIdx`, so no global
+nine enumeration-shaped types use `OpaqueCalleeTable.decEqOfCtorIdx`, so no global
 `Trusted.Rustc.V2026_08_01.….ofNat` auxiliary is ever emitted, and the nested inductive
 `RigidTy` uses an axiom-free Boolean reflection whose diagonal cases unfold by `show`. -/
 
@@ -2797,6 +2797,31 @@ def demandsDynKey (dynKey : DefPath × List RigidTy) (body : CapturedMir) (s : M
   | some k => decide ((k.defPath, k.typeArgs) = dynKey)
   | none => false
 
+/-- Whether the call / tail-call terminator `term` at `s` resolves as a *direct* (`FnDef`) call
+(`target.isIndirect = false`), rather than an indirect `FnPtr` call through `s.memory.fnPtrs`. -/
+def isDirectTerminatorCall (s : MachineState) (term : Terminator)
+    (currentBody : CapturedMir) : Bool :=
+  match term.kind with
+  | .call func argOps _ _ _ =>
+    match resolveCallTarget s func (length argOps) currentBody.localDecls currentBody.layouts with
+    | .ok target _ => !target.isIndirect
+    | _ => false
+  | .tailCall func argOps =>
+    match resolveCallTarget s func (length argOps) currentBody.localDecls currentBody.layouts with
+    | .ok target _ => !target.isIndirect
+    | _ => false
+  | _ => false
+
+/-- Whether the active step at `(body, s)` is a direct (`FnDef`) call terminator. Lowered
+`charon#1611` virtual calls are always direct trait-method calls (`isIndirect = false`); gating
+`DynCallSite` matching on `isDirectCallAt` prevents an indirect `FnPtr` call whose `FnPtrEntry`
+carries a virtual key from hijacking a `DynCallSite` and reading an unrelated `vtableLocal`
+(`canary_indirect_fnptr_virtual_key_not_hijacked`). -/
+def isDirectCallAt (body : CapturedMir) (s : MachineState) : Bool :=
+  match activeTerminator? body s with
+  | some (term, cb) => isDirectTerminatorCall s term cb
+  | none => false
+
 /-- Callee-body compatibility check for a resolved dynamic dispatch target: enforces
 `Terminators.lean`'s `checkCalleeTargetCompatible`, exact argument-count match against the
 evaluated arguments, and ABI compatibility of the actual `CapturedMir` body `calleeBody.fnAbi`
@@ -2809,8 +2834,9 @@ def dynCalleeBodyCompatible (site : DynCallSite) (callTarget : ResolvedCallTarge
     (fnAbiMismatch? site.callerAbi calleeBody.fnAbi).isNone
 
 /-- Terminator step for a resolved dynamic call to `target = (implPath, implTypeArgs)`:
-1. verifies `length argOps = site.callerAbi.args.length` (failing closed `.unsupported` if the
-   site's `callerAbi` disagrees with the MIR call instruction's operand count),
+1. verifies `length argOps = site.callerAbi.args.length` and `!callTarget.isIndirect` (failing
+   closed `.unsupported` if the site's `callerAbi` disagrees with the MIR call instruction's
+   operand count or if the instruction is an indirect `FnPtr` call),
 2. checks `dynCalleeBodyCompatible` on a `resolve` hit (faulting `.ub` if `tbl`'s `CapturedMir`
    body contradicts `site.callerAbi`), and
 3. on a `resolve` miss (`none`), emits `MirStepNode.extCall` with the **resolved vtable target**
@@ -2827,22 +2853,25 @@ def stepDynTerminator (resolve : CalleeResolver) (site : DynCallSite)
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok callTarget localsAfterFunc =>
-        match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            cb.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok argVals locals' =>
-          match resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
-          | .some calleeBody =>
-            if dynCalleeBodyCompatible site callTarget calleeBody (length argVals) then
-              MirStepNode.step
-                (pushCalleeFrame s cb locals' destination targetBb calleeBody argVals unwind)
-            else
-              MirStepNode.fail .ub
-          | .none =>
-            MirStepNode.extCall
-              { defPath := target.1, typeArgs := target.2, args := argVals, memory := s.memory }
-              (resumeExternalCall s locals' destination targetBb unwind)
+        if callTarget.isIndirect then
+          MirStepNode.unsupported
+        else
+          match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+              cb.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+          | .ok argVals locals' =>
+            match resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
+            | .some calleeBody =>
+              if dynCalleeBodyCompatible site callTarget calleeBody (length argVals) then
+                MirStepNode.step
+                  (pushCalleeFrame s cb locals' destination targetBb calleeBody argVals unwind)
+              else
+                MirStepNode.fail .ub
+            | .none =>
+              MirStepNode.extCall
+                { defPath := target.1, typeArgs := target.2, args := argVals, memory := s.memory }
+                (resumeExternalCall s locals' destination targetBb unwind)
     else
       MirStepNode.unsupported
   | .call func argOps destination .none unwind =>
@@ -2851,22 +2880,25 @@ def stepDynTerminator (resolve : CalleeResolver) (site : DynCallSite)
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok callTarget localsAfterFunc =>
-        match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            cb.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok argVals locals' =>
-          match resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
-          | .some calleeBody =>
-            if dynCalleeBodyCompatible site callTarget calleeBody (length argVals) then
-              MirStepNode.step
-                (pushDivergingCalleeFrame s cb locals' destination unwind calleeBody argVals)
-            else
-              MirStepNode.fail .ub
-          | .none =>
-            MirStepNode.extCall
-              { defPath := target.1, typeArgs := target.2, args := argVals, memory := s.memory }
-              (resumeExternalDivergingCall s locals' unwind)
+        if callTarget.isIndirect then
+          MirStepNode.unsupported
+        else
+          match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+              cb.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+          | .ok argVals locals' =>
+            match resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
+            | .some calleeBody =>
+              if dynCalleeBodyCompatible site callTarget calleeBody (length argVals) then
+                MirStepNode.step
+                  (pushDivergingCalleeFrame s cb locals' destination unwind calleeBody argVals)
+              else
+                MirStepNode.fail .ub
+            | .none =>
+              MirStepNode.extCall
+                { defPath := target.1, typeArgs := target.2, args := argVals, memory := s.memory }
+                (resumeExternalDivergingCall s locals' unwind)
     else
       MirStepNode.unsupported
   | .tailCall func argOps =>
@@ -2875,44 +2907,53 @@ def stepDynTerminator (resolve : CalleeResolver) (site : DynCallSite)
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok callTarget localsAfterFunc =>
-        match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            cb.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok argVals _ =>
-          let depth := length s.memory.callStack
-          let nLocals := length s.frame.locals
-          match hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
-              depth nLocals with
-          | true => MirStepNode.fail .ub
-          | false =>
-            let memAfterTeardown : Memory :=
-              { s.memory with borrows := disableFrameBorrows s.memory.borrows depth nLocals }
-            match resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
-            | .some calleeBody =>
-              if dynCalleeBodyCompatible site callTarget calleeBody (length argVals) then
-                MirStepNode.step (enterTailCalleeFrame memAfterTeardown calleeBody argVals)
-              else
-                MirStepNode.fail .ub
-            | .none =>
-              MirStepNode.extCall
-                { defPath := target.1, typeArgs := target.2, args := argVals,
-                  memory := memAfterTeardown }
-                resumeExternalTailCall
+        if callTarget.isIndirect then
+          MirStepNode.unsupported
+        else
+          match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+              cb.layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+          | .ok argVals _ =>
+            let depth := length s.memory.callStack
+            let nLocals := length s.frame.locals
+            match hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+                depth nLocals with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let memAfterTeardown : Memory :=
+                { s.memory with borrows := disableFrameBorrows s.memory.borrows depth nLocals }
+              match resolve cb.layouts callTarget.defPath callTarget.typeArgs
+                  s.memory.traitImpls with
+              | .some calleeBody =>
+                if dynCalleeBodyCompatible site callTarget calleeBody (length argVals) then
+                  MirStepNode.step (enterTailCalleeFrame memAfterTeardown calleeBody argVals)
+                else
+                  MirStepNode.fail .ub
+              | .none =>
+                MirStepNode.extCall
+                  { defPath := target.1, typeArgs := target.2, args := argVals,
+                    memory := memAfterTeardown }
+                  resumeExternalTailCall
     else
       MirStepNode.unsupported
   | _ => MirStepNode.unsupported
 
 /-- Target-redirected branch-pruned step for a resolved dynamic dispatch target `target`:
-executes `stepDynTerminator` when `s` demands `site.dynKey`, and `stepBranchPruned tbl.lookup`
-on all other steps. -/
+when `s` demands `site.dynKey`, verifies `site.matchesLoc body s` (failing closed `.unsupported`
+outside `site`'s function/block scope so even eager `dynDispatchStep` never hijacks a foreign
+callee frame or another SSA block) before executing `stepDynTerminator`; steps via
+`stepBranchPruned tbl.lookup` on all other steps. -/
 def stepDynPruned (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (target : DefPath × List RigidTy) (body : CapturedMir) (s : MachineState) : MirStepNode :=
   if demandsDynKey site.dynKey body s then
-    match activeTerminator? body s with
-    | some (term, cb) =>
-      stepDynTerminator (redirectResolver tbl site.dynKey target) site target s term cb
-    | none => MirStepNode.unsupported
+    if site.matchesLoc body s then
+      match activeTerminator? body s with
+      | some (term, cb) =>
+        stepDynTerminator (redirectResolver tbl site.dynKey target) site target s term cb
+      | none => MirStepNode.unsupported
+    else
+      MirStepNode.unsupported
   else
     stepBranchPruned tbl.lookup body s
 
@@ -2926,11 +2967,18 @@ theorem stepDynTerminator_congr {r₁ r₂ : CalleeResolver} (site : DynCallSite
     by_cases har : length argOps = site.callerAbi.args.length
     · cases hrt : resolveCallTarget s func (length argOps) cb.localDecls cb.layouts with
       | ok callTarget locals =>
-        have hk := h ⟨cb.layouts, callTarget.defPath, callTarget.typeArgs, s.memory.traitImpls⟩
-          (by simp only [terminatorKey?, hrt])
-        simp only [CalleeKey.apply] at hk
-        cases tgt <;>
-          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hk]
+        cases hind : callTarget.isIndirect with
+        | true =>
+          cases tgt <;>
+            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+              ite_true]
+        | false =>
+          have hk := h ⟨cb.layouts, callTarget.defPath, callTarget.typeArgs, s.memory.traitImpls⟩
+            (by simp only [terminatorKey?, hrt])
+          simp only [CalleeKey.apply] at hk
+          cases tgt <;>
+            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+              Bool.false_eq_true, ite_false, hk]
       | ub =>
         cases tgt <;> simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt]
       | unsupported =>
@@ -2940,10 +2988,16 @@ theorem stepDynTerminator_congr {r₁ r₂ : CalleeResolver} (site : DynCallSite
     by_cases har : length argOps = site.callerAbi.args.length
     · cases hrt : resolveCallTarget s func (length argOps) cb.localDecls cb.layouts with
       | ok callTarget locals =>
-        have hk := h ⟨cb.layouts, callTarget.defPath, callTarget.typeArgs, s.memory.traitImpls⟩
-          (by simp only [terminatorKey?, hrt])
-        simp only [CalleeKey.apply] at hk
-        simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hk]
+        cases hind : callTarget.isIndirect with
+        | true =>
+          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+            ite_true]
+        | false =>
+          have hk := h ⟨cb.layouts, callTarget.defPath, callTarget.typeArgs, s.memory.traitImpls⟩
+            (by simp only [terminatorKey?, hrt])
+          simp only [CalleeKey.apply] at hk
+          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+            Bool.false_eq_true, ite_false, hk]
       | ub => simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt]
       | unsupported => simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt]
     · simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)]
@@ -2960,12 +3014,16 @@ theorem stepDynPruned_congr {narrowTbl fullTbl : OpaqueCalleeTable} (site : DynC
   cases hd : demandsDynKey site.dynKey body s with
   | true =>
     simp only [ite_true]
-    cases hact : activeTerminator? body s with
-    | none => rfl
-    | some p =>
-      rcases p with ⟨term, cb⟩
-      exact stepDynTerminator_congr site target s term cb fun k hk =>
-        h k (by simp [demandedKey?, hact, hk])
+    cases hloc : site.matchesLoc body s with
+    | false => rfl
+    | true =>
+      simp only [ite_true]
+      cases hact : activeTerminator? body s with
+      | none => rfl
+      | some p =>
+        rcases p with ⟨term, cb⟩
+        exact stepDynTerminator_congr site target s term cb fun k hk =>
+          h k (by simp [demandedKey?, hact, hk])
   | false =>
     simp only [Bool.false_eq_true, ite_false]
     apply stepBranchPruned_congr
@@ -2992,19 +3050,24 @@ theorem stepDynTerminator_frames (resolve : CalleeResolver) (site : DynCallSite)
         | unsupported => exact True.intro
         | ok callTarget locals =>
           dsimp only
-          cases evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
-              s.memory.callerLocals (callStack := s.memory.callStack) with
-          | ub => exact True.intro
-          | unsupported => exact True.intro
-          | ok argVals locals' =>
-            dsimp only
-            cases resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
-            | none => exact True.intro
-            | some calleeBody =>
+          cases callTarget.isIndirect with
+          | true => exact True.intro
+          | false =>
+            simp only [Bool.false_eq_true, ite_false]
+            cases evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
+                s.memory.callerLocals (callStack := s.memory.callStack) with
+            | ub => exact True.intro
+            | unsupported => exact True.intro
+            | ok argVals locals' =>
               dsimp only
-              split
-              · exact ⟨rfl, rfl⟩
-              · exact True.intro
+              cases resolve cb.layouts callTarget.defPath callTarget.typeArgs
+                  s.memory.traitImpls with
+              | none => exact True.intro
+              | some calleeBody =>
+                dsimp only
+                split
+                · exact ⟨rfl, rfl⟩
+                · exact True.intro
       · exact True.intro
   | tailCall func argOps =>
     dsimp only [stepDynTerminator]
@@ -3014,24 +3077,29 @@ theorem stepDynTerminator_frames (resolve : CalleeResolver) (site : DynCallSite)
       | unsupported => exact True.intro
       | ok callTarget locals =>
         dsimp only
-        cases evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
-        | ub => exact True.intro
-        | unsupported => exact True.intro
-        | ok argVals locals' =>
-          dsimp only
-          cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
-              (length s.memory.callStack) (length s.frame.locals) with
-          | true => exact True.intro
-          | false =>
+        cases callTarget.isIndirect with
+        | true => exact True.intro
+        | false =>
+          simp only [Bool.false_eq_true, ite_false]
+          cases evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
+              s.memory.callerLocals (callStack := s.memory.callStack) with
+          | ub => exact True.intro
+          | unsupported => exact True.intro
+          | ok argVals locals' =>
             dsimp only
-            cases resolve cb.layouts callTarget.defPath callTarget.typeArgs s.memory.traitImpls with
-            | none => exact True.intro
-            | some calleeBody =>
+            cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+                (length s.memory.callStack) (length s.frame.locals) with
+            | true => exact True.intro
+            | false =>
               dsimp only
-              split
-              · exact ⟨rfl, rfl⟩
-              · exact True.intro
+              cases resolve cb.layouts callTarget.defPath callTarget.typeArgs
+                  s.memory.traitImpls with
+              | none => exact True.intro
+              | some calleeBody =>
+                dsimp only
+                split
+                · exact ⟨rfl, rfl⟩
+                · exact True.intro
     · exact True.intro
   | _ => exact True.intro
 
@@ -3042,18 +3110,22 @@ theorem stepDynPruned_frames (tbl : OpaqueCalleeTable) (site : DynCallSite)
   cases demandsDynKey site.dynKey body s with
   | true =>
     simp only [ite_true]
-    cases activeTerminator? body s with
-    | none => exact True.intro
-    | some p => exact stepDynTerminator_frames _ site target s p.1 p.2
+    cases site.matchesLoc body s with
+    | false => exact True.intro
+    | true =>
+      simp only [ite_true]
+      cases activeTerminator? body s with
+      | none => exact True.intro
+      | some p => exact stepDynTerminator_frames _ site target s p.1 p.2
   | false => exact stepBranchPruned_frames tbl.lookup body s
 
-/-- **A successful dynamic call step is the trusted call step**: every `.step` that
-`stepDynTerminator` takes — pushing the resolved callee's frame (returning or diverging
-`.call`) or entering it in place (`.tailCall`) — is exactly the step of the resolver-parametric
-copy of the trusted terminator, `stepTerminatorWith`, under the same resolver. The dynamic
-terminator only *adds* failure edges (operand-count mismatch against `site.callerAbi`, linked
-callee-body ABI/arity mismatch) and names the vtable-resolved target in an unlinked external
-call; it never takes a step the trusted semantics would not. -/
+/-- **A successful dynamic call step is a direct (`!isIndirect`) trusted call step**: every `.step`
+that `stepDynTerminator` takes — pushing the resolved callee's frame (returning or diverging
+`.call`) or entering it in place (`.tailCall`) — is a direct (`FnDef`) call whose step equals the
+resolver-parametric copy of the trusted terminator, `stepTerminatorWith`, under the same resolver.
+The dynamic terminator only *adds* failure edges (operand-count mismatch against `site.callerAbi`,
+indirect `FnPtr` rejection, linked callee-body ABI/arity mismatch) and names the vtable-resolved
+target in an unlinked external call; it never takes a step the trusted semantics would not. -/
 theorem stepTerminatorWith_of_stepDynTerminator_step {resolve : CalleeResolver}
     {site : DynCallSite} {target : DefPath × List RigidTy} {s s' : MachineState}
     {term : Terminator} {cb : CapturedMir} (prune : Bool)
@@ -3073,43 +3145,50 @@ theorem stepTerminatorWith_of_stepDynTerminator_step {resolve : CalleeResolver}
           simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt] at h <;>
           simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
       | ok callTarget locals =>
-        cases hev : evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
-        | ub =>
+        cases hind : callTarget.isIndirect with
+        | true =>
           cases tgt <;>
-            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
-              hev] at h <;>
-            simp [MirStepNode.fail, MirStepNode.step] at h
-        | unsupported =>
-          cases tgt <;>
-            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
-              hev] at h <;>
+            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+              ite_true] at h <;>
             simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
-        | ok argVals locals' =>
-          cases hres : resolve cb.layouts callTarget.defPath callTarget.typeArgs
-              s.memory.traitImpls with
-          | none =>
+        | false =>
+          cases hev : evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
+              s.memory.callerLocals (callStack := s.memory.callStack) with
+          | ub =>
             cases tgt <;>
-              simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev,
-                hres] at h <;>
-              simp [MirStepNode.extCall, MirStepNode.step] at h
-          | some calleeBody =>
-            cases hcomp : dynCalleeBodyCompatible site callTarget calleeBody (length argVals) with
-            | false =>
+              simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+                Bool.false_eq_true, ite_false, hev] at h <;>
+              simp [MirStepNode.fail, MirStepNode.step] at h
+          | unsupported =>
+            cases tgt <;>
+              simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+                Bool.false_eq_true, ite_false, hev] at h <;>
+              simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+          | ok argVals locals' =>
+            cases hres : resolve cb.layouts callTarget.defPath callTarget.typeArgs
+                s.memory.traitImpls with
+            | none =>
               cases tgt <;>
-                simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
-                  hev, hres, hcomp, Bool.false_eq_true, ite_false] at h <;>
-                simp [MirStepNode.fail, MirStepNode.step] at h
-            | true =>
-              have hchk : checkCalleeTargetCompatible callTarget calleeBody (length argVals) =
-                  true := by
-                unfold dynCalleeBodyCompatible at hcomp
-                simp only [Bool.and_eq_true] at hcomp
-                exact hcomp.1.1
-              cases tgt <;>
-                simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev,
-                  hres, hcomp, ite_true] at h <;>
-                simp only [stepTerminatorWith, bodyLocalDeclsOf, hrt, hev, hres, hchk, h]
+                simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+                  Bool.false_eq_true, ite_false, hev, hres] at h <;>
+                simp [MirStepNode.extCall, MirStepNode.step] at h
+            | some calleeBody =>
+              cases hcomp : dynCalleeBodyCompatible site callTarget calleeBody (length argVals) with
+              | false =>
+                cases tgt <;>
+                  simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
+                    hind, Bool.false_eq_true, ite_false, hev, hres, hcomp] at h <;>
+                  simp [MirStepNode.fail, MirStepNode.step] at h
+              | true =>
+                have hchk : checkCalleeTargetCompatible callTarget calleeBody (length argVals) =
+                    true := by
+                  unfold dynCalleeBodyCompatible at hcomp
+                  simp only [Bool.and_eq_true] at hcomp
+                  exact hcomp.1.1
+                cases tgt <;>
+                  simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
+                    hind, Bool.false_eq_true, ite_false, hev, hres, hcomp, ite_true] at h <;>
+                  simp only [stepTerminatorWith, bodyLocalDeclsOf, hrt, hev, hres, hchk, h]
     · cases tgt <;>
         simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)] at h <;>
         simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
@@ -3123,49 +3202,127 @@ theorem stepTerminatorWith_of_stepDynTerminator_step {resolve : CalleeResolver}
         simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt] at h
         simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
       | ok callTarget locals =>
-        cases hev : evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
-        | ub =>
-          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev] at h
-          simp [MirStepNode.fail, MirStepNode.step] at h
-        | unsupported =>
-          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev] at h
+        cases hind : callTarget.isIndirect with
+        | true =>
+          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+            ite_true] at h
           simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
-        | ok argVals locals' =>
-          cases hpc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
-              (length s.memory.callStack) (length s.frame.locals) with
-          | true =>
-            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev,
-              hpc] at h
+        | false =>
+          cases hev : evalOperands locals argOps s.memory.borrows s.memory.globals cb.layouts
+              s.memory.callerLocals (callStack := s.memory.callStack) with
+          | ub =>
+            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+              Bool.false_eq_true, ite_false, hev] at h
             simp [MirStepNode.fail, MirStepNode.step] at h
-          | false =>
-            cases hres : resolve cb.layouts callTarget.defPath callTarget.typeArgs
-                s.memory.traitImpls with
-            | none =>
-              simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev,
-                hpc, hres] at h
-              simp [MirStepNode.extCall, MirStepNode.step] at h
-            | some calleeBody =>
-              cases hcomp : dynCalleeBodyCompatible site callTarget calleeBody (length argVals) with
-              | false =>
-                simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev,
-                  hpc, hres, hcomp, Bool.false_eq_true, ite_false] at h
-                simp [MirStepNode.fail, MirStepNode.step] at h
-              | true =>
-                have hchk : checkCalleeTargetCompatible callTarget calleeBody (length argVals) =
-                    true := by
-                  unfold dynCalleeBodyCompatible at hcomp
-                  simp only [Bool.and_eq_true] at hcomp
-                  exact hcomp.1.1
-                simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hev,
-                  hpc, hres, hcomp, ite_true] at h
-                simp only [stepTerminatorWith, tailCallWith, bodyLocalDeclsOf, hrt, hev, hpc,
-                  hres, hchk, h]
+          | unsupported =>
+            simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+              Bool.false_eq_true, ite_false, hev] at h
+            simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+          | ok argVals locals' =>
+            cases hpc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+                (length s.memory.callStack) (length s.frame.locals) with
+            | true =>
+              simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+                Bool.false_eq_true, ite_false, hev, hpc] at h
+              simp [MirStepNode.fail, MirStepNode.step] at h
+            | false =>
+              cases hres : resolve cb.layouts callTarget.defPath callTarget.typeArgs
+                  s.memory.traitImpls with
+              | none =>
+                simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hind,
+                  Bool.false_eq_true, ite_false, hev, hpc, hres] at h
+                simp [MirStepNode.extCall, MirStepNode.step] at h
+              | some calleeBody =>
+                cases hcomp : dynCalleeBodyCompatible site callTarget calleeBody (length argVals) with
+                | false =>
+                  simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
+                    hind, Bool.false_eq_true, ite_false, hev, hpc, hres, hcomp] at h
+                  simp [MirStepNode.fail, MirStepNode.step] at h
+                | true =>
+                  have hchk : checkCalleeTargetCompatible callTarget calleeBody (length argVals) =
+                      true := by
+                    unfold dynCalleeBodyCompatible at hcomp
+                    simp only [Bool.and_eq_true] at hcomp
+                    exact hcomp.1.1
+                  simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
+                    hind, Bool.false_eq_true, ite_false, hev, hpc, hres, hcomp, ite_true] at h
+                  simp only [stepTerminatorWith, tailCallWith, bodyLocalDeclsOf, hrt, hev, hpc,
+                    hres, hchk, h]
     · simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)] at h
       simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
   | _ =>
     simp only [stepDynTerminator] at h
     simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+
+/-- Whenever `isDirectTerminatorCall s term cb = false` (a non-call terminator, an unresolvable
+call target, or an indirect `FnPtr` call), `stepDynTerminator` faults (`.ub` or fail-closed
+`.unsupported`) — never stepping or emitting an external call. -/
+theorem stepDynTerminator_of_not_directCall (resolve : CalleeResolver) (site : DynCallSite)
+    (target : DefPath × List RigidTy) (s : MachineState) (term : Terminator) (cb : CapturedMir)
+    (hnd : isDirectTerminatorCall s term cb = false) :
+    ∃ fk, viewStepNode (stepDynTerminator resolve site target s term cb) = .fault fk := by
+  obtain ⟨kind, span⟩ := term
+  cases kind with
+  | call func argOps destination tgt unwind =>
+    unfold isDirectTerminatorCall at hnd
+    by_cases har : length argOps = site.callerAbi.args.length
+    · cases hrt : resolveCallTarget s func (length argOps) cb.localDecls cb.layouts with
+      | ub =>
+        refine ⟨.ub, ?_⟩
+        cases tgt <;>
+          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt] <;>
+          rfl
+      | unsupported =>
+        refine ⟨.unsupported, ?_⟩
+        cases tgt <;>
+          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt] <;>
+          rfl
+      | ok callTarget locals =>
+        simp only [hrt, Bool.not_eq_false'] at hnd
+        refine ⟨.unsupported, ?_⟩
+        cases tgt <;>
+          simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hnd,
+            ite_true] <;>
+          rfl
+    · refine ⟨.unsupported, ?_⟩
+      cases tgt <;>
+        simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)] <;>
+        rfl
+  | tailCall func argOps =>
+    unfold isDirectTerminatorCall at hnd
+    by_cases har : length argOps = site.callerAbi.args.length
+    · cases hrt : resolveCallTarget s func (length argOps) cb.localDecls cb.layouts with
+      | ub =>
+        refine ⟨.ub, ?_⟩
+        simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt]
+        rfl
+      | unsupported =>
+        refine ⟨.unsupported, ?_⟩
+        simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt]
+        rfl
+      | ok callTarget locals =>
+        simp only [hrt, Bool.not_eq_false'] at hnd
+        refine ⟨.unsupported, ?_⟩
+        simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt, hnd, ite_true]
+        rfl
+    · refine ⟨.unsupported, ?_⟩
+      simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)]
+      rfl
+  | _ =>
+    exact ⟨.unsupported, rfl⟩
+
+/-- Every successful `.step` of `stepDynTerminator` is a direct (`!isIndirect`) call terminator. -/
+theorem isDirectTerminatorCall_of_stepDynTerminator_step {resolve : CalleeResolver}
+    {site : DynCallSite} {target : DefPath × List RigidTy} {s s' : MachineState}
+    {term : Terminator} {cb : CapturedMir}
+    (h : stepDynTerminator resolve site target s term cb = MirStepNode.step s') :
+    isDirectTerminatorCall s term cb = true := by
+  cases hd : isDirectTerminatorCall s term cb with
+  | true => rfl
+  | false =>
+    obtain ⟨fk, hfk⟩ := stepDynTerminator_of_not_directCall resolve site target s term cb hd
+    rw [h] at hfk
+    simp [MirStepNode.step, viewStepNode] at hfk
 
 /-- **Exhaustive `StepView` classification of `stepDynTerminator`** (unconditional, with no output
 hypothesis): at *every* state and terminator, `stepDynTerminator` exclusively:
@@ -3404,31 +3561,6 @@ theorem dynDispatchStep_frames (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable
 
 /-! ### Demand-gated dynamic dispatch -/
 
-/-- Whether the call / tail-call terminator `term` at `s` resolves as a *direct* (`FnDef`) call
-(`target.isIndirect = false`), rather than an indirect `FnPtr` call through `s.memory.fnPtrs`. -/
-def isDirectTerminatorCall (s : MachineState) (term : Terminator)
-    (currentBody : CapturedMir) : Bool :=
-  match term.kind with
-  | .call func argOps _ _ _ =>
-    match resolveCallTarget s func (length argOps) currentBody.localDecls currentBody.layouts with
-    | .ok target _ => !target.isIndirect
-    | _ => false
-  | .tailCall func argOps =>
-    match resolveCallTarget s func (length argOps) currentBody.localDecls currentBody.layouts with
-    | .ok target _ => !target.isIndirect
-    | _ => false
-  | _ => false
-
-/-- Whether the active step at `(body, s)` is a direct (`FnDef`) call terminator. Lowered
-`charon#1611` virtual calls are always direct trait-method calls (`isIndirect = false`); gating
-`DynCallSite` matching on `isDirectCallAt` prevents an indirect `FnPtr` call whose `FnPtrEntry`
-carries a virtual key from hijacking a `DynCallSite` and reading an unrelated `vtableLocal`
-(`canary_indirect_fnptr_virtual_key_not_hijacked`). -/
-def isDirectCallAt (body : CapturedMir) (s : MachineState) : Bool :=
-  match activeTerminator? body s with
-  | some (term, cb) => isDirectTerminatorCall s term cb
-  | none => false
-
 /-- Whether the next step at `s` demands the `dyn` call site `site` (a direct call matching both
 `site.dynKey` and `site.matchesLoc body s`). -/
 def demandsDynSite (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
@@ -3511,20 +3643,106 @@ theorem stepBranchPruned_redirect_of_stepDynPruned_step {tbl : OpaqueCalleeTable
   cases hd : demandsDynKey site.dynKey body s with
   | true =>
     simp only [hd, ite_true] at h
-    cases hact : activeTerminator? body s with
-    | none =>
-      simp only [hact] at h
+    cases hloc : site.matchesLoc body s with
+    | false =>
+      simp only [hloc, Bool.false_eq_true, ite_false] at h
       simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
-    | some p =>
-      obtain ⟨term, cb⟩ := p
-      simp only [hact] at h
-      unfold stepBranchPruned
-      rw [stepMirFnWith_of_activeTerminator _ hact]
-      exact stepTerminatorWith_of_stepDynTerminator_step true h
+    | true =>
+      simp only [hloc, ite_true] at h
+      cases hact : activeTerminator? body s with
+      | none =>
+        simp only [hact] at h
+        simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+      | some p =>
+        obtain ⟨term, cb⟩ := p
+        simp only [hact] at h
+        unfold stepBranchPruned
+        rw [stepMirFnWith_of_activeTerminator _ hact]
+        exact stepTerminatorWith_of_stepDynTerminator_step true h
   | false =>
     simp only [hd, Bool.false_eq_true, ite_false] at h
     rw [stepBranchPruned_redirect_of_not_demanded tbl site body s target hd]
     exact h
+
+/-- Out-of-scope calls to `site.dynKey` (`site.matchesLoc body s = false`, including foreign callee
+frames for an unscoped site or other SSA blocks for a block-scoped site) fail closed even under raw
+`stepDynPruned`. -/
+theorem stepDynPruned_of_not_matchesLoc (tbl : OpaqueCalleeTable) (site : DynCallSite)
+    (target : DefPath × List RigidTy) (body : CapturedMir) (s : MachineState)
+    (hd : demandsDynKey site.dynKey body s = true) (hloc : site.matchesLoc body s = false) :
+    stepDynPruned tbl site target body s = MirStepNode.unsupported := by
+  simp [stepDynPruned, hd, hloc]
+
+/-- Whenever `stepDynPruned` advances to `.step s'` on a call to `site.dynKey`, `s` is a *direct*
+call within `site`'s scope (`demandsDynSite site body s = true`). -/
+theorem demandsDynSite_of_stepDynPruned_step {tbl : OpaqueCalleeTable} {site : DynCallSite}
+    {target : DefPath × List RigidTy} {body : CapturedMir} {s s' : MachineState}
+    (hd : demandsDynKey site.dynKey body s = true)
+    (h : stepDynPruned tbl site target body s = MirStepNode.step s') :
+    demandsDynSite site body s = true := by
+  unfold stepDynPruned at h
+  simp only [hd, ite_true] at h
+  cases hloc : site.matchesLoc body s with
+  | false =>
+    simp only [hloc, Bool.false_eq_true, ite_false] at h
+    simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+  | true =>
+    simp only [hloc, ite_true] at h
+    cases hact : activeTerminator? body s with
+    | none =>
+      rw [hact] at h
+      simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+    | some p =>
+      rcases p with ⟨term, cb⟩
+      rw [hact] at h
+      have hdir : isDirectCallAt body s = true := by
+        simp only [isDirectCallAt, hact]
+        exact isDirectTerminatorCall_of_stepDynTerminator_step h
+      unfold demandsDynKey at hd
+      cases hk : demandedKey? body s with
+      | none => rw [hk] at hd; nomatch hd
+      | some k =>
+        rw [hk] at hd
+        simp [demandsDynSite, hk, hdir, hd, hloc]
+
+/-- Whenever eager `dynDispatchStep` advances to `.step s'` on a call to `site.dynKey`, `s` is a
+direct call inside `site`'s scope (`demandsDynSite site body s = true`): eager `dynDispatchStep`
+can never hijack an indirect `FnPtr` call, a foreign callee frame, or another SSA block. -/
+theorem demandsDynSite_of_dynDispatchStep_step {env : CompilerQueryEnv} {tbl : OpaqueCalleeTable}
+    {site : DynCallSite} {body : CapturedMir} {s s' : MachineState}
+    (hd : demandsDynKey site.dynKey body s = true)
+    (h : dynDispatchStep env tbl site body s = MirStepNode.step s') :
+    demandsDynSite site body s = true := by
+  unfold dynDispatchStep at h
+  cases hwf : site.wellFormed with
+  | false =>
+    simp only [hwf, Bool.false_eq_true, ite_false] at h
+    simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+  | true =>
+    simp only [hwf, ite_true] at h
+    cases hvt : site.vtablePtr? s with
+    | none =>
+      simp only [hvt] at h
+      simp [MirStepNode.fail, MirStepNode.step] at h
+    | some vt =>
+      simp only [hvt] at h
+      cases hr : resolveDynTarget env site vt with
+      | ok target =>
+        simp only [hr] at h
+        cases hta : vtableTargetAgrees site target with
+        | false =>
+          simp only [hta, Bool.false_eq_true, ite_false] at h
+          simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
+        | true =>
+          simp only [hta, ite_true] at h
+          exact demandsDynSite_of_stepDynPruned_step hd h
+      | err e =>
+        simp only [hr] at h
+        cases e <;> simp [MirStepNode.retOutcome, MirStepNode.unsupported, MirStepNode.fail,
+          MirStepNode.step] at h
+      | unsupported m =>
+        simp only [hr] at h
+        simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
 
 /-- **Specification of a successful dynamic-dispatch step**: if `dynDispatchStep` advances to
 `s'`, then the site is well formed, the receiver's vtable pointer `vt` (start of a non-stack
@@ -4212,6 +4430,220 @@ theorem DynCallRegistry.findSiteAt?_eq_none_of_overlapping
     rw [hk₁, hfind] at hs₁
     nomatch hs₁
 
+/-- Root-aware overlap check on two `DynCallSite` registrations for a verified root function with
+`DefPath` `rootDefPath`: since `DynCallSite.matchesLoc` scopes `callSiteLoc? = none` to frames
+executing `rootDefPath`, an unscoped root site and a callee-scoped site `some (dp, bb)` with
+`dp ≠ rootDefPath` have disjoint location domains and never overlap. -/
+def DynCallSite.overlapsFor (rootDefPath : DefPath) (s₁ s₂ : DynCallSite) : Bool :=
+  decide (s₁.dynKey = s₂.dynKey) &&
+    match s₁.callSiteLoc?, s₂.callSiteLoc? with
+    | some l₁, some l₂ => decide (l₁ = l₂)
+    | some (dp₁, _), none => decide (dp₁ = rootDefPath)
+    | none, some (dp₂, _) => decide (rootDefPath = dp₂)
+    | none, none => true
+
+/-- Pairwise root-aware non-overlap check on a `DynCallRegistry`. -/
+def DynCallRegistry.noOverlapsFor (rootDefPath : DefPath) : DynCallRegistry → Bool
+  | [] => true
+  | s :: rest => rest.all (fun s' => !s.overlapsFor rootDefPath s') && noOverlapsFor rootDefPath rest
+
+/-- Root-aware location-scoped registry well-formedness for root body `rootDefPath`: strictly
+generalizes `scopedWellFormed` (`scopedWellFormedFor_of_scopedWellFormed`) so a registry combining
+an unscoped root site (`callSiteLoc? = none`) with callee-scoped sites (`some (calleePath, bb)`
+for `calleePath ≠ rootDefPath`) is statically certified unambiguous. -/
+def DynCallRegistry.scopedWellFormedFor (rootDefPath : DefPath) (reg : DynCallRegistry) : Bool :=
+  reg.all DynCallSite.wellFormed && DynCallRegistry.noOverlapsFor rootDefPath reg
+
+/-- Two registrations for the same call key that both match `(body, s)` satisfy
+`overlapsFor body.defPath`. -/
+theorem DynCallSite.overlapsFor_of_matchesLoc {x y : DynCallSite} {body : CapturedMir}
+    {s : MachineState} (hk : x.dynKey = y.dynKey) (hx : x.matchesLoc body s = true)
+    (hy : y.matchesLoc body s = true) : x.overlapsFor body.defPath y = true := by
+  unfold DynCallSite.overlapsFor
+  unfold DynCallSite.matchesLoc at hx hy
+  rw [hk]
+  cases hlx : x.callSiteLoc? with
+  | none =>
+    rw [hlx] at hx
+    cases hly : y.callSiteLoc? with
+    | none => simp
+    | some ly =>
+      rcases ly with ⟨dpy, bby⟩
+      rw [hly] at hy
+      simp only [decide_eq_true_eq, Prod.mk.injEq] at hx hy
+      simp [← hx, hy.1]
+  | some lx =>
+    rcases lx with ⟨dpx, bbx⟩
+    rw [hlx] at hx
+    cases hly : y.callSiteLoc? with
+    | none =>
+      rw [hly] at hy
+      simp only [decide_eq_true_eq, Prod.mk.injEq] at hx hy
+      simp [← hx.1, hy]
+    | some ly =>
+      rw [hly] at hy
+      simp only [decide_eq_true_eq] at hx hy
+      simp [← hx, ← hy]
+
+/-- Conservative root-oblivious `overlaps` over-approximates `overlapsFor rootDefPath`. -/
+theorem DynCallSite.overlaps_of_overlapsFor {rootDefPath : DefPath} {x y : DynCallSite}
+    (h : x.overlapsFor rootDefPath y = true) : x.overlaps y = true := by
+  unfold DynCallSite.overlapsFor at h
+  unfold DynCallSite.overlaps
+  cases hx : x.callSiteLoc? with
+  | none =>
+    rw [hx] at h
+    cases hy : y.callSiteLoc? with
+    | none => simp_all
+    | some ly => rcases ly with ⟨_, _⟩; rw [hy] at h; simp_all
+  | some lx =>
+    rcases lx with ⟨_, _⟩
+    rw [hx] at h
+    cases hy : y.callSiteLoc? with
+    | none => rw [hy] at h; simp_all
+    | some ly => rw [hy] at h; simp_all
+
+theorem DynCallRegistry.noOverlapsFor_of_noOverlaps (rootDefPath : DefPath) :
+    ∀ {reg : DynCallRegistry}, reg.noOverlaps = true → reg.noOverlapsFor rootDefPath = true
+  | [], _ => rfl
+  | s :: rest, h => by
+    unfold DynCallRegistry.noOverlaps at h
+    rw [Bool.and_eq_true, List.all_eq_true] at h
+    unfold DynCallRegistry.noOverlapsFor
+    rw [Bool.and_eq_true, List.all_eq_true]
+    refine ⟨fun s' hs' => ?_, noOverlapsFor_of_noOverlaps rootDefPath h.2⟩
+    cases hov : s.overlapsFor rootDefPath s' with
+    | false => rfl
+    | true =>
+      have h' := h.1 s' hs'
+      rw [DynCallSite.overlaps_of_overlapsFor hov] at h'
+      nomatch h'
+
+/-- `scopedWellFormedFor` strictly generalizes `scopedWellFormed` for every `rootDefPath`. -/
+theorem DynCallRegistry.scopedWellFormedFor_of_scopedWellFormed (rootDefPath : DefPath)
+    {reg : DynCallRegistry} (hwf : reg.scopedWellFormed = true) :
+    reg.scopedWellFormedFor rootDefPath = true := by
+  unfold DynCallRegistry.scopedWellFormed at hwf
+  rw [Bool.and_eq_true] at hwf
+  unfold DynCallRegistry.scopedWellFormedFor
+  rw [Bool.and_eq_true]
+  exact ⟨hwf.1, DynCallRegistry.noOverlapsFor_of_noOverlaps rootDefPath hwf.2⟩
+
+/-- `scopedWellFormedFor` strictly generalizes key-disjoint `wellFormed`. -/
+theorem DynCallRegistry.scopedWellFormedFor_of_wellFormed (rootDefPath : DefPath)
+    {reg : DynCallRegistry} (hwf : reg.wellFormed = true) :
+    reg.scopedWellFormedFor rootDefPath = true :=
+  DynCallRegistry.scopedWellFormedFor_of_scopedWellFormed rootDefPath
+    (DynCallRegistry.scopedWellFormed_of_wellFormed hwf)
+
+theorem DynCallRegistry.noOverlapsFor_pairwise (rootDefPath : DefPath) :
+    ∀ {reg : DynCallRegistry}, reg.noOverlapsFor rootDefPath = true →
+      reg.Pairwise (fun a b => a.overlapsFor rootDefPath b = false)
+  | [], _ => List.Pairwise.nil
+  | x :: rest, h => by
+    unfold DynCallRegistry.noOverlapsFor at h
+    rw [Bool.and_eq_true, List.all_eq_true] at h
+    refine List.Pairwise.cons (fun b hb => ?_) (noOverlapsFor_pairwise rootDefPath h.2)
+    have hb' := h.1 b hb
+    simpa using hb'
+
+theorem DynCallRegistry.filter_eq_singleton_of_pairwiseFor {rootDefPath : DefPath}
+    {p : DynCallSite → Bool} {site : DynCallSite}
+    (hov : ∀ a b, p a = true → p b = true → a.overlapsFor rootDefPath b = true) :
+    ∀ {reg : DynCallRegistry},
+      reg.Pairwise (fun a b => a.overlapsFor rootDefPath b = false) →
+      site ∈ reg → p site = true → reg.filter p = [site]
+  | [], _, hmem, _ => nomatch hmem
+  | x :: rest, hpw, hmem, hp => by
+    rcases List.pairwise_cons.mp hpw with ⟨hx, hrest⟩
+    rcases List.mem_cons.mp hmem with rfl | hmem'
+    · have hnil : rest.filter p = [] := by
+        refine DynCallRegistry.filter_eq_nil_of_forall fun a ha => ?_
+        cases hpa : p a with
+        | false => rfl
+        | true =>
+          have hxa := hx a ha
+          rw [hov _ _ hp hpa] at hxa
+          nomatch hxa
+      simp only [List.filter_cons, hp, ite_true, hnil]
+    · have hpx : p x = false := by
+        cases hpx : p x with
+        | false => rfl
+        | true =>
+          have hxs := hx site hmem'
+          rw [hov _ _ hpx hp] at hxs
+          nomatch hxs
+      simp only [List.filter_cons, hpx, Bool.false_eq_true, ite_false]
+      exact DynCallRegistry.filter_eq_singleton_of_pairwiseFor hov hrest hmem' hp
+
+/-- **Unique root-aware location-scoped resolution**: in a `reg.scopedWellFormedFor body.defPath`
+registry (including registries combining an unscoped root site `callSiteLoc? = none` with
+callee-scoped sites `some (calleePath, bb)`), every member `site ∈ reg` is uniquely returned by
+`findSiteAt?` at *every* state where `site.matchesLoc body s = true`, and is well formed. -/
+theorem DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormedFor {reg : DynCallRegistry}
+    {site : DynCallSite} (body : CapturedMir) (s : MachineState)
+    (hwf : reg.scopedWellFormedFor body.defPath = true) (hmem : site ∈ reg)
+    (hloc : site.matchesLoc body s = true) :
+    reg.findSiteAt? body s site.dynKey = some site ∧ site.wellFormed = true := by
+  unfold DynCallRegistry.scopedWellFormedFor at hwf
+  rw [Bool.and_eq_true, List.all_eq_true] at hwf
+  refine ⟨?_, hwf.1 site hmem⟩
+  have hov : ∀ a b : DynCallSite,
+      (decide (a.dynKey = site.dynKey) && a.matchesLoc body s) = true →
+      (decide (b.dynKey = site.dynKey) && b.matchesLoc body s) = true →
+      a.overlapsFor body.defPath b = true := by
+    intro a b ha hb
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at ha hb
+    exact DynCallSite.overlapsFor_of_matchesLoc (ha.1.trans hb.1.symm) ha.2 hb.2
+  unfold DynCallRegistry.findSiteAt?
+  rw [DynCallRegistry.filter_eq_singleton_of_pairwiseFor hov
+    (DynCallRegistry.noOverlapsFor_pairwise body.defPath hwf.2) hmem (by simp [hloc])]
+
+/-- **Root-aware overlapping registrations fail closed**: if two entries in
+`pre ++ s₁ :: mid ++ s₂ :: post` share `dynKey = key` and both match `(body, s)` (for example, an
+unscoped root site colliding with a block-scoped site on `body.defPath`), then
+`scopedWellFormedFor body.defPath = false` and `findSiteAt? body s key = none`. -/
+theorem DynCallRegistry.findSiteAt?_eq_none_of_overlappingFor
+    (pre mid post : List DynCallSite) {s₁ s₂ : DynCallSite}
+    {body : CapturedMir} {s : MachineState} {key : DefPath × List RigidTy}
+    (hk₁ : s₁.dynKey = key) (hk₂ : s₂.dynKey = key)
+    (hm₁ : s₁.matchesLoc body s = true) (hm₂ : s₂.matchesLoc body s = true) :
+    DynCallRegistry.scopedWellFormedFor body.defPath (pre ++ s₁ :: mid ++ s₂ :: post) = false ∧
+      DynCallRegistry.findSiteAt? (pre ++ s₁ :: mid ++ s₂ :: post) body s key = none := by
+  have hfind := (DynCallRegistry.findSiteAt?_eq_none_of_overlapping pre mid post hk₁ hk₂ hm₁ hm₂).2
+  refine ⟨?_, hfind⟩
+  cases hswf : DynCallRegistry.scopedWellFormedFor body.defPath
+      (pre ++ s₁ :: mid ++ s₂ :: post) with
+  | false => rfl
+  | true =>
+    have hs₁ := (DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormedFor body s hswf
+      (by simp : s₁ ∈ pre ++ s₁ :: mid ++ s₂ :: post) hm₁).1
+    rw [hk₁, hfind] at hs₁
+    nomatch hs₁
+
+/-- Whenever no site in `reg` matches the active location `(body, s)`, `findSiteAt?` returns `none`
+for every key. -/
+theorem DynCallRegistry.findSiteAt?_eq_none_of_no_matching_scope (reg : DynCallRegistry)
+    (body : CapturedMir) (s : MachineState) (key : DefPath × List RigidTy)
+    (hno : ∀ site ∈ reg, site.matchesLoc body s = false) :
+    reg.findSiteAt? body s key = none := by
+  unfold DynCallRegistry.findSiteAt?
+  rw [DynCallRegistry.filter_eq_nil_of_forall fun site hmem => by simp [hno site hmem]]
+
+/-- **Complementary foreign-frame theorem to `findSiteAt?_eq_findSite?_of_unscoped`**: when every
+site in `reg` is unscoped (`callSiteLoc? = none`) and `s` executes a foreign callee frame
+(`(s.memory.activeCallee.getD body).defPath ≠ body.defPath`), `findSiteAt?` returns `none` for
+*every* call key. -/
+theorem DynCallRegistry.findSiteAt?_eq_none_of_unscoped_foreign_frame (reg : DynCallRegistry)
+    (body : CapturedMir) (s : MachineState) (key : DefPath × List RigidTy)
+    (hun : reg.all (fun site => site.callSiteLoc?.isNone) = true)
+    (hforeign : (s.memory.activeCallee.getD body).defPath ≠ body.defPath) :
+    reg.findSiteAt? body s key = none := by
+  refine DynCallRegistry.findSiteAt?_eq_none_of_no_matching_scope reg body s key fun site hmem => ?_
+  have hnone : site.callSiteLoc? = none :=
+    Option.isNone_iff_eq_none.mp (List.all_eq_true.mp hun site hmem)
+  simp [DynCallSite.matchesLoc, hnone, hforeign]
+
 /-- Multi-site demand-gated dynamic-dispatch step (location-aware via `findSiteAt?` on direct calls):
 - if the active step at `s` is a direct call uniquely resolved at `(body, s)` in `reg`,
   dispatch via that site's `dynDispatchStep`;
@@ -4269,6 +4701,28 @@ theorem dynRegistryStep_of_unregistered (env : CompilerQueryEnv) (tbl : OpaqueCa
     dynRegistryStep env tbl reg body s = MirStepNode.unsupported := by
   simp [dynRegistryStep, hk, hfind, hdyn]
 
+/-- **Unscoped registries never dispatch in another function's frame** (multi-site registry
+generalization of `dynDemandStep_of_unscoped_foreign_frame`): when all entries of `reg` have
+`callSiteLoc? = none` and `s` executes a foreign callee frame, `dynRegistryStep` is either the
+branch-pruned trusted step or fails closed on the unregistered virtual call — never reinterpreting
+the callee's `vtableLocal`. -/
+theorem dynRegistryStep_of_unscoped_foreign_frame (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) {body : CapturedMir} {s : MachineState}
+    (hun : reg.all (fun site => site.callSiteLoc?.isNone) = true)
+    (hforeign : (s.memory.activeCallee.getD body).defPath ≠ body.defPath) :
+    dynRegistryStep env tbl reg body s = stepBranchPruned tbl.lookup body s ∨
+      dynRegistryStep env tbl reg body s = MirStepNode.unsupported := by
+  unfold dynRegistryStep
+  cases demandedKey? body s with
+  | none => exact Or.inl rfl
+  | some k =>
+    have hf : reg.findSiteAt? body s (k.defPath, k.typeArgs) = none :=
+      DynCallRegistry.findSiteAt?_eq_none_of_unscoped_foreign_frame reg body s _ hun hforeign
+    simp only [hf, ite_self]
+    cases (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
+    | true => exact Or.inr rfl
+    | false => exact Or.inl rfl
+
 /-- **Exhaustive `StepView` classification of `dynRegistryStep`** (unconditional): at *every*
 state `s`, `dynRegistryStep` exclusively:
 1. equals the branch-pruned trusted step `stepBranchPruned tbl.lookup body s` (hence `stepMirFn`
@@ -4325,6 +4779,8 @@ theorem dynRegistryStep_view_spec (env : CompilerQueryEnv) (tbl : OpaqueCalleeTa
         dsimp only
         have hkey : site.dynKey = (k.defPath, k.typeArgs) :=
           (DynCallRegistry.findSiteAt?_spec hf).2.1
+        have hloc : site.matchesLoc body s = true :=
+          (DynCallRegistry.findSiteAt?_spec hf).2.2
         have hdk : demandsDynKey site.dynKey body s = true := by
           simp [demandsDynKey, hk, hkey]
         unfold dynDispatchStep
@@ -4366,7 +4822,7 @@ theorem dynRegistryStep_view_spec (env : CompilerQueryEnv) (tbl : OpaqueCalleeTa
                 have hdp : stepDynPruned tbl site target body s =
                     stepDynTerminator (redirectResolver tbl site.dynKey target) site target s
                       term cb := by
-                  simp [stepDynPruned, hdk, hact]
+                  simp [stepDynPruned, hdk, hloc, hact]
                 rcases stepDynTerminator_view_spec (redirectResolver tbl site.dynKey target) site
                     target s term cb with ⟨fk, hfk⟩ | ⟨req, hreq, hd1, hd2⟩ | ⟨s', hs1, hs2⟩
                 · exact Or.inr (Or.inl ⟨fk, by rw [hdp]; exact hfk⟩)
@@ -4723,6 +5179,160 @@ theorem evalDynWithOpaqueCallees_cone_narrow_of_demands
       evalDynWithOpaqueCallees env₁ fullTbl site body fuel s := by
   rw [← evalDynRegistryWithOpaqueCallees_singleton, ← evalDynRegistryWithOpaqueCallees_singleton]
   exact evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands h fuel s hsup hkeys
+
+theorem of_mem_filterMap {α β : Type} {f : α → Option β} {b : β} :
+    ∀ {xs : List α}, b ∈ xs.filterMap f → ∃ a ∈ xs, f a = some b
+  | [], hmem => nomatch hmem
+  | x :: xs, hmem => by
+    cases hfx : f x with
+    | none =>
+      rw [List.filterMap_cons_none hfx] at hmem
+      obtain ⟨a, ha, hfa⟩ := of_mem_filterMap hmem
+      exact ⟨a, List.Mem.tail _ ha, hfa⟩
+    | some y =>
+      rw [List.filterMap_cons_some hfx] at hmem
+      rcases List.mem_cons.mp hmem with rfl | hrest
+      · exact ⟨x, List.Mem.head _, hfx⟩
+      · obtain ⟨a, ha, hfa⟩ := of_mem_filterMap hrest
+        exact ⟨a, List.Mem.tail _ ha, hfa⟩
+
+/-- Any key emitted by `dynRegistryStepCalleeKey?` at `s` carries `s.memory.traitImpls`. -/
+theorem dynRegistryStepCalleeKey?_extraTraitImpls {env : CompilerQueryEnv} {reg : DynCallRegistry}
+    {body : CapturedMir} {s : MachineState} {ck : CalleeKey}
+    (h : dynRegistryStepCalleeKey? env reg body s = some ck) :
+    ck.extraTraitImpls = s.memory.traitImpls := by
+  unfold dynRegistryStepCalleeKey? at h
+  cases hk : demandedKey? body s with
+  | none => rw [hk] at h; nomatch h
+  | some k =>
+    have hti : k.extraTraitImpls = s.memory.traitImpls := demandedKey?_extraTraitImpls hk
+    rw [hk] at h
+    dsimp only at h
+    cases hf : (if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs)
+        else none) with
+    | none =>
+      rw [hf] at h
+      cases hv : (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
+      | true => rw [hv] at h; nomatch h
+      | false =>
+        rw [hv] at h
+        injection h with hck
+        rw [← hck, hti]
+    | some site =>
+      rw [hf] at h
+      dsimp only at h
+      cases hwf : site.wellFormed with
+      | false => simp [hwf] at h
+      | true =>
+        simp only [hwf, ite_true] at h
+        cases hvt : site.vtablePtr? s with
+        | none => rw [hvt] at h; nomatch h
+        | some vt =>
+          rw [hvt] at h
+          dsimp only at h
+          cases hr : resolveDynTarget env site vt with
+          | err _ => rw [hr] at h; nomatch h
+          | unsupported _ => rw [hr] at h; nomatch h
+          | ok target =>
+            rw [hr] at h
+            dsimp only at h
+            cases hta : vtableTargetAgrees site target with
+            | false => simp [hta] at h
+            | true =>
+              simp only [hta, ite_true, Option.some.injEq] at h
+              rw [← h, hti]
+
+/-- **Every key in `dynRegistryDemandedCalleeKeys` carries the initial state's `memory.traitImpls`**
+(matching `OpaqueCalleeTable.demandedKeys_extraTraitImpls`): `dynRegistryStep_frames` preserves
+`memory.traitImpls` across every visited state. -/
+theorem dynRegistryDemandedCalleeKeys_extraTraitImpls (env : CompilerQueryEnv)
+    (tbl : OpaqueCalleeTable) (reg : DynCallRegistry) (body : CapturedMir) (fuel : Nat)
+    (s : MachineState) :
+    ∀ ck ∈ dynRegistryDemandedCalleeKeys env tbl reg body fuel s,
+      ck.extraTraitImpls = s.memory.traitImpls := by
+  intro ck hck
+  obtain ⟨s', hs', hstep⟩ := of_mem_filterMap hck
+  rw [dynRegistryStepCalleeKey?_extraTraitImpls hstep]
+  exact (runVisited_frames (dynRegistryStep_frames env tbl reg body) fuel s s' hs').2
+
+/-- **Dynamic-dispatch + generic-callee cone narrowing from `OpaqueCalleeTable.AgreesOn`**
+(connecting `OpaqueCalleeTable.AgreesOn` / `narrowToCone` directly to `evalDynRegistryWithOpaqueCallees`):
+no `fullTbl` step and no per-key `lookupKey` certificate is needed when `narrowTbl` and `fullTbl`
+agree on `cone` and no `dp ∈ cone` has a `TraitImplEntry`. -/
+theorem evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_poly
+    {env₁ env₂ : CompilerQueryEnv} (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (reg : DynCallRegistry)
+    (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : EnvExtends env₁ env₂)
+    (hagree : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (hno₁ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (s.memory.traitImpls ++ narrowTbl.traitImpls) dp = false)
+    (hno₂ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (s.memory.traitImpls ++ fullTbl.traitImpls) dp = false)
+    (hsup : ∀ p ∈ dynRegistryDemandedQueries env₂ narrowTbl reg body fuel s,
+      ∀ m, resolveDynTarget env₁ p.1 p.2 ≠ .unsupported m)
+    (hkeys : ∀ ck ∈ dynRegistryDemandedCalleeKeys env₂ narrowTbl reg body fuel s,
+      ck.defPath ∈ cone) :
+    evalDynRegistryWithOpaqueCallees env₂ narrowTbl reg body fuel s =
+      evalDynRegistryWithOpaqueCallees env₁ fullTbl reg body fuel s :=
+  evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands h fuel s hsup fun ck hck => by
+    have hextra := dynRegistryDemandedCalleeKeys_extraTraitImpls env₂ narrowTbl reg body fuel s ck hck
+    have hdp := hkeys ck hck
+    refine lookupKey_eq_of_agreesOn_free hagree hdp ?_ ?_
+    · rw [hextra]; exact hno₁ _ hdp
+    · rw [hextra]; exact hno₂ _ hdp
+
+/-- **Full dynamic-dispatch + generic + static-trait cone narrowing from `OpaqueCalleeTable.AgreesOn`**:
+composes `evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands` with
+`lookupKey_eq_of_agreesOn_with_traits` and `dynRegistryDemandedCalleeKeys_extraTraitImpls`, so a
+program mixing receiver-driven `dyn` calls, generic functions, and static `TraitImplEntry` overrides
+narrows from `OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl` without unfolding `fullTbl` along
+the run. -/
+theorem evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits
+    {env₁ env₂ : CompilerQueryEnv} (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (reg : DynCallRegistry)
+    (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : EnvExtends env₁ env₂)
+    (hagree : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (htraits : ∀ dp, dp ∈ cone →
+      narrowTbl.traitImpls.filter (fun e => stringEq e.traitRef.defPath dp) =
+        fullTbl.traitImpls.filter (fun e => stringEq e.traitRef.defPath dp))
+    (himpls : ∀ dp, dp ∈ cone → ∀ e ∈ s.memory.traitImpls ++ narrowTbl.traitImpls,
+      stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone)
+    (hsup : ∀ p ∈ dynRegistryDemandedQueries env₂ narrowTbl reg body fuel s,
+      ∀ m, resolveDynTarget env₁ p.1 p.2 ≠ .unsupported m)
+    (hkeys : ∀ ck ∈ dynRegistryDemandedCalleeKeys env₂ narrowTbl reg body fuel s,
+      ck.defPath ∈ cone) :
+    evalDynRegistryWithOpaqueCallees env₂ narrowTbl reg body fuel s =
+      evalDynRegistryWithOpaqueCallees env₁ fullTbl reg body fuel s :=
+  evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands h fuel s hsup fun ck hck => by
+    have hextra := dynRegistryDemandedCalleeKeys_extraTraitImpls env₂ narrowTbl reg body fuel s ck hck
+    have hdp := hkeys ck hck
+    refine lookupKey_eq_of_agreesOn_with_traits hagree hdp (htraits _ hdp) ?_
+    rw [hextra]
+    exact himpls _ hdp
+
+/-- Single-site corollary of `evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits`. -/
+theorem evalDynWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits
+    {env₁ env₂ : CompilerQueryEnv} (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (site : DynCallSite)
+    (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : EnvExtends env₁ env₂)
+    (hagree : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (htraits : ∀ dp, dp ∈ cone →
+      narrowTbl.traitImpls.filter (fun e => stringEq e.traitRef.defPath dp) =
+        fullTbl.traitImpls.filter (fun e => stringEq e.traitRef.defPath dp))
+    (himpls : ∀ dp, dp ∈ cone → ∀ e ∈ s.memory.traitImpls ++ narrowTbl.traitImpls,
+      stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone)
+    (hsup : ∀ p ∈ dynRegistryDemandedQueries env₂ narrowTbl [site] body fuel s,
+      ∀ m, resolveDynTarget env₁ p.1 p.2 ≠ .unsupported m)
+    (hkeys : ∀ ck ∈ dynRegistryDemandedCalleeKeys env₂ narrowTbl [site] body fuel s,
+      ck.defPath ∈ cone) :
+    evalDynWithOpaqueCallees env₂ narrowTbl site body fuel s =
+      evalDynWithOpaqueCallees env₁ fullTbl site body fuel s := by
+  rw [← evalDynRegistryWithOpaqueCallees_singleton, ← evalDynRegistryWithOpaqueCallees_singleton]
+  exact evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits cone narrowTbl fullTbl
+    [site] body fuel s h hagree htraits himpls hsup hkeys
 
 
 end Anneal.CompilerQueryEnv

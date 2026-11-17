@@ -1027,6 +1027,55 @@ theorem lookupCallee_hit_free_poly_opaque {tbl : OpaqueCalleeTable} {callerLayou
   rw [← htraits, OpaqueCalleeTable.traitImpls_eq] at hnoImpl
   exact lookupCallee_hit_free_poly hnoImpl hraw harity hlay
 
+/-- **`O(1)` miss certificate (absent free function, monomorphic or generic, `tbl.toList`-free)**:
+from the sealed `tbl.traitImpls = impls` certificate, `hasTraitImplForDefPath (extra ++ impls)
+defPath = false`, and `tbl.lookupRaw defPath = none`, `tbl.lookup` misses for *every* `typeArgs`
+without unfolding `tbl.toList`. -/
+theorem lookupCallee_miss_free_poly_opaque {tbl : OpaqueCalleeTable} {callerLayouts : LayoutTable}
+    {defPath : DefPath} {typeArgs : List RigidTy} {extra impls : List TraitImplEntry}
+    (htraits : tbl.traitImpls = impls)
+    (hnoImpl : hasTraitImplForDefPath (extra ++ impls) defPath = false)
+    (hraw : tbl.lookupRaw defPath = none) :
+    tbl.lookup callerLayouts defPath typeArgs extra = none := by
+  rw [← htraits, OpaqueCalleeTable.traitImpls_eq] at hnoImpl
+  rw [OpaqueCalleeTable.lookupRaw_eq] at hraw
+  apply lookupCallee_miss
+  cases typeArgs with
+  | nil => simp [resolveCalleeBodyAndArgs?, hraw]
+  | cons firstArg restArgs =>
+    have hnil : collectMatchingTraitImpls tbl.toList (extra ++ flatMapTraitImpls tbl.toList)
+        defPath (firstArg :: restArgs) = [] :=
+      collectMatchingTraitImpls_of_no_impl _ _ _ _ [] hnoImpl
+    cases firstArg <;> simp only [resolveCalleeBodyAndArgs?, hnil, hraw]
+
+/-- **`O(1)` miss certificate (arity-mismatched free generic function, `tbl.toList`-free)**:
+`tbl.toList`-free form of `lookupCallee_miss_arity` over `tbl.traitImpls` and `tbl.lookupRaw`. -/
+theorem lookupCallee_miss_free_poly_arity_opaque {tbl : OpaqueCalleeTable}
+    {callerLayouts : LayoutTable} {defPath : DefPath} {firstArg : RigidTy}
+    {restArgs : List RigidTy} {extra impls : List TraitImplEntry} {c : CapturedMir}
+    (htraits : tbl.traitImpls = impls)
+    (hnoImpl : hasTraitImplForDefPath (extra ++ impls) defPath = false)
+    (hraw : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length ≠ c.typeParamCount) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra = none := by
+  rw [← htraits, OpaqueCalleeTable.traitImpls_eq] at hnoImpl
+  exact lookupCallee_miss_arity (resolve_free_poly hnoImpl hraw) (by simp) harity
+
+/-- **`O(1)` miss certificate (uninstantiable free generic function, `tbl.toList`-free)**:
+`tbl.toList`-free form of `lookupCallee_miss_uninstantiable` over `tbl.traitImpls` and
+`tbl.lookupRaw`. -/
+theorem lookupCallee_miss_free_poly_uninstantiable_opaque {tbl : OpaqueCalleeTable}
+    {callerLayouts : LayoutTable} {defPath : DefPath} {firstArg : RigidTy}
+    {restArgs : List RigidTy} {extra impls : List TraitImplEntry} {c : CapturedMir}
+    (htraits : tbl.traitImpls = impls)
+    (hnoImpl : hasTraitImplForDefPath (extra ++ impls) defPath = false)
+    (hraw : tbl.lookupRaw defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? callerLayouts (firstArg :: restArgs) = none) :
+    tbl.lookup callerLayouts defPath (firstArg :: restArgs) extra = none := by
+  rw [← htraits, OpaqueCalleeTable.traitImpls_eq] at hnoImpl
+  exact lookupCallee_miss_uninstantiable (resolve_free_poly hnoImpl hraw) (by simp) harity hlay
+
 /-- Resolver-parametric companion of `collectMatchingTraitImpls`: replaces the
 linear `findCallee? callees entry.implPath` scan with an opaque raw lookup
 `lookupRaw : DefPath → Option CapturedMir` (`tbl.lookupRaw`), which is only
@@ -1284,6 +1333,19 @@ theorem lookupKey_miss_direct {tbl : OpaqueCalleeTable} {k : CalleeKey}
   subst hk
   rw [OpaqueCalleeTable.lookupKey_eq]
   exact lookupCallee_miss_direct hraw
+
+/-- **`O(1)` key miss certificate (absent free function, monomorphic or generic, `tbl.toList`-free)**:
+the `CalleeKey` form of `lookupCallee_miss_free_poly_opaque`. -/
+theorem lookupKey_miss_free_poly_opaque {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {impls : List TraitImplEntry}
+    (htraits : tbl.traitImpls = impls)
+    (hnoImpl : hasTraitImplForDefPath (k.extraTraitImpls ++ impls) k.defPath = false)
+    (hraw : tbl.lookupRaw k.defPath = none) :
+    tbl.lookupKey k = none := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hnoImpl hraw
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_miss_free_poly_opaque htraits hnoImpl hraw
 
 /-- **`O(1)` key certificate (direct polymorphic / fallback default-method hit)**:
 the `CalleeKey` form of `lookupCallee_hit_poly`. -/

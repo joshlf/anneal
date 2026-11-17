@@ -2597,6 +2597,176 @@ theorem canary_scoped_registry_overlap_and_subsumption :
     DynCallRegistry.findSiteAt?_eq_none_of_overlapping [] [] [] rfl rfl rfl (by decide),
     by decide +kernel⟩
 
+/-- State executing `fx::unreg_dyn_callee`'s `bb0` call to `<dyn Area>::area` inside a foreign
+callee frame (`activeCallee = some fxUnregDynCallee`), while `_1` holds `Square`'s vtable `9`. -/
+def crossForeignFrameState : MachineState :=
+  { crossFrameInit with
+    frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.ptr ⟨9, 0⟩ 0)] }
+    memory := { crossFrameInit.memory with activeCallee := some fxUnregDynCallee } }
+
+/-- State at `bb1` of `ssaDynRoot` (`ssaSite0` is scoped to `bb0`, so `ssaSite0.matchesLoc = false`). -/
+def ssaAtBb1 : MachineState :=
+  { ssaInit with frame := { ssaInit.frame with blockIdx := 1 } }
+
+/-- **Eager `dynDispatchStep` & `stepDynPruned` enforce both `site.matchesLoc` and `!isIndirect`**:
+1. At `fnPtrVirtInit`, `demandsDynKey dynSite.dynKey = true` and `dynSite.matchesLoc = true`, but
+   the instruction is an indirect `FnPtr` call (`isDirectCallAt = false`); `stepDynTerminator`
+   rejects `callTarget.isIndirect = true`, so **even eager `dynDispatchStep`** fails closed
+   (`MirStepNode.unsupported`) instead of hijacking `_1`.
+2. At `crossForeignFrameState` (foreign callee `fx::unreg_dyn_callee`), `demandsDynKey = true` and
+   `isDirectCallAt = true`, but unscoped `dynSite` has `matchesLoc crossFrameRoot = false`;
+   `stepDynPruned` rejects out-of-scope calls, so **even eager `dynDispatchStep`** fails closed.
+3. At `ssaAtBb1` (`bb1` of `ssaDynRoot`), `bb0`-scoped `ssaSite0` has `matchesLoc = false`, so
+   eager `dynDispatchStep` fails closed instead of reading `bb0`'s `_1` (`Circle`).
+4. Universally (`demandsDynSite_of_dynDispatchStep_step`), any `.step s'` of `dynDispatchStep` on
+   `site.dynKey` satisfies `demandsDynSite site body s = true`. -/
+theorem canary_eager_dynDispatchStep_respects_scope_and_direct_call :
+    demandsDynKey dynSite.dynKey fnPtrSpoofRoot fnPtrVirtInit = true ∧
+    dynSite.matchesLoc fnPtrSpoofRoot fnPtrVirtInit = true ∧
+    isDirectCallAt fnPtrSpoofRoot fnPtrVirtInit = false ∧
+    viewStepNode (dynDispatchStep dynEnv13 dynFullTbl dynSite fnPtrSpoofRoot fnPtrVirtInit) =
+      .fault .unsupported ∧
+    demandsDynKey dynSite.dynKey crossFrameRoot crossForeignFrameState = true ∧
+    dynSite.matchesLoc crossFrameRoot crossForeignFrameState = false ∧
+    viewStepNode
+        (dynDispatchStep dynEnv13 crossFrameTbl dynSite crossFrameRoot crossForeignFrameState) =
+      .fault .unsupported ∧
+    ssaSite0.matchesLoc ssaDynRoot ssaAtBb1 = false ∧
+    viewStepNode (dynDispatchStep dynEnv13 dynFullTbl ssaSite0 ssaDynRoot ssaAtBb1) =
+      .fault .unsupported ∧
+    (∀ env tbl site body s s',
+      demandsDynKey site.dynKey body s = true →
+      dynDispatchStep env tbl site body s = MirStepNode.step s' →
+      demandsDynSite site body s = true) :=
+  ⟨by decide +kernel, by decide, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide, by decide +kernel,
+    by decide, by decide +kernel,
+    fun _ _ _ _ _ _ => demandsDynSite_of_dynDispatchStep_step⟩
+
+/-- Cross-frame registry pairing the verified root's **unscoped** `dynSite` (`callSiteLoc? = none`,
+matching all frames of `crossFrameRoot`) with the callee's scoped `crossCalleeSite`
+(`callSiteLoc? = some ("fx::unreg_dyn_callee", 0)`). -/
+def crossRootUnscopedRegistry : DynCallRegistry := [dynSite, crossCalleeSite]
+
+/-- **Root-aware `scopedWellFormedFor` & `DynCallRegistry` foreign-frame protection canary**:
+1. Root-oblivious `scopedWellFormed` falsely rejects `crossRootUnscopedRegistry` (`false`), whereas
+   root-aware `scopedWellFormedFor crossFrameRoot.defPath` certifies it (`true`), uniquely resolves
+   both caller and callee sites at every matching state (`findSiteAt?_eq_some_of_scopedWellFormedFor`),
+   and `evalDynRegistryWithOpaqueCallees` halts returning `44`.
+2. Mixing unscoped `dynSite` with `ssaSite0` (`some ("fx::ssa_dyn_root", 0)`) on `ssaDynRoot`
+   genuinely overlaps on the root function, so `scopedWellFormedFor ssaDynRoot.defPath = false` and
+   `findSiteAt? = none` (`findSiteAt?_eq_none_of_overlappingFor`).
+3. Universally (`dynRegistryStep_of_unscoped_foreign_frame`), at *every* state `s` executing a
+   foreign callee body `(s.memory.activeCallee.getD dynMultiSiteRoot).defPath ≠
+   dynMultiSiteRoot.defPath`, `dynRegistryStep` on the unscoped `dynTwoSiteRegistry` is either
+   `stepBranchPruned` or `MirStepNode.unsupported`. -/
+theorem canary_root_aware_scopedWellFormedFor_and_foreign_registry :
+    crossRootUnscopedRegistry.scopedWellFormed = false ∧
+    crossRootUnscopedRegistry.scopedWellFormedFor crossFrameRoot.defPath = true ∧
+    ssaRegistry.scopedWellFormedFor ssaDynRoot.defPath = true ∧
+    (∀ s, crossCalleeSite.matchesLoc crossFrameRoot s = true →
+      crossRootUnscopedRegistry.findSiteAt? crossFrameRoot s crossCalleeSite.dynKey =
+        some crossCalleeSite) ∧
+    (evalDynRegistryWithOpaqueCallees dynEnv13 crossFrameTbl crossRootUnscopedRegistry
+        crossFrameRoot 20 crossFrameInit).summary = ⟨.halted, [], some 44, none⟩ ∧
+    (DynCallRegistry.scopedWellFormedFor ssaDynRoot.defPath
+        ([] ++ dynSite :: [] ++ ssaSite0 :: []) = false ∧
+      DynCallRegistry.findSiteAt? ([] ++ dynSite :: [] ++ ssaSite0 :: []) ssaDynRoot ssaInit
+        dynSite.dynKey = none) ∧
+    (∀ s : MachineState,
+      (s.memory.activeCallee.getD dynMultiSiteRoot).defPath ≠ dynMultiSiteRoot.defPath →
+      dynRegistryStep dynMultiSiteEnv13 dynMultiSiteFullTbl dynTwoSiteRegistry dynMultiSiteRoot s =
+          stepBranchPruned dynMultiSiteFullTbl.lookup dynMultiSiteRoot s ∨
+        dynRegistryStep dynMultiSiteEnv13 dynMultiSiteFullTbl dynTwoSiteRegistry dynMultiSiteRoot s =
+          MirStepNode.unsupported) :=
+  ⟨by decide, by decide,
+    DynCallRegistry.scopedWellFormedFor_of_scopedWellFormed _ (by decide),
+    fun s hloc =>
+      (DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormedFor crossFrameRoot s (by decide)
+        (by simp [crossRootUnscopedRegistry]) hloc).1,
+    by decide +kernel,
+    DynCallRegistry.findSiteAt?_eq_none_of_overlappingFor [] [] [] rfl rfl rfl (by decide),
+    fun _ hfor =>
+      dynRegistryStep_of_unscoped_foreign_frame dynMultiSiteEnv13 dynMultiSiteFullTbl
+        dynTwoSiteRegistry (by decide) hfor⟩
+
+/-- Program combining receiver-driven `<dyn Area>::area()` (`bb0`), free generic `poly::<u32>()`
+(`bb1`), and static `TraitImplEntry`-dispatched `<Circle as Area>::area()` (`bb2`) in one run. -/
+def dynPolyTraitRoot : CapturedMir :=
+  { defPath := "fx::dyn_poly_trait_root", phase := .runtimePostCleanup, role := .subject,
+    argCount := 1,
+    localDecls := [⟨.mut, fxU32Ty, some "_0"⟩, ⟨.not, fxVtPtrTy, some "vt"⟩],
+    basicBlocks := [
+      fxCallBlock "fx::Area::area" [.dynamic "fx::Area"] 1,
+      fxCallBlock "fx::poly" [.uint .u32] 2,
+      fxCallBlock "fx::Area::area" [fxCircleTy] 3,
+      ⟨[], ⟨.return_, "dpt:ret"⟩, false⟩ ],
+    fnAbi := fxRetU32Abi, layouts := fxLayouts, allocations := [] }
+
+def dynPolyTraitInit : MachineState := initMachineState dynPolyTraitRoot [.ptr ⟨7, 0⟩ 0]
+
+/-- **`OpaqueCalleeTable.AgreesOn` bridge for combined `dyn` + generic + trait-override runs &
+`tbl.toList`-free polymorphic miss certificates**:
+1. `dynPolyTraitRoot` executes `<dyn Area>::area()` (`vt = 7`), `poly::<u32>()`, and static
+   `<Circle as Area>::area()` in one run, halting with `31`, and narrows from `multiFullTbl` to
+   `multiNarrowTbl` (and `dynEnv13` to `dynEnv13Sync`) via
+   `evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits` + `canary_multi_agreesOn`.
+2. Every demanded key in `dynRegistryDemandedCalleeKeys` carries `dynPolyTraitInit.memory.traitImpls`
+   (`dynRegistryDemandedCalleeKeys_extraTraitImpls`).
+3. `lookupKey_miss_free_poly_opaque`, `lookupCallee_miss_free_poly_arity_opaque`, and
+   `lookupCallee_miss_free_poly_uninstantiable_opaque` certify unlinked, arity-mismatched, and
+   uninstantiable generic calls on `multiFullTbl` without unfolding `multiFullTbl.toList`. -/
+theorem canary_dyn_agreesOn_with_traits_and_poly_miss_opaque :
+    (evalDynRegistryWithOpaqueCallees dynEnv13Sync multiNarrowTbl [dynSite] dynPolyTraitRoot 18
+        dynPolyTraitInit).summary = ⟨.halted, [], some 31, none⟩ ∧
+    evalDynRegistryWithOpaqueCallees dynEnv13Sync multiNarrowTbl [dynSite] dynPolyTraitRoot 18
+        dynPolyTraitInit =
+      evalDynRegistryWithOpaqueCallees dynEnv13 multiFullTbl [dynSite] dynPolyTraitRoot 18
+        dynPolyTraitInit ∧
+    (∀ ck ∈ dynRegistryDemandedCalleeKeys dynEnv13Sync multiNarrowTbl [dynSite] dynPolyTraitRoot 18
+        dynPolyTraitInit,
+      ck.extraTraitImpls = dynPolyTraitInit.memory.traitImpls) ∧
+    multiFullTbl.lookupKey ⟨fxLayouts, "fx::unlinked_poly", [.uint .u32], []⟩ = none ∧
+    multiFullTbl.lookup fxLayouts "fx::poly" [.uint .u32, .bool] [] = none ∧
+    multiFullTbl.lookup fxLayouts "fx::poly" [.dynamic "fx::Area"] [] = none := by
+  have hmem : dynPolyTraitInit.memory.traitImpls = [] := rfl
+  have hpolyRaw : multiFullTbl.lookupRaw "fx::poly" = some fxPoly := by
+    unfold multiFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hunlinkedRaw : multiFullTbl.lookupRaw "fx::unlinked_poly" = none := by
+    unfold multiFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      OpaqueCalleeTable.lookupRaw_eq, OpaqueCalleeTable.toList_ofList]
+    rfl
+  have hq :
+      dynRegistryDemandedQueries dynEnv13Sync multiNarrowTbl [dynSite] dynPolyTraitRoot 18
+        dynPolyTraitInit = [(dynSite, ⟨7, 0⟩)] := by
+    decide +kernel
+  refine ⟨by decide +kernel,
+    evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits multiCone
+      multiNarrowTbl multiFullTbl [dynSite] dynPolyTraitRoot 18 dynPolyTraitInit
+      dyn_envExtends_13_sync canary_multi_agreesOn
+      (by intro dp _; rw [multiNarrowTbl_traitImpls, multiFullTbl_traitImpls])
+      (by intro dp hdp; rw [hmem, multiNarrowTbl_traitImpls]; revert dp hdp; decide)
+      (by
+        rw [hq]
+        intro p hp
+        simp only [List.mem_singleton] at hp
+        subst hp
+        rw [dyn_schema13_resolves]
+        exact fun _ h => nomatch h)
+      (by decide +kernel),
+    dynRegistryDemandedCalleeKeys_extraTraitImpls dynEnv13Sync multiNarrowTbl [dynSite]
+      dynPolyTraitRoot 18 dynPolyTraitInit,
+    lookupKey_miss_free_poly_opaque multiFullTbl_traitImpls (by decide) hunlinkedRaw,
+    lookupCallee_miss_free_poly_arity_opaque multiFullTbl_traitImpls (by decide) hpolyRaw
+      (by decide),
+    lookupCallee_miss_free_poly_uninstantiable_opaque multiFullTbl_traitImpls (by decide) hpolyRaw
+      rfl (by decide)⟩
+
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -3819,6 +3989,78 @@ constant. -/
 /-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_unscoped_site_root_only' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_unscoped_site_root_only
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_opaque' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_opaque
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupKey_miss_free_poly_opaque' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupKey_miss_free_poly_opaque
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_arity_opaque' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_arity_opaque
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_uninstantiable_opaque' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_uninstantiable_opaque
+
+/-- info: 'Anneal.CompilerQueryEnv.isDirectTerminatorCall_of_stepDynTerminator_step' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.isDirectTerminatorCall_of_stepDynTerminator_step
+
+/-- info: 'Anneal.CompilerQueryEnv.demandsDynSite_of_dynDispatchStep_step' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.demandsDynSite_of_dynDispatchStep_step
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.scopedWellFormedFor_of_scopedWellFormed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.scopedWellFormedFor_of_scopedWellFormed
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormedFor' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormedFor
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_none_of_overlappingFor' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_none_of_overlappingFor
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_none_of_unscoped_foreign_frame' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_none_of_unscoped_foreign_frame
+
+/-- info: 'Anneal.CompilerQueryEnv.dynRegistryStep_of_unscoped_foreign_frame' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynRegistryStep_of_unscoped_foreign_frame
+
+/-- info: 'Anneal.CompilerQueryEnv.dynRegistryDemandedCalleeKeys_extraTraitImpls' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynRegistryDemandedCalleeKeys_extraTraitImpls
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_poly' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_poly
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynWithOpaqueCallees_cone_narrow_of_agreesOn_with_traits
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_eager_dynDispatchStep_respects_scope_and_direct_call' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_eager_dynDispatchStep_respects_scope_and_direct_call
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_root_aware_scopedWellFormedFor_and_foreign_registry' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_root_aware_scopedWellFormedFor_and_foreign_registry
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_agreesOn_with_traits_and_poly_miss_opaque' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_agreesOn_with_traits_and_poly_miss_opaque
 
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
