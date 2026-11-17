@@ -2560,9 +2560,11 @@ pub fn emit_opaque_callee_table_lean_module_with_imports(
         {
             let arity = entry.type_param_count;
             out.push_str(&format!(
-                "/-- No `TraitImplEntry` of the table targets callee [{k}] (`extra = []`). -/\n\
+                "/-- No `TraitImplEntry` of the table targets callee [{k}] (stated over the sealed \
+                 `table.traitImpls`, exactly the `hnoTbl` premise of \
+                 `lookupCallee_hit_free_poly_of_noImpl_opaque`). -/\n\
                  theorem cert_noImpl_{ident} :\n    \
-                 hasTraitImplForDefPath (List.nil ++ table.traitImpls) {def_path} = false := by\n  \
+                 hasTraitImplForDefPath table.traitImpls {def_path} = false := by\n  \
                  rw [cert_traitImpls]\n  \
                  decide +kernel\n\n\
                  /-- `tbl.toList`-free and `impls`-list-free `O(1)` free-generic lookup \
@@ -2680,7 +2682,16 @@ fn parse_deriving_entry(entry: &str) -> (&str, &str) {
             let inner = s[1..close].trim();
             let (head, inner_args) = parse_deriving_entry(inner);
             let outer_args = s[close + 1..].trim();
-            let tail = if !inner_args.is_empty() { inner_args } else { outer_args };
+            // Keep *every* argument in the tail: `(Handler a) b` must neither dedup against
+            // `Handler a` / `(Handler a) c` nor ever classify as a unary class.
+            let tail = if inner_args.is_empty() {
+                outer_args
+            } else if outer_args.is_empty() {
+                inner_args
+            } else {
+                // `inner_args` is a non-empty subslice of `s`: span it through `outer_args`.
+                &s[inner_args.as_ptr() as usize - s.as_ptr() as usize..]
+            };
             return (head, tail);
         }
         return ("", "");
@@ -3237,7 +3248,7 @@ mod opaque_callee_table_tests {
         let code = emit_opaque_callee_table_lean_module("Gen.Poly", &entries);
         assert!(code.contains(
             "theorem cert_noImpl_demo__poly :\n    \
-             hasTraitImplForDefPath (List.nil ++ table.traitImpls) \"demo::poly\" = false := by\n  \
+             hasTraitImplForDefPath table.traitImpls \"demo::poly\" = false := by\n  \
              rw [cert_traitImpls]\n  decide +kernel\n"
         ));
         assert!(code.contains(
@@ -3595,6 +3606,12 @@ mod opaque_callee_table_tests {
             (
                 &["(CustomHandler) opt", "((CustomHandler) opt)", "BEq", "DecidableEq"],
                 &["(CustomHandler) opt", "DecidableEq"],
+            ),
+            (
+                // Regression: outer arguments after a parenthesized class application are part
+                // of the class reference (never dropped, deduplicated away, or read as unary).
+                &["Handler a", "(Handler a) b", "(Handler a) c", "(BEq a) b", "DecidableEq"],
+                &["Handler a", "(Handler a) b", "(Handler a) c", "(BEq a) b", "DecidableEq"],
             ),
             // Multi-argument handler whose head ends in `.BEq` is not core's unary `BEq`:
             (&["CustomPkg.BEq opt", "DecidableEq"], &["CustomPkg.BEq opt", "DecidableEq"]),
