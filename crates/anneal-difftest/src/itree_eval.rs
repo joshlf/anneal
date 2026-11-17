@@ -1702,7 +1702,6 @@ where
             });
         for (&chunk, (label, res)) in wave.iter().zip(wave_res) {
             if let Err(e) = accept(&mut results, chunk, res, &label) {
-                note_failure(chunk, &e);
                 errors.push(e);
                 failed_chunks.push(chunk);
             }
@@ -1722,6 +1721,7 @@ where
         for (fn_name, fn_cases) in by_fn {
             if fallback_successes == 0 && fallback_failures >= ITREE_FALLBACK_CIRCUIT_BREAKER {
                 skipped_fallbacks += 1;
+                note_failure(&fn_cases, "");
                 continue;
             }
             let label = format!("{stage_label}Fallback_{fn_name}");
@@ -1757,6 +1757,7 @@ where
                 for (a, b) in [(lo, mid), (mid, hi)] {
                     if failing_runs >= budget {
                         unresolved_by_budget += b - a;
+                        note_failure(&fn_cases[a..b], "");
                         continue;
                     }
                     let slice = &fn_cases[a..b];
@@ -3889,7 +3890,7 @@ fn evaluate_itree_entries(
         // larger batches confirm every divergence plus the first trace of every
         // candidate. `kernel_confirmed_traces` counts only traces whose theorems were
         // actually checked by the Lean kernel.
-        let confirm_cases: Vec<BatchTraceEvalCase> =
+        let mut confirm_cases: Vec<BatchTraceEvalCase> =
             if mode == "identity" || batch_cases.len() <= ITREE_FULL_CONFIRM_MAX_TRACES {
                 batch_cases.clone()
             } else {
@@ -3911,35 +3912,91 @@ fn evaluate_itree_entries(
         let confirm_chunk_size = options
             .confirm_chunk_size
             .clamp(1, ITREE_MAX_CONFIRM_CHUNK_SIZE);
-        let confirm_stage = run_isolated_lean_stage(
+        let run_confirm_chunk = |label: &str, chunk: &[BatchTraceEvalCase]| {
+            let src = render_batch_trace_eval_lean_module(&format!("Proof.{label}"), chunk, false);
+            run_itree_lean_module_with_workers(
+                &verify_dir,
+                &anneal_dir,
+                label,
+                &src,
+                itree_lean_stage_concurrency(lean_jobs),
+                chunk.len(),
+            )?;
+            Ok(chunk
+                .iter()
+                .map(|c| {
+                    (
+                        c.case_ident.clone(),
+                        extract_itree_confirm_theorem(&src, &c.case_ident),
+                    )
+                })
+                .collect::<BTreeMap<String, String>>())
+        };
+        let mut confirm_stage = run_isolated_lean_stage(
             "ItreeDiffBatchConfirm",
             &confirm_cases,
             confirm_chunk_size,
             lean_jobs,
             batch_case_ident,
             &case_to_fn,
-            |label: &str, chunk: &[BatchTraceEvalCase]| {
-                let src =
-                    render_batch_trace_eval_lean_module(&format!("Proof.{label}"), chunk, false);
-                run_itree_lean_module_with_workers(
-                    &verify_dir,
-                    &anneal_dir,
-                    label,
-                    &src,
-                    itree_lean_stage_concurrency(lean_jobs),
-                    chunk.len(),
-                )?;
-                Ok(chunk
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.case_ident.clone(),
-                            extract_itree_confirm_theorem(&src, &c.case_ident),
-                        )
-                    })
-                    .collect::<BTreeMap<String, String>>())
-            },
+            run_confirm_chunk,
         );
+        // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
+        // candidate had only its first `ok` trace selected into `confirm_cases`.
+        // If that trace hit a watchdog / resource limit (`inconclusive_cases`), try
+        // the candidate's remaining Stage-1 `ok` traces so it can still obtain at
+        // least one kernel-confirmed trace.
+        if confirm_cases.len() < batch_cases.len() && !confirm_stage.failed_fns.is_empty() {
+            let selected_idents: BTreeSet<String> =
+                confirm_cases.iter().map(|c| c.case_ident.clone()).collect();
+            let mut replacement_cases: Vec<BatchTraceEvalCase> = Vec::new();
+            for fn_name in &confirm_stage.failed_fns {
+                let fn_selected: Vec<&BatchTraceEvalCase> = confirm_cases
+                    .iter()
+                    .filter(|c| case_to_fn.get(&c.case_ident) == Some(fn_name))
+                    .collect();
+                let any_completed = fn_selected
+                    .iter()
+                    .any(|c| confirm_stage.results.contains_key(&c.case_ident));
+                let all_inconclusive_ok = !fn_selected.is_empty()
+                    && fn_selected.iter().all(|c| {
+                        confirm_stage.results.contains_key(&c.case_ident)
+                            || (confirm_stage.inconclusive_cases.contains(&c.case_ident)
+                                && c.expected_diag_tag.as_deref() == Some("ok"))
+                    });
+                if !any_completed && all_inconclusive_ok {
+                    if let Some(backup) = batch_cases.iter().find(|c| {
+                        case_to_fn.get(&c.case_ident) == Some(fn_name)
+                            && !selected_idents.contains(&c.case_ident)
+                            && c.expected_diag_tag.as_deref() == Some("ok")
+                    }) {
+                        replacement_cases.push(backup.clone());
+                    }
+                }
+            }
+            if !replacement_cases.is_empty() {
+                let rep_stage = run_isolated_lean_stage(
+                    "ItreeDiffBatchConfirmReplacement",
+                    &replacement_cases,
+                    confirm_chunk_size,
+                    lean_jobs,
+                    batch_case_ident,
+                    &case_to_fn,
+                    run_confirm_chunk,
+                );
+                confirm_cases.extend(replacement_cases);
+                confirm_stage.results.extend(rep_stage.results);
+                confirm_stage
+                    .inconclusive_cases
+                    .extend(rep_stage.inconclusive_cases);
+                confirm_stage.errors.extend(rep_stage.errors);
+                confirm_stage.failed_fns = confirm_cases
+                    .iter()
+                    .filter(|c| !confirm_stage.results.contains_key(&c.case_ident))
+                    .filter_map(|c| case_to_fn.get(&c.case_ident).cloned())
+                    .collect();
+            }
+        }
         for err in &confirm_stage.errors {
             eprintln!("itree-difftest: Stage 2 Lean kernel confirmation failure: {err}");
         }
@@ -4003,7 +4060,16 @@ fn evaluate_itree_entries(
             .iter()
             .filter_map(|f| raw_trace_count_by_fn.get(f))
             .sum();
-        per_candidate_distinct_traces.retain(|f, _| compared_fn_names.contains(f));
+        per_candidate_distinct_traces.clear();
+        for case in &batch_cases {
+            if let Some(fn_name) = case_to_fn.get(&case.case_ident)
+                && compared_fn_names.contains(fn_name)
+            {
+                *per_candidate_distinct_traces
+                    .entry(fn_name.clone())
+                    .or_insert(0) += 1;
+            }
+        }
 
         let mut obs_path_set = MirObsPathSet::new();
         let mut obs_path_signatures_set = BTreeSet::new();
@@ -7268,5 +7334,48 @@ mod tests {
         assert!(!stage_rfl.results.contains_key("case_cand_two_rfl_poison_t1"));
         assert!(!stage_rfl.results.contains_key("case_cand_two_rfl_poison_t6"));
         assert!(!stage_rfl.errors.iter().any(|e| e.contains("candidate-wide")));
+
+        // 6. Cases whose bisection slice was skipped because the failure budget ran
+        //    out (`cand_slow` above) or whose per-candidate fallback was skipped by
+        //    `ITREE_FALLBACK_CIRCUIT_BREAKER` must NOT be marked in
+        //    `inconclusive_cases` (otherwise a candidate split across chunks could
+        //    silently drop an un-isolated kernel rejection).
+        let (cb_cases, cb_map) = stage_fixture(&[
+            ("cand_split", 2),
+            ("cand_f0", 1),
+            ("cand_f1", 1),
+            ("cand_f2", 1),
+            ("cand_f3", 1),
+            ("cand_split_tail", 1),
+        ]);
+        // Re-map `case_cand_split_tail_t0` to `cand_split` so `cand_split` spans
+        // Chunk 0 (which succeeds) and Chunk 1 (which fails with a watchdog error
+        // and hits the circuit breaker before `cand_split` runs its fallback in
+        // Chunk 1, because `cand_f0..f3` sort before `cand_split`!).
+        let mut cb_case_to_fn = cb_map;
+        cb_case_to_fn.insert("case_cand_split_tail_t0".to_string(), "cand_split".to_string());
+        let cb_stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cb_cases,
+            2,
+            1,
+            ident,
+            &cb_case_to_fn,
+            |label: &str, chunk: &[String]| {
+                if label == "ItreeDiffBatchConfirmChunk0" {
+                    return ok_all(chunk);
+                }
+                Err("[WATCHDOG:RSS_EXCEEDED] exceeded RSS limit".to_string())
+            },
+        );
+        assert!(
+            !cb_stage.inconclusive_cases.contains("case_cand_split_tail_t0"),
+            "fallback skipped by circuit breaker must not mark un-tested case as inconclusive"
+        );
+        assert!(
+            itree_partially_comparable_fns(&cb_stage, &cb_cases, ident, &cb_case_to_fn, |_| true)
+                .is_empty(),
+            "cand_split must not be partially compared when its Chunk 3 fallback was skipped"
+        );
     }
 }

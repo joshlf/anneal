@@ -2179,13 +2179,27 @@ pub fn explore_itree_concolic_trials(
 
     let mut pins: Vec<ConcolicPinState> = Vec::new();
     for (bi, b) in bases.iter().enumerate() {
-        for (pin_idx, (pos, callee, args, ret)) in b.3.ext_calls().into_iter().enumerate() {
+        let mut pin_idx = 0usize;
+        for (pos, ev_item) in b.3.events.iter().enumerate() {
+            let (callee, args, ret) = match ev_item {
+                ItreeConcreteEvent::ExtCall { callee, args, ret } => {
+                    (callee.as_str(), args.as_slice(), ret.clone())
+                }
+                ItreeConcreteEvent::ExtCallPanic { callee, args } => {
+                    let ret_len = ev
+                        .callee_return_layout(callee)
+                        .map(|l| l.size_bytes)
+                        .unwrap_or(0);
+                    (callee.as_str(), args.as_slice(), vec![0u8; ret_len])
+                }
+                _ => continue,
+            };
             let mut pin = ArgPinConstraint::new(
                 pin_idx,
                 callee,
                 b.3.branches_before(pos),
                 args.to_vec(),
-                ret.to_vec(),
+                ret,
             );
             if let Some(layouts) = ev.callee_arg_layouts(callee)
                 && layouts.len() == args.len()
@@ -2200,6 +2214,7 @@ pub fn explore_itree_concolic_trials(
                 pin,
                 exhausted,
             });
+            pin_idx += 1;
         }
     }
 
@@ -2345,8 +2360,12 @@ pub fn explore_itree_concolic_trials(
                 let b = &bases[ps.base];
                 (b.0, b.1, b.2, &b.3)
             };
-            let ItreeConcreteEvent::ExtCall { callee, args, ret } = &base.events[ps.pos] else {
-                continue;
+            let (callee, args, ret, base_panicked) = match &base.events[ps.pos] {
+                ItreeConcreteEvent::ExtCall { callee, args, ret } => (callee, args, ret, false),
+                ItreeConcreteEvent::ExtCallPanic { callee, args } => {
+                    (callee, args, &ps.pin.ret_bytes, true)
+                }
+                _ => continue,
             };
             if ret.is_empty() {
                 continue;
@@ -2358,7 +2377,13 @@ pub fn explore_itree_concolic_trials(
                 continue;
             }
             let key = (base.events[..ps.pos].to_vec(), callee.clone());
-            let used = used_rets.entry(key).or_insert_with(|| BTreeSet::from([ret.clone()]));
+            let used = used_rets.entry(key).or_insert_with(|| {
+                if base_panicked {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from([ret.clone()])
+                }
+            });
             let mut prefix_sched = EnvSchedule::new();
             for prior in &base.events[..ps.pos] {
                 if let ItreeConcreteEvent::ExtCall { callee, ret, .. } = prior {
@@ -3521,5 +3546,26 @@ mod tests {
                 .unwrap(),
             t.predicted
         );
+
+        // Reverse direction: when the BASE input itself unwinds inside the callee
+        // (`payload_len = 2 < 5` -> `ExtCallPanic`), the explorer still creates a
+        // pin for that boundary call, negates `x` in Phase 1 to escape the panic
+        // (`Return`), and perturbs its oracle return in Phase 2 so the base input
+        // returns normally without panicking.
+        let panic_base = ev
+            .run_kernel_step(0x414E_4E4C, 2, &EnvSchedule::new(), "")
+            .unwrap();
+        assert_eq!(panic_base.outcome, ItreeConcreteOutcome::Panic);
+        let rev_trials =
+            explore_itree_concolic_trials(src, "kernel_step", "", &[(0x414E_4E4C, 2)], &dict, 12, 3);
+        assert!(rev_trials.iter().any(|t| {
+            matches!(t.phase, ConcolicTrialPhase::NegateCallArg { .. })
+                && matches!(t.predicted.outcome, ItreeConcreteOutcome::Return(_))
+        }));
+        assert!(rev_trials.iter().any(|t| {
+            matches!(t.phase, ConcolicTrialPhase::PerturbOracleReturn { .. })
+                && (t.magic, t.payload_len) == (0x414E_4E4C, 2)
+                && matches!(t.predicted.outcome, ItreeConcreteOutcome::Return(_))
+        }));
     }
 }
