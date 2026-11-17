@@ -2386,16 +2386,27 @@ def crossFrameTbl : OpaqueCalleeTable := .ofList [fxCircleArea, fxSquareArea, fx
 
 def crossFrameInit : MachineState := initMachineState crossFrameRoot [.ptr ⟨7, 0⟩ 0, .ptr ⟨9, 0⟩ 0]
 
+/-- Site for the callee `fx::unreg_dyn_callee`'s own `<dyn Area>::area` call (its receiver vtable
+pointer is the callee's `_1`). -/
+def crossCalleeSite : DynCallSite :=
+  { dynSite with vtableLocal := 1, callSiteLoc? := some ("fx::unreg_dyn_callee", 0) }
+
+/-- Statically well-formed cross-frame registry: the caller's `bb0` site and the callee's site,
+each scoped to its own function. -/
+def crossFrameRegistry : DynCallRegistry :=
+  [{ dynSite with callSiteLoc? := some ("fx::cross_caller", 0) }, crossCalleeSite]
+
 /-- **Location-scoped (`callSiteLoc?`) SSA registry & cross-frame hijack protection canary**:
 1. `ssaRegistry` registers two sites for `<dyn Area>::area` at `("fx::ssa_dyn_root", 0)` (`_1`)
    and `("fx::ssa_dyn_root", 1)` (`_2`): unscoped `wellFormed` is `false` (same `dynKey`), whereas
    `scopedWellFormed` is `true`, and `evalDynRegistryWithOpaqueCallees` dispatches `Circle` then
    `Square` (halting with `44`) and preserves the run across `EnvExtends` + narrowing.
-2. On `crossFrameRoot`, an unscoped site (`callSiteLoc? = none`, `vtableLocal = 1`) hijacks
-   `fx::unreg_dyn_callee`'s unregistered `<dyn Area>::area` call and reads the callee's `_1`
-   (halting with `44`), whereas scoping `callSiteLoc? = some ("fx::cross_caller", 0)` dispatches
-   the caller's `bb0` and fails closed (`.faulted .unsupported`) at the callee's unregistered
-   virtual call. -/
+2. On `crossFrameRoot`, an unscoped site (`callSiteLoc? = none`) matches only the root function's
+   frames, so it dispatches the caller's `bb0` but never reinterprets the callee's `_1`: the callee
+   `fx::unreg_dyn_callee`'s own virtual call is unregistered and fails closed
+   (`.faulted .unsupported`), exactly as with the caller-scoped site.
+3. Registering the callee's call with its own scoped site (`crossFrameRegistry`, statically
+   `scopedWellFormed`) dispatches it with the callee's receiver (`Square`, halting with `44`). -/
 theorem canary_dyn_scoped_ssa_and_cross_frame_registry :
     ssaRegistry.wellFormed = false ∧
     ssaRegistry.scopedWellFormed = true ∧
@@ -2404,16 +2415,31 @@ theorem canary_dyn_scoped_ssa_and_cross_frame_registry :
     evalDynRegistryWithOpaqueCallees dynEnv13Sync dyn2NarrowTbl ssaRegistry ssaDynRoot 16
         ssaInit =
       evalDynRegistryWithOpaqueCallees dynEnv13 dynFullTbl ssaRegistry ssaDynRoot 16 ssaInit ∧
-    (evalDynWithOpaqueCallees dynEnv13 crossFrameTbl dynSite crossFrameRoot 20
-        crossFrameInit).summary = ⟨.halted, [], some 44, none⟩ ∧
+    evalDynWithOpaqueCallees dynEnv13 crossFrameTbl dynSite crossFrameRoot 20
+        crossFrameInit =
+      .faulted .unsupported [] ∧
     evalDynWithOpaqueCallees dynEnv13 crossFrameTbl
         { dynSite with callSiteLoc? := some ("fx::cross_caller", 0) } crossFrameRoot 20
         crossFrameInit =
-      .faulted .unsupported [] :=
+      .faulted .unsupported [] ∧
+    crossFrameRegistry.scopedWellFormed = true ∧
+    (evalDynRegistryWithOpaqueCallees dynEnv13 crossFrameTbl crossFrameRegistry crossFrameRoot 20
+        crossFrameInit).summary = ⟨.halted, [], some 44, none⟩ :=
   ⟨by decide, by decide, by decide +kernel,
     evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check dyn_envExtends_13_sync 16 ssaInit
       (by decide +kernel),
-    by decide +kernel, by decide +kernel⟩
+    by decide +kernel, by decide +kernel, by decide, by decide +kernel⟩
+
+/-- **The unscoped `dynSite` can never dispatch in another function's frame** — at *every* state
+executing a body other than `dynRoot`'s function, its demand-gated step is the trusted pruned step
+or fails closed (`dynDemandStep_of_unscoped_foreign_frame`; universally quantified, beyond any
+`decide`). -/
+theorem canary_unscoped_site_root_only :
+    ∀ s : MachineState, (s.memory.activeCallee.getD dynRoot).defPath ≠ dynRoot.defPath →
+      dynDemandStep dynEnv13 dynFullTbl dynSite dynRoot s =
+          stepBranchPruned dynFullTbl.lookup dynRoot s ∨
+        dynDemandStep dynEnv13 dynFullTbl dynSite dynRoot s = MirStepNode.unsupported :=
+  fun _ h => dynDemandStep_of_unscoped_foreign_frame dynEnv13 dynFullTbl rfl h
 
 /-- **Unique scoped resolution at every state** (`findSiteAt?_eq_some_of_scopedWellFormed`):
 in the `scopedWellFormed` registry `ssaRegistry`, the `bb1` site is returned by `findSiteAt?` at
@@ -3781,6 +3807,18 @@ constant. -/
 /-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_scoped_registry_overlap_and_subsumption' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_scoped_registry_overlap_and_subsumption
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallSite.matchesLoc_of_unscoped' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallSite.matchesLoc_of_unscoped
+
+/-- info: 'Anneal.CompilerQueryEnv.dynDemandStep_of_unscoped_foreign_frame' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynDemandStep_of_unscoped_foreign_frame
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_unscoped_site_root_only' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_unscoped_site_root_only
 
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 

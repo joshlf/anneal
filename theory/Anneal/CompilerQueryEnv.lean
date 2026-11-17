@@ -2564,17 +2564,24 @@ structure DynCallSite : Type where
   /-- Call key `(defPath, typeArgs)` of the `dyn` call in the caller's terminator. -/
   dynKey : DefPath × List RigidTy
   /-- Optional `(callerDefPath, blockIdx)` scope pinning this site to a specific MIR basic-block
-  terminator (`none` matches any caller/block calling `dynKey`). Scoping prevents a caller's site
-  from hijacking an unregistered virtual call inside a callee frame and lets distinct SSA blocks
-  call the same virtual method with different `vtableLocal` temporaries (`canary_dyn_scoped_ssa_and_cross_frame_registry`). -/
+  terminator of a specific function (in every frame of that function). `none` scopes the site to
+  the **root function** (every frame executing the verified body, any block): the site describes
+  the verified body's own lowering, so it never reinterprets another function's unrelated
+  `vtableLocal`; a callee's virtual call needs its own scoped site and otherwise fails closed as
+  unregistered. Scoping also
+  lets distinct SSA blocks call the same virtual method with different `vtableLocal` temporaries
+  (`canary_dyn_scoped_ssa_and_cross_frame_registry`). -/
   callSiteLoc? : Option (DefPath × BasicBlockIdx) := none
   deriving DecidableEq
 
-/-- Whether `site`'s optional `(callerDefPath, blockIdx)` scope matches the active frame at `s`
-(`true` when `site.callSiteLoc? = none`). -/
+/-- Whether `site`'s scope matches the active frame at `s`: a scoped site matches its
+`(callerDefPath, blockIdx)` in every frame of that function; an unscoped site matches every frame
+executing the root body `body` (by definition path: the root frame before any call, after a
+callee returns — when `activeCallee = some body` — and recursive invocations), never a frame of
+another function. -/
 def DynCallSite.matchesLoc (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
   match site.callSiteLoc? with
-  | none => true
+  | none => decide ((s.memory.activeCallee.getD body).defPath = body.defPath)
   | some loc => decide (((s.memory.activeCallee.getD body).defPath, s.frame.blockIdx) = loc)
 
 /-- The receiver's runtime vtable pointer at `s`: local `site.vtableLocal` of the
@@ -3625,6 +3632,33 @@ theorem dynDemandStep_of_unregistered (env : CompilerQueryEnv) (tbl : OpaqueCall
       | true => simp [hd] at hu
   simp only [dynDemandStep, hnd, hu, Bool.false_eq_true, ite_false, ite_true]
 
+/-- An unscoped site matches exactly the frames executing the root function. -/
+theorem DynCallSite.matchesLoc_of_unscoped {site : DynCallSite} (body : CapturedMir)
+    (s : MachineState) (hun : site.callSiteLoc? = none) :
+    site.matchesLoc body s = decide ((s.memory.activeCallee.getD body).defPath = body.defPath) := by
+  simp [DynCallSite.matchesLoc, hun]
+
+/-- **Unscoped sites never dispatch in another function's frame**: while a body of a different
+function executes, an unscoped site is never demanded, so `dynDemandStep` is either the
+branch-pruned trusted step or fails closed on the (then unregistered) virtual call — it never
+reinterprets that frame's `vtableLocal`. -/
+theorem dynDemandStep_of_unscoped_foreign_frame (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    {site : DynCallSite} {body : CapturedMir} {s : MachineState}
+    (hun : site.callSiteLoc? = none)
+    (hforeign : (s.memory.activeCallee.getD body).defPath ≠ body.defPath) :
+    dynDemandStep env tbl site body s = stepBranchPruned tbl.lookup body s ∨
+      dynDemandStep env tbl site body s = MirStepNode.unsupported := by
+  have hnd : demandsDynSite site body s = false := by
+    unfold demandsDynSite
+    cases demandedKey? body s with
+    | none => rfl
+    | some k => simp [DynCallSite.matchesLoc, hun, hforeign]
+  unfold dynDemandStep
+  simp only [hnd, Bool.false_eq_true, ite_false]
+  cases demandsUnregisteredDyn site body s with
+  | true => exact Or.inr rfl
+  | false => exact Or.inl rfl
+
 /-- Fuel-bounded multi-step evaluation with demand-gated dynamic dispatch. -/
 def evalDynWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
     (site : DynCallSite) (body : CapturedMir) (fuel : Nat) (s : MachineState) : RunResult :=
@@ -3949,10 +3983,11 @@ def DynCallRegistry.scopedWellFormed (reg : DynCallRegistry) : Bool :=
   reg.all DynCallSite.wellFormed && DynCallRegistry.noOverlaps reg
 
 /-- When every site in `reg` is unscoped (`callSiteLoc? = none`), `findSiteAt?` coincides
-with `findSite?`. -/
+with `findSite?` in every frame of the root function. -/
 theorem DynCallRegistry.findSiteAt?_eq_findSite?_of_unscoped (reg : DynCallRegistry)
     (body : CapturedMir) (s : MachineState) (key : DefPath × List RigidTy)
-    (hun : reg.all (fun site => site.callSiteLoc?.isNone) = true) :
+    (hun : reg.all (fun site => site.callSiteLoc?.isNone) = true)
+    (hroot : (s.memory.activeCallee.getD body).defPath = body.defPath) :
     reg.findSiteAt? body s key = reg.findSite? key := by
   unfold DynCallRegistry.findSiteAt? DynCallRegistry.findSite?
   have hflt :
@@ -3965,7 +4000,7 @@ theorem DynCallRegistry.findSiteAt?_eq_findSite?_of_unscoped (reg : DynCallRegis
       have hloc : hd.matchesLoc body s = true := by
         unfold DynCallSite.matchesLoc
         cases hopt : hd.callSiteLoc? with
-        | none => rfl
+        | none => simp [hroot]
         | some _ => rw [hopt] at hun; nomatch hun.1
       simp only [List.filter_cons, hloc, Bool.and_true, ih hun.2]
   rw [hflt]
