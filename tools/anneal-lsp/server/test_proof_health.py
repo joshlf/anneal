@@ -5232,6 +5232,37 @@ class TestRule8RedundantBeqDecidableEq(unittest.TestCase):
             [(expected_line, "RealAfterTricky")],
         )
 
+    def test_guillemet_keywords_unary_parity_and_nested_attrs(self) -> None:
+        src = (
+            "structure «theorem» where\n"
+            "  «end» : Nat\n"
+            "  «for» : Nat\n"
+            "  deriving CustomHandler «for» «end», (@[expose] BEq.{0}), @[aesop safe [constructors]] DecidableEq.{0}\n"
+            "inductive KwTok where\n"
+            "  | «def» (x : Nat)\n"
+            "  | «section»\n"
+            "  deriving BEq, DecidableEq\n"
+            "deriving instance BEq, DecidableEq for «for», «end»\n"
+            "-- Negative controls (multi-argument handlers ending in `.BEq`, adjacent char+raw string, non-ident `!\"...\"`):\n"
+            "structure NonUnary where\n"
+            "  x : Nat\n"
+            "  deriving CustomPkg.BEq opt, (BEq a) b, DecidableEq\n"
+            'def nonInterpBang := (123!"{\\" deriving BEq, DecidableEq", \'a\'!"{\\" deriving BEq, DecidableEq")\n'
+        )
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(src)],
+            [
+                (4, "theorem"),
+                (8, "KwTok"),
+                (9, "for,end"),
+            ],
+        )
+        # Standalone check (no `!"` anywhere in text) for `'a'r#"..."#` and `'\''r"..."`:
+        adj_raw_only = (
+            'def adjRaw := (\'a\'r#"\\" deriving BEq, DecidableEq"#, \'\\\'\'r"\\" deriving BEq, DecidableEq")\n'
+        )
+        self.assertEqual(self._scan8(adj_raw_only), [])
+
     def test_post_edit_deltas_and_v7_cache_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "cache.json"

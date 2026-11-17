@@ -7789,7 +7789,7 @@ def _is_rbd_ident_char(ch: str) -> bool:
 
 def _skip_lean_char_lit(text: str, j: int, limit: int) -> int | None:
     """End offset of a Lean 4 character literal starting at `j` (`text[j] == "'"`), or `None`."""
-    if j + 2 < limit and text[j + 1] not in "\\\n'" and text[j + 2] == "'":
+    if j + 2 < limit and text[j + 1] not in "\\\r\n'" and text[j + 2] == "'":
         return j + 3
     if j + 3 < limit and text[j + 1] == "\\":
         esc = text[j + 2]
@@ -7856,8 +7856,10 @@ def _skip_lean_block_comment(text: str, j: int, limit: int) -> int:
 def _read_lean_dotted_ident(text: str, i: int, limit: int) -> tuple[str, int, bool]:
     """Read a dotted/guillemet Lean 4 identifier at `i`, returning `(name, end_off, plain_bang_tail)`.
 
-    `plain_bang_tail` is `True` when the final component is an unquoted identifier ending in `!`
-    (so an immediately following `"` forms an `<ident>!"..."` interpolated string literal).
+    Guillemet-quoted components retain their `«...»` delimiters so escaped names (`«for»`,
+    `«end»`, `«def»`, `«theorem»`, `«Not.BEq»`) never collide with bare Lean keywords or split on
+    embedded dots. `plain_bang_tail` is `True` when the final component is an unquoted identifier
+    ending in `!` (so an immediately following `"` forms an `<ident>!"..."` interpolated string).
     """
     parts: list[str] = []
     plain_bang = False
@@ -7871,9 +7873,7 @@ def _read_lean_dotted_ident(text: str, i: int, limit: int) -> tuple[str, int, bo
             else:
                 part = text[j + 1 : k]
                 j = k + 1
-            # Preserve guillemets when the single component itself contains `.`, so `«Not.BEq»`
-            # never splits into namespace `Not` + last component `BEq`.
-            parts.append(f"«{part}»" if "." in part else part)
+            parts.append(f"«{part}»")
             plain_bang = False
         elif j < limit and _is_rbd_ident_start(text[j]):
             k = j + 1
@@ -7890,6 +7890,55 @@ def _read_lean_dotted_ident(text: str, i: int, limit: int) -> tuple[str, int, bo
             continue
         break
     return ".".join(parts), j, plain_bang
+
+
+def _unquote_lean_ident(name: str) -> str:
+    """Strip `«...»` quotes from each `.`-separated component of `name`."""
+    if "«" not in name:
+        return name
+    out: list[str] = []
+    i = 0
+    n = len(name)
+    while i < n:
+        if name[i] == "«":
+            k = name.find("»", i + 1)
+            if k == -1:
+                out.append(name[i + 1 :])
+                break
+            out.append(name[i + 1 : k])
+            i = k + 1
+            if i < n and name[i] == ".":
+                out.append(".")
+                i += 1
+        else:
+            k = name.find(".", i)
+            if k == -1:
+                out.append(name[i:])
+                break
+            out.append(name[i : k + 1])
+            i = k + 1
+    return "".join(out)
+
+
+def _last_unquoted_component(name: str) -> str:
+    """Unquoted final component of a dotted Lean identifier (`«Not.BEq»` -> `Not.BEq`,
+    `_root_.«BEq»` -> `BEq`, `Foo.DecidableEq` -> `DecidableEq`)."""
+    if "«" not in name:
+        return name.rsplit(".", 1)[-1]
+    last_dot = -1
+    in_gui = False
+    for idx, ch in enumerate(name):
+        if in_gui:
+            if ch == "»":
+                in_gui = False
+        elif ch == "«":
+            in_gui = True
+        elif ch == ".":
+            last_dot = idx
+    comp = name[last_dot + 1 :]
+    if comp.startswith("«") and comp.endswith("»") and len(comp) >= 2:
+        return comp[1:-1]
+    return comp
 
 
 def _skip_lean_str_or_interp(text: str, quote_pos: int, limit: int, interpolated: bool) -> int:
@@ -8114,7 +8163,11 @@ def _blank_lean_exact(text: str) -> str:
                     not (_is_rbd_ident_char(text[r_pos - 1]) or text[r_pos - 1] == ".")
                     or (
                         text[r_pos - 1] == "'"
-                        and _is_char_lit_at(text, r_pos - 3, r_pos) == r_pos
+                        and any(
+                            _is_char_lit_at(text, r_pos - cl_len, r_pos) == r_pos
+                            for cl_len in range(3, 16)
+                            if r_pos >= cl_len and text[r_pos - cl_len] == "'"
+                        )
                     )
                 )
                 if prev_ok:
@@ -8126,12 +8179,7 @@ def _blank_lean_exact(text: str) -> str:
                         pos = end
                         continue
 
-        is_interp = (
-            nxt >= 2
-            and text[nxt - 1] == "!"
-            and text[nxt - 2] != "»"
-            and _is_rbd_ident_char(text[nxt - 2])
-        )
+        is_interp = nxt >= 2 and _has_interp_ident_before(text, nxt - 1)
         if nxt > pos:
             app(text[pos:nxt])
         end = _skip_lean_str_or_interp(text, nxt, n, is_interp)
@@ -8139,6 +8187,19 @@ def _blank_lean_exact(text: str) -> str:
         pos = end
 
     return "".join(out)
+
+
+def _has_interp_ident_before(text: str, bang_pos: int) -> bool:
+    """True iff `text[bang_pos] == "!"` ends an unquoted Lean identifier `<ident>!`
+    (rather than a numeric literal `123!` or character literal `'a'!`)."""
+    if bang_pos <= 0 or text[bang_pos] != "!" or text[bang_pos - 1] == "»":
+        return False
+    p = bang_pos - 1
+    if not _is_rbd_ident_char(text[p]):
+        return False
+    while p > 0 and _is_rbd_ident_char(text[p - 1]):
+        p -= 1
+    return _is_rbd_ident_start(text[p])
 
 
 class _LeanCursor:
@@ -8303,7 +8364,7 @@ def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
         tk = cur.peek()
         if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for":
             break
-        targets.append(tk[1])
+        targets.append(_unquote_lean_ident(tk[1]))
         cur.next()
 
         # Consume remaining outer parens from `(Foo α)` and optional type arguments.
@@ -8347,7 +8408,10 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
     """Parse a Lean 4.34.1 `deriving` clause or `deriving [noncomputable] instance` command
     beginning right after the `deriving` keyword at `after_deriving`.
 
-    Returns `(is_instance, classes, targets)`.
+    Returns `(is_instance, unary_classes, targets)`. Multi-argument class applications such as
+    `CustomPkg.BEq opt` or `(BEq a) b` are excluded from `unary_classes` (matching `lean_emit.rs`
+    `deriving_unary_class_core`), while universe-annotated `BEq.{0}` / `DecidableEq.{0}`,
+    parenthesized `(BEq)`, and `@[...]`-attributed entries remain unary.
     """
     cur = _LeanCursor(text, start=after_deriving)
     is_instance = False
@@ -8363,29 +8427,35 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
         else:
             return False, [], []
 
-    classes: list[str] = []
+    unary_classes: list[str] = []
+    saw_any_class = False
     while True:
-        if cur.peek()[:2] == ("punct", "@["):
-            cur.next()
-            if cur.peek()[:2] == ("ident", "expose"):
-                cur.next()
-                if cur.peek()[:2] == ("punct", "]"):
-                    cur.next()
-                else:
-                    break
-            else:
+        while cur.peek()[:2] == ("punct", "@["):
+            if not saw_any_class and cur.peek()[4] and cur.peek()[5] == 0:
                 break
+            _consume_balanced_group(cur)
 
         paren_depth = 0
         while cur.peek()[:2] == ("punct", "("):
             paren_depth += 1
             cur.next()
+            while cur.peek()[:2] == ("punct", "@["):
+                _consume_balanced_group(cur)
 
         tk = cur.peek()
         if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for":
             break
-        classes.append(tk[1])
+        head_name = tk[1]
+        saw_any_class = True
         cur.next()
+
+        has_term_arg = False
+        if cur.peek()[:2] == ("punct", "."):
+            cur.next()
+            if cur.peek()[:2] == ("punct", "{"):
+                _consume_balanced_group(cur)
+            else:
+                has_term_arg = True
 
         while True:
             tk = cur.peek()
@@ -8397,8 +8467,10 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
                     paren_depth -= 1
                     cur.next()
                 elif kind == "punct" and (val in _RBD_BRACKETS or val == "@["):
+                    has_term_arg = True
                     _consume_balanced_group(cur)
                 else:
+                    has_term_arg = True
                     cur.next()
                 continue
             if has_nl and col == 0:
@@ -8410,11 +8482,16 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
             if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
                 break
             if kind == "punct" and val in _RBD_BRACKETS:
+                has_term_arg = True
                 _consume_balanced_group(cur)
             elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
+                has_term_arg = True
                 cur.next()
             else:
                 break
+
+        if not has_term_arg and paren_depth == 0:
+            unary_classes.append(head_name)
 
         if cur.peek()[:2] == ("punct", ","):
             cur.next()
@@ -8425,7 +8502,7 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
     if is_instance and cur.peek()[:2] == ("ident", "for"):
         cur.next()
         targets = _parse_deriving_instance_targets_cursor(cur)
-    return is_instance, classes, targets
+    return is_instance, unary_classes, targets
 
 
 def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str | None:
@@ -8465,7 +8542,7 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
                     cur.next()
                     nxt = cur.peek()
                 if nxt[0] == "ident" and nxt[1] not in _DERIVING_STOP_WORDS and nxt[1] != "for":
-                    enclosing = nxt[1]
+                    enclosing = _unquote_lean_ident(nxt[1])
                     cur.next()
             elif val in _DERIVING_ENCLOSING_RESET_KWS:
                 if val in ("lemma", "constant", "universes", "variables") and cur.peek()[:2] == (
@@ -8484,7 +8561,14 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
 def _needs_exact_rbd_blank(text: str) -> bool:
     """True when `text` contains `<ident>!"..."` interpolation or adjacent char literals (`'a''\"'`)
     where `_scan_lean_comments_and_strings` is conservative and `_blank_lean_exact` is needed."""
-    return '!"' in text or "''\"" in text or "''\\" in text or "''«" in text
+    return (
+        '!"' in text
+        or "''\"" in text
+        or "''\\" in text
+        or "''«" in text
+        or "'r\"" in text
+        or "'r#" in text
+    )
 
 
 def _scan_redundant_beq_decidable_eq(
@@ -8528,7 +8612,7 @@ def _scan_redundant_beq_decidable_eq(
         if valid_kw:
             is_instance, classes, targets = _parse_deriving_clause_at(text, end_kw)
             if classes:
-                last_names = {c.rsplit(".", 1)[-1] for c in classes}
+                last_names = {_last_unquoted_component(c) for c in classes}
                 if "BEq" in last_names and "DecidableEq" in last_names:
                     if is_instance:
                         sym = ",".join(targets) if targets else "BEq,DecidableEq"

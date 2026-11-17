@@ -817,23 +817,23 @@ fn summarize_basic_block(bb: &IrBasicBlockData) -> String {
         {
             continue;
         }
-        if let Some(comment) = &stmt.comment {
-            parts.push(sanitize_comment_line(comment));
-        } else {
-            parts.push(summarize_statement_kind(&stmt.kind));
-        }
+        let raw = match &stmt.comment {
+            Some(comment) => comment.clone(),
+            None => summarize_statement_kind(&stmt.kind),
+        };
+        parts.push(sanitize_comment_line(&raw));
     }
-    if let Some(comment) = &bb.terminator.comment {
-        parts.push(sanitize_comment_line(comment));
-    } else {
-        parts.push(summarize_terminator_kind(&bb.terminator.kind));
-    }
+    let term_raw = match &bb.terminator.comment {
+        Some(comment) => comment.clone(),
+        None => summarize_terminator_kind(&bb.terminator.kind),
+    };
+    parts.push(sanitize_comment_line(&term_raw));
     parts.join("; ")
 }
 
 fn sanitize_comment_line(text: &str) -> String {
     text.chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .map(|c| if is_disallowed_guillemet_char(c) { ' ' } else { c })
         .collect::<String>()
         .trim()
         .to_owned()
@@ -1029,7 +1029,10 @@ fn summarize_terminator_kind(kind: &IrTerminatorKind) -> String {
 }
 
 /// Escapes a Rust string for inclusion inside a Lean 4 string literal
-/// (`"..."`).
+/// (`"..."`), escaping control characters (`\xHH`) as well as Unicode line/paragraph
+/// separators and bidirectional/zero-width format characters (`\uHHHH`, preventing
+/// Trojan-Source BiDi overrides in generated `.lean` files while preserving exact
+/// `String` scalar values in Lean).
 pub fn escape_lean_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1047,6 +1050,11 @@ pub fn escape_lean_str(s: &str) -> String {
                 let code = u32::from(c);
                 debug_assert!(code <= 0xff, "control character {c:?} exceeds `\\xHH`");
                 out.push_str(&format!("\\x{code:02x}"));
+            }
+            c if is_disallowed_guillemet_char(c) => {
+                let code = u32::from(c);
+                debug_assert!(code <= 0xffff, "format character {c:?} exceeds `\\uHHHH`");
+                out.push_str(&format!("\\u{code:04x}"));
             }
             c => out.push(c),
         }
@@ -2325,13 +2333,13 @@ pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
                 if prev_kind != 0 {
                     return Err("`@` must appear at term start, after whitespace, or after `(` / `[`".to_owned());
                 }
-                if !matches!(chars.peek(), Some(nc) if nc.is_ascii_alphabetic() || matches!(nc, '_' | '«' | '(')) {
-                    return Err("dangling `@` in Lean term".to_owned());
+                if !matches!(chars.peek(), Some(nc) if nc.is_ascii_alphabetic() || matches!(nc, '_' | '«')) {
+                    return Err("`@` must be followed by an identifier in Lean term".to_owned());
                 }
                 prev_kind = 5;
             }
             '(' | '[' => {
-                if prev_kind == 4 || (c == '[' && prev_kind == 5) {
+                if matches!(prev_kind, 4 | 5) {
                     return Err(format!("unexpected `{c}` after `.` or `@` in Lean term"));
                 }
                 brackets.push(c);
@@ -2603,118 +2611,352 @@ pub fn emit_opaque_callee_table_lean_module_with_imports(
 // `DecidableEq`-without-redundant-`BEq` (`LawfulBEq`) deriving hygiene.
 // ---------------------------------------------------------------------------
 
-/// If `s` starts with `open` (`(` or `[`) and that opener's matching `close` (`)` or `]`) occurs in
-/// `s` (ignoring delimiters inside `"..."` strings and `«...»` guillemets), returns the byte index
-/// of that matching `close`.
+fn is_lean_ident_cont_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '\'' | '!' | '?')
+}
+
+/// If `s[start..]` begins with a Lean 4 character literal (`'x'`, `'\''`, `'\"'`, `'\x41'`,
+/// `'\u0041'`, `'\u{41}'`), returns the byte offset immediately after its closing `'`.
+fn skip_lean_char_lit_bytes(s: &str, start: usize) -> Option<usize> {
+    let rest = s.get(start..)?.strip_prefix('\'')?;
+    let mut it = rest.char_indices();
+    let (_, c1) = it.next()?;
+    if c1 == '\\' {
+        let (_, esc) = it.next()?;
+        match esc {
+            '\\' | '\'' | '"' | 'n' | 'r' | 't' | '0' => {
+                let (close_rel, close_ch) = it.next()?;
+                (close_ch == '\'').then_some(start + 1 + close_rel + 1)
+            }
+            'x' => {
+                for _ in 0..2 {
+                    if !it.next()?.1.is_ascii_hexdigit() {
+                        return None;
+                    }
+                }
+                let (close_rel, close_ch) = it.next()?;
+                (close_ch == '\'').then_some(start + 1 + close_rel + 1)
+            }
+            'u' => {
+                let (_, u0) = it.next()?;
+                if u0 == '{' {
+                    let mut digits = 0usize;
+                    loop {
+                        let (_, ch) = it.next()?;
+                        if ch == '}' {
+                            break;
+                        }
+                        if !ch.is_ascii_hexdigit() || digits >= 8 {
+                            return None;
+                        }
+                        digits += 1;
+                    }
+                    if digits == 0 {
+                        return None;
+                    }
+                } else {
+                    if !u0.is_ascii_hexdigit() {
+                        return None;
+                    }
+                    for _ in 0..3 {
+                        if !it.next()?.1.is_ascii_hexdigit() {
+                            return None;
+                        }
+                    }
+                }
+                let (close_rel, close_ch) = it.next()?;
+                (close_ch == '\'').then_some(start + 1 + close_rel + 1)
+            }
+            _ => None,
+        }
+    } else if !matches!(c1, '\'' | '\n' | '\r') {
+        let (close_rel, close_ch) = it.next()?;
+        (close_ch == '\'').then_some(start + 1 + close_rel + 1)
+    } else {
+        None
+    }
+}
+
+/// If `s[start..]` begins with a Lean 4 raw string literal (`r"..."` or `r#"..."#`), returns the
+/// byte offset past its closing delimiter (or `s.len()` when unclosed).
+fn skip_lean_raw_str_bytes(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(start).copied() != Some(b'r') {
+        return None;
+    }
+    let mut k = start + 1;
+    while k < bytes.len() && bytes[k] == b'#' {
+        k += 1;
+    }
+    if bytes.get(k).copied() != Some(b'"') {
+        return None;
+    }
+    let hashes = k - (start + 1);
+    let mut close = String::with_capacity(1 + hashes);
+    close.push('"');
+    for _ in 0..hashes {
+        close.push('#');
+    }
+    Some(
+        s[k + 1..]
+            .find(&close)
+            .map_or(s.len(), |rel| k + 1 + rel + close.len()),
+    )
+}
+
+/// Byte offset past a `"`-opened Lean string literal at `s[start..]` (or `s.len()` when unclosed).
+fn skip_lean_quoted_str_bytes(s: &str, start: usize) -> usize {
+    let mut escaped = false;
+    for (rel, c) in s[start + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return start + 1 + rel + 1;
+        }
+    }
+    s.len()
+}
+
+/// Strips Lean `--` line comments and nested `/- ... -/` block comments from `s`, preserving
+/// `"..."` strings, `r#"..."#` raw strings, `'...'` character literals, and `«...»` guillemets.
+fn strip_lean_deriving_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut prev_ident = false;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("--") {
+            out.push(' ');
+            i = rest.find('\n').map_or(s.len(), |nl| i + nl);
+            prev_ident = false;
+        } else if rest.starts_with("/-") {
+            let mut depth = 1usize;
+            let mut cur = i + 2;
+            while depth > 0 && cur < s.len() {
+                let tail = &s[cur..];
+                if tail.starts_with("/-") {
+                    depth += 1;
+                    cur += 2;
+                } else if tail.starts_with("-/") {
+                    depth -= 1;
+                    cur += 2;
+                } else {
+                    cur += tail.chars().next().unwrap().len_utf8();
+                }
+            }
+            out.push(' ');
+            i = cur;
+            prev_ident = false;
+        } else if rest.starts_with('«') {
+            let end = rest.get(2..).and_then(|r| r.find('»')).map_or(s.len(), |rel| i + 2 + rel + 2);
+            out.push_str(&s[i..end]);
+            i = end;
+            prev_ident = true;
+        } else if !prev_ident
+            && rest.starts_with('r')
+            && let Some(end) = skip_lean_raw_str_bytes(s, i)
+        {
+            out.push_str(&s[i..end]);
+            i = end;
+            prev_ident = false;
+        } else if rest.starts_with('"') {
+            let end = skip_lean_quoted_str_bytes(s, i);
+            out.push_str(&s[i..end]);
+            i = end;
+            prev_ident = false;
+        } else if !prev_ident
+            && rest.starts_with('\'')
+            && let Some(end) = skip_lean_char_lit_bytes(s, i)
+        {
+            out.push_str(&s[i..end]);
+            i = end;
+            prev_ident = false;
+        } else {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+            prev_ident = is_lean_ident_cont_char(c);
+        }
+    }
+    out
+}
+
+/// If `s` starts with `open` (`(`, `[`, or `{`) and that opener's matching `close` (`)`, `]`, or
+/// `}`) occurs in `s` (ignoring delimiters inside comments, `"..."` strings, `r#"..."#` raw
+/// strings, `'...'` character literals, and `«...»` guillemets), returns the byte index of that
+/// matching `close`.
 fn find_matching_delim(s: &str, open: char, close: char) -> Option<usize> {
     if !s.starts_with(open) {
         return None;
     }
     let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut in_gui = false;
-    for (i, c) in s.char_indices() {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_str = false;
+    let mut i = 0usize;
+    let mut prev_ident = false;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("--") {
+            i = rest.find('\n').map_or(s.len(), |nl| i + nl);
+            prev_ident = false;
+        } else if rest.starts_with("/-") {
+            let mut cdepth = 1usize;
+            let mut cur = i + 2;
+            while cdepth > 0 && cur < s.len() {
+                let tail = &s[cur..];
+                if tail.starts_with("/-") {
+                    cdepth += 1;
+                    cur += 2;
+                } else if tail.starts_with("-/") {
+                    cdepth -= 1;
+                    cur += 2;
+                } else {
+                    cur += tail.chars().next().unwrap().len_utf8();
+                }
             }
-            continue;
-        }
-        if in_gui {
-            if c == '»' {
-                in_gui = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => in_str = true,
-            '«' => in_gui = true,
-            _ if c == open => depth += 1,
-            _ if c == close => {
+            i = cur;
+            prev_ident = false;
+        } else if rest.starts_with('«') {
+            i = rest.get(2..).and_then(|r| r.find('»')).map_or(s.len(), |rel| i + 2 + rel + 2);
+            prev_ident = true;
+        } else if !prev_ident
+            && rest.starts_with('r')
+            && let Some(end) = skip_lean_raw_str_bytes(s, i)
+        {
+            i = end;
+            prev_ident = false;
+        } else if rest.starts_with('"') {
+            i = skip_lean_quoted_str_bytes(s, i);
+            prev_ident = false;
+        } else if !prev_ident
+            && rest.starts_with('\'')
+            && let Some(end) = skip_lean_char_lit_bytes(s, i)
+        {
+            i = end;
+            prev_ident = false;
+        } else {
+            let c = rest.chars().next().unwrap();
+            if c == open {
+                depth += 1;
+            } else if c == close {
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
                 }
             }
-            _ => {}
+            prev_ident = is_lean_ident_cont_char(c);
+            i += c.len_utf8();
         }
     }
     None
 }
 
-/// Strips leading `@[...]` attributes (including nested brackets like `@[aesop safe [constructors]]`)
-/// and outer parentheses wrapping the entire entry, then splits the remaining entry into
-/// `(head_class_ref, arg_tail)` while respecting `«...»` guillemets and parenthesized heads like
-/// `(CustomHandler) opt`.
-fn parse_deriving_entry(entry: &str) -> (&str, &str) {
-    let mut s = entry.trim();
-    while let Some(after_at) = s.strip_prefix('@') {
-        let after_at = after_at.trim_start();
-        if !after_at.starts_with('[') {
-            break;
-        }
-        match find_matching_delim(after_at, '[', ']') {
-            Some(close) => s = after_at[close + 1..].trim_start(),
-            None => return ("", ""),
-        }
-    }
+/// Strips comments, leading `@[...]` attributes (including nested brackets like
+/// `@[aesop safe [constructors]]`), and outer parentheses wrapping the entire entry, then splits
+/// the remaining entry into `(head_class_ref, arg_tail)` while respecting `«...»` guillemets,
+/// `.{...}` universe annotations, char/string literals, and curried parenthesized heads like
+/// `(Handler a) b`. Never returns `("", "")` on a non-empty class body.
+fn parse_deriving_entry(entry: &str) -> (String, String) {
+    let cleaned = strip_lean_deriving_comments(entry);
+    parse_deriving_entry_clean(cleaned.trim())
+}
+
+fn parse_deriving_entry_clean(raw: &str) -> (String, String) {
+    let mut s = raw.trim();
     loop {
-        let t = s.trim();
-        if let Some(close) = find_matching_delim(t, '(', ')') {
-            if close + 1 == t.len() {
-                s = &t[1..close];
-                continue;
+        if let Some(after_at) = s.strip_prefix('@') {
+            let after_at = after_at.trim_start();
+            if after_at.starts_with('[') {
+                match find_matching_delim(after_at, '[', ']') {
+                    Some(close) => {
+                        s = after_at[close + 1..].trim();
+                        continue;
+                    }
+                    None => return (s.to_owned(), String::new()),
+                }
             }
         }
-        s = t;
+        if let Some(close) = find_matching_delim(s, '(', ')')
+            && close + 1 == s.len()
+        {
+            s = s[1..close].trim();
+            continue;
+        }
         break;
     }
     if s.is_empty() {
-        return ("", "");
+        return (String::new(), String::new());
     }
     if s.starts_with('(') {
         if let Some(close) = find_matching_delim(s, '(', ')') {
             let inner = s[1..close].trim();
-            let (head, inner_args) = parse_deriving_entry(inner);
+            let (head, inner_args) = parse_deriving_entry_clean(inner);
             let outer_args = s[close + 1..].trim();
-            // Keep *every* argument in the tail: `(Handler a) b` must neither dedup against
-            // `Handler a` / `(Handler a) c` nor ever classify as a unary class.
-            let tail = if inner_args.is_empty() {
-                outer_args
-            } else if outer_args.is_empty() {
-                inner_args
-            } else {
-                // `inner_args` is a non-empty subslice of `s`: span it through `outer_args`.
-                &s[inner_args.as_ptr() as usize - s.as_ptr() as usize..]
+            if head.is_empty() {
+                return (s.to_owned(), String::new());
+            }
+            let tail = match (inner_args.is_empty(), outer_args.is_empty()) {
+                (true, _) => outer_args.to_owned(),
+                (false, true) => inner_args,
+                (false, false) => format!("{inner_args} {outer_args}"),
             };
             return (head, tail);
         }
-        return ("", "");
+        return (s.to_owned(), String::new());
     }
     let mut in_gui = false;
     let mut head_end = s.len();
-    for (i, c) in s.char_indices() {
+    let mut i = 0usize;
+    while i < s.len() {
+        let rest = &s[i..];
+        let c = rest.chars().next().unwrap();
         if in_gui {
             if c == '»' {
                 in_gui = false;
             }
+            i += c.len_utf8();
             continue;
         }
         if c == '«' {
             in_gui = true;
+            i += c.len_utf8();
             continue;
         }
-        if c.is_whitespace() || matches!(c, '(' | '[' | '{' | '⟨' | '⦃') {
+        if c == '.'
+            && rest[1..].starts_with('{')
+            && let Some(u_close) = find_matching_delim(&rest[1..], '{', '}')
+        {
+            i += 1 + u_close + 1;
+            continue;
+        }
+        if c.is_whitespace() || matches!(c, '(' | '[' | '{' | '⟨' | '⦃' | '"' | '\'') {
             head_end = i;
             break;
         }
+        i += c.len_utf8();
     }
-    (&s[..head_end], s[head_end..].trim())
+    (s[..head_end].to_owned(), s[head_end..].trim().to_owned())
+}
+
+/// Splits a trailing `.{...}` universe annotation off `head` (outside `«...»` guillemets).
+fn split_universe_suffix(head: &str) -> (&str, &str) {
+    let mut in_gui = false;
+    for (i, c) in head.char_indices() {
+        if in_gui {
+            if c == '»' {
+                in_gui = false;
+            }
+        } else if c == '«' {
+            in_gui = true;
+        } else if c == '.'
+            && head[i + 1..].starts_with('{')
+            && let Some(close) = find_matching_delim(&head[i + 1..], '{', '}')
+            && i + 1 + close + 1 == head.len()
+        {
+            return (&head[..i], &head[i..]);
+        }
+    }
+    (head, "")
 }
 
 /// Splits a dotted Lean identifier on `.` outside `«...»` guillemets.
@@ -2745,33 +2987,35 @@ fn unwrap_guillemet_component(comp: &str) -> &str {
 }
 
 /// Unqualified unary class name of a `deriving` entry (`_root_.BEq`, `Foo.DecidableEq`,
-/// `@[expose] BEq`, `(BEq)`, `Lean.«BEq»`, and `«a b».BEq` map to `Some("BEq")` /
+/// `@[expose] BEq`, `(BEq)`, `BEq.{0}`, `Lean.«BEq»`, and `«a b».BEq` map to `Some("BEq")` /
 /// `Some("DecidableEq")`, whereas an atomic guillemet containing a dot `«Not.BEq»` maps to
 /// `Some("Not.BEq")` and a multi-argument class term `Custom.BEq opt` maps to `None`).
-fn deriving_unary_class_core(entry: &str) -> Option<&str> {
+fn deriving_unary_class_core(entry: &str) -> Option<String> {
     let (head, arg_tail) = parse_deriving_entry(entry);
     if head.is_empty() || !arg_tail.is_empty() {
         return None;
     }
-    let last = *split_dotted_outside_guillemets(head).last()?;
-    Some(unwrap_guillemet_component(last))
+    let (base_head, _) = split_universe_suffix(&head);
+    let last = *split_dotted_outside_guillemets(base_head).last()?;
+    Some(unwrap_guillemet_component(last).to_owned())
 }
 
-/// Deduplication key of a `deriving` entry: attributes and outer parentheses stripped, leading
-/// `_root_.` removed, simple ASCII guillemets (`«DecidableEq»` -> `DecidableEq`) normalized, and
-/// trailing arguments whitespace-collapsed.
+/// Deduplication key of a `deriving` entry: comments, attributes, and outer parentheses stripped,
+/// leading `_root_.` removed, simple ASCII guillemets (`«DecidableEq»` -> `DecidableEq`)
+/// normalized, universe annotations preserved, and arguments whitespace-collapsed.
 fn deriving_class_dedup_key(entry: &str) -> String {
     let (head, arg_tail) = parse_deriving_entry(entry);
     if head.is_empty() {
         return String::new();
     }
-    let raw_parts = split_dotted_outside_guillemets(head);
+    let (base_head, univ_suffix) = split_universe_suffix(&head);
+    let raw_parts = split_dotted_outside_guillemets(base_head);
     let parts = if raw_parts.len() > 1 && unwrap_guillemet_component(raw_parts[0]) == "_root_" {
         &raw_parts[1..]
     } else {
         &raw_parts[..]
     };
-    let norm_head: String = parts
+    let mut norm_head: String = parts
         .iter()
         .map(|&comp| {
             let unq = unwrap_guillemet_component(comp);
@@ -2788,6 +3032,11 @@ fn deriving_class_dedup_key(entry: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".");
+    if !univ_suffix.is_empty() {
+        let inner = &univ_suffix[2..univ_suffix.len() - 1];
+        let norm_univ = inner.split_whitespace().collect::<Vec<_>>().join(" ");
+        norm_head.push_str(&format!(".{{{norm_univ}}}"));
+    }
     if arg_tail.is_empty() {
         norm_head
     } else {
@@ -2797,22 +3046,22 @@ fn deriving_class_dedup_key(entry: &str) -> String {
 }
 
 /// Sanitizes the classes of one `deriving` clause (cl/1022563952): whenever `DecidableEq`
-/// (possibly qualified, parenthesized or `@[...]`-attributed) is present, every unary `BEq` entry
-/// (in any of those forms) is dropped, so the derived structural `BEq` instance never shadows
-/// `instBEqOfDecidableEq` and core's `instLawfulBEq` (`beq_iff_eq`) keeps applying. Entries are
-/// trimmed, empty entries dropped, and duplicates (same class reference) removed keeping the
-/// first occurrence, preserving order.
+/// (possibly qualified, parenthesized, universe-annotated, commented, or `@[...]`-attributed) is
+/// present, every unary `BEq` entry (in any of those forms) is dropped, so the derived structural
+/// `BEq` instance never shadows `instBEqOfDecidableEq` and core's `instLawfulBEq` (`beq_iff_eq`)
+/// keeps applying. Entries are trimmed, empty/comment-only entries dropped, and duplicates (same
+/// class reference) removed keeping the first occurrence, preserving order.
 pub fn sanitize_deriving_classes<'a>(classes: &[&'a str]) -> Vec<&'a str> {
     let has_decidable_eq = classes
         .iter()
-        .any(|class| deriving_unary_class_core(class) == Some("DecidableEq"));
+        .any(|class| deriving_unary_class_core(class).as_deref() == Some("DecidableEq"));
     let mut seen: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for &class in classes {
         let class = class.trim();
         let (head, _) = parse_deriving_entry(class);
         if head.is_empty()
-            || (has_decidable_eq && deriving_unary_class_core(class) == Some("BEq"))
+            || (has_decidable_eq && deriving_unary_class_core(class).as_deref() == Some("BEq"))
         {
             continue;
         }
@@ -3447,6 +3696,7 @@ mod opaque_callee_table_tests {
         // Regression: a C1 control is escaped by code point, not by its UTF-8 bytes `\xc2\x85`.
         assert_eq!(escape_lean_str("\u{85}"), "\\x85");
         assert_eq!(escape_lean_str("\u{0}\u{7f}"), "\\x00\\x7f");
+        assert_eq!(escape_lean_str("\u{2028}\u{202e}"), "\\u2028\\u202e");
         assert_eq!(escape_lean_str("\"\\"), "\\\"\\\\");
 
         let code = emit_opaque_callee_table_lean_module(
@@ -3463,13 +3713,67 @@ mod opaque_callee_table_tests {
 
     #[test]
     fn mir_module_header_neutralizes_comment_delimiters_and_imports_trusted_only() {
-        let mir = fixture_mir("demo::x -/ axiom bad : False /- y\nz", 0, vec![], 1);
+        let mut mir = fixture_mir(
+            "demo::x -/ axiom bad : False /- y\nz\u{2028}\u{202e}end",
+            0,
+            vec![],
+            1,
+        );
+        let u32_ty = mir.local_decls[0].ty.clone();
+        // Regression (B2): when `stmt.comment` / `terminator.comment` is `None`,
+        // `summarize_basic_block` falls back to `summarize_statement_kind` /
+        // `summarize_terminator_kind`, which splice `Unevaluated(def_path)`,
+        // `ThreadLocalRef(path)`, and `Downcast(Some(name), _)` into `-- bb0: ...`.
+        // Embedded `\n`, `\r`, `\u{85}`, `\u{2028}`, or BiDi overrides must never break out of
+        // the `-- bb0:` line comment into trusted `Mir/<Item>.lean`.
+        mir.basic_blocks[0].statements.push(IrStatement {
+            kind: IrStatementKind::Assign(
+                IrPlace {
+                    local_: 0,
+                    projection: vec![IrProjectionElem::Downcast(
+                        Some(String::from("Variant\naxiom bad_downcast : False")),
+                        0,
+                    )],
+                },
+                IrRvalue::ThreadLocalRef(String::from(
+                    "demo::TLS\raxiom bad_tls : False\u{2028}def injected := 1",
+                )),
+            ),
+            span: String::from("src/lib.rs:2:1: 2:2"),
+            comment: None,
+        });
+        mir.basic_blocks[0].terminator = IrTerminator {
+            kind: IrTerminatorKind::Call {
+                func: IrOperand::Constant(IrConstOperand {
+                    ty: u32_ty,
+                    val: IrConstValue::Unevaluated(String::from(
+                        "demo::callee\naxiom bad_call : False\u{85}theorem evil : False := sorry",
+                    )),
+                }),
+                args: vec![],
+                destination: IrPlace { local_: 0, projection: vec![] },
+                target: None,
+                unwind: IrUnwindAction::Terminate,
+            },
+            span: String::from("src/lib.rs:3:1: 3:2"),
+            comment: None,
+        };
         let code = emit_mir_lean_module("Mir.Demo.X", &mir);
         let doc = code.lines().find(|line| line.starts_with("/-! ")).unwrap();
         assert!(doc.ends_with(" -/"), "{doc}");
         let inner = &doc[3..doc.len() - 2];
         assert!(!inner.contains("-/") && !inner.contains("/-"), "{doc}");
-        assert!(!code.lines().any(|line| line.starts_with("axiom")));
+        assert!(
+            !code.lines().any(|line| {
+                let t = line.trim_start();
+                t.starts_with("axiom") || t.starts_with("theorem") || t.starts_with("def injected")
+            }),
+            "comment breakout in emitted Mir module:\n{code}"
+        );
+        assert!(
+            !code.chars().any(|c| c != '\n' && is_disallowed_guillemet_char(c)),
+            "disallowed control/format character in emitted Mir module:\n{code:?}"
+        );
         // TrustedBoundary statement-origin isolation: a trusted `Mir/<Item>.lean` module imports
         // `Trusted` only, never `Anneal.*` (in particular not `Anneal.OpaqueCalleeTable`).
         let imports: Vec<&str> = code.lines().filter(|line| line.starts_with("import ")).collect();
@@ -3497,8 +3801,9 @@ mod opaque_callee_table_tests {
             "[a)", "a; b", "a := b", "Mir.def.body", "Mir.repeat.body", "Mir.exists.body",
             "Mir.elab.body", "sorry", "s!", "_", "Mir._.body", "x end Foo", "«»", "Mir.«».body",
             "«a", "«a\nb»", "Mir.«a\u{202e}b».body", "Mir.«a\u{2028}b».body", "a «b «c» »", "a,b",
-            "a{b}", "a#b", "a\\b", "a`b", "$x", "a ⟨b⟩", "@", "@ ", "@)", "a@b", "@@x", ".", ".x",
-            "Mir.", "Mir..body", "Mir.0", "0abc", "123'!", "0x", "()", "[]", "42",
+            "a{b}", "a#b", "a\\b", "a`b", "$x", "a ⟨b⟩", "@", "@ ", "@)", "@(Mir.Demo.leaf.body)",
+            "@() x", "a@b", "@@x", ".", ".x", "Mir.", "Mir..body", "Mir.0", "0abc", "123'!", "0x",
+            "()", "[]", "42",
         ] {
             assert!(validate_lean_term_expr(bad).is_err(), "{bad:?}");
         }
@@ -3615,6 +3920,40 @@ mod opaque_callee_table_tests {
             ),
             // Multi-argument handler whose head ends in `.BEq` is not core's unary `BEq`:
             (&["CustomPkg.BEq opt", "DecidableEq"], &["CustomPkg.BEq opt", "DecidableEq"]),
+            // Char literals, raw strings, comments, universe annotations, curried parens, and
+            // unclosed delimiters (never silently delete a non-empty class entry):
+            (
+                &[
+                    "/- a -/ @[expose] /- b -/ BEq /- c -/",
+                    "BEq -- trailing note\n",
+                    "BEq.{0}",
+                    "(Handler '\"')",
+                    "(Handler ')') opt",
+                    "(Handler r#\")\"#)",
+                    "Handler.{0}",
+                    "Handler.{ 0 }",
+                    "Handler.{1}",
+                    "Handler a b",
+                    "(Handler a) b",
+                    "((Handler a)) b",
+                    "(Handler a ) b",
+                    "Handler (a b)",
+                    "(UnclosedHandler",
+                    "/- only comment -/",
+                    "DecidableEq.{0}",
+                ],
+                &[
+                    "(Handler '\"')",
+                    "(Handler ')') opt",
+                    "(Handler r#\")\"#)",
+                    "Handler.{0}",
+                    "Handler.{1}",
+                    "Handler a b",
+                    "Handler (a b)",
+                    "(UnclosedHandler",
+                    "DecidableEq.{0}",
+                ],
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(sanitize_deriving_classes(input), want.to_vec(), "{input:?}");
@@ -3635,41 +3974,67 @@ mod opaque_callee_table_tests {
         );
     }
 
-    /// Splits a `deriving` class list on top-level commas outside brackets, quotes, and `«...»`.
+    /// Splits a `deriving` class list on top-level commas outside brackets, comments, strings,
+    /// raw strings, char literals, and `«...»`.
     fn split_top_level_commas(s: &str) -> Vec<&str> {
         let mut out = Vec::new();
         let mut start = 0usize;
         let mut depth = 0usize;
-        let mut in_gui = false;
-        let mut in_str = false;
-        let mut escaped = false;
-        for (i, c) in s.char_indices() {
-            if in_str {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_str = false;
+        let mut i = 0usize;
+        let mut prev_ident = false;
+        while i < s.len() {
+            let rest = &s[i..];
+            if rest.starts_with("--") {
+                i = rest.find('\n').map_or(s.len(), |nl| i + nl);
+                prev_ident = false;
+            } else if rest.starts_with("/-") {
+                let mut cdepth = 1usize;
+                let mut cur = i + 2;
+                while cdepth > 0 && cur < s.len() {
+                    let tail = &s[cur..];
+                    if tail.starts_with("/-") {
+                        cdepth += 1;
+                        cur += 2;
+                    } else if tail.starts_with("-/") {
+                        cdepth -= 1;
+                        cur += 2;
+                    } else {
+                        cur += tail.chars().next().unwrap().len_utf8();
+                    }
                 }
-                continue;
-            }
-            if in_gui {
-                if c == '»' {
-                    in_gui = false;
+                i = cur;
+                prev_ident = false;
+            } else if rest.starts_with('«') {
+                i = rest.get(2..).and_then(|r| r.find('»')).map_or(s.len(), |rel| i + 2 + rel + 2);
+                prev_ident = true;
+            } else if !prev_ident
+                && rest.starts_with('r')
+                && let Some(end) = skip_lean_raw_str_bytes(s, i)
+            {
+                i = end;
+                prev_ident = false;
+            } else if rest.starts_with('"') {
+                i = skip_lean_quoted_str_bytes(s, i);
+                prev_ident = false;
+            } else if !prev_ident
+                && rest.starts_with('\'')
+                && let Some(end) = skip_lean_char_lit_bytes(s, i)
+            {
+                i = end;
+                prev_ident = false;
+            } else {
+                let c = rest.chars().next().unwrap();
+                match c {
+                    '(' | '[' | '{' | '⟨' | '⦃' => depth += 1,
+                    ')' | ']' | '}' | '⟩' | '⦄' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        out.push(&s[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
                 }
-                continue;
-            }
-            match c {
-                '"' => in_str = true,
-                '«' => in_gui = true,
-                '(' | '[' | '{' | '⟨' | '⦃' => depth += 1,
-                ')' | ']' | '}' | '⟩' | '⦄' => depth = depth.saturating_sub(1),
-                ',' if depth == 0 => {
-                    out.push(&s[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
+                prev_ident = is_lean_ident_cont_char(c);
+                i += c.len_utf8();
             }
         }
         out.push(&s[start..]);
@@ -3715,11 +4080,11 @@ mod opaque_callee_table_tests {
                 }
             }
             let classes = words.find(" for ").map_or(words, |end| &words[..end]);
-            let cores: Vec<&str> = split_top_level_commas(classes)
+            let cores: Vec<String> = split_top_level_commas(classes)
                 .into_iter()
                 .filter_map(deriving_unary_class_core)
                 .collect();
-            if cores.contains(&"BEq") && cores.contains(&"DecidableEq") {
+            if cores.iter().any(|c| c == "BEq") && cores.iter().any(|c| c == "DecidableEq") {
                 hits.push((line_no, acc.trim().to_owned()));
             }
         }
@@ -3899,7 +4264,22 @@ mod opaque_callee_table_tests {
         let stage = stage_dir.0.canonicalize().unwrap();
         assert!(!stage.starts_with(&lean.repo_root), "staging dir must be outside the checkout");
 
-        let weird_path = "demo::we\"ird\\path\n\t\u{1}\u{7f}\u{85}é→";
+        let weird_path = "demo::we\"ird\\path\n\t\u{1}\u{7f}\u{85}\u{2028}\u{202e}é→";
+        let mut weird_mir = fixture_mir(weird_path, 0, vec![], 7);
+        let weird_u32_ty = weird_mir.local_decls[0].ty.clone();
+        weird_mir.basic_blocks[0].statements.push(IrStatement {
+            kind: IrStatementKind::Assign(
+                IrPlace { local_: 0, projection: vec![] },
+                IrRvalue::Use(IrOperand::Constant(IrConstOperand {
+                    ty: weird_u32_ty,
+                    val: IrConstValue::Unevaluated(String::from(
+                        "demo::CONST\naxiom bad_e2e_comment_breakout : False",
+                    )),
+                })),
+            ),
+            span: String::from("src/lib.rs:2:1: 2:2"),
+            comment: None,
+        });
         let area_impl = trait_impl("demo::Area::area", "demo::<Square as Area>::area");
         // (module, `lean_ident` hint, captured body)
         let items = vec![
@@ -3913,7 +4293,7 @@ mod opaque_callee_table_tests {
             ("Mir.Demo.AreaMethod", "demo::Area::area", fixture_mir("demo::Area::area", 1, vec![], 4)),
             ("Mir.Demo.LeafShadow", "demo::leaf", fixture_mir("demo::leaf", 0, vec![], 5)),
             ("Mir.Demo.Collide", "demo::leaf", fixture_mir("demo::leaf_2", 0, vec![], 6)),
-            ("Mir.Demo.Weird", "end", fixture_mir(weird_path, 0, vec![], 7)),
+            ("Mir.Demo.Weird", "end", weird_mir),
         ];
         let mut entries = Vec::new();
         for (module, hint, mir) in &items {
