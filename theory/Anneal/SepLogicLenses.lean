@@ -27573,6 +27573,60 @@ theorem WidePtrVal.evalRvalue_len_oob_global_ub_and_ptrMetadata_ok
     cases heq
   · rfl
 
+/-- **`UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_to_thin_global`**: casting a global-backed
+(`lookupBorrow mem.borrows wide.1.tag = none`) `UnsizedSliceDstAt` wide pointer `fatVal` to a thin
+raw pointer (`isThinRawPtrTy targetTy = true`, i.e., `p as *const U` in rustc's `to_raw_parts`
+lowering) yields `.ok (wide.dataVal ptrBytes) locals' mem` and preserves `UnsizedSliceDstAt`. -/
+theorem UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_to_thin_global
+    {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {dstTy : RigidTy} {mem : Memory} {wide : WidePtrVal} {fatVal : Value}
+    {elems : List α} {bytes : ByteMem}
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hDst : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hNoBorrow : lookupBorrow mem.borrows wide.1.tag = none)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok fatVal locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (wide.dataVal (layoutPointerBytes layouts)) locals' mem ∧
+    UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes := by
+  have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hOp
+  exact ⟨Anneal.MirLiftCore.evalRvalue_cast_ptrToPtr_wide_to_thin locals locals' op targetTy mem
+      localDecls layouts wide.1 wide.2 hThin hNoBorrow hOp',
+    hDst⟩
+
+/-- **`UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_wide_to_wide`**: casting any (global-backed or
+borrow-backed) `UnsizedSliceDstAt` wide pointer `fatVal` to a non-`dyn` wide raw pointer type
+(`isThinRawPtrTy targetTy = false`, `wideRawPtrIsDyn? targetTy = some false`, e.g.,
+`*const [T] as *mut [T]` or `*const str as *const [u8]`) returns `.ok fatVal locals' mem` and
+preserves `UnsizedSliceDstAt`. -/
+theorem UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_wide_to_wide
+    {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {dstTy : RigidTy} {mem : Memory} {wide : WidePtrVal} {fatVal : Value}
+    {elems : List α} {bytes : ByteMem}
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hDst : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hNotThin : isThinRawPtrTy targetTy = false)
+    (hWide : wideRawPtrIsDyn? targetTy = some false)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok fatVal locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok fatVal locals' mem ∧
+    UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes := by
+  have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hOp
+  refine ⟨?_, hDst⟩
+  rw [hDst.fat_eq]
+  exact Anneal.MirLiftCore.evalRvalue_cast_ptrToPtr_wide_to_wide locals locals' op targetTy mem
+    localDecls layouts wide.1 wide.2 hNotThin hWide hOp'
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses

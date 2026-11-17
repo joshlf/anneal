@@ -768,13 +768,22 @@ theorem realistic_to_raw_parts_from_raw_parts_roundtrip :
     { frame := { blockIdx := 0, stmtIdx := 2, locals := rawPartsLocals2 }, memory := mem0 }
   let s3 : MachineState :=
     { frame := { blockIdx := 0, stmtIdx := 3, locals := rawPartsLocals3 }, memory := mem0 }
-  obtain ⟨_, h1, _, _⟩ := mirStep_assign_local (body := rawPartsBody) (cur := rawPartsBody)
-    (s := s0) (dstLoc := 2) (val := .ptr p9 8) (locals₁ := rawPartsLocals0) (mem₁ := mem0)
-    (locals₂ := rawPartsLocals1) rfl (Or.inl rfl) rfl rfl
-    (evalRvalue_cast_ptrToPtr_wide_to_thin rawPartsLocals0 rawPartsLocals0
-      (.copy { local_ := 1, projection := [] }) _ mem0 rawPartsBody.localDecls layouts64 p9 4
-      rfl rfl rfl)
-    rfl rfl rfl rfl
+  obtain ⟨_, h1, _, _⟩ := mirStep_assign_cast_ptrToPtr_wide_to_thin (body := rawPartsBody)
+    (cur := rawPartsBody) (s := s0) (dstLoc := 2) (q := p9) (len := 4)
+    (locals₁ := rawPartsLocals0) (locals₂ := rawPartsLocals1)
+    rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  have _ := evalRvalue_cast_ptrToPtr_wide_to_thin rawPartsLocals0 rawPartsLocals0
+    (.copy { local_ := 1, projection := [] })
+    { kind := .rawPtr .not (.tuple []), layoutIdx := 0 } mem0 rawPartsBody.localDecls layouts64
+    p9 4 rfl rfl rfl
+  have _ := arr_unsizedDst64.evalRvalue_cast_ptrToPtr_to_thin_global rawPartsLocals0 rawPartsLocals0
+    (.copy { local_ := 1, projection := [] })
+    { kind := .rawPtr .not (.tuple []), layoutIdx := 0 } rawPartsBody.localDecls layouts64
+    rfl rfl rfl
+  have _ := arr_unsizedDst64.evalRvalue_cast_ptrToPtr_wide_to_wide rawPartsLocals0 rawPartsLocals0
+    (.copy { local_ := 1, projection := [] })
+    { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 1 } rawPartsBody.localDecls
+    layouts64 rfl rfl rfl
   obtain ⟨_, h2, _, _⟩ := mirStep_assign_local (body := rawPartsBody) (cur := rawPartsBody)
     (s := s1) (dstLoc := 3) (val := .scalar ⟨4, 8⟩) (locals₁ := rawPartsLocals1) (mem₁ := mem0)
     (locals₂ := rawPartsLocals2) rfl (Or.inl rfl) rfl rfl
@@ -792,6 +801,43 @@ theorem realistic_to_raw_parts_from_raw_parts_roundtrip :
     evalRvalue_cast_ptrToPtr_wide_to_wide rawPartsLocals0 rawPartsLocals0
       (.copy { local_ := 1, projection := [] }) _ mem0 rawPartsBody.localDecls layouts64 p9 4
       rfl rfl rfl⟩
+
+/-- Subslice-backed borrow entry (`targetProjection = [.subslice 0 4 false]`) on `backingArrLocals`. -/
+def subsliceEntry77 : BorrowEntry :=
+  { tag := 77, targetLocal := 0, targetProjection := [.subslice 0 4 false], perm := .unique,
+    rangeOffset := 0, rangeLen := 16 }
+
+/-- **Borrow-backed `CastKind.ptrToPtr` (`p as *const ()`) characterization**:
+1. When the borrow entry already ends with `.subslice 0 4 false` (`subsliceEntry77`),
+   `evalRvalue_cast_ptrToPtr_wide_to_thin_already_subslice` returns `.ok (.ptr ⟨77, 0⟩ 8)` with
+   `mem` **unchanged** (`alreadySubslice = true`), so `(p as *const (), PtrMetadata(p))` +
+   `AggregateKind.rawPtr` is the exact identity even on borrow-backed slice pointers!
+2. When the borrow entry targets the whole array with `targetProjection = []` (`mutEntry77`),
+   `evalRvalue_cast_ptrToPtr_wide_to_thin_fresh_subslice` allocates a fresh narrowed subslice
+   borrow entry at `mem.nextTag = 78` (`targetProjection = [.subslice 0 4 false]`). -/
+theorem borrow_backed_ptrToPtr_already_subslice_and_fresh_subslice :
+    let unitPtrTy : Ty := { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }
+    let memSub : Memory := { borrows := [subsliceEntry77], nextTag := 78 }
+    let memArr : Memory := { borrows := [mutEntry77], nextTag := 78 }
+    let child78 : BorrowEntry :=
+      { tag := 78, targetLocal := 0, targetProjection := [.subslice 0 4 false], perm := .unique }
+    evalRvalue backingArrLocals (.cast .ptrToPtr (.copy { local_ := 1, projection := [] }) unitPtrTy)
+        memSub [] layouts64 = .ok (.ptr ⟨77, 0⟩ 8) backingArrLocals memSub ∧
+    evalRvalue backingArrLocals (.cast .ptrToPtr (.copy { local_ := 1, projection := [] }) unitPtrTy)
+        memArr [] layouts64 =
+      .ok (.ptr ⟨78, 0⟩ 8) backingArrLocals
+        { memArr with borrows := child78 :: memArr.borrows, nextTag := 79 } := by
+  intro unitPtrTy memSub memArr child78
+  exact ⟨evalRvalue_cast_ptrToPtr_wide_to_thin_already_subslice backingArrLocals backingArrLocals
+      (.copy { local_ := 1, projection := [] }) unitPtrTy memSub [] layouts64 ⟨77, 0⟩ 4
+      subsliceEntry77 (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩])
+      [.subslice 0 4 false] 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩] 0
+      rfl rfl rfl (fun h => by cases h) rfl rfl rfl rfl rfl,
+    evalRvalue_cast_ptrToPtr_wide_to_thin_fresh_subslice backingArrLocals backingArrLocals
+      (.copy { local_ := 1, projection := [] }) unitPtrTy memArr [] layouts64 ⟨77, 0⟩ 4
+      mutEntry77 (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩])
+      [] 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩] 0
+      rfl rfl rfl (fun h => by cases h) rfl rfl rfl rfl rfl⟩
 
 /-! ## 5. End-to-End `MirWpConverges` & `PureLift.V2026_06_01Bridge` Spatial-Pin Preservation -/
 
@@ -1996,6 +2042,133 @@ theorem metadata_without_deref_disabled_tag_contrast :
       (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
       rfl rfl rfl rfl
   exact ⟨hLenUb, hMetaOk, hMir, _, _, hD1, hD2, hPin2, hBind2⟩
+
+/-- MIR body executing `_4 = copy _1 as *const ()` (`CastKind.ptrToPtr` wide-to-thin) and
+`_5 = copy _1 as *mut [u32]` (`CastKind.ptrToPtr` wide-to-wide) while `_2 : [u32; 4]` is spatially
+pinned and `_3 : u32` holds an active loan binding. -/
+def ptrToPtrPinBody : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "test::ptrToPtr_with_pinned_array" 1
+      [{ mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := some "_0" },
+       { mutability := .not, ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 1 },
+         debugName := some "p" },
+       { mutability := .mut, ty := pinArrTy, debugName := some "pinned_arr" },
+       { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 },
+         debugName := some "bound_u32" },
+       { mutability := .mut, ty := { kind := .rawPtr .not (.tuple []), layoutIdx := 0 },
+         debugName := some "data_ptr" },
+       { mutability := .mut, ty := { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 1 },
+         debugName := some "mut_sl" }]
+      [retBlock
+         [{ kind := .assign { local_ := 4, projection := [] }
+              (.cast .ptrToPtr (.copy { local_ := 1, projection := [] })
+                { kind := .rawPtr .not (.tuple []), layoutIdx := 0 })
+            span := "stmt_cast_wide_to_thin" },
+          { kind := .assign { local_ := 5, projection := [] }
+              (.cast .ptrToPtr (.copy { local_ := 1, projection := [] })
+                { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 1 })
+            span := "stmt_cast_wide_to_wide" }]]) with
+    layouts := layouts64 }
+
+/-- **`CastKind.ptrToPtr` spatial-pin lifters, provenance-free casts, and negative `.ub` canaries**:
+- `mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin`,
+  `mirStep_assign_cast_ptrToPtr_wide_to_wide`, and
+  `mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin` step across `p as *const ()`
+  and `p as *mut [u32]` while `_2 : [u32; 4]` remains spatially pinned and `_3 : u32` remains bound;
+- `evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_thin` and
+  `evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_wide` cast provenance-free wide pointers;
+- `evalRvalue_cast_ptrToPtr_wide_to_thin_disabled_ub` faults `.ub` when casting a `.disabled`
+  borrow-backed wide pointer to a thin pointer (in contrast to `UnOp.ptrMetadata`, which succeeds!);
+- `evalRvalue_cast_ptrToPtr_thin_to_wide_ub` and `evalRvalue_cast_ptrToPtr_wide_slice_to_dyn_ub`
+  fault `.ub` on thin-to-wide and slice-to-`dyn` `CastKind.ptrToPtr` casts. -/
+theorem ptrToPtr_spatialPin_scalarAddr_and_negative_canaries :
+    let unitPtrTy : Ty := { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }
+    let mutSlicePtrTy : Ty := { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 1 }
+    let dynPtrTy : Ty := { kind := .rawPtr .not (.dynamic "core::fmt::Debug"), layoutIdx := 1 }
+    let danglingVal : Value := .aggregate 0 [.scalar ⟨4, 8⟩, .scalar ⟨0, 8⟩]
+    let danglingLocals : List LocalSlot := (dstLocals 8).set 1 (.init danglingVal)
+    let cLocals0 : List LocalSlot :=
+      [.init .unit, .init (WidePtrVal.toValue 8 wide4), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+       .uninit, .uninit]
+    let cMs0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := cLocals0 }
+        memory := { mem0 with borrows := pinBorrows } }
+    (∃ cMs1 cMs2,
+      PureMirExec.mirStep ptrToPtrPinBody cMs0 = .cont cMs1 ∧
+      PureMirExec.mirStep ptrToPtrPinBody cMs1 = .cont cMs2 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt cMs2 ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt cMs2) ∧
+    evalRvalue danglingLocals (.cast .ptrToPtr (.copy { local_ := 1, projection := [] }) unitPtrTy)
+        mem0 dstDecls layouts64 = .ok (.scalar ⟨4, 8⟩) danglingLocals mem0 ∧
+    evalRvalue danglingLocals
+        (.cast .ptrToPtr (.copy { local_ := 1, projection := [] }) mutSlicePtrTy)
+        mem0 dstDecls layouts64 = .ok danglingVal danglingLocals mem0 ∧
+    evalRvalue disabledLocals (.cast .ptrToPtr (.copy { local_ := 1, projection := [] }) unitPtrTy)
+        disabledMem dstDecls layouts64 = .ub ∧
+    evalRvalue (dstLocals 8)
+        (.cast .ptrToPtr (.copy { local_ := 5, projection := [] }) mutSlicePtrTy)
+        mem0 dstDecls layouts64 = .ub ∧
+    evalRvalue (dstLocals 8)
+        (.cast .ptrToPtr (.copy { local_ := 1, projection := [] }) dynPtrTy)
+        mem0 dstDecls layouts64 = .ub := by
+  intro unitPtrTy mutSlicePtrTy dynPtrTy danglingVal danglingLocals cLocals0 cMs0
+  let cLocals1 : List LocalSlot :=
+    [.init .unit, .init (WidePtrVal.toValue 8 wide4), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+     .init (.ptr p9 8), .uninit]
+  let cLocals2 : List LocalSlot :=
+    [.init .unit, .init (WidePtrVal.toValue 8 wide4), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+     .init (.ptr p9 8), .init (WidePtrVal.toValue 8 wide4)]
+  have hPin0 : spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt cMs0 :=
+    ⟨_, _, [], _, rfl, ⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl⟩⟩
+  have hBind0 : spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt cMs0 :=
+    ⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩
+  have hNeBind : ∀ d, d ≠ 3 → ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ d := by
+    intro d hd b hb
+    cases hb with
+    | head => exact fun h => hd h.symm
+    | tail _ h => cases h
+  obtain ⟨hC1, hPin1, hBind1, _⟩ :=
+    mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin tagOfLoan
+      (body := ptrToPtrPinBody) (cur := ptrToPtrPinBody) (ms := cMs0) (dstLoc := 4)
+      (p := p9) (len := 4) (locals₁ := cLocals0) (locals₂ := cLocals1)
+      hPin0 hBind0 (by decide) (hNeBind 4 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  have _ := mirStep_assign_cast_ptrToPtr_wide_to_wide (body := ptrToPtrPinBody)
+    (cur := ptrToPtrPinBody)
+    (s := { frame := { blockIdx := 0, stmtIdx := 1, locals := cLocals1 },
+            memory := { cMs0.memory with
+              borrows := invalidateConflictingBorrows cMs0.memory.borrows 4 .none 0 } })
+    (dstLoc := 5) (q := p9) (len := 4) (locals₁ := cLocals1) (locals₂ := cLocals2)
+    rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  obtain ⟨hC2, hPin2, hBind2, _⟩ :=
+    mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin tagOfLoan
+      (body := ptrToPtrPinBody) (cur := ptrToPtrPinBody) (dstLoc := 5)
+      (p := p9) (len := 4) (locals₁ := cLocals1) (locals₂ := cLocals2)
+      hPin1 hBind1 (by decide) (hNeBind 5 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  exact ⟨⟨_, _, hC1, hC2, hPin2, hBind2⟩,
+    evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_thin danglingLocals danglingLocals
+      (.copy { local_ := 1, projection := [] }) unitPtrTy mem0 dstDecls layouts64 4 0
+      rfl (by decide) rfl,
+    evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_wide danglingLocals danglingLocals
+      (.copy { local_ := 1, projection := [] }) mutSlicePtrTy mem0 dstDecls layouts64 4 0
+      rfl rfl (by decide) (by decide) rfl,
+    evalRvalue_cast_ptrToPtr_wide_to_thin_disabled_ub disabledLocals disabledLocals
+      (.copy { local_ := 1, projection := [] }) unitPtrTy disabledMem dstDecls layouts64
+      ⟨77, 0⟩ 4
+      { tag := 77, targetLocal := 0, targetProjection := [], perm := .disabled,
+        rangeOffset := 0, rangeLen := 16 }
+      rfl rfl rfl rfl,
+    evalRvalue_cast_ptrToPtr_thin_to_wide_ub (dstLocals 8) (dstLocals 8)
+      (.copy { local_ := 5, projection := [] }) mutSlicePtrTy mem0 dstDecls layouts64 p9 rfl rfl,
+    evalRvalue_cast_ptrToPtr_wide_slice_to_dyn_ub (dstLocals 8) (dstLocals 8)
+      (.copy { local_ := 1, projection := [] }) dynPtrTy mem0 dstDecls layouts64 p9 4
+      rfl rfl rfl rfl⟩
 
 /-! ## 8. Automated `run_cmd` Axiom & Reachability Audit -/
 

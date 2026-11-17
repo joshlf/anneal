@@ -21875,6 +21875,287 @@ theorem evalRvalue_cast_ptrToPtr_wide_to_wide (locals locals' : List LocalSlot) 
   unfold evalCastPtrToPtr
   simp only [hOp, Nat.beq_refl, Bool.and_self, hNotThin, hWide]
 
+/-- **`evalRvalue_cast_ptrToPtr_wide_to_thin_already_subslice`**: when a stack-borrow-backed wide
+slice pointer `.aggregate 0 [.ptr q ptrBytes, .scalar ⟨len, ptrBytes⟩]` is cast to a thin raw
+pointer (`isThinRawPtrTy targetTy = true`) and its `BorrowEntry`'s container projection already
+ends with a `.subslice` covering `[0 .. length elems)` at element offset `0`
+(`alreadySubslice = true` in `deriveStackElemThinPtr`), `evalCastPtrToPtr` returns
+`.ok (.ptr q ptrBytes) locals' mem` with `mem` **unchanged** (no fresh tag is allocated), so
+`(p as *const U, PtrMetadata(p))` + `AggregateKind.rawPtr` is the exact identity on subslice-backed
+borrow pointers as well as global-backed pointers. -/
+theorem evalRvalue_cast_ptrToPtr_wide_to_thin_already_subslice
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (q : ProvenancePtr) (len : Nat) (parentEntry : BorrowEntry) (rootVal : Value)
+    (containerProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value)
+    (rawElemOffset : Nat)
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals')
+    (hBorrow : lookupBorrow mem.borrows q.tag = some parentEntry)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth
+      parentEntry.targetLocal = some (.init rootVal))
+    (hRead : readSliceBackingAggregate? locals' rootVal
+      (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection))
+      len = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? q.offsetBytes (inferElemListByteStride elems) =
+      some rawElemOffset)
+    (hBound : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (length elems) = true)
+    (hAlready : Bool.and (endsWithSubslice containerProj)
+      (Bool.and (Nat.beq (Nat.add rawElemOffset baseIdx) 0) (Nat.beq len (length elems))) =
+        true) :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.ptr q (layoutPointerBytes layouts)) locals' mem := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hThin, hBorrow]
+  unfold deriveStackElemThinPtr
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
+  dsimp only at hPerm hRoot hRead ⊢
+  cases perm
+  all_goals first
+    | exact absurd rfl hPerm
+    | (simp only [hRoot, hRead, hOff, hBound, hAlready] <;> rfl)
+
+/-- **`evalRvalue_cast_ptrToPtr_wide_to_thin_fresh_subslice`**: when a stack-borrow-backed wide
+slice pointer `.aggregate 0 [.ptr q ptrBytes, .scalar ⟨len, ptrBytes⟩]` is cast to a thin raw
+pointer (`isThinRawPtrTy targetTy = true`) and its container projection does not already end with
+a matching `[0 .. length elems)` `.subslice` (`alreadySubslice = false`), `deriveStackElemThinPtr`
+allocates a fresh narrowed child borrow entry at `mem.nextTag` and returns
+`.ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } ptrBytes) locals' mem'`. -/
+theorem evalRvalue_cast_ptrToPtr_wide_to_thin_fresh_subslice
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (q : ProvenancePtr) (len : Nat) (parentEntry : BorrowEntry) (rootVal : Value)
+    (containerProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value)
+    (rawElemOffset : Nat)
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals')
+    (hBorrow : lookupBorrow mem.borrows q.tag = some parentEntry)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth
+      parentEntry.targetLocal = some (.init rootVal))
+    (hRead : readSliceBackingAggregate? locals' rootVal
+      (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection))
+      len = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? q.offsetBytes (inferElemListByteStride elems) =
+      some rawElemOffset)
+    (hBound : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (length elems) = true)
+    (hFresh : Bool.and (endsWithSubslice containerProj)
+      (Bool.and (Nat.beq (Nat.add rawElemOffset baseIdx) 0) (Nat.beq len (length elems))) =
+        false) :
+    let elemOffset := Nat.add rawElemOffset baseIdx
+    let endOffset := Nat.add elemOffset len
+    let subProj := ProjectionElem.subslice elemOffset endOffset false :: .nil
+    let fullProj :=
+      match containerProj with
+      | .nil => subProj
+      | ph :: pt => ph :: appendProjections pt subProj
+    let entry : BorrowEntry :=
+      { tag := mem.nextTag
+        targetLocal := parentEntry.targetLocal
+        targetFrameDepth := parentEntry.targetFrameDepth
+        allocDead := parentEntry.allocDead
+        targetProjection := normalizeSubsliceProjections fullProj
+        perm := parentEntry.perm }
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } (layoutPointerBytes layouts)) locals'
+        { mem with borrows := entry :: mem.borrows, nextTag := Nat.add mem.nextTag 1 } := by
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
+  intro elemOffset endOffset subProj fullProj entry
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hThin, hBorrow]
+  unfold deriveStackElemThinPtr
+  dsimp only [entry, fullProj, subProj, endOffset, elemOffset] at hPerm hRoot hRead ⊢
+  cases perm
+  all_goals first
+    | exact absurd rfl hPerm
+    | (cases containerProj <;> simp only [hRoot, hRead, hOff, hBound, hFresh] <;> rfl)
+
+/-- **UB Characterization (`CastKind.ptrToPtr` on `.disabled` borrow)**: unlike `UnOp.ptrMetadata`
+(which never consults `mem.borrows`), casting a wide pointer `.aggregate 0 [.ptr q ptrBytes,
+.scalar ⟨len, ptrBytes⟩]` to a thin raw pointer (`p as *const ()`) consults `lookupBorrow` via
+`deriveStackElemThinPtr` and faults with `.ub` when `parentEntry.perm = .disabled`. -/
+theorem evalRvalue_cast_ptrToPtr_wide_to_thin_disabled_ub
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (q : ProvenancePtr) (len : Nat) (parentEntry : BorrowEntry)
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals')
+    (hBorrow : lookupBorrow mem.borrows q.tag = some parentEntry)
+    (hDis : parentEntry.perm = .disabled) :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hThin, hBorrow]
+  unfold deriveStackElemThinPtr
+  rw [hDis]
+
+/-- **`evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_thin`**: `CastKind.ptrToPtr` on a provenance-free
+(integer-address) wide pointer `.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]`
+(`addr < scalarModulus ptrBytes`) to a thin raw pointer (`isThinRawPtrTy targetTy = true`) returns
+`.ok (.scalar ⟨addr, ptrBytes⟩) locals' mem` without consulting `mem.borrows`. -/
+theorem evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_thin
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (addr len : Nat)
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hAddr : addr < scalarModulus (layoutPointerBytes layouts))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.scalar ⟨addr, layoutPointerBytes layouts⟩) locals' mem := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hThin, wrapScalarBits_eq_of_lt hAddr]
+
+/-- **`evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_wide`**: `CastKind.ptrToPtr` on a provenance-free
+wide pointer `.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]`
+(`addr, len < scalarModulus ptrBytes`) between non-`dyn` wide raw pointer types returns the
+provenance-free wide pointer unchanged. -/
+theorem evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_wide
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (addr len : Nat)
+    (hNotThin : isThinRawPtrTy targetTy = false)
+    (hWide : wideRawPtrIsDyn? targetTy = some false)
+    (hAddr : addr < scalarModulus (layoutPointerBytes layouts))
+    (hLen : len < scalarModulus (layoutPointerBytes layouts))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+        .scalar ⟨len, layoutPointerBytes layouts⟩]) locals' mem := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hNotThin, hWide,
+    wrapScalarBits_eq_of_lt hAddr, wrapScalarBits_eq_of_lt hLen]
+
+/-- **Negative (`CastKind.ptrToPtr` thin-to-wide)**: casting a thin pointer `.ptr q ptrBytes` to a
+wide raw pointer (`thinRawPtrPointee? targetTy = none`) via `CastKind.ptrToPtr` faults with `.ub`. -/
+theorem evalRvalue_cast_ptrToPtr_thin_to_wide_ub
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (q : ProvenancePtr)
+    (hNotThin : thinRawPtrPointee? targetTy = none)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.ptr q (layoutPointerBytes layouts)) locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, hNotThin]
+
+/-- **Negative (`CastKind.ptrToPtr` slice-to-`dyn`)**: casting a slice/str wide pointer
+(`isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) = true`) to a `dyn Trait` wide pointer
+(`isThinRawPtrTy targetTy = false`, `wideRawPtrIsDyn? targetTy = some true`) via `CastKind.ptrToPtr`
+faults with `.ub`. -/
+theorem evalRvalue_cast_ptrToPtr_wide_slice_to_dyn_ub
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (q : ProvenancePtr) (len : Nat)
+    (hNotThin : isThinRawPtrTy targetTy = false)
+    (hDyn : wideRawPtrIsDyn? targetTy = some true)
+    (hSliceSrc : isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts = .ub := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hNotThin, hDyn, hSliceSrc]
+
+/-- **`mirStep_assign_cast_ptrToPtr_wide_to_thin`**: one-step `stepMirFn` / `mirStep` lifter for
+`StatementKind.assign { local_ := dstLoc, projection := [] } (.cast .ptrToPtr op targetTy)` on a
+wide pointer with `lookupBorrow s.memory.borrows q.tag = none` (rustc's `p as *const ()` data-half
+lowering in `to_raw_parts`). -/
+theorem mirStep_assign_cast_ptrToPtr_wide_to_thin {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {dstLoc : Local} {op : Operand} {targetTy : Ty} {span : String}
+    {q : ProvenancePtr} {len : Nat} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hStmt : get? blk.statements s.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.cast .ptrToPtr op targetTy),
+             span := span })
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hNoBorrow : lookupBorrow s.memory.borrows q.tag = none)
+    (hOp : evalOperand s.frame.locals op s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes cur.layouts),
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
+    (hProt : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors dstLoc .none
+      .nil 0 0 (length s.memory.callStack) = false)
+    (hSlot : get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals₁ dstLoc (.init (.ptr q (layoutPointerBytes cur.layouts))) = some locals₂) :
+    let s' : MachineState :=
+      { frame := { blockIdx := s.frame.blockIdx, stmtIdx := s.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none
+            (length s.memory.callStack) } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    mirStep body s = .cont s' ∧
+    (∀ fuel post,
+      Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
+        Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
+    (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) :=
+  mirStep_assign_local hCur hPhase hBb hStmt
+    (evalRvalue_cast_ptrToPtr_wide_to_thin s.frame.locals locals₁ op targetTy s.memory
+      cur.localDecls cur.layouts q len hThin hNoBorrow hOp)
+    hProt hSlot hLive hSet
+
+/-- **`mirStep_assign_cast_ptrToPtr_wide_to_wide`**: one-step `stepMirFn` / `mirStep` lifter for
+`StatementKind.assign { local_ := dstLoc, projection := [] } (.cast .ptrToPtr op targetTy)` between
+non-`dyn` wide raw pointer types (`*const [T] as *mut [T]`, `*const str as *const [u8]`). -/
+theorem mirStep_assign_cast_ptrToPtr_wide_to_wide {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {dstLoc : Local} {op : Operand} {targetTy : Ty} {span : String}
+    {q : ProvenancePtr} {len : Nat} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hStmt : get? blk.statements s.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.cast .ptrToPtr op targetTy),
+             span := span })
+    (hNotThin : isThinRawPtrTy targetTy = false)
+    (hWide : wideRawPtrIsDyn? targetTy = some false)
+    (hOp : evalOperand s.frame.locals op s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes cur.layouts),
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
+    (hProt : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors dstLoc .none
+      .nil 0 0 (length s.memory.callStack) = false)
+    (hSlot : get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals₁ dstLoc
+      (.init (.aggregate 0 [.ptr q (layoutPointerBytes cur.layouts),
+        .scalar ⟨len, layoutPointerBytes cur.layouts⟩])) = some locals₂) :
+    let s' : MachineState :=
+      { frame := { blockIdx := s.frame.blockIdx, stmtIdx := s.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none
+            (length s.memory.callStack) } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    mirStep body s = .cont s' ∧
+    (∀ fuel post,
+      Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
+        Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
+    (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) :=
+  mirStep_assign_local hCur hPhase hBb hStmt
+    (evalRvalue_cast_ptrToPtr_wide_to_wide s.frame.locals locals₁ op targetTy s.memory
+      cur.localDecls cur.layouts q len hNotThin hWide hOp)
+    hProt hSlot hLive hSet
+
 end UnsizedDstMetadataLifters
 
 end Anneal.MirLiftCore
