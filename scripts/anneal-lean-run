@@ -860,6 +860,35 @@ def _strip_transparent_launchers(cmd: list[str]) -> list[str]:
                     continue
                 if arg in _ENV_OPTIONS_WITH_OPERAND:
                     i += 2
+                elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+                    cluster = arg[1:]
+                    spliced = False
+                    for pos, flag in enumerate(cluster):
+                        if flag == "S":
+                            rest = cluster[pos + 1 :]
+                            if rest:
+                                try:
+                                    split_tokens = shlex.split(rest)
+                                except ValueError:
+                                    return []
+                                argv = [*argv[:i], *split_tokens, *argv[i + 1 :]]
+                            else:
+                                if i + 1 >= len(argv):
+                                    return []
+                                try:
+                                    split_tokens = shlex.split(argv[i + 1])
+                                except ValueError:
+                                    return []
+                                argv = [*argv[:i], *split_tokens, *argv[i + 2 :]]
+                            spliced = True
+                            break
+                        if flag in "uC":
+                            if pos == len(cluster) - 1:
+                                i += 1
+                            break
+                    if spliced:
+                        continue
+                    i += 1
                 elif arg.startswith("-") or _ENV_ASSIGNMENT_RE.fullmatch(arg):
                     i += 1
                 else:
@@ -868,6 +897,8 @@ def _strip_transparent_launchers(cmd: list[str]) -> list[str]:
             continue
         if name == "lake":
             i = 1
+            if i < len(argv) and len(argv[i]) > 1 and argv[i].startswith("+"):
+                i += 1
             while i < len(argv) and argv[i].startswith("-"):
                 i += 2 if argv[i] in _LAKE_OPTIONS_WITH_OPERAND else 1
             if i < len(argv) and argv[i] in ("env", "exe", "exec"):
@@ -2318,7 +2349,10 @@ def run_self_test() -> int:
                 ["env", "--", "FOO=1", "python3-dbg", "trusted/audit/check_trusted.py"],
                 ["env", "-S", "FOO=1 python3 -B trusted/audit/check_trusted.py --fast"],
                 ["env", "-SFOO=1 python3 trusted/audit/check_trusted.py"],
+                ["env", "-iu", "LEAN_PATH", "python3", "trusted/audit/check_trusted.py"],
+                ["env", "-iS", "FOO=1 python3 trusted/audit/check_trusted.py"],
                 ["env", "--split-string=lean --run trusted/audit/TrustedBoundary.lean"],
+                ["lake", "+leanprover/lean4:v4.34.1", "env", "leanchecker", "Anneal"],
                 ["uv", "run", "--no-project", "python3", "trusted/audit/check_trusted.py"],
                 ["uv", "run", "--python", "3.12", "--", "trusted/audit/check_trusted.py"],
                 ["elan", "run", "leanprover/lean4:v4.34.1", "leanchecker", "Anneal"],

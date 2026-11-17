@@ -2767,23 +2767,27 @@ fn is_lean_decl_name(name: &str) -> bool {
     name.split('.').all(is_lean_ident_component)
 }
 
-/// ASCII identifier atoms of a Lean type: maximal runs of `[A-Za-z0-9_']`. Every reference to a
-/// field named by an ASCII identifier appears as one of these atoms.
+/// Identifier atoms of a Lean type: maximal runs of [`is_lean_id_rest`] characters (with `«` and
+/// `»` treated as delimiters so `«self»` still exposes `self`). Every reference to a field or
+/// generated structure named by a Lean identifier appears as one of these atoms, without splitting
+/// Unicode identifier suffixes (`x₁`, `αself`).
 fn lean_ident_atoms(lean_ty: &str) -> impl Iterator<Item = &str> {
     lean_ty
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\''))
+        .split(|c: char| !is_lean_id_rest(c))
         .filter(|atom| !atom.is_empty())
 }
 
 /// Leading components of the dotted identifiers of a Lean type: of each maximal run of
-/// `[A-Za-z0-9_'.]`, the text before its first `.` when that text starts like an identifier.
-/// Lean resolves only these components through the open namespaces (`Nat.rec` names `Nat`'s
-/// recursor and `x.f` projects from `x`, whatever the open namespaces declare as `rec` or `f`).
+/// `[<id_rest>.«»]`, the text before its first `.` (with `«` and `»` stripped) when that text
+/// starts like a Lean identifier ([`is_lean_id_first`]). Lean resolves only these components
+/// through the open namespaces (`Nat.rec` names `Nat`'s recursor and `Foo.«part1»` resolves in
+/// `Foo`, whatever the open namespaces declare as `rec` or `part1`).
 fn lean_ident_heads(lean_ty: &str) -> impl Iterator<Item = &str> {
     lean_ty
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\'' || c == '.'))
+        .split(|c: char| !(is_lean_id_rest(c) || c == '.' || c == '\u{ab}' || c == '\u{bb}'))
         .filter_map(|run| run.split('.').next())
-        .filter(|head| head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+        .map(|head| head.trim_matches(['\u{ab}', '\u{bb}']))
+        .filter(|head| head.starts_with(is_lean_id_first))
 }
 
 /// Lean `v4.34.1`'s `isLetterLike`: Greek letters other than `λ`, `Π`, and `Σ`, Coptic,
@@ -2885,7 +2889,19 @@ fn has_balanced_lean_delimiters(text: &str) -> bool {
                 Prev::Gap
             }
             (_, '\u{ab}') => {
-                if !chars.by_ref().any(|q| q == '\u{bb}') {
+                let mut closed = false;
+                let mut non_empty = false;
+                for q in chars.by_ref() {
+                    if q == '\u{ab}' {
+                        return false;
+                    }
+                    if q == '\u{bb}' {
+                        closed = non_empty;
+                        break;
+                    }
+                    non_empty = true;
+                }
+                if !closed {
                     return false;
                 }
                 Prev::Gap
@@ -3021,19 +3037,23 @@ fn check_lcnf_emission(
         .iter()
         .map(|field| field.name.as_str())
         .collect();
+    let is_derived_part_instance = |ident: &str| {
+        ident.starts_with("inst")
+            && generated_types
+                .iter()
+                .any(|ty| ident.ends_with(ty.as_str()))
+    };
     for field in &plan.fields {
         // `deriving C` on a generated structure `<struct_name>.<T>` declares the instance
         // `<struct_name>.instC<T>` (`Wide.instReprPart1`), which an accessor would collide with.
-        let derived_instance = field.name.starts_with("inst")
-            && generated_types.iter().any(|ty| field.name.ends_with(ty.as_str()));
-        if reserved.contains(&field.name) || derived_instance {
+        if reserved.contains(&field.name) || is_derived_part_instance(&field.name) {
             return Err(LcnfLayoutError::ReservedFieldName {
                 name: field.name.clone(),
             });
         }
         // The accessors are elaborated inside the structure's namespace, where an identifier
-        // headed by a root field (`part1`) or an auxiliary declaration (`mk`) resolves to the
-        // generated `<struct_name>.part1` / `<struct_name>.mk` instead of the caller's one.
+        // headed by a root field (`part1`), an auxiliary declaration (`mk`), or a derived part
+        // instance (`instReprPart1`) resolves to `<struct_name>.<ident>` instead of the caller's.
         if let Some(atom) = lean_ident_atoms(&field.lean_ty)
             .find(|&atom| {
                 atom == "self"
@@ -3041,7 +3061,10 @@ fn check_lcnf_emission(
                     || field_names.contains(atom)
                     || generated_types.contains(atom)
             })
-            .or_else(|| lean_ident_heads(&field.lean_ty).find(|&head| reserved.contains(head)))
+            .or_else(|| {
+                lean_ident_heads(&field.lean_ty)
+                    .find(|&head| reserved.contains(head) || is_derived_part_instance(head))
+            })
         {
             return Err(LcnfLayoutError::DependentFieldType {
                 field: field.name.clone(),
@@ -4482,6 +4505,8 @@ mod lcnf_tests {
             // Where a numeric literal ends (`0x1`, then `'"'`) is not modeled.
             "0x1'\"'",
             "1'a'",
+            "\u{ab}\u{bb}",
+            "\u{ab}a\u{ab}b\u{bb}",
         ] {
             assert!(!has_balanced_lean_delimiters(rejected), "{rejected}");
         }
@@ -4614,9 +4639,11 @@ mod lcnf_tests {
         for (lean_ty, head) in [
             ("Fin part1", "part1"),
             ("Fin (part2 + 1)", "part2"),
+            ("Fin \u{ab}part1\u{bb}.val", "part1"),
             ("List mk", "mk"),
             ("Fin rec.succ", "rec"),
             ("Fin _sizeOf_1", "_sizeOf_1"),
+            ("Fin instReprPart1", "instReprPart1"),
         ] {
             let fields = wide(&[LcnfFieldSpec::new("w", lean_ty, ObjectRef)]);
             assert_eq!(
@@ -4628,11 +4655,11 @@ mod lcnf_tests {
                 "type `{lean_ty}`"
             );
         }
-        // Only leading components resolve through the namespace: `Nat.rec` and `Foo.part1` are
-        // unaffected, as are these names in a flat structure.
+        // Only leading components resolve through the namespace: `Nat.rec`, `Foo.part1`,
+        // `Foo.«part1»`, and Unicode identifiers like `f0₁` / `αself` / `part1₁` are unaffected.
         let qualified = wide(&[LcnfFieldSpec::new(
             "w",
-            "Fin (Foo.part1 + Nat.rec 0 (fun _ n => n) 3)",
+            "Fin (Foo.part1 + Foo.\u{ab}part1\u{bb} + f0\u{2081} + \u{3b1}self + part1\u{2081} + Nat.rec 0 (fun _ n => n) 3)",
             ObjectRef,
         )]);
         assert!(emit_lcnf_guarded_structure("Wide", &qualified, &[]).is_ok());
