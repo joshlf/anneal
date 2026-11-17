@@ -828,6 +828,215 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                        2, "base-snapshot", "not read-only")
         shutil.rmtree(snap)
         done("waiver pins, annotated-claim vacuity, read-only staged inputs, and --base-snapshot TCB drift")
+
+        # Group 19: Independent MIR fault-site census, unified 12-class PROPERTY_REGISTRY,
+        # cross-language source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage.
+        # 19a. All 4+2 false-proof mutation probes pass when intact and fail closed when compromised.
+        fc_report = checked(fixture())["faultCoverageAudit"]
+        assert fc_report["faultClasses"] == 12 and fc_report["propertyRegistryVerified"] == 12
+        assert fc_report["probesPassed"] == list(runner.ALL_FALSE_PROOF_PROBES)
+        for probe_name in runner.FAULT_MUTATION_PROBES:
+            probe_rep = runner.run_false_proof_probe(probe_name)
+            assert probe_rep["passed"] is True
+            assert probe_rep["baseline_verdict"]["verdict"] == "VERIFIED"
+            assert probe_rep["mutant_verdict"]["verdict"] == "UNKNOWN(UNMAPPED_FAULT_SITE)"
+            assert probe_rep["mutant_verdict"]["missing_sites"] == probe_rep["expected_missing_sites"]
+        assert runner.run_property_registry_unemitted_probe()["passed"] is True
+        assert runner.run_callee_coordinate_mask_probe()["passed"] is True
+        bad_reg = {k: dict(v) for k, v in runner.PROPERTY_REGISTRY.items()}
+        bad_reg["tree_borrows_violation"]["status"] = runner.PROPERTY_STATUS_UNEMITTED_GAP
+        with patch.object(runner, "PROPERTY_REGISTRY", bad_reg):
+            checked(fixture(), expected=1, phase="fault-coverage", executed=False)
+
+        # 19b. Strict census_lean_mir_module lexer traps, malformed/shadowed/truncated Mir,
+        # OOB CFG targets, and RigidTy.param call-constant checks.
+        valid_mir_mod = (
+            "import Trusted\n"
+            "namespace Mir.Demo.«item_1»\n"
+            "-- comment with fake def body : CapturedMir := { basicBlocks := List.nil }\n"
+            "/- nested /- comment \"unclosed -/ -/\n"
+            "def emptyLayoutTable : LayoutTable := { entries := List.nil }\n"
+            "def «body» : CapturedMir :=\n"
+            "  { defPath := \"demo::item_1\"\n"
+            "  , phase := MirPhaseTag.runtimePostCleanup\n"
+            "  , role := ContractRole.subject\n"
+            "  , argCount := 0\n"
+            "  , localDecls := List.nil\n"
+            "  , basicBlocks :=\n"
+            "      (List.cons\n"
+            "        { statements :=\n"
+            "            (List.cons\n"
+            "              { kind := (StatementKind.storageLive 1), span := \"src/lib.rs:1:1\" }\n"
+            "              List.nil)\n"
+            "        , terminator := { kind := TerminatorKind.return_, span := \"src/lib.rs:2:1\" }\n"
+            "        , isCleanup := false\n"
+            "        }\n"
+            "        List.nil)\n"
+            "  , fnAbi := { args := List.nil, ret := { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.primitive, variants := VariantsShape.empty, isUninhabited := false }, mode := AbiPassMode.ignore }, conv := CallConv.rust, canUnwind := false }\n"
+            "  , layouts := emptyLayoutTable\n"
+            "  , allocations := List.nil\n"
+            "  }\n"
+            "end Mir.Demo.«item_1»\n"
+        )
+        expected_sites = [
+            runner.FaultSite(0, 0, "storage_live_protected"),
+            runner.FaultSite(0, 1, "tree_borrows_violation"),
+            runner.FaultSite(0, 1, "uninit_read"),
+            runner.FaultSite(0, 1, "call_abi_mismatch"),
+        ]
+        assert runner.census_lean_mir_module(valid_mir_mod) == expected_sites
+        assert runner.emit_mir_obligation_fault_sites(
+            runner.parse_lean_mir_module_body_strict(valid_mir_mod)
+        ) == expected_sites
+        for bad_mir in (
+            valid_mir_mod + "/- unclosed comment",
+            valid_mir_mod.replace('"demo::item_1"', '"unclosed'),
+            valid_mir_mod.replace("«body»", "«unclosed\nbody»"),
+            valid_mir_mod.replace("import Trusted", "import Trusted.Rustc.V2026_08_01.MirAst"),
+            valid_mir_mod.replace("def «body» : CapturedMir :=", "def StatementKind.nop : Nat := 0\ndef «body» : CapturedMir :="),
+            valid_mir_mod.replace("end Mir.Demo.«item_1»", ""),
+            valid_mir_mod.replace("allocations := List.nil\n  }", "allocations := List.nil\n  } |> id"),
+            valid_mir_mod.replace("basicBlocks :=", "basicBlocks := externalBlocks --"),
+        ):
+            try:
+                runner.census_lean_mir_module(bad_mir)
+            except runner.CensusScanError:
+                pass
+            else:
+                raise AssertionError(f"bad Mir module was accepted: {bad_mir[:80]!r}")
+            assert runner.reconcile_lean_mir_coverage(bad_mir, expected_sites)["is_verified"] is False
+
+        oob_body = runner.parse_lean_mir_module_body_strict(
+            valid_mir_mod.replace("TerminatorKind.return_", "(TerminatorKind.goto 5)")
+        )
+        assert runner.cfg_targets_in_bounds(oob_body) is False
+        oob_batch = runner.reconcile_multi_item_coverage(
+            [{"def_path": "demo::item_1", "body": oob_body, "discharged": runner.census_mir_fault_sites(oob_body)}]
+        )
+        assert oob_batch["is_verified"] is False and any("cfgTargetsInBounds" in r for r in oob_batch["reasons"])
+
+        param_call_mod = valid_mir_mod.replace(
+            "TerminatorKind.return_",
+            "(TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.param 0 \"T\"), layoutIdx := 0 }, val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } (Option.some 0) UnwindAction.continue_)",
+        )
+        param_body = runner.parse_lean_mir_module_body_strict(param_call_mod)
+        assert runner.body_has_no_param_call_const(param_body) is False
+        param_batch = runner.reconcile_multi_item_coverage(
+            [{"def_path": "demo::item_1", "body": param_body, "discharged": runner.census_mir_fault_sites(param_body)}],
+            {"inline_callees": [], "external_callees": [], "allow_unresolved_indirect_calls": True},
+        )
+        assert param_batch["is_verified"] is False and any("bodyHasNoParamCallConst" in r for r in param_batch["reasons"])
+
+        # 19c. Cross-language Terminators.lean & FaultSiteCensus.lean source-pin drift fails closed.
+        assert runner.check_fault_census_source_pins(checkout) == {
+            "terminators": True,
+            "faultSiteCensus": True,
+        }
+        term_rel = Path("trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean")
+        root = fixture()
+        (root / term_rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / term_rel).write_text(
+            (checkout / term_rel).read_text().replace(
+                '"core::intrinsics::exact_div"', '"core::intrinsics::drifted_exact_div"', 1
+            )
+        )
+        expect_failure(lambda: runner.check_fault_census_source_pins(root), 1, "fault-coverage", "Terminators.lean")
+        shutil.rmtree(root)
+
+        fsc_rel = Path("theory/Anneal/FaultSiteCensus.lean")
+        root = fixture()
+        (root / fsc_rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / fsc_rel).write_text(
+            (checkout / fsc_rel).read_text().replace(
+                "| .arithOverflow => \"arith_overflow\"",
+                "| .arithOverflow => \"drifted_overflow\"",
+                1,
+            )
+        )
+        checked(root, expected=1, phase="fault-coverage", executed=False)
+
+        # 19d. --audit-fault-coverage workspace & CaptureManifest.json positive and negative checks.
+        ws_dir = suite / "fc-workspace"
+        gen_dir = ws_dir / ".anneal/generated"
+        for sub in ("Mir/Demo", "FaultCensus/Demo", "Obligations/Demo", "Verify/Demo"):
+            (gen_dir / sub).mkdir(parents=True, exist_ok=True)
+        (ws_dir / "src").mkdir(parents=True, exist_ok=True)
+        rs_ws = ws_dir / "src/lib.rs"
+        rs_ws.write_text("pub fn item_1() {}\n")
+        mir_ws = gen_dir / "Mir/Demo/item_1.lean"
+        mir_ws.write_text(valid_mir_mod)
+        ob_ws = gen_dir / "Obligations/Demo/item_1.lean"
+        ob_ws.write_text("import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\ndef defaultCallees : List CapturedMir := .nil\nend Obligations.Demo.item_1\n")
+        ver_ws = gen_dir / "Verify/Demo/item_1.lean"
+        ver_ws.write_text("import Trusted\nnamespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n")
+        fc_ws = gen_dir / "FaultCensus/Demo/item_1.json"
+        valid_receipt = {
+            "def_path": "demo::item_1",
+            "mir_module_sha256": runner.digest(mir_ws),
+            "census_sites": [s.to_dict() for s in expected_sites],
+            "discharged_sites": [s.to_dict() for s in expected_sites],
+            "callee_closure": {
+                "inline_callees": [],
+                "external_callees": [],
+                "allow_unresolved_indirect_calls": False,
+            },
+            "reconciliation_verdict": "VERIFIED",
+            "is_verified": True,
+            "reasons": [],
+        }
+        fc_ws.write_text(json.dumps(valid_receipt, indent=2))
+        ws_manifest = ws_dir / "CaptureManifest.json"
+        ws_manifest.write_text(json.dumps({
+            "schema": 1,
+            "compilation_succeeded": True,
+            "rust_sources": [["src/lib.rs", runner.digest(rs_ws)]],
+            "targets": [{
+                "def_id": "demo::item_1",
+                "mir_module_path": ".anneal/generated/Mir/Demo/item_1.lean",
+                "mir_module_sha256": runner.digest(mir_ws),
+            }],
+        }))
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        assert runner.audit_fault_coverage(ws_manifest)["targets"] == 1
+
+        # Negative 1: Omitted discharged site fails closed.
+        fc_ws.write_text(json.dumps({**valid_receipt, "discharged_sites": [s.to_dict() for s in expected_sites[:-1]]}))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "unmapped fault site")
+        expect_failure(lambda: runner.verify_capture_manifest(ws_manifest, ws_dir), 1, "fault-coverage", "unmapped fault site")
+
+        # Negative 2: Stale/truncated census_sites in FaultCensus/<Item>.json fails closed.
+        fc_ws.write_text(json.dumps({**valid_receipt, "census_sites": [s.to_dict() for s in expected_sites[:-1]]}))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "stale or tampered")
+
+        # Negative 3: SHA-256 mismatch in FaultCensus/<Item>.json fails closed.
+        fc_ws.write_text(json.dumps({**valid_receipt, "mir_module_sha256": "0" * 64}))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "SHA-256 mismatch")
+
+        # Negative 4: Unverified verdict in FaultCensus/<Item>.json fails closed.
+        fc_ws.write_text(json.dumps({**valid_receipt, "is_verified": False, "reconciliation_verdict": "UNKNOWN(UNMAPPED_FAULT_SITE)"}))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "not VERIFIED")
+
+        # Negative 5: Unemitted registry class fails closed.
+        fc_ws.write_text(json.dumps(valid_receipt))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir, registry=bad_reg), 1, "fault-coverage", "tree_borrows_violation")
+
+        # Negative 6: Missing subject receipt fails closed (both via manifest and via generated dir).
+        fc_ws.unlink()
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing FaultCensus receipt")
+        expect_failure(lambda: runner.audit_fault_coverage(gen_dir), 1, "fault-coverage", "no `FaultCensus/<Item>.json` receipts")
+        fc_ws.write_text(json.dumps(valid_receipt))
+
+        # Negative 7: Orphan receipt without matching Mir/<Item>.lean fails closed.
+        orphan_fc = gen_dir / "FaultCensus/Demo/orphan.json"
+        orphan_fc.write_text(json.dumps(valid_receipt))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "orphan FaultCensus receipt")
+        orphan_fc.unlink()
+
+        # Negative 8: Unlisted inline callee in Obligations defaultCallees fails closed.
+        ob_ws.write_text("import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\ndef defaultCallees : List CapturedMir := [Mir.Demo.item_1.body]\nend Obligations.Demo.item_1\n")
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing from FaultCensus `callee_closure.inline_callees`")
+        shutil.rmtree(ws_dir)
+        done("fault-site census, 12-class PropertyRegistry, source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

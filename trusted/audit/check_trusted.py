@@ -203,7 +203,13 @@ def check_cargo_boundary(checkout: Path) -> dict[str, str]:
     }
 
 
-def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
+def verify_capture_manifest(
+    manifest_path: Path,
+    root: Path,
+    *,
+    registry: object = None,
+    require_fault_coverage: bool = False,
+) -> dict:
     """Verify a CaptureManifest.json handshake against .rs and Mir/<Item>.lean files on disk."""
     phase = "manifest"
     regular(manifest_path, phase)
@@ -287,6 +293,18 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
     # `Mir/<Item>.lean` targets (`lang="lean"`, after their digests matched).
     audit_waivers_and_vacuity(rust_audit_sources, vacuity=False, lang="rust")
     audit_waivers_and_vacuity(lean_audit_targets, vacuity=True, lang="lean")
+    if _should_audit_manifest_fault_coverage(
+        root, lean_audit_targets, require_fault_coverage=require_fault_coverage
+    ):
+        _audit_manifest_targets_fault_coverage(
+            manifest,
+            root,
+            lean_audit_targets,
+            registry=registry,
+            require_receipts=require_fault_coverage
+            or (root / "FaultCensus").exists()
+            or (root / ".anneal/generated/FaultCensus").exists(),
+        )
     return manifest
 
 
@@ -1005,6 +1023,7 @@ class Checker:
         trusted_waiver_audit = audit_waivers_and_vacuity(
             [(f"trusted/lean/{rel}", self.source_copy / rel) for rel in self.modules.values()]
         )
+        fault_coverage_audit = audit_checkout_fault_coverage_gate(self.checkout, self.source_copy)
         headers = self.inspect("preflight", sources=[(n, str(self.source_copy / p)) for n, p in self.modules.items()]).get("headers")
         if not isinstance(headers, list) or {h["module"] for h in headers} != set(self.modules) or len(headers) != len(self.modules):
             raise Failure(2, "preflight", "incomplete source-header inventory")
@@ -1081,6 +1100,7 @@ class Checker:
                       toolchain=self.version,
                       guarantee="kernel dependency closure, statement-origin separation, and Cargo DAG boundary")
         report["waiverVacuityAudit"] = {"trusted": trusted_waiver_audit, "rustcCapture": rust_waiver_audit}
+        report["faultCoverageAudit"] = fault_coverage_audit
         if base_hashes is not None:
             report["baseSnapshotSha256"] = fingerprint(base_hashes)
         (self.stage / "report.json").write_text(json.dumps(report, indent=2))
@@ -5178,6 +5198,4947 @@ def waiver_vacuity_gate(checkout: Path) -> dict[str, dict[str, int]]:
     return {"trusted": trusted, "rustcCapture": rust, "downstream": downstream}
 
 
+# ===========================================================================
+# Episode 2: Independent MIR Fault-Site Census, Unified PropertyRegistry,
+# Cross-Language Source Pins, False-Proof Mutation Probes & Coverage Reconciler
+# ===========================================================================
+
+FAULT_COVERAGE_PHASE = "fault-coverage"
+
+MIR_FAULT_CLASSES: tuple[str, ...] = (
+    "arith_overflow",
+    "div_rem_by_zero",
+    "shift_overflow",
+    "bounds_check",
+    "ptr_deref_invalid",
+    "ptr_align_mismatch",
+    "tree_borrows_violation",
+    "scalar_niche_invalid",
+    "uninit_read",
+    "storage_live_protected",
+    "call_abi_mismatch",
+    "unreachable_terminator",
+)
+
+FAULT_CLASS_RANK: dict[str, int] = {cls: idx for idx, cls in enumerate(MIR_FAULT_CLASSES)}
+
+LEAN_CTOR_TO_FAULT_CLASS: dict[str, str] = {
+    "arithOverflow": "arith_overflow",
+    "divRemByZero": "div_rem_by_zero",
+    "shiftOverflow": "shift_overflow",
+    "boundsCheck": "bounds_check",
+    "ptrDerefInvalid": "ptr_deref_invalid",
+    "ptrAlignMismatch": "ptr_align_mismatch",
+    "treeBorrowsViolation": "tree_borrows_violation",
+    "scalarNicheInvalid": "scalar_niche_invalid",
+    "uninitRead": "uninit_read",
+    "storageLiveProtected": "storage_live_protected",
+    "callAbiMismatch": "call_abi_mismatch",
+    "unreachableTerminator": "unreachable_terminator",
+}
+
+FAULT_CLASS_TO_LEAN_CTOR: dict[str, str] = {
+    v: k for k, v in LEAN_CTOR_TO_FAULT_CLASS.items()
+}
+
+PROPERTY_STATUS_EMITTED_AND_VERIFIED = "emitted_and_verified"
+PROPERTY_STATUS_UNSUPPORTED_FAIL_CLOSED = "unsupported_fail_closed"
+PROPERTY_STATUS_UNEMITTED_GAP = "unemitted_gap"
+
+VALID_PROPERTY_STATUSES: frozenset[str] = frozenset((
+    PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+    PROPERTY_STATUS_UNSUPPORTED_FAIL_CLOSED,
+    PROPERTY_STATUS_UNEMITTED_GAP,
+))
+
+PROPERTY_REGISTRY: dict[str, dict[str, str]] = {
+    "arith_overflow": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Checked/unchecked integer arithmetic and negation overflow",
+    },
+    "div_rem_by_zero": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Integer division/remainder by zero and signed MIN / -1",
+    },
+    "shift_overflow": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Bit shift distance >= bit_width or < 0",
+    },
+    "bounds_check": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Array/slice indexing, pointer offset, and CFG target bounds",
+    },
+    "ptr_deref_invalid": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Pointer dereference liveness, bounds, and provenance validity",
+    },
+    "ptr_align_mismatch": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Pointer dereference and copy_nonoverlapping byte alignment",
+    },
+    "tree_borrows_violation": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Tree Borrows permission and active protector conflicts",
+    },
+    "scalar_niche_invalid": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Scalar validity range, enum discriminant, transmute, and assume",
+    },
+    "uninit_read": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Initialized local slot and memory byte reads",
+    },
+    "storage_live_protected": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Local slot liveness and StorageLive/StorageDead protector checks",
+    },
+    "call_abi_mismatch": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Function call signature/ABI compatibility and unwind ABI checks",
+    },
+    "unreachable_terminator": {
+        "status": PROPERTY_STATUS_EMITTED_AND_VERIFIED,
+        "description": "Unreachable terminator and unreachable_unchecked non-reachability",
+    },
+}
+
+NATIVE_CONVERGING_CALL_CALLEES: tuple[str, ...] = (
+    "core::intrinsics::exact_div",
+    "core::intrinsics::ub_checks",
+    "core::intrinsics::arith_offset",
+    "core::intrinsics::ctlz",
+    "core::intrinsics::ctlz_nonzero",
+    "core::intrinsics::cttz",
+    "core::intrinsics::cttz_nonzero",
+    "core::intrinsics::ctpop",
+    "core::intrinsics::bswap",
+    "core::intrinsics::bitreverse",
+    "core::intrinsics::wrapping_add",
+    "core::intrinsics::wrapping_sub",
+    "core::intrinsics::wrapping_mul",
+    "core::intrinsics::saturating_add",
+    "core::intrinsics::saturating_sub",
+    "core::intrinsics::unchecked_shl",
+    "core::intrinsics::unchecked_shr",
+    "core::intrinsics::unchecked_add",
+    "core::intrinsics::unchecked_sub",
+    "core::intrinsics::unchecked_mul",
+    "core::intrinsics::unchecked_div",
+    "core::intrinsics::unchecked_rem",
+    "core::intrinsics::three_way_compare",
+    "core::intrinsics::size_of_val",
+    "core::intrinsics::align_of_val",
+)
+
+NATIVE_DIVERGING_CALL_CALLEES: tuple[str, ...] = (
+    "core::hint::unreachable_unchecked",
+    "std::hint::unreachable_unchecked",
+    "core::intrinsics::unreachable",
+    "core::panicking::panic_nounwind",
+    "core::panicking::panic_nounwind_fmt",
+    "core::panicking::panic_nounwind_fmt::panic_impl",
+    "core::panicking::panic_nounwind_nobacktrace",
+    "core::panicking::panic_in_cleanup",
+    "core::panicking::panic_cannot_unwind",
+    "core::panicking::panic_misaligned_pointer_dereference",
+    "core::panicking::panic_null_pointer_dereference",
+    "core::panicking::panic_invalid_enum_construction",
+    "core::intrinsics::abort",
+    "core::panicking::panic",
+    "core::panicking::panic_fmt",
+    "core::panicking::panic_fmt::panic_impl",
+    "core::panicking::const_panic_fmt",
+    "core::panicking::assert_failed",
+    "core::panicking::assert_failed_inner",
+    "core::panicking::assert_matches_failed",
+    "core::slice::index::slice_index_fail",
+    "core::panicking::panic_bounds_check",
+    "core::panicking::panic_explicit",
+    "core::panicking::panic_display",
+    "core::panicking::panic_str_2015",
+    "core::panicking::unreachable_display",
+    "core::option::unwrap_failed",
+    "core::option::expect_failed",
+    "core::result::unwrap_failed",
+    "core::panicking::panic_const::panic_const_add_overflow",
+    "core::panicking::panic_const::panic_const_sub_overflow",
+    "core::panicking::panic_const::panic_const_mul_overflow",
+    "core::panicking::panic_const::panic_const_div_overflow",
+    "core::panicking::panic_const::panic_const_rem_overflow",
+    "core::panicking::panic_const::panic_const_neg_overflow",
+    "core::panicking::panic_const::panic_const_shr_overflow",
+    "core::panicking::panic_const::panic_const_shl_overflow",
+    "core::panicking::panic_const::panic_const_div_by_zero",
+    "core::panicking::panic_const::panic_const_rem_by_zero",
+)
+
+_NATIVE_CONVERGING_SET: frozenset[str] = frozenset(NATIVE_CONVERGING_CALL_CALLEES)
+_NATIVE_DIVERGING_SET: frozenset[str] = frozenset(NATIVE_DIVERGING_CALL_CALLEES)
+
+
+class FaultSite:
+    __slots__ = ("block_idx", "stmt_idx", "fault_class")
+
+    def __init__(self, block_idx: int, stmt_idx: int, fault_class: str) -> None:
+        if type(block_idx) is not int or block_idx < 0:
+            raise ValueError(f"invalid FaultSite block_idx: {block_idx!r}")
+        if type(stmt_idx) is not int or stmt_idx < 0:
+            raise ValueError(f"invalid FaultSite stmt_idx: {stmt_idx!r}")
+        if not isinstance(fault_class, str) or fault_class not in FAULT_CLASS_RANK:
+            raise ValueError(f"invalid FaultSite fault_class: {fault_class!r}")
+        self.block_idx = block_idx
+        self.stmt_idx = stmt_idx
+        self.fault_class = fault_class
+
+    def _key(self) -> tuple[int, int, int]:
+        return (self.block_idx, self.stmt_idx, FAULT_CLASS_RANK[self.fault_class])
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FaultSite):
+            return NotImplemented
+        return (
+            self.block_idx == other.block_idx
+            and self.stmt_idx == other.stmt_idx
+            and self.fault_class == other.fault_class
+        )
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, FaultSite):
+            return NotImplemented
+        return self._key() < other._key()
+
+    def __le__(self, other: object) -> bool:
+        if not isinstance(other, FaultSite):
+            return NotImplemented
+        return self._key() <= other._key()
+
+    def __hash__(self) -> int:
+        return hash((self.block_idx, self.stmt_idx, self.fault_class))
+
+    def __repr__(self) -> str:
+        return f"FaultSite({self.block_idx}, {self.stmt_idx}, {self.fault_class!r})"
+
+    def __str__(self) -> str:
+        return f"(bb{self.block_idx}, stmt{self.stmt_idx}, {self.fault_class})"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "block_idx": self.block_idx,
+            "stmt_idx": self.stmt_idx,
+            "fault_class": self.fault_class,
+        }
+
+    @classmethod
+    def from_dict(cls, obj: object) -> "FaultSite":
+        if not isinstance(obj, dict) or set(obj) != {"block_idx", "stmt_idx", "fault_class"}:
+            raise ValueError(f"malformed FaultSite object: {obj!r}")
+        return cls(obj["block_idx"], obj["stmt_idx"], obj["fault_class"])
+
+
+class CensusScanError(ValueError):
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def validate_property_registry(
+    registry: object = None, *, require_all_verified: bool = False
+) -> dict[str, dict[str, str]]:
+    if registry is None:
+        registry = PROPERTY_REGISTRY
+    if not isinstance(registry, dict):
+        raise Failure(1, FAULT_COVERAGE_PHASE, "PropertyRegistry must be a dict")
+    missing = [cls for cls in MIR_FAULT_CLASSES if cls not in registry]
+    extra = [k for k in registry if k not in FAULT_CLASS_RANK]
+    if missing or extra:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"PropertyRegistry keys do not match canonical 12 MirFaultClasses (missing={missing}, extra={extra})",
+        )
+    out: dict[str, dict[str, str]] = {}
+    unverified: list[str] = []
+    for cls in MIR_FAULT_CLASSES:
+        entry = registry[cls]
+        if isinstance(entry, str):
+            status = entry
+            desc = PROPERTY_REGISTRY[cls]["description"]
+        elif isinstance(entry, dict):
+            status = entry.get("status")
+            desc = entry.get("description", PROPERTY_REGISTRY[cls]["description"])
+        else:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"malformed PropertyRegistry descriptor for {cls}: {entry!r}"
+            )
+        if not isinstance(status, str) or status not in VALID_PROPERTY_STATUSES:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"invalid PropertyStatus {status!r} for {cls} in PropertyRegistry",
+            )
+        if not isinstance(desc, str) or not desc.strip():
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"missing description for {cls} in PropertyRegistry",
+            )
+        if status != PROPERTY_STATUS_EMITTED_AND_VERIFIED:
+            unverified.append(f"{cls}={status}")
+        out[cls] = {"status": status, "description": desc}
+    if require_all_verified and unverified:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"PropertyRegistry has non-verified fault classes: {', '.join(unverified)}",
+        )
+    return out
+
+
+def _is_lean_ident_continue(ch: str) -> bool:
+    return ch.isalnum() or ch in ("_", "'", "!", "?")
+
+
+def _lex_dotted_ident(src: str, start: int) -> tuple[str, int]:
+    n = len(src)
+    i = start
+    parts: list[str] = []
+    while True:
+        if i < n and src[i] == "«":
+            i += 1
+            seg_start = i
+            while i < n and src[i] != "»" and src[i] != "\n":
+                i += 1
+            if i >= n or src[i] != "»":
+                raise CensusScanError(
+                    "unterminated_guillemet_ident",
+                    "unterminated or multi-line Lean guillemet identifier `«...»`",
+                )
+            parts.append(src[seg_start:i])
+            i += 1
+        else:
+            seg_start = i
+            while i < n and _is_lean_ident_continue(src[i]):
+                i += 1
+            if i == seg_start:
+                raise CensusScanError(
+                    "malformed_syntax", "empty identifier segment"
+                )
+            parts.append(src[seg_start:i])
+        if (
+            i + 1 < n
+            and src[i] == "."
+            and (src[i + 1].isalpha() or src[i + 1] in ("_", "«"))
+        ):
+            parts.append(".")
+            i += 1
+        else:
+            break
+    return ("".join(parts), i)
+
+
+def _lex_string_escape(
+    src: str, i: int, out: list[str], interpolated: bool
+) -> int:
+    n = len(src)
+    if i >= n:
+        raise CensusScanError(
+            "unterminated_string_literal", "unterminated Lean string literal"
+        )
+    ch = src[i]
+    if ch == "\\":
+        out.append("\\")
+        return i + 1
+    if ch == '"':
+        out.append('"')
+        return i + 1
+    if ch == "'":
+        out.append("'")
+        return i + 1
+    if ch == "n":
+        out.append("\n")
+        return i + 1
+    if ch == "r":
+        out.append("\r")
+        return i + 1
+    if ch == "t":
+        out.append("\t")
+        return i + 1
+    if ch == "x":
+        if i + 3 > n or not all(c in "0123456789abcdefABCDEF" for c in src[i + 1 : i + 3]):
+            raise CensusScanError(
+                "malformed_syntax", "invalid Lean string escape (expected hex digits)"
+            )
+        code = int(src[i + 1 : i + 3], 16)
+        out.append(chr(code))
+        return i + 3
+    if ch == "u":
+        if i + 5 > n or not all(c in "0123456789abcdefABCDEF" for c in src[i + 1 : i + 5]):
+            raise CensusScanError(
+                "malformed_syntax", "invalid Lean string escape (expected hex digits)"
+            )
+        code = int(src[i + 1 : i + 5], 16)
+        if 0xD800 <= code <= 0xDFFF:
+            raise CensusScanError(
+                "malformed_syntax", "invalid Lean string escape (surrogate code point)"
+            )
+        out.append(chr(code))
+        return i + 5
+    if ch == "\n":
+        j = i + 1
+        while j < n and src[j].isspace():
+            j += 1
+        return j
+    if ch == "{" and interpolated:
+        out.append("{")
+        return i + 1
+    raise CensusScanError(
+        "malformed_syntax", f"invalid Lean string escape `\\{ch}`"
+    )
+
+
+def _lex_char_literal(src: str, open_quote: int) -> tuple[str, int] | None:
+    n = len(src)
+    prev_is_ident = open_quote > 0 and _is_lean_ident_continue(src[open_quote - 1])
+    if prev_is_ident or open_quote + 2 >= n:
+        return None
+    if src[open_quote + 1] == "\\":
+        decoded: list[str] = []
+        after_esc = _lex_string_escape(src, open_quote + 2, decoded, False)
+        s = "".join(decoded)
+        if len(s) != 1 or after_esc >= n or src[after_esc] != "'":
+            raise CensusScanError(
+                "malformed_syntax", "unterminated escaped character literal"
+            )
+        return (s, after_esc + 1)
+    if src[open_quote + 2] == "'" and src[open_quote + 1] not in ("'", "\n"):
+        return (src[open_quote + 1], open_quote + 3)
+    return None
+
+
+def _lex_raw_string(src: str, start: int) -> tuple[str, int] | None:
+    n = len(src)
+    prev_is_ident = start > 0 and _is_lean_ident_continue(src[start - 1])
+    if prev_is_ident or start + 1 >= n or src[start] != "r" or src[start + 1] not in ('"', "#"):
+        return None
+    hashes = 0
+    k = start + 1
+    while k < n and src[k] == "#":
+        hashes += 1
+        k += 1
+    if k >= n or src[k] != '"':
+        return None
+    k += 1
+    closing = '"' + ("#" * hashes)
+    end_pos = src.find(closing, k)
+    if end_pos < 0:
+        raise CensusScanError(
+            "unterminated_raw_string", "unterminated Lean raw string literal"
+        )
+    return (src[k:end_pos], end_pos + len(closing))
+
+
+def _lex_standard_string(src: str, after_open_quote: int) -> tuple[str, int]:
+    n = len(src)
+    i = after_open_quote
+    out: list[str] = []
+    while i < n:
+        ch = src[i]
+        if ch == '"':
+            return ("".join(out), i + 1)
+        if ch == "\\":
+            i = _lex_string_escape(src, i + 1, out, False)
+        else:
+            out.append(ch)
+            i += 1
+    raise CensusScanError(
+        "unterminated_string_literal", "unterminated Lean string literal"
+    )
+
+
+def _lex_interpolated_string(src: str, after_open_quote: int) -> tuple[str, int]:
+    n = len(src)
+    i = after_open_quote
+    out: list[str] = []
+    while i < n:
+        ch = src[i]
+        if ch == '"':
+            return ("".join(out), i + 1)
+        if ch == "\\":
+            try:
+                i = _lex_string_escape(src, i + 1, out, True)
+            except CensusScanError as err:
+                if err.kind == "unterminated_string_literal":
+                    raise CensusScanError(
+                        "unterminated_interpolated_string",
+                        "unterminated Lean interpolated string literal",
+                    ) from err
+                raise
+            continue
+        if ch == "{":
+            brace_depth = 1
+            out.append("{")
+            i += 1
+            while i < n and brace_depth > 0:
+                if (src[i] == "-" and i + 1 < n and src[i + 1] == "-") or (
+                    src[i] == "/" and i + 1 < n and src[i + 1] == "-"
+                ):
+                    raise CensusScanError(
+                        "malformed_syntax", "comment inside string interpolation"
+                    )
+                if src[i] == "'":
+                    ch_res = _lex_char_literal(src, i)
+                    if ch_res is not None:
+                        lit_ch, next_i = ch_res
+                        out.append(f"'{lit_ch}'")
+                        i = next_i
+                        continue
+                if src[i] == "«":
+                    ident, next_i = _lex_dotted_ident(src, i)
+                    out.append(f"«{ident}»")
+                    i = next_i
+                    continue
+                raw_res = _lex_raw_string(src, i)
+                if raw_res is not None:
+                    raw_s, next_i = raw_res
+                    out.append(f'"{raw_s}"')
+                    i = next_i
+                    continue
+                if src[i].isalpha() or src[i] == "_":
+                    ident, next_i = _lex_dotted_ident(src, i)
+                    out.append(ident)
+                    if ident.endswith("!") and next_i < n and src[next_i] == '"':
+                        inner_interp, after_interp = _lex_interpolated_string(
+                            src, next_i + 1
+                        )
+                        out.append(f'"{inner_interp}"')
+                        i = after_interp
+                    else:
+                        i = next_i
+                    continue
+                if src[i] == '"':
+                    try:
+                        inner_s, next_i = _lex_standard_string(src, i + 1)
+                    except CensusScanError as err:
+                        raise CensusScanError(
+                            "unterminated_interpolated_string",
+                            "unterminated Lean interpolated string literal",
+                        ) from err
+                    out.append(f'"{inner_s}"')
+                    i = next_i
+                elif src[i] == "{":
+                    brace_depth += 1
+                    out.append("{")
+                    i += 1
+                elif src[i] == "}":
+                    brace_depth -= 1
+                    out.append("}")
+                    i += 1
+                else:
+                    out.append(src[i])
+                    i += 1
+            if brace_depth != 0:
+                raise CensusScanError(
+                    "unterminated_interpolated_string",
+                    "unterminated Lean interpolated string literal",
+                )
+            continue
+        out.append(ch)
+        i += 1
+    raise CensusScanError(
+        "unterminated_interpolated_string",
+        "unterminated Lean interpolated string literal",
+    )
+
+
+def tokenize_lean_source(src: str) -> list[tuple[str, Any]]:
+    n = len(src)
+    i = 0
+    tokens: list[tuple[str, Any]] = []
+    punct_map = {
+        "(": ("LParen", "("),
+        ")": ("RParen", ")"),
+        "{": ("LBrace", "{"),
+        "}": ("RBrace", "}"),
+        "[": ("LBracket", "["),
+        "]": ("RBracket", "]"),
+        ",": ("Comma", ","),
+        ";": ("Semicolon", ";"),
+        ".": ("Dot", "."),
+    }
+
+    while i < n:
+        ch = src[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and src[i + 1] == "-":
+            nl = src.find("\n", i + 2)
+            i = n if nl < 0 else nl + 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "-":
+            i += 2
+            depth = 1
+            while i < n and depth > 0:
+                if src[i] == "/" and i + 1 < n and src[i + 1] == "-":
+                    depth += 1
+                    i += 2
+                elif src[i] == "-" and i + 1 < n and src[i + 1] == "/":
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth != 0:
+                raise CensusScanError(
+                    "unterminated_block_comment",
+                    "unterminated Lean block comment `/- ... -/`",
+                )
+            continue
+        if ch == "'":
+            ch_res = _lex_char_literal(src, i)
+            if ch_res is not None:
+                lit_ch, next_i = ch_res
+                tokens.append(("CharLit", lit_ch))
+                i = next_i
+                continue
+        if ch == "«":
+            ident, next_i = _lex_dotted_ident(src, i)
+            tokens.append(("Ident", ident))
+            i = next_i
+            continue
+        raw_res = _lex_raw_string(src, i)
+        if raw_res is not None:
+            content, next_i = raw_res
+            tokens.append(("StrLit", content))
+            i = next_i
+            continue
+        if ch in ("s", "f") and i + 2 < n and src[i + 1] == "!" and src[i + 2] == '"':
+            content, next_i = _lex_interpolated_string(src, i + 3)
+            tokens.append(("StrLit", content))
+            i = next_i
+            continue
+        if ch == '"':
+            content, next_i = _lex_standard_string(src, i + 1)
+            tokens.append(("StrLit", content))
+            i = next_i
+            continue
+        if ch in punct_map:
+            tokens.append(punct_map[ch])
+            i += 1
+            continue
+        if ch == ":":
+            if i + 1 < n and src[i + 1] == "=":
+                tokens.append(("ColonEq", ":="))
+                i += 2
+            else:
+                tokens.append(("Colon", ":"))
+                i += 1
+            continue
+        if ch.isdigit() and ch.isascii():
+            start = i
+            i += 1
+            while i < n and ((src[i].isalnum() and src[i].isascii()) or src[i] == "_"):
+                i += 1
+            raw_num = src[start:i].replace("_", "")
+            try:
+                if raw_num.startswith(("0x", "0X")):
+                    val = int(raw_num[2:], 16)
+                elif raw_num.startswith(("0b", "0B")):
+                    val = int(raw_num[2:], 2)
+                elif raw_num.startswith(("0o", "0O")):
+                    val = int(raw_num[2:], 8)
+                else:
+                    if not raw_num.isdigit():
+                        raise ValueError("non-digit in decimal literal")
+                    val = int(raw_num, 10)
+            except ValueError as err:
+                raise CensusScanError(
+                    "malformed_syntax", f"invalid numeric literal `{raw_num}`"
+                ) from err
+            if val < 0 or val >= (1 << 128):
+                raise CensusScanError(
+                    "malformed_syntax", f"u128 overflow in numeric literal `{raw_num}`"
+                )
+            tokens.append(("NatLit", val))
+            continue
+        if ch.isalpha() or ch == "_":
+            ident, next_i = _lex_dotted_ident(src, i)
+            if ident.endswith("!") and next_i < n and src[next_i] == '"':
+                content, after = _lex_interpolated_string(src, next_i + 1)
+                tokens.append(("StrLit", content))
+                i = after
+                continue
+            tokens.append(("Ident", ident))
+            i = next_i
+            continue
+        start = i
+        i += 1
+        while (
+            i < n
+            and not src[i].isspace()
+            and src[i] not in ("(", ")", "{", "}", "[", "]", ",", ";", ":", ".", '"', "«")
+        ):
+            if (src[i] == "-" and i + 1 < n and src[i + 1] == "-") or (
+                src[i] == "/" and i + 1 < n and src[i + 1] == "-"
+            ):
+                break
+            i += 1
+        tokens.append(("Ident", src[start:i]))
+
+    return tokens
+
+
+_MIR_AST_NAMESPACES: tuple[str, ...] = (
+    "MirAst",
+    "Trusted.MirAst",
+    "Trusted.Rustc.V2026_06_01.MirAst",
+    "_root_.Trusted.Rustc.V2026_06_01.MirAst",
+)
+
+_STRICT_MODULE_OPENS: frozenset[str] = frozenset((
+    "Trusted.Rustc.V2026_06_01.Layout",
+    "Trusted.Rustc.V2026_06_01.MirAst",
+    "Trusted.Rustc.V2026_06_01.MirSemantics",
+    "Trusted.VerificationResult",
+    "Trusted.MirAst",
+    "Trusted.MirSemantics",
+))
+
+_STRICT_MODULE_IMPORTS: frozenset[str] = frozenset((
+    "Trusted",
+    "Trusted.MirAst",
+    "Trusted.MirSemantics",
+    "Trusted.VerificationResult",
+    "Trusted.Rustc.V2026_06_01.Layout",
+    "Trusted.Rustc.V2026_06_01.MirAst",
+    "Trusted.Rustc.V2026_06_01.MirSemantics",
+    "Trusted.Rustc.V2026_06_01",
+    "Trusted.Rustc",
+))
+
+_MIR_AST_TYPE_NAMES: frozenset[str] = frozenset((
+    "AggregateKind",
+    "BasicBlockData",
+    "BinOp",
+    "Bool",
+    "BorrowKind",
+    "CapturedMir",
+    "CastKind",
+    "ConstOperand",
+    "ConstScalar",
+    "ConstValue",
+    "ContractRole",
+    "List",
+    "LocalDecl",
+    "MirPhaseTag",
+    "Mutability",
+    "Nat",
+    "NonDivergingIntrinsic",
+    "NullOp",
+    "Operand",
+    "Option",
+    "Place",
+    "ProjectionElem",
+    "ProvenancePtr",
+    "RetagKind",
+    "RigidTy",
+    "Rvalue",
+    "ScalarInt",
+    "Statement",
+    "StatementKind",
+    "SwitchTargets",
+    "Terminator",
+    "TerminatorKind",
+    "Ty",
+    "UnOp",
+    "UnwindAction",
+))
+
+_LEAN_COMMAND_KEYWORDS: frozenset[str] = frozenset((
+    "def",
+    "theorem",
+    "lemma",
+    "abbrev",
+    "example",
+    "instance",
+    "structure",
+    "inductive",
+    "class",
+    "opaque",
+    "axiom",
+    "namespace",
+    "end",
+    "section",
+    "open",
+    "import",
+    "export",
+    "set_option",
+    "attribute",
+    "local",
+    "scoped",
+    "private",
+    "protected",
+    "noncomputable",
+    "partial",
+    "unsafe",
+    "mutual",
+    "variable",
+    "universe",
+    "macro",
+    "macro_rules",
+    "syntax",
+    "notation",
+    "elab",
+    "deriving",
+))
+
+
+def _is_valid_captured_mir_type(ty: str) -> bool:
+    if ty == "CapturedMir":
+        return True
+    for ns in _MIR_AST_NAMESPACES:
+        if ty == f"{ns}.CapturedMir":
+            return True
+    return False
+
+
+def _check_ctor_qualifier(full: str, short: str, type_name: str) -> None:
+    if full == f".{short}":
+        return
+    qualified = f"{type_name}.{short}"
+    if full == qualified:
+        return
+    for ns in _MIR_AST_NAMESPACES:
+        if full == f"{ns}.{qualified}":
+            return
+    raise CensusScanError(
+        "malformed_syntax",
+        f"constructor head `{full}` is not a `{type_name}` constructor (expected `.{short}` or `{type_name}.{short}`)",
+    )
+
+
+def _fc_is_lean_command_start(tok: tuple[str, Any]) -> bool:
+    if tok[0] != "Ident":
+        return False
+    kw: str = tok[1]
+    return kw.startswith("#") or kw.startswith("@") or kw in _LEAN_COMMAND_KEYWORDS
+
+
+def _shadows_mir_ast_name(name: str) -> bool:
+    return any(seg in _MIR_AST_TYPE_NAMES for seg in name.split("."))
+
+
+class _MirTokenCursor:
+    def __init__(self, tokens: list[tuple[str, Any]], pos: int = 0) -> None:
+        self.tokens = tokens
+        self.pos = pos
+
+    def peek(self) -> tuple[str, Any] | None:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def next(self) -> tuple[str, Any] | None:
+        if self.pos < len(self.tokens):
+            tok = self.tokens[self.pos]
+            self.pos += 1
+            return tok
+        return None
+
+    def expect(self, kind: str) -> Any:
+        tok = self.next()
+        if tok is None:
+            raise CensusScanError(
+                "malformed_syntax", f"unexpected EOF while expecting {kind}"
+            )
+        if tok[0] != kind:
+            raise CensusScanError(
+                "malformed_syntax", f"expected {kind}, found {tok!r}"
+            )
+        return tok[1]
+
+    def parse_ctor_head(self) -> tuple[str, str]:
+        had_leading_dot = False
+        pk = self.peek()
+        if pk is not None and pk[0] == "Dot":
+            self.next()
+            had_leading_dot = True
+        tok = self.next()
+        if tok is None or tok[0] != "Ident":
+            raise CensusScanError(
+                "malformed_syntax", f"expected constructor identifier, found {tok!r}"
+            )
+        full: str = tok[1]
+        short = full.rsplit(".", 1)[-1]
+        full_norm = f".{full}" if had_leading_dot else full
+        return (full_norm, short)
+
+    def with_optional_parens(self, fn):
+        paren_depth = 0
+        while True:
+            pk = self.peek()
+            if pk is not None and pk[0] == "LParen":
+                self.next()
+                paren_depth += 1
+            else:
+                break
+        val = fn(self)
+        for _ in range(paren_depth):
+            self.expect("RParen")
+        return val
+
+    def skip_balanced_expr(self) -> None:
+        tok = self.next()
+        if tok is None:
+            raise CensusScanError(
+                "malformed_syntax", "unexpected EOF while skipping expression"
+            )
+        kind = tok[0]
+        if kind in ("LParen", "LBrace", "LBracket"):
+            close_kind = {
+                "LParen": "RParen",
+                "LBrace": "RBrace",
+                "LBracket": "RBracket",
+            }[kind]
+            depth = 1
+            while depth > 0:
+                nxt = self.next()
+                if nxt is None:
+                    raise CensusScanError(
+                        "malformed_syntax", f"unbalanced {kind} in expression"
+                    )
+                if nxt[0] == kind:
+                    depth += 1
+                elif nxt[0] == close_kind:
+                    depth -= 1
+            return
+        if kind == "Dot":
+            nxt = self.next()
+            if nxt is None or nxt[0] != "Ident":
+                raise CensusScanError(
+                    "malformed_syntax", f"expected identifier after `.`, found {nxt!r}"
+                )
+            while True:
+                pk = self.peek()
+                if pk is not None and pk[0] in (
+                    "LParen",
+                    "LBrace",
+                    "LBracket",
+                    "NatLit",
+                    "StrLit",
+                    "CharLit",
+                    "Dot",
+                ):
+                    self.skip_balanced_expr()
+                else:
+                    break
+            return
+        if kind == "Ident":
+            while True:
+                pk = self.peek()
+                if pk is not None and pk[0] in (
+                    "LParen",
+                    "LBrace",
+                    "LBracket",
+                    "NatLit",
+                    "StrLit",
+                    "CharLit",
+                    "Dot",
+                ):
+                    self.skip_balanced_expr()
+                else:
+                    break
+            return
+        if kind in ("NatLit", "StrLit", "CharLit"):
+            return
+        raise CensusScanError(
+            "malformed_syntax", f"unexpected token while skipping expression: {tok!r}"
+        )
+
+    def skip_atomic_expr(self) -> None:
+        pk = self.peek()
+        if pk is None:
+            raise CensusScanError(
+                "malformed_syntax", "unexpected EOF while skipping atomic expression"
+            )
+        if pk[0] in ("LParen", "LBrace", "LBracket"):
+            self.skip_balanced_expr()
+            return
+        if pk[0] == "Dot":
+            self.next()
+            nxt = self.next()
+            if nxt is None or nxt[0] != "Ident":
+                raise CensusScanError(
+                    "malformed_syntax", f"expected identifier after `.`, found {nxt!r}"
+                )
+            return
+        if pk[0] in ("Ident", "NatLit", "StrLit", "CharLit"):
+            self.next()
+            return
+        raise CensusScanError(
+            "malformed_syntax",
+            f"unexpected token while skipping atomic expression: {pk!r}",
+        )
+
+    def parse_usize(self) -> int:
+        def _inner(cur: "_MirTokenCursor") -> int:
+            tok = cur.next()
+            if tok is None:
+                raise CensusScanError("malformed_syntax", "unexpected EOF expecting usize")
+            if tok[0] == "NatLit":
+                val = int(tok[1])
+                if val < 0 or val >= (1 << 64):
+                    raise CensusScanError("malformed_syntax", f"usize overflow: {val}")
+                return val
+            if tok[0] == "Dot":
+                nxt = cur.next()
+                if nxt == ("Ident", "zero"):
+                    return 0
+                raise CensusScanError(
+                    "malformed_syntax", f"expected Nat literal, found `.{nxt!r}`"
+                )
+            if tok == ("Ident", "Nat.zero"):
+                return 0
+            raise CensusScanError(
+                "malformed_syntax", f"expected usize literal, found {tok!r}"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_u64(self) -> int:
+        return self.parse_usize()
+
+    def parse_u128(self) -> int:
+        def _inner(cur: "_MirTokenCursor") -> int:
+            tok = cur.next()
+            if tok is not None and tok[0] == "NatLit":
+                val = int(tok[1])
+                if val < 0 or val >= (1 << 128):
+                    raise CensusScanError("malformed_syntax", f"u128 overflow: {val}")
+                return val
+            raise CensusScanError(
+                "malformed_syntax", f"expected u128 literal, found {tok!r}"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_bool(self) -> bool:
+        def _inner(cur: "_MirTokenCursor") -> bool:
+            full, short = cur.parse_ctor_head()
+            if full != short:
+                _check_ctor_qualifier(full, short, "Bool")
+            if short == "true":
+                return True
+            if short == "false":
+                return False
+            raise CensusScanError(
+                "malformed_syntax", f"expected `true` or `false`, found `{short}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_string(self) -> str:
+        def _inner(cur: "_MirTokenCursor") -> str:
+            tok = cur.next()
+            if tok is not None and tok[0] == "StrLit":
+                return str(tok[1])
+            raise CensusScanError(
+                "malformed_syntax", f"expected string literal, found {tok!r}"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_list(self, parse_elem) -> list[Any]:
+        pk = self.peek()
+        if pk is not None and pk[0] == "LBracket":
+            self.next()
+            items: list[Any] = []
+            while True:
+                pk2 = self.peek()
+                if pk2 is not None and pk2[0] == "RBracket":
+                    break
+                items.append(parse_elem(self))
+                pk3 = self.peek()
+                if pk3 is not None and pk3[0] == "Comma":
+                    self.next()
+                else:
+                    break
+            self.expect("RBracket")
+            return items
+
+        def _inner(cur: "_MirTokenCursor") -> list[Any]:
+            pk_in = cur.peek()
+            if pk_in is not None and pk_in[0] == "LBracket":
+                return cur.parse_list(parse_elem)
+            full, short = cur.parse_ctor_head()
+            if short == "nil" and full in ("List.nil", ".nil"):
+                return []
+            if short == "cons" and full in ("List.cons", ".cons"):
+                head = parse_elem(cur)
+                tail = cur.parse_list(parse_elem)
+                return [head, *tail]
+            raise CensusScanError(
+                "malformed_syntax",
+                f"expected inline `List.nil`, `List.cons`, or `[...]`, found `{full}`",
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_option(self, parse_inner):
+        def _inner(cur: "_MirTokenCursor"):
+            full, short = cur.parse_ctor_head()
+            if short == "none" and full in ("Option.none", ".none", "none"):
+                return None
+            if short == "some" and full in ("Option.some", ".some", "some"):
+                return parse_inner(cur)
+            raise CensusScanError(
+                "malformed_syntax",
+                f"expected `Option.some` or `Option.none`, found `{full}`",
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_record(self, on_field) -> None:
+        def _inner(cur: "_MirTokenCursor") -> None:
+            cur.expect("LBrace")
+            seen_fields: set[str] = set()
+            while True:
+                pk = cur.peek()
+                if pk is not None and pk[0] == "RBrace":
+                    break
+                tok = cur.next()
+                if tok is None or tok[0] != "Ident":
+                    raise CensusScanError(
+                        "malformed_syntax", f"expected record field name, found {tok!r}"
+                    )
+                field_name: str = tok[1]
+                if field_name in seen_fields:
+                    raise CensusScanError(
+                        "malformed_syntax", f"duplicate record field `{field_name}`"
+                    )
+                seen_fields.add(field_name)
+                cur.expect("ColonEq")
+                on_field(field_name, cur)
+                pk2 = cur.peek()
+                if pk2 is not None and pk2[0] in ("Comma", "Semicolon"):
+                    cur.next()
+            cur.expect("RBrace")
+
+        self.with_optional_parens(_inner)
+
+    def parse_captured_mir_metadata(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "def_path": None,
+            "has_phase": False,
+            "role": None,
+            "has_arg_count": False,
+            "has_local_decls": False,
+            "basic_blocks": None,
+            "has_fn_abi": False,
+            "has_layouts": False,
+            "has_allocations": False,
+            "trait_impls": [],
+        }
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "defPath":
+                state["def_path"] = cur.parse_string()
+            elif field == "phase":
+                cur.parse_mir_phase_tag()
+                state["has_phase"] = True
+            elif field == "role":
+                state["role"] = cur.parse_contract_role()
+            elif field == "argCount":
+                cur.parse_usize()
+                state["has_arg_count"] = True
+            elif field == "localDecls":
+                cur.parse_list(lambda c: c.skip_atomic_expr())
+                state["has_local_decls"] = True
+            elif field == "basicBlocks":
+                state["basic_blocks"] = cur.parse_list(lambda c: c.parse_basic_block())
+            elif field == "fnAbi":
+                cur.skip_balanced_expr()
+                state["has_fn_abi"] = True
+            elif field == "layouts":
+                cur.skip_balanced_expr()
+                state["has_layouts"] = True
+            elif field == "allocations":
+                cur.parse_list(lambda c: c.skip_atomic_expr())
+                state["has_allocations"] = True
+            elif field == "typeParamCount":
+                cur.parse_usize()
+            elif field == "genericParams":
+                cur.parse_list(lambda c: c.skip_atomic_expr())
+            elif field == "traitImpls":
+                state["trait_impls"] = cur.parse_list(
+                    lambda c: c.parse_trait_impl_entry()
+                )
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown CapturedMir field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if state["def_path"] is None:
+            raise CensusScanError(
+                "malformed_syntax",
+                "CapturedMir record is missing required `defPath` field",
+            )
+        if state["role"] is None:
+            raise CensusScanError(
+                "malformed_syntax",
+                "CapturedMir record is missing required `role` field",
+            )
+        for key, name in (
+            ("has_phase", "phase"),
+            ("has_arg_count", "argCount"),
+            ("has_local_decls", "localDecls"),
+            ("has_fn_abi", "fnAbi"),
+            ("has_layouts", "layouts"),
+            ("has_allocations", "allocations"),
+        ):
+            if not state[key]:
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"CapturedMir record is missing required `{name}` field",
+                )
+        if state["basic_blocks"] is None:
+            raise CensusScanError(
+                "malformed_syntax",
+                "CapturedMir record is missing required `basicBlocks` field",
+            )
+        return {
+            "body": {
+                "def_path": state["def_path"],
+                "basic_blocks": state["basic_blocks"],
+            },
+            "role": state["role"],
+            "trait_impls": state["trait_impls"],
+        }
+
+    def parse_mir_phase_tag(self) -> None:
+        def _inner(cur: "_MirTokenCursor") -> None:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "MirPhaseTag")
+            if short in ("runtimePostCleanup", "runtimeOptimized"):
+                return
+            if short == "other":
+                cur.parse_string()
+                return
+            raise CensusScanError(
+                "malformed_syntax", f"unknown MirPhaseTag constructor `{full}`"
+            )
+
+        self.with_optional_parens(_inner)
+
+    def parse_contract_role(self) -> tuple[str, str | None]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[str, str | None]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "ContractRole")
+            if short == "subject":
+                return ("subject", None)
+            if short == "model":
+                return ("model", None)
+            if short in ("requires", "ensures", "externalSpec"):
+                return (short, cur.parse_string())
+            raise CensusScanError(
+                "malformed_syntax", f"unknown ContractRole constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_trait_impl_entry(self) -> dict[str, str]:
+        state: dict[str, str | None] = {"trait_method_def_path": None, "impl_path": None}
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "traitRef":
+                tr: dict[str, Any] = {"def_path": None, "has_args": False}
+
+                def _on_tr(tr_field: str, tr_cur: "_MirTokenCursor") -> None:
+                    if tr_field == "defPath":
+                        tr["def_path"] = tr_cur.parse_string()
+                    elif tr_field == "args":
+                        tr_cur.parse_list(lambda c: c.skip_atomic_expr())
+                        tr["has_args"] = True
+                    else:
+                        raise CensusScanError(
+                            "malformed_syntax", f"unknown TraitRef field `{tr_field}`"
+                        )
+
+                cur.parse_record(_on_tr)
+                if not tr["has_args"]:
+                    raise CensusScanError(
+                        "malformed_syntax", "TraitRef missing `args` field"
+                    )
+                if tr["def_path"] is None:
+                    raise CensusScanError(
+                        "malformed_syntax", "TraitRef missing `defPath` field"
+                    )
+                state["trait_method_def_path"] = tr["def_path"]
+            elif field == "implPath":
+                state["impl_path"] = cur.parse_string()
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown TraitImplEntry field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if state["trait_method_def_path"] is None:
+            raise CensusScanError(
+                "malformed_syntax", "TraitImplEntry missing `traitRef` field"
+            )
+        if state["impl_path"] is None:
+            raise CensusScanError(
+                "malformed_syntax", "TraitImplEntry missing `implPath` field"
+            )
+        return {
+            "trait_method_def_path": state["trait_method_def_path"],
+            "impl_path": state["impl_path"],
+        }
+
+    def parse_basic_block(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "statements": None,
+            "terminator": None,
+            "is_cleanup": None,
+        }
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "statements":
+                state["statements"] = cur.parse_list(lambda c: c.parse_statement())
+            elif field == "terminator":
+                state["terminator"] = cur.parse_terminator()
+            elif field == "isCleanup":
+                state["is_cleanup"] = cur.parse_bool()
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown BasicBlockData field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        for key, label in (
+            ("statements", "statements"),
+            ("terminator", "terminator"),
+            ("is_cleanup", "isCleanup"),
+        ):
+            if state[key] is None:
+                raise CensusScanError(
+                    "malformed_syntax", f"BasicBlockData missing `{label}`"
+                )
+        return state
+
+    def parse_statement(self) -> dict[str, Any]:
+        state: dict[str, Any] = {"kind": None, "span": None}
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "kind":
+                state["kind"] = cur.parse_statement_kind()
+            elif field == "span":
+                state["span"] = cur.parse_string()
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown Statement field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if state["kind"] is None:
+            raise CensusScanError("malformed_syntax", "Statement missing `kind`")
+        if state["span"] is None:
+            raise CensusScanError("malformed_syntax", "Statement missing `span`")
+        return state
+
+    def parse_statement_kind(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "StatementKind")
+            if short == "assign":
+                place = cur.parse_place()
+                rv = cur.parse_rvalue()
+                return ("assign", place, rv)
+            if short == "setDiscriminant":
+                place = cur.parse_place()
+                idx = cur.parse_usize()
+                return ("setDiscriminant", place, idx)
+            if short == "deinit":
+                return ("deinit", cur.parse_place())
+            if short == "storageLive":
+                return ("storageLive", cur.parse_usize())
+            if short == "storageDead":
+                return ("storageDead", cur.parse_usize())
+            if short == "retag":
+                cur.parse_retag_kind()
+                return ("retag", cur.parse_place())
+            if short == "placeMention":
+                return ("placeMention", cur.parse_place())
+            if short == "intrinsic":
+                return ("intrinsic", cur.parse_intrinsic())
+            if short in ("coverage", "constEvalCounter", "nop"):
+                return (short,)
+            if short == "backwardIncompatibleDropHint":
+                return ("backwardIncompatibleDropHint", cur.parse_place())
+            raise CensusScanError(
+                "malformed_syntax", f"unknown StatementKind constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_retag_kind(self) -> None:
+        def _inner(cur: "_MirTokenCursor") -> None:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "RetagKind")
+            if short not in ("fnEntry", "twoPhase", "raw", "default"):
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown RetagKind constructor `{full}`"
+                )
+
+        self.with_optional_parens(_inner)
+
+    def parse_intrinsic(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "NonDivergingIntrinsic")
+            if short == "assume":
+                return ("assume", cur.parse_operand())
+            if short == "copyNonOverlapping":
+                src = cur.parse_operand()
+                dst = cur.parse_operand()
+                count = cur.parse_operand()
+                return ("copyNonOverlapping", src, dst, count)
+            raise CensusScanError(
+                "malformed_syntax",
+                f"unknown NonDivergingIntrinsic constructor `{full}`",
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_place(self) -> dict[str, Any]:
+        state: dict[str, Any] = {"local_": None, "projection": None}
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "local_":
+                state["local_"] = cur.parse_usize()
+            elif field == "projection":
+                state["projection"] = cur.parse_list(
+                    lambda c: c.parse_projection_elem()
+                )
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown Place field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if state["local_"] is None:
+            raise CensusScanError("malformed_syntax", "Place missing `local_`")
+        if state["projection"] is None:
+            raise CensusScanError("malformed_syntax", "Place missing `projection`")
+        return state
+
+    def parse_projection_elem(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "ProjectionElem")
+            if short == "deref":
+                return ("deref",)
+            if short == "field":
+                idx = cur.parse_usize()
+                cur.skip_balanced_expr()
+                return ("field", idx)
+            if short == "index":
+                return ("index", cur.parse_usize())
+            if short == "constantIndex":
+                offset = cur.parse_u64()
+                min_length = cur.parse_u64()
+                from_end = cur.parse_bool()
+                return ("constantIndex", offset, min_length, from_end)
+            if short == "subslice":
+                from_idx = cur.parse_u64()
+                to_idx = cur.parse_u64()
+                from_end = cur.parse_bool()
+                return ("subslice", from_idx, to_idx, from_end)
+            if short == "downcast":
+                sym = cur.parse_option(lambda c: c.parse_string())
+                idx = cur.parse_usize()
+                return ("downcast", sym, idx)
+            if short in ("opaqueCast", "unwrapUnsafeBinder"):
+                cur.skip_balanced_expr()
+                return (short,)
+            raise CensusScanError(
+                "malformed_syntax", f"unknown ProjectionElem constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_operand(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "Operand")
+            if short == "copy":
+                return ("copy", cur.parse_place())
+            if short == "move":
+                return ("move", cur.parse_place())
+            if short == "constant":
+                return ("constant", cur.parse_const_operand())
+            raise CensusScanError(
+                "malformed_syntax", f"unknown Operand constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_const_operand(self) -> tuple[Any, ...]:
+        state: dict[str, Any] = {
+            "has_ty": False,
+            "fn_def_path": None,
+            "is_type_param": False,
+            "val": None,
+        }
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "ty":
+                fn_def, is_param = cur.parse_ty_extract_fn_def()
+                state["fn_def_path"] = fn_def
+                state["is_type_param"] = is_param
+                state["has_ty"] = True
+            elif field == "val":
+                state["val"] = cur.parse_const_value()
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown ConstOperand field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if not state["has_ty"]:
+            raise CensusScanError("malformed_syntax", "ConstOperand missing `ty`")
+        cv = state["val"]
+        if cv is None:
+            raise CensusScanError("malformed_syntax", "ConstOperand missing `val`")
+        if cv[0] == "zeroSized":
+            cv = ("zeroSized", state["fn_def_path"])
+        elif state["fn_def_path"] is not None:
+            raise CensusScanError(
+                "malformed_syntax",
+                "`RigidTy.fnDef`-typed constant with a non-zero-sized value",
+            )
+        if state["is_type_param"]:
+            return ("paramTypedConst", cv)
+        return cv
+
+    def parse_ty_extract_fn_def(self) -> tuple[str | None, bool]:
+        state: dict[str, Any] = {
+            "has_kind": False,
+            "has_layout_idx": False,
+            "fn_def": None,
+            "is_type_param": False,
+        }
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "kind":
+                fd, is_param = cur.parse_rigid_ty_extract_fn_def()
+                state["fn_def"] = fd
+                state["is_type_param"] = is_param
+                state["has_kind"] = True
+            elif field == "layoutIdx":
+                cur.parse_usize()
+                state["has_layout_idx"] = True
+            else:
+                raise CensusScanError("malformed_syntax", f"unknown Ty field `{field}`")
+
+        self.parse_record(_on_field)
+        if not state["has_kind"]:
+            raise CensusScanError("malformed_syntax", "Ty missing `kind`")
+        if not state["has_layout_idx"]:
+            raise CensusScanError("malformed_syntax", "Ty missing `layoutIdx`")
+        return (state["fn_def"], state["is_type_param"])
+
+    def parse_rigid_ty_extract_fn_def(self) -> tuple[str | None, bool]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[str | None, bool]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "RigidTy")
+            if short == "fnDef":
+                path = cur.parse_string()
+                cur.parse_list(lambda c: c.skip_atomic_expr())
+                return (path, False)
+            is_param = short == "param"
+            while True:
+                pk = cur.peek()
+                if pk is None or pk[0] in ("Comma", "Semicolon", "RBrace", "RParen"):
+                    break
+                cur.skip_balanced_expr()
+            return (None, is_param)
+
+        return self.with_optional_parens(_inner)
+
+    def parse_const_value(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "ConstValue")
+            if short == "zeroSized":
+                return ("zeroSized", None)
+            if short == "scalar":
+                return cur.parse_const_scalar()
+            if short == "slice":
+                cur.parse_const_scalar()
+                meta = cur.parse_u64()
+                return ("slice", meta)
+            if short == "indirect":
+                alloc_id = cur.parse_u64()
+                offset_bytes = cur.parse_u64()
+                return ("indirect", alloc_id, offset_bytes)
+            if short == "unevaluated":
+                return ("unevaluated", cur.parse_string())
+            raise CensusScanError(
+                "malformed_syntax", f"unknown ConstValue constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_const_scalar(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "ConstScalar")
+            if short == "int":
+                st: dict[str, int | None] = {"bits": None, "size_bytes": None}
+
+                def _on_f(f: str, c: "_MirTokenCursor") -> None:
+                    if f == "bits":
+                        st["bits"] = c.parse_u128()
+                    elif f == "sizeBytes":
+                        st["size_bytes"] = c.parse_u64()
+                    else:
+                        raise CensusScanError(
+                            "malformed_syntax", f"unknown ScalarInt field `{f}`"
+                        )
+
+                cur.parse_record(_on_f)
+                if st["bits"] is None:
+                    raise CensusScanError("malformed_syntax", "ScalarInt missing `bits`")
+                if st["size_bytes"] is None:
+                    raise CensusScanError(
+                        "malformed_syntax", "ScalarInt missing `sizeBytes`"
+                    )
+                return ("scalarInt", st["bits"], st["size_bytes"])
+            if short == "ptr":
+                st_ptr: dict[str, int | None] = {"alloc_id": None, "offset_bytes": None}
+
+                def _on_pf(f: str, c: "_MirTokenCursor") -> None:
+                    if f == "allocId":
+                        st_ptr["alloc_id"] = c.parse_u64()
+                    elif f == "offsetBytes":
+                        st_ptr["offset_bytes"] = c.parse_u64()
+                    elif f == "tag":
+                        c.parse_u64()
+                    else:
+                        raise CensusScanError(
+                            "malformed_syntax", f"unknown ProvenancePtr field `{f}`"
+                        )
+
+                cur.parse_record(_on_pf)
+                if st_ptr["alloc_id"] is None:
+                    raise CensusScanError(
+                        "malformed_syntax", "ProvenancePtr missing `allocId`"
+                    )
+                if st_ptr["offset_bytes"] is None:
+                    raise CensusScanError(
+                        "malformed_syntax", "ProvenancePtr missing `offsetBytes`"
+                    )
+                size = cur.parse_u64()
+                return (
+                    "scalarPtr",
+                    st_ptr["alloc_id"],
+                    st_ptr["offset_bytes"],
+                    size,
+                )
+            raise CensusScanError(
+                "malformed_syntax", f"unknown ConstScalar constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_aggregate_kind(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "AggregateKind")
+            if short == "array":
+                cur.skip_balanced_expr()
+                return ("array",)
+            if short == "tuple":
+                return ("tuple",)
+            if short == "adt":
+                def_id = cur.parse_string()
+                variant_idx = cur.parse_usize()
+                active_field = cur.parse_option(lambda c: c.parse_usize())
+                return ("adt", def_id, variant_idx, active_field)
+            if short in ("closure", "coroutine"):
+                return (short, cur.parse_string())
+            if short == "rawPtr":
+                cur.skip_balanced_expr()
+                mutable = cur.parse_mutability()
+                return ("rawPtr", mutable)
+            raise CensusScanError(
+                "malformed_syntax", f"unknown AggregateKind constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_rvalue(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "Rvalue")
+            if short == "use":
+                return ("use", cur.parse_operand())
+            if short == "repeat":
+                op = cur.parse_operand()
+                cnt = cur.parse_u64()
+                return ("repeat", op, cnt)
+            if short == "ref":
+                mutable = cur.parse_borrow_kind()
+                place = cur.parse_place()
+                return ("ref", mutable, place)
+            if short == "threadLocalRef":
+                return ("threadLocalRef", cur.parse_string())
+            if short == "rawPtr":
+                mutable = cur.parse_mutability()
+                place = cur.parse_place()
+                return ("rawPtr", mutable, place)
+            if short == "len":
+                return ("len", cur.parse_place())
+            if short == "cast":
+                kind = cur.parse_cast_kind()
+                op = cur.parse_operand()
+                cur.skip_balanced_expr()
+                return ("cast", kind, op)
+            if short == "binaryOp":
+                op = cur.parse_bin_op()
+                lhs = cur.parse_operand()
+                rhs = cur.parse_operand()
+                return ("binaryOp", op, lhs, rhs)
+            if short == "nullaryOp":
+                op = cur.parse_null_op()
+                cur.skip_balanced_expr()
+                return ("nullaryOp", op)
+            if short == "unaryOp":
+                op = cur.parse_un_op()
+                val = cur.parse_operand()
+                return ("unaryOp", op, val)
+            if short == "discriminant":
+                return ("discriminant", cur.parse_place())
+            if short == "aggregate":
+                kind = cur.parse_aggregate_kind()
+                ops = cur.parse_list(lambda c: c.parse_operand())
+                return ("aggregate", kind, ops)
+            if short == "shallowInitBox":
+                op = cur.parse_operand()
+                cur.skip_balanced_expr()
+                return ("shallowInitBox", op)
+            if short == "copyForDeref":
+                return ("copyForDeref", cur.parse_place())
+            if short == "wrapUnsafeBinder":
+                op = cur.parse_operand()
+                cur.skip_balanced_expr()
+                return ("wrapUnsafeBinder", op)
+            raise CensusScanError(
+                "malformed_syntax", f"unknown Rvalue constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_borrow_kind(self) -> bool:
+        def _inner(cur: "_MirTokenCursor") -> bool:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "BorrowKind")
+            if short == "shared":
+                return False
+            if short == "mut":
+                cur.parse_bool()
+                return True
+            raise CensusScanError(
+                "malformed_syntax", f"unknown BorrowKind constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_mutability(self) -> bool:
+        def _inner(cur: "_MirTokenCursor") -> bool:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "Mutability")
+            if short == "not":
+                return False
+            if short == "mut":
+                return True
+            raise CensusScanError(
+                "malformed_syntax", f"unknown Mutability constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_cast_kind(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "CastKind")
+            if short == "pointerCoercion":
+                return ("pointerCoercion", cur.parse_string())
+            if short in (
+                "pointerExposeProvenance",
+                "pointerWithExposedProvenance",
+                "intToInt",
+                "floatToInt",
+                "floatToFloat",
+                "intToFloat",
+                "ptrToPtr",
+                "fnPtrToPtr",
+                "transmute",
+                "subtype",
+            ):
+                return (short,)
+            raise CensusScanError(
+                "malformed_syntax", f"unknown CastKind constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_bin_op(self) -> str:
+        def _inner(cur: "_MirTokenCursor") -> str:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "BinOp")
+            if short in (
+                "add",
+                "addUnchecked",
+                "addWithOverflow",
+                "sub",
+                "subUnchecked",
+                "subWithOverflow",
+                "mul",
+                "mulUnchecked",
+                "mulWithOverflow",
+                "div",
+                "rem",
+                "bitXor",
+                "bitAnd",
+                "bitOr",
+                "shl",
+                "shlUnchecked",
+                "shr",
+                "shrUnchecked",
+                "eq",
+                "lt",
+                "le",
+                "ne",
+                "ge",
+                "gt",
+                "cmp",
+                "offset",
+            ):
+                return short
+            raise CensusScanError(
+                "malformed_syntax", f"unknown BinOp constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_un_op(self) -> str:
+        def _inner(cur: "_MirTokenCursor") -> str:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "UnOp")
+            if short in ("not", "neg", "ptrMetadata"):
+                return short
+            raise CensusScanError(
+                "malformed_syntax", f"unknown UnOp constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_null_op(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "NullOp")
+            if short in ("sizeOf", "alignOf", "ubChecks", "contractChecks"):
+                return (short,)
+            if short == "offsetOf":
+                def _parse_pair(c: "_MirTokenCursor") -> tuple[int, int]:
+                    c.expect("LParen")
+                    v = c.parse_usize()
+                    c.expect("Comma")
+                    f = c.parse_usize()
+                    c.expect("RParen")
+                    return (v, f)
+
+                return ("offsetOf", cur.parse_list(_parse_pair))
+            raise CensusScanError(
+                "malformed_syntax", f"unknown NullOp constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_terminator(self) -> dict[str, Any]:
+        state: dict[str, Any] = {"kind": None, "span": None}
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "kind":
+                state["kind"] = cur.parse_terminator_kind()
+            elif field == "span":
+                state["span"] = cur.parse_string()
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown Terminator field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if state["kind"] is None:
+            raise CensusScanError("malformed_syntax", "Terminator missing `kind`")
+        if state["span"] is None:
+            raise CensusScanError("malformed_syntax", "Terminator missing `span`")
+        return state
+
+    def parse_terminator_kind(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "TerminatorKind")
+            if short == "goto":
+                return ("goto", cur.parse_usize())
+            if short == "switchInt":
+                discr = cur.parse_operand()
+                targets = cur.parse_switch_targets()
+                return ("switchInt", discr, targets)
+            if short in ("unwindResume", "unwindTerminate", "return_", "unreachable"):
+                return (short,)
+            if short == "drop":
+                place = cur.parse_place()
+                target = cur.parse_usize()
+                unwind = cur.parse_unwind_action()
+                return ("drop", place, target, unwind)
+            if short == "call":
+                func = cur.parse_operand()
+                args = cur.parse_list(lambda c: c.parse_operand())
+                destination = cur.parse_place()
+                target = cur.parse_option(lambda c: c.parse_usize())
+                unwind = cur.parse_unwind_action()
+                return ("call", func, args, destination, target, unwind)
+            if short == "tailCall":
+                func = cur.parse_operand()
+                args = cur.parse_list(lambda c: c.parse_operand())
+                return ("tailCall", func, args)
+            if short == "assert":
+                cond = cur.parse_operand()
+                expected = cur.parse_bool()
+                target = cur.parse_usize()
+                unwind = cur.parse_unwind_action()
+                return ("assert", cond, expected, target, unwind)
+            if short == "inlineAsm":
+                template = cur.parse_string()
+                targets = cur.parse_list(lambda c: c.parse_usize())
+                unwind = cur.parse_unwind_action()
+                return ("inlineAsm", template, targets, unwind)
+            raise CensusScanError(
+                "malformed_syntax", f"unknown TerminatorKind constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+    def parse_switch_targets(self) -> dict[str, Any]:
+        state: dict[str, Any] = {"branches": None, "otherwise": None}
+
+        def _parse_branch(c: "_MirTokenCursor") -> tuple[int, int]:
+            c.expect("LParen")
+            val = c.parse_u128()
+            c.expect("Comma")
+            bb = c.parse_usize()
+            c.expect("RParen")
+            return (val, bb)
+
+        def _on_field(field: str, cur: "_MirTokenCursor") -> None:
+            if field == "branches":
+                state["branches"] = cur.parse_list(_parse_branch)
+            elif field == "otherwise":
+                state["otherwise"] = cur.parse_usize()
+            else:
+                raise CensusScanError(
+                    "malformed_syntax", f"unknown SwitchTargets field `{field}`"
+                )
+
+        self.parse_record(_on_field)
+        if state["branches"] is None:
+            raise CensusScanError(
+                "malformed_syntax", "SwitchTargets missing `branches`"
+            )
+        if state["otherwise"] is None:
+            raise CensusScanError(
+                "malformed_syntax", "SwitchTargets missing `otherwise`"
+            )
+        return state
+
+    def parse_unwind_action(self) -> tuple[Any, ...]:
+        def _inner(cur: "_MirTokenCursor") -> tuple[Any, ...]:
+            full, short = cur.parse_ctor_head()
+            _check_ctor_qualifier(full, short, "UnwindAction")
+            if short == "cleanup":
+                return ("cleanup", cur.parse_usize())
+            if short in ("unreachable", "terminate", "continue_"):
+                return (short,)
+            raise CensusScanError(
+                "malformed_syntax", f"unknown UnwindAction constructor `{full}`"
+            )
+
+        return self.with_optional_parens(_inner)
+
+
+def check_strict_mir_module_grammar(tokens: list[tuple[str, Any]]) -> None:
+    def _ident_at(idx: int) -> str | None:
+        if idx < len(tokens) and tokens[idx][0] == "Ident":
+            return str(tokens[idx][1])
+        return None
+
+    scope_stack: list[tuple[str, str]] = []
+    top_level_namespaces = 0
+    body_defs = 0
+    i = 0
+    n = len(tokens)
+    while i < n:
+        kw = _ident_at(i)
+        if kw is None:
+            raise CensusScanError(
+                "malformed_syntax",
+                f"unexpected top-level token {tokens[i]!r} in strict Mir module",
+            )
+        if kw == "import":
+            imp = _ident_at(i + 1)
+            if imp is None:
+                raise CensusScanError(
+                    "malformed_syntax", "`import` without module"
+                )
+            if imp not in _STRICT_MODULE_IMPORTS:
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"unsupported `import {imp}` in strict Mir module (only `Trusted` / `V2026_06_01` allowed)",
+                )
+            i += 2
+        elif kw in ("namespace", "section"):
+            name = _ident_at(i + 1)
+            if name is None or _fc_is_lean_command_start(tokens[i + 1]):
+                raise CensusScanError(
+                    "malformed_syntax", f"`{kw}` without an explicit scope name"
+                )
+            if _shadows_mir_ast_name(name):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"namespace `{name}` shadows a MIR AST type name",
+                )
+            if kw == "namespace" and not scope_stack:
+                if top_level_namespaces >= 1:
+                    raise CensusScanError(
+                        "malformed_syntax",
+                        f"multiple top-level `namespace` blocks (`{name}`) in strict Mir module",
+                    )
+                top_level_namespaces += 1
+            scope_stack.append((kw, name))
+            i += 2
+        elif kw == "end":
+            name = _ident_at(i + 1)
+            if name is None or _fc_is_lean_command_start(tokens[i + 1]):
+                raise CensusScanError(
+                    "malformed_syntax", "`end` without an explicit scope name"
+                )
+            if not scope_stack:
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"unmatched `end {name}` with no open namespace or section",
+                )
+            open_kw, open_name = scope_stack.pop()
+            if open_name != name:
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"mismatched `end {name}` for open `{open_kw} {open_name}`",
+                )
+            i += 2
+        elif kw == "open":
+            i += 1
+            count = 0
+            while True:
+                name = _ident_at(i)
+                if name is None or _fc_is_lean_command_start(tokens[i]):
+                    break
+                if name in ("renaming", "hiding", "in", "scoped"):
+                    raise CensusScanError(
+                        "malformed_syntax", f"`open ... {name}` is not supported"
+                    )
+                if name not in _STRICT_MODULE_OPENS:
+                    raise CensusScanError(
+                        "malformed_syntax",
+                        f"unsupported `open {name}` in strict Mir module (only `Trusted` namespaces allowed)",
+                    )
+                count += 1
+                i += 1
+            if count == 0:
+                raise CensusScanError(
+                    "malformed_syntax", "`open` without namespaces"
+                )
+        elif kw == "set_option":
+            if _ident_at(i + 1) is None:
+                raise CensusScanError(
+                    "malformed_syntax", "`set_option` without name"
+                )
+            if i + 2 >= n or tokens[i + 2][0] not in (
+                "Ident",
+                "NatLit",
+                "StrLit",
+                "CharLit",
+            ):
+                raise CensusScanError(
+                    "malformed_syntax", "`set_option` with invalid value"
+                )
+            i += 3
+        elif kw == "def":
+            name = _ident_at(i + 1)
+            if name is None:
+                raise CensusScanError(
+                    "malformed_syntax", "`def` without a plain identifier name"
+                )
+            if _shadows_mir_ast_name(name) or _fc_is_lean_command_start(tokens[i + 1]):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"declaration `{name}` shadows a MIR AST name or keyword",
+                )
+            if name.endswith(".body"):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"qualified `def {name}` is not allowed in strict Mir module (expected bare `def body`)",
+                )
+            if i + 2 >= n or tokens[i + 2][0] != "Colon":
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"`def {name}` must carry an explicit `: <type>` ascription",
+                )
+            is_body = name == "body"
+            j = i + 3
+            ty_start = j
+            depth = 0
+            while j < n:
+                tk = tokens[j][0]
+                if tk in ("LParen", "LBrace", "LBracket"):
+                    depth += 1
+                elif tk in ("RParen", "RBrace", "RBracket"):
+                    depth -= 1
+                elif tk == "ColonEq" and depth == 0:
+                    break
+                elif depth == 0 and _fc_is_lean_command_start(tokens[j]):
+                    raise CensusScanError(
+                        "malformed_syntax", f"`def {name}` has no `:=` body"
+                    )
+                j += 1
+            if j >= n:
+                raise CensusScanError(
+                    "malformed_syntax", f"`def {name}` has no `:=` body"
+                )
+            if is_body:
+                if len(scope_stack) != 1 or scope_stack[0][0] != "namespace":
+                    raise CensusScanError(
+                        "malformed_syntax",
+                        "`def body : CapturedMir` must appear directly inside the module's single top-level `namespace`",
+                    )
+                ty_ok = (
+                    j == ty_start + 1
+                    and tokens[ty_start][0] == "Ident"
+                    and _is_valid_captured_mir_type(str(tokens[ty_start][1]))
+                )
+                if not ty_ok:
+                    raise CensusScanError(
+                        "malformed_syntax",
+                        f"`def {name}` must be ascribed `: CapturedMir` (in `V2026_06_01` dialect)",
+                    )
+                body_defs += 1
+            cursor = _MirTokenCursor(tokens, j + 1)
+            cursor.skip_balanced_expr()
+            if not is_body:
+                for tok in tokens[i + 3 : cursor.pos]:
+                    if tok[0] == "StrLit" and ("{" in tok[1] or "}" in tok[1]):
+                        raise CensusScanError(
+                            "malformed_syntax",
+                            f"brace-carrying string in skipped `def {name}`",
+                        )
+                    if tok[0] == "Ident" and str(tok[1]).endswith("!"):
+                        raise CensusScanError(
+                            "malformed_syntax",
+                            f"macro invocation `{tok[1]}` in skipped `def {name}`",
+                        )
+            nxt_tok = cursor.peek()
+            if nxt_tok is not None and not _fc_is_lean_command_start(nxt_tok):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"unexpected token {nxt_tok!r} after the value of `def {name}`",
+                )
+            i = cursor.pos
+        else:
+            raise CensusScanError(
+                "malformed_syntax",
+                f"unsupported top-level command `{kw}` in strict Mir module",
+            )
+    if scope_stack:
+        open_kw, open_name = scope_stack[-1]
+        raise CensusScanError(
+            "malformed_syntax",
+            f"unclosed `{open_kw} {open_name}` at end of strict Mir module",
+        )
+    if body_defs != 1:
+        raise CensusScanError(
+            "missing_or_duplicate_def",
+            f"expected exactly one `def body : CapturedMir`, found {body_defs}",
+        )
+
+
+def parse_lean_captured_mir_def_metadata(
+    lean_src: str, def_name: str = "body", *, tokens: list[tuple[str, Any]] | None = None
+) -> dict[str, Any]:
+    if tokens is None:
+        tokens = tokenize_lean_source(lean_src)
+    found_body: dict[str, Any] | None = None
+    idx = 0
+    n = len(tokens)
+    delim_depth = 0
+    while idx + 4 < n:
+        tk = tokens[idx][0]
+        if tk in ("LParen", "LBrace", "LBracket"):
+            delim_depth += 1
+            idx += 1
+            continue
+        if tk in ("RParen", "RBrace", "RBracket"):
+            delim_depth -= 1
+            idx += 1
+            continue
+        is_def = (
+            delim_depth == 0
+            and tokens[idx][0] == "Ident"
+            and tokens[idx][1] in ("def", "abbrev")
+        )
+        name_matches = tokens[idx + 1][0] == "Ident" and (
+            tokens[idx + 1][1] == def_name
+            or str(tokens[idx + 1][1]).endswith(f".{def_name}")
+        )
+        is_colon = tokens[idx + 2][0] == "Colon"
+        is_captured_mir = tokens[idx + 3][0] == "Ident" and _is_valid_captured_mir_type(
+            str(tokens[idx + 3][1])
+        )
+        is_assign = tokens[idx + 4][0] == "ColonEq"
+        if is_def and name_matches and is_colon and is_captured_mir and is_assign:
+            if found_body is not None:
+                raise CensusScanError(
+                    "missing_or_duplicate_def",
+                    f"multiple `def {def_name} : CapturedMir` declarations found",
+                )
+            cursor = _MirTokenCursor(tokens, idx + 5)
+            parsed = cursor.parse_captured_mir_metadata()
+            nxt = cursor.peek()
+            if nxt is not None and not _fc_is_lean_command_start(nxt):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"unexpected token {nxt!r} after `def {def_name} : CapturedMir` record",
+                )
+            found_body = parsed
+            idx = cursor.pos
+        else:
+            idx += 1
+    if found_body is None:
+        raise CensusScanError(
+            "missing_or_duplicate_def",
+            f"`def {def_name} : CapturedMir := ...` not found",
+        )
+    return found_body
+
+
+def parse_lean_captured_mir_def(lean_src: str, def_name: str = "body") -> dict[str, Any]:
+    return parse_lean_captured_mir_def_metadata(lean_src, def_name)["body"]
+
+
+def parse_lean_mir_module_metadata_strict(lean_src: str) -> dict[str, Any]:
+    tokens = tokenize_lean_source(lean_src)
+    check_strict_mir_module_grammar(tokens)
+    return parse_lean_captured_mir_def_metadata(lean_src, "body", tokens=tokens)
+
+
+def parse_lean_mir_module_body_strict(lean_src: str) -> dict[str, Any]:
+    return parse_lean_mir_module_metadata_strict(lean_src)["body"]
+
+
+def dedup_fault_classes(raw: Iterable[str]) -> list[str]:
+    seen = set(raw)
+    return sorted(seen, key=lambda c: FAULT_CLASS_RANK[c])
+
+
+def _extract_operand_callee_def_path(op: tuple[Any, ...]) -> str | None:
+    if op[0] != "constant":
+        return None
+    cv = op[1]
+    if cv[0] == "zeroSized" and cv[1] is not None:
+        return str(cv[1])
+    if cv[0] == "unevaluated":
+        return str(cv[1])
+    if cv[0] == "paramTypedConst":
+        inner = cv[1]
+        if inner[0] == "unevaluated":
+            return str(inner[1])
+    return None
+
+
+def _operand_has_no_param_const_ty(op: tuple[Any, ...]) -> bool:
+    return not (op[0] == "constant" and op[1][0] == "paramTypedConst")
+
+
+def body_has_no_param_call_const(body: dict[str, Any]) -> bool:
+    for bb in body["basic_blocks"]:
+        tk = bb["terminator"]["kind"]
+        if tk[0] in ("call", "tailCall"):
+            if not _operand_has_no_param_const_ty(tk[1]):
+                return False
+    return True
+
+
+def _unwind_targets(unwind: tuple[Any, ...]) -> list[int]:
+    if unwind[0] == "cleanup":
+        return [int(unwind[1])]
+    return []
+
+
+def terminator_targets(kind: tuple[Any, ...]) -> list[int]:
+    tag = kind[0]
+    if tag == "goto":
+        return [int(kind[1])]
+    if tag == "switchInt":
+        targets = kind[2]
+        out = [int(targets["otherwise"])]
+        out.extend(int(t) for _, t in targets["branches"])
+        return out
+    if tag in ("unwindResume", "unwindTerminate", "return_", "unreachable", "tailCall"):
+        return []
+    if tag == "drop":
+        return [int(kind[2]), *_unwind_targets(kind[3])]
+    if tag == "assert":
+        return [int(kind[3]), *_unwind_targets(kind[4])]
+    if tag == "call":
+        target_opt = kind[4]
+        unwind = kind[5]
+        if target_opt is not None:
+            return [int(target_opt), *_unwind_targets(unwind)]
+        return _unwind_targets(unwind)
+    if tag == "inlineAsm":
+        return [*[int(t) for t in kind[2]], *_unwind_targets(kind[3])]
+    return []
+
+
+def cfg_targets_in_bounds(body: dict[str, Any]) -> bool:
+    bbs = body["basic_blocks"]
+    num_blocks = len(bbs)
+    if num_blocks == 0:
+        return False
+    for bb in bbs:
+        if any(t < 0 or t >= num_blocks for t in terminator_targets(bb["terminator"]["kind"])):
+            return False
+    return True
+
+
+def census_projection_elem_fault_classes(proj: tuple[Any, ...]) -> list[str]:
+    tag = proj[0]
+    if tag == "deref":
+        return [
+            "ptr_deref_invalid",
+            "ptr_align_mismatch",
+            "tree_borrows_violation",
+        ]
+    if tag in ("field", "opaqueCast", "unwrapUnsafeBinder"):
+        return []
+    if tag == "index":
+        return ["bounds_check", "uninit_read"]
+    if tag in ("constantIndex", "subslice"):
+        return ["bounds_check"]
+    if tag == "downcast":
+        return ["scalar_niche_invalid"]
+    return []
+
+
+def census_read_projected_fault_classes(proj: tuple[Any, ...]) -> list[str]:
+    tag = proj[0]
+    if tag in ("deref", "field", "opaqueCast", "unwrapUnsafeBinder"):
+        return []
+    if tag == "downcast":
+        return ["scalar_niche_invalid"]
+    if tag == "subslice":
+        return ["bounds_check"]
+    if tag in ("index", "constantIndex"):
+        return ["bounds_check", "scalar_niche_invalid", "uninit_read"]
+    return []
+
+
+def census_place_read_fault_classes(place: dict[str, Any]) -> list[str]:
+    out = ["uninit_read"]
+    for proj in place["projection"]:
+        out.extend(census_projection_elem_fault_classes(proj))
+    return out
+
+
+def census_place_write_fault_classes(place: dict[str, Any]) -> list[str]:
+    if not place["projection"]:
+        return ["storage_live_protected", "tree_borrows_violation"]
+    out = ["storage_live_protected", "tree_borrows_violation", "uninit_read"]
+    for proj in place["projection"]:
+        out.extend(census_projection_elem_fault_classes(proj))
+    return out
+
+
+def census_place_ref_fault_classes(place: dict[str, Any]) -> list[str]:
+    projs = place["projection"]
+    if not projs or projs[0][0] != "deref":
+        if any(p[0] == "subslice" for p in projs):
+            return ["uninit_read", "bounds_check", "ptr_align_mismatch"]
+        return ["uninit_read"]
+    out = [
+        "uninit_read",
+        "ptr_deref_invalid",
+        "ptr_align_mismatch",
+        "tree_borrows_violation",
+    ]
+    for proj in projs:
+        out.extend(census_projection_elem_fault_classes(proj))
+    return out
+
+
+def census_const_value_fault_classes(cv: tuple[Any, ...]) -> list[str]:
+    if cv[0] == "indirect":
+        return ["bounds_check", "scalar_niche_invalid", "uninit_read"]
+    if cv[0] == "paramTypedConst":
+        return census_const_value_fault_classes(cv[1])
+    return []
+
+
+def census_operand_fault_classes(op: tuple[Any, ...]) -> list[str]:
+    if op[0] in ("copy", "move"):
+        return census_place_read_fault_classes(op[1])
+    return census_const_value_fault_classes(op[1])
+
+
+def census_loaded_operand_fault_classes(op: tuple[Any, ...]) -> list[str]:
+    if op[0] in ("copy", "move"):
+        out = census_place_read_fault_classes(op[1])
+        out.append("scalar_niche_invalid")
+        return out
+    return census_const_value_fault_classes(op[1])
+
+
+def census_bin_op_fault_classes(op: str) -> list[str]:
+    if op in ("addUnchecked", "subUnchecked", "mulUnchecked"):
+        return ["arith_overflow"]
+    if op in ("div", "rem"):
+        return ["arith_overflow", "div_rem_by_zero"]
+    if op in ("shlUnchecked", "shrUnchecked"):
+        return ["shift_overflow"]
+    if op == "offset":
+        return [
+            "arith_overflow",
+            "bounds_check",
+            "ptr_deref_invalid",
+            "tree_borrows_violation",
+        ]
+    return []
+
+
+def census_un_op_fault_classes(op: str) -> list[str]:
+    if op == "neg":
+        return []
+    if op == "not":
+        return ["scalar_niche_invalid"]
+    if op == "ptrMetadata":
+        return ["ptr_deref_invalid"]
+    return []
+
+
+def census_cast_kind_fault_classes(kind: tuple[Any, ...]) -> list[str]:
+    tag = kind[0]
+    if tag in ("intToInt", "floatToInt", "floatToFloat", "intToFloat"):
+        return []
+    if tag == "pointerExposeProvenance":
+        return ["ptr_deref_invalid", "scalar_niche_invalid"]
+    if tag == "pointerWithExposedProvenance":
+        return ["scalar_niche_invalid"]
+    if tag in ("transmute", "subtype"):
+        return ["scalar_niche_invalid", "uninit_read"]
+    if tag == "pointerCoercion":
+        coercion = kind[1]
+        if coercion == "MutToConstPointer":
+            return ["ptr_deref_invalid", "scalar_niche_invalid"]
+        if coercion in ("Unsize", "ArrayToPointer"):
+            return [
+                "bounds_check",
+                "ptr_deref_invalid",
+                "ptr_align_mismatch",
+                "tree_borrows_violation",
+                "scalar_niche_invalid",
+            ]
+        return ["ptr_deref_invalid", "scalar_niche_invalid", "call_abi_mismatch"]
+    if tag == "ptrToPtr":
+        return [
+            "bounds_check",
+            "ptr_deref_invalid",
+            "ptr_align_mismatch",
+            "tree_borrows_violation",
+            "scalar_niche_invalid",
+        ]
+    if tag == "fnPtrToPtr":
+        return ["ptr_deref_invalid", "scalar_niche_invalid", "call_abi_mismatch"]
+    return []
+
+
+def census_aggregate_kind_fault_classes(kind: tuple[Any, ...]) -> list[str]:
+    tag = kind[0]
+    if tag == "adt" and kind[3] is not None:
+        return ["scalar_niche_invalid"]
+    if tag == "rawPtr":
+        return ["ptr_deref_invalid", "scalar_niche_invalid"]
+    return []
+
+
+def rvalue_unevaluated(rv: tuple[Any, ...]) -> bool:
+    tag = rv[0]
+    if tag in ("threadLocalRef", "nullaryOp", "shallowInitBox"):
+        return True
+    if tag == "aggregate" and rv[1][0] == "coroutine":
+        return True
+    return False
+
+
+def census_rvalue_fault_classes(rv: tuple[Any, ...]) -> list[str]:
+    tag = rv[0]
+    if tag in ("use", "wrapUnsafeBinder"):
+        return census_loaded_operand_fault_classes(rv[1])
+    if tag == "repeat":
+        return census_operand_fault_classes(rv[1])
+    if tag in ("ref", "rawPtr"):
+        return census_place_ref_fault_classes(rv[2])
+    if tag in ("threadLocalRef", "nullaryOp", "shallowInitBox"):
+        return []
+    if tag == "len":
+        return [*census_place_read_fault_classes(rv[1]), "bounds_check"]
+    if tag == "cast":
+        return [
+            *census_operand_fault_classes(rv[2]),
+            *census_cast_kind_fault_classes(rv[1]),
+        ]
+    if tag == "binaryOp":
+        return [
+            *census_operand_fault_classes(rv[2]),
+            *census_operand_fault_classes(rv[3]),
+            *census_bin_op_fault_classes(rv[1]),
+        ]
+    if tag == "unaryOp":
+        return [
+            *census_operand_fault_classes(rv[2]),
+            *census_un_op_fault_classes(rv[1]),
+        ]
+    if tag == "discriminant":
+        return [*census_place_read_fault_classes(rv[1]), "scalar_niche_invalid"]
+    if tag == "aggregate":
+        kind = rv[1]
+        if kind[0] == "coroutine":
+            return []
+        out: list[str] = []
+        for op in rv[2]:
+            out.extend(census_operand_fault_classes(op))
+        out.extend(census_aggregate_kind_fault_classes(kind))
+        return out
+    if tag == "copyForDeref":
+        return census_place_read_fault_classes(rv[1])
+    return []
+
+
+def census_intrinsic_fault_classes(intr: tuple[Any, ...]) -> list[str]:
+    if intr[0] == "assume":
+        return [*census_operand_fault_classes(intr[1]), "scalar_niche_invalid"]
+    if intr[0] == "copyNonOverlapping":
+        return [
+            *census_operand_fault_classes(intr[1]),
+            *census_operand_fault_classes(intr[2]),
+            *census_operand_fault_classes(intr[3]),
+            "arith_overflow",
+            "bounds_check",
+            "ptr_deref_invalid",
+            "ptr_align_mismatch",
+            "tree_borrows_violation",
+            "scalar_niche_invalid",
+            "uninit_read",
+        ]
+    return []
+
+
+def census_stmt_fault_classes(kind: tuple[Any, ...]) -> list[str]:
+    tag = kind[0]
+    raw: list[str] = []
+    if tag in ("nop", "coverage", "constEvalCounter", "backwardIncompatibleDropHint"):
+        raw = []
+    elif tag in ("storageLive", "storageDead"):
+        raw = ["storage_live_protected"]
+    elif tag == "placeMention":
+        raw = ["uninit_read"]
+    elif tag == "deinit":
+        place = kind[1]
+        if not place["projection"]:
+            raw = ["storage_live_protected"]
+        else:
+            raw = ["uninit_read"]
+            for proj in place["projection"]:
+                raw.extend(census_read_projected_fault_classes(proj))
+    elif tag == "retag":
+        raw = [
+            *census_place_read_fault_classes(kind[1]),
+            "bounds_check",
+            "ptr_deref_invalid",
+            "tree_borrows_violation",
+        ]
+    elif tag == "setDiscriminant":
+        place = kind[1]
+        if not place["projection"]:
+            raw = ["scalar_niche_invalid", "uninit_read"]
+        else:
+            raw = [
+                *census_place_read_fault_classes(place),
+                *census_place_write_fault_classes(place),
+                "scalar_niche_invalid",
+            ]
+    elif tag == "intrinsic":
+        raw = census_intrinsic_fault_classes(kind[1])
+    elif tag == "assign":
+        dst, rv = kind[1], kind[2]
+        if not rvalue_unevaluated(rv):
+            raw = [
+                *census_place_write_fault_classes(dst),
+                *census_rvalue_fault_classes(rv),
+            ]
+    return dedup_fault_classes(raw)
+
+
+def census_callee_def_path_fault_classes(def_path: str) -> list[str]:
+    if def_path in (
+        "core::hint::unreachable_unchecked",
+        "std::hint::unreachable_unchecked",
+        "core::intrinsics::unreachable",
+    ):
+        return ["unreachable_terminator"]
+    if def_path == "core::intrinsics::exact_div":
+        return ["arith_overflow", "div_rem_by_zero"]
+    if not def_path.startswith("core::intrinsics::"):
+        return []
+    suffix = def_path[len("core::intrinsics::") :]
+    if suffix == "arith_offset":
+        return ["ptr_deref_invalid", "scalar_niche_invalid"]
+    if suffix in ("unchecked_add", "unchecked_sub", "unchecked_mul"):
+        return ["arith_overflow"]
+    if suffix in ("unchecked_div", "unchecked_rem"):
+        return ["arith_overflow", "div_rem_by_zero"]
+    if suffix in ("unchecked_shl", "unchecked_shr"):
+        return ["shift_overflow"]
+    if suffix in ("ctlz_nonzero", "cttz_nonzero"):
+        return ["scalar_niche_invalid"]
+    if suffix in ("size_of_val", "align_of_val"):
+        return ["arith_overflow", "ptr_deref_invalid", "scalar_niche_invalid"]
+    if suffix == "const_eval_select":
+        return [
+            "arith_overflow",
+            "div_rem_by_zero",
+            "shift_overflow",
+            "ptr_deref_invalid",
+            "scalar_niche_invalid",
+            "call_abi_mismatch",
+            "unreachable_terminator",
+        ]
+    return []
+
+
+def census_terminator_fault_classes(
+    num_blocks: int, kind: tuple[Any, ...]
+) -> list[str]:
+    target_oob = (
+        ["bounds_check"]
+        if any(t < 0 or t >= num_blocks for t in terminator_targets(kind))
+        else []
+    )
+    tag = kind[0]
+    raw: list[str] = []
+    if tag == "goto":
+        raw = target_oob
+    elif tag in ("unwindTerminate", "inlineAsm"):
+        raw = []
+    elif tag == "unreachable":
+        raw = ["unreachable_terminator"]
+    elif tag == "unwindResume":
+        raw = ["call_abi_mismatch"]
+    elif tag == "return_":
+        raw = ["uninit_read", "tree_borrows_violation", "call_abi_mismatch"]
+    elif tag == "switchInt":
+        raw = [
+            *census_operand_fault_classes(kind[1]),
+            "scalar_niche_invalid",
+            *target_oob,
+        ]
+    elif tag == "drop":
+        place = kind[1]
+        if not place["projection"]:
+            raw = ["storage_live_protected", *target_oob]
+        else:
+            raw = ["uninit_read"]
+            for proj in place["projection"]:
+                raw.extend(census_read_projected_fault_classes(proj))
+            raw.extend(target_oob)
+    elif tag == "assert":
+        cond, unwind = kind[1], kind[4]
+        raw = [*census_operand_fault_classes(cond), "scalar_niche_invalid"]
+        if unwind[0] == "unreachable":
+            raw.append("unreachable_terminator")
+        elif unwind[0] == "continue_":
+            raw.append("call_abi_mismatch")
+        raw.extend(target_oob)
+    elif tag == "call":
+        func, args, destination, target, unwind = (
+            kind[1],
+            kind[2],
+            kind[3],
+            kind[4],
+            kind[5],
+        )
+        raw = list(census_operand_fault_classes(func))
+        for arg in args:
+            raw.extend(census_operand_fault_classes(arg))
+        if target is not None:
+            raw.extend(census_place_write_fault_classes(destination))
+        raw.append("call_abi_mismatch")
+        def_path = _extract_operand_callee_def_path(func)
+        if def_path is not None:
+            if target is not None:
+                raw.extend(census_callee_def_path_fault_classes(def_path))
+            elif def_path in (
+                "core::hint::unreachable_unchecked",
+                "std::hint::unreachable_unchecked",
+                "core::intrinsics::unreachable",
+            ):
+                raw.append("unreachable_terminator")
+        else:
+            raw.append("ptr_deref_invalid")
+        if unwind[0] == "unreachable":
+            raw.append("unreachable_terminator")
+        raw.extend(target_oob)
+    elif tag == "tailCall":
+        func, args = kind[1], kind[2]
+        raw = list(census_operand_fault_classes(func))
+        for arg in args:
+            raw.extend(census_operand_fault_classes(arg))
+        raw.extend([
+            "tree_borrows_violation",
+            "uninit_read",
+            "storage_live_protected",
+            "call_abi_mismatch",
+        ])
+        if _extract_operand_callee_def_path(func) is None:
+            raw.append("ptr_deref_invalid")
+    return dedup_fault_classes(raw)
+
+
+def census_mir_fault_sites(body: dict[str, Any]) -> list[FaultSite]:
+    bbs = body["basic_blocks"]
+    num_blocks = len(bbs)
+    sites: list[FaultSite] = []
+    for block_idx, bb in enumerate(bbs):
+        stmts = bb["statements"]
+        for stmt_idx, stmt in enumerate(stmts):
+            for fc in census_stmt_fault_classes(stmt["kind"]):
+                sites.append(FaultSite(block_idx, stmt_idx, fc))
+        term_idx = len(stmts)
+        for fc in census_terminator_fault_classes(num_blocks, bb["terminator"]["kind"]):
+            sites.append(FaultSite(block_idx, term_idx, fc))
+    return sites
+
+
+def census_lean_mir_def(lean_src: str, def_name: str = "body") -> list[FaultSite]:
+    body = parse_lean_captured_mir_def(lean_src, def_name)
+    return census_mir_fault_sites(body)
+
+
+def census_lean_mir_module(lean_src: str) -> list[FaultSite]:
+    body = parse_lean_mir_module_body_strict(lean_src)
+    return census_mir_fault_sites(body)
+
+
+def _emit_ob_proj_sites(
+    proj: tuple[Any, ...], bb_idx: int, stmt_idx: int, out: set[FaultSite]
+) -> None:
+    tag = proj[0]
+    if tag == "deref":
+        for fc in ("ptr_deref_invalid", "ptr_align_mismatch", "tree_borrows_violation"):
+            out.add(FaultSite(bb_idx, stmt_idx, fc))
+    elif tag == "index":
+        out.add(FaultSite(bb_idx, stmt_idx, "bounds_check"))
+        out.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+    elif tag in ("constantIndex", "subslice"):
+        out.add(FaultSite(bb_idx, stmt_idx, "bounds_check"))
+    elif tag == "downcast":
+        out.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+
+
+def _emit_ob_read_projected_sites(
+    proj: tuple[Any, ...], bb_idx: int, stmt_idx: int, out: set[FaultSite]
+) -> None:
+    tag = proj[0]
+    if tag == "downcast":
+        out.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+    elif tag == "subslice":
+        out.add(FaultSite(bb_idx, stmt_idx, "bounds_check"))
+    elif tag in ("index", "constantIndex"):
+        for fc in ("bounds_check", "scalar_niche_invalid", "uninit_read"):
+            out.add(FaultSite(bb_idx, stmt_idx, fc))
+
+
+def _emit_ob_place_read_sites(
+    place: dict[str, Any], bb_idx: int, stmt_idx: int, out: set[FaultSite]
+) -> None:
+    out.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+    for proj in place["projection"]:
+        _emit_ob_proj_sites(proj, bb_idx, stmt_idx, out)
+
+
+def _emit_ob_place_write_sites(
+    place: dict[str, Any], bb_idx: int, stmt_idx: int, out: set[FaultSite]
+) -> None:
+    out.add(FaultSite(bb_idx, stmt_idx, "storage_live_protected"))
+    out.add(FaultSite(bb_idx, stmt_idx, "tree_borrows_violation"))
+    if place["projection"]:
+        out.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+        for proj in place["projection"]:
+            _emit_ob_proj_sites(proj, bb_idx, stmt_idx, out)
+
+
+def _emit_ob_place_ref_sites(
+    place: dict[str, Any], bb_idx: int, stmt_idx: int, out: set[FaultSite]
+) -> None:
+    projs = place["projection"]
+    if not projs or projs[0][0] != "deref":
+        out.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+        if any(p[0] == "subslice" for p in projs):
+            out.add(FaultSite(bb_idx, stmt_idx, "bounds_check"))
+            out.add(FaultSite(bb_idx, stmt_idx, "ptr_align_mismatch"))
+        return
+    for fc in (
+        "uninit_read",
+        "ptr_deref_invalid",
+        "ptr_align_mismatch",
+        "tree_borrows_violation",
+    ):
+        out.add(FaultSite(bb_idx, stmt_idx, fc))
+    for proj in projs:
+        _emit_ob_proj_sites(proj, bb_idx, stmt_idx, out)
+
+
+def _emit_ob_const_sites(
+    cv: tuple[Any, ...], bb_idx: int, stmt_idx: int, out: set[FaultSite]
+) -> None:
+    if cv[0] == "indirect":
+        for fc in ("bounds_check", "scalar_niche_invalid", "uninit_read"):
+            out.add(FaultSite(bb_idx, stmt_idx, fc))
+    elif cv[0] == "paramTypedConst":
+        _emit_ob_const_sites(cv[1], bb_idx, stmt_idx, out)
+
+
+def _emit_ob_operand_sites(
+    op: tuple[Any, ...], bb_idx: int, stmt_idx: int, out: set[FaultSite], *, loaded: bool = False
+) -> None:
+    if op[0] in ("copy", "move"):
+        _emit_ob_place_read_sites(op[1], bb_idx, stmt_idx, out)
+        if loaded:
+            out.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+    else:
+        _emit_ob_const_sites(op[1], bb_idx, stmt_idx, out)
+
+
+def emit_mir_obligation_fault_sites(body: dict[str, Any]) -> list[FaultSite]:
+    bbs = body["basic_blocks"]
+    num_blocks = len(bbs)
+    sites: set[FaultSite] = set()
+    for bb_idx, bb in enumerate(bbs):
+        stmts = bb["statements"]
+        for stmt_idx, stmt in enumerate(stmts):
+            sk = stmt["kind"]
+            stag = sk[0]
+            if stag in ("storageLive", "storageDead"):
+                sites.add(FaultSite(bb_idx, stmt_idx, "storage_live_protected"))
+            elif stag == "placeMention":
+                sites.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+            elif stag == "deinit":
+                place = sk[1]
+                if not place["projection"]:
+                    sites.add(FaultSite(bb_idx, stmt_idx, "storage_live_protected"))
+                else:
+                    sites.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+                    for proj in place["projection"]:
+                        _emit_ob_read_projected_sites(proj, bb_idx, stmt_idx, sites)
+            elif stag == "retag":
+                _emit_ob_place_read_sites(sk[1], bb_idx, stmt_idx, sites)
+                for fc in ("bounds_check", "ptr_deref_invalid", "tree_borrows_violation"):
+                    sites.add(FaultSite(bb_idx, stmt_idx, fc))
+            elif stag == "setDiscriminant":
+                place = sk[1]
+                if not place["projection"]:
+                    sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                    sites.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+                else:
+                    _emit_ob_place_read_sites(place, bb_idx, stmt_idx, sites)
+                    _emit_ob_place_write_sites(place, bb_idx, stmt_idx, sites)
+                    sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+            elif stag == "intrinsic":
+                intr = sk[1]
+                if intr[0] == "assume":
+                    _emit_ob_operand_sites(intr[1], bb_idx, stmt_idx, sites)
+                    sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                elif intr[0] == "copyNonOverlapping":
+                    _emit_ob_operand_sites(intr[1], bb_idx, stmt_idx, sites)
+                    _emit_ob_operand_sites(intr[2], bb_idx, stmt_idx, sites)
+                    _emit_ob_operand_sites(intr[3], bb_idx, stmt_idx, sites)
+                    for fc in (
+                        "arith_overflow",
+                        "bounds_check",
+                        "ptr_deref_invalid",
+                        "ptr_align_mismatch",
+                        "tree_borrows_violation",
+                        "scalar_niche_invalid",
+                        "uninit_read",
+                    ):
+                        sites.add(FaultSite(bb_idx, stmt_idx, fc))
+            elif stag == "assign":
+                dst, rv = sk[1], sk[2]
+                rtag = rv[0]
+                uneval = rtag in ("threadLocalRef", "nullaryOp", "shallowInitBox") or (
+                    rtag == "aggregate" and rv[1][0] == "coroutine"
+                )
+                if not uneval:
+                    _emit_ob_place_write_sites(dst, bb_idx, stmt_idx, sites)
+                    if rtag in ("use", "wrapUnsafeBinder"):
+                        _emit_ob_operand_sites(rv[1], bb_idx, stmt_idx, sites, loaded=True)
+                    elif rtag == "repeat":
+                        _emit_ob_operand_sites(rv[1], bb_idx, stmt_idx, sites)
+                    elif rtag in ("ref", "rawPtr"):
+                        _emit_ob_place_ref_sites(rv[2], bb_idx, stmt_idx, sites)
+                    elif rtag == "len":
+                        _emit_ob_place_read_sites(rv[1], bb_idx, stmt_idx, sites)
+                        sites.add(FaultSite(bb_idx, stmt_idx, "bounds_check"))
+                    elif rtag == "cast":
+                        ck, op = rv[1], rv[2]
+                        _emit_ob_operand_sites(op, bb_idx, stmt_idx, sites)
+                        ctag = ck[0]
+                        if ctag == "pointerExposeProvenance":
+                            sites.add(FaultSite(bb_idx, stmt_idx, "ptr_deref_invalid"))
+                            sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                        elif ctag == "pointerWithExposedProvenance":
+                            sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                        elif ctag in ("transmute", "subtype"):
+                            sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                            sites.add(FaultSite(bb_idx, stmt_idx, "uninit_read"))
+                        elif ctag == "pointerCoercion":
+                            coerc = ck[1]
+                            if coerc == "MutToConstPointer":
+                                sites.add(FaultSite(bb_idx, stmt_idx, "ptr_deref_invalid"))
+                                sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                            elif coerc in ("Unsize", "ArrayToPointer"):
+                                for fc in (
+                                    "bounds_check",
+                                    "ptr_deref_invalid",
+                                    "ptr_align_mismatch",
+                                    "tree_borrows_violation",
+                                    "scalar_niche_invalid",
+                                ):
+                                    sites.add(FaultSite(bb_idx, stmt_idx, fc))
+                            else:
+                                for fc in (
+                                    "ptr_deref_invalid",
+                                    "scalar_niche_invalid",
+                                    "call_abi_mismatch",
+                                ):
+                                    sites.add(FaultSite(bb_idx, stmt_idx, fc))
+                        elif ctag == "ptrToPtr":
+                            for fc in (
+                                "bounds_check",
+                                "ptr_deref_invalid",
+                                "ptr_align_mismatch",
+                                "tree_borrows_violation",
+                                "scalar_niche_invalid",
+                            ):
+                                sites.add(FaultSite(bb_idx, stmt_idx, fc))
+                        elif ctag == "fnPtrToPtr":
+                            for fc in (
+                                "ptr_deref_invalid",
+                                "scalar_niche_invalid",
+                                "call_abi_mismatch",
+                            ):
+                                sites.add(FaultSite(bb_idx, stmt_idx, fc))
+                    elif rtag == "binaryOp":
+                        bop, lhs, rhs = rv[1], rv[2], rv[3]
+                        _emit_ob_operand_sites(lhs, bb_idx, stmt_idx, sites)
+                        _emit_ob_operand_sites(rhs, bb_idx, stmt_idx, sites)
+                        if bop in ("addUnchecked", "subUnchecked", "mulUnchecked"):
+                            sites.add(FaultSite(bb_idx, stmt_idx, "arith_overflow"))
+                        elif bop in ("div", "rem"):
+                            sites.add(FaultSite(bb_idx, stmt_idx, "arith_overflow"))
+                            sites.add(FaultSite(bb_idx, stmt_idx, "div_rem_by_zero"))
+                        elif bop in ("shlUnchecked", "shrUnchecked"):
+                            sites.add(FaultSite(bb_idx, stmt_idx, "shift_overflow"))
+                        elif bop == "offset":
+                            for fc in (
+                                "arith_overflow",
+                                "bounds_check",
+                                "ptr_deref_invalid",
+                                "tree_borrows_violation",
+                            ):
+                                sites.add(FaultSite(bb_idx, stmt_idx, fc))
+                    elif rtag == "unaryOp":
+                        uop, val = rv[1], rv[2]
+                        _emit_ob_operand_sites(val, bb_idx, stmt_idx, sites)
+                        if uop == "not":
+                            sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                        elif uop == "ptrMetadata":
+                            sites.add(FaultSite(bb_idx, stmt_idx, "ptr_deref_invalid"))
+                    elif rtag == "discriminant":
+                        _emit_ob_place_read_sites(rv[1], bb_idx, stmt_idx, sites)
+                        sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                    elif rtag == "aggregate":
+                        ak, ops = rv[1], rv[2]
+                        for op in ops:
+                            _emit_ob_operand_sites(op, bb_idx, stmt_idx, sites)
+                        if ak[0] == "adt" and ak[3] is not None:
+                            sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                        elif ak[0] == "rawPtr":
+                            sites.add(FaultSite(bb_idx, stmt_idx, "ptr_deref_invalid"))
+                            sites.add(FaultSite(bb_idx, stmt_idx, "scalar_niche_invalid"))
+                    elif rtag == "copyForDeref":
+                        _emit_ob_place_read_sites(rv[1], bb_idx, stmt_idx, sites)
+
+        term_idx = len(stmts)
+        tk = bb["terminator"]["kind"]
+        ttag = tk[0]
+        if any(t < 0 or t >= num_blocks for t in terminator_targets(tk)) and ttag not in (
+            "unwindTerminate",
+            "inlineAsm",
+            "unreachable",
+            "unwindResume",
+            "return_",
+            "tailCall",
+        ):
+            sites.add(FaultSite(bb_idx, term_idx, "bounds_check"))
+        if ttag == "unreachable":
+            sites.add(FaultSite(bb_idx, term_idx, "unreachable_terminator"))
+        elif ttag == "unwindResume":
+            sites.add(FaultSite(bb_idx, term_idx, "call_abi_mismatch"))
+        elif ttag == "return_":
+            for fc in ("uninit_read", "tree_borrows_violation", "call_abi_mismatch"):
+                sites.add(FaultSite(bb_idx, term_idx, fc))
+        elif ttag == "switchInt":
+            _emit_ob_operand_sites(tk[1], bb_idx, term_idx, sites)
+            sites.add(FaultSite(bb_idx, term_idx, "scalar_niche_invalid"))
+        elif ttag == "drop":
+            place = tk[1]
+            if not place["projection"]:
+                sites.add(FaultSite(bb_idx, term_idx, "storage_live_protected"))
+            else:
+                sites.add(FaultSite(bb_idx, term_idx, "uninit_read"))
+                for proj in place["projection"]:
+                    _emit_ob_read_projected_sites(proj, bb_idx, term_idx, sites)
+        elif ttag == "assert":
+            cond, unwind = tk[1], tk[4]
+            _emit_ob_operand_sites(cond, bb_idx, term_idx, sites)
+            sites.add(FaultSite(bb_idx, term_idx, "scalar_niche_invalid"))
+            if unwind[0] == "unreachable":
+                sites.add(FaultSite(bb_idx, term_idx, "unreachable_terminator"))
+            elif unwind[0] == "continue_":
+                sites.add(FaultSite(bb_idx, term_idx, "call_abi_mismatch"))
+        elif ttag == "call":
+            func, args, dest, target, unwind = tk[1], tk[2], tk[3], tk[4], tk[5]
+            _emit_ob_operand_sites(func, bb_idx, term_idx, sites)
+            for arg in args:
+                _emit_ob_operand_sites(arg, bb_idx, term_idx, sites)
+            if target is not None:
+                _emit_ob_place_write_sites(dest, bb_idx, term_idx, sites)
+            sites.add(FaultSite(bb_idx, term_idx, "call_abi_mismatch"))
+            dp = _extract_operand_callee_def_path(func)
+            if dp is not None:
+                if target is not None:
+                    for fc in census_callee_def_path_fault_classes(dp):
+                        sites.add(FaultSite(bb_idx, term_idx, fc))
+                elif dp in (
+                    "core::hint::unreachable_unchecked",
+                    "std::hint::unreachable_unchecked",
+                    "core::intrinsics::unreachable",
+                ):
+                    sites.add(FaultSite(bb_idx, term_idx, "unreachable_terminator"))
+            else:
+                sites.add(FaultSite(bb_idx, term_idx, "ptr_deref_invalid"))
+            if unwind[0] == "unreachable":
+                sites.add(FaultSite(bb_idx, term_idx, "unreachable_terminator"))
+        elif ttag == "tailCall":
+            func, args = tk[1], tk[2]
+            _emit_ob_operand_sites(func, bb_idx, term_idx, sites)
+            for arg in args:
+                _emit_ob_operand_sites(arg, bb_idx, term_idx, sites)
+            for fc in (
+                "tree_borrows_violation",
+                "uninit_read",
+                "storage_live_protected",
+                "call_abi_mismatch",
+            ):
+                sites.add(FaultSite(bb_idx, term_idx, fc))
+            if _extract_operand_callee_def_path(func) is None:
+                sites.add(FaultSite(bb_idx, term_idx, "ptr_deref_invalid"))
+    return sorted(sites)
+
+
+def direct_callee_def_paths(body: dict[str, Any]) -> list[str]:
+    out: set[str] = set()
+    for bb in body["basic_blocks"]:
+        tk = bb["terminator"]["kind"]
+        if tk[0] == "call":
+            func, args, _dest, target, _unwind = tk[1], tk[2], tk[3], tk[4], tk[5]
+            path = _extract_operand_callee_def_path(func)
+            if path is not None:
+                if (
+                    target is not None
+                    and path == "core::intrinsics::const_eval_select"
+                    and len(args) == 3
+                ):
+                    rt = _extract_operand_callee_def_path(args[2])
+                    out.add(rt if rt is not None else path)
+                else:
+                    out.add(path)
+        elif tk[0] == "tailCall":
+            path = _extract_operand_callee_def_path(tk[1])
+            if path is not None:
+                out.add(path)
+    return sorted(out)
+
+
+def reified_fn_def_paths(body: dict[str, Any]) -> list[str]:
+    out: set[str] = set()
+    for bb in body["basic_blocks"]:
+        for stmt in bb["statements"]:
+            sk = stmt["kind"]
+            if sk[0] == "assign":
+                rv = sk[2]
+                if rv[0] == "cast":
+                    ck, op = rv[1], rv[2]
+                    if ck[0] == "pointerCoercion":
+                        coercion: str = ck[1]
+                        if (
+                            coercion == "ReifyFnPointer"
+                            or coercion.startswith("ReifyFnPointer(")
+                            or coercion == "ClosureFnPointer"
+                            or coercion.startswith("ClosureFnPointer(")
+                        ):
+                            path = _extract_operand_callee_def_path(op)
+                            if path is not None:
+                                out.add(path)
+    return sorted(out)
+
+
+def reconcile_obligation_coverage(
+    census: Iterable[FaultSite],
+    discharged: Iterable[FaultSite],
+    registry: object = None,
+) -> dict[str, Any]:
+    reg = validate_property_registry(registry, require_all_verified=False)
+    discharged_set = set(discharged)
+    missing_sites: list[FaultSite] = []
+    unemitted_set: set[str] = set()
+    reasons: list[str] = []
+
+    for site in census:
+        status = reg[site.fault_class]["status"]
+        in_discharged = site in discharged_set
+        is_cls_verified = status == PROPERTY_STATUS_EMITTED_AND_VERIFIED
+        if not in_discharged or not is_cls_verified:
+            missing_sites.append(site)
+            if not in_discharged:
+                reasons.append(
+                    f"unmapped fault site {site}: present in MIR census but omitted by obligation generator"
+                )
+            if not is_cls_verified and site.fault_class not in unemitted_set:
+                unemitted_set.add(site.fault_class)
+                reasons.append(
+                    f"fault class `{site.fault_class}` at {site} has non-verified registry status {status}"
+                )
+
+    unemitted_classes = sorted(unemitted_set, key=lambda c: FAULT_CLASS_RANK[c])
+    is_verified = not missing_sites and not unemitted_classes
+    return {
+        "verdict": "VERIFIED" if is_verified else "UNKNOWN(UNMAPPED_FAULT_SITE)",
+        "is_verified": is_verified,
+        "missing_sites": missing_sites,
+        "unemitted_classes": unemitted_classes,
+        "reasons": reasons,
+    }
+
+
+def reconcile_lean_mir_coverage(
+    lean_src: str,
+    discharged: Iterable[FaultSite],
+    registry: object = None,
+) -> dict[str, Any]:
+    try:
+        census = census_lean_mir_module(lean_src)
+    except CensusScanError as err:
+        return {
+            "verdict": "UNKNOWN(UNMAPPED_FAULT_SITE)",
+            "is_verified": False,
+            "missing_sites": [],
+            "unemitted_classes": [],
+            "reasons": [f"census scan failed closed: {err}"],
+        }
+    return reconcile_obligation_coverage(census, discharged, registry)
+
+
+def reconcile_multi_item_coverage(
+    items: list[dict[str, Any]],
+    closure: dict[str, Any] | None = None,
+    registry: object = None,
+) -> dict[str, Any]:
+    reg = validate_property_registry(registry, require_all_verified=False)
+    if closure is None:
+        closure = {
+            "inline_callees": [],
+            "external_callees": [],
+            "allow_unresolved_indirect_calls": False,
+        }
+    if not items:
+        return {
+            "verdict": "UNKNOWN(UNMAPPED_FAULT_SITE)",
+            "is_verified": False,
+            "failed_items": [],
+            "reasons": [
+                "multi-item coverage batch is empty (at least one subject item required)"
+            ],
+        }
+
+    seen_paths: set[str] = set()
+    failed_items: list[tuple[str, dict[str, Any]]] = []
+    reasons: list[str] = []
+
+    for item in items:
+        def_path = str(item.get("def_path", ""))
+        body = item["body"]
+        body_def_path = str(body.get("def_path", ""))
+        discharged = list(item.get("discharged", ()))
+        if not def_path:
+            reasons.append("batch item has an empty `def_path`")
+        if def_path in seen_paths:
+            reasons.append(
+                f"duplicate item def_path `{def_path}` in multi-item coverage batch"
+            )
+        seen_paths.add(def_path)
+        if def_path != body_def_path:
+            reasons.append(
+                f"item label `{def_path}` does not match its body def_path `{body_def_path}`"
+            )
+        census = census_mir_fault_sites(body)
+        verdict = reconcile_obligation_coverage(census, discharged, reg)
+        if not verdict["is_verified"]:
+            for r in verdict["reasons"]:
+                reasons.append(f"[{def_path}] {r}")
+            failed_items.append((def_path, verdict))
+
+    inline_list = list(closure.get("inline_callees", ()))
+    external_list = list(closure.get("external_callees", ()))
+    allow_unresolved = bool(closure.get("allow_unresolved_indirect_calls", False))
+
+    external_set: set[str] = set()
+    for ext in external_list:
+        if ext in external_set:
+            reasons.append(f"duplicate external callee `{ext}` in CalleeClosure")
+        external_set.add(ext)
+
+    inline_set: set[str] = set()
+    for callee in inline_list:
+        if callee in inline_set:
+            reasons.append(f"duplicate inline callee `{callee}` in CalleeClosure")
+        inline_set.add(callee)
+        if callee not in seen_paths:
+            reasons.append(
+                f"inline callee `{callee}` has no batch item: its body can become `activeCallee` but its census was never reconciled"
+            )
+        if callee in external_set:
+            reasons.append(f"callee `{callee}` is declared both inline and external")
+
+    for item in items:
+        def_path = str(item["def_path"])
+        body = item["body"]
+        if def_path in external_set:
+            reasons.append(
+                f"batch item `{def_path}` is declared in `closure.external_callees` (a verified batch item cannot be treated as an uninterpreted external callee)"
+            )
+        if not body_has_no_param_call_const(body):
+            reasons.append(
+                f"[{def_path}] body contains a `Call` or `TailCall` terminator whose `func` operand is a `RigidTy.param`-typed constant (`bodyHasNoParamCallConst` violated)"
+            )
+        if not cfg_targets_in_bounds(body):
+            reasons.append(
+                f"[{def_path}] body violates `cfgTargetsInBounds` (empty `basicBlocks` or out-of-bounds terminator/unwind target)"
+            )
+        for bb_idx, bb in enumerate(body["basic_blocks"]):
+            tk = bb["terminator"]["kind"]
+            if tk[0] == "call":
+                func, args, _dest, target, _unwind = tk[1], tk[2], tk[3], tk[4], tk[5]
+                callee = _extract_operand_callee_def_path(func)
+                if target is not None:
+                    if callee is not None:
+                        if callee == "core::intrinsics::const_eval_select":
+                            rt_ok = False
+                            if len(args) == 3:
+                                rt = _extract_operand_callee_def_path(args[2])
+                                if rt is not None:
+                                    rt_ok = (
+                                        rt in inline_set
+                                        or rt in external_set
+                                        or rt in _NATIVE_CONVERGING_SET
+                                        or rt in _NATIVE_DIVERGING_SET
+                                    )
+                                else:
+                                    rt_ok = allow_unresolved
+                            if not rt_ok:
+                                reasons.append(
+                                    f"[{def_path}] bb{bb_idx} `const_eval_select` runtime target is not classified in CalleeClosure"
+                                )
+                        else:
+                            classified = (
+                                callee in inline_set
+                                or callee in external_set
+                                or callee in _NATIVE_CONVERGING_SET
+                            )
+                            if not classified:
+                                reasons.append(
+                                    f"[{def_path}] direct callee `{callee}` is neither a declared inline callee, a declared external callee, nor a natively modeled converging-call intrinsic"
+                                )
+                    elif not allow_unresolved:
+                        reasons.append(
+                            f"[{def_path}] bb{bb_idx} indirect call through a non-constant `func` operand has an unresolved target and CalleeClosure does not permit unresolved indirect calls"
+                        )
+                else:
+                    if callee is not None:
+                        classified = (
+                            callee in inline_set
+                            or callee in external_set
+                            or callee in _NATIVE_DIVERGING_SET
+                        )
+                        if not classified:
+                            reasons.append(
+                                f"[{def_path}] direct callee `{callee}` is neither a declared inline callee, a declared external callee, nor a natively modeled diverging-call target"
+                            )
+                    elif not allow_unresolved:
+                        reasons.append(
+                            f"[{def_path}] bb{bb_idx} indirect diverging call through a non-constant `func` operand has an unresolved target and CalleeClosure does not permit unresolved indirect calls"
+                        )
+            elif tk[0] == "tailCall":
+                callee = _extract_operand_callee_def_path(tk[1])
+                if callee is not None:
+                    if callee not in inline_set and callee not in external_set:
+                        reasons.append(
+                            f"[{def_path}] direct tail-call callee `{callee}` is neither a declared inline callee nor a declared external callee"
+                        )
+                elif not allow_unresolved:
+                    reasons.append(
+                        f"[{def_path}] bb{bb_idx} indirect tail call through a non-constant `func` operand has an unresolved target and CalleeClosure does not permit unresolved indirect calls"
+                    )
+        for reified in reified_fn_def_paths(body):
+            if reified not in inline_set and reified not in external_set:
+                reasons.append(
+                    f"[{def_path}] reified function pointer target `{reified}` (`ReifyFnPointer`) is neither a declared inline callee nor a declared external callee"
+                )
+
+    is_verified = not failed_items and not reasons
+    return {
+        "verdict": "VERIFIED" if is_verified else "UNKNOWN(UNMAPPED_FAULT_SITE)",
+        "is_verified": is_verified,
+        "failed_items": failed_items,
+        "reasons": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4 + 2 False-Proof Mutation Probes
+# ---------------------------------------------------------------------------
+
+FAULT_MUTATION_PROBES: tuple[str, ...] = (
+    "CallArgBlindProbe",
+    "SwitchBreakStripProbe",
+    "LoopUpdateOverflowProbe",
+    "DerefAliasProbe",
+)
+
+ALL_FALSE_PROOF_PROBES: tuple[str, ...] = (
+    "CallArgBlindProbe",
+    "SwitchBreakStripProbe",
+    "LoopUpdateOverflowProbe",
+    "DerefAliasProbe",
+    "PropertyRegistryUnemittedProbe",
+    "CalleeCoordinateMaskProbe",
+)
+
+
+def _place_has_deref(place: dict[str, Any]) -> bool:
+    return any(p[0] == "deref" for p in place["projection"])
+
+
+def _operand_has_deref(op: tuple[Any, ...]) -> bool:
+    return op[0] in ("copy", "move") and _place_has_deref(op[1])
+
+
+def _rvalue_has_deref(rv: tuple[Any, ...]) -> bool:
+    tag = rv[0]
+    if tag in ("use", "repeat", " unaryOp", "shallowInitBox", "wrapUnsafeBinder"):
+        return _operand_has_deref(rv[1] if tag != "unaryOp" else rv[2])
+    if tag == "cast":
+        return _operand_has_deref(rv[2])
+    if tag == "unaryOp":
+        return _operand_has_deref(rv[2])
+    if tag == "binaryOp":
+        return _operand_has_deref(rv[2]) or _operand_has_deref(rv[3])
+    if tag == "aggregate":
+        return any(_operand_has_deref(op) for op in rv[2])
+    if tag in ("ref", "rawPtr"):
+        return _place_has_deref(rv[2])
+    if tag in ("len", "discriminant", "copyForDeref"):
+        return _place_has_deref(rv[1])
+    return False
+
+
+def _stmt_has_deref(kind: tuple[Any, ...]) -> bool:
+    tag = kind[0]
+    if tag == "assign":
+        return _place_has_deref(kind[1]) or _rvalue_has_deref(kind[2])
+    if tag in ("setDiscriminant", "deinit", "retag", "placeMention"):
+        return _place_has_deref(kind[1])
+    if tag == "intrinsic":
+        intr = kind[1]
+        if intr[0] == "assume":
+            return _operand_has_deref(intr[1])
+        if intr[0] == "copyNonOverlapping":
+            return True
+    return False
+
+
+def _strip_deref_projections(op: tuple[Any, ...]) -> tuple[Any, ...]:
+    if op[0] in ("copy", "move"):
+        p = op[1]
+        return (
+            op[0],
+            {
+                "local_": p["local_"],
+                "projection": [e for e in p["projection"] if e[0] != "deref"],
+            },
+        )
+    return op
+
+
+def mock_emit_obligations(
+    body: dict[str, Any], mutation: str | None = None
+) -> list[FaultSite]:
+    bbs = body["basic_blocks"]
+    num_blocks = len(bbs)
+    reachable = [False] * num_blocks
+    work = [0]
+    while work:
+        b = work.pop()
+        if b < 0 or b >= num_blocks or reachable[b]:
+            continue
+        reachable[b] = True
+        tk = bbs[b]["terminator"]["kind"]
+        if tk[0] == "switchInt" and mutation == "SwitchBreakStripProbe":
+            work.extend(int(t) for _, t in tk[2]["branches"])
+        else:
+            work.extend(terminator_targets(tk))
+
+    out: list[FaultSite] = []
+    for b, bb in enumerate(bbs):
+        if not reachable[b]:
+            continue
+        is_latch = any(t <= b for t in terminator_targets(bb["terminator"]["kind"]))
+        for i, stmt in enumerate(bb["statements"]):
+            classes = list(census_stmt_fault_classes(stmt["kind"]))
+            if mutation == "LoopUpdateOverflowProbe" and is_latch:
+                classes = [c for c in classes if c != "arith_overflow"]
+            elif mutation == "DerefAliasProbe" and _stmt_has_deref(stmt["kind"]):
+                classes = [
+                    c
+                    for c in classes
+                    if c
+                    not in (
+                        "ptr_deref_invalid",
+                        "ptr_align_mismatch",
+                        "tree_borrows_violation",
+                    )
+                ]
+            for c in classes:
+                out.append(FaultSite(b, i, c))
+        term_idx = len(bb["statements"])
+        tk = bb["terminator"]["kind"]
+        if tk[0] == "call" and mutation == "CallArgBlindProbe":
+            stripped_tk = (
+                "call",
+                tk[1],
+                [_strip_deref_projections(a) for a in tk[2]],
+                tk[3],
+                tk[4],
+                tk[5],
+            )
+            term_classes = census_terminator_fault_classes(num_blocks, stripped_tk)
+        else:
+            term_classes = census_terminator_fault_classes(num_blocks, tk)
+        for c in term_classes:
+            out.append(FaultSite(b, term_idx, c))
+    return out
+
+
+def _mk_local_place(local_: int) -> dict[str, Any]:
+    return {"local_": local_, "projection": []}
+
+
+def _mk_deref_local_place(local_: int) -> dict[str, Any]:
+    return {"local_": local_, "projection": [("deref",)]}
+
+
+def _mk_const_u32(bits: int) -> tuple[Any, ...]:
+    return ("constant", ("scalarInt", bits, 4))
+
+
+def _mk_const_fn(def_path: str) -> tuple[Any, ...]:
+    return ("constant", ("zeroSized", def_path))
+
+
+def build_probe_scenario(
+    probe: str,
+) -> tuple[dict[str, Any], list[FaultSite], list[FaultSite], list[FaultSite]]:
+    if probe == "CallArgBlindProbe":
+        body = {
+            "def_path": "proto::witness_call_arg_blind",
+            "basic_blocks": [
+                {
+                    "statements": [],
+                    "terminator": {
+                        "kind": (
+                            "call",
+                            _mk_const_fn("proto::callee_u32"),
+                            [("copy", _mk_deref_local_place(1))],
+                            _mk_local_place(0),
+                            1,
+                            ("continue_",),
+                        ),
+                        "span": "proto.rs:10:5",
+                    },
+                    "is_cleanup": False,
+                },
+                {
+                    "statements": [],
+                    "terminator": {"kind": ("return_",), "span": "proto.rs:11:5"},
+                    "is_cleanup": False,
+                },
+            ],
+        }
+        expected_missing = [
+            FaultSite(0, 0, "ptr_deref_invalid"),
+            FaultSite(0, 0, "ptr_align_mismatch"),
+        ]
+    elif probe == "SwitchBreakStripProbe":
+        body = {
+            "def_path": "proto::witness_switch_break_strip",
+            "basic_blocks": [
+                {
+                    "statements": [],
+                    "terminator": {
+                        "kind": (
+                            "switchInt",
+                            ("copy", _mk_local_place(1)),
+                            {"branches": [(0, 1)], "otherwise": 2},
+                        ),
+                        "span": "proto.rs:20:5",
+                    },
+                    "is_cleanup": False,
+                },
+                {
+                    "statements": [
+                        {
+                            "kind": (
+                                "assign",
+                                _mk_local_place(0),
+                                ("use", _mk_const_u32(42)),
+                            ),
+                            "span": "proto.rs:21:9",
+                        }
+                    ],
+                    "terminator": {"kind": ("return_",), "span": "proto.rs:21:15"},
+                    "is_cleanup": False,
+                },
+                {
+                    "statements": [
+                        {
+                            "kind": (
+                                "assign",
+                                _mk_local_place(0),
+                                (
+                                    "binaryOp",
+                                    "div",
+                                    ("copy", _mk_local_place(1)),
+                                    ("copy", _mk_local_place(2)),
+                                ),
+                            ),
+                            "span": "proto.rs:22:9",
+                        }
+                    ],
+                    "terminator": {"kind": ("return_",), "span": "proto.rs:22:15"},
+                    "is_cleanup": False,
+                },
+            ],
+        }
+        expected_missing = [
+            FaultSite(2, 0, "arith_overflow"),
+            FaultSite(2, 0, "div_rem_by_zero"),
+            FaultSite(2, 0, "tree_borrows_violation"),
+            FaultSite(2, 0, "uninit_read"),
+            FaultSite(2, 0, "storage_live_protected"),
+            FaultSite(2, 1, "tree_borrows_violation"),
+            FaultSite(2, 1, "uninit_read"),
+            FaultSite(2, 1, "call_abi_mismatch"),
+        ]
+    elif probe == "LoopUpdateOverflowProbe":
+        body = {
+            "def_path": "proto::witness_loop_update_overflow",
+            "basic_blocks": [
+                {
+                    "statements": [],
+                    "terminator": {"kind": ("goto", 1), "span": "proto.rs:30:5"},
+                    "is_cleanup": False,
+                },
+                {
+                    "statements": [],
+                    "terminator": {
+                        "kind": (
+                            "switchInt",
+                            ("copy", _mk_local_place(1)),
+                            {"branches": [(0, 3)], "otherwise": 2},
+                        ),
+                        "span": "proto.rs:31:5",
+                    },
+                    "is_cleanup": False,
+                },
+                {
+                    "statements": [
+                        {
+                            "kind": (
+                                "assign",
+                                _mk_local_place(1),
+                                (
+                                    "binaryOp",
+                                    "addUnchecked",
+                                    ("copy", _mk_local_place(1)),
+                                    _mk_const_u32(1),
+                                ),
+                            ),
+                            "span": "proto.rs:32:9",
+                        },
+                        {
+                            "kind": (
+                                "assign",
+                                _mk_local_place(0),
+                                (
+                                    "binaryOp",
+                                    "add",
+                                    ("copy", _mk_local_place(0)),
+                                    ("copy", _mk_local_place(1)),
+                                ),
+                            ),
+                            "span": "proto.rs:33:9",
+                        },
+                    ],
+                    "terminator": {"kind": ("goto", 1), "span": "proto.rs:33:20"},
+                    "is_cleanup": False,
+                },
+                {
+                    "statements": [],
+                    "terminator": {"kind": ("return_",), "span": "proto.rs:34:5"},
+                    "is_cleanup": False,
+                },
+            ],
+        }
+        expected_missing = [FaultSite(2, 0, "arith_overflow")]
+    elif probe == "DerefAliasProbe":
+        body = {
+            "def_path": "proto::witness_deref_alias",
+            "basic_blocks": [
+                {
+                    "statements": [
+                        {
+                            "kind": (
+                                "assign",
+                                _mk_deref_local_place(1),
+                                ("use", ("copy", _mk_deref_local_place(2))),
+                            ),
+                            "span": "proto.rs:40:5",
+                        }
+                    ],
+                    "terminator": {"kind": ("return_",), "span": "proto.rs:41:5"},
+                    "is_cleanup": False,
+                }
+            ],
+        }
+        expected_missing = [
+            FaultSite(0, 0, "ptr_deref_invalid"),
+            FaultSite(0, 0, "ptr_align_mismatch"),
+            FaultSite(0, 0, "tree_borrows_violation"),
+        ]
+    else:
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"unknown false-proof mutation probe `{probe}`"
+        )
+    baseline = mock_emit_obligations(body, None)
+    mutant = mock_emit_obligations(body, probe)
+    return (body, baseline, mutant, expected_missing)
+
+
+def build_callee_storage_witness_body() -> dict[str, Any]:
+    return {
+        "def_path": "proto::witness_callee_storage",
+        "basic_blocks": [
+            {
+                "statements": [
+                    {"kind": ("storageDead", 1), "span": "proto.rs:50:5"}
+                ],
+                "terminator": {"kind": ("return_",), "span": "proto.rs:51:5"},
+                "is_cleanup": False,
+            }
+        ],
+    }
+
+
+def run_false_proof_probe(
+    probe: str, *, registry: object = None
+) -> dict[str, Any]:
+    reg = validate_property_registry(registry, require_all_verified=False)
+    body, baseline_discharged, mutant_discharged, expected_missing = (
+        build_probe_scenario(probe)
+    )
+    census = census_mir_fault_sites(body)
+    baseline_verdict = reconcile_obligation_coverage(
+        census, baseline_discharged, reg
+    )
+    mutant_verdict = reconcile_obligation_coverage(
+        census, mutant_discharged, reg
+    )
+    passed = (
+        baseline_verdict["is_verified"]
+        and not mutant_verdict["is_verified"]
+        and mutant_verdict["missing_sites"] == expected_missing
+        and mutant_verdict["unemitted_classes"] == []
+    )
+    return {
+        "probe": probe,
+        "census": census,
+        "baseline_verdict": baseline_verdict,
+        "mutant_verdict": mutant_verdict,
+        "expected_missing_sites": expected_missing,
+        "passed": passed,
+    }
+
+
+def run_property_registry_unemitted_probe() -> dict[str, Any]:
+    body, _baseline, _mutant, _expected_missing = build_probe_scenario(
+        "DerefAliasProbe"
+    )
+    census = census_mir_fault_sites(body)
+    baseline_verdict = reconcile_obligation_coverage(
+        census, census, PROPERTY_REGISTRY
+    )
+    unemitted_reg = {
+        cls: dict(desc) for cls, desc in PROPERTY_REGISTRY.items()
+    }
+    unemitted_reg["tree_borrows_violation"]["status"] = PROPERTY_STATUS_UNEMITTED_GAP
+    mutant_verdict = reconcile_obligation_coverage(census, census, unemitted_reg)
+    expected_missing = [
+        FaultSite(0, 0, "tree_borrows_violation"),
+        FaultSite(0, 1, "tree_borrows_violation"),
+    ]
+    passed = (
+        baseline_verdict["is_verified"]
+        and not mutant_verdict["is_verified"]
+        and mutant_verdict["missing_sites"] == expected_missing
+        and mutant_verdict["unemitted_classes"] == ["tree_borrows_violation"]
+    )
+    return {
+        "probe": "PropertyRegistryUnemittedProbe",
+        "baseline_verdict": baseline_verdict,
+        "mutant_verdict": mutant_verdict,
+        "expected_missing_sites": expected_missing,
+        "passed": passed,
+    }
+
+
+def run_callee_coordinate_mask_probe() -> dict[str, Any]:
+    caller_body, caller_discharged, _mutant, _expected = build_probe_scenario(
+        "DerefAliasProbe"
+    )
+    callee_body = build_callee_storage_witness_body()
+    callee_census = census_mir_fault_sites(callee_body)
+    closure = {
+        "inline_callees": [callee_body["def_path"]],
+        "external_callees": [],
+        "allow_unresolved_indirect_calls": False,
+    }
+    flattened_census = [*census_mir_fault_sites(caller_body), *callee_census]
+    flattened_verdict = reconcile_obligation_coverage(
+        flattened_census, caller_discharged, PROPERTY_REGISTRY
+    )
+    baseline_batch = reconcile_multi_item_coverage(
+        [
+            {
+                "def_path": caller_body["def_path"],
+                "body": caller_body,
+                "discharged": caller_discharged,
+            },
+            {
+                "def_path": callee_body["def_path"],
+                "body": callee_body,
+                "discharged": callee_census,
+            },
+        ],
+        closure,
+        PROPERTY_REGISTRY,
+    )
+    masked_batch = reconcile_multi_item_coverage(
+        [
+            {
+                "def_path": caller_body["def_path"],
+                "body": caller_body,
+                "discharged": caller_discharged,
+            },
+            {
+                "def_path": callee_body["def_path"],
+                "body": callee_body,
+                "discharged": [],
+            },
+        ],
+        closure,
+        PROPERTY_REGISTRY,
+    )
+    passed = (
+        flattened_verdict["is_verified"]
+        and baseline_batch["is_verified"]
+        and not masked_batch["is_verified"]
+        and len(masked_batch["failed_items"]) == 1
+        and masked_batch["failed_items"][0][0] == "proto::witness_callee_storage"
+        and masked_batch["failed_items"][0][1]["missing_sites"] == callee_census
+    )
+    return {
+        "probe": "CalleeCoordinateMaskProbe",
+        "flattened_verdict": flattened_verdict,
+        "baseline_verdict": baseline_batch,
+        "mutant_verdict": masked_batch,
+        "expected_missing_sites": callee_census,
+        "passed": passed,
+    }
+
+
+def run_false_proof_mutation_probes(
+    *, registry: object = None
+) -> dict[str, Any]:
+    reg = validate_property_registry(registry, require_all_verified=True)
+    passed_probes: list[str] = []
+    for probe_name in FAULT_MUTATION_PROBES:
+        rep = run_false_proof_probe(probe_name, registry=reg)
+        if not rep["passed"]:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"false-proof mutation probe `{probe_name}` failed: baseline={rep['baseline_verdict']['verdict']}, mutant={rep['mutant_verdict']['verdict']}",
+            )
+        passed_probes.append(probe_name)
+
+    reg_probe = run_property_registry_unemitted_probe()
+    if not reg_probe["passed"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            "false-proof mutation probe `PropertyRegistryUnemittedProbe` failed",
+        )
+    passed_probes.append("PropertyRegistryUnemittedProbe")
+
+    mask_probe = run_callee_coordinate_mask_probe()
+    if not mask_probe["passed"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            "false-proof mutation probe `CalleeCoordinateMaskProbe` failed",
+        )
+    passed_probes.append("CalleeCoordinateMaskProbe")
+
+    return {
+        "faultClasses": len(MIR_FAULT_CLASSES),
+        "propertyRegistryVerified": len(reg),
+        "probesPassed": passed_probes,
+    }
+
+
+def _trusted_string_eq_literals(src: str, def_name: str) -> set[str]:
+    header = f"def {def_name} "
+    pos = src.find(header)
+    if pos < 0:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing trusted definition `{header.strip()}` in Terminators.lean",
+        )
+    rest = src[pos + len(header) :]
+    end_candidates = [
+        idx
+        for marker in ("\n/--", "\ndef ", "\n@[", "\ntheorem ")
+        if (idx := rest.find(marker)) >= 0
+    ]
+    end = min(end_candidates) if end_candidates else len(rest)
+    body = rest[:end]
+    # Strip `--` line comments and `/- ... -/` block comments before scanning `stringEq "..."`
+    try:
+        tokens = tokenize_lean_source(body)
+    except CensusScanError as err:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"malformed syntax in Terminators.lean `{def_name}`: {err}",
+        ) from err
+    out: set[str] = set()
+    for i in range(len(tokens) - 1):
+        if tokens[i] == ("Ident", "stringEq"):
+            for j in range(i + 1, min(i + 4, len(tokens))):
+                if tokens[j][0] == "StrLit":
+                    out.add(str(tokens[j][1]))
+                    break
+    return out
+
+
+def _parse_lean_expected_fault_site_list(
+    tokens: list[tuple[str, Any]], def_name: str
+) -> list[FaultSite]:
+    n = len(tokens)
+    idx = 0
+    while idx + 5 < n:
+        if (
+            tokens[idx] == ("Ident", "def")
+            and tokens[idx + 1] == ("Ident", def_name)
+            and tokens[idx + 2][0] == "Colon"
+            and tokens[idx + 5][0] == "ColonEq"
+        ):
+            cur = _MirTokenCursor(tokens, idx + 6)
+
+            def _parse_site(c: _MirTokenCursor) -> FaultSite:
+                c.expect("LParen")
+                b = c.parse_usize()
+                c.expect("Comma")
+                s = c.parse_usize()
+                c.expect("Comma")
+                full, short = c.parse_ctor_head()
+                cls = LEAN_CTOR_TO_FAULT_CLASS.get(short)
+                if cls is None:
+                    raise CensusScanError(
+                        "malformed_syntax", f"unknown MirFaultClass `{full}`"
+                    )
+                c.expect("RParen")
+                return FaultSite(b, s, cls)
+
+            return cur.parse_list(_parse_site)
+        idx += 1
+    raise Failure(
+        1,
+        FAULT_COVERAGE_PHASE,
+        f"missing `def {def_name} : List FaultSite` in FaultSiteCensus.lean",
+    )
+
+
+def _check_fault_site_census_lean_pins(src: str) -> None:
+    all_marker = "def all : List MirFaultClass :="
+    all_pos = src.find(all_marker)
+    if all_pos < 0:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            "missing `def all : List MirFaultClass :=` in FaultSiteCensus.lean",
+        )
+    end_ns_pos = src.find("end MirFaultClass", all_pos)
+    if end_ns_pos < 0:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            "missing `end MirFaultClass` in FaultSiteCensus.lean",
+        )
+    header_window = src[all_pos : end_ns_pos + len("end MirFaultClass")]
+    try:
+        hdr_tokens = tokenize_lean_source(header_window)
+    except CensusScanError as err:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"failed to tokenize MirFaultClass definitions in FaultSiteCensus.lean: {err}",
+        ) from err
+
+    # 1. Parse `def all : List MirFaultClass := [ ... ]`
+    cur = _MirTokenCursor(hdr_tokens, 6)
+    try:
+        ctors = cur.parse_list(lambda c: c.parse_ctor_head()[1])
+    except CensusScanError as err:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"malformed `MirFaultClass.all` in FaultSiteCensus.lean: {err}",
+        ) from err
+    expected_ctors = [FAULT_CLASS_TO_LEAN_CTOR[cls] for cls in MIR_FAULT_CLASSES]
+    if ctors != expected_ctors:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`MirFaultClass.all` in FaultSiteCensus.lean ({ctors}) drifted from MIR_FAULT_CLASSES ({expected_ctors})",
+        )
+
+    # 2. Verify `def toRank` arms and `def asStr` arms in `header_window`
+    to_rank_matches = re.findall(
+        r"\|\s*\.([A-Za-z0-9_]+)\s*=>\s*(\d+)", header_window
+    )
+    if len(to_rank_matches) != len(MIR_FAULT_CLASSES):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`MirFaultClass.toRank` arm count ({len(to_rank_matches)}) != {len(MIR_FAULT_CLASSES)} in FaultSiteCensus.lean",
+        )
+    for ctor, rank_str in to_rank_matches:
+        rank = int(rank_str)
+        expected_cls = LEAN_CTOR_TO_FAULT_CLASS.get(ctor)
+        if expected_cls is None or FAULT_CLASS_RANK.get(expected_cls) != rank:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`MirFaultClass.toRank` drift for `.{ctor} => {rank}` in FaultSiteCensus.lean",
+            )
+
+    as_str_matches = re.findall(
+        r'\|\s*\.([A-Za-z0-9_]+)\s*=>\s*"([^"]+)"', header_window
+    )
+    if len(as_str_matches) != len(MIR_FAULT_CLASSES):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`MirFaultClass.asStr` arm count ({len(as_str_matches)}) != {len(MIR_FAULT_CLASSES)} in FaultSiteCensus.lean",
+        )
+    for ctor, snake_str in as_str_matches:
+        if LEAN_CTOR_TO_FAULT_CLASS.get(ctor) != snake_str:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`MirFaultClass.asStr` drift for `.{ctor} => \"{snake_str}\"` in FaultSiteCensus.lean",
+            )
+
+    # 3. Parse the witness definitions in the tail of `FaultSiteCensus.lean`
+    wit_pos = src.find("def witnessPureNoopBody : CapturedMir :=")
+    if wit_pos < 0:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            "missing `witnessPureNoopBody` in FaultSiteCensus.lean",
+        )
+    witness_slice = src[wit_pos:]
+    try:
+        wit_tokens = tokenize_lean_source(witness_slice)
+        noop_body = parse_lean_captured_mir_def_metadata(
+            witness_slice, "witnessPureNoopBody", tokens=wit_tokens
+        )["body"]
+        if census_mir_fault_sites(noop_body) != []:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                "witnessPureNoopBody census is non-empty",
+            )
+        for body_def, expected_def, probe_name in (
+            (
+                "witnessCallArgBlindBody",
+                "witnessCallArgBlindExpectedCensus",
+                "CallArgBlindProbe",
+            ),
+            (
+                "witnessSwitchBreakStripBody",
+                "witnessSwitchBreakStripExpectedCensus",
+                "SwitchBreakStripProbe",
+            ),
+            (
+                "witnessLoopUpdateOverflowBody",
+                "witnessLoopUpdateOverflowExpectedCensus",
+                "LoopUpdateOverflowProbe",
+            ),
+            (
+                "witnessDerefAliasBody",
+                "witnessDerefAliasExpectedCensus",
+                "DerefAliasProbe",
+            ),
+        ):
+            parsed_w = parse_lean_captured_mir_def_metadata(
+                witness_slice, body_def, tokens=wit_tokens
+            )["body"]
+            lean_expected = _parse_lean_expected_fault_site_list(
+                wit_tokens, expected_def
+            )
+            py_census = census_mir_fault_sites(parsed_w)
+            probe_body, _, _, _ = build_probe_scenario(probe_name)
+            if parsed_w != probe_body or py_census != lean_expected:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"Lean witness `{body_def}` / `{expected_def}` drifted from Python `{probe_name}`",
+                )
+        for body_def, expected_def in (
+            ("witnessWrappingArithBody", "witnessWrappingArithExpectedCensus"),
+            ("witnessCalleeStorageBody", "witnessCalleeStorageExpectedCensus"),
+        ):
+            parsed_w = parse_lean_captured_mir_def_metadata(
+                witness_slice, body_def, tokens=wit_tokens
+            )["body"]
+            lean_expected = _parse_lean_expected_fault_site_list(
+                wit_tokens, expected_def
+            )
+            if census_mir_fault_sites(parsed_w) != lean_expected:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"Lean witness `{body_def}` census drifted from `{expected_def}`",
+                )
+    except CensusScanError as err:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"failed to parse witness definitions in FaultSiteCensus.lean: {err}",
+        ) from err
+
+
+def check_fault_census_source_pins(
+    checkout: Path, staged_source: Path | None = None
+) -> dict[str, bool]:
+    validate_property_registry(PROPERTY_REGISTRY, require_all_verified=True)
+    terminators_rel = Path(
+        "Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean"
+    )
+    term_candidates: list[Path] = []
+    if staged_source is not None:
+        term_candidates.append(staged_source / terminators_rel)
+    term_candidates.append(checkout / "trusted/lean" / terminators_rel)
+
+    checked_terminators = False
+    for term_path in term_candidates:
+        if term_path.exists() or term_path.is_symlink():
+            regular(term_path, FAULT_COVERAGE_PHASE)
+            try:
+                term_src = term_path.read_text(encoding="utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError) as err:
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"cannot read {term_path}: {err}"
+                ) from err
+            intrinsics = _trusted_string_eq_literals(
+                term_src, "classifyRustIntrinsic?"
+            )
+            exact_div = _trusted_string_eq_literals(
+                term_src, "isDirectExactDivTarget"
+            )
+            converging = (
+                intrinsics - {"core::intrinsics::const_eval_select"}
+            ) | exact_div
+            if len(intrinsics) != 25 or converging != _NATIVE_CONVERGING_SET:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"Terminators.lean native converging call callees drifted from NATIVE_CONVERGING_CALL_CALLEES (diff={ sorted(converging ^ _NATIVE_CONVERGING_SET) })",
+                )
+            diverging: set[str] = set()
+            for def_name in (
+                "isUnreachableCallTarget",
+                "isAbortingPanicDefPath",
+                "isUnwindingPanicDefPath",
+            ):
+                diverging |= _trusted_string_eq_literals(term_src, def_name)
+            if diverging != _NATIVE_DIVERGING_SET:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"Terminators.lean native diverging call callees drifted from NATIVE_DIVERGING_CALL_CALLEES (diff={ sorted(diverging ^ _NATIVE_DIVERGING_SET) })",
+                )
+            checked_terminators = True
+            break
+
+    census_lean_path = checkout / "theory/Anneal/FaultSiteCensus.lean"
+    checked_census_lean = False
+    if census_lean_path.exists() or census_lean_path.is_symlink():
+        regular(census_lean_path, FAULT_COVERAGE_PHASE)
+        try:
+            census_src = census_lean_path.read_text(
+                encoding="utf-8", errors="strict"
+            )
+        except (OSError, UnicodeDecodeError) as err:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"cannot read {census_lean_path}: {err}",
+            ) from err
+        _check_fault_site_census_lean_pins(census_src)
+        checked_census_lean = True
+
+    return {
+        "terminators": checked_terminators,
+        "faultSiteCensus": checked_census_lean,
+    }
+
+
+def audit_checkout_fault_coverage_gate(
+    checkout: Path, staged_source: Path | None = None
+) -> dict[str, Any]:
+    pins = check_fault_census_source_pins(checkout, staged_source)
+    probes = run_false_proof_mutation_probes()
+    return {
+        **probes,
+        "sourcePinsChecked": pins,
+    }
+
+
+def _parse_obligations_default_callee_suffixes(ob_text: str, ob_label: str) -> list[str]:
+    try:
+        tokens = tokenize_lean_source(ob_text)
+    except CensusScanError as err:
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"malformed Obligations module {ob_label}: {err}"
+        ) from err
+    def_positions: list[int] = []
+    depth = 0
+    for idx, (tk, val) in enumerate(tokens):
+        cur_depth = depth
+        if tk in ("LParen", "LBrace", "LBracket"):
+            depth += 1
+        elif tk in ("RParen", "RBrace", "RBracket"):
+            depth = max(0, depth - 1)
+        if cur_depth != 0:
+            continue
+        if tk == "Ident" and val == "def" and idx + 1 < len(tokens) and tokens[idx + 1] == ("Ident", "defaultCallees"):
+            def_positions.append(idx)
+    if not def_positions:
+        return []
+    if len(def_positions) > 1:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"multiple `def defaultCallees` tables in {ob_label}",
+        )
+    pos = def_positions[0]
+    if pos + 6 >= len(tokens) or tokens[pos + 5][0] != "ColonEq":
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"malformed `def defaultCallees` header in {ob_label}",
+        )
+    val_idx = pos + 6
+    if tokens[val_idx] in (("Ident", ".nil"), ("Ident", "List.nil")):
+        return []
+    if (
+        val_idx + 1 < len(tokens)
+        and tokens[val_idx][0] == "Dot"
+        and tokens[val_idx + 1] == ("Ident", "nil")
+    ):
+        return []
+    if tokens[val_idx][0] != "LBracket":
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"unrecognized `defaultCallees` table in {ob_label}",
+        )
+    if val_idx + 1 < len(tokens) and tokens[val_idx + 1][0] == "RBracket":
+        return []
+    out: list[str] = []
+    cur = val_idx + 1
+    while cur < len(tokens):
+        tok = tokens[cur]
+        if tok[0] != "Ident":
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"unrecognized `defaultCallees` entry {tok!r} in {ob_label}",
+            )
+        entry = str(tok[1])
+        if not (entry.startswith("Mir.") and entry.endswith(".body")):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"unrecognized `defaultCallees` entry `{entry}` in {ob_label}",
+            )
+        suffix = entry[len("Mir.") : -len(".body")]
+        if not suffix:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"empty `defaultCallees` entry `{entry}` in {ob_label}",
+            )
+        out.append(suffix)
+        cur += 1
+        if cur < len(tokens) and tokens[cur][0] == "Comma":
+            cur += 1
+        elif cur < len(tokens) and tokens[cur][0] == "RBracket":
+            break
+        else:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"unterminated `defaultCallees` list in {ob_label}",
+            )
+    return out
+
+
+def _parse_fault_census_receipt_json(receipt_path: Path) -> dict[str, Any]:
+    regular(receipt_path, FAULT_COVERAGE_PHASE)
+    try:
+        raw = json.loads(receipt_path.read_text(encoding="utf-8", errors="strict"))
+    except (ValueError, OSError, UnicodeDecodeError) as err:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"malformed FaultCensus receipt {receipt_path}: {err}",
+        ) from err
+    expected_keys = {
+        "def_path",
+        "mir_module_sha256",
+        "census_sites",
+        "discharged_sites",
+        "callee_closure",
+        "reconciliation_verdict",
+        "is_verified",
+        "reasons",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"unexpected schema keys in FaultCensus receipt {receipt_path}",
+        )
+    if not isinstance(raw["def_path"], str) or not raw["def_path"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"invalid def_path in FaultCensus receipt {receipt_path}",
+        )
+    if not isinstance(raw["mir_module_sha256"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", raw["mir_module_sha256"]
+    ):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"invalid mir_module_sha256 in FaultCensus receipt {receipt_path}",
+        )
+    if not isinstance(raw["census_sites"], list) or not isinstance(
+        raw["discharged_sites"], list
+    ):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"census_sites and discharged_sites must be lists in {receipt_path}",
+        )
+    try:
+        census_sites = [FaultSite.from_dict(s) for s in raw["census_sites"]]
+        discharged_sites = [FaultSite.from_dict(s) for s in raw["discharged_sites"]]
+    except ValueError as err:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"invalid FaultSite entry in {receipt_path}: {err}",
+        ) from err
+
+    cc = raw["callee_closure"]
+    if not isinstance(cc, dict) or set(cc) != {
+        "inline_callees",
+        "external_callees",
+        "allow_unresolved_indirect_calls",
+    }:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"invalid callee_closure in {receipt_path}",
+        )
+    if (
+        not isinstance(cc["inline_callees"], list)
+        or not all(isinstance(x, str) and x for x in cc["inline_callees"])
+        or not isinstance(cc["external_callees"], list)
+        or not all(isinstance(x, str) and x for x in cc["external_callees"])
+        or type(cc["allow_unresolved_indirect_calls"]) is not bool
+    ):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"invalid callee_closure field types in {receipt_path}",
+        )
+    if (
+        not isinstance(raw["reconciliation_verdict"], str)
+        or type(raw["is_verified"]) is not bool
+        or not isinstance(raw["reasons"], list)
+        or not all(isinstance(r, str) for r in raw["reasons"])
+    ):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"invalid verdict fields in {receipt_path}",
+        )
+    return {
+        "def_path": raw["def_path"],
+        "mir_module_sha256": raw["mir_module_sha256"],
+        "census_sites": census_sites,
+        "discharged_sites": discharged_sites,
+        "callee_closure": cc,
+        "reconciliation_verdict": raw["reconciliation_verdict"],
+        "is_verified": raw["is_verified"],
+        "reasons": raw["reasons"],
+    }
+
+
+def _check_trait_impl_closure(
+    subject_meta: dict[str, Any],
+    callee_metas: list[dict[str, Any]],
+    closure: dict[str, Any],
+) -> list[str]:
+    if closure.get("allow_unresolved_indirect_calls", False):
+        return []
+    all_metas = [subject_meta, *callee_metas]
+    referenced: set[str] = set()
+    for meta in all_metas:
+        referenced.update(direct_callee_def_paths(meta["body"]))
+        referenced.update(reified_fn_def_paths(meta["body"]))
+    while True:
+        changed = False
+        for meta in all_metas:
+            for entry in meta.get("trait_impls", ()):
+                tm = entry["trait_method_def_path"]
+                imp = entry["impl_path"]
+                if tm in referenced and imp and imp not in referenced:
+                    referenced.add(imp)
+                    changed = True
+        if not changed:
+            break
+    inline_set = set(closure.get("inline_callees", ()))
+    external_set = set(closure.get("external_callees", ()))
+    reasons: list[str] = []
+    for meta in all_metas:
+        for entry in meta.get("trait_impls", ()):
+            tm = entry["trait_method_def_path"]
+            imp = entry["impl_path"]
+            if (
+                tm in referenced
+                and imp != tm
+                and imp not in inline_set
+                and imp not in external_set
+            ):
+                msg = (
+                    f"[{meta['body']['def_path']}] TraitImplEntry for `{tm}` redirects `lookupCallee` to `{imp}` "
+                    "which is neither an inline callee nor an external callee in CalleeClosure"
+                )
+                if msg not in reasons:
+                    reasons.append(msg)
+    return reasons
+
+
+def _audit_single_item_receipt(
+    rel_stem: str,
+    mir_path: Path,
+    mir_meta: dict[str, Any],
+    receipt_path: Path,
+    mir_by_stem: dict[str, dict[str, Any]],
+    mir_by_def_path: dict[str, dict[str, Any]],
+    receipts_by_def_path: dict[str, dict[str, Any]],
+    obligations_root: Path | None,
+    reg: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    receipt = _parse_fault_census_receipt_json(receipt_path)
+    actual_sha = digest(mir_path)
+    if receipt["mir_module_sha256"] != actual_sha:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt SHA-256 mismatch for {rel_stem}: receipt={receipt['mir_module_sha256']}, Mir={actual_sha}",
+        )
+    subject_body = mir_meta["body"]
+    if receipt["def_path"] != subject_body["def_path"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt def_path `{receipt['def_path']}` does not match Mir `{subject_body['def_path']}` in {receipt_path}",
+        )
+    actual_census = census_mir_fault_sites(subject_body)
+    if receipt["census_sites"] != actual_census:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt census_sites in {receipt_path} is stale or tampered relative to independent census_lean_mir_module ({len(receipt['census_sites'])} vs {len(actual_census)} sites)",
+        )
+    if (
+        not receipt["is_verified"]
+        or receipt["reconciliation_verdict"] != "VERIFIED"
+        or receipt["reasons"]
+    ):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt {receipt_path} is not VERIFIED (verdict={receipt['reconciliation_verdict']!r}, is_verified={receipt['is_verified']}, reasons={receipt['reasons']})",
+        )
+
+    single_verdict = reconcile_obligation_coverage(
+        actual_census, receipt["discharged_sites"], reg
+    )
+    if not single_verdict["is_verified"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"obligation coverage reconciliation failed for {receipt['def_path']} ({receipt_path}): {'; '.join(single_verdict['reasons'])}",
+        )
+
+    closure = receipt["callee_closure"]
+    if obligations_root is not None:
+        ob_path = obligations_root / f"{rel_stem}.lean"
+        if ob_path.exists() or ob_path.is_symlink():
+            regular(ob_path, FAULT_COVERAGE_PHASE)
+            try:
+                ob_text = ob_path.read_text(encoding="utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError) as err:
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"cannot read {ob_path}: {err}"
+                ) from err
+            default_callee_suffixes = _parse_obligations_default_callee_suffixes(
+                ob_text, str(ob_path)
+            )
+            inline_set = set(closure["inline_callees"])
+            for suf in default_callee_suffixes:
+                callee_stem = suf.replace(".", "/")
+                callee_meta = mir_by_stem.get(callee_stem)
+                if callee_meta is None:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"Obligations module {ob_path} lists `Mir.{suf}.body` in `defaultCallees`, but `Mir/{callee_stem}.lean` is missing",
+                    )
+                callee_dp = callee_meta["body"]["def_path"]
+                if callee_dp not in inline_set:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"Obligations module {ob_path} links inline callee `{callee_dp}` (`Mir.{suf}.body`), which is missing from FaultCensus `callee_closure.inline_callees`",
+                    )
+
+    batch_items: list[dict[str, Any]] = [
+        {
+            "def_path": subject_body["def_path"],
+            "body": subject_body,
+            "discharged": receipt["discharged_sites"],
+        }
+    ]
+    callee_metas: list[dict[str, Any]] = []
+    for inline_dp in closure["inline_callees"]:
+        if inline_dp == subject_body["def_path"]:
+            continue
+        c_meta = mir_by_def_path.get(inline_dp)
+        if c_meta is not None:
+            callee_metas.append(c_meta)
+            c_receipt = receipts_by_def_path.get(inline_dp)
+            c_discharged = (
+                c_receipt["discharged_sites"]
+                if c_receipt is not None
+                else emit_mir_obligation_fault_sites(c_meta["body"])
+            )
+            batch_items.append(
+                {
+                    "def_path": inline_dp,
+                    "body": c_meta["body"],
+                    "discharged": c_discharged,
+                }
+            )
+
+    batch_verdict = reconcile_multi_item_coverage(batch_items, closure, reg)
+    trait_reasons = _check_trait_impl_closure(mir_meta, callee_metas, closure)
+    if not batch_verdict["is_verified"] or trait_reasons:
+        all_reasons = [*batch_verdict["reasons"], *trait_reasons]
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"multi-item fault-coverage reconciliation failed for {receipt['def_path']}: {'; '.join(all_reasons)}",
+        )
+    return receipt
+
+
+def _collect_regular_files_by_suffix(
+    root_dir: Path, suffix: str
+) -> dict[str, Path]:
+    if root_dir.is_symlink() or not root_dir.is_dir():
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"expected regular directory: {root_dir}",
+        )
+    out: dict[str, Path] = {}
+    for directory, dirs, files in os.walk(root_dir, followlinks=False):
+        dirs.sort()
+        for dname in dirs:
+            dpath = Path(directory) / dname
+            if dpath.is_symlink():
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"symlinked directory not allowed: {dpath}",
+                )
+        for fname in sorted(files):
+            if not fname.endswith(suffix):
+                continue
+            fpath = Path(directory) / fname
+            regular(fpath, FAULT_COVERAGE_PHASE)
+            rel = fpath.relative_to(root_dir).as_posix()
+            stem = rel[: -len(suffix)]
+            out[stem] = fpath
+    return out
+
+
+def _should_audit_manifest_fault_coverage(
+    root: Path,
+    lean_audit_targets: list[tuple[str, Path]],
+    *,
+    require_fault_coverage: bool = False,
+) -> bool:
+    if require_fault_coverage:
+        return True
+    if (root / "FaultCensus").exists() or (
+        root / ".anneal/generated/FaultCensus"
+    ).exists():
+        return True
+    for _mir_rel, mir_path in lean_audit_targets:
+        try:
+            txt = mir_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "CapturedMir" in txt or "def body" in txt:
+            return True
+    return False
+
+
+def _audit_manifest_targets_fault_coverage(
+    manifest: dict[str, Any],
+    root: Path,
+    lean_audit_targets: list[tuple[str, Path]],
+    *,
+    registry: object = None,
+    require_receipts: bool = False,
+) -> dict[str, Any]:
+    reg = validate_property_registry(registry, require_all_verified=True)
+    mir_by_stem: dict[str, dict[str, Any]] = {}
+    mir_path_by_stem: dict[str, Path] = {}
+    mir_by_def_path: dict[str, dict[str, Any]] = {}
+    generated_root: Path | None = None
+
+    for mir_rel, mir_path in lean_audit_targets:
+        try:
+            mir_text = mir_path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as err:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"cannot read {mir_rel}: {err}"
+            ) from err
+        try:
+            meta = parse_lean_mir_module_metadata_strict(mir_text)
+        except CensusScanError as err:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Mir target {mir_rel} failed strict fault-site census scan: {err}",
+            ) from err
+        if meta["body"]["def_path"] != next(
+            (
+                t["def_id"]
+                for t in manifest["targets"]
+                if t["mir_module_path"] == mir_rel
+            ),
+            meta["body"]["def_path"],
+        ):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"CaptureManifest target def_id does not match Mir defPath `{meta['body']['def_path']}` in {mir_rel}",
+            )
+        norm_rel = mir_rel.removeprefix("./")
+        if norm_rel.startswith(".anneal/generated/Mir/") and norm_rel.endswith(".lean"):
+            stem = norm_rel[len(".anneal/generated/Mir/") : -len(".lean")]
+            generated_root = root / ".anneal/generated"
+        elif norm_rel.startswith("Mir/") and norm_rel.endswith(".lean"):
+            stem = norm_rel[len("Mir/") : -len(".lean")]
+            if generated_root is None:
+                generated_root = root
+        else:
+            stem = norm_rel[: -len(".lean")]
+            if generated_root is None:
+                generated_root = root
+        mir_by_stem[stem] = meta
+        mir_path_by_stem[stem] = mir_path
+        mir_by_def_path[meta["body"]["def_path"]] = meta
+
+    fc_root: Path | None = None
+    if generated_root is not None and (generated_root / "FaultCensus").exists():
+        fc_root = generated_root / "FaultCensus"
+    elif (root / ".anneal/generated/FaultCensus").exists():
+        fc_root = root / ".anneal/generated/FaultCensus"
+    elif (root / "FaultCensus").exists():
+        fc_root = root / "FaultCensus"
+
+    if fc_root is None:
+        if require_receipts:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"missing FaultCensus directory for CaptureManifest under {root}",
+            )
+        return {
+            "mirTargetsAudited": len(mir_by_stem),
+            "receiptsAudited": 0,
+        }
+
+    receipt_files = _collect_regular_files_by_suffix(fc_root, ".json")
+    receipts_by_def_path: dict[str, dict[str, Any]] = {}
+    for r_stem, r_path in receipt_files.items():
+        if r_stem not in mir_by_stem:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"orphan FaultCensus receipt `{r_stem}.json` has no matching Mir target in CaptureManifest.json",
+            )
+        parsed_r = _parse_fault_census_receipt_json(r_path)
+        receipts_by_def_path[parsed_r["def_path"]] = parsed_r
+
+    subject_stems = [
+        stem
+        for stem, meta in sorted(mir_by_stem.items())
+        if meta["role"][0] == "subject"
+    ]
+    for stem in subject_stems:
+        if stem not in receipt_files:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"subject Mir target `{stem}` is missing FaultCensus receipt `{fc_root / (stem + '.json')}`",
+            )
+
+    if require_receipts and not receipt_files:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus directory {fc_root} contains no `.json` receipts",
+        )
+
+    ob_root = (
+        generated_root / "Obligations"
+        if generated_root is not None
+        and (generated_root / "Obligations").is_dir()
+        else None
+    )
+    for stem, r_path in sorted(receipt_files.items()):
+        _audit_single_item_receipt(
+            stem,
+            mir_path_by_stem[stem],
+            mir_by_stem[stem],
+            r_path,
+            mir_by_stem,
+            mir_by_def_path,
+            receipts_by_def_path,
+            ob_root,
+            reg,
+        )
+
+    return {
+        "mirTargetsAudited": len(mir_by_stem),
+        "receiptsAudited": len(receipt_files),
+    }
+
+
+def audit_fault_coverage(
+    target_path: Path, *, registry: object = None
+) -> dict[str, Any]:
+    reg = validate_property_registry(registry, require_all_verified=True)
+    if target_path.is_symlink():
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"expected regular file or directory, not symlink: {target_path}",
+        )
+    if not target_path.exists():
+        raise Failure(
+            2,
+            FAULT_COVERAGE_PHASE,
+            f"audit target does not exist: {target_path}",
+        )
+    resolved = target_path.resolve()
+    if resolved.is_file():
+        manifest = verify_capture_manifest(
+            resolved,
+            resolved.parent,
+            registry=reg,
+            require_fault_coverage=True,
+        )
+        return {
+            "mode": "manifest",
+            "targets": len(manifest["targets"]),
+        }
+    if not resolved.is_dir():
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"unsupported audit target: {target_path}",
+        )
+
+    # Check if `resolved` is a manifest directory with `CaptureManifest.json`
+    manifest_candidates = [
+        resolved / "CaptureManifest.json",
+        resolved / ".anneal/CaptureManifest.json",
+    ]
+    for m_cand in manifest_candidates:
+        if m_cand.is_file() or m_cand.is_symlink():
+            verify_capture_manifest(
+                m_cand,
+                resolved,
+                registry=reg,
+                require_fault_coverage=True,
+            )
+
+    if (resolved / ".anneal/generated").exists() or (
+        resolved / ".anneal/generated"
+    ).is_symlink():
+        generated_dir = resolved / ".anneal/generated"
+    elif (resolved / "Mir").exists() or (resolved / "FaultCensus").exists():
+        generated_dir = resolved
+    else:
+        if any(m.is_file() for m in manifest_candidates):
+            return {
+                "mode": "manifest",
+                "mirFilesAudited": len(
+                    json.loads(
+                        next(m for m in manifest_candidates if m.is_file()).read_text()
+                    )["targets"]
+                ),
+            }
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"no `.anneal/generated/`, `Mir/`, `FaultCensus/`, or `CaptureManifest.json` found under {target_path}",
+        )
+
+    if generated_dir.is_symlink() or not generated_dir.is_dir():
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"expected regular generated directory: {generated_dir}",
+        )
+
+    mir_root = generated_dir / "Mir"
+    fc_root = generated_dir / "FaultCensus"
+    if not mir_root.exists():
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"missing Mir directory: {mir_root}"
+        )
+    if not fc_root.exists():
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing FaultCensus directory: {fc_root}",
+        )
+
+    mir_files = _collect_regular_files_by_suffix(mir_root, ".lean")
+    if not mir_files:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"no `Mir/<Item>.lean` files found under {mir_root}",
+        )
+    receipt_files = _collect_regular_files_by_suffix(fc_root, ".json")
+    if not receipt_files:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"no `FaultCensus/<Item>.json` receipts found under {fc_root}",
+        )
+
+    mir_by_stem: dict[str, dict[str, Any]] = {}
+    mir_by_def_path: dict[str, dict[str, Any]] = {}
+    for stem, mir_path in mir_files.items():
+        try:
+            mir_text = mir_path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as err:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"cannot read {mir_path}: {err}"
+            ) from err
+        try:
+            meta = parse_lean_mir_module_metadata_strict(mir_text)
+        except CensusScanError as err:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Mir module {mir_path} failed strict fault-site census scan: {err}",
+            ) from err
+        mir_by_stem[stem] = meta
+        mir_by_def_path[meta["body"]["def_path"]] = meta
+
+    receipts_by_def_path: dict[str, dict[str, Any]] = {}
+    for r_stem, r_path in receipt_files.items():
+        if r_stem not in mir_by_stem:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"orphan FaultCensus receipt `{r_path}` has no matching `Mir/{r_stem}.lean`",
+            )
+        parsed_r = _parse_fault_census_receipt_json(r_path)
+        receipts_by_def_path[parsed_r["def_path"]] = parsed_r
+
+    # Every subject Mir/<Item>.lean (and every Verify/<Item>.lean if Verify/ exists)
+    # must have a corresponding FaultCensus/<Item>.json receipt.
+    required_stems = {
+        stem for stem, meta in mir_by_stem.items() if meta["role"][0] == "subject"
+    }
+    verify_root = generated_dir / "Verify"
+    if verify_root.exists() or verify_root.is_symlink():
+        verify_files = _collect_regular_files_by_suffix(verify_root, ".lean")
+        required_stems |= set(verify_files)
+
+    for stem in sorted(required_stems):
+        if stem not in receipt_files:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"missing FaultCensus receipt `{fc_root / (stem + '.json')}` for subject item `{stem}`",
+            )
+
+    ob_root = (
+        generated_dir / "Obligations"
+        if (generated_dir / "Obligations").exists()
+        or (generated_dir / "Obligations").is_symlink()
+        else None
+    )
+    if ob_root is not None:
+        _collect_regular_files_by_suffix(ob_root, ".lean")
+
+    total_sites = 0
+    for stem, r_path in sorted(receipt_files.items()):
+        rec = _audit_single_item_receipt(
+            stem,
+            mir_files[stem],
+            mir_by_stem[stem],
+            r_path,
+            mir_by_stem,
+            mir_by_def_path,
+            receipts_by_def_path,
+            ob_root,
+            reg,
+        )
+        total_sites += len(rec["census_sites"])
+
+    return {
+        "mode": "workspace",
+        "mirFilesAudited": len(mir_files),
+        "receiptsAudited": len(receipt_files),
+        "totalCensusSites": total_sites,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lean", type=Path, help="absolute path to an already installed pinned Lean executable")
@@ -5186,6 +10147,8 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=Path, help="directory outside the checkout for --fast incremental cache")
     parser.add_argument("--audit-vacuity", action="store_true",
                         help="only run the pure-Python waiver-pin and annotated-claim vacuity audit (no Lean)")
+    parser.add_argument("--audit-fault-coverage", type=Path, metavar="PATH",
+                        help="audit MIR fault-site census and obligation coverage for a workspace or CaptureManifest.json (no Lean)")
     parser.add_argument("--base-snapshot", type=Path,
                         help="immutable read-only directory mirroring the expected TCB files "
                              "(default: $ANNEAL_TRUSTED_BASE_SNAPSHOT); any other TCB drift fails")
@@ -5214,6 +10177,20 @@ def main() -> int:
             print(f"Trusted check failed (waiver-pin): {error}", file=sys.stderr)
             return 2
         print(f"PASS: waiver pins and annotated-claim vacuity; {json.dumps(summary, sort_keys=True)}")
+        return 0
+    if args.audit_fault_coverage is not None:
+        try:
+            if base_snapshot is not None:
+                verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
+            gate_summary = audit_checkout_fault_coverage_gate(checkout)
+            target_summary = audit_fault_coverage(args.audit_fault_coverage)
+        except Failure as error:
+            print(f"Trusted check failed ({error.phase}): {error}", file=sys.stderr)
+            return error.code
+        except OSError as error:
+            print(f"Trusted check failed ({FAULT_COVERAGE_PHASE}): {error}", file=sys.stderr)
+            return 2
+        print(f"PASS: fault-site coverage audit; {json.dumps({**gate_summary, **target_summary}, sort_keys=True)}")
         return 0
     try:
         checker = Checker(checkout, args.lean, fast=args.fast, cache_dir=args.cache_dir,
