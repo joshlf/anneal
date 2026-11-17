@@ -976,6 +976,24 @@ pub(crate) fn assemble_batch_items_and_check_trait_closure(
             referenced_callees.extend(direct_callee_def_paths(body));
             referenced_callees.extend(reified_fn_def_paths(body));
         }
+        // `[adv ep1-A3]`: close `referenced_callees` transitively across chained
+        // `TraitImplEntry` overrides (`TraitA::m -> TraitB::m -> Concrete::m`).
+        loop {
+            let mut changed = false;
+            for meta in std::iter::once(subject_meta).chain(callee_metas.iter()) {
+                for entry in &meta.trait_impls {
+                    if referenced_callees.contains(&entry.trait_method_def_path)
+                        && !entry.impl_path.is_empty()
+                        && referenced_callees.insert(entry.impl_path.clone())
+                    {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         for meta in std::iter::once(subject_meta).chain(callee_metas.iter()) {
             for entry in &meta.trait_impls {
                 if referenced_callees.contains(&entry.trait_method_def_path)
@@ -1027,6 +1045,33 @@ pub fn compute_bundle_fault_census_receipt(
     registry: &PropertyRegistry,
     dropped_sites: &BTreeSet<FaultSite>,
 ) -> Result<(FaultCensusReceipt, MultiItemCoverageVerdict), CensusScanError> {
+    compute_bundle_fault_census_receipt_with_context(
+        bundle,
+        mir_lean_src,
+        callee_mir_sources,
+        None,
+        None,
+        bundle.has_rust_trusted_attr(),
+        registry,
+        dropped_sites,
+    )
+}
+
+/// `[adv ep1-A3]` Context-aware variant of [`compute_bundle_fault_census_receipt`]
+/// incorporating authored `Specs/<Item>.lean` `ModularItemSpec` external overrides,
+/// `StatefulEquivItemSpec` `specBody` reconciliation, and `UbExceptionItemSpec`
+/// assumption status.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_bundle_fault_census_receipt_with_context(
+    bundle: &SubjectObligationBundle,
+    mir_lean_src: &str,
+    callee_mir_sources: &[(String, String)],
+    specs_modular_externals: Option<&[String]>,
+    equiv_spec_mir_src: Option<&str>,
+    subject_is_assumed: bool,
+    registry: &PropertyRegistry,
+    dropped_sites: &BTreeSet<FaultSite>,
+) -> Result<(FaultCensusReceipt, MultiItemCoverageVerdict), CensusScanError> {
     // `[adv ep1-B1]` / `[adv ep1-B3]`: enforce the strict `Mir/<Item>.lean` module
     // grammar and extract `ContractRole` + `traitImpls` metadata.
     let subject_meta = parse_lean_mir_module_metadata_strict(mir_lean_src)?;
@@ -1048,28 +1093,71 @@ pub fn compute_bundle_fault_census_receipt(
     let subject_discharged =
         filter_dropped(emit_obligation_fault_sites_for_body(&subject_meta.body));
 
-    let mut explicit_external: Vec<String> = bundle
-        .external_spec_callees
-        .iter()
-        .map(|e| e.target_def_id.clone())
-        .chain(bundle.called_callees.iter().map(|c| c.def_id.clone()))
-        .collect();
+    let mut explicit_external: Vec<String> = match specs_modular_externals {
+        Some(exts) => exts.to_vec(),
+        None => bundle
+            .external_spec_callees
+            .iter()
+            .map(|e| e.target_def_id.clone())
+            .chain(bundle.called_callees.iter().map(|c| c.def_id.clone()))
+            .collect(),
+    };
     explicit_external.sort();
     explicit_external.dedup();
     let closure = build_batch_callee_closure(
         &subject_meta.body,
         &callee_bodies,
         &explicit_external,
-        bundle.has_rust_trusted_attr(),
+        subject_is_assumed,
     );
 
-    let (items, extra_reasons) = assemble_batch_items_and_check_trait_closure(
+    let (items, mut extra_reasons) = assemble_batch_items_and_check_trait_closure(
         &subject_meta,
         &callee_metas,
         &closure,
         dropped_sites,
     );
     let mut verdict = reconcile_multi_item_coverage(&items, &closure, registry);
+
+    if let Some(spec_src) = equiv_spec_mir_src {
+        let spec_meta = parse_lean_mir_module_metadata_strict(spec_src)?;
+        let spec_closure = build_batch_callee_closure(
+            &spec_meta.body,
+            &callee_bodies,
+            &explicit_external,
+            subject_is_assumed,
+        );
+        let (spec_items, spec_extra) = assemble_batch_items_and_check_trait_closure(
+            &spec_meta,
+            &callee_metas,
+            &spec_closure,
+            dropped_sites,
+        );
+        extra_reasons.extend(spec_extra);
+        let spec_verdict = reconcile_multi_item_coverage(&spec_items, &spec_closure, registry);
+        if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+            failed_items: spec_failed,
+            unsupported_reasons: spec_reasons,
+        } = spec_verdict
+        {
+            match &mut verdict {
+                MultiItemCoverageVerdict::Verified => {
+                    verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                        failed_items: spec_failed,
+                        unsupported_reasons: spec_reasons,
+                    };
+                }
+                MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                    failed_items,
+                    unsupported_reasons,
+                } => {
+                    failed_items.extend(spec_failed);
+                    unsupported_reasons.extend(spec_reasons);
+                }
+            }
+        }
+    }
+
     if !extra_reasons.is_empty() {
         match &mut verdict {
             MultiItemCoverageVerdict::Verified => {

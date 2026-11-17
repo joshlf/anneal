@@ -2629,6 +2629,69 @@ theorem evalTerminator_tailCall_args_ub_justified
     simp [censusTerminatorFaultClasses, hCls]
 
 /--
+`[adv ep1-A3]` Terminator-site attribution of indirect `Call` `func`-operand faults:
+when `extractCalleeDefPath? func = none`, `resolveCallTarget` evaluates `func` via
+`evalOperand` first, so whenever `evalOperand` faults the terminator steps to
+`MirStepNode.fail .ub` and is justified by a class of `censusOperandFaultClasses func`
+inside `censusTerminatorFaultClasses numBlocks (.call func argOps destination target unwind)`.
+-/
+theorem evalTerminator_call_func_ub_justified
+    (numBlocks : Nat) (s : MachineState) (func : Operand) (argOps : List Operand)
+    (destination : Place) (target : Option BasicBlockIdx) (unwind : UnwindAction)
+    (span : String) (currentBody : Option CapturedMir)
+    (hIndirect : extractCalleeDefPath? func = none)
+    (hUb : evalOperand s.frame.locals func s.memory.borrows s.memory.globals
+      (bodyLayoutsOf currentBody) s.memory.callerLocals (callStack := s.memory.callStack) = .ub) :
+    evalTerminator s ⟨.call func argOps destination target unwind, span⟩ currentBody =
+      MirStepNode.fail .ub ∧
+    ∃ cls : MirFaultClass, cls ∈ censusOperandFaultClasses func ∧
+      cls ∈ censusTerminatorFaultClasses numBlocks
+        (.call func argOps destination target unwind) := by
+  refine ⟨?_, ?_⟩
+  · cases currentBody <;> cases target <;> {
+      dsimp only [evalTerminator, resolveCallTarget, bodyLocalDeclsOf, bodyLayoutsOf] at hUb ⊢
+      rw [hIndirect]
+      dsimp only []
+      rw [hUb]
+    }
+  · rcases evalOperand_ub_implies_mem_censusOperand s.frame.locals func s.memory.borrows
+      s.memory.globals (bodyLayoutsOf currentBody) s.memory.callerLocals [] s.memory.callStack
+      hUb with ⟨cls, hCls⟩
+    refine ⟨cls, hCls, ?_⟩
+    simp [censusTerminatorFaultClasses, hCls]
+
+/--
+`[adv ep1-A3]` Terminator-site attribution of indirect `TailCall` `func`-operand faults:
+when `extractCalleeDefPath? func = none`, `resolveCallTarget` inside
+`evalTailCallTerminator` evaluates `func` via `evalOperand` first, so whenever
+`evalOperand` faults the terminator steps to `MirStepNode.fail .ub` and is justified by
+a class of `censusOperandFaultClasses func` inside
+`censusTerminatorFaultClasses numBlocks (.tailCall func argOps)`.
+-/
+theorem evalTerminator_tailCall_func_ub_justified
+    (numBlocks : Nat) (s : MachineState) (func : Operand) (argOps : List Operand)
+    (span : String) (currentBody : Option CapturedMir)
+    (hIndirect : extractCalleeDefPath? func = none)
+    (hUb : evalOperand s.frame.locals func s.memory.borrows s.memory.globals
+      (bodyLayoutsOf currentBody) s.memory.callerLocals (callStack := s.memory.callStack) = .ub) :
+    evalTerminator s ⟨.tailCall func argOps, span⟩ currentBody = MirStepNode.fail .ub ∧
+    ∃ cls : MirFaultClass, cls ∈ censusOperandFaultClasses func ∧
+      cls ∈ censusTerminatorFaultClasses numBlocks (.tailCall func argOps) := by
+  refine ⟨?_, ?_⟩
+  · cases currentBody <;> {
+      dsimp only [evalTerminator, evalTailCallTerminator, resolveCallTarget,
+        bodyLocalDeclsOf, bodyLayoutsOf] at hUb ⊢
+      rw [hIndirect]
+      dsimp only []
+      rw [hUb]
+    }
+  · rcases evalOperand_ub_implies_mem_censusOperand s.frame.locals func s.memory.borrows
+      s.memory.globals (bodyLayoutsOf currentBody) s.memory.callerLocals [] s.memory.callStack
+      hUb with ⟨cls, hCls⟩
+    refine ⟨cls, hCls, ?_⟩
+    simp [censusTerminatorFaultClasses, hCls]
+
+/--
 `[adv A2]` Exact `.ub` characterization for writing to an unprojected local place
 `writePlaceValue locals borrows { local_ := loc, projection := [] } val`: returns
 `.ub` iff `loc` is out of bounds or `.dead` (succeeding on both `.uninit` and

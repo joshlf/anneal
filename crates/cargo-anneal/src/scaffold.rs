@@ -33,7 +33,7 @@ use crate::fault_census::{
 use crate::obligations::{
     AuthoredItemModules, CalleeContractRef, ExternalSpecContractRef, SubjectObligationBundle,
     TransitiveCalleeRef,
-    collect_external_spec_contracts, compute_bundle_fault_census_receipt,
+    collect_external_spec_contracts,
     derive_item_module_suffix, group_subject_obligations, module_suffix_to_rel_path,
     refresh_obligations_census_summary, render_crate_verify_module,
     render_generated_assumptions_module,
@@ -717,6 +717,21 @@ pub fn compute_workspace_bundle_fault_census(
         .iter()
         .map(|r| (r.target.def_id.as_str(), r))
         .collect();
+    let record_by_suffix: BTreeMap<String, &UnitTargetRecord> = records
+        .iter()
+        .map(|r| (derive_item_module_suffix(r), r))
+        .collect();
+    let read_mir_by_suffix = |suffix: &str| -> Option<String> {
+        let rel = module_suffix_to_rel_path(suffix);
+        let path = if let Some(rec) = record_by_suffix.get(suffix) {
+            resolve_workspace_mir_file(mir_root, rec, &rel)
+        } else {
+            let direct = mir_root.join(&rel);
+            direct.is_file().then_some(direct)
+        }?;
+        fs::read_to_string(path).ok()
+    };
+
     let mut callee_sources = Vec::new();
     for callee in &bundle.transitive_callees {
         let callee_rel = module_suffix_to_rel_path(&callee.item_module_suffix);
@@ -735,10 +750,153 @@ pub fn compute_workspace_bundle_fault_census(
         }
     }
 
-    let scanned = compute_bundle_fault_census_receipt(
+    let proofs_root = mir_root
+        .parent()
+        .and_then(|g| g.parent())
+        .and_then(|d| d.parent())
+        .map(|ws| ws.join("anneal").join("proofs"));
+    let authored = proofs_root
+        .as_deref()
+        .filter(|pr| pr.is_dir())
+        .map(|pr| {
+            effective_authored_for_bundle(
+                bundle,
+                detect_authored_item_modules(pr, &bundle.item_rel_path),
+                None,
+            )
+        })
+        .unwrap_or_else(|| {
+            effective_authored_for_bundle(bundle, AuthoredItemModules::default(), None)
+        });
+
+    let fail_closed_receipt = |reason: String| -> (FaultCensusReceipt, MultiItemCoverageVerdict) {
+        let verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+            failed_items: Vec::new(),
+            unsupported_reasons: vec![reason.clone()],
+        };
+        let receipt = FaultCensusReceipt {
+            def_path: bundle.subject.target.def_id.clone(),
+            mir_module_sha256: bundle.subject.target.mir_module_sha256.clone(),
+            census_sites: Vec::new(),
+            discharged_sites: Vec::new(),
+            callee_closure: CalleeClosure::default(),
+            reconciliation_verdict: verdict.status_code().to_string(),
+            is_verified: false,
+            reasons: vec![reason],
+        };
+        (receipt, verdict)
+    };
+
+    let mut specs_modular_externals: Option<Vec<String>> = None;
+    let mut specs_equiv_ref_suffix: Option<String> = None;
+    if authored.has_specs
+        && let Some(ref pr) = proofs_root
+    {
+        let specs_path = pr.join("Specs").join(&bundle.item_rel_path);
+        if let Ok(specs_src) = fs::read_to_string(&specs_path) {
+            match crate::fault_census::scan_specs_module(&specs_src, &bundle.item_module_suffix) {
+                Ok(specs_links) => {
+                    specs_equiv_ref_suffix = specs_links.equiv_spec_body_suffix;
+                    if authored.is_modular && specs_links.has_modular_spec_instance {
+                        let mut exts = Vec::new();
+                        if specs_links.delegates_to_default_modular_spec_env {
+                            exts.extend(
+                                bundle
+                                    .external_spec_callees
+                                    .iter()
+                                    .map(|e| e.target_def_id.clone())
+                                    .chain(bundle.called_callees.iter().map(|c| c.def_id.clone())),
+                            );
+                        }
+                        for callee_suf in &specs_links.referenced_modular_callee_suffixes {
+                            let Some(c_src) = read_mir_by_suffix(callee_suf) else {
+                                return Ok(Some(fail_closed_receipt(format!(
+                                    "Specs.{} references missing MIR module `Mir.{callee_suf}`",
+                                    bundle.item_module_suffix
+                                ))));
+                            };
+                            match crate::fault_census::parse_lean_mir_module_body_strict(&c_src) {
+                                Ok(cbody) if !cbody.def_path.is_empty() => {
+                                    exts.push(cbody.def_path);
+                                }
+                                Ok(_) => {
+                                    return Ok(Some(fail_closed_receipt(format!(
+                                        "MIR module `Mir.{callee_suf}` has an empty `defPath`"
+                                    ))));
+                                }
+                                Err(err) => {
+                                    return Ok(Some(fail_closed_receipt(format!(
+                                        "MIR fault-census scan error in `Mir.{callee_suf}`: {err}"
+                                    ))));
+                                }
+                            }
+                        }
+                        for ext_ident in &specs_links.referenced_subject_external_contract_idents {
+                            let resolved = if ext_ident == "defaultExternalCallContract" {
+                                bundle
+                                    .external_spec_callees
+                                    .first()
+                                    .map(|e| e.target_def_id.clone())
+                            } else {
+                                bundle
+                                    .external_spec_callees
+                                    .iter()
+                                    .find(|e| {
+                                        crate::obligations::external_call_contract_ident(e)
+                                            == *ext_ident
+                                    })
+                                    .map(|e| e.target_def_id.clone())
+                            };
+                            match resolved {
+                                Some(target_def_id) => exts.push(target_def_id),
+                                None => {
+                                    return Ok(Some(fail_closed_receipt(format!(
+                                        "Specs.{} references unknown external contract `{ext_ident}.holdsOn`",
+                                        bundle.item_module_suffix
+                                    ))));
+                                }
+                            }
+                        }
+                        specs_modular_externals = Some(exts);
+                    }
+                }
+                Err(err) => {
+                    return Ok(Some(fail_closed_receipt(err)));
+                }
+            }
+        }
+    }
+
+    let equiv_mir_src_opt = if authored.is_equiv {
+        let ref_suffix_opt = if specs_equiv_ref_suffix.is_some() {
+            specs_equiv_ref_suffix
+        } else {
+            bundle.rust_equiv_target_module_suffix()
+        };
+        let Some(ref_suffix) = ref_suffix_opt else {
+            return Ok(Some(fail_closed_receipt(format!(
+                "equivalence subject `{}` has no `StatefulEquivItemSpec` reference body",
+                bundle.subject.target.def_id
+            ))));
+        };
+        let Some(ref_src) = read_mir_by_suffix(&ref_suffix) else {
+            return Ok(Some(fail_closed_receipt(format!(
+                "equivalence subject `{}` references missing MIR module `Mir.{ref_suffix}`",
+                bundle.subject.target.def_id
+            ))));
+        };
+        Some(ref_src)
+    } else {
+        None
+    };
+
+    let scanned = crate::obligations::compute_bundle_fault_census_receipt_with_context(
         bundle,
         &subject_mir_src,
         &callee_sources,
+        specs_modular_externals.as_deref(),
+        equiv_mir_src_opt.as_deref(),
+        bundle.has_rust_trusted_attr() || authored.is_ub_exception,
         &PropertyRegistry::all_verified(),
         &BTreeSet::new(),
     );
@@ -749,27 +907,12 @@ pub fn compute_workspace_bundle_fault_census(
             // must not abort scaffolding (the item simply cannot be reconciled); record
             // a fail-closed receipt so `agent-context` and the JSON report surface the
             // reason, and `verify` independently downgrades the item.
-            let reason = format!(
+            Ok(Some(fail_closed_receipt(format!(
                 "failed to scan captured MIR for fault-site census of `{}` ({}): {}",
                 bundle.subject.target.def_id,
                 subject_mir_path.display(),
                 err
-            );
-            let verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-                failed_items: Vec::new(),
-                unsupported_reasons: vec![reason.clone()],
-            };
-            let receipt = FaultCensusReceipt {
-                def_path: bundle.subject.target.def_id.clone(),
-                mir_module_sha256: bundle.subject.target.mir_module_sha256.clone(),
-                census_sites: Vec::new(),
-                discharged_sites: Vec::new(),
-                callee_closure: CalleeClosure::default(),
-                reconciliation_verdict: verdict.status_code().to_string(),
-                is_verified: false,
-                reasons: vec![reason],
-            };
-            Ok(Some((receipt, verdict)))
+            ))))
         }
     }
 }

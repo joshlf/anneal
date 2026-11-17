@@ -891,4 +891,155 @@ theorem evalCopyNonOverlapping_one_not_exposesUb_and_census_of_obligations
     exact (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp
       hRec (blockIdx, stmtIdx, cls) hInSites
 
+/--
+`[adv ep1-A3]` Full statement-step (`¬ StepNodeExposesUb`) deref-load reconciliation bridge:
+when `evalOperand_deref_of_obligations` holds at the root frame and the destination local
+slot is `.uninit` with no active protectors, `evalStmt` on `dstLocal = copy (*ptrLocal)`
+never exposes `.ub` (`¬ StepNodeExposesUb`) and every deref-load and destination-write
+`MirFaultClass` at `(blockIdx, stmtIdx)` is discharged in `discharged` with
+`.emittedAndVerified` status.
+-/
+theorem evalStmt_deref_load_reconciled_of_obligations
+    (s : MachineState) (dstLocal ptrLocal : Local) (span : String)
+    (blockIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (registry : PropertyRegistry) (discharged : List FaultSite)
+    (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (v : Value)
+    (locals' : List LocalValue)
+    (hPtr : get? s.frame.locals ptrLocal = some (.init (.ptr rp.toProvenancePtr sz)))
+    (hLookup : lookupBorrow s.memory.borrows rp.toProvenancePtr.tag = some entry)
+    (hNotDis : entry.perm ≠ .disabled)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? s.frame.locals entry.targetLocal = some (.init v))
+    (hCaller : s.memory.callerLocals = [])
+    (hStack : s.memory.callStack = [])
+    (hNoReadTreeUb :
+      derefReadTreeUB s.frame.locals ptrLocal [] s.memory.borrows s.memory.activeProtectors =
+        false)
+    (hDstSlot : get? s.frame.locals dstLocal = some .uninit)
+    (hSet : set? s.frame.locals dstLocal (.init v) = some locals')
+    (hNoProt : s.memory.activeProtectors = [])
+    (hRec :
+      reconcileFaultCoverageWithRegistry registry
+        (censusStmtFaultSites blockIdx stmtIdx
+          ⟨.assign { local_ := dstLocal, projection := [] }
+            (.use (.copy { local_ := ptrLocal, projection := [.deref] })), span⟩)
+        discharged = .verified) :
+    ¬ StepNodeExposesUb
+        (evalStmt s
+          ⟨.assign { local_ := dstLocal, projection := [] }
+            (.use (.copy { local_ := ptrLocal, projection := [.deref] })), span⟩
+          [] emptyLayoutTable) ∧
+    ∀ cls ∈ [MirFaultClass.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation,
+              .uninitRead, .storageLiveProtected],
+      (blockIdx, stmtIdx, cls) ∈ discharged ∧ registry cls = .emittedAndVerified := by
+  have hOp := evalOperand_deref_of_obligations
+    s.memory s.frame.locals ptrLocal rp sz entry v hPtr hLookup hNotDis hProj hTarget
+  have hDis := (evalOperand_deref_reconciled_of_obligations
+    s.memory s.frame.locals dstLocal ptrLocal span blockIdx stmtIdx registry discharged
+    rp sz entry v hPtr hLookup hNotDis hProj hTarget hRec).2
+  refine ⟨?_, hDis⟩
+  have hValOk :
+      validateLoadedValue emptyLayoutTable []
+        (.copy { local_ := ptrLocal, projection := [.deref] }) v = true := rfl
+  dsimp only [evalStmt, evalRvalue]
+  rw [hCaller, hStack, hOp]
+  dsimp only []
+  rw [hValOk]
+  dsimp only []
+  cases hB1 : s.memory.borrows with
+  | nil =>
+    dsimp only []
+    rw [hDstSlot]
+    dsimp only []
+    rw [hSet]
+    dsimp only []
+    rw [hNoProt]
+    intro hUb
+    nomatch hUb
+  | cons b₁ bs =>
+    cases bs with
+    | nil =>
+      dsimp only []
+      rw [hDstSlot]
+      dsimp only []
+      rw [hSet]
+      dsimp only []
+      rw [hNoProt]
+      intro hUb
+      nomatch hUb
+    | cons b₂ rest =>
+      rw [hB1] at hNoReadTreeUb
+      dsimp only []
+      rw [hNoReadTreeUb]
+      dsimp only []
+      rw [hDstSlot]
+      dsimp only []
+      rw [hSet]
+      dsimp only []
+      rw [hNoProt]
+      intro hUb
+      nomatch hUb
+
+/--
+`[adv ep1-A3]` Full statement-step (`¬ StepNodeExposesUb`) deref-store reconciliation bridge:
+when `evalPlaceWrite` succeeds on `*ptrLocal = rv` with no Tree Borrows / union-protector
+write conflict, `evalStmt` never exposes `.ub` (`¬ StepNodeExposesUb`) and every deref-store
+`MirFaultClass` at `(blockIdx, stmtIdx)` is discharged in `discharged` with
+`.emittedAndVerified` status.
+-/
+theorem evalStmt_deref_store_reconciled_of_obligations
+    (s : MachineState) (ptrLocal : Local) (rv : Rvalue) (span : String)
+    (blockIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (registry : PropertyRegistry) (discharged : List FaultSite)
+    (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (oldVal newVal : Value)
+    (locals' : List LocalValue)
+    (hEvalRv : rvalueUnevaluated rv = false)
+    (hRv : evalRvalue s.frame.locals rv s.memory [] emptyLayoutTable =
+      .ok newVal s.frame.locals s.memory)
+    (hPtr : get? s.frame.locals ptrLocal = some (.init (.ptr rp.toProvenancePtr sz)))
+    (hLookup : lookupBorrow s.memory.borrows rp.toProvenancePtr.tag = some entry)
+    (hWritable : entry.perm = .active ∨ entry.perm = .reserved)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? s.frame.locals entry.targetLocal = some (.init oldVal))
+    (hSet : set? s.frame.locals entry.targetLocal (.init newVal) = some locals')
+    (hPlaceWrite :
+      evalPlaceWrite s.frame.locals s.memory.borrows
+        { local_ := ptrLocal, projection := [.deref] }
+        newVal s.memory.activeProtectors [] emptyLayoutTable s.memory.callStack = .ok locals')
+    (hNoTreeUb :
+      derefWriteTreeUB s.frame.locals s.memory.borrows
+        { local_ := ptrLocal, projection := [.deref] } = false)
+    (hNoUnionUb :
+      derefWriteUnionProtectorUB [] emptyLayoutTable s.frame.locals s.memory.borrows
+        s.memory.activeProtectors { local_ := ptrLocal, projection := [.deref] } []
+        s.memory.callStack = false)
+    (hRec :
+      reconcileFaultCoverageWithRegistry registry
+        (censusStmtFaultSites blockIdx stmtIdx
+          ⟨.assign { local_ := ptrLocal, projection := [.deref] } rv, span⟩)
+        discharged = .verified) :
+    ¬ StepNodeExposesUb
+        (evalStmt s ⟨.assign { local_ := ptrLocal, projection := [.deref] } rv, span⟩
+          [] emptyLayoutTable) ∧
+    writePlaceValue s.frame.locals s.memory.borrows
+      { local_ := ptrLocal, projection := [.deref] } newVal = .ok locals' ∧
+    ∀ cls ∈ [MirFaultClass.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation,
+              .uninitRead, .storageLiveProtected],
+      (blockIdx, stmtIdx, cls) ∈ discharged ∧ registry cls = .emittedAndVerified := by
+  have hWp := writePlaceValue_deref_of_obligations
+    s.memory s.frame.locals locals' ptrLocal rp sz entry oldVal newVal
+    hPtr hLookup hWritable hProj hTarget hSet
+  have hDis := (writePlaceValue_deref_reconciled_of_obligations
+    s.memory s.frame.locals locals' ptrLocal rv span blockIdx stmtIdx registry discharged
+    rp sz entry oldVal newVal hEvalRv hPtr hLookup hWritable hProj hTarget hSet hRec).2
+  refine ⟨?_, hWp, hDis⟩
+  dsimp only [evalStmt]
+  rw [hRv]
+  dsimp only []
+  rw [hPlaceWrite]
+  dsimp only []
+  rw [hNoTreeUb, hNoUnionUb]
+  intro hUb
+  nomatch hUb
+
 end Anneal.UnsafeObligations
