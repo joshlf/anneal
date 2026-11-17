@@ -272,6 +272,9 @@ def make_elf64(
     strtab_outside_load: bool = False,
     strtab_in_nobits: bool = False,
     unterminated: bool = False,
+    unterminated_within_strsz: bool = False,
+    needed_index_oob: bool = False,
+    runpath_index_oob: bool = False,
     strsz_overrun: bool = False,
     omit_strtab: bool = False,
     phentsize: int = 56,
@@ -290,16 +293,17 @@ def make_elf64(
     strtab = bytearray(b"\0")
     dyn: List[Tuple[int, int]] = []
     for name in needed:
-        dyn.append((1, len(strtab)))
+        dyn.append((1, len(strtab) + (4096 if needed_index_oob else 0)))
         strtab += name.encode() + b"\0"
     if rpath:
         dyn.append((15, len(strtab)))
         strtab += ":".join(rpath).encode() + b"\0"
     if runpath:
-        dyn.append((rpath_tag, len(strtab)))
+        dyn.append((rpath_tag, len(strtab) + (4096 if runpath_index_oob else 0)))
         strtab += ":".join(runpath).encode() + b"\0"
     if unterminated:
         del strtab[-1]
+    declared_strsz = len(strtab) - (1 if unterminated_within_strsz and len(strtab) > 1 else 0)
     n_phdrs = 3 if overlapping_loads else 2
     dyn_off = 64 + n_phdrs * phentsize
     dyn_slots = len(dyn) + (2 if omit_dt_null else 3)  # + DT_STRTAB, DT_STRSZ, [DT_NULL]
@@ -307,7 +311,7 @@ def make_elf64(
     total = str_off + len(strtab)
     if not omit_strtab:
         dyn.append((5, str_off + (0x100000 if strtab_outside_load else 0)))
-        dyn.append((10, len(strtab) + (64 if strsz_overrun else 0)))
+        dyn.append((10, declared_strsz + (64 if strsz_overrun else 0)))
     if not omit_dt_null:
         dyn.append((0, 0))
     body = b"".join(struct.pack("<qQ", tag, val) for tag, val in dyn).ljust(16 * dyn_slots, b"\0")
@@ -334,6 +338,9 @@ def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
         ("DT_STRTAB outside every PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], strtab_outside_load=True), "not inside a PT_LOAD"),
         ("DT_STRTAB in PT_LOAD NOBITS/BSS tail", make_elf64(["libfoo.so"], ["$ORIGIN"], strtab_in_nobits=True), "NOBITS/BSS tail"),
         ("unterminated dynamic string", make_elf64(["libfoo.so"], ["$ORIGIN"], unterminated=True), "unterminated"),
+        ("dynamic string NUL sits past DT_STRSZ", make_elf64(["libfoo.so"], ["$ORIGIN"], unterminated_within_strsz=True), "unterminated"),
+        ("DT_NEEDED d_val >= DT_STRSZ", make_elf64(["libfoo.so"], ["$ORIGIN"], needed_index_oob=True), "out of DT_STRSZ bounds"),
+        ("DT_RUNPATH d_val >= DT_STRSZ", make_elf64(["libfoo.so"], ["$ORIGIN"], runpath_index_oob=True), "out of DT_STRSZ bounds"),
         ("DT_STRSZ overruns PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], strsz_overrun=True), "overruns"),
         ("DT_NEEDED without DT_STRTAB", make_elf64(["libfoo.so"], ["$ORIGIN"], omit_strtab=True), "without DT_STRTAB"),
         ("e_phentsize != 56", make_elf64(["libfoo.so"], ["$ORIGIN"], phentsize=64), "malformed ELF program header table"),
@@ -657,6 +664,47 @@ class HashPrimitiveTests(TempCase):
         run("add", "-A")
         self.assertEqual(ours, run("write-tree"))
         self.assertEqual(V.git_tree_sha1({k[2:]: v for k, v in entries.items() if k.startswith("a/")}), run("rev-parse", f"{run('write-tree')}:a"))
+
+    def test_git_tree_canonical_sorting_foo_variants(self) -> None:
+        """Git `base_name_compare` sorts directory `foo` as `foo/` (`0x2f`), so
+        `foo-a` (`0x2d`) < `foo.lean` (`0x2e`) < `foo/` (`0x2f`) < `foo_a` (`0x5f`)."""
+        files = {
+            "foo/bar.lean": b"inside foo dir\n",
+            "foo-a": b"dash file\n",
+            "foo-dir/x.lean": b"dash dir\n",
+            "foo.lean": b"dot lean file\n",
+            "foo_a": b"underscore file\n",
+            "foo_dir/x.lean": b"underscore dir\n",
+        }
+        entries = {rel: ("100644", V.git_blob_sha1(data)) for rel, data in files.items()}
+        ours = V.git_tree_sha1(entries)
+        self.assertEqual(CT._git_tree_id(entries), ours)
+        # Verify the exact order of top-level entries:
+        # foo-a (0x2d), foo-dir/ (0x2d), foo.lean (0x2e), foo/ (0x2f), foo_a (0x5f), foo_dir/ (0x5f).
+        expected_order = [
+            ("100644", "foo-a", entries["foo-a"][1]),
+            ("40000", "foo-dir", V.git_tree_sha1({"x.lean": entries["foo-dir/x.lean"]})),
+            ("100644", "foo.lean", entries["foo.lean"][1]),
+            ("40000", "foo", V.git_tree_sha1({"bar.lean": entries["foo/bar.lean"]})),
+            ("100644", "foo_a", entries["foo_a"][1]),
+            ("40000", "foo_dir", V.git_tree_sha1({"x.lean": entries["foo_dir/x.lean"]})),
+        ]
+        manual_body = b"".join(f"{m} {n}".encode("utf-8") + b"\0" + bytes.fromhex(h) for m, n, h in expected_order)
+        self.assertEqual(ours, hashlib.sha1(b"tree %d\0" % len(manual_body) + manual_body).hexdigest())
+        # Naive sorting by bare name (putting "foo" before "foo-a" and "foo.lean") must differ.
+        naive_body = b"".join(f"{m} {n}".encode("utf-8") + b"\0" + bytes.fromhex(h) for m, n, h in sorted(expected_order, key=lambda x: x[1]))
+        self.assertNotEqual(ours, hashlib.sha1(b"tree %d\0" % len(naive_body) + naive_body).hexdigest())
+        git = shutil.which("git")
+        if git is not None:
+            repo = self.tmp / "gitrepo-foo"
+            for rel, data in files.items():
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                (repo / rel).write_bytes(data)
+            env = _git_env()
+            run = lambda *a: subprocess.run([git, *a], cwd=repo, env=env, check=True, capture_output=True, text=True).stdout.strip()  # noqa: E731
+            run("init", "-q")
+            run("add", "-A")
+            self.assertEqual(ours, run("write-tree"))
 
     def test_manifest_formula_reproduces_pinned_digest_and_rejects_alternatives(self) -> None:
         pin = json.loads((REPO_ROOT / V.PIN_RELPATH).read_text())
@@ -1537,6 +1585,12 @@ class ToolchainTests(TempCase):
             (["libleanshared.so"], ["$LIB/x"], "bin/lean: unsupported DT_RUNPATH entry '$LIB/x'"),
             (["libleanshared.so"], ["lib/lean"], "bin/lean: unsupported DT_RUNPATH entry 'lib/lean'"),
             (["/tmp/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '/tmp/evil.so' is a path"),
+            (["sub/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry 'sub/evil.so' is a path"),
+            ([""], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '' is a path"),
+            (["."], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '.' is a path"),
+            ([".."], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '..' is a path"),
+            (["$ORIGIN/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '$ORIGIN/evil.so' is a path"),
+            (["$ORIGIN"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '$ORIGIN' is a path"),
             (["libz.so.1"], ["$ORIGIN/../lib"], "RUNPATH shadowing: bin/lean needs 'libz.so.1', which ld.so can resolve to the unpinned toolchain file lib/libz.so.1"),
         )
         for needed, runpath, needle in cases:
@@ -1680,7 +1734,8 @@ class ElfDynamicParserTests(TempCase):
         rng = random.Random(20261117)
         names = ["libfoo.so", "libc.so.6", "", "a/b.so", "libleanshared_1.so"]
         entries = ["$ORIGIN", "$ORIGIN/../lib", "${ORIGIN}/x", "", "/abs", "$LIB", "$ORIGINX"]
-        flags = ("strtab_outside_load", "strtab_in_nobits", "unterminated", "strsz_overrun", "omit_strtab",
+        flags = ("strtab_outside_load", "strtab_in_nobits", "unterminated", "unterminated_within_strsz",
+                 "needed_index_oob", "runpath_index_oob", "strsz_overrun", "omit_strtab",
                  "load_filesz_gt_memsz", "overlapping_loads", "omit_dt_null", "dyn_outside_load")
 
         def outcome(parse: Callable[[Path], Any], path: Path) -> Tuple[str, Any]:
@@ -2208,6 +2263,12 @@ class CheckTrustedIntegrationTests(TempCase):
             (["libleanshared.so"], ["$ORIGINX/../lib/lean"], "bin/lean: unsupported DT_RUNPATH entry '$ORIGINX/../lib/lean'"),
             (["libleanshared.so"], ["${ORIGIN/../lib/lean"], "bin/lean: unsupported DT_RUNPATH entry '${ORIGIN/../lib/lean'"),
             (["/tmp/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '/tmp/evil.so' is a path"),
+            (["sub/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry 'sub/evil.so' is a path"),
+            ([""], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '' is a path"),
+            (["."], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '.' is a path"),
+            ([".."], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '..' is a path"),
+            (["$ORIGIN/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '$ORIGIN/evil.so' is a path"),
+            (["$ORIGIN"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '$ORIGIN' is a path"),
             (["libz.so.1"], ["$ORIGIN/../lib"], "RUNPATH shadowing: bin/lean needs 'libz.so.1', which ld.so can resolve to the unpinned toolchain file lib/libz.so.1"),
         )
         for needed, runpath, needle in cases:
@@ -2427,6 +2488,64 @@ class CheckTrustedIntegrationTests(TempCase):
             ws.pin_path.unlink()
             ws.pin_path.write_text(pristine, encoding="utf-8")
         self.assertEqual(CT.verify_lean_miri_pin(root)["patchedFiles"], 10)
+
+    @NEEDS_LIVE_RELEASE
+    def test_freshness_revalidates_root_manifest_lean_miri_pin_and_tool_hashes_mid_run(self) -> None:
+        """`Checker.freshness()` must detect mid-run modifications, deletions, or
+        symlink replacements of `trusted/root-manifest.sha256` (and its covered
+        files), `lean-miri/UPSTREAM_PIN.json` (and `lean-miri/vendor/`), and
+        `Cargo.toml`, as well as mid-run planting of a manifest or pin."""
+        root, ws = self.fixture_with_lean_miri()
+        pin_bytes = ws.pin_path.read_bytes()
+        manifest = self.write_root_manifest(
+            root,
+            {"Cargo.lock": b"# lock\n"},
+            extra=f"{_sha256(pin_bytes)}  {V.PIN_RELPATH}\n",
+        )
+        manifest_bytes = manifest.read_bytes()
+        size_path = ws.path(TAMPER_TARGET)
+        size_bytes = size_path.read_bytes()
+        checker = self.checker(root, LIVE_TOOLCHAIN_DIR / "bin" / "lean")
+        self.assertEqual(self.run_until_first_lean_process(checker), [("version", ["--version"])])
+        self.assertIn(CT.ROOT_MANIFEST_RELPATH, checker.tool_hashes)
+        self.assertIn(CT.LEAN_MIRI_PIN_RELPATH, checker.tool_hashes)
+        checker.freshness()  # baseline clean
+
+        def assert_freshness_fails(needle: str) -> None:
+            with self.assertRaises(CT.Failure) as cm:
+                checker.freshness()
+            self.assertEqual((cm.exception.code, cm.exception.phase), (2, "freshness"), str(cm.exception))
+            self.assertIn(needle, str(cm.exception))
+
+        with self.subTest("root-manifest modified mid-run"):
+            manifest.write_bytes(manifest_bytes + b"# comment\n")
+            assert_freshness_fails("checker/policy inputs changed during check")
+            manifest.write_bytes(manifest_bytes)
+        with self.subTest("file covered by root-manifest modified mid-run"):
+            (root / "Cargo.lock").write_bytes(b"# tampered mid-run\n")
+            assert_freshness_fails("SHA-256 mismatch for Cargo.lock")
+            (root / "Cargo.lock").write_bytes(b"# lock\n")
+        with self.subTest("UPSTREAM_PIN.json modified mid-run"):
+            ws.pin_path.write_bytes(pin_bytes + b"\n")
+            assert_freshness_fails("checker/policy inputs changed during check")
+            ws.pin_path.write_bytes(pin_bytes)
+        with self.subTest("UPSTREAM_PIN.json replaced by symlink to identical bytes mid-run"):
+            outside_pin = self.tmp / "outside-pin.json"
+            outside_pin.write_bytes(pin_bytes)
+            ws.pin_path.unlink()
+            ws.pin_path.symlink_to(outside_pin)
+            assert_freshness_fails("expected a regular file")
+            ws.pin_path.unlink()
+            ws.pin_path.write_bytes(pin_bytes)
+        with self.subTest("vendored Miri file modified mid-run"):
+            size_path.write_bytes(size_bytes + b"\n-- mid-run tamper\n")
+            assert_freshness_fails(f"SHA-256 mismatch for {TAMPER_TARGET}")
+            size_path.write_bytes(size_bytes)
+        with self.subTest("Cargo.toml planted mid-run when absent at admission"):
+            (root / "Cargo.toml").write_bytes(b"[workspace]\n")
+            assert_freshness_fails("checker/policy inputs changed during check")
+            (root / "Cargo.toml").unlink()
+        checker.freshness()  # restored state passes again
 
 
 # ---------------------------------------------------------------------------

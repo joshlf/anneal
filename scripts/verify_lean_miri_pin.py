@@ -1885,7 +1885,7 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
             if directory not in search_dirs:
                 search_dirs.append(directory)
         for soname in needed:
-            if "/" in soname or soname in ("", ".", ".."):
+            if "/" in soname or "\\" in soname or "$" in soname or soname in ("", ".", ".."):
                 c.err("toolchain", f"{rel}: DT_NEEDED entry {soname!r} is a path")
                 continue
             needs.append((rel, soname))

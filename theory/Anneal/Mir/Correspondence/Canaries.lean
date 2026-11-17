@@ -507,4 +507,90 @@ theorem canary_trusted_evalOperands_move_then_copy_ub :
     evalOperands trustedD1Locals [.move (tpl 1 []), .copy (tpl 1 [])]
       (deinitProjectedMoves := true) = .ub := rfl
 
+/-- **`D4` & `D6` multi-operand field evaluation on the live `evalOperands`**
+(`deinitProjectedMoves := true` vs `false`):
+1. `[copy _1.0, move _1.0]` succeeds with `[2, 2]` and deinitializes `_1.0`;
+2. `[move _1.0, copy _1.0]`, `[move _1.0, move _1.0]`, and `[move _1.0, copy _1]`
+   fault with `.ub` (whereas legacy `false` mode returns `[2, 2]` on
+   `[move _1.0, copy _1.0]`);
+3. `[move _1.0, copy _1.1]` succeeds with `[2, 3]`; and
+4. `[move _1.1, move _1.0]` followed by `writePlaceValue` completes the `D6`
+   self-aggregate field swap `_1 = (move _1.1, move _1.0)`. -/
+theorem canary_trusted_evalOperands_D4_D6_field_order_and_swap :
+    evalOperands trustedD2Locals
+      [.copy (tpl 1 [.field 0 trustedU8Ty]), .move (tpl 1 [.field 0 trustedU8Ty])]
+      (deinitProjectedMoves := true) = .ok [u8Value 2, u8Value 2] trustedD2AfterMove ∧
+    evalOperands trustedD2Locals
+      [.move (tpl 1 [.field 0 trustedU8Ty]), .copy (tpl 1 [.field 0 trustedU8Ty])]
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperands trustedD2Locals
+      [.move (tpl 1 [.field 0 trustedU8Ty]), .move (tpl 1 [.field 0 trustedU8Ty])]
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperands trustedD2Locals
+      [.move (tpl 1 [.field 0 trustedU8Ty]), .copy (tpl 1 [])]
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperands trustedD2Locals
+      [.move (tpl 1 [.field 0 trustedU8Ty]), .copy (tpl 1 [.field 1 trustedU8Ty])]
+      (deinitProjectedMoves := true) = .ok [u8Value 2, u8Value 3] trustedD2AfterMove ∧
+    evalOperands trustedD2Locals
+      [.move (tpl 1 [.field 0 trustedU8Ty]), .copy (tpl 1 [.field 0 trustedU8Ty])] =
+        .ok [u8Value 2, u8Value 2] trustedD2Locals ∧
+    evalOperands trustedD2Locals
+      [.move (tpl 1 [.field 1 trustedU8Ty]), .move (tpl 1 [.field 0 trustedU8Ty])]
+      (deinitProjectedMoves := true) =
+        .ok [u8Value 3, u8Value 2]
+          [.uninit, .init (.aggregate 0 [movedUninitValue, movedUninitValue])] ∧
+    writePlaceValue
+      [.uninit, .init (.aggregate 0 [movedUninitValue, movedUninitValue])]
+      [] (tpl 1 []) (.aggregate 0 [u8Value 3, u8Value 2]) =
+        .ok [.uninit, .init (.aggregate 0 [u8Value 3, u8Value 2])] :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **`D7` call-argument / multi-operand `Deref` evaluation on the live
+`evalOperands` with a sibling `.frozen` borrow** (`_2 = &raw mut _1`,
+`_3 = &_1` `.frozen`):
+1. `[copy (*_2), move (*_2)]` and `[copy (*_3), move (*_2)]` return `[5, 5]` and
+   deinitialize `_1`;
+2. `[move (*_2), copy (*_2)]` and `[move (*_2), copy (*_3)]` fault with `.ub`
+   while preserving the sibling `.frozen` borrow `_3` (whereas legacy `false`
+   mode returns `[5, 5]`); and
+3. on typed `*mut (u8, u8)` (`_2` at byte offset `2`) with sibling `&(u8, u8)`
+   (`_3` `.frozen`), `[copy (*_2).0, move (*_2).0]` returns `[3, 3]`,
+   `[move (*_2).0, copy (*_2).0]` and `[move (*_2).0, copy (*_3).0]` fault with
+   `.ub`, and `[move (*_2).0, copy (*_3).1]` returns `[3, 4]`. -/
+theorem canary_trusted_evalOperands_D7_deref_order_with_frozen_sibling :
+    let initTyped : List LocalSlot :=
+      [.uninit,
+        .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+          .aggregate 0 [u8Value 3, u8Value 4]]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+        .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+    evalOperands d5TrustedLocals [.copy (tpl 2 [.deref]), .move (tpl 2 [.deref])]
+      d5TrustedBorrows (deinitProjectedMoves := true) =
+        .ok [u8Value 5, u8Value 5] d5TrustedAfterMove ∧
+    evalOperands d5TrustedLocals [.copy (tpl 3 [.deref]), .move (tpl 2 [.deref])]
+      d5TrustedBorrows (deinitProjectedMoves := true) =
+        .ok [u8Value 5, u8Value 5] d5TrustedAfterMove ∧
+    evalOperands d5TrustedLocals [.move (tpl 2 [.deref]), .copy (tpl 2 [.deref])]
+      d5TrustedBorrows (deinitProjectedMoves := true) = .ub ∧
+    evalOperands d5TrustedLocals [.move (tpl 2 [.deref]), .copy (tpl 3 [.deref])]
+      d5TrustedBorrows (deinitProjectedMoves := true) = .ub ∧
+    evalOperands d5TrustedLocals [.move (tpl 2 [.deref]), .copy (tpl 2 [.deref])]
+      d5TrustedBorrows = .ok [u8Value 5, u8Value 5] d5TrustedLocals ∧
+    evalOperands initTyped
+      [.copy (tpl 2 [.deref, .field 0 claimU8Ty]), .move (tpl 2 [.deref, .field 0 claimU8Ty])]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
+        .ok [u8Value 3, u8Value 3] d5TrustedTypedDerefAfterMove ∧
+    evalOperands initTyped
+      [.move (tpl 2 [.deref, .field 0 claimU8Ty]), .copy (tpl 2 [.deref, .field 0 claimU8Ty])]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperands initTyped
+      [.move (tpl 2 [.deref, .field 0 claimU8Ty]), .copy (tpl 3 [.deref, .field 0 claimU8Ty])]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperands initTyped
+      [.move (tpl 2 [.deref, .field 0 claimU8Ty]), .copy (tpl 3 [.deref, .field 1 claimU8Ty])]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
+        .ok [u8Value 3, u8Value 4] d5TrustedTypedDerefAfterMove :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.Mir.Correspondence

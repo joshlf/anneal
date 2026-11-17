@@ -53,7 +53,7 @@ Contents:
    `LayoutQueryCorrespondenceClaim`, `CorrespondenceClaim`,
    `FaultEquivalenceClaim`, `MiriMoveDeinitWiringClaim`, and
    `TrustedProjectedMoveDeinitClaim` (a live bridge to
-   `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand`).
+   `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` and `evalOperands`).
 -/
 
 namespace Trusted.Correspondence
@@ -2706,9 +2706,26 @@ def claimDerefBorrows : List BorrowEntry :=
        `_1[1]`, and moving `(*_2)[1..3]` returns `[11, 12]` and deinitializes
        `_1[1..3]` while keeping `_1[0] = 10` and `_1[3] = 13` readable;
     9. (*read guard, all states*) every read in this mode faults on a value
-       that contains a moved-out leaf; and
+       that contains a moved-out leaf;
    10. (*non-vacuity of 9*) a default-mode copy can indeed return a value
-       containing a moved-out leaf. -/
+       containing a moved-out leaf;
+   11. (*`D4` multi-operand left-to-right field evaluation on `evalOperands`,
+       all states*) for any initialized aggregate local, `[copy _l.idx, move _l.idx]`
+       returns `[v, v]` and deinitializes field `idx`, `[move _l.idx, copy _l.idx]`
+       and `[move _l.idx, move _l.idx]` fault with `.ub`, `[move _l.idx, copy _l.j]`
+       (`j ≠ idx`) returns `[v, w]`, and legacy `false` mode returns `[v, v]` on
+       `[move _l.idx, copy _l.idx]`; and
+   12. (*`D7` multi-operand `Deref` evaluation on `evalOperands` with a sibling
+       `.frozen` borrow*) on untyped `*mut u8` (`_2`) with sibling `&u8` (`_3`
+       `.frozen`), `[copy (*_2), move (*_2)]` and `[copy (*_3), move (*_2)]`
+       return `[5, 5]` and deinitialize `_1`, while `[move (*_2), copy (*_2)]`
+       and `[move (*_2), copy (*_3)]` fault with `.ub` (versus `[5, 5]` in legacy
+       `false` mode); and on typed `*mut (u8, u8)` (`_2` at byte offset `2`) with
+       sibling `&(u8, u8)` (`_3` `.frozen`), `[copy (*_2).0, move (*_2).0]`
+       returns `[3, 3]`, `[move (*_2).0, copy (*_2).0]` and
+       `[move (*_2).0, copy (*_3).0]` fault with `.ub`, and
+       `[move (*_2).0, copy (*_3).1]` returns `[3, 4]` while preserving the
+       sibling `.frozen` borrow. -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
@@ -2905,6 +2922,62 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (c10) non-vacuity of (c9)
   (∃ (locals : List LocalSlot) (p : Place) (v : Value) (locals' : List LocalSlot),
     evalOperand locals (.copy p) [] [] emptyLayoutTable [] [] [] = .ok v locals' ∧
-    valueContainsMovedUninit v = true)
+    valueContainsMovedUninit v = true) ∧
+  -- (c11) D4 multi-operand left-to-right field evaluation on live `evalOperands`
+  (∀ (locals : List LocalSlot) (l : Local) (variant : VariantIdx) (fields : List Value)
+      (idx : FieldIdx) (fty : Ty) (v : Value) (borrows : List BorrowEntry)
+      (globals : List CapturedAllocation) (layouts : LayoutTable)
+      (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame),
+    Trusted.Sequence.get? locals l = some (.init (.aggregate variant fields)) →
+    Trusted.Sequence.get? fields idx = some v →
+    v ≠ .unit → valueContainsMovedUninit v = false →
+    ∃ locals',
+      evalOperands locals [.copy ⟨l, [.field idx fty]⟩, .move ⟨l, [.field idx fty]⟩]
+        borrows globals layouts callerLocals [] callStack true = .ok [v, v] locals' ∧
+      evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, [.field idx fty]⟩]
+        borrows globals layouts callerLocals [] callStack true = .ub ∧
+      evalOperands locals [.move ⟨l, [.field idx fty]⟩, .move ⟨l, [.field idx fty]⟩]
+        borrows globals layouts callerLocals [] callStack true = .ub ∧
+      evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, [.field idx fty]⟩]
+        borrows globals layouts callerLocals [] callStack false = .ok [v, v] locals ∧
+      ∀ (j : FieldIdx) (jty : Ty) (w : Value), j ≠ idx →
+        Trusted.Sequence.get? fields j = some w → valueContainsMovedUninit w = false →
+        evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, [.field j jty]⟩]
+          borrows globals layouts callerLocals [] callStack true = .ok [v, w] locals') ∧
+  -- (c12) D7 multi-operand `Deref` evaluation on live `evalOperands` with a sibling `.frozen` borrow
+  (∃ localsDeref localsTyped : List LocalSlot,
+    let initDeref : List LocalSlot :=
+      [.uninit, .init (u8Value 5), .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+        .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
+    let initTyped : List LocalSlot :=
+      [.uninit,
+        .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+          .aggregate 0 [u8Value 3, u8Value 4]]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+        .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+    evalOperands initDeref [.copy ⟨2, [.deref]⟩, .move ⟨2, [.deref]⟩] claimDerefBorrows []
+      emptyLayoutTable [] [] [] true = .ok [u8Value 5, u8Value 5] localsDeref ∧
+    evalOperands initDeref [.copy ⟨3, [.deref]⟩, .move ⟨2, [.deref]⟩] claimDerefBorrows []
+      emptyLayoutTable [] [] [] true = .ok [u8Value 5, u8Value 5] localsDeref ∧
+    evalOperands initDeref [.move ⟨2, [.deref]⟩, .copy ⟨2, [.deref]⟩] claimDerefBorrows []
+      emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperands initDeref [.move ⟨2, [.deref]⟩, .copy ⟨3, [.deref]⟩] claimDerefBorrows []
+      emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperands initDeref [.move ⟨2, [.deref]⟩, .copy ⟨2, [.deref]⟩] claimDerefBorrows []
+      emptyLayoutTable [] [] [] false = .ok [u8Value 5, u8Value 5] initDeref ∧
+    evalOperands initTyped
+      [.copy ⟨2, [.deref, .field 0 claimU8Ty]⟩, .move ⟨2, [.deref, .field 0 claimU8Ty]⟩]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
+        .ok [u8Value 3, u8Value 3] localsTyped ∧
+    evalOperands initTyped
+      [.move ⟨2, [.deref, .field 0 claimU8Ty]⟩, .copy ⟨2, [.deref, .field 0 claimU8Ty]⟩]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperands initTyped
+      [.move ⟨2, [.deref, .field 0 claimU8Ty]⟩, .copy ⟨3, [.deref, .field 0 claimU8Ty]⟩]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperands initTyped
+      [.move ⟨2, [.deref, .field 0 claimU8Ty]⟩, .copy ⟨3, [.deref, .field 1 claimU8Ty]⟩]
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
+        .ok [u8Value 3, u8Value 4] localsTyped)
 
 end Trusted.Correspondence

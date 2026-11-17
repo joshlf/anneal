@@ -47,8 +47,8 @@ theorem miri_move_deinit_wiring_claim_holds :
     Trusted.Correspondence.MiriMoveDeinitWiringClaim :=
   Anneal.Mir.Correspondence.miriMoveDeinitWiringClaim_proof
 
-/-- The live Trusted `evalOperand` deinitializes projected and dereferenced
-moves when `deinitProjectedMoves := true`. -/
+/-- The live Trusted `evalOperand` and `evalOperands` deinitialize projected
+and dereferenced moves when `deinitProjectedMoves := true`. -/
 theorem trusted_projected_move_deinit_claim_holds :
     Trusted.Correspondence.TrustedProjectedMoveDeinitClaim :=
   Anneal.Mir.Correspondence.trustedProjectedMoveDeinitClaim_proof

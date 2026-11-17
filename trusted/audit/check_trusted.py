@@ -393,6 +393,7 @@ class Checker:
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
         self.expected_artifacts: dict[str, str] = {}
+        self.tool_hashes: dict[str, str] = {}
         self.last_status = None
         self.preflight: dict[str, dict] = {}
 
@@ -777,10 +778,25 @@ class Checker:
         self.tool_paths = [
             self.checkout / "trusted/audit/check_trusted.py",
             self.checkout / "trusted/audit/TrustedBoundary.lean",
+            *(
+                self.checkout / rel
+                for rel in (
+                    "Cargo.toml",
+                    "trusted/rustc-capture/Cargo.toml",
+                    ROOT_MANIFEST_RELPATH,
+                    LEAN_MIRI_PIN_RELPATH,
+                )
+                if os.path.lexists(self.checkout / rel)
+            ),
         ]
         for path in self.tool_paths:
             regular(path, "tool-snapshot")
-        self.tool_hashes = {str(p.relative_to(self.checkout)): digest(p) for p in self.tool_paths}
+        for path in self.tool_paths:
+            rel = path.relative_to(self.checkout).as_posix()
+            actual = digest(path)
+            if rel in self.tool_hashes and self.tool_hashes[rel] != actual:
+                raise Failure(2, "freshness", "checker/policy inputs changed during check")
+            self.tool_hashes[rel] = actual
         self.inspector = self.stage / "TrustedBoundary.lean"
         shutil.copyfile(self.tool_paths[1], self.inspector)
         # Staged inputs are read-only from here on (GUIDE.md): no later step or child
@@ -899,8 +915,17 @@ class Checker:
         staged, staged_modules = snapshot(self.source_copy)
         if staged != self.initial or staged_modules != self.modules:
             raise Failure(2, "freshness", "staged Trusted root inventory/bytes changed during check")
-        if any(digest(self.checkout / p) != h for p, h in self.tool_hashes.items()):
-            raise Failure(2, "freshness", "checker/policy inputs changed during check")
+        for rel in ("Cargo.toml", "trusted/rustc-capture/Cargo.toml", ROOT_MANIFEST_RELPATH, LEAN_MIRI_PIN_RELPATH):
+            if os.path.lexists(self.checkout / rel) != (rel in self.tool_hashes):
+                raise Failure(2, "freshness", "checker/policy inputs changed during check")
+        for p, h in self.tool_hashes.items():
+            regular(self.checkout / p, "freshness")
+            if digest(self.checkout / p) != h:
+                raise Failure(2, "freshness", "checker/policy inputs changed during check")
+        if "rootManifest" in self.preflight and verify_root_manifest(self.checkout) != self.preflight["rootManifest"]:
+            raise Failure(2, "freshness", "root manifest or covered files changed during check")
+        if "leanMiriPin" in self.preflight and verify_lean_miri_pin(self.checkout) != self.preflight["leanMiriPin"]:
+            raise Failure(2, "freshness", "lean-miri pin or vendor tree changed during check")
         if digest(self.inspector) != self.inspector_hash:
             raise Failure(2, "freshness", "staged inspector changed")
         for path, expected in self.expected_artifacts.items():
@@ -1043,6 +1068,7 @@ class Checker:
         preflight_hashes = {rel: summary["sha256"] for rel, summary in ((ROOT_MANIFEST_RELPATH, root_manifest),
                                                                       (LEAN_MIRI_PIN_RELPATH, lean_miri_pin)) if summary}
         cargo_hashes = check_cargo_boundary(self.checkout) if (self.checkout / "Cargo.toml").exists() else {}
+        self.tool_hashes = {**cargo_hashes, **preflight_hashes}
         rust_waiver_audit = audit_waivers_and_vacuity(rustc_capture_sources(self.checkout), vacuity=False)
         self.tool_admission()
         trusted_waiver_audit = audit_waivers_and_vacuity(
@@ -5767,7 +5793,7 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
             if directory not in search_dirs:
                 search_dirs.append(directory)
         for soname in needed:
-            if "/" in soname or soname in ("", ".", ".."):
+            if "/" in soname or "\\" in soname or "$" in soname or soname in ("", ".", ".."):
                 problems.append(f"{rel}: DT_NEEDED entry {soname!r} is a path")
                 continue
             needs.append((rel, soname))
