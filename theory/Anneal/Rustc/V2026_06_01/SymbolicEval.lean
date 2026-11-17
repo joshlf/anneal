@@ -12346,6 +12346,29 @@ theorem execCfg_lookupSwitchTarget_of_matchSwitchCases {cfg : MirCfg} {joinBb : 
       · cases hCases
     · cases hCases
 
+/-- Statically known `switchTable` target for a **constant** discriminant (the N-way analogue of
+    `constCond?`): `lookupCfgSwitchTarget (wrap64 v) cases otherwiseBb` when `discrId` is interned as
+    `.const v`. Infeasible arms are then neither merged nor explored, so an arm that can never run
+    (e.g. one that asserts `false`) cannot make verification fail. -/
+def constSwitchTarget? (tbl : SymTable) (discrId : SymId) (cases : List (Nat × BlockId))
+    (otherwiseBb : BlockId) : Option BlockId :=
+  match tbl.nodes[discrId]? with
+  | some (.const v) => some (lookupCfgSwitchTarget (wrap64 v) cases otherwiseBb)
+  | _ => none
+
+theorem constSwitchTarget?_sound {tbl : SymTable} {discrId : SymId} {cases : List (Nat × BlockId)}
+    {otherwiseBb targetBb : BlockId} (hValid : ValidTable tbl)
+    (h : constSwitchTarget? tbl discrId cases otherwiseBb = some targetBb) (env : SymEnv) :
+    lookupCfgSwitchTarget (evalSymId tbl env discrId) cases otherwiseBb = targetBb := by
+  unfold constSwitchTarget? at h
+  split at h
+  · rename_i v hNode
+    injection h with hT
+    subst hT
+    rw [evalSymId_eq_evalSymNodeWith hValid env hNode]
+    rfl
+  · cases h
+
 /-- Path-splitting fallback for an unhinted N-way `switchTable`: evaluates each `(caseVal, targetBb)`
     under **that case's path condition** `discrId == wrap64 caseVal` (the same interned
     `.op2 .eq discrId (.const caseVal)` node `symExecSwitchTableJoin` uses for merged arms), and
@@ -12529,18 +12552,21 @@ def symEvalCfgGvn (cfg : MirCfg) (hints : JoinHints) :
           | none => none
           | some discrId =>
             let st₂ := st₁.ownerReadLoc discr
-            match switchTableMergePlan cfg hints cases otherwiseBb with
-            | some (caseArms, otherwiseStmts, joinBb, mask) =>
-              match fuel with
-              | 0 => none
-              | f + 1 =>
-                match symExecSwitchTableJoin st₂ discrId mask otherwiseStmts caseArms tbl₁ pc with
-                | none => none
-                | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
+            match constSwitchTarget? tbl₁ discrId cases otherwiseBb with
+            | some targetBb => symEvalCfgGvn cfg hints fuel targetBb st₂ tbl₁ pc
             | none =>
-              evalSwitchTableSplit
-                (fun targetBb tblIn pcIn => symEvalCfgGvn cfg hints fuel targetBb st₂ tblIn pcIn)
-                discrId pc cases otherwiseBb tbl₁
+              match switchTableMergePlan cfg hints cases otherwiseBb with
+              | some (caseArms, otherwiseStmts, joinBb, mask) =>
+                match fuel with
+                | 0 => none
+                | f + 1 =>
+                  match symExecSwitchTableJoin st₂ discrId mask otherwiseStmts caseArms tbl₁ pc with
+                  | none => none
+                  | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
+              | none =>
+                evalSwitchTableSplit
+                  (fun targetBb tblIn pcIn => symEvalCfgGvn cfg hints fuel targetBb st₂ tblIn pcIn)
+                  discrId pc cases otherwiseBb tbl₁
         | .ret retLoc =>
           match readSymScalar st₁ retLoc with
           | some retSymId => some ([retSymId], tbl₁)
@@ -12911,6 +12937,21 @@ theorem symEvalCfgGvn_under_sound (cfg : MirCfg) (hints : JoinHints) :
               rw [hTerm]
               dsimp only
               rw [readConcreteScalar_refines hR₁ hSpec.2]
+            cases hConst : constSwitchTarget? tbl₁ discrId cases otherwiseBb
+            case some targetBb =>
+              rw [hConst] at hEval
+              dsimp only at hEval
+              rcases symEvalCfgGvn_under_sound cfg hints fuel targetBb (st₁.ownerReadLoc discr)
+                tbl₁ pc rets tbl' hValid₁ hSt₂ hPcValid₁ hEval with ⟨hV', hE', hLt', hEv'⟩
+              refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
+              intro env cst hPc hR
+              rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+              rcases hEv' env (c₁.ownerReadLoc discr) hPc₁ (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
+              refine ⟨r, hr, ?_⟩
+              rw [hStepT env cst c₁ hC₁ hR₁, constSwitchTarget?_sound hValid₁ hConst env]
+              exact hExec
+            rw [hConst] at hEval
+            dsimp only at hEval
             cases hPlan : switchTableMergePlan cfg hints cases otherwiseBb with
             | none =>
               rw [hPlan] at hEval
@@ -13424,6 +13465,35 @@ theorem switchCaseAssert_concrete_sound (env : SymEnv) :
       (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
       .ret ((ExprTree.var 0).eval env) :=
   checkCfgAgainstTree_sound switchCase_pathCond_verified.1 diamondInitSymTable_valid
+    diamondInitSymState_valid env _ (StateRefines.refl _)
+
+/-- `switchTable` on a **constant** discriminant (`_2 := 5; switchTable _2 [(3, bb1)] bb2`), whose
+    infeasible `3 =>` arm asserts `false` (`_2 := 0; assert _2`). Exploring or merging that arm would
+    reject the CFG; `constSwitchTarget?` folds the switch to `bb2`. -/
+def constSwitchTableCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [ .storageLive 2, .assign 2 (.const 5) ], term := .switchTable 2 [(3, 1)] 2 },
+        { stmts := [ .assign 2 (.const 0), .assert 2 ], term := .ret 0 },
+        { stmts := [], term := .ret 0 } ] }
+
+/-- **Constant-discriminant `switchTable` folding (`constSwitchTable_folded_verified`)**: with and
+    without join hints, the evaluator follows only the statically selected target (**1** path), so
+    the infeasible arm's `assert false` is never explored; the CFG returns `_0`. -/
+theorem constSwitchTable_folded_verified :
+    checkCfgAgainstTree constSwitchTableCfg noJoinHints 2 0 diamondInitSymState
+        diamondInitSymTable (.var 0) = true ∧
+      (symEvalCfgGvn constSwitchTableCfg noJoinHints 2 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => res.1.length) = some 1 ∧
+      (symEvalCfgGvn constSwitchTableCfg (fun bb => if bb == 2 then some [true, true, false] else none)
+        2 0 diamondInitSymState diamondInitSymTable).map (fun res => res.1.length) = some 1 := by
+  decide +kernel
+
+/-- Concrete corollary: for every `env`, the constant-discriminant `switchTable` returns `_0`. -/
+theorem constSwitchTable_concrete_sound (env : SymEnv) :
+    execCfg constSwitchTableCfg 2 0
+      (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
+      .ret ((ExprTree.var 0).eval env) :=
+  checkCfgAgainstTree_sound constSwitchTable_folded_verified.1 diamondInitSymTable_valid
     diamondInitSymState_valid env _ (StateRefines.refl _)
 
 /-- 3-way `switchTable` on `_1` (`3 => bb1 | 5 => bb2 | otherwise => bb3`) converging at `bb4`:
