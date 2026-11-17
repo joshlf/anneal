@@ -14,15 +14,16 @@ import Anneal.SparseRetagAndVcNarrowPrototype
 
 1. Co-imports `Anneal` and `Anneal.SparseRetagAndVcNarrowPrototype` to prove zero global constant /
    `DecidableEq` instance collisions.
-2. Instantiates positive and negative canaries across all 4 subsystems (Part A `SparseRetagAttrIndex`,
-   Part B `BatchedVcConeNarrowCert` + `hoistTraitImpls` + `@[irreducible] coerceValueAt`,
-   Part C `DemandCallerLocationEnv` + `AllocRenamingRel`, Part D `LazyWriteChain` + `bvShiftSafe` /
-   `shiftLeftBitsSafe`).
-3. Measures kernel/elaborator `IO.getNumHeartbeats` scaling tables across `M ∈ {16, 64, 128, 256}`,
-   `S ∈ {16, 64, 128}`, `N ∈ {16, 64}`, and `shift = 2^64`.
-4. Runs a self-enforcing bottom-of-file `run_cmd` audit verifying `0` `unsafe`, `0` `Classical.choice`,
-   `0` `Lean.ofReduceBool`, `0` `sorryAx`, `0` leaked constants (`leaked.isEmpty`), and `100%`
-   theorem reachability (`unreached.isEmpty`).
+2. Instantiates positive and negative canaries across all 4 subsystems with concrete arguments
+   (no `have _ := @thm` placeholders: the bottom-of-file audit rejects any test proof that binds a
+   prototype theorem without using it).
+3. Measures kernel `IO.getNumHeartbeats` / wall-clock scaling with ONE evaluation mechanism
+   (`decide +kernel`) for both arms of every comparison, including one-time preparation /
+   certificate costs in the optimized arm.
+4. Runs a self-enforcing bottom-of-file `run_cmd` audit verifying `0` `unsafe`, `0`
+   `Classical.choice`, `0` `Lean.ofReduceBool`, `0` `sorryAx`, `0` leaked constants
+   (`leaked.isEmpty`), `0` placeholder-only theorem uses, and `100%` theorem reachability
+   (`unreached.isEmpty`).
 -/
 
 set_option Elab.async false
@@ -87,9 +88,17 @@ def dupRetagRows : List RetagQueryRow :=
 def oobRetagRows : List RetagQueryRow :=
   [ ⟨0, "a", true⟩, ⟨12, "oob", false⟩ ]
 
+/-- The prepared index of `sampleRetagRows` (extracted from the `Except`). -/
+def sampleIdx : SparseRetagAttrIndex :=
+  match prepareSparseRetagIndex 10 sampleRetagRows with
+  | .ok idx => idx
+  | .error _ => ⟨.empty, 0⟩
+
+theorem sampleIdx_prepared : prepareSparseRetagIndex 10 sampleRetagRows = .ok sampleIdx := rfl
+
 /-- Positive and negative canaries for `SparseRetagAttrIndex`, exercising every `RetagAttrErr`
-variant, `lookupSparseRetag_eq_linearScan`, `frameAbsent_precedes_malformedTable`,
-`lookupSparseRetag_cert`, `lookupSparseRetag_miss_cert`, and `SparseDefPathRetagIndex`. -/
+variant, `lookupSparseRetag_eq_linearScan`, `frameAbsent_precedes_malformedTable`, the hit/miss
+certificates on the *actual* prepared index, and `SparseDefPathRetagIndex`. -/
 theorem test_partA_sparseRetag_canaries :
     trieLookupBits (.empty : BitTrie Bool) [true, false] 1 = none ∧
     trieLookupBits (trieInsertBits (.empty : BitTrie Bool) [true] 1 true) [true] 1 = some true ∧
@@ -98,7 +107,8 @@ theorem test_partA_sparseRetag_canaries :
     (NatBitTrie.empty : NatBitTrie Bool).get? 3 = none ∧
     ((NatBitTrie.empty : NatBitTrie Bool).insert 3 true).get? 3 = some true ∧
     SparseRetagAttrIndex.get? ⟨.empty, 0⟩ 0 = none ∧
-    evalPreparedRetagLookup (prepareSparseRetagLoop 10 .empty 0 sampleRetagRows) 3 = .ok true ∧
+    evalPreparedRetagLookup (prepareSparseRetagLoop 10 .empty 0 sampleRetagRows) 3 =
+      linearScanLoop 10 3 [] ((NatBitTrie.empty : NatBitTrie Bool).get? 3) sampleRetagRows ∧
     lookupSparseRetag 10 (prepareSparseRetagIndex 10 sampleRetagRows) 3 =
       linearScanRetagAttr 10 sampleRetagRows 3 ∧
     lookupSparseRetag 10 (prepareSparseRetagIndex 10 sampleRetagRows) 7 = .ok false ∧
@@ -109,20 +119,6 @@ theorem test_partA_sparseRetag_canaries :
     (SparseDefPathRetagIndex.mk .empty).get? "x" = none ∧
     ((SparseDefPathRetagIndex.mk .empty).insert "alloc::boxed::Box::new" true).get?
       "alloc::boxed::Box::new" = some true := by
-  have _ := @trieLookupBits_empty
-  have _ := @trieLookupBits_insert_same
-  have _ := @trieLookupBits_insert_diff
-  have _ := @natLowBits_length
-  have _ := @NatBitTrie.get?_empty
-  have _ := @NatBitTrie.get?_insert
-  have _ := @SparseRetagAttrIndex.get?_eq
-  have _ := @prepareSparseRetagLoop_lookup_eq
-  have _ := @lookupSparseRetag_eq_linearScan
-  have _ := @frameAbsent_precedes_malformedTable
-  have _ := @lookupSparseRetag_cert
-  have _ := @lookupSparseRetag_miss_cert
-  have _ := @SparseDefPathRetagIndex.get?_empty
-  have _ := @SparseDefPathRetagIndex.get?_insert
   refine ⟨trieLookupBits_empty [true, false] 1,
     by rw [trieLookupBits_insert_same]; rfl,
     by rw [trieLookupBits_insert_diff [true] [false] .empty 1 true 0 rfl (by decide)]; rfl,
@@ -130,20 +126,18 @@ theorem test_partA_sparseRetag_canaries :
     NatBitTrie.get?_empty 3,
     by rw [NatBitTrie.get?_insert]; rfl,
     by rw [SparseRetagAttrIndex.get?_eq]; rfl,
-    by rw [prepareSparseRetagLoop_lookup_eq 10 3 sampleRetagRows [] .empty 0 (fun _ => rfl)]; rfl,
+    prepareSparseRetagLoop_lookup_eq 10 3 sampleRetagRows [] .empty 0 (fun _ => rfl),
     lookupSparseRetag_eq_linearScan 10 sampleRetagRows 3,
-    by with_unfolding_all rfl,
-    by with_unfolding_all rfl,
-    by with_unfolding_all rfl,
-    by with_unfolding_all rfl,
+    by rw [sampleIdx_prepared]; exact lookupSparseRetag_cert (by decide) rfl,
+    by rw [sampleIdx_prepared]; exact lookupSparseRetag_miss_cert (by decide) rfl,
+    by rw [lookupSparseRetag_eq_linearScan]; rfl,
+    by rw [lookupSparseRetag_eq_linearScan]; rfl,
     frameAbsent_precedes_malformedTable (Nat.le_refl 10) .duplicateDefQuery,
     SparseDefPathRetagIndex.get?_empty "x",
     by rw [SparseDefPathRetagIndex.get?_insert]; rfl⟩
 
-/-- Concrete MIR state with a mutable reference `_1 : &mut u32` borrowed from `_2 : u32` (`tag = 1`)
-to test `evalFnEntryRetagWithSparseAttr` permission selection (`.reservedFrz false` when
-`rustcNoWritable = true` vs. `.unique` when `rustcNoWritable = false` and `implicitWrites = true`)
-and demand-locality on malformed tables. -/
+/-- Concrete MIR state with a mutable reference `_1 : &mut u32` borrowed from `_2 : u32`
+(`tag = 1`). -/
 def protoRefMutU32Ty : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
 
 def protoRetagLocalDecls : List LocalDecl :=
@@ -171,6 +165,63 @@ def protoRetagMachineState : MachineState :=
 def protoFnEntryRetagStmt : Statement := ⟨.retag .fnEntry ⟨1, []⟩, "retag:fnEntry"⟩
 def protoDefaultRetagStmt : Statement := ⟨.retag .default ⟨1, []⟩, "retag:default"⟩
 
+/-- Zero-sized `_1 : &mut ()` (non-null dangling scalar) with an unrelated live borrow entry at
+the head of `borrows`: its fn-entry retag creates no child tag in `Trusted` semantics. -/
+def protoZstRefTy : Ty := { kind := .ref .mut (.tuple []), layoutIdx := 0 }
+
+def protoZstLocalDecls : List LocalDecl :=
+  [ ⟨.mut, protoU32Ty, some "_0"⟩, ⟨.mut, protoZstRefTy, some "_1"⟩ ]
+
+def protoZstMachineState : MachineState :=
+  { frame :=
+      { locals := [ .init (.scalar ⟨0, 4⟩), .init (.scalar ⟨1, 8⟩) ]
+        blockIdx := 0
+        stmtIdx := 0 }
+    memory :=
+      { emptyMemory with
+        borrows := [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .reservedFrz false }]
+        nextTag := 2
+        nextProtector := 1 } }
+
+/-- `some true` iff the head borrow entry of the successor state is `.unique`. -/
+def headPermIsUnique (node : MirStepNode) : Option Bool :=
+  match node with
+  | .tau (.running s') =>
+    match s'.memory.borrows with
+    | head :: _ => some (match head.perm with | .unique => true | _ => false)
+    | [] => none
+  | _ => none
+
+/-- The `[adv A0]` overlay (kept verbatim here only as a regression witness): it rewrote the
+head borrow entry whatever it was. -/
+def applyImplicitWriteUpgradeLegacyA0 (node : MirStepNode) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (place : Place) (implicitWrites rustcNoWritable : Bool) :
+    MirStepNode :=
+  match implicitWrites && !rustcNoWritable with
+  | false => node
+  | true =>
+    match placeTy localDecls layouts place with
+    | some { kind := .ref .mut _, .. } =>
+      match node with
+      | .tau (.running s') =>
+        match s'.memory.borrows with
+        | head :: tail =>
+          MirStepNode.step
+            { s' with memory := { s'.memory with borrows := { head with perm := .unique } :: tail } }
+        | [] => node
+      | _ => node
+    | _ => node
+
+/-- Successor state of the ZST fn-entry retag. -/
+def protoZstAfter : MachineState :=
+  match evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts with
+  | .tau (.running s') => s'
+  | _ => protoZstMachineState
+
+theorem protoZst_step :
+    evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts =
+      .tau (.running protoZstAfter) := rfl
+
 theorem test_partA_operational_retag_overlay :
     fnEntryRetagPermWithAttr .mut (.uint .u32) true true =
       fnEntryRetagPerm .mut (.uint .u32) ∧
@@ -188,7 +239,19 @@ theorem test_partA_operational_retag_overlay :
       evalStmt protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts ∧
     evalFnEntryRetagWithSparseAttr 10 (prepareSparseRetagIndex 10 sampleRetagRows) true 3
         protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts =
-      evalStmt protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts := by
+      evalStmt protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts ∧
+    headPermIsUnique (evalFnEntryRetagWithSparseAttr 10 (prepareSparseRetagIndex 10 sampleRetagRows)
+      true 7 protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts) = some true ∧
+    headPermIsUnique (evalFnEntryRetagWithSparseAttr 10 (prepareSparseRetagIndex 10 sampleRetagRows)
+      true 3 protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts) = some false ∧
+    evalFnEntryRetagWithSparseAttr 10 (prepareSparseRetagIndex 10 sampleRetagRows) true 7
+        protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts =
+      evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts ∧
+    headPermIsUnique (evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls
+      protoLayouts) = some false ∧
+    headPermIsUnique (applyImplicitWriteUpgradeLegacyA0
+      (evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts)
+      protoZstLocalDecls protoLayouts ⟨1, []⟩ true false) = some true := by
   refine ⟨fnEntryRetagPermWithAttr_noWritable .mut (.uint .u32) true,
     fnEntryRetagPermWithAttr_implicitWrites_false .mut (.uint .u32) false,
     evalFnEntryRetagWithSparseAttr_eq_linear 10 sampleRetagRows true 7
@@ -200,59 +263,55 @@ theorem test_partA_operational_retag_overlay :
     evalFnEntryRetagWithSparseAttr_rustcNoWritable_true 10
       (prepareSparseRetagIndex 10 sampleRetagRows) true 3
       protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts
-      (lookupSparseRetag_cert (by decide) rfl)⟩
+      (by rw [sampleIdx_prepared]; exact lookupSparseRetag_cert (by decide) rfl),
+    by decide +kernel, by decide +kernel, ?_, by decide +kernel, by decide +kernel⟩
+  have hq : lookupSparseRetag 10 (prepareSparseRetagIndex 10 sampleRetagRows) 7 = .ok false := by
+    rw [sampleIdx_prepared]
+    exact lookupSparseRetag_cert (by decide) rfl
+  unfold evalFnEntryRetagWithSparseAttr evalStmtWithRetagAttrOracle
+  show (match lookupSparseRetag 10 (prepareSparseRetagIndex 10 sampleRetagRows) 7 with
+      | .error _ => MirStepNode.unsupported
+      | .ok noWritable =>
+        applyImplicitWriteUpgrade protoZstMachineState.memory.nextTag
+          (evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts)
+          protoZstLocalDecls protoLayouts ⟨1, []⟩ true noWritable) = _
+  rw [hq]
+  show applyImplicitWriteUpgrade protoZstMachineState.memory.nextTag
+      (evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts)
+      protoZstLocalDecls protoLayouts ⟨1, []⟩ true false = _
+  rw [protoZst_step]
+  exact applyImplicitWriteUpgrade_of_no_fresh_child _ protoZstAfter _ _ _ _ _ rfl
 
-/-! ## 3. Part A Heartbeat Scaling Benchmarks (`M ∈ {16, 64, 128, 256}`) -/
+/-! ## 3. Part A Heartbeat Scaling (`M ∈ {16, 64, 128, 256}`)
+
+Both arms are evaluated by `decide +kernel`. The sparse arm *includes* the one-time
+`prepareSparseRetagIndex` table preparation (`M` trie insertions with `O(log D)` duplicate
+checks); the linear arm is the reference oracle, which re-validates the whole table (with its
+list-based duplicate scan) on every query, exactly like `lean-miri`'s pre-#68 `rustcNoWritable`. -/
 
 def buildRetagRows : Nat → List RetagQueryRow
   | 0 => []
   | k + 1 => ⟨k, "crate::retag_fn", k % 2 == 0⟩ :: buildRetagRows k
-
-/-- Construct the exact 12-bit binary radix trie for keys `0 ..< maxKey` top-down so lazy kernel
-WHNF only forces the $O(\log M)$ path along a queried key rather than re-running $M$ insertions on
-every theorem invocation. Proved definitionally equal (`rfl`) to `prepareSparseRetagIndex`. -/
-def mkDirectBitTrie : Nat → Nat → Nat → Nat → BitTrie Bool
-  | 0, maxKey, curKey, _ =>
-    if curKey < maxKey then .leaf [(curKey, curKey % 2 == 0)] else .empty
-  | d + 1, maxKey, curKey, stride =>
-    if !(curKey < maxKey) then .empty
-    else
-      .branch
-        (mkDirectBitTrie d maxKey curKey (stride * 2))
-        (mkDirectBitTrie d maxKey (curKey + stride) (stride * 2))
-
-def buildSparseIndex (m : Nat) : SparseRetagAttrIndex :=
-  ⟨⟨mkDirectBitTrie defaultRetagTrieDepth m 0 1⟩, m⟩
-
-theorem prepareSparseRetagIndex_eq_buildSparseIndex_16 :
-    prepareSparseRetagIndex 512 (buildRetagRows 16) = .ok (buildSparseIndex 16) := rfl
-
-def retagRows16 : List RetagQueryRow := buildRetagRows 16
-def retagRows64 : List RetagQueryRow := buildRetagRows 64
-def retagRows128 : List RetagQueryRow := buildRetagRows 128
-def retagRows256 : List RetagQueryRow := buildRetagRows 256
-
-def sparseIdx16 : SparseRetagAttrIndex := buildSparseIndex 16
-def sparseIdx64 : SparseRetagAttrIndex := buildSparseIndex 64
-def sparseIdx128 : SparseRetagAttrIndex := buildSparseIndex 128
-def sparseIdx256 : SparseRetagAttrIndex := buildSparseIndex 256
 
 def retagResOkEq (r : Except RetagAttrErr Bool) (expected : Bool) : Bool :=
   match r with
   | .ok b => b == expected
   | .error _ => false
 
+/-- `q` linear-oracle queries for ids `0 ..< q`. -/
 def runLinearRetagBench (definitionCount : Nat) (rows : List RetagQueryRow) : Nat → Bool
   | 0 => true
   | q + 1 =>
     retagResOkEq (linearScanRetagAttr definitionCount rows q) (q % 2 == 0) &&
       runLinearRetagBench definitionCount rows q
 
-def runSparseRetagBench (definitionCount : Nat) (idx : SparseRetagAttrIndex) : Nat → Bool
+/-- `q` sparse queries for ids `0 ..< q` against one prepared index. -/
+def runSparseQueries (definitionCount : Nat) (prepared : Except RetagAttrErr SparseRetagAttrIndex) :
+    Nat → Bool
   | 0 => true
   | q + 1 =>
-    retagResOkEq (lookupSparseRetag definitionCount (.ok idx) q) (q % 2 == 0) &&
-      runSparseRetagBench definitionCount idx q
+    retagResOkEq (lookupSparseRetag definitionCount prepared q) (q % 2 == 0) &&
+      runSparseQueries definitionCount prepared q
 
 open Lean Elab Command in
 run_cmd do
@@ -264,57 +323,103 @@ run_cmd do
     let t1 ← IO.monoNanosNow
     let h1 ← IO.getNumHeartbeats
     logInfo m!"BENCH {label} heartbeats={h1 - h0} ns={t1 - t0}"
-  bench "PartA_linear_M16" `(command|
-    theorem bench_partA_linear_16 :
-        runLinearRetagBench 512 retagRows16 1 = true := rfl)
-  bench "PartA_sparse_M16" `(command|
-    theorem bench_partA_sparse_16 :
-        runSparseRetagBench 512 sparseIdx16 1 = true := by with_unfolding_all rfl)
-  bench "PartA_linear_M64" `(command|
-    theorem bench_partA_linear_64 :
-        runLinearRetagBench 512 retagRows64 1 = true := rfl)
-  bench "PartA_sparse_M64" `(command|
-    theorem bench_partA_sparse_64 :
-        runSparseRetagBench 512 sparseIdx64 1 = true := by with_unfolding_all rfl)
-  bench "PartA_linear_M128" `(command|
-    theorem bench_partA_linear_128 :
-        runLinearRetagBench 512 retagRows128 1 = true := rfl)
-  bench "PartA_sparse_M128" `(command|
-    theorem bench_partA_sparse_128 :
-        runSparseRetagBench 512 sparseIdx128 1 = true := by with_unfolding_all rfl)
-  bench "PartA_linear_M256" `(command|
-    theorem bench_partA_linear_256 :
-        runLinearRetagBench 512 retagRows256 1 = true := rfl)
-  bench "PartA_sparse_M256" `(command|
-    theorem bench_partA_sparse_256 :
-        runSparseRetagBench 512 sparseIdx256 1 = true := by with_unfolding_all rfl)
+  bench "PartA_linear_q1_M16" `(command|
+    theorem bench_partA_linear_q1_16 :
+        runLinearRetagBench 512 (buildRetagRows 16) 1 = true := by decide +kernel)
+  bench "PartA_sparse_prep_q1_M16" `(command|
+    theorem bench_partA_sparse_q1_16 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 16)) 1 = true := by
+      decide +kernel)
+  bench "PartA_sparse_prep_qM_M16" `(command|
+    theorem bench_partA_sparse_qM_16 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 16)) 16 = true := by
+      decide +kernel)
+  bench "PartA_linear_q1_M64" `(command|
+    theorem bench_partA_linear_q1_64 :
+        runLinearRetagBench 512 (buildRetagRows 64) 1 = true := by decide +kernel)
+  bench "PartA_sparse_prep_q1_M64" `(command|
+    theorem bench_partA_sparse_q1_64 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 64)) 1 = true := by
+      decide +kernel)
+  bench "PartA_sparse_prep_qM_M64" `(command|
+    theorem bench_partA_sparse_qM_64 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 64)) 64 = true := by
+      decide +kernel)
+  bench "PartA_linear_q1_M128" `(command|
+    theorem bench_partA_linear_q1_128 :
+        runLinearRetagBench 512 (buildRetagRows 128) 1 = true := by decide +kernel)
+  bench "PartA_sparse_prep_q1_M128" `(command|
+    theorem bench_partA_sparse_q1_128 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 128)) 1 = true := by
+      decide +kernel)
+  bench "PartA_sparse_prep_qM_M128" `(command|
+    theorem bench_partA_sparse_qM_128 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 128)) 128 = true := by
+      decide +kernel)
+  bench "PartA_linear_q1_M256" `(command|
+    theorem bench_partA_linear_q1_256 :
+        runLinearRetagBench 512 (buildRetagRows 256) 1 = true := by decide +kernel)
+  bench "PartA_sparse_prep_q1_M256" `(command|
+    theorem bench_partA_sparse_q1_256 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 256)) 1 = true := by
+      decide +kernel)
+  bench "PartA_sparse_prep_qM_M256" `(command|
+    theorem bench_partA_sparse_qM_256 :
+        runSparseQueries 512 (prepareSparseRetagIndex 512 (buildRetagRows 256)) 256 = true := by
+      decide +kernel)
 
-/-! ## 4. Part B Witnesses, Canaries, & Scaling Benchmarks (`BatchedVcConeNarrowCert` + `coerceValueAt`) -/
+/-! ## 4. Part B Witnesses, Canaries, & Scaling (`BatchedVcConeNarrowCert` + `coerceValueAt`) -/
+
+/-- The `[adv A0]` callee-agreement "check" (metadata only: `defPath`, `argCount`,
+`typeParamCount`, block count), kept here as a regression witness: it ACCEPTS the same-shape
+shadowing narrowing that `checkMaskKeepsFirstMatch` rejects, although the exposed body differs. -/
+def checkCalleesAgreeOnLegacyA0 (cone : List DefPath) (c₁ c₂ : List CapturedMir) : Bool :=
+  cone.all (fun dp =>
+    match findCallee? c₁ dp, findCallee? c₂ dp with
+    | none, none => true
+    | some b₁, some b₂ =>
+      stringEq b₁.defPath b₂.defPath &&
+        decide (b₁.argCount = b₂.argCount) &&
+        decide (b₁.typeParamCount = b₂.typeParamCount) &&
+        decide (b₁.basicBlocks.length = b₂.basicBlocks.length)
+    | _, _ => false)
+
+/-- Leaf result extractor. -/
+def leafBits (out : MirOutcome) : Option Nat :=
+  match out with
+  | .normal (.scalar sc, _) => some sc.bits
+  | _ => none
 
 theorem test_partB_batchedVcNarrow_and_coerceValueAt :
     hoistTraitImpls (stripCalleeTraitImpls protoNaiveNarrowCallees) [] ++
         flatMapTraitImpls (stripCalleeTraitImpls protoNaiveNarrowCallees) =
       [] ++ flatMapTraitImpls (stripCalleeTraitImpls protoNaiveNarrowCallees) ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).callees =
+      protoNaiveNarrowCallees ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).traitImpls =
+      protoHoistedExtra ∧
     lookupCallee protoFullCallees protoLayouts "proto::Area::area" [protoCircleTy] [] =
       lookupCallee protoNaiveNarrowCallees protoLayouts "proto::Area::area" [protoCircleTy]
         protoHoistedExtra ∧
     runMirExecBounded 12 traitCallRootMir
         (.running (MachineState.mapMem
           (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra)
-          (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-            emptyMemory protoFullCallees))) =
-      (runMirExecBounded 12 traitCallRootMir
-        (.running (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-          emptyMemory protoFullCallees))).map
+          protoTraitInitState)) =
+      (runMirExecBounded 12 traitCallRootMir (.running protoTraitInitState)).map
         (MirOutcome.mapMem (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra)) ∧
-    (vcMirWithCallees 12 traitCallRootMir
-        (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees)
+    (vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir protoTraitInitState
         protoNaiveNarrowCallees protoHoistedExtra [] protoTraitCone
         (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) ↔
-      vcMirWithCallees 12 traitCallRootMir
-        (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees)
+      vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir protoTraitInitState
         protoFullCallees [] [] protoTraitCone
         (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) ∧
+    (wpMirExecExt (fun _ _ _ => True) protoTraitCone [] 12 traitCallRootMir
+        (.running protoTraitInitState)
+        (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) ↔
+      wpMirExecSym 12 traitCallRootMir (.running protoTraitInitState)
+        (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) ∧
+    checkCalleesAgreeOnLegacyA0 protoTraitCone protoShadowFullCallees
+      (selectByMask protoShadowFullCallees protoShadowBadMask) = true ∧
     coerceValueAt protoLayouts (.uint .u32) (.scalar ⟨42, 4⟩) =
       some (.scalar ⟨wrapScalarBits 42 (scalarModulus 4), 4⟩) ∧
     coerceValueAt protoLayouts .bool (.scalar (boolToScalar true)) =
@@ -327,88 +432,131 @@ theorem test_partB_batchedVcNarrow_and_coerceValueAt :
     coerceValueAt protoLayouts (.uint .u32)
         (.scalar ⟨wrapScalarBits 42 (scalarModulus 4), 4⟩) =
       some (.scalar ⟨wrapScalarBits 42 (scalarModulus 4), 4⟩) := by
-  have _ := @flatMapTraitImpls_stripCalleeTraitImpls
-  have _ := @hoistTraitImpls_append_strip
-  have _ := @Memory.withCalleesAndTraits_callees
-  have _ := @Memory.withCalleesAndTraits_traitImpls
-  have _ := @Memory.withCalleesAndTraits_activeCallee
-  have _ := @Memory.withCalleesAndTraits_activeProtectors
-  have _ := @Memory.withCalleesAndTraits_borrows
-  have _ := @Memory.withCalleesAndTraits_callStack
-  have _ := @Memory.withCalleesAndTraits_callerLocals
-  have _ := @Memory.withCalleesAndTraits_fnPtrs
-  have _ := @Memory.withCalleesAndTraits_globals
-  have _ := @Memory.withCalleesAndTraits_eq_withCalleeCtx
-  have _ := @MachineState.withCalleesAndTraits_eq_withCalleeCtx
-  have _ := @Memory.withCalleesAndTraits_comp_withCalleeCtx
-  have _ := @evalStmt_withCalleesAndTraits
-  have _ := @unwindFromCallStack_withCalleesAndTraits
-  have _ := @applyUnwindAction_withCalleesAndTraits
-  have _ := @commitForeignFrameLocals_withCalleesAndTraits
-  have _ := @foreignFrameDerefWrite_withCalleesAndTraits
-  have _ := @writeReturnDestination_withCalleesAndTraits
-  have _ := @evalTerminator_return_withCalleesAndTraits
-  have _ := @writeIntrinsicReturn_withCalleesAndTraits
-  have _ := @evalNonSelectIntrinsicCall_withCalleesAndTraits
-  have _ := @evalDirectRustIntrinsic?_withCalleesAndTraits_of_nonSelect
-  have _ := @collectMatchingTraitImpls_filter_defPath
-  have _ := @hasTraitImplForDefPath_eq_of_filter_eq
-  have _ := @collectMatchingTraitImpls_congr_callees
-  have _ := @upsertMatchingTraitImpl_mem_fst
-  have _ := @collectMatchingTraitImpls_mem_fst
-  have _ := @filterMostSpecificTraitImpls_sub
-  have _ := @resolveCalleeNonParam?_congr
-  have _ := @resolveCalleeBodyAndArgs?_eq_of_traitConeAgree
-  have _ := @lookupCallee_eq_of_traitConeAgree
-  have _ := @resolveCalleeBodyAndArgs?_origin
-  have _ := @lookupCallee_origin
-  have _ := @inConeSetPoly_of_lookup_trait
-  have _ := @TraitConeAgreeOn.refl
-  have _ := @lookupCallee_eq_of_traitConeAgreeOn
-  have _ := @evalTerminator_withCalleesAndTraits
-  have _ := @stepMirFn_withCalleesAndTraits
-  have _ := @stepMirFn_calleesAndTraits_preserved
-  have _ := @traitAgreesAt_succ
-  have _ := @runMirExecBounded_trait_cone_narrow
-  have _ := @wpMirExecSym_trait_cone_narrow
-  have _ := @stepConeSafeTrait_of_closedInvPoly
-  have _ := @nodeSuccs_evalTerminatorTrait
-  have _ := @nodeSuccs_stepMirFnTrait
-  have _ := @coneReach_of_closedInvTrait
-  have _ := @traitImplConeClosed_imp
-  have _ := @BatchedVcConeNarrowCert.rootInCone
-  have _ := @BatchedVcConeNarrowCert.coneBodiesInCone
-  have _ := @BatchedVcConeNarrowCert.traitImplsInCone
-  have _ := @BatchedVcConeNarrowCert.toTraitConeAgreeOn
-  have _ := @BatchedVcConeNarrowCert.untrustedAdmissible
-  have _ := @lookupCallee_eq_of_batchedCert
-  have _ := @runMirExecBounded_narrow_of_batchedCert
-  have _ := @wpMirExecSym_narrow_of_batchedCert
-  have _ := @vcMirWithCallees_narrow_of_batchedCert
-  have _ := @canary_naiveNarrow_breaks_trait_dispatch
-  have _ := @protoTraitBatchedCert
-  have _ := @canary_traitDispatch_preserved_under_batchedVcNarrow
-  have _ := @canary_duplicateShadow_rejected
-  have _ := @canary_externalShadowsInternal_rejected
-  have _ := @canary_missingTraitImplBody_rejected
   refine ⟨hoistTraitImpls_append_strip (stripCalleeTraitImpls protoNaiveNarrowCallees) []
       protoNaiveNarrowCallees,
+    Memory.withCalleesAndTraits_callees _ _ _,
+    Memory.withCalleesAndTraits_traitImpls _ _ _,
     lookupCallee_eq_of_batchedCert protoTraitBatchedCert protoLayouts
       (List.Mem.tail _ (List.Mem.head _)) [protoCircleTy],
-    runMirExecBounded_narrow_of_batchedCert protoTraitBatchedCert 12
-      (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees)
+    runMirExecBounded_narrow_of_batchedCert protoTraitBatchedCert 12 protoTraitInitState
       rfl rfl rfl rfl,
-    (vcMirWithCallees_narrow_of_batchedCert protoTraitBatchedCert 12
-      (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees)
-      rfl rfl rfl rfl
+    vcMirWithCallees_narrow_of_batchedCert protoTraitBatchedCert (fun _ _ _ => True) 12
+      protoTraitInitState rfl rfl rfl rfl
       (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)
-      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)).1,
+      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+      (fun _ _ _ => Iff.rfl),
+    wpMirExecExt_nil_iff (fun _ _ _ => True) protoTraitCone traitCallRootMir _ 12 _,
+    by decide +kernel,
     coerceValueAt_u32 protoLayouts 42,
     coerceValueAt_bool protoLayouts true,
     coerceValueAt_ref protoLayouts .not (.uint .u32) { allocId := 1, offsetBytes := 0 },
     coerceValueAt_adt_exact protoLayouts "proto::Circle" [] 0 [.scalar ⟨7, 4⟩],
     coerceValueAt_idempotent protoLayouts (.uint .u32) (.scalar ⟨42, 4⟩)
       (.scalar ⟨wrapScalarBits 42 (scalarModulus 4), 4⟩) (coerceValueAt_u32 protoLayouts 42)⟩
+
+/-- The plain havoc WP implies the contract-aware VC (summaries only weaken obligations). -/
+theorem test_partB_summary_weakening
+    (h : wpMirExecSym 12 traitCallRootMir (.running protoTraitInitState)
+      (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) :
+    wpMirExecExt protoExtContracts protoTraitCone [⟨"proto::poly", 7⟩] 12 traitCallRootMir
+      (.running protoTraitInitState)
+      (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) :=
+  wpMirExecExt_of_wpMirExecSym _ _ _ _ _ 12 _ h
+
+/-- Memory-frame simp lemmas of `Memory.withCalleesAndTraits`, instantiated concretely. -/
+theorem test_partB_memory_frame_lemmas :
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).borrows =
+      emptyMemory.borrows ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).globals =
+      emptyMemory.globals ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).callerLocals =
+      emptyMemory.callerLocals ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).fnPtrs =
+      emptyMemory.fnPtrs ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).callStack =
+      emptyMemory.callStack ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).activeCallee =
+      emptyMemory.activeCallee ∧
+    (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory).activeProtectors =
+      emptyMemory.activeProtectors ∧
+    Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra emptyMemory =
+      Memory.withCalleeCtx protoNaiveNarrowCallees emptyMemory.activeCallee protoHoistedExtra
+        emptyMemory :=
+  ⟨Memory.withCalleesAndTraits_borrows _ _ _, Memory.withCalleesAndTraits_globals _ _ _,
+    Memory.withCalleesAndTraits_callerLocals _ _ _, Memory.withCalleesAndTraits_fnPtrs _ _ _,
+    Memory.withCalleesAndTraits_callStack _ _ _, Memory.withCalleesAndTraits_activeCallee _ _ _,
+    Memory.withCalleesAndTraits_activeProtectors _ _ _,
+    Memory.withCalleesAndTraits_eq_withCalleeCtx _ _ _⟩
+
+/-- The theory-file canaries, re-exported conjunct by conjunct (each is *used*, not merely
+named): naive narrowing breaks trait dispatch, the certified narrowing preserves the exact result,
+every negative certificate is rejected, and the external summary is load-bearing in the VC. -/
+theorem test_partB_canaries :
+    lookupCallee protoNaiveNarrowCallees protoLayouts "proto::Area::area" [protoCircleTy] [] = none ∧
+    CallConeClosedPoly protoTraitCone traitCallRootMir protoFullCallees [] = false ∧
+    ((runMirExecBounded 12 traitCallRootMir
+        (.running (MachineState.mapMem
+          (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra)
+          protoTraitInitState))).map
+      (fun out => match out with | .normal (v, _) => some v | _ => none)) =
+      some (some (Value.scalar ⟨31, 4⟩)) ∧
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoShadowFullCallees
+      protoShadowBadMask [] [] [] = false ∧
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees protoTraitMask []
+      [⟨"proto::poly", 1⟩] [⟨"proto::poly", 1⟩] = false ∧
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees
+      [false, false, true, false, false, false] [] [] [] = false ∧
+    vcMirWithCallees protoExtContracts 3 protoExtCallRootMir protoExtInitState [] []
+      [⟨"ext::rand", 7⟩] protoExtCone protoExtPost ∧
+    ¬ vcMirWithCallees protoExtContracts 3 protoExtCallRootMir protoExtInitState [] []
+      [] protoExtCone protoExtPost ∧
+    (∀ ext ∈ ([] : ExternalSummaryEnv), findCallee? protoFullCallees ext.defPath = none) :=
+  ⟨canary_naiveNarrow_breaks_trait_dispatch.2.1,
+    canary_naiveNarrow_breaks_trait_dispatch.2.2.2.2,
+    canary_traitDispatch_preserved_under_batchedVcNarrow.1,
+    canary_duplicateShadow_rejected.1,
+    canary_externalShadowsInternal_rejected.1,
+    canary_missingTraitImplBody_rejected.1,
+    canary_externalSummary_vc.2.1,
+    canary_externalSummary_vc.2.2,
+    protoTraitBatchedCert.untrustedAdmissible⟩
+
+/-- Part C / Part D theory canaries and the projections of `AllocRenamingRel`, used concretely. -/
+theorem test_partCD_canaries :
+    (evalDemandCallerLocation (evalDemandCallerLocation {} (protoPanicSite {} {}) emptyMemory).1
+        (protoDirectSite {}) (evalDemandCallerLocation {} (protoPanicSite {} {}) emptyMemory).2.2).2.2.globals.length = 3 ∧
+    (protoPanicSite ⟨false, false, false⟩ {}).resolve = protoUserCallerPos ∧
+    CallerLocationSite.resolve
+        ⟨protoUnwrapFailedPos, [protoUnwrapFailedFrame {},
+          ⟨"my_crate::non_track_helper", some protoOtherCallPos, false, {}⟩, protoUserCallerFrame {}]⟩ =
+      protoUnwrapBodyPos ∧
+    shiftLeftBitsSafe 0xdeadbeef wideShiftTwoPow64 4 = 0 ∧
+    symArrayLen (buildEagerDistinctChain 16 16) = 16 ∧
+    (lazyDistinctChainCounted 16 16).1 = buildLazyDistinctChain 16 16 :=
+  ⟨demandCallerLocation_filename_dedup.1,
+    trackCaller_span_owner_policy.1,
+    trackCaller_stops_at_nonTrackCaller_frame,
+    canary_wideShift_two_pow_64.2.1,
+    symArrayLen_buildEagerDistinctChain 16 16,
+    lazyDistinctChainCounted_fst 16 16⟩
+
+/-- The three projections of a concrete `AllocRenamingRel`. -/
+theorem test_partC_renaming_projections
+    (h : AllocRenamingRel [(1, 4)] emptyMemory emptyMemory [⟨1, 0⟩] [⟨4, 0⟩]) :
+    AllocRenamingWf [(1, 4)] = true ∧
+    [(⟨4, 0⟩ : ProvenancePtr)] = [(⟨1, 0⟩ : ProvenancePtr)].map (relocatePtr [(1, 4)]) ∧
+    LocationPtrObsEq emptyMemory.globals ⟨1, 0⟩ emptyMemory.globals (relocatePtr [(1, 4)] ⟨1, 0⟩) :=
+  ⟨h.wf, h.ptrsMapped, h.obsAgree ⟨1, 0⟩ (List.Mem.head _)⟩
+
+theorem test_partC_renaming_witness :
+    AllocRenamingRel [(1, 4)] emptyMemory emptyMemory [⟨1, 0⟩] [⟨4, 0⟩] :=
+  ⟨by decide, rfl, fun _ hp => by cases hp with | head => rfl | tail _ h => nomatch h⟩
+
+/-- Part B runs with the narrowed table cached as a literal (steady state after the one-time
+certificate + narrowing), proved equal to the computed narrowing. -/
+def cachedNarrowState (full : List CapturedMir) : MachineState :=
+  MachineState.mapMem (Memory.withCalleesAndTraits [protoPoly, protoCircleArea] [protoAreaEntry])
+    (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory full)
 
 def buildFillerCallees : Nat → List CapturedMir
   | 0 => []
@@ -418,8 +566,39 @@ def fullCallees16 : List CapturedMir := buildFillerCallees 13 ++ [protoPoly, pro
 def fullCallees64 : List CapturedMir := buildFillerCallees 61 ++ [protoPoly, protoAreaImplHolder, protoCircleArea]
 def fullCallees128 : List CapturedMir := buildFillerCallees 125 ++ [protoPoly, protoAreaImplHolder, protoCircleArea]
 
-def narrowCallees2 : List CapturedMir := [protoPoly, protoCircleArea]
-def narrowTraitExtra : List TraitImplEntry := [protoAreaEntry]
+theorem cachedNarrow_eq_computed_16 :
+    selectByMask fullCallees16 (fullCallees16.map (fun b => inCone protoTraitCone b.defPath)) =
+      [protoPoly, protoCircleArea] ∧ hoistTraitImpls fullCallees16 [] = [protoAreaEntry] :=
+  ⟨rfl, rfl⟩
+theorem cachedNarrow_eq_computed_64 :
+    selectByMask fullCallees64 (fullCallees64.map (fun b => inCone protoTraitCone b.defPath)) =
+      [protoPoly, protoCircleArea] ∧ hoistTraitImpls fullCallees64 [] = [protoAreaEntry] :=
+  ⟨rfl, rfl⟩
+theorem cachedNarrow_eq_computed_128 :
+    selectByMask fullCallees128 (fullCallees128.map (fun b => inCone protoTraitCone b.defPath)) =
+      [protoPoly, protoCircleArea] ∧ hoistTraitImpls fullCallees128 [] = [protoAreaEntry] :=
+  ⟨rfl, rfl⟩
+
+/-- Narrowed state computed from the certificate data (mask + hoisting) of a full table. -/
+def narrowedTraitState (full : List CapturedMir) : MachineState :=
+  MachineState.mapMem
+    (Memory.withCalleesAndTraits
+      (selectByMask full (full.map (fun b => inCone protoTraitCone b.defPath)))
+      (hoistTraitImpls full []))
+    (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory full)
+
+/-- Reducible (unsealed) copy of `coerceValueAt`, used only as the coercion baseline. -/
+def coerceValueAtUnsealed (layouts : LayoutTable) (ty : RigidTy) (v : Value) : Option Value :=
+  match ty with
+  | .uint ut =>
+    match v with
+    | .scalar sc =>
+      let w := uintTyByteWidth layouts ut
+      match sc.sizeBytes == w with
+      | true => some (.scalar ⟨wrapScalarBits sc.bits (scalarModulus w), w⟩)
+      | false => none
+    | _ => none
+  | _ => none
 
 open Lean Elab Command in
 run_cmd do
@@ -433,51 +612,106 @@ run_cmd do
     logInfo m!"BENCH {label} heartbeats={h1 - h0} ns={t1 - t0}"
   bench "PartB_full_M16" `(command|
     theorem bench_partB_full_16 :
-        ((runMirExecBounded 12 traitCallRootMir
+        (runMirExecBounded 12 traitCallRootMir
           (.running (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-            emptyMemory fullCallees16))).map
-          (fun out => match out with | .normal (.scalar sc, _) => some sc.bits | _ => none)) =
-        some (some 31) := by decide +kernel)
+            emptyMemory fullCallees16))).map leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_cert_M16" `(command|
+    theorem bench_partB_cert_16 :
+        (computeBatchedVcNarrowCert 4 traitCallRootMir fullCallees16 [] []).1 = protoTraitCone ∧
+        checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir fullCallees16
+          (fullCallees16.map (fun b => inCone protoTraitCone b.defPath)) [] [] [] = true := by
+      decide +kernel)
   bench "PartB_narrow_M16" `(command|
     theorem bench_partB_narrow_16 :
-        ((runMirExecBounded 12 traitCallRootMir
-          (.running (MachineState.mapMem (Memory.withCalleesAndTraits narrowCallees2 narrowTraitExtra)
-            (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-              emptyMemory fullCallees16)))).map
-          (fun out => match out with | .normal (.scalar sc, _) => some sc.bits | _ => none)) =
-        some (some 31) := by decide +kernel)
+        (runMirExecBounded 12 traitCallRootMir (.running (narrowedTraitState fullCallees16))).map
+          leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_narrowCached_M16" `(command|
+    theorem bench_partB_narrowCached_16 :
+        (runMirExecBounded 12 traitCallRootMir (.running (cachedNarrowState fullCallees16))).map
+          leafBits = some (some 31) := by decide +kernel)
   bench "PartB_full_M64" `(command|
     theorem bench_partB_full_64 :
-        ((runMirExecBounded 12 traitCallRootMir
+        (runMirExecBounded 12 traitCallRootMir
           (.running (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-            emptyMemory fullCallees64))).map
-          (fun out => match out with | .normal (.scalar sc, _) => some sc.bits | _ => none)) =
-        some (some 31) := by decide +kernel)
+            emptyMemory fullCallees64))).map leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_cert_M64" `(command|
+    theorem bench_partB_cert_64 :
+        (computeBatchedVcNarrowCert 4 traitCallRootMir fullCallees64 [] []).1 = protoTraitCone ∧
+        checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir fullCallees64
+          (fullCallees64.map (fun b => inCone protoTraitCone b.defPath)) [] [] [] = true := by
+      decide +kernel)
   bench "PartB_narrow_M64" `(command|
     theorem bench_partB_narrow_64 :
-        ((runMirExecBounded 12 traitCallRootMir
-          (.running (MachineState.mapMem (Memory.withCalleesAndTraits narrowCallees2 narrowTraitExtra)
-            (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-              emptyMemory fullCallees64)))).map
-          (fun out => match out with | .normal (.scalar sc, _) => some sc.bits | _ => none)) =
-        some (some 31) := by decide +kernel)
+        (runMirExecBounded 12 traitCallRootMir (.running (narrowedTraitState fullCallees64))).map
+          leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_narrowCached_M64" `(command|
+    theorem bench_partB_narrowCached_64 :
+        (runMirExecBounded 12 traitCallRootMir (.running (cachedNarrowState fullCallees64))).map
+          leafBits = some (some 31) := by decide +kernel)
   bench "PartB_full_M128" `(command|
     theorem bench_partB_full_128 :
-        ((runMirExecBounded 12 traitCallRootMir
+        (runMirExecBounded 12 traitCallRootMir
           (.running (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-            emptyMemory fullCallees128))).map
-          (fun out => match out with | .normal (.scalar sc, _) => some sc.bits | _ => none)) =
-        some (some 31) := by decide +kernel)
+            emptyMemory fullCallees128))).map leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_cert_M128" `(command|
+    theorem bench_partB_cert_128 :
+        (computeBatchedVcNarrowCert 4 traitCallRootMir fullCallees128 [] []).1 = protoTraitCone ∧
+        checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir fullCallees128
+          (fullCallees128.map (fun b => inCone protoTraitCone b.defPath)) [] [] [] = true := by
+      decide +kernel)
   bench "PartB_narrow_M128" `(command|
     theorem bench_partB_narrow_128 :
-        ((runMirExecBounded 12 traitCallRootMir
-          (.running (MachineState.mapMem (Memory.withCalleesAndTraits narrowCallees2 narrowTraitExtra)
-            (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-              emptyMemory fullCallees128)))).map
-          (fun out => match out with | .normal (.scalar sc, _) => some sc.bits | _ => none)) =
-        some (some 31) := by decide +kernel)
+        (runMirExecBounded 12 traitCallRootMir (.running (narrowedTraitState fullCallees128))).map
+          leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_narrowCached_M128" `(command|
+    theorem bench_partB_narrowCached_128 :
+        (runMirExecBounded 12 traitCallRootMir (.running (cachedNarrowState fullCallees128))).map
+          leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_coerce_sealed_lemma" `(command|
+    theorem bench_partB_coerce_sealed :
+        ∀ bits : Nat, coerceValueAt protoLayouts (.uint .u32) (.scalar ⟨bits, 4⟩) =
+          some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) :=
+      fun bits => coerceValueAt_u32 protoLayouts bits)
+  bench "PartB_coerce_unsealed_rfl" `(command|
+    theorem bench_partB_coerce_unsealed :
+        ∀ bits : Nat, coerceValueAtUnsealed protoLayouts (.uint .u32) (.scalar ⟨bits, 4⟩) =
+          some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) :=
+      fun _ => rfl)
 
-/-! ## 5. Part C Witnesses & Scaling Benchmarks (`DemandCallerLocationEnv`, `lean-miri#67`) -/
+/-! ## 5. Part C Witnesses & Scaling (`DemandCallerLocationEnv`, `lean-miri#67`) -/
+
+/-- A demand-world initial state with fresh (empty) globals. -/
+def protoLocState : MachineState := { protoRetagMachineState with memory := emptyMemory }
+
+theorem protoLocState_fresh : GlobalsFresh protoLocState.memory := fun _ h => nomatch h
+
+/-- Panicking trace: two normal steps, the 3-frame chain twice (repeated site), and the direct
+site once. -/
+def protoPanicTrace : List CallerLocationTraceEvent :=
+  [ .normalStep ⟨.nop, "nop"⟩, .invokeCallerLocation 2, .normalStep ⟨.nop, "nop"⟩,
+    .invokeCallerLocation 2, .invokeCallerLocation 0, .invokeCallerLocation 7 ]
+
+/-- Trace invoking two *distinct* sites (renaming is injective). -/
+def protoDistinctTrace : List CallerLocationTraceEvent :=
+  [ .invokeCallerLocation 2, .normalStep ⟨.nop, "nop"⟩, .invokeCallerLocation 0 ]
+
+/-- Demand / eager observations agree for ALL 8 redaction policies (general theorem
+instantiated per policy) and equal the resolved location of every invoked site. -/
+theorem test_partC_bisim_all_policies :
+    ∀ pol ∈ allLocationDetailPolicies,
+      readLocations
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoLocState protoRetagLocalDecls
+            protoLayouts protoPanicTrace).2.2.memory.globals
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoLocState protoRetagLocalDecls
+            protoLayouts protoPanicTrace).2.1 =
+        readLocations
+          (runEagerCallerLocationWorld (protoSites pol pol) protoLocState protoRetagLocalDecls
+            protoLayouts protoPanicTrace).2.memory.globals
+          (runEagerCallerLocationWorld (protoSites pol pol) protoLocState protoRetagLocalDecls
+            protoLayouts protoPanicTrace).1 := by
+  intro pol _
+  exact (demandCallerLocation_bisim_eager (protoSites pol pol) protoLocState protoRetagLocalDecls
+    protoLayouts protoPanicTrace protoLocState_fresh (protoSites_fileLenOk pol pol)).1
 
 theorem test_partC_demandCallerLocation :
     allLocationDetailPolicies.length = 8 ∧
@@ -485,10 +719,10 @@ theorem test_partC_demandCallerLocation :
     applyLocationDetailPolicy ⟨false, true, false⟩
         (applyLocationDetailPolicy ⟨false, true, false⟩ protoUserCallerPos) =
       applyLocationDetailPolicy ⟨false, true, false⟩ protoUserCallerPos ∧
-    resolveTrackCallerWalkUpAux {} protoUnwrapBodyPos
-        ([protoUnwrapFrame {}] ++ protoUserCallerFrame {} :: []) =
+    resolveCallerLocationAux {} protoUnwrapFailedPos
+        ([protoUnwrapFailedFrame {}, protoUnwrapFrame {}] ++ protoUserCallerFrame {} :: []) =
       applyLocationDetailPolicy {}
-        (propagateTrackCallerTopDown protoUnwrapBodyPos [protoUnwrapFrame {}]) ∧
+        (propagateTrackCallerTopDown protoUnwrapFailedPos [protoUnwrapFailedFrame {}, protoUnwrapFrame {}]) ∧
     readU32Le? (u32LeBytes (42 : UInt32).toNat ++ []) = some 42 ∧
     readU64Le? (u64LeBytes 10 ++ []) = some 10 ∧
     decodeInitBytes? (protoLibRsBytes.map Option.some) = some protoLibRsBytes ∧
@@ -498,33 +732,46 @@ theorem test_partC_demandCallerLocation :
     lookupGlobalAlloc
         ([mkFilenameAllocation 1 protoLibRsBytes] ++ [mkLocationAllocation 2 1 10 42 13]) 2 =
       some (mkLocationAllocation 2 1 10 42 13) ∧
-    (runDemandCallerLocationTrace {} protoRetagMachineState protoRetagLocalDecls protoLayouts
-      [.normalStep ⟨.nop, "nop"⟩]).1 = {} ∧
-    (let (_, ptr, mem') := evalDemandCallerLocation {} (protoUnwrapFailedFrame {})
-        [protoUnwrapFrame {}, protoUserCallerFrame {}] emptyMemory
-     readLocationFromGlobals mem'.globals ptr = some (protoLibRsBytes, 42, 13)) := by
-  have _ := @allLocationDetailPolicies_length
-  have _ := @mem_allLocationDetailPolicies
-  have _ := @applyLocationDetailPolicy_idempotent
-  have _ := @resolveTrackCallerWalkUpAux_eq_topDown
-  have _ := @readU32Le_u32LeBytes
-  have _ := @readU64Le_u64LeBytes
-  have _ := @decodeInitBytes?_map_some
-  have _ := @lookupGlobalAlloc_append_left
-  have _ := @lookupGlobalAlloc_snoc_self
-  have _ := @demandCallerLocation_no_call_zero_allocs
-  have _ := @readLocationFromGlobals_evalDemandCallerLocation_fresh
-  have _ := @demandCallerLocation_filename_dedup
-  have _ := @AllocRenamingRel.wf
-  have _ := @AllocRenamingRel.ptrsMapped
-  have _ := @AllocRenamingRel.obsAgree
-  have _ := @demandCallerLocation_bisim_eager
-  have _ := @trackCaller_stops_at_nonTrackCaller_frame
+    readLocationFromGlobals
+        ([mkFilenameAllocation 1 protoLibRsBytes] ++ [mkLocationAllocation 2 1 10 42 13])
+        { allocId := 2, offsetBytes := 0 } = some (protoLibRsBytes, 42, 13) ∧
+    readLocations
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoPanicTrace).2.2.memory.globals
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoPanicTrace).2.1 =
+      [ some (protoLibRsBytes, 42, 13), some (protoLibRsBytes, 42, 13),
+        some (protoLibRsBytes, 108, 7) ] ∧
+    runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+        protoLayouts [.normalStep ⟨.nop, "nop"⟩, .normalStep ⟨.nop, "nop"⟩] =
+      ({}, [], runPlainTrace protoLocState protoRetagLocalDecls protoLayouts
+        [.normalStep ⟨.nop, "nop"⟩, .normalStep ⟨.nop, "nop"⟩]) ∧
+    (runEagerCallerLocationWorld (protoSites {} {}) protoLocState protoRetagLocalDecls protoLayouts
+        [.normalStep ⟨.nop, "nop"⟩]).2.memory.globals.length =
+      0 + 3 + (eagerInitCallerLocations (protoSites {} {}) protoLocState.memory).1.fileCache.length ∧
+    AllocRenamingRel
+      (renamingOfPtrs
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoDistinctTrace).2.1
+        (runEagerCallerLocationWorld (protoSites {} {}) protoLocState protoRetagLocalDecls
+          protoLayouts protoDistinctTrace).1)
+      (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+        protoLayouts protoDistinctTrace).2.2.memory
+      (runEagerCallerLocationWorld (protoSites {} {}) protoLocState protoRetagLocalDecls
+        protoLayouts protoDistinctTrace).2.memory
+      (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+        protoLayouts protoDistinctTrace).2.1
+      (runEagerCallerLocationWorld (protoSites {} {}) protoLocState protoRetagLocalDecls
+        protoLayouts protoDistinctTrace).1 := by
+  have h_bisim := demandCallerLocation_bisim_eager (protoSites {} {}) protoLocState
+    protoRetagLocalDecls protoLayouts protoPanicTrace protoLocState_fresh (protoSites_fileLenOk {} {})
+  have h_dist := demandCallerLocation_bisim_eager (protoSites {} {}) protoLocState
+    protoRetagLocalDecls protoLayouts protoDistinctTrace protoLocState_fresh (protoSites_fileLenOk {} {})
   refine ⟨allLocationDetailPolicies_length,
     mem_allLocationDetailPolicies ⟨true, false, true⟩,
     applyLocationDetailPolicy_idempotent ⟨false, true, false⟩ protoUserCallerPos,
-    resolveTrackCallerWalkUpAux_eq_topDown {}
-      [protoUnwrapFrame {}] (protoUserCallerFrame {}) [] protoUnwrapBodyPos rfl rfl,
+    resolveCallerLocationAux_eq_topDown [protoUnwrapFailedFrame {}, protoUnwrapFrame {}]
+      (protoUserCallerFrame {}) [] {} protoUnwrapFailedPos rfl rfl,
     readU32Le_u32LeBytes 42 [],
     readU64Le_u64LeBytes (by decide) [],
     decodeInitBytes?_map_some protoLibRsBytes,
@@ -532,24 +779,32 @@ theorem test_partC_demandCallerLocation :
     lookupGlobalAlloc_snoc_self [mkFilenameAllocation 1 protoLibRsBytes]
       (mkLocationAllocation 2 1 10 42 13)
       (fun a ha => by cases ha with | head => decide | tail _ h => nomatch h),
-    (demandCallerLocation_no_call_zero_allocs {} [.normalStep ⟨.nop, "nop"⟩]
-      protoRetagMachineState protoRetagLocalDecls protoLayouts rfl).1,
-    readLocationFromGlobals_evalDemandCallerLocation_fresh (protoUnwrapFailedFrame {})
-      [protoUnwrapFrame {}, protoUserCallerFrame {}] emptyMemory rfl (by decide)⟩
+    readLocationFromGlobals_of_lookups (fileId := 1) rfl rfl (by decide),
+    ?_,
+    (demandCallerLocation_no_call_zero_allocs (protoSites {} {}) {} protoRetagLocalDecls protoLayouts
+      [.normalStep ⟨.nop, "nop"⟩, .normalStep ⟨.nop, "nop"⟩] protoLocState rfl).1,
+    (eagerCallerLocation_clutter (protoSites {} {}) protoLocState protoRetagLocalDecls protoLayouts
+      [.normalStep ⟨.nop, "nop"⟩] rfl).2,
+    allocRenamingRel_of_readLocations h_dist.1 (by decide +kernel) (by decide +kernel)
+      (by decide +kernel)⟩
+  rw [h_bisim.2]
+  decide +kernel
 
-def buildCandidateSpans : Nat → List (FrameLocMeta × List FrameLocMeta)
+def buildCandidateSites : Nat → List CallerLocationSite
   | 0 => []
   | k + 1 =>
-    let pos : SourceExpansionPos :=
-      ⟨"src/lib.rs", protoLibRsBytes, UInt32.ofNat (k + 1), 5⟩
-    (⟨"crate::caller", pos, false, {}⟩, []) :: buildCandidateSpans k
+    let pos : SourceExpansionPos := ⟨"src/lib.rs", protoLibRsBytes, UInt32.ofNat (k + 1), 5⟩
+    ⟨pos, [protoUserCallerFrame {}]⟩ :: buildCandidateSites k
 
-def candidateSpans16 : List (FrameLocMeta × List FrameLocMeta) := buildCandidateSpans 16
-def candidateSpans64 : List (FrameLocMeta × List FrameLocMeta) := buildCandidateSpans 64
-def candidateSpans128 : List (FrameLocMeta × List FrameLocMeta) := buildCandidateSpans 128
+def candidateSites16 : List CallerLocationSite := buildCandidateSites 16
+def candidateSites64 : List CallerLocationSite := buildCandidateSites 64
+def candidateSites128 : List CallerLocationSite := buildCandidateSites 128
 
 def nonPanickingTrace8 : List CallerLocationTraceEvent :=
   List.replicate 8 (.normalStep ⟨.nop, "nop"⟩)
+
+def panickingTrace9 : List CallerLocationTraceEvent :=
+  nonPanickingTrace8 ++ [.invokeCallerLocation 0]
 
 open Lean Elab Command in
 run_cmd do
@@ -561,84 +816,106 @@ run_cmd do
     let t1 ← IO.monoNanosNow
     let h1 ← IO.getNumHeartbeats
     logInfo m!"BENCH {label} heartbeats={h1 - h0} ns={t1 - t0}"
-  bench "PartC_eager_S16" `(command|
-    theorem bench_partC_eager_16 :
-        (eagerInitCallerLocations candidateSpans16 emptyMemory).2.2.globals.length = 17 := by
-      decide +kernel)
-  bench "PartC_demand_S16" `(command|
-    theorem bench_partC_demand_16 :
-        (runDemandCallerLocationTrace {} protoRetagMachineState protoRetagLocalDecls protoLayouts
-          nonPanickingTrace8).2.2.memory.globals.length = 0 := by
-      decide +kernel)
-  bench "PartC_eager_S64" `(command|
-    theorem bench_partC_eager_64 :
-        (eagerInitCallerLocations candidateSpans64 emptyMemory).2.2.globals.length = 65 := by
-      decide +kernel)
-  bench "PartC_demand_S64" `(command|
-    theorem bench_partC_demand_64 :
-        (runDemandCallerLocationTrace {} protoRetagMachineState protoRetagLocalDecls protoLayouts
-          nonPanickingTrace8).2.2.memory.globals.length = 0 := by
-      decide +kernel)
-  bench "PartC_eager_S128" `(command|
-    theorem bench_partC_eager_128 :
-        (eagerInitCallerLocations candidateSpans128 emptyMemory).2.2.globals.length = 129 := by
-      decide +kernel)
-  bench "PartC_demand_S128" `(command|
-    theorem bench_partC_demand_128 :
-        (runDemandCallerLocationTrace {} protoRetagMachineState protoRetagLocalDecls protoLayouts
-          nonPanickingTrace8).2.2.memory.globals.length = 0 := by
-      decide +kernel)
+  bench "PartC_eager_noPanic_S16" `(command|
+    theorem bench_partC_eager_np_16 :
+        (runEagerCallerLocationWorld candidateSites16 protoLocState protoRetagLocalDecls protoLayouts
+          nonPanickingTrace8).2.memory.globals.length = 17 := by decide +kernel)
+  bench "PartC_demand_noPanic_S16" `(command|
+    theorem bench_partC_demand_np_16 :
+        (runDemandCallerLocationTrace candidateSites16 {} protoLocState protoRetagLocalDecls
+          protoLayouts nonPanickingTrace8).2.2.memory.globals.length = 0 := by decide +kernel)
+  bench "PartC_eager_panic_S16" `(command|
+    theorem bench_partC_eager_p_16 :
+        (fun r => readLocations r.2.memory.globals r.1)
+          (runEagerCallerLocationWorld candidateSites16 protoLocState protoRetagLocalDecls
+            protoLayouts panickingTrace9) = [some (protoLibRsBytes, 16, 5)] := by decide +kernel)
+  bench "PartC_demand_panic_S16" `(command|
+    theorem bench_partC_demand_p_16 :
+        (fun r => readLocations r.2.2.memory.globals r.2.1)
+          (runDemandCallerLocationTrace candidateSites16 {} protoLocState protoRetagLocalDecls
+            protoLayouts panickingTrace9) = [some (protoLibRsBytes, 16, 5)] := by decide +kernel)
+  bench "PartC_eager_noPanic_S64" `(command|
+    theorem bench_partC_eager_np_64 :
+        (runEagerCallerLocationWorld candidateSites64 protoLocState protoRetagLocalDecls protoLayouts
+          nonPanickingTrace8).2.memory.globals.length = 65 := by decide +kernel)
+  bench "PartC_demand_noPanic_S64" `(command|
+    theorem bench_partC_demand_np_64 :
+        (runDemandCallerLocationTrace candidateSites64 {} protoLocState protoRetagLocalDecls
+          protoLayouts nonPanickingTrace8).2.2.memory.globals.length = 0 := by decide +kernel)
+  bench "PartC_eager_panic_S64" `(command|
+    theorem bench_partC_eager_p_64 :
+        (fun r => readLocations r.2.memory.globals r.1)
+          (runEagerCallerLocationWorld candidateSites64 protoLocState protoRetagLocalDecls
+            protoLayouts panickingTrace9) = [some (protoLibRsBytes, 64, 5)] := by decide +kernel)
+  bench "PartC_demand_panic_S64" `(command|
+    theorem bench_partC_demand_p_64 :
+        (fun r => readLocations r.2.2.memory.globals r.2.1)
+          (runDemandCallerLocationTrace candidateSites64 {} protoLocState protoRetagLocalDecls
+            protoLayouts panickingTrace9) = [some (protoLibRsBytes, 64, 5)] := by decide +kernel)
+  bench "PartC_eager_noPanic_S128" `(command|
+    theorem bench_partC_eager_np_128 :
+        (runEagerCallerLocationWorld candidateSites128 protoLocState protoRetagLocalDecls protoLayouts
+          nonPanickingTrace8).2.memory.globals.length = 129 := by decide +kernel)
+  bench "PartC_demand_noPanic_S128" `(command|
+    theorem bench_partC_demand_np_128 :
+        (runDemandCallerLocationTrace candidateSites128 {} protoLocState protoRetagLocalDecls
+          protoLayouts nonPanickingTrace8).2.2.memory.globals.length = 0 := by decide +kernel)
+  bench "PartC_eager_panic_S128" `(command|
+    theorem bench_partC_eager_p_128 :
+        (fun r => readLocations r.2.memory.globals r.1)
+          (runEagerCallerLocationWorld candidateSites128 protoLocState protoRetagLocalDecls
+            protoLayouts panickingTrace9) = [some (protoLibRsBytes, 128, 5)] := by decide +kernel)
+  bench "PartC_demand_panic_S128" `(command|
+    theorem bench_partC_demand_p_128 :
+        (fun r => readLocations r.2.2.memory.globals r.2.1)
+          (runDemandCallerLocationTrace candidateSites128 {} protoLocState protoRetagLocalDecls
+            protoLayouts panickingTrace9) = [some (protoLibRsBytes, 128, 5)] := by decide +kernel)
 
-/-! ## 6. Part D Witnesses & Scaling Benchmarks (`LazyWriteChain` & `bvShiftSafe` / `shiftLeftBitsSafe`) -/
+/-! ## 6. Part D Witnesses & Scaling (`LazyWriteChain` & `bvShiftSafe` / `shiftLeftBitsSafe`) -/
 
 def zeroEnv : Nat → Nat → Option Nat := fun _ _ => some 0
 
 theorem test_partD_lazyWrite_and_shifts :
     evalSymArrayTerm zeroEnv (.constVec 8 0) 9 = none ∧
-    symArrayLen (mkLazyWrite (.constVec 8 0) 2 99) = 8 ∧
-    evalSymArrayTerm zeroEnv (mkLazyWrite (.constVec 8 0) 2 99) 2 =
-      evalSymArrayTerm zeroEnv (.write (.constVec 8 0) 2 99) 2 ∧
+    symArrayLen (mkLazyWrite 8 (.constVec 8 0) 2 99) = 8 ∧
+    evalSymArrayTerm zeroEnv (mkLazyWrite 8 (.constVec 8 0) 2 99) 3 =
+      evalSymArrayTerm zeroEnv (.write (.constVec 8 0) 2 99) 3 ∧
+    evalSymArrayTerm zeroEnv (mkEagerWrite 8 (.write (.constVec 8 0) 2 99) 2 7) 2 =
+      evalSymArrayTerm zeroEnv (.write (.write (.constVec 8 0) 2 99) 2 7) 2 ∧
+    evalSymArrayTerm zeroEnv (.write (.constVec 8 0) 9 5) 3 =
+      evalSymArrayTerm zeroEnv (.constVec 8 0) 3 ∧
     symArrayLen (stripShadowedWrites (.write (.constVec 8 0) 2 99) 2) = 8 ∧
     evalSymArrayTerm zeroEnv (stripShadowedWrites (.write (.constVec 8 0) 2 99) 2) 3 =
       evalSymArrayTerm zeroEnv (.write (.constVec 8 0) 2 99) 3 ∧
-    evalSymArrayTerm zeroEnv (mkLazyWrite (.constVec 8 0) 2 99) 2 = some 99 ∧
-    lazyWriteChainSteps 16 = 16 ∧
-    2 * eagerWriteChainSteps 16 = 16 * 17 ∧
+    evalSymArrayTerm zeroEnv (mkLazyWrite 8 (.constVec 8 0) 2 99) 2 = some 99 ∧
+    (mkLazyWriteCounted 8 (.constVec 8 0) 2 99).1 = mkLazyWrite 8 (.constVec 8 0) 2 99 ∧
+    (stripShadowedWritesCounted (.write (.write (.constVec 8 0) 1 5) 2 6) 3).2 = 3 ∧
+    (eagerDistinctChainCounted 16 16).1 = buildEagerDistinctChain 16 16 ∧
+    (lazyDistinctChainCounted 16 16).2 = 16 ∧
+    2 * (eagerDistinctChainCounted 16 16).2 = 16 * 17 ∧
+    buildLazyDistinctChain 16 16 = buildEagerDistinctChain 16 16 ∧
+    symArrayLen (buildLazyDistinctChain 16 16) = 16 ∧
     bvShlSafe (0x12345678#32) 64 = (0x12345678#32) <<< 64 ∧
     bvLshrSafe (0x12345678#32) 64 = (0x12345678#32) >>> 64 ∧
     bvAshrSafe (0x80000000#32) 64 = BitVec.sshiftRight (0x80000000#32) 64 ∧
     shiftLeftBitsSafe 0x12345678 64 4 = shiftLeftBits 0x12345678 64 (scalarModulus 4) ∧
     shiftRightUnsignedBitsSafe 0x12345678 64 4 = shiftRightUnsignedBits 0x12345678 64 ∧
     arithmeticShrBitsSafe 0x80000000 4 64 = arithmeticShrBits 0x80000000 4 64 := by
-  have _ := @nat_beq_self_raw
-  have _ := @nat_beq_self
-  have _ := @nat_beq_ne
-  have _ := @evalSymArrayTerm_oob
-  have _ := @symArrayLen_mkLazyWrite
-  have _ := @eval_mkLazyWrite
-  have _ := @symArrayLen_stripShadowedWrites
-  have _ := @eval_stripShadowedWrites_ne
-  have _ := @eval_mkLazyRead
-  have _ := @lazyWriteChain_distinctAddrs_steps_eq_N
-  have _ := @eagerWriteChain_distinctAddrs_steps_quadratic
-  have _ := @bvShlSafe_eq
-  have _ := @bvLshrSafe_eq
-  have _ := @bvAshrSafe_eq
-  have _ := @scalarPow2_add
-  have _ := @scalarPow2_le_of_le
-  have _ := @scalarModulus_eq_scalarPow2_mul8
-  have _ := @shiftLeftBitsSafe_eq
-  have _ := @shiftRightUnsignedBitsSafe_eq
-  have _ := @arithmeticShrBitsSafe_eq
-  have _ := @canary_wideShift_two_pow_64
   refine ⟨evalSymArrayTerm_oob zeroEnv (.constVec 8 0) 9 (by decide),
-    symArrayLen_mkLazyWrite (.constVec 8 0) 2 99,
-    eval_mkLazyWrite zeroEnv (.constVec 8 0) 2 99 2,
+    symArrayLen_mkLazyWrite 8 (.constVec 8 0) 2 99,
+    eval_mkLazyWrite zeroEnv (.constVec 8 0) rfl 2 99 3,
+    eval_mkEagerWrite zeroEnv (.write (.constVec 8 0) 2 99) rfl 2 7 2,
+    eval_write_oob zeroEnv (.constVec 8 0) 9 5 3 (by decide),
     symArrayLen_stripShadowedWrites (.write (.constVec 8 0) 2 99) 2,
     eval_stripShadowedWrites_ne zeroEnv (.write (.constVec 8 0) 2 99) 2 3 rfl,
-    eval_mkLazyRead zeroEnv (mkLazyWrite (.constVec 8 0) 2 99) 2 99 rfl,
-    lazyWriteChain_distinctAddrs_steps_eq_N 16,
-    eagerWriteChain_distinctAddrs_steps_quadratic 16,
+    eval_mkLazyRead zeroEnv (mkLazyWrite 8 (.constVec 8 0) 2 99) rfl 2 99 rfl,
+    mkLazyWriteCounted_fst 8 (.constVec 8 0) 2 99,
+    by rw [stripShadowedWritesCounted_snd]; rfl,
+    eagerDistinctChainCounted_fst 16 16,
+    lazyWriteChain_distinctAddrs_steps_eq_N (Nat.le_refl 16),
+    eagerWriteChain_distinctAddrs_steps_quadratic (Nat.le_refl 16),
+    buildLazyDistinctChain_eq_eager (Nat.le_refl 16),
+    symArrayLen_buildLazyDistinctChain 16 16,
     bvShlSafe_eq (0x12345678#32) 64,
     bvLshrSafe_eq (0x12345678#32) 64,
     bvAshrSafe_eq (0x80000000#32) 64,
@@ -658,24 +935,28 @@ run_cmd do
     logInfo m!"BENCH {label} heartbeats={h1 - h0} ns={t1 - t0}"
   bench "PartD_eagerWrite_N16" `(command|
     theorem bench_partD_eager_16 :
-        (buildEagerDistinctChainWithSteps 128 16).2 = 136 ∧
-        mkLazyRead (buildEagerDistinctChainWithSteps 128 16).1 15 = some 16 := by
-      decide +kernel)
+        (eagerDistinctChainCounted 128 16).2 = 136 ∧
+        mkLazyRead 128 (eagerDistinctChainCounted 128 16).1 15 = some 16 := by decide +kernel)
   bench "PartD_lazyWrite_N16" `(command|
     theorem bench_partD_lazy_16 :
-        lazyWriteChainSteps 16 = 16 ∧
-        mkLazyRead (buildLazyDistinctChain 128 16) 15 = some 16 := by
-      decide +kernel)
+        (lazyDistinctChainCounted 128 16).2 = 16 ∧
+        mkLazyRead 128 (lazyDistinctChainCounted 128 16).1 15 = some 16 := by decide +kernel)
   bench "PartD_eagerWrite_N64" `(command|
     theorem bench_partD_eager_64 :
-        (buildEagerDistinctChainWithSteps 128 64).2 = 2080 ∧
-        mkLazyRead (buildEagerDistinctChainWithSteps 128 64).1 63 = some 64 := by
-      decide +kernel)
+        (eagerDistinctChainCounted 128 64).2 = 2080 ∧
+        mkLazyRead 128 (eagerDistinctChainCounted 128 64).1 63 = some 64 := by decide +kernel)
   bench "PartD_lazyWrite_N64" `(command|
     theorem bench_partD_lazy_64 :
-        lazyWriteChainSteps 64 = 64 ∧
-        mkLazyRead (buildLazyDistinctChain 128 64) 63 = some 64 := by
-      decide +kernel)
+        (lazyDistinctChainCounted 128 64).2 = 64 ∧
+        mkLazyRead 128 (lazyDistinctChainCounted 128 64).1 63 = some 64 := by decide +kernel)
+  bench "PartD_eagerWrite_N128" `(command|
+    theorem bench_partD_eager_128 :
+        (eagerDistinctChainCounted 128 128).2 = 8256 ∧
+        mkLazyRead 128 (eagerDistinctChainCounted 128 128).1 127 = some 128 := by decide +kernel)
+  bench "PartD_lazyWrite_N128" `(command|
+    theorem bench_partD_lazy_128 :
+        (lazyDistinctChainCounted 128 128).2 = 128 ∧
+        mkLazyRead 128 (lazyDistinctChainCounted 128 128).1 127 = some 128 := by decide +kernel)
   bench "PartD_wideShift_2pow64" `(command|
     theorem bench_partD_wideShift_2pow64 :
         shiftLeftBitsSafe 0xdeadbeef wideShiftTwoPow64 4 = 0 ∧
@@ -686,7 +967,7 @@ run_cmd do
         bvAshrSafe (0x80000000#32) wideShiftTwoPow64 = 0xffffffff#32 := by
       decide +kernel)
 
-/-! ## 7. Bottom-of-File Kernel Axiom, Namespace Hygiene, & Theorem Reachability Audit -/
+/-! ## 7. Bottom-of-File Kernel Axiom, Namespace Hygiene, Placeholder, & Reachability Audit -/
 
 open Lean Elab Command in
 run_cmd do
@@ -699,6 +980,7 @@ run_cmd do
   let mut audited : Nat := 0
   let mut theorems : Nat := 0
   let mut auditedSet : NameSet := {}
+  let mut auditedThmSet : NameSet := {}
   let mut auditedThms : Array Name := #[]
   let mut leaked : Array Name := #[]
   for (n, ci) in env.constants.map₁.toList do
@@ -721,10 +1003,12 @@ run_cmd do
               last == "noConfusion" || last == "noConfusionType" ||
               last == "ctorIdx" || last == "toCtorIdx" || last == "ofNat_ctorIdx" ||
               last == "inj" || last == "injEq" || last == "sizeOf_spec" ||
-              last == "eq" || last == "_arg_pusher" || last.startsWith "_proof_"
+              last == "eq" || last == "_arg_pusher" || last.startsWith "_proof_" ||
+              last.startsWith "_simp_"
           unless un.hasMacroScopes || isAutoAux do
             theorems := theorems + 1
             auditedThms := auditedThms.push n
+            auditedThmSet := auditedThmSet.insert n
       else
         let last := un.eraseMacroScopes.getString!
         let isRealizedEq :=
@@ -734,6 +1018,34 @@ run_cmd do
           leaked := leaked.push un
   unless leaked.isEmpty do
     throwError "leaked constants outside {protoMod}: {leaked}"
+  -- Placeholder detector: a `have _ := @thm` (elaborated as `let`/`letFun`) whose value is a bare
+  -- prototype theorem and whose body never uses the bound variable instantiates nothing.
+  let isPlaceholder (e : Expr) : Bool :=
+    match e with
+    | .letE _ _ v b _ =>
+      (match v.getAppFn.constName? with
+        | some c => auditedThmSet.contains c && !b.hasLooseBVar 0
+        | none => false)
+    | _ =>
+      if e.isAppOfArity ``letFun 4 then
+        let v := e.getArg! 2
+        let f := e.getArg! 3
+        match v.getAppFn.constName?, f with
+        | some c, .lam _ _ b _ => auditedThmSet.contains c && !b.hasLooseBVar 0
+        | _, _ => false
+      else
+        false
+  -- Detector self-test: an elaborated `have _ := @thm` placeholder must be caught.
+  let probe ← liftTermElabM do
+    let stx ← `(term| (by
+      have _ := @$(mkIdent ``Anneal.SparseRetagAndVcNarrowPrototype.nat_beq_self)
+      exact True.intro : True))
+    let e ← Term.elabTerm stx none
+    Term.synthesizeSyntheticMVarsNoPostponing
+    instantiateMVars e
+  unless (probe.find? isPlaceholder).isSome do
+    throwError "placeholder detector self-test failed on {probe}"
+  let mut placeholders : Array Name := #[]
   let mut reached : NameSet := {}
   let mut work : Array Name := #[]
   for (n, ci) in env.constants.map₂.toList do
@@ -745,10 +1057,15 @@ run_cmd do
         unless allowed.contains a do
           throwError "{n} in {testPfx} depends on disallowed axiom {a}"
       audited := audited + 1
+      if let some v := ci.value? then
+        if (v.find? isPlaceholder).isSome then
+          placeholders := placeholders.push n
       for c in ci.getUsedConstantsAsSet do
         if auditedSet.contains c && !reached.contains c then
           reached := reached.insert c
           work := work.push c
+  unless placeholders.isEmpty do
+    throwError "placeholder-only prototype theorem uses (`have _ := @thm`) in: {placeholders.toList}"
   while !work.isEmpty do
     let c := work.back!
     work := work.pop
@@ -760,6 +1077,6 @@ run_cmd do
   let unreached := auditedThms.filter (fun n => !reached.contains n)
   unless unreached.isEmpty do
     throwError "prototype theorems not instantiated/reached by any test witness: {unreached.toList}"
-  logInfo m!"axiom audit passed: {audited} declarations ({theorems} prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 100% theorem reachability)"
+  logInfo m!"axiom audit passed: {audited} declarations ({theorems} prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, 100% theorem reachability)"
 
 end Anneal.SparseRetagAndVcNarrowProtoTests

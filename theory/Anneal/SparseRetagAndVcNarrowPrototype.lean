@@ -20,33 +20,41 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
 `Classical.choice`, zero `Lean.ofReduceBool`, and zero leaked global constants outside
 `Anneal.SparseRetagAndVcNarrowPrototype`.
 
-* **Part A (`SparseRetagAttrIndex`, `proofs-rs/lean-miri` PR #68)**: Constructive 12-bit binary
-  radix trie over `DefId` (`NatBitTrie`) with `Except`-cached whole-table duplicate and bounds
-  validation (`prepareSparseRetagIndex`, `lookupSparseRetag`), proved unconditionally equivalent
-  (`lookupSparseRetag_eq_linearScan`) to the $O(M^2)$ linear reference oracle
-  `linearScanRetagAttr`, preserving exact error precedence (`frameAbsent_precedes_malformedTable`),
-  paired with $O(1)$ lookup certificates (`lookupSparseRetag_cert`), a `DefPath`-keyed companion
-  index (`SparseDefPathRetagIndex`), and an operational `MirSemantics` overlay
-  (`evalFnEntryRetagWithSparseAttr`, `unusedMalformedTable_demand_local`).
+* **Part A (`SparseRetagAttrIndex`, `proofs-rs/lean-miri` PR #68)**: binary radix trie over
+  `DefId` (`NatBitTrie`, 12 low bits + exact-key leaf buckets) with `Except`-cached whole-table
+  duplicate and bounds validation (`prepareSparseRetagIndex`, `lookupSparseRetag`), proved
+  unconditionally equivalent (`lookupSparseRetag_eq_linearScan`) to the linear reference oracle
+  `linearScanRetagAttr` (which re-validates the table with an `O(M)` duplicate scan per row, i.e.
+  `O(M^2)` per query, mirroring `lean-miri`'s `CompilerRetagOptions.rustcNoWritable`), preserving
+  exact error precedence (`frameAbsent_precedes_malformedTable`), with hit/miss certificates, a
+  `DefPath`-keyed companion index, and an operational `StatementKind.retag .fnEntry` overlay whose
+  implicit-write upgrade targets only the freshly created child tag
+  (`applyImplicitWriteUpgrade_of_no_fresh_child`).
 * **Part B (`BatchedVcConeNarrowCert` + `hoistTraitImpls` + `@[irreducible] coerceValueAt`,
-  `bensherman` `cl/1022801564` `#cpp_vc_narrow`)**: Single batched kernel-checkable certificate
-  (`checkBatchedVcConeNarrowCert`) verifying transitive call-cone closure, first-match
-  `findCallee?` agreement (`calleesAgreeOn`), `TraitImplEntry` target closure + hoisting
-  (`hoistTraitImpls`), and external call contract admissibility (`UntrustedAdmissible`). Proves
-  `lookupCallee_eq_of_batchedCert`, `stepMirFn_withCalleesAndTraits`,
-  `runMirExecBounded_narrow_of_batchedCert`, `wpMirExecSym_narrow_of_batchedCert`, and
-  `vcMirWithCallees_narrow_of_batchedCert`, closing `canary_naiveNarrow_breaks_trait_dispatch`, and
-  seals `coerceValueAt` (`@[irreducible]`) with targeted rewrite lemmas.
-* **Part C (`DemandCallerLocationEnv`, `proofs-rs/lean-miri` PR #67 Schema 15)**: Demand-time
-  `#[track_caller]` `core::panic::Location` + deduplicated filename allocation construction in
-  `Memory.globals` across all 8 `-Zlocation-detail` redaction policies, with injective `AllocId`
-  renaming (`AllocRenamingRel`), `demandCallerLocation_no_call_zero_allocs`,
-  `demandCallerLocation_filename_dedup`, and `demandCallerLocation_bisim_eager`.
+  `bensherman` `cl/1022801564` `#cpp_vc_narrow`)**: ONE Boolean checker
+  (`checkBatchedVcConeNarrowCert`, discharged by a single `decide +kernel`) from which every field
+  of the propositional certificate is derived (`BatchedVcConeNarrowCert.ofCheck`): closed
+  direct/polymorphic/trait-method call cone, mask-based first-match `findCallee?` preservation
+  (duplicate shadowing included, no body equality needed), `TraitImplEntry` target closure with
+  `hoistTraitImpls`, and external-contract admissibility (`UntrustedAdmissible`, summary
+  agreement). `computeBatchedVcNarrowCert` / `collectTraitConeBodies` compute the certificate
+  data. Core theorems: `runMirExecBounded_narrow_of_batchedCert`,
+  `wpMirExecSym_narrow_of_batchedCert`, and `vcMirWithCallees_narrow_of_batchedCert` over a
+  contract-aware WP (`wpMirExecExt`) in which cone summaries genuinely restrict external-call
+  answers (`canary_externalSummary_vc`). `coerceValueAt` is sealed (`@[irreducible]`) with targeted
+  rewrite lemmas.
+* **Part C (`DemandCallerLocationEnv`, `proofs-rs/lean-miri` PR #67 Schema 15)**: demand-time
+  `#[track_caller]` `core::panic::Location` + deduplicated filename allocation in `Memory.globals`
+  (fresh ids drawn from the *next fresh* `Memory.nextAllocId`), `find_closest_untracked_caller_location`
+  resolution with per-crate `-Zlocation-detail` policies (all 8 combinations, `Option` call sites),
+  and general theorems over ALL call-site tables and traces: `demandCallerLocation_bisim_eager`,
+  `demandCallerLocation_no_call_zero_allocs`, `eagerCallerLocation_clutter`, and
+  `allocRenamingRel_of_readLocations`.
 * **Part D (`LazyWriteChain` & `bvShiftSafe` / `shiftLeftBitsSafe`, `bilid` `cl/1023450318` &
-  `cl/1023378691`, `leanprover/lean4` PRs #16501 & #16504)**: Lazy 1-layer overwrite-stripping
-  symbolic array writes (`mkLazyWrite`, $O(N)$ vs. $O(N^2)$ `mkEagerWrite` on $N$ distinct
-  addresses) and total width-clamped `BitVec` and Anneal `Scalars` shifts evaluating `shift = 2^64`
-  in $O(1)$ heartbeats.
+  `cl/1023378691`, `leanprover/lean4` PRs #16501 & #16504)**: static-width lazy 1-layer
+  overwrite-stripping writes (`mkLazyWrite`: `O(1)` per write) vs. spine-stripping `mkEagerWrite`,
+  with step counts proved on instrumented copies of the implementations (`N` vs. `N(N+1)/2`), and
+  total width-clamped `BitVec` / Anneal `Scalars` shifts evaluating `shift = 2^64` in the kernel.
 -/
 
 namespace Anneal.SparseRetagAndVcNarrowPrototype
@@ -545,9 +553,20 @@ theorem fnEntryRetagPermWithAttr_implicitWrites_false (mutability : Mutability) 
       fnEntryRetagPerm mutability pointee := by
   cases mutability <;> simp [fnEntryRetagPermWithAttr, fnEntryRetagPerm]
 
-/-- Post-upgrade the head borrow entry's permission after `evalStmt` on `.retag .fnEntry` when
-`implicitWrites && !rustcNoWritable` activates a mutable reference retag to `.unique`. -/
-def applyImplicitWriteUpgrade (node : MirStepNode) (localDecls : List LocalDecl)
+/-- Upgrade the protected child created by `evalStmt` on `.retag .fnEntry` to `.unique` when
+`implicitWrites && !rustcNoWritable` activates a mutable reference at function entry.
+
+The child is identified *by its fresh tag*: `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnEntryRetag`
+pushes `child :: borrowsAfterRead` with `child.tag = preTag` (the pre-step `nextTag`) and bumps
+`nextTag` to `preTag + 1`. Retag paths that create no child (slice fat pointers, which only attach a
+protector; non-null ZST scalars; pointers into global allocations; unknown place types) leave
+`nextTag` unchanged, so their unrelated head borrow entry is never touched (the `[adv A0]` overlay
+rewrote whatever entry happened to be at the head of `borrows`).
+
+Scope: only the initial permission is modeled; the implicit child write's foreign-access effects
+on other tags (`treeBorrowForeignWrite`) are not, which `PROTOTYPE_REPORT.md` lists as a Track A
+integration item. -/
+def applyImplicitWriteUpgrade (preTag : Nat) (node : MirStepNode) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (place : Place) (implicitWrites rustcNoWritable : Bool) :
     MirStepNode :=
   match implicitWrites && !rustcNoWritable with
@@ -559,11 +578,37 @@ def applyImplicitWriteUpgrade (node : MirStepNode) (localDecls : List LocalDecl)
       | .tau (.running s') =>
         match s'.memory.borrows with
         | head :: tail =>
-          MirStepNode.step
-            { s' with memory := { s'.memory with borrows := { head with perm := .unique } :: tail } }
+          match Nat.beq head.tag preTag && Nat.beq s'.memory.nextTag (preTag + 1) with
+          | true =>
+            MirStepNode.step
+              { s' with memory := { s'.memory with
+                  borrows := { head with perm := .unique } :: tail } }
+          | false => node
         | [] => node
       | _ => node
     | _ => node
+
+/-- **Child-targeting of the implicit-write overlay**: when the step created no fresh child
+(`nextTag` unchanged), `applyImplicitWriteUpgrade` is the identity — no unrelated borrow entry is
+ever rewritten. -/
+theorem applyImplicitWriteUpgrade_of_no_fresh_child (preTag : Nat) (s' : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (implicitWrites rustcNoWritable : Bool) (h : s'.memory.nextTag = preTag) :
+    applyImplicitWriteUpgrade preTag (.tau (.running s')) localDecls layouts place
+        implicitWrites rustcNoWritable = .tau (.running s') := by
+  have hb : Nat.beq s'.memory.nextTag (preTag + 1) = false := by
+    rw [h]
+    exact nat_beq_ne (Nat.ne_of_lt (Nat.lt_succ_self preTag))
+  unfold applyImplicitWriteUpgrade
+  cases implicitWrites && !rustcNoWritable with
+  | false => rfl
+  | true =>
+    dsimp only
+    split
+    · split
+      · rw [hb, Bool.and_false]
+      · rfl
+    · rfl
 
 /-- Operational `Statement` evaluator parameterized by an attribute-query oracle
 `queryAttr : Nat → Except RetagAttrErr Bool`, mirroring `Miri/Interpreter/TypedRetag.lean` lines
@@ -582,7 +627,7 @@ def evalStmtWithRetagAttrOracle (queryAttr : Nat → Except RetagAttrErr Bool)
     match queryAttr frameDefId with
     | .error _ => MirStepNode.unsupported
     | .ok noWritable =>
-      applyImplicitWriteUpgrade (evalStmt s stmt localDecls layouts)
+      applyImplicitWriteUpgrade s.memory.nextTag (evalStmt s stmt localDecls layouts)
         localDecls layouts place true noWritable
   | _, _ => evalStmt s stmt localDecls layouts
 
@@ -2103,8 +2148,8 @@ theorem coneReach_of_closedInvTrait {cone : List DefPath} {root : CapturedMir}
 
 /-! ### External Summary Environment & Batched VC Cone Narrowing Certificate (`#cpp_vc_narrow`) -/
 
-/-- External call summary entry associating an external `DefPath` with a deterministic return-value
-contract identifier (`summaryTag : Nat`). -/
+/-- External call summary entry associating an external `DefPath` with a return-value contract
+identifier (`summaryTag : Nat`, interpreted by an `ExternalContractInterp`). -/
 structure ExternalCallSummary where
   defPath : DefPath
   summaryTag : Nat
@@ -2126,22 +2171,9 @@ def checkExternalSummariesAgreeOn (cone : List DefPath)
     (ext₁ ext₂ : ExternalSummaryEnv) : Bool :=
   cone.all (fun dp => decide (findExternalSummary? ext₁ dp = findExternalSummary? ext₂ dp))
 
-/-- Decidable first-match `findCallee?` agreement between `c₁` and `c₂` on `cone`. -/
-def checkCalleesAgreeOn (cone : List DefPath) (c₁ c₂ : List CapturedMir) : Bool :=
-  cone.all (fun dp =>
-    match findCallee? c₁ dp, findCallee? c₂ dp with
-    | none, none => true
-    | some b₁, some b₂ =>
-      stringEq b₁.defPath b₂.defPath &&
-        decide (b₁.argCount = b₂.argCount) &&
-        decide (b₁.typeParamCount = b₂.typeParamCount) &&
-        decide (b₁.basicBlocks.length = b₂.basicBlocks.length)
-    | _, _ => false)
-
-/-- Decidable check that for every `dp ∈ cone`:
-1. every `TraitImplEntry` targeting `dp` in `ti₁ ++ flatMapTraitImpls c₁` has `e.implPath ∈ cone`,
-   and
-2. `findCallee? c₂ e.implPath` is present (`isSome`, rejecting missing impl bodies). -/
+/-- Decidable check that for every `dp ∈ cone`, every `TraitImplEntry` targeting `dp` in
+`ti₁ ++ flatMapTraitImpls c₁` has `e.implPath ∈ cone` and a body in `c₂` (rejecting missing impl
+bodies). -/
 def checkTraitImplConeClosed (cone : List DefPath) (c₁ c₂ : List CapturedMir)
     (ti₁ : List TraitImplEntry) : Bool :=
   let allTi₁ := ti₁ ++ flatMapTraitImpls c₁
@@ -2164,105 +2196,208 @@ theorem traitImplConeClosed_imp {cone : List DefPath} {c₁ c₂ : List Captured
   simp only [hs, ↓reduceIte, Bool.and_eq_true] at h2
   exact inCone_iff.mp h2.1
 
-/-- Canonical trait-preserving narrowing of `fullCallees` to `cone`:
-- `narrowCallees := stripCalleeTraitImpls (coneBodies cone fullCallees)` (or `coneBodies cone fullCallees`),
-- `hoistedExtra := hoistTraitImpls fullCallees extra`. -/
-def narrowCalleesWithHoistedTraits (cone : List DefPath) (fullCallees : List CapturedMir)
-    (extra : List TraitImplEntry) : List CapturedMir × List TraitImplEntry :=
-  (coneBodies cone fullCallees, hoistTraitImpls fullCallees extra)
+/-! #### Mask-Based Callee Narrowing (sound first-match preservation without body equality) -/
+
+/-- Keep the callees whose mask bit is `true` (missing bits drop the callee). -/
+def selectByMask : List CapturedMir → List Bool → List CapturedMir
+  | [], _ => []
+  | _ :: _, [] => []
+  | c :: cs, b :: bs => if b then c :: selectByMask cs bs else selectByMask cs bs
+
+/-- Index of the first callee whose `defPath` is `dp` (the entry `findCallee?` returns). -/
+def firstCalleeIdx? : List CapturedMir → DefPath → Option Nat
+  | [], _ => none
+  | c :: cs, dp => if stringEq c.defPath dp then some 0 else (firstCalleeIdx? cs dp).map (· + 1)
+
+/-- For every `dp ∈ cone`, the mask keeps the *first* full-table entry for `dp`, so a shadowed
+duplicate can never be exposed by the narrowing (string/index-only check: no `CapturedMir`
+equality is needed). -/
+def checkMaskKeepsFirstMatch (cone : List DefPath) (full : List CapturedMir)
+    (mask : List Bool) : Bool :=
+  cone.all (fun dp =>
+    match firstCalleeIdx? full dp with
+    | none => true
+    | some i => mask.getD i false)
+
+theorem firstCalleeIdx?_cons (c : CapturedMir) (cs : List CapturedMir) (dp : DefPath) :
+    firstCalleeIdx? (c :: cs) dp =
+      if stringEq c.defPath dp then some 0 else (firstCalleeIdx? cs dp).map (· + 1) := rfl
+
+theorem findCallee?_cons (c : CapturedMir) (cs : List CapturedMir) (dp : DefPath) :
+    findCallee? (c :: cs) dp =
+      match stringEq c.defPath dp with
+      | true => some c
+      | false => findCallee? cs dp := rfl
+
+theorem findCallee?_eq_none_of_firstCalleeIdx? :
+    ∀ {cs : List CapturedMir} {dp : DefPath}, firstCalleeIdx? cs dp = none → findCallee? cs dp = none
+  | [], _, _ => rfl
+  | c :: cs, dp, h => by
+    rw [firstCalleeIdx?_cons] at h
+    rw [findCallee?_cons]
+    cases hs : stringEq c.defPath dp with
+    | true => rw [hs] at h; nomatch h
+    | false =>
+      rw [hs] at h
+      dsimp only
+      cases hj : firstCalleeIdx? cs dp with
+      | none => exact findCallee?_eq_none_of_firstCalleeIdx? hj
+      | some j => rw [hj] at h; nomatch h
+
+theorem findCallee?_selectByMask :
+    ∀ (full : List CapturedMir) (mask : List Bool) (dp : DefPath),
+      (match firstCalleeIdx? full dp with
+        | none => true
+        | some i => mask.getD i false) = true →
+      findCallee? (selectByMask full mask) dp = findCallee? full dp
+  | [], _, _, _ => rfl
+  | c :: cs, mask, dp, h => by
+    cases hs : stringEq c.defPath dp with
+    | true =>
+      have hfi : firstCalleeIdx? (c :: cs) dp = some 0 := by
+        rw [firstCalleeIdx?_cons, hs]
+        rfl
+      rw [hfi] at h
+      cases mask with
+      | nil => nomatch h
+      | cons b bs =>
+        cases b with
+        | false => nomatch h
+        | true =>
+          show findCallee? (c :: selectByMask cs bs) dp = findCallee? (c :: cs) dp
+          rw [findCallee?_cons, findCallee?_cons, hs]
+    | false =>
+      have hfi : firstCalleeIdx? (c :: cs) dp = (firstCalleeIdx? cs dp).map (· + 1) := by
+        rw [firstCalleeIdx?_cons, hs]
+        rfl
+      have hfull : findCallee? (c :: cs) dp = findCallee? cs dp := by
+        rw [findCallee?_cons, hs]
+      rw [hfi] at h
+      rw [hfull]
+      cases mask with
+      | nil =>
+        cases hj : firstCalleeIdx? cs dp with
+        | none => exact (findCallee?_eq_none_of_firstCalleeIdx? hj).symm
+        | some j => rw [hj] at h; nomatch h
+      | cons b bs =>
+        have ih := findCallee?_selectByMask cs bs dp (by
+          cases hj : firstCalleeIdx? cs dp with
+          | none => rfl
+          | some j =>
+            rw [hj] at h
+            exact h)
+        cases b with
+        | false => exact ih
+        | true =>
+          show findCallee? (c :: selectByMask cs bs) dp = findCallee? cs dp
+          rw [findCallee?_cons, hs]
+          exact ih
+
+theorem calleesAgreeOn_selectByMask {cone : List DefPath} {full : List CapturedMir}
+    {mask : List Bool} (h : checkMaskKeepsFirstMatch cone full mask = true) :
+    calleesAgreeOn cone full (selectByMask full mask) := by
+  intro dp hdp
+  exact (findCallee?_selectByMask full mask dp (List.all_eq_true.mp h dp hdp)).symm
+
+/-- Kept bodies carry no `TraitImplEntry` targeting a cone path, so hoisting every entry with
+`hoistTraitImpls` cannot duplicate cone dispatch records (fail-closed restriction). -/
+def checkKeptCarryNoConeTraitImpls (cone : List DefPath) (narrow : List CapturedMir) : Bool :=
+  (flatMapTraitImpls narrow).all (fun e => !inCone cone e.traitRef.defPath)
+
+theorem traitFilter_hoist_eq {cone : List DefPath} {full narrow : List CapturedMir}
+    {extra : List TraitImplEntry} (h : checkKeptCarryNoConeTraitImpls cone narrow = true)
+    {dp : DefPath} (hdp : dp ∈ cone) :
+    (extra ++ flatMapTraitImpls full).filter (fun e => stringEq e.traitRef.defPath dp) =
+      (hoistTraitImpls full extra ++ flatMapTraitImpls narrow).filter
+        (fun e => stringEq e.traitRef.defPath dp) := by
+  have hgen : ∀ (l : List TraitImplEntry),
+      l.all (fun e => !inCone cone e.traitRef.defPath) = true →
+      l.filter (fun e => stringEq e.traitRef.defPath dp) = [] := by
+    intro l
+    induction l with
+    | nil => intro _; rfl
+    | cons e rest ih =>
+      intro hall
+      rw [List.all_cons, Bool.and_eq_true] at hall
+      have hs : stringEq e.traitRef.defPath dp = false := by
+        cases hs : stringEq e.traitRef.defPath dp with
+        | false => rfl
+        | true =>
+          have hin : inCone cone e.traitRef.defPath = true := by
+            rw [coneStringEq_iff.mp hs]
+            exact inCone_iff.mpr hdp
+          have hno := hall.1
+          rw [hin] at hno
+          nomatch hno
+      simp only [List.filter, hs]
+      exact ih hall.2
+  have hnil : (flatMapTraitImpls narrow).filter (fun e => stringEq e.traitRef.defPath dp) = [] :=
+    hgen _ h
+  conv => rhs; rw [List.filter_append, hnil, List.append_nil]
+  rfl
 
 /-- Single batched VC call-cone + trait-impl + external-summary narrowing certificate checker
-(`#cpp_vc_narrow`, `cl/1022801564`):
-Checks in one `decide +kernel` invocation:
-1. `bodyCallsInConePoly cone rootBody`
-2. `(coneBodies cone fullCallees).all (bodyCallsInConePoly cone)`
-3. `checkCalleesAgreeOn cone fullCallees narrowCallees`
-4. `checkTraitImplConeClosed cone fullCallees narrowCallees extra₁`
-5. `checkUntrustedAdmissible fullCallees fullExt` and
-   `checkExternalSummariesAgreeOn cone fullExt narrowExt`. -/
+(`#cpp_vc_narrow`, `cl/1022801564`), checked in ONE `decide +kernel` call. The narrowed
+environment is *determined by the certificate data*: `narrowCallees := selectByMask fullCallees
+mask` and `hoistedExtra := hoistTraitImpls fullCallees extra`. Checks:
+1. `bodyCallsInConePoly cone rootBody` and `(coneBodies cone fullCallees).all (bodyCallsInConePoly cone)`
+   (closed direct/polymorphic/trait-method call cone),
+2. `checkMaskKeepsFirstMatch` (first-match `findCallee?` agreement, incl. duplicate shadowing),
+3. `checkTraitImplConeClosed` (every `TraitImplEntry` target of a cone path is in the cone and
+   has a body in the narrowed table),
+4. `checkKeptCarryNoConeTraitImpls` (hoisting cannot duplicate cone dispatch records),
+5. `checkUntrustedAdmissible` + `checkExternalSummariesAgreeOn` (external contracts). -/
 def checkBatchedVcConeNarrowCert (cone : List DefPath) (rootBody : CapturedMir)
-    (fullCallees narrowCallees : List CapturedMir)
-    (extra₁ extra₂ : List TraitImplEntry)
+    (fullCallees : List CapturedMir) (mask : List Bool) (extra : List TraitImplEntry)
     (fullExt narrowExt : ExternalSummaryEnv := []) : Bool :=
   bodyCallsInConePoly cone rootBody &&
     (coneBodies cone fullCallees).all (bodyCallsInConePoly cone) &&
-    checkCalleesAgreeOn cone fullCallees narrowCallees &&
-    checkTraitImplConeClosed cone fullCallees narrowCallees extra₁ &&
-    cone.all (fun dp =>
-      listEqBy traitImplEntryEq
-        ((extra₁ ++ flatMapTraitImpls fullCallees).filter (fun e => stringEq e.traitRef.defPath dp))
-        ((extra₂ ++ flatMapTraitImpls narrowCallees).filter (fun e => stringEq e.traitRef.defPath dp))) &&
+    checkMaskKeepsFirstMatch cone fullCallees mask &&
+    checkTraitImplConeClosed cone fullCallees (selectByMask fullCallees mask) extra &&
+    checkKeptCarryNoConeTraitImpls cone (selectByMask fullCallees mask) &&
     checkUntrustedAdmissible fullCallees fullExt &&
     checkExternalSummariesAgreeOn cone fullExt narrowExt
 
-/-- Propositional batched VC narrowing certificate combining `checkBatchedVcConeNarrowCert = true`
-with `TraitConeAgreeOn cone fullCallees narrowCallees extra₁ extra₂`. For the canonical
-`(stripCalleeTraitImpls (coneBodies cone fullCallees), hoistTraitImpls fullCallees extra₁)` or
-`(coneBodies cone fullCallees, extra₁)` when hoisted, `TraitConeAgreeOn` is discharged
-automatically by `traitConeAgreeOn_of_batchedCert`. -/
+/-- Propositional batched VC narrowing certificate for an arbitrary narrowed environment
+`(narrowCallees, extra₂, narrowExt)`; `BatchedVcConeNarrowCert.ofCheck` derives *every* field from
+the single Boolean `checkBatchedVcConeNarrowCert`. -/
 structure BatchedVcConeNarrowCert (cone : List DefPath) (rootBody : CapturedMir)
     (fullCallees narrowCallees : List CapturedMir)
     (extra₁ extra₂ : List TraitImplEntry)
     (fullExt narrowExt : ExternalSummaryEnv := []) : Prop where
-  certOk :
-    checkBatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees
-      extra₁ extra₂ fullExt narrowExt = true
-  calleesAgree : calleesAgreeOn cone fullCallees narrowCallees
-  traitFilterAgree :
-    ∀ dp ∈ cone,
-      (extra₁ ++ flatMapTraitImpls fullCallees).filter (fun e => stringEq e.traitRef.defPath dp) =
-        (extra₂ ++ flatMapTraitImpls narrowCallees).filter (fun e => stringEq e.traitRef.defPath dp)
+  rootInCone : bodyCallsInConePoly cone rootBody = true
+  coneBodiesInCone : (coneBodies cone fullCallees).all (bodyCallsInConePoly cone) = true
+  traitConeAgree : TraitConeAgreeOn cone fullCallees narrowCallees extra₁ extra₂
+  untrustedAdmissible : ∀ ext ∈ fullExt, findCallee? fullCallees ext.defPath = none
+  extAgree : ∀ dp ∈ cone, findExternalSummary? fullExt dp = findExternalSummary? narrowExt dp
 
-theorem BatchedVcConeNarrowCert.rootInCone {cone : List DefPath} {rootBody : CapturedMir}
-    {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
+/-- **Soundness of the single batched checker (`BatchedVcConeNarrowCert.ofCheck`)**. -/
+theorem BatchedVcConeNarrowCert.ofCheck {cone : List DefPath} {rootBody : CapturedMir}
+    {fullCallees : List CapturedMir} {mask : List Bool} {extra : List TraitImplEntry}
     {fullExt narrowExt : ExternalSummaryEnv}
-    (h : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees extra₁ extra₂ fullExt narrowExt) :
-    bodyCallsInConePoly cone rootBody = true := by
-  have hc := h.certOk
-  unfold checkBatchedVcConeNarrowCert at hc
-  simp only [Bool.and_eq_true] at hc
-  exact hc.1.1.1.1.1.1
-
-theorem BatchedVcConeNarrowCert.coneBodiesInCone {cone : List DefPath} {rootBody : CapturedMir}
-    {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
-    {fullExt narrowExt : ExternalSummaryEnv}
-    (h : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees extra₁ extra₂ fullExt narrowExt) :
-    (coneBodies cone fullCallees).all (bodyCallsInConePoly cone) = true := by
-  have hc := h.certOk
-  unfold checkBatchedVcConeNarrowCert at hc
-  simp only [Bool.and_eq_true] at hc
-  exact hc.1.1.1.1.1.2
-
-theorem BatchedVcConeNarrowCert.traitImplsInCone {cone : List DefPath} {rootBody : CapturedMir}
-    {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
-    {fullExt narrowExt : ExternalSummaryEnv}
-    (h : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees extra₁ extra₂ fullExt narrowExt) :
-    ∀ dp ∈ cone, ∀ e ∈ extra₁ ++ flatMapTraitImpls fullCallees,
-      stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone := by
-  have hc := h.certOk
-  unfold checkBatchedVcConeNarrowCert at hc
-  simp only [Bool.and_eq_true] at hc
-  exact traitImplConeClosed_imp hc.1.1.1.2
+    (h : checkBatchedVcConeNarrowCert cone rootBody fullCallees mask extra fullExt narrowExt = true) :
+    BatchedVcConeNarrowCert cone rootBody fullCallees (selectByMask fullCallees mask)
+      extra (hoistTraitImpls fullCallees extra) fullExt narrowExt := by
+  unfold checkBatchedVcConeNarrowCert at h
+  simp only [Bool.and_eq_true] at h
+  obtain ⟨⟨⟨⟨⟨⟨h_root, h_cone⟩, h_mask⟩, h_closed⟩, h_kept⟩, h_adm⟩, h_ext⟩ := h
+  refine ⟨h_root, h_cone, ⟨calleesAgreeOn_selectByMask h_mask,
+    fun dp hdp => traitFilter_hoist_eq h_kept hdp, traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
+  · intro ext hext
+    unfold checkUntrustedAdmissible at h_adm
+    exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
+  · intro dp hdp
+    unfold checkExternalSummariesAgreeOn at h_ext
+    exact of_decide_eq_true (List.all_eq_true.mp h_ext dp hdp)
 
 theorem BatchedVcConeNarrowCert.toTraitConeAgreeOn {cone : List DefPath} {rootBody : CapturedMir}
     {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
     {fullExt narrowExt : ExternalSummaryEnv}
     (h : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees extra₁ extra₂ fullExt narrowExt) :
     TraitConeAgreeOn cone fullCallees narrowCallees extra₁ extra₂ :=
-  ⟨h.calleesAgree, h.traitFilterAgree, h.traitImplsInCone⟩
+  h.traitConeAgree
 
-theorem BatchedVcConeNarrowCert.untrustedAdmissible {cone : List DefPath} {rootBody : CapturedMir}
-    {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
-    {fullExt narrowExt : ExternalSummaryEnv}
-    (h : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees extra₁ extra₂ fullExt narrowExt) :
-    checkUntrustedAdmissible fullCallees fullExt = true ∧
-      checkExternalSummariesAgreeOn cone fullExt narrowExt = true := by
-  have hc := h.certOk
-  unfold checkBatchedVcConeNarrowCert at hc
-  simp only [Bool.and_eq_true] at hc
-  exact ⟨hc.1.2, hc.2⟩
-
-/-- `lookupCallee` equivalence from a `BatchedVcConeNarrowCert`. -/
+/-- `lookupCallee` equivalence from a `BatchedVcConeNarrowCert` across all cone call keys. -/
 theorem lookupCallee_eq_of_batchedCert {cone : List DefPath} {rootBody : CapturedMir}
     {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
     {fullExt narrowExt : ExternalSummaryEnv}
@@ -2271,6 +2406,16 @@ theorem lookupCallee_eq_of_batchedCert {cone : List DefPath} {rootBody : Capture
     lookupCallee fullCallees layouts dp typeArgs extra₁ =
       lookupCallee narrowCallees layouts dp typeArgs extra₂ :=
   lookupCallee_eq_of_traitConeAgreeOn layouts typeArgs h.toTraitConeAgreeOn h_dp
+
+/-- Entry-state invariant shared by the narrowing theorems. -/
+theorem closedInvPoly_entry {cone : List DefPath} {rootBody : CapturedMir}
+    {fullCallees : List CapturedMir} {extra₁ : List TraitImplEntry} {s : MachineState}
+    (h_callees : s.memory.callees = fullCallees) (h_traits : s.memory.traitImpls = extra₁)
+    (h_ac : s.memory.activeCallee = none) (h_cs : s.memory.callStack = []) :
+    ClosedInvPoly cone rootBody fullCallees extra₁ s := by
+  refine ⟨h_callees, h_traits, ?_, ?_⟩
+  · rw [h_ac]; exact Or.inl rfl
+  · intro f hf; rw [h_cs] at hf; nomatch hf
 
 /-- **Core Bounded Execution Narrowing Theorem (`runMirExecBounded_narrow_of_batchedCert`)**:
 A single `BatchedVcConeNarrowCert` narrows `(fullCallees, extra₁)` to `(narrowCallees, extra₂)`
@@ -2290,12 +2435,10 @@ theorem runMirExecBounded_narrow_of_batchedCert {cone : List DefPath} {rootBody 
         (.running (MachineState.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) s)) =
       (runMirExecBounded fuel rootBody (.running s)).map
         (MirOutcome.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂)) := by
-  have h_inv : ClosedInvPoly cone rootBody fullCallees extra₁ s := by
-    refine ⟨h_callees, h_traits, ?_, ?_⟩
-    · rw [h_ac]; exact Or.inl rfl
-    · intro f hf; rw [h_cs] at hf; nomatch hf
+  have h_inv : ClosedInvPoly cone rootBody fullCallees extra₁ s :=
+    closedInvPoly_entry h_callees h_traits h_ac h_cs
   have h_reach := coneReach_of_closedInvTrait h_cert.rootInCone h_cert.coneBodiesInCone
-    h_cert.traitImplsInCone fuel s h_inv
+    h_cert.traitConeAgree.2.2 fuel s h_inv
   have h_at : TraitAgreesAt cone narrowCallees extra₂ (.running s) := by
     intro s' hs'
     cases hs'
@@ -2304,10 +2447,7 @@ theorem runMirExecBounded_narrow_of_batchedCert {cone : List DefPath} {rootBody 
   exact runMirExecBounded_trait_cone_narrow cone rootBody narrowCallees extra₂ fuel
     (.running s) h_reach h_at
 
-/-- **Core Symbolic WP Narrowing Theorem (`wpMirExecSym_narrow_of_batchedCert`)**:
-Under `BatchedVcConeNarrowCert`, `wpMirExecSym` in the narrowed `(narrowCallees, extra₂)`
-environment is logically equivalent (`↔`) to `wpMirExecSym` in `(fullCallees, extra₁)` for any
-postcondition invariant under `Memory.withCalleesAndTraits narrowCallees extra₂`. -/
+/-- **Core Symbolic WP Narrowing Theorem (`wpMirExecSym_narrow_of_batchedCert`)**. -/
 theorem wpMirExecSym_narrow_of_batchedCert {cone : List DefPath} {rootBody : CapturedMir}
     {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
     {fullExt narrowExt : ExternalSummaryEnv}
@@ -2325,12 +2465,10 @@ theorem wpMirExecSym_narrow_of_batchedCert {cone : List DefPath} {rootBody : Cap
         (.running (MachineState.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) s))
         post ↔
       wpMirExecSym fuel rootBody (.running s) post := by
-  have h_inv : ClosedInvPoly cone rootBody fullCallees extra₁ s := by
-    refine ⟨h_callees, h_traits, ?_, ?_⟩
-    · rw [h_ac]; exact Or.inl rfl
-    · intro f hf; rw [h_cs] at hf; nomatch hf
+  have h_inv : ClosedInvPoly cone rootBody fullCallees extra₁ s :=
+    closedInvPoly_entry h_callees h_traits h_ac h_cs
   have h_reach := coneReach_of_closedInvTrait h_cert.rootInCone h_cert.coneBodiesInCone
-    h_cert.traitImplsInCone fuel s h_inv
+    h_cert.traitConeAgree.2.2 fuel s h_inv
   have h_at : TraitAgreesAt cone narrowCallees extra₂ (.running s) := by
     intro s' hs'
     cases hs'
@@ -2339,38 +2477,274 @@ theorem wpMirExecSym_narrow_of_batchedCert {cone : List DefPath} {rootBody : Cap
   exact wpMirExecSym_trait_cone_narrow cone rootBody narrowCallees extra₂ post h_post fuel
     (.running s) h_reach h_at
 
-/-- Verification Condition wrapper (`vcMirWithCallees`) pairing `wpMirExecSym` with external
-summary environment lookup on `cone`. -/
-def vcMirWithCallees (fuel : Nat) (rootBody : CapturedMir) (s : MachineState)
-    (callees : List CapturedMir) (traitImpls : List TraitImplEntry)
-    (extEnv : ExternalSummaryEnv) (cone : List DefPath) (post : MirOutcome → Prop) : Prop :=
-  wpMirExecSym fuel rootBody
-      (.running (MachineState.mapMem (Memory.withCalleesAndTraits callees traitImpls) s)) post ∧
-    ∀ dp ∈ cone, (findCallee? callees dp).isNone = true →
-      findExternalSummary? extEnv dp = findExternalSummary? extEnv dp
+/-! #### Contract-Aware Verification Conditions (`vcMirWithCallees`) -/
 
-/-- **Combined VC + External-Summary Narrowing Theorem (`vcMirWithCallees_narrow_of_batchedCert`)**:
-Narrows both `(fullCallees, extra₁)` and `fullExt` to `(narrowCallees, extra₂)` and `narrowExt` in
-one `BatchedVcConeNarrowCert` step, plus proves that `findExternalSummary? fullExt dp =
-findExternalSummary? narrowExt dp` for every `dp ∈ cone` and no external summary in `fullExt`
-shadows an internal callee. -/
+/-- Interpretation of external call contracts: `contracts tag req ans` holds when answer `ans` to
+request `req` satisfies the summary contract identified by `tag`. -/
+abbrev ExternalContractInterp := Nat → MirCallReq → MirCallAns → Prop
+
+/-- External summary lookup restricted to the call cone (summaries outside the cone are never
+trusted; a reachable external call outside the cone is havoc'd, which is conservative). -/
+def coneSummary? (cone : List DefPath) (extEnv : ExternalSummaryEnv) (dp : DefPath) :
+    Option ExternalCallSummary :=
+  if inCone cone dp then findExternalSummary? extEnv dp else none
+
+/-- `evalNodeWP` (`SymbolicEval`) with external-call answers restricted by cone summaries: an
+external call to `dp` with summary `s` only considers answers satisfying `contracts s.summaryTag`;
+without a summary every answer is considered (havoc), exactly as in `wpMirExecSym`. -/
+def evalNodeWPExt (contracts : ExternalContractInterp) (cone : List DefPath)
+    (extEnv : ExternalSummaryEnv) (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    MirStepNode → Prop
+  | .ret out => post out
+  | .tau st' => cont st'
+  | .vis (.inl _) _ => False
+  | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
+  | .vis (.inr (.inr (.call req))) k =>
+    match coneSummary? cone extEnv req.defPath with
+    | some s => ∀ ans : MirCallAns, contracts s.summaryTag req ans → cont (k ans)
+    | none => ∀ ans : MirCallAns, cont (k ans)
+
+/-- Fuel-bounded contract-aware WP over `MirExecState`. -/
+def wpMirExecExt (contracts : ExternalContractInterp) (cone : List DefPath)
+    (extEnv : ExternalSummaryEnv) : Nat → CapturedMir → MirExecState → (MirOutcome → Prop) → Prop
+  | 0, _, _, _ => False
+  | fuel + 1, body, st, post =>
+    evalNodeWPExt contracts cone extEnv (fun st' => wpMirExecExt contracts cone extEnv fuel body st' post)
+      post (stepMirState body st)
+
+/-- With no summaries, the contract-aware WP is exactly `wpMirExecSym`. -/
+theorem wpMirExecExt_nil_iff (contracts : ExternalContractInterp) (cone : List DefPath)
+    (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpMirExecExt contracts cone [] fuel body st post ↔ wpMirExecSym fuel body st post
+  | 0, _ => Iff.rfl
+  | fuel + 1, st => by
+    rw [wpMirExecSym_succ_eq]
+    show evalNodeWPExt contracts cone [] _ post (stepMirState body st) ↔ _
+    cases stepMirState body st with
+    | ret out => exact Iff.rfl
+    | tau st' => exact wpMirExecExt_nil_iff contracts cone body post fuel st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · exact Iff.rfl
+      · exact wpMirExecExt_nil_iff contracts cone body post fuel (k PUnit.unit)
+      · cases req with | call req => ?_
+        have hnone : coneSummary? cone [] req.defPath = none := by
+          unfold coneSummary?
+          split <;> rfl
+        show (match coneSummary? cone [] req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans → wpMirExecExt contracts cone [] fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone [] fuel body (k ans) post) ↔
+          ∀ ans, wpMirExecSym fuel body (k ans) post
+        rw [hnone]
+        exact forall_congr' (fun ans => wpMirExecExt_nil_iff contracts cone body post fuel (k ans))
+
+/-- Summaries only weaken the obligation: the havoc WP implies the contract-aware WP. -/
+theorem wpMirExecExt_of_wpMirExecSym (contracts : ExternalContractInterp) (cone : List DefPath)
+    (extEnv : ExternalSummaryEnv) (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpMirExecSym fuel body st post → wpMirExecExt contracts cone extEnv fuel body st post
+  | 0, _, h => h
+  | fuel + 1, st, h => by
+    rw [wpMirExecSym_succ_eq] at h
+    show evalNodeWPExt contracts cone extEnv _ post (stepMirState body st)
+    revert h
+    cases stepMirState body st with
+    | ret out => exact id
+    | tau st' => exact wpMirExecExt_of_wpMirExecSym contracts cone extEnv body post fuel st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · exact id
+      · exact wpMirExecExt_of_wpMirExecSym contracts cone extEnv body post fuel (k PUnit.unit)
+      · cases req with | call req => ?_
+        intro h
+        show match coneSummary? cone extEnv req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans → wpMirExecExt contracts cone extEnv fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone extEnv fuel body (k ans) post
+        cases coneSummary? cone extEnv req.defPath with
+        | some _ =>
+          exact fun ans _ => wpMirExecExt_of_wpMirExecSym contracts cone extEnv body post fuel (k ans) (h ans)
+        | none =>
+          exact fun ans => wpMirExecExt_of_wpMirExecSym contracts cone extEnv body post fuel (k ans) (h ans)
+
+/-- A run that terminates without external calls (`runMirExecBounded = some out`) discharges
+the contract-aware WP exactly when `post out` holds (sufficiency). -/
+theorem wpMirExecExt_of_run (contracts : ExternalContractInterp) (cone : List DefPath)
+    (extEnv : ExternalSummaryEnv) (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState) (out : MirOutcome),
+      runMirExecBounded fuel body st = some out → post out →
+      wpMirExecExt contracts cone extEnv fuel body st post
+  | 0, _, _, h, _ => nomatch h
+  | fuel + 1, st, out, h, hp => by
+    show evalNodeWPExt contracts cone extEnv _ post (stepMirState body st)
+    unfold runMirExecBounded at h
+    revert h
+    cases stepMirState body st with
+    | ret o => intro h; cases h; exact hp
+    | tau st' => exact fun h => wpMirExecExt_of_run contracts cone extEnv body post fuel st' out h hp
+    | vis e k =>
+      rcases e with fk | obs | c
+      · intro h; nomatch h
+      · exact fun h => wpMirExecExt_of_run contracts cone extEnv body post fuel (k PUnit.unit) out h hp
+      · intro h; nomatch h
+
+/-- ... and necessity: the WP of a terminating external-call-free run implies `post out`. -/
+theorem post_of_wpMirExecExt_run (contracts : ExternalContractInterp) (cone : List DefPath)
+    (extEnv : ExternalSummaryEnv) (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState) (out : MirOutcome),
+      runMirExecBounded fuel body st = some out →
+      wpMirExecExt contracts cone extEnv fuel body st post → post out
+  | 0, _, _, h, _ => nomatch h
+  | fuel + 1, st, out, h, hw => by
+    change evalNodeWPExt contracts cone extEnv _ post (stepMirState body st) at hw
+    unfold runMirExecBounded at h
+    cases hs : stepMirState body st with
+    | ret o =>
+      rw [hs] at h hw
+      cases h
+      exact hw
+    | tau st' =>
+      rw [hs] at h hw
+      exact post_of_wpMirExecExt_run contracts cone extEnv body post fuel st' out h hw
+    | vis e k =>
+      rw [hs] at h hw
+      rcases e with fk | obs | c
+      · nomatch h
+      · exact post_of_wpMirExecExt_run contracts cone extEnv body post fuel (k PUnit.unit) out h hw
+      · nomatch h
+
+/-- Summary-environment congruence (on unmapped states, e.g. after an external call answer). -/
+theorem wpMirExecExt_congr_ext (contracts : ExternalContractInterp) (cone : List DefPath)
+    {ext₁ ext₂ : ExternalSummaryEnv} (h_ext : ∀ dp, coneSummary? cone ext₂ dp = coneSummary? cone ext₁ dp)
+    (body : CapturedMir) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpMirExecExt contracts cone ext₂ fuel body st post ↔ wpMirExecExt contracts cone ext₁ fuel body st post
+  | 0, _ => Iff.rfl
+  | fuel + 1, st => by
+    show evalNodeWPExt contracts cone ext₂ _ post (stepMirState body st) ↔
+      evalNodeWPExt contracts cone ext₁ _ post (stepMirState body st)
+    cases stepMirState body st with
+    | ret out => exact Iff.rfl
+    | tau st' => exact wpMirExecExt_congr_ext contracts cone h_ext body post fuel st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · exact Iff.rfl
+      · exact wpMirExecExt_congr_ext contracts cone h_ext body post fuel (k PUnit.unit)
+      · cases req with | call req => ?_
+        show (match coneSummary? cone ext₂ req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans → wpMirExecExt contracts cone ext₂ fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone ext₂ fuel body (k ans) post) ↔
+          (match coneSummary? cone ext₁ req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans → wpMirExecExt contracts cone ext₁ fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone ext₁ fuel body (k ans) post)
+        rw [h_ext req.defPath]
+        cases coneSummary? cone ext₁ req.defPath with
+        | some s =>
+          exact forall_congr' (fun ans => imp_congr_right (fun _ =>
+            wpMirExecExt_congr_ext contracts cone h_ext body post fuel (k ans)))
+        | none =>
+          exact forall_congr' (fun ans => wpMirExecExt_congr_ext contracts cone h_ext body post fuel (k ans))
+
+/-- Trait-aware narrowing of the contract-aware WP (narrowing callees, trait impls, *and* the
+external summary environment simultaneously). -/
+theorem wpMirExecExt_trait_cone_narrow (cone : List DefPath) (body : CapturedMir)
+    (c₂ : CalleeEnv) (ti₂ : List TraitImplEntry) (contracts : ExternalContractInterp)
+    {ext₁ ext₂ : ExternalSummaryEnv} (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirOutcome.mapMem (Memory.withCalleesAndTraits c₂ ti₂) out) ↔ post out)
+    (h_contract : ∀ tag req ans,
+      contracts tag { req with memory := Memory.withCalleesAndTraits c₂ ti₂ req.memory } ans ↔
+        contracts tag req ans)
+    (h_ext : ∀ dp, coneSummary? cone ext₂ dp = coneSummary? cone ext₁ dp) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      ConeReach body (StepConeSafeTrait cone body) fuel st →
+      TraitAgreesAt cone c₂ ti₂ st →
+      (wpMirExecExt contracts cone ext₂ fuel body
+          (MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) st) post ↔
+        wpMirExecExt contracts cone ext₁ fuel body st post)
+  | 0, _, _, _ => Iff.rfl
+  | fuel + 1, .halted out, _, _ => h_post out
+  | fuel + 1, .faulted _, _, _ => Iff.rfl
+  | fuel + 1, .running s, h_reach, h_agree => by
+    have h_ag := h_agree s rfl
+    obtain ⟨h_safe, h_next⟩ := h_reach
+    have h_step := stepMirFn_withCalleesAndTraits cone body s c₂ ti₂ h_ag h_safe
+    have h_fix := stepMirFn_calleesAndTraits_preserved cone body s h_ag.2.2 h_safe
+    show evalNodeWPExt contracts cone ext₂ _ post
+        (stepMirFn body (MachineState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) s)) ↔
+      evalNodeWPExt contracts cone ext₁ _ post (stepMirFn body s)
+    rw [h_step]
+    revert h_next h_fix
+    cases stepMirFn body s with
+    | ret out => intro _ _; exact h_post out
+    | tau st' =>
+      intro h_next h_fix
+      have h_tau_fix : st' =
+          MirExecState.mapMem
+            (Memory.withCalleesAndTraits s.memory.callees s.memory.traitImpls) st' :=
+        Trusted.ITree.ITreeF.tau.inj h_fix
+      exact wpMirExecExt_trait_cone_narrow cone body c₂ ti₂ contracts post h_post h_contract h_ext
+        fuel st' h_next (traitAgreesAt_succ h_ag h_tau_fix)
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · intro _ _; exact Iff.rfl
+      · intro h_next h_fix
+        have hk : k PUnit.unit =
+            MirExecState.mapMem
+              (Memory.withCalleesAndTraits s.memory.callees s.memory.traitImpls)
+              (k PUnit.unit) :=
+          congrFun (eq_of_heq (Trusted.ITree.ITreeF.vis.inj h_fix).2) PUnit.unit
+        exact wpMirExecExt_trait_cone_narrow cone body c₂ ti₂ contracts post h_post h_contract h_ext
+          fuel (k PUnit.unit) h_next (traitAgreesAt_succ h_ag hk)
+      · cases req with | call req => ?_
+        intro _ _
+        show (match coneSummary? cone ext₂ req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag
+              { req with memory := Memory.withCalleesAndTraits c₂ ti₂ req.memory } ans →
+              wpMirExecExt contracts cone ext₂ fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone ext₂ fuel body (k ans) post) ↔
+          (match coneSummary? cone ext₁ req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans →
+              wpMirExecExt contracts cone ext₁ fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone ext₁ fuel body (k ans) post)
+        rw [h_ext req.defPath]
+        cases coneSummary? cone ext₁ req.defPath with
+        | some sm =>
+          exact forall_congr' (fun ans => imp_congr (h_contract sm.summaryTag req ans)
+            (wpMirExecExt_congr_ext contracts cone h_ext body post fuel (k ans)))
+        | none =>
+          exact forall_congr' (fun ans => wpMirExecExt_congr_ext contracts cone h_ext body post fuel (k ans))
+
+/-- Verification condition: contract-aware WP of `rootBody` from `s` with callee table `callees`,
+trait impls `traitImpls`, and external summaries `extEnv` (trusted only on `cone`). -/
+def vcMirWithCallees (contracts : ExternalContractInterp) (fuel : Nat) (rootBody : CapturedMir)
+    (s : MachineState) (callees : List CapturedMir) (traitImpls : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (cone : List DefPath) (post : MirOutcome → Prop) : Prop :=
+  wpMirExecExt contracts cone extEnv fuel rootBody
+    (.running (MachineState.mapMem (Memory.withCalleesAndTraits callees traitImpls) s)) post
+
+/-- **Combined VC + External-Contract Narrowing Theorem (`vcMirWithCallees_narrow_of_batchedCert`)**:
+one `BatchedVcConeNarrowCert` narrows `Memory.callees`, `Memory.traitImpls` (hoisted), AND the
+external summary environment, preserving the contract-aware VC for every postcondition and
+contract interpretation insensitive to `Memory.callees` / `Memory.traitImpls`. -/
 theorem vcMirWithCallees_narrow_of_batchedCert {cone : List DefPath} {rootBody : CapturedMir}
     {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
     {fullExt narrowExt : ExternalSummaryEnv}
     (h_cert : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees
       extra₁ extra₂ fullExt narrowExt)
-    (fuel : Nat) (s : MachineState)
+    (contracts : ExternalContractInterp) (fuel : Nat) (s : MachineState)
     (h_callees : s.memory.callees = fullCallees)
     (h_traits : s.memory.traitImpls = extra₁)
     (h_ac : s.memory.activeCallee = none)
     (h_cs : s.memory.callStack = [])
     (post : MirOutcome → Prop)
     (h_post : ∀ out,
-      post (MirOutcome.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) out) ↔ post out) :
-    (vcMirWithCallees fuel rootBody s narrowCallees extra₂ narrowExt cone post ↔
-      vcMirWithCallees fuel rootBody s fullCallees extra₁ fullExt cone post) ∧
-    (∀ dp ∈ cone, findExternalSummary? fullExt dp = findExternalSummary? narrowExt dp) ∧
-    (∀ ext ∈ fullExt, findCallee? fullCallees ext.defPath = none) := by
+      post (MirOutcome.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) out) ↔ post out)
+    (h_contract : ∀ tag req ans,
+      contracts tag { req with memory := Memory.withCalleesAndTraits narrowCallees extra₂ req.memory } ans ↔
+        contracts tag req ans) :
+    vcMirWithCallees contracts fuel rootBody s narrowCallees extra₂ narrowExt cone post ↔
+      vcMirWithCallees contracts fuel rootBody s fullCallees extra₁ fullExt cone post := by
   have h_self : MachineState.mapMem (Memory.withCalleesAndTraits fullCallees extra₁) s = s := by
     cases s with
     | mk frame mem =>
@@ -2379,20 +2753,85 @@ theorem vcMirWithCallees_narrow_of_batchedCert {cone : List DefPath} {rootBody :
       dsimp only at h_callees h_traits
       subst h_callees h_traits
       rfl
-  have h_wp := wpMirExecSym_narrow_of_batchedCert h_cert fuel s h_callees h_traits h_ac h_cs
-    post h_post
-  obtain ⟨h_adm, h_ext_ag⟩ := h_cert.untrustedAdmissible
-  refine ⟨?_, ?_, ?_⟩
-  · unfold vcMirWithCallees
-    rw [h_self]
-    exact ⟨fun ⟨hw, _⟩ => ⟨h_wp.mp hw, fun _ _ _ => rfl⟩,
-      fun ⟨hw, _⟩ => ⟨h_wp.mpr hw, fun _ _ _ => rfl⟩⟩
-  · intro dp hdp
-    unfold checkExternalSummariesAgreeOn at h_ext_ag
-    exact of_decide_eq_true (List.all_eq_true.mp h_ext_ag dp hdp)
-  · intro ext hext
-    unfold checkUntrustedAdmissible at h_adm
-    exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
+  have h_inv : ClosedInvPoly cone rootBody fullCallees extra₁ s :=
+    closedInvPoly_entry h_callees h_traits h_ac h_cs
+  have h_reach := coneReach_of_closedInvTrait h_cert.rootInCone h_cert.coneBodiesInCone
+    h_cert.traitConeAgree.2.2 fuel s h_inv
+  have h_at : TraitAgreesAt cone narrowCallees extra₂ (.running s) := by
+    intro s' hs'
+    cases hs'
+    rw [h_callees, h_traits]
+    exact h_cert.toTraitConeAgreeOn
+  have h_ext : ∀ dp, coneSummary? cone narrowExt dp = coneSummary? cone fullExt dp := by
+    intro dp
+    unfold coneSummary?
+    by_cases hin : inCone cone dp = true
+    · simp only [hin, ↓reduceIte]
+      exact (h_cert.extAgree dp (inCone_iff.mp hin)).symm
+    · simp only [hin, Bool.false_eq_true, ↓reduceIte]
+  unfold vcMirWithCallees
+  rw [h_self]
+  exact wpMirExecExt_trait_cone_narrow cone rootBody narrowCallees extra₂ contracts post h_post
+    h_contract h_ext fuel (.running s) h_reach h_at
+
+/-! #### Computing the Certificate (`collectTraitConeBodies`, `computeBatchedVcNarrowCert`) -/
+
+/-- Direct `.fnDef` call targets of a body's `call` / `tailCall` terminators. -/
+def bodyDirectCallTargets (b : CapturedMir) : List DefPath :=
+  b.basicBlocks.filterMap (fun blk =>
+    match blk.terminator.kind with
+    | .call func _ _ _ _ => extractFnDefPath? func
+    | .tailCall func _ => extractFnDefPath? func
+    | _ => none)
+
+/-- Order-preserving `DefPath` deduplication. -/
+def dedupDefPaths (dps : List DefPath) : List DefPath :=
+  dps.foldl (fun acc dp => if inCone acc dp then acc else acc ++ [dp]) []
+
+/-- One cone-closure step: add the direct call targets of every cone body and the `implPath` of
+every `TraitImplEntry` targeting a cone path. -/
+def traitConeStep (fullCallees : List CapturedMir) (allTi : List TraitImplEntry)
+    (cone : List DefPath) : List DefPath :=
+  dedupDefPaths (cone ++ (coneBodies cone fullCallees).flatMap bodyDirectCallTargets ++
+    allTi.filterMap (fun e => if inCone cone e.traitRef.defPath then some e.implPath else none))
+
+/-- `collectTraitConeBodies`: fuel-bounded transitive call + trait-impl closure from `rootBody`
+(the result is only a *candidate*; closure is re-checked by `checkBatchedVcConeNarrowCert`). -/
+def collectTraitConeBodies (fuel : Nat) (rootBody : CapturedMir) (fullCallees : List CapturedMir)
+    (extra : List TraitImplEntry) : List DefPath :=
+  let allTi := extra ++ flatMapTraitImpls fullCallees
+  (List.range fuel).foldl (fun cone _ => traitConeStep fullCallees allTi cone)
+    (dedupDefPaths (bodyDirectCallTargets rootBody))
+
+/-- Canonical certificate data `(cone, mask, narrowExt)`: keep every cone body, hoist all trait
+impls, and restrict external summaries to the cone. -/
+def computeBatchedVcNarrowCert (fuel : Nat) (rootBody : CapturedMir)
+    (fullCallees : List CapturedMir) (extra : List TraitImplEntry) (fullExt : ExternalSummaryEnv) :
+    List DefPath × List Bool × ExternalSummaryEnv :=
+  let cone := collectTraitConeBodies fuel rootBody fullCallees extra
+  (cone, fullCallees.map (fun b => inCone cone b.defPath),
+    fullExt.filter (fun s => inCone cone s.defPath))
+
+/-- The canonical mask keeps exactly `coneBodies`. -/
+theorem selectByMask_coneMask (cone : List DefPath) :
+    ∀ (full : List CapturedMir),
+      selectByMask full (full.map (fun b => inCone cone b.defPath)) = coneBodies cone full
+  | [] => rfl
+  | c :: cs => by
+    have ih := selectByMask_coneMask cone cs
+    show selectByMask (c :: cs) (inCone cone c.defPath :: cs.map (fun b => inCone cone b.defPath)) =
+      List.filter (fun b => inCone cone b.defPath) (c :: cs)
+    cases hc : inCone cone c.defPath with
+    | true =>
+      show c :: selectByMask cs (cs.map (fun b => inCone cone b.defPath)) = _
+      rw [ih]
+      simp only [List.filter, hc]
+      rfl
+    | false =>
+      show selectByMask cs (cs.map (fun b => inCone cone b.defPath)) = _
+      rw [ih]
+      simp only [List.filter, hc]
+      rfl
 
 /-! ### Non-Reducible Value-to-Storage Coercion (`@[irreducible] coerceValueAt`, `cl/1022801564`) -/
 
@@ -2731,72 +3170,212 @@ theorem canary_naiveNarrow_breaks_trait_dispatch :
     CallConeClosedPoly protoTraitCone traitCallRootMir protoFullCallees [] = false := by
   refine ⟨rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Constructive certificate proof that `protoTraitCone`, `protoFullCallees`, and
-`(protoNaiveNarrowCallees, protoHoistedExtra)` satisfy `BatchedVcConeNarrowCert`. -/
+/-- Initial machine state of `traitCallRootMir` with the full callee table. -/
+def protoTraitInitState : MachineState :=
+  MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees
+
+/-- Canonical keep-mask (`coneBodies`) of `protoFullCallees` over `protoTraitCone`. -/
+def protoTraitMask : List Bool :=
+  protoFullCallees.map (fun b => inCone protoTraitCone b.defPath)
+
+/-- The single batched certificate check for `traitCallRootMir`, computed by
+`computeBatchedVcNarrowCert` and discharged by ONE `decide +kernel`. -/
+theorem protoTraitBatchedCert_check :
+    computeBatchedVcNarrowCert 4 traitCallRootMir protoFullCallees [] [] =
+      (protoTraitCone, protoTraitMask, []) ∧
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees protoTraitMask
+      [] [] [] = true := by
+  decide +kernel
+
+/-- Certificate for `(protoNaiveNarrowCallees, protoHoistedExtra)`, derived entirely from the
+Boolean check via `BatchedVcConeNarrowCert.ofCheck`. -/
 theorem protoTraitBatchedCert :
     BatchedVcConeNarrowCert protoTraitCone traitCallRootMir
-      protoFullCallees protoNaiveNarrowCallees [] protoHoistedExtra [] [] where
-  certOk := by decide +kernel
-  calleesAgree := calleesAgreeOn_coneBodies protoTraitCone protoFullCallees
-  traitFilterAgree := by
-    intro dp hdp
-    simp only [protoTraitCone, List.mem_cons, List.not_mem_nil, or_false] at hdp
-    rcases hdp with rfl | rfl | rfl <;> rfl
+      protoFullCallees protoNaiveNarrowCallees [] protoHoistedExtra [] [] := by
+  have h := BatchedVcConeNarrowCert.ofCheck protoTraitBatchedCert_check.2
+  rw [show selectByMask protoFullCallees protoTraitMask = protoNaiveNarrowCallees from
+    selectByMask_coneMask protoTraitCone protoFullCallees] at h
+  exact h
 
-/-- **Canary 2 (`canary_traitDispatch_preserved_under_batchedVcNarrow`)**:
-`BatchedVcConeNarrowCert` + `hoistTraitImpls` accepts `traitCallRootMir` (`checkBatchedVcConeNarrowCert = true`)
-and proves that narrowing `(protoFullCallees, [])` to `(protoNaiveNarrowCallees, protoHoistedExtra)`
-preserves both `runMirExecBounded` and `wpMirExecSym` (`31 : u32`). -/
+/-- **Canary 2 (`canary_traitDispatch_preserved_under_batchedVcNarrow`)**: under the computed and
+kernel-checked certificate, the narrowed execution `(protoNaiveNarrowCallees, protoHoistedExtra)`
+returns exactly `31 : u32` (derived from `runMirExecBounded_narrow_of_batchedCert`), and
+`wpMirExecSym` is preserved. -/
 theorem canary_traitDispatch_preserved_under_batchedVcNarrow :
-    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir
-      protoFullCallees protoNaiveNarrowCallees [] protoHoistedExtra [] [] = true ∧
+    ((runMirExecBounded 12 traitCallRootMir
+        (.running (MachineState.mapMem
+          (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra)
+          protoTraitInitState))).map
+      (fun out => match out with | .normal (v, _) => some v | _ => none)) =
+      some (some (Value.scalar ⟨31, 4⟩)) ∧
     (wpMirExecSym 12 traitCallRootMir
       (.running (MachineState.mapMem
-        (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra)
-        (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees)))
+        (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra) protoTraitInitState))
       (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) ↔
-    wpMirExecSym 12 traitCallRootMir
-      (.running (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
-        emptyMemory protoFullCallees))
+    wpMirExecSym 12 traitCallRootMir (.running protoTraitInitState)
       (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) := by
-  refine ⟨protoTraitBatchedCert.certOk, ?_⟩
-  exact wpMirExecSym_narrow_of_batchedCert protoTraitBatchedCert 12
-    (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory protoFullCallees)
-    rfl rfl rfl rfl
-    (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)
-    (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+  refine ⟨?_, ?_⟩
+  · rw [runMirExecBounded_narrow_of_batchedCert protoTraitBatchedCert 12 protoTraitInitState
+      rfl rfl rfl rfl, Option.map_map]
+    have hfun : ((fun out => match out with | .normal (v, _) => some v | _ => none) ∘
+        MirOutcome.mapMem (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra)) =
+        (fun out => match out with | .normal (v, _) => some v | _ => none) := by
+      funext out
+      rcases out with ⟨v, m⟩ | _ | _ <;> rfl
+    rw [hfun]
+    rfl
+  · exact wpMirExecSym_narrow_of_batchedCert protoTraitBatchedCert 12 protoTraitInitState
+      rfl rfl rfl rfl
+      (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)
+      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
 
-/-- Negative Canary 1: duplicate callee shadowing mismatch (`fullCallees` has `[v1, v2]` where `v1`
-has 1 block and `v2` has 2 blocks, while `narrowCallees` drops `v1` and exposes shadowed `v2`) is
-rejected by `checkBatchedVcConeNarrowCert`. -/
-def protoDupShadowV2 : CapturedMir :=
-  { protoLeaf "proto::poly" 7 1 [] with
-    basicBlocks := [
-      { statements := [], terminator := ⟨.goto 1, "g"⟩, isCleanup := false },
-      { statements := [⟨.assign ⟨0, []⟩ (.use (protoU32Const 99)), "a"⟩],
-        terminator := ⟨.return_, "r"⟩, isCleanup := false }
-    ] }
+/-- Same-shape duplicate shadow of `proto::poly` (same `defPath`, `argCount`, `typeParamCount`,
+and block count as `protoPoly`, but returns `8` instead of `7`). -/
+def protoPolyShadow : CapturedMir := protoLeaf "proto::poly" 8 1 []
 
+/-- Full table in which `protoPoly` shadows `protoPolyShadow`. -/
+def protoShadowFullCallees : List CapturedMir := protoPoly :: protoPolyShadow :: protoFullCallees
+
+/-- Untrusted narrowing dropping the first `proto::poly` (index 0) but keeping the shadowed copy. -/
+def protoShadowBadMask : List Bool := [false, true, false, false, false, false, false, true]
+
+/-- **Negative Canary 1 (`canary_duplicateShadow_rejected`)**: exposing a shadowed duplicate of
+the *same shape* (which changes the callee body that `findCallee?` returns) is rejected. -/
 theorem canary_duplicateShadow_rejected :
-    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir
-      (protoPoly :: protoDupShadowV2 :: protoFullCallees)
-      [protoDupShadowV2, protoCircleArea] [] protoHoistedExtra [] [] = false := by
-  decide +kernel
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoShadowFullCallees
+      protoShadowBadMask [] [] [] = false ∧
+    findCallee? (selectByMask protoShadowFullCallees protoShadowBadMask) "proto::poly" =
+      some protoPolyShadow ∧
+    findCallee? protoShadowFullCallees "proto::poly" = some protoPoly := by
+  refine ⟨by decide +kernel, rfl, rfl⟩
 
-/-- Negative Canary 2: external summary shadowing an internal callee in `fullCallees` violates
-`checkUntrustedAdmissible` and is rejected by `checkBatchedVcConeNarrowCert`. -/
+/-- **Negative Canary 2 (`canary_externalShadowsInternal_rejected`)**: an external summary that
+shadows an internal callee violates `UntrustedAdmissible`; a summary injected for a cone path
+on the narrowed side only violates summary agreement. -/
 theorem canary_externalShadowsInternal_rejected :
-    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir
-      protoFullCallees protoNaiveNarrowCallees [] protoHoistedExtra
-      [⟨"proto::poly", 1⟩] [⟨"proto::poly", 1⟩] = false := by
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees protoTraitMask []
+      [⟨"proto::poly", 1⟩] [⟨"proto::poly", 1⟩] = false ∧
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees protoTraitMask []
+      [] [⟨"proto::Area::area", 3⟩] = false := by
   decide +kernel
 
-/-- Negative Canary 3: omitting the `TraitImplEntry.implPath` target body (`protoCircleArea`) from
-`narrowCallees` is rejected by `checkBatchedVcConeNarrowCert`. -/
+/-- **Negative Canary 3 (`canary_missingTraitImplBody_rejected`)**: omitting the
+`TraitImplEntry.implPath` target body (`protoCircleArea`) is rejected, as is keeping a body that
+carries a cone-targeting `TraitImplEntry` (hoisting would duplicate dispatch records). -/
 theorem canary_missingTraitImplBody_rejected :
-    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir
-      protoFullCallees [protoPoly] [] protoHoistedExtra [] [] = false := by
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees
+      [false, false, true, false, false, false] [] [] [] = false ∧
+    checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees
+      [false, false, true, true, false, true] [] [] [] = false := by
   decide +kernel
+
+
+/-- Root body `_0 = ext::rand() -> bb1; bb1: return` calling an *external* function that is
+absent from `Memory.callees` (so `Trusted` semantics emits a `MirCallE` interaction). -/
+def protoExtCallRootMir : CapturedMir :=
+  { traitCallRootMir with
+    defPath := "proto::ext_root"
+    basicBlocks := [
+      protoCallBlock "ext::rand" [] 1,
+      { statements := [], terminator := ⟨.return_, "ret"⟩, isCleanup := false } ] }
+
+def protoExtInitState : MachineState :=
+  MirFuelFree.initMachineStateWithMemoryAndCallees protoExtCallRootMir [] emptyMemory []
+
+def protoExtCone : List DefPath := ["ext::rand"]
+
+/-- Contract `7`: `ext::rand` returns `5 : u32` and leaves memory unchanged. -/
+def protoExtContracts : ExternalContractInterp := fun tag req ans =>
+  tag = 7 ∧ ans = .returned (.scalar ⟨5, 4⟩) req.memory
+
+def protoExtPost (out : MirOutcome) : Prop :=
+  match out with
+  | .normal (v, _) => v = Value.scalar ⟨5, 4⟩
+  | _ => False
+
+/-- First step of `protoExtCallRootMir`: the external `MirCallE` request and its continuation. -/
+def protoExtStep : MirStepNode := stepMirState protoExtCallRootMir (.running protoExtInitState)
+
+def protoExtReq : MirCallReq :=
+  match protoExtStep with
+  | .vis (.inr (.inr (.call req))) _ => req
+  | _ => { defPath := "", args := [], memory := emptyMemory }
+
+def protoExtCont : MirCallAns → MirExecState :=
+  match protoExtStep with
+  | .vis (.inr (.inr (.call _))) k => k
+  | _ => fun _ => .faulted .ub
+
+theorem protoExtStep_eq :
+    protoExtStep = .vis (.inr (.inr (.call protoExtReq))) protoExtCont := rfl
+
+/-- Final value after answering the external call with `ans`. -/
+def protoExtResultAfter (ans : MirCallAns) : Option (Option Value) :=
+  (runMirExecBounded 2 protoExtCallRootMir (protoExtCont ans)).map
+    (fun out => match out with | .normal (v, _) => some v | _ => none)
+
+/-- **External-contract canary (`canary_externalSummary_vc`)**: the external summary is *used*
+by `vcMirWithCallees` (non-vacuity): with the cone summary `ext::rand ↦ 7` the VC
+`result = 5` holds, while without any summary (havoc) the same VC is false, witnessed by the
+answer `6`. -/
+theorem canary_externalSummary_vc :
+    protoExtReq.defPath = "ext::rand" ∧
+    vcMirWithCallees protoExtContracts 3 protoExtCallRootMir protoExtInitState [] []
+      [⟨"ext::rand", 7⟩] protoExtCone protoExtPost ∧
+    ¬ vcMirWithCallees protoExtContracts 3 protoExtCallRootMir protoExtInitState [] []
+      [] protoExtCone protoExtPost := by
+  have h5 : protoExtResultAfter (.returned (.scalar ⟨5, 4⟩) protoExtReq.memory) =
+      some (some (Value.scalar ⟨5, 4⟩)) := rfl
+  have h6 : protoExtResultAfter (.returned (.scalar ⟨6, 4⟩) protoExtReq.memory) =
+      some (some (Value.scalar ⟨6, 4⟩)) := rfl
+  have hself : MachineState.mapMem (Memory.withCalleesAndTraits [] []) protoExtInitState =
+      protoExtInitState := rfl
+  refine ⟨rfl, ?_, ?_⟩
+  · unfold vcMirWithCallees
+    rw [hself]
+    show evalNodeWPExt protoExtContracts protoExtCone [⟨"ext::rand", 7⟩] _ protoExtPost protoExtStep
+    rw [protoExtStep_eq]
+    show (match coneSummary? protoExtCone [⟨"ext::rand", 7⟩] protoExtReq.defPath with
+      | some s => ∀ ans, protoExtContracts s.summaryTag protoExtReq ans →
+          wpMirExecExt protoExtContracts protoExtCone [⟨"ext::rand", 7⟩] 2 protoExtCallRootMir
+            (protoExtCont ans) protoExtPost
+      | none => ∀ ans, wpMirExecExt protoExtContracts protoExtCone [⟨"ext::rand", 7⟩] 2
+          protoExtCallRootMir (protoExtCont ans) protoExtPost)
+    have hsum : coneSummary? protoExtCone [⟨"ext::rand", 7⟩] protoExtReq.defPath =
+        some ⟨"ext::rand", 7⟩ := by decide +kernel
+    rw [hsum]
+    intro ans ⟨_, hans⟩
+    subst hans
+    unfold protoExtResultAfter at h5
+    obtain ⟨out, hout, hv⟩ := Option.map_eq_some_iff.mp h5
+    apply wpMirExecExt_of_run _ _ _ _ _ 2 _ out hout
+    rcases out with ⟨v, m⟩ | _ | _
+    · exact Option.some.inj hv
+    · nomatch hv
+    · nomatch hv
+  · intro hvc
+    unfold vcMirWithCallees at hvc
+    rw [hself] at hvc
+    change evalNodeWPExt protoExtContracts protoExtCone [] _ protoExtPost protoExtStep at hvc
+    rw [protoExtStep_eq] at hvc
+    have hnone : coneSummary? protoExtCone [] protoExtReq.defPath = none := by decide +kernel
+    change (match coneSummary? protoExtCone [] protoExtReq.defPath with
+      | some s => ∀ ans, protoExtContracts s.summaryTag protoExtReq ans →
+          wpMirExecExt protoExtContracts protoExtCone [] 2 protoExtCallRootMir (protoExtCont ans) protoExtPost
+      | none => ∀ ans, wpMirExecExt protoExtContracts protoExtCone [] 2 protoExtCallRootMir
+          (protoExtCont ans) protoExtPost) at hvc
+    rw [hnone] at hvc
+    have hw := hvc (.returned (.scalar ⟨6, 4⟩) protoExtReq.memory)
+    unfold protoExtResultAfter at h6
+    obtain ⟨out, hout, hv⟩ := Option.map_eq_some_iff.mp h6
+    have hp := post_of_wpMirExecExt_run _ _ _ _ _ 2 _ out hout hw
+    rcases out with ⟨v, m⟩ | _ | _
+    · have hv' : v = Value.scalar ⟨6, 4⟩ := Option.some.inj hv
+      have hp' : v = Value.scalar ⟨5, 4⟩ := hp
+      rw [hv'] at hp'
+      nomatch hp'
+    · nomatch hv
+    · nomatch hv
 
 /-! ## Part C: `DemandCallerLocationEnv` (`proofs-rs/lean-miri` PR #67 Schema 15) -/
 
@@ -2848,75 +3427,88 @@ theorem applyLocationDetailPolicy_idempotent (pol : LocationDetailPolicy)
   unfold applyLocationDetailPolicy
   cases pol.file <;> cases pol.line <;> cases pol.column <;> rfl
 
-/-- Per-frame caller-location metadata (`FrameLocMeta`):
+/-- Per-frame caller-location metadata (`FrameLocMeta`, stacks are listed innermost frame first):
 - `defPath`: frame function identity,
-- `callSitePos`: source position of the call site in the caller that invoked this frame,
-- `isTrackCaller`: whether this frame carries `#[track_caller]`,
-- `detailPolicy`: active `-Zlocation-detail` policy. -/
+- `callSitePos`: span of the call terminator *in this frame's caller* that invoked this frame
+  (`none` for an entry frame whose caller is not part of the interpreted stack),
+- `isTrackCaller`: whether this frame's function carries `#[track_caller]`,
+- `detailPolicy`: `-Zlocation-detail` policy of the crate owning this frame's body, applied to
+  spans located inside this frame. -/
 structure FrameLocMeta where
   defPath : DefPath
-  callSitePos : SourceExpansionPos
+  callSitePos : Option SourceExpansionPos
   isTrackCaller : Bool
   detailPolicy : LocationDetailPolicy := {}
   deriving DecidableEq, Repr
 
-/-- Bottom-up stack walk (`Miri/Interpreter/VirtualCalls.lean:168-198` `caller_location_span`):
-given the call stack from innermost active frame outward (`active :: callers`), walks outward
-across `isTrackCaller = true` frames and returns the `callSitePos` of the outermost consecutive
-`#[track_caller]` frame (redacted under `active.detailPolicy`). -/
-def resolveTrackCallerWalkUpAux (pol : LocationDetailPolicy)
-    (curPos : SourceExpansionPos) : List FrameLocMeta → SourceExpansionPos
-  | [] => applyLocationDetailPolicy pol curPos
+/-- Bottom-up `find_closest_untracked_caller_location` walk (`rustc_const_eval`
+`interpret/intrinsics/caller_location.rs`; Miri `caller_location_span`). `pos` is a span inside
+the head frame: a `#[track_caller]` frame forwards the walk to its own call site (a span inside
+the next frame out, so the *next* frame's redaction policy applies), while the first
+non-`#[track_caller]` frame — or a `#[track_caller]` frame with no recorded call site — resolves
+`pos` under its own crate's policy. `fallbackPol` redacts a call site lying in a caller outside
+the captured stack. -/
+def resolveCallerLocationAux (fallbackPol : LocationDetailPolicy) (pos : SourceExpansionPos) :
+    List FrameLocMeta → SourceExpansionPos
+  | [] => applyLocationDetailPolicy fallbackPol pos
   | f :: rest =>
     if f.isTrackCaller then
-      resolveTrackCallerWalkUpAux pol f.callSitePos rest
+      match f.callSitePos with
+      | some callerPos => resolveCallerLocationAux f.detailPolicy callerPos rest
+      | none => applyLocationDetailPolicy f.detailPolicy pos
     else
-      applyLocationDetailPolicy pol curPos
+      applyLocationDetailPolicy f.detailPolicy pos
 
-def resolveTrackCallerStack (active : FrameLocMeta) (callers : List FrameLocMeta) :
-    SourceExpansionPos :=
-  if active.isTrackCaller then
-    resolveTrackCallerWalkUpAux active.detailPolicy active.callSitePos callers
-  else
-    applyLocationDetailPolicy active.detailPolicy active.callSitePos
+/-- A `core::intrinsics::caller_location` call site: the span of the intrinsic call inside the
+innermost frame plus the interpreted frame stack (innermost first). -/
+structure CallerLocationSite where
+  intrinsicPos : SourceExpansionPos
+  frames : List FrameLocMeta
+  deriving DecidableEq, Repr
 
-/-- Top-down `trackCallerArg` propagation (`Miri/Interpreter/Call.lean:245-275`): when pushing a
-chain of `#[track_caller]` callee frames `tcChain` (`tcChain.all (·.isTrackCaller) = true`) onto an
-outer caller `outer` (`outer.isTrackCaller = false`), `resolveTrackCallerWalkUpAux` resolves to
-`applyLocationDetailPolicy pol lastTc.callSitePos` if `tcChain` has outermost `#[track_caller]`
-frame `lastTc`, or `curPos` if `tcChain` is empty. -/
+/-- Effective (redacted) source position returned by `caller_location` at `site`. -/
+def CallerLocationSite.resolve (site : CallerLocationSite) : SourceExpansionPos :=
+  resolveCallerLocationAux {} site.intrinsicPos site.frames
+
+/-- Top-down `trackCallerArg` propagation (`Miri/Interpreter/Call.lean:245-275`): pushing a
+`#[track_caller]` frame whose call site is `p` replaces the propagated caller location by `p`,
+so the location seen through a chain `tcChain` (innermost first) is the call site of its
+outermost frame, or the intrinsic span itself for an empty chain. -/
 def propagateTrackCallerTopDown (defaultPos : SourceExpansionPos)
     (tcChain : List FrameLocMeta) : SourceExpansionPos :=
-  match tcChain.getLast? with
-  | some lastTc => lastTc.callSitePos
-  | none => defaultPos
+  tcChain.foldl (fun pos f => f.callSitePos.getD pos) defaultPos
 
-theorem resolveTrackCallerWalkUpAux_eq_topDown (pol : LocationDetailPolicy) :
+/-- Bottom-up walk = top-down propagation: across a chain of `#[track_caller]` frames with
+recorded call sites, followed by a non-`#[track_caller]` frame `outer`, the walk returns the
+outermost call site redacted under `outer`'s policy (the crate owning that span). -/
+theorem resolveCallerLocationAux_eq_topDown :
     ∀ (tcChain : List FrameLocMeta) (outer : FrameLocMeta) (rest : List FrameLocMeta)
-      (curPos : SourceExpansionPos),
-      tcChain.all (·.isTrackCaller) = true →
+      (fallbackPol : LocationDetailPolicy) (pos : SourceExpansionPos),
+      tcChain.all (fun f => f.isTrackCaller && f.callSitePos.isSome) = true →
       outer.isTrackCaller = false →
-      resolveTrackCallerWalkUpAux pol curPos (tcChain ++ outer :: rest) =
-        applyLocationDetailPolicy pol (propagateTrackCallerTopDown curPos tcChain)
-  | [], outer, rest, curPos, _, h_out => by
-    dsimp only [List.nil_append, resolveTrackCallerWalkUpAux, propagateTrackCallerTopDown,
-      List.getLast?]
+      resolveCallerLocationAux fallbackPol pos (tcChain ++ outer :: rest) =
+        applyLocationDetailPolicy outer.detailPolicy (propagateTrackCallerTopDown pos tcChain)
+  | [], outer, rest, fallbackPol, pos, _, h_out => by
+    show resolveCallerLocationAux fallbackPol pos (outer :: rest) = _
+    unfold resolveCallerLocationAux
     rw [h_out]
     rfl
-  | [f], outer, rest, curPos, h_tc, h_out => by
-    simp only [List.all_cons, List.all_nil, Bool.and_true] at h_tc
-    dsimp only [List.cons_append, List.nil_append, resolveTrackCallerWalkUpAux,
-      propagateTrackCallerTopDown, List.getLast?]
-    simp only [h_tc, ↓reduceIte, h_out, Bool.false_eq_true]
-    rfl
-  | f₁ :: f₂ :: tcRest, outer, rest, curPos, h_tc, h_out => by
-    simp only [List.all_cons, Bool.and_eq_true] at h_tc
-    rw [List.cons_append, resolveTrackCallerWalkUpAux]
-    simp only [h_tc.1, ↓reduceIte]
-    have h_ih := resolveTrackCallerWalkUpAux_eq_topDown pol (f₂ :: tcRest) outer rest
-      f₁.callSitePos (by simp [List.all_cons, h_tc.2]) h_out
-    rw [h_ih]
-    rfl
+  | f :: tcRest, outer, rest, fallbackPol, pos, h_tc, h_out => by
+    rw [List.all_cons, Bool.and_eq_true, Bool.and_eq_true] at h_tc
+    obtain ⟨⟨h_f, h_some⟩, h_rest⟩ := h_tc
+    rw [List.cons_append]
+    unfold resolveCallerLocationAux
+    rw [h_f]
+    cases hc : f.callSitePos with
+    | none => rw [hc] at h_some; nomatch h_some
+    | some p =>
+      simp only [↓reduceIte]
+      rw [resolveCallerLocationAux_eq_topDown tcRest outer rest f.detailPolicy p h_rest h_out]
+      show applyLocationDetailPolicy outer.detailPolicy (propagateTrackCallerTopDown p tcRest) =
+        applyLocationDetailPolicy outer.detailPolicy
+          (tcRest.foldl (fun pos f => f.callSitePos.getD pos) (f.callSitePos.getD pos))
+      rw [hc]
+      rfl
 
 /-! ### Little-Endian Encoding & `CapturedAllocation` Materialization in `Memory.globals` -/
 
@@ -3018,6 +3610,28 @@ theorem decodeInitBytes?_map_some :
     unfold List.map decodeInitBytes?
     rw [decodeInitBytes?_map_some rest]
 
+/-- Decode a `core::panic::Location<'static>` root allocation: a single relocation at offset `0`
+(`file.ptr`, zero offset), `file.len : usize` at bytes `8..16`, `line : u32` at `16..20`, and
+`col : u32` at `20..24`. Returns `(fileAllocId, fileLen, line, col)`. -/
+def decodeLocationAlloc (locAlloc : CapturedAllocation) :
+    Option (AllocId × Nat × UInt32 × UInt32) :=
+  match locAlloc.relocations with
+  | [(0, filePtr)] =>
+    if filePtr.offsetBytes != 0 then
+      none
+    else
+      match readU64Le? (locAlloc.bytes.drop 8), readU32Le? (locAlloc.bytes.drop 16),
+          readU32Le? (locAlloc.bytes.drop 20) with
+      | some fileLen, some line, some col => some (filePtr.allocId, fileLen, line, col)
+      | _, _, _ => none
+  | _ => none
+
+/-- Decode exactly `fileLen` initialized filename bytes from a filename allocation. -/
+def decodeFilenameAlloc (fileAlloc : CapturedAllocation) (fileLen : Nat) : Option (List UInt8) :=
+  match decodeInitBytes? (fileAlloc.bytes.take fileLen) with
+  | some fileBytes => if fileBytes.length == fileLen then some fileBytes else none
+  | none => none
+
 /-- Dereference a `&'static core::panic::Location<'static>` pointer (`locPtr`) in `globals` via
 `Trusted.Rustc.V2026_06_01.MirSemantics.lookupGlobalAlloc`, reading `(fileBytes, line, column)`. -/
 def readLocationFromGlobals (globals : List CapturedAllocation) (locPtr : ProvenancePtr) :
@@ -3028,25 +3642,15 @@ def readLocationFromGlobals (globals : List CapturedAllocation) (locPtr : Proven
     match lookupGlobalAlloc globals locPtr.allocId with
     | none => none
     | some locAlloc =>
-      match locAlloc.relocations with
-      | [(0, filePtr)] =>
-        if filePtr.offsetBytes != 0 then
-          none
-        else
-          match readU64Le? (locAlloc.bytes.drop 8),
-                readU32Le? (locAlloc.bytes.drop 16),
-                readU32Le? (locAlloc.bytes.drop 20),
-                lookupGlobalAlloc globals filePtr.allocId with
-          | some fileLen, some line, some col, some fileAlloc =>
-            match decodeInitBytes? (fileAlloc.bytes.take fileLen) with
-            | some fileBytes =>
-              if fileBytes.length == fileLen then
-                some (fileBytes, line, col)
-              else
-                none
-            | none => none
-          | _, _, _, _ => none
-      | _ => none
+      match decodeLocationAlloc locAlloc with
+      | none => none
+      | some (fileId, fileLen, line, col) =>
+        match lookupGlobalAlloc globals fileId with
+        | none => none
+        | some fileAlloc =>
+          match decodeFilenameAlloc fileAlloc fileLen with
+          | none => none
+          | some fileBytes => some (fileBytes, line, col)
 
 theorem lookupGlobalAlloc_append_left {globals₁ globals₂ : List CapturedAllocation}
     {id : AllocId} {alloc : CapturedAllocation}
@@ -3064,23 +3668,113 @@ theorem lookupGlobalAlloc_append_left {globals₁ globals₂ : List CapturedAllo
       rw [h_eq] at h
       exact ih h
 
+theorem lookupGlobalAlloc_append_of_absent {G R : List CapturedAllocation} {x : AllocId}
+    (h : ∀ a ∈ G, a.allocId ≠ x) : lookupGlobalAlloc (G ++ R) x = lookupGlobalAlloc R x := by
+  induction G with
+  | nil => rfl
+  | cons a rest ih =>
+    simp only [List.cons_append, lookupGlobalAlloc]
+    rw [nat_beq_ne (h a (List.Mem.head _))]
+    exact ih (fun a' hm => h a' (List.Mem.tail _ hm))
+
 theorem lookupGlobalAlloc_snoc_self (globals : List CapturedAllocation) (alloc : CapturedAllocation)
     (h_fresh : ∀ a ∈ globals, a.allocId < alloc.allocId) :
     lookupGlobalAlloc (globals ++ [alloc]) alloc.allocId = some alloc := by
-  induction globals with
-  | nil =>
-    simp only [List.nil_append, lookupGlobalAlloc, nat_beq_self_raw]
-  | cons a rest ih =>
-    simp only [List.cons_append, lookupGlobalAlloc]
-    have hlt : a.allocId < alloc.allocId := h_fresh a (List.Mem.head _)
-    have hne : Nat.beq a.allocId alloc.allocId = false :=
-      nat_beq_ne (Nat.ne_of_lt hlt)
-    rw [hne]
-    exact ih (fun a' hm => h_fresh a' (List.Mem.tail _ hm))
+  rw [lookupGlobalAlloc_append_of_absent (fun a ha => Nat.ne_of_lt (h_fresh a ha))]
+  simp only [lookupGlobalAlloc, nat_beq_self_raw]
+
+theorem decodeLocationAlloc_mk (locId fileId : AllocId) (fileLen : Nat) (line col : UInt32)
+    (h_len : fileLen < 4294967296) :
+    decodeLocationAlloc (mkLocationAllocation locId fileId fileLen line col) =
+      some (fileId, fileLen, line, col) := by
+  unfold decodeLocationAlloc mkLocationAllocation
+  dsimp only
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  have hdrop8 :
+      ([some (0 : UInt8), some 0, some 0, some 0, some 0, some 0, some 0, some 0] ++
+        u64LeBytes fileLen ++ u32LeBytes line.toNat ++ u32LeBytes col.toNat).drop 8 =
+      u64LeBytes fileLen ++ (u32LeBytes line.toNat ++ u32LeBytes col.toNat) := rfl
+  have hdrop16 :
+      ([some (0 : UInt8), some 0, some 0, some 0, some 0, some 0, some 0, some 0] ++
+        u64LeBytes fileLen ++ u32LeBytes line.toNat ++ u32LeBytes col.toNat).drop 16 =
+      u32LeBytes line.toNat ++ u32LeBytes col.toNat := rfl
+  have hdrop20 :
+      ([some (0 : UInt8), some 0, some 0, some 0, some 0, some 0, some 0, some 0] ++
+        u64LeBytes fileLen ++ u32LeBytes line.toNat ++ u32LeBytes col.toNat).drop 20 =
+      u32LeBytes col.toNat ++ [] := by
+    simp [List.append_nil]
+    rfl
+  rw [hdrop8, readU64Le_u64LeBytes h_len, hdrop16, readU32Le_u32LeBytes line,
+    hdrop20, readU32Le_u32LeBytes col]
+
+theorem decodeFilenameAlloc_mk (fileId : AllocId) (bs : List UInt8) :
+    decodeFilenameAlloc (mkFilenameAllocation fileId bs) bs.length = some bs := by
+  unfold decodeFilenameAlloc mkFilenameAllocation
+  dsimp only
+  have htake : (bs.map Option.some).take bs.length = bs.map Option.some :=
+    List.take_of_length_le (by simp)
+  rw [htake, decodeInitBytes?_map_some]
+  dsimp only
+  rw [nat_beq_self]
+  rfl
+
+/-- A `Location` root allocation and its filename allocation found in `G` decode to
+`(bs, line, col)` through the returned `&'static Location`. -/
+theorem readLocationFromGlobals_of_lookups {G : List CapturedAllocation} {locId fileId : AllocId}
+    {bs : List UInt8} {line col : UInt32}
+    (h_loc : lookupGlobalAlloc G locId =
+      some (mkLocationAllocation locId fileId bs.length line col))
+    (h_file : lookupGlobalAlloc G fileId = some (mkFilenameAllocation fileId bs))
+    (h_len : bs.length < 4294967296) :
+    readLocationFromGlobals G { allocId := locId, offsetBytes := 0 } = some (bs, line, col) := by
+  unfold readLocationFromGlobals
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  rw [h_loc]
+  dsimp only
+  rw [decodeLocationAlloc_mk _ _ _ _ _ h_len]
+  dsimp only
+  rw [h_file]
+  dsimp only
+  rw [decodeFilenameAlloc_mk]
+
+/-- `Location` reads are stable under appending further global allocations. -/
+theorem readLocationFromGlobals_append {G : List CapturedAllocation} (R : List CapturedAllocation)
+    {p : ProvenancePtr} {x : List UInt8 × UInt32 × UInt32}
+    (h : readLocationFromGlobals G p = some x) : readLocationFromGlobals (G ++ R) p = some x := by
+  unfold readLocationFromGlobals at h ⊢
+  by_cases hoff : (p.offsetBytes != 0) = true
+  · simp only [hoff, ↓reduceIte] at h
+    cases h
+  · simp only [hoff, Bool.false_eq_true, ↓reduceIte] at h ⊢
+    cases hloc : lookupGlobalAlloc G p.allocId with
+    | none =>
+      rw [hloc] at h
+      nomatch h
+    | some la =>
+      rw [hloc] at h
+      rw [lookupGlobalAlloc_append_left hloc]
+      dsimp only at h ⊢
+      cases hdec : decodeLocationAlloc la with
+      | none =>
+        rw [hdec] at h
+        nomatch h
+      | some q =>
+        obtain ⟨fid, flen, line, col⟩ := q
+        rw [hdec] at h
+        dsimp only at h ⊢
+        cases hf : lookupGlobalAlloc G fid with
+        | none =>
+          rw [hf] at h
+          nomatch h
+        | some fa =>
+          rw [hf] at h
+          rw [lookupGlobalAlloc_append_left hf]
+          exact h
 
 /-- Demand-time `#[track_caller]` environment (`lean-miri#67` Schema 15), caching allocated
-immutable filename `AllocId`s by their redacted byte content so multiple `caller_location` calls
-from the same file share a single filename `CapturedAllocation` in `Memory.globals`. -/
+immutable filename `AllocId`s by their (post-redaction) byte content so multiple
+`caller_location` calls from the same file share a single filename `CapturedAllocation` in
+`Memory.globals`. -/
 structure DemandCallerLocationEnv where
   fileCache : List (List UInt8 × AllocId) := []
   deriving DecidableEq, Repr
@@ -3091,56 +3785,496 @@ def lookupFileCache? (fileBytes : List UInt8) : List (List UInt8 × AllocId) →
   | (bs, id) :: rest => if listByteEq bs fileBytes then some id else lookupFileCache? fileBytes rest
 
 /-- Demand-time `core::intrinsics::caller_location` evaluation (`lean-miri#67` Schema 15):
-1. Resolves the effective `SourceExpansionPos` across the `#[track_caller]` call stack and applies
-   the frame's `-Zlocation-detail` redaction policy.
-2. Reuses the cached filename `AllocId` if `effPos.fileBytes` is already in `env.fileCache`;
-   otherwise allocates a fresh filename `CapturedAllocation` at `mem.nextAllocId`.
-3. Allocates a fresh `Location` root `CapturedAllocation` in `Memory.globals` (matching
-   `EvalCallerLocationConstruction.lean:55`: fresh root `AllocId` per invocation, shared filename
-   `AllocId`), and returns the `&'static Location` pointer `Value.ptr`. -/
-def evalDemandCallerLocation (env : DemandCallerLocationEnv) (active : FrameLocMeta)
-    (callers : List FrameLocMeta) (mem : Memory) :
-    DemandCallerLocationEnv × ProvenancePtr × Memory :=
-  let effPos := resolveTrackCallerStack active callers
+1. Resolves the effective redacted position of `site` (`CallerLocationSite.resolve`).
+2. Reuses the cached filename `AllocId` if the (redacted) bytes were already materialized;
+   otherwise allocates a fresh filename `CapturedAllocation`.
+3. Allocates a fresh `Location` root `CapturedAllocation` per invocation (lean-miri
+   `EvalCallerLocationConstruction.hook`: "never deduplicate same-span invocations") and returns
+   the `&'static Location` pointer.
+Fresh identifiers are drawn from `mem.nextAllocId`, which `Trusted.Rustc.V2026_06_01` defines as
+the *next fresh* allocation identifier, and `nextAllocId` is advanced past every allocation made
+here, so later allocations can never collide with a materialized `Location` / filename. -/
+def evalDemandCallerLocation (env : DemandCallerLocationEnv) (site : CallerLocationSite)
+    (mem : Memory) : DemandCallerLocationEnv × ProvenancePtr × Memory :=
+  let effPos := site.resolve
   match lookupFileCache? effPos.fileBytes env.fileCache with
   | some fileAllocId =>
-    let locAllocId := mem.nextAllocId + 1
+    let locAllocId := mem.nextAllocId
     let locAlloc := mkLocationAllocation locAllocId fileAllocId
       effPos.fileBytes.length effPos.line effPos.column
-    let mem' : Memory :=
+    (env, { allocId := locAllocId, offsetBytes := 0 },
       { mem with
-        nextAllocId := locAllocId
-        globals := mem.globals ++ [locAlloc] }
-    (env, { allocId := locAllocId, offsetBytes := 0 }, mem')
+        nextAllocId := locAllocId + 1
+        globals := mem.globals ++ [locAlloc] })
   | none =>
-    let fileAllocId := mem.nextAllocId + 1
-    let locAllocId := mem.nextAllocId + 2
+    let fileAllocId := mem.nextAllocId
+    let locAllocId := mem.nextAllocId + 1
     let fileAlloc := mkFilenameAllocation fileAllocId effPos.fileBytes
     let locAlloc := mkLocationAllocation locAllocId fileAllocId
       effPos.fileBytes.length effPos.line effPos.column
-    let env' : DemandCallerLocationEnv :=
-      { fileCache := (effPos.fileBytes, fileAllocId) :: env.fileCache }
-    let mem' : Memory :=
+    ({ fileCache := (effPos.fileBytes, fileAllocId) :: env.fileCache },
+      { allocId := locAllocId, offsetBytes := 0 },
       { mem with
-        nextAllocId := locAllocId
-        globals := mem.globals ++ [fileAlloc, locAlloc] }
-    (env', { allocId := locAllocId, offsetBytes := 0 }, mem')
+        nextAllocId := locAllocId + 1
+        globals := mem.globals ++ [fileAlloc, locAlloc] })
 
 /-- Eager pre-materialization baseline (pre-Schema 15): materializes filename + `Location`
-allocations for all $S$ candidate call-site spans into `Memory.globals` before execution begins,
-even if the program never panics or invokes `caller_location`. -/
-def eagerInitCallerLocations (candidateSpans : List (FrameLocMeta × List FrameLocMeta))
-    (mem₀ : Memory) : DemandCallerLocationEnv × List ProvenancePtr × Memory :=
-  candidateSpans.foldl
-    (fun (env, ptrs, mem) (active, callers) =>
-      let (env', ptr, mem') := evalDemandCallerLocation env active callers mem
-      (env', ptrs ++ [ptr], mem'))
-    ({}, [], mem₀)
+allocations for all $S$ candidate call sites into `Memory.globals` before execution begins, even
+if the program never panics or invokes `caller_location`. -/
+def eagerInitAux (env : DemandCallerLocationEnv) (mem : Memory) :
+    List CallerLocationSite → DemandCallerLocationEnv × List ProvenancePtr × Memory
+  | [] => (env, [], mem)
+  | site :: rest =>
+    let r := evalDemandCallerLocation env site mem
+    let r' := eagerInitAux r.1 r.2.2 rest
+    (r'.1, r.2.1 :: r'.2.1, r'.2.2)
 
-/-! ### Observational Bisimulation (`AllocRenamingRel`) & Zero-Clutter Theorems -/
+def eagerInitCallerLocations (sites : List CallerLocationSite) (mem₀ : Memory) :
+    DemandCallerLocationEnv × List ProvenancePtr × Memory :=
+  eagerInitAux {} mem₀ sites
+
+/-! ### Demand-World Invariants -/
+
+/-- Every global allocation identifier is below the next fresh identifier. -/
+def GlobalsFresh (mem : Memory) : Prop :=
+  ∀ a ∈ mem.globals, a.allocId < mem.nextAllocId
+
+/-- Every cached `(bytes, id)` filename entry is materialized in `globals`. -/
+def FileCacheCoherent (env : DemandCallerLocationEnv) (globals : List CapturedAllocation) : Prop :=
+  ∀ bs id, (bs, id) ∈ env.fileCache →
+    lookupGlobalAlloc globals id = some (mkFilenameAllocation id bs)
+
+def DemandLocInv (env : DemandCallerLocationEnv) (mem : Memory) : Prop :=
+  GlobalsFresh mem ∧ FileCacheCoherent env mem.globals
+
+theorem listByteEq_sound : ∀ {a b : List UInt8}, listByteEq a b = true → a = b
+  | [], [], _ => rfl
+  | [], _ :: _, h => nomatch h
+  | _ :: _, [], h => nomatch h
+  | x :: xs, y :: ys, h => by
+    unfold listByteEq at h
+    cases hb : Nat.beq x.toBitVec.toNat y.toBitVec.toNat with
+    | false =>
+      rw [hb] at h
+      nomatch h
+    | true =>
+      rw [hb] at h
+      have hxy : x = y :=
+        UInt8.toBitVec_inj.mp (BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true hb))
+      rw [hxy, listByteEq_sound h]
+
+theorem lookupFileCache?_sound {bs : List UInt8} {id : AllocId} :
+    ∀ {cache : List (List UInt8 × AllocId)}, lookupFileCache? bs cache = some id → (bs, id) ∈ cache
+  | [], h => nomatch h
+  | (bs', id') :: rest, h => by
+    unfold lookupFileCache? at h
+    by_cases hb : listByteEq bs' bs = true
+    · simp only [hb, ↓reduceIte, Option.some.injEq] at h
+      subst h
+      rw [listByteEq_sound hb]
+      exact List.Mem.head _
+    · simp only [hb, Bool.false_eq_true, ↓reduceIte] at h
+      exact List.Mem.tail _ (lookupFileCache?_sound h)
+
+/-- **Demand step soundness (`evalDemandCallerLocation_spec`)**: under the invariant, one
+`caller_location` evaluation returns a pointer that dereferences to the resolved
+`(fileBytes, line, column)`, re-establishes the invariant, and only *appends* to
+`Memory.globals`. -/
+theorem evalDemandCallerLocation_spec (env : DemandCallerLocationEnv) (site : CallerLocationSite)
+    (mem : Memory) (h_inv : DemandLocInv env mem)
+    (h_len : site.resolve.fileBytes.length < 4294967296) :
+    readLocationFromGlobals (evalDemandCallerLocation env site mem).2.2.globals
+        (evalDemandCallerLocation env site mem).2.1 =
+      some (site.resolve.fileBytes, site.resolve.line, site.resolve.column) ∧
+    DemandLocInv (evalDemandCallerLocation env site mem).1
+      (evalDemandCallerLocation env site mem).2.2 ∧
+    ∃ extra, (evalDemandCallerLocation env site mem).2.2.globals = mem.globals ++ extra := by
+  obtain ⟨h_fresh, h_coh⟩ := h_inv
+  have h_abs0 : ∀ a ∈ mem.globals, a.allocId ≠ mem.nextAllocId :=
+    fun a ha => Nat.ne_of_lt (h_fresh a ha)
+  have h_abs1 : ∀ a ∈ mem.globals, a.allocId ≠ mem.nextAllocId + 1 :=
+    fun a ha => Nat.ne_of_lt (Nat.lt_succ_of_lt (h_fresh a ha))
+  unfold evalDemandCallerLocation
+  dsimp only
+  generalize site.resolve = eff at h_len ⊢
+  cases hc : lookupFileCache? eff.fileBytes env.fileCache with
+  | some fid =>
+    dsimp only
+    have h_file : lookupGlobalAlloc mem.globals fid = some (mkFilenameAllocation fid eff.fileBytes) :=
+      h_coh _ _ (lookupFileCache?_sound hc)
+    refine ⟨?_, ⟨?_, ?_⟩, ⟨_, rfl⟩⟩
+    · apply readLocationFromGlobals_of_lookups (fileId := fid) _ _ h_len
+      · rw [lookupGlobalAlloc_append_of_absent h_abs0]
+        simp only [lookupGlobalAlloc, mkLocationAllocation, nat_beq_self_raw]
+      · exact lookupGlobalAlloc_append_left h_file
+    · intro a ha
+      rcases List.mem_append.mp ha with hG | hL
+      · exact Nat.lt_succ_of_lt (h_fresh a hG)
+      · rw [List.mem_singleton] at hL
+        subst hL
+        exact Nat.lt_succ_self _
+    · intro bs id hm
+      exact lookupGlobalAlloc_append_left (h_coh bs id hm)
+  | none =>
+    dsimp only
+    refine ⟨?_, ⟨?_, ?_⟩, ⟨_, rfl⟩⟩
+    · apply readLocationFromGlobals_of_lookups (fileId := mem.nextAllocId) _ _ h_len
+      · rw [lookupGlobalAlloc_append_of_absent h_abs1]
+        simp only [lookupGlobalAlloc, mkLocationAllocation, mkFilenameAllocation,
+          nat_beq_self_raw, nat_beq_ne (Nat.ne_of_lt (Nat.lt_succ_self mem.nextAllocId))]
+      · rw [lookupGlobalAlloc_append_of_absent h_abs0]
+        simp only [lookupGlobalAlloc, mkFilenameAllocation, nat_beq_self_raw]
+    · intro a ha
+      rcases List.mem_append.mp ha with hG | hL
+      · exact Nat.lt_succ_of_lt (Nat.lt_succ_of_lt (h_fresh a hG))
+      · simp only [List.mem_cons, List.not_mem_nil, or_false] at hL
+        rcases hL with rfl | rfl
+        · exact Nat.lt_succ_of_lt (Nat.lt_succ_self _)
+        · exact Nat.lt_succ_self _
+    · intro bs id hm
+      rcases List.mem_cons.mp hm with heq | hold
+      · cases heq
+        rw [lookupGlobalAlloc_append_of_absent h_abs0]
+        simp only [lookupGlobalAlloc, mkFilenameAllocation, nat_beq_self_raw]
+      · exact lookupGlobalAlloc_append_left (h_coh bs id hold)
+
+/-! ### Trace Semantics: Plain, Demand-Time, and Eager Worlds -/
+
+/-- Trace step: a normal MIR statement, or a `caller_location` intrinsic invocation at call site
+`site` (an index into the program's `CallerLocationSite` table). -/
+inductive CallerLocationTraceEvent where
+  | normalStep (stmt : Statement)
+  | invokeCallerLocation (site : Nat)
+
+/-- Normal statement step shared by all three worlds: commits
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt`'s frame/locals/borrow effects and keeps the
+immutable global table and fresh-identifier counter (no `V2026_06_01` statement writes
+`Memory.globals` or consumes `Memory.nextAllocId`; the only `globals :=` sites in `Places.lean`
+build read-only bound memories). A faulting statement leaves the state unchanged: the trace
+model compares `Location` observations, not fault handling. -/
+def normalStmtStep (s : MachineState) (stmt : Statement) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) : MachineState :=
+  match evalStmt s stmt localDecls layouts with
+  | .tau (.running ns) =>
+    { ns with memory := { ns.memory with
+        globals := s.memory.globals, nextAllocId := s.memory.nextAllocId } }
+  | _ => s
+
+theorem normalStmtStep_globals (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (normalStmtStep s stmt localDecls layouts).memory.globals = s.memory.globals := by
+  unfold normalStmtStep
+  split <;> rfl
+
+theorem normalStmtStep_nextAllocId (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (normalStmtStep s stmt localDecls layouts).memory.nextAllocId = s.memory.nextAllocId := by
+  unfold normalStmtStep
+  split <;> rfl
+
+/-- Plain execution with no `caller_location` machinery at all (invocations are ignored). -/
+def runPlainTrace (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    List CallerLocationTraceEvent → MachineState
+  | [] => s
+  | .normalStep stmt :: rest => runPlainTrace (normalStmtStep s stmt localDecls layouts) localDecls layouts rest
+  | .invokeCallerLocation _ :: rest => runPlainTrace s localDecls layouts rest
+
+/-- Demand-time world (`lean-miri#67`): allocates `Location` globals ONLY when a valid
+`.invokeCallerLocation` event occurs, returning one pointer per such event. -/
+def runDemandCallerLocationTrace (sites : List CallerLocationSite) (env : DemandCallerLocationEnv)
+    (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    List CallerLocationTraceEvent → DemandCallerLocationEnv × List ProvenancePtr × MachineState
+  | [] => (env, [], s)
+  | .normalStep stmt :: rest =>
+    runDemandCallerLocationTrace sites env (normalStmtStep s stmt localDecls layouts)
+      localDecls layouts rest
+  | .invokeCallerLocation i :: rest =>
+    match sites[i]? with
+    | none => runDemandCallerLocationTrace sites env s localDecls layouts rest
+    | some site =>
+      let r := evalDemandCallerLocation env site s.memory
+      let r' := runDemandCallerLocationTrace sites r.1 { s with memory := r.2.2 }
+        localDecls layouts rest
+      (r'.1, r.2.1 :: r'.2.1, r'.2.2)
+
+/-- Eager world execution after pre-allocation: an invocation returns the pre-materialized
+pointer of its call site without allocating. -/
+def runEagerCallerLocationTrace (ePtrs : List ProvenancePtr) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    List CallerLocationTraceEvent → List ProvenancePtr × MachineState
+  | [] => ([], s)
+  | .normalStep stmt :: rest =>
+    runEagerCallerLocationTrace ePtrs (normalStmtStep s stmt localDecls layouts)
+      localDecls layouts rest
+  | .invokeCallerLocation i :: rest =>
+    match ePtrs[i]? with
+    | none => runEagerCallerLocationTrace ePtrs s localDecls layouts rest
+    | some p =>
+      let r := runEagerCallerLocationTrace ePtrs s localDecls layouts rest
+      (p :: r.1, r.2)
+
+/-- Eager world: pre-allocate every call site, then run the trace. -/
+def runEagerCallerLocationWorld (sites : List CallerLocationSite) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (trace : List CallerLocationTraceEvent) : List ProvenancePtr × MachineState :=
+  let init := eagerInitCallerLocations sites s.memory
+  runEagerCallerLocationTrace init.2.1 { s with memory := init.2.2 } localDecls layouts trace
+
+/-- Call sites actually invoked (valid indices only) along a trace. -/
+def invokedSites (sites : List CallerLocationSite) : List CallerLocationTraceEvent → List CallerLocationSite
+  | [] => []
+  | .normalStep _ :: rest => invokedSites sites rest
+  | .invokeCallerLocation i :: rest =>
+    match sites[i]? with
+    | none => invokedSites sites rest
+    | some site => site :: invokedSites sites rest
+
+/-- Expected dereferenced `(fileBytes, line, column)` of a call site. -/
+def expectedLocation (site : CallerLocationSite) : Option (List UInt8 × UInt32 × UInt32) :=
+  some (site.resolve.fileBytes, site.resolve.line, site.resolve.column)
+
+/-- Observations made through returned `&'static Location` pointers. -/
+def readLocations (globals : List CapturedAllocation) (ptrs : List ProvenancePtr) :
+    List (Option (List UInt8 × UInt32 × UInt32)) :=
+  ptrs.map (readLocationFromGlobals globals)
+
+/-- All call sites have `usize`-encodable (`< 2^32` in this layout) filename lengths. -/
+def SitesFileLenOk (sites : List CallerLocationSite) : Prop :=
+  ∀ site ∈ sites, site.resolve.fileBytes.length < 4294967296
+
+/-- Predicate stating that a trace contains zero `.invokeCallerLocation` events. -/
+def traceHasNoCallerLocation : List CallerLocationTraceEvent → Bool
+  | [] => true
+  | .normalStep _ :: rest => traceHasNoCallerLocation rest
+  | .invokeCallerLocation _ :: _ => false
+
+theorem demandLocInv_normalStmtStep {env : DemandCallerLocationEnv} {s : MachineState}
+    (stmt : Statement) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : DemandLocInv env s.memory) :
+    DemandLocInv env (normalStmtStep s stmt localDecls layouts).memory := by
+  unfold DemandLocInv GlobalsFresh FileCacheCoherent at *
+  rw [normalStmtStep_globals, normalStmtStep_nextAllocId]
+  exact h
+
+/-- Multi-step demand-world soundness: every returned pointer dereferences (in the *final*
+globals) to its call site's resolved location; the invariant is preserved and globals only grow. -/
+theorem runDemandCallerLocationTrace_spec (sites : List CallerLocationSite)
+    (h_sites : SitesFileLenOk sites) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (trace : List CallerLocationTraceEvent) (env : DemandCallerLocationEnv) (s : MachineState),
+      DemandLocInv env s.memory →
+      readLocations (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory.globals
+          (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.1 =
+        (invokedSites sites trace).map expectedLocation ∧
+      DemandLocInv (runDemandCallerLocationTrace sites env s localDecls layouts trace).1
+        (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory ∧
+      ∃ extra, (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory.globals =
+        s.memory.globals ++ extra
+  | [], env, s, h_inv => ⟨rfl, h_inv, ⟨[], (List.append_nil _).symm⟩⟩
+  | .normalStep stmt :: rest, env, s, h_inv => by
+    have ih := runDemandCallerLocationTrace_spec sites h_sites localDecls layouts rest env
+      (normalStmtStep s stmt localDecls layouts) (demandLocInv_normalStmtStep stmt localDecls layouts h_inv)
+    rw [normalStmtStep_globals] at ih
+    exact ih
+  | .invokeCallerLocation i :: rest, env, s, h_inv => by
+    unfold runDemandCallerLocationTrace invokedSites
+    cases hsite : sites[i]? with
+    | none =>
+      exact runDemandCallerLocationTrace_spec sites h_sites localDecls layouts rest env s h_inv
+    | some site =>
+      dsimp only
+      have h_mem : site ∈ sites := List.mem_of_getElem? hsite
+      obtain ⟨h_read, h_inv', ⟨e₁, h_g₁⟩⟩ :=
+        evalDemandCallerLocation_spec env site s.memory h_inv (h_sites site h_mem)
+      obtain ⟨ih_read, ih_inv, ⟨e₂, h_g₂⟩⟩ :=
+        runDemandCallerLocationTrace_spec sites h_sites localDecls layouts rest
+          (evalDemandCallerLocation env site s.memory).1
+          { s with memory := (evalDemandCallerLocation env site s.memory).2.2 } h_inv'
+      refine ⟨?_, ih_inv, ⟨e₁ ++ e₂, ?_⟩⟩
+      · show readLocationFromGlobals _ _ :: readLocations _ _ = expectedLocation site :: _
+        rw [ih_read, h_g₂, readLocationFromGlobals_append e₂ h_read]
+        rfl
+      · rw [h_g₂]
+        show (evalDemandCallerLocation env site s.memory).2.2.globals ++ e₂ = _
+        rw [h_g₁, List.append_assoc]
+
+/-- Eager pre-allocation soundness: one pointer per site, each dereferencing to its resolved
+location in the eager globals. -/
+theorem eagerInitAux_spec :
+    ∀ (sites : List CallerLocationSite) (env : DemandCallerLocationEnv) (mem : Memory),
+      DemandLocInv env mem → SitesFileLenOk sites →
+      readLocations (eagerInitAux env mem sites).2.2.globals (eagerInitAux env mem sites).2.1 =
+          sites.map expectedLocation ∧
+        (eagerInitAux env mem sites).2.1.length = sites.length ∧
+        DemandLocInv (eagerInitAux env mem sites).1 (eagerInitAux env mem sites).2.2 ∧
+        ∃ extra, (eagerInitAux env mem sites).2.2.globals = mem.globals ++ extra
+  | [], env, mem, h_inv, _ => ⟨rfl, rfl, h_inv, ⟨[], (List.append_nil _).symm⟩⟩
+  | site :: rest, env, mem, h_inv, h_sites => by
+    unfold eagerInitAux
+    dsimp only
+    obtain ⟨h_read, h_inv', ⟨e₁, h_g₁⟩⟩ :=
+      evalDemandCallerLocation_spec env site mem h_inv (h_sites site (List.Mem.head _))
+    obtain ⟨ih_read, ih_len, ih_inv, ⟨e₂, h_g₂⟩⟩ :=
+      eagerInitAux_spec rest (evalDemandCallerLocation env site mem).1
+        (evalDemandCallerLocation env site mem).2.2 h_inv'
+        (fun st hst => h_sites st (List.Mem.tail _ hst))
+    refine ⟨?_, ?_, ih_inv, ⟨e₁ ++ e₂, ?_⟩⟩
+    · show readLocationFromGlobals _ _ :: readLocations _ _ = expectedLocation site :: _
+      rw [ih_read, h_g₂, readLocationFromGlobals_append e₂ h_read]
+      rfl
+    · show (eagerInitAux _ _ rest).2.1.length + 1 = rest.length + 1
+      rw [ih_len]
+    · show (eagerInitAux _ _ rest).2.2.globals = _
+      rw [h_g₂, h_g₁, List.append_assoc]
+
+/-- Eager-world execution never allocates: globals stay fixed and every invocation observes its
+pre-materialized pointer. -/
+theorem runEagerCallerLocationTrace_spec (sites : List CallerLocationSite)
+    (ePtrs : List ProvenancePtr) (G : List CapturedAllocation)
+    (h_map : readLocations G ePtrs = sites.map expectedLocation)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (trace : List CallerLocationTraceEvent) (s : MachineState), s.memory.globals = G →
+      readLocations G (runEagerCallerLocationTrace ePtrs s localDecls layouts trace).1 =
+          (invokedSites sites trace).map expectedLocation ∧
+        (runEagerCallerLocationTrace ePtrs s localDecls layouts trace).2.memory.globals = G
+  | [], s, h_g => ⟨rfl, h_g⟩
+  | .normalStep stmt :: rest, s, h_g =>
+    runEagerCallerLocationTrace_spec sites ePtrs G h_map localDecls layouts rest
+      (normalStmtStep s stmt localDecls layouts) (by rw [normalStmtStep_globals]; exact h_g)
+  | .invokeCallerLocation i :: rest, s, h_g => by
+    have h_idx : (ePtrs[i]?).map (readLocationFromGlobals G) = (sites[i]?).map expectedLocation := by
+      have := congrArg (fun l => l[i]?) h_map
+      simp only [readLocations, List.getElem?_map] at this
+      exact this
+    have ih := runEagerCallerLocationTrace_spec sites ePtrs G h_map localDecls layouts rest s h_g
+    unfold runEagerCallerLocationTrace invokedSites
+    cases hp : ePtrs[i]? with
+    | none =>
+      rw [hp] at h_idx
+      cases hs : sites[i]? with
+      | none => exact ih
+      | some _ => rw [hs] at h_idx; nomatch h_idx
+    | some p =>
+      rw [hp] at h_idx
+      cases hs : sites[i]? with
+      | none => rw [hs] at h_idx; nomatch h_idx
+      | some site =>
+        rw [hs] at h_idx
+        dsimp only
+        refine ⟨?_, ih.2⟩
+        show readLocationFromGlobals G p :: readLocations G _ = expectedLocation site :: _
+        rw [ih.1]
+        exact congrArg (· :: _) (Option.some.inj h_idx)
+
+/-- **Observational Bisimulation (`demandCallerLocation_bisim_eager`)**: for EVERY call-site
+table (arbitrary `#[track_caller]` forwarding chains and arbitrary per-crate
+`LocationDetailPolicy` among all 8 combinations), EVERY trace (panicking or not, with any number
+of repeated invocations), and every initial state with fresh globals, the demand-time world and
+the eager pre-allocated world observe exactly the same `(fileBytes, line, column)` through every
+returned `&'static core::panic::Location`, namely the resolved location of each invoked site. -/
+theorem demandCallerLocation_bisim_eager (sites : List CallerLocationSite) (s₀ : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (trace : List CallerLocationTraceEvent)
+    (h_fresh : GlobalsFresh s₀.memory) (h_sites : SitesFileLenOk sites) :
+    readLocations (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.2.memory.globals
+        (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.1 =
+      readLocations (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).2.memory.globals
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).1 ∧
+    readLocations (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.2.memory.globals
+        (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.1 =
+      (invokedSites sites trace).map expectedLocation := by
+  have h_inv₀ : DemandLocInv {} s₀.memory := ⟨h_fresh, fun _ _ h => nomatch h⟩
+  have h_d := (runDemandCallerLocationTrace_spec sites h_sites localDecls layouts trace {} s₀ h_inv₀).1
+  obtain ⟨h_init, _, _, _⟩ := eagerInitAux_spec sites {} s₀.memory h_inv₀ h_sites
+  have h_e := runEagerCallerLocationTrace_spec sites (eagerInitCallerLocations sites s₀.memory).2.1
+    (eagerInitCallerLocations sites s₀.memory).2.2.globals h_init localDecls layouts trace
+    { s₀ with memory := (eagerInitCallerLocations sites s₀.memory).2.2 } rfl
+  refine ⟨?_, h_d⟩
+  unfold runEagerCallerLocationWorld
+  dsimp only
+  rw [h_d, h_e.2, h_e.1]
+
+/-- **Zero-Clutter Theorem (`demandCallerLocation_no_call_zero_allocs`)**: on any trace that does
+not invoke `caller_location`, the demand-time world is *identical* (`=`) to plain execution with no
+`Location` machinery: same environment, no pointers, same final `MachineState` (hence the same
+`Memory.globals` and `nextAllocId` as the initial state). -/
+theorem demandCallerLocation_no_call_zero_allocs (sites : List CallerLocationSite)
+    (env : DemandCallerLocationEnv) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (trace : List CallerLocationTraceEvent) (s : MachineState),
+      traceHasNoCallerLocation trace = true →
+      runDemandCallerLocationTrace sites env s localDecls layouts trace =
+          (env, [], runPlainTrace s localDecls layouts trace) ∧
+        (runPlainTrace s localDecls layouts trace).memory.globals = s.memory.globals ∧
+        (runPlainTrace s localDecls layouts trace).memory.nextAllocId = s.memory.nextAllocId
+  | [], _, _ => ⟨rfl, rfl, rfl⟩
+  | .normalStep stmt :: rest, s, h => by
+    obtain ⟨h₁, h₂, h₃⟩ := demandCallerLocation_no_call_zero_allocs sites env localDecls layouts
+      rest (normalStmtStep s stmt localDecls layouts) h
+    refine ⟨h₁, ?_, ?_⟩
+    · show (runPlainTrace (normalStmtStep s stmt localDecls layouts) localDecls layouts rest).memory.globals = _
+      rw [h₂, normalStmtStep_globals]
+    · show (runPlainTrace (normalStmtStep s stmt localDecls layouts) localDecls layouts rest).memory.nextAllocId = _
+      rw [h₃, normalStmtStep_nextAllocId]
+  | .invokeCallerLocation _ :: _, _, h => nomatch h
+
+/-- Exact eager clutter: pre-allocation adds one `Location` per call site plus one filename
+allocation per distinct (redacted) filename (`globals.length = G₀ + S + #files`). -/
+theorem eagerInitAux_globals_length :
+    ∀ (sites : List CallerLocationSite) (env : DemandCallerLocationEnv) (mem : Memory),
+      (eagerInitAux env mem sites).2.2.globals.length + env.fileCache.length =
+        mem.globals.length + sites.length + (eagerInitAux env mem sites).1.fileCache.length
+  | [], env, mem => by
+    show mem.globals.length + env.fileCache.length = mem.globals.length + 0 + env.fileCache.length
+    rw [Nat.add_zero]
+  | site :: rest, env, mem => by
+    have ih := eagerInitAux_globals_length rest (evalDemandCallerLocation env site mem).1
+      (evalDemandCallerLocation env site mem).2.2
+    show (eagerInitAux _ _ rest).2.2.globals.length + env.fileCache.length =
+      mem.globals.length + (rest.length + 1) + (eagerInitAux _ _ rest).1.fileCache.length
+    have hstep : (evalDemandCallerLocation env site mem).2.2.globals.length +
+        env.fileCache.length =
+        mem.globals.length + 1 + (evalDemandCallerLocation env site mem).1.fileCache.length := by
+      unfold evalDemandCallerLocation
+      dsimp only
+      split <;> simp only [List.length_append, List.length_cons, List.length_nil] <;> omega
+    omega
+
+/-- Eager world on a non-panicking trace: no observations, yet `Memory.globals` carries
+`G₀ + S + #files` pre-materialized allocations for the whole run. -/
+theorem eagerCallerLocation_clutter (sites : List CallerLocationSite) (s₀ : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (trace : List CallerLocationTraceEvent)
+    (h : traceHasNoCallerLocation trace = true) :
+    (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).1 = [] ∧
+      (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).2.memory.globals.length =
+        s₀.memory.globals.length + sites.length +
+          (eagerInitCallerLocations sites s₀.memory).1.fileCache.length := by
+  have hno : ∀ (ePtrs : List ProvenancePtr) (tr : List CallerLocationTraceEvent) (s : MachineState),
+      traceHasNoCallerLocation tr = true →
+      (runEagerCallerLocationTrace ePtrs s localDecls layouts tr).1 = [] ∧
+        (runEagerCallerLocationTrace ePtrs s localDecls layouts tr).2.memory.globals =
+          s.memory.globals := by
+    intro ePtrs tr
+    induction tr with
+    | nil => intro s _; exact ⟨rfl, rfl⟩
+    | cons ev rest ih =>
+      intro s hev
+      cases ev with
+      | normalStep stmt =>
+        obtain ⟨h₁, h₂⟩ := ih (normalStmtStep s stmt localDecls layouts) hev
+        exact ⟨h₁, h₂.trans (normalStmtStep_globals s stmt localDecls layouts)⟩
+      | invokeCallerLocation _ => nomatch hev
+  obtain ⟨h₁, h₂⟩ := hno (eagerInitCallerLocations sites s₀.memory).2.1 trace
+    { s₀ with memory := (eagerInitCallerLocations sites s₀.memory).2.2 } h
+  refine ⟨h₁, ?_⟩
+  unfold runEagerCallerLocationWorld
+  dsimp only
+  rw [h₂]
+  have := eagerInitAux_globals_length sites {} s₀.memory
+  unfold eagerInitCallerLocations
+  simpa using this
+
+/-! ### Explicit `AllocId` Renaming (`AllocRenamingRel`) -/
 
 /-- Explicit `AllocId` relocation map (`ren : List (AllocId × AllocId)`), relating demand-time
-`AllocId`s to eager-world `AllocId`s. -/
+`AllocId`s to eager-world `AllocId`s (first match wins; unmapped ids are fixed). -/
 def relocateAllocId (ren : List (AllocId × AllocId)) (id : AllocId) : AllocId :=
   match ren.find? (fun p => p.1 == id) with
   | some (_, id') => id'
@@ -3149,16 +4283,17 @@ def relocateAllocId (ren : List (AllocId × AllocId)) (id : AllocId) : AllocId :
 def relocatePtr (ren : List (AllocId × AllocId)) (p : ProvenancePtr) : ProvenancePtr :=
   { p with allocId := relocateAllocId ren p.allocId }
 
+/-- Relocate every `ProvenancePtr.allocId` inside a `Value`. -/
 def relocateValue (ren : List (AllocId × AllocId)) : Value → Value
   | .unit => .unit
   | .scalar sc => .scalar sc
   | .ptr p sz => .ptr (relocatePtr ren p) sz
   | .aggregate vIdx fields => .aggregate vIdx (fields.map (relocateValue ren))
 
-/-- Constructive duplicate-free check on `List Nat`. -/
+/-- Constructive duplicate-free check on `List Nat` (via `natListContains`, `Nat.beq`). -/
 def nodupNat : List Nat → Bool
   | [] => true
-  | x :: xs => !(xs.contains x) && nodupNat xs
+  | x :: xs => !(natListContains x xs) && nodupNat xs
 
 /-- Injective partial bijection predicate on `ren : List (AllocId × AllocId)`. -/
 def AllocRenamingWf (ren : List (AllocId × AllocId)) : Bool :=
@@ -3166,19 +4301,16 @@ def AllocRenamingWf (ren : List (AllocId × AllocId)) : Bool :=
   let cod := ren.map Prod.snd
   nodupNat dom && nodupNat cod
 
-/-- Observational equivalence of two `(globals, locPtr)` pairs: dereferencing `locPtr₁` in
-`globals₁` and `locPtr₂` in `globals₂` via `readLocationFromGlobals` yields the exact same
-`Option (List UInt8 × UInt32 × UInt32)`. -/
+/-- Observational equivalence of two `(globals, locPtr)` pairs. -/
 def LocationPtrObsEq (globals₁ : List CapturedAllocation) (ptr₁ : ProvenancePtr)
     (globals₂ : List CapturedAllocation) (ptr₂ : ProvenancePtr) : Prop :=
   readLocationFromGlobals globals₁ ptr₁ = readLocationFromGlobals globals₂ ptr₂
 
-/-- Full `AllocRenamingRel` between demand-time and eager `Memory` states over a list of returned
-`Location` pointers `demandPtrs` (`eagerPtrs = demandPtrs.map (relocatePtr ren)`):
-1. `AllocRenamingWf ren = true` (injective `AllocId` renaming),
-2. `eagerPtrs = demandPtrs.map (relocatePtr ren)`, and
-3. Every pointer pair `(p_d, p_e)` dereferences to the exact same `(fileBytes, line, column)` in
-   `memDemand.globals` and `memEager.globals`. -/
+/-- `AllocRenamingRel` between demand-time and eager `Memory` states over returned `Location`
+pointers: an injective renaming `ren` maps every demand pointer to its eager counterpart, and the
+two dereference to identical `(fileBytes, line, column)`. Injectivity of the *codomain* holds
+exactly when no call site is invoked twice: lean-miri allocates a fresh `Location` per
+invocation, while the eager world has one per site. -/
 structure AllocRenamingRel (ren : List (AllocId × AllocId))
     (memDemand memEager : Memory)
     (demandPtrs eagerPtrs : List ProvenancePtr) : Prop where
@@ -3188,132 +4320,110 @@ structure AllocRenamingRel (ren : List (AllocId × AllocId))
     ∀ p ∈ demandPtrs,
       LocationPtrObsEq memDemand.globals p memEager.globals (relocatePtr ren p)
 
-/-- Trace step in a multi-step execution comparing demand-time vs. eager `caller_location` worlds:
-either a normal MIR statement/computation step (`normalStep` not invoking `caller_location`) or a
-`caller_location` intrinsic invocation. -/
-inductive CallerLocationTraceEvent where
-  | normalStep (stmt : Statement)
-  | invokeCallerLocation (active : FrameLocMeta) (callers : List FrameLocMeta)
+/-- Positional renaming from demand-time `Location` ids to eager-world `Location` ids. -/
+def renamingOfPtrs (ds es : List ProvenancePtr) : List (AllocId × AllocId) :=
+  List.zip (ds.map (·.allocId)) (es.map (·.allocId))
 
-/-- Run a sequence of `CallerLocationTraceEvent`s in demand-time mode (`lean-miri#67`), allocating
-`Location` globals ONLY when `.invokeCallerLocation` events occur. -/
-def runDemandCallerLocationTrace (env : DemandCallerLocationEnv) (s : MachineState)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    List CallerLocationTraceEvent → DemandCallerLocationEnv × List ProvenancePtr × MachineState
-  | [] => (env, [], s)
-  | .normalStep stmt :: rest =>
-    let s' := match evalStmt s stmt localDecls layouts with
-      | .tau (.running nextState) => nextState
-      | _ => s
-    runDemandCallerLocationTrace env s' localDecls layouts rest
-  | .invokeCallerLocation active callers :: rest =>
-    let (nextEnv, ptr, nextMem) :=
-      evalDemandCallerLocation env active callers s.memory
-    let (finalEnv, restPtrs, finalState) :=
-      runDemandCallerLocationTrace nextEnv { s with memory := nextMem } localDecls layouts rest
-    (finalEnv, ptr :: restPtrs, finalState)
+theorem relocateAllocId_cons (a b x : AllocId) (ren : List (AllocId × AllocId)) :
+    relocateAllocId ((a, b) :: ren) x = if a == x then b else relocateAllocId ren x := by
+  unfold relocateAllocId
+  rw [List.find?_cons]
+  cases a == x <;> rfl
 
-/-- Predicate stating that a trace contains zero `.invokeCallerLocation` events. -/
-def traceHasNoCallerLocation : List CallerLocationTraceEvent → Bool
-  | [] => true
-  | .normalStep _ :: rest => traceHasNoCallerLocation rest
-  | .invokeCallerLocation _ _ :: _ => false
+theorem not_mem_of_natListContains_eq_false {x : Nat} :
+    ∀ {xs : List Nat}, natListContains x xs = false → x ∉ xs
+  | [], _, hm => nomatch hm
+  | y :: ys, h, hm => by
+    unfold natListContains at h
+    cases hb : Nat.beq x y with
+    | true => rw [hb] at h; nomatch h
+    | false =>
+      rw [hb] at h
+      rcases List.mem_cons.mp hm with heq | htl
+      · subst heq
+        rw [nat_beq_self_raw] at hb
+        nomatch hb
+      · exact not_mem_of_natListContains_eq_false h htl
 
-/-- **Zero-Clutter Theorem (`demandCallerLocation_no_call_zero_allocs`)**:
-On any trace that does not invoke `caller_location` (`traceHasNoCallerLocation events = true`),
-demand-time execution leaves `env` and `ptrs` completely empty (`([], 0)` `Location` allocations),
-whereas `eagerInitCallerLocations` pre-allocates `Location` globals for all $S$ candidate spans
-before step 0! -/
-theorem demandCallerLocation_no_call_zero_allocs (env : DemandCallerLocationEnv) :
-    ∀ (events : List CallerLocationTraceEvent) (s : MachineState)
-      (localDecls : List LocalDecl) (layouts : LayoutTable),
-      traceHasNoCallerLocation events = true →
-      (runDemandCallerLocationTrace env s localDecls layouts events).1 = env ∧
-        (runDemandCallerLocationTrace env s localDecls layouts events).2.1 = []
-  | [], _, _, _, _ => ⟨rfl, rfl⟩
-  | .normalStep _stmt :: rest, _s, localDecls, layouts, h =>
-    demandCallerLocation_no_call_zero_allocs env rest _ localDecls layouts h
-  | .invokeCallerLocation _ _ :: _, _, _, _, h => nomatch h
+theorem renamingOfPtrs_mapped :
+    ∀ (ds es : List ProvenancePtr), ds.length = es.length →
+      nodupNat (ds.map (·.allocId)) = true →
+      (∀ p ∈ ds, p.offsetBytes = 0) → (∀ p ∈ es, p.offsetBytes = 0) →
+      es = ds.map (relocatePtr (renamingOfPtrs ds es))
+  | [], [], _, _, _, _ => rfl
+  | [], _ :: _, h, _, _, _ => nomatch h
+  | _ :: _, [], h, _, _, _ => nomatch h
+  | d :: ds, e :: es, h_len, h_nd, h_offD, h_offE => by
+    unfold nodupNat at h_nd
+    rw [List.map_cons, Bool.and_eq_true] at h_nd
+    have h_notin : d.allocId ∉ ds.map (·.allocId) := by
+      apply not_mem_of_natListContains_eq_false
+      cases hc : natListContains d.allocId (ds.map (·.allocId)) with
+      | false => rfl
+      | true => rw [hc] at h_nd; nomatch h_nd.1
+    have ih := renamingOfPtrs_mapped ds es (Nat.succ.inj h_len) h_nd.2
+      (fun p hp => h_offD p (List.Mem.tail _ hp)) (fun p hp => h_offE p (List.Mem.tail _ hp))
+    show e :: es = relocatePtr ((d.allocId, e.allocId) :: renamingOfPtrs ds es) d ::
+      ds.map (relocatePtr ((d.allocId, e.allocId) :: renamingOfPtrs ds es))
+    have h_head : relocatePtr ((d.allocId, e.allocId) :: renamingOfPtrs ds es) d = e := by
+      have hd : d.offsetBytes = 0 := h_offD _ (List.Mem.head _)
+      have he : e.offsetBytes = 0 := h_offE _ (List.Mem.head _)
+      generalize renamingOfPtrs ds es = ren
+      rcases e with ⟨eid, eoff⟩
+      rcases d with ⟨did, doff⟩
+      dsimp only at hd he
+      subst hd
+      subst he
+      show ({ allocId := relocateAllocId ((did, eid) :: ren) did, offsetBytes := 0 } :
+        ProvenancePtr) = ⟨eid, 0⟩
+      rw [relocateAllocId_cons, nat_beq_self]
+      rfl
+    have h_tail : ds.map (relocatePtr ((d.allocId, e.allocId) :: renamingOfPtrs ds es)) =
+        ds.map (relocatePtr (renamingOfPtrs ds es)) := by
+      apply List.map_congr_left
+      intro q hq
+      unfold relocatePtr
+      have hne : (d.allocId == q.allocId) = false := by
+        apply beq_eq_false_iff_ne.mpr
+        intro heq
+        exact h_notin (heq ▸ List.mem_map_of_mem hq)
+      rw [relocateAllocId_cons, hne]
+      rfl
+    rw [h_head, h_tail, ← ih]
 
-/-- Soundness of fresh `evalDemandCallerLocation`: when `env = {}`, `mem.globals = []`, and
-`pos.fileBytes.length < 4294967296`, `evalDemandCallerLocation` produces a pointer `ptr` that
-dereferences in `mem'.globals` to `some (effPos.fileBytes, effPos.line, effPos.column)` where
-`effPos = resolveTrackCallerStack active callers`. -/
-theorem readLocationFromGlobals_evalDemandCallerLocation_fresh
-    (active : FrameLocMeta) (callers : List FrameLocMeta) (mem : Memory)
-    (h_empty : mem.globals = [])
-    (h_len : (resolveTrackCallerStack active callers).fileBytes.length < 4294967296) :
-    let (_, ptr, mem') := evalDemandCallerLocation {} active callers mem
-    let effPos := resolveTrackCallerStack active callers
-    readLocationFromGlobals mem'.globals ptr =
-      some (effPos.fileBytes, effPos.line, effPos.column) := by
-  dsimp only [evalDemandCallerLocation, lookupFileCache?]
-  unfold readLocationFromGlobals
-  rw [h_empty]
-  dsimp only [List.nil_append]
-  have h_loc_lookup :
-      lookupGlobalAlloc
-        [mkFilenameAllocation (mem.nextAllocId + 1)
-          (resolveTrackCallerStack active callers).fileBytes,
-         mkLocationAllocation (mem.nextAllocId + 2) (mem.nextAllocId + 1)
-          (resolveTrackCallerStack active callers).fileBytes.length
-          (resolveTrackCallerStack active callers).line
-          (resolveTrackCallerStack active callers).column]
-        (mem.nextAllocId + 2) =
-      some (mkLocationAllocation (mem.nextAllocId + 2) (mem.nextAllocId + 1)
-        (resolveTrackCallerStack active callers).fileBytes.length
-        (resolveTrackCallerStack active callers).line
-        (resolveTrackCallerStack active callers).column) := by
-    simp only [lookupGlobalAlloc, mkFilenameAllocation, mkLocationAllocation]
-    have hne : Nat.beq (mem.nextAllocId + 1) (mem.nextAllocId + 2) = false :=
-      nat_beq_ne (by omega)
-    rw [hne, nat_beq_self_raw]
-  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, h_loc_lookup]
-  dsimp only [mkLocationAllocation]
-  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
-  have hdrop8 :
-      ([some (0 : UInt8), some 0, some 0, some 0, some 0, some 0, some 0, some 0] ++
-        u64LeBytes (resolveTrackCallerStack active callers).fileBytes.length ++
-        u32LeBytes (resolveTrackCallerStack active callers).line.toNat ++
-        u32LeBytes (resolveTrackCallerStack active callers).column.toNat).drop 8 =
-      u64LeBytes (resolveTrackCallerStack active callers).fileBytes.length ++
-        (u32LeBytes (resolveTrackCallerStack active callers).line.toNat ++
-         u32LeBytes (resolveTrackCallerStack active callers).column.toNat) := rfl
-  have hdrop16 :
-      ([some (0 : UInt8), some 0, some 0, some 0, some 0, some 0, some 0, some 0] ++
-        u64LeBytes (resolveTrackCallerStack active callers).fileBytes.length ++
-        u32LeBytes (resolveTrackCallerStack active callers).line.toNat ++
-        u32LeBytes (resolveTrackCallerStack active callers).column.toNat).drop 16 =
-      u32LeBytes (resolveTrackCallerStack active callers).line.toNat ++
-        u32LeBytes (resolveTrackCallerStack active callers).column.toNat := rfl
-  have hdrop20 :
-      ([some (0 : UInt8), some 0, some 0, some 0, some 0, some 0, some 0, some 0] ++
-        u64LeBytes (resolveTrackCallerStack active callers).fileBytes.length ++
-        u32LeBytes (resolveTrackCallerStack active callers).line.toNat ++
-        u32LeBytes (resolveTrackCallerStack active callers).column.toNat).drop 20 =
-      u32LeBytes (resolveTrackCallerStack active callers).column.toNat ++ [] := by
-    simp [List.append_nil]
-    rfl
-  rw [hdrop8, readU64Le_u64LeBytes h_len,
-      hdrop16, readU32Le_u32LeBytes (resolveTrackCallerStack active callers).line,
-      hdrop20, readU32Le_u32LeBytes (resolveTrackCallerStack active callers).column]
-  simp only [lookupGlobalAlloc, mkFilenameAllocation, nat_beq_self_raw]
-  have htake :
-      ((resolveTrackCallerStack active callers).fileBytes.map Option.some).take
-        (resolveTrackCallerStack active callers).fileBytes.length =
-      (resolveTrackCallerStack active callers).fileBytes.map Option.some := by
-    rw [List.take_of_length_le (by simp)]
-  rw [htake, decodeInitBytes?_map_some]
-  dsimp only
-  rw [nat_beq_self]
-  rfl
+/-- **`AllocRenamingRel` from observational agreement**: whenever the demand and eager pointer
+lists are observationally equal (`demandCallerLocation_bisim_eager`), have zero offsets, and the
+positional renaming is well-formed (injective — i.e. no call site was invoked twice), they are
+related by the explicit renaming `renamingOfPtrs`. -/
+theorem allocRenamingRel_of_readLocations {ds es : List ProvenancePtr} {memD memE : Memory}
+    (h_obs : readLocations memD.globals ds = readLocations memE.globals es)
+    (h_wf : AllocRenamingWf (renamingOfPtrs ds es) = true)
+    (h_offD : ∀ p ∈ ds, p.offsetBytes = 0) (h_offE : ∀ p ∈ es, p.offsetBytes = 0) :
+    AllocRenamingRel (renamingOfPtrs ds es) memD memE ds es := by
+  have h_len : ds.length = es.length := by
+    have := congrArg List.length h_obs
+    simpa [readLocations] using this
+  have h_nd : nodupNat (ds.map (·.allocId)) = true := by
+    unfold AllocRenamingWf renamingOfPtrs at h_wf
+    rw [Bool.and_eq_true] at h_wf
+    have h_fst : (List.zip (ds.map (·.allocId)) (es.map (·.allocId))).map Prod.fst =
+        ds.map (·.allocId) :=
+      List.map_fst_zip (by simp [h_len])
+    rw [← h_fst]
+    exact h_wf.1
+  have h_map := renamingOfPtrs_mapped ds es h_len h_nd h_offD h_offE
+  refine ⟨h_wf, h_map, ?_⟩
+  intro p hp
+  unfold LocationPtrObsEq
+  rw [h_map] at h_obs
+  unfold readLocations at h_obs
+  rw [List.map_map] at h_obs
+  exact (List.map_inj_left.mp h_obs) p hp
 
-/-- Concrete 3-frame `#[track_caller]` forwarding chain:
-`user_caller` (`isTrackCaller = false`, `src/lib.rs:42:13`)
-  $\rightarrow$ `Option::unwrap` (`isTrackCaller = true`, `core/option.rs:950:5`)
-  $\rightarrow$ `option::unwrap_failed` (`isTrackCaller = true`, `core/option.rs:1980:5`)
-  $\rightarrow$ `core::intrinsics::caller_location()`. -/
-def protoLibRsBytes : List UInt8 := [115, 114, 99, 47, 108, 105, 98, 46, 114, 115] -- "src/lib.rs"
+/-! ### Concrete `#[track_caller]` Chains Across All 8 `-Zlocation-detail` Policies -/
+
+/-- `"src/lib.rs"` and `"core/opt.rs"` filename bytes. -/
+def protoLibRsBytes : List UInt8 := [115, 114, 99, 47, 108, 105, 98, 46, 114, 115]
 def protoOptionRsBytes : List UInt8 := [99, 111, 114, 101, 47, 111, 112, 116, 46, 114, 115]
 
 def protoUserCallerPos : SourceExpansionPos := ⟨"src/lib.rs", protoLibRsBytes, 42, 13⟩
@@ -3321,76 +4431,111 @@ def protoUnwrapBodyPos : SourceExpansionPos := ⟨"core/opt.rs", protoOptionRsBy
 def protoUnwrapFailedPos : SourceExpansionPos := ⟨"core/opt.rs", protoOptionRsBytes, 1980, 5⟩
 def protoOtherCallPos : SourceExpansionPos := ⟨"src/lib.rs", protoLibRsBytes, 108, 7⟩
 
+/-- `option::unwrap_failed` (`#[track_caller]`), called from `Option::unwrap` at `opt.rs:950:5`. -/
 def protoUnwrapFailedFrame (pol : LocationDetailPolicy := {}) : FrameLocMeta :=
-  ⟨"core::option::unwrap_failed", protoUnwrapBodyPos, true, pol⟩
+  ⟨"core::option::unwrap_failed", some protoUnwrapBodyPos, true, pol⟩
 
+/-- `Option::unwrap` (`#[track_caller]`), called from `user_caller` at `lib.rs:42:13`. -/
 def protoUnwrapFrame (pol : LocationDetailPolicy := {}) : FrameLocMeta :=
-  ⟨"core::option::Option::unwrap", protoUserCallerPos, true, pol⟩
+  ⟨"core::option::Option::unwrap", some protoUserCallerPos, true, pol⟩
 
+/-- Entry frame `my_crate::user_caller` (not `#[track_caller]`, no recorded caller). -/
 def protoUserCallerFrame (pol : LocationDetailPolicy := {}) : FrameLocMeta :=
-  ⟨"my_crate::user_caller", protoOtherCallPos, false, pol⟩
+  ⟨"my_crate::user_caller", none, false, pol⟩
 
-/-- Candidate spans for the eager vs. demand comparison. -/
-def protoCandidateSpans (pol : LocationDetailPolicy := {}) :
-    List (FrameLocMeta × List FrameLocMeta) :=
-  [ (protoUserCallerFrame pol, []),
-    (protoUnwrapFrame pol, [protoUserCallerFrame pol]),
-    (protoUnwrapFailedFrame pol, [protoUnwrapFrame pol, protoUserCallerFrame pol]) ]
+/-- `caller_location` invoked directly in `user_caller` at `lib.rs:108:7`. -/
+def protoDirectSite (userPol : LocationDetailPolicy := {}) : CallerLocationSite :=
+  ⟨protoOtherCallPos, [protoUserCallerFrame userPol]⟩
 
-/-- **Filename Deduplication Theorem (`demandCallerLocation_filename_dedup`)**:
-Two `caller_location` invocations from different lines in `"src/lib.rs"` (`42:13` and `108:7`)
-materialize only **3** `CapturedAllocation`s in `Memory.globals` (1 shared filename allocation at
-`allocId = 1`, plus 2 distinct `Location` root allocations at `allocId = 2` and `allocId = 3`),
-rather than duplicating the filename bytes! -/
+/-- `caller_location` invoked inside `Option::unwrap` (2-frame forwarding chain). -/
+def protoUnwrapSite (corePol userPol : LocationDetailPolicy := {}) : CallerLocationSite :=
+  ⟨protoUnwrapBodyPos, [protoUnwrapFrame corePol, protoUserCallerFrame userPol]⟩
+
+/-- `caller_location` invoked inside `unwrap_failed` (3-frame forwarding chain
+`user_caller -> unwrap -> unwrap_failed -> caller_location`). -/
+def protoPanicSite (corePol userPol : LocationDetailPolicy := {}) : CallerLocationSite :=
+  ⟨protoUnwrapFailedPos,
+    [protoUnwrapFailedFrame corePol, protoUnwrapFrame corePol, protoUserCallerFrame userPol]⟩
+
+/-- Call-site table; frames of the `core` crate use `corePol`, `user_caller` uses `userPol`. -/
+def protoSites (corePol userPol : LocationDetailPolicy) : List CallerLocationSite :=
+  [protoDirectSite userPol, protoUnwrapSite corePol userPol, protoPanicSite corePol userPol]
+
+theorem applyLocationDetailPolicy_fileBytes_length_le {pol : LocationDetailPolicy}
+    {pos : SourceExpansionPos} {bound : Nat}
+    (h_pos : pos.fileBytes.length ≤ bound) (h_red : redactedFileBytes.length ≤ bound) :
+    (applyLocationDetailPolicy pol pos).fileBytes.length ≤ bound := by
+  unfold applyLocationDetailPolicy
+  dsimp only
+  split <;> assumption
+
+/-- The resolved filename is either `"<redacted>"` or one of the spans along the walk, so a
+uniform byte-length bound on those spans bounds the resolved filename. -/
+theorem resolveCallerLocationAux_fileBytes_length_le {bound : Nat}
+    (h_red : redactedFileBytes.length ≤ bound) :
+    ∀ (frames : List FrameLocMeta) (fallbackPol : LocationDetailPolicy) (pos : SourceExpansionPos),
+      pos.fileBytes.length ≤ bound →
+      (∀ f ∈ frames, ∀ p, f.callSitePos = some p → p.fileBytes.length ≤ bound) →
+      (resolveCallerLocationAux fallbackPol pos frames).fileBytes.length ≤ bound
+  | [], _, _, h_pos, _ => applyLocationDetailPolicy_fileBytes_length_le h_pos h_red
+  | f :: rest, _, pos, h_pos, h_frames => by
+    unfold resolveCallerLocationAux
+    split
+    · split
+      · rename_i p hp
+        exact resolveCallerLocationAux_fileBytes_length_le h_red rest f.detailPolicy p
+          (h_frames f (List.Mem.head _) p hp)
+          (fun g hg q hq => h_frames g (List.Mem.tail _ hg) q hq)
+      · exact applyLocationDetailPolicy_fileBytes_length_le h_pos h_red
+    · exact applyLocationDetailPolicy_fileBytes_length_le h_pos h_red
+
+theorem protoSites_fileLenOk (corePol userPol : LocationDetailPolicy) :
+    SitesFileLenOk (protoSites corePol userPol) := by
+  intro site hsite
+  apply Nat.lt_of_le_of_lt _ (by decide : 11 < 4294967296)
+  apply resolveCallerLocationAux_fileBytes_length_le (by decide)
+  · simp only [protoSites, List.mem_cons, List.not_mem_nil, or_false] at hsite
+    rcases hsite with rfl | rfl | rfl <;> exact Nat.le_of_ble_eq_true rfl
+  · intro f hf p hp
+    simp only [protoSites, List.mem_cons, List.not_mem_nil, or_false] at hsite
+    rcases hsite with rfl | rfl | rfl <;>
+      simp only [protoDirectSite, protoUnwrapSite, protoPanicSite, List.mem_cons,
+        List.not_mem_nil, or_false] at hf <;>
+      rcases hf with rfl | rfl | rfl <;>
+      simp only [protoUnwrapFailedFrame, protoUnwrapFrame, protoUserCallerFrame,
+        Option.some.injEq, reduceCtorEq] at hp <;>
+      subst hp <;> decide
+
+/-- **Filename Deduplication (`demandCallerLocation_filename_dedup`)**: two `caller_location`
+invocations resolving into `"src/lib.rs"` (`42:13` via the 3-frame chain and `108:7` directly)
+materialize only **3** `CapturedAllocation`s (1 shared filename at `allocId = 0`, 2 distinct
+`Location` roots at `1` and `2`) and leave `nextAllocId = 3` past every materialized id. -/
 theorem demandCallerLocation_filename_dedup :
-    let (env₁, ptr₁, mem₁) :=
-      evalDemandCallerLocation {} (protoUnwrapFailedFrame {})
-        [protoUnwrapFrame {}, protoUserCallerFrame {}] emptyMemory
-    let (env₂, ptr₂, mem₂) :=
-      evalDemandCallerLocation env₁ (protoUserCallerFrame {}) [] mem₁
-    mem₂.globals.length = 3 ∧
-      env₂.fileCache.length = 1 ∧
-      ptr₁.allocId = 2 ∧
-      ptr₂.allocId = 3 ∧
-      readLocationFromGlobals mem₂.globals ptr₁ = some (protoLibRsBytes, 42, 13) ∧
-      readLocationFromGlobals mem₂.globals ptr₂ = some (protoLibRsBytes, 108, 7) := by
+    let r₁ := evalDemandCallerLocation {} (protoPanicSite {} {}) emptyMemory
+    let r₂ := evalDemandCallerLocation r₁.1 (protoDirectSite {}) r₁.2.2
+    r₂.2.2.globals.length = 3 ∧
+      r₂.1.fileCache.length = 1 ∧
+      r₁.2.1.allocId = 1 ∧
+      r₂.2.1.allocId = 2 ∧
+      r₂.2.2.nextAllocId = 3 ∧
+      readLocationFromGlobals r₂.2.2.globals r₁.2.1 = some (protoLibRsBytes, 42, 13) ∧
+      readLocationFromGlobals r₂.2.2.globals r₂.2.1 = some (protoLibRsBytes, 108, 7) := by
   decide +kernel
 
-/-- **Observational Bisimulation Across All 8 `-Zlocation-detail` Policies & `#[track_caller]`
-Forwarding Chains (`demandCallerLocation_bisim_eager`)**:
-For every policy `pol ∈ allLocationDetailPolicies` (all 8 combinations of `file`, `line`, `column`
-redaction):
-1. Executing `caller_location` on demand in `protoUnwrapFailedFrame pol` across the 3-frame
-   `#[track_caller]` chain `user_caller -> unwrap -> unwrap_failed` and pre-allocating all
-   candidate spans via `eagerInitCallerLocations (protoCandidateSpans pol)` are related by an
-   injective `AllocRenamingRel` (`ren = [(1, 1), (2, 4)]`), and
-2. Both dereference to the exact same redacted `(fileBytes, line, column)` of `protoUserCallerPos`! -/
-theorem demandCallerLocation_bisim_eager :
-    ∀ pol ∈ allLocationDetailPolicies,
-      let (_, dPtr, dMem) :=
-        evalDemandCallerLocation {} (protoUnwrapFailedFrame pol)
-          [protoUnwrapFrame pol, protoUserCallerFrame pol] emptyMemory
-      let (_, ePtrs, eMem) :=
-        eagerInitCallerLocations (protoCandidateSpans pol) emptyMemory
-      let expected := applyLocationDetailPolicy pol protoUserCallerPos
-      AllocRenamingRel [(1, 1), (2, 4)] dMem eMem [dPtr] (ePtrs.drop 2) ∧
-        readLocationFromGlobals dMem.globals dPtr =
-          some (expected.fileBytes, expected.line, expected.column) ∧
-        readLocationFromGlobals eMem.globals ({ allocId := 4, offsetBytes := 0 }) =
-          some (expected.fileBytes, expected.line, expected.column) := by
-  intro pol hpol
-  simp only [allLocationDetailPolicies, List.mem_cons, List.not_mem_nil, or_false] at hpol
-  rcases hpol with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
-    refine ⟨⟨rfl, rfl, ?_⟩, by decide +kernel, by decide +kernel⟩ <;>
-    (intro p hp; simp only [List.mem_singleton] at hp; subst hp; rfl)
+/-- Per-crate policy ownership: the 3-frame chain resolves to `user_caller`'s span, so
+`user_caller`'s crate policy applies even when every `core` frame redacts everything. -/
+theorem trackCaller_span_owner_policy :
+    (protoPanicSite ⟨false, false, false⟩ {}).resolve = protoUserCallerPos ∧
+    (protoPanicSite {} ⟨false, false, false⟩).resolve =
+      applyLocationDetailPolicy ⟨false, false, false⟩ protoUserCallerPos := by
+  decide +kernel
 
-/-- Non-`#[track_caller]` intermediate frame reset witness: if the middle frame has
-`isTrackCaller = false`, `resolveTrackCallerStack` stops at that frame's call site rather than
-forwarding the outer caller's position. -/
+/-- Non-`#[track_caller]` intermediate frame: the walk stops at the call site inside that
+frame rather than forwarding the outer caller's position. -/
 theorem trackCaller_stops_at_nonTrackCaller_frame :
-    let nonTrackMid : FrameLocMeta :=
-      ⟨"my_crate::non_track_helper", protoUnwrapBodyPos, false, {}⟩
-    resolveTrackCallerStack (protoUnwrapFailedFrame {}) [nonTrackMid, protoUserCallerFrame {}] =
+    let nonTrackMid : FrameLocMeta := ⟨"my_crate::non_track_helper", some protoOtherCallPos, false, {}⟩
+    CallerLocationSite.resolve
+        ⟨protoUnwrapFailedPos, [protoUnwrapFailedFrame {}, nonTrackMid, protoUserCallerFrame {}]⟩ =
       protoUnwrapBodyPos := by
   decide +kernel
 
@@ -3423,14 +4568,17 @@ def evalSymArrayTerm (env : Nat → Nat → Option Nat) : SymArrayTerm → Nat �
   | .ite cond t f, i =>
     if cond then evalSymArrayTerm env t i else evalSymArrayTerm env f i
 
-/-- **Lazy 1-layer overwrite-stripping symbolic write (`mkLazyWrite`, `cl/1023450318`)**:
-1. Constant-folds out-of-bounds writes (`!(idx < symArrayLen arr)`),
+/-- **Lazy 1-layer overwrite-stripping symbolic write (`mkLazyWrite`, `cl/1023450318`)** over a
+fixed-width array whose width `w` is statically known (`symArrayLen arr = w`):
+1. Constant-folds out-of-bounds writes with an `O(1)` check against the static width `w`
+   (`!(idx < w)`; recomputing `symArrayLen arr` here would walk the whole write spine and make
+   every write `O(N)`),
 2. Collapses same-value writes onto `.constVec len defVal`,
-3. Collapses **immediately preceding** same-address concrete overwrites `.write inner idx' _` when
-   `idx' == idx`, and
-4. Stops immediately in $O(1)$ when `idx' != idx` without walking the write spine! -/
-def mkLazyWrite (arr : SymArrayTerm) (idx : Nat) (val : Nat) : SymArrayTerm :=
-  if !(idx < symArrayLen arr) then
+3. Collapses an **immediately preceding** same-address concrete overwrite `.write inner idx' _`
+   when `idx' == idx`, and
+4. Stops immediately in `O(1)` when `idx' != idx` without walking the write spine. -/
+def mkLazyWrite (w : Nat) (arr : SymArrayTerm) (idx : Nat) (val : Nat) : SymArrayTerm :=
+  if !(idx < w) then
     arr
   else
     match arr with
@@ -3443,8 +4591,8 @@ def mkLazyWrite (arr : SymArrayTerm) (idx : Nat) (val : Nat) : SymArrayTerm :=
         .write (.write inner idx' val') idx val
     | other => .write other idx val
 
-theorem symArrayLen_mkLazyWrite (arr : SymArrayTerm) (idx val : Nat) :
-    symArrayLen (mkLazyWrite arr idx val) = symArrayLen arr := by
+theorem symArrayLen_mkLazyWrite (w : Nat) (arr : SymArrayTerm) (idx val : Nat) :
+    symArrayLen (mkLazyWrite w arr idx val) = symArrayLen arr := by
   unfold mkLazyWrite
   split
   · rfl
@@ -3485,26 +4633,36 @@ theorem evalSymArrayTerm_oob (env : Nat → Nat → Option Nat) :
       simp only [↓reduceIte] at hi ⊢
       exact evalSymArrayTerm_oob env t i hi
 
+/-- An out-of-bounds write (`symArrayLen arr ≤ idx`) is semantically a no-op. -/
+theorem eval_write_oob (env : Nat → Nat → Option Nat) (arr : SymArrayTerm) (idx val i : Nat)
+    (hge : symArrayLen arr ≤ idx) :
+    evalSymArrayTerm env (.write arr idx val) i = evalSymArrayTerm env arr i := by
+  show (if i < symArrayLen arr then
+      (if (i == idx) = true then some val else evalSymArrayTerm env arr i) else none) =
+    evalSymArrayTerm env arr i
+  by_cases hi : i < symArrayLen arr
+  · simp only [hi, ↓reduceIte]
+    have hne : (i == idx) = false :=
+      beq_eq_false_iff_ne.mpr (Nat.ne_of_lt (Nat.lt_of_lt_of_le hi hge))
+    rw [hne]
+    rfl
+  · simp only [hi, ↓reduceIte]
+    exact (evalSymArrayTerm_oob env arr i hi).symm
+
 /-- **Exact Semantic Soundness of `mkLazyWrite` (`eval_mkLazyWrite`)**:
-For all environments `env`, terms `arr`, write indices `idx`, values `val`, and read indices `i`,
-`mkLazyWrite arr idx val` denotes the exact same array as `.write arr idx val`. -/
-theorem eval_mkLazyWrite (env : Nat → Nat → Option Nat) (arr : SymArrayTerm)
-    (idx val i : Nat) :
-    evalSymArrayTerm env (mkLazyWrite arr idx val) i =
+For all environments `env`, terms `arr` of static width `w`, write indices `idx`, values `val`,
+and read indices `i`, `mkLazyWrite w arr idx val` denotes the exact same array as
+`.write arr idx val`. -/
+theorem eval_mkLazyWrite (env : Nat → Nat → Option Nat) {w : Nat} (arr : SymArrayTerm)
+    (h_w : symArrayLen arr = w) (idx val i : Nat) :
+    evalSymArrayTerm env (mkLazyWrite w arr idx val) i =
       evalSymArrayTerm env (.write arr idx val) i := by
+  subst h_w
   unfold mkLazyWrite
   split
   · rename_i h_oob
     have hge : symArrayLen arr ≤ idx := Nat.le_of_not_lt (by simpa using h_oob)
-    conv => rhs; unfold evalSymArrayTerm
-    by_cases hi : i < symArrayLen arr
-    · simp only [hi, ↓reduceIte]
-      have hne : (i == idx) = false :=
-        beq_eq_false_iff_ne.mpr (Nat.ne_of_lt (Nat.lt_of_lt_of_le hi hge))
-      rw [hne]
-      rfl
-    · simp only [hi, ↓reduceIte]
-      exact evalSymArrayTerm_oob env arr i hi
+    exact (eval_write_oob env arr idx val i hge).symm
   · rename_i h_in
     cases arr with
     | base id len => rfl
@@ -3548,9 +4706,10 @@ def stripShadowedWrites : SymArrayTerm → Nat → SymArrayTerm
   | other, _ => other
 
 /-- Eager write baseline (`mkEagerWrite`): walks the entire write spine on every write to strip
-shadowed writes at `idx`, incurring $\Theta(N^2)$ spine inspections across $N$ distinct-address writes. -/
-def mkEagerWrite (arr : SymArrayTerm) (idx : Nat) (val : Nat) : SymArrayTerm :=
-  if !(idx < symArrayLen arr) then
+shadowed writes at `idx`, incurring $\Theta(N^2)$ spine inspections across $N$ distinct-address
+writes (`eagerWriteChain_distinctAddrs_steps_quadratic`). -/
+def mkEagerWrite (w : Nat) (arr : SymArrayTerm) (idx : Nat) (val : Nat) : SymArrayTerm :=
+  if !(idx < w) then
     arr
   else
     .write (stripShadowedWrites arr idx) idx val
@@ -3606,112 +4765,371 @@ theorem eval_stripShadowedWrites_ne (env : Nat → Nat → Option Nat) :
         | false => exact eval_stripShadowedWrites_ne env inner idx i hne
       · simp only [hi, ↓reduceIte]
 
-/-- Lazy read-over-write folding (`mkLazyRead`): resolves concrete reads directly from a write
-chain by forwarding `val` on `rIdx == idx` and skipping distinct concrete writes `rIdx != idx`. -/
-def mkLazyRead : SymArrayTerm → Nat → Option Nat
-  | .base _ _, _ => none
-  | .constVec len defVal, rIdx => if rIdx < len then some defVal else none
-  | .write inner idx val, rIdx =>
-    if !(rIdx < symArrayLen inner) then
-      none
-    else if rIdx == idx then
-      some val
-    else
-      mkLazyRead inner rIdx
-  | .ite cond t f, rIdx =>
-    if cond then mkLazyRead t rIdx else mkLazyRead f rIdx
-
-/-- **Soundness of `mkLazyRead` (`eval_mkLazyRead`)**: whenever `mkLazyRead arr rIdx = some v`,
-`evalSymArrayTerm env arr rIdx = some v` for *every* base environment `env`! -/
-theorem eval_mkLazyRead (env : Nat → Nat → Option Nat) :
-    ∀ (arr : SymArrayTerm) (rIdx v : Nat),
-      mkLazyRead arr rIdx = some v →
-      evalSymArrayTerm env arr rIdx = some v
-  | .base _ _, _, _, h => nomatch h
-  | .constVec len defVal, rIdx, v, h => by
-    unfold mkLazyRead at h
-    unfold evalSymArrayTerm
-    exact h
-  | .write inner idx val, rIdx, v, h => by
-    unfold mkLazyRead at h
-    unfold evalSymArrayTerm
-    by_cases hlt : rIdx < symArrayLen inner
-    · have hnot : (!(rIdx < symArrayLen inner)) = false := by simp [hlt]
-      rw [hnot] at h
-      simp only [hlt, ↓reduceIte]
-      cases h_eq : rIdx == idx with
-      | true =>
-        rw [h_eq] at h
-        exact h
+/-- **Exact Semantic Soundness of the eager baseline (`eval_mkEagerWrite`)**: `mkEagerWrite`
+denotes the same array as `.write arr idx val`, so both strategies are interchangeable and the
+benchmark compares equal semantics. -/
+theorem eval_mkEagerWrite (env : Nat → Nat → Option Nat) {w : Nat} (arr : SymArrayTerm)
+    (h_w : symArrayLen arr = w) (idx val i : Nat) :
+    evalSymArrayTerm env (mkEagerWrite w arr idx val) i =
+      evalSymArrayTerm env (.write arr idx val) i := by
+  subst h_w
+  unfold mkEagerWrite
+  split
+  · rename_i h_oob
+    have hge : symArrayLen arr ≤ idx := Nat.le_of_not_lt (by simpa using h_oob)
+    exact (eval_write_oob env arr idx val i hge).symm
+  · unfold evalSymArrayTerm
+    rw [symArrayLen_stripShadowedWrites]
+    by_cases hi : i < symArrayLen arr
+    · simp only [hi, ↓reduceIte]
+      cases h_i : i == idx with
+      | true => rfl
       | false =>
-        rw [h_eq] at h
-        exact eval_mkLazyRead env inner rIdx v h
-    · have hnot : (!(rIdx < symArrayLen inner)) = true := by simp [hlt]
-      rw [hnot] at h
-      nomatch h
-  | .ite cond t f, rIdx, v, h => by
-    unfold mkLazyRead at h
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        exact eval_stripShadowedWrites_ne env arr idx i h_i
+    · simp only [hi, ↓reduceIte]
+
+/-- Spine walk of `mkLazyRead` (read-over-write forwarding on `rIdx == idx`, skipping distinct
+concrete writes `rIdx != idx`; bounds were already checked once against the static width). -/
+def lazyReadSpine : SymArrayTerm → Nat → Option Nat
+  | .base _ _, _ => none
+  | .constVec _ defVal, _ => some defVal
+  | .write inner idx val, rIdx => if rIdx == idx then some val else lazyReadSpine inner rIdx
+  | .ite cond t f, rIdx => if cond then lazyReadSpine t rIdx else lazyReadSpine f rIdx
+
+/-- Lazy read-over-write folding (`mkLazyRead`): one `O(1)` bounds check against the static width
+`w`, then `lazyReadSpine` (which no longer re-walks the spine via `symArrayLen` at every node). -/
+def mkLazyRead (w : Nat) (arr : SymArrayTerm) (rIdx : Nat) : Option Nat :=
+  if rIdx < w then lazyReadSpine arr rIdx else none
+
+theorem lazyReadSpine_sound (env : Nat → Nat → Option Nat) :
+    ∀ (arr : SymArrayTerm) (rIdx v : Nat),
+      rIdx < symArrayLen arr →
+      lazyReadSpine arr rIdx = some v →
+      evalSymArrayTerm env arr rIdx = some v
+  | .base _ _, _, _, _, h => nomatch h
+  | .constVec len defVal, rIdx, v, hlt, h => by
+    unfold symArrayLen at hlt
+    unfold lazyReadSpine at h
+    unfold evalSymArrayTerm
+    simp only [hlt, ↓reduceIte]
+    exact h
+  | .write inner idx val, rIdx, v, hlt, h => by
+    unfold symArrayLen at hlt
+    unfold lazyReadSpine at h
+    unfold evalSymArrayTerm
+    simp only [hlt, ↓reduceIte]
+    cases h_eq : rIdx == idx with
+    | true =>
+      rw [h_eq] at h
+      exact h
+    | false =>
+      rw [h_eq] at h
+      exact lazyReadSpine_sound env inner rIdx v hlt h
+  | .ite cond t f, rIdx, v, hlt, h => by
+    unfold symArrayLen at hlt
+    unfold lazyReadSpine at h
     unfold evalSymArrayTerm
     cases cond with
-    | false => exact eval_mkLazyRead env f rIdx v h
-    | true => exact eval_mkLazyRead env t rIdx v h
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte] at hlt h ⊢
+      exact lazyReadSpine_sound env f rIdx v hlt h
+    | true =>
+      simp only [↓reduceIte] at hlt h ⊢
+      exact lazyReadSpine_sound env t rIdx v hlt h
 
-/-! ### Exact Spine-Inspection Complexity: `mkLazyWrite` ($O(N)$) vs. `mkEagerWrite` ($\Theta(N^2)$) -/
+/-- **Soundness of `mkLazyRead` (`eval_mkLazyRead`)**: whenever `mkLazyRead w arr rIdx = some v`
+for a term of static width `w`, `evalSymArrayTerm env arr rIdx = some v` for *every* base
+environment `env`! -/
+theorem eval_mkLazyRead (env : Nat → Nat → Option Nat) {w : Nat} (arr : SymArrayTerm)
+    (h_w : symArrayLen arr = w) (rIdx v : Nat) (h : mkLazyRead w arr rIdx = some v) :
+    evalSymArrayTerm env arr rIdx = some v := by
+  subst h_w
+  unfold mkLazyRead at h
+  by_cases hlt : rIdx < symArrayLen arr
+  · simp only [hlt, ↓reduceIte] at h
+    exact lazyReadSpine_sound env arr rIdx v hlt h
+  · simp only [hlt, ↓reduceIte] at h
+    nomatch h
 
-/-- Number of write-spine nodes inspected by one `mkLazyWrite` call (always $1$). -/
-def lazyWriteInspectSteps (_arr : SymArrayTerm) : Nat := 1
+/-! ### Exact Spine-Inspection Complexity Tied to the Implementations
 
-/-- Number of write-spine nodes inspected by `stripShadowedWrites` during one `mkEagerWrite` call
-on a spine of length $k$ (inspects `1 + spineDepth`, i.e., $k + 1$ nodes). -/
-def eagerWriteInspectSteps : SymArrayTerm → Nat
-  | .write inner _ _ => 1 + eagerWriteInspectSteps inner
-  | _ => 1
+The step counters below are *instrumented copies* of `mkLazyWrite`, `stripShadowedWrites`, and
+`mkEagerWrite` with identical recursion structure; `*_fst` theorems prove they compute exactly the
+uninstrumented terms, so the complexity theorems are statements about the real implementations
+(not free-standing closed-form recurrences). -/
 
-/-- Total spine inspections across $N$ distinct-address writes `[0, 1, ..., N - 1]` under
-`mkLazyWrite`. -/
-def lazyWriteChainSteps : Nat → Nat
-  | 0 => 0
-  | n + 1 => lazyWriteChainSteps n + 1
+/-- Number of `.write` nodes on the spine of a `SymArrayTerm`. -/
+def writeSpineDepth : SymArrayTerm → Nat
+  | .write inner _ _ => writeSpineDepth inner + 1
+  | _ => 0
 
-/-- Total spine inspections across $N$ distinct-address writes `[0, 1, ..., N - 1]` under
-`mkEagerWrite` (the $(k+1)$-th write walks the $k$ previous distinct-address writes plus the base). -/
-def eagerWriteChainSteps : Nat → Nat
-  | 0 => 0
-  | n + 1 => eagerWriteChainSteps n + (n + 1)
+/-- `true` iff no `.write` on the spine of the term targets `idx`. -/
+def spineAvoids (idx : Nat) : SymArrayTerm → Bool
+  | .write inner idx' _ => (idx' != idx) && spineAvoids idx inner
+  | _ => true
 
-/-- Build an actual `SymArrayTerm` of $n$ distinct-address writes under `mkLazyWrite`. -/
+/-- Instrumented `mkLazyWrite`: same result, plus the number of term nodes inspected (`0` for an
+out-of-bounds write folded by the static-width check, otherwise the single top node examined). -/
+def mkLazyWriteCounted (w : Nat) (arr : SymArrayTerm) (idx val : Nat) : SymArrayTerm × Nat :=
+  if !(idx < w) then
+    (arr, 0)
+  else
+    match arr with
+    | .constVec len defVal =>
+      (if val == defVal then .constVec len defVal else .write (.constVec len defVal) idx val, 1)
+    | .write inner idx' val' =>
+      (if idx' == idx then .write inner idx val else .write (.write inner idx' val') idx val, 1)
+    | other => (.write other idx val, 1)
+
+theorem mkLazyWriteCounted_fst (w : Nat) (arr : SymArrayTerm) (idx val : Nat) :
+    (mkLazyWriteCounted w arr idx val).1 = mkLazyWrite w arr idx val := by
+  unfold mkLazyWriteCounted mkLazyWrite
+  split
+  · rfl
+  · cases arr <;> rfl
+
+theorem mkLazyWriteCounted_snd_of_lt {w idx : Nat} (arr : SymArrayTerm) (val : Nat)
+    (h : idx < w) : (mkLazyWriteCounted w arr idx val).2 = 1 := by
+  unfold mkLazyWriteCounted
+  have hnot : (!decide (idx < w)) = false := by simp [h]
+  rw [hnot]
+  cases arr <;> rfl
+
+/-- Instrumented `stripShadowedWrites`: identical recursion, counting one inspection per visited
+spine node (every `.write` plus the terminal non-`.write` node). -/
+def stripShadowedWritesCounted : SymArrayTerm → Nat → SymArrayTerm × Nat
+  | .write inner idx' val', idx =>
+    let r := stripShadowedWritesCounted inner idx
+    (if idx' == idx then r.1 else .write r.1 idx' val', r.2 + 1)
+  | other, _ => (other, 1)
+
+theorem stripShadowedWritesCounted_fst :
+    ∀ (arr : SymArrayTerm) (idx : Nat),
+      (stripShadowedWritesCounted arr idx).1 = stripShadowedWrites arr idx
+  | .base _ _, _ => rfl
+  | .constVec _ _, _ => rfl
+  | .ite _ _ _, _ => rfl
+  | .write inner idx' val', idx => by
+    unfold stripShadowedWritesCounted stripShadowedWrites
+    dsimp only
+    rw [stripShadowedWritesCounted_fst inner idx]
+
+theorem stripShadowedWritesCounted_snd :
+    ∀ (arr : SymArrayTerm) (idx : Nat),
+      (stripShadowedWritesCounted arr idx).2 = writeSpineDepth arr + 1
+  | .base _ _, _ => rfl
+  | .constVec _ _, _ => rfl
+  | .ite _ _ _, _ => rfl
+  | .write inner idx' val', idx => by
+    unfold stripShadowedWritesCounted writeSpineDepth
+    dsimp only
+    rw [stripShadowedWritesCounted_snd inner idx]
+
+/-- Instrumented `mkEagerWrite`. -/
+def mkEagerWriteCounted (w : Nat) (arr : SymArrayTerm) (idx val : Nat) : SymArrayTerm × Nat :=
+  if !(idx < w) then
+    (arr, 0)
+  else
+    let r := stripShadowedWritesCounted arr idx
+    (.write r.1 idx val, r.2)
+
+theorem mkEagerWriteCounted_fst (w : Nat) (arr : SymArrayTerm) (idx val : Nat) :
+    (mkEagerWriteCounted w arr idx val).1 = mkEagerWrite w arr idx val := by
+  unfold mkEagerWriteCounted mkEagerWrite
+  split
+  · rfl
+  · dsimp only
+    rw [stripShadowedWritesCounted_fst]
+
+theorem mkEagerWriteCounted_snd_of_lt {w idx : Nat} (arr : SymArrayTerm) (val : Nat)
+    (h : idx < w) : (mkEagerWriteCounted w arr idx val).2 = writeSpineDepth arr + 1 := by
+  unfold mkEagerWriteCounted
+  have hnot : (!decide (idx < w)) = false := by simp [h]
+  rw [hnot]
+  exact stripShadowedWritesCounted_snd arr idx
+
+theorem mkEagerWrite_of_lt {w idx : Nat} (arr : SymArrayTerm) (val : Nat) (h : idx < w) :
+    mkEagerWrite w arr idx val = .write (stripShadowedWrites arr idx) idx val := by
+  unfold mkEagerWrite
+  have hnot : (!decide (idx < w)) = false := by simp [h]
+  rw [hnot]
+  rfl
+
+theorem stripShadowedWrites_of_spineAvoids :
+    ∀ (arr : SymArrayTerm) (idx : Nat),
+      spineAvoids idx arr = true → stripShadowedWrites arr idx = arr
+  | .base _ _, _, _ => rfl
+  | .constVec _ _, _, _ => rfl
+  | .ite _ _ _, _, _ => rfl
+  | .write inner idx' val', idx, h => by
+    unfold spineAvoids at h
+    rw [Bool.and_eq_true] at h
+    have hne : (idx' == idx) = false := by
+      simpa [bne_iff_ne, beq_eq_false_iff_ne] using h.1
+    unfold stripShadowedWrites
+    dsimp only
+    rw [hne, stripShadowedWrites_of_spineAvoids inner idx h.2]
+    rfl
+
+/-- `N` distinct-address writes `a[k] := k + 1` (`k = 0, …, N - 1`) under `mkLazyWrite`. -/
 def buildLazyDistinctChain (cap : Nat) : Nat → SymArrayTerm
   | 0 => .constVec cap 0
-  | n + 1 => mkLazyWrite (buildLazyDistinctChain cap n) n (n + 1)
+  | n + 1 => mkLazyWrite cap (buildLazyDistinctChain cap n) n (n + 1)
 
-/-- Build an actual `SymArrayTerm` of $n$ distinct-address writes under `mkEagerWrite` while
-accumulating exact `eagerWriteInspectSteps`. -/
-def buildEagerDistinctChainWithSteps (cap : Nat) : Nat → SymArrayTerm × Nat
+/-- `N` distinct-address writes `a[k] := k + 1` (`k = 0, …, N - 1`) under `mkEagerWrite`. -/
+def buildEagerDistinctChain (cap : Nat) : Nat → SymArrayTerm
+  | 0 => .constVec cap 0
+  | n + 1 => mkEagerWrite cap (buildEagerDistinctChain cap n) n (n + 1)
+
+/-- Instrumented lazy chain: `(buildLazyDistinctChain cap n, total inspections)`. -/
+def lazyDistinctChainCounted (cap : Nat) : Nat → SymArrayTerm × Nat
   | 0 => (.constVec cap 0, 0)
   | n + 1 =>
-    let (arr, steps) := buildEagerDistinctChainWithSteps cap n
-    let cost := eagerWriteInspectSteps arr
-    (mkEagerWrite arr n (n + 1), steps + cost)
+    let r := lazyDistinctChainCounted cap n
+    let w := mkLazyWriteCounted cap r.1 n (n + 1)
+    (w.1, r.2 + w.2)
+
+/-- Instrumented eager chain: `(buildEagerDistinctChain cap n, total inspections)`. -/
+def eagerDistinctChainCounted (cap : Nat) : Nat → SymArrayTerm × Nat
+  | 0 => (.constVec cap 0, 0)
+  | n + 1 =>
+    let r := eagerDistinctChainCounted cap n
+    let w := mkEagerWriteCounted cap r.1 n (n + 1)
+    (w.1, r.2 + w.2)
+
+theorem lazyDistinctChainCounted_fst (cap : Nat) :
+    ∀ n, (lazyDistinctChainCounted cap n).1 = buildLazyDistinctChain cap n
+  | 0 => rfl
+  | n + 1 => by
+    unfold lazyDistinctChainCounted buildLazyDistinctChain
+    dsimp only
+    rw [mkLazyWriteCounted_fst, lazyDistinctChainCounted_fst cap n]
+
+theorem eagerDistinctChainCounted_fst (cap : Nat) :
+    ∀ n, (eagerDistinctChainCounted cap n).1 = buildEagerDistinctChain cap n
+  | 0 => rfl
+  | n + 1 => by
+    unfold eagerDistinctChainCounted buildEagerDistinctChain
+    dsimp only
+    rw [mkEagerWriteCounted_fst, eagerDistinctChainCounted_fst cap n]
+
+theorem symArrayLen_buildEagerDistinctChain (cap : Nat) :
+    ∀ n, symArrayLen (buildEagerDistinctChain cap n) = cap
+  | 0 => rfl
+  | n + 1 => by
+    unfold buildEagerDistinctChain mkEagerWrite
+    split
+    · exact symArrayLen_buildEagerDistinctChain cap n
+    · show symArrayLen (stripShadowedWrites (buildEagerDistinctChain cap n) n) = cap
+      rw [symArrayLen_stripShadowedWrites, symArrayLen_buildEagerDistinctChain cap n]
+
+theorem symArrayLen_buildLazyDistinctChain (cap : Nat) :
+    ∀ n, symArrayLen (buildLazyDistinctChain cap n) = cap
+  | 0 => rfl
+  | n + 1 => by
+    unfold buildLazyDistinctChain
+    rw [symArrayLen_mkLazyWrite, symArrayLen_buildLazyDistinctChain cap n]
+
+/-- Structure of the eager chain: every in-bounds write appends exactly one new spine node, since
+the spine never contains the fresh address. -/
+theorem buildEagerDistinctChain_succ {cap : Nat} :
+    ∀ {n : Nat}, n < cap →
+      buildEagerDistinctChain cap (n + 1) = .write (buildEagerDistinctChain cap n) n (n + 1) ∧
+        ∀ m, n + 1 ≤ m → spineAvoids m (buildEagerDistinctChain cap (n + 1)) = true
+  | 0, h0 => by
+    refine ⟨?_, ?_⟩
+    · show mkEagerWrite cap (.constVec cap 0) 0 1 = _
+      rw [mkEagerWrite_of_lt _ _ h0]
+      rfl
+    · intro m hm
+      show spineAvoids m (mkEagerWrite cap (.constVec cap 0) 0 1) = true
+      rw [mkEagerWrite_of_lt _ _ h0]
+      show ((0 != m) && true) = true
+      have hne : (0 != m) = true := by simp [bne_iff_ne]; omega
+      rw [hne]
+      rfl
+  | k + 1, hk => by
+    obtain ⟨ih_eq, ih_av⟩ := buildEagerDistinctChain_succ (cap := cap) (n := k) (by omega)
+    have hav : spineAvoids (k + 1) (buildEagerDistinctChain cap (k + 1)) = true :=
+      ih_av (k + 1) (Nat.le_refl _)
+    have h_eq : buildEagerDistinctChain cap (k + 1 + 1) =
+        .write (buildEagerDistinctChain cap (k + 1)) (k + 1) (k + 1 + 1) := by
+      show mkEagerWrite cap (buildEagerDistinctChain cap (k + 1)) (k + 1) (k + 1 + 1) = _
+      rw [mkEagerWrite_of_lt _ _ hk,
+        stripShadowedWrites_of_spineAvoids _ _ hav]
+    refine ⟨h_eq, ?_⟩
+    intro m hm
+    rw [h_eq]
+    show ((k + 1 != m) && spineAvoids m (buildEagerDistinctChain cap (k + 1))) = true
+    have hne : (k + 1 != m) = true := by simp [bne_iff_ne]; omega
+    rw [hne, ih_av m (by omega)]
+    rfl
+
+theorem writeSpineDepth_buildEagerDistinctChain {cap : Nat} :
+    ∀ {n : Nat}, n ≤ cap → writeSpineDepth (buildEagerDistinctChain cap n) = n
+  | 0, _ => rfl
+  | n + 1, h => by
+    rw [(buildEagerDistinctChain_succ (cap := cap) (n := n) (by omega)).1]
+    show writeSpineDepth (buildEagerDistinctChain cap n) + 1 = n + 1
+    rw [writeSpineDepth_buildEagerDistinctChain (by omega)]
+
+/-- Structure of the lazy chain: identical to the eager chain term-for-term. -/
+theorem buildLazyDistinctChain_succ {cap : Nat} :
+    ∀ {n : Nat}, n < cap →
+      buildLazyDistinctChain cap (n + 1) = .write (buildLazyDistinctChain cap n) n (n + 1)
+  | 0, h0 => by
+    show mkLazyWrite cap (.constVec cap 0) 0 1 = _
+    unfold mkLazyWrite
+    have hnot : (!decide (0 < cap)) = false := by simp [h0]
+    rw [hnot]
+    rfl
+  | k + 1, hk => by
+    have ih := buildLazyDistinctChain_succ (cap := cap) (n := k) (by omega)
+    show mkLazyWrite cap (buildLazyDistinctChain cap (k + 1)) (k + 1) (k + 1 + 1) = _
+    conv => lhs; rw [ih]
+    unfold mkLazyWrite
+    have hnot : (!decide (k + 1 < cap)) = false := by simp [hk]
+    rw [hnot]
+    have hne : (k == k + 1) = false :=
+      beq_eq_false_iff_ne.mpr (Nat.ne_of_lt (Nat.lt_succ_self k))
+    simp only [hne, Bool.false_eq_true, ↓reduceIte]
+    rw [← ih]
+
+/-- Lazy and eager distinct-address chains build the *same* symbolic term. -/
+theorem buildLazyDistinctChain_eq_eager {cap : Nat} :
+    ∀ {n : Nat}, n ≤ cap → buildLazyDistinctChain cap n = buildEagerDistinctChain cap n
+  | 0, _ => rfl
+  | n + 1, h => by
+    rw [buildLazyDistinctChain_succ (by omega),
+      (buildEagerDistinctChain_succ (cap := cap) (n := n) (by omega)).1,
+      buildLazyDistinctChain_eq_eager (by omega)]
 
 /-- **$O(N)$ Linear Bound for `mkLazyWrite` (`lazyWriteChain_distinctAddrs_steps_eq_N`)**:
-$N$ distinct-address writes perform exactly $N$ constant-time top-layer inspections. -/
-theorem lazyWriteChain_distinctAddrs_steps_eq_N :
-    ∀ (N : Nat), lazyWriteChainSteps N = N
-  | 0 => rfl
-  | n + 1 => by
-    unfold lazyWriteChainSteps
-    rw [lazyWriteChain_distinctAddrs_steps_eq_N n]
+$N \le cap$ distinct-address writes through the instrumented `mkLazyWrite` perform exactly $N$
+node inspections. -/
+theorem lazyWriteChain_distinctAddrs_steps_eq_N {cap : Nat} :
+    ∀ {N : Nat}, N ≤ cap → (lazyDistinctChainCounted cap N).2 = N
+  | 0, _ => rfl
+  | n + 1, h => by
+    unfold lazyDistinctChainCounted
+    dsimp only
+    rw [mkLazyWriteCounted_snd_of_lt _ _ (by omega : n < cap),
+      lazyWriteChain_distinctAddrs_steps_eq_N (by omega)]
 
-/-- **$\Theta(N^2)$ Quadratic Lower/Exact Bound for `mkEagerWrite`
-(`eagerWriteChain_distinctAddrs_steps_quadratic`)**:
-$N$ distinct-address writes under eager spine stripping perform $\frac{N(N+1)}{2}$ inspections
-(`2 * eagerWriteChainSteps N = N * (N + 1)`). -/
-theorem eagerWriteChain_distinctAddrs_steps_quadratic :
-    ∀ (N : Nat), 2 * eagerWriteChainSteps N = N * (N + 1)
-  | 0 => rfl
-  | n + 1 => by
-    unfold eagerWriteChainSteps
-    rw [Nat.left_distrib, eagerWriteChain_distinctAddrs_steps_quadratic n]
+/-- **$\Theta(N^2)$ Exact Bound for `mkEagerWrite`
+(`eagerWriteChain_distinctAddrs_steps_quadratic`)**: $N \le cap$ distinct-address writes through
+the instrumented `mkEagerWrite` perform exactly $\frac{N(N+1)}{2}$ spine inspections
+(`2 * steps = N * (N + 1)`). -/
+theorem eagerWriteChain_distinctAddrs_steps_quadratic {cap : Nat} :
+    ∀ {N : Nat}, N ≤ cap → 2 * (eagerDistinctChainCounted cap N).2 = N * (N + 1)
+  | 0, _ => rfl
+  | n + 1, h => by
+    unfold eagerDistinctChainCounted
+    dsimp only
+    rw [mkEagerWriteCounted_snd_of_lt _ _ (by omega : n < cap), eagerDistinctChainCounted_fst,
+      writeSpineDepth_buildEagerDistinctChain (by omega), Nat.left_distrib,
+      eagerWriteChain_distinctAddrs_steps_quadratic (by omega)]
     have h_rhs : (n + 1) * (n + 1 + 1) = n * (n + 1) + 2 * (n + 1) := by
       calc (n + 1) * ((n + 1) + 1)
         _ = (n + 1) * (n + 1) + (n + 1) * 1 := Nat.left_distrib (n + 1) (n + 1) 1
