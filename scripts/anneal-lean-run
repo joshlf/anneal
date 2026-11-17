@@ -39,7 +39,7 @@ Why this wrapper exists:
   against accidental non-fast-forward rollbacks.
 - Kernel replay is single-threaded, so replay / TCB audit commands
   (`check_trusted.py`, `leanchecker`, `lean4checker`,
-  `lean --run ... TrustedBoundary.lean`) default `LEAN_NUM_THREADS` to the
+  `lean --run TrustedBoundary.lean ...`) default `LEAN_NUM_THREADS` to the
   replay budget (`--replay-threads`, default 2) instead of the full worktree
   budget. Every child also receives `ANNEAL_AUDIT_LEAN_THREADS`, the only
   thread setting `check_trusted.py` honors after it strips ambient `LEAN*`
@@ -74,7 +74,7 @@ REMOTE_URI_PREFIX = "/remote/"
 # Replay / audit thread budget. The default and bound mirror
 # `DEFAULT_AUDIT_LEAN_THREADS` / `MAX_AUDIT_LEAN_THREADS` in
 # `trusted/audit/check_trusted.py` (asserted by `--self-test`), so every value
-# exported as `ANNEAL_AUDIT_LEAN_THREADS` is one that `check_trusted.py` admits.
+# exported as `ANNEAL_AUDIT_LEAN_THREADS` is one that `check_trusted.py` accepts.
 DEFAULT_REPLAY_THREADS = 2
 MAX_REPLAY_THREADS = 64
 REPLAY_THREADS_ENV = "ANNEAL_REPLAY_THREADS"
@@ -812,26 +812,6 @@ _UV_OPTIONS_WITH_OPERAND = frozenset(
         "--color",
     }
 )
-_LEAN_OPTIONS_WITH_OPERAND = frozenset(
-    {
-        "-M",
-        "--memory",
-        "-j",
-        "--threads",
-        "-t",
-        "--trust",
-        "-D",
-        "-o",
-        "-c",
-        "-b",
-        "--bc",
-        "--load-dynlib",
-        "--plugin",
-        "--deps",
-        "--root",
-        "-R",
-    }
-)
 _PYTHON_EXE_RE = re.compile(
     r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?[a-z]*(?:-(?:dbg|debug))?"
 )
@@ -934,18 +914,18 @@ def _python_script_operand(args: list[str]) -> str | None:
 
 
 def _lean_run_script_operand(args: list[str]) -> str | None:
-    """Returns the Lean file executed by `lean ... --run <file> [args...]`, or None."""
+    """Returns the Lean file executed by `lean ... --run <file> [args...]`, or None.
+
+    Lean `v4.34.1` runs the argument right after the first `--run`, even one that
+    looks like an option (`lean --run -M 2048 X.lean` and `lean --run -- X.lean`
+    try to open `-M` and `--`), passes every later argument to `main`, and
+    ignores a file named before `--run` (`lean A.lean --run B.lean` runs
+    `B.lean`). `--run=<file>` is not accepted.
+    """
     if "--run" not in args:
         return None
     i = args.index("--run") + 1
-    while i < len(args):
-        arg = args[i]
-        if arg == "--":
-            return args[i + 1] if i + 1 < len(args) else None
-        if not arg.startswith("-"):
-            return arg
-        i += 2 if arg in _LEAN_OPTIONS_WITH_OPERAND else 1
-    return None
+    return args[i] if i < len(args) else None
 
 
 def is_replay_or_audit_command(cmd: list[str]) -> bool:
@@ -954,7 +934,7 @@ def is_replay_or_audit_command(cmd: list[str]) -> bool:
     Recognized, optionally behind `env`, `lake env|exe`, `uv run`, or `elan run`:
     - `check_trusted.py`, run directly or as a Python interpreter's script;
     - `leanchecker` / `lean4checker`;
-    - `lean ... --run ... TrustedBoundary.lean` (or its compiled `TrustedBoundary` binary).
+    - `lean ... --run TrustedBoundary.lean ...` (or its compiled `TrustedBoundary` binary).
     Shell strings (`sh -c '...'`) and other launchers are not parsed; pass
     `--replay-threads` to pin such commands explicitly.
     """
@@ -2303,7 +2283,10 @@ def run_self_test() -> int:
                 ],
                 ["/home/u/.elan/toolchains/t/bin/lean", "--run", "TrustedBoundary.lean"],
                 ["lean", "-M", "2048", "-j", "1", "--run", "trusted/audit/TrustedBoundary.lean"],
-                ["lean", "--run", "-M", "2048", "trusted/audit/TrustedBoundary.lean"],
+                # Lean runs the argument after `--run` and passes the rest to `main`.
+                ["lean", "--run", "trusted/audit/TrustedBoundary.lean", "-M", "2048"],
+                ["lean", "Other.lean", "--run", "trusted/audit/TrustedBoundary.lean"],
+                ["lean", "--run", "TrustedBoundary.lean", "--run", "Other.lean"],
                 ["lake", "env", "--", "lean", "--run", "trusted/audit/TrustedBoundary.lean"],
                 ["lake", "exe", "-q", "leanchecker", "Anneal"],
                 ["env", "--", "FOO=1", "python3-dbg", "trusted/audit/check_trusted.py"],
@@ -2330,6 +2313,11 @@ def run_self_test() -> int:
                 ["lean", "--run", "Other.lean"],
                 ["lean", "TrustedBoundary.lean", "--run", "Other.lean"],
                 ["lean", "--run", "Other.lean", "trusted/audit/TrustedBoundary.lean"],
+                # Lean tries to run `-M` / `--`, rejects `--run=`, and needs a `--run` operand.
+                ["lean", "--run", "-M", "2048", "trusted/audit/TrustedBoundary.lean"],
+                ["lean", "--run", "--", "trusted/audit/TrustedBoundary.lean"],
+                ["lean", "--run=trusted/audit/TrustedBoundary.lean"],
+                ["lean", "trusted/audit/TrustedBoundary.lean", "--run"],
                 ["uv", "run", "python3", "scripts/other.py", "trusted/audit/check_trusted.py"],
                 ["elan", "run", "leanprover/lean4:v4.34.1", "lean", "Foo.lean"],
                 ["cargo", "test", "--manifest-path", "trusted/rustc-capture/Cargo.toml"],
@@ -2525,7 +2513,7 @@ def run_self_test() -> int:
             self.assertEqual(resolve({}), str(DEFAULT_REPLAY_THREADS))
             for raw, expected in (("", "2"), (" \t", "2"), ("1", "1"), ("08", "8")):
                 self.assertEqual(resolve({AUDIT_LEAN_THREADS_ENV: raw}), expected)
-            # Every replay budget this wrapper can export is admitted verbatim.
+            # Every replay budget this wrapper can export is accepted verbatim.
             for n in range(1, MAX_REPLAY_THREADS + 1):
                 self.assertEqual(resolve({AUDIT_LEAN_THREADS_ENV: str(n)}), str(n))
             for raw in (
@@ -2723,8 +2711,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             f"Thread budget (1..{MAX_REPLAY_THREADS}, capped by the worktree "
             "budget) for kernel replay / audit commands (`check_trusted.py`, "
-            "`leanchecker`, `lean4checker`, `lean --run ... "
-            "TrustedBoundary.lean`), exported to every child as "
+            "`leanchecker`, `lean4checker`, `lean --run "
+            "TrustedBoundary.lean ...`), exported to every child as "
             "`ANNEAL_AUDIT_LEAN_THREADS` (default: $ANNEAL_REPLAY_THREADS or "
             f"{DEFAULT_REPLAY_THREADS}). Passing it pins `LEAN_NUM_THREADS` "
             "and `ANNEAL_AUDIT_LEAN_THREADS` for any command, overriding "

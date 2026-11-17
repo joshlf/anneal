@@ -2046,6 +2046,13 @@ pub enum CtorReprKind {
     /// `lean_box(0)` object: Lean `v4.34.1` rejects `300` fields of
     /// `structure Z : Type where h : True` with "has too many fields". The guard therefore
     /// charges one boxed field ([`CtorReprKind::parent_field_kind`]).
+    ///
+    /// An erased proposition would leave its parent wrapper with one relevant field fewer,
+    /// which can unbox the wrapper (a wrapper over a proof-only part and a one-`UInt64` part
+    /// is stored as that `UInt64`) and invalidate the plan's accounting. In a structure with a
+    /// relevant field, [`render_lcnf_guarded_structure`] therefore declares every `Erased` part
+    /// `: Type _`, which Lean stores as one boxed field. A structure without relevant fields
+    /// has no unboxed scalar to expose, so charging a boxed field only over-approximates.
     Erased,
 }
 
@@ -2560,8 +2567,9 @@ impl LcnfCtorLayoutPlan {
     /// level below in order, so no field or constructor is lost, duplicated, or reordered.
     /// Every constructor records the kinds, footprint and representation of its children, fits
     /// its budget (the `Part` budget on level `0`, the default budget on wrapper levels) and
-    /// the IR-checker limits. Each wrapper level has fewer constructors than the level below,
-    /// and the root level has exactly one constructor.
+    /// the IR-checker limits, with every part stored the way [`render_lcnf_guarded_structure`]
+    /// declares it ([`CtorReprKind::Erased`]). Each wrapper level has fewer constructors than
+    /// the level below, and the root level has exactly one constructor.
     pub fn validate(&self) -> Result<(), LcnfLayoutError> {
         let part_budget = LcnfCtorBudget::checked(
             self.part_budget.max_scalar_bytes,
@@ -2729,11 +2737,14 @@ const LEAN_RESERVED_WORDS: &str = concat!(
     "universe unless unsafe using variable where with ",
 );
 
-/// Declarations Lean generates in a structure's namespace, which an accessor of a split layout
-/// must not shadow (whitespace-separated).
+/// Declarations Lean `v4.34.1` generates in the namespace of every `Type`-valued structure `S`
+/// besides its projections: `S.mk`, `S.rec`, `S.recOn`, `S.casesOn`, `S.noConfusionType`,
+/// `S.noConfusion`, `S.ctorIdx`, `S._sizeOf_1`, and `S._sizeOf_inst` (whitespace-separated).
+/// Lean rejects a field with any of these names, and no accessor of a split layout may shadow
+/// them. Names Lean does not generate there, such as `below`, `brecOn`, or `ext`, are valid
+/// field names (`lcnf_tests::lcnf_live_lean_structure_aux_names_match_model`).
 const LEAN_STRUCTURE_AUX_NAMES: &str = concat!(
-    "below binductionOn brecOn casesOn ctorIdx ext ext_iff ibelow mk noConfusion ",
-    "noConfusionType rec recOn toCtorIdx ",
+    "_sizeOf_1 _sizeOf_inst casesOn ctorIdx mk noConfusion noConfusionType rec recOn",
 );
 
 /// True for an ASCII Lean identifier component that is not a keyword: `[A-Za-z_][A-Za-z0-9_']*`
@@ -2762,6 +2773,17 @@ fn lean_ident_atoms(lean_ty: &str) -> impl Iterator<Item = &str> {
     lean_ty
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\''))
         .filter(|atom| !atom.is_empty())
+}
+
+/// Leading components of the dotted identifiers of a Lean type: of each maximal run of
+/// `[A-Za-z0-9_'.]`, the text before its first `.` when that text starts like an identifier.
+/// Lean resolves only these components through the open namespaces (`Nat.rec` names `Nat`'s
+/// recursor and `x.f` projects from `x`, whatever the open namespaces declare as `rec` or `f`).
+fn lean_ident_heads(lean_ty: &str) -> impl Iterator<Item = &str> {
+    lean_ty
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\'' || c == '.'))
+        .filter_map(|run| run.split('.').next())
+        .filter(|head| head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
 }
 
 fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
@@ -2799,9 +2821,11 @@ fn check_field_specs(fields: &[LcnfFieldSpec]) -> Result<(), LcnfLayoutError> {
     Ok(())
 }
 
-/// Checks the structure name, the `deriving` entries and the plan, and, for a split layout,
-/// that no field name collides with a generated declaration and no field type depends on a
-/// field, on the structure itself, or on the accessor binder `self`.
+/// Checks the structure name, the `deriving` entries and the plan, that no field takes the name
+/// of a declaration Lean generates for the structure, and, for a split layout, that no field
+/// name collides with a generated declaration and no field type depends on a field, on the
+/// structure itself, on the accessor binder `self`, or on a declaration generated in the
+/// structure's namespace.
 fn check_lcnf_emission(
     struct_name: &str,
     plan: &LcnfCtorLayoutPlan,
@@ -2871,12 +2895,18 @@ fn check_lcnf_emission(
                 name: field.name.clone(),
             });
         }
-        if let Some(atom) = lean_ident_atoms(&field.lean_ty).find(|&atom| {
-            atom == "self"
-                || atom == struct_leaf
-                || field_names.contains(atom)
-                || generated_types.contains(atom)
-        }) {
+        // The accessors are elaborated inside the structure's namespace, where an identifier
+        // headed by a root field (`part1`) or an auxiliary declaration (`mk`) resolves to the
+        // generated `<struct_name>.part1` / `<struct_name>.mk` instead of the caller's one.
+        if let Some(atom) = lean_ident_atoms(&field.lean_ty)
+            .find(|&atom| {
+                atom == "self"
+                    || atom == struct_leaf
+                    || field_names.contains(atom)
+                    || generated_types.contains(atom)
+            })
+            .or_else(|| lean_ident_heads(&field.lean_ty).find(|&head| reserved.contains(head)))
+        {
             return Err(LcnfLayoutError::DependentFieldType {
                 field: field.name.clone(),
                 depends_on: atom.to_owned(),
@@ -2895,6 +2925,12 @@ fn check_lcnf_emission(
 /// `structure <struct_name>` (each with the same `deriving` line), and then one
 /// `abbrev <struct_name>.<field> (self : <struct_name>) : <type> := self.<path>` accessor per
 /// original field, so `s.<field>` keeps working and reads exactly the original field.
+///
+/// When the structure has a relevant field, a part whose fields are all
+/// [`LcnfFieldKind::Irrelevant`] is declared `structure <struct_name>.Part<j> : Type _ where`.
+/// Lean would otherwise infer `Prop` for a part of proofs, erase it in its wrapper (possibly
+/// unboxing the wrapper, see [`CtorReprKind::Erased`]), and fail to derive `Repr`, `BEq`, or
+/// `Ord` for it, none of which happens to the flat structure, which is a `Type`.
 pub fn render_lcnf_guarded_structure(
     struct_name: &str,
     plan: &LcnfCtorLayoutPlan,
@@ -2906,15 +2942,21 @@ pub fn render_lcnf_guarded_structure(
     } else {
         format!("  deriving {}\n", derives.join(", "))
     };
+    let has_relevant_field = plan.fields.iter().any(|field| field.kind.is_relevant());
     let mut out = String::new();
     for (level, ctors) in plan.levels.iter().enumerate() {
         for (index, ctor) in ctors.iter().enumerate() {
             if !out.is_empty() {
                 out.push('\n');
             }
+            let irrelevant_part = level == 0
+                && !plan.is_flat()
+                && has_relevant_field
+                && ctor.repr == CtorReprKind::Erased;
             out.push_str(&format!(
-                "structure {} where\n",
-                plan.ctor_lean_name(struct_name, level, index)
+                "structure {}{} where\n",
+                plan.ctor_lean_name(struct_name, level, index),
+                if irrelevant_part { " : Type _" } else { "" }
             ));
             for child in ctor.children.clone() {
                 if level == 0 {
@@ -3742,6 +3784,90 @@ mod lcnf_tests {
         );
     }
 
+    /// A plan whose root holds `count` wrappers over two one-field parts `[h<k> : True]` and
+    /// `[x<k> : UInt64]`, built by hand. [`CtorReprKind`] charges each wrapper one boxed field,
+    /// which holds only because the `[h<k>]` parts are declared `: Type _`: as propositions,
+    /// Lean would erase them and store each wrapper as its `UInt64`.
+    fn proposition_wrapper_plan(count: usize) -> LcnfCtorLayoutPlan {
+        let mut fields = Vec::with_capacity(2 * count);
+        for index in 0..count {
+            fields.push(LcnfFieldSpec::new(format!("h{index}"), "True", Irrelevant));
+            fields.push(LcnfFieldSpec::new(format!("x{index}"), "UInt64", U64));
+        }
+        let kinds: Vec<LcnfFieldKind> = fields.iter().map(|field| field.kind).collect();
+        let parts = build_layout_level(&kinds, (0..fields.len()).map(|i| i..i + 1).collect());
+        let part_kinds: Vec<LcnfFieldKind> = parts
+            .iter()
+            .map(|ctor| ctor.repr.parent_field_kind())
+            .collect();
+        let wrappers = build_layout_level(&part_kinds, (0..count).map(|k| 2 * k..2 * k + 2).collect());
+        let wrapper_kinds: Vec<LcnfFieldKind> = wrappers
+            .iter()
+            .map(|ctor| ctor.repr.parent_field_kind())
+            .collect();
+        let root = build_layout_level(&wrapper_kinds, vec![0..count]);
+        LcnfCtorLayoutPlan {
+            fields,
+            part_budget: LcnfCtorBudget::DEFAULT,
+            levels: vec![parts, wrappers, root],
+        }
+    }
+
+    #[test]
+    fn irrelevant_parts_of_structures_with_data_are_declared_types() {
+        // Every `[h<k> : True]` part would be a proposition; declared `: Type _`, it is one boxed
+        // field, so the root holds `129` boxed fields as the plan charges.
+        let plan = proposition_wrapper_plan(129);
+        assert_eq!(plan.validate(), Ok(()));
+        assert_eq!(
+            plan.root().footprint,
+            LcnfCtorFootprint {
+                scalar_bytes: 0,
+                obj_fields: 129,
+                declared_fields: 129,
+            }
+        );
+        let out = render_lcnf_guarded_structure("S", &plan, &[]).unwrap();
+        assert!(out.starts_with(
+            "structure S.Part1 : Type _ where\n  h0 : True\n\nstructure S.Part2 where\n  x0 : UInt64\n"
+        ));
+        assert_eq!(out.matches(" : Type _ where").count(), 129);
+
+        // Greedy layout of `[240 x Nat, 480 x True, UInt64]`: two proof-only parts.
+        let mut fields = nats(240);
+        fields.extend(uniform(480, "h", "True", Irrelevant));
+        fields.push(LcnfFieldSpec::new("x", "UInt64", U64));
+        let plan = default_plan(&fields);
+        assert_eq!(plan.ctor_counts_per_level(), [4, 1]);
+        assert_lossless(&plan);
+        let out = render_lcnf_guarded_structure("Mixed", &plan, &["Repr"]).unwrap();
+        for (part, declared) in [
+            ("Part1 where", true),
+            ("Part2 : Type _ where", true),
+            ("Part3 : Type _ where", true),
+            ("Part4 where", true),
+            ("Part2 where", false),
+            ("Part3 where", false),
+        ] {
+            assert_eq!(out.contains(&format!("structure Mixed.{part}\n")), declared, "{part}");
+        }
+
+        // Without a relevant field, the flat structure is a proposition when its fields are
+        // proofs, and so are the parts: nothing is declared `: Type _`.
+        let proofs = uniform(300, "h", "True", Irrelevant);
+        let out = emit_lcnf_guarded_structure("Proofs", &proofs, &[]).unwrap();
+        assert!(out.contains("structure Proofs.Part1 where\n") && !out.contains("Type _"));
+        // Flat structures are never annotated.
+        let flat = [
+            LcnfFieldSpec::new("h", "True", Irrelevant),
+            LcnfFieldSpec::new("n", "Nat", ObjectRef),
+        ];
+        assert_eq!(
+            emit_lcnf_guarded_structure("Flat", &flat, &[]).unwrap(),
+            "structure Flat where\n  h : True\n  n : Nat\n"
+        );
+    }
+
     // The 11 boundary cases of `PROTOTYPE_REPORT.md` §4.3 (Lean `v4.34.1` verdicts reproduced by
     // `lcnf_live_lean_probe_matches_model`).
 
@@ -4253,6 +4379,36 @@ mod lcnf_tests {
                 depends_on: String::from("Node")
             })
         );
+        // The accessors are elaborated in `Wide`'s namespace, where `part1` is the root field
+        // `Wide.part1` and `mk` / `rec` are `Wide.mk` / `Wide.rec`, so a type headed by them
+        // would silently change meaning (Lean `v4.34.1` reads `Fin part1` as `Fin Wide.part1`).
+        for (lean_ty, head) in [
+            ("Fin part1", "part1"),
+            ("Fin (part2 + 1)", "part2"),
+            ("List mk", "mk"),
+            ("Fin rec.succ", "rec"),
+            ("Fin _sizeOf_1", "_sizeOf_1"),
+        ] {
+            let fields = wide(&[LcnfFieldSpec::new("w", lean_ty, ObjectRef)]);
+            assert_eq!(
+                emit_lcnf_guarded_structure("Wide", &fields, &[]),
+                Err(LcnfLayoutError::DependentFieldType {
+                    field: String::from("w"),
+                    depends_on: head.to_owned()
+                }),
+                "type `{lean_ty}`"
+            );
+        }
+        // Only leading components resolve through the namespace: `Nat.rec` and `Foo.part1` are
+        // unaffected, as are these names in a flat structure.
+        let qualified = wide(&[LcnfFieldSpec::new(
+            "w",
+            "Fin (Foo.part1 + Nat.rec 0 (fun _ n => n) 3)",
+            ObjectRef,
+        )]);
+        assert!(emit_lcnf_guarded_structure("Wide", &qualified, &[]).is_ok());
+        let flat_heads = [LcnfFieldSpec::new("w", "Fin part1", ObjectRef)];
+        assert!(emit_lcnf_guarded_structure("Small", &flat_heads, &[]).is_ok());
         let fine = wide(&[
             LcnfFieldSpec::new("part", "Nat", ObjectRef),
             LcnfFieldSpec::new("v", "Fin 3", ObjectRef),
@@ -5349,5 +5505,104 @@ mod lcnf_tests {
             "lcnf_live_lean_standard_derives_scale_to_the_budget",
             &cases,
         );
+    }
+
+    #[test]
+    fn lcnf_live_lean_irrelevant_parts_stay_boxed_types() {
+        // `A` holds `P` and a one-`UInt64` structure `U`. As a proposition, `P` is erased and Lean
+        // stores `A` as one unboxed `UInt64` (`8` scalar bytes per field of `W`); declared
+        // `: Type _`, `P` is one boxed field and `A` is boxed, as `CtorReprKind` charges it.
+        let raw_case = |name: &str, p_sort: &str, count: usize, w: LcnfCtorFootprint| {
+            let fields: String = (0..count).map(|index| format!("  a{index} : A\n")).collect();
+            let body = format!(
+                "structure P{p_sort} where\n  h : True\n  deriving Inhabited\n\n\
+                 structure U where\n  x : UInt64\n  deriving Inhabited\n\n\
+                 structure A where\n  p : P\n  u : U\n  deriving Inhabited\n\n\
+                 structure W where\n{fields}  deriving Inhabited\n"
+            );
+            LeanProbeCase::new(name, &body, &[w])
+        };
+        let unboxed = |count: usize| LcnfCtorFootprint {
+            scalar_bytes: 8 * count,
+            obj_fields: 0,
+            declared_fields: count,
+        };
+        let a_kind = CtorReprKind::of_kinds(&[CtorReprKind::Erased.parent_field_kind(), U64])
+            .parent_field_kind();
+        assert_eq!(a_kind, ObjectRef);
+        let mut fields = nats(240);
+        fields.extend(uniform(300, "h", "True", Irrelevant));
+        let cases = [
+            raw_case("prop_part_128", "", 128, unboxed(128)),
+            raw_case("prop_part_129", "", 129, unboxed(129)),
+            raw_case(
+                "type_part_129",
+                " : Type _",
+                129,
+                LcnfCtorFootprint::of_kinds(vec![a_kind; 129]),
+            ),
+            guarded_case(
+                "guarded_prop_wrappers_129",
+                &proposition_wrapper_plan(129),
+                &["Inhabited"],
+            ),
+            // Lean derives no `Repr` or `BEq` instance for a proposition.
+            guarded_case(
+                "guarded_proof_parts_derive",
+                &default_plan(&fields),
+                &["Inhabited", "Repr", "BEq", "Hashable"],
+            ),
+        ];
+        assert!(cases[0].predicted.is_empty());
+        assert_eq!(cases[1].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
+        assert!(cases[2..].iter().all(|case| case.predicted.is_empty()));
+        assert_lean_matches_model("lcnf_live_lean_irrelevant_parts_stay_boxed_types", &cases);
+    }
+
+    #[test]
+    fn lcnf_live_lean_structure_aux_names_match_model() {
+        let reserved: Vec<&str> = LEAN_STRUCTURE_AUX_NAMES.split_whitespace().collect();
+        // Not generated in a structure's namespace by Lean `v4.34.1`.
+        let free = [
+            "below",
+            "binductionOn",
+            "brecOn",
+            "ext",
+            "ext_iff",
+            "ibelow",
+            "toCtorIdx",
+            "injEq",
+        ];
+        let mut cases = Vec::new();
+        for (index, &name) in reserved.iter().chain(&free).enumerate() {
+            let fields = [
+                LcnfFieldSpec::new(name, "Nat", ObjectRef),
+                LcnfFieldSpec::new("y", "UInt64", U64),
+            ];
+            let guarded = emit_lcnf_guarded_structure("W", &fields, &[]);
+            if index < reserved.len() {
+                assert_eq!(
+                    guarded,
+                    Err(LcnfLayoutError::ReservedFieldName {
+                        name: name.to_owned()
+                    })
+                );
+            } else {
+                assert!(guarded.is_ok(), "field `{name}`: {guarded:?}");
+            }
+            cases.push(unguarded_flat_case(&format!("aux_{index}"), &fields));
+        }
+        let Some(errors) = run_lean_probe("lcnf_live_lean_structure_aux_names_match_model", &cases)
+        else {
+            return;
+        };
+        for (index, case_errors) in errors.iter().enumerate() {
+            let name = reserved.iter().chain(&free).nth(index).copied().unwrap_or_default();
+            assert_eq!(
+                case_errors.is_empty(),
+                index >= reserved.len(),
+                "field `{name}`: Lean 4.34.1 disagrees with LEAN_STRUCTURE_AUX_NAMES: {case_errors:?}"
+            );
+        }
     }
 }
